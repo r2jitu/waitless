@@ -27,7 +27,6 @@ static constexpr uint32_t GICD_ICENABLER0 = 0x180; // Interrupt clear-enable
 static constexpr uint32_t GICD_ICPENDR0   = 0x280; // Clear pending
 static constexpr uint32_t GICD_IPRIORITYR0 = 0x400; // Priority registers
 static constexpr uint32_t GICD_ITARGETSR0  = 0x800; // Target CPU registers
-static constexpr uint32_t GICD_ICFGR0      = 0xC00; // Configuration
 
 // CPU interface registers (offsets from GICC_BASE)
 static constexpr uint32_t GICC_CTLR  = 0x000; // CPU interface control

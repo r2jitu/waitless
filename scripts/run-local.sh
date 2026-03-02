@@ -81,11 +81,15 @@ if [ "$HOST_ARCH" = "arm64" ]; then
         "${QEMU_NET[@]}"
     )
 
-    # On Apple Silicon, use HVF (native hypervisor) with -cpu host for full speed.
-    # HVF requires -cpu host on M1/M2/M3; cortex-a57 only works in software TCG.
-    # Fall back to software TCG with cortex-a57 if HVF is unavailable.
-    exec "${QEMU_BASE[@]}" -cpu host -accel hvf 2>/dev/null || \
-    exec "${QEMU_BASE[@]}" -cpu cortex-a57
+    # Use HVF (native hypervisor) if available, otherwise fall back to software TCG.
+    # We detect HVF via sysctl rather than using "exec hvf || exec tcg" — the
+    # latter is broken because exec replaces the shell process, so if QEMU fails
+    # at HVF runtime the fallback is unreachable.
+    if sysctl -n kern.hv_support 2>/dev/null | grep -q '^1$'; then
+        exec "${QEMU_BASE[@]}" -cpu host -accel hvf
+    else
+        exec "${QEMU_BASE[@]}" -cpu cortex-a57
+    fi
 
 # ── x86_64 (Intel Mac) ───────────────────────────────────────────────────────
 else
@@ -107,6 +111,9 @@ else
         -netdev "user,id=net0,hostfwd=tcp::${HOST_PORT}-:80"
     )
 
-    exec "${QEMU_COMMON[@]}" -accel hvf 2>/dev/null || \
-    exec "${QEMU_COMMON[@]}"
+    if sysctl -n kern.hv_support 2>/dev/null | grep -q '^1$'; then
+        exec "${QEMU_COMMON[@]}" -accel hvf
+    else
+        exec "${QEMU_COMMON[@]}"
+    fi
 fi
