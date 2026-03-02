@@ -1,0 +1,78 @@
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "core",
+    srcs = [
+        "mm.cc",
+        "libc.cc",
+    ] + select({
+        "//bazel/platforms:x86_64": ["serial.cc"],
+        "//bazel/platforms:aarch64": ["aarch64/serial.cc"],
+        "//conditions:default": ["serial.cc"],
+    }),
+    hdrs = [
+        "arch.h",
+        "serial.h",
+        "mm.h",
+        "panic.h",
+    ] + select({
+        "//bazel/platforms:aarch64": [
+            "aarch64/arch.h",
+            "aarch64/timer.h",
+        ],
+        "//conditions:default": [],
+    }),
+    copts = ["-I."],
+)
+
+cc_library(
+    name = "arch_init",
+    srcs = select({
+        "//bazel/platforms:x86_64": [
+            "gdt.cc",
+            "idt.cc",
+        ],
+        "//bazel/platforms:aarch64": ["aarch64/exceptions.cc"],
+        "//conditions:default": [
+            "gdt.cc",
+            "idt.cc",
+        ],
+    }),
+    hdrs = select({
+        "//bazel/platforms:x86_64": [
+            "gdt.h",
+            "idt.h",
+        ],
+        "//bazel/platforms:aarch64": ["aarch64/exceptions.h"],
+        "//conditions:default": [
+            "gdt.h",
+            "idt.h",
+        ],
+    }),
+    deps = [":core"],
+    copts = ["-I."],
+)
+
+cc_library(
+    name = "boot",
+    srcs = select({
+        "//bazel/platforms:x86_64": ["boot.S"],
+        "//bazel/platforms:aarch64": ["aarch64/boot.S"],
+        "//conditions:default": ["boot.S"],
+    }),
+)
+
+cc_library(
+    name = "entry",
+    srcs = ["entry.cc"],
+    deps = [
+        ":core",
+        ":arch_init",
+        "//drivers:virtio_net",
+        "//net",
+    ],
+    copts = [
+        "-I.",
+        "-Iinclude",
+    ],
+)

@@ -1,0 +1,13 @@
+# --- x86_64 unikernel (default, for cloud deployments) ----------------------
+build:unikernel --platforms=//bazel/platforms:x86_64_unikernel
+build:unikernel --action_env=PATH
+
+# --- aarch64 unikernel (for local macOS ARM development with HVF) -----------
+# Note: use  bazel build --config=aarch64  (NOT --config=aarch64 --config=unikernel)
+# to avoid the "option '--platforms' expanded from multiple configs" warning.
+build:aarch64 --platforms=//bazel/platforms:aarch64_unikernel
+build:aarch64 --action_env=PATH
+
+# Default to x86_64 unikernel config.
+# Override on the command line with --config=aarch64.
+build --config=unikernel

@@ -1,0 +1,10 @@
+load("//bazel/rules:unikernel.bzl", "unikernel_binary")
+
+unikernel_binary(
+    name = "webserver",
+    srcs = ["main.cc"],
+    copts = [
+        "-I.",
+        "-Iinclude",
+    ],
+)

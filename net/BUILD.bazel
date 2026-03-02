@@ -1,0 +1,31 @@
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "net",
+    srcs = [
+        "types.cc",
+        "ethernet.cc",
+        "arp.cc",
+        "ipv4.cc",
+        "tcp.cc",
+        "dhcp.cc",
+        "http.cc",
+    ],
+    hdrs = [
+        "types.h",
+        "ethernet.h",
+        "arp.h",
+        "ipv4.h",
+        "tcp.h",
+        "dhcp.h",
+        "http.h",
+    ],
+    deps = [
+        "//kernel:core",
+        "//drivers:virtio_net",
+    ],
+    copts = [
+        "-I.",
+        "-Iinclude",
+    ],
+)

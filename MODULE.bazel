@@ -1,0 +1,9 @@
+module(name = "unikernel", version = "0.1.0")
+
+bazel_dep(name = "rules_cc", version = "0.1.1")
+bazel_dep(name = "platforms", version = "0.0.10")
+
+register_toolchains(
+    "//bazel/toolchain:unikernel_cc_toolchain_x86_64",
+    "//bazel/toolchain:unikernel_cc_toolchain_aarch64",
+)

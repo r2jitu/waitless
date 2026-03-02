@@ -1,0 +1,23 @@
+# Bazel build outputs (symlinks created by Bazel in the project root)
+bazel-bin
+bazel-out
+bazel-testlogs
+bazel-unikernel
+
+# Bazel cache and user-specific files
+.bazel/
+user.bazelrc
+
+# macOS metadata
+.DS_Store
+
+# Editor artifacts
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Compiled binaries
+*.o
+*.elf
+*.iso

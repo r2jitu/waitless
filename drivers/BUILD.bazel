@@ -1,0 +1,28 @@
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "pci",
+    srcs = ["pci.cc"],
+    hdrs = ["pci.h"],
+    deps = ["//kernel:core"],
+    copts = ["-I."],
+)
+
+cc_library(
+    name = "virtio",
+    srcs = ["virtio.cc"],
+    hdrs = ["virtio.h"],
+    deps = [
+        "//kernel:core",
+        ":pci",
+    ],
+    copts = ["-I."],
+)
+
+cc_library(
+    name = "virtio_net",
+    srcs = ["virtio_net.cc"],
+    hdrs = ["virtio_net.h"],
+    deps = [":virtio"],
+    copts = ["-I."],
+)

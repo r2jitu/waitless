@@ -1,0 +1,64 @@
+load(":cc_toolchain_config.bzl", "cc_toolchain_config")
+
+# Parameterised configs — one per target arch
+cc_toolchain_config(name = "x86_64_toolchain_config",  target_arch = "x86_64")
+cc_toolchain_config(name = "aarch64_toolchain_config", target_arch = "aarch64")
+
+filegroup(name = "empty")
+
+filegroup(
+    name = "all_files",
+    srcs = glob(["**"]),
+)
+
+# ---- x86_64 -----------------------------------------------------------------
+
+cc_toolchain(
+    name = "unikernel_x86_64_impl",
+    toolchain_config = ":x86_64_toolchain_config",
+    all_files = ":all_files",
+    ar_files = ":all_files",
+    as_files = ":all_files",
+    compiler_files = ":all_files",
+    dwp_files = ":empty",
+    linker_files = ":all_files",
+    objcopy_files = ":empty",
+    strip_files = ":empty",
+)
+
+toolchain(
+    name = "unikernel_cc_toolchain_x86_64",
+    exec_compatible_with = ["@platforms//os:macos"],
+    target_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:none",
+    ],
+    toolchain = ":unikernel_x86_64_impl",
+    toolchain_type = "@rules_cc//cc:toolchain_type",
+)
+
+# ---- aarch64 ----------------------------------------------------------------
+
+cc_toolchain(
+    name = "unikernel_aarch64_impl",
+    toolchain_config = ":aarch64_toolchain_config",
+    all_files = ":all_files",
+    ar_files = ":all_files",
+    as_files = ":all_files",
+    compiler_files = ":all_files",
+    dwp_files = ":empty",
+    linker_files = ":all_files",
+    objcopy_files = ":empty",
+    strip_files = ":empty",
+)
+
+toolchain(
+    name = "unikernel_cc_toolchain_aarch64",
+    exec_compatible_with = ["@platforms//os:macos"],
+    target_compatible_with = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:none",
+    ],
+    toolchain = ":unikernel_aarch64_impl",
+    toolchain_type = "@rules_cc//cc:toolchain_type",
+)
