@@ -17,7 +17,6 @@ static constexpr uint16_t COM1 = 0x3F8;
 
 // Register offsets from base port
 static constexpr uint16_t THR = 0; // Transmit Holding Register (write, DLAB=0)
-static constexpr uint16_t RBR = 0; // Receive Buffer Register (read, DLAB=0)
 static constexpr uint16_t DLL = 0; // Divisor Latch Low (DLAB=1)
 static constexpr uint16_t DLH = 1; // Divisor Latch High (DLAB=1)
 static constexpr uint16_t IER = 1; // Interrupt Enable Register (DLAB=0)

@@ -6,6 +6,8 @@
 namespace net {
 namespace arp {
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunaligned-access"
 struct ArpPacket {
     uint16_t hw_type;      // 1 = Ethernet
     uint16_t proto_type;   // 0x0800 = IPv4
@@ -17,6 +19,7 @@ struct ArpPacket {
     MacAddr  target_mac;
     Ipv4Addr target_ip;
 } __attribute__((packed));
+#pragma GCC diagnostic pop
 
 static constexpr uint16_t OP_REQUEST = 1;
 static constexpr uint16_t OP_REPLY   = 2;

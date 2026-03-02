@@ -5,6 +5,7 @@ optionally produces a bootable ISO and raw disk image for QEMU or cloud
 deployment.
 """
 
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
 
 def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
@@ -25,7 +26,7 @@ def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
         copts: Additional compiler flags.
         visibility: Bazel visibility specification.
     """
-    native.cc_binary(
+    cc_binary(
         name = name + ".elf",
         srcs = srcs,
         deps = deps + [

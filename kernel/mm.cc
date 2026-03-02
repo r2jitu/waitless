@@ -109,6 +109,8 @@ static BlockHeader* heap_head = nullptr;  // First block in the heap
 // Boot protocol parsing (multiboot2 and PVH/Xen hvm_start_info)
 // ============================================================================
 
+#if !defined(__aarch64__)
+
 // Align a value up to an 8-byte boundary (multiboot2 tag alignment)
 static inline uint64_t align_up_8(uint64_t val) {
     return (val + 7) & ~7ULL;
@@ -137,6 +139,8 @@ struct HvmStartInfo {
     uint32_t memmap_entries;
     uint32_t reserved;
 };
+
+#endif // !defined(__aarch64__)
 
 // Align a value up to a page boundary
 static inline uint64_t align_up_page(uint64_t val) {
