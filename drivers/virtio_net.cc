@@ -37,11 +37,165 @@ static uint8_t mac_[6];
 static RxBuffer* rx_buffers_[RX_BUFFERS];
 
 // ============================================================================
+// TX buffer pool
+//
+// send() is non-blocking: it copies the frame into a pool slot, submits to
+// the TX queue, kicks the device, and returns immediately.  tx_drain() is
+// called opportunistically to reclaim slots whose TX completions have been
+// posted to the used ring by QEMU's BH.
+//
+// With virtio-mmio on TCG, QUEUE_NOTIFY schedules an async BH in QEMU's I/O
+// event loop.  If send() blocked spinning on get_used(), the guest spin loop
+// would starve QEMU's event loop and the BH would never run — resulting in
+// ~58 req/sec instead of thousands.  Non-blocking send() avoids this.
+// ============================================================================
+
+struct TxBuf {
+    VirtioNetHeader hdr;
+    uint8_t         data[1514];  // max Ethernet frame (1500 payload + 14 header)
+} __attribute__((packed));
+
+static constexpr int TX_POOL_SIZE = 64;
+static TxBuf tx_pool_[TX_POOL_SIZE];
+static bool  tx_pool_used_[TX_POOL_SIZE];
+
+// ============================================================================
 // Initialization
 // ============================================================================
 
 bool init() {
     serial::printf("virtio_net: initializing...\n");
+
+#if defined(__aarch64__)
+    // -----------------------------------------------------------------------
+    // ARM64: virtio-mmio transport (QEMU -device virtio-net-device)
+    //
+    // The QEMU virt machine provides 32 virtio-mmio slots at 0x0a000000..
+    // 0x0a003e00 (step 0x200).  All slots carry the "virt" magic value; only
+    // occupied ones have DeviceID != 0.  Scan all slots to find DeviceID=1
+    // (network) rather than assuming the first slot.
+    // -----------------------------------------------------------------------
+    device_  = nullptr;
+    io_base_ = 0;
+
+    // MMIO register helpers
+    auto r32 = [](uint64_t base, uint32_t off) -> uint32_t {
+        return arch::virtio_read32(base + off);
+    };
+    auto w32 = [](uint64_t base, uint32_t off, uint32_t v) {
+        arch::virtio_write32(base + off, v);
+    };
+
+    // Scan the 32 virtio-mmio slots for a network device (DeviceID = 1)
+    for (int slot = 0; slot < 32; slot++) {
+        uint64_t candidate = virtio::mmio::BASE + (uint64_t)slot * 0x200;
+        if (r32(candidate, virtio::mmio::MAGIC_VALUE) != virtio::mmio::MAGIC)
+            continue;
+        if (r32(candidate, virtio::mmio::DEVICE_ID) == 1) {
+            io_base_ = candidate;
+            break;
+        }
+    }
+    if (io_base_ == 0) {
+        serial::printf("virtio_net: no virtio-mmio net device found in 32 slots\n");
+        return false;
+    }
+
+    uint32_t ver = r32(io_base_, virtio::mmio::VERSION);
+    if (ver != 1) {
+        serial::printf("virtio_net: unsupported virtio-mmio version %u at 0x%lx\n",
+                       ver, io_base_);
+        return false;
+    }
+    serial::printf("virtio_net: virtio-mmio net device found at 0x%lx (v%u)\n",
+                   io_base_, ver);
+
+    // Reset
+    w32(io_base_, virtio::mmio::STATUS, 0);
+
+    // ACKNOWLEDGE + DRIVER
+    w32(io_base_, virtio::mmio::STATUS,
+        virtio::STATUS_ACKNOWLEDGE);
+    w32(io_base_, virtio::mmio::STATUS,
+        virtio::STATUS_ACKNOWLEDGE | virtio::STATUS_DRIVER);
+
+    // Negotiate features
+    uint32_t dev_features = r32(io_base_, virtio::mmio::HOST_FEATURES);
+    serial::printf("virtio_net: device features = 0x%x\n", dev_features);
+
+    uint32_t guest_features = 0;
+    if (dev_features & VIRTIO_NET_F_MAC)    guest_features |= VIRTIO_NET_F_MAC;
+    if (dev_features & VIRTIO_NET_F_STATUS) guest_features |= VIRTIO_NET_F_STATUS;
+    w32(io_base_, virtio::mmio::GUEST_FEATURES, guest_features);
+    serial::printf("virtio_net: guest features = 0x%x\n", guest_features);
+
+    // GuestPageSize MUST be written before queue setup for legacy MMIO
+    w32(io_base_, virtio::mmio::GUEST_PAGE_SIZE, 4096);
+
+    // Init RX and TX queues (is_mmio = true)
+    if (!rx_queue_.init(0, io_base_, 0, /*is_mmio=*/true)) {
+        serial::printf("virtio_net: failed to init RX queue\n");
+        w32(io_base_, virtio::mmio::STATUS, virtio::STATUS_FAILED);
+        return false;
+    }
+    if (!tx_queue_.init(0, io_base_, 1, /*is_mmio=*/true)) {
+        serial::printf("virtio_net: failed to init TX queue\n");
+        w32(io_base_, virtio::mmio::STATUS, virtio::STATUS_FAILED);
+        return false;
+    }
+
+    // Read MAC from config space (two 32-bit reads to stay 32-bit aligned)
+    {
+        uint32_t lo = r32(io_base_, virtio::mmio::DEVICE_CONFIG + 0);
+        uint32_t hi = r32(io_base_, virtio::mmio::DEVICE_CONFIG + 4);
+        mac_[0] =  lo        & 0xff;
+        mac_[1] = (lo >>  8) & 0xff;
+        mac_[2] = (lo >> 16) & 0xff;
+        mac_[3] = (lo >> 24) & 0xff;
+        mac_[4] =  hi        & 0xff;
+        mac_[5] = (hi >>  8) & 0xff;
+    }
+    serial::printf("virtio_net: MAC = %02x:%02x:%02x:%02x:%02x:%02x\n",
+                   mac_[0], mac_[1], mac_[2], mac_[3], mac_[4], mac_[5]);
+
+    // Allocate RX buffers
+    for (int i = 0; i < RX_BUFFERS; i++) {
+        rx_buffers_[i] = reinterpret_cast<RxBuffer*>(mm::kmalloc(sizeof(RxBuffer)));
+        if (!rx_buffers_[i]) {
+            serial::printf("virtio_net: failed to allocate RX buffer %d\n", i);
+            w32(io_base_, virtio::mmio::STATUS, virtio::STATUS_FAILED);
+            return false;
+        }
+        RxBuffer* buf = rx_buffers_[i];
+        buf->hdr.flags       = 0;
+        buf->hdr.gso_type    = 0;
+        buf->hdr.hdr_len     = 0;
+        buf->hdr.gso_size    = 0;
+        buf->hdr.csum_start  = 0;
+        buf->hdr.csum_offset = 0;
+
+        void* buf_ptr    = reinterpret_cast<void*>(buf);
+        uint32_t buf_len = BUFFER_SIZE;
+        int ret = rx_queue_.add_buf(&buf_ptr, &buf_len, 0, 1);
+        if (ret < 0) {
+            serial::printf("virtio_net: failed to add RX buffer %d\n", i);
+            break;
+        }
+    }
+    rx_queue_.kick();
+
+    // DRIVER_OK — device is live
+    w32(io_base_, virtio::mmio::STATUS,
+        virtio::STATUS_ACKNOWLEDGE | virtio::STATUS_DRIVER |
+        virtio::STATUS_DRIVER_OK);
+
+    serial::printf("virtio_net: initialization complete (MMIO)\n");
+    return true;
+
+#else
+    // -----------------------------------------------------------------------
+    // x86_64: virtio-PCI legacy transport (unchanged)
+    // -----------------------------------------------------------------------
 
     // -----------------------------------------------------------------------
     // Step 1: Find the virtio-net PCI device
@@ -210,6 +364,7 @@ bool init() {
 
     serial::printf("virtio_net: initialization complete\n");
     return true;
+#endif // __aarch64__ / x86_64
 }
 
 // ============================================================================
@@ -217,10 +372,13 @@ bool init() {
 // ============================================================================
 
 void shutdown() {
-    if (io_base_ != 0) {
-        virtio::reset(io_base_);
-        serial::printf("virtio_net: device reset\n");
-    }
+    if (io_base_ == 0) return;
+#if defined(__aarch64__)
+    arch::virtio_write32(io_base_ + virtio::mmio::STATUS, 0);
+#else
+    virtio::reset(io_base_);
+#endif
+    serial::printf("virtio_net: device reset\n");
 }
 
 // ============================================================================
@@ -232,61 +390,73 @@ const uint8_t* get_mac() {
 }
 
 // ============================================================================
+// TX drain -- reclaim completed TX pool slots
+// ============================================================================
+
+static void tx_drain() {
+    uint16_t used_id;
+    uint32_t used_len;
+    while (tx_queue_.get_used(&used_id, &used_len)) {
+        // After get_used() the descriptor's addr field still holds the
+        // original TxBuf pointer (get_used only modifies the next field).
+        virtio::VirtqDesc* d = tx_queue_.desc(used_id);
+        TxBuf* buf = reinterpret_cast<TxBuf*>(d->addr);
+        int slot = (int)(buf - tx_pool_);
+        if (slot >= 0 && slot < TX_POOL_SIZE) {
+            tx_pool_used_[slot] = false;
+        }
+    }
+}
+
+// ============================================================================
 // Packet transmission
 // ============================================================================
 
 void send(const void* data, uint32_t len) {
-    if (!data || len == 0) {
-        return;
+    if (!data || len == 0) return;
+    if (len > 1514) len = 1514;
+
+    // Reclaim any pool slots whose TX has already completed.
+    tx_drain();
+
+    // Find a free pool slot.  Spin-drain if all slots are momentarily busy
+    // (rare: would require 64 in-flight TX packets simultaneously).
+    int slot = -1;
+    for (;;) {
+        for (int i = 0; i < TX_POOL_SIZE; i++) {
+            if (!tx_pool_used_[i]) { slot = i; break; }
+        }
+        if (slot >= 0) break;
+        tx_drain();
+        arch::cpu_relax();
     }
 
-    // Allocate a buffer for the virtio header + the ethernet frame
-    uint32_t total_len = sizeof(VirtioNetHeader) + len;
-    uint8_t* buf = reinterpret_cast<uint8_t*>(mm::kmalloc(total_len));
-    if (!buf) {
-        serial::printf("virtio_net: TX allocation failed\n");
-        return;
-    }
+    tx_pool_used_[slot] = true;
+    TxBuf* buf = &tx_pool_[slot];
 
-    // Zero the virtio-net header (no offloads, no GSO)
-    VirtioNetHeader* hdr = reinterpret_cast<VirtioNetHeader*>(buf);
-    hdr->flags       = 0;
-    hdr->gso_type    = 0;
-    hdr->hdr_len     = 0;
-    hdr->gso_size    = 0;
-    hdr->csum_start  = 0;
-    hdr->csum_offset = 0;
+    buf->hdr.flags       = 0;
+    buf->hdr.gso_type    = 0;
+    buf->hdr.hdr_len     = 0;
+    buf->hdr.gso_size    = 0;
+    buf->hdr.csum_start  = 0;
+    buf->hdr.csum_offset = 0;
 
-    // Copy the ethernet frame after the header
     const uint8_t* src = reinterpret_cast<const uint8_t*>(data);
-    uint8_t* dst = buf + sizeof(VirtioNetHeader);
-    for (uint32_t i = 0; i < len; i++) {
-        dst[i] = src[i];
-    }
+    for (uint32_t i = 0; i < len; i++) buf->data[i] = src[i];
 
-    // Add the buffer to the TX queue as a device-readable (output) buffer.
-    // The device will read the header + frame and transmit it.
+    uint32_t total_len = sizeof(VirtioNetHeader) + len;
     void* buf_ptr = reinterpret_cast<void*>(buf);
     int head = tx_queue_.add_buf(&buf_ptr, &total_len, 1, 0);
     if (head < 0) {
         serial::printf("virtio_net: TX queue full\n");
-        mm::kfree(buf);
+        tx_pool_used_[slot] = false;
         return;
     }
 
-    // Kick the TX queue to notify the device
+    // Kick the device and return immediately -- no spin-wait.
+    // QEMU processes the TX BH in its event loop between TCG translation
+    // blocks; tx_drain() on the next poll() call will reclaim this slot.
     tx_queue_.kick();
-
-    // Poll until the transmission completes.
-    // In a unikernel with cooperative scheduling this is fine -- we own the CPU.
-    uint16_t used_id;
-    uint32_t used_len;
-    while (!tx_queue_.get_used(&used_id, &used_len)) {
-        arch::cpu_relax();
-    }
-
-    // Free the TX buffer
-    mm::kfree(buf);
 }
 
 // ============================================================================
@@ -297,6 +467,9 @@ int poll(void (*callback)(const uint8_t* data, uint32_t len)) {
     if (!callback) {
         return 0;
     }
+
+    // Opportunistically reclaim completed TX buffers.
+    tx_drain();
 
     int count = 0;
     uint16_t used_id;

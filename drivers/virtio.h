@@ -1,13 +1,15 @@
 #pragma once
 
-// drivers/virtio.h -- Virtio PCI transport layer and split virtqueue
+// drivers/virtio.h -- Virtio transport layer and split virtqueue
 //
-// Implements the virtio 0.9.5 (legacy) PCI transport with split virtqueues.
+// Supports two transports:
+//   PCI (legacy 0.9.5): used on x86_64 via I/O ports; on ARM64 via PCI I/O MMIO.
+//   MMIO (legacy v1):   used on ARM64 via virtio-net-device (no PCI bus needed).
+//
 // This is a library layer: applications and higher-level drivers (like
 // virtio_net) call these functions directly -- no syscalls, no mode switches.
 //
-// Reference: Virtual I/O Device (VIRTIO) Version 0.9.5
-//            https://docs.oasis-open.org/virtio/virtio/v1.0/virtio-v1.0.html
+// Reference: Virtual I/O Device (VIRTIO) Version 0.9.5 / MMIO transport spec
 
 #include <stdint.h>
 #include <stddef.h>
@@ -49,6 +51,33 @@ static constexpr uint16_t VIRTQ_DESC_F_WRITE = 2; // Buffer is device-writable
 
 // Available ring flag
 static constexpr uint16_t VIRTQ_AVAIL_F_NO_INTERRUPT = 1;
+
+// ============================================================================
+// Virtio-MMIO transport register offsets (relative to device base address)
+//
+// QEMU virt machine maps the first virtio-mmio device at 0x0a000000.
+// All registers are 32-bit, memory-mapped.  Legacy (version 1) protocol.
+// ============================================================================
+
+namespace mmio {
+    static constexpr uint64_t BASE           = 0x0a000000ULL;
+    // Register offsets (all 32-bit)
+    static constexpr uint32_t MAGIC_VALUE    = 0x000; // "virt" = 0x74726976 (read)
+    static constexpr uint32_t VERSION        = 0x004; // 1 = legacy           (read)
+    static constexpr uint32_t DEVICE_ID      = 0x008; // 1=net, 2=blk …      (read)
+    static constexpr uint32_t HOST_FEATURES  = 0x010; // device feature bits  (read)
+    static constexpr uint32_t GUEST_FEATURES = 0x020; // driver feature bits  (write)
+    static constexpr uint32_t GUEST_PAGE_SIZE= 0x028; // must write 4096      (write)
+    static constexpr uint32_t QUEUE_SEL      = 0x030; // queue selector       (write)
+    static constexpr uint32_t QUEUE_NUM_MAX  = 0x034; // max queue size       (read)
+    static constexpr uint32_t QUEUE_NUM      = 0x038; // chosen queue size    (write)
+    static constexpr uint32_t QUEUE_ALIGN    = 0x03c; // must write 4096      (write)
+    static constexpr uint32_t QUEUE_PFN      = 0x040; // phys addr >> 12      (r/w)
+    static constexpr uint32_t QUEUE_NOTIFY   = 0x050; // queue kick           (write)
+    static constexpr uint32_t STATUS         = 0x070; // device status        (r/w)
+    static constexpr uint32_t DEVICE_CONFIG  = 0x100; // device-specific config
+    static constexpr uint32_t MAGIC          = 0x74726976u; // "virt"
+} // namespace mmio
 
 // ============================================================================
 // Split virtqueue data structures (must match hardware layout exactly)
@@ -94,11 +123,15 @@ public:
     // sets up the descriptor table / available ring / used ring, and tells the
     // device where the queue lives.
     //
-    // base: BAR0 base — I/O port (x86_64) or MMIO address (aarch64)
+    // base:        BAR0 base — I/O port (x86_64) or MMIO address (aarch64/PCI)
+    //              For is_mmio=true, base is the virtio-mmio device base (e.g. 0x0a000000).
     // queue_index: which virtqueue (0 = RX, 1 = TX, etc.)
+    // is_mmio:     true  = virtio-mmio transport (ARM64, virtio-net-device)
+    //              false = virtio-PCI legacy transport (default)
     //
     // Returns true on success.
-    bool init(uint16_t queue_size, uint64_t base, uint16_t queue_index);
+    bool init(uint16_t queue_size, uint64_t base, uint16_t queue_index,
+              bool is_mmio = false);
 
     // Add a buffer chain to the available ring.
     //
@@ -132,8 +165,9 @@ private:
     uint16_t free_head_     = 0;    // Head of free descriptor linked list
     uint16_t num_free_      = 0;    // Number of free descriptors remaining
     uint16_t last_used_idx_ = 0;    // Last used ring index we processed
-    uint64_t io_base_       = 0;    // BAR0 base (I/O port on x86, MMIO on ARM64)
+    uint64_t io_base_       = 0;    // Device base (I/O port on x86, MMIO on ARM64)
     uint16_t queue_index_   = 0;    // This queue's index (for notify)
+    bool     is_mmio_       = false; // true = virtio-mmio transport
     bool*    desc_used_     = nullptr; // Tracks which descriptors are in use
 };
 

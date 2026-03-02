@@ -90,17 +90,21 @@ if [ "$HOST_ARCH" = "arm64" ]; then
         exit 1
     fi
 
-    # HVF is not used on aarch64: Apple's Hypervisor.framework does not guarantee
-    # ISV=1 in ESR_EL2 for device MMIO exits, so QEMU cannot decode or emulate
-    # those accesses.  This affects every device the unikernel touches (GIC,
-    # PCIe ECAM, virtio BARs).  TCG emulates all MMIO correctly.
+    # Use virtio-net-device (virtio-mmio transport) instead of virtio-net-pci.
+    # This eliminates the PCIe ECAM bus scan from the kernel boot sequence and
+    # is more efficient for TCG emulation (simpler device model).
+    #
+    # Note: HVF (-accel hvf) is not enabled because QEMU aborts on ISV=0
+    # MMIO exits from UART and GIC accesses — this affects all MMIO devices,
+    # not just PCIe ECAM.  Full ARM64 HVF support requires QEMU 9.2+ with
+    # instruction-level ISV=0 emulation.
     exec qemu-system-aarch64 \
         -machine virt \
         -kernel "$ELF" \
         -m "${MEMORY}" \
         -smp "${CPUS}" \
         "${QEMU_OUTPUT[@]}" \
-        -device virtio-net-pci,netdev=net0 \
+        -device virtio-net-device,netdev=net0 \
         -netdev "user,id=net0,hostfwd=tcp::${HOST_PORT}-:80" \
         -cpu max
 

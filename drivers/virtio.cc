@@ -77,23 +77,35 @@ void write_guest_features(uint64_t base, uint32_t features) {
 // ============================================================================
 
 bool Virtqueue::init(uint16_t queue_size_param, uint64_t base,
-                     uint16_t queue_index) {
+                     uint16_t queue_index, bool is_mmio) {
     io_base_     = base;
     queue_index_ = queue_index;
+    is_mmio_     = is_mmio;
 
-    // Step 1: Select this queue
-    arch::virtio_write16(io_base_ + REG_QUEUE_SELECT, queue_index_);
-
-    // Step 2: Read the queue size from the device
-    uint16_t dev_queue_size = arch::virtio_read16(io_base_ + REG_QUEUE_SIZE);
-    if (dev_queue_size == 0) {
-        serial::printf("virtio: queue %d has size 0\n", queue_index_);
-        return false;
+    // Step 1 & 2: Select queue and determine its size.
+    // PCI transport: write 16-bit QueueSelect, read 16-bit QueueSize.
+    // MMIO transport: write 32-bit QueueSel, read 32-bit QueueNumMax,
+    //                 then write QueueNum and QueueAlign (4096).
+    if (is_mmio_) {
+        arch::virtio_write32(io_base_ + mmio::QUEUE_SEL, queue_index_);
+        uint32_t qmax = arch::virtio_read32(io_base_ + mmio::QUEUE_NUM_MAX);
+        if (qmax == 0) {
+            serial::printf("virtio: queue %d has size 0\n", queue_index_);
+            return false;
+        }
+        // Cap at 256 to keep memory usage reasonable
+        queue_size_ = (qmax > 256) ? 256 : (uint16_t)qmax;
+        arch::virtio_write32(io_base_ + mmio::QUEUE_NUM,   queue_size_);
+        arch::virtio_write32(io_base_ + mmio::QUEUE_ALIGN, 4096);
+    } else {
+        arch::virtio_write16(io_base_ + REG_QUEUE_SELECT, queue_index_);
+        uint16_t dev_queue_size = arch::virtio_read16(io_base_ + REG_QUEUE_SIZE);
+        if (dev_queue_size == 0) {
+            serial::printf("virtio: queue %d has size 0\n", queue_index_);
+            return false;
+        }
+        queue_size_ = dev_queue_size;
     }
-
-    // Use the device-reported queue size (ignore the parameter if the device
-    // provides one, as the device dictates the maximum).
-    queue_size_ = dev_queue_size;
 
     serial::printf("virtio: queue %d size = %d\n", queue_index_, queue_size_);
 
@@ -166,9 +178,15 @@ bool Virtqueue::init(uint16_t queue_size_param, uint64_t base,
     avail_->flags = VIRTQ_AVAIL_F_NO_INTERRUPT;
 
     // Step 8: Tell the device where the queue lives.
-    // Legacy virtio uses the physical page frame number (address >> 12).
-    arch::virtio_write32(io_base_ + REG_QUEUE_ADDRESS,
-                         (uint32_t)(phys_base >> 12));
+    // Both PCI and MMIO use the physical page frame number (address >> 12).
+    // PCI: REG_QUEUE_ADDRESS (32-bit).  MMIO: mmio::QUEUE_PFN (32-bit).
+    if (is_mmio_) {
+        arch::virtio_write32(io_base_ + mmio::QUEUE_PFN,
+                             (uint32_t)(phys_base >> 12));
+    } else {
+        arch::virtio_write32(io_base_ + REG_QUEUE_ADDRESS,
+                             (uint32_t)(phys_base >> 12));
+    }
 
     serial::printf("virtio: queue %d initialized at phys 0x%lx\n",
                    queue_index_, phys_base);
@@ -236,7 +254,11 @@ int Virtqueue::add_buf(void** buffers, uint32_t* lengths,
 void Virtqueue::kick() {
     // Memory barrier before notifying the device
     asm volatile("" ::: "memory");
-    arch::virtio_write16(io_base_ + REG_QUEUE_NOTIFY, queue_index_);
+    if (is_mmio_) {
+        arch::virtio_write32(io_base_ + mmio::QUEUE_NOTIFY, queue_index_);
+    } else {
+        arch::virtio_write16(io_base_ + REG_QUEUE_NOTIFY, queue_index_);
+    }
 }
 
 bool Virtqueue::get_used(uint16_t* id, uint32_t* len) {

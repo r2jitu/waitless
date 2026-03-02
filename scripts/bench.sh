@@ -157,6 +157,10 @@ bench_unikernel() {
     # Start QEMU in the background.
     # -chardev file routes serial output to a log without needing a terminal.
     if [ "$HOST_ARCH" = "arm64" ]; then
+        # virtio-net-device (MMIO) is simpler than virtio-net-pci and avoids
+        # the PCIe ECAM bus scan in the kernel.
+        # Note: HVF is not used — QEMU on ARM64 aborts on ISV=0 exits from
+        # UART/GIC MMIO accesses, which is a separate limitation from PCIe ECAM.
         qemu-system-aarch64 \
             -machine virt \
             -kernel "$elf" \
@@ -164,7 +168,7 @@ bench_unikernel() {
             -display none -monitor none \
             -chardev "file,id=s0,path=${log}" -serial chardev:s0 \
             -no-reboot \
-            -device virtio-net-pci,netdev=net0 \
+            -device virtio-net-device,netdev=net0 \
             -netdev "user,id=net0,hostfwd=tcp::${BENCH_PORT}-:80" \
             </dev/null >/dev/null 2>&1 &
     else

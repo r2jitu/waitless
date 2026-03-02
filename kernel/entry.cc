@@ -83,8 +83,13 @@ extern "C" void kernel_main(uint64_t boot_info_addr) {
 
     call_global_constructors();
 
+#if !defined(__aarch64__)
+    // On ARM64 we use virtio-mmio transport, so no PCI bus scan is needed.
+    // Skipping it also prevents ISV=0 faults when running under HVF, since
+    // the PCIe ECAM at 0x4010000000 does not reliably produce ISV=1 exits.
     serial::printf("[INIT] PCI bus scan...\n");
     pci::init();
+#endif
 
     serial::printf("[INIT] Virtio-net driver...\n");
     bool net_ok = virtio_net::init();
