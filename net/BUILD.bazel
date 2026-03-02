@@ -1,9 +1,18 @@
 package(default_visibility = ["//visibility:public"])
 
+# Pure networking types (byte-order helpers, IP/MAC addresses, checksums).
+# No hardware or kernel dependencies — can be compiled for the host toolchain
+# and used in unit tests.
+cc_library(
+    name = "types",
+    srcs = ["types.cc"],
+    hdrs = ["types.h"],
+    copts = ["-I.", "-Iinclude"],
+)
+
 cc_library(
     name = "net",
     srcs = [
-        "types.cc",
         "ethernet.cc",
         "arp.cc",
         "ipv4.cc",
@@ -21,6 +30,7 @@ cc_library(
         "http.h",
     ],
     deps = [
+        ":types",
         "//kernel:core",
         "//drivers:virtio_net",
     ],

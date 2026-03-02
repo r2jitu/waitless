@@ -76,15 +76,26 @@ bazel build --config=aarch64 //apps/webserver:webserver.elf
 
 ## Run
 
-The `run-local.sh` script builds (if needed) and launches QEMU, forwarding `localhost:8080` to port 80 in the VM:
+### bazel run (recommended)
+
+Build and launch QEMU in one command:
 
 ```bash
-./scripts/run-local.sh
+# x86_64 (default)
+bazel run //apps/webserver:run
+
+# ARM64 / Apple Silicon
+bazel run --config=aarch64 //apps/webserver:run
 ```
 
-Architecture is detected automatically from the host (`uname -m`):
-- **Apple Silicon (arm64)**: uses `qemu-system-aarch64` with HVF acceleration (falls back to TCG `cortex-a57`)
-- **Intel Mac (x86_64)**: uses `qemu-system-x86_64` with HVF acceleration (falls back to software TCG)
+Architecture detection is automatic — `run-local.sh` reads `uname -m` and selects the right QEMU binary. On Apple Silicon, it tries HVF acceleration first and falls back to TCG `cortex-a57`.
+
+### Script directly
+
+```bash
+./scripts/run-local.sh                      # auto-build + run (x86_64)
+./scripts/run-local.sh path/to/kernel.elf  # run a pre-built ELF
+```
 
 Once booted, test the HTTP server:
 
@@ -101,11 +112,25 @@ curl http://localhost:8080/health
 | `UNIKERNEL_CPUS` | `1` | vCPU count |
 | `UNIKERNEL_PORT` | `8080` | Host port forwarded to VM port 80 |
 
-### Run a pre-built ELF directly
+## Testing
+
+The integration test boots the webserver in QEMU and verifies HTTP endpoint responses:
 
 ```bash
-./scripts/run-local.sh path/to/kernel.elf
+# x86_64 (default)
+bazel test //apps/webserver:integration_test
+
+# aarch64
+bazel test --config=aarch64 //apps/webserver:integration_test
 ```
+
+Requirements: `qemu-system-{x86_64,aarch64}` (`brew install qemu`). If the QEMU binary is not found the test exits 0 (skip, not fail).
+
+### What is tested
+
+| Test | What it covers |
+|------|---------------|
+| `integration_test` | Boots webserver in QEMU; verifies `GET /` → 200, `GET /health` → 200, `GET /xyz` → 404, `POST /` → 200 |
 
 ## Writing an Application
 

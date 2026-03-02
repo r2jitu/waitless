@@ -26,3 +26,10 @@ config_setting(
     name = "aarch64",
     constraint_values = ["@platforms//cpu:aarch64"],
 )
+
+# Matches any unikernel platform (bare-metal, os=none).
+# Used by tests to mark themselves as incompatible with the unikernel toolchain.
+config_setting(
+    name = "os_none",
+    constraint_values = ["@platforms//os:none"],
+)

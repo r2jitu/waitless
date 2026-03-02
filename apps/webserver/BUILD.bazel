@@ -1,4 +1,7 @@
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("//bazel/rules:unikernel.bzl", "unikernel_binary")
+
+package(default_visibility = ["//visibility:public"])
 
 unikernel_binary(
     name = "webserver",
@@ -7,4 +10,34 @@ unikernel_binary(
         "-I.",
         "-Iinclude",
     ],
+)
+
+# Friendly aliases so users can type:
+#   bazel run //apps/webserver:run               (x86_64)
+#   bazel run --config=aarch64 //apps/webserver:run  (aarch64)
+alias(
+    name = "run",
+    actual = ":webserver_run",
+)
+
+# End-to-end integration test: boots the webserver in QEMU and verifies HTTP.
+#
+# Via "bazel test" (recommended for CI — enforces timeout + result reporting):
+#   bazel test //apps/webserver:integration_test              # x86_64
+#   bazel test --config=aarch64 //apps/webserver:integration_test  # aarch64
+#
+# Via "bazel run" (interactive — shows live output):
+#   bazel run //apps/webserver:integration_test
+#   bazel run --config=aarch64 //apps/webserver:integration_test
+#
+# Requirements: qemu-system-{x86_64,aarch64} (brew install qemu).
+# If the QEMU binary is missing the test exits 0 (skip, not fail).
+sh_test(
+    name = "integration_test",
+    srcs = ["integration_test.sh"],
+    data = [":webserver.elf"],
+    # local     — must run on the dev machine (needs QEMU + host networking)
+    # exclusive — uses a fixed port; avoid parallel runs with itself
+    tags = ["local", "exclusive"],
+    timeout = "long",  # allows up to 15 min; QEMU boot typically takes 5-30s
 )

@@ -5,6 +5,8 @@ optionally produces a bootable ISO and raw disk image for QEMU or cloud
 deployment.
 """
 
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+
 def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
     """Build a unikernel ELF binary from application sources.
 
@@ -36,6 +38,21 @@ def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
         ],
         copts = copts,
         linkopts = [],
+        visibility = visibility,
+    )
+
+    # "bazel run //apps/<name>:run" — builds the ELF then launches QEMU.
+    # Works for both x86_64 (default) and aarch64 (--config=aarch64).
+    # UNIKERNEL_ELF_RELPATH tells run_wrapper.sh where to find the ELF inside
+    # bazel-bin/.  BUILD_WORKSPACE_DIRECTORY (set by "bazel run") provides the
+    # workspace root so the wrapper can reach scripts/run-local.sh.
+    sh_binary(
+        name = name + "_run",
+        srcs = ["//bazel/rules:run_wrapper.sh"],
+        data = [":" + name + ".elf"],
+        env = {
+            "UNIKERNEL_ELF_RELPATH": native.package_name() + "/" + name + ".elf",
+        },
         visibility = visibility,
     )
 
