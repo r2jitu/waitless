@@ -1,6 +1,7 @@
 """Custom Clang toolchain configuration for x86_64 bare-metal unikernel."""
 
 load("@rules_cc//cc:action_names.bzl", "ACTION_NAMES")
+load("@rules_cc//cc/common:cc_common.bzl", "cc_common")
 load(
     "@rules_cc//cc:cc_toolchain_config_lib.bzl",
     "feature",
@@ -65,6 +66,10 @@ def _impl(ctx):
             # which faults on QEMU cortex-a57 even with SCTLR_EL1.A=0.
             "-mstrict-align",
             "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Wshadow",
+            "-Wno-unused-parameter",  # kernel callbacks must match fixed signatures
             "-O2",
             "-g",
             "-D__UNIKERNEL__=1",
@@ -85,6 +90,10 @@ def _impl(ctx):
             "-mno-red-zone",
             "-mcmodel=kernel",
             "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Wshadow",
+            "-Wno-unused-parameter",  # kernel callbacks must match fixed signatures
             "-O2",
             "-g",
             "-D__UNIKERNEL__=1",

@@ -114,8 +114,7 @@ extern "C" void kernel_main(uint64_t boot_info_addr) {
     serial::printf("\n[BOOT] All subsystems ready. Starting application.\n\n");
     int ret = uni_main();
     serial::printf("\n[SHUTDOWN] Application exited with code %d.\n", ret);
-    serial::printf("[SHUTDOWN] Halting.\n");
+    serial::printf("[SHUTDOWN] Powering off.\n");
 
-    arch::cli();
-    while (true) arch::hlt();
+    arch::shutdown();
 }

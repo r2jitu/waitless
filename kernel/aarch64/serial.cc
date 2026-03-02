@@ -28,6 +28,7 @@ static constexpr uint64_t LCR_H = UART_BASE + 0x02C; // Line control
 static constexpr uint64_t CR    = UART_BASE + 0x030; // Control
 
 static constexpr uint32_t FR_TXFF = (1U << 5);  // TX FIFO full
+static constexpr uint32_t FR_RXFE = (1U << 4);  // RX FIFO empty
 static constexpr uint32_t CR_UARTEN = (1U << 0); // UART enable
 static constexpr uint32_t CR_TXE    = (1U << 8); // TX enable
 static constexpr uint32_t CR_RXE    = (1U << 9); // RX enable
@@ -171,6 +172,30 @@ void printf(const char* fmt, ...) {
     }
 
     va_end(ap);
+}
+
+// ---- Shutdown detection ----------------------------------------------------
+
+int try_getc() {
+    // FR bit 4 = RXFE: RX FIFO is empty; if clear, a byte is waiting
+    if (!(*reg(FR) & FR_RXFE)) {
+        return (int)(uint8_t)(*reg(DR) & 0xFF);
+    }
+    return -1;
+}
+
+static bool shutdown_requested = false;
+
+bool check_shutdown() {
+    if (shutdown_requested) return true;
+    int c;
+    while ((c = try_getc()) >= 0) {
+        if (c == 0x03) {  // Ctrl-C byte forwarded by QEMU (signal=off)
+            shutdown_requested = true;
+            return true;
+        }
+    }
+    return false;
 }
 
 } // namespace serial

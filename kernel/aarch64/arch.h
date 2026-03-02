@@ -33,6 +33,19 @@ static inline void wfi() {
     asm volatile("wfi");
 }
 
+// Power off the machine via PSCI SYSTEM_OFF (HVC call, function 0x84000008).
+// QEMU's virt machine handles this and terminates the emulator cleanly.
+// Never returns.
+[[noreturn]] static inline void shutdown() {
+    asm volatile(
+        "movz x0, #0x8400, lsl #16\n\t"  // x0  = 0x84000000
+        "movk x0, #0x0008\n\t"           // x0 |= 0x00000008 → 0x84000008
+        "hvc #0\n\t"                      // PSCI SYSTEM_OFF
+        ::: "x0", "memory"
+    );
+    while (true) asm volatile("wfi");
+}
+
 // ---- MMIO access -----------------------------------------------------------
 // All device registers are memory-mapped on ARM64.
 

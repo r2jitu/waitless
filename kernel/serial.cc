@@ -16,6 +16,7 @@ namespace serial {
 static constexpr uint16_t COM1 = 0x3F8;
 
 // Register offsets from base port
+static constexpr uint16_t RBR = 0; // Receive Buffer Register (read, DLAB=0)
 static constexpr uint16_t THR = 0; // Transmit Holding Register (write, DLAB=0)
 static constexpr uint16_t DLL = 0; // Divisor Latch Low (DLAB=1)
 static constexpr uint16_t DLH = 1; // Divisor Latch High (DLAB=1)
@@ -277,6 +278,32 @@ void printf(const char* fmt, ...) {
 
 done:
     va_end(args);
+}
+
+// ============================================================================
+// Shutdown detection
+// ============================================================================
+
+int try_getc() {
+    // LSR bit 0 = Data Ready: at least one byte is in the RX FIFO
+    if (arch::inb(COM1 + LSR) & 0x01) {
+        return (int)(uint8_t)arch::inb(COM1 + RBR);
+    }
+    return -1;
+}
+
+static bool shutdown_requested = false;
+
+bool check_shutdown() {
+    if (shutdown_requested) return true;
+    int c;
+    while ((c = try_getc()) >= 0) {
+        if (c == 0x03) {  // Ctrl-C byte forwarded by QEMU (signal=off)
+            shutdown_requested = true;
+            return true;
+        }
+    }
+    return false;
 }
 
 } // namespace serial

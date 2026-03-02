@@ -175,6 +175,20 @@ static inline void virtio_write32(uint64_t base, uint32_t v) { outl((uint16_t)ba
 // Hint to the CPU to reduce power during a spin-wait loop.
 static inline void cpu_relax() { asm volatile("pause" ::: "memory"); }
 
+// Power off the machine via QEMU's ACPI PIIX4 PM controller.
+// Writes the S5 sleep command (SLP_TYP=5, SLP_EN) to PM1_CNT at port 0x604.
+// Falls back to halting if the ACPI write has no effect.
+// Never returns.
+[[noreturn]] static inline void shutdown() {
+    // QEMU pc-i440fx: PIIX4 PM I/O base 0x600, PM1_CNT at offset 4 = 0x604.
+    // SLP_TYP=5 in bits [12:10] → 0x1400; SLP_EN in bit 13 → 0x2000.
+    outw(0x0604, 0x3400);
+    // Fallback for Q35 or alternate PM base (some QEMU versions use 0xb000).
+    outw(0xb004, 0x2000);
+    cli();
+    while (true) hlt();
+}
+
 } // namespace arch
 
 #else

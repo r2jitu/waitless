@@ -339,6 +339,14 @@ void Server::run() {
     serial::printf("http: listening on port %u\n", (unsigned)port_);
 
     while (true) {
+        // Ctrl-C from the host terminal arrives as byte 0x03 in the serial RX
+        // FIFO (QEMU passes it through with signal=off).  Check every iteration
+        // so we exit promptly without blocking the network loop.
+        if (serial::check_shutdown()) {
+            serial::printf("http: shutdown requested — stopping server.\n");
+            break;
+        }
+
         // Drive the network stack — processes received packets from virtio-net,
         // advances the TCP state machine for all connections, sends ACKs, etc.
         // This is a direct function call — zero syscall overhead.
@@ -415,6 +423,16 @@ void Server::run() {
             }
         }
     }
+
+    // Graceful shutdown: close all active connections, then the listener.
+    for (int i = 0; i < MAX_ACTIVE; ++i) {
+        if (active_[i].in_use && active_[i].conn) {
+            tcp::close(active_[i].conn);
+            free_active(&active_[i]);
+        }
+    }
+    tcp::close(listener);
+    serial::printf("http: server stopped.\n");
 }
 
 } // namespace http

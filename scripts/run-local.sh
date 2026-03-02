@@ -9,8 +9,8 @@
 #
 # If no path is given, builds and runs the webserver example.
 # Architecture is detected automatically:
-#   • Apple Silicon (arm64) → qemu-system-aarch64 with HVF acceleration
-#   • Intel Mac  (x86_64)  → qemu-system-x86_64  with HVF or software
+#   • Apple Silicon (arm64) → qemu-system-aarch64 with TCG (HVF unavailable; see below)
+#   • Intel Mac  (x86_64)  → qemu-system-x86_64  with HVF if available
 #
 # The VM gets a virtio-net NIC with user-mode networking.
 # Port 8080 on localhost is forwarded to port 80 in the VM.
@@ -55,8 +55,33 @@ fi
 echo "==> Starting QEMU (arch=${HOST_ARCH})"
 echo "    Memory: ${MEMORY}MB  CPUs: ${CPUS}"
 echo "    Network: http://localhost:${HOST_PORT}/ -> VM port 80"
-echo "    Serial console below.  Press Ctrl-A X to exit."
+echo "    Serial console below.  Press Ctrl-C to exit."
 echo ""
+
+# ── Common QEMU output flags ──────────────────────────────────────────────────
+# We use exec so QEMU is Bazel's direct child process.  That way Ctrl-C from
+# the terminal reaches Bazel, which kills QEMU (its direct child) cleanly.
+# If we left a shell in between, Bazel would kill the shell and QEMU would be
+# orphaned and keep running.
+#
+# -display none                 : no graphical window
+# -monitor none                 : no QEMU monitor
+# -chardev stdio,id=s0,signal=off : serial on stdio; "signal=off" (the QEMU
+#                                   default) disables ISIG so Ctrl-C is passed
+#                                   to the VM as byte 0x03 instead of generating
+#                                   SIGINT.  The kernel detects 0x03 in the
+#                                   serial RX FIFO, stops the server, and calls
+#                                   PSCI/ACPI power-off so QEMU exits cleanly.
+#                                   ("signal=on" would send SIGINT to QEMU.)
+# -serial chardev:s0            : attach serial port to the chardev above
+
+QEMU_OUTPUT=(
+    -display none
+    -monitor none
+    -chardev stdio,id=s0,signal=off
+    -serial chardev:s0
+    -no-reboot
+)
 
 # ── ARM64 (Apple Silicon) ────────────────────────────────────────────────────
 if [ "$HOST_ARCH" = "arm64" ]; then
@@ -65,31 +90,19 @@ if [ "$HOST_ARCH" = "arm64" ]; then
         exit 1
     fi
 
-    QEMU_NET=(
-        -device virtio-net-pci,netdev=net0
-        -netdev "user,id=net0,hostfwd=tcp::${HOST_PORT}-:80"
-    )
-    QEMU_BASE=(
-        qemu-system-aarch64
-        -machine virt
-        -kernel "$ELF"
-        -m "${MEMORY}"
-        -smp "${CPUS}"
-        -nographic
-        -serial mon:stdio
-        -no-reboot
-        "${QEMU_NET[@]}"
-    )
-
-    # Use HVF (native hypervisor) if available, otherwise fall back to software TCG.
-    # We detect HVF via sysctl rather than using "exec hvf || exec tcg" — the
-    # latter is broken because exec replaces the shell process, so if QEMU fails
-    # at HVF runtime the fallback is unreachable.
-    if sysctl -n kern.hv_support 2>/dev/null | grep -q '^1$'; then
-        exec "${QEMU_BASE[@]}" -cpu host -accel hvf
-    else
-        exec "${QEMU_BASE[@]}" -cpu cortex-a57
-    fi
+    # HVF is not used on aarch64: Apple's Hypervisor.framework does not guarantee
+    # ISV=1 in ESR_EL2 for device MMIO exits, so QEMU cannot decode or emulate
+    # those accesses.  This affects every device the unikernel touches (GIC,
+    # PCIe ECAM, virtio BARs).  TCG emulates all MMIO correctly.
+    exec qemu-system-aarch64 \
+        -machine virt \
+        -kernel "$ELF" \
+        -m "${MEMORY}" \
+        -smp "${CPUS}" \
+        "${QEMU_OUTPUT[@]}" \
+        -device virtio-net-pci,netdev=net0 \
+        -netdev "user,id=net0,hostfwd=tcp::${HOST_PORT}-:80" \
+        -cpu max
 
 # ── x86_64 (Intel Mac) ───────────────────────────────────────────────────────
 else
@@ -98,22 +111,20 @@ else
         exit 1
     fi
 
-    QEMU_COMMON=(
+    QEMU_X86=(
         qemu-system-x86_64
         -kernel "$ELF"
         -m "${MEMORY}"
         -smp "${CPUS}"
         -cpu qemu64
-        -nographic
-        -serial mon:stdio
-        -no-reboot
+        "${QEMU_OUTPUT[@]}"
         -device virtio-net-pci,netdev=net0
         -netdev "user,id=net0,hostfwd=tcp::${HOST_PORT}-:80"
     )
 
     if sysctl -n kern.hv_support 2>/dev/null | grep -q '^1$'; then
-        exec "${QEMU_COMMON[@]}" -accel hvf
+        exec "${QEMU_X86[@]}" -accel hvf
     else
-        exec "${QEMU_COMMON[@]}"
+        exec "${QEMU_X86[@]}"
     fi
 fi
