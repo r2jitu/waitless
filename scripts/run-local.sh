@@ -71,17 +71,10 @@ fi
 # Set UNIKERNEL_RUNNER=qemu to skip VZ and use QEMU TCG instead.
 RUNNER="${UNIKERNEL_RUNNER:-vz}"
 if [ "$HOST_OS" = "Darwin" ] && [ "$HOST_ARCH" = "arm64" ] && [ "$RUNNER" != "qemu" ]; then
-    RUN_VZ="$SCRIPT_DIR/run-vz"
-    RUN_VZ_SWIFT="$SCRIPT_DIR/run-vz.swift"
+    RUN_VZ="$PROJECT_ROOT/bazel-bin/scripts/run-vz"
 
-    # Compile run-vz on first use or if the Swift source is newer.
-    if [ ! -f "$RUN_VZ" ] || [ "$RUN_VZ_SWIFT" -nt "$RUN_VZ" ]; then
-        echo "==> Compiling run-vz.swift (one-time setup)..."
-        swiftc "$RUN_VZ_SWIFT" -o "$RUN_VZ" -framework Virtualization
-        # VZ.framework requires com.apple.security.virtualization entitlement.
-        codesign --sign - --entitlements "$SCRIPT_DIR/run-vz.entitlements" "$RUN_VZ"
-        echo "    Done."
-    fi
+    # Always build via Bazel — fast no-op if run-vz.swift hasn't changed.
+    (cd "$PROJECT_ROOT" && bazel build //scripts:run_vz)
 
     # run-vz requires a raw ARM64 binary image (.img), not an ELF.
     # When called via "bazel run", run_wrapper.sh already provides a .img.

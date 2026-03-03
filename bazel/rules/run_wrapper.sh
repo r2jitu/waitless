@@ -34,11 +34,12 @@ if [[ ! -f "$ELF" ]]; then
     exit 1
 fi
 
-# On macOS arm64, use the pre-built raw binary image for VZ.framework.
-# run-vz accepts only raw binaries (not ELFs), and Bazel built the .img
-# alongside the .elf via the _img genrule.
-if [[ "$HOST_OS" = "Darwin" && "$HOST_ARCH" = "arm64" && -n "$IMG" && -f "$IMG" ]]; then
-    exec "${WORKSPACE}/scripts/run-local.sh" "$IMG"
+# On macOS arm64, use the Bazel-built VZ.framework runner directly.
+# run-vz accepts only raw binaries (not ELFs), and Bazel built both the
+# .img and run-vz binary as part of this target's dependencies.
+VZ_BIN="${WORKSPACE}/bazel-bin/${UNIKERNEL_VZ_RELPATH:-}"
+if [[ "$HOST_OS" = "Darwin" && "$HOST_ARCH" = "arm64" && -n "$VZ_BIN" && -x "$VZ_BIN" && -f "$IMG" ]]; then
+    exec "$VZ_BIN" "$IMG" "${UNIKERNEL_PORT:-8080}"
 fi
 
 exec "${WORKSPACE}/scripts/run-local.sh" "$ELF"

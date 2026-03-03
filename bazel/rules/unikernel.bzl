@@ -75,12 +75,16 @@ def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
         name = name + "_run",
         srcs = ["//bazel/rules:run_wrapper.sh"],
         data = [":" + name + ".elf"] + select({
-            "//bazel/platforms:aarch64": [":" + name + ".img"],
+            "//bazel/platforms:aarch64": [
+                ":" + name + ".img",
+                "//scripts:run_vz",
+            ],
             "//conditions:default": [],
         }),
         env = {
             "UNIKERNEL_ELF_RELPATH": native.package_name() + "/" + name + ".elf",
             "UNIKERNEL_IMG_RELPATH": native.package_name() + "/" + name + ".img",
+            "UNIKERNEL_VZ_RELPATH": "scripts/run-vz",
         },
         visibility = visibility,
     )

@@ -27,3 +27,6 @@ user.bazelrc
 *.o
 *.elf
 *.iso
+
+# Manually-compiled run-vz binary (superseded by bazel build //scripts:run_vz)
+scripts/run-vz

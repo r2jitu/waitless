@@ -118,9 +118,7 @@ check_prereqs() {
     command -v wrk >/dev/null 2>&1 || die "wrk not found.  Install: brew install wrk"
 
     if [ "$HOST_OS" = "Darwin" ] && [ "$HOST_ARCH" = "arm64" ]; then
-        # VZ path: need swiftc to compile run-vz (if not already compiled)
-        command -v swiftc >/dev/null 2>&1 \
-            || die "swiftc not found.  Install Xcode Command Line Tools: xcode-select --install"
+        : # run-vz is built via Bazel (bazel build //scripts:run_vz)
     elif [ "$HOST_ARCH" = "arm64" ] || [ "$HOST_ARCH" = "aarch64" ]; then
         command -v qemu-system-aarch64 >/dev/null 2>&1 \
             || die "qemu-system-aarch64 not found.  Install: brew install qemu  OR  sudo apt install qemu-system-arm"
@@ -193,12 +191,9 @@ bench_unikernel() {
         # Run with stdin from /dev/null (no terminal) and stdout to the log.
         # isatty() returns 0 so enableRawInput() is a no-op.  The serial
         # console writes to stdout → log; stderr (VZ banner) goes to log too.
-        local RUN_VZ="$SCRIPT_DIR/run-vz"
-        if [ ! -f "$RUN_VZ" ] || [ "$SCRIPT_DIR/run-vz.swift" -nt "$RUN_VZ" ]; then
-            echo "  Compiling run-vz.swift (one-time setup)..."
-            swiftc "$SCRIPT_DIR/run-vz.swift" -o "$RUN_VZ" -framework Virtualization
-            codesign --sign - --entitlements "$SCRIPT_DIR/run-vz.entitlements" "$RUN_VZ"
-        fi
+        local RUN_VZ="$PROJECT_ROOT/bazel-bin/scripts/run-vz"
+        # Always build via Bazel — fast no-op if run-vz.swift hasn't changed.
+        (cd "$PROJECT_ROOT" && bazel build //scripts:run_vz 2>&1 | grep -E '(INFO|ERROR|WARNING|Target)' | tail -3) || true
         UNIKERNEL_MEMORY=128 "$RUN_VZ" "$img" "$BENCH_PORT" \
             </dev/null >"$log" 2>&1 &
         QEMU_PID=$!
