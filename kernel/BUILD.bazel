@@ -3,6 +3,45 @@ load("@rules_cc//cc:cc_library.bzl", "cc_library")
 package(default_visibility = ["//visibility:public"])
 
 cc_library(
+    name = "arch_h",
+    hdrs = ["arch.h"] + select({
+        "//bazel/platforms:aarch64": [
+            "aarch64/arch.h",
+            "aarch64/timer.h",
+        ],
+        "//conditions:default": [],
+    }),
+    copts = ["-I."],
+)
+
+cc_library(
+    name = "fdt",
+    srcs = select({
+        "//bazel/platforms:aarch64": ["fdt.cc"],
+        "//conditions:default": [],
+    }),
+    hdrs = ["fdt.h"],
+    copts = ["-I."],
+)
+
+cc_library(
+    name = "mmu",
+    srcs = select({
+        "//bazel/platforms:aarch64": ["aarch64/mmu.cc"],
+        "//conditions:default": [],
+    }),
+    hdrs = select({
+        "//bazel/platforms:aarch64": ["aarch64/mmu.h"],
+        "//conditions:default": [],
+    }),
+    deps = select({
+        "//bazel/platforms:aarch64": [":boot"],  # boot_l1_table in boot.S
+        "//conditions:default": [],
+    }),
+    copts = ["-I."],
+)
+
+cc_library(
     name = "core",
     srcs = [
         "mm.cc",
@@ -13,14 +52,14 @@ cc_library(
         "//conditions:default": ["serial.cc"],
     }),
     hdrs = [
-        "arch.h",
         "serial.h",
         "mm.h",
         "panic.h",
-    ] + select({
+    ],
+    deps = [":arch_h", ":fdt"] + select({
         "//bazel/platforms:aarch64": [
-            "aarch64/arch.h",
-            "aarch64/timer.h",
+            "//drivers:virtio_console",
+            "//drivers:virtio_pci",
         ],
         "//conditions:default": [],
     }),
@@ -51,7 +90,7 @@ cc_library(
             "idt.h",
         ],
     }),
-    deps = [":core"],
+    deps = [":core", ":fdt"],
     copts = ["-I."],
 )
 
@@ -70,9 +109,14 @@ cc_library(
     deps = [
         ":core",
         ":arch_init",
+        ":fdt",
+        "//drivers:pci",
         "//drivers:virtio_net",
         "//net",
-    ],
+    ] + select({
+        "//bazel/platforms:aarch64": [":mmu"],
+        "//conditions:default": [],
+    }),
     copts = [
         "-I.",
         "-Iinclude",

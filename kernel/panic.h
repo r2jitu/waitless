@@ -20,11 +20,9 @@
     serial::puts(msg);
     serial::puts("\nSystem halted.\n");
 
-    // Infinite halt loop — the machine stops here
-    for (;;) {
-        arch::cli();
-        arch::hlt();
-    }
+    // Shut down via PSCI so hypervisors (VZ, QEMU) exit cleanly.
+    // On bare metal, this falls through to an infinite WFE loop.
+    arch::shutdown();
 }
 
 // Assertion macro for kernel invariant checking.

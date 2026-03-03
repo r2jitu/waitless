@@ -42,17 +42,45 @@ def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
         visibility = visibility,
     )
 
-    # "bazel run //apps/<name>:run" — builds the ELF then launches QEMU.
-    # Works for both x86_64 (default) and aarch64 (--config=aarch64).
-    # UNIKERNEL_ELF_RELPATH tells run_wrapper.sh where to find the ELF inside
-    # bazel-bin/.  BUILD_WORKSPACE_DIRECTORY (set by "bazel run") provides the
-    # workspace root so the wrapper can reach scripts/run-local.sh.
+    # Flat binary image for ARM64 bootloaders (VZ.framework, QEMU -kernel).
+    # Converts ELF → raw binary via llvm-objcopy at build time so the
+    # runtime tools (run-vz, run-local.sh) don't need to do it themselves.
+    native.genrule(
+        name = name + ".img",
+        srcs = [":" + name + ".elf"],
+        outs = [name + ".img"],
+        cmd = """
+            OC=""
+            for p in /opt/homebrew/opt/llvm/bin/llvm-objcopy \
+                     /usr/local/bin/llvm-objcopy \
+                     /usr/bin/llvm-objcopy \
+                     llvm-objcopy; do
+                if command -v "$$p" >/dev/null 2>&1 || [ -x "$$p" ]; then
+                    OC=$$p; break
+                fi
+            done
+            if [ -z "$$OC" ]; then
+                echo "ERROR: llvm-objcopy not found. Install: brew install llvm" >&2
+                exit 1
+            fi
+            $$OC -O binary $(location :{name_elf}) $@
+        """.format(name_elf = name + ".elf"),
+        visibility = visibility,
+    )
+
+    # "bazel run //apps/<name>:run" — builds the ELF (and IMG on aarch64) then
+    # launches the appropriate runner.  On macOS arm64, run_wrapper.sh passes
+    # the pre-built .img to run-local.sh → run-vz (no runtime ELF conversion).
     sh_binary(
         name = name + "_run",
         srcs = ["//bazel/rules:run_wrapper.sh"],
-        data = [":" + name + ".elf"],
+        data = [":" + name + ".elf"] + select({
+            "//bazel/platforms:aarch64": [":" + name + ".img"],
+            "//conditions:default": [],
+        }),
         env = {
             "UNIKERNEL_ELF_RELPATH": native.package_name() + "/" + name + ".elf",
+            "UNIKERNEL_IMG_RELPATH": native.package_name() + "/" + name + ".img",
         },
         visibility = visibility,
     )

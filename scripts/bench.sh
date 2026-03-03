@@ -4,7 +4,9 @@
 # Measures and compares throughput and latency for three configurations,
 # all running the SAME minimal poll()-based HTTP server (bench_server.c):
 #
-#   1. Unikernel       — our bare-metal HTTP server running in QEMU (TCG)
+#   1. Unikernel       — our bare-metal HTTP server
+#                        macOS arm64: VZ.framework (hardware-accelerated)
+#                        other:       QEMU (TCG software emulation)
 #   2. Linux (Docker)  — bench_server compiled for Linux, running in Docker
 #                        (Apple Virtualization.framework on Apple Silicon)
 #   3. macOS (native)  — bench_server compiled natively on the host, no VM
@@ -30,7 +32,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-HOST_ARCH="$(uname -m)"   # arm64 or x86_64
+HOST_OS="$(uname -s)"     # Darwin or Linux
+HOST_ARCH="$(uname -m)"   # arm64/aarch64 or x86_64
 
 # ── Benchmark parameters (override via environment) ──────────────────────────
 BENCH_PORT="${BENCH_PORT:-18080}"     # separate from the dev port (8080)
@@ -62,11 +65,18 @@ trap cleanup EXIT INT TERM
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 wait_ready() {
-    local port=$1 max=${2:-60} elapsed=0
+    local port=$1 max=${2:-60} pid=${3:-""}
+    local elapsed=0
     printf "  Waiting for server on port %s... " "$port"
     while ! curl -sf "http://localhost:${port}${ENDPOINT}" >/dev/null 2>&1; do
         if [ $elapsed -ge $max ]; then
             echo "TIMEOUT after ${max}s"
+            return 1
+        fi
+        # Detect if the background process has already crashed so we don't
+        # spend the full timeout waiting for a server that will never arrive.
+        if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+            echo "CRASHED (process exited unexpectedly)"
             return 1
         fi
         sleep 1
@@ -107,12 +117,16 @@ check_prereqs() {
     echo "==> Checking prerequisites..."
     command -v wrk >/dev/null 2>&1 || die "wrk not found.  Install: brew install wrk"
 
-    if [ "$HOST_ARCH" = "arm64" ]; then
+    if [ "$HOST_OS" = "Darwin" ] && [ "$HOST_ARCH" = "arm64" ]; then
+        # VZ path: need swiftc to compile run-vz (if not already compiled)
+        command -v swiftc >/dev/null 2>&1 \
+            || die "swiftc not found.  Install Xcode Command Line Tools: xcode-select --install"
+    elif [ "$HOST_ARCH" = "arm64" ] || [ "$HOST_ARCH" = "aarch64" ]; then
         command -v qemu-system-aarch64 >/dev/null 2>&1 \
-            || die "qemu-system-aarch64 not found.  Install: brew install qemu"
+            || die "qemu-system-aarch64 not found.  Install: brew install qemu  OR  sudo apt install qemu-system-arm"
     else
         command -v qemu-system-x86_64 >/dev/null 2>&1 \
-            || die "qemu-system-x86_64 not found.  Install: brew install qemu"
+            || die "qemu-system-x86_64 not found.  Install: brew install qemu  OR  sudo apt install qemu-system-x86"
     fi
     echo "  wrk:    $(wrk --version 2>&1 | head -1)"
 
@@ -140,51 +154,87 @@ check_prereqs() {
     echo ""
 }
 
-# ── Benchmark 1: Unikernel in QEMU ───────────────────────────────────────────
+# ── Benchmark 1: Unikernel ────────────────────────────────────────────────────
 bench_unikernel() {
-    echo "==> [1/3] Unikernel — bare-metal in QEMU (TCG software emulation)"
+    local label runner
+    if [ "${UNIKERNEL_RUNNER:-}" = "qemu" ]; then
+        label="Unikernel (QEMU TCG)"
+        runner="qemu"
+    elif [ "$HOST_OS" = "Darwin" ] && [ "$HOST_ARCH" = "arm64" ]; then
+        label="Unikernel (VZ.framework)"
+        runner="vz"
+    else
+        label="Unikernel (QEMU TCG)"
+        runner="qemu"
+    fi
+    echo "==> [1/3] $label"
 
-    echo "  Building unikernel ELF..."
+    echo "  Building unikernel image..."
     cd "$PROJECT_ROOT"
-    bazel build //apps/webserver:webserver.elf 2>&1 | \
-        grep -E '(INFO|ERROR|WARNING|Target)' | tail -3 || true
-    local elf="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver.elf"
-    [ -f "$elf" ] || die "ELF not found: $elf"
+    if [ "$runner" = "vz" ] || [ "$HOST_ARCH" = "arm64" ] || [ "$HOST_ARCH" = "aarch64" ]; then
+        # Build raw binary image (ELF→img conversion happens at Bazel build time).
+        bazel build //apps/webserver:webserver.img 2>&1 | \
+            grep -E '(INFO|ERROR|WARNING|Target)' | tail -3 || true
+        local img="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver.img"
+        [ -f "$img" ] || die "IMG not found: $img"
+    else
+        bazel build //apps/webserver:webserver.elf 2>&1 | \
+            grep -E '(INFO|ERROR|WARNING|Target)' | tail -3 || true
+        local elf="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver.elf"
+        [ -f "$elf" ] || die "ELF not found: $elf"
+    fi
 
     local log="/tmp/unikernel-bench.log"
     rm -f "$log"
 
-    # Start QEMU in the background.
-    # -chardev file routes serial output to a log without needing a terminal.
-    if [ "$HOST_ARCH" = "arm64" ]; then
-        # virtio-net-device (MMIO) is simpler than virtio-net-pci and avoids
-        # the PCIe ECAM bus scan in the kernel.
-        # Note: HVF is not used — QEMU on ARM64 aborts on ISV=0 exits from
-        # UART/GIC MMIO accesses, which is a separate limitation from PCIe ECAM.
-        qemu-system-aarch64 \
-            -machine virt \
-            -kernel "$elf" \
-            -m 128 -smp 1 -cpu max \
-            -display none -monitor none \
-            -chardev "file,id=s0,path=${log}" -serial chardev:s0 \
-            -no-reboot \
-            -device virtio-net-device,netdev=net0 \
-            -netdev "user,id=net0,hostfwd=tcp::${BENCH_PORT}-:80" \
-            </dev/null >/dev/null 2>&1 &
-    else
-        qemu-system-x86_64 \
-            -kernel "$elf" \
-            -m 128 -smp 1 -cpu qemu64 \
-            -display none -monitor none \
-            -chardev "file,id=s0,path=${log}" -serial chardev:s0 \
-            -no-reboot \
-            -device virtio-net-pci,netdev=net0 \
-            -netdev "user,id=net0,hostfwd=tcp::${BENCH_PORT}-:80" \
-            </dev/null >/dev/null 2>&1 &
-    fi
-    QEMU_PID=$!
+    if [ "$runner" = "vz" ]; then
+        # ── macOS arm64: use VZ.framework via run-vz ─────────────────────────
+        # run-vz accepts a pre-built raw binary image (.img).
+        # Run with stdin from /dev/null (no terminal) and stdout to the log.
+        # isatty() returns 0 so enableRawInput() is a no-op.  The serial
+        # console writes to stdout → log; stderr (VZ banner) goes to log too.
+        local RUN_VZ="$SCRIPT_DIR/run-vz"
+        if [ ! -f "$RUN_VZ" ] || [ "$SCRIPT_DIR/run-vz.swift" -nt "$RUN_VZ" ]; then
+            echo "  Compiling run-vz.swift (one-time setup)..."
+            swiftc "$SCRIPT_DIR/run-vz.swift" -o "$RUN_VZ" -framework Virtualization
+            codesign --sign - --entitlements "$SCRIPT_DIR/run-vz.entitlements" "$RUN_VZ"
+        fi
+        UNIKERNEL_MEMORY=128 "$RUN_VZ" "$img" "$BENCH_PORT" \
+            </dev/null >"$log" 2>&1 &
+        QEMU_PID=$!
 
-    if ! wait_ready "$BENCH_PORT" 90; then
+    else
+        # ── QEMU path (Linux or macOS x86_64) ────────────────────────────────
+        if [ "$HOST_ARCH" = "arm64" ] || [ "$HOST_ARCH" = "aarch64" ]; then
+            # arm64: use the pre-built raw binary image (PIE ELF loads wrong in QEMU).
+            qemu-system-aarch64 \
+                -machine virt \
+                -kernel "$img" \
+                -m 128 -smp 1 -cpu max \
+                -display none -monitor none \
+                -chardev "file,id=s0,path=${log}" -serial chardev:s0 \
+                -no-reboot \
+                -device virtio-net-device,netdev=net0 \
+                -netdev "user,id=net0,hostfwd=tcp::${BENCH_PORT}-:80" \
+                </dev/null >/dev/null 2>&1 &
+            QEMU_PID=$!
+        else
+            qemu-system-x86_64 \
+                -kernel "$elf" \
+                -m 128 -smp 1 -cpu qemu64 \
+                -display none -monitor none \
+                -chardev "file,id=s0,path=${log}" -serial chardev:s0 \
+                -no-reboot \
+                -device virtio-net-pci,netdev=net0 \
+                -netdev "user,id=net0,hostfwd=tcp::${BENCH_PORT}-:80" \
+                </dev/null >/dev/null 2>&1 &
+            QEMU_PID=$!
+        fi
+    fi
+
+    local timeout=60
+    [ "$runner" = "vz" ] && timeout=30  # VZ boots much faster than TCG
+    if ! wait_ready "$BENCH_PORT" "$timeout" "$QEMU_PID"; then
         echo "  Boot log (last 30 lines):"
         tail -30 "$log" 2>/dev/null || echo "  (no log)"
         kill -TERM "$QEMU_PID" 2>/dev/null; QEMU_PID=""
@@ -198,7 +248,7 @@ bench_unikernel() {
     kill -TERM "$QEMU_PID" 2>/dev/null; wait "$QEMU_PID" 2>/dev/null || true
     QEMU_PID=""
 
-    LABELS+=("Unikernel (QEMU TCG)")
+    LABELS+=("$label")
     RPS_ARR+=("$rps")
     P50_ARR+=("$p50")
     P99_ARR+=("$p99")
@@ -301,9 +351,14 @@ print_results() {
     Connection: close (no keep-alive) after every response, matching the
     unikernel's HTTP/1.0-style behaviour.
 
-  Unikernel (QEMU TCG): every instruction is translated in software by QEMU's
-    TCG emulator.  Network packets also traverse virtio-net emulation.  Both
-    TCG cost and virtio overhead are included in the latency numbers.
+  Unikernel (VZ.framework): on macOS arm64, the unikernel runs inside Apple
+    Virtualization.framework (hardware-accelerated HVF).  No QEMU TCG overhead.
+    Network goes through a user-space Ethernet bridge (run-vz) that proxies
+    TCP connections — latency includes this proxy overhead.
+
+  Unikernel (QEMU TCG): on other platforms, every instruction is translated
+    in software by QEMU's TCG emulator.  Network packets also traverse
+    virtio-net emulation.  Both TCG cost and virtio overhead are included.
 
   bench_server/Linux (Docker): on Apple Silicon, Docker uses Apple
     Virtualization.framework (hardware-accelerated VM), NOT QEMU TCG.
@@ -325,7 +380,7 @@ NOTES
 echo ""
 echo "══════════════════════════════════════════════════════════════════════"
 echo "  HTTP Server Benchmark  (same server code, three environments)"
-echo "  Unikernel (QEMU) · Linux/bench_server (Docker) · macOS (native)"
+echo "  Unikernel (VZ/QEMU) · Linux/bench_server (Docker) · macOS (native)"
 echo "══════════════════════════════════════════════════════════════════════"
 echo ""
 

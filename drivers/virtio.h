@@ -77,6 +77,18 @@ namespace mmio {
     static constexpr uint32_t STATUS         = 0x070; // device status        (r/w)
     static constexpr uint32_t DEVICE_CONFIG  = 0x100; // device-specific config
     static constexpr uint32_t MAGIC          = 0x74726976u; // "virt"
+
+    // Version 2 (modern VirtIO 1.0+) additional register offsets.
+    // v1 registers at 0x010/0x020/0x030/0x034/0x038/0x070/0x100 are shared.
+    static constexpr uint32_t DEVICE_FEATURES_SEL = 0x014; // v2: select feature word (0=lo,1=hi)
+    static constexpr uint32_t DRIVER_FEATURES_SEL = 0x024; // v2: select driver feature word
+    static constexpr uint32_t QUEUE_READY         = 0x044; // v2: write 1 to activate queue
+    static constexpr uint32_t QUEUE_DESC_LOW      = 0x080; // v2: descriptor table phys lo 32b
+    static constexpr uint32_t QUEUE_DESC_HIGH     = 0x084; // v2: descriptor table phys hi 32b
+    static constexpr uint32_t QUEUE_DRIVER_LOW    = 0x090; // v2: available ring phys lo 32b
+    static constexpr uint32_t QUEUE_DRIVER_HIGH   = 0x094; // v2: available ring phys hi 32b
+    static constexpr uint32_t QUEUE_DEVICE_LOW    = 0x0a0; // v2: used ring phys lo 32b
+    static constexpr uint32_t QUEUE_DEVICE_HIGH   = 0x0a4; // v2: used ring phys hi 32b
 } // namespace mmio
 
 // ============================================================================
@@ -131,7 +143,16 @@ public:
     //
     // Returns true on success.
     bool init(uint16_t queue_size, uint64_t base, uint16_t queue_index,
-              bool is_mmio = false);
+              bool is_mmio = false, bool is_mmio_v2 = false);
+
+    // Initialize for modern PCI transport (VirtIO 1.0+).
+    // Allocates ring memory and sets up pointers, but does NOT write to device
+    // registers — the caller uses virtio_pci::set_queue_addrs() for that.
+    // Returns physical addresses of the three ring regions via output params.
+    bool init_pci_modern(uint16_t queue_size, uint64_t notify_addr,
+                         uint16_t queue_index,
+                         uint64_t* desc_phys, uint64_t* avail_phys,
+                         uint64_t* used_phys);
 
     // Add a buffer chain to the available ring.
     //
@@ -157,6 +178,9 @@ public:
     // Get the descriptor at a given index (for reading buffer addresses)
     VirtqDesc* desc(uint16_t idx) { return &descs_[idx]; }
 
+    // Debug: return the physical address of the used ring (for range validation)
+    uintptr_t used_ring_addr() const { return reinterpret_cast<uintptr_t>(used_); }
+
 private:
     VirtqDesc*  descs_  = nullptr;  // Descriptor table
     VirtqAvail* avail_  = nullptr;  // Available ring
@@ -166,6 +190,7 @@ private:
     uint16_t num_free_      = 0;    // Number of free descriptors remaining
     uint16_t last_used_idx_ = 0;    // Last used ring index we processed
     uint64_t io_base_       = 0;    // Device base (I/O port on x86, MMIO on ARM64)
+    uint64_t notify_addr_   = 0;    // Modern PCI: MMIO address for queue notify
     uint16_t queue_index_   = 0;    // This queue's index (for notify)
     bool     is_mmio_       = false; // true = virtio-mmio transport
     bool*    desc_used_     = nullptr; // Tracks which descriptors are in use

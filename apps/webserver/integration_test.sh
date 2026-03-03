@@ -27,10 +27,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# ---- Locate the webserver ELF -----------------------------------------------
+# ---- Locate the webserver binary --------------------------------------------
 # Bazel sets RUNFILES_DIR when running via "bazel test".
 RUNFILES="${RUNFILES_DIR:-${BASH_SOURCE[0]%.sh}.runfiles}"
 ELF="${RUNFILES}/_main/apps/webserver/webserver.elf"
+IMG="${RUNFILES}/_main/apps/webserver/webserver.img"
 
 if [[ ! -f "$ELF" ]]; then
     echo "ERROR: webserver.elf not found at $ELF" >&2
@@ -42,10 +43,19 @@ ELF_INFO="$(file "$ELF" 2>/dev/null || echo "")"
 
 if echo "$ELF_INFO" | grep -q "ARM aarch64"; then
     QEMU_BIN="qemu-system-aarch64"
-    QEMU_MACHINE_ARGS=(-machine virt -cpu cortex-a57)
+    QEMU_MACHINE_ARGS=(-machine virt -cpu max)
+    VIRTIO_NET_DEV="virtio-net-device"
+    # ARM64 QEMU -kernel expects a raw binary with ARM64 Image header, not ELF.
+    KERNEL="$IMG"
+    if [[ ! -f "$KERNEL" ]]; then
+        echo "ERROR: webserver.img not found at $IMG" >&2
+        exit 1
+    fi
 elif echo "$ELF_INFO" | grep -q "x86-64"; then
     QEMU_BIN="qemu-system-x86_64"
     QEMU_MACHINE_ARGS=(-cpu qemu64)
+    VIRTIO_NET_DEV="virtio-net-pci"
+    KERNEL="$ELF"
 else
     echo "ERROR: could not detect ELF architecture from: $ELF_INFO" >&2
     exit 1
@@ -62,18 +72,18 @@ PORT="${TEST_PORT:-18099}"
 # ---- Launch QEMU in the background ------------------------------------------
 QEMU_LOG="$(mktemp /tmp/unikernel_test_XXXXXX.log)"
 
-echo "==> Booting webserver in $QEMU_BIN (ELF: $(basename "$ELF"))..."
+echo "==> Booting webserver in $QEMU_BIN (kernel: $(basename "$KERNEL"))..."
 echo "    Port: localhost:${PORT} → VM:80"
 
 "$QEMU_BIN" \
     "${QEMU_MACHINE_ARGS[@]}" \
-    -kernel "$ELF" \
+    -kernel "$KERNEL" \
     -m 128 \
     -smp 1 \
     -nographic \
     -serial "file:${QEMU_LOG}" \
     -no-reboot \
-    -device virtio-net-pci,netdev=net0 \
+    -device "${VIRTIO_NET_DEV}",netdev=net0 \
     -netdev "user,id=net0,hostfwd=tcp::${PORT}-:80" \
     &>/dev/null &
 

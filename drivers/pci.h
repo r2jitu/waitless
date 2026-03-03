@@ -76,9 +76,14 @@ const Device* get_devices(int* count);
 // Required for DMA-capable devices like virtio.
 void enable_bus_mastering(const Device& dev);
 
-// Read and decode a Base Address Register.
+// Read and decode a Base Address Register (32-bit result).
 // For I/O BARs (bit 0 set): masks off lower 2 bits.
 // For memory BARs: masks off lower 4 bits. Checks bits 1-2 for 32/64-bit type.
 uint32_t read_bar(const Device& dev, int bar_idx);
+
+// Read a 64-bit BAR address.  For 64-bit memory BARs (type bits [2:1] = 0b10),
+// combines bar[idx] and bar[idx+1].  For 32-bit BARs, returns the 32-bit value.
+// Essential for VZ.framework which places BARs above 4GB.
+uint64_t read_bar64(const Device& dev, int bar_idx);
 
 } // namespace pci

@@ -20,6 +20,9 @@
 #include "kernel/mm.h"
 #include "kernel/serial.h"
 #include "kernel/panic.h"
+#if defined(__aarch64__)
+#include "kernel/fdt.h"
+#endif
 
 // Linker-provided symbol marking the end of the kernel image
 extern "C" uint8_t _kernel_end[];
@@ -155,22 +158,22 @@ void init(uint64_t boot_info_addr) {
     uint64_t bitmap_end;
 
 #if defined(__aarch64__)
-    // ---- ARM64 / QEMU virt: fixed memory layout -------------------------
-    // QEMU virt machine places RAM at 0x40000000. We don't have a multiboot2
-    // memory map; instead we derive available memory from the linker-provided
-    // _kernel_end symbol and assume the configured RAM size.
-    //
-    // The boot_info_addr argument is the DTB address — we don't parse it,
-    // but we use the RAM start + QEMU's default 128 MB assumption.
-    static constexpr uint64_t QEMU_RAM_BASE = 0x40000000ULL;
-    static constexpr uint64_t QEMU_RAM_SIZE = 128ULL * 1024 * 1024; // 128 MB
+    // ---- ARM64: use FDT-discovered RAM base and size -------------------------
+    // VZ.framework maps RAM at GPA 0x00000000; QEMU virt uses 0x40000000.
+    // We read the base and size from the /memory node parsed by fdt::init().
+    // If the FDT didn't supply a memory node (dtb_addr==0 or missing node),
+    // fall back to the QEMU virt default of 128 MB at 0x40000000.
+    const fdt::Info& fdt_mem = fdt::info();
+    uint64_t ram_base = (fdt_mem.ram_size != 0) ? fdt_mem.ram_base : 0x40000000ULL;
+    uint64_t ram_size = (fdt_mem.ram_size != 0) ? fdt_mem.ram_size
+                                                 : 128ULL * 1024 * 1024;
 
-    max_physical_addr  = QEMU_RAM_BASE + QEMU_RAM_SIZE;
-    total_memory_bytes = QEMU_RAM_SIZE;
+    max_physical_addr  = ram_base + ram_size;
+    total_memory_bytes = ram_size;
 
-    serial::printf("  Physical memory: %u MB (QEMU virt, 0x%lx-0x%lx)\n",
-                   (unsigned)(QEMU_RAM_SIZE / (1024 * 1024)),
-                   QEMU_RAM_BASE, max_physical_addr);
+    serial::printf("  Physical memory: %u MB (FDT/ARM64, 0x%lx-0x%lx)\n",
+                   (unsigned)(ram_size / (1024 * 1024)),
+                   ram_base, max_physical_addr);
 
     // Frame bitmap placed after the kernel image
     total_frames       = max_physical_addr / PAGE_SIZE;
@@ -193,8 +196,8 @@ void init(uint64_t boot_info_addr) {
         }
     }
 
-    // Keep the RAM base and kernel reserved
-    mark_frames_used(QEMU_RAM_BASE, bitmap_end);
+    // Keep the RAM base through kernel+bitmap reserved
+    mark_frames_used(ram_base, bitmap_end);
 
 #else
     // ---- x86_64: parse boot info (multiboot2 or PVH hvm_start_info) -----

@@ -14,6 +14,7 @@
 
 #include "net/http.h"
 #include "net/tcp.h"
+#include "kernel/arch.h"
 #include "kernel/serial.h"
 #include "kernel/mm.h"
 
@@ -339,22 +340,18 @@ void Server::run() {
     serial::printf("http: listening on port %u\n", (unsigned)port_);
 
     while (true) {
-        // Ctrl-C from the host terminal arrives as byte 0x03 in the serial RX
-        // FIFO (QEMU passes it through with signal=off).  Check every iteration
-        // so we exit promptly without blocking the network loop.
         if (serial::check_shutdown()) {
             serial::printf("http: shutdown requested — stopping server.\n");
             break;
         }
-
-        // Drive the network stack — processes received packets from virtio-net,
-        // advances the TCP state machine for all connections, sends ACKs, etc.
-        // This is a direct function call — zero syscall overhead.
         tcp::poll();
+
+        bool had_work = false;
 
         // ---- Accept new connections ----------------------------------------
         tcp::Connection* new_conn = tcp::accept(listener);
         if (new_conn) {
+            had_work = true;
             ActiveConn* ac = alloc_active();
             if (ac) {
                 ac->conn = new_conn;
@@ -375,6 +372,7 @@ void Server::run() {
             // Connection died?
             if (conn->state == tcp::State::CLOSED) {
                 free_active(ac);
+                had_work = true;
                 continue;
             }
 
@@ -386,6 +384,7 @@ void Server::run() {
                                            ac->buf + ac->buf_len,
                                            avail);
                     ac->buf_len += got;
+                    had_work = true;
                 }
             }
 
@@ -405,6 +404,7 @@ void Server::run() {
                     send_response(conn, resp);
                     tcp::close(conn);
                     free_active(ac);
+                    had_work = true;
 
                     // (Optional) log
                     const char* method_str =
@@ -421,6 +421,11 @@ void Server::run() {
                     free_active(ac);
                 }
             }
+        }
+
+        // If we did nothing this iteration, yield to reduce CPU burn.
+        if (!had_work) {
+            arch::cpu_relax();
         }
     }
 

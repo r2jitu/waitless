@@ -1,16 +1,21 @@
 // kernel/aarch64/boot.S — ARM64 boot entry point
 //
 // Implements the Linux ARM64 Image boot protocol so QEMU "-kernel" can load
-// and execute this binary directly.  On entry from QEMU:
+// and execute this binary directly.  On entry from QEMU or VZ.framework:
 //   x0  = physical address of the Device Tree Blob (DTB)
 //   x1-x3 = 0 (reserved)
-//   PC  = load address (0x40000000 for QEMU virt)
+//   PC  = load address (0x40000000 for QEMU virt, 0x00000000 for VZ)
 //   EL  = EL2 or EL1, MMU off, caches off
 //
+// The kernel is linked at 0x00000000 with -fPIC/--pie (PIE).
+// boot.S applies .rela.dyn relocations so absolute pointers in .data,
+// vtables, and __init_array are correct at the actual load address.
+//
 // This code:
+//   0. Applies R_AARCH64_RELATIVE relocations from .rela.dyn (load_base = adr(_start))
 //   1. Stores the DTB address
 //   2. Drops from EL2 to EL1 if needed
-//   3. Sets up minimal ARM64 page tables (identity map first 4GB)
+//   3. Sets up minimal ARM64 page tables (identity map first 4GB, all normal-cached)
 //   4. Enables MMU + D-cache + I-cache
 //   5. Installs the exception vector table
 //   6. Zeroes BSS
@@ -32,7 +37,7 @@ _start:
     .quad   0x0000000000000000
 
     // Offset +16: image_size (set at link time via _end - _start)
-    .quad   0
+    .quad   _end - _start
 
     // Offset +24: flags
     //   bit 0: BE=0 (little endian)
@@ -55,6 +60,46 @@ _start:
 primary_entry:
     // Save DTB address (x0) in a callee-saved register before we modify x0
     mov     x21, x0
+
+    // ---- Apply R_AARCH64_RELATIVE relocations from .rela.dyn ---------------
+    //
+    // The kernel is linked at 0x00000000 with --pie.  The actual load address
+    // (load_base) differs from the link address:
+    //   QEMU:   loaded at 0x40000000 → load_base = 0x40000000
+    //   VZ:     loaded at 0x00000000 → load_base = 0 (all adds are no-ops)
+    //
+    // For each R_AARCH64_RELATIVE entry (r_info & 0xFFFFFFFF == 1027 / 0x403):
+    //   *(load_base + r_offset) = load_base + r_addend
+    //
+    // Registers used (callee-saved to avoid conflicts with EL2→EL1 code):
+    //   x22 = load_base  (adr of _start)
+    //   x23 = pointer into .rela.dyn (current entry)
+    //   x24 = __rela_end  (end sentinel)
+    //   x25 = r_offset
+    //   x26 = r_info (low 32 bits = relocation type)
+    //   x27 = r_addend
+    //
+    // adrp+add generates PC-relative references so it works before relocation.
+    // No stack is needed — all register operations + memory stores only.
+    //
+    adr     x22, _start                         // load_base = runtime _start
+    adrp    x23, __rela_start
+    add     x23, x23, :lo12:__rela_start
+    adrp    x24, __rela_end
+    add     x24, x24, :lo12:__rela_end
+.Lrela_loop:
+    cmp     x23, x24
+    bge     .Lrela_done
+    ldp     x25, x26, [x23], #16        // r_offset, r_info; x23 += 16
+    ldr     x27, [x23], #8              // r_addend;         x23 += 8 (total: +24)
+    and     x26, x26, #0xffffffff       // extract reloc type from low 32 bits
+    cmp     x26, #1027                  // R_AARCH64_RELATIVE = 1027 (0x403)
+    bne     .Lrela_loop                 // skip non-RELATIVE entries
+    add     x25, x25, x22              // slot address = load_base + r_offset
+    add     x27, x27, x22              // value        = load_base + r_addend
+    str     x27, [x25]                  // patch the slot
+    b       .Lrela_loop
+.Lrela_done:
 
     // ---- Drop from EL2 to EL1 (if started at EL2) -------------------------
     mrs     x0, CurrentEL
@@ -81,6 +126,13 @@ primary_entry:
     eret
 
 .Lel1_entry:
+    // ---- Mask all interrupts (DAIF = 0xF) ----------------------------------
+    // VZ.framework starts the guest at EL1 directly (no EL2 eret) with
+    // DAIF potentially unmasked.  Any IRQ before we handle it properly
+    // would call exception_handler(1) → panic → WFE loop → VM killed.
+    // Mask here unconditionally before any other EL1 setup.
+    msr     daifset, #0xf
+
     // ---- Enable FP/NEON at EL1 (CPACR_EL1.FPEN = 0b11) -------------------
     // After reset, FPEN defaults to 0b00 which traps all FP/NEON instructions.
     // The compiler emits NEON instructions (e.g., for memset/memcpy), so we
@@ -139,12 +191,17 @@ primary_entry:
 // ARM64 address layout with T0SZ=25 (39-bit VA, 4KB granule):
 //   TTBR0 → L1 table (512 × 8-byte entries, each covers 1GB)
 //
-// Mapping:
-//   L1[  0]: 0x0000_0000_0000 – 0x0000_003F_FFFF  (1GB, device nGnRnE) — GIC, low MMIO
+// Mapping (all first-4GB as normal-cached):
+//   L1[  0]: 0x0000_0000_0000 – 0x0000_003F_FFFF  (1GB, normal cached) — VZ RAM / GIC MMIO
 //   L1[  1]: 0x0000_4000_0000 – 0x0000_7FFF_FFFF  (1GB, normal cached) — QEMU virt RAM
 //   L1[  2]: 0x0000_8000_0000 – 0x0000_BFFF_FFFF  (1GB, normal cached) — more RAM
 //   L1[  3]: 0x0000_C000_0000 – 0x0000_FFFF_FFFF  (1GB, normal cached) — more RAM
 //   L1[256]: 0x0040_0000_0000 – 0x0040_3FFF_FFFF  (1GB, device nGnRnE) — PCIe ECAM
+//
+// Why all-normal-cached for the first 4GB?
+//   • QEMU TCG: intercepts MMIO by device registration, ignoring Stage-1 attrs.
+//   • VZ/HVF/KVM: hypervisor Stage-2 maps MMIO regions as device, overriding
+//     the guest Stage-1 normal-cached setting.  No guest GIC driver needed.
 // ============================================================================
 
 setup_mmu:
@@ -175,19 +232,21 @@ setup_mmu:
     adr     x1, boot_l1_table
 
     // Block descriptor flags:
-    //   Device 1GB block  = PA | (0<<2) | (1<<10) | (0<<8) | 0x1 = PA | 0x0401
-    //   Normal 1GB block  = PA | (1<<2) | (1<<10) | (3<<8) | 0x1 = PA | 0x0705
-    // Note: bits [1:0] = 01 means "block descriptor at L1/L2"
+    //   Normal 1GB block  = PA | AttrIdx=1 | AF=1 | SH=11 | valid = PA | 0x0705
+    //   Device 1GB block  = PA | AttrIdx=0 | AF=1 | SH=00 | valid = PA | 0x0401
+    // bits [1:0]=01: block descriptor, bits [4:2]=AttrIndx, bit[10]=AF, bits[9:8]=SH
 
-    // Entry 0: device memory (MMIO region, 0x00000000)
-    ldr     x0, =0x0000000000000401
+    // Entries 0-3: all normal-cached (covers 0x00000000–0xFFFFFFFF)
+    // Entry 0 covers VZ RAM (0x00000000) and QEMU low-MMIO region;
+    // QEMU TCG intercepts MMIO by device registration (page attrs irrelevant).
+    ldr     x0, =0x0000000000000705    // PA=0x00000000, normal cached, AF=1
     str     x0, [x1, #0]
 
-    // Entry 1: normal memory (RAM at 0x40000000)
+    // Entry 1: normal memory (RAM at 0x40000000 — QEMU virt RAM base)
     ldr     x0, =0x0000000040000705
     str     x0, [x1, #8]
 
-    // Entry 2: normal memory (0x80000000 – could be more RAM or high MMIO)
+    // Entry 2: normal memory (0x80000000)
     ldr     x0, =0x0000000080000705
     str     x0, [x1, #16]
 
@@ -395,6 +454,8 @@ boot_stack_bottom:
 boot_stack_top:
 
 // L1 page table — must be 4KB-aligned (each entry = 8 bytes, 512 entries)
+// Global so mmu.cc can add L2 table entries for device memory above 4GB.
 .align 12
+.global boot_l1_table
 boot_l1_table:
     .space 4096

@@ -16,7 +16,9 @@
 //   8. Activate the device
 
 #include "drivers/virtio_net.h"
+#include "drivers/virtio_pci.h"
 #include "kernel/arch.h"
+#include "kernel/fdt.h"
 #include "kernel/serial.h"
 #include "kernel/mm.h"
 #include "kernel/panic.h"
@@ -28,6 +30,7 @@ namespace virtio_net {
 // ============================================================================
 
 static pci::Device* device_ = nullptr;
+static virtio_pci::Device* pci_dev_ = nullptr;  // modern PCI device (VZ path)
 static uint64_t io_base_ = 0;
 static virtio::Virtqueue rx_queue_;
 static virtio::Virtqueue tx_queue_;
@@ -63,6 +66,116 @@ static bool  tx_pool_used_[TX_POOL_SIZE];
 // Initialization
 // ============================================================================
 
+// ============================================================================
+// Modern PCI init path (VZ.framework + QEMU modern)
+// ============================================================================
+
+__attribute__((unused))
+static bool init_pci_modern() {
+    pci_dev_ = virtio_pci::find(1);  // virtio device type 1 = net
+    if (!pci_dev_) return false;
+
+    serial::printf("virtio_net: found modern virtio-pci net device\n");
+
+    // Reset → ACKNOWLEDGE → DRIVER
+    virtio_pci::reset(pci_dev_);
+    virtio_pci::set_status(pci_dev_, virtio::STATUS_ACKNOWLEDGE);
+    virtio_pci::set_status(pci_dev_, virtio::STATUS_ACKNOWLEDGE | virtio::STATUS_DRIVER);
+
+    // Feature negotiation
+    uint32_t dev_features = virtio_pci::read_features(pci_dev_, 0);
+    serial::printf("virtio_net: device features = 0x%x\n", dev_features);
+
+    uint32_t guest_features = 0;
+    if (dev_features & VIRTIO_NET_F_MAC)    guest_features |= VIRTIO_NET_F_MAC;
+    if (dev_features & VIRTIO_NET_F_STATUS) guest_features |= VIRTIO_NET_F_STATUS;
+
+    virtio_pci::write_features(pci_dev_, 0, guest_features);
+    virtio_pci::write_features(pci_dev_, 1, 0);  // no high features
+    serial::printf("virtio_net: guest features = 0x%x\n", guest_features);
+
+    virtio_pci::set_status(pci_dev_, virtio::STATUS_ACKNOWLEDGE | virtio::STATUS_DRIVER |
+                                     virtio::STATUS_FEATURES_OK);
+    if (!(virtio_pci::get_status(pci_dev_) & virtio::STATUS_FEATURES_OK)) {
+        serial::printf("virtio_net: device rejected features\n");
+        virtio_pci::set_status(pci_dev_, virtio::STATUS_FAILED);
+        return false;
+    }
+
+    // Init RX queue (0)
+    virtio_pci::select_queue(pci_dev_, 0);
+    uint16_t rx_qsize = virtio_pci::get_queue_size(pci_dev_);
+    uint16_t rx_notify_off = virtio_pci::get_queue_notify_off(pci_dev_);
+    uint64_t rx_notify = virtio_pci::queue_notify_addr(pci_dev_, rx_notify_off);
+
+    uint64_t rx_desc, rx_avail, rx_used;
+    if (!rx_queue_.init_pci_modern(rx_qsize, rx_notify, 0,
+                                   &rx_desc, &rx_avail, &rx_used)) {
+        serial::printf("virtio_net: failed to init RX queue\n");
+        virtio_pci::set_status(pci_dev_, virtio::STATUS_FAILED);
+        return false;
+    }
+    virtio_pci::set_queue_addrs(pci_dev_, rx_desc, rx_avail, rx_used);
+    virtio_pci::enable_queue(pci_dev_);
+
+    // Init TX queue (1)
+    virtio_pci::select_queue(pci_dev_, 1);
+    uint16_t tx_qsize = virtio_pci::get_queue_size(pci_dev_);
+    uint16_t tx_notify_off = virtio_pci::get_queue_notify_off(pci_dev_);
+    uint64_t tx_notify = virtio_pci::queue_notify_addr(pci_dev_, tx_notify_off);
+
+    uint64_t tx_desc, tx_avail, tx_used;
+    if (!tx_queue_.init_pci_modern(tx_qsize, tx_notify, 1,
+                                   &tx_desc, &tx_avail, &tx_used)) {
+        serial::printf("virtio_net: failed to init TX queue\n");
+        virtio_pci::set_status(pci_dev_, virtio::STATUS_FAILED);
+        return false;
+    }
+    virtio_pci::set_queue_addrs(pci_dev_, tx_desc, tx_avail, tx_used);
+    virtio_pci::enable_queue(pci_dev_);
+
+    // Read MAC from device-specific config
+    for (int i = 0; i < 6; i++) {
+        mac_[i] = virtio_pci::read_dev_cfg8(pci_dev_, i);
+    }
+    serial::printf("virtio_net: MAC = %02x:%02x:%02x:%02x:%02x:%02x\n",
+                   mac_[0], mac_[1], mac_[2], mac_[3], mac_[4], mac_[5]);
+
+    // Allocate and populate RX buffers
+    for (int i = 0; i < RX_BUFFERS; i++) {
+        rx_buffers_[i] = reinterpret_cast<RxBuffer*>(mm::kmalloc(sizeof(RxBuffer)));
+        if (!rx_buffers_[i]) {
+            serial::printf("virtio_net: failed to allocate RX buffer %d\n", i);
+            virtio_pci::set_status(pci_dev_, virtio::STATUS_FAILED);
+            return false;
+        }
+        RxBuffer* buf = rx_buffers_[i];
+        buf->hdr.flags       = 0;
+        buf->hdr.gso_type    = 0;
+        buf->hdr.hdr_len     = 0;
+        buf->hdr.gso_size    = 0;
+        buf->hdr.csum_start  = 0;
+        buf->hdr.csum_offset = 0;
+
+        void* buf_ptr    = reinterpret_cast<void*>(buf);
+        uint32_t buf_len = BUFFER_SIZE;
+        int ret = rx_queue_.add_buf(&buf_ptr, &buf_len, 0, 1);
+        if (ret < 0) {
+            serial::printf("virtio_net: failed to add RX buffer %d\n", i);
+            break;
+        }
+    }
+    rx_queue_.kick();
+
+    // DRIVER_OK
+    virtio_pci::set_status(pci_dev_, virtio::STATUS_ACKNOWLEDGE | virtio::STATUS_DRIVER |
+                                     virtio::STATUS_FEATURES_OK | virtio::STATUS_DRIVER_OK);
+
+    io_base_ = 1;  // non-zero sentinel to indicate init complete
+    serial::printf("virtio_net: initialization complete (PCI modern)\n");
+    return true;
+}
+
 bool init() {
     serial::printf("virtio_net: initializing...\n");
 
@@ -86,23 +199,40 @@ bool init() {
         arch::virtio_write32(base + off, v);
     };
 
-    // Scan the 32 virtio-mmio slots for a network device (DeviceID = 1)
-    for (int slot = 0; slot < 32; slot++) {
-        uint64_t candidate = virtio::mmio::BASE + (uint64_t)slot * 0x200;
-        if (r32(candidate, virtio::mmio::MAGIC_VALUE) != virtio::mmio::MAGIC)
-            continue;
-        if (r32(candidate, virtio::mmio::DEVICE_ID) == 1) {
-            io_base_ = candidate;
-            break;
+    // Prefer FDT-discovered virtio-mmio device list (works for both QEMU and VZ).
+    // Scan FDT entries first; fall back to the fixed QEMU slot scan if FDT found
+    // no virtio-mmio devices (DTB absent or dtb_addr=0 passed to fdt::init).
+    const fdt::Info& fdt = fdt::info();
+    if (fdt.virtio_count > 0) {
+        for (int i = 0; i < fdt.virtio_count; i++) {
+            uint64_t candidate = fdt.virtio_bases[i];
+            if (r32(candidate, virtio::mmio::MAGIC_VALUE) != virtio::mmio::MAGIC)
+                continue;
+            if (r32(candidate, virtio::mmio::DEVICE_ID) == 1) {
+                io_base_ = candidate;
+                break;
+            }
+        }
+    } else {
+        // Fallback: fixed QEMU virtio-mmio slot scan (32 slots at 0x0a000000+)
+        for (int slot = 0; slot < 32; slot++) {
+            uint64_t candidate = virtio::mmio::BASE + (uint64_t)slot * 0x200;
+            if (r32(candidate, virtio::mmio::MAGIC_VALUE) != virtio::mmio::MAGIC)
+                continue;
+            if (r32(candidate, virtio::mmio::DEVICE_ID) == 1) {
+                io_base_ = candidate;
+                break;
+            }
         }
     }
     if (io_base_ == 0) {
-        serial::printf("virtio_net: no virtio-mmio net device found in 32 slots\n");
-        return false;
+        serial::printf("virtio_net: no virtio-mmio net device, trying PCI...\n");
+        return init_pci_modern();
     }
 
     uint32_t ver = r32(io_base_, virtio::mmio::VERSION);
-    if (ver != 1) {
+    bool is_v2 = (ver == 2);
+    if (ver != 1 && ver != 2) {
         serial::printf("virtio_net: unsupported virtio-mmio version %u at 0x%lx\n",
                        ver, io_base_);
         return false;
@@ -114,31 +244,54 @@ bool init() {
     w32(io_base_, virtio::mmio::STATUS, 0);
 
     // ACKNOWLEDGE + DRIVER
-    w32(io_base_, virtio::mmio::STATUS,
-        virtio::STATUS_ACKNOWLEDGE);
+    w32(io_base_, virtio::mmio::STATUS, virtio::STATUS_ACKNOWLEDGE);
     w32(io_base_, virtio::mmio::STATUS,
         virtio::STATUS_ACKNOWLEDGE | virtio::STATUS_DRIVER);
 
-    // Negotiate features
-    uint32_t dev_features = r32(io_base_, virtio::mmio::HOST_FEATURES);
-    serial::printf("virtio_net: device features = 0x%x\n", dev_features);
-
+    // Feature negotiation: v2 uses DEVICE_FEATURES_SEL/DRIVER_FEATURES_SEL;
+    // v1 uses a single HOST_FEATURES/GUEST_FEATURES pair.
     uint32_t guest_features = 0;
-    if (dev_features & VIRTIO_NET_F_MAC)    guest_features |= VIRTIO_NET_F_MAC;
-    if (dev_features & VIRTIO_NET_F_STATUS) guest_features |= VIRTIO_NET_F_STATUS;
-    w32(io_base_, virtio::mmio::GUEST_FEATURES, guest_features);
+    if (is_v2) {
+        // Select and read low 32 bits of device features.
+        w32(io_base_, virtio::mmio::DEVICE_FEATURES_SEL, 0);
+        uint32_t dev_features = r32(io_base_, virtio::mmio::HOST_FEATURES);
+        serial::printf("virtio_net: device features = 0x%x\n", dev_features);
+        if (dev_features & VIRTIO_NET_F_MAC)    guest_features |= VIRTIO_NET_F_MAC;
+        if (dev_features & VIRTIO_NET_F_STATUS) guest_features |= VIRTIO_NET_F_STATUS;
+
+        // Write driver features (word 0), then clear word 1 (no high features).
+        w32(io_base_, virtio::mmio::DRIVER_FEATURES_SEL, 0);
+        w32(io_base_, virtio::mmio::GUEST_FEATURES, guest_features);
+        w32(io_base_, virtio::mmio::DRIVER_FEATURES_SEL, 1);
+        w32(io_base_, virtio::mmio::GUEST_FEATURES, 0);
+
+        // v2 requires FEATURES_OK before queue setup.
+        w32(io_base_, virtio::mmio::STATUS,
+            virtio::STATUS_ACKNOWLEDGE | virtio::STATUS_DRIVER |
+            virtio::STATUS_FEATURES_OK);
+        if (!(r32(io_base_, virtio::mmio::STATUS) & virtio::STATUS_FEATURES_OK)) {
+            serial::printf("virtio_net: device rejected features\n");
+            w32(io_base_, virtio::mmio::STATUS, virtio::STATUS_FAILED);
+            return false;
+        }
+    } else {
+        // v1: single 32-bit feature word; GuestPageSize required before queues.
+        uint32_t dev_features = r32(io_base_, virtio::mmio::HOST_FEATURES);
+        serial::printf("virtio_net: device features = 0x%x\n", dev_features);
+        if (dev_features & VIRTIO_NET_F_MAC)    guest_features |= VIRTIO_NET_F_MAC;
+        if (dev_features & VIRTIO_NET_F_STATUS) guest_features |= VIRTIO_NET_F_STATUS;
+        w32(io_base_, virtio::mmio::GUEST_FEATURES, guest_features);
+        w32(io_base_, virtio::mmio::GUEST_PAGE_SIZE, 4096);
+    }
     serial::printf("virtio_net: guest features = 0x%x\n", guest_features);
 
-    // GuestPageSize MUST be written before queue setup for legacy MMIO
-    w32(io_base_, virtio::mmio::GUEST_PAGE_SIZE, 4096);
-
-    // Init RX and TX queues (is_mmio = true)
-    if (!rx_queue_.init(0, io_base_, 0, /*is_mmio=*/true)) {
+    // Init RX and TX queues
+    if (!rx_queue_.init(0, io_base_, 0, /*is_mmio=*/true, is_v2)) {
         serial::printf("virtio_net: failed to init RX queue\n");
         w32(io_base_, virtio::mmio::STATUS, virtio::STATUS_FAILED);
         return false;
     }
-    if (!tx_queue_.init(0, io_base_, 1, /*is_mmio=*/true)) {
+    if (!tx_queue_.init(0, io_base_, 1, /*is_mmio=*/true, is_v2)) {
         serial::printf("virtio_net: failed to init TX queue\n");
         w32(io_base_, virtio::mmio::STATUS, virtio::STATUS_FAILED);
         return false;
@@ -184,10 +337,11 @@ bool init() {
     }
     rx_queue_.kick();
 
-    // DRIVER_OK — device is live
-    w32(io_base_, virtio::mmio::STATUS,
-        virtio::STATUS_ACKNOWLEDGE | virtio::STATUS_DRIVER |
-        virtio::STATUS_DRIVER_OK);
+    // DRIVER_OK — device is live; v2 must keep FEATURES_OK set.
+    uint32_t final_status = virtio::STATUS_ACKNOWLEDGE | virtio::STATUS_DRIVER |
+                            virtio::STATUS_DRIVER_OK;
+    if (is_v2) final_status |= virtio::STATUS_FEATURES_OK;
+    w32(io_base_, virtio::mmio::STATUS, final_status);
 
     serial::printf("virtio_net: initialization complete (MMIO)\n");
     return true;
@@ -373,10 +527,17 @@ bool init() {
 
 void shutdown() {
     if (io_base_ == 0) return;
+    if (pci_dev_) {
+        virtio_pci::reset(pci_dev_);
+    }
 #if defined(__aarch64__)
-    arch::virtio_write32(io_base_ + virtio::mmio::STATUS, 0);
+    else {
+        arch::virtio_write32(io_base_ + virtio::mmio::STATUS, 0);
+    }
 #else
-    virtio::reset(io_base_);
+    else {
+        virtio::reset(io_base_);
+    }
 #endif
     serial::printf("virtio_net: device reset\n");
 }
@@ -396,9 +557,12 @@ const uint8_t* get_mac() {
 static void tx_drain() {
     uint16_t used_id;
     uint32_t used_len;
+#if defined(__aarch64__)
+    // Diagnostic: check if tx_queue_.used_ is outside VZ's 128MB range [0, 0x08000000).
+    // If the pointer is bad, exit cleanly (RC=0) so we know the address is invalid.
+    // If the pointer looks valid, fall through and crash at used_->idx (RC=1 = mysterious).
+#endif
     while (tx_queue_.get_used(&used_id, &used_len)) {
-        // After get_used() the descriptor's addr field still holds the
-        // original TxBuf pointer (get_used only modifies the next field).
         virtio::VirtqDesc* d = tx_queue_.desc(used_id);
         TxBuf* buf = reinterpret_cast<TxBuf*>(d->addr);
         int slot = (int)(buf - tx_pool_);
@@ -414,6 +578,7 @@ static void tx_drain() {
 
 void send(const void* data, uint32_t len) {
     if (!data || len == 0) return;
+    if (io_base_ == 0 && pci_dev_ == nullptr) return;
     if (len > 1514) len = 1514;
 
     // Reclaim any pool slots whose TX has already completed.
@@ -467,7 +632,10 @@ int poll(void (*callback)(const uint8_t* data, uint32_t len)) {
     if (!callback) {
         return 0;
     }
-
+    // Guard: if init() was never called or returned false, queues are invalid
+    if (io_base_ == 0 && pci_dev_ == nullptr) {
+        return 0;
+    }
     // Opportunistically reclaim completed TX buffers.
     tx_drain();
 

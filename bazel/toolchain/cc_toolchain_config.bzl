@@ -52,6 +52,11 @@ def _impl(ctx):
             "-fno-exceptions",
             "-fno-rtti",
             "-fno-stack-protector",
+            # PIE: generate position-independent code so the kernel can be
+            # loaded at any physical address (QEMU: 0x40000000, VZ: 0x00000000).
+            # boot.S processes .rela.dyn at startup to fix absolute pointers.
+            # LLD resolves all GOT entries at link time; no dynamic linker needed.
+            "-fPIC",
             # Disable FP/NEON register usage by the compiler.
             # This is the standard approach for kernel code (same as Linux
             # CONFIG_KERNEL_MODE_NEON).  Without this, the compiler emits
@@ -128,7 +133,7 @@ def _impl(ctx):
                             "--target=" + target_system,
                             "-fuse-ld=lld",
                             "-nostdlib",
-                            "-static",
+                        ] + (["-pie"] if arch == "aarch64" else ["-static"]) + [
                             "-Wl,-z,max-page-size=0x1000",
                             "-Wl,-T," + linker_script,
                         ],
@@ -138,7 +143,9 @@ def _impl(ctx):
         ],
     )
 
-    supports_pic_feature = feature(name = "supports_pic", enabled = False)
+    # aarch64 uses -fPIC/--pie for position-independent kernel (load at any addr).
+    # x86_64 uses -mcmodel=kernel (large PIE model) so PIC is not needed there.
+    supports_pic_feature = feature(name = "supports_pic", enabled = (arch == "aarch64"))
 
     return cc_common.create_cc_toolchain_config_info(
         ctx = ctx,

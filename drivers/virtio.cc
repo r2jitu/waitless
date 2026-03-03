@@ -77,7 +77,7 @@ void write_guest_features(uint64_t base, uint32_t features) {
 // ============================================================================
 
 bool Virtqueue::init(uint16_t queue_size_param, uint64_t base,
-                     uint16_t queue_index, bool is_mmio) {
+                     uint16_t queue_index, bool is_mmio, bool is_mmio_v2) {
     io_base_     = base;
     queue_index_ = queue_index;
     is_mmio_     = is_mmio;
@@ -95,8 +95,11 @@ bool Virtqueue::init(uint16_t queue_size_param, uint64_t base,
         }
         // Cap at 256 to keep memory usage reasonable
         queue_size_ = (qmax > 256) ? 256 : (uint16_t)qmax;
-        arch::virtio_write32(io_base_ + mmio::QUEUE_NUM,   queue_size_);
-        arch::virtio_write32(io_base_ + mmio::QUEUE_ALIGN, 4096);
+        arch::virtio_write32(io_base_ + mmio::QUEUE_NUM, queue_size_);
+        if (!is_mmio_v2) {
+            // QUEUE_ALIGN is v1-only; reserved in v2 (0x03c is undefined).
+            arch::virtio_write32(io_base_ + mmio::QUEUE_ALIGN, 4096);
+        }
     } else {
         arch::virtio_write16(io_base_ + REG_QUEUE_SELECT, queue_index_);
         uint16_t dev_queue_size = arch::virtio_read16(io_base_ + REG_QUEUE_SIZE);
@@ -178,17 +181,110 @@ bool Virtqueue::init(uint16_t queue_size_param, uint64_t base,
     avail_->flags = VIRTQ_AVAIL_F_NO_INTERRUPT;
 
     // Step 8: Tell the device where the queue lives.
-    // Both PCI and MMIO use the physical page frame number (address >> 12).
-    // PCI: REG_QUEUE_ADDRESS (32-bit).  MMIO: mmio::QUEUE_PFN (32-bit).
+    // v1 MMIO / PCI: single QUEUE_PFN/REG_QUEUE_ADDRESS (phys >> 12).
+    // v2 MMIO: separate addresses for desc table, available ring, used ring.
     if (is_mmio_) {
-        arch::virtio_write32(io_base_ + mmio::QUEUE_PFN,
-                             (uint32_t)(phys_base >> 12));
+        if (is_mmio_v2) {
+            uint64_t avail_phys = phys_base + desc_size;
+            uint64_t used_phys  = phys_base + first_region;
+            arch::virtio_write32(io_base_ + mmio::QUEUE_DESC_LOW,
+                                 (uint32_t)phys_base);
+            arch::virtio_write32(io_base_ + mmio::QUEUE_DESC_HIGH,
+                                 (uint32_t)(phys_base >> 32));
+            arch::virtio_write32(io_base_ + mmio::QUEUE_DRIVER_LOW,
+                                 (uint32_t)avail_phys);
+            arch::virtio_write32(io_base_ + mmio::QUEUE_DRIVER_HIGH,
+                                 (uint32_t)(avail_phys >> 32));
+            arch::virtio_write32(io_base_ + mmio::QUEUE_DEVICE_LOW,
+                                 (uint32_t)used_phys);
+            arch::virtio_write32(io_base_ + mmio::QUEUE_DEVICE_HIGH,
+                                 (uint32_t)(used_phys >> 32));
+            arch::virtio_write32(io_base_ + mmio::QUEUE_READY, 1);
+        } else {
+            arch::virtio_write32(io_base_ + mmio::QUEUE_PFN,
+                                 (uint32_t)(phys_base >> 12));
+        }
     } else {
         arch::virtio_write32(io_base_ + REG_QUEUE_ADDRESS,
                              (uint32_t)(phys_base >> 12));
     }
 
     serial::printf("virtio: queue %d initialized at phys 0x%lx\n",
+                   queue_index_, phys_base);
+    return true;
+}
+
+bool Virtqueue::init_pci_modern(uint16_t queue_size_param, uint64_t notify_addr,
+                                uint16_t queue_index,
+                                uint64_t* desc_phys, uint64_t* avail_phys,
+                                uint64_t* used_phys) {
+    queue_index_  = queue_index;
+    notify_addr_  = notify_addr;
+    is_mmio_      = false;
+    queue_size_   = queue_size_param;
+
+    if (queue_size_ == 0) {
+        serial::printf("virtio: queue %d has size 0\n", queue_index_);
+        return false;
+    }
+
+    serial::printf("virtio: queue %d size = %d (PCI modern)\n",
+                   queue_index_, queue_size_);
+
+    // Calculate memory layout sizes (same as legacy init)
+    uint64_t desc_size  = (uint64_t)queue_size_ * sizeof(VirtqDesc);
+    uint64_t avail_size = 6 + 2 * (uint64_t)queue_size_;
+    uint64_t used_size  = 6 + 8 * (uint64_t)queue_size_;
+
+    // Modern virtio: desc aligned to 16, avail to 2, used to 4.
+    // We still page-align for simplicity with frame allocator.
+    uint64_t first_region = align_up(desc_size + avail_size, 4096);
+    uint64_t second_region = align_up(used_size, 4096);
+    uint64_t total_size = first_region + second_region;
+
+    uint64_t num_frames = (total_size + 4095) / 4096;
+    uint64_t phys_base = mm::alloc_frame();
+    if (phys_base == 0) {
+        serial::printf("virtio: failed to allocate memory for queue %d\n",
+                       queue_index_);
+        return false;
+    }
+    for (uint64_t i = 1; i < num_frames; i++) {
+        mm::alloc_frame();
+    }
+
+    uint8_t* base_ptr = reinterpret_cast<uint8_t*>(phys_base);
+    for (uint64_t i = 0; i < total_size; i++) {
+        base_ptr[i] = 0;
+    }
+
+    descs_ = reinterpret_cast<VirtqDesc*>(base_ptr);
+    avail_ = reinterpret_cast<VirtqAvail*>(base_ptr + desc_size);
+    used_  = reinterpret_cast<VirtqUsed*>(base_ptr + first_region);
+
+    for (uint16_t i = 0; i < queue_size_; i++) {
+        descs_[i].next = i + 1;
+        descs_[i].flags = 0;
+    }
+    free_head_ = 0;
+    num_free_  = queue_size_;
+
+    desc_used_ = reinterpret_cast<bool*>(mm::kmalloc(queue_size_ * sizeof(bool)));
+    if (desc_used_) {
+        for (uint16_t i = 0; i < queue_size_; i++) {
+            desc_used_[i] = false;
+        }
+    }
+
+    last_used_idx_ = 0;
+    avail_->flags = VIRTQ_AVAIL_F_NO_INTERRUPT;
+
+    // Return physical addresses for caller to pass to virtio_pci::set_queue_addrs
+    *desc_phys  = phys_base;
+    *avail_phys = phys_base + desc_size;
+    *used_phys  = phys_base + first_region;
+
+    serial::printf("virtio: queue %d initialized at phys 0x%lx (PCI modern)\n",
                    queue_index_, phys_base);
     return true;
 }
@@ -254,7 +350,10 @@ int Virtqueue::add_buf(void** buffers, uint32_t* lengths,
 void Virtqueue::kick() {
     // Memory barrier before notifying the device
     asm volatile("" ::: "memory");
-    if (is_mmio_) {
+    if (notify_addr_ != 0) {
+        // Modern PCI: write queue_index to the notify MMIO address
+        *reinterpret_cast<volatile uint16_t*>(notify_addr_) = queue_index_;
+    } else if (is_mmio_) {
         arch::virtio_write32(io_base_ + mmio::QUEUE_NOTIFY, queue_index_);
     } else {
         arch::virtio_write16(io_base_ + REG_QUEUE_NOTIFY, queue_index_);

@@ -1,9 +1,16 @@
-// kernel/aarch64/serial.cc — PL011 UART driver for ARM64
+// kernel/aarch64/serial.cc — ARM64 serial console driver
 //
-// The QEMU "virt" machine exposes a PL011 UART at physical address 0x09000000.
-// All register accesses are MMIO (no I/O ports on ARM64).
+// Supports two backends, selected at runtime based on DTB discovery:
 //
-// PL011 register map (offsets from UART_BASE):
+//   PL011 UART (QEMU "virt" machine):
+//     Physical address: 0x09000000 (from FDT "arm,pl011" node).
+//     All register accesses are MMIO.
+//
+//   VirtIO console (VZ.framework):
+//     DeviceID=3 virtio-mmio device; address from FDT "virtio,mmio" scan.
+//     Uses virtio_console:: driver (drivers/virtio_console.h).
+//
+// PL011 register map (offsets from uart_base):
 //   0x000  DR    — Data Register (read/write)
 //   0x018  FR    — Flag Register (bit 5 = TXFF = TX FIFO full)
 //   0x024  IBRD  — Integer Baud Rate Divisor
@@ -12,55 +19,103 @@
 //   0x030  CR    — Control Register
 
 #include "kernel/serial.h"
+#include "kernel/fdt.h"
+#include "drivers/virtio_console.h"
+#include "drivers/virtio_pci.h"
 #include <stdarg.h>
 
 namespace serial {
 
-// ---- PL011 register base and offsets ---------------------------------------
+// ---- Backend selection -----------------------------------------------------
 
-static constexpr uint64_t UART_BASE = 0x09000000UL;
+enum class Backend { NONE, PL011, VIRTIO };
+static Backend g_backend = Backend::NONE;
 
-static constexpr uint64_t DR    = UART_BASE + 0x000; // Data register
-static constexpr uint64_t FR    = UART_BASE + 0x018; // Flag register
-static constexpr uint64_t IBRD  = UART_BASE + 0x024; // Integer baud rate divisor
-static constexpr uint64_t FBRD  = UART_BASE + 0x028; // Fractional baud rate divisor
-static constexpr uint64_t LCR_H = UART_BASE + 0x02C; // Line control
-static constexpr uint64_t CR    = UART_BASE + 0x030; // Control
+// ---- PL011 register offsets ------------------------------------------------
 
-static constexpr uint32_t FR_TXFF = (1U << 5);  // TX FIFO full
-static constexpr uint32_t FR_RXFE = (1U << 4);  // RX FIFO empty
-static constexpr uint32_t CR_UARTEN = (1U << 0); // UART enable
-static constexpr uint32_t CR_TXE    = (1U << 8); // TX enable
-static constexpr uint32_t CR_RXE    = (1U << 9); // RX enable
+static constexpr uint64_t PL011_DR    = 0x000; // Data register
+static constexpr uint64_t PL011_FR    = 0x018; // Flag register
+static constexpr uint64_t PL011_IBRD  = 0x024; // Integer baud rate divisor
+static constexpr uint64_t PL011_FBRD  = 0x028; // Fractional baud rate divisor
+static constexpr uint64_t PL011_LCR_H = 0x02C; // Line control
+static constexpr uint64_t PL011_CR    = 0x030; // Control
 
-static inline volatile uint32_t* reg(uint64_t addr) {
-    return reinterpret_cast<volatile uint32_t*>(addr);
+static constexpr uint32_t FR_TXFF  = (1U << 5); // TX FIFO full
+static constexpr uint32_t FR_RXFE  = (1U << 4); // RX FIFO empty
+static constexpr uint32_t CR_UARTEN = (1U << 0);
+static constexpr uint32_t CR_TXE    = (1U << 8);
+static constexpr uint32_t CR_RXE    = (1U << 9);
+
+static uint64_t g_uart_base = 0;
+
+static inline volatile uint32_t* pl011(uint64_t off) {
+    return reinterpret_cast<volatile uint32_t*>(g_uart_base + off);
+}
+
+// ---- PL011 init ------------------------------------------------------------
+
+static void pl011_init(uint64_t base) {
+    g_uart_base = base;
+    *pl011(PL011_CR)    = 0;             // disable UART
+    *pl011(PL011_IBRD)  = 13;            // 115200 @ 24 MHz
+    *pl011(PL011_FBRD)  = 1;
+    *pl011(PL011_LCR_H) = (3U << 5) | (1U << 4); // 8N1, FIFO on
+    *pl011(PL011_CR)    = CR_UARTEN | CR_TXE | CR_RXE;
+    g_backend = Backend::PL011;
 }
 
 // ---- Public API ------------------------------------------------------------
 
 void init() {
-    // Disable UART
-    *reg(CR) = 0;
+    const fdt::Info& fdt = fdt::info();
 
-    // Baud rate: QEMU doesn't enforce baud in emulation, but set 115200
-    // Assuming 24 MHz UART clock: divisor = 24000000 / (16 * 115200) = 13.02
-    // IBRD = 13, FBRD = floor(0.02 * 64 + 0.5) = 1
-    *reg(IBRD) = 13;
-    *reg(FBRD) = 1;
+    // Prefer PL011 if FDT found one (QEMU path).
+    if (fdt.uart_base != 0) {
+        pl011_init(fdt.uart_base);
+        return;
+    }
 
-    // 8 bits, 1 stop, no parity, FIFO enabled
-    *reg(LCR_H) = (3U << 5) | (1U << 4); // WLEN=11 (8-bit), FEN=1
+    // Try virtio-mmio console if FDT found virtio-mmio devices (QEMU path).
+    if (fdt.virtio_count > 0) {
+        for (int i = 0; i < fdt.virtio_count; i++) {
+            if (virtio_console::init(fdt.virtio_bases[i])) {
+                g_backend = Backend::VIRTIO;
+                return;
+            }
+        }
+    }
 
-    // Enable UART with TX and RX
-    *reg(CR) = CR_UARTEN | CR_TXE | CR_RXE;
+    // Try PCI console (VZ.framework path — all I/O is virtio-pci).
+    // pci::init() must have been called before serial::init() for this to work.
+    if (fdt.pcie_ecam_base != 0) {
+        auto* dev = virtio_pci::find(3);  // DeviceID 3 = console
+        if (dev && virtio_console::init_pci(dev)) {
+            g_backend = Backend::VIRTIO;
+            return;
+        }
+    }
+
+    // No console found.
+    // DO NOT fall back to a hardcoded PL011 address:
+    //   • On VZ.framework (128MB RAM), GPA 0x09000000 is outside the
+    //     Stage-2 memory map → any write causes "Internal Virtualization
+    //     error" (VZError.internalError, Code=1) and VM abort.
+    //   • If this path is reached, g_backend remains NONE and putc() is
+    //     a no-op — kernel runs silently rather than crashing.
+    // (If FDT is broken, increase UNIKERNEL_MEMORY to > 144MB to allow
+    //  the PL011 fallback to work, or fix FDT parsing.)
 }
 
 void putc(char c) {
-    // Wait until the TX FIFO has room
-    while (*reg(FR) & FR_TXFF)
+    if (g_backend == Backend::VIRTIO) {
+        virtio_console::putc(c);
+        return;
+    }
+    if (g_backend == Backend::NONE) return;  // no output device yet
+    // PL011
+    while (*pl011(PL011_FR) & FR_TXFF)
         asm volatile("nop");
-    *reg(DR) = (uint32_t)(uint8_t)c;
+    *pl011(PL011_DR) = (uint32_t)(uint8_t)c;
 }
 
 void puts(const char* s) {
@@ -177,9 +232,13 @@ void printf(const char* fmt, ...) {
 // ---- Shutdown detection ----------------------------------------------------
 
 int try_getc() {
-    // FR bit 4 = RXFE: RX FIFO is empty; if clear, a byte is waiting
-    if (!(*reg(FR) & FR_RXFE)) {
-        return (int)(uint8_t)(*reg(DR) & 0xFF);
+    if (g_backend == Backend::VIRTIO) {
+        return virtio_console::try_getc();
+    }
+    if (g_backend == Backend::NONE) return -1;
+    // PL011: FR bit 4 = RXFE; if clear, a byte is waiting
+    if (!(*pl011(PL011_FR) & FR_RXFE)) {
+        return (int)(uint8_t)(*pl011(PL011_DR) & 0xFF);
     }
     return -1;
 }

@@ -6,7 +6,15 @@
 
 #include "drivers/pci.h"
 #include "kernel/arch.h"
-#include "kernel/serial.h"
+#if defined(__aarch64__)
+#include "kernel/fdt.h"
+#include "kernel/aarch64/mmu.h"
+#endif
+
+// PCI runs before serial on VZ (early PCI scan for console discovery).
+// Use a late-bound printf that's safe to call even when serial is not yet up.
+// Declared in serial.h, but we avoid the header dep to break a build cycle.
+namespace serial { void printf(const char* fmt, ...); }
 
 namespace pci {
 
@@ -23,20 +31,18 @@ static int device_count_ = 0;
 
 #if defined(__aarch64__)
 
-// QEMU virt machine ECAM base (PCIe config space, memory-mapped).
-// Address from DTB: pcie@10000000 reg = <0x40 0x10000000 ...> = 0x4010000000.
-static constexpr uint64_t ECAM_BASE = 0x4010000000ULL;
+// ECAM base — set dynamically from FDT in pci::init().
+// Default to QEMU's address (0x4010000000); overridden when FDT provides one.
+static uint64_t g_ecam_base = 0x4010000000ULL;
 
-// PCIe resource windows for the QEMU virt machine (from DTB `ranges` property):
-//   I/O space:    PCI 0x00000000 → CPU 0x3EFF0000, size 0x10000
-//   32-bit mem:   PCI 0x10000000 → CPU 0x10000000, size 0x2EFF0000
+// PCIe resource windows for BAR assignment (QEMU -kernel only, not VZ).
 // QEMU does not run firmware to assign BAR addresses when using -kernel, so
-// we do a minimal PCI resource allocation here.
-static constexpr uint64_t PCI_MEM_START    = 0x10000000ULL;  // start of 32-bit PCI mem
-// PCI I/O CPU base (0x3EFF0000) is used by virtio.cc to translate I/O ports to MMIO.
+// we do a minimal PCI resource allocation here.  VZ pre-assigns BARs, so
+// these are only used as fallback.
+static constexpr uint64_t PCI_MEM_START = 0x10000000ULL;
 
-static uint64_t g_pci_io_next  = 0x1000;        // next I/O port to allocate (avoid 0)
-static uint64_t g_pci_mem_next = PCI_MEM_START;  // next memory address to allocate
+static uint64_t g_pci_io_next  = 0x1000;
+static uint64_t g_pci_mem_next = PCI_MEM_START;
 
 // Probe one BAR, assign a resource, and update dev.bar[i].
 // Returns the number of BAR slots consumed (1 for 32-bit, 2 for 64-bit).
@@ -91,25 +97,32 @@ static int assign_bar(Device& dev, int i) {
 }
 
 // Assign BAR addresses to an endpoint device and enable I/O + memory access.
+// If firmware (VZ) already enabled memory space, BARs are pre-assigned —
+// re-probing would corrupt PCIe bridge windows and cause synchronous exceptions.
 __attribute__((optnone))
 static void assign_bars(Device& dev) {
     if ((dev.header_type & 0x7F) != 0x00) return;  // only type-0 endpoints
+
+    // Check if firmware already assigned BARs (Memory Space Enable set)
+    uint32_t cmd = read_config(dev.bus, dev.slot, dev.func, 0x04);
+    if (cmd & 0x2) return;  // trust firmware BAR assignments
+
     for (int i = 0; i < 6; ) {
         i += assign_bar(dev, i);
     }
     // Enable I/O space + memory space in the PCI command register
-    uint32_t cmd = read_config(dev.bus, dev.slot, dev.func, 0x04);
+    cmd = read_config(dev.bus, dev.slot, dev.func, 0x04);
     cmd |= 0x3;
     write_config(dev.bus, dev.slot, dev.func, 0x04, cmd);
 }
 
 static volatile uint32_t* ecam_ptr(uint8_t bus, uint8_t slot,
                                     uint8_t func, uint8_t offset) {
-    uint64_t addr = ECAM_BASE
-                  | ((uint64_t)bus  << 20)
-                  | ((uint64_t)slot << 15)
-                  | ((uint64_t)func << 12)
-                  | ((uint64_t)(offset & 0xFC));
+    uint64_t addr = g_ecam_base
+                  + ((uint64_t)bus  << 20)
+                  + ((uint64_t)slot << 15)
+                  + ((uint64_t)func << 12)
+                  + ((uint64_t)(offset & 0xFC));
     return reinterpret_cast<volatile uint32_t*>(addr);
 }
 
@@ -190,8 +203,14 @@ static bool probe_function(uint8_t bus, uint8_t slot, uint8_t func) {
     }
 
 #if defined(__aarch64__)
-    // No firmware assigns BARs on ARM64 -kernel boot; do it ourselves.
+    // Assign BARs if firmware hasn't done so (Memory Space Enable not set).
     assign_bars(dev);
+    // Re-read BARs: assign_bars() may have written new addresses to config
+    // space.  Refresh dev.bar[] so virtio_pci::read_bar64() gets current
+    // values.  Safe to call even when assign_bars() was a no-op.
+    for (int i = 0; i < 6; i++) {
+        dev.bar[i] = read_config(bus, slot, func, 0x10 + i * 4);
+    }
 #endif
 
     serial::printf("PCI %02x:%02x.%x -- %04x:%04x class %02x:%02x\n",
@@ -202,12 +221,34 @@ static bool probe_function(uint8_t bus, uint8_t slot, uint8_t func) {
     return true;
 }
 
+static bool initialized_ = false;
+
 void init() {
+    if (initialized_) return;  // already scanned
+    initialized_ = true;
     device_count_ = 0;
 
-    serial::printf("PCI: scanning buses...\n");
+#if defined(__aarch64__)
+    // Set ECAM base from FDT (VZ uses a dynamic address; QEMU uses 0x4010000000).
+    const fdt::Info& fdt = fdt::info();
+    if (fdt.pcie_ecam_base != 0) {
+        g_ecam_base = fdt.pcie_ecam_base;
 
-    for (int bus = 0; bus < 256; bus++) {
+        // Map the ECAM region if it's above 4GB (below 4GB is already mapped)
+        if (g_ecam_base >= 0x100000000ULL) {
+            uint64_t ecam_size = fdt.pcie_ecam_size ? fdt.pcie_ecam_size : (256ULL << 20);
+            mmu::map_device_range(g_ecam_base, ecam_size);
+        }
+    }
+#endif
+
+#if defined(__aarch64__)
+    serial::printf("PCI: scanning buses (ECAM at 0x%lx)...\n", g_ecam_base);
+#else
+    serial::printf("PCI: scanning buses...\n");
+#endif
+
+    for (int bus = 0; bus < 1; bus++) {  // DEBUG: bus 0 only to isolate crash
         for (int slot = 0; slot < 32; slot++) {
             // Check function 0 first
             uint32_t reg0 = read_config(bus, slot, 0, 0x00);
@@ -292,6 +333,26 @@ uint32_t read_bar(const Device& dev, int bar_idx) {
         // Mask off the lower 4 bits (type and prefetch bits)
         return bar & ~0x0Fu;
     }
+}
+
+uint64_t read_bar64(const Device& dev, int bar_idx) {
+    if (bar_idx < 0 || bar_idx >= 6) return 0;
+
+    uint32_t bar = dev.bar[bar_idx];
+    if (bar & 0x01) {
+        // I/O BAR — return 32-bit address
+        return (uint64_t)(bar & ~0x03u);
+    }
+
+    // Memory BAR — check if 64-bit (type bits [2:1] = 0b10)
+    bool is_64bit = ((bar & 0x6) == 0x4);
+    uint64_t addr = (uint64_t)(bar & ~0x0Fu);
+
+    if (is_64bit && bar_idx < 5) {
+        addr |= (uint64_t)dev.bar[bar_idx + 1] << 32;
+    }
+
+    return addr;
 }
 
 } // namespace pci

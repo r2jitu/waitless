@@ -35,7 +35,10 @@ alias(
 sh_test(
     name = "integration_test",
     srcs = ["integration_test.sh"],
-    data = [":webserver.elf"],
+    data = [
+        ":webserver.elf",
+        ":webserver.img",
+    ],
     # local     — must run on the dev machine (needs QEMU + host networking)
     # exclusive — uses a fixed port; avoid parallel runs with itself
     tags = ["local", "exclusive"],

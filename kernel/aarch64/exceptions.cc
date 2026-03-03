@@ -1,22 +1,25 @@
 // kernel/aarch64/exceptions.cc — ARM64 exception handling + GIC init
 //
 // Installs the vector table (defined in boot.S) and initialises the
-// ARM GIC v2 distributor / CPU interface so we can receive IRQs.
+// ARM GICv2 distributor/CPU interface so we can receive IRQs.
 //
-// GICv2 addresses on QEMU "virt" machine:
-//   Distributor:    0x08000000
-//   CPU interface:  0x08010000
+// GICv2 addresses are discovered from the DTB via fdt::info().gic_dist_base.
+// If that field is 0 (VZ/GICv3, or no GIC found in DTB), GIC init is skipped:
+// we operate in pure polling mode and rely on the hypervisor's vGIC to
+// deliver virtual IRQs when WFI is executed.
 
 #include "kernel/aarch64/exceptions.h"
+#include "kernel/fdt.h"
 #include "kernel/serial.h"
 #include "kernel/panic.h"
 
 namespace exceptions {
 
-// ---- GIC v2 register bases ------------------------------------------------
+// ---- GIC v2 register bases (filled from FDT at init time) -----------------
 
-static constexpr uint64_t GICD_BASE = 0x08000000UL;
-static constexpr uint64_t GICC_BASE = 0x08010000UL;
+// GICD and GICC are contiguous: GICC typically follows GICD after 0x10000.
+static uint64_t GICD_BASE = 0;
+static uint64_t GICC_BASE = 0;
 
 // Distributor registers (offsets from GICD_BASE)
 static constexpr uint32_t GICD_CTLR     = 0x000; // Distributor control
@@ -49,8 +52,8 @@ static void (*irq_handlers[MAX_IRQS])(uint32_t irq);
 // ---- Exception handler (called from vector stubs in boot.S) ---------------
 
 extern "C" void exception_handler(uint32_t kind, Frame* frame) {
-    if (kind == 2) {
-        // IRQ
+    if (kind == 1) {
+        // IRQ (Group 2 SP_EL1 slot 1 → kind=1)
         uint32_t iar = *gicc(GICC_IAR);
         uint32_t irq = iar & 0x3FF; // bits [9:0] are the interrupt ID
 
@@ -86,6 +89,18 @@ extern "C" void exception_handler(uint32_t kind, Frame* frame) {
 // ---- GIC initialisation ---------------------------------------------------
 
 void init() {
+    // Discover GICv2 addresses from the DTB.
+    // gic_dist_base == 0 means: no GICv2 found (VZ uses GICv3, or DTB absent).
+    // In that case skip GIC init — we operate polling-only and the hypervisor's
+    // vGIC delivers virtual IRQs when WFI wakes the vCPU.
+    GICD_BASE = fdt::info().gic_dist_base;
+    if (GICD_BASE == 0) {
+        serial::printf("       GIC init skipped (no GICv2 in DTB — polling mode)\n");
+        return;
+    }
+    // On QEMU virt, GICC immediately follows GICD with a 0x10000 offset.
+    GICC_BASE = GICD_BASE + 0x10000;
+
     // ---- Distributor -------------------------------------------------------
 
     // Disable distributor while configuring

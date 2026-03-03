@@ -2,13 +2,14 @@
 //
 // Called from boot.S after the processor is in 64-bit mode with a valid stack.
 // On x86_64: RDI = multiboot2 info physical address.
-// On aarch64: x0  = DTB physical address (ignored; we use a fixed memory map).
+// On aarch64: x0  = DTB physical address (QEMU or VZ.framework).
 //
 // Initialises every subsystem in dependency order, then calls uni_main().
 // Every driver/network call from this point is a direct in-process function
 // call — no syscalls, no mode switches, no kernel/user copies.
 
 #include "kernel/arch.h"
+#include "kernel/fdt.h"
 #include "kernel/serial.h"
 #include "kernel/mm.h"
 #include "kernel/panic.h"
@@ -22,6 +23,7 @@
 #  include "kernel/idt.h"
 #elif defined(__aarch64__)
 #  include "kernel/aarch64/exceptions.h"
+#  include "kernel/aarch64/mmu.h"
 #endif
 
 // Provided by the user's application (e.g. apps/webserver/main.cc)
@@ -52,6 +54,34 @@ static void call_global_constructors() {
 extern "C" void kernel_main(uint64_t boot_info_addr) {
     zero_bss();
 
+#if defined(__aarch64__)
+    // Parse the Device Tree Blob to discover MMIO device addresses.
+    // Must be called before serial::init() (which uses fdt::info() for PL011
+    // address) and before virtio_net::init() (FDT virtio-mmio scan).
+    fdt::init(boot_info_addr);
+
+    // Map the PCIe ECAM region as device memory before any PCI access.
+    // VZ.framework places the ECAM at a runtime-chosen GPA (from FDT `reg`).
+    // mmu::map_device_range is a no-op for addresses in the first 4GB
+    // (those are already covered by boot.S and VZ Stage-2 overrides attrs).
+    {
+        const fdt::Info& fdt_info = fdt::info();
+        if (fdt_info.pcie_ecam_base != 0 && fdt_info.pcie_ecam_size != 0) {
+            mmu::map_device_range(fdt_info.pcie_ecam_base, fdt_info.pcie_ecam_size);
+        }
+    }
+
+    // VZ.framework uses virtio-pci for ALL I/O (no PL011, no virtio-mmio).
+    // PCI must be scanned before serial::init() so the console can be found.
+    {
+        const fdt::Info& fdt = fdt::info();
+        if (fdt.pcie_ecam_base != 0 && fdt.uart_base == 0
+            && fdt.virtio_count == 0) {
+            pci::init();  // early PCI scan for VZ console
+        }
+    }
+#endif
+
     serial::init();
     serial::printf("\n");
     serial::printf("==============================================\n");
@@ -64,6 +94,17 @@ extern "C" void kernel_main(uint64_t boot_info_addr) {
     serial::printf("  No OS, no syscalls, no context switches.\n");
     serial::printf("  All I/O is in-process via direct calls.\n");
     serial::printf("==============================================\n\n");
+
+#if defined(__aarch64__)
+    // Debug: show what the FDT parser found (helps diagnose VZ vs QEMU)
+    {
+        const fdt::Info& dbg = fdt::info();
+        serial::printf("[FDT] uart=0x%lx pcie=0x%lx virtio=%d gic=0x%lx ram=0x%lx+%uMB\n",
+                       dbg.uart_base, dbg.pcie_ecam_base,
+                       dbg.virtio_count, dbg.gic_dist_base,
+                       dbg.ram_base, (unsigned)(dbg.ram_size / (1024*1024)));
+    }
+#endif
 
 #if defined(__x86_64__)
     serial::printf("[INIT] GDT...\n");
@@ -83,14 +124,21 @@ extern "C" void kernel_main(uint64_t boot_info_addr) {
 
     call_global_constructors();
 
-#if !defined(__aarch64__)
-    // On ARM64 we use virtio-mmio transport, so no PCI bus scan is needed.
-    // Skipping it also prevents ISV=0 faults when running under HVF, since
-    // the PCIe ECAM at 0x4010000000 does not reliably produce ISV=1 exits.
+#if defined(__aarch64__)
+    // On ARM64, PCI may have been scanned early (for VZ console).
+    // If not yet scanned and PCI is available, scan now for virtio-net.
+    {
+        const fdt::Info& fdt = fdt::info();
+        if (fdt.pcie_ecam_base != 0) {
+            // pci::init() is idempotent — safe to call if already scanned
+            serial::printf("[INIT] PCI bus scan...\n");
+            pci::init();
+        }
+    }
+#else
     serial::printf("[INIT] PCI bus scan...\n");
     pci::init();
 #endif
-
     serial::printf("[INIT] Virtio-net driver...\n");
     bool net_ok = virtio_net::init();
     if (!net_ok) {

@@ -97,6 +97,12 @@ static inline void virtio_write32(uint64_t base, uint32_t v) { mmio_write32(base
 // Hint to the CPU to reduce power during a spin-wait loop.
 static inline void cpu_relax() { asm volatile("yield" ::: "memory"); }
 
+// Suspend until the next interrupt or event.  Safe with DAIF.I=1: WFI wakes on
+// any pending IRQ regardless of masking (ARM ARM B2.2.7).  Under VZ/HVF/KVM,
+// HCR_EL2.IMO=1 ensures virtual IRQs from virtio devices trigger the wake-up.
+// No GIC reconfiguration is needed — the hypervisor's vGIC handles routing.
+static inline void idle() { asm volatile("wfi" ::: "memory"); }
+
 // ---- ARM generic timer (for busy-wait timeouts) ----------------------------
 
 static inline uint64_t read_cntpct() {

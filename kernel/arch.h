@@ -175,6 +175,12 @@ static inline void virtio_write32(uint64_t base, uint32_t v) { outl((uint16_t)ba
 // Hint to the CPU to reduce power during a spin-wait loop.
 static inline void cpu_relax() { asm volatile("pause" ::: "memory"); }
 
+// Yield the CPU briefly when the event loop is idle.
+// TODO: replace with `sti; hlt; cli` once the PIC is initialised and interrupts
+// are unmasked.  HLT requires EFLAGS.IF=1; without a working 8259 PIC the CPU
+// would halt forever waiting for an IRQ that can never be delivered.
+static inline void idle() { asm volatile("pause" ::: "memory"); }
+
 // Power off the machine via QEMU's ACPI PIIX4 PM controller.
 // Writes the S5 sleep command (SLP_TYP=5, SLP_EN) to PM1_CNT at port 0x604.
 // Falls back to halting if the ACPI write has no effect.
