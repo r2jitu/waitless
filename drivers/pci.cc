@@ -35,86 +35,15 @@ static int device_count_ = 0;
 // Default to QEMU's address (0x4010000000); overridden when FDT provides one.
 static uint64_t g_ecam_base = 0x4010000000ULL;
 
-// PCIe resource windows for BAR assignment (QEMU -kernel only, not VZ).
-// QEMU does not run firmware to assign BAR addresses when using -kernel, so
-// we do a minimal PCI resource allocation here.  VZ pre-assigns BARs, so
-// these are only used as fallback.
+// PCIe resource windows for BAR assignment.
+// Starting address is overridden from FDT pci_mmio32_base in pci::init().
+// Fallback (0x10000000) matches the QEMU virt 32-bit MMIO window.
 static constexpr uint64_t PCI_MEM_START = 0x10000000ULL;
 
 static uint64_t g_pci_io_next  = 0x1000;
 static uint64_t g_pci_mem_next = PCI_MEM_START;
 
-// Probe one BAR, assign a resource, and update dev.bar[i].
-// Returns the number of BAR slots consumed (1 for 32-bit, 2 for 64-bit).
-// optnone: prevent the compiler from combining adjacent uint32_t writes into a
-// single 64-bit store (str x), which would be unaligned in the Device struct.
-__attribute__((optnone))
-static int assign_bar(Device& dev, int i) {
-    uint8_t off = 0x10 + i * 4;
-    uint32_t orig = read_config(dev.bus, dev.slot, dev.func, off);
-
-    if (orig == 0 || orig == 0xFFFFFFFF) return 1;  // not implemented
-
-    // Probe size: write all-ones, read back, restore
-    write_config(dev.bus, dev.slot, dev.func, off, 0xFFFFFFFF);
-    uint32_t probe = read_config(dev.bus, dev.slot, dev.func, off);
-    write_config(dev.bus, dev.slot, dev.func, off, orig);
-
-    bool is_io    = (orig & 0x1);
-    bool is_64bit = !is_io && ((orig & 0x6) == 0x4);
-
-    if (is_io) {
-        uint32_t size = ~(probe & ~0x3u) + 1;
-        if (size == 0 || size > 0x10000) return 1;
-        uint64_t port = (g_pci_io_next + size - 1) & ~(uint64_t)(size - 1);
-        g_pci_io_next = port + size;
-        write_config(dev.bus, dev.slot, dev.func, off, (uint32_t)(port | 0x1));
-        dev.bar[i] = (uint32_t)(port | 0x1);
-    } else if (is_64bit) {
-        // 64-bit BAR: probe high half too
-        uint8_t off_hi = off + 4;
-        write_config(dev.bus, dev.slot, dev.func, off_hi, 0xFFFFFFFF);
-        uint32_t probe_hi = read_config(dev.bus, dev.slot, dev.func, off_hi);
-        write_config(dev.bus, dev.slot, dev.func, off_hi, 0);  // keep high = 0
-        uint64_t sz64 = ~(((uint64_t)probe_hi << 32) | (probe & ~0xFu)) + 1;
-        if (sz64 == 0) { i++; return 2; }
-        uint64_t addr = (g_pci_mem_next + sz64 - 1) & ~(sz64 - 1);
-        g_pci_mem_next = addr + sz64;
-        write_config(dev.bus, dev.slot, dev.func, off,    (uint32_t)addr);
-        write_config(dev.bus, dev.slot, dev.func, off_hi, (uint32_t)(addr >> 32));
-        dev.bar[i]   = (uint32_t)addr;
-        dev.bar[i+1] = (uint32_t)(addr >> 32);
-        return 2;
-    } else {
-        uint32_t size = ~(probe & ~0xFu) + 1;
-        if (size == 0) return 1;
-        uint64_t addr = (g_pci_mem_next + size - 1) & ~(uint64_t)(size - 1);
-        g_pci_mem_next = addr + size;
-        write_config(dev.bus, dev.slot, dev.func, off, (uint32_t)addr);
-        dev.bar[i] = (uint32_t)addr;
-    }
-    return 1;
-}
-
-// Assign BAR addresses to an endpoint device and enable I/O + memory access.
-// If firmware (VZ) already enabled memory space, BARs are pre-assigned —
-// re-probing would corrupt PCIe bridge windows and cause synchronous exceptions.
-__attribute__((optnone))
-static void assign_bars(Device& dev) {
-    if ((dev.header_type & 0x7F) != 0x00) return;  // only type-0 endpoints
-
-    // Check if firmware already assigned BARs (Memory Space Enable set)
-    uint32_t cmd = read_config(dev.bus, dev.slot, dev.func, 0x04);
-    if (cmd & 0x2) return;  // trust firmware BAR assignments
-
-    for (int i = 0; i < 6; ) {
-        i += assign_bar(dev, i);
-    }
-    // Enable I/O space + memory space in the PCI command register
-    cmd = read_config(dev.bus, dev.slot, dev.func, 0x04);
-    cmd |= 0x3;
-    write_config(dev.bus, dev.slot, dev.func, 0x04, cmd);
-}
+// ── ECAM helpers (must come before assign_bar / assign_bars) ─────────────────
 
 static volatile uint32_t* ecam_ptr(uint8_t bus, uint8_t slot,
                                     uint8_t func, uint8_t offset) {
@@ -124,6 +53,121 @@ static volatile uint32_t* ecam_ptr(uint8_t bus, uint8_t slot,
                   + ((uint64_t)func << 12)
                   + ((uint64_t)(offset & 0xFC));
     return reinterpret_cast<volatile uint32_t*>(addr);
+}
+
+// 16-bit ECAM access — offset need not be 4-byte aligned.
+// Used for the PCI Command register (offset 0x04) to avoid touching the
+// adjacent read-only Status register (offset 0x06).  A 32-bit write to
+// dword 0x04 clobbers Status bits and crashes Apple VZ.framework.
+static volatile uint16_t* ecam_ptr16(uint8_t bus, uint8_t slot,
+                                      uint8_t func, uint8_t offset) {
+    uint64_t addr = g_ecam_base
+                  + ((uint64_t)bus  << 20)
+                  + ((uint64_t)slot << 15)
+                  + ((uint64_t)func << 12)
+                  + (uint64_t)offset;
+    return reinterpret_cast<volatile uint16_t*>(addr);
+}
+
+static uint16_t read_config16(uint8_t bus, uint8_t slot,
+                               uint8_t func, uint8_t offset) {
+    return *ecam_ptr16(bus, slot, func, offset);
+}
+
+static void write_config16(uint8_t bus, uint8_t slot,
+                            uint8_t func, uint8_t offset, uint16_t value) {
+    *ecam_ptr16(bus, slot, func, offset) = value;
+}
+
+// Assign a resource to BAR[i] and update dev.bar[i].
+// Returns the number of BAR slots consumed (1 for 32-bit, 2 for 64-bit).
+//
+// IMPORTANT: We do NOT probe BAR sizes by writing 0xFFFFFFFF.
+// Apple VZ.framework crashes if 0xFFFFFFFF is written to a BAR register.
+// Instead: if the address portion of a BAR is already non-zero (firmware
+// pre-assigned it), we leave it alone.  If the address is zero (unassigned),
+// we assign from our MMIO pool using a conservative 4 MB block — large
+// enough for all VirtIO PCI config structures.
+//
+// optnone: prevent adjacent uint32_t writes from being merged into a 64-bit
+// store (str x), which would be unaligned inside the Device struct.
+__attribute__((optnone))
+static int assign_bar(Device& dev, int i) {
+    uint8_t  off  = 0x10 + i * 4;
+    uint32_t orig = read_config(dev.bus, dev.slot, dev.func, off);
+
+    if (orig == 0xFFFFFFFF) return 1;  // slot not populated
+
+    bool is_io    = (orig & 0x1);
+    bool is_64bit = !is_io && ((orig & 0x6) == 0x4);
+
+    // Mask off type bits to get the address portion.
+    uint32_t addr_mask = is_io ? ~0x3u : ~0xFu;
+
+    if (is_64bit) {
+        // 64-bit BAR: combine low and high halves.
+        uint32_t orig_hi = read_config(dev.bus, dev.slot, dev.func, off + 4);
+        uint64_t cur = ((uint64_t)orig_hi << 32) | (orig & addr_mask);
+        if (cur != 0) return 2;  // already assigned by firmware
+
+        // Assign 4 MB from the MMIO pool, 4 MB-aligned.
+        constexpr uint64_t sz = 4ULL << 20;
+        uint64_t addr = (g_pci_mem_next + sz - 1) & ~(sz - 1);
+        g_pci_mem_next = addr + sz;
+        write_config(dev.bus, dev.slot, dev.func, off,     (uint32_t)addr);
+        write_config(dev.bus, dev.slot, dev.func, off + 4, (uint32_t)(addr >> 32));
+        dev.bar[i]   = (uint32_t)addr;
+        dev.bar[i+1] = (uint32_t)(addr >> 32);
+        return 2;
+    } else if (is_io) {
+        uint64_t cur = orig & addr_mask;
+        if (cur != 0) return 1;  // already assigned
+
+        // Assign 64 bytes of I/O space.
+        uint64_t port = (g_pci_io_next + 63) & ~(uint64_t)63;
+        g_pci_io_next = port + 64;
+        write_config(dev.bus, dev.slot, dev.func, off, (uint32_t)(port | 0x1));
+        dev.bar[i] = (uint32_t)(port | 0x1);
+    } else {
+        uint64_t cur = orig & addr_mask;
+        if (cur != 0) return 1;  // already assigned
+
+        // Assign 4 MB from the MMIO pool.
+        constexpr uint32_t sz = 4U << 20;
+        uint64_t addr = (g_pci_mem_next + sz - 1) & ~(uint64_t)(sz - 1);
+        g_pci_mem_next = addr + sz;
+        write_config(dev.bus, dev.slot, dev.func, off, (uint32_t)addr);
+        dev.bar[i] = (uint32_t)addr;
+    }
+    return 1;
+}
+
+// Assign BAR addresses to an endpoint device and enable I/O + memory access.
+// assign_bar() handles already-assigned BARs (address != 0) gracefully, so
+// this is safe to call even when firmware has pre-configured some BARs.
+//
+// If Memory Space Enable (bit 1 of Command) is already set, the device has
+// been configured by earlier software (e.g. virtio_console::init_vz).
+// Skip assignment entirely to avoid disrupting already-running devices.
+//
+// Command register write uses 16-bit ECAM access so it does not touch the
+// adjacent Status register (offset 0x06).  A 32-bit write to dword 0x04
+// clobbers Status write-1-to-clear bits and crashes Apple VZ.framework.
+__attribute__((optnone))
+static void assign_bars(Device& dev) {
+    if ((dev.header_type & 0x7F) != 0x00) return;  // only type-0 endpoints
+
+    // Skip devices already configured (Memory Space Enable set).
+    uint16_t cmd0 = read_config16(dev.bus, dev.slot, dev.func, 0x04);
+    if (cmd0 & 0x2) return;
+
+    for (int i = 0; i < 6; ) {
+        i += assign_bar(dev, i);
+    }
+    // Enable I/O + memory space via 16-bit write to Command register only.
+    uint16_t cmd = read_config16(dev.bus, dev.slot, dev.func, 0x04);
+    cmd |= 0x3;
+    write_config16(dev.bus, dev.slot, dev.func, 0x04, cmd);
 }
 
 uint32_t read_config(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset) {
@@ -240,6 +284,15 @@ void init() {
             mmu::map_device_range(g_ecam_base, ecam_size);
         }
     }
+    // Seed the MMIO pool from the FDT-reported 32-bit PCI MMIO aperture.
+    // Start ONE 4 MB block above the base to leave room for the VirtIO
+    // console BAR that virtio_console::init_vz() already assigned at
+    // pci_mmio32_base.  On QEMU the console uses virtio-mmio (not PCI),
+    // so this reservation is harmless — QEMU also puts its own MMIO window
+    // above 0x10000000 anyway.
+    if (fdt.pci_mmio32_base != 0) {
+        g_pci_mem_next = fdt.pci_mmio32_base + (4ULL << 20);
+    }
 #endif
 
 #if defined(__aarch64__)
@@ -310,10 +363,18 @@ const Device* get_devices(int* count) {
 // ============================================================================
 
 void enable_bus_mastering(const Device& dev) {
-    // PCI Command register is at offset 0x04, lower 16 bits
+    // Set Bus Master Enable (bit 2) in the PCI Command register.
+#if defined(__aarch64__)
+    // Use 16-bit ECAM write to avoid touching the Status register (offset 0x06).
+    // A 32-bit write to dword 0x04 clobbers Status bits and crashes Apple VZ.
+    uint16_t cmd = read_config16(dev.bus, dev.slot, dev.func, 0x04);
+    cmd |= (1 << 2);
+    write_config16(dev.bus, dev.slot, dev.func, 0x04, cmd);
+#else
     uint32_t cmd = read_config(dev.bus, dev.slot, dev.func, 0x04);
-    cmd |= (1 << 2); // Set Bus Master Enable bit
+    cmd |= (1 << 2);
     write_config(dev.bus, dev.slot, dev.func, 0x04, cmd);
+#endif
 }
 
 uint32_t read_bar(const Device& dev, int bar_idx) {

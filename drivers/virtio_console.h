@@ -23,7 +23,12 @@ namespace virtio_console {
 // or if initialisation fails.
 bool init(uint64_t base_addr);
 
-// Initialise via modern virtio-PCI transport (VZ.framework path).
+// Initialise directly from ECAM + MMIO window (VZ.framework path).
+// Scans the PCIe bus for 0x1AF4:0x1043/0x1003, assigns BAR, walks
+// capabilities, and initialises VirtIO — no pci.cc or virtio_pci.cc needed.
+bool init_vz(uint64_t ecam_base, uint64_t mmio32_base);
+
+// Initialise via modern virtio-PCI transport (VZ.framework path, layered).
 // Uses the same static BSS rings — safe to call before mm::init().
 bool init_pci(virtio_pci::Device* dev);
 

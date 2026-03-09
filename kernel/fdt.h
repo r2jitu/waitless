@@ -19,6 +19,8 @@ struct Info {
     uint64_t pcie_ecam_size;     // PCIe ECAM region size
     uint64_t ram_base;           // Physical RAM base from /memory node (0 if not found)
     uint64_t ram_size;           // RAM size in bytes (0 if not found in FDT)
+    uint64_t pci_mmio32_base;    // PCIe 32-bit MMIO aperture CPU address (from PCI ranges), 0 if not found
+    uint64_t pci_mmio32_size;    // PCIe 32-bit MMIO aperture size
 };
 
 #if defined(__aarch64__)

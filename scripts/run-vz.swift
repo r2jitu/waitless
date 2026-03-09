@@ -16,7 +16,7 @@
 //   Ports:  host:HOST_PORT → VM:80  (TCP proxy via Ethernet injection)
 //   Serial: stdin/stdout via VirtIO console (Ctrl-C → graceful shutdown)
 //
-// Requires macOS 13 (VZVirtioConsoleDeviceConfiguration).
+// Requires macOS 11 (VZVirtioConsoleDeviceSerialPortConfiguration).
 
 import Darwin
 import Foundation
@@ -382,7 +382,7 @@ final class NetBridge {
 
 // ─── VZVirtualMachine delegate ───────────────────────────────────────────────
 
-@available(macOS 13, *)
+@available(macOS 11, *)
 final class VMDelegate: NSObject, VZVirtualMachineDelegate {
     func virtualMachine(_ vm: VZVirtualMachine, didStopWithError error: Error) {
         restoreTerminal()
@@ -397,7 +397,7 @@ final class VMDelegate: NSObject, VZVirtualMachineDelegate {
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
-@available(macOS 13, *)
+@available(macOS 11, *)
 func main() throws {
     let args = CommandLine.arguments
     guard args.count >= 2 else {
@@ -429,14 +429,15 @@ func main() throws {
     let loader = VZLinuxBootLoader(kernelURL: URL(fileURLWithPath: binPath))
     cfg.bootLoader = loader
 
-    // Serial console: VirtIO console port 0 → stdin/stdout
-    let console = VZVirtioConsoleDeviceConfiguration()
-    let port0   = VZVirtioConsolePortConfiguration()
-    port0.attachment = VZFileHandleSerialPortAttachment(
+    // Serial console: VirtIO serial port → stdin/stdout.
+    // Uses VZVirtioConsoleDeviceSerialPortConfiguration (macOS 11+) which
+    // presents a simple single-port VirtIO console (no MULTIPORT feature),
+    // matching what hello-apple-vz demonstrates works with bare-metal kernels.
+    let serialPort = VZVirtioConsoleDeviceSerialPortConfiguration()
+    serialPort.attachment = VZFileHandleSerialPortAttachment(
         fileHandleForReading: FileHandle.standardInput,
         fileHandleForWriting: FileHandle.standardOutput)
-    console.ports[0] = port0
-    cfg.consoleDevices = [console]
+    cfg.serialPorts = [serialPort]
 
     // Network: VirtIO NIC → our bridge socket
     let net     = VZVirtioNetworkDeviceConfiguration()
@@ -475,9 +476,9 @@ func main() throws {
     RunLoop.main.run()
 }
 
-if #available(macOS 13, *) {
+if #available(macOS 11, *) {
     try main()
 } else {
-    fputs("run-vz: requires macOS 13 or later (VZVirtioConsoleDeviceConfiguration)\n", stderr)
+    fputs("run-vz: requires macOS 11 or later\n", stderr)
     exit(1)
 }

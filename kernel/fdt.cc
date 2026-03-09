@@ -84,10 +84,12 @@ void init(uint64_t dtb_addr) {
     // We scan nodes at any depth — devices can be under /soc or root.
     static constexpr int MAX_DEPTH = 8;
     struct NodeState {
-        int      compat;   // CF_* flags set from "compatible" property
-        uint64_t reg;      // first address from "reg" property
-        uint64_t reg_size; // first size from "reg" property
-        bool     has_reg;  // true once "reg" has been read
+        int            compat;       // CF_* flags set from "compatible" property
+        uint64_t       reg;          // first address from "reg" property
+        uint64_t       reg_size;     // first size from "reg" property
+        bool           has_reg;      // true once "reg" has been read
+        const uint8_t* ranges_data;  // pointer into DTB for "ranges" property value
+        uint32_t       ranges_len;   // byte length of "ranges" value
     };
     NodeState stack[MAX_DEPTH] = {};
     int depth = 0;
@@ -101,7 +103,7 @@ void init(uint64_t dtb_addr) {
         case FDT_BEGIN_NODE: {
             // Push a fresh node state for the new depth level.
             if (depth < MAX_DEPTH)
-                stack[depth] = {0, 0, 0, false};
+                stack[depth] = {0, 0, 0, false, nullptr, 0};
             depth++;
             // Skip the null-terminated node name.
             while (*p) ++p;
@@ -131,6 +133,26 @@ void init(uint64_t dtb_addr) {
                     if ((ns.compat & CF_PCI) && g_info.pcie_ecam_base == 0) {
                         g_info.pcie_ecam_base = ns.reg;
                         g_info.pcie_ecam_size = ns.reg_size;
+                    }
+
+                    // Parse PCI "ranges" to find the 32-bit MMIO aperture.
+                    // Each entry: [flags(4), child_hi(4), child_lo(4),
+                    //              cpu_hi(4), cpu_lo(4), size_hi(4), size_lo(4)] = 28 bytes.
+                    // Space type bits[25:24]: 0=cfg 1=I/O 2=32-bit-mem 3=64-bit-mem.
+                    if ((ns.compat & CF_PCI) && ns.ranges_data
+                            && ns.ranges_len >= 28 && g_info.pci_mmio32_base == 0) {
+                        for (uint32_t off = 0; off + 28 <= ns.ranges_len; off += 28) {
+                            const uint8_t* e   = ns.ranges_data + off;
+                            uint32_t flags     = be32(e);
+                            int space          = (flags >> 24) & 3;
+                            if (space == 2) { // 32-bit memory space
+                                uint64_t cpu_hi = be32(e + 12), cpu_lo = be32(e + 16);
+                                g_info.pci_mmio32_base = (cpu_hi << 32) | cpu_lo;
+                                g_info.pci_mmio32_size =
+                                    ((uint64_t)be32(e + 20) << 32) | be32(e + 24);
+                                break;
+                            }
+                        }
                     }
 
                     if ((ns.compat & CF_MEMORY) && g_info.ram_size == 0) {
@@ -180,6 +202,10 @@ void init(uint64_t dtb_addr) {
                     // Read size if present (next 2 cells after address).
                     stack[d].reg_size = (vlen >= 16) ? be64_2cell(vdata + 8) : 0;
                     stack[d].has_reg = true;
+                }
+                else if (str_eq(pname, "ranges") && vlen > 0) {
+                    stack[d].ranges_data = vdata;
+                    stack[d].ranges_len  = vlen;
                 }
             }
             break;

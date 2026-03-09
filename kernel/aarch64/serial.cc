@@ -85,11 +85,13 @@ void init() {
         }
     }
 
-    // Try PCI console (VZ.framework path — all I/O is virtio-pci).
-    // pci::init() must have been called before serial::init() for this to work.
+    // VZ.framework path: direct VirtIO PCI console (no pci.cc dependency).
+    // init_vz() assigns the console BAR at pci_mmio32_base and initialises
+    // VirtIO directly — mirroring hello-apple-vz/kernel.c.
+    // pci::init() (for the net driver) runs later and starts its MMIO pool
+    // one block above pci_mmio32_base so it does not conflict.
     if (fdt.pcie_ecam_base != 0) {
-        auto* dev = virtio_pci::find(3);  // DeviceID 3 = console
-        if (dev && virtio_console::init_pci(dev)) {
+        if (virtio_console::init_vz(fdt.pcie_ecam_base, fdt.pci_mmio32_base)) {
             g_backend = Backend::VIRTIO;
             return;
         }

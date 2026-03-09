@@ -71,15 +71,8 @@ extern "C" void kernel_main(uint64_t boot_info_addr) {
         }
     }
 
-    // VZ.framework uses virtio-pci for ALL I/O (no PL011, no virtio-mmio).
-    // PCI must be scanned before serial::init() so the console can be found.
-    {
-        const fdt::Info& fdt = fdt::info();
-        if (fdt.pcie_ecam_base != 0 && fdt.uart_base == 0
-            && fdt.virtio_count == 0) {
-            pci::init();  // early PCI scan for VZ console
-        }
-    }
+    // VZ.framework console is initialised directly inside serial::init()
+    // via virtio_console::init_vz() — no early pci::init() needed here.
 #endif
 
     serial::init();

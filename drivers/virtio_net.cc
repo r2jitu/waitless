@@ -86,12 +86,12 @@ static bool init_pci_modern() {
     uint32_t dev_features = virtio_pci::read_features(pci_dev_, 0);
     serial::printf("virtio_net: device features = 0x%x\n", dev_features);
 
-    uint32_t guest_features = 0;
-    if (dev_features & VIRTIO_NET_F_MAC)    guest_features |= VIRTIO_NET_F_MAC;
-    if (dev_features & VIRTIO_NET_F_STATUS) guest_features |= VIRTIO_NET_F_STATUS;
+    // Accept all offered word-0 features (VZ may require CSUM/INDIRECT_DESC
+    // etc.; our TX/RX paths don't use them actively but accepting is safe).
+    uint32_t guest_features = dev_features;
 
     virtio_pci::write_features(pci_dev_, 0, guest_features);
-    virtio_pci::write_features(pci_dev_, 1, 0);  // no high features
+    virtio_pci::write_features(pci_dev_, 1, 1);  // VIRTIO_F_VERSION_1 (bit 32)
     serial::printf("virtio_net: guest features = 0x%x\n", guest_features);
 
     virtio_pci::set_status(pci_dev_, virtio::STATUS_ACKNOWLEDGE | virtio::STATUS_DRIVER |

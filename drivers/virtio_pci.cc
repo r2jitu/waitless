@@ -230,6 +230,9 @@ void reset(Device* dev) {
 
 void set_status(Device* dev, uint8_t status) {
     w8(dev->common_cfg, CC_DEVICE_STATUS, status);
+    // Apple VZ processes config-space writes asynchronously.
+    // Brief delay lets the host I/O thread catch up before a subsequent read.
+    for (volatile int i = 0; i < 10000; i++) asm volatile("nop");
 }
 
 uint8_t get_status(Device* dev) {
@@ -244,6 +247,8 @@ uint32_t read_features(Device* dev, uint32_t word) {
 void write_features(Device* dev, uint32_t word, uint32_t features) {
     w32(dev->common_cfg, CC_DRIVER_FEATURE_SELECT, word);
     w32(dev->common_cfg, CC_DRIVER_FEATURE, features);
+    // VZ processes feature writes asynchronously; delay before next write.
+    for (volatile int i = 0; i < 10000; i++) asm volatile("nop");
 }
 
 // ============================================================================
