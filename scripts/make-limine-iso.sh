@@ -32,9 +32,11 @@ done
 command -v xorriso >/dev/null 2>&1 || die "xorriso not found. Install: brew install xorriso"
 command -v git >/dev/null 2>&1 || die "git not found"
 
-# Find project root (works both standalone and inside Bazel sandbox)
+# Find project root (works standalone, bazel run, and bazel genrule)
 if [[ -n "${BUILD_WORKSPACE_DIRECTORY:-}" ]]; then
     PROJECT_ROOT="$BUILD_WORKSPACE_DIRECTORY"
+elif PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+    : # git found it
 else
     PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 fi
@@ -116,8 +118,10 @@ XORRISO_ARGS+=(
 
 xorriso "${XORRISO_ARGS[@]}" 2>/dev/null
 
-# Install BIOS bootloader on the ISO (x86_64 only)
+# Install BIOS bootloader on the ISO (x86_64 only).
+# chmod +w needed because Bazel genrule output files may be read-only.
 if [[ "$ARCH" == "x86_64" && -x "$LIMINE_DIR/limine" ]]; then
+    chmod +w "$OUTPUT_ISO" 2>/dev/null || true
     "$LIMINE_DIR/limine" bios-install "$OUTPUT_ISO" 2>/dev/null || true
 fi
 

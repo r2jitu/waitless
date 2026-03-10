@@ -20,16 +20,29 @@ alias(
     actual = ":webserver_run",
 )
 
-# QEMU integration test: boots the webserver in QEMU and verifies HTTP.
-# Architecture is determined by the build platform config:
-#   bazel test //apps/webserver:integration_test
-#   bazel test //apps/webserver:integration_test --platforms=//bazel/platforms:x86_64_unikernel
+# --- Integration tests -------------------------------------------------------
+# Each target tests one boot environment. Skips (exit 0) if prerequisites
+# are not available (e.g. QEMU not installed, wrong host platform).
 #
-# Requirements: qemu-system-{x86_64,aarch64} (brew install qemu).
-# Skips (exit 0) if the QEMU binary is missing.
+#   bazel test //apps/webserver:test_vz                                 (macOS arm64 only)
+#   bazel test //apps/webserver:test_qemu                               (uses current arch)
+#   bazel test --config=x86_64 //apps/webserver:test_qemu               (force x86 QEMU)
+#   bazel test --config=x86_64 //apps/webserver:test_limine             (Limine ISO, x86 only)
+
 sh_test(
-    name = "integration_test",
-    srcs = ["integration_test.sh"],
+    name = "test_vz",
+    srcs = ["test_vz.sh"],
+    data = [
+        ":webserver.img",
+        "//scripts:run_vz",
+    ],
+    tags = ["local", "exclusive"],
+    timeout = "long",
+)
+
+sh_test(
+    name = "test_qemu",
+    srcs = ["test_qemu.sh"],
     data = [
         ":webserver.elf",
         ":webserver.img",
@@ -38,15 +51,12 @@ sh_test(
     timeout = "long",
 )
 
-# VZ.framework integration test: boots webserver via VZ.framework, verifies HTTP.
-# macOS arm64 only — skips on other platforms.
-#   bazel test //apps/webserver:integration_test_vz
 sh_test(
-    name = "integration_test_vz",
-    srcs = ["integration_test_vz.sh"],
+    name = "test_limine",
+    srcs = ["test_limine.sh"],
     data = [
-        ":webserver.img",
-        "//scripts:run_vz",
+        ":webserver.elf",
+        ":webserver_limine_iso",
     ],
     tags = ["local", "exclusive"],
     timeout = "long",
