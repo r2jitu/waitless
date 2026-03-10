@@ -13,12 +13,14 @@ unikernel_binary(
 )
 
 # Friendly aliases so users can type:
-#   bazel run //apps/webserver:run               (x86_64)
-#   bazel run --config=aarch64 //apps/webserver:run  (aarch64)
-alias(
-    name = "run",
-    actual = ":webserver_run",
-)
+#   bazel run //apps/webserver:run                    (auto-detect VZ or QEMU)
+#   bazel run //apps/webserver:run_vz                 (VZ.framework, macOS arm64)
+#   bazel run //apps/webserver:run_qemu               (QEMU, any arch)
+#   bazel run --config=x86_64 //apps/webserver:run_iso  (Limine ISO, x86_64)
+alias(name = "run", actual = ":webserver_run")
+alias(name = "run_vz", actual = ":webserver_run_vz")
+alias(name = "run_qemu", actual = ":webserver_run_qemu")
+alias(name = "run_iso", actual = ":webserver_run_iso")
 
 # --- Integration tests -------------------------------------------------------
 # Each target tests one boot environment. Skips (exit 0) if prerequisites

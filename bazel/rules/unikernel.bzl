@@ -15,7 +15,10 @@ def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
       - <name>.elf        : Bare-metal ELF kernel binary (identity-mapped)
       - <name>.limine.elf : Higher-half ELF for Limine boot
       - <name>.img        : Raw binary (objcopy, for QEMU -kernel / VZ)
-      - <name>_run        : Launch with QEMU or VZ.framework
+      - <name>_run        : Launch with auto-detected runner (QEMU or VZ)
+      - <name>_run_vz     : Launch with VZ.framework (macOS arm64)
+      - <name>_run_qemu   : Launch with QEMU (auto-detects arch)
+      - <name>_run_iso    : Launch Limine ISO with QEMU (x86_64)
       - <name>.iso        : Limine-bootable ISO (BIOS+UEFI, for cloud/QEMU)
 
     Args:
@@ -84,6 +87,56 @@ def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
             "UNIKERNEL_ELF_RELPATH": native.package_name() + "/" + name + ".elf",
             "UNIKERNEL_IMG_RELPATH": native.package_name() + "/" + name + ".img",
             "UNIKERNEL_VZ_RELPATH": "scripts/run-vz",
+        },
+        visibility = visibility,
+    )
+
+    # "bazel run //apps/<name>:run_vz" — VZ.framework (macOS arm64 only)
+    sh_binary(
+        name = name + "_run_vz",
+        srcs = ["//bazel/rules:run_vz.sh"],
+        data = [
+            ":" + name + ".img",
+            "//scripts:run_vz",
+        ],
+        env = {
+            "UNIKERNEL_IMG_RELPATH": native.package_name() + "/" + name + ".img",
+            "UNIKERNEL_VZ_RELPATH": "scripts/run-vz",
+        },
+        visibility = visibility,
+    )
+
+    # "bazel run //apps/<name>:run_qemu" — QEMU (auto-detects arch from ELF)
+    sh_binary(
+        name = name + "_run_qemu",
+        srcs = ["//bazel/rules:run_qemu.sh"],
+        data = [":" + name + ".elf"] + select({
+            "//bazel/platforms:aarch64": [":" + name + ".img"],
+            "//conditions:default": [],
+        }),
+        env = {
+            "UNIKERNEL_ELF_RELPATH": native.package_name() + "/" + name + ".elf",
+            "UNIKERNEL_IMG_RELPATH": native.package_name() + "/" + name + ".img",
+        },
+        visibility = visibility,
+    )
+
+    # "bazel run //apps/<name>:run_iso" — Limine ISO via QEMU (x86_64)
+    sh_binary(
+        name = name + "_run_iso",
+        srcs = ["//bazel/rules:run_iso.sh"],
+        data = select({
+            "//bazel/platforms:aarch64": [
+                ":" + name + ".elf",
+                ":" + name + ".iso",
+            ],
+            "//conditions:default": [
+                ":" + name + ".limine.elf",
+                ":" + name + ".iso",
+            ],
+        }),
+        env = {
+            "UNIKERNEL_ISO_RELPATH": native.package_name() + "/" + name + ".iso",
         },
         visibility = visibility,
     )

@@ -1,3 +1,8 @@
 package(default_visibility = ["//visibility:public"])
 
-exports_files(["run_wrapper.sh"])
+exports_files([
+    "run_wrapper.sh",
+    "run_vz.sh",
+    "run_qemu.sh",
+    "run_iso.sh",
+])
