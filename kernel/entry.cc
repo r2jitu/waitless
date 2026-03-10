@@ -71,8 +71,8 @@ extern "C" void kernel_main(uint64_t boot_info_addr) {
         }
     }
 
-    // VZ.framework console is initialised directly inside serial::init()
-    // via virtio_console::init_vz() — no early pci::init() needed here.
+    // serial::init() may call pci::init() early for VirtIO PCI console.
+    // The pci::init() call later in this function is idempotent.
 #endif
 
     serial::init();
@@ -118,8 +118,8 @@ extern "C" void kernel_main(uint64_t boot_info_addr) {
     call_global_constructors();
 
 #if defined(__aarch64__)
-    // On ARM64, PCI may have been scanned early (for VZ console).
-    // If not yet scanned and PCI is available, scan now for virtio-net.
+    // On ARM64, PCI may have been scanned early (for PCI console).
+    // pci::init() is idempotent — safe to call even if already scanned.
     {
         const fdt::Info& fdt = fdt::info();
         if (fdt.pcie_ecam_base != 0) {

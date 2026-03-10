@@ -147,8 +147,7 @@ static int assign_bar(Device& dev, int i) {
 // this is safe to call even when firmware has pre-configured some BARs.
 //
 // If Memory Space Enable (bit 1 of Command) is already set, the device has
-// been configured by earlier software (e.g. virtio_console::init_vz).
-// Skip assignment entirely to avoid disrupting already-running devices.
+// already been configured.  Skip to avoid disrupting running devices.
 //
 // Command register write uses 16-bit ECAM access so it does not touch the
 // adjacent Status register (offset 0x06).  A 32-bit write to dword 0x04
@@ -285,13 +284,9 @@ void init() {
         }
     }
     // Seed the MMIO pool from the FDT-reported 32-bit PCI MMIO aperture.
-    // Start ONE 4 MB block above the base to leave room for the VirtIO
-    // console BAR that virtio_console::init_vz() already assigned at
-    // pci_mmio32_base.  On QEMU the console uses virtio-mmio (not PCI),
-    // so this reservation is harmless — QEMU also puts its own MMIO window
-    // above 0x10000000 anyway.
+    // assign_bar() allocates 4 MB blocks sequentially from this base.
     if (fdt.pci_mmio32_base != 0) {
-        g_pci_mem_next = fdt.pci_mmio32_base + (4ULL << 20);
+        g_pci_mem_next = fdt.pci_mmio32_base;
     }
 #endif
 

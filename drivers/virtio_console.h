@@ -1,11 +1,11 @@
 #pragma once
-// drivers/virtio_console.h — VirtIO MMIO console driver (DeviceID = 3)
+// drivers/virtio_console.h — VirtIO console driver (DeviceID = 3)
 //
-// Provides serial I/O through the virtio-console device that VZ.framework
-// exposes via VZVirtioConsoleDeviceConfiguration.
+// Provides serial I/O through the virtio-console device over either
+// virtio-mmio (QEMU) or modern virtio-pci (VZ.framework, any PCI host).
 //
-// Uses statically-allocated ring buffers in BSS so init() can be called
-// before mm::init() (no dynamic allocation required).
+// Uses statically-allocated ring buffers in BSS so init() / init_pci()
+// can be called before mm::init() (no dynamic allocation required).
 //
 // Queue assignment (virtio-console port 0):
 //   Queue 0: receiveq  — incoming bytes from host (stdin)
@@ -23,13 +23,9 @@ namespace virtio_console {
 // or if initialisation fails.
 bool init(uint64_t base_addr);
 
-// Initialise directly from ECAM + MMIO window (VZ.framework path).
-// Scans the PCIe bus for 0x1AF4:0x1043/0x1003, assigns BAR, walks
-// capabilities, and initialises VirtIO — no pci.cc or virtio_pci.cc needed.
-bool init_vz(uint64_t ecam_base, uint64_t mmio32_base);
-
-// Initialise via modern virtio-PCI transport (VZ.framework path, layered).
-// Uses the same static BSS rings — safe to call before mm::init().
+// Initialise via modern virtio-PCI transport (works on any platform with
+// PCI, including Apple VZ.framework).  Uses the same static BSS rings —
+// safe to call before mm::init().
 bool init_pci(virtio_pci::Device* dev);
 
 // Write one byte to the console.  Blocks briefly until the device accepts it.

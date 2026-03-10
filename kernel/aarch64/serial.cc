@@ -1,13 +1,13 @@
 // kernel/aarch64/serial.cc — ARM64 serial console driver
 //
-// Supports two backends, selected at runtime based on DTB discovery:
+// Supports two backends, selected at runtime based on FDT discovery:
 //
 //   PL011 UART (QEMU "virt" machine):
-//     Physical address: 0x09000000 (from FDT "arm,pl011" node).
+//     Physical address discovered from FDT "arm,pl011" node.
 //     All register accesses are MMIO.
 //
-//   VirtIO console (VZ.framework):
-//     DeviceID=3 virtio-mmio device; address from FDT "virtio,mmio" scan.
+//   VirtIO console (VZ.framework, or any platform with PCI):
+//     Discovered via PCI bus scan (virtio-pci) or FDT virtio-mmio nodes.
 //     Uses virtio_console:: driver (drivers/virtio_console.h).
 //
 // PL011 register map (offsets from uart_base):
@@ -20,6 +20,7 @@
 
 #include "kernel/serial.h"
 #include "kernel/fdt.h"
+#include "drivers/pci.h"
 #include "drivers/virtio_console.h"
 #include "drivers/virtio_pci.h"
 #include <stdarg.h>
@@ -85,13 +86,13 @@ void init() {
         }
     }
 
-    // VZ.framework path: direct VirtIO PCI console (no pci.cc dependency).
-    // init_vz() assigns the console BAR at pci_mmio32_base and initialises
-    // VirtIO directly — mirroring hello-apple-vz/kernel.c.
-    // pci::init() (for the net driver) runs later and starts its MMIO pool
-    // one block above pci_mmio32_base so it does not conflict.
+    // PCI VirtIO console (VZ.framework and any other PCI-based platform).
+    // pci::init() is idempotent; calling it early is safe — the later call
+    // in kernel_main() will be a no-op.
     if (fdt.pcie_ecam_base != 0) {
-        if (virtio_console::init_vz(fdt.pcie_ecam_base, fdt.pci_mmio32_base)) {
+        pci::init();
+        virtio_pci::Device* con = virtio_pci::find(3);  // device type 3 = console
+        if (con && virtio_console::init_pci(con)) {
             g_backend = Backend::VIRTIO;
             return;
         }

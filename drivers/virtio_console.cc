@@ -1,7 +1,7 @@
-// drivers/virtio_console.cc — VirtIO MMIO console driver
+// drivers/virtio_console.cc — VirtIO console driver (MMIO + PCI)
 //
-// Implements the virtio-console (DeviceID=3) over the virtio-mmio v1 transport.
-// Uses two virtqueues:
+// Implements the virtio-console (DeviceID=3) over virtio-mmio or modern
+// virtio-pci transport.  Uses two virtqueues:
 //   Queue 0: receiveq  — host→guest bytes (stdin / Ctrl-C detection)
 //   Queue 1: transmitq — guest→host bytes (stdout)
 //
@@ -205,146 +205,12 @@ static bool init_pci_queue(virtio_pci::Device* dev, uint32_t qidx, uint8_t* mem)
 
 // ---- Public API ------------------------------------------------------------
 
-// Apple VZ.framework processes VirtIO config-space writes asynchronously on a
-// host-side I/O thread.  Without a brief pause between consecutive writes,
-// a read-after-write can return stale pre-write values (e.g. FEATURES_OK
-// check returns 0 even though the write was accepted).  10 000 nops ≈ a few
-// microseconds on Apple Silicon — enough for the host thread to catch up.
+// Brief delay for platforms (e.g. Apple VZ.framework) that process VirtIO
+// config-space writes asynchronously.  10 000 nops ≈ a few microseconds on
+// Apple Silicon — enough for the host I/O thread to catch up.
 static inline void vz_delay() {
     for (volatile int i = 0; i < 10000; i++)
         asm volatile("nop");
-}
-
-// ---- Direct VZ init (no pci.cc / virtio_pci.cc dependency) ----------------
-//
-// Scans the ECAM directly for the VirtIO console (0x1AF4:0x1043 or 0x1003),
-// assigns BAR0 from the 32-bit MMIO aperture, walks PCI capabilities, and
-// initialises the VirtIO device — mirroring hello-apple-vz/kernel.c exactly.
-//
-// Called from serial::init() on the VZ path (pcie_ecam_base != 0,
-// uart_base == 0, virtio_count == 0).  entry.cc no longer needs an early
-// pci::init() just to bring up the console.
-bool init_vz(uint64_t ecam_base, uint64_t mmio32_base) {
-    // ---- 1. Scan bus 0 for VirtIO console (DID 0x1043 modern or 0x1003 legacy) ---
-    uint64_t dbase = 0;
-    for (int slot = 0; slot < 32; slot++) {
-        uint64_t db  = ecam_base + ((uint64_t)slot << 15);
-        uint32_t id  = *(volatile uint32_t*)db;
-        if (id == 0 || id == 0xFFFFFFFF) continue;
-        uint16_t vid = (uint16_t)(id & 0xFFFF);
-        uint16_t did = (uint16_t)(id >> 16);
-        if (vid == 0x1AF4 && (did == 0x1043 || did == 0x1003)) {
-            dbase = db;
-            break;
-        }
-    }
-    if (!dbase) return false;
-
-    // ---- 2. Assign BAR0 from MMIO window; enable Memory Space + Bus Master ----
-    // VZ BARs are unassigned (type bits set, address = 0).
-    // DO NOT write 0xFFFFFFFF to probe size — crashes Apple VZ.
-    uint64_t bar0_addr = (mmio32_base != 0) ? mmio32_base : 0x50000000ULL;
-    *(volatile uint32_t*)(dbase + 0x10) = (uint32_t)bar0_addr;  // BAR0 low
-    *(volatile uint32_t*)(dbase + 0x14) = 0;                     // BAR0 high (64-bit)
-    // 16-bit write to Command register only — a 32-bit write also touches the
-    // Status register and crashes Apple VZ.framework.
-    uint16_t cmd = *(volatile uint16_t*)(dbase + 0x04);
-    *(volatile uint16_t*)(dbase + 0x04) = (uint16_t)(cmd | 0x06); // Mem + Bus Master
-
-    // ---- 3. Walk PCI capabilities (cap ID 0x09 = VirtIO vendor-specific) -----
-    volatile uint8_t* common_cfg     = nullptr;
-    volatile uint8_t* notify_cfg_ptr = nullptr;
-    uint32_t notify_off_mult         = 0;
-    for (uint8_t cp = *(volatile uint8_t*)(dbase + 0x34); cp;
-            cp = *(volatile uint8_t*)(dbase + cp + 1)) {
-        if (*(volatile uint8_t*)(dbase + cp) != 0x09) continue; // not VirtIO cap
-        uint8_t  ctype  = *(volatile uint8_t*) (dbase + cp + 3);
-        uint32_t offset = *(volatile uint32_t*)(dbase + cp + 8);
-        if (ctype == 1) common_cfg     = (volatile uint8_t*)(bar0_addr + offset);
-        else if (ctype == 2) {
-            notify_cfg_ptr  = (volatile uint8_t*)(bar0_addr + offset);
-            notify_off_mult = *(volatile uint32_t*)(dbase + cp + 16);
-        }
-    }
-    if (!common_cfg || !notify_cfg_ptr) return false;
-
-    // ---- 4. VirtIO modern init via common_cfg (with VZ async-write delays) ----
-    // Offset map (virtio_pci_common_cfg):
-    //   0x08 = driver_feature_select, 0x0C = driver_feature
-    //   0x14 = device_status
-    //   0x16 = queue_select, 0x18 = queue_size, 0x1C = queue_enable
-    //   0x1E = queue_notify_off
-    //   0x20/0x24 = queue_desc lo/hi, 0x28/0x2C = queue_driver lo/hi
-    //   0x30/0x34 = queue_device lo/hi
-
-    auto r8  = [&](int off) { return *(volatile uint8_t *)(common_cfg + off); };
-    auto r16 = [&](int off) { return *(volatile uint16_t*)(common_cfg + off); };
-    auto w8  = [&](int off, uint8_t  v) { *(volatile uint8_t *)(common_cfg + off) = v; };
-    auto w16 = [&](int off, uint16_t v) { *(volatile uint16_t*)(common_cfg + off) = v; };
-    auto w32 = [&](int off, uint32_t v) { *(volatile uint32_t*)(common_cfg + off) = v; };
-
-    w8(0x14, 0); vz_delay(); while (r8(0x14) != 0) {}  // RESET; poll until clear
-    w8(0x14, 1); vz_delay();   // ACKNOWLEDGE
-    w8(0x14, 3); vz_delay();   // DRIVER
-    // Feature negotiation: VIRTIO_F_VERSION_1 (bit 32 = word1[0])
-    w32(0x08, 0); w32(0x0C, 0); vz_delay();  // word 0: no optional features
-    w32(0x08, 1); w32(0x0C, 1); vz_delay();  // word 1: VERSION_1
-    w8(0x14, 11); vz_delay();   // FEATURES_OK
-    if (!(r8(0x14) & 8)) return false;       // VZ rejected features
-
-    // ---- 5. Set up virtqueues (QS=16 entries, reusing existing ring buffers) ---
-    // RX queue (0)
-    w16(0x16, 0); vz_delay();
-    { uint16_t qmax = r16(0x18);
-      w16(0x18, (QS <= (int)qmax) ? (uint16_t)QS : qmax); }
-    uint64_t rxd = (uint64_t)(uintptr_t)rx_mem_;
-    w32(0x20, (uint32_t)rxd);               w32(0x24, (uint32_t)(rxd >> 32));
-    w32(0x28, (uint32_t)(rxd+AVAIL_OFFSET));w32(0x2C, (uint32_t)((rxd+AVAIL_OFFSET)>>32));
-    w32(0x30, (uint32_t)(rxd+USED_OFFSET)); w32(0x34, (uint32_t)((rxd+USED_OFFSET)>>32));
-    uint16_t rx_noff = r16(0x1E);
-    w16(0x1C, 1);
-
-    // TX queue (1)
-    w16(0x16, 1); vz_delay();
-    { uint16_t qmax = r16(0x18);
-      w16(0x18, (QS <= (int)qmax) ? (uint16_t)QS : qmax); }
-    uint64_t txd = (uint64_t)(uintptr_t)tx_mem_;
-    w32(0x20, (uint32_t)txd);               w32(0x24, (uint32_t)(txd >> 32));
-    w32(0x28, (uint32_t)(txd+AVAIL_OFFSET));w32(0x2C, (uint32_t)((txd+AVAIL_OFFSET)>>32));
-    w32(0x30, (uint32_t)(txd+USED_OFFSET)); w32(0x34, (uint32_t)((txd+USED_OFFSET)>>32));
-    uint16_t tx_noff = r16(0x1E);
-    w16(0x1C, 1);
-
-    rx_notify_addr_ = (uint64_t)(notify_cfg_ptr + (uint64_t)rx_noff * notify_off_mult);
-    tx_notify_addr_ = (uint64_t)(notify_cfg_ptr + (uint64_t)tx_noff * notify_off_mult);
-
-    // Pre-populate RX descriptors so the host can send us data
-    for (int i = 0; i < QS; i++) {
-        rx_desc_addr(i)  = (uint64_t)(uintptr_t)&rx_bufs_[i];
-        rx_desc_len(i)   = 1;
-        rx_desc_flags(i) = DESC_F_WRITE;
-        rx_avail_ring(i) = (uint16_t)i;
-        rx_avail_idx_++;
-    }
-    asm volatile("dsb sy" ::: "memory");
-    rx_avail_idx_reg() = rx_avail_idx_;
-    asm volatile("dsb sy" ::: "memory");
-
-    // Prepare TX descriptor 0 (reused for every putc)
-    tx_desc_addr(0)  = (uint64_t)(uintptr_t)tx_buf_;
-    tx_desc_len(0)   = 1;
-    tx_desc_flags(0) = 0;
-
-    // DRIVER_OK
-    w8(0x14, 15); vz_delay();
-
-    // Kick RX queue and wait for VZ to fully initialise its console side
-    *(volatile uint16_t*)(rx_notify_addr_) = 0;
-    for (volatile int i = 0; i < 1000000; i++) asm volatile("nop");
-
-    pci_mode_ = true;
-    base_ = 1;  // non-zero sentinel: init complete
-    return true;
 }
 
 bool init_pci(virtio_pci::Device* dev) {
@@ -404,17 +270,22 @@ bool init_pci(virtio_pci::Device* dev) {
     asm volatile("dsb sy" ::: "memory");
     rx_avail_idx_reg() = rx_avail_idx_;
     asm volatile("dsb sy" ::: "memory");
-    // Kick RX queue via PCI notify
-    *reinterpret_cast<volatile uint16_t*>(rx_notify_addr_) = 0;
 
     // Set up TX descriptor 0
     tx_desc_addr(0)  = (uint64_t)(uintptr_t)tx_buf_;
     tx_desc_len(0)   = 1;
     tx_desc_flags(0) = 0;
 
-    // Activate device
+    // Activate device — must happen before RX kick (VZ ignores pre-DRIVER_OK kicks)
     virtio_pci::set_status(dev, STATUS_ACKNOWLEDGE | STATUS_DRIVER |
                                 STATUS_FEATURES_OK | STATUS_DRIVER_OK);
+
+    // Kick RX queue so the host can start sending us data.
+    *reinterpret_cast<volatile uint16_t*>(rx_notify_addr_) = 0;
+
+    // Brief pause for the host I/O thread to fully initialise after DRIVER_OK.
+    // Apple VZ.framework needs this; harmless (one-time ~few ms) elsewhere.
+    for (volatile int i = 0; i < 1000000; i++) asm volatile("nop");
 
     // Mark as initialized (base_ != 0 signals init complete)
     base_ = 1;  // non-zero sentinel for PCI mode
