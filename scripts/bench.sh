@@ -151,7 +151,7 @@ wait_ready() {
 
 record_result() {
     LABELS+=("$1"); RPS_ARR+=("$2"); P50_ARR+=("$3"); P99_ARR+=("$4")
-    printf "  %-35s  %12s  %8s  %8s\n" "$1" "$2" "$3" "$4"
+    printf "  → %s req/s  p50=%s  p99=%s\n" "$2" "$3" "$4"
 }
 
 # Run a wrk benchmark and store results into the named shell variables.
@@ -446,6 +446,17 @@ bench_native_server() {
 }
 
 print_results() {
+    [ ${#LABELS[@]} -eq 0 ] && { echo "No benchmark results to display."; return; }
+    echo "══════════════════════════════════════════════════════════════════════"
+    printf "  Results  (%s threads · %s connections · %ss · %s)\n" \
+        "$THREADS" "$CONNS" "$DURATION" "$ENDPOINT"
+    echo "══════════════════════════════════════════════════════════════════════"
+    printf "  %-35s  %12s  %8s  %8s\n" "Server" "Req/sec" "p50" "p99"
+    echo "──────────────────────────────────────────────────────────────────────"
+    for i in "${!LABELS[@]}"; do
+        printf "  %-35s  %12s  %8s  %8s\n" \
+            "${LABELS[$i]}" "${RPS_ARR[$i]}" "${P50_ARR[$i]}" "${P99_ARR[$i]}"
+    done
     echo "══════════════════════════════════════════════════════════════════════"
     echo "  To run with different parameters:"
     echo "    BENCH_CONNS=10 BENCH_DURATION=60 ./scripts/bench.sh"
@@ -477,14 +488,6 @@ else
     STEP_NATIVE=3
     TOTAL=3
 fi
-
-# Print the results table header once; record_result fills in rows as we go.
-echo "══════════════════════════════════════════════════════════════════════"
-printf "  %s threads · %s connections · %ss · %s\n" \
-    "$THREADS" "$CONNS" "$DURATION" "$ENDPOINT"
-echo "══════════════════════════════════════════════════════════════════════"
-printf "  %-35s  %12s  %8s  %8s\n" "Server" "Req/sec" "p50" "p99"
-echo "──────────────────────────────────────────────────────────────────────"
 
 # Run VZ benchmark (macOS arm64 only)
 if [ -n "$STEP_UNIKERNEL_VZ" ]; then
