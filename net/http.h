@@ -101,9 +101,11 @@ private:
     ActiveConn active_[MAX_ACTIVE];
 
     // ---- Helpers -----
-    bool        parse_request(const char* data, size_t len, Request* req) const;
+    // Returns number of bytes consumed (>0) on success, 0 if incomplete.
+    size_t      parse_request(const char* data, size_t len, Request* req) const;
     Handler     find_handler(const char* path) const;
-    void        send_response(net::tcp::Connection* conn, const Response& resp) const;
+    void        send_response(net::tcp::Connection* conn, const Response& resp,
+                              bool keep_alive) const;
     const char* status_text(int status) const;
     ActiveConn* alloc_active();
     void        free_active(ActiveConn* ac);

@@ -5,9 +5,9 @@
 //     calls tcp::poll() (which drives virtio_net::poll() + ethernet::receive()),
 //     checks for new connections via tcp::accept(), reads data from established
 //     connections, parses requests, dispatches to handlers, and sends responses.
-//   • HTTP/1.0-style: connection is closed after each response.  No keep-alive.
-//     This keeps the state machine trivial while still being correct HTTP/1.1
-//     (we send "Connection: close" so clients know).
+//   • HTTP/1.1 keep-alive: connections stay open after each response and serve
+//     multiple requests.  The client signals close via "Connection: close" header.
+//     This avoids TCP connection churn and ephemeral port exhaustion under load.
 //   • Zero copies at the app level: the TCP receive buffer is read directly into
 //     the request parser — no extra memcpy between kernel and "user" space,
 //     because there is no user space.
@@ -177,7 +177,7 @@ Handler Server::find_handler(const char* path) const {
 // Parses the raw byte stream in [data, data+len).
 // Returns true if a complete HTTP/1.x request has been parsed into *req.
 
-bool Server::parse_request(const char* data, size_t len, Request* req) const {
+size_t Server::parse_request(const char* data, size_t len, Request* req) const {
     memset(req, 0, sizeof(*req));
 
     // Find the end of the header section ("\r\n\r\n")
@@ -189,7 +189,7 @@ bool Server::parse_request(const char* data, size_t len, Request* req) const {
             break;
         }
     }
-    if (!header_end) return false; // incomplete headers
+    if (!header_end) return 0; // incomplete headers
 
     // Parse request line: "METHOD /path HTTP/1.x\r\n"
     const char* p = data;
@@ -247,6 +247,7 @@ bool Server::parse_request(const char* data, size_t len, Request* req) const {
 
     // Skip the blank line (\r\n)
     const char* body_start = header_end + 4;
+    size_t consumed = (size_t)(body_start - data);
 
     // Body (for POST/PUT)
     const char* cl = req->get_header("Content-Length");
@@ -258,35 +259,27 @@ bool Server::parse_request(const char* data, size_t len, Request* req) const {
             ++q;
         }
         size_t avail = (size_t)(data + len - body_start);
-        if (avail < body_len) return false; // body not fully received yet
+        if (avail < body_len) return 0; // body not fully received yet
         if (body_len > sizeof(req->body) - 1) body_len = sizeof(req->body) - 1;
         memcpy(req->body, body_start, body_len);
         req->body_len = body_len;
         req->body[body_len] = '\0';
+        consumed += body_len;
     }
 
-    return true;
+    return consumed;
 }
 
 // ---- Response sender --------------------------------------------------------
 
 void Server::send_response(net::tcp::Connection* conn,
-                           const Response& resp) const {
+                           const Response& resp, bool keep_alive) const {
     size_t body_len = resp.body_len ? resp.body_len : strlen(resp.body);
 
     // Build response headers in a stack buffer
     char header_buf[512];
-    int  hlen = 0;
-
-    // Status line
-    const char* st = status_text(resp.status);
-    hlen += (int)strlen("HTTP/1.1 ");
-    memcpy(header_buf + hlen - (int)strlen("HTTP/1.1 "),
-           "HTTP/1.1 ", strlen("HTTP/1.1 "));
-
-    // Use a small scratch area
     char* h = header_buf;
-    hlen = 0;
+    int  hlen = 0;
 
     // Helper: append string to header_buf
     auto append = [&](const char* s, size_t n = 0) {
@@ -300,27 +293,21 @@ void Server::send_response(net::tcp::Connection* conn,
     // "HTTP/1.1 200 OK\r\n"
     append("HTTP/1.1 ");
     char num[12]; fmt_int(num, sizeof(num), resp.status); append(num);
-    append(" "); append(st);
+    append(" "); append(status_text(resp.status));
     append("\r\n");
 
-    // "Content-Type: text/html\r\n"
     append("Content-Type: "); append(resp.content_type); append("\r\n");
 
-    // "Content-Length: 123\r\n"
     append("Content-Length: ");
     fmt_int(num, sizeof(num), (int)body_len);
     append(num); append("\r\n");
 
-    // "Connection: close\r\n"
-    append("Connection: close\r\n");
+    append(keep_alive ? "Connection: keep-alive\r\n"
+                      : "Connection: close\r\n");
 
-    // Blank line
     append("\r\n");
 
-    // Send headers
     tcp::send(conn, header_buf, (size_t)hlen);
-
-    // Send body (only for non-HEAD requests)
     if (body_len > 0) {
         tcp::send(conn, resp.body, body_len);
     }
@@ -395,7 +382,12 @@ void Server::run() {
             // Try to parse a complete HTTP request
             if (ac->buf_len > 0) {
                 Request req;
-                if (parse_request(ac->buf, ac->buf_len, &req)) {
+                size_t consumed = parse_request(ac->buf, ac->buf_len, &req);
+                if (consumed > 0) {
+                    // Check if client wants to close
+                    const char* conn_hdr = req.get_header("Connection");
+                    bool want_close = conn_hdr && str_iequal(conn_hdr, "close");
+
                     // Dispatch to the matching handler
                     Handler h = find_handler(req.path);
                     Response resp;
@@ -405,20 +397,20 @@ void Server::run() {
                         resp = Response::not_found();
                     }
 
-                    send_response(conn, resp);
-                    tcp::close(conn);
-                    free_active(ac);
+                    send_response(conn, resp, !want_close);
                     had_work = true;
 
-                    // (Optional) log
-                    const char* method_str =
-                        req.method == Request::GET    ? "GET"    :
-                        req.method == Request::POST   ? "POST"   :
-                        req.method == Request::PUT    ? "PUT"    :
-                        req.method == Request::DELETE ? "DELETE" :
-                        req.method == Request::HEAD   ? "HEAD"   : "?";
-                    serial::printf("http: %s %s -> %d\n",
-                                   method_str, req.path, resp.status);
+                    if (want_close) {
+                        tcp::close(conn);
+                        free_active(ac);
+                    } else {
+                        // Keep-alive: shift unconsumed bytes and continue
+                        size_t remaining = ac->buf_len - consumed;
+                        if (remaining > 0) {
+                            memcpy(ac->buf, ac->buf + consumed, remaining);
+                        }
+                        ac->buf_len = remaining;
+                    }
                 } else if (ac->buf_len >= sizeof(ac->buf)) {
                     // Buffer full and still no complete request — give up
                     tcp::close(conn);
