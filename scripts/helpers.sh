@@ -50,17 +50,21 @@ cleanup_vm() {
     [[ -n "${VM_LOG:-}" ]] && rm -f "$VM_LOG" || true
 }
 
-# Start QEMU in background for testing.
-# Usage: start_qemu PORT [EXTRA_QEMU_ARGS...]
+# Start QEMU in background.
+# Usage: start_qemu PORT [LOG] [EXTRA_QEMU_ARGS...]
+#   LOG: log file path; omit or pass "" to create a tempfile (sets VM_LOG).
 # Prereq: QEMU_BIN and VIRTIO_DEV must be set (via detect_qemu or manually).
-# Sets: VM_PID, VM_LOG
+# Sets: VM_PID; sets VM_LOG if LOG is empty.
 start_qemu() {
-    local port="$1"; shift
-    VM_LOG="$(mktemp /tmp/unikernel_test_XXXXXX.log)"
+    local port="$1" log="${2:-}"; shift 2
+    if [[ -z "$log" ]]; then
+        VM_LOG="$(mktemp /tmp/unikernel_test_XXXXXX.log)"
+        log="$VM_LOG"
+    fi
     "$QEMU_BIN" \
         "$@" \
         -m 128 -smp 1 -nographic \
-        -serial "file:${VM_LOG}" \
+        -serial "file:${log}" \
         -no-reboot \
         -device "${VIRTIO_DEV}",netdev=net0 \
         -netdev "user,id=net0,hostfwd=tcp::${port}-:80" \

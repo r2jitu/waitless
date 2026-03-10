@@ -21,7 +21,7 @@ command -v "$QEMU_BIN" &>/dev/null || { echo "SKIP: $QEMU_BIN not found"; exit 0
 
 PORT="${TEST_PORT:-18099}"
 echo "==> Booting webserver in $QEMU_BIN (port $PORT)..."
-start_qemu "$PORT" "${QEMU_MACHINE[@]}" -kernel "$KERNEL_ARG"
+start_qemu "$PORT" "" "${QEMU_MACHINE[@]}" -kernel "$KERNEL_ARG"
 
 if ! wait_http "$PORT" 60 "$VM_PID"; then
     echo "ERROR: not ready after 60s" >&2; cat "$VM_LOG" >&2; exit 1

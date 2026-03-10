@@ -244,16 +244,16 @@ bench_unikernel() {
 
     echo "  Building unikernel image..."
     cd "$PROJECT_ROOT"
+    # ELF is always produced — it is an intermediate product of the .img genrule.
+    local elf="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver.elf"
+    local img="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver.img"
     if [ "$runner" = "vz" ] || [ "$HOST_ARCH" = "arm64" ] || [ "$HOST_ARCH" = "aarch64" ]; then
-        # Build raw binary image (ELF→img conversion happens at Bazel build time).
         bazel build //apps/webserver:webserver.img 2>&1 | \
             grep -E '(INFO|ERROR|WARNING|Target)' | tail -3 || true
-        local img="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver.img"
         [ -f "$img" ] || die "IMG not found: $img"
     else
         bazel build //apps/webserver:webserver.elf 2>&1 | \
             grep -E '(INFO|ERROR|WARNING|Target)' | tail -3 || true
-        local elf="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver.elf"
         [ -f "$elf" ] || die "ELF not found: $elf"
     fi
 
@@ -276,16 +276,8 @@ bench_unikernel() {
     else
         # ── QEMU path ────────────────────────────────────────────────────────
         detect_qemu "$elf"
-        "$QEMU_BIN" \
-            "${QEMU_MACHINE[@]}" -kernel "$KERNEL_ARG" \
-            -m 128 -smp 1 \
-            -display none -monitor none \
-            -chardev "file,id=s0,path=${log}" -serial chardev:s0 \
-            -no-reboot \
-            -device "${VIRTIO_DEV}",netdev=net0 \
-            -netdev "user,id=net0,hostfwd=tcp::${port}-:80" \
-            </dev/null >/dev/null 2>&1 &
-        QEMU_PID=$!
+        start_qemu "$port" "$log" "${QEMU_MACHINE[@]}" -kernel "$KERNEL_ARG"
+        QEMU_PID=$VM_PID
     fi
 
     local timeout=60
@@ -362,16 +354,8 @@ bench_unikernel_x86() {
     rm -f "$log"
 
     detect_qemu "$elf"
-    "$QEMU_BIN" \
-        "${QEMU_MACHINE[@]}" -kernel "$KERNEL_ARG" \
-        -m 128 -smp 1 \
-        -display none -monitor none \
-        -chardev "file,id=s0,path=${log}" -serial chardev:s0 \
-        -no-reboot \
-        -device "${VIRTIO_DEV}",netdev=net0 \
-        -netdev "user,id=net0,hostfwd=tcp::${PORT_X86}-:80" \
-        </dev/null >/dev/null 2>&1 &
-    QEMU_PID=$!
+    start_qemu "$PORT_X86" "$log" "${QEMU_MACHINE[@]}" -kernel "$KERNEL_ARG"
+    QEMU_PID=$VM_PID
 
     if ! wait_ready "$PORT_X86" 120 "$QEMU_PID"; then
         echo "  Boot log (last 30 lines):"
