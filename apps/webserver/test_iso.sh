@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# apps/webserver/test_limine.sh — Boot webserver from Limine ISO via QEMU, verify HTTP.
+# apps/webserver/test_iso.sh — Boot webserver from Limine ISO via QEMU, verify HTTP.
 # Tests the full bootloader path: Limine BIOS → kernel ELF entry.
 # x86_64 only — skips on aarch64 (needs UEFI firmware).
 #
-#   bazel test --config=x86_64 //apps/webserver:test_limine
+#   bazel test --config=x86_64 //apps/webserver:test_iso
 
 set -euo pipefail
 
@@ -23,9 +23,9 @@ trap cleanup EXIT
 # ---- Locate binaries --------------------------------------------------------
 RUNFILES="${RUNFILES_DIR:-${BASH_SOURCE[0]%.sh}.runfiles}"
 ISO="${RUNFILES}/_main/apps/webserver/webserver.iso"
-ELF="${RUNFILES}/_main/apps/webserver/webserver.elf"
+ELF="${RUNFILES}/_main/apps/webserver/webserver.limine.elf"
 
-[[ -f "$ISO" ]] || { echo "ERROR: webserver_limine.iso not found at $ISO" >&2; exit 1; }
+[[ -f "$ISO" ]] || { echo "ERROR: webserver.iso not found at $ISO" >&2; exit 1; }
 
 # ---- Architecture check (x86 only) -----------------------------------------
 ELF_INFO="$(file "$ELF" 2>/dev/null || echo "")"
@@ -39,7 +39,7 @@ command -v "$QEMU_BIN" &>/dev/null || { echo "SKIP: $QEMU_BIN not found"; exit 0
 
 # ---- Boot from ISO ----------------------------------------------------------
 PORT="${TEST_PORT:-18097}"
-VM_LOG="$(mktemp /tmp/unikernel_limine_test_XXXXXX.log)"
+VM_LOG="$(mktemp /tmp/unikernel_iso_test_XXXXXX.log)"
 
 echo "==> Booting webserver from Limine ISO in $QEMU_BIN (port $PORT)..."
 "$QEMU_BIN" \
@@ -82,5 +82,5 @@ check_http "GET /health"  "http://localhost:${PORT}/health" "200"
 check_http "GET /notfound" "http://localhost:${PORT}/xyz"   "404" "Not Found"
 
 echo ""
-[[ $FAILURES -eq 0 ]] && { echo "ALL LIMINE TESTS PASSED"; exit 0; }
-echo "$FAILURES LIMINE TEST(S) FAILED"; tail -40 "$VM_LOG"; exit 1
+[[ $FAILURES -eq 0 ]] && { echo "ALL ISO TESTS PASSED"; exit 0; }
+echo "$FAILURES ISO TEST(S) FAILED"; tail -40 "$VM_LOG"; exit 1

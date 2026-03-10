@@ -12,7 +12,8 @@ def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
     """Build a unikernel ELF binary from application sources.
 
     Targets produced:
-      - <name>.elf        : Bare-metal ELF kernel binary
+      - <name>.elf        : Bare-metal ELF kernel binary (identity-mapped)
+      - <name>.limine.elf : Higher-half ELF for Limine boot
       - <name>.img        : Raw binary (objcopy, for QEMU -kernel / VZ)
       - <name>_run        : Launch with QEMU or VZ.framework
       - <name>.iso        : Limine-bootable ISO (BIOS+UEFI, for cloud/QEMU)
@@ -87,16 +88,44 @@ def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
         visibility = visibility,
     )
 
+    # Higher-half ELF for Limine boot.
+    # Limine revision 3 requires kernel virtual addresses >= 0xFFFF800000000000.
+    # This target re-links the same sources with a supplemental linker script
+    # that overrides __kernel_base to place the kernel in the top-2GB region.
+    # Excludes //kernel:boot (boot.S) because its 32-bit entry code uses
+    # R_X86_64_32 relocations that can't reach higher-half addresses.
+    # Limine enters at limine_entry() directly — boot.S is not needed.
+    cc_binary(
+        name = name + ".limine.elf",
+        srcs = srcs,
+        deps = deps + [
+            "//kernel:entry",
+            "//kernel:core",
+            "//kernel:arch_init",
+            "//drivers:virtio_net",
+            "//net",
+        ],
+        copts = copts,
+        linkopts = ["-Wl,-T,bazel/toolchain/unikernel_limine.ld"],
+        visibility = visibility,
+    )
+
     # Limine-bootable ISO (BIOS+UEFI hybrid).
-    # Works on both x86_64 and aarch64. Uses scripts/make-limine-iso.sh
-    # which fetches Limine binaries on first run.
+    # Uses the higher-half ELF on x86_64 (required by Limine revision 3)
+    # and the normal ELF on aarch64.
     # Prerequisites: xorriso (brew install xorriso), git.
     native.genrule(
         name = name + ".iso",
-        srcs = [
-            ":" + name + ".elf",
-            "//boot:limine.conf",
-        ],
+        srcs = select({
+            "//bazel/platforms:aarch64": [
+                ":" + name + ".elf",
+                "//boot:limine.conf",
+            ],
+            "//conditions:default": [
+                ":" + name + ".limine.elf",
+                "//boot:limine.conf",
+            ],
+        }),
         outs = [name + ".iso"],
         cmd = select({
             "//bazel/platforms:aarch64": """
@@ -106,9 +135,9 @@ def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
             """.format(name_elf = name + ".elf"),
             "//conditions:default": """
                 $(location //scripts:make_limine_iso) \
-                    $(location :{name_elf}) $@ \
+                    $(location :{name_limine_elf}) $@ \
                     --arch x86_64 --conf $(location //boot:limine.conf)
-            """.format(name_elf = name + ".elf"),
+            """.format(name_limine_elf = name + ".limine.elf"),
         }),
         tools = ["//scripts:make_limine_iso"],
         local = True,  # Needs network (first run) and host tools

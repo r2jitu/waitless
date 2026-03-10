@@ -27,7 +27,7 @@ alias(
 #   bazel test //apps/webserver:test_vz                                 (macOS arm64 only)
 #   bazel test //apps/webserver:test_qemu                               (uses current arch)
 #   bazel test --config=x86_64 //apps/webserver:test_qemu               (force x86 QEMU)
-#   bazel test --config=x86_64 //apps/webserver:test_limine             (Limine ISO, x86 only)
+#   bazel test --config=x86_64 //apps/webserver:test_iso                (Limine ISO, x86 only)
 
 sh_test(
     name = "test_vz",
@@ -53,10 +53,10 @@ sh_test(
 )
 
 sh_test(
-    name = "test_limine",
-    srcs = ["test_limine.sh"],
+    name = "test_iso",
+    srcs = ["test_iso.sh"],
     data = [
-        ":webserver.elf",
+        ":webserver.limine.elf",
         ":webserver.iso",
     ],
     target_compatible_with = ["@platforms//cpu:x86_64"],

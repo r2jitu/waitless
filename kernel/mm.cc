@@ -37,6 +37,9 @@ static uint64_t total_frames = 0;       // Total number of frames tracked
 static uint64_t used_frames = 0;        // Number of frames currently in use
 static uint64_t total_memory_bytes = 0; // Total RAM detected
 static uint64_t max_physical_addr = 0;  // Highest usable physical address
+static uint64_t g_hhdm_offset = 0;      // Limine HHDM offset (0 = identity-mapped)
+static uint64_t g_kernel_phys_base = 0; // Physical load address of kernel image
+static uint64_t g_kernel_virt_base = 0; // Virtual base of kernel image
 
 // ============================================================================
 // Bitmap helpers
@@ -117,6 +120,9 @@ static inline uint64_t align_up_page(uint64_t val) {
 
 void init(const boot::BootInfo &info) {
   // ---- Phase 1: Compute total memory and max physical address ----
+  g_hhdm_offset = info.hhdm_offset;
+  g_kernel_phys_base = info.kernel_phys_base;
+  g_kernel_virt_base = info.kernel_virt_base;
   total_memory_bytes = 0;
   max_physical_addr = 0;
 
@@ -134,10 +140,57 @@ void init(const boot::BootInfo &info) {
                  max_physical_addr);
 
   // ---- Phase 2: Set up frame bitmap ----
+  // When the kernel is linked in the higher half (Limine boot),
+  // _kernel_end is a virtual address like 0xFFFFFFFF801xxxxx.
+  // Compute the physical end using the phys/virt base from BootInfo.
+  // Limine revision 3 dropped identity mapping; access physical memory
+  // via HHDM: virtual = hhdm_offset + physical.
+  uint64_t kern_end_phys;
+  if (info.kernel_virt_base != 0) {
+    kern_end_phys = info.kernel_phys_base +
+                    (reinterpret_cast<uint64_t>(_kernel_end) -
+                     info.kernel_virt_base);
+  } else {
+    kern_end_phys = reinterpret_cast<uint64_t>(_kernel_end);
+  }
+
   total_frames = max_physical_addr / PAGE_SIZE;
   frame_bitmap_size = (total_frames + 7) / 8;
-  frame_bitmap = reinterpret_cast<uint8_t *>(
-      align_up_page(reinterpret_cast<uint64_t>(_kernel_end)));
+
+  // Find where to place the bitmap + heap.  We need bitmap_size + HEAP_SIZE
+  // of contiguous physical memory.  For identity-mapped boots the kernel is
+  // at 0x100000 (start of the big region), so placing after it works.
+  // For Limine, the kernel is near the END of RAM, so we search the memory
+  // map for the largest available region and place our structures there.
+  uint64_t needed = align_up_page(frame_bitmap_size) + HEAP_SIZE;
+  uint64_t placement_phys = 0;
+
+  if (info.kernel_virt_base != 0) {
+    // Higher-half (Limine): find the largest available region
+    uint64_t best_size = 0;
+    for (int i = 0; i < info.memory_map_count; i++) {
+      if (info.memory_map[i].type != boot::MemoryRegion::AVAILABLE)
+        continue;
+      uint64_t rbase = align_up_page(info.memory_map[i].base);
+      uint64_t rend =
+          (info.memory_map[i].base + info.memory_map[i].length) &
+          ~(PAGE_SIZE - 1);
+      if (rend > rbase && (rend - rbase) > best_size &&
+          (rend - rbase) >= needed) {
+        best_size = rend - rbase;
+        placement_phys = rbase;
+      }
+    }
+  }
+
+  if (placement_phys == 0) {
+    // Identity-mapped boot or fallback: place after kernel
+    placement_phys = align_up_page(kern_end_phys);
+  }
+
+  uint64_t bitmap_phys = placement_phys;
+  frame_bitmap =
+      reinterpret_cast<uint8_t *>(g_hhdm_offset + bitmap_phys);
 
   // Start: all frames used
   for (uint64_t i = 0; i < frame_bitmap_size; i++)
@@ -160,24 +213,24 @@ void init(const boot::BootInfo &info) {
     }
   }
 
-  // Reserve kernel image + frame bitmap
-  uint64_t bitmap_end =
-      reinterpret_cast<uint64_t>(frame_bitmap) + frame_bitmap_size;
-  mark_frames_used(0, bitmap_end);
+  // Reserve kernel image (physical) + bitmap
+  mark_frames_used(info.kernel_phys_base, kern_end_phys);
+  uint64_t bitmap_end_phys = bitmap_phys + align_up_page(frame_bitmap_size);
+  mark_frames_used(bitmap_phys, bitmap_end_phys);
 
   serial::printf("  Frame allocator: %u total frames, %u free frames\n",
                  (unsigned)total_frames,
                  (unsigned)(total_frames - used_frames));
 
   // ---- Phase 4: Set up the kernel heap ----
-
-  // The heap starts after the bitmap, page-aligned
-  heap_start = reinterpret_cast<uint8_t *>(align_up_page(bitmap_end));
+  // Heap starts after the bitmap, page-aligned. All pointers are virtual
+  // (HHDM-offset on Limine, identity-mapped otherwise).
+  uint64_t heap_phys = bitmap_end_phys;
+  heap_start = reinterpret_cast<uint8_t *>(g_hhdm_offset + heap_phys);
   heap_end = heap_start + HEAP_SIZE;
 
-  // Mark heap pages as used in the frame allocator
-  mark_frames_used(reinterpret_cast<uint64_t>(heap_start),
-                   reinterpret_cast<uint64_t>(heap_end));
+  // Mark heap pages as used in the frame allocator (physical addresses)
+  mark_frames_used(heap_phys, heap_phys + HEAP_SIZE);
 
   // Initialize the heap with a single large free block
   heap_head = reinterpret_cast<BlockHeader *>(heap_start);
@@ -185,9 +238,8 @@ void init(const boot::BootInfo &info) {
   heap_head->next = nullptr;
   heap_head->free = true;
 
-  serial::printf("  Heap: %u KB at 0x%lx - 0x%lx\n",
-                 (unsigned)(HEAP_SIZE / 1024), (uint64_t)heap_start,
-                 (uint64_t)heap_end);
+  serial::printf("  Heap: %u KB at phys 0x%lx\n",
+                 (unsigned)(HEAP_SIZE / 1024), heap_phys);
 }
 
 uint64_t alloc_frame() {
@@ -306,5 +358,22 @@ void kfree(void *ptr) {
 size_t get_total_memory() { return total_memory_bytes; }
 
 size_t get_free_memory() { return (total_frames - used_frames) * PAGE_SIZE; }
+
+void *phys_to_virt(uint64_t phys) {
+  return reinterpret_cast<void *>(g_hhdm_offset + phys);
+}
+
+uint64_t virt_to_phys(const void *virt) {
+  uint64_t addr = reinterpret_cast<uint64_t>(virt);
+  // Check kernel virtual range first — it's at higher addresses
+  // (0xFFFFFFFF80xxxxxx) than HHDM (0xFFFF800000000000).
+  if (g_kernel_virt_base != 0 && addr >= g_kernel_virt_base) {
+    return addr - g_kernel_virt_base + g_kernel_phys_base;
+  }
+  if (g_hhdm_offset != 0 && addr >= g_hhdm_offset) {
+    return addr - g_hhdm_offset;
+  }
+  return addr; // identity-mapped
+}
 
 } // namespace mm

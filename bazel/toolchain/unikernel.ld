@@ -1,7 +1,12 @@
 ENTRY(_start)
 
+/* Default kernel base address (identity-mapped for QEMU direct boot).
+   Overridable via a supplemental linker script that defines __kernel_base
+   as a strong symbol, overriding this PROVIDE (weak definition). */
+PROVIDE(__kernel_base = 0x100000);
+
 SECTIONS {
-    . = 1M;
+    . = __kernel_base;
 
     /* Multiboot2 header — scanned by GRUB/QEMU multiboot loader */
     .multiboot2 ALIGN(8) : {
@@ -22,8 +27,10 @@ SECTIONS {
     }
 
     /* Limine boot protocol requests — contiguous, between start/end markers.
-       Limine scans the ELF for these sections to discover boot requests. */
-    .limine_requests_start ALIGN(16) : {
+       Limine scans the ELF for these sections to discover boot requests.
+       Page-aligned so the RW segment doesn't share a page with .rodata (R),
+       which Limine's ELF loader rejects. */
+    .limine_requests_start ALIGN(4K) : {
         KEEP(*(.limine_requests_start))
     }
     .limine_requests ALIGN(16) : {

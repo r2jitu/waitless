@@ -52,4 +52,10 @@ size_t get_total_memory();
 // Return the amount of free physical RAM (in bytes).
 size_t get_free_memory();
 
+// Convert between physical and virtual addresses.
+// For identity-mapped boots (QEMU direct, VZ), these are no-ops.
+// For Limine higher-half boot, they apply the HHDM offset.
+void *phys_to_virt(uint64_t phys);
+uint64_t virt_to_phys(const void *virt);
+
 } // namespace mm

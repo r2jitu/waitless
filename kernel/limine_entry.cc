@@ -20,7 +20,14 @@
 
 // Forward declarations
 extern "C" void kernel_boot_from_bootinfo(boot::BootInfo *info);
-static void limine_entry();
+
+// On x86_64, Limine enters via limine_entry_stub (limine_boot.S) which
+// enables SSE before calling limine_entry_cpp().  On aarch64, Limine
+// calls limine_entry_cpp() directly.
+#if defined(__x86_64__)
+extern "C" void limine_entry_stub();
+#endif
+extern "C" void limine_entry_cpp();
 
 // ---- Limine request structs (placed in .limine_requests section) ------------
 
@@ -40,14 +47,19 @@ static volatile uint64_t limine_base_revision[3] = {
 static volatile limine::MemmapRequest memmap_request;
 
 // Entry point request — entry field must be populated at link time so
-// Limine knows to call limine_entry() instead of _start.
+// Limine knows to call our entry point instead of _start.
+// On x86_64, the stub enables SSE before calling C++ code.
 [[gnu::used, gnu::section(".limine_requests")]]
 static volatile limine::EntryPointRequest entry_point_request = {
     {limine::COMMON_MAGIC_0, limine::COMMON_MAGIC_1, 0x13d86c035a1cd3e1,
      0x2b0caa89d8f3026a},
     0,       // revision
     nullptr, // response (filled by Limine)
-    limine_entry,
+#if defined(__x86_64__)
+    limine_entry_stub,
+#else
+    limine_entry_cpp,
+#endif
 };
 
 // HHDM request
@@ -77,10 +89,28 @@ static volatile uint64_t limine_end_marker[2] = {
 
 static boot::BootInfo limine_boot_info;
 
-static void limine_entry() {
+extern "C" void limine_entry_cpp() {
   limine_boot_info.protocol = boot::Protocol::LIMINE;
   limine_boot_info.memory_map_count = 0;
   limine_boot_info.dtb_addr = 0;
+  limine_boot_info.kernel_phys_base = 0;
+  limine_boot_info.kernel_virt_base = 0;
+  limine_boot_info.hhdm_offset = 0;
+
+  // HHDM offset — Limine revision 3 dropped identity mapping of the first 4GB.
+  // All physical memory must be accessed via HHDM: virt = hhdm_offset + phys.
+  if (hhdm_request.response) {
+    limine_boot_info.hhdm_offset = hhdm_request.response->offset;
+  }
+
+  // Kernel address — needed by mm::init() to compute physical addresses
+  // for the frame bitmap and heap.
+  if (kaddr_request.response) {
+    limine_boot_info.kernel_phys_base =
+        kaddr_request.response->physical_base;
+    limine_boot_info.kernel_virt_base =
+        kaddr_request.response->virtual_base;
+  }
 
   // Memory map
   if (memmap_request.response) {

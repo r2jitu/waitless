@@ -320,18 +320,18 @@ void Server::send_response(net::tcp::Connection *conn, const Response &resp,
                            bool keep_alive) const {
   size_t body_len = resp.body_len ? resp.body_len : strlen(resp.body);
 
-  // Build response headers in a stack buffer
-  char header_buf[512];
-  char *h = header_buf;
-  int hlen = 0;
+  // Build entire response (headers + body) in a single buffer so it goes out
+  // as one tcp::send — halving the number of TCP segments per response.
+  char buf[2048];
+  int len = 0;
 
-  // Helper: append string to header_buf
+  // Helper: append string to buf
   auto append = [&](const char *s, size_t n = 0) {
     if (n == 0)
       n = strlen(s);
-    if (hlen + (int)n < (int)sizeof(header_buf)) {
-      memcpy(h + hlen, s, n);
-      hlen += (int)n;
+    if (len + (int)n < (int)sizeof(buf)) {
+      memcpy(buf + len, s, n);
+      len += (int)n;
     }
   };
 
@@ -357,10 +357,11 @@ void Server::send_response(net::tcp::Connection *conn, const Response &resp,
 
   append("\r\n");
 
-  tcp::send(conn, header_buf, (size_t)hlen);
   if (body_len > 0) {
-    tcp::send(conn, resp.body, body_len);
+    append(resp.body, body_len);
   }
+
+  tcp::send(conn, buf, (size_t)len);
 }
 
 // ---- Event loop -------------------------------------------------------------

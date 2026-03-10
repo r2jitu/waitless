@@ -145,8 +145,9 @@ bool Virtqueue::init(uint16_t queue_size_param, uint64_t base,
     mm::alloc_frame();
   }
 
-  // In a unikernel with identity mapping, physical == virtual.
-  uint8_t *base_ptr = reinterpret_cast<uint8_t *>(phys_base);
+  // Convert physical to virtual for CPU access (identity or HHDM).
+  uint8_t *base_ptr =
+      reinterpret_cast<uint8_t *>(mm::phys_to_virt(phys_base));
 
   // Step 5: Zero the entire region
   for (uint64_t i = 0; i < total_size; i++) {
@@ -253,7 +254,8 @@ bool Virtqueue::init_pci_modern(uint16_t queue_size_param, uint64_t notify_addr,
     mm::alloc_frame();
   }
 
-  uint8_t *base_ptr = reinterpret_cast<uint8_t *>(phys_base);
+  uint8_t *base_ptr =
+      reinterpret_cast<uint8_t *>(mm::phys_to_virt(phys_base));
   for (uint64_t i = 0; i < total_size; i++) {
     base_ptr[i] = 0;
   }
@@ -307,9 +309,10 @@ int Virtqueue::add_buf(void **buffers, uint32_t *lengths, int out_count,
   uint16_t head = free_head_;
   uint16_t idx = head;
 
-  // Set up output (device-readable) buffers
+  // Set up output (device-readable) buffers.
+  // Descriptor addresses must be guest-physical for DMA.
   for (int i = 0; i < out_count; i++) {
-    descs_[idx].addr = reinterpret_cast<uint64_t>(buffers[i]);
+    descs_[idx].addr = mm::virt_to_phys(buffers[i]);
     descs_[idx].len = lengths[i];
     descs_[idx].flags = 0;
     if (i < total - 1) {
@@ -322,7 +325,7 @@ int Virtqueue::add_buf(void **buffers, uint32_t *lengths, int out_count,
 
   // Set up input (device-writable) buffers
   for (int i = 0; i < in_count; i++) {
-    descs_[idx].addr = reinterpret_cast<uint64_t>(buffers[out_count + i]);
+    descs_[idx].addr = mm::virt_to_phys(buffers[out_count + i]);
     descs_[idx].len = lengths[out_count + i];
     descs_[idx].flags = VIRTQ_DESC_F_WRITE;
     if (i < in_count - 1) {

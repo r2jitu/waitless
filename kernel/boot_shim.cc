@@ -71,6 +71,9 @@ void shim_x86(BootInfo *info, uint64_t boot_info_addr) {
   info->protocol = Protocol::UNKNOWN;
   info->memory_map_count = 0;
   info->dtb_addr = 0;
+  info->kernel_phys_base = 0;
+  info->kernel_virt_base = 0;
+  info->hhdm_offset = 0;
 
   if (boot_info_addr == 0) {
     // Fallback: assume 128MB
@@ -157,6 +160,9 @@ void shim_x86(BootInfo *info, uint64_t boot_info_addr) {
 void shim_fdt(BootInfo *info, uint64_t dtb_addr) {
   info->protocol = Protocol::FDT;
   info->dtb_addr = dtb_addr;
+  info->kernel_phys_base = 0;
+  info->kernel_virt_base = 0;
+  info->hhdm_offset = 0;
 
   const fdt::Info &fdt_mem = fdt::info();
   uint64_t ram_base =

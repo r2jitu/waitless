@@ -125,7 +125,10 @@ cc_library(
 
 cc_library(
     name = "limine_entry",
-    srcs = ["limine_entry.cc"],
+    srcs = ["limine_entry.cc"] + select({
+        "//bazel/platforms:x86_64": ["limine_boot.S"],
+        "//conditions:default": [],
+    }),
     deps = [":boot_info", ":limine_proto", ":fdt"] + select({
         "//bazel/platforms:aarch64": [":mmu"],
         "//conditions:default": [],

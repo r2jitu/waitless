@@ -594,16 +594,12 @@ const uint8_t *get_mac() { return mac_; }
 static void tx_drain() {
   uint16_t used_id;
   uint32_t used_len;
-#if defined(__aarch64__)
-  // Diagnostic: check if tx_queue_.used_ is outside VZ's 128MB range [0,
-  // 0x08000000). If the pointer is bad, exit cleanly (RC=0) so we know the
-  // address is invalid. If the pointer looks valid, fall through and crash at
-  // used_->idx (RC=1 = mysterious).
-#endif
+  // Descriptor addr fields contain physical addresses (set by add_buf).
+  // Compute slot index via physical address arithmetic.
+  uint64_t pool_phys = mm::virt_to_phys(tx_pool_);
   while (tx_queue_.get_used(&used_id, &used_len)) {
     virtio::VirtqDesc *d = tx_queue_.desc(used_id);
-    TxBuf *buf = reinterpret_cast<TxBuf *>(d->addr);
-    int slot = (int)(buf - tx_pool_);
+    int slot = (int)((d->addr - pool_phys) / sizeof(TxBuf));
     if (slot >= 0 && slot < TX_POOL_SIZE) {
       tx_pool_used_[slot] = false;
     }
@@ -691,9 +687,10 @@ int poll(void (*callback)(const uint8_t *data, uint32_t len)) {
 
   while (rx_queue_.get_used(&used_id, &used_len)) {
     // The used_id is the descriptor index. The descriptor's addr field
-    // points to the RxBuffer that the device wrote into.
+    // contains the physical address of the RxBuffer.
     virtio::VirtqDesc *desc = rx_queue_.desc(used_id);
-    RxBuffer *buf = reinterpret_cast<RxBuffer *>(desc->addr);
+    RxBuffer *buf =
+        reinterpret_cast<RxBuffer *>(mm::phys_to_virt(desc->addr));
 
     // Sanity check: used_len must be larger than the virtio header
     if (used_len > sizeof(VirtioNetHeader)) {
