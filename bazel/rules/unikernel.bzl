@@ -13,11 +13,9 @@ def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
 
     Targets produced:
       - <name>.elf        : Bare-metal ELF kernel binary
-      - <name>.img        : Raw ARM64 binary (objcopy, for QEMU/VZ)
+      - <name>.img        : Raw binary (objcopy, for QEMU -kernel / VZ)
       - <name>_run        : Launch with QEMU or VZ.framework
       - <name>_limine_iso : Limine-bootable ISO (BIOS+UEFI, for cloud/QEMU)
-      - <name>_iso        : Legacy GRUB multiboot2 ISO (x86 only)
-      - <name>_raw        : Raw disk image (legacy)
 
     Args:
         name: Base name for all output targets.
@@ -114,36 +112,5 @@ def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
         }),
         tools = ["//scripts:make_limine_iso"],
         local = True,  # Needs network (first run) and host tools
-        visibility = visibility,
-    )
-
-    # Legacy: GRUB multiboot2 ISO (x86 only).
-    # Falls back to copying the raw ELF if grub-mkrescue is not available.
-    native.genrule(
-        name = name + "_iso",
-        srcs = [":" + name + ".elf"],
-        outs = [name + ".iso"],
-        cmd = """
-            mkdir -p $(@D)/iso/boot/grub
-            cp $(location :{name_elf}) $(@D)/iso/boot/kernel.elf
-            echo 'set timeout=0' > $(@D)/iso/boot/grub/grub.cfg
-            echo 'set default=0' >> $(@D)/iso/boot/grub/grub.cfg
-            echo 'menuentry "unikernel" {{' >> $(@D)/iso/boot/grub/grub.cfg
-            echo '  multiboot2 /boot/kernel.elf' >> $(@D)/iso/boot/grub/grub.cfg
-            echo '}}' >> $(@D)/iso/boot/grub/grub.cfg
-            grub-mkrescue -o $@ $(@D)/iso 2>/dev/null || cp $(location :{name_elf}) $@
-        """.format(name_elf = name + ".elf"),
-        visibility = visibility,
-    )
-
-    # Legacy: raw disk image (ELF at offset 0).
-    native.genrule(
-        name = name + "_raw",
-        srcs = [":" + name + ".elf"],
-        outs = [name + ".raw"],
-        cmd = """
-            dd if=/dev/zero of=$@ bs=1M count=64 2>/dev/null
-            dd if=$(location :{name_elf}) of=$@ conv=notrunc 2>/dev/null
-        """.format(name_elf = name + ".elf"),
         visibility = visibility,
     )
