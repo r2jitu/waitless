@@ -20,18 +20,13 @@ alias(
     actual = ":webserver_run",
 )
 
-# End-to-end integration test: boots the webserver in QEMU and verifies HTTP.
-#
-# Via "bazel test" (recommended for CI — enforces timeout + result reporting):
-#   bazel test //apps/webserver:integration_test              # x86_64
-#   bazel test --config=aarch64 //apps/webserver:integration_test  # aarch64
-#
-# Via "bazel run" (interactive — shows live output):
-#   bazel run //apps/webserver:integration_test
-#   bazel run --config=aarch64 //apps/webserver:integration_test
+# QEMU integration test: boots the webserver in QEMU and verifies HTTP.
+# Architecture is determined by the build platform config:
+#   bazel test //apps/webserver:integration_test
+#   bazel test //apps/webserver:integration_test --platforms=//bazel/platforms:x86_64_unikernel
 #
 # Requirements: qemu-system-{x86_64,aarch64} (brew install qemu).
-# If the QEMU binary is missing the test exits 0 (skip, not fail).
+# Skips (exit 0) if the QEMU binary is missing.
 sh_test(
     name = "integration_test",
     srcs = ["integration_test.sh"],
@@ -39,8 +34,20 @@ sh_test(
         ":webserver.elf",
         ":webserver.img",
     ],
-    # local     — must run on the dev machine (needs QEMU + host networking)
-    # exclusive — uses a fixed port; avoid parallel runs with itself
     tags = ["local", "exclusive"],
-    timeout = "long",  # allows up to 15 min; QEMU boot typically takes 5-30s
+    timeout = "long",
+)
+
+# VZ.framework integration test: boots webserver via VZ.framework, verifies HTTP.
+# macOS arm64 only — skips on other platforms.
+#   bazel test //apps/webserver:integration_test_vz
+sh_test(
+    name = "integration_test_vz",
+    srcs = ["integration_test_vz.sh"],
+    data = [
+        ":webserver.img",
+        "//scripts:run_vz",
+    ],
+    tags = ["local", "exclusive"],
+    timeout = "long",
 )
