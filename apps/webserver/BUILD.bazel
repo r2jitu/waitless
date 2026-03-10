@@ -36,6 +36,7 @@ sh_test(
         ":webserver.img",
         "//scripts:run_vz",
     ],
+    target_compatible_with = ["@platforms//cpu:aarch64"],
     tags = ["local", "exclusive"],
     timeout = "long",
 )
@@ -58,6 +59,7 @@ sh_test(
         ":webserver.elf",
         ":webserver.iso",
     ],
+    target_compatible_with = ["@platforms//cpu:x86_64"],
     tags = ["local", "exclusive"],
     timeout = "long",
 )
