@@ -50,6 +50,7 @@ PORT_VZ="${BENCH_PORT}"
 PORT_QEMU="$((BENCH_PORT + 1))"
 PORT_DOCKER="$((BENCH_PORT + 2))"
 PORT_NATIVE="$((BENCH_PORT + 3))"
+PORT_X86="$((BENCH_PORT + 4))"
 
 # ── State ────────────────────────────────────────────────────────────────────
 QEMU_PID=""
@@ -211,7 +212,7 @@ check_prereqs() {
     fi
 
     # Check all benchmark ports are free
-    for _p in "$PORT_VZ" "$PORT_QEMU" "$PORT_DOCKER" "$PORT_NATIVE"; do
+    for _p in "$PORT_VZ" "$PORT_QEMU" "$PORT_X86" "$PORT_DOCKER" "$PORT_NATIVE"; do
         if lsof -i ":${_p}" -sTCP:LISTEN >/dev/null 2>&1; then
             die "Port ${_p} is already in use.  Set BENCH_PORT=<other base port>."
         fi
@@ -348,9 +349,12 @@ bench_unikernel() {
     echo ""
 }
 
-# ── Benchmark 1b: Unikernel (QEMU x86-64) ─────────────────────────────────────
+# ── Benchmark: Unikernel (QEMU x86-64 cross-emulation) ────────────────────────
 bench_unikernel_x86() {
-    echo "==> Unikernel (QEMU x86-64 TCG)"
+    local step=$1
+    local url="http://127.0.0.1:${PORT_X86}${ENDPOINT}"
+    wait_port_pool
+    echo "==> [${step}/${TOTAL}] Unikernel (QEMU x86-64 TCG)"
 
     if ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
         echo "  qemu-system-x86_64 not found — skipping"
@@ -363,34 +367,39 @@ bench_unikernel_x86() {
     bazel build --platforms=//bazel/platforms:x86_64_unikernel \
         //apps/webserver:webserver.elf 2>&1 | \
         grep -E '(INFO|ERROR|WARNING|Target)' | tail -3 || true
-    local elf
-    elf=$(bazel info --platforms=//bazel/platforms:x86_64_unikernel \
-          bazel-bin 2>/dev/null)/apps/webserver/webserver.elf
-    if [ ! -f "$elf" ]; then
-        # Fallback path
-        elf="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver.elf"
-    fi
+    local elf="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver.elf"
     [ -f "$elf" ] || { echo "  ELF not found — skipping"; echo ""; return 0; }
 
     local log="/tmp/unikernel-x86-bench.log"
     rm -f "$log"
 
+    # On Apple Silicon, HVF can't run x86 code — must use TCG.
+    # On x86 Macs, try HVF for hardware acceleration.
+    local accel_flags=()
+    if [ "$HOST_ARCH" = "x86_64" ]; then
+        if [ "$HOST_OS" = "Darwin" ] && sysctl -n kern.hv_support 2>/dev/null | grep -q '^1$'; then
+            accel_flags=(-accel hvf)
+        elif [ "$HOST_OS" = "Linux" ] && [ -r /dev/kvm ]; then
+            accel_flags=(-accel kvm)
+        fi
+    fi
+
     qemu-system-x86_64 \
         -kernel "$elf" \
         -m 128 -smp 1 \
-        -cpu max \
+        -cpu qemu64 \
         -display none -monitor none \
         -chardev "file,id=s0,path=${log}" -serial chardev:s0 \
         -no-reboot \
         -device virtio-net-pci,netdev=net0 \
-        -netdev "user,id=net0,hostfwd=tcp::${BENCH_PORT}-:80" \
-        -accel hvf 2>/dev/null \
+        -netdev "user,id=net0,hostfwd=tcp::${PORT_X86}-:80" \
+        ${accel_flags[@]+"${accel_flags[@]}"} \
         </dev/null >/dev/null 2>&1 &
     QEMU_PID=$!
 
-    if ! wait_ready "$BENCH_PORT" 60 "$QEMU_PID"; then
-        echo "  Boot log (last 20 lines):"
-        tail -20 "$log" 2>/dev/null || echo "  (no log)"
+    if ! wait_ready "$PORT_X86" 120 "$QEMU_PID"; then
+        echo "  Boot log (last 30 lines):"
+        tail -30 "$log" 2>/dev/null || echo "  (no log)"
         kill -TERM "$QEMU_PID" 2>/dev/null; QEMU_PID=""
         echo "  Skipping x86-64 benchmark."
         echo ""
@@ -398,15 +407,12 @@ bench_unikernel_x86() {
     fi
 
     local rps p50 p99
-    run_wrk "unikernel_x86" rps p50 p99
+    run_wrk "unikernel_x86" rps p50 p99 "$url"
 
     kill -TERM "$QEMU_PID" 2>/dev/null; wait "$QEMU_PID" 2>/dev/null || true
     QEMU_PID=""
 
-    LABELS+=("Unikernel (QEMU x86-64 TCG)")
-    RPS_ARR+=("$rps")
-    P50_ARR+=("$p50")
-    P99_ARR+=("$p99")
+    record_result "Unikernel (QEMU x86-64 TCG)" "$rps" "$p50" "$p99"
     echo ""
 }
 
@@ -505,19 +511,25 @@ check_prereqs
 
 # On macOS arm64, run both VZ (hardware-accelerated) and QEMU (TCG).
 # On other platforms, only one unikernel runner is available.
+# x86-64 cross-emulation benchmark runs if qemu-system-x86_64 is installed.
+HAS_QEMU_X86=false
+command -v qemu-system-x86_64 >/dev/null 2>&1 && HAS_QEMU_X86=true
+
+NEXT_STEP=1
+STEP_UNIKERNEL_VZ=""
+STEP_UNIKERNEL_QEMU=""
+STEP_UNIKERNEL_X86=""
+
 if [ "$HOST_OS" = "Darwin" ] && [ "$HOST_ARCH" = "arm64" ] && [ "${UNIKERNEL_RUNNER:-}" != "qemu" ]; then
-    STEP_UNIKERNEL_VZ=1
-    STEP_UNIKERNEL_QEMU=2
-    STEP_DOCKER=3
-    STEP_NATIVE=4
-    TOTAL=4
-else
-    STEP_UNIKERNEL_VZ=""
-    STEP_UNIKERNEL_QEMU=1
-    STEP_DOCKER=2
-    STEP_NATIVE=3
-    TOTAL=3
+    STEP_UNIKERNEL_VZ=$NEXT_STEP; NEXT_STEP=$((NEXT_STEP + 1))
 fi
+STEP_UNIKERNEL_QEMU=$NEXT_STEP; NEXT_STEP=$((NEXT_STEP + 1))
+if [ "$HAS_QEMU_X86" = true ] && [ "$HOST_ARCH" != "x86_64" ]; then
+    STEP_UNIKERNEL_X86=$NEXT_STEP; NEXT_STEP=$((NEXT_STEP + 1))
+fi
+STEP_DOCKER=$NEXT_STEP; NEXT_STEP=$((NEXT_STEP + 1))
+STEP_NATIVE=$NEXT_STEP; NEXT_STEP=$((NEXT_STEP + 1))
+TOTAL=$((NEXT_STEP - 1))
 
 # Run VZ benchmark (macOS arm64 only)
 if [ -n "$STEP_UNIKERNEL_VZ" ]; then
@@ -528,8 +540,9 @@ fi
 UNIKERNEL_RUNNER=qemu bench_unikernel "$STEP_UNIKERNEL_QEMU" "$PORT_QEMU"
 
 # Run x86-64 QEMU benchmark (cross-architecture emulation)
-# TODO: fix x86-64 crash before re-enabling
-# bench_unikernel_x86
+if [ -n "$STEP_UNIKERNEL_X86" ]; then
+    bench_unikernel_x86 "$STEP_UNIKERNEL_X86"
+fi
 
 if [ "$HAVE_DOCKER" = true ]; then
     bench_docker_server

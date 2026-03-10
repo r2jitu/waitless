@@ -179,6 +179,69 @@ static inline void dsb_st() { asm volatile("" ::: "memory"); }  // store barrier
 static inline void dsb_sy() { asm volatile("" ::: "memory"); }  // full barrier
 static inline void dsb_ld() { asm volatile("" ::: "memory"); }  // load barrier
 
+// Read the Time Stamp Counter (monotonic cycle counter).
+static inline uint64_t rdtsc() {
+    uint32_t lo, hi;
+    asm volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+// Calibrate TSC frequency using the PIT channel 2 (one-shot mode).
+// Returns TSC ticks per microsecond.  Called once during boot.
+static inline uint64_t calibrate_tsc_per_us() {
+    // PIT oscillator frequency: 1,193,182 Hz.
+    // Count for ~10ms: 1193182/100 = 11932 ticks → ~10.000ms.
+    constexpr uint16_t PIT_COUNT = 11932;
+    constexpr uint16_t PIT_CH2_PORT = 0x42;
+    constexpr uint16_t PIT_CMD_PORT = 0x43;
+    constexpr uint16_t PIT_GATE_PORT = 0x61;
+
+    // Disable speaker, enable gate for channel 2
+    uint8_t gate = inb(PIT_GATE_PORT);
+    gate = (gate & 0xFD) | 0x01;  // clear speaker bit, set gate bit
+    outb(PIT_GATE_PORT, gate);
+
+    // Channel 2, mode 0 (one-shot), binary, lo/hi byte
+    outb(PIT_CMD_PORT, 0xB0);
+    outb(PIT_CH2_PORT, (uint8_t)(PIT_COUNT & 0xFF));
+    outb(PIT_CH2_PORT, (uint8_t)(PIT_COUNT >> 8));
+
+    // Reset the latch by toggling the gate
+    gate = inb(PIT_GATE_PORT);
+    outb(PIT_GATE_PORT, gate & 0xFE);  // gate low → reset
+    outb(PIT_GATE_PORT, gate | 0x01);   // gate high → start counting
+
+    uint64_t start = rdtsc();
+
+    // Wait for OUT pin (bit 5 of port 0x61) to go high (counter reached 0)
+    while (!(inb(PIT_GATE_PORT) & 0x20)) {
+        asm volatile("nop");
+    }
+
+    uint64_t elapsed = rdtsc() - start;
+    // PIT_COUNT ticks at 1,193,182 Hz = PIT_COUNT/1193182 seconds
+    // = PIT_COUNT/1193182 * 1e6 microseconds = PIT_COUNT * 1e6 / 1193182
+    // TSC per microsecond = elapsed / (PIT_COUNT * 1e6 / 1193182)
+    //                     = elapsed * 1193182 / (PIT_COUNT * 1000000)
+    // Simplify: elapsed * 1193182 / 11932000000
+    //         ≈ elapsed / 10000  (since 11932/1193182 ≈ 0.01s)
+    return elapsed / 10000;
+}
+
+// Busy-wait for approximately `microseconds` microseconds.
+// On first call, calibrates the TSC frequency via the PIT.
+static inline void udelay(uint64_t microseconds) {
+    static uint64_t tsc_per_us = 0;
+    if (tsc_per_us == 0) {
+        tsc_per_us = calibrate_tsc_per_us();
+        if (tsc_per_us == 0) tsc_per_us = 1;  // safety fallback
+    }
+    uint64_t end = rdtsc() + tsc_per_us * microseconds;
+    while (rdtsc() < end) {
+        asm volatile("pause" ::: "memory");
+    }
+}
+
 // Hint to the CPU to reduce power during a spin-wait loop.
 static inline void cpu_relax() { asm volatile("pause" ::: "memory"); }
 
