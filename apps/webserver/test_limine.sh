@@ -22,7 +22,7 @@ trap cleanup EXIT
 
 # ---- Locate binaries --------------------------------------------------------
 RUNFILES="${RUNFILES_DIR:-${BASH_SOURCE[0]%.sh}.runfiles}"
-ISO="${RUNFILES}/_main/apps/webserver/webserver_limine.iso"
+ISO="${RUNFILES}/_main/apps/webserver/webserver.iso"
 ELF="${RUNFILES}/_main/apps/webserver/webserver.elf"
 
 [[ -f "$ISO" ]] || { echo "ERROR: webserver_limine.iso not found at $ISO" >&2; exit 1; }

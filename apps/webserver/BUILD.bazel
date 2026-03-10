@@ -56,7 +56,7 @@ sh_test(
     srcs = ["test_limine.sh"],
     data = [
         ":webserver.elf",
-        ":webserver_limine_iso",
+        ":webserver.iso",
     ],
     tags = ["local", "exclusive"],
     timeout = "long",

@@ -15,7 +15,7 @@ def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
       - <name>.elf        : Bare-metal ELF kernel binary
       - <name>.img        : Raw binary (objcopy, for QEMU -kernel / VZ)
       - <name>_run        : Launch with QEMU or VZ.framework
-      - <name>_limine_iso : Limine-bootable ISO (BIOS+UEFI, for cloud/QEMU)
+      - <name>.iso        : Limine-bootable ISO (BIOS+UEFI, for cloud/QEMU)
 
     Args:
         name: Base name for all output targets.
@@ -92,12 +92,12 @@ def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
     # which fetches Limine binaries on first run.
     # Prerequisites: xorriso (brew install xorriso), git.
     native.genrule(
-        name = name + "_limine_iso",
+        name = name + ".iso",
         srcs = [
             ":" + name + ".elf",
             "//boot:limine.conf",
         ],
-        outs = [name + "_limine.iso"],
+        outs = [name + ".iso"],
         cmd = select({
             "//bazel/platforms:aarch64": """
                 $(location //scripts:make_limine_iso) \
