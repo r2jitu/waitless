@@ -2,6 +2,7 @@
 #include "net/ethernet.h"
 #include "net/ipv4.h"
 #include "net/arp.h"
+#include "kernel/arch.h"
 #include "kernel/mm.h"
 #include "kernel/serial.h"
 #include "drivers/virtio_net.h"
@@ -302,9 +303,24 @@ static bool send_request() {
     return true;
 }
 
+// Poll for DHCP response with a real time-based timeout.
+// On hardware-accelerated VZ, iteration-based loops complete in microseconds
+// because each poll() is just a memory read at native CPU speed.
+// Using arch::udelay() ensures the timeout is reliable across TCG and HW accel.
+static void dhcp_poll_wait(bool* flag, int timeout_ms) {
+    // Poll in 1ms increments until timeout or flag is set.
+    for (int ms = 0; ms < timeout_ms && !*flag; ms++) {
+        // Do a batch of polls per ms to keep latency low
+        for (int i = 0; i < 100 && !*flag; i++) {
+            virtio_net::poll(dhcp_receive);
+        }
+        arch::udelay(1000); // 1ms
+    }
+}
+
 bool discover() {
-    static constexpr int MAX_RETRIES = 3;
-    static constexpr int POLLS_PER_RETRY = 300000;
+    static constexpr int MAX_RETRIES = 5;
+    static constexpr int RETRY_TIMEOUT_MS = 2000; // 2 seconds per retry
 
     serial::printf("dhcp: starting discovery...\n");
 
@@ -322,9 +338,7 @@ bool discover() {
             return false;
         }
 
-        for (int i = 0; i < POLLS_PER_RETRY && !got_offer; i++) {
-            virtio_net::poll(dhcp_receive);
-        }
+        dhcp_poll_wait(&got_offer, RETRY_TIMEOUT_MS);
     }
 
     if (!got_offer) {
@@ -341,9 +355,7 @@ bool discover() {
             return false;
         }
 
-        for (int i = 0; i < POLLS_PER_RETRY && !got_ack; i++) {
-            virtio_net::poll(dhcp_receive);
-        }
+        dhcp_poll_wait(&got_ack, RETRY_TIMEOUT_MS);
     }
 
     if (!got_ack) {

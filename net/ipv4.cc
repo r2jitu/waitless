@@ -2,7 +2,6 @@
 #include "net/ethernet.h"
 #include "net/arp.h"
 #include "net/tcp.h"
-#include "kernel/mm.h"
 #include "kernel/serial.h"
 
 extern "C" void* memcpy(void* dst, const void* src, size_t n);
@@ -14,14 +13,13 @@ namespace ipv4 {
 // Incrementing packet ID counter
 static uint16_t next_id = 1;
 
+// Static TX buffer: max IP packet = 20 (IP) + 20 (TCP) + 1460 (MSS) = 1500.
+// Single-threaded, non-reentrant on hot path (gateway ARP cached).
+static uint8_t ip_buf_[sizeof(Ipv4Header) + 1480];
+
 void send(Ipv4Addr dst, uint8_t protocol, const void* payload, size_t len) {
     size_t total_len = sizeof(Ipv4Header) + len;
-    uint8_t* buf = (uint8_t*)mm::kmalloc(total_len);
-    if (!buf) {
-        serial::printf("ipv4: failed to allocate send buffer (%u bytes)\n",
-                       (unsigned)total_len);
-        return;
-    }
+    uint8_t* buf = ip_buf_;
 
     Ipv4Header* hdr = (Ipv4Header*)buf;
     hdr->version_ihl = 0x45;   // IPv4, IHL=5 (20 bytes, no options)
@@ -48,7 +46,6 @@ void send(Ipv4Addr dst, uint8_t protocol, const void* payload, size_t len) {
     if (dst == IP_BROADCAST) {
         // Broadcast goes directly on the local network
         ethernet::send(MAC_BROADCAST, ethernet::ETHERTYPE_IPV4, buf, total_len);
-        mm::kfree(buf);
         return;
     }
 
@@ -63,7 +60,6 @@ void send(Ipv4Addr dst, uint8_t protocol, const void* payload, size_t len) {
     MacAddr dst_mac = arp::resolve(next_hop);
 
     ethernet::send(dst_mac, ethernet::ETHERTYPE_IPV4, buf, total_len);
-    mm::kfree(buf);
 }
 
 void receive(const uint8_t* data, size_t len) {

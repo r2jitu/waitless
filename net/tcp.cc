@@ -72,20 +72,26 @@ static size_t rx_buf_free(Connection* conn) {
 }
 
 static void rx_buf_write(Connection* conn, const uint8_t* data, size_t len) {
-    for (size_t i = 0; i < len; i++) {
-        conn->rx_buf[conn->rx_head] = data[i];
-        conn->rx_head = (conn->rx_head + 1) % conn->rx_buf_size;
+    // Fast memcpy for contiguous runs, avoiding per-byte modulo.
+    while (len > 0) {
+        // Contiguous space from head to end-of-buffer (or to tail if tail > head)
+        size_t contig = conn->rx_buf_size - conn->rx_head;
+        if (contig > len) contig = len;
+        memcpy(conn->rx_buf + conn->rx_head, data, contig);
+        conn->rx_head = (conn->rx_head + contig) % conn->rx_buf_size;
+        data += contig;
+        len -= contig;
     }
 }
+
+// Static TX buffer for send_segment.  Safe because the unikernel is
+// single-threaded and the hot path (gateway ARP cached) is non-reentrant.
+static uint8_t seg_buf_[sizeof(TcpHeader) + MSS];
 
 static void send_segment(Connection* conn, uint8_t flags,
                           const void* data, size_t len) {
     size_t total = sizeof(TcpHeader) + len;
-    uint8_t* buf = (uint8_t*)mm::kmalloc(total);
-    if (!buf) {
-        serial::printf("tcp: failed to allocate segment buffer\n");
-        return;
-    }
+    uint8_t* buf = seg_buf_;
 
     TcpHeader* tcp = (TcpHeader*)buf;
     tcp->src_port = htons(conn->local_port);
@@ -106,16 +112,16 @@ static void send_segment(Connection* conn, uint8_t flags,
                                   ipv4::PROTO_TCP, buf, total);
 
     ipv4::send(conn->remote_ip, ipv4::PROTO_TCP, buf, total);
-    mm::kfree(buf);
 }
 
 // Send a RST to a remote host (not tied to an existing connection)
+static uint8_t rst_buf_[sizeof(TcpHeader)];
+
 static void send_rst(Ipv4Addr remote_ip, uint16_t local_port,
                      uint16_t remote_port, uint32_t seq_num,
                      uint32_t ack_num) {
     size_t total = sizeof(TcpHeader);
-    uint8_t* buf = (uint8_t*)mm::kmalloc(total);
-    if (!buf) return;
+    uint8_t* buf = rst_buf_;
 
     TcpHeader* tcp = (TcpHeader*)buf;
     tcp->src_port = htons(local_port);
@@ -132,7 +138,6 @@ static void send_rst(Ipv4Addr remote_ip, uint16_t local_port,
                                   ipv4::PROTO_TCP, buf, total);
 
     ipv4::send(remote_ip, ipv4::PROTO_TCP, buf, total);
-    mm::kfree(buf);
 }
 
 static void free_connection(Connection* conn) {
@@ -227,9 +232,14 @@ size_t recv(Connection* conn, void* buf, size_t max_len) {
     }
 
     uint8_t* dst = (uint8_t*)buf;
-    for (size_t i = 0; i < to_read; i++) {
-        dst[i] = conn->rx_buf[conn->rx_tail];
-        conn->rx_tail = (conn->rx_tail + 1) % conn->rx_buf_size;
+    size_t remaining = to_read;
+    while (remaining > 0) {
+        size_t contig = conn->rx_buf_size - conn->rx_tail;
+        if (contig > remaining) contig = remaining;
+        memcpy(dst, conn->rx_buf + conn->rx_tail, contig);
+        conn->rx_tail = (conn->rx_tail + contig) % conn->rx_buf_size;
+        dst += contig;
+        remaining -= contig;
     }
 
     return to_read;

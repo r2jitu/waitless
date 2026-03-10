@@ -125,15 +125,33 @@ void request(Ipv4Addr ip) {
     ethernet::send(MAC_BROADCAST, ethernet::ETHERTYPE_ARP, &pkt, sizeof(pkt));
 }
 
+// Dedicated gateway MAC cache: O(1) lookup for the most common case.
+// Nearly all outgoing packets go through the gateway; this avoids the
+// O(64) linear scan in the general ARP cache on every packet.
+static Ipv4Addr cached_gw_ip_ = {0};
+static MacAddr  cached_gw_mac_;
+static bool     gw_cached_ = false;
+
 MacAddr resolve(Ipv4Addr ip) {
     // Broadcast and zero addresses
     if (ip == IP_BROADCAST) {
         return MAC_BROADCAST;
     }
 
+    // Fast path: gateway (most packets go here)
+    if (gw_cached_ && ip.addr == cached_gw_ip_.addr) {
+        return cached_gw_mac_;
+    }
+
     // Check cache first
     MacAddr mac;
     if (lookup(ip, &mac)) {
+        // Promote gateway to dedicated fast-path cache
+        if (ip == config.gateway && config.gateway != IP_ANY) {
+            cached_gw_ip_ = ip;
+            cached_gw_mac_ = mac;
+            gw_cached_ = true;
+        }
         return mac;
     }
 

@@ -1,7 +1,6 @@
 #include "net/ethernet.h"
 #include "net/arp.h"
 #include "net/ipv4.h"
-#include "kernel/mm.h"
 #include "kernel/serial.h"
 #include "drivers/virtio_net.h"
 
@@ -24,14 +23,13 @@ const MacAddr& our_mac() {
     return cached_mac;
 }
 
+// Static TX frame buffer: 14 (ETH) + 1500 (IP) = 1514.
+// Single-threaded, non-reentrant on hot path.
+static uint8_t eth_buf_[sizeof(EthernetHeader) + 1500];
+
 void send(const MacAddr& dst, uint16_t ethertype, const void* payload, size_t len) {
     size_t frame_len = sizeof(EthernetHeader) + len;
-    uint8_t* buf = (uint8_t*)mm::kmalloc(frame_len);
-    if (!buf) {
-        serial::printf("ethernet: failed to allocate send buffer (%u bytes)\n",
-                       (unsigned)frame_len);
-        return;
-    }
+    uint8_t* buf = eth_buf_;
 
     EthernetHeader* hdr = (EthernetHeader*)buf;
     memcpy(hdr->dst.bytes, dst.bytes, 6);
@@ -43,7 +41,6 @@ void send(const MacAddr& dst, uint16_t ethertype, const void* payload, size_t le
     }
 
     virtio_net::send(buf, frame_len);
-    mm::kfree(buf);
 }
 
 void receive(const uint8_t* data, uint32_t len) {

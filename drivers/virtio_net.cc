@@ -23,6 +23,8 @@
 #include "kernel/mm.h"
 #include "kernel/panic.h"
 
+extern "C" void* memcpy(void* dst, const void* src, size_t n);
+
 namespace virtio_net {
 
 // ============================================================================
@@ -629,7 +631,7 @@ void send(const void* data, uint32_t len) {
     buf->hdr.num_buffers = 1;  // TX: always 1 buffer per packet
 
     const uint8_t* src = reinterpret_cast<const uint8_t*>(data);
-    for (uint32_t i = 0; i < len; i++) buf->data[i] = src[i];
+    memcpy(buf->data, src, len);
 
     uint32_t total_len = sizeof(VirtioNetHeader) + len;
     void* buf_ptr = reinterpret_cast<void*>(buf);

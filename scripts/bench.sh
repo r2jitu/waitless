@@ -129,10 +129,10 @@ trap cleanup EXIT INT TERM
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 wait_ready() {
-    local port=$1 max=${2:-60} pid=${3:-""}
+    local port=$1 max=${2:-60} pid=${3:-""} host=${4:-"127.0.0.1"}
     local elapsed=0
-    printf "  Waiting for server on port %s... " "$port"
-    while ! curl -sf --max-time 3 "http://127.0.0.1:${port}${ENDPOINT}" >/dev/null 2>&1; do
+    printf "  Waiting for server on %s:%s... " "$host" "$port"
+    while ! curl -sf --max-time 3 "http://${host}:${port}${ENDPOINT}" >/dev/null 2>&1; do
         if [ $elapsed -ge $max ]; then
             echo "TIMEOUT after ${max}s"
             return 1
@@ -301,7 +301,36 @@ bench_unikernel() {
 
     local timeout=60
     [ "$runner" = "vz" ] && timeout=30  # VZ boots much faster than TCG
-    if ! wait_ready "$port" "$timeout" "$QEMU_PID"; then
+
+    # For VZ with NAT networking (macOS 13+), discover the VM's vmnet IP
+    # from serial output.  The kernel prints "dhcp: configured IP x.x.x.x"
+    # during boot.  If found and not 10.0.2.x (legacy bridge), connect
+    # directly to the VM IP — bypassing any user-space proxy.
+    local wait_host="127.0.0.1"
+    local wait_port="$port"
+    if [ "$runner" = "vz" ]; then
+        local vm_ip=""
+        for (( _w=0; _w<timeout; _w++ )); do
+            if ! kill -0 "$QEMU_PID" 2>/dev/null; then break; fi
+            vm_ip=$(grep -o 'dhcp: configured IP [0-9.]*' "$log" 2>/dev/null \
+                    | head -1 | awk '{print $NF}') || true
+            [ -n "$vm_ip" ] && break
+            sleep 1
+        done
+        if [ -n "$vm_ip" ]; then
+            case "$vm_ip" in
+                10.0.2.*) ;; # legacy bridge — use localhost:PORT
+                *)
+                    wait_host="$vm_ip"
+                    wait_port="80"
+                    url="http://${vm_ip}:80${ENDPOINT}"
+                    echo "  VM IP: $vm_ip (NAT networking — direct connection)"
+                    ;;
+            esac
+        fi
+    fi
+
+    if ! wait_ready "$wait_port" "$timeout" "$QEMU_PID" "$wait_host"; then
         echo "  Boot log (last 30 lines):"
         tail -30 "$log" 2>/dev/null || echo "  (no log)"
         kill -TERM "$QEMU_PID" 2>/dev/null; QEMU_PID=""
