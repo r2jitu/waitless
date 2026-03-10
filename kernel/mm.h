@@ -53,9 +53,18 @@ size_t get_total_memory();
 size_t get_free_memory();
 
 // Convert between physical and virtual addresses.
-// For identity-mapped boots (QEMU direct, VZ), these are no-ops.
-// For Limine higher-half boot, they apply the HHDM offset.
+// On arm64, the kernel is always identity-mapped so these are no-ops.
+// On x86_64, Limine higher-half boot requires the HHDM offset.
+#if defined(__aarch64__)
+inline void *phys_to_virt(uint64_t phys) {
+  return reinterpret_cast<void *>(phys);
+}
+inline uint64_t virt_to_phys(const void *virt) {
+  return reinterpret_cast<uint64_t>(virt);
+}
+#else
 void *phys_to_virt(uint64_t phys);
 uint64_t virt_to_phys(const void *virt);
+#endif
 
 } // namespace mm

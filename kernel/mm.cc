@@ -359,6 +359,7 @@ size_t get_total_memory() { return total_memory_bytes; }
 
 size_t get_free_memory() { return (total_frames - used_frames) * PAGE_SIZE; }
 
+#if !defined(__aarch64__)
 void *phys_to_virt(uint64_t phys) {
   return reinterpret_cast<void *>(g_hhdm_offset + phys);
 }
@@ -375,5 +376,6 @@ uint64_t virt_to_phys(const void *virt) {
   }
   return addr; // identity-mapped
 }
+#endif
 
 } // namespace mm
