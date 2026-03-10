@@ -256,16 +256,17 @@ static inline void cpu_relax() { asm volatile("pause" ::: "memory"); }
 // would halt forever waiting for an IRQ that can never be delivered.
 static inline void idle() { asm volatile("pause" ::: "memory"); }
 
-// Power off the machine via QEMU's ACPI PIIX4 PM controller.
-// Writes the S5 sleep command (SLP_TYP=5, SLP_EN) to PM1_CNT at port 0x604.
-// Falls back to halting if the ACPI write has no effect.
+// Power off the machine via ACPI S5 sleep.
+// Tries multiple PM1_CNT ports and SLP_TYP values to cover:
+//   - SeaBIOS/Limine boot (S5 SLP_TYP=0, PIIX4 PM at 0x600)
+//   - Direct QEMU -kernel boot (no DSDT, accepts any SLP_TYP)
+//   - Q35 machine type (PM at 0xb000)
 // Never returns.
 [[noreturn]] static inline void shutdown() {
-  // QEMU pc-i440fx: PIIX4 PM I/O base 0x600, PM1_CNT at offset 4 = 0x604.
-  // SLP_TYP=5 in bits [12:10] → 0x1400; SLP_EN in bit 13 → 0x2000.
-  outw(0x0604, 0x3400);
-  // Fallback for Q35 or alternate PM base (some QEMU versions use 0xb000).
-  outw(0xb004, 0x2000);
+  // PM1_CNT: SLP_EN (bit 13) | SLP_TYP (bits 12:10)
+  outw(0x0604, 0x2000);  // i440fx, SLP_TYP=0 (SeaBIOS default S5)
+  outw(0x0604, 0x3400);  // i440fx, SLP_TYP=5
+  outw(0xb004, 0x2000);  // Q35, SLP_TYP=0
   cli();
   while (true)
     hlt();

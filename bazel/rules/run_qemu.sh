@@ -32,16 +32,19 @@ if echo "$ELF_INFO" | grep -q "ARM aarch64"; then
         -device virtio-net-device,netdev=net0 \
         -netdev "user,id=net0,hostfwd=tcp::${PORT}-:80"
 else
+    # HVF/KVM only work when host arch matches guest arch
     ACCEL=()
-    if [[ "$(uname -s)" = "Darwin" ]] && sysctl -n kern.hv_support 2>/dev/null | grep -q '^1$'; then
-        ACCEL=(-accel hvf)
-    elif [[ "$(uname -s)" = "Linux" ]] && [[ -r /dev/kvm ]]; then
-        ACCEL=(-accel kvm)
+    if [[ "$(uname -m)" = "x86_64" ]]; then
+        if [[ "$(uname -s)" = "Darwin" ]] && sysctl -n kern.hv_support 2>/dev/null | grep -q '^1$'; then
+            ACCEL=(-accel hvf)
+        elif [[ "$(uname -s)" = "Linux" ]] && [[ -r /dev/kvm ]]; then
+            ACCEL=(-accel kvm)
+        fi
     fi
     exec qemu-system-x86_64 \
         -cpu qemu64 -kernel "$ELF" \
         "${QEMU_COMMON[@]}" \
         -device virtio-net-pci,netdev=net0 \
         -netdev "user,id=net0,hostfwd=tcp::${PORT}-:80" \
-        "${ACCEL[@]}"
+        ${ACCEL[@]+"${ACCEL[@]}"}
 fi
