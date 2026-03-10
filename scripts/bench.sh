@@ -1,18 +1,17 @@
 #!/usr/bin/env bash
 # scripts/bench.sh — HTTP server benchmark
 #
-# Measures and compares throughput and latency for three configurations,
-# all running the SAME minimal poll()-based HTTP server (bench_server.c):
+# Measures and compares throughput and latency for the same minimal
+# poll()-based HTTP server (bench_server.c) across up to four environments:
 #
-#   1. Unikernel       — our bare-metal HTTP server
-#                        macOS arm64: VZ.framework (hardware-accelerated)
-#                        other:       QEMU (TCG software emulation)
-#   2. Linux (Docker)  — bench_server compiled for Linux, running in Docker
-#                        (Apple Virtualization.framework on Apple Silicon)
-#   3. macOS (native)  — bench_server compiled natively on the host, no VM
+#   1. Unikernel (VZ)   — macOS arm64 only: hardware-accelerated via VZ.framework
+#   2. Unikernel (QEMU) — software TCG emulation (all platforms)
+#   3. Linux (Docker)   — bench_server compiled for Linux, running in Docker
+#                         (Apple Virtualization.framework on Apple Silicon)
+#   4. macOS (native)   — bench_server compiled natively, no VM
 #
-# Using the same server code in all three scenarios isolates OS and
-# virtualization overhead rather than differences between HTTP servers.
+# Using the same server code isolates OS and virtualization overhead rather
+# than differences between HTTP server implementations.
 #
 # Prerequisites (all installable via Homebrew / standard tools):
 #   brew install wrk
@@ -21,11 +20,10 @@
 #
 # Usage:
 #   ./scripts/bench.sh                        # defaults below
-#   BENCH_CONNS=200 BENCH_DURATION=60 ./scripts/bench.sh
+#   BENCH_CONNS=10 BENCH_DURATION=60 ./scripts/bench.sh
 #
-# Important: the unikernel's HTTP server has MAX_ACTIVE=64 simultaneous
-# connections.  Keep BENCH_CONNS ≤ 63 to avoid excess connections being
-# dropped by the server.  The default (50) is safe.
+# Note: the unikernel HTTP server supports up to MAX_ACTIVE=64 simultaneous
+# connections.  Keep BENCH_CONNS ≤ 63.
 
 set -euo pipefail
 
@@ -45,7 +43,6 @@ DURATION="${BENCH_DURATION:-30}"      # seconds
 # all connections at the same time (bridge state bug). The first few seconds
 # of the measurement inherently serve as warmup.
 ENDPOINT="/health"
-BENCH_URL="http://127.0.0.1:${BENCH_PORT}${ENDPOINT}"
 
 # Each benchmark gets its own port so there is zero chance of port conflicts
 # between server transitions (no sleep or timing dependency needed).
@@ -60,7 +57,27 @@ DOCKER_CID=""
 SERVER_PID=""
 HAVE_DOCKER=false
 HAVE_CC=false
+ORIG_MSL=""   # saved net.inet.tcp.msl before we reduce it
 declare -a LABELS RPS_ARR P50_ARR P99_ARR
+
+# ── TCP TIME_WAIT reduction (macOS only, requires sudo) ───────────────────────
+# Reducing MSL 15000→500ms makes TIME_WAIT = 1s instead of 30s, which keeps
+# the ephemeral port pool from exhausting between benchmarks.
+reduce_time_wait() {
+    [ "$HOST_OS" != "Darwin" ] && return
+    ORIG_MSL=$(sysctl -n net.inet.tcp.msl 2>/dev/null || true)
+    if sudo -n sysctl -w net.inet.tcp.msl=500 >/dev/null 2>&1; then
+        echo "  Reduced net.inet.tcp.msl: ${ORIG_MSL}ms → 500ms (TIME_WAIT: 30s → 1s)"
+    else
+        echo "  note: sudo not available — will wait for TIME_WAIT to drain between benchmarks"
+        ORIG_MSL=""
+    fi
+}
+restore_time_wait() {
+    [ -n "$ORIG_MSL" ] || return 0
+    sudo -n sysctl -w net.inet.tcp.msl="$ORIG_MSL" >/dev/null 2>&1 || true
+    ORIG_MSL=""
+}
 
 # Wait for loopback TIME_WAIT connections to drain before starting the next
 # benchmark.  With Connection: close, each HTTP request leaves a source port
@@ -104,6 +121,7 @@ cleanup() {
     [ -n "$QEMU_PID" ]   && kill -TERM "$QEMU_PID"   2>/dev/null; QEMU_PID=""
     [ -n "$DOCKER_CID" ] && docker stop "$DOCKER_CID" >/dev/null 2>&1; DOCKER_CID=""
     [ -n "$SERVER_PID" ] && kill -TERM "$SERVER_PID"  2>/dev/null; SERVER_PID=""
+    restore_time_wait
 }
 trap cleanup EXIT INT TERM
 
@@ -131,10 +149,15 @@ wait_ready() {
     echo "ready (${elapsed}s)"
 }
 
+record_result() {
+    LABELS+=("$1"); RPS_ARR+=("$2"); P50_ARR+=("$3"); P99_ARR+=("$4")
+    printf "  %-35s  %12s  %8s  %8s\n" "$1" "$2" "$3" "$4"
+}
+
 # Run a wrk benchmark and store results into the named shell variables.
-# Usage: run_wrk label rps_var p50_var p99_var
+# Usage: run_wrk label rps_var p50_var p99_var url
 run_wrk() {
-    local label=$1 rps_var=$2 p50_var=$3 p99_var=$4 url=${5:-$BENCH_URL}
+    local label=$1 rps_var=$2 p50_var=$3 p99_var=$4 url=$5
 
     printf "  Measure (%ds)... " "$DURATION"
     local out
@@ -194,12 +217,13 @@ check_prereqs() {
         fi
     done
 
+    reduce_time_wait
     echo ""
 }
 
-# ── Benchmark 1: Unikernel ────────────────────────────────────────────────────
+# ── Benchmark: Unikernel (VZ or QEMU) ─────────────────────────────────────────
 bench_unikernel() {
-    local port=${1:-$BENCH_PORT}
+    local step=$1 port=$2
     local url="http://127.0.0.1:${port}${ENDPOINT}"
     local label runner
     if [ "${UNIKERNEL_RUNNER:-}" = "qemu" ]; then
@@ -212,7 +236,7 @@ bench_unikernel() {
         label="Unikernel (QEMU TCG)"
         runner="qemu"
     fi
-    echo "==> [1/3] $label"
+    echo "==> [${step}/${TOTAL}] $label"
 
     echo "  Building unikernel image..."
     cd "$PROJECT_ROOT"
@@ -291,10 +315,7 @@ bench_unikernel() {
     QEMU_PID=""
     wait_port_pool   # drain TIME_WAIT before the next benchmark can start
 
-    LABELS+=("$label")
-    RPS_ARR+=("$rps")
-    P50_ARR+=("$p50")
-    P99_ARR+=("$p99")
+    record_result "$label" "$rps" "$p50" "$p99"
     echo ""
 }
 
@@ -360,10 +381,10 @@ bench_unikernel_x86() {
     echo ""
 }
 
-# ── Benchmark 2: bench_server in Docker (Linux VM) ────────────────────────────
+# ── Benchmark: bench_server in Docker (Linux VM) ──────────────────────────────
 bench_docker_server() {
     local url="http://127.0.0.1:${PORT_DOCKER}${ENDPOINT}"
-    echo "==> [2/3] bench_server in Docker  (Linux VM + same server code)"
+    echo "==> [${STEP_DOCKER}/${TOTAL}] bench_server in Docker  (Linux VM + same server code)"
 
     echo "  Building Docker image (bench_server for Linux)..."
     docker build -q \
@@ -390,17 +411,14 @@ bench_docker_server() {
     docker stop "$cid" >/dev/null 2>&1; DOCKER_CID=""
     wait_port_pool   # drain TIME_WAIT before the native benchmark starts
 
-    LABELS+=("bench_server/Linux (Docker VM)")
-    RPS_ARR+=("$rps")
-    P50_ARR+=("$p50")
-    P99_ARR+=("$p99")
+    record_result "bench_server/Linux (Docker VM)" "$rps" "$p50" "$p99"
     echo ""
 }
 
-# ── Benchmark 3: bench_server native on macOS ─────────────────────────────────
+# ── Benchmark: bench_server native on macOS ───────────────────────────────────
 bench_native_server() {
     local url="http://127.0.0.1:${PORT_NATIVE}${ENDPOINT}"
-    echo "==> [3/3] bench_server on macOS  (native, no virtualization)"
+    echo "==> [${STEP_NATIVE}/${TOTAL}] bench_server on macOS  (native, no virtualization)"
 
     local bin="/tmp/bench_server_macos"
     echo "  Compiling bench_server for macOS..."
@@ -423,65 +441,15 @@ bench_native_server() {
     kill -TERM "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true
     SERVER_PID=""
 
-    LABELS+=("bench_server (native macOS)")
-    RPS_ARR+=("$rps")
-    P50_ARR+=("$p50")
-    P99_ARR+=("$p99")
+    record_result "bench_server (native macOS)" "$rps" "$p50" "$p99"
     echo ""
 }
 
-# ── Results table ─────────────────────────────────────────────────────────────
 print_results() {
-    if [ ${#LABELS[@]} -eq 0 ]; then
-        echo "No benchmark results to display."
-        return
-    fi
-
     echo "══════════════════════════════════════════════════════════════════════"
-    echo "  Results"
-    printf "  %s threads · %s connections · %ss · %s\n" \
-        "$THREADS" "$CONNS" "$DURATION" "$ENDPOINT"
+    echo "  To run with different parameters:"
+    echo "    BENCH_CONNS=10 BENCH_DURATION=60 ./scripts/bench.sh"
     echo "══════════════════════════════════════════════════════════════════════"
-    printf "  %-35s  %12s  %8s  %8s\n" "Server" "Req/sec" "p50" "p99"
-    echo "──────────────────────────────────────────────────────────────────────"
-    for i in "${!LABELS[@]}"; do
-        printf "  %-35s  %12s  %8s  %8s\n" \
-            "${LABELS[$i]}" "${RPS_ARR[$i]}" "${P50_ARR[$i]}" "${P99_ARR[$i]}"
-    done
-    echo "══════════════════════════════════════════════════════════════════════"
-    cat << 'NOTES'
-
-  Interpretation
-  ──────────────
-  All three scenarios run the same poll()-based HTTP server (bench_server.c)
-    so the benchmark isolates OS and virtualization overhead rather than
-    differences between HTTP server implementations.  Each server uses
-    Connection: close (no keep-alive) after every response, matching the
-    unikernel's HTTP/1.0-style behaviour.
-
-  Unikernel (VZ.framework): on macOS arm64, the unikernel runs inside Apple
-    Virtualization.framework (hardware-accelerated HVF).  No QEMU TCG overhead.
-    Network goes through a user-space Ethernet bridge (run-vz) that proxies
-    TCP connections — latency includes this proxy overhead.
-
-  Unikernel (QEMU TCG): on other platforms, every instruction is translated
-    in software by QEMU's TCG emulator.  Network packets also traverse
-    virtio-net emulation.  Both TCG cost and virtio overhead are included.
-
-  bench_server/Linux (Docker): on Apple Silicon, Docker uses Apple
-    Virtualization.framework (hardware-accelerated VM), NOT QEMU TCG.
-    Network still goes through a virtual interface, but the guest CPU runs
-    at near-native speed.  This scenario shows Linux kernel + network stack
-    overhead on top of the hardware VM.
-
-  bench_server (native macOS): no virtualization — just the macOS TCP stack
-    and the poll() event loop at full speed.  This is the practical ceiling
-    for single-threaded connection throughput on this machine.
-
-  To run with different parameters:
-    BENCH_CONNS=10 BENCH_DURATION=60 ./scripts/bench.sh
-
-NOTES
 }
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -510,13 +478,21 @@ else
     TOTAL=3
 fi
 
+# Print the results table header once; record_result fills in rows as we go.
+echo "══════════════════════════════════════════════════════════════════════"
+printf "  %s threads · %s connections · %ss · %s\n" \
+    "$THREADS" "$CONNS" "$DURATION" "$ENDPOINT"
+echo "══════════════════════════════════════════════════════════════════════"
+printf "  %-35s  %12s  %8s  %8s\n" "Server" "Req/sec" "p50" "p99"
+echo "──────────────────────────────────────────────────────────────────────"
+
 # Run VZ benchmark (macOS arm64 only)
 if [ -n "$STEP_UNIKERNEL_VZ" ]; then
-    bench_unikernel "$PORT_VZ"   # defaults to VZ on macOS arm64
+    bench_unikernel "$STEP_UNIKERNEL_VZ" "$PORT_VZ"
 fi
 
 # Run aarch64 QEMU benchmark (always on arm64; overrides default on macOS arm64)
-UNIKERNEL_RUNNER=qemu bench_unikernel "$PORT_QEMU"
+UNIKERNEL_RUNNER=qemu bench_unikernel "$STEP_UNIKERNEL_QEMU" "$PORT_QEMU"
 
 # Run x86-64 QEMU benchmark (cross-architecture emulation)
 # TODO: fix x86-64 crash before re-enabling
