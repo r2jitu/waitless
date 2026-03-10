@@ -11,6 +11,8 @@
 #include "drivers/pci.h"
 #include "drivers/virtio_net.h"
 #include "kernel/arch.h"
+#include "kernel/boot_info.h"
+#include "kernel/boot_shim.h"
 #include "kernel/fdt.h"
 #include "kernel/mm.h"
 #include "kernel/panic.h"
@@ -50,32 +52,12 @@ static void call_global_constructors() {
   }
 }
 
-// ---- Kernel entry point (called from boot.S) --------------------------------
+// Unified boot info, populated by protocol-specific shim before kernel_boot()
+static boot::BootInfo g_boot_info;
 
-extern "C" void kernel_main(uint64_t boot_info_addr) {
-  zero_bss();
+// ---- Shared boot sequence (called after BootInfo is populated) ---------------
 
-#if defined(__aarch64__)
-  // Parse the Device Tree Blob to discover MMIO device addresses.
-  // Must be called before serial::init() (which uses fdt::info() for PL011
-  // address) and before virtio_net::init() (FDT virtio-mmio scan).
-  fdt::init(boot_info_addr);
-
-  // Map the PCIe ECAM region as device memory before any PCI access.
-  // VZ.framework places the ECAM at a runtime-chosen GPA (from FDT `reg`).
-  // mmu::map_device_range is a no-op for addresses in the first 4GB
-  // (those are already covered by boot.S and VZ Stage-2 overrides attrs).
-  {
-    const fdt::Info &fdt_info = fdt::info();
-    if (fdt_info.pcie_ecam_base != 0 && fdt_info.pcie_ecam_size != 0) {
-      mmu::map_device_range(fdt_info.pcie_ecam_base, fdt_info.pcie_ecam_size);
-    }
-  }
-
-  // serial::init() may call pci::init() early for VirtIO PCI console.
-  // The pci::init() call later in this function is idempotent.
-#endif
-
+static void kernel_boot(boot::BootInfo *info) {
   serial::init();
   serial::printf("\n");
   serial::printf("==============================================\n");
@@ -111,7 +93,7 @@ extern "C" void kernel_main(uint64_t boot_info_addr) {
 #endif
 
   serial::printf("[INIT] Memory manager...\n");
-  mm::init(boot_info_addr);
+  mm::init(*info);
   serial::printf("       %u MB total, %u MB free\n",
                  (unsigned)(mm::get_total_memory() / (1024 * 1024)),
                  (unsigned)(mm::get_free_memory() / (1024 * 1024)));
@@ -163,4 +145,31 @@ extern "C" void kernel_main(uint64_t boot_info_addr) {
   serial::printf("[SHUTDOWN] Powering off.\n");
 
   arch::shutdown();
+}
+
+// ---- Legacy entry point (called from boot.S) ---------------------------------
+
+extern "C" void kernel_main(uint64_t boot_info_addr) {
+  zero_bss();
+
+#if defined(__aarch64__)
+  // Parse the Device Tree Blob to discover MMIO device addresses.
+  // Must be called before serial::init() (which uses fdt::info() for PL011
+  // address) and before virtio_net::init() (FDT virtio-mmio scan).
+  fdt::init(boot_info_addr);
+
+  // Map the PCIe ECAM region as device memory before any PCI access.
+  {
+    const fdt::Info &fdt_info = fdt::info();
+    if (fdt_info.pcie_ecam_base != 0 && fdt_info.pcie_ecam_size != 0) {
+      mmu::map_device_range(fdt_info.pcie_ecam_base, fdt_info.pcie_ecam_size);
+    }
+  }
+
+  boot::shim_fdt(&g_boot_info, boot_info_addr);
+#else
+  boot::shim_x86(&g_boot_info, boot_info_addr);
+#endif
+
+  kernel_boot(&g_boot_info);
 }

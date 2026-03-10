@@ -42,6 +42,20 @@ cc_library(
 )
 
 cc_library(
+    name = "boot_info",
+    hdrs = ["boot_info.h"],
+    copts = ["-I."],
+)
+
+cc_library(
+    name = "boot_shim",
+    srcs = ["boot_shim.cc"],
+    hdrs = ["boot_shim.h"],
+    deps = [":boot_info", ":core", ":fdt"],
+    copts = ["-I."],
+)
+
+cc_library(
     name = "core",
     srcs = [
         "mm.cc",
@@ -56,7 +70,7 @@ cc_library(
         "mm.h",
         "panic.h",
     ],
-    deps = [":arch_h", ":fdt"] + select({
+    deps = [":arch_h", ":boot_info", ":fdt"] + select({
         "//bazel/platforms:aarch64": [
             "//drivers:virtio_console",
             "//drivers:virtio_pci",
@@ -107,6 +121,8 @@ cc_library(
     name = "entry",
     srcs = ["entry.cc"],
     deps = [
+        ":boot_info",
+        ":boot_shim",
         ":core",
         ":arch_init",
         ":fdt",

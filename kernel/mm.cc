@@ -4,7 +4,7 @@
 //
 // 1. Physical frame allocator:
 //    A bitmap where each bit represents a 4KB page frame. Bit=1 means used.
-//    The bitmap lives immediately after _kernel_end. We parse the multiboot2
+//    The bitmap lives immediately after _kernel_end. We walk the BootInfo
 //    memory map to find available regions and mark everything else as used.
 //
 // 2. Kernel heap allocator:
@@ -20,9 +20,6 @@
 #include "kernel/mm.h"
 #include "kernel/panic.h"
 #include "kernel/serial.h"
-#if defined(__aarch64__)
-#include "kernel/fdt.h"
-#endif
 
 // Linker-provided symbol marking the end of the kernel image
 extern "C" uint8_t _kernel_end[];
@@ -109,41 +106,6 @@ static uint8_t *heap_start = nullptr;
 static uint8_t *heap_end = nullptr;
 static BlockHeader *heap_head = nullptr; // First block in the heap
 
-// ============================================================================
-// Boot protocol parsing (multiboot2 and PVH/Xen hvm_start_info)
-// ============================================================================
-
-#if !defined(__aarch64__)
-
-// Align a value up to an 8-byte boundary (multiboot2 tag alignment)
-static inline uint64_t align_up_8(uint64_t val) { return (val + 7) & ~7ULL; }
-
-// PVH (Xen HVM) boot info structures — used by QEMU 10.x PVH kernel loading
-static constexpr uint32_t HVM_START_MAGIC_VALUE = 0x336ec578U;
-static constexpr uint32_t HVM_MEMMAP_TYPE_RAM = 1U;
-
-struct HvmMemmapEntry {
-  uint64_t addr;
-  uint64_t size;
-  uint32_t type; // 1 = usable RAM
-  uint32_t reserved;
-};
-
-struct HvmStartInfo {
-  uint32_t magic; // HVM_START_MAGIC_VALUE
-  uint32_t version;
-  uint32_t flags;
-  uint32_t nr_modules;
-  uint64_t modlist_paddr;
-  uint64_t cmdline_paddr;
-  uint64_t rsdp_paddr;
-  uint64_t memmap_paddr; // physical address of HvmMemmapEntry array
-  uint32_t memmap_entries;
-  uint32_t reserved;
-};
-
-#endif // !defined(__aarch64__)
-
 // Align a value up to a page boundary
 static inline uint64_t align_up_page(uint64_t val) {
   return (val + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
@@ -153,29 +115,25 @@ static inline uint64_t align_up_page(uint64_t val) {
 // Public API implementation
 // ============================================================================
 
-void init(uint64_t boot_info_addr) {
-  uint64_t bitmap_end;
+void init(const boot::BootInfo &info) {
+  // ---- Phase 1: Compute total memory and max physical address ----
+  total_memory_bytes = 0;
+  max_physical_addr = 0;
 
-#if defined(__aarch64__)
-  // ---- ARM64: use FDT-discovered RAM base and size -------------------------
-  // VZ.framework maps RAM at GPA 0x00000000; QEMU virt uses 0x40000000.
-  // We read the base and size from the /memory node parsed by fdt::init().
-  // If the FDT didn't supply a memory node (dtb_addr==0 or missing node),
-  // fall back to the QEMU virt default of 128 MB at 0x40000000.
-  const fdt::Info &fdt_mem = fdt::info();
-  uint64_t ram_base =
-      (fdt_mem.ram_size != 0) ? fdt_mem.ram_base : 0x40000000ULL;
-  uint64_t ram_size =
-      (fdt_mem.ram_size != 0) ? fdt_mem.ram_size : 128ULL * 1024 * 1024;
+  for (int i = 0; i < info.memory_map_count; i++) {
+    if (info.memory_map[i].type == boot::MemoryRegion::AVAILABLE) {
+      total_memory_bytes += info.memory_map[i].length;
+      uint64_t end = info.memory_map[i].base + info.memory_map[i].length;
+      if (end > max_physical_addr)
+        max_physical_addr = end;
+    }
+  }
 
-  max_physical_addr = ram_base + ram_size;
-  total_memory_bytes = ram_size;
-
-  serial::printf("  Physical memory: %u MB (FDT/ARM64, 0x%lx-0x%lx)\n",
-                 (unsigned)(ram_size / (1024 * 1024)), ram_base,
+  serial::printf("  Physical memory: %u MB (max addr 0x%lx)\n",
+                 (unsigned)(total_memory_bytes / (1024 * 1024)),
                  max_physical_addr);
 
-  // Frame bitmap placed after the kernel image
+  // ---- Phase 2: Set up frame bitmap ----
   total_frames = max_physical_addr / PAGE_SIZE;
   frame_bitmap_size = (total_frames + 7) / 8;
   frame_bitmap = reinterpret_cast<uint8_t *>(
@@ -186,196 +144,26 @@ void init(uint64_t boot_info_addr) {
     frame_bitmap[i] = 0xFF;
   used_frames = total_frames;
 
-  // Free the available region (after bitmap, within RAM range)
-  bitmap_end = reinterpret_cast<uint64_t>(frame_bitmap) + frame_bitmap_size;
-  uint64_t free_start = align_up_page(bitmap_end);
-  for (uint64_t addr = free_start; addr < max_physical_addr;
-       addr += PAGE_SIZE) {
-    uint64_t frame = addr / PAGE_SIZE;
-    if (frame < total_frames && bitmap_test(frame)) {
-      bitmap_clear(frame);
-      used_frames--;
+  // ---- Phase 3: Free available regions from memory map ----
+  for (int i = 0; i < info.memory_map_count; i++) {
+    if (info.memory_map[i].type != boot::MemoryRegion::AVAILABLE)
+      continue;
+    uint64_t start = align_up_page(info.memory_map[i].base);
+    uint64_t end =
+        (info.memory_map[i].base + info.memory_map[i].length) & ~(PAGE_SIZE - 1);
+    for (uint64_t addr = start; addr < end; addr += PAGE_SIZE) {
+      uint64_t frame = addr / PAGE_SIZE;
+      if (frame < total_frames && bitmap_test(frame)) {
+        bitmap_clear(frame);
+        used_frames--;
+      }
     }
   }
 
-  // Keep the RAM base through kernel+bitmap reserved
-  mark_frames_used(ram_base, bitmap_end);
-
-#else
-  // ---- x86_64: parse boot info (multiboot2 or PVH hvm_start_info) -----
-  //
-  // QEMU 10.x boots 64-bit ELF kernels via PVH (Xen HVM start), passing
-  // hvm_start_info in ESI (which boot.S saves in RDI → boot_info_addr).
-  // Older QEMU / GRUB uses multiboot2 and passes the info struct in EBX.
-  // We detect the protocol by checking the magic at boot_info_addr.
-
-  uint64_t mbi_addr = boot_info_addr;
-  total_memory_bytes = 0;
-  max_physical_addr = 0;
-
-  const uint32_t *magic_ptr = reinterpret_cast<const uint32_t *>(mbi_addr);
-  if (mbi_addr != 0 && *magic_ptr == HVM_START_MAGIC_VALUE) {
-    // ---- PVH boot (QEMU 10.x) ----------------------------------------
-    const HvmStartInfo *info = reinterpret_cast<const HvmStartInfo *>(mbi_addr);
-    const HvmMemmapEntry *entries =
-        reinterpret_cast<const HvmMemmapEntry *>((uint64_t)info->memmap_paddr);
-
-    for (uint32_t i = 0; i < info->memmap_entries; i++) {
-      if (entries[i].type == HVM_MEMMAP_TYPE_RAM) {
-        total_memory_bytes += entries[i].size;
-        uint64_t end = entries[i].addr + entries[i].size;
-        if (end > max_physical_addr)
-          max_physical_addr = end;
-      }
-    }
-
-    serial::printf("  Physical memory: %u MB (PVH, max addr 0x%lx)\n",
-                   (unsigned)(total_memory_bytes / (1024 * 1024)),
-                   max_physical_addr);
-
-    total_frames = max_physical_addr / PAGE_SIZE;
-    frame_bitmap_size = (total_frames + 7) / 8;
-    frame_bitmap = reinterpret_cast<uint8_t *>(
-        align_up_page(reinterpret_cast<uint64_t>(_kernel_end)));
-
-    for (uint64_t i = 0; i < frame_bitmap_size; i++)
-      frame_bitmap[i] = 0xFF;
-    used_frames = total_frames;
-
-    for (uint32_t i = 0; i < info->memmap_entries; i++) {
-      if (entries[i].type != HVM_MEMMAP_TYPE_RAM)
-        continue;
-      uint64_t start = align_up_page(entries[i].addr);
-      uint64_t end = (entries[i].addr + entries[i].size) & ~(PAGE_SIZE - 1);
-      for (uint64_t addr = start; addr < end; addr += PAGE_SIZE) {
-        uint64_t frame = addr / PAGE_SIZE;
-        if (frame < total_frames && bitmap_test(frame)) {
-          bitmap_clear(frame);
-          used_frames--;
-        }
-      }
-    }
-
-    bitmap_end = reinterpret_cast<uint64_t>(frame_bitmap) + frame_bitmap_size;
-    mark_frames_used(0, bitmap_end);
-    mark_frames_used(mbi_addr, mbi_addr + sizeof(HvmStartInfo));
-  } else {
-    // ---- Try multiboot2 (GRUB / older QEMU with SeaBIOS) ---------------
-    const MultibootMmapTag *mmap_tag = nullptr;
-    bool multiboot2_valid = false;
-
-    // Multiboot2 info: first dword is total_size (must be > 8 and < 64KB)
-    uint32_t mb2_total_size =
-        mbi_addr ? *reinterpret_cast<const uint32_t *>(mbi_addr) : 0;
-    if (mb2_total_size >= 8 && mb2_total_size < 65536) {
-      uint64_t tag_addr = mbi_addr + 8;
-      while (true) {
-        const MultibootTag *tag =
-            reinterpret_cast<const MultibootTag *>(tag_addr);
-        if (tag->type == MULTIBOOT_TAG_END)
-          break;
-        if (tag->type == MULTIBOOT_TAG_MMAP) {
-          mmap_tag = reinterpret_cast<const MultibootMmapTag *>(tag_addr);
-        }
-        tag_addr = align_up_8(tag_addr + tag->size);
-      }
-      if (mmap_tag)
-        multiboot2_valid = true;
-    }
-
-    if (multiboot2_valid) {
-      uint64_t mmap_entries_start =
-          reinterpret_cast<uint64_t>(&mmap_tag->entries[0]);
-      uint64_t mmap_entries_end =
-          reinterpret_cast<uint64_t>(mmap_tag) + mmap_tag->size;
-      uint32_t entry_size = mmap_tag->entry_size;
-
-      for (uint64_t ea = mmap_entries_start; ea < mmap_entries_end;
-           ea += entry_size) {
-        const MultibootMmapEntry *e =
-            reinterpret_cast<const MultibootMmapEntry *>(ea);
-        if (e->type == MULTIBOOT_MEMORY_AVAILABLE) {
-          total_memory_bytes += e->len;
-          uint64_t end = e->addr + e->len;
-          if (end > max_physical_addr)
-            max_physical_addr = end;
-        }
-      }
-
-      serial::printf("  Physical memory: %u MB (multiboot2, max addr 0x%lx)\n",
-                     (unsigned)(total_memory_bytes / (1024 * 1024)),
-                     max_physical_addr);
-
-      total_frames = max_physical_addr / PAGE_SIZE;
-      frame_bitmap_size = (total_frames + 7) / 8;
-      frame_bitmap = reinterpret_cast<uint8_t *>(
-          align_up_page(reinterpret_cast<uint64_t>(_kernel_end)));
-
-      for (uint64_t i = 0; i < frame_bitmap_size; i++)
-        frame_bitmap[i] = 0xFF;
-      used_frames = total_frames;
-
-      for (uint64_t ea = mmap_entries_start; ea < mmap_entries_end;
-           ea += entry_size) {
-        const MultibootMmapEntry *e =
-            reinterpret_cast<const MultibootMmapEntry *>(ea);
-        if (e->type != MULTIBOOT_MEMORY_AVAILABLE)
-          continue;
-        uint64_t start = align_up_page(e->addr);
-        uint64_t end = (e->addr + e->len) & ~(PAGE_SIZE - 1);
-        for (uint64_t addr = start; addr < end; addr += PAGE_SIZE) {
-          uint64_t frame = addr / PAGE_SIZE;
-          if (frame < total_frames && bitmap_test(frame)) {
-            bitmap_clear(frame);
-            used_frames--;
-          }
-        }
-      }
-
-      bitmap_end = reinterpret_cast<uint64_t>(frame_bitmap) + frame_bitmap_size;
-      mark_frames_used(0, bitmap_end);
-
-      uint32_t mbi_total_size_val =
-          *reinterpret_cast<const uint32_t *>(mbi_addr);
-      mark_frames_used(mbi_addr, mbi_addr + mbi_total_size_val);
-    } else {
-      // ---- Fallback: fixed QEMU memory layout (no valid boot info) ---
-      // When neither PVH nor multiboot2 info is available (e.g., QEMU
-      // 10.x with SeaBIOS that doesn't support multiboot2), use a
-      // hardcoded layout matching QEMU PC machine with -m 128.
-      static constexpr uint64_t QEMU_X86_RAM_SIZE = 128ULL * 1024 * 1024;
-      max_physical_addr = QEMU_X86_RAM_SIZE;
-      total_memory_bytes = QEMU_X86_RAM_SIZE;
-
-      serial::printf("  Physical memory: %u MB (hardcoded QEMU default)\n",
-                     (unsigned)(total_memory_bytes / (1024 * 1024)));
-
-      total_frames = max_physical_addr / PAGE_SIZE;
-      frame_bitmap_size = (total_frames + 7) / 8;
-      frame_bitmap = reinterpret_cast<uint8_t *>(
-          align_up_page(reinterpret_cast<uint64_t>(_kernel_end)));
-
-      for (uint64_t i = 0; i < frame_bitmap_size; i++)
-        frame_bitmap[i] = 0xFF;
-      used_frames = total_frames;
-
-      // Free RAM above the kernel image
-      bitmap_end = reinterpret_cast<uint64_t>(frame_bitmap) + frame_bitmap_size;
-      uint64_t free_start = align_up_page(bitmap_end);
-      for (uint64_t addr = free_start; addr < max_physical_addr;
-           addr += PAGE_SIZE) {
-        uint64_t frame = addr / PAGE_SIZE;
-        if (frame < total_frames && bitmap_test(frame)) {
-          bitmap_clear(frame);
-          used_frames--;
-        }
-      }
-
-      // Reserve low memory (BIOS/VGA area) and kernel
-      mark_frames_used(0, bitmap_end);
-    }
-  }
-#endif
+  // Reserve kernel image + frame bitmap
+  uint64_t bitmap_end =
+      reinterpret_cast<uint64_t>(frame_bitmap) + frame_bitmap_size;
+  mark_frames_used(0, bitmap_end);
 
   serial::printf("  Frame allocator: %u total frames, %u free frames\n",
                  (unsigned)total_frames,
