@@ -374,25 +374,48 @@ NOTES
 # ── Entry point ───────────────────────────────────────────────────────────────
 echo ""
 echo "══════════════════════════════════════════════════════════════════════"
-echo "  HTTP Server Benchmark  (same server code, three environments)"
-echo "  Unikernel (VZ/QEMU) · Linux/bench_server (Docker) · macOS (native)"
+echo "  HTTP Server Benchmark  (same server code, four environments)"
+echo "  Unikernel VZ · Unikernel QEMU · Linux/Docker · macOS (native)"
 echo "══════════════════════════════════════════════════════════════════════"
 echo ""
 
 check_prereqs
-bench_unikernel
+
+# On macOS arm64, run both VZ (hardware-accelerated) and QEMU (TCG).
+# On other platforms, only one unikernel runner is available.
+if [ "$HOST_OS" = "Darwin" ] && [ "$HOST_ARCH" = "arm64" ] && [ "${UNIKERNEL_RUNNER:-}" != "qemu" ]; then
+    STEP_UNIKERNEL_VZ=1
+    STEP_UNIKERNEL_QEMU=2
+    STEP_DOCKER=3
+    STEP_NATIVE=4
+    TOTAL=4
+else
+    STEP_UNIKERNEL_VZ=""
+    STEP_UNIKERNEL_QEMU=1
+    STEP_DOCKER=2
+    STEP_NATIVE=3
+    TOTAL=3
+fi
+
+# Run VZ benchmark (macOS arm64 only)
+if [ -n "$STEP_UNIKERNEL_VZ" ]; then
+    bench_unikernel   # defaults to VZ on macOS arm64
+fi
+
+# Run QEMU benchmark (always; overrides default on macOS arm64)
+UNIKERNEL_RUNNER=qemu bench_unikernel
 
 if [ "$HAVE_DOCKER" = true ]; then
     bench_docker_server
 else
-    echo "==> [2/3] bench_server in Docker — skipped (Docker not available)"
+    echo "==> [${STEP_DOCKER}/${TOTAL}] bench_server in Docker — skipped (Docker not available)"
     echo ""
 fi
 
 if [ "$HAVE_CC" = true ]; then
     bench_native_server
 else
-    echo "==> [3/3] bench_server on macOS — skipped (cc not found)"
+    echo "==> [${STEP_NATIVE}/${TOTAL}] bench_server on macOS — skipped (cc not found)"
     echo "  Install: xcode-select --install"
     echo ""
 fi

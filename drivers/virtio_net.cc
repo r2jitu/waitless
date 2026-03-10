@@ -268,8 +268,11 @@ bool init() {
         w32(io_base_, virtio::mmio::DEVICE_FEATURES_SEL, 0);
         uint32_t dev_features = r32(io_base_, virtio::mmio::HOST_FEATURES);
         serial::printf("virtio_net: device features = 0x%x\n", dev_features);
-        if (dev_features & VIRTIO_NET_F_MAC)    guest_features |= VIRTIO_NET_F_MAC;
-        if (dev_features & VIRTIO_NET_F_STATUS) guest_features |= VIRTIO_NET_F_STATUS;
+        if (dev_features & VIRTIO_NET_F_MAC)       guest_features |= VIRTIO_NET_F_MAC;
+        if (dev_features & VIRTIO_NET_F_STATUS)    guest_features |= VIRTIO_NET_F_STATUS;
+        // Negotiate MRG_RXBUF so QEMU also uses the 12-byte virtio_net_hdr_mrg_rxbuf
+        // layout, matching Apple VZ which always uses 12-byte headers.
+        if (dev_features & VIRTIO_NET_F_MRG_RXBUF) guest_features |= VIRTIO_NET_F_MRG_RXBUF;
 
         // Write driver features (word 0), then clear word 1 (no high features).
         w32(io_base_, virtio::mmio::DRIVER_FEATURES_SEL, 0);
@@ -290,8 +293,9 @@ bool init() {
         // v1: single 32-bit feature word; GuestPageSize required before queues.
         uint32_t dev_features = r32(io_base_, virtio::mmio::HOST_FEATURES);
         serial::printf("virtio_net: device features = 0x%x\n", dev_features);
-        if (dev_features & VIRTIO_NET_F_MAC)    guest_features |= VIRTIO_NET_F_MAC;
-        if (dev_features & VIRTIO_NET_F_STATUS) guest_features |= VIRTIO_NET_F_STATUS;
+        if (dev_features & VIRTIO_NET_F_MAC)       guest_features |= VIRTIO_NET_F_MAC;
+        if (dev_features & VIRTIO_NET_F_STATUS)    guest_features |= VIRTIO_NET_F_STATUS;
+        if (dev_features & VIRTIO_NET_F_MRG_RXBUF) guest_features |= VIRTIO_NET_F_MRG_RXBUF;
         w32(io_base_, virtio::mmio::GUEST_FEATURES, guest_features);
         w32(io_base_, virtio::mmio::GUEST_PAGE_SIZE, 4096);
     }
@@ -435,15 +439,12 @@ bool init() {
     uint32_t dev_features = virtio::read_device_features(io_base_);
     serial::printf("virtio_net: device features = 0x%x\n", dev_features);
 
-    // Accept MAC feature, reject MRG_RXBUF for simplicity
+    // Negotiate MAC, STATUS, and MRG_RXBUF (ensures 12-byte header layout
+    // consistently across QEMU legacy PCI, QEMU MMIO, and VZ.framework).
     uint32_t guest_features = 0;
-    if (dev_features & VIRTIO_NET_F_MAC) {
-        guest_features |= VIRTIO_NET_F_MAC;
-    }
-    if (dev_features & VIRTIO_NET_F_STATUS) {
-        guest_features |= VIRTIO_NET_F_STATUS;
-    }
-    // Explicitly do NOT set VIRTIO_NET_F_MRG_RXBUF -- we use fixed-size buffers
+    if (dev_features & VIRTIO_NET_F_MAC)       guest_features |= VIRTIO_NET_F_MAC;
+    if (dev_features & VIRTIO_NET_F_STATUS)    guest_features |= VIRTIO_NET_F_STATUS;
+    if (dev_features & VIRTIO_NET_F_MRG_RXBUF) guest_features |= VIRTIO_NET_F_MRG_RXBUF;
 
     virtio::write_guest_features(io_base_, guest_features);
     serial::printf("virtio_net: guest features = 0x%x\n", guest_features);
