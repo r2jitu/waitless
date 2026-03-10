@@ -1,9 +1,18 @@
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+
 package(default_visibility = ["//visibility:public"])
 
 exports_files([
     "run-local.sh",
     "run-vz.entitlements",
+    "make-limine-iso.sh",
 ])
+
+sh_binary(
+    name = "make_limine_iso",
+    srcs = ["make-limine-iso.sh"],
+    data = ["//boot:limine.conf"],
+)
 
 # Compile the VZ.framework runner from Swift source and codesign it.
 # Produces bazel-bin/scripts/run-vz, a macOS arm64 command-line binary with

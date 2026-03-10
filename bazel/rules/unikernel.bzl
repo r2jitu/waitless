@@ -1,8 +1,8 @@
 """Build rules for unikernel images.
 
 Provides unikernel_binary() which compiles a bare-metal ELF kernel and
-optionally produces a bootable ISO and raw disk image for QEMU or cloud
-deployment.
+produces bootable images for local testing (QEMU, VZ) and cloud deployment
+(Limine ISO/disk).
 """
 
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
@@ -11,13 +11,13 @@ load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
 def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
     """Build a unikernel ELF binary from application sources.
 
-    This macro produces three targets:
-      - <name>.elf  : The bare-metal ELF kernel binary (cc_binary)
-      - <name>_iso  : A GRUB multiboot2 bootable ISO (genrule)
-      - <name>_raw  : A raw disk image for cloud deployment (genrule)
-
-    The ELF binary automatically links against the kernel runtime (boot,
-    core, arch_init), drivers (virtio_net), and the network stack.
+    Targets produced:
+      - <name>.elf        : Bare-metal ELF kernel binary
+      - <name>.img        : Raw ARM64 binary (objcopy, for QEMU/VZ)
+      - <name>_run        : Launch with QEMU or VZ.framework
+      - <name>_limine_iso : Limine-bootable ISO (BIOS+UEFI, for cloud/QEMU)
+      - <name>_iso        : Legacy GRUB multiboot2 ISO (x86 only)
+      - <name>_raw        : Raw disk image (legacy)
 
     Args:
         name: Base name for all output targets.
@@ -89,7 +89,35 @@ def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
         visibility = visibility,
     )
 
-    # Create a bootable ISO for QEMU/cloud using GRUB multiboot2.
+    # Limine-bootable ISO (BIOS+UEFI hybrid).
+    # Works on both x86_64 and aarch64. Uses scripts/make-limine-iso.sh
+    # which fetches Limine binaries on first run.
+    # Prerequisites: xorriso (brew install xorriso), git.
+    native.genrule(
+        name = name + "_limine_iso",
+        srcs = [
+            ":" + name + ".elf",
+            "//boot:limine.conf",
+        ],
+        outs = [name + "_limine.iso"],
+        cmd = select({
+            "//bazel/platforms:aarch64": """
+                $(location //scripts:make_limine_iso) \
+                    $(location :{name_elf}) $@ \
+                    --arch aarch64 --conf $(location //boot:limine.conf)
+            """.format(name_elf = name + ".elf"),
+            "//conditions:default": """
+                $(location //scripts:make_limine_iso) \
+                    $(location :{name_elf}) $@ \
+                    --arch x86_64 --conf $(location //boot:limine.conf)
+            """.format(name_elf = name + ".elf"),
+        }),
+        tools = ["//scripts:make_limine_iso"],
+        local = True,  # Needs network (first run) and host tools
+        visibility = visibility,
+    )
+
+    # Legacy: GRUB multiboot2 ISO (x86 only).
     # Falls back to copying the raw ELF if grub-mkrescue is not available.
     native.genrule(
         name = name + "_iso",
@@ -108,10 +136,7 @@ def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
         visibility = visibility,
     )
 
-    # Create a raw disk image for cloud deployment.
-    # This embeds the ELF at the start of a 64MB image.
-    # Production cloud scripts should handle proper partitioning and
-    # bootloader installation.
+    # Legacy: raw disk image (ELF at offset 0).
     native.genrule(
         name = name + "_raw",
         srcs = [":" + name + ".elf"],
