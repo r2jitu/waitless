@@ -6,6 +6,7 @@ exports_files([
     "run-local.sh",
     "run-vz.entitlements",
     "make-limine-iso.sh",
+    "helpers.sh",
 ])
 
 sh_binary(
@@ -38,4 +39,8 @@ genrule(
         "codesign --sign - --entitlements $(location run-vz.entitlements) $@",
     ]),
     local = True,
+    target_compatible_with = [
+        "@platforms//cpu:aarch64",
+        "//bazel/platforms:host_macos",
+    ],
 )

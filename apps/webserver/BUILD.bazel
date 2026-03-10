@@ -37,6 +37,7 @@ sh_test(
     data = [
         ":webserver.img",
         "//scripts:run_vz",
+        "//scripts:helpers.sh",
     ],
     target_compatible_with = ["@platforms//cpu:aarch64"],
     tags = ["local", "exclusive"],
@@ -49,6 +50,7 @@ sh_test(
     data = [
         ":webserver.elf",
         ":webserver.img",
+        "//scripts:helpers.sh",
     ],
     tags = ["local", "exclusive"],
     timeout = "long",
@@ -60,6 +62,7 @@ sh_test(
     data = [
         ":webserver.limine.elf",
         ":webserver.iso",
+        "//scripts:helpers.sh",
     ],
     target_compatible_with = ["@platforms//cpu:x86_64"],
     tags = ["local", "exclusive"],

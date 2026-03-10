@@ -30,6 +30,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+source "$SCRIPT_DIR/helpers.sh"
+
 HOST_OS="$(uname -s)"     # Darwin or Linux
 HOST_ARCH="$(uname -m)"   # arm64/aarch64 or x86_64
 
@@ -272,32 +274,18 @@ bench_unikernel() {
         QEMU_PID=$!
 
     else
-        # ── QEMU path (Linux or macOS x86_64) ────────────────────────────────
-        if [ "$HOST_ARCH" = "arm64" ] || [ "$HOST_ARCH" = "aarch64" ]; then
-            # arm64: use the pre-built raw binary image (PIE ELF loads wrong in QEMU).
-            qemu-system-aarch64 \
-                -machine virt \
-                -kernel "$img" \
-                -m 128 -smp 1 -cpu max \
-                -display none -monitor none \
-                -chardev "file,id=s0,path=${log}" -serial chardev:s0 \
-                -no-reboot \
-                -device virtio-net-device,netdev=net0 \
-                -netdev "user,id=net0,hostfwd=tcp::${port}-:80" \
-                </dev/null >/dev/null 2>&1 &
-            QEMU_PID=$!
-        else
-            qemu-system-x86_64 \
-                -kernel "$elf" \
-                -m 128 -smp 1 -cpu qemu64 \
-                -display none -monitor none \
-                -chardev "file,id=s0,path=${log}" -serial chardev:s0 \
-                -no-reboot \
-                -device virtio-net-pci,netdev=net0 \
-                -netdev "user,id=net0,hostfwd=tcp::${port}-:80" \
-                </dev/null >/dev/null 2>&1 &
-            QEMU_PID=$!
-        fi
+        # ── QEMU path ────────────────────────────────────────────────────────
+        detect_qemu "$elf"
+        "$QEMU_BIN" \
+            "${QEMU_MACHINE[@]}" -kernel "$KERNEL_ARG" \
+            -m 128 -smp 1 \
+            -display none -monitor none \
+            -chardev "file,id=s0,path=${log}" -serial chardev:s0 \
+            -no-reboot \
+            -device "${VIRTIO_DEV}",netdev=net0 \
+            -netdev "user,id=net0,hostfwd=tcp::${port}-:80" \
+            </dev/null >/dev/null 2>&1 &
+        QEMU_PID=$!
     fi
 
     local timeout=60
@@ -373,27 +361,15 @@ bench_unikernel_x86() {
     local log="/tmp/unikernel-x86-bench.log"
     rm -f "$log"
 
-    # On Apple Silicon, HVF can't run x86 code — must use TCG.
-    # On x86 Macs, try HVF for hardware acceleration.
-    local accel_flags=()
-    if [ "$HOST_ARCH" = "x86_64" ]; then
-        if [ "$HOST_OS" = "Darwin" ] && sysctl -n kern.hv_support 2>/dev/null | grep -q '^1$'; then
-            accel_flags=(-accel hvf)
-        elif [ "$HOST_OS" = "Linux" ] && [ -r /dev/kvm ]; then
-            accel_flags=(-accel kvm)
-        fi
-    fi
-
-    qemu-system-x86_64 \
-        -kernel "$elf" \
+    detect_qemu "$elf"
+    "$QEMU_BIN" \
+        "${QEMU_MACHINE[@]}" -kernel "$KERNEL_ARG" \
         -m 128 -smp 1 \
-        -cpu qemu64 \
         -display none -monitor none \
         -chardev "file,id=s0,path=${log}" -serial chardev:s0 \
         -no-reboot \
-        -device virtio-net-pci,netdev=net0 \
+        -device "${VIRTIO_DEV}",netdev=net0 \
         -netdev "user,id=net0,hostfwd=tcp::${PORT_X86}-:80" \
-        ${accel_flags[@]+"${accel_flags[@]}"} \
         </dev/null >/dev/null 2>&1 &
     QEMU_PID=$!
 

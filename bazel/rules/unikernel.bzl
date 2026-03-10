@@ -70,16 +70,21 @@ def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
         visibility = visibility,
     )
 
-    # "bazel run //apps/<name>:run" — builds the ELF (and IMG on aarch64) then
-    # launches the appropriate runner.  On macOS arm64, run_wrapper.sh passes
-    # the pre-built .img to run-local.sh → run-vz (no runtime ELF conversion).
+    # "bazel run //apps/<name>:run" — auto-detects runner:
+    #   macOS arm64  → VZ.framework (hardware-accelerated via run-vz)
+    #   everything else → QEMU (via detect_qemu in helpers.sh)
     sh_binary(
         name = name + "_run",
         srcs = ["//bazel/rules:run_wrapper.sh"],
         data = [":" + name + ".elf"] + select({
-            "//bazel/platforms:aarch64": [
+            # macOS arm64: include VZ runner + raw image (more specific than :aarch64).
+            "//bazel/platforms:macos_arm64": [
                 ":" + name + ".img",
                 "//scripts:run_vz",
+            ],
+            # Other arm64 (Linux): raw image for QEMU -kernel (PIE ELF loads wrong).
+            "//bazel/platforms:aarch64": [
+                ":" + name + ".img",
             ],
             "//conditions:default": [],
         }),
@@ -103,6 +108,10 @@ def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
             "UNIKERNEL_IMG_RELPATH": native.package_name() + "/" + name + ".img",
             "UNIKERNEL_VZ_RELPATH": "scripts/run-vz",
         },
+        target_compatible_with = [
+            "@platforms//cpu:aarch64",
+            "//bazel/platforms:host_macos",
+        ],
         visibility = visibility,
     )
 

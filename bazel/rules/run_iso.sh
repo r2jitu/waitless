@@ -9,15 +9,10 @@ set -euo pipefail
 [[ -z "${BUILD_WORKSPACE_DIRECTORY:-}" ]] && { echo "error: use 'bazel run'" >&2; exit 1; }
 WS="$BUILD_WORKSPACE_DIRECTORY"
 
-ISO="$WS/bazel-bin/${UNIKERNEL_ISO_RELPATH}"
-PORT="${UNIKERNEL_PORT:-8080}"
-MEMORY="${UNIKERNEL_MEMORY:-128}"
+source "$WS/scripts/helpers.sh"
 
-exec qemu-system-x86_64 \
-    -cpu qemu64 -cdrom "$ISO" \
-    -m "$MEMORY" -smp 1 \
-    -display none -monitor none \
-    -chardev stdio,id=s0,signal=off -serial chardev:s0 \
-    -no-reboot \
-    -device virtio-net-pci,netdev=net0 \
-    -netdev "user,id=net0,hostfwd=tcp::${PORT}-:80"
+QEMU_BIN="qemu-system-x86_64"
+VIRTIO_DEV="virtio-net-pci"
+
+run_qemu "${UNIKERNEL_PORT:-8080}" "${UNIKERNEL_MEMORY:-128}" \
+    -cpu qemu64 -cdrom "$WS/bazel-bin/${UNIKERNEL_ISO_RELPATH}"

@@ -16,7 +16,24 @@ platform(
     ],
 )
 
-# config_setting helpers used in select() expressions across the repo
+# ── Host OS marker ────────────────────────────────────────────────────────────
+# The unikernel target OS is always bare-metal (os:none). These constraints
+# embed the *build host* OS into the platform so select() can distinguish
+# macOS arm64 from Linux arm64 — needed for VZ.framework dependencies.
+constraint_setting(name = "host_os")
+constraint_value(name = "host_macos", constraint_setting = ":host_os")
+constraint_value(name = "host_linux", constraint_setting = ":host_os")
+
+platform(
+    name = "macos_arm64_unikernel",
+    constraint_values = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:none",
+        ":host_macos",
+    ],
+)
+
+# ── config_setting helpers used in select() expressions ──────────────────────
 config_setting(
     name = "x86_64",
     constraint_values = ["@platforms//cpu:x86_64"],
@@ -25,6 +42,15 @@ config_setting(
 config_setting(
     name = "aarch64",
     constraint_values = ["@platforms//cpu:aarch64"],
+)
+
+# Matches macOS arm64 only (more specific than :aarch64; wins in ambiguous selects).
+config_setting(
+    name = "macos_arm64",
+    constraint_values = [
+        "@platforms//cpu:aarch64",
+        ":host_macos",
+    ],
 )
 
 # Matches any unikernel platform (bare-metal, os=none).

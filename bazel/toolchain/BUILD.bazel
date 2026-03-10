@@ -1,4 +1,5 @@
 load(":cc_toolchain_config.bzl", "cc_toolchain_config")
+load("@rules_cc//cc/toolchains:cc_toolchain.bzl", "cc_toolchain")
 
 # Parameterised configs — one per target arch
 cc_toolchain_config(name = "x86_64_toolchain_config",  target_arch = "x86_64")
