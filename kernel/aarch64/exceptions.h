@@ -21,16 +21,16 @@ namespace exceptions {
 //   sp+272: pc       (ELR_EL1)
 //   sp+280: pstate   (SPSR_EL1)
 struct Frame {
-    uint64_t esr;            // ESR_EL1 — syndrome register
-    uint64_t far;            // FAR_EL1 — fault address
-    uint64_t x[31];          // x0..x30 (general purpose)
-    uint64_t sp;             // original SP
-    uint64_t pc;             // ELR_EL1
-    uint64_t pstate;         // SPSR_EL1
+  uint64_t esr;    // ESR_EL1 — syndrome register
+  uint64_t far;    // FAR_EL1 — fault address
+  uint64_t x[31];  // x0..x30 (general purpose)
+  uint64_t sp;     // original SP
+  uint64_t pc;     // ELR_EL1
+  uint64_t pstate; // SPSR_EL1
 };
 
 // C-level exception dispatcher, called by the vector stubs.
-extern "C" void exception_handler(uint32_t kind, Frame* frame);
+extern "C" void exception_handler(uint32_t kind, Frame *frame);
 
 // Install the exception vector table and initialise the GIC.
 void init();

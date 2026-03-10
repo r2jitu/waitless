@@ -14,7 +14,9 @@
 #include <stdint.h>
 
 // Forward declaration to avoid header dependency cycle
-namespace virtio_pci { struct Device; }
+namespace virtio_pci {
+struct Device;
+}
 
 namespace virtio_console {
 
@@ -26,12 +28,12 @@ bool init(uint64_t base_addr);
 // Initialise via modern virtio-PCI transport (works on any platform with
 // PCI, including Apple VZ.framework).  Uses the same static BSS rings —
 // safe to call before mm::init().
-bool init_pci(virtio_pci::Device* dev);
+bool init_pci(virtio_pci::Device *dev);
 
 // Write one byte to the console.  Blocks briefly until the device accepts it.
 void putc(char c);
 
 // Return the next byte from the console receive queue, or -1 if empty.
-int  try_getc();
+int try_getc();
 
 } // namespace virtio_console

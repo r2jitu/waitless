@@ -16,11 +16,11 @@ void init();
 void putc(char c);
 
 // Write a null-terminated string
-void puts(const char* s);
+void puts(const char *s);
 
 // Minimal printf supporting: %s %d %u %x %lx %p %c %%
 // No heap allocation. Uses va_list internally.
-void printf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+void printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 // Read one byte from the serial RX buffer without blocking.
 // Returns the byte value (0–255) if data is available, or -1 if empty.

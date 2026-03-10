@@ -11,8 +11,8 @@
 // The heap allocator provides kmalloc/kfree for dynamic allocations needed
 // by the network stack, drivers, etc.
 
-#include <stdint.h>
 #include <stddef.h>
+#include <stdint.h>
 
 namespace mm {
 
@@ -21,27 +21,27 @@ namespace mm {
 // ============================================================================
 
 struct MultibootTag {
-    uint32_t type;
-    uint32_t size;
+  uint32_t type;
+  uint32_t size;
 };
 
 struct MultibootMmapEntry {
-    uint64_t addr;
-    uint64_t len;
-    uint32_t type;      // 1 = available RAM
-    uint32_t reserved;
+  uint64_t addr;
+  uint64_t len;
+  uint32_t type; // 1 = available RAM
+  uint32_t reserved;
 };
 
 struct MultibootMmapTag {
-    uint32_t type;          // 6 = memory map
-    uint32_t size;
-    uint32_t entry_size;
-    uint32_t entry_version;
-    MultibootMmapEntry entries[];
+  uint32_t type; // 6 = memory map
+  uint32_t size;
+  uint32_t entry_size;
+  uint32_t entry_version;
+  MultibootMmapEntry entries[];
 };
 
 // Multiboot2 tag types
-static constexpr uint32_t MULTIBOOT_TAG_END  = 0;
+static constexpr uint32_t MULTIBOOT_TAG_END = 0;
 static constexpr uint32_t MULTIBOOT_TAG_MMAP = 6;
 
 // Multiboot2 memory types
@@ -70,12 +70,12 @@ void free_frame(uint64_t addr);
 // Returns a pointer to at least `size` bytes of usable memory, or
 // nullptr if the heap is exhausted. The returned pointer is aligned
 // to 16 bytes.
-void* kmalloc(size_t size);
+void *kmalloc(size_t size);
 
 // Free memory previously allocated by kmalloc.
 // Marks the block as free and attempts to coalesce with adjacent
 // free blocks.
-void kfree(void* ptr);
+void kfree(void *ptr);
 
 // Return the total amount of physical RAM detected (in bytes).
 size_t get_total_memory();

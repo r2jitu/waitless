@@ -33,65 +33,70 @@ static int l2_next = 0;
 //     AF=1 → bit[10] = access flag
 //     valid → bit[0] = 1
 //     block → bit[1] = 0 (2MB block, not table)
-static constexpr uint64_t L1_TABLE_DESC  = 0x3;
+static constexpr uint64_t L1_TABLE_DESC = 0x3;
 static constexpr uint64_t L2_DEVICE_BLOCK = 0x0401;
 
 void map_device_range(uint64_t phys_base, uint64_t size) {
-    if (size == 0) return;
+  if (size == 0)
+    return;
 
-    // Align phys_base down to 2MB, adjust size
-    uint64_t base_2m = phys_base & ~((uint64_t)0x1FFFFF);
-    uint64_t end     = (phys_base + size + 0x1FFFFF) & ~((uint64_t)0x1FFFFF);
+  // Align phys_base down to 2MB, adjust size
+  uint64_t base_2m = phys_base & ~((uint64_t)0x1FFFFF);
+  uint64_t end = (phys_base + size + 0x1FFFFF) & ~((uint64_t)0x1FFFFF);
 
-    // Process each 1GB region that overlaps [base_2m, end)
-    uint64_t gb_start = base_2m & ~((uint64_t)0x3FFFFFFF);  // 1GB-aligned
-    for (uint64_t gb = gb_start; gb < end; gb += (uint64_t)1 << 30) {
-        uint64_t l1_idx = gb >> 30;
-        if (l1_idx >= 512) continue;
+  // Process each 1GB region that overlaps [base_2m, end)
+  uint64_t gb_start = base_2m & ~((uint64_t)0x3FFFFFFF); // 1GB-aligned
+  for (uint64_t gb = gb_start; gb < end; gb += (uint64_t)1 << 30) {
+    uint64_t l1_idx = gb >> 30;
+    if (l1_idx >= 512)
+      continue;
 
-        // Skip if already in the first 4GB (mapped as normal-cached by boot.S;
-        // VZ Stage-2 overrides to device for MMIO regions)
-        if (l1_idx < 4) continue;
+    // Skip if already in the first 4GB (mapped as normal-cached by boot.S;
+    // VZ Stage-2 overrides to device for MMIO regions)
+    if (l1_idx < 4)
+      continue;
 
-        // Check if L1 entry already has a table descriptor (from previous call)
-        uint64_t l1_entry = boot_l1_table[l1_idx];
-        uint64_t* l2;
+    // Check if L1 entry already has a table descriptor (from previous call)
+    uint64_t l1_entry = boot_l1_table[l1_idx];
+    uint64_t *l2;
 
-        if ((l1_entry & 0x3) == 0x3) {
-            // Already a table descriptor — reuse the L2 table
-            l2 = reinterpret_cast<uint64_t*>(l1_entry & ~(uint64_t)0xFFF);
-        } else {
-            // Need a new L2 table
-            if (l2_next >= MAX_L2_TABLES) return;  // out of L2 tables
-            l2 = l2_tables[l2_next++];
+    if ((l1_entry & 0x3) == 0x3) {
+      // Already a table descriptor — reuse the L2 table
+      l2 = reinterpret_cast<uint64_t *>(l1_entry & ~(uint64_t)0xFFF);
+    } else {
+      // Need a new L2 table
+      if (l2_next >= MAX_L2_TABLES)
+        return; // out of L2 tables
+      l2 = l2_tables[l2_next++];
 
-            // If there was a block descriptor, preserve it by filling
-            // the L2 table with equivalent 2MB blocks
-            if (l1_entry & 0x1) {
-                uint64_t block_pa    = l1_entry & ~(uint64_t)0x3FFFFFFF;
-                uint64_t block_attrs = l1_entry & 0xFFF;
-                // Convert L1 block attrs to L2 block attrs (same format)
-                for (int i = 0; i < 512; i++) {
-                    l2[i] = (block_pa + (uint64_t)i * (2 << 20)) | block_attrs;
-                }
-            }
-
-            // Point L1 entry at the new L2 table
-            boot_l1_table[l1_idx] = ((uint64_t)l2) | L1_TABLE_DESC;
+      // If there was a block descriptor, preserve it by filling
+      // the L2 table with equivalent 2MB blocks
+      if (l1_entry & 0x1) {
+        uint64_t block_pa = l1_entry & ~(uint64_t)0x3FFFFFFF;
+        uint64_t block_attrs = l1_entry & 0xFFF;
+        // Convert L1 block attrs to L2 block attrs (same format)
+        for (int i = 0; i < 512; i++) {
+          l2[i] = (block_pa + (uint64_t)i * (2 << 20)) | block_attrs;
         }
+      }
 
-        // Fill in the device entries for the 2MB blocks within this 1GB region
-        uint64_t range_start = (base_2m > gb) ? base_2m : gb;
-        uint64_t range_end   = (end < gb + ((uint64_t)1 << 30)) ? end : gb + ((uint64_t)1 << 30);
-
-        for (uint64_t addr = range_start; addr < range_end; addr += (2 << 20)) {
-            int l2_idx = (int)((addr - gb) >> 21);
-            l2[l2_idx] = addr | L2_DEVICE_BLOCK;
-        }
+      // Point L1 entry at the new L2 table
+      boot_l1_table[l1_idx] = ((uint64_t)l2) | L1_TABLE_DESC;
     }
 
-    // Ensure table writes are visible, then invalidate TLB
-    asm volatile("dsb sy; tlbi vmalle1; dsb sy; isb" ::: "memory");
+    // Fill in the device entries for the 2MB blocks within this 1GB region
+    uint64_t range_start = (base_2m > gb) ? base_2m : gb;
+    uint64_t range_end =
+        (end < gb + ((uint64_t)1 << 30)) ? end : gb + ((uint64_t)1 << 30);
+
+    for (uint64_t addr = range_start; addr < range_end; addr += (2 << 20)) {
+      int l2_idx = (int)((addr - gb) >> 21);
+      l2[l2_idx] = addr | L2_DEVICE_BLOCK;
+    }
+  }
+
+  // Ensure table writes are visible, then invalidate TLB
+  asm volatile("dsb sy; tlbi vmalle1; dsb sy; isb" ::: "memory");
 }
 
 } // namespace mmu
