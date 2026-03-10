@@ -225,6 +225,7 @@ check_prereqs() {
 bench_unikernel() {
     local step=$1 port=$2
     local url="http://127.0.0.1:${port}${ENDPOINT}"
+    wait_port_pool
     local label runner
     if [ "${UNIKERNEL_RUNNER:-}" = "qemu" ]; then
         label="Unikernel (QEMU TCG)"
@@ -313,7 +314,6 @@ bench_unikernel() {
 
     kill -TERM "$QEMU_PID" 2>/dev/null; wait "$QEMU_PID" 2>/dev/null || true
     QEMU_PID=""
-    wait_port_pool   # drain TIME_WAIT before the next benchmark can start
 
     record_result "$label" "$rps" "$p50" "$p99"
     echo ""
@@ -384,6 +384,7 @@ bench_unikernel_x86() {
 # ── Benchmark: bench_server in Docker (Linux VM) ──────────────────────────────
 bench_docker_server() {
     local url="http://127.0.0.1:${PORT_DOCKER}${ENDPOINT}"
+    wait_port_pool
     echo "==> [${STEP_DOCKER}/${TOTAL}] bench_server in Docker  (Linux VM + same server code)"
 
     echo "  Building Docker image (bench_server for Linux)..."
@@ -409,7 +410,6 @@ bench_docker_server() {
     run_wrk "docker_server" rps p50 p99 "$url"
 
     docker stop "$cid" >/dev/null 2>&1; DOCKER_CID=""
-    wait_port_pool   # drain TIME_WAIT before the native benchmark starts
 
     record_result "bench_server/Linux (Docker VM)" "$rps" "$p50" "$p99"
     echo ""
@@ -418,6 +418,7 @@ bench_docker_server() {
 # ── Benchmark: bench_server native on macOS ───────────────────────────────────
 bench_native_server() {
     local url="http://127.0.0.1:${PORT_NATIVE}${ENDPOINT}"
+    wait_port_pool
     echo "==> [${STEP_NATIVE}/${TOTAL}] bench_server on macOS  (native, no virtualization)"
 
     local bin="/tmp/bench_server_macos"
