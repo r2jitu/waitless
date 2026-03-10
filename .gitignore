@@ -14,8 +14,8 @@ user.bazelrc
 # macOS metadata
 .DS_Store
 
-# Claude Code — machine-local session permissions (commit settings.json, not this)
-.claude/settings.local.json
+# Claude Code
+.claude/
 
 # Editor artifacts
 *.swp
