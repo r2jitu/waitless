@@ -16,18 +16,18 @@
 //   Ports:  host:HOST_PORT → VM:80  (TCP proxy via Ethernet injection)
 //   Serial: stdin/stdout via VirtIO console (Ctrl-C → graceful shutdown)
 //
-// Requires macOS 11 (VZVirtioConsoleDeviceSerialPortConfiguration).
+// Performance: zero-copy packet construction, kqueue event loop,
+// TCP_NODELAY, enlarged socket buffers.  No Swift Data/Array on hot path.
 
 import Darwin
 import Foundation
 import Virtualization
 
-// ─── Constants ───────────────────────────────────────────────────────────────
+// ─── Constants (raw bytes, no heap allocations) ──────────────────────────────
 
-let GW_MAC   = Data([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
-let BCAST_MAC = Data([0xff, 0xff, 0xff, 0xff, 0xff, 0xff])
-let VM_IP    = Data([10, 0, 2, 15])
-let GW_IP    = Data([10, 0, 2, 2])
+let GW_MAC:  (UInt8,UInt8,UInt8,UInt8,UInt8,UInt8) = (0xaa,0xbb,0xcc,0xdd,0xee,0xff)
+let VM_IP4:  (UInt8,UInt8,UInt8,UInt8) = (10, 0, 2, 15)
+let GW_IP4:  (UInt8,UInt8,UInt8,UInt8) = (10, 0, 2, 2)
 
 // ─── Terminal raw mode ───────────────────────────────────────────────────────
 
@@ -37,8 +37,6 @@ private var termRaw      = false
 func enableRawInput() {
     guard isatty(STDIN_FILENO) != 0, tcgetattr(STDIN_FILENO, &savedTermios) == 0 else { return }
     var t = savedTermios
-    // Disable signal generation (ISIG) and line buffering (ICANON).
-    // Ctrl-C becomes byte 0x03 forwarded to the VM's virtio console.
     t.c_lflag &= ~tcflag_t(ISIG | ICANON | ECHO | IEXTEN)
     t.c_iflag &= ~tcflag_t(ICRNL | IXON)
     t.c_oflag &= ~tcflag_t(OPOST)
@@ -50,276 +48,333 @@ func restoreTerminal() {
     if termRaw { tcsetattr(STDIN_FILENO, TCSAFLUSH, &savedTermios) }
 }
 
-// ─── Packet helpers ───────────────────────────────────────────────────────────
+// ─── Zero-copy packet builder ────────────────────────────────────────────────
+// All packet construction writes directly into a pre-allocated buffer.
+// No Data, no Array, no heap allocations on the hot path.
 
-func u16be(_ v: Int) -> Data { Data([UInt8(v >> 8), UInt8(v & 0xff)]) }
-func u32be(_ v: UInt32) -> Data {
-    Data([UInt8(v>>24), UInt8((v>>16)&0xff), UInt8((v>>8)&0xff), UInt8(v&0xff)])
+@inline(__always)
+func put16(_ p: UnsafeMutablePointer<UInt8>, _ v: UInt16) {
+    p[0] = UInt8(v >> 8); p[1] = UInt8(v & 0xff)
 }
 
-func ipv4Checksum(_ d: Data) -> UInt16 {
+@inline(__always)
+func put32(_ p: UnsafeMutablePointer<UInt8>, _ v: UInt32) {
+    p[0] = UInt8(v >> 24); p[1] = UInt8((v >> 16) & 0xff)
+    p[2] = UInt8((v >> 8) & 0xff); p[3] = UInt8(v & 0xff)
+}
+
+@inline(__always)
+func get16(_ p: UnsafePointer<UInt8>) -> UInt16 {
+    UInt16(p[0]) << 8 | UInt16(p[1])
+}
+
+@inline(__always)
+func get32(_ p: UnsafePointer<UInt8>) -> UInt32 {
+    UInt32(p[0]) << 24 | UInt32(p[1]) << 16 | UInt32(p[2]) << 8 | UInt32(p[3])
+}
+
+@inline(__always)
+func putMAC(_ p: UnsafeMutablePointer<UInt8>, _ m: (UInt8,UInt8,UInt8,UInt8,UInt8,UInt8)) {
+    p[0] = m.0; p[1] = m.1; p[2] = m.2; p[3] = m.3; p[4] = m.4; p[5] = m.5
+}
+
+@inline(__always)
+func putIP4(_ p: UnsafeMutablePointer<UInt8>, _ ip: (UInt8,UInt8,UInt8,UInt8)) {
+    p[0] = ip.0; p[1] = ip.1; p[2] = ip.2; p[3] = ip.3
+}
+
+func checksumBuf(_ p: UnsafePointer<UInt8>, _ len: Int) -> UInt16 {
     var s: UInt32 = 0
-    let b = Array(d)
     var i = 0
-    while i + 1 < b.count { s += UInt32(b[i]) << 8 | UInt32(b[i+1]); i += 2 }
-    if i < b.count { s += UInt32(b[i]) << 8 }
+    while i + 1 < len { s += UInt32(p[i]) << 8 | UInt32(p[i+1]); i += 2 }
+    if i < len { s += UInt32(p[i]) << 8 }
     while s >> 16 != 0 { s = (s & 0xffff) + (s >> 16) }
     return UInt16(~s & 0xffff)
 }
 
-func buildEth(dst: Data, ethertype: UInt16, payload: Data) -> Data {
-    dst + GW_MAC + u16be(Int(ethertype)) + payload
+// Write Ethernet header into `p`, return pointer to payload area.
+@inline(__always)
+func writeEthHdr(_ p: UnsafeMutablePointer<UInt8>,
+                 dstMAC: UnsafePointer<UInt8>,
+                 ethertype: UInt16) -> UnsafeMutablePointer<UInt8> {
+    memcpy(p, dstMAC, 6)
+    putMAC(p + 6, GW_MAC)
+    put16(p + 12, ethertype)
+    return p + 14
 }
 
-func buildIPv4(src: Data, dst: Data, proto: UInt8, payload: Data) -> Data {
-    var h = Data(count: 20)
-    h[0] = 0x45
-    let len = UInt16(20 + payload.count)
-    h[2] = UInt8(len >> 8); h[3] = UInt8(len & 0xff)
-    h[6] = 0x40             // DF
-    h[8] = 64               // TTL
-    h[9] = proto
-    h[12...15] = src[...]; h[16...19] = dst[...]
-    let cs = ipv4Checksum(h)
-    h[10] = UInt8(cs >> 8); h[11] = UInt8(cs & 0xff)
-    return h + payload
+@inline(__always)
+func writeIPv4Hdr(_ p: UnsafeMutablePointer<UInt8>,
+                  srcIP: (UInt8,UInt8,UInt8,UInt8),
+                  dstIP: (UInt8,UInt8,UInt8,UInt8),
+                  proto: UInt8,
+                  payloadLen: Int) {
+    p[0] = 0x45; p[1] = 0
+    put16(p + 2, UInt16(20 + payloadLen))
+    p[4] = 0; p[5] = 0; p[6] = 0x40; p[7] = 0
+    p[8] = 64; p[9] = proto
+    p[10] = 0; p[11] = 0
+    putIP4(p + 12, srcIP); putIP4(p + 16, dstIP)
+    let cs = checksumBuf(p, 20)
+    p[10] = UInt8(cs >> 8); p[11] = UInt8(cs & 0xff)
 }
 
-func buildUDP(srcPort: Int, dstPort: Int, data: Data) -> Data {
-    let len = 8 + data.count
-    return u16be(srcPort) + u16be(dstPort) + u16be(len) + Data([0,0]) + data
-}
-
-func tcpCsum(srcIP: Data, dstIP: Data, seg: Data) -> UInt16 {
-    var ph = srcIP + dstIP + Data([0, 6]) + u16be(seg.count)
-    ph += seg
-    if ph.count % 2 != 0 { ph += Data([0]) }
-    return ipv4Checksum(ph)
-}
-
-func buildTCP(sp: Int, dp: Int, seq: UInt32, ack: UInt32, flags: UInt8,
-              data: Data, srcIP: Data, dstIP: Data) -> Data {
-    var h = Data(count: 20)
-    h[0] = UInt8(sp>>8); h[1] = UInt8(sp&0xff)
-    h[2] = UInt8(dp>>8); h[3] = UInt8(dp&0xff)
-    h[4...7] = u32be(seq)[...]; h[8...11] = u32be(ack)[...]
-    h[12] = 0x50; h[13] = flags
-    h[14] = 0xff; h[15] = 0xff  // window
-    let seg = h + data
-    let cs  = tcpCsum(srcIP: srcIP, dstIP: dstIP, seg: seg)
-    var out = seg; out[16] = UInt8(cs>>8); out[17] = UInt8(cs&0xff)
-    return out
+func tcpChecksum(srcIP: (UInt8,UInt8,UInt8,UInt8),
+                 dstIP: (UInt8,UInt8,UInt8,UInt8),
+                 tcp: UnsafePointer<UInt8>, tcpLen: Int) -> UInt16 {
+    var s: UInt32 = 0
+    // Pseudo-header
+    s += UInt32(srcIP.0) << 8 | UInt32(srcIP.1)
+    s += UInt32(srcIP.2) << 8 | UInt32(srcIP.3)
+    s += UInt32(dstIP.0) << 8 | UInt32(dstIP.1)
+    s += UInt32(dstIP.2) << 8 | UInt32(dstIP.3)
+    s += 6 // TCP protocol
+    s += UInt32(tcpLen)
+    // Segment
+    var i = 0
+    while i + 1 < tcpLen { s += UInt32(tcp[i]) << 8 | UInt32(tcp[i+1]); i += 2 }
+    if i < tcpLen { s += UInt32(tcp[i]) << 8 }
+    while s >> 16 != 0 { s = (s & 0xffff) + (s >> 16) }
+    return UInt16(~s & 0xffff)
 }
 
 // ─── TCP proxy connection ─────────────────────────────────────────────────────
 
 final class ProxyConn {
     let hostFD:  Int32
-    let srcPort: Int
+    let srcPort: UInt16
     var mySeq:   UInt32
-    var peerAck: UInt32 = 0   // VM's seq (we track for our ack field)
+    var peerAck: UInt32 = 0
     var state:   Int = 0      // 0=SYN_SENT 1=ESTAB 2=CLOSED
-    var pending: Data = Data()
+    var pending     = UnsafeMutablePointer<UInt8>.allocate(capacity: 65536)
+    var pendingLen  = 0
 
-    init(fd: Int32, port: Int) {
+    init(fd: Int32, port: UInt16) {
         hostFD  = fd; srcPort = port
         mySeq   = UInt32.random(in: 0..<UInt32.max)
     }
+    deinit { pending.deallocate() }
 }
 
 // ─── Network bridge ───────────────────────────────────────────────────────────
 
 final class NetBridge {
-    let vmFD:     Int32   // our end of the socketpair → frames to/from VM
+    let vmFD:     Int32
     let hostPort: Int32
-    var vmMAC:    Data?   // learned from first VM frame
+    var vmMACBuf  = UnsafeMutablePointer<UInt8>.allocate(capacity: 6) // flat buffer
+    var hasVmMAC  = false
+    let bcastMAC  = UnsafeMutablePointer<UInt8>.allocate(capacity: 6)
     var conns:    [Int: ProxyConn] = [:]
-    var nextPort  = 40000
+    var nextPort: UInt16 = 40000
 
-    init(vmFD: Int32, port: Int32) { self.vmFD = vmFD; self.hostPort = port }
+    // Pre-allocated I/O buffers
+    let txBuf = UnsafeMutablePointer<UInt8>.allocate(capacity: 65536)
+    let rxBuf = UnsafeMutablePointer<UInt8>.allocate(capacity: 65536)
+
+    init(vmFD: Int32, port: Int32) {
+        self.vmFD = vmFD; self.hostPort = port
+        memset(bcastMAC, 0xff, 6)
+    }
 
     // ── Frame I/O ────────────────────────────────────────────────────────────
 
-    func sendToVM(_ frame: Data) {
-        _ = frame.withUnsafeBytes { read in write(vmFD, read.baseAddress!, frame.count) }
+    @inline(__always)
+    func sendFrame(_ len: Int) {
+        _ = Darwin.write(vmFD, txBuf, len)
     }
 
-    func toVM(dstMAC: Data, ethertype: UInt16, payload: Data) {
-        sendToVM(buildEth(dst: dstMAC, ethertype: ethertype, payload: payload))
-    }
+    func tcpToVM(c: ProxyConn, flags: UInt8,
+                 payload: UnsafePointer<UInt8>?, payloadLen: Int) {
+        let dst = hasVmMAC ? vmMACBuf : bcastMAC
+        let ip = writeEthHdr(txBuf, dstMAC: dst, ethertype: 0x0800)
+        let tcp = ip + 20
+        let tcpLen = 20 + payloadLen
 
-    func tcpToVM(c: ProxyConn, flags: UInt8, data: Data) {
-        let dst = vmMAC ?? BCAST_MAC
-        let tcp = buildTCP(sp: c.srcPort, dp: 80, seq: c.mySeq, ack: c.peerAck,
-                           flags: flags, data: data, srcIP: GW_IP, dstIP: VM_IP)
-        toVM(dstMAC: dst, ethertype: 0x0800,
-             payload: buildIPv4(src: GW_IP, dst: VM_IP, proto: 6, payload: tcp))
+        // TCP header
+        put16(tcp, UInt16(c.srcPort))
+        put16(tcp + 2, 80)
+        put32(tcp + 4, c.mySeq)
+        put32(tcp + 8, c.peerAck)
+        tcp[12] = 0x50; tcp[13] = flags
+        put16(tcp + 14, 0xffff)
+        tcp[16] = 0; tcp[17] = 0; tcp[18] = 0; tcp[19] = 0
+
+        if payloadLen > 0, let payload = payload {
+            memcpy(tcp + 20, payload, payloadLen)
+        }
+
+        let cs = tcpChecksum(srcIP: GW_IP4, dstIP: VM_IP4, tcp: tcp, tcpLen: tcpLen)
+        tcp[16] = UInt8(cs >> 8); tcp[17] = UInt8(cs & 0xff)
+
+        writeIPv4Hdr(ip, srcIP: GW_IP4, dstIP: VM_IP4, proto: 6, payloadLen: tcpLen)
+        sendFrame(14 + 20 + tcpLen)
     }
 
     // ── ARP ──────────────────────────────────────────────────────────────────
 
-    func handleARP(_ arp: Data, srcMAC: Data) {
-        guard arp.count >= 28,
-              (UInt16(arp[6])<<8)|UInt16(arp[7]) == 1,  // REQUEST
-              Data(arp[24...27]) == GW_IP else { return }
+    func handleARP(_ arp: UnsafePointer<UInt8>, _ arpLen: Int,
+                   srcMAC: UnsafePointer<UInt8>) {
+        guard arpLen >= 28, get16(arp + 6) == 1,
+              arp[24] == GW_IP4.0, arp[25] == GW_IP4.1,
+              arp[26] == GW_IP4.2, arp[27] == GW_IP4.3 else { return }
 
-        var rep = Data(count: 28)
-        rep[0]=0; rep[1]=1; rep[2]=0x08; rep[3]=0x00
-        rep[4]=6; rep[5]=4; rep[6]=0; rep[7]=2     // REPLY
-        rep[8...13] = GW_MAC[...]
-        rep[14...17] = GW_IP[...]
-        rep[18...23] = srcMAC[...]
-        rep[24...27] = srcMAC[...]  // target IP is whatever they asked about
-        rep[24...27] = arp[14...17] // target IP = sender IP (their IP)
-        toVM(dstMAC: srcMAC, ethertype: 0x0806, payload: rep)
+        let p = writeEthHdr(txBuf, dstMAC: srcMAC, ethertype: 0x0806)
+        put16(p, 1); put16(p + 2, 0x0800)
+        p[4] = 6; p[5] = 4; put16(p + 6, 2)
+        putMAC(p + 8, GW_MAC); putIP4(p + 14, GW_IP4)
+        memcpy(p + 18, srcMAC, 6)
+        memcpy(p + 24, arp + 14, 4) // target IP = request sender IP
+        sendFrame(14 + 28)
     }
 
     // ── DHCP ─────────────────────────────────────────────────────────────────
 
-    func handleDHCP(_ udp: Data, srcMAC: Data) {
-        guard udp.count >= 8 else { return }
-        let sp = (Int(udp[0])<<8)|Int(udp[1]), dp = (Int(udp[2])<<8)|Int(udp[3])
-        guard sp == 68 && dp == 67 else { return }
-        let bootp = Data(udp.dropFirst(8))  // fresh Data so [n] indices start at 0
-        guard bootp.count >= 236 else { return }
-        let xid = Data(bootp[4...7])
+    func handleDHCP(_ udp: UnsafePointer<UInt8>, _ udpLen: Int,
+                    srcMAC: UnsafePointer<UInt8>) {
+        guard udpLen >= 8, get16(udp) == 68, get16(udp + 2) == 67 else { return }
+        let bootp = udp + 8, bootpLen = udpLen - 8
+        guard bootpLen >= 240 else { return }
 
-        // Find message type option
         var msgType: UInt8 = 0
-        // DHCP options start at bootp offset 240: skip fixed 236-byte bootp header
-        // and the 4-byte magic cookie (99.130.83.99) that precedes the TLV options.
-        var i = 0; let opts = Array(Data(bootp.dropFirst(240)))
-        while i < opts.count {
-            let t = opts[i]; if t == 255 { break }; if t == 0 { i += 1; continue }
-            let l = Int(opts[i+1])
-            if t == 53, l >= 1 { msgType = opts[i+2] }
+        var i = 240
+        while i < bootpLen {
+            let t = bootp[i]; if t == 255 { break }; if t == 0 { i += 1; continue }
+            guard i + 1 < bootpLen else { break }
+            let l = Int(bootp[i+1])
+            if t == 53, l >= 1, i + 2 < bootpLen { msgType = bootp[i+2] }
             i += 2 + l
         }
         guard msgType == 1 || msgType == 3 else { return }
         let replyType: UInt8 = (msgType == 1) ? 2 : 5
 
-        // Build BOOTP reply (236 bytes)
-        var bp = Data(count: 236)
-        bp[0]=2; bp[1]=1; bp[2]=6; bp[3]=0
-        bp[4...7] = xid[...]
-        bp[16...19] = VM_IP[...]    // yiaddr
-        bp[20...23] = GW_IP[...]    // siaddr
-        bp[28...33] = srcMAC[...]   // chaddr
+        let eth = writeEthHdr(txBuf, dstMAC: srcMAC, ethertype: 0x0800)
+        let ip = eth, udpH = ip + 20, bp = udpH + 8
 
-        // DHCP options
-        var o = Data([99,130,83,99])   // magic cookie
-        o += Data([53,1,replyType])    // msg type
-        o += Data([54,4])+GW_IP        // server id
-        o += Data([51,4,0,1,81,128])   // lease 86400s
-        o += Data([1,4,255,255,255,0]) // subnet
-        o += Data([3,4])+GW_IP         // router
-        o += Data([6,4,10,0,2,3])      // DNS
-        o += Data([255])               // end
+        memset(bp, 0, 236)
+        bp[0] = 2; bp[1] = 1; bp[2] = 6
+        memcpy(bp + 4, bootp + 4, 4)       // xid
+        putIP4(bp + 16, VM_IP4)             // yiaddr
+        putIP4(bp + 20, GW_IP4)             // siaddr
+        memcpy(bp + 28, srcMAC, 6)          // chaddr
 
-        let udpPkt = buildUDP(srcPort: 67, dstPort: 68, data: bp + o)
-        let dst = Data([255,255,255,255])
-        let ipPkt = buildIPv4(src: GW_IP, dst: dst, proto: 17, payload: udpPkt)
-        let frame = buildEth(dst: srcMAC, ethertype: 0x0800, payload: ipPkt)
-        sendToVM(frame)
+        let opts = bp + 236; var o = 0
+        opts[o]=99; opts[o+1]=130; opts[o+2]=83; opts[o+3]=99; o += 4
+        opts[o]=53; opts[o+1]=1; opts[o+2]=replyType; o += 3
+        opts[o]=54; opts[o+1]=4; putIP4(opts+o+2, GW_IP4); o += 6
+        opts[o]=51; opts[o+1]=4; put32(opts+o+2, 86400); o += 6
+        opts[o]=1; opts[o+1]=4; opts[o+2]=255; opts[o+3]=255; opts[o+4]=255; opts[o+5]=0; o += 6
+        opts[o]=3; opts[o+1]=4; putIP4(opts+o+2, GW_IP4); o += 6
+        opts[o]=6; opts[o+1]=4; opts[o+2]=10; opts[o+3]=0; opts[o+4]=2; opts[o+5]=3; o += 6
+        opts[o]=255; o += 1
+
+        let udpTotal = 8 + 236 + o
+        put16(udpH, 67); put16(udpH + 2, 68)
+        put16(udpH + 4, UInt16(udpTotal)); udpH[6] = 0; udpH[7] = 0
+        writeIPv4Hdr(ip, srcIP: GW_IP4, dstIP: (255,255,255,255), proto: 17, payloadLen: udpTotal)
+        sendFrame(14 + 20 + udpTotal)
     }
 
-    // ── TCP (VM → host direction: from TCP proxy perspective) ─────────────────
+    // ── TCP from VM ──────────────────────────────────────────────────────────
 
-    func handleTCPFromVM(_ tcp: Data) {
-        guard tcp.count >= 20 else { return }
-        let dstPort = (Int(tcp[2])<<8)|Int(tcp[3])
-        let seq     = (UInt32(tcp[4])<<24)|(UInt32(tcp[5])<<16)|(UInt32(tcp[6])<<8)|UInt32(tcp[7])
-        let ack     = (UInt32(tcp[8])<<24)|(UInt32(tcp[9])<<16)|(UInt32(tcp[10])<<8)|UInt32(tcp[11])
-        let flags   = tcp[13]
-        let doff    = Int((tcp[12] >> 4) * 4)
-        let payload = tcp.dropFirst(doff)
-
-        let SYN: UInt8=0x02, ACK: UInt8=0x10, FIN: UInt8=0x01, RST: UInt8=0x04
+    func handleTCPFromVM(_ tcp: UnsafePointer<UInt8>, _ tcpLen: Int) {
+        guard tcpLen >= 20 else { return }
+        let dstPort = Int(get16(tcp + 2))
+        let seq = get32(tcp + 4), ack = get32(tcp + 8)
+        let flags = tcp[13]
+        let doff = Int(tcp[12] >> 4) * 4
+        let payloadLen = tcpLen - doff
 
         guard let c = conns[dstPort] else { return }
-
-        if flags & RST != 0 {
+        if flags & 0x04 != 0 { // RST
             close(c.hostFD); conns.removeValue(forKey: dstPort); return
         }
 
         switch c.state {
-        case 0:
-            guard flags & SYN != 0, flags & ACK != 0 else { return }
-            c.peerAck = seq + 1
-            c.state   = 1
-            tcpToVM(c: c, flags: ACK, data: Data())
-            if !c.pending.isEmpty {
-                tcpToVM(c: c, flags: ACK|0x08, data: c.pending)
-                c.mySeq += UInt32(c.pending.count)
-                c.pending = Data()
+        case 0: // SYN_SENT
+            guard flags & 0x02 != 0, flags & 0x10 != 0 else { return } // SYN+ACK
+            c.peerAck = seq + 1; c.state = 1
+            tcpToVM(c: c, flags: 0x10, payload: nil, payloadLen: 0)
+            if c.pendingLen > 0 {
+                tcpToVM(c: c, flags: 0x18, payload: c.pending, payloadLen: c.pendingLen)
+                c.mySeq += UInt32(c.pendingLen); c.pendingLen = 0
             }
-
-        case 1:
-            if flags & ACK != 0 { _ = ack }  // we don't do retransmit, ignore ack
-            if !payload.isEmpty {
-                c.peerAck = seq + UInt32(payload.count)
-                _ = payload.withUnsafeBytes { write(c.hostFD, $0.baseAddress!, payload.count) }
-                tcpToVM(c: c, flags: ACK, data: Data())
+        case 1: // ESTABLISHED
+            _ = ack
+            if payloadLen > 0 {
+                c.peerAck = seq + UInt32(payloadLen)
+                _ = Darwin.write(c.hostFD, tcp + doff, payloadLen)
+                tcpToVM(c: c, flags: 0x10, payload: nil, payloadLen: 0)
             }
-            if flags & FIN != 0 {
+            if flags & 0x01 != 0 { // FIN
                 c.peerAck += 1
-                tcpToVM(c: c, flags: ACK|FIN, data: Data())
-                c.mySeq += 1
-                c.state = 2
-                close(c.hostFD)
-                conns.removeValue(forKey: dstPort)
+                tcpToVM(c: c, flags: 0x11, payload: nil, payloadLen: 0) // FIN+ACK
+                c.mySeq += 1; c.state = 2
+                close(c.hostFD); conns.removeValue(forKey: dstPort)
             }
         default: break
         }
     }
 
-    // ── IPv4 dispatcher ──────────────────────────────────────────────────────
+    // ── Dispatchers ──────────────────────────────────────────────────────────
 
-    func handleIPv4(_ ip: Data, srcMAC: Data) {
-        guard ip.count >= 20 else { return }
-        let proto = ip[9]
-        let ihl   = Int(ip[0] & 0x0f) * 4
-        // Data(slice) copies into a new Data with indices starting at 0,
-        // so handlers can safely use body[0], body[1] etc.
-        let body  = Data(ip.dropFirst(ihl))
-        if proto == 17 { handleDHCP(body, srcMAC: srcMAC) }
-        else if proto == 6 { handleTCPFromVM(body) }
+    @inline(__always)
+    func handleIPv4(_ ip: UnsafePointer<UInt8>, _ ipLen: Int,
+                    srcMAC: UnsafePointer<UInt8>) {
+        guard ipLen >= 20 else { return }
+        let ihl = Int(ip[0] & 0x0f) * 4
+        let body = ip + ihl, bodyLen = ipLen - ihl
+        if ip[9] == 17 { handleDHCP(body, bodyLen, srcMAC: srcMAC) }
+        else if ip[9] == 6 { handleTCPFromVM(body, bodyLen) }
     }
 
-    // ── Frame dispatcher ──────────────────────────────────────────────────────
-
-    func processFrame(_ frame: Data) {
-        guard frame.count >= 14 else { return }
-        let srcMAC    = Data(frame[6...11])
-        if vmMAC == nil, srcMAC != GW_MAC, srcMAC != BCAST_MAC { vmMAC = srcMAC }
-        let ethertype = (UInt16(frame[12])<<8)|UInt16(frame[13])
-
-        let payload   = frame.dropFirst(14)
-        if ethertype == 0x0806      { handleARP(Data(payload), srcMAC: srcMAC) }
-        else if ethertype == 0x0800 { handleIPv4(Data(payload), srcMAC: srcMAC) }
+    @inline(__always)
+    func processFrame(_ frame: UnsafePointer<UInt8>, _ frameLen: Int) {
+        guard frameLen >= 14 else { return }
+        let srcMAC = frame + 6
+        if !hasVmMAC && srcMAC[0] != 0xff && srcMAC[0] != GW_MAC.0 {
+            memcpy(vmMACBuf, srcMAC, 6); hasVmMAC = true
+        }
+        let et = get16(frame + 12)
+        let payload = frame + 14, pLen = frameLen - 14
+        if et == 0x0806 { handleARP(payload, pLen, srcMAC: srcMAC) }
+        else if et == 0x0800 { handleIPv4(payload, pLen, srcMAC: srcMAC) }
     }
 
-    // ── New incoming host connection → synthesize TCP SYN to VM ──────────────
+    // ── New host connection ──────────────────────────────────────────────────
 
-    func newHostConn(fd: Int32) {
-        let port = nextPort; nextPort = nextPort % 19999 + 40001
-        let c    = ProxyConn(fd: fd, port: port)
-        conns[port] = c
-        let SYN: UInt8 = 0x02
-        tcpToVM(c: c, flags: SYN, data: Data())
-        c.mySeq += 1  // SYN consumes one seq#
+    func newHostConn(fd: Int32, kq: Int32) {
+        let port = nextPort
+        nextPort = nextPort >= 59999 ? 40000 : nextPort + 1
+        var one: Int32 = 1
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, 4)
+        _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK)
+        let c = ProxyConn(fd: fd, port: port)
+        conns[Int(port)] = c
+        // Register with kqueue
+        var ev = kevent(ident: UInt(fd), filter: Int16(EVFILT_READ),
+                        flags: UInt16(EV_ADD), fflags: 0, data: 0,
+                        udata: UnsafeMutableRawPointer(bitPattern: Int(port)))
+        kevent(kq, &ev, 1, nil, 0, nil)
+        tcpToVM(c: c, flags: 0x02, payload: nil, payloadLen: 0) // SYN
+        c.mySeq += 1
     }
 
-    // ── Main bridge loop ──────────────────────────────────────────────────────
+    // ── Main loop (kqueue) ───────────────────────────────────────────────────
 
     func run() {
-        // Listen for incoming host TCP connections
+        // Enlarge socketpair buffers for burst throughput
+        var bufSize: Int32 = 1024 * 1024
+        setsockopt(vmFD, SOL_SOCKET, SO_SNDBUF, &bufSize, 4)
+        setsockopt(vmFD, SOL_SOCKET, SO_RCVBUF, &bufSize, 4)
+        _ = fcntl(vmFD, F_SETFL, fcntl(vmFD, F_GETFL, 0) | O_NONBLOCK)
+
+        // Listen socket
         let listenFD = socket(AF_INET, SOCK_STREAM, 0)
         var opt: Int32 = 1
         setsockopt(listenFD, SOL_SOCKET, SO_REUSEADDR, &opt, 4)
         var sa = sockaddr_in()
-        sa.sin_family  = sa_family_t(AF_INET)
-        sa.sin_port    = in_port_t(UInt16(bigEndian: UInt16(hostPort)))
+        sa.sin_family = sa_family_t(AF_INET)
+        sa.sin_port = UInt16(hostPort).bigEndian
         sa.sin_addr.s_addr = INADDR_ANY
         withUnsafeMutablePointer(to: &sa) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
@@ -327,76 +382,79 @@ final class NetBridge {
             }
         }
         listen(listenFD, 128)
+        _ = fcntl(listenFD, F_SETFL, fcntl(listenFD, F_GETFL, 0) | O_NONBLOCK)
 
-        // Non-blocking accept: lets us drain all pending connections in one loop.
-        let listenFlags = fcntl(listenFD, F_GETFL, 0)
-        _ = fcntl(listenFD, F_SETFL, listenFlags | O_NONBLOCK)
+        // Create kqueue
+        let kq = kqueue()
 
-        var frameBuf = Data(count: 65536)
+        // Register vmFD and listenFD
+        var events: [kevent] = [
+            kevent(ident: UInt(vmFD), filter: Int16(EVFILT_READ),
+                   flags: UInt16(EV_ADD), fflags: 0, data: 0, udata: nil),
+            kevent(ident: UInt(listenFD), filter: Int16(EVFILT_READ),
+                   flags: UInt16(EV_ADD), fflags: 0, data: 0, udata: nil)
+        ]
+        kevent(kq, &events, 2, nil, 0, nil)
+
+        let evBuf = UnsafeMutablePointer<kevent>.allocate(capacity: 256)
 
         while true {
-            // Build poll list
-            var pfds: [pollfd] = []
-            pfds.append(pollfd(fd: vmFD,     events: Int16(POLLIN), revents: 0))
-            pfds.append(pollfd(fd: listenFD, events: Int16(POLLIN), revents: 0))
-            let connPorts = Array(conns.keys)
-            for port in connPorts {
-                if let c = conns[port], c.state < 2 {
-                    pfds.append(pollfd(fd: c.hostFD, events: Int16(POLLIN), revents: 0))
-                }
-            }
+            // 1ms timeout for responsiveness
+            var ts = timespec(tv_sec: 0, tv_nsec: 1_000_000)
+            let nev = kevent(kq, nil, 0, evBuf, 256, &ts)
+            if nev <= 0 { continue }
 
-            let n = poll(&pfds, nfds_t(pfds.count), 10)
-            guard n > 0 else { continue }
+            for i in 0..<nev {
+                let ev = evBuf[Int(i)]
+                let fd = Int32(ev.ident)
 
-            // VM frames — drain ALL pending frames per iteration.
-            // Previously we read only one frame per poll, causing the vmFD
-            // socket buffer to overflow under load.  Dropped frames meant TCP
-            // FINs were never delivered to the bridge, so the VM's FIN_WAIT_1
-            // connections were never freed and the TCP pool exhausted after a
-            // few seconds.  Draining in a loop prevents the buffer overflow.
-            if pfds[0].revents & Int16(POLLIN) != 0 {
-                while true {
-                    let r = frameBuf.withUnsafeMutableBytes {
-                        recv(vmFD, $0.baseAddress!, $0.count, Int32(MSG_DONTWAIT))
+                if fd == vmFD {
+                    // Drain all VM frames
+                    while true {
+                        let r = recv(vmFD, rxBuf, 65536, Int32(MSG_DONTWAIT))
+                        if r <= 0 { break }
+                        processFrame(rxBuf, r)
                     }
-                    if r <= 0 { break }
-                    processFrame(frameBuf.prefix(r))
-                }
-            }
-
-            // New host connections — accept all pending, not just one.
-            if pfds[1].revents & Int16(POLLIN) != 0 {
-                while true {
-                    var ca = sockaddr_in(); var cl = socklen_t(MemoryLayout<sockaddr_in>.size)
-                    let fd: Int32 = withUnsafeMutablePointer(to: &ca) {
-                        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                            accept(listenFD, $0, &cl)
+                } else if fd == listenFD {
+                    // Accept all pending connections
+                    while true {
+                        var ca = sockaddr_in()
+                        var cl = socklen_t(MemoryLayout<sockaddr_in>.size)
+                        let afd: Int32 = withUnsafeMutablePointer(to: &ca) {
+                            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                                accept(listenFD, $0, &cl)
+                            }
                         }
+                        if afd < 0 { break }
+                        newHostConn(fd: afd, kq: kq)
                     }
-                    if fd < 0 { break }
-                    newHostConn(fd: fd)
-                }
-            }
-
-            // Data from host connections
-            for i in 2..<pfds.count {
-                guard pfds[i].revents & Int16(POLLIN) != 0 else { continue }
-                guard let c = conns[connPorts[i - 2]] else { continue }
-                let r = frameBuf.withUnsafeMutableBytes { read(c.hostFD, $0.baseAddress!, $0.count) }
-                if r <= 0 {
-                    if c.state == 1 {
-                        tcpToVM(c: c, flags: 0x01|0x10, data: Data())  // FIN+ACK
-                        c.mySeq += 1
-                    }
-                    close(c.hostFD)
-                    conns.removeValue(forKey: c.srcPort)
-                } else if c.state == 1 {
-                    let data = frameBuf.prefix(r)
-                    tcpToVM(c: c, flags: 0x08|0x10, data: data)  // PSH+ACK
-                    c.mySeq += UInt32(r)
                 } else {
-                    c.pending += frameBuf.prefix(r)
+                    // Host connection data
+                    let port = Int(bitPattern: ev.udata)
+                    guard let c = conns[port] else {
+                        // Stale event — remove from kqueue
+                        var rmev = kevent(ident: ev.ident, filter: Int16(EVFILT_READ),
+                                          flags: UInt16(EV_DELETE), fflags: 0, data: 0, udata: nil)
+                        kevent(kq, &rmev, 1, nil, 0, nil)
+                        continue
+                    }
+                    let r = Darwin.read(c.hostFD, rxBuf, 65536)
+                    if r <= 0 {
+                        if c.state == 1 {
+                            tcpToVM(c: c, flags: 0x11, payload: nil, payloadLen: 0) // FIN+ACK
+                            c.mySeq += 1
+                        }
+                        var rmev = kevent(ident: UInt(c.hostFD), filter: Int16(EVFILT_READ),
+                                          flags: UInt16(EV_DELETE), fflags: 0, data: 0, udata: nil)
+                        kevent(kq, &rmev, 1, nil, 0, nil)
+                        close(c.hostFD); conns.removeValue(forKey: port)
+                    } else if c.state == 1 {
+                        tcpToVM(c: c, flags: 0x18, payload: rxBuf, payloadLen: r) // PSH+ACK
+                        c.mySeq += UInt32(r)
+                    } else {
+                        memcpy(c.pending + c.pendingLen, rxBuf, r)
+                        c.pendingLen += r
+                    }
                 }
             }
         }
@@ -405,27 +463,16 @@ final class NetBridge {
 
 // ─── VZVirtualMachine delegate ───────────────────────────────────────────────
 
-@available(macOS 11, *)
 final class VMDelegate: NSObject, VZVirtualMachineDelegate {
-    // Holds the Pipe alive for the entire VM lifetime when running non-interactively.
-    // Swift ARC would otherwise release it after its last use in main(), closing the
-    // write end and sending EOF to the VirtIO serial device (which triggers VM stop).
     var keepAlivePipe: Pipe?
-
     func virtualMachine(_ vm: VZVirtualMachine, didStopWithError error: Error) {
-        restoreTerminal()
-        fputs("run-vz: VM stopped with error: \(error)\n", stderr)
-        exit(1)
+        restoreTerminal(); fputs("run-vz: VM stopped with error: \(error)\n", stderr); exit(1)
     }
-    func guestDidStop(_ vm: VZVirtualMachine) {
-        restoreTerminal()
-        exit(0)
-    }
+    func guestDidStop(_ vm: VZVirtualMachine) { restoreTerminal(); exit(0) }
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
-@available(macOS 11, *)
 func main() throws {
     let args = CommandLine.arguments
     guard args.count >= 2 else {
@@ -436,45 +483,24 @@ func main() throws {
     let memory   = Int(ProcessInfo.processInfo.environment["UNIKERNEL_MEMORY"] ?? "128")! * 1024 * 1024
     let cpus     = Int(ProcessInfo.processInfo.environment["UNIKERNEL_CPUS"] ?? "1")!
 
-    // Create socketpair for VM ↔ bridge Ethernet frames.
-    // SOCK_DGRAM preserves message (frame) boundaries and is supported
-    // by AF_UNIX socketpair on macOS (SOCK_SEQPACKET is not).
     var fds = [Int32](repeating: -1, count: 2)
     guard socketpair(AF_UNIX, SOCK_DGRAM, 0, &fds) == 0 else {
         fputs("run-vz: socketpair failed\n", stderr); exit(1)
     }
 
-    // ── VZ configuration ────────────────────────────────────────────────────
-
     let cfg = VZVirtualMachineConfiguration()
-
-    // CPU + memory
     cfg.cpuCount = max(VZVirtualMachineConfiguration.minimumAllowedCPUCount,
                        min(VZVirtualMachineConfiguration.maximumAllowedCPUCount, cpus))
     cfg.memorySize = UInt64(memory)
+    cfg.bootLoader = VZLinuxBootLoader(kernelURL: URL(fileURLWithPath: binPath))
 
-    // Bootloader
-    let loader = VZLinuxBootLoader(kernelURL: URL(fileURLWithPath: binPath))
-    cfg.bootLoader = loader
-
-    // Serial console: VirtIO serial port → stdin/stdout.
-    // Uses VZVirtioConsoleDeviceSerialPortConfiguration (macOS 11+) which
-    // presents a simple single-port VirtIO console (no MULTIPORT feature),
-    // matching what hello-apple-vz demonstrates works with bare-metal kernels.
-    //
-    // When stdin is not a terminal (e.g. benchmark or CI), we use a Pipe as
-    // the reading side so the VirtIO serial device never sees EOF.  Receiving
-    // EOF on the reading file handle causes VZ to disconnect the serial device
-    // and signal the VM to stop — breaking long-running benchmarks.
     let serialReadHandle: FileHandle
-    let consolePipe: Pipe?  // kept alive so write end stays open
+    let consolePipe: Pipe?
     if isatty(STDIN_FILENO) != 0 {
-        serialReadHandle = FileHandle.standardInput
-        consolePipe = nil
+        serialReadHandle = FileHandle.standardInput; consolePipe = nil
     } else {
         let pipe = Pipe()
-        serialReadHandle = pipe.fileHandleForReading
-        consolePipe = pipe  // write end never closed → no EOF to VM
+        serialReadHandle = pipe.fileHandleForReading; consolePipe = pipe
     }
     let serialPort = VZVirtioConsoleDeviceSerialPortConfiguration()
     serialPort.attachment = VZFileHandleSerialPortAttachment(
@@ -482,47 +508,32 @@ func main() throws {
         fileHandleForWriting: FileHandle.standardOutput)
     cfg.serialPorts = [serialPort]
 
-    // Network: VirtIO NIC → our bridge socket
-    let net     = VZVirtioNetworkDeviceConfiguration()
+    let net = VZVirtioNetworkDeviceConfiguration()
     net.attachment = VZFileHandleNetworkDeviceAttachment(
         fileHandle: FileHandle(fileDescriptor: fds[0]))
     cfg.networkDevices = [net]
 
-    // Validate
     try cfg.validate()
-
-    // ── Start bridge thread ─────────────────────────────────────────────────
 
     let bridge = NetBridge(vmFD: fds[1], port: hostPort)
     Thread { bridge.run() }.start()
 
-    // ── Start VM ─────────────────────────────────────────────────────────────
-
     let delegate = VMDelegate()
-    delegate.keepAlivePipe = consolePipe  // prevent ARC from closing pipe before VM stops
-    let vm       = VZVirtualMachine(configuration: cfg, queue: .main)
-    vm.delegate  = delegate
+    delegate.keepAlivePipe = consolePipe
+    let vm = VZVirtualMachine(configuration: cfg, queue: .main)
+    vm.delegate = delegate
 
     enableRawInput()
-
     fputs("==> VZ.framework unikernel starting\n", stderr)
     fputs("    Network: http://localhost:\(hostPort)/ → VM port 80\n", stderr)
     fputs("    Serial console below.  Press Ctrl-C to exit.\n\n", stderr)
 
     vm.start { result in
         if case .failure(let err) = result {
-            restoreTerminal()
-            fputs("run-vz: failed to start VM: \(err)\n", stderr)
-            exit(1)
+            restoreTerminal(); fputs("run-vz: failed to start VM: \(err)\n", stderr); exit(1)
         }
     }
-
     RunLoop.main.run()
 }
 
-if #available(macOS 11, *) {
-    try main()
-} else {
-    fputs("run-vz: requires macOS 11 or later\n", stderr)
-    exit(1)
-}
+try main()

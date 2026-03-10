@@ -35,9 +35,9 @@ HOST_ARCH="$(uname -m)"   # arm64/aarch64 or x86_64
 
 # ── Benchmark parameters (override via environment) ──────────────────────────
 BENCH_PORT="${BENCH_PORT:-18080}"     # separate from the dev port (8080)
-THREADS="${BENCH_THREADS:-4}"
+THREADS="${BENCH_THREADS:-1}"
 CONNS="${BENCH_CONNS:-1}"             # Start with 1; unikernel serialises on single-thread TCP
-DURATION="${BENCH_DURATION:-30}"      # seconds
+DURATION="${BENCH_DURATION:-5}"       # seconds
 # NOTE: No separate warmup run — the unikernel has no JIT/caches to warm.
 # A separate warmup wrk causes the server to crash when wrk tears down
 # all connections at the same time (bridge state bug). The first few seconds
