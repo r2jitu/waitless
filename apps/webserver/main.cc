@@ -105,6 +105,7 @@ extern "C" int uni_main() {
     // All via direct function calls. No syscalls anywhere.
     server.run();
 
-    // Never reached
+    // If we reach here, the server exited (only via check_shutdown)
+    serial::printf("[uni_main] server.run() returned — shutting down\n");
     return 0;
 }

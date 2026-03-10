@@ -349,8 +349,11 @@ void Server::run() {
         bool had_work = false;
 
         // ---- Accept new connections ----------------------------------------
-        tcp::Connection* new_conn = tcp::accept(listener);
-        if (new_conn) {
+        // Drain all ready connections in one pass — not just one — so that
+        // connections queued in the TCP pool don't back up and hold slots.
+        while (true) {
+            tcp::Connection* new_conn = tcp::accept(listener);
+            if (!new_conn) break;
             had_work = true;
             ActiveConn* ac = alloc_active();
             if (ac) {
@@ -359,6 +362,7 @@ void Server::run() {
                 // No room — reject immediately
                 serial::printf("http: too many connections, dropping\n");
                 tcp::close(new_conn);
+                break;
             }
         }
 

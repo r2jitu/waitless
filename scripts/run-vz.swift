@@ -326,7 +326,11 @@ final class NetBridge {
                 _ = bind(listenFD, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
         }
-        listen(listenFD, 16)
+        listen(listenFD, 128)
+
+        // Non-blocking accept: lets us drain all pending connections in one loop.
+        let listenFlags = fcntl(listenFD, F_GETFL, 0)
+        _ = fcntl(listenFD, F_SETFL, listenFlags | O_NONBLOCK)
 
         var frameBuf = Data(count: 65536)
 
@@ -345,21 +349,34 @@ final class NetBridge {
             let n = poll(&pfds, nfds_t(pfds.count), 10)
             guard n > 0 else { continue }
 
-            // VM frames
+            // VM frames — drain ALL pending frames per iteration.
+            // Previously we read only one frame per poll, causing the vmFD
+            // socket buffer to overflow under load.  Dropped frames meant TCP
+            // FINs were never delivered to the bridge, so the VM's FIN_WAIT_1
+            // connections were never freed and the TCP pool exhausted after a
+            // few seconds.  Draining in a loop prevents the buffer overflow.
             if pfds[0].revents & Int16(POLLIN) != 0 {
-                let r = frameBuf.withUnsafeMutableBytes { read(vmFD, $0.baseAddress!, $0.count) }
-                if r > 0 { processFrame(frameBuf.prefix(r)) }
+                while true {
+                    let r = frameBuf.withUnsafeMutableBytes {
+                        recv(vmFD, $0.baseAddress!, $0.count, Int32(MSG_DONTWAIT))
+                    }
+                    if r <= 0 { break }
+                    processFrame(frameBuf.prefix(r))
+                }
             }
 
-            // New host connection
+            // New host connections — accept all pending, not just one.
             if pfds[1].revents & Int16(POLLIN) != 0 {
-                var ca = sockaddr_in(); var cl = socklen_t(MemoryLayout<sockaddr_in>.size)
-                let fd: Int32 = withUnsafeMutablePointer(to: &ca) {
-                    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                        accept(listenFD, $0, &cl)
+                while true {
+                    var ca = sockaddr_in(); var cl = socklen_t(MemoryLayout<sockaddr_in>.size)
+                    let fd: Int32 = withUnsafeMutablePointer(to: &ca) {
+                        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                            accept(listenFD, $0, &cl)
+                        }
                     }
+                    if fd < 0 { break }
+                    newHostConn(fd: fd)
                 }
-                if fd >= 0 { newHostConn(fd: fd) }
             }
 
             // Data from host connections
@@ -390,6 +407,11 @@ final class NetBridge {
 
 @available(macOS 11, *)
 final class VMDelegate: NSObject, VZVirtualMachineDelegate {
+    // Holds the Pipe alive for the entire VM lifetime when running non-interactively.
+    // Swift ARC would otherwise release it after its last use in main(), closing the
+    // write end and sending EOF to the VirtIO serial device (which triggers VM stop).
+    var keepAlivePipe: Pipe?
+
     func virtualMachine(_ vm: VZVirtualMachine, didStopWithError error: Error) {
         restoreTerminal()
         fputs("run-vz: VM stopped with error: \(error)\n", stderr)
@@ -439,9 +461,24 @@ func main() throws {
     // Uses VZVirtioConsoleDeviceSerialPortConfiguration (macOS 11+) which
     // presents a simple single-port VirtIO console (no MULTIPORT feature),
     // matching what hello-apple-vz demonstrates works with bare-metal kernels.
+    //
+    // When stdin is not a terminal (e.g. benchmark or CI), we use a Pipe as
+    // the reading side so the VirtIO serial device never sees EOF.  Receiving
+    // EOF on the reading file handle causes VZ to disconnect the serial device
+    // and signal the VM to stop — breaking long-running benchmarks.
+    let serialReadHandle: FileHandle
+    let consolePipe: Pipe?  // kept alive so write end stays open
+    if isatty(STDIN_FILENO) != 0 {
+        serialReadHandle = FileHandle.standardInput
+        consolePipe = nil
+    } else {
+        let pipe = Pipe()
+        serialReadHandle = pipe.fileHandleForReading
+        consolePipe = pipe  // write end never closed → no EOF to VM
+    }
     let serialPort = VZVirtioConsoleDeviceSerialPortConfiguration()
     serialPort.attachment = VZFileHandleSerialPortAttachment(
-        fileHandleForReading: FileHandle.standardInput,
+        fileHandleForReading: serialReadHandle,
         fileHandleForWriting: FileHandle.standardOutput)
     cfg.serialPorts = [serialPort]
 
@@ -462,6 +499,7 @@ func main() throws {
     // ── Start VM ─────────────────────────────────────────────────────────────
 
     let delegate = VMDelegate()
+    delegate.keepAlivePipe = consolePipe  // prevent ARC from closing pipe before VM stops
     let vm       = VZVirtualMachine(configuration: cfg, queue: .main)
     vm.delegate  = delegate
 

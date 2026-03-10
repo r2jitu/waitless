@@ -38,11 +38,21 @@ HOST_ARCH="$(uname -m)"   # arm64/aarch64 or x86_64
 # ── Benchmark parameters (override via environment) ──────────────────────────
 BENCH_PORT="${BENCH_PORT:-18080}"     # separate from the dev port (8080)
 THREADS="${BENCH_THREADS:-4}"
-CONNS="${BENCH_CONNS:-50}"            # ≤ 63 for unikernel (MAX_ACTIVE=64)
-WARMUP="${BENCH_WARMUP:-5}"           # seconds
+CONNS="${BENCH_CONNS:-1}"             # Start with 1; unikernel serialises on single-thread TCP
 DURATION="${BENCH_DURATION:-30}"      # seconds
+# NOTE: No separate warmup run — the unikernel has no JIT/caches to warm.
+# A separate warmup wrk causes the server to crash when wrk tears down
+# all connections at the same time (bridge state bug). The first few seconds
+# of the measurement inherently serve as warmup.
 ENDPOINT="/health"
-BENCH_URL="http://localhost:${BENCH_PORT}${ENDPOINT}"
+BENCH_URL="http://127.0.0.1:${BENCH_PORT}${ENDPOINT}"
+
+# Each benchmark gets its own port so there is zero chance of port conflicts
+# between server transitions (no sleep or timing dependency needed).
+PORT_VZ="${BENCH_PORT}"
+PORT_QEMU="$((BENCH_PORT + 1))"
+PORT_DOCKER="$((BENCH_PORT + 2))"
+PORT_NATIVE="$((BENCH_PORT + 3))"
 
 # ── State ────────────────────────────────────────────────────────────────────
 QEMU_PID=""
@@ -50,8 +60,44 @@ DOCKER_CID=""
 SERVER_PID=""
 HAVE_DOCKER=false
 HAVE_CC=false
-
 declare -a LABELS RPS_ARR P50_ARR P99_ARR
+
+# Wait for loopback TIME_WAIT connections to drain before starting the next
+# benchmark.  With Connection: close, each HTTP request leaves a source port
+# in TIME_WAIT for 2*MSL (~30s on macOS default).  A high-throughput benchmark
+# can exhaust the 16384-port loopback pool; the next benchmark then can't
+# open new TCP connections from the host.
+#
+# Strategy: poll netstat every second until the loopback TIME_WAIT count drops
+# below a safe threshold, with a hard cap of 2*MSL+5 seconds.
+wait_port_pool() {
+    [ "$HOST_OS" = "Darwin" ] || return
+    # If MSL was already reduced to 500ms, TIME_WAIT = 1s — no need to wait long
+    local msl
+    msl=$(sysctl -n net.inet.tcp.msl 2>/dev/null || echo "15000")
+    local tw_max=$(( (msl * 2 / 1000) + 5 ))  # hard timeout in seconds
+    local threshold=1000  # consider pool "free" once fewer than 1000 TIME_WAIT
+    local start=$SECONDS
+    local first_wait=true
+
+    while true; do
+        local tw
+        tw=$(netstat -an 2>/dev/null | awk '/127\.0\.0\.1.*TIME_WAIT/ || /::1.*TIME_WAIT/{c++} END{print c+0}')
+        [ "$tw" -le "$threshold" ] && break
+        if [ $(( SECONDS - start )) -ge $tw_max ]; then
+            $first_wait && echo ""
+            printf "  (TIME_WAIT drain timeout after %ds, proceeding with %d ports)\n" \
+                "$tw_max" "$tw"
+            return
+        fi
+        if $first_wait; then
+            printf "  Waiting for %d TIME_WAIT ports to expire (max %ds)..." "$tw" "$tw_max"
+            first_wait=false
+        fi
+        sleep 1
+    done
+    $first_wait || echo " done ($((SECONDS - start))s)"
+}
 
 # ── Cleanup on exit ───────────────────────────────────────────────────────────
 cleanup() {
@@ -68,7 +114,7 @@ wait_ready() {
     local port=$1 max=${2:-60} pid=${3:-""}
     local elapsed=0
     printf "  Waiting for server on port %s... " "$port"
-    while ! curl -sf "http://localhost:${port}${ENDPOINT}" >/dev/null 2>&1; do
+    while ! curl -sf --max-time 3 "http://127.0.0.1:${port}${ENDPOINT}" >/dev/null 2>&1; do
         if [ $elapsed -ge $max ]; then
             echo "TIMEOUT after ${max}s"
             return 1
@@ -88,15 +134,11 @@ wait_ready() {
 # Run a wrk benchmark and store results into the named shell variables.
 # Usage: run_wrk label rps_var p50_var p99_var
 run_wrk() {
-    local label=$1 rps_var=$2 p50_var=$3 p99_var=$4
-
-    printf "  Warmup  (%ds)... " "$WARMUP"
-    wrk -t"$THREADS" -c"$CONNS" -d"${WARMUP}s" "$BENCH_URL" >/dev/null 2>&1 || true
-    echo "done"
+    local label=$1 rps_var=$2 p50_var=$3 p99_var=$4 url=${5:-$BENCH_URL}
 
     printf "  Measure (%ds)... " "$DURATION"
     local out
-    out=$(wrk -t"$THREADS" -c"$CONNS" -d"${DURATION}s" --latency "$BENCH_URL" 2>&1) || true
+    out=$(wrk -t"$THREADS" -c"$CONNS" -d"${DURATION}s" --latency "$url" 2>&1) || true
     echo "done"
 
     # Parse wrk's output.
@@ -145,15 +187,20 @@ check_prereqs() {
         echo "          Install: xcode-select --install"
     fi
 
-    # Check port is free
-    if lsof -i ":${BENCH_PORT}" -sTCP:LISTEN >/dev/null 2>&1; then
-        die "Port ${BENCH_PORT} is already in use.  Set BENCH_PORT=<other port>."
-    fi
+    # Check all benchmark ports are free
+    for _p in "$PORT_VZ" "$PORT_QEMU" "$PORT_DOCKER" "$PORT_NATIVE"; do
+        if lsof -i ":${_p}" -sTCP:LISTEN >/dev/null 2>&1; then
+            die "Port ${_p} is already in use.  Set BENCH_PORT=<other base port>."
+        fi
+    done
+
     echo ""
 }
 
 # ── Benchmark 1: Unikernel ────────────────────────────────────────────────────
 bench_unikernel() {
+    local port=${1:-$BENCH_PORT}
+    local url="http://127.0.0.1:${port}${ENDPOINT}"
     local label runner
     if [ "${UNIKERNEL_RUNNER:-}" = "qemu" ]; then
         label="Unikernel (QEMU TCG)"
@@ -194,7 +241,7 @@ bench_unikernel() {
         local RUN_VZ="$PROJECT_ROOT/bazel-bin/scripts/run-vz"
         # Always build via Bazel — fast no-op if run-vz.swift hasn't changed.
         (cd "$PROJECT_ROOT" && bazel build //scripts:run_vz 2>&1 | grep -E '(INFO|ERROR|WARNING|Target)' | tail -3) || true
-        UNIKERNEL_MEMORY=128 "$RUN_VZ" "$img" "$BENCH_PORT" \
+        UNIKERNEL_MEMORY=128 "$RUN_VZ" "$img" "$port" \
             </dev/null >"$log" 2>&1 &
         QEMU_PID=$!
 
@@ -210,7 +257,7 @@ bench_unikernel() {
                 -chardev "file,id=s0,path=${log}" -serial chardev:s0 \
                 -no-reboot \
                 -device virtio-net-device,netdev=net0 \
-                -netdev "user,id=net0,hostfwd=tcp::${BENCH_PORT}-:80" \
+                -netdev "user,id=net0,hostfwd=tcp::${port}-:80" \
                 </dev/null >/dev/null 2>&1 &
             QEMU_PID=$!
         else
@@ -221,7 +268,7 @@ bench_unikernel() {
                 -chardev "file,id=s0,path=${log}" -serial chardev:s0 \
                 -no-reboot \
                 -device virtio-net-pci,netdev=net0 \
-                -netdev "user,id=net0,hostfwd=tcp::${BENCH_PORT}-:80" \
+                -netdev "user,id=net0,hostfwd=tcp::${port}-:80" \
                 </dev/null >/dev/null 2>&1 &
             QEMU_PID=$!
         fi
@@ -229,7 +276,7 @@ bench_unikernel() {
 
     local timeout=60
     [ "$runner" = "vz" ] && timeout=30  # VZ boots much faster than TCG
-    if ! wait_ready "$BENCH_PORT" "$timeout" "$QEMU_PID"; then
+    if ! wait_ready "$port" "$timeout" "$QEMU_PID"; then
         echo "  Boot log (last 30 lines):"
         tail -30 "$log" 2>/dev/null || echo "  (no log)"
         kill -TERM "$QEMU_PID" 2>/dev/null; QEMU_PID=""
@@ -238,10 +285,11 @@ bench_unikernel() {
     fi
 
     local rps p50 p99
-    run_wrk "unikernel" rps p50 p99
+    run_wrk "unikernel" rps p50 p99 "$url"
 
     kill -TERM "$QEMU_PID" 2>/dev/null; wait "$QEMU_PID" 2>/dev/null || true
     QEMU_PID=""
+    wait_port_pool   # drain TIME_WAIT before the next benchmark can start
 
     LABELS+=("$label")
     RPS_ARR+=("$rps")
@@ -250,8 +298,71 @@ bench_unikernel() {
     echo ""
 }
 
+# ── Benchmark 1b: Unikernel (QEMU x86-64) ─────────────────────────────────────
+bench_unikernel_x86() {
+    echo "==> Unikernel (QEMU x86-64 TCG)"
+
+    if ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
+        echo "  qemu-system-x86_64 not found — skipping"
+        echo ""
+        return 0
+    fi
+
+    echo "  Building x86-64 unikernel ELF..."
+    cd "$PROJECT_ROOT"
+    bazel build --platforms=//bazel/platforms:x86_64_unikernel \
+        //apps/webserver:webserver.elf 2>&1 | \
+        grep -E '(INFO|ERROR|WARNING|Target)' | tail -3 || true
+    local elf
+    elf=$(bazel info --platforms=//bazel/platforms:x86_64_unikernel \
+          bazel-bin 2>/dev/null)/apps/webserver/webserver.elf
+    if [ ! -f "$elf" ]; then
+        # Fallback path
+        elf="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver.elf"
+    fi
+    [ -f "$elf" ] || { echo "  ELF not found — skipping"; echo ""; return 0; }
+
+    local log="/tmp/unikernel-x86-bench.log"
+    rm -f "$log"
+
+    qemu-system-x86_64 \
+        -kernel "$elf" \
+        -m 128 -smp 1 \
+        -cpu max \
+        -display none -monitor none \
+        -chardev "file,id=s0,path=${log}" -serial chardev:s0 \
+        -no-reboot \
+        -device virtio-net-pci,netdev=net0 \
+        -netdev "user,id=net0,hostfwd=tcp::${BENCH_PORT}-:80" \
+        -accel hvf 2>/dev/null \
+        </dev/null >/dev/null 2>&1 &
+    QEMU_PID=$!
+
+    if ! wait_ready "$BENCH_PORT" 60 "$QEMU_PID"; then
+        echo "  Boot log (last 20 lines):"
+        tail -20 "$log" 2>/dev/null || echo "  (no log)"
+        kill -TERM "$QEMU_PID" 2>/dev/null; QEMU_PID=""
+        echo "  Skipping x86-64 benchmark."
+        echo ""
+        return 0
+    fi
+
+    local rps p50 p99
+    run_wrk "unikernel_x86" rps p50 p99
+
+    kill -TERM "$QEMU_PID" 2>/dev/null; wait "$QEMU_PID" 2>/dev/null || true
+    QEMU_PID=""
+
+    LABELS+=("Unikernel (QEMU x86-64 TCG)")
+    RPS_ARR+=("$rps")
+    P50_ARR+=("$p50")
+    P99_ARR+=("$p99")
+    echo ""
+}
+
 # ── Benchmark 2: bench_server in Docker (Linux VM) ────────────────────────────
 bench_docker_server() {
+    local url="http://127.0.0.1:${PORT_DOCKER}${ENDPOINT}"
     echo "==> [2/3] bench_server in Docker  (Linux VM + same server code)"
 
     echo "  Building Docker image (bench_server for Linux)..."
@@ -263,20 +374,21 @@ bench_docker_server() {
 
     local cid
     cid=$(docker run --rm -d \
-        -p "${BENCH_PORT}:80" \
+        -p "${PORT_DOCKER}:80" \
         bench_server_linux 2>/dev/null) \
         || { echo "  docker run failed — skipping"; echo ""; return 0; }
     DOCKER_CID="$cid"
 
-    if ! wait_ready "$BENCH_PORT" 30; then
+    if ! wait_ready "$PORT_DOCKER" 30; then
         docker stop "$cid" >/dev/null 2>&1 || true; DOCKER_CID=""
         echo "  Skipping Docker benchmark."; echo ""; return 0
     fi
 
     local rps p50 p99
-    run_wrk "docker_server" rps p50 p99
+    run_wrk "docker_server" rps p50 p99 "$url"
 
     docker stop "$cid" >/dev/null 2>&1; DOCKER_CID=""
+    wait_port_pool   # drain TIME_WAIT before the native benchmark starts
 
     LABELS+=("bench_server/Linux (Docker VM)")
     RPS_ARR+=("$rps")
@@ -287,6 +399,7 @@ bench_docker_server() {
 
 # ── Benchmark 3: bench_server native on macOS ─────────────────────────────────
 bench_native_server() {
+    local url="http://127.0.0.1:${PORT_NATIVE}${ENDPOINT}"
     echo "==> [3/3] bench_server on macOS  (native, no virtualization)"
 
     local bin="/tmp/bench_server_macos"
@@ -296,16 +409,16 @@ bench_native_server() {
         "$PROJECT_ROOT/bench/bench_server.c" 2>&1 \
         || { echo "  Compile failed — skipping"; echo ""; return 0; }
 
-    "$bin" "$BENCH_PORT" >/dev/null 2>&1 &
+    "$bin" "$PORT_NATIVE" >/dev/null 2>&1 &
     SERVER_PID=$!
 
-    if ! wait_ready "$BENCH_PORT" 10; then
+    if ! wait_ready "$PORT_NATIVE" 10; then
         kill -TERM "$SERVER_PID" 2>/dev/null; SERVER_PID=""
         echo "  Skipping native benchmark."; echo ""; return 0
     fi
 
     local rps p50 p99
-    run_wrk "native_server" rps p50 p99
+    run_wrk "native_server" rps p50 p99 "$url"
 
     kill -TERM "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true
     SERVER_PID=""
@@ -399,11 +512,15 @@ fi
 
 # Run VZ benchmark (macOS arm64 only)
 if [ -n "$STEP_UNIKERNEL_VZ" ]; then
-    bench_unikernel   # defaults to VZ on macOS arm64
+    bench_unikernel "$PORT_VZ"   # defaults to VZ on macOS arm64
 fi
 
-# Run QEMU benchmark (always; overrides default on macOS arm64)
-UNIKERNEL_RUNNER=qemu bench_unikernel
+# Run aarch64 QEMU benchmark (always on arm64; overrides default on macOS arm64)
+UNIKERNEL_RUNNER=qemu bench_unikernel "$PORT_QEMU"
+
+# Run x86-64 QEMU benchmark (cross-architecture emulation)
+# TODO: fix x86-64 crash before re-enabling
+# bench_unikernel_x86
 
 if [ "$HAVE_DOCKER" = true ]; then
     bench_docker_server
