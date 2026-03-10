@@ -57,6 +57,9 @@ static boot::BootInfo g_boot_info;
 
 // ---- Shared boot sequence (called after BootInfo is populated) ---------------
 
+// Also callable from limine_entry.cc
+extern "C" void kernel_boot_from_bootinfo(boot::BootInfo *info);
+
 static void kernel_boot(boot::BootInfo *info) {
   serial::init();
   serial::printf("\n");
@@ -172,4 +175,11 @@ extern "C" void kernel_main(uint64_t boot_info_addr) {
 #endif
 
   kernel_boot(&g_boot_info);
+}
+
+// ---- Entry point for Limine bootloader (called from limine_entry.cc) ---------
+// BSS is already zeroed by Limine, FDT/ECAM already handled by limine_entry().
+
+extern "C" void kernel_boot_from_bootinfo(boot::BootInfo *info) {
+  kernel_boot(info);
 }

@@ -21,6 +21,18 @@ SECTIONS {
         *(.rodata .rodata.*)
     }
 
+    /* Limine boot protocol requests — contiguous, between start/end markers.
+       Limine scans the ELF for these sections to discover boot requests. */
+    .limine_requests_start ALIGN(16) : {
+        KEEP(*(.limine_requests_start))
+    }
+    .limine_requests ALIGN(16) : {
+        KEEP(*(.limine_requests))
+    }
+    .limine_requests_end ALIGN(16) : {
+        KEEP(*(.limine_requests_end))
+    }
+
     .data ALIGN(4K) : {
         *(.data .data.*)
     }

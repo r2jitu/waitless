@@ -118,6 +118,23 @@ cc_library(
 )
 
 cc_library(
+    name = "limine_proto",
+    hdrs = ["limine.h"],
+    copts = ["-I."],
+)
+
+cc_library(
+    name = "limine_entry",
+    srcs = ["limine_entry.cc"],
+    deps = [":boot_info", ":limine_proto", ":fdt"] + select({
+        "//bazel/platforms:aarch64": [":mmu"],
+        "//conditions:default": [],
+    }),
+    alwayslink = True,  # Limine requests must not be stripped by linker
+    copts = ["-I."],
+)
+
+cc_library(
     name = "entry",
     srcs = ["entry.cc"],
     deps = [
@@ -126,6 +143,7 @@ cc_library(
         ":core",
         ":arch_init",
         ":fdt",
+        ":limine_entry",
         "//drivers:pci",
         "//drivers:virtio_net",
         "//net",

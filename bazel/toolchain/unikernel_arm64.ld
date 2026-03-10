@@ -37,6 +37,18 @@ SECTIONS {
         *(.rodata .rodata.*)
     }
 
+    /* Limine boot protocol requests — contiguous, between start/end markers.
+       Limine scans the ELF for these sections to discover boot requests. */
+    .limine_requests_start ALIGN(8) : {
+        KEEP(*(.limine_requests_start))
+    }
+    .limine_requests ALIGN(8) : {
+        KEEP(*(.limine_requests))
+    }
+    .limine_requests_end ALIGN(8) : {
+        KEEP(*(.limine_requests_end))
+    }
+
     /* PIE relocation table — processed by boot.S before C++ starts.
      * boot.S walks [__rela_start, __rela_end) applying R_AARCH64_RELATIVE. */
     .rela.dyn ALIGN(8) : {
