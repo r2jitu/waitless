@@ -88,7 +88,7 @@ static uint8_t rx_bufs_[QS];
 
 // ---- Ring state ------------------------------------------------------------
 
-static uint64_t base_ = 0;            // virtio-mmio base address, 0 = not inited
+static uint64_t base_ = 0;            // non-zero = init complete (MMIO addr or PCI sentinel)
 static bool     pci_mode_ = false;    // true = PCI transport, false = MMIO
 static uint64_t tx_notify_addr_ = 0;  // PCI: MMIO address for TX queue notify
 static uint64_t rx_notify_addr_ = 0;  // PCI: MMIO address for RX queue notify
@@ -205,10 +205,10 @@ static bool init_pci_queue(virtio_pci::Device* dev, uint32_t qidx, uint8_t* mem)
 
 // ---- Public API ------------------------------------------------------------
 
-// Brief delay for platforms (e.g. Apple VZ.framework) that process VirtIO
-// config-space writes asynchronously.  10 000 nops ≈ a few microseconds on
-// Apple Silicon — enough for the host I/O thread to catch up.
-static inline void vz_delay() {
+// Brief delay for hosts that process VirtIO config-space writes asynchronously
+// (e.g. Apple VZ.framework).  10 000 nops ≈ a few µs — enough for the host
+// I/O thread to catch up before a subsequent read-back.
+static inline void config_write_delay() {
     for (volatile int i = 0; i < 10000; i++)
         asm volatile("nop");
 }
@@ -219,19 +219,19 @@ bool init_pci(virtio_pci::Device* dev) {
     pci_mode_ = true;
 
     // Reset → ACKNOWLEDGE → DRIVER (with inter-write delays for Apple VZ).
-    virtio_pci::reset(dev);        vz_delay();
+    virtio_pci::reset(dev);        config_write_delay();
     virtio_pci::set_status(dev, STATUS_ACKNOWLEDGE);
-    vz_delay();
+    config_write_delay();
     virtio_pci::set_status(dev, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
-    vz_delay();
+    config_write_delay();
 
     // Feature negotiation: modern VirtIO-PCI requires VIRTIO_F_VERSION_1
     // (bit 32 = word 1 bit 0).  Without it VZ rejects FEATURES_OK.
     virtio_pci::write_features(dev, 0, 0);  // word 0: no optional features
     virtio_pci::write_features(dev, 1, 1);  // word 1: VIRTIO_F_VERSION_1
-    vz_delay();
+    config_write_delay();
     virtio_pci::set_status(dev, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK);
-    vz_delay();
+    config_write_delay();
     if (!(virtio_pci::get_status(dev) & STATUS_FEATURES_OK)) {
         virtio_pci::set_status(dev, STATUS_FAILED);
         return false;
@@ -267,9 +267,9 @@ bool init_pci(virtio_pci::Device* dev) {
         rx_avail_ring(i) = (uint16_t)i;
         rx_avail_idx_++;
     }
-    asm volatile("dsb sy" ::: "memory");
+    arch::dsb_st();
     rx_avail_idx_reg() = rx_avail_idx_;
-    asm volatile("dsb sy" ::: "memory");
+    arch::dsb_sy();
 
     // Set up TX descriptor 0
     tx_desc_addr(0)  = (uint64_t)(uintptr_t)tx_buf_;
@@ -385,7 +385,7 @@ void putc(char c) {
     arch::dsb_st();
     tx_avail_idx_reg() = tx_avail_idx_ + 1;
     tx_avail_idx_++;
-    asm volatile("dsb sy" ::: "memory");
+    arch::dsb_sy();
 
     // Kick TX queue
     if (pci_mode_) {
@@ -418,10 +418,10 @@ int try_getc() {
 
     arch::dsb_st();
     rx_avail_ring(rx_avail_idx_ % QS) = (uint16_t)desc_id;
-    asm volatile("dsb st" ::: "memory");
+    arch::dsb_st();
     rx_avail_idx_reg() = rx_avail_idx_ + 1;
     rx_avail_idx_++;
-    asm volatile("dsb sy" ::: "memory");
+    arch::dsb_sy();
 
     // Kick RX queue
     if (pci_mode_) {

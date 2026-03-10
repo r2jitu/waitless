@@ -11,7 +11,7 @@
 #include "kernel/aarch64/mmu.h"
 #endif
 
-// PCI runs before serial on VZ (early PCI scan for console discovery).
+// PCI may run during serial::init() for early console discovery.
 // Use a late-bound printf that's safe to call even when serial is not yet up.
 // Declared in serial.h, but we avoid the header dep to break a build cycle.
 namespace serial { void printf(const char* fmt, ...); }

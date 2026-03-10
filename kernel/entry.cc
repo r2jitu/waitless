@@ -123,7 +123,6 @@ extern "C" void kernel_main(uint64_t boot_info_addr) {
     {
         const fdt::Info& fdt = fdt::info();
         if (fdt.pcie_ecam_base != 0) {
-            // pci::init() is idempotent — safe to call if already scanned
             serial::printf("[INIT] PCI bus scan...\n");
             pci::init();
         }
