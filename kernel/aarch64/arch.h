@@ -15,6 +15,7 @@ namespace arch {
 
 static inline void dsb_sy()  { asm volatile("dsb sy"  ::: "memory"); }
 static inline void dsb_st()  { asm volatile("dsb st"  ::: "memory"); }
+static inline void dsb_ld()  { asm volatile("dsb ld"  ::: "memory"); }
 static inline void isb()     { asm volatile("isb"     ::: "memory"); }
 static inline void dmb_sy()  { asm volatile("dmb sy"  ::: "memory"); }
 

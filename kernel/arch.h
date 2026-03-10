@@ -172,6 +172,13 @@ static inline void virtio_write8 (uint64_t base, uint8_t  v) { outb((uint16_t)ba
 static inline void virtio_write16(uint64_t base, uint16_t v) { outw((uint16_t)base, v); }
 static inline void virtio_write32(uint64_t base, uint32_t v) { outl((uint16_t)base, v); }
 
+// Memory barriers.  x86 TSO guarantees store-store and load-load ordering,
+// so these are no-ops here.  On aarch64 (see kernel/aarch64/arch.h) they
+// emit the corresponding DSB instructions required by ARM's weak model.
+static inline void dsb_st() { asm volatile("" ::: "memory"); }  // store barrier
+static inline void dsb_sy() { asm volatile("" ::: "memory"); }  // full barrier
+static inline void dsb_ld() { asm volatile("" ::: "memory"); }  // load barrier
+
 // Hint to the CPU to reduce power during a spin-wait loop.
 static inline void cpu_relax() { asm volatile("pause" ::: "memory"); }
 

@@ -180,13 +180,15 @@ final class NetBridge {
         guard udp.count >= 8 else { return }
         let sp = (Int(udp[0])<<8)|Int(udp[1]), dp = (Int(udp[2])<<8)|Int(udp[3])
         guard sp == 68 && dp == 67 else { return }
-        let bootp = udp.dropFirst(8)
+        let bootp = Data(udp.dropFirst(8))  // fresh Data so [n] indices start at 0
         guard bootp.count >= 236 else { return }
         let xid = Data(bootp[4...7])
 
         // Find message type option
         var msgType: UInt8 = 0
-        var i = 0; let opts = Array(bootp.dropFirst(236))
+        // DHCP options start at bootp offset 240: skip fixed 236-byte bootp header
+        // and the 4-byte magic cookie (99.130.83.99) that precedes the TLV options.
+        var i = 0; let opts = Array(Data(bootp.dropFirst(240)))
         while i < opts.count {
             let t = opts[i]; if t == 255 { break }; if t == 0 { i += 1; continue }
             let l = Int(opts[i+1])
@@ -217,7 +219,8 @@ final class NetBridge {
         let udpPkt = buildUDP(srcPort: 67, dstPort: 68, data: bp + o)
         let dst = Data([255,255,255,255])
         let ipPkt = buildIPv4(src: GW_IP, dst: dst, proto: 17, payload: udpPkt)
-        toVM(dstMAC: srcMAC, ethertype: 0x0800, payload: ipPkt)
+        let frame = buildEth(dst: srcMAC, ethertype: 0x0800, payload: ipPkt)
+        sendToVM(frame)
     }
 
     // ── TCP (VM → host direction: from TCP proxy perspective) ─────────────────
@@ -276,7 +279,9 @@ final class NetBridge {
         guard ip.count >= 20 else { return }
         let proto = ip[9]
         let ihl   = Int(ip[0] & 0x0f) * 4
-        let body  = ip.dropFirst(ihl)
+        // Data(slice) copies into a new Data with indices starting at 0,
+        // so handlers can safely use body[0], body[1] etc.
+        let body  = Data(ip.dropFirst(ihl))
         if proto == 17 { handleDHCP(body, srcMAC: srcMAC) }
         else if proto == 6 { handleTCPFromVM(body) }
     }
@@ -288,6 +293,7 @@ final class NetBridge {
         let srcMAC    = Data(frame[6...11])
         if vmMAC == nil, srcMAC != GW_MAC, srcMAC != BCAST_MAC { vmMAC = srcMAC }
         let ethertype = (UInt16(frame[12])<<8)|UInt16(frame[13])
+
         let payload   = frame.dropFirst(14)
         if ethertype == 0x0806      { handleARP(Data(payload), srcMAC: srcMAC) }
         else if ethertype == 0x0800 { handleIPv4(Data(payload), srcMAC: srcMAC) }

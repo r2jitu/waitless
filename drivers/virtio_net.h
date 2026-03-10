@@ -41,8 +41,11 @@ struct VirtioNetHeader {
     uint16_t gso_size;
     uint16_t csum_start;
     uint16_t csum_offset;
-    // Note: num_buffers (uint16_t) is only present when MRG_RXBUF is negotiated.
-    // We reject MRG_RXBUF for simplicity, so it is not included here.
+    // Apple VZ.framework always uses the 12-byte virtio_net_hdr_mrg_rxbuf
+    // layout (with num_buffers) for both TX and RX, regardless of whether
+    // VIRTIO_NET_F_MRG_RXBUF is negotiated.  We include num_buffers here
+    // so our header size matches what VZ expects.
+    uint16_t num_buffers;
 } __attribute__((packed));
 
 // ============================================================================

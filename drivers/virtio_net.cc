@@ -143,7 +143,13 @@ static bool init_pci_modern() {
 
     // Allocate and populate RX buffers
     for (int i = 0; i < RX_BUFFERS; i++) {
-        rx_buffers_[i] = reinterpret_cast<RxBuffer*>(mm::kmalloc(sizeof(RxBuffer)));
+        // Allocate 2 extra bytes and shift the RxBuffer pointer by 2.
+        // VZ writes: [VirtioNetHeader(12B)] [Ethernet] at desc.addr.
+        // With +2 shift: Ethernet starts at desc.addr+12 = alloc+14,
+        // IPv4 header at alloc+28 — 4-byte aligned (28 % 4 == 0),
+        // preventing ARM64 alignment faults on VZ.framework.
+        rx_buffers_[i] = reinterpret_cast<RxBuffer*>(
+            static_cast<uint8_t*>(mm::kmalloc(sizeof(RxBuffer) + 2)) + 2);
         if (!rx_buffers_[i]) {
             serial::printf("virtio_net: failed to allocate RX buffer %d\n", i);
             virtio_pci::set_status(pci_dev_, virtio::STATUS_FAILED);
@@ -156,6 +162,7 @@ static bool init_pci_modern() {
         buf->hdr.gso_size    = 0;
         buf->hdr.csum_start  = 0;
         buf->hdr.csum_offset = 0;
+        buf->hdr.num_buffers = 0;
 
         void* buf_ptr    = reinterpret_cast<void*>(buf);
         uint32_t buf_len = BUFFER_SIZE;
@@ -165,11 +172,16 @@ static bool init_pci_modern() {
             break;
         }
     }
-    rx_queue_.kick();
 
-    // DRIVER_OK
+    // DRIVER_OK — must be set before kicking queues (VZ ignores pre-DRIVER_OK kicks)
     virtio_pci::set_status(pci_dev_, virtio::STATUS_ACKNOWLEDGE | virtio::STATUS_DRIVER |
                                      virtio::STATUS_FEATURES_OK | virtio::STATUS_DRIVER_OK);
+
+    // Notify RX queue that receive buffers are ready.
+    // Then pause ~1M nops: VZ needs time after DRIVER_OK before the host
+    // I/O side is ready (same requirement as the VirtIO console).
+    rx_queue_.kick();
+    for (volatile int i = 0; i < 1000000; i++) asm volatile("nop");
 
     io_base_ = 1;  // non-zero sentinel to indicate init complete
     serial::printf("virtio_net: initialization complete (PCI modern)\n");
@@ -313,7 +325,13 @@ bool init() {
 
     // Allocate RX buffers
     for (int i = 0; i < RX_BUFFERS; i++) {
-        rx_buffers_[i] = reinterpret_cast<RxBuffer*>(mm::kmalloc(sizeof(RxBuffer)));
+        // Allocate 2 extra bytes and shift the RxBuffer pointer by 2.
+        // VZ writes: [VirtioNetHeader(12B)] [Ethernet] at desc.addr.
+        // With +2 shift: Ethernet starts at desc.addr+12 = alloc+14,
+        // IPv4 header at alloc+28 — 4-byte aligned (28 % 4 == 0),
+        // preventing ARM64 alignment faults on VZ.framework.
+        rx_buffers_[i] = reinterpret_cast<RxBuffer*>(
+            static_cast<uint8_t*>(mm::kmalloc(sizeof(RxBuffer) + 2)) + 2);
         if (!rx_buffers_[i]) {
             serial::printf("virtio_net: failed to allocate RX buffer %d\n", i);
             w32(io_base_, virtio::mmio::STATUS, virtio::STATUS_FAILED);
@@ -326,6 +344,7 @@ bool init() {
         buf->hdr.gso_size    = 0;
         buf->hdr.csum_start  = 0;
         buf->hdr.csum_offset = 0;
+        buf->hdr.num_buffers = 0;
 
         void* buf_ptr    = reinterpret_cast<void*>(buf);
         uint32_t buf_len = BUFFER_SIZE;
@@ -492,6 +511,7 @@ bool init() {
         buf->hdr.gso_size    = 0;
         buf->hdr.csum_start  = 0;
         buf->hdr.csum_offset = 0;
+        buf->hdr.num_buffers = 0;
 
         // Add the entire buffer as a device-writable (input) buffer.
         // The device will write the virtio header + ethernet frame into it.
@@ -605,6 +625,7 @@ void send(const void* data, uint32_t len) {
     buf->hdr.gso_size    = 0;
     buf->hdr.csum_start  = 0;
     buf->hdr.csum_offset = 0;
+    buf->hdr.num_buffers = 1;  // TX: always 1 buffer per packet
 
     const uint8_t* src = reinterpret_cast<const uint8_t*>(data);
     for (uint32_t i = 0; i < len; i++) buf->data[i] = src[i];

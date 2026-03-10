@@ -338,9 +338,10 @@ int Virtqueue::add_buf(void** buffers, uint32_t* lengths,
     uint16_t avail_idx = avail_->idx & (queue_size_ - 1);
     avail_->ring[avail_idx] = head;
 
-    // Memory barrier to ensure the descriptor writes are visible before
-    // we update the available index. On x86 a compiler barrier suffices.
-    asm volatile("" ::: "memory");
+    // Store barrier: descriptor fields must be visible to the device before
+    // avail_->idx is updated.  On x86 TSO a compiler barrier suffices, but
+    // ARM64's weak memory model requires DSB ST.
+    arch::dsb_st();
 
     avail_->idx++;
 
@@ -348,8 +349,8 @@ int Virtqueue::add_buf(void** buffers, uint32_t* lengths,
 }
 
 void Virtqueue::kick() {
-    // Memory barrier before notifying the device
-    asm volatile("" ::: "memory");
+    // Store barrier: avail_->idx must be visible before the doorbell write.
+    arch::dsb_st();
     if (notify_addr_ != 0) {
         // Modern PCI: write queue_index to the notify MMIO address
         *reinterpret_cast<volatile uint16_t*>(notify_addr_) = queue_index_;
@@ -361,8 +362,9 @@ void Virtqueue::kick() {
 }
 
 bool Virtqueue::get_used(uint16_t* id, uint32_t* len) {
-    // Memory barrier to see the latest used->idx
-    asm volatile("" ::: "memory");
+    // Load barrier: ensures we see the device's latest writes to used_->idx
+    // and used_->ring[] before reading them.  Required on ARM64's weak model.
+    arch::dsb_ld();
 
     if (last_used_idx_ == used_->idx) {
         return false; // No new used entries
