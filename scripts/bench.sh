@@ -1,22 +1,21 @@
 #!/usr/bin/env bash
 # scripts/bench.sh — HTTP server benchmark
 #
-# Measures and compares throughput and latency for the same minimal
-# poll()-based HTTP server (bench_server.c) across up to four environments:
+# Measures and compares throughput and latency for the same webserver
+# application across up to four environments:
 #
 #   1. Unikernel (VZ)   — macOS arm64 only: hardware-accelerated via VZ.framework
 #   2. Unikernel (QEMU) — software TCG emulation (all platforms)
-#   3. Linux (Docker)   — bench_server compiled for Linux, running in Docker
+#   3. Linux (Docker)   — webserver compiled for Linux, running in Docker
 #                         (Apple Virtualization.framework on Apple Silicon)
-#   4. macOS (native)   — bench_server compiled natively, no VM
+#   4. macOS native     — webserver_native binary, POSIX TCP, no VM
 #
-# Using the same server code isolates OS and virtualization overhead rather
-# than differences between HTTP server implementations.
+# The same application code (apps/webserver/main.cc + net/http.cc) runs in
+# all four environments — only the TCP backend and OS differ.
 #
 # Prerequisites (all installable via Homebrew / standard tools):
 #   brew install wrk
 #   Docker Desktop (for the Linux VM comparison)
-#   Xcode Command Line Tools / any cc (for the native macOS build)
 #
 # Usage:
 #   ./scripts/bench.sh                        # defaults below
@@ -53,14 +52,12 @@ PORT_QEMU="$((BENCH_PORT + 1))"
 PORT_DOCKER="$((BENCH_PORT + 2))"
 PORT_NATIVE="$((BENCH_PORT + 3))"
 PORT_X86="$((BENCH_PORT + 4))"
-PORT_WEBSERVER_NATIVE="$((BENCH_PORT + 5))"
 
 # ── State ────────────────────────────────────────────────────────────────────
 QEMU_PID=""
 DOCKER_CID=""
 SERVER_PID=""
 HAVE_DOCKER=false
-HAVE_CC=false
 ORIG_MSL=""   # saved net.inet.tcp.msl before we reduce it
 declare -a LABELS RPS_ARR P50_ARR P99_ARR
 
@@ -205,17 +202,8 @@ check_prereqs() {
         echo "  docker: not available  (Docker benchmark will be skipped)"
     fi
 
-    if command -v cc >/dev/null 2>&1; then
-        HAVE_CC=true
-        echo "  cc:     $(cc --version 2>&1 | head -1)"
-    else
-        HAVE_CC=false
-        echo "  cc:     not found  (native macOS benchmark will be skipped)"
-        echo "          Install: xcode-select --install"
-    fi
-
     # Check all benchmark ports are free
-    for _p in "$PORT_VZ" "$PORT_QEMU" "$PORT_X86" "$PORT_DOCKER" "$PORT_NATIVE" "$PORT_WEBSERVER_NATIVE"; do
+    for _p in "$PORT_VZ" "$PORT_QEMU" "$PORT_X86" "$PORT_DOCKER" "$PORT_NATIVE"; do
         if lsof -i ":${_p}" -sTCP:LISTEN >/dev/null 2>&1; then
             die "Port ${_p} is already in use.  Set BENCH_PORT=<other base port>."
         fi
@@ -377,23 +365,23 @@ bench_unikernel_x86() {
     echo ""
 }
 
-# ── Benchmark: bench_server in Docker (Linux VM) ──────────────────────────────
+# ── Benchmark: webserver in Docker (Linux VM) ─────────────────────────────────
 bench_docker_server() {
     local url="http://127.0.0.1:${PORT_DOCKER}${ENDPOINT}"
     wait_port_pool
-    echo "==> [${STEP_DOCKER}/${TOTAL}] bench_server in Docker  (Linux VM + same server code)"
+    echo "==> [${STEP_DOCKER}/${TOTAL}] webserver in Docker  (same app code, Linux VM)"
 
-    echo "  Building Docker image (bench_server for Linux)..."
+    echo "  Building Docker image (webserver for Linux)..."
     docker build -q \
         -f "$PROJECT_ROOT/bench/Dockerfile" \
-        -t bench_server_linux \
+        -t webserver_linux \
         "$PROJECT_ROOT" >/dev/null 2>&1 \
         || { echo "  docker build failed — skipping"; echo ""; return 0; }
 
     local cid
     cid=$(docker run --rm -d \
         -p "${PORT_DOCKER}:80" \
-        bench_server_linux 2>/dev/null) \
+        webserver_linux 2>/dev/null) \
         || { echo "  docker run failed — skipping"; echo ""; return 0; }
     DOCKER_CID="$cid"
 
@@ -407,15 +395,15 @@ bench_docker_server() {
 
     docker stop "$cid" >/dev/null 2>&1; DOCKER_CID=""
 
-    record_result "bench_server/Linux (Docker VM)" "$rps" "$p50" "$p99"
+    record_result "webserver/Linux (Docker VM)" "$rps" "$p50" "$p99"
     echo ""
 }
 
-# ── Benchmark: webserver_native (same webserver code, POSIX backend) ──────────
-bench_webserver_native() {
-    local url="http://127.0.0.1:${PORT_WEBSERVER_NATIVE}${ENDPOINT}"
+# ── Benchmark: webserver_native (same app code, POSIX TCP, no VM) ─────────────
+bench_native_server() {
+    local url="http://127.0.0.1:${PORT_NATIVE}${ENDPOINT}"
     wait_port_pool
-    echo "==> [${STEP_WEBSERVER_NATIVE}/${TOTAL}] webserver_native  (same code, POSIX TCP, no VM)"
+    echo "==> [${STEP_NATIVE}/${TOTAL}] webserver_native  (same app code, POSIX TCP, no VM)"
 
     echo "  Building webserver_native..."
     cd "$PROJECT_ROOT"
@@ -427,10 +415,10 @@ bench_webserver_native() {
         echo "  Binary not found — skipping"; echo ""; return 0
     fi
 
-    PORT="$PORT_WEBSERVER_NATIVE" "$bin" >/dev/null 2>&1 &
+    PORT="$PORT_NATIVE" "$bin" >/dev/null 2>&1 &
     SERVER_PID=$!
 
-    if ! wait_ready "$PORT_WEBSERVER_NATIVE" 10 "$SERVER_PID"; then
+    if ! wait_ready "$PORT_NATIVE" 10 "$SERVER_PID"; then
         kill -TERM "$SERVER_PID" 2>/dev/null; SERVER_PID=""
         echo "  Skipping webserver_native benchmark."; echo ""; return 0
     fi
@@ -442,37 +430,6 @@ bench_webserver_native() {
     SERVER_PID=""
 
     record_result "webserver_native (POSIX, no VM)" "$rps" "$p50" "$p99"
-    echo ""
-}
-
-# ── Benchmark: bench_server native on macOS ───────────────────────────────────
-bench_native_server() {
-    local url="http://127.0.0.1:${PORT_NATIVE}${ENDPOINT}"
-    wait_port_pool
-    echo "==> [${STEP_NATIVE}/${TOTAL}] bench_server on macOS  (native, no virtualization)"
-
-    local bin="/tmp/bench_server_macos"
-    echo "  Compiling bench_server for macOS..."
-    cc -O2 -DRUNTIME='"macos"' \
-        -o "$bin" \
-        "$PROJECT_ROOT/bench/bench_server.c" 2>&1 \
-        || { echo "  Compile failed — skipping"; echo ""; return 0; }
-
-    "$bin" "$PORT_NATIVE" >/dev/null 2>&1 &
-    SERVER_PID=$!
-
-    if ! wait_ready "$PORT_NATIVE" 10; then
-        kill -TERM "$SERVER_PID" 2>/dev/null; SERVER_PID=""
-        echo "  Skipping native benchmark."; echo ""; return 0
-    fi
-
-    local rps p50 p99
-    run_wrk "native_server" rps p50 p99 "$url"
-
-    kill -TERM "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true
-    SERVER_PID=""
-
-    record_result "bench_server (native macOS)" "$rps" "$p50" "$p99"
     echo ""
 }
 
@@ -497,8 +454,8 @@ print_results() {
 # ── Entry point ───────────────────────────────────────────────────────────────
 echo ""
 echo "══════════════════════════════════════════════════════════════════════"
-echo "  HTTP Server Benchmark  (same server code, five environments)"
-echo "  Unikernel VZ · Unikernel QEMU · Linux/Docker · webserver_native · macOS (native)"
+echo "  HTTP Server Benchmark  (same app code, four environments)"
+echo "  Unikernel VZ · Unikernel QEMU · Linux/Docker · macOS native"
 echo "══════════════════════════════════════════════════════════════════════"
 echo ""
 
@@ -523,7 +480,6 @@ if [ "$HAS_QEMU_X86" = true ] && [ "$HOST_ARCH" != "x86_64" ]; then
     STEP_UNIKERNEL_X86=$NEXT_STEP; NEXT_STEP=$((NEXT_STEP + 1))
 fi
 STEP_DOCKER=$NEXT_STEP; NEXT_STEP=$((NEXT_STEP + 1))
-STEP_WEBSERVER_NATIVE=$NEXT_STEP; NEXT_STEP=$((NEXT_STEP + 1))
 STEP_NATIVE=$NEXT_STEP; NEXT_STEP=$((NEXT_STEP + 1))
 TOTAL=$((NEXT_STEP - 1))
 
@@ -543,18 +499,10 @@ fi
 if [ "$HAVE_DOCKER" = true ]; then
     bench_docker_server
 else
-    echo "==> [${STEP_DOCKER}/${TOTAL}] bench_server in Docker — skipped (Docker not available)"
+    echo "==> [${STEP_DOCKER}/${TOTAL}] webserver in Docker — skipped (Docker not available)"
     echo ""
 fi
 
-bench_webserver_native
-
-if [ "$HAVE_CC" = true ]; then
-    bench_native_server
-else
-    echo "==> [${STEP_NATIVE}/${TOTAL}] bench_server on macOS — skipped (cc not found)"
-    echo "  Install: xcode-select --install"
-    echo ""
-fi
+bench_native_server
 
 print_results

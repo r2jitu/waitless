@@ -1,20 +1,26 @@
-# bench/Dockerfile — builds bench_server for the Linux benchmark scenario
+# bench/Dockerfile — builds webserver_native for Linux (same app code, POSIX TCP)
 #
-# Multi-stage: compile in a builder then copy the static binary into a
-# minimal Alpine image so the final container is tiny (~10 MB).
+# Compiles the same HTTP server application that runs as a unikernel, using
+# standard Linux clang with POSIX sockets.  Allows comparing unikernel
+# overhead vs Linux kernel + VZ.framework overhead with identical app logic.
 #
 # Usage (from project root):
-#   docker build -f bench/Dockerfile -t bench_server .
-#   docker run --rm -p 18080:80 bench_server
+#   docker build -f bench/Dockerfile -t webserver_linux .
+#   docker run --rm -p 18080:80 webserver_linux
 
-FROM alpine:3.19 AS build
-WORKDIR /src
-COPY bench/bench_server.c .
-RUN apk add --no-cache gcc musl-dev && \
-    gcc -O2 -static -DRUNTIME='"linux"' -o /bench_server bench_server.c
+FROM debian:bookworm-slim AS build
+WORKDIR /build
+COPY apps/webserver/main.cc .
+COPY net/ net/
+COPY uni/ uni/
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        g++ \
+    && rm -rf /var/lib/apt/lists/* \
+    && g++ -std=c++17 -O2 -I. \
+        main.cc net/http.cc uni/native.cc uni/native_main.cc \
+        -o /webserver
 
-FROM alpine:3.19
-COPY --from=build /bench_server /bench_server
+FROM debian:bookworm-slim
+COPY --from=build /webserver /webserver
 EXPOSE 80
-ENTRYPOINT ["/bench_server"]
-CMD ["80"]
+CMD ["/webserver"]
