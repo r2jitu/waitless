@@ -606,24 +606,22 @@ void shutdown() {
 
 #if defined(__aarch64__)
 static void virtio_net_irq(uint32_t /*irq*/) {
+  // NAPI-style: disable device notifications so no further interrupts fire
+  // during active polling.  The event loop re-enables them before sleeping.
+  rx_queue_.disable_interrupts();
   // Acknowledge the device interrupt to de-assert the IRQ line.
   if (pci_dev_) {
-    // PCI modern: read ISR capability register (clears pending at device).
     virtio_pci::read_isr(pci_dev_);
   } else if (io_base_ != 0) {
-    // MMIO: read interrupt status + write ACK.
     uint32_t isr =
         arch::virtio_read32(io_base_ + virtio::mmio::INTERRUPT_STATUS);
     arch::virtio_write32(io_base_ + virtio::mmio::INTERRUPT_ACK, isr);
   }
-  // The interrupt woke us from WFI.  The main loop calls poll() next.
 }
 #elif defined(__x86_64__)
 static void virtio_net_irq(idt::InterruptFrame * /*frame*/) {
-  // Read the ISR status register to acknowledge the device interrupt.
-  // Legacy virtio PCI: ISR is at BAR0 + 0x13 (8-bit read).
+  rx_queue_.disable_interrupts();
   arch::virtio_read8(io_base_ + virtio::REG_ISR_STATUS);
-  // The interrupt woke us from HLT.  The main loop calls poll() next.
 }
 #endif
 
@@ -684,6 +682,8 @@ void enable_irq() {
 bool irq_idle_supported() { return irq_idle_available_; }
 
 bool has_pending_rx() { return rx_queue_.has_used(); }
+
+void arm_rx_interrupts() { rx_queue_.enable_interrupts(); }
 
 // ============================================================================
 // MAC address
@@ -811,36 +811,12 @@ int poll(void (*callback)(const uint8_t *data, uint32_t len)) {
     count++;
   }
 
-  // If we re-armed any buffers, kick the RX queue
+  // If we re-armed any buffers, kick the RX queue.
+  // NAPI-style: do NOT re-enable interrupts or read ISR here — the IRQ
+  // handler disabled notifications and acked the device.  Interrupts are
+  // re-enabled only when the event loop goes idle (arm_rx_interrupts).
   if (count > 0) {
     rx_queue_.kick();
-
-    // Acknowledge the device interrupt so the IRQ line de-asserts.
-    // This lets WFI/HLT sleep properly on the next idle cycle.
-#if defined(__aarch64__)
-    if (io_base_ != 0 && pci_dev_ == nullptr) {
-      // MMIO path (QEMU virtio-mmio): read ISR status + write ACK.
-      uint32_t isr =
-          arch::virtio_read32(io_base_ + virtio::mmio::INTERRUPT_STATUS);
-      if (isr)
-        arch::virtio_write32(io_base_ + virtio::mmio::INTERRUPT_ACK, isr);
-    } else if (pci_dev_) {
-      // PCI modern path (VZ.framework): read ISR capability (clears pending).
-      virtio_pci::read_isr(pci_dev_);
-    }
-#else
-    // x86 legacy PCI: read ISR register at BAR0 + 0x13 (clears pending).
-    if (io_base_ != 0) {
-      arch::virtio_read8(io_base_ + virtio::REG_ISR_STATUS);
-    }
-#endif
-
-    // Re-arm used_event so the device fires an interrupt on the next
-    // RX completion.  Required for VIRTIO_RING_F_EVENT_IDX; harmless
-    // for non-EVENT_IDX devices (just clears avail->flags again).
-    if (irq_idle_available_) {
-      rx_queue_.enable_interrupts();
-    }
   }
 
   return count;

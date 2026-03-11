@@ -474,12 +474,18 @@ void Server::run() {
     // If we did nothing this iteration, wait for the next event.
     if (!had_work) {
       if (virtio_net::irq_idle_supported()) {
-        // Race-free idle: mask IRQs, check if data arrived between the
-        // last poll() and now, then WFI.  On ARM64, WFI wakes on any
-        // pending GIC interrupt even with DAIF.I masked — the interrupt
-        // stays pending until unmask_irq() lets the handler run.
-        // On x86, mask/unmask are no-ops; idle() does sti;hlt;cli.
+        // NAPI-style idle: the IRQ handler disabled device notifications,
+        // so no interrupts fired during polling.  Now re-enable them
+        // before sleeping so the next completion wakes us.
+        //
+        // Order matters for race-freedom:
+        //   1. mask_irq() — prevent handler from running
+        //   2. arm_rx_interrupts() — tell device to signal again
+        //   3. has_pending_rx() — check if data arrived meanwhile
+        //   4. WFI — sleep (wakes on pending GIC interrupt even when masked)
+        //   5. unmask_irq() — handler runs, disables notifications, acks
         arch::mask_irq();
+        virtio_net::arm_rx_interrupts();
         if (!virtio_net::has_pending_rx()) {
           arch::idle();
         }

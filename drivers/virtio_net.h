@@ -91,6 +91,11 @@ bool irq_idle_supported();
 // Used by the idle pattern to avoid sleeping when data is already available.
 bool has_pending_rx();
 
+// Re-enable RX interrupt notifications (NAPI-style).
+// Call before sleeping — the IRQ handler disables notifications on entry
+// so no interrupts fire during active polling.
+void arm_rx_interrupts();
+
 // Shut down the device by resetting it.
 void shutdown();
 
