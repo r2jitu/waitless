@@ -21,8 +21,10 @@ def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
                               (default)           → native POSIX binary
                               --config=vz         → VZ.framework (macOS arm64)
                               --config=qemu       → QEMU (host arch)
-                              --config=aarch64-vz → explicit
+                              --config=aarch64-vz  → explicit
                               --config=x86_64-qemu, --config=x86_64-iso, …
+                              --config=native      → native (host arch, from .bazelrc.local)
+                              --config=native-macos, --config=native-linux → explicit
 
     Args:
         name: Base name for all output targets.
@@ -75,8 +77,9 @@ def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
     )
 
     # Native POSIX binary — same application code, host OS TCP backend.
-    # Built with the native_macos_arm64 toolchain (--config=aarch64-macos or
-    # the default when .bazelrc.local sets native_macos_arm64 platform).
+    # Only built when the platform has the runtime:native constraint
+    # (native_macos_arm64 or native_linux_x86_64); excluded from unikernel
+    # platforms (os:none) where the bare-metal toolchain would be selected.
     cc_binary(
         name = name + "_native",
         srcs = srcs,
@@ -86,7 +89,7 @@ def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
             "//uni:native_entry",
         ],
         copts = copts,
-        target_compatible_with = ["@platforms//os:macos"],
+        target_compatible_with = ["//bazel/platforms:native"],
         visibility = visibility,
     )
 

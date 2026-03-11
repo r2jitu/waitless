@@ -16,29 +16,31 @@ platform(
     ],
 )
 
-# ── Host OS marker ────────────────────────────────────────────────────────────
-# The unikernel target OS is always bare-metal (os:none). These constraints
-# embed the *build host* OS into the platform so select() can distinguish
-# macOS arm64 from Linux arm64 — needed for VZ.framework dependencies.
-constraint_setting(name = "host_os")
-constraint_value(name = "host_macos", constraint_setting = ":host_os")
-constraint_value(name = "host_linux", constraint_setting = ":host_os")
+# ── Runtime constraint ─────────────────────────────────────────────────────────
+# Distinguishes native host builds (os:macos or os:linux) from bare-metal
+# unikernel builds (os:none).  Used in target_compatible_with to gate targets
+# that only make sense as host binaries (native app binary, VZ runner).
+constraint_setting(name = "runtime")
+constraint_value(name = "native", constraint_setting = ":runtime")
 
-platform(
-    name = "macos_arm64_unikernel",
-    constraint_values = [
-        "@platforms//cpu:aarch64",
-        "@platforms//os:none",
-        ":host_macos",
-    ],
-)
-
-# Native macOS arm64 — for building host binaries (benchmarks, dev tools).
+# Native macOS arm64 — builds host POSIX binaries via the custom macOS toolchain.
 platform(
     name = "native_macos_arm64",
     constraint_values = [
         "@platforms//cpu:aarch64",
         "@platforms//os:macos",
+        ":native",
+    ],
+)
+
+# Native Linux x86_64 — builds host POSIX binaries via the auto-detected
+# host toolchain (local_config_cc; no custom toolchain registration needed).
+platform(
+    name = "native_linux_x86_64",
+    constraint_values = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+        ":native",
     ],
 )
 
@@ -51,15 +53,6 @@ config_setting(
 config_setting(
     name = "aarch64",
     constraint_values = ["@platforms//cpu:aarch64"],
-)
-
-# Matches macOS arm64 only (more specific than :aarch64; wins in ambiguous selects).
-config_setting(
-    name = "macos_arm64",
-    constraint_values = [
-        "@platforms//cpu:aarch64",
-        ":host_macos",
-    ],
 )
 
 # Matches any unikernel platform (bare-metal, os=none).

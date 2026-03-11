@@ -3,7 +3,7 @@ build --action_env=PATH
 
 # ── Shorthand configs ─────────────────────────────────────────────────────────
 # --config=vz   → ARM64 unikernel, VZ.framework (macOS arm64)
-build:vz   --platforms=//bazel/platforms:macos_arm64_unikernel
+build:vz   --platforms=//bazel/platforms:aarch64_unikernel
 build:vz   --define=uni_runner=vz
 
 # --config=qemu → unikernel via QEMU (platform from .bazelrc.local for host arch)
@@ -13,8 +13,11 @@ build:qemu --define=uni_runner=qemu
 build:iso  --platforms=//bazel/platforms:x86_64_unikernel
 build:iso  --define=uni_runner=iso
 
+# --config=native → native POSIX binary (platform from .bazelrc.local for host)
+# setup-dev.sh generates: build:native --platforms=//bazel/platforms:native_<host>
+
 # ── Full triplet configs ───────────────────────────────────────────────────────
-build:aarch64-vz   --platforms=//bazel/platforms:macos_arm64_unikernel
+build:aarch64-vz   --platforms=//bazel/platforms:aarch64_unikernel
 build:aarch64-vz   --define=uni_runner=vz
 
 build:aarch64-qemu --platforms=//bazel/platforms:aarch64_unikernel
@@ -26,12 +29,14 @@ build:x86_64-qemu  --define=uni_runner=qemu
 build:x86_64-iso   --platforms=//bazel/platforms:x86_64_unikernel
 build:x86_64-iso   --define=uni_runner=iso
 
-build:aarch64-macos --platforms=//bazel/platforms:native_macos_arm64
+build:native-macos --platforms=//bazel/platforms:native_macos_arm64
+build:native-linux --platforms=//bazel/platforms:native_linux_x86_64
 
 # ── Fallback default (overridden by .bazelrc.local on dev machines) ───────────
 # setup-dev.sh generates .bazelrc.local; on Apple Silicon it sets:
 #   build --platforms=//bazel/platforms:native_macos_arm64  (native, no VM)
-#   build:qemu --platforms=//bazel/platforms:aarch64_unikernel
+#   build:native --platforms=//bazel/platforms:native_macos_arm64
+#   build:qemu   --platforms=//bazel/platforms:aarch64_unikernel
 # On a fresh checkout without .bazelrc.local, x86_64 unikernel is the default.
 build --platforms=//bazel/platforms:x86_64_unikernel
 

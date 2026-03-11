@@ -41,6 +41,6 @@ genrule(
     local = True,
     target_compatible_with = [
         "@platforms//cpu:aarch64",
-        "//bazel/platforms:host_macos",
+        "//bazel/platforms:native",
     ],
 )
