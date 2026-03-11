@@ -160,6 +160,10 @@ __attribute__((unused)) static bool init_pci_modern() {
   serial::printf("virtio_net: MAC = %02x:%02x:%02x:%02x:%02x:%02x\n", mac_[0],
                  mac_[1], mac_[2], mac_[3], mac_[4], mac_[5]);
 
+  // NOTE: Do NOT enable MSI-X here.  Apple VZ.framework ignores MSI-X for
+  // virtual devices and uses legacy pin-based IRQs (INTx).  Enabling MSI-X
+  // disables INTx per PCI spec, preventing interrupt delivery entirely.
+
   // Allocate and populate RX buffers
   for (int i = 0; i < RX_BUFFERS; i++) {
     // Allocate 2 extra bytes and shift the RxBuffer pointer by 2.
@@ -630,33 +634,17 @@ void enable_irq() {
   const fdt::Info &fdt = fdt::info();
 
   if (pci_dev_ != nullptr && fdt.gic_dist_base != 0) {
-    // PCI modern path (VZ.framework / QEMU modern PCI):
-    // Look up GIC INTID from FDT PCI interrupt-map.
+    // PCI modern path (VZ.framework).  VZ uses legacy pin-based IRQs (INTx),
+    // not MSI-X.  The INTID comes from the FDT interrupt-map.
     uint8_t slot = pci_dev_->pci_dev->slot;
     uint32_t intid = (slot < 8) ? fdt.pci_irqs[slot] : 0;
 
     if (intid != 0) {
-      // Enable MSI-X so VZ.framework routes device interrupts to the vGIC.
-      // VZ only delivers interrupts via MSI-X, not legacy INTx.
-      // The hypervisor manages MSI-X routing internally — we just enable
-      // MSI-X and set queue vectors.
-      const char *mode = "INTx";
-      bool msix_ok =
-          virtio_pci::setup_msix(pci_dev_, fdt.gic_dist_base, intid);
-      if (msix_ok) {
-        virtio_pci::select_queue(pci_dev_, 0);
-        virtio_pci::set_queue_msix_vector(pci_dev_, 0);
-        virtio_pci::select_queue(pci_dev_, 1);
-        virtio_pci::set_queue_msix_vector(pci_dev_, 0);
-        mode = "MSI-X";
-      }
-
       rx_queue_.enable_interrupts();
       exceptions::register_irq(intid, virtio_net_irq);
       irq_idle_available_ = true;
-      serial::printf(
-          "virtio_net: INTID %u registered (GICv%d, PCI slot %d, %s)\n",
-          intid, fdt.gic_version, slot, mode);
+      serial::printf("virtio_net: INTID %u registered (GICv%d, PCI slot %d)\n",
+                     intid, fdt.gic_version, slot);
     }
   } else if (io_base_ != 0 && pci_dev_ == nullptr && fdt.gic_dist_base != 0) {
     // MMIO path (QEMU virtio-mmio with GICv2).

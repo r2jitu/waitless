@@ -356,7 +356,7 @@ uint16_t get_queue_msix_vector(Device *dev) {
   return r16(dev->common_cfg, CC_QUEUE_MSIX_VECTOR);
 }
 
-bool setup_msix(Device *dev, uint64_t gic_dist_base, uint32_t intid) {
+bool setup_msix(Device *dev) {
   pci::Device *pci = dev->pci_dev;
   if (dev->msix_cap_off == 0)
     return false;
@@ -380,9 +380,30 @@ bool setup_msix(Device *dev, uint64_t gic_dist_base, uint32_t intid) {
   // Set config_msix_vector to vector 0
   w16(dev->common_cfg, CC_CONFIG_MSIX_VECTOR, 0);
 
+  // Resolve MSI-X table BAR so we can read entries after DRIVER_OK
+  uint32_t table_off_bir =
+      pci::read_config(pci->bus, pci->slot, pci->func, dev->msix_cap_off + 4);
+  uint8_t table_bir = table_off_bir & 0x7;
+  uint32_t table_offset = table_off_bir & ~0x7U;
+  volatile uint8_t *bar_base = resolve_bar(pci, table_bir);
+  if (bar_base) {
+    dev->msix_table = bar_base + table_offset;
+  }
+
   dev->msix_table_size = table_size;
 
   serial::printf("virtio_pci: MSI-X enabled (%u vectors)\n", table_size);
+  return true;
+}
+
+bool read_msix_entry(Device *dev, uint16_t entry, MsixEntry *out) {
+  if (!dev->msix_table || entry >= dev->msix_table_size)
+    return false;
+  volatile uint32_t *e =
+      reinterpret_cast<volatile uint32_t *>(dev->msix_table + entry * 16);
+  out->addr = (uint64_t)e[0] | ((uint64_t)e[1] << 32);
+  out->data = e[2];
+  out->vector_ctrl = e[3];
   return true;
 }
 

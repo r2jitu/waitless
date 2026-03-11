@@ -69,10 +69,21 @@ uint8_t read_isr(Device *dev);
 
 // ---- MSI-X support --------------------------------------------------------
 
-// Configure MSI-X with a single vector targeting GICv3 GICD_SETSPI_NSR.
-// Must be called after find() and before or after DRIVER_OK.
-// Returns true if MSI-X was successfully configured.
-bool setup_msix(Device *dev, uint64_t gic_dist_base, uint32_t intid);
+// Enable MSI-X and resolve the table BAR.  Must be called before DRIVER_OK
+// (VirtIO spec 4.1.4.3.2).  VZ.framework manages MSI-X table entries
+// internally — the guest only enables MSI-X and sets queue/config vectors.
+bool setup_msix(Device *dev);
+
+// MSI-X table entry (read from device-managed table after DRIVER_OK).
+struct MsixEntry {
+  uint64_t addr;
+  uint32_t data;
+  uint32_t vector_ctrl;
+};
+
+// Read an MSI-X table entry.  Returns false if table not resolved or
+// entry out of range.
+bool read_msix_entry(Device *dev, uint16_t entry, MsixEntry *out);
 
 // Set/get the MSI-X vector for the currently selected queue.
 void set_queue_msix_vector(Device *dev, uint16_t vector);
