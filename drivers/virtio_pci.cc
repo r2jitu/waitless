@@ -167,7 +167,7 @@ static bool parse_capabilities(Device *dev) {
         dev->device_cfg = bar_base + offset;
         break;
       case VIRTIO_PCI_CAP_ISR_CFG:
-        // We don't use interrupts (polling mode), but note it exists
+        dev->isr_cfg = bar_base + offset;
         break;
       }
     }
@@ -208,6 +208,7 @@ Device *find(uint16_t virtio_device_type) {
   dev->common_cfg = nullptr;
   dev->notify_base = nullptr;
   dev->device_cfg = nullptr;
+  dev->isr_cfg = nullptr;
   dev->notify_off_multiplier = 0;
   dev->virtio_device_type = virtio_device_type;
 
@@ -319,6 +320,16 @@ uint32_t read_dev_cfg32(Device *dev, uint32_t offset) {
   if (!dev->device_cfg)
     return 0;
   return r32(dev->device_cfg, offset);
+}
+
+// ============================================================================
+// ISR status (read clears pending interrupt at the device)
+// ============================================================================
+
+uint8_t read_isr(Device *dev) {
+  if (!dev->isr_cfg)
+    return 0;
+  return r8(dev->isr_cfg, 0);
 }
 
 } // namespace virtio_pci

@@ -21,6 +21,7 @@ struct Device {
   volatile uint8_t *common_cfg;  // VIRTIO_PCI_CAP_COMMON_CFG
   volatile uint8_t *notify_base; // VIRTIO_PCI_CAP_NOTIFY_CFG
   volatile uint8_t *device_cfg;  // VIRTIO_PCI_CAP_DEVICE_CFG
+  volatile uint8_t *isr_cfg;     // VIRTIO_PCI_CAP_ISR_CFG
   uint32_t notify_off_multiplier;
   uint16_t virtio_device_type; // 1=net, 3=console, etc.
 };
@@ -58,5 +59,9 @@ uint64_t queue_notify_addr(Device *dev, uint16_t notify_off);
 uint8_t read_dev_cfg8(Device *dev, uint32_t offset);
 uint16_t read_dev_cfg16(Device *dev, uint32_t offset);
 uint32_t read_dev_cfg32(Device *dev, uint32_t offset);
+
+// Read (and acknowledge) the ISR status register.
+// Returns the ISR bits; reading clears the pending interrupt at the device.
+uint8_t read_isr(Device *dev);
 
 } // namespace virtio_pci

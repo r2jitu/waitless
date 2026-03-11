@@ -250,11 +250,12 @@ static inline void udelay(uint64_t microseconds) {
 // Hint to the CPU to reduce power during a spin-wait loop.
 static inline void cpu_relax() { asm volatile("pause" ::: "memory"); }
 
-// Yield the CPU briefly when the event loop is idle.
-// TODO: replace with `sti; hlt; cli` once the PIC is initialised and interrupts
-// are unmasked.  HLT requires EFLAGS.IF=1; without a working 8259 PIC the CPU
-// would halt forever waiting for an IRQ that can never be delivered.
-static inline void idle() { asm volatile("pause" ::: "memory"); }
+// Yield the CPU until the next hardware interrupt.
+// STI enables interrupts; HLT halts until an IRQ fires (ISR runs, sends EOI);
+// CLI re-masks interrupts.  The STI;HLT pair is architecturally atomic — the
+// CPU checks for pending interrupts after STI but before HLT, so there is no
+// window where an IRQ could be missed.
+static inline void idle() { asm volatile("sti; hlt; cli" ::: "memory"); }
 
 // Power off the machine via ACPI S5 sleep.
 // Tries multiple PM1_CNT ports and SLP_TYP values to cover:

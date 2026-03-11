@@ -77,6 +77,16 @@ struct RxBuffer {
 // Returns true on success.
 bool init();
 
+// Register the virtio-net IRQ handler and enable RX queue interrupts.
+// Call after init() succeeds.  Enables interrupt-driven idle: the CPU
+// sleeps (WFI/HLT) until the device signals an RX completion.
+void enable_irq();
+
+// Returns true if interrupt-driven idle is available (IRQ handler registered).
+// When true, the caller can use arch::idle() (WFI/HLT) to sleep until the
+// next packet.  When false, fall back to arch::cpu_relax() (polling).
+bool irq_idle_supported();
+
 // Shut down the device by resetting it.
 void shutdown();
 

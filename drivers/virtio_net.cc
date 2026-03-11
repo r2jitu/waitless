@@ -23,6 +23,12 @@
 #include "kernel/panic.h"
 #include "kernel/serial.h"
 
+#if defined(__aarch64__)
+#include "kernel/aarch64/exceptions.h"
+#elif defined(__x86_64__)
+#include "kernel/idt.h"
+#endif
+
 extern "C" void *memcpy(void *dst, const void *src, size_t n);
 
 namespace virtio_net {
@@ -582,6 +588,76 @@ void shutdown() {
 }
 
 // ============================================================================
+// Interrupt-driven idle — register IRQ handler + enable RX notifications
+// ============================================================================
+
+#if defined(__aarch64__)
+static void virtio_net_irq(uint32_t /*irq*/) {
+  // Acknowledge the MMIO interrupt to de-assert the IRQ line.
+  if (io_base_ != 0 && pci_dev_ == nullptr) {
+    uint32_t isr =
+        arch::virtio_read32(io_base_ + virtio::mmio::INTERRUPT_STATUS);
+    arch::virtio_write32(io_base_ + virtio::mmio::INTERRUPT_ACK, isr);
+  }
+  // The interrupt woke us from WFI.  The main loop calls poll() next.
+}
+#elif defined(__x86_64__)
+static void virtio_net_irq(idt::InterruptFrame * /*frame*/) {
+  // Read the ISR status register to acknowledge the device interrupt.
+  // Legacy virtio PCI: ISR is at BAR0 + 0x13 (8-bit read).
+  arch::virtio_read8(io_base_ + virtio::REG_ISR_STATUS);
+  // The interrupt woke us from HLT.  The main loop calls poll() next.
+}
+#endif
+
+static bool irq_idle_available_ = false;
+
+void enable_irq() {
+#if defined(__aarch64__)
+  // Find the GIC IRQ ID for our virtio-mmio device from the FDT.
+  const fdt::Info &fdt = fdt::info();
+  if (fdt.gic_dist_base != 0 && io_base_ != 0 && pci_dev_ == nullptr) {
+    // QEMU virtio-mmio with GIC: register IRQ handler + enable RX interrupts.
+    for (int i = 0; i < fdt.virtio_count; i++) {
+      if (fdt.virtio_bases[i] == io_base_ && fdt.virtio_irqs[i] != 0) {
+        rx_queue_.enable_interrupts();
+        exceptions::register_irq(fdt.virtio_irqs[i], virtio_net_irq);
+        irq_idle_available_ = true;
+        serial::printf("virtio_net: IRQ %u registered (GIC)\n",
+                       fdt.virtio_irqs[i]);
+        break;
+      }
+    }
+  } else {
+    // VZ or PCI modern without GIC: no reliable interrupt delivery path.
+    // Fall back to polling (cpu_relax); don't enable RX interrupts.
+    serial::printf("virtio_net: no GIC — polling mode (cpu_relax)\n");
+  }
+#elif defined(__x86_64__)
+  // Read PCI Interrupt Line register (offset 0x3C, low byte).
+  if (device_) {
+    uint32_t irq_reg = pci::read_config(device_->bus, device_->slot,
+                                         device_->func, 0x3C);
+    uint8_t irq_line = irq_reg & 0xFF;
+    if (irq_line < 16) {
+      rx_queue_.enable_interrupts();
+      idt::register_handler(32 + irq_line, virtio_net_irq);
+      idt::enable_irq(irq_line);
+      irq_idle_available_ = true;
+      serial::printf("virtio_net: IRQ %u registered (PIC vector %u)\n",
+                     irq_line, 32 + irq_line);
+    }
+  }
+#endif
+
+  if (irq_idle_available_) {
+    serial::printf("virtio_net: interrupt-driven idle enabled\n");
+  }
+}
+
+bool irq_idle_supported() { return irq_idle_available_; }
+
+// ============================================================================
 // MAC address
 // ============================================================================
 
@@ -710,6 +786,26 @@ int poll(void (*callback)(const uint8_t *data, uint32_t len)) {
   // If we re-armed any buffers, kick the RX queue
   if (count > 0) {
     rx_queue_.kick();
+
+    // Acknowledge the device interrupt so the IRQ line de-asserts.
+    // This lets WFI/HLT sleep properly on the next idle cycle.
+#if defined(__aarch64__)
+    if (io_base_ != 0 && pci_dev_ == nullptr) {
+      // MMIO path (QEMU virtio-mmio): read ISR status + write ACK.
+      uint32_t isr =
+          arch::virtio_read32(io_base_ + virtio::mmio::INTERRUPT_STATUS);
+      if (isr)
+        arch::virtio_write32(io_base_ + virtio::mmio::INTERRUPT_ACK, isr);
+    } else if (pci_dev_) {
+      // PCI modern path (VZ.framework): read ISR capability (clears pending).
+      virtio_pci::read_isr(pci_dev_);
+    }
+#else
+    // x86 legacy PCI: read ISR register at BAR0 + 0x13 (clears pending).
+    if (io_base_ != 0) {
+      arch::virtio_read8(io_base_ + virtio::REG_ISR_STATUS);
+    }
+#endif
   }
 
   return count;

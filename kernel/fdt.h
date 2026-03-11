@@ -12,6 +12,7 @@ namespace fdt {
 struct Info {
   uint64_t uart_base;        // PL011 base, 0 if not found
   uint64_t virtio_bases[32]; // virtio-mmio device base addresses
+  uint32_t virtio_irqs[32];  // GIC IRQ ID for each virtio-mmio device (SPI+32)
   int virtio_count;          // number found
   uint64_t gic_dist_base;    // GICv2 distributor base (arm,gic-400).
                              // 0 if not found or if GICv3 (skip GIC init).

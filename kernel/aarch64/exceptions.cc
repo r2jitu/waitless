@@ -54,6 +54,11 @@ static void (*irq_handlers[MAX_IRQS])(uint32_t irq);
 extern "C" void exception_handler(uint32_t kind, Frame *frame) {
   if (kind == 1) {
     // IRQ (Group 2 SP_EL1 slot 1 → kind=1)
+    if (GICD_BASE == 0) {
+      // No GIC (VZ mode) — interrupt woke us from WFI; nothing to ack.
+      // The poll loop will drain the device and de-assert the IRQ.
+      return;
+    }
     uint32_t iar = *gicc(GICC_IAR);
     uint32_t irq = iar & 0x3FF; // bits [9:0] are the interrupt ID
 

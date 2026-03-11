@@ -16,6 +16,7 @@
 //     because there is no user space.
 
 #include "net/http.h"
+#include "drivers/virtio_net.h"
 #include "kernel/arch.h"
 #include "kernel/mm.h"
 #include "kernel/serial.h"
@@ -470,9 +471,16 @@ void Server::run() {
       }
     }
 
-    // If we did nothing this iteration, yield to reduce CPU burn.
+    // If we did nothing this iteration, wait for the next event.
     if (!had_work) {
-      arch::cpu_relax();
+      if (virtio_net::irq_idle_supported()) {
+        // Interrupt-driven: sleep until the device signals an RX completion.
+        // ARM64: WFI; x86_64: STI;HLT;CLI.
+        arch::idle();
+      } else {
+        // No interrupt path (e.g. VZ without GIC): yield briefly.
+        arch::cpu_relax();
+      }
     }
   }
 

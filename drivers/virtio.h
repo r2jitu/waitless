@@ -74,8 +74,10 @@ static constexpr uint32_t QUEUE_NUM_MAX = 0x034; // max queue size       (read)
 static constexpr uint32_t QUEUE_NUM = 0x038;     // chosen queue size    (write)
 static constexpr uint32_t QUEUE_ALIGN = 0x03c;   // must write 4096      (write)
 static constexpr uint32_t QUEUE_PFN = 0x040;     // phys addr >> 12      (r/w)
-static constexpr uint32_t QUEUE_NOTIFY = 0x050;  // queue kick           (write)
-static constexpr uint32_t STATUS = 0x070;        // device status        (r/w)
+static constexpr uint32_t QUEUE_NOTIFY = 0x050;      // queue kick       (write)
+static constexpr uint32_t INTERRUPT_STATUS = 0x060;   // pending IRQ bits (read)
+static constexpr uint32_t INTERRUPT_ACK = 0x064;      // acknowledge bits (write)
+static constexpr uint32_t STATUS = 0x070;             // device status    (r/w)
 static constexpr uint32_t DEVICE_CONFIG = 0x100; // device-specific config
 static constexpr uint32_t MAGIC = 0x74726976u;   // "virt"
 
@@ -180,6 +182,12 @@ public:
   // and *len to the number of bytes written, then returns true.
   // Returns false if no used entries are pending.
   bool get_used(uint16_t *id, uint32_t *len);
+
+  // Enable/disable device-to-driver interrupt notifications.
+  // By default queues suppress interrupts (polling mode).
+  // Call enable_interrupts() on the RX queue for interrupt-driven idle.
+  void enable_interrupts() { avail_->flags = 0; }
+  void disable_interrupts() { avail_->flags = VIRTQ_AVAIL_F_NO_INTERRUPT; }
 
   uint16_t size() const { return queue_size_; }
 

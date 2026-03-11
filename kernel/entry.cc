@@ -140,6 +140,19 @@ static void kernel_boot(boot::BootInfo *info) {
 
     serial::printf("[INIT] TCP stack...\n");
     net::tcp::init();
+
+    serial::printf("[INIT] Interrupt-driven idle...\n");
+    virtio_net::enable_irq();
+#if defined(__aarch64__)
+    // Enable IRQ delivery only when GIC is present (QEMU), so the exception
+    // handler can acknowledge GIC interrupts via GICC_IAR/GICC_EOIR.
+    // On VZ (no GIC), keep DAIF.I=1: WFI still wakes on pending virtual IRQs
+    // (ARM ARM B2.2.7), and poll() acknowledges the device ISR directly.
+    if (fdt::info().gic_dist_base != 0)
+      arch::sti();
+#endif
+    // x86_64: interrupts stay masked (CLI).  idle() does STI;HLT;CLI
+    // atomically, so the ISR only runs during the HLT window.
   }
 
   serial::printf("\n[BOOT] All subsystems ready. Starting application.\n\n");

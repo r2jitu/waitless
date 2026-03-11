@@ -100,6 +100,8 @@ void init(uint64_t dtb_addr) {
     bool has_reg;               // true once "reg" has been read
     const uint8_t *ranges_data; // pointer into DTB for "ranges" property value
     uint32_t ranges_len;        // byte length of "ranges" value
+    uint32_t irq;               // GIC IRQ ID parsed from "interrupts" property
+    bool has_irq;               // true once "interrupts" has been read
   };
   NodeState stack[MAX_DEPTH] = {};
   int depth = 0;
@@ -114,7 +116,7 @@ void init(uint64_t dtb_addr) {
     case FDT_BEGIN_NODE: {
       // Push a fresh node state for the new depth level.
       if (depth < MAX_DEPTH)
-        stack[depth] = {0, 0, 0, false, nullptr, 0};
+        stack[depth] = {0, 0, 0, false, nullptr, 0, 0, false};
       depth++;
       // Skip the null-terminated node name.
       while (*p)
@@ -135,8 +137,12 @@ void init(uint64_t dtb_addr) {
           if ((ns.compat & CF_PL011) && g_info.uart_base == 0)
             g_info.uart_base = ns.reg;
 
-          if ((ns.compat & CF_VIRTIO) && g_info.virtio_count < 32)
-            g_info.virtio_bases[g_info.virtio_count++] = ns.reg;
+          if ((ns.compat & CF_VIRTIO) && g_info.virtio_count < 32) {
+            int idx = g_info.virtio_count;
+            g_info.virtio_bases[idx] = ns.reg;
+            g_info.virtio_irqs[idx] = ns.has_irq ? ns.irq : 0;
+            g_info.virtio_count++;
+          }
 
           // Only store GICv2 distributor base; skip GICv3 (no driver).
           if ((ns.compat & CF_GICV2) && g_info.gic_dist_base == 0)
@@ -218,6 +224,15 @@ void init(uint64_t dtb_addr) {
         } else if (str_eq(pname, "ranges") && vlen > 0) {
           stack[d].ranges_data = vdata;
           stack[d].ranges_len = vlen;
+        } else if (str_eq(pname, "interrupts") && vlen >= 12 &&
+                   !stack[d].has_irq) {
+          // GIC interrupt specifier: <type irq_num flags> (3 cells).
+          // type 0 = SPI (GIC IRQ ID = irq_num + 32).
+          // type 1 = PPI (GIC IRQ ID = irq_num + 16).
+          uint32_t type = be32(vdata);
+          uint32_t irq_num = be32(vdata + 4);
+          stack[d].irq = (type == 0) ? irq_num + 32 : irq_num + 16;
+          stack[d].has_irq = true;
         }
       }
       break;

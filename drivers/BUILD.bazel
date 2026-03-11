@@ -47,6 +47,7 @@ cc_library(
         ":virtio",
         ":virtio_pci",
         "//kernel:fdt",
+        "//kernel:arch_init",
     ],
     copts = ["-I."],
 )
