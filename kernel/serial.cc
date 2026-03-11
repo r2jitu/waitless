@@ -310,4 +310,22 @@ bool check_shutdown() {
   return false;
 }
 
+void enable_rx_irq() {
+  // Enable ERBFI (Received Data Available Interrupt) in the UART IER.
+  // After calling this, COM1 will assert IRQ4 whenever the RX FIFO
+  // has data.  The caller must register an IDT handler and unmask
+  // IRQ4 in the 8259 PIC before this takes effect.
+  arch::outb(COM1 + IER, 0x01);
+}
+
+void rx_isr() {
+  // Drain the RX FIFO to clear the UART interrupt condition.
+  // Must be called from the IRQ4 ISR on x86.
+  int c;
+  while ((c = try_getc()) >= 0) {
+    if (c == 0x03)
+      shutdown_requested = true;
+  }
+}
+
 } // namespace serial

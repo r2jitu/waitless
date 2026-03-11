@@ -157,8 +157,16 @@ static void kernel_boot(boot::BootInfo *info) {
       asm volatile("msr daifclr, #0x2" ::: "memory");
     }
 #endif
-    // x86_64: interrupts stays masked (CLI).  idle() does STI;HLT;CLI
+#if defined(__x86_64__)
+    // Enable serial RX interrupt (IRQ4 / vector 36) so that Ctrl-C bytes
+    // in the UART FIFO wake HLT.  Without this, idle() sleeps until the
+    // next virtio-net IRQ and Ctrl-C only works if an HTTP request arrives.
+    idt::register_handler(36, [](idt::InterruptFrame *) { serial::rx_isr(); });
+    idt::enable_irq(4);
+    serial::enable_rx_irq();
+    // x86_64: interrupts stay masked (CLI).  idle() does STI;HLT;CLI
     // atomically, so the ISR only runs during the HLT window.
+#endif
   }
 
   serial::printf("\n[BOOT] All subsystems ready. Starting application.\n\n");

@@ -31,4 +31,14 @@ int try_getc();
 // signal=off).  Once set, subsequent calls always return true.
 bool check_shutdown();
 
+#if defined(__x86_64__)
+// Enable UART RX interrupt (ERBFI bit in IER).  Call after the IDT handler
+// for IRQ4 (vector 36) is registered and IRQ4 is unmasked in the PIC.
+void enable_rx_irq();
+
+// Drain the UART RX FIFO and set shutdown_requested if 0x03 is seen.
+// Must be called from the IRQ4 ISR to clear the interrupt condition.
+void rx_isr();
+#endif
+
 } // namespace serial
