@@ -67,8 +67,9 @@ uint32_t read_dev_cfg32(Device *dev, uint32_t offset);
 // Returns the ISR bits; reading clears the pending interrupt at the device.
 uint8_t read_isr(Device *dev);
 
-// ---- MSI-X support --------------------------------------------------------
+// ---- MSI-X support (aarch64/ECAM only) ------------------------------------
 
+#if defined(__aarch64__)
 // Enable MSI-X and resolve the table BAR.  Must be called before DRIVER_OK
 // (VirtIO spec 4.1.4.3.2).  VZ.framework manages MSI-X table entries
 // internally — the guest only enables MSI-X and sets queue/config vectors.
@@ -84,6 +85,7 @@ struct MsixEntry {
 // Read an MSI-X table entry.  Returns false if table not resolved or
 // entry out of range.
 bool read_msix_entry(Device *dev, uint16_t entry, MsixEntry *out);
+#endif  // __aarch64__
 
 // Set/get the MSI-X vector for the currently selected queue.
 void set_queue_msix_vector(Device *dev, uint16_t vector);

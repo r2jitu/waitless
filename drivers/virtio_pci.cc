@@ -345,7 +345,6 @@ uint8_t read_isr(Device *dev) {
 // ============================================================================
 
 // common_cfg offsets for MSI-X vector fields
-static constexpr int CC_CONFIG_MSIX_VECTOR = 0x10;
 static constexpr int CC_QUEUE_MSIX_VECTOR = 0x1a;
 
 void set_queue_msix_vector(Device *dev, uint16_t vector) {
@@ -355,6 +354,9 @@ void set_queue_msix_vector(Device *dev, uint16_t vector) {
 uint16_t get_queue_msix_vector(Device *dev) {
   return r16(dev->common_cfg, CC_QUEUE_MSIX_VECTOR);
 }
+
+#if defined(__aarch64__)
+static constexpr int CC_CONFIG_MSIX_VECTOR = 0x10;
 
 bool setup_msix(Device *dev) {
   pci::Device *pci = dev->pci_dev;
@@ -406,5 +408,6 @@ bool read_msix_entry(Device *dev, uint16_t entry, MsixEntry *out) {
   out->vector_ctrl = e[3];
   return true;
 }
+#endif  // __aarch64__
 
 } // namespace virtio_pci

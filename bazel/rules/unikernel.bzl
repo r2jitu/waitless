@@ -15,11 +15,14 @@ def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
       - <name>.elf        : Bare-metal ELF kernel binary (identity-mapped)
       - <name>.limine.elf : Higher-half ELF for Limine boot
       - <name>.img        : Raw binary (objcopy, for QEMU -kernel / VZ)
-      - <name>_run        : Launch with auto-detected runner (QEMU or VZ)
-      - <name>_run_vz     : Launch with VZ.framework (macOS arm64)
-      - <name>_run_qemu   : Launch with QEMU (auto-detects arch)
-      - <name>_run_iso    : Launch Limine ISO with QEMU (x86_64)
       - <name>.iso        : Limine-bootable ISO (BIOS+UEFI, for cloud/QEMU)
+      - <name>_native     : Native POSIX binary (same app code, host OS TCP)
+      - <name>_run        : Launch with runner selected by --config:
+                              (default)           → native POSIX binary
+                              --config=vz         → VZ.framework (macOS arm64)
+                              --config=qemu       → QEMU (host arch)
+                              --config=aarch64-vz → explicit
+                              --config=x86_64-qemu, --config=x86_64-iso, …
 
     Args:
         name: Base name for all output targets.
@@ -71,83 +74,68 @@ def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
         visibility = visibility,
     )
 
-    # "bazel run //apps/<name>:run" — auto-detects runner:
-    #   macOS arm64  → VZ.framework (hardware-accelerated via run-vz)
-    #   everything else → QEMU (via detect_qemu in helpers.sh)
+    # Native POSIX binary — same application code, host OS TCP backend.
+    # Built with the native_macos_arm64 toolchain (--config=aarch64-macos or
+    # the default when .bazelrc.local sets native_macos_arm64 platform).
+    cc_binary(
+        name = name + "_native",
+        srcs = srcs,
+        deps = deps + [
+            "//net:http",
+            "//uni:native",
+            "//uni:native_entry",
+        ],
+        copts = copts,
+        target_compatible_with = ["@platforms//os:macos"],
+        visibility = visibility,
+    )
+
+    # Unified run target — runner selected by --define=uni_runner=<value>.
+    # Default (no define): native POSIX binary.
+    # --config=vz/qemu/iso (or --config=<arch>-<runner>) set the define.
     sh_binary(
         name = name + "_run",
-        srcs = ["//bazel/rules:run_wrapper.sh"],
-        data = [":" + name + ".elf"] + select({
-            # macOS arm64: include VZ runner + raw image (more specific than :aarch64).
-            "//bazel/platforms:macos_arm64": [
+        srcs = select({
+            "//bazel/platforms:runner_vz":   ["//bazel/rules:run_vz.sh"],
+            "//bazel/platforms:runner_qemu": ["//bazel/rules:run_qemu.sh"],
+            "//bazel/platforms:runner_iso":  ["//bazel/rules:run_iso.sh"],
+            "//conditions:default":          ["//bazel/rules:run_native.sh"],
+        }),
+        data = select({
+            "//bazel/platforms:runner_vz": [
                 ":" + name + ".img",
                 "//scripts:run_vz",
             ],
-            # Other arm64 (Linux): raw image for QEMU -kernel (PIE ELF loads wrong).
-            "//bazel/platforms:aarch64": [
+            "//bazel/platforms:runner_qemu": [
+                # Include both .elf and .img: run_qemu.sh uses .elf for x86_64
+                # and .img for aarch64 (both are needed to avoid nested select).
+                ":" + name + ".elf",
                 ":" + name + ".img",
             ],
-            "//conditions:default": [],
-        }),
-        env = {
-            "UNIKERNEL_ELF_RELPATH": native.package_name() + "/" + name + ".elf",
-            "UNIKERNEL_IMG_RELPATH": native.package_name() + "/" + name + ".img",
-            "UNIKERNEL_VZ_RELPATH": "scripts/run-vz",
-        },
-        visibility = visibility,
-    )
-
-    # "bazel run //apps/<name>:run_vz" — VZ.framework (macOS arm64 only)
-    sh_binary(
-        name = name + "_run_vz",
-        srcs = ["//bazel/rules:run_vz.sh"],
-        data = [
-            ":" + name + ".img",
-            "//scripts:run_vz",
-        ],
-        env = {
-            "UNIKERNEL_IMG_RELPATH": native.package_name() + "/" + name + ".img",
-            "UNIKERNEL_VZ_RELPATH": "scripts/run-vz",
-        },
-        target_compatible_with = [
-            "@platforms//cpu:aarch64",
-            "//bazel/platforms:host_macos",
-        ],
-        visibility = visibility,
-    )
-
-    # "bazel run //apps/<name>:run_qemu" — QEMU (auto-detects arch from ELF)
-    sh_binary(
-        name = name + "_run_qemu",
-        srcs = ["//bazel/rules:run_qemu.sh"],
-        data = [":" + name + ".elf"] + select({
-            "//bazel/platforms:aarch64": [":" + name + ".img"],
-            "//conditions:default": [],
-        }),
-        env = {
-            "UNIKERNEL_ELF_RELPATH": native.package_name() + "/" + name + ".elf",
-            "UNIKERNEL_IMG_RELPATH": native.package_name() + "/" + name + ".img",
-        },
-        visibility = visibility,
-    )
-
-    # "bazel run //apps/<name>:run_iso" — Limine ISO via QEMU (x86_64)
-    sh_binary(
-        name = name + "_run_iso",
-        srcs = ["//bazel/rules:run_iso.sh"],
-        data = select({
-            "//bazel/platforms:aarch64": [
-                ":" + name + ".elf",
+            "//bazel/platforms:runner_iso": [
+                # .iso already embeds the kernel; only the ISO path is needed.
                 ":" + name + ".iso",
             ],
             "//conditions:default": [
-                ":" + name + ".limine.elf",
-                ":" + name + ".iso",
+                ":" + name + "_native",
             ],
         }),
-        env = {
-            "UNIKERNEL_ISO_RELPATH": native.package_name() + "/" + name + ".iso",
-        },
+        env = select({
+            "//bazel/platforms:runner_vz": {
+                "UNIKERNEL_IMG_RELPATH": native.package_name() + "/" + name + ".img",
+                "UNIKERNEL_VZ_RELPATH":  "scripts/run-vz",
+            },
+            "//bazel/platforms:runner_qemu": {
+                "UNIKERNEL_ELF_RELPATH": native.package_name() + "/" + name + ".elf",
+                "UNIKERNEL_IMG_RELPATH": native.package_name() + "/" + name + ".img",
+            },
+            "//bazel/platforms:runner_iso": {
+                "UNIKERNEL_ISO_RELPATH": native.package_name() + "/" + name + ".iso",
+            },
+            "//conditions:default": {
+                "UNIKERNEL_NATIVE_RELPATH": native.package_name() + "/" + name + "_native",
+            },
+        }),
         visibility = visibility,
     )
 

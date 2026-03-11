@@ -407,7 +407,7 @@ bench_native_server() {
 
     echo "  Building webserver_native..."
     cd "$PROJECT_ROOT"
-    bazel build --config=native //apps/webserver:webserver_native 2>&1 | \
+    bazel build --config=aarch64-macos //apps/webserver:webserver_native 2>&1 | \
         grep -E '(INFO|ERROR|WARNING|Target)' | tail -3 || true
 
     local bin="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver_native"

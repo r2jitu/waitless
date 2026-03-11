@@ -1,4 +1,3 @@
-load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("//bazel/rules:unikernel.bzl", "unikernel_binary")
 
@@ -13,76 +12,43 @@ unikernel_binary(
     ],
 )
 
-# Native binary — same application code, POSIX TCP backend.
-# Build with:  bazel build --config=native //apps/webserver:webserver_native
-# Run with:   bazel run  --config=native //apps/webserver:webserver_native
-cc_binary(
-    name = "webserver_native",
-    srcs = ["main.cc"],
-    copts = [
-        "-I.",
-        "-Iinclude",
-    ],
-    deps = [
-        "//net:http",
-        "//uni:native",
-        "//uni:native_entry",
-    ],
-)
-
-# Friendly aliases so users can type:
-#   bazel run //apps/webserver:run                    (auto-detect VZ or QEMU)
-#   bazel run //apps/webserver:run_vz                 (VZ.framework, macOS arm64)
-#   bazel run //apps/webserver:run_qemu               (QEMU, any arch)
-#   bazel run --config=x86_64 //apps/webserver:run_iso  (Limine ISO, x86_64)
+# Friendly alias: bazel run //apps/webserver  (or :run)
 alias(name = "run", actual = ":webserver_run")
-alias(name = "run_vz", actual = ":webserver_run_vz")
-alias(name = "run_qemu", actual = ":webserver_run_qemu")
-alias(name = "run_iso", actual = ":webserver_run_iso")
 
-# --- Integration tests -------------------------------------------------------
-# Each target tests one boot environment. Skips (exit 0) if prerequisites
-# are not available (e.g. QEMU not installed, wrong host platform).
-#
-#   bazel test //apps/webserver:test_vz                                 (macOS arm64 only)
-#   bazel test //apps/webserver:test_qemu                               (uses current arch)
-#   bazel test --config=x86_64 //apps/webserver:test_qemu               (force x86 QEMU)
-#   bazel test --config=x86_64 //apps/webserver:test_iso                (Limine ISO, x86 only)
-
+# Integration test — runner selected by --config:
+#   bazel test //apps/webserver:test                        (native, no VM)
+#   bazel test --config=vz   //apps/webserver:test          (VZ.framework)
+#   bazel test --config=qemu //apps/webserver:test          (QEMU, host arch)
+#   bazel test --config=aarch64-qemu //apps/webserver:test  (explicit)
+#   bazel test --config=x86_64-iso   //apps/webserver:test  (Limine ISO)
 sh_test(
-    name = "test_vz",
-    srcs = ["test_vz.sh"],
-    data = [
-        ":webserver.img",
-        "//scripts:run_vz",
-        "//scripts:helpers.sh",
-    ],
-    target_compatible_with = ["@platforms//cpu:aarch64"],
-    tags = ["local", "exclusive"],
-    timeout = "long",
-)
-
-sh_test(
-    name = "test_qemu",
-    srcs = ["test_qemu.sh"],
-    data = [
-        ":webserver.elf",
-        ":webserver.img",
-        "//scripts:helpers.sh",
-    ],
-    tags = ["local", "exclusive"],
-    timeout = "long",
-)
-
-sh_test(
-    name = "test_iso",
-    srcs = ["test_iso.sh"],
-    data = [
-        ":webserver.limine.elf",
-        ":webserver.iso",
-        "//scripts:helpers.sh",
-    ],
-    target_compatible_with = ["@platforms//cpu:x86_64"],
+    name = "test",
+    srcs = select({
+        "//bazel/platforms:runner_vz":   ["test_vz.sh"],
+        "//bazel/platforms:runner_qemu": ["test_qemu.sh"],
+        "//bazel/platforms:runner_iso":  ["test_iso.sh"],
+        "//conditions:default":          ["test_native.sh"],
+    }),
+    data = select({
+        "//bazel/platforms:runner_vz": [
+            ":webserver.img",
+            "//scripts:run_vz",
+            "//scripts:helpers.sh",
+        ],
+        "//bazel/platforms:runner_qemu": [
+            ":webserver.elf",
+            ":webserver.img",
+            "//scripts:helpers.sh",
+        ],
+        "//bazel/platforms:runner_iso": [
+            ":webserver.limine.elf",
+            ":webserver.iso",
+            "//scripts:helpers.sh",
+        ],
+        "//conditions:default": [
+            ":webserver_native",
+        ],
+    }),
     tags = ["local", "exclusive"],
     timeout = "long",
 )
