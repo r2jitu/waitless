@@ -236,15 +236,17 @@ bench_unikernel() {
     # ELF is always produced — it is an intermediate product of the .img genrule.
     local elf="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver.elf"
     local img="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver.img"
-    if [ "$runner" = "vz" ] || [ "$HOST_ARCH" = "arm64" ] || [ "$HOST_ARCH" = "aarch64" ]; then
-        bazel build //apps/webserver:webserver.img 2>&1 | \
-            grep -E '(INFO|ERROR|WARNING|Target)' | tail -3 || true
-        [ -f "$img" ] || die "IMG not found: $img"
+    local build_config target artifact_path
+    if [ "$runner" = "vz" ]; then
+        build_config="aarch64-vz"; target="webserver.img"; artifact_path="$img"
+    elif [ "$HOST_ARCH" = "arm64" ] || [ "$HOST_ARCH" = "aarch64" ]; then
+        build_config="aarch64-qemu"; target="webserver.img"; artifact_path="$img"
     else
-        bazel build //apps/webserver:webserver.elf 2>&1 | \
-            grep -E '(INFO|ERROR|WARNING|Target)' | tail -3 || true
-        [ -f "$elf" ] || die "ELF not found: $elf"
+        build_config="x86_64-qemu"; target="webserver.elf"; artifact_path="$elf"
     fi
+    bazel build "--config=$build_config" "//apps/webserver:$target" 2>&1 | \
+        grep -E '(INFO|ERROR|WARNING|Target)' | tail -3 || true
+    [ -f "$artifact_path" ] || die "$target not found: $artifact_path"
 
     local log="/tmp/unikernel-bench.log"
     rm -f "$log"
