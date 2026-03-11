@@ -164,10 +164,7 @@ static void write_int(long long val, int width, char pad) {
   }
 }
 
-void printf(const char *fmt, ...) {
-  va_list ap;
-  va_start(ap, fmt);
-
+void vprintf(const char *fmt, va_list ap) {
   for (const char *p = fmt; *p; p++) {
     if (*p != '%') {
       if (*p == '\n')
@@ -249,7 +246,12 @@ void printf(const char *fmt, ...) {
       break;
     }
   }
+}
 
+void printf(const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vprintf(fmt, ap);
   va_end(ap);
 }
 

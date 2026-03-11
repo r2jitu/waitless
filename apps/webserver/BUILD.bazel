@@ -1,3 +1,4 @@
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("//bazel/rules:unikernel.bzl", "unikernel_binary")
 
@@ -9,6 +10,23 @@ unikernel_binary(
     copts = [
         "-I.",
         "-Iinclude",
+    ],
+)
+
+# Native binary — same application code, POSIX TCP backend.
+# Build with:  bazel build --config=native //apps/webserver:webserver_native
+# Run with:   bazel run  --config=native //apps/webserver:webserver_native
+cc_binary(
+    name = "webserver_native",
+    srcs = ["main.cc"],
+    copts = [
+        "-I.",
+        "-Iinclude",
+    ],
+    deps = [
+        "//net:http",
+        "//uni:native",
+        "//uni:native_entry",
     ],
 )
 

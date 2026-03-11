@@ -1,11 +1,11 @@
 // UniKernel Example: HTTP Web Server
 //
-// This is an idiomatic C++ web server that runs directly on the unikernel.
-// All network I/O goes through direct function calls to the virtio-net
-// driver and TCP/IP stack — no kernel syscalls, no context switches.
+// This is an idiomatic C++ web server that runs both as a bare-metal unikernel
+// and as a native host process.  All logic above the uni:: layer is
+// identical in both modes — only the network and I/O backends differ.
 
-#include "kernel/serial.h"
 #include "net/http.h"
+#include "uni/uni.h"
 
 // --- Request Handlers ---
 
@@ -38,18 +38,13 @@ static net::http::Response handle_index(const net::http::Request &req) {
       "    |  direct function call\n"
       "    v\n"
       "HTTP parser (net::http)\n"
-      "    |  direct function call\n"
+      "    |  uni:: interface\n"
       "    v\n"
-      "TCP stack (net::tcp)\n"
-      "    |  direct function call\n"
+      "TCP stack (uni::tcp)\n"
+      "    |  unikernel: net::tcp + virtio-net\n"
+      "    |  native:    POSIX sockets\n"
       "    v\n"
-      "IP + ARP (net::ipv4, net::arp)\n"
-      "    |  direct function call\n"
-      "    v\n"
-      "Virtio-net driver (drivers::virtio_net)\n"
-      "    |  MMIO / port I/O\n"
-      "    v\n"
-      "Virtual NIC (hypervisor)\n"
+      "Network backend\n"
       "</pre>"
       "<h2>Endpoints</h2>"
       "<ul>"
@@ -72,7 +67,6 @@ static net::http::Response handle_health(const net::http::Request &req) {
 
 static net::http::Response handle_stats(const net::http::Request &req) {
   (void)req;
-  // In a real app, you'd gather actual stats from mm::, tcp::, etc.
   return net::http::Response::ok("application/json",
                                  "{\"connections_active\":0,"
                                  "\"total_requests\":0,"
@@ -89,24 +83,21 @@ static net::http::Response handle_default(const net::http::Request &req) {
 
 // The Server object is ~530KB (64 ActiveConn × ~8KB each + routes).
 // It must live in BSS (global static), not on the 64KB kernel stack.
-static net::http::Server server(80);
+static net::http::Server server;
 
 extern "C" int uni_main() {
-  serial::printf("Starting HTTP server on port 80...\n");
+  uni::log("Starting HTTP server...\n");
 
   server.route("/", handle_index);
   server.route("/health", handle_health);
   server.route("/stats", handle_stats);
   server.default_handler(handle_default);
 
-  serial::printf("Routes registered. Entering event loop.\n");
+  uni::log("Routes registered. Entering event loop.\n");
 
-  // This runs the event loop — polls virtio-net, processes TCP,
-  // parses HTTP requests, dispatches to handlers, sends responses.
-  // All via direct function calls. No syscalls anywhere.
-  server.run();
+  // uni::config_port(80): unikernel → 80; native → $PORT env var (or 80).
+  server.run(uni::config_port(80));
 
-  // If we reach here, the server exited (only via check_shutdown)
-  serial::printf("[uni_main] server.run() returned — shutting down\n");
+  uni::log("[uni_main] server.run() returned — shutting down\n");
   return 0;
 }

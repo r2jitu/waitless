@@ -3,8 +3,7 @@ load("@rules_cc//cc:cc_library.bzl", "cc_library")
 package(default_visibility = ["//visibility:public"])
 
 # Pure networking types (byte-order helpers, IP/MAC addresses, checksums).
-# No hardware or kernel dependencies — can be compiled for the host toolchain
-# and used in unit tests.
+# No hardware or kernel dependencies — can be compiled for the host toolchain.
 cc_library(
     name = "types",
     srcs = ["types.cc"],
@@ -12,15 +11,17 @@ cc_library(
     copts = ["-I.", "-Iinclude"],
 )
 
+# Bare-metal network stack: Ethernet, ARP, IPv4, TCP, DHCP.
+# Depends on kernel/serial, kernel/mm, and the virtio-net driver.
+# Compiled only for unikernel targets.
 cc_library(
-    name = "net",
+    name = "stack",
     srcs = [
         "ethernet.cc",
         "arp.cc",
         "ipv4.cc",
         "tcp.cc",
         "dhcp.cc",
-        "http.cc",
     ],
     hdrs = [
         "types.h",
@@ -29,7 +30,6 @@ cc_library(
         "ipv4.h",
         "tcp.h",
         "dhcp.h",
-        "http.h",
     ],
     deps = [
         ":types",
@@ -39,5 +39,31 @@ cc_library(
     copts = [
         "-I.",
         "-Iinclude",
+    ],
+)
+
+# HTTP/1.1 server: request parsing, routing, event loop.
+# Depends only on the platform interface — not on the bare-metal stack.
+# Compiles for both unikernel and native targets.
+cc_library(
+    name = "http",
+    srcs = ["http.cc"],
+    hdrs = ["http.h"],
+    deps = [
+        "//uni:uni",
+    ],
+    copts = [
+        "-I.",
+        "-Iinclude",
+    ],
+)
+
+# Convenience alias: the full network library (stack + HTTP).
+# Used by unikernel_binary() in bazel/rules/unikernel.bzl.
+cc_library(
+    name = "net",
+    deps = [
+        ":stack",
+        ":http",
     ],
 )

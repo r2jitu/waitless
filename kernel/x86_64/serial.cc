@@ -164,12 +164,9 @@ void puts(const char *s) {
   }
 }
 
-void printf(const char *fmt, ...) {
+void vprintf(const char *fmt, va_list args) {
   if (!fmt)
     return;
-
-  va_list args;
-  va_start(args, fmt);
 
   while (*fmt) {
     if (*fmt != '%') {
@@ -267,7 +264,7 @@ void printf(const char *fmt, ...) {
     }
     case '\0': {
       // Format string ended with a trailing '%'
-      goto done;
+      return;
     }
     default: {
       // Unknown format specifier — print it literally
@@ -279,8 +276,12 @@ void printf(const char *fmt, ...) {
 
     fmt++;
   }
+}
 
-done:
+void printf(const char *fmt, ...) {
+  va_list args;
+  va_start(args, fmt);
+  vprintf(fmt, args);
   va_end(args);
 }
 

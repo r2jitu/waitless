@@ -7,4 +7,5 @@ bazel_dep(name = "platforms", version = "0.0.10")
 register_toolchains(
     "//bazel/toolchain:unikernel_cc_toolchain_x86_64",
     "//bazel/toolchain:unikernel_cc_toolchain_aarch64",
+    "//bazel/toolchain:native_cc_toolchain_macos_arm64",
 )

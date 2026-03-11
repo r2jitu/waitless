@@ -1,0 +1,50 @@
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# ---- Header-only interface ---------------------------------------------------
+# All code that uses uni:: depends on this target.
+# The actual implementation (unikernel or native) is linked in by the binary.
+
+cc_library(
+    name = "uni",
+    hdrs = ["uni.h"],
+    copts = ["-I."],
+)
+
+# ---- Unikernel implementation ------------------------------------------------
+# Delegates to kernel/serial, net/tcp, kernel/arch, and drivers/virtio_net.
+# Linked into unikernel binaries (via unikernel.bzl).
+
+cc_library(
+    name = "unikernel",
+    srcs = ["unikernel.cc"],
+    deps = [
+        ":uni",
+        "//drivers:virtio_net",
+        "//kernel:arch_h",
+        "//kernel:core",
+        "//net:stack",
+    ],
+    copts = ["-I."],
+)
+
+# ---- Native implementation ---------------------------------------------------
+# Uses POSIX sockets + stdio.  Linked into the native binary.
+
+cc_library(
+    name = "native",
+    srcs = ["native.cc"],
+    deps = [":uni"],
+    copts = ["-I."],
+)
+
+# ---- Native entry point ------------------------------------------------------
+# Provides int main() → uni_main().  Linked into the native binary.
+
+cc_library(
+    name = "native_entry",
+    srcs = ["native_main.cc"],
+    deps = [":native"],
+    copts = ["-I."],
+)

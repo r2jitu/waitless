@@ -8,15 +8,10 @@
 //   server.default_handler(my_404_handler);
 //   server.run();   // blocks forever — this is the event loop
 
+#include "uni/uni.h"
+
 #include <stddef.h>
 #include <stdint.h>
-
-// Forward declaration to avoid circular includes with net/tcp.h
-namespace net {
-namespace tcp {
-struct Connection;
-}
-} // namespace net
 
 namespace net {
 namespace http {
@@ -75,9 +70,9 @@ public:
   // Handler called when no route matches.
   void default_handler(Handler handler);
 
-  // Run the server event loop.  This function never returns under normal
-  // operation; it polls virtio-net → TCP → dispatches HTTP → sends response.
-  void run();
+  // Run the server event loop.  Blocks until a shutdown signal is received.
+  // port_override=0 (default) uses the port passed to the constructor.
+  void run(uint16_t port_override = 0);
 
 private:
   // ---- Configuration -----
@@ -93,10 +88,9 @@ private:
   Handler default_handler_ = nullptr;
 
   // ---- Active connection tracking -----
-  // We handle up to 64 simultaneous HTTP connections (sufficient for a
-  // unikernel — we're not doing thousands of idle keep-alive connections).
+  // We handle up to 64 simultaneous HTTP connections.
   struct ActiveConn {
-    net::tcp::Connection *conn = nullptr;
+    uni::tcp::Connection *conn = nullptr;
     char buf[8192];
     size_t buf_len = 0;
     bool in_use = false;
@@ -105,10 +99,9 @@ private:
   ActiveConn active_[MAX_ACTIVE];
 
   // ---- Helpers -----
-  // Returns number of bytes consumed (>0) on success, 0 if incomplete.
   size_t parse_request(const char *data, size_t len, Request *req) const;
   Handler find_handler(const char *path) const;
-  void send_response(net::tcp::Connection *conn, const Response &resp,
+  void send_response(uni::tcp::Connection *conn, const Response &resp,
                      bool keep_alive) const;
   const char *status_text(int status) const;
   ActiveConn *alloc_active();
@@ -117,5 +110,3 @@ private:
 
 } // namespace http
 } // namespace net
-
-#include "net/tcp.h"

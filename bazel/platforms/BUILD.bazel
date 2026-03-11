@@ -33,6 +33,15 @@ platform(
     ],
 )
 
+# Native macOS arm64 — for building host binaries (benchmarks, dev tools).
+platform(
+    name = "native_macos_arm64",
+    constraint_values = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:macos",
+    ],
+)
+
 # ── config_setting helpers used in select() expressions ──────────────────────
 config_setting(
     name = "x86_64",

@@ -53,6 +53,7 @@ PORT_QEMU="$((BENCH_PORT + 1))"
 PORT_DOCKER="$((BENCH_PORT + 2))"
 PORT_NATIVE="$((BENCH_PORT + 3))"
 PORT_X86="$((BENCH_PORT + 4))"
+PORT_WEBSERVER_NATIVE="$((BENCH_PORT + 5))"
 
 # ── State ────────────────────────────────────────────────────────────────────
 QEMU_PID=""
@@ -214,7 +215,7 @@ check_prereqs() {
     fi
 
     # Check all benchmark ports are free
-    for _p in "$PORT_VZ" "$PORT_QEMU" "$PORT_X86" "$PORT_DOCKER" "$PORT_NATIVE"; do
+    for _p in "$PORT_VZ" "$PORT_QEMU" "$PORT_X86" "$PORT_DOCKER" "$PORT_NATIVE" "$PORT_WEBSERVER_NATIVE"; do
         if lsof -i ":${_p}" -sTCP:LISTEN >/dev/null 2>&1; then
             die "Port ${_p} is already in use.  Set BENCH_PORT=<other base port>."
         fi
@@ -410,6 +411,40 @@ bench_docker_server() {
     echo ""
 }
 
+# ── Benchmark: webserver_native (same webserver code, POSIX backend) ──────────
+bench_webserver_native() {
+    local url="http://127.0.0.1:${PORT_WEBSERVER_NATIVE}${ENDPOINT}"
+    wait_port_pool
+    echo "==> [${STEP_WEBSERVER_NATIVE}/${TOTAL}] webserver_native  (same code, POSIX TCP, no VM)"
+
+    echo "  Building webserver_native..."
+    cd "$PROJECT_ROOT"
+    bazel build --config=native //apps/webserver:webserver_native 2>&1 | \
+        grep -E '(INFO|ERROR|WARNING|Target)' | tail -3 || true
+
+    local bin="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver_native"
+    if [ ! -f "$bin" ]; then
+        echo "  Binary not found — skipping"; echo ""; return 0
+    fi
+
+    PORT="$PORT_WEBSERVER_NATIVE" "$bin" >/dev/null 2>&1 &
+    SERVER_PID=$!
+
+    if ! wait_ready "$PORT_WEBSERVER_NATIVE" 10 "$SERVER_PID"; then
+        kill -TERM "$SERVER_PID" 2>/dev/null; SERVER_PID=""
+        echo "  Skipping webserver_native benchmark."; echo ""; return 0
+    fi
+
+    local rps p50 p99
+    run_wrk "webserver_native" rps p50 p99 "$url"
+
+    kill -TERM "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true
+    SERVER_PID=""
+
+    record_result "webserver_native (POSIX, no VM)" "$rps" "$p50" "$p99"
+    echo ""
+}
+
 # ── Benchmark: bench_server native on macOS ───────────────────────────────────
 bench_native_server() {
     local url="http://127.0.0.1:${PORT_NATIVE}${ENDPOINT}"
@@ -462,8 +497,8 @@ print_results() {
 # ── Entry point ───────────────────────────────────────────────────────────────
 echo ""
 echo "══════════════════════════════════════════════════════════════════════"
-echo "  HTTP Server Benchmark  (same server code, four environments)"
-echo "  Unikernel VZ · Unikernel QEMU · Linux/Docker · macOS (native)"
+echo "  HTTP Server Benchmark  (same server code, five environments)"
+echo "  Unikernel VZ · Unikernel QEMU · Linux/Docker · webserver_native · macOS (native)"
 echo "══════════════════════════════════════════════════════════════════════"
 echo ""
 
@@ -488,6 +523,7 @@ if [ "$HAS_QEMU_X86" = true ] && [ "$HOST_ARCH" != "x86_64" ]; then
     STEP_UNIKERNEL_X86=$NEXT_STEP; NEXT_STEP=$((NEXT_STEP + 1))
 fi
 STEP_DOCKER=$NEXT_STEP; NEXT_STEP=$((NEXT_STEP + 1))
+STEP_WEBSERVER_NATIVE=$NEXT_STEP; NEXT_STEP=$((NEXT_STEP + 1))
 STEP_NATIVE=$NEXT_STEP; NEXT_STEP=$((NEXT_STEP + 1))
 TOTAL=$((NEXT_STEP - 1))
 
@@ -510,6 +546,8 @@ else
     echo "==> [${STEP_DOCKER}/${TOTAL}] bench_server in Docker — skipped (Docker not available)"
     echo ""
 fi
+
+bench_webserver_native
 
 if [ "$HAVE_CC" = true ]; then
     bench_native_server

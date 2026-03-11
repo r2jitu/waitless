@@ -2,25 +2,17 @@
 //
 // Design:
 //   • Non-blocking cooperative model: Server::run() is an infinite loop that
-//     calls tcp::poll() (which drives virtio_net::poll() +
-//     ethernet::receive()), checks for new connections via tcp::accept(), reads
-//     data from established connections, parses requests, dispatches to
-//     handlers, and sends responses.
+//     calls uni::tcp::poll() to drive the network stack, checks for new
+//     connections via uni::tcp::accept(), reads data from established
+//     connections, parses requests, dispatches to handlers, and sends responses.
 //   • HTTP/1.1 keep-alive: connections stay open after each response and serve
 //     multiple requests.  The client signals close via "Connection: close"
-//     header. This avoids TCP connection churn and ephemeral port exhaustion
-//     under load.
+//     header.
 //   • Zero copies at the app level: the TCP receive buffer is read directly
-//   into
-//     the request parser — no extra memcpy between kernel and "user" space,
-//     because there is no user space.
+//     into the request parser — no extra memcpy between layers.
 
 #include "net/http.h"
-#include "drivers/virtio_net.h"
-#include "kernel/arch.h"
-#include "kernel/mm.h"
-#include "kernel/serial.h"
-#include "net/tcp.h"
+#include "uni/uni.h"
 
 extern "C" size_t strlen(const char *s);
 extern "C" int strcmp(const char *a, const char *b);
@@ -35,8 +27,7 @@ namespace http {
 
 // ---- Helpers ----------------------------------------------------------------
 
-// Minimal snprintf-like formatting into a fixed buffer.
-// Only used internally for response headers.
+// Minimal integer formatter into a fixed buffer. Returns number of chars written.
 static int fmt_int(char *buf, size_t buflen, int n) {
   if (buflen == 0)
     return 0;
@@ -57,7 +48,6 @@ static int fmt_int(char *buf, size_t buflen, int n) {
   if (neg)
     tmp[len++] = '-';
 
-  // Reverse into buf
   int out = 0;
   for (int i = len - 1; i >= 0 && (size_t)out < buflen - 1; --i)
     buf[out++] = tmp[i];
@@ -119,7 +109,7 @@ Server::Server(uint16_t port) : port_(port), route_count_(0) {
 
 void Server::route(const char *path, Handler handler) {
   if (route_count_ >= MAX_ROUTES) {
-    serial::printf("http: too many routes (max %d)\n", MAX_ROUTES);
+    uni::log("http: too many routes (max %d)\n", MAX_ROUTES);
     return;
   }
   strncpy(routes_[route_count_].path, path, sizeof(routes_[0].path) - 1);
@@ -149,36 +139,21 @@ void Server::free_active(ActiveConn *ac) {
 
 const char *Server::status_text(int status) const {
   switch (status) {
-  case 200:
-    return "OK";
-  case 201:
-    return "Created";
-  case 204:
-    return "No Content";
-  case 301:
-    return "Moved Permanently";
-  case 302:
-    return "Found";
-  case 304:
-    return "Not Modified";
-  case 400:
-    return "Bad Request";
-  case 401:
-    return "Unauthorized";
-  case 403:
-    return "Forbidden";
-  case 404:
-    return "Not Found";
-  case 405:
-    return "Method Not Allowed";
-  case 500:
-    return "Internal Server Error";
-  case 501:
-    return "Not Implemented";
-  case 503:
-    return "Service Unavailable";
-  default:
-    return "Unknown";
+  case 200: return "OK";
+  case 201: return "Created";
+  case 204: return "No Content";
+  case 301: return "Moved Permanently";
+  case 302: return "Found";
+  case 304: return "Not Modified";
+  case 400: return "Bad Request";
+  case 401: return "Unauthorized";
+  case 403: return "Forbidden";
+  case 404: return "Not Found";
+  case 405: return "Method Not Allowed";
+  case 500: return "Internal Server Error";
+  case 501: return "Not Implemented";
+  case 503: return "Service Unavailable";
+  default:  return "Unknown";
   }
 }
 
@@ -198,13 +173,12 @@ Handler Server::find_handler(const char *path) const {
 }
 
 // ---- HTTP request parser ----------------------------------------------------
-// Parses the raw byte stream in [data, data+len).
-// Returns true if a complete HTTP/1.x request has been parsed into *req.
+// Returns bytes consumed (> 0) when a complete request is parsed, 0 if incomplete.
 
 size_t Server::parse_request(const char *data, size_t len, Request *req) const {
   memset(req, 0, sizeof(*req));
 
-  // Find the end of the header section ("\r\n\r\n")
+  // Find end of headers ("\r\n\r\n")
   const char *header_end = nullptr;
   for (size_t i = 0; i + 3 < len; ++i) {
     if (data[i] == '\r' && data[i + 1] == '\n' && data[i + 2] == '\r' &&
@@ -219,27 +193,13 @@ size_t Server::parse_request(const char *data, size_t len, Request *req) const {
   // Parse request line: "METHOD /path HTTP/1.x\r\n"
   const char *p = data;
 
-  // Method
-  if (strncmp(p, "GET ", 4) == 0) {
-    req->method = Request::GET;
-    p += 4;
-  } else if (strncmp(p, "POST ", 5) == 0) {
-    req->method = Request::POST;
-    p += 5;
-  } else if (strncmp(p, "PUT ", 4) == 0) {
-    req->method = Request::PUT;
-    p += 4;
-  } else if (strncmp(p, "DELETE ", 7) == 0) {
-    req->method = Request::DELETE;
-    p += 7;
-  } else if (strncmp(p, "HEAD ", 5) == 0) {
-    req->method = Request::HEAD;
-    p += 5;
-  } else {
-    req->method = Request::UNKNOWN;
-  }
+  if (strncmp(p, "GET ", 4) == 0)         { req->method = Request::GET;     p += 4; }
+  else if (strncmp(p, "POST ", 5) == 0)   { req->method = Request::POST;    p += 5; }
+  else if (strncmp(p, "PUT ", 4) == 0)    { req->method = Request::PUT;     p += 4; }
+  else if (strncmp(p, "DELETE ", 7) == 0) { req->method = Request::DELETE;  p += 7; }
+  else if (strncmp(p, "HEAD ", 5) == 0)   { req->method = Request::HEAD;    p += 5; }
+  else                                     { req->method = Request::UNKNOWN;         }
 
-  // Path (up to space or end of line)
   int path_len = 0;
   while (*p && *p != ' ' && *p != '\r' && *p != '\n' &&
          path_len < (int)sizeof(req->path) - 1) {
@@ -247,32 +207,25 @@ size_t Server::parse_request(const char *data, size_t len, Request *req) const {
   }
   req->path[path_len] = '\0';
 
-  // Skip to end of request line
-  while (*p && *p != '\n')
-    ++p;
-  if (*p == '\n')
-    ++p;
+  while (*p && *p != '\n') ++p;
+  if (*p == '\n') ++p;
 
-  // Parse header lines until the blank line
+  // Parse header lines
   while (p < header_end) {
     if (*p == '\r' || *p == '\n')
       break;
 
-    // Header name
     int ni = 0;
     if (req->header_count < 16) {
       char *hname = req->headers[req->header_count].name;
-      char *hval = req->headers[req->header_count].value;
+      char *hval  = req->headers[req->header_count].value;
 
       while (*p && *p != ':' && *p != '\r' && ni < 63)
         hname[ni++] = *p++;
       hname[ni] = '\0';
 
-      // Skip ": " and optional spaces
-      while (*p == ':' || *p == ' ')
-        ++p;
+      while (*p == ':' || *p == ' ') ++p;
 
-      // Header value
       int vi = 0;
       while (*p && *p != '\r' && *p != '\n' && vi < 255)
         hval[vi++] = *p++;
@@ -281,18 +234,13 @@ size_t Server::parse_request(const char *data, size_t len, Request *req) const {
       ++req->header_count;
     }
 
-    // Skip to next line
-    while (*p && *p != '\n')
-      ++p;
-    if (*p == '\n')
-      ++p;
+    while (*p && *p != '\n') ++p;
+    if (*p == '\n') ++p;
   }
 
-  // Skip the blank line (\r\n)
   const char *body_start = header_end + 4;
   size_t consumed = (size_t)(body_start - data);
 
-  // Body (for POST/PUT)
   const char *cl = req->get_header("Content-Length");
   if (cl) {
     size_t body_len = 0;
@@ -303,7 +251,7 @@ size_t Server::parse_request(const char *data, size_t len, Request *req) const {
     }
     size_t avail = (size_t)(data + len - body_start);
     if (avail < body_len)
-      return 0; // body not fully received yet
+      return 0;
     if (body_len > sizeof(req->body) - 1)
       body_len = sizeof(req->body) - 1;
     memcpy(req->body, body_start, body_len);
@@ -317,26 +265,22 @@ size_t Server::parse_request(const char *data, size_t len, Request *req) const {
 
 // ---- Response sender --------------------------------------------------------
 
-void Server::send_response(net::tcp::Connection *conn, const Response &resp,
+void Server::send_response(uni::tcp::Connection *conn, const Response &resp,
                            bool keep_alive) const {
   size_t body_len = resp.body_len ? resp.body_len : strlen(resp.body);
 
-  // Build entire response (headers + body) in a single buffer so it goes out
-  // as one tcp::send — halving the number of TCP segments per response.
+  // Build headers + body in one buffer → single tcp::send → one TCP segment.
   char buf[2048];
   int len = 0;
 
-  // Helper: append string to buf
   auto append = [&](const char *s, size_t n = 0) {
-    if (n == 0)
-      n = strlen(s);
+    if (n == 0) n = strlen(s);
     if (len + (int)n < (int)sizeof(buf)) {
       memcpy(buf + len, s, n);
       len += (int)n;
     }
   };
 
-  // "HTTP/1.1 200 OK\r\n"
   append("HTTP/1.1 ");
   char num[12];
   fmt_int(num, sizeof(num), resp.status);
@@ -355,43 +299,39 @@ void Server::send_response(net::tcp::Connection *conn, const Response &resp,
   append("\r\n");
 
   append(keep_alive ? "Connection: keep-alive\r\n" : "Connection: close\r\n");
-
   append("\r\n");
 
-  if (body_len > 0) {
+  if (body_len > 0)
     append(resp.body, body_len);
-  }
 
-  tcp::send(conn, buf, (size_t)len);
+  uni::tcp::send(conn, buf, (size_t)len);
 }
 
 // ---- Event loop -------------------------------------------------------------
 
-void Server::run() {
-  // Create a TCP listener on our port
-  tcp::Connection *listener = tcp::listen(port_);
+void Server::run(uint16_t port_override) {
+  uint16_t port = port_override ? port_override : port_;
+  uni::tcp::Connection *listener = uni::tcp::listen(port);
   if (!listener) {
-    serial::printf("http: failed to create TCP listener on port %u\n",
-                   (unsigned)port_);
+    uni::log("http: failed to create TCP listener on port %u\n",
+                  (unsigned)port);
     return;
   }
 
-  serial::printf("http: listening on port %u\n", (unsigned)port_);
+  uni::log("http: listening on port %u\n", (unsigned)port);
 
   while (true) {
-    if (serial::check_shutdown()) {
-      serial::printf("http: shutdown requested — stopping server.\n");
+    if (uni::check_shutdown()) {
+      uni::log("http: shutdown requested — stopping server.\n");
       break;
     }
-    tcp::poll();
+    uni::tcp::poll();
 
     bool had_work = false;
 
     // ---- Accept new connections ----------------------------------------
-    // Drain all ready connections in one pass — not just one — so that
-    // connections queued in the TCP pool don't back up and hold slots.
     while (true) {
-      tcp::Connection *new_conn = tcp::accept(listener);
+      uni::tcp::Connection *new_conn = uni::tcp::accept(listener);
       if (!new_conn)
         break;
       had_work = true;
@@ -399,9 +339,8 @@ void Server::run() {
       if (ac) {
         ac->conn = new_conn;
       } else {
-        // No room — reject immediately
-        serial::printf("http: too many connections, dropping\n");
-        tcp::close(new_conn);
+        uni::log("http: too many connections, dropping\n");
+        uni::tcp::close(new_conn);
         break;
       }
     }
@@ -412,35 +351,30 @@ void Server::run() {
       if (!ac->in_use || !ac->conn)
         continue;
 
-      tcp::Connection *conn = ac->conn;
+      uni::tcp::Connection *conn = ac->conn;
 
-      // Connection died?
-      if (conn->state == tcp::State::CLOSED) {
+      if (uni::tcp::is_closed(conn)) {
         free_active(ac);
         had_work = true;
         continue;
       }
 
-      // Read data into our accumulation buffer
-      if (tcp::has_data(conn)) {
+      if (uni::tcp::has_data(conn)) {
         size_t avail = sizeof(ac->buf) - ac->buf_len;
         if (avail > 0) {
-          size_t got = tcp::recv(conn, ac->buf + ac->buf_len, avail);
+          size_t got = uni::tcp::recv(conn, ac->buf + ac->buf_len, avail);
           ac->buf_len += got;
           had_work = true;
         }
       }
 
-      // Try to parse a complete HTTP request
       if (ac->buf_len > 0) {
         Request req;
         size_t consumed = parse_request(ac->buf, ac->buf_len, &req);
         if (consumed > 0) {
-          // Check if client wants to close
           const char *conn_hdr = req.get_header("Connection");
           bool want_close = conn_hdr && str_iequal(conn_hdr, "close");
 
-          // Dispatch to the matching handler
           Handler h = find_handler(req.path);
           Response resp;
           if (h) {
@@ -453,58 +387,35 @@ void Server::run() {
           had_work = true;
 
           if (want_close) {
-            tcp::close(conn);
+            uni::tcp::close(conn);
             free_active(ac);
           } else {
-            // Keep-alive: shift unconsumed bytes and continue
             size_t remaining = ac->buf_len - consumed;
-            if (remaining > 0) {
+            if (remaining > 0)
               memcpy(ac->buf, ac->buf + consumed, remaining);
-            }
             ac->buf_len = remaining;
           }
         } else if (ac->buf_len >= sizeof(ac->buf)) {
-          // Buffer full and still no complete request — give up
-          tcp::close(conn);
+          uni::tcp::close(conn);
           free_active(ac);
         }
       }
     }
 
-    // If we did nothing this iteration, wait for the next event.
     if (!had_work) {
-      if (virtio_net::irq_idle_supported()) {
-        // NAPI-style idle: the IRQ handler disabled device notifications,
-        // so no interrupts fired during polling.  Now re-enable them
-        // before sleeping so the next completion wakes us.
-        //
-        // Order matters for race-freedom:
-        //   1. mask_irq() — prevent handler from running
-        //   2. arm_rx_interrupts() — tell device to signal again
-        //   3. has_pending_rx() — check if data arrived meanwhile
-        //   4. WFI — sleep (wakes on pending GIC interrupt even when masked)
-        //   5. unmask_irq() — handler runs, disables notifications, acks
-        arch::mask_irq();
-        virtio_net::arm_rx_interrupts();
-        if (!virtio_net::has_pending_rx()) {
-          arch::idle();
-        }
-        arch::unmask_irq();
-      } else {
-        arch::cpu_relax();
-      }
+      uni::wait_for_events();
     }
   }
 
-  // Graceful shutdown: close all active connections, then the listener.
+  // Graceful shutdown
   for (int i = 0; i < MAX_ACTIVE; ++i) {
     if (active_[i].in_use && active_[i].conn) {
-      tcp::close(active_[i].conn);
+      uni::tcp::close(active_[i].conn);
       free_active(&active_[i]);
     }
   }
-  tcp::close(listener);
-  serial::printf("http: server stopped.\n");
+  uni::tcp::close(listener);
+  uni::log("http: server stopped.\n");
 }
 
 } // namespace http

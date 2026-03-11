@@ -29,7 +29,7 @@
 #include "kernel/aarch64/mmu.h"
 #endif
 
-// Provided by the user's application (e.g. apps/webserver/main.cc)
+// Provided by the user's application (e.g. apps/webserver/main.cc).
 extern "C" int uni_main();
 
 // Linker-generated symbols
