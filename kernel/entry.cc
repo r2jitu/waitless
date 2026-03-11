@@ -143,6 +143,13 @@ static void kernel_boot(boot::BootInfo *info) {
     serial::printf("[INIT] Interrupt-driven idle...\n");
     virtio_net::enable_irq();
 #if defined(__aarch64__)
+    // Enable the virtual timer PPI (INTID 27) in the GIC so that the 100ms
+    // one-shot timer inside arch::idle() can wake WFI.  On GICv2 (QEMU) all
+    // PPIs are disabled by init_gicv2(); without this explicit enable the
+    // timer fires but the GIC never asserts an interrupt to break WFI.
+    if (fdt::info().gic_dist_base != 0) {
+      exceptions::enable_timer_wakeup();
+    }
     // Unmask only IRQ (DAIF.I bit 1 → mask 0x2).  Do NOT unmask FIQ or
     // SError — VZ.framework uses FIQ for hypervisor signaling and clearing
     // DAIF.F crashes the VM.

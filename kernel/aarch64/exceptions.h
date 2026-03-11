@@ -38,4 +38,8 @@ void init();
 // Register a handler for IRQ number `irq`.
 void register_irq(uint32_t irq, void (*handler)(uint32_t irq));
 
+// Enable INTID 27 (virtual timer PPI) in the GIC so that the one-shot timer
+// inside arch::idle() can wake WFI.  Must be called after init().
+void enable_timer_wakeup();
+
 } // namespace exceptions

@@ -241,6 +241,22 @@ void init() {
 // GICv3 redistributor SGI frame offset (PPIs/SGIs live here, not in GICD)
 static constexpr uint32_t GICR_SGI_BASE = 0x10000;
 
+// Timer PPI handler — disables the virtual timer so it doesn't re-fire
+// after unmask_irq().  idle() arms it fresh on each call.
+static void timer_wakeup_handler(uint32_t /*irq*/) {
+  asm volatile("msr cntv_ctl_el0, %0" ::"r"((uint64_t)0) : "memory");
+}
+
+void enable_timer_wakeup() {
+  // Registering INTID 27 enables it in the GIC distributor/redistributor.
+  // Required on GICv2 (QEMU): GICD_ICENABLER0 clears all PPIs at init time;
+  // without an explicit enable, the timer fires at the CPU level but the GIC
+  // never asserts an interrupt to wake WFI.
+  // On GICv3 (VZ) it's already enabled in the pre-configured vGIC, but the
+  // write is idempotent (ISENABLER is a set-enable register).
+  register_irq(27, timer_wakeup_handler);
+}
+
 void register_irq(uint32_t irq, void (*handler)(uint32_t)) {
   if (irq >= MAX_IRQS)
     return;
