@@ -1,14 +1,13 @@
 #pragma once
 
-// drivers/pci.h -- PCI bus enumeration via Configuration Space Access Mechanism
-// #1
+// drivers/pci.h -- PCI bus enumeration
 //
 // This is a library, not a kernel module. Applications call these functions
 // directly in the same address space -- no syscalls, no mode switches.
 //
-// PCI configuration space is accessed through two I/O ports:
-//   0xCF8 (CONFIG_ADDRESS) -- write the address of the register to access
-//   0xCFC (CONFIG_DATA)    -- read/write the 32-bit data at that address
+// Config space access is arch-specific (implemented in pci.cc):
+//   x86_64:  Configuration Space Access Mechanism #1 (I/O ports 0xCF8/0xCFC)
+//   aarch64: ECAM (Enhanced Configuration Access Mechanism, memory-mapped)
 
 #include <stddef.h>
 #include <stdint.h>
@@ -18,9 +17,6 @@ namespace pci {
 // ============================================================================
 // Constants
 // ============================================================================
-
-static constexpr uint16_t CONFIG_ADDRESS = 0xCF8;
-static constexpr uint16_t CONFIG_DATA = 0xCFC;
 
 static constexpr int MAX_DEVICES = 64;
 
@@ -48,13 +44,16 @@ uint32_t read_config(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset);
 void write_config(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset,
                   uint32_t value);
 
-// 16-bit config read/write (ECAM only, ARM64).
+#if defined(__aarch64__)
+// 16-bit config read/write (ECAM/aarch64 only).
+// ECAM supports sub-dword granularity, unlike x86 I/O port config space.
 // Required for registers where a 32-bit write would clobber adjacent fields
 // (e.g. PCI Command vs Status, MSI-X Message Control vs cap_id/cap_next).
 uint16_t read_config16(uint8_t bus, uint8_t slot, uint8_t func,
                        uint8_t offset);
 void write_config16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset,
                     uint16_t value);
+#endif
 
 // ============================================================================
 // Bus enumeration

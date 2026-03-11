@@ -179,7 +179,10 @@ void write_config(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset,
   *ecam_ptr(bus, slot, func, offset) = value;
 }
 
-#else // x86_64: I/O port-based config access mechanism #1
+#else // x86_64: Configuration Space Access Mechanism #1 (I/O ports 0xCF8/0xCFC)
+
+static constexpr uint16_t CONFIG_ADDRESS = 0xCF8;
+static constexpr uint16_t CONFIG_DATA    = 0xCFC;
 
 uint32_t read_config(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset) {
   uint32_t address = (1u << 31) | ((uint32_t)bus << 16) |
@@ -296,7 +299,7 @@ void init() {
   serial::printf("PCI: scanning buses...\n");
 #endif
 
-  for (int bus = 0; bus < 1; bus++) { // DEBUG: bus 0 only to isolate crash
+  for (int bus = 0; bus < 1; bus++) { // QEMU/VZ virt machines use a single bus
     for (int slot = 0; slot < 32; slot++) {
       // Check function 0 first
       uint32_t reg0 = read_config(bus, slot, 0, 0x00);
