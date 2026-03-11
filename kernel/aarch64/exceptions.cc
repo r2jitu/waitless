@@ -263,15 +263,5 @@ void register_irq(uint32_t irq, void (*handler)(uint32_t)) {
   }
 }
 
-// Enable the ARM virtual timer PPI (INTID 27) for timer-based WFI wakeup.
-// The timer handler is a no-op — we just need WFI to wake up periodically.
-static void timer_irq(uint32_t /*irq*/) {
-  // Mask timer output to prevent retriggering before the next idle().
-  asm volatile("msr CNTV_CTL_EL0, %0" ::"r"((uint64_t)2)); // ENABLE=0,IMASK=1
-}
-
-void enable_timer_wakeup() {
-  register_irq(27, timer_irq);
-}
 
 } // namespace exceptions

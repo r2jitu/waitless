@@ -683,6 +683,8 @@ void enable_irq() {
 
 bool irq_idle_supported() { return irq_idle_available_; }
 
+bool has_pending_rx() { return rx_queue_.has_used(); }
+
 // ============================================================================
 // MAC address
 // ============================================================================

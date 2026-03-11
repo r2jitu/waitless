@@ -205,6 +205,9 @@ public:
   // Tell this queue that VIRTIO_RING_F_EVENT_IDX was negotiated.
   void set_event_idx(bool enabled) { event_idx_ = enabled; }
 
+  // Check if the device has posted any completions we haven't consumed yet.
+  bool has_used() const { return last_used_idx_ != used_->idx; }
+
   uint16_t size() const { return queue_size_; }
 
   // Get the descriptor at a given index (for reading buffer addresses)

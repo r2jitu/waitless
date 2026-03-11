@@ -250,6 +250,10 @@ static inline void udelay(uint64_t microseconds) {
 // Hint to the CPU to reduce power during a spin-wait loop.
 static inline void cpu_relax() { asm volatile("pause" ::: "memory"); }
 
+// IRQ mask/unmask — no-ops on x86 because idle() uses sti;hlt;cli internally.
+static inline void mask_irq() {}
+static inline void unmask_irq() {}
+
 // Yield the CPU until the next hardware interrupt.
 // STI enables interrupts; HLT halts until an IRQ fires (ISR runs, sends EOI);
 // CLI re-masks interrupts.  The STI;HLT pair is architecturally atomic — the

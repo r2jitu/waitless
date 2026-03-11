@@ -378,7 +378,6 @@ void Server::run() {
 
   serial::printf("http: listening on port %u\n", (unsigned)port_);
 
-  int idle_streak = 0;
   while (true) {
     if (serial::check_shutdown()) {
       serial::printf("http: shutdown requested — stopping server.\n");
@@ -473,21 +472,21 @@ void Server::run() {
     }
 
     // If we did nothing this iteration, wait for the next event.
-    // Spin briefly before sleeping — catches in-flight packets without
-    // adding timer/interrupt latency.  After the spin window, enter WFI
-    // (ARM64) or HLT (x86) to save power.
     if (!had_work) {
       if (virtio_net::irq_idle_supported()) {
-        if (++idle_streak > 16) {
+        // Race-free idle: mask IRQs, check if data arrived between the
+        // last poll() and now, then WFI.  On ARM64, WFI wakes on any
+        // pending GIC interrupt even with DAIF.I masked — the interrupt
+        // stays pending until unmask_irq() lets the handler run.
+        // On x86, mask/unmask are no-ops; idle() does sti;hlt;cli.
+        arch::mask_irq();
+        if (!virtio_net::has_pending_rx()) {
           arch::idle();
-          idle_streak = 0;
         }
-        // idle_streak <= 16: fall through to next loop iteration (spin)
+        arch::unmask_irq();
       } else {
         arch::cpu_relax();
       }
-    } else {
-      idle_streak = 0;
     }
   }
 

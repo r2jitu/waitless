@@ -87,6 +87,10 @@ void enable_irq();
 // next packet.  When false, fall back to arch::cpu_relax() (polling).
 bool irq_idle_supported();
 
+// Returns true if the RX used ring has unprocessed completions.
+// Used by the idle pattern to avoid sleeping when data is already available.
+bool has_pending_rx();
+
 // Shut down the device by resetting it.
 void shutdown();
 

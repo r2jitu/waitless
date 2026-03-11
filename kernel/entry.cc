@@ -143,10 +143,6 @@ static void kernel_boot(boot::BootInfo *info) {
     serial::printf("[INIT] Interrupt-driven idle...\n");
     virtio_net::enable_irq();
 #if defined(__aarch64__)
-    // Enable timer-based WFI wakeup (INTID 27) so idle() always wakes
-    // periodically — needed for VZ.framework where device interrupts may
-    // not reliably reach the guest.
-    exceptions::enable_timer_wakeup();
     // Unmask only IRQ (DAIF.I bit 1 → mask 0x2).  Do NOT unmask FIQ or
     // SError — VZ.framework uses FIQ for hypervisor signaling and clearing
     // DAIF.F crashes the VM.
