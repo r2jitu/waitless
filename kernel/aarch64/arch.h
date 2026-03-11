@@ -109,7 +109,26 @@ static inline void unmask_irq() { asm volatile("msr daifclr, #0x2" ::: "memory")
 // even when DAIF.I is set (IRQs masked at CPU level).  The caller uses the
 // mask→check→WFI→unmask pattern to avoid the race where an interrupt fires
 // and gets handled between the ring check and WFI.
-static inline void idle() { asm volatile("wfi" ::: "memory"); }
+//
+// A one-shot 100ms virtual timer ensures WFI wakes periodically so the
+// main loop can check serial input (e.g. Ctrl-C).  The timer is armed
+// here and disabled immediately after WFI returns; setting ENABLE=0
+// deasserts the GIC interrupt line, so no IRQ handler registration is
+// needed.  CNTV registers are accessible from EL1 without hypervisor
+// traps in standard ARM virtualization (unlike CNTP).
+static inline void idle() {
+  uint64_t freq;
+  asm volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+  uint64_t tval = freq / 10; // ~100ms
+  if (tval == 0)
+    tval = 1;
+  asm volatile("msr cntv_tval_el0, %0" :: "r"(tval) : "memory");
+  asm volatile("msr cntv_ctl_el0, %0" :: "r"((uint64_t)1) : "memory"); // ENABLE
+  asm volatile("isb" ::: "memory");
+  asm volatile("wfi" ::: "memory");
+  asm volatile("msr cntv_ctl_el0, %0" :: "r"((uint64_t)0) : "memory"); // DISABLE
+  asm volatile("isb" ::: "memory");
+}
 
 // ---- ARM generic timer (for busy-wait timeouts) ----------------------------
 
