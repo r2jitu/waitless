@@ -31,7 +31,7 @@ _ALL_LINK_ACTIONS = [
 def _impl(ctx):
     arch = ctx.attr.target_arch
 
-    if arch == "native_macos_arm64":
+    if arch == "aarch64_macos":
         # Native macOS: use system libtool (macOS archive format: libtool -static)
         # and Apple ld via the clang driver (no ELF linker wrapper needed).
         tool_paths = [
@@ -98,7 +98,7 @@ def _impl(ctx):
         toolchain_id  = "unikernel-aarch64-toolchain"
         target_system = "aarch64-linux-musl"
         target_cpu    = "aarch64"
-    elif arch == "native_macos_arm64":
+    elif arch == "aarch64_macos":
         # Native macOS arm64 binary — host toolchain, no bare-metal restrictions.
         arch_compile_flags = [
             "-Wall",
@@ -110,7 +110,7 @@ def _impl(ctx):
             "-g",
         ]
         linker_script = None
-        toolchain_id  = "native-macos-arm64-toolchain"
+        toolchain_id  = "aarch64-macos-toolchain"
         target_system = "aarch64-apple-darwin"
         target_cpu    = "aarch64"
     else:
@@ -148,7 +148,7 @@ def _impl(ctx):
         ],
     )
 
-    if arch == "native_macos_arm64":
+    if arch == "aarch64_macos":
         # Native macOS: clang driver defaults to Apple ld + system SDK.
         # No special linker flags needed — just link the C++ runtime.
         link_flag_list = ["-lc++"]
@@ -176,7 +176,7 @@ def _impl(ctx):
     )
 
     # aarch64 unikernel uses -fPIC/--pie for position-independent kernel.
-    # native_macos_arm64 uses default PIC (position-dependent MachO is fine).
+    # aarch64_macos (native) uses default PIC (position-dependent MachO is fine).
     # x86_64 uses -mcmodel=kernel (large PIE model) so PIC is not needed there.
     supports_pic_feature = feature(name = "supports_pic", enabled = (arch == "aarch64"))
 
@@ -191,7 +191,7 @@ def _impl(ctx):
         host_system_name = "aarch64-apple-darwin",
         target_system_name = target_system,
         target_cpu = target_cpu,
-        target_libc = "macosx" if arch == "native_macos_arm64" else "none",
+        target_libc = "macosx" if arch == "aarch64_macos" else "none",
         compiler = "clang",
         abi_version = "unknown",
         abi_libc_version = "unknown",
@@ -205,7 +205,7 @@ def _impl(ctx):
             "/opt/homebrew/Cellar/llvm/22.1.0/include/c++/v1",
             "/Library/Developer/CommandLineTools/SDKs/MacOSX26.sdk/usr/include",
             "/Library/Developer/CommandLineTools/usr/include",
-        ] if arch == "native_macos_arm64" else []),
+        ] if arch == "aarch64_macos" else []),
     )
 
 cc_toolchain_config = rule(
@@ -213,7 +213,7 @@ cc_toolchain_config = rule(
     attrs = {
         "target_arch": attr.string(
             default = "x86_64",
-            values = ["x86_64", "aarch64", "native_macos_arm64"],
+            values = ["x86_64", "aarch64", "aarch64_macos"],
         ),
     },
     provides = [CcToolchainConfigInfo],

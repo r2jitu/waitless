@@ -25,7 +25,7 @@ constraint_value(name = "native", constraint_setting = ":runtime")
 
 # Native macOS arm64 — builds host POSIX binaries via the custom macOS toolchain.
 platform(
-    name = "native_macos_arm64",
+    name = "aarch64_macos",
     constraint_values = [
         "@platforms//cpu:aarch64",
         "@platforms//os:macos",
@@ -36,7 +36,7 @@ platform(
 # Native Linux x86_64 — builds host POSIX binaries via the auto-detected
 # host toolchain (local_config_cc; no custom toolchain registration needed).
 platform(
-    name = "native_linux_x86_64",
+    name = "x86_64_linux",
     constraint_values = [
         "@platforms//cpu:x86_64",
         "@platforms//os:linux",

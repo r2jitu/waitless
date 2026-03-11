@@ -78,7 +78,7 @@ def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
 
     # Native POSIX binary — same application code, host OS TCP backend.
     # Only built when the platform has the runtime:native constraint
-    # (native_macos_arm64 or native_linux_x86_64); excluded from unikernel
+    # (aarch64_macos or x86_64_linux); excluded from unikernel
     # platforms (os:none) where the bare-metal toolchain would be selected.
     cc_binary(
         name = name + "_native",

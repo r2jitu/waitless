@@ -2,9 +2,9 @@ load(":cc_toolchain_config.bzl", "cc_toolchain_config")
 load("@rules_cc//cc/toolchains:cc_toolchain.bzl", "cc_toolchain")
 
 # Parameterised configs — one per target arch
-cc_toolchain_config(name = "x86_64_toolchain_config",             target_arch = "x86_64")
-cc_toolchain_config(name = "aarch64_toolchain_config",            target_arch = "aarch64")
-cc_toolchain_config(name = "native_macos_arm64_toolchain_config", target_arch = "native_macos_arm64")
+cc_toolchain_config(name = "x86_64_toolchain_config",    target_arch = "x86_64")
+cc_toolchain_config(name = "aarch64_toolchain_config",   target_arch = "aarch64")
+cc_toolchain_config(name = "aarch64_macos_toolchain_config", target_arch = "aarch64_macos")
 
 filegroup(name = "empty")
 
@@ -65,11 +65,11 @@ toolchain(
     toolchain_type = "@rules_cc//cc:toolchain_type",
 )
 
-# ---- native macOS arm64 -----------------------------------------------------
+# ---- aarch64 macOS (native host binary) ------------------------------------
 
 cc_toolchain(
-    name = "native_macos_arm64_impl",
-    toolchain_config = ":native_macos_arm64_toolchain_config",
+    name = "aarch64_macos_impl",
+    toolchain_config = ":aarch64_macos_toolchain_config",
     all_files = ":all_files",
     ar_files = ":all_files",
     as_files = ":all_files",
@@ -81,12 +81,12 @@ cc_toolchain(
 )
 
 toolchain(
-    name = "native_cc_toolchain_macos_arm64",
+    name = "cc_toolchain_aarch64_macos",
     exec_compatible_with = ["@platforms//os:macos"],
     target_compatible_with = [
         "@platforms//cpu:aarch64",
         "@platforms//os:macos",
     ],
-    toolchain = ":native_macos_arm64_impl",
+    toolchain = ":aarch64_macos_impl",
     toolchain_type = "@rules_cc//cc:toolchain_type",
 )
