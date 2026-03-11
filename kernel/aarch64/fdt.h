@@ -1,5 +1,5 @@
 #pragma once
-// kernel/fdt.h — Minimal Flattened Device Tree scanner
+// kernel/aarch64/fdt.h — Minimal Flattened Device Tree scanner
 //
 // Parses just enough of the DTB to discover MMIO device base addresses.
 // Called from kernel_main() (C++, after MMU) before serial::init().

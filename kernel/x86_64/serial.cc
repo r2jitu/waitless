@@ -1,4 +1,4 @@
-// kernel/serial.cc — Serial port driver implementation (COM1)
+// kernel/x86_64/serial.cc — Serial port driver implementation (COM1)
 //
 // Implements 115200 baud 8N1 serial output on COM1 (I/O port 0x3F8).
 // This is the primary debug output channel for the unikernel since there

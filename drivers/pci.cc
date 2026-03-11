@@ -9,7 +9,7 @@
 #include "kernel/arch.h"
 #if defined(__aarch64__)
 #include "kernel/aarch64/mmu.h"
-#include "kernel/fdt.h"
+#include "kernel/aarch64/fdt.h"
 #endif
 
 // PCI may run during serial::init() for early console discovery.

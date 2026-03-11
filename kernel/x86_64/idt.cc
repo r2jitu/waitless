@@ -1,4 +1,4 @@
-// kernel/idt.cc — Interrupt Descriptor Table implementation
+// kernel/x86_64/idt.cc — Interrupt Descriptor Table implementation
 //
 // This file sets up the full x86_64 IDT:
 //   1. Defines ISR stubs for all 256 vectors using assembly macros
@@ -14,9 +14,9 @@
 //   - isr_common calls isr_common_handler(InterruptFrame*)
 //   - On return, registers are restored and iretq returns to interrupted code
 
-#include "kernel/idt.h"
+#include "kernel/x86_64/idt.h"
 #include "kernel/arch.h"
-#include "kernel/gdt.h"
+#include "kernel/x86_64/gdt.h"
 #include "kernel/serial.h"
 
 namespace idt {

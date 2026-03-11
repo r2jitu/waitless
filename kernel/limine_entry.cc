@@ -15,7 +15,7 @@
 
 #if defined(__aarch64__)
 #include "kernel/aarch64/mmu.h"
-#include "kernel/fdt.h"
+#include "kernel/aarch64/fdt.h"
 #endif
 
 // Forward declarations

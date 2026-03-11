@@ -9,6 +9,9 @@ cc_library(
             "aarch64/arch.h",
             "aarch64/timer.h",
         ],
+        "//bazel/platforms:x86_64": [
+            "x86_64/arch.h",
+        ],
         "//conditions:default": [],
     }),
     copts = ["-I."],
@@ -17,10 +20,13 @@ cc_library(
 cc_library(
     name = "fdt",
     srcs = select({
-        "//bazel/platforms:aarch64": ["fdt.cc"],
+        "//bazel/platforms:aarch64": ["aarch64/fdt.cc"],
         "//conditions:default": [],
     }),
-    hdrs = ["fdt.h"],
+    hdrs = select({
+        "//bazel/platforms:aarch64": ["aarch64/fdt.h"],
+        "//conditions:default": ["aarch64/fdt.h"],
+    }),
     copts = ["-I."],
 )
 
@@ -61,9 +67,9 @@ cc_library(
         "mm.cc",
         "libc.cc",
     ] + select({
-        "//bazel/platforms:x86_64": ["serial.cc"],
+        "//bazel/platforms:x86_64": ["x86_64/serial.cc"],
         "//bazel/platforms:aarch64": ["aarch64/serial.cc"],
-        "//conditions:default": ["serial.cc"],
+        "//conditions:default": ["x86_64/serial.cc"],
     }),
     hdrs = [
         "serial.h",
@@ -84,24 +90,24 @@ cc_library(
     name = "arch_init",
     srcs = select({
         "//bazel/platforms:x86_64": [
-            "gdt.cc",
-            "idt.cc",
+            "x86_64/gdt.cc",
+            "x86_64/idt.cc",
         ],
         "//bazel/platforms:aarch64": ["aarch64/exceptions.cc"],
         "//conditions:default": [
-            "gdt.cc",
-            "idt.cc",
+            "x86_64/gdt.cc",
+            "x86_64/idt.cc",
         ],
     }),
     hdrs = select({
         "//bazel/platforms:x86_64": [
-            "gdt.h",
-            "idt.h",
+            "x86_64/gdt.h",
+            "x86_64/idt.h",
         ],
         "//bazel/platforms:aarch64": ["aarch64/exceptions.h"],
         "//conditions:default": [
-            "gdt.h",
-            "idt.h",
+            "x86_64/gdt.h",
+            "x86_64/idt.h",
         ],
     }),
     deps = [":core", ":fdt"],
@@ -111,9 +117,9 @@ cc_library(
 cc_library(
     name = "boot",
     srcs = select({
-        "//bazel/platforms:x86_64": ["boot.S"],
+        "//bazel/platforms:x86_64": ["x86_64/boot.S"],
         "//bazel/platforms:aarch64": ["aarch64/boot.S"],
-        "//conditions:default": ["boot.S"],
+        "//conditions:default": ["x86_64/boot.S"],
     }),
 )
 
@@ -126,7 +132,7 @@ cc_library(
 cc_library(
     name = "limine_entry",
     srcs = ["limine_entry.cc"] + select({
-        "//bazel/platforms:x86_64": ["limine_boot.S"],
+        "//bazel/platforms:x86_64": ["x86_64/limine_boot.S"],
         "//conditions:default": [],
     }),
     deps = [":boot_info", ":limine_proto", ":fdt"] + select({

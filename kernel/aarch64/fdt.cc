@@ -1,4 +1,4 @@
-// kernel/fdt.cc — Minimal FDT (Device Tree Blob) scanner for ARM64
+// kernel/aarch64/fdt.cc — Minimal FDT (Device Tree Blob) scanner for ARM64
 //
 // Walks the DTB structure block looking for nodes with specific compatible
 // strings and extracts their MMIO base addresses from the reg property.
@@ -9,7 +9,7 @@
 //   • Devices of interest are direct children of root (depth 1) or /soc (depth
 //   2)
 
-#include "kernel/fdt.h"
+#include "kernel/aarch64/fdt.h"
 
 #if defined(__aarch64__)
 

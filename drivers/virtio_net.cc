@@ -18,7 +18,7 @@
 #include "drivers/virtio_net.h"
 #include "drivers/virtio_pci.h"
 #include "kernel/arch.h"
-#include "kernel/fdt.h"
+#include "kernel/aarch64/fdt.h"
 #include "kernel/mm.h"
 #include "kernel/panic.h"
 #include "kernel/serial.h"
@@ -26,7 +26,7 @@
 #if defined(__aarch64__)
 #include "kernel/aarch64/exceptions.h"
 #elif defined(__x86_64__)
-#include "kernel/idt.h"
+#include "kernel/x86_64/idt.h"
 #endif
 
 extern "C" void *memcpy(void *dst, const void *src, size_t n);

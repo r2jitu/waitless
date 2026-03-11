@@ -1,6 +1,6 @@
 #pragma once
 
-// kernel/idt.h — Interrupt Descriptor Table interface
+// kernel/x86_64/idt.h — Interrupt Descriptor Table interface
 //
 // Sets up the x86_64 IDT with 256 entries for:
 //   - Vectors 0-31:  CPU exceptions

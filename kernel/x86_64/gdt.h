@@ -1,6 +1,6 @@
 #pragma once
 
-// kernel/gdt.h — Global Descriptor Table interface
+// kernel/x86_64/gdt.h — Global Descriptor Table interface
 //
 // Sets up the x86_64 GDT with kernel code/data segments and a TSS.
 // In long mode, most segmentation is ignored, but we still need:

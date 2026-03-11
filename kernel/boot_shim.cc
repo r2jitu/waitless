@@ -7,7 +7,7 @@
 #include "kernel/serial.h"
 
 #if defined(__aarch64__)
-#include "kernel/fdt.h"
+#include "kernel/aarch64/fdt.h"
 #endif
 
 namespace boot {

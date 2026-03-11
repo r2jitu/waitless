@@ -1,4 +1,4 @@
-// kernel/gdt.cc — Global Descriptor Table implementation
+// kernel/x86_64/gdt.cc — Global Descriptor Table implementation
 //
 // Sets up the flat-model GDT for x86_64 long mode:
 //   Entry 0: Null descriptor
@@ -9,7 +9,7 @@
 // After loading the GDTR, we reload CS via a far return and set all
 // data segment registers to the kernel data selector.
 
-#include "kernel/gdt.h"
+#include "kernel/x86_64/gdt.h"
 #include "kernel/arch.h"
 #include "kernel/serial.h"
 

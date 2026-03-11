@@ -22,7 +22,7 @@
 #include "drivers/pci.h"
 #include "drivers/virtio_console.h"
 #include "drivers/virtio_pci.h"
-#include "kernel/fdt.h"
+#include "kernel/aarch64/fdt.h"
 #include <stdarg.h>
 
 namespace serial {

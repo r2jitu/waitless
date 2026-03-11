@@ -11,7 +11,7 @@
 //   • gic_version == 0: no GIC found — polling mode only
 
 #include "kernel/aarch64/exceptions.h"
-#include "kernel/fdt.h"
+#include "kernel/aarch64/fdt.h"
 #include "kernel/panic.h"
 #include "kernel/serial.h"
 
