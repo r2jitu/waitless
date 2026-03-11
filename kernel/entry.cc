@@ -23,6 +23,7 @@
 #if defined(__x86_64__)
 #include "kernel/x86_64/gdt.h"
 #include "kernel/x86_64/idt.h"
+#include "kernel/x86_64/serial.h"
 #elif defined(__aarch64__)
 #include "kernel/aarch64/exceptions.h"
 #include "kernel/aarch64/mmu.h"

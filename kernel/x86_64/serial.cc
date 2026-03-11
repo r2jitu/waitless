@@ -6,6 +6,7 @@
 // the host terminal.
 
 #include "kernel/serial.h"
+#include "kernel/x86_64/serial.h"
 #include "kernel/arch.h"
 #include <stdarg.h>
 #include <stddef.h>
