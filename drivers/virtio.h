@@ -16,6 +16,7 @@
 #include <stdint.h>
 
 #include "drivers/pci.h"
+#include "kernel/arch.h"
 
 namespace virtio {
 
@@ -186,8 +187,23 @@ public:
   // Enable/disable device-to-driver interrupt notifications.
   // By default queues suppress interrupts (polling mode).
   // Call enable_interrupts() on the RX queue for interrupt-driven idle.
-  void enable_interrupts() { avail_->flags = 0; }
+  //
+  // With VIRTIO_RING_F_EVENT_IDX negotiated, the device ignores avail->flags
+  // and uses used_event (uint16 after avail->ring[queue_size]) to decide when
+  // to interrupt.  Setting used_event = used->idx triggers on the next
+  // completion.
+  void enable_interrupts() {
+    avail_->flags = 0;
+    if (event_idx_) {
+      volatile uint16_t *used_event = &avail_->ring[queue_size_];
+      *used_event = used_->idx;
+      arch::dsb_st(); // ensure used_event is visible before WFI/HLT
+    }
+  }
   void disable_interrupts() { avail_->flags = VIRTQ_AVAIL_F_NO_INTERRUPT; }
+
+  // Tell this queue that VIRTIO_RING_F_EVENT_IDX was negotiated.
+  void set_event_idx(bool enabled) { event_idx_ = enabled; }
 
   uint16_t size() const { return queue_size_; }
 
@@ -212,6 +228,7 @@ private:
   uint16_t queue_index_ = 0;    // This queue's index (for notify)
   bool is_mmio_ = false;        // true = virtio-mmio transport
   bool *desc_used_ = nullptr;   // Tracks which descriptors are in use
+  bool event_idx_ = false;      // VIRTIO_RING_F_EVENT_IDX negotiated
 };
 
 // ============================================================================

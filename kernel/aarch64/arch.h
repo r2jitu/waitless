@@ -100,11 +100,26 @@ static inline void virtio_write32(uint64_t base, uint32_t v) {
 // Hint to the CPU to reduce power during a spin-wait loop.
 static inline void cpu_relax() { asm volatile("yield" ::: "memory"); }
 
-// Suspend until the next interrupt or event.  Safe with DAIF.I=1: WFI wakes on
-// any pending IRQ regardless of masking (ARM ARM B2.2.7).  Under VZ/HVF/KVM,
-// HCR_EL2.IMO=1 ensures virtual IRQs from virtio devices trigger the wake-up.
-// No GIC reconfiguration is needed — the hypervisor's vGIC handles routing.
-static inline void idle() { asm volatile("wfi" ::: "memory"); }
+// Suspend until the next interrupt or event.  Arms the ARM virtual timer to
+// fire after ~1ms so WFI always wakes up periodically — this is the fallback
+// for environments (like Apple VZ.framework) where device interrupts don't
+// reliably wake the CPU.  The timer PPI (INTID 27) must be registered first
+// via exceptions::enable_timer_wakeup().
+static inline void idle() {
+  // Arm virtual timer: fire in ~1ms
+  uint64_t freq;
+  asm volatile("mrs %0, CNTFRQ_EL0" : "=r"(freq));
+  uint64_t tval = freq / 10000; // ~100µs
+  if (tval == 0)
+    tval = 1;
+  asm volatile("msr CNTV_TVAL_EL0, %0" ::"r"(tval));
+  asm volatile("msr CNTV_CTL_EL0, %0" ::"r"((uint64_t)1)); // ENABLE, unmask
+  asm volatile("isb" ::: "memory");
+  asm volatile("wfi" ::: "memory");
+  // Disable timer after wakeup (handler may have already masked it)
+  asm volatile("msr CNTV_CTL_EL0, %0" ::"r"((uint64_t)0));
+  asm volatile("isb" ::: "memory");
+}
 
 // ---- ARM generic timer (for busy-wait timeouts) ----------------------------
 

@@ -71,8 +71,8 @@ static constexpr int CF_GICV2 = 1 << 2;  // "arm,gic-400" / "arm,cortex-a15-gic"
 static constexpr int CF_PCI =
     1 << 3; // device_type="pci" or "pci-host-ecam-generic"
 static constexpr int CF_MEMORY =
-    1 << 4; // device_type="memory" — physical RAM range
-// GICv3 ("arm,gic-v3"): detected but intentionally NOT stored — skip GIC init.
+    1 << 4;                            // device_type="memory" — physical RAM range
+static constexpr int CF_GICV3 = 1 << 5; // "arm,gic-v3"
 
 // ---- Main parser -----------------------------------------------------------
 
@@ -98,10 +98,14 @@ void init(uint64_t dtb_addr) {
     uint64_t reg;               // first address from "reg" property
     uint64_t reg_size;          // first size from "reg" property
     bool has_reg;               // true once "reg" has been read
+    uint64_t reg2;              // second address (e.g. GICv3 GICR base)
+    bool has_reg2;              // true if second reg entry exists
     const uint8_t *ranges_data; // pointer into DTB for "ranges" property value
     uint32_t ranges_len;        // byte length of "ranges" value
     uint32_t irq;               // GIC IRQ ID parsed from "interrupts" property
     bool has_irq;               // true once "interrupts" has been read
+    const uint8_t *int_map_data; // "interrupt-map" property data
+    uint32_t int_map_len;        // "interrupt-map" property length
   };
   NodeState stack[MAX_DEPTH] = {};
   int depth = 0;
@@ -116,7 +120,7 @@ void init(uint64_t dtb_addr) {
     case FDT_BEGIN_NODE: {
       // Push a fresh node state for the new depth level.
       if (depth < MAX_DEPTH)
-        stack[depth] = {0, 0, 0, false, nullptr, 0, 0, false};
+        stack[depth] = {};
       depth++;
       // Skip the null-terminated node name.
       while (*p)
@@ -144,9 +148,16 @@ void init(uint64_t dtb_addr) {
             g_info.virtio_count++;
           }
 
-          // Only store GICv2 distributor base; skip GICv3 (no driver).
-          if ((ns.compat & CF_GICV2) && g_info.gic_dist_base == 0)
+          if ((ns.compat & CF_GICV2) && g_info.gic_dist_base == 0) {
             g_info.gic_dist_base = ns.reg;
+            g_info.gic_version = 2;
+          }
+
+          if ((ns.compat & CF_GICV3) && g_info.gic_dist_base == 0) {
+            g_info.gic_dist_base = ns.reg;
+            g_info.gic_redist_base = ns.has_reg2 ? ns.reg2 : 0;
+            g_info.gic_version = 3;
+          }
 
           if ((ns.compat & CF_PCI) && g_info.pcie_ecam_base == 0) {
             g_info.pcie_ecam_base = ns.reg;
@@ -171,6 +182,28 @@ void init(uint64_t dtb_addr) {
                     ((uint64_t)be32(e + 20) << 32) | be32(e + 24);
                 break;
               }
+            }
+          }
+
+          // Parse PCI interrupt-map: maps (slot, pin) → GIC INTID.
+          // Entry layout (10 cells = 40 bytes):
+          //   child_addr(3) + child_int(1) + parent_phandle(1)
+          //   + parent_addr(2) + parent_int(3 = type, irq_num, flags).
+          if ((ns.compat & CF_PCI) && ns.int_map_data &&
+              ns.int_map_len >= 40) {
+            for (uint32_t off = 0; off + 40 <= ns.int_map_len; off += 40) {
+              const uint8_t *e = ns.int_map_data + off;
+              uint32_t child_hi = be32(e);      // PCI address hi
+              // e+12: INTx pin (1=A..4=D), not needed for slot lookup
+              uint32_t gic_type = be32(e + 28); // 0=SPI, 1=PPI
+              uint32_t gic_irq = be32(e + 32);   // GIC irq_num
+              uint32_t slot = (child_hi >> 11) & 0x1F;
+              uint32_t intid =
+                  (gic_type == 0) ? gic_irq + 32 : gic_irq + 16;
+              // Store first interrupt mapping for each slot.
+              // PCI DT may use 1-based (1=INTA) or 0-based pin numbering.
+              if (slot < 8 && g_info.pci_irqs[slot] == 0)
+                g_info.pci_irqs[slot] = intid;
             }
           }
 
@@ -207,7 +240,8 @@ void init(uint64_t dtb_addr) {
             stack[d].compat |= CF_GICV2;
           if (strlist_has(vdata, vlen, "pci-host-ecam-generic"))
             stack[d].compat |= CF_PCI;
-          // "arm,gic-v3" is explicitly not flagged (skip GIC init).
+          if (strlist_has(vdata, vlen, "arm,gic-v3"))
+            stack[d].compat |= CF_GICV3;
         } else if (str_eq(pname, "device_type")) {
           // Canonical way to identify PCIe host bridge nodes.
           if (strlist_has(vdata, vlen, "pci"))
@@ -221,9 +255,18 @@ void init(uint64_t dtb_addr) {
           // Read size if present (next 2 cells after address).
           stack[d].reg_size = (vlen >= 16) ? be64_2cell(vdata + 8) : 0;
           stack[d].has_reg = true;
+          // Second reg entry (e.g. GICv3 redistributor base).
+          // Each entry is 16 bytes (#address-cells=2, #size-cells=2).
+          if (vlen >= 32) {
+            stack[d].reg2 = be64_2cell(vdata + 16);
+            stack[d].has_reg2 = true;
+          }
         } else if (str_eq(pname, "ranges") && vlen > 0) {
           stack[d].ranges_data = vdata;
           stack[d].ranges_len = vlen;
+        } else if (str_eq(pname, "interrupt-map")) {
+          stack[d].int_map_data = vdata;
+          stack[d].int_map_len = vlen;
         } else if (str_eq(pname, "interrupts") && vlen >= 12 &&
                    !stack[d].has_irq) {
           // GIC interrupt specifier: <type irq_num flags> (3 cells).

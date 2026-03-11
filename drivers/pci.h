@@ -48,6 +48,14 @@ uint32_t read_config(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset);
 void write_config(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset,
                   uint32_t value);
 
+// 16-bit config read/write (ECAM only, ARM64).
+// Required for registers where a 32-bit write would clobber adjacent fields
+// (e.g. PCI Command vs Status, MSI-X Message Control vs cap_id/cap_next).
+uint16_t read_config16(uint8_t bus, uint8_t slot, uint8_t func,
+                       uint8_t offset);
+void write_config16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset,
+                    uint16_t value);
+
 // ============================================================================
 // Bus enumeration
 // ============================================================================

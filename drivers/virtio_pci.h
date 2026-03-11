@@ -23,7 +23,10 @@ struct Device {
   volatile uint8_t *device_cfg;  // VIRTIO_PCI_CAP_DEVICE_CFG
   volatile uint8_t *isr_cfg;     // VIRTIO_PCI_CAP_ISR_CFG
   uint32_t notify_off_multiplier;
-  uint16_t virtio_device_type; // 1=net, 3=console, etc.
+  uint16_t virtio_device_type;   // 1=net, 3=console, etc.
+  volatile uint8_t *msix_table;  // MSI-X table base (nullptr if no MSI-X)
+  uint16_t msix_table_size;      // Number of MSI-X table entries
+  uint8_t msix_cap_off;          // PCI config offset of MSI-X capability
 };
 
 // Discover a modern virtio-pci device by virtio device type (1=net, 3=console).
@@ -63,5 +66,16 @@ uint32_t read_dev_cfg32(Device *dev, uint32_t offset);
 // Read (and acknowledge) the ISR status register.
 // Returns the ISR bits; reading clears the pending interrupt at the device.
 uint8_t read_isr(Device *dev);
+
+// ---- MSI-X support --------------------------------------------------------
+
+// Configure MSI-X with a single vector targeting GICv3 GICD_SETSPI_NSR.
+// Must be called after find() and before or after DRIVER_OK.
+// Returns true if MSI-X was successfully configured.
+bool setup_msix(Device *dev, uint64_t gic_dist_base, uint32_t intid);
+
+// Set/get the MSI-X vector for the currently selected queue.
+void set_queue_msix_vector(Device *dev, uint16_t vector);
+uint16_t get_queue_msix_vector(Device *dev);
 
 } // namespace virtio_pci

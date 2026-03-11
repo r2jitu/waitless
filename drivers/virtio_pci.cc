@@ -22,6 +22,7 @@ namespace virtio_pci {
 // ============================================================================
 
 static constexpr uint8_t PCI_CAP_ID_VNDR = 0x09;
+static constexpr uint8_t PCI_CAP_ID_MSIX = 0x11;
 
 // virtio_pci_cap cfg_type values
 static constexpr uint8_t VIRTIO_PCI_CAP_COMMON_CFG = 1;
@@ -126,6 +127,10 @@ static bool parse_capabilities(Device *dev) {
     uint8_t cap_vndr = hdr & 0xFF;
     uint8_t cap_next = (hdr >> 8) & 0xFF;
 
+    if (cap_vndr == PCI_CAP_ID_MSIX && dev->msix_cap_off == 0) {
+      dev->msix_cap_off = cap_ptr;
+    }
+
     if (cap_vndr == PCI_CAP_ID_VNDR) {
       // This is a virtio-specific capability
       uint8_t cfg_type = (hdr >> 24) & 0xFF;
@@ -211,6 +216,9 @@ Device *find(uint16_t virtio_device_type) {
   dev->isr_cfg = nullptr;
   dev->notify_off_multiplier = 0;
   dev->virtio_device_type = virtio_device_type;
+  dev->msix_table = nullptr;
+  dev->msix_table_size = 0;
+  dev->msix_cap_off = 0;
 
   // Enable bus mastering for DMA
   pci::enable_bus_mastering(*pci);
@@ -330,6 +338,52 @@ uint8_t read_isr(Device *dev) {
   if (!dev->isr_cfg)
     return 0;
   return r8(dev->isr_cfg, 0);
+}
+
+// ============================================================================
+// MSI-X support
+// ============================================================================
+
+// common_cfg offsets for MSI-X vector fields
+static constexpr int CC_CONFIG_MSIX_VECTOR = 0x10;
+static constexpr int CC_QUEUE_MSIX_VECTOR = 0x1a;
+
+void set_queue_msix_vector(Device *dev, uint16_t vector) {
+  w16(dev->common_cfg, CC_QUEUE_MSIX_VECTOR, vector);
+}
+
+uint16_t get_queue_msix_vector(Device *dev) {
+  return r16(dev->common_cfg, CC_QUEUE_MSIX_VECTOR);
+}
+
+bool setup_msix(Device *dev, uint64_t gic_dist_base, uint32_t intid) {
+  pci::Device *pci = dev->pci_dev;
+  if (dev->msix_cap_off == 0)
+    return false;
+
+  // Read MSI-X Message Control via 16-bit read at cap_off + 2.
+  // IMPORTANT: use 16-bit writes for Message Control — a 32-bit write
+  // to cap_off clobbers read-only cap_id/cap_next and crashes VZ.
+  uint16_t msg_ctrl =
+      pci::read_config16(pci->bus, pci->slot, pci->func,
+                         dev->msix_cap_off + 2);
+  uint16_t table_size = (msg_ctrl & 0x7FF) + 1;
+
+  // Enable MSI-X: set Enable bit (15), clear Function Mask (14).
+  // Do NOT write MSI-X table entries — VZ.framework manages MSI-X routing
+  // internally.  Writing GICD_SETSPI_NSR to the table crashes VZ.
+  msg_ctrl |= (1 << 15);
+  msg_ctrl &= ~(uint16_t)(1 << 14);
+  pci::write_config16(pci->bus, pci->slot, pci->func,
+                      dev->msix_cap_off + 2, msg_ctrl);
+
+  // Set config_msix_vector to vector 0
+  w16(dev->common_cfg, CC_CONFIG_MSIX_VECTOR, 0);
+
+  dev->msix_table_size = table_size;
+
+  serial::printf("virtio_pci: MSI-X enabled (%u vectors)\n", table_size);
+  return true;
 }
 
 } // namespace virtio_pci

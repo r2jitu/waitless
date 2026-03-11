@@ -144,6 +144,15 @@ __attribute__((unused)) static bool init_pci_modern() {
   virtio_pci::set_queue_addrs(pci_dev_, tx_desc, tx_avail, tx_used);
   virtio_pci::enable_queue(pci_dev_);
 
+  // If EVENT_IDX is negotiated, the device uses used_event instead of
+  // avail->flags to decide when to send interrupts.  Enable on RX queue
+  // so enable_interrupts() writes used_event correctly.
+  static constexpr uint32_t VIRTIO_RING_F_EVENT_IDX = (1U << 29);
+  if (guest_features & VIRTIO_RING_F_EVENT_IDX) {
+    rx_queue_.set_event_idx(true);
+    serial::printf("virtio_net: EVENT_IDX negotiated\n");
+  }
+
   // Read MAC from device-specific config
   for (int i = 0; i < 6; i++) {
     mac_[i] = virtio_pci::read_dev_cfg8(pci_dev_, i);
@@ -593,8 +602,12 @@ void shutdown() {
 
 #if defined(__aarch64__)
 static void virtio_net_irq(uint32_t /*irq*/) {
-  // Acknowledge the MMIO interrupt to de-assert the IRQ line.
-  if (io_base_ != 0 && pci_dev_ == nullptr) {
+  // Acknowledge the device interrupt to de-assert the IRQ line.
+  if (pci_dev_) {
+    // PCI modern: read ISR capability register (clears pending at device).
+    virtio_pci::read_isr(pci_dev_);
+  } else if (io_base_ != 0) {
+    // MMIO: read interrupt status + write ACK.
     uint32_t isr =
         arch::virtio_read32(io_base_ + virtio::mmio::INTERRUPT_STATUS);
     arch::virtio_write32(io_base_ + virtio::mmio::INTERRUPT_ACK, isr);
@@ -614,24 +627,49 @@ static bool irq_idle_available_ = false;
 
 void enable_irq() {
 #if defined(__aarch64__)
-  // Find the GIC IRQ ID for our virtio-mmio device from the FDT.
   const fdt::Info &fdt = fdt::info();
-  if (fdt.gic_dist_base != 0 && io_base_ != 0 && pci_dev_ == nullptr) {
-    // QEMU virtio-mmio with GIC: register IRQ handler + enable RX interrupts.
+
+  if (pci_dev_ != nullptr && fdt.gic_dist_base != 0) {
+    // PCI modern path (VZ.framework / QEMU modern PCI):
+    // Look up GIC INTID from FDT PCI interrupt-map.
+    uint8_t slot = pci_dev_->pci_dev->slot;
+    uint32_t intid = (slot < 8) ? fdt.pci_irqs[slot] : 0;
+
+    if (intid != 0) {
+      // Enable MSI-X so VZ.framework routes device interrupts to the vGIC.
+      // VZ only delivers interrupts via MSI-X, not legacy INTx.
+      // The hypervisor manages MSI-X routing internally — we just enable
+      // MSI-X and set queue vectors.
+      const char *mode = "INTx";
+      bool msix_ok =
+          virtio_pci::setup_msix(pci_dev_, fdt.gic_dist_base, intid);
+      if (msix_ok) {
+        virtio_pci::select_queue(pci_dev_, 0);
+        virtio_pci::set_queue_msix_vector(pci_dev_, 0);
+        virtio_pci::select_queue(pci_dev_, 1);
+        virtio_pci::set_queue_msix_vector(pci_dev_, 0);
+        mode = "MSI-X";
+      }
+
+      rx_queue_.enable_interrupts();
+      exceptions::register_irq(intid, virtio_net_irq);
+      irq_idle_available_ = true;
+      serial::printf(
+          "virtio_net: INTID %u registered (GICv%d, PCI slot %d, %s)\n",
+          intid, fdt.gic_version, slot, mode);
+    }
+  } else if (io_base_ != 0 && pci_dev_ == nullptr && fdt.gic_dist_base != 0) {
+    // MMIO path (QEMU virtio-mmio with GICv2).
     for (int i = 0; i < fdt.virtio_count; i++) {
       if (fdt.virtio_bases[i] == io_base_ && fdt.virtio_irqs[i] != 0) {
         rx_queue_.enable_interrupts();
         exceptions::register_irq(fdt.virtio_irqs[i], virtio_net_irq);
         irq_idle_available_ = true;
-        serial::printf("virtio_net: IRQ %u registered (GIC)\n",
+        serial::printf("virtio_net: IRQ %u registered (GICv2)\n",
                        fdt.virtio_irqs[i]);
         break;
       }
     }
-  } else {
-    // VZ or PCI modern without GIC: no reliable interrupt delivery path.
-    // Fall back to polling (cpu_relax); don't enable RX interrupts.
-    serial::printf("virtio_net: no GIC — polling mode (cpu_relax)\n");
   }
 #elif defined(__x86_64__)
   // Read PCI Interrupt Line register (offset 0x3C, low byte).
@@ -806,6 +844,13 @@ int poll(void (*callback)(const uint8_t *data, uint32_t len)) {
       arch::virtio_read8(io_base_ + virtio::REG_ISR_STATUS);
     }
 #endif
+
+    // Re-arm used_event so the device fires an interrupt on the next
+    // RX completion.  Required for VIRTIO_RING_F_EVENT_IDX; harmless
+    // for non-EVENT_IDX devices (just clears avail->flags again).
+    if (irq_idle_available_) {
+      rx_queue_.enable_interrupts();
+    }
   }
 
   return count;

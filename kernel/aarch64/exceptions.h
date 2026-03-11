@@ -38,4 +38,7 @@ void init();
 // Register a handler for IRQ number `irq`.
 void register_irq(uint32_t irq, void (*handler)(uint32_t irq));
 
+// Enable the ARM virtual timer PPI (INTID 27) for timer-based WFI wakeup.
+void enable_timer_wakeup();
+
 } // namespace exceptions

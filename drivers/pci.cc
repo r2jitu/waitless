@@ -66,13 +66,13 @@ static volatile uint16_t *ecam_ptr16(uint8_t bus, uint8_t slot, uint8_t func,
   return reinterpret_cast<volatile uint16_t *>(addr);
 }
 
-static uint16_t read_config16(uint8_t bus, uint8_t slot, uint8_t func,
-                              uint8_t offset) {
+uint16_t read_config16(uint8_t bus, uint8_t slot, uint8_t func,
+                       uint8_t offset) {
   return *ecam_ptr16(bus, slot, func, offset);
 }
 
-static void write_config16(uint8_t bus, uint8_t slot, uint8_t func,
-                           uint8_t offset, uint16_t value) {
+void write_config16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset,
+                    uint16_t value) {
   *ecam_ptr16(bus, slot, func, offset) = value;
 }
 

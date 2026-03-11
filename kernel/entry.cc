@@ -75,7 +75,6 @@ static void kernel_boot(boot::BootInfo *info) {
   serial::printf("==============================================\n\n");
 
 #if defined(__aarch64__)
-  // Debug: show what the FDT parser found (helps diagnose VZ vs QEMU)
   {
     const fdt::Info &dbg = fdt::info();
     serial::printf(
@@ -144,14 +143,18 @@ static void kernel_boot(boot::BootInfo *info) {
     serial::printf("[INIT] Interrupt-driven idle...\n");
     virtio_net::enable_irq();
 #if defined(__aarch64__)
-    // Enable IRQ delivery only when GIC is present (QEMU), so the exception
-    // handler can acknowledge GIC interrupts via GICC_IAR/GICC_EOIR.
-    // On VZ (no GIC), keep DAIF.I=1: WFI still wakes on pending virtual IRQs
-    // (ARM ARM B2.2.7), and poll() acknowledges the device ISR directly.
-    if (fdt::info().gic_dist_base != 0)
-      arch::sti();
+    // Enable timer-based WFI wakeup (INTID 27) so idle() always wakes
+    // periodically — needed for VZ.framework where device interrupts may
+    // not reliably reach the guest.
+    exceptions::enable_timer_wakeup();
+    // Unmask only IRQ (DAIF.I bit 1 → mask 0x2).  Do NOT unmask FIQ or
+    // SError — VZ.framework uses FIQ for hypervisor signaling and clearing
+    // DAIF.F crashes the VM.
+    if (fdt::info().gic_dist_base != 0) {
+      asm volatile("msr daifclr, #0x2" ::: "memory");
+    }
 #endif
-    // x86_64: interrupts stay masked (CLI).  idle() does STI;HLT;CLI
+    // x86_64: interrupts stays masked (CLI).  idle() does STI;HLT;CLI
     // atomically, so the ISR only runs during the HLT window.
   }
 
@@ -174,11 +177,18 @@ extern "C" void kernel_main(uint64_t boot_info_addr) {
   // address) and before virtio_net::init() (FDT virtio-mmio scan).
   fdt::init(boot_info_addr);
 
-  // Map the PCIe ECAM region as device memory before any PCI access.
+  // Map device MMIO regions before any access.
   {
     const fdt::Info &fdt_info = fdt::info();
     if (fdt_info.pcie_ecam_base != 0 && fdt_info.pcie_ecam_size != 0) {
       mmu::map_device_range(fdt_info.pcie_ecam_base, fdt_info.pcie_ecam_size);
+    }
+    // GIC distributor + redistributor (needed by exceptions::init).
+    if (fdt_info.gic_dist_base != 0) {
+      mmu::map_device_range(fdt_info.gic_dist_base, 0x10000);
+    }
+    if (fdt_info.gic_redist_base != 0) {
+      mmu::map_device_range(fdt_info.gic_redist_base, 0x20000);
     }
   }
 

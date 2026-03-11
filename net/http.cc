@@ -378,6 +378,7 @@ void Server::run() {
 
   serial::printf("http: listening on port %u\n", (unsigned)port_);
 
+  int idle_streak = 0;
   while (true) {
     if (serial::check_shutdown()) {
       serial::printf("http: shutdown requested — stopping server.\n");
@@ -472,15 +473,21 @@ void Server::run() {
     }
 
     // If we did nothing this iteration, wait for the next event.
+    // Spin briefly before sleeping — catches in-flight packets without
+    // adding timer/interrupt latency.  After the spin window, enter WFI
+    // (ARM64) or HLT (x86) to save power.
     if (!had_work) {
       if (virtio_net::irq_idle_supported()) {
-        // Interrupt-driven: sleep until the device signals an RX completion.
-        // ARM64: WFI; x86_64: STI;HLT;CLI.
-        arch::idle();
+        if (++idle_streak > 16) {
+          arch::idle();
+          idle_streak = 0;
+        }
+        // idle_streak <= 16: fall through to next loop iteration (spin)
       } else {
-        // No interrupt path (e.g. VZ without GIC): yield briefly.
         arch::cpu_relax();
       }
+    } else {
+      idle_streak = 0;
     }
   }
 
