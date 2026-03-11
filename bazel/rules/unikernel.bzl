@@ -24,7 +24,7 @@ def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
                               --config=aarch64-vz  → explicit
                               --config=x86_64-qemu, --config=x86_64-iso, …
                               --config=native      → native (host arch, from .bazelrc.local)
-                              --config=aarch64-native, --config=x86_64-native → explicit
+                              --config=aarch64-macos, --config=x86_64-linux → explicit
 
     Args:
         name: Base name for all output targets.

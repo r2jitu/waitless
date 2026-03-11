@@ -29,8 +29,8 @@ build:x86_64-qemu  --define=uni_runner=qemu
 build:x86_64-iso   --platforms=//bazel/platforms:x86_64_unikernel
 build:x86_64-iso   --define=uni_runner=iso
 
-build:aarch64-native --platforms=//bazel/platforms:native_macos_arm64
-build:x86_64-native  --platforms=//bazel/platforms:native_linux_x86_64
+build:aarch64-macos --platforms=//bazel/platforms:native_macos_arm64
+build:x86_64-linux  --platforms=//bazel/platforms:native_linux_x86_64
 
 # ── Fallback default (overridden by .bazelrc.local on dev machines) ───────────
 # setup-dev.sh generates .bazelrc.local; on Apple Silicon it sets:
