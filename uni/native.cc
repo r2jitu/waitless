@@ -1,11 +1,8 @@
-// uni/native.cc — uni:: implementation for the native host process.
+// uni/native.cc — Native (POSIX) backend: extern "C" functions for Rust interop
 //
-// Uses POSIX sockets for TCP, fprintf(stderr) for logging, and SIGINT for
-// shutdown detection.  Mirrors the same interface as uni/unikernel.cc so
-// that the same HTTP server and application code can run on the host for
-// benchmarking and debugging.
-
-#include "uni/uni.h"
+// Provides the same uni_* extern "C" symbols as ffi.cc, but implemented
+// with POSIX sockets and stdio. The linker selects native.cc for the native
+// binary and ffi.cc for the unikernel binary.
 
 #include <cerrno>
 #include <cstdio>
@@ -21,9 +18,9 @@
 #include <time.h>
 #include <unistd.h>
 
-// ---- Connection pool ---------------------------------------------------------
+// ---- Connection pool --------------------------------------------------------
 
-struct uni::tcp::Connection {
+struct NativeConn {
   int fd = -1;
   bool is_listener = false;
   bool closed = true;
@@ -31,12 +28,12 @@ struct uni::tcp::Connection {
 };
 
 static constexpr int CONN_POOL_SIZE = 256;
-static uni::tcp::Connection g_pool[CONN_POOL_SIZE];
+static NativeConn g_pool[CONN_POOL_SIZE];
 
-static uni::tcp::Connection *alloc_conn() {
+static NativeConn *alloc_conn() {
   for (auto &c : g_pool) {
     if (c.closed && c.fd < 0) {
-      c = uni::tcp::Connection{};
+      c = NativeConn{};
       c.closed = false;
       return &c;
     }
@@ -44,7 +41,7 @@ static uni::tcp::Connection *alloc_conn() {
   return nullptr;
 }
 
-static void release_conn(uni::tcp::Connection *c) {
+static void release_conn(NativeConn *c) {
   if (c->fd >= 0) {
     ::shutdown(c->fd, SHUT_RDWR);
     ::close(c->fd);
@@ -55,22 +52,16 @@ static void release_conn(uni::tcp::Connection *c) {
   c->is_listener = false;
 }
 
-// ---- Configuration -----------------------------------------------------------
+// ---- State ------------------------------------------------------------------
 
-static uint16_t g_config_port = 0; // 0 = unset; see uni::config_port()
-
-uint16_t uni::config_port(uint16_t default_port) {
-  return g_config_port ? g_config_port : default_port;
-}
-
-// ---- Shutdown ----------------------------------------------------------------
-
+static uint16_t g_config_port = 0;
 static volatile bool g_shutdown = false;
 
 static void sigint_handler(int) { g_shutdown = true; }
 
-void uni::init_native() {
-  // Read $PORT so that uni::config_port() works before uni_main() is called.
+// ---- Init (called by native_main.cc) ----------------------------------------
+
+static void init_native() {
   if (const char *p = ::getenv("PORT"))
     g_config_port = static_cast<uint16_t>(::atoi(p));
 
@@ -80,29 +71,27 @@ void uni::init_native() {
   sa.sa_flags = 0;
   sigaction(SIGINT, &sa, nullptr);
   sigaction(SIGTERM, &sa, nullptr);
-  // Ignore SIGPIPE so that writing to a closed socket returns EPIPE rather
-  // than killing the process.
   signal(SIGPIPE, SIG_IGN);
 }
 
-[[noreturn]] void uni::shutdown() { ::exit(0); }
+// ---- Extern "C" API (same symbols as ffi.cc) --------------------------------
 
-bool uni::check_shutdown() { return g_shutdown; }
+extern "C" {
 
-// ---- Logging -----------------------------------------------------------------
+void uni_init_native() { init_native(); }
 
-void uni::log(const char *fmt, ...) {
-  va_list ap;
-  va_start(ap, fmt);
-  ::vfprintf(stderr, fmt, ap);
-  va_end(ap);
+void uni_log(const char *msg) {
+  ::fprintf(stderr, "%s", msg);
   ::fflush(stderr);
 }
 
-// ---- Idle (poll-based) -------------------------------------------------------
+uint16_t uni_config_port(uint16_t default_port) {
+  return g_config_port ? g_config_port : default_port;
+}
 
-void uni::wait_for_events() {
-  // Collect all open file descriptors.
+bool uni_check_shutdown() { return g_shutdown; }
+
+void uni_wait_for_events() {
   struct pollfd fds[CONN_POOL_SIZE];
   int n = 0;
   for (auto &c : g_pool) {
@@ -114,14 +103,11 @@ void uni::wait_for_events() {
     }
   }
   if (n == 0) {
-    // No sockets open — yield briefly.
     struct timespec ts = {0, 1000000}; // 1 ms
     nanosleep(&ts, nullptr);
     return;
   }
-  // Block up to 10 ms for any socket to become readable.
   ::poll(fds, n, 10);
-  // Update has_pending_data flags.
   for (int i = 0; i < n; i++) {
     if (fds[i].revents & (POLLIN | POLLHUP | POLLERR)) {
       for (auto &c : g_pool) {
@@ -134,19 +120,15 @@ void uni::wait_for_events() {
   }
 }
 
-// ---- TCP ---------------------------------------------------------------------
+// ---- TCP --------------------------------------------------------------------
 
-uni::tcp::Connection *uni::tcp::listen(uint16_t port) {
+void *uni_tcp_listen(uint16_t port) {
   int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0) {
-    ::fprintf(stderr, "platform: socket() failed: %s\n", strerror(errno));
+  if (fd < 0)
     return nullptr;
-  }
 
   int opt = 1;
   ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-  // Non-blocking so accept() returns immediately when no connection is ready.
   ::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
 
   struct sockaddr_in addr{};
@@ -156,29 +138,26 @@ uni::tcp::Connection *uni::tcp::listen(uint16_t port) {
 
   if (::bind(fd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) <
       0) {
-    ::fprintf(stderr, "platform: bind(:%u) failed: %s\n", port,
-              strerror(errno));
     ::close(fd);
     return nullptr;
   }
   if (::listen(fd, 128) < 0) {
-    ::fprintf(stderr, "platform: listen() failed: %s\n", strerror(errno));
     ::close(fd);
     return nullptr;
   }
 
-  Connection *c = alloc_conn();
+  NativeConn *c = alloc_conn();
   if (!c) {
-    ::fprintf(stderr, "platform: connection pool exhausted\n");
     ::close(fd);
     return nullptr;
   }
   c->fd = fd;
   c->is_listener = true;
-  return c;
+  return static_cast<void *>(c);
 }
 
-uni::tcp::Connection *uni::tcp::accept(Connection *listener) {
+void *uni_tcp_accept(void *conn) {
+  auto *listener = static_cast<NativeConn *>(conn);
   if (!listener || listener->fd < 0 || listener->closed)
     return nullptr;
 
@@ -189,62 +168,67 @@ uni::tcp::Connection *uni::tcp::accept(Connection *listener) {
     return nullptr;
   }
 
-  // Non-blocking so recv() returns immediately when no data is ready.
   ::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
 
-  Connection *c = alloc_conn();
+  NativeConn *c = alloc_conn();
   if (!c) {
     ::close(fd);
     return nullptr;
   }
   c->fd = fd;
-  return c;
+  return static_cast<void *>(c);
 }
 
-bool uni::tcp::has_data(Connection *conn) {
-  if (!conn || conn->closed)
+bool uni_tcp_has_data(void *conn) {
+  auto *c = static_cast<NativeConn *>(conn);
+  if (!c || c->closed)
     return false;
-  return conn->has_pending_data;
+  return c->has_pending_data;
 }
 
-size_t uni::tcp::recv(Connection *conn, void *buf, size_t max_len) {
-  if (!conn || conn->fd < 0 || conn->closed)
+size_t uni_tcp_recv(void *conn, void *buf, size_t max_len) {
+  auto *c = static_cast<NativeConn *>(conn);
+  if (!c || c->fd < 0 || c->closed)
     return 0;
-  ssize_t n = ::recv(conn->fd, buf, max_len, 0);
+  ssize_t n = ::recv(c->fd, buf, max_len, 0);
   if (n < 0) {
-    conn->has_pending_data = false;
+    c->has_pending_data = false;
     return 0;
   }
   if (n == 0) {
-    // EOF — remote closed the connection.
-    conn->closed = true;
-    conn->has_pending_data = false;
+    c->closed = true;
+    c->has_pending_data = false;
     return 0;
   }
-  // Reset flag; poll() will re-set it if more data arrives.
-  conn->has_pending_data = false;
+  c->has_pending_data = false;
   return static_cast<size_t>(n);
 }
 
-int uni::tcp::send(Connection *conn, const void *data, size_t len) {
-  if (!conn || conn->fd < 0 || conn->closed)
+int uni_tcp_send(void *conn, const void *data, size_t len) {
+  auto *c = static_cast<NativeConn *>(conn);
+  if (!c || c->fd < 0 || c->closed)
     return -1;
-  ssize_t sent = ::send(conn->fd, data, len, MSG_NOSIGNAL);
+  ssize_t sent = ::send(c->fd, data, len, MSG_NOSIGNAL);
   if (sent < 0)
     return -1;
   return static_cast<int>(sent);
 }
 
-void uni::tcp::close(Connection *conn) {
-  if (!conn)
+void uni_tcp_close(void *conn) {
+  auto *c = static_cast<NativeConn *>(conn);
+  if (!c)
     return;
-  release_conn(conn);
+  release_conn(c);
 }
 
-void uni::tcp::poll() {
-  // Non-blocking poll to update has_pending_data flags for all open sockets.
+bool uni_tcp_is_closed(void *conn) {
+  auto *c = static_cast<NativeConn *>(conn);
+  return !c || c->closed;
+}
+
+void uni_tcp_poll() {
   struct pollfd fds[CONN_POOL_SIZE];
-  uni::tcp::Connection *map[CONN_POOL_SIZE];
+  NativeConn *map[CONN_POOL_SIZE];
   int n = 0;
   for (auto &c : g_pool) {
     if (!c.closed && c.fd >= 0) {
@@ -257,13 +241,11 @@ void uni::tcp::poll() {
   }
   if (n == 0)
     return;
-  ::poll(fds, n, 0); // non-blocking
+  ::poll(fds, n, 0);
   for (int i = 0; i < n; i++) {
     if (fds[i].revents & (POLLIN | POLLHUP | POLLERR))
       map[i]->has_pending_data = true;
   }
 }
 
-bool uni::tcp::is_closed(Connection *conn) {
-  return !conn || conn->closed;
-}
+} // extern "C"
