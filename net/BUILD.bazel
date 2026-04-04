@@ -58,6 +58,22 @@ cc_library(
     ],
 )
 
+# C-linkage FFI bridge for the HTTP server (used by Rust apps).
+# Exposes a dispatch callback interface so Rust can handle HTTP requests
+# without directly interacting with the C++ Server class.
+cc_library(
+    name = "http_ffi",
+    srcs = ["http_ffi.cc"],
+    deps = [
+        ":http",
+        "//uni:uni",
+    ],
+    copts = [
+        "-I.",
+        "-Iinclude",
+    ],
+)
+
 # Convenience alias: the full network library (stack + HTTP).
 # Used by unikernel_binary() in bazel/rules/unikernel.bzl.
 cc_library(

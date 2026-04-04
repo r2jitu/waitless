@@ -1,11 +1,25 @@
+load("@rules_rust//rust:defs.bzl", "rust_static_library")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("//bazel/rules:unikernel.bzl", "unikernel_binary")
 
 package(default_visibility = ["//visibility:public"])
 
+# ---- Rust application --------------------------------------------------------
+
+rust_static_library(
+    name = "webserver_rs",
+    srcs = ["main.rs"],
+    edition = "2024",
+    rustc_flags = ["-C", "panic=abort"] + select({
+        "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
+        "//conditions:default": [],
+    }),
+)
+
 unikernel_binary(
     name = "webserver",
-    srcs = ["main.cc"],
+    srcs = [],
+    deps = [":webserver_rs"],
     copts = [
         "-I.",
         "-Iinclude",

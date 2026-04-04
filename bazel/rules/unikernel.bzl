@@ -43,6 +43,7 @@ def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
             "//kernel:arch_init",
             "//drivers:virtio_net",
             "//net",
+            "//net:http_ffi",
             "//uni:unikernel",
         ],
         copts = copts,
@@ -85,6 +86,7 @@ def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
         srcs = srcs,
         deps = deps + [
             "//net:http",
+            "//net:http_ffi",
             "//uni:native",
             "//uni:native_entry",
         ],
@@ -158,6 +160,7 @@ def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
             "//kernel:arch_init",
             "//drivers:virtio_net",
             "//net",
+            "//net:http_ffi",
             "//uni:unikernel",
         ],
         copts = copts,

@@ -152,21 +152,25 @@ primary_entry:
     isb
 
     // ---- Set up stack (boot stack is in BSS at a known address) -----------
-    // Using RIP-relative address to avoid needing MMU
-    adr     x0, boot_stack_top
+    // Using adrp+add for ±4GB range (adr only has ±1MB, too small with Rust core)
+    adrp    x0, boot_stack_top
+    add     x0, x0, :lo12:boot_stack_top
     mov     sp, x0
 
     // ---- Set up page tables and enable MMU --------------------------------
     bl      setup_mmu
 
     // ---- Install exception vector table -----------------------------------
-    adr     x0, exception_vector_table
+    adrp    x0, exception_vector_table
+    add     x0, x0, :lo12:exception_vector_table
     msr     vbar_el1, x0
     isb
 
     // ---- Zero BSS -----------------------------------------------------------
-    adr     x0, __bss_start
-    adr     x1, __bss_end
+    adrp    x0, __bss_start
+    add     x0, x0, :lo12:__bss_start
+    adrp    x1, __bss_end
+    add     x1, x1, :lo12:__bss_end
     sub     x2, x1, x0
     cbz     x2, .Lbss_done
 .Lbss_loop:
@@ -229,7 +233,8 @@ setup_mmu:
     isb
 
     // ---- Fill L1 page table ------------------------------------------------
-    adr     x1, boot_l1_table
+    adrp    x1, boot_l1_table
+    add     x1, x1, :lo12:boot_l1_table
 
     // Block descriptor flags:
     //   Normal 1GB block  = PA | AttrIdx=1 | AF=1 | SH=11 | valid = PA | 0x0705
@@ -265,7 +270,8 @@ setup_mmu:
 
     // ---- Set TTBR0_EL1 to our L1 table ------------------------------------
     // With T0SZ=25 the initial lookup is at L1 — TTBR0 points directly to L1.
-    adr     x0, boot_l1_table
+    adrp    x0, boot_l1_table
+    add     x0, x0, :lo12:boot_l1_table
     msr     ttbr0_el1, x0
     isb
 

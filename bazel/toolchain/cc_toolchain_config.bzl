@@ -159,7 +159,7 @@ def _impl(ctx):
             "--target=" + target_system,
             "-fuse-ld=lld",
             "-nostdlib",
-        ] + (["-pie"] if arch == "aarch64" else ["-static"]) + [
+        ] + (["-pie", "-Wl,-z,notext"] if arch == "aarch64" else ["-static"]) + [
             "-Wl,-z,max-page-size=0x1000",
             "-Wl,-T," + linker_script,
         ]
