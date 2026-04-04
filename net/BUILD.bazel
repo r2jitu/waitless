@@ -1,4 +1,5 @@
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_rust//rust:defs.bzl", "rust_library")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -42,44 +43,25 @@ cc_library(
     ],
 )
 
-# HTTP/1.1 server: request parsing, routing, event loop.
-# Depends only on the platform interface — not on the bare-metal stack.
-# Compiles for both unikernel and native targets.
-cc_library(
-    name = "http",
-    srcs = ["http.cc"],
-    hdrs = ["http.h"],
-    deps = [
-        "//uni:uni",
-    ],
-    copts = [
-        "-I.",
-        "-Iinclude",
-    ],
+# HTTP/1.1 server (Rust): request parsing, routing, event loop.
+# Calls uni:: functions via FFI (symbols resolved at link time from
+# uni/ffi.cc + either uni/unikernel.cc or uni/native.cc).
+rust_library(
+    name = "http_rs",
+    srcs = ["http.rs"],
+    crate_name = "http",
+    edition = "2024",
+    rustc_flags = ["-C", "panic=abort"] + select({
+        "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
+        "//conditions:default": [],
+    }),
 )
 
-# C-linkage FFI bridge for the HTTP server (used by Rust apps).
-# Exposes a dispatch callback interface so Rust can handle HTTP requests
-# without directly interacting with the C++ Server class.
-cc_library(
-    name = "http_ffi",
-    srcs = ["http_ffi.cc"],
-    deps = [
-        ":http",
-        "//uni:uni",
-    ],
-    copts = [
-        "-I.",
-        "-Iinclude",
-    ],
-)
-
-# Convenience alias: the full network library (stack + HTTP).
+# Convenience alias: the full network library (stack only — HTTP is now Rust).
 # Used by unikernel_binary() in bazel/rules/unikernel.bzl.
 cc_library(
     name = "net",
     deps = [
         ":stack",
-        ":http",
     ],
 )

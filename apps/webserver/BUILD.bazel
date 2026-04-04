@@ -10,6 +10,7 @@ rust_static_library(
     name = "webserver_rs",
     srcs = ["main.rs"],
     edition = "2024",
+    deps = ["//net:http_rs"],
     rustc_flags = ["-C", "panic=abort"] + select({
         "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
         "//conditions:default": [],

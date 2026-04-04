@@ -1,41 +1,19 @@
 // UniKernel Example: HTTP Web Server in Rust
 //
-// Equivalent to the C++ webserver (main.cc), running on the same bare-metal
-// unikernel runtime. Uses the C++ HTTP server via FFI dispatch callback.
+// Runs on the bare-metal unikernel runtime with a pure Rust HTTP server.
 // All driver and network calls are direct function calls — zero overhead.
 
 #![no_std]
 #![no_main]
 
-use core::ffi::c_char;
 use core::panic::PanicInfo;
-
-// ---- FFI bindings to the C++ runtime ----------------------------------------
-
-#[repr(C)]
-struct FfiHttpResponse {
-    status: i32,
-    content_type: *const c_char,
-    body: *const c_char,
-    body_len: u64,
-}
-
-type FfiHttpDispatch = unsafe extern "C" fn(*const c_char, i32) -> FfiHttpResponse;
-
-unsafe extern "C" {
-    fn uni_log(msg: *const c_char);
-    fn uni_config_port(default_port: u16) -> u16;
-    fn http_server_set_dispatch(dispatch: FfiHttpDispatch);
-    fn http_server_run(port: u16);
-}
+use http::{Request, Response, Server};
 
 // ---- Panic handler ----------------------------------------------------------
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
-    unsafe {
-        uni_log(b"PANIC: Rust webserver panicked!\n\0".as_ptr() as *const c_char);
-    }
+    http::uni_log_msg(b"PANIC: Rust webserver panicked!\n\0");
     loop {
         core::hint::spin_loop();
     }
@@ -45,26 +23,6 @@ fn panic(_info: &PanicInfo) -> ! {
 // On bare-metal targets (panic=abort), core doesn't reference it.
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_eh_personality() {}
-
-// ---- Response helpers -------------------------------------------------------
-
-const fn ok(content_type: &'static [u8], body: &'static [u8]) -> FfiHttpResponse {
-    FfiHttpResponse {
-        status: 200,
-        content_type: content_type.as_ptr() as *const c_char,
-        body: body.as_ptr() as *const c_char,
-        body_len: body.len() as u64,
-    }
-}
-
-const fn not_found() -> FfiHttpResponse {
-    FfiHttpResponse {
-        status: 404,
-        content_type: b"text/plain\0".as_ptr() as *const c_char,
-        body: b"404 Not Found\0".as_ptr() as *const c_char,
-        body_len: 13,
-    }
-}
 
 // ---- Request handlers -------------------------------------------------------
 
@@ -91,7 +49,7 @@ background: #1a1a2e; border-radius: 4px; }\
 Application (this server)\n\
     |  direct function call\n\
     v\n\
-HTTP parser (net::http)\n\
+HTTP parser (Rust)\n\
     |  uni:: interface\n\
     v\n\
 TCP stack (uni::tcp)\n\
@@ -114,30 +72,12 @@ const HEALTH_JSON: &[u8] = b"{\"status\":\"ok\",\"runtime\":\"unikernel\",\"vers
 const STATS_JSON: &[u8] =
     b"{\"connections_active\":0,\"total_requests\":0,\"memory_free_mb\":0,\"uptime_seconds\":0}";
 
-// ---- Dispatch function ------------------------------------------------------
-
-/// Compares a null-terminated C string with a Rust byte slice (without null).
-unsafe fn path_eq(c_path: *const c_char, expected: &[u8]) -> bool {
-    let c = c_path as *const u8;
-    for (i, &b) in expected.iter().enumerate() {
-        if unsafe { *c.add(i) } != b {
-            return false;
-        }
-    }
-    // Ensure C string ends here (null terminator)
-    unsafe { *c.add(expected.len()) == 0 }
-}
-
-/// HTTP request dispatch — called by the C++ HTTP server for every request.
-unsafe extern "C" fn dispatch(path: *const c_char, _method: i32) -> FfiHttpResponse {
-    if unsafe { path_eq(path, b"/") } {
-        ok(b"text/html\0", INDEX_HTML)
-    } else if unsafe { path_eq(path, b"/health") } {
-        ok(b"application/json\0", HEALTH_JSON)
-    } else if unsafe { path_eq(path, b"/stats") } {
-        ok(b"application/json\0", STATS_JSON)
-    } else {
-        not_found()
+fn handle_request(req: &Request) -> Response {
+    match req.path() {
+        b"/" => Response::ok(b"text/html", INDEX_HTML),
+        b"/health" => Response::ok(b"application/json", HEALTH_JSON),
+        b"/stats" => Response::ok(b"application/json", STATS_JSON),
+        _ => Response::not_found(),
     }
 }
 
@@ -145,13 +85,16 @@ unsafe extern "C" fn dispatch(path: *const c_char, _method: i32) -> FfiHttpRespo
 
 #[unsafe(no_mangle)]
 pub extern "C" fn uni_main() -> i32 {
-    unsafe {
-        uni_log(b"Starting Rust HTTP server...\n\0".as_ptr() as *const c_char);
-        http_server_set_dispatch(dispatch);
-        uni_log(b"Routes registered. Entering event loop.\n\0".as_ptr() as *const c_char);
-        let port = uni_config_port(80);
-        http_server_run(port);
-        uni_log(b"[uni_main] server.run() returned -- shutting down\n\0".as_ptr() as *const c_char);
-    }
+    http::uni_log_msg(b"Starting Rust HTTP server...\n\0");
+    let port = http::config_port(80);
+
+    static mut SERVER: Server = Server::new();
+    // Safety: uni_main is single-threaded and called exactly once.
+    let server = unsafe { &mut *core::ptr::addr_of_mut!(SERVER) };
+    server.default_handler(handle_request);
+
+    http::uni_log_msg(b"Routes registered. Entering event loop.\n\0");
+    server.run(port);
+    http::uni_log_msg(b"[uni_main] server.run() returned -- shutting down\n\0");
     0
 }

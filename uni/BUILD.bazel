@@ -39,6 +39,18 @@ cc_library(
     copts = ["-I."],
 )
 
+# ---- C-linkage FFI wrappers for Rust -----------------------------------------
+# Wraps uni:: functions with extern "C" symbols.
+# Linked into both unikernel and native binaries (actual implementations
+# come from :unikernel or :native at link time).
+
+cc_library(
+    name = "ffi",
+    srcs = ["ffi.cc"],
+    deps = [":uni"],
+    copts = ["-I."],
+)
+
 # ---- Native entry point ------------------------------------------------------
 # Provides int main() → uni_main().  Linked into the native binary.
 
