@@ -66,6 +66,7 @@ cc_library(
     srcs = [
         "mm.cc",
         "libc.cc",
+        "ffi.cc",
     ] + select({
         "//bazel/platforms:x86_64": ["x86_64/serial.cc"],
         "//bazel/platforms:aarch64": ["aarch64/serial.cc"],

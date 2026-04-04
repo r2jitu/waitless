@@ -7,4 +7,8 @@ if [ ! -x "$LLVM_CLANG" ]; then
   echo "       Install with: brew install llvm" >&2
   exit 1
 fi
+# Ensure system tools (ld, dsymutil, etc.) are findable. Some callers
+# (e.g. rules_rust) invoke the wrapper with a restricted PATH that does
+# not include /usr/bin, causing clang to fail to spawn the linker.
+export PATH="/usr/bin:/bin:$PATH"
 exec "$LLVM_CLANG" "$@"

@@ -1,0 +1,16 @@
+load("@rules_rust//rust:defs.bzl", "rust_static_library")
+load("//bazel/rules:unikernel.bzl", "unikernel_binary")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_static_library(
+    name = "hello_rust_lib",
+    srcs = ["lib.rs"],
+    edition = "2021",
+)
+
+unikernel_binary(
+    name = "hello_rust",
+    srcs = [],
+    deps = [":hello_rust_lib"],
+)
