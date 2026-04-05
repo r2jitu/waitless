@@ -6,35 +6,13 @@ package(default_visibility = ["//visibility:public"])
 cc_library(
     name = "arch_h",
     hdrs = ["arch.h"] + select({
-        "//bazel/platforms:aarch64": [
-            "aarch64/arch.h",
-            "aarch64/timer.h",
-        ],
-        "//bazel/platforms:x86_64": [
-            "x86_64/arch.h",
-        ],
+        "//bazel/platforms:aarch64": ["aarch64/arch.h"],
+        "//bazel/platforms:x86_64": ["x86_64/arch.h"],
         "//conditions:default": [],
     }),
     copts = ["-I."],
 )
 
-cc_library(
-    name = "fdt",
-    hdrs = select({
-        "//bazel/platforms:aarch64": ["aarch64/fdt.h"],
-        "//conditions:default": [],
-    }),
-    copts = ["-I."],
-)
-
-cc_library(
-    name = "mmu",
-    hdrs = select({
-        "//bazel/platforms:aarch64": ["aarch64/mmu.h"],
-        "//conditions:default": [],
-    }),
-    copts = ["-I."],
-)
 
 rust_library(
     name = "mmu_rs",
@@ -110,11 +88,8 @@ cc_library(
         "serial.h",
         "mm.h",
         "panic.h",
-    ] + select({
-        "//bazel/platforms:x86_64": ["x86_64/serial.h"],
-        "//conditions:default": [],
-    }),
-    deps = [":arch_h", ":boot_info", ":fdt"],
+    ],
+    deps = [":arch_h", ":boot_info"],
     copts = ["-I."],
 )
 
@@ -136,7 +111,6 @@ cc_library(
             "x86_64/gdt.h",
             "x86_64/idt.h",
         ],
-        "//bazel/platforms:aarch64": ["aarch64/exceptions.h"],
         "//conditions:default": [
             "x86_64/gdt.h",
             "x86_64/idt.h",
@@ -144,7 +118,7 @@ cc_library(
     }),
     deps = select({
         "//bazel/platforms:aarch64": [],
-        "//conditions:default": [":core", ":fdt"],
+        "//conditions:default": [":core"],
     }),
     copts = ["-I."],
 )
