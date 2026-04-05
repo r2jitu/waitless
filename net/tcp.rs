@@ -214,19 +214,19 @@ fn send_rst(dst_ip: Ipv4Addr, src_port: u16, dst_port: u16, seq: u32, ack: u32) 
     }
 }
 
-pub(crate) fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: *const u8, len: usize) {
-    if len < 20 {
+pub(crate) fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
+    if data.len() < 20 {
         return;
     }
-    let hdr = unsafe { &*(data as *const TcpHeader) };
+    let hdr = unsafe { &*(data.as_ptr() as *const TcpHeader) };
     let src_port = ntohs(hdr.src_port);
     let dst_port = ntohs(hdr.dst_port);
     let seq = ntohl(hdr.seq);
     let ack = ntohl(hdr.ack);
     let flags = hdr.flags;
     let data_offset = ((hdr.data_offset >> 4) as usize) * 4;
-    let payload_len = if len > data_offset { len - data_offset } else { 0 };
-    let payload = unsafe { data.add(data_offset) };
+    let payload_len = if data.len() > data_offset { data.len() - data_offset } else { 0 };
+    let payload = &data[data_offset..];
 
     // RST handling
     if flags & TCP_RST != 0 {
@@ -342,7 +342,7 @@ pub(crate) fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: *const u8, 
         if payload_len > 0 && (c.state == TcpState::Established || c.state == TcpState::FinWait1 || c.state == TcpState::FinWait2) {
             if seq == c.rcv_nxt {
                 // In-order data
-                let pushed = c.rx_push(core::slice::from_raw_parts(payload, payload_len));
+                let pushed = c.rx_push(&payload[..payload_len]);
                 c.rcv_nxt = c.rcv_nxt.wrapping_add(pushed as u32);
                 c.rcv_wnd = c.rx_free() as u16;
                 // ACK

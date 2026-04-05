@@ -51,24 +51,24 @@ static mut DHCP_OFFERED_DNS: Ipv4Addr = Ipv4Addr::ANY;
 static mut DHCP_SERVER_IP: Ipv4Addr = Ipv4Addr::ANY;
 
 /// DHCP receive callback — processes raw ethernet frames during DHCP.
-unsafe extern "C" fn dhcp_receive(data: *const u8, len: u32) {
-    let len = len as usize;
+fn dhcp_receive(frame: &[u8]) {
+    let len = frame.len();
     if len < 14 {
         return;
     }
-    let hdr = unsafe { &*(data as *const EthernetHeader) };
+    let hdr = unsafe { &*(frame.as_ptr() as *const EthernetHeader) };
     let ethertype = ntohs(hdr.ethertype);
 
     // Also process ARP during DHCP
     if ethertype == ETHERTYPE_ARP && len >= 14 + 28 {
-        arp_receive(unsafe { data.add(14) }, len - 14);
+        arp_receive(&frame[14..]);
         return;
     }
 
     if ethertype != ETHERTYPE_IPV4 || len < 14 + 20 {
         return;
     }
-    let ip_hdr = unsafe { &*(data.add(14) as *const Ipv4Header) };
+    let ip_hdr = unsafe { &*(frame[14..].as_ptr() as *const Ipv4Header) };
     if ip_hdr.protocol != PROTO_UDP {
         return;
     }
@@ -77,7 +77,7 @@ unsafe extern "C" fn dhcp_receive(data: *const u8, len: u32) {
         return;
     }
 
-    let udp = unsafe { &*(data.add(14 + ip_hdr_len) as *const UdpHeader) };
+    let udp = unsafe { &*(frame[14 + ip_hdr_len..].as_ptr() as *const UdpHeader) };
     if ntohs(udp.dst_port) != 68 || ntohs(udp.src_port) != 67 {
         return;
     }
@@ -87,14 +87,14 @@ unsafe extern "C" fn dhcp_receive(data: *const u8, len: u32) {
         return;
     }
 
-    let dhcp = unsafe { &*(data.add(dhcp_offset) as *const DhcpPacket) };
+    let dhcp = unsafe { &*(frame[dhcp_offset..].as_ptr() as *const DhcpPacket) };
     if dhcp.xid != unsafe { DHCP_XID } || dhcp.magic_cookie != htonl(0x63825363) {
         return;
     }
 
     // Parse options
     let opts_start = dhcp_offset + 240;
-    let opts_data = unsafe { core::slice::from_raw_parts(data.add(opts_start), len - opts_start) };
+    let opts_data = &frame[opts_start..];
 
     let mut msg_type: u8 = 0;
     let mut subnet = Ipv4Addr::ANY;
@@ -219,7 +219,7 @@ fn dhcp_send_discover() {
     ip.checksum = 0;
     ip.checksum = unsafe { checksum(frame.as_ptr().add(14) as *const u8, 20) };
 
-    drivers::virtio_net_send(frame.as_ptr(), (14 + ip_total) as u32);
+    drivers::virtio_net_send(&frame[..14 + ip_total]);
 }
 
 fn dhcp_send_request() {
@@ -287,18 +287,18 @@ fn dhcp_send_request() {
     ip.checksum = 0;
     ip.checksum = unsafe { checksum(frame.as_ptr().add(14) as *const u8, 20) };
 
-    drivers::virtio_net_send(frame.as_ptr(), (14 + ip_total) as u32);
+    drivers::virtio_net_send(&frame[..14 + ip_total]);
 }
 
 fn dhcp_poll_wait(timeout_ms: u32) -> bool {
     for _ in 0..timeout_ms {
+        drivers::virtio_net_poll(dhcp_receive);
         unsafe {
-            drivers::virtio_net_poll(dhcp_receive);
             if DHCP_GOT_OFFER || DHCP_GOT_ACK {
                 return true;
             }
-            arch_udelay(1000); // 1ms
         }
+        arch_udelay(1000); // 1ms
     }
     false
 }

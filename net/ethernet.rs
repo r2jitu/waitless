@@ -42,24 +42,22 @@ pub(crate) fn ethernet_send(dst: MacAddr, ethertype: u16, payload: &[u8]) {
         let payload_len = payload.len().min(1500);
         ptr::copy_nonoverlapping(payload.as_ptr(), ETH_TX_BUF.as_mut_ptr().add(14), payload_len);
 
-        drivers::virtio_net_send(ETH_TX_BUF.as_ptr(), (14 + payload_len) as u32);
+        drivers::virtio_net_send(&ETH_TX_BUF[..14 + payload_len]);
     }
 }
 
 /// Ethernet frame receive callback — dispatches to ARP or IPv4.
-pub(crate) unsafe extern "C" fn ethernet_receive(data: *const u8, len: u32) {
-    let len = len as usize;
-    if len < 14 {
+pub(crate) fn ethernet_receive(frame: &[u8]) {
+    if frame.len() < 14 {
         return;
     }
-    let hdr = unsafe { &*(data as *const EthernetHeader) };
+    let hdr = unsafe { &*(frame.as_ptr() as *const EthernetHeader) };
     let ethertype = ntohs(hdr.ethertype);
-    let payload = unsafe { data.add(14) };
-    let payload_len = len - 14;
+    let payload = &frame[14..];
 
     match ethertype {
-        ETHERTYPE_ARP => arp_receive(payload, payload_len),
-        ETHERTYPE_IPV4 => ipv4_receive(payload, payload_len),
+        ETHERTYPE_ARP => arp_receive(payload),
+        ETHERTYPE_IPV4 => ipv4_receive(payload),
         _ => {}
     }
 }

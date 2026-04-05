@@ -513,11 +513,12 @@ pub fn virtio_net_get_mac(mac_out: *mut u8) {
     }
 }
 
-pub fn virtio_net_send(data: *const u8, len: u32) {
-    if data.is_null() || len == 0 { return; }
+pub fn virtio_net_send(data: &[u8]) {
+    if data.is_empty() { return; }
     unsafe {
         if let Transport::None = NET_TRANSPORT { return; }
     }
+    let len = data.len() as u32;
     let frame_len = if len > MAX_ETH_FRAME as u32 { MAX_ETH_FRAME as u32 } else { len };
 
     tx_drain();
@@ -547,7 +548,7 @@ pub fn virtio_net_send(data: *const u8, len: u32) {
         buf.hdr.csum_offset = 0;
         buf.hdr.num_buffers = 1;
 
-        ptr::copy_nonoverlapping(data, buf.data.as_mut_ptr(), frame_len as usize);
+        ptr::copy_nonoverlapping(data.as_ptr(), buf.data.as_mut_ptr(), frame_len as usize);
 
         let total_len = VIRTIO_NET_HDR_SIZE as u32 + frame_len;
         let buf_phys = virt_to_phys(buf as *const TxBuf as *const u8);
@@ -562,7 +563,7 @@ pub fn virtio_net_send(data: *const u8, len: u32) {
 }
 
 pub fn virtio_net_poll(
-    callback: unsafe extern "C" fn(*const u8, u32),
+    callback: fn(&[u8]),
 ) -> i32 {
     unsafe {
         if let Transport::None = NET_TRANSPORT { return 0; }
@@ -577,9 +578,10 @@ pub fn virtio_net_poll(
             let buf = phys_to_virt(desc.addr);
 
             if used_len > VIRTIO_NET_HDR_SIZE as u32 {
-                let frame_len = used_len - VIRTIO_NET_HDR_SIZE as u32;
+                let frame_len = (used_len - VIRTIO_NET_HDR_SIZE as u32) as usize;
                 let frame_data = buf.add(VIRTIO_NET_HDR_SIZE);
-                callback(frame_data, frame_len);
+                let slice = core::slice::from_raw_parts(frame_data, frame_len);
+                callback(slice);
             }
 
             // Re-arm RX buffer

@@ -93,11 +93,11 @@ pub(crate) fn arp_request(target_ip: Ipv4Addr) {
     ethernet_send(MacAddr::BROADCAST, ETHERTYPE_ARP, data);
 }
 
-pub(crate) fn arp_receive(data: *const u8, len: usize) {
-    if len < 28 {
+pub(crate) fn arp_receive(data: &[u8]) {
+    if data.len() < 28 {
         return;
     }
-    let pkt = unsafe { &*(data as *const ArpPacket) };
+    let pkt = unsafe { &*(data.as_ptr() as *const ArpPacket) };
     let our_ip = unsafe { CONFIG.ip };
 
     // Copy fields out of packed struct before use (avoids unaligned references)

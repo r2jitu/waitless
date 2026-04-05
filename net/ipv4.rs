@@ -69,11 +69,11 @@ pub(crate) fn ipv4_send(dst: Ipv4Addr, proto: u8, payload: &[u8]) {
     }
 }
 
-pub(crate) fn ipv4_receive(data: *const u8, len: usize) {
-    if len < 20 {
+pub(crate) fn ipv4_receive(data: &[u8]) {
+    if data.len() < 20 {
         return;
     }
-    let hdr = unsafe { &*(data as *const Ipv4Header) };
+    let hdr = unsafe { &*(data.as_ptr() as *const Ipv4Header) };
 
     // Validate
     let version = hdr.version_ihl >> 4;
@@ -86,7 +86,7 @@ pub(crate) fn ipv4_receive(data: *const u8, len: usize) {
     }
     let header_len = ihl * 4;
     let total_len = ntohs(hdr.total_length) as usize;
-    if total_len > len || total_len < header_len {
+    if total_len > data.len() || total_len < header_len {
         return;
     }
 
@@ -101,11 +101,10 @@ pub(crate) fn ipv4_receive(data: *const u8, len: usize) {
         }
     }
 
-    let payload = unsafe { data.add(header_len) };
-    let payload_len = total_len - header_len;
+    let payload = &data[header_len..total_len];
 
     match hdr.protocol {
-        PROTO_TCP => tcp_receive(hdr.src, hdr.dst, payload, payload_len),
+        PROTO_TCP => tcp_receive(hdr.src, hdr.dst, payload),
         _ => {}
     }
 }
