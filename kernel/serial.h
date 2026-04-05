@@ -1,38 +1,39 @@
 #pragma once
 
-// kernel/serial.h — Serial port driver (COM1) interface
+// kernel/serial.h — Serial console interface
 //
-// Provides formatted text output over the serial port for kernel logging
-// and debugging. COM1 at 0x3F8, 115200 baud, 8N1.
+// Thin C++ wrapper around the Rust serial implementation (kernel/serial.rs).
+// The extern "C" functions are exported by the Rust library; the namespace
+// serial inlines provide source-compatible C++ API.
+//
+// printf/vprintf remain implemented in C++ (serial_printf.cc) since Rust
+// cannot export C-compatible variadic functions on stable.
 
 #include <stdarg.h>
 #include <stdint.h>
 
+// ---- Rust extern "C" functions (kernel/serial.rs) ----
+
+extern "C" {
+void serial_init();
+void serial_putc(uint8_t c);
+void serial_puts(const char *s);
+int serial_try_getc();
+bool serial_check_shutdown();
+}
+
+// ---- Source-compatible C++ namespace wrappers ----
+
 namespace serial {
 
-// Initialize COM1 at 115200 baud, 8N1, FIFO enabled
-void init();
+inline void init() { serial_init(); }
+inline void putc(char c) { serial_putc((uint8_t)c); }
+inline void puts(const char *s) { serial_puts(s); }
+inline int try_getc() { return serial_try_getc(); }
+inline bool check_shutdown() { return serial_check_shutdown(); }
 
-// Write a single character (waits for TX buffer to be ready)
-void putc(char c);
-
-// Write a null-terminated string
-void puts(const char *s);
-
-// Minimal printf supporting: %s %d %u %x %lx %p %c %%
-// No heap allocation. Uses va_list internally.
+// printf/vprintf — implemented in serial_printf.cc (calls Rust serial_putc)
 void printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-
-// va_list variant of printf (for forwarding varargs).
 void vprintf(const char *fmt, va_list args);
-
-// Read one byte from the serial RX buffer without blocking.
-// Returns the byte value (0–255) if data is available, or -1 if empty.
-int try_getc();
-
-// Returns true if a graceful-shutdown request has arrived on the serial port
-// (i.e., byte 0x03, which QEMU sends when the user presses Ctrl-C with
-// signal=off).  Once set, subsequent calls always return true.
-bool check_shutdown();
 
 } // namespace serial

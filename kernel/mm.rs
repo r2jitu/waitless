@@ -24,37 +24,18 @@
 use core::ptr;
 
 // ============================================================================
-// FFI declarations
+// Dependencies
 // ============================================================================
 
-unsafe extern "C" {
-    fn driver_serial_putc(c: u8);
+extern crate kernel_serial;
 
+unsafe extern "C" {
     // Linker-provided symbol marking the end of the kernel image
     static _kernel_end: u8;
 }
 
-// ============================================================================
-// Serial writer for formatted logging
-// ============================================================================
-
-struct SerialWriter;
-
-impl core::fmt::Write for SerialWriter {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        for b in s.bytes() {
-            if b == b'\n' {
-                unsafe { driver_serial_putc(b'\r') };
-            }
-            unsafe { driver_serial_putc(b) };
-        }
-        Ok(())
-    }
-}
-
 fn log_fmt(args: core::fmt::Arguments) {
-    use core::fmt::Write;
-    let _ = SerialWriter.write_fmt(args);
+    kernel_serial::serial_write_fmt(args);
 }
 
 macro_rules! klog {

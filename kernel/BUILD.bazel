@@ -49,10 +49,22 @@ cc_library(
 )
 
 rust_library(
+    name = "serial_rs",
+    srcs = ["serial.rs"],
+    crate_name = "kernel_serial",
+    edition = "2024",
+    rustc_flags = ["-C", "panic=abort"] + select({
+        "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
+        "//conditions:default": [],
+    }),
+)
+
+rust_library(
     name = "mm_rs",
     srcs = ["mm.rs"],
     crate_name = "kernel_mm",
     edition = "2024",
+    deps = [":serial_rs"],
     rustc_flags = ["-C", "panic=abort"] + select({
         "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
         "//conditions:default": [],
@@ -77,11 +89,8 @@ cc_library(
     name = "core",
     srcs = [
         "libc.cc",
-    ] + select({
-        "//bazel/platforms:x86_64": ["x86_64/serial.cc"],
-        "//bazel/platforms:aarch64": ["aarch64/serial.cc"],
-        "//conditions:default": ["x86_64/serial.cc"],
-    }),
+        "serial_printf.cc",
+    ],
     hdrs = [
         "serial.h",
         "mm.h",

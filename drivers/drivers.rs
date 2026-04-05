@@ -29,13 +29,12 @@ pub extern "C" fn rust_eh_personality() {}
 // FFI declarations — kernel functions provided by drivers_ffi.cc
 // ============================================================================
 
-// Memory management — direct calls to Rust mm (kernel/mm.rs via kernel_mm rlib).
-// This eliminates the C++ FFI hop through drivers_ffi.cc for memory operations.
+// Kernel Rust rlibs — direct calls, no C++ FFI hop.
 extern crate kernel_mm;
+extern crate kernel_serial;
 use kernel_mm::{mm_alloc_frame, mm_phys_to_virt, mm_virt_to_phys, mm_kmalloc, mm_kfree};
 
 unsafe extern "C" {
-    fn driver_log(msg: *const u8);
     fn driver_register_irq(intid_or_vector: u32, handler: unsafe extern "C" fn());
     #[cfg(target_arch = "x86_64")]
     fn driver_x86_enable_irq(irq: u32);
@@ -67,7 +66,7 @@ unsafe extern "C" {
 }
 
 fn log(msg: &[u8]) {
-    unsafe { driver_log(msg.as_ptr()) }
+    unsafe { kernel_serial::serial_puts(msg.as_ptr()) }
 }
 
 // ============================================================================
