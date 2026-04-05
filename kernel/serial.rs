@@ -10,7 +10,7 @@
 //     - Falls back to no-op if nothing found.
 //
 // Provides a core::fmt::Write implementation (SerialWriter) for formatted
-// Rust output, plus serial_puts() for byte-slice logging.
+// Rust output, plus puts() for byte-slice logging.
 
 use core::ptr;
 
@@ -113,11 +113,11 @@ mod aarch64 {
     static mut UART_BASE: u64 = 0;
 
     unsafe extern "C" {
-        fn driver_pci_init();
-        fn driver_virtio_console_init_mmio(base_addr: u64) -> bool;
-        fn driver_virtio_console_init_pci() -> bool;
-        fn driver_virtio_console_putc(c: u8);
-        fn driver_virtio_console_try_getc() -> i32;
+        fn pci_init();
+        fn virtio_console_init_mmio(base_addr: u64) -> bool;
+        fn virtio_console_init_pci() -> bool;
+        fn virtio_console_putc(c: u8);
+        fn virtio_console_try_getc() -> i32;
     }
 
     #[inline(always)]
@@ -152,7 +152,7 @@ mod aarch64 {
         // Try virtio-mmio console if FDT found virtio-mmio devices
         if fdt.virtio_count > 0 {
             for i in 0..fdt.virtio_count as usize {
-                if driver_virtio_console_init_mmio(fdt.virtio_bases[i]) {
+                if virtio_console_init_mmio(fdt.virtio_bases[i]) {
                     BACKEND = Backend::Virtio;
                     return;
                 }
@@ -161,8 +161,8 @@ mod aarch64 {
 
         // PCI VirtIO console (VZ.framework and other PCI platforms)
         if fdt.pcie_ecam_base != 0 {
-            driver_pci_init();
-            if driver_virtio_console_init_pci() {
+            pci_init();
+            if virtio_console_init_pci() {
                 BACKEND = Backend::Virtio;
                 return;
             }
@@ -173,7 +173,7 @@ mod aarch64 {
 
     pub unsafe fn putc(c: u8) {
         match BACKEND {
-            Backend::Virtio => driver_virtio_console_putc(c),
+            Backend::Virtio => virtio_console_putc(c),
             Backend::None => {},
             Backend::Pl011 => {
                 // Wait for TX FIFO not full
@@ -185,7 +185,7 @@ mod aarch64 {
 
     pub unsafe fn try_getc() -> i32 {
         match BACKEND {
-            Backend::Virtio => driver_virtio_console_try_getc(),
+            Backend::Virtio => virtio_console_try_getc(),
             Backend::None => -1,
             Backend::Pl011 => {
                 if (pl011_read(PL011_FR) & FR_RXFE) == 0 {
@@ -204,7 +204,7 @@ mod aarch64 {
 
 static mut SHUTDOWN_REQUESTED: bool = false;
 
-pub fn serial_init() {
+pub fn init() {
     unsafe {
         #[cfg(target_arch = "x86_64")]
         x86::init();
@@ -213,7 +213,7 @@ pub fn serial_init() {
     }
 }
 
-pub fn serial_putc(c: u8) {
+pub fn putc(c: u8) {
     unsafe {
         #[cfg(target_arch = "x86_64")]
         x86::putc(c);
@@ -222,16 +222,16 @@ pub fn serial_putc(c: u8) {
     }
 }
 
-pub fn serial_puts(s: &[u8]) {
+pub fn puts(s: &[u8]) {
     for &c in s {
         if c == b'\n' {
-            serial_putc(b'\r');
+            putc(b'\r');
         }
-        serial_putc(c);
+        putc(c);
     }
 }
 
-pub fn serial_try_getc() -> i32 {
+pub fn try_getc() -> i32 {
     unsafe {
         #[cfg(target_arch = "x86_64")]
         { x86::try_getc() }
@@ -240,13 +240,13 @@ pub fn serial_try_getc() -> i32 {
     }
 }
 
-pub fn serial_check_shutdown() -> bool {
+pub fn check_shutdown() -> bool {
     unsafe {
         if SHUTDOWN_REQUESTED {
             return true;
         }
         loop {
-            let c = serial_try_getc();
+            let c = try_getc();
             if c < 0 {
                 break;
             }
@@ -261,12 +261,12 @@ pub fn serial_check_shutdown() -> bool {
 
 // x86_64-specific: RX interrupt support for idle wakeup on Ctrl-C
 #[cfg(target_arch = "x86_64")]
-pub fn serial_enable_rx_irq() {
+pub fn enable_rx_irq() {
     unsafe { x86::enable_rx_irq(); }
 }
 
 #[cfg(target_arch = "x86_64")]
-pub fn serial_rx_isr() {
+pub fn rx_isr() {
     // Drain RX FIFO to clear the UART interrupt condition
     unsafe {
         loop {
@@ -293,16 +293,16 @@ impl core::fmt::Write for SerialWriter {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         for b in s.bytes() {
             if b == b'\n' {
-                unsafe { serial_putc(b'\r') };
+                unsafe { putc(b'\r') };
             }
-            unsafe { serial_putc(b) };
+            unsafe { putc(b) };
         }
         Ok(())
     }
 }
 
 /// Formatted serial output from Rust code.
-pub fn serial_write_fmt(args: core::fmt::Arguments) {
+pub fn write_fmt(args: core::fmt::Arguments) {
     use core::fmt::Write;
     let _ = SerialWriter.write_fmt(args);
 }

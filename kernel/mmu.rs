@@ -124,7 +124,7 @@ mod aarch64 {
 
 /// Map a range of physical addresses as device memory.
 /// On x86_64, this is a no-op (all physical memory is identity-mapped).
-pub fn mmu_map_device_range(phys_base: u64, size: u64) {
+pub fn map_device_range(phys_base: u64, size: u64) {
     #[cfg(target_arch = "aarch64")]
     unsafe { aarch64::map_device_range(phys_base, size); }
     #[cfg(not(target_arch = "aarch64"))]

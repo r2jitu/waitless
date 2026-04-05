@@ -393,7 +393,7 @@ unsafe fn parse_dtb(dtb_addr: u64) {
 /// Return a reference to the global parsed FDT info.
 ///
 /// # Safety
-/// Caller must ensure `fdt_init()` has been called first.
+/// Caller must ensure `init()` has been called first.
 pub unsafe fn info() -> &'static FdtInfo {
     &*(&raw const G_INFO)
 }
@@ -404,7 +404,7 @@ pub unsafe fn info() -> &'static FdtInfo {
 
 /// Parse the DTB at the given physical address.
 /// Safe to call with dtb_addr=0 (no-op).
-pub fn fdt_init(dtb_addr: u64) {
+pub fn init(dtb_addr: u64) {
     #[cfg(target_arch = "aarch64")]
     unsafe { parse_dtb(dtb_addr); }
     #[cfg(not(target_arch = "aarch64"))]
@@ -412,11 +412,11 @@ pub fn fdt_init(dtb_addr: u64) {
 }
 
 /// Return a pointer to the parsed FDT info.
-pub fn fdt_info_ptr() -> *const FdtInfo {
+pub fn info_ptr() -> *const FdtInfo {
     unsafe { &raw const G_INFO }
 }
 
 /// Copy the parsed FDT info to the caller's buffer.
-pub fn fdt_get_info(out: *mut FdtInfo) {
+pub fn get_info(out: *mut FdtInfo) {
     unsafe { ptr::copy_nonoverlapping(&raw const G_INFO, out, 1); }
 }

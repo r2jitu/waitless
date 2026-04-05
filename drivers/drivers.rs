@@ -17,14 +17,14 @@ use core::sync::atomic::{compiler_fence, Ordering};
 // ============================================================================
 extern crate kernel;
 use kernel::{exceptions as kernel_exceptions, fdt as kernel_fdt, mm as kernel_mm, mmu as kernel_mmu, serial as kernel_serial};
-use kernel_mm::{mm_alloc_frame, mm_phys_to_virt, mm_virt_to_phys, mm_kmalloc, mm_kfree};
-use kernel_mmu::mmu_map_device_range;
+use kernel_mm::{alloc_frame, phys_to_virt, virt_to_phys, kmalloc, kfree};
+use kernel_mmu::map_device_range;
 
 #[cfg(target_arch = "x86_64")]
 use kernel::x86_64 as x86_init;
 
 fn log(msg: &[u8]) {
-    kernel_serial::serial_puts(msg)
+    kernel_serial::puts(msg)
 }
 
 // ============================================================================
@@ -449,7 +449,7 @@ fn pci_init_inner() {
         if fdt.pcie_ecam_base != 0 {
             G_ECAM_BASE = fdt.pcie_ecam_base;
             if G_ECAM_BASE >= 0x1_0000_0000 {
-                mmu_map_device_range(G_ECAM_BASE, fdt.pcie_ecam_size);
+                map_device_range(G_ECAM_BASE, fdt.pcie_ecam_size);
             }
         }
         if fdt.pci_mmio32_base != 0 {
@@ -486,7 +486,7 @@ fn pci_find_device(vendor_id: u16, device_id: u16) -> Option<usize> {
     None
 }
 
-fn pci_enable_bus_mastering(slot: u8) {
+fn pci_enable_bus_mastering_inner(slot: u8) {
     #[cfg(target_arch = "aarch64")]
     {
         let cmd = pci_read_config16(0, slot, 0, 0x04);
@@ -520,16 +520,16 @@ fn pci_read_bar64(dev: &PciDevice, bar_idx: usize) -> u64 {
 // Public API — PCI
 // ============================================================================
 
-// NOTE: driver_pci_init is also called from kernel/serial.rs via FFI
+// NOTE: pci_init is also called from kernel/serial.rs via FFI
 // (serial cannot depend on drivers due to circular dependency).
 // Keep #[unsafe(no_mangle)] + extern "C" for FFI linkage.
 #[unsafe(no_mangle)]
-pub extern "C" fn driver_pci_init() {
+pub extern "C" fn pci_init() {
     pci_init_inner();
 }
 
-pub fn driver_pci_enable_bus_mastering(slot: u8) {
-    pci_enable_bus_mastering(slot);
+pub fn pci_enable_bus_mastering(slot: u8) {
+    pci_enable_bus_mastering_inner(slot);
 }
 
 // ============================================================================
@@ -611,7 +611,7 @@ fn resolve_bar(pci_idx: usize, bar_idx: usize) -> u64 {
 
     #[cfg(target_arch = "aarch64")]
     if addr >= 0x1_0000_0000 {
-        mmu_map_device_range(addr & !0x1F_FFFF, 2 << 20);
+        map_device_range(addr & !0x1F_FFFF, 2 << 20);
     }
 
     addr
@@ -689,7 +689,7 @@ fn vpci_find(virtio_device_type: u16) -> Option<usize> {
         *dev = VirtioPciDevice::ZERO;
         dev.pci_idx = pci_idx;
 
-        pci_enable_bus_mastering(PCI_DEVICES[pci_idx].slot);
+        pci_enable_bus_mastering_inner(PCI_DEVICES[pci_idx].slot);
 
         if !vpci_parse_caps(dev) { return None; }
 
@@ -928,13 +928,13 @@ impl Virtqueue {
         let total_size = first_region + second_region;
         let num_frames = (total_size + 4095) / 4096;
 
-        let phys_base = mm_alloc_frame();
+        let phys_base = alloc_frame();
         if phys_base == 0 { return None; }
         for _ in 1..num_frames {
-            mm_alloc_frame();
+            alloc_frame();
         }
 
-        let base_ptr = mm_phys_to_virt(phys_base);
+        let base_ptr = phys_to_virt(phys_base);
         unsafe { ptr::write_bytes(base_ptr, 0, total_size as usize); }
 
         self.descs = base_ptr as *mut VirtqDesc;
@@ -1276,7 +1276,7 @@ fn init_pci_modern() -> bool {
 
     // Allocate and populate RX buffers
     for i in 0..RX_BUFFERS {
-        let alloc = mm_kmalloc(BUFFER_SIZE as usize + 2);
+        let alloc = kmalloc(BUFFER_SIZE as usize + 2);
         if alloc.is_null() {
             log(b"virtio_net: failed to allocate RX buffer\n");
             vpci_set_status(dev, STATUS_FAILED);
@@ -1287,7 +1287,7 @@ fn init_pci_modern() -> bool {
         unsafe {
             ptr::write_bytes(buf, 0, VIRTIO_NET_HDR_SIZE);
             NET_RX_BUFFERS[i] = buf;
-            let buf_phys = mm_virt_to_phys(buf);
+            let buf_phys = virt_to_phys(buf);
             NET_RX_QUEUE.add_buf(buf_phys, BUFFER_SIZE, 0, 1);
         }
     }
@@ -1417,13 +1417,13 @@ fn init_mmio() -> bool {
 
     // Allocate RX buffers
     for i in 0..RX_BUFFERS {
-        let alloc = mm_kmalloc(BUFFER_SIZE as usize + 2);
+        let alloc = kmalloc(BUFFER_SIZE as usize + 2);
         if alloc.is_null() { return false; }
         let buf = unsafe { alloc.add(2) };
         unsafe {
             ptr::write_bytes(buf, 0, VIRTIO_NET_HDR_SIZE);
             NET_RX_BUFFERS[i] = buf;
-            let buf_phys = mm_virt_to_phys(buf);
+            let buf_phys = virt_to_phys(buf);
             NET_RX_QUEUE.add_buf(buf_phys, BUFFER_SIZE, 0, 1);
         }
     }
@@ -1466,7 +1466,7 @@ fn init_legacy_pci() -> bool {
         return false;
     }
 
-    pci_enable_bus_mastering(dev.slot);
+    pci_enable_bus_mastering_inner(dev.slot);
 
     // Get I/O base from BAR0
     let bar0 = dev.bar[0];
@@ -1525,12 +1525,12 @@ fn init_legacy_pci() -> bool {
 
     // Allocate RX buffers (no +2 alignment shift on x86)
     for i in 0..RX_BUFFERS {
-        let buf = mm_kmalloc(BUFFER_SIZE as usize);
+        let buf = kmalloc(BUFFER_SIZE as usize);
         if buf.is_null() { return false; }
         unsafe {
             ptr::write_bytes(buf, 0, VIRTIO_NET_HDR_SIZE);
             NET_RX_BUFFERS[i] = buf;
-            let buf_phys = mm_virt_to_phys(buf);
+            let buf_phys = virt_to_phys(buf);
             NET_RX_QUEUE.add_buf(buf_phys, BUFFER_SIZE, 0, 1);
         }
     }
@@ -1554,7 +1554,7 @@ fn init_legacy_pci() -> bool {
 // ---- TX drain ---------------------------------------------------------------
 
 fn tx_drain() {
-    let pool_phys = unsafe { mm_virt_to_phys(NET_TX_POOL.as_ptr() as *const u8) };
+    let pool_phys = unsafe { virt_to_phys(NET_TX_POOL.as_ptr() as *const u8) };
     unsafe {
         while let Some((used_id, _used_len)) = NET_TX_QUEUE.get_used() {
             let d = NET_TX_QUEUE.desc(used_id);
@@ -1571,11 +1571,11 @@ fn tx_drain() {
 // x86_64: extern "C" fn() wrapper for the idt.cc trampoline
 #[cfg(target_arch = "x86_64")]
 #[cfg(target_arch = "x86_64")]
-unsafe extern "C" fn driver_virtio_net_irq_handler_x86(_frame: *mut x86_init::idt::InterruptFrame) {
-    driver_virtio_net_irq_handler(0);
+unsafe extern "C" fn virtio_net_irq_handler_x86(_frame: *mut x86_init::idt::InterruptFrame) {
+    virtio_net_irq_handler(0);
 }
 
-fn driver_virtio_net_irq_handler(_irq: u32) {
+fn virtio_net_irq_handler(_irq: u32) {
     unsafe {
         // NAPI: disable notifications on entry
         NET_RX_QUEUE.disable_interrupts();
@@ -1603,7 +1603,7 @@ fn driver_virtio_net_irq_handler(_irq: u32) {
 // Public API — VirtIO-net
 // ============================================================================
 
-pub fn driver_virtio_net_init() -> bool {
+pub fn virtio_net_init() -> bool {
     log(b"virtio_net: initializing...\n");
 
     #[cfg(target_arch = "aarch64")]
@@ -1617,13 +1617,13 @@ pub fn driver_virtio_net_init() -> bool {
     }
 }
 
-pub fn driver_virtio_net_get_mac(mac_out: *mut u8) {
+pub fn virtio_net_get_mac(mac_out: *mut u8) {
     unsafe {
         ptr::copy_nonoverlapping(NET_MAC.as_ptr(), mac_out, 6);
     }
 }
 
-pub fn driver_virtio_net_send(data: *const u8, len: u32) {
+pub fn virtio_net_send(data: *const u8, len: u32) {
     if data.is_null() || len == 0 { return; }
     unsafe {
         if let Transport::None = NET_TRANSPORT { return; }
@@ -1660,7 +1660,7 @@ pub fn driver_virtio_net_send(data: *const u8, len: u32) {
         ptr::copy_nonoverlapping(data, buf.data.as_mut_ptr(), frame_len as usize);
 
         let total_len = VIRTIO_NET_HDR_SIZE as u32 + frame_len;
-        let buf_phys = mm_virt_to_phys(buf as *const TxBuf as *const u8);
+        let buf_phys = virt_to_phys(buf as *const TxBuf as *const u8);
         let head = NET_TX_QUEUE.add_buf(buf_phys, total_len, 1, 0);
         if head < 0 {
             NET_TX_POOL_USED[slot] = false;
@@ -1671,7 +1671,7 @@ pub fn driver_virtio_net_send(data: *const u8, len: u32) {
     }
 }
 
-pub fn driver_virtio_net_poll(
+pub fn virtio_net_poll(
     callback: unsafe extern "C" fn(*const u8, u32),
 ) -> i32 {
     unsafe {
@@ -1684,7 +1684,7 @@ pub fn driver_virtio_net_poll(
     unsafe {
         while let Some((used_id, used_len)) = NET_RX_QUEUE.get_used() {
             let desc = NET_RX_QUEUE.desc(used_id);
-            let buf = mm_phys_to_virt(desc.addr);
+            let buf = phys_to_virt(desc.addr);
 
             if used_len > VIRTIO_NET_HDR_SIZE as u32 {
                 let frame_len = used_len - VIRTIO_NET_HDR_SIZE as u32;
@@ -1693,7 +1693,7 @@ pub fn driver_virtio_net_poll(
             }
 
             // Re-arm RX buffer
-            let buf_phys = mm_virt_to_phys(buf);
+            let buf_phys = virt_to_phys(buf);
             NET_RX_QUEUE.add_buf(buf_phys, BUFFER_SIZE, 0, 1);
             count += 1;
         }
@@ -1706,7 +1706,7 @@ pub fn driver_virtio_net_poll(
     count
 }
 
-pub fn driver_virtio_net_enable_irq() {
+pub fn virtio_net_enable_irq() {
     unsafe {
         #[cfg(target_arch = "aarch64")]
         {
@@ -1718,7 +1718,7 @@ pub fn driver_virtio_net_enable_irq() {
                     let intid = if (slot as usize) < 8 { fdt.pci_irqs[slot as usize] } else { 0 };
                     if intid != 0 {
                         NET_RX_QUEUE.enable_interrupts();
-                        kernel_exceptions::exceptions_register_irq(intid, driver_virtio_net_irq_handler);
+                        kernel_exceptions::register_irq(intid, virtio_net_irq_handler);
                         NET_IRQ_IDLE_AVAILABLE = true;
                     }
                 }
@@ -1726,7 +1726,7 @@ pub fn driver_virtio_net_enable_irq() {
                     for i in 0..fdt.virtio_count as usize {
                         if fdt.virtio_bases[i] == base && fdt.virtio_irqs[i] != 0 {
                             NET_RX_QUEUE.enable_interrupts();
-                            kernel_exceptions::exceptions_register_irq(fdt.virtio_irqs[i], driver_virtio_net_irq_handler);
+                            kernel_exceptions::register_irq(fdt.virtio_irqs[i], virtio_net_irq_handler);
                             NET_IRQ_IDLE_AVAILABLE = true;
                             break;
                         }
@@ -1744,7 +1744,7 @@ pub fn driver_virtio_net_enable_irq() {
                 let irq_line = (irq_reg & 0xFF) as u8;
                 if irq_line < 16 {
                     NET_RX_QUEUE.enable_interrupts();
-                    x86_init::idt::register_handler(32 + irq_line, driver_virtio_net_irq_handler_x86);
+                    x86_init::idt::register_handler(32 + irq_line, virtio_net_irq_handler_x86);
                     x86_init::idt::enable_irq(irq_line);
                     NET_IRQ_IDLE_AVAILABLE = true;
                 }
@@ -1753,15 +1753,15 @@ pub fn driver_virtio_net_enable_irq() {
     }
 }
 
-pub fn driver_virtio_net_irq_idle_supported() -> bool {
+pub fn virtio_net_irq_idle_supported() -> bool {
     unsafe { NET_IRQ_IDLE_AVAILABLE }
 }
 
-pub fn driver_virtio_net_arm_rx_interrupts() {
+pub fn virtio_net_arm_rx_interrupts() {
     unsafe { NET_RX_QUEUE.enable_interrupts(); }
 }
 
-pub fn driver_virtio_net_has_pending_rx() -> bool {
+pub fn virtio_net_has_pending_rx() -> bool {
     unsafe { NET_RX_QUEUE.has_used() }
 }
 
@@ -2110,25 +2110,25 @@ fn con_try_getc() -> i32 {
 /// Initialize console via virtio-mmio at given base address.
 /// Returns true if device found and initialized.
 #[unsafe(no_mangle)]
-pub extern "C" fn driver_virtio_console_init_mmio(base_addr: u64) -> bool {
+pub extern "C" fn virtio_console_init_mmio(base_addr: u64) -> bool {
     con_init_mmio(base_addr)
 }
 
 /// Initialize console via PCI (scans PCI bus, finds device type 3).
-/// PCI must be initialized first (driver_pci_init).
+/// PCI must be initialized first (pci_init).
 #[unsafe(no_mangle)]
-pub extern "C" fn driver_virtio_console_init_pci() -> bool {
+pub extern "C" fn virtio_console_init_pci() -> bool {
     con_init_pci()
 }
 
 /// Write one byte to the console.
 #[unsafe(no_mangle)]
-pub extern "C" fn driver_virtio_console_putc(c: u8) {
+pub extern "C" fn virtio_console_putc(c: u8) {
     con_putc(c);
 }
 
 /// Try to read one byte from the console. Returns -1 if nothing available.
 #[unsafe(no_mangle)]
-pub extern "C" fn driver_virtio_console_try_getc() -> i32 {
+pub extern "C" fn virtio_console_try_getc() -> i32 {
     con_try_getc()
 }

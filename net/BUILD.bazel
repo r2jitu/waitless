@@ -4,7 +4,7 @@ package(default_visibility = ["//visibility:public"])
 
 # Rust network stack: Ethernet, ARP, IPv4, TCP, DHCP.
 # Linked as rust_library — depends on kernel and driver crates directly.
-# The #[no_mangle] extern "C" exports (uni_tcp_*, net_tcp_init, etc.)
+# The #[no_mangle] extern "C" exports (uni_tcp_*, tcp_init, etc.)
 # are available for C++ linking when included transitively via entry_rs.
 rust_library(
     name = "stack_rs",

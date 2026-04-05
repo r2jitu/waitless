@@ -152,7 +152,7 @@ mod aarch64 {
             klog!("    x0  = 0x{:x}  x1  = 0x{:x}\n", frame.x[0], frame.x[1]);
 
             // Halt — unrecoverable
-            kernel_serial::serial_puts(b"\nSystem halted.\n");
+            kernel_serial::puts(b"\nSystem halted.\n");
             loop {
                 asm!("wfe", options(nomem, nostack));
             }
@@ -163,7 +163,7 @@ mod aarch64 {
 
     macro_rules! klog {
         ($($arg:tt)*) => {
-            kernel_serial::serial_write_fmt(format_args!($($arg)*));
+            kernel_serial::write_fmt(format_args!($($arg)*));
         };
     }
     use klog;
@@ -274,7 +274,7 @@ mod aarch64 {
         } else if GIC_VERSION == 2 {
             init_gicv2();
         } else {
-            kernel_serial::serial_puts(b"       GIC init skipped (no GIC in DTB)\n");
+            kernel_serial::puts(b"       GIC init skipped (no GIC in DTB)\n");
         }
     }
 
@@ -316,14 +316,14 @@ mod aarch64 {
 // ============================================================================
 
 /// Initialise the GIC (or no-op on x86_64).
-pub fn exceptions_init() {
+pub fn init() {
     #[cfg(target_arch = "aarch64")]
     unsafe { aarch64::init(); }
 }
 
 /// Register an IRQ handler (aarch64 GIC).
 /// On x86_64 this is a no-op — IDT registration goes through idt.cc.
-pub fn exceptions_register_irq(irq: u32, handler: fn(u32)) {
+pub fn register_irq(irq: u32, handler: fn(u32)) {
     #[cfg(target_arch = "aarch64")]
     unsafe { aarch64::register_irq(irq, handler); }
     #[cfg(not(target_arch = "aarch64"))]
@@ -331,7 +331,7 @@ pub fn exceptions_register_irq(irq: u32, handler: fn(u32)) {
 }
 
 /// Enable the timer wakeup PPI (INTID 27) for idle().
-pub fn exceptions_enable_timer_wakeup() {
+pub fn enable_timer_wakeup() {
     #[cfg(target_arch = "aarch64")]
     unsafe { aarch64::enable_timer_wakeup(); }
 }

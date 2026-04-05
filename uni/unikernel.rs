@@ -5,7 +5,7 @@ use kernel::serial as kernel_serial;
 // ---- Lifecycle / config -------------------------------------------------------
 
 pub fn log(msg: &[u8]) {
-    kernel_serial::serial_puts(msg)
+    kernel_serial::puts(msg)
 }
 
 pub fn config_port(default_port: u16) -> u16 {
@@ -13,16 +13,16 @@ pub fn config_port(default_port: u16) -> u16 {
 }
 
 pub fn check_shutdown() -> bool {
-    kernel_serial::serial_check_shutdown()
+    kernel_serial::check_shutdown()
 }
 
 // ---- Wait for events (arch-specific idle) -------------------------------------
 
 pub fn wait_for_events() {
-    if drivers::driver_virtio_net_irq_idle_supported() {
+    if drivers::virtio_net_irq_idle_supported() {
         unsafe { arch_mask_irq() };
-        drivers::driver_virtio_net_arm_rx_interrupts();
-        if !drivers::driver_virtio_net_has_pending_rx() {
+        drivers::virtio_net_arm_rx_interrupts();
+        if !drivers::virtio_net_has_pending_rx() {
             unsafe { arch_idle() };
         }
         unsafe { arch_unmask_irq() };

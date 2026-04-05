@@ -299,10 +299,10 @@ pub extern "C" fn limine_entry_cpp() {
 
             // Parse FDT and map PCIe ECAM before serial::init()
             if LIMINE_BOOT_INFO.dtb_addr != 0 {
-                kernel_fdt::fdt_init(LIMINE_BOOT_INFO.dtb_addr);
-                let info = &*kernel_fdt::fdt_info_ptr();
+                kernel_fdt::init(LIMINE_BOOT_INFO.dtb_addr);
+                let info = &*kernel_fdt::info_ptr();
                 if info.pcie_ecam_base != 0 && info.pcie_ecam_size != 0 {
-                    kernel_mmu::mmu_map_device_range(info.pcie_ecam_base, info.pcie_ecam_size);
+                    kernel_mmu::map_device_range(info.pcie_ecam_base, info.pcie_ecam_size);
                 }
             }
         }

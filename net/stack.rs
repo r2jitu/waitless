@@ -22,7 +22,7 @@ use kernel::{serial as kernel_serial, mm as kernel_mm};
 extern crate drivers;
 
 fn log(msg: &[u8]) {
-    kernel_serial::serial_puts(msg)
+    kernel_serial::puts(msg)
 }
 
 /// Busy-wait for approximately `us` microseconds.
@@ -239,7 +239,7 @@ static mut MAC_CACHED: bool = false;
 fn ethernet_our_mac() -> MacAddr {
     unsafe {
         if !MAC_CACHED {
-            drivers::driver_virtio_net_get_mac(OUR_MAC.bytes.as_mut_ptr());
+            drivers::virtio_net_get_mac(OUR_MAC.bytes.as_mut_ptr());
             MAC_CACHED = true;
         }
         OUR_MAC
@@ -258,7 +258,7 @@ fn ethernet_send(dst: MacAddr, ethertype: u16, payload: &[u8]) {
         let payload_len = payload.len().min(1500);
         ptr::copy_nonoverlapping(payload.as_ptr(), ETH_TX_BUF.as_mut_ptr().add(14), payload_len);
 
-        drivers::driver_virtio_net_send(ETH_TX_BUF.as_ptr(), (14 + payload_len) as u32);
+        drivers::virtio_net_send(ETH_TX_BUF.as_ptr(), (14 + payload_len) as u32);
     }
 }
 
@@ -450,7 +450,7 @@ fn arp_resolve(ip: Ipv4Addr) -> Option<MacAddr> {
     for _retry in 0..3 {
         arp_request(target);
         for _poll in 0..200_000 {
-            drivers::driver_virtio_net_poll(ethernet_receive);
+            drivers::virtio_net_poll(ethernet_receive);
             if let Some(mac) = arp_lookup(target) {
                 return Some(mac);
             }
@@ -724,7 +724,7 @@ fn alloc_connection() -> Option<usize> {
 fn free_connection(idx: usize) {
     unsafe {
         if !CONNECTIONS[idx].rx_buf.is_null() {
-            kernel_mm::mm_kfree(CONNECTIONS[idx].rx_buf);
+            kernel_mm::kfree(CONNECTIONS[idx].rx_buf);
         }
         CONNECTIONS[idx] = TcpConnection::new();
     }
@@ -866,7 +866,7 @@ fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: *const u8, len: usize)
             c.accepted = false;
 
             // Allocate RX buffer
-            c.rx_buf = kernel_mm::mm_kmalloc(RX_BUF_SIZE);
+            c.rx_buf = kernel_mm::kmalloc(RX_BUF_SIZE);
             c.rx_buf_size = RX_BUF_SIZE;
             c.rx_head = 0;
             c.rx_tail = 0;
@@ -1177,7 +1177,7 @@ fn dhcp_send_discover() {
     ip.checksum = 0;
     ip.checksum = unsafe { checksum(frame.as_ptr().add(14) as *const u8, 20) };
 
-    drivers::driver_virtio_net_send(frame.as_ptr(), (14 + ip_total) as u32);
+    drivers::virtio_net_send(frame.as_ptr(), (14 + ip_total) as u32);
 }
 
 fn dhcp_send_request() {
@@ -1245,13 +1245,13 @@ fn dhcp_send_request() {
     ip.checksum = 0;
     ip.checksum = unsafe { checksum(frame.as_ptr().add(14) as *const u8, 20) };
 
-    drivers::driver_virtio_net_send(frame.as_ptr(), (14 + ip_total) as u32);
+    drivers::virtio_net_send(frame.as_ptr(), (14 + ip_total) as u32);
 }
 
 fn dhcp_poll_wait(timeout_ms: u32) -> bool {
     for _ in 0..timeout_ms {
         unsafe {
-            drivers::driver_virtio_net_poll(dhcp_receive);
+            drivers::virtio_net_poll(dhcp_receive);
             if DHCP_GOT_OFFER || DHCP_GOT_ACK {
                 return true;
             }
@@ -1266,7 +1266,7 @@ fn dhcp_poll_wait(timeout_ms: u32) -> bool {
 // ============================================================================
 
 /// Initialize TCP connection pool.
-pub fn net_tcp_init() {
+pub fn tcp_init() {
     unsafe {
         for i in 0..MAX_CONNECTIONS {
             CONNECTIONS[i] = TcpConnection::new();
@@ -1275,7 +1275,7 @@ pub fn net_tcp_init() {
 }
 
 /// DHCP discover — blocks until IP obtained or timeout.
-pub fn net_dhcp_discover() -> bool {
+pub fn dhcp_discover() -> bool {
     unsafe {
         DHCP_GOT_OFFER = false;
         DHCP_GOT_ACK = false;
@@ -1320,7 +1320,7 @@ pub fn net_dhcp_discover() -> bool {
 }
 
 /// Set fallback network config (called from entry.rs if DHCP fails).
-pub fn net_set_fallback_config(
+pub fn set_fallback_config(
     ip_a: u8, ip_b: u8, ip_c: u8, ip_d: u8,
     mask_a: u8, mask_b: u8, mask_c: u8, mask_d: u8,
     gw_a: u8, gw_b: u8, gw_c: u8, gw_d: u8,
@@ -1457,5 +1457,5 @@ pub fn tcp_is_closed(handle: *mut ()) -> bool {
 }
 
 pub fn tcp_poll() {
-    drivers::driver_virtio_net_poll(ethernet_receive);
+    drivers::virtio_net_poll(ethernet_receive);
 }

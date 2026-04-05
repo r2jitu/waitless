@@ -32,7 +32,7 @@ unsafe extern "C" {
 }
 
 fn log_fmt(args: core::fmt::Arguments) {
-    kernel_serial::serial_write_fmt(args);
+    kernel_serial::write_fmt(args);
 }
 
 macro_rules! klog {
@@ -137,7 +137,7 @@ fn align_up_page(val: u64) -> u64 {
 // Public API
 // ============================================================================
 
-pub fn mm_init(info: *const BootInfo) {
+pub fn init(info: *const BootInfo) {
     unsafe {
     let info = &*info;
 
@@ -264,7 +264,7 @@ pub fn mm_init(info: *const BootInfo) {
     } // unsafe
 }
 
-pub fn mm_alloc_frame() -> u64 {
+pub fn alloc_frame() -> u64 {
     unsafe {
         // Linear scan for the first free frame
         for i in 0..TOTAL_FRAMES {
@@ -279,7 +279,7 @@ pub fn mm_alloc_frame() -> u64 {
     }
 }
 
-pub fn mm_free_frame(addr: u64) {
+pub fn free_frame(addr: u64) {
     unsafe {
         let frame = addr / PAGE_SIZE;
         if frame >= TOTAL_FRAMES {
@@ -292,7 +292,7 @@ pub fn mm_free_frame(addr: u64) {
     }
 }
 
-pub fn mm_kmalloc(size: usize) -> *mut u8 {
+pub fn kmalloc(size: usize) -> *mut u8 {
     unsafe {
         if size == 0 {
             return ptr::null_mut();
@@ -330,7 +330,7 @@ pub fn mm_kmalloc(size: usize) -> *mut u8 {
     }
 }
 
-pub fn mm_kfree(ptr: *mut u8) {
+pub fn kfree(ptr: *mut u8) {
     unsafe {
         if ptr.is_null() {
             return;
@@ -373,15 +373,15 @@ pub fn mm_kfree(ptr: *mut u8) {
     }
 }
 
-pub fn mm_get_total_memory() -> usize {
+pub fn get_total_memory() -> usize {
     unsafe { TOTAL_MEMORY_BYTES as usize }
 }
 
-pub fn mm_get_free_memory() -> usize {
+pub fn get_free_memory() -> usize {
     unsafe { ((TOTAL_FRAMES - USED_FRAMES) * PAGE_SIZE) as usize }
 }
 
-pub fn mm_phys_to_virt(phys: u64) -> *mut u8 {
+pub fn phys_to_virt(phys: u64) -> *mut u8 {
     #[cfg(target_arch = "aarch64")]
     {
         phys as *mut u8
@@ -392,7 +392,7 @@ pub fn mm_phys_to_virt(phys: u64) -> *mut u8 {
     }
 }
 
-pub fn mm_virt_to_phys(virt: *const u8) -> u64 {
+pub fn virt_to_phys(virt: *const u8) -> u64 {
     #[cfg(target_arch = "aarch64")]
     {
         virt as u64

@@ -27,7 +27,7 @@ use types::{BootInfo, MemoryRegion, Protocol, MEM_AVAILABLE, MEM_RESERVED, MAX_M
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    serial::serial_puts(b"PANIC in entry\n");
+    serial::puts(b"PANIC in entry\n");
     unsafe { arch_shutdown() }
 }
 
@@ -89,9 +89,9 @@ fn klog(args: core::fmt::Arguments) {
         fn write_str(&mut self, s: &str) -> core::fmt::Result {
             for b in s.bytes() {
                 if b == b'\n' {
-                    serial::serial_putc(b'\r');
+                    serial::putc(b'\r');
                 }
-                serial::serial_putc(b);
+                serial::putc(b);
             }
             Ok(())
         }
@@ -291,7 +291,7 @@ mod boot_shim_fdt {
         info.kernel_virt_base = 0;
         info.hhdm_offset = 0;
 
-        let fdt = &*fdt::fdt_info_ptr();
+        let fdt = &*fdt::info_ptr();
         let ram_base = if fdt.ram_size != 0 {
             fdt.ram_base
         } else {
@@ -325,7 +325,7 @@ mod boot_shim_fdt {
 static mut G_BOOT_INFO: BootInfo = BootInfo::zeroed();
 
 unsafe fn kernel_boot(info: &BootInfo) {
-    serial::serial_init();
+    serial::init();
     klog!("\n");
     klog!("==============================================\n");
     #[cfg(target_arch = "aarch64")]
@@ -339,7 +339,7 @@ unsafe fn kernel_boot(info: &BootInfo) {
 
     #[cfg(target_arch = "aarch64")]
     {
-        let fdt = &*fdt::fdt_info_ptr();
+        let fdt = &*fdt::info_ptr();
         klog!(
             "[FDT] uart=0x{:x} pcie=0x{:x} virtio={} gic=0x{:x} ram=0x{:x}+{}MB\n",
             fdt.uart_base,
@@ -361,41 +361,41 @@ unsafe fn kernel_boot(info: &BootInfo) {
     #[cfg(target_arch = "aarch64")]
     {
         klog!("[INIT] Exception vectors + GIC...\n");
-        exceptions::exceptions_init();
+        exceptions::init();
     }
 
     klog!("[INIT] Memory manager...\n");
-    mm::mm_init(info as *const BootInfo);
+    mm::init(info as *const BootInfo);
     klog!(
         "       {} MB total, {} MB free\n",
-        mm::mm_get_total_memory() / (1024 * 1024),
-        mm::mm_get_free_memory() / (1024 * 1024)
+        mm::get_total_memory() / (1024 * 1024),
+        mm::get_free_memory() / (1024 * 1024)
     );
 
     call_global_constructors();
 
     klog!("[INIT] PCI bus scan (Rust)...\n");
-    drivers::driver_pci_init();
+    drivers::pci_init();
 
     klog!("[INIT] Virtio-net driver (Rust)...\n");
-    let net_ok = drivers::driver_virtio_net_init();
+    let net_ok = drivers::virtio_net_init();
     if !net_ok {
         klog!("       [WARN] No virtio-net device found.\n");
     } else {
         let mut mac = [0u8; 6];
-        drivers::driver_virtio_net_get_mac(mac.as_mut_ptr());
+        drivers::virtio_net_get_mac(mac.as_mut_ptr());
         klog!(
             "       MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
         );
 
         klog!("[INIT] DHCP (Rust)...\n");
-        let dhcp_ok = net_stack::net_dhcp_discover();
+        let dhcp_ok = net_stack::dhcp_discover();
         if dhcp_ok {
             klog!("       IP obtained successfully\n");
         } else {
             klog!("       [WARN] DHCP failed, using 10.0.2.15/24\n");
-            net_stack::net_set_fallback_config(
+            net_stack::set_fallback_config(
                 10, 0, 2, 15,      // IP
                 255, 255, 255, 0,   // subnet
                 10, 0, 2, 2,       // gateway
@@ -404,16 +404,16 @@ unsafe fn kernel_boot(info: &BootInfo) {
         }
 
         klog!("[INIT] TCP stack (Rust)...\n");
-        net_stack::net_tcp_init();
+        net_stack::tcp_init();
 
         klog!("[INIT] Interrupt-driven idle...\n");
-        drivers::driver_virtio_net_enable_irq();
+        drivers::virtio_net_enable_irq();
 
         #[cfg(target_arch = "aarch64")]
         {
-            let fdt = &*fdt::fdt_info_ptr();
+            let fdt = &*fdt::info_ptr();
             if fdt.gic_dist_base != 0 {
-                exceptions::exceptions_enable_timer_wakeup();
+                exceptions::enable_timer_wakeup();
             }
             // Unmask IRQ only (not FIQ — VZ uses FIQ for hypervisor)
             if fdt.gic_dist_base != 0 {
@@ -425,7 +425,7 @@ unsafe fn kernel_boot(info: &BootInfo) {
             // Serial RX interrupt (IRQ4 / vector 36) for Ctrl-C wakeup
             x86_init::idt::register_handler(36, serial_rx_isr_trampoline);
             x86_init::idt::enable_irq(4);
-            serial::serial_enable_rx_irq();
+            serial::enable_rx_irq();
         }
     }
 
@@ -440,7 +440,7 @@ unsafe fn kernel_boot(info: &BootInfo) {
 // x86_64: ISR trampoline for serial RX (ignores InterruptFrame pointer)
 #[cfg(target_arch = "x86_64")]
 unsafe extern "C" fn serial_rx_isr_trampoline(_frame: *mut x86_init::idt::InterruptFrame) {
-    serial::serial_rx_isr();
+    serial::rx_isr();
 }
 
 // ============================================================================
@@ -455,18 +455,18 @@ pub unsafe extern "C" fn kernel_main(boot_info_addr: u64) {
     #[cfg(target_arch = "aarch64")]
     {
         // Parse DTB before serial::init() (PL011 address comes from FDT)
-        fdt::fdt_init(boot_info_addr);
+        fdt::init(boot_info_addr);
 
         // Map device MMIO regions before any access
-        let fdt = &*fdt::fdt_info_ptr();
+        let fdt = &*fdt::info_ptr();
         if fdt.pcie_ecam_base != 0 && fdt.pcie_ecam_size != 0 {
-            mmu::mmu_map_device_range(fdt.pcie_ecam_base, fdt.pcie_ecam_size);
+            mmu::map_device_range(fdt.pcie_ecam_base, fdt.pcie_ecam_size);
         }
         if fdt.gic_dist_base != 0 {
-            mmu::mmu_map_device_range(fdt.gic_dist_base, 0x10000);
+            mmu::map_device_range(fdt.gic_dist_base, 0x10000);
         }
         if fdt.gic_redist_base != 0 {
-            mmu::mmu_map_device_range(fdt.gic_redist_base, 0x20000);
+            mmu::map_device_range(fdt.gic_redist_base, 0x20000);
         }
 
         boot_shim_fdt::shim(&mut G_BOOT_INFO, boot_info_addr);
