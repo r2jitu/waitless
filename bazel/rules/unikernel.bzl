@@ -6,49 +6,59 @@ produces bootable images for local testing (QEMU, VZ) and cloud deployment
 """
 
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_static_library")
 load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
 
-def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
-    """Build a unikernel ELF binary from application sources.
+def unikernel_binary(name, app_srcs, app_deps = [], visibility = None):
+    """Build a unikernel ELF binary from Rust application sources.
 
     Targets produced:
       - <name>.elf        : Bare-metal ELF kernel binary (identity-mapped)
       - <name>.limine.elf : Higher-half ELF for Limine boot
       - <name>.img        : Raw binary (objcopy, for QEMU -kernel / VZ)
       - <name>.iso        : Limine-bootable ISO (BIOS+UEFI, for cloud/QEMU)
-      - <name>_native     : Native POSIX binary (same app code, host OS TCP)
-      - <name>_run        : Launch with runner selected by --config:
-                              (default)           → native POSIX binary
-                              --config=vz         → VZ.framework (macOS arm64)
-                              --config=qemu       → QEMU (host arch)
-                              --config=aarch64-vz  → explicit
-                              --config=x86_64-qemu, --config=x86_64-iso, …
-                              --config=native      → native (host arch, from .bazelrc.local)
-                              --config=aarch64-macos, --config=x86_64-linux → explicit
+      - <name>_native     : Native POSIX binary (rust_binary, no VM)
+      - <name>_run        : Launch with runner selected by --config
 
     Args:
         name: Base name for all output targets.
-        srcs: Application source files (typically main.cc).
-        deps: Additional dependencies beyond the kernel runtime.
-        copts: Additional compiler flags.
+        app_srcs: Rust source files (e.g. ["main.rs"]).
+        app_deps: Rust library dependencies (e.g. ["//net:http_rs", "//uni:api"]).
         visibility: Bazel visibility specification.
     """
+
+    # Common rustc flags for the application crate.
+    common_rustc_flags = ["-C", "panic=abort", "-C", "opt-level=2"]
+    unikernel_rustc_flags = common_rustc_flags + select({
+        "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
+        "//conditions:default": [],
+    })
+
+    # ---- Unikernel ELF (cc_binary links Rust static lib + ASM) ----
+
+    # Compile app as rust_static_library for linking into cc_binary.
+    rust_static_library(
+        name = name + "_rs",
+        srcs = app_srcs,
+        edition = "2024",
+        deps = app_deps,
+        rustc_flags = unikernel_rustc_flags,
+        visibility = ["//visibility:private"],
+    )
+
     cc_binary(
         name = name + ".elf",
-        srcs = srcs,
-        deps = deps + [
+        srcs = [],
+        deps = [
+            ":" + name + "_rs",
             "//kernel:entry",
             "//kernel:entry_rs",
             "//kernel:boot",
         ],
-        copts = copts,
-        linkopts = [],
         visibility = visibility,
     )
 
     # Flat binary image for ARM64 bootloaders (VZ.framework, QEMU -kernel).
-    # Converts ELF → raw binary via llvm-objcopy at build time so the
-    # runtime tools (run-vz, run-local.sh) don't need to do it themselves.
     native.genrule(
         name = name + ".img",
         srcs = [":" + name + ".elf"],
@@ -72,24 +82,24 @@ def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
         visibility = visibility,
     )
 
-    # Native POSIX binary — same application code, host OS TCP backend.
-    # Only built when the platform has the runtime:native constraint
-    # (aarch64_macos or x86_64_linux); excluded from unikernel
-    # platforms (os:none) where the bare-metal toolchain would be selected.
-    # The native backend (uni/native.rs) is pulled in transitively via
-    # uni:api → uni:native (selected by #[cfg(platform_native)]).
-    cc_binary(
+    # ---- Native POSIX binary (pure rust_binary, no VM) ----
+
+    rust_binary(
         name = name + "_native",
-        srcs = srcs,
-        deps = deps,
-        copts = copts,
+        srcs = app_srcs,
+        edition = "2024",
+        deps = app_deps,
+        rustc_flags = common_rustc_flags + select({
+            # no_std crates need explicit system library linking
+            "@platforms//os:macos": ["-C", "link-arg=-lSystem"],
+            "//conditions:default": ["-C", "link-arg=-lc", "-C", "link-arg=-lpthread"],
+        }),
         target_compatible_with = ["//bazel/platforms:native"],
         visibility = visibility,
     )
 
-    # Unified run target — runner selected by --define=uni_runner=<value>.
-    # Default (no define): native POSIX binary.
-    # --config=vz/qemu/iso (or --config=<arch>-<runner>) set the define.
+    # ---- Unified run target ----
+
     sh_binary(
         name = name + "_run",
         srcs = select({
@@ -104,13 +114,10 @@ def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
                 "//scripts:run_vz",
             ],
             "//bazel/platforms:runner_qemu": [
-                # Include both .elf and .img: run_qemu.sh uses .elf for x86_64
-                # and .img for aarch64 (both are needed to avoid nested select).
                 ":" + name + ".elf",
                 ":" + name + ".img",
             ],
             "//bazel/platforms:runner_iso": [
-                # .iso already embeds the kernel; only the ISO path is needed.
                 ":" + name + ".iso",
             ],
             "//conditions:default": [
@@ -136,29 +143,22 @@ def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
         visibility = visibility,
     )
 
-    # Higher-half ELF for Limine boot.
-    # Limine revision 3 requires kernel virtual addresses >= 0xFFFF800000000000.
-    # This target re-links the same sources with a supplemental linker script
-    # that overrides __kernel_base to place the kernel in the top-2GB region.
-    # Excludes //kernel:boot (boot.S) because its 32-bit entry code uses
-    # R_X86_64_32 relocations that can't reach higher-half addresses.
-    # Limine enters at limine_entry() directly — boot.S is not needed.
+    # ---- Higher-half ELF for Limine boot ----
+
     cc_binary(
         name = name + ".limine.elf",
-        srcs = srcs,
-        deps = deps + [
+        srcs = [],
+        deps = [
+            ":" + name + "_rs",
             "//kernel:entry",
             "//kernel:entry_rs",
         ],
-        copts = copts,
         linkopts = ["-Wl,-T,bazel/toolchain/unikernel_limine.ld"],
         visibility = visibility,
     )
 
-    # Limine-bootable ISO (BIOS+UEFI hybrid).
-    # Uses the higher-half ELF on x86_64 (required by Limine revision 3)
-    # and the normal ELF on aarch64.
-    # Prerequisites: xorriso (brew install xorriso), git.
+    # ---- Limine-bootable ISO ----
+
     native.genrule(
         name = name + ".iso",
         srcs = select({
@@ -185,6 +185,6 @@ def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
             """.format(name_limine_elf = name + ".limine.elf"),
         }),
         tools = ["//scripts:make_limine_iso"],
-        local = True,  # Needs network (first run) and host tools
+        local = True,
         visibility = visibility,
     )

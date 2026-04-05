@@ -1,30 +1,12 @@
-load("@rules_rust//rust:defs.bzl", "rust_static_library")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("//bazel/rules:unikernel.bzl", "unikernel_binary")
 
 package(default_visibility = ["//visibility:public"])
 
-# ---- Rust application --------------------------------------------------------
-
-rust_static_library(
-    name = "webserver_rs",
-    srcs = ["main.rs"],
-    edition = "2024",
-    deps = ["//net:http_rs", "//uni:api"],
-    rustc_flags = ["-C", "panic=abort", "-C", "opt-level=2"] + select({
-        "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
-        "//conditions:default": [],
-    }),
-)
-
 unikernel_binary(
     name = "webserver",
-    srcs = [],
-    deps = [":webserver_rs"],
-    copts = [
-        "-I.",
-        "-Iinclude",
-    ],
+    app_srcs = ["main.rs"],
+    app_deps = ["//net:http_rs", "//uni:api"],
 )
 
 # Friendly alias: bazel run //apps/webserver  (or :run)
