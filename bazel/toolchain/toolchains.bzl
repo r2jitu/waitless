@@ -1,7 +1,7 @@
 """Helper to register CC toolchains with minimal boilerplate."""
 
-load(":cc_toolchain_config.bzl", "cc_toolchain_config")
 load("@rules_cc//cc/toolchains:cc_toolchain.bzl", "cc_toolchain")
+load(":cc_toolchain_config.bzl", "cc_toolchain_config")
 
 def register_cc_toolchain(name, cpu, os, target_system, target_libc = "none", pic = False):
     """Register a CC toolchain for a (cpu, os) platform pair."""

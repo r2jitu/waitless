@@ -1,7 +1,7 @@
 load("@rules_rust//rust:defs.bzl", "rust_library")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
-load("//bazel/rules:unikernel.bzl", "unikernel_binary")
 load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
+load("//bazel/rules:unikernel.bzl", "unikernel_binary")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -9,8 +9,8 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "app",
     srcs = ["main.rs"],
-    deps = ["//uni"],
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    deps = ["//uni"],
 )
 
 unikernel_binary(
@@ -18,21 +18,25 @@ unikernel_binary(
     app = ":app",
 )
 
-alias(name = "run", actual = ":webserver_run")
+alias(
+    name = "run",
+    actual = ":webserver_run",
+)
 
 sh_test(
     name = "test",
+    timeout = "long",
     srcs = select({
-        "//bazel/platforms:runner_vz":   ["test_vz.sh"],
+        "//bazel/platforms:runner_vz": ["test_vz.sh"],
         "//bazel/platforms:runner_qemu": ["test_qemu.sh"],
-        "//bazel/platforms:runner_iso":  ["test_iso.sh"],
-        "//conditions:default":          ["test_native.sh"],
+        "//bazel/platforms:runner_iso": ["test_iso.sh"],
+        "//conditions:default": ["test_native.sh"],
     }),
     data = select({
         "//bazel/platforms:runner_vz": [
             ":webserver.img",
-            "//scripts:run_vz",
             "//scripts:helpers.sh",
+            "//scripts:run_vz",
         ],
         "//bazel/platforms:runner_qemu": [
             ":webserver.elf",
@@ -40,14 +44,16 @@ sh_test(
             "//scripts:helpers.sh",
         ],
         "//bazel/platforms:runner_iso": [
-            ":webserver.limine.elf",
             ":webserver.iso",
+            ":webserver.limine.elf",
             "//scripts:helpers.sh",
         ],
         "//conditions:default": [
             ":webserver_native",
         ],
     }),
-    tags = ["local", "exclusive"],
-    timeout = "long",
+    tags = [
+        "exclusive",
+        "local",
+    ],
 )

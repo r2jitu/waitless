@@ -5,7 +5,18 @@ package(default_visibility = ["//visibility:public"])
 
 rust_library(
     name = "net",
-    srcs = ["lib.rs", "types.rs", "ethernet.rs", "arp.rs", "ipv4.rs", "tcp.rs", "dhcp.rs"],
-    deps = ["//kernel", "//drivers"],
+    srcs = [
+        "arp.rs",
+        "dhcp.rs",
+        "ethernet.rs",
+        "ipv4.rs",
+        "lib.rs",
+        "tcp.rs",
+        "types.rs",
+    ],
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    deps = [
+        "//drivers",
+        "//kernel",
+    ],
 )

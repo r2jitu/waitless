@@ -5,14 +5,23 @@ package(default_visibility = ["//visibility:public"])
 
 rust_library(
     name = "uni",
-    srcs = ["lib.rs", "unikernel.rs", "native.rs", "http.rs"],
+    srcs = [
+        "http.rs",
+        "lib.rs",
+        "native.rs",
+        "unikernel.rs",
+    ],
     proc_macro_deps = ["//uni/macros:uni_macros"],
-    deps = select({
-        "//bazel/platforms:native": [],
-        "//conditions:default": ["//kernel", "//drivers", "//net"],
-    }),
     rustc_flags = select({
         "//bazel/platforms:native": ["--cfg=platform_native"],
         "//conditions:default": ["--cfg=platform_unikernel"],
     }) + UNIKERNEL_RUSTC_FLAGS,
+    deps = select({
+        "//bazel/platforms:native": [],
+        "//conditions:default": [
+            "//drivers",
+            "//kernel",
+            "//net",
+        ],
+    }),
 )

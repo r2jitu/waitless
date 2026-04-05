@@ -6,15 +6,19 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "kernel",
     srcs = [
-        "lib.rs",
-        "types.rs",
-        "serial.rs",
-        "mm.rs",
-        "fdt.rs",
-        "mmu.rs",
         "exceptions.rs",
+        "fdt.rs",
+        "lib.rs",
+        "mm.rs",
+        "mmu.rs",
+        "serial.rs",
+        "types.rs",
     ] + select({
-        "//bazel/platforms:x86_64": ["x86_64/mod.rs", "x86_64/gdt.rs", "x86_64/idt.rs"],
+        "//bazel/platforms:x86_64": [
+            "x86_64/gdt.rs",
+            "x86_64/idt.rs",
+            "x86_64/mod.rs",
+        ],
         "//conditions:default": [],
     }),
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
@@ -27,21 +31,32 @@ rust_library(
 rust_static_library(
     name = "entry",
     srcs = ["entry.rs"],
-    crate_root = "entry.rs",
     compile_data = select({
-        "//bazel/platforms:x86_64": ["x86_64/boot.S", "x86_64/idt_stubs.S"],
+        "//bazel/platforms:x86_64": [
+            "x86_64/boot.S",
+            "x86_64/idt_stubs.S",
+        ],
         "//bazel/platforms:aarch64": ["aarch64/boot.S"],
-        "//conditions:default": ["x86_64/boot.S", "x86_64/idt_stubs.S"],
+        "//conditions:default": [
+            "x86_64/boot.S",
+            "x86_64/idt_stubs.S",
+        ],
     }),
-    deps = [":kernel", "//drivers", "//net", "//uni"],
+    crate_root = "entry.rs",
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    deps = [
+        ":kernel",
+        "//drivers",
+        "//net",
+        "//uni",
+    ],
 )
 
 rust_static_library(
     name = "limine",
     srcs = ["limine_entry.rs"],
-    deps = [":kernel"],
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    deps = [":kernel"],
 )
 
 rust_static_library(

@@ -10,13 +10,20 @@ load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 
 # Bare-metal linker flags (passed to rust-lld via -C link-arg).
 _LINK_FLAGS = [
-    "-C", "linker-flavor=ld.lld",
-    "-C", "link-arg=--gc-sections",
-    "-C", "link-arg=--allow-multiple-definition",
-    "-C", "link-arg=-zmax-page-size=0x1000",
-    "-C", "link-arg=-znorelro",
-    "-C", "link-arg=-nostdlib",
-    "-C", "link-arg=--strip-debug",
+    "-C",
+    "linker-flavor=ld.lld",
+    "-C",
+    "link-arg=--gc-sections",
+    "-C",
+    "link-arg=--allow-multiple-definition",
+    "-C",
+    "link-arg=-zmax-page-size=0x1000",
+    "-C",
+    "link-arg=-znorelro",
+    "-C",
+    "link-arg=-nostdlib",
+    "-C",
+    "link-arg=--strip-debug",
 ]
 
 _LINK_FLAGS_ARCH = select({
@@ -92,7 +99,10 @@ def unikernel_binary(name, app, visibility = None):
         data = ["//bazel/toolchain:unikernel_limine.ld"],
         linker_script = "//bazel/toolchain:unikernel.ld",
         rustc_flags = _unikernel_flags + [
-            "-C", "link-arg=-T", "-C", "link-arg=bazel/toolchain/unikernel_limine.ld",
+            "-C",
+            "link-arg=-T",
+            "-C",
+            "link-arg=bazel/toolchain/unikernel_limine.ld",
         ],
         visibility = visibility,
     )
@@ -138,9 +148,12 @@ def unikernel_binary(name, app, visibility = None):
             # Linux musl: static binary, no external sysroot needed.
             # Rust ships a self-contained musl libc + crt.
             "//conditions:default": [
-                "-C", "linker-flavor=ld.lld",
-                "-C", "target-feature=+crt-static",
-                "-C", "link-arg=-lc",
+                "-C",
+                "linker-flavor=ld.lld",
+                "-C",
+                "target-feature=+crt-static",
+                "-C",
+                "link-arg=-lc",
             ],
         }),
         target_compatible_with = ["//bazel/platforms:native"],
@@ -151,16 +164,16 @@ def unikernel_binary(name, app, visibility = None):
     sh_binary(
         name = name + "_run",
         srcs = select({
-            "//bazel/platforms:runner_vz":   ["//bazel/rules:run_vz.sh"],
+            "//bazel/platforms:runner_vz": ["//bazel/rules:run_vz.sh"],
             "//bazel/platforms:runner_qemu": ["//bazel/rules:run_qemu.sh"],
-            "//bazel/platforms:runner_iso":  ["//bazel/rules:run_iso.sh"],
-            "//conditions:default":          ["//bazel/rules:run_native.sh"],
+            "//bazel/platforms:runner_iso": ["//bazel/rules:run_iso.sh"],
+            "//conditions:default": ["//bazel/rules:run_native.sh"],
         }),
         data = select({
-            "//bazel/platforms:runner_vz":   [":" + name + ".img", "//scripts:run_vz"],
+            "//bazel/platforms:runner_vz": [":" + name + ".img", "//scripts:run_vz"],
             "//bazel/platforms:runner_qemu": [":" + name + ".elf", ":" + name + ".img"],
-            "//bazel/platforms:runner_iso":  [":" + name + ".iso"],
-            "//conditions:default":          [":" + name + "_native"],
+            "//bazel/platforms:runner_iso": [":" + name + ".iso"],
+            "//conditions:default": [":" + name + "_native"],
         }),
         env = select({
             "//bazel/platforms:runner_vz": {

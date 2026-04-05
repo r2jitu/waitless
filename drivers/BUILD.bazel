@@ -5,8 +5,14 @@ package(default_visibility = ["//visibility:public"])
 
 rust_library(
     name = "drivers",
-    srcs = ["lib.rs", "pci.rs", "virtio.rs", "virtio_net.rs", "virtio_console.rs"],
+    srcs = [
+        "lib.rs",
+        "pci.rs",
+        "virtio.rs",
+        "virtio_console.rs",
+        "virtio_net.rs",
+    ],
     crate_root = "lib.rs",
-    deps = ["//kernel"],
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    deps = ["//kernel"],
 )
