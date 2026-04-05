@@ -292,10 +292,13 @@ fn dhcp_send_request() {
 
 fn dhcp_poll_wait(timeout_ms: u32) -> bool {
     for _ in 0..timeout_ms {
-        drivers::virtio_net_poll(dhcp_receive);
-        unsafe {
-            if DHCP_GOT_OFFER || DHCP_GOT_ACK {
-                return true;
+        // Poll aggressively within each ms to keep latency low
+        for _ in 0..100 {
+            drivers::virtio_net_poll(dhcp_receive);
+            unsafe {
+                if DHCP_GOT_OFFER || DHCP_GOT_ACK {
+                    return true;
+                }
             }
         }
         arch_udelay(1000); // 1ms
@@ -340,6 +343,21 @@ pub fn dhcp_discover() -> bool {
         CONFIG.subnet_mask = DHCP_OFFERED_SUBNET;
         CONFIG.gateway = DHCP_OFFERED_GATEWAY;
         CONFIG.dns = DHCP_OFFERED_DNS;
+    }
+
+    // Log the configured IP (bench.sh VZ path looks for this)
+    unsafe {
+        let o = CONFIG.ip.octets();
+        let mut msg = *b"dhcp: configured IP xxx.xxx.xxx.xxx\n";
+        let mut pos = 22;
+        for (idx, &b) in o.iter().enumerate() {
+            if b >= 100 { msg[pos] = b'0' + b / 100; pos += 1; }
+            if b >= 10 { msg[pos] = b'0' + (b / 10) % 10; pos += 1; }
+            msg[pos] = b'0' + b % 10; pos += 1;
+            if idx < 3 { msg[pos] = b'.'; pos += 1; }
+        }
+        msg[pos] = b'\n'; pos += 1;
+        crate::log(&msg[..pos]);
     }
 
     // Gratuitous ARP

@@ -274,15 +274,15 @@ bench_unikernel() {
     local timeout=60
     [ "$runner" = "vz" ] && timeout=30  # VZ boots much faster than TCG
 
-    # For VZ with NAT networking (macOS 13+), discover the VM's vmnet IP
-    # from serial output.  The kernel prints "dhcp: configured IP x.x.x.x"
-    # during boot.  If found and not 10.0.2.x (legacy bridge), connect
-    # directly to the VM IP — bypassing any user-space proxy.
+    # For VZ with NAT networking, try to discover the VM's IP from the
+    # serial log.  If DHCP succeeds, the kernel prints "dhcp: configured IP x.x.x.x".
+    # Limit this search to 10s — if DHCP fails, the VM still works via
+    # localhost port forwarding (the run-vz bridge handles TCP proxy).
     local wait_host="127.0.0.1"
     local wait_port="$port"
     if [ "$runner" = "vz" ]; then
         local vm_ip=""
-        for (( _w=0; _w<timeout; _w++ )); do
+        for (( _w=0; _w<10; _w++ )); do
             if ! kill -0 "$QEMU_PID" 2>/dev/null; then break; fi
             vm_ip=$(grep -o 'dhcp: configured IP [0-9.]*' "$log" 2>/dev/null \
                     | head -1 | awk '{print $NF}') || true
