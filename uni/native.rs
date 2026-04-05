@@ -119,11 +119,6 @@ fn get_errno() -> i32 {
     }
 }
 
-fn c_strlen(s: *const u8) -> usize {
-    let mut len = 0;
-    unsafe { while *s.add(len) != 0 { len += 1; } }
-    len
-}
 
 fn parse_u16(s: *const u8) -> u16 {
     let mut n: u32 = 0;
@@ -219,8 +214,7 @@ fn init_native() {
 // ============================================================================
 
 pub fn log(msg: &[u8]) {
-    let len = c_strlen(msg.as_ptr());
-    unsafe { write(2, msg.as_ptr(), len); }
+    unsafe { write(2, msg.as_ptr(), msg.len()); }
 }
 
 pub fn config_port(default_port: u16) -> u16 {

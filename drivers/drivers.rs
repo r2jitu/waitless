@@ -444,7 +444,7 @@ fn pci_init_inner() {
         PCI_INITIALIZED = true;
     }
 
-    log(b"[PCI] Scanning bus 0...\n\0");
+    log(b"[PCI] Scanning bus 0...\n");
 
     #[cfg(target_arch = "aarch64")]
     unsafe {
@@ -475,7 +475,7 @@ fn pci_init_inner() {
         }
     }
 
-    log(b"[PCI] Scan complete\n\0");
+    log(b"[PCI] Scan complete\n");
 }
 
 fn pci_find_device(vendor_id: u16, device_id: u16) -> Option<usize> {
@@ -1205,7 +1205,7 @@ fn init_pci_modern() -> bool {
         None => return false,
     };
 
-    log(b"virtio_net: found modern virtio-pci net device\n\0");
+    log(b"virtio_net: found modern virtio-pci net device\n");
 
     let dev = unsafe { &VPCI_DEVICES[vpci_idx] };
 
@@ -1222,7 +1222,7 @@ fn init_pci_modern() -> bool {
 
     vpci_set_status(dev, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK);
     if (vpci_get_status(dev) & STATUS_FEATURES_OK) == 0 {
-        log(b"virtio_net: device rejected features\n\0");
+        log(b"virtio_net: device rejected features\n");
         vpci_set_status(dev, STATUS_FAILED);
         return false;
     }
@@ -1237,7 +1237,7 @@ fn init_pci_modern() -> bool {
         match NET_RX_QUEUE.init_pci_modern(rx_qsize, rx_notify, 0) {
             Some(a) => a,
             None => {
-                log(b"virtio_net: failed to init RX queue\n\0");
+                log(b"virtio_net: failed to init RX queue\n");
                 vpci_set_status(dev, STATUS_FAILED);
                 return false;
             }
@@ -1256,7 +1256,7 @@ fn init_pci_modern() -> bool {
         match NET_TX_QUEUE.init_pci_modern(tx_qsize, tx_notify, 1) {
             Some(a) => a,
             None => {
-                log(b"virtio_net: failed to init TX queue\n\0");
+                log(b"virtio_net: failed to init TX queue\n");
                 vpci_set_status(dev, STATUS_FAILED);
                 return false;
             }
@@ -1279,7 +1279,7 @@ fn init_pci_modern() -> bool {
     for i in 0..RX_BUFFERS {
         let alloc = unsafe { mm_kmalloc(BUFFER_SIZE as usize + 2) };
         if alloc.is_null() {
-            log(b"virtio_net: failed to allocate RX buffer\n\0");
+            log(b"virtio_net: failed to allocate RX buffer\n");
             vpci_set_status(dev, STATUS_FAILED);
             return false;
         }
@@ -1304,7 +1304,7 @@ fn init_pci_modern() -> bool {
         NET_TRANSPORT = Transport::ModernPci { vpci_idx };
         NET_GUEST_FEATURES = guest_features;
     }
-    log(b"virtio_net: initialization complete (PCI modern)\n\0");
+    log(b"virtio_net: initialization complete (PCI modern)\n");
     true
 }
 
@@ -1348,7 +1348,7 @@ fn init_mmio() -> bool {
     let is_v2 = ver == 2;
     if ver != 1 && ver != 2 { return false; }
 
-    log(b"virtio_net: virtio-mmio net device found\n\0");
+    log(b"virtio_net: virtio-mmio net device found\n");
 
     // Reset
     unsafe { virtio_write32(io_base + MMIO_STATUS, 0); }
@@ -1378,7 +1378,7 @@ fn init_mmio() -> bool {
             virtio_write32(io_base + MMIO_STATUS,
                            (STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK) as u32);
             if (virtio_read32(io_base + MMIO_STATUS) & STATUS_FEATURES_OK as u32) == 0 {
-                log(b"virtio_net: device rejected features\n\0");
+                log(b"virtio_net: device rejected features\n");
                 virtio_write32(io_base + MMIO_STATUS, STATUS_FAILED as u32);
                 return false;
             }
@@ -1395,11 +1395,11 @@ fn init_mmio() -> bool {
     // Init RX and TX queues
     unsafe {
         if !NET_RX_QUEUE.init_legacy(io_base, 0, true, is_v2) {
-            log(b"virtio_net: failed to init RX queue\n\0");
+            log(b"virtio_net: failed to init RX queue\n");
             return false;
         }
         if !NET_TX_QUEUE.init_legacy(io_base, 1, true, is_v2) {
-            log(b"virtio_net: failed to init TX queue\n\0");
+            log(b"virtio_net: failed to init TX queue\n");
             return false;
         }
     }
@@ -1440,7 +1440,7 @@ fn init_mmio() -> bool {
         NET_TRANSPORT = Transport::Mmio { base: io_base, is_v2 };
         NET_GUEST_FEATURES = guest_features;
     }
-    log(b"virtio_net: initialization complete (MMIO)\n\0");
+    log(b"virtio_net: initialization complete (MMIO)\n");
     true
 }
 
@@ -1457,13 +1457,13 @@ fn init_legacy_pci() -> bool {
     };
 
     let dev = unsafe { &PCI_DEVICES[pci_idx] };
-    log(b"virtio_net: found legacy PCI device\n\0");
+    log(b"virtio_net: found legacy PCI device\n");
 
     // Verify subsystem device ID = 1 (network)
     let subsys = pci_read_config(dev.bus, dev.slot, dev.func, 0x2C);
     let subsys_device_id = ((subsys >> 16) & 0xFFFF) as u16;
     if subsys_device_id != 1 {
-        log(b"virtio_net: not a network device\n\0");
+        log(b"virtio_net: not a network device\n");
         return false;
     }
 
@@ -1472,7 +1472,7 @@ fn init_legacy_pci() -> bool {
     // Get I/O base from BAR0
     let bar0 = dev.bar[0];
     if (bar0 & 0x01) == 0 {
-        log(b"virtio_net: BAR0 is not I/O space\n\0");
+        log(b"virtio_net: BAR0 is not I/O space\n");
         return false;
     }
     let io_base = (bar0 & !0x03u32) as u64;
@@ -1501,7 +1501,7 @@ fn init_legacy_pci() -> bool {
                       STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK);
         let status = virtio_read8(io_base + VREG_DEVICE_STATUS);
         if (status & STATUS_FEATURES_OK) == 0 {
-            log(b"virtio_net: device did not accept features\n\0");
+            log(b"virtio_net: device did not accept features\n");
             virtio_write8(io_base + VREG_DEVICE_STATUS, STATUS_FAILED);
             return false;
         }
@@ -1510,11 +1510,11 @@ fn init_legacy_pci() -> bool {
     // Init RX and TX queues
     unsafe {
         if !NET_RX_QUEUE.init_legacy(io_base, 0, false, false) {
-            log(b"virtio_net: failed to init RX queue\n\0");
+            log(b"virtio_net: failed to init RX queue\n");
             return false;
         }
         if !NET_TX_QUEUE.init_legacy(io_base, 1, false, false) {
-            log(b"virtio_net: failed to init TX queue\n\0");
+            log(b"virtio_net: failed to init TX queue\n");
             return false;
         }
     }
@@ -1548,7 +1548,7 @@ fn init_legacy_pci() -> bool {
         NET_TRANSPORT = Transport::LegacyPci { base: io_base, pci_idx };
         NET_GUEST_FEATURES = guest_features;
     }
-    log(b"virtio_net: initialization complete (legacy PCI)\n\0");
+    log(b"virtio_net: initialization complete (legacy PCI)\n");
     true
 }
 
@@ -1606,7 +1606,7 @@ fn driver_virtio_net_irq_handler(_irq: u32) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn driver_virtio_net_init() -> bool {
-    log(b"virtio_net: initializing...\n\0");
+    log(b"virtio_net: initializing...\n");
 
     #[cfg(target_arch = "aarch64")]
     {
