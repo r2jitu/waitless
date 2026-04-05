@@ -21,18 +21,27 @@ rust_library(
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
 )
 
-# Kernel entry point + limine boot + memory intrinsics.
-# Single rust_static_library — one panic handler, one link unit.
+# Kernel entry: Rust init code + Limine boot + memory intrinsics + ASM stubs.
+# Single target for unikernel.bzl to depend on.
+
 rust_static_library(
-    name = "entry",
+    name = "entry_rs",
     srcs = ["entry.rs", "libc.rs", "limine_entry.rs"],
-    deps = [
-        ":kernel",
-        "//drivers",
-        "//net",
-        "//uni",
-    ],
+    crate_root = "entry.rs",
+    deps = [":kernel", "//drivers", "//net", "//uni"],
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    visibility = ["//visibility:private"],
+)
+
+cc_library(
+    name = "entry",
+    deps = [
+        ":entry_rs",
+        ":boot",
+        ":limine_boot_asm",
+        ":idt_stubs",
+    ],
+    alwayslink = True,
 )
 
 cc_library(
@@ -42,6 +51,7 @@ cc_library(
         "//bazel/platforms:aarch64": ["aarch64/boot.S"],
         "//conditions:default": ["x86_64/boot.S"],
     }),
+    visibility = ["//visibility:private"],
 )
 
 cc_library(
@@ -50,6 +60,7 @@ cc_library(
         "//bazel/platforms:x86_64": ["x86_64/limine_boot.S"],
         "//conditions:default": [],
     }),
+    visibility = ["//visibility:private"],
 )
 
 cc_library(
@@ -58,13 +69,5 @@ cc_library(
         "//bazel/platforms:x86_64": ["x86_64/idt_stubs.S"],
         "//conditions:default": [],
     }),
-    alwayslink = True,
-)
-
-# Assembly + Rust entry aggregate (linked by cc_binary in unikernel.bzl).
-# alwayslink ensures Limine request sections and memcpy aren't stripped.
-cc_library(
-    name = "entry_asm",
-    deps = [":limine_boot_asm", ":idt_stubs"],
-    alwayslink = True,
+    visibility = ["//visibility:private"],
 )

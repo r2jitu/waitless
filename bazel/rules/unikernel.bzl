@@ -34,12 +34,7 @@ def unikernel_binary(name, app, visibility = None):
     cc_binary(
         name = name + ".elf",
         srcs = [],
-        deps = [
-            app,
-            "//kernel:entry_asm",
-            "//kernel:entry",
-            "//kernel:boot",
-        ],
+        deps = [app, "//kernel:entry"],
         visibility = visibility,
     )
 
@@ -129,11 +124,7 @@ def unikernel_binary(name, app, visibility = None):
     cc_binary(
         name = name + ".limine.elf",
         srcs = [],
-        deps = [
-            app,
-            "//kernel:entry_asm",
-            "//kernel:entry",
-        ],
+        deps = [app, "//kernel:entry"],
         linkopts = ["-Wl,-T,bazel/toolchain/unikernel_limine.ld"],
         visibility = visibility,
     )
