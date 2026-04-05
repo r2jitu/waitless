@@ -10,9 +10,16 @@
 // Limine scans for these tagged structs and fills in response pointers
 // before calling our entry point.
 
-use crate::kernel::types::{BootInfo, MemoryRegion, Protocol, MEM_AVAILABLE, MEM_RESERVED, MAX_MEMORY_REGIONS};
-use crate::kernel::fdt as kernel_fdt;
-use crate::kernel::mmu as kernel_mmu;
+#![no_std]
+#![allow(static_mut_refs)]
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }
+
+extern crate kernel;
+use kernel::types::{BootInfo, MemoryRegion, Protocol, MEM_AVAILABLE, MEM_RESERVED, MAX_MEMORY_REGIONS};
+use kernel::fdt as kernel_fdt;
+use kernel::mmu as kernel_mmu;
 
 // ============================================================================
 // Limine protocol constants and struct types

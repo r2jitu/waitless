@@ -18,8 +18,6 @@ extern crate drivers;
 extern crate net;
 extern crate uni;
 
-mod libc;
-mod limine_entry;
 
 use kernel::{types, serial, mm, fdt, mmu, exceptions};
 use types::{BootInfo, MemoryRegion, Protocol, MEM_AVAILABLE, MEM_RESERVED, MAX_MEMORY_REGIONS};
