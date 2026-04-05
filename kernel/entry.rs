@@ -79,7 +79,7 @@ unsafe fn arch_shutdown() -> ! {
 
 unsafe extern "C" {
     // User application entry point (from app crate)
-    fn uni_main() -> i32;
+    fn uni_main();
 
     // Linker-generated symbols
     static __bss_start: u8;
@@ -439,9 +439,8 @@ unsafe fn kernel_boot(info: &BootInfo) {
     }
 
     klog!("\n[BOOT] All subsystems ready. Starting application.\n\n");
-    let ret = uni_main();
-    klog!("\n[SHUTDOWN] Application exited with code {}.\n", ret);
-    klog!("[SHUTDOWN] Powering off.\n");
+    uni_main();
+    klog!("\n[SHUTDOWN] Application returned. Powering off.\n");
 
     arch_shutdown();
 }

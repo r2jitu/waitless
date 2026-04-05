@@ -67,7 +67,7 @@ fn handle_request(req: &Request) -> Response {
 // ---- Application entry point ------------------------------------------------
 
 #[uni::main]
-fn main() -> i32 {
+fn main() {
     uni::log(b"Starting Rust HTTP server...\n");
     let port = uni::config_port(80);
 
@@ -77,6 +77,4 @@ fn main() -> i32 {
 
     uni::log(b"Routes registered. Entering event loop.\n");
     server.run(port);
-    uni::log(b"server.run() returned -- shutting down\n");
-    0
 }

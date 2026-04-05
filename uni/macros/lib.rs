@@ -41,7 +41,7 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let output = format!(
         r#"
 #[unsafe(no_mangle)]
-pub extern "C" fn uni_main() -> i32 {body}
+pub extern "C" fn uni_main() {body}
 "#,
         body = body,
     );

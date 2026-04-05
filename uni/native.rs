@@ -392,12 +392,12 @@ pub fn tcp_poll() {
 // ============================================================================
 
 unsafe extern "C" {
-    fn uni_main() -> i32;
+    fn uni_main();
 }
 
-// Provide the C main() symbol. The cc_binary linker picks this up.
 #[unsafe(no_mangle)]
 pub extern "C" fn main() -> i32 {
     init_native();
-    unsafe { uni_main() }
+    unsafe { uni_main() };
+    0
 }
