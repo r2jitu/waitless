@@ -10,6 +10,7 @@ load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 
 # Bare-metal linker flags (passed to rust-lld via -C link-arg).
 _LINK_FLAGS = [
+    "-C", "linker-flavor=ld.lld",
     "-C", "link-arg=--gc-sections",
     "-C", "link-arg=--allow-multiple-definition",
     "-C", "link-arg=-zmax-page-size=0x1000",
@@ -137,6 +138,7 @@ def unikernel_binary(name, app, visibility = None):
             # Linux musl: static binary, no external sysroot needed.
             # Rust ships a self-contained musl libc + crt.
             "//conditions:default": [
+                "-C", "linker-flavor=ld.lld",
                 "-C", "target-feature=+crt-static",
                 "-C", "link-arg=-lc",
             ],

@@ -42,9 +42,11 @@ def _impl(ctx):
         target_cpu = "aarch64"
         target_libc = "macosx"
     else:
+        # Bare-metal and Linux: use ld.lld directly (found from Rust toolchain).
+        # rustc_flags includes -C linker-flavor=ld.lld so args are raw LLD flags.
         tool_paths = [
-            tool_path(name = "gcc",     path = "wrapper/clang_wrapper.sh"),
-            tool_path(name = "ld",      path = "wrapper/clang_wrapper.sh"),
+            tool_path(name = "gcc",     path = "wrapper/lld.sh"),
+            tool_path(name = "ld",      path = "wrapper/lld.sh"),
             tool_path(name = "ar",      path = "/usr/bin/false"),
             tool_path(name = "cpp",     path = "/usr/bin/false"),
             tool_path(name = "gcov",    path = "/usr/bin/false"),
