@@ -3,9 +3,16 @@
 load(":cc_toolchain_config.bzl", "cc_toolchain_config")
 load("@rules_cc//cc/toolchains:cc_toolchain.bzl", "cc_toolchain")
 
-def register_cc_toolchain(name, arch, cpu, os):
-    """Register a CC toolchain for a (cpu, os) pair."""
-    cc_toolchain_config(name = name + "_config", target_arch = arch)
+def register_cc_toolchain(name, cpu, os, target_system, target_libc = "none", pic = False):
+    """Register a CC toolchain for a (cpu, os) platform pair."""
+    cc_toolchain_config(
+        name = name + "_config",
+        target_cpu = cpu,
+        target_os = os,
+        target_system = target_system,
+        target_libc = target_libc,
+        pic = pic,
+    )
     cc_toolchain(
         name = name + "_impl",
         toolchain_config = ":" + name + "_config",

@@ -14,37 +14,10 @@ load(
     "tool_path",
 )
 
-# Target configurations: (toolchain_id, target_system, target_cpu, target_libc)
-_TARGETS = {
-    "x86_64":      ("unikernel-x86_64", "x86_64-linux-musl",    "x86_64",  "none"),
-    "aarch64":     ("unikernel-aarch64", "aarch64-linux-musl",   "aarch64", "none"),
-    "x86_64_linux":("x86_64-linux",      "x86_64-unknown-linux-musl", "x86_64", "musl"),
-    "aarch64_macos":("aarch64-macos",    "aarch64-apple-darwin", "aarch64", "macosx"),
-}
-
 def _impl(ctx):
-    arch = ctx.attr.target_arch
-    toolchain_id, target_system, target_cpu, target_libc = _TARGETS[arch]
-
-    if arch == "aarch64_macos":
-        # macOS native: use system clang
-        gcc_tool = "wrapper/clang.sh"
-        link_flags = ["-lc++"]
-    else:
-        # Bare-metal + Linux: use Rust's ld.lld
-        gcc_tool = "wrapper/lld.sh"
-        link_flags = ["-nostdlib"]
-
-    tool_paths = [
-        tool_path(name = "gcc",     path = gcc_tool),
-        tool_path(name = "ld",      path = gcc_tool),
-        tool_path(name = "ar",      path = "/usr/bin/false"),
-        tool_path(name = "cpp",     path = "/usr/bin/false"),
-        tool_path(name = "gcov",    path = "/usr/bin/false"),
-        tool_path(name = "nm",      path = "/usr/bin/false"),
-        tool_path(name = "objdump", path = "/usr/bin/false"),
-        tool_path(name = "strip",   path = "/usr/bin/false"),
-    ]
+    is_macos = ctx.attr.target_os == "macos"
+    gcc_tool = "wrapper/clang.sh" if is_macos else "wrapper/lld.sh"
+    link_flags = ["-lc++"] if is_macos else ["-nostdlib"]
 
     return cc_common.create_cc_toolchain_config_info(
         ctx = ctx,
@@ -61,25 +34,36 @@ def _impl(ctx):
                     flag_groups = [flag_group(flags = link_flags)],
                 )],
             ),
-            feature(name = "supports_pic", enabled = (arch == "aarch64")),
+            feature(name = "supports_pic", enabled = ctx.attr.pic),
         ],
-        toolchain_identifier = toolchain_id,
+        toolchain_identifier = ctx.attr.name,
         host_system_name = "local",
-        target_system_name = target_system,
-        target_cpu = target_cpu,
-        target_libc = target_libc,
+        target_system_name = ctx.attr.target_system,
+        target_cpu = ctx.attr.target_cpu,
+        target_libc = ctx.attr.target_libc,
         compiler = "clang",
         abi_version = "unknown",
         abi_libc_version = "unknown",
-        tool_paths = tool_paths,
+        tool_paths = [
+            tool_path(name = "gcc",     path = gcc_tool),
+            tool_path(name = "ld",      path = gcc_tool),
+            tool_path(name = "ar",      path = "/usr/bin/false"),
+            tool_path(name = "cpp",     path = "/usr/bin/false"),
+            tool_path(name = "gcov",    path = "/usr/bin/false"),
+            tool_path(name = "nm",      path = "/usr/bin/false"),
+            tool_path(name = "objdump", path = "/usr/bin/false"),
+            tool_path(name = "strip",   path = "/usr/bin/false"),
+        ],
     )
 
 cc_toolchain_config = rule(
     implementation = _impl,
     attrs = {
-        "target_arch": attr.string(
-            values = ["x86_64", "aarch64", "aarch64_macos", "x86_64_linux"],
-        ),
+        "target_cpu":    attr.string(mandatory = True),
+        "target_os":     attr.string(mandatory = True),
+        "target_system": attr.string(mandatory = True),
+        "target_libc":   attr.string(default = "none"),
+        "pic":           attr.bool(default = False),
     },
     provides = [CcToolchainConfigInfo],
 )
