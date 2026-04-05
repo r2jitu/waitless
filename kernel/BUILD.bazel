@@ -1,4 +1,3 @@
-load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_static_library")
 load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 
@@ -22,7 +21,7 @@ rust_library(
 )
 
 # Separate rust_static_library targets so the linker can GC unused
-# code from each .a independently (merging bloats the binary by ~7KB).
+# code from each .a independently.
 
 rust_static_library(
     name = "entry_rs",
@@ -48,44 +47,4 @@ rust_static_library(
     name = "libc_rs",
     srcs = ["libc.rs"],
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
-)
-
-# Single target for unikernel.bzl — aggregates Rust + ASM.
-cc_library(
-    name = "entry",
-    deps = [
-        ":entry_rs",
-        ":limine_rs",
-        ":libc_rs",
-        ":boot",
-        ":limine_boot_asm",
-        ":idt_stubs",
-    ],
-)
-
-cc_library(
-    name = "boot",
-    srcs = select({
-        "//bazel/platforms:x86_64": ["x86_64/boot.S"],
-        "//bazel/platforms:aarch64": ["aarch64/boot.S"],
-        "//conditions:default": ["x86_64/boot.S"],
-    }),
-)
-
-cc_library(
-    name = "limine_boot_asm",
-    srcs = select({
-        "//bazel/platforms:x86_64": ["x86_64/limine_boot.S"],
-        "//conditions:default": [],
-    }),
-    alwayslink = True,
-)
-
-cc_library(
-    name = "idt_stubs",
-    srcs = select({
-        "//bazel/platforms:x86_64": ["x86_64/idt_stubs.S"],
-        "//conditions:default": [],
-    }),
-    alwayslink = True,
 )
