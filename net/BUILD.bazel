@@ -8,7 +8,16 @@ package(default_visibility = ["//visibility:public"])
 # are available for C++ linking when included transitively via entry_rs.
 rust_library(
     name = "stack_rs",
-    srcs = ["stack.rs"],
+    srcs = [
+        "lib.rs",
+        "types.rs",
+        "ethernet.rs",
+        "arp.rs",
+        "ipv4.rs",
+        "tcp.rs",
+        "dhcp.rs",
+    ],
+    crate_root = "lib.rs",
     crate_name = "net_stack",
     edition = "2024",
     deps = [
