@@ -39,8 +39,8 @@ genrule(
         "codesign --sign - --entitlements $(location run-vz.entitlements) $@",
     ]),
     local = True,
-    target_compatible_with = [
-        "@platforms//cpu:aarch64",
-        "//bazel/platforms:native",
-    ],
+    # No target_compatible_with — this genrule has local=True so it always
+    # runs on the host (exec platform), regardless of the Bazel target platform.
+    # Runtime compatibility (macOS arm64) is checked by the Swift compiler
+    # and by the test script (uname guard).
 )
