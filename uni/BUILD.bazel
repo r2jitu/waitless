@@ -1,7 +1,23 @@
-load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_rust//rust:defs.bzl", "rust_library")
 
 package(default_visibility = ["//visibility:public"])
+
+# ---- Platform API (Rust) ----------------------------------------------------
+# Safe Rust types for the uni:: platform abstraction: TcpListener, TcpStream,
+# log(), config_port(), etc. Symbols are resolved at link time from one of:
+#   - Unikernel backend: net/stack.rs (TCP) + uni/ffi.rs (lifecycle)
+#   - Native backend:    uni/native.rs (POSIX sockets + stdio)
+
+rust_library(
+    name = "api",
+    srcs = ["api.rs"],
+    crate_name = "uni",
+    edition = "2024",
+    rustc_flags = ["-C", "panic=abort"] + select({
+        "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
+        "//conditions:default": [],
+    }),
+)
 
 # ---- Unikernel backend (Rust) -----------------------------------------------
 # Provides uni_* lifecycle/config symbols (uni_log, uni_config_port,
@@ -23,21 +39,14 @@ rust_library(
     }),
 )
 
-# ---- Native backend (extern "C" FFI for Rust) -------------------------------
+# ---- Native backend (Rust) --------------------------------------------------
 # Provides the same uni_* symbols using POSIX sockets + stdio.
-# Linked into the native binary.
+# Also provides main() → init + uni_main() for the native entry point.
 
-cc_library(
+rust_library(
     name = "native",
-    srcs = ["native.cc"],
-    copts = ["-I."],
-)
-
-# ---- Native entry point -----------------------------------------------------
-# Provides int main() → uni_init_native() + uni_main().
-
-cc_library(
-    name = "native_entry",
-    srcs = ["native_main.cc"],
-    copts = ["-I."],
+    srcs = ["native.rs"],
+    crate_name = "uni_native",
+    edition = "2024",
+    rustc_flags = ["-C", "panic=abort"],
 )

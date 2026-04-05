@@ -8,91 +8,9 @@
 
 #![no_std]
 
-use core::ptr;
+extern crate uni;
 
-// ---- FFI declarations for uni:: functions -----------------------------------
-
-unsafe extern "C" {
-    fn uni_log(msg: *const u8);
-    fn uni_check_shutdown() -> bool;
-    fn uni_wait_for_events();
-    fn uni_tcp_listen(port: u16) -> *mut ();
-    fn uni_tcp_accept(conn: *mut ()) -> *mut ();
-    fn uni_tcp_has_data(conn: *mut ()) -> bool;
-    fn uni_tcp_recv(conn: *mut (), buf: *mut u8, max_len: usize) -> usize;
-    fn uni_tcp_send(conn: *mut (), data: *const u8, len: usize) -> i32;
-    fn uni_tcp_close(conn: *mut ());
-    fn uni_tcp_is_closed(conn: *mut ()) -> bool;
-    fn uni_tcp_poll();
-    fn uni_config_port(default_port: u16) -> u16;
-}
-
-// ---- Safe TCP wrapper -------------------------------------------------------
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct TcpConn(*mut ());
-
-impl TcpConn {
-    const NULL: Self = TcpConn(ptr::null_mut());
-
-    fn is_null(self) -> bool {
-        self.0.is_null()
-    }
-
-    fn listen(port: u16) -> Self {
-        TcpConn(unsafe { uni_tcp_listen(port) })
-    }
-
-    fn accept(self) -> Self {
-        TcpConn(unsafe { uni_tcp_accept(self.0) })
-    }
-
-    fn has_data(self) -> bool {
-        unsafe { uni_tcp_has_data(self.0) }
-    }
-
-    fn recv(self, buf: &mut [u8]) -> usize {
-        unsafe { uni_tcp_recv(self.0, buf.as_mut_ptr(), buf.len()) }
-    }
-
-    fn send(self, data: &[u8]) -> i32 {
-        unsafe { uni_tcp_send(self.0, data.as_ptr(), data.len()) }
-    }
-
-    fn close(self) {
-        unsafe { uni_tcp_close(self.0) }
-    }
-
-    fn is_closed(self) -> bool {
-        unsafe { uni_tcp_is_closed(self.0) }
-    }
-}
-
-fn tcp_poll() {
-    unsafe { uni_tcp_poll() }
-}
-
-fn check_shutdown() -> bool {
-    unsafe { uni_check_shutdown() }
-}
-
-fn wait_for_events() {
-    unsafe { uni_wait_for_events() }
-}
-
-fn log(msg: &[u8]) {
-    unsafe { uni_log(msg.as_ptr()) }
-}
-
-// ---- Re-export uni:: functions for app use ----------------------------------
-
-pub fn config_port(default_port: u16) -> u16 {
-    unsafe { uni_config_port(default_port) }
-}
-
-pub fn uni_log_msg(msg: &[u8]) {
-    log(msg);
-}
+use uni::{TcpListener, TcpStream};
 
 // ---- HTTP types -------------------------------------------------------------
 
@@ -271,19 +189,17 @@ impl Route {
 }
 
 struct ActiveConn {
-    conn: TcpConn,
+    conn: Option<TcpStream>,
     buf: [u8; BUF_SIZE],
     buf_len: usize,
-    in_use: bool,
 }
 
 impl ActiveConn {
     const fn new() -> Self {
         ActiveConn {
-            conn: TcpConn(ptr::null_mut()),
+            conn: None,
             buf: [0; BUF_SIZE],
             buf_len: 0,
-            in_use: false,
         }
     }
 }
@@ -308,7 +224,7 @@ impl Server {
     /// Register an exact-path handler.
     pub fn route(&mut self, path: &[u8], handler: Handler) {
         if self.route_count >= MAX_ROUTES {
-            log(b"http: too many routes\n\0");
+            uni::log(b"http: too many routes\n\0");
             return;
         }
         let r = &mut self.routes[self.route_count];
@@ -326,35 +242,33 @@ impl Server {
 
     /// Run the event loop. Blocks until shutdown signal.
     pub fn run(&mut self, port: u16) {
-        let listener = TcpConn::listen(port);
-        if listener.is_null() {
-            log(b"http: failed to create TCP listener\n\0");
-            return;
-        }
+        let listener = match TcpListener::bind(port) {
+            Some(l) => l,
+            None => {
+                uni::log(b"http: failed to create TCP listener\n\0");
+                return;
+            }
+        };
 
-        log(b"http: listening\n\0");
+        uni::log(b"http: listening\n\0");
 
         loop {
-            if check_shutdown() {
-                log(b"http: shutdown requested\n\0");
+            if uni::check_shutdown() {
+                uni::log(b"http: shutdown requested\n\0");
                 break;
             }
-            tcp_poll();
+            uni::tcp_poll();
 
             let mut had_work = false;
 
             // Accept new connections
-            loop {
-                let new_conn = listener.accept();
-                if new_conn.is_null() {
-                    break;
-                }
+            while let Some(stream) = listener.accept() {
                 had_work = true;
                 if let Some(ac) = self.alloc_active() {
-                    ac.conn = new_conn;
+                    ac.conn = Some(stream);
                 } else {
-                    log(b"http: too many connections, dropping\n\0");
-                    new_conn.close();
+                    uni::log(b"http: too many connections, dropping\n\0");
+                    stream.close();
                     break;
                 }
             }
@@ -363,16 +277,14 @@ impl Server {
             // Uses index-based access to avoid holding &mut self.active[i]
             // while calling self.find_handler().
             for i in 0..MAX_ACTIVE {
-                if !self.active[i].in_use || self.active[i].conn.is_null() {
-                    continue;
-                }
-
-                let conn = self.active[i].conn;
+                let conn = match self.active[i].conn {
+                    Some(c) => c,
+                    None => continue,
+                };
 
                 if conn.is_closed() {
-                    self.active[i].in_use = false;
+                    self.active[i].conn = None;
                     self.active[i].buf_len = 0;
-                    self.active[i].conn = TcpConn::NULL;
                     had_work = true;
                     continue;
                 }
@@ -381,12 +293,7 @@ impl Server {
                     let buf_len = self.active[i].buf_len;
                     let avail = BUF_SIZE - buf_len;
                     if avail > 0 {
-                        let got = conn.recv(unsafe {
-                            core::slice::from_raw_parts_mut(
-                                self.active[i].buf.as_mut_ptr().add(buf_len),
-                                avail,
-                            )
-                        });
+                        let got = conn.recv(&mut self.active[i].buf[buf_len..buf_len + avail]);
                         self.active[i].buf_len += got;
                         had_work = true;
                     }
@@ -413,57 +320,44 @@ impl Server {
 
                         if want_close {
                             conn.close();
-                            self.active[i].in_use = false;
+                            self.active[i].conn = None;
                             self.active[i].buf_len = 0;
-                            self.active[i].conn = TcpConn::NULL;
                         } else {
                             let remaining = buf_len - consumed;
                             if remaining > 0 {
-                                unsafe {
-                                    ptr::copy(
-                                        self.active[i].buf.as_ptr().add(consumed),
-                                        self.active[i].buf.as_mut_ptr(),
-                                        remaining,
-                                    );
-                                }
+                                self.active[i].buf.copy_within(consumed..buf_len, 0);
                             }
                             self.active[i].buf_len = remaining;
                         }
                     } else if buf_len >= BUF_SIZE {
                         conn.close();
-                        self.active[i].in_use = false;
+                        self.active[i].conn = None;
                         self.active[i].buf_len = 0;
-                        self.active[i].conn = TcpConn::NULL;
                     }
                 }
             }
 
             if !had_work {
-                wait_for_events();
+                uni::wait_for_events();
             }
         }
 
         // Graceful shutdown
-        for i in 0..MAX_ACTIVE {
-            let ac = &mut self.active[i];
-            if ac.in_use && !ac.conn.is_null() {
-                ac.conn.close();
-                ac.in_use = false;
+        for ac in self.active.iter_mut() {
+            if let Some(conn) = ac.conn.take() {
+                conn.close();
                 ac.buf_len = 0;
-                ac.conn = TcpConn::NULL;
             }
         }
         listener.close();
-        log(b"http: server stopped\n\0");
+        uni::log(b"http: server stopped\n\0");
     }
 
     fn alloc_active(&mut self) -> Option<&mut ActiveConn> {
-        for i in 0..MAX_ACTIVE {
-            if !self.active[i].in_use {
-                self.active[i].in_use = true;
-                self.active[i].buf_len = 0;
-                self.active[i].conn = TcpConn::NULL;
-                return Some(&mut self.active[i]);
+        for ac in self.active.iter_mut() {
+            if ac.conn.is_none() {
+                ac.buf_len = 0;
+                return Some(ac);
             }
         }
         None
@@ -613,7 +507,7 @@ fn parse_request(data: &[u8], req: &mut Request) -> usize {
 
 // ---- Response sender --------------------------------------------------------
 
-fn send_response(conn: TcpConn, resp: &Response, keep_alive: bool) {
+fn send_response(conn: TcpStream, resp: &Response, keep_alive: bool) {
     let body = resp.body_bytes();
     let content_type = resp.content_type_bytes();
 

@@ -9,11 +9,13 @@
 use core::panic::PanicInfo;
 use http::{Request, Response, Server};
 
+extern crate uni;
+
 // ---- Panic handler ----------------------------------------------------------
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
-    http::uni_log_msg(b"PANIC: Rust webserver panicked!\n\0");
+    uni::log(b"PANIC: Rust webserver panicked!\n\0");
     loop {
         core::hint::spin_loop();
     }
@@ -85,16 +87,16 @@ fn handle_request(req: &Request) -> Response {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn uni_main() -> i32 {
-    http::uni_log_msg(b"Starting Rust HTTP server...\n\0");
-    let port = http::config_port(80);
+    uni::log(b"Starting Rust HTTP server...\n\0");
+    let port = uni::config_port(80);
 
     static mut SERVER: Server = Server::new();
     // Safety: uni_main is single-threaded and called exactly once.
     let server = unsafe { &mut *core::ptr::addr_of_mut!(SERVER) };
     server.default_handler(handle_request);
 
-    http::uni_log_msg(b"Routes registered. Entering event loop.\n\0");
+    uni::log(b"Routes registered. Entering event loop.\n\0");
     server.run(port);
-    http::uni_log_msg(b"[uni_main] server.run() returned -- shutting down\n\0");
+    uni::log(b"[uni_main] server.run() returned -- shutting down\n\0");
     0
 }

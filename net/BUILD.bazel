@@ -23,13 +23,13 @@ rust_library(
 )
 
 # HTTP/1.1 server (Rust): request parsing, routing, event loop.
-# Calls uni:: functions via FFI (symbols resolved at link time from
-# uni/ffi_rs or uni/native.cc).
+# Uses the uni:: platform API for TCP, logging, and shutdown.
 rust_library(
     name = "http_rs",
     srcs = ["http.rs"],
     crate_name = "http",
     edition = "2024",
+    deps = ["//uni:api"],
     rustc_flags = ["-C", "panic=abort"] + select({
         "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
         "//conditions:default": [],
