@@ -93,13 +93,6 @@ def _impl(ctx):
         abi_version = "unknown",
         abi_libc_version = "unknown",
         tool_paths = tool_paths,
-        cxx_builtin_include_directories = [
-            "/opt/homebrew/Cellar/llvm/22.1.0/lib/clang/22/include",
-        ] + ([
-            "/opt/homebrew/Cellar/llvm/22.1.0/include/c++/v1",
-            "/Library/Developer/CommandLineTools/SDKs/MacOSX26.sdk/usr/include",
-            "/Library/Developer/CommandLineTools/usr/include",
-        ] if arch == "aarch64_macos" else []),
     )
 
 cc_toolchain_config = rule(

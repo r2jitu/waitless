@@ -1,10 +1,13 @@
 #!/bin/bash
-# clang wrapper for macOS native builds (aarch64-macos platform only).
-# Finds Homebrew clang or system clang.
-for CLANG in /opt/homebrew/opt/llvm/bin/clang /usr/bin/clang; do
-    if [ -x "$CLANG" ]; then
-        export PATH="/usr/bin:/bin:$PATH"
-        exec "$CLANG" "$@"
-    fi
-done
-echo "error: clang not found" >&2; exit 1
+# clang — system C compiler for native builds.
+# macOS: Xcode CommandLineTools clang. Linux: system cc/gcc/clang.
+
+case "$(/usr/bin/uname -s)" in
+    Darwin) exec /usr/bin/clang "$@" ;;
+    *)
+        for cc in /usr/bin/cc /usr/bin/gcc /usr/bin/clang; do
+            [ -x "$cc" ] && exec "$cc" "$@"
+        done
+        ;;
+esac
+echo "error: no C compiler found" >&2; exit 1
