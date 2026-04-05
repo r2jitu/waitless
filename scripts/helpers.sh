@@ -58,7 +58,7 @@ cleanup_vm() {
 start_qemu() {
     local port="$1" log="${2:-}"; shift 2
     if [[ -z "$log" ]]; then
-        VM_LOG="$(mktemp /tmp/unikernel_test_XXXXXX.log)"
+        VM_LOG="$(mktemp /tmp/unikernel_test_XXXXXXXX)"
         log="$VM_LOG"
     fi
     "$QEMU_BIN" \

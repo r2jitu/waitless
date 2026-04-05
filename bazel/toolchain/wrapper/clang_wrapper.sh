@@ -1,41 +1,48 @@
 #!/bin/bash
 # Linker dispatch for cross-compilation from macOS.
 #
-# rustc invokes this as the linker. We detect the target format and
-# dispatch to the right tool:
-#   - "-flavor gnu": bare-metal ELF (rustc for *-unknown-none) → ld.lld
-#   - "--eh-frame-hdr" or "-Bstatic": Linux ELF (rustc for *-linux-*) → ld.lld
-#   - Otherwise: macOS native (rustc for *-apple-*) → Homebrew clang
+# rustc invokes this as the linker. We detect the target:
+#   - "-flavor gnu": bare-metal (*-unknown-none) → ld.lld, pass all args raw
+#   - "-Wl,--as-needed": Linux ELF (*-linux-*) → ld.lld, strip clang-driver flags
+#   - Otherwise: macOS native (*-apple-*) → Homebrew clang
 
 find_lld() {
-    for p in /opt/homebrew/bin/ld.lld /opt/homebrew/opt/llvm/bin/ld.lld; do
+    for p in /opt/homebrew/bin/ld.lld /opt/homebrew/opt/llvm/bin/ld.lld \
+             /usr/bin/ld.lld; do
         [ -x "$p" ] && echo "$p" && return
     done
-    echo "error: ld.lld not found" >&2
-    exit 1
+    echo "error: ld.lld not found" >&2; exit 1
 }
 
-# Check if this is an ELF link invocation (not macOS Mach-O).
-# rustc passes ELF linker flags as -Wl,--flag or bare --flag.
+# Check first arg for bare-metal (raw LLD invocation from rustc)
+if [ "$1" = "-flavor" ]; then
+    exec "$(find_lld)" "$@"
+fi
+
+# Check for Linux ELF target (rustc passes clang-driver style flags)
 for arg in "$@"; do
     case "$arg" in
-        -flavor|-Wl,--eh-frame-hdr|-Wl,--as-needed|-Wl,-Bstatic)
-            # Strip -Wl, prefixes and pass to lld directly
+        -Wl,--as-needed)
+            # Linux cross-compile: strip -Wl, prefixes and clang-driver flags
+            LLD="$(find_lld)"
             args=()
             for a in "$@"; do
-                args+=("${a#-Wl,}")
+                case "$a" in
+                    -Wl,*)   args+=("${a#-Wl,}") ;;
+                    -m64|-m32|-pie|-nostdlib|-nodefaultlibs|-nostartfiles) ;;
+                    *)       args+=("$a") ;;
+                esac
             done
-            exec "$(find_lld)" "${args[@]}"
+            exec "$LLD" "${args[@]}"
             ;;
     esac
 done
 
-# macOS native: use Homebrew LLVM clang
-LLVM_CLANG="/opt/homebrew/opt/llvm/bin/clang"
-if [ ! -x "$LLVM_CLANG" ]; then
-    echo "error: Homebrew LLVM clang not found at $LLVM_CLANG" >&2
-    echo "       Install with: brew install llvm" >&2
-    exit 1
-fi
-export PATH="/usr/bin:/bin:$PATH"
-exec "$LLVM_CLANG" "$@"
+# macOS native
+for CLANG in /opt/homebrew/opt/llvm/bin/clang /usr/bin/clang; do
+    if [ -x "$CLANG" ]; then
+        export PATH="/usr/bin:/bin:$PATH"
+        exec "$CLANG" "$@"
+    fi
+done
+echo "error: clang not found" >&2; exit 1

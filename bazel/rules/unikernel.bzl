@@ -134,7 +134,12 @@ def unikernel_binary(name, app, visibility = None):
         deps = [app, "//uni"],
         rustc_flags = select({
             "@platforms//os:macos": ["-C", "link-arg=-lSystem"],
-            "//conditions:default": ["-C", "link-arg=-lc", "-C", "link-arg=-lpthread"],
+            # Linux musl: static binary, no external sysroot needed.
+            # Rust ships a self-contained musl libc + crt.
+            "//conditions:default": [
+                "-C", "target-feature=+crt-static",
+                "-C", "link-arg=-lc",
+            ],
         }),
         target_compatible_with = ["//bazel/platforms:native"],
         visibility = visibility,

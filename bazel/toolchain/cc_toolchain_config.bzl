@@ -53,7 +53,12 @@ def _impl(ctx):
             tool_path(name = "strip",   path = "/usr/bin/false"),
         ]
         link_flags = ["-nostdlib"]
-        if arch == "aarch64":
+        if arch == "x86_64_linux":
+            toolchain_id = "x86_64-linux-toolchain"
+            target_system = "x86_64-unknown-linux-musl"
+            target_cpu = "x86_64"
+            target_libc = "musl"
+        elif arch == "aarch64":
             toolchain_id = "unikernel-aarch64-toolchain"
             target_system = "aarch64-linux-musl"
             target_cpu = "aarch64"
@@ -100,7 +105,7 @@ cc_toolchain_config = rule(
     attrs = {
         "target_arch": attr.string(
             default = "x86_64",
-            values = ["x86_64", "aarch64", "aarch64_macos"],
+            values = ["x86_64", "aarch64", "aarch64_macos", "x86_64_linux"],
         ),
     },
     provides = [CcToolchainConfigInfo],

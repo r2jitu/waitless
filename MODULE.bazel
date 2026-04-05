@@ -9,6 +9,7 @@ register_toolchains(
     "//bazel/toolchain:unikernel_cc_toolchain_x86_64",
     "//bazel/toolchain:unikernel_cc_toolchain_aarch64",
     "//bazel/toolchain:cc_toolchain_aarch64_macos",
+    "//bazel/toolchain:cc_toolchain_x86_64_linux",
 )
 
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
@@ -18,6 +19,7 @@ rust.toolchain(
     extra_target_triples = [
         "x86_64-unknown-none",
         "aarch64-unknown-none",
+        "x86_64-unknown-linux-musl",
     ],
 )
 use_repo(rust, "rust_toolchains")

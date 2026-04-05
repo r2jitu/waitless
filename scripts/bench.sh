@@ -374,10 +374,15 @@ bench_docker_server() {
     echo "==> [${STEP_DOCKER}/${TOTAL}] webserver in Docker  (same app code, Linux VM)"
 
     echo "  Building Docker image (webserver for Linux)..."
+    # Cross-compile for Linux x86_64 (static musl binary) using Bazel
+    cd "$PROJECT_ROOT"
+    bazel build --config=x86_64-linux //apps/webserver:webserver_native 2>&1 | \
+        grep -E '(INFO|ERROR|WARNING|Target)' | tail -3 || true
+    cp -Lf bazel-bin/apps/webserver/webserver_native bench/webserver_native 2>/dev/null \
+        || { echo "  bazel cross-compile failed — skipping"; echo ""; return 0; }
     docker build -q \
-        -f "$PROJECT_ROOT/bench/Dockerfile" \
         -t webserver_linux \
-        "$PROJECT_ROOT" >/dev/null 2>&1 \
+        "$PROJECT_ROOT/bench" >/dev/null 2>&1 \
         || { echo "  docker build failed — skipping"; echo ""; return 0; }
 
     local cid
