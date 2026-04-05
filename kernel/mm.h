@@ -2,69 +2,43 @@
 
 // kernel/mm.h — Memory management interface
 //
-// Provides:
-//   - Physical frame allocator (bitmap-based, 4KB pages)
-//   - Kernel heap allocator (free-list with splitting and coalescing)
-//
-// The physical frame allocator manages all available RAM above the kernel.
-// The heap allocator provides kmalloc/kfree for dynamic allocations needed
-// by the network stack, drivers, etc.
+// Thin C++ wrapper around the Rust mm implementation (kernel/mm.rs).
+// The extern "C" functions are exported by the Rust static library;
+// the namespace mm inlines provide source-compatible C++ API.
 
 #include <stddef.h>
 #include <stdint.h>
 
 #include "kernel/boot_info.h"
 
+// ---- Rust extern "C" functions (kernel/mm.rs) ----
+
+extern "C" {
+void mm_init(const boot::BootInfo *info);
+uint64_t mm_alloc_frame();
+void mm_free_frame(uint64_t addr);
+void *mm_kmalloc(size_t size);
+void mm_kfree(void *ptr);
+size_t mm_get_total_memory();
+size_t mm_get_free_memory();
+void *mm_phys_to_virt(uint64_t phys);
+uint64_t mm_virt_to_phys(const void *virt);
+}
+
+// ---- Source-compatible C++ namespace wrappers ----
+
 namespace mm {
 
-// Page size
 static constexpr uint64_t PAGE_SIZE = 4096;
 
-// ============================================================================
-// Public API
-// ============================================================================
-
-// Initialize the memory manager from the unified boot info.
-// Sets up the physical frame bitmap and kernel heap.
-void init(const boot::BootInfo &info);
-
-// Allocate a single 4KB physical page frame.
-// Returns the physical address of the frame, or 0 on failure.
-uint64_t alloc_frame();
-
-// Free a previously allocated physical page frame.
-void free_frame(uint64_t addr);
-
-// Allocate memory from the kernel heap.
-// Returns a pointer to at least `size` bytes of usable memory, or
-// nullptr if the heap is exhausted. The returned pointer is aligned
-// to 16 bytes.
-void *kmalloc(size_t size);
-
-// Free memory previously allocated by kmalloc.
-// Marks the block as free and attempts to coalesce with adjacent
-// free blocks.
-void kfree(void *ptr);
-
-// Return the total amount of physical RAM detected (in bytes).
-size_t get_total_memory();
-
-// Return the amount of free physical RAM (in bytes).
-size_t get_free_memory();
-
-// Convert between physical and virtual addresses.
-// On arm64, the kernel is always identity-mapped so these are no-ops.
-// On x86_64, Limine higher-half boot requires the HHDM offset.
-#if defined(__aarch64__)
-inline void *phys_to_virt(uint64_t phys) {
-  return reinterpret_cast<void *>(phys);
-}
-inline uint64_t virt_to_phys(const void *virt) {
-  return reinterpret_cast<uint64_t>(virt);
-}
-#else
-void *phys_to_virt(uint64_t phys);
-uint64_t virt_to_phys(const void *virt);
-#endif
+inline void init(const boot::BootInfo &info) { mm_init(&info); }
+inline uint64_t alloc_frame() { return mm_alloc_frame(); }
+inline void free_frame(uint64_t addr) { mm_free_frame(addr); }
+inline void *kmalloc(size_t size) { return mm_kmalloc(size); }
+inline void kfree(void *ptr) { mm_kfree(ptr); }
+inline size_t get_total_memory() { return mm_get_total_memory(); }
+inline size_t get_free_memory() { return mm_get_free_memory(); }
+inline void *phys_to_virt(uint64_t phys) { return mm_phys_to_virt(phys); }
+inline uint64_t virt_to_phys(const void *virt) { return mm_virt_to_phys(virt); }
 
 } // namespace mm

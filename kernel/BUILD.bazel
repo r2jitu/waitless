@@ -1,4 +1,5 @@
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_rust//rust:defs.bzl", "rust_library")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -47,6 +48,17 @@ cc_library(
     copts = ["-I."],
 )
 
+rust_library(
+    name = "mm_rs",
+    srcs = ["mm.rs"],
+    crate_name = "kernel_mm",
+    edition = "2024",
+    rustc_flags = ["-C", "panic=abort"] + select({
+        "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
+        "//conditions:default": [],
+    }),
+)
+
 cc_library(
     name = "boot_info",
     hdrs = ["boot_info.h"],
@@ -64,7 +76,6 @@ cc_library(
 cc_library(
     name = "core",
     srcs = [
-        "mm.cc",
         "libc.cc",
     ] + select({
         "//bazel/platforms:x86_64": ["x86_64/serial.cc"],

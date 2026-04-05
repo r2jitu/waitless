@@ -29,13 +29,13 @@ pub extern "C" fn rust_eh_personality() {}
 // FFI declarations — kernel functions provided by drivers_ffi.cc
 // ============================================================================
 
+// Memory management — direct calls to Rust mm (kernel/mm.rs via kernel_mm rlib).
+// This eliminates the C++ FFI hop through drivers_ffi.cc for memory operations.
+extern crate kernel_mm;
+use kernel_mm::{mm_alloc_frame, mm_phys_to_virt, mm_virt_to_phys, mm_kmalloc, mm_kfree};
+
 unsafe extern "C" {
     fn driver_log(msg: *const u8);
-    fn driver_alloc_frame() -> u64;
-    fn driver_phys_to_virt(phys: u64) -> *mut u8;
-    fn driver_virt_to_phys(virt: *const u8) -> u64;
-    fn driver_kmalloc(size: usize) -> *mut u8;
-    fn driver_kfree(ptr: *mut u8);
     fn driver_register_irq(intid_or_vector: u32, handler: unsafe extern "C" fn());
     #[cfg(target_arch = "x86_64")]
     fn driver_x86_enable_irq(irq: u32);
@@ -970,13 +970,13 @@ impl Virtqueue {
         let total_size = first_region + second_region;
         let num_frames = (total_size + 4095) / 4096;
 
-        let phys_base = unsafe { driver_alloc_frame() };
+        let phys_base = unsafe { mm_alloc_frame() };
         if phys_base == 0 { return None; }
         for _ in 1..num_frames {
-            unsafe { driver_alloc_frame(); }
+            unsafe { mm_alloc_frame(); }
         }
 
-        let base_ptr = unsafe { driver_phys_to_virt(phys_base) };
+        let base_ptr = unsafe { mm_phys_to_virt(phys_base) };
         unsafe { ptr::write_bytes(base_ptr, 0, total_size as usize); }
 
         self.descs = base_ptr as *mut VirtqDesc;
@@ -1318,7 +1318,7 @@ fn init_pci_modern() -> bool {
 
     // Allocate and populate RX buffers
     for i in 0..RX_BUFFERS {
-        let alloc = unsafe { driver_kmalloc(BUFFER_SIZE as usize + 2) };
+        let alloc = unsafe { mm_kmalloc(BUFFER_SIZE as usize + 2) };
         if alloc.is_null() {
             log(b"virtio_net: failed to allocate RX buffer\n\0");
             vpci_set_status(dev, STATUS_FAILED);
@@ -1329,7 +1329,7 @@ fn init_pci_modern() -> bool {
         unsafe {
             ptr::write_bytes(buf, 0, VIRTIO_NET_HDR_SIZE);
             NET_RX_BUFFERS[i] = buf;
-            let buf_phys = driver_virt_to_phys(buf);
+            let buf_phys = mm_virt_to_phys(buf);
             NET_RX_QUEUE.add_buf(buf_phys, BUFFER_SIZE, 0, 1);
         }
     }
@@ -1460,13 +1460,13 @@ fn init_mmio() -> bool {
 
     // Allocate RX buffers
     for i in 0..RX_BUFFERS {
-        let alloc = unsafe { driver_kmalloc(BUFFER_SIZE as usize + 2) };
+        let alloc = unsafe { mm_kmalloc(BUFFER_SIZE as usize + 2) };
         if alloc.is_null() { return false; }
         let buf = unsafe { alloc.add(2) };
         unsafe {
             ptr::write_bytes(buf, 0, VIRTIO_NET_HDR_SIZE);
             NET_RX_BUFFERS[i] = buf;
-            let buf_phys = driver_virt_to_phys(buf);
+            let buf_phys = mm_virt_to_phys(buf);
             NET_RX_QUEUE.add_buf(buf_phys, BUFFER_SIZE, 0, 1);
         }
     }
@@ -1568,12 +1568,12 @@ fn init_legacy_pci() -> bool {
 
     // Allocate RX buffers (no +2 alignment shift on x86)
     for i in 0..RX_BUFFERS {
-        let buf = unsafe { driver_kmalloc(BUFFER_SIZE as usize) };
+        let buf = unsafe { mm_kmalloc(BUFFER_SIZE as usize) };
         if buf.is_null() { return false; }
         unsafe {
             ptr::write_bytes(buf, 0, VIRTIO_NET_HDR_SIZE);
             NET_RX_BUFFERS[i] = buf;
-            let buf_phys = driver_virt_to_phys(buf);
+            let buf_phys = mm_virt_to_phys(buf);
             NET_RX_QUEUE.add_buf(buf_phys, BUFFER_SIZE, 0, 1);
         }
     }
@@ -1597,7 +1597,7 @@ fn init_legacy_pci() -> bool {
 // ---- TX drain ---------------------------------------------------------------
 
 fn tx_drain() {
-    let pool_phys = unsafe { driver_virt_to_phys(NET_TX_POOL.as_ptr() as *const u8) };
+    let pool_phys = unsafe { mm_virt_to_phys(NET_TX_POOL.as_ptr() as *const u8) };
     unsafe {
         while let Some((used_id, _used_len)) = NET_TX_QUEUE.get_used() {
             let d = NET_TX_QUEUE.desc(used_id);
@@ -1700,7 +1700,7 @@ pub extern "C" fn driver_virtio_net_send(data: *const u8, len: u32) {
         ptr::copy_nonoverlapping(data, buf.data.as_mut_ptr(), frame_len as usize);
 
         let total_len = VIRTIO_NET_HDR_SIZE as u32 + frame_len;
-        let buf_phys = driver_virt_to_phys(buf as *const TxBuf as *const u8);
+        let buf_phys = mm_virt_to_phys(buf as *const TxBuf as *const u8);
         let head = NET_TX_QUEUE.add_buf(buf_phys, total_len, 1, 0);
         if head < 0 {
             NET_TX_POOL_USED[slot] = false;
@@ -1725,7 +1725,7 @@ pub extern "C" fn driver_virtio_net_poll(
     unsafe {
         while let Some((used_id, used_len)) = NET_RX_QUEUE.get_used() {
             let desc = NET_RX_QUEUE.desc(used_id);
-            let buf = driver_phys_to_virt(desc.addr);
+            let buf = mm_phys_to_virt(desc.addr);
 
             if used_len > VIRTIO_NET_HDR_SIZE as u32 {
                 let frame_len = used_len - VIRTIO_NET_HDR_SIZE as u32;
@@ -1734,7 +1734,7 @@ pub extern "C" fn driver_virtio_net_poll(
             }
 
             // Re-arm RX buffer
-            let buf_phys = driver_virt_to_phys(buf);
+            let buf_phys = mm_virt_to_phys(buf);
             NET_RX_QUEUE.add_buf(buf_phys, BUFFER_SIZE, 0, 1);
             count += 1;
         }

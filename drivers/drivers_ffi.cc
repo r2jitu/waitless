@@ -1,11 +1,11 @@
 // drivers/drivers_ffi.cc — C-linkage FFI bridge for Rust driver code
 //
-// Exposes kernel functions (memory management, serial, FDT, MMU, IRQ)
-// to the Rust driver crate. Architecture-specific I/O (port I/O, MMIO,
-// barriers) is handled directly in Rust via inline assembly.
+// Exposes kernel functions (serial, FDT, MMU, IRQ) to the Rust driver
+// crate. Memory management is now handled directly in Rust (kernel/mm.rs).
+// Architecture-specific I/O (port I/O, MMIO, barriers) is handled
+// directly in Rust via inline assembly.
 
 #include "kernel/serial.h"
-#include "kernel/mm.h"
 
 #if defined(__aarch64__)
 #include "kernel/aarch64/fdt.h"
@@ -21,14 +21,7 @@ extern "C" {
 // ---- Serial output ----------------------------------------------------------
 
 void driver_log(const char *msg) { serial::printf("%s", msg); }
-
-// ---- Memory management ------------------------------------------------------
-
-uint64_t driver_alloc_frame() { return mm::alloc_frame(); }
-void *driver_phys_to_virt(uint64_t phys) { return mm::phys_to_virt(phys); }
-uint64_t driver_virt_to_phys(const void *virt) { return mm::virt_to_phys(virt); }
-void *driver_kmalloc(size_t size) { return mm::kmalloc(size); }
-void driver_kfree(void *ptr) { mm::kfree(ptr); }
+void driver_serial_putc(uint8_t c) { serial::putc((char)c); }
 
 // ---- Platform-specific: aarch64 ---------------------------------------------
 
