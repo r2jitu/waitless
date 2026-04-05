@@ -11,21 +11,22 @@ rust_static_library(
     srcs = ["drivers.rs"],
     crate_name = "drivers",
     edition = "2024",
-    deps = ["//kernel:fdt_rs", "//kernel:mm_rs", "//kernel:mmu_rs", "//kernel:serial_rs"],
+    deps = ["//kernel:exceptions_rs", "//kernel:fdt_rs", "//kernel:mm_rs", "//kernel:mmu_rs", "//kernel:serial_rs"],
     rustc_flags = ["-C", "panic=abort"] + select({
         "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
         "//conditions:default": [],
     }),
 )
 
-# C FFI bridge: exposes kernel functions to the Rust driver crate.
+# C FFI bridge: exposes x86_64 IDT functions to the Rust driver crate.
+# On aarch64 this is empty (all kernel functions called from Rust directly).
 cc_library(
     name = "drivers_ffi",
     srcs = ["drivers_ffi.cc"],
-    deps = [
-        "//kernel:arch_h",
-        "//kernel:arch_init",
-    ],
+    deps = select({
+        "//bazel/platforms:x86_64": ["//kernel:arch_init"],
+        "//conditions:default": [],
+    }),
     copts = ["-I."],
 )
 

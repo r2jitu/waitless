@@ -48,6 +48,18 @@ rust_library(
 )
 
 rust_library(
+    name = "exceptions_rs",
+    srcs = ["exceptions.rs"],
+    crate_name = "kernel_exceptions",
+    edition = "2024",
+    deps = [":fdt_rs", ":serial_rs"],
+    rustc_flags = ["-C", "panic=abort"] + select({
+        "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
+        "//conditions:default": [],
+    }),
+)
+
+rust_library(
     name = "fdt_rs",
     srcs = ["fdt.rs"],
     crate_name = "kernel_fdt",
@@ -121,7 +133,7 @@ cc_library(
             "x86_64/gdt.cc",
             "x86_64/idt.cc",
         ],
-        "//bazel/platforms:aarch64": ["aarch64/exceptions.cc"],
+        "//bazel/platforms:aarch64": [],
         "//conditions:default": [
             "x86_64/gdt.cc",
             "x86_64/idt.cc",
@@ -138,7 +150,10 @@ cc_library(
             "x86_64/idt.h",
         ],
     }),
-    deps = [":core", ":fdt"],
+    deps = select({
+        "//bazel/platforms:aarch64": [],
+        "//conditions:default": [":core", ":fdt"],
+    }),
     copts = ["-I."],
 )
 

@@ -30,6 +30,7 @@ pub extern "C" fn rust_eh_personality() {}
 // ============================================================================
 
 // Kernel Rust rlibs — direct calls, no C++ FFI hop.
+extern crate kernel_exceptions;
 extern crate kernel_fdt;
 extern crate kernel_mm;
 extern crate kernel_mmu;
@@ -37,9 +38,9 @@ extern crate kernel_serial;
 use kernel_mm::{mm_alloc_frame, mm_phys_to_virt, mm_virt_to_phys, mm_kmalloc, mm_kfree};
 use kernel_mmu::mmu_map_device_range;
 
+#[cfg(target_arch = "x86_64")]
 unsafe extern "C" {
-    fn driver_register_irq(intid_or_vector: u32, handler: unsafe extern "C" fn());
-    #[cfg(target_arch = "x86_64")]
+    fn driver_register_irq(vector: u32, handler: unsafe extern "C" fn());
     fn driver_x86_enable_irq(irq: u32);
 }
 
@@ -1584,10 +1585,15 @@ fn tx_drain() {
     }
 }
 
-// ---- IRQ handler (called from drivers_ffi.cc trampoline) --------------------
+// ---- IRQ handler -----------------------------------------------------------
 
-#[unsafe(no_mangle)]
-extern "C" fn driver_virtio_net_irq_handler() {
+// x86_64: extern "C" fn() wrapper for the idt.cc trampoline
+#[cfg(target_arch = "x86_64")]
+unsafe extern "C" fn driver_virtio_net_irq_handler_x86() {
+    driver_virtio_net_irq_handler(0);
+}
+
+fn driver_virtio_net_irq_handler(_irq: u32) {
     unsafe {
         // NAPI: disable notifications on entry
         NET_RX_QUEUE.disable_interrupts();
@@ -1735,7 +1741,7 @@ pub extern "C" fn driver_virtio_net_enable_irq() {
                     let intid = if (slot as usize) < 8 { fdt.pci_irqs[slot as usize] } else { 0 };
                     if intid != 0 {
                         NET_RX_QUEUE.enable_interrupts();
-                        driver_register_irq(intid, driver_virtio_net_irq_handler);
+                        kernel_exceptions::exceptions_register_irq(intid, driver_virtio_net_irq_handler);
                         NET_IRQ_IDLE_AVAILABLE = true;
                     }
                 }
@@ -1743,7 +1749,7 @@ pub extern "C" fn driver_virtio_net_enable_irq() {
                     for i in 0..fdt.virtio_count as usize {
                         if fdt.virtio_bases[i] == base && fdt.virtio_irqs[i] != 0 {
                             NET_RX_QUEUE.enable_interrupts();
-                            driver_register_irq(fdt.virtio_irqs[i], driver_virtio_net_irq_handler);
+                            kernel_exceptions::exceptions_register_irq(fdt.virtio_irqs[i], driver_virtio_net_irq_handler);
                             NET_IRQ_IDLE_AVAILABLE = true;
                             break;
                         }
@@ -1761,7 +1767,7 @@ pub extern "C" fn driver_virtio_net_enable_irq() {
                 let irq_line = (irq_reg & 0xFF) as u8;
                 if irq_line < 16 {
                     NET_RX_QUEUE.enable_interrupts();
-                    driver_register_irq(32 + irq_line as u32, driver_virtio_net_irq_handler);
+                    driver_register_irq(32 + irq_line as u32, driver_virtio_net_irq_handler_x86);
                     driver_x86_enable_irq(irq_line as u32);
                     NET_IRQ_IDLE_AVAILABLE = true;
                 }
