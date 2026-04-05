@@ -364,21 +364,17 @@ impl Server {
     }
 
     fn find_handler(&self, path: &[u8]) -> Option<Handler> {
+        let routes = &self.routes[..self.route_count];
         // Exact match first
-        for i in 0..self.route_count {
-            let r = &self.routes[i];
-            if r.path[..r.path_len] == *path {
-                return r.handler;
-            }
+        if let Some(r) = routes.iter().find(|r| r.path[..r.path_len] == *path) {
+            return r.handler;
         }
         // Prefix match (e.g. "/api" matches "/api/v1/foo")
-        for i in 0..self.route_count {
-            let r = &self.routes[i];
-            if r.path_len > 1 && path.len() >= r.path_len {
-                if r.path[..r.path_len] == path[..r.path_len] {
-                    return r.handler;
-                }
-            }
+        if let Some(r) = routes.iter().find(|r| {
+            r.path_len > 1 && path.len() >= r.path_len
+                && r.path[..r.path_len] == path[..r.path_len]
+        }) {
+            return r.handler;
         }
         self.default_handler
     }
@@ -401,19 +397,19 @@ fn parse_request(data: &[u8], req: &mut Request) -> usize {
     // Parse request line: "METHOD /path HTTP/1.x\r\n"
     let mut pos = 0;
 
-    if starts_with(&data[pos..], b"GET ") {
+    if data[pos..].starts_with(b"GET ") {
         req.method = Method::Get;
         pos += 4;
-    } else if starts_with(&data[pos..], b"POST ") {
+    } else if data[pos..].starts_with(b"POST ") {
         req.method = Method::Post;
         pos += 5;
-    } else if starts_with(&data[pos..], b"PUT ") {
+    } else if data[pos..].starts_with(b"PUT ") {
         req.method = Method::Put;
         pos += 4;
-    } else if starts_with(&data[pos..], b"DELETE ") {
+    } else if data[pos..].starts_with(b"DELETE ") {
         req.method = Method::Delete;
         pos += 7;
-    } else if starts_with(&data[pos..], b"HEAD ") {
+    } else if data[pos..].starts_with(b"HEAD ") {
         req.method = Method::Head;
         pos += 5;
     } else {
@@ -507,65 +503,57 @@ fn parse_request(data: &[u8], req: &mut Request) -> usize {
 
 // ---- Response sender --------------------------------------------------------
 
-fn send_response(conn: TcpStream, resp: &Response, keep_alive: bool) {
-    let body = resp.body_bytes();
-    let content_type = resp.content_type_bytes();
-
-    // Build response in a single buffer → single tcp::send → one TCP segment.
-    let mut buf = [0u8; 2048];
-    let mut len = 0;
-
-    buf_append(&mut buf, &mut len, b"HTTP/1.1 ");
-    append_int(&mut buf, &mut len, resp.status);
-    buf_append(&mut buf, &mut len, b" ");
-    buf_append(&mut buf, &mut len, status_text(resp.status));
-    buf_append(&mut buf, &mut len, b"\r\n");
-
-    buf_append(&mut buf, &mut len, b"Content-Type: ");
-    buf_append(&mut buf, &mut len, content_type);
-    buf_append(&mut buf, &mut len, b"\r\n");
-
-    buf_append(&mut buf, &mut len, b"Content-Length: ");
-    append_int(&mut buf, &mut len, body.len() as i32);
-    buf_append(&mut buf, &mut len, b"\r\n");
-
-    if keep_alive {
-        buf_append(&mut buf, &mut len, b"Connection: keep-alive\r\n");
-    } else {
-        buf_append(&mut buf, &mut len, b"Connection: close\r\n");
-    }
-    buf_append(&mut buf, &mut len, b"\r\n");
-
-    if !body.is_empty() {
-        buf_append(&mut buf, &mut len, body);
-    }
-
-    conn.send(&buf[..len]);
+/// Fixed-size buffer writer for building HTTP responses without heap allocation.
+struct BufWriter {
+    buf: [u8; 2048],
+    pos: usize,
 }
 
-fn buf_append(buf: &mut [u8; 2048], len: &mut usize, data: &[u8]) {
-    let n = data.len().min(2048 - *len);
-    buf[*len..*len + n].copy_from_slice(&data[..n]);
-    *len += n;
+impl BufWriter {
+    fn new() -> Self {
+        BufWriter { buf: [0u8; 2048], pos: 0 }
+    }
+
+    fn push(&mut self, data: &[u8]) {
+        let n = data.len().min(2048 - self.pos);
+        self.buf[self.pos..self.pos + n].copy_from_slice(&data[..n]);
+        self.pos += n;
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.pos]
+    }
+}
+
+impl core::fmt::Write for BufWriter {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        self.push(s.as_bytes());
+        Ok(())
+    }
+}
+
+fn send_response(conn: TcpStream, resp: &Response, keep_alive: bool) {
+    use core::fmt::Write;
+
+    let body = resp.body_bytes();
+    let content_type = resp.content_type_bytes();
+    let conn_header = if keep_alive { "keep-alive" } else { "close" };
+
+    let mut w = BufWriter::new();
+    let _ = write!(w, "HTTP/1.1 {} {}\r\n", resp.status, status_text(resp.status));
+    let _ = write!(w, "Content-Type: ");
+    w.push(content_type);
+    let _ = write!(w, "\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n", body.len(), conn_header);
+    w.push(body);
+
+    conn.send(w.as_bytes());
 }
 
 // ---- Helper functions -------------------------------------------------------
 
 fn find_header_end(data: &[u8]) -> Option<usize> {
-    if data.len() < 4 {
-        return None;
-    }
-    for i in 0..data.len() - 3 {
-        if data[i] == b'\r' && data[i + 1] == b'\n' && data[i + 2] == b'\r' && data[i + 3] == b'\n'
-        {
-            return Some(i);
-        }
-    }
-    None
-}
-
-fn starts_with(data: &[u8], prefix: &[u8]) -> bool {
-    data.len() >= prefix.len() && data[..prefix.len()] == *prefix
+    data.windows(4)
+        .position(|w| w == b"\r\n\r\n")
 }
 
 
@@ -581,57 +569,23 @@ fn parse_usize(data: &[u8]) -> usize {
     n
 }
 
-fn append_int(buf: &mut [u8; 2048], len: &mut usize, n: i32) {
-    if *len >= 2048 {
-        return;
-    }
-    let mut tmp = [0u8; 12];
-    let mut pos = 0;
 
-    if n == 0 {
-        if *len < 2048 {
-            buf[*len] = b'0';
-            *len += 1;
-        }
-        return;
-    }
-
-    let mut u = if n < 0 { (-(n as i64)) as u32 } else { n as u32 };
-    while u > 0 {
-        tmp[pos] = b'0' + (u % 10) as u8;
-        u /= 10;
-        pos += 1;
-    }
-
-    if n < 0 && *len < 2048 {
-        buf[*len] = b'-';
-        *len += 1;
-    }
-
-    for i in (0..pos).rev() {
-        if *len < 2048 {
-            buf[*len] = tmp[i];
-            *len += 1;
-        }
-    }
-}
-
-fn status_text(status: i32) -> &'static [u8] {
+fn status_text(status: i32) -> &'static str {
     match status {
-        200 => b"OK",
-        201 => b"Created",
-        204 => b"No Content",
-        301 => b"Moved Permanently",
-        302 => b"Found",
-        304 => b"Not Modified",
-        400 => b"Bad Request",
-        401 => b"Unauthorized",
-        403 => b"Forbidden",
-        404 => b"Not Found",
-        405 => b"Method Not Allowed",
-        500 => b"Internal Server Error",
-        501 => b"Not Implemented",
-        503 => b"Service Unavailable",
-        _ => b"Unknown",
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        304 => "Not Modified",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        500 => "Internal Server Error",
+        501 => "Not Implemented",
+        503 => "Service Unavailable",
+        _ => "Unknown",
     }
 }
