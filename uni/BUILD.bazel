@@ -4,16 +4,29 @@ package(default_visibility = ["//visibility:public"])
 
 # ---- Platform API (Rust) ----------------------------------------------------
 # Safe Rust types for the uni:: platform abstraction: TcpListener, TcpStream,
-# log(), config_port(), etc. Symbols are resolved at link time from one of:
-#   - Unikernel backend: net/stack.rs (TCP) + uni/ffi.rs (lifecycle)
-#   - Native backend:    uni/native.rs (POSIX sockets + stdio)
+# log(), config_port(), etc.
+#
+# The backend is selected at compile time via --cfg:
+#   - platform_unikernel: direct calls to net/stack.rs + uni/ffi.rs
+#   - platform_native:    direct calls to uni/native.rs
+# No C FFI boundary — pure Rust crate-to-crate calls.
 
 rust_library(
     name = "api",
     srcs = ["api.rs"],
     crate_name = "uni",
     edition = "2024",
-    rustc_flags = ["-C", "panic=abort"] + select({
+    deps = select({
+        "//bazel/platforms:native": [":native"],
+        "//conditions:default": [
+            "//net:stack_rs",
+            ":ffi",
+        ],
+    }),
+    rustc_flags = select({
+        "//bazel/platforms:native": ["--cfg=platform_native"],
+        "//conditions:default": ["--cfg=platform_unikernel"],
+    }) + ["-C", "panic=abort"] + select({
         "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
         "//conditions:default": [],
     }),

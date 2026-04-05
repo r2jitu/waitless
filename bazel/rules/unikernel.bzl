@@ -79,13 +79,12 @@ def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
     # Only built when the platform has the runtime:native constraint
     # (aarch64_macos or x86_64_linux); excluded from unikernel
     # platforms (os:none) where the bare-metal toolchain would be selected.
-    # uni:native provides both the POSIX backend and main().
+    # The native backend (uni/native.rs) is pulled in transitively via
+    # uni:api → uni:native (selected by #[cfg(platform_native)]).
     cc_binary(
         name = name + "_native",
         srcs = srcs,
-        deps = deps + [
-            "//uni:native",
-        ],
+        deps = deps,
         copts = copts,
         target_compatible_with = ["//bazel/platforms:native"],
         visibility = visibility,
