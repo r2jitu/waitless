@@ -12,8 +12,7 @@ rust_library(
     crate_name = "net_stack",
     edition = "2024",
     deps = [
-        "//kernel:serial_rs",
-        "//kernel:mm_rs",
+        "//kernel:kernel_rs",
         "//drivers:drivers_rs",
     ],
     rustc_flags = ["-C", "panic=abort", "-C", "opt-level=2"] + select({

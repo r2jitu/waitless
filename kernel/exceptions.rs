@@ -6,10 +6,6 @@
 //
 // On x86_64 this module provides no-op stubs.
 
-#![no_std]
-#![allow(unsafe_op_in_unsafe_fn)]
-#![allow(static_mut_refs)]
-
 // ============================================================================
 // aarch64 implementation
 // ============================================================================
@@ -19,8 +15,8 @@ mod aarch64 {
     use core::arch::asm;
     use core::ptr;
 
-    extern crate kernel_fdt;
-    extern crate kernel_serial;
+    use crate::fdt as kernel_fdt;
+    use crate::serial as kernel_serial;
 
     // ---- GIC register bases (filled from FDT at init time) ----------------
 

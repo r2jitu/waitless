@@ -9,10 +9,6 @@
 //
 // On x86_64 this module provides a no-op stub.
 
-#![no_std]
-#![allow(unsafe_op_in_unsafe_fn)]
-#![allow(static_mut_refs)]
-
 // ============================================================================
 // aarch64 implementation
 // ============================================================================

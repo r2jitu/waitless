@@ -12,10 +12,6 @@
 // Provides a core::fmt::Write implementation (SerialWriter) for formatted
 // Rust output, plus serial_puts() for byte-slice logging.
 
-#![no_std]
-#![allow(unsafe_op_in_unsafe_fn)]
-#![allow(static_mut_refs)]
-
 use core::ptr;
 
 // ============================================================================
@@ -94,7 +90,7 @@ mod x86 {
 mod aarch64 {
     use core::ptr;
 
-    extern crate kernel_fdt;
+    use crate::fdt as kernel_fdt;
 
     // PL011 register offsets
     const PL011_DR: u64 = 0x000;    // Data register

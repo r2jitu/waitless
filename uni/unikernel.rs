@@ -6,7 +6,8 @@
 #![allow(static_mut_refs)]
 #![allow(unsafe_op_in_unsafe_fn)]
 
-extern crate kernel_serial;
+extern crate kernel;
+use kernel::serial as kernel_serial;
 extern crate drivers;
 
 // ---- Lifecycle / config -------------------------------------------------------

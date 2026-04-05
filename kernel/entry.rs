@@ -13,17 +13,13 @@
 
 use core::ptr;
 
-extern crate kernel_types;
-extern crate kernel_serial;
-extern crate kernel_mm;
-extern crate kernel_fdt;
-extern crate kernel_mmu;
-extern crate kernel_exceptions;
+extern crate kernel;
 extern crate drivers;
 extern crate net_stack;
 extern crate uni_unikernel;
 
-use kernel_types::{BootInfo, MemoryRegion, Protocol, MEM_AVAILABLE, MEM_RESERVED, MAX_MEMORY_REGIONS};
+use kernel::{types, serial, mm, fdt, mmu, exceptions};
+use types::{BootInfo, MemoryRegion, Protocol, MEM_AVAILABLE, MEM_RESERVED, MAX_MEMORY_REGIONS};
 
 // ============================================================================
 // Panic handler (required for rust_static_library)
@@ -31,7 +27,7 @@ use kernel_types::{BootInfo, MemoryRegion, Protocol, MEM_AVAILABLE, MEM_RESERVED
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    kernel_serial::serial_puts(b"PANIC in entry\n");
+    serial::serial_puts(b"PANIC in entry\n");
     unsafe { arch_shutdown() }
 }
 
@@ -43,7 +39,7 @@ pub extern "C" fn rust_eh_personality() {}
 // ============================================================================
 
 #[cfg(target_arch = "x86_64")]
-extern crate x86_init;
+use kernel::x86_64 as x86_init;
 
 /// Power off the machine. Never returns.
 #[cfg(target_arch = "x86_64")]
@@ -93,9 +89,9 @@ fn klog(args: core::fmt::Arguments) {
         fn write_str(&mut self, s: &str) -> core::fmt::Result {
             for b in s.bytes() {
                 if b == b'\n' {
-                    kernel_serial::serial_putc(b'\r');
+                    serial::serial_putc(b'\r');
                 }
-                kernel_serial::serial_putc(b);
+                serial::serial_putc(b);
             }
             Ok(())
         }
@@ -295,7 +291,7 @@ mod boot_shim_fdt {
         info.kernel_virt_base = 0;
         info.hhdm_offset = 0;
 
-        let fdt = &*kernel_fdt::fdt_info_ptr();
+        let fdt = &*fdt::fdt_info_ptr();
         let ram_base = if fdt.ram_size != 0 {
             fdt.ram_base
         } else {
@@ -329,7 +325,7 @@ mod boot_shim_fdt {
 static mut G_BOOT_INFO: BootInfo = BootInfo::zeroed();
 
 unsafe fn kernel_boot(info: &BootInfo) {
-    kernel_serial::serial_init();
+    serial::serial_init();
     klog!("\n");
     klog!("==============================================\n");
     #[cfg(target_arch = "aarch64")]
@@ -343,7 +339,7 @@ unsafe fn kernel_boot(info: &BootInfo) {
 
     #[cfg(target_arch = "aarch64")]
     {
-        let fdt = &*kernel_fdt::fdt_info_ptr();
+        let fdt = &*fdt::fdt_info_ptr();
         klog!(
             "[FDT] uart=0x{:x} pcie=0x{:x} virtio={} gic=0x{:x} ram=0x{:x}+{}MB\n",
             fdt.uart_base,
@@ -365,15 +361,15 @@ unsafe fn kernel_boot(info: &BootInfo) {
     #[cfg(target_arch = "aarch64")]
     {
         klog!("[INIT] Exception vectors + GIC...\n");
-        kernel_exceptions::exceptions_init();
+        exceptions::exceptions_init();
     }
 
     klog!("[INIT] Memory manager...\n");
-    kernel_mm::mm_init(info as *const BootInfo);
+    mm::mm_init(info as *const BootInfo);
     klog!(
         "       {} MB total, {} MB free\n",
-        kernel_mm::mm_get_total_memory() / (1024 * 1024),
-        kernel_mm::mm_get_free_memory() / (1024 * 1024)
+        mm::mm_get_total_memory() / (1024 * 1024),
+        mm::mm_get_free_memory() / (1024 * 1024)
     );
 
     call_global_constructors();
@@ -415,9 +411,9 @@ unsafe fn kernel_boot(info: &BootInfo) {
 
         #[cfg(target_arch = "aarch64")]
         {
-            let fdt = &*kernel_fdt::fdt_info_ptr();
+            let fdt = &*fdt::fdt_info_ptr();
             if fdt.gic_dist_base != 0 {
-                kernel_exceptions::exceptions_enable_timer_wakeup();
+                exceptions::exceptions_enable_timer_wakeup();
             }
             // Unmask IRQ only (not FIQ — VZ uses FIQ for hypervisor)
             if fdt.gic_dist_base != 0 {
@@ -429,7 +425,7 @@ unsafe fn kernel_boot(info: &BootInfo) {
             // Serial RX interrupt (IRQ4 / vector 36) for Ctrl-C wakeup
             x86_init::idt::register_handler(36, serial_rx_isr_trampoline);
             x86_init::idt::enable_irq(4);
-            kernel_serial::serial_enable_rx_irq();
+            serial::serial_enable_rx_irq();
         }
     }
 
@@ -444,7 +440,7 @@ unsafe fn kernel_boot(info: &BootInfo) {
 // x86_64: ISR trampoline for serial RX (ignores InterruptFrame pointer)
 #[cfg(target_arch = "x86_64")]
 unsafe extern "C" fn serial_rx_isr_trampoline(_frame: *mut x86_init::idt::InterruptFrame) {
-    kernel_serial::serial_rx_isr();
+    serial::serial_rx_isr();
 }
 
 // ============================================================================
@@ -459,18 +455,18 @@ pub unsafe extern "C" fn kernel_main(boot_info_addr: u64) {
     #[cfg(target_arch = "aarch64")]
     {
         // Parse DTB before serial::init() (PL011 address comes from FDT)
-        kernel_fdt::fdt_init(boot_info_addr);
+        fdt::fdt_init(boot_info_addr);
 
         // Map device MMIO regions before any access
-        let fdt = &*kernel_fdt::fdt_info_ptr();
+        let fdt = &*fdt::fdt_info_ptr();
         if fdt.pcie_ecam_base != 0 && fdt.pcie_ecam_size != 0 {
-            kernel_mmu::mmu_map_device_range(fdt.pcie_ecam_base, fdt.pcie_ecam_size);
+            mmu::mmu_map_device_range(fdt.pcie_ecam_base, fdt.pcie_ecam_size);
         }
         if fdt.gic_dist_base != 0 {
-            kernel_mmu::mmu_map_device_range(fdt.gic_dist_base, 0x10000);
+            mmu::mmu_map_device_range(fdt.gic_dist_base, 0x10000);
         }
         if fdt.gic_redist_base != 0 {
-            kernel_mmu::mmu_map_device_range(fdt.gic_redist_base, 0x20000);
+            mmu::mmu_map_device_range(fdt.gic_redist_base, 0x20000);
         }
 
         boot_shim_fdt::shim(&mut G_BOOT_INFO, boot_info_addr);

@@ -17,19 +17,14 @@
 //    The heap starts after the frame bitmap and grows upward. We pre-allocate
 //    a fixed heap region (16MB) from the available physical memory.
 
-#![no_std]
-#![allow(unsafe_op_in_unsafe_fn)]
-#![allow(static_mut_refs)]
-
 use core::ptr;
 
 // ============================================================================
 // Dependencies
 // ============================================================================
 
-extern crate kernel_serial;
-extern crate kernel_types;
-use kernel_types::{BootInfo, MEM_AVAILABLE};
+use crate::serial as kernel_serial;
+use crate::types::{BootInfo, MEM_AVAILABLE};
 
 unsafe extern "C" {
     // Linker-provided symbol marking the end of the kernel image

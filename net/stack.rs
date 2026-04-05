@@ -17,8 +17,8 @@ use core::ptr;
 // Rust crate dependencies — direct calls, no FFI
 // ============================================================================
 
-extern crate kernel_serial;
-extern crate kernel_mm;
+extern crate kernel;
+use kernel::{serial as kernel_serial, mm as kernel_mm};
 extern crate drivers;
 
 fn log(msg: &[u8]) {

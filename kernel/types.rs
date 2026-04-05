@@ -5,8 +5,6 @@
 // boot protocol).  Defining them once eliminates duplication and
 // provides compile-time layout guarantees.
 
-#![no_std]
-
 pub const MAX_MEMORY_REGIONS: usize = 64;
 pub const MEM_AVAILABLE: u32 = 1;
 pub const MEM_RESERVED: u32 = 2;

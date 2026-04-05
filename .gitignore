@@ -33,3 +33,4 @@ scripts/run-vz
 
 # Cached Limine bootloader binaries (downloaded by make-limine-iso.sh)
 .cache/
+bazel-agent-*

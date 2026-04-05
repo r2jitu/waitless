@@ -15,11 +15,11 @@
 
 use core::panic::PanicInfo;
 
-extern crate kernel_types;
-extern crate kernel_fdt;
-extern crate kernel_mmu;
+extern crate kernel;
 
-use kernel_types::{BootInfo, MemoryRegion, Protocol, MEM_AVAILABLE, MEM_RESERVED, MAX_MEMORY_REGIONS};
+use kernel::types::{BootInfo, MemoryRegion, Protocol, MEM_AVAILABLE, MEM_RESERVED, MAX_MEMORY_REGIONS};
+use kernel::fdt as kernel_fdt;
+use kernel::mmu as kernel_mmu;
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {

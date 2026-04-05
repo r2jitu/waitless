@@ -3,69 +3,23 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_static_library")
 
 package(default_visibility = ["//visibility:public"])
 
+# Unified kernel library — types, serial, mm, fdt, mmu, exceptions, x86_64 init.
 rust_library(
-    name = "types_rs",
-    srcs = ["types.rs"],
-    crate_name = "kernel_types",
-    edition = "2024",
-    rustc_flags = ["-C", "panic=abort", "-C", "opt-level=2"] + select({
-        "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
+    name = "kernel_rs",
+    srcs = [
+        "lib.rs",
+        "types.rs",
+        "serial.rs",
+        "mm.rs",
+        "fdt.rs",
+        "mmu.rs",
+        "exceptions.rs",
+    ] + select({
+        "//bazel/platforms:x86_64": ["x86_64/mod.rs", "x86_64/gdt.rs", "x86_64/idt.rs"],
         "//conditions:default": [],
     }),
-)
-
-rust_library(
-    name = "mmu_rs",
-    srcs = ["mmu.rs"],
-    crate_name = "kernel_mmu",
+    crate_name = "kernel",
     edition = "2024",
-    rustc_flags = ["-C", "panic=abort", "-C", "opt-level=2"] + select({
-        "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
-        "//conditions:default": [],
-    }),
-)
-
-rust_library(
-    name = "exceptions_rs",
-    srcs = ["exceptions.rs"],
-    crate_name = "kernel_exceptions",
-    edition = "2024",
-    deps = [":fdt_rs", ":serial_rs"],
-    rustc_flags = ["-C", "panic=abort", "-C", "opt-level=2"] + select({
-        "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
-        "//conditions:default": [],
-    }),
-)
-
-rust_library(
-    name = "fdt_rs",
-    srcs = ["fdt.rs"],
-    crate_name = "kernel_fdt",
-    edition = "2024",
-    rustc_flags = ["-C", "panic=abort", "-C", "opt-level=2"] + select({
-        "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
-        "//conditions:default": [],
-    }),
-)
-
-rust_library(
-    name = "serial_rs",
-    srcs = ["serial.rs"],
-    crate_name = "kernel_serial",
-    edition = "2024",
-    deps = [":fdt_rs"],
-    rustc_flags = ["-C", "panic=abort", "-C", "opt-level=2"] + select({
-        "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
-        "//conditions:default": [],
-    }),
-)
-
-rust_library(
-    name = "mm_rs",
-    srcs = ["mm.rs"],
-    crate_name = "kernel_mm",
-    edition = "2024",
-    deps = [":serial_rs", ":types_rs"],
     rustc_flags = ["-C", "panic=abort", "-C", "opt-level=2"] + select({
         "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
         "//conditions:default": [],
@@ -107,7 +61,7 @@ rust_static_library(
     srcs = ["limine_entry.rs"],
     crate_name = "limine_entry",
     edition = "2024",
-    deps = [":types_rs", ":fdt_rs", ":mmu_rs"],
+    deps = [":kernel_rs"],
     rustc_flags = ["-C", "panic=abort", "-C", "opt-level=2"] + select({
         "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
         "//conditions:default": [],
@@ -129,21 +83,6 @@ cc_library(
     alwayslink = True,  # Limine requests must not be stripped by linker
 )
 
-# x86_64 arch initialization (GDT + IDT) in Rust + assembly ISR stubs.
-# The Rust code (gdt.rs, idt.rs) is compiled as a rust_library.
-# The ISR stub assembly (idt_stubs.S) is compiled as a cc_library.
-rust_library(
-    name = "x86_init_rs",
-    srcs = ["x86_64/x86_init.rs"] + select({
-        "//bazel/platforms:x86_64": ["x86_64/gdt.rs", "x86_64/idt.rs"],
-        "//conditions:default": [],
-    }),
-    crate_name = "x86_init",
-    edition = "2024",
-    deps = [":serial_rs"],
-    rustc_flags = ["-C", "panic=abort", "-C", "opt-level=2"],
-)
-
 # ISR stub assembly — provides isr_stub_table and isr_common.
 cc_library(
     name = "idt_stubs",
@@ -160,13 +99,7 @@ rust_static_library(
     crate_name = "kernel_entry",
     edition = "2024",
     deps = [
-        ":types_rs",
-        ":serial_rs",
-        ":mm_rs",
-        ":fdt_rs",
-        ":mmu_rs",
-        ":exceptions_rs",
-        ":x86_init_rs",
+        ":kernel_rs",
         "//drivers:drivers_rs",
         "//net:stack_rs",
         "//uni:unikernel",

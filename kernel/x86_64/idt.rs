@@ -239,7 +239,7 @@ pub unsafe extern "C" fn isr_common_handler(frame: *mut InterruptFrame) {
 
     // Unhandled CPU exception — print simple diagnostic and halt
     if vector < 32 {
-        kernel_serial::serial_puts(b"\n!!! UNHANDLED EXCEPTION !!!\nSystem halted.\n");
+        crate::serial::serial_puts(b"\n!!! UNHANDLED EXCEPTION !!!\nSystem halted.\n");
         loop {
             asm!("cli", "hlt", options(nomem, nostack));
         }
