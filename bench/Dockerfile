@@ -25,12 +25,16 @@ RUN mkdir -p out \
          -o out/libuni.rlib \
     && rustc --edition 2024 -C opt-level=2 -C panic=abort \
          --crate-type rlib --crate-name http \
-         net/http.rs --extern uni=out/libuni.rlib \
+         -L dependency=out \
+         net/http.rs \
+         --extern uni=out/libuni.rlib \
          -o out/libhttp.rlib \
     && rustc --edition 2024 -C opt-level=2 -C panic=abort \
          --crate-type staticlib \
+         -L dependency=out \
          apps/webserver/main.rs \
-         --extern http=out/libhttp.rlib --extern uni=out/libuni.rlib \
+         --extern http=out/libhttp.rlib \
+         --extern uni=out/libuni.rlib \
          -o out/libwebserver.a \
     && cc out/libwebserver.a -o /webserver -lpthread -ldl -lm
 
