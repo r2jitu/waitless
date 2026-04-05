@@ -92,7 +92,7 @@ impl Request {
     /// Look up a header by name (case-insensitive). Returns None if not found.
     pub fn get_header(&self, name: &[u8]) -> Option<&[u8]> {
         for i in 0..self.header_count {
-            if ascii_ieq(self.headers[i].name(), name) {
+            if self.headers[i].name().eq_ignore_ascii_case(name) {
                 return Some(self.headers[i].value());
             }
         }
@@ -224,7 +224,7 @@ impl Server {
     /// Register an exact-path handler.
     pub fn route(&mut self, path: &[u8], handler: Handler) {
         if self.route_count >= MAX_ROUTES {
-            uni::log(b"http: too many routes\n\0");
+            uni::log(b"http: too many routes\n");
             return;
         }
         let r = &mut self.routes[self.route_count];
@@ -245,16 +245,16 @@ impl Server {
         let listener = match TcpListener::bind(port) {
             Some(l) => l,
             None => {
-                uni::log(b"http: failed to create TCP listener\n\0");
+                uni::log(b"http: failed to create TCP listener\n");
                 return;
             }
         };
 
-        uni::log(b"http: listening\n\0");
+        uni::log(b"http: listening\n");
 
         loop {
             if uni::check_shutdown() {
-                uni::log(b"http: shutdown requested\n\0");
+                uni::log(b"http: shutdown requested\n");
                 break;
             }
             uni::tcp_poll();
@@ -267,7 +267,7 @@ impl Server {
                 if let Some(ac) = self.alloc_active() {
                     ac.conn = Some(stream);
                 } else {
-                    uni::log(b"http: too many connections, dropping\n\0");
+                    uni::log(b"http: too many connections, dropping\n");
                     stream.close();
                     break;
                 }
@@ -305,7 +305,7 @@ impl Server {
                     let consumed = parse_request(&self.active[i].buf[..buf_len], &mut req);
                     if consumed > 0 {
                         let want_close = match req.get_header(b"Connection") {
-                            Some(v) => ascii_ieq(v, b"close"),
+                            Some(v) => v.eq_ignore_ascii_case(b"close"),
                             None => false,
                         };
 
@@ -350,7 +350,7 @@ impl Server {
             }
         }
         listener.close();
-        uni::log(b"http: server stopped\n\0");
+        uni::log(b"http: server stopped\n");
     }
 
     fn alloc_active(&mut self) -> Option<&mut ActiveConn> {
@@ -367,7 +367,7 @@ impl Server {
         // Exact match first
         for i in 0..self.route_count {
             let r = &self.routes[i];
-            if bytes_eq(&r.path[..r.path_len], path) {
+            if r.path[..r.path_len] == *path {
                 return r.handler;
             }
         }
@@ -375,7 +375,7 @@ impl Server {
         for i in 0..self.route_count {
             let r = &self.routes[i];
             if r.path_len > 1 && path.len() >= r.path_len {
-                if bytes_eq(&r.path[..r.path_len], &path[..r.path_len]) {
+                if r.path[..r.path_len] == path[..r.path_len] {
                     return r.handler;
                 }
             }
@@ -565,34 +565,9 @@ fn find_header_end(data: &[u8]) -> Option<usize> {
 }
 
 fn starts_with(data: &[u8], prefix: &[u8]) -> bool {
-    data.len() >= prefix.len() && bytes_eq(&data[..prefix.len()], prefix)
+    data.len() >= prefix.len() && data[..prefix.len()] == *prefix
 }
 
-fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    for i in 0..a.len() {
-        if a[i] != b[i] {
-            return false;
-        }
-    }
-    true
-}
-
-fn ascii_ieq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    for i in 0..a.len() {
-        let ca = if a[i] >= b'A' && a[i] <= b'Z' { a[i] + 32 } else { a[i] };
-        let cb = if b[i] >= b'A' && b[i] <= b'Z' { b[i] + 32 } else { b[i] };
-        if ca != cb {
-            return false;
-        }
-    }
-    true
-}
 
 fn parse_usize(data: &[u8]) -> usize {
     let mut n: usize = 0;
