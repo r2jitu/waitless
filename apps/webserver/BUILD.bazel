@@ -11,7 +11,7 @@ rust_static_library(
     srcs = ["main.rs"],
     edition = "2024",
     deps = ["//net:http_rs", "//uni:api"],
-    rustc_flags = ["-C", "panic=abort"] + select({
+    rustc_flags = ["-C", "panic=abort", "-C", "opt-level=2"] + select({
         "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
         "//conditions:default": [],
     }),

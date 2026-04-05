@@ -162,6 +162,7 @@ def _impl(ctx):
         ] + (["-pie", "-Wl,-z,notext"] if arch == "aarch64" else ["-static"]) + [
             "-Wl,-z,norelro",
             "-Wl,--allow-multiple-definition",
+            "-Wl,--gc-sections",
             "-Wl,-z,max-page-size=0x1000",
             "-Wl,-T," + linker_script,
         ]

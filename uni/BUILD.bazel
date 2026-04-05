@@ -26,7 +26,7 @@ rust_library(
     rustc_flags = select({
         "//bazel/platforms:native": ["--cfg=platform_native"],
         "//conditions:default": ["--cfg=platform_unikernel"],
-    }) + ["-C", "panic=abort"] + select({
+    }) + ["-C", "panic=abort", "-C", "opt-level=2"] + select({
         "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
         "//conditions:default": [],
     }),
@@ -46,7 +46,7 @@ rust_library(
         "//kernel:serial_rs",
         "//drivers:drivers_rs",
     ],
-    rustc_flags = ["-C", "panic=abort"] + select({
+    rustc_flags = ["-C", "panic=abort", "-C", "opt-level=2"] + select({
         "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
         "//conditions:default": [],
     }),
@@ -61,5 +61,5 @@ rust_library(
     srcs = ["native.rs"],
     crate_name = "uni_native",
     edition = "2024",
-    rustc_flags = ["-C", "panic=abort"],
+    rustc_flags = ["-C", "panic=abort", "-C", "opt-level=2"],
 )
