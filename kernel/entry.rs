@@ -18,6 +18,14 @@ extern crate drivers;
 extern crate net;
 extern crate uni;
 
+// Boot assembly — compiled by LLVM's integrated assembler via global_asm!.
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(include_str!("x86_64/boot.S"), options(att_syntax));
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(include_str!("x86_64/idt_stubs.S"), options(att_syntax));
+#[cfg(target_arch = "aarch64")]
+core::arch::global_asm!(include_str!("aarch64/boot.S"));
+
 
 use kernel::{types, serial, mm, fdt, mmu, exceptions};
 use types::{BootInfo, MemoryRegion, Protocol, MEM_AVAILABLE, MEM_RESERVED, MAX_MEMORY_REGIONS};

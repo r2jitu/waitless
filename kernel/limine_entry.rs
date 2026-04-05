@@ -18,6 +18,25 @@ fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }
 
 extern crate kernel;
 use kernel::types::{BootInfo, MemoryRegion, Protocol, MEM_AVAILABLE, MEM_RESERVED, MAX_MEMORY_REGIONS};
+
+// x86_64 SSE enable stub — Limine doesn't enable SSE before calling our entry.
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(
+    ".section .text",
+    ".code64",
+    ".global limine_entry_stub",
+    "limine_entry_stub:",
+    "    mov %cr4, %rax",
+    "    or  $(1 << 9) | (1 << 10), %rax",
+    "    mov %rax, %cr4",
+    "    xor %rbp, %rbp",
+    "    and $-16, %rsp",
+    "    call limine_entry_cpp",
+    "1: cli",
+    "    hlt",
+    "    jmp 1b",
+    options(att_syntax),
+);
 use kernel::fdt as kernel_fdt;
 use kernel::mmu as kernel_mmu;
 

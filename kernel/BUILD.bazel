@@ -28,6 +28,11 @@ rust_static_library(
     name = "entry_rs",
     srcs = ["entry.rs"],
     crate_root = "entry.rs",
+    compile_data = select({
+        "//bazel/platforms:x86_64": ["x86_64/boot.S", "x86_64/idt_stubs.S"],
+        "//bazel/platforms:aarch64": ["aarch64/boot.S"],
+        "//conditions:default": ["x86_64/boot.S", "x86_64/idt_stubs.S"],
+    }),
     deps = [":kernel", "//drivers", "//net", "//uni"],
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
     visibility = ["//visibility:private"],
