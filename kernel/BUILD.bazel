@@ -1,5 +1,5 @@
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
-load("@rules_rust//rust:defs.bzl", "rust_library")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_static_library")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -101,14 +101,6 @@ cc_library(
 )
 
 cc_library(
-    name = "boot_shim",
-    srcs = ["boot_shim.cc"],
-    hdrs = ["boot_shim.h"],
-    deps = [":boot_info", ":core", ":fdt"],
-    copts = ["-I."],
-)
-
-cc_library(
     name = "core",
     srcs = [
         "libc.cc",
@@ -186,22 +178,30 @@ cc_library(
     copts = ["-I."],
 )
 
-cc_library(
-    name = "entry",
-    srcs = ["entry.cc"],
-    deps = [
-        ":boot_info",
-        ":boot_shim",
-        ":core",
-        ":arch_init",
-        ":fdt",
-        ":limine_entry",
-    ] + select({
-        "//bazel/platforms:aarch64": [":mmu"],
+rust_static_library(
+    name = "entry_rs",
+    srcs = ["entry.rs"],
+    crate_name = "kernel_entry",
+    edition = "2024",
+    rustc_flags = ["-C", "panic=abort"] + select({
+        "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
         "//conditions:default": [],
     }),
-    copts = [
-        "-I.",
-        "-Iinclude",
+)
+
+# C++ wrappers for arch_shutdown, gdt_init, idt_init etc.
+# Temporary — will be removed when gdt.cc/idt.cc are migrated to Rust.
+cc_library(
+    name = "entry_ffi",
+    srcs = ["entry_ffi.cc"],
+    deps = [":arch_h", ":arch_init"],
+    copts = ["-I."],
+)
+
+cc_library(
+    name = "entry",
+    deps = [
+        ":entry_ffi",
+        ":limine_entry",
     ],
 )

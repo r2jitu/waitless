@@ -38,6 +38,7 @@ def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
         srcs = srcs,
         deps = deps + [
             "//kernel:entry",
+            "//kernel:entry_rs",
             "//kernel:boot",
             "//kernel:core",
             "//kernel:arch_init",
@@ -155,6 +156,7 @@ def unikernel_binary(name, srcs, deps = [], copts = [], visibility = None):
         srcs = srcs,
         deps = deps + [
             "//kernel:entry",
+            "//kernel:entry_rs",
             "//kernel:core",
             "//kernel:arch_init",
             "//drivers:drivers_rs",
