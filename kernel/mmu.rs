@@ -123,15 +123,14 @@ mod aarch64 {
 }
 
 // ============================================================================
-// Public API — extern "C" exports
+// Public API
 // ============================================================================
 
 /// Map a range of physical addresses as device memory.
 /// On x86_64, this is a no-op (all physical memory is identity-mapped).
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mmu_map_device_range(phys_base: u64, size: u64) {
+pub fn mmu_map_device_range(phys_base: u64, size: u64) {
     #[cfg(target_arch = "aarch64")]
-    aarch64::map_device_range(phys_base, size);
+    unsafe { aarch64::map_device_range(phys_base, size); }
     #[cfg(not(target_arch = "aarch64"))]
     {
         let _ = (phys_base, size);

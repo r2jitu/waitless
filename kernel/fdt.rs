@@ -403,27 +403,24 @@ pub unsafe fn info() -> &'static FdtInfo {
 }
 
 // ============================================================================
-// Public API — extern "C" exports (for C++ callers)
+// Public API
 // ============================================================================
 
 /// Parse the DTB at the given physical address.
 /// Safe to call with dtb_addr=0 (no-op).
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn fdt_init(dtb_addr: u64) {
+pub fn fdt_init(dtb_addr: u64) {
     #[cfg(target_arch = "aarch64")]
-    parse_dtb(dtb_addr);
+    unsafe { parse_dtb(dtb_addr); }
     #[cfg(not(target_arch = "aarch64"))]
     { let _ = dtb_addr; }
 }
 
 /// Return a pointer to the parsed FDT info.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn fdt_info_ptr() -> *const FdtInfo {
-    &raw const G_INFO
+pub fn fdt_info_ptr() -> *const FdtInfo {
+    unsafe { &raw const G_INFO }
 }
 
 /// Copy the parsed FDT info to the caller's buffer.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn fdt_get_info(out: *mut FdtInfo) {
-    ptr::copy_nonoverlapping(&raw const G_INFO, out, 1);
+pub fn fdt_get_info(out: *mut FdtInfo) {
+    unsafe { ptr::copy_nonoverlapping(&raw const G_INFO, out, 1); }
 }

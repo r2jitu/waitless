@@ -520,16 +520,18 @@ fn pci_read_bar64(dev: &PciDevice, bar_idx: usize) -> u64 {
 }
 
 // ============================================================================
-// Extern "C" API — PCI
+// Public API — PCI
 // ============================================================================
 
+// NOTE: driver_pci_init is also called from kernel/serial.rs via FFI
+// (serial cannot depend on drivers due to circular dependency).
+// Keep #[unsafe(no_mangle)] + extern "C" for FFI linkage.
 #[unsafe(no_mangle)]
 pub extern "C" fn driver_pci_init() {
     pci_init_inner();
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn driver_pci_enable_bus_mastering(slot: u8) {
+pub fn driver_pci_enable_bus_mastering(slot: u8) {
     pci_enable_bus_mastering(slot);
 }
 
@@ -612,7 +614,7 @@ fn resolve_bar(pci_idx: usize, bar_idx: usize) -> u64 {
 
     #[cfg(target_arch = "aarch64")]
     if addr >= 0x1_0000_0000 {
-        unsafe { mmu_map_device_range(addr & !0x1F_FFFF, 2 << 20); }
+        mmu_map_device_range(addr & !0x1F_FFFF, 2 << 20);
     }
 
     addr
@@ -929,13 +931,13 @@ impl Virtqueue {
         let total_size = first_region + second_region;
         let num_frames = (total_size + 4095) / 4096;
 
-        let phys_base = unsafe { mm_alloc_frame() };
+        let phys_base = mm_alloc_frame();
         if phys_base == 0 { return None; }
         for _ in 1..num_frames {
-            unsafe { mm_alloc_frame(); }
+            mm_alloc_frame();
         }
 
-        let base_ptr = unsafe { mm_phys_to_virt(phys_base) };
+        let base_ptr = mm_phys_to_virt(phys_base);
         unsafe { ptr::write_bytes(base_ptr, 0, total_size as usize); }
 
         self.descs = base_ptr as *mut VirtqDesc;
@@ -1277,7 +1279,7 @@ fn init_pci_modern() -> bool {
 
     // Allocate and populate RX buffers
     for i in 0..RX_BUFFERS {
-        let alloc = unsafe { mm_kmalloc(BUFFER_SIZE as usize + 2) };
+        let alloc = mm_kmalloc(BUFFER_SIZE as usize + 2);
         if alloc.is_null() {
             log(b"virtio_net: failed to allocate RX buffer\n");
             vpci_set_status(dev, STATUS_FAILED);
@@ -1418,7 +1420,7 @@ fn init_mmio() -> bool {
 
     // Allocate RX buffers
     for i in 0..RX_BUFFERS {
-        let alloc = unsafe { mm_kmalloc(BUFFER_SIZE as usize + 2) };
+        let alloc = mm_kmalloc(BUFFER_SIZE as usize + 2);
         if alloc.is_null() { return false; }
         let buf = unsafe { alloc.add(2) };
         unsafe {
@@ -1526,7 +1528,7 @@ fn init_legacy_pci() -> bool {
 
     // Allocate RX buffers (no +2 alignment shift on x86)
     for i in 0..RX_BUFFERS {
-        let buf = unsafe { mm_kmalloc(BUFFER_SIZE as usize) };
+        let buf = mm_kmalloc(BUFFER_SIZE as usize);
         if buf.is_null() { return false; }
         unsafe {
             ptr::write_bytes(buf, 0, VIRTIO_NET_HDR_SIZE);
@@ -1601,11 +1603,10 @@ fn driver_virtio_net_irq_handler(_irq: u32) {
 }
 
 // ============================================================================
-// Extern "C" API — VirtIO-net
+// Public API — VirtIO-net
 // ============================================================================
 
-#[unsafe(no_mangle)]
-pub extern "C" fn driver_virtio_net_init() -> bool {
+pub fn driver_virtio_net_init() -> bool {
     log(b"virtio_net: initializing...\n");
 
     #[cfg(target_arch = "aarch64")]
@@ -1619,15 +1620,13 @@ pub extern "C" fn driver_virtio_net_init() -> bool {
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn driver_virtio_net_get_mac(mac_out: *mut u8) {
+pub fn driver_virtio_net_get_mac(mac_out: *mut u8) {
     unsafe {
         ptr::copy_nonoverlapping(NET_MAC.as_ptr(), mac_out, 6);
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn driver_virtio_net_send(data: *const u8, len: u32) {
+pub fn driver_virtio_net_send(data: *const u8, len: u32) {
     if data.is_null() || len == 0 { return; }
     unsafe {
         if let Transport::None = NET_TRANSPORT { return; }
@@ -1675,8 +1674,7 @@ pub extern "C" fn driver_virtio_net_send(data: *const u8, len: u32) {
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn driver_virtio_net_poll(
+pub fn driver_virtio_net_poll(
     callback: unsafe extern "C" fn(*const u8, u32),
 ) -> i32 {
     unsafe {
@@ -1711,8 +1709,7 @@ pub extern "C" fn driver_virtio_net_poll(
     count
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn driver_virtio_net_enable_irq() {
+pub fn driver_virtio_net_enable_irq() {
     unsafe {
         #[cfg(target_arch = "aarch64")]
         {
@@ -1759,18 +1756,15 @@ pub extern "C" fn driver_virtio_net_enable_irq() {
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn driver_virtio_net_irq_idle_supported() -> bool {
+pub fn driver_virtio_net_irq_idle_supported() -> bool {
     unsafe { NET_IRQ_IDLE_AVAILABLE }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn driver_virtio_net_arm_rx_interrupts() {
+pub fn driver_virtio_net_arm_rx_interrupts() {
     unsafe { NET_RX_QUEUE.enable_interrupts(); }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn driver_virtio_net_has_pending_rx() -> bool {
+pub fn driver_virtio_net_has_pending_rx() -> bool {
     unsafe { NET_RX_QUEUE.has_used() }
 }
 
@@ -2109,7 +2103,11 @@ fn con_try_getc() -> i32 {
 }
 
 // ============================================================================
-// Extern "C" API — VirtIO console
+// Public API — VirtIO console
+//
+// NOTE: These functions are also called from kernel/serial.rs via FFI
+// (serial cannot depend on drivers due to circular dependency).
+// Keep #[unsafe(no_mangle)] + extern "C" for FFI linkage.
 // ============================================================================
 
 /// Initialize console via virtio-mmio at given base address.

@@ -316,29 +316,26 @@ mod aarch64 {
 }
 
 // ============================================================================
-// Public API — extern "C" exports
+// Public API
 // ============================================================================
 
 /// Initialise the GIC (or no-op on x86_64).
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn exceptions_init() {
+pub fn exceptions_init() {
     #[cfg(target_arch = "aarch64")]
-    aarch64::init();
+    unsafe { aarch64::init(); }
 }
 
 /// Register an IRQ handler (aarch64 GIC).
 /// On x86_64 this is a no-op — IDT registration goes through idt.cc.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn exceptions_register_irq(irq: u32, handler: fn(u32)) {
+pub fn exceptions_register_irq(irq: u32, handler: fn(u32)) {
     #[cfg(target_arch = "aarch64")]
-    aarch64::register_irq(irq, handler);
+    unsafe { aarch64::register_irq(irq, handler); }
     #[cfg(not(target_arch = "aarch64"))]
     { let _ = (irq, handler); }
 }
 
 /// Enable the timer wakeup PPI (INTID 27) for idle().
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn exceptions_enable_timer_wakeup() {
+pub fn exceptions_enable_timer_wakeup() {
     #[cfg(target_arch = "aarch64")]
-    aarch64::enable_timer_wakeup();
+    unsafe { aarch64::enable_timer_wakeup(); }
 }

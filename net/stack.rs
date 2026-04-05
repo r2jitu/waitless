@@ -1266,8 +1266,7 @@ fn dhcp_poll_wait(timeout_ms: u32) -> bool {
 // ============================================================================
 
 /// Initialize TCP connection pool.
-#[unsafe(no_mangle)]
-pub extern "C" fn net_tcp_init() {
+pub fn net_tcp_init() {
     unsafe {
         for i in 0..MAX_CONNECTIONS {
             CONNECTIONS[i] = TcpConnection::new();
@@ -1276,8 +1275,7 @@ pub extern "C" fn net_tcp_init() {
 }
 
 /// DHCP discover — blocks until IP obtained or timeout.
-#[unsafe(no_mangle)]
-pub extern "C" fn net_dhcp_discover() -> bool {
+pub fn net_dhcp_discover() -> bool {
     unsafe {
         DHCP_GOT_OFFER = false;
         DHCP_GOT_ACK = false;
@@ -1322,8 +1320,7 @@ pub extern "C" fn net_dhcp_discover() -> bool {
 }
 
 /// Set fallback network config (called from entry.rs if DHCP fails).
-#[unsafe(no_mangle)]
-pub extern "C" fn net_set_fallback_config(
+pub fn net_set_fallback_config(
     ip_a: u8, ip_b: u8, ip_c: u8, ip_d: u8,
     mask_a: u8, mask_b: u8, mask_c: u8, mask_d: u8,
     gw_a: u8, gw_b: u8, gw_c: u8, gw_d: u8,
