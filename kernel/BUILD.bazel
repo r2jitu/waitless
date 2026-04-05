@@ -29,19 +29,22 @@ cc_library(
 
 cc_library(
     name = "mmu",
-    srcs = select({
-        "//bazel/platforms:aarch64": ["aarch64/mmu.cc"],
-        "//conditions:default": [],
-    }),
     hdrs = select({
         "//bazel/platforms:aarch64": ["aarch64/mmu.h"],
         "//conditions:default": [],
     }),
-    deps = select({
-        "//bazel/platforms:aarch64": [":boot"],  # boot_l1_table in boot.S
+    copts = ["-I."],
+)
+
+rust_library(
+    name = "mmu_rs",
+    srcs = ["mmu.rs"],
+    crate_name = "kernel_mmu",
+    edition = "2024",
+    rustc_flags = ["-C", "panic=abort"] + select({
+        "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
         "//conditions:default": [],
     }),
-    copts = ["-I."],
 )
 
 rust_library(

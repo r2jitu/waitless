@@ -11,7 +11,7 @@ rust_static_library(
     srcs = ["drivers.rs"],
     crate_name = "drivers",
     edition = "2024",
-    deps = ["//kernel:fdt_rs", "//kernel:mm_rs", "//kernel:serial_rs"],
+    deps = ["//kernel:fdt_rs", "//kernel:mm_rs", "//kernel:mmu_rs", "//kernel:serial_rs"],
     rustc_flags = ["-C", "panic=abort"] + select({
         "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
         "//conditions:default": [],
@@ -25,12 +25,7 @@ cc_library(
     deps = [
         "//kernel:arch_h",
         "//kernel:arch_init",
-    ] + select({
-        "//bazel/platforms:aarch64": [
-            "//kernel:mmu",
-        ],
-        "//conditions:default": [],
-    }),
+    ],
     copts = ["-I."],
 )
 

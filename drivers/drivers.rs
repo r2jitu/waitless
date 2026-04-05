@@ -32,18 +32,15 @@ pub extern "C" fn rust_eh_personality() {}
 // Kernel Rust rlibs — direct calls, no C++ FFI hop.
 extern crate kernel_fdt;
 extern crate kernel_mm;
+extern crate kernel_mmu;
 extern crate kernel_serial;
 use kernel_mm::{mm_alloc_frame, mm_phys_to_virt, mm_virt_to_phys, mm_kmalloc, mm_kfree};
+use kernel_mmu::mmu_map_device_range;
 
 unsafe extern "C" {
     fn driver_register_irq(intid_or_vector: u32, handler: unsafe extern "C" fn());
     #[cfg(target_arch = "x86_64")]
     fn driver_x86_enable_irq(irq: u32);
-}
-
-#[cfg(target_arch = "aarch64")]
-unsafe extern "C" {
-    fn driver_mmu_map_device_range(base: u64, size: u64);
 }
 
 fn log(msg: &[u8]) {
@@ -472,7 +469,7 @@ fn pci_init_inner() {
         if fdt.pcie_ecam_base != 0 {
             G_ECAM_BASE = fdt.pcie_ecam_base;
             if G_ECAM_BASE >= 0x1_0000_0000 {
-                driver_mmu_map_device_range(G_ECAM_BASE, fdt.pcie_ecam_size);
+                mmu_map_device_range(G_ECAM_BASE, fdt.pcie_ecam_size);
             }
         }
         if fdt.pci_mmio32_base != 0 {
@@ -632,7 +629,7 @@ fn resolve_bar(pci_idx: usize, bar_idx: usize) -> u64 {
 
     #[cfg(target_arch = "aarch64")]
     if addr >= 0x1_0000_0000 {
-        unsafe { driver_mmu_map_device_range(addr & !0x1F_FFFF, 2 << 20); }
+        unsafe { mmu_map_device_range(addr & !0x1F_FFFF, 2 << 20); }
     }
 
     addr
