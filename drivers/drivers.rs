@@ -30,6 +30,7 @@ pub extern "C" fn rust_eh_personality() {}
 // ============================================================================
 
 // Kernel Rust rlibs — direct calls, no C++ FFI hop.
+extern crate kernel_fdt;
 extern crate kernel_mm;
 extern crate kernel_serial;
 use kernel_mm::{mm_alloc_frame, mm_phys_to_virt, mm_virt_to_phys, mm_kmalloc, mm_kfree};
@@ -41,27 +42,7 @@ unsafe extern "C" {
 }
 
 #[cfg(target_arch = "aarch64")]
-#[repr(C)]
-struct DriverFdtInfo {
-    uart_base: u64,
-    virtio_bases: [u64; 32],
-    virtio_irqs: [u32; 32],
-    virtio_count: i32,
-    gic_dist_base: u64,
-    gic_redist_base: u64,
-    gic_version: u8,
-    pcie_ecam_base: u64,
-    pcie_ecam_size: u64,
-    ram_base: u64,
-    ram_size: u64,
-    pci_mmio32_base: u64,
-    pci_mmio32_size: u64,
-    pci_irqs: [u32; 8],
-}
-
-#[cfg(target_arch = "aarch64")]
 unsafe extern "C" {
-    fn driver_get_fdt_info(out: *mut DriverFdtInfo);
     fn driver_mmu_map_device_range(base: u64, size: u64);
 }
 
@@ -487,8 +468,7 @@ fn pci_init_inner() {
 
     #[cfg(target_arch = "aarch64")]
     unsafe {
-        let mut fdt = core::mem::zeroed::<DriverFdtInfo>();
-        driver_get_fdt_info(&mut fdt);
+        let fdt = kernel_fdt::info();
         if fdt.pcie_ecam_base != 0 {
             G_ECAM_BASE = fdt.pcie_ecam_base;
             if G_ECAM_BASE >= 0x1_0000_0000 {
@@ -1355,8 +1335,7 @@ fn init_mmio() -> bool {
     let mut io_base: u64 = 0;
 
     unsafe {
-        let mut fdt: DriverFdtInfo = core::mem::zeroed();
-        driver_get_fdt_info(&mut fdt);
+        let fdt = kernel_fdt::info();
 
         // Search FDT virtio-mmio devices for net (device_id=1)
         if fdt.virtio_count > 0 {
@@ -1751,8 +1730,7 @@ pub extern "C" fn driver_virtio_net_enable_irq() {
     unsafe {
         #[cfg(target_arch = "aarch64")]
         {
-            let mut fdt: DriverFdtInfo = core::mem::zeroed();
-            driver_get_fdt_info(&mut fdt);
+            let fdt = kernel_fdt::info();
 
             match NET_TRANSPORT {
                 Transport::ModernPci { vpci_idx } if fdt.gic_dist_base != 0 => {

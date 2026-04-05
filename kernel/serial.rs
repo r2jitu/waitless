@@ -96,6 +96,8 @@ mod x86 {
 mod aarch64 {
     use core::ptr;
 
+    extern crate kernel_fdt;
+
     // PL011 register offsets
     const PL011_DR: u64 = 0x000;    // Data register
     const PL011_FR: u64 = 0x018;    // Flag register
@@ -116,27 +118,7 @@ mod aarch64 {
     static mut BACKEND: Backend = Backend::None;
     static mut UART_BASE: u64 = 0;
 
-    // FDT info struct — must match drivers_ffi.cc DriverFdtInfo
-    #[repr(C)]
-    struct FdtInfo {
-        uart_base: u64,
-        virtio_bases: [u64; 32],
-        virtio_irqs: [u32; 32],
-        virtio_count: i32,
-        gic_dist_base: u64,
-        gic_redist_base: u64,
-        gic_version: u8,
-        pcie_ecam_base: u64,
-        pcie_ecam_size: u64,
-        ram_base: u64,
-        ram_size: u64,
-        pci_mmio32_base: u64,
-        pci_mmio32_size: u64,
-        pci_irqs: [u32; 8],
-    }
-
     unsafe extern "C" {
-        fn driver_get_fdt_info(out: *mut FdtInfo);
         fn driver_pci_init();
         fn driver_virtio_console_init_mmio(base_addr: u64) -> bool;
         fn driver_virtio_console_init_pci() -> bool;
@@ -165,9 +147,7 @@ mod aarch64 {
     }
 
     pub unsafe fn init() {
-        let mut fdt = core::mem::MaybeUninit::<FdtInfo>::zeroed();
-        driver_get_fdt_info(fdt.as_mut_ptr());
-        let fdt = fdt.assume_init();
+        let fdt = kernel_fdt::info();
 
         // Prefer PL011 if FDT found one (QEMU path)
         if fdt.uart_base != 0 {

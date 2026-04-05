@@ -20,10 +20,6 @@ cc_library(
 
 cc_library(
     name = "fdt",
-    srcs = select({
-        "//bazel/platforms:aarch64": ["aarch64/fdt.cc"],
-        "//conditions:default": [],
-    }),
     hdrs = select({
         "//bazel/platforms:aarch64": ["aarch64/fdt.h"],
         "//conditions:default": [],
@@ -49,10 +45,22 @@ cc_library(
 )
 
 rust_library(
+    name = "fdt_rs",
+    srcs = ["fdt.rs"],
+    crate_name = "kernel_fdt",
+    edition = "2024",
+    rustc_flags = ["-C", "panic=abort"] + select({
+        "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
+        "//conditions:default": [],
+    }),
+)
+
+rust_library(
     name = "serial_rs",
     srcs = ["serial.rs"],
     crate_name = "kernel_serial",
     edition = "2024",
+    deps = [":fdt_rs"],
     rustc_flags = ["-C", "panic=abort"] + select({
         "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
         "//conditions:default": [],

@@ -1,40 +1,44 @@
 #pragma once
-// kernel/aarch64/fdt.h — Minimal Flattened Device Tree scanner
+// kernel/aarch64/fdt.h — Thin C++ wrapper around the Rust FDT parser
 //
-// Parses just enough of the DTB to discover MMIO device base addresses.
-// Called from kernel_main() (C++, after MMU) before serial::init().
-// On x86_64 this header provides no-op stubs; all real code is aarch64-only.
+// The actual parser lives in kernel/fdt.rs (fdt_rs crate).
+// This header provides fdt::init() and fdt::info() for C++ callers
+// (entry.cc, boot_shim.cc, exceptions.cc, limine_entry.cc).
+// On x86_64, provides no-op stubs.
 
 #include <stdint.h>
 
+// Rust extern "C" functions from kernel/fdt.rs
+extern "C" {
+void fdt_init(uint64_t dtb_addr);
+}
+
 namespace fdt {
 
+// Must match kernel/fdt.rs FdtInfo exactly.
 struct Info {
-  uint64_t uart_base;        // PL011 base, 0 if not found
-  uint64_t virtio_bases[32]; // virtio-mmio device base addresses
-  uint32_t virtio_irqs[32];  // GIC IRQ ID for each virtio-mmio device (SPI+32)
-  int virtio_count;          // number found
-  uint64_t gic_dist_base;    // GIC distributor base (GICv2 or GICv3), 0 if none
-  uint64_t gic_redist_base;  // GICv3 redistributor base, 0 if GICv2 or none
-  uint8_t gic_version;       // 2=GICv2, 3=GICv3, 0=none
-  uint64_t pcie_ecam_base;   // PCIe ECAM base, 0 if not found
-  uint64_t pcie_ecam_size;   // PCIe ECAM region size
-  uint64_t ram_base; // Physical RAM base from /memory node (0 if not found)
-  uint64_t ram_size; // RAM size in bytes (0 if not found in FDT)
-  uint64_t pci_mmio32_base; // PCIe 32-bit MMIO aperture CPU address (from PCI
-                            // ranges), 0 if not found
-  uint64_t pci_mmio32_size; // PCIe 32-bit MMIO aperture size
-  uint32_t pci_irqs[8];    // GIC INTID per PCI slot INTA (from interrupt-map)
+  uint64_t uart_base;
+  uint64_t virtio_bases[32];
+  uint32_t virtio_irqs[32];
+  int32_t virtio_count;
+  uint64_t gic_dist_base;
+  uint64_t gic_redist_base;
+  uint8_t gic_version;
+  uint64_t pcie_ecam_base;
+  uint64_t pcie_ecam_size;
+  uint64_t ram_base;
+  uint64_t ram_size;
+  uint64_t pci_mmio32_base;
+  uint64_t pci_mmio32_size;
+  uint32_t pci_irqs[8];
 };
 
 #if defined(__aarch64__)
 
-// Parse the DTB at the given physical address.  Must be called once before
-// any other fdt:: function.  Safe to call with dtb_addr=0 (no-op).
-void init(uint64_t dtb_addr);
+extern "C" const Info *fdt_info_ptr();
 
-// Return the parsed device information (populated by init()).
-const Info &info();
+inline void init(uint64_t dtb_addr) { fdt_init(dtb_addr); }
+inline const Info &info() { return *fdt_info_ptr(); }
 
 #else
 
