@@ -14,17 +14,6 @@ rust_library(
     }),
 )
 
-cc_library(
-    name = "arch_h",
-    hdrs = ["arch.h"] + select({
-        "//bazel/platforms:aarch64": ["aarch64/arch.h"],
-        "//bazel/platforms:x86_64": ["x86_64/arch.h"],
-        "//conditions:default": [],
-    }),
-    copts = ["-I."],
-)
-
-
 rust_library(
     name = "mmu_rs",
     srcs = ["mmu.rs"],
@@ -83,55 +72,23 @@ rust_library(
     }),
 )
 
-cc_library(
-    name = "boot_info",
-    hdrs = ["boot_info.h"],
-    copts = ["-I."],
+# Compiler-required memory intrinsics (memcpy, memset, etc.)
+rust_static_library(
+    name = "libc_rs",
+    srcs = ["libc.rs"],
+    crate_name = "kernel_libc",
+    edition = "2024",
+    rustc_flags = ["-C", "panic=abort", "-C", "opt-level=2"] + select({
+        "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
+        "//conditions:default": [],
+    }),
 )
 
+# Wrap libc_rs as cc_library for linking into cc_binary
 cc_library(
-    name = "core",
-    srcs = [
-        "libc.cc",
-        "serial_printf.cc",
-    ],
-    hdrs = [
-        "serial.h",
-        "mm.h",
-        "panic.h",
-    ],
-    deps = [":arch_h", ":boot_info"],
-    copts = ["-I."],
-)
-
-cc_library(
-    name = "arch_init",
-    srcs = select({
-        "//bazel/platforms:x86_64": [
-            "x86_64/gdt.cc",
-            "x86_64/idt.cc",
-        ],
-        "//bazel/platforms:aarch64": [],
-        "//conditions:default": [
-            "x86_64/gdt.cc",
-            "x86_64/idt.cc",
-        ],
-    }),
-    hdrs = select({
-        "//bazel/platforms:x86_64": [
-            "x86_64/gdt.h",
-            "x86_64/idt.h",
-        ],
-        "//conditions:default": [
-            "x86_64/gdt.h",
-            "x86_64/idt.h",
-        ],
-    }),
-    deps = select({
-        "//bazel/platforms:aarch64": [],
-        "//conditions:default": [":core"],
-    }),
-    copts = ["-I."],
+    name = "libc",
+    deps = [":libc_rs"],
+    alwayslink = True,  # memcpy etc. must not be stripped
 )
 
 cc_library(
@@ -172,6 +129,30 @@ cc_library(
     alwayslink = True,  # Limine requests must not be stripped by linker
 )
 
+# x86_64 arch initialization (GDT + IDT) in Rust + assembly ISR stubs.
+# The Rust code (gdt.rs, idt.rs) is compiled as a rust_library.
+# The ISR stub assembly (idt_stubs.S) is compiled as a cc_library.
+rust_library(
+    name = "x86_init_rs",
+    srcs = ["x86_64/x86_init.rs"] + select({
+        "//bazel/platforms:x86_64": ["x86_64/gdt.rs", "x86_64/idt.rs"],
+        "//conditions:default": [],
+    }),
+    crate_name = "x86_init",
+    edition = "2024",
+    rustc_flags = ["-C", "panic=abort", "-C", "opt-level=2"],
+)
+
+# ISR stub assembly — provides isr_stub_table and isr_common.
+cc_library(
+    name = "idt_stubs",
+    srcs = select({
+        "//bazel/platforms:x86_64": ["x86_64/idt_stubs.S"],
+        "//conditions:default": [],
+    }),
+    alwayslink = True,  # ISR stubs must not be stripped
+)
+
 rust_static_library(
     name = "entry_rs",
     srcs = ["entry.rs"],
@@ -184,6 +165,7 @@ rust_static_library(
         ":fdt_rs",
         ":mmu_rs",
         ":exceptions_rs",
+        ":x86_init_rs",
         "//drivers:drivers_rs",
         "//net:stack_rs",
         "//uni:unikernel",
@@ -194,19 +176,11 @@ rust_static_library(
     }),
 )
 
-# C++ wrappers for arch_shutdown, gdt_init, idt_init etc.
-# Temporary — will be removed when gdt.cc/idt.cc are migrated to Rust.
-cc_library(
-    name = "entry_ffi",
-    srcs = ["entry_ffi.cc"],
-    deps = [":arch_h", ":arch_init"],
-    copts = ["-I."],
-)
-
 cc_library(
     name = "entry",
     deps = [
-        ":entry_ffi",
         ":limine_entry",
+        ":idt_stubs",
+        ":libc",
     ],
 )

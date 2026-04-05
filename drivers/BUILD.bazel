@@ -1,33 +1,23 @@
-load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_rust//rust:defs.bzl", "rust_library")
 
 package(default_visibility = ["//visibility:public"])
 
 # Rust device drivers: PCI, VirtIO PCI, Virtqueue, VirtIO-net.
-# Linked as rust_library so other Rust crates can depend on it directly.
-# The #[no_mangle] extern "C" exports are still available for C++ linking
-# when included transitively via a rust_static_library.
 rust_library(
     name = "drivers_rs",
     srcs = ["drivers.rs"],
     crate_name = "drivers",
     edition = "2024",
-    deps = ["//kernel:exceptions_rs", "//kernel:fdt_rs", "//kernel:mm_rs", "//kernel:mmu_rs", "//kernel:serial_rs"],
+    deps = [
+        "//kernel:exceptions_rs",
+        "//kernel:fdt_rs",
+        "//kernel:mm_rs",
+        "//kernel:mmu_rs",
+        "//kernel:serial_rs",
+        "//kernel:x86_init_rs",
+    ],
     rustc_flags = ["-C", "panic=abort", "-C", "opt-level=2"] + select({
         "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
         "//conditions:default": [],
     }),
 )
-
-# C FFI bridge: exposes x86_64 IDT functions to the Rust driver crate.
-# On aarch64 this is empty (all kernel functions called from Rust directly).
-cc_library(
-    name = "drivers_ffi",
-    srcs = ["drivers_ffi.cc"],
-    deps = select({
-        "//bazel/platforms:x86_64": ["//kernel:arch_init"],
-        "//conditions:default": [],
-    }),
-    copts = ["-I."],
-)
-

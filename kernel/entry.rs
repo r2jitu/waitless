@@ -33,7 +33,7 @@ use kernel_types::{BootInfo, MemoryRegion, Protocol, MEM_AVAILABLE, MEM_RESERVED
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     unsafe {
         kernel_serial::serial_puts(b"PANIC in entry\n\0".as_ptr());
-        arch_shutdown();
+        arch_shutdown()
     }
 }
 
@@ -41,23 +41,40 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 pub extern "C" fn rust_eh_personality() {}
 
 // ============================================================================
-// Extern "C" declarations — C++ functions and linker symbols only
+// Architecture-specific code
+// ============================================================================
+
+#[cfg(target_arch = "x86_64")]
+extern crate x86_init;
+
+/// Power off the machine. Never returns.
+#[cfg(target_arch = "x86_64")]
+unsafe fn arch_shutdown() -> ! {
+    // ACPI S5 sleep via PM1_CNT — try multiple ports/SLP_TYP values
+    core::arch::asm!("out dx, ax", in("dx") 0x0604u16, in("ax") 0x2000u16, options(nomem, nostack));
+    core::arch::asm!("out dx, ax", in("dx") 0x0604u16, in("ax") 0x3400u16, options(nomem, nostack));
+    core::arch::asm!("out dx, ax", in("dx") 0xb004u16, in("ax") 0x2000u16, options(nomem, nostack));
+    loop { core::arch::asm!("cli", "hlt", options(nomem, nostack)); }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn arch_shutdown() -> ! {
+    // PSCI SYSTEM_OFF (HVC #0, function 0x84000008)
+    core::arch::asm!(
+        "movz x0, #0x8400, lsl #16",
+        "movk x0, #0x0008",
+        "hvc #0",
+        out("x0") _,
+        options(nomem, nostack)
+    );
+    loop { core::arch::asm!("wfi", options(nomem, nostack)); }
+}
+
+// ============================================================================
+// Extern "C" declarations — linker symbols and app entry point only
 // ============================================================================
 
 unsafe extern "C" {
-    // x86_64 arch init (from C++ gdt.cc/idt.cc via entry_ffi.cc)
-    #[cfg(target_arch = "x86_64")]
-    fn gdt_init();
-    #[cfg(target_arch = "x86_64")]
-    fn idt_init();
-    #[cfg(target_arch = "x86_64")]
-    fn idt_register_handler(vector: u8, handler: unsafe extern "C" fn(*const u8));
-    #[cfg(target_arch = "x86_64")]
-    fn idt_enable_irq(irq: u8);
-
-    // Arch shutdown (from C++ entry_ffi.cc)
-    fn arch_shutdown() -> !;
-
     // User application entry point (from app crate)
     fn uni_main() -> i32;
 
@@ -343,9 +360,9 @@ unsafe fn kernel_boot(info: &BootInfo) {
     #[cfg(target_arch = "x86_64")]
     {
         klog!("[INIT] GDT...\n");
-        gdt_init();
+        x86_init::gdt::init();
         klog!("[INIT] IDT...\n");
-        idt_init();
+        x86_init::idt::init();
     }
     #[cfg(target_arch = "aarch64")]
     {
@@ -412,8 +429,8 @@ unsafe fn kernel_boot(info: &BootInfo) {
         #[cfg(target_arch = "x86_64")]
         {
             // Serial RX interrupt (IRQ4 / vector 36) for Ctrl-C wakeup
-            idt_register_handler(36, serial_rx_isr_trampoline);
-            idt_enable_irq(4);
+            x86_init::idt::register_handler(36, serial_rx_isr_trampoline);
+            x86_init::idt::enable_irq(4);
             kernel_serial::serial_enable_rx_irq();
         }
     }
@@ -428,7 +445,7 @@ unsafe fn kernel_boot(info: &BootInfo) {
 
 // x86_64: ISR trampoline for serial RX (ignores InterruptFrame pointer)
 #[cfg(target_arch = "x86_64")]
-unsafe extern "C" fn serial_rx_isr_trampoline(_frame: *const u8) {
+unsafe extern "C" fn serial_rx_isr_trampoline(_frame: *mut x86_init::idt::InterruptFrame) {
     kernel_serial::serial_rx_isr();
 }
 

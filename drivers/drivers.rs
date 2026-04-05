@@ -26,10 +26,7 @@ use kernel_mm::{mm_alloc_frame, mm_phys_to_virt, mm_virt_to_phys, mm_kmalloc, mm
 use kernel_mmu::mmu_map_device_range;
 
 #[cfg(target_arch = "x86_64")]
-unsafe extern "C" {
-    fn driver_register_irq(vector: u32, handler: unsafe extern "C" fn());
-    fn driver_x86_enable_irq(irq: u32);
-}
+extern crate x86_init;
 
 fn log(msg: &[u8]) {
     unsafe { kernel_serial::serial_puts(msg.as_ptr()) }
@@ -1576,7 +1573,8 @@ fn tx_drain() {
 
 // x86_64: extern "C" fn() wrapper for the idt.cc trampoline
 #[cfg(target_arch = "x86_64")]
-unsafe extern "C" fn driver_virtio_net_irq_handler_x86() {
+#[cfg(target_arch = "x86_64")]
+unsafe extern "C" fn driver_virtio_net_irq_handler_x86(_frame: *mut x86_init::idt::InterruptFrame) {
     driver_virtio_net_irq_handler(0);
 }
 
@@ -1754,8 +1752,8 @@ pub extern "C" fn driver_virtio_net_enable_irq() {
                 let irq_line = (irq_reg & 0xFF) as u8;
                 if irq_line < 16 {
                     NET_RX_QUEUE.enable_interrupts();
-                    driver_register_irq(32 + irq_line as u32, driver_virtio_net_irq_handler_x86);
-                    driver_x86_enable_irq(irq_line as u32);
+                    x86_init::idt::register_handler(32 + irq_line, driver_virtio_net_irq_handler_x86);
+                    x86_init::idt::enable_irq(irq_line);
                     NET_IRQ_IDLE_AVAILABLE = true;
                 }
             }
