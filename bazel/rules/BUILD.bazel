@@ -5,4 +5,5 @@ exports_files([
     "run_vz.sh",
     "run_qemu.sh",
     "run_iso.sh",
+    "native_main.rs",
 ])

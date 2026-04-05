@@ -1,24 +1,12 @@
-// UniKernel Example: HTTP Web Server in Rust
+// UniKernel Example: HTTP Web Server
 //
-// Runs on the bare-metal unikernel runtime with a pure Rust HTTP server.
-// All driver and network calls are direct function calls — zero overhead.
+// Pure application logic — no platform boilerplate. The unikernel_binary()
+// macro handles panic handlers, entry points, and platform selection.
 
 #![no_std]
-#![no_main]
 
 extern crate uni;
 use uni::http::{Request, Response, Server};
-
-// Panic handler + eh_personality — only for the native rust_binary.
-// The unikernel rust_static_library gets these from kernel/entry.rs.
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    uni::log(b"PANIC: application panicked!\n");
-    loop { core::hint::spin_loop(); }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_eh_personality() {}
 
 // ---- Request handlers -------------------------------------------------------
 
@@ -81,16 +69,15 @@ fn handle_request(req: &Request) -> Response {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn uni_main() -> i32 {
-    uni::log(b"Starting Rust HTTP server...\n\0");
+    uni::log(b"Starting Rust HTTP server...\n");
     let port = uni::config_port(80);
 
     static mut SERVER: Server = Server::new();
-    // Safety: uni_main is single-threaded and called exactly once.
     let server = unsafe { &mut *core::ptr::addr_of_mut!(SERVER) };
     server.default_handler(handle_request);
 
-    uni::log(b"Routes registered. Entering event loop.\n\0");
+    uni::log(b"Routes registered. Entering event loop.\n");
     server.run(port);
-    uni::log(b"[uni_main] server.run() returned -- shutting down\n\0");
+    uni::log(b"[uni_main] server.run() returned -- shutting down\n");
     0
 }

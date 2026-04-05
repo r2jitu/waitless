@@ -1,23 +1,25 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("//bazel/rules:unikernel.bzl", "unikernel_binary")
+load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 
 package(default_visibility = ["//visibility:public"])
 
-unikernel_binary(
-    name = "webserver",
-    app_srcs = ["main.rs"],
-    app_deps = ["//uni"],
+# Application library — pure business logic, no platform boilerplate.
+rust_library(
+    name = "app",
+    srcs = ["main.rs"],
+    deps = ["//uni"],
+    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
 )
 
-# Friendly alias: bazel run //apps/webserver  (or :run)
+unikernel_binary(
+    name = "webserver",
+    app = ":app",
+)
+
 alias(name = "run", actual = ":webserver_run")
 
-# Integration test — runner selected by --config:
-#   bazel test //apps/webserver:test                        (native, no VM)
-#   bazel test --config=vz   //apps/webserver:test          (VZ.framework)
-#   bazel test --config=qemu //apps/webserver:test          (QEMU, host arch)
-#   bazel test --config=aarch64-qemu //apps/webserver:test  (explicit)
-#   bazel test --config=x86_64-iso   //apps/webserver:test  (Limine ISO)
 sh_test(
     name = "test",
     srcs = select({

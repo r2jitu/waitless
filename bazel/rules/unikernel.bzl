@@ -1,48 +1,41 @@
 """Build rules for unikernel images.
 
-Provides unikernel_binary() which compiles a bare-metal ELF kernel and
-produces bootable images for local testing (QEMU, VZ) and cloud deployment
-(Limine ISO/disk).
+Provides unikernel_binary() which links a Rust application library into
+bootable kernel images for local testing (QEMU, VZ) and cloud deployment.
 """
 
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
-load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_static_library")
+load("@rules_rust//rust:defs.bzl", "rust_binary")
 load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
-load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 
-def unikernel_binary(name, app_srcs, app_deps = [], visibility = None):
-    """Build a unikernel ELF binary from Rust application sources.
+def unikernel_binary(name, app, visibility = None):
+    """Build a unikernel from a Rust application library.
+
+    The application is a rust_library that exports:
+        #[unsafe(no_mangle)] pub extern "C" fn uni_main() -> i32
 
     Targets produced:
-      - <name>.elf        : Bare-metal ELF kernel binary (identity-mapped)
+      - <name>.elf        : Bare-metal ELF kernel binary
       - <name>.limine.elf : Higher-half ELF for Limine boot
-      - <name>.img        : Raw binary (objcopy, for QEMU -kernel / VZ)
-      - <name>.iso        : Limine-bootable ISO (BIOS+UEFI, for cloud/QEMU)
-      - <name>_native     : Native POSIX binary (rust_binary, no VM)
+      - <name>.img        : Raw binary (for QEMU -kernel / VZ)
+      - <name>.iso        : Limine-bootable ISO
+      - <name>_native     : Native POSIX binary (no VM)
       - <name>_run        : Launch with runner selected by --config
 
     Args:
         name: Base name for all output targets.
-        app_srcs: Rust source files (e.g. ["main.rs"]).
-        app_deps: Rust library dependencies (e.g. ["//net:http", "//uni"]).
+        app: A rust_library target (e.g. ":webserver").
         visibility: Bazel visibility specification.
     """
 
-    # ---- Unikernel ELF (cc_binary links Rust static lib + ASM) ----
-
-    rust_static_library(
-        name = name + "_rs",
-        srcs = app_srcs,
-        deps = app_deps,
-        rustc_flags = UNIKERNEL_RUSTC_FLAGS,
-        visibility = ["//visibility:private"],
-    )
-
+    # ---- Unikernel ELF ----
+    # The app's rust_library provides CcInfo (a .a with the uni_main symbol).
+    # cc_binary links it with the kernel entry + boot assembly.
     cc_binary(
         name = name + ".elf",
         srcs = [],
         deps = [
-            ":" + name + "_rs",
+            app,
             "//kernel:entry_asm",
             "//kernel:entry",
             "//kernel:boot",
@@ -50,7 +43,7 @@ def unikernel_binary(name, app_srcs, app_deps = [], visibility = None):
         visibility = visibility,
     )
 
-    # Flat binary image for ARM64 bootloaders (VZ.framework, QEMU -kernel).
+    # Flat binary for ARM64 bootloaders (VZ.framework, QEMU -kernel).
     native.genrule(
         name = name + ".img",
         srcs = [":" + name + ".elf"],
@@ -74,14 +67,13 @@ def unikernel_binary(name, app_srcs, app_deps = [], visibility = None):
         visibility = visibility,
     )
 
-    # ---- Native POSIX binary (pure rust_binary, no VM) ----
-
+    # ---- Native POSIX binary ----
+    # Thin wrapper provides #[panic_handler]; app + uni linked as deps.
     rust_binary(
         name = name + "_native",
-        srcs = app_srcs,
-        deps = app_deps,
+        srcs = ["//bazel/rules:native_main.rs"],
+        deps = [app, "//uni"],
         rustc_flags = select({
-            # no_std crates need explicit system library linking
             "@platforms//os:macos": ["-C", "link-arg=-lSystem"],
             "//conditions:default": ["-C", "link-arg=-lc", "-C", "link-arg=-lpthread"],
         }),
@@ -90,7 +82,6 @@ def unikernel_binary(name, app_srcs, app_deps = [], visibility = None):
     )
 
     # ---- Unified run target ----
-
     sh_binary(
         name = name + "_run",
         srcs = select({
@@ -135,12 +126,11 @@ def unikernel_binary(name, app_srcs, app_deps = [], visibility = None):
     )
 
     # ---- Higher-half ELF for Limine boot ----
-
     cc_binary(
         name = name + ".limine.elf",
         srcs = [],
         deps = [
-            ":" + name + "_rs",
+            app,
             "//kernel:entry_asm",
             "//kernel:entry",
         ],
@@ -149,7 +139,6 @@ def unikernel_binary(name, app_srcs, app_deps = [], visibility = None):
     )
 
     # ---- Limine-bootable ISO ----
-
     native.genrule(
         name = name + ".iso",
         srcs = select({
