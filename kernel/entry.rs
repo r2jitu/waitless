@@ -16,7 +16,7 @@ use core::ptr;
 extern crate kernel;
 extern crate drivers;
 extern crate net_stack;
-extern crate uni_unikernel;
+extern crate uni;
 
 use kernel::{types, serial, mm, fdt, mmu, exceptions};
 use types::{BootInfo, MemoryRegion, Protocol, MEM_AVAILABLE, MEM_RESERVED, MAX_MEMORY_REGIONS};

@@ -2,24 +2,23 @@ load("@rules_rust//rust:defs.bzl", "rust_library")
 
 package(default_visibility = ["//visibility:public"])
 
-# ---- Platform API ------------------------------------------------------------
-# Safe Rust types for the uni:: platform abstraction: TcpListener, TcpStream,
-# log(), config_port(), etc.
+# Platform abstraction: TcpListener, TcpStream, log(), config_port(), etc.
 #
-# Backend selected at compile time via --cfg:
-#   - platform_unikernel: calls net/stack.rs (TCP) + uni/unikernel.rs (lifecycle)
-#   - platform_native:    calls uni/native.rs (POSIX sockets + stdio)
+# Single crate with cfg-gated backend modules:
+#   - platform_unikernel: unikernel.rs (lifecycle) + net_stack (TCP)
+#   - platform_native:    native.rs (POSIX sockets + stdio)
 
 rust_library(
-    name = "api",
-    srcs = ["api.rs"],
+    name = "uni",
+    srcs = ["lib.rs", "unikernel.rs", "native.rs"],
     crate_name = "uni",
     edition = "2024",
     deps = select({
-        "//bazel/platforms:native": [":native"],
+        "//bazel/platforms:native": [],
         "//conditions:default": [
+            "//kernel:kernel_rs",
+            "//drivers:drivers_rs",
             "//net:stack_rs",
-            ":unikernel",
         ],
     }),
     rustc_flags = select({
@@ -29,34 +28,4 @@ rust_library(
         "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
         "//conditions:default": [],
     }),
-)
-
-# ---- Unikernel backend ------------------------------------------------------
-# Lifecycle/config: log, config_port, check_shutdown, wait_for_events.
-# Calls kernel serial + driver crates directly with inline assembly for idle.
-
-rust_library(
-    name = "unikernel",
-    srcs = ["unikernel.rs"],
-    crate_name = "uni_unikernel",
-    edition = "2024",
-    deps = [
-        "//kernel:kernel_rs",
-        "//drivers:drivers_rs",
-    ],
-    rustc_flags = ["-C", "panic=abort", "-C", "opt-level=2"] + select({
-        "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
-        "//conditions:default": [],
-    }),
-)
-
-# ---- Native backend ----------------------------------------------------------
-# POSIX sockets + stdio. Also provides main() for the native entry point.
-
-rust_library(
-    name = "native",
-    srcs = ["native.rs"],
-    crate_name = "uni_native",
-    edition = "2024",
-    rustc_flags = ["-C", "panic=abort", "-C", "opt-level=2"],
 )

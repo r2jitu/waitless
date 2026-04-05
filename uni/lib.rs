@@ -1,63 +1,64 @@
-// uni/api.rs — Platform abstraction API
+// uni/lib.rs — Platform abstraction API
 //
-// Provides safe Rust types for the uni:: platform interface:
-//   - TcpListener / TcpStream
-//   - log(), config_port(), check_shutdown(), wait_for_events(), tcp_poll()
+// Provides safe Rust types: TcpListener, TcpStream, log(), config_port(), etc.
 //
 // Backend selected at compile time via #[cfg]:
-//   - platform_unikernel: net_stack (TCP) + uni_unikernel (lifecycle)
-//   - platform_native:    uni_native (POSIX sockets + stdio)
+//   - platform_unikernel: unikernel module (lifecycle) + net_stack (TCP)
+//   - platform_native:    native module (POSIX sockets + stdio)
 
 #![no_std]
+#![allow(static_mut_refs)]
+#![allow(unsafe_op_in_unsafe_fn)]
 
 #[cfg(platform_unikernel)]
-extern crate uni_unikernel;
+extern crate kernel;
+#[cfg(platform_unikernel)]
+extern crate drivers;
 #[cfg(platform_unikernel)]
 extern crate net_stack;
 
+#[cfg(platform_unikernel)]
+mod unikernel;
+
 #[cfg(platform_native)]
-extern crate uni_native;
+pub mod native;
 
 // ---- Backend dispatch --------------------------------------------------------
 
 #[cfg(platform_unikernel)]
 mod backend {
-    pub use uni_unikernel::{log, config_port, check_shutdown, wait_for_events};
+    pub use crate::unikernel::{log, config_port, check_shutdown, wait_for_events};
     pub use net_stack::{tcp_listen, tcp_accept, tcp_has_data,
                         tcp_recv, tcp_send, tcp_close, tcp_is_closed, tcp_poll};
 }
 
 #[cfg(platform_native)]
 mod backend {
-    pub use uni_native::{log, config_port, check_shutdown, wait_for_events,
-                         tcp_listen, tcp_accept, tcp_has_data,
-                         tcp_recv, tcp_send, tcp_close, tcp_is_closed, tcp_poll};
+    pub use crate::native::{log, config_port, check_shutdown, wait_for_events,
+                            tcp_listen, tcp_accept, tcp_has_data,
+                            tcp_recv, tcp_send, tcp_close, tcp_is_closed, tcp_poll};
 }
 
-// ---- Re-exported platform functions (no wrapper needed) ----------------------
+// ---- Re-exported platform functions ------------------------------------------
 
 pub use backend::{log, config_port, check_shutdown, wait_for_events, tcp_poll};
 
 // ---- TcpListener ------------------------------------------------------------
 
-/// A TCP listener socket, bound to a port and accepting connections.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct TcpListener(*mut ());
 
 impl TcpListener {
-    /// Bind and listen on the given port. Returns `None` on failure.
     pub fn bind(port: u16) -> Option<Self> {
         let p = backend::tcp_listen(port);
         if p.is_null() { None } else { Some(TcpListener(p)) }
     }
 
-    /// Accept a pending connection. Returns `None` if no connection is waiting.
     pub fn accept(&self) -> Option<TcpStream> {
         let p = backend::tcp_accept(self.0);
         if p.is_null() { None } else { Some(TcpStream(p)) }
     }
 
-    /// Close the listener socket.
     pub fn close(&self) {
         backend::tcp_close(self.0);
     }
@@ -65,7 +66,6 @@ impl TcpListener {
 
 // ---- TcpStream --------------------------------------------------------------
 
-/// An accepted TCP connection.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct TcpStream(*mut ());
 

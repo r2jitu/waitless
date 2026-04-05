@@ -1,14 +1,6 @@
 // uni/unikernel.rs — Unikernel backend: lifecycle/config functions
-//
-// Called directly from uni/api.rs via Rust crate deps.
 
-#![no_std]
-#![allow(static_mut_refs)]
-#![allow(unsafe_op_in_unsafe_fn)]
-
-extern crate kernel;
 use kernel::serial as kernel_serial;
-extern crate drivers;
 
 // ---- Lifecycle / config -------------------------------------------------------
 

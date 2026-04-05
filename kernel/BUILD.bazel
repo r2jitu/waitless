@@ -102,7 +102,7 @@ rust_static_library(
         ":kernel_rs",
         "//drivers:drivers_rs",
         "//net:stack_rs",
-        "//uni:unikernel",
+        "//uni:uni",
     ],
     rustc_flags = ["-C", "panic=abort", "-C", "opt-level=2"] + select({
         "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],

@@ -1,14 +1,5 @@
-// uni/native.rs — Native (POSIX) backend for the uni:: platform API
-//
-// Provides the same uni_* extern "C" symbols as the unikernel backend
-// (stack.rs + ffi.rs), but implemented with POSIX sockets and stdio.
-// The linker selects this file for the native binary.
-//
-// Also provides main() → init + uni_main() for the native entry point.
-
-#![no_std]
-#![allow(static_mut_refs)]
-#![allow(unsafe_op_in_unsafe_fn)]
+// uni/native.rs — Native (POSIX) backend: sockets + stdio.
+// Also provides main() for the native entry point.
 
 use core::ptr;
 

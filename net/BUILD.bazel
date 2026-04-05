@@ -28,7 +28,7 @@ rust_library(
     srcs = ["http.rs"],
     crate_name = "http",
     edition = "2024",
-    deps = ["//uni:api"],
+    deps = ["//uni"],
     rustc_flags = ["-C", "panic=abort", "-C", "opt-level=2"] + select({
         "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
         "//conditions:default": [],
