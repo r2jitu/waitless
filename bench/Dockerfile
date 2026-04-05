@@ -10,18 +10,14 @@
 
 FROM rust:bookworm AS build
 WORKDIR /build
-COPY uni/native.rs uni/
-COPY uni/api.rs uni/
+COPY uni/lib.rs uni/native.rs uni/
 COPY net/http.rs net/
 COPY apps/webserver/main.rs apps/webserver/
 RUN mkdir -p out \
     && rustc --edition 2024 -C opt-level=2 -C panic=abort \
-         --crate-type rlib --crate-name uni_native \
-         uni/native.rs -o out/libuni_native.rlib \
-    && rustc --edition 2024 -C opt-level=2 -C panic=abort \
          --cfg platform_native \
          --crate-type rlib --crate-name uni \
-         uni/api.rs --extern uni_native=out/libuni_native.rlib \
+         uni/lib.rs \
          -o out/libuni.rlib \
     && rustc --edition 2024 -C opt-level=2 -C panic=abort \
          --crate-type rlib --crate-name http \
