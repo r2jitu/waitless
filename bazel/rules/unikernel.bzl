@@ -24,7 +24,7 @@ def unikernel_binary(name, app_srcs, app_deps = [], visibility = None):
     Args:
         name: Base name for all output targets.
         app_srcs: Rust source files (e.g. ["main.rs"]).
-        app_deps: Rust library dependencies (e.g. ["//net:http_rs", "//uni:api"]).
+        app_deps: Rust library dependencies (e.g. ["//net:http", "//uni"]).
         visibility: Bazel visibility specification.
     """
 
@@ -43,8 +43,8 @@ def unikernel_binary(name, app_srcs, app_deps = [], visibility = None):
         srcs = [],
         deps = [
             ":" + name + "_rs",
+            "//kernel:entry_asm",
             "//kernel:entry",
-            "//kernel:entry_rs",
             "//kernel:boot",
         ],
         visibility = visibility,
@@ -141,8 +141,8 @@ def unikernel_binary(name, app_srcs, app_deps = [], visibility = None):
         srcs = [],
         deps = [
             ":" + name + "_rs",
+            "//kernel:entry_asm",
             "//kernel:entry",
-            "//kernel:entry_rs",
         ],
         linkopts = ["-Wl,-T,bazel/toolchain/unikernel_limine.ld"],
         visibility = visibility,

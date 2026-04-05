@@ -4,10 +4,9 @@ load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 package(default_visibility = ["//visibility:public"])
 
 rust_library(
-    name = "drivers_rs",
+    name = "drivers",
     srcs = ["lib.rs", "pci.rs", "virtio.rs", "virtio_net.rs", "virtio_console.rs"],
-    crate_name = "drivers",
     crate_root = "lib.rs",
-    deps = ["//kernel:kernel_rs"],
+    deps = ["//kernel"],
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
 )

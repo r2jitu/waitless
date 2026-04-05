@@ -3,21 +3,18 @@ load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 
 package(default_visibility = ["//visibility:public"])
 
-# Network stack: Ethernet, ARP, IPv4, TCP, DHCP.
 rust_library(
-    name = "stack_rs",
+    name = "stack",
     srcs = ["lib.rs", "types.rs", "ethernet.rs", "arp.rs", "ipv4.rs", "tcp.rs", "dhcp.rs"],
-    crate_name = "net_stack",
+    crate_name = "net_stack",  # extern crate net_stack in entry.rs, uni/lib.rs
     crate_root = "lib.rs",
-    deps = ["//kernel:kernel_rs", "//drivers:drivers_rs"],
+    deps = ["//kernel", "//drivers"],
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
 )
 
-# HTTP/1.1 server: request parsing, routing, event loop.
 rust_library(
-    name = "http_rs",
+    name = "http",
     srcs = ["http.rs"],
-    crate_name = "http",
     deps = ["//uni"],
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
 )

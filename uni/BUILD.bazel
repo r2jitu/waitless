@@ -3,19 +3,12 @@ load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 
 package(default_visibility = ["//visibility:public"])
 
-# Platform abstraction: TcpListener, TcpStream, log(), config_port(), etc.
-# Backend selected via --cfg: unikernel.rs or native.rs.
 rust_library(
     name = "uni",
     srcs = ["lib.rs", "unikernel.rs", "native.rs"],
-    crate_name = "uni",
     deps = select({
         "//bazel/platforms:native": [],
-        "//conditions:default": [
-            "//kernel:kernel_rs",
-            "//drivers:drivers_rs",
-            "//net:stack_rs",
-        ],
+        "//conditions:default": ["//kernel", "//drivers", "//net:stack"],
     }),
     rustc_flags = select({
         "//bazel/platforms:native": ["--cfg=platform_native"],
