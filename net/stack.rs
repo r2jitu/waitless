@@ -11,41 +11,18 @@
 // Bare-metal single-threaded code: static mut references are safe here.
 #![allow(static_mut_refs)]
 
-use core::panic::PanicInfo;
 use core::ptr;
 
-#[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    log(b"PANIC in net stack\n\0");
-    loop {}
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_eh_personality() {}
-
 // ============================================================================
-// FFI declarations — direct calls to kernel/driver Rust functions
+// Rust crate dependencies — direct calls, no FFI
 // ============================================================================
 
-type PollCallback = unsafe extern "C" fn(*const u8, u32);
-
-unsafe extern "C" {
-    // kernel/serial.rs
-    fn serial_puts(s: *const u8);
-    fn serial_check_shutdown() -> bool;
-
-    // kernel/mm.rs
-    fn mm_kmalloc(size: usize) -> *mut u8;
-    fn mm_kfree(ptr: *mut u8);
-
-    // drivers/drivers.rs
-    fn driver_virtio_net_get_mac(mac_out: *mut u8);
-    fn driver_virtio_net_send(data: *const u8, len: u32);
-    fn driver_virtio_net_poll(callback: PollCallback);
-}
+extern crate kernel_serial;
+extern crate kernel_mm;
+extern crate drivers;
 
 fn log(msg: &[u8]) {
-    unsafe { serial_puts(msg.as_ptr()) }
+    unsafe { kernel_serial::serial_puts(msg.as_ptr()) }
 }
 
 /// Busy-wait for approximately `us` microseconds.
@@ -262,7 +239,7 @@ static mut MAC_CACHED: bool = false;
 fn ethernet_our_mac() -> MacAddr {
     unsafe {
         if !MAC_CACHED {
-            driver_virtio_net_get_mac(OUR_MAC.bytes.as_mut_ptr());
+            drivers::driver_virtio_net_get_mac(OUR_MAC.bytes.as_mut_ptr());
             MAC_CACHED = true;
         }
         OUR_MAC
@@ -281,7 +258,7 @@ fn ethernet_send(dst: MacAddr, ethertype: u16, payload: &[u8]) {
         let payload_len = payload.len().min(1500);
         ptr::copy_nonoverlapping(payload.as_ptr(), ETH_TX_BUF.as_mut_ptr().add(14), payload_len);
 
-        driver_virtio_net_send(ETH_TX_BUF.as_ptr(), (14 + payload_len) as u32);
+        drivers::driver_virtio_net_send(ETH_TX_BUF.as_ptr(), (14 + payload_len) as u32);
     }
 }
 
@@ -473,7 +450,7 @@ fn arp_resolve(ip: Ipv4Addr) -> Option<MacAddr> {
     for _retry in 0..3 {
         arp_request(target);
         for _poll in 0..200_000 {
-            unsafe { driver_virtio_net_poll(ethernet_receive) };
+            drivers::driver_virtio_net_poll(ethernet_receive);
             if let Some(mac) = arp_lookup(target) {
                 return Some(mac);
             }
@@ -747,7 +724,7 @@ fn alloc_connection() -> Option<usize> {
 fn free_connection(idx: usize) {
     unsafe {
         if !CONNECTIONS[idx].rx_buf.is_null() {
-            mm_kfree(CONNECTIONS[idx].rx_buf);
+            kernel_mm::mm_kfree(CONNECTIONS[idx].rx_buf);
         }
         CONNECTIONS[idx] = TcpConnection::new();
     }
@@ -889,7 +866,7 @@ fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: *const u8, len: usize)
             c.accepted = false;
 
             // Allocate RX buffer
-            c.rx_buf = mm_kmalloc(RX_BUF_SIZE);
+            c.rx_buf = kernel_mm::mm_kmalloc(RX_BUF_SIZE);
             c.rx_buf_size = RX_BUF_SIZE;
             c.rx_head = 0;
             c.rx_tail = 0;
@@ -1200,7 +1177,7 @@ fn dhcp_send_discover() {
     ip.checksum = 0;
     ip.checksum = unsafe { checksum(frame.as_ptr().add(14) as *const u8, 20) };
 
-    unsafe { driver_virtio_net_send(frame.as_ptr(), (14 + ip_total) as u32) };
+    drivers::driver_virtio_net_send(frame.as_ptr(), (14 + ip_total) as u32);
 }
 
 fn dhcp_send_request() {
@@ -1268,13 +1245,13 @@ fn dhcp_send_request() {
     ip.checksum = 0;
     ip.checksum = unsafe { checksum(frame.as_ptr().add(14) as *const u8, 20) };
 
-    unsafe { driver_virtio_net_send(frame.as_ptr(), (14 + ip_total) as u32) };
+    drivers::driver_virtio_net_send(frame.as_ptr(), (14 + ip_total) as u32);
 }
 
 fn dhcp_poll_wait(timeout_ms: u32) -> bool {
     for _ in 0..timeout_ms {
         unsafe {
-            driver_virtio_net_poll(dhcp_receive);
+            drivers::driver_virtio_net_poll(dhcp_receive);
             if DHCP_GOT_OFFER || DHCP_GOT_ACK {
                 return true;
             }
@@ -1494,5 +1471,5 @@ pub extern "C" fn uni_tcp_is_closed(conn: *mut ()) -> bool {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn uni_tcp_poll() {
-    unsafe { driver_virtio_net_poll(ethernet_receive) }
+    drivers::driver_virtio_net_poll(ethernet_receive);
 }

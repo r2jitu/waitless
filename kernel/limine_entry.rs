@@ -15,48 +15,15 @@
 
 use core::panic::PanicInfo;
 
+extern crate kernel_types;
+extern crate kernel_fdt;
+extern crate kernel_mmu;
+
+use kernel_types::{BootInfo, MemoryRegion, Protocol, MEM_AVAILABLE, MEM_RESERVED, MAX_MEMORY_REGIONS};
+
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     loop {}
-}
-
-// ============================================================================
-// BootInfo — must match kernel/entry.rs layout exactly
-// ============================================================================
-
-const MAX_MEMORY_REGIONS: usize = 64;
-
-#[repr(u8)]
-#[derive(Clone, Copy)]
-enum Protocol {
-    _Unknown = 0,
-    _Multiboot2 = 1,
-    _Pvh = 2,
-    _Fdt = 3,
-    Limine = 4,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct MemoryRegion {
-    base: u64,
-    length: u64,
-    region_type: u32,
-    _pad: u32,
-}
-
-const MEM_AVAILABLE: u32 = 1;
-const MEM_RESERVED: u32 = 2;
-
-#[repr(C)]
-struct BootInfo {
-    protocol: Protocol,
-    memory_map_count: i32,
-    memory_map: [MemoryRegion; MAX_MEMORY_REGIONS],
-    dtb_addr: u64,
-    kernel_phys_base: u64,
-    kernel_virt_base: u64,
-    hhdm_offset: u64,
 }
 
 // ============================================================================
@@ -255,27 +222,11 @@ static LIMINE_END_MARKER: [u64; 2] = [
 ];
 
 // ============================================================================
-// External kernel functions
+// External kernel functions (in different static library)
 // ============================================================================
 
 unsafe extern "C" {
     fn kernel_boot_from_bootinfo(info: *const BootInfo);
-
-    #[cfg(target_arch = "aarch64")]
-    fn fdt_init(dtb_addr: u64);
-    #[cfg(target_arch = "aarch64")]
-    fn fdt_info_ptr() -> *const FdtInfoOpaque;
-    #[cfg(target_arch = "aarch64")]
-    fn mmu_map_device_range(phys_base: u64, size: u64);
-}
-
-// Opaque FDT info struct — we only need the first two fields (pcie_ecam_base/size).
-#[cfg(target_arch = "aarch64")]
-#[repr(C)]
-struct FdtInfoOpaque {
-    pcie_ecam_base: u64,
-    pcie_ecam_size: u64,
-    // remaining fields not needed here
 }
 
 // ============================================================================
@@ -348,10 +299,10 @@ pub extern "C" fn limine_entry_cpp() {
 
             // Parse FDT and map PCIe ECAM before serial::init()
             if LIMINE_BOOT_INFO.dtb_addr != 0 {
-                fdt_init(LIMINE_BOOT_INFO.dtb_addr);
-                let info = &*fdt_info_ptr();
+                kernel_fdt::fdt_init(LIMINE_BOOT_INFO.dtb_addr);
+                let info = &*kernel_fdt::fdt_info_ptr();
                 if info.pcie_ecam_base != 0 && info.pcie_ecam_size != 0 {
-                    mmu_map_device_range(info.pcie_ecam_base, info.pcie_ecam_size);
+                    kernel_mmu::mmu_map_device_range(info.pcie_ecam_base, info.pcie_ecam_size);
                 }
             }
         }

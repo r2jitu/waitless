@@ -1,15 +1,21 @@
-load("@rules_rust//rust:defs.bzl", "rust_library", "rust_static_library")
+load("@rules_rust//rust:defs.bzl", "rust_library")
 
 package(default_visibility = ["//visibility:public"])
 
 # Rust network stack: Ethernet, ARP, IPv4, TCP, DHCP.
-# Provides net_dhcp_discover, net_tcp_init, uni_tcp_* and net_set_fallback_config.
-# Calls kernel/driver Rust functions directly (no C++ FFI bridge).
-rust_static_library(
+# Linked as rust_library — depends on kernel and driver crates directly.
+# The #[no_mangle] extern "C" exports (uni_tcp_*, net_tcp_init, etc.)
+# are available for C++ linking when included transitively via entry_rs.
+rust_library(
     name = "stack_rs",
     srcs = ["stack.rs"],
     crate_name = "net_stack",
     edition = "2024",
+    deps = [
+        "//kernel:serial_rs",
+        "//kernel:mm_rs",
+        "//drivers:drivers_rs",
+    ],
     rustc_flags = ["-C", "panic=abort"] + select({
         "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
         "//conditions:default": [],

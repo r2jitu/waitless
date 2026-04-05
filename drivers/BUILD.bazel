@@ -1,12 +1,13 @@
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
-load("@rules_rust//rust:defs.bzl", "rust_static_library")
+load("@rules_rust//rust:defs.bzl", "rust_library")
 
 package(default_visibility = ["//visibility:public"])
 
 # Rust device drivers: PCI, VirtIO PCI, Virtqueue, VirtIO-net.
-# Exports driver_* extern "C" symbols consumed by drivers_ffi (for kernel calls)
-# and by entry.cc / net_ffi.cc / uni/ffi.cc.
-rust_static_library(
+# Linked as rust_library so other Rust crates can depend on it directly.
+# The #[no_mangle] extern "C" exports are still available for C++ linking
+# when included transitively via a rust_static_library.
+rust_library(
     name = "drivers_rs",
     srcs = ["drivers.rs"],
     crate_name = "drivers",

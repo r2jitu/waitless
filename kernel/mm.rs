@@ -28,6 +28,8 @@ use core::ptr;
 // ============================================================================
 
 extern crate kernel_serial;
+extern crate kernel_types;
+use kernel_types::{BootInfo, MEM_AVAILABLE};
 
 unsafe extern "C" {
     // Linker-provided symbol marking the end of the kernel image
@@ -42,33 +44,6 @@ macro_rules! klog {
     ($($arg:tt)*) => {
         log_fmt(core::format_args!($($arg)*))
     };
-}
-
-// ============================================================================
-// BootInfo struct — must match kernel/boot_info.h layout exactly
-// ============================================================================
-
-const MAX_MEMORY_REGIONS: usize = 64;
-const MEMORY_REGION_AVAILABLE: u32 = 1;
-
-#[repr(C)]
-pub struct MemoryRegion {
-    base: u64,
-    length: u64,
-    region_type: u32,
-    _pad: u32,
-}
-
-#[repr(C)]
-pub struct BootInfo {
-    protocol: u8,
-    // 3 bytes padding inserted by repr(C) to align memory_map_count
-    memory_map_count: i32,
-    memory_map: [MemoryRegion; MAX_MEMORY_REGIONS],
-    dtb_addr: u64,
-    kernel_phys_base: u64,
-    kernel_virt_base: u64,
-    hhdm_offset: u64,
 }
 
 // ============================================================================
@@ -180,7 +155,7 @@ pub unsafe extern "C" fn mm_init(info: *const BootInfo) {
 
     for i in 0..info.memory_map_count as usize {
         let region = &info.memory_map[i];
-        if region.region_type == MEMORY_REGION_AVAILABLE {
+        if region.region_type == MEM_AVAILABLE {
             TOTAL_MEMORY_BYTES += region.length;
             let end = region.base + region.length;
             if end > max_physical_addr {
@@ -218,7 +193,7 @@ pub unsafe extern "C" fn mm_init(info: *const BootInfo) {
         let mut best_size: u64 = 0;
         for i in 0..info.memory_map_count as usize {
             let region = &info.memory_map[i];
-            if region.region_type != MEMORY_REGION_AVAILABLE {
+            if region.region_type != MEM_AVAILABLE {
                 continue;
             }
             let rbase = align_up_page(region.base);
@@ -245,7 +220,7 @@ pub unsafe extern "C" fn mm_init(info: *const BootInfo) {
     // ---- Phase 3: Free available regions from memory map ----
     for i in 0..info.memory_map_count as usize {
         let region = &info.memory_map[i];
-        if region.region_type != MEMORY_REGION_AVAILABLE {
+        if region.region_type != MEM_AVAILABLE {
             continue;
         }
         let start = align_up_page(region.base);

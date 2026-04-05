@@ -5,30 +5,16 @@
 
 #![no_std]
 #![allow(static_mut_refs)]
+#![allow(unsafe_op_in_unsafe_fn)]
 
-use core::panic::PanicInfo;
-
-#[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    loop {}
-}
-
-unsafe extern "C" {
-    // kernel/serial.rs
-    fn serial_puts(s: *const u8);
-    fn serial_check_shutdown() -> bool;
-
-    // drivers/drivers.rs
-    fn driver_virtio_net_irq_idle_supported() -> bool;
-    fn driver_virtio_net_arm_rx_interrupts();
-    fn driver_virtio_net_has_pending_rx() -> bool;
-}
+extern crate kernel_serial;
+extern crate drivers;
 
 // ---- Lifecycle / config -------------------------------------------------------
 
 #[unsafe(no_mangle)]
 pub extern "C" fn uni_log(msg: *const u8) {
-    unsafe { serial_puts(msg) }
+    unsafe { kernel_serial::serial_puts(msg) }
 }
 
 #[unsafe(no_mangle)]
@@ -38,24 +24,22 @@ pub extern "C" fn uni_config_port(default_port: u16) -> u16 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn uni_check_shutdown() -> bool {
-    unsafe { serial_check_shutdown() }
+    unsafe { kernel_serial::serial_check_shutdown() }
 }
 
 // ---- Wait for events (arch-specific idle) -------------------------------------
 
 #[unsafe(no_mangle)]
 pub extern "C" fn uni_wait_for_events() {
-    unsafe {
-        if driver_virtio_net_irq_idle_supported() {
-            arch_mask_irq();
-            driver_virtio_net_arm_rx_interrupts();
-            if !driver_virtio_net_has_pending_rx() {
-                arch_idle();
-            }
-            arch_unmask_irq();
-        } else {
-            arch_cpu_relax();
+    if drivers::driver_virtio_net_irq_idle_supported() {
+        unsafe { arch_mask_irq() };
+        drivers::driver_virtio_net_arm_rx_interrupts();
+        if !drivers::driver_virtio_net_has_pending_rx() {
+            unsafe { arch_idle() };
         }
+        unsafe { arch_unmask_irq() };
+    } else {
+        unsafe { arch_cpu_relax() };
     }
 }
 

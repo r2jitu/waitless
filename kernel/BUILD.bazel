@@ -3,6 +3,17 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_static_library")
 
 package(default_visibility = ["//visibility:public"])
 
+rust_library(
+    name = "types_rs",
+    srcs = ["types.rs"],
+    crate_name = "kernel_types",
+    edition = "2024",
+    rustc_flags = ["-C", "panic=abort"] + select({
+        "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
+        "//conditions:default": [],
+    }),
+)
+
 cc_library(
     name = "arch_h",
     hdrs = ["arch.h"] + select({
@@ -65,7 +76,7 @@ rust_library(
     srcs = ["mm.rs"],
     crate_name = "kernel_mm",
     edition = "2024",
-    deps = [":serial_rs"],
+    deps = [":serial_rs", ":types_rs"],
     rustc_flags = ["-C", "panic=abort"] + select({
         "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
         "//conditions:default": [],
@@ -139,6 +150,7 @@ rust_static_library(
     srcs = ["limine_entry.rs"],
     crate_name = "limine_entry",
     edition = "2024",
+    deps = [":types_rs", ":fdt_rs", ":mmu_rs"],
     rustc_flags = ["-C", "panic=abort"] + select({
         "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
         "//conditions:default": [],
@@ -165,6 +177,17 @@ rust_static_library(
     srcs = ["entry.rs"],
     crate_name = "kernel_entry",
     edition = "2024",
+    deps = [
+        ":types_rs",
+        ":serial_rs",
+        ":mm_rs",
+        ":fdt_rs",
+        ":mmu_rs",
+        ":exceptions_rs",
+        "//drivers:drivers_rs",
+        "//net:stack_rs",
+        "//uni:ffi",
+    ],
     rustc_flags = ["-C", "panic=abort"] + select({
         "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
         "//conditions:default": [],

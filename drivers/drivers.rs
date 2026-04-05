@@ -13,19 +13,6 @@ use core::ptr;
 use core::sync::atomic::{compiler_fence, Ordering};
 
 // ============================================================================
-// Panic handler (required for rust_static_library)
-// ============================================================================
-
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    log(b"PANIC in drivers\n\0");
-    loop {}
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_eh_personality() {}
-
-// ============================================================================
 // FFI declarations — kernel functions provided by drivers_ffi.cc
 // ============================================================================
 

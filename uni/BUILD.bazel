@@ -1,5 +1,5 @@
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
-load("@rules_rust//rust:defs.bzl", "rust_static_library")
+load("@rules_rust//rust:defs.bzl", "rust_library")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -8,11 +8,15 @@ package(default_visibility = ["//visibility:public"])
 # uni_check_shutdown, uni_wait_for_events). Calls kernel/driver Rust
 # functions directly with inline assembly for arch primitives.
 
-rust_static_library(
+rust_library(
     name = "ffi",
     srcs = ["ffi.rs"],
     crate_name = "uni_ffi",
     edition = "2024",
+    deps = [
+        "//kernel:serial_rs",
+        "//drivers:drivers_rs",
+    ],
     rustc_flags = ["-C", "panic=abort"] + select({
         "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
         "//conditions:default": [],
