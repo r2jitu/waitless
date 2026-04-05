@@ -29,7 +29,7 @@ rust_static_library(
     deps = [
         ":kernel",
         "//drivers",
-        "//net:stack",
+        "//net",
         "//uni",
     ],
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,

@@ -15,7 +15,7 @@ extern crate kernel;
 #[cfg(platform_unikernel)]
 extern crate drivers;
 #[cfg(platform_unikernel)]
-extern crate net_stack;
+extern crate net;
 
 #[cfg(platform_unikernel)]
 mod unikernel;
@@ -30,7 +30,7 @@ pub mod http;
 #[cfg(platform_unikernel)]
 mod backend {
     pub use crate::unikernel::{log, config_port, check_shutdown, wait_for_events};
-    pub use net_stack::{tcp_listen, tcp_accept, tcp_has_data,
+    pub use net::{tcp_listen, tcp_accept, tcp_has_data,
                         tcp_recv, tcp_send, tcp_close, tcp_is_closed, tcp_poll};
 }
 

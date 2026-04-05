@@ -15,7 +15,7 @@ use core::ptr;
 
 extern crate kernel;
 extern crate drivers;
-extern crate net_stack;
+extern crate net;
 extern crate uni;
 
 mod libc;
@@ -393,12 +393,12 @@ unsafe fn kernel_boot(info: &BootInfo) {
         );
 
         klog!("[INIT] DHCP (Rust)...\n");
-        let dhcp_ok = net_stack::dhcp_discover();
+        let dhcp_ok = net::dhcp_discover();
         if dhcp_ok {
             klog!("       IP obtained successfully\n");
         } else {
             klog!("       [WARN] DHCP failed, using 10.0.2.15/24\n");
-            net_stack::set_fallback_config(
+            net::set_fallback_config(
                 10, 0, 2, 15,      // IP
                 255, 255, 255, 0,   // subnet
                 10, 0, 2, 2,       // gateway
@@ -407,7 +407,7 @@ unsafe fn kernel_boot(info: &BootInfo) {
         }
 
         klog!("[INIT] TCP stack (Rust)...\n");
-        net_stack::tcp_init();
+        net::tcp_init();
 
         klog!("[INIT] Interrupt-driven idle...\n");
         drivers::virtio_net_enable_irq();

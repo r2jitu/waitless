@@ -4,10 +4,8 @@ load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 package(default_visibility = ["//visibility:public"])
 
 rust_library(
-    name = "stack",
+    name = "net",
     srcs = ["lib.rs", "types.rs", "ethernet.rs", "arp.rs", "ipv4.rs", "tcp.rs", "dhcp.rs"],
-    crate_name = "net_stack",
-    crate_root = "lib.rs",
     deps = ["//kernel", "//drivers"],
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
 )

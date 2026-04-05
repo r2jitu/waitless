@@ -8,7 +8,7 @@ rust_library(
     srcs = ["lib.rs", "unikernel.rs", "native.rs", "http.rs"],
     deps = select({
         "//bazel/platforms:native": [],
-        "//conditions:default": ["//kernel", "//drivers", "//net:stack"],
+        "//conditions:default": ["//kernel", "//drivers", "//net"],
     }),
     rustc_flags = select({
         "//bazel/platforms:native": ["--cfg=platform_native"],
