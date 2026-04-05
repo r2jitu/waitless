@@ -19,11 +19,15 @@
 //   0x030  CR    — Control Register
 
 #include "kernel/serial.h"
-#include "drivers/pci.h"
-#include "drivers/virtio_console.h"
-#include "drivers/virtio_pci.h"
 #include "kernel/aarch64/fdt.h"
 #include <stdarg.h>
+
+// Rust driver functions (drivers/drivers.rs)
+extern "C" void driver_pci_init();
+extern "C" bool driver_virtio_console_init_mmio(uint64_t base_addr);
+extern "C" bool driver_virtio_console_init_pci();
+extern "C" void driver_virtio_console_putc(uint8_t c);
+extern "C" int driver_virtio_console_try_getc();
 
 namespace serial {
 
@@ -79,7 +83,7 @@ void init() {
   // Try virtio-mmio console if FDT found virtio-mmio devices (QEMU path).
   if (fdt.virtio_count > 0) {
     for (int i = 0; i < fdt.virtio_count; i++) {
-      if (virtio_console::init(fdt.virtio_bases[i])) {
+      if (driver_virtio_console_init_mmio(fdt.virtio_bases[i])) {
         g_backend = Backend::VIRTIO;
         return;
       }
@@ -87,12 +91,10 @@ void init() {
   }
 
   // PCI VirtIO console (VZ.framework and any other PCI-based platform).
-  // pci::init() is idempotent; calling it early is safe — the later call
-  // in kernel_main() will be a no-op.
+  // driver_pci_init() is idempotent; calling it early is safe.
   if (fdt.pcie_ecam_base != 0) {
-    pci::init();
-    virtio_pci::Device *con = virtio_pci::find(3); // device type 3 = console
-    if (con && virtio_console::init_pci(con)) {
+    driver_pci_init();
+    if (driver_virtio_console_init_pci()) {
       g_backend = Backend::VIRTIO;
       return;
     }
@@ -111,7 +113,7 @@ void init() {
 
 void putc(char c) {
   if (g_backend == Backend::VIRTIO) {
-    virtio_console::putc(c);
+    driver_virtio_console_putc((uint8_t)c);
     return;
   }
   if (g_backend == Backend::NONE)
@@ -259,7 +261,7 @@ void printf(const char *fmt, ...) {
 
 int try_getc() {
   if (g_backend == Backend::VIRTIO) {
-    return virtio_console::try_getc();
+    return driver_virtio_console_try_getc();
   }
   if (g_backend == Backend::NONE)
     return -1;

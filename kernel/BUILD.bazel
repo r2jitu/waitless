@@ -79,13 +79,7 @@ cc_library(
         "//bazel/platforms:x86_64": ["x86_64/serial.h"],
         "//conditions:default": [],
     }),
-    deps = [":arch_h", ":boot_info", ":fdt"] + select({
-        "//bazel/platforms:aarch64": [
-            "//drivers:virtio_console",
-            "//drivers:virtio_pci",
-        ],
-        "//conditions:default": [],
-    }),
+    deps = [":arch_h", ":boot_info", ":fdt"],
     copts = ["-I."],
 )
 

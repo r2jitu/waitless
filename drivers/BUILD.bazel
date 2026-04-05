@@ -35,38 +35,3 @@ cc_library(
     copts = ["-I."],
 )
 
-cc_library(
-    name = "pci",
-    srcs = ["pci.cc"],
-    hdrs = ["pci.h"],
-    # No dep on kernel:core (serial.h) to break a build cycle:
-    # kernel:core → virtio_console → virtio_pci → pci.
-    # pci.cc forward-declares serial::printf; linker resolves at link time.
-    deps = ["//kernel:arch_h", "//kernel:fdt"] + select({
-        "//bazel/platforms:aarch64": ["//kernel:mmu"],
-        "//conditions:default": [],
-    }),
-    copts = ["-I."],
-)
-
-cc_library(
-    name = "virtio_pci",
-    srcs = ["virtio_pci.cc"],
-    hdrs = ["virtio_pci.h"],
-    # Same cycle-breaking strategy as pci: no dep on kernel:core.
-    deps = [":pci", "//kernel:arch_h"] + select({
-        "//bazel/platforms:aarch64": ["//kernel:mmu"],
-        "//conditions:default": [],
-    }),
-    copts = ["-I."],
-)
-
-cc_library(
-    name = "virtio_console",
-    srcs = ["virtio_console.cc"],
-    hdrs = ["virtio_console.h"],
-    # Deps kept minimal to avoid circular dependency:
-    # kernel:core (aarch64/serial.cc) → drivers:virtio_console.
-    deps = ["//kernel:arch_h", ":virtio_pci"],
-    copts = ["-I."],
-)
