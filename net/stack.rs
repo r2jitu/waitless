@@ -1337,10 +1337,9 @@ pub extern "C" fn net_set_fallback_config(
     }
 }
 
-// ---- TCP extern "C" API (replaces uni/ffi.cc TCP wrappers) ------------------
+// ---- TCP API (called from uni/api.rs via Rust crate deps) -------------------
 
-#[unsafe(no_mangle)]
-pub extern "C" fn uni_tcp_listen(port: u16) -> *mut () {
+pub fn tcp_listen(port: u16) -> *mut () {
     let idx = match alloc_connection() {
         Some(i) => i,
         None => return ptr::null_mut(),
@@ -1353,9 +1352,8 @@ pub extern "C" fn uni_tcp_listen(port: u16) -> *mut () {
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn uni_tcp_accept(conn: *mut ()) -> *mut () {
-    let listener_idx = (conn as usize) - 1;
+pub fn tcp_accept(handle: *mut ()) -> *mut () {
+    let listener_idx = (handle as usize) - 1;
     if listener_idx >= MAX_CONNECTIONS {
         return ptr::null_mut();
     }
@@ -1373,30 +1371,24 @@ pub extern "C" fn uni_tcp_accept(conn: *mut ()) -> *mut () {
     ptr::null_mut()
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn uni_tcp_has_data(conn: *mut ()) -> bool {
-    let idx = (conn as usize) - 1;
+pub fn tcp_has_data(handle: *mut ()) -> bool {
+    let idx = (handle as usize) - 1;
     if idx >= MAX_CONNECTIONS {
         return false;
     }
     unsafe { CONNECTIONS[idx].rx_used() > 0 }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn uni_tcp_recv(conn: *mut (), buf: *mut u8, max_len: usize) -> usize {
-    let idx = (conn as usize) - 1;
+pub fn tcp_recv(handle: *mut (), buf: &mut [u8]) -> usize {
+    let idx = (handle as usize) - 1;
     if idx >= MAX_CONNECTIONS {
         return 0;
     }
-    unsafe {
-        let out = core::slice::from_raw_parts_mut(buf, max_len);
-        CONNECTIONS[idx].rx_pop(out)
-    }
+    unsafe { CONNECTIONS[idx].rx_pop(buf) }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn uni_tcp_send(conn: *mut (), data: *const u8, len: usize) -> i32 {
-    let idx = (conn as usize) - 1;
+pub fn tcp_send(handle: *mut (), data: &[u8]) -> i32 {
+    let idx = (handle as usize) - 1;
     if idx >= MAX_CONNECTIONS {
         return -1;
     }
@@ -1405,9 +1397,9 @@ pub extern "C" fn uni_tcp_send(conn: *mut (), data: *const u8, len: usize) -> i3
         if c.state != TcpState::Established {
             return -1;
         }
-        let payload = core::slice::from_raw_parts(data, len);
 
         // Send in MSS-sized chunks
+        let len = data.len();
         let mut sent = 0;
         while sent < len {
             let chunk = (len - sent).min(MSS);
@@ -1418,7 +1410,7 @@ pub extern "C" fn uni_tcp_send(conn: *mut (), data: *const u8, len: usize) -> i3
                 c.snd_nxt,
                 c.rcv_nxt,
                 TCP_ACK | TCP_PSH,
-                &payload[sent..sent + chunk],
+                &data[sent..sent + chunk],
             );
             c.snd_nxt = c.snd_nxt.wrapping_add(chunk as u32);
             sent += chunk;
@@ -1427,9 +1419,8 @@ pub extern "C" fn uni_tcp_send(conn: *mut (), data: *const u8, len: usize) -> i3
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn uni_tcp_close(conn: *mut ()) {
-    let idx = (conn as usize) - 1;
+pub fn tcp_close(handle: *mut ()) {
+    let idx = (handle as usize) - 1;
     if idx >= MAX_CONNECTIONS {
         return;
     }
@@ -1460,16 +1451,14 @@ pub extern "C" fn uni_tcp_close(conn: *mut ()) {
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn uni_tcp_is_closed(conn: *mut ()) -> bool {
-    let idx = (conn as usize) - 1;
+pub fn tcp_is_closed(handle: *mut ()) -> bool {
+    let idx = (handle as usize) - 1;
     if idx >= MAX_CONNECTIONS {
         return true;
     }
     unsafe { CONNECTIONS[idx].state == TcpState::Closed }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn uni_tcp_poll() {
+pub fn tcp_poll() {
     drivers::driver_virtio_net_poll(ethernet_receive);
 }

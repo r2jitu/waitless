@@ -2,14 +2,13 @@ load("@rules_rust//rust:defs.bzl", "rust_library")
 
 package(default_visibility = ["//visibility:public"])
 
-# ---- Platform API (Rust) ----------------------------------------------------
+# ---- Platform API ------------------------------------------------------------
 # Safe Rust types for the uni:: platform abstraction: TcpListener, TcpStream,
 # log(), config_port(), etc.
 #
-# The backend is selected at compile time via --cfg:
-#   - platform_unikernel: direct calls to net/stack.rs + uni/ffi.rs
-#   - platform_native:    direct calls to uni/native.rs
-# No C FFI boundary — pure Rust crate-to-crate calls.
+# Backend selected at compile time via --cfg:
+#   - platform_unikernel: calls net/stack.rs (TCP) + uni/unikernel.rs (lifecycle)
+#   - platform_native:    calls uni/native.rs (POSIX sockets + stdio)
 
 rust_library(
     name = "api",
@@ -20,7 +19,7 @@ rust_library(
         "//bazel/platforms:native": [":native"],
         "//conditions:default": [
             "//net:stack_rs",
-            ":ffi",
+            ":unikernel",
         ],
     }),
     rustc_flags = select({
@@ -32,15 +31,14 @@ rust_library(
     }),
 )
 
-# ---- Unikernel backend (Rust) -----------------------------------------------
-# Provides uni_* lifecycle/config symbols (uni_log, uni_config_port,
-# uni_check_shutdown, uni_wait_for_events). Calls kernel/driver Rust
-# functions directly with inline assembly for arch primitives.
+# ---- Unikernel backend ------------------------------------------------------
+# Lifecycle/config: log, config_port, check_shutdown, wait_for_events.
+# Calls kernel serial + driver crates directly with inline assembly for idle.
 
 rust_library(
-    name = "ffi",
-    srcs = ["ffi.rs"],
-    crate_name = "uni_ffi",
+    name = "unikernel",
+    srcs = ["unikernel.rs"],
+    crate_name = "uni_unikernel",
     edition = "2024",
     deps = [
         "//kernel:serial_rs",
@@ -52,9 +50,8 @@ rust_library(
     }),
 )
 
-# ---- Native backend (Rust) --------------------------------------------------
-# Provides the same uni_* symbols using POSIX sockets + stdio.
-# Also provides main() → init + uni_main() for the native entry point.
+# ---- Native backend ----------------------------------------------------------
+# POSIX sockets + stdio. Also provides main() for the native entry point.
 
 rust_library(
     name = "native",

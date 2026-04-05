@@ -186,7 +186,7 @@ rust_static_library(
         ":exceptions_rs",
         "//drivers:drivers_rs",
         "//net:stack_rs",
-        "//uni:ffi",
+        "//uni:unikernel",
     ],
     rustc_flags = ["-C", "panic=abort", "-C", "opt-level=2"] + select({
         "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],

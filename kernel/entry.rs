@@ -21,7 +21,7 @@ extern crate kernel_mmu;
 extern crate kernel_exceptions;
 extern crate drivers;
 extern crate net_stack;
-extern crate uni_ffi;
+extern crate uni_unikernel;
 
 use kernel_types::{BootInfo, MemoryRegion, Protocol, MEM_AVAILABLE, MEM_RESERVED, MAX_MEMORY_REGIONS};
 

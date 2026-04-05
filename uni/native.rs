@@ -215,34 +215,24 @@ fn init_native() {
 }
 
 // ============================================================================
-// Extern "C" API — same symbols as ffi.rs + stack.rs
+// Platform API — same interface as ffi.rs + stack.rs (called from api.rs)
 // ============================================================================
 
-#[unsafe(no_mangle)]
-pub extern "C" fn uni_init_native() {
-    init_native();
+pub fn log(msg: &[u8]) {
+    let len = c_strlen(msg.as_ptr());
+    unsafe { write(2, msg.as_ptr(), len); }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn uni_log(msg: *const u8) {
-    if msg.is_null() { return; }
-    let len = c_strlen(msg);
-    unsafe { write(2, msg, len); }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn uni_config_port(default_port: u16) -> u16 {
+pub fn config_port(default_port: u16) -> u16 {
     let port = unsafe { CONFIG_PORT };
     if port != 0 { port } else { default_port }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn uni_check_shutdown() -> bool {
+pub fn check_shutdown() -> bool {
     unsafe { SHUTDOWN }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn uni_wait_for_events() {
+pub fn wait_for_events() {
     unsafe {
         let mut fds = [PollFd { fd: 0, events: 0, revents: 0 }; CONN_POOL_SIZE];
         let mut n: usize = 0;
@@ -273,8 +263,7 @@ pub extern "C" fn uni_wait_for_events() {
 
 // ---- TCP --------------------------------------------------------------------
 
-#[unsafe(no_mangle)]
-pub extern "C" fn uni_tcp_listen(port: u16) -> *mut () {
+pub fn tcp_listen(port: u16) -> *mut () {
     unsafe {
         let fd = socket(AF_INET, SOCK_STREAM, 0);
         if fd < 0 { return ptr::null_mut(); }
@@ -315,9 +304,8 @@ pub extern "C" fn uni_tcp_listen(port: u16) -> *mut () {
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn uni_tcp_accept(conn: *mut ()) -> *mut () {
-    let listener = conn as *mut NativeConn;
+pub fn tcp_accept(handle: *mut ()) -> *mut () {
+    let listener = handle as *mut NativeConn;
     unsafe {
         if listener.is_null() || (*listener).fd < 0 || (*listener).closed {
             return ptr::null_mut();
@@ -343,21 +331,19 @@ pub extern "C" fn uni_tcp_accept(conn: *mut ()) -> *mut () {
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn uni_tcp_has_data(conn: *mut ()) -> bool {
-    let c = conn as *mut NativeConn;
+pub fn tcp_has_data(handle: *mut ()) -> bool {
+    let c = handle as *mut NativeConn;
     unsafe {
         if c.is_null() || (*c).closed { return false; }
         (*c).has_pending_data
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn uni_tcp_recv(conn: *mut (), buf: *mut u8, max_len: usize) -> usize {
-    let c = conn as *mut NativeConn;
+pub fn tcp_recv(handle: *mut (), buf: &mut [u8]) -> usize {
+    let c = handle as *mut NativeConn;
     unsafe {
         if c.is_null() || (*c).fd < 0 || (*c).closed { return 0; }
-        let n = recv((*c).fd, buf, max_len, 0);
+        let n = recv((*c).fd, buf.as_mut_ptr(), buf.len(), 0);
         if n < 0 {
             (*c).has_pending_data = false;
             return 0;
@@ -372,33 +358,29 @@ pub extern "C" fn uni_tcp_recv(conn: *mut (), buf: *mut u8, max_len: usize) -> u
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn uni_tcp_send(conn: *mut (), data: *const u8, len: usize) -> i32 {
-    let c = conn as *mut NativeConn;
+pub fn tcp_send(handle: *mut (), data: &[u8]) -> i32 {
+    let c = handle as *mut NativeConn;
     unsafe {
         if c.is_null() || (*c).fd < 0 || (*c).closed { return -1; }
-        let sent = send((*c).fd, data, len, MSG_NOSIGNAL);
+        let sent = send((*c).fd, data.as_ptr(), data.len(), MSG_NOSIGNAL);
         if sent < 0 { -1 } else { sent as i32 }
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn uni_tcp_close(conn: *mut ()) {
-    let c = conn as *mut NativeConn;
+pub fn tcp_close(handle: *mut ()) {
+    let c = handle as *mut NativeConn;
     unsafe {
         if c.is_null() { return; }
         release_conn(c);
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn uni_tcp_is_closed(conn: *mut ()) -> bool {
-    let c = conn as *mut NativeConn;
+pub fn tcp_is_closed(handle: *mut ()) -> bool {
+    let c = handle as *mut NativeConn;
     unsafe { c.is_null() || (*c).closed }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn uni_tcp_poll() {
+pub fn tcp_poll() {
     unsafe {
         let mut fds = [PollFd { fd: 0, events: 0, revents: 0 }; CONN_POOL_SIZE];
         let mut map = [ptr::null_mut::<NativeConn>(); CONN_POOL_SIZE];

@@ -1,7 +1,6 @@
-// uni/ffi.rs — Unikernel backend: lifecycle/config functions for Rust HTTP server
+// uni/unikernel.rs — Unikernel backend: lifecycle/config functions
 //
-// Provides the same uni_* extern "C" symbols that http.rs calls.
-// Replaces the C++ uni/ffi.cc — calls kernel/driver Rust functions directly.
+// Called directly from uni/api.rs via Rust crate deps.
 
 #![no_std]
 #![allow(static_mut_refs)]
@@ -12,25 +11,21 @@ extern crate drivers;
 
 // ---- Lifecycle / config -------------------------------------------------------
 
-#[unsafe(no_mangle)]
-pub extern "C" fn uni_log(msg: *const u8) {
-    unsafe { kernel_serial::serial_puts(msg) }
+pub fn log(msg: &[u8]) {
+    unsafe { kernel_serial::serial_puts(msg.as_ptr()) }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn uni_config_port(default_port: u16) -> u16 {
+pub fn config_port(default_port: u16) -> u16 {
     default_port
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn uni_check_shutdown() -> bool {
+pub fn check_shutdown() -> bool {
     unsafe { kernel_serial::serial_check_shutdown() }
 }
 
 // ---- Wait for events (arch-specific idle) -------------------------------------
 
-#[unsafe(no_mangle)]
-pub extern "C" fn uni_wait_for_events() {
+pub fn wait_for_events() {
     if drivers::driver_virtio_net_irq_idle_supported() {
         unsafe { arch_mask_irq() };
         drivers::driver_virtio_net_arm_rx_interrupts();
@@ -86,8 +81,6 @@ unsafe fn arch_unmask_irq() {
 #[cfg(target_arch = "aarch64")]
 #[inline]
 unsafe fn arch_idle() {
-    // Arm a one-shot ~100ms virtual timer so WFI wakes periodically
-    // for serial input checking (Ctrl-C).
     let freq: u64;
     core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq);
     let tval = if freq / 10 == 0 { 1u64 } else { freq / 10 };
