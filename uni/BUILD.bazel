@@ -6,6 +6,7 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "uni",
     srcs = ["lib.rs", "unikernel.rs", "native.rs", "http.rs"],
+    proc_macro_deps = ["//uni/macros:uni_macros"],
     deps = select({
         "//bazel/platforms:native": [],
         "//conditions:default": ["//kernel", "//drivers", "//net"],

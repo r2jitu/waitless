@@ -1,7 +1,6 @@
 // UniKernel Example: HTTP Web Server
 //
-// Pure application logic — no platform boilerplate. The unikernel_binary()
-// macro handles panic handlers, entry points, and platform selection.
+// Pure application logic. #[uni::main] handles the platform entry point.
 
 #![no_std]
 
@@ -67,8 +66,8 @@ fn handle_request(req: &Request) -> Response {
 
 // ---- Application entry point ------------------------------------------------
 
-#[unsafe(no_mangle)]
-pub extern "C" fn uni_main() -> i32 {
+#[uni::main]
+fn main() -> i32 {
     uni::log(b"Starting Rust HTTP server...\n");
     let port = uni::config_port(80);
 
@@ -78,6 +77,6 @@ pub extern "C" fn uni_main() -> i32 {
 
     uni::log(b"Routes registered. Entering event loop.\n");
     server.run(port);
-    uni::log(b"[uni_main] server.run() returned -- shutting down\n");
+    uni::log(b"server.run() returned -- shutting down\n");
     0
 }

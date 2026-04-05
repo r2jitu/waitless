@@ -10,6 +10,9 @@
 #![allow(static_mut_refs)]
 #![allow(unsafe_op_in_unsafe_fn)]
 
+// Re-export the #[uni::main] proc macro.
+pub use uni_macros::main;
+
 #[cfg(platform_unikernel)]
 extern crate kernel;
 #[cfg(platform_unikernel)]
