@@ -158,24 +158,32 @@ cc_library(
     }),
 )
 
+# Limine boot entry point (Rust): declares Limine requests in
+# .limine_requests section and calls kernel_boot_from_bootinfo.
+rust_static_library(
+    name = "limine_entry_rs",
+    srcs = ["limine_entry.rs"],
+    crate_name = "limine_entry",
+    edition = "2024",
+    rustc_flags = ["-C", "panic=abort"] + select({
+        "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
+        "//conditions:default": [],
+    }),
+)
+
+# x86_64 SSE enable stub (ASM) — called before Rust limine_entry_cpp().
 cc_library(
-    name = "limine_proto",
-    hdrs = ["limine.h"],
-    copts = ["-I."],
+    name = "limine_boot_asm",
+    srcs = select({
+        "//bazel/platforms:x86_64": ["x86_64/limine_boot.S"],
+        "//conditions:default": [],
+    }),
 )
 
 cc_library(
     name = "limine_entry",
-    srcs = ["limine_entry.cc"] + select({
-        "//bazel/platforms:x86_64": ["x86_64/limine_boot.S"],
-        "//conditions:default": [],
-    }),
-    deps = [":boot_info", ":limine_proto", ":fdt"] + select({
-        "//bazel/platforms:aarch64": [":mmu"],
-        "//conditions:default": [],
-    }),
+    deps = [":limine_entry_rs", ":limine_boot_asm"],
     alwayslink = True,  # Limine requests must not be stripped by linker
-    copts = ["-I."],
 )
 
 rust_static_library(
