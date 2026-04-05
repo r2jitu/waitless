@@ -23,6 +23,8 @@ mod unikernel;
 #[cfg(platform_native)]
 pub mod native;
 
+pub mod http;
+
 // ---- Backend dispatch --------------------------------------------------------
 
 #[cfg(platform_unikernel)]

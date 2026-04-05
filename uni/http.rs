@@ -1,16 +1,12 @@
-// net/http.rs — HTTP/1.1 server library (pure Rust, no_std)
+// uni/http.rs — HTTP/1.1 server library (pure Rust, no_std)
 //
-// Direct translation of net/http.cc. Non-blocking cooperative model:
-// Server::run() polls the network stack, accepts connections, reads data,
-// parses HTTP requests, dispatches to handlers, and sends responses.
+// Non-blocking cooperative model: Server::run() polls the network stack,
+// accepts connections, reads data, parses HTTP requests, dispatches to
+// handlers, and sends responses.
 //
 // All buffers are fixed-size, stack/static allocated. No heap.
 
-#![no_std]
-
-extern crate uni;
-
-use uni::{TcpListener, TcpStream};
+use crate::{TcpListener, TcpStream};
 
 // ---- HTTP types -------------------------------------------------------------
 
@@ -224,7 +220,7 @@ impl Server {
     /// Register an exact-path handler.
     pub fn route(&mut self, path: &[u8], handler: Handler) {
         if self.route_count >= MAX_ROUTES {
-            uni::log(b"http: too many routes\n");
+            crate::log(b"http: too many routes\n");
             return;
         }
         let r = &mut self.routes[self.route_count];
@@ -245,19 +241,19 @@ impl Server {
         let listener = match TcpListener::bind(port) {
             Some(l) => l,
             None => {
-                uni::log(b"http: failed to create TCP listener\n");
+                crate::log(b"http: failed to create TCP listener\n");
                 return;
             }
         };
 
-        uni::log(b"http: listening\n");
+        crate::log(b"http: listening\n");
 
         loop {
-            if uni::check_shutdown() {
-                uni::log(b"http: shutdown requested\n");
+            if crate::check_shutdown() {
+                crate::log(b"http: shutdown requested\n");
                 break;
             }
-            uni::tcp_poll();
+            crate::tcp_poll();
 
             let mut had_work = false;
 
@@ -267,7 +263,7 @@ impl Server {
                 if let Some(ac) = self.alloc_active() {
                     ac.conn = Some(stream);
                 } else {
-                    uni::log(b"http: too many connections, dropping\n");
+                    crate::log(b"http: too many connections, dropping\n");
                     stream.close();
                     break;
                 }
@@ -338,7 +334,7 @@ impl Server {
             }
 
             if !had_work {
-                uni::wait_for_events();
+                crate::wait_for_events();
             }
         }
 
@@ -350,7 +346,7 @@ impl Server {
             }
         }
         listener.close();
-        uni::log(b"http: server stopped\n");
+        crate::log(b"http: server stopped\n");
     }
 
     fn alloc_active(&mut self) -> Option<&mut ActiveConn> {

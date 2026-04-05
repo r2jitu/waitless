@@ -6,7 +6,7 @@ package(default_visibility = ["//visibility:public"])
 unikernel_binary(
     name = "webserver",
     app_srcs = ["main.rs"],
-    app_deps = ["//net:http", "//uni"],
+    app_deps = ["//uni"],
 )
 
 # Friendly alias: bazel run //apps/webserver  (or :run)

@@ -6,15 +6,8 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "stack",
     srcs = ["lib.rs", "types.rs", "ethernet.rs", "arp.rs", "ipv4.rs", "tcp.rs", "dhcp.rs"],
-    crate_name = "net_stack",  # extern crate net_stack in entry.rs, uni/lib.rs
+    crate_name = "net_stack",
     crate_root = "lib.rs",
     deps = ["//kernel", "//drivers"],
-    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
-)
-
-rust_library(
-    name = "http",
-    srcs = ["http.rs"],
-    deps = ["//uni"],
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
 )

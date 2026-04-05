@@ -7,9 +7,9 @@
 #![no_main]
 
 use core::panic::PanicInfo;
-use http::{Request, Response, Server};
 
 extern crate uni;
+use uni::http::{Request, Response, Server};
 
 // ---- Panic handler ----------------------------------------------------------
 
