@@ -1,6 +1,39 @@
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_rust//rust:defs.bzl", "rust_static_library")
 
 package(default_visibility = ["//visibility:public"])
+
+# Rust device drivers: PCI, VirtIO PCI, Virtqueue, VirtIO-net.
+# Exports driver_* extern "C" symbols consumed by drivers_ffi (for kernel calls)
+# and by entry.cc / net_ffi.cc / uni/ffi.cc.
+rust_static_library(
+    name = "drivers_rs",
+    srcs = ["drivers.rs"],
+    crate_name = "drivers",
+    edition = "2024",
+    rustc_flags = ["-C", "panic=abort"] + select({
+        "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
+        "//conditions:default": [],
+    }),
+)
+
+# C FFI bridge: exposes kernel functions to the Rust driver crate.
+cc_library(
+    name = "drivers_ffi",
+    srcs = ["drivers_ffi.cc"],
+    deps = [
+        "//kernel:core",
+        "//kernel:arch_h",
+        "//kernel:arch_init",
+    ] + select({
+        "//bazel/platforms:aarch64": [
+            "//kernel:fdt",
+            "//kernel:mmu",
+        ],
+        "//conditions:default": [],
+    }),
+    copts = ["-I."],
+)
 
 cc_library(
     name = "pci",
@@ -25,30 +58,6 @@ cc_library(
         "//bazel/platforms:aarch64": ["//kernel:mmu"],
         "//conditions:default": [],
     }),
-    copts = ["-I."],
-)
-
-cc_library(
-    name = "virtio",
-    srcs = ["virtio.cc"],
-    hdrs = ["virtio.h"],
-    deps = [
-        "//kernel:core",
-        ":pci",
-    ],
-    copts = ["-I."],
-)
-
-cc_library(
-    name = "virtio_net",
-    srcs = ["virtio_net.cc"],
-    hdrs = ["virtio_net.h"],
-    deps = [
-        ":virtio",
-        ":virtio_pci",
-        "//kernel:fdt",
-        "//kernel:arch_init",
-    ],
     copts = ["-I."],
 )
 

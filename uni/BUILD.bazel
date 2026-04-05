@@ -4,13 +4,12 @@ package(default_visibility = ["//visibility:public"])
 
 # ---- Unikernel backend (extern "C" FFI for Rust) ----------------------------
 # Provides uni_* lifecycle/config symbols by calling kernel/serial, kernel/arch,
-# drivers/virtio_net. TCP symbols are provided by the Rust net stack.
+# and Rust driver functions (via extern "C" declarations).
 
 cc_library(
     name = "ffi",
     srcs = ["ffi.cc"],
     deps = [
-        "//drivers:virtio_net",
         "//kernel:arch_h",
         "//kernel:core",
     ],

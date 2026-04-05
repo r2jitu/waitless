@@ -156,8 +156,6 @@ cc_library(
         ":arch_init",
         ":fdt",
         ":limine_entry",
-        "//drivers:pci",
-        "//drivers:virtio_net",
     ] + select({
         "//bazel/platforms:aarch64": [":mmu"],
         "//conditions:default": [],

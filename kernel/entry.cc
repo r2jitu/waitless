@@ -8,8 +8,6 @@
 // Every driver/network call from this point is a direct in-process function
 // call — no syscalls, no mode switches, no kernel/user copies.
 
-#include "drivers/pci.h"
-#include "drivers/virtio_net.h"
 #include "kernel/arch.h"
 #include "kernel/boot_info.h"
 #include "kernel/boot_shim.h"
@@ -17,6 +15,12 @@
 #include "kernel/panic.h"
 #include "kernel/serial.h"
 // C++ net headers no longer needed — DHCP/TCP init done via Rust FFI
+
+// Rust driver functions (drivers/drivers.rs via drivers_ffi.cc)
+extern "C" void driver_pci_init();
+extern "C" bool driver_virtio_net_init();
+extern "C" void driver_virtio_net_get_mac(uint8_t *mac_out);
+extern "C" void driver_virtio_net_enable_irq();
 
 // Rust net stack functions (net/stack.rs)
 extern "C" bool net_dhcp_discover();
@@ -111,26 +115,16 @@ static void kernel_boot(boot::BootInfo *info) {
 
   call_global_constructors();
 
-#if defined(__aarch64__)
-  // On ARM64, PCI may have been scanned early (for PCI console).
-  // pci::init() is idempotent — safe to call even if already scanned.
-  {
-    const fdt::Info &fdt = fdt::info();
-    if (fdt.pcie_ecam_base != 0) {
-      serial::printf("[INIT] PCI bus scan...\n");
-      pci::init();
-    }
-  }
-#else
-  serial::printf("[INIT] PCI bus scan...\n");
-  pci::init();
-#endif
-  serial::printf("[INIT] Virtio-net driver...\n");
-  bool net_ok = virtio_net::init();
+  serial::printf("[INIT] PCI bus scan (Rust)...\n");
+  driver_pci_init();
+
+  serial::printf("[INIT] Virtio-net driver (Rust)...\n");
+  bool net_ok = driver_virtio_net_init();
   if (!net_ok) {
     serial::printf("       [WARN] No virtio-net device found.\n");
   } else {
-    const uint8_t *mac = virtio_net::get_mac();
+    uint8_t mac[6];
+    driver_virtio_net_get_mac(mac);
     serial::printf("       MAC: %02x:%02x:%02x:%02x:%02x:%02x\n", mac[0],
                    mac[1], mac[2], mac[3], mac[4], mac[5]);
 
@@ -151,7 +145,7 @@ static void kernel_boot(boot::BootInfo *info) {
     net_tcp_init();
 
     serial::printf("[INIT] Interrupt-driven idle...\n");
-    virtio_net::enable_irq();
+    driver_virtio_net_enable_irq();
 #if defined(__aarch64__)
     // Enable the virtual timer PPI (INTID 27) in the GIC so that the 100ms
     // one-shot timer inside arch::idle() can wake WFI.  On GICv2 (QEMU) all

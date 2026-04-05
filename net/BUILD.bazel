@@ -17,14 +17,15 @@ rust_static_library(
 )
 
 # C FFI bridge: extern "C" wrappers for kernel/driver functions
-# that the Rust net stack calls (serial, mm, virtio_net, arch).
+# that the Rust net stack calls (serial, mm, arch).
+# virtio-net driver functions are now extern "C" declarations
+# resolved at link time from drivers:drivers_rs.
 cc_library(
     name = "net_ffi",
     srcs = ["net_ffi.cc"],
     deps = [
         "//kernel:core",
         "//kernel:arch_h",
-        "//drivers:virtio_net",
     ],
     copts = ["-I."],
 )

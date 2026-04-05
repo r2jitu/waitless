@@ -2,12 +2,16 @@
 //
 // Provides extern "C" access to kernel and driver functions that the
 // Rust network stack needs: serial output, memory allocation,
-// virtio-net, and architecture-specific timing.
+// virtio-net (via Rust driver), and architecture-specific timing.
 
 #include "kernel/serial.h"
 #include "kernel/mm.h"
 #include "kernel/arch.h"
-#include "drivers/virtio_net.h"
+
+// Rust driver functions (drivers/drivers.rs)
+extern "C" void driver_virtio_net_get_mac(uint8_t *mac_out);
+extern "C" void driver_virtio_net_send(const void *data, uint32_t len);
+extern "C" int32_t driver_virtio_net_poll(void (*callback)(const uint8_t *, uint32_t));
 
 extern "C" {
 
@@ -21,23 +25,20 @@ void *net_kmalloc(size_t size) { return mm::kmalloc(size); }
 
 void net_kfree(void *ptr) { mm::kfree(ptr); }
 
-// ---- Virtio-net driver ------------------------------------------------------
+// ---- Virtio-net driver (delegates to Rust) ----------------------------------
 
 void net_virtio_get_mac(uint8_t *mac_out) {
-  const uint8_t *mac = virtio_net::get_mac();
-  for (int i = 0; i < 6; i++)
-    mac_out[i] = mac[i];
+  driver_virtio_net_get_mac(mac_out);
 }
 
 void net_virtio_send(const void *data, uint32_t len) {
-  virtio_net::send(data, len);
+  driver_virtio_net_send(data, len);
 }
 
-// Callback type: void(*)(const uint8_t* data, uint32_t len)
 using PollCallback = void (*)(const uint8_t *, uint32_t);
 
 void net_virtio_poll(PollCallback callback) {
-  virtio_net::poll(callback);
+  driver_virtio_net_poll(callback);
 }
 
 // ---- Architecture -----------------------------------------------------------
