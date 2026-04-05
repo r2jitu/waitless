@@ -6,4 +6,5 @@ exports_files([
     "run_qemu.sh",
     "run_iso.sh",
     "native_main.rs",
+    "unikernel_main.rs",
 ])

@@ -1,12 +1,27 @@
 """Build rules for unikernel images.
 
 Provides unikernel_binary() which links a Rust application library into
-bootable kernel images for local testing (QEMU, VZ) and cloud deployment.
+bootable kernel images using rustc + rust-lld (no C++ toolchain for linking).
 """
 
-load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_rust//rust:defs.bzl", "rust_binary")
 load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
+
+# Linker flags shared by all unikernel binaries.
+_LINK_FLAGS = [
+    "-C", "link-arg=--gc-sections",
+    "-C", "link-arg=--allow-multiple-definition",
+    "-C", "link-arg=-zmax-page-size=0x1000",
+    "-C", "link-arg=-znorelro",
+    "-C", "link-arg=-nostdlib",
+    "-C", "link-arg=--strip-debug",
+]
+
+_LINK_FLAGS_ARCH = select({
+    "//bazel/platforms:aarch64": ["-C", "link-arg=-pie", "-C", "link-arg=-znotext"],
+    "//conditions:default": ["-C", "link-arg=-static", "-C", "link-arg=--no-pie"],
+})
 
 def unikernel_binary(name, app, visibility = None):
     """Build a unikernel from a Rust application library.
@@ -24,17 +39,31 @@ def unikernel_binary(name, app, visibility = None):
 
     Args:
         name: Base name for all output targets.
-        app: A rust_library target (e.g. ":webserver").
+        app: A rust_library target (e.g. ":app").
         visibility: Bazel visibility specification.
     """
 
+    # Common deps for unikernel binaries (Rust static libs + linker scripts).
+    _unikernel_deps = [
+        app,
+        "//kernel:entry_rs",
+        "//kernel:limine_rs",
+        "//kernel:libc_rs",
+    ]
+
     # ---- Unikernel ELF ----
-    # The app's rust_library provides CcInfo (a .a with the uni_main symbol).
-    # cc_binary links it with the kernel entry + boot assembly.
-    cc_binary(
+    # rust_binary links via rustc → rust-lld. Assembly is included via
+    # global_asm!(include_str!(...)) in the Rust crates — no cc_library needed.
+    rust_binary(
         name = name + ".elf",
-        srcs = [],
-        deps = [app, "//kernel:entry"],
+        crate_name = name + "_elf",
+        srcs = ["//bazel/rules:unikernel_main.rs"],
+        deps = _unikernel_deps,
+        linker_script = select({
+            "//bazel/platforms:aarch64": "//bazel/toolchain:unikernel_arm64.ld",
+            "//conditions:default": "//bazel/toolchain:unikernel.ld",
+        }),
+        rustc_flags = UNIKERNEL_RUSTC_FLAGS + _LINK_FLAGS + _LINK_FLAGS_ARCH,
         visibility = visibility,
     )
 
@@ -63,7 +92,6 @@ def unikernel_binary(name, app, visibility = None):
     )
 
     # ---- Native POSIX binary ----
-    # Thin wrapper provides #[panic_handler]; app + uni linked as deps.
     rust_binary(
         name = name + "_native",
         srcs = ["//bazel/rules:native_main.rs"],
@@ -121,11 +149,18 @@ def unikernel_binary(name, app, visibility = None):
     )
 
     # ---- Higher-half ELF for Limine boot ----
-    cc_binary(
+    # Uses both the base linker script (via linker_script attr) and the
+    # supplemental Limine script (via -C link-arg=-T).
+    rust_binary(
         name = name + ".limine.elf",
-        srcs = [],
-        deps = [app, "//kernel:entry"],
-        linkopts = ["-Wl,-T,bazel/toolchain/unikernel_limine.ld"],
+        crate_name = name + "_limine_elf",
+        srcs = ["//bazel/rules:unikernel_main.rs"],
+        deps = _unikernel_deps,
+        data = ["//bazel/toolchain:unikernel_limine.ld"],
+        linker_script = "//bazel/toolchain:unikernel.ld",
+        rustc_flags = UNIKERNEL_RUSTC_FLAGS + _LINK_FLAGS + _LINK_FLAGS_ARCH + [
+            "-C", "link-arg=-T", "-C", "link-arg=bazel/toolchain/unikernel_limine.ld",
+        ],
         visibility = visibility,
     )
 

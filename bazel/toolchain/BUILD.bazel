@@ -1,4 +1,6 @@
 load(":cc_toolchain_config.bzl", "cc_toolchain_config")
+
+exports_files(["unikernel.ld", "unikernel_arm64.ld", "unikernel_limine.ld"])
 load("@rules_cc//cc/toolchains:cc_toolchain.bzl", "cc_toolchain")
 
 # Parameterised configs — one per target arch

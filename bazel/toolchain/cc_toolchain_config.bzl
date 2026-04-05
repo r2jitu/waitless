@@ -94,7 +94,6 @@ def _impl(ctx):
             "-D__UNIKERNEL__=1",
             "-D__aarch64__=1",
         ]
-        linker_script = "bazel/toolchain/unikernel_arm64.ld"
         toolchain_id  = "unikernel-aarch64-toolchain"
         target_system = "aarch64-linux-musl"
         target_cpu    = "aarch64"
@@ -109,7 +108,6 @@ def _impl(ctx):
             "-O2",
             "-g",
         ]
-        linker_script = None
         toolchain_id  = "aarch64-macos-toolchain"
         target_system = "aarch64-apple-darwin"
         target_cpu    = "aarch64"
@@ -132,7 +130,6 @@ def _impl(ctx):
             "-g",
             "-D__UNIKERNEL__=1",
         ]
-        linker_script = "bazel/toolchain/unikernel.ld"
         toolchain_id  = "unikernel-x86_64-toolchain"
         target_system = "x86_64-linux-musl"
         target_cpu    = "x86_64"
@@ -150,22 +147,13 @@ def _impl(ctx):
 
     if arch == "aarch64_macos":
         # Native macOS: clang driver defaults to Apple ld + system SDK.
-        # No special linker flags needed — just link the C++ runtime.
         link_flag_list = ["-lc++"]
     else:
-        link_flag_list = [
-            # --target must be present at link time too so
-            # clang drives ld.lld (ELF) not ld64.lld (MachO).
-            "--target=" + target_system,
-            "-fuse-ld=lld",
-            "-nostdlib",
-        ] + (["-pie", "-Wl,-z,notext"] if arch == "aarch64" else ["-static"]) + [
-            "-Wl,-z,norelro",
-            "-Wl,--allow-multiple-definition",
-            "-Wl,--gc-sections",
-            "-Wl,-z,max-page-size=0x1000",
-            "-Wl,-T," + linker_script,
-        ]
+        # Bare-metal: minimal link flags. rustc provides the full set via
+        # -C link-arg when linking rust_binary. The clang_wrapper.sh
+        # detects LLD-mode invocation (-flavor gnu) and dispatches to
+        # ld.lld directly.
+        link_flag_list = ["-nostdlib"]
 
     default_link_flags_feature = feature(
         name = "default_link_flags",

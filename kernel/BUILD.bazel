@@ -35,7 +35,6 @@ rust_static_library(
     }),
     deps = [":kernel", "//drivers", "//net", "//uni"],
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
-    visibility = ["//visibility:private"],
 )
 
 rust_static_library(
@@ -43,14 +42,12 @@ rust_static_library(
     srcs = ["limine_entry.rs"],
     deps = [":kernel"],
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
-    visibility = ["//visibility:private"],
 )
 
 rust_static_library(
     name = "libc_rs",
     srcs = ["libc.rs"],
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
-    visibility = ["//visibility:private"],
 )
 
 # Single target for unikernel.bzl — aggregates Rust + ASM.
@@ -73,7 +70,6 @@ cc_library(
         "//bazel/platforms:aarch64": ["aarch64/boot.S"],
         "//conditions:default": ["x86_64/boot.S"],
     }),
-    visibility = ["//visibility:private"],
 )
 
 cc_library(
@@ -83,7 +79,6 @@ cc_library(
         "//conditions:default": [],
     }),
     alwayslink = True,
-    visibility = ["//visibility:private"],
 )
 
 cc_library(
@@ -93,5 +88,4 @@ cc_library(
         "//conditions:default": [],
     }),
     alwayslink = True,
-    visibility = ["//visibility:private"],
 )
