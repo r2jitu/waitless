@@ -160,6 +160,8 @@ def _impl(ctx):
             "-fuse-ld=lld",
             "-nostdlib",
         ] + (["-pie", "-Wl,-z,notext"] if arch == "aarch64" else ["-static"]) + [
+            "-Wl,-z,norelro",
+            "-Wl,--allow-multiple-definition",
             "-Wl,-z,max-page-size=0x1000",
             "-Wl,-T," + linker_script,
         ]

@@ -16,8 +16,16 @@
 #include "kernel/mm.h"
 #include "kernel/panic.h"
 #include "kernel/serial.h"
-#include "net/dhcp.h"
-#include "net/tcp.h"
+// C++ net headers no longer needed — DHCP/TCP init done via Rust FFI
+
+// Rust net stack functions (net/stack.rs)
+extern "C" bool net_dhcp_discover();
+extern "C" void net_tcp_init();
+extern "C" void net_set_fallback_config(
+    uint8_t ip_a, uint8_t ip_b, uint8_t ip_c, uint8_t ip_d,
+    uint8_t mask_a, uint8_t mask_b, uint8_t mask_c, uint8_t mask_d,
+    uint8_t gw_a, uint8_t gw_b, uint8_t gw_c, uint8_t gw_d,
+    uint8_t dns_a, uint8_t dns_b, uint8_t dns_c, uint8_t dns_d);
 
 #if defined(__x86_64__)
 #include "kernel/x86_64/gdt.h"
@@ -126,20 +134,21 @@ static void kernel_boot(boot::BootInfo *info) {
     serial::printf("       MAC: %02x:%02x:%02x:%02x:%02x:%02x\n", mac[0],
                    mac[1], mac[2], mac[3], mac[4], mac[5]);
 
-    serial::printf("[INIT] DHCP...\n");
-    bool dhcp_ok = net::dhcp::discover();
+    serial::printf("[INIT] DHCP (Rust)...\n");
+    bool dhcp_ok = net_dhcp_discover();
     if (dhcp_ok) {
       serial::printf("       IP obtained successfully\n");
     } else {
       serial::printf("       [WARN] DHCP failed, using 10.0.2.15/24\n");
-      net::config.ip = net::Ipv4Addr::from(10, 0, 2, 15);
-      net::config.subnet_mask = net::Ipv4Addr::from(255, 255, 255, 0);
-      net::config.gateway = net::Ipv4Addr::from(10, 0, 2, 2);
-      net::config.dns = net::Ipv4Addr::from(10, 0, 2, 3);
+      net_set_fallback_config(
+          10, 0, 2, 15,     // IP
+          255, 255, 255, 0,  // subnet
+          10, 0, 2, 2,      // gateway
+          10, 0, 2, 3);     // DNS
     }
 
-    serial::printf("[INIT] TCP stack...\n");
-    net::tcp::init();
+    serial::printf("[INIT] TCP stack (Rust)...\n");
+    net_tcp_init();
 
     serial::printf("[INIT] Interrupt-driven idle...\n");
     virtio_net::enable_irq();

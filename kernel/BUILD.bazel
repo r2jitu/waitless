@@ -158,7 +158,6 @@ cc_library(
         ":limine_entry",
         "//drivers:pci",
         "//drivers:virtio_net",
-        "//net",
     ] + select({
         "//bazel/platforms:aarch64": [":mmu"],
         "//conditions:default": [],

@@ -1,46 +1,32 @@
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
-load("@rules_rust//rust:defs.bzl", "rust_library")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_static_library")
 
 package(default_visibility = ["//visibility:public"])
 
-# Pure networking types (byte-order helpers, IP/MAC addresses, checksums).
-# No hardware or kernel dependencies — can be compiled for the host toolchain.
-cc_library(
-    name = "types",
-    srcs = ["types.cc"],
-    hdrs = ["types.h"],
-    copts = ["-I.", "-Iinclude"],
+# Rust network stack: Ethernet, ARP, IPv4, TCP, DHCP.
+# Provides net_dhcp_discover, net_tcp_init, uni_tcp_* and net_set_fallback_config.
+rust_static_library(
+    name = "stack_rs",
+    srcs = ["stack.rs"],
+    crate_name = "net_stack",
+    edition = "2024",
+    rustc_flags = ["-C", "panic=abort"] + select({
+        "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
+        "//conditions:default": [],
+    }),
 )
 
-# Bare-metal network stack: Ethernet, ARP, IPv4, TCP, DHCP.
-# Depends on kernel/serial, kernel/mm, and the virtio-net driver.
-# Compiled only for unikernel targets.
+# C FFI bridge: extern "C" wrappers for kernel/driver functions
+# that the Rust net stack calls (serial, mm, virtio_net, arch).
 cc_library(
-    name = "stack",
-    srcs = [
-        "ethernet.cc",
-        "arp.cc",
-        "ipv4.cc",
-        "tcp.cc",
-        "dhcp.cc",
-    ],
-    hdrs = [
-        "types.h",
-        "ethernet.h",
-        "arp.h",
-        "ipv4.h",
-        "tcp.h",
-        "dhcp.h",
-    ],
+    name = "net_ffi",
+    srcs = ["net_ffi.cc"],
     deps = [
-        ":types",
         "//kernel:core",
+        "//kernel:arch_h",
         "//drivers:virtio_net",
     ],
-    copts = [
-        "-I.",
-        "-Iinclude",
-    ],
+    copts = ["-I."],
 )
 
 # HTTP/1.1 server (Rust): request parsing, routing, event loop.
@@ -55,13 +41,4 @@ rust_library(
         "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
         "//conditions:default": [],
     }),
-)
-
-# Convenience alias: the full network library (stack only — HTTP is now Rust).
-# Used by unikernel_binary() in bazel/rules/unikernel.bzl.
-cc_library(
-    name = "net",
-    deps = [
-        ":stack",
-    ],
 )

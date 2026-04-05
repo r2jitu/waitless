@@ -3,8 +3,8 @@ load("@rules_cc//cc:cc_library.bzl", "cc_library")
 package(default_visibility = ["//visibility:public"])
 
 # ---- Unikernel backend (extern "C" FFI for Rust) ----------------------------
-# Provides uni_* symbols by calling kernel/serial, kernel/arch,
-# drivers/virtio_net, and net/tcp directly. Linked into unikernel binaries.
+# Provides uni_* lifecycle/config symbols by calling kernel/serial, kernel/arch,
+# drivers/virtio_net. TCP symbols are provided by the Rust net stack.
 
 cc_library(
     name = "ffi",
@@ -13,7 +13,6 @@ cc_library(
         "//drivers:virtio_net",
         "//kernel:arch_h",
         "//kernel:core",
-        "//net:stack",
     ],
     copts = ["-I."],
 )
