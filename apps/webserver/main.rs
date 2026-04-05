@@ -6,23 +6,17 @@
 #![no_std]
 #![no_main]
 
-use core::panic::PanicInfo;
-
 extern crate uni;
 use uni::http::{Request, Response, Server};
 
-// ---- Panic handler ----------------------------------------------------------
-
+// Panic handler + eh_personality — only for the native rust_binary.
+// The unikernel rust_static_library gets these from kernel/entry.rs.
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    uni::log(b"PANIC: Rust webserver panicked!\n\0");
-    loop {
-        core::hint::spin_loop();
-    }
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    uni::log(b"PANIC: application panicked!\n");
+    loop { core::hint::spin_loop(); }
 }
 
-// Stub for macOS host core library (compiled with panic=unwind, references this symbol).
-// On bare-metal targets (panic=abort), core doesn't reference it.
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_eh_personality() {}
 
