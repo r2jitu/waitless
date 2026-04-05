@@ -4,13 +4,6 @@
 // for struct copies, array initialization, etc. On bare-metal targets
 // these must be provided as extern "C" symbols with standard C ABI.
 
-#![no_std]
-
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    loop { core::hint::spin_loop(); }
-}
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
     let mut i = 0;

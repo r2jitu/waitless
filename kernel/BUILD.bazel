@@ -21,16 +21,18 @@ rust_library(
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
 )
 
+# Kernel entry point + limine boot + memory intrinsics.
+# Single rust_static_library — one panic handler, one link unit.
 rust_static_library(
-    name = "libc",
-    srcs = ["libc.rs"],
+    name = "entry",
+    srcs = ["entry.rs", "libc.rs", "limine_entry.rs"],
+    deps = [
+        ":kernel",
+        "//drivers",
+        "//net:stack",
+        "//uni",
+    ],
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
-)
-
-cc_library(
-    name = "libc_cc",
-    deps = [":libc"],
-    alwayslink = True,
 )
 
 cc_library(
@@ -42,25 +44,12 @@ cc_library(
     }),
 )
 
-rust_static_library(
-    name = "limine",
-    srcs = ["limine_entry.rs"],
-    deps = [":kernel"],
-    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
-)
-
 cc_library(
     name = "limine_boot_asm",
     srcs = select({
         "//bazel/platforms:x86_64": ["x86_64/limine_boot.S"],
         "//conditions:default": [],
     }),
-)
-
-cc_library(
-    name = "limine_cc",
-    deps = [":limine", ":limine_boot_asm"],
-    alwayslink = True,
 )
 
 cc_library(
@@ -72,24 +61,10 @@ cc_library(
     alwayslink = True,
 )
 
-rust_static_library(
-    name = "entry",
-    srcs = ["entry.rs"],
-    deps = [
-        ":kernel",
-        "//drivers",
-        "//net:stack",
-        "//uni",
-    ],
-    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
-)
-
-# Assembly + intrinsics aggregate (linked by cc_binary in unikernel.bzl)
+# Assembly + Rust entry aggregate (linked by cc_binary in unikernel.bzl).
+# alwayslink ensures Limine request sections and memcpy aren't stripped.
 cc_library(
     name = "entry_asm",
-    deps = [
-        ":limine_cc",
-        ":idt_stubs",
-        ":libc_cc",
-    ],
+    deps = [":limine_boot_asm", ":idt_stubs"],
+    alwayslink = True,
 )
