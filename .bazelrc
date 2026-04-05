@@ -1,6 +1,10 @@
 # ── Global ────────────────────────────────────────────────────────────────────
 build --action_env=PATH
 
+# Rust compiler flags applied to all crates (panic=abort for no_std,
+# opt-level=2 to match the C++ -O2 in the bare-metal toolchain).
+build --@rules_rust//:extra_rustc_flags=-Cpanic=abort,-Copt-level=2
+
 # ── Shorthand configs ─────────────────────────────────────────────────────────
 # --config=vz   → ARM64 unikernel, VZ.framework (macOS arm64)
 build:vz   --platforms=//bazel/platforms:aarch64_unikernel

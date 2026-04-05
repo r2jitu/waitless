@@ -1,5 +1,6 @@
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_static_library")
+load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -19,11 +20,7 @@ rust_library(
         "//conditions:default": [],
     }),
     crate_name = "kernel",
-    edition = "2024",
-    rustc_flags = ["-C", "panic=abort", "-C", "opt-level=2"] + select({
-        "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
-        "//conditions:default": [],
-    }),
+    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
 )
 
 # Compiler-required memory intrinsics (memcpy, memset, etc.)
@@ -31,18 +28,13 @@ rust_static_library(
     name = "libc_rs",
     srcs = ["libc.rs"],
     crate_name = "kernel_libc",
-    edition = "2024",
-    rustc_flags = ["-C", "panic=abort", "-C", "opt-level=2"] + select({
-        "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
-        "//conditions:default": [],
-    }),
+    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
 )
 
-# Wrap libc_rs as cc_library for linking into cc_binary
 cc_library(
     name = "libc",
     deps = [":libc_rs"],
-    alwayslink = True,  # memcpy etc. must not be stripped
+    alwayslink = True,
 )
 
 cc_library(
@@ -54,21 +46,14 @@ cc_library(
     }),
 )
 
-# Limine boot entry point (Rust): declares Limine requests in
-# .limine_requests section and calls kernel_boot_from_bootinfo.
 rust_static_library(
     name = "limine_entry_rs",
     srcs = ["limine_entry.rs"],
     crate_name = "limine_entry",
-    edition = "2024",
     deps = [":kernel_rs"],
-    rustc_flags = ["-C", "panic=abort", "-C", "opt-level=2"] + select({
-        "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
-        "//conditions:default": [],
-    }),
+    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
 )
 
-# x86_64 SSE enable stub (ASM) — called before Rust limine_entry_cpp().
 cc_library(
     name = "limine_boot_asm",
     srcs = select({
@@ -80,34 +65,29 @@ cc_library(
 cc_library(
     name = "limine_entry",
     deps = [":limine_entry_rs", ":limine_boot_asm"],
-    alwayslink = True,  # Limine requests must not be stripped by linker
+    alwayslink = True,
 )
 
-# ISR stub assembly — provides isr_stub_table and isr_common.
 cc_library(
     name = "idt_stubs",
     srcs = select({
         "//bazel/platforms:x86_64": ["x86_64/idt_stubs.S"],
         "//conditions:default": [],
     }),
-    alwayslink = True,  # ISR stubs must not be stripped
+    alwayslink = True,
 )
 
 rust_static_library(
     name = "entry_rs",
     srcs = ["entry.rs"],
     crate_name = "kernel_entry",
-    edition = "2024",
     deps = [
         ":kernel_rs",
         "//drivers:drivers_rs",
         "//net:stack_rs",
         "//uni:uni",
     ],
-    rustc_flags = ["-C", "panic=abort", "-C", "opt-level=2"] + select({
-        "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
-        "//conditions:default": [],
-    }),
+    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
 )
 
 cc_library(

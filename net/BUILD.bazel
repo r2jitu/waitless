@@ -1,45 +1,23 @@
 load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 
 package(default_visibility = ["//visibility:public"])
 
-# Rust network stack: Ethernet, ARP, IPv4, TCP, DHCP.
-# Linked as rust_library — depends on kernel and driver crates directly.
-# The #[no_mangle] extern "C" exports (uni_tcp_*, tcp_init, etc.)
-# are available for C++ linking when included transitively via entry_rs.
+# Network stack: Ethernet, ARP, IPv4, TCP, DHCP.
 rust_library(
     name = "stack_rs",
-    srcs = [
-        "lib.rs",
-        "types.rs",
-        "ethernet.rs",
-        "arp.rs",
-        "ipv4.rs",
-        "tcp.rs",
-        "dhcp.rs",
-    ],
-    crate_root = "lib.rs",
+    srcs = ["lib.rs", "types.rs", "ethernet.rs", "arp.rs", "ipv4.rs", "tcp.rs", "dhcp.rs"],
     crate_name = "net_stack",
-    edition = "2024",
-    deps = [
-        "//kernel:kernel_rs",
-        "//drivers:drivers_rs",
-    ],
-    rustc_flags = ["-C", "panic=abort", "-C", "opt-level=2"] + select({
-        "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
-        "//conditions:default": [],
-    }),
+    crate_root = "lib.rs",
+    deps = ["//kernel:kernel_rs", "//drivers:drivers_rs"],
+    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
 )
 
-# HTTP/1.1 server (Rust): request parsing, routing, event loop.
-# Uses the uni:: platform API for TCP, logging, and shutdown.
+# HTTP/1.1 server: request parsing, routing, event loop.
 rust_library(
     name = "http_rs",
     srcs = ["http.rs"],
     crate_name = "http",
-    edition = "2024",
     deps = ["//uni"],
-    rustc_flags = ["-C", "panic=abort", "-C", "opt-level=2"] + select({
-        "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
-        "//conditions:default": [],
-    }),
+    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
 )

@@ -1,25 +1,13 @@
 load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 
 package(default_visibility = ["//visibility:public"])
 
-# Rust device drivers: PCI, VirtIO PCI, Virtqueue, VirtIO-net, VirtIO-console.
 rust_library(
     name = "drivers_rs",
-    srcs = [
-        "lib.rs",
-        "pci.rs",
-        "virtio.rs",
-        "virtio_net.rs",
-        "virtio_console.rs",
-    ],
+    srcs = ["lib.rs", "pci.rs", "virtio.rs", "virtio_net.rs", "virtio_console.rs"],
     crate_name = "drivers",
     crate_root = "lib.rs",
-    edition = "2024",
-    deps = [
-        "//kernel:kernel_rs",
-    ],
-    rustc_flags = ["-C", "panic=abort", "-C", "opt-level=2"] + select({
-        "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
-        "//conditions:default": [],
-    }),
+    deps = ["//kernel:kernel_rs"],
+    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
 )

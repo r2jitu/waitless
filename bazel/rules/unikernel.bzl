@@ -8,6 +8,7 @@ produces bootable images for local testing (QEMU, VZ) and cloud deployment
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_static_library")
 load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 
 def unikernel_binary(name, app_srcs, app_deps = [], visibility = None):
     """Build a unikernel ELF binary from Rust application sources.
@@ -27,22 +28,13 @@ def unikernel_binary(name, app_srcs, app_deps = [], visibility = None):
         visibility: Bazel visibility specification.
     """
 
-    # Common rustc flags for the application crate.
-    common_rustc_flags = ["-C", "panic=abort", "-C", "opt-level=2"]
-    unikernel_rustc_flags = common_rustc_flags + select({
-        "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
-        "//conditions:default": [],
-    })
-
     # ---- Unikernel ELF (cc_binary links Rust static lib + ASM) ----
 
-    # Compile app as rust_static_library for linking into cc_binary.
     rust_static_library(
         name = name + "_rs",
         srcs = app_srcs,
-        edition = "2024",
         deps = app_deps,
-        rustc_flags = unikernel_rustc_flags,
+        rustc_flags = UNIKERNEL_RUSTC_FLAGS,
         visibility = ["//visibility:private"],
     )
 
@@ -87,9 +79,8 @@ def unikernel_binary(name, app_srcs, app_deps = [], visibility = None):
     rust_binary(
         name = name + "_native",
         srcs = app_srcs,
-        edition = "2024",
         deps = app_deps,
-        rustc_flags = common_rustc_flags + select({
+        rustc_flags = select({
             # no_std crates need explicit system library linking
             "@platforms//os:macos": ["-C", "link-arg=-lSystem"],
             "//conditions:default": ["-C", "link-arg=-lc", "-C", "link-arg=-lpthread"],
