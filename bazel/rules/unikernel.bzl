@@ -46,9 +46,9 @@ def unikernel_binary(name, app, visibility = None):
     # Common deps for unikernel binaries (Rust static libs + linker scripts).
     _unikernel_deps = [
         app,
-        "//kernel:entry_rs",
-        "//kernel:limine_rs",
-        "//kernel:libc_rs",
+        "//kernel:entry",
+        "//kernel:limine",
+        "//kernel:libc",
     ]
 
     # ---- Unikernel ELF ----
