@@ -31,10 +31,8 @@ use kernel_types::{BootInfo, MemoryRegion, Protocol, MEM_AVAILABLE, MEM_RESERVED
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    unsafe {
-        kernel_serial::serial_puts(b"PANIC in entry\n\0".as_ptr());
-        arch_shutdown()
-    }
+    kernel_serial::serial_puts(b"PANIC in entry\n");
+    unsafe { arch_shutdown() }
 }
 
 #[unsafe(no_mangle)]
@@ -95,9 +93,9 @@ fn klog(args: core::fmt::Arguments) {
         fn write_str(&mut self, s: &str) -> core::fmt::Result {
             for b in s.bytes() {
                 if b == b'\n' {
-                    unsafe { kernel_serial::serial_putc(b'\r') };
+                    kernel_serial::serial_putc(b'\r');
                 }
-                unsafe { kernel_serial::serial_putc(b) };
+                kernel_serial::serial_putc(b);
             }
             Ok(())
         }
@@ -484,7 +482,7 @@ pub unsafe extern "C" fn kernel_main(boot_info_addr: u64) {
     kernel_boot(&G_BOOT_INFO);
 }
 
-/// Entry from Limine bootloader (BSS already zeroed, FDT/ECAM handled by limine_entry.cc).
+/// Entry from Limine bootloader (BSS already zeroed, FDT/ECAM handled by limine_entry.rs).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kernel_boot_from_bootinfo(info: *const BootInfo) {
     kernel_boot(&*info);

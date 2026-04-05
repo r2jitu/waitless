@@ -8,6 +8,9 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 #[cfg(target_arch = "x86_64")]
+extern crate kernel_serial;
+
+#[cfg(target_arch = "x86_64")]
 pub mod gdt;
 
 #[cfg(target_arch = "x86_64")]

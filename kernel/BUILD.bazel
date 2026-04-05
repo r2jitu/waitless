@@ -140,6 +140,7 @@ rust_library(
     }),
     crate_name = "x86_init",
     edition = "2024",
+    deps = [":serial_rs"],
     rustc_flags = ["-C", "panic=abort", "-C", "opt-level=2"],
 )
 

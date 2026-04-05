@@ -156,7 +156,7 @@ mod aarch64 {
             klog!("    x0  = 0x{:x}  x1  = 0x{:x}\n", frame.x[0], frame.x[1]);
 
             // Halt — unrecoverable
-            kernel_serial::serial_puts(b"\nSystem halted.\n\0".as_ptr());
+            kernel_serial::serial_puts(b"\nSystem halted.\n");
             loop {
                 asm!("wfe", options(nomem, nostack));
             }
@@ -278,7 +278,7 @@ mod aarch64 {
         } else if GIC_VERSION == 2 {
             init_gicv2();
         } else {
-            kernel_serial::serial_puts(b"       GIC init skipped (no GIC in DTB)\n\0".as_ptr());
+            kernel_serial::serial_puts(b"       GIC init skipped (no GIC in DTB)\n");
         }
     }
 

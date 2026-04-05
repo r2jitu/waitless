@@ -12,7 +12,7 @@ extern crate drivers;
 // ---- Lifecycle / config -------------------------------------------------------
 
 pub fn log(msg: &[u8]) {
-    unsafe { kernel_serial::serial_puts(msg.as_ptr()) }
+    kernel_serial::serial_puts(msg)
 }
 
 pub fn config_port(default_port: u16) -> u16 {
@@ -20,7 +20,7 @@ pub fn config_port(default_port: u16) -> u16 {
 }
 
 pub fn check_shutdown() -> bool {
-    unsafe { kernel_serial::serial_check_shutdown() }
+    kernel_serial::serial_check_shutdown()
 }
 
 // ---- Wait for events (arch-specific idle) -------------------------------------

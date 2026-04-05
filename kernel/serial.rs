@@ -10,9 +10,7 @@
 //     - Falls back to no-op if nothing found.
 //
 // Provides a core::fmt::Write implementation (SerialWriter) for formatted
-// Rust output. C++ callers use serial_putc/serial_puts via thin wrappers
-// in serial.h; serial::printf remains in C++ (serial_printf.cc) until all
-// C++ callers are migrated.
+// Rust output, plus serial_puts() for byte-slice logging.
 
 #![no_std]
 #![allow(unsafe_op_in_unsafe_fn)]
@@ -210,82 +208,79 @@ mod aarch64 {
 
 static mut SHUTDOWN_REQUESTED: bool = false;
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn serial_init() {
-    #[cfg(target_arch = "x86_64")]
-    x86::init();
-    #[cfg(target_arch = "aarch64")]
-    aarch64::init();
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn serial_putc(c: u8) {
-    #[cfg(target_arch = "x86_64")]
-    x86::putc(c);
-    #[cfg(target_arch = "aarch64")]
-    aarch64::putc(c);
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn serial_puts(s: *const u8) {
-    if s.is_null() {
-        return;
+pub fn serial_init() {
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        x86::init();
+        #[cfg(target_arch = "aarch64")]
+        aarch64::init();
     }
-    let mut p = s;
-    while unsafe { *p } != 0 {
-        let c = unsafe { *p };
+}
+
+pub fn serial_putc(c: u8) {
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        x86::putc(c);
+        #[cfg(target_arch = "aarch64")]
+        aarch64::putc(c);
+    }
+}
+
+pub fn serial_puts(s: &[u8]) {
+    for &c in s {
         if c == b'\n' {
             serial_putc(b'\r');
         }
         serial_putc(c);
-        p = unsafe { p.add(1) };
     }
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn serial_try_getc() -> i32 {
-    #[cfg(target_arch = "x86_64")]
-    { x86::try_getc() }
-    #[cfg(target_arch = "aarch64")]
-    { aarch64::try_getc() }
+pub fn serial_try_getc() -> i32 {
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        { x86::try_getc() }
+        #[cfg(target_arch = "aarch64")]
+        { aarch64::try_getc() }
+    }
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn serial_check_shutdown() -> bool {
-    if SHUTDOWN_REQUESTED {
-        return true;
-    }
-    loop {
-        let c = serial_try_getc();
-        if c < 0 {
-            break;
-        }
-        if c == 0x03 { // Ctrl-C
-            SHUTDOWN_REQUESTED = true;
+pub fn serial_check_shutdown() -> bool {
+    unsafe {
+        if SHUTDOWN_REQUESTED {
             return true;
         }
+        loop {
+            let c = serial_try_getc();
+            if c < 0 {
+                break;
+            }
+            if c == 0x03 { // Ctrl-C
+                SHUTDOWN_REQUESTED = true;
+                return true;
+            }
+        }
+        false
     }
-    false
 }
 
 // x86_64-specific: RX interrupt support for idle wakeup on Ctrl-C
 #[cfg(target_arch = "x86_64")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn serial_enable_rx_irq() {
-    x86::enable_rx_irq();
+pub fn serial_enable_rx_irq() {
+    unsafe { x86::enable_rx_irq(); }
 }
 
 #[cfg(target_arch = "x86_64")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn serial_rx_isr() {
+pub fn serial_rx_isr() {
     // Drain RX FIFO to clear the UART interrupt condition
-    loop {
-        let c = x86::try_getc();
-        if c < 0 {
-            break;
-        }
-        if c == 0x03 {
-            SHUTDOWN_REQUESTED = true;
+    unsafe {
+        loop {
+            let c = x86::try_getc();
+            if c < 0 {
+                break;
+            }
+            if c == 0x03 {
+                SHUTDOWN_REQUESTED = true;
+            }
         }
     }
 }

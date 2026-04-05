@@ -22,7 +22,7 @@ extern crate kernel_mm;
 extern crate drivers;
 
 fn log(msg: &[u8]) {
-    unsafe { kernel_serial::serial_puts(msg.as_ptr()) }
+    kernel_serial::serial_puts(msg)
 }
 
 /// Busy-wait for approximately `us` microseconds.
@@ -1262,7 +1262,7 @@ fn dhcp_poll_wait(timeout_ms: u32) -> bool {
 }
 
 // ============================================================================
-// Extern "C" API — called by C++ (kernel/entry.cc and uni/ffi.cc)
+// Network init API — called from kernel/entry.rs during boot
 // ============================================================================
 
 /// Initialize TCP connection pool.
@@ -1321,7 +1321,7 @@ pub extern "C" fn net_dhcp_discover() -> bool {
     true
 }
 
-/// Set fallback network config (called by entry.cc if DHCP fails).
+/// Set fallback network config (called from entry.rs if DHCP fails).
 #[unsafe(no_mangle)]
 pub extern "C" fn net_set_fallback_config(
     ip_a: u8, ip_b: u8, ip_c: u8, ip_d: u8,

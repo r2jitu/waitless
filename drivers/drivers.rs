@@ -13,10 +13,8 @@ use core::ptr;
 use core::sync::atomic::{compiler_fence, Ordering};
 
 // ============================================================================
-// FFI declarations — kernel functions provided by drivers_ffi.cc
+// Kernel crate dependencies — direct Rust calls
 // ============================================================================
-
-// Kernel Rust rlibs — direct calls, no C++ FFI hop.
 extern crate kernel_exceptions;
 extern crate kernel_fdt;
 extern crate kernel_mm;
@@ -29,7 +27,7 @@ use kernel_mmu::mmu_map_device_range;
 extern crate x86_init;
 
 fn log(msg: &[u8]) {
-    unsafe { kernel_serial::serial_puts(msg.as_ptr()) }
+    kernel_serial::serial_puts(msg)
 }
 
 // ============================================================================
