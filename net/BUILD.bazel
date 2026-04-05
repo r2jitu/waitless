@@ -1,10 +1,10 @@
-load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_static_library")
 
 package(default_visibility = ["//visibility:public"])
 
 # Rust network stack: Ethernet, ARP, IPv4, TCP, DHCP.
 # Provides net_dhcp_discover, net_tcp_init, uni_tcp_* and net_set_fallback_config.
+# Calls kernel/driver Rust functions directly (no C++ FFI bridge).
 rust_static_library(
     name = "stack_rs",
     srcs = ["stack.rs"],
@@ -16,23 +16,9 @@ rust_static_library(
     }),
 )
 
-# C FFI bridge: extern "C" wrappers for kernel/driver functions
-# that the Rust net stack calls (serial, mm, arch).
-# virtio-net driver functions are now extern "C" declarations
-# resolved at link time from drivers:drivers_rs.
-cc_library(
-    name = "net_ffi",
-    srcs = ["net_ffi.cc"],
-    deps = [
-        "//kernel:core",
-        "//kernel:arch_h",
-    ],
-    copts = ["-I."],
-)
-
 # HTTP/1.1 server (Rust): request parsing, routing, event loop.
 # Calls uni:: functions via FFI (symbols resolved at link time from
-# uni/ffi.cc + either uni/unikernel.cc or uni/native.cc).
+# uni/ffi_rs or uni/native.cc).
 rust_library(
     name = "http_rs",
     srcs = ["http.rs"],

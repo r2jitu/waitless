@@ -24,29 +24,105 @@ fn panic(_info: &PanicInfo) -> ! {
 pub extern "C" fn rust_eh_personality() {}
 
 // ============================================================================
-// FFI declarations for kernel/driver functions
+// FFI declarations — direct calls to kernel/driver Rust functions
 // ============================================================================
 
 type PollCallback = unsafe extern "C" fn(*const u8, u32);
 
 unsafe extern "C" {
-    fn net_serial_log(msg: *const u8);
-    fn net_kmalloc(size: usize) -> *mut u8;
-    fn net_kfree(ptr: *mut u8);
-    fn net_virtio_get_mac(mac_out: *mut u8);
-    fn net_virtio_send(data: *const u8, len: u32);
-    fn net_virtio_poll(callback: PollCallback);
-    fn net_arch_udelay(us: u32);
+    // kernel/serial.rs
+    fn serial_puts(s: *const u8);
+    fn serial_check_shutdown() -> bool;
 
-    // From uni/ffi.cc — lifecycle functions
-    fn uni_check_shutdown() -> bool;
+    // kernel/mm.rs
+    fn mm_kmalloc(size: usize) -> *mut u8;
+    fn mm_kfree(ptr: *mut u8);
 
-    // From drivers — IRQ support (for wait_for_events in tcp::poll path)
-    // These are already linked via the cc_binary deps.
+    // drivers/drivers.rs
+    fn driver_virtio_net_get_mac(mac_out: *mut u8);
+    fn driver_virtio_net_send(data: *const u8, len: u32);
+    fn driver_virtio_net_poll(callback: PollCallback);
 }
 
 fn log(msg: &[u8]) {
-    unsafe { net_serial_log(msg.as_ptr()) }
+    unsafe { serial_puts(msg.as_ptr()) }
+}
+
+/// Busy-wait for approximately `us` microseconds.
+#[cfg(target_arch = "x86_64")]
+fn arch_udelay(us: u32) {
+    // Use TSC for timing. Calibrate once via PIT channel 2.
+    static mut TSC_PER_US: u64 = 0;
+
+    unsafe {
+        if TSC_PER_US == 0 {
+            // PIT channel 2, mode 0 (one-shot), ~10ms count
+            const PIT_COUNT: u16 = 11932;
+            // Disable speaker, enable gate
+            let gate = x86_inb(0x61);
+            x86_outb(0x61, (gate & 0xFD) | 0x01);
+            // Channel 2, mode 0, binary, lo/hi byte
+            x86_outb(0x43, 0xB0);
+            x86_outb(0x42, (PIT_COUNT & 0xFF) as u8);
+            x86_outb(0x42, (PIT_COUNT >> 8) as u8);
+            // Reset latch by toggling gate
+            let gate = x86_inb(0x61);
+            x86_outb(0x61, gate & 0xFE);
+            x86_outb(0x61, gate | 0x01);
+            let start = x86_rdtsc();
+            // Wait for OUT pin (bit 5) to go high
+            while (x86_inb(0x61) & 0x20) == 0 {
+                core::arch::asm!("nop");
+            }
+            let elapsed = x86_rdtsc() - start;
+            TSC_PER_US = if elapsed / 10000 == 0 { 1 } else { elapsed / 10000 };
+        }
+        let end = x86_rdtsc() + TSC_PER_US * (us as u64);
+        while x86_rdtsc() < end {
+            core::arch::asm!("pause", options(nomem, nostack));
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn x86_inb(port: u16) -> u8 {
+    let val: u8;
+    unsafe { core::arch::asm!("in al, dx", out("al") val, in("dx") port, options(nomem, nostack)); }
+    val
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn x86_outb(port: u16, val: u8) {
+    unsafe { core::arch::asm!("out dx, al", in("al") val, in("dx") port, options(nomem, nostack)); }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn x86_rdtsc() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack)); }
+    ((hi as u64) << 32) | (lo as u64)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn arch_udelay(us: u32) {
+    unsafe {
+        let freq: u64;
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq);
+        let ticks = (freq / 1_000_000) * (us as u64);
+        let start: u64;
+        core::arch::asm!("mrs {}, cntpct_el0", out(reg) start);
+        let end = start + ticks;
+        loop {
+            let now: u64;
+            core::arch::asm!("mrs {}, cntpct_el0", out(reg) now);
+            if now >= end { break; }
+            core::arch::asm!("nop");
+        }
+    }
 }
 
 // ============================================================================
@@ -186,7 +262,7 @@ static mut MAC_CACHED: bool = false;
 fn ethernet_our_mac() -> MacAddr {
     unsafe {
         if !MAC_CACHED {
-            net_virtio_get_mac(OUR_MAC.bytes.as_mut_ptr());
+            driver_virtio_net_get_mac(OUR_MAC.bytes.as_mut_ptr());
             MAC_CACHED = true;
         }
         OUR_MAC
@@ -205,7 +281,7 @@ fn ethernet_send(dst: MacAddr, ethertype: u16, payload: &[u8]) {
         let payload_len = payload.len().min(1500);
         ptr::copy_nonoverlapping(payload.as_ptr(), ETH_TX_BUF.as_mut_ptr().add(14), payload_len);
 
-        net_virtio_send(ETH_TX_BUF.as_ptr(), (14 + payload_len) as u32);
+        driver_virtio_net_send(ETH_TX_BUF.as_ptr(), (14 + payload_len) as u32);
     }
 }
 
@@ -397,7 +473,7 @@ fn arp_resolve(ip: Ipv4Addr) -> Option<MacAddr> {
     for _retry in 0..3 {
         arp_request(target);
         for _poll in 0..200_000 {
-            unsafe { net_virtio_poll(ethernet_receive) };
+            unsafe { driver_virtio_net_poll(ethernet_receive) };
             if let Some(mac) = arp_lookup(target) {
                 return Some(mac);
             }
@@ -671,7 +747,7 @@ fn alloc_connection() -> Option<usize> {
 fn free_connection(idx: usize) {
     unsafe {
         if !CONNECTIONS[idx].rx_buf.is_null() {
-            net_kfree(CONNECTIONS[idx].rx_buf);
+            mm_kfree(CONNECTIONS[idx].rx_buf);
         }
         CONNECTIONS[idx] = TcpConnection::new();
     }
@@ -813,7 +889,7 @@ fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: *const u8, len: usize)
             c.accepted = false;
 
             // Allocate RX buffer
-            c.rx_buf = net_kmalloc(RX_BUF_SIZE);
+            c.rx_buf = mm_kmalloc(RX_BUF_SIZE);
             c.rx_buf_size = RX_BUF_SIZE;
             c.rx_head = 0;
             c.rx_tail = 0;
@@ -1124,7 +1200,7 @@ fn dhcp_send_discover() {
     ip.checksum = 0;
     ip.checksum = unsafe { checksum(frame.as_ptr().add(14) as *const u8, 20) };
 
-    unsafe { net_virtio_send(frame.as_ptr(), (14 + ip_total) as u32) };
+    unsafe { driver_virtio_net_send(frame.as_ptr(), (14 + ip_total) as u32) };
 }
 
 fn dhcp_send_request() {
@@ -1192,17 +1268,17 @@ fn dhcp_send_request() {
     ip.checksum = 0;
     ip.checksum = unsafe { checksum(frame.as_ptr().add(14) as *const u8, 20) };
 
-    unsafe { net_virtio_send(frame.as_ptr(), (14 + ip_total) as u32) };
+    unsafe { driver_virtio_net_send(frame.as_ptr(), (14 + ip_total) as u32) };
 }
 
 fn dhcp_poll_wait(timeout_ms: u32) -> bool {
     for _ in 0..timeout_ms {
         unsafe {
-            net_virtio_poll(dhcp_receive);
+            driver_virtio_net_poll(dhcp_receive);
             if DHCP_GOT_OFFER || DHCP_GOT_ACK {
                 return true;
             }
-            net_arch_udelay(1000); // 1ms
+            arch_udelay(1000); // 1ms
         }
     }
     false
@@ -1418,5 +1494,5 @@ pub extern "C" fn uni_tcp_is_closed(conn: *mut ()) -> bool {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn uni_tcp_poll() {
-    unsafe { net_virtio_poll(ethernet_receive) }
+    unsafe { driver_virtio_net_poll(ethernet_receive) }
 }

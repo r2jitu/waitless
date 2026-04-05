@@ -1,19 +1,22 @@
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_rust//rust:defs.bzl", "rust_static_library")
 
 package(default_visibility = ["//visibility:public"])
 
-# ---- Unikernel backend (extern "C" FFI for Rust) ----------------------------
-# Provides uni_* lifecycle/config symbols by calling kernel/serial, kernel/arch,
-# and Rust driver functions (via extern "C" declarations).
+# ---- Unikernel backend (Rust) -----------------------------------------------
+# Provides uni_* lifecycle/config symbols (uni_log, uni_config_port,
+# uni_check_shutdown, uni_wait_for_events). Calls kernel/driver Rust
+# functions directly with inline assembly for arch primitives.
 
-cc_library(
+rust_static_library(
     name = "ffi",
-    srcs = ["ffi.cc"],
-    deps = [
-        "//kernel:arch_h",
-        "//kernel:core",
-    ],
-    copts = ["-I."],
+    srcs = ["ffi.rs"],
+    crate_name = "uni_ffi",
+    edition = "2024",
+    rustc_flags = ["-C", "panic=abort"] + select({
+        "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
+        "//conditions:default": [],
+    }),
 )
 
 # ---- Native backend (extern "C" FFI for Rust) -------------------------------
