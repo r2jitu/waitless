@@ -28,7 +28,7 @@ def _impl(ctx):
 
     if arch == "aarch64_macos":
         # macOS native: use system clang
-        gcc_tool = "wrapper/clang_wrapper.sh"
+        gcc_tool = "wrapper/clang.sh"
         link_flags = ["-lc++"]
     else:
         # Bare-metal + Linux: use Rust's ld.lld
