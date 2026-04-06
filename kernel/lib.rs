@@ -12,6 +12,7 @@ pub mod mm;
 pub mod time;
 pub mod deque;
 pub mod spsc;
+pub mod timer;
 
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;

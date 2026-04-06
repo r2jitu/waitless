@@ -9,6 +9,7 @@ rust_library(
         "deque.rs",
         "lib.rs",
         "spsc.rs",
+        "timer.rs",
         "mm.rs",
         "serial.rs",
         "time.rs",
@@ -43,5 +44,12 @@ rust_test(
     name = "spsc_test",
     srcs = ["spsc.rs"],
     crate_root = "spsc.rs",
+    rustc_flags = ["-Cpanic=unwind"],
+)
+
+rust_test(
+    name = "timer_test",
+    srcs = ["timer.rs"],
+    crate_root = "timer.rs",
     rustc_flags = ["-Cpanic=unwind"],
 )
