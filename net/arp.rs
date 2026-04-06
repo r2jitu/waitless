@@ -1,8 +1,7 @@
 // net/arp.rs — ARP cache, request/reply, resolve, announce.
 
-use crate::types::{MacAddr, Ipv4Addr, CONFIG};
+use types::{MacAddr, Ipv4Addr, CONFIG, htons, ntohs};
 use crate::ethernet::{ethernet_our_mac, ethernet_send, ethernet_parse, ETHERTYPE_ARP};
-use crate::{htons, ntohs};
 
 const ARP_CACHE_SIZE: usize = 64;
 

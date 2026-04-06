@@ -16,8 +16,8 @@
 extern crate kernel;
 use kernel::serial;
 extern crate drivers;
+pub extern crate net_types as types;
 
-pub(crate) mod types;
 pub(crate) mod ethernet;
 pub(crate) mod arp;
 pub(crate) mod ipv4;
@@ -105,15 +105,3 @@ pub(crate) fn arch_udelay(us: u32) {
     }
 }
 
-// ============================================================================
-// Byte-order utilities
-// ============================================================================
-
-#[inline]
-pub(crate) fn htons(h: u16) -> u16 { h.to_be() }
-#[inline]
-pub(crate) fn ntohs(n: u16) -> u16 { u16::from_be(n) }
-#[inline]
-pub(crate) fn htonl(h: u32) -> u32 { h.to_be() }
-#[inline]
-pub(crate) fn ntohl(n: u32) -> u32 { u32::from_be(n) }

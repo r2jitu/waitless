@@ -5,8 +5,7 @@
 
 use core::ptr;
 
-use crate::types::MacAddr;
-use crate::htons;
+use types::{MacAddr, htons};
 
 pub(crate) const ETHERTYPE_ARP: u16 = 0x0806;
 pub(crate) const ETHERTYPE_IPV4: u16 = 0x0800;

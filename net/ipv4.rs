@@ -2,11 +2,10 @@
 
 use core::ptr;
 
-use crate::types::{MacAddr, Ipv4Addr, CONFIG, checksum};
+use types::{MacAddr, Ipv4Addr, CONFIG, checksum, htons, ntohs};
 use crate::ethernet::{ethernet_send, ETHERTYPE_IPV4};
 use crate::arp::arp_resolve;
 use crate::tcp::tcp_receive;
-use crate::{htons, ntohs};
 
 pub(crate) const PROTO_TCP: u8 = 6;
 pub(crate) const PROTO_UDP: u8 = 17;

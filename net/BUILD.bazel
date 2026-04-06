@@ -3,6 +3,18 @@ load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 
 package(default_visibility = ["//visibility:public"])
 
+# Standalone types crate — no dependencies on drivers, kernel, or other net/ modules.
+# New protocol crates (udp, ipv6, quic) can depend on this without pulling in
+# the full legacy stack.
+rust_library(
+    name = "types",
+    srcs = ["types.rs"],
+    crate_root = "types.rs",
+    crate_name = "net_types",
+    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+)
+
+# Full network stack: ethernet + ARP + IPv4 + TCP + DHCP.
 rust_library(
     name = "net",
     srcs = [
@@ -12,10 +24,10 @@ rust_library(
         "ipv4.rs",
         "lib.rs",
         "tcp.rs",
-        "types.rs",
     ],
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
     deps = [
+        ":types",
         "//drivers",
         "//kernel",
     ],

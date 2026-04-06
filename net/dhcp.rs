@@ -2,11 +2,11 @@
 
 use core::ptr;
 
-use crate::types::{MacAddr, Ipv4Addr, CONFIG, checksum};
+use types::{MacAddr, Ipv4Addr, CONFIG, checksum, htons, ntohs, htonl};
 use crate::ethernet::{EthernetHeader, ethernet_our_mac, ethernet_parse, ETHERTYPE_ARP, ETHERTYPE_IPV4};
 use crate::arp::{arp_receive, arp_announce};
 use crate::ipv4::{Ipv4Header, PROTO_UDP};
-use crate::{htons, ntohs, htonl, arch_udelay};
+use crate::arch_udelay;
 
 #[repr(C, packed)]
 struct UdpHeader {

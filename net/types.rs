@@ -1,10 +1,28 @@
-// net/types.rs — Network types, config, and checksum helpers.
+// net/types.rs — Network types, byte order, config, and checksum helpers.
+//
+// This module has no dependencies on other net/ modules or external crates.
+// It can be compiled as a standalone crate (//net:types).
 
-use crate::htons;
+// When compiled as a standalone crate (//net:types), no_std is needed.
+// When compiled as a module of //net:net, the parent's no_std applies.
+#![no_std]
+
+// ── Byte-order utilities ─────────────────────────────────────────────────────
+
+#[inline]
+pub fn htons(h: u16) -> u16 { h.to_be() }
+#[inline]
+pub fn ntohs(n: u16) -> u16 { u16::from_be(n) }
+#[inline]
+pub fn htonl(h: u32) -> u32 { h.to_be() }
+#[inline]
+pub fn ntohl(n: u32) -> u32 { u32::from_be(n) }
+
+// ── Types ────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
-pub(crate) struct MacAddr {
+pub struct MacAddr {
     pub bytes: [u8; 6],
 }
 
@@ -16,7 +34,7 @@ impl MacAddr {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
-pub(crate) struct Ipv4Addr {
+pub struct Ipv4Addr {
     pub addr: u32, // network byte order
 }
 
@@ -36,14 +54,14 @@ impl Ipv4Addr {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct NetConfig {
+pub struct NetConfig {
     pub ip: Ipv4Addr,
     pub subnet_mask: Ipv4Addr,
     pub gateway: Ipv4Addr,
     pub dns: Ipv4Addr,
 }
 
-pub(crate) static mut CONFIG: NetConfig = NetConfig {
+pub static mut CONFIG: NetConfig = NetConfig {
     ip: Ipv4Addr::ANY,
     subnet_mask: Ipv4Addr::ANY,
     gateway: Ipv4Addr::ANY,
@@ -53,7 +71,7 @@ pub(crate) static mut CONFIG: NetConfig = NetConfig {
 /// RFC 1071 internet checksum over a byte buffer.
 /// Reads 16-bit words in little-endian byte order.
 /// so that the returned u16 can be stored directly in packed struct fields.
-pub(crate) fn checksum(data: *const u8, len: usize) -> u16 {
+pub fn checksum(data: *const u8, len: usize) -> u16 {
     let mut sum: u32 = 0;
     let mut i = 0;
     while i + 1 < len {
@@ -72,7 +90,7 @@ pub(crate) fn checksum(data: *const u8, len: usize) -> u16 {
 
 /// TCP/UDP pseudo-header checksum.
 /// Pseudo-header + data summed in LE byte order.
-pub(crate) fn tcp_checksum(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, data: *const u8, len: usize) -> u16 {
+pub fn tcp_checksum(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, data: *const u8, len: usize) -> u16 {
     let mut sum: u32 = 0;
 
     // Pseudo-header — read addr fields as LE 16-bit words

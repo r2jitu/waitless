@@ -4,11 +4,10 @@ use core::ptr;
 
 use kernel::mm;
 
-use crate::types::{Ipv4Addr, CONFIG, tcp_checksum};
+use types::{Ipv4Addr, CONFIG, tcp_checksum, htons, ntohs, htonl, ntohl};
 use crate::ipv4::{ipv4_send, ipv4_receive, PROTO_TCP};
 use crate::arp::arp_receive;
 use crate::ethernet::{ethernet_parse, ETHERTYPE_ARP, ETHERTYPE_IPV4};
-use crate::{htons, ntohs, htonl, ntohl};
 
 const TCP_FIN: u8 = 0x01;
 const TCP_SYN: u8 = 0x02;
