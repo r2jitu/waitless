@@ -14,7 +14,7 @@ pub const MAX_CORES: usize = 8;
 const TX_BUF_SIZE: usize = 1514;
 
 /// Number of TX staging slots per core.
-const TX_POOL_SIZE: usize = 32;
+const TX_POOL_SIZE: usize = 8;
 
 /// A staged TX packet: length + data.
 #[derive(Clone, Copy)]
@@ -37,7 +37,7 @@ fn noop(_: usize) {}
 const RX_BUF_SIZE: usize = 1514;
 
 /// Number of RX inbox slots per core.
-const RX_POOL_SIZE: usize = 64;
+const RX_POOL_SIZE: usize = 16;
 
 /// A received packet in the inbox: length + data.
 #[derive(Clone, Copy)]

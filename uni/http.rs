@@ -104,41 +104,44 @@ impl Request {
 
 pub struct Response {
     pub status: i32,
-    content_type: [u8; 64],
+    content_type: *const u8,
     content_type_len: usize,
-    body: [u8; 8192],
+    body: *const u8,
     body_len: usize,
 }
 
+// Response stores pointers to caller-owned data. Safe because Response
+// is always used within a single function scope (handler returns it,
+// send_response consumes it immediately).
+unsafe impl Send for Response {}
+unsafe impl Sync for Response {}
+
 impl Response {
     pub fn ok(content_type: &[u8], body: &[u8]) -> Self {
-        let mut resp = Response {
+        Response {
             status: 200,
-            content_type: [0; 64],
-            content_type_len: 0,
-            body: [0; 8192],
-            body_len: 0,
-        };
-        let ct = content_type.len().min(64);
-        resp.content_type[..ct].copy_from_slice(&content_type[..ct]);
-        resp.content_type_len = ct;
-        let bl = body.len().min(8192);
-        resp.body[..bl].copy_from_slice(&body[..bl]);
-        resp.body_len = bl;
-        resp
+            content_type: content_type.as_ptr(),
+            content_type_len: content_type.len(),
+            body: body.as_ptr(),
+            body_len: body.len(),
+        }
     }
 
     pub fn not_found() -> Self {
-        let mut resp = Self::ok(b"text/plain", b"Not Found");
-        resp.status = 404;
-        resp
+        Response {
+            status: 404,
+            content_type: b"text/plain".as_ptr(),
+            content_type_len: 10,
+            body: b"Not Found".as_ptr(),
+            body_len: 9,
+        }
     }
 
     fn body_bytes(&self) -> &[u8] {
-        &self.body[..self.body_len]
+        unsafe { core::slice::from_raw_parts(self.body, self.body_len) }
     }
     fn content_type_bytes(&self) -> &[u8] {
-        &self.content_type[..self.content_type_len]
+        unsafe { core::slice::from_raw_parts(self.content_type, self.content_type_len) }
     }
 }
 
@@ -149,7 +152,7 @@ pub type Handler = fn(&Request) -> Response;
 // ---- Server -----------------------------------------------------------------
 
 const MAX_ROUTES: usize = 64;
-const MAX_ACTIVE: usize = 16; // per core
+const MAX_ACTIVE: usize = 8; // per core
 const BUF_SIZE: usize = 8192;
 const MAX_CORES: usize = 8;
 
