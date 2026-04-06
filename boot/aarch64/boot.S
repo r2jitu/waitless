@@ -36,8 +36,9 @@ _start:
     // Offset +8: text_offset — image start relative to RAM base (0 = 2MB-aligned)
     .quad   0x0000000000000000
 
-    // Offset +16: image_size (set at link time via _end - _start)
-    .quad   _end - _start
+    // Offset +16: image_size (total memory footprint including BSS)
+    // _image_size is computed by the linker script (. - _image_start at end of sections).
+    .quad   _image_size
 
     // Offset +24: flags
     //   bit 0: BE=0 (little endian)

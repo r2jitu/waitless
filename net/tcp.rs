@@ -151,8 +151,6 @@ impl TcpConnection {
 // Per-core connection pools. Core N owns POOLS[N].
 static mut POOLS: [[TcpConnection; CONNECTIONS_PER_CORE]; MAX_CORES] =
     [const { [const { TcpConnection::new() }; CONNECTIONS_PER_CORE] }; MAX_CORES];
-// Per-core initial sequence number. Not truly atomic — duplicates are harmless
-// (TCP ISN just needs to not repeat recently). Avoids LDXR/STXR which VZ can't handle.
 static mut SEQ_COUNTER: u32 = 100_000;
 
 /// Encode a connection handle from core + slot index.

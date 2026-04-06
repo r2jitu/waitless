@@ -37,9 +37,6 @@ pub struct Ipv4Packet<'a> {
     pub payload: &'a [u8],
 }
 
-// Per-packet IP identification. Volatile increment — duplicates are harmless
-// (IP ID just disambiguates fragments within a connection).
-// Avoids LDXR/STXR which VZ doesn't handle correctly.
 static mut IP_ID_COUNTER: u16 = 1;
 
 pub fn ipv4_send(dst: Ipv4Addr, proto: u8, payload: &[u8]) {

@@ -23,6 +23,7 @@ ENTRY(_start)
 
 SECTIONS {
     . = 0x00000000;
+    _image_start = .;               /* used by Image header image_size field */
 
     /* ARM64 Image header and boot code must be at the very start */
     .text.boot ALIGN(4096) : {
@@ -84,5 +85,6 @@ SECTIONS {
 
     . = ALIGN(4096);
     _kernel_end = .;
-    _end = .;                       /* used by Image header image_size field */
+    _end = .;
+    _image_size = . - _image_start; /* total footprint including BSS */
 }
