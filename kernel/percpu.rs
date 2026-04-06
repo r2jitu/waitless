@@ -91,7 +91,19 @@ impl RxInbox {
 }
 
 /// Per-core state. Each core has exactly one of these.
+/// The TLS register (GS_BASE on x86_64, TPIDR_EL1 on aarch64) points
+/// to this struct. Fields at known offsets can be read directly via
+/// the TLS register without indirection.
+///
+/// IMPORTANT: `id` must be the first field (offset 0) — cpu_id() reads
+/// it directly via `gs:[0]` / TPIDR_EL1 without going through Rust.
+#[repr(C)]
 pub struct PerCore {
+    /// Core ID — MUST be at offset 0 (read by cpu_id() via TLS register).
+    pub id: u32,
+
+    _pad: u32, // align next field to 8 bytes
+
     /// RX inbox for Tier 2 delivery (core 0 writes, this core reads).
     pub rx_inbox: RxInbox,
 
@@ -112,9 +124,6 @@ pub struct PerCore {
 
     /// TX staging buffer — this core writes packets here, core 0 flushes (Tier 2).
     pub tx_staging: TxStaging,
-
-    /// Core ID.
-    pub id: u32,
 }
 
 /// TX staging: fixed pool of packet buffers + SPSC index ring.
@@ -166,6 +175,8 @@ impl TxStaging {
 impl PerCore {
     pub const fn new(id: u32) -> Self {
         PerCore {
+            id,
+            _pad: 0,
             rx_inbox: RxInbox::new(),
             inbox: spsc::Ring::new(),
             pinned: spsc::Ring::new(),
@@ -173,7 +184,6 @@ impl PerCore {
             timers: TimerWheel::new(),
             pending_timers: PendingTimers::new(),
             tx_staging: TxStaging::new(),
-            id,
         }
     }
 }

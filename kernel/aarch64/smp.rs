@@ -28,17 +28,28 @@ static mut NUM_CORES_ONLINE: u32 = 1; // BSP is always online
 
 /// Get the current CPU's logical core index.
 ///
-/// Reads TPIDR_EL1 which we program with the core ID during boot.
-/// Cost: one system register read (~1 cycle) vs MPIDR parse.
+/// Reads TPIDR_EL1 which points to this core's PerCore struct, then
+/// loads the `id` field (offset 0). Cost: ~2 cycles (mrs + ldr).
 pub fn cpu_id() -> u32 {
-    let id: u64;
-    unsafe { core::arch::asm!("mrs {}, tpidr_el1", out(reg) id, options(nomem, nostack)) };
-    id as u32
+    let id: u32;
+    unsafe {
+        core::arch::asm!(
+            "mrs {tmp}, tpidr_el1",
+            "ldr {id:w}, [{tmp}]",
+            tmp = out(reg) _,
+            id = out(reg) id,
+            options(nomem, nostack),
+        );
+    }
+    id
 }
 
-/// Set TPIDR_EL1 to the logical core index. Called once per core during boot.
+/// Set TPIDR_EL1 to point at this core's PerCore struct. Called once per core.
 pub fn init_cpu_id(id: u32) {
-    unsafe { core::arch::asm!("msr tpidr_el1, {}", in(reg) id as u64, options(nomem, nostack)) };
+    unsafe {
+        let addr = crate::percpu::get(id) as *const crate::percpu::PerCore as u64;
+        core::arch::asm!("msr tpidr_el1, {}", in(reg) addr, options(nomem, nostack));
+    }
 }
 
 /// Returns the number of cores that have booted.

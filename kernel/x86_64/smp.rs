@@ -26,10 +26,9 @@ static NUM_CORES_ONLINE: AtomicU32 = AtomicU32::new(1);
 
 /// Get current CPU's logical core index.
 ///
-/// Reads from GS:0 where we store the core ID. Each core programs
-/// GS_BASE to point to its slot in a per-core ID array during boot.
-/// Cost: one segment-prefixed memory load (~1 cycle) vs APIC MMIO
-/// (~200+ cycles under TCG).
+/// Reads from GS:0 which is the `id` field of this core's PerCore struct.
+/// Each core sets GS_BASE to point at its PerCore during boot.
+/// Cost: one segment-prefixed load (~1 cycle) vs APIC MMIO (~200+ under TCG).
 pub fn cpu_id() -> u32 {
     let id: u32;
     unsafe {
@@ -42,18 +41,13 @@ pub fn cpu_id() -> u32 {
     id
 }
 
-/// Per-core ID storage. GS_BASE for core N points to CORE_IDS[N].
-static mut CORE_IDS: [u32; MAX_CORES] = [0; MAX_CORES];
-
-/// Set GS_BASE to point at this core's ID slot. Called once per core during boot.
+/// Set GS_BASE to point at this core's PerCore struct. Called once per core.
 pub fn init_cpu_id(id: u32) {
     unsafe {
-        CORE_IDS[id as usize] = id;
-        let addr = &CORE_IDS[id as usize] as *const u32 as u64;
-        // Write IA32_GS_BASE MSR (0xC0000101)
+        let addr = crate::percpu::get(id) as *const crate::percpu::PerCore as u64;
         core::arch::asm!(
             "wrmsr",
-            in("ecx") 0xC0000101u32,
+            in("ecx") 0xC0000101u32, // IA32_GS_BASE
             in("eax") addr as u32,
             in("edx") (addr >> 32) as u32,
             options(nomem, nostack),
