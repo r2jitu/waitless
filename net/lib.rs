@@ -64,12 +64,15 @@ pub fn poll() {
         }
     }
 
+    // Flush TX staging FIRST — APs may have responses ready from the
+    // previous cycle. Flushing before VirtIO poll minimizes the round-trip
+    // latency between AP response and actual packet transmission.
+    drivers::virtio_net::flush_tx_staging();
+
     // Core 0: poll VirtIO and distribute frames.
     drivers::virtio_net::poll(distribute_frame);
 
-    // Wake APs that received new packets. SEV on aarch64 broadcasts
-    // to all cores (~1 cycle); x86 APs spin with PAUSE and see the
-    // inbox directly. No per-core IPI needed.
+    // Wake APs that received new packets.
     unsafe {
         let any_wakeup = (1..num_cores as usize).any(|i| WAKEUP[i]);
         if any_wakeup {
@@ -77,7 +80,8 @@ pub fn poll() {
         }
     }
 
-    // Flush TX staging from all other cores.
+    // Flush again — APs may have processed inline during distribute
+    // (e.g. if SEV wakes them before we finish distributing all packets).
     drivers::virtio_net::flush_tx_staging();
 }
 

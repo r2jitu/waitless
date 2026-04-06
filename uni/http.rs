@@ -281,6 +281,10 @@ impl Server {
             let had_work = self.service_core(0);
 
             if !had_work {
+                // Tight-loop flush: APs may have staged TX responses
+                // while we were servicing core-0 connections.
+                #[cfg(platform_unikernel)]
+                drivers::virtio_net::flush_tx_staging();
                 crate::wait_for_events();
             }
         }

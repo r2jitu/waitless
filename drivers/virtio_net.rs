@@ -579,16 +579,16 @@ fn send_direct(data: &[u8]) {
     }
 }
 
-/// Flag: set by APs when they stage TX, checked by core 0 before sleeping.
-static TX_PENDING: AtomicBool = AtomicBool::new(false);
+/// Flag: set by APs when they stage TX, checked by core 0.
+static TX_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// Send a frame. Core 0 sends directly; other cores stage for core 0 to flush.
+/// Send a frame. Core 0 sends directly; APs stage for core 0 to flush.
+/// Avoids spinlock contention on the VirtIO TX queue.
 pub fn send(data: &[u8]) {
     let id = kernel::cpu_id();
-    if id == 0 {
+    if id == 0 || kernel::percpu::num_cores() <= 1 {
         send_direct(data);
     } else {
-        // Stage in this core's TX staging buffer — core 0 will flush it.
         unsafe {
             kernel::percpu::get(id).tx_staging.push(data);
         }
