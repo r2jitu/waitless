@@ -200,7 +200,9 @@ extern "C" fn ap_entry_x86(_ctx: u64) -> ! {
         }
 
         if !did_work {
-            // HLT until IPI or interrupt wakes us. Interrupts are enabled (STI above).
+            // HLT until interrupt. On x86 TCG, PAUSE spin loops starve
+            // core 0 (all vCPUs share one host thread). HLT yields the
+            // vCPU slot. Core 0 sends SEV/IPI to wake us when work arrives.
             unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
         }
     }

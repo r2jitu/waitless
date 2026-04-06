@@ -178,8 +178,9 @@ unsafe extern "C" fn ap_entry(_stack_top: u64) -> ! {
             }
 
             if !did_work {
-                // No work — sleep until IPI or interrupt wakes us.
-                core::arch::asm!("wfi");
+                // WFE (Wait For Event) — wakes on SEV from core 0.
+                // Much cheaper than WFI+IPI: no GIC routing, no handler, no EOI.
+                core::arch::asm!("wfe", options(nomem, nostack));
             }
         }
     }

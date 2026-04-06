@@ -67,12 +67,13 @@ pub fn poll() {
     // Core 0: poll VirtIO and distribute frames.
     drivers::virtio_net::poll(distribute_frame);
 
-    // Batched IPI: one per core that received new packets.
+    // Wake APs that received new packets. SEV on aarch64 broadcasts
+    // to all cores (~1 cycle); x86 APs spin with PAUSE and see the
+    // inbox directly. No per-core IPI needed.
     unsafe {
-        for i in 1..num_cores as usize {
-            if WAKEUP[i] {
-                kernel::send_ipi(i as u32);
-            }
+        let any_wakeup = (1..num_cores as usize).any(|i| WAKEUP[i]);
+        if any_wakeup {
+            kernel::wake_cores();
         }
     }
 
