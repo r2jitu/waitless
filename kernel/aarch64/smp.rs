@@ -36,6 +36,7 @@ pub fn num_cores_online() -> u32 {
 
 /// PSCI CPU_ON via HVC (QEMU virt uses PSCI 0.2 conduit=hvc).
 /// Returns 0 on success, negative PSCI error otherwise.
+/// PSCI CPU_ON via HVC (QEMU virt default conduit).
 fn psci_cpu_on(target_cpu: u64, entry_point: u64, context_id: u64) -> i64 {
     let ret: i64;
     unsafe {
@@ -72,11 +73,13 @@ pub unsafe fn start_secondary_cores(cpu_count: u32) {
         let stack_top = stack_base + AP_STACK_SIZE as u64;
         CORES[i as usize].stack_top = stack_top;
 
-        // Start the AP — pass stack_top as context_id (x3)
-        let entry = ap_entry as u64;
+        // Start the AP at the assembly trampoline (handles MMU + VBAR setup).
+        // stack_top passed as context_id (x0 when AP starts).
+        unsafe extern "C" { fn ap_trampoline(); }
+        let entry = ap_trampoline as u64;
         let ret = psci_cpu_on(i as u64, entry, stack_top);
         if ret != 0 {
-            serial::puts(b"[SMP] PSCI CPU_ON failed for core\n");
+            serial::puts(b"[SMP] PSCI CPU_ON failed\n");
         }
     }
 
@@ -101,26 +104,11 @@ pub unsafe fn start_secondary_cores(cpu_count: u32) {
     } // unsafe
 }
 
-/// AP entry point — called by PSCI CPU_ON.
-/// x0 = context_id (stack_top), set by PSCI.
+/// AP entry point — called from ap_trampoline (boot.S) after MMU + VBAR + stack
+/// are set up. x0 = stack_top (unused here, stack already set by trampoline).
 #[unsafe(no_mangle)]
-unsafe extern "C" fn ap_entry(stack_top: u64) -> ! {
+unsafe extern "C" fn ap_entry(_stack_top: u64) -> ! {
     unsafe {
-        // Set stack pointer
-        core::arch::asm!(
-            "mov sp, {0}",
-            in(reg) stack_top,
-            options(nostack),
-        );
-
-        // Install exception vector table (same as BSP)
-        core::arch::asm!(
-            "adr {0}, exception_vector_table",
-            "msr VBAR_EL1, {0}",
-            "isb",
-            out(reg) _,
-        );
-
         // Initialize this core's GIC redistributor
         exceptions::init_ap();
 

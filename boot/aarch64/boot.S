@@ -445,6 +445,85 @@ EXCEPTION_FULL_HANDLER 2   // IRQ → dispatches via GIC
 EXCEPTION_FULL_HANDLER 3   // SError / FIQ → panics
 
 // ============================================================================
+// AP (secondary core) trampoline
+//
+// PSCI CPU_ON starts the AP at this address with MMU OFF.
+// x0 = context_id (stack_top, passed by BSP).
+// We set up MMU (same page tables as BSP), install VBAR, set SP, then
+// jump to the Rust ap_entry function.
+// ============================================================================
+
+.global ap_trampoline
+.align 4
+ap_trampoline:
+    // Save stack_top (context_id from PSCI) in x19
+    mov     x19, x0
+
+    // Drop EL2 → EL1 if started at EL2 (same logic as BSP)
+    mrs     x0, CurrentEL
+    lsr     x0, x0, #2
+    cmp     x0, #2
+    bne     .Lap_el1
+
+    mov     x0, #(1 << 31)          // HCR_EL2.RW = 1
+    msr     hcr_el2, x0
+    mov     x0, #0x3c5              // SPSR_EL2: EL1h, DAIF masked
+    msr     spsr_el2, x0
+    adr     x0, .Lap_el1
+    msr     elr_el2, x0
+    msr     cptr_el2, xzr
+    msr     hstr_el2, xzr
+    eret
+
+.Lap_el1:
+    // Mask all interrupts
+    msr     daifset, #0xF
+
+    // Enable FP/NEON
+    mov     x0, #(3 << 20)
+    msr     cpacr_el1, x0
+    isb
+
+    // Set MAIR_EL1 (same values as BSP setup_mmu)
+    ldr     x0, =0x00FF
+    msr     mair_el1, x0
+
+    // Set TCR_EL1
+    ldr     x0, =0x00000005B5993519
+    msr     tcr_el1, x0
+    isb
+
+    // Set TTBR0_EL1 to BSP's page table
+    adrp    x0, boot_l1_table
+    add     x0, x0, :lo12:boot_l1_table
+    msr     ttbr0_el1, x0
+    isb
+
+    // Enable MMU + caches
+    mrs     x0, sctlr_el1
+    orr     x0, x0, #(1 << 0)      // M=1 MMU
+    orr     x0, x0, #(1 << 2)      // C=1 D-cache
+    orr     x0, x0, #(1 << 12)     // I=1 I-cache
+    bic     x0, x0, #(1 << 1)      // A=0 alignment check off
+    msr     sctlr_el1, x0
+    isb
+
+    // Install exception vector table
+    adr     x0, exception_vector_table
+    msr     vbar_el1, x0
+    isb
+
+    // Set stack pointer
+    mov     sp, x19
+
+    // Jump to Rust AP entry (x0 = stack_top for the function argument)
+    mov     x0, x19
+    bl      ap_entry
+    // Should not return; halt if it does
+1:  wfi
+    b       1b
+
+// ============================================================================
 // Boot-time stack and page table
 //
 // Placed in a separate .boot_bss section (outside [__bss_start, __bss_end])
