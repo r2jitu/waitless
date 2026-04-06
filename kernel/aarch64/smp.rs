@@ -146,7 +146,7 @@ unsafe extern "C" fn ap_entry(_stack_top: u64) -> ! {
         // Unmask IRQs so SGI can be delivered
         core::arch::asm!("msr daifclr, #0x2", options(nomem, nostack));
 
-        // Mark this core as online. Volatile (not atomic) — APs boot sequentially.
+        // Mark this core as online.
         let n = core::ptr::read_volatile(&NUM_CORES_ONLINE);
         core::ptr::write_volatile(&raw mut NUM_CORES_ONLINE, n + 1);
 

@@ -37,6 +37,7 @@ pub struct Ipv4Packet<'a> {
     pub payload: &'a [u8],
 }
 
+// Volatile (not atomic) — see SEQ_COUNTER comment in tcp.rs.
 static mut IP_ID_COUNTER: u16 = 1;
 
 pub fn ipv4_send(dst: Ipv4Addr, proto: u8, payload: &[u8]) {

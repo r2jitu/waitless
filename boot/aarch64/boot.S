@@ -266,11 +266,15 @@ setup_mmu:
     ldr     x0, =0x0000004000000401    // PA=0x4000000000, device nGnRnE, AF=1
     str     x0, [x1, #(256*8)]
 
-    // Make sure writes are visible before loading TTBR0
+    // Make sure page table writes are visible
     dsb     sy
 
+    // ---- Invalidate TLB before enabling MMU ---------------------------------
+    tlbi    vmalle1
+    dsb     sy
+    isb
+
     // ---- Set TTBR0_EL1 to our L1 table ------------------------------------
-    // With T0SZ=25 the initial lookup is at L1 — TTBR0 points directly to L1.
     adrp    x0, boot_l1_table
     add     x0, x0, :lo12:boot_l1_table
     msr     ttbr0_el1, x0
@@ -285,6 +289,50 @@ setup_mmu:
     msr     sctlr_el1, x0
     isb
 
+    ret
+
+// ============================================================================
+// Invalidate entire D-cache by set/way (all levels up to LoC).
+// Clobbers: x0-x12. Safe to call with MMU off.
+// Based on ARM Architecture Reference Manual D7.9.2.
+// ============================================================================
+invalidate_dcache:
+    mrs     x0, clidr_el1
+    ubfx    w3, w0, #24, #3         // w3 = LoC (Level of Coherence)
+    cbz     w3, .Linv_done
+    mov     w10, #0                 // w10 = current level * 2
+.Linv_level:
+    add     w12, w10, w10, lsr #1   // w12 = level * 3 (index into CLIDR)
+    lsr     w1, w0, w12
+    and     w1, w1, #7              // cache type at this level
+    cmp     w1, #2                  // >= 2 means data or unified cache
+    blt     .Linv_next_level
+    msr     csselr_el1, x10         // select cache level
+    isb
+    mrs     x1, ccsidr_el1          // read cache geometry
+    and     w2, w1, #7              // log2(line_size) - 4
+    add     w2, w2, #4              // w2 = log2(line_size in bytes)
+    ubfx    w4, w1, #3, #10         // w4 = associativity - 1 (ways)
+    clz     w5, w4                  // w5 = bit position of way in DC ISW
+    ubfx    w7, w1, #13, #15        // w7 = num sets - 1
+.Linv_set:
+    mov     w6, w4                  // w6 = current way
+.Linv_way:
+    lsl     w11, w6, w5             // way << way_shift
+    lsl     w8, w7, w2              // set << set_shift
+    orr     w11, w11, w8
+    orr     w11, w11, w10           // level
+    dc      isw, x11               // invalidate by set/way
+    subs    w6, w6, #1
+    bge     .Linv_way
+    subs    w7, w7, #1
+    bge     .Linv_set
+.Linv_next_level:
+    add     w10, w10, #2
+    cmp     w3, w10
+    bgt     .Linv_level
+.Linv_done:
+    dsb     sy
     ret
 
 // ============================================================================
