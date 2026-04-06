@@ -2,11 +2,15 @@
 //
 // Re-exports per-protocol sub-crates and provides full-stack
 // poll/dispatch that ties them together.
+//
+// In single-queue mode (Tier 2), core 0 polls VirtIO and dispatches.
+// Other cores process their inbox (populated by core 0).
 
 #![no_std]
 #![allow(static_mut_refs)]
 
 extern crate drivers;
+extern crate kernel;
 pub extern crate net_types as types;
 pub extern crate net_ethernet as ethernet;
 pub extern crate net_arp as arp;
@@ -17,7 +21,12 @@ pub extern crate net_dhcp as dhcp;
 
 /// Poll the network device and dispatch received frames through the
 /// full stack: Ethernet -> ARP/IPv4 -> TCP/UDP.
+///
+/// In single-queue mode (Tier 2), only core 0 touches VirtIO.
+/// All TCP/UDP processing currently runs on core 0.
 pub fn poll() {
+    // TODO: when multi-core TCP is ready, check cpu_id and only
+    // poll VirtIO on core 0, process inbox on other cores.
     drivers::virtio_net::poll(net_receive);
 }
 
