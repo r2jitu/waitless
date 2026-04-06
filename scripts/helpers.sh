@@ -67,7 +67,7 @@ start_qemu() {
         -serial "file:${log}" \
         -no-reboot \
         -device "${VIRTIO_DEV}",netdev=net0 \
-        -netdev "user,id=net0,hostfwd=tcp::${port}-:80" \
+        -netdev "user,id=net0,hostfwd=tcp::${port}-:80,hostfwd=udp::$((port+1))-:7" \
         &>/dev/null &
     VM_PID=$!
 }

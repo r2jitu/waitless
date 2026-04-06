@@ -16,16 +16,16 @@ pub(crate) struct UdpHeader {
 
 const MAX_HANDLERS: usize = 8;
 
-/// Registered UDP port handler.
 struct PortHandler {
     port: u16,
-    handler: fn(src_ip: Ipv4Addr, src_port: u16, data: &[u8]),
+    handler: fn([u8; 4], u16, &[u8]),
 }
 
 static mut HANDLERS: [Option<PortHandler>; MAX_HANDLERS] = [const { None }; MAX_HANDLERS];
 
 /// Register a handler for incoming UDP packets on a specific port.
-pub fn bind(port: u16, handler: fn(Ipv4Addr, u16, &[u8])) {
+/// Callback receives (src_ip_octets, src_port, payload).
+pub fn bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
     unsafe {
         for slot in HANDLERS.iter_mut() {
             if slot.is_none() {
@@ -37,12 +37,13 @@ pub fn bind(port: u16, handler: fn(Ipv4Addr, u16, &[u8])) {
 }
 
 /// Send a UDP datagram.
-pub fn send(dst_ip: Ipv4Addr, src_port: u16, dst_port: u16, data: &[u8]) {
+pub fn send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
     let udp_len = 8 + data.len();
     if udp_len > 1480 {
-        return; // Too large for single IPv4 packet
+        return;
     }
 
+    let dst = Ipv4Addr::from(dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]);
     static mut TX_BUF: [u8; 1480] = [0; 1480];
 
     unsafe {
@@ -52,13 +53,11 @@ pub fn send(dst_ip: Ipv4Addr, src_port: u16, dst_port: u16, data: &[u8]) {
         hdr.length = htons(udp_len as u16);
         hdr.checksum = 0;
 
-        // Copy payload after header
         core::ptr::copy_nonoverlapping(data.as_ptr(), TX_BUF.as_mut_ptr().add(8), data.len());
 
-        // UDP checksum (optional for IPv4, but good practice)
-        hdr.checksum = tcp_checksum(CONFIG.ip, dst_ip, PROTO_UDP, TX_BUF.as_ptr(), udp_len);
+        hdr.checksum = tcp_checksum(CONFIG.ip, dst, PROTO_UDP, TX_BUF.as_ptr(), udp_len);
 
-        ipv4_send(dst_ip, PROTO_UDP, &TX_BUF[..udp_len]);
+        ipv4_send(dst, PROTO_UDP, &TX_BUF[..udp_len]);
     }
 }
 
@@ -77,12 +76,11 @@ pub(crate) fn udp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
     }
     let payload = &data[8..udp_len];
 
-    // Dispatch to registered handler
     unsafe {
         for slot in HANDLERS.iter() {
             if let Some(h) = slot {
                 if h.port == dst_port {
-                    (h.handler)(src_ip, src_port, payload);
+                    (h.handler)(src_ip.octets(), src_port, payload);
                     return;
                 }
             }

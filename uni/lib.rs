@@ -48,6 +48,26 @@ mod backend {
 
 pub use backend::{log, config_port, check_shutdown, wait_for_events, tcp_poll};
 
+// ---- UDP --------------------------------------------------------------------
+
+/// Bind a UDP port handler. Callback receives (src_ip_octets, src_port, payload).
+#[cfg(platform_unikernel)]
+pub fn udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
+    net::udp::bind(port, handler);
+}
+
+/// Send a UDP datagram.
+#[cfg(platform_unikernel)]
+pub fn udp_send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
+    net::udp::send(dst_ip, src_port, dst_port, data);
+}
+
+#[cfg(platform_native)]
+pub fn udp_bind(_port: u16, _handler: fn([u8; 4], u16, &[u8])) {}
+
+#[cfg(platform_native)]
+pub fn udp_send(_dst_ip: [u8; 4], _src_port: u16, _dst_port: u16, _data: &[u8]) {}
+
 // ---- TcpListener ------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Eq)]

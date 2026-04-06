@@ -71,6 +71,13 @@ fn main() {
     uni::log(b"Starting Rust HTTP server...\n");
     let port = uni::config_port(80);
 
+    // Start UDP echo server on port 7
+    fn udp_echo(src_ip: [u8; 4], src_port: u16, data: &[u8]) {
+        uni::udp_send(src_ip, 7, src_port, data);
+    }
+    uni::udp_bind(7, udp_echo);
+    uni::log(b"UDP echo server on port 7\n");
+
     static mut SERVER: Server = Server::new();
     let server = unsafe { &mut *core::ptr::addr_of_mut!(SERVER) };
     server.default_handler(handle_request);

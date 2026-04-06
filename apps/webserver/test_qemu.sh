@@ -32,6 +32,27 @@ check_http "GET /"         "http://localhost:${PORT}/"       "200"             |
 check_http "GET /health"   "http://localhost:${PORT}/health" "200"             || FAILURES=$((FAILURES+1))
 check_http "GET /notfound" "http://localhost:${PORT}/xyz"    "404" "Not Found" || FAILURES=$((FAILURES+1))
 
+echo ""; echo "==> Running UDP echo test (QEMU)..."
+UDP_PORT=$((PORT+1))
+REPLY=$(python3 -c "
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(2)
+s.sendto(b'hello', ('127.0.0.1', $UDP_PORT))
+try:
+    data, _ = s.recvfrom(1024)
+    sys.stdout.write(data.decode())
+except socket.timeout:
+    pass
+s.close()
+" 2>/dev/null || true)
+if [[ "$REPLY" == "hello" ]]; then
+    echo "  PASS: UDP echo on port $UDP_PORT"
+else
+    echo "  FAIL: UDP echo — expected 'hello', got '${REPLY:-<empty>}'"
+    FAILURES=$((FAILURES+1))
+fi
+
 echo ""
 [[ $FAILURES -eq 0 ]] && { echo "ALL QEMU TESTS PASSED"; exit 0; }
 echo "$FAILURES QEMU TEST(S) FAILED"; tail -40 "$VM_LOG"; exit 1
