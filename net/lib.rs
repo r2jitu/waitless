@@ -47,7 +47,9 @@ pub fn poll() {
     // Tier 2: multi-core with software distribution.
     unsafe {
         if !MULTICORE_INIT {
-            percpu::set_ap_poll_fn(ap_poll);
+            // Note: we do NOT set ap_poll_fn here — the application layer
+            // (e.g. HTTP server) registers its own poll function that includes
+            // both RX inbox draining and application-level connection servicing.
             MULTICORE_INIT = true;
             kernel::serial::puts(b"[net] Tier 2: software distribution (");
             let mut buf = [0u8; 4];
@@ -92,30 +94,32 @@ fn distribute_frame(frame: &[u8]) {
             }
             ethernet::ETHERTYPE_IPV4 => {
                 if let Some(pkt) = ipv4::ipv4_receive(payload) {
-                    match pkt.protocol {
-                        ipv4::PROTO_TCP => {
-                            // TCP: always core 0 (global connection table, not yet per-core).
-                            tcp::tcp_receive(pkt.src, pkt.dst, pkt.payload);
+                    // Extract ports for flow hash (TCP and UDP both have ports at offset 0-3).
+                    let (src_port, dst_port) = if pkt.payload.len() >= 4 {
+                        (u16::from_be_bytes([pkt.payload[0], pkt.payload[1]]),
+                         u16::from_be_bytes([pkt.payload[2], pkt.payload[3]]))
+                    } else {
+                        (0, 0)
+                    };
+                    let target = flow_hash(
+                        pkt.src.addr, pkt.dst.addr, src_port, dst_port, num_cores,
+                    );
+
+                    if target == 0 {
+                        // Process locally on core 0.
+                        match pkt.protocol {
+                            ipv4::PROTO_TCP => tcp::tcp_receive(pkt.src, pkt.dst, pkt.payload),
+                            ipv4::PROTO_UDP => udp::udp_receive(pkt.src, pkt.dst, pkt.payload),
+                            _ => {}
                         }
-                        ipv4::PROTO_UDP => {
-                            // UDP: distribute by flow hash (stateless, safe on any core).
-                            let (src_port, dst_port) = udp_ports(pkt.payload);
-                            let target = flow_hash(
-                                pkt.src.addr, pkt.dst.addr, src_port, dst_port, num_cores,
-                            );
-                            if target == 0 {
-                                udp::udp_receive(pkt.src, pkt.dst, pkt.payload);
-                            } else {
-                                // Copy the raw frame to the target core's RX inbox.
-                                unsafe {
-                                    let core = percpu::get(target);
-                                    if core.rx_inbox.push(frame) {
-                                        WAKEUP[target as usize] = true;
-                                    }
-                                }
+                    } else {
+                        // Distribute to target core's RX inbox.
+                        unsafe {
+                            let core = percpu::get(target);
+                            if core.rx_inbox.push(frame) {
+                                WAKEUP[target as usize] = true;
                             }
                         }
-                        _ => {}
                     }
                 }
             }
@@ -124,24 +128,10 @@ fn distribute_frame(frame: &[u8]) {
     }
 }
 
-/// AP poll function: drain this core's RX inbox and process each frame.
-/// Returns true if any work was done.
-fn ap_poll(core_id: u32) -> bool {
-    let mut did_work = false;
-    unsafe {
-        let core = percpu::get(core_id);
-        while let Some(frame) = core.rx_inbox.pop() {
-            net_receive(frame);
-            did_work = true;
-        }
-    }
-    did_work
-}
-
 /// Process a single received frame through the full stack.
 /// Called on core 0 for single-core mode and ARP/TCP frames,
-/// and on any core for distributed UDP frames.
-fn net_receive(frame: &[u8]) {
+/// and on any core for distributed frames via ap_poll.
+pub fn net_receive(frame: &[u8]) {
     if let Some((ethertype, payload)) = ethernet::ethernet_parse(frame) {
         match ethertype {
             ethernet::ETHERTYPE_ARP => arp::arp_receive(payload),
@@ -157,16 +147,6 @@ fn net_receive(frame: &[u8]) {
             _ => {}
         }
     }
-}
-
-/// Extract UDP source and destination ports from a UDP header.
-fn udp_ports(payload: &[u8]) -> (u16, u16) {
-    if payload.len() < 4 {
-        return (0, 0);
-    }
-    let src = u16::from_be_bytes([payload[0], payload[1]]);
-    let dst = u16::from_be_bytes([payload[2], payload[3]]);
-    (src, dst)
 }
 
 /// Flow hash: map a 4-tuple to a core index.

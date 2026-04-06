@@ -1,4 +1,8 @@
-// net/tcp.rs — TCP state machine, connection pool, ring buffers.
+// net/tcp.rs — TCP state machine, per-core connection pool, ring buffers.
+//
+// Connections are partitioned across cores. Each core owns a slice of
+// the global pool. The flow hash (in net/lib.rs) routes packets to the
+// owning core. All connection operations are core-local — no locks.
 
 #![no_std]
 #![allow(static_mut_refs)]
@@ -56,7 +60,8 @@ struct TcpHeader {
     urgent: u16,
 }
 
-const MAX_CONNECTIONS: usize = 128;
+const CONNECTIONS_PER_CORE: usize = 32;
+const MAX_CORES: usize = 8;
 const RX_BUF_SIZE: usize = 8192;
 const MSS: usize = 1460;
 
@@ -113,7 +118,6 @@ impl TcpConnection {
         let free = self.rx_free();
         let n = data.len().min(free);
         if n == 0 { return 0; }
-        // Copy in up to two chunks (head to end, then wraparound to start).
         let contig = self.rx_buf_size - self.rx_head;
         if n <= contig {
             unsafe { ptr::copy_nonoverlapping(data.as_ptr(), self.rx_buf.add(self.rx_head), n) };
@@ -130,7 +134,6 @@ impl TcpConnection {
     fn rx_pop(&mut self, buf: &mut [u8]) -> usize {
         let used = self.rx_used();
         let n = buf.len().min(used);
-        // Optimize: contiguous read from tail
         let contig = self.rx_buf_size - self.rx_tail;
         if n <= contig {
             unsafe { ptr::copy_nonoverlapping(self.rx_buf.add(self.rx_tail), buf.as_mut_ptr(), n) };
@@ -145,30 +148,50 @@ impl TcpConnection {
     }
 }
 
-static mut CONNECTIONS: [TcpConnection; MAX_CONNECTIONS] =
-    [const { TcpConnection::new() }; MAX_CONNECTIONS];
+// Per-core connection pools. Core N owns POOLS[N].
+static mut POOLS: [[TcpConnection; CONNECTIONS_PER_CORE]; MAX_CORES] =
+    [const { [const { TcpConnection::new() }; CONNECTIONS_PER_CORE] }; MAX_CORES];
 static mut SEQ_COUNTER: u32 = 100_000;
 
+/// Encode a connection handle from core + slot index.
+/// Handle = (core << 8) | slot, +1 to avoid null.
+fn encode_handle(core: u32, slot: usize) -> *mut () {
+    (((core as usize) << 8 | slot) + 1) as *mut ()
+}
 
-fn alloc_connection() -> Option<usize> {
-    unsafe {
-        for i in 0..MAX_CONNECTIONS {
-            if CONNECTIONS[i].state == TcpState::Closed {
-                CONNECTIONS[i] = TcpConnection::new();
-                return Some(i);
-            }
-        }
+/// Decode a handle into (core, slot).
+fn decode_handle(handle: *mut ()) -> Option<(u32, usize)> {
+    let v = (handle as usize).wrapping_sub(1);
+    let core = (v >> 8) as u32;
+    let slot = v & 0xFF;
+    if core as usize >= MAX_CORES || slot >= CONNECTIONS_PER_CORE {
         None
+    } else {
+        Some((core, slot))
     }
 }
 
-fn free_connection(idx: usize) {
-    unsafe {
-        if !CONNECTIONS[idx].rx_buf.is_null() {
-            mm::kfree(CONNECTIONS[idx].rx_buf);
+fn pool(core: u32) -> &'static mut [TcpConnection; CONNECTIONS_PER_CORE] {
+    unsafe { &mut POOLS[core as usize] }
+}
+
+fn alloc_connection(core: u32) -> Option<usize> {
+    let p = pool(core);
+    for i in 0..CONNECTIONS_PER_CORE {
+        if p[i].state == TcpState::Closed {
+            p[i] = TcpConnection::new();
+            return Some(i);
         }
-        CONNECTIONS[idx] = TcpConnection::new();
     }
+    None
+}
+
+fn free_connection(core: u32, slot: usize) {
+    let p = pool(core);
+    if !p[slot].rx_buf.is_null() {
+        mm::kfree(p[slot].rx_buf);
+    }
+    p[slot] = TcpConnection::new();
 }
 
 fn send_segment(
@@ -229,6 +252,7 @@ fn send_rst(dst_ip: Ipv4Addr, src_port: u16, dst_port: u16, seq: u32, ack: u32) 
     }
 }
 
+/// Process an incoming TCP packet. Called on the owning core (via flow hash).
 pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
     if data.len() < 20 {
         return;
@@ -243,20 +267,22 @@ pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
     let payload_len = if data.len() > data_offset { data.len() - data_offset } else { 0 };
     let payload = &data[data_offset..];
 
+    // Determine which core owns this packet.
+    let core = kernel::cpu_id();
+    let p = pool(core);
+
     // RST handling
     if flags & TCP_RST != 0 {
-        unsafe {
-            for i in 0..MAX_CONNECTIONS {
-                let c = &mut CONNECTIONS[i];
-                if c.state != TcpState::Closed
-                    && c.state != TcpState::Listen
-                    && c.remote_ip == src_ip
-                    && c.local_port == dst_port
-                    && c.remote_port == src_port
-                {
-                    free_connection(i);
-                    return;
-                }
+        for i in 0..CONNECTIONS_PER_CORE {
+            let c = &mut p[i];
+            if c.state != TcpState::Closed
+                && c.state != TcpState::Listen
+                && c.remote_ip == src_ip
+                && c.local_port == dst_port
+                && c.remote_port == src_port
+            {
+                free_connection(core, i);
+                return;
             }
         }
         return;
@@ -264,12 +290,11 @@ pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
 
     // SYN — new connection from client
     if flags & TCP_SYN != 0 && flags & TCP_ACK == 0 {
-        // Find listener
-        let listener_idx = unsafe {
+        // Find listener on this core
+        let listener_idx = {
             let mut found = None;
-            for i in 0..MAX_CONNECTIONS {
-                if CONNECTIONS[i].state == TcpState::Listen && CONNECTIONS[i].local_port == dst_port
-                {
+            for i in 0..CONNECTIONS_PER_CORE {
+                if p[i].state == TcpState::Listen && p[i].local_port == dst_port {
                     found = Some(i);
                     break;
                 }
@@ -282,20 +307,22 @@ pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
             return;
         }
 
-        // Allocate new connection
-        let idx = match alloc_connection() {
+        // Allocate new connection on this core
+        let slot = match alloc_connection(core) {
             Some(i) => i,
             None => return,
         };
 
-        unsafe {
-            let c = &mut CONNECTIONS[idx];
+        {
+            let c = &mut pool(core)[slot];
             c.state = TcpState::SynReceived;
             c.remote_ip = src_ip;
             c.local_port = dst_port;
             c.remote_port = src_port;
-            SEQ_COUNTER = SEQ_COUNTER.wrapping_add(64000);
-            c.snd_nxt = SEQ_COUNTER;
+            unsafe {
+                SEQ_COUNTER = SEQ_COUNTER.wrapping_add(64000);
+                c.snd_nxt = SEQ_COUNTER;
+            }
             c.snd_una = c.snd_nxt;
             c.rcv_nxt = seq + 1;
             c.listener_port = dst_port;
@@ -309,19 +336,19 @@ pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
         }
 
         // Send SYN+ACK
-        unsafe {
-            let c = &CONNECTIONS[idx];
+        {
+            let c = &pool(core)[slot];
             send_segment(src_ip, dst_port, src_port, c.snd_nxt, c.rcv_nxt, TCP_SYN | TCP_ACK, &[]);
-            CONNECTIONS[idx].snd_nxt = CONNECTIONS[idx].snd_nxt.wrapping_add(1);
         }
+        pool(core)[slot].snd_nxt = pool(core)[slot].snd_nxt.wrapping_add(1);
         return;
     }
 
-    // Find existing connection
-    let conn_idx = unsafe {
+    // Find existing connection on this core
+    let conn_slot = {
         let mut found = None;
-        for i in 0..MAX_CONNECTIONS {
-            let c = &CONNECTIONS[i];
+        for i in 0..CONNECTIONS_PER_CORE {
+            let c = &p[i];
             if c.state != TcpState::Closed
                 && c.state != TcpState::Listen
                 && c.remote_ip == src_ip
@@ -335,199 +362,184 @@ pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
         found
     };
 
-    let idx = match conn_idx {
+    let slot = match conn_slot {
         Some(i) => i,
         None => return,
     };
 
-    unsafe {
-        let c = &mut CONNECTIONS[idx];
+    let c = &mut pool(core)[slot];
 
-        // Process ACK
-        if flags & TCP_ACK != 0 {
-            if c.state == TcpState::SynReceived {
-                c.state = TcpState::Established;
-                c.snd_una = ack;
-            } else {
-                c.snd_una = ack;
-            }
+    // Process ACK
+    if flags & TCP_ACK != 0 {
+        if c.state == TcpState::SynReceived {
+            c.state = TcpState::Established;
+            c.snd_una = ack;
+        } else {
+            c.snd_una = ack;
         }
+    }
 
-        // Process data
-        if payload_len > 0 && (c.state == TcpState::Established || c.state == TcpState::FinWait1 || c.state == TcpState::FinWait2) {
-            if seq == c.rcv_nxt {
-                // In-order data
-                let pushed = c.rx_push(&payload[..payload_len]);
-                c.rcv_nxt = c.rcv_nxt.wrapping_add(pushed as u32);
-                c.rcv_wnd = c.rx_free() as u16;
-                // ACK
-                send_segment(src_ip, dst_port, src_port, c.snd_nxt, c.rcv_nxt, TCP_ACK, &[]);
-            } else if seq_lt(seq, c.rcv_nxt) {
-                // Duplicate — resend ACK
-                send_segment(src_ip, dst_port, src_port, c.snd_nxt, c.rcv_nxt, TCP_ACK, &[]);
-            }
-            // Out of order: silently drop
-        }
-
-        // Process FIN
-        if flags & TCP_FIN != 0 {
-            c.rcv_nxt = c.rcv_nxt.wrapping_add(1);
+    // Process data
+    if payload_len > 0 && (c.state == TcpState::Established || c.state == TcpState::FinWait1 || c.state == TcpState::FinWait2) {
+        if seq == c.rcv_nxt {
+            let pushed = c.rx_push(&payload[..payload_len]);
+            c.rcv_nxt = c.rcv_nxt.wrapping_add(pushed as u32);
+            c.rcv_wnd = c.rx_free() as u16;
             send_segment(src_ip, dst_port, src_port, c.snd_nxt, c.rcv_nxt, TCP_ACK, &[]);
+        } else if seq_lt(seq, c.rcv_nxt) {
+            send_segment(src_ip, dst_port, src_port, c.snd_nxt, c.rcv_nxt, TCP_ACK, &[]);
+        }
+    }
 
-            match c.state {
-                TcpState::Established | TcpState::SynReceived => {
-                    c.state = TcpState::CloseWait;
-                }
-                TcpState::FinWait1 => {
-                    // Simultaneous close: FIN received in FinWait1 → TimeWait.
-                    // Simplified: skip TimeWait timer and free immediately.
-                    free_connection(idx);
-                }
-                TcpState::FinWait2 => {
-                    // TIME_WAIT → immediate close (simplified)
-                    free_connection(idx);
-                }
-                _ => {}
+    // Process FIN
+    if flags & TCP_FIN != 0 {
+        c.rcv_nxt = c.rcv_nxt.wrapping_add(1);
+        send_segment(src_ip, dst_port, src_port, c.snd_nxt, c.rcv_nxt, TCP_ACK, &[]);
+
+        match c.state {
+            TcpState::Established | TcpState::SynReceived => {
+                c.state = TcpState::CloseWait;
             }
+            TcpState::FinWait1 => {
+                free_connection(core, slot);
+            }
+            TcpState::FinWait2 => {
+                free_connection(core, slot);
+            }
+            _ => {}
         }
     }
 }
 
-/// Compare TCP sequence numbers (handles wraparound).
 fn seq_lt(a: u32, b: u32) -> bool {
     (a.wrapping_sub(b) as i32) < 0
 }
 
 // ============================================================================
-// TCP public API
+// TCP public API — handles encode (core, slot) for transparent routing.
 // ============================================================================
 
-/// Initialize TCP connection pool.
+/// Initialize TCP connection pools.
 pub fn init() {
-    unsafe {
-        for i in 0..MAX_CONNECTIONS {
-            CONNECTIONS[i] = TcpConnection::new();
+    for core in 0..MAX_CORES {
+        for i in 0..CONNECTIONS_PER_CORE {
+            pool(core as u32)[i] = TcpConnection::new();
         }
     }
 }
 
+/// Create a listener on the current core.
 pub fn listen(port: u16) -> *mut () {
-    let idx = match alloc_connection() {
+    listen_on_core(kernel::cpu_id(), port)
+}
+
+/// Create a listener on a specific core.
+pub fn listen_on_core(core: u32, port: u16) -> *mut () {
+    let slot = match alloc_connection(core) {
         Some(i) => i,
         None => return ptr::null_mut(),
     };
-    unsafe {
-        CONNECTIONS[idx].state = TcpState::Listen;
-        CONNECTIONS[idx].local_port = port;
-        // Return connection index encoded as pointer (1-based to avoid null)
-        (idx + 1) as *mut ()
-    }
+    pool(core)[slot].state = TcpState::Listen;
+    pool(core)[slot].local_port = port;
+    encode_handle(core, slot)
 }
 
+/// Accept a connection from a specific core's pool.
 pub fn accept(handle: *mut ()) -> *mut () {
-    let listener_idx = (handle as usize) - 1;
-    if listener_idx >= MAX_CONNECTIONS {
-        return ptr::null_mut();
-    }
-
-    unsafe {
-        let port = CONNECTIONS[listener_idx].local_port;
-        for i in 0..MAX_CONNECTIONS {
-            let c = &mut CONNECTIONS[i];
-            if c.state == TcpState::Established && c.listener_port == port && !c.accepted {
-                c.accepted = true;
-                return (i + 1) as *mut ();
-            }
+    let (core, listener_slot) = match decode_handle(handle) {
+        Some(v) => v,
+        None => return ptr::null_mut(),
+    };
+    let p = pool(core);
+    let port = p[listener_slot].local_port;
+    for i in 0..CONNECTIONS_PER_CORE {
+        let c = &mut p[i];
+        if c.state == TcpState::Established && c.listener_port == port && !c.accepted {
+            c.accepted = true;
+            return encode_handle(core, i);
         }
     }
     ptr::null_mut()
 }
 
 pub fn has_data(handle: *mut ()) -> bool {
-    let idx = (handle as usize) - 1;
-    if idx >= MAX_CONNECTIONS {
-        return false;
-    }
-    unsafe { CONNECTIONS[idx].rx_used() > 0 }
+    let (core, slot) = match decode_handle(handle) {
+        Some(v) => v,
+        None => return false,
+    };
+    pool(core)[slot].rx_used() > 0
 }
 
 pub fn recv(handle: *mut (), buf: &mut [u8]) -> usize {
-    let idx = (handle as usize) - 1;
-    if idx >= MAX_CONNECTIONS {
-        return 0;
-    }
-    unsafe { CONNECTIONS[idx].rx_pop(buf) }
+    let (core, slot) = match decode_handle(handle) {
+        Some(v) => v,
+        None => return 0,
+    };
+    pool(core)[slot].rx_pop(buf)
 }
 
 pub fn send(handle: *mut (), data: &[u8]) -> i32 {
-    let idx = (handle as usize) - 1;
-    if idx >= MAX_CONNECTIONS {
+    let (core, slot) = match decode_handle(handle) {
+        Some(v) => v,
+        None => return -1,
+    };
+    let c = &mut pool(core)[slot];
+    if c.state != TcpState::Established {
         return -1;
     }
-    unsafe {
-        let c = &mut CONNECTIONS[idx];
-        if c.state != TcpState::Established {
-            return -1;
-        }
 
-        // Send in MSS-sized chunks
-        let len = data.len();
-        let mut sent = 0;
-        while sent < len {
-            let chunk = (len - sent).min(MSS);
-            send_segment(
-                c.remote_ip,
-                c.local_port,
-                c.remote_port,
-                c.snd_nxt,
-                c.rcv_nxt,
-                TCP_ACK | TCP_PSH,
-                &data[sent..sent + chunk],
-            );
-            c.snd_nxt = c.snd_nxt.wrapping_add(chunk as u32);
-            sent += chunk;
-        }
-        sent as i32
+    let len = data.len();
+    let mut sent = 0;
+    while sent < len {
+        let chunk = (len - sent).min(MSS);
+        send_segment(
+            c.remote_ip,
+            c.local_port,
+            c.remote_port,
+            c.snd_nxt,
+            c.rcv_nxt,
+            TCP_ACK | TCP_PSH,
+            &data[sent..sent + chunk],
+        );
+        c.snd_nxt = c.snd_nxt.wrapping_add(chunk as u32);
+        sent += chunk;
     }
+    sent as i32
 }
 
 pub fn close(handle: *mut ()) {
-    let idx = (handle as usize) - 1;
-    if idx >= MAX_CONNECTIONS {
-        return;
-    }
-    unsafe {
-        let c = &mut CONNECTIONS[idx];
-        match c.state {
-            TcpState::Established => {
-                // Send FIN
-                send_segment(
-                    c.remote_ip, c.local_port, c.remote_port,
-                    c.snd_nxt, c.rcv_nxt, TCP_FIN | TCP_ACK, &[],
-                );
-                c.snd_nxt = c.snd_nxt.wrapping_add(1);
-                c.state = TcpState::FinWait1;
-            }
-            TcpState::CloseWait => {
-                send_segment(
-                    c.remote_ip, c.local_port, c.remote_port,
-                    c.snd_nxt, c.rcv_nxt, TCP_FIN | TCP_ACK, &[],
-                );
-                c.snd_nxt = c.snd_nxt.wrapping_add(1);
-                c.state = TcpState::LastAck;
-            }
-            _ => {
-                free_connection(idx);
-            }
+    let (core, slot) = match decode_handle(handle) {
+        Some(v) => v,
+        None => return,
+    };
+    let c = &mut pool(core)[slot];
+    match c.state {
+        TcpState::Established => {
+            send_segment(
+                c.remote_ip, c.local_port, c.remote_port,
+                c.snd_nxt, c.rcv_nxt, TCP_FIN | TCP_ACK, &[],
+            );
+            c.snd_nxt = c.snd_nxt.wrapping_add(1);
+            c.state = TcpState::FinWait1;
+        }
+        TcpState::CloseWait => {
+            send_segment(
+                c.remote_ip, c.local_port, c.remote_port,
+                c.snd_nxt, c.rcv_nxt, TCP_FIN | TCP_ACK, &[],
+            );
+            c.snd_nxt = c.snd_nxt.wrapping_add(1);
+            c.state = TcpState::LastAck;
+        }
+        _ => {
+            free_connection(core, slot);
         }
     }
 }
 
 pub fn is_closed(handle: *mut ()) -> bool {
-    let idx = (handle as usize) - 1;
-    if idx >= MAX_CONNECTIONS {
-        return true;
-    }
-    unsafe { CONNECTIONS[idx].state == TcpState::Closed }
+    let (core, slot) = match decode_handle(handle) {
+        Some(v) => v,
+        None => return true,
+    };
+    pool(core)[slot].state == TcpState::Closed
 }
-

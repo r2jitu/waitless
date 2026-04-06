@@ -4,6 +4,10 @@
 // accepts connections, reads data, parses HTTP requests, dispatches to
 // handlers, and sends responses.
 //
+// Multi-core: each core creates its own TCP listener and maintains its
+// own active connection set. Core 0 runs the main event loop; APs run
+// HTTP service via the percpu ap_poll hook. Routes are shared (read-only).
+//
 // All buffers are fixed-size, stack/static allocated. No heap.
 
 use crate::{TcpListener, TcpStream};
@@ -38,11 +42,11 @@ impl Header {
         }
     }
 
-    fn name(&self) -> &[u8] {
+    pub fn name(&self) -> &[u8] {
         &self.name[..self.name_len]
     }
 
-    fn value(&self) -> &[u8] {
+    pub fn value(&self) -> &[u8] {
         &self.value[..self.value_len]
     }
 }
@@ -51,41 +55,29 @@ pub struct Request {
     pub method: Method,
     path: [u8; 256],
     path_len: usize,
-    body: [u8; 8192],
-    pub body_len: usize,
     headers: [Header; 16],
     header_count: usize,
+    body: [u8; 8192],
+    body_len: usize,
 }
 
 impl Request {
-    const fn new() -> Self {
+    pub fn new() -> Self {
         Request {
             method: Method::Unknown,
             path: [0; 256],
             path_len: 0,
-            body: [0; 8192],
-            body_len: 0,
             headers: [const { Header::new() }; 16],
             header_count: 0,
+            body: [0; 8192],
+            body_len: 0,
         }
-    }
-
-    fn clear(&mut self) {
-        self.method = Method::Unknown;
-        self.path_len = 0;
-        self.body_len = 0;
-        self.header_count = 0;
     }
 
     pub fn path(&self) -> &[u8] {
         &self.path[..self.path_len]
     }
 
-    pub fn body(&self) -> &[u8] {
-        &self.body[..self.body_len]
-    }
-
-    /// Look up a header by name (case-insensitive). Returns None if not found.
     pub fn get_header(&self, name: &[u8]) -> Option<&[u8]> {
         for i in 0..self.header_count {
             if self.headers[i].name().eq_ignore_ascii_case(name) {
@@ -94,67 +86,59 @@ impl Request {
         }
         None
     }
+
+    #[allow(dead_code)]
+    pub fn body(&self) -> &[u8] {
+        &self.body[..self.body_len]
+    }
+
+    fn clear(&mut self) {
+        self.method = Method::Unknown;
+        self.path_len = 0;
+        self.header_count = 0;
+        self.body_len = 0;
+    }
 }
+
+// ---- Response ---------------------------------------------------------------
 
 pub struct Response {
     pub status: i32,
-    content_type: *const u8,
+    content_type: [u8; 64],
     content_type_len: usize,
-    body: *const u8,
+    body: [u8; 8192],
     body_len: usize,
 }
 
-// Response only contains pointers to static data, safe to send across contexts.
-unsafe impl Send for Response {}
-unsafe impl Sync for Response {}
-
 impl Response {
-    pub const fn ok(content_type: &'static [u8], body: &'static [u8]) -> Self {
-        Response {
+    pub fn ok(content_type: &[u8], body: &[u8]) -> Self {
+        let mut resp = Response {
             status: 200,
-            content_type: content_type.as_ptr(),
-            content_type_len: content_type.len(),
-            body: body.as_ptr(),
-            body_len: body.len(),
-        }
+            content_type: [0; 64],
+            content_type_len: 0,
+            body: [0; 8192],
+            body_len: 0,
+        };
+        let ct = content_type.len().min(64);
+        resp.content_type[..ct].copy_from_slice(&content_type[..ct]);
+        resp.content_type_len = ct;
+        let bl = body.len().min(8192);
+        resp.body[..bl].copy_from_slice(&body[..bl]);
+        resp.body_len = bl;
+        resp
     }
 
-    pub const fn not_found() -> Self {
-        Response {
-            status: 404,
-            content_type: b"text/plain".as_ptr(),
-            content_type_len: 10,
-            body: b"404 Not Found".as_ptr(),
-            body_len: 13,
-        }
-    }
-
-    pub const fn method_not_allowed() -> Self {
-        Response {
-            status: 405,
-            content_type: b"text/plain".as_ptr(),
-            content_type_len: 10,
-            body: b"405 Method Not Allowed".as_ptr(),
-            body_len: 22,
-        }
-    }
-
-    pub const fn error(status: i32, msg: &'static [u8]) -> Self {
-        Response {
-            status,
-            content_type: b"text/plain".as_ptr(),
-            content_type_len: 10,
-            body: msg.as_ptr(),
-            body_len: msg.len(),
-        }
-    }
-
-    fn content_type_bytes(&self) -> &[u8] {
-        unsafe { core::slice::from_raw_parts(self.content_type, self.content_type_len) }
+    pub fn not_found() -> Self {
+        let mut resp = Self::ok(b"text/plain", b"Not Found");
+        resp.status = 404;
+        resp
     }
 
     fn body_bytes(&self) -> &[u8] {
-        unsafe { core::slice::from_raw_parts(self.body, self.body_len) }
+        &self.body[..self.body_len]
+    }
+    fn content_type_bytes(&self) -> &[u8] {
+        &self.content_type[..self.content_type_len]
     }
 }
 
@@ -165,8 +149,9 @@ pub type Handler = fn(&Request) -> Response;
 // ---- Server -----------------------------------------------------------------
 
 const MAX_ROUTES: usize = 64;
-const MAX_ACTIVE: usize = 64;
+const MAX_ACTIVE: usize = 16; // per core
 const BUF_SIZE: usize = 8192;
+const MAX_CORES: usize = 8;
 
 struct Route {
     path: [u8; 256],
@@ -200,12 +185,30 @@ impl ActiveConn {
     }
 }
 
+/// Per-core HTTP state: listener + active connections.
+struct CoreHttp {
+    listener: Option<TcpListener>,
+    active: [ActiveConn; MAX_ACTIVE],
+}
+
+impl CoreHttp {
+    const fn new() -> Self {
+        CoreHttp {
+            listener: None,
+            active: [const { ActiveConn::new() }; MAX_ACTIVE],
+        }
+    }
+}
+
 pub struct Server {
     routes: [Route; MAX_ROUTES],
     route_count: usize,
     default_handler: Option<Handler>,
-    active: [ActiveConn; MAX_ACTIVE],
+    cores: [CoreHttp; MAX_CORES],
 }
+
+// Global server pointer for AP poll callback.
+static mut SERVER_PTR: *mut Server = core::ptr::null_mut();
 
 impl Server {
     pub const fn new() -> Self {
@@ -213,7 +216,7 @@ impl Server {
             routes: [const { Route::new() }; MAX_ROUTES],
             route_count: 0,
             default_handler: None,
-            active: [const { ActiveConn::new() }; MAX_ACTIVE],
+            cores: [const { CoreHttp::new() }; MAX_CORES],
         }
     }
 
@@ -238,13 +241,33 @@ impl Server {
 
     /// Run the event loop. Blocks until shutdown signal.
     pub fn run(&mut self, port: u16) {
-        let listener = match TcpListener::bind(port) {
-            Some(l) => l,
-            None => {
+        // Create a listener on each core's TCP pool (SO_REUSEPORT pattern).
+        // SYN packets hashed to core N will find the listener in core N's pool.
+        #[cfg(platform_unikernel)]
+        let num_cores = kernel::percpu::num_cores();
+        #[cfg(not(platform_unikernel))]
+        let num_cores = 1u32;
+
+        for i in 0..num_cores {
+            #[cfg(platform_unikernel)]
+            let handle = net::tcp::listen_on_core(i, port);
+            #[cfg(not(platform_unikernel))]
+            let handle = crate::backend::tcp_listen(port);
+
+            if handle.is_null() {
                 crate::log(b"http: failed to create TCP listener\n");
-                return;
+                if i == 0 { return; }
+            } else {
+                self.cores[i as usize].listener = Some(TcpListener(handle));
             }
-        };
+        }
+
+        // Register AP poll hook for multi-core HTTP service.
+        #[cfg(platform_unikernel)]
+        if num_cores > 1 {
+            unsafe { SERVER_PTR = self as *mut Server; }
+            kernel::percpu::set_ap_poll_fn(ap_http_poll);
+        }
 
         crate::log(b"http: listening\n");
 
@@ -255,83 +278,7 @@ impl Server {
             }
             crate::tcp_poll();
 
-            let mut had_work = false;
-
-            // Accept new connections
-            while let Some(stream) = listener.accept() {
-                had_work = true;
-                if let Some(ac) = self.alloc_active() {
-                    ac.conn = Some(stream);
-                } else {
-                    crate::log(b"http: too many connections, dropping\n");
-                    stream.close();
-                    break;
-                }
-            }
-
-            // Service active connections.
-            // Uses index-based access to avoid holding &mut self.active[i]
-            // while calling self.find_handler().
-            for i in 0..MAX_ACTIVE {
-                let conn = match self.active[i].conn {
-                    Some(c) => c,
-                    None => continue,
-                };
-
-                if conn.is_closed() {
-                    self.active[i].conn = None;
-                    self.active[i].buf_len = 0;
-                    had_work = true;
-                    continue;
-                }
-
-                if conn.has_data() {
-                    let buf_len = self.active[i].buf_len;
-                    let avail = BUF_SIZE - buf_len;
-                    if avail > 0 {
-                        let got = conn.recv(&mut self.active[i].buf[buf_len..buf_len + avail]);
-                        self.active[i].buf_len += got;
-                        had_work = true;
-                    }
-                }
-
-                let buf_len = self.active[i].buf_len;
-                if buf_len > 0 {
-                    let mut req = Request::new();
-                    let consumed = parse_request(&self.active[i].buf[..buf_len], &mut req);
-                    if consumed > 0 {
-                        let want_close = match req.get_header(b"Connection") {
-                            Some(v) => v.eq_ignore_ascii_case(b"close"),
-                            None => false,
-                        };
-
-                        let handler = self.find_handler(req.path());
-                        let resp = match handler {
-                            Some(h) => h(&req),
-                            None => Response::not_found(),
-                        };
-
-                        send_response(conn, &resp, !want_close);
-                        had_work = true;
-
-                        if want_close {
-                            conn.close();
-                            self.active[i].conn = None;
-                            self.active[i].buf_len = 0;
-                        } else {
-                            let remaining = buf_len - consumed;
-                            if remaining > 0 {
-                                self.active[i].buf.copy_within(consumed..buf_len, 0);
-                            }
-                            self.active[i].buf_len = remaining;
-                        }
-                    } else if buf_len >= BUF_SIZE {
-                        conn.close();
-                        self.active[i].conn = None;
-                        self.active[i].buf_len = 0;
-                    }
-                }
-            }
+            let had_work = self.service_core(0);
 
             if !had_work {
                 crate::wait_for_events();
@@ -339,24 +286,102 @@ impl Server {
         }
 
         // Graceful shutdown
-        for ac in self.active.iter_mut() {
-            if let Some(conn) = ac.conn.take() {
-                conn.close();
-                ac.buf_len = 0;
+        for core in self.cores.iter_mut() {
+            for ac in core.active.iter_mut() {
+                if let Some(conn) = ac.conn.take() {
+                    conn.close();
+                    ac.buf_len = 0;
+                }
+            }
+            if let Some(l) = core.listener.take() {
+                l.close();
             }
         }
-        listener.close();
         crate::log(b"http: server stopped\n");
     }
 
-    fn alloc_active(&mut self) -> Option<&mut ActiveConn> {
-        for ac in self.active.iter_mut() {
-            if ac.conn.is_none() {
-                ac.buf_len = 0;
-                return Some(ac);
+    /// Service connections for a specific core. Returns true if any work was done.
+    fn service_core(&mut self, core_id: u32) -> bool {
+        let mut had_work = false;
+
+        // Accept new connections
+        if let Some(listener) = self.cores[core_id as usize].listener {
+            while let Some(stream) = listener.accept() {
+                had_work = true;
+                if let Some(ac) = alloc_active(&mut self.cores[core_id as usize].active) {
+                    ac.conn = Some(stream);
+                } else {
+                    crate::log(b"http: too many connections, dropping\n");
+                    stream.close();
+                    break;
+                }
             }
         }
-        None
+
+        // Service active connections.
+        // Use index-based access to avoid borrow conflicts with find_handler.
+        for i in 0..MAX_ACTIVE {
+            let conn = match self.cores[core_id as usize].active[i].conn {
+                Some(c) => c,
+                None => continue,
+            };
+
+            if conn.is_closed() {
+                self.cores[core_id as usize].active[i].conn = None;
+                self.cores[core_id as usize].active[i].buf_len = 0;
+                had_work = true;
+                continue;
+            }
+
+            if conn.has_data() {
+                let buf_len = self.cores[core_id as usize].active[i].buf_len;
+                let avail = BUF_SIZE - buf_len;
+                if avail > 0 {
+                    let got = conn.recv(&mut self.cores[core_id as usize].active[i].buf[buf_len..buf_len + avail]);
+                    self.cores[core_id as usize].active[i].buf_len += got;
+                    had_work = true;
+                }
+            }
+
+            let buf_len = self.cores[core_id as usize].active[i].buf_len;
+            if buf_len > 0 {
+                let mut req = Request::new();
+                let consumed = parse_request(&self.cores[core_id as usize].active[i].buf[..buf_len], &mut req);
+                if consumed > 0 {
+                    let want_close = match req.get_header(b"Connection") {
+                        Some(v) => v.eq_ignore_ascii_case(b"close"),
+                        None => false,
+                    };
+
+                    let handler = self.find_handler(req.path());
+                    let resp = match handler {
+                        Some(h) => h(&req),
+                        None => Response::not_found(),
+                    };
+
+                    send_response(conn, &resp, !want_close);
+                    had_work = true;
+
+                    if want_close {
+                        conn.close();
+                        self.cores[core_id as usize].active[i].conn = None;
+                        self.cores[core_id as usize].active[i].buf_len = 0;
+                    } else {
+                        let remaining = buf_len - consumed;
+                        if remaining > 0 {
+                            self.cores[core_id as usize].active[i].buf.copy_within(consumed..buf_len, 0);
+                        }
+                        self.cores[core_id as usize].active[i].buf_len = remaining;
+                    }
+                } else if buf_len >= BUF_SIZE {
+                    conn.close();
+                    self.cores[core_id as usize].active[i].conn = None;
+                    self.cores[core_id as usize].active[i].buf_len = 0;
+                }
+            }
+        }
+
+        had_work
     }
 
     fn find_handler(&self, path: &[u8]) -> Option<Handler> {
@@ -374,6 +399,37 @@ impl Server {
         }
         self.default_handler
     }
+}
+
+fn alloc_active(active: &mut [ActiveConn; MAX_ACTIVE]) -> Option<&mut ActiveConn> {
+    for ac in active.iter_mut() {
+        if ac.conn.is_none() {
+            ac.buf_len = 0;
+            return Some(ac);
+        }
+    }
+    None
+}
+
+/// AP poll callback: drain RX inbox (network packets), then service HTTP connections.
+fn ap_http_poll(core_id: u32) -> bool {
+    // First, process any packets in this core's RX inbox (same as net::ap_poll).
+    #[cfg(platform_unikernel)]
+    {
+        unsafe {
+            let core = kernel::percpu::get(core_id);
+            while let Some(frame) = core.rx_inbox.pop() {
+                net::net_receive(frame);
+            }
+        }
+    }
+
+    // Then service HTTP connections.
+    let server = unsafe {
+        if SERVER_PTR.is_null() { return false; }
+        &mut *SERVER_PTR
+    };
+    server.service_core(core_id)
 }
 
 // ---- HTTP request parser ----------------------------------------------------
@@ -499,7 +555,6 @@ fn parse_request(data: &[u8], req: &mut Request) -> usize {
 
 // ---- Response sender --------------------------------------------------------
 
-/// Fixed-size buffer writer for building HTTP responses without heap allocation.
 struct BufWriter {
     buf: [u8; 2048],
     pos: usize,
