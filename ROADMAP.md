@@ -490,7 +490,7 @@ INIT-SIPI-SIPI after init is done.
 - [x] UNIKERNEL_CPUS env var for configurable SMP count in QEMU
 - [x] x86_64: extend boot page tables to 4GB (covers APIC MMIO at 0xFEE00000)
 - [x] x86_64: APIC detected + logged (SVR enable deferred to avoid PIC conflict)
-- [ ] x86_64: ACPI MADT parsing for CPU topology discovery
+- [x] x86_64: ACPI MADT parsing (kernel/x86_64/acpi.rs, detects 4 CPUs)
 - [x] x86_64: INIT-SIPI-SIPI infrastructure ready (kernel/x86_64/smp.rs + ap_boot.S)
 - [x] Per-core Chase-Lev deque (kernel/deque.rs, 8 unit tests)
 - [x] Per-core timer wheel + pending_timers MPSC queue (kernel/timer.rs, 6 tests)
