@@ -146,17 +146,11 @@ unsafe extern "C" fn ap_entry(_stack_top: u64) -> ! {
         // Unmask IRQs so SGI can be delivered
         core::arch::asm!("msr daifclr, #0x2", options(nomem, nostack));
 
-        // Mark this core as online (atomic increment)
-        core::arch::asm!(
-            "1: ldaxr {0:w}, [{1}]",
-            "add {0:w}, {0:w}, #1",
-            "stlxr {2:w}, {0:w}, [{1}]",
-            "cbnz {2:w}, 1b",
-            out(reg) _,
-            in(reg) &NUM_CORES_ONLINE as *const u32,
-            out(reg) _,
-            options(nostack),
-        );
+        // Mark this core as online. APs boot sequentially (BSP waits for
+        // each), so a volatile write is safe — no concurrent writers.
+        // Avoids LDXR/STXR which VZ doesn't handle correctly for all regions.
+        let n = core::ptr::read_volatile(&NUM_CORES_ONLINE);
+        core::ptr::write_volatile(&raw mut NUM_CORES_ONLINE, n + 1);
 
         // Log
         let id = cpu_id();
