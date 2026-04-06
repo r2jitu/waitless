@@ -26,23 +26,6 @@ pub fn wait_for_events() {
         unsafe { arch_mask_irq() };
         drivers::virtio_net::arm_rx_interrupts();
         if !drivers::virtio_net::has_pending_rx() && !drivers::virtio_net::has_pending_tx() {
-            #[cfg(platform_unikernel)]
-            if kernel::percpu::num_cores() > 1 {
-                // Multi-core: short spin so we can promptly flush AP TX staging.
-                // WFI/HLT doesn't reliably wake on AP TX staging IPI during
-                // the masked IRQ window.
-                for _ in 0..10_000u32 {
-                    unsafe { arch_cpu_relax() };
-                    if drivers::virtio_net::has_pending_rx()
-                        || drivers::virtio_net::has_pending_tx()
-                    {
-                        break;
-                    }
-                }
-            } else {
-                unsafe { arch_idle() };
-            }
-            #[cfg(not(platform_unikernel))]
             unsafe { arch_idle() };
         }
         drivers::virtio_net::flush_tx_staging();
