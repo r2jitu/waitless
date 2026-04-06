@@ -463,6 +463,10 @@ unsafe fn kernel_boot(info: &BootInfo) {
     uni_main();
     klog!("\n[SHUTDOWN] Application returned. Powering off.\n");
 
+    // Stop secondary cores before system poweroff
+    #[cfg(target_arch = "aarch64")]
+    kernel::aarch64::smp::request_shutdown();
+
     arch_shutdown();
     }
 }

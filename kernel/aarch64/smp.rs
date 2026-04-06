@@ -3,6 +3,8 @@
 // Uses PSCI CPU_ON to start secondary cores (APs). Core 0 (BSP) calls
 // this after all init is complete.
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use crate::serial;
 use crate::mm;
 use super::exceptions;
@@ -12,6 +14,9 @@ const AP_STACK_SIZE: usize = 64 * 1024;
 
 /// Maximum number of cores supported.
 pub const MAX_CORES: usize = 8;
+
+/// Global shutdown flag — set by core 0, checked by all APs.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 /// Per-core state, allocated by core 0 during boot.
 struct CoreState {
@@ -133,11 +138,44 @@ unsafe extern "C" fn ap_entry(_stack_top: u64) -> ! {
         for &b in b" online\n" { buf[pos] = b; pos += 1; }
         serial::puts(&buf[..pos]);
 
-        // Idle loop — WFI until work is available (Phase 2b+)
+        // Idle loop — WFI until shutdown or work is available (Phase 2b+)
         loop {
             core::arch::asm!("wfi");
+            if SHUTDOWN.load(Ordering::Relaxed) {
+                // PSCI CPU_OFF — this core stops executing
+                core::arch::asm!(
+                    "hvc #0",
+                    in("x0") 0x8400_0002u64,  // PSCI CPU_OFF
+                    options(nostack, nomem),
+                );
+            }
         }
     }
+}
+
+/// Signal all APs to shut down. Called by core 0 before system poweroff.
+pub fn request_shutdown() {
+    if num_cores_online() <= 1 {
+        return;
+    }
+    SHUTDOWN.store(true, Ordering::Relaxed);
+    // Send SGI (Software Generated Interrupt) 0 to all other cores to wake them from WFI.
+    // ICC_SGI1_EL1: IRM=1 (all other PEs), INTID=0
+    unsafe {
+        let sgi_val: u64 = 1 << 40; // IRM=1: target all other PEs, INTID=0
+        // ICC_SGI1_EL1 = S3_0_C12_C11_5
+        core::arch::asm!(
+            "msr S3_0_C12_C11_5, {0}",
+            "isb",
+            in(reg) sgi_val,
+            options(nostack),
+        );
+    }
+}
+
+/// Check if shutdown has been requested.
+pub fn is_shutdown() -> bool {
+    SHUTDOWN.load(Ordering::Relaxed)
 }
 
 /// Format a u32 into decimal in a byte buffer. Returns bytes written.
