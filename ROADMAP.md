@@ -502,7 +502,7 @@ INIT-SIPI-SIPI after init is done.
 **Tests:**
 - [x] Integration: boot with `-smp 4`, all 4 cores print "core N online" (aarch64 QEMU)
 - [x] Integration: `test_smp_boot` — automated test parsing serial for core count
-- [ ] Integration: `test_per_core_state` — verify each core has independent stack, timer, queue
+- [x] Integration: `test_per_core_state` — verify each core has independent inbox, TX staging, ID
 - [x] Integration: `test_ipi` — core 0 sends SGI to core 1, core 1 acknowledges (GICv2 + GICv3)
 - [x] x86_64: AP trampoline working (16-bit→32-bit→64-bit, absolute call to Rust)
 - [x] x86_64: 4 cores online via INIT-SIPI-SIPI (per-core serialized startup)
