@@ -656,6 +656,94 @@ pub fn poll(
     count
 }
 
+/// Maximum frames per batch poll.
+const BATCH_SIZE: usize = 32;
+
+/// A batch of received frames. Frames are stored contiguously with
+/// a length prefix: [len: u16][frame data][len: u16][frame data]...
+pub struct RxBatch {
+    pub data: [u8; BATCH_SIZE * 1600], // worst case: 32 × 1514-byte frames
+    pub len: usize,                     // bytes used in data
+    pub count: usize,                   // number of frames
+}
+
+impl RxBatch {
+    pub const fn new() -> Self {
+        RxBatch { data: [0; BATCH_SIZE * 1600], len: 0, count: 0 }
+    }
+
+    /// Iterate over frames in the batch.
+    pub fn iter(&self) -> RxBatchIter<'_> {
+        RxBatchIter { data: &self.data[..self.len], pos: 0 }
+    }
+}
+
+pub struct RxBatchIter<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Iterator for RxBatchIter<'a> {
+    type Item = &'a [u8];
+    fn next(&mut self) -> Option<&'a [u8]> {
+        if self.pos + 2 > self.data.len() { return None; }
+        let len = u16::from_le_bytes([self.data[self.pos], self.data[self.pos + 1]]) as usize;
+        self.pos += 2;
+        if self.pos + len > self.data.len() { return None; }
+        let frame = &self.data[self.pos..self.pos + len];
+        self.pos += len;
+        Some(frame)
+    }
+}
+
+/// Poll VirtIO RX queue and collect frames into a batch buffer.
+/// Does NOT invoke a callback — caller processes frames after this returns.
+/// Also drains TX completions.
+pub fn poll_batch(batch: &mut RxBatch) {
+    batch.len = 0;
+    batch.count = 0;
+
+    unsafe {
+        if let Transport::None = NET.transport { return; }
+    }
+
+    tx_drain();
+
+    unsafe {
+        while batch.count < BATCH_SIZE {
+            let (used_id, used_len) = match NET.rx_queue.get_used() {
+                Some(v) => v,
+                None => break,
+            };
+            let desc = NET.rx_queue.desc(used_id);
+            let buf = phys_to_virt(desc.addr);
+
+            if used_len > VIRTIO_NET_HDR_SIZE as u32 {
+                let frame_len = (used_len - VIRTIO_NET_HDR_SIZE as u32) as usize;
+                if batch.len + 2 + frame_len <= batch.data.len() {
+                    // Store length prefix + frame data
+                    let len_bytes = (frame_len as u16).to_le_bytes();
+                    batch.data[batch.len] = len_bytes[0];
+                    batch.data[batch.len + 1] = len_bytes[1];
+                    let frame_data = buf.add(VIRTIO_NET_HDR_SIZE);
+                    core::ptr::copy_nonoverlapping(
+                        frame_data, batch.data.as_mut_ptr().add(batch.len + 2), frame_len);
+                    batch.len += 2 + frame_len;
+                    batch.count += 1;
+                }
+            }
+
+            // Re-arm RX buffer
+            let buf_phys = virt_to_phys(buf);
+            NET.rx_queue.add_buf(buf_phys, BUFFER_SIZE, 0, 1);
+        }
+
+        if batch.count > 0 {
+            NET.rx_queue.kick();
+        }
+    }
+}
+
 pub fn enable_irq() {
     unsafe {
         #[cfg(target_arch = "aarch64")]

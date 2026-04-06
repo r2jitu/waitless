@@ -68,31 +68,34 @@ pub fn poll() {
     ).is_ok();
 
     if got_lock {
-        // We're the distributor this cycle.
         // Flush TX staging first — responses from previous cycle.
         drivers::virtio_net::flush_tx_staging();
 
+        // Batch-poll: drain VirtIO RX into a local buffer, then release
+        // the lock. This minimizes lock hold time — other cores can start
+        // polling the next batch while we distribute.
+        static mut BATCH: drivers::virtio_net::RxBatch = drivers::virtio_net::RxBatch::new();
+        unsafe { drivers::virtio_net::poll_batch(&mut BATCH); }
+
+        // Release lock immediately — VirtIO RX queue is idle now.
+        RX_LOCK.store(0, core::sync::atomic::Ordering::Release);
+
+        // Distribute from batch (no lock held).
         unsafe {
             for i in 0..num_cores as usize {
                 WAKEUP[i] = false;
             }
-        }
-
-        // Poll VirtIO and distribute frames.
-        drivers::virtio_net::poll(distribute_frame);
-
-        // Wake cores that received new packets.
-        unsafe {
+            for frame in BATCH.iter() {
+                distribute_frame(frame);
+            }
             let any_wakeup = (1..num_cores as usize).any(|i| WAKEUP[i]);
             if any_wakeup {
                 kernel::wake_cores();
             }
         }
 
-        // Flush again (APs may have responded during distribution).
+        // Flush TX (APs may have responded during distribution).
         drivers::virtio_net::flush_tx_staging();
-
-        RX_LOCK.store(0, core::sync::atomic::Ordering::Release);
     }
 }
 
