@@ -253,6 +253,11 @@ pub(crate) fn vpci_read_dev_cfg8(dev: &VirtioPciDevice, offset: u32) -> u8 {
     unsafe { mmio_read8(dev.device_cfg + offset as u64) }
 }
 
+pub(crate) fn vpci_read_dev_cfg16(dev: &VirtioPciDevice, offset: u32) -> u16 {
+    if dev.device_cfg == 0 { return 0; }
+    unsafe { mmio_read16(dev.device_cfg + offset as u64) }
+}
+
 pub(crate) fn vpci_read_isr(dev: &VirtioPciDevice) -> u8 {
     if dev.isr_cfg == 0 { return 0; }
     unsafe { mmio_read8(dev.isr_cfg) }
@@ -324,6 +329,8 @@ pub(crate) const VIRTQ_AVAIL_F_NO_INTERRUPT: u16 = 1;
 pub(crate) const VIRTIO_NET_F_MAC: u32 = 1 << 5;
 pub(crate) const VIRTIO_NET_F_MRG_RXBUF: u32 = 1 << 15;
 pub(crate) const VIRTIO_NET_F_STATUS: u32 = 1 << 16;
+pub(crate) const VIRTIO_NET_F_MQ: u32 = 1 << 22;
+pub(crate) const VIRTIO_NET_F_CTRL_VQ: u32 = 1 << 17;
 pub(crate) const VIRTIO_RING_F_EVENT_IDX: u32 = 1 << 29;
 
 // ============================================================================
