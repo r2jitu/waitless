@@ -47,8 +47,6 @@ pub extern "C" fn rust_eh_personality() {}
 // Architecture-specific code
 // ============================================================================
 
-#[cfg(target_arch = "x86_64")]
-use kernel::x86_64 as x86_init;
 
 /// Power off the machine. Never returns.
 #[cfg(target_arch = "x86_64")]
@@ -363,9 +361,9 @@ unsafe fn kernel_boot(info: &BootInfo) {
     #[cfg(target_arch = "x86_64")]
     {
         klog!("[INIT] GDT...\n");
-        x86_init::gdt::init();
+        kernel::x86_64::gdt::init();
         klog!("[INIT] IDT...\n");
-        x86_init::idt::init();
+        kernel::x86_64::idt::init();
     }
     #[cfg(target_arch = "aarch64")]
     {
@@ -432,8 +430,8 @@ unsafe fn kernel_boot(info: &BootInfo) {
         #[cfg(target_arch = "x86_64")]
         {
             // Serial RX interrupt (IRQ4 / vector 36) for Ctrl-C wakeup
-            x86_init::idt::register_handler(36, serial_rx_isr_trampoline);
-            x86_init::idt::enable_irq(4);
+            kernel::x86_64::idt::register_handler(36, serial_rx_isr_trampoline);
+            kernel::x86_64::idt::enable_irq(4);
             serial::enable_rx_irq();
         }
     }
@@ -447,7 +445,7 @@ unsafe fn kernel_boot(info: &BootInfo) {
 
 // x86_64: ISR trampoline for serial RX (ignores InterruptFrame pointer)
 #[cfg(target_arch = "x86_64")]
-unsafe extern "C" fn serial_rx_isr_trampoline(_frame: *mut x86_init::idt::InterruptFrame) {
+unsafe extern "C" fn serial_rx_isr_trampoline(_frame: *mut kernel::x86_64::idt::InterruptFrame) {
     serial::rx_isr();
 }
 
