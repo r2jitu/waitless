@@ -184,6 +184,22 @@ pub unsafe fn send_sipi(target_apic_id: u32, vector: u8) {
     }
 }
 
+/// Broadcast INIT to all cores except self.
+pub unsafe fn send_init_broadcast() {
+    apic_write(APIC_ICR_HI, 0);
+    // INIT (101), all excluding self (11 in bits 19:18)
+    apic_write(APIC_ICR_LO, 0x000C4500);
+    for _ in 0..100_000 { core::arch::asm!("pause", options(nomem, nostack)); }
+}
+
+/// Broadcast SIPI to all cores except self.
+pub unsafe fn send_sipi_broadcast(vector: u8) {
+    apic_write(APIC_ICR_HI, 0);
+    // SIPI (110), all excluding self (11 in bits 19:18)
+    apic_write(APIC_ICR_LO, 0x000C4600 | vector as u32);
+    for _ in 0..100_000 { core::arch::asm!("pause", options(nomem, nostack)); }
+}
+
 fn fmt_u32(buf: &mut [u8], mut val: u32) -> usize {
     if val == 0 { buf[0] = b'0'; return 1; }
     let mut tmp = [0u8; 10];

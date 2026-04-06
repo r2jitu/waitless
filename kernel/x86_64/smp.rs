@@ -82,15 +82,24 @@ pub unsafe fn start_secondary_cores(cpu_count: u32) {
         let stack_slot = (AP_TRAMPOLINE_ADDR + 0xFF8) as *mut u64;
         core::ptr::write_volatile(stack_slot, stack_top);
 
-        // INIT-SIPI-SIPI sequence
-        // For QEMU, APIC IDs are sequential 0,1,2,... so target = i
-        apic::send_init(i);
-        // 10ms delay
-        for _ in 0..10_000_000 { core::arch::asm!("pause", options(nomem, nostack)); }
-        apic::send_sipi(i, sipi_vector);
-        for _ in 0..1_000_000 { core::arch::asm!("pause", options(nomem, nostack)); }
-        apic::send_sipi(i, sipi_vector); // second SIPI per spec
-        for _ in 0..1_000_000 { core::arch::asm!("pause", options(nomem, nostack)); }
+        // INIT-SIPI-SIPI for this specific AP
+        let topo = super::acpi::topology();
+        let target_apic_id = topo.apic_ids[i as usize] as u32;
+        let expected = num_cores_online() + 1;
+
+        apic::send_init(target_apic_id);
+        for _ in 0..10_000_000u64 { core::arch::asm!("pause", options(nomem, nostack)); }
+        apic::send_sipi(target_apic_id, sipi_vector);
+        for _ in 0..1_000_000u64 { core::arch::asm!("pause", options(nomem, nostack)); }
+        apic::send_sipi(target_apic_id, sipi_vector);
+
+        // Wait for this AP to come online before starting the next
+        for _ in 0..10_000_000u64 {
+            if num_cores_online() >= expected {
+                break;
+            }
+            core::arch::asm!("pause", options(nomem, nostack));
+        }
     }
 
     // Wait for APs
@@ -153,24 +162,29 @@ unsafe fn setup_ap_gdt(addr: *mut u8) {
     // GDT entries start at addr + 6 (after the 6-byte GDT pointer)
     let gdt_base = addr.add(6);
 
-    // Entry 0: null descriptor
+    // Entry 0 (0x00): null descriptor
     core::ptr::write_bytes(gdt_base, 0, 8);
 
-    // Entry 1: 64-bit code segment (selector 0x08)
-    let code = gdt_base.add(8) as *mut u64;
-    // Limit=0, Base=0, Access=0x9A (P=1,DPL=0,S=1,E=1,RW=1), Flags=0xA0 (L=1,D=0)
-    core::ptr::write_volatile(code, 0x00209A0000000000u64);
+    // Entry 1 (0x08): 32-bit code segment (for real→protected mode)
+    let e1 = gdt_base.add(8) as *mut u64;
+    // Limit=0xFFFFF, Base=0, Access=0x9A, Flags=0xC0 (G=1,D=1,L=0)
+    core::ptr::write_volatile(e1, 0x00CF9A000000FFFFu64);
 
-    // Entry 2: data segment (selector 0x10)
-    let data = gdt_base.add(16) as *mut u64;
-    // Limit=0xFFFFF, Base=0, Access=0x92 (P=1,DPL=0,S=1,RW=1), Flags=0xC0 (G=1,D=1)
-    core::ptr::write_volatile(data, 0x00CF92000000FFFFu64);
+    // Entry 2 (0x10): 32-bit data segment
+    let e2 = gdt_base.add(16) as *mut u64;
+    // Limit=0xFFFFF, Base=0, Access=0x92, Flags=0xC0 (G=1,D=1)
+    core::ptr::write_volatile(e2, 0x00CF92000000FFFFu64);
 
-    // GDT pointer: limit (3 entries × 8 bytes - 1 = 23), base = physical addr of GDT entries
+    // Entry 3 (0x18): 64-bit code segment (for protected→long mode)
+    let e3 = gdt_base.add(24) as *mut u64;
+    // Limit=0, Base=0, Access=0x9A, Flags=0xA0 (L=1,D=0)
+    core::ptr::write_volatile(e3, 0x00209A0000000000u64);
+
+    // GDT pointer: limit (4 entries × 8 - 1 = 31), base = physical addr of GDT
     let ptr = addr as *mut u16;
-    core::ptr::write_volatile(ptr, 23); // limit
+    core::ptr::write_volatile(ptr, 31); // limit
     let base_ptr = addr.add(2) as *mut u32;
-    core::ptr::write_volatile(base_ptr, gdt_base as u32); // base (physical, 32-bit)
+    core::ptr::write_volatile(base_ptr, gdt_base as u32);
 }
 
 fn fmt_u32(buf: &mut [u8], mut val: u32) -> usize {

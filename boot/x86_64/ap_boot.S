@@ -1,17 +1,13 @@
 // boot/x86_64/ap_boot.S — AP trampoline for x86_64 SMP.
 //
-// INIT-SIPI-SIPI starts APs in 16-bit real mode at the address
-// specified by the SIPI vector (page-aligned, below 1MB).
-// This trampoline transitions: real mode → protected → long mode,
-// then jumps to the Rust ap_entry function.
-//
-// The BSP copies this code to a low-memory page (e.g., 0x8000)
-// before sending SIPI. Data at the end of the page contains the
-// page table address and stack pointer set by the BSP.
+// Copied to 0x8000 by the BSP. APs start via SIPI vector=0x08.
+// Data at end of page:
+//   0x8F00: GDT descriptor (6 bytes) + GDT entries (24 bytes)
+//   0x8FF0: PML4 physical address (4 bytes)
+//   0x8FF8: stack pointer (8 bytes)
 
 .section .text
 
-// ── 16-bit real mode entry ──────────────────────────────────────────────
 .code16
 .global ap_trampoline_start
 .global ap_trampoline_end
@@ -19,35 +15,31 @@
 ap_trampoline_start:
     cli
     cld
-
-    // Load the data page address (same page, offset 0xFF0)
-    // The BSP writes the PML4 address and stack pointer here.
-    // Since we're running at an unknown base, use CS-relative addressing.
-    mov %cs, %ax
+    xor %ax, %ax
     mov %ax, %ds
 
-    // Load GDT pointer (at offset 0xF00 in this page)
-    lgdt (0xF00)
+// Load GDT: use o32 prefix for 32-bit GDTR base
+    .byte 0x66
+    lgdt (0x8F00)
 
-    // Enable protected mode (CR0.PE = 1)
+    // Enable protected mode
     mov %cr0, %eax
     or  $1, %eax
     mov %eax, %cr0
 
-    // Far jump to 32-bit code (selector 0x08 = code segment)
-    // Use a data-based far jump since we don't know our load address
-    ljmpl $0x08, $(ap_trampoline_32 - ap_trampoline_start + 0x8000)
+    // Far jump to protected mode
+    // In 16-bit mode: EA [2-byte offset] [2-byte selector]
+    ljmpw $0x08, $(0x8000 + ap_pm32 - ap_trampoline_start)
 
-// ── 32-bit protected mode ───────────────────────────────────────────────
 .code32
-ap_trampoline_32:
-    // Set up data segments
-    mov $0x10, %ax          // data segment selector
+.align 4
+ap_pm32:
+mov $0x10, %ax
     mov %ax, %ds
     mov %ax, %es
     mov %ax, %ss
 
-    // Load PML4 from data area (offset 0xFF0 from page base)
+    // Load PML4
     mov (0x8FF0), %eax
     mov %eax, %cr3
 
@@ -62,20 +54,20 @@ ap_trampoline_32:
     or  $(1 << 8), %eax
     wrmsr
 
-    // Enable paging (CR0.PG)
+    // Enable paging
     mov %cr0, %eax
     or  $(1 << 31), %eax
     mov %eax, %cr0
 
-    // Load 64-bit GDT and far jump to 64-bit code
-    lgdt (0x8F00)
-    ljmpl $0x08, $(ap_trampoline_64 - ap_trampoline_start + 0x8000)
+    // Far jump to 64-bit long mode (selector 0x18 = 64-bit code)
+    .byte 0xEA
+    .long 0x8000 + (ap_lm64 - ap_trampoline_start)
+    .word 0x18
 
-// ── 64-bit long mode ────────────────────────────────────────────────────
 .code64
-ap_trampoline_64:
-    // Reload data segments for long mode
-    mov $0x10, %ax
+.align 8
+ap_lm64:
+mov $0x10, %ax
     mov %ax, %ds
     mov %ax, %es
     mov %ax, %ss
@@ -83,20 +75,20 @@ ap_trampoline_64:
     mov %ax, %fs
     mov %ax, %gs
 
-    // Load stack pointer from data area (offset 0xFF8)
+    // Load stack
     mov (0x8FF8), %rsp
 
-    // Enable SSE (CR4 bits 9 & 10)
+    // Enable SSE
     mov %cr4, %rax
     or  $(3 << 9), %rax
     mov %rax, %cr4
 
-    // Jump to Rust AP entry (defined in kernel/x86_64/smp.rs)
-    // RDI = 0 (no context needed, stack already set)
+    // Call Rust AP entry via absolute address (trampoline is copied to 0x8000,
+    // so relative call would use wrong offset)
     xor %rdi, %rdi
-    call ap_entry_x86
+    movabs $ap_entry_x86, %rax
+    call *%rax
 
-    // Should not return
 1:  hlt
     jmp 1b
 
