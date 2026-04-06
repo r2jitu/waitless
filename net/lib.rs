@@ -151,14 +151,17 @@ pub fn net_receive(frame: &[u8]) {
 }
 
 /// Flow hash: map a 4-tuple to a core index.
-/// Uses FNV-1a-inspired multiplicative hashing for good distribution.
+/// XORs each field separately with FNV-1a multiply for good distribution
+/// even when only the source port varies (QEMU user-mode NAT).
 fn flow_hash(src_ip: u32, dst_ip: u32, src_port: u16, dst_port: u16, num_cores: u32) -> u32 {
     let mut h: u32 = 2166136261; // FNV offset basis
     h ^= src_ip;
-    h = h.wrapping_mul(16777619); // FNV prime
+    h = h.wrapping_mul(16777619);
     h ^= dst_ip;
     h = h.wrapping_mul(16777619);
-    h ^= (src_port as u32) << 16 | dst_port as u32;
+    h ^= src_port as u32;
+    h = h.wrapping_mul(16777619);
+    h ^= dst_port as u32;
     h = h.wrapping_mul(16777619);
     h % num_cores
 }

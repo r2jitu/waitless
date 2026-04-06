@@ -55,11 +55,11 @@ const HEALTH_JSON: &[u8] = b"{\"status\":\"ok\",\"runtime\":\"unikernel\",\"vers
 const STATS_JSON: &[u8] =
     b"{\"connections_active\":0,\"total_requests\":0,\"memory_free_mb\":0,\"uptime_seconds\":0}";
 
-/// CPU-intensive work: iterative hash (FNV-1a, 10K iterations).
-/// Takes ~50-100us under TCG, making it the dominant cost per request.
+/// CPU-intensive work: iterative hash (FNV-1a, 100K iterations).
+/// Dominates per-request cost, making multi-core distribution visible.
 fn compute_work() -> u32 {
     let mut h: u32 = 2166136261;
-    for i in 0..10_000u32 {
+    for i in 0..100_000u32 {
         h ^= i;
         h = h.wrapping_mul(16777619);
     }
