@@ -902,7 +902,8 @@ sh_test(name = "test", srcs = ["test.sh"], data = [":test_smp.elf"])
 | 4. HTTP/3 | Medium | Modern HTTP | 3c |
 | 5. IPv6 + NDP | Medium | Drop IPv4 legacy | None |
 
-**Suggested order: 1a -> 1b -> 3a -> 2a -> 2b -> 2c -> 3b -> 3c -> 4 -> 5 -> 2d-h**
+**Suggested order: 1a -> 1b -> 3a -> 2a -> 2c -> 2b -> 3b -> 3c -> 4 -> 5 -> 2d-h**
+(2c before 2b: software distribution works on all platforms without driver changes)
 
 Start with infrastructure (per-protocol targets, crate_universe), then
 UDP (simple win), then multi-core in stages: SMP boot first (foundation),
