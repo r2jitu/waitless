@@ -584,11 +584,6 @@ static TX_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// Send a frame. Core 0 sends directly; other cores stage for core 0 to flush.
 pub fn send(data: &[u8]) {
-    if kernel::percpu::num_cores() <= 1 {
-        // Single-core fast path: skip cpu_id() MMIO read entirely.
-        send_direct(data);
-        return;
-    }
     let id = kernel::cpu_id();
     if id == 0 {
         send_direct(data);
