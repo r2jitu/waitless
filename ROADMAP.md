@@ -490,7 +490,7 @@ INIT-SIPI-SIPI after init is done.
 - [x] UNIKERNEL_CPUS env var for configurable SMP count in QEMU
 - [ ] x86_64: start APs via INIT-SIPI-SIPI (after init complete)
 - [ ] x86_64: APIC init (replace legacy PIC for multi-core)
-- [ ] Per-core Chase-Lev deque
+- [x] Per-core Chase-Lev deque (kernel/deque.rs, 8 unit tests)
 - [ ] Per-core timer wheel + pending_timers MPSC queue
 - [ ] Per-core TX staging buffer (Tier 2)
 - [ ] Per-core heap slab (bump allocator for task-scoped allocations)
@@ -563,7 +563,7 @@ UNIKERNEL_CPUS=4 ./scripts/bench.sh   # VZ flavor shows multi-core perf
 ### 2d. Work stealing
 
 - [ ] Per-core SPSC ring for pinned tasks (no atomics on fast path)
-- [ ] Per-core Chase-Lev deque for stealable tasks (owner LIFO, thieves FIFO CAS)
+- [x] Per-core Chase-Lev deque for stealable tasks (kernel/deque.rs)
 - [ ] Event loop: drain pinned queue first, then stealable deque
 - [ ] Thieves only access other cores' stealable deques (never pinned queues)
 - [ ] Steal from busiest core (check stealable deque depths)
