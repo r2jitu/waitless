@@ -6,3 +6,4 @@
 pub mod fdt;
 pub mod mmu;
 pub mod exceptions;
+pub mod smp;

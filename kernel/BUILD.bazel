@@ -22,6 +22,7 @@ rust_library(
             "aarch64/fdt.rs",
             "aarch64/mod.rs",
             "aarch64/mmu.rs",
+            "aarch64/smp.rs",
         ],
         "//conditions:default": [],
     }),

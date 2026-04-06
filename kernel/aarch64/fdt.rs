@@ -34,6 +34,7 @@ pub struct FdtInfo {
     pub pci_mmio32_base: u64,
     pub pci_mmio32_size: u64,
     pub pci_irqs: [u32; 8],
+    pub cpu_count: u32,
 }
 
 static mut G_INFO: FdtInfo = FdtInfo {
@@ -51,6 +52,7 @@ static mut G_INFO: FdtInfo = FdtInfo {
     pci_mmio32_base: 0,
     pci_mmio32_size: 0,
     pci_irqs: [0; 8],
+    cpu_count: 0,
 };
 
 // ============================================================================
@@ -199,13 +201,21 @@ fn parse_dtb(dtb: &[u8]) {
                     stack[depth as usize] = NodeState::new();
                 }
                 depth += 1;
-                // Skip null-terminated node name
+                // Read node name, then skip
+                let name_start = pos;
                 while pos < dtb.len() && dtb[pos] != 0 {
                     pos += 1;
                 }
+                let name = &dtb[name_start..pos];
                 pos += 1; // skip null
-                // Align to 4-byte boundary
-                pos = (pos + 3) & !3;
+                pos = (pos + 3) & !3; // align
+
+                // Count cpu@N nodes (children of /cpus)
+                if name.len() >= 4 && name[0] == b'c' && name[1] == b'p'
+                    && name[2] == b'u' && name[3] == b'@'
+                {
+                    unsafe { G_INFO.cpu_count += 1; }
+                }
             }
 
             FDT_END_NODE => {

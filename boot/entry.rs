@@ -450,6 +450,15 @@ unsafe fn kernel_boot(info: &BootInfo) {
         }
     }
 
+    // ── SMP: start secondary cores ─────────────────────────────────────────
+    #[cfg(target_arch = "aarch64")]
+    {
+        let cpu_count = kernel::aarch64::fdt::info().cpu_count;
+        if cpu_count > 1 {
+            kernel::aarch64::smp::start_secondary_cores(cpu_count);
+        }
+    }
+
     klog!("\n[BOOT] All subsystems ready. Starting application.\n\n");
     uni_main();
     klog!("\n[SHUTDOWN] Application returned. Powering off.\n");

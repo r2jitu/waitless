@@ -63,7 +63,7 @@ start_qemu() {
     fi
     "$QEMU_BIN" \
         "$@" \
-        -m 128 -smp 1 -nographic \
+        -m 128 -smp "${UNIKERNEL_CPUS:-1}" -nographic \
         -serial "file:${log}" \
         -no-reboot \
         -device "${VIRTIO_DEV}",netdev=net0 \

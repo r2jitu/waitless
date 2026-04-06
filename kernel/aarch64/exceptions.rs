@@ -286,6 +286,42 @@ mod aarch64 {
         }
     }
 
+    /// Initialize GICv3 CPU interface for a secondary core (AP).
+    /// The distributor is already configured by core 0; APs only need
+    /// their own redistributor + CPU interface registers.
+    pub unsafe fn init_ap() {
+        unsafe {
+            if GIC_VERSION != 3 || GICR_BASE == 0 {
+                return;
+            }
+
+            // Each redistributor frame is 0x20000 bytes apart
+            let cpu = crate::aarch64::smp::cpu_id() as u64;
+            let gicr_frame = GICR_BASE + cpu * 0x20000;
+
+            // Wake this core's redistributor
+            let waker_addr = gicr_frame + GICR_WAKER as u64;
+            let waker = ptr::read_volatile(waker_addr as *const u32);
+            ptr::write_volatile(waker_addr as *mut u32, waker & !(1 << 1));
+            for _ in 0..1_000_000 {
+                if (ptr::read_volatile(waker_addr as *const u32) & (1 << 2)) == 0 {
+                    break;
+                }
+                asm!("nop", options(nomem, nostack));
+            }
+
+            // Enable CPU interface (system registers)
+            let sre: u64;
+            asm!("mrs {}, ICC_SRE_EL1", out(reg) sre);
+            asm!("msr ICC_SRE_EL1, {}", in(reg) sre | 1);
+            asm!("isb", options(nostack));
+            asm!("msr ICC_PMR_EL1, {}", in(reg) 0xFF_u64);
+            asm!("msr ICC_BPR1_EL1, {}", in(reg) 0_u64);
+            asm!("msr ICC_IGRPEN1_EL1, {}", in(reg) 1_u64);
+            asm!("isb", options(nostack));
+        }
+    }
+
     /// Timer PPI handler — disables the virtual timer so it doesn't re-fire.
     fn timer_wakeup_handler(_irq: u32) {
         unsafe { asm!("msr cntv_ctl_el0, {}", in(reg) 0_u64, options(nostack)); }
@@ -346,4 +382,10 @@ pub fn register_irq(irq: u32, handler: fn(u32)) {
 pub fn enable_timer_wakeup() {
     #[cfg(target_arch = "aarch64")]
     unsafe { aarch64::enable_timer_wakeup(); }
+}
+
+/// Initialize GIC for a secondary core (AP).
+pub fn init_ap() {
+    #[cfg(target_arch = "aarch64")]
+    unsafe { aarch64::init_ap(); }
 }

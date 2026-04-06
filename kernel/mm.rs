@@ -351,6 +351,31 @@ pub fn alloc_frame() -> u64 {
     }
 }
 
+/// Allocate `count` contiguous physical pages. Returns physical address or 0 on failure.
+pub fn alloc_pages(count: usize) -> u64 {
+    unsafe {
+        let total = FRAME_ALLOC.total_frames as usize;
+        'outer: for start in 0..total {
+            if start + count > total {
+                break;
+            }
+            for j in 0..count {
+                if FRAME_ALLOC.bitmap.test((start + j) as u64) {
+                    continue 'outer;
+                }
+            }
+            // Found contiguous run
+            for j in 0..count {
+                FRAME_ALLOC.bitmap.set((start + j) as u64);
+            }
+            FRAME_ALLOC.used_frames += count as u64;
+            return (start as u64) * PAGE_SIZE;
+        }
+        klog!("mm::alloc_pages: out of physical memory!\n");
+        0
+    }
+}
+
 pub fn free_frame(addr: u64) {
     unsafe {
         let frame = addr / PAGE_SIZE;
