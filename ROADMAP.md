@@ -556,8 +556,10 @@ UNIKERNEL_CPUS=4 ./scripts/bench.sh   # expect ~linear scaling
 - [x] Stack-allocated TX buffers in ethernet/ipv4 (safe for multi-core)
 - [x] AP poll function hook (kernel::percpu::set_ap_poll_fn with volatile read)
 - [x] x86_64: AP loads BSP GDT + IDT, APIC EOI for IPI vectors
+- [x] TCP connection pinning: per-core pools (32 slots/core), flow hash distribution
+- [x] Per-core HTTP service: each core has listener + active connections (SO_REUSEPORT)
+- [x] Per-core TLS via GS_BASE (x86_64) / TPIDR_EL1 (aarch64) → fast cpu_id()
 - [ ] Tier auto-detection: MQ offered -> Tier 1, else -> Tier 2 (deferred to 2b)
-- [ ] TCP connection pinning (currently TCP stays on core 0, UDP distributed)
 
 **Tests:**
 - [x] Integration: HTTP + UDP tests pass with -smp 4 on both arches
