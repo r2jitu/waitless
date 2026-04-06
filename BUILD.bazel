@@ -1,1 +1,8 @@
 package(default_visibility = ["//visibility:public"])
+
+# Regenerate rust-project.json for rust-analyzer:
+#   bazel run //:rust_analyzer
+alias(
+    name = "rust_analyzer",
+    actual = "@rules_rust//tools/rust_analyzer:gen_rust_project",
+)
