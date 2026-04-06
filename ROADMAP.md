@@ -544,6 +544,7 @@ UNIKERNEL_CPUS=4 ./scripts/bench.sh   # expect ~linear scaling
 
 ### 2c. Tier 2: software distribution (VZ + single-queue)
 
+- [x] HTTP + UDP tests pass with -smp 4 on both arches (regression verified)
 - [ ] Detect single-queue at boot (`VIRTIO_NET_F_MQ` not offered)
 - [ ] Flow hash function: hash(src_ip, dst_ip, src_port, dst_port)
 - [ ] Per-core inbox (SPSC: core 0 writes, owning core reads) for RX delivery
