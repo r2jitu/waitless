@@ -15,8 +15,12 @@ const APIC_EOI: u32 = 0x0B0;
 const APIC_SVR: u32 = 0x0F0;
 const APIC_ICR_LO: u32 = 0x300;
 const APIC_ICR_HI: u32 = 0x310;
+// LVT registers — used when APIC is fully enabled (Phase 2b)
+#[allow(dead_code)]
 const APIC_LVT_TIMER: u32 = 0x320;
+#[allow(dead_code)]
 const APIC_LVT_LINT0: u32 = 0x350;
+#[allow(dead_code)]
 const APIC_LVT_LINT1: u32 = 0x360;
 
 /// Spurious interrupt vector (must be 0xXF per Intel spec).
@@ -93,20 +97,11 @@ pub unsafe fn init() {
         // Map APIC MMIO page via HHDM
         APIC_BASE = mm::phys_to_virt(phys_base) as u64;
 
-        // Keep legacy PIC active — device IRQs (serial, virtio) still
-        // route through it. PIC will be disabled when we switch to MSI-X
-        // in Phase 2b.
-
-        // Enable APIC: set SVR bit 8 (APIC Software Enable) + spurious vector
-        apic_write(APIC_SVR, 0x100 | SPURIOUS_VECTOR);
-
-        // Set task priority to 0 (accept all interrupts)
-        apic_write(APIC_TPR, 0);
-
-        // Mask LVT entries we don't use yet
-        apic_write(APIC_LVT_TIMER, 0x10000);  // masked
-        apic_write(APIC_LVT_LINT0, 0x10000);  // masked
-        apic_write(APIC_LVT_LINT1, 0x10000);  // masked
+        // Don't enable APIC software enable yet — PIC handles device IRQs.
+        // The APIC will be fully enabled when we switch to MSI-X (Phase 2b)
+        // or when starting APs via INIT-SIPI-SIPI.
+        // For now, just detect and log — IPI/SIPI functions work regardless
+        // of the SVR enable bit.
 
         let id = apic_read(APIC_ID) >> 24;
         let ver = apic_read(APIC_VERSION) & 0xFF;

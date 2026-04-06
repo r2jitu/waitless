@@ -74,14 +74,21 @@ stack_bottom:
     .space 65536
 stack_top:
 
-// Bootstrap page tables — identity map the first 1GB with 2MB pages.
-// PML4 -> PDPT -> PD (with 512 x 2MB entries = 1GB)
+// Bootstrap page tables — identity map the first 4GB with 2MB pages.
+// PML4 -> PDPT -> PD0..3 (4 × 512 × 2MB = 4GB)
+// Covers RAM + APIC MMIO (0xFEE00000) + PCI config space.
 .align 4096
 boot_pml4:
     .space 4096
 boot_pdpt:
     .space 4096
-boot_pd:
+boot_pd0:
+    .space 4096
+boot_pd1:
+    .space 4096
+boot_pd2:
+    .space 4096
+boot_pd3:
     .space 4096
 
 // ============================================================================
@@ -115,15 +122,28 @@ _start:
     or  $0x3, %eax              // P=1, R/W=1
     mov %eax, (boot_pml4)
 
-    // PDPT[0] -> boot_pd | Present | Writable
-    lea boot_pd, %eax
+    // PDPT[0..3] -> boot_pd0..3 | Present | Writable
+    // Maps 4GB total (4 × 1GB) to cover RAM + APIC MMIO (0xFEE00000)
+    lea boot_pd0, %eax
     or  $0x3, %eax
     mov %eax, (boot_pdpt)
 
-    // Fill boot_pd with 512 entries, each mapping a 2MB page.
+    lea boot_pd1, %eax
+    or  $0x3, %eax
+    mov %eax, (boot_pdpt + 8)
+
+    lea boot_pd2, %eax
+    or  $0x3, %eax
+    mov %eax, (boot_pdpt + 16)
+
+    lea boot_pd3, %eax
+    or  $0x3, %eax
+    mov %eax, (boot_pdpt + 24)
+
+    // Fill all 4 PD tables (2048 entries total), each mapping a 2MB page.
     // Entry format: base_addr | PS(bit7) | R/W(bit1) | P(bit0) = 0x83
-    // This maps physical addresses 0x00000000 - 0x3FFFFFFF (1GB).
-    lea  boot_pd, %ebx
+    // Maps physical 0x00000000 - 0xFFFFFFFF (4GB).
+    lea  boot_pd0, %ebx
     mov  $0, %ecx               // Counter
     mov  $0x83, %eax             // First entry: addr=0, P=1, R/W=1, PS=1(2MB)
 1:
@@ -132,7 +152,7 @@ _start:
     add  $0x200000, %eax        // Next 2MB page
     add  $8, %ebx               // Next PD entry (8 bytes each)
     inc  %ecx
-    cmp  $512, %ecx
+    cmp  $2048, %ecx            // 4 PDs × 512 entries = 2048
     jne  1b
 
     // ---- Load PML4 into CR3 ----
