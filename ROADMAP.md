@@ -51,29 +51,31 @@ rust_library(name = "app", deps = ["//uni:http", "//uni:http3"])
 
 ### 1a. Restructure net/ into per-protocol targets
 
-Split the current monolithic `//net` crate into individual targets.
-The existing `//net` target becomes an alias or umbrella for the legacy stack.
-New protocol targets (udp, ipv6, ndp, quic) are added as new crates.
+Split the monolithic `//net` crate. Extract shared types first, break
+circular dependencies, then new protocols get their own targets.
 
-- [ ] `//net:ethernet` (ethernet.rs, types.rs — shared by all)
-- [ ] `//net:arp` (arp.rs — deps: ethernet)
-- [ ] `//net:ipv4` (ipv4.rs — deps: ethernet, arp)
-- [ ] `//net:tcp` (tcp.rs — deps: ipv4)
-- [ ] `//net:dhcp` (dhcp.rs — deps: ipv4, ethernet)
+- [x] Break circular dependency: ethernet.rs no longer dispatches to arp/ipv4
+- [x] `//net:types` — standalone crate (MacAddr, Ipv4Addr, byte order, checksums)
+- [x] `//net:net` depends on `//net:types` via extern crate
+- [ ] `//net:ethernet` (ethernet.rs — deps: types)
+- [ ] `//net:arp` (arp.rs — deps: types, ethernet)
+- [ ] `//net:ipv4` (ipv4.rs — deps: types, ethernet, arp)
+- [ ] `//net:tcp` (tcp.rs — deps: types, ipv4)
+- [ ] `//net:dhcp` (dhcp.rs — deps: types, ipv4, ethernet)
 - [ ] `//net` umbrella alias for the full legacy stack
 
 **Tests:**
+- [x] Unit: byte order roundtrips, address types, RFC 1071 checksums (8 tests)
+- [x] Integration: existing HTTP smoke tests pass on x86_64 + aarch64
 - [ ] Unit: ethernet frame parse/build
 - [ ] Unit: ARP request/reply encode/decode
-- [ ] Unit: IPv4 header checksum
 - [ ] Unit: TCP segment parse
 - [ ] Unit: DHCP option parsing
-- [ ] Integration: existing HTTP smoke tests still pass (no regression)
 
 **Try it:**
 ```bash
-bazel test //net:ethernet_test //net:arp_test //net:tcp_test  # new unit tests
-bazel test //apps/webserver:test                              # regression check
+bazel test //net:types_test         # 8 unit tests (host-native)
+bazel test //apps/webserver:test    # regression check (QEMU)
 ```
 
 ### 1b. Add crate_universe for crates.io dependencies
