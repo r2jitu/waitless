@@ -625,14 +625,13 @@ Maybe 100 lines. Sits between IPv4 and QUIC.
 
 **Tests:**
 - [x] Unit: UDP checksum computation + verification
-- [ ] Integration: send/receive UDP packets through QEMU (netcat or custom tool)
+- [x] Integration: UDP echo test through QEMU (python3 socket, both arches)
 
 **Try it:**
 ```bash
-bazel test //net:udp_test                      # unit tests
-# From host while QEMU runs:
-echo "hello" | nc -u localhost 5000            # send UDP to unikernel
-# Serial: "UDP recv: 5 bytes from 10.0.2.2:xxxxx"
+bazel test //net:types_test                          # unit tests (includes UDP checksum)
+bazel test --config=x86_64-qemu //apps/webserver:test  # HTTP + UDP echo (x86_64)
+bazel test --config=aarch64-qemu //apps/webserver:test # HTTP + UDP echo (aarch64)
 ```
 
 ### 3b. TLS 1.3 crypto
