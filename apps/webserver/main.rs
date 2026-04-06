@@ -55,13 +55,43 @@ const HEALTH_JSON: &[u8] = b"{\"status\":\"ok\",\"runtime\":\"unikernel\",\"vers
 const STATS_JSON: &[u8] =
     b"{\"connections_active\":0,\"total_requests\":0,\"memory_free_mb\":0,\"uptime_seconds\":0}";
 
+/// CPU-intensive work: iterative hash (FNV-1a, 10K iterations).
+/// Takes ~50-100us under TCG, making it the dominant cost per request.
+fn compute_work() -> u32 {
+    let mut h: u32 = 2166136261;
+    for i in 0..10_000u32 {
+        h ^= i;
+        h = h.wrapping_mul(16777619);
+    }
+    h
+}
+
 fn handle_request(req: &Request) -> Response {
     match req.path() {
         b"/" => Response::ok(b"text/html", INDEX_HTML),
         b"/health" => Response::ok(b"application/json", HEALTH_JSON),
         b"/stats" => Response::ok(b"application/json", STATS_JSON),
+        b"/compute" => {
+            let result = compute_work();
+            // Format result as JSON into a stack buffer
+            let mut buf = [0u8; 64];
+            let mut pos = 0;
+            for &b in b"{\"hash\":" { buf[pos] = b; pos += 1; }
+            pos += fmt_u32(&mut buf[pos..], result);
+            for &b in b"}" { buf[pos] = b; pos += 1; }
+            Response::ok(b"application/json", &buf[..pos])
+        }
         _ => Response::not_found(),
     }
+}
+
+fn fmt_u32(buf: &mut [u8], mut val: u32) -> usize {
+    if val == 0 { buf[0] = b'0'; return 1; }
+    let mut tmp = [0u8; 10];
+    let mut len = 0;
+    while val > 0 { tmp[len] = b'0' + (val % 10) as u8; val /= 10; len += 1; }
+    for i in 0..len { buf[i] = tmp[len - 1 - i]; }
+    len
 }
 
 // ---- Application entry point ------------------------------------------------

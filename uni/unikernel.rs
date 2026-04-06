@@ -19,7 +19,6 @@ pub fn check_shutdown() -> bool {
 // ---- Wait for events (arch-specific idle) -------------------------------------
 
 pub fn wait_for_events() {
-    // Flush any pending TX from APs before considering sleep.
     drivers::virtio_net::flush_tx_staging();
 
     if drivers::virtio_net::irq_idle_supported() {

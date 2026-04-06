@@ -215,8 +215,10 @@ pub fn send_sgi_to(target_core: u32) {
 }
 
 /// SGI 0 handler — called on the receiving core by the GIC exception dispatcher.
+/// This is just a wakeup signal — all real work happens in the event loop.
 pub fn sgi_handler(_irq: u32) {
-    IPI_COUNT.fetch_add(1, Ordering::Relaxed);
+    // Intentionally empty. The IPI wakes the core from WFI; the event
+    // loop polls for work. Avoids LDXR/STXR which VZ doesn't handle.
 }
 
 /// Get the total IPI count (for testing).
