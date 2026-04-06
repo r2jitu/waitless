@@ -1,13 +1,16 @@
 // net/tcp.rs — TCP state machine, connection pool, ring buffers.
 
+#![no_std]
+#![allow(static_mut_refs)]
+
+extern crate kernel;
+extern crate net_types as types;
+extern crate net_ipv4 as ipv4;
+
 use core::ptr;
-
 use kernel::mm;
-
 use types::{Ipv4Addr, CONFIG, tcp_checksum, htons, ntohs, htonl, ntohl};
-use crate::ipv4::{ipv4_send, ipv4_receive, PROTO_TCP};
-use crate::arp::arp_receive;
-use crate::ethernet::{ethernet_parse, ETHERTYPE_ARP, ETHERTYPE_IPV4};
+use ipv4::{ipv4_send, PROTO_TCP};
 
 const TCP_FIN: u8 = 0x01;
 const TCP_SYN: u8 = 0x02;
@@ -214,7 +217,7 @@ fn send_rst(dst_ip: Ipv4Addr, src_port: u16, dst_port: u16, seq: u32, ack: u32) 
     }
 }
 
-pub(crate) fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
+pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
     if data.len() < 20 {
         return;
     }
@@ -516,17 +519,3 @@ pub fn is_closed(handle: *mut ()) -> bool {
     unsafe { CONNECTIONS[idx].state == TcpState::Closed }
 }
 
-pub fn poll() {
-    drivers::virtio_net::poll(net_receive);
-}
-
-/// Full network stack dispatch: Ethernet -> ARP/IPv4 -> TCP.
-fn net_receive(frame: &[u8]) {
-    if let Some((ethertype, payload)) = ethernet_parse(frame) {
-        match ethertype {
-            ETHERTYPE_ARP => arp_receive(payload),
-            ETHERTYPE_IPV4 => ipv4_receive(payload),
-            _ => {}
-        }
-    }
-}

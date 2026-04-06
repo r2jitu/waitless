@@ -9,6 +9,7 @@
 pub mod types;
 pub mod serial;
 pub mod mm;
+pub mod time;
 
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;

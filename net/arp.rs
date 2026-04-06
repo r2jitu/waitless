@@ -1,7 +1,14 @@
 // net/arp.rs — ARP cache, request/reply, resolve, announce.
 
+#![no_std]
+#![allow(static_mut_refs)]
+
+extern crate net_types as types;
+extern crate net_ethernet as ethernet;
+extern crate drivers;
+
 use types::{MacAddr, Ipv4Addr, CONFIG, htons, ntohs};
-use crate::ethernet::{ethernet_our_mac, ethernet_send, ethernet_parse, ETHERTYPE_ARP};
+use ethernet::{ethernet_our_mac, ethernet_send, ethernet_parse, ETHERTYPE_ARP};
 
 const ARP_CACHE_SIZE: usize = 64;
 
@@ -38,10 +45,10 @@ impl ArpEntry {
 }
 
 static mut ARP_CACHE: [ArpEntry; ARP_CACHE_SIZE] = [const { ArpEntry::new() }; ARP_CACHE_SIZE];
-pub(crate) static mut GATEWAY_MAC: MacAddr = MacAddr::ZERO;
-pub(crate) static mut GATEWAY_MAC_VALID: bool = false;
+static mut GATEWAY_MAC: MacAddr = MacAddr::ZERO;
+static mut GATEWAY_MAC_VALID: bool = false;
 
-pub(crate) fn arp_lookup(ip: Ipv4Addr) -> Option<MacAddr> {
+fn arp_lookup(ip: Ipv4Addr) -> Option<MacAddr> {
     unsafe {
         for i in 0..ARP_CACHE_SIZE {
             if ARP_CACHE[i].valid && ARP_CACHE[i].ip == ip {
@@ -52,28 +59,25 @@ pub(crate) fn arp_lookup(ip: Ipv4Addr) -> Option<MacAddr> {
     }
 }
 
-pub(crate) fn arp_cache_update(ip: Ipv4Addr, mac: MacAddr) {
+fn arp_cache_update(ip: Ipv4Addr, mac: MacAddr) {
     unsafe {
-        // Check if already in cache
         for i in 0..ARP_CACHE_SIZE {
             if ARP_CACHE[i].valid && ARP_CACHE[i].ip == ip {
                 ARP_CACHE[i].mac = mac;
                 return;
             }
         }
-        // Find empty slot
         for i in 0..ARP_CACHE_SIZE {
             if !ARP_CACHE[i].valid {
                 ARP_CACHE[i] = ArpEntry { ip, mac, valid: true };
                 return;
             }
         }
-        // Overwrite first entry (simple LRU)
         ARP_CACHE[0] = ArpEntry { ip, mac, valid: true };
     }
 }
 
-pub(crate) fn arp_request(target_ip: Ipv4Addr) {
+fn arp_request(target_ip: Ipv4Addr) {
     let our_mac = ethernet_our_mac();
     let our_ip = unsafe { CONFIG.ip };
 
@@ -92,23 +96,20 @@ pub(crate) fn arp_request(target_ip: Ipv4Addr) {
     ethernet_send(MacAddr::BROADCAST, ETHERTYPE_ARP, data);
 }
 
-pub(crate) fn arp_receive(data: &[u8]) {
+pub fn arp_receive(data: &[u8]) {
     if data.len() < 28 {
         return;
     }
     let pkt = unsafe { &*(data.as_ptr() as *const ArpPacket) };
     let our_ip = unsafe { CONFIG.ip };
 
-    // Copy fields out of packed struct before use (avoids unaligned references)
     let sender_ip = pkt.sender_ip;
     let sender_mac = pkt.sender_mac;
     let target_ip = pkt.target_ip;
     let operation = pkt.operation;
 
-    // Update cache from any ARP packet
     if sender_ip != Ipv4Addr::ANY {
         arp_cache_update(sender_ip, sender_mac);
-        // Update gateway MAC cache
         unsafe {
             if sender_ip == CONFIG.gateway {
                 GATEWAY_MAC = sender_mac;
@@ -117,7 +118,6 @@ pub(crate) fn arp_receive(data: &[u8]) {
         }
     }
 
-    // Reply to requests for our IP
     let op = ntohs(operation);
     if op == ARP_OP_REQUEST && target_ip == our_ip && our_ip != Ipv4Addr::ANY {
         let our_mac = ethernet_our_mac();
@@ -137,8 +137,7 @@ pub(crate) fn arp_receive(data: &[u8]) {
     }
 }
 
-/// Resolve an IP address to a MAC address (blocking, with retries).
-pub(crate) fn arp_resolve(ip: Ipv4Addr) -> Option<MacAddr> {
+pub fn arp_resolve(ip: Ipv4Addr) -> Option<MacAddr> {
     if ip == Ipv4Addr::BROADCAST || ip.addr == 0xFFFFFFFF {
         return Some(MacAddr::BROADCAST);
     }
@@ -146,11 +145,9 @@ pub(crate) fn arp_resolve(ip: Ipv4Addr) -> Option<MacAddr> {
         return None;
     }
 
-    // Use gateway for non-local addresses
     let target = unsafe {
         let mask = CONFIG.subnet_mask.addr;
         if (ip.addr & mask) != (CONFIG.ip.addr & mask) && CONFIG.gateway != Ipv4Addr::ANY {
-            // Fast-path: cached gateway MAC
             if GATEWAY_MAC_VALID {
                 return Some(GATEWAY_MAC);
             }
@@ -160,12 +157,10 @@ pub(crate) fn arp_resolve(ip: Ipv4Addr) -> Option<MacAddr> {
         }
     };
 
-    // Check cache
     if let Some(mac) = arp_lookup(target) {
         return Some(mac);
     }
 
-    // Send request and poll for reply (only dispatch ARP frames)
     for _retry in 0..3 {
         arp_request(target);
         for _poll in 0..200_000 {
@@ -178,7 +173,7 @@ pub(crate) fn arp_resolve(ip: Ipv4Addr) -> Option<MacAddr> {
     None
 }
 
-pub(crate) fn arp_announce() {
+pub fn arp_announce() {
     let our_mac = ethernet_our_mac();
     let our_ip = unsafe { CONFIG.ip };
 
@@ -197,7 +192,6 @@ pub(crate) fn arp_announce() {
     ethernet_send(MacAddr::BROADCAST, ETHERTYPE_ARP, data);
 }
 
-/// Poll callback that only handles ARP frames (used during arp_resolve).
 fn arp_poll_callback(frame: &[u8]) {
     if let Some((ETHERTYPE_ARP, payload)) = ethernet_parse(frame) {
         arp_receive(payload);

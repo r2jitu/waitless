@@ -3,15 +3,21 @@
 // Simple datagram protocol — no state machine, no connection tracking.
 // Port-based dispatch via registered handlers.
 
+#![no_std]
+#![allow(static_mut_refs)]
+
+extern crate net_types as types;
+extern crate net_ipv4 as ipv4;
+
 use types::{Ipv4Addr, CONFIG, tcp_checksum, htons, ntohs};
-use crate::ipv4::{ipv4_send, PROTO_UDP};
+use ipv4::{ipv4_send, PROTO_UDP};
 
 #[repr(C, packed)]
-pub(crate) struct UdpHeader {
-    pub src_port: u16,
-    pub dst_port: u16,
-    pub length: u16,
-    pub checksum: u16,
+struct UdpHeader {
+    src_port: u16,
+    dst_port: u16,
+    length: u16,
+    checksum: u16,
 }
 
 const MAX_HANDLERS: usize = 8;
@@ -24,7 +30,6 @@ struct PortHandler {
 static mut HANDLERS: [Option<PortHandler>; MAX_HANDLERS] = [const { None }; MAX_HANDLERS];
 
 /// Register a handler for incoming UDP packets on a specific port.
-/// Callback receives (src_ip_octets, src_port, payload).
 pub fn bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
     unsafe {
         for slot in HANDLERS.iter_mut() {
@@ -61,8 +66,8 @@ pub fn send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
     }
 }
 
-/// Called by ipv4_receive when protocol == UDP.
-pub(crate) fn udp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
+/// Called by the network dispatch layer when protocol == UDP.
+pub fn udp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
     if data.len() < 8 {
         return;
     }

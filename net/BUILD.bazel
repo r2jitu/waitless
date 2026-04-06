@@ -3,9 +3,8 @@ load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 
 package(default_visibility = ["//visibility:public"])
 
-# Standalone types crate — no dependencies on drivers, kernel, or other net/ modules.
-# New protocol crates (udp, ipv6, quic) can depend on this without pulling in
-# the full legacy stack.
+# ── Per-protocol crates (leaf → root) ────────────────────────────────────────
+
 rust_library(
     name = "types",
     srcs = ["types.rs"],
@@ -14,29 +13,105 @@ rust_library(
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
 )
 
-# Host-native unit tests for types, byte order, and checksum.
 rust_test(
     name = "types_test",
     crate = ":types",
     rustc_flags = ["-Cpanic=unwind"],
 )
 
-# Full network stack: ethernet + ARP + IPv4 + TCP + DHCP.
 rust_library(
-    name = "net",
-    srcs = [
-        "arp.rs",
-        "dhcp.rs",
-        "ethernet.rs",
-        "ipv4.rs",
-        "lib.rs",
-        "tcp.rs",
-        "udp.rs",
-    ],
+    name = "ethernet",
+    srcs = ["ethernet.rs"],
+    crate_root = "ethernet.rs",
+    crate_name = "net_ethernet",
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
     deps = [
         ":types",
         "//drivers",
+    ],
+)
+
+rust_library(
+    name = "arp",
+    srcs = ["arp.rs"],
+    crate_root = "arp.rs",
+    crate_name = "net_arp",
+    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    deps = [
+        ":types",
+        ":ethernet",
+        "//drivers",
+    ],
+)
+
+rust_library(
+    name = "ipv4",
+    srcs = ["ipv4.rs"],
+    crate_root = "ipv4.rs",
+    crate_name = "net_ipv4",
+    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    deps = [
+        ":types",
+        ":ethernet",
+        ":arp",
+    ],
+)
+
+rust_library(
+    name = "tcp",
+    srcs = ["tcp.rs"],
+    crate_root = "tcp.rs",
+    crate_name = "net_tcp",
+    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    deps = [
+        ":types",
+        ":ipv4",
         "//kernel",
+    ],
+)
+
+rust_library(
+    name = "udp",
+    srcs = ["udp.rs"],
+    crate_root = "udp.rs",
+    crate_name = "net_udp",
+    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    deps = [
+        ":types",
+        ":ipv4",
+    ],
+)
+
+rust_library(
+    name = "dhcp",
+    srcs = ["dhcp.rs"],
+    crate_root = "dhcp.rs",
+    crate_name = "net_dhcp",
+    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    deps = [
+        ":types",
+        ":ethernet",
+        ":arp",
+        ":ipv4",
+        "//drivers",
+        "//kernel",
+    ],
+)
+
+# ── Umbrella crate: full-stack dispatch + poll ───────────────────────────────
+
+rust_library(
+    name = "net",
+    srcs = ["lib.rs"],
+    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    deps = [
+        ":types",
+        ":ethernet",
+        ":arp",
+        ":ipv4",
+        ":tcp",
+        ":udp",
+        ":dhcp",
+        "//drivers",
     ],
 )

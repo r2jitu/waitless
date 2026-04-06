@@ -1,18 +1,23 @@
 // net/ethernet.rs — Ethernet frame parsing/building.
 //
-// This module handles layer 2 only: MAC addresses, frame headers, send/receive.
+// Layer 2 only: MAC addresses, frame headers, send/receive.
 // Protocol dispatch (ARP, IPv4) is handled by callers, not here.
 
-use core::ptr;
+#![no_std]
+#![allow(static_mut_refs)]
 
+extern crate net_types as types;
+extern crate drivers;
+
+use core::ptr;
 use types::{MacAddr, htons};
 
-pub(crate) const ETHERTYPE_ARP: u16 = 0x0806;
-pub(crate) const ETHERTYPE_IPV4: u16 = 0x0800;
-pub(crate) const HEADER_LEN: usize = 14;
+pub const ETHERTYPE_ARP: u16 = 0x0806;
+pub const ETHERTYPE_IPV4: u16 = 0x0800;
+pub const HEADER_LEN: usize = 14;
 
 #[repr(C, packed)]
-pub(crate) struct EthernetHeader {
+pub struct EthernetHeader {
     pub dst: MacAddr,
     pub src: MacAddr,
     pub ethertype: u16, // network byte order
@@ -21,7 +26,7 @@ pub(crate) struct EthernetHeader {
 static mut OUR_MAC: MacAddr = MacAddr::ZERO;
 static mut MAC_CACHED: bool = false;
 
-pub(crate) fn ethernet_our_mac() -> MacAddr {
+pub fn ethernet_our_mac() -> MacAddr {
     unsafe {
         if !MAC_CACHED {
             drivers::virtio_net::get_mac(OUR_MAC.bytes.as_mut_ptr());
@@ -31,9 +36,9 @@ pub(crate) fn ethernet_our_mac() -> MacAddr {
     }
 }
 
-pub(crate) static mut ETH_TX_BUF: [u8; 1514] = [0; 1514]; // 14 header + 1500 payload
+static mut ETH_TX_BUF: [u8; 1514] = [0; 1514];
 
-pub(crate) fn ethernet_send(dst: MacAddr, ethertype: u16, payload: &[u8]) {
+pub fn ethernet_send(dst: MacAddr, ethertype: u16, payload: &[u8]) {
     unsafe {
         let hdr = &mut *(ETH_TX_BUF.as_mut_ptr() as *mut EthernetHeader);
         hdr.dst = dst;
@@ -48,7 +53,7 @@ pub(crate) fn ethernet_send(dst: MacAddr, ethertype: u16, payload: &[u8]) {
 }
 
 /// Parse an Ethernet frame into ethertype + payload. Returns None if too short.
-pub(crate) fn ethernet_parse(frame: &[u8]) -> Option<(u16, &[u8])> {
+pub fn ethernet_parse(frame: &[u8]) -> Option<(u16, &[u8])> {
     if frame.len() < HEADER_LEN {
         return None;
     }

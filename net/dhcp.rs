@@ -1,12 +1,21 @@
 // net/dhcp.rs — DHCP discover/offer/request/ack.
 
-use core::ptr;
+#![no_std]
+#![allow(static_mut_refs)]
 
+extern crate kernel;
+extern crate drivers;
+extern crate net_types as types;
+extern crate net_ethernet as ethernet;
+extern crate net_arp as arp;
+extern crate net_ipv4 as ipv4;
+
+use core::ptr;
 use types::{MacAddr, Ipv4Addr, CONFIG, checksum, htons, ntohs, htonl};
-use crate::ethernet::{EthernetHeader, ethernet_our_mac, ethernet_parse, ETHERTYPE_ARP, ETHERTYPE_IPV4};
-use crate::arp::{arp_receive, arp_announce};
-use crate::ipv4::{Ipv4Header, PROTO_UDP};
-use crate::arch_udelay;
+use ethernet::{EthernetHeader, ethernet_our_mac, ethernet_parse, ETHERTYPE_ARP, ETHERTYPE_IPV4};
+use arp::{arp_receive, arp_announce};
+use ipv4::{Ipv4Header, PROTO_UDP};
+use kernel::time::udelay;
 
 #[repr(C, packed)]
 struct UdpHeader {
@@ -299,7 +308,7 @@ fn dhcp_poll_wait(timeout_ms: u32) -> bool {
                 }
             }
         }
-        arch_udelay(1000); // 1ms
+        udelay(1000); // 1ms
     }
     false
 }
@@ -355,7 +364,7 @@ pub fn discover() -> bool {
             if idx < 3 { msg[pos] = b'.'; pos += 1; }
         }
         msg[pos] = b'\n'; pos += 1;
-        crate::log(&msg[..pos]);
+        kernel::serial::puts(&msg[..pos]);
     }
 
     // Gratuitous ARP

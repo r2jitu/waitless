@@ -9,6 +9,7 @@ rust_library(
         "lib.rs",
         "mm.rs",
         "serial.rs",
+        "time.rs",
         "types.rs",
     ] + select({
         "//bazel/platforms:x86_64": [
