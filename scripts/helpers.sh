@@ -62,14 +62,14 @@ start_qemu() {
         log="$VM_LOG"
     fi
     local cpus="${UNIKERNEL_CPUS:-1}"
-    local accel_args=()
+    local accel_args=""
     # Use multi-threaded TCG when running multiple vCPUs so each gets its own host thread.
     if [[ "$cpus" -gt 1 ]]; then
-        accel_args=(-accel "tcg,thread=multi")
+        accel_args="-accel tcg,thread=multi"
     fi
     "$QEMU_BIN" \
         "$@" \
-        "${accel_args[@]}" \
+        ${accel_args} \
         -m 128 -smp "$cpus" -nographic \
         -serial "file:${log}" \
         -no-reboot \
