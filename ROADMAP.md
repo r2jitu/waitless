@@ -70,6 +70,12 @@ New protocol targets (udp, ipv6, ndp, quic) are added as new crates.
 - [ ] Unit: DHCP option parsing
 - [ ] Integration: existing HTTP smoke tests still pass (no regression)
 
+**Try it:**
+```bash
+bazel test //net:ethernet_test //net:arp_test //net:tcp_test  # new unit tests
+bazel test //apps/webserver:test                              # regression check
+```
+
 ### 1b. Add crate_universe for crates.io dependencies
 
 Required for pulling in crypto (`ring`), QUIC (`quiche`/`quinn`), etc.
@@ -77,6 +83,12 @@ Required for pulling in crypto (`ring`), QUIC (`quiche`/`quinn`), etc.
 - [ ] Add `crates_repository` to MODULE.bazel
 - [ ] Test with a simple `no_std` dep (e.g., `bitflags` or `heapless`)
 - [ ] Verify build + boot smoke test passes
+
+**Try it:**
+```bash
+bazel build //apps/webserver:webserver.elf   # builds with crates.io dep
+bazel test //apps/webserver:test             # boots and serves HTTP
+```
 
 ---
 
@@ -482,6 +494,13 @@ INIT-SIPI-SIPI after init is done.
 - [ ] Integration: `test_ipi` — core 0 sends SGI/IPI to core 1, core 1 acknowledges via serial
 - [ ] Run on QEMU aarch64 AND x86_64
 
+**Try it:**
+```bash
+bazel test //apps/test_smp:test                # serial: "core 0 online" .. "core 3 online"
+bazel test //apps/test_smp:test --config=qemu  # same on QEMU
+# Webserver still runs single-core here — cores boot but networking is next
+```
+
 ### 2b. Tier 1: multi-queue + MSI-X (QEMU)
 
 - [ ] Negotiate `VIRTIO_NET_F_MQ` feature bit
@@ -490,13 +509,25 @@ INIT-SIPI-SIPI after init is done.
 - [ ] MSI-X affinity: route each vector to owning core (APIC / GICv2M)
 - [ ] RSS configuration: program indirection table + hash key
 - [ ] Per-core RX/TX poll in event loop
+- [ ] Log which core handles each HTTP request
 - [ ] QEMU flags: `-smp N`, `mq=on,queues=N,vectors=2N+2`
+- [ ] Extend bench.sh: compare 1-core vs 2-core vs 4-core throughput
 
 **Tests:**
 - [ ] Integration: `test_multiqueue` — boot with `-smp 4, mq=on,queues=4`, verify 4 queue pairs negotiated
 - [ ] Integration: `test_msix_affinity` — verify MSI-X vectors route to correct cores
 - [ ] Integration: `test_rss_distribution` — send from multiple source ports, verify packets land on different cores
 - [ ] Integration: HTTP smoke tests with `-smp 4` (regression)
+
+**Try it (the big milestone):**
+```bash
+# Webserver on 4 cores — serial shows requests handled by different cores
+bazel run //apps/webserver:run   # with -smp 4 in run script
+# Benchmark: compare 1 vs 4 cores
+UNIKERNEL_CPUS=1 ./scripts/bench.sh   # baseline
+UNIKERNEL_CPUS=4 ./scripts/bench.sh   # expect ~linear scaling
+# Watch serial output for "core 2: GET /health from 10.0.2.2:54321"
+```
 
 ### 2c. Tier 2: software distribution (VZ + single-queue)
 
@@ -512,6 +543,13 @@ INIT-SIPI-SIPI after init is done.
 **Tests:**
 - [ ] Integration: `test_tier2_distribution` — boot VZ (or QEMU without MQ), verify software distribution active
 - [ ] Integration: `test_tier_autodetect` — verify Tier 1 on QEMU with MQ, Tier 2 on QEMU without MQ
+
+**Try it:**
+```bash
+UNIKERNEL_CPUS=4 ./scripts/bench.sh   # VZ flavor shows multi-core perf
+# Serial: "Tier 2: software distribution (single-queue detected)"
+# Serial: "core 0: distributed 12 packets (3 to core 1, 4 to core 2, 5 to core 3)"
+```
 
 ### 2d. Work stealing
 
@@ -584,6 +622,14 @@ Maybe 100 lines. Sits between IPv4 and QUIC.
 - [ ] Unit: UDP header checksum, parse/build
 - [ ] Integration: send/receive UDP packets through QEMU (netcat or custom tool)
 
+**Try it:**
+```bash
+bazel test //net:udp_test                      # unit tests
+# From host while QEMU runs:
+echo "hello" | nc -u localhost 5000            # send UDP to unikernel
+# Serial: "UDP recv: 5 bytes from 10.0.2.2:xxxxx"
+```
+
 ### 3b. TLS 1.3 crypto
 
 QUIC mandates TLS 1.3. Options:
@@ -634,6 +680,13 @@ Skip: 0-RTT, connection migration, path validation, PMTUD.
 **Tests:**
 - [ ] Unit: QUIC packet number decode, frame parsing
 - [ ] Integration: QUIC handshake with external client (curl --http3 or quiche-client)
+
+**Try it:**
+```bash
+# QUIC handshake from host to unikernel
+quiche-client --no-verify https://localhost:4433/health
+# Serial: "QUIC: handshake complete, 1 stream"
+```
 
 ---
 
@@ -691,6 +744,16 @@ fn main() {
 - [ ] Integration: HTTP/3 request/response with curl --http3
 - [ ] Integration: HTTP smoke tests (GET /, GET /health, GET /404) over HTTP/3
 
+**Try it:**
+```bash
+# HTTP/3 request from host to unikernel
+curl --http3 -k https://localhost:8443/health
+# Response: {"status": "ok"}
+# Serial: "H3: GET /health from [::1]:xxxxx (QUIC stream 0)"
+# Benchmark comparison:
+./scripts/bench.sh   # now includes HTTP/1.1 vs HTTP/3 comparison
+```
+
 ---
 
 ## Phase 5: IPv6 + NDP (drop IPv4/ARP)
@@ -733,6 +796,16 @@ Replaces DHCP for IPv6. Generate address from MAC + router prefix.
 **Tests:**
 - [ ] Unit: SLAAC address generation
 - [ ] Integration: HTTP over IPv6 end-to-end
+
+**Try it:**
+```bash
+# IPv6 ping from host to unikernel
+ping6 fe80::...%tap0
+# HTTP over IPv6
+curl -6 http://[fe80::...%tap0]:80/health
+# Serial: "SLAAC: configured fe80::5054:ff:fe12:3456"
+# Serial: "NDP: neighbor solicitation from fe80::1"
+```
 
 ---
 
