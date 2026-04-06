@@ -403,6 +403,12 @@ unsafe fn kernel_boot(info: &BootInfo) {
         kernel::x86_64::apic::init();
     }
 
+    // Set per-core TLS register early (before any networking that calls cpu_id).
+    #[cfg(target_arch = "x86_64")]
+    kernel::x86_64::smp::init_cpu_id(0);
+    #[cfg(target_arch = "aarch64")]
+    kernel::aarch64::smp::init_cpu_id(0);
+
     klog!("[INIT] PCI bus scan (Rust)...\n");
     drivers::pci::init();
 

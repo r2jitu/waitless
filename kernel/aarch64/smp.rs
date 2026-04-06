@@ -26,12 +26,19 @@ struct CoreState {
 static mut CORES: [CoreState; MAX_CORES] = [const { CoreState { stack_top: 0 } }; MAX_CORES];
 static mut NUM_CORES_ONLINE: u32 = 1; // BSP is always online
 
-/// Get the current CPU ID from MPIDR_EL1.
+/// Get the current CPU's logical core index.
+///
+/// Reads TPIDR_EL1 which we program with the core ID during boot.
+/// Cost: one system register read (~1 cycle) vs MPIDR parse.
 pub fn cpu_id() -> u32 {
-    let mpidr: u64;
-    unsafe { core::arch::asm!("mrs {}, MPIDR_EL1", out(reg) mpidr) };
-    // Aff0 is the core ID within a cluster
-    (mpidr & 0xFF) as u32
+    let id: u64;
+    unsafe { core::arch::asm!("mrs {}, tpidr_el1", out(reg) id, options(nomem, nostack)) };
+    id as u32
+}
+
+/// Set TPIDR_EL1 to the logical core index. Called once per core during boot.
+pub fn init_cpu_id(id: u32) {
+    unsafe { core::arch::asm!("msr tpidr_el1, {}", in(reg) id as u64, options(nomem, nostack)) };
 }
 
 /// Returns the number of cores that have booted.
@@ -114,6 +121,11 @@ pub unsafe fn start_secondary_cores(cpu_count: u32) {
 #[unsafe(no_mangle)]
 unsafe extern "C" fn ap_entry(_stack_top: u64) -> ! {
     unsafe {
+        // Set TPIDR_EL1 for fast cpu_id(). MPIDR Aff0 = logical core index on QEMU virt.
+        let mpidr: u64;
+        core::arch::asm!("mrs {}, MPIDR_EL1", out(reg) mpidr, options(nomem, nostack));
+        init_cpu_id((mpidr & 0xFF) as u32);
+
         // Initialize this core's GIC redistributor
         exceptions::init_ap();
 

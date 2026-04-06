@@ -24,9 +24,41 @@ pub const MAX_CORES: usize = 8;
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static NUM_CORES_ONLINE: AtomicU32 = AtomicU32::new(1);
 
-/// Get current CPU's APIC ID.
+/// Get current CPU's logical core index.
+///
+/// Reads from GS:0 where we store the core ID. Each core programs
+/// GS_BASE to point to its slot in a per-core ID array during boot.
+/// Cost: one segment-prefixed memory load (~1 cycle) vs APIC MMIO
+/// (~200+ cycles under TCG).
 pub fn cpu_id() -> u32 {
-    apic::apic_id()
+    let id: u32;
+    unsafe {
+        core::arch::asm!(
+            "mov {:e}, gs:[0]",
+            out(reg) id,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    id
+}
+
+/// Per-core ID storage. GS_BASE for core N points to CORE_IDS[N].
+static mut CORE_IDS: [u32; MAX_CORES] = [0; MAX_CORES];
+
+/// Set GS_BASE to point at this core's ID slot. Called once per core during boot.
+pub fn init_cpu_id(id: u32) {
+    unsafe {
+        CORE_IDS[id as usize] = id;
+        let addr = &CORE_IDS[id as usize] as *const u32 as u64;
+        // Write IA32_GS_BASE MSR (0xC0000101)
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") 0xC0000101u32,
+            in("eax") addr as u32,
+            in("edx") (addr >> 32) as u32,
+            options(nomem, nostack),
+        );
+    }
 }
 
 /// Number of online cores.
@@ -132,6 +164,18 @@ extern "C" fn ap_entry_x86(_ctx: u64) -> ! {
 
     // Initialize this AP's APIC
     unsafe { apic::init_ap(); }
+
+    // Set GS_BASE for fast cpu_id() — look up logical core index from APIC ID.
+    let apic_id = apic::apic_id();
+    let topo = super::acpi::topology();
+    let mut logical_id = 0u32;
+    for i in 0..topo.cpu_count as usize {
+        if topo.apic_ids[i] as u32 == apic_id {
+            logical_id = i as u32;
+            break;
+        }
+    }
+    init_cpu_id(logical_id);
 
     // Load the IDT (same one BSP set up) so this AP can handle interrupts.
     super::idt::load_idt_on_ap();
