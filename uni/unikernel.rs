@@ -19,12 +19,35 @@ pub fn check_shutdown() -> bool {
 // ---- Wait for events (arch-specific idle) -------------------------------------
 
 pub fn wait_for_events() {
+    // Flush any pending TX from APs before considering sleep.
+    if drivers::virtio_net::has_pending_tx() {
+        drivers::virtio_net::flush_tx_staging();
+        return;
+    }
+
+    let multicore = kernel::percpu::num_cores() > 1;
+
     if drivers::virtio_net::irq_idle_supported() {
         unsafe { arch_mask_irq() };
         drivers::virtio_net::arm_rx_interrupts();
-        if !drivers::virtio_net::has_pending_rx() {
-            unsafe { arch_idle() };
+        if !drivers::virtio_net::has_pending_rx() && !drivers::virtio_net::has_pending_tx() {
+            if multicore {
+                // In multi-core mode, do a short spin instead of deep sleep
+                // so we can promptly flush TX staging from APs.
+                for _ in 0..10_000u32 {
+                    unsafe { arch_cpu_relax() };
+                    if drivers::virtio_net::has_pending_rx()
+                        || drivers::virtio_net::has_pending_tx()
+                    {
+                        break;
+                    }
+                }
+            } else {
+                unsafe { arch_idle() };
+            }
         }
+        // Flush any TX staging that arrived while we were idle.
+        drivers::virtio_net::flush_tx_staging();
         unsafe { arch_unmask_irq() };
     } else {
         unsafe { arch_cpu_relax() };

@@ -2,7 +2,7 @@
 
 use core::arch::asm;
 use core::ptr;
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
 use crate::{
     log, dsb_st,
@@ -529,7 +529,8 @@ pub fn get_mac(mac_out: *mut u8) {
     }
 }
 
-pub fn send(data: &[u8]) {
+/// Send a frame directly to the VirtIO TX queue. Only core 0 should call this.
+fn send_direct(data: &[u8]) {
     if data.is_empty() { return; }
     unsafe {
         if let Transport::None = NET.transport { return; }
@@ -575,6 +576,45 @@ pub fn send(data: &[u8]) {
         }
 
         NET.tx_queue.kick();
+    }
+}
+
+/// Flag: set by APs when they stage TX, checked by core 0 before sleeping.
+static TX_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Send a frame. Core 0 sends directly; other cores stage for core 0 to flush.
+pub fn send(data: &[u8]) {
+    let id = kernel::cpu_id();
+    if id == 0 {
+        send_direct(data);
+    } else {
+        // Stage in this core's TX staging buffer — core 0 will flush it.
+        unsafe {
+            kernel::percpu::get(id).tx_staging.push(data);
+        }
+        TX_PENDING.store(true, Ordering::Release);
+    }
+}
+
+/// True if any AP has staged TX packets waiting for flush.
+pub fn has_pending_tx() -> bool {
+    TX_PENDING.load(Ordering::Acquire)
+}
+
+/// Flush all per-core TX staging buffers into the VirtIO TX queue.
+/// Called by core 0 during its poll cycle.
+pub fn flush_tx_staging() {
+    if !TX_PENDING.swap(false, Ordering::Acquire) {
+        return;
+    }
+    let n = kernel::percpu::num_cores();
+    for i in 1..n {
+        unsafe {
+            let core = kernel::percpu::get(i);
+            while let Some(pkt) = core.tx_staging.pop() {
+                send_direct(pkt);
+            }
+        }
     }
 }
 

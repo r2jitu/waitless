@@ -121,11 +121,20 @@ pub unsafe fn start_secondary_cores(cpu_count: u32) {
     serial::puts(&buf[..pos]);
 }
 
+/// IPI wakeup vector (must not conflict with PIC IRQs 32-47 or exceptions 0-31).
+pub const IPI_VECTOR: u8 = 0x40;
+
 /// AP entry point — called from the trampoline in 64-bit mode.
 #[unsafe(no_mangle)]
 extern "C" fn ap_entry_x86(_ctx: u64) -> ! {
+    // Load BSP's GDT (AP trampoline GDT has wrong selector layout for IDT).
+    super::gdt::load_on_ap();
+
     // Initialize this AP's APIC
     unsafe { apic::init_ap(); }
+
+    // Load the IDT (same one BSP set up) so this AP can handle interrupts.
+    super::idt::load_idt_on_ap();
 
     // Mark online
     NUM_CORES_ONLINE.fetch_add(1, Ordering::SeqCst);
@@ -138,11 +147,23 @@ extern "C" fn ap_entry_x86(_ctx: u64) -> ! {
     for &b in b" online\n" { buf[pos] = b; pos += 1; }
     serial::puts(&buf[..pos]);
 
-    // Idle loop
+    // Enable interrupts so IPI can be delivered.
+    unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
+
+    // Event loop: drain inbox, process, sleep when idle.
     loop {
-        unsafe { core::arch::asm!("hlt"); }
         if SHUTDOWN.load(Ordering::Relaxed) {
             loop { unsafe { core::arch::asm!("hlt"); } }
+        }
+
+        let mut did_work = false;
+        if let Some(poll_fn) = crate::percpu::ap_poll_fn() {
+            did_work = poll_fn(id);
+        }
+
+        if !did_work {
+            // HLT until IPI or interrupt wakes us. Interrupts are enabled (STI above).
+            unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
         }
     }
 }

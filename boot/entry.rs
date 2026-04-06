@@ -462,6 +462,7 @@ unsafe fn kernel_boot(info: &BootInfo) {
     #[cfg(target_arch = "aarch64")]
     {
         let cpu_count = kernel::aarch64::fdt::info().cpu_count;
+        kernel::percpu::init(cpu_count);
         if cpu_count > 1 {
             kernel::aarch64::smp::start_secondary_cores(cpu_count);
         }
@@ -469,6 +470,7 @@ unsafe fn kernel_boot(info: &BootInfo) {
     #[cfg(target_arch = "x86_64")]
     {
         let cpu_count = kernel::x86_64::acpi::detect_cpus();
+        kernel::percpu::init(cpu_count);
         if cpu_count > 1 {
             kernel::x86_64::smp::start_secondary_cores(cpu_count);
         }

@@ -211,6 +211,34 @@ pub fn init() {
     }
 }
 
+/// Load the BSP's GDT on an AP. Reloads segment registers for the new GDT layout.
+pub fn load_on_ap() {
+    unsafe {
+        #[allow(static_mut_refs)]
+        let gdtr_ptr = &GDTR as *const DescriptorTablePtr;
+        asm!("lgdt [{}]", in(reg) gdtr_ptr, options(nostack));
+
+        // Reload CS via far return, then reload data segments.
+        asm!(
+            "push {cs}",
+            "lea rax, [rip + 2f]",
+            "push rax",
+            "retfq",
+            "2:",
+            "mov ax, {ds:x}",
+            "mov ds, ax",
+            "mov es, ax",
+            "mov ss, ax",
+            "xor ax, ax",
+            "mov fs, ax",
+            "mov gs, ax",
+            cs = const KERNEL_CODE_SELECTOR as u64,
+            ds = in(reg) KERNEL_DATA_SELECTOR,
+            out("rax") _,
+        );
+    }
+}
+
 /// Set the kernel stack pointer in the TSS.
 /// When an interrupt occurs in ring 3, the CPU switches RSP to this value.
 pub fn set_kernel_stack(stack: u64) {

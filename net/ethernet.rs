@@ -36,19 +36,19 @@ pub fn ethernet_our_mac() -> MacAddr {
     }
 }
 
-static mut ETH_TX_BUF: [u8; 1514] = [0; 1514];
-
 pub fn ethernet_send(dst: MacAddr, ethertype: u16, payload: &[u8]) {
+    // Stack-allocated buffer: safe for multi-core (each core has its own stack).
+    let mut buf = [0u8; 1514];
     unsafe {
-        let hdr = &mut *(ETH_TX_BUF.as_mut_ptr() as *mut EthernetHeader);
+        let hdr = &mut *(buf.as_mut_ptr() as *mut EthernetHeader);
         hdr.dst = dst;
         hdr.src = ethernet_our_mac();
         hdr.ethertype = htons(ethertype);
 
         let payload_len = payload.len().min(1500);
-        ptr::copy_nonoverlapping(payload.as_ptr(), ETH_TX_BUF.as_mut_ptr().add(HEADER_LEN), payload_len);
+        ptr::copy_nonoverlapping(payload.as_ptr(), buf.as_mut_ptr().add(HEADER_LEN), payload_len);
 
-        drivers::virtio_net::send(&ETH_TX_BUF[..HEADER_LEN + payload_len]);
+        drivers::virtio_net::send(&buf[..HEADER_LEN + payload_len]);
     }
 }
 

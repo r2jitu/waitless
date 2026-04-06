@@ -33,8 +33,68 @@ impl spsc::Default for Task {
 
 fn noop(_: usize) {}
 
+/// Maximum packet size for RX inbox.
+const RX_BUF_SIZE: usize = 1514;
+
+/// Number of RX inbox slots per core.
+const RX_POOL_SIZE: usize = 64;
+
+/// A received packet in the inbox: length + data.
+#[derive(Clone, Copy)]
+pub struct RxPacket {
+    pub len: usize,
+    pub data: [u8; RX_BUF_SIZE],
+}
+
+impl spsc::Default for RxPacket {
+    const DEFAULT: Self = RxPacket { len: 0, data: [0; RX_BUF_SIZE] };
+}
+
+/// RX inbox: core 0 pushes received frames here, owning core pops and processes.
+pub struct RxInbox {
+    pool: [RxPacket; RX_POOL_SIZE],
+    /// Indices of filled packets, ready for the owning core to process.
+    ready: spsc::Ring<u32>,
+    next_slot: usize,
+}
+
+impl RxInbox {
+    pub const fn new() -> Self {
+        RxInbox {
+            pool: [const { RxPacket { len: 0, data: [0; RX_BUF_SIZE] } }; RX_POOL_SIZE],
+            ready: spsc::Ring::new(),
+            next_slot: 0,
+        }
+    }
+
+    /// Push a frame into the inbox (called by core 0 during distribution).
+    pub fn push(&mut self, data: &[u8]) -> bool {
+        if data.len() > RX_BUF_SIZE {
+            return false;
+        }
+        let slot = self.next_slot;
+        self.pool[slot].data[..data.len()].copy_from_slice(data);
+        self.pool[slot].len = data.len();
+        if !self.ready.push(slot as u32) {
+            return false;
+        }
+        self.next_slot = (self.next_slot + 1) % RX_POOL_SIZE;
+        true
+    }
+
+    /// Pop a ready frame (called by owning core).
+    pub fn pop(&mut self) -> Option<&[u8]> {
+        let idx = self.ready.pop()?;
+        let pkt = &self.pool[idx as usize];
+        Some(&pkt.data[..pkt.len])
+    }
+}
+
 /// Per-core state. Each core has exactly one of these.
 pub struct PerCore {
+    /// RX inbox for Tier 2 delivery (core 0 writes, this core reads).
+    pub rx_inbox: RxInbox,
+
     /// Inbox for Tier 2 RX delivery (SPSC: core 0 writes, this core reads).
     pub inbox: spsc::Ring<Task>,
 
@@ -106,6 +166,7 @@ impl TxStaging {
 impl PerCore {
     pub const fn new(id: u32) -> Self {
         PerCore {
+            rx_inbox: RxInbox::new(),
             inbox: spsc::Ring::new(),
             pinned: spsc::Ring::new(),
             stealable: Deque::new(),
@@ -120,6 +181,10 @@ impl PerCore {
 /// Global array of per-core state. Initialized by core 0 during boot.
 static mut CORES: [PerCore; MAX_CORES] = [const { PerCore::new(0) }; MAX_CORES];
 static mut NUM_CORES: u32 = 1;
+
+/// AP poll function: registered by the network layer, called by APs in their event loop.
+/// Returns true if work was done.
+static mut AP_POLL_FN: Option<fn(u32) -> bool> = None;
 
 /// Initialize per-core state for `count` cores.
 pub unsafe fn init(count: u32) {
@@ -140,4 +205,15 @@ pub unsafe fn get(id: u32) -> &'static mut PerCore {
 /// Get the total number of cores.
 pub fn num_cores() -> u32 {
     unsafe { NUM_CORES }
+}
+
+/// Register the AP poll function (called by net layer during init).
+pub fn set_ap_poll_fn(f: fn(u32) -> bool) {
+    unsafe { core::ptr::write_volatile(&raw mut AP_POLL_FN, Some(f)); }
+}
+
+/// Get the AP poll function (called by APs in their event loop).
+/// Uses volatile read to prevent the compiler from caching the value.
+pub fn ap_poll_fn() -> Option<fn(u32) -> bool> {
+    unsafe { core::ptr::read_volatile(&raw const AP_POLL_FN) }
 }

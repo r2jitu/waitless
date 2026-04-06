@@ -144,16 +144,25 @@ unsafe extern "C" fn ap_entry(_stack_top: u64) -> ! {
         for &b in b" online\n" { buf[pos] = b; pos += 1; }
         serial::puts(&buf[..pos]);
 
-        // Idle loop — WFI until shutdown or work is available (Phase 2b+)
+        // Event loop: drain inbox, process, sleep when idle.
+        let id = cpu_id();
         loop {
-            core::arch::asm!("wfi");
             if SHUTDOWN.load(Ordering::Relaxed) {
-                // PSCI CPU_OFF — this core stops executing
                 core::arch::asm!(
                     "hvc #0",
                     in("x0") 0x8400_0002u64,  // PSCI CPU_OFF
                     options(nostack, nomem),
                 );
+            }
+
+            let mut did_work = false;
+            if let Some(poll_fn) = crate::percpu::ap_poll_fn() {
+                did_work = poll_fn(id);
+            }
+
+            if !did_work {
+                // No work — sleep until IPI or interrupt wakes us.
+                core::arch::asm!("wfi");
             }
         }
     }

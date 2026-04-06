@@ -122,5 +122,6 @@ rust_library(
         ":udp",
         ":dhcp",
         "//drivers",
+        "//kernel",
     ],
 )

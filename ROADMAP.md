@@ -545,24 +545,30 @@ UNIKERNEL_CPUS=4 ./scripts/bench.sh   # expect ~linear scaling
 ### 2c. Tier 2: software distribution (VZ + single-queue)
 
 - [x] HTTP + UDP tests pass with -smp 4 on both arches (regression verified)
-- [ ] Detect single-queue at boot (`VIRTIO_NET_F_MQ` not offered)
-- [ ] Flow hash function: hash(src_ip, dst_ip, src_port, dst_port)
-- [ ] Per-core inbox (SPSC: core 0 writes, owning core reads) for RX delivery
-- [ ] Batched RX distribution: drain entire RX queue, classify, enqueue to inbox
-- [ ] Batched IPI: one IPI per core that received packets (not per packet)
-- [ ] Per-core TX staging buffers (SPSC rings in regular memory)
-- [ ] Core 0 TX flush: drain all per-core TX staging into VirtIO TX ring
-- [ ] Tier auto-detection: MQ offered -> Tier 1, else -> Tier 2
+- [x] Detect single-queue at boot (always Tier 2 when `num_cores > 1`; MQ not yet supported)
+- [x] Flow hash function: FNV-1a hash(src_ip, dst_ip, src_port, dst_port) % num_cores
+- [x] Per-core RX inbox (RxInbox: 64-slot packet pool + SPSC index ring)
+- [x] Batched RX distribution: core 0 drains RX, classifies by protocol+flow, enqueues to inbox
+- [x] Batched IPI: one IPI per core that received packets (not per packet)
+- [x] Per-core TX staging buffers (TxStaging: 32-slot pool, SPSC ring)
+- [x] Core 0 TX flush: drains all per-core TX staging via TX_PENDING atomic flag
+- [x] AP event loop: drain inbox → process → HLT/WFI (replaces idle loop)
+- [x] Stack-allocated TX buffers in ethernet/ipv4 (safe for multi-core)
+- [x] AP poll function hook (kernel::percpu::set_ap_poll_fn with volatile read)
+- [x] x86_64: AP loads BSP GDT + IDT, APIC EOI for IPI vectors
+- [ ] Tier auto-detection: MQ offered -> Tier 1, else -> Tier 2 (deferred to 2b)
+- [ ] TCP connection pinning (currently TCP stays on core 0, UDP distributed)
 
 **Tests:**
-- [ ] Integration: `test_tier2_distribution` — boot VZ (or QEMU without MQ), verify software distribution active
-- [ ] Integration: `test_tier_autodetect` — verify Tier 1 on QEMU with MQ, Tier 2 on QEMU without MQ
+- [x] Integration: HTTP + UDP tests pass with -smp 4 on both arches
+- [x] Integration: serial output shows "Tier 2: software distribution (N cores)"
+- [ ] Integration: `test_tier2_distribution` — dedicated test verifying per-core packet processing
 
 **Try it:**
 ```bash
-UNIKERNEL_CPUS=4 ./scripts/bench.sh   # VZ flavor shows multi-core perf
-# Serial: "Tier 2: software distribution (single-queue detected)"
-# Serial: "core 0: distributed 12 packets (3 to core 1, 4 to core 2, 5 to core 3)"
+UNIKERNEL_CPUS=4 bazel test --config=aarch64-qemu //apps/webserver:test --test_env=UNIKERNEL_CPUS=4
+UNIKERNEL_CPUS=4 bazel test --config=x86_64-qemu //apps/webserver:test --test_env=UNIKERNEL_CPUS=4
+# Serial: "[net] Tier 2: software distribution (4 cores)"
 ```
 
 ### 2d. Work stealing

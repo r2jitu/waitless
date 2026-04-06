@@ -223,12 +223,15 @@ pub unsafe extern "C" fn isr_common_handler(frame: *mut InterruptFrame) {
     // Dispatch to registered handler if one exists
     if let Some(handler) = HANDLERS[vector] {
         handler(frame);
-        // Send EOI for hardware IRQs (vectors 32-47)
+        // Send EOI for hardware IRQs (vectors 32-47) via PIC
         if vector >= 32 && vector < 48 {
             if vector >= 40 {
                 outb(PIC2_CMD, 0x20); // Slave PIC EOI
             }
             outb(PIC1_CMD, 0x20); // Master PIC EOI
+        } else if vector >= 48 {
+            // APIC vector — send APIC EOI
+            super::apic::eoi();
         }
         return;
     }
@@ -241,6 +244,12 @@ pub unsafe extern "C" fn isr_common_handler(frame: *mut InterruptFrame) {
             outb(PIC2_CMD, 0x20);
         }
         outb(PIC1_CMD, 0x20);
+        return;
+    }
+
+    // APIC vectors without handlers: send EOI and return
+    if vector >= 48 {
+        super::apic::eoi();
         return;
     }
 
@@ -308,6 +317,13 @@ pub fn enable_irq(irq: u8) {
         };
         let mask = inb(port);
         outb(port, mask & !(1 << bit)); // Clear the bit to unmask
+    }
+}
+
+/// Load the IDT on an AP (same IDT as BSP). APs share the IDT and handler table.
+pub fn load_idt_on_ap() {
+    unsafe {
+        asm!("lidt [{}]", in(reg) &IDTR, options(nostack));
     }
 }
 
