@@ -22,6 +22,7 @@ pub(crate) mod ethernet;
 pub(crate) mod arp;
 pub(crate) mod ipv4;
 pub mod tcp;
+pub mod udp;
 pub mod dhcp;
 
 fn log(msg: &[u8]) {

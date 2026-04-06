@@ -197,4 +197,26 @@ mod tests {
         verified[11] = (cksum >> 8) as u8;
         assert_eq!(checksum(verified.as_ptr(), verified.len()), 0);
     }
+
+    #[test]
+    fn udp_checksum_verification() {
+        // Build a UDP pseudo-header + payload and verify the checksum.
+        let src = Ipv4Addr::from(10, 0, 2, 15);
+        let dst = Ipv4Addr::from(10, 0, 2, 2);
+        // UDP header (8 bytes): src_port=5000, dst_port=80, len=13, cksum=0
+        // + payload "hello" (5 bytes) = 13 bytes total
+        let udp_data: [u8; 13] = [
+            0x13, 0x88, // src_port = 5000 (big-endian)
+            0x00, 0x50, // dst_port = 80
+            0x00, 0x0D, // length = 13
+            0x00, 0x00, // checksum = 0 (to be computed)
+            b'h', b'e', b'l', b'l', b'o',
+        ];
+        let cksum = tcp_checksum(src, dst, 17, udp_data.as_ptr(), udp_data.len());
+        // Fill in and re-verify
+        let mut verified = udp_data;
+        verified[6] = (cksum & 0xFF) as u8;
+        verified[7] = (cksum >> 8) as u8;
+        assert_eq!(tcp_checksum(src, dst, 17, verified.as_ptr(), verified.len()), 0);
+    }
 }

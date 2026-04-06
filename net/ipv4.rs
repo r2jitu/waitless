@@ -6,6 +6,7 @@ use types::{MacAddr, Ipv4Addr, CONFIG, checksum, htons, ntohs};
 use crate::ethernet::{ethernet_send, ETHERTYPE_IPV4};
 use crate::arp::arp_resolve;
 use crate::tcp::tcp_receive;
+use crate::udp::udp_receive;
 
 pub(crate) const PROTO_TCP: u8 = 6;
 pub(crate) const PROTO_UDP: u8 = 17;
@@ -104,6 +105,7 @@ pub(crate) fn ipv4_receive(data: &[u8]) {
 
     match hdr.protocol {
         PROTO_TCP => tcp_receive(hdr.src, hdr.dst, payload),
+        PROTO_UDP => udp_receive(hdr.src, hdr.dst, payload),
         _ => {}
     }
 }

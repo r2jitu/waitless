@@ -31,6 +31,7 @@ rust_library(
         "ipv4.rs",
         "lib.rs",
         "tcp.rs",
+        "udp.rs",
     ],
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
     deps = [
