@@ -494,7 +494,7 @@ INIT-SIPI-SIPI after init is done.
 - [ ] Per-core timer wheel + pending_timers MPSC queue
 - [ ] Per-core TX staging buffer (Tier 2)
 - [ ] Per-core heap slab (bump allocator for task-scoped allocations)
-- [ ] Graceful shutdown: serial 0x03 detected -> set AtomicBool -> IPI all cores
+- [x] Graceful shutdown: AtomicBool + SGI to wake APs + PSCI CPU_OFF
 
 **Tests:**
 - [x] Integration: boot with `-smp 4`, all 4 cores print "core N online" (aarch64 QEMU)
