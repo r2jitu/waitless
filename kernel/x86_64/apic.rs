@@ -97,11 +97,18 @@ pub unsafe fn init() {
         // Map APIC MMIO page via HHDM
         APIC_BASE = mm::phys_to_virt(phys_base) as u64;
 
-        // Don't enable APIC software enable yet — PIC handles device IRQs.
-        // The APIC will be fully enabled when we switch to MSI-X (Phase 2b)
-        // or when starting APs via INIT-SIPI-SIPI.
-        // For now, just detect and log — IPI/SIPI functions work regardless
-        // of the SVR enable bit.
+        // Enable APIC in virtual wire mode: PIC interrupts route through
+        // LINT0 of the BSP's Local APIC. This lets PIC device IRQs work
+        // while the APIC is active (needed for INIT-SIPI-SIPI).
+        apic_write(APIC_SVR, 0x100 | SPURIOUS_VECTOR);
+        apic_write(APIC_TPR, 0);
+
+        // LINT0 = ExtINT (PIC passthrough), edge-triggered, unmasked
+        apic_write(APIC_LVT_LINT0, 0x00000700); // delivery mode 111 = ExtINT
+        // LINT1 = NMI, edge-triggered, unmasked
+        apic_write(APIC_LVT_LINT1, 0x00000400); // delivery mode 100 = NMI
+        // Timer = masked (not used yet)
+        apic_write(APIC_LVT_TIMER, 0x10000);
 
         let id = apic_read(APIC_ID) >> 24;
         let ver = apic_read(APIC_VERSION) & 0xFF;

@@ -22,6 +22,8 @@ extern crate uni;
 core::arch::global_asm!(include_str!("x86_64/boot.S"), options(att_syntax));
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(include_str!("x86_64/idt_stubs.S"), options(att_syntax));
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(include_str!("x86_64/ap_boot.S"), options(att_syntax));
 #[cfg(target_arch = "aarch64")]
 core::arch::global_asm!(include_str!("aarch64/boot.S"));
 
@@ -463,6 +465,14 @@ unsafe fn kernel_boot(info: &BootInfo) {
         if cpu_count > 1 {
             kernel::aarch64::smp::start_secondary_cores(cpu_count);
         }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // For now, use QEMU's -smp N — QEMU reports CPUs via ACPI MADT.
+        // TODO: Parse ACPI MADT for actual CPU count. For now, hardcode 1
+        // (effectively no SMP) unless UNIKERNEL_CPUS is set in the test env,
+        // which only affects the QEMU command line, not kernel detection.
+        // The SMP module is ready — we just need CPU topology discovery.
     }
 
     klog!("\n[BOOT] All subsystems ready. Starting application.\n\n");

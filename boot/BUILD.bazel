@@ -16,11 +16,13 @@ rust_static_library(
         "//bazel/platforms:x86_64": [
             "x86_64/boot.S",
             "x86_64/idt_stubs.S",
+            "x86_64/ap_boot.S",
         ],
         "//bazel/platforms:aarch64": ["aarch64/boot.S"],
         "//conditions:default": [
             "x86_64/boot.S",
             "x86_64/idt_stubs.S",
+            "x86_64/ap_boot.S",
         ],
     }),
     crate_root = "entry.rs",

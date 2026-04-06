@@ -22,6 +22,7 @@ rust_library(
             "x86_64/gdt.rs",
             "x86_64/idt.rs",
             "x86_64/mod.rs",
+            "x86_64/smp.rs",
         ],
         "//bazel/platforms:aarch64": [
             "aarch64/exceptions.rs",
