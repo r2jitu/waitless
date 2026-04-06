@@ -9,7 +9,10 @@ rust_library(
     name = "app",
     srcs = ["main.rs"],
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
-    deps = ["//uni"],
+    deps = [
+        "//uni",
+        "//kernel",
+    ],
 )
 
 unikernel_binary(

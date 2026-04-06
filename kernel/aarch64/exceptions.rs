@@ -291,6 +291,15 @@ mod aarch64 {
     /// their own redistributor + CPU interface registers.
     pub unsafe fn init_ap() {
         unsafe {
+            if GIC_VERSION == 2 {
+                // GICv2: CPU interface is at GICD_BASE + 0x10000 (banked per-CPU)
+                let gicc = GICD_BASE + 0x10000;
+                // Enable CPU interface
+                ptr::write_volatile((gicc + 0x00) as *mut u32, 1);  // GICC_CTLR = enable
+                ptr::write_volatile((gicc + 0x04) as *mut u32, 0xFF); // GICC_PMR = all priorities
+                return;
+            }
+
             if GIC_VERSION != 3 || GICR_BASE == 0 {
                 return;
             }

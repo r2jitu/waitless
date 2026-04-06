@@ -117,6 +117,12 @@ unsafe extern "C" fn ap_entry(_stack_top: u64) -> ! {
         // Initialize this core's GIC redistributor
         exceptions::init_ap();
 
+        // Register SGI 0 handler for IPI
+        exceptions::register_irq(0, sgi_handler);
+
+        // Unmask IRQs so SGI can be delivered
+        core::arch::asm!("msr daifclr, #0x2", options(nomem, nostack));
+
         // Mark this core as online (atomic increment)
         core::arch::asm!(
             "1: ldaxr {0:w}, [{1}]",
@@ -153,23 +159,68 @@ unsafe extern "C" fn ap_entry(_stack_top: u64) -> ! {
     }
 }
 
+/// Counter of IPIs received across all cores (for testing).
+static IPI_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Send SGI 0 to a specific core.
+/// Supports both GICv2 (GICD_SGIR MMIO) and GICv3 (ICC_SGI1_EL1).
+pub fn send_sgi_to(target_core: u32) {
+    unsafe {
+        let fdt = super::fdt::info();
+        if fdt.gic_version == 3 {
+            // GICv3: ICC_SGI1_EL1 system register
+            let sgi_val: u64 = 1u64 << (target_core as u64);
+            core::arch::asm!(
+                "msr S3_0_C12_C11_5, {0}",
+                "isb",
+                in(reg) sgi_val,
+                options(nostack),
+            );
+        } else {
+            // GICv2: GICD_SGIR at offset 0xF00 from distributor base
+            // Bits [25:24] = 0 (target list filter: use target list)
+            // Bits [23:16] = target CPU mask
+            // Bits [3:0] = SGI INTID (0)
+            let sgir = fdt.gic_dist_base + 0xF00;
+            let val: u32 = (1 << (16 + target_core)) | 0; // target core, SGI 0
+            core::ptr::write_volatile(sgir as *mut u32, val);
+        }
+    }
+}
+
+/// SGI 0 handler — called on the receiving core by the GIC exception dispatcher.
+pub fn sgi_handler(_irq: u32) {
+    IPI_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Get the total IPI count (for testing).
+pub fn ipi_count() -> u32 {
+    IPI_COUNT.load(Ordering::Relaxed)
+}
+
 /// Signal all APs to shut down. Called by core 0 before system poweroff.
 pub fn request_shutdown() {
     if num_cores_online() <= 1 {
         return;
     }
     SHUTDOWN.store(true, Ordering::Relaxed);
-    // Send SGI (Software Generated Interrupt) 0 to all other cores to wake them from WFI.
-    // ICC_SGI1_EL1: IRM=1 (all other PEs), INTID=0
+    // Send SGI 0 to all other cores to wake them from WFI
     unsafe {
-        let sgi_val: u64 = 1 << 40; // IRM=1: target all other PEs, INTID=0
-        // ICC_SGI1_EL1 = S3_0_C12_C11_5
-        core::arch::asm!(
-            "msr S3_0_C12_C11_5, {0}",
-            "isb",
-            in(reg) sgi_val,
-            options(nostack),
-        );
+        let fdt = super::fdt::info();
+        if fdt.gic_version == 3 {
+            let sgi_val: u64 = 1 << 40; // IRM=1: all other PEs
+            core::arch::asm!(
+                "msr S3_0_C12_C11_5, {0}",
+                "isb",
+                in(reg) sgi_val,
+                options(nostack),
+            );
+        } else {
+            // GICv2: GICD_SGIR, broadcast to all other CPUs
+            let sgir = fdt.gic_dist_base + 0xF00;
+            let val: u32 = (1 << 24) | 0; // target filter = all other, SGI 0
+            core::ptr::write_volatile(sgir as *mut u32, val);
+        }
     }
 }
 

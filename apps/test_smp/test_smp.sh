@@ -67,6 +67,14 @@ else
     FAILURES=$((FAILURES+1))
 fi
 
+# Check IPI test
+if grep -q "IPI test: PASS" "$VM_LOG"; then
+    echo "  PASS: IPI delivered between cores"
+elif grep -q "IPI test: FAIL" "$VM_LOG"; then
+    echo "  FAIL: IPI was not received"
+    FAILURES=$((FAILURES+1))
+fi
+
 echo ""
 [[ $FAILURES -eq 0 ]] && { echo "ALL SMP TESTS PASSED"; exit 0; }
 echo "$FAILURES SMP TEST(S) FAILED"; exit 1

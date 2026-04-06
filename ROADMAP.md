@@ -488,8 +488,9 @@ INIT-SIPI-SIPI after init is done.
 - [x] aarch64: per-core GIC redistributor init (init_ap)
 - [x] FDT parser: count cpu@N nodes for CPU count
 - [x] UNIKERNEL_CPUS env var for configurable SMP count in QEMU
+- [ ] x86_64: extend boot page tables to cover APIC MMIO (0xFEE00000)
+- [ ] x86_64: wire APIC init into boot sequence (module exists: kernel/x86_64/apic.rs)
 - [ ] x86_64: start APs via INIT-SIPI-SIPI (after init complete)
-- [ ] x86_64: APIC init (replace legacy PIC for multi-core)
 - [x] Per-core Chase-Lev deque (kernel/deque.rs, 8 unit tests)
 - [x] Per-core timer wheel + pending_timers MPSC queue (kernel/timer.rs, 6 tests)
 - [x] Per-core TX staging buffer (kernel/percpu.rs TxStaging)
