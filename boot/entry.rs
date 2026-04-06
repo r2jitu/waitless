@@ -468,11 +468,10 @@ unsafe fn kernel_boot(info: &BootInfo) {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        // For now, use QEMU's -smp N — QEMU reports CPUs via ACPI MADT.
-        // TODO: Parse ACPI MADT for actual CPU count. For now, hardcode 1
-        // (effectively no SMP) unless UNIKERNEL_CPUS is set in the test env,
-        // which only affects the QEMU command line, not kernel detection.
-        // The SMP module is ready — we just need CPU topology discovery.
+        let cpu_count = kernel::x86_64::acpi::detect_cpus();
+        if cpu_count > 1 {
+            kernel::x86_64::smp::start_secondary_cores(cpu_count);
+        }
     }
 
     klog!("\n[BOOT] All subsystems ready. Starting application.\n\n");
