@@ -84,16 +84,13 @@ Required for pulling in crypto (`ring`), QUIC (`quiche`/`quinn`), etc.
 
 - [x] Add `crate_universe` to MODULE.bazel (annotation-based, no Cargo.toml)
 - [x] Verified bitflags resolves and compiles for x86_64-unknown-none
-- [ ] Fix aarch64-unknown-none platform gap in rules_rust (not in triple_mappings.bzl)
+- [x] Fix aarch64-unknown-none platform gap (patched rules_rust triple_mappings.bzl)
 - [ ] Use a crates.io dep in the unikernel and boot it
-
-**Known issue:** `aarch64-unknown-none` is not in rules_rust 0.56.0's
-platform registry. Crate_universe marks crates as incompatible for that
-target. Needs fix before Phase 3 (QUIC/TLS deps on aarch64).
 
 **Try it:**
 ```bash
-bazel build --config=x86_64-qemu @crates//:bitflags   # resolves + compiles
+bazel build --config=aarch64-qemu @crates//:bitflags   # compiles for bare-metal aarch64
+bazel build --config=x86_64-qemu @crates//:bitflags    # compiles for bare-metal x86_64
 ```
 
 ---
