@@ -5,8 +5,9 @@ use core::ptr;
 use kernel::mm;
 
 use crate::types::{Ipv4Addr, CONFIG, tcp_checksum};
-use crate::ipv4::{ipv4_send, PROTO_TCP};
-use crate::ethernet::ethernet_receive;
+use crate::ipv4::{ipv4_send, ipv4_receive, PROTO_TCP};
+use crate::arp::arp_receive;
+use crate::ethernet::{ethernet_parse, ETHERTYPE_ARP, ETHERTYPE_IPV4};
 use crate::{htons, ntohs, htonl, ntohl};
 
 const TCP_FIN: u8 = 0x01;
@@ -517,5 +518,16 @@ pub fn is_closed(handle: *mut ()) -> bool {
 }
 
 pub fn poll() {
-    drivers::virtio_net::poll(ethernet_receive);
+    drivers::virtio_net::poll(net_receive);
+}
+
+/// Full network stack dispatch: Ethernet -> ARP/IPv4 -> TCP.
+fn net_receive(frame: &[u8]) {
+    if let Some((ethertype, payload)) = ethernet_parse(frame) {
+        match ethertype {
+            ETHERTYPE_ARP => arp_receive(payload),
+            ETHERTYPE_IPV4 => ipv4_receive(payload),
+            _ => {}
+        }
+    }
 }

@@ -3,7 +3,7 @@
 use core::ptr;
 
 use crate::types::{MacAddr, Ipv4Addr, CONFIG, checksum};
-use crate::ethernet::{EthernetHeader, ethernet_our_mac, ETHERTYPE_ARP, ETHERTYPE_IPV4};
+use crate::ethernet::{EthernetHeader, ethernet_our_mac, ethernet_parse, ETHERTYPE_ARP, ETHERTYPE_IPV4};
 use crate::arp::{arp_receive, arp_announce};
 use crate::ipv4::{Ipv4Header, PROTO_UDP};
 use crate::{htons, ntohs, htonl, arch_udelay};
@@ -52,49 +52,47 @@ static mut DHCP_SERVER_IP: Ipv4Addr = Ipv4Addr::ANY;
 
 /// DHCP receive callback — processes raw ethernet frames during DHCP.
 fn dhcp_receive(frame: &[u8]) {
-    let len = frame.len();
-    if len < 14 {
-        return;
-    }
-    let hdr = unsafe { &*(frame.as_ptr() as *const EthernetHeader) };
-    let ethertype = ntohs(hdr.ethertype);
+    let (ethertype, payload) = match ethernet_parse(frame) {
+        Some(v) => v,
+        None => return,
+    };
 
     // Also process ARP during DHCP
-    if ethertype == ETHERTYPE_ARP && len >= 14 + 28 {
-        arp_receive(&frame[14..]);
+    if ethertype == ETHERTYPE_ARP && payload.len() >= 28 {
+        arp_receive(payload);
         return;
     }
 
-    if ethertype != ETHERTYPE_IPV4 || len < 14 + 20 {
+    if ethertype != ETHERTYPE_IPV4 || payload.len() < 20 {
         return;
     }
-    let ip_hdr = unsafe { &*(frame[14..].as_ptr() as *const Ipv4Header) };
+    let ip_hdr = unsafe { &*(payload.as_ptr() as *const Ipv4Header) };
     if ip_hdr.protocol != PROTO_UDP {
         return;
     }
     let ip_hdr_len = ((ip_hdr.version_ihl & 0x0F) as usize) * 4;
-    if len < 14 + ip_hdr_len + 8 {
+    if payload.len() < ip_hdr_len + 8 {
         return;
     }
 
-    let udp = unsafe { &*(frame[14 + ip_hdr_len..].as_ptr() as *const UdpHeader) };
+    let udp = unsafe { &*(payload[ip_hdr_len..].as_ptr() as *const UdpHeader) };
     if ntohs(udp.dst_port) != 68 || ntohs(udp.src_port) != 67 {
         return;
     }
 
-    let dhcp_offset = 14 + ip_hdr_len + 8;
-    if len < dhcp_offset + 240 {
+    let dhcp_offset = ip_hdr_len + 8;
+    if payload.len() < dhcp_offset + 240 {
         return;
     }
 
-    let dhcp = unsafe { &*(frame[dhcp_offset..].as_ptr() as *const DhcpPacket) };
+    let dhcp = unsafe { &*(payload[dhcp_offset..].as_ptr() as *const DhcpPacket) };
     if dhcp.xid != unsafe { DHCP_XID } || dhcp.magic_cookie != htonl(0x63825363) {
         return;
     }
 
     // Parse options
     let opts_start = dhcp_offset + 240;
-    let opts_data = &frame[opts_start..];
+    let opts_data = &payload[opts_start..];
 
     let mut msg_type: u8 = 0;
     let mut subnet = Ipv4Addr::ANY;

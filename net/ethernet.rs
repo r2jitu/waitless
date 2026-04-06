@@ -1,14 +1,16 @@
-// net/ethernet.rs — Ethernet frame parsing/building and receive callback.
+// net/ethernet.rs — Ethernet frame parsing/building.
+//
+// This module handles layer 2 only: MAC addresses, frame headers, send/receive.
+// Protocol dispatch (ARP, IPv4) is handled by callers, not here.
 
 use core::ptr;
 
 use crate::types::MacAddr;
-use crate::{htons, ntohs};
-use crate::arp::arp_receive;
-use crate::ipv4::ipv4_receive;
+use crate::htons;
 
 pub(crate) const ETHERTYPE_ARP: u16 = 0x0806;
 pub(crate) const ETHERTYPE_IPV4: u16 = 0x0800;
+pub(crate) const HEADER_LEN: usize = 14;
 
 #[repr(C, packed)]
 pub(crate) struct EthernetHeader {
@@ -40,24 +42,17 @@ pub(crate) fn ethernet_send(dst: MacAddr, ethertype: u16, payload: &[u8]) {
         hdr.ethertype = htons(ethertype);
 
         let payload_len = payload.len().min(1500);
-        ptr::copy_nonoverlapping(payload.as_ptr(), ETH_TX_BUF.as_mut_ptr().add(14), payload_len);
+        ptr::copy_nonoverlapping(payload.as_ptr(), ETH_TX_BUF.as_mut_ptr().add(HEADER_LEN), payload_len);
 
-        drivers::virtio_net::send(&ETH_TX_BUF[..14 + payload_len]);
+        drivers::virtio_net::send(&ETH_TX_BUF[..HEADER_LEN + payload_len]);
     }
 }
 
-/// Ethernet frame receive callback — dispatches to ARP or IPv4.
-pub(crate) fn ethernet_receive(frame: &[u8]) {
-    if frame.len() < 14 {
-        return;
+/// Parse an Ethernet frame into ethertype + payload. Returns None if too short.
+pub(crate) fn ethernet_parse(frame: &[u8]) -> Option<(u16, &[u8])> {
+    if frame.len() < HEADER_LEN {
+        return None;
     }
     let hdr = unsafe { &*(frame.as_ptr() as *const EthernetHeader) };
-    let ethertype = ntohs(hdr.ethertype);
-    let payload = &frame[14..];
-
-    match ethertype {
-        ETHERTYPE_ARP => arp_receive(payload),
-        ETHERTYPE_IPV4 => ipv4_receive(payload),
-        _ => {}
-    }
+    Some((u16::from_be(hdr.ethertype), &frame[HEADER_LEN..]))
 }

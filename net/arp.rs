@@ -1,7 +1,7 @@
 // net/arp.rs — ARP cache, request/reply, resolve, announce.
 
 use crate::types::{MacAddr, Ipv4Addr, CONFIG};
-use crate::ethernet::{ethernet_our_mac, ethernet_send, ethernet_receive, ETHERTYPE_ARP};
+use crate::ethernet::{ethernet_our_mac, ethernet_send, ethernet_parse, ETHERTYPE_ARP};
 use crate::{htons, ntohs};
 
 const ARP_CACHE_SIZE: usize = 64;
@@ -166,11 +166,11 @@ pub(crate) fn arp_resolve(ip: Ipv4Addr) -> Option<MacAddr> {
         return Some(mac);
     }
 
-    // Send request and poll for reply
+    // Send request and poll for reply (only dispatch ARP frames)
     for _retry in 0..3 {
         arp_request(target);
         for _poll in 0..200_000 {
-            drivers::virtio_net::poll(ethernet_receive);
+            drivers::virtio_net::poll(arp_poll_callback);
             if let Some(mac) = arp_lookup(target) {
                 return Some(mac);
             }
@@ -196,4 +196,11 @@ pub(crate) fn arp_announce() {
     };
     let data = unsafe { core::slice::from_raw_parts(&pkt as *const _ as *const u8, 28) };
     ethernet_send(MacAddr::BROADCAST, ETHERTYPE_ARP, data);
+}
+
+/// Poll callback that only handles ARP frames (used during arp_resolve).
+fn arp_poll_callback(frame: &[u8]) {
+    if let Some((ETHERTYPE_ARP, payload)) = ethernet_parse(frame) {
+        arp_receive(payload);
+    }
 }
