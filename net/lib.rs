@@ -29,12 +29,15 @@ static mut MULTICORE_INIT: bool = false;
 /// Wakeup flags — set during distribution, cleared each poll cycle.
 static mut WAKEUP: [bool; percpu::MAX_CORES] = [false; percpu::MAX_CORES];
 
+/// RX poll lock: 0 = free, 1 = held. Any core can try to acquire.
+static RX_LOCK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 /// Poll the network device and dispatch received frames through the
 /// full stack: Ethernet -> ARP/IPv4 -> TCP/UDP.
 ///
 /// In single-core mode, all processing happens here.
-/// In Tier 2 multi-core mode, core 0 distributes frames to per-core
-/// inboxes and flushes TX staging from other cores.
+/// In Tier 2 multi-core mode, any idle core can become the distributor
+/// by acquiring the RX lock. This avoids dedicating a core to distribution.
 pub fn poll() {
     let num_cores = percpu::num_cores();
 
@@ -47,9 +50,6 @@ pub fn poll() {
     // Tier 2: multi-core with software distribution.
     unsafe {
         if !MULTICORE_INIT {
-            // Note: we do NOT set ap_poll_fn here — the application layer
-            // (e.g. HTTP server) registers its own poll function that includes
-            // both RX inbox draining and application-level connection servicing.
             MULTICORE_INIT = true;
             kernel::serial::puts(b"[net] Tier 2: software distribution (");
             let mut buf = [0u8; 4];
@@ -57,32 +57,43 @@ pub fn poll() {
             kernel::serial::puts(&buf[..len]);
             kernel::serial::puts(b" cores)\n");
         }
-
-        // Clear wakeup flags (only for active cores).
-        for i in 0..num_cores as usize {
-            WAKEUP[i] = false;
-        }
     }
 
-    // Flush TX staging FIRST — APs may have responses ready from the
-    // previous cycle. Flushing before VirtIO poll minimizes the round-trip
-    // latency between AP response and actual packet transmission.
-    drivers::virtio_net::flush_tx_staging();
+    // Try to become the distributor. Non-blocking: if another core holds
+    // the lock, skip distribution and just process our own connections.
+    let got_lock = RX_LOCK.compare_exchange(
+        0, 1,
+        core::sync::atomic::Ordering::Acquire,
+        core::sync::atomic::Ordering::Relaxed,
+    ).is_ok();
 
-    // Core 0: poll VirtIO and distribute frames.
-    drivers::virtio_net::poll(distribute_frame);
+    if got_lock {
+        // We're the distributor this cycle.
+        // Flush TX staging first — responses from previous cycle.
+        drivers::virtio_net::flush_tx_staging();
 
-    // Wake APs that received new packets.
-    unsafe {
-        let any_wakeup = (1..num_cores as usize).any(|i| WAKEUP[i]);
-        if any_wakeup {
-            kernel::wake_cores();
+        unsafe {
+            for i in 0..num_cores as usize {
+                WAKEUP[i] = false;
+            }
         }
-    }
 
-    // Flush again — APs may have processed inline during distribute
-    // (e.g. if SEV wakes them before we finish distributing all packets).
-    drivers::virtio_net::flush_tx_staging();
+        // Poll VirtIO and distribute frames.
+        drivers::virtio_net::poll(distribute_frame);
+
+        // Wake cores that received new packets.
+        unsafe {
+            let any_wakeup = (1..num_cores as usize).any(|i| WAKEUP[i]);
+            if any_wakeup {
+                kernel::wake_cores();
+            }
+        }
+
+        // Flush again (APs may have responded during distribution).
+        drivers::virtio_net::flush_tx_staging();
+
+        RX_LOCK.store(0, core::sync::atomic::Ordering::Release);
+    }
 }
 
 /// Classify a frame and distribute it to the appropriate core.
@@ -110,8 +121,16 @@ fn distribute_frame(frame: &[u8]) {
                         pkt.src.addr, pkt.dst.addr, src_port, dst_port, num_cores,
                     );
 
-                    if target == 0 {
-                        // Single-core mode: process locally.
+                    let my_core = kernel::cpu_id();
+                    if target == my_core {
+                        // Target is the current core — process inline (no inbox).
+                        match pkt.protocol {
+                            ipv4::PROTO_TCP => tcp::tcp_receive(pkt.src, pkt.dst, pkt.payload),
+                            ipv4::PROTO_UDP => udp::udp_receive(pkt.src, pkt.dst, pkt.payload),
+                            _ => {}
+                        }
+                    } else if num_cores <= 1 {
+                        // Single-core fallback.
                         match pkt.protocol {
                             ipv4::PROTO_TCP => tcp::tcp_receive(pkt.src, pkt.dst, pkt.payload),
                             ipv4::PROTO_UDP => udp::udp_receive(pkt.src, pkt.dst, pkt.payload),
@@ -158,9 +177,6 @@ pub fn net_receive(frame: &[u8]) {
 /// In Tier 2, core 0 is the dedicated distributor — it shouldn't also
 /// handle application connections. Hash to cores 1..N only (when multi-core).
 fn flow_hash(src_ip: u32, dst_ip: u32, src_port: u16, dst_port: u16, num_cores: u32) -> u32 {
-    if num_cores <= 1 {
-        return 0;
-    }
     let mut h: u32 = 2166136261; // FNV offset basis
     h ^= src_ip;
     h = h.wrapping_mul(16777619);
@@ -170,8 +186,7 @@ fn flow_hash(src_ip: u32, dst_ip: u32, src_port: u16, dst_port: u16, num_cores: 
     h = h.wrapping_mul(16777619);
     h ^= dst_port as u32;
     h = h.wrapping_mul(16777619);
-    // Map to cores 1..num_cores (skip core 0, the distributor).
-    1 + h % (num_cores - 1)
+    h % num_cores
 }
 
 fn fmt_u32(buf: &mut [u8], mut val: u32) -> usize {
