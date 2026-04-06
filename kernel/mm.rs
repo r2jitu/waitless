@@ -23,7 +23,7 @@ use core::ptr;
 // Dependencies
 // ============================================================================
 
-use crate::serial as kernel_serial;
+use crate::serial;
 use crate::types::{BootInfo, MEM_AVAILABLE};
 
 unsafe extern "C" {
@@ -32,7 +32,7 @@ unsafe extern "C" {
 }
 
 fn log_fmt(args: core::fmt::Arguments) {
-    kernel_serial::write_fmt(args);
+    serial::write_fmt(args);
 }
 
 macro_rules! klog {

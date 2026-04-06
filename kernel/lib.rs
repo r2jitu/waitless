@@ -16,6 +16,3 @@ pub mod x86_64;
 #[cfg(target_arch = "aarch64")]
 pub mod aarch64;
 
-// Re-export arch modules so callers can use kernel::fdt, kernel::mmu, etc.
-#[cfg(target_arch = "aarch64")]
-pub use aarch64::{fdt, mmu, exceptions};

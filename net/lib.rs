@@ -16,7 +16,7 @@
 // ============================================================================
 
 extern crate kernel;
-use kernel::serial as kernel_serial;
+use kernel::serial;
 extern crate drivers;
 
 pub(crate) mod types;
@@ -26,13 +26,8 @@ pub(crate) mod ipv4;
 pub mod tcp;
 pub mod dhcp;
 
-// Re-export public API so external callers can use net::foo()
-pub use tcp::{TcpState, TcpConnection};
-pub use tcp::{tcp_init, tcp_listen, tcp_accept, tcp_has_data, tcp_recv, tcp_send, tcp_close, tcp_is_closed, tcp_poll};
-pub use dhcp::{dhcp_discover, set_fallback_config};
-
 fn log(msg: &[u8]) {
-    kernel_serial::puts(msg)
+    serial::puts(msg)
 }
 
 /// Busy-wait for approximately `us` microseconds.

@@ -28,7 +28,7 @@ core::arch::global_asm!(include_str!("aarch64/boot.S"));
 
 use kernel::{types, serial, mm};
 #[cfg(target_arch = "aarch64")]
-use kernel::{fdt, mmu, exceptions};
+use kernel::aarch64::{fdt, mmu, exceptions};
 use types::{BootInfo, MemoryRegion, Protocol, MEM_AVAILABLE, MEM_RESERVED, MAX_MEMORY_REGIONS};
 
 // ============================================================================
@@ -396,27 +396,27 @@ unsafe fn kernel_boot(info: &BootInfo) {
     call_global_constructors();
 
     klog!("[INIT] PCI bus scan (Rust)...\n");
-    drivers::pci_init();
+    drivers::pci::init();
 
     klog!("[INIT] Virtio-net driver (Rust)...\n");
-    let net_ok = drivers::virtio_net_init();
+    let net_ok = drivers::virtio_net::init();
     if !net_ok {
         klog!("       [WARN] No virtio-net device found.\n");
     } else {
         let mut mac = [0u8; 6];
-        drivers::virtio_net_get_mac(mac.as_mut_ptr());
+        drivers::virtio_net::get_mac(mac.as_mut_ptr());
         klog!(
             "       MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
         );
 
         klog!("[INIT] DHCP (Rust)...\n");
-        let dhcp_ok = net::dhcp_discover();
+        let dhcp_ok = net::dhcp::discover();
         if dhcp_ok {
             klog!("       IP obtained successfully\n");
         } else {
             klog!("       [WARN] DHCP failed, using 10.0.2.15/24\n");
-            net::set_fallback_config(
+            net::dhcp::set_fallback_config(
                 10, 0, 2, 15,      // IP
                 255, 255, 255, 0,   // subnet
                 10, 0, 2, 2,       // gateway
@@ -425,10 +425,10 @@ unsafe fn kernel_boot(info: &BootInfo) {
         }
 
         klog!("[INIT] TCP stack (Rust)...\n");
-        net::tcp_init();
+        net::tcp::init();
 
         klog!("[INIT] Interrupt-driven idle...\n");
-        drivers::virtio_net_enable_irq();
+        drivers::virtio_net::enable_irq();
 
         #[cfg(target_arch = "aarch64")]
         {

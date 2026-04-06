@@ -38,9 +38,7 @@ core::arch::global_asm!(
     options(att_syntax),
 );
 #[cfg(target_arch = "aarch64")]
-use kernel::fdt as kernel_fdt;
-#[cfg(target_arch = "aarch64")]
-use kernel::mmu as kernel_mmu;
+use kernel::aarch64::{fdt, mmu};
 
 // ============================================================================
 // Limine protocol constants and struct types
@@ -319,10 +317,10 @@ pub extern "C" fn limine_entry_cpp() {
 
             // Parse FDT and map PCIe ECAM before serial::init()
             if LIMINE_BOOT_INFO.dtb_addr != 0 {
-                kernel_fdt::init(LIMINE_BOOT_INFO.dtb_addr);
-                let info = &*kernel_fdt::info_ptr();
+                fdt::init(LIMINE_BOOT_INFO.dtb_addr);
+                let info = &*fdt::info_ptr();
                 if info.pcie_ecam_base != 0 && info.pcie_ecam_size != 0 {
-                    kernel_mmu::map_device_range(info.pcie_ecam_base, info.pcie_ecam_size);
+                    mmu::map_device_range(info.pcie_ecam_base, info.pcie_ecam_size);
                 }
             }
         }

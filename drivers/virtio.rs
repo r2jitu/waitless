@@ -9,8 +9,8 @@ use crate::{
     vz_config_delay,
 };
 use crate::pci::{
-    PCI_DEVICES, pci_read_config, pci_write_config, pci_find_device,
-    pci_enable_bus_mastering_inner, pci_read_bar64,
+    PCI_DEVICES, read_config, write_config, find_device,
+    enable_bus_mastering_inner, read_bar64,
 };
 #[cfg(target_arch = "aarch64")]
 use crate::map_device_range;
@@ -90,7 +90,7 @@ pub(crate) static mut VPCI_DEVICE_COUNT: usize = 0;
 /// Resolve a PCI BAR to a CPU virtual address. Maps above-4GB ranges on aarch64.
 fn resolve_bar(pci_idx: usize, bar_idx: usize) -> u64 {
     let dev = unsafe { &PCI_DEVICES[pci_idx] };
-    let addr = pci_read_bar64(dev, bar_idx);
+    let addr = read_bar64(dev, bar_idx);
     if addr == 0 { return 0; }
 
     #[cfg(target_arch = "aarch64")]
@@ -107,15 +107,15 @@ fn vpci_parse_caps(dev: &mut VirtioPciDevice) -> bool {
     let (bus, slot, func) = (pci.bus, pci.slot, pci.func);
 
     // Check capabilities bit in Status register
-    let status_cmd = pci_read_config(bus, slot, func, 0x04);
+    let status_cmd = read_config(bus, slot, func, 0x04);
     if ((status_cmd >> 16) & (1 << 4)) == 0 { return false; }
 
-    let mut cap_ptr = (pci_read_config(bus, slot, func, 0x34) & 0xFF) as u8;
+    let mut cap_ptr = (read_config(bus, slot, func, 0x34) & 0xFF) as u8;
     let mut found_common = false;
     let mut found_notify = false;
 
     while cap_ptr != 0 {
-        let hdr = pci_read_config(bus, slot, func, cap_ptr);
+        let hdr = read_config(bus, slot, func, cap_ptr);
         let cap_vndr = (hdr & 0xFF) as u8;
         let cap_next = ((hdr >> 8) & 0xFF) as u8;
 
@@ -126,9 +126,9 @@ fn vpci_parse_caps(dev: &mut VirtioPciDevice) -> bool {
 
         if cap_vndr == PCI_CAP_ID_VNDR {
             let cfg_type = ((hdr >> 24) & 0xFF) as u8;
-            let bar_word = pci_read_config(bus, slot, func, cap_ptr.wrapping_add(4));
+            let bar_word = read_config(bus, slot, func, cap_ptr.wrapping_add(4));
             let bar_idx = (bar_word & 0xFF) as usize;
-            let offset = pci_read_config(bus, slot, func, cap_ptr.wrapping_add(8)) as u64;
+            let offset = read_config(bus, slot, func, cap_ptr.wrapping_add(8)) as u64;
 
             let bar_base = resolve_bar(dev.pci_idx, bar_idx);
             if bar_base != 0 {
@@ -139,7 +139,7 @@ fn vpci_parse_caps(dev: &mut VirtioPciDevice) -> bool {
                     }
                     VIRTIO_PCI_CAP_NOTIFY_CFG => {
                         dev.notify_base = bar_base + offset;
-                        dev.notify_off_multiplier = pci_read_config(
+                        dev.notify_off_multiplier = read_config(
                             bus, slot, func, cap_ptr.wrapping_add(16));
                         found_notify = true;
                     }
@@ -164,7 +164,7 @@ fn vpci_parse_caps(dev: &mut VirtioPciDevice) -> bool {
 pub(crate) fn vpci_find(virtio_device_type: u16) -> Option<usize> {
     let target_id = 0x1040 + virtio_device_type;
 
-    let pci_idx = pci_find_device(0x1AF4, target_id)?;
+    let pci_idx = find_device(0x1AF4, target_id)?;
 
     unsafe {
         if VPCI_DEVICE_COUNT >= VIRTIO_PCI_MAX_DEVICES { return None; }
@@ -173,7 +173,7 @@ pub(crate) fn vpci_find(virtio_device_type: u16) -> Option<usize> {
         *dev = VirtioPciDevice::ZERO;
         dev.pci_idx = pci_idx;
 
-        pci_enable_bus_mastering_inner(PCI_DEVICES[pci_idx].slot);
+        enable_bus_mastering_inner(PCI_DEVICES[pci_idx].slot);
 
         if !vpci_parse_caps(dev) { return None; }
 

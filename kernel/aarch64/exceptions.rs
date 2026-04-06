@@ -15,8 +15,8 @@ mod aarch64 {
     use core::arch::asm;
     use core::ptr;
 
-    use crate::fdt as kernel_fdt;
-    use crate::serial as kernel_serial;
+    use crate::aarch64::fdt;
+    use crate::serial;
 
     // ---- GIC register bases (filled from FDT at init time) ----------------
 
@@ -153,7 +153,7 @@ mod aarch64 {
             klog!("    x0  = 0x{:x}  x1  = 0x{:x}\n", frame.x[0], frame.x[1]);
 
             // Halt — unrecoverable
-            kernel_serial::puts(b"\nSystem halted.\n");
+            serial::puts(b"\nSystem halted.\n");
             loop {
                 asm!("wfe", options(nomem, nostack));
             }
@@ -161,11 +161,11 @@ mod aarch64 {
         }
     }
 
-    // ---- Logging macro using kernel_serial --------------------------------
+    // ---- Logging macro using serial ----------------------------------------
 
     macro_rules! klog {
         ($($arg:tt)*) => {
-            kernel_serial::write_fmt(format_args!($($arg)*));
+            serial::write_fmt(format_args!($($arg)*));
         };
     }
     use klog;
@@ -271,7 +271,7 @@ mod aarch64 {
 
     pub unsafe fn init() {
         unsafe {
-            let fdt = kernel_fdt::info();
+            let fdt = fdt::info();
             GICD_BASE = fdt.gic_dist_base;
             GICR_BASE = fdt.gic_redist_base;
             GIC_VERSION = fdt.gic_version;
@@ -281,7 +281,7 @@ mod aarch64 {
             } else if GIC_VERSION == 2 {
                 init_gicv2();
             } else {
-                kernel_serial::puts(b"       GIC init skipped (no GIC in DTB)\n");
+                serial::puts(b"       GIC init skipped (no GIC in DTB)\n");
             }
         }
     }

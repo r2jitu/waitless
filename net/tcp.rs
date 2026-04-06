@@ -2,7 +2,7 @@
 
 use core::ptr;
 
-use kernel::mm as kernel_mm;
+use kernel::mm;
 
 use crate::types::{Ipv4Addr, CONFIG, tcp_checksum};
 use crate::ipv4::{ipv4_send, PROTO_TCP};
@@ -145,7 +145,7 @@ fn alloc_connection() -> Option<usize> {
 fn free_connection(idx: usize) {
     unsafe {
         if !CONNECTIONS[idx].rx_buf.is_null() {
-            kernel_mm::kfree(CONNECTIONS[idx].rx_buf);
+            mm::kfree(CONNECTIONS[idx].rx_buf);
         }
         CONNECTIONS[idx] = TcpConnection::new();
     }
@@ -287,7 +287,7 @@ pub(crate) fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
             c.accepted = false;
 
             // Allocate RX buffer
-            c.rx_buf = kernel_mm::kmalloc(RX_BUF_SIZE);
+            c.rx_buf = mm::kmalloc(RX_BUF_SIZE);
             c.rx_buf_size = RX_BUF_SIZE;
             c.rx_head = 0;
             c.rx_tail = 0;
@@ -388,7 +388,7 @@ fn seq_lt(a: u32, b: u32) -> bool {
 // ============================================================================
 
 /// Initialize TCP connection pool.
-pub fn tcp_init() {
+pub fn init() {
     unsafe {
         for i in 0..MAX_CONNECTIONS {
             CONNECTIONS[i] = TcpConnection::new();
@@ -396,7 +396,7 @@ pub fn tcp_init() {
     }
 }
 
-pub fn tcp_listen(port: u16) -> *mut () {
+pub fn listen(port: u16) -> *mut () {
     let idx = match alloc_connection() {
         Some(i) => i,
         None => return ptr::null_mut(),
@@ -409,7 +409,7 @@ pub fn tcp_listen(port: u16) -> *mut () {
     }
 }
 
-pub fn tcp_accept(handle: *mut ()) -> *mut () {
+pub fn accept(handle: *mut ()) -> *mut () {
     let listener_idx = (handle as usize) - 1;
     if listener_idx >= MAX_CONNECTIONS {
         return ptr::null_mut();
@@ -428,7 +428,7 @@ pub fn tcp_accept(handle: *mut ()) -> *mut () {
     ptr::null_mut()
 }
 
-pub fn tcp_has_data(handle: *mut ()) -> bool {
+pub fn has_data(handle: *mut ()) -> bool {
     let idx = (handle as usize) - 1;
     if idx >= MAX_CONNECTIONS {
         return false;
@@ -436,7 +436,7 @@ pub fn tcp_has_data(handle: *mut ()) -> bool {
     unsafe { CONNECTIONS[idx].rx_used() > 0 }
 }
 
-pub fn tcp_recv(handle: *mut (), buf: &mut [u8]) -> usize {
+pub fn recv(handle: *mut (), buf: &mut [u8]) -> usize {
     let idx = (handle as usize) - 1;
     if idx >= MAX_CONNECTIONS {
         return 0;
@@ -444,7 +444,7 @@ pub fn tcp_recv(handle: *mut (), buf: &mut [u8]) -> usize {
     unsafe { CONNECTIONS[idx].rx_pop(buf) }
 }
 
-pub fn tcp_send(handle: *mut (), data: &[u8]) -> i32 {
+pub fn send(handle: *mut (), data: &[u8]) -> i32 {
     let idx = (handle as usize) - 1;
     if idx >= MAX_CONNECTIONS {
         return -1;
@@ -476,7 +476,7 @@ pub fn tcp_send(handle: *mut (), data: &[u8]) -> i32 {
     }
 }
 
-pub fn tcp_close(handle: *mut ()) {
+pub fn close(handle: *mut ()) {
     let idx = (handle as usize) - 1;
     if idx >= MAX_CONNECTIONS {
         return;
@@ -508,7 +508,7 @@ pub fn tcp_close(handle: *mut ()) {
     }
 }
 
-pub fn tcp_is_closed(handle: *mut ()) -> bool {
+pub fn is_closed(handle: *mut ()) -> bool {
     let idx = (handle as usize) - 1;
     if idx >= MAX_CONNECTIONS {
         return true;
@@ -516,6 +516,6 @@ pub fn tcp_is_closed(handle: *mut ()) -> bool {
     unsafe { CONNECTIONS[idx].state == TcpState::Closed }
 }
 
-pub fn tcp_poll() {
-    drivers::virtio_net_poll(ethernet_receive);
+pub fn poll() {
+    drivers::virtio_net::poll(ethernet_receive);
 }

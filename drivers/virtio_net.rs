@@ -10,8 +10,8 @@ use crate::{
     vz_init_delay,
 };
 #[cfg(target_arch = "aarch64")]
-use crate::{kernel_exceptions, kernel_fdt};
-use crate::pci::{PCI_DEVICES, pci_read_config, pci_find_device, pci_enable_bus_mastering_inner};
+use kernel::aarch64::{exceptions, fdt};
+use crate::pci::{PCI_DEVICES, read_config, find_device, enable_bus_mastering_inner};
 use crate::virtio::{
     VPCI_DEVICES, Virtqueue,
     vpci_find, vpci_reset, vpci_set_status, vpci_get_status,
@@ -223,7 +223,7 @@ fn init_mmio() -> bool {
     let mut io_base: u64 = 0;
 
     unsafe {
-        let fdt = kernel_fdt::info();
+        let fdt = fdt::info();
 
         // Search FDT virtio-mmio devices for net (device_id=1)
         if fdt.virtio_count > 0 {
@@ -357,8 +357,8 @@ fn init_mmio() -> bool {
 #[cfg(target_arch = "x86_64")]
 fn init_legacy_pci() -> bool {
     // Find legacy virtio-net (0x1AF4/0x1000) or modern (0x1AF4/0x1041)
-    let pci_idx = pci_find_device(0x1AF4, 0x1000)
-        .or_else(|| pci_find_device(0x1AF4, 0x1041));
+    let pci_idx = find_device(0x1AF4, 0x1000)
+        .or_else(|| find_device(0x1AF4, 0x1041));
     let pci_idx = match pci_idx {
         Some(i) => i,
         None => return false,
@@ -368,14 +368,14 @@ fn init_legacy_pci() -> bool {
     log(b"virtio_net: found legacy PCI device\n");
 
     // Verify subsystem device ID = 1 (network)
-    let subsys = pci_read_config(dev.bus, dev.slot, dev.func, 0x2C);
+    let subsys = read_config(dev.bus, dev.slot, dev.func, 0x2C);
     let subsys_device_id = ((subsys >> 16) & 0xFFFF) as u16;
     if subsys_device_id != 1 {
         log(b"virtio_net: not a network device\n");
         return false;
     }
 
-    pci_enable_bus_mastering_inner(dev.slot);
+    enable_bus_mastering_inner(dev.slot);
 
     // Get I/O base from BAR0
     let bar0 = dev.bar[0];
@@ -480,11 +480,11 @@ fn tx_drain() {
 // x86_64: extern "C" fn() wrapper for the idt.cc trampoline
 #[cfg(target_arch = "x86_64")]
 #[cfg(target_arch = "x86_64")]
-unsafe extern "C" fn virtio_net_irq_handler_x86(_frame: *mut x86_init::idt::InterruptFrame) {
-    virtio_net_irq_handler(0);
+unsafe extern "C" fn irq_handler_x86(_frame: *mut x86_init::idt::InterruptFrame) {
+    irq_handler(0);
 }
 
-fn virtio_net_irq_handler(_irq: u32) {
+fn irq_handler(_irq: u32) {
     unsafe {
         // NAPI: disable notifications on entry
         NET.rx_queue.disable_interrupts();
@@ -512,7 +512,7 @@ fn virtio_net_irq_handler(_irq: u32) {
 // Public API — VirtIO-net
 // ============================================================================
 
-pub fn virtio_net_init() -> bool {
+pub fn init() -> bool {
     log(b"virtio_net: initializing...\n");
 
     #[cfg(target_arch = "aarch64")]
@@ -526,13 +526,13 @@ pub fn virtio_net_init() -> bool {
     }
 }
 
-pub fn virtio_net_get_mac(mac_out: *mut u8) {
+pub fn get_mac(mac_out: *mut u8) {
     unsafe {
         ptr::copy_nonoverlapping(NET.mac.as_ptr(), mac_out, 6);
     }
 }
 
-pub fn virtio_net_send(data: &[u8]) {
+pub fn send(data: &[u8]) {
     if data.is_empty() { return; }
     unsafe {
         if let Transport::None = NET.transport { return; }
@@ -581,7 +581,7 @@ pub fn virtio_net_send(data: &[u8]) {
     }
 }
 
-pub fn virtio_net_poll(
+pub fn poll(
     callback: fn(&[u8]),
 ) -> i32 {
     unsafe {
@@ -617,11 +617,11 @@ pub fn virtio_net_poll(
     count
 }
 
-pub fn virtio_net_enable_irq() {
+pub fn enable_irq() {
     unsafe {
         #[cfg(target_arch = "aarch64")]
         {
-            let fdt = kernel_fdt::info();
+            let fdt = fdt::info();
 
             match NET.transport {
                 Transport::ModernPci { vpci_idx } if fdt.gic_dist_base != 0 => {
@@ -629,7 +629,7 @@ pub fn virtio_net_enable_irq() {
                     let intid = if (slot as usize) < 8 { fdt.pci_irqs[slot as usize] } else { 0 };
                     if intid != 0 {
                         NET.rx_queue.enable_interrupts();
-                        kernel_exceptions::register_irq(intid, virtio_net_irq_handler);
+                        exceptions::register_irq(intid, irq_handler);
                         NET.irq_idle_available = true;
                     }
                 }
@@ -637,7 +637,7 @@ pub fn virtio_net_enable_irq() {
                     for i in 0..fdt.virtio_count as usize {
                         if fdt.virtio_bases[i] == base && fdt.virtio_irqs[i] != 0 {
                             NET.rx_queue.enable_interrupts();
-                            kernel_exceptions::register_irq(fdt.virtio_irqs[i], virtio_net_irq_handler);
+                            exceptions::register_irq(fdt.virtio_irqs[i], irq_handler);
                             NET.irq_idle_available = true;
                             break;
                         }
@@ -651,11 +651,11 @@ pub fn virtio_net_enable_irq() {
         {
             if let Transport::LegacyPci { pci_idx, .. } = NET.transport {
                 let dev = &PCI_DEVICES[pci_idx];
-                let irq_reg = pci_read_config(dev.bus, dev.slot, dev.func, 0x3C);
+                let irq_reg = read_config(dev.bus, dev.slot, dev.func, 0x3C);
                 let irq_line = (irq_reg & 0xFF) as u8;
                 if irq_line < 16 {
                     NET.rx_queue.enable_interrupts();
-                    x86_init::idt::register_handler(32 + irq_line, virtio_net_irq_handler_x86);
+                    x86_init::idt::register_handler(32 + irq_line, irq_handler_x86);
                     x86_init::idt::enable_irq(irq_line);
                     NET.irq_idle_available = true;
                 }
@@ -664,14 +664,14 @@ pub fn virtio_net_enable_irq() {
     }
 }
 
-pub fn virtio_net_irq_idle_supported() -> bool {
+pub fn irq_idle_supported() -> bool {
     unsafe { NET.irq_idle_available }
 }
 
-pub fn virtio_net_arm_rx_interrupts() {
+pub fn arm_rx_interrupts() {
     unsafe { NET.rx_queue.enable_interrupts(); }
 }
 
-pub fn virtio_net_has_pending_rx() -> bool {
+pub fn has_pending_rx() -> bool {
     unsafe { NET.rx_queue.has_used() }
 }

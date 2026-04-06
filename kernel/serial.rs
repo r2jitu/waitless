@@ -100,7 +100,7 @@ mod x86 {
 mod aarch64 {
     use core::ptr;
 
-    use crate::fdt as kernel_fdt;
+    use crate::aarch64::fdt;
 
     // PL011 register offsets
     const PL011_DR: u64 = 0x000;    // Data register
@@ -158,7 +158,7 @@ mod aarch64 {
 
     pub unsafe fn init() {
         unsafe {
-            let fdt = kernel_fdt::info();
+            let fdt = fdt::info();
 
             // Prefer PL011 if FDT found one (QEMU path)
             if fdt.uart_base != 0 {

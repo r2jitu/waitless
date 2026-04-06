@@ -17,18 +17,15 @@ use core::sync::atomic::{compiler_fence, Ordering};
 // Kernel crate dependencies — direct Rust calls
 // ============================================================================
 extern crate kernel;
-use kernel::{mm as kernel_mm, serial as kernel_serial};
-use kernel_mm::{alloc_frame, phys_to_virt, virt_to_phys, kmalloc, kfree};
+use kernel::serial;
 #[cfg(target_arch = "aarch64")]
-use kernel::{exceptions as kernel_exceptions, fdt as kernel_fdt, mmu as kernel_mmu};
-#[cfg(target_arch = "aarch64")]
-use kernel_mmu::map_device_range;
+use kernel::aarch64::mmu::map_device_range;
 
 #[cfg(target_arch = "x86_64")]
 use kernel::x86_64 as x86_init;
 
 pub(crate) fn log(msg: &[u8]) {
-    kernel_serial::puts(msg)
+    serial::puts(msg)
 }
 
 // ============================================================================
@@ -243,21 +240,3 @@ pub mod virtio;
 pub mod virtio_net;
 pub mod virtio_console;
 
-// ============================================================================
-// Public API re-exports — keeps external callers unchanged
-// ============================================================================
-
-pub use pci::pci_init;
-pub use pci::pci_enable_bus_mastering;
-pub use virtio_net::virtio_net_init;
-pub use virtio_net::virtio_net_get_mac;
-pub use virtio_net::virtio_net_send;
-pub use virtio_net::virtio_net_poll;
-pub use virtio_net::virtio_net_enable_irq;
-pub use virtio_net::virtio_net_irq_idle_supported;
-pub use virtio_net::virtio_net_arm_rx_interrupts;
-pub use virtio_net::virtio_net_has_pending_rx;
-pub use virtio_console::virtio_console_init_mmio;
-pub use virtio_console::virtio_console_init_pci;
-pub use virtio_console::virtio_console_putc;
-pub use virtio_console::virtio_console_try_getc;

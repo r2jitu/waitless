@@ -32,8 +32,9 @@ pub mod http;
 #[cfg(platform_unikernel)]
 mod backend {
     pub use crate::unikernel::{log, config_port, check_shutdown, wait_for_events};
-    pub use net::{tcp_listen, tcp_accept, tcp_has_data,
-                        tcp_recv, tcp_send, tcp_close, tcp_is_closed, tcp_poll};
+    pub use net::tcp::{listen as tcp_listen, accept as tcp_accept, has_data as tcp_has_data,
+                       recv as tcp_recv, send as tcp_send, close as tcp_close,
+                       is_closed as tcp_is_closed, poll as tcp_poll};
 }
 
 #[cfg(platform_native)]

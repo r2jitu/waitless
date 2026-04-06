@@ -2,7 +2,9 @@
 
 use crate::{log, mmio_read32, mmio_write32, mmio_read16, mmio_write16};
 #[cfg(target_arch = "aarch64")]
-use crate::{map_device_range, kernel_fdt};
+use crate::map_device_range;
+#[cfg(target_arch = "aarch64")]
+use kernel::aarch64::fdt;
 
 #[cfg(target_arch = "x86_64")]
 use crate::{outl, inl};
@@ -55,7 +57,7 @@ const PCI_CONFIG_ADDR: u16 = 0x0CF8;
 const PCI_CONFIG_DATA: u16 = 0x0CFC;
 
 /// Read 32-bit PCI config register (offset must be 4-byte aligned).
-pub(crate) fn pci_read_config(bus: u8, slot: u8, func: u8, offset: u8) -> u32 {
+pub(crate) fn read_config(bus: u8, slot: u8, func: u8, offset: u8) -> u32 {
     unsafe {
         #[cfg(target_arch = "x86_64")]
         {
@@ -80,7 +82,7 @@ pub(crate) fn pci_read_config(bus: u8, slot: u8, func: u8, offset: u8) -> u32 {
 }
 
 /// Write 32-bit PCI config register.
-pub(crate) fn pci_write_config(bus: u8, slot: u8, func: u8, offset: u8, val: u32) {
+pub(crate) fn write_config(bus: u8, slot: u8, func: u8, offset: u8, val: u32) {
     unsafe {
         #[cfg(target_arch = "x86_64")]
         {
@@ -106,7 +108,7 @@ pub(crate) fn pci_write_config(bus: u8, slot: u8, func: u8, offset: u8, val: u32
 
 /// Read 16-bit PCI config register (aarch64 ECAM supports sub-dword access).
 #[cfg(target_arch = "aarch64")]
-pub(crate) fn pci_read_config16(bus: u8, slot: u8, func: u8, offset: u8) -> u16 {
+pub(crate) fn read_config16(bus: u8, slot: u8, func: u8, offset: u8) -> u16 {
     unsafe {
         let ecam_addr = G_ECAM_BASE
             + ((bus as u64) << 20)
@@ -120,7 +122,7 @@ pub(crate) fn pci_read_config16(bus: u8, slot: u8, func: u8, offset: u8) -> u16 
 /// Write 16-bit PCI config register.
 /// Critical for Command register (offset 0x04) to avoid clobbering Status.
 #[cfg(target_arch = "aarch64")]
-pub(crate) fn pci_write_config16(bus: u8, slot: u8, func: u8, offset: u8, val: u16) {
+pub(crate) fn write_config16(bus: u8, slot: u8, func: u8, offset: u8, val: u16) {
     unsafe {
         let ecam_addr = G_ECAM_BASE
             + ((bus as u64) << 20)
@@ -135,12 +137,12 @@ pub(crate) fn pci_write_config16(bus: u8, slot: u8, func: u8, offset: u8, val: u
 
 /// Assign BARs from the MMIO pool. NEVER probes with 0xFFFFFFFF (crashes VZ).
 #[cfg(target_arch = "aarch64")]
-fn pci_assign_bars(dev: &mut PciDevice) {
+fn assign_bars(dev: &mut PciDevice) {
     // Only assign for endpoint devices (header type 0x00)
     if (dev.header_type & 0x7F) != 0x00 { return; }
 
     // Check if Memory Space is already enabled (firmware assigned BARs)
-    let cmd = pci_read_config16(dev.bus, dev.slot, dev.func, 0x04);
+    let cmd = read_config16(dev.bus, dev.slot, dev.func, 0x04);
     if (cmd & 0x02) != 0 { return; } // Already enabled
 
     let mut i = 0;
@@ -161,14 +163,14 @@ fn pci_assign_bars(dev: &mut PciDevice) {
                 // Skip I/O BARs on aarch64
             } else if is_64bit {
                 let alloc = (G_PCI_MEM_NEXT + 0x3F_FFFF) & !0x3F_FFFF; // 4MB align
-                pci_write_config(dev.bus, dev.slot, dev.func, (0x10 + i * 4) as u8, (alloc as u32) | (bar_val & 0x0F));
-                pci_write_config(dev.bus, dev.slot, dev.func, (0x10 + (i + 1) * 4) as u8, (alloc >> 32) as u32);
+                write_config(dev.bus, dev.slot, dev.func, (0x10 + i * 4) as u8, (alloc as u32) | (bar_val & 0x0F));
+                write_config(dev.bus, dev.slot, dev.func, (0x10 + (i + 1) * 4) as u8, (alloc >> 32) as u32);
                 dev.bar[i] = (alloc as u32) | (bar_val & 0x0F);
                 dev.bar[i + 1] = (alloc >> 32) as u32;
                 G_PCI_MEM_NEXT = alloc + 0x40_0000; // 4MB block
             } else {
                 let alloc = (G_PCI_MEM_NEXT + 0x3F_FFFF) & !0x3F_FFFF; // 4MB align
-                pci_write_config(dev.bus, dev.slot, dev.func, (0x10 + i * 4) as u8, (alloc as u32) | (bar_val & 0x0F));
+                write_config(dev.bus, dev.slot, dev.func, (0x10 + i * 4) as u8, (alloc as u32) | (bar_val & 0x0F));
                 dev.bar[i] = (alloc as u32) | (bar_val & 0x0F);
                 G_PCI_MEM_NEXT = alloc + 0x40_0000;
             }
@@ -179,22 +181,22 @@ fn pci_assign_bars(dev: &mut PciDevice) {
 
     // Enable I/O + Memory Space + Bus Master
     let new_cmd = cmd | 0x07;
-    pci_write_config16(dev.bus, dev.slot, dev.func, 0x04, new_cmd);
+    write_config16(dev.bus, dev.slot, dev.func, 0x04, new_cmd);
 }
 
 // ---- Bus scan ---------------------------------------------------------------
 
-fn pci_probe_function(bus: u8, slot: u8, func: u8) -> bool {
-    let reg0 = pci_read_config(bus, slot, func, 0x00);
+fn probe_function(bus: u8, slot: u8, func: u8) -> bool {
+    let reg0 = read_config(bus, slot, func, 0x00);
     let vendor_id = (reg0 & 0xFFFF) as u16;
     if vendor_id == 0xFFFF { return false; }
 
     let device_id = (reg0 >> 16) as u16;
-    let reg8 = pci_read_config(bus, slot, func, 0x08);
+    let reg8 = read_config(bus, slot, func, 0x08);
     let class_code = (reg8 >> 24) as u8;
     let subclass = (reg8 >> 16) as u8;
     let prog_if = (reg8 >> 8) as u8;
-    let regc = pci_read_config(bus, slot, func, 0x0C);
+    let regc = read_config(bus, slot, func, 0x0C);
     let header_type = (regc >> 16) as u8;
 
     let mut dev = PciDevice {
@@ -207,16 +209,16 @@ fn pci_probe_function(bus: u8, slot: u8, func: u8) -> bool {
 
     // Read BARs
     for i in 0..6 {
-        dev.bar[i] = pci_read_config(bus, slot, func, (0x10 + i * 4) as u8);
+        dev.bar[i] = read_config(bus, slot, func, (0x10 + i * 4) as u8);
     }
 
     // Assign BARs on aarch64 if firmware hasn't
     #[cfg(target_arch = "aarch64")]
     {
-        pci_assign_bars(&mut dev);
+        assign_bars(&mut dev);
         // Re-read BARs after assignment
         for i in 0..6 {
-            dev.bar[i] = pci_read_config(bus, slot, func, (0x10 + i * 4) as u8);
+            dev.bar[i] = read_config(bus, slot, func, (0x10 + i * 4) as u8);
         }
     }
 
@@ -230,7 +232,7 @@ fn pci_probe_function(bus: u8, slot: u8, func: u8) -> bool {
     true
 }
 
-fn pci_init_inner() {
+fn init_inner() {
     unsafe {
         if PCI_INITIALIZED { return; }
         PCI_INITIALIZED = true;
@@ -240,7 +242,7 @@ fn pci_init_inner() {
 
     #[cfg(target_arch = "aarch64")]
     unsafe {
-        let fdt = kernel_fdt::info();
+        let fdt = fdt::info();
         if fdt.pcie_ecam_base != 0 {
             G_ECAM_BASE = fdt.pcie_ecam_base;
             if G_ECAM_BASE >= 0x1_0000_0000 {
@@ -255,14 +257,14 @@ fn pci_init_inner() {
 
     // Scan bus 0, slots 0-31
     for slot in 0..32u8 {
-        if !pci_probe_function(0, slot, 0) { continue; }
+        if !probe_function(0, slot, 0) { continue; }
 
         // Check multi-function bit
-        let regc = pci_read_config(0, slot, 0, 0x0C);
+        let regc = read_config(0, slot, 0, 0x0C);
         let header_type = (regc >> 16) as u8;
         if (header_type & 0x80) != 0 {
             for func in 1..8u8 {
-                pci_probe_function(0, slot, func);
+                probe_function(0, slot, func);
             }
         }
     }
@@ -270,7 +272,7 @@ fn pci_init_inner() {
     log(b"[PCI] Scan complete\n");
 }
 
-pub(crate) fn pci_find_device(vendor_id: u16, device_id: u16) -> Option<usize> {
+pub(crate) fn find_device(vendor_id: u16, device_id: u16) -> Option<usize> {
     unsafe {
         for i in 0..PCI_DEVICE_COUNT {
             if PCI_DEVICES[i].vendor_id == vendor_id && PCI_DEVICES[i].device_id == device_id {
@@ -281,21 +283,21 @@ pub(crate) fn pci_find_device(vendor_id: u16, device_id: u16) -> Option<usize> {
     None
 }
 
-pub(crate) fn pci_enable_bus_mastering_inner(slot: u8) {
+pub(crate) fn enable_bus_mastering_inner(slot: u8) {
     #[cfg(target_arch = "aarch64")]
     {
-        let cmd = pci_read_config16(0, slot, 0, 0x04);
-        pci_write_config16(0, slot, 0, 0x04, cmd | 0x04);
+        let cmd = read_config16(0, slot, 0, 0x04);
+        write_config16(0, slot, 0, 0x04, cmd | 0x04);
     }
     #[cfg(target_arch = "x86_64")]
     {
-        let cmd = pci_read_config(0, slot, 0, 0x04);
-        pci_write_config(0, slot, 0, 0x04, cmd | 0x04);
+        let cmd = read_config(0, slot, 0, 0x04);
+        write_config(0, slot, 0, 0x04, cmd | 0x04);
     }
 }
 
 /// Read 64-bit BAR address from a device.
-pub(crate) fn pci_read_bar64(dev: &PciDevice, bar_idx: usize) -> u64 {
+pub(crate) fn read_bar64(dev: &PciDevice, bar_idx: usize) -> u64 {
     let bar0 = dev.bar[bar_idx];
     let is_io = (bar0 & 1) != 0;
     if is_io {
@@ -318,11 +320,11 @@ pub(crate) fn pci_read_bar64(dev: &PciDevice, bar_idx: usize) -> u64 {
 // NOTE: pci_init is also called from kernel/serial.rs via FFI
 // (serial cannot depend on drivers due to circular dependency).
 // Keep #[unsafe(no_mangle)] + extern "C" for FFI linkage.
-#[unsafe(no_mangle)]
-pub extern "C" fn pci_init() {
-    pci_init_inner();
+#[unsafe(export_name = "pci_init")]
+pub extern "C" fn init() {
+    init_inner();
 }
 
-pub fn pci_enable_bus_mastering(slot: u8) {
-    pci_enable_bus_mastering_inner(slot);
+pub fn enable_bus_mastering(slot: u8) {
+    enable_bus_mastering_inner(slot);
 }

@@ -23,7 +23,7 @@ static mut MAC_CACHED: bool = false;
 pub(crate) fn ethernet_our_mac() -> MacAddr {
     unsafe {
         if !MAC_CACHED {
-            drivers::virtio_net_get_mac(OUR_MAC.bytes.as_mut_ptr());
+            drivers::virtio_net::get_mac(OUR_MAC.bytes.as_mut_ptr());
             MAC_CACHED = true;
         }
         OUR_MAC
@@ -42,7 +42,7 @@ pub(crate) fn ethernet_send(dst: MacAddr, ethertype: u16, payload: &[u8]) {
         let payload_len = payload.len().min(1500);
         ptr::copy_nonoverlapping(payload.as_ptr(), ETH_TX_BUF.as_mut_ptr().add(14), payload_len);
 
-        drivers::virtio_net_send(&ETH_TX_BUF[..14 + payload_len]);
+        drivers::virtio_net::send(&ETH_TX_BUF[..14 + payload_len]);
     }
 }
 

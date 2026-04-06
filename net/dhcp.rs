@@ -219,7 +219,7 @@ fn dhcp_send_discover() {
     ip.checksum = 0;
     ip.checksum = unsafe { checksum(frame.as_ptr().add(14) as *const u8, 20) };
 
-    drivers::virtio_net_send(&frame[..14 + ip_total]);
+    drivers::virtio_net::send(&frame[..14 + ip_total]);
 }
 
 fn dhcp_send_request() {
@@ -287,14 +287,14 @@ fn dhcp_send_request() {
     ip.checksum = 0;
     ip.checksum = unsafe { checksum(frame.as_ptr().add(14) as *const u8, 20) };
 
-    drivers::virtio_net_send(&frame[..14 + ip_total]);
+    drivers::virtio_net::send(&frame[..14 + ip_total]);
 }
 
 fn dhcp_poll_wait(timeout_ms: u32) -> bool {
     for _ in 0..timeout_ms {
         // Poll aggressively within each ms to keep latency low
         for _ in 0..100 {
-            drivers::virtio_net_poll(dhcp_receive);
+            drivers::virtio_net::poll(dhcp_receive);
             unsafe {
                 if DHCP_GOT_OFFER || DHCP_GOT_ACK {
                     return true;
@@ -307,7 +307,7 @@ fn dhcp_poll_wait(timeout_ms: u32) -> bool {
 }
 
 /// DHCP discover — blocks until IP obtained or timeout.
-pub fn dhcp_discover() -> bool {
+pub fn discover() -> bool {
     unsafe {
         DHCP_GOT_OFFER = false;
         DHCP_GOT_ACK = false;

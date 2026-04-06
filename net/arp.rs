@@ -170,7 +170,7 @@ pub(crate) fn arp_resolve(ip: Ipv4Addr) -> Option<MacAddr> {
     for _retry in 0..3 {
         arp_request(target);
         for _poll in 0..200_000 {
-            drivers::virtio_net_poll(ethernet_receive);
+            drivers::virtio_net::poll(ethernet_receive);
             if let Some(mac) = arp_lookup(target) {
                 return Some(mac);
             }

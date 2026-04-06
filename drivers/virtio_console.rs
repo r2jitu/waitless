@@ -376,7 +376,7 @@ pub extern "C" fn virtio_console_init_mmio(base_addr: u64) -> bool {
 }
 
 /// Initialize console via PCI (scans PCI bus, finds device type 3).
-/// PCI must be initialized first (pci_init).
+/// PCI must be initialized first (pci::init).
 #[unsafe(no_mangle)]
 pub extern "C" fn virtio_console_init_pci() -> bool {
     con_init_pci()
