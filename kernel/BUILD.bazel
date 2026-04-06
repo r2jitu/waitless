@@ -1,4 +1,4 @@
-load("@rules_rust//rust:defs.bzl", "rust_library", "rust_static_library")
+load("@rules_rust//rust:defs.bzl", "rust_library")
 load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 
 package(default_visibility = ["//visibility:public"])
@@ -21,46 +21,5 @@ rust_library(
         ],
         "//conditions:default": [],
     }),
-    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
-)
-
-# rust_static_library: these provide #[no_mangle] extern "C" symbols
-# resolved at link time by boot assembly (kernel_main, limine_entry_cpp,
-# memcpy). Separate targets for better --gc-sections dead code elimination.
-
-rust_static_library(
-    name = "entry",
-    srcs = ["entry.rs"],
-    compile_data = select({
-        "//bazel/platforms:x86_64": [
-            "x86_64/boot.S",
-            "x86_64/idt_stubs.S",
-        ],
-        "//bazel/platforms:aarch64": ["aarch64/boot.S"],
-        "//conditions:default": [
-            "x86_64/boot.S",
-            "x86_64/idt_stubs.S",
-        ],
-    }),
-    crate_root = "entry.rs",
-    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
-    deps = [
-        ":kernel",
-        "//drivers",
-        "//net",
-        "//uni",
-    ],
-)
-
-rust_static_library(
-    name = "limine",
-    srcs = ["limine_entry.rs"],
-    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
-    deps = [":kernel"],
-)
-
-rust_static_library(
-    name = "libc",
-    srcs = ["libc.rs"],
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
 )

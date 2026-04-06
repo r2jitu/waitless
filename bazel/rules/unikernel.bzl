@@ -50,7 +50,7 @@ def unikernel_binary(name, app, visibility = None):
         visibility: Bazel visibility specification.
     """
 
-    _unikernel_deps = [app, "//kernel:entry", "//kernel:limine", "//kernel:libc"]
+    _unikernel_deps = [app, "//boot:entry", "//boot:limine", "//boot:libc"]
     _unikernel_flags = UNIKERNEL_RUSTC_FLAGS + _LINK_FLAGS + _LINK_FLAGS_ARCH
 
     # ── Unikernel ELF ────────────────────────────────────────────────────
