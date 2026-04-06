@@ -8,6 +8,7 @@ rust_library(
     srcs = [
         "deque.rs",
         "lib.rs",
+        "spsc.rs",
         "mm.rs",
         "serial.rs",
         "time.rs",
@@ -30,10 +31,17 @@ rust_library(
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
 )
 
-# Host-native unit test for the Chase-Lev work-stealing deque.
+# Host-native unit tests for lock-free data structures.
 rust_test(
     name = "deque_test",
     srcs = ["deque.rs"],
     crate_root = "deque.rs",
+    rustc_flags = ["-Cpanic=unwind"],
+)
+
+rust_test(
+    name = "spsc_test",
+    srcs = ["spsc.rs"],
+    crate_root = "spsc.rs",
     rustc_flags = ["-Cpanic=unwind"],
 )
