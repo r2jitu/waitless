@@ -425,18 +425,16 @@ impl Virtqueue {
 
         // Initialize free descriptor linked list
         for i in 0..queue_size {
-            unsafe {
-                let d = &mut *self.descs.add(i as usize);
-                d.next = i + 1;
-                d.flags = 0;
-            }
+            let d = self.desc_mut(i);
+            d.next = i + 1;
+            d.flags = 0;
         }
         self.free_head = 0;
         self.num_free = queue_size;
         self.last_used_idx = 0;
 
         // Suppress interrupts by default (polling mode)
-        unsafe { ptr::write_volatile(&mut (*self.avail).flags, VIRTQ_AVAIL_F_NO_INTERRUPT); }
+        self.set_avail_flags(VIRTQ_AVAIL_F_NO_INTERRUPT);
 
         let desc_phys = phys_base;
         let avail_phys = phys_base + desc_size;
@@ -518,40 +516,35 @@ impl Virtqueue {
 
         // Output (device-readable) buffers
         for i in 0..out_count {
-            unsafe {
-                let d = &mut *self.descs.add(idx as usize);
-                d.addr = buf_phys;
-                d.len = buf_len;
-                d.flags = if i < total - 1 { VIRTQ_DESC_F_NEXT } else { 0 };
-                idx = d.next;
-            }
+            let d = self.desc_mut(idx);
+            d.addr = buf_phys;
+            d.len = buf_len;
+            d.flags = if i < total - 1 { VIRTQ_DESC_F_NEXT } else { 0 };
+            idx = d.next;
         }
 
         // Input (device-writable) buffers
         for i in 0..in_count {
-            unsafe {
-                let d = &mut *self.descs.add(idx as usize);
-                d.addr = buf_phys;
-                d.len = buf_len;
-                d.flags = VIRTQ_DESC_F_WRITE;
-                if i < in_count - 1 { d.flags |= VIRTQ_DESC_F_NEXT; }
-                idx = d.next;
-            }
+            let d = self.desc_mut(idx);
+            d.addr = buf_phys;
+            d.len = buf_len;
+            d.flags = VIRTQ_DESC_F_WRITE;
+            if i < in_count - 1 { d.flags |= VIRTQ_DESC_F_NEXT; }
+            idx = d.next;
         }
 
         self.free_head = idx;
         self.num_free -= total;
 
         // Add chain head to available ring
-        unsafe {
-            let avail_idx = ptr::read_volatile(&(*self.avail).idx);
-            let ring_slot = (avail_idx & (self.queue_size - 1)) as usize;
-            let ring_ptr = (self.avail as *mut u8).add(4) as *mut u16; // skip flags+idx
-            ptr::write_volatile(ring_ptr.add(ring_slot), head);
+        {
+            let avail_idx = self.avail_idx();
+            let ring_slot = avail_idx & (self.queue_size - 1);
+            self.set_avail_ring(ring_slot, head);
 
             dsb_st();
 
-            ptr::write_volatile(&mut (*self.avail).idx, avail_idx.wrapping_add(1));
+            self.set_avail_idx(avail_idx.wrapping_add(1));
         }
 
         head as i32
@@ -575,14 +568,12 @@ impl Virtqueue {
     pub fn get_used(&mut self) -> Option<(u16, u32)> {
         dsb_ld();
 
-        let used_idx = unsafe { ptr::read_volatile(&(*self.used).idx) };
-        if self.last_used_idx == used_idx { return None; }
+        let cur_used_idx = self.used_idx();
+        if self.last_used_idx == cur_used_idx { return None; }
 
-        let used_slot = (self.last_used_idx & (self.queue_size - 1)) as usize;
-        let ring_ptr = unsafe { (self.used as *mut u8).add(4) as *mut VirtqUsedElem };
-        let elem = unsafe { ptr::read_volatile(ring_ptr.add(used_slot)) };
-        let id = elem.id as u16;
-        let len = elem.len;
+        let used_slot = self.last_used_idx & (self.queue_size - 1);
+        let id = self.used_ring_id(used_slot) as u16;
+        let len = self.used_ring_len(used_slot);
 
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
 
@@ -590,42 +581,129 @@ impl Virtqueue {
         let mut idx = id;
         loop {
             self.num_free += 1;
-            let d = unsafe { &mut *self.descs.add(idx as usize) };
-            if (d.flags & VIRTQ_DESC_F_NEXT) == 0 {
-                d.next = self.free_head;
+            let flags = self.desc(idx).flags;
+            let next = self.desc(idx).next;
+            if (flags & VIRTQ_DESC_F_NEXT) == 0 {
+                self.desc_mut(idx).next = self.free_head;
                 self.free_head = id;
                 break;
             }
-            idx = d.next;
+            idx = next;
         }
 
         Some((id, len))
     }
 
     pub fn has_used(&self) -> bool {
-        let used_idx = unsafe { ptr::read_volatile(&(*self.used).idx) };
-        self.last_used_idx != used_idx
+        self.last_used_idx != self.used_idx()
     }
 
     pub fn enable_interrupts(&mut self) {
-        unsafe { ptr::write_volatile(&mut (*self.avail).flags, 0); }
+        self.set_avail_flags(0);
         if self.event_idx {
             // Write used_event = used->idx after avail->ring[queue_size]
-            let used_event_ptr = unsafe {
-                ((self.avail as *mut u8).add(4) as *mut u16).add(self.queue_size as usize)
-            };
-            let used_idx = unsafe { ptr::read_volatile(&(*self.used).idx) };
-            unsafe { ptr::write_volatile(used_event_ptr, used_idx); }
+            let cur_used_idx = self.used_idx();
+            self.set_used_event(cur_used_idx);
             dsb_st();
         }
     }
 
     pub fn disable_interrupts(&mut self) {
-        unsafe { ptr::write_volatile(&mut (*self.avail).flags, VIRTQ_AVAIL_F_NO_INTERRUPT); }
+        self.set_avail_flags(VIRTQ_AVAIL_F_NO_INTERRUPT);
     }
 
-    /// Get descriptor at index (for reading buffer addresses)
+    // ---- Ring buffer access helpers ----
+    // These encapsulate the raw pointer arithmetic for the split virtqueue
+    // ring structures. The underlying memory is allocated by alloc_rings()
+    // and these pointers are valid for the lifetime of the Virtqueue.
+
+    /// Get a shared reference to the descriptor at `idx`.
     pub fn desc(&self, idx: u16) -> &VirtqDesc {
+        // SAFETY: descs points to a valid array of queue_size VirtqDesc entries
+        // allocated in alloc_rings(), and idx is expected to be < queue_size.
         unsafe { &*self.descs.add(idx as usize) }
+    }
+
+    /// Get a mutable reference to the descriptor at `idx`.
+    pub fn desc_mut(&mut self, idx: u16) -> &mut VirtqDesc {
+        // SAFETY: descs points to a valid array of queue_size VirtqDesc entries
+        // allocated in alloc_rings(), and idx is expected to be < queue_size.
+        unsafe { &mut *self.descs.add(idx as usize) }
+    }
+
+    /// Read the available ring entry at position `idx` (the descriptor index
+    /// stored in avail->ring[idx % queue_size]).
+    pub fn avail_ring(&self, idx: u16) -> u16 {
+        // SAFETY: The avail ring entries start at offset 4 (after flags + idx)
+        // from avail base. The ring has queue_size u16 entries.
+        unsafe {
+            let ring_ptr = (self.avail as *const u8).add(4) as *const u16;
+            ptr::read_volatile(ring_ptr.add(idx as usize))
+        }
+    }
+
+    /// Write a descriptor index into the available ring at position `idx`.
+    pub fn set_avail_ring(&mut self, idx: u16, val: u16) {
+        // SAFETY: The avail ring entries start at offset 4 (after flags + idx)
+        // from avail base. The ring has queue_size u16 entries.
+        unsafe {
+            let ring_ptr = (self.avail as *mut u8).add(4) as *mut u16;
+            ptr::write_volatile(ring_ptr.add(idx as usize), val);
+        }
+    }
+
+    /// Read the id field of the used ring element at position `idx`.
+    pub fn used_ring_id(&self, idx: u16) -> u32 {
+        // SAFETY: The used ring elements start at offset 4 (after flags + idx)
+        // from used base. Each element is a VirtqUsedElem (8 bytes).
+        unsafe {
+            let ring_ptr = (self.used as *const u8).add(4) as *const VirtqUsedElem;
+            ptr::read_volatile(&(*ring_ptr.add(idx as usize)).id)
+        }
+    }
+
+    /// Read the len field of the used ring element at position `idx`.
+    pub fn used_ring_len(&self, idx: u16) -> u32 {
+        // SAFETY: The used ring elements start at offset 4 (after flags + idx)
+        // from used base. Each element is a VirtqUsedElem (8 bytes).
+        unsafe {
+            let ring_ptr = (self.used as *const u8).add(4) as *const VirtqUsedElem;
+            ptr::read_volatile(&(*ring_ptr.add(idx as usize)).len)
+        }
+    }
+
+    /// Read avail->idx (volatile, device may read concurrently).
+    fn avail_idx(&self) -> u16 {
+        // SAFETY: avail points to a valid VirtqAvail header.
+        unsafe { ptr::read_volatile(&(*self.avail).idx) }
+    }
+
+    /// Write avail->idx (volatile, device may read concurrently).
+    fn set_avail_idx(&mut self, val: u16) {
+        // SAFETY: avail points to a valid VirtqAvail header.
+        unsafe { ptr::write_volatile(&mut (*self.avail).idx, val); }
+    }
+
+    /// Read used->idx (volatile, device writes this).
+    fn used_idx(&self) -> u16 {
+        // SAFETY: used points to a valid VirtqUsed header.
+        unsafe { ptr::read_volatile(&(*self.used).idx) }
+    }
+
+    /// Write avail->flags (volatile).
+    fn set_avail_flags(&mut self, val: u16) {
+        // SAFETY: avail points to a valid VirtqAvail header.
+        unsafe { ptr::write_volatile(&mut (*self.avail).flags, val); }
+    }
+
+    /// Write the used_event field (located after avail->ring[queue_size]).
+    fn set_used_event(&mut self, val: u16) {
+        // SAFETY: used_event is the u16 immediately after avail->ring[queue_size],
+        // i.e. at offset 4 + 2*queue_size from avail base.
+        unsafe {
+            let used_event_ptr = ((self.avail as *mut u8).add(4) as *mut u16)
+                .add(self.queue_size as usize);
+            ptr::write_volatile(used_event_ptr, val);
+        }
     }
 }
