@@ -221,7 +221,7 @@ mod aarch64 {
 }
 
 // ============================================================================
-// Common serial API — exported as extern "C" for C++ callers
+// Common serial API
 // ============================================================================
 
 static mut SHUTDOWN_REQUESTED: bool = false;

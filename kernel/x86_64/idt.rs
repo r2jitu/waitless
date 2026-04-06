@@ -155,7 +155,7 @@ const ICW4_8086: u8 = 0x01; // 8086 mode
 
 fn pic_remap() {
     unsafe {
-        // Save current masks (unused, but matches C++ for correctness)
+        // Save current masks (unused, preserved for spec compliance)
         let _mask1 = inb(PIC1_DATA);
         let _mask2 = inb(PIC2_DATA);
 

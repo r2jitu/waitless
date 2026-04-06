@@ -21,8 +21,6 @@ use kernel::serial;
 #[cfg(target_arch = "aarch64")]
 use kernel::aarch64::mmu::map_device_range;
 
-#[cfg(target_arch = "x86_64")]
-use kernel::x86_64 as x86_init;
 
 pub(crate) fn log(msg: &[u8]) {
     serial::puts(msg)

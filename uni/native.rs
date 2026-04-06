@@ -207,7 +207,7 @@ fn init_native() {
 }
 
 // ============================================================================
-// Platform API — same interface as ffi.rs + stack.rs (called from api.rs)
+// Platform API — called from uni/lib.rs backend dispatch
 // ============================================================================
 
 pub fn log(msg: &[u8]) {

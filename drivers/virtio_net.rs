@@ -32,9 +32,6 @@ use crate::virtio::{
 };
 use kernel::mm::{kmalloc, virt_to_phys, phys_to_virt};
 
-#[cfg(target_arch = "x86_64")]
-use crate::x86_init;
-
 // ============================================================================
 // VirtIO-net constants and types
 // ============================================================================
@@ -480,7 +477,7 @@ fn tx_drain() {
 // x86_64: extern "C" fn() wrapper for the idt.cc trampoline
 #[cfg(target_arch = "x86_64")]
 #[cfg(target_arch = "x86_64")]
-unsafe extern "C" fn irq_handler_x86(_frame: *mut x86_init::idt::InterruptFrame) {
+unsafe extern "C" fn irq_handler_x86(_frame: *mut kernel::x86_64::idt::InterruptFrame) {
     irq_handler(0);
 }
 
@@ -655,8 +652,8 @@ pub fn enable_irq() {
                 let irq_line = (irq_reg & 0xFF) as u8;
                 if irq_line < 16 {
                     NET.rx_queue.enable_interrupts();
-                    x86_init::idt::register_handler(32 + irq_line, irq_handler_x86);
-                    x86_init::idt::enable_irq(irq_line);
+                    kernel::x86_64::idt::register_handler(32 + irq_line, irq_handler_x86);
+                    kernel::x86_64::idt::enable_irq(irq_line);
                     NET.irq_idle_available = true;
                 }
             }

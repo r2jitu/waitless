@@ -13,7 +13,7 @@
 use core::ptr;
 
 // ============================================================================
-// FDT Info struct — shared with C++ callers and Rust crates
+// FDT Info struct — device tree discovery results
 // ============================================================================
 
 /// Device information discovered from the FDT.

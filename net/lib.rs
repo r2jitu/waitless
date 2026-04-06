@@ -1,8 +1,6 @@
-// net/lib.rs — Bare-metal network stack (Rust, no_std)
+// net/lib.rs — Bare-metal network stack (no_std)
 //
-// Complete TCP/IP stack for the unikernel: Ethernet, ARP, IPv4, TCP, DHCP.
-// Replaces the C++ net/ethernet.cc, net/arp.cc, net/ipv4.cc, net/tcp.cc,
-// net/dhcp.cc, and net/types.cc.
+// Complete TCP/IP stack: Ethernet, ARP, IPv4, TCP, DHCP.
 //
 // All buffers are fixed-size, statically allocated. No heap except for
 // per-connection TCP receive buffers (via kmalloc/kfree FFI).

@@ -51,7 +51,7 @@ pub(crate) static mut CONFIG: NetConfig = NetConfig {
 };
 
 /// RFC 1071 internet checksum over a byte buffer.
-/// Reads 16-bit words in little-endian (matching the C++ implementation)
+/// Reads 16-bit words in little-endian byte order.
 /// so that the returned u16 can be stored directly in packed struct fields.
 pub(crate) fn checksum(data: *const u8, len: usize) -> u16 {
     let mut sum: u32 = 0;
@@ -71,11 +71,11 @@ pub(crate) fn checksum(data: *const u8, len: usize) -> u16 {
 }
 
 /// TCP/UDP pseudo-header checksum.
-/// Matches the C++ implementation: pseudo-header + data summed in LE byte order.
+/// Pseudo-header + data summed in LE byte order.
 pub(crate) fn tcp_checksum(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, data: *const u8, len: usize) -> u16 {
     let mut sum: u32 = 0;
 
-    // Pseudo-header — read addr fields as LE 16-bit words (matching C++ struct layout)
+    // Pseudo-header — read addr fields as LE 16-bit words
     sum += (src.addr & 0xFFFF) as u32;
     sum += (src.addr >> 16) as u32;
     sum += (dst.addr & 0xFFFF) as u32;
