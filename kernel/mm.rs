@@ -67,39 +67,47 @@ static mut KERNEL_VIRT_BASE: u64 = 0;
 // ============================================================================
 
 unsafe fn bitmap_set(frame: u64) {
-    if frame < TOTAL_FRAMES {
-        let byte = &mut *FRAME_BITMAP.add((frame / 8) as usize);
-        *byte |= 1 << (frame % 8);
+    unsafe {
+        if frame < TOTAL_FRAMES {
+            let byte = &mut *FRAME_BITMAP.add((frame / 8) as usize);
+            *byte |= 1 << (frame % 8);
+        }
     }
 }
 
 unsafe fn bitmap_clear(frame: u64) {
-    if frame < TOTAL_FRAMES {
-        let byte = &mut *FRAME_BITMAP.add((frame / 8) as usize);
-        *byte &= !(1 << (frame % 8));
+    unsafe {
+        if frame < TOTAL_FRAMES {
+            let byte = &mut *FRAME_BITMAP.add((frame / 8) as usize);
+            *byte &= !(1 << (frame % 8));
+        }
     }
 }
 
 unsafe fn bitmap_test(frame: u64) -> bool {
-    if frame < TOTAL_FRAMES {
-        let byte = *FRAME_BITMAP.add((frame / 8) as usize);
-        (byte & (1 << (frame % 8))) != 0
-    } else {
-        true // Out-of-range frames are considered "in use"
+    unsafe {
+        if frame < TOTAL_FRAMES {
+            let byte = *FRAME_BITMAP.add((frame / 8) as usize);
+            (byte & (1 << (frame % 8))) != 0
+        } else {
+            true // Out-of-range frames are considered "in use"
+        }
     }
 }
 
 /// Mark a range of frames as used
 unsafe fn mark_frames_used(start_addr: u64, end_addr: u64) {
-    let start_frame = start_addr / PAGE_SIZE;
-    let mut end_frame = (end_addr + PAGE_SIZE - 1) / PAGE_SIZE;
-    if end_frame > TOTAL_FRAMES {
-        end_frame = TOTAL_FRAMES;
-    }
-    for i in start_frame..end_frame {
-        if !bitmap_test(i) {
-            bitmap_set(i);
-            USED_FRAMES += 1;
+    unsafe {
+        let start_frame = start_addr / PAGE_SIZE;
+        let mut end_frame = (end_addr + PAGE_SIZE - 1) / PAGE_SIZE;
+        if end_frame > TOTAL_FRAMES {
+            end_frame = TOTAL_FRAMES;
+        }
+        for i in start_frame..end_frame {
+            if !bitmap_test(i) {
+                bitmap_set(i);
+                USED_FRAMES += 1;
+            }
         }
     }
 }

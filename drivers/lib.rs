@@ -7,7 +7,6 @@
 
 #![no_std]
 #![allow(static_mut_refs)]
-#![allow(unsafe_op_in_unsafe_fn)]
 #![allow(dead_code, unused_imports)]  // register constants + arch-conditional imports
 
 use core::arch::asm;
@@ -64,37 +63,37 @@ pub(crate) fn dsb_sy() {
 /// # Safety: addr must be a valid, mapped MMIO address.
 #[inline(always)]
 pub(crate) unsafe fn mmio_read32(addr: u64) -> u32 {
-    ptr::read_volatile(addr as *const u32)
+    unsafe { ptr::read_volatile(addr as *const u32) }
 }
 
 /// # Safety: addr must be a valid, mapped MMIO address.
 #[inline(always)]
 pub(crate) unsafe fn mmio_write32(addr: u64, val: u32) {
-    ptr::write_volatile(addr as *mut u32, val);
+    unsafe { ptr::write_volatile(addr as *mut u32, val); }
 }
 
 /// # Safety: addr must be a valid, mapped MMIO address.
 #[inline(always)]
 pub(crate) unsafe fn mmio_read16(addr: u64) -> u16 {
-    ptr::read_volatile(addr as *const u16)
+    unsafe { ptr::read_volatile(addr as *const u16) }
 }
 
 /// # Safety: addr must be a valid, mapped MMIO address.
 #[inline(always)]
 pub(crate) unsafe fn mmio_write16(addr: u64, val: u16) {
-    ptr::write_volatile(addr as *mut u16, val);
+    unsafe { ptr::write_volatile(addr as *mut u16, val); }
 }
 
 /// # Safety: addr must be a valid, mapped MMIO address.
 #[inline(always)]
 pub(crate) unsafe fn mmio_read8(addr: u64) -> u8 {
-    ptr::read_volatile(addr as *const u8)
+    unsafe { ptr::read_volatile(addr as *const u8) }
 }
 
 /// # Safety: addr must be a valid, mapped MMIO address.
 #[inline(always)]
 pub(crate) unsafe fn mmio_write8(addr: u64, val: u8) {
-    ptr::write_volatile(addr as *mut u8, val);
+    unsafe { ptr::write_volatile(addr as *mut u8, val); }
 }
 
 // ---- x86_64 port I/O -------------------------------------------------------
@@ -102,43 +101,49 @@ pub(crate) unsafe fn mmio_write8(addr: u64, val: u8) {
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub(crate) unsafe fn outl(port: u16, val: u32) {
-    asm!("out dx, eax", in("dx") port, in("eax") val, options(nostack, preserves_flags));
+    unsafe { asm!("out dx, eax", in("dx") port, in("eax") val, options(nostack, preserves_flags)); }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub(crate) unsafe fn inl(port: u16) -> u32 {
-    let val: u32;
-    asm!("in eax, dx", in("dx") port, out("eax") val, options(nostack, preserves_flags));
-    val
+    unsafe {
+        let val: u32;
+        asm!("in eax, dx", in("dx") port, out("eax") val, options(nostack, preserves_flags));
+        val
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub(crate) unsafe fn outw(port: u16, val: u16) {
-    asm!("out dx, ax", in("dx") port, in("ax") val, options(nostack, preserves_flags));
+    unsafe { asm!("out dx, ax", in("dx") port, in("ax") val, options(nostack, preserves_flags)); }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub(crate) unsafe fn inw(port: u16) -> u16 {
-    let val: u16;
-    asm!("in ax, dx", in("dx") port, out("ax") val, options(nostack, preserves_flags));
-    val
+    unsafe {
+        let val: u16;
+        asm!("in ax, dx", in("dx") port, out("ax") val, options(nostack, preserves_flags));
+        val
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub(crate) unsafe fn outb(port: u16, val: u8) {
-    asm!("out dx, al", in("dx") port, in("al") val, options(nostack, preserves_flags));
+    unsafe { asm!("out dx, al", in("dx") port, in("al") val, options(nostack, preserves_flags)); }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub(crate) unsafe fn inb(port: u16) -> u8 {
-    let val: u8;
-    asm!("in al, dx", in("dx") port, out("al") val, options(nostack, preserves_flags));
-    val
+    unsafe {
+        let val: u8;
+        asm!("in al, dx", in("dx") port, out("al") val, options(nostack, preserves_flags));
+        val
+    }
 }
 
 // ---- Unified virtio register access -----------------------------------------
@@ -146,55 +151,67 @@ pub(crate) unsafe fn inb(port: u16) -> u8 {
 /// Read 32-bit virtio register. On x86 uses port I/O; on aarch64 uses MMIO.
 #[inline(always)]
 pub(crate) unsafe fn virtio_read32(base: u64) -> u32 {
-    #[cfg(target_arch = "x86_64")]
-    { inl(base as u16) }
-    #[cfg(target_arch = "aarch64")]
-    { mmio_read32(base) }
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        { inl(base as u16) }
+        #[cfg(target_arch = "aarch64")]
+        { mmio_read32(base) }
+    }
 }
 
 /// Write 32-bit virtio register.
 #[inline(always)]
 pub(crate) unsafe fn virtio_write32(base: u64, val: u32) {
-    #[cfg(target_arch = "x86_64")]
-    { outl(base as u16, val) }
-    #[cfg(target_arch = "aarch64")]
-    { mmio_write32(base, val) }
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        { outl(base as u16, val) }
+        #[cfg(target_arch = "aarch64")]
+        { mmio_write32(base, val) }
+    }
 }
 
 /// Read 16-bit virtio register.
 #[inline(always)]
 pub(crate) unsafe fn virtio_read16(base: u64) -> u16 {
-    #[cfg(target_arch = "x86_64")]
-    { inw(base as u16) }
-    #[cfg(target_arch = "aarch64")]
-    { mmio_read16(base) }
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        { inw(base as u16) }
+        #[cfg(target_arch = "aarch64")]
+        { mmio_read16(base) }
+    }
 }
 
 /// Write 16-bit virtio register.
 #[inline(always)]
 pub(crate) unsafe fn virtio_write16(base: u64, val: u16) {
-    #[cfg(target_arch = "x86_64")]
-    { outw(base as u16, val) }
-    #[cfg(target_arch = "aarch64")]
-    { mmio_write16(base, val) }
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        { outw(base as u16, val) }
+        #[cfg(target_arch = "aarch64")]
+        { mmio_write16(base, val) }
+    }
 }
 
 /// Read 8-bit virtio register.
 #[inline(always)]
 pub(crate) unsafe fn virtio_read8(base: u64) -> u8 {
-    #[cfg(target_arch = "x86_64")]
-    { inb(base as u16) }
-    #[cfg(target_arch = "aarch64")]
-    { mmio_read8(base) }
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        { inb(base as u16) }
+        #[cfg(target_arch = "aarch64")]
+        { mmio_read8(base) }
+    }
 }
 
 /// Write 8-bit virtio register.
 #[inline(always)]
 pub(crate) unsafe fn virtio_write8(base: u64, val: u8) {
-    #[cfg(target_arch = "x86_64")]
-    { outb(base as u16, val) }
-    #[cfg(target_arch = "aarch64")]
-    { mmio_write8(base, val) }
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        { outb(base as u16, val) }
+        #[cfg(target_arch = "aarch64")]
+        { mmio_write8(base, val) }
+    }
 }
 
 /// VZ async delay — Apple VZ processes config writes asynchronously.

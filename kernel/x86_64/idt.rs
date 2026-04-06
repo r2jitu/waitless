@@ -118,14 +118,18 @@ unsafe extern "C" {
 
 #[inline(always)]
 unsafe fn outb(port: u16, val: u8) {
-    asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack));
+    unsafe {
+        asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack));
+    }
 }
 
 #[inline(always)]
 unsafe fn inb(port: u16) -> u8 {
-    let val: u8;
-    asm!("in al, dx", out("al") val, in("dx") port, options(nomem, nostack));
-    val
+    unsafe {
+        let val: u8;
+        asm!("in al, dx", out("al") val, in("dx") port, options(nomem, nostack));
+        val
+    }
 }
 
 /// Small I/O delay by writing to port 0x80 (POST diagnostic port).
@@ -191,15 +195,17 @@ fn pic_remap() {
 // ============================================================================
 
 unsafe fn set_idt_entry(vector: usize, handler_addr: u64, selector: u16, ist: u8, type_attr: u8) {
-    IDT_ENTRIES[vector] = IdtEntry {
-        offset_low: (handler_addr & 0xFFFF) as u16,
-        selector,
-        ist: ist & 0x07,
-        type_attr,
-        offset_mid: ((handler_addr >> 16) & 0xFFFF) as u16,
-        offset_high: ((handler_addr >> 32) & 0xFFFF_FFFF) as u32,
-        zero: 0,
-    };
+    unsafe {
+        IDT_ENTRIES[vector] = IdtEntry {
+            offset_low: (handler_addr & 0xFFFF) as u16,
+            selector,
+            ist: ist & 0x07,
+            type_attr,
+            offset_mid: ((handler_addr >> 16) & 0xFFFF) as u16,
+            offset_high: ((handler_addr >> 32) & 0xFFFF_FFFF) as u32,
+            zero: 0,
+        };
+    }
 }
 
 // ============================================================================
@@ -211,6 +217,7 @@ unsafe fn set_idt_entry(vector: usize, handler_addr: u64, selector: u16, ist: u8
 /// and halts on unhandled CPU exceptions.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn isr_common_handler(frame: *mut InterruptFrame) {
+    unsafe {
     let vector = (*frame).vector as usize;
 
     // Dispatch to registered handler if one exists
@@ -243,6 +250,7 @@ pub unsafe extern "C" fn isr_common_handler(frame: *mut InterruptFrame) {
         loop {
             asm!("cli", "hlt", options(nomem, nostack));
         }
+    }
     }
 }
 

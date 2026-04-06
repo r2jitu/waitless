@@ -48,45 +48,57 @@ unsafe fn arch_unmask_irq() {
 #[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn arch_idle() {
-    // STI;HLT;CLI — atomic idle pattern on x86
-    core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+    unsafe {
+        // STI;HLT;CLI — atomic idle pattern on x86
+        core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn arch_cpu_relax() {
-    core::arch::asm!("pause", options(nomem, nostack));
+    unsafe {
+        core::arch::asm!("pause", options(nomem, nostack));
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
 #[inline]
 unsafe fn arch_mask_irq() {
-    // Mask IRQ only (DAIF.I) — never touch FIQ, VZ uses it
-    core::arch::asm!("msr daifset, #0x2", options(nomem, nostack));
+    unsafe {
+        // Mask IRQ only (DAIF.I) — never touch FIQ, VZ uses it
+        core::arch::asm!("msr daifset, #0x2", options(nomem, nostack));
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
 #[inline]
 unsafe fn arch_unmask_irq() {
-    core::arch::asm!("msr daifclr, #0x2", options(nomem, nostack));
+    unsafe {
+        core::arch::asm!("msr daifclr, #0x2", options(nomem, nostack));
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
 #[inline]
 unsafe fn arch_idle() {
-    let freq: u64;
-    core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq);
-    let tval = if freq / 10 == 0 { 1u64 } else { freq / 10 };
-    core::arch::asm!("msr cntv_tval_el0, {}", in(reg) tval);
-    core::arch::asm!("msr cntv_ctl_el0, {}", in(reg) 1u64); // ENABLE
-    core::arch::asm!("isb", options(nomem, nostack));
-    core::arch::asm!("wfi", options(nomem, nostack));
-    core::arch::asm!("msr cntv_ctl_el0, {}", in(reg) 0u64); // DISABLE
-    core::arch::asm!("isb", options(nomem, nostack));
+    unsafe {
+        let freq: u64;
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq);
+        let tval = if freq / 10 == 0 { 1u64 } else { freq / 10 };
+        core::arch::asm!("msr cntv_tval_el0, {}", in(reg) tval);
+        core::arch::asm!("msr cntv_ctl_el0, {}", in(reg) 1u64); // ENABLE
+        core::arch::asm!("isb", options(nomem, nostack));
+        core::arch::asm!("wfi", options(nomem, nostack));
+        core::arch::asm!("msr cntv_ctl_el0, {}", in(reg) 0u64); // DISABLE
+        core::arch::asm!("isb", options(nomem, nostack));
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
 #[inline]
 unsafe fn arch_cpu_relax() {
-    core::arch::asm!("yield", options(nomem, nostack));
+    unsafe {
+        core::arch::asm!("yield", options(nomem, nostack));
+    }
 }

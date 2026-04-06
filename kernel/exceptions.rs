@@ -59,32 +59,32 @@ mod aarch64 {
 
     #[inline(always)]
     unsafe fn gicd_read(off: u32) -> u32 {
-        ptr::read_volatile((GICD_BASE + off as u64) as *const u32)
+        unsafe { ptr::read_volatile((GICD_BASE + off as u64) as *const u32) }
     }
 
     #[inline(always)]
     unsafe fn gicd_write(off: u32, val: u32) {
-        ptr::write_volatile((GICD_BASE + off as u64) as *mut u32, val);
+        unsafe { ptr::write_volatile((GICD_BASE + off as u64) as *mut u32, val); }
     }
 
     #[inline(always)]
     unsafe fn gicc_read(off: u32) -> u32 {
-        ptr::read_volatile((GICC_BASE + off as u64) as *const u32)
+        unsafe { ptr::read_volatile((GICC_BASE + off as u64) as *const u32) }
     }
 
     #[inline(always)]
     unsafe fn gicc_write(off: u32, val: u32) {
-        ptr::write_volatile((GICC_BASE + off as u64) as *mut u32, val);
+        unsafe { ptr::write_volatile((GICC_BASE + off as u64) as *mut u32, val); }
     }
 
     #[inline(always)]
     unsafe fn gicr_read(off: u32) -> u32 {
-        ptr::read_volatile((GICR_BASE + off as u64) as *const u32)
+        unsafe { ptr::read_volatile((GICR_BASE + off as u64) as *const u32) }
     }
 
     #[inline(always)]
     unsafe fn gicr_write(off: u32, val: u32) {
-        ptr::write_volatile((GICR_BASE + off as u64) as *mut u32, val);
+        unsafe { ptr::write_volatile((GICR_BASE + off as u64) as *mut u32, val); }
     }
 
     // ---- IRQ handler table ------------------------------------------------
@@ -107,6 +107,7 @@ mod aarch64 {
 
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn exception_handler(kind: u32, frame: *const Frame) {
+        unsafe {
         let frame = &*frame;
 
         if kind == 1 {
@@ -157,6 +158,7 @@ mod aarch64 {
                 asm!("wfe", options(nomem, nostack));
             }
         }
+        }
     }
 
     // ---- Logging macro using kernel_serial --------------------------------
@@ -171,6 +173,7 @@ mod aarch64 {
     // ---- GICv2 initialisation ---------------------------------------------
 
     unsafe fn init_gicv2() {
+        unsafe {
         GICC_BASE = GICD_BASE + 0x10000;
 
         // Disable distributor while configuring
@@ -197,11 +200,13 @@ mod aarch64 {
         asm!("dsb sy", "isb", options(nostack));
 
         klog!("       GICv2 init: {} IRQ lines\n", num_irqs);
+        }
     }
 
     // ---- GICv3 initialisation ---------------------------------------------
 
     unsafe fn init_gicv3() {
+        unsafe {
         let typer = gicd_read(GICD_TYPER);
         let it_lines = (typer & 0x1F) + 1;
         let num_irqs = it_lines * 32;
@@ -259,22 +264,25 @@ mod aarch64 {
         asm!("msr ICC_BPR1_EL1, {}", in(reg) 0_u64);
         asm!("msr ICC_IGRPEN1_EL1, {}", in(reg) 1_u64);
         asm!("isb", options(nostack));
+        }
     }
 
     // ---- Public interface --------------------------------------------------
 
     pub unsafe fn init() {
-        let fdt = kernel_fdt::info();
-        GICD_BASE = fdt.gic_dist_base;
-        GICR_BASE = fdt.gic_redist_base;
-        GIC_VERSION = fdt.gic_version;
+        unsafe {
+            let fdt = kernel_fdt::info();
+            GICD_BASE = fdt.gic_dist_base;
+            GICR_BASE = fdt.gic_redist_base;
+            GIC_VERSION = fdt.gic_version;
 
-        if GIC_VERSION == 3 {
-            init_gicv3();
-        } else if GIC_VERSION == 2 {
-            init_gicv2();
-        } else {
-            kernel_serial::puts(b"       GIC init skipped (no GIC in DTB)\n");
+            if GIC_VERSION == 3 {
+                init_gicv3();
+            } else if GIC_VERSION == 2 {
+                init_gicv2();
+            } else {
+                kernel_serial::puts(b"       GIC init skipped (no GIC in DTB)\n");
+            }
         }
     }
 
@@ -284,29 +292,33 @@ mod aarch64 {
     }
 
     pub unsafe fn enable_timer_wakeup() {
-        register_irq(27, timer_wakeup_handler);
+        unsafe {
+            register_irq(27, timer_wakeup_handler);
+        }
     }
 
     pub unsafe fn register_irq(irq: u32, handler: fn(u32)) {
-        if (irq as usize) >= MAX_IRQS {
-            return;
-        }
-        IRQ_HANDLERS[irq as usize] = Some(handler);
+        unsafe {
+            if (irq as usize) >= MAX_IRQS {
+                return;
+            }
+            IRQ_HANDLERS[irq as usize] = Some(handler);
 
-        if GICD_BASE == 0 {
-            return;
-        }
+            if GICD_BASE == 0 {
+                return;
+            }
 
-        let reg_idx = irq / 32;
-        let bit = 1u32 << (irq % 32);
+            let reg_idx = irq / 32;
+            let bit = 1u32 << (irq % 32);
 
-        if irq < 32 && GIC_VERSION == 3 && GICR_BASE != 0 {
-            // GICv3: PPIs/SGIs (INTID 0-31) are in the GICR SGI frame
-            let addr = GICR_BASE + GICR_SGI_BASE as u64 + GICD_ISENABLER0 as u64;
-            ptr::write_volatile(addr as *mut u32, bit);
-        } else {
-            // SPIs (INTID >= 32) or GICv2: enable in the distributor
-            gicd_write(GICD_ISENABLER0 + reg_idx * 4, bit);
+            if irq < 32 && GIC_VERSION == 3 && GICR_BASE != 0 {
+                // GICv3: PPIs/SGIs (INTID 0-31) are in the GICR SGI frame
+                let addr = GICR_BASE + GICR_SGI_BASE as u64 + GICD_ISENABLER0 as u64;
+                ptr::write_volatile(addr as *mut u32, bit);
+            } else {
+                // SPIs (INTID >= 32) or GICv2: enable in the distributor
+                gicd_write(GICD_ISENABLER0 + reg_idx * 4, bit);
+            }
         }
     }
 }

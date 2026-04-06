@@ -154,24 +154,28 @@ const CONN_POOL_SIZE: usize = 256;
 static mut POOL: [NativeConn; CONN_POOL_SIZE] = [NativeConn::empty(); CONN_POOL_SIZE];
 
 unsafe fn alloc_conn() -> *mut NativeConn {
-    for c in POOL.iter_mut() {
-        if c.closed && c.fd < 0 {
-            *c = NativeConn { fd: -1, is_listener: false, closed: false, has_pending_data: false };
-            return c as *mut NativeConn;
+    unsafe {
+        for c in POOL.iter_mut() {
+            if c.closed && c.fd < 0 {
+                *c = NativeConn { fd: -1, is_listener: false, closed: false, has_pending_data: false };
+                return c as *mut NativeConn;
+            }
         }
+        ptr::null_mut()
     }
-    ptr::null_mut()
 }
 
 unsafe fn release_conn(c: *mut NativeConn) {
-    if (*c).fd >= 0 {
-        shutdown((*c).fd, SHUT_RDWR);
-        close((*c).fd);
-        (*c).fd = -1;
+    unsafe {
+        if (*c).fd >= 0 {
+            shutdown((*c).fd, SHUT_RDWR);
+            close((*c).fd);
+            (*c).fd = -1;
+        }
+        (*c).closed = true;
+        (*c).has_pending_data = false;
+        (*c).is_listener = false;
     }
-    (*c).closed = true;
-    (*c).has_pending_data = false;
-    (*c).is_listener = false;
 }
 
 // ============================================================================
@@ -182,7 +186,9 @@ static mut CONFIG_PORT: u16 = 0;
 static mut SHUTDOWN: bool = false;
 
 unsafe extern "C" fn sigint_handler(_sig: i32) {
-    SHUTDOWN = true;
+    unsafe {
+        SHUTDOWN = true;
+    }
 }
 
 fn init_native() {

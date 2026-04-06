@@ -59,25 +59,25 @@ static mut CON_RX_LAST_USED: u16 = 0;
 // Ring accessors using raw pointer arithmetic
 
 unsafe fn con_desc_addr(mem: &mut ConQueueMem, i: usize) -> *mut u64 {
-    mem.0.as_mut_ptr().add(i * 16) as *mut u64
+    unsafe { mem.0.as_mut_ptr().add(i * 16) as *mut u64 }
 }
 unsafe fn con_desc_len(mem: &mut ConQueueMem, i: usize) -> *mut u32 {
-    mem.0.as_mut_ptr().add(i * 16 + 8) as *mut u32
+    unsafe { mem.0.as_mut_ptr().add(i * 16 + 8) as *mut u32 }
 }
 unsafe fn con_desc_flags(mem: &mut ConQueueMem, i: usize) -> *mut u16 {
-    mem.0.as_mut_ptr().add(i * 16 + 12) as *mut u16
+    unsafe { mem.0.as_mut_ptr().add(i * 16 + 12) as *mut u16 }
 }
 unsafe fn con_avail_idx_reg(mem: &mut ConQueueMem) -> *mut u16 {
-    mem.0.as_mut_ptr().add(CON_AVAIL_OFF + 2) as *mut u16
+    unsafe { mem.0.as_mut_ptr().add(CON_AVAIL_OFF + 2) as *mut u16 }
 }
 unsafe fn con_avail_ring(mem: &mut ConQueueMem, i: usize) -> *mut u16 {
-    mem.0.as_mut_ptr().add(CON_AVAIL_OFF + 4 + i * 2) as *mut u16
+    unsafe { mem.0.as_mut_ptr().add(CON_AVAIL_OFF + 4 + i * 2) as *mut u16 }
 }
 unsafe fn con_used_idx_reg(mem: &ConQueueMem) -> *const u16 {
-    mem.0.as_ptr().add(CON_USED_OFF + 2) as *const u16
+    unsafe { mem.0.as_ptr().add(CON_USED_OFF + 2) as *const u16 }
 }
 unsafe fn con_used_ring_id(mem: &ConQueueMem, i: usize) -> *const u32 {
-    mem.0.as_ptr().add(CON_USED_OFF + 4 + i * 8) as *const u32
+    unsafe { mem.0.as_ptr().add(CON_USED_OFF + 4 + i * 8) as *const u32 }
 }
 
 // ---- MMIO console init -------------------------------------------------------

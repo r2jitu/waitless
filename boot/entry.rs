@@ -7,7 +7,6 @@
 // Initialises every subsystem in dependency order, then calls uni_main().
 
 #![no_std]
-#![allow(unsafe_op_in_unsafe_fn)]
 #![allow(static_mut_refs)]
 #![allow(unused_imports)]
 
@@ -51,24 +50,28 @@ pub extern "C" fn rust_eh_personality() {}
 /// Power off the machine. Never returns.
 #[cfg(target_arch = "x86_64")]
 unsafe fn arch_shutdown() -> ! {
-    // ACPI S5 sleep via PM1_CNT — try multiple ports/SLP_TYP values
-    core::arch::asm!("out dx, ax", in("dx") 0x0604u16, in("ax") 0x2000u16, options(nomem, nostack));
-    core::arch::asm!("out dx, ax", in("dx") 0x0604u16, in("ax") 0x3400u16, options(nomem, nostack));
-    core::arch::asm!("out dx, ax", in("dx") 0xb004u16, in("ax") 0x2000u16, options(nomem, nostack));
-    loop { core::arch::asm!("cli", "hlt", options(nomem, nostack)); }
+    unsafe {
+        // ACPI S5 sleep via PM1_CNT — try multiple ports/SLP_TYP values
+        core::arch::asm!("out dx, ax", in("dx") 0x0604u16, in("ax") 0x2000u16, options(nomem, nostack));
+        core::arch::asm!("out dx, ax", in("dx") 0x0604u16, in("ax") 0x3400u16, options(nomem, nostack));
+        core::arch::asm!("out dx, ax", in("dx") 0xb004u16, in("ax") 0x2000u16, options(nomem, nostack));
+        loop { core::arch::asm!("cli", "hlt", options(nomem, nostack)); }
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
 unsafe fn arch_shutdown() -> ! {
-    // PSCI SYSTEM_OFF (HVC #0, function 0x84000008)
-    core::arch::asm!(
-        "movz x0, #0x8400, lsl #16",
-        "movk x0, #0x0008",
-        "hvc #0",
-        out("x0") _,
-        options(nomem, nostack)
-    );
-    loop { core::arch::asm!("wfi", options(nomem, nostack)); }
+    unsafe {
+        // PSCI SYSTEM_OFF (HVC #0, function 0x84000008)
+        core::arch::asm!(
+            "movz x0, #0x8400, lsl #16",
+            "movk x0, #0x0008",
+            "hvc #0",
+            out("x0") _,
+            options(nomem, nostack)
+        );
+        loop { core::arch::asm!("wfi", options(nomem, nostack)); }
+    }
 }
 
 // ============================================================================
@@ -116,19 +119,23 @@ macro_rules! klog {
 // ============================================================================
 
 unsafe fn zero_bss() {
-    let start = &raw const __bss_start as *mut u8;
-    let end = &raw const __bss_end as *mut u8;
-    let len = end as usize - start as usize;
-    ptr::write_bytes(start, 0, len);
+    unsafe {
+        let start = &raw const __bss_start as *mut u8;
+        let end = &raw const __bss_end as *mut u8;
+        let len = end as usize - start as usize;
+        ptr::write_bytes(start, 0, len);
+    }
 }
 
 unsafe fn call_global_constructors() {
-    let start = &raw const __init_array_start as *const unsafe extern "C" fn();
-    let end = &raw const __init_array_end as *const unsafe extern "C" fn();
-    let mut f = start;
-    while (f as usize) < (end as usize) {
-        (*f)();
-        f = f.add(1);
+    unsafe {
+        let start = &raw const __init_array_start as *const unsafe extern "C" fn();
+        let end = &raw const __init_array_end as *const unsafe extern "C" fn();
+        let mut f = start;
+        while (f as usize) < (end as usize) {
+            (*f)();
+            f = f.add(1);
+        }
     }
 }
 
@@ -172,6 +179,7 @@ mod boot_shim_x86 {
     }
 
     pub unsafe fn shim(info: &mut BootInfo, boot_info_addr: u64) {
+        unsafe {
         info.protocol = Protocol::Unknown;
         info.memory_map_count = 0;
         info.dtb_addr = 0;
@@ -284,6 +292,7 @@ mod boot_shim_x86 {
         };
         info.memory_map_count = 1;
         klog!("  Boot protocol: fallback (unrecognized boot info)\n");
+        }
     }
 }
 
@@ -292,6 +301,7 @@ mod boot_shim_fdt {
     use super::*;
 
     pub unsafe fn shim(info: &mut BootInfo, dtb_addr: u64) {
+        unsafe {
         info.protocol = Protocol::Fdt;
         info.dtb_addr = dtb_addr;
         info.kernel_phys_base = 0;
@@ -322,6 +332,7 @@ mod boot_shim_fdt {
             ram_base,
             ram_size / (1024 * 1024)
         );
+        }
     }
 }
 
@@ -332,6 +343,7 @@ mod boot_shim_fdt {
 static mut G_BOOT_INFO: BootInfo = BootInfo::zeroed();
 
 unsafe fn kernel_boot(info: &BootInfo) {
+    unsafe {
     serial::init();
     klog!("\n");
     klog!("==============================================\n");
@@ -441,6 +453,7 @@ unsafe fn kernel_boot(info: &BootInfo) {
     klog!("\n[SHUTDOWN] Application returned. Powering off.\n");
 
     arch_shutdown();
+    }
 }
 
 // x86_64: ISR trampoline for serial RX (ignores InterruptFrame pointer)
@@ -456,6 +469,7 @@ unsafe extern "C" fn serial_rx_isr_trampoline(_frame: *mut kernel::x86_64::idt::
 /// Legacy entry point called from boot.S.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kernel_main(boot_info_addr: u64) {
+    unsafe {
     zero_bss();
 
     #[cfg(target_arch = "aarch64")]
@@ -482,10 +496,13 @@ pub unsafe extern "C" fn kernel_main(boot_info_addr: u64) {
     boot_shim_x86::shim(&mut G_BOOT_INFO, boot_info_addr);
 
     kernel_boot(&G_BOOT_INFO);
+    }
 }
 
 /// Entry from Limine bootloader (BSS already zeroed, FDT/ECAM handled by limine_entry.rs).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kernel_boot_from_bootinfo(info: *const BootInfo) {
-    kernel_boot(&*info);
+    unsafe {
+        kernel_boot(&*info);
+    }
 }

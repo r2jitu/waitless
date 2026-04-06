@@ -33,50 +33,62 @@ mod x86 {
 
     #[inline(always)]
     unsafe fn outb(port: u16, val: u8) {
-        asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack));
+        unsafe {
+            asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack));
+        }
     }
 
     #[inline(always)]
     unsafe fn inb(port: u16) -> u8 {
-        let ret: u8;
-        asm!("in al, dx", out("al") ret, in("dx") port, options(nomem, nostack));
-        ret
+        unsafe {
+            let ret: u8;
+            asm!("in al, dx", out("al") ret, in("dx") port, options(nomem, nostack));
+            ret
+        }
     }
 
     pub unsafe fn init() {
-        // Disable all UART interrupts
-        outb(COM1 + IER, 0x00);
-        // Enable DLAB to set baud rate
-        outb(COM1 + LCR, 0x80);
-        // Set divisor to 1 (115200 baud)
-        outb(COM1 + DLL, 0x01);
-        outb(COM1 + DLH, 0x00);
-        // 8N1, clear DLAB
-        outb(COM1 + LCR, 0x03);
-        // Enable FIFO, clear queues, 14-byte threshold
-        outb(COM1 + FCR, 0xC7);
-        // RTS/DSR + OUT2 (required for interrupts)
-        outb(COM1 + MCR, 0x0B);
+        unsafe {
+            // Disable all UART interrupts
+            outb(COM1 + IER, 0x00);
+            // Enable DLAB to set baud rate
+            outb(COM1 + LCR, 0x80);
+            // Set divisor to 1 (115200 baud)
+            outb(COM1 + DLL, 0x01);
+            outb(COM1 + DLH, 0x00);
+            // 8N1, clear DLAB
+            outb(COM1 + LCR, 0x03);
+            // Enable FIFO, clear queues, 14-byte threshold
+            outb(COM1 + FCR, 0xC7);
+            // RTS/DSR + OUT2 (required for interrupts)
+            outb(COM1 + MCR, 0x0B);
+        }
     }
 
     pub unsafe fn putc(c: u8) {
-        // Wait for THR empty (LSR bit 5)
-        while (inb(COM1 + LSR) & 0x20) == 0 {}
-        outb(COM1 + THR, c);
+        unsafe {
+            // Wait for THR empty (LSR bit 5)
+            while (inb(COM1 + LSR) & 0x20) == 0 {}
+            outb(COM1 + THR, c);
+        }
     }
 
     pub unsafe fn try_getc() -> i32 {
-        // LSR bit 0 = Data Ready
-        if (inb(COM1 + LSR) & 0x01) != 0 {
-            inb(COM1 + RBR) as i32
-        } else {
-            -1
+        unsafe {
+            // LSR bit 0 = Data Ready
+            if (inb(COM1 + LSR) & 0x01) != 0 {
+                inb(COM1 + RBR) as i32
+            } else {
+                -1
+            }
         }
     }
 
     pub unsafe fn enable_rx_irq() {
-        // Enable ERBFI (Received Data Available Interrupt)
-        outb(COM1 + IER, 0x01);
+        unsafe {
+            // Enable ERBFI (Received Data Available Interrupt)
+            outb(COM1 + IER, 0x01);
+        }
     }
 }
 
@@ -120,76 +132,88 @@ mod aarch64 {
 
     #[inline(always)]
     unsafe fn pl011_read(off: u64) -> u32 {
-        ptr::read_volatile((UART_BASE + off) as *const u32)
+        unsafe {
+            ptr::read_volatile((UART_BASE + off) as *const u32)
+        }
     }
 
     #[inline(always)]
     unsafe fn pl011_write(off: u64, val: u32) {
-        ptr::write_volatile((UART_BASE + off) as *mut u32, val);
+        unsafe {
+            ptr::write_volatile((UART_BASE + off) as *mut u32, val);
+        }
     }
 
     unsafe fn pl011_init(base: u64) {
-        UART_BASE = base;
-        pl011_write(PL011_CR, 0);           // disable UART
-        pl011_write(PL011_IBRD, 13);        // 115200 @ 24 MHz
-        pl011_write(PL011_FBRD, 1);
-        pl011_write(PL011_LCR_H, (3 << 5) | (1 << 4)); // 8N1, FIFO on
-        pl011_write(PL011_CR, CR_UARTEN | CR_TXE | CR_RXE);
-        BACKEND = Backend::Pl011;
+        unsafe {
+            UART_BASE = base;
+            pl011_write(PL011_CR, 0);           // disable UART
+            pl011_write(PL011_IBRD, 13);        // 115200 @ 24 MHz
+            pl011_write(PL011_FBRD, 1);
+            pl011_write(PL011_LCR_H, (3 << 5) | (1 << 4)); // 8N1, FIFO on
+            pl011_write(PL011_CR, CR_UARTEN | CR_TXE | CR_RXE);
+            BACKEND = Backend::Pl011;
+        }
     }
 
     pub unsafe fn init() {
-        let fdt = kernel_fdt::info();
+        unsafe {
+            let fdt = kernel_fdt::info();
 
-        // Prefer PL011 if FDT found one (QEMU path)
-        if fdt.uart_base != 0 {
-            pl011_init(fdt.uart_base);
-            return;
-        }
+            // Prefer PL011 if FDT found one (QEMU path)
+            if fdt.uart_base != 0 {
+                pl011_init(fdt.uart_base);
+                return;
+            }
 
-        // Try virtio-mmio console if FDT found virtio-mmio devices
-        if fdt.virtio_count > 0 {
-            for i in 0..fdt.virtio_count as usize {
-                if virtio_console_init_mmio(fdt.virtio_bases[i]) {
+            // Try virtio-mmio console if FDT found virtio-mmio devices
+            if fdt.virtio_count > 0 {
+                for i in 0..fdt.virtio_count as usize {
+                    if virtio_console_init_mmio(fdt.virtio_bases[i]) {
+                        BACKEND = Backend::Virtio;
+                        return;
+                    }
+                }
+            }
+
+            // PCI VirtIO console (VZ.framework and other PCI platforms)
+            if fdt.pcie_ecam_base != 0 {
+                pci_init();
+                if virtio_console_init_pci() {
                     BACKEND = Backend::Virtio;
                     return;
                 }
             }
-        }
 
-        // PCI VirtIO console (VZ.framework and other PCI platforms)
-        if fdt.pcie_ecam_base != 0 {
-            pci_init();
-            if virtio_console_init_pci() {
-                BACKEND = Backend::Virtio;
-                return;
-            }
+            // No console found — putc() is a no-op, kernel runs silently.
         }
-
-        // No console found — putc() is a no-op, kernel runs silently.
     }
 
     pub unsafe fn putc(c: u8) {
-        match BACKEND {
-            Backend::Virtio => virtio_console_putc(c),
-            Backend::None => {},
-            Backend::Pl011 => {
-                // Wait for TX FIFO not full
-                while (pl011_read(PL011_FR) & FR_TXFF) != 0 {}
-                pl011_write(PL011_DR, c as u32);
+        unsafe {
+            match BACKEND {
+                Backend::Virtio => virtio_console_putc(c),
+                Backend::None => {},
+                Backend::Pl011 => {
+                    // Wait for TX FIFO not full
+                    while (pl011_read(PL011_FR) & FR_TXFF) != 0 {}
+                    pl011_write(PL011_DR, c as u32);
+                }
             }
         }
     }
 
     pub unsafe fn try_getc() -> i32 {
-        match BACKEND {
-            Backend::Virtio => virtio_console_try_getc(),
-            Backend::None => -1,
-            Backend::Pl011 => {
-                if (pl011_read(PL011_FR) & FR_RXFE) == 0 {
-                    (pl011_read(PL011_DR) & 0xFF) as i32
-                } else {
-                    -1
+        unsafe {
+            match BACKEND {
+                Backend::Virtio => virtio_console_try_getc(),
+                Backend::None => -1,
+                Backend::Pl011 => {
+                    if (pl011_read(PL011_FR) & FR_RXFE) == 0 {
+                        (pl011_read(PL011_DR) & 0xFF) as i32
+                    } else {
+                        -1
+                    }
                 }
             }
         }

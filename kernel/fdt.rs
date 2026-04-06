@@ -402,7 +402,9 @@ fn parse_dtb(dtb: &[u8]) {
 /// # Safety
 /// Caller must ensure `init()` has been called first.
 pub unsafe fn info() -> &'static FdtInfo {
-    &*(&raw const G_INFO)
+    unsafe {
+        &*(&raw const G_INFO)
+    }
 }
 
 // ============================================================================

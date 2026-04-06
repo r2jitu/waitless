@@ -8,7 +8,6 @@
 
 #![no_std]
 #![allow(static_mut_refs)]
-#![allow(unsafe_op_in_unsafe_fn)]
 
 // Re-export the #[uni::main] proc macro.
 pub use uni_macros::main;

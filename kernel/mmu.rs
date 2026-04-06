@@ -45,6 +45,7 @@ mod aarch64 {
     const L2_DEVICE_BLOCK: u64 = 0x0401;
 
     pub unsafe fn map_device_range(phys_base: u64, size: u64) {
+        unsafe {
         if size == 0 {
             return;
         }
@@ -115,6 +116,7 @@ mod aarch64 {
 
         // Ensure table writes are visible, then invalidate TLB
         asm!("dsb sy", "tlbi vmalle1", "dsb sy", "isb", options(nostack));
+        }
     }
 }
 
