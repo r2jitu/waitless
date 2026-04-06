@@ -559,7 +559,22 @@ UNIKERNEL_CPUS=4 ./scripts/bench.sh   # expect ~linear scaling
 - [x] TCP connection pinning: per-core pools (32 slots/core), flow hash distribution
 - [x] Per-core HTTP service: each core has listener + active connections (SO_REUSEPORT)
 - [x] Per-core TLS via GS_BASE (x86_64) / TPIDR_EL1 (aarch64) → fast cpu_id()
+- [x] SEV/WFE inter-core signaling on aarch64 (replaces GIC SGI IPI on hot path)
 - [ ] Tier auto-detection: MQ offered -> Tier 1, else -> Tier 2 (deferred to 2b)
+
+**Blockers for demonstrating multi-core perf scaling:**
+
+- [ ] **MTTCG data races**: `qemu -accel tcg,thread=multi` crashes — exposes
+  data races in `static mut` globals accessed from multiple cores. Need to
+  audit all shared mutable state and make it atomic or per-core. Without
+  MTTCG, all vCPUs share one host thread (no true parallelism).
+- [ ] **VZ multi-core TCP**: VZ TCP proxy (`run-vz.swift`) routes all host
+  connections from a single source, so all flows hash to one core. Fix:
+  vary proxy source ports, or use direct VM networking (VZBridgedNetworkDeviceAttachment).
+- [ ] **VZ exclusive monitor**: VZ doesn't handle LDXR/STXR (atomic RMW)
+  correctly for some BSS addresses. Workaround in place (volatile writes),
+  but limits use of Rust atomics on VZ. May need to relocate atomics to
+  a dedicated memory region or use ARMv8.1 LSE atomics.
 
 **Tests:**
 - [x] Integration: HTTP + UDP tests pass with -smp 4 on both arches
@@ -571,6 +586,8 @@ UNIKERNEL_CPUS=4 ./scripts/bench.sh   # expect ~linear scaling
 UNIKERNEL_CPUS=4 bazel test --config=aarch64-qemu //apps/webserver:test --test_env=UNIKERNEL_CPUS=4
 UNIKERNEL_CPUS=4 bazel test --config=x86_64-qemu //apps/webserver:test --test_env=UNIKERNEL_CPUS=4
 # Serial: "[net] Tier 2: software distribution (4 cores)"
+# UDP multi-core benchmark:
+./scripts/bench_udp.sh
 ```
 
 ### 2d. Work stealing
