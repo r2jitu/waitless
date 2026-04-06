@@ -28,3 +28,25 @@ rust.toolchain(
 use_repo(rust, "rust_toolchains")
 
 register_toolchains("@rust_toolchains//:all")
+
+# ── crates.io dependencies (annotation-based, no Cargo.toml needed) ──────────
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+
+crate.spec(
+    package = "bitflags",
+    version = "2.9.1",
+    default_features = False,
+)
+
+crate.from_specs(
+    # Only list triples in rules_rust 0.56.0's triple_mappings.bzl.
+    # aarch64-unknown-none is missing from rules_rust, but these triples
+    # cover our constraint_values (aarch64 cpu matched via aarch64-apple-darwin,
+    # x86_64 bare-metal via x86_64-unknown-none).
+    supported_platform_triples = [
+        "aarch64-apple-darwin",
+        "x86_64-unknown-none",
+        "x86_64-unknown-linux-gnu",
+    ],
+)
+use_repo(crate, "crates")
