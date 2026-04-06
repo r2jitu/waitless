@@ -481,25 +481,27 @@ network config) BEFORE starting secondary cores. No boot barrier needed —
 secondary cores simply don't exist until core 0 calls PSCI CPU_ON /
 INIT-SIPI-SIPI after init is done.
 
-- [ ] Core 0: complete all init (mm, devices, DHCP, VirtIO queues)
-- [ ] Core 0: allocate per-core state for all cores (stacks, queues, timers)
-- [ ] aarch64: start APs via PSCI CPU_ON (after init complete)
+- [x] Core 0: complete all init (mm, devices, DHCP, VirtIO queues)
+- [x] Core 0: allocate per-core stacks (64KB each via alloc_pages)
+- [x] aarch64: start APs via PSCI CPU_ON (after init complete)
+- [x] AP trampoline (boot.S): EL2->EL1 drop, MMU enable, VBAR, stack, jump to Rust
+- [x] aarch64: per-core GIC redistributor init (init_ap)
+- [x] FDT parser: count cpu@N nodes for CPU count
+- [x] UNIKERNEL_CPUS env var for configurable SMP count in QEMU
 - [ ] x86_64: start APs via INIT-SIPI-SIPI (after init complete)
-- [ ] Each AP: init own GIC redistributor / APIC, enter event loop
-- [ ] Per-core stack allocation (fixed-size, allocated by core 0 at boot)
+- [ ] x86_64: APIC init (replace legacy PIC for multi-core)
 - [ ] Per-core Chase-Lev deque
 - [ ] Per-core timer wheel + pending_timers MPSC queue
 - [ ] Per-core TX staging buffer (Tier 2)
 - [ ] Per-core heap slab (bump allocator for task-scoped allocations)
-- [ ] x86_64: APIC init (replace legacy PIC for multi-core)
-- [ ] aarch64: per-core GIC redistributor init
 - [ ] Graceful shutdown: serial 0x03 detected -> set AtomicBool -> IPI all cores
 
 **Tests:**
-- [ ] Integration: `test_smp_boot` — boot with `-smp 4`, verify all 4 cores reach event loop (each prints "core N online")
+- [x] Integration: boot with `-smp 4`, all 4 cores print "core N online" (aarch64 QEMU)
+- [ ] Integration: `test_smp_boot` — automated test parsing serial for core count
 - [ ] Integration: `test_per_core_state` — verify each core has independent stack, timer, queue
 - [ ] Integration: `test_ipi` — core 0 sends SGI/IPI to core 1, core 1 acknowledges via serial
-- [ ] Run on QEMU aarch64 AND x86_64
+- [ ] Run on QEMU x86_64
 
 **Try it:**
 ```bash
