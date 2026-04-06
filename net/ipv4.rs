@@ -44,9 +44,11 @@ pub fn ipv4_send(dst: Ipv4Addr, proto: u8, payload: &[u8]) {
     let total_len = 20 + payload_len;
 
     // Stack-allocated buffer: safe for multi-core (each core has its own stack).
-    let mut buf = [0u8; 1500];
+    // MaybeUninit avoids zeroing — we fill header + payload before send.
+    let mut buf = core::mem::MaybeUninit::<[u8; 1500]>::uninit();
+    let buf_ptr = buf.as_mut_ptr() as *mut u8;
     unsafe {
-        let hdr = &mut *(buf.as_mut_ptr() as *mut Ipv4Header);
+        let hdr = &mut *(buf_ptr as *mut Ipv4Header);
         hdr.version_ihl = 0x45;
         hdr.tos = 0;
         hdr.total_length = htons(total_len as u16);
@@ -59,9 +61,9 @@ pub fn ipv4_send(dst: Ipv4Addr, proto: u8, payload: &[u8]) {
         hdr.src = CONFIG.ip;
         hdr.dst = dst;
 
-        hdr.checksum = checksum(buf.as_ptr(), 20);
+        hdr.checksum = checksum(buf_ptr, 20);
 
-        ptr::copy_nonoverlapping(payload.as_ptr(), buf.as_mut_ptr().add(20), payload_len);
+        ptr::copy_nonoverlapping(payload.as_ptr(), buf_ptr.add(20), payload_len);
     }
 
     let dst_mac = if unsafe { CONFIG.ip } == Ipv4Addr::ANY {
@@ -73,7 +75,8 @@ pub fn ipv4_send(dst: Ipv4Addr, proto: u8, payload: &[u8]) {
         }
     };
 
-    ethernet_send(dst_mac, ETHERTYPE_IPV4, &buf[..total_len]);
+    let frame = unsafe { core::slice::from_raw_parts(buf_ptr, total_len) };
+    ethernet_send(dst_mac, ETHERTYPE_IPV4, frame);
 }
 
 /// Parse and validate an IPv4 packet. Returns None if invalid or not for us.
