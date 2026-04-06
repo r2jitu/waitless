@@ -562,7 +562,7 @@ UNIKERNEL_CPUS=4 ./scripts/bench.sh   # VZ flavor shows multi-core perf
 
 ### 2d. Work stealing
 
-- [ ] Per-core SPSC ring for pinned tasks (no atomics on fast path)
+- [x] Per-core SPSC ring for pinned tasks/inbox/TX staging (kernel/spsc.rs, 5 tests)
 - [x] Per-core Chase-Lev deque for stealable tasks (kernel/deque.rs)
 - [ ] Event loop: drain pinned queue first, then stealable deque
 - [ ] Thieves only access other cores' stealable deques (never pinned queues)
