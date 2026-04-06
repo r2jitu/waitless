@@ -504,8 +504,8 @@ INIT-SIPI-SIPI after init is done.
 - [x] Integration: `test_smp_boot` — automated test parsing serial for core count
 - [ ] Integration: `test_per_core_state` — verify each core has independent stack, timer, queue
 - [x] Integration: `test_ipi` — core 0 sends SGI to core 1, core 1 acknowledges (GICv2 + GICv3)
-- [ ] x86_64: debug AP trampoline (16-bit->64-bit transition not completing)
-- [ ] Run SMP test on QEMU x86_64
+- [x] x86_64: AP trampoline working (16-bit→32-bit→64-bit, absolute call to Rust)
+- [x] x86_64: 4 cores online via INIT-SIPI-SIPI (per-core serialized startup)
 
 **Try it:**
 ```bash
