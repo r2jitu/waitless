@@ -8,6 +8,15 @@ bazel_dep(name = "rules_shell", version = "0.6.1")
 bazel_dep(name = "platforms", version = "0.0.10")
 bazel_dep(name = "rules_rust", version = "0.56.0")
 
+# Patch rules_rust to add aarch64-unknown-none to the platform registry.
+# Without this, crate_universe marks crates as incompatible for our
+# aarch64 bare-metal target. x86_64-unknown-none is already registered.
+single_version_override(
+    module_name = "rules_rust",
+    patches = ["//bazel/patches:rules_rust_aarch64_none.patch"],
+    patch_strip = 1,
+)
+
 register_toolchains(
     "//bazel/toolchain:unikernel_cc_toolchain_x86_64",
     "//bazel/toolchain:unikernel_cc_toolchain_aarch64",
@@ -39,12 +48,9 @@ crate.spec(
 )
 
 crate.from_specs(
-    # Only list triples in rules_rust 0.56.0's triple_mappings.bzl.
-    # aarch64-unknown-none is missing from rules_rust, but these triples
-    # cover our constraint_values (aarch64 cpu matched via aarch64-apple-darwin,
-    # x86_64 bare-metal via x86_64-unknown-none).
     supported_platform_triples = [
         "aarch64-apple-darwin",
+        "aarch64-unknown-none",
         "x86_64-unknown-none",
         "x86_64-unknown-linux-gnu",
     ],
