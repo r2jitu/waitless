@@ -37,7 +37,9 @@ core::arch::global_asm!(
     "    jmp 1b",
     options(att_syntax),
 );
+#[cfg(target_arch = "aarch64")]
 use kernel::fdt as kernel_fdt;
+#[cfg(target_arch = "aarch64")]
 use kernel::mmu as kernel_mmu;
 
 // ============================================================================
@@ -112,12 +114,14 @@ struct KernelAddressRequest {
     response: *const KernelAddressResponse,
 }
 
+#[cfg(target_arch = "aarch64")]
 #[repr(C)]
 struct DtbResponse {
     revision: u64,
     dtb_ptr: u64, // void* in C, treated as u64 for pointer-width independence
 }
 
+#[cfg(target_arch = "aarch64")]
 #[repr(C)]
 struct DtbRequest {
     id: [u64; 4],
@@ -125,12 +129,14 @@ struct DtbRequest {
     response: *const DtbResponse,
 }
 
+#[cfg(target_arch = "x86_64")]
 #[repr(C)]
 struct RsdpResponse {
     revision: u64,
     address: u64, // void* in C
 }
 
+#[cfg(target_arch = "x86_64")]
 #[repr(C)]
 struct RsdpRequest {
     id: [u64; 4],

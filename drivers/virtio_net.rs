@@ -63,7 +63,7 @@ struct TxBuf {
 
 // Transport state
 #[derive(Clone, Copy, PartialEq)]
-enum Transport {
+pub(crate) enum Transport {
     None,
     #[cfg(target_arch = "aarch64")]
     Mmio { base: u64, is_v2: bool },

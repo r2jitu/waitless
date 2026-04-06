@@ -8,6 +8,7 @@
 #![no_std]
 #![allow(static_mut_refs)]
 #![allow(unsafe_op_in_unsafe_fn)]
+#![allow(dead_code, unused_imports)]  // register constants + arch-conditional imports
 
 use core::arch::asm;
 use core::ptr;

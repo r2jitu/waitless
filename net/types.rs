@@ -12,9 +12,6 @@ impl MacAddr {
     pub const ZERO: Self = MacAddr { bytes: [0; 6] };
     pub const BROADCAST: Self = MacAddr { bytes: [0xff; 6] };
 
-    pub fn is_broadcast(&self) -> bool {
-        self.bytes == [0xff; 6]
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

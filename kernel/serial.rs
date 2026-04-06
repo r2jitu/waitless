@@ -12,8 +12,6 @@
 // Provides a core::fmt::Write implementation (SerialWriter) for formatted
 // Rust output, plus puts() for byte-slice logging.
 
-use core::ptr;
-
 // ============================================================================
 // x86_64: COM1 port I/O serial
 // ============================================================================
@@ -293,9 +291,9 @@ impl core::fmt::Write for SerialWriter {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         for b in s.bytes() {
             if b == b'\n' {
-                unsafe { putc(b'\r') };
+                putc(b'\r');
             }
-            unsafe { putc(b) };
+            putc(b);
         }
         Ok(())
     }
