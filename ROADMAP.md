@@ -502,8 +502,8 @@ INIT-SIPI-SIPI after init is done.
 - [x] Integration: boot with `-smp 4`, all 4 cores print "core N online" (aarch64 QEMU)
 - [x] Integration: `test_smp_boot` — automated test parsing serial for core count
 - [ ] Integration: `test_per_core_state` — verify each core has independent stack, timer, queue
-- [ ] Integration: `test_ipi` — core 0 sends SGI/IPI to core 1, core 1 acknowledges via serial
-- [ ] Run on QEMU x86_64
+- [x] Integration: `test_ipi` — core 0 sends SGI to core 1, core 1 acknowledges (GICv2 + GICv3)
+- [ ] Run on QEMU x86_64 (blocked on page table extension for APIC MMIO)
 
 **Try it:**
 ```bash
