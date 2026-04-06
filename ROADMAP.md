@@ -491,7 +491,7 @@ INIT-SIPI-SIPI after init is done.
 - [ ] x86_64: start APs via INIT-SIPI-SIPI (after init complete)
 - [ ] x86_64: APIC init (replace legacy PIC for multi-core)
 - [x] Per-core Chase-Lev deque (kernel/deque.rs, 8 unit tests)
-- [ ] Per-core timer wheel + pending_timers MPSC queue
+- [x] Per-core timer wheel + pending_timers MPSC queue (kernel/timer.rs, 6 tests)
 - [ ] Per-core TX staging buffer (Tier 2)
 - [ ] Per-core heap slab (bump allocator for task-scoped allocations)
 - [x] Graceful shutdown: AtomicBool + SGI to wake APs + PSCI CPU_OFF
