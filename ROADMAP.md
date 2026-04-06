@@ -57,12 +57,15 @@ circular dependencies, then new protocols get their own targets.
 - [x] Break circular dependency: ethernet.rs no longer dispatches to arp/ipv4
 - [x] `//net:types` — standalone crate (MacAddr, Ipv4Addr, byte order, checksums)
 - [x] `//net:net` depends on `//net:types` via extern crate
-- [ ] `//net:ethernet` (ethernet.rs — deps: types)
-- [ ] `//net:arp` (arp.rs — deps: types, ethernet)
-- [ ] `//net:ipv4` (ipv4.rs — deps: types, ethernet, arp)
-- [ ] `//net:tcp` (tcp.rs — deps: types, ipv4)
-- [ ] `//net:dhcp` (dhcp.rs — deps: types, ipv4, ethernet)
-- [ ] `//net` umbrella alias for the full legacy stack
+- [x] `//net:ethernet` (deps: types, drivers)
+- [x] `//net:arp` (deps: types, ethernet, drivers)
+- [x] `//net:ipv4` (deps: types, ethernet, arp) — returns `Ipv4Packet`, no dispatch
+- [x] `//net:tcp` (deps: types, ipv4, kernel)
+- [x] `//net:udp` (deps: types, ipv4)
+- [x] `//net:dhcp` (deps: types, ethernet, arp, ipv4, drivers, kernel)
+- [x] `//net:net` umbrella — thin dispatch + poll (~30 lines)
+- [x] `arch_udelay` moved to `kernel/time.rs`
+- [ ] Split `//uni` into per-feature targets (deferred — tied to Phase 2 event loop)
 
 **Tests:**
 - [x] Unit: byte order roundtrips, address types, RFC 1071 checksums (8 tests)
