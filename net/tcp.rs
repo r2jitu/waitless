@@ -6,17 +6,28 @@
 extern crate kernel;
 extern crate net_types as types;
 extern crate net_ipv4 as ipv4;
+extern crate bitflags;
 
 use core::ptr;
 use kernel::mm;
 use types::{Ipv4Addr, CONFIG, tcp_checksum, htons, ntohs, htonl, ntohl};
 use ipv4::{ipv4_send, PROTO_TCP};
 
-const TCP_FIN: u8 = 0x01;
-const TCP_SYN: u8 = 0x02;
-const TCP_RST: u8 = 0x04;
-const TCP_PSH: u8 = 0x08;
-const TCP_ACK: u8 = 0x10;
+bitflags::bitflags! {
+    struct TcpFlags: u8 {
+        const FIN = 0x01;
+        const SYN = 0x02;
+        const RST = 0x04;
+        const PSH = 0x08;
+        const ACK = 0x10;
+    }
+}
+
+const TCP_FIN: u8 = TcpFlags::FIN.bits();
+const TCP_SYN: u8 = TcpFlags::SYN.bits();
+const TCP_RST: u8 = TcpFlags::RST.bits();
+const TCP_PSH: u8 = TcpFlags::PSH.bits();
+const TCP_ACK: u8 = TcpFlags::ACK.bits();
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

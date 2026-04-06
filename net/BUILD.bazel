@@ -19,6 +19,14 @@ rust_test(
     rustc_flags = ["-Cpanic=unwind"],
 )
 
+# Protocol parsing tests — host-native, tests raw byte parsing for all protocols.
+# No deps on bare-metal crates (panic=abort incompatible with test harness).
+rust_test(
+    name = "protocol_tests",
+    srcs = ["protocol_tests.rs"],
+    rustc_flags = ["-Cpanic=unwind"],
+)
+
 rust_library(
     name = "ethernet",
     srcs = ["ethernet.rs"],
@@ -67,6 +75,7 @@ rust_library(
         ":types",
         ":ipv4",
         "//kernel",
+        "@crates//:bitflags",
     ],
 )
 
