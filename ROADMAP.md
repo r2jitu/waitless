@@ -492,8 +492,9 @@ INIT-SIPI-SIPI after init is done.
 - [ ] x86_64: APIC init (replace legacy PIC for multi-core)
 - [x] Per-core Chase-Lev deque (kernel/deque.rs, 8 unit tests)
 - [x] Per-core timer wheel + pending_timers MPSC queue (kernel/timer.rs, 6 tests)
-- [ ] Per-core TX staging buffer (Tier 2)
-- [ ] Per-core heap slab (bump allocator for task-scoped allocations)
+- [x] Per-core TX staging buffer (kernel/percpu.rs TxStaging)
+- [x] PerCore struct tying all data structures together
+- [x] Per-core heap slab (kernel/bump.rs, 64KB bump allocator, 5 tests)
 - [x] Graceful shutdown: AtomicBool + SGI to wake APs + PSCI CPU_OFF
 
 **Tests:**
