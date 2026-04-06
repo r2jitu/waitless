@@ -112,10 +112,18 @@ impl TcpConnection {
     fn rx_push(&mut self, data: &[u8]) -> usize {
         let free = self.rx_free();
         let n = data.len().min(free);
-        for i in 0..n {
-            unsafe { *self.rx_buf.add(self.rx_head) = data[i] };
-            self.rx_head = (self.rx_head + 1) % self.rx_buf_size;
+        if n == 0 { return 0; }
+        // Copy in up to two chunks (head to end, then wraparound to start).
+        let contig = self.rx_buf_size - self.rx_head;
+        if n <= contig {
+            unsafe { ptr::copy_nonoverlapping(data.as_ptr(), self.rx_buf.add(self.rx_head), n) };
+        } else {
+            unsafe {
+                ptr::copy_nonoverlapping(data.as_ptr(), self.rx_buf.add(self.rx_head), contig);
+                ptr::copy_nonoverlapping(data.as_ptr().add(contig), self.rx_buf, n - contig);
+            }
         }
+        self.rx_head = (self.rx_head + n) % self.rx_buf_size;
         n
     }
 
@@ -141,8 +149,6 @@ static mut CONNECTIONS: [TcpConnection; MAX_CONNECTIONS] =
     [const { TcpConnection::new() }; MAX_CONNECTIONS];
 static mut SEQ_COUNTER: u32 = 100_000;
 
-static mut TCP_SEG_BUF: [u8; 20 + MSS] = [0; 20 + MSS];
-static mut TCP_RST_BUF: [u8; 20] = [0; 20];
 
 fn alloc_connection() -> Option<usize> {
     unsafe {
@@ -177,41 +183,36 @@ fn send_segment(
     let payload_len = payload.len().min(MSS);
     let seg_len = 20 + payload_len;
 
+    let mut buf = core::mem::MaybeUninit::<[u8; 20 + MSS]>::uninit();
+    let p = buf.as_mut_ptr() as *mut u8;
+
     unsafe {
-        let hdr = &mut *(TCP_SEG_BUF.as_mut_ptr() as *mut TcpHeader);
+        let hdr = &mut *(p as *mut TcpHeader);
         hdr.src_port = htons(src_port);
         hdr.dst_port = htons(dst_port);
         hdr.seq = htonl(seq);
         hdr.ack = htonl(ack);
-        hdr.data_offset = 0x50; // 5 words = 20 bytes
+        hdr.data_offset = 0x50;
         hdr.flags = flags;
         hdr.window = htons(RX_BUF_SIZE as u16);
         hdr.checksum = 0;
         hdr.urgent = 0;
 
         if !payload.is_empty() {
-            ptr::copy_nonoverlapping(
-                payload.as_ptr(),
-                TCP_SEG_BUF.as_mut_ptr().add(20),
-                payload_len,
-            );
+            ptr::copy_nonoverlapping(payload.as_ptr(), p.add(20), payload_len);
         }
 
-        hdr.checksum = tcp_checksum(
-            CONFIG.ip,
-            dst_ip,
-            PROTO_TCP,
-            TCP_SEG_BUF.as_ptr(),
-            seg_len,
-        );
+        hdr.checksum = tcp_checksum(CONFIG.ip, dst_ip, PROTO_TCP, p, seg_len);
 
-        ipv4_send(dst_ip, PROTO_TCP, &TCP_SEG_BUF[..seg_len]);
+        ipv4_send(dst_ip, PROTO_TCP, core::slice::from_raw_parts(p, seg_len));
     }
 }
 
 fn send_rst(dst_ip: Ipv4Addr, src_port: u16, dst_port: u16, seq: u32, ack: u32) {
+    let mut buf = core::mem::MaybeUninit::<[u8; 20]>::uninit();
+    let p = buf.as_mut_ptr() as *mut u8;
     unsafe {
-        let hdr = &mut *(TCP_RST_BUF.as_mut_ptr() as *mut TcpHeader);
+        let hdr = &mut *(p as *mut TcpHeader);
         hdr.src_port = htons(src_port);
         hdr.dst_port = htons(dst_port);
         hdr.seq = htonl(seq);
@@ -222,9 +223,9 @@ fn send_rst(dst_ip: Ipv4Addr, src_port: u16, dst_port: u16, seq: u32, ack: u32) 
         hdr.checksum = 0;
         hdr.urgent = 0;
 
-        hdr.checksum = tcp_checksum(CONFIG.ip, dst_ip, PROTO_TCP, TCP_RST_BUF.as_ptr(), 20);
+        hdr.checksum = tcp_checksum(CONFIG.ip, dst_ip, PROTO_TCP, p, 20);
 
-        ipv4_send(dst_ip, PROTO_TCP, &TCP_RST_BUF[..20]);
+        ipv4_send(dst_ip, PROTO_TCP, core::slice::from_raw_parts(p, 20));
     }
 }
 

@@ -20,10 +20,7 @@ pub fn check_shutdown() -> bool {
 
 pub fn wait_for_events() {
     // Flush any pending TX from APs before considering sleep.
-    if drivers::virtio_net::has_pending_tx() {
-        drivers::virtio_net::flush_tx_staging();
-        return;
-    }
+    drivers::virtio_net::flush_tx_staging();
 
     if drivers::virtio_net::irq_idle_supported() {
         unsafe { arch_mask_irq() };

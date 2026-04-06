@@ -593,6 +593,8 @@ pub fn send(data: &[u8]) {
             kernel::percpu::get(id).tx_staging.push(data);
         }
         TX_PENDING.store(true, Ordering::Release);
+        // Wake core 0 so it flushes TX staging promptly.
+        kernel::send_ipi(0);
     }
 }
 

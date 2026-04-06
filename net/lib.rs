@@ -56,8 +56,8 @@ pub fn poll() {
             kernel::serial::puts(b" cores)\n");
         }
 
-        // Clear wakeup flags.
-        for i in 0..percpu::MAX_CORES {
+        // Clear wakeup flags (only for active cores).
+        for i in 0..num_cores as usize {
             WAKEUP[i] = false;
         }
     }

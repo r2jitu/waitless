@@ -49,20 +49,21 @@ pub fn send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
     }
 
     let dst = Ipv4Addr::from(dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]);
-    static mut TX_BUF: [u8; 1480] = [0; 1480];
+    let mut buf = core::mem::MaybeUninit::<[u8; 1480]>::uninit();
+    let p = buf.as_mut_ptr() as *mut u8;
 
     unsafe {
-        let hdr = &mut *(TX_BUF.as_mut_ptr() as *mut UdpHeader);
+        let hdr = &mut *(p as *mut UdpHeader);
         hdr.src_port = htons(src_port);
         hdr.dst_port = htons(dst_port);
         hdr.length = htons(udp_len as u16);
         hdr.checksum = 0;
 
-        core::ptr::copy_nonoverlapping(data.as_ptr(), TX_BUF.as_mut_ptr().add(8), data.len());
+        core::ptr::copy_nonoverlapping(data.as_ptr(), p.add(8), data.len());
 
-        hdr.checksum = tcp_checksum(CONFIG.ip, dst, PROTO_UDP, TX_BUF.as_ptr(), udp_len);
+        hdr.checksum = tcp_checksum(CONFIG.ip, dst, PROTO_UDP, p, udp_len);
 
-        ipv4_send(dst, PROTO_UDP, &TX_BUF[..udp_len]);
+        ipv4_send(dst, PROTO_UDP, core::slice::from_raw_parts(p, udp_len));
     }
 }
 
