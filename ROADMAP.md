@@ -617,12 +617,14 @@ pub fn recv(buf: &mut [u8]) -> Option<(Ipv4Addr, u16, usize)>
 ```
 Maybe 100 lines. Sits between IPv4 and QUIC.
 
-- [ ] UDP send/receive implementation
-- [ ] Checksum calculation
-- [ ] `//net:udp` Bazel target (deps: ipv4)
+- [x] UDP send/receive implementation (net/udp.rs)
+- [x] Checksum calculation (reuses tcp_checksum with proto=17)
+- [x] Port-based dispatch: bind(port, handler), up to 8 handlers
+- [x] ipv4_receive dispatches PROTO_UDP to udp_receive
+- [ ] `//net:udp` as separate Bazel target (currently part of //net:net)
 
 **Tests:**
-- [ ] Unit: UDP header checksum, parse/build
+- [x] Unit: UDP checksum computation + verification
 - [ ] Integration: send/receive UDP packets through QEMU (netcat or custom tool)
 
 **Try it:**
