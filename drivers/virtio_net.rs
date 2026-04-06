@@ -604,9 +604,10 @@ pub fn has_pending_tx() -> bool {
 /// Flush all per-core TX staging buffers into the VirtIO TX queue.
 /// Called by core 0 during its poll cycle.
 pub fn flush_tx_staging() {
-    if !TX_PENDING.swap(false, Ordering::Acquire) {
+    if !TX_PENDING.load(Ordering::Acquire) {
         return;
     }
+    TX_PENDING.store(false, Ordering::Release);
     let n = kernel::percpu::num_cores();
     for i in 1..n {
         unsafe {
