@@ -1,4 +1,4 @@
-load("@rules_rust//rust:defs.bzl", "rust_library")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 
 package(default_visibility = ["//visibility:public"])
@@ -6,6 +6,7 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "kernel",
     srcs = [
+        "deque.rs",
         "lib.rs",
         "mm.rs",
         "serial.rs",
@@ -27,4 +28,12 @@ rust_library(
         "//conditions:default": [],
     }),
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+)
+
+# Host-native unit test for the Chase-Lev work-stealing deque.
+rust_test(
+    name = "deque_test",
+    srcs = ["deque.rs"],
+    crate_root = "deque.rs",
+    rustc_flags = ["-Cpanic=unwind"],
 )
