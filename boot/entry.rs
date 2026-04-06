@@ -26,7 +26,9 @@ core::arch::global_asm!(include_str!("x86_64/idt_stubs.S"), options(att_syntax))
 core::arch::global_asm!(include_str!("aarch64/boot.S"));
 
 
-use kernel::{types, serial, mm, fdt, mmu, exceptions};
+use kernel::{types, serial, mm};
+#[cfg(target_arch = "aarch64")]
+use kernel::{fdt, mmu, exceptions};
 use types::{BootInfo, MemoryRegion, Protocol, MEM_AVAILABLE, MEM_RESERVED, MAX_MEMORY_REGIONS};
 
 // ============================================================================

@@ -6,12 +6,14 @@ use crate::{
     log, dsb_st, dsb_ld, dsb_sy,
     mmio_read32, mmio_write32, mmio_read16, mmio_write16, mmio_read8, mmio_write8,
     virtio_read32, virtio_write32, virtio_read16, virtio_write16, virtio_read8, virtio_write8,
-    vz_config_delay, map_device_range,
+    vz_config_delay,
 };
 use crate::pci::{
     PCI_DEVICES, pci_read_config, pci_write_config, pci_find_device,
     pci_enable_bus_mastering_inner, pci_read_bar64,
 };
+#[cfg(target_arch = "aarch64")]
+use crate::map_device_range;
 use kernel::mm::{alloc_frame, phys_to_virt};
 
 // ============================================================================

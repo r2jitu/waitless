@@ -17,8 +17,11 @@ use core::sync::atomic::{compiler_fence, Ordering};
 // Kernel crate dependencies — direct Rust calls
 // ============================================================================
 extern crate kernel;
-use kernel::{exceptions as kernel_exceptions, fdt as kernel_fdt, mm as kernel_mm, mmu as kernel_mmu, serial as kernel_serial};
+use kernel::{mm as kernel_mm, serial as kernel_serial};
 use kernel_mm::{alloc_frame, phys_to_virt, virt_to_phys, kmalloc, kfree};
+#[cfg(target_arch = "aarch64")]
+use kernel::{exceptions as kernel_exceptions, fdt as kernel_fdt, mmu as kernel_mmu};
+#[cfg(target_arch = "aarch64")]
 use kernel_mmu::map_device_range;
 
 #[cfg(target_arch = "x86_64")]

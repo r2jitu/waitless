@@ -1,18 +1,21 @@
-// kernel/lib.rs — Crate root for the unified kernel library.
+// kernel/lib.rs — Unified kernel library crate.
 //
-// Combines types, serial, memory management, FDT, MMU, exceptions,
-// and x86_64 arch init into a single `kernel` crate with modules.
+// Platform-independent modules at the top level, arch-specific
+// modules in x86_64/ and aarch64/ subdirectories.
 
 #![no_std]
 #![allow(static_mut_refs)]
-#![allow(dead_code)]  // FDT/MMU code is aarch64-only, x86_64 code is x86-only
 
 pub mod types;
-pub mod fdt;
-pub mod mmu;
 pub mod serial;
 pub mod mm;
-pub mod exceptions;
 
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;
+
+#[cfg(target_arch = "aarch64")]
+pub mod aarch64;
+
+// Re-export arch modules so callers can use kernel::fdt, kernel::mmu, etc.
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::{fdt, mmu, exceptions};

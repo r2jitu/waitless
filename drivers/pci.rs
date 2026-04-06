@@ -1,6 +1,8 @@
 // drivers/pci.rs — PCI config space access, bus scan, BAR assignment
 
-use crate::{log, mmio_read32, mmio_write32, mmio_read16, mmio_write16, map_device_range, kernel_fdt};
+use crate::{log, mmio_read32, mmio_write32, mmio_read16, mmio_write16};
+#[cfg(target_arch = "aarch64")]
+use crate::{map_device_range, kernel_fdt};
 
 #[cfg(target_arch = "x86_64")]
 use crate::{outl, inl};

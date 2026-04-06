@@ -8,8 +8,9 @@ use crate::{
     log, dsb_st,
     virtio_read32, virtio_write32, virtio_read8, virtio_write8,
     vz_init_delay,
-    kernel_exceptions, kernel_fdt,
 };
+#[cfg(target_arch = "aarch64")]
+use crate::{kernel_exceptions, kernel_fdt};
 use crate::pci::{PCI_DEVICES, pci_read_config, pci_find_device, pci_enable_bus_mastering_inner};
 use crate::virtio::{
     VPCI_DEVICES, Virtqueue,
