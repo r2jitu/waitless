@@ -68,17 +68,18 @@ circular dependencies, then new protocols get their own targets.
 - [ ] Split `//uni` into per-feature targets (deferred — tied to Phase 2 event loop)
 
 **Tests:**
-- [x] Unit: byte order roundtrips, address types, RFC 1071 checksums (8 tests)
-- [x] Integration: existing HTTP smoke tests pass on x86_64 + aarch64
-- [ ] Unit: ethernet frame parse/build
-- [ ] Unit: ARP request/reply encode/decode
-- [ ] Unit: TCP segment parse
-- [ ] Unit: DHCP option parsing
+- [x] Unit: byte order roundtrips, address types, RFC 1071 checksums (9 tests)
+- [x] Integration: existing HTTP + UDP smoke tests pass on x86_64 + aarch64
+- [x] Unit: ethernet frame parse/build (2 tests)
+- [x] Unit: ARP request encoding, reply decoding (2 tests)
+- [x] Unit: IPv4 header parse, checksum, version rejection (3 tests)
+- [x] Unit: TCP SYN segment parse, flag decode (2 tests)
+- [x] Unit: DHCP magic cookie, option parsing, end marker (3 tests)
 
 **Try it:**
 ```bash
-bazel test //net:types_test         # 8 unit tests (host-native)
-bazel test //apps/webserver:test    # regression check (QEMU)
+bazel test //net:types_test //net:protocol_tests  # 21 unit tests (host-native)
+bazel test //apps/webserver:test                  # HTTP + UDP echo (QEMU)
 ```
 
 ### 1b. Add crate_universe for crates.io dependencies
@@ -88,7 +89,7 @@ Required for pulling in crypto (`ring`), QUIC (`quiche`/`quinn`), etc.
 - [x] Add `crate_universe` to MODULE.bazel (annotation-based, no Cargo.toml)
 - [x] Verified bitflags resolves and compiles for x86_64-unknown-none
 - [x] Fix aarch64-unknown-none platform gap (patched rules_rust triple_mappings.bzl)
-- [ ] Use a crates.io dep in the unikernel and boot it
+- [x] Use a crates.io dep in the unikernel and boot it (bitflags in net/tcp.rs)
 
 **Try it:**
 ```bash
