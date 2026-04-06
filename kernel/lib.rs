@@ -10,6 +10,7 @@ pub mod types;
 pub mod serial;
 pub mod mm;
 pub mod time;
+pub mod bump;
 pub mod deque;
 pub mod spsc;
 pub mod timer;
