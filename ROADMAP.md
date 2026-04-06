@@ -8,7 +8,7 @@ optional via Bazel deps — you pick exactly what you need.
 
 - **Modern over legacy**: QUIC over TCP, IPv6 over IPv4, NDP over ARP
 - **Deps as feature selection**: app declares what it needs via Bazel deps — unused protocols never compile
-- **No preemption, no locks**: cooperative per-core work queues with work stealing
+- **No preemption, no locks**: cooperative scheduling, lock-free data structures only
 - **Lean by default**: start from zero, add only what's needed
 
 ---
@@ -111,61 +111,127 @@ hash. MSI-X routes interrupts to the owning core. No software routing.
 Zero contention, zero software overhead.
 
 **Tier 2 — Software distribution (VZ, or any single-queue platform):**
-One core polls the single RX queue (not dedicated — it also does work).
-Incoming packets are classified by flow hash and dispatched to the
-owning core's work queue. The polling core rotates — whoever wakes
-first from WFI on the net IRQ polls that batch.
+Core 0 owns the single RX/TX VirtIO queue pair. On VZ, INTx always
+routes to core 0, so it is always the core that wakes on RX interrupts.
+
+**RX distribution**: core 0 drains the entire RX queue in one batch,
+classifies packets by flow hash, and enqueues them to target cores'
+work queues. One IPI per core that received packets (not per packet)
+amortizes the IPI cost.
 
 ```rust
-// Tier 2: single-queue software distribution
+// Tier 2: batched single-queue RX distribution (runs on core 0)
 fn poll_single_rx_queue() {
+    let mut wakeup = [false; MAX_CORES];
+    // Drain entire RX queue in one batch — classify and enqueue ALL packets
     while let Some(pkt) = rx_queue.poll() {
         let flow = hash(pkt.src_ip, pkt.dst_ip, pkt.src_port, pkt.dst_port);
         let target_core = flow % num_cores;
-        if target_core == my_core {
-            process_packet(pkt);          // Handle locally
-        } else {
-            cores[target_core].queue.push(Task::Packet(pkt));
-            if cores[target_core].sleeping {
-                send_ipi(target_core);    // Wake the target
-            }
+        // Enqueue to target core's inbox (SPSC: core 0 writes, target reads).
+        // Don't process inline — keep poll fast so all packets get distributed.
+        cores[target_core].inbox.push(Task::Packet(pkt));
+        wakeup[target_core] = true;
+    }
+    // One IPI per remote core that has new work (not per packet)
+    for core in 1..num_cores {  // skip self (core 0)
+        if wakeup[core] && cores[core].sleeping {
+            send_ipi(core);
         }
     }
 }
 ```
 
+**TX path**: the single VirtIO TX ring is NOT thread-safe. Each core
+has a per-core TX staging buffer (regular memory, no contention).
+Core 0 drains all per-core TX staging buffers into the VirtIO TX ring
+during its poll phase. Other cores write to their staging buffer and
+set a flag; core 0 flushes on next poll. No locks needed.
+
+```rust
+// Per-core TX staging (any core writes to its own, core 0 flushes all)
+fn tx_send(pkt: &[u8]) {
+    my_core.tx_staging.push(pkt);  // lock-free, only this core writes
+    TX_PENDING.store(true, Relaxed);
+}
+
+// Core 0 flushes during poll
+fn flush_all_tx_staging() {
+    if !TX_PENDING.swap(false, Relaxed) { return; }
+    for core in 0..num_cores {
+        while let Some(pkt) = cores[core].tx_staging.pop() {
+            virtio_tx_queue.submit(pkt);
+        }
+    }
+    virtio_tx_queue.notify();
+}
+```
+
+**Tier 2 throughput ceiling**: core 0 handles all RX distribution and
+TX flushing. Under extreme packet rates, core 0 becomes the bottleneck.
+This is inherent to single-queue hardware — no software design can
+avoid it. Tier 2 is for VZ (dev/test). Production targets Tier 1.
+
 **Detection at boot**: check if `VIRTIO_NET_F_MQ` is offered. If yes ->
 Tier 1 (per-core queues). If no -> Tier 2 (software distribution).
 Same event loop code, different poll implementation.
 
-### Architecture: per-core event loop (poll after every task)
+### Architecture: per-core event loop (batched tasks between polls)
 
 ```rust
+const TASK_BATCH: usize = 32;  // max tasks between polls
+
 // Every core runs this — identical loop
 loop {
-    // 1. Poll MY queues — each core owns its own hardware queue pair
-    //    No contention, no try-lock needed
-    poll_virtio_net_rx(&my_rx_queue);   // network packets
+    // 1. Poll IO sources (non-blocking, tier-aware)
+    match tier {
+        Tier1 => {
+            poll_virtio_net_rx(&my_rx_queue);  // each core polls own queue
+            // TX: each core owns its own VirtIO TX queue, send directly
+        }
+        Tier2 if my_core == 0 => {
+            poll_single_rx_queue();   // core 0: drain + distribute to all cores
+            flush_all_tx_staging();   // core 0: drain per-core TX staging -> VirtIO TX
+        }
+        Tier2 => {}  // non-core-0: no VirtIO queue to poll; work arrives via IPI
+    }
+    // Drain cross-core inbox into local pinned queue (Tier 2: packets from core 0)
+    while let Some(task) = my_inbox.pop() {
+        my_pinned_queue.push(task);
+    }
     poll_virtio_blk(&my_blk_queue);     // storage completions (future)
-    poll_timers(&my_timer_wheel);       // expired timers
+    poll_timers(&my_timer_wheel);       // drain pending_timers MPSC, fire expired
 
-    // 2. Process one task from my work queue
-    if let Some(task) = my_queue.pop() {
-        task.run();
-        continue;  // poll again immediately — keeps IO responsive
+    // 2. Process pinned tasks first (connection-bound, latency-sensitive)
+    //    Then stealable tasks. Batch up to TASK_BATCH before re-polling.
+    for _ in 0..TASK_BATCH {
+        if let Some(task) = my_pinned_queue.pop() {
+            task.run();
+        } else if let Some(task) = my_stealable_deque.pop() {
+            task.run();
+        } else {
+            break;
+        }
     }
-    // 3. Steal work if idle (tasks only, not connections)
-    if let Some(task) = steal_from_busiest() {
-        task.run();
-        continue;  // poll again after stolen task
+
+    // 3. If both queues empty, try to steal (stealable deques only)
+    if my_pinned_queue.is_empty() && my_stealable_deque.is_empty() {
+        if let Some(task) = steal_stealable_from_busiest() {
+            task.run();
+            continue;  // back to poll after stolen work
+        }
+        // 4. Nothing to do — sleep until interrupt
+        wfi();  // wake on virtio IRQ, IPI, or timer
     }
-    // 4. Nothing to do — sleep until interrupt
-    wfi();  // wake on virtio IRQ, IPI, or timer
 }
 ```
 
-Every core polls, every core processes, every core can steal. Polling
-happens after every task completion, ensuring IO is serviced promptly.
+**Tier-aware polling**: in Tier 1, each core polls its own VirtIO queue.
+In Tier 2, only core 0 touches VirtIO — other cores receive work via
+their pinned queues (populated by core 0's distribution) and wake via IPI.
+
+**Two-queue processing**: pinned tasks first (connection work is
+latency-sensitive), then stealable tasks. Batch up to 32 between polls —
+amortizes poll cost under load, exits early when idle.
 
 ### Interrupt handling — just a wakeup, never real work
 
@@ -202,26 +268,102 @@ Back to WFI — zero CPU until next interrupt
 Cores NEVER spin. When there's no work, they sleep (WFI on ARM,
 HLT on x86). Wake cost is one interrupt latency (~microseconds).
 
-### Work queue + stealing
+### Per-core state + work queue
 
 ```rust
 struct PerCore {
-    queue: WorkQueue,         // lock-free SPSC ring
-    timer_wheel: TimerWheel,  // per-core deadlines
-    connections: ConnPool,    // connections owned by this core
+    inbox: SpscRing,             // Tier 2: core 0 pushes packets here; this core drains
+    pinned_queue: SpscRing,      // connection-bound tasks, only this core reads/writes
+    stealable_deque: ChaseLevDeque,  // pure-compute tasks, thieves steal from here
+    timer_wheel: TimerWheel,     // only this core polls; fires enqueue tasks locally
+    pending_timers: MpscQueue,   // any core can push timers; this core drains into wheel
+    tx_staging: SpscRing,        // this core's outbound TX packets (Tier 2)
+    connections: ConnPool,       // connections owned by this core
+    listener: ListenerState,     // per-core accept state for incoming connections
 }
 ```
+
+**Three queues per core** — each with strict ownership rules:
+
+- **`inbox`** (SPSC ring): Tier 2 cross-core delivery. Core 0 is the
+  only writer (RX distribution). Owning core is the only reader. Drained
+  into `pinned_queue` at start of each poll cycle. Unused in Tier 1.
+- **`pinned_queue`** (SPSC ring): only the owning core pushes and pops.
+  No atomics, no stealing. Connection-bound tasks go here.
+- **`stealable_deque`** (Chase-Lev): owner pushes/pops one end (LIFO,
+  cache-friendly), thieves steal from the other end (FIFO, single CAS).
+  Pure-compute tasks go here. Thieves only see this deque.
+
+A Chase-Lev deque can't selectively skip tasks — a steal CAS gets
+whatever's at the bottom. Separate queues ensure thieves never touch
+pinned tasks and cross-core delivery never corrupts local state.
+
+Owner processes: drain inbox -> pinned tasks -> stealable tasks.
+Thieves only touch the stealable deque.
+
+### Task classification: pinned vs stealable
+
+Not all tasks can be stolen. Tasks that touch connection state must run
+on the owning core. Tasks that are pure compute can run anywhere.
+
+- **Pinned tasks**: access connection buffers, TCP state, timers.
+  Examples: parse HTTP request, advance TCP state machine, write response
+  to connection's TX buffer. Must run on the owning core — NOT stealable.
+- **Stealable tasks**: pure computation, no connection state access.
+  Examples: TLS encrypt/decrypt, QUIC packet encryption, gzip compression,
+  template rendering. Can safely run on any core.
+
+```rust
+enum Task {
+    Pinned(PinnedTask),     // only owning core can run
+    Stealable(StealTask),   // any core can run
+}
+```
+
+Thieves only steal `Stealable` tasks from other cores' deques. `Pinned`
+tasks are invisible to thieves. For a simple HTTP server, most tasks are
+pinned (responses are cheap). Work stealing becomes valuable for
+CPU-heavy operations: TLS/QUIC crypto, compression, complex rendering.
+
+### Connection pinning
 
 - **Connections pinned to cores** via RSS hash(src_ip, dst_ip, src_port,
   dst_port). All packets for a connection arrive on the same core's queue.
   Connection state (buffers, timers) stays local — no migration needed.
+- **Per-core listeners**: `server.run(port)` replicates listener state on
+  all cores. When a SYN arrives on core N (via RSS hash), core N creates
+  the connection locally. No shared listening socket. Same pattern as
+  Linux `SO_REUSEPORT` — each core accepts independently.
+
+### Timers and cross-core timer creation
+
 - **Timers are per-core**: each connection's timers live on the owning
   core's timer wheel. They fire locally and enqueue tasks locally.
-  A thief might steal the resulting task, but the timer itself stays put.
-- **Work stealing steals tasks, not connections**: an idle core peeks at
-  other cores' queues via atomic tail-steal (single CAS). It runs the
-  stolen task (e.g., "generate HTTP response") to completion, then returns
-  to its own work. Connection state doesn't move.
+- **Cross-core timer creation**: a stolen task running on core B may need
+  to arm a timer for a connection owned by core A. It pushes the timer
+  to core A's `pending_timers` MPSC queue (lock-free, any core can push).
+  Core A drains `pending_timers` into its timer wheel during `poll_timers()`.
+  No IPI needed — the timer will fire on core A's next poll cycle.
+
+```rust
+fn poll_timers(&mut self) {
+    // 1. Drain remotely-submitted timers into my wheel
+    while let Some(timer) = self.pending_timers.pop() {
+        self.timer_wheel.insert(timer);
+    }
+    // 2. Fire expired timers — connection-bound, so pinned queue
+    while let Some(task) = self.timer_wheel.poll() {
+        self.pinned_queue.push(task);
+    }
+}
+```
+
+### Work stealing
+
+- **Work stealing steals stealable tasks only**: an idle core peeks at
+  other cores' deques via atomic tail-steal (single CAS). It runs the
+  stolen task to completion, then returns to its own work. Connection
+  state doesn't move — the task is pure compute.
 - **IPI**: wake a sleeping core when stealing finds work.
 
 ### Why imbalance self-corrects (no migration needed)
@@ -234,14 +376,32 @@ struct PerCore {
   AND generating CPU-heavy tasks. Unlikely for a webserver. Escape hatch:
   reprogram RSS indirection table (future optimization, not day-1).
 
-### Why no synchronization
+### Synchronization points (minimal but real)
 
-- Connection state lives on ONE core (pinned by RSS hash)
-- VirtIO queues are per-core (no shared queue contention)
-- Global state (ARP cache, routing table) is write-once at boot
-- TX: each core has its own TX queue (virtio multi-queue)
-- Only sync point: work stealing (one atomic CAS per steal attempt)
-- Timer wheels are per-core (no global timer queue)
+**No synchronization needed:**
+- Connection state: lives on ONE core (pinned by RSS hash), no sharing
+- VirtIO queues: per-core in Tier 1, core-0-owned in Tier 2
+- Timer wheels: per-core, only owning core reads
+- Routing table: write-once at boot, read-only after
+
+**Minimal synchronization required:**
+- **Work stealing**: one atomic CAS per steal attempt (Chase-Lev deque).
+  Only on the steal path — owner push/pop is non-atomic.
+- **Pending timers MPSC queue**: atomic push (any core), non-atomic pop
+  (only owning core). Lock-free, bounded cost.
+- **ARP/NDP cache**: entries expire and refresh. Double-buffer pattern —
+  two fixed-size tables, writer fills the inactive one, atomically swaps
+  an index (`AtomicU8::store`). Readers load index and read. No allocation,
+  no free, no grace period. ARP updates are rare (seconds), so the copy
+  cost is negligible. Both tables are always valid (one current, one stale).
+- **Inbox + TX staging** (Tier 2): SPSC rings. Core 0 writes to other
+  cores' inboxes (one writer, one reader). Each core writes its own TX
+  staging (one writer), core 0 reads (one reader). Acquire/release on
+  index updates, no CAS.
+- **Shutdown flag**: one `AtomicBool`, checked in event loop. Set by
+  whichever core detects 0x03 on serial, then IPI all cores to wake.
+- **DHCP lease state**: single-writer (core 0 handles DHCP). IP address
+  change requires updating all cores. Use same atomic-swap pattern as ARP.
 
 ### Task model evolution: closures -> async/await
 
@@ -297,15 +457,24 @@ per-core queue pair, hardware RSS/MSI-X distribution, poll in the loop.
 
 ### 2a. SMP boot
 
-- [ ] aarch64 AP startup via PSCI CPU_ON
-- [ ] x86_64 AP startup via INIT-SIPI-SIPI (APIC)
-- [ ] Per-core stack allocation (fixed-size, allocated at boot)
-- [ ] Per-core work queue (lock-free ring buffer)
-- [ ] Per-core timer wheel
-- [ ] Per-core heap slab (local allocations, no contention)
-- [ ] Core 0 bootstraps, then becomes a regular worker
+Boot sequence: core 0 completes ALL initialization (memory, devices,
+network config) BEFORE starting secondary cores. No boot barrier needed —
+secondary cores simply don't exist until core 0 calls PSCI CPU_ON /
+INIT-SIPI-SIPI after init is done.
+
+- [ ] Core 0: complete all init (mm, devices, DHCP, VirtIO queues)
+- [ ] Core 0: allocate per-core state for all cores (stacks, queues, timers)
+- [ ] aarch64: start APs via PSCI CPU_ON (after init complete)
+- [ ] x86_64: start APs via INIT-SIPI-SIPI (after init complete)
+- [ ] Each AP: init own GIC redistributor / APIC, enter event loop
+- [ ] Per-core stack allocation (fixed-size, allocated by core 0 at boot)
+- [ ] Per-core Chase-Lev deque
+- [ ] Per-core timer wheel + pending_timers MPSC queue
+- [ ] Per-core TX staging buffer (Tier 2)
+- [ ] Per-core heap slab (bump allocator for task-scoped allocations)
 - [ ] x86_64: APIC init (replace legacy PIC for multi-core)
 - [ ] aarch64: per-core GIC redistributor init
+- [ ] Graceful shutdown: serial 0x03 detected -> set AtomicBool -> IPI all cores
 
 **Tests:**
 - [ ] Integration: `test_smp_boot` — boot with `-smp 4`, verify all 4 cores reach event loop (each prints "core N online")
@@ -333,8 +502,11 @@ per-core queue pair, hardware RSS/MSI-X distribution, poll in the loop.
 
 - [ ] Detect single-queue at boot (`VIRTIO_NET_F_MQ` not offered)
 - [ ] Flow hash function: hash(src_ip, dst_ip, src_port, dst_port)
-- [ ] Software packet dispatch: classify + enqueue to target core
-- [ ] IPI to wake target core when dispatching cross-core
+- [ ] Per-core inbox (SPSC: core 0 writes, owning core reads) for RX delivery
+- [ ] Batched RX distribution: drain entire RX queue, classify, enqueue to inbox
+- [ ] Batched IPI: one IPI per core that received packets (not per packet)
+- [ ] Per-core TX staging buffers (SPSC rings in regular memory)
+- [ ] Core 0 TX flush: drain all per-core TX staging into VirtIO TX ring
 - [ ] Tier auto-detection: MQ offered -> Tier 1, else -> Tier 2
 
 **Tests:**
@@ -343,26 +515,33 @@ per-core queue pair, hardware RSS/MSI-X distribution, poll in the loop.
 
 ### 2d. Work stealing
 
-- [ ] Lock-free SPSC work queue (per-core)
-- [ ] Atomic tail-steal (single CAS) for cross-core stealing
-- [ ] Steal from busiest core (check queue depths)
+- [ ] Per-core SPSC ring for pinned tasks (no atomics on fast path)
+- [ ] Per-core Chase-Lev deque for stealable tasks (owner LIFO, thieves FIFO CAS)
+- [ ] Event loop: drain pinned queue first, then stealable deque
+- [ ] Thieves only access other cores' stealable deques (never pinned queues)
+- [ ] Steal from busiest core (check stealable deque depths)
 - [ ] IPI to wake sleeping core when work is available
 
 **Tests:**
-- [ ] Unit: ring buffer SPSC ops (push, pop, boundary conditions)
-- [ ] Unit: steal protocol (push N items, steal from other end, verify no lost items)
-- [ ] Integration: `test_work_stealing` — load one core, verify idle cores steal tasks
+- [ ] Unit: SPSC ring ops (push, pop, full, empty)
+- [ ] Unit: Chase-Lev deque ops (push, pop, steal, boundary conditions)
+- [ ] Unit: concurrent steal (multiple thieves, verify no lost/duplicated items)
+- [ ] Integration: `test_work_stealing` — load one core with stealable tasks, verify idle cores steal
+- [ ] Integration: `test_pinned_not_stolen` — pinned tasks stay on owning core under load
 
 ### 2e. Per-core timer wheels
 
-- [ ] Timer wheel data structure (per-core)
+- [ ] Timer wheel data structure (per-core, only owning core reads)
 - [ ] Insert / fire / cancel operations
-- [ ] Poll timers in event loop
+- [ ] `pending_timers` MPSC queue: stolen tasks push timers for remote connections
+- [ ] `poll_timers()`: drain pending_timers into wheel, then fire expired
 - [ ] Timer-driven wakeup (per-core architectural timer)
 
 **Tests:**
 - [ ] Unit: timer wheel insert, fire ordering, cancel
+- [ ] Unit: MPSC pending_timers push from multiple cores, drain on owner
 - [ ] Integration: `test_timer_fire` — set timers on different cores, verify correct fire times
+- [ ] Integration: `test_cross_core_timer` — stolen task arms timer on remote core, verify it fires
 
 ### 2f. Task trait + closure-based tasks
 
