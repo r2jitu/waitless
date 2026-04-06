@@ -161,10 +161,15 @@ fn vpci_parse_caps(dev: &mut VirtioPciDevice) -> bool {
 }
 
 /// Find a modern virtio-pci device by type (1=net, 3=console).
+/// Tries non-transitional ID (0x1040+type) first, then transitional
+/// ID (0x1000-range) which QEMU uses by default.
 pub(crate) fn vpci_find(virtio_device_type: u16) -> Option<usize> {
-    let target_id = 0x1040 + virtio_device_type;
+    let modern_id = 0x1040 + virtio_device_type;
+    // Transitional IDs: net=0x1000, block=0x1001, console=0x1003
+    let transitional_id = 0x1000 + virtio_device_type - 1;
 
-    let pci_idx = find_device(0x1AF4, target_id)?;
+    let pci_idx = find_device(0x1AF4, modern_id)
+        .or_else(|| find_device(0x1AF4, transitional_id))?;
 
     unsafe {
         if VPCI_DEVICE_COUNT >= VIRTIO_PCI_MAX_DEVICES { return None; }

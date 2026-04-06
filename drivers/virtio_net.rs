@@ -516,12 +516,15 @@ pub fn init() -> bool {
     #[cfg(target_arch = "aarch64")]
     {
         if init_mmio() { return true; }
-        return init_pci_modern();
     }
+    // Try modern PCI first (supports multi-queue), fall back to legacy.
+    if init_pci_modern() { return true; }
     #[cfg(target_arch = "x86_64")]
     {
         return init_legacy_pci();
     }
+    #[cfg(not(target_arch = "x86_64"))]
+    false
 }
 
 pub fn get_mac(mac_out: *mut u8) {
