@@ -1,4 +1,4 @@
-load("@rules_rust//rust:defs.bzl", "rust_library")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 
 package(default_visibility = ["//visibility:public"])
@@ -12,6 +12,13 @@ rust_library(
     crate_root = "types.rs",
     crate_name = "net_types",
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+)
+
+# Host-native unit tests for types, byte order, and checksum.
+rust_test(
+    name = "types_test",
+    crate = ":types",
+    rustc_flags = ["-Cpanic=unwind"],
 )
 
 # Full network stack: ethernet + ARP + IPv4 + TCP + DHCP.

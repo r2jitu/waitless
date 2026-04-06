@@ -3,9 +3,7 @@
 // This module has no dependencies on other net/ modules or external crates.
 // It can be compiled as a standalone crate (//net:types).
 
-// When compiled as a standalone crate (//net:types), no_std is needed.
-// When compiled as a module of //net:net, the parent's no_std applies.
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 // ── Byte-order utilities ─────────────────────────────────────────────────────
 
@@ -20,7 +18,7 @@ pub fn ntohl(n: u32) -> u32 { u32::from_be(n) }
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct MacAddr {
     pub bytes: [u8; 6],
@@ -32,7 +30,7 @@ impl MacAddr {
 
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct Ipv4Addr {
     pub addr: u32, // network byte order
@@ -115,4 +113,88 @@ pub fn tcp_checksum(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, data: *const u8, le
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
     !(sum as u16)
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byte_order_roundtrip() {
+        assert_eq!(ntohs(htons(0x1234)), 0x1234);
+        assert_eq!(ntohl(htonl(0x12345678)), 0x12345678);
+        assert_eq!(htons(80), 80u16.to_be());
+        assert_eq!(ntohs(80u16.to_be()), 80);
+    }
+
+    #[test]
+    fn mac_addr_constants() {
+        assert_eq!(MacAddr::ZERO.bytes, [0; 6]);
+        assert_eq!(MacAddr::BROADCAST.bytes, [0xff; 6]);
+        assert_ne!(MacAddr::ZERO, MacAddr::BROADCAST);
+    }
+
+    #[test]
+    fn ipv4_addr_from_octets() {
+        let addr = Ipv4Addr::from(10, 0, 2, 15);
+        assert_eq!(addr.octets(), [10, 0, 2, 15]);
+    }
+
+    #[test]
+    fn ipv4_addr_constants() {
+        assert_eq!(Ipv4Addr::ANY.addr, 0);
+        assert_eq!(Ipv4Addr::BROADCAST.addr, 0xFFFFFFFF);
+    }
+
+    #[test]
+    fn ipv4_addr_equality() {
+        let a = Ipv4Addr::from(192, 168, 1, 1);
+        let b = Ipv4Addr::from(192, 168, 1, 1);
+        let c = Ipv4Addr::from(192, 168, 1, 2);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn checksum_zeros() {
+        // All-zero data should checksum to 0xFFFF
+        let data = [0u8; 20];
+        assert_eq!(checksum(data.as_ptr(), data.len()), 0xFFFF);
+    }
+
+    #[test]
+    fn checksum_ones() {
+        // All-0xFF data (20 bytes = 10 words of 0xFFFF)
+        // Folded sum = 0xFFFF, complement = 0x0000
+        let data = [0xFFu8; 20];
+        assert_eq!(checksum(data.as_ptr(), data.len()), 0x0000);
+    }
+
+    #[test]
+    fn checksum_odd_length() {
+        let data = [0x01, 0x02, 0x03];
+        // sum = 0x0201 + 0x03 = 0x0204, complement = 0xFDFB
+        assert_eq!(checksum(data.as_ptr(), data.len()), 0xFDFB);
+    }
+
+    #[test]
+    fn checksum_verification() {
+        // Compute checksum of an IPv4-like header, then verify it
+        // produces 0 when re-checked with the checksum filled in.
+        let hdr: [u8; 20] = [
+            0x45, 0x00, 0x00, 0x3C,
+            0x1C, 0x46, 0x40, 0x00,
+            0x40, 0x06, 0x00, 0x00,  // checksum field = 0
+            0xAC, 0x10, 0x0A, 0x63,
+            0xAC, 0x10, 0x0A, 0x0C,
+        ];
+        let cksum = checksum(hdr.as_ptr(), hdr.len());
+        // Fill in checksum (LE byte order) and re-verify
+        let mut verified = hdr;
+        verified[10] = (cksum & 0xFF) as u8;
+        verified[11] = (cksum >> 8) as u8;
+        assert_eq!(checksum(verified.as_ptr(), verified.len()), 0);
+    }
 }
