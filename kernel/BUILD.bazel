@@ -18,6 +18,7 @@ rust_library(
         "types.rs",
     ] + select({
         "//bazel/platforms:x86_64": [
+            "x86_64/apic.rs",
             "x86_64/gdt.rs",
             "x86_64/idt.rs",
             "x86_64/mod.rs",

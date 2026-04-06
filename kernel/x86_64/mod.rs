@@ -3,5 +3,5 @@
 // Provides GDT and IDT setup for x86_64 bare-metal boot.
 
 pub mod gdt;
-
 pub mod idt;
+pub mod apic;

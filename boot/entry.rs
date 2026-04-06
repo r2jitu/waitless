@@ -395,6 +395,9 @@ unsafe fn kernel_boot(info: &BootInfo) {
 
     call_global_constructors();
 
+    // x86_64 APIC init deferred — APIC MMIO (0xFEE00000) is outside
+    // the 1GB identity map set up by boot.S. Needs page table extension first.
+
     klog!("[INIT] PCI bus scan (Rust)...\n");
     drivers::pci::init();
 
