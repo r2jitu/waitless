@@ -42,7 +42,7 @@ pub fn cpu_id() -> u32 {
 }
 
 /// Set GS_BASE to point at this core's PerCore struct. Called once per core.
-pub fn init_cpu_id(id: u32) {
+pub fn init_tls(id: u32) {
     unsafe {
         let addr = crate::percpu::get(id) as *const crate::percpu::PerCore as u64;
         core::arch::asm!(
@@ -169,7 +169,7 @@ extern "C" fn ap_entry_x86(_ctx: u64) -> ! {
             break;
         }
     }
-    init_cpu_id(logical_id);
+    init_tls(logical_id);
 
     // Load the IDT (same one BSP set up) so this AP can handle interrupts.
     super::idt::load_idt_on_ap();

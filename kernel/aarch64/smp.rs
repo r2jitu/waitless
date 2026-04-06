@@ -45,7 +45,7 @@ pub fn cpu_id() -> u32 {
 }
 
 /// Set TPIDR_EL1 to point at this core's PerCore struct. Called once per core.
-pub fn init_cpu_id(id: u32) {
+pub fn init_tls(id: u32) {
     unsafe {
         let addr = crate::percpu::get(id) as *const crate::percpu::PerCore as u64;
         core::arch::asm!("msr tpidr_el1, {}", in(reg) addr, options(nomem, nostack));
@@ -135,7 +135,7 @@ unsafe extern "C" fn ap_entry(_stack_top: u64) -> ! {
         // Set TPIDR_EL1 for fast cpu_id(). MPIDR Aff0 = logical core index on QEMU virt.
         let mpidr: u64;
         core::arch::asm!("mrs {}, MPIDR_EL1", out(reg) mpidr, options(nomem, nostack));
-        init_cpu_id((mpidr & 0xFF) as u32);
+        init_tls((mpidr & 0xFF) as u32);
 
         // Initialize this core's GIC redistributor
         exceptions::init_ap();
