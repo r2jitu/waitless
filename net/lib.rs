@@ -111,7 +111,7 @@ fn distribute_frame(frame: &[u8]) {
                     );
 
                     if target == 0 {
-                        // Process locally on core 0.
+                        // Single-core mode: process locally.
                         match pkt.protocol {
                             ipv4::PROTO_TCP => tcp::tcp_receive(pkt.src, pkt.dst, pkt.payload),
                             ipv4::PROTO_UDP => udp::udp_receive(pkt.src, pkt.dst, pkt.payload),
@@ -155,9 +155,12 @@ pub fn net_receive(frame: &[u8]) {
 }
 
 /// Flow hash: map a 4-tuple to a core index.
-/// XORs each field separately with FNV-1a multiply for good distribution
-/// even when only the source port varies (QEMU user-mode NAT).
+/// In Tier 2, core 0 is the dedicated distributor — it shouldn't also
+/// handle application connections. Hash to cores 1..N only (when multi-core).
 fn flow_hash(src_ip: u32, dst_ip: u32, src_port: u16, dst_port: u16, num_cores: u32) -> u32 {
+    if num_cores <= 1 {
+        return 0;
+    }
     let mut h: u32 = 2166136261; // FNV offset basis
     h ^= src_ip;
     h = h.wrapping_mul(16777619);
@@ -167,7 +170,8 @@ fn flow_hash(src_ip: u32, dst_ip: u32, src_port: u16, dst_port: u16, num_cores: 
     h = h.wrapping_mul(16777619);
     h ^= dst_port as u32;
     h = h.wrapping_mul(16777619);
-    h % num_cores
+    // Map to cores 1..num_cores (skip core 0, the distributor).
+    1 + h % (num_cores - 1)
 }
 
 fn fmt_u32(buf: &mut [u8], mut val: u32) -> usize {

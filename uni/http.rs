@@ -241,14 +241,16 @@ impl Server {
 
     /// Run the event loop. Blocks until shutdown signal.
     pub fn run(&mut self, port: u16) {
-        // Create a listener on each core's TCP pool (SO_REUSEPORT pattern).
-        // SYN packets hashed to core N will find the listener in core N's pool.
+        // Create listeners. In Tier 2 multi-core, core 0 is the dedicated
+        // distributor — connections hash to cores 1..N only. In single-core
+        // mode, core 0 handles everything.
         #[cfg(platform_unikernel)]
         let num_cores = kernel::percpu::num_cores();
         #[cfg(not(platform_unikernel))]
         let num_cores = 1u32;
 
-        for i in 0..num_cores {
+        let start_core = if num_cores > 1 { 1u32 } else { 0u32 };
+        for i in start_core..num_cores {
             #[cfg(platform_unikernel)]
             let handle = net::tcp::listen_on_core(i, port);
             #[cfg(not(platform_unikernel))]
@@ -256,7 +258,7 @@ impl Server {
 
             if handle.is_null() {
                 crate::log(b"http: failed to create TCP listener\n");
-                if i == 0 { return; }
+                if i == start_core { return; }
             } else {
                 self.cores[i as usize].listener = Some(TcpListener(handle));
             }
