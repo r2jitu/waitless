@@ -151,9 +151,9 @@ impl TcpConnection {
 // Per-core connection pools. Core N owns POOLS[N].
 static mut POOLS: [[TcpConnection; CONNECTIONS_PER_CORE]; MAX_CORES] =
     [const { [const { TcpConnection::new() }; CONNECTIONS_PER_CORE] }; MAX_CORES];
-// Volatile (not atomic) — VZ.framework rejects all atomic RMW instructions
-// (LDXR/STXR and LSE LDADD/SWP) on guest RAM due to Stage-2 page table
-// attributes. Duplicates across cores are harmless for TCP ISN.
+// Volatile, not atomic — VZ.framework rejects ALL atomic RMW (LDXR/STXR
+// and LSE LDADD/SWP) on guest RAM. DFSC 0x35 on both .data and .bss.
+// Duplicates across cores are harmless for TCP ISN.
 static mut SEQ_COUNTER: u32 = 100_000;
 
 /// Encode a connection handle from core + slot index.
