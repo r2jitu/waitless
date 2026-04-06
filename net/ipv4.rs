@@ -37,7 +37,7 @@ pub struct Ipv4Packet<'a> {
     pub payload: &'a [u8],
 }
 
-static mut IP_ID_COUNTER: u16 = 1;
+static IP_ID_COUNTER: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(1);
 
 pub fn ipv4_send(dst: Ipv4Addr, proto: u8, payload: &[u8]) {
     let payload_len = payload.len().min(1480);
@@ -52,8 +52,7 @@ pub fn ipv4_send(dst: Ipv4Addr, proto: u8, payload: &[u8]) {
         hdr.version_ihl = 0x45;
         hdr.tos = 0;
         hdr.total_length = htons(total_len as u16);
-        hdr.identification = htons(IP_ID_COUNTER);
-        IP_ID_COUNTER = IP_ID_COUNTER.wrapping_add(1);
+        hdr.identification = htons(IP_ID_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed));
         hdr.flags_fragment = htons(0x4000);
         hdr.ttl = 64;
         hdr.protocol = proto;

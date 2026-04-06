@@ -24,16 +24,16 @@ pub struct EthernetHeader {
 }
 
 static mut OUR_MAC: MacAddr = MacAddr::ZERO;
-static mut MAC_CACHED: bool = false;
+
+/// Cache our MAC address. Called once at boot after virtio-net init.
+pub fn init_mac() {
+    unsafe {
+        drivers::virtio_net::get_mac(OUR_MAC.bytes.as_mut_ptr());
+    }
+}
 
 pub fn ethernet_our_mac() -> MacAddr {
-    unsafe {
-        if !MAC_CACHED {
-            drivers::virtio_net::get_mac(OUR_MAC.bytes.as_mut_ptr());
-            MAC_CACHED = true;
-        }
-        OUR_MAC
-    }
+    unsafe { OUR_MAC }
 }
 
 pub fn ethernet_send(dst: MacAddr, ethertype: u16, payload: &[u8]) {

@@ -151,7 +151,7 @@ impl TcpConnection {
 // Per-core connection pools. Core N owns POOLS[N].
 static mut POOLS: [[TcpConnection; CONNECTIONS_PER_CORE]; MAX_CORES] =
     [const { [const { TcpConnection::new() }; CONNECTIONS_PER_CORE] }; MAX_CORES];
-static mut SEQ_COUNTER: u32 = 100_000;
+static SEQ_COUNTER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(100_000);
 
 /// Encode a connection handle from core + slot index.
 /// Handle = (core << 8) | slot, +1 to avoid null.
@@ -319,10 +319,7 @@ pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
             c.remote_ip = src_ip;
             c.local_port = dst_port;
             c.remote_port = src_port;
-            unsafe {
-                SEQ_COUNTER = SEQ_COUNTER.wrapping_add(64000);
-                c.snd_nxt = SEQ_COUNTER;
-            }
+            c.snd_nxt = SEQ_COUNTER.fetch_add(64000, core::sync::atomic::Ordering::Relaxed);
             c.snd_una = c.snd_nxt;
             c.rcv_nxt = seq + 1;
             c.listener_port = dst_port;

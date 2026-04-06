@@ -417,6 +417,8 @@ unsafe fn kernel_boot(info: &BootInfo) {
     if !net_ok {
         klog!("       [WARN] No virtio-net device found.\n");
     } else {
+        // Cache MAC address for multi-core safe access.
+        net::ethernet::init_mac();
         let mut mac = [0u8; 6];
         drivers::virtio_net::get_mac(mac.as_mut_ptr());
         klog!(

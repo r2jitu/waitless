@@ -224,7 +224,7 @@ mod aarch64 {
 // Common serial API
 // ============================================================================
 
-static mut SHUTDOWN_REQUESTED: bool = false;
+static SHUTDOWN_REQUESTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 pub fn init() {
     unsafe {
@@ -263,22 +263,20 @@ pub fn try_getc() -> i32 {
 }
 
 pub fn check_shutdown() -> bool {
-    unsafe {
-        if SHUTDOWN_REQUESTED {
+    if SHUTDOWN_REQUESTED.load(core::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    loop {
+        let c = try_getc();
+        if c < 0 {
+            break;
+        }
+        if c == 0x03 { // Ctrl-C
+            SHUTDOWN_REQUESTED.store(true, core::sync::atomic::Ordering::Relaxed);
             return true;
         }
-        loop {
-            let c = try_getc();
-            if c < 0 {
-                break;
-            }
-            if c == 0x03 { // Ctrl-C
-                SHUTDOWN_REQUESTED = true;
-                return true;
-            }
-        }
-        false
     }
+    false
 }
 
 // x86_64-specific: RX interrupt support for idle wakeup on Ctrl-C
@@ -290,15 +288,13 @@ pub fn enable_rx_irq() {
 #[cfg(target_arch = "x86_64")]
 pub fn rx_isr() {
     // Drain RX FIFO to clear the UART interrupt condition
-    unsafe {
-        loop {
-            let c = x86::try_getc();
-            if c < 0 {
-                break;
-            }
-            if c == 0x03 {
-                SHUTDOWN_REQUESTED = true;
-            }
+    loop {
+        let c = unsafe { x86::try_getc() };
+        if c < 0 {
+            break;
+        }
+        if c == 0x03 {
+            SHUTDOWN_REQUESTED.store(true, core::sync::atomic::Ordering::Relaxed);
         }
     }
 }
