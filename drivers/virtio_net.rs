@@ -731,27 +731,41 @@ fn send_direct(data: &[u8]) {
     send_on_qp(0, data);
 }
 
-/// Flag: set by APs when they stage TX, checked by core 0.
+/// Flag: set by APs when they stage TX.
 static TX_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// TX lock: protects the VirtIO TX queue. Any core can acquire to flush or send.
+static TX_LOCK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+fn tx_try_lock() -> bool {
+    TX_LOCK.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok()
+}
+
+fn tx_unlock() {
+    TX_LOCK.store(0, Ordering::Release);
+}
+
 /// Send a frame. Tier 1 (multi-queue): each core sends on its own queue pair.
-/// Tier 2 (single-queue): core 0 sends directly, APs stage for flush.
+/// Tier 2 (single-queue): try to send directly (TX lock), fall back to staging.
 pub fn send(data: &[u8]) {
     let id = kernel::cpu_id();
     let nqp = unsafe { NET.num_queue_pairs };
     if nqp > 1 && (id as u16) < nqp {
         // Tier 1: send directly on this core's queue pair. No locking needed.
         send_on_qp(id as usize, data);
-    } else if id == 0 || kernel::percpu::num_cores() <= 1 {
-        // Single-queue or core 0: send on queue pair 0.
+    } else if kernel::percpu::num_cores() <= 1 {
+        // Single-core: no lock needed.
         send_on_qp(0, data);
+    } else if tx_try_lock() {
+        // Multi-core: got the TX lock — send directly.
+        send_on_qp(0, data);
+        tx_unlock();
     } else {
-        // Tier 2: stage for core 0 to flush.
+        // TX lock held by another core — stage for later flush.
         unsafe {
             kernel::percpu::get(id).tx_staging.push(data);
         }
         TX_PENDING.store(true, Ordering::Release);
-        kernel::wake_core0();
     }
 }
 
@@ -761,21 +775,25 @@ pub fn has_pending_tx() -> bool {
 }
 
 /// Flush all per-core TX staging buffers into the VirtIO TX queue.
-/// Called by core 0 during its poll cycle.
+/// Any core can call this — acquires TX lock.
 pub fn flush_tx_staging() {
     if !TX_PENDING.load(Ordering::Acquire) {
         return;
     }
+    if !tx_try_lock() {
+        return; // another core is flushing or sending — skip
+    }
     TX_PENDING.store(false, Ordering::Release);
     let n = kernel::percpu::num_cores();
-    for i in 1..n {
+    for i in 0..n {
         unsafe {
             let core = kernel::percpu::get(i);
             while let Some(pkt) = core.tx_staging.pop() {
-                send_direct(pkt);
+                send_on_qp(0, pkt);
             }
         }
     }
+    tx_unlock();
 }
 
 pub fn poll(
@@ -790,7 +808,12 @@ pub fn poll_qp(qp: usize, callback: fn(&[u8])) -> i32 {
         if let Transport::None = NET.transport { return 0; }
     }
 
-    tx_drain_qp(qp);
+    if kernel::percpu::num_cores() <= 1 {
+        tx_drain_qp(qp);
+    } else if tx_try_lock() {
+        tx_drain_qp(qp);
+        tx_unlock();
+    }
 
     let mut count: i32 = 0;
     unsafe {
@@ -873,7 +896,13 @@ pub fn poll_batch_qp(qp: usize, batch: &mut RxBatch) {
         if let Transport::None = NET.transport { return; }
     }
 
-    tx_drain_qp(qp);
+    // Drain TX completions (under lock when multi-core).
+    if kernel::percpu::num_cores() <= 1 {
+        tx_drain_qp(qp);
+    } else if tx_try_lock() {
+        tx_drain_qp(qp);
+        tx_unlock();
+    }
 
     unsafe {
         while batch.count < BATCH_SIZE {
