@@ -303,6 +303,8 @@ def main():
 
     if args.env == "all":
         env_names = ["qemu", "qemu-arm", "vz", "docker", "native"]
+    elif args.env == "vm":
+        env_names = ["qemu", "qemu-arm", "vz"]
     else:
         env_names = [e.strip() for e in args.env.split(",")]
 
@@ -314,8 +316,10 @@ def main():
             print(f"Available: {', '.join(w['name'] for w in WORKLOADS)}")
             sys.exit(1)
 
-    # Docker/native only support 1 core
-    single_core_only = {"docker", "native"}
+    # These environments only run single-core benchmarks.
+    # VZ: multi-core networking has inbox visibility issues (vz_compat mode
+    # uses single-core networking). Override with --env vz --cores 1,4.
+    single_core_only = {"docker", "native", "vz", "qemu-arm"}
 
     # Kill stale processes
     subprocess.run(["pkill", "-9", "-f", "qemu-system"], capture_output=True)
