@@ -746,7 +746,8 @@ fn tx_unlock() {
 }
 
 /// Send a frame. Tier 1 (multi-queue): each core sends on its own queue pair.
-/// Tier 2 (single-queue): try to send directly (TX lock), fall back to staging.
+/// Tier 2 (single-queue): core sends directly if single-core, stages if multi-core.
+/// Any core can flush staging via flush_tx_staging().
 pub fn send(data: &[u8]) {
     let id = kernel::cpu_id();
     let nqp = unsafe { NET.num_queue_pairs };
@@ -756,12 +757,8 @@ pub fn send(data: &[u8]) {
     } else if kernel::percpu::num_cores() <= 1 {
         // Single-core: no lock needed.
         send_on_qp(0, data);
-    } else if tx_try_lock() {
-        // Multi-core: got the TX lock — send directly.
-        send_on_qp(0, data);
-        tx_unlock();
     } else {
-        // TX lock held by another core — stage for later flush.
+        // Tier 2 multi-core: stage for flush (avoids TX lock contention on send).
         unsafe {
             kernel::percpu::get(id).tx_staging.push(data);
         }

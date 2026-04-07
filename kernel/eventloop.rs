@@ -113,12 +113,7 @@ pub fn run(core_id: u32) -> ! {
             if f(core_id) { did_work = true; }
         }
 
-        // 4. Flush TX staging
-        if let Some(f) = unsafe { core::ptr::read_volatile(&raw const CB.net_flush) } {
-            f();
-        }
-
-        // 5. Check for shutdown
+        // 4. Check for shutdown
         if let Some(f) = unsafe { core::ptr::read_volatile(&raw const CB.check_shutdown) } {
             if f() {
                 request_shutdown();
