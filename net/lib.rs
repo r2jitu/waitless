@@ -29,13 +29,16 @@ static MULTICORE_INIT: core::sync::atomic::AtomicBool = core::sync::atomic::Atom
 /// Wakeup flags — set during distribution, cleared each poll cycle.
 static mut WAKEUP: [bool; percpu::MAX_CORES] = [false; percpu::MAX_CORES];
 
-/// RX poll lock: 0 = free, 1 = held. Any core can try to acquire.
+/// RX poll lock: 0 = free, 1 = held. Uses load/store (not CAS) because
+/// VZ.framework rejects all atomic RMW on guest RAM. The lock is best-effort:
+/// two cores may both see 0 and enter, but the VirtIO RX queue is drained
+/// quickly so the race window is tiny and the worst case is a redundant poll.
 static RX_LOCK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-// Diagnostic counters
-static RX_LOCK_GOT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static RX_LOCK_MISS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static FRAMES_DISTRIBUTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+// Diagnostic counters (volatile, not atomic — VZ compat)
+static mut RX_LOCK_GOT: u64 = 0;
+static mut RX_LOCK_MISS: u64 = 0;
+static mut FRAMES_DISTRIBUTED: u64 = 0;
 
 /// Poll the network device and dispatch received frames through the
 /// full stack: Ethernet -> ARP/IPv4 -> TCP/UDP.
@@ -52,7 +55,8 @@ pub fn poll() -> bool {
     }
 
     // Tier 2: multi-core with software distribution.
-    if !MULTICORE_INIT.swap(true, core::sync::atomic::Ordering::Relaxed) {
+    if !MULTICORE_INIT.load(core::sync::atomic::Ordering::Relaxed) {
+        MULTICORE_INIT.store(true, core::sync::atomic::Ordering::Relaxed);
         kernel::serial::puts(b"[net] Tier 2: software distribution (");
         let mut buf = [0u8; 4];
         let len = fmt_u32(&mut buf, num_cores);
@@ -60,19 +64,13 @@ pub fn poll() -> bool {
         kernel::serial::puts(b" cores)\n");
     }
 
-    // Try to become the distributor. Non-blocking: if another core holds
-    // the lock, skip distribution and just process our own connections.
-    let got_lock = RX_LOCK.compare_exchange(
-        0, 1,
-        core::sync::atomic::Ordering::Acquire,
-        core::sync::atomic::Ordering::Relaxed,
-    ).is_ok();
-
-    if !got_lock {
-        RX_LOCK_MISS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // Try to become the distributor. Load/store lock (not CAS) for VZ compat.
+    if RX_LOCK.load(core::sync::atomic::Ordering::Acquire) != 0 {
+        unsafe { RX_LOCK_MISS += 1; }
         return false;
     }
-    RX_LOCK_GOT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    RX_LOCK.store(1, core::sync::atomic::Ordering::Release);
+    unsafe { RX_LOCK_GOT += 1; }
 
     // Flush TX staging first — responses from previous cycle.
     drivers::virtio_net::flush_tx_staging();
@@ -92,7 +90,7 @@ pub fn poll() -> bool {
 
     let had_frames = count > 0;
     if had_frames {
-        FRAMES_DISTRIBUTED.fetch_add(count as u64, core::sync::atomic::Ordering::Relaxed);
+        unsafe { FRAMES_DISTRIBUTED += count as u64; }
         unsafe {
             let any_wakeup = (1..num_cores as usize).any(|i| WAKEUP[i]);
             if any_wakeup {

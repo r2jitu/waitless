@@ -48,17 +48,22 @@ pub fn send_ipi(target_core: u32) {
 }
 
 /// Lightweight wakeup: signal all sleeping cores that work is available.
-/// aarch64: SEV (Send Event) — ~1 cycle, broadcasts to all cores.
-/// x86_64: broadcast IPI (HLT requires an interrupt to wake).
+/// Uses SEV (aarch64 QEMU) or IPI broadcast. On VZ, SEV may not
+/// propagate between vCPUs, so we also send SGI as fallback.
 #[inline]
 pub fn wake_cores() {
+    let n = percpu::num_cores();
+    if n <= 1 { return; }
     #[cfg(target_arch = "aarch64")]
-    unsafe { core::arch::asm!("sev", options(nomem, nostack)); }
+    {
+        unsafe { core::arch::asm!("sev", options(nomem, nostack)); }
+        // Also send SGI — VZ may not propagate SEV between vCPU threads.
+        for i in 1..n {
+            aarch64::smp::send_sgi_to(i);
+        }
+    }
     #[cfg(target_arch = "x86_64")]
     {
-        // Send IPI to all APs. Still cheaper than per-core IPIs since
-        // we only call this once per batch of distributed packets.
-        let n = percpu::num_cores();
         for i in 1..n {
             send_ipi(i);
         }
@@ -66,12 +71,13 @@ pub fn wake_cores() {
 }
 
 /// Lightweight wakeup: signal core 0 that TX staging is ready.
-/// aarch64: SEV broadcasts to all cores (core 0 wakes from WFE/WFI).
-/// x86_64: IPI to core 0 (HLT requires interrupt).
 #[inline]
 pub fn wake_core0() {
     #[cfg(target_arch = "aarch64")]
-    unsafe { core::arch::asm!("sev", options(nomem, nostack)); }
+    {
+        unsafe { core::arch::asm!("sev", options(nomem, nostack)); }
+        aarch64::smp::send_sgi_to(0);
+    }
     #[cfg(target_arch = "x86_64")]
     send_ipi(0);
 }

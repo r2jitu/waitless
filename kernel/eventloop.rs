@@ -174,7 +174,7 @@ pub fn run(core_id: u32) -> ! {
                     f(core_id);
                 } else {
                     #[cfg(target_arch = "aarch64")]
-                    unsafe { core::arch::asm!("wfe", options(nomem, nostack)); }
+                    unsafe { core::arch::asm!("wfi", options(nomem, nostack)); }
                     #[cfg(target_arch = "x86_64")]
                     unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
                 }

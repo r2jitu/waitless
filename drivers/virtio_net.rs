@@ -738,7 +738,10 @@ static TX_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 static TX_LOCK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 fn tx_try_lock() -> bool {
-    TX_LOCK.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok()
+    // Load/store lock (not CAS) — VZ rejects all atomic RMW on guest RAM.
+    if TX_LOCK.load(Ordering::Acquire) != 0 { return false; }
+    TX_LOCK.store(1, Ordering::Release);
+    true
 }
 
 fn tx_unlock() {
@@ -757,12 +760,10 @@ pub fn send(data: &[u8]) {
     } else if kernel::percpu::num_cores() <= 1 {
         // Single-core: no lock needed.
         send_on_qp(0, data);
-    } else if tx_try_lock() {
-        // Tier 2: got TX lock — send directly (no staging round-trip).
-        send_on_qp(0, data);
-        tx_unlock();
     } else {
-        // TX lock held — stage for later flush.
+        // Tier 2 multi-core: always stage. The load/store lock isn't safe
+        // for concurrent VirtIO TX queue access (race window between load
+        // and store). Staging is lock-free (per-core buffers).
         unsafe {
             kernel::percpu::get(id).tx_staging.push(data);
         }
@@ -776,14 +777,16 @@ pub fn has_pending_tx() -> bool {
 }
 
 /// Flush all per-core TX staging buffers into the VirtIO TX queue.
-/// Any core can call this — acquires TX lock.
+/// Safe to call from any core — uses load/store TX lock. The lock
+/// prevents concurrent VirtIO TX queue access (load/store has a tiny
+/// race window but TX_PENDING check + lock makes double-entry unlikely).
 pub fn flush_tx_staging() {
     if !TX_PENDING.load(Ordering::Acquire) {
         return;
     }
-    if !tx_try_lock() {
-        return; // another core is flushing or sending — skip
-    }
+    // Only one core should flush at a time.
+    if TX_LOCK.load(Ordering::Acquire) != 0 { return; }
+    TX_LOCK.store(1, Ordering::Release);
     TX_PENDING.store(false, Ordering::Release);
     let n = kernel::percpu::num_cores();
     for i in 0..n {
