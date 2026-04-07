@@ -560,18 +560,28 @@ UNIKERNEL_CPUS=4 ./scripts/bench.sh   # expect ~linear scaling
 - [x] Per-core HTTP service: each core has listener + active connections (SO_REUSEPORT)
 - [x] Per-core TLS via GS_BASE (x86_64) / TPIDR_EL1 (aarch64) → fast cpu_id()
 - [x] SEV/WFE inter-core signaling on aarch64 (replaces GIC SGI IPI on hot path)
+- [x] MTTCG data race fixes (atomic counters, boot-time MAC init)
+- [x] Unified kernel event loop: all cores run identical poll→drain→service→idle
+- [x] Rotating distributor with test-then-CAS RX lock
+- [x] Direct RX distribution (no batch buffer copy)
+- [x] Try-lock direct TX send (bypass staging when uncontended)
+- [x] Graduated idle backoff (reduce MTTCG wasted wakeups)
 - [ ] Tier auto-detection: MQ offered -> Tier 1, else -> Tier 2 (deferred to 2b)
 
-**Blockers for demonstrating multi-core perf scaling:**
+**Multi-core scaling results (x86_64 MTTCG, 4 cores):**
 
-- [ ] **MTTCG data races**: `qemu -accel tcg,thread=multi` crashes — exposes
-  data races in `static mut` globals accessed from multiple cores. Need to
-  audit all shared mutable state and make it atomic or per-core. Without
-  MTTCG, all vCPUs share one host thread (no true parallelism).
-- [ ] **VZ multi-core TCP**: VZ TCP proxy (`run-vz.swift`) routes all host
-  connections from a single source, so all flows hash to one core. Fix:
-  vary proxy source ports, or use direct VM networking (VZBridgedNetworkDeviceAttachment).
-- [ ] **VZ exclusive monitor**: VZ doesn't handle LDXR/STXR (atomic RMW)
+| Workload | 1-core | 4-core | Scaling |
+|----------|--------|--------|---------|
+| /health c=1 | 15,452 | 6,979 | 0.45x (single-conn, no parallelism) |
+| /health c=8 | 17,130 | 22,303 | 1.30x (IO-bound, VirtIO limited) |
+| /compute c=1 | 3,165 | 3,231 | 1.02x (single-conn) |
+| /compute c=8 | ~3,900 | ~13,900 | **3.5-3.8x** (CPU-bound, near-linear) |
+
+**Known limitations:**
+
+- [ ] **VZ multi-core TCP**: VZ TCP proxy routes all connections from single source
+- [ ] **VZ exclusive monitor**: VZ rejects all atomic RMW on guest RAM (DFSC 0x35).
+  Workaround: volatile read-modify-write for counters. Root cause: VZ Stage-2
   correctly for some BSS addresses. Workaround in place (volatile writes),
   but limits use of Rust atomics on VZ. May need to relocate atomics to
   a dedicated memory region or use ARMv8.1 LSE atomics.
