@@ -394,6 +394,12 @@ fn init_native() {
         signal(SIGTERM, sigint_handler as usize);
         signal(SIGPIPE, SIG_IGN);
     }
+
+    // Register TCP as an IO poll source with the event loop.
+    crate::register_io_poll(|_worker_id| {
+        tcp_poll();
+        false // tcp_poll marks has_pending_data on ready fds; service callback checks it
+    });
 }
 
 // ============================================================================
@@ -606,19 +612,11 @@ pub extern "C" fn main() -> i32 {
 pub extern "C" fn native_worker_loop(thread_id: u32) {
     unsafe { CURRENT_THREAD_ID = thread_id; }
 
-    // Worker threads (not thread 0) need their own SO_REUSEPORT listener.
+    // Worker threads (not thread 0) create their own SO_REUSEPORT listener.
     if thread_id > 0 {
         crate::http::add_worker_listener(thread_id);
     }
 
-    // Same loop structure as the unikernel event loop:
-    // poll → service → idle
-    loop {
-        if check_shutdown() { break; }
-        tcp_poll();
-        if let Some(svc) = crate::backend::get_service() {
-            svc(thread_id);
-        }
-        wait_for_events();
-    }
+    // Enter the callback-driven event loop (same structure as kernel's).
+    crate::backend::run_worker(thread_id);
 }

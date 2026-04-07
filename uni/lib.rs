@@ -44,6 +44,16 @@ mod backend {
     #[allow(dead_code)]
     pub fn run(id: u32) -> ! { kernel::eventloop::run(id) }
     pub fn request_shutdown() { kernel::eventloop::request_shutdown(); }
+
+    /// Register an IO poll callback. On unikernel, this is handled by
+    /// kernel::eventloop callbacks (net_poll, net_drain, etc). For app-level
+    /// IO sources, this is a placeholder — real registration goes through
+    /// kernel::eventloop directly.
+    #[allow(dead_code)]
+    pub fn register_io_poll(_f: fn(u32) -> bool) {
+        // Unikernel IO sources register with kernel::eventloop directly
+        // (e.g., net::init_eventloop sets net_poll/net_drain/net_flush).
+    }
 }
 
 #[cfg(platform_native)]
@@ -52,9 +62,25 @@ mod backend {
                             tcp_listen, tcp_accept, tcp_has_data,
                             tcp_recv, tcp_send, tcp_close, tcp_is_closed, tcp_poll};
 
-    // Event loop — maps to native threading
+    // ── Callback-driven event loop (mirrors kernel::eventloop) ──────────
+    // Same pattern as the unikernel: register callbacks, all workers run
+    // the same loop. On native, "worker" = OS thread.
+
+    type PollFn = fn(u32) -> bool;
+
+    struct Callbacks {
+        io_poll: [Option<PollFn>; 4],  // up to 4 IO sources (net, storage, ...)
+        io_poll_count: usize,
+        service: Option<PollFn>,
+    }
+
+    static mut CB: Callbacks = Callbacks {
+        io_poll: [None; 4],
+        io_poll_count: 0,
+        service: None,
+    };
+
     static mut NUM_WORKERS: u32 = 1;
-    static mut SERVICE_FN: Option<fn(u32) -> bool> = None;
     static READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
     pub fn num_workers() -> u32 {
@@ -65,42 +91,81 @@ mod backend {
             NUM_WORKERS
         }
     }
-    pub fn set_service(f: fn(u32) -> bool) {
-        unsafe { core::ptr::write_volatile(&raw mut SERVICE_FN, Some(f)); }
+
+    /// Register an IO poll callback (network, storage, etc).
+    /// Multiple sources can be registered; all are called each iteration.
+    pub fn register_io_poll(f: PollFn) {
+        unsafe {
+            if CB.io_poll_count < CB.io_poll.len() {
+                CB.io_poll[CB.io_poll_count] = Some(f);
+                CB.io_poll_count += 1;
+            }
+        }
     }
-    pub fn get_service() -> Option<fn(u32) -> bool> {
-        unsafe { core::ptr::read_volatile(&raw const SERVICE_FN) }
+
+    pub fn set_service(f: PollFn) {
+        unsafe { core::ptr::write_volatile(&raw mut CB.service, Some(f)); }
     }
+
+    pub fn get_service() -> Option<PollFn> {
+        unsafe { core::ptr::read_volatile(&raw const CB.service) }
+    }
+
     pub fn set_ready() {
         READY.store(true, core::sync::atomic::Ordering::Release);
     }
-    #[allow(dead_code)]
+
     pub fn is_ready() -> bool {
         READY.load(core::sync::atomic::Ordering::Acquire)
     }
-    #[allow(dead_code)]
-    pub fn run(_id: u32) -> ! {
-        // On native, run() returns — the main() in native.rs manages threads.
-        // This is a no-op; the blocking happens in native_worker_loop.
-        loop {}
-    }
+
     pub fn request_shutdown() {
         unsafe { crate::native::SHUTDOWN = true; }
     }
 
-    /// TCP listen on a specific worker (SO_REUSEPORT).
     pub fn tcp_listen_on(_worker_id: u32, port: u16) -> *mut () {
-        // Native: each thread creates its own listener.
-        // For worker 0, tcp_listen is called normally.
-        // For workers > 0, this is called from native_worker_loop.
         crate::native::tcp_listen(port)
+    }
+
+    /// Run the worker event loop on this thread. Same structure as kernel's.
+    /// Called by native_worker_loop after thread setup.
+    pub fn run_worker(worker_id: u32) {
+        // Wait for ready
+        while !is_ready() && !crate::native::check_shutdown() {
+            crate::native::wait_for_events();
+        }
+
+        loop {
+            if crate::native::check_shutdown() { break; }
+
+            let mut did_work = false;
+
+            // 1. IO poll callbacks (network, future storage, etc)
+            unsafe {
+                for i in 0..CB.io_poll_count {
+                    if let Some(f) = CB.io_poll[i] {
+                        if f(worker_id) { did_work = true; }
+                    }
+                }
+            }
+
+            // 2. App service callback
+            if let Some(f) = get_service() {
+                if f(worker_id) { did_work = true; }
+            }
+
+            // 3. Idle if no work
+            if !did_work {
+                crate::native::wait_for_events();
+            }
+        }
     }
 }
 
 // ---- Re-exported platform functions ------------------------------------------
 
 pub use backend::{log, config_port, check_shutdown, wait_for_events, tcp_poll};
-pub use backend::{num_workers, set_service, set_ready, request_shutdown};
+pub use backend::{num_workers, set_service, set_ready, request_shutdown, register_io_poll};
 pub use backend::tcp_listen_on;
 
 // ---- UDP --------------------------------------------------------------------
@@ -118,7 +183,9 @@ pub fn udp_send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
 }
 
 #[cfg(platform_native)]
-pub fn udp_bind(_port: u16, _handler: fn([u8; 4], u16, &[u8])) {}
+pub fn udp_bind(_port: u16, _handler: fn([u8; 4], u16, &[u8])) {
+    log(b"[WARN] UDP not implemented on native backend\n");
+}
 
 #[cfg(platform_native)]
 pub fn udp_send(_dst_ip: [u8; 4], _src_port: u16, _dst_port: u16, _data: &[u8]) {}
