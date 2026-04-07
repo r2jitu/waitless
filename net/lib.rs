@@ -32,6 +32,11 @@ static mut WAKEUP: [bool; percpu::MAX_CORES] = [false; percpu::MAX_CORES];
 /// RX poll lock: 0 = free, 1 = held. Any core can try to acquire.
 static RX_LOCK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+// Diagnostic counters
+static RX_LOCK_GOT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static RX_LOCK_MISS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static FRAMES_DISTRIBUTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Poll the network device and dispatch received frames through the
 /// full stack: Ethernet -> ARP/IPv4 -> TCP/UDP.
 ///
@@ -64,8 +69,10 @@ pub fn poll() -> bool {
     ).is_ok();
 
     if !got_lock {
+        RX_LOCK_MISS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         return false;
     }
+    RX_LOCK_GOT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
     // Flush TX staging first — responses from previous cycle.
     drivers::virtio_net::flush_tx_staging();
@@ -76,6 +83,9 @@ pub fn poll() -> bool {
     unsafe { drivers::virtio_net::poll_batch(&mut BATCH); }
 
     let had_frames = unsafe { BATCH.count > 0 };
+    if had_frames {
+        FRAMES_DISTRIBUTED.fetch_add(unsafe { BATCH.count } as u64, core::sync::atomic::Ordering::Relaxed);
+    }
 
     // Release lock immediately.
     RX_LOCK.store(0, core::sync::atomic::Ordering::Release);
