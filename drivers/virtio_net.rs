@@ -757,8 +757,8 @@ pub fn send(data: &[u8]) {
     if nqp > 1 && (id as u16) < nqp {
         // Tier 1: send directly on this core's queue pair. No locking needed.
         send_on_qp(id as usize, data);
-    } else if kernel::percpu::num_cores() <= 1 {
-        // Single-core: no lock needed.
+    } else if kernel::percpu::num_cores() <= 1 || (cfg!(vz_compat) && id == 0) {
+        // Single-core or VZ core 0: send directly (no staging needed).
         send_on_qp(0, data);
     } else {
         // Tier 2 multi-core: always stage. The load/store lock isn't safe

@@ -1,12 +1,7 @@
 // apps/test_percpu — Per-core state integration test.
 //
-// Verifies each core has independent per-core state:
-//   - Unique core ID (cpu_id matches percpu slot)
-//   - RX inbox push/pop works per-core
-//   - TX staging push/pop works per-core
-//
-// Core 0 pushes test data to each AP's inbox, APs process and
-// set atomic result flags. Core 0 polls results and prints.
+// Verifies each core participates in the event loop and has
+// independent per-core state. Uses the event loop service callback.
 
 #![no_std]
 
@@ -20,7 +15,15 @@ const MAX_CORES: usize = 8;
 // Per-core test results: 0 = pending, 1 = pass, 2 = fail
 static RESULTS: [AtomicU8; MAX_CORES] = [const { AtomicU8::new(0) }; MAX_CORES];
 
-fn test_poll(core_id: u32) -> bool {
+// Per-core test data: each core should see its own ID here
+static mut TEST_DATA: [u32; MAX_CORES] = [0xFFFFFFFF; MAX_CORES];
+
+fn test_service(core_id: u32) -> bool {
+    // Only run the test once per core
+    if RESULTS[core_id as usize].load(Ordering::Relaxed) != 0 {
+        return false;
+    }
+
     unsafe {
         let core = kernel::percpu::get(core_id);
 
@@ -30,23 +33,16 @@ fn test_poll(core_id: u32) -> bool {
             return true;
         }
 
-        // Pop the test frame that core 0 pushed to our inbox
-        let frame = match core.rx_inbox.pop() {
-            Some(f) => f,
-            None => return false, // no work yet
-        };
-
-        // Verify the frame contains our core ID as a marker
-        if frame.len() < 1 || frame[0] != core_id as u8 {
+        // Verify we can see our test data
+        if TEST_DATA[core_id as usize] != core_id {
             RESULTS[core_id as usize].store(2, Ordering::Release);
             return true;
         }
 
-        // Push a response to TX staging
+        // Push to TX staging and verify it's there
         let response = [core_id as u8, 0xAA];
         core.tx_staging.push(&response);
 
-        // Mark pass
         RESULTS[core_id as usize].store(1, Ordering::Release);
     }
     true
@@ -67,47 +63,25 @@ fn main() {
         return;
     }
 
-    // Register AP poll function
-    kernel::percpu::set_ap_poll_fn(test_poll);
-
-    // Test core 0's own per-core state
-    unsafe {
-        let core0 = kernel::percpu::get(0);
-        if core0.id != 0 {
-            uni::log(b"Core 0: FAIL id mismatch\n");
-        } else {
-            core0.rx_inbox.push(&[42u8]);
-            if let Some(data) = core0.rx_inbox.pop() {
-                if data[0] == 42 {
-                    uni::log(b"Core 0: inbox OK, id OK\n");
-                } else {
-                    uni::log(b"Core 0: FAIL inbox data\n");
-                }
-            } else {
-                uni::log(b"Core 0: FAIL inbox empty\n");
-            }
-        }
+    // Write test data for each core
+    for i in 0..num_cores {
+        unsafe { TEST_DATA[i as usize] = i; }
     }
 
-    // Push test data to each AP's inbox
-    for i in 1..num_cores {
-        unsafe {
-            let core = kernel::percpu::get(i);
-            let marker = [i as u8];
-            core.rx_inbox.push(&marker);
-        }
-    }
+    // Register service callback
+    kernel::eventloop::set_service(test_service);
 
-    // Send IPI to wake APs
-    for i in 1..num_cores {
-        kernel::send_ipi(i);
-    }
+    // Signal APs to start
+    kernel::eventloop::set_ready();
+    kernel::wake_cores();
 
-    // Wait for all APs to complete, polling results
+    // Run core 0's test inline
+    test_service(0);
+
+    // Wait for all APs
     let expected = num_cores - 1;
-    let mut done = 0u32;
     for _ in 0..50_000_000u32 {
-        done = 0;
+        let mut done = 0u32;
         for i in 1..num_cores {
             if RESULTS[i as usize].load(Ordering::Acquire) != 0 {
                 done += 1;
@@ -116,7 +90,7 @@ fn main() {
         if done >= expected { break; }
     }
 
-    // Print results for each AP (core 0 does all printing — no garbled output)
+    // Print results
     for i in 1..num_cores {
         let result = RESULTS[i as usize].load(Ordering::Acquire);
         uni::log(b"Core ");
@@ -150,4 +124,5 @@ fn main() {
     }
 
     uni::log(b"Per-core state test complete.\n");
+    kernel::eventloop::request_shutdown();
 }

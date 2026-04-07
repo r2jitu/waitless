@@ -54,7 +54,25 @@ pub fn poll() -> bool {
         return drivers::virtio_net::poll(net_receive) > 0;
     }
 
+    // VZ-compat: no inbox distribution, but still need the RX lock
+    // to prevent concurrent VirtIO queue access under true parallelism.
+    if cfg!(vz_compat) {
+        if RX_LOCK.load(core::sync::atomic::Ordering::Acquire) != 0 {
+            return false;
+        }
+        RX_LOCK.store(1, core::sync::atomic::Ordering::Release);
+        drivers::virtio_net::flush_tx_staging();
+        let count = drivers::virtio_net::poll(net_receive);
+        RX_LOCK.store(0, core::sync::atomic::Ordering::Release);
+        drivers::virtio_net::flush_tx_staging();
+        return count > 0;
+    }
+
     // Tier 2: multi-core with software distribution.
+    poll_tier2(num_cores)
+}
+
+fn poll_tier2(num_cores: u32) -> bool {
     if !MULTICORE_INIT.load(core::sync::atomic::Ordering::Relaxed) {
         MULTICORE_INIT.store(true, core::sync::atomic::Ordering::Relaxed);
         kernel::serial::puts(b"[net] Tier 2: software distribution (");
@@ -76,7 +94,6 @@ pub fn poll() -> bool {
     drivers::virtio_net::flush_tx_staging();
 
     // Poll VirtIO RX and distribute directly (no batch buffer copy).
-    // The callback runs inline for each frame while we hold the RX lock.
     unsafe {
         for i in 0..num_cores as usize {
             WAKEUP[i] = false;
@@ -210,8 +227,12 @@ pub fn init_eventloop() {
     kernel::eventloop::set_net_flush(net_flush_cb);
 }
 
-fn net_poll_cb(_core_id: u32) -> bool {
-    // Quick check: is the RX lock free? Skip CAS if held.
+fn net_poll_cb(core_id: u32) -> bool {
+    // VZ-compat: only core 0 polls VirtIO (load/store lock has race window).
+    // QEMU: any core can poll (rotating distributor).
+    if cfg!(vz_compat) && core_id != 0 {
+        return false;
+    }
     if RX_LOCK.load(core::sync::atomic::Ordering::Relaxed) != 0 {
         return false;
     }
