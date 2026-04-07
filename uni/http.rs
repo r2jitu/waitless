@@ -244,21 +244,16 @@ impl Server {
         self.default_handler = Some(handler);
     }
 
-    /// Create TCP listeners on all cores and register with the event loop.
-    /// Non-blocking: returns immediately. The kernel event loop will call
-    /// the service callback on each core.
+    /// Create TCP listeners and register the HTTP service callback.
+    /// Non-blocking: returns immediately. The event loop (kernel or native)
+    /// will call the service callback on each worker.
     pub fn listen(&mut self, port: u16) {
-        #[cfg(platform_unikernel)]
-        let num_cores = kernel::percpu::num_cores();
-        #[cfg(not(platform_unikernel))]
-        let num_cores = 1u32;
+        let nw = crate::num_workers();
 
-        for i in 0..num_cores {
-            #[cfg(platform_unikernel)]
-            let handle = net::tcp::listen_on_core(i, port);
-            #[cfg(not(platform_unikernel))]
-            let handle = crate::backend::tcp_listen(port);
-
+        // Create a listener per worker (SO_REUSEPORT on native,
+        // per-core TCP pool on unikernel).
+        for i in 0..nw {
+            let handle = crate::tcp_listen_on(i, port);
             if handle.is_null() {
                 crate::log(b"http: failed to create TCP listener\n");
                 if i == 0 { return; }
@@ -267,35 +262,23 @@ impl Server {
             }
         }
 
-        // Register service callback with the kernel event loop.
         unsafe {
             SERVER_PTR = self as *mut Server;
             LISTEN_PORT = port;
         }
-        #[cfg(platform_unikernel)]
-        kernel::eventloop::set_service(http_service_cb);
+        crate::set_service(http_service_cb);
 
         crate::log(b"http: listening\n");
     }
 
-    /// Run the event loop. Blocks until shutdown signal.
-    /// Legacy API — calls listen() then enters the kernel event loop.
+    /// Start listening and enter the event loop. Blocks until shutdown.
+    /// On unikernel: enters kernel event loop on core 0.
+    /// On native: returns to main() which spawns worker threads.
     pub fn run(&mut self, port: u16) {
         self.listen(port);
-
-        #[cfg(platform_unikernel)]
-        {
-            kernel::eventloop::set_check_shutdown(|| crate::check_shutdown());
-            kernel::eventloop::set_ready();
-            kernel::eventloop::run(kernel::cpu_id());
-        }
-
-        #[cfg(not(platform_unikernel))]
-        {
-            // Native: listen() already set up thread 0's listener.
-            // Return to main() which spawns worker threads and enters
-            // native_worker_loop(0). This allows multi-threaded operation.
-        }
+        crate::set_ready();
+        // On unikernel, this blocks forever. On native, it returns
+        // and native.rs::main() handles thread management.
     }
 
     /// Service connections for a specific core. Returns true if any work was done.
@@ -411,31 +394,22 @@ fn alloc_active(active: &mut [ActiveConn; MAX_ACTIVE]) -> Option<&mut ActiveConn
 
 /// Event loop service callback: service HTTP connections on this core.
 /// Network poll + inbox drain are handled by the event loop itself.
-/// Called by native worker threads to create their own SO_REUSEPORT listener.
-#[cfg(not(platform_unikernel))]
-pub fn native_add_listener(thread_id: u32) {
+/// Add a listener for a specific worker. Called by native worker threads
+/// to create their own SO_REUSEPORT listener.
+pub fn add_worker_listener(worker_id: u32) {
     let port = unsafe { LISTEN_PORT };
     let server = unsafe {
         if SERVER_PTR.is_null() { return; }
         &mut *SERVER_PTR
     };
-    let handle = crate::backend::tcp_listen(port);
+    let handle = crate::tcp_listen_on(worker_id, port);
     if !handle.is_null() {
-        server.cores[thread_id as usize].listener = Some(TcpListener(handle));
+        server.cores[worker_id as usize].listener = Some(TcpListener(handle));
     }
 }
 
-/// Called by native worker threads to service HTTP connections.
-#[cfg(not(platform_unikernel))]
-pub fn native_service(thread_id: u32) {
-    let server = unsafe {
-        if SERVER_PTR.is_null() { return; }
-        &mut *SERVER_PTR
-    };
-    server.service_core(thread_id);
-}
-
-#[cfg(platform_unikernel)]
+/// Event loop service callback — services HTTP connections on this worker.
+/// Used by both unikernel (kernel event loop) and native (per-thread loop).
 fn http_service_cb(core_id: u32) -> bool {
     let server = unsafe {
         if SERVER_PTR.is_null() { return false; }

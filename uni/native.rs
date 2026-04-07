@@ -179,7 +179,7 @@ fn set_nonblocking(fd: i32) {
     }
 }
 
-fn num_cpus() -> usize {
+pub fn num_cpus() -> usize {
     #[cfg(target_os = "macos")]
     const SC_NPROCESSORS_ONLN: i32 = 58;
     #[cfg(target_os = "linux")]
@@ -345,7 +345,7 @@ impl ThreadState {
 static mut THREADS: [ThreadState; MAX_THREADS] = [const { ThreadState::new(0) }; MAX_THREADS];
 static mut NUM_THREADS: usize = 1;
 static mut CONFIG_PORT: u16 = 0;
-static mut SHUTDOWN: bool = false;
+pub static mut SHUTDOWN: bool = false;
 
 /// Get the current thread's state. Thread ID is stored in a thread-local-like
 /// fashion by passing it through the worker function argument.
@@ -607,15 +607,18 @@ pub extern "C" fn native_worker_loop(thread_id: u32) {
     unsafe { CURRENT_THREAD_ID = thread_id; }
 
     // Worker threads (not thread 0) need their own SO_REUSEPORT listener.
-    // Thread 0's listener was already created by Server::listen().
     if thread_id > 0 {
-        crate::http::native_add_listener(thread_id);
+        crate::http::add_worker_listener(thread_id);
     }
 
+    // Same loop structure as the unikernel event loop:
+    // poll → service → idle
     loop {
         if check_shutdown() { break; }
         tcp_poll();
-        crate::http::native_service(thread_id);
+        if let Some(svc) = crate::backend::get_service() {
+            svc(thread_id);
+        }
         wait_for_events();
     }
 }
