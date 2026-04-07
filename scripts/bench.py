@@ -250,6 +250,7 @@ class NativeEnv:
             return None
         env = os.environ.copy()
         env["PORT"] = str(port)
+        env["THREADS"] = str(cpus)
         return subprocess.Popen(
             [bin_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
 
@@ -259,7 +260,7 @@ class NativeEnv:
             proc.wait()
 
     def core_label(self, cpus):
-        return "Native"
+        return f"Native {cpus}t"
 
 
 ENV_MAP = {
@@ -317,9 +318,9 @@ def main():
             sys.exit(1)
 
     # These environments only run single-core benchmarks.
-    # VZ: multi-core networking has inbox visibility issues (vz_compat mode
-    # uses single-core networking). Override with --env vz --cores 1,4.
-    single_core_only = {"docker", "native", "vz", "qemu-arm"}
+    # VZ: multi-core networking has inbox visibility issues.
+    # ARM TCG: no MTTCG support.
+    single_core_only = {"docker", "vz", "qemu-arm"}
 
     # Kill stale processes
     subprocess.run(["pkill", "-9", "-f", "qemu-system"], capture_output=True)
