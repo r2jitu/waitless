@@ -48,9 +48,6 @@ const MSG_NOSIGNAL: i32 = 0x4000;
 #[cfg(target_os = "macos")]
 const MSG_NOSIGNAL: i32 = 0;
 
-const POLLIN: i16 = 0x0001;
-const POLLHUP: i16 = 0x0010;
-const POLLERR: i16 = 0x0008;
 
 #[cfg(target_os = "macos")]
 const EAGAIN: i32 = 35;
@@ -71,23 +68,46 @@ struct SockAddrIn {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
-struct PollFd {
-    fd: i32,
-    events: i16,
-    revents: i16,
-}
-
-#[repr(C)]
 struct Timespec {
     tv_sec: i64,
     tv_nsec: i64,
 }
 
+// kqueue (macOS)
 #[cfg(target_os = "macos")]
-type NfdsT = u32;
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Kevent {
+    ident: usize,
+    filter: i16,
+    flags: u16,
+    fflags: u32,
+    data: isize,
+    udata: *mut u8,
+}
+
+#[cfg(target_os = "macos")]
+const EVFILT_READ: i16 = -1;
+#[cfg(target_os = "macos")]
+const EV_ADD: u16 = 0x0001;
+#[cfg(target_os = "macos")]
+const EV_DELETE: u16 = 0x0002;
+
+// epoll (Linux)
 #[cfg(target_os = "linux")]
-type NfdsT = u64;
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct EpollEvent {
+    events: u32,
+    data: u64,
+}
+
+#[cfg(target_os = "linux")]
+const EPOLLIN: u32 = 0x001;
+#[cfg(target_os = "linux")]
+const EPOLL_CTL_ADD: i32 = 1;
+#[cfg(target_os = "linux")]
+const EPOLL_CTL_DEL: i32 = 2;
 
 type PthreadT = usize;
 
@@ -102,11 +122,22 @@ unsafe extern "C" {
     fn shutdown(fd: i32, how: i32) -> i32;
     fn setsockopt(fd: i32, level: i32, name: i32, val: *const i32, len: u32) -> i32;
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
-    fn poll(fds: *mut PollFd, nfds: NfdsT, timeout: i32) -> i32;
     fn signal(sig: i32, handler: usize) -> usize;
     fn getenv(name: *const u8) -> *const u8;
     fn write(fd: i32, buf: *const u8, count: usize) -> isize;
-    fn nanosleep(req: *const Timespec, rem: *mut Timespec) -> i32;
+    #[cfg(target_os = "macos")]
+    fn kqueue() -> i32;
+    #[cfg(target_os = "macos")]
+    fn kevent(kq: i32, changelist: *const Kevent, nchanges: i32,
+              eventlist: *mut Kevent, nevents: i32, timeout: *const Timespec) -> i32;
+
+    #[cfg(target_os = "linux")]
+    fn epoll_create1(flags: i32) -> i32;
+    #[cfg(target_os = "linux")]
+    fn epoll_ctl(epfd: i32, op: i32, fd: i32, event: *mut EpollEvent) -> i32;
+    #[cfg(target_os = "linux")]
+    fn epoll_wait(epfd: i32, events: *mut EpollEvent, maxevents: i32, timeout: i32) -> i32;
+
     fn pthread_create(thread: *mut PthreadT, attr: *const u8,
                       start: extern "C" fn(*mut u8) -> *mut u8, arg: *mut u8) -> i32;
     fn pthread_join(thread: PthreadT, retval: *mut *mut u8) -> i32;
@@ -180,6 +211,7 @@ impl NativeConn {
 
 struct ThreadState {
     conns: [NativeConn; CONNS_PER_THREAD],
+    eq_fd: i32,  // kqueue (macOS) or epoll (Linux) fd
     thread_id: u32,
 }
 
@@ -187,7 +219,53 @@ impl ThreadState {
     const fn new(id: u32) -> Self {
         ThreadState {
             conns: [NativeConn::empty(); CONNS_PER_THREAD],
+            eq_fd: -1,
             thread_id: id,
+        }
+    }
+
+    fn init_event_queue(&mut self) {
+        unsafe {
+            #[cfg(target_os = "macos")]
+            { self.eq_fd = kqueue(); }
+            #[cfg(target_os = "linux")]
+            { self.eq_fd = epoll_create1(0); }
+        }
+    }
+
+    fn register_fd(&self, fd: i32) {
+        unsafe {
+            #[cfg(target_os = "macos")]
+            {
+                let ev = Kevent {
+                    ident: fd as usize, filter: EVFILT_READ,
+                    flags: EV_ADD, fflags: 0, data: 0,
+                    udata: fd as *mut u8,
+                };
+                kevent(self.eq_fd, &ev, 1, ptr::null_mut(), 0, ptr::null());
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let mut ev = EpollEvent { events: EPOLLIN, data: fd as u64 };
+                epoll_ctl(self.eq_fd, EPOLL_CTL_ADD, fd, &mut ev);
+            }
+        }
+    }
+
+    fn unregister_fd(&self, fd: i32) {
+        unsafe {
+            #[cfg(target_os = "macos")]
+            {
+                let ev = Kevent {
+                    ident: fd as usize, filter: EVFILT_READ,
+                    flags: EV_DELETE, fflags: 0, data: 0, udata: ptr::null_mut(),
+                };
+                kevent(self.eq_fd, &ev, 1, ptr::null_mut(), 0, ptr::null());
+            }
+            #[cfg(target_os = "linux")]
+            {
+                epoll_ctl(self.eq_fd, EPOLL_CTL_DEL, fd, ptr::null_mut());
+            }
         }
     }
 
@@ -204,6 +282,7 @@ impl ThreadState {
     fn release_conn(&mut self, c: *mut NativeConn) {
         unsafe {
             if (*c).fd >= 0 {
+                self.unregister_fd((*c).fd);
                 shutdown((*c).fd, SHUT_RDWR);
                 close((*c).fd);
                 (*c).fd = -1;
@@ -214,46 +293,46 @@ impl ThreadState {
         }
     }
 
-    fn poll_fds(&mut self) {
-        let mut fds = [PollFd { fd: 0, events: 0, revents: 0 }; CONNS_PER_THREAD];
-        let mut map = [ptr::null_mut::<NativeConn>(); CONNS_PER_THREAD];
-        let mut n: usize = 0;
-        for c in self.conns.iter_mut() {
-            if !c.closed && c.fd >= 0 {
-                fds[n] = PollFd { fd: c.fd, events: POLLIN, revents: 0 };
-                map[n] = c as *mut NativeConn;
-                n += 1;
-            }
-        }
-        if n == 0 { return; }
-        unsafe { poll(fds.as_mut_ptr(), n as NfdsT, 0); }
-        for i in 0..n {
-            if fds[i].revents & (POLLIN | POLLHUP | POLLERR) != 0 {
-                unsafe { (*map[i]).has_pending_data = true; }
-            }
-        }
+    /// Non-blocking poll: check for ready fds without waiting.
+    fn poll_events(&mut self) {
+        self.collect_events(0);
     }
 
+    /// Blocking wait: sleep until at least one fd is ready (up to 10ms).
     fn wait_for_events(&mut self) {
-        let mut fds = [PollFd { fd: 0, events: 0, revents: 0 }; CONNS_PER_THREAD];
-        let mut map = [ptr::null_mut::<NativeConn>(); CONNS_PER_THREAD];
-        let mut n: usize = 0;
-        for c in self.conns.iter_mut() {
-            if !c.closed && c.fd >= 0 {
-                fds[n] = PollFd { fd: c.fd, events: POLLIN, revents: 0 };
-                map[n] = c as *mut NativeConn;
-                n += 1;
+        self.collect_events(10);
+    }
+
+    fn collect_events(&mut self, timeout_ms: i32) {
+        const MAX_EVENTS: usize = 64;
+        unsafe {
+            #[cfg(target_os = "macos")]
+            {
+                let mut events = [core::mem::zeroed::<Kevent>(); MAX_EVENTS];
+                let ts = if timeout_ms > 0 {
+                    Timespec { tv_sec: 0, tv_nsec: timeout_ms as i64 * 1_000_000 }
+                } else {
+                    Timespec { tv_sec: 0, tv_nsec: 0 }
+                };
+                let n = kevent(self.eq_fd, ptr::null(), 0,
+                               events.as_mut_ptr(), MAX_EVENTS as i32, &ts);
+                for i in 0..n.max(0) as usize {
+                    let fd = events[i].udata as i32;
+                    for c in self.conns.iter_mut() {
+                        if c.fd == fd { c.has_pending_data = true; break; }
+                    }
+                }
             }
-        }
-        if n == 0 {
-            let ts = Timespec { tv_sec: 0, tv_nsec: 1_000_000 };
-            unsafe { nanosleep(&ts, ptr::null_mut()); }
-            return;
-        }
-        unsafe { poll(fds.as_mut_ptr(), n as NfdsT, 10); }
-        for i in 0..n {
-            if fds[i].revents & (POLLIN | POLLHUP | POLLERR) != 0 {
-                unsafe { (*map[i]).has_pending_data = true; }
+            #[cfg(target_os = "linux")]
+            {
+                let mut events = [core::mem::zeroed::<EpollEvent>(); MAX_EVENTS];
+                let n = epoll_wait(self.eq_fd, events.as_mut_ptr(), MAX_EVENTS as i32, timeout_ms);
+                for i in 0..n.max(0) as usize {
+                    let fd = events[i].data as i32;
+                    for c in self.conns.iter_mut() {
+                        if c.fd == fd { c.has_pending_data = true; break; }
+                    }
+                }
             }
         }
     }
@@ -308,6 +387,7 @@ fn init_native() {
 
         for i in 0..NUM_THREADS {
             THREADS[i].thread_id = i as u32;
+            THREADS[i].init_event_queue();
         }
 
         signal(SIGINT, sigint_handler as usize);
@@ -335,6 +415,10 @@ pub fn check_shutdown() -> bool {
 
 pub fn wait_for_events() {
     thread_state(current_thread_id()).wait_for_events();
+}
+
+pub fn poll_events() {
+    thread_state(current_thread_id()).poll_events();
 }
 
 // ---- TCP (per-thread) -------------------------------------------------------
@@ -386,6 +470,7 @@ pub fn tcp_listen(port: u16) -> *mut () {
         (*c).fd = fd;
         (*c).is_listener = true;
     }
+    ts.register_fd(fd);
     c as *mut ()
 }
 
@@ -414,6 +499,7 @@ pub fn tcp_accept(handle: *mut ()) -> *mut () {
             return ptr::null_mut();
         }
         (*c).fd = fd;
+        ts.register_fd(fd);
         c as *mut ()
     }
 }
@@ -461,7 +547,7 @@ pub fn tcp_is_closed(handle: *mut ()) -> bool {
 }
 
 pub fn tcp_poll() {
-    thread_state(current_thread_id()).poll_fds();
+    thread_state(current_thread_id()).poll_events();
 }
 
 // ============================================================================
