@@ -25,7 +25,7 @@ struct Callbacks {
     /// Check for shutdown signal (serial Ctrl-C).
     check_shutdown: Option<fn() -> bool>,
     /// Idle — sleep until interrupt/event.
-    idle: Option<fn()>,
+    idle: Option<fn(u32)>,  // receives core_id
 }
 
 static mut CB: Callbacks = Callbacks {
@@ -38,6 +38,7 @@ static mut CB: Callbacks = Callbacks {
 };
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+static READY: AtomicBool = AtomicBool::new(false);
 
 // ---- Registration API (called during boot/app init) ----
 
@@ -61,8 +62,16 @@ pub fn set_check_shutdown(f: fn() -> bool) {
     unsafe { core::ptr::write_volatile(&raw mut CB.check_shutdown, Some(f)); }
 }
 
-pub fn set_idle(f: fn()) {
+pub fn set_idle(f: fn(u32)) {
     unsafe { core::ptr::write_volatile(&raw mut CB.idle, Some(f)); }
+}
+
+/// Signal that the app has finished initialization and the event loop
+/// can start processing. Called by boot code after uni_main() returns.
+pub fn set_ready() {
+    READY.store(true, Ordering::Release);
+    // Wake all cores so they stop waiting and enter the loop.
+    crate::wake_cores();
 }
 
 pub fn request_shutdown() {
@@ -75,6 +84,15 @@ pub fn is_shutdown() -> bool {
 
 /// Run the event loop on the current core. Does not return until shutdown.
 pub fn run(core_id: u32) -> ! {
+    // Wait for the app to finish initialization before processing.
+    // Core 0 calls set_ready() after uni_main() returns or Server::run() starts.
+    while !READY.load(Ordering::Acquire) && !is_shutdown() {
+        #[cfg(target_arch = "aarch64")]
+        unsafe { core::arch::asm!("wfe", options(nomem, nostack)); }
+        #[cfg(target_arch = "x86_64")]
+        unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
+    }
+
     loop {
         if is_shutdown() { break; }
 
@@ -114,7 +132,7 @@ pub fn run(core_id: u32) -> ! {
                 f(); // one more flush before sleeping
             }
             if let Some(f) = unsafe { core::ptr::read_volatile(&raw const CB.idle) } {
-                f();
+                f(core_id);
             } else {
                 #[cfg(target_arch = "aarch64")]
                 unsafe { core::arch::asm!("wfe", options(nomem, nostack)); }

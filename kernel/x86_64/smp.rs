@@ -188,24 +188,8 @@ extern "C" fn ap_entry_x86(_ctx: u64) -> ! {
     // Enable interrupts so IPI can be delivered.
     unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
 
-    // Event loop: drain inbox, process, sleep when idle.
-    loop {
-        if SHUTDOWN.load(Ordering::Relaxed) {
-            loop { unsafe { core::arch::asm!("hlt"); } }
-        }
-
-        let mut did_work = false;
-        if let Some(poll_fn) = crate::percpu::ap_poll_fn() {
-            did_work = poll_fn(id);
-        }
-
-        if !did_work {
-            // HLT until interrupt. On x86 TCG, PAUSE spin loops starve
-            // core 0 (all vCPUs share one host thread). HLT yields the
-            // vCPU slot. Core 0 sends SEV/IPI to wake us when work arrives.
-            unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
-        }
-    }
+    // Enter the unified kernel event loop.
+    crate::eventloop::run(id);
 }
 
 /// Signal APs to shut down.

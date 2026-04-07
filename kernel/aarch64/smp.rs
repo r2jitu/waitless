@@ -159,28 +159,10 @@ unsafe extern "C" fn ap_entry(_stack_top: u64) -> ! {
         for &b in b" online\n" { buf[pos] = b; pos += 1; }
         serial::puts(&buf[..pos]);
 
-        // Event loop: drain inbox, process, sleep when idle.
-        let id = cpu_id();
-        loop {
-            if SHUTDOWN.load(Ordering::Relaxed) {
-                core::arch::asm!(
-                    "hvc #0",
-                    in("x0") 0x8400_0002u64,  // PSCI CPU_OFF
-                    options(nostack, nomem),
-                );
-            }
-
-            let mut did_work = false;
-            if let Some(poll_fn) = crate::percpu::ap_poll_fn() {
-                did_work = poll_fn(id);
-            }
-
-            if !did_work {
-                // WFE (Wait For Event) — wakes on SEV from core 0.
-                // Much cheaper than WFI+IPI: no GIC routing, no handler, no EOI.
-                core::arch::asm!("wfe", options(nomem, nostack));
-            }
-        }
+        // Enter the unified kernel event loop.
+        // Runs: net poll → inbox drain → app service → TX flush → idle.
+        // Does not return until shutdown.
+        crate::eventloop::run(cpu_id());
     }
 }
 

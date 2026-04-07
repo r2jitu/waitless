@@ -24,7 +24,7 @@ pub extern crate net_dhcp as dhcp;
 use kernel::percpu;
 
 /// Whether multi-core distribution has been initialized.
-static mut MULTICORE_INIT: bool = false;
+static MULTICORE_INIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Wakeup flags — set during distribution, cleared each poll cycle.
 static mut WAKEUP: [bool; percpu::MAX_CORES] = [false; percpu::MAX_CORES];
@@ -38,25 +38,21 @@ static RX_LOCK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::n
 /// In single-core mode, all processing happens here.
 /// In Tier 2 multi-core mode, any idle core can become the distributor
 /// by acquiring the RX lock. This avoids dedicating a core to distribution.
-pub fn poll() {
+/// Returns true if any network work was done.
+pub fn poll() -> bool {
     let num_cores = percpu::num_cores();
 
     if num_cores <= 1 {
-        // Single-core: existing path, no distribution overhead.
-        drivers::virtio_net::poll(net_receive);
-        return;
+        return drivers::virtio_net::poll(net_receive) > 0;
     }
 
     // Tier 2: multi-core with software distribution.
-    unsafe {
-        if !MULTICORE_INIT {
-            MULTICORE_INIT = true;
-            kernel::serial::puts(b"[net] Tier 2: software distribution (");
-            let mut buf = [0u8; 4];
-            let len = fmt_u32(&mut buf, num_cores);
-            kernel::serial::puts(&buf[..len]);
-            kernel::serial::puts(b" cores)\n");
-        }
+    if !MULTICORE_INIT.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        kernel::serial::puts(b"[net] Tier 2: software distribution (");
+        let mut buf = [0u8; 4];
+        let len = fmt_u32(&mut buf, num_cores);
+        kernel::serial::puts(&buf[..len]);
+        kernel::serial::puts(b" cores)\n");
     }
 
     // Try to become the distributor. Non-blocking: if another core holds
@@ -67,36 +63,41 @@ pub fn poll() {
         core::sync::atomic::Ordering::Relaxed,
     ).is_ok();
 
-    if got_lock {
-        // Flush TX staging first — responses from previous cycle.
-        drivers::virtio_net::flush_tx_staging();
-
-        // Batch-poll: drain VirtIO RX into a local buffer, then release
-        // the lock. This minimizes lock hold time — other cores can start
-        // polling the next batch while we distribute.
-        static mut BATCH: drivers::virtio_net::RxBatch = drivers::virtio_net::RxBatch::new();
-        unsafe { drivers::virtio_net::poll_batch(&mut BATCH); }
-
-        // Release lock immediately — VirtIO RX queue is idle now.
-        RX_LOCK.store(0, core::sync::atomic::Ordering::Release);
-
-        // Distribute from batch (no lock held).
-        unsafe {
-            for i in 0..num_cores as usize {
-                WAKEUP[i] = false;
-            }
-            for frame in BATCH.iter() {
-                distribute_frame(frame);
-            }
-            let any_wakeup = (1..num_cores as usize).any(|i| WAKEUP[i]);
-            if any_wakeup {
-                kernel::wake_cores();
-            }
-        }
-
-        // Flush TX (APs may have responded during distribution).
-        drivers::virtio_net::flush_tx_staging();
+    if !got_lock {
+        return false;
     }
+
+    // Flush TX staging first — responses from previous cycle.
+    drivers::virtio_net::flush_tx_staging();
+
+    // Batch-poll: drain VirtIO RX into a local buffer, then release
+    // the lock. This minimizes lock hold time.
+    static mut BATCH: drivers::virtio_net::RxBatch = drivers::virtio_net::RxBatch::new();
+    unsafe { drivers::virtio_net::poll_batch(&mut BATCH); }
+
+    let had_frames = unsafe { BATCH.count > 0 };
+
+    // Release lock immediately.
+    RX_LOCK.store(0, core::sync::atomic::Ordering::Release);
+
+    // Distribute from batch (no lock held).
+    unsafe {
+        for i in 0..num_cores as usize {
+            WAKEUP[i] = false;
+        }
+        for frame in BATCH.iter() {
+            distribute_frame(frame);
+        }
+        let any_wakeup = (1..num_cores as usize).any(|i| WAKEUP[i]);
+        if any_wakeup {
+            kernel::wake_cores();
+        }
+    }
+
+    // Flush TX (APs may have responded during distribution).
+    drivers::virtio_net::flush_tx_staging();
+
+    had_frames
 }
 
 /// Classify a frame and distribute it to the appropriate core.
@@ -190,6 +191,38 @@ fn flow_hash(src_ip: u32, dst_ip: u32, src_port: u16, dst_port: u16, num_cores: 
     h ^= dst_port as u32;
     h = h.wrapping_mul(16777619);
     h % num_cores
+}
+
+// ============================================================================
+// Event loop integration
+// ============================================================================
+
+/// Register network callbacks with the kernel event loop.
+/// Called during boot after virtio-net is initialized.
+pub fn init_eventloop() {
+    kernel::eventloop::set_net_poll(net_poll_cb);
+    kernel::eventloop::set_net_drain(net_drain_cb);
+    kernel::eventloop::set_net_flush(net_flush_cb);
+}
+
+fn net_poll_cb(_core_id: u32) -> bool {
+    poll()
+}
+
+fn net_drain_cb(core_id: u32) -> bool {
+    let mut did_work = false;
+    unsafe {
+        let core = percpu::get(core_id);
+        while let Some(frame) = core.rx_inbox.pop() {
+            net_receive(frame);
+            did_work = true;
+        }
+    }
+    did_work
+}
+
+fn net_flush_cb() {
+    drivers::virtio_net::flush_tx_staging();
 }
 
 fn fmt_u32(buf: &mut [u8], mut val: u32) -> usize {

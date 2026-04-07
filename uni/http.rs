@@ -242,9 +242,10 @@ impl Server {
         self.default_handler = Some(handler);
     }
 
-    /// Run the event loop. Blocks until shutdown signal.
-    pub fn run(&mut self, port: u16) {
-        // Create listeners on all cores. Any core can be distributor or worker.
+    /// Create TCP listeners on all cores and register with the event loop.
+    /// Non-blocking: returns immediately. The kernel event loop will call
+    /// the service callback on each core.
+    pub fn listen(&mut self, port: u16) {
         #[cfg(platform_unikernel)]
         let num_cores = kernel::percpu::num_cores();
         #[cfg(not(platform_unikernel))]
@@ -264,58 +265,38 @@ impl Server {
             }
         }
 
-        // Register AP poll hook for multi-core HTTP service.
+        // Register service callback with the kernel event loop.
+        unsafe { SERVER_PTR = self as *mut Server; }
         #[cfg(platform_unikernel)]
-        if num_cores > 1 {
-            unsafe { SERVER_PTR = self as *mut Server; }
-            kernel::percpu::set_ap_poll_fn(ap_http_poll);
-        }
+        kernel::eventloop::set_service(http_service_cb);
 
         crate::log(b"http: listening\n");
+    }
 
-        loop {
-            if crate::check_shutdown() {
-                crate::log(b"http: shutdown requested\n");
-                break;
-            }
-            crate::tcp_poll();
+    /// Run the event loop. Blocks until shutdown signal.
+    /// Legacy API — calls listen() then enters the kernel event loop.
+    pub fn run(&mut self, port: u16) {
+        self.listen(port);
 
-            // Core 0 is also a worker — drain its inbox (another core may
-            // have distributed packets to us while it held the RX lock).
-            #[cfg(platform_unikernel)]
-            {
-                unsafe {
-                    let core = kernel::percpu::get(0);
-                    while let Some(frame) = core.rx_inbox.pop() {
-                        net::net_receive(frame);
-                    }
-                }
-            }
-
-            let had_work = self.service_core(0);
-
-            if !had_work {
-                // Tight-loop flush: APs may have staged TX responses
-                // while we were servicing core-0 connections.
-                #[cfg(platform_unikernel)]
-                drivers::virtio_net::flush_tx_staging();
-                crate::wait_for_events();
-            }
+        #[cfg(platform_unikernel)]
+        {
+            kernel::eventloop::set_check_shutdown(|| crate::check_shutdown());
+            kernel::eventloop::set_ready();
+            kernel::eventloop::run(kernel::cpu_id());
         }
 
-        // Graceful shutdown
-        for core in self.cores.iter_mut() {
-            for ac in core.active.iter_mut() {
-                if let Some(conn) = ac.conn.take() {
-                    conn.close();
-                    ac.buf_len = 0;
+        #[cfg(not(platform_unikernel))]
+        {
+            // Native: simple polling loop (no kernel event loop)
+            loop {
+                if crate::check_shutdown() { break; }
+                crate::tcp_poll();
+                let had_work = self.service_core(0);
+                if !had_work {
+                    crate::wait_for_events();
                 }
             }
-            if let Some(l) = core.listener.take() {
-                l.close();
-            }
         }
-        crate::log(b"http: server stopped\n");
     }
 
     /// Service connections for a specific core. Returns true if any work was done.
@@ -429,20 +410,9 @@ fn alloc_active(active: &mut [ActiveConn; MAX_ACTIVE]) -> Option<&mut ActiveConn
     None
 }
 
-/// AP poll callback: drain RX inbox (network packets), then service HTTP connections.
-fn ap_http_poll(core_id: u32) -> bool {
-    // First, process any packets in this core's RX inbox (same as net::ap_poll).
-    #[cfg(platform_unikernel)]
-    {
-        unsafe {
-            let core = kernel::percpu::get(core_id);
-            while let Some(frame) = core.rx_inbox.pop() {
-                net::net_receive(frame);
-            }
-        }
-    }
-
-    // Then service HTTP connections.
+/// Event loop service callback: service HTTP connections on this core.
+/// Network poll + inbox drain are handled by the event loop itself.
+fn http_service_cb(core_id: u32) -> bool {
     let server = unsafe {
         if SERVER_PTR.is_null() { return false; }
         &mut *SERVER_PTR

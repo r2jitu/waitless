@@ -484,15 +484,48 @@ unsafe fn kernel_boot(info: &BootInfo) {
         }
     }
 
+    // Register callbacks with the kernel event loop.
+    if net_ok {
+        net::init_eventloop();
+        kernel::eventloop::set_check_shutdown(|| serial::check_shutdown());
+        kernel::eventloop::set_idle(idle_cb);
+    }
+
     klog!("\n[BOOT] All subsystems ready. Starting application.\n\n");
     uni_main();
-    klog!("\n[SHUTDOWN] Application returned. Powering off.\n");
+
+    // App init complete — signal APs to start their event loops.
+    kernel::eventloop::set_ready();
+
+    // If the app's main() returns without calling server.run(),
+    // enter the kernel event loop on core 0.
+    if !kernel::eventloop::is_shutdown() {
+        klog!("[BOOT] Entering event loop on core 0.\n");
+        kernel::eventloop::run(0);
+    }
+
+    klog!("\n[SHUTDOWN] Powering off.\n");
 
     // Stop secondary cores before system poweroff
     #[cfg(target_arch = "aarch64")]
     kernel::aarch64::smp::request_shutdown();
 
     arch_shutdown();
+    }
+}
+
+/// Event loop idle callback. Core-aware:
+/// - Core 0: arm VirtIO RX notifications + WFI/HLT (wakes on RX interrupt)
+/// - Other cores: lightweight sleep (WFE on aarch64, HLT on x86)
+///   Wakes when the distributor sends SEV/IPI after distributing packets.
+fn idle_cb(core_id: u32) {
+    if core_id == 0 || kernel::percpu::num_cores() <= 1 {
+        uni::wait_for_events();
+    } else {
+        #[cfg(target_arch = "aarch64")]
+        unsafe { core::arch::asm!("wfe", options(nomem, nostack)); }
+        #[cfg(target_arch = "x86_64")]
+        unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
     }
 }
 
