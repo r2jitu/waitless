@@ -323,8 +323,57 @@ final class NetBridge {
         guard ipLen >= 20 else { return }
         let ihl = Int(ip[0] & 0x0f) * 4
         let body = ip + ihl, bodyLen = ipLen - ihl
-        if ip[9] == 17 { handleDHCP(body, bodyLen, srcMAC: srcMAC) }
+        if ip[9] == 17 {
+            // UDP: check if it's DHCP (dst port 67) or app traffic
+            if bodyLen >= 4 && get16(body + 2) == 67 {
+                handleDHCP(body, bodyLen, srcMAC: srcMAC)
+            } else {
+                handleUDPFromVM(body, bodyLen)
+            }
+        }
         else if ip[9] == 6 { handleTCPFromVM(body, bodyLen) }
+    }
+
+    // ── UDP proxy ───────────────────────────────────────────────────────────
+
+    var udpFD: Int32 = -1
+    var udpClients: [UInt16: sockaddr_in] = [:] // VM src_port → host client addr
+
+    func handleUDPFromVM(_ udp: UnsafePointer<UInt8>, _ udpLen: Int) {
+        guard udpLen >= 8, udpFD >= 0 else { return }
+        let srcPort = get16(udp)
+        let dstPort = get16(udp + 2)
+        let dataOff = 8
+        let dataLen = udpLen - dataOff
+        guard dataLen > 0 else { return }
+
+        // The VM's reply has srcPort = VM service port (e.g. 7 for echo).
+        // Look up the host client by the VM's source port.
+        guard var clientAddr = udpClients[srcPort] else { return }
+        _ = withUnsafePointer(to: &clientAddr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                sendto(udpFD, udp + dataOff, dataLen, 0, sa,
+                       socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+    }
+
+    func udpToVM(srcPort: UInt16, dstPort: UInt16, payload: UnsafePointer<UInt8>, payloadLen: Int) {
+        guard hasVmMAC else { return }
+        let eth = writeEthHdr(txBuf, dstMAC: vmMACBuf, ethertype: 0x0800)
+        let ip = eth, udpH = ip + 20, data = udpH + 8
+        let udpTotal = 8 + payloadLen
+
+        // UDP header
+        put16(udpH, srcPort)
+        put16(udpH + 2, dstPort)
+        put16(udpH + 4, UInt16(udpTotal))
+        udpH[6] = 0; udpH[7] = 0 // checksum (optional for IPv4)
+
+        memcpy(data, payload, payloadLen)
+
+        writeIPv4Hdr(ip, srcIP: GW_IP4, dstIP: VM_IP4, proto: 17, payloadLen: udpTotal)
+        sendFrame(14 + 20 + udpTotal)
     }
 
     @inline(__always)
@@ -386,17 +435,32 @@ final class NetBridge {
         listen(listenFD, 128)
         _ = fcntl(listenFD, F_SETFL, fcntl(listenFD, F_GETFL, 0) | O_NONBLOCK)
 
+        // UDP socket for proxying (hostPort+1 → VM port 7)
+        udpFD = socket(AF_INET, SOCK_DGRAM, 0)
+        var udpSA = sockaddr_in()
+        udpSA.sin_family = sa_family_t(AF_INET)
+        udpSA.sin_port = UInt16(hostPort + 1).bigEndian
+        udpSA.sin_addr.s_addr = INADDR_ANY
+        withUnsafeMutablePointer(to: &udpSA) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                _ = bind(udpFD, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        _ = fcntl(udpFD, F_SETFL, fcntl(udpFD, F_GETFL, 0) | O_NONBLOCK)
+
         // Create kqueue
         let kq = kqueue()
 
-        // Register vmFD and listenFD
+        // Register vmFD, listenFD, and udpFD
         var events: [kevent] = [
             kevent(ident: UInt(vmFD), filter: Int16(EVFILT_READ),
                    flags: UInt16(EV_ADD), fflags: 0, data: 0, udata: nil),
             kevent(ident: UInt(listenFD), filter: Int16(EVFILT_READ),
+                   flags: UInt16(EV_ADD), fflags: 0, data: 0, udata: nil),
+            kevent(ident: UInt(udpFD), filter: Int16(EVFILT_READ),
                    flags: UInt16(EV_ADD), fflags: 0, data: 0, udata: nil)
         ]
-        kevent(kq, &events, 2, nil, 0, nil)
+        kevent(kq, &events, 3, nil, 0, nil)
 
         let evBuf = UnsafeMutablePointer<kevent>.allocate(capacity: 256)
 
@@ -416,6 +480,25 @@ final class NetBridge {
                         let r = recv(vmFD, rxBuf, 65536, Int32(MSG_DONTWAIT))
                         if r <= 0 { break }
                         processFrame(rxBuf, r)
+                    }
+                } else if fd == udpFD {
+                    // Host → VM UDP proxy
+                    while true {
+                        var clientAddr = sockaddr_in()
+                        var addrLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+                        let r: Int = withUnsafeMutablePointer(to: &clientAddr) {
+                            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                                recvfrom(udpFD, rxBuf, 65536, Int32(MSG_DONTWAIT), $0, &addrLen)
+                            }
+                        }
+                        if r <= 0 { break }
+                        // Store client address keyed by VM destination port (7 = echo)
+                        let vmDstPort: UInt16 = 7
+                        udpClients[vmDstPort] = clientAddr
+                        // Inject as Ethernet/IP/UDP frame into VM
+                        let srcPort = UInt16(bigEndian: clientAddr.sin_port)
+                        udpToVM(srcPort: srcPort, dstPort: vmDstPort,
+                                payload: rxBuf, payloadLen: r)
                     }
                 } else if fd == listenFD {
                     // Accept all pending connections
@@ -528,6 +611,7 @@ func main() throws {
     enableRawInput()
     fputs("==> VZ.framework unikernel starting\n", stderr)
     fputs("    Network: http://localhost:\(hostPort)/ → VM port 80\n", stderr)
+    fputs("    UDP: localhost:\(hostPort + 1) → VM port 7\n", stderr)
     fputs("    Serial console below.  Press Ctrl-C to exit.\n\n", stderr)
 
     vm.start { result in
