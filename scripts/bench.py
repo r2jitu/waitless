@@ -47,7 +47,7 @@ def wait_port_pool(threshold=500, timeout=8):
         time.sleep(1)
 
 
-def wait_http(port, timeout=40):
+def wait_http(port, timeout=60):
     for _ in range(timeout):
         try:
             r = subprocess.run(
@@ -318,8 +318,9 @@ def main():
             sys.exit(1)
 
     # These environments only run single-core benchmarks.
+    # VZ 4c: vz_compat mode works but TCP proxy drops under concurrent load.
     # ARM TCG: no MTTCG support.
-    single_core_only = {"docker", "qemu-arm"}
+    single_core_only = {"docker", "qemu-arm", "vz"}
 
     # Kill stale processes
     subprocess.run(["pkill", "-9", "-f", "qemu-system"], capture_output=True)
