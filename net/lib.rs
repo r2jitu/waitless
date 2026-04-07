@@ -82,12 +82,21 @@ fn poll_tier2(num_cores: u32) -> bool {
         kernel::serial::puts(b" cores)\n");
     }
 
-    // Try to become the distributor. Load/store lock (not CAS) for VZ compat.
-    if RX_LOCK.load(core::sync::atomic::Ordering::Acquire) != 0 {
+    // Try to become the distributor.
+    let got_lock = if cfg!(vz_compat) {
+        // VZ: load/store (CAS crashes on VZ guest RAM).
+        if RX_LOCK.load(core::sync::atomic::Ordering::Acquire) != 0 { false }
+        else { RX_LOCK.store(1, core::sync::atomic::Ordering::Release); true }
+    } else {
+        // QEMU/KVM: proper CAS (safe under true parallelism).
+        RX_LOCK.compare_exchange(0, 1,
+            core::sync::atomic::Ordering::Acquire,
+            core::sync::atomic::Ordering::Relaxed).is_ok()
+    };
+    if !got_lock {
         unsafe { RX_LOCK_MISS += 1; }
         return false;
     }
-    RX_LOCK.store(1, core::sync::atomic::Ordering::Release);
     unsafe { RX_LOCK_GOT += 1; }
 
     // Flush TX staging first — responses from previous cycle.

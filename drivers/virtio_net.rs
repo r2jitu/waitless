@@ -738,10 +738,15 @@ static TX_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 static TX_LOCK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 fn tx_try_lock() -> bool {
-    // Load/store lock (not CAS) — VZ rejects all atomic RMW on guest RAM.
-    if TX_LOCK.load(Ordering::Acquire) != 0 { return false; }
-    TX_LOCK.store(1, Ordering::Release);
-    true
+    if cfg!(vz_compat) {
+        // VZ: load/store (CAS crashes on VZ guest RAM).
+        if TX_LOCK.load(Ordering::Acquire) != 0 { return false; }
+        TX_LOCK.store(1, Ordering::Release);
+        true
+    } else {
+        // QEMU/KVM: proper CAS.
+        TX_LOCK.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok()
+    }
 }
 
 fn tx_unlock() {
