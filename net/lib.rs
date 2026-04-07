@@ -77,30 +77,27 @@ pub fn poll() -> bool {
     // Flush TX staging first — responses from previous cycle.
     drivers::virtio_net::flush_tx_staging();
 
-    // Batch-poll: drain VirtIO RX into a local buffer, then release
-    // the lock. This minimizes lock hold time.
-    static mut BATCH: drivers::virtio_net::RxBatch = drivers::virtio_net::RxBatch::new();
-    unsafe { drivers::virtio_net::poll_batch(&mut BATCH); }
-
-    let had_frames = unsafe { BATCH.count > 0 };
-    if had_frames {
-        FRAMES_DISTRIBUTED.fetch_add(unsafe { BATCH.count } as u64, core::sync::atomic::Ordering::Relaxed);
-    }
-
-    // Release lock immediately.
-    RX_LOCK.store(0, core::sync::atomic::Ordering::Release);
-
-    // Distribute from batch (no lock held).
+    // Poll VirtIO RX and distribute directly (no batch buffer copy).
+    // The callback runs inline for each frame while we hold the RX lock.
     unsafe {
         for i in 0..num_cores as usize {
             WAKEUP[i] = false;
         }
-        for frame in BATCH.iter() {
-            distribute_frame(frame);
-        }
-        let any_wakeup = (1..num_cores as usize).any(|i| WAKEUP[i]);
-        if any_wakeup {
-            kernel::wake_cores();
+    }
+
+    let count = drivers::virtio_net::poll(distribute_frame);
+
+    // Release lock.
+    RX_LOCK.store(0, core::sync::atomic::Ordering::Release);
+
+    let had_frames = count > 0;
+    if had_frames {
+        FRAMES_DISTRIBUTED.fetch_add(count as u64, core::sync::atomic::Ordering::Relaxed);
+        unsafe {
+            let any_wakeup = (1..num_cores as usize).any(|i| WAKEUP[i]);
+            if any_wakeup {
+                kernel::wake_cores();
+            }
         }
     }
 

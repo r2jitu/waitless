@@ -757,8 +757,12 @@ pub fn send(data: &[u8]) {
     } else if kernel::percpu::num_cores() <= 1 {
         // Single-core: no lock needed.
         send_on_qp(0, data);
+    } else if tx_try_lock() {
+        // Tier 2: got TX lock — send directly (no staging round-trip).
+        send_on_qp(0, data);
+        tx_unlock();
     } else {
-        // Tier 2 multi-core: stage for flush (avoids TX lock contention on send).
+        // TX lock held — stage for later flush.
         unsafe {
             kernel::percpu::get(id).tx_staging.push(data);
         }
