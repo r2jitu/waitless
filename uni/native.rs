@@ -1,5 +1,11 @@
-// uni/native.rs — Native (POSIX) backend: sockets + stdio.
-// Also provides main() for the native entry point.
+// uni/native.rs — Native (POSIX) backend: multi-threaded sockets + stdio.
+//
+// Each worker thread has its own:
+//   - Listener socket (SO_REUSEPORT — OS distributes connections)
+//   - Connection pool
+//   - poll() loop
+//
+// This mirrors the unikernel's per-core event loop architecture.
 
 use core::ptr;
 
@@ -32,10 +38,15 @@ const SO_REUSEADDR: i32 = 0x0004;
 #[cfg(target_os = "linux")]
 const SO_REUSEADDR: i32 = 2;
 
+#[cfg(target_os = "macos")]
+const SO_REUSEPORT: i32 = 0x0200;
+#[cfg(target_os = "linux")]
+const SO_REUSEPORT: i32 = 15;
+
 #[cfg(target_os = "linux")]
 const MSG_NOSIGNAL: i32 = 0x4000;
 #[cfg(target_os = "macos")]
-const MSG_NOSIGNAL: i32 = 0; // SIGPIPE is ignored globally via signal()
+const MSG_NOSIGNAL: i32 = 0;
 
 const POLLIN: i16 = 0x0001;
 const POLLHUP: i16 = 0x0010;
@@ -78,6 +89,8 @@ type NfdsT = u32;
 #[cfg(target_os = "linux")]
 type NfdsT = u64;
 
+type PthreadT = usize;
+
 unsafe extern "C" {
     fn socket(domain: i32, sock_type: i32, protocol: i32) -> i32;
     fn bind(fd: i32, addr: *const SockAddrIn, len: u32) -> i32;
@@ -94,6 +107,10 @@ unsafe extern "C" {
     fn getenv(name: *const u8) -> *const u8;
     fn write(fd: i32, buf: *const u8, count: usize) -> isize;
     fn nanosleep(req: *const Timespec, rem: *mut Timespec) -> i32;
+    fn pthread_create(thread: *mut PthreadT, attr: *const u8,
+                      start: extern "C" fn(*mut u8) -> *mut u8, arg: *mut u8) -> i32;
+    fn pthread_join(thread: PthreadT, retval: *mut *mut u8) -> i32;
+    fn sysconf(name: i32) -> i64;
 
     #[cfg(target_os = "macos")]
     fn __error() -> *mut i32;
@@ -109,7 +126,6 @@ fn get_errno() -> i32 {
         { *__errno_location() }
     }
 }
-
 
 fn parse_u16(s: *const u8) -> u16 {
     let mut n: u32 = 0;
@@ -132,9 +148,21 @@ fn set_nonblocking(fd: i32) {
     }
 }
 
+fn num_cpus() -> usize {
+    #[cfg(target_os = "macos")]
+    const SC_NPROCESSORS_ONLN: i32 = 58;
+    #[cfg(target_os = "linux")]
+    const SC_NPROCESSORS_ONLN: i32 = 84;
+    let n = unsafe { sysconf(SC_NPROCESSORS_ONLN) };
+    if n > 0 { n as usize } else { 1 }
+}
+
 // ============================================================================
-// Connection pool
+// Per-thread connection pool
 // ============================================================================
+
+const CONNS_PER_THREAD: usize = 64;
+const MAX_THREADS: usize = 16;
 
 #[derive(Clone, Copy)]
 struct NativeConn {
@@ -150,12 +178,21 @@ impl NativeConn {
     }
 }
 
-const CONN_POOL_SIZE: usize = 256;
-static mut POOL: [NativeConn; CONN_POOL_SIZE] = [NativeConn::empty(); CONN_POOL_SIZE];
+struct ThreadState {
+    conns: [NativeConn; CONNS_PER_THREAD],
+    thread_id: u32,
+}
 
-unsafe fn alloc_conn() -> *mut NativeConn {
-    unsafe {
-        for c in POOL.iter_mut() {
+impl ThreadState {
+    const fn new(id: u32) -> Self {
+        ThreadState {
+            conns: [NativeConn::empty(); CONNS_PER_THREAD],
+            thread_id: id,
+        }
+    }
+
+    fn alloc_conn(&mut self) -> *mut NativeConn {
+        for c in self.conns.iter_mut() {
             if c.closed && c.fd < 0 {
                 *c = NativeConn { fd: -1, is_listener: false, closed: false, has_pending_data: false };
                 return c as *mut NativeConn;
@@ -163,43 +200,116 @@ unsafe fn alloc_conn() -> *mut NativeConn {
         }
         ptr::null_mut()
     }
-}
 
-unsafe fn release_conn(c: *mut NativeConn) {
-    unsafe {
-        if (*c).fd >= 0 {
-            shutdown((*c).fd, SHUT_RDWR);
-            close((*c).fd);
-            (*c).fd = -1;
+    fn release_conn(&mut self, c: *mut NativeConn) {
+        unsafe {
+            if (*c).fd >= 0 {
+                shutdown((*c).fd, SHUT_RDWR);
+                close((*c).fd);
+                (*c).fd = -1;
+            }
+            (*c).closed = true;
+            (*c).has_pending_data = false;
+            (*c).is_listener = false;
         }
-        (*c).closed = true;
-        (*c).has_pending_data = false;
-        (*c).is_listener = false;
+    }
+
+    fn poll_fds(&mut self) {
+        let mut fds = [PollFd { fd: 0, events: 0, revents: 0 }; CONNS_PER_THREAD];
+        let mut map = [ptr::null_mut::<NativeConn>(); CONNS_PER_THREAD];
+        let mut n: usize = 0;
+        for c in self.conns.iter_mut() {
+            if !c.closed && c.fd >= 0 {
+                fds[n] = PollFd { fd: c.fd, events: POLLIN, revents: 0 };
+                map[n] = c as *mut NativeConn;
+                n += 1;
+            }
+        }
+        if n == 0 { return; }
+        unsafe { poll(fds.as_mut_ptr(), n as NfdsT, 0); }
+        for i in 0..n {
+            if fds[i].revents & (POLLIN | POLLHUP | POLLERR) != 0 {
+                unsafe { (*map[i]).has_pending_data = true; }
+            }
+        }
+    }
+
+    fn wait_for_events(&mut self) {
+        let mut fds = [PollFd { fd: 0, events: 0, revents: 0 }; CONNS_PER_THREAD];
+        let mut map = [ptr::null_mut::<NativeConn>(); CONNS_PER_THREAD];
+        let mut n: usize = 0;
+        for c in self.conns.iter_mut() {
+            if !c.closed && c.fd >= 0 {
+                fds[n] = PollFd { fd: c.fd, events: POLLIN, revents: 0 };
+                map[n] = c as *mut NativeConn;
+                n += 1;
+            }
+        }
+        if n == 0 {
+            let ts = Timespec { tv_sec: 0, tv_nsec: 1_000_000 };
+            unsafe { nanosleep(&ts, ptr::null_mut()); }
+            return;
+        }
+        unsafe { poll(fds.as_mut_ptr(), n as NfdsT, 10); }
+        for i in 0..n {
+            if fds[i].revents & (POLLIN | POLLHUP | POLLERR) != 0 {
+                unsafe { (*map[i]).has_pending_data = true; }
+            }
+        }
     }
 }
 
 // ============================================================================
-// State
+// Global state
 // ============================================================================
 
+static mut THREADS: [ThreadState; MAX_THREADS] = [const { ThreadState::new(0) }; MAX_THREADS];
+static mut NUM_THREADS: usize = 1;
 static mut CONFIG_PORT: u16 = 0;
 static mut SHUTDOWN: bool = false;
 
+/// Get the current thread's state. Thread ID is stored in a thread-local-like
+/// fashion by passing it through the worker function argument.
+/// For the main thread (thread 0), we access THREADS[0] directly.
+fn thread_state(id: u32) -> &'static mut ThreadState {
+    unsafe { &mut THREADS[id as usize] }
+}
+
+// ============================================================================
+// Helpers for the uni API (dispatched by thread_id)
+// ============================================================================
+
+// Thread-local thread ID (set per-thread at start)
+#[cfg(not(target_arch = "wasm32"))]
+static mut CURRENT_THREAD_ID: u32 = 0;
+
+fn current_thread_id() -> u32 {
+    unsafe { CURRENT_THREAD_ID }
+}
+
 unsafe extern "C" fn sigint_handler(_sig: i32) {
-    unsafe {
-        SHUTDOWN = true;
-    }
+    unsafe { SHUTDOWN = true; }
 }
 
 fn init_native() {
     unsafe {
-        // Parse $PORT
         let p = getenv(b"PORT\0".as_ptr());
         if !p.is_null() && *p != 0 {
             CONFIG_PORT = parse_u16(p);
         }
 
-        // Signal handlers
+        // Determine thread count from environment or CPU count
+        let t = getenv(b"THREADS\0".as_ptr());
+        if !t.is_null() && *t != 0 {
+            NUM_THREADS = parse_u16(t) as usize;
+        } else {
+            NUM_THREADS = num_cpus().min(MAX_THREADS);
+        }
+
+        for i in 0..NUM_THREADS {
+            THREADS[i].thread_id = i as u32;
+        }
+
         signal(SIGINT, sigint_handler as usize);
         signal(SIGTERM, sigint_handler as usize);
         signal(SIGPIPE, SIG_IGN);
@@ -224,43 +334,19 @@ pub fn check_shutdown() -> bool {
 }
 
 pub fn wait_for_events() {
-    unsafe {
-        let mut fds = [PollFd { fd: 0, events: 0, revents: 0 }; CONN_POOL_SIZE];
-        let mut n: usize = 0;
-        for c in POOL.iter() {
-            if !c.closed && c.fd >= 0 {
-                fds[n] = PollFd { fd: c.fd, events: POLLIN, revents: 0 };
-                n += 1;
-            }
-        }
-        if n == 0 {
-            let ts = Timespec { tv_sec: 0, tv_nsec: 1_000_000 }; // 1 ms
-            nanosleep(&ts, ptr::null_mut());
-            return;
-        }
-        poll(fds.as_mut_ptr(), n as NfdsT, 10);
-        for i in 0..n {
-            if fds[i].revents & (POLLIN | POLLHUP | POLLERR) != 0 {
-                for c in POOL.iter_mut() {
-                    if c.fd == fds[i].fd {
-                        c.has_pending_data = true;
-                        break;
-                    }
-                }
-            }
-        }
-    }
+    thread_state(current_thread_id()).wait_for_events();
 }
 
-// ---- TCP --------------------------------------------------------------------
+// ---- TCP (per-thread) -------------------------------------------------------
 
-pub fn tcp_listen(port: u16) -> *mut () {
+fn make_listener(port: u16) -> i32 {
     unsafe {
         let fd = socket(AF_INET, SOCK_STREAM, 0);
-        if fd < 0 { return ptr::null_mut(); }
+        if fd < 0 { return -1; }
 
         let opt: i32 = 1;
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, 4);
+        setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, 4);
         set_nonblocking(fd);
 
         let addr = SockAddrIn {
@@ -271,32 +357,42 @@ pub fn tcp_listen(port: u16) -> *mut () {
             #[cfg(target_os = "linux")]
             sin_family: AF_INET as u16,
             sin_port: port.to_be(),
-            sin_addr: 0, // INADDR_ANY
+            sin_addr: 0,
             sin_zero: [0; 8],
         };
 
         if bind(fd, &addr, core::mem::size_of::<SockAddrIn>() as u32) < 0 {
-            close(fd);
-            return ptr::null_mut();
+            close(fd); return -1;
         }
         if listen(fd, 128) < 0 {
-            close(fd);
-            return ptr::null_mut();
+            close(fd); return -1;
         }
+        fd
+    }
+}
 
-        let c = alloc_conn();
-        if c.is_null() {
-            close(fd);
-            return ptr::null_mut();
-        }
+pub fn tcp_listen(port: u16) -> *mut () {
+    let tid = current_thread_id();
+    let ts = thread_state(tid);
+    let fd = make_listener(port);
+    if fd < 0 { return ptr::null_mut(); }
+
+    let c = ts.alloc_conn();
+    if c.is_null() {
+        unsafe { close(fd); }
+        return ptr::null_mut();
+    }
+    unsafe {
         (*c).fd = fd;
         (*c).is_listener = true;
-        c as *mut ()
     }
+    c as *mut ()
 }
 
 pub fn tcp_accept(handle: *mut ()) -> *mut () {
     let listener = handle as *mut NativeConn;
+    let tid = current_thread_id();
+    let ts = thread_state(tid);
     unsafe {
         if listener.is_null() || (*listener).fd < 0 || (*listener).closed {
             return ptr::null_mut();
@@ -312,7 +408,7 @@ pub fn tcp_accept(handle: *mut ()) -> *mut () {
 
         set_nonblocking(fd);
 
-        let c = alloc_conn();
+        let c = ts.alloc_conn();
         if c.is_null() {
             close(fd);
             return ptr::null_mut();
@@ -335,15 +431,8 @@ pub fn tcp_recv(handle: *mut (), buf: &mut [u8]) -> usize {
     unsafe {
         if c.is_null() || (*c).fd < 0 || (*c).closed { return 0; }
         let n = recv((*c).fd, buf.as_mut_ptr(), buf.len(), 0);
-        if n < 0 {
-            (*c).has_pending_data = false;
-            return 0;
-        }
-        if n == 0 {
-            (*c).closed = true;
-            (*c).has_pending_data = false;
-            return 0;
-        }
+        if n < 0 { (*c).has_pending_data = false; return 0; }
+        if n == 0 { (*c).closed = true; (*c).has_pending_data = false; return 0; }
         (*c).has_pending_data = false;
         n as usize
     }
@@ -360,10 +449,10 @@ pub fn tcp_send(handle: *mut (), data: &[u8]) -> i32 {
 
 pub fn tcp_close(handle: *mut ()) {
     let c = handle as *mut NativeConn;
-    unsafe {
-        if c.is_null() { return; }
-        release_conn(c);
-    }
+    if c.is_null() { return; }
+    // Find which thread owns this connection and release it
+    let tid = current_thread_id();
+    thread_state(tid).release_conn(c);
 }
 
 pub fn tcp_is_closed(handle: *mut ()) -> bool {
@@ -372,38 +461,75 @@ pub fn tcp_is_closed(handle: *mut ()) -> bool {
 }
 
 pub fn tcp_poll() {
-    unsafe {
-        let mut fds = [PollFd { fd: 0, events: 0, revents: 0 }; CONN_POOL_SIZE];
-        let mut map = [ptr::null_mut::<NativeConn>(); CONN_POOL_SIZE];
-        let mut n: usize = 0;
-        for c in POOL.iter_mut() {
-            if !c.closed && c.fd >= 0 {
-                fds[n] = PollFd { fd: c.fd, events: POLLIN, revents: 0 };
-                map[n] = c as *mut NativeConn;
-                n += 1;
-            }
-        }
-        if n == 0 { return; }
-        poll(fds.as_mut_ptr(), n as NfdsT, 0);
-        for i in 0..n {
-            if fds[i].revents & (POLLIN | POLLHUP | POLLERR) != 0 {
-                (*map[i]).has_pending_data = true;
-            }
-        }
-    }
+    thread_state(current_thread_id()).poll_fds();
 }
 
 // ============================================================================
-// Native entry point — replaces native_main.cc
+// Native entry point
 // ============================================================================
 
 unsafe extern "C" {
     fn uni_main();
 }
 
+extern "C" fn worker_thread(arg: *mut u8) -> *mut u8 {
+    let tid = arg as u32;
+    unsafe { CURRENT_THREAD_ID = tid; }
+
+    // Import the Server pointer from http.rs
+    // Workers call the same service_core() as the unikernel APs.
+    // The Server is set up by the main thread before workers start.
+    unsafe extern "C" { fn native_worker_loop(thread_id: u32); }
+    unsafe { native_worker_loop(tid); }
+    ptr::null_mut()
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn main() -> i32 {
     init_native();
-    unsafe { uni_main() };
+    unsafe {
+        uni_main();
+
+        // Start worker threads (if multi-threaded)
+        let mut thread_handles = [0usize; MAX_THREADS];
+        for i in 1..NUM_THREADS {
+            pthread_create(
+                &mut thread_handles[i],
+                ptr::null(),
+                worker_thread,
+                i as *mut u8,
+            );
+        }
+
+        // Main thread is worker 0
+        CURRENT_THREAD_ID = 0;
+        native_worker_loop(0);
+
+        // Join workers
+        for i in 1..NUM_THREADS {
+            if thread_handles[i] != 0 {
+                pthread_join(thread_handles[i], ptr::null_mut());
+            }
+        }
+    }
     0
+}
+
+/// Called by each worker thread (including main).
+#[unsafe(no_mangle)]
+pub extern "C" fn native_worker_loop(thread_id: u32) {
+    unsafe { CURRENT_THREAD_ID = thread_id; }
+
+    // Worker threads (not thread 0) need their own SO_REUSEPORT listener.
+    // Thread 0's listener was already created by Server::listen().
+    if thread_id > 0 {
+        crate::http::native_add_listener(thread_id);
+    }
+
+    loop {
+        if check_shutdown() { break; }
+        tcp_poll();
+        crate::http::native_service(thread_id);
+        wait_for_events();
+    }
 }

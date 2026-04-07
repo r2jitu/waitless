@@ -210,8 +210,10 @@ pub struct Server {
     cores: [CoreHttp; MAX_CORES],
 }
 
-// Global server pointer for AP poll callback.
+// Global server pointer for AP poll callback / native worker threads.
 static mut SERVER_PTR: *mut Server = core::ptr::null_mut();
+// Listen port (needed by native worker threads to create SO_REUSEPORT listeners).
+static mut LISTEN_PORT: u16 = 0;
 
 impl Server {
     pub const fn new() -> Self {
@@ -266,7 +268,10 @@ impl Server {
         }
 
         // Register service callback with the kernel event loop.
-        unsafe { SERVER_PTR = self as *mut Server; }
+        unsafe {
+            SERVER_PTR = self as *mut Server;
+            LISTEN_PORT = port;
+        }
         #[cfg(platform_unikernel)]
         kernel::eventloop::set_service(http_service_cb);
 
@@ -287,15 +292,9 @@ impl Server {
 
         #[cfg(not(platform_unikernel))]
         {
-            // Native: simple polling loop (no kernel event loop)
-            loop {
-                if crate::check_shutdown() { break; }
-                crate::tcp_poll();
-                let had_work = self.service_core(0);
-                if !had_work {
-                    crate::wait_for_events();
-                }
-            }
+            // Native: listen() already set up thread 0's listener.
+            // Return to main() which spawns worker threads and enters
+            // native_worker_loop(0). This allows multi-threaded operation.
         }
     }
 
@@ -412,6 +411,31 @@ fn alloc_active(active: &mut [ActiveConn; MAX_ACTIVE]) -> Option<&mut ActiveConn
 
 /// Event loop service callback: service HTTP connections on this core.
 /// Network poll + inbox drain are handled by the event loop itself.
+/// Called by native worker threads to create their own SO_REUSEPORT listener.
+#[cfg(not(platform_unikernel))]
+pub fn native_add_listener(thread_id: u32) {
+    let port = unsafe { LISTEN_PORT };
+    let server = unsafe {
+        if SERVER_PTR.is_null() { return; }
+        &mut *SERVER_PTR
+    };
+    let handle = crate::backend::tcp_listen(port);
+    if !handle.is_null() {
+        server.cores[thread_id as usize].listener = Some(TcpListener(handle));
+    }
+}
+
+/// Called by native worker threads to service HTTP connections.
+#[cfg(not(platform_unikernel))]
+pub fn native_service(thread_id: u32) {
+    let server = unsafe {
+        if SERVER_PTR.is_null() { return; }
+        &mut *SERVER_PTR
+    };
+    server.service_core(thread_id);
+}
+
+#[cfg(platform_unikernel)]
 fn http_service_cb(core_id: u32) -> bool {
     let server = unsafe {
         if SERVER_PTR.is_null() { return false; }
