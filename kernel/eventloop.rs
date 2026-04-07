@@ -102,7 +102,7 @@ pub fn run(core_id: u32) -> ! {
     let mut consecutive_idle: u32 = 0;
 
     loop {
-        if is_shutdown() { break; }
+        if loops & 63 == 0 && is_shutdown() { break; }
         loops += 1;
 
         let mut did_work = false;
@@ -140,11 +140,13 @@ pub fn run(core_id: u32) -> ! {
             crate::serial::puts(b"\n");
         }
 
-        // 4. Check for shutdown
-        if let Some(f) = unsafe { core::ptr::read_volatile(&raw const CB.check_shutdown) } {
-            if f() {
-                request_shutdown();
-                break;
+        // 4. Check for shutdown (every 64 iterations to avoid MMIO overhead)
+        if loops & 63 == 0 {
+            if let Some(f) = unsafe { core::ptr::read_volatile(&raw const CB.check_shutdown) } {
+                if f() {
+                    request_shutdown();
+                    break;
+                }
             }
         }
 
@@ -154,26 +156,28 @@ pub fn run(core_id: u32) -> ! {
         } else {
             idle_count += 1;
             consecutive_idle = consecutive_idle.saturating_add(1);
+
+            // Flush before sleeping (responses may be staged).
             if let Some(f) = unsafe { core::ptr::read_volatile(&raw const CB.net_flush) } {
-                f(); // one more flush before sleeping
+                f();
             }
-            // Backoff: after many consecutive idles, pause longer to reduce
-            // CPU waste. Capped at 1024 PAUSE instructions (~5us).
-            let backoff = (consecutive_idle.min(10) * 100) as u32;
-            for _ in 0..backoff {
-                core::hint::spin_loop();
-            }
-            if consecutive_idle < 10 {
-                // Light idle: just yield briefly, stay responsive
-                core::hint::spin_loop();
-            } else if let Some(f) = unsafe { core::ptr::read_volatile(&raw const CB.idle) } {
-                // Heavy idle: deep sleep (interrupt-armed WFI/HLT)
-                f(core_id);
+
+            // Graduated backoff: spin briefly first, then deep sleep.
+            // This reduces wasted HLT/WFI wakeups under MTTCG where
+            // HLT doesn't properly block the host thread.
+            if consecutive_idle < 8 {
+                // Light idle: brief spin, stay responsive for incoming work
+                for _ in 0..100u32 { core::hint::spin_loop(); }
             } else {
-                #[cfg(target_arch = "aarch64")]
-                unsafe { core::arch::asm!("wfe", options(nomem, nostack)); }
-                #[cfg(target_arch = "x86_64")]
-                unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
+                // Heavy idle: deep sleep (interrupt-armed)
+                if let Some(f) = unsafe { core::ptr::read_volatile(&raw const CB.idle) } {
+                    f(core_id);
+                } else {
+                    #[cfg(target_arch = "aarch64")]
+                    unsafe { core::arch::asm!("wfe", options(nomem, nostack)); }
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
+                }
             }
         }
     }

@@ -216,6 +216,10 @@ pub fn init_eventloop() {
 }
 
 fn net_poll_cb(_core_id: u32) -> bool {
+    // Quick check: is the RX lock free? Skip CAS if held.
+    if RX_LOCK.load(core::sync::atomic::Ordering::Relaxed) != 0 {
+        return false;
+    }
     poll()
 }
 
