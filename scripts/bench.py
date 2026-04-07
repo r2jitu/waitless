@@ -139,6 +139,34 @@ class QemuEnv:
         return f"QEMU {cpus}c" + (" MTTCG" if cpus > 1 else "")
 
 
+class QemuAarch64Env:
+    name = "qemu-arm"
+    label = "QEMU aarch64 TCG"
+
+    def build(self):
+        subprocess.run(
+            ["bazel", "build", "--config=aarch64-qemu", "//apps/webserver:webserver.img"],
+            capture_output=True, cwd=PROJECT_ROOT, timeout=120)
+
+    def start(self, cpus, port):
+        img = os.path.join(PROJECT_ROOT, "bazel-bin/apps/webserver/webserver.img")
+        cmd = ["qemu-system-aarch64", "-machine", "virt", "-cpu", "max",
+               "-m", "128", "-smp", str(cpus), "-nographic",
+               "-serial", f"file:/tmp/bench_{port}.log", "-no-reboot",
+               "-device", "virtio-net-device,netdev=net0",
+               "-netdev", f"user,id=net0,hostfwd=tcp::{port}-:80,hostfwd=udp::{port+1}-:7",
+               "-kernel", img]
+        return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def stop(self, proc):
+        if proc and proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+    def core_label(self, cpus):
+        return f"ARM {cpus}c"
+
+
 class VzEnv:
     name = "vz"
     label = "VZ.framework"
@@ -236,6 +264,7 @@ class NativeEnv:
 
 ENV_MAP = {
     "qemu": QemuEnv,
+    "qemu-arm": QemuAarch64Env,
     "vz": VzEnv,
     "docker": DockerEnv,
     "native": NativeEnv,
@@ -273,7 +302,7 @@ def main():
     core_counts = [int(c) for c in args.cores.split(",")]
 
     if args.env == "all":
-        env_names = ["qemu", "vz", "docker", "native"]
+        env_names = ["qemu", "qemu-arm", "vz", "docker", "native"]
     else:
         env_names = [e.strip() for e in args.env.split(",")]
 
@@ -366,16 +395,15 @@ def main():
     for env_name, cpus in columns:
         env = envs[env_name]
         hdr += f" {env.core_label(cpus):>12s}"
-    # Scaling column if we have 1-core and multi-core for same env
-    has_scaling = False
+    # Scaling columns: one per environment that has multiple core counts
+    scaling_envs = []
     for env_name in env_names:
         env_cores = [c for c in core_counts if not (env_name in single_core_only and c > 1)]
         if len(env_cores) > 1:
-            has_scaling = True
-            hdr += f" {'Scaling':>8s}"
-            break
+            scaling_envs.append(env_name)
+            hdr += f" {envs[env_name].label[:6]+' ×':>8s}"
     print(hdr)
-    print(f"  {'─'*22}" + f" {'─'*12}" * len(columns) + (" " + "─"*8 if has_scaling else ""))
+    print(f"  {'─'*22}" + f" {'─'*12}" * len(columns) + (f" {'─'*8}" * len(scaling_envs)))
 
     # Rows
     for w in workloads:
@@ -385,18 +413,15 @@ def main():
             val = results.get((env_name, cpus, wname), (0, "", ""))
             row += f" {val[0]:>10.0f}  "
 
-        # Scaling: compare first and last core count for first env with multiple cores
-        if has_scaling:
-            for env_name in env_names:
-                env_cores = [c for c in core_counts if not (env_name in single_core_only and c > 1)]
-                if len(env_cores) > 1:
-                    base = results.get((env_name, env_cores[0], wname), (0,))[0]
-                    top = results.get((env_name, env_cores[-1], wname), (0,))[0]
-                    if base > 0:
-                        row += f" {top/base:>6.2f}x"
-                    else:
-                        row += f" {'N/A':>7s}"
-                    break
+        # Per-environment scaling columns
+        for env_name in scaling_envs:
+            env_cores = [c for c in core_counts if not (env_name in single_core_only and c > 1)]
+            base = results.get((env_name, env_cores[0], wname), (0,))[0]
+            top = results.get((env_name, env_cores[-1], wname), (0,))[0]
+            if base > 0:
+                row += f" {top/base:>6.2f}x"
+            else:
+                row += f" {'N/A':>7s}"
         print(row)
 
     print("=" * (24 + 14 * len(columns) + 10))
