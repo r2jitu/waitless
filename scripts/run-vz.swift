@@ -412,12 +412,11 @@ final class NetBridge {
 
     func run() {
         // Enlarge socketpair buffers for burst throughput.
-        // vmFD stays BLOCKING for writes — if the buffer fills, we apply
-        // backpressure instead of silently dropping frames (which kills TCP).
-        // Reads use MSG_DONTWAIT to avoid blocking the event loop.
-        var bufSize: Int32 = 1024 * 1024
+        var bufSize: Int32 = 4 * 1024 * 1024
         setsockopt(vmFD, SOL_SOCKET, SO_SNDBUF, &bufSize, 4)
         setsockopt(vmFD, SOL_SOCKET, SO_RCVBUF, &bufSize, 4)
+        // vmFD stays blocking — non-blocking drops too many frames under load.
+        // The enlarged buffers prevent blocking in normal operation.
 
         // Listen socket
         let listenFD = socket(AF_INET, SOCK_STREAM, 0)

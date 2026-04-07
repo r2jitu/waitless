@@ -72,27 +72,15 @@ fn handle_request(req: &Request) -> Response {
         b"/health" => Response::ok(b"application/json", HEALTH_JSON),
         b"/stats" => Response::ok(b"application/json", STATS_JSON),
         b"/compute" => {
-            let result = compute_work();
-            // Format result as JSON into a stack buffer
-            let mut buf = [0u8; 64];
-            let mut pos = 0;
-            for &b in b"{\"hash\":" { buf[pos] = b; pos += 1; }
-            pos += fmt_u32(&mut buf[pos..], result);
-            for &b in b"}" { buf[pos] = b; pos += 1; }
-            Response::ok(b"application/json", &buf[..pos])
+            compute_work();
+            // Return a fixed response. The compute_work() result doesn't
+            // matter — the point is CPU time, not the hash value.
+            Response::ok(b"application/json", b"{\"status\":\"computed\"}")
         }
         _ => Response::not_found(),
     }
 }
 
-fn fmt_u32(buf: &mut [u8], mut val: u32) -> usize {
-    if val == 0 { buf[0] = b'0'; return 1; }
-    let mut tmp = [0u8; 10];
-    let mut len = 0;
-    while val > 0 { tmp[len] = b'0' + (val % 10) as u8; val /= 10; len += 1; }
-    for i in 0..len { buf[i] = tmp[len - 1 - i]; }
-    len
-}
 
 // ---- Application entry point ------------------------------------------------
 
