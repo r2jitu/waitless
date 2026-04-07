@@ -318,9 +318,8 @@ def main():
             sys.exit(1)
 
     # These environments only run single-core benchmarks.
-    # VZ: multi-core networking has inbox visibility issues.
     # ARM TCG: no MTTCG support.
-    single_core_only = {"docker", "vz", "qemu-arm"}
+    single_core_only = {"docker", "qemu-arm"}
 
     # Kill stale processes
     subprocess.run(["pkill", "-9", "-f", "qemu-system"], capture_output=True)

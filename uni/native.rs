@@ -581,8 +581,20 @@ pub extern "C" fn main() -> i32 {
     init_native();
     unsafe {
         uni_main();
+        // uni_main called server.listen() which created thread 0's listener
+        // and called set_ready(). But workers need their SO_REUSEPORT
+        // listeners BEFORE any clients connect, otherwise all connections
+        // land on thread 0.
 
-        // Start worker threads (if multi-threaded)
+        // Create worker listeners on the main thread (before spawning).
+        // Each listener gets SO_REUSEPORT so the OS distributes connections.
+        for i in 1..NUM_THREADS {
+            CURRENT_THREAD_ID = i as u32;
+            crate::http::add_worker_listener(i as u32);
+        }
+        CURRENT_THREAD_ID = 0;
+
+        // Start worker threads
         let mut thread_handles = [0usize; MAX_THREADS];
         for i in 1..NUM_THREADS {
             pthread_create(
@@ -612,11 +624,7 @@ pub extern "C" fn main() -> i32 {
 pub extern "C" fn native_worker_loop(thread_id: u32) {
     unsafe { CURRENT_THREAD_ID = thread_id; }
 
-    // Worker threads (not thread 0) create their own SO_REUSEPORT listener.
-    if thread_id > 0 {
-        crate::http::add_worker_listener(thread_id);
-    }
-
+    // Listeners already created by main() before spawning threads.
     // Enter the callback-driven event loop (same structure as kernel's).
     crate::backend::run_worker(thread_id);
 }
