@@ -62,12 +62,20 @@ start_qemu() {
         log="$VM_LOG"
     fi
     local cpus="${UNIKERNEL_CPUS:-1}"
+    local dev_extra=""
+    # Enable VirtIO multi-queue for PCI devices with multiple vCPUs.
+    # MMIO devices (virtio-net-device) don't support mq parameter.
+    # user-mode netdev doesn't support queues= parameter.
+    if [[ "$cpus" -gt 1 ]] && [[ "$VIRTIO_DEV" == *"-pci"* ]]; then
+        local vectors=$(( 2 * cpus + 2 ))
+        dev_extra=",mq=on,vectors=$vectors"
+    fi
     "$QEMU_BIN" \
         "$@" \
         -m 128 -smp "$cpus" -nographic \
         -serial "file:${log}" \
         -no-reboot \
-        -device "${VIRTIO_DEV}",netdev=net0 \
+        -device "${VIRTIO_DEV}${dev_extra}",netdev=net0 \
         -netdev "user,id=net0,hostfwd=tcp::${port}-:80,hostfwd=udp::$((port+1))-:7" \
         &>/dev/null &
     VM_PID=$!
