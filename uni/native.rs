@@ -15,6 +15,7 @@ use core::ptr;
 
 const AF_INET: i32 = 2;
 const SOCK_STREAM: i32 = 1;
+const SOCK_DGRAM: i32 = 2;
 const SHUT_RDWR: i32 = 2;
 const F_GETFL: i32 = 3;
 const F_SETFL: i32 = 4;
@@ -118,6 +119,10 @@ unsafe extern "C" {
     fn accept(fd: i32, addr: *mut u8, len: *mut u32) -> i32;
     fn recv(fd: i32, buf: *mut u8, len: usize, flags: i32) -> isize;
     fn send(fd: i32, buf: *const u8, len: usize, flags: i32) -> isize;
+    fn recvfrom(fd: i32, buf: *mut u8, len: usize, flags: i32,
+                addr: *mut SockAddrIn, addrlen: *mut u32) -> isize;
+    fn sendto(fd: i32, buf: *const u8, len: usize, flags: i32,
+              addr: *const SockAddrIn, addrlen: u32) -> isize;
     fn close(fd: i32) -> i32;
     fn shutdown(fd: i32, how: i32) -> i32;
     fn setsockopt(fd: i32, level: i32, name: i32, val: *const i32, len: u32) -> i32;
@@ -395,11 +400,12 @@ fn init_native() {
         signal(SIGPIPE, SIG_IGN);
     }
 
-    // Register TCP as an IO poll source with the event loop.
+    // Register IO poll sources with the event loop.
     crate::register_io_poll(|_worker_id| {
         tcp_poll();
-        false // tcp_poll marks has_pending_data on ready fds; service callback checks it
+        false
     });
+    crate::register_io_poll(udp_poll);
 }
 
 // ============================================================================
@@ -554,6 +560,117 @@ pub fn tcp_is_closed(handle: *mut ()) -> bool {
 
 pub fn tcp_poll() {
     thread_state(current_thread_id()).poll_events();
+}
+
+// ============================================================================
+// UDP support
+// ============================================================================
+
+const MAX_UDP_BINDINGS: usize = 8;
+
+struct UdpBinding {
+    fd: i32,
+    port: u16,
+    handler: fn([u8; 4], u16, &[u8]),
+}
+
+static mut UDP_BINDINGS: [Option<UdpBinding>; MAX_UDP_BINDINGS] =
+    [const { None }; MAX_UDP_BINDINGS];
+static mut UDP_COUNT: usize = 0;
+
+pub fn native_udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
+    unsafe {
+        if UDP_COUNT >= MAX_UDP_BINDINGS { return; }
+
+        let fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if fd < 0 { return; }
+
+        let opt: i32 = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, 4);
+        set_nonblocking(fd);
+
+        let addr = SockAddrIn {
+            #[cfg(target_os = "macos")]
+            sin_len: core::mem::size_of::<SockAddrIn>() as u8,
+            #[cfg(target_os = "macos")]
+            sin_family: AF_INET as u8,
+            #[cfg(target_os = "linux")]
+            sin_family: AF_INET as u16,
+            sin_port: port.to_be(),
+            sin_addr: 0,
+            sin_zero: [0; 8],
+        };
+
+        if bind(fd, &addr, core::mem::size_of::<SockAddrIn>() as u32) < 0 {
+            close(fd);
+            return;
+        }
+
+        // Register with thread 0's kqueue for polling
+        thread_state(0).register_fd(fd);
+
+        UDP_BINDINGS[UDP_COUNT] = Some(UdpBinding { fd, port, handler });
+        UDP_COUNT += 1;
+    }
+}
+
+pub fn native_udp_send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
+    unsafe {
+        // Find the binding for src_port to get the fd
+        let mut send_fd = -1;
+        for i in 0..UDP_COUNT {
+            if let Some(ref b) = UDP_BINDINGS[i] {
+                if b.port == src_port {
+                    send_fd = b.fd;
+                    break;
+                }
+            }
+        }
+        if send_fd < 0 {
+            // No binding — create ephemeral socket
+            send_fd = socket(AF_INET, SOCK_DGRAM, 0);
+            if send_fd < 0 { return; }
+        }
+
+        let dst_addr = SockAddrIn {
+            #[cfg(target_os = "macos")]
+            sin_len: core::mem::size_of::<SockAddrIn>() as u8,
+            #[cfg(target_os = "macos")]
+            sin_family: AF_INET as u8,
+            #[cfg(target_os = "linux")]
+            sin_family: AF_INET as u16,
+            sin_port: dst_port.to_be(),
+            sin_addr: u32::from_be_bytes(dst_ip),
+            sin_zero: [0; 8],
+        };
+
+        sendto(send_fd, data.as_ptr(), data.len(), 0,
+               &dst_addr, core::mem::size_of::<SockAddrIn>() as u32);
+    }
+}
+
+/// Poll UDP sockets and dispatch to handlers. Called as IO poll callback.
+fn udp_poll(_worker_id: u32) -> bool {
+    let mut did_work = false;
+    unsafe {
+        let mut buf = [0u8; 2048];
+        for i in 0..UDP_COUNT {
+            if let Some(ref b) = UDP_BINDINGS[i] {
+                loop {
+                    let mut src_addr: SockAddrIn = core::mem::zeroed();
+                    let mut addr_len = core::mem::size_of::<SockAddrIn>() as u32;
+                    let n = recvfrom(b.fd, buf.as_mut_ptr(), buf.len(), 0,
+                                     &mut src_addr, &mut addr_len);
+                    if n <= 0 { break; }
+                    let src_ip = src_addr.sin_addr.to_be_bytes();
+                    let src_port = u16::from_be(src_addr.sin_port);
+                    (b.handler)(src_ip, src_port, &buf[..n as usize]);
+                    did_work = true;
+                }
+            }
+        }
+    }
+    did_work
 }
 
 // ============================================================================

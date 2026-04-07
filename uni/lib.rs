@@ -183,12 +183,14 @@ pub fn udp_send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
 }
 
 #[cfg(platform_native)]
-pub fn udp_bind(_port: u16, _handler: fn([u8; 4], u16, &[u8])) {
-    log(b"[WARN] UDP not implemented on native backend\n");
+pub fn udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
+    native::native_udp_bind(port, handler);
 }
 
 #[cfg(platform_native)]
-pub fn udp_send(_dst_ip: [u8; 4], _src_port: u16, _dst_port: u16, _data: &[u8]) {}
+pub fn udp_send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
+    native::native_udp_send(dst_ip, src_port, dst_port, data);
+}
 
 // ---- TcpListener ------------------------------------------------------------
 
