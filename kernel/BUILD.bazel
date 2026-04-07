@@ -8,6 +8,7 @@ rust_library(
     srcs = [
         "bump.rs",
         "deque.rs",
+        "eventloop.rs",
         "lib.rs",
         "percpu.rs",
         "spsc.rs",

@@ -15,6 +15,7 @@ pub mod deque;
 pub mod spsc;
 pub mod timer;
 pub mod percpu;
+pub mod eventloop;
 
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;
