@@ -27,6 +27,15 @@ PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 PORT_COUNTER = [38000]
 
 
+def _drain(stream):
+    """Discard all output from a pipe to prevent the writer from blocking."""
+    try:
+        while stream.read(4096):
+            pass
+    except Exception:
+        pass
+
+
 def next_port():
     PORT_COUNTER[0] += 10
     return PORT_COUNTER[0]
@@ -192,8 +201,9 @@ class VzEnv:
     def wait_proxy_ready(self, proc, timeout=30):
         """Wait for run-vz to print PROXY_READY on stdout.
 
-        Returns True immediately once the sentinel arrives; falls back to
-        False if the process exits or the timeout expires.
+        Returns True immediately once the sentinel arrives and starts a
+        drain thread so the pipe never blocks the VM's serial writes.
+        Returns False if the process exits or the timeout expires.
         """
         import select
         deadline = time.monotonic() + timeout
@@ -205,6 +215,10 @@ class VzEnv:
             if rlist:
                 line = proc.stdout.readline()
                 if b"PROXY_READY" in line:
+                    # Drain remaining stdout in background so the pipe never
+                    # fills up and blocks the VM's serial console writes.
+                    t = threading.Thread(target=lambda: _drain(proc.stdout), daemon=True)
+                    t.start()
                     return True
         return False
 
@@ -213,7 +227,10 @@ class VzEnv:
             proc.kill()
             proc.wait()
         if proc and proc.stdout:
-            proc.stdout.close()
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
         # VZ.framework tears down the VM asynchronously; give it time
         # to release the virtual network interface before the next start.
         time.sleep(6)

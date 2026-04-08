@@ -418,12 +418,12 @@ fn init_native() {
         signal(SIGPIPE, SIG_IGN);
     }
 
-    // Register IO poll sources with the event loop.
+    // Register TCP IO poll with the event loop.
+    // UDP has its own dedicated thread (spawned in native_udp_bind).
     crate::register_io_poll(|_worker_id| {
         tcp_poll();
         false
     });
-    crate::register_io_poll(udp_poll);
 }
 
 // ============================================================================
@@ -637,12 +637,44 @@ pub fn native_udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
             return;
         }
 
-        // Register with thread 0's kqueue for polling
-        thread_state(0).register_fd(fd);
+        // Make the socket blocking — the dedicated UDP thread will block on
+        // recvfrom(), matching the VZ proxy's dedicated kqueue thread model.
+        let flags = fcntl(fd, F_GETFL, 0i32);
+        fcntl(fd, F_SETFL, flags & !O_NONBLOCK);
 
         UDP_BINDINGS[UDP_COUNT] = Some(UdpBinding { fd, app_port: port, handler });
         UDP_COUNT += 1;
+
+        // Spawn a dedicated thread that blocks on recvfrom() and dispatches
+        // the handler inline — no interleaving with TCP connection scanning.
+        // This matches the VZ Swift proxy's dedicated kqueue UDP loop.
+        let idx = UDP_COUNT - 1;
+        let mut thread: PthreadT = 0;
+        pthread_create(&mut thread, ptr::null(), udp_thread_fn, idx as *mut u8);
     }
+}
+
+extern "C" fn udp_thread_fn(arg: *mut u8) -> *mut u8 {
+    let idx = arg as usize;
+    let mut buf = [0u8; 65536];
+    loop {
+        unsafe {
+            let binding = match UDP_BINDINGS[idx] {
+                Some(ref b) => (b.fd, b.app_port, b.handler),
+                None => break,
+            };
+            let (fd, _app_port, handler) = binding;
+            let mut src_addr: SockAddrIn = core::mem::zeroed();
+            let mut addr_len = core::mem::size_of::<SockAddrIn>() as u32;
+            let n = recvfrom(fd, buf.as_mut_ptr(), buf.len(), 0,
+                             &mut src_addr, &mut addr_len);
+            if n <= 0 { break; }
+            let src_ip = src_addr.sin_addr.to_be_bytes();
+            let src_port = u16::from_be(src_addr.sin_port);
+            handler(src_ip, src_port, &buf[..n as usize]);
+        }
+    }
+    ptr::null_mut()
 }
 
 pub fn native_udp_send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
@@ -680,29 +712,6 @@ pub fn native_udp_send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8
     }
 }
 
-/// Poll UDP sockets and dispatch to handlers. Called as IO poll callback.
-fn udp_poll(_worker_id: u32) -> bool {
-    let mut did_work = false;
-    unsafe {
-        let mut buf = [0u8; 2048];
-        for i in 0..UDP_COUNT {
-            if let Some(ref b) = UDP_BINDINGS[i] {
-                loop {
-                    let mut src_addr: SockAddrIn = core::mem::zeroed();
-                    let mut addr_len = core::mem::size_of::<SockAddrIn>() as u32;
-                    let n = recvfrom(b.fd, buf.as_mut_ptr(), buf.len(), 0,
-                                     &mut src_addr, &mut addr_len);
-                    if n <= 0 { break; }
-                    let src_ip = src_addr.sin_addr.to_be_bytes();
-                    let src_port = u16::from_be(src_addr.sin_port);
-                    (b.handler)(src_ip, src_port, &buf[..n as usize]);
-                    did_work = true;
-                }
-            }
-        }
-    }
-    did_work
-}
 
 // ============================================================================
 // Native entry point
