@@ -48,6 +48,16 @@ platform(
     ],
 )
 
+# Native Linux aarch64 — builds host POSIX binaries (e.g., Oracle Cloud A1).
+platform(
+    name = "aarch64_linux",
+    constraint_values = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:linux",
+        ":native",
+    ],
+)
+
 # ── config_setting helpers used in select() expressions ──────────────────────
 config_setting(
     name = "x86_64",
