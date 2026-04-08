@@ -183,15 +183,37 @@ class VzEnv:
         env = os.environ.copy()
         env["UNIKERNEL_CPUS"] = str(cpus)
         env["UNIKERNEL_MEMORY"] = "128"
+        # Capture stdout to read the PROXY_READY sentinel.
         return subprocess.Popen(
             [run_vz, img, str(port)],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             env=env)
+
+    def wait_proxy_ready(self, proc, timeout=30):
+        """Wait for run-vz to print PROXY_READY on stdout.
+
+        Returns True immediately once the sentinel arrives; falls back to
+        False if the process exits or the timeout expires.
+        """
+        import select
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                return False
+            remaining = deadline - time.monotonic()
+            rlist, _, _ = select.select([proc.stdout], [], [], min(remaining, 1.0))
+            if rlist:
+                line = proc.stdout.readline()
+                if b"PROXY_READY" in line:
+                    return True
+        return False
 
     def stop(self, proc):
         if proc and proc.poll() is None:
             proc.kill()
             proc.wait()
+        if proc and proc.stdout:
+            proc.stdout.close()
         # VZ.framework tears down the VM asynchronously; give it time
         # to release the virtual network interface before the next start.
         time.sleep(6)
@@ -279,28 +301,35 @@ ENV_MAP = {
 def start_env_verified(env, cpus, port):
     """Start env and verify HTTP readiness.
 
-    VZ.framework sometimes fails to set up the virtual network interface in
-    time after a prior VM teardown. Use a short initial timeout (30s) so
-    failures are detected quickly, then retry once with the full timeout.
-    Non-VZ environments use the full timeout directly (no retry).
+    For VZ: wait for PROXY_READY sentinel (proxy ports bound), then poll
+    HTTP for the VM to finish booting. Retry once if first attempt fails.
+    For other envs: poll HTTP directly, no retry.
     """
-    first_timeout = 30 if isinstance(env, VzEnv) else 90
     proc = env.start(cpus, port)
     if proc is None:
         return None
-    if wait_http(port, timeout=first_timeout):
-        return proc
-    # First attempt failed — stop and retry (VZ only; others SKIP immediately).
-    env.stop(proc)
-    if not isinstance(env, VzEnv):
+
+    if isinstance(env, VzEnv):
+        # Phase 1: wait for proxy ports to be bound (fast, <1s normally).
+        if not env.wait_proxy_ready(proc, timeout=30):
+            env.stop(proc)
+            # Retry once — VZ network interface may not have been released yet.
+            proc = env.start(cpus, port)
+            if proc is None:
+                return None
+            if not env.wait_proxy_ready(proc, timeout=30):
+                env.stop(proc)
+                return None
+        # Phase 2: poll HTTP until the VM finishes booting.
+        if wait_http(port):
+            return proc
+        env.stop(proc)
         return None
-    proc = env.start(cpus, port)
-    if proc is None:
+    else:
+        if wait_http(port):
+            return proc
+        env.stop(proc)
         return None
-    if wait_http(port):
-        return proc
-    env.stop(proc)
-    return None
 
 # ── Workload definitions ─────────────────────────────────────────────────────
 

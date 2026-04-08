@@ -447,6 +447,12 @@ final class NetBridge {
         }
         _ = fcntl(udpFD, F_SETFL, fcntl(udpFD, F_GETFL, 0) | O_NONBLOCK)
 
+        // Signal to bench.py (or any parent process) that both proxy ports
+        // are bound and ready to accept connections. The parent reads stdout
+        // for this line instead of polling HTTP, eliminating startup race.
+        fputs("PROXY_READY\n", stdout)
+        fflush(stdout)
+
         // Create kqueue
         let kq = kqueue()
 

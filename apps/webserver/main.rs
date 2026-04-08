@@ -72,9 +72,9 @@ fn handle_request(req: &Request) -> Response {
         b"/health" => Response::ok(b"application/json", HEALTH_JSON),
         b"/stats" => Response::ok(b"application/json", STATS_JSON),
         b"/compute" => {
-            compute_work();
-            // Return a fixed response. The compute_work() result doesn't
-            // matter — the point is CPU time, not the hash value.
+            // black_box prevents the compiler from eliminating compute_work()
+            // as dead code (the return value would otherwise be unused).
+            core::hint::black_box(compute_work());
             Response::ok(b"application/json", b"{\"status\":\"computed\"}")
         }
         _ => Response::not_found(),
