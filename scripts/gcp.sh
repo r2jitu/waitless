@@ -66,7 +66,7 @@ _build() {
 _push() {
     local elf="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver.elf"
     echo "==> Copying image to GCP..."
-    scp "$elf" "$SSH_HOST:~/webserver.elf"
+    cat "$elf" | ssh "$SSH_HOST" "cat > ~/webserver.elf"
 }
 
 case "$cmd" in
@@ -110,7 +110,7 @@ case "$cmd" in
         echo "    URL: http://localhost:${HOST_PORT}/"
         echo "    Serial console below. Press Ctrl-C to stop."
         echo ""
-        ssh -t -L "${HOST_PORT}:localhost:${HOST_PORT}" "$SSH_HOST" \
+        ssh -tt -L "${HOST_PORT}:localhost:${HOST_PORT}" "$SSH_HOST" \
             "qemu-system-x86_64 \
                 -accel kvm \
                 -kernel ~/webserver.elf \
