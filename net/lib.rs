@@ -54,21 +54,9 @@ pub fn poll() -> bool {
         return drivers::virtio_net::poll(net_receive) > 0;
     }
 
-    // VZ-compat: no inbox distribution, but still need the RX lock
-    // to prevent concurrent VirtIO queue access under true parallelism.
-    if cfg!(vz_compat) {
-        if RX_LOCK.load(core::sync::atomic::Ordering::Acquire) != 0 {
-            return false;
-        }
-        RX_LOCK.store(1, core::sync::atomic::Ordering::Release);
-        drivers::virtio_net::flush_tx_staging();
-        let count = drivers::virtio_net::poll(net_receive);
-        RX_LOCK.store(0, core::sync::atomic::Ordering::Release);
-        drivers::virtio_net::flush_tx_staging();
-        return count > 0;
-    }
-
     // Tier 2: multi-core with software distribution.
+    // On VZ, only core 0 reaches here (net_poll_cb blocks other cores).
+    // poll_tier2 uses load/store for RX_LOCK under vz_compat.
     poll_tier2(num_cores)
 }
 
@@ -84,7 +72,10 @@ fn poll_tier2(num_cores: u32) -> bool {
 
     // Try to become the distributor.
     let got_lock = if cfg!(vz_compat) {
-        // VZ: load/store (CAS crashes on VZ guest RAM).
+        // VZ: load/store — VZ does not virtualize the exclusive monitor
+        // (both LDXR/STXR and LSE CAS → DFSC 0x35). On VZ, net_poll_cb
+        // only allows core 0 to poll, so contention is impossible; this
+        // is never racy in practice.
         if RX_LOCK.load(core::sync::atomic::Ordering::Acquire) != 0 { false }
         else { RX_LOCK.store(1, core::sync::atomic::Ordering::Release); true }
     } else {
@@ -237,8 +228,9 @@ pub fn init_eventloop() {
 }
 
 fn net_poll_cb(core_id: u32) -> bool {
-    // VZ-compat: only core 0 polls VirtIO (load/store lock has race window).
-    // QEMU: any core can poll (rotating distributor).
+    // VZ: only core 0 polls VirtIO (serializes queue access without CAS).
+    // Core 0 distributes to AP inboxes; APs only drain their inbox.
+    // QEMU: any core can be the rotating distributor.
     if cfg!(vz_compat) && core_id != 0 {
         return false;
     }

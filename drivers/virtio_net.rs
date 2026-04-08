@@ -782,10 +782,15 @@ pub fn has_pending_tx() -> bool {
 }
 
 /// Flush all per-core TX staging buffers into the VirtIO TX queue.
-/// Safe to call from any core — uses load/store TX lock. The lock
-/// prevents concurrent VirtIO TX queue access (load/store has a tiny
-/// race window but TX_PENDING check + lock makes double-entry unlikely).
+/// On VZ (vz_compat), only core 0 flushes — the load/store TX_LOCK is not
+/// truly atomic, and concurrent VirtIO queue access from APs would race.
+/// APs only stage TX; core 0 drains all staging during its poll cycle.
 pub fn flush_tx_staging() {
+    // On VZ, restrict flushing to core 0 to avoid concurrent VirtIO TX access.
+    // The load/store TX_LOCK cannot safely exclude APs from racing with core 0.
+    if cfg!(vz_compat) && kernel::cpu_id() != 0 {
+        return;
+    }
     if !TX_PENDING.load(Ordering::Acquire) {
         return;
     }

@@ -395,6 +395,7 @@ unsafe fn kernel_boot(info: &BootInfo) {
         mm::get_free_memory() / (1024 * 1024)
     );
 
+
     call_global_constructors();
 
     #[cfg(target_arch = "x86_64")]
@@ -516,14 +517,16 @@ unsafe fn kernel_boot(info: &BootInfo) {
 
 /// Event loop idle callback. Core-aware:
 /// - Core 0: arm VirtIO RX notifications + WFI/HLT (wakes on RX interrupt)
-/// - Other cores: lightweight sleep (WFE on aarch64, HLT on x86)
-///   Wakes when the distributor sends SEV/IPI after distributing packets.
+/// - Other cores: lightweight sleep (WFI on aarch64, HLT on x86)
+///   Wakes when the distributor sends SGI after distributing packets.
+///   WFI is used (not WFE) because WFE wakes from any SEV (spurious), which
+///   starves the VZ TCP proxy thread. wake_cores() sends SGI so WFI wakes correctly.
 fn idle_cb(core_id: u32) {
     if core_id == 0 || kernel::percpu::num_cores() <= 1 {
         uni::wait_for_events();
     } else {
         #[cfg(target_arch = "aarch64")]
-        unsafe { core::arch::asm!("wfe", options(nomem, nostack)); }
+        unsafe { core::arch::asm!("wfi", options(nomem, nostack)); }
         #[cfg(target_arch = "x86_64")]
         unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
     }
@@ -559,7 +562,9 @@ pub unsafe extern "C" fn kernel_main(boot_info_addr: u64) {
             mmu::map_device_range(fdt.gic_dist_base, 0x10000);
         }
         if fdt.gic_redist_base != 0 {
-            mmu::map_device_range(fdt.gic_redist_base, 0x20000);
+            // Each CPU's redistributor frame is 0x20000 bytes; map all CPUs.
+            let n = (fdt.cpu_count as u64).max(1);
+            mmu::map_device_range(fdt.gic_redist_base, n * 0x20000);
         }
 
         boot_shim_fdt::shim(&mut G_BOOT_INFO, boot_info_addr);

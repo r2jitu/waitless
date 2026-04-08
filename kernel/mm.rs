@@ -255,8 +255,23 @@ pub fn init(info: *const BootInfo) {
     let needed = align_up_page(bitmap_byte_size) + HEAP_SIZE as u64;
     let mut placement_phys: u64 = 0;
 
-    if info.kernel_virt_base != 0 {
-        // Higher-half (Limine): find the largest available region
+    // Check whether kern_end falls within any available memory region.
+    // If YES (QEMU: kernel loaded inside RAM): place right after kernel.
+    // If NO  (VZ: kernel image at 0x0, RAM at 0x70000000): search for the
+    //         largest available region so the heap lands in actual RAM.
+    //         This is important on VZ where the hypervisor Stage-2 page tables
+    //         only mark the FDT-described RAM (0x70000000+) as inner-shareable,
+    //         which is required for atomic RMW (LDXR/STXR) to work.
+    let kern_end_in_ram = (0..info.memory_map_count as usize).any(|i| {
+        let r = &info.memory_map[i];
+        r.region_type == MEM_AVAILABLE
+            && kern_end_phys > r.base
+            && kern_end_phys <= r.base + r.length
+    });
+
+    if info.kernel_virt_base != 0 || !kern_end_in_ram {
+        // Higher-half (Limine) OR kernel not in available RAM (VZ):
+        // find the largest available region with enough space.
         let mut best_size: u64 = 0;
         for i in 0..info.memory_map_count as usize {
             let region = &info.memory_map[i];
@@ -273,7 +288,7 @@ pub fn init(info: *const BootInfo) {
     }
 
     if placement_phys == 0 {
-        // Identity-mapped boot or fallback: place after kernel
+        // Identity-mapped boot (kernel in RAM): place bitmap+heap after kernel image.
         placement_phys = align_up_page(kern_end_phys);
     }
 

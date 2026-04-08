@@ -47,7 +47,7 @@ def wait_port_pool(threshold=500, timeout=8):
         time.sleep(1)
 
 
-def wait_http(port, timeout=60):
+def wait_http(port, timeout=90):
     for _ in range(timeout):
         try:
             r = subprocess.run(
@@ -192,6 +192,9 @@ class VzEnv:
         if proc and proc.poll() is None:
             proc.kill()
             proc.wait()
+        # VZ.framework tears down the VM asynchronously; give it time
+        # to release the virtual network interface before the next start.
+        time.sleep(6)
 
     def core_label(self, cpus):
         return f"VZ {cpus}c"
@@ -271,6 +274,31 @@ ENV_MAP = {
     "native": NativeEnv,
 }
 
+
+def start_env_verified(env, cpus, port):
+    """Start env and verify HTTP readiness.
+
+    VZ.framework sometimes fails to set up the virtual network interface in
+    time after a prior VM teardown. Retry once with an extra delay if the
+    first attempt times out.
+    """
+    proc = env.start(cpus, port)
+    if proc is None:
+        return None
+    if wait_http(port):
+        return proc
+    # First attempt failed — stop and retry (VZ only; others SKIP immediately).
+    env.stop(proc)
+    if not isinstance(env, VzEnv):
+        return None
+    proc = env.start(cpus, port)
+    if proc is None:
+        return None
+    if wait_http(port):
+        return proc
+    env.stop(proc)
+    return None
+
 # ── Workload definitions ─────────────────────────────────────────────────────
 
 WORKLOADS = [
@@ -318,9 +346,9 @@ def main():
             sys.exit(1)
 
     # These environments only run single-core benchmarks.
-    # VZ 4c: vz_compat mode works but TCP proxy drops under concurrent load.
     # ARM TCG: no MTTCG support.
-    single_core_only = {"docker", "qemu-arm", "vz"}
+    # VZ: multi-core now supported (distributor enabled; TCP proxy handles c=8 load).
+    single_core_only = {"docker", "qemu-arm"}
 
     # Kill stale processes
     subprocess.run(["pkill", "-9", "-f", "qemu-system"], capture_output=True)
@@ -351,19 +379,20 @@ def main():
             label = env.core_label(cpus)
             print(f"\n==> {label}")
 
+            # VZ: extra pause before the first VM of each core-count group.
+            # After running N VMs at the previous core count, VZ.framework needs
+            # additional time to settle before the first VM of a new core count
+            # will reliably accept connections.
+            if isinstance(env, VzEnv):
+                time.sleep(10)
+
             for w in workloads:
                 wname = w["name"]
                 port = next_port()
 
-                proc = env.start(cpus, port)
+                proc = start_env_verified(env, cpus, port)
                 if proc is None:
-                    print(f"    {wname:<20s} SKIP (failed to start)")
-                    results[(env_name, cpus, wname)] = (0, "", "")
-                    continue
-
-                if not wait_http(port):
                     print(f"    {wname:<20s} SKIP (not ready)")
-                    env.stop(proc)
                     results[(env_name, cpus, wname)] = (0, "", "")
                     wait_port_pool()
                     continue

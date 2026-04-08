@@ -357,8 +357,13 @@ mod aarch64 {
             let bit = 1u32 << (irq % 32);
 
             if irq < 32 && GIC_VERSION == 3 && GICR_BASE != 0 {
-                // GICv3: PPIs/SGIs (INTID 0-31) are in the GICR SGI frame
-                let addr = GICR_BASE + GICR_SGI_BASE as u64 + GICD_ISENABLER0 as u64;
+                // GICv3: PPIs/SGIs (INTID 0-31) are in the GICR SGI frame.
+                // Use this CPU's redistributor frame (each is 0x20000 bytes apart).
+                // Bug fix: must NOT use GICR_BASE directly — that is CPU 0's frame.
+                // APs must enable their SGIs in their own GICR frame.
+                let cpu = crate::aarch64::smp::cpu_id() as u64;
+                let gicr_frame = GICR_BASE + cpu * 0x20000;
+                let addr = gicr_frame + GICR_SGI_BASE as u64 + GICD_ISENABLER0 as u64;
                 ptr::write_volatile(addr as *mut u32, bit);
             } else {
                 // SPIs (INTID >= 32) or GICv2: enable in the distributor
