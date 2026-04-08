@@ -85,12 +85,29 @@ pub fn is_shutdown() -> bool {
 /// Run the event loop on the current core. Does not return until shutdown.
 pub fn run(core_id: u32) -> ! {
     // Wait for the app to finish initialization before processing.
-    // Core 0 calls set_ready() after uni_main() returns or Server::run() starts.
     while !READY.load(Ordering::Acquire) && !is_shutdown() {
         #[cfg(target_arch = "aarch64")]
-        unsafe { core::arch::asm!("wfe", options(nomem, nostack)); }
+        unsafe { core::arch::asm!("wfi", options(nomem, nostack)); }
         #[cfg(target_arch = "x86_64")]
         unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
+    }
+
+    // VZ-compat: APs have no networking work (no distribution).
+    // Sleep deeply instead of spinning the event loop, which wastes
+    // host CPU and starves the VZ TCP proxy thread.
+    #[cfg(vz_compat)]
+    if core_id != 0 {
+        loop {
+            if is_shutdown() { break; }
+            // Only wake for service callbacks (if registered).
+            if let Some(f) = unsafe { core::ptr::read_volatile(&raw const CB.service) } {
+                f(core_id);
+            }
+            #[cfg(target_arch = "aarch64")]
+            unsafe { core::arch::asm!("wfi", options(nomem, nostack)); }
+            #[cfg(target_arch = "x86_64")]
+            unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
+        }
     }
 
     // Per-core counters for diagnostics.
