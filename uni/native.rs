@@ -146,6 +146,9 @@ unsafe extern "C" {
     fn pthread_create(thread: *mut PthreadT, attr: *const u8,
                       start: extern "C" fn(*mut u8) -> *mut u8, arg: *mut u8) -> i32;
     fn pthread_join(thread: PthreadT, retval: *mut *mut u8) -> i32;
+    fn pthread_key_create(key: *mut usize, destructor: usize) -> i32;
+    fn pthread_setspecific(key: usize, value: *const u8) -> i32;
+    fn pthread_getspecific(key: usize) -> *const u8;
     fn sysconf(name: i32) -> i64;
 
     #[cfg(target_os = "macos")]
@@ -363,12 +366,20 @@ fn thread_state(id: u32) -> &'static mut ThreadState {
 // Helpers for the uni API (dispatched by thread_id)
 // ============================================================================
 
-// Thread-local thread ID (set per-thread at start)
-#[cfg(not(target_arch = "wasm32"))]
-static mut CURRENT_THREAD_ID: u32 = 0;
+// Thread-local thread ID via pthread TLS.
+// Must be per-thread so concurrent workers don't clobber each other's
+// identity — wrong thread ID means wrong connection pool and wrong
+// kqueue/epoll fd.
+//
+// pthread_key_t: usize on both macOS and Linux (unsigned long / unsigned int).
+static mut TLS_KEY: usize = 0;
+
+fn set_current_thread_id(id: u32) {
+    unsafe { pthread_setspecific(TLS_KEY, id as usize as *const u8); }
+}
 
 fn current_thread_id() -> u32 {
-    unsafe { CURRENT_THREAD_ID }
+    unsafe { pthread_getspecific(TLS_KEY) as u32 }
 }
 
 unsafe extern "C" fn sigint_handler(_sig: i32) {
@@ -377,6 +388,8 @@ unsafe extern "C" fn sigint_handler(_sig: i32) {
 
 fn init_native() {
     unsafe {
+        pthread_key_create(&mut TLS_KEY, 0);
+
         let p = getenv(b"PORT\0".as_ptr());
         if !p.is_null() && *p != 0 {
             CONFIG_PORT = parse_u16(p);
@@ -701,7 +714,7 @@ unsafe extern "C" {
 
 extern "C" fn worker_thread(arg: *mut u8) -> *mut u8 {
     let tid = arg as u32;
-    unsafe { CURRENT_THREAD_ID = tid; }
+    set_current_thread_id(tid);
 
     // Import the Server pointer from http.rs
     // Workers call the same service_core() as the unikernel APs.
@@ -724,10 +737,10 @@ pub extern "C" fn main() -> i32 {
         // Create worker listeners on the main thread (before spawning).
         // Each listener gets SO_REUSEPORT so the OS distributes connections.
         for i in 1..NUM_THREADS {
-            CURRENT_THREAD_ID = i as u32;
+            set_current_thread_id(i as u32);
             crate::http::add_worker_listener(i as u32);
         }
-        CURRENT_THREAD_ID = 0;
+        set_current_thread_id(0);
 
         // Start worker threads
         let mut thread_handles = [0usize; MAX_THREADS];
@@ -741,7 +754,7 @@ pub extern "C" fn main() -> i32 {
         }
 
         // Main thread is worker 0
-        CURRENT_THREAD_ID = 0;
+        set_current_thread_id(0);
         native_worker_loop(0);
 
         // Join workers
@@ -757,7 +770,7 @@ pub extern "C" fn main() -> i32 {
 /// Called by each worker thread (including main).
 #[unsafe(no_mangle)]
 pub extern "C" fn native_worker_loop(thread_id: u32) {
-    unsafe { CURRENT_THREAD_ID = thread_id; }
+    set_current_thread_id(thread_id);
 
     // Listeners already created by main() before spawning threads.
     // Enter the callback-driven event loop (same structure as kernel's).

@@ -382,11 +382,10 @@ def main():
             label = env.core_label(cpus)
             print(f"\n==> {label}")
 
-            # VZ: extra pause before the first VM of each core-count group.
-            # After running N VMs at the previous core count, VZ.framework needs
-            # additional time to settle before the first VM of a new core count
-            # will reliably accept connections.
-            if isinstance(env, VzEnv):
+            # VZ: extra pause before each core-count group except the first.
+            # After running N VMs at a given core count, VZ.framework needs
+            # additional time to settle before the first VM of the next group.
+            if isinstance(env, VzEnv) and cpus != core_counts[0]:
                 time.sleep(10)
 
             for w in workloads:
