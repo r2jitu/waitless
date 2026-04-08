@@ -253,6 +253,7 @@ class NativeEnv:
             return None
         env = os.environ.copy()
         env["PORT"] = str(port)
+        env["UDP_PORT"] = str(port + 1)
         env["THREADS"] = str(cpus)
         return subprocess.Popen(
             [bin_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
@@ -279,13 +280,15 @@ def start_env_verified(env, cpus, port):
     """Start env and verify HTTP readiness.
 
     VZ.framework sometimes fails to set up the virtual network interface in
-    time after a prior VM teardown. Retry once with an extra delay if the
-    first attempt times out.
+    time after a prior VM teardown. Use a short initial timeout (30s) so
+    failures are detected quickly, then retry once with the full timeout.
+    Non-VZ environments use the full timeout directly (no retry).
     """
+    first_timeout = 30 if isinstance(env, VzEnv) else 90
     proc = env.start(cpus, port)
     if proc is None:
         return None
-    if wait_http(port):
+    if wait_http(port, timeout=first_timeout):
         return proc
     # First attempt failed — stop and retry (VZ only; others SKIP immediately).
     env.stop(proc)

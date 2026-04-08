@@ -382,6 +382,11 @@ fn init_native() {
             CONFIG_PORT = parse_u16(p);
         }
 
+        let u = getenv(b"UDP_PORT\0".as_ptr());
+        if !u.is_null() && *u != 0 {
+            UDP_PORT_BASE = parse_u16(u);
+        }
+
         // Determine thread count from environment or CPU count
         let t = getenv(b"THREADS\0".as_ptr());
         if !t.is_null() && *t != 0 {
@@ -570,17 +575,30 @@ const MAX_UDP_BINDINGS: usize = 8;
 
 struct UdpBinding {
     fd: i32,
-    port: u16,
+    app_port: u16,  // port as requested by app (used for send-side lookup)
     handler: fn([u8; 4], u16, &[u8]),
 }
 
 static mut UDP_BINDINGS: [Option<UdpBinding>; MAX_UDP_BINDINGS] =
     [const { None }; MAX_UDP_BINDINGS];
 static mut UDP_COUNT: usize = 0;
+/// Base UDP port override from UDP_PORT env var (0 = use app-requested port).
+static mut UDP_PORT_BASE: u16 = 0;
+/// Default UDP port used by the app (first bound port, set on first bind call).
+static mut UDP_DEFAULT_PORT: u16 = 0;
 
 pub fn native_udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
     unsafe {
         if UDP_COUNT >= MAX_UDP_BINDINGS { return; }
+
+        // If UDP_PORT env var is set, remap ports: the first app UDP port maps
+        // to UDP_PORT, subsequent ports offset from there.
+        let bind_port = if UDP_PORT_BASE != 0 {
+            if UDP_DEFAULT_PORT == 0 { UDP_DEFAULT_PORT = port; }
+            UDP_PORT_BASE + (port - UDP_DEFAULT_PORT)
+        } else {
+            port
+        };
 
         let fd = socket(AF_INET, SOCK_DGRAM, 0);
         if fd < 0 { return; }
@@ -596,7 +614,7 @@ pub fn native_udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
             sin_family: AF_INET as u8,
             #[cfg(target_os = "linux")]
             sin_family: AF_INET as u16,
-            sin_port: port.to_be(),
+            sin_port: bind_port.to_be(),
             sin_addr: 0,
             sin_zero: [0; 8],
         };
@@ -609,18 +627,18 @@ pub fn native_udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
         // Register with thread 0's kqueue for polling
         thread_state(0).register_fd(fd);
 
-        UDP_BINDINGS[UDP_COUNT] = Some(UdpBinding { fd, port, handler });
+        UDP_BINDINGS[UDP_COUNT] = Some(UdpBinding { fd, app_port: port, handler });
         UDP_COUNT += 1;
     }
 }
 
 pub fn native_udp_send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
     unsafe {
-        // Find the binding for src_port to get the fd
+        // Find the binding for src_port (app port) to get the fd
         let mut send_fd = -1;
         for i in 0..UDP_COUNT {
             if let Some(ref b) = UDP_BINDINGS[i] {
-                if b.port == src_port {
+                if b.app_port == src_port {
                     send_fd = b.fd;
                     break;
                 }
