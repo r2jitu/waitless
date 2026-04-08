@@ -27,15 +27,6 @@ PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 PORT_COUNTER = [38000]
 
 
-def _drain(stream):
-    """Discard all output from a pipe to prevent the writer from blocking."""
-    try:
-        while stream.read(4096):
-            pass
-    except Exception:
-        pass
-
-
 def next_port():
     PORT_COUNTER[0] += 10
     return PORT_COUNTER[0]
@@ -192,45 +183,37 @@ class VzEnv:
         env = os.environ.copy()
         env["UNIKERNEL_CPUS"] = str(cpus)
         env["UNIKERNEL_MEMORY"] = "128"
-        # Capture stdout to read the PROXY_READY sentinel.
         return subprocess.Popen(
             [run_vz, img, str(port)],
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             env=env)
 
-    def wait_proxy_ready(self, proc, timeout=30):
-        """Wait for run-vz to print PROXY_READY on stdout.
+    def wait_proxy_ready(self, port, proc, timeout=30):
+        """Wait until the TCP proxy port is accepting connections.
 
-        Returns True immediately once the sentinel arrives and starts a
-        drain thread so the pipe never blocks the VM's serial writes.
-        Returns False if the process exits or the timeout expires.
+        run-vz calls listen() before PROXY_READY is printed; a successful
+        TCP connect means the proxy socket is bound and the VM is about to
+        receive its first frame. This avoids pipe/sentinel complexity entirely.
         """
-        import select
+        import socket as _socket
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if proc.poll() is not None:
                 return False
-            remaining = deadline - time.monotonic()
-            rlist, _, _ = select.select([proc.stdout], [], [], min(remaining, 1.0))
-            if rlist:
-                line = proc.stdout.readline()
-                if b"PROXY_READY" in line:
-                    # Drain remaining stdout in background so the pipe never
-                    # fills up and blocks the VM's serial console writes.
-                    t = threading.Thread(target=lambda: _drain(proc.stdout), daemon=True)
-                    t.start()
-                    return True
+            try:
+                s = _socket.socket()
+                s.settimeout(0.5)
+                s.connect(('127.0.0.1', port))
+                s.close()
+                return True
+            except (_socket.timeout, ConnectionRefusedError, OSError):
+                time.sleep(0.1)
         return False
 
     def stop(self, proc):
         if proc and proc.poll() is None:
             proc.kill()
             proc.wait()
-        if proc and proc.stdout:
-            try:
-                proc.stdout.close()
-            except Exception:
-                pass
         # VZ.framework tears down the VM asynchronously; give it time
         # to release the virtual network interface before the next start.
         time.sleep(6)
@@ -327,14 +310,14 @@ def start_env_verified(env, cpus, port):
         return None
 
     if isinstance(env, VzEnv):
-        # Phase 1: wait for proxy ports to be bound (fast, <1s normally).
-        if not env.wait_proxy_ready(proc, timeout=30):
+        # Phase 1: wait for proxy TCP port to be connectable (fast, <1s normally).
+        if not env.wait_proxy_ready(port, proc, timeout=30):
             env.stop(proc)
             # Retry once — VZ network interface may not have been released yet.
             proc = env.start(cpus, port)
             if proc is None:
                 return None
-            if not env.wait_proxy_ready(proc, timeout=30):
+            if not env.wait_proxy_ready(port, proc, timeout=30):
                 env.stop(proc)
                 return None
         # Phase 2: poll HTTP until the VM finishes booting.
