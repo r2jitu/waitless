@@ -81,6 +81,41 @@ def run_wrk(port, endpoint, threads, conns, duration):
         return 0.0, "", ""
 
 
+def run_wrk_parallel(port, endpoint, threads, conns, duration, instances):
+    """Run `instances` parallel wrk processes and aggregate results.
+
+    Each process is a separate OS client with its own TCP source-port range,
+    which forces the OS (SO_REUSEPORT) or unikernel flow-hash to distribute
+    connections across server threads/cores. Without this, all connections
+    from a single wrk process can land on one server thread (macOS loopback
+    SO_REUSEPORT ignores source-port in its hash).
+
+    conns and threads are split evenly across instances (minimum 1 each).
+    Total req/s is summed; p50/p99 are the median across instances.
+    """
+    per_conns   = max(1, (conns   + instances - 1) // instances)
+    per_threads = max(1, (threads + instances - 1) // instances)
+
+    all_results = [None] * instances
+    lock = threading.Lock()
+
+    def run_one(idx):
+        r = run_wrk(port, endpoint, per_threads, per_conns, duration)
+        with lock:
+            all_results[idx] = r
+
+    ts = [threading.Thread(target=run_one, args=(i,)) for i in range(instances)]
+    for t in ts: t.start()
+    for t in ts: t.join()
+
+    total_rps = sum(r[0] for r in all_results if r)
+    p50s = sorted(r[1] for r in all_results if r and r[1])
+    p99s = sorted(r[2] for r in all_results if r and r[2])
+    p50 = p50s[len(p50s) // 2] if p50s else ""
+    p99 = p99s[len(p99s) // 2] if p99s else ""
+    return total_rps, p50, p99
+
+
 def run_udp(port, senders, duration):
     recv = [0] * senders
     def sender(idx):
@@ -341,7 +376,8 @@ WORKLOADS = [
     {"name": "compute_c1", "type": "tcp", "endpoint": "/compute", "threads": 1, "conns": 1,
      "desc": "/compute × 1 conn (single-flow CPU)"},
     {"name": "compute_c8", "type": "tcp", "endpoint": "/compute", "threads": 2, "conns": 8,
-     "desc": "/compute × 8 conn (CPU-bound)"},
+     "parallel": True,
+     "desc": "/compute × 8 conn (CPU-bound, parallel clients for multi-core scaling)"},
     {"name": "udp_8s",     "type": "udp", "endpoint": "",         "threads": 0, "conns": 8,
      "desc": "UDP echo × 8 senders"},
 ]
@@ -429,7 +465,12 @@ def main():
                     continue
 
                 if w["type"] == "tcp":
-                    rps, p50, p99 = run_wrk(port, w["endpoint"], w["threads"], w["conns"], duration)
+                    if w.get("parallel") and cpus > 1:
+                        rps, p50, p99 = run_wrk_parallel(
+                            port, w["endpoint"], w["threads"], w["conns"], duration, cpus)
+                    else:
+                        rps, p50, p99 = run_wrk(
+                            port, w["endpoint"], w["threads"], w["conns"], duration)
                     results[(env_name, cpus, wname)] = (rps, p50, p99)
                     print(f"    {wname:<20s} {rps:>10.0f} req/s  p50={p50}  p99={p99}")
                 else:

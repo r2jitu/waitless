@@ -1,11 +1,15 @@
 // uni/native.rs — Native (POSIX) backend: multi-threaded sockets + stdio.
 //
 // Each worker thread has its own:
-//   - Listener socket (SO_REUSEPORT — OS distributes connections)
+//   - Shared listen socket registered in its own kqueue/epoll
 //   - Connection pool
 //   - poll() loop
 //
-// This mirrors the unikernel's per-core event loop architecture.
+// Multi-thread distribution: a single nonblocking listen socket is registered
+// in every worker's kqueue/epoll. When a connection arrives, the first worker
+// whose kqueue fires calls accept() and owns the connection; others see EAGAIN
+// and go back to sleep. No dedicated acceptor thread, no pipes — mirrors the
+// unikernel's per-core event loop model where each core polls the accept queue.
 
 use core::ptr;
 
@@ -39,10 +43,6 @@ const SO_REUSEADDR: i32 = 0x0004;
 #[cfg(target_os = "linux")]
 const SO_REUSEADDR: i32 = 2;
 
-#[cfg(target_os = "macos")]
-const SO_REUSEPORT: i32 = 0x0200;
-#[cfg(target_os = "linux")]
-const SO_REUSEPORT: i32 = 15;
 
 #[cfg(target_os = "linux")]
 const MSG_NOSIGNAL: i32 = 0x4000;
@@ -207,13 +207,16 @@ const MAX_THREADS: usize = 16;
 struct NativeConn {
     fd: i32,
     is_listener: bool,
+    /// True when this listener's fd is shared across workers (multi-thread mode).
+    /// release_conn must NOT close the fd — other workers are still using it.
+    is_shared_listener: bool,
     closed: bool,
     has_pending_data: bool,
 }
 
 impl NativeConn {
     const fn empty() -> Self {
-        NativeConn { fd: -1, is_listener: false, closed: true, has_pending_data: false }
+        NativeConn { fd: -1, is_listener: false, is_shared_listener: false, closed: true, has_pending_data: false }
     }
 }
 
@@ -280,7 +283,7 @@ impl ThreadState {
     fn alloc_conn(&mut self) -> *mut NativeConn {
         for c in self.conns.iter_mut() {
             if c.closed && c.fd < 0 {
-                *c = NativeConn { fd: -1, is_listener: false, closed: false, has_pending_data: false };
+                *c = NativeConn { fd: -1, is_listener: false, is_shared_listener: false, closed: false, has_pending_data: false };
                 return c as *mut NativeConn;
             }
         }
@@ -291,13 +294,16 @@ impl ThreadState {
         unsafe {
             if (*c).fd >= 0 {
                 self.unregister_fd((*c).fd);
-                shutdown((*c).fd, SHUT_RDWR);
-                close((*c).fd);
+                if !(*c).is_shared_listener {
+                    shutdown((*c).fd, SHUT_RDWR);
+                    close((*c).fd);
+                }
                 (*c).fd = -1;
             }
             (*c).closed = true;
             (*c).has_pending_data = false;
             (*c).is_listener = false;
+            (*c).is_shared_listener = false;
         }
     }
 
@@ -351,9 +357,18 @@ impl ThreadState {
 // ============================================================================
 
 static mut THREADS: [ThreadState; MAX_THREADS] = [const { ThreadState::new(0) }; MAX_THREADS];
-static mut NUM_THREADS: usize = 1;
+pub static mut NUM_THREADS: usize = 1;
 static mut CONFIG_PORT: u16 = 0;
 pub static mut SHUTDOWN: bool = false;
+
+// ── Shared listen socket ──────────────────────────────────────────────────────
+// macOS SO_REUSEPORT does not distribute connections across sockets. Instead,
+// all workers share a single nonblocking listen socket. Each worker registers
+// it with its own kqueue/epoll. The worker whose kqueue fires first calls
+// accept(); others see EAGAIN and go back to sleep. No dedicated thread, no
+// pipes — mirrors the unikernel's per-core polling model.
+
+static mut SHARED_LISTEN_FD: i32 = -1;
 
 /// Get the current thread's state. Thread ID is stored in a thread-local-like
 /// fashion by passing it through the worker function argument.
@@ -453,15 +468,16 @@ pub fn poll_events() {
 
 // ---- TCP (per-thread) -------------------------------------------------------
 
-fn make_listener(port: u16) -> i32 {
+fn make_listener(port: u16, nonblocking: bool) -> i32 {
     unsafe {
         let fd = socket(AF_INET, SOCK_STREAM, 0);
         if fd < 0 { return -1; }
 
         let opt: i32 = 1;
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, 4);
-        setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, 4);
-        set_nonblocking(fd);
+        // SO_REUSEPORT intentionally omitted: on macOS it doesn't distribute
+        // connections across sockets; the centralized acceptor handles this.
+        if nonblocking { set_nonblocking(fd); }
 
         let addr = SockAddrIn {
             #[cfg(target_os = "macos")]
@@ -486,22 +502,43 @@ fn make_listener(port: u16) -> i32 {
 }
 
 pub fn tcp_listen(port: u16) -> *mut () {
-    let tid = current_thread_id();
-    let ts = thread_state(tid);
-    let fd = make_listener(port);
-    if fd < 0 { return ptr::null_mut(); }
+    tcp_listen_for(port, current_thread_id())
+}
 
-    let c = ts.alloc_conn();
-    if c.is_null() {
-        unsafe { close(fd); }
-        return ptr::null_mut();
-    }
+pub fn tcp_listen_for(port: u16, worker_id: u32) -> *mut () {
+    let tid = worker_id;
+    let ts = thread_state(tid);
+
     unsafe {
-        (*c).fd = fd;
-        (*c).is_listener = true;
+        if NUM_THREADS > 1 {
+            // Multi-thread: single shared nonblocking listen socket.
+            // Create it once on the first call, then hand each worker a handle
+            // pointing at the same fd. Registration with each worker's
+            // kqueue/epoll happens in tcp_register_shared_listener() once the
+            // worker thread is actually running.
+            if SHARED_LISTEN_FD < 0 {
+                let fd = make_listener(port, true);  // nonblocking
+                if fd < 0 { return ptr::null_mut(); }
+                SHARED_LISTEN_FD = fd;
+            }
+            let c = ts.alloc_conn();
+            if c.is_null() { return ptr::null_mut(); }
+            (*c).fd = SHARED_LISTEN_FD;
+            (*c).is_listener = true;
+            (*c).is_shared_listener = true;
+            c as *mut ()
+        } else {
+            // Single-thread: direct accept(), nonblocking (polled via kqueue/epoll).
+            let fd = make_listener(port, true);
+            if fd < 0 { return ptr::null_mut(); }
+            let c = ts.alloc_conn();
+            if c.is_null() { close(fd); return ptr::null_mut(); }
+            (*c).fd = fd;
+            (*c).is_listener = true;
+            ts.register_fd(fd);
+            c as *mut ()
+        }
     }
-    ts.register_fd(fd);
-    c as *mut ()
 }
 
 pub fn tcp_accept(handle: *mut ()) -> *mut () {
@@ -512,22 +549,14 @@ pub fn tcp_accept(handle: *mut ()) -> *mut () {
         if listener.is_null() || (*listener).fd < 0 || (*listener).closed {
             return ptr::null_mut();
         }
-
         let fd = accept((*listener).fd, ptr::null_mut(), ptr::null_mut());
         if fd < 0 {
-            if get_errno() == EAGAIN {
-                (*listener).has_pending_data = false;
-            }
+            if get_errno() == EAGAIN { (*listener).has_pending_data = false; }
             return ptr::null_mut();
         }
-
         set_nonblocking(fd);
-
         let c = ts.alloc_conn();
-        if c.is_null() {
-            close(fd);
-            return ptr::null_mut();
-        }
+        if c.is_null() { close(fd); return ptr::null_mut(); }
         (*c).fd = fd;
         ts.register_fd(fd);
         c as *mut ()
@@ -578,6 +607,19 @@ pub fn tcp_is_closed(handle: *mut ()) -> bool {
 
 pub fn tcp_poll() {
     thread_state(current_thread_id()).poll_events();
+}
+
+/// Register the shared listen socket with this worker's kqueue/epoll.
+/// Called once per worker thread once it's running. In multi-thread mode the
+/// shared fd is watched by all workers simultaneously; whichever kqueue fires
+/// first calls accept() and the rest see EAGAIN.
+pub fn tcp_register_shared_listener() {
+    let tid = current_thread_id();
+    unsafe {
+        if SHARED_LISTEN_FD >= 0 {
+            thread_state(tid).register_fd(SHARED_LISTEN_FD);
+        }
+    }
 }
 
 // ============================================================================
@@ -738,13 +780,11 @@ pub extern "C" fn main() -> i32 {
     init_native();
     unsafe {
         uni_main();
-        // uni_main called server.listen() which created thread 0's listener
-        // and called set_ready(). But workers need their SO_REUSEPORT
-        // listeners BEFORE any clients connect, otherwise all connections
-        // land on thread 0.
+        // uni_main called server.run() → tcp_listen() on thread 0.
+        // In multi-thread mode, tcp_listen() created the shared listen socket
+        // and per-worker handles. add_worker_listener creates the remaining
+        // worker handles before their threads start.
 
-        // Create worker listeners on the main thread (before spawning).
-        // Each listener gets SO_REUSEPORT so the OS distributes connections.
         for i in 1..NUM_THREADS {
             set_current_thread_id(i as u32);
             crate::http::add_worker_listener(i as u32);
@@ -780,8 +820,8 @@ pub extern "C" fn main() -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn native_worker_loop(thread_id: u32) {
     set_current_thread_id(thread_id);
-
-    // Listeners already created by main() before spawning threads.
-    // Enter the callback-driven event loop (same structure as kernel's).
+    // Register the shared listen socket with this worker's kqueue/epoll so it
+    // wakes up when a new connection arrives.
+    tcp_register_shared_listener();
     crate::backend::run_worker(thread_id);
 }

@@ -80,16 +80,13 @@ mod backend {
         service: None,
     };
 
-    static mut NUM_WORKERS: u32 = 1;
+    // NUM_WORKERS removed: num_workers() now reads native::NUM_THREADS directly.
     static READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
     pub fn num_workers() -> u32 {
-        unsafe {
-            if NUM_WORKERS == 1 {
-                NUM_WORKERS = crate::native::num_cpus() as u32;
-            }
-            NUM_WORKERS
-        }
+        // NUM_THREADS is set by init_native() from the THREADS env var (or
+        // num_cpus() as default). Use it directly — don't override with num_cpus().
+        unsafe { crate::native::NUM_THREADS as u32 }
     }
 
     /// Register an IO poll callback (network, storage, etc).
@@ -123,8 +120,8 @@ mod backend {
         unsafe { crate::native::SHUTDOWN = true; }
     }
 
-    pub fn tcp_listen_on(_worker_id: u32, port: u16) -> *mut () {
-        crate::native::tcp_listen(port)
+    pub fn tcp_listen_on(worker_id: u32, port: u16) -> *mut () {
+        crate::native::tcp_listen_for(port, worker_id)
     }
 
     /// Run the worker event loop on this thread. Same structure as kernel's.
