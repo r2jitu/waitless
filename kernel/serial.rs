@@ -245,6 +245,16 @@ pub fn putc(c: u8) {
 }
 
 pub fn puts(s: &[u8]) {
+    // VZ.framework doesn't support exclusive load/store instructions (LDXR/STXR),
+    // so a spinlock on the VirtIO console TX is not possible. Prevent concurrent
+    // access by allowing only core 0 to write. APs read MPIDR_EL1.Aff0 directly
+    // (no TPIDR_EL1 initialization required — MPIDR is a hardware register).
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let mpidr: u64;
+        core::arch::asm!("mrs {}, MPIDR_EL1", out(reg) mpidr, options(nomem, nostack));
+        if (mpidr & 0xFF) != 0 { return; }
+    }
     for &c in s {
         if c == b'\n' {
             putc(b'\r');

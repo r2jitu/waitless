@@ -94,6 +94,13 @@ fn arp_request(target_ip: Ipv4Addr) {
     };
     let data = unsafe { core::slice::from_raw_parts(&pkt as *const _ as *const u8, 28) };
     ethernet_send(MacAddr::BROADCAST, ETHERTYPE_ARP, data);
+    // On VZ (vz_compat), this call stages the ARP request rather than sending
+    // it directly. When arp_resolve is spinning (not running the event loop),
+    // net_flush_cb never fires, so core 0 stays in WFI until a VirtIO RX
+    // interrupt arrives — but that can't happen until the ARP request is sent.
+    // One targeted flush_tx_staging call breaks the deadlock by waking core 0.
+    // This fires at most 3 times per arp_resolve (once per retry), not thousands.
+    drivers::virtio_net::flush_tx_staging();
 }
 
 pub fn arp_receive(data: &[u8]) {
@@ -164,7 +171,12 @@ pub fn arp_resolve(ip: Ipv4Addr) -> Option<MacAddr> {
     for _retry in 0..3 {
         arp_request(target);
         for _poll in 0..200_000 {
-            drivers::virtio_net::poll(arp_poll_callback);
+            // Use poll_if_safe: on VZ (vz_compat), only core 0 may access
+            // the VirtIO RX ring.  AP cores skip the poll and spin on
+            // arp_lookup instead — core 0's event loop flushes the staged
+            // ARP request and processes the reply via distribute_frame,
+            // which updates the ARP cache that arp_lookup reads.
+            drivers::virtio_net::poll_if_safe(arp_poll_callback);
             if let Some(mac) = arp_lookup(target) {
                 return Some(mac);
             }

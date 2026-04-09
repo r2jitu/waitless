@@ -822,6 +822,23 @@ pub fn poll(
     poll_qp(0, callback)
 }
 
+/// Poll the RX queue only if safe to do so on the calling core.
+///
+/// On VZ (vz_compat), the VirtIO exclusive monitor is not virtualized:
+/// only core 0 may safely access the VirtIO RX queue.  AP cores must not
+/// call poll_qp concurrently with core 0's event loop — the shared
+/// `last_used_idx` and descriptor free-list would be corrupted.
+///
+/// When called from a non-core-0 AP on VZ this returns 0 immediately.
+/// The caller should spin on its expected side-effect (e.g. arp_lookup)
+/// while core 0's event loop processes the reply via distribute_frame.
+pub fn poll_if_safe(callback: fn(&[u8])) -> i32 {
+    if cfg!(vz_compat) && kernel::cpu_id() != 0 {
+        return 0;
+    }
+    poll_qp(0, callback)
+}
+
 /// Poll a specific queue pair for received frames.
 pub fn poll_qp(qp: usize, callback: fn(&[u8])) -> i32 {
     unsafe {
@@ -857,6 +874,9 @@ pub fn poll_qp(qp: usize, callback: fn(&[u8])) -> i32 {
         if count > 0 {
             NET.rx_queues[qp].kick();
         }
+        // Re-arm EVENT_IDX: update used_event to current used->idx so VZ fires
+        // the next interrupt when the next frame arrives.
+        NET.rx_queues[qp].enable_interrupts();
     }
 
     count

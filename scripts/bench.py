@@ -218,9 +218,11 @@ class VzEnv:
         env = os.environ.copy()
         env["UNIKERNEL_CPUS"] = str(cpus)
         env["UNIKERNEL_MEMORY"] = "128"
+        log_err = open(f"/tmp/vz_{port}.log", "w")
+        log_out = open(f"/tmp/vz_{port}.serial.log", "w")
         return subprocess.Popen(
             [run_vz, img, str(port)],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, stdout=log_out, stderr=log_err,
             env=env)
 
     def wait_proxy_ready(self, port, proc, timeout=30):
@@ -251,7 +253,8 @@ class VzEnv:
             proc.wait()
         # VZ.framework tears down the VM asynchronously; give it time
         # to release the virtual network interface before the next start.
-        time.sleep(6)
+        # 2-core VMs need longer — VZ holds vCPU thread resources for ~15s.
+        time.sleep(15)
 
     def core_label(self, cpus):
         return f"VZ {cpus}c"
@@ -476,6 +479,16 @@ def main():
                 _current["proc"] = proc
                 if proc is None:
                     print(f"    {wname:<20s} SKIP (not ready)")
+                    # Print last few lines of serial log to show why it failed.
+                    if isinstance(env, VzEnv):
+                        for suffix, label in [(".serial.log", "serial"), (".log", "stderr")]:
+                            try:
+                                with open(f"/tmp/vz_{port}{suffix}") as lf:
+                                    lines = lf.read().strip().splitlines()
+                                    for l in lines[-8:]:
+                                        print(f"      {label}: {l}")
+                            except Exception:
+                                pass
                     results[(env_name, cpus, wname)] = (0, "", "")
                     wait_port_pool()
                     continue

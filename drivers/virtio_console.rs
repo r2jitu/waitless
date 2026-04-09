@@ -56,6 +56,7 @@ static mut CON_TX_LAST_USED: u16 = 0;
 static mut CON_RX_AVAIL_IDX: u16 = 0;
 static mut CON_RX_LAST_USED: u16 = 0;
 
+
 // Ring accessors using raw pointer arithmetic
 
 unsafe fn con_desc_addr(mem: &mut ConQueueMem, i: usize) -> *mut u64 {

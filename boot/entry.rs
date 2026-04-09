@@ -30,7 +30,7 @@ core::arch::global_asm!(include_str!("aarch64/boot.S"));
 
 use kernel::{types, serial, mm};
 #[cfg(target_arch = "aarch64")]
-use kernel::aarch64::{fdt, mmu, exceptions};
+use kernel::aarch64::{fdt, mmu, exceptions, smp};
 use types::{BootInfo, MemoryRegion, Protocol, MEM_AVAILABLE, MEM_RESERVED, MAX_MEMORY_REGIONS};
 
 // ============================================================================
@@ -452,6 +452,10 @@ unsafe fn kernel_boot(info: &BootInfo) {
             let fdt = &*fdt::info_ptr();
             if fdt.gic_dist_base != 0 {
                 exceptions::enable_timer_wakeup();
+                // Enable SGI 0 on core 0 so APs can wake it from WFI via wake_core0().
+                // Without this, SGI 0 is pending in GICR but never forwarded to the
+                // CPU interface (bit 0 of GICR_ISENABLER0 is 0), so WFI never returns.
+                exceptions::register_irq(0, smp::sgi_handler);
             }
             // Unmask IRQ only (not FIQ — VZ uses FIQ for hypervisor)
             if fdt.gic_dist_base != 0 {

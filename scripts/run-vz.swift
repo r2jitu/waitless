@@ -427,10 +427,14 @@ final class NetBridge {
         sa.sin_family = sa_family_t(AF_INET)
         sa.sin_port = UInt16(hostPort).bigEndian
         sa.sin_addr.s_addr = INADDR_ANY
-        withUnsafeMutablePointer(to: &sa) {
+        let bindRet = withUnsafeMutablePointer(to: &sa) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                _ = bind(listenFD, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                bind(listenFD, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
+        }
+        if bindRet != 0 {
+            fputs("run-vz: bind TCP port \(hostPort) failed: \(String(cString: strerror(errno)))\n", stderr)
+            exit(1)
         }
         listen(listenFD, 128)
         _ = fcntl(listenFD, F_SETFL, fcntl(listenFD, F_GETFL, 0) | O_NONBLOCK)
@@ -441,10 +445,14 @@ final class NetBridge {
         udpSA.sin_family = sa_family_t(AF_INET)
         udpSA.sin_port = UInt16(hostPort + 1).bigEndian
         udpSA.sin_addr.s_addr = INADDR_ANY
-        withUnsafeMutablePointer(to: &udpSA) {
+        let udpBindRet = withUnsafeMutablePointer(to: &udpSA) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                _ = bind(udpFD, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                bind(udpFD, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
+        }
+        if udpBindRet != 0 {
+            fputs("run-vz: bind UDP port \(hostPort + 1) failed: \(String(cString: strerror(errno)))\n", stderr)
+            exit(1)
         }
         _ = fcntl(udpFD, F_SETFL, fcntl(udpFD, F_GETFL, 0) | O_NONBLOCK)
 
