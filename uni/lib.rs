@@ -66,19 +66,37 @@ mod backend {
     // Same pattern as the unikernel: register callbacks, all workers run
     // the same loop. On native, "worker" = OS thread.
 
+    use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+
     type PollFn = fn(u32) -> bool;
 
-    struct Callbacks {
-        io_poll: [Option<PollFn>; 4],  // up to 4 IO sources (net, storage, ...)
-        io_poll_count: usize,
-        service: Option<PollFn>,
-    }
+    /// Up to 4 IO poll callbacks (network, storage, ...). Each slot is an
+    /// `AtomicPtr<()>` (null = empty, non-null = `PollFn`); `IO_POLL_COUNT`
+    /// is the number of slots that have been claimed. Slots are filled in
+    /// order during init by `register_io_poll`, then read by all worker
+    /// threads. Volatile reads/writes (the previous design) are NOT a
+    /// synchronisation primitive in the Rust memory model.
+    const IO_POLL_MAX: usize = 4;
+    static IO_POLL: [AtomicPtr<()>; IO_POLL_MAX] = [
+        AtomicPtr::new(core::ptr::null_mut()),
+        AtomicPtr::new(core::ptr::null_mut()),
+        AtomicPtr::new(core::ptr::null_mut()),
+        AtomicPtr::new(core::ptr::null_mut()),
+    ];
+    static IO_POLL_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static SERVICE: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 
-    static mut CB: Callbacks = Callbacks {
-        io_poll: [None; 4],
-        io_poll_count: 0,
-        service: None,
-    };
+    #[inline]
+    fn load_poll(slot: &AtomicPtr<()>) -> Option<PollFn> {
+        let p = slot.load(Ordering::Acquire);
+        if p.is_null() {
+            None
+        } else {
+            // SAFETY: only `register_io_poll`/`set_service` write here, and
+            // both write valid `PollFn` pointers.
+            Some(unsafe { core::mem::transmute::<*mut (), PollFn>(p) })
+        }
+    }
 
     // NUM_WORKERS removed: num_workers() now reads native::NUM_THREADS directly.
     static READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -91,21 +109,25 @@ mod backend {
 
     /// Register an IO poll callback (network, storage, etc).
     /// Multiple sources can be registered; all are called each iteration.
+    /// Designed to be called from a single init thread; the atomic
+    /// fetch_add reserves the slot index race-free even if that contract
+    /// is ever violated.
     pub fn register_io_poll(f: PollFn) {
-        unsafe {
-            if CB.io_poll_count < CB.io_poll.len() {
-                CB.io_poll[CB.io_poll_count] = Some(f);
-                CB.io_poll_count += 1;
-            }
+        let idx = IO_POLL_COUNT.fetch_add(1, Ordering::AcqRel);
+        if idx < IO_POLL_MAX {
+            IO_POLL[idx].store(f as *mut (), Ordering::Release);
+        } else {
+            // Roll back to keep IO_POLL_COUNT bounded.
+            IO_POLL_COUNT.store(IO_POLL_MAX, Ordering::Release);
         }
     }
 
     pub fn set_service(f: PollFn) {
-        unsafe { core::ptr::write_volatile(&raw mut CB.service, Some(f)); }
+        SERVICE.store(f as *mut (), Ordering::Release);
     }
 
     pub fn get_service() -> Option<PollFn> {
-        unsafe { core::ptr::read_volatile(&raw const CB.service) }
+        load_poll(&SERVICE)
     }
 
     pub fn set_ready() {
@@ -138,11 +160,10 @@ mod backend {
             let mut did_work = false;
 
             // 1. IO poll callbacks (network, future storage, etc)
-            unsafe {
-                for i in 0..CB.io_poll_count {
-                    if let Some(f) = CB.io_poll[i] {
-                        if f(worker_id) { did_work = true; }
-                    }
+            let n = IO_POLL_COUNT.load(Ordering::Acquire).min(IO_POLL_MAX);
+            for i in 0..n {
+                if let Some(f) = load_poll(&IO_POLL[i]) {
+                    if f(worker_id) { did_work = true; }
                 }
             }
 
