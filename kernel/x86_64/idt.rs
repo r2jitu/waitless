@@ -292,8 +292,8 @@ pub fn init() {
 
         // Load the IDTR
         IDTR.limit = (core::mem::size_of::<[IdtEntry; 256]>() - 1) as u16;
-        IDTR.base = &IDT_ENTRIES as *const _ as u64;
-        asm!("lidt [{}]", in(reg) &IDTR, options(nostack));
+        IDTR.base = &raw const IDT_ENTRIES as u64;
+        asm!("lidt [{}]", in(reg) &raw const IDTR, options(nostack));
     }
 }
 
@@ -323,7 +323,7 @@ pub fn enable_irq(irq: u8) {
 /// Load the IDT on an AP (same IDT as BSP). APs share the IDT and handler table.
 pub fn load_idt_on_ap() {
     unsafe {
-        asm!("lidt [{}]", in(reg) &IDTR, options(nostack));
+        asm!("lidt [{}]", in(reg) &raw const IDTR, options(nostack));
     }
 }
 

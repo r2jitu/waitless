@@ -4,7 +4,6 @@
 // modules in x86_64/ and aarch64/ subdirectories.
 
 #![no_std]
-#![allow(static_mut_refs)]
 
 pub mod types;
 pub mod sync;
@@ -85,3 +84,4 @@ pub fn wake_core0() {
     #[cfg(target_arch = "x86_64")]
     send_ipi(0);
 }
+
