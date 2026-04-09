@@ -1,19 +1,23 @@
 /* Limine higher-half linker script for x86_64.
  *
- * Limine revision 3 requires the kernel to be linked at higher-half virtual
- * addresses (>= 0xFFFF800000000000). We pick the top-2GB region
- * (0xFFFFFFFF80000000+), which matches `-mcmodel=kernel` and is the
- * conventional Linux kernel layout.
+ * The kernel must be linked at higher-half virtual addresses
+ * (>= 0xFFFF800000000000) so the Limine bootloader's PML4 covers it.
+ * We pick the top-2GB region (0xFFFFFFFF80000000+), the conventional
+ * Linux kernel layout, which is also compatible with `-mcmodel=kernel`
+ * if we ever want signed 32-bit relocations.
  *
- * Limine maps:
- *   - Kernel segments at their linked virtual addresses
- *   - Identity map of first 4GB (physical == virtual for MMIO/bitmap/heap)
- *   - HHDM (Higher Half Direct Map) for all physical memory
+ * The driver/kernel code accesses MMIO (Local APIC at 0xFEE00000,
+ * virtio-pci BARs in the 0xFEBxxxxx range) by physical address. We
+ * therefore request Limine base revision 0 in `boot/limine_entry.rs`
+ * so Limine provides BOTH a 4 GiB identity map AND an HHDM that covers
+ * every memory-map region (including reserved/MMIO). Revisions 1+
+ * progressively dropped these guarantees and would require us to set
+ * up our own page-table entries for MMIO.
  *
- * Layout mirrors unikernel.ld but with `__kernel_base` fixed to higher-half.
- * (We don't share unikernel.ld + an override script: lld evaluates SECTIONS
- * at script-parse time, so a `--defsym` or supplemental `-T` arrives too
- * late to influence the location counter.)
+ * Layout mirrors unikernel.ld but with `__kernel_base` fixed to
+ * higher-half. We don't share unikernel.ld + an override script: lld
+ * evaluates SECTIONS at script-parse time, so a `--defsym` or
+ * supplemental `-T` arrives too late to influence the location counter.
  */
 
 /* Limine reads the actual entry point from the EntryPointRequest in

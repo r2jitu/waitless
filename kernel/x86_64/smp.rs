@@ -55,9 +55,11 @@ pub fn init_tls(id: u32) {
     }
 }
 
-/// Number of online cores.
+/// Number of online cores. Acquire pairs with the AP's `SeqCst` `fetch_add`
+/// in `ap_main_x86`, matching the aarch64 SMP code so the BSP's wait-loop
+/// is well-defined under the abstract memory model (not just x86 TSO).
 pub fn num_cores_online() -> u32 {
-    NUM_CORES_ONLINE.load(Ordering::Relaxed)
+    NUM_CORES_ONLINE.load(Ordering::Acquire)
 }
 
 /// Boot secondary cores. Called by core 0 after all init.
