@@ -36,6 +36,13 @@ rust.toolchain(
 )
 use_repo(rust, "rust_toolchains")
 
+# Pin host tools (cargo, rustc used during dep resolution) to 1.86.0 too.
+# Default in rules_rust 0.56.0 is 1.83 which doesn't understand
+# `edition = "2024"` in dependency Cargo.toml files (stabilised in 1.85).
+rust_host_tools = use_extension("@rules_rust//rust:extensions.bzl", "rust_host_tools")
+rust_host_tools.host_tools(version = "1.86.0", edition = "2024")
+use_repo(rust_host_tools, "rust_host_tools")
+
 register_toolchains("@rust_toolchains//:all")
 
 # ── crates.io dependencies (annotation-based, no Cargo.toml needed) ──────────
@@ -44,6 +51,25 @@ crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
 crate.spec(
     package = "bitflags",
     version = "2.9.1",
+    default_features = False,
+)
+
+# Limine boot protocol bindings (no_std, only bitflags as runtime dep).
+# Replaces the hand-written request/response structs in
+# boot/limine_entry.rs and gets correct PHDR-friendly layout.
+# Pin to 0.5.0 — 0.6.x (under different maintainership) needs nightly
+# features (`ptr_metadata`) which we can't use on stable rustc.
+crate.spec(
+    package = "limine",
+    version = "0.5.0",
+    default_features = False,
+)
+
+# Flattened device tree parser (zero deps, no_std).
+# Replaces the hand-written FDT walker in kernel/aarch64/fdt.rs.
+crate.spec(
+    package = "fdt",
+    version = "0.1.5",
     default_features = False,
 )
 

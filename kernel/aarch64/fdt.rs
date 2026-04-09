@@ -1,12 +1,11 @@
-// kernel/fdt.rs — Minimal FDT (Device Tree Blob) scanner for ARM64
+// kernel/aarch64/fdt.rs — FDT (Device Tree Blob) discovery for ARM64
 //
-// Walks the DTB structure block looking for nodes with specific compatible
-// strings and extracts their MMIO base addresses from the reg property.
-//
-// Assumptions (standard for QEMU virt and Apple VZ):
-//   - #address-cells = 2, #size-cells = 2 at root level
-//   - reg addresses stored as (hi32 BE, lo32 BE) -> 64-bit address
-//   - Devices of interest are direct children of root (depth 1) or /soc
+// Walks the device tree looking for the platform devices we care about
+// (PL011 UART, virtio-mmio, GIC distributor/redistributor, PCIe ECAM) and
+// populates an `FdtInfo` struct used during boot. Parsing is delegated to
+// the upstream `fdt` crate; this file is the kernel-specific extraction
+// layer that knows about GIC SPI/PPI offsets, PCI 32-bit MMIO ranges, and
+// the interrupt-map → slot table.
 //
 // On x86_64 this module provides no-op stubs.
 
@@ -60,354 +59,205 @@ impl FdtInfo {
 static G_INFO: InitOnce<FdtInfo> = InitOnce::new();
 
 // ============================================================================
-// Big-endian helpers (safe, slice-based)
-// ============================================================================
-
-#[inline]
-fn be32(s: &[u8]) -> u32 {
-    ((s[0] as u32) << 24) | ((s[1] as u32) << 16) | ((s[2] as u32) << 8) | (s[3] as u32)
-}
-
-#[inline]
-fn be64_2cell(s: &[u8]) -> u64 {
-    ((be32(s) as u64) << 32) | be32(&s[4..]) as u64
-}
-
-// ============================================================================
-// String helpers (safe, slice-based)
-// ============================================================================
-
-/// Check if the null-terminated string at `s` equals `name`.
-/// `s` must start at the string and extend at least to the null terminator.
-fn str_at_eq(s: &[u8], name: &[u8]) -> bool {
-    if s.len() < name.len() + 1 {
-        return false;
-    }
-    s[..name.len()] == *name && s[name.len()] == 0
-}
-
-/// Check if the null-string list `data` contains `needle`.
-fn strlist_has(data: &[u8], needle: &[u8]) -> bool {
-    let mut start = 0;
-    while start < data.len() {
-        // Find the end of the current null-terminated string
-        let mut end = start;
-        while end < data.len() && data[end] != 0 {
-            end += 1;
-        }
-        let s = &data[start..end];
-        if s == needle {
-            return true;
-        }
-        // Skip the null terminator
-        start = end + 1;
-    }
-    false
-}
-
-// ============================================================================
-// DTB structure tokens
-// ============================================================================
-
-const FDT_MAGIC: u32 = 0xD00DFEED;
-const FDT_BEGIN_NODE: u32 = 1;
-const FDT_END_NODE: u32 = 2;
-const FDT_PROP: u32 = 3;
-const FDT_NOP: u32 = 4;
-const FDT_END: u32 = 9;
-
-// Compatible flags
-const CF_PL011: u32 = 1 << 0;
-const CF_VIRTIO: u32 = 1 << 1;
-const CF_GICV2: u32 = 1 << 2;
-const CF_PCI: u32 = 1 << 3;
-const CF_MEMORY: u32 = 1 << 4;
-const CF_GICV3: u32 = 1 << 5;
-
-// ============================================================================
-// Per-node state during parsing
-// ============================================================================
-
-const MAX_DEPTH: usize = 8;
-
-struct NodeState {
-    compat: u32,
-    reg: u64,
-    reg_size: u64,
-    has_reg: bool,
-    reg2: u64,
-    has_reg2: bool,
-    /// Offset into the DTB slice where the ranges property value begins.
-    ranges_off: usize,
-    ranges_len: u32,
-    has_ranges: bool,
-    irq: u32,
-    has_irq: bool,
-    /// Offset into the DTB slice where the interrupt-map property value begins.
-    int_map_off: usize,
-    int_map_len: u32,
-    has_int_map: bool,
-}
-
-impl NodeState {
-    const fn new() -> Self {
-        NodeState {
-            compat: 0,
-            reg: 0,
-            reg_size: 0,
-            has_reg: false,
-            reg2: 0,
-            has_reg2: false,
-            ranges_off: 0,
-            ranges_len: 0,
-            has_ranges: false,
-            irq: 0,
-            has_irq: false,
-            int_map_off: 0,
-            int_map_len: 0,
-            has_int_map: false,
-        }
-    }
-}
-
-// ============================================================================
-// Main parser
+// Big-endian helpers — used to parse raw `ranges` and `interrupt-map`
+// property bytes that the fdt crate exposes as `&[u8]`.
 // ============================================================================
 
 #[cfg(target_arch = "aarch64")]
-fn parse_dtb(dtb: &[u8]) -> Option<FdtInfo> {
-    if dtb.len() < 40 {
-        return None;
-    }
+#[inline]
+fn be32(s: &[u8]) -> u32 {
+    u32::from_be_bytes([s[0], s[1], s[2], s[3]])
+}
 
-    if be32(dtb) != FDT_MAGIC {
-        return None;
-    }
+// ============================================================================
+// Per-protocol GIC interrupt translation
+// ============================================================================
+//
+// The Device Tree `interrupts` property for a GIC consumer encodes
+// `(type, number, flags)`:
+//   type 0 → SPI (Shared Peripheral Interrupt), GIC INTID = number + 32
+//   type 1 → PPI (Private Peripheral Interrupt), GIC INTID = number + 16
+//
+// The `fdt` crate's `interrupts()` iterator returns each cell flattened to
+// `usize`, so we read the raw bytes ourselves to keep the (type, num) pair.
+#[cfg(target_arch = "aarch64")]
+fn translate_gic_irq(int_type: u32, int_num: u32) -> u32 {
+    if int_type == 0 { int_num + 32 } else { int_num + 16 }
+}
 
-    let off_struct = be32(&dtb[8..]) as usize;
-    let off_strings = be32(&dtb[12..]) as usize;
+#[cfg(target_arch = "aarch64")]
+fn parse_first_interrupt(prop: &[u8]) -> Option<u32> {
+    if prop.len() < 12 { return None; }
+    let int_type = be32(prop);
+    let int_num = be32(&prop[4..]);
+    Some(translate_gic_irq(int_type, int_num))
+}
 
-    let mut pos = off_struct;
+// ============================================================================
+// PCI ranges parser — extracts the 32-bit MMIO aperture
+// ============================================================================
+//
+// PCI host `ranges` property layout (per PCI bus binding):
+//   child_high (1 cell): flags
+//   child_mid  (1 cell): pci addr high
+//   child_low  (1 cell): pci addr low
+//   parent_high (1 cell): cpu addr high
+//   parent_low  (1 cell): cpu addr low
+//   size_high   (1 cell): size high
+//   size_low    (1 cell): size low
+// Total: 28 bytes per range.
+//
+// flags >> 24 & 3: 0=config, 1=I/O, 2=32-bit memory, 3=64-bit memory.
 
-    let mut stack = [const { NodeState::new() }; MAX_DEPTH];
-    let mut depth: i32 = 0;
-    // Build the parsed result in a local — published once at the end via
-    // InitOnce so every cross-core read sees a fully-initialised struct.
-    let mut info = FdtInfo::ZEROED;
-
-    loop {
-        if pos + 4 > dtb.len() {
-            return None;
+#[cfg(target_arch = "aarch64")]
+fn parse_pci_mmio32(ranges: &[u8]) -> Option<(u64, u64)> {
+    let mut off = 0;
+    while off + 28 <= ranges.len() {
+        let flags = be32(&ranges[off..]);
+        let space = (flags >> 24) & 3;
+        if space == 2 {
+            let cpu_hi = be32(&ranges[off + 12..]) as u64;
+            let cpu_lo = be32(&ranges[off + 16..]) as u64;
+            let size_hi = be32(&ranges[off + 20..]) as u64;
+            let size_lo = be32(&ranges[off + 24..]) as u64;
+            return Some(((cpu_hi << 32) | cpu_lo, (size_hi << 32) | size_lo));
         }
-        let tok = be32(&dtb[pos..]);
-        pos += 4;
+        off += 28;
+    }
+    None
+}
 
-        match tok {
-            FDT_BEGIN_NODE => {
-                if (depth as usize) < MAX_DEPTH {
-                    stack[depth as usize] = NodeState::new();
-                }
-                depth += 1;
-                // Read node name, then skip
-                let name_start = pos;
-                while pos < dtb.len() && dtb[pos] != 0 {
-                    pos += 1;
-                }
-                let name = &dtb[name_start..pos];
-                pos += 1; // skip null
-                pos = (pos + 3) & !3; // align
+// ============================================================================
+// PCI interrupt-map parser — slot → GIC INTID
+// ============================================================================
+//
+// `interrupt-map` is variable-width but for QEMU virt and Apple VZ it's
+// 40 bytes per entry:
+//   child_addr  (3 cells = 12 bytes): pci unit address (slot in bits 11-15 of [0])
+//   child_int   (1 cell  =  4 bytes): pin
+//   parent      (1 cell  =  4 bytes): phandle
+//   parent_addr (2 cells =  8 bytes): zero
+//   parent_int  (3 cells = 12 bytes): GIC type, GIC irq, flags
 
-                // Count cpu@N nodes (children of /cpus)
-                if name.len() >= 4 && name[0] == b'c' && name[1] == b'p'
-                    && name[2] == b'u' && name[3] == b'@'
-                {
-                    info.cpu_count += 1;
-                }
-            }
-
-            FDT_END_NODE => {
-                depth -= 1;
-                if depth >= 0 && (depth as usize) < MAX_DEPTH {
-                    let ns = &stack[depth as usize];
-                    if ns.has_reg {
-                        if (ns.compat & CF_PL011) != 0 && info.uart_base == 0 {
-                            info.uart_base = ns.reg;
-                        }
-
-                        if (ns.compat & CF_VIRTIO) != 0 && info.virtio_count < 32 {
-                            let idx = info.virtio_count as usize;
-                            info.virtio_bases[idx] = ns.reg;
-                            info.virtio_irqs[idx] = if ns.has_irq { ns.irq } else { 0 };
-                            info.virtio_count += 1;
-                        }
-
-                        if (ns.compat & CF_GICV2) != 0 && info.gic_dist_base == 0 {
-                            info.gic_dist_base = ns.reg;
-                            info.gic_version = 2;
-                        }
-
-                        if (ns.compat & CF_GICV3) != 0 && info.gic_dist_base == 0 {
-                            info.gic_dist_base = ns.reg;
-                            info.gic_redist_base =
-                                if ns.has_reg2 { ns.reg2 } else { 0 };
-                            info.gic_version = 3;
-                        }
-
-                        if (ns.compat & CF_PCI) != 0 && info.pcie_ecam_base == 0 {
-                            info.pcie_ecam_base = ns.reg;
-                            info.pcie_ecam_size = ns.reg_size;
-                        }
-
-                        // Parse PCI "ranges" for 32-bit MMIO aperture
-                        if (ns.compat & CF_PCI) != 0
-                            && ns.has_ranges
-                            && ns.ranges_len >= 28
-                            && info.pci_mmio32_base == 0
-                        {
-                            let ranges = &dtb[ns.ranges_off..];
-                            let mut off: u32 = 0;
-                            while off + 28 <= ns.ranges_len {
-                                let o = off as usize;
-                                let flags = be32(&ranges[o..]);
-                                let space = (flags >> 24) & 3;
-                                if space == 2 {
-                                    // 32-bit memory space
-                                    let cpu_hi = be32(&ranges[o + 12..]) as u64;
-                                    let cpu_lo = be32(&ranges[o + 16..]) as u64;
-                                    info.pci_mmio32_base = (cpu_hi << 32) | cpu_lo;
-                                    info.pci_mmio32_size =
-                                        ((be32(&ranges[o + 20..]) as u64) << 32)
-                                            | be32(&ranges[o + 24..]) as u64;
-                                    break;
-                                }
-                                off += 28;
-                            }
-                        }
-
-                        // Parse PCI interrupt-map
-                        if (ns.compat & CF_PCI) != 0
-                            && ns.has_int_map
-                            && ns.int_map_len >= 40
-                        {
-                            let imap = &dtb[ns.int_map_off..];
-                            let mut off: u32 = 0;
-                            while off + 40 <= ns.int_map_len {
-                                let o = off as usize;
-                                let child_hi = be32(&imap[o..]);
-                                let gic_type = be32(&imap[o + 28..]);
-                                let gic_irq = be32(&imap[o + 32..]);
-                                let slot = (child_hi >> 11) & 0x1F;
-                                let intid = if gic_type == 0 {
-                                    gic_irq + 32
-                                } else {
-                                    gic_irq + 16
-                                };
-                                if slot < 8 && info.pci_irqs[slot as usize] == 0 {
-                                    info.pci_irqs[slot as usize] = intid;
-                                }
-                                off += 40;
-                            }
-                        }
-
-                        if (ns.compat & CF_MEMORY) != 0 && info.ram_size == 0 {
-                            info.ram_base = ns.reg;
-                            info.ram_size = ns.reg_size;
-                        }
-                    }
-                }
-            }
-
-            FDT_PROP => {
-                if pos + 8 > dtb.len() {
-                    return None;
-                }
-                let vlen = be32(&dtb[pos..]);
-                pos += 4;
-                let nameoff = be32(&dtb[pos..]);
-                pos += 4;
-                let vdata_off = pos;
-                // Advance past value (padded to 4-byte alignment)
-                pos += ((vlen + 3) & !3) as usize;
-
-                let d = depth - 1;
-                if d >= 0 && (d as usize) < MAX_DEPTH {
-                    let ns = &mut stack[d as usize];
-                    let pname_off = off_strings + nameoff as usize;
-                    let pname = &dtb[pname_off..];
-
-                    if str_at_eq(pname, b"compatible") {
-                        let vdata = &dtb[vdata_off..vdata_off + vlen as usize];
-                        if strlist_has(vdata, b"arm,pl011") {
-                            ns.compat |= CF_PL011;
-                        }
-                        if strlist_has(vdata, b"virtio,mmio") {
-                            ns.compat |= CF_VIRTIO;
-                        }
-                        if strlist_has(vdata, b"arm,gic-400")
-                            || strlist_has(vdata, b"arm,cortex-a15-gic")
-                        {
-                            ns.compat |= CF_GICV2;
-                        }
-                        if strlist_has(vdata, b"pci-host-ecam-generic") {
-                            ns.compat |= CF_PCI;
-                        }
-                        if strlist_has(vdata, b"arm,gic-v3") {
-                            ns.compat |= CF_GICV3;
-                        }
-                    } else if str_at_eq(pname, b"device_type") {
-                        let vdata = &dtb[vdata_off..vdata_off + vlen as usize];
-                        if strlist_has(vdata, b"pci") {
-                            ns.compat |= CF_PCI;
-                        }
-                        if strlist_has(vdata, b"memory") {
-                            ns.compat |= CF_MEMORY;
-                        }
-                    } else if str_at_eq(pname, b"reg") && vlen >= 8 && !ns.has_reg {
-                        let vdata = &dtb[vdata_off..];
-                        ns.reg = be64_2cell(vdata);
-                        ns.reg_size = if vlen >= 16 {
-                            be64_2cell(&vdata[8..])
-                        } else {
-                            0
-                        };
-                        ns.has_reg = true;
-                        if vlen >= 32 {
-                            ns.reg2 = be64_2cell(&vdata[16..]);
-                            ns.has_reg2 = true;
-                        }
-                    } else if str_at_eq(pname, b"ranges") && vlen > 0 {
-                        ns.ranges_off = vdata_off;
-                        ns.ranges_len = vlen;
-                        ns.has_ranges = true;
-                    } else if str_at_eq(pname, b"interrupt-map") {
-                        ns.int_map_off = vdata_off;
-                        ns.int_map_len = vlen;
-                        ns.has_int_map = true;
-                    } else if str_at_eq(pname, b"interrupts") && vlen >= 12 && !ns.has_irq {
-                        let vdata = &dtb[vdata_off..];
-                        let irq_type = be32(vdata);
-                        let irq_num = be32(&vdata[4..]);
-                        ns.irq = if irq_type == 0 {
-                            irq_num + 32
-                        } else {
-                            irq_num + 16
-                        };
-                        ns.has_irq = true;
-                    }
-                }
-            }
-
-            FDT_NOP => {}
-
-            FDT_END => return Some(info),
-
-            _ => return None, // corrupted DTB
+#[cfg(target_arch = "aarch64")]
+fn parse_pci_interrupt_map(imap: &[u8], pci_irqs: &mut [u32; 8]) {
+    let mut off = 0;
+    while off + 40 <= imap.len() {
+        let child_hi = be32(&imap[off..]);
+        let gic_type = be32(&imap[off + 28..]);
+        let gic_irq = be32(&imap[off + 32..]);
+        let slot = ((child_hi >> 11) & 0x1F) as usize;
+        let intid = translate_gic_irq(gic_type, gic_irq);
+        if slot < 8 && pci_irqs[slot] == 0 {
+            pci_irqs[slot] = intid;
         }
+        off += 40;
     }
 }
 
 // ============================================================================
-// Public Rust API — for Rust crate consumers (serial_rs, drivers_rs, etc.)
+// Main parser — populates an FdtInfo from a parsed Fdt
+// ============================================================================
+
+#[cfg(target_arch = "aarch64")]
+fn extract_info(fdt: &fdt::Fdt) -> FdtInfo {
+    let mut info = FdtInfo::ZEROED;
+
+    info.cpu_count = fdt.cpus().count() as u32;
+
+    if let Some(region) = fdt.memory().regions().next() {
+        info.ram_base = region.starting_address as u64;
+        info.ram_size = region.size.unwrap_or(0) as u64;
+    }
+
+    if let Some(uart) = fdt.find_compatible(&["arm,pl011"]) {
+        if let Some(reg) = uart.reg().and_then(|mut r| r.next()) {
+            info.uart_base = reg.starting_address as u64;
+        }
+    }
+
+    // GIC: try v3 first, fall back to v2 names.
+    let gic = fdt
+        .find_compatible(&["arm,gic-v3"])
+        .map(|n| (n, 3u8))
+        .or_else(|| {
+            fdt.find_compatible(&["arm,gic-400", "arm,cortex-a15-gic"])
+                .map(|n| (n, 2u8))
+        });
+    if let Some((node, version)) = gic {
+        info.gic_version = version;
+        let mut regs = node.reg().into_iter().flatten();
+        if let Some(r) = regs.next() {
+            info.gic_dist_base = r.starting_address as u64;
+        }
+        if version == 3 {
+            if let Some(r) = regs.next() {
+                info.gic_redist_base = r.starting_address as u64;
+            }
+        }
+    }
+
+    // virtio-mmio: walk every node in the tree and pick those whose
+    // compatible includes "virtio,mmio". The fdt crate doesn't expose a
+    // typed "find_all_compatible" helper, so we do the filter ourselves.
+    for node in fdt.find_all_nodes("/").flat_map(|root| root.children()) {
+        scan_for_virtio(&node, &mut info);
+    }
+    // Also scan /soc and /soc/* in case the layout uses an SoC sub-node.
+    if let Some(soc) = fdt.find_node("/soc") {
+        for node in soc.children() {
+            scan_for_virtio(&node, &mut info);
+        }
+    }
+
+    // PCIe ECAM (host bridge).
+    if let Some(pci) = fdt.find_compatible(&["pci-host-ecam-generic"]) {
+        if let Some(reg) = pci.reg().and_then(|mut r| r.next()) {
+            info.pcie_ecam_base = reg.starting_address as u64;
+            info.pcie_ecam_size = reg.size.unwrap_or(0) as u64;
+        }
+        if let Some(ranges) = pci.property("ranges") {
+            if let Some((base, size)) = parse_pci_mmio32(ranges.value) {
+                info.pci_mmio32_base = base;
+                info.pci_mmio32_size = size;
+            }
+        }
+        if let Some(imap) = pci.property("interrupt-map") {
+            parse_pci_interrupt_map(imap.value, &mut info.pci_irqs);
+        }
+    }
+
+    info
+}
+
+#[cfg(target_arch = "aarch64")]
+fn scan_for_virtio(node: &fdt::node::FdtNode<'_, '_>, info: &mut FdtInfo) {
+    if info.virtio_count >= 32 {
+        return;
+    }
+    let is_virtio = node
+        .compatible()
+        .map(|c| c.all().any(|s| s == "virtio,mmio"))
+        .unwrap_or(false);
+    if !is_virtio {
+        return;
+    }
+    let base = match node.reg().and_then(|mut r| r.next()) {
+        Some(r) => r.starting_address as u64,
+        None => return,
+    };
+    let irq = node
+        .property("interrupts")
+        .and_then(|p| parse_first_interrupt(p.value))
+        .unwrap_or(0);
+    let idx = info.virtio_count as usize;
+    info.virtio_bases[idx] = base;
+    info.virtio_irqs[idx] = irq;
+    info.virtio_count += 1;
+}
+
+// ============================================================================
+// Public API
 // ============================================================================
 
 /// Return a reference to the global parsed FDT info. Panics if `init`
@@ -416,9 +266,11 @@ pub fn info() -> &'static FdtInfo {
     G_INFO.get()
 }
 
-// ============================================================================
-// Public API
-// ============================================================================
+/// Return a pointer to the parsed FDT info. Used by code that needs a
+/// raw pointer (e.g., FFI). Panics if `init` has not been called.
+pub fn info_ptr() -> *const FdtInfo {
+    G_INFO.get() as *const FdtInfo
+}
 
 /// Parse the DTB at the given physical address.
 /// Safe to call with dtb_addr=0 (publishes a zeroed FdtInfo so later
@@ -432,31 +284,17 @@ pub fn init(dtb_addr: u64) {
             G_INFO.init(FdtInfo::ZEROED);
             return;
         }
-        // Safety: On bare-metal aarch64, the DTB physical address is identity-mapped
-        // (or HHDM-mapped) and valid for the entire DTB. We read total_size from
-        // the header (offset 4) to determine the slice length. After this single
-        // unsafe slice creation, all parsing is done with safe slice operations.
-        let total_size = unsafe {
-            let p = dtb_addr as *const u8;
-            be32(core::slice::from_raw_parts(p.add(4), 4))
-        } as usize;
-        if total_size < 40 {
-            G_INFO.init(FdtInfo::ZEROED);
-            return;
-        }
-        let dtb =
-            unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, total_size) };
-        let parsed = parse_dtb(dtb).unwrap_or(FdtInfo::ZEROED);
+        // SAFETY: On bare-metal aarch64 the DTB is loaded by the firmware
+        // (QEMU/VZ/Limine) at a stable physical address that's identity-
+        // mapped or HHDM-mapped. The fdt crate reads the header to find
+        // the total length, then bounds-checks every subsequent access.
+        let parsed = unsafe { fdt::Fdt::from_ptr(dtb_addr as *const u8) }
+            .map(|fdt| extract_info(&fdt))
+            .unwrap_or(FdtInfo::ZEROED);
         G_INFO.init(parsed);
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
         let _ = dtb_addr;
     }
-}
-
-/// Return a pointer to the parsed FDT info. Used by code that needs a
-/// raw pointer (e.g., FFI). Panics if `init` has not been called.
-pub fn info_ptr() -> *const FdtInfo {
-    G_INFO.get() as *const FdtInfo
 }

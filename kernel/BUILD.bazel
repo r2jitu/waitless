@@ -40,6 +40,10 @@ rust_library(
         "//conditions:default": [],
     }),
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    deps = select({
+        "//bazel/platforms:aarch64": ["@crates//:fdt"],
+        "//conditions:default": [],
+    }),
 )
 
 # Host-native unit tests for lock-free data structures.

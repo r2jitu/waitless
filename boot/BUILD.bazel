@@ -48,7 +48,10 @@ rust_static_library(
     name = "limine",
     srcs = ["limine_entry.rs"],
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
-    deps = ["//kernel"],
+    deps = [
+        "//kernel",
+        "@crates//:limine",
+    ],
 )
 
 rust_static_library(
