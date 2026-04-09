@@ -7,35 +7,72 @@
 // After the app's main() returns, all cores enter eventloop::run().
 // The loop runs until shutdown.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 /// Callback types. All receive core_id, return true if work was done.
 type PollFn = fn(u32) -> bool;
 
-/// Registered callbacks. Written once during init, read by all cores.
-struct Callbacks {
-    /// Network poll: try to distribute RX, flush TX staging.
-    net_poll: Option<PollFn>,
-    /// Drain this core's RX inbox and process packets.
-    net_drain: Option<PollFn>,
-    /// Flush TX staging.
-    net_flush: Option<fn()>,
-    /// App-level service (HTTP connections, etc).
-    service: Option<PollFn>,
-    /// Check for shutdown signal (serial Ctrl-C).
-    check_shutdown: Option<fn() -> bool>,
-    /// Idle — sleep until interrupt/event.
-    idle: Option<fn(u32)>,  // receives core_id
+/// Registered callbacks. Each is published as an `AtomicPtr<()>` (null = not
+/// set, non-null = function pointer). The release-store on registration
+/// pairs with the acquire-load in `run()` so that any data written before
+/// registration is visible to the consumer cores. Volatile reads/writes
+/// (the previous design) are NOT a synchronisation primitive — they prevent
+/// the access itself from being optimised away but neither establish a
+/// happens-before edge nor prevent surrounding memory accesses from being
+/// reordered around them.
+static NET_POLL: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+static NET_DRAIN: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+static NET_FLUSH: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+static SERVICE: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+static CHECK_SHUTDOWN: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+static IDLE: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+
+#[inline]
+fn store_fn(slot: &AtomicPtr<()>, f: usize) {
+    slot.store(f as *mut (), Ordering::Release);
 }
 
-static mut CB: Callbacks = Callbacks {
-    net_poll: None,
-    net_drain: None,
-    net_flush: None,
-    service: None,
-    check_shutdown: None,
-    idle: None,
-};
+#[inline]
+fn load_poll(slot: &AtomicPtr<()>) -> Option<PollFn> {
+    let p = slot.load(Ordering::Acquire);
+    if p.is_null() {
+        None
+    } else {
+        // SAFETY: only the matching `set_*` writes here, and it always
+        // writes a valid `PollFn`.
+        Some(unsafe { core::mem::transmute::<*mut (), PollFn>(p) })
+    }
+}
+
+#[inline]
+fn load_void(slot: &AtomicPtr<()>) -> Option<fn()> {
+    let p = slot.load(Ordering::Acquire);
+    if p.is_null() {
+        None
+    } else {
+        Some(unsafe { core::mem::transmute::<*mut (), fn()>(p) })
+    }
+}
+
+#[inline]
+fn load_bool(slot: &AtomicPtr<()>) -> Option<fn() -> bool> {
+    let p = slot.load(Ordering::Acquire);
+    if p.is_null() {
+        None
+    } else {
+        Some(unsafe { core::mem::transmute::<*mut (), fn() -> bool>(p) })
+    }
+}
+
+#[inline]
+fn load_idle(slot: &AtomicPtr<()>) -> Option<fn(u32)> {
+    let p = slot.load(Ordering::Acquire);
+    if p.is_null() {
+        None
+    } else {
+        Some(unsafe { core::mem::transmute::<*mut (), fn(u32)>(p) })
+    }
+}
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static READY: AtomicBool = AtomicBool::new(false);
@@ -43,27 +80,27 @@ static READY: AtomicBool = AtomicBool::new(false);
 // ---- Registration API (called during boot/app init) ----
 
 pub fn set_net_poll(f: PollFn) {
-    unsafe { core::ptr::write_volatile(&raw mut CB.net_poll, Some(f)); }
+    store_fn(&NET_POLL, f as usize);
 }
 
 pub fn set_net_drain(f: PollFn) {
-    unsafe { core::ptr::write_volatile(&raw mut CB.net_drain, Some(f)); }
+    store_fn(&NET_DRAIN, f as usize);
 }
 
 pub fn set_net_flush(f: fn()) {
-    unsafe { core::ptr::write_volatile(&raw mut CB.net_flush, Some(f)); }
+    store_fn(&NET_FLUSH, f as usize);
 }
 
 pub fn set_service(f: PollFn) {
-    unsafe { core::ptr::write_volatile(&raw mut CB.service, Some(f)); }
+    store_fn(&SERVICE, f as usize);
 }
 
 pub fn set_check_shutdown(f: fn() -> bool) {
-    unsafe { core::ptr::write_volatile(&raw mut CB.check_shutdown, Some(f)); }
+    store_fn(&CHECK_SHUTDOWN, f as usize);
 }
 
 pub fn set_idle(f: fn(u32)) {
-    unsafe { core::ptr::write_volatile(&raw mut CB.idle, Some(f)); }
+    store_fn(&IDLE, f as usize);
 }
 
 /// Signal that the app has finished initialization and the event loop
@@ -108,17 +145,17 @@ pub fn run(core_id: u32) -> ! {
         let mut did_work = false;
 
         // 1. Network poll: try to distribute RX + flush TX (rotating distributor)
-        if let Some(f) = unsafe { core::ptr::read_volatile(&raw const CB.net_poll) } {
+        if let Some(f) = load_poll(&NET_POLL) {
             if f(core_id) { did_work = true; poll_work += 1; }
         }
 
         // 2. Drain this core's inbox
-        if let Some(f) = unsafe { core::ptr::read_volatile(&raw const CB.net_drain) } {
+        if let Some(f) = load_poll(&NET_DRAIN) {
             if f(core_id) { did_work = true; drain_work += 1; }
         }
 
         // 3. App service (connections, handlers)
-        if let Some(f) = unsafe { core::ptr::read_volatile(&raw const CB.service) } {
+        if let Some(f) = load_poll(&SERVICE) {
             if f(core_id) { did_work = true; service_work += 1; }
         }
 
@@ -142,7 +179,7 @@ pub fn run(core_id: u32) -> ! {
 
         // 4. Check for shutdown (every 64 iterations to avoid MMIO overhead)
         if loops & 63 == 0 {
-            if let Some(f) = unsafe { core::ptr::read_volatile(&raw const CB.check_shutdown) } {
+            if let Some(f) = load_bool(&CHECK_SHUTDOWN) {
                 if f() {
                     request_shutdown();
                     break;
@@ -158,7 +195,7 @@ pub fn run(core_id: u32) -> ! {
             consecutive_idle = consecutive_idle.saturating_add(1);
 
             // Flush before sleeping (responses may be staged).
-            if let Some(f) = unsafe { core::ptr::read_volatile(&raw const CB.net_flush) } {
+            if let Some(f) = load_void(&NET_FLUSH) {
                 f();
             }
 
@@ -170,7 +207,7 @@ pub fn run(core_id: u32) -> ! {
                 for _ in 0..100u32 { core::hint::spin_loop(); }
             } else {
                 // Heavy idle: deep sleep (interrupt-armed)
-                if let Some(f) = unsafe { core::ptr::read_volatile(&raw const CB.idle) } {
+                if let Some(f) = load_idle(&IDLE) {
                     f(core_id);
                 } else {
                     #[cfg(target_arch = "aarch64")]
