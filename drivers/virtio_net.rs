@@ -761,20 +761,44 @@ static TX_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 /// TX lock: protects the VirtIO TX queue. Any core can acquire to flush or send.
 static TX_LOCK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-fn tx_try_lock() -> bool {
-    if cfg!(vz_compat) {
-        // VZ: load/store (CAS crashes on VZ guest RAM).
-        if TX_LOCK.load(Ordering::Acquire) != 0 { return false; }
-        TX_LOCK.store(1, Ordering::Release);
-        true
-    } else {
-        // QEMU/KVM: proper CAS.
-        TX_LOCK.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok()
+/// RAII guard for the VirtIO TX lock. Returned by `tx_try_lock()` on
+/// success; `Drop` releases the lock automatically. Can't forget to
+/// release; can't double-release. Zero cost — Drop inlines to one
+/// `store(0, Release)`.
+#[must_use = "if you want the lock to release immediately, drop the guard explicitly"]
+struct TxLockGuard {
+    _no_send: core::marker::PhantomData<*mut ()>,
+}
+
+impl Drop for TxLockGuard {
+    #[inline]
+    fn drop(&mut self) {
+        TX_LOCK.store(0, Ordering::Release);
     }
 }
 
-fn tx_unlock() {
-    TX_LOCK.store(0, Ordering::Release);
+/// Try to acquire the TX lock. Returns `Some(TxLockGuard)` on success;
+/// `None` if another core holds it. Released automatically on drop.
+fn tx_try_lock() -> Option<TxLockGuard> {
+    let acquired = if cfg!(vz_compat) {
+        // VZ: load/store (CAS crashes on VZ guest RAM).
+        if TX_LOCK.load(Ordering::Acquire) != 0 {
+            false
+        } else {
+            TX_LOCK.store(1, Ordering::Release);
+            true
+        }
+    } else {
+        // QEMU/KVM: proper CAS.
+        TX_LOCK
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+    };
+    if acquired {
+        Some(TxLockGuard { _no_send: core::marker::PhantomData })
+    } else {
+        None
+    }
 }
 
 /// Send a frame. Tier 1 (multi-queue): each core sends on its own queue pair.
@@ -826,9 +850,11 @@ pub fn flush_tx_staging() {
     }
     // Only one core should flush at a time. tx_try_lock() uses CAS on
     // QEMU/KVM (race-free) and load/store on vz_compat (best-effort).
-    if !tx_try_lock() {
-        return;
-    }
+    // The returned guard releases the lock automatically on scope exit.
+    let _guard = match tx_try_lock() {
+        Some(g) => g,
+        None => return,
+    };
     TX_PENDING.store(false, Ordering::Release);
     let n = kernel::percpu::num_cores();
     let mut buf = [0u8; 1514];
@@ -840,7 +866,7 @@ pub fn flush_tx_staging() {
             }
         }
     }
-    tx_unlock();
+    // _guard released at end of scope.
 }
 
 pub fn poll(
@@ -874,9 +900,9 @@ pub fn poll_qp(qp: usize, callback: fn(&[u8])) -> i32 {
 
     if kernel::percpu::num_cores() <= 1 {
         tx_drain_qp(qp);
-    } else if tx_try_lock() {
+    } else if let Some(_g) = tx_try_lock() {
         tx_drain_qp(qp);
-        tx_unlock();
+        // _g released at end of scope.
     }
 
     let mut count: i32 = 0;
@@ -966,9 +992,8 @@ pub fn poll_batch_qp(qp: usize, batch: &mut RxBatch) {
     // Drain TX completions (under lock when multi-core).
     if kernel::percpu::num_cores() <= 1 {
         tx_drain_qp(qp);
-    } else if tx_try_lock() {
+    } else if let Some(_g) = tx_try_lock() {
         tx_drain_qp(qp);
-        tx_unlock();
     }
 
     unsafe {

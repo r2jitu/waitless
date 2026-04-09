@@ -18,17 +18,45 @@ pub fn check_shutdown() -> bool {
 
 // ---- Wait for events (arch-specific idle) -------------------------------------
 
+/// RAII guard that masks IRQs on construction and unmasks on drop.
+/// Used to bracket the "check pending → idle" race window in
+/// `wait_for_events`. Can't forget to unmask. Zero cost: Drop inlines
+/// to one `daifclr #0x2` (or nothing on x86 where mask/unmask are
+/// no-ops because the idle path uses `sti;hlt;cli` atomically).
+#[must_use = "the guard unmasks IRQs when dropped; binding to _ unmasks immediately"]
+struct IrqGuard {
+    _no_send: core::marker::PhantomData<*mut ()>,
+}
+
+impl IrqGuard {
+    #[inline]
+    fn new() -> Self {
+        unsafe { arch_mask_irq() };
+        IrqGuard { _no_send: core::marker::PhantomData }
+    }
+}
+
+impl Drop for IrqGuard {
+    #[inline]
+    fn drop(&mut self) {
+        unsafe { arch_unmask_irq() };
+    }
+}
+
 pub fn wait_for_events() {
     drivers::virtio_net::flush_tx_staging();
 
     if drivers::virtio_net::irq_idle_supported() {
-        unsafe { arch_mask_irq() };
+        // RAII: mask on construction, unmask on Drop. Even if `arch_idle`
+        // is added later that may early-return or panic, IRQs are
+        // guaranteed to be unmasked by the guard's drop.
+        let _irq = IrqGuard::new();
         drivers::virtio_net::arm_rx_interrupts();
         if !drivers::virtio_net::has_pending_rx() && !drivers::virtio_net::has_pending_tx() {
             unsafe { arch_idle() };
         }
         drivers::virtio_net::flush_tx_staging();
-        unsafe { arch_unmask_irq() };
+        // _irq dropped here → unmask.
     } else {
         unsafe { arch_cpu_relax() };
     }

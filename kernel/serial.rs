@@ -250,20 +250,55 @@ static SHUTDOWN_REQUESTED: core::sync::atomic::AtomicBool = core::sync::atomic::
 static SERIAL_TX_LOCK: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-#[cfg(not(vz_compat))]
-fn serial_lock() {
-    use core::sync::atomic::Ordering;
-    while SERIAL_TX_LOCK
-        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        core::hint::spin_loop();
+/// RAII guard for the serial TX spinlock. Acquired by `SerialTxGuard::new`,
+/// released automatically on `Drop`. Can't forget to release; can't
+/// double-release. Zero cost — `Drop::drop` inlines to one
+/// `store(false, Release)`, the same code the manual `serial_unlock`
+/// produced.
+///
+/// On vz_compat the spinlock is replaced with a BSP-only check (atomic
+/// RMW faults on guest RAM); the guard is still constructed but
+/// `held = false` so its drop is a no-op.
+#[must_use = "the guard releases the lock when dropped; binding to _ would release it immediately"]
+pub(crate) struct SerialTxGuard {
+    held: bool,
+}
+
+impl SerialTxGuard {
+    /// Acquire the lock. On QEMU/KVM spins until CAS succeeds. On
+    /// vz_compat (`held = false`) returns immediately and the guard
+    /// is a no-op; callers must check `is_held()` before performing
+    /// the actual TX (or rely on the BSP-only path in puts/putc).
+    #[inline]
+    pub(crate) fn new() -> Self {
+        #[cfg(not(vz_compat))]
+        {
+            use core::sync::atomic::Ordering;
+            while SERIAL_TX_LOCK
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                core::hint::spin_loop();
+            }
+            SerialTxGuard { held: true }
+        }
+        #[cfg(vz_compat)]
+        {
+            SerialTxGuard { held: false }
+        }
     }
 }
 
-#[cfg(not(vz_compat))]
-fn serial_unlock() {
-    SERIAL_TX_LOCK.store(false, core::sync::atomic::Ordering::Release);
+impl Drop for SerialTxGuard {
+    #[inline]
+    fn drop(&mut self) {
+        #[cfg(not(vz_compat))]
+        if self.held {
+            SERIAL_TX_LOCK.store(false, core::sync::atomic::Ordering::Release);
+        }
+        #[cfg(vz_compat)]
+        let _ = self.held;
+    }
 }
 
 /// On vz_compat we cannot take a real lock; restrict console TX to the BSP.
@@ -290,59 +325,32 @@ pub fn init() {
 
 pub fn putc(c: u8) {
     #[cfg(vz_compat)]
-    {
-        if !vz_is_bsp() { return; }
-        unsafe {
-            #[cfg(target_arch = "x86_64")]
-            x86::putc(c);
-            #[cfg(target_arch = "aarch64")]
-            aarch64::putc(c);
-        }
+    if !vz_is_bsp() { return; }
+    let _guard = SerialTxGuard::new();
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        x86::putc(c);
+        #[cfg(target_arch = "aarch64")]
+        aarch64::putc(c);
     }
-    #[cfg(not(vz_compat))]
-    {
-        serial_lock();
-        unsafe {
-            #[cfg(target_arch = "x86_64")]
-            x86::putc(c);
-            #[cfg(target_arch = "aarch64")]
-            aarch64::putc(c);
-        }
-        serial_unlock();
-    }
+    // _guard released at end of scope.
 }
 
 pub fn puts(s: &[u8]) {
     #[cfg(vz_compat)]
-    {
-        if !vz_is_bsp() { return; }
-        for &c in s {
-            if c == b'\n' { unsafe {
-                #[cfg(target_arch = "x86_64")] x86::putc(b'\r');
-                #[cfg(target_arch = "aarch64")] aarch64::putc(b'\r');
-            }}
-            unsafe {
-                #[cfg(target_arch = "x86_64")] x86::putc(c);
-                #[cfg(target_arch = "aarch64")] aarch64::putc(c);
-            }
+    if !vz_is_bsp() { return; }
+    // Take the lock once around the whole string so multi-core log lines
+    // don't interleave at byte granularity. RAII releases on scope exit.
+    let _guard = SerialTxGuard::new();
+    for &c in s {
+        if c == b'\n' { unsafe {
+            #[cfg(target_arch = "x86_64")] x86::putc(b'\r');
+            #[cfg(target_arch = "aarch64")] aarch64::putc(b'\r');
+        }}
+        unsafe {
+            #[cfg(target_arch = "x86_64")] x86::putc(c);
+            #[cfg(target_arch = "aarch64")] aarch64::putc(c);
         }
-    }
-    #[cfg(not(vz_compat))]
-    {
-        // Take the lock once around the whole string so multi-core log lines
-        // don't interleave at byte granularity.
-        serial_lock();
-        for &c in s {
-            if c == b'\n' { unsafe {
-                #[cfg(target_arch = "x86_64")] x86::putc(b'\r');
-                #[cfg(target_arch = "aarch64")] aarch64::putc(b'\r');
-            }}
-            unsafe {
-                #[cfg(target_arch = "x86_64")] x86::putc(c);
-                #[cfg(target_arch = "aarch64")] aarch64::putc(c);
-            }
-        }
-        serial_unlock();
     }
 }
 
