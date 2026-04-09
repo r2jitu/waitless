@@ -79,7 +79,7 @@ fn arp_cache_update(ip: Ipv4Addr, mac: MacAddr) {
 
 fn arp_request(target_ip: Ipv4Addr) {
     let our_mac = ethernet_our_mac();
-    let our_ip = unsafe { CONFIG.ip };
+    let our_ip = CONFIG.ip();
 
     let pkt = ArpPacket {
         hw_type: htons(1),
@@ -108,7 +108,7 @@ pub fn arp_receive(data: &[u8]) {
         return;
     }
     let pkt = unsafe { &*(data.as_ptr() as *const ArpPacket) };
-    let our_ip = unsafe { CONFIG.ip };
+    let our_ip = CONFIG.ip();
 
     let sender_ip = pkt.sender_ip;
     let sender_mac = pkt.sender_mac;
@@ -117,8 +117,8 @@ pub fn arp_receive(data: &[u8]) {
 
     if sender_ip != Ipv4Addr::ANY {
         arp_cache_update(sender_ip, sender_mac);
-        unsafe {
-            if sender_ip == CONFIG.gateway {
+        if sender_ip == CONFIG.gateway() {
+            unsafe {
                 GATEWAY_MAC = sender_mac;
                 GATEWAY_MAC_VALID = true;
             }
@@ -152,13 +152,17 @@ pub fn arp_resolve(ip: Ipv4Addr) -> Option<MacAddr> {
         return None;
     }
 
-    let target = unsafe {
-        let mask = CONFIG.subnet_mask.addr;
-        if (ip.addr & mask) != (CONFIG.ip.addr & mask) && CONFIG.gateway != Ipv4Addr::ANY {
-            if GATEWAY_MAC_VALID {
-                return Some(GATEWAY_MAC);
+    let target = {
+        let mask = CONFIG.subnet_mask().addr;
+        let our_ip = CONFIG.ip().addr;
+        let gateway = CONFIG.gateway();
+        if (ip.addr & mask) != (our_ip & mask) && gateway != Ipv4Addr::ANY {
+            // SAFETY: GATEWAY_MAC / GATEWAY_MAC_VALID are written once during ARP
+            // resolution; reads are racy but only reflect cache freshness.
+            if unsafe { GATEWAY_MAC_VALID } {
+                return Some(unsafe { GATEWAY_MAC });
             }
-            CONFIG.gateway
+            gateway
         } else {
             ip
         }
@@ -187,7 +191,7 @@ pub fn arp_resolve(ip: Ipv4Addr) -> Option<MacAddr> {
 
 pub fn arp_announce() {
     let our_mac = ethernet_our_mac();
-    let our_ip = unsafe { CONFIG.ip };
+    let our_ip = CONFIG.ip();
 
     let pkt = ArpPacket {
         hw_type: htons(1),

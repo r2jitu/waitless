@@ -346,15 +346,17 @@ pub fn discover() -> bool {
 
     // Apply configuration
     unsafe {
-        CONFIG.ip = DHCP_OFFERED_IP;
-        CONFIG.subnet_mask = DHCP_OFFERED_SUBNET;
-        CONFIG.gateway = DHCP_OFFERED_GATEWAY;
-        CONFIG.dns = DHCP_OFFERED_DNS;
+        CONFIG.store(types::NetConfig {
+            ip: DHCP_OFFERED_IP,
+            subnet_mask: DHCP_OFFERED_SUBNET,
+            gateway: DHCP_OFFERED_GATEWAY,
+            dns: DHCP_OFFERED_DNS,
+        });
     }
 
     // Log the configured IP (bench.sh VZ path looks for this)
-    unsafe {
-        let o = CONFIG.ip.octets();
+    {
+        let o = CONFIG.ip().octets();
         let mut msg = *b"dhcp: configured IP xxx.xxx.xxx.xxx\n";
         let mut pos = 22;
         for (idx, &b) in o.iter().enumerate() {
@@ -380,10 +382,10 @@ pub fn set_fallback_config(
     gw_a: u8, gw_b: u8, gw_c: u8, gw_d: u8,
     dns_a: u8, dns_b: u8, dns_c: u8, dns_d: u8,
 ) {
-    unsafe {
-        CONFIG.ip = Ipv4Addr::from(ip_a, ip_b, ip_c, ip_d);
-        CONFIG.subnet_mask = Ipv4Addr::from(mask_a, mask_b, mask_c, mask_d);
-        CONFIG.gateway = Ipv4Addr::from(gw_a, gw_b, gw_c, gw_d);
-        CONFIG.dns = Ipv4Addr::from(dns_a, dns_b, dns_c, dns_d);
-    }
+    CONFIG.store(types::NetConfig {
+        ip: Ipv4Addr::from(ip_a, ip_b, ip_c, ip_d),
+        subnet_mask: Ipv4Addr::from(mask_a, mask_b, mask_c, mask_d),
+        gateway: Ipv4Addr::from(gw_a, gw_b, gw_c, gw_d),
+        dns: Ipv4Addr::from(dns_a, dns_b, dns_c, dns_d),
+    });
 }

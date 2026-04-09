@@ -60,7 +60,7 @@ pub fn ipv4_send(dst: Ipv4Addr, proto: u8, payload: &[u8]) {
         hdr.ttl = 64;
         hdr.protocol = proto;
         hdr.checksum = 0;
-        hdr.src = CONFIG.ip;
+        hdr.src = CONFIG.ip();
         hdr.dst = dst;
 
         hdr.checksum = checksum(buf_ptr, 20);
@@ -68,7 +68,7 @@ pub fn ipv4_send(dst: Ipv4Addr, proto: u8, payload: &[u8]) {
         ptr::copy_nonoverlapping(payload.as_ptr(), buf_ptr.add(20), payload_len);
     }
 
-    let dst_mac = if unsafe { CONFIG.ip } == Ipv4Addr::ANY {
+    let dst_mac = if CONFIG.ip() == Ipv4Addr::ANY {
         MacAddr::BROADCAST
     } else {
         match arp_resolve(dst) {
@@ -103,10 +103,10 @@ pub fn ipv4_receive(data: &[u8]) -> Option<Ipv4Packet<'_>> {
         return None;
     }
 
-    let our_ip = unsafe { CONFIG.ip };
+    let our_ip = CONFIG.ip();
     let dst = hdr.dst;
     if dst != our_ip && dst != Ipv4Addr::BROADCAST && our_ip != Ipv4Addr::ANY {
-        let mask = unsafe { CONFIG.subnet_mask.addr };
+        let mask = CONFIG.subnet_mask().addr;
         if mask != 0 && (dst.addr & !mask) != !mask {
             return None;
         }

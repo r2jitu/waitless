@@ -61,7 +61,7 @@ pub fn send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
 
         core::ptr::copy_nonoverlapping(data.as_ptr(), p.add(8), data.len());
 
-        hdr.checksum = tcp_checksum(CONFIG.ip, dst, PROTO_UDP, p, udp_len);
+        hdr.checksum = tcp_checksum(CONFIG.ip(), dst, PROTO_UDP, p, udp_len);
 
         ipv4_send(dst, PROTO_UDP, core::slice::from_raw_parts(p, udp_len));
     }

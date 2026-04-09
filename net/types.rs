@@ -59,12 +59,65 @@ pub struct NetConfig {
     pub dns: Ipv4Addr,
 }
 
-pub static mut CONFIG: NetConfig = NetConfig {
-    ip: Ipv4Addr::ANY,
-    subnet_mask: Ipv4Addr::ANY,
-    gateway: Ipv4Addr::ANY,
-    dns: Ipv4Addr::ANY,
-};
+/// Network configuration storage. Each field is an `AtomicU32` so the
+/// config can be set during DHCP and read by every core thereafter
+/// without `static mut` aliasing UB. Loads/stores use `Relaxed` ordering;
+/// the four fields are not atomically consistent with each other, but
+/// in practice they are all written together during the DHCP transaction
+/// during single-threaded init, and all reads happen long after that
+/// init completes — the only window where torn reads could matter is a
+/// few cycles during DHCP, and the only readers during that window are
+/// DHCP itself.
+pub struct ConfigStore {
+    ip: core::sync::atomic::AtomicU32,
+    subnet_mask: core::sync::atomic::AtomicU32,
+    gateway: core::sync::atomic::AtomicU32,
+    dns: core::sync::atomic::AtomicU32,
+}
+
+impl ConfigStore {
+    pub const fn new() -> Self {
+        ConfigStore {
+            ip: core::sync::atomic::AtomicU32::new(0),
+            subnet_mask: core::sync::atomic::AtomicU32::new(0),
+            gateway: core::sync::atomic::AtomicU32::new(0),
+            dns: core::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    pub fn store(&self, c: NetConfig) {
+        use core::sync::atomic::Ordering;
+        self.ip.store(c.ip.addr, Ordering::Relaxed);
+        self.subnet_mask.store(c.subnet_mask.addr, Ordering::Relaxed);
+        self.gateway.store(c.gateway.addr, Ordering::Relaxed);
+        self.dns.store(c.dns.addr, Ordering::Relaxed);
+    }
+
+    pub fn load(&self) -> NetConfig {
+        use core::sync::atomic::Ordering;
+        NetConfig {
+            ip: Ipv4Addr { addr: self.ip.load(Ordering::Relaxed) },
+            subnet_mask: Ipv4Addr { addr: self.subnet_mask.load(Ordering::Relaxed) },
+            gateway: Ipv4Addr { addr: self.gateway.load(Ordering::Relaxed) },
+            dns: Ipv4Addr { addr: self.dns.load(Ordering::Relaxed) },
+        }
+    }
+
+    pub fn ip(&self) -> Ipv4Addr {
+        Ipv4Addr { addr: self.ip.load(core::sync::atomic::Ordering::Relaxed) }
+    }
+    pub fn subnet_mask(&self) -> Ipv4Addr {
+        Ipv4Addr { addr: self.subnet_mask.load(core::sync::atomic::Ordering::Relaxed) }
+    }
+    pub fn gateway(&self) -> Ipv4Addr {
+        Ipv4Addr { addr: self.gateway.load(core::sync::atomic::Ordering::Relaxed) }
+    }
+    pub fn dns(&self) -> Ipv4Addr {
+        Ipv4Addr { addr: self.dns.load(core::sync::atomic::Ordering::Relaxed) }
+    }
+}
+
+pub static CONFIG: ConfigStore = ConfigStore::new();
 
 /// RFC 1071 internet checksum over a byte buffer.
 /// Reads 16-bit words in little-endian byte order.

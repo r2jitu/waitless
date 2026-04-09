@@ -280,7 +280,7 @@ fn send_segment(
             ptr::copy_nonoverlapping(payload.as_ptr(), p.add(20), payload_len);
         }
 
-        hdr.checksum = tcp_checksum(CONFIG.ip, dst_ip, PROTO_TCP, p, seg_len);
+        hdr.checksum = tcp_checksum(CONFIG.ip(), dst_ip, PROTO_TCP, p, seg_len);
 
         ipv4_send(dst_ip, PROTO_TCP, core::slice::from_raw_parts(p, seg_len));
     }
@@ -301,7 +301,7 @@ fn send_rst(dst_ip: Ipv4Addr, src_port: u16, dst_port: u16, seq: u32, ack: u32) 
         hdr.checksum = 0;
         hdr.urgent = 0;
 
-        hdr.checksum = tcp_checksum(CONFIG.ip, dst_ip, PROTO_TCP, p, 20);
+        hdr.checksum = tcp_checksum(CONFIG.ip(), dst_ip, PROTO_TCP, p, 20);
 
         ipv4_send(dst_ip, PROTO_TCP, core::slice::from_raw_parts(p, 20));
     }
