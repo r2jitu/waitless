@@ -4,24 +4,62 @@
 // Detects and configures the Local APIC for each CPU core.
 // Replaces the legacy 8259 PIC for interrupt delivery on SMP systems.
 
-use crate::serial;
 use crate::mm;
+use crate::mmio::{self, ReadWrite};
+use crate::serial;
 
-/// Local APIC register offsets (from APIC base address).
-const APIC_ID: u32 = 0x020;
-const APIC_VERSION: u32 = 0x030;
-const APIC_TPR: u32 = 0x080;
-const APIC_EOI: u32 = 0x0B0;
-const APIC_SVR: u32 = 0x0F0;
-const APIC_ICR_LO: u32 = 0x300;
-const APIC_ICR_HI: u32 = 0x310;
-// LVT registers — used when APIC is fully enabled (Phase 2b)
-#[allow(dead_code)]
-const APIC_LVT_TIMER: u32 = 0x320;
-#[allow(dead_code)]
-const APIC_LVT_LINT0: u32 = 0x350;
-#[allow(dead_code)]
-const APIC_LVT_LINT1: u32 = 0x360;
+// ── Local APIC register layout ───────────────────────────────────────────────
+//
+// Each LAPIC register is a u32 at a 16-byte stride. We wrap each one in
+// `ApicReg<u32>` (a `ReadWrite<u32>` + 12 bytes of padding) so the struct
+// layout matches the Intel SDM exactly. Compile-time `offset_of!` asserts
+// validate every named offset.
+
+#[repr(C)]
+struct ApicReg<T: Copy> {
+    val: ReadWrite<T>,
+    _pad: [u32; 3],
+}
+
+impl<T: Copy> ApicReg<T> {
+    #[inline(always)]
+    fn read(&self) -> T { self.val.read() }
+    #[inline(always)]
+    fn write(&self, v: T) { self.val.write(v); }
+}
+
+#[repr(C)]
+struct ApicRegs {
+    _r0:        [ApicReg<u32>; 2],   // 0x000..0x020
+    id:         ApicReg<u32>,        // 0x020
+    version:    ApicReg<u32>,        // 0x030
+    _r1:        [ApicReg<u32>; 4],   // 0x040..0x080
+    tpr:        ApicReg<u32>,        // 0x080
+    _r2:        [ApicReg<u32>; 2],   // 0x090..0x0B0
+    eoi:        ApicReg<u32>,        // 0x0B0
+    _r3:        [ApicReg<u32>; 3],   // 0x0C0..0x0F0
+    svr:        ApicReg<u32>,        // 0x0F0
+    _r4:        [ApicReg<u32>; 32],  // 0x100..0x300
+    icr_lo:     ApicReg<u32>,        // 0x300
+    icr_hi:     ApicReg<u32>,        // 0x310
+    lvt_timer:  ApicReg<u32>,        // 0x320
+    _r5:        [ApicReg<u32>; 2],   // 0x330..0x350
+    lvt_lint0:  ApicReg<u32>,        // 0x350
+    lvt_lint1:  ApicReg<u32>,        // 0x360
+}
+
+// Compile-time layout assertions — every named register lands at the
+// Intel SDM-documented offset.
+const _: () = assert!(core::mem::offset_of!(ApicRegs, id) == 0x020);
+const _: () = assert!(core::mem::offset_of!(ApicRegs, version) == 0x030);
+const _: () = assert!(core::mem::offset_of!(ApicRegs, tpr) == 0x080);
+const _: () = assert!(core::mem::offset_of!(ApicRegs, eoi) == 0x0B0);
+const _: () = assert!(core::mem::offset_of!(ApicRegs, svr) == 0x0F0);
+const _: () = assert!(core::mem::offset_of!(ApicRegs, icr_lo) == 0x300);
+const _: () = assert!(core::mem::offset_of!(ApicRegs, icr_hi) == 0x310);
+const _: () = assert!(core::mem::offset_of!(ApicRegs, lvt_timer) == 0x320);
+const _: () = assert!(core::mem::offset_of!(ApicRegs, lvt_lint0) == 0x350);
+const _: () = assert!(core::mem::offset_of!(ApicRegs, lvt_lint1) == 0x360);
 
 /// Spurious interrupt vector (must be 0xXF per Intel spec).
 const SPURIOUS_VECTOR: u32 = 0xFF;
@@ -32,6 +70,14 @@ const IA32_APIC_BASE_MSR: u32 = 0x1B;
 /// Virtual address of the Local APIC MMIO page. Set once on the BSP via
 /// `init()` before any AP starts; read by every core for MMIO access.
 static APIC_BASE: crate::once::InitOnce<u64> = crate::once::InitOnce::new();
+
+#[inline(always)]
+fn lapic() -> &'static ApicRegs {
+    // SAFETY: APIC_BASE is published exactly once during init(); readers
+    // see the post-Acquire address. The struct layout matches the Intel
+    // SDM (verified by const offset_of! asserts above).
+    unsafe { mmio::at::<ApicRegs>(*APIC_BASE.get()) }
+}
 
 /// Read an MSR.
 unsafe fn rdmsr(msr: u32) -> u64 {
@@ -58,26 +104,14 @@ unsafe fn wrmsr(msr: u32, val: u64) {
     );
 }
 
-/// Read a Local APIC register.
-unsafe fn apic_read(reg: u32) -> u32 {
-    let addr = (*APIC_BASE.get() + reg as u64) as *const u32;
-    core::ptr::read_volatile(addr)
-}
-
-/// Write a Local APIC register.
-unsafe fn apic_write(reg: u32, val: u32) {
-    let addr = (*APIC_BASE.get() + reg as u64) as *mut u32;
-    core::ptr::write_volatile(addr, val);
-}
-
 /// Get the current CPU's APIC ID.
 pub fn apic_id() -> u32 {
-    unsafe { apic_read(APIC_ID) >> 24 }
+    lapic().id.read() >> 24
 }
 
 /// Send End-Of-Interrupt to the Local APIC.
 pub fn eoi() {
-    unsafe { apic_write(APIC_EOI, 0); }
+    lapic().eoi.write(0);
 }
 
 /// Disable the legacy 8259 PIC by masking all IRQs.
@@ -97,31 +131,33 @@ pub unsafe fn init() {
 
         // Map APIC MMIO page via HHDM and publish for all cores.
         APIC_BASE.init(mm::phys_to_virt(phys_base) as u64);
-
-        // Enable APIC in virtual wire mode: PIC interrupts route through
-        // LINT0 of the BSP's Local APIC. This lets PIC device IRQs work
-        // while the APIC is active (needed for INIT-SIPI-SIPI).
-        apic_write(APIC_SVR, 0x100 | SPURIOUS_VECTOR);
-        apic_write(APIC_TPR, 0);
-
-        // LINT0 = ExtINT (PIC passthrough), edge-triggered, unmasked
-        apic_write(APIC_LVT_LINT0, 0x00000700); // delivery mode 111 = ExtINT
-        // LINT1 = NMI, edge-triggered, unmasked
-        apic_write(APIC_LVT_LINT1, 0x00000400); // delivery mode 100 = NMI
-        // Timer = masked (not used yet)
-        apic_write(APIC_LVT_TIMER, 0x10000);
-
-        let id = apic_read(APIC_ID) >> 24;
-        let ver = apic_read(APIC_VERSION) & 0xFF;
-        serial::puts(b"       APIC init: ID=");
-        let mut buf = [0u8; 16];
-        let len = fmt_u32(&mut buf, id);
-        serial::puts(&buf[..len]);
-        serial::puts(b" ver=0x");
-        let len = fmt_hex(&mut buf, ver);
-        serial::puts(&buf[..len]);
-        serial::puts(b"\n");
     }
+
+    let l = lapic();
+
+    // Enable APIC in virtual wire mode: PIC interrupts route through
+    // LINT0 of the BSP's Local APIC. This lets PIC device IRQs work
+    // while the APIC is active (needed for INIT-SIPI-SIPI).
+    l.svr.write(0x100 | SPURIOUS_VECTOR);
+    l.tpr.write(0);
+
+    // LINT0 = ExtINT (PIC passthrough), edge-triggered, unmasked
+    l.lvt_lint0.write(0x00000700); // delivery mode 111 = ExtINT
+    // LINT1 = NMI, edge-triggered, unmasked
+    l.lvt_lint1.write(0x00000400); // delivery mode 100 = NMI
+    // Timer = masked (not used yet)
+    l.lvt_timer.write(0x10000);
+
+    let id = l.id.read() >> 24;
+    let ver = l.version.read() & 0xFF;
+    serial::puts(b"       APIC init: ID=");
+    let mut buf = [0u8; 16];
+    let len = fmt_u32(&mut buf, id);
+    serial::puts(&buf[..len]);
+    serial::puts(b" ver=0x");
+    let len = fmt_hex(&mut buf, ver);
+    serial::puts(&buf[..len]);
+    serial::puts(b"\n");
 }
 
 /// Initialize the Local APIC on a secondary core (AP).
@@ -130,75 +166,66 @@ pub unsafe fn init_ap() {
     unsafe {
         // Read APIC base from MSR (same physical address as BSP)
         let msr_val = rdmsr(IA32_APIC_BASE_MSR);
-        let phys_base = msr_val & 0xFFFF_F000;
-
         // Ensure global enable bit is set
         wrmsr(IA32_APIC_BASE_MSR, msr_val | (1 << 11));
-
-        // Use same virtual mapping as BSP
-        let base = mm::phys_to_virt(phys_base) as u64;
-
-        // Enable APIC
-        let addr = (base + APIC_SVR as u64) as *mut u32;
-        core::ptr::write_volatile(addr, 0x100 | SPURIOUS_VECTOR);
-
-        // Accept all interrupts
-        let addr = (base + APIC_TPR as u64) as *mut u32;
-        core::ptr::write_volatile(addr, 0);
     }
+
+    // The BSP has already published APIC_BASE; APs use the same mapping.
+    let l = lapic();
+    l.svr.write(0x100 | SPURIOUS_VECTOR);
+    l.tpr.write(0);
 }
 
 /// Send an IPI (Inter-Processor Interrupt) to a specific APIC ID.
 pub unsafe fn send_ipi(target_apic_id: u32, vector: u8) {
-    unsafe {
-        // Set destination in ICR high
-        apic_write(APIC_ICR_HI, target_apic_id << 24);
-        // Send: fixed delivery, physical mode, assert, edge-triggered
-        apic_write(APIC_ICR_LO, vector as u32);
-    }
+    let l = lapic();
+    // Set destination in ICR high
+    l.icr_hi.write(target_apic_id << 24);
+    // Send: fixed delivery, physical mode, assert, edge-triggered
+    l.icr_lo.write(vector as u32);
 }
 
 /// Send INIT IPI to a target core.
 pub unsafe fn send_init(target_apic_id: u32) {
-    unsafe {
-        apic_write(APIC_ICR_HI, target_apic_id << 24);
-        // INIT: delivery mode 101, level assert, edge
-        apic_write(APIC_ICR_LO, 0x00004500);
-        // Wait for delivery
-        for _ in 0..100_000 { core::arch::asm!("pause", options(nomem, nostack)); }
-        // Deassert
-        apic_write(APIC_ICR_HI, target_apic_id << 24);
-        apic_write(APIC_ICR_LO, 0x00008500);
-        for _ in 0..100_000 { core::arch::asm!("pause", options(nomem, nostack)); }
-    }
+    let l = lapic();
+    l.icr_hi.write(target_apic_id << 24);
+    // INIT: delivery mode 101, level assert, edge
+    l.icr_lo.write(0x00004500);
+    // Wait for delivery
+    for _ in 0..100_000 { unsafe { core::arch::asm!("pause", options(nomem, nostack)); } }
+    // Deassert
+    l.icr_hi.write(target_apic_id << 24);
+    l.icr_lo.write(0x00008500);
+    for _ in 0..100_000 { unsafe { core::arch::asm!("pause", options(nomem, nostack)); } }
 }
 
 /// Send Startup IPI (SIPI) to a target core.
 /// `vector` is the page number (4KB-aligned) where the AP trampoline lives.
 /// e.g., if trampoline is at 0x8000, vector = 0x08.
 pub unsafe fn send_sipi(target_apic_id: u32, vector: u8) {
-    unsafe {
-        apic_write(APIC_ICR_HI, target_apic_id << 24);
-        // SIPI: delivery mode 110, vector = page number
-        apic_write(APIC_ICR_LO, 0x00004600 | vector as u32);
-        for _ in 0..100_000 { core::arch::asm!("pause", options(nomem, nostack)); }
-    }
+    let l = lapic();
+    l.icr_hi.write(target_apic_id << 24);
+    // SIPI: delivery mode 110, vector = page number
+    l.icr_lo.write(0x00004600 | vector as u32);
+    for _ in 0..100_000 { unsafe { core::arch::asm!("pause", options(nomem, nostack)); } }
 }
 
 /// Broadcast INIT to all cores except self.
 pub unsafe fn send_init_broadcast() {
-    apic_write(APIC_ICR_HI, 0);
+    let l = lapic();
+    l.icr_hi.write(0);
     // INIT (101), all excluding self (11 in bits 19:18)
-    apic_write(APIC_ICR_LO, 0x000C4500);
-    for _ in 0..100_000 { core::arch::asm!("pause", options(nomem, nostack)); }
+    l.icr_lo.write(0x000C4500);
+    for _ in 0..100_000 { unsafe { core::arch::asm!("pause", options(nomem, nostack)); } }
 }
 
 /// Broadcast SIPI to all cores except self.
 pub unsafe fn send_sipi_broadcast(vector: u8) {
-    apic_write(APIC_ICR_HI, 0);
+    let l = lapic();
+    l.icr_hi.write(0);
     // SIPI (110), all excluding self (11 in bits 19:18)
-    apic_write(APIC_ICR_LO, 0x000C4600 | vector as u32);
-    for _ in 0..100_000 { core::arch::asm!("pause", options(nomem, nostack)); }
+    l.icr_lo.write(0x000C4600 | vector as u32);
+    for _ in 0..100_000 { unsafe { core::arch::asm!("pause", options(nomem, nostack)); } }
 }
 
 fn fmt_u32(buf: &mut [u8], mut val: u32) -> usize {
