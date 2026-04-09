@@ -237,71 +237,20 @@ mod aarch64 {
 
 static SHUTDOWN_REQUESTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// Serial-write spinlock. Serialises whole `puts`/`putc` calls so multi-core
-/// log output isn't interleaved or torn (the underlying COM1/PL011 ports
-/// take a single byte per cycle, but the VirtIO console backend has a
-/// shared TX descriptor ring that races on `static mut` indices if two
+/// Serial-write spinlock. Serialises whole `puts`/`putc` calls so
+/// multi-core log output isn't interleaved or torn (the underlying
+/// COM1/PL011 ports take a single byte per cycle, but the VirtIO
+/// console backend has a shared TX descriptor ring that races if two
 /// cores write concurrently).
 ///
-/// On QEMU/KVM and x86_64 use real CAS. On vz_compat (atomic RMW faults
-/// on guest RAM) skip the lock entirely and instead restrict console
-/// output to the BSP only — APs return without printing. This preserves
-/// the previous aarch64 behaviour while removing the latent
-/// `static mut`-based data race for everyone else.
-#[cfg(not(vz_compat))]
-static SERIAL_TX_LOCK: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-/// RAII guard for the serial TX spinlock. Acquired by `SerialTxGuard::new`,
-/// released automatically on `Drop`. Can't forget to release; can't
-/// double-release. Zero cost — `Drop::drop` inlines to one
-/// `store(false, Release)`, the same code the manual `serial_unlock`
-/// produced.
+/// Wraps `()` because we don't need to protect any inner data — the
+/// underlying serial state is owned by the device-specific putc/puts
+/// implementations. The lock just provides mutual exclusion.
 ///
-/// On vz_compat the spinlock is replaced with a BSP-only check (atomic
-/// RMW faults on guest RAM); the guard is still constructed but
-/// `held = false` so its drop is a no-op.
-#[must_use = "the guard releases the lock when dropped; binding to _ would release it immediately"]
-pub(crate) struct SerialTxGuard {
-    held: bool,
-}
-
-impl SerialTxGuard {
-    /// Acquire the lock. On QEMU/KVM spins until CAS succeeds. On
-    /// vz_compat (`held = false`) returns immediately and the guard
-    /// is a no-op; callers must check `is_held()` before performing
-    /// the actual TX (or rely on the BSP-only path in puts/putc).
-    #[inline]
-    pub(crate) fn new() -> Self {
-        #[cfg(not(vz_compat))]
-        {
-            use core::sync::atomic::Ordering;
-            while SERIAL_TX_LOCK
-                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
-            {
-                core::hint::spin_loop();
-            }
-            SerialTxGuard { held: true }
-        }
-        #[cfg(vz_compat)]
-        {
-            SerialTxGuard { held: false }
-        }
-    }
-}
-
-impl Drop for SerialTxGuard {
-    #[inline]
-    fn drop(&mut self) {
-        #[cfg(not(vz_compat))]
-        if self.held {
-            SERIAL_TX_LOCK.store(false, core::sync::atomic::Ordering::Release);
-        }
-        #[cfg(vz_compat)]
-        let _ = self.held;
-    }
-}
+/// On vz_compat the lock falls back to load+store (atomic RMW faults
+/// on VZ guest RAM); see `kernel::sync::Spinlock` for details.
+#[cfg(not(vz_compat))]
+static SERIAL_TX_LOCK: crate::sync::Spinlock<()> = crate::sync::Spinlock::new(());
 
 /// On vz_compat we cannot take a real lock; restrict console TX to the BSP.
 #[cfg(vz_compat)]
@@ -328,7 +277,8 @@ pub fn init() {
 pub fn putc(c: u8) {
     #[cfg(vz_compat)]
     if !vz_is_bsp() { return; }
-    let _guard = SerialTxGuard::new();
+    #[cfg(not(vz_compat))]
+    let _guard = SERIAL_TX_LOCK.lock();
     unsafe {
         #[cfg(target_arch = "x86_64")]
         x86::putc(c);
@@ -341,9 +291,11 @@ pub fn putc(c: u8) {
 pub fn puts(s: &[u8]) {
     #[cfg(vz_compat)]
     if !vz_is_bsp() { return; }
-    // Take the lock once around the whole string so multi-core log lines
-    // don't interleave at byte granularity. RAII releases on scope exit.
-    let _guard = SerialTxGuard::new();
+    // Take the lock once around the whole string so multi-core log
+    // lines don't interleave at byte granularity. RAII releases on
+    // scope exit.
+    #[cfg(not(vz_compat))]
+    let _guard = SERIAL_TX_LOCK.lock();
     for &c in s {
         if c == b'\n' { unsafe {
             #[cfg(target_arch = "x86_64")] x86::putc(b'\r');
