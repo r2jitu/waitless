@@ -28,13 +28,13 @@ pub fn udelay(us: u32) {
                 core::arch::asm!("nop");
             }
             let elapsed = x86_rdtsc() - start;
-            tsc_per_us = if elapsed / 10000 == 0 { 1 } else { elapsed / 10000 };
+            tsc_per_us = (elapsed / 10000).max(1);
         }
         TSC_PER_US.store(tsc_per_us, core::sync::atomic::Ordering::Relaxed);
     }
     let end = x86_rdtsc() + tsc_per_us * (us as u64);
     while x86_rdtsc() < end {
-        unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
+        core::hint::spin_loop();
     }
 }
 

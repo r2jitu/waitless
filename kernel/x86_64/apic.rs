@@ -114,14 +114,6 @@ pub fn eoi() {
     lapic().eoi.write(0);
 }
 
-/// Disable the legacy 8259 PIC by masking all IRQs.
-/// Only call when device IRQs are fully routed through APIC/MSI-X.
-#[allow(dead_code)]
-unsafe fn disable_pic() {
-    core::arch::asm!("out dx, al", in("dx") 0x21u16, in("al") 0xFFu8, options(nomem, nostack));
-    core::arch::asm!("out dx, al", in("dx") 0xA1u16, in("al") 0xFFu8, options(nomem, nostack));
-}
-
 /// Initialize the Local APIC on the current core (BSP or AP).
 pub unsafe fn init() {
     unsafe {
@@ -192,11 +184,11 @@ pub unsafe fn send_init(target_apic_id: u32) {
     // INIT: delivery mode 101, level assert, edge
     l.icr_lo.write(0x00004500);
     // Wait for delivery
-    for _ in 0..100_000 { unsafe { core::arch::asm!("pause", options(nomem, nostack)); } }
+    for _ in 0..100_000 { core::hint::spin_loop(); }
     // Deassert
     l.icr_hi.write(target_apic_id << 24);
     l.icr_lo.write(0x00008500);
-    for _ in 0..100_000 { unsafe { core::arch::asm!("pause", options(nomem, nostack)); } }
+    for _ in 0..100_000 { core::hint::spin_loop(); }
 }
 
 /// Send Startup IPI (SIPI) to a target core.
@@ -207,7 +199,7 @@ pub unsafe fn send_sipi(target_apic_id: u32, vector: u8) {
     l.icr_hi.write(target_apic_id << 24);
     // SIPI: delivery mode 110, vector = page number
     l.icr_lo.write(0x00004600 | vector as u32);
-    for _ in 0..100_000 { unsafe { core::arch::asm!("pause", options(nomem, nostack)); } }
+    for _ in 0..100_000 { core::hint::spin_loop(); }
 }
 
 /// Broadcast INIT to all cores except self.
@@ -216,7 +208,7 @@ pub unsafe fn send_init_broadcast() {
     l.icr_hi.write(0);
     // INIT (101), all excluding self (11 in bits 19:18)
     l.icr_lo.write(0x000C4500);
-    for _ in 0..100_000 { unsafe { core::arch::asm!("pause", options(nomem, nostack)); } }
+    for _ in 0..100_000 { core::hint::spin_loop(); }
 }
 
 /// Broadcast SIPI to all cores except self.
@@ -225,7 +217,7 @@ pub unsafe fn send_sipi_broadcast(vector: u8) {
     l.icr_hi.write(0);
     // SIPI (110), all excluding self (11 in bits 19:18)
     l.icr_lo.write(0x000C4600 | vector as u32);
-    for _ in 0..100_000 { unsafe { core::arch::asm!("pause", options(nomem, nostack)); } }
+    for _ in 0..100_000 { core::hint::spin_loop(); }
 }
 
 fn fmt_u32(buf: &mut [u8], mut val: u32) -> usize {

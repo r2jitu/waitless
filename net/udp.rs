@@ -9,7 +9,7 @@ extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
 extern crate net_ipv4 as ipv4;
 
-use core::sync::atomic::{AtomicPtr, AtomicU16, Ordering};
+use core::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 use from_bytes::FromBytes;
 use types::{Ipv4Addr, CONFIG, tcp_checksum, htons, ntohs};
 use ipv4::{ipv4_send, PROTO_UDP};
@@ -27,6 +27,30 @@ unsafe impl FromBytes for UdpHeader {}
 
 type UdpHandlerFn = fn([u8; 4], u16, &[u8]);
 
+/// Atomic cell for a typed function pointer. Hides the unsafe transmute
+/// behind a safe API: `store` takes a typed fn, `load` returns one.
+struct AtomicHandlerFn(AtomicUsize);
+
+impl AtomicHandlerFn {
+    const fn new() -> Self {
+        AtomicHandlerFn(AtomicUsize::new(0))
+    }
+    fn store(&self, f: UdpHandlerFn) {
+        self.0.store(f as usize, Ordering::Release);
+    }
+    fn load(&self) -> Option<UdpHandlerFn> {
+        let v = self.0.load(Ordering::Acquire);
+        if v == 0 {
+            None
+        } else {
+            // SAFETY: only `store(f)` writes this field, and `f`'s type
+            // is statically `UdpHandlerFn`. The bit pattern is therefore
+            // a valid `UdpHandlerFn` whenever `v != 0`.
+            Some(unsafe { core::mem::transmute::<usize, UdpHandlerFn>(v) })
+        }
+    }
+}
+
 const MAX_HANDLERS: usize = 8;
 
 /// Port→handler dispatch table. Each slot is `(port, handler_fn)`.
@@ -41,11 +65,11 @@ static HANDLER_PORTS: [AtomicU16; MAX_HANDLERS] = [
     AtomicU16::new(0), AtomicU16::new(0), AtomicU16::new(0), AtomicU16::new(0),
     AtomicU16::new(0), AtomicU16::new(0), AtomicU16::new(0), AtomicU16::new(0),
 ];
-static HANDLER_FNS: [AtomicPtr<()>; MAX_HANDLERS] = [
-    AtomicPtr::new(core::ptr::null_mut()), AtomicPtr::new(core::ptr::null_mut()),
-    AtomicPtr::new(core::ptr::null_mut()), AtomicPtr::new(core::ptr::null_mut()),
-    AtomicPtr::new(core::ptr::null_mut()), AtomicPtr::new(core::ptr::null_mut()),
-    AtomicPtr::new(core::ptr::null_mut()), AtomicPtr::new(core::ptr::null_mut()),
+static HANDLER_FNS: [AtomicHandlerFn; MAX_HANDLERS] = [
+    AtomicHandlerFn::new(), AtomicHandlerFn::new(),
+    AtomicHandlerFn::new(), AtomicHandlerFn::new(),
+    AtomicHandlerFn::new(), AtomicHandlerFn::new(),
+    AtomicHandlerFn::new(), AtomicHandlerFn::new(),
 ];
 
 /// Register a handler for incoming UDP packets on a specific port.
@@ -68,7 +92,7 @@ pub fn bind(port: u16, handler: UdpHandlerFn) {
         };
 
         if claimed {
-            HANDLER_FNS[i].store(handler as *mut (), Ordering::Release);
+            HANDLER_FNS[i].store(handler);
             return;
         }
     }
@@ -119,13 +143,9 @@ pub fn udp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
         let p = HANDLER_PORTS[i].load(Ordering::Acquire);
         if p == 0 { continue; }
         if p == dst_port {
-            let raw = HANDLER_FNS[i].load(Ordering::Acquire);
-            if raw.is_null() { continue; }
-            // SAFETY: published by `bind` with the same fn type.
-            let h: UdpHandlerFn = unsafe {
-                core::mem::transmute::<*mut (), UdpHandlerFn>(raw)
-            };
-            h(src_ip.octets(), src_port, payload);
+            if let Some(h) = HANDLER_FNS[i].load() {
+                h(src_ip.octets(), src_port, payload);
+            }
             return;
         }
     }

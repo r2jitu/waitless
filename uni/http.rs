@@ -87,11 +87,6 @@ impl Request {
         None
     }
 
-    #[allow(dead_code)]
-    pub fn body(&self) -> &[u8] {
-        &self.body[..self.body_len]
-    }
-
     fn clear(&mut self) {
         self.method = Method::Unknown;
         self.path_len = 0;
@@ -211,9 +206,13 @@ pub struct Server {
 }
 
 // Global server pointer for AP poll callback / native worker threads.
-static mut SERVER_PTR: *mut Server = core::ptr::null_mut();
+// Written once during `Server::start()` on core 0; read from any core via
+// the service callbacks. AtomicPtr lets multiple readers see a consistent
+// pointer without forming `&mut` to a `static mut`.
+static SERVER_PTR: core::sync::atomic::AtomicPtr<Server> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 // Listen port (needed by native worker threads to create SO_REUSEPORT listeners).
-static mut LISTEN_PORT: u16 = 0;
+static LISTEN_PORT: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
 
 impl Server {
     pub const fn new() -> Self {
@@ -262,10 +261,8 @@ impl Server {
             }
         }
 
-        unsafe {
-            SERVER_PTR = self as *mut Server;
-            LISTEN_PORT = port;
-        }
+        SERVER_PTR.store(self as *mut Server, core::sync::atomic::Ordering::Release);
+        LISTEN_PORT.store(port, core::sync::atomic::Ordering::Release);
         crate::set_service(http_service_cb);
 
         crate::log(b"http: listening\n");
@@ -397,11 +394,13 @@ fn alloc_active(active: &mut [ActiveConn; MAX_ACTIVE]) -> Option<&mut ActiveConn
 /// Add a listener for a specific worker. Called by native worker threads
 /// to create their own SO_REUSEPORT listener.
 pub fn add_worker_listener(worker_id: u32) {
-    let port = unsafe { LISTEN_PORT };
-    let server = unsafe {
-        if SERVER_PTR.is_null() { return; }
-        &mut *SERVER_PTR
-    };
+    let port = LISTEN_PORT.load(core::sync::atomic::Ordering::Acquire);
+    let raw = SERVER_PTR.load(core::sync::atomic::Ordering::Acquire);
+    if raw.is_null() { return; }
+    // SAFETY: SERVER_PTR is published once via Release in `Server::start`;
+    // the matching Acquire load above synchronises with that store. The
+    // pointee outlives the program (it's the app's `static mut SERVER`).
+    let server = unsafe { &mut *raw };
     let handle = crate::tcp_listen_on(worker_id, port);
     if !handle.is_null() {
         server.cores[worker_id as usize].listener = Some(TcpListener(handle));
@@ -411,10 +410,10 @@ pub fn add_worker_listener(worker_id: u32) {
 /// Event loop service callback — services HTTP connections on this worker.
 /// Used by both unikernel (kernel event loop) and native (per-thread loop).
 fn http_service_cb(core_id: u32) -> bool {
-    let server = unsafe {
-        if SERVER_PTR.is_null() { return false; }
-        &mut *SERVER_PTR
-    };
+    let raw = SERVER_PTR.load(core::sync::atomic::Ordering::Acquire);
+    if raw.is_null() { return false; }
+    // SAFETY: see add_worker_listener.
+    let server = unsafe { &mut *raw };
     server.service_core(core_id)
 }
 

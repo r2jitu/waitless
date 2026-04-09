@@ -10,7 +10,6 @@ extern crate net_ethernet as ethernet;
 extern crate net_arp as arp;
 extern crate net_ipv4 as ipv4;
 
-use core::ptr;
 use from_bytes::FromBytes;
 use kernel::sync::Spinlock;
 use kernel::time::udelay;
@@ -51,6 +50,21 @@ struct DhcpPacket {
 
 // SAFETY: repr(C, packed), all fields are POD integers / byte arrays / Ipv4Addr.
 unsafe impl FromBytes for DhcpPacket {}
+
+impl DhcpPacket {
+    /// View this packet as a `&[u8]` of exactly its 240-byte wire size.
+    /// Safe because `DhcpPacket` is `repr(C, packed)` POD.
+    fn as_bytes(&self) -> &[u8] {
+        // SAFETY: DhcpPacket is repr(C, packed) with no padding and only
+        // POD fields, so any bit pattern is a valid byte slice.
+        unsafe {
+            core::slice::from_raw_parts(
+                self as *const _ as *const u8,
+                core::mem::size_of::<DhcpPacket>(),
+            )
+        }
+    }
+}
 
 const DHCP_DISCOVER: u8 = 1;
 const DHCP_OFFER: u8 = 2;
@@ -233,13 +247,7 @@ fn dhcp_frame_prologue(frame: &mut [u8]) -> usize {
     eth.ethertype = htons(ETHERTYPE_IPV4);
 
     let dhcp_base = build_dhcp_base();
-    unsafe {
-        ptr::copy_nonoverlapping(
-            &dhcp_base as *const _ as *const u8,
-            frame.as_mut_ptr().add(DHCP_OFFSET),
-            240,
-        );
-    }
+    frame[DHCP_OFFSET..DHCP_OFFSET + 240].copy_from_slice(dhcp_base.as_bytes());
 
     DHCP_OFFSET + 240
 }

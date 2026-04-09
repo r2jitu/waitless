@@ -145,10 +145,7 @@ fn set_tss_entry(index: usize, base: u64, limit: u32) {
 pub fn init() {
     unsafe {
         // Zero out the TSS
-        let tss_ptr = &raw mut TSS as *mut u8;
-        for i in 0..mem::size_of::<Tss>() {
-            tss_ptr.add(i).write_volatile(0);
-        }
+        core::ptr::write_bytes(&raw mut TSS as *mut u8, 0, mem::size_of::<Tss>());
 
         // Set the I/O permission bitmap offset past the end of the TSS
         #[allow(static_mut_refs)]

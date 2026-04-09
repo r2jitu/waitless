@@ -114,9 +114,9 @@ pub unsafe fn start_secondary_cores(cpu_count: u32) {
         let expected = num_cores_online() + 1;
 
         apic::send_init(target_apic_id);
-        for _ in 0..10_000_000u64 { core::arch::asm!("pause", options(nomem, nostack)); }
+        for _ in 0..10_000_000u64 { core::hint::spin_loop(); }
         apic::send_sipi(target_apic_id, sipi_vector);
-        for _ in 0..1_000_000u64 { core::arch::asm!("pause", options(nomem, nostack)); }
+        for _ in 0..1_000_000u64 { core::hint::spin_loop(); }
         apic::send_sipi(target_apic_id, sipi_vector);
 
         // Wait for this AP to come online before starting the next
@@ -124,7 +124,7 @@ pub unsafe fn start_secondary_cores(cpu_count: u32) {
             if num_cores_online() >= expected {
                 break;
             }
-            core::arch::asm!("pause", options(nomem, nostack));
+            core::hint::spin_loop();
         }
     }
 
@@ -133,7 +133,7 @@ pub unsafe fn start_secondary_cores(cpu_count: u32) {
         if num_cores_online() >= count {
             break;
         }
-        core::arch::asm!("pause", options(nomem, nostack));
+        core::hint::spin_loop();
     }
 
     let online = num_cores_online();

@@ -749,13 +749,16 @@ fn send_on_qp(qp: usize, data: &[u8]) {
     unsafe {
         (*ndev()).qp_state[qp].tx_pool_used[slot] = true;
         let buf = &mut (*ndev()).qp_state[qp].tx_pool[slot];
-        buf.hdr.flags = 0;
-        buf.hdr.gso_type = 0;
-        buf.hdr.hdr_len = 0;
-        buf.hdr.gso_size = 0;
-        buf.hdr.csum_start = 0;
-        buf.hdr.csum_offset = 0;
-        buf.hdr.num_buffers = 1;
+        // VirtIO net header: all zero except num_buffers = 1.
+        buf.hdr = VirtioNetHeader {
+            flags: 0,
+            gso_type: 0,
+            hdr_len: 0,
+            gso_size: 0,
+            csum_start: 0,
+            csum_offset: 0,
+            num_buffers: 1,
+        };
 
         ptr::copy_nonoverlapping(data.as_ptr(), buf.data.as_mut_ptr(), frame_len as usize);
 
@@ -769,11 +772,6 @@ fn send_on_qp(qp: usize, data: &[u8]) {
 
         (*ndev()).tx_queues[qp].kick();
     }
-}
-
-/// Send a frame directly on queue pair 0 (backward compat).
-fn send_direct(data: &[u8]) {
-    send_on_qp(0, data);
 }
 
 /// Flag: set by APs when they stage TX.
