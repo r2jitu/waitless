@@ -149,12 +149,65 @@ impl TcpConnection {
 }
 
 // Per-core connection pools. Core N owns POOLS[N].
-static mut POOLS: [[TcpConnection; CONNECTIONS_PER_CORE]; MAX_CORES] =
-    [const { [const { TcpConnection::new() }; CONNECTIONS_PER_CORE] }; MAX_CORES];
-// Volatile, not atomic — VZ.framework rejects ALL atomic RMW (LDXR/STXR
-// and LSE LDADD/SWP) on guest RAM. DFSC 0x35 on both .data and .bss.
-// Duplicates across cores are harmless for TCP ISN.
+//
+// Each `TcpConnection` is wrapped in an `UnsafeCell` so cores share the
+// `POOLS` static via shared references rather than aliased `&mut`. The
+// previous `pool(core) -> &'static mut [TcpConnection; N]` was the same
+// `static mut + &mut` aliasing UB that was just fixed in `kernel::percpu`:
+// two cores calling `pool()` with different ids both formed `&mut` into
+// the single static, which is undefined behaviour even when the
+// underlying memory accesses target disjoint slots.
+//
+// SAFETY discipline (enforced by flow-hash routing in net/lib.rs and by
+// the API's `cpu_id()` calls): the connection at `POOLS[core][slot]` is
+// only mutated by code running on the matching core. The handles
+// returned by `encode_handle` carry the core id, and every public TCP
+// API decodes the handle and only ever accesses the matching core's
+// slots. Tier 2 RX is delivered to the owning core via `rx_inbox` before
+// `tcp_receive` runs, so cross-core access cannot occur there either.
+struct TcpConnCell(core::cell::UnsafeCell<TcpConnection>);
+// SAFETY: per-core ownership documented above; each core only mutates
+// its own slots, no two threads ever hold &mut to the same TcpConnection.
+unsafe impl Sync for TcpConnCell {}
+impl TcpConnCell {
+    const fn new() -> Self {
+        TcpConnCell(core::cell::UnsafeCell::new(TcpConnection::new()))
+    }
+}
+
+static POOLS: [[TcpConnCell; CONNECTIONS_PER_CORE]; MAX_CORES] =
+    [const { [const { TcpConnCell::new() }; CONNECTIONS_PER_CORE] }; MAX_CORES];
+
+/// Get a `*mut TcpConnection` for `(core, slot)`. The caller must
+/// uphold the per-core ownership discipline (only the owning core may
+/// dereference the resulting pointer mutably).
+#[inline]
+fn conn_ptr(core: u32, slot: usize) -> *mut TcpConnection {
+    POOLS[core as usize][slot].0.get()
+}
+
+/// TCP initial-sequence-number counter. Atomic on QEMU/KVM; on
+/// vz_compat (atomic RMW faults) fall back to volatile read+write,
+/// where duplicates are harmless for TCP ISN.
+#[cfg(not(vz_compat))]
+static SEQ_COUNTER: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(100_000);
+#[cfg(vz_compat)]
 static mut SEQ_COUNTER: u32 = 100_000;
+
+#[inline]
+fn next_seq() -> u32 {
+    #[cfg(not(vz_compat))]
+    {
+        SEQ_COUNTER.fetch_add(64_000, core::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(vz_compat)]
+    unsafe {
+        let s = core::ptr::read_volatile(&SEQ_COUNTER);
+        core::ptr::write_volatile(&raw mut SEQ_COUNTER, s.wrapping_add(64_000));
+        s
+    }
+}
 
 /// Encode a connection handle from core + slot index.
 /// Handle = (core << 8) | slot, +1 to avoid null.
@@ -174,15 +227,13 @@ fn decode_handle(handle: *mut ()) -> Option<(u32, usize)> {
     }
 }
 
-fn pool(core: u32) -> &'static mut [TcpConnection; CONNECTIONS_PER_CORE] {
-    unsafe { &mut POOLS[core as usize] }
-}
-
 fn alloc_connection(core: u32) -> Option<usize> {
-    let p = pool(core);
     for i in 0..CONNECTIONS_PER_CORE {
-        if p[i].state == TcpState::Closed {
-            p[i] = TcpConnection::new();
+        // SAFETY: per-core ownership; only the owning core (which is `core`
+        // by the public API contract) calls this.
+        let c = unsafe { &mut *conn_ptr(core, i) };
+        if c.state == TcpState::Closed {
+            *c = TcpConnection::new();
             return Some(i);
         }
     }
@@ -190,11 +241,12 @@ fn alloc_connection(core: u32) -> Option<usize> {
 }
 
 fn free_connection(core: u32, slot: usize) {
-    let p = pool(core);
-    if !p[slot].rx_buf.is_null() {
-        mm::kfree(p[slot].rx_buf);
+    // SAFETY: per-core ownership.
+    let c = unsafe { &mut *conn_ptr(core, slot) };
+    if !c.rx_buf.is_null() {
+        mm::kfree(c.rx_buf);
     }
-    p[slot] = TcpConnection::new();
+    *c = TcpConnection::new();
 }
 
 fn send_segment(
@@ -272,12 +324,14 @@ pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
 
     // Determine which core owns this packet.
     let core = kernel::cpu_id();
-    let p = pool(core);
+
+    // SAFETY for the closures below: per-core ownership — only this
+    // core (== `core`) is touching POOLS[core][*].
 
     // RST handling
     if flags & TCP_RST != 0 {
         for i in 0..CONNECTIONS_PER_CORE {
-            let c = &mut p[i];
+            let c = unsafe { &*conn_ptr(core, i) };
             if c.state != TcpState::Closed
                 && c.state != TcpState::Listen
                 && c.remote_ip == src_ip
@@ -297,7 +351,8 @@ pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
         let listener_idx = {
             let mut found = None;
             for i in 0..CONNECTIONS_PER_CORE {
-                if p[i].state == TcpState::Listen && p[i].local_port == dst_port {
+                let c = unsafe { &*conn_ptr(core, i) };
+                if c.state == TcpState::Listen && c.local_port == dst_port {
                     found = Some(i);
                     break;
                 }
@@ -317,16 +372,13 @@ pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
         };
 
         {
-            let c = &mut pool(core)[slot];
+            let c = unsafe { &mut *conn_ptr(core, slot) };
             c.state = TcpState::SynReceived;
             c.remote_ip = src_ip;
             c.local_port = dst_port;
             c.remote_port = src_port;
-            unsafe {
-                let seq = core::ptr::read_volatile(&SEQ_COUNTER);
-                core::ptr::write_volatile(&raw mut SEQ_COUNTER, seq.wrapping_add(64000));
-                c.snd_nxt = seq;
-            }
+            let isn = next_seq();
+            c.snd_nxt = isn;
             c.snd_una = c.snd_nxt;
             c.rcv_nxt = seq + 1;
             c.listener_port = dst_port;
@@ -341,10 +393,12 @@ pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
 
         // Send SYN+ACK
         {
-            let c = &pool(core)[slot];
+            let c = unsafe { &*conn_ptr(core, slot) };
             send_segment(src_ip, dst_port, src_port, c.snd_nxt, c.rcv_nxt, TCP_SYN | TCP_ACK, &[]);
         }
-        pool(core)[slot].snd_nxt = pool(core)[slot].snd_nxt.wrapping_add(1);
+        unsafe {
+            (*conn_ptr(core, slot)).snd_nxt = (*conn_ptr(core, slot)).snd_nxt.wrapping_add(1);
+        }
         return;
     }
 
@@ -352,7 +406,7 @@ pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
     let conn_slot = {
         let mut found = None;
         for i in 0..CONNECTIONS_PER_CORE {
-            let c = &p[i];
+            let c = unsafe { &*conn_ptr(core, i) };
             if c.state != TcpState::Closed
                 && c.state != TcpState::Listen
                 && c.remote_ip == src_ip
@@ -371,7 +425,7 @@ pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
         None => return,
     };
 
-    let c = &mut pool(core)[slot];
+    let c = unsafe { &mut *conn_ptr(core, slot) };
 
     // Process ACK
     if flags & TCP_ACK != 0 {
@@ -427,7 +481,7 @@ fn seq_lt(a: u32, b: u32) -> bool {
 pub fn init() {
     for core in 0..MAX_CORES {
         for i in 0..CONNECTIONS_PER_CORE {
-            pool(core as u32)[i] = TcpConnection::new();
+            unsafe { *conn_ptr(core as u32, i) = TcpConnection::new(); }
         }
     }
 }
@@ -443,8 +497,11 @@ pub fn listen_on_core(core: u32, port: u16) -> *mut () {
         Some(i) => i,
         None => return ptr::null_mut(),
     };
-    pool(core)[slot].state = TcpState::Listen;
-    pool(core)[slot].local_port = port;
+    // SAFETY: per-core ownership; only the owning core mutates this slot.
+    // listen_on_core is called from app init, single-threaded.
+    let c = unsafe { &mut *conn_ptr(core, slot) };
+    c.state = TcpState::Listen;
+    c.local_port = port;
     encode_handle(core, slot)
 }
 
@@ -454,10 +511,10 @@ pub fn accept(handle: *mut ()) -> *mut () {
         Some(v) => v,
         None => return ptr::null_mut(),
     };
-    let p = pool(core);
-    let port = p[listener_slot].local_port;
+    let port = unsafe { (*conn_ptr(core, listener_slot)).local_port };
     for i in 0..CONNECTIONS_PER_CORE {
-        let c = &mut p[i];
+        // SAFETY: per-core ownership.
+        let c = unsafe { &mut *conn_ptr(core, i) };
         if c.state == TcpState::Established && c.listener_port == port && !c.accepted {
             c.accepted = true;
             return encode_handle(core, i);
@@ -471,7 +528,7 @@ pub fn has_data(handle: *mut ()) -> bool {
         Some(v) => v,
         None => return false,
     };
-    pool(core)[slot].rx_used() > 0
+    unsafe { (*conn_ptr(core, slot)).rx_used() > 0 }
 }
 
 pub fn recv(handle: *mut (), buf: &mut [u8]) -> usize {
@@ -479,7 +536,7 @@ pub fn recv(handle: *mut (), buf: &mut [u8]) -> usize {
         Some(v) => v,
         None => return 0,
     };
-    pool(core)[slot].rx_pop(buf)
+    unsafe { (*conn_ptr(core, slot)).rx_pop(buf) }
 }
 
 pub fn send(handle: *mut (), data: &[u8]) -> i32 {
@@ -487,7 +544,8 @@ pub fn send(handle: *mut (), data: &[u8]) -> i32 {
         Some(v) => v,
         None => return -1,
     };
-    let c = &mut pool(core)[slot];
+    // SAFETY: per-core ownership.
+    let c = unsafe { &mut *conn_ptr(core, slot) };
     if c.state != TcpState::Established {
         return -1;
     }
@@ -516,7 +574,8 @@ pub fn close(handle: *mut ()) {
         Some(v) => v,
         None => return,
     };
-    let c = &mut pool(core)[slot];
+    // SAFETY: per-core ownership.
+    let c = unsafe { &mut *conn_ptr(core, slot) };
     match c.state {
         TcpState::Established => {
             send_segment(
@@ -545,5 +604,5 @@ pub fn is_closed(handle: *mut ()) -> bool {
         Some(v) => v,
         None => return true,
     };
-    pool(core)[slot].state == TcpState::Closed
+    unsafe { (*conn_ptr(core, slot)).state == TcpState::Closed }
 }
