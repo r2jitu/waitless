@@ -3,10 +3,12 @@
 #![no_std]
 #![allow(static_mut_refs)]
 
+extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
 extern crate net_ethernet as ethernet;
 extern crate drivers;
 
+use from_bytes::FromBytes;
 use types::{MacAddr, Ipv4Addr, CONFIG, htons, ntohs};
 use ethernet::{ethernet_our_mac, ethernet_send, ethernet_parse, ETHERTYPE_ARP};
 
@@ -24,6 +26,9 @@ struct ArpPacket {
     target_mac: MacAddr,
     target_ip: Ipv4Addr,
 }
+
+// SAFETY: repr(C, packed), all fields are POD integers/byte arrays.
+unsafe impl FromBytes for ArpPacket {}
 
 const ARP_OP_REQUEST: u16 = 1;
 const ARP_OP_REPLY: u16 = 2;
@@ -104,10 +109,10 @@ fn arp_request(target_ip: Ipv4Addr) {
 }
 
 pub fn arp_receive(data: &[u8]) {
-    if data.len() < 28 {
-        return;
-    }
-    let pkt = unsafe { &*(data.as_ptr() as *const ArpPacket) };
+    let pkt = match ArpPacket::try_ref_from(data) {
+        Some(p) => p,
+        None => return,
+    };
     let our_ip = CONFIG.ip();
 
     let sender_ip = pkt.sender_ip;

@@ -8,11 +8,13 @@
 #![allow(static_mut_refs)]
 
 extern crate kernel;
+extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
 extern crate net_ipv4 as ipv4;
 extern crate bitflags;
 
 use core::ptr;
+use from_bytes::FromBytes;
 use kernel::mm;
 use types::{Ipv4Addr, CONFIG, tcp_checksum, htons, ntohs, htonl, ntohl};
 use ipv4::{ipv4_send, PROTO_TCP};
@@ -59,6 +61,9 @@ struct TcpHeader {
     checksum: u16,
     urgent: u16,
 }
+
+// SAFETY: repr(C, packed), all fields are POD integers.
+unsafe impl FromBytes for TcpHeader {}
 
 const CONNECTIONS_PER_CORE: usize = 32;
 const MAX_CORES: usize = 8;
@@ -309,10 +314,10 @@ fn send_rst(dst_ip: Ipv4Addr, src_port: u16, dst_port: u16, seq: u32, ack: u32) 
 
 /// Process an incoming TCP packet. Called on the owning core (via flow hash).
 pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
-    if data.len() < 20 {
-        return;
-    }
-    let hdr = unsafe { &*(data.as_ptr() as *const TcpHeader) };
+    let hdr = match TcpHeader::try_ref_from(data) {
+        Some(h) => h,
+        None => return,
+    };
     let src_port = ntohs(hdr.src_port);
     let dst_port = ntohs(hdr.dst_port);
     let seq = ntohl(hdr.seq);

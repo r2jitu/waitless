@@ -5,12 +5,14 @@
 
 extern crate kernel;
 extern crate drivers;
+extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
 extern crate net_ethernet as ethernet;
 extern crate net_arp as arp;
 extern crate net_ipv4 as ipv4;
 
 use core::ptr;
+use from_bytes::FromBytes;
 use types::{MacAddr, Ipv4Addr, CONFIG, checksum, htons, ntohs, htonl};
 use ethernet::{EthernetHeader, ethernet_our_mac, ethernet_parse, ETHERTYPE_ARP, ETHERTYPE_IPV4};
 use arp::{arp_receive, arp_announce};
@@ -24,6 +26,9 @@ struct UdpHeader {
     length: u16,
     checksum: u16,
 }
+
+// SAFETY: repr(C, packed), all u16 fields.
+unsafe impl FromBytes for UdpHeader {}
 
 #[repr(C, packed)]
 struct DhcpPacket {
@@ -43,6 +48,9 @@ struct DhcpPacket {
     file: [u8; 128],
     magic_cookie: u32,
 }
+
+// SAFETY: repr(C, packed), all fields are POD integers / byte arrays / Ipv4Addr.
+unsafe impl FromBytes for DhcpPacket {}
 
 const DHCP_DISCOVER: u8 = 1;
 const DHCP_OFFER: u8 = 2;
@@ -72,30 +80,40 @@ fn dhcp_receive(frame: &[u8]) {
         return;
     }
 
-    if ethertype != ETHERTYPE_IPV4 || payload.len() < 20 {
+    if ethertype != ETHERTYPE_IPV4 {
         return;
     }
-    let ip_hdr = unsafe { &*(payload.as_ptr() as *const Ipv4Header) };
+    let ip_hdr = match Ipv4Header::try_ref_from(payload) {
+        Some(h) => h,
+        None => return,
+    };
     if ip_hdr.protocol != PROTO_UDP {
         return;
     }
     let ip_hdr_len = ((ip_hdr.version_ihl & 0x0F) as usize) * 4;
-    if payload.len() < ip_hdr_len + 8 {
+    if payload.len() < ip_hdr_len {
         return;
     }
 
-    let udp = unsafe { &*(payload[ip_hdr_len..].as_ptr() as *const UdpHeader) };
+    let udp = match UdpHeader::try_ref_from(&payload[ip_hdr_len..]) {
+        Some(h) => h,
+        None => return,
+    };
     if ntohs(udp.dst_port) != 68 || ntohs(udp.src_port) != 67 {
         return;
     }
 
     let dhcp_offset = ip_hdr_len + 8;
-    if payload.len() < dhcp_offset + 240 {
+    if payload.len() < dhcp_offset {
         return;
     }
-
-    let dhcp = unsafe { &*(payload[dhcp_offset..].as_ptr() as *const DhcpPacket) };
-    if dhcp.xid != unsafe { DHCP_XID } || dhcp.magic_cookie != htonl(0x63825363) {
+    let dhcp = match DhcpPacket::try_ref_from(&payload[dhcp_offset..]) {
+        Some(h) => h,
+        None => return,
+    };
+    let xid = dhcp.xid;
+    let cookie = dhcp.magic_cookie;
+    if xid != unsafe { DHCP_XID } || cookie != htonl(0x63825363) {
         return;
     }
 

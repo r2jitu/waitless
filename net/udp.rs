@@ -6,9 +6,11 @@
 #![no_std]
 #![allow(static_mut_refs)]
 
+extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
 extern crate net_ipv4 as ipv4;
 
+use from_bytes::FromBytes;
 use types::{Ipv4Addr, CONFIG, tcp_checksum, htons, ntohs};
 use ipv4::{ipv4_send, PROTO_UDP};
 
@@ -19,6 +21,9 @@ struct UdpHeader {
     length: u16,
     checksum: u16,
 }
+
+// SAFETY: repr(C, packed), all fields u16.
+unsafe impl FromBytes for UdpHeader {}
 
 const MAX_HANDLERS: usize = 8;
 
@@ -69,10 +74,10 @@ pub fn send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
 
 /// Called by the network dispatch layer when protocol == UDP.
 pub fn udp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
-    if data.len() < 8 {
-        return;
-    }
-    let hdr = unsafe { &*(data.as_ptr() as *const UdpHeader) };
+    let hdr = match UdpHeader::try_ref_from(data) {
+        Some(h) => h,
+        None => return,
+    };
     let dst_port = ntohs(hdr.dst_port);
     let src_port = ntohs(hdr.src_port);
     let udp_len = ntohs(hdr.length) as usize;

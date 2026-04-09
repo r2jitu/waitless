@@ -19,6 +19,23 @@ rust_test(
     rustc_flags = ["-Cpanic=unwind"],
 )
 
+# Safe `try_ref_from(&[u8]) -> Option<&Self>` for packed packet headers.
+# Eliminates the dominant unsafe pattern in net/* (interpreting an inbound
+# byte slice as `&PacketHeader`).
+rust_library(
+    name = "from_bytes",
+    srcs = ["from_bytes.rs"],
+    crate_root = "from_bytes.rs",
+    crate_name = "net_from_bytes",
+    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+)
+
+rust_test(
+    name = "from_bytes_test",
+    crate = ":from_bytes",
+    rustc_flags = ["-Cpanic=unwind"],
+)
+
 # Protocol parsing tests — host-native, tests raw byte parsing for all protocols.
 # No deps on bare-metal crates (panic=abort incompatible with test harness).
 rust_test(
@@ -34,6 +51,7 @@ rust_library(
     crate_name = "net_ethernet",
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
     deps = [
+        ":from_bytes",
         ":types",
         "//drivers",
     ],
@@ -46,6 +64,7 @@ rust_library(
     crate_name = "net_arp",
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
     deps = [
+        ":from_bytes",
         ":types",
         ":ethernet",
         "//drivers",
@@ -59,6 +78,7 @@ rust_library(
     crate_name = "net_ipv4",
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
     deps = [
+        ":from_bytes",
         ":types",
         ":ethernet",
         ":arp",
@@ -72,6 +92,7 @@ rust_library(
     crate_name = "net_tcp",
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
     deps = [
+        ":from_bytes",
         ":types",
         ":ipv4",
         "//kernel",
@@ -86,6 +107,7 @@ rust_library(
     crate_name = "net_udp",
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
     deps = [
+        ":from_bytes",
         ":types",
         ":ipv4",
     ],
@@ -98,6 +120,7 @@ rust_library(
     crate_name = "net_dhcp",
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
     deps = [
+        ":from_bytes",
         ":types",
         ":ethernet",
         ":arp",

@@ -3,11 +3,13 @@
 #![no_std]
 #![allow(static_mut_refs)]
 
+extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
 extern crate net_ethernet as ethernet;
 extern crate net_arp as arp;
 
 use core::ptr;
+use from_bytes::FromBytes;
 use types::{MacAddr, Ipv4Addr, CONFIG, checksum, htons, ntohs};
 use ethernet::{ethernet_send, ETHERTYPE_IPV4};
 use arp::arp_resolve;
@@ -28,6 +30,9 @@ pub struct Ipv4Header {
     pub src: Ipv4Addr,
     pub dst: Ipv4Addr,
 }
+
+// SAFETY: repr(C, packed), all fields are POD integer / Ipv4Addr.
+unsafe impl FromBytes for Ipv4Header {}
 
 /// Parsed IPv4 packet returned by ipv4_receive.
 pub struct Ipv4Packet<'a> {
@@ -103,10 +108,7 @@ pub fn ipv4_send(dst: Ipv4Addr, proto: u8, payload: &[u8]) {
 /// Parse and validate an IPv4 packet. Returns None if invalid or not for us.
 /// Caller is responsible for dispatching based on protocol field.
 pub fn ipv4_receive(data: &[u8]) -> Option<Ipv4Packet<'_>> {
-    if data.len() < 20 {
-        return None;
-    }
-    let hdr = unsafe { &*(data.as_ptr() as *const Ipv4Header) };
+    let hdr = Ipv4Header::try_ref_from(data)?;
 
     let version = hdr.version_ihl >> 4;
     if version != 4 {

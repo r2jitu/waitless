@@ -6,10 +6,12 @@
 #![no_std]
 #![allow(static_mut_refs)]
 
+extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
 extern crate drivers;
 
 use core::ptr;
+use from_bytes::FromBytes;
 use types::{MacAddr, htons};
 
 pub const ETHERTYPE_ARP: u16 = 0x0806;
@@ -22,6 +24,11 @@ pub struct EthernetHeader {
     pub src: MacAddr,
     pub ethertype: u16, // network byte order
 }
+
+// SAFETY: repr(C, packed) (alignment 1) and all fields are POD
+// (MacAddr is [u8; 6], ethertype is u16). Any byte pattern is a valid
+// EthernetHeader.
+unsafe impl FromBytes for EthernetHeader {}
 
 /// Cached MAC address. Packed into the low 48 bits of an `AtomicU64` so
 /// the cross-core publish is data-race-free without depending on
@@ -79,9 +86,7 @@ pub fn ethernet_send(dst: MacAddr, ethertype: u16, payload: &[u8]) {
 
 /// Parse an Ethernet frame into ethertype + payload. Returns None if too short.
 pub fn ethernet_parse(frame: &[u8]) -> Option<(u16, &[u8])> {
-    if frame.len() < HEADER_LEN {
-        return None;
-    }
-    let hdr = unsafe { &*(frame.as_ptr() as *const EthernetHeader) };
-    Some((u16::from_be(hdr.ethertype), &frame[HEADER_LEN..]))
+    let hdr = EthernetHeader::try_ref_from(frame)?;
+    let ethertype = hdr.ethertype;
+    Some((u16::from_be(ethertype), &frame[HEADER_LEN..]))
 }
