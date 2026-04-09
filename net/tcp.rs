@@ -14,7 +14,7 @@ extern crate bitflags;
 
 use core::ptr;
 use from_bytes::FromBytes;
-use kernel::mm;
+use kernel::kbox::KBox;
 use types::{Ipv4Addr, CONFIG, tcp_checksum, htons, ntohs, htonl, ntohl};
 use ipv4::{ipv4_send, PROTO_TCP};
 
@@ -78,8 +78,12 @@ pub struct TcpConnection {
     snd_una: u32,
     rcv_nxt: u32,
     rcv_wnd: u16,
-    rx_buf: *mut u8,
-    rx_buf_size: usize,
+    /// Owned RX ring buffer. `None` until the connection is accepted
+    /// (allocated in `tcp_receive` SYN handling), then a `KBox<[u8]>`
+    /// of length `RX_BUF_SIZE`. Drop runs `kfree` automatically when
+    /// the connection is reset, eliminating the manual `kfree` that
+    /// the previous `*mut u8` field required.
+    rx_buf: Option<KBox<[u8]>>,
     rx_head: usize,
     rx_tail: usize,
     listener_port: u16,
@@ -97,8 +101,7 @@ impl TcpConnection {
             snd_una: 0,
             rcv_nxt: 0,
             rcv_wnd: RX_BUF_SIZE as u16,
-            rx_buf: ptr::null_mut(),
-            rx_buf_size: 0,
+            rx_buf: None,
             rx_head: 0,
             rx_tail: 0,
             listener_port: 0,
@@ -106,48 +109,60 @@ impl TcpConnection {
         }
     }
 
+    #[inline]
+    fn rx_buf_size(&self) -> usize {
+        self.rx_buf.as_ref().map(|b| b.len()).unwrap_or(0)
+    }
+
     fn rx_used(&self) -> usize {
+        let size = self.rx_buf_size();
+        if size == 0 { return 0; }
         if self.rx_head >= self.rx_tail {
             self.rx_head - self.rx_tail
         } else {
-            self.rx_buf_size - self.rx_tail + self.rx_head
+            size - self.rx_tail + self.rx_head
         }
     }
 
     fn rx_free(&self) -> usize {
-        self.rx_buf_size - 1 - self.rx_used()
+        let size = self.rx_buf_size();
+        if size == 0 { return 0; }
+        size - 1 - self.rx_used()
     }
 
     fn rx_push(&mut self, data: &[u8]) -> usize {
+        let size = self.rx_buf_size();
+        if size == 0 { return 0; }
         let free = self.rx_free();
         let n = data.len().min(free);
         if n == 0 { return 0; }
-        let contig = self.rx_buf_size - self.rx_head;
+        let contig = size - self.rx_head;
+        let buf = self.rx_buf.as_mut().unwrap();
         if n <= contig {
-            unsafe { ptr::copy_nonoverlapping(data.as_ptr(), self.rx_buf.add(self.rx_head), n) };
+            buf[self.rx_head..self.rx_head + n].copy_from_slice(&data[..n]);
         } else {
-            unsafe {
-                ptr::copy_nonoverlapping(data.as_ptr(), self.rx_buf.add(self.rx_head), contig);
-                ptr::copy_nonoverlapping(data.as_ptr().add(contig), self.rx_buf, n - contig);
-            }
+            buf[self.rx_head..self.rx_head + contig].copy_from_slice(&data[..contig]);
+            buf[..n - contig].copy_from_slice(&data[contig..n]);
         }
-        self.rx_head = (self.rx_head + n) % self.rx_buf_size;
+        self.rx_head = (self.rx_head + n) % size;
         n
     }
 
-    fn rx_pop(&mut self, buf: &mut [u8]) -> usize {
+    fn rx_pop(&mut self, out: &mut [u8]) -> usize {
+        let size = self.rx_buf_size();
+        if size == 0 { return 0; }
         let used = self.rx_used();
-        let n = buf.len().min(used);
-        let contig = self.rx_buf_size - self.rx_tail;
+        let n = out.len().min(used);
+        if n == 0 { return 0; }
+        let contig = size - self.rx_tail;
+        let buf = self.rx_buf.as_ref().unwrap();
         if n <= contig {
-            unsafe { ptr::copy_nonoverlapping(self.rx_buf.add(self.rx_tail), buf.as_mut_ptr(), n) };
+            out[..n].copy_from_slice(&buf[self.rx_tail..self.rx_tail + n]);
         } else {
-            unsafe {
-                ptr::copy_nonoverlapping(self.rx_buf.add(self.rx_tail), buf.as_mut_ptr(), contig);
-                ptr::copy_nonoverlapping(self.rx_buf, buf.as_mut_ptr().add(contig), n - contig);
-            }
+            out[..contig].copy_from_slice(&buf[self.rx_tail..self.rx_tail + contig]);
+            out[contig..n].copy_from_slice(&buf[..n - contig]);
         }
-        self.rx_tail = (self.rx_tail + n) % self.rx_buf_size;
+        self.rx_tail = (self.rx_tail + n) % size;
         n
     }
 }
@@ -247,9 +262,9 @@ fn alloc_connection(core: u32) -> Option<usize> {
 fn free_connection(core: u32, slot: usize) {
     // SAFETY: per-core ownership.
     let c = unsafe { &mut *conn_ptr(core, slot) };
-    if !c.rx_buf.is_null() {
-        mm::kfree(c.rx_buf);
-    }
+    // Assigning a fresh TcpConnection drops the old one, which runs
+    // the Drop impl on `rx_buf: Option<KBox<[u8]>>` — KBox::drop calls
+    // kfree. No manual kfree needed.
     *c = TcpConnection::new();
 }
 
@@ -388,9 +403,9 @@ pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
             c.listener_port = dst_port;
             c.accepted = false;
 
-            // Allocate RX buffer
-            c.rx_buf = mm::kmalloc(RX_BUF_SIZE);
-            c.rx_buf_size = RX_BUF_SIZE;
+            // Allocate RX buffer. KBox handles kmalloc + auto-kfree;
+            // no manual free is needed when the connection is reset.
+            c.rx_buf = KBox::<[u8]>::try_new_zeroed_slice(RX_BUF_SIZE);
             c.rx_head = 0;
             c.rx_tail = 0;
         }
