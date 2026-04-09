@@ -9,7 +9,6 @@
 // buffers that core 0 flushes.
 
 #![no_std]
-#![allow(static_mut_refs)]
 
 extern crate drivers;
 extern crate kernel;
@@ -104,7 +103,7 @@ fn poll_tier2(num_cores: u32) -> bool {
         { RX_LOCK_MISS.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
         #[cfg(vz_compat)]
         unsafe {
-            let v = core::ptr::read_volatile(&RX_LOCK_MISS);
+            let v = core::ptr::read_volatile(&raw const RX_LOCK_MISS);
             core::ptr::write_volatile(&raw mut RX_LOCK_MISS, v.wrapping_add(1));
         }
         return false;
@@ -113,7 +112,7 @@ fn poll_tier2(num_cores: u32) -> bool {
     { RX_LOCK_GOT.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
     #[cfg(vz_compat)]
     unsafe {
-        let v = core::ptr::read_volatile(&RX_LOCK_GOT);
+        let v = core::ptr::read_volatile(&raw const RX_LOCK_GOT);
         core::ptr::write_volatile(&raw mut RX_LOCK_GOT, v.wrapping_add(1));
     }
 
@@ -136,7 +135,7 @@ fn poll_tier2(num_cores: u32) -> bool {
         { FRAMES_DISTRIBUTED.fetch_add(count as u64, core::sync::atomic::Ordering::Relaxed); }
         #[cfg(vz_compat)]
         unsafe {
-            let v = core::ptr::read_volatile(&FRAMES_DISTRIBUTED);
+            let v = core::ptr::read_volatile(&raw const FRAMES_DISTRIBUTED);
             core::ptr::write_volatile(&raw mut FRAMES_DISTRIBUTED, v.wrapping_add(count as u64));
         }
         let any_wakeup = (1..num_cores as usize)

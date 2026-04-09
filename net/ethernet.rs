@@ -4,7 +4,6 @@
 // Protocol dispatch (ARP, IPv4) is handled by callers, not here.
 
 #![no_std]
-#![allow(static_mut_refs)]
 
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;

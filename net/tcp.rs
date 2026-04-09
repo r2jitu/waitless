@@ -5,7 +5,6 @@
 // owning core. All connection operations are core-local — no locks.
 
 #![no_std]
-#![allow(static_mut_refs)]
 
 extern crate kernel;
 extern crate net_from_bytes as from_bytes;
@@ -208,7 +207,7 @@ fn next_seq() -> u32 {
     }
     #[cfg(vz_compat)]
     unsafe {
-        let s = core::ptr::read_volatile(&SEQ_COUNTER);
+        let s = core::ptr::read_volatile(&raw const SEQ_COUNTER);
         core::ptr::write_volatile(&raw mut SEQ_COUNTER, s.wrapping_add(64_000));
         s
     }

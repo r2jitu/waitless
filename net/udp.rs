@@ -4,6 +4,10 @@
 // Port-based dispatch via registered handlers.
 
 #![no_std]
+// HANDLERS is a small port→handler table set during bind() and read on
+// every UDP rx. Single-threaded init phase + read-mostly afterwards. The
+// access pattern is sound but uses `static mut`; a follow-up could
+// convert to AtomicU16[N] + AtomicPtr[N] or an InitOnce-backed table.
 #![allow(static_mut_refs)]
 
 extern crate net_from_bytes as from_bytes;

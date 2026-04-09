@@ -1,7 +1,6 @@
 // net/ipv4.rs — IPv4 packet parsing/building.
 
 #![no_std]
-#![allow(static_mut_refs)]
 
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
@@ -59,7 +58,7 @@ fn next_ip_id() -> u16 {
     }
     #[cfg(vz_compat)]
     unsafe {
-        let id = core::ptr::read_volatile(&IP_ID_COUNTER);
+        let id = core::ptr::read_volatile(&raw const IP_ID_COUNTER);
         core::ptr::write_volatile(&raw mut IP_ID_COUNTER, id.wrapping_add(1));
         id
     }
