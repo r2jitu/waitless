@@ -4,6 +4,7 @@
 // Finds RSDP in BIOS memory, parses RSDT, finds MADT, extracts
 // Local APIC entries to discover CPU count and APIC IDs.
 
+use crate::once::InitOnce;
 use crate::serial;
 
 /// ACPI RSDP signature: "RSD PTR "
@@ -21,14 +22,26 @@ pub struct CpuTopology {
     pub apic_ids: [u8; MAX_CPUS],
 }
 
-static mut TOPOLOGY: CpuTopology = CpuTopology {
-    cpu_count: 0,
-    apic_ids: [0; MAX_CPUS],
-};
+/// Parsed ACPI topology, populated exactly once on the BSP via
+/// `detect_cpus()` before any AP starts.
+static TOPOLOGY: InitOnce<CpuTopology> = InitOnce::new();
 
 /// Scan BIOS memory for RSDP, parse RSDT → MADT → CPU entries.
 /// Returns the number of CPUs found, or 1 if ACPI is unavailable.
+///
+/// Idempotent: subsequent calls return the cached topology rather than
+/// re-parsing (and rather than panicking on InitOnce double-init). The
+/// virtio_net driver and boot/entry both call this; the first wins,
+/// the rest read the cached value.
 pub unsafe fn detect_cpus() -> u32 {
+    if let Some(t) = TOPOLOGY.try_get() {
+        return t.cpu_count;
+    }
+    let mut topo = CpuTopology {
+        cpu_count: 0,
+        apic_ids: [0; MAX_CPUS],
+    };
+
     // Scan for RSDP in BIOS area: 0xE0000 - 0xFFFFF (16-byte aligned)
     let mut rsdp_addr: u64 = 0;
     let mut addr = 0xE0000u64;
@@ -50,7 +63,8 @@ pub unsafe fn detect_cpus() -> u32 {
 
     if rsdp_addr == 0 {
         serial::puts(b"       ACPI: RSDP not found\n");
-        TOPOLOGY.cpu_count = 1;
+        topo.cpu_count = 1;
+        TOPOLOGY.init(topo);
         return 1;
     }
 
@@ -58,7 +72,8 @@ pub unsafe fn detect_cpus() -> u32 {
     let rsdt_phys = *((rsdp_addr + 16) as *const u32) as u64;
     if rsdt_phys == 0 {
         serial::puts(b"       ACPI: RSDT address is 0\n");
-        TOPOLOGY.cpu_count = 1;
+        topo.cpu_count = 1;
+        TOPOLOGY.init(topo);
         return 1;
     }
 
@@ -79,7 +94,8 @@ pub unsafe fn detect_cpus() -> u32 {
 
     if madt_addr == 0 {
         serial::puts(b"       ACPI: MADT not found\n");
-        TOPOLOGY.cpu_count = 1;
+        topo.cpu_count = 1;
+        TOPOLOGY.init(topo);
         return 1;
     }
 
@@ -100,7 +116,7 @@ pub unsafe fn detect_cpus() -> u32 {
             let flags = *((madt_addr + offset as u64 + 4) as *const u32);
             // Bit 0 = enabled, bit 1 = online capable
             if (flags & 0x3) != 0 && (count as usize) < MAX_CPUS {
-                TOPOLOGY.apic_ids[count as usize] = apic_id;
+                topo.apic_ids[count as usize] = apic_id;
                 count += 1;
             }
         }
@@ -109,7 +125,8 @@ pub unsafe fn detect_cpus() -> u32 {
     }
 
     if count == 0 { count = 1; }
-    TOPOLOGY.cpu_count = count;
+    topo.cpu_count = count;
+    TOPOLOGY.init(topo);
 
     let mut buf = [0u8; 32];
     let mut pos = 0;
@@ -121,9 +138,9 @@ pub unsafe fn detect_cpus() -> u32 {
     count
 }
 
-/// Get the discovered CPU topology.
+/// Get the discovered CPU topology. Panics if `detect_cpus` hasn't run.
 pub fn topology() -> &'static CpuTopology {
-    unsafe { &TOPOLOGY }
+    TOPOLOGY.get()
 }
 
 fn fmt_u32(buf: &mut [u8], mut val: u32) -> usize {

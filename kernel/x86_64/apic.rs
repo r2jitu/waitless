@@ -29,8 +29,9 @@ const SPURIOUS_VECTOR: u32 = 0xFF;
 /// MSR for APIC base address.
 const IA32_APIC_BASE_MSR: u32 = 0x1B;
 
-/// Virtual address of the Local APIC MMIO page.
-static mut APIC_BASE: u64 = 0;
+/// Virtual address of the Local APIC MMIO page. Set once on the BSP via
+/// `init()` before any AP starts; read by every core for MMIO access.
+static APIC_BASE: crate::once::InitOnce<u64> = crate::once::InitOnce::new();
 
 /// Read an MSR.
 unsafe fn rdmsr(msr: u32) -> u64 {
@@ -59,13 +60,13 @@ unsafe fn wrmsr(msr: u32, val: u64) {
 
 /// Read a Local APIC register.
 unsafe fn apic_read(reg: u32) -> u32 {
-    let addr = (APIC_BASE + reg as u64) as *const u32;
+    let addr = (*APIC_BASE.get() + reg as u64) as *const u32;
     core::ptr::read_volatile(addr)
 }
 
 /// Write a Local APIC register.
 unsafe fn apic_write(reg: u32, val: u32) {
-    let addr = (APIC_BASE + reg as u64) as *mut u32;
+    let addr = (*APIC_BASE.get() + reg as u64) as *mut u32;
     core::ptr::write_volatile(addr, val);
 }
 
@@ -94,8 +95,8 @@ pub unsafe fn init() {
         let msr_val = rdmsr(IA32_APIC_BASE_MSR);
         let phys_base = msr_val & 0xFFFF_F000; // bits 12-35
 
-        // Map APIC MMIO page via HHDM
-        APIC_BASE = mm::phys_to_virt(phys_base) as u64;
+        // Map APIC MMIO page via HHDM and publish for all cores.
+        APIC_BASE.init(mm::phys_to_virt(phys_base) as u64);
 
         // Enable APIC in virtual wire mode: PIC interrupts route through
         // LINT0 of the BSP's Local APIC. This lets PIC device IRQs work

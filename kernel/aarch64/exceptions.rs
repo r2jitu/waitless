@@ -16,14 +16,25 @@ mod aarch64 {
     use core::ptr;
 
     use crate::aarch64::fdt;
+    use crate::once::InitOnce;
     use crate::serial;
 
     // ---- GIC register bases (filled from FDT at init time) ----------------
 
-    static mut GICD_BASE: u64 = 0;
-    static mut GICC_BASE: u64 = 0; // GICv2 only
-    static mut GICR_BASE: u64 = 0; // GICv3 only
-    static mut GIC_VERSION: u8 = 0;
+    /// Resolved GIC bases. Populated exactly once on the BSP via `init()`
+    /// before any AP starts; read by every core for MMIO access.
+    struct GicConfig {
+        gicd_base: u64,
+        gicc_base: u64, // GICv2 only (computed as gicd_base + 0x10000)
+        gicr_base: u64, // GICv3 only
+        version: u8,
+    }
+    static GIC: InitOnce<GicConfig> = InitOnce::new();
+
+    #[inline] fn gicd_base() -> u64 { GIC.get().gicd_base }
+    #[inline] fn gicc_base() -> u64 { GIC.get().gicc_base }
+    #[inline] fn gicr_base() -> u64 { GIC.get().gicr_base }
+    #[inline] fn gic_version() -> u8 { GIC.get().version }
 
     // ---- Distributor registers --------------------------------------------
 
@@ -59,32 +70,32 @@ mod aarch64 {
 
     #[inline(always)]
     unsafe fn gicd_read(off: u32) -> u32 {
-        unsafe { ptr::read_volatile((GICD_BASE + off as u64) as *const u32) }
+        unsafe { ptr::read_volatile((gicd_base() + off as u64) as *const u32) }
     }
 
     #[inline(always)]
     unsafe fn gicd_write(off: u32, val: u32) {
-        unsafe { ptr::write_volatile((GICD_BASE + off as u64) as *mut u32, val); }
+        unsafe { ptr::write_volatile((gicd_base() + off as u64) as *mut u32, val); }
     }
 
     #[inline(always)]
     unsafe fn gicc_read(off: u32) -> u32 {
-        unsafe { ptr::read_volatile((GICC_BASE + off as u64) as *const u32) }
+        unsafe { ptr::read_volatile((gicc_base() + off as u64) as *const u32) }
     }
 
     #[inline(always)]
     unsafe fn gicc_write(off: u32, val: u32) {
-        unsafe { ptr::write_volatile((GICC_BASE + off as u64) as *mut u32, val); }
+        unsafe { ptr::write_volatile((gicc_base() + off as u64) as *mut u32, val); }
     }
 
     #[inline(always)]
     unsafe fn gicr_read(off: u32) -> u32 {
-        unsafe { ptr::read_volatile((GICR_BASE + off as u64) as *const u32) }
+        unsafe { ptr::read_volatile((gicr_base() + off as u64) as *const u32) }
     }
 
     #[inline(always)]
     unsafe fn gicr_write(off: u32, val: u32) {
-        unsafe { ptr::write_volatile((GICR_BASE + off as u64) as *mut u32, val); }
+        unsafe { ptr::write_volatile((gicr_base() + off as u64) as *mut u32, val); }
     }
 
     // ---- IRQ handler table ------------------------------------------------
@@ -112,7 +123,8 @@ mod aarch64 {
 
         if kind == 1 {
             // IRQ
-            if GIC_VERSION == 3 {
+            let ver = if GIC.is_initialized() { gic_version() } else { 0 };
+            if ver == 3 {
                 let iar: u64;
                 asm!("mrs {}, ICC_IAR1_EL1", out(reg) iar);
                 let intid = (iar & 0xFF_FFFF) as u32;
@@ -124,7 +136,7 @@ mod aarch64 {
                     }
                     asm!("msr ICC_EOIR1_EL1, {}", in(reg) iar);
                 }
-            } else if GIC_VERSION == 2 {
+            } else if ver == 2 {
                 let iar = gicc_read(GICC_IAR);
                 let irq = iar & 0x3FF;
                 if irq < 1020 {
@@ -174,8 +186,6 @@ mod aarch64 {
 
     unsafe fn init_gicv2() {
         unsafe {
-        GICC_BASE = GICD_BASE + 0x10000;
-
         // Disable distributor while configuring
         gicd_write(GICD_CTLR, 0);
         asm!("dsb sy", options(nostack));
@@ -217,7 +227,7 @@ mod aarch64 {
 
         if !already_configured {
             // Redistributor: wake up CPU 0's frame
-            if GICR_BASE != 0 {
+            if gicr_base() != 0 {
                 let waker = gicr_read(GICR_WAKER);
                 gicr_write(GICR_WAKER, waker & !(1 << 1)); // Clear ProcessorSleep
                 for _ in 0..1_000_000 {
@@ -243,7 +253,7 @@ mod aarch64 {
 
             // Route all SPIs to affinity 0.0.0.0 (CPU 0)
             for intid in 32..num_irqs {
-                let router_addr = GICD_BASE + GICD_IROUTER_BASE as u64 + (intid - 32) as u64 * 8;
+                let router_addr = gicd_base() + GICD_IROUTER_BASE as u64 + (intid - 32) as u64 * 8;
                 ptr::write_volatile(router_addr as *mut u64, 0);
             }
 
@@ -272,13 +282,20 @@ mod aarch64 {
     pub unsafe fn init() {
         unsafe {
             let fdt = fdt::info();
-            GICD_BASE = fdt.gic_dist_base;
-            GICR_BASE = fdt.gic_redist_base;
-            GIC_VERSION = fdt.gic_version;
+            // GICv2 CPU interface lives at GICD + 0x10000 (banked per-CPU);
+            // GICv3 doesn't use it. Compute eagerly so the InitOnce holds
+            // the full configuration.
+            GIC.init(GicConfig {
+                gicd_base: fdt.gic_dist_base,
+                gicc_base: fdt.gic_dist_base.wrapping_add(0x10000),
+                gicr_base: fdt.gic_redist_base,
+                version: fdt.gic_version,
+            });
 
-            if GIC_VERSION == 3 {
+            let v = gic_version();
+            if v == 3 {
                 init_gicv3();
-            } else if GIC_VERSION == 2 {
+            } else if v == 2 {
                 init_gicv2();
             } else {
                 serial::puts(b"       GIC init skipped (no GIC in DTB)\n");
@@ -291,22 +308,22 @@ mod aarch64 {
     /// their own redistributor + CPU interface registers.
     pub unsafe fn init_ap() {
         unsafe {
-            if GIC_VERSION == 2 {
+            if gic_version() == 2 {
                 // GICv2: CPU interface is at GICD_BASE + 0x10000 (banked per-CPU)
-                let gicc = GICD_BASE + 0x10000;
+                let gicc = gicc_base();
                 // Enable CPU interface
                 ptr::write_volatile((gicc + 0x00) as *mut u32, 1);  // GICC_CTLR = enable
                 ptr::write_volatile((gicc + 0x04) as *mut u32, 0xFF); // GICC_PMR = all priorities
                 return;
             }
 
-            if GIC_VERSION != 3 || GICR_BASE == 0 {
+            if gic_version() != 3 || gicr_base() == 0 {
                 return;
             }
 
             // Each redistributor frame is 0x20000 bytes apart
             let cpu = crate::aarch64::smp::cpu_id() as u64;
-            let gicr_frame = GICR_BASE + cpu * 0x20000;
+            let gicr_frame = gicr_base() + cpu * 0x20000;
 
             // Wake this core's redistributor
             let waker_addr = gicr_frame + GICR_WAKER as u64;
@@ -349,20 +366,20 @@ mod aarch64 {
             }
             IRQ_HANDLERS[irq as usize] = Some(handler);
 
-            if GICD_BASE == 0 {
+            if !GIC.is_initialized() || gicd_base() == 0 {
                 return;
             }
 
             let reg_idx = irq / 32;
             let bit = 1u32 << (irq % 32);
 
-            if irq < 32 && GIC_VERSION == 3 && GICR_BASE != 0 {
+            if irq < 32 && gic_version() == 3 && gicr_base() != 0 {
                 // GICv3: PPIs/SGIs (INTID 0-31) are in the GICR SGI frame.
                 // Use this CPU's redistributor frame (each is 0x20000 bytes apart).
                 // Bug fix: must NOT use GICR_BASE directly — that is CPU 0's frame.
                 // APs must enable their SGIs in their own GICR frame.
                 let cpu = crate::aarch64::smp::cpu_id() as u64;
-                let gicr_frame = GICR_BASE + cpu * 0x20000;
+                let gicr_frame = gicr_base() + cpu * 0x20000;
                 let addr = gicr_frame + GICR_SGI_BASE as u64 + GICD_ISENABLER0 as u64;
                 ptr::write_volatile(addr as *mut u32, bit);
             } else {
