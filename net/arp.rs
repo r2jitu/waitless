@@ -1,14 +1,15 @@
 // net/arp.rs — ARP cache, request/reply, resolve, announce.
 
 #![no_std]
-#![allow(static_mut_refs)]
 
+extern crate kernel;
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
 extern crate net_ethernet as ethernet;
 extern crate drivers;
 
 use from_bytes::FromBytes;
+use kernel::sync::Spinlock;
 use types::{MacAddr, Ipv4Addr, CONFIG, htons, ntohs};
 use ethernet::{ethernet_our_mac, ethernet_send, ethernet_parse, ETHERTYPE_ARP};
 
@@ -33,6 +34,7 @@ unsafe impl FromBytes for ArpPacket {}
 const ARP_OP_REQUEST: u16 = 1;
 const ARP_OP_REPLY: u16 = 2;
 
+#[derive(Clone, Copy)]
 struct ArpEntry {
     ip: Ipv4Addr,
     mac: MacAddr,
@@ -49,38 +51,53 @@ impl ArpEntry {
     }
 }
 
-static mut ARP_CACHE: [ArpEntry; ARP_CACHE_SIZE] = [const { ArpEntry::new() }; ARP_CACHE_SIZE];
-static mut GATEWAY_MAC: MacAddr = MacAddr::ZERO;
-static mut GATEWAY_MAC_VALID: bool = false;
+/// ARP cache + cached gateway MAC, all behind one lock so reads from
+/// one core can't observe a half-written entry from another core. The
+/// cache is mutated by `arp_receive` (which can run on any core under
+/// the distributor) and read by `arp_resolve` (which runs on the
+/// sending core), so it's the textbook case for `Spinlock<T>`.
+struct ArpCache {
+    entries: [ArpEntry; ARP_CACHE_SIZE],
+    gateway_mac: MacAddr,
+    gateway_mac_valid: bool,
+}
 
-fn arp_lookup(ip: Ipv4Addr) -> Option<MacAddr> {
-    unsafe {
-        for i in 0..ARP_CACHE_SIZE {
-            if ARP_CACHE[i].valid && ARP_CACHE[i].ip == ip {
-                return Some(ARP_CACHE[i].mac);
+impl ArpCache {
+    const fn new() -> Self {
+        ArpCache {
+            entries: [const { ArpEntry::new() }; ARP_CACHE_SIZE],
+            gateway_mac: MacAddr::ZERO,
+            gateway_mac_valid: false,
+        }
+    }
+
+    fn lookup(&self, ip: Ipv4Addr) -> Option<MacAddr> {
+        for entry in &self.entries {
+            if entry.valid && entry.ip == ip {
+                return Some(entry.mac);
             }
         }
         None
     }
-}
 
-fn arp_cache_update(ip: Ipv4Addr, mac: MacAddr) {
-    unsafe {
-        for i in 0..ARP_CACHE_SIZE {
-            if ARP_CACHE[i].valid && ARP_CACHE[i].ip == ip {
-                ARP_CACHE[i].mac = mac;
+    fn update(&mut self, ip: Ipv4Addr, mac: MacAddr) {
+        for entry in &mut self.entries {
+            if entry.valid && entry.ip == ip {
+                entry.mac = mac;
                 return;
             }
         }
-        for i in 0..ARP_CACHE_SIZE {
-            if !ARP_CACHE[i].valid {
-                ARP_CACHE[i] = ArpEntry { ip, mac, valid: true };
+        for entry in &mut self.entries {
+            if !entry.valid {
+                *entry = ArpEntry { ip, mac, valid: true };
                 return;
             }
         }
-        ARP_CACHE[0] = ArpEntry { ip, mac, valid: true };
+        self.entries[0] = ArpEntry { ip, mac, valid: true };
     }
 }
+
+static ARP_CACHE: Spinlock<ArpCache> = Spinlock::new(ArpCache::new());
 
 fn arp_request(target_ip: Ipv4Addr) {
     let our_mac = ethernet_our_mac();
@@ -121,12 +138,11 @@ pub fn arp_receive(data: &[u8]) {
     let operation = pkt.operation;
 
     if sender_ip != Ipv4Addr::ANY {
-        arp_cache_update(sender_ip, sender_mac);
+        let mut cache = ARP_CACHE.lock();
+        cache.update(sender_ip, sender_mac);
         if sender_ip == CONFIG.gateway() {
-            unsafe {
-                GATEWAY_MAC = sender_mac;
-                GATEWAY_MAC_VALID = true;
-            }
+            cache.gateway_mac = sender_mac;
+            cache.gateway_mac_valid = true;
         }
     }
 
@@ -162,10 +178,9 @@ pub fn arp_resolve(ip: Ipv4Addr) -> Option<MacAddr> {
         let our_ip = CONFIG.ip().addr;
         let gateway = CONFIG.gateway();
         if (ip.addr & mask) != (our_ip & mask) && gateway != Ipv4Addr::ANY {
-            // SAFETY: GATEWAY_MAC / GATEWAY_MAC_VALID are written once during ARP
-            // resolution; reads are racy but only reflect cache freshness.
-            if unsafe { GATEWAY_MAC_VALID } {
-                return Some(unsafe { GATEWAY_MAC });
+            let cache = ARP_CACHE.lock();
+            if cache.gateway_mac_valid {
+                return Some(cache.gateway_mac);
             }
             gateway
         } else {
@@ -173,7 +188,7 @@ pub fn arp_resolve(ip: Ipv4Addr) -> Option<MacAddr> {
         }
     };
 
-    if let Some(mac) = arp_lookup(target) {
+    if let Some(mac) = ARP_CACHE.lock().lookup(target) {
         return Some(mac);
     }
 
@@ -186,7 +201,7 @@ pub fn arp_resolve(ip: Ipv4Addr) -> Option<MacAddr> {
             // ARP request and processes the reply via distribute_frame,
             // which updates the ARP cache that arp_lookup reads.
             drivers::virtio_net::poll_if_safe(arp_poll_callback);
-            if let Some(mac) = arp_lookup(target) {
+            if let Some(mac) = ARP_CACHE.lock().lookup(target) {
                 return Some(mac);
             }
         }
