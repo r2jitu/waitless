@@ -23,17 +23,39 @@ pub struct EthernetHeader {
     pub ethertype: u16, // network byte order
 }
 
-static mut OUR_MAC: MacAddr = MacAddr::ZERO;
+/// Cached MAC address. Packed into the low 48 bits of an `AtomicU64` so
+/// the cross-core publish is data-race-free without depending on
+/// `kernel::once::InitOnce` (this leaf crate has no kernel dep).
+/// `init_mac` runs once on the BSP after virtio-net init; readers on
+/// every core load via Acquire and decode.
+static OUR_MAC_PACKED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 /// Cache our MAC address. Called once at boot after virtio-net init.
 pub fn init_mac() {
-    unsafe {
-        drivers::virtio_net::get_mac(OUR_MAC.bytes.as_mut_ptr());
-    }
+    let mut bytes = [0u8; 6];
+    drivers::virtio_net::get_mac(bytes.as_mut_ptr());
+    let packed = (bytes[0] as u64)
+        | ((bytes[1] as u64) << 8)
+        | ((bytes[2] as u64) << 16)
+        | ((bytes[3] as u64) << 24)
+        | ((bytes[4] as u64) << 32)
+        | ((bytes[5] as u64) << 40);
+    OUR_MAC_PACKED.store(packed, core::sync::atomic::Ordering::Release);
 }
 
 pub fn ethernet_our_mac() -> MacAddr {
-    unsafe { OUR_MAC }
+    let p = OUR_MAC_PACKED.load(core::sync::atomic::Ordering::Acquire);
+    MacAddr {
+        bytes: [
+            p as u8,
+            (p >> 8) as u8,
+            (p >> 16) as u8,
+            (p >> 24) as u8,
+            (p >> 32) as u8,
+            (p >> 40) as u8,
+        ],
+    }
 }
 
 pub fn ethernet_send(dst: MacAddr, ethertype: u16, payload: &[u8]) {
