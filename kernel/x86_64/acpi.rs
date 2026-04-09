@@ -26,6 +26,87 @@ pub struct CpuTopology {
 /// `detect_cpus()` before any AP starts.
 static TOPOLOGY: InitOnce<CpuTopology> = InitOnce::new();
 
+/// Scan the BIOS area (0xE0000–0xFFFFF) for the RSDP signature, verify the
+/// 20-byte checksum, and return its physical address. Returns 0 if not found.
+///
+/// SAFETY: dereferences raw pointers to BIOS memory; only safe to call on
+/// x86_64 with identity-mapped low memory available.
+unsafe fn find_rsdp() -> u64 {
+    let mut addr = 0xE0000u64;
+    while addr < 0x100000 {
+        let ptr = addr as *const [u8; 8];
+        if *ptr == RSDP_SIG {
+            let mut sum: u8 = 0;
+            for i in 0..20 {
+                sum = sum.wrapping_add(*((addr + i) as *const u8));
+            }
+            if sum == 0 {
+                return addr;
+            }
+        }
+        addr += 16;
+    }
+    0
+}
+
+/// Walk the RSDT pointed to by `rsdt_phys` and return the physical address
+/// of the first MADT (signature "APIC"). Returns 0 if not found.
+///
+/// SAFETY: caller must ensure `rsdt_phys` points to a valid RSDT.
+unsafe fn find_madt(rsdt_phys: u64) -> u64 {
+    let rsdt_len = *((rsdt_phys + 4) as *const u32) as usize;
+    let entry_count = (rsdt_len - 36) / 4; // 36-byte header, 4-byte entries
+
+    for i in 0..entry_count {
+        let entry_phys = *((rsdt_phys + 36 + (i as u64) * 4) as *const u32) as u64;
+        if entry_phys == 0 { continue; }
+        let sig = entry_phys as *const [u8; 4];
+        if *sig == MADT_SIG {
+            return entry_phys;
+        }
+    }
+    0
+}
+
+/// Walk the Local APIC entries (type 0) in the MADT at `madt_addr` and
+/// populate `topo.apic_ids`. Returns the number of enabled APICs found.
+///
+/// SAFETY: caller must ensure `madt_addr` points to a valid MADT.
+unsafe fn parse_madt_entries(madt_addr: u64, topo: &mut CpuTopology) -> u32 {
+    let madt_len = *((madt_addr + 4) as *const u32) as usize;
+    let mut offset = 44usize; // MADT header is 44 bytes
+    let mut count = 0u32;
+
+    while offset + 2 <= madt_len {
+        let entry_type = *((madt_addr + offset as u64) as *const u8);
+        let entry_len = *((madt_addr + offset as u64 + 1) as *const u8) as usize;
+        if entry_len == 0 { break; }
+
+        if entry_type == 0 && entry_len >= 8 {
+            // Local APIC entry: type(1) + len(1) + acpi_processor_id(1) +
+            // apic_id(1) + flags(4). Bit 0 = enabled, bit 1 = online capable.
+            let apic_id = *((madt_addr + offset as u64 + 3) as *const u8);
+            let flags = *((madt_addr + offset as u64 + 4) as *const u32);
+            if (flags & 0x3) != 0 && (count as usize) < MAX_CPUS {
+                topo.apic_ids[count as usize] = apic_id;
+                count += 1;
+            }
+        }
+
+        offset += entry_len;
+    }
+
+    count
+}
+
+/// Cache the topology and return its CPU count, logging a one-line message.
+fn finish(topo: CpuTopology, msg: &[u8]) -> u32 {
+    let count = topo.cpu_count;
+    TOPOLOGY.init(topo);
+    serial::puts(msg);
+    count
+}
+
 /// Scan BIOS memory for RSDP, parse RSDT → MADT → CPU entries.
 /// Returns the number of CPUs found, or 1 if ACPI is unavailable.
 ///
@@ -38,92 +119,27 @@ pub unsafe fn detect_cpus() -> u32 {
         return t.cpu_count;
     }
     let mut topo = CpuTopology {
-        cpu_count: 0,
+        cpu_count: 1,
         apic_ids: [0; MAX_CPUS],
     };
 
-    // Scan for RSDP in BIOS area: 0xE0000 - 0xFFFFF (16-byte aligned)
-    let mut rsdp_addr: u64 = 0;
-    let mut addr = 0xE0000u64;
-    while addr < 0x100000 {
-        let ptr = addr as *const [u8; 8];
-        if *ptr == RSDP_SIG {
-            // Verify checksum (first 20 bytes)
-            let mut sum: u8 = 0;
-            for i in 0..20 {
-                sum = sum.wrapping_add(*((addr + i) as *const u8));
-            }
-            if sum == 0 {
-                rsdp_addr = addr;
-                break;
-            }
-        }
-        addr += 16;
-    }
-
+    let rsdp_addr = find_rsdp();
     if rsdp_addr == 0 {
-        serial::puts(b"       ACPI: RSDP not found\n");
-        topo.cpu_count = 1;
-        TOPOLOGY.init(topo);
-        return 1;
+        return finish(topo, b"       ACPI: RSDP not found\n");
     }
 
-    // RSDP: revision at offset 15, RSDT address at offset 16 (4 bytes)
+    // RSDP: RSDT address at offset 16 (4 bytes).
     let rsdt_phys = *((rsdp_addr + 16) as *const u32) as u64;
     if rsdt_phys == 0 {
-        serial::puts(b"       ACPI: RSDT address is 0\n");
-        topo.cpu_count = 1;
-        TOPOLOGY.init(topo);
-        return 1;
+        return finish(topo, b"       ACPI: RSDT address is 0\n");
     }
 
-    // Parse RSDT — find MADT
-    let rsdt_len = *((rsdt_phys + 4) as *const u32) as usize;
-    let entry_count = (rsdt_len - 36) / 4; // 36-byte header, 4-byte entries
-
-    let mut madt_addr: u64 = 0;
-    for i in 0..entry_count {
-        let entry_phys = *((rsdt_phys + 36 + (i as u64) * 4) as *const u32) as u64;
-        if entry_phys == 0 { continue; }
-        let sig = entry_phys as *const [u8; 4];
-        if *sig == MADT_SIG {
-            madt_addr = entry_phys;
-            break;
-        }
-    }
-
+    let madt_addr = find_madt(rsdt_phys);
     if madt_addr == 0 {
-        serial::puts(b"       ACPI: MADT not found\n");
-        topo.cpu_count = 1;
-        TOPOLOGY.init(topo);
-        return 1;
+        return finish(topo, b"       ACPI: MADT not found\n");
     }
 
-    // Parse MADT — extract Local APIC entries (type 0)
-    let madt_len = *((madt_addr + 4) as *const u32) as usize;
-    let mut offset = 44usize; // MADT header is 44 bytes
-    let mut count = 0u32;
-
-    while offset + 2 <= madt_len {
-        let entry_type = *((madt_addr + offset as u64) as *const u8);
-        let entry_len = *((madt_addr + offset as u64 + 1) as *const u8) as usize;
-        if entry_len == 0 { break; }
-
-        if entry_type == 0 && entry_len >= 8 {
-            // Local APIC entry: type(1) + len(1) + acpi_processor_id(1) +
-            // apic_id(1) + flags(4)
-            let apic_id = *((madt_addr + offset as u64 + 3) as *const u8);
-            let flags = *((madt_addr + offset as u64 + 4) as *const u32);
-            // Bit 0 = enabled, bit 1 = online capable
-            if (flags & 0x3) != 0 && (count as usize) < MAX_CPUS {
-                topo.apic_ids[count as usize] = apic_id;
-                count += 1;
-            }
-        }
-
-        offset += entry_len;
-    }
-
+    let mut count = parse_madt_entries(madt_addr, &mut topo);
     if count == 0 { count = 1; }
     topo.cpu_count = count;
     TOPOLOGY.init(topo);

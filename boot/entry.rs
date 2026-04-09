@@ -88,8 +88,6 @@ unsafe extern "C" {
     // Linker-generated symbols
     static __bss_start: u8;
     static __bss_end: u8;
-    static __init_array_start: unsafe extern "C" fn();
-    static __init_array_end: unsafe extern "C" fn();
 }
 
 // ============================================================================
@@ -127,18 +125,6 @@ unsafe fn zero_bss() {
         let end = &raw const __bss_end as *mut u8;
         let len = end as usize - start as usize;
         ptr::write_bytes(start, 0, len);
-    }
-}
-
-unsafe fn call_global_constructors() {
-    unsafe {
-        let start = &raw const __init_array_start as *const unsafe extern "C" fn();
-        let end = &raw const __init_array_end as *const unsafe extern "C" fn();
-        let mut f = start;
-        while (f as usize) < (end as usize) {
-            (*f)();
-            f = f.add(1);
-        }
     }
 }
 
@@ -393,9 +379,6 @@ unsafe fn kernel_boot(info: &BootInfo) {
         mm::get_total_memory() / (1024 * 1024),
         mm::get_free_memory() / (1024 * 1024)
     );
-
-
-    call_global_constructors();
 
     #[cfg(target_arch = "x86_64")]
     {

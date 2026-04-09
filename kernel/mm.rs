@@ -224,20 +224,59 @@ fn align_up_page(val: u64) -> u64 {
 // Public API
 // ============================================================================
 
-pub fn init(info: *const BootInfo) {
-    // SAFETY: caller passes a valid BootInfo pointer that lives for the
-    // duration of init. Init runs single-threaded on the BSP before any
-    // AP starts, so the locks below are taken without contention.
-    let info = unsafe { &*info };
+/// Compute the physical end address of the kernel image. Handles both
+/// identity-mapped boot (kern_end_ptr == phys) and higher-half boot
+/// (Limine: virt = phys + offset).
+fn kernel_end_phys(info: &BootInfo) -> u64 {
+    let kern_end_ptr = &raw const _kernel_end as u64;
+    if info.kernel_virt_base != 0 {
+        info.kernel_phys_base + (kern_end_ptr - info.kernel_virt_base)
+    } else {
+        kern_end_ptr
+    }
+}
 
-    // ---- Phase 1: Publish address-space config ----
-    ADDR_SPACE.init(AddressSpace {
-        hhdm_offset: info.hhdm_offset,
-        kernel_phys_base: info.kernel_phys_base,
-        kernel_virt_base: info.kernel_virt_base,
+/// Choose where to place the frame bitmap and heap given a memory map.
+/// Identity-mapped boot puts them right after the kernel image; higher-half
+/// (Limine) and VZ (kernel image outside RAM) search for the largest
+/// available region with enough space.
+fn pick_placement_phys(info: &BootInfo, kern_end_phys: u64, needed: u64) -> u64 {
+    let kern_end_in_ram = (0..info.memory_map_count as usize).any(|i| {
+        let r = &info.memory_map[i];
+        r.region_type == MEM_AVAILABLE
+            && kern_end_phys > r.base
+            && kern_end_phys <= r.base + r.length
     });
 
-    // ---- Phase 2: Compute memory layout under the FRAME_ALLOC lock ----
+    if info.kernel_virt_base != 0 || !kern_end_in_ram {
+        let mut best_size: u64 = 0;
+        let mut placement: u64 = 0;
+        for i in 0..info.memory_map_count as usize {
+            let region = &info.memory_map[i];
+            if region.region_type != MEM_AVAILABLE {
+                continue;
+            }
+            let rbase = align_up_page(region.base);
+            let rend = (region.base + region.length) & !(PAGE_SIZE - 1);
+            if rend > rbase && (rend - rbase) > best_size && (rend - rbase) >= needed {
+                best_size = rend - rbase;
+                placement = rbase;
+            }
+        }
+        if placement != 0 {
+            return placement;
+        }
+    }
+
+    // Identity-mapped boot fallback: bitmap+heap go right after the kernel.
+    align_up_page(kern_end_phys)
+}
+
+/// Initialise the frame allocator from the boot memory map. Returns the
+/// physical address where the heap should be placed (immediately after the
+/// bitmap). Reserves the kernel image and bitmap in the allocator before
+/// returning.
+fn init_frame_allocator(info: &BootInfo, kern_end_phys: u64) -> u64 {
     let mut fa = FRAME_ALLOC.lock();
     fa.total_memory = 0;
     let mut max_physical_addr: u64 = 0;
@@ -259,66 +298,18 @@ pub fn init(info: *const BootInfo) {
         max_physical_addr
     );
 
-    // When the kernel is linked in the higher half (Limine boot),
-    // _kernel_end is a virtual address like 0xFFFFFFFF801xxxxx.
-    // Compute the physical end using the phys/virt base from BootInfo.
-    let kern_end_ptr = &raw const _kernel_end as u64;
-    let kern_end_phys = if info.kernel_virt_base != 0 {
-        info.kernel_phys_base + (kern_end_ptr - info.kernel_virt_base)
-    } else {
-        kern_end_ptr
-    };
-
     fa.total_frames = max_physical_addr / PAGE_SIZE;
     let bitmap_byte_size = Bitmap::byte_size(fa.total_frames);
     fa.bitmap.num_bits = fa.total_frames;
 
-    // Find where to place the bitmap + heap.
     let needed = align_up_page(bitmap_byte_size) + HEAP_SIZE as u64;
-    let mut placement_phys: u64 = 0;
-
-    // Check whether kern_end falls within any available memory region.
-    // If YES (QEMU: kernel loaded inside RAM): place right after kernel.
-    // If NO  (VZ: kernel image at 0x0, RAM at 0x70000000): search for the
-    //         largest available region so the heap lands in actual RAM.
-    let kern_end_in_ram = (0..info.memory_map_count as usize).any(|i| {
-        let r = &info.memory_map[i];
-        r.region_type == MEM_AVAILABLE
-            && kern_end_phys > r.base
-            && kern_end_phys <= r.base + r.length
-    });
-
-    if info.kernel_virt_base != 0 || !kern_end_in_ram {
-        // Higher-half (Limine) OR kernel not in available RAM (VZ):
-        // find the largest available region with enough space.
-        let mut best_size: u64 = 0;
-        for i in 0..info.memory_map_count as usize {
-            let region = &info.memory_map[i];
-            if region.region_type != MEM_AVAILABLE {
-                continue;
-            }
-            let rbase = align_up_page(region.base);
-            let rend = (region.base + region.length) & !(PAGE_SIZE - 1);
-            if rend > rbase && (rend - rbase) > best_size && (rend - rbase) >= needed {
-                best_size = rend - rbase;
-                placement_phys = rbase;
-            }
-        }
-    }
-
-    if placement_phys == 0 {
-        // Identity-mapped boot (kernel in RAM): place bitmap+heap after kernel image.
-        placement_phys = align_up_page(kern_end_phys);
-    }
-
-    let bitmap_phys = placement_phys;
+    let bitmap_phys = pick_placement_phys(info, kern_end_phys, needed);
     fa.bitmap.data = (info.hhdm_offset + bitmap_phys) as *mut u8;
 
-    // Start: all frames used (0xFF = all bits set)
+    // Start: all frames used (0xFF = all bits set), then free available regions.
     unsafe { fa.bitmap.fill(0xFF); }
     fa.used_frames = fa.total_frames;
 
-    // ---- Phase 3: Free available regions from memory map ----
     for i in 0..info.memory_map_count as usize {
         let region = &info.memory_map[i];
         if region.region_type != MEM_AVAILABLE {
@@ -337,13 +328,13 @@ pub fn init(info: *const BootInfo) {
         }
     }
 
-    // Reserve kernel image (physical) + bitmap
-    unsafe {
-        fa.mark_frames_used(info.kernel_phys_base, kern_end_phys);
-    }
+    // Reserve kernel image + bitmap.
     let bitmap_end_phys = bitmap_phys + align_up_page(bitmap_byte_size);
     unsafe {
+        fa.mark_frames_used(info.kernel_phys_base, kern_end_phys);
         fa.mark_frames_used(bitmap_phys, bitmap_end_phys);
+        // Reserve heap pages now while we still hold the frame-allocator lock.
+        fa.mark_frames_used(bitmap_end_phys, bitmap_end_phys + HEAP_SIZE as u64);
     }
 
     klog!(
@@ -352,23 +343,18 @@ pub fn init(info: *const BootInfo) {
         fa.total_frames - fa.used_frames
     );
 
-    // ---- Phase 4: Set up the kernel heap ----
-    let heap_phys = bitmap_end_phys;
-    let heap_start = (info.hhdm_offset + heap_phys) as *mut u8;
+    bitmap_end_phys
+}
 
-    // Mark heap pages as used in the frame allocator (still under fa lock).
-    unsafe {
-        fa.mark_frames_used(heap_phys, heap_phys + HEAP_SIZE as u64);
-    }
-    drop(fa); // release frame allocator before taking heap lock
-
+/// Set up the kernel heap as a single large free block at `heap_phys`.
+fn init_heap(hhdm_offset: u64, heap_phys: u64) {
+    let heap_start = (hhdm_offset + heap_phys) as *mut u8;
     let mut heap = HEAP.lock();
     heap.start = heap_start;
-    // SAFETY: heap_start was just allocated above; HEAP_SIZE bytes are
-    // reserved for us in the frame allocator.
+    // SAFETY: heap_start points to HEAP_SIZE bytes that init_frame_allocator
+    // already reserved in the frame allocator.
     unsafe {
         heap.end = heap.start.add(HEAP_SIZE);
-        // Initialize the heap with a single large free block
         heap.head = heap.start as *mut BlockHeader;
         (*heap.head).size = (HEAP_SIZE - core::mem::size_of::<BlockHeader>()) as u64;
         (*heap.head).next = ptr::null_mut();
@@ -380,6 +366,23 @@ pub fn init(info: *const BootInfo) {
         HEAP_SIZE / 1024,
         heap_phys
     );
+}
+
+pub fn init(info: *const BootInfo) {
+    // SAFETY: caller passes a valid BootInfo pointer that lives for the
+    // duration of init. Init runs single-threaded on the BSP before any
+    // AP starts, so the locks below are taken without contention.
+    let info = unsafe { &*info };
+
+    ADDR_SPACE.init(AddressSpace {
+        hhdm_offset: info.hhdm_offset,
+        kernel_phys_base: info.kernel_phys_base,
+        kernel_virt_base: info.kernel_virt_base,
+    });
+
+    let kern_end_phys = kernel_end_phys(info);
+    let heap_phys = init_frame_allocator(info, kern_end_phys);
+    init_heap(info.hhdm_offset, heap_phys);
 }
 
 pub fn alloc_frame() -> u64 {
