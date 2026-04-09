@@ -3,10 +3,17 @@
 /// Busy-wait for approximately `us` microseconds.
 #[cfg(target_arch = "x86_64")]
 pub fn udelay(us: u32) {
-    static mut TSC_PER_US: u64 = 0;
+    // Calibration cache: TSC ticks per microsecond. AtomicU64 because
+    // multiple cores may call udelay() concurrently and the first call
+    // calibrates. The calibration result is a constant property of the
+    // host so a benign double-calibrate is harmless; the atomic just
+    // makes the publish/observe race-free at the language level.
+    static TSC_PER_US: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
 
-    unsafe {
-        if TSC_PER_US == 0 {
+    let mut tsc_per_us = TSC_PER_US.load(core::sync::atomic::Ordering::Relaxed);
+    if tsc_per_us == 0 {
+        unsafe {
             const PIT_COUNT: u16 = 11932; // ~10ms
             let gate = x86_inb(0x61);
             x86_outb(0x61, (gate & 0xFD) | 0x01);
@@ -21,12 +28,13 @@ pub fn udelay(us: u32) {
                 core::arch::asm!("nop");
             }
             let elapsed = x86_rdtsc() - start;
-            TSC_PER_US = if elapsed / 10000 == 0 { 1 } else { elapsed / 10000 };
+            tsc_per_us = if elapsed / 10000 == 0 { 1 } else { elapsed / 10000 };
         }
-        let end = x86_rdtsc() + TSC_PER_US * (us as u64);
-        while x86_rdtsc() < end {
-            core::arch::asm!("pause", options(nomem, nostack));
-        }
+        TSC_PER_US.store(tsc_per_us, core::sync::atomic::Ordering::Relaxed);
+    }
+    let end = x86_rdtsc() + tsc_per_us * (us as u64);
+    while x86_rdtsc() < end {
+        unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
     }
 }
 
