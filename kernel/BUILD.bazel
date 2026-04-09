@@ -10,6 +10,7 @@ rust_library(
         "deque.rs",
         "eventloop.rs",
         "lib.rs",
+        "once.rs",
         "percpu.rs",
         "spsc.rs",
         "timer.rs",
@@ -57,6 +58,13 @@ rust_test(
     name = "spsc_test",
     srcs = ["spsc.rs"],
     crate_root = "spsc.rs",
+    rustc_flags = ["-Cpanic=unwind"],
+)
+
+rust_test(
+    name = "once_test",
+    srcs = ["once.rs"],
+    crate_root = "once.rs",
     rustc_flags = ["-Cpanic=unwind"],
 )
 
