@@ -788,7 +788,13 @@ pub fn has_pending_tx() -> bool {
 pub fn flush_tx_staging() {
     // On VZ, restrict flushing to core 0 to avoid concurrent VirtIO TX access.
     // The load/store TX_LOCK cannot safely exclude APs from racing with core 0.
+    // Instead, wake core 0 so it flushes on our behalf — otherwise core 0 stays
+    // in WFI waiting for a VirtIO RX interrupt that can't arrive until the client
+    // receives the response, causing a deadlock.
     if cfg!(vz_compat) && kernel::cpu_id() != 0 {
+        if TX_PENDING.load(Ordering::Acquire) {
+            kernel::wake_core0();
+        }
         return;
     }
     if !TX_PENDING.load(Ordering::Acquire) {
