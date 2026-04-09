@@ -7,7 +7,6 @@
 // Initialises every subsystem in dependency order, then calls uni_main().
 
 #![no_std]
-#![allow(static_mut_refs)]
 #![allow(unused_imports)]
 
 use core::ptr;
@@ -571,13 +570,16 @@ pub unsafe extern "C" fn kernel_main(boot_info_addr: u64) {
             mmu::map_device_range(fdt.gic_redist_base, n * 0x20000);
         }
 
-        boot_shim_fdt::shim(&mut G_BOOT_INFO, boot_info_addr);
+        // SAFETY: G_BOOT_INFO is touched only here during single-
+        // threaded boot before any AP starts. Reborrow through a raw
+        // pointer to satisfy the static_mut_refs lint.
+        boot_shim_fdt::shim(&mut *(&raw mut G_BOOT_INFO), boot_info_addr);
     }
 
     #[cfg(target_arch = "x86_64")]
-    boot_shim_x86::shim(&mut G_BOOT_INFO, boot_info_addr);
+    boot_shim_x86::shim(&mut *(&raw mut G_BOOT_INFO), boot_info_addr);
 
-    kernel_boot(&G_BOOT_INFO);
+    kernel_boot(&*(&raw const G_BOOT_INFO));
     }
 }
 

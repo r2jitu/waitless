@@ -11,7 +11,6 @@
 // before calling our entry point.
 
 #![no_std]
-#![allow(static_mut_refs)]
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }
@@ -264,36 +263,42 @@ static mut LIMINE_BOOT_INFO: BootInfo = BootInfo {
 #[unsafe(no_mangle)]
 pub extern "C" fn limine_entry_cpp() {
     unsafe {
-        LIMINE_BOOT_INFO.protocol = Protocol::Limine;
-        LIMINE_BOOT_INFO.memory_map_count = 0;
-        LIMINE_BOOT_INFO.dtb_addr = 0;
-        LIMINE_BOOT_INFO.kernel_phys_base = 0;
-        LIMINE_BOOT_INFO.kernel_virt_base = 0;
-        LIMINE_BOOT_INFO.hhdm_offset = 0;
+        // Build the BootInfo in a local first; commit to LIMINE_BOOT_INFO
+        // once at the end. This avoids forming an `&mut LIMINE_BOOT_INFO`
+        // and lets the file build with `static_mut_refs` denied.
+        let mut info = BootInfo {
+            protocol: Protocol::Limine,
+            memory_map_count: 0,
+            memory_map: [MemoryRegion { base: 0, length: 0, region_type: 0, _pad: 0 }; MAX_MEMORY_REGIONS],
+            dtb_addr: 0,
+            kernel_phys_base: 0,
+            kernel_virt_base: 0,
+            hhdm_offset: 0,
+        };
 
         // HHDM offset — Limine revision 3 dropped identity mapping of first 4GB.
         // All physical memory must be accessed via HHDM: virt = hhdm_offset + phys.
-        let hhdm_resp = core::ptr::read_volatile(&HHDM_REQUEST.response);
+        let hhdm_resp = core::ptr::read_volatile(&raw const HHDM_REQUEST.response);
         if !hhdm_resp.is_null() {
-            LIMINE_BOOT_INFO.hhdm_offset = (*hhdm_resp).offset;
+            info.hhdm_offset = (*hhdm_resp).offset;
         }
 
         // Kernel address — needed by mm::init() to compute physical addresses.
-        let kaddr_resp = core::ptr::read_volatile(&KADDR_REQUEST.response);
+        let kaddr_resp = core::ptr::read_volatile(&raw const KADDR_REQUEST.response);
         if !kaddr_resp.is_null() {
-            LIMINE_BOOT_INFO.kernel_phys_base = (*kaddr_resp).physical_base;
-            LIMINE_BOOT_INFO.kernel_virt_base = (*kaddr_resp).virtual_base;
+            info.kernel_phys_base = (*kaddr_resp).physical_base;
+            info.kernel_virt_base = (*kaddr_resp).virtual_base;
         }
 
         // Memory map
-        let memmap_resp = core::ptr::read_volatile(&MEMMAP_REQUEST.response);
+        let memmap_resp = core::ptr::read_volatile(&raw const MEMMAP_REQUEST.response);
         if !memmap_resp.is_null() {
             let resp = &*memmap_resp;
             let mut count = 0i32;
             for i in 0..resp.entry_count {
                 if count as usize >= MAX_MEMORY_REGIONS { break; }
                 let entry = *resp.entries.add(i as usize);
-                LIMINE_BOOT_INFO.memory_map[count as usize] = MemoryRegion {
+                info.memory_map[count as usize] = MemoryRegion {
                     base: (*entry).base,
                     length: (*entry).length,
                     region_type: match (*entry).entry_type {
@@ -304,27 +309,29 @@ pub extern "C" fn limine_entry_cpp() {
                 };
                 count += 1;
             }
-            LIMINE_BOOT_INFO.memory_map_count = count;
+            info.memory_map_count = count;
         }
 
         // aarch64: DTB for FDT-based device discovery
         #[cfg(target_arch = "aarch64")]
         {
-            let dtb_resp = core::ptr::read_volatile(&DTB_REQUEST.response);
+            let dtb_resp = core::ptr::read_volatile(&raw const DTB_REQUEST.response);
             if !dtb_resp.is_null() {
-                LIMINE_BOOT_INFO.dtb_addr = (*dtb_resp).dtb_ptr;
+                info.dtb_addr = (*dtb_resp).dtb_ptr;
             }
 
             // Parse FDT and map PCIe ECAM before serial::init()
-            if LIMINE_BOOT_INFO.dtb_addr != 0 {
-                fdt::init(LIMINE_BOOT_INFO.dtb_addr);
-                let info = &*fdt::info_ptr();
-                if info.pcie_ecam_base != 0 && info.pcie_ecam_size != 0 {
-                    mmu::map_device_range(info.pcie_ecam_base, info.pcie_ecam_size);
+            if info.dtb_addr != 0 {
+                fdt::init(info.dtb_addr);
+                let fdt_info = &*fdt::info_ptr();
+                if fdt_info.pcie_ecam_base != 0 && fdt_info.pcie_ecam_size != 0 {
+                    mmu::map_device_range(fdt_info.pcie_ecam_base, fdt_info.pcie_ecam_size);
                 }
             }
         }
 
-        kernel_boot_from_bootinfo(&LIMINE_BOOT_INFO);
+        // Commit the populated BootInfo to the static and call into the kernel.
+        core::ptr::write(&raw mut LIMINE_BOOT_INFO, info);
+        kernel_boot_from_bootinfo(&raw const LIMINE_BOOT_INFO);
     }
 }
