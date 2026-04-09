@@ -124,11 +124,35 @@ impl NetDevice {
     };
 }
 
-static mut NET: NetDevice = NetDevice::ZEROED;
+/// Driver state singleton.
+///
+/// Wrapped in `UnsafeCell` so cross-core access is via raw-pointer place
+/// expressions (`(*ndev()).foo`) rather than via `&mut NetDevice`. Forming
+/// `&mut NetDevice` from multiple cores would alias even when the
+/// underlying memory accesses target disjoint per-qp slots — undefined
+/// behaviour by the Rust aliasing model regardless of whether they
+/// actually overlap.
+///
+/// Per-field SPSC/ownership rules (e.g. "rx_queues[qp] is owned by the
+/// core whose id == qp under Tier 1 multi-queue") are documented at the
+/// access sites; the wrapper just makes "no &mut NetDevice" enforceable
+/// at the syntactic level.
+struct NetCell(core::cell::UnsafeCell<NetDevice>);
+unsafe impl Sync for NetCell {}
+
+static NET: NetCell = NetCell(core::cell::UnsafeCell::new(NetDevice::ZEROED));
+
+/// Raw pointer to the driver state. Use as `(*ndev()).field` so the
+/// place expression yields a `&mut Field` directly without going via
+/// `&mut NetDevice`.
+#[inline(always)]
+fn ndev() -> *mut NetDevice {
+    NET.0.get()
+}
 
 /// Get the number of active queue pairs.
 pub fn num_queue_pairs() -> u16 {
-    unsafe { NET.num_queue_pairs }
+    unsafe { (*ndev()).num_queue_pairs }
 }
 
 // ---- Modern PCI init (VZ.framework + QEMU modern) --------------------------
@@ -192,7 +216,7 @@ fn init_pci_modern() -> bool {
         let rx_notify_off = vpci_get_queue_notify_off(dev);
         let rx_notify = vpci_queue_notify_addr(dev, rx_notify_off);
         let rx_addrs = unsafe {
-            match NET.rx_queues[pair].init_pci_modern(rx_qsize, rx_notify, rx_qi) {
+            match (*ndev()).rx_queues[pair].init_pci_modern(rx_qsize, rx_notify, rx_qi) {
                 Some(a) => a,
                 None => {
                     log(b"virtio_net: failed to init RX queue\n");
@@ -210,7 +234,7 @@ fn init_pci_modern() -> bool {
         let tx_notify_off = vpci_get_queue_notify_off(dev);
         let tx_notify = vpci_queue_notify_addr(dev, tx_notify_off);
         let tx_addrs = unsafe {
-            match NET.tx_queues[pair].init_pci_modern(tx_qsize, tx_notify, tx_qi) {
+            match (*ndev()).tx_queues[pair].init_pci_modern(tx_qsize, tx_notify, tx_qi) {
                 Some(a) => a,
                 None => {
                     log(b"virtio_net: failed to init TX queue\n");
@@ -232,12 +256,12 @@ fn init_pci_modern() -> bool {
             let ctrl_notify_off = vpci_get_queue_notify_off(dev);
             let ctrl_notify = vpci_queue_notify_addr(dev, ctrl_notify_off);
             let ctrl_addrs = unsafe {
-                match NET.ctrl_queue.init_pci_modern(ctrl_qsize, ctrl_notify, ctrl_qi) {
+                match (*ndev()).ctrl_queue.init_pci_modern(ctrl_qsize, ctrl_notify, ctrl_qi) {
                     Some(a) => a,
                     None => {
                         log(b"virtio_net: failed to init CTRL queue\n");
                         // Non-fatal: fall back to single queue
-                        NET.num_queue_pairs = 1; NET.has_mq = false;
+                        (*ndev()).num_queue_pairs = 1; (*ndev()).has_mq = false;
                         (0, 0, 0) // won't be used
                     }
                 }
@@ -252,13 +276,13 @@ fn init_pci_modern() -> bool {
     // EVENT_IDX
     if (guest_features & VIRTIO_RING_F_EVENT_IDX) != 0 {
         for pair in 0..num_pairs as usize {
-            unsafe { NET.rx_queues[pair].event_idx = true; }
+            unsafe { (*ndev()).rx_queues[pair].event_idx = true; }
         }
     }
 
     // Read MAC
     for i in 0..6u32 {
-        unsafe { NET.mac[i as usize] = vpci_read_dev_cfg8(dev, i); }
+        unsafe { (*ndev()).mac[i as usize] = vpci_read_dev_cfg8(dev, i); }
     }
 
     // Allocate and populate RX buffers for all queue pairs
@@ -273,9 +297,9 @@ fn init_pci_modern() -> bool {
             let buf = unsafe { alloc.add(2) };
             unsafe {
                 ptr::write_bytes(buf, 0, VIRTIO_NET_HDR_SIZE);
-                NET.qp_state[pair].rx_buffers[i] = buf;
+                (*ndev()).qp_state[pair].rx_buffers[i] = buf;
                 let buf_phys = virt_to_phys(buf);
-                NET.rx_queues[pair].add_buf(buf_phys, BUFFER_SIZE, 0, 1);
+                (*ndev()).rx_queues[pair].add_buf(buf_phys, BUFFER_SIZE, 0, 1);
             }
         }
     }
@@ -285,19 +309,19 @@ fn init_pci_modern() -> bool {
                          STATUS_FEATURES_OK | STATUS_DRIVER_OK);
 
     for pair in 0..num_pairs as usize {
-        unsafe { NET.rx_queues[pair].kick(); }
+        unsafe { (*ndev()).rx_queues[pair].kick(); }
     }
     vz_init_delay(); // VZ needs time after DRIVER_OK
 
     unsafe {
-        NET.transport = Transport::ModernPci { vpci_idx };
-        NET.guest_features = guest_features;
-        NET.num_queue_pairs = num_pairs;
-        NET.has_mq = has_mq && num_pairs > 1;
+        (*ndev()).transport = Transport::ModernPci { vpci_idx };
+        (*ndev()).guest_features = guest_features;
+        (*ndev()).num_queue_pairs = num_pairs;
+        (*ndev()).has_mq = has_mq && num_pairs > 1;
     }
 
     // Send MQ activation command via control VQ
-    if unsafe { NET.has_mq } {
+    if unsafe { (*ndev()).has_mq } {
         ctrl_mq_set_pairs(num_pairs);
     }
 
@@ -333,22 +357,22 @@ fn ctrl_mq_set_pairs(num_pairs: u16) {
         let cmd_phys = virt_to_phys(cmd_buf.as_ptr());
         let ack_phys = virt_to_phys(&ack as *const u8);
 
-        NET.ctrl_queue.add_buf(cmd_phys, 4, 1, 0);
-        NET.ctrl_queue.add_buf(ack_phys, 1, 0, 1);
-        NET.ctrl_queue.kick();
+        (*ndev()).ctrl_queue.add_buf(cmd_phys, 4, 1, 0);
+        (*ndev()).ctrl_queue.add_buf(ack_phys, 1, 0, 1);
+        (*ndev()).ctrl_queue.kick();
 
         // Wait for completion
         for _ in 0..1_000_000u32 {
-            if NET.ctrl_queue.get_used().is_some() { break; }
+            if (*ndev()).ctrl_queue.get_used().is_some() { break; }
         }
-        let _ = NET.ctrl_queue.get_used();
+        let _ = (*ndev()).ctrl_queue.get_used();
 
         if ack == 0 {
             log(b"virtio_net: MQ activated\n");
         } else {
             log(b"virtio_net: MQ activation failed\n");
-            NET.has_mq = false;
-            NET.num_queue_pairs = 1;
+            (*ndev()).has_mq = false;
+            (*ndev()).num_queue_pairs = 1;
         }
     }
 }
@@ -439,11 +463,11 @@ fn init_mmio() -> bool {
 
     // Init RX and TX queues
     unsafe {
-        if !NET.rx_queues[0].init_legacy(io_base, 0, true, is_v2) {
+        if !(*ndev()).rx_queues[0].init_legacy(io_base, 0, true, is_v2) {
             log(b"virtio_net: failed to init RX queue\n");
             return false;
         }
-        if !NET.tx_queues[0].init_legacy(io_base, 1, true, is_v2) {
+        if !(*ndev()).tx_queues[0].init_legacy(io_base, 1, true, is_v2) {
             log(b"virtio_net: failed to init TX queue\n");
             return false;
         }
@@ -453,12 +477,12 @@ fn init_mmio() -> bool {
     unsafe {
         let lo = virtio_read32(io_base + MMIO_DEVICE_CONFIG);
         let hi = virtio_read32(io_base + MMIO_DEVICE_CONFIG + 4);
-        NET.mac[0] = (lo & 0xff) as u8;
-        NET.mac[1] = ((lo >> 8) & 0xff) as u8;
-        NET.mac[2] = ((lo >> 16) & 0xff) as u8;
-        NET.mac[3] = ((lo >> 24) & 0xff) as u8;
-        NET.mac[4] = (hi & 0xff) as u8;
-        NET.mac[5] = ((hi >> 8) & 0xff) as u8;
+        (*ndev()).mac[0] = (lo & 0xff) as u8;
+        (*ndev()).mac[1] = ((lo >> 8) & 0xff) as u8;
+        (*ndev()).mac[2] = ((lo >> 16) & 0xff) as u8;
+        (*ndev()).mac[3] = ((lo >> 24) & 0xff) as u8;
+        (*ndev()).mac[4] = (hi & 0xff) as u8;
+        (*ndev()).mac[5] = ((hi >> 8) & 0xff) as u8;
     }
 
     // Allocate RX buffers
@@ -468,13 +492,13 @@ fn init_mmio() -> bool {
         let buf = unsafe { alloc.add(2) };
         unsafe {
             ptr::write_bytes(buf, 0, VIRTIO_NET_HDR_SIZE);
-            NET.qp_state[0].rx_buffers[i] = buf;
+            (*ndev()).qp_state[0].rx_buffers[i] = buf;
             let buf_phys = virt_to_phys(buf);
-            NET.rx_queues[0].add_buf(buf_phys, BUFFER_SIZE, 0, 1);
+            (*ndev()).rx_queues[0].add_buf(buf_phys, BUFFER_SIZE, 0, 1);
         }
     }
 
-    unsafe { NET.rx_queues[0].kick(); }
+    unsafe { (*ndev()).rx_queues[0].kick(); }
 
     // DRIVER_OK
     let mut final_status = (STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_DRIVER_OK) as u32;
@@ -482,8 +506,8 @@ fn init_mmio() -> bool {
     unsafe { virtio_write32(io_base + MMIO_STATUS, final_status); }
 
     unsafe {
-        NET.transport = Transport::Mmio { base: io_base, is_v2 };
-        NET.guest_features = guest_features;
+        (*ndev()).transport = Transport::Mmio { base: io_base, is_v2 };
+        (*ndev()).guest_features = guest_features;
     }
     log(b"virtio_net: initialization complete (MMIO)\n");
     true
@@ -554,11 +578,11 @@ fn init_legacy_pci() -> bool {
 
     // Init RX and TX queues
     unsafe {
-        if !NET.rx_queues[0].init_legacy(io_base, 0, false, false) {
+        if !(*ndev()).rx_queues[0].init_legacy(io_base, 0, false, false) {
             log(b"virtio_net: failed to init RX queue\n");
             return false;
         }
-        if !NET.tx_queues[0].init_legacy(io_base, 1, false, false) {
+        if !(*ndev()).tx_queues[0].init_legacy(io_base, 1, false, false) {
             log(b"virtio_net: failed to init TX queue\n");
             return false;
         }
@@ -566,7 +590,7 @@ fn init_legacy_pci() -> bool {
 
     // Read MAC
     for i in 0..6u64 {
-        unsafe { NET.mac[i as usize] = virtio_read8(io_base + VREG_DEVICE_CONFIG + i); }
+        unsafe { (*ndev()).mac[i as usize] = virtio_read8(io_base + VREG_DEVICE_CONFIG + i); }
     }
 
     // Allocate RX buffers (no +2 alignment shift on x86)
@@ -575,13 +599,13 @@ fn init_legacy_pci() -> bool {
         if buf.is_null() { return false; }
         unsafe {
             ptr::write_bytes(buf, 0, VIRTIO_NET_HDR_SIZE);
-            NET.qp_state[0].rx_buffers[i] = buf;
+            (*ndev()).qp_state[0].rx_buffers[i] = buf;
             let buf_phys = virt_to_phys(buf);
-            NET.rx_queues[0].add_buf(buf_phys, BUFFER_SIZE, 0, 1);
+            (*ndev()).rx_queues[0].add_buf(buf_phys, BUFFER_SIZE, 0, 1);
         }
     }
 
-    unsafe { NET.rx_queues[0].kick(); }
+    unsafe { (*ndev()).rx_queues[0].kick(); }
 
     // DRIVER_OK
     unsafe {
@@ -590,8 +614,8 @@ fn init_legacy_pci() -> bool {
     }
 
     unsafe {
-        NET.transport = Transport::LegacyPci { base: io_base, pci_idx };
-        NET.guest_features = guest_features;
+        (*ndev()).transport = Transport::LegacyPci { base: io_base, pci_idx };
+        (*ndev()).guest_features = guest_features;
     }
     log(b"virtio_net: initialization complete (legacy PCI)\n");
     true
@@ -600,13 +624,13 @@ fn init_legacy_pci() -> bool {
 // ---- TX drain ---------------------------------------------------------------
 
 fn tx_drain_qp(qp: usize) {
-    let pool_phys = unsafe { virt_to_phys(NET.qp_state[qp].tx_pool.as_ptr() as *const u8) };
+    let pool_phys = unsafe { virt_to_phys((*ndev()).qp_state[qp].tx_pool.as_ptr() as *const u8) };
     unsafe {
-        while let Some((used_id, _used_len)) = NET.tx_queues[qp].get_used() {
-            let d = NET.tx_queues[qp].desc(used_id);
+        while let Some((used_id, _used_len)) = (*ndev()).tx_queues[qp].get_used() {
+            let d = (*ndev()).tx_queues[qp].desc(used_id);
             let slot = ((d.addr - pool_phys) / core::mem::size_of::<TxBuf>() as u64) as usize;
             if slot < TX_POOL_SIZE {
-                NET.qp_state[qp].tx_pool_used[slot] = false;
+                (*ndev()).qp_state[qp].tx_pool_used[slot] = false;
             }
         }
     }
@@ -628,10 +652,10 @@ unsafe extern "C" fn irq_handler_x86(_frame: *mut kernel::x86_64::idt::Interrupt
 fn irq_handler(_irq: u32) {
     unsafe {
         // NAPI: disable notifications on entry
-        NET.rx_queues[0].disable_interrupts();
+        (*ndev()).rx_queues[0].disable_interrupts();
 
         // Acknowledge device interrupt
-        match NET.transport {
+        match (*ndev()).transport {
             Transport::ModernPci { vpci_idx } => {
                 vpci_read_isr(&VPCI_DEVICES[vpci_idx]);
             }
@@ -672,7 +696,7 @@ pub fn init() -> bool {
 
 pub fn get_mac(mac_out: *mut u8) {
     unsafe {
-        ptr::copy_nonoverlapping(NET.mac.as_ptr(), mac_out, 6);
+        ptr::copy_nonoverlapping((*ndev()).mac.as_ptr(), mac_out, 6);
     }
 }
 
@@ -680,7 +704,7 @@ pub fn get_mac(mac_out: *mut u8) {
 fn send_on_qp(qp: usize, data: &[u8]) {
     if data.is_empty() { return; }
     unsafe {
-        if let Transport::None = NET.transport { return; }
+        if let Transport::None = (*ndev()).transport { return; }
     }
     let len = data.len() as u32;
     let frame_len = if len > MAX_ETH_FRAME as u32 { MAX_ETH_FRAME as u32 } else { len };
@@ -691,7 +715,7 @@ fn send_on_qp(qp: usize, data: &[u8]) {
     let slot = loop {
         let mut found = None;
         for i in 0..TX_POOL_SIZE {
-            if unsafe { !NET.qp_state[qp].tx_pool_used[i] } {
+            if unsafe { !(*ndev()).qp_state[qp].tx_pool_used[i] } {
                 found = Some(i);
                 break;
             }
@@ -702,8 +726,8 @@ fn send_on_qp(qp: usize, data: &[u8]) {
     };
 
     unsafe {
-        NET.qp_state[qp].tx_pool_used[slot] = true;
-        let buf = &mut NET.qp_state[qp].tx_pool[slot];
+        (*ndev()).qp_state[qp].tx_pool_used[slot] = true;
+        let buf = &mut (*ndev()).qp_state[qp].tx_pool[slot];
         buf.hdr.flags = 0;
         buf.hdr.gso_type = 0;
         buf.hdr.hdr_len = 0;
@@ -716,13 +740,13 @@ fn send_on_qp(qp: usize, data: &[u8]) {
 
         let total_len = VIRTIO_NET_HDR_SIZE as u32 + frame_len;
         let buf_phys = virt_to_phys(buf as *const TxBuf as *const u8);
-        let head = NET.tx_queues[qp].add_buf(buf_phys, total_len, 1, 0);
+        let head = (*ndev()).tx_queues[qp].add_buf(buf_phys, total_len, 1, 0);
         if head < 0 {
-            NET.qp_state[qp].tx_pool_used[slot] = false;
+            (*ndev()).qp_state[qp].tx_pool_used[slot] = false;
             return;
         }
 
-        NET.tx_queues[qp].kick();
+        (*ndev()).tx_queues[qp].kick();
     }
 }
 
@@ -758,7 +782,7 @@ fn tx_unlock() {
 /// Any core can flush staging via flush_tx_staging().
 pub fn send(data: &[u8]) {
     let id = kernel::cpu_id();
-    let nqp = unsafe { NET.num_queue_pairs };
+    let nqp = unsafe { (*ndev()).num_queue_pairs };
     if nqp > 1 && (id as u16) < nqp {
         // Tier 1: send directly on this core's queue pair. No locking needed.
         send_on_qp(id as usize, data);
@@ -845,7 +869,7 @@ pub fn poll_if_safe(callback: fn(&[u8])) -> i32 {
 /// Poll a specific queue pair for received frames.
 pub fn poll_qp(qp: usize, callback: fn(&[u8])) -> i32 {
     unsafe {
-        if let Transport::None = NET.transport { return 0; }
+        if let Transport::None = (*ndev()).transport { return 0; }
     }
 
     if kernel::percpu::num_cores() <= 1 {
@@ -857,8 +881,8 @@ pub fn poll_qp(qp: usize, callback: fn(&[u8])) -> i32 {
 
     let mut count: i32 = 0;
     unsafe {
-        while let Some((used_id, used_len)) = NET.rx_queues[qp].get_used() {
-            let desc = NET.rx_queues[qp].desc(used_id);
+        while let Some((used_id, used_len)) = (*ndev()).rx_queues[qp].get_used() {
+            let desc = (*ndev()).rx_queues[qp].desc(used_id);
             let buf = phys_to_virt(desc.addr);
 
             if used_len > VIRTIO_NET_HDR_SIZE as u32 {
@@ -870,16 +894,16 @@ pub fn poll_qp(qp: usize, callback: fn(&[u8])) -> i32 {
 
             // Re-arm RX buffer
             let buf_phys = virt_to_phys(buf);
-            NET.rx_queues[qp].add_buf(buf_phys, BUFFER_SIZE, 0, 1);
+            (*ndev()).rx_queues[qp].add_buf(buf_phys, BUFFER_SIZE, 0, 1);
             count += 1;
         }
 
         if count > 0 {
-            NET.rx_queues[qp].kick();
+            (*ndev()).rx_queues[qp].kick();
         }
         // Re-arm EVENT_IDX: update used_event to current used->idx so VZ fires
         // the next interrupt when the next frame arrives.
-        NET.rx_queues[qp].enable_interrupts();
+        (*ndev()).rx_queues[qp].enable_interrupts();
     }
 
     count
@@ -936,7 +960,7 @@ pub fn poll_batch_qp(qp: usize, batch: &mut RxBatch) {
     batch.count = 0;
 
     unsafe {
-        if let Transport::None = NET.transport { return; }
+        if let Transport::None = (*ndev()).transport { return; }
     }
 
     // Drain TX completions (under lock when multi-core).
@@ -949,11 +973,11 @@ pub fn poll_batch_qp(qp: usize, batch: &mut RxBatch) {
 
     unsafe {
         while batch.count < BATCH_SIZE {
-            let (used_id, used_len) = match NET.rx_queues[qp].get_used() {
+            let (used_id, used_len) = match (*ndev()).rx_queues[qp].get_used() {
                 Some(v) => v,
                 None => break,
             };
-            let desc = NET.rx_queues[qp].desc(used_id);
+            let desc = (*ndev()).rx_queues[qp].desc(used_id);
             let buf = phys_to_virt(desc.addr);
 
             if used_len > VIRTIO_NET_HDR_SIZE as u32 {
@@ -972,11 +996,11 @@ pub fn poll_batch_qp(qp: usize, batch: &mut RxBatch) {
 
             // Re-arm RX buffer
             let buf_phys = virt_to_phys(buf);
-            NET.rx_queues[qp].add_buf(buf_phys, BUFFER_SIZE, 0, 1);
+            (*ndev()).rx_queues[qp].add_buf(buf_phys, BUFFER_SIZE, 0, 1);
         }
 
         if batch.count > 0 {
-            NET.rx_queues[0].kick();
+            (*ndev()).rx_queues[0].kick();
         }
     }
 }
@@ -987,22 +1011,22 @@ pub fn enable_irq() {
         {
             let fdt = fdt::info();
 
-            match NET.transport {
+            match (*ndev()).transport {
                 Transport::ModernPci { vpci_idx } if fdt.gic_dist_base != 0 => {
                     let slot = PCI_DEVICES[VPCI_DEVICES[vpci_idx].pci_idx].slot;
                     let intid = if (slot as usize) < 8 { fdt.pci_irqs[slot as usize] } else { 0 };
                     if intid != 0 {
-                        NET.rx_queues[0].enable_interrupts();
+                        (*ndev()).rx_queues[0].enable_interrupts();
                         exceptions::register_irq(intid, irq_handler);
-                        NET.irq_idle_available = true;
+                        (*ndev()).irq_idle_available = true;
                     }
                 }
                 Transport::Mmio { base, .. } if fdt.gic_dist_base != 0 => {
                     for i in 0..fdt.virtio_count as usize {
                         if fdt.virtio_bases[i] == base && fdt.virtio_irqs[i] != 0 {
-                            NET.rx_queues[0].enable_interrupts();
+                            (*ndev()).rx_queues[0].enable_interrupts();
                             exceptions::register_irq(fdt.virtio_irqs[i], irq_handler);
-                            NET.irq_idle_available = true;
+                            (*ndev()).irq_idle_available = true;
                             break;
                         }
                     }
@@ -1013,15 +1037,15 @@ pub fn enable_irq() {
 
         #[cfg(target_arch = "x86_64")]
         {
-            if let Transport::LegacyPci { pci_idx, .. } = NET.transport {
+            if let Transport::LegacyPci { pci_idx, .. } = (*ndev()).transport {
                 let dev = &PCI_DEVICES[pci_idx];
                 let irq_reg = read_config(dev.bus, dev.slot, dev.func, 0x3C);
                 let irq_line = (irq_reg & 0xFF) as u8;
                 if irq_line < 16 {
-                    NET.rx_queues[0].enable_interrupts();
+                    (*ndev()).rx_queues[0].enable_interrupts();
                     kernel::x86_64::idt::register_handler(32 + irq_line, irq_handler_x86);
                     kernel::x86_64::idt::enable_irq(irq_line);
-                    NET.irq_idle_available = true;
+                    (*ndev()).irq_idle_available = true;
                 }
             }
         }
@@ -1029,13 +1053,13 @@ pub fn enable_irq() {
 }
 
 pub fn irq_idle_supported() -> bool {
-    unsafe { NET.irq_idle_available }
+    unsafe { (*ndev()).irq_idle_available }
 }
 
 pub fn arm_rx_interrupts() {
-    unsafe { NET.rx_queues[0].enable_interrupts(); }
+    unsafe { (*ndev()).rx_queues[0].enable_interrupts(); }
 }
 
 pub fn has_pending_rx() -> bool {
-    unsafe { NET.rx_queues[0].has_used() }
+    unsafe { (*ndev()).rx_queues[0].has_used() }
 }
