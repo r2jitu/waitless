@@ -226,6 +226,50 @@ mod aarch64 {
 
 static SHUTDOWN_REQUESTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Serial-write spinlock. Serialises whole `puts`/`putc` calls so multi-core
+/// log output isn't interleaved or torn (the underlying COM1/PL011 ports
+/// take a single byte per cycle, but the VirtIO console backend has a
+/// shared TX descriptor ring that races on `static mut` indices if two
+/// cores write concurrently).
+///
+/// On QEMU/KVM and x86_64 use real CAS. On vz_compat (atomic RMW faults
+/// on guest RAM) skip the lock entirely and instead restrict console
+/// output to the BSP only — APs return without printing. This preserves
+/// the previous aarch64 behaviour while removing the latent
+/// `static mut`-based data race for everyone else.
+#[cfg(not(vz_compat))]
+static SERIAL_TX_LOCK: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(not(vz_compat))]
+fn serial_lock() {
+    use core::sync::atomic::Ordering;
+    while SERIAL_TX_LOCK
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+}
+
+#[cfg(not(vz_compat))]
+fn serial_unlock() {
+    SERIAL_TX_LOCK.store(false, core::sync::atomic::Ordering::Release);
+}
+
+/// On vz_compat we cannot take a real lock; restrict console TX to the BSP.
+#[cfg(vz_compat)]
+fn vz_is_bsp() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let mpidr: u64;
+        core::arch::asm!("mrs {}, MPIDR_EL1", out(reg) mpidr, options(nomem, nostack));
+        (mpidr & 0xFF) == 0
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    { true }
+}
+
 pub fn init() {
     unsafe {
         #[cfg(target_arch = "x86_64")]
@@ -236,30 +280,60 @@ pub fn init() {
 }
 
 pub fn putc(c: u8) {
-    unsafe {
-        #[cfg(target_arch = "x86_64")]
-        x86::putc(c);
-        #[cfg(target_arch = "aarch64")]
-        aarch64::putc(c);
+    #[cfg(vz_compat)]
+    {
+        if !vz_is_bsp() { return; }
+        unsafe {
+            #[cfg(target_arch = "x86_64")]
+            x86::putc(c);
+            #[cfg(target_arch = "aarch64")]
+            aarch64::putc(c);
+        }
+    }
+    #[cfg(not(vz_compat))]
+    {
+        serial_lock();
+        unsafe {
+            #[cfg(target_arch = "x86_64")]
+            x86::putc(c);
+            #[cfg(target_arch = "aarch64")]
+            aarch64::putc(c);
+        }
+        serial_unlock();
     }
 }
 
 pub fn puts(s: &[u8]) {
-    // VZ.framework doesn't support exclusive load/store instructions (LDXR/STXR),
-    // so a spinlock on the VirtIO console TX is not possible. Prevent concurrent
-    // access by allowing only core 0 to write. APs read MPIDR_EL1.Aff0 directly
-    // (no TPIDR_EL1 initialization required — MPIDR is a hardware register).
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        let mpidr: u64;
-        core::arch::asm!("mrs {}, MPIDR_EL1", out(reg) mpidr, options(nomem, nostack));
-        if (mpidr & 0xFF) != 0 { return; }
-    }
-    for &c in s {
-        if c == b'\n' {
-            putc(b'\r');
+    #[cfg(vz_compat)]
+    {
+        if !vz_is_bsp() { return; }
+        for &c in s {
+            if c == b'\n' { unsafe {
+                #[cfg(target_arch = "x86_64")] x86::putc(b'\r');
+                #[cfg(target_arch = "aarch64")] aarch64::putc(b'\r');
+            }}
+            unsafe {
+                #[cfg(target_arch = "x86_64")] x86::putc(c);
+                #[cfg(target_arch = "aarch64")] aarch64::putc(c);
+            }
         }
-        putc(c);
+    }
+    #[cfg(not(vz_compat))]
+    {
+        // Take the lock once around the whole string so multi-core log lines
+        // don't interleave at byte granularity.
+        serial_lock();
+        for &c in s {
+            if c == b'\n' { unsafe {
+                #[cfg(target_arch = "x86_64")] x86::putc(b'\r');
+                #[cfg(target_arch = "aarch64")] aarch64::putc(b'\r');
+            }}
+            unsafe {
+                #[cfg(target_arch = "x86_64")] x86::putc(c);
+                #[cfg(target_arch = "aarch64")] aarch64::putc(c);
+            }
+        }
+        serial_unlock();
     }
 }
 

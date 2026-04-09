@@ -51,10 +51,18 @@ static mut CON_BASE: u64 = 0; // non-zero = initialized
 static mut CON_PCI_MODE: bool = false;
 static mut CON_TX_NOTIFY: u64 = 0;
 static mut CON_RX_NOTIFY: u64 = 0;
-static mut CON_TX_AVAIL_IDX: u16 = 0;
-static mut CON_TX_LAST_USED: u16 = 0;
-static mut CON_RX_AVAIL_IDX: u16 = 0;
-static mut CON_RX_LAST_USED: u16 = 0;
+
+// TX/RX ring index state. Atomic so cross-core access is data-race-free at
+// the language level. The actual TX serialisation is done by the caller
+// (kernel::serial holds a spinlock around the whole `puts`/`putc` call on
+// QEMU/KVM, and restricts to BSP-only on vz_compat). Atomic ops here defend
+// against future callers that bypass that lock and let Miri verify the
+// soundness of any concurrent test.
+use core::sync::atomic::{AtomicU16, Ordering};
+static CON_TX_AVAIL_IDX: AtomicU16 = AtomicU16::new(0);
+static CON_TX_LAST_USED: AtomicU16 = AtomicU16::new(0);
+static CON_RX_AVAIL_IDX: AtomicU16 = AtomicU16::new(0);
+static CON_RX_LAST_USED: AtomicU16 = AtomicU16::new(0);
 
 
 // Ring accessors using raw pointer arithmetic
@@ -154,10 +162,10 @@ fn con_init_mmio(base_addr: u64) -> bool {
             ptr::write_volatile(con_desc_len(&mut CON_RX_MEM, i), 1);
             ptr::write_volatile(con_desc_flags(&mut CON_RX_MEM, i), VIRTQ_DESC_F_WRITE);
             ptr::write_volatile(con_avail_ring(&mut CON_RX_MEM, i), i as u16);
-            CON_RX_AVAIL_IDX += 1;
         }
+        CON_RX_AVAIL_IDX.store(CON_QS as u16, Ordering::Relaxed);
         dsb_st();
-        ptr::write_volatile(con_avail_idx_reg(&mut CON_RX_MEM), CON_RX_AVAIL_IDX);
+        ptr::write_volatile(con_avail_idx_reg(&mut CON_RX_MEM), CON_QS as u16);
         dsb_sy();
         mmio_write32(base_addr + MMIO_QUEUE_NOTIFY, 0);
 
@@ -250,10 +258,10 @@ fn con_init_pci() -> bool {
             ptr::write_volatile(con_desc_len(&mut CON_RX_MEM, i), 1);
             ptr::write_volatile(con_desc_flags(&mut CON_RX_MEM, i), VIRTQ_DESC_F_WRITE);
             ptr::write_volatile(con_avail_ring(&mut CON_RX_MEM, i), i as u16);
-            CON_RX_AVAIL_IDX += 1;
         }
+        CON_RX_AVAIL_IDX.store(CON_QS as u16, Ordering::Relaxed);
         dsb_st();
-        ptr::write_volatile(con_avail_idx_reg(&mut CON_RX_MEM), CON_RX_AVAIL_IDX);
+        ptr::write_volatile(con_avail_idx_reg(&mut CON_RX_MEM), CON_QS as u16);
         dsb_sy();
 
         // TX descriptor 0
@@ -286,10 +294,16 @@ fn con_putc(c: u8) {
     unsafe {
         if CON_BASE == 0 { return; }
 
+        let mut tx_avail = CON_TX_AVAIL_IDX.load(Ordering::Relaxed);
+        let mut tx_last = CON_TX_LAST_USED.load(Ordering::Relaxed);
+
         // Spin until previous TX completes
-        while CON_TX_LAST_USED < CON_TX_AVAIL_IDX {
+        while tx_last < tx_avail {
             let u = ptr::read_volatile(con_used_idx_reg(&CON_TX_MEM));
-            if u != CON_TX_LAST_USED { CON_TX_LAST_USED = u; }
+            if u != tx_last {
+                tx_last = u;
+                CON_TX_LAST_USED.store(u, Ordering::Relaxed);
+            }
             #[cfg(target_arch = "aarch64")]
             asm!("yield", options(nostack, preserves_flags));
             #[cfg(target_arch = "x86_64")]
@@ -299,11 +313,12 @@ fn con_putc(c: u8) {
         CON_TX_BUF[0] = c;
 
         dsb_st();
-        let slot = (CON_TX_AVAIL_IDX % CON_QS as u16) as usize;
+        let slot = (tx_avail % CON_QS as u16) as usize;
         ptr::write_volatile(con_avail_ring(&mut CON_TX_MEM, slot), 0);
         dsb_st();
-        ptr::write_volatile(con_avail_idx_reg(&mut CON_TX_MEM), CON_TX_AVAIL_IDX + 1);
-        CON_TX_AVAIL_IDX += 1;
+        ptr::write_volatile(con_avail_idx_reg(&mut CON_TX_MEM), tx_avail + 1);
+        tx_avail += 1;
+        CON_TX_AVAIL_IDX.store(tx_avail, Ordering::Relaxed);
         dsb_sy();
 
         // Kick TX queue
@@ -314,13 +329,14 @@ fn con_putc(c: u8) {
         }
 
         // Spin until TX completes
-        while ptr::read_volatile(con_used_idx_reg(&CON_TX_MEM)) == CON_TX_LAST_USED {
+        while ptr::read_volatile(con_used_idx_reg(&CON_TX_MEM)) == tx_last {
             #[cfg(target_arch = "aarch64")]
             asm!("yield", options(nostack, preserves_flags));
             #[cfg(target_arch = "x86_64")]
             asm!("pause", options(nostack, preserves_flags));
         }
-        CON_TX_LAST_USED = ptr::read_volatile(con_used_idx_reg(&CON_TX_MEM));
+        let new_last = ptr::read_volatile(con_used_idx_reg(&CON_TX_MEM));
+        CON_TX_LAST_USED.store(new_last, Ordering::Relaxed);
     }
 }
 
@@ -328,13 +344,15 @@ fn con_try_getc() -> i32 {
     unsafe {
         if CON_BASE == 0 { return -1; }
 
+        let rx_last = CON_RX_LAST_USED.load(Ordering::Relaxed);
         let used_idx = ptr::read_volatile(con_used_idx_reg(&CON_RX_MEM));
-        if used_idx == CON_RX_LAST_USED { return -1; }
+        if used_idx == rx_last { return -1; }
 
-        let slot = (CON_RX_LAST_USED % CON_QS as u16) as usize;
+        let slot = (rx_last % CON_QS as u16) as usize;
         let desc_id = ptr::read_volatile(con_used_ring_id(&CON_RX_MEM, slot)) as usize;
         let c = CON_RX_BUFS[desc_id] as i32;
-        CON_RX_LAST_USED += 1;
+        let new_rx_last = rx_last + 1;
+        CON_RX_LAST_USED.store(new_rx_last, Ordering::Relaxed);
 
         // Resubmit descriptor
         ptr::write_volatile(con_desc_addr(&mut CON_RX_MEM, desc_id),
@@ -342,12 +360,13 @@ fn con_try_getc() -> i32 {
         ptr::write_volatile(con_desc_len(&mut CON_RX_MEM, desc_id), 1);
         ptr::write_volatile(con_desc_flags(&mut CON_RX_MEM, desc_id), VIRTQ_DESC_F_WRITE);
 
+        let rx_avail = CON_RX_AVAIL_IDX.load(Ordering::Relaxed);
         dsb_st();
-        let avail_slot = (CON_RX_AVAIL_IDX % CON_QS as u16) as usize;
+        let avail_slot = (rx_avail % CON_QS as u16) as usize;
         ptr::write_volatile(con_avail_ring(&mut CON_RX_MEM, avail_slot), desc_id as u16);
         dsb_st();
-        ptr::write_volatile(con_avail_idx_reg(&mut CON_RX_MEM), CON_RX_AVAIL_IDX + 1);
-        CON_RX_AVAIL_IDX += 1;
+        ptr::write_volatile(con_avail_idx_reg(&mut CON_RX_MEM), rx_avail + 1);
+        CON_RX_AVAIL_IDX.store(rx_avail + 1, Ordering::Relaxed);
         dsb_sy();
 
         // Kick RX queue
