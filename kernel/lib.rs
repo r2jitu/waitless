@@ -7,6 +7,7 @@
 #![allow(static_mut_refs)]
 
 pub mod types;
+pub mod sync;
 pub mod serial;
 pub mod mm;
 pub mod kbox;

@@ -15,6 +15,7 @@ rust_library(
         "once.rs",
         "percpu.rs",
         "spsc.rs",
+        "sync.rs",
         "timer.rs",
         "mm.rs",
         "serial.rs",
@@ -67,6 +68,13 @@ rust_test(
     name = "once_test",
     srcs = ["once.rs"],
     crate_root = "once.rs",
+    rustc_flags = ["-Cpanic=unwind"],
+)
+
+rust_test(
+    name = "sync_test",
+    srcs = ["sync.rs"],
+    crate_root = "sync.rs",
     rustc_flags = ["-Cpanic=unwind"],
 )
 
