@@ -193,14 +193,17 @@ fn distribute_frame(frame: &[u8]) {
                         }
                     } else {
                         // Distribute to target core's RX inbox.
-                        unsafe {
-                            let core = percpu::get(target);
-                            if core.rx_inbox.push(frame) {
-                                WAKEUP[target as usize].store(
-                                    true,
-                                    core::sync::atomic::Ordering::Relaxed,
-                                );
-                            }
+                        // SAFETY: percpu::init() runs before any AP starts;
+                        // target is bounded by num_cores. The inbox uses
+                        // SPSC discipline (single producer = the distributor
+                        // here, single consumer = the target core's
+                        // net_drain_cb).
+                        let core = unsafe { percpu::get(target) };
+                        if core.rx_inbox.push(frame) {
+                            WAKEUP[target as usize].store(
+                                true,
+                                core::sync::atomic::Ordering::Relaxed,
+                            );
                         }
                     }
                 }

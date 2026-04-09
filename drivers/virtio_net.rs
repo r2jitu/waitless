@@ -771,7 +771,8 @@ static TX_LOCK: kernel::sync::Spinlock<()> = kernel::sync::Spinlock::new(());
 /// Tier 2 (single-queue): core sends directly if single-core, stages if multi-core.
 /// Any core can flush staging via flush_tx_staging().
 pub fn send(data: &[u8]) {
-    let id = kernel::cpu_id();
+    let cc = kernel::percpu::CurrentCore::enter();
+    let id = cc.id();
     let nqp = unsafe { (*ndev()).num_queue_pairs };
     if nqp > 1 && (id as u16) < nqp {
         // Tier 1: send directly on this core's queue pair. No locking needed.
@@ -783,9 +784,7 @@ pub fn send(data: &[u8]) {
         // Tier 2 multi-core: always stage. The load/store lock isn't safe
         // for concurrent VirtIO TX queue access (race window between load
         // and store). Staging is lock-free (per-core buffers).
-        unsafe {
-            kernel::percpu::get(id).tx_staging.push(data);
-        }
+        cc.percore().tx_staging.push(data);
         TX_PENDING.store(true, Ordering::Release);
     }
 }
