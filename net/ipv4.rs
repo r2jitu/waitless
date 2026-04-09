@@ -37,8 +37,28 @@ pub struct Ipv4Packet<'a> {
     pub payload: &'a [u8],
 }
 
-// Volatile, not atomic — see SEQ_COUNTER comment in tcp.rs.
+/// IPv4 packet identification counter. Atomic on QEMU/KVM; on vz_compat
+/// (atomic RMW faults on guest RAM) fall back to volatile read+write,
+/// where duplicates across cores are harmless for fragmentation.
+#[cfg(not(vz_compat))]
+static IP_ID_COUNTER: core::sync::atomic::AtomicU16 =
+    core::sync::atomic::AtomicU16::new(1);
+#[cfg(vz_compat)]
 static mut IP_ID_COUNTER: u16 = 1;
+
+#[inline]
+fn next_ip_id() -> u16 {
+    #[cfg(not(vz_compat))]
+    {
+        IP_ID_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(vz_compat)]
+    unsafe {
+        let id = core::ptr::read_volatile(&IP_ID_COUNTER);
+        core::ptr::write_volatile(&raw mut IP_ID_COUNTER, id.wrapping_add(1));
+        id
+    }
+}
 
 pub fn ipv4_send(dst: Ipv4Addr, proto: u8, payload: &[u8]) {
     let payload_len = payload.len().min(1480);
@@ -48,13 +68,12 @@ pub fn ipv4_send(dst: Ipv4Addr, proto: u8, payload: &[u8]) {
     // MaybeUninit avoids zeroing — we fill header + payload before send.
     let mut buf = core::mem::MaybeUninit::<[u8; 1500]>::uninit();
     let buf_ptr = buf.as_mut_ptr() as *mut u8;
+    let ip_id = next_ip_id();
     unsafe {
         let hdr = &mut *(buf_ptr as *mut Ipv4Header);
         hdr.version_ihl = 0x45;
         hdr.tos = 0;
         hdr.total_length = htons(total_len as u16);
-        let ip_id = core::ptr::read_volatile(&IP_ID_COUNTER);
-        core::ptr::write_volatile(&raw mut IP_ID_COUNTER, ip_id.wrapping_add(1));
         hdr.identification = htons(ip_id);
         hdr.flags_fragment = htons(0x4000);
         hdr.ttl = 64;

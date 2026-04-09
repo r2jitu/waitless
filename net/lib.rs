@@ -26,8 +26,12 @@ use kernel::percpu;
 /// Whether multi-core distribution has been initialized.
 static MULTICORE_INIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// Wakeup flags — set during distribution, cleared each poll cycle.
-static mut WAKEUP: [bool; percpu::MAX_CORES] = [false; percpu::MAX_CORES];
+/// Wakeup flags — set during distribution, cleared each poll cycle. The
+/// distributor is single-threaded (only the lock holder writes), but
+/// every core wakes up afterwards and reads the flags, so atomic load/
+/// store removes the language-level data race.
+static WAKEUP: [core::sync::atomic::AtomicBool; percpu::MAX_CORES] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; percpu::MAX_CORES];
 
 /// RX poll lock: 0 = free, 1 = held. Uses load/store (not CAS) because
 /// VZ.framework rejects all atomic RMW on guest RAM. The lock is best-effort:
@@ -35,10 +39,21 @@ static mut WAKEUP: [bool; percpu::MAX_CORES] = [false; percpu::MAX_CORES];
 /// quickly so the race window is tiny and the worst case is a redundant poll.
 static RX_LOCK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-// Diagnostic counters (volatile, not atomic — VZ compat)
+/// Diagnostic counters. Atomic (Relaxed) on QEMU/KVM; volatile RMW on
+/// vz_compat where atomic RMW faults — best-effort either way.
+#[cfg(not(vz_compat))]
+static RX_LOCK_GOT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(not(vz_compat))]
+static RX_LOCK_MISS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(not(vz_compat))]
+static FRAMES_DISTRIBUTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(vz_compat)]
 static mut RX_LOCK_GOT: u64 = 0;
+#[cfg(vz_compat)]
 static mut RX_LOCK_MISS: u64 = 0;
+#[cfg(vz_compat)]
 static mut FRAMES_DISTRIBUTED: u64 = 0;
+
 
 /// Poll the network device and dispatch received frames through the
 /// full stack: Ethernet -> ARP/IPv4 -> TCP/UDP.
@@ -85,19 +100,29 @@ fn poll_tier2(num_cores: u32) -> bool {
             core::sync::atomic::Ordering::Relaxed).is_ok()
     };
     if !got_lock {
-        unsafe { RX_LOCK_MISS += 1; }
+        #[cfg(not(vz_compat))]
+        { RX_LOCK_MISS.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
+        #[cfg(vz_compat)]
+        unsafe {
+            let v = core::ptr::read_volatile(&RX_LOCK_MISS);
+            core::ptr::write_volatile(&raw mut RX_LOCK_MISS, v.wrapping_add(1));
+        }
         return false;
     }
-    unsafe { RX_LOCK_GOT += 1; }
+    #[cfg(not(vz_compat))]
+    { RX_LOCK_GOT.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
+    #[cfg(vz_compat)]
+    unsafe {
+        let v = core::ptr::read_volatile(&RX_LOCK_GOT);
+        core::ptr::write_volatile(&raw mut RX_LOCK_GOT, v.wrapping_add(1));
+    }
 
     // Flush TX staging first — responses from previous cycle.
     drivers::virtio_net::flush_tx_staging();
 
     // Poll VirtIO RX and distribute directly (no batch buffer copy).
-    unsafe {
-        for i in 0..num_cores as usize {
-            WAKEUP[i] = false;
-        }
+    for i in 0..num_cores as usize {
+        WAKEUP[i].store(false, core::sync::atomic::Ordering::Relaxed);
     }
 
     let count = drivers::virtio_net::poll(distribute_frame);
@@ -107,12 +132,17 @@ fn poll_tier2(num_cores: u32) -> bool {
 
     let had_frames = count > 0;
     if had_frames {
-        unsafe { FRAMES_DISTRIBUTED += count as u64; }
+        #[cfg(not(vz_compat))]
+        { FRAMES_DISTRIBUTED.fetch_add(count as u64, core::sync::atomic::Ordering::Relaxed); }
+        #[cfg(vz_compat)]
         unsafe {
-            let any_wakeup = (1..num_cores as usize).any(|i| WAKEUP[i]);
-            if any_wakeup {
-                kernel::wake_cores();
-            }
+            let v = core::ptr::read_volatile(&FRAMES_DISTRIBUTED);
+            core::ptr::write_volatile(&raw mut FRAMES_DISTRIBUTED, v.wrapping_add(count as u64));
+        }
+        let any_wakeup = (1..num_cores as usize)
+            .any(|i| WAKEUP[i].load(core::sync::atomic::Ordering::Relaxed));
+        if any_wakeup {
+            kernel::wake_cores();
         }
     }
 
@@ -167,7 +197,10 @@ fn distribute_frame(frame: &[u8]) {
                         unsafe {
                             let core = percpu::get(target);
                             if core.rx_inbox.push(frame) {
-                                WAKEUP[target as usize] = true;
+                                WAKEUP[target as usize].store(
+                                    true,
+                                    core::sync::atomic::Ordering::Relaxed,
+                                );
                             }
                         }
                     }
