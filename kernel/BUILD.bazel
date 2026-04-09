@@ -11,6 +11,7 @@ rust_library(
         "eventloop.rs",
         "kbox.rs",
         "lib.rs",
+        "mmio.rs",
         "once.rs",
         "percpu.rs",
         "spsc.rs",

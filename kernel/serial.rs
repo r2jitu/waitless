@@ -98,17 +98,26 @@ mod x86 {
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64 {
-    use core::ptr;
-
     use crate::aarch64::fdt;
+    use crate::mmio::{self, ReadOnly, ReadWrite, WriteOnly};
 
-    // PL011 register offsets
-    const PL011_DR: u64 = 0x000;    // Data register
-    const PL011_FR: u64 = 0x018;    // Flag register
-    const PL011_IBRD: u64 = 0x024;  // Integer baud rate divisor
-    const PL011_FBRD: u64 = 0x028;  // Fractional baud rate divisor
-    const PL011_LCR_H: u64 = 0x02C; // Line control
-    const PL011_CR: u64 = 0x030;    // Control
+    // ── PL011 PrimeCell UART register layout ──────────────────────────────
+    //
+    // Per ARM PrimeCell PL011 r1p5 TRM. Only the registers we use are
+    // accessed; the rest are reserved-but-named for clarity.
+    #[repr(C)]
+    struct Pl011Regs {
+        dr: ReadWrite<u32>,            // 0x000 Data register
+        _rsr_ecr: u32,                 // 0x004 Receive Status / Error Clear
+        _reserved0: [u32; 4],          // 0x008–0x014
+        fr: ReadOnly<u32>,             // 0x018 Flag register
+        _reserved1: u32,               // 0x01C
+        _ilpr: u32,                    // 0x020
+        ibrd: WriteOnly<u32>,          // 0x024 Integer baud rate divisor
+        fbrd: WriteOnly<u32>,          // 0x028 Fractional baud rate divisor
+        lcr_h: WriteOnly<u32>,         // 0x02C Line control
+        cr: ReadWrite<u32>,            // 0x030 Control
+    }
 
     const FR_TXFF: u32 = 1 << 5; // TX FIFO full
     const FR_RXFE: u32 = 1 << 4; // RX FIFO empty
@@ -125,9 +134,21 @@ mod aarch64 {
     static BACKEND: core::sync::atomic::AtomicU8 =
         core::sync::atomic::AtomicU8::new(BACKEND_NONE);
 
-    /// PL011 MMIO base. Set in `pl011_init`; read by every PL011 access.
-    static UART_BASE: core::sync::atomic::AtomicU64 =
+    /// Resolved PL011 register handle. Populated by `pl011_init` after
+    /// FDT discovery; read by every PL011 access. Stored as the raw
+    /// base address (AtomicU64) since the typed reference can't go
+    /// into a static directly without an unsafe const initializer.
+    static PL011_BASE: core::sync::atomic::AtomicU64 =
         core::sync::atomic::AtomicU64::new(0);
+
+    #[inline(always)]
+    fn pl011() -> &'static Pl011Regs {
+        let base = PL011_BASE.load(core::sync::atomic::Ordering::Relaxed);
+        // SAFETY: PL011_BASE is set exactly once in pl011_init from a
+        // valid FDT-discovered MMIO base; subsequent loads return the
+        // same address. The Pl011Regs layout matches the ARM TRM.
+        unsafe { mmio::at::<Pl011Regs>(base) }
+    }
 
     unsafe extern "C" {
         fn pci_init();
@@ -137,32 +158,15 @@ mod aarch64 {
         fn virtio_console_try_getc() -> i32;
     }
 
-    #[inline(always)]
-    unsafe fn pl011_read(off: u64) -> u32 {
-        unsafe {
-            let base = UART_BASE.load(core::sync::atomic::Ordering::Relaxed);
-            ptr::read_volatile((base + off) as *const u32)
-        }
-    }
-
-    #[inline(always)]
-    unsafe fn pl011_write(off: u64, val: u32) {
-        unsafe {
-            let base = UART_BASE.load(core::sync::atomic::Ordering::Relaxed);
-            ptr::write_volatile((base + off) as *mut u32, val);
-        }
-    }
-
-    unsafe fn pl011_init(base: u64) {
-        unsafe {
-            UART_BASE.store(base, core::sync::atomic::Ordering::Release);
-            pl011_write(PL011_CR, 0);           // disable UART
-            pl011_write(PL011_IBRD, 13);        // 115200 @ 24 MHz
-            pl011_write(PL011_FBRD, 1);
-            pl011_write(PL011_LCR_H, (3 << 5) | (1 << 4)); // 8N1, FIFO on
-            pl011_write(PL011_CR, CR_UARTEN | CR_TXE | CR_RXE);
-            BACKEND.store(BACKEND_PL011, core::sync::atomic::Ordering::Release);
-        }
+    fn pl011_init(base: u64) {
+        PL011_BASE.store(base, core::sync::atomic::Ordering::Release);
+        let r = pl011();
+        r.cr.write(0);                      // disable UART
+        r.ibrd.write(13);                   // 115200 @ 24 MHz
+        r.fbrd.write(1);
+        r.lcr_h.write((3 << 5) | (1 << 4)); // 8N1, FIFO on
+        r.cr.write(CR_UARTEN | CR_TXE | CR_RXE);
+        BACKEND.store(BACKEND_PL011, core::sync::atomic::Ordering::Release);
     }
 
     pub unsafe fn init() {
@@ -199,32 +203,30 @@ mod aarch64 {
     }
 
     pub unsafe fn putc(c: u8) {
-        unsafe {
-            match BACKEND.load(core::sync::atomic::Ordering::Acquire) {
-                BACKEND_VIRTIO => virtio_console_putc(c),
-                BACKEND_PL011 => {
-                    // Wait for TX FIFO not full
-                    while (pl011_read(PL011_FR) & FR_TXFF) != 0 {}
-                    pl011_write(PL011_DR, c as u32);
-                }
-                _ => {}
+        match BACKEND.load(core::sync::atomic::Ordering::Acquire) {
+            BACKEND_VIRTIO => unsafe { virtio_console_putc(c) },
+            BACKEND_PL011 => {
+                let r = pl011();
+                // Wait for TX FIFO not full
+                while (r.fr.read() & FR_TXFF) != 0 {}
+                r.dr.write(c as u32);
             }
+            _ => {}
         }
     }
 
     pub unsafe fn try_getc() -> i32 {
-        unsafe {
-            match BACKEND.load(core::sync::atomic::Ordering::Acquire) {
-                BACKEND_VIRTIO => virtio_console_try_getc(),
-                BACKEND_PL011 => {
-                    if (pl011_read(PL011_FR) & FR_RXFE) == 0 {
-                        (pl011_read(PL011_DR) & 0xFF) as i32
-                    } else {
-                        -1
-                    }
+        match BACKEND.load(core::sync::atomic::Ordering::Acquire) {
+            BACKEND_VIRTIO => unsafe { virtio_console_try_getc() },
+            BACKEND_PL011 => {
+                let r = pl011();
+                if (r.fr.read() & FR_RXFE) == 0 {
+                    (r.dr.read() & 0xFF) as i32
+                } else {
+                    -1
                 }
-                _ => -1,
             }
+            _ => -1,
         }
     }
 }

@@ -13,13 +13,77 @@
 #[cfg(target_arch = "aarch64")]
 mod aarch64 {
     use core::arch::asm;
-    use core::ptr;
 
     use crate::aarch64::fdt;
+    use crate::mmio::{self, ReadOnly, ReadWrite};
     use crate::once::InitOnce;
     use crate::serial;
 
-    // ---- GIC register bases (filled from FDT at init time) ----------------
+    // ---- GIC register layouts ─────────────────────────────────────────────
+    //
+    // Per ARM Generic Interrupt Controller v2/v3 architecture spec. Only
+    // the registers actually accessed by this driver are named; the rest
+    // are explicit `_pad` arrays so the offsets compile-check against the
+    // struct layout.
+
+    /// GIC distributor register block. Covers offsets 0x0000..0x0BFF
+    /// (the part this driver touches outside of IROUTER). IROUTER lives
+    /// at +0x6100 and is accessed via a separate helper since putting it
+    /// in this struct would require ~21KB of `_pad`.
+    #[repr(C)]
+    struct GicdRegs {
+        ctlr: ReadWrite<u32>,              // 0x000
+        typer: ReadOnly<u32>,              // 0x004
+        _pad_008: [u32; 30],               // 0x008..0x07F
+        _igroupr: [ReadWrite<u32>; 32],    // 0x080..0x0FF (kept for layout)
+        isenabler: [ReadWrite<u32>; 32],   // 0x100..0x17F
+        icenabler: [ReadWrite<u32>; 32],   // 0x180..0x1FF
+        _pad_200: [u32; 32],               // 0x200..0x27F (ISPENDR)
+        icpendr: [ReadWrite<u32>; 32],     // 0x280..0x2FF
+        _pad_300: [u32; 64],               // 0x300..0x3FF
+        ipriorityr: [ReadWrite<u32>; 256], // 0x400..0x7FF
+        itargetsr: [ReadWrite<u32>; 256],  // 0x800..0xBFF (GICv2 only for SPIs)
+    }
+
+    // We do also write a GICv3 SPI router at offset 0x6100+8*intid. That's
+    // 21 KB beyond the end of GicdRegs; put it in its own struct anchored
+    // at +0x6100 from the distributor base.
+    #[repr(C)]
+    struct GicdIrouter {
+        irouter: [ReadWrite<u64>; 988],    // 0x6100..0x7FD0 (32..1019 SPIs)
+    }
+
+    /// GICv2 CPU interface register block (also used as the per-CPU
+    /// interface accessed via the banked alias).
+    #[repr(C)]
+    struct GiccRegs {
+        ctlr: ReadWrite<u32>,              // 0x000
+        pmr: ReadWrite<u32>,               // 0x004
+        _bpr: u32,                         // 0x008
+        iar: ReadOnly<u32>,                // 0x00C
+        eoir: ReadWrite<u32>,              // 0x010
+    }
+
+    /// GICv3 redistributor frame: top 64KB for the RD region (we only
+    /// touch GICR_WAKER at offset 0x014). The SGI/PPI configuration
+    /// frame lives at +0x10000 from the same base.
+    #[repr(C)]
+    struct GicrRdFrame {
+        _pad_000: [u32; 5],                // 0x000..0x013
+        waker: ReadWrite<u32>,             // 0x014
+    }
+
+    #[repr(C)]
+    struct GicrSgiFrame {
+        _pad_000: [u32; 64],               // 0x000..0x0FF
+        isenabler0: ReadWrite<u32>,        // 0x100 (corresponds to GICD_ISENABLER0 in the SGI frame)
+    }
+
+    // Compile-time layout assertions.
+    const _: () = assert!(core::mem::size_of::<GicdRegs>() == 0xC00);
+    const _: () = assert!(core::mem::size_of::<GiccRegs>() == 0x14);
+    const _: () = assert!(core::mem::offset_of!(GicrRdFrame, waker) == 0x14);
+    const _: () = assert!(core::mem::offset_of!(GicrSgiFrame, isenabler0) == 0x100);
 
     /// Resolved GIC bases. Populated exactly once on the BSP via `init()`
     /// before any AP starts; read by every core for MMIO access.
@@ -36,67 +100,29 @@ mod aarch64 {
     #[inline] fn gicr_base() -> u64 { GIC.get().gicr_base }
     #[inline] fn gic_version() -> u8 { GIC.get().version }
 
-    // ---- Distributor registers --------------------------------------------
-
-    const GICD_CTLR: u32 = 0x000;
-    const GICD_TYPER: u32 = 0x004;
-    const GICD_IGROUPR0: u32 = 0x080;
-    const GICD_ISENABLER0: u32 = 0x100;
-    const GICD_ICENABLER0: u32 = 0x180;
-    const GICD_ICPENDR0: u32 = 0x280;
-    const GICD_IPRIORITYR0: u32 = 0x400;
-    const GICD_ITARGETSR0: u32 = 0x800; // GICv2 only
+    #[inline]
+    fn gicd() -> &'static GicdRegs {
+        // SAFETY: GIC is initialised once via init(); the address comes
+        // from the FDT and matches the GIC distributor layout.
+        unsafe { mmio::at::<GicdRegs>(gicd_base()) }
+    }
+    #[inline]
+    fn gicd_irouter() -> &'static GicdIrouter {
+        unsafe { mmio::at::<GicdIrouter>(gicd_base() + 0x6100) }
+    }
+    #[inline]
+    fn gicc() -> &'static GiccRegs {
+        unsafe { mmio::at::<GiccRegs>(gicc_base()) }
+    }
 
     // GICv3 distributor CTLR bits
     const GICD_CTLR_ARE_NS: u32 = 1 << 4;
     const GICD_CTLR_ENABLE_GRP1_NS: u32 = 1 << 1;
 
-    // GICv3: SPI affinity routing
-    const GICD_IROUTER_BASE: u32 = 0x6100; // first SPI = INTID 32
-
-    // ---- GICv2 CPU interface registers ------------------------------------
-
-    const GICC_CTLR: u32 = 0x000;
-    const GICC_PMR: u32 = 0x004;
-    const GICC_IAR: u32 = 0x00C;
-    const GICC_EOIR: u32 = 0x010;
-
-    // ---- GICv3 redistributor registers ------------------------------------
-
-    const GICR_WAKER: u32 = 0x014;
-    const GICR_SGI_BASE: u32 = 0x10000;
-
-    // ---- MMIO helpers -----------------------------------------------------
-
-    #[inline(always)]
-    unsafe fn gicd_read(off: u32) -> u32 {
-        unsafe { ptr::read_volatile((gicd_base() + off as u64) as *const u32) }
-    }
-
-    #[inline(always)]
-    unsafe fn gicd_write(off: u32, val: u32) {
-        unsafe { ptr::write_volatile((gicd_base() + off as u64) as *mut u32, val); }
-    }
-
-    #[inline(always)]
-    unsafe fn gicc_read(off: u32) -> u32 {
-        unsafe { ptr::read_volatile((gicc_base() + off as u64) as *const u32) }
-    }
-
-    #[inline(always)]
-    unsafe fn gicc_write(off: u32, val: u32) {
-        unsafe { ptr::write_volatile((gicc_base() + off as u64) as *mut u32, val); }
-    }
-
-    #[inline(always)]
-    unsafe fn gicr_read(off: u32) -> u32 {
-        unsafe { ptr::read_volatile((gicr_base() + off as u64) as *const u32) }
-    }
-
-    #[inline(always)]
-    unsafe fn gicr_write(off: u32, val: u32) {
-        unsafe { ptr::write_volatile((gicr_base() + off as u64) as *mut u32, val); }
-    }
+    /// Per-CPU redistributor frame stride (RD + SGI = 0x20000).
+    const GICR_FRAME_STRIDE: u64 = 0x20000;
+    /// Offset from RD frame base to SGI/PPI configuration frame.
+    const GICR_SGI_OFFSET: u64 = 0x10000;
 
     // ---- IRQ handler table ------------------------------------------------
 
@@ -137,7 +163,7 @@ mod aarch64 {
                     asm!("msr ICC_EOIR1_EL1, {}", in(reg) iar);
                 }
             } else if ver == 2 {
-                let iar = gicc_read(GICC_IAR);
+                let iar = gicc().iar.read();
                 let irq = iar & 0x3FF;
                 if irq < 1020 {
                     if (irq as usize) < MAX_IRQS {
@@ -145,7 +171,7 @@ mod aarch64 {
                             handler(irq);
                         }
                     }
-                    gicc_write(GICC_EOIR, iar);
+                    gicc().eoir.write(iar);
                 }
             }
             // GIC_VERSION == 0: no GIC, WFI woke us, nothing to ack
@@ -185,95 +211,105 @@ mod aarch64 {
     // ---- GICv2 initialisation ---------------------------------------------
 
     unsafe fn init_gicv2() {
-        unsafe {
-        // Disable distributor while configuring
-        gicd_write(GICD_CTLR, 0);
-        asm!("dsb sy", options(nostack));
+        let d = gicd();
+        let c = gicc();
 
-        let typer = gicd_read(GICD_TYPER);
+        // Disable distributor while configuring
+        d.ctlr.write(0);
+        unsafe { asm!("dsb sy", options(nostack)); }
+
+        let typer = d.typer.read();
         let it_lines = (typer & 0x1F) + 1;
         let num_irqs = it_lines * 32;
 
-        for i in 0..num_irqs / 32 {
-            gicd_write(GICD_IGROUPR0 + i * 4, 0x0000_0000);   // Group 0
-            gicd_write(GICD_ICENABLER0 + i * 4, 0xFFFF_FFFF); // All disabled
-            gicd_write(GICD_ICPENDR0 + i * 4, 0xFFFF_FFFF);   // Clear pending
+        for i in 0..(num_irqs / 32) as usize {
+            d._igroupr[i].write(0x0000_0000);   // Group 0
+            d.icenabler[i].write(0xFFFF_FFFF);  // All disabled
+            d.icpendr[i].write(0xFFFF_FFFF);    // Clear pending
         }
-        for i in 0..num_irqs / 4 {
-            gicd_write(GICD_IPRIORITYR0 + i * 4, 0xA0A0_A0A0);
-            gicd_write(GICD_ITARGETSR0 + i * 4, 0x0101_0101);
+        for i in 0..(num_irqs / 4) as usize {
+            d.ipriorityr[i].write(0xA0A0_A0A0);
+            d.itargetsr[i].write(0x0101_0101);
         }
 
-        gicd_write(GICD_CTLR, 1);
-        gicc_write(GICC_PMR, 0xFF);
-        gicc_write(GICC_CTLR, 1);
-        asm!("dsb sy", "isb", options(nostack));
+        d.ctlr.write(1);
+        c.pmr.write(0xFF);
+        c.ctlr.write(1);
+        unsafe { asm!("dsb sy", "isb", options(nostack)); }
 
         klog!("       GICv2 init: {} IRQ lines\n", num_irqs);
-        }
     }
 
     // ---- GICv3 initialisation ---------------------------------------------
 
     unsafe fn init_gicv3() {
-        unsafe {
-        let typer = gicd_read(GICD_TYPER);
+        let d = gicd();
+        let typer = d.typer.read();
         let it_lines = (typer & 0x1F) + 1;
         let num_irqs = it_lines * 32;
 
         // Check if distributor is already configured (VZ pre-inits vGIC)
-        let ctlr = gicd_read(GICD_CTLR);
+        let ctlr = d.ctlr.read();
         let already_configured = (ctlr & GICD_CTLR_ENABLE_GRP1_NS) != 0;
 
         if !already_configured {
             // Redistributor: wake up CPU 0's frame
             if gicr_base() != 0 {
-                let waker = gicr_read(GICR_WAKER);
-                gicr_write(GICR_WAKER, waker & !(1 << 1)); // Clear ProcessorSleep
+                // SAFETY: redist base resolved from FDT; first frame is CPU 0.
+                let rd = unsafe { mmio::at::<GicrRdFrame>(gicr_base()) };
+                let waker = rd.waker.read();
+                rd.waker.write(waker & !(1 << 1)); // Clear ProcessorSleep
                 for _ in 0..1_000_000 {
-                    if (gicr_read(GICR_WAKER) & (1 << 2)) == 0 {
+                    if (rd.waker.read() & (1 << 2)) == 0 {
                         break;
                     }
-                    asm!("nop", options(nomem, nostack));
+                    unsafe { asm!("nop", options(nomem, nostack)); }
                 }
             }
 
             // Full distributor init (QEMU, bare metal)
-            gicd_write(GICD_CTLR, 0);
-            asm!("dsb sy", options(nostack));
+            d.ctlr.write(0);
+            unsafe { asm!("dsb sy", options(nostack)); }
 
-            for i in 1..num_irqs / 32 {
-                gicd_write(GICD_IGROUPR0 + i * 4, 0xFFFF_FFFF);   // Group 1 NS
-                gicd_write(GICD_ICENABLER0 + i * 4, 0xFFFF_FFFF); // Disabled
-                gicd_write(GICD_ICPENDR0 + i * 4, 0xFFFF_FFFF);   // Clear pending
+            for i in 1..(num_irqs / 32) as usize {
+                d._igroupr[i].write(0xFFFF_FFFF);   // Group 1 NS
+                d.icenabler[i].write(0xFFFF_FFFF);  // Disabled
+                d.icpendr[i].write(0xFFFF_FFFF);    // Clear pending
             }
-            for i in 8..num_irqs / 4 {
-                gicd_write(GICD_IPRIORITYR0 + i * 4, 0xA0A0_A0A0);
-            }
-
-            // Route all SPIs to affinity 0.0.0.0 (CPU 0)
-            for intid in 32..num_irqs {
-                let router_addr = gicd_base() + GICD_IROUTER_BASE as u64 + (intid - 32) as u64 * 8;
-                ptr::write_volatile(router_addr as *mut u64, 0);
+            for i in 8..(num_irqs / 4) as usize {
+                d.ipriorityr[i].write(0xA0A0_A0A0);
             }
 
-            gicd_write(GICD_CTLR, GICD_CTLR_ARE_NS | GICD_CTLR_ENABLE_GRP1_NS);
-            asm!("dsb sy", options(nostack));
+            // Route all SPIs to affinity 0.0.0.0 (CPU 0). GICv3 IROUTER
+            // exists only for SPIs (INTID 32..1019), so cap the loop at
+            // 1020 even if num_irqs reports more lines.
+            let irouter = gicd_irouter();
+            let last_spi = num_irqs.min(1020);
+            for intid in 32..last_spi {
+                irouter.irouter[(intid - 32) as usize].write(0);
+            }
+
+            d.ctlr.write(GICD_CTLR_ARE_NS | GICD_CTLR_ENABLE_GRP1_NS);
+            unsafe { asm!("dsb sy", options(nostack)); }
             klog!("       GICv3 init: {} IRQ lines (full)\n", num_irqs);
         } else {
             klog!("       GICv3 init: {} IRQ lines (vGIC pre-configured)\n", num_irqs);
         }
 
-        // CPU interface (system registers) — always needed
-        let sre: u64;
-        asm!("mrs {}, ICC_SRE_EL1", out(reg) sre);
-        asm!("msr ICC_SRE_EL1, {}", in(reg) sre | 1);
-        asm!("isb", options(nostack));
+        // CPU interface (system registers) — always needed.
+        // SAFETY: writing to ICC_* system registers is privileged but
+        // that is exactly what GIC init does; we are at EL1 with the
+        // system registers we control.
+        unsafe {
+            let sre: u64;
+            asm!("mrs {}, ICC_SRE_EL1", out(reg) sre);
+            asm!("msr ICC_SRE_EL1, {}", in(reg) sre | 1);
+            asm!("isb", options(nostack));
 
-        asm!("msr ICC_PMR_EL1, {}", in(reg) 0xFF_u64);
-        asm!("msr ICC_BPR1_EL1, {}", in(reg) 0_u64);
-        asm!("msr ICC_IGRPEN1_EL1, {}", in(reg) 1_u64);
-        asm!("isb", options(nostack));
+            asm!("msr ICC_PMR_EL1, {}", in(reg) 0xFF_u64);
+            asm!("msr ICC_BPR1_EL1, {}", in(reg) 0_u64);
+            asm!("msr ICC_IGRPEN1_EL1, {}", in(reg) 1_u64);
+            asm!("isb", options(nostack));
         }
     }
 
@@ -310,10 +346,9 @@ mod aarch64 {
         unsafe {
             if gic_version() == 2 {
                 // GICv2: CPU interface is at GICD_BASE + 0x10000 (banked per-CPU)
-                let gicc = gicc_base();
-                // Enable CPU interface
-                ptr::write_volatile((gicc + 0x00) as *mut u32, 1);  // GICC_CTLR = enable
-                ptr::write_volatile((gicc + 0x04) as *mut u32, 0xFF); // GICC_PMR = all priorities
+                let c = gicc();
+                c.ctlr.write(1);     // Enable CPU interface
+                c.pmr.write(0xFF);   // All priorities
                 return;
             }
 
@@ -323,14 +358,15 @@ mod aarch64 {
 
             // Each redistributor frame is 0x20000 bytes apart
             let cpu = crate::aarch64::smp::cpu_id() as u64;
-            let gicr_frame = gicr_base() + cpu * 0x20000;
+            let gicr_frame = gicr_base() + cpu * GICR_FRAME_STRIDE;
 
-            // Wake this core's redistributor
-            let waker_addr = gicr_frame + GICR_WAKER as u64;
-            let waker = ptr::read_volatile(waker_addr as *const u32);
-            ptr::write_volatile(waker_addr as *mut u32, waker & !(1 << 1));
+            // Wake this core's redistributor.
+            // SAFETY: gicr_frame is a per-CPU GICR RD frame.
+            let rd = mmio::at::<GicrRdFrame>(gicr_frame);
+            let waker = rd.waker.read();
+            rd.waker.write(waker & !(1 << 1));
             for _ in 0..1_000_000 {
-                if (ptr::read_volatile(waker_addr as *const u32) & (1 << 2)) == 0 {
+                if (rd.waker.read() & (1 << 2)) == 0 {
                     break;
                 }
                 asm!("nop", options(nomem, nostack));
@@ -370,7 +406,7 @@ mod aarch64 {
                 return;
             }
 
-            let reg_idx = irq / 32;
+            let reg_idx = (irq / 32) as usize;
             let bit = 1u32 << (irq % 32);
 
             if irq < 32 && gic_version() == 3 && gicr_base() != 0 {
@@ -379,12 +415,12 @@ mod aarch64 {
                 // Bug fix: must NOT use GICR_BASE directly — that is CPU 0's frame.
                 // APs must enable their SGIs in their own GICR frame.
                 let cpu = crate::aarch64::smp::cpu_id() as u64;
-                let gicr_frame = gicr_base() + cpu * 0x20000;
-                let addr = gicr_frame + GICR_SGI_BASE as u64 + GICD_ISENABLER0 as u64;
-                ptr::write_volatile(addr as *mut u32, bit);
+                let sgi_frame_base = gicr_base() + cpu * GICR_FRAME_STRIDE + GICR_SGI_OFFSET;
+                let sgi = mmio::at::<GicrSgiFrame>(sgi_frame_base);
+                sgi.isenabler0.write(bit);
             } else {
                 // SPIs (INTID >= 32) or GICv2: enable in the distributor
-                gicd_write(GICD_ISENABLER0 + reg_idx * 4, bit);
+                gicd().isenabler[reg_idx].write(bit);
             }
         }
     }
