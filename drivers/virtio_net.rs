@@ -195,7 +195,7 @@ fn init_pci_modern() -> bool {
     #[cfg(target_arch = "x86_64")]
     let desired_pairs = unsafe { kernel::x86_64::acpi::detect_cpus() as u16 };
     #[cfg(target_arch = "aarch64")]
-    let desired_pairs = unsafe { kernel::aarch64::fdt::info() }.cpu_count as u16;
+    let desired_pairs = kernel::aarch64::fdt::info().cpu_count as u16;
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let desired_pairs = 1u16;
     let max_pairs = if has_mq {
