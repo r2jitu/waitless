@@ -192,9 +192,15 @@ impl PerCore {
 static mut CORES: [PerCore; MAX_CORES] = [const { PerCore::new(0) }; MAX_CORES];
 static mut NUM_CORES: u32 = 1;
 
-/// AP poll function: registered by the network layer, called by APs in their event loop.
-/// Returns true if work was done.
-static mut AP_POLL_FN: Option<fn(u32) -> bool> = None;
+/// AP poll function: registered by the network layer, called by APs in
+/// their event loop. Returns true if work was done.
+///
+/// Stored as `AtomicPtr<()>` rather than `static mut` so the cross-core
+/// publish/subscribe is a real release/acquire pair, not a volatile read
+/// (which is not a synchronisation primitive). The `Option<fn>` is encoded
+/// as a nullable raw pointer: null = `None`, non-null = `Some(fn)`.
+static AP_POLL_FN: core::sync::atomic::AtomicPtr<()> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
 /// Initialize per-core state for `count` cores.
 pub unsafe fn init(count: u32) {
@@ -218,12 +224,21 @@ pub fn num_cores() -> u32 {
 }
 
 /// Register the AP poll function (called by net layer during init).
+/// Release-stores the pointer so APs that observe it via acquire-load
+/// also see all writes that happened-before this store.
 pub fn set_ap_poll_fn(f: fn(u32) -> bool) {
-    unsafe { core::ptr::write_volatile(&raw mut AP_POLL_FN, Some(f)); }
+    AP_POLL_FN.store(f as *mut (), core::sync::atomic::Ordering::Release);
 }
 
 /// Get the AP poll function (called by APs in their event loop).
-/// Uses volatile read to prevent the compiler from caching the value.
+/// Acquire-loads to pair with `set_ap_poll_fn`'s release-store.
 pub fn ap_poll_fn() -> Option<fn(u32) -> bool> {
-    unsafe { core::ptr::read_volatile(&raw const AP_POLL_FN) }
+    let p = AP_POLL_FN.load(core::sync::atomic::Ordering::Acquire);
+    if p.is_null() {
+        None
+    } else {
+        // SAFETY: only `set_ap_poll_fn` writes here, and it always writes a
+        // valid `fn(u32) -> bool` pointer.
+        Some(unsafe { core::mem::transmute::<*mut (), fn(u32) -> bool>(p) })
+    }
 }
