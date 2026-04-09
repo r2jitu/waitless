@@ -10,6 +10,15 @@
 // whose kqueue fires calls accept() and owns the connection; others see EAGAIN
 // and go back to sleep. No dedicated acceptor thread, no pipes — mirrors the
 // unikernel's per-core event loop model where each core polls the accept queue.
+//
+// NOTE: this file is the host POSIX dev backend, not the unikernel itself.
+// It still uses several `static mut` globals for thread/UDP/listener state.
+// They're sound by current convention (init from a single thread before
+// workers start, then mutated only by their owning worker), but the
+// migration to atomics/locks here is lower priority than the unikernel
+// side and is left as future work. The lint allow is local to this file
+// rather than crate-wide.
+#![allow(static_mut_refs)]
 
 use core::ptr;
 

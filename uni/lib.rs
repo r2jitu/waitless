@@ -7,7 +7,6 @@
 //   - platform_native:    native module (POSIX sockets + stdio)
 
 #![no_std]
-#![allow(static_mut_refs)]
 
 // Re-export the #[uni::main] proc macro.
 pub use uni_macros::main;
