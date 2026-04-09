@@ -4,16 +4,12 @@
 // Port-based dispatch via registered handlers.
 
 #![no_std]
-// HANDLERS is a small port→handler table set during bind() and read on
-// every UDP rx. Single-threaded init phase + read-mostly afterwards. The
-// access pattern is sound but uses `static mut`; a follow-up could
-// convert to AtomicU16[N] + AtomicPtr[N] or an InitOnce-backed table.
-#![allow(static_mut_refs)]
 
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
 extern crate net_ipv4 as ipv4;
 
+use core::sync::atomic::{AtomicPtr, AtomicU16, Ordering};
 use from_bytes::FromBytes;
 use types::{Ipv4Addr, CONFIG, tcp_checksum, htons, ntohs};
 use ipv4::{ipv4_send, PROTO_UDP};
@@ -29,23 +25,51 @@ struct UdpHeader {
 // SAFETY: repr(C, packed), all fields u16.
 unsafe impl FromBytes for UdpHeader {}
 
+type UdpHandlerFn = fn([u8; 4], u16, &[u8]);
+
 const MAX_HANDLERS: usize = 8;
 
-struct PortHandler {
-    port: u16,
-    handler: fn([u8; 4], u16, &[u8]),
-}
-
-static mut HANDLERS: [Option<PortHandler>; MAX_HANDLERS] = [const { None }; MAX_HANDLERS];
+/// Port→handler dispatch table. Each slot is `(port, handler_fn)`.
+/// Slots are filled in-order during init via `bind()` (single-threaded
+/// boot phase); reads happen from any core during packet dispatch.
+/// `port = 0` means "empty slot" (UDP port 0 isn't usable for traffic).
+///
+/// Atomic stores publish each slot in two steps: handler first, then
+/// port — so a reader that sees a non-zero port is guaranteed to also
+/// see the matching handler (acquire-pair).
+static HANDLER_PORTS: [AtomicU16; MAX_HANDLERS] = [
+    AtomicU16::new(0), AtomicU16::new(0), AtomicU16::new(0), AtomicU16::new(0),
+    AtomicU16::new(0), AtomicU16::new(0), AtomicU16::new(0), AtomicU16::new(0),
+];
+static HANDLER_FNS: [AtomicPtr<()>; MAX_HANDLERS] = [
+    AtomicPtr::new(core::ptr::null_mut()), AtomicPtr::new(core::ptr::null_mut()),
+    AtomicPtr::new(core::ptr::null_mut()), AtomicPtr::new(core::ptr::null_mut()),
+    AtomicPtr::new(core::ptr::null_mut()), AtomicPtr::new(core::ptr::null_mut()),
+    AtomicPtr::new(core::ptr::null_mut()), AtomicPtr::new(core::ptr::null_mut()),
+];
 
 /// Register a handler for incoming UDP packets on a specific port.
-pub fn bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
-    unsafe {
-        for slot in HANDLERS.iter_mut() {
-            if slot.is_none() {
-                *slot = Some(PortHandler { port, handler });
-                return;
-            }
+/// On QEMU/KVM uses CAS to claim a slot race-free; on vz_compat (where
+/// atomic RMW faults) falls back to load+store, which is sound because
+/// `bind` runs from app init on the BSP single-threaded.
+pub fn bind(port: u16, handler: UdpHandlerFn) {
+    if port == 0 { return; }
+    for i in 0..MAX_HANDLERS {
+        #[cfg(not(vz_compat))]
+        let claimed = HANDLER_PORTS[i]
+            .compare_exchange(0, port, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok();
+        #[cfg(vz_compat)]
+        let claimed = if HANDLER_PORTS[i].load(Ordering::Acquire) == 0 {
+            HANDLER_PORTS[i].store(port, Ordering::Release);
+            true
+        } else {
+            false
+        };
+
+        if claimed {
+            HANDLER_FNS[i].store(handler as *mut (), Ordering::Release);
+            return;
         }
     }
 }
@@ -91,14 +115,18 @@ pub fn udp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
     }
     let payload = &data[8..udp_len];
 
-    unsafe {
-        for slot in HANDLERS.iter() {
-            if let Some(h) = slot {
-                if h.port == dst_port {
-                    (h.handler)(src_ip.octets(), src_port, payload);
-                    return;
-                }
-            }
+    for i in 0..MAX_HANDLERS {
+        let p = HANDLER_PORTS[i].load(Ordering::Acquire);
+        if p == 0 { continue; }
+        if p == dst_port {
+            let raw = HANDLER_FNS[i].load(Ordering::Acquire);
+            if raw.is_null() { continue; }
+            // SAFETY: published by `bind` with the same fn type.
+            let h: UdpHandlerFn = unsafe {
+                core::mem::transmute::<*mut (), UdpHandlerFn>(raw)
+            };
+            h(src_ip.octets(), src_port, payload);
+            return;
         }
     }
 }

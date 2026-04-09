@@ -1,7 +1,6 @@
 // net/dhcp.rs — DHCP discover/offer/request/ack.
 
 #![no_std]
-#![allow(static_mut_refs)]
 
 extern crate kernel;
 extern crate drivers;
@@ -13,11 +12,12 @@ extern crate net_ipv4 as ipv4;
 
 use core::ptr;
 use from_bytes::FromBytes;
+use kernel::sync::Spinlock;
+use kernel::time::udelay;
 use types::{MacAddr, Ipv4Addr, CONFIG, checksum, htons, ntohs, htonl};
 use ethernet::{EthernetHeader, ethernet_our_mac, ethernet_parse, ETHERTYPE_ARP, ETHERTYPE_IPV4};
 use arp::{arp_receive, arp_announce};
 use ipv4::{Ipv4Header, PROTO_UDP};
-use kernel::time::udelay;
 
 #[repr(C, packed)]
 struct UdpHeader {
@@ -58,14 +58,37 @@ const DHCP_REQUEST: u8 = 3;
 const DHCP_ACK: u8 = 5;
 const DHCP_NAK: u8 = 6;
 
-static mut DHCP_XID: u32 = 0x12345678;
-static mut DHCP_GOT_OFFER: bool = false;
-static mut DHCP_GOT_ACK: bool = false;
-static mut DHCP_OFFERED_IP: Ipv4Addr = Ipv4Addr::ANY;
-static mut DHCP_OFFERED_SUBNET: Ipv4Addr = Ipv4Addr::ANY;
-static mut DHCP_OFFERED_GATEWAY: Ipv4Addr = Ipv4Addr::ANY;
-static mut DHCP_OFFERED_DNS: Ipv4Addr = Ipv4Addr::ANY;
-static mut DHCP_SERVER_IP: Ipv4Addr = Ipv4Addr::ANY;
+/// DHCP negotiation state. The negotiation runs once at boot but
+/// `dhcp_receive` is invoked from the network stack callback (which
+/// could in principle run on any core), so the state lives behind a
+/// spinlock to avoid the cross-core race.
+struct DhcpState {
+    xid: u32,
+    got_offer: bool,
+    got_ack: bool,
+    offered_ip: Ipv4Addr,
+    offered_subnet: Ipv4Addr,
+    offered_gateway: Ipv4Addr,
+    offered_dns: Ipv4Addr,
+    server_ip: Ipv4Addr,
+}
+
+impl DhcpState {
+    const fn new() -> Self {
+        DhcpState {
+            xid: 0x12345678,
+            got_offer: false,
+            got_ack: false,
+            offered_ip: Ipv4Addr::ANY,
+            offered_subnet: Ipv4Addr::ANY,
+            offered_gateway: Ipv4Addr::ANY,
+            offered_dns: Ipv4Addr::ANY,
+            server_ip: Ipv4Addr::ANY,
+        }
+    }
+}
+
+static DHCP_STATE: Spinlock<DhcpState> = Spinlock::new(DhcpState::new());
 
 /// DHCP receive callback — processes raw ethernet frames during DHCP.
 fn dhcp_receive(frame: &[u8]) {
@@ -113,7 +136,7 @@ fn dhcp_receive(frame: &[u8]) {
     };
     let xid = dhcp.xid;
     let cookie = dhcp.magic_cookie;
-    if xid != unsafe { DHCP_XID } || cookie != htonl(0x63825363) {
+    if xid != DHCP_STATE.lock().xid || cookie != htonl(0x63825363) {
         return;
     }
 
@@ -149,28 +172,28 @@ fn dhcp_receive(frame: &[u8]) {
         i += 2 + opt_len;
     }
 
-    unsafe {
-        match msg_type {
-            DHCP_OFFER => {
-                DHCP_OFFERED_IP = dhcp.yiaddr;
-                DHCP_OFFERED_SUBNET = subnet;
-                DHCP_OFFERED_GATEWAY = gateway;
-                DHCP_OFFERED_DNS = dns;
-                DHCP_SERVER_IP = server_id;
-                DHCP_GOT_OFFER = true;
-            }
-            DHCP_ACK => {
-                DHCP_OFFERED_IP = dhcp.yiaddr;
-                if subnet != Ipv4Addr::ANY { DHCP_OFFERED_SUBNET = subnet; }
-                if gateway != Ipv4Addr::ANY { DHCP_OFFERED_GATEWAY = gateway; }
-                if dns != Ipv4Addr::ANY { DHCP_OFFERED_DNS = dns; }
-                DHCP_GOT_ACK = true;
-            }
-            DHCP_NAK => {
-                DHCP_GOT_OFFER = false;
-            }
-            _ => {}
+    let yiaddr = dhcp.yiaddr;
+    let mut state = DHCP_STATE.lock();
+    match msg_type {
+        DHCP_OFFER => {
+            state.offered_ip = yiaddr;
+            state.offered_subnet = subnet;
+            state.offered_gateway = gateway;
+            state.offered_dns = dns;
+            state.server_ip = server_id;
+            state.got_offer = true;
         }
+        DHCP_ACK => {
+            state.offered_ip = yiaddr;
+            if subnet != Ipv4Addr::ANY { state.offered_subnet = subnet; }
+            if gateway != Ipv4Addr::ANY { state.offered_gateway = gateway; }
+            if dns != Ipv4Addr::ANY { state.offered_dns = dns; }
+            state.got_ack = true;
+        }
+        DHCP_NAK => {
+            state.got_offer = false;
+        }
+        _ => {}
     }
 }
 
@@ -180,7 +203,7 @@ fn build_dhcp_base() -> DhcpPacket {
     pkt.op = 1; // BOOTREQUEST
     pkt.htype = 1; // Ethernet
     pkt.hlen = 6;
-    pkt.xid = unsafe { DHCP_XID };
+    pkt.xid = DHCP_STATE.lock().xid;
     pkt.flags = htons(0x8000); // Broadcast
     pkt.magic_cookie = htonl(0x63825363);
     pkt.chaddr[..6].copy_from_slice(&mac.bytes);
@@ -266,8 +289,10 @@ fn dhcp_send_request() {
         );
     }
 
-    let offered_ip = unsafe { DHCP_OFFERED_IP };
-    let server_ip = unsafe { DHCP_SERVER_IP };
+    let (offered_ip, server_ip) = {
+        let s = DHCP_STATE.lock();
+        (s.offered_ip, s.server_ip)
+    };
 
     // DHCP options
     let mut opt_pos = dhcp_offset + 240;
@@ -320,10 +345,9 @@ fn dhcp_poll_wait(timeout_ms: u32) -> bool {
         // Poll aggressively within each ms to keep latency low
         for _ in 0..100 {
             drivers::virtio_net::poll(dhcp_receive);
-            unsafe {
-                if DHCP_GOT_OFFER || DHCP_GOT_ACK {
-                    return true;
-                }
+            let s = DHCP_STATE.lock();
+            if s.got_offer || s.got_ack {
+                return true;
             }
         }
         udelay(1000); // 1ms
@@ -333,44 +357,47 @@ fn dhcp_poll_wait(timeout_ms: u32) -> bool {
 
 /// DHCP discover — blocks until IP obtained or timeout.
 pub fn discover() -> bool {
-    unsafe {
-        DHCP_GOT_OFFER = false;
-        DHCP_GOT_ACK = false;
-        DHCP_XID = DHCP_XID.wrapping_add(1);
+    {
+        let mut s = DHCP_STATE.lock();
+        s.got_offer = false;
+        s.got_ack = false;
+        s.xid = s.xid.wrapping_add(1);
     }
 
     // Phase 1: DISCOVER → OFFER
     for _attempt in 0..5 {
         dhcp_send_discover();
-        if dhcp_poll_wait(2000) && unsafe { DHCP_GOT_OFFER } {
+        if dhcp_poll_wait(2000) && DHCP_STATE.lock().got_offer {
             break;
         }
     }
-    if !unsafe { DHCP_GOT_OFFER } {
+    if !DHCP_STATE.lock().got_offer {
         return false;
     }
 
     // Phase 2: REQUEST → ACK
-    unsafe { DHCP_GOT_ACK = false; }
+    DHCP_STATE.lock().got_ack = false;
     for _attempt in 0..5 {
         dhcp_send_request();
-        if dhcp_poll_wait(2000) && unsafe { DHCP_GOT_ACK } {
+        if dhcp_poll_wait(2000) && DHCP_STATE.lock().got_ack {
             break;
         }
     }
-    if !unsafe { DHCP_GOT_ACK } {
+    if !DHCP_STATE.lock().got_ack {
         return false;
     }
 
     // Apply configuration
-    unsafe {
-        CONFIG.store(types::NetConfig {
-            ip: DHCP_OFFERED_IP,
-            subnet_mask: DHCP_OFFERED_SUBNET,
-            gateway: DHCP_OFFERED_GATEWAY,
-            dns: DHCP_OFFERED_DNS,
-        });
-    }
+    let net_config = {
+        let s = DHCP_STATE.lock();
+        types::NetConfig {
+            ip: s.offered_ip,
+            subnet_mask: s.offered_subnet,
+            gateway: s.offered_gateway,
+            dns: s.offered_dns,
+        }
+    };
+    CONFIG.store(net_config);
 
     // Log the configured IP (bench.sh VZ path looks for this)
     {
