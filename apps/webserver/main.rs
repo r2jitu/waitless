@@ -96,8 +96,11 @@ fn main() {
     uni::udp_bind(7, udp_echo);
     uni::log(b"UDP echo server on port 7\n");
 
-    static mut SERVER: Server = Server::new();
-    let server = unsafe { &mut *core::ptr::addr_of_mut!(SERVER) };
+    // Allocate the Server (and its per-connection buffers) on the heap.
+    // `Box::leak` extends the lifetime to 'static so worker threads and AP
+    // service callbacks can keep accessing it via SERVER_PTR after main()
+    // returns on native (on unikernel `run()` blocks forever).
+    let server: &'static mut Server = uni::Box::leak(Server::new_boxed());
     server.default_handler(handle_request);
 
     uni::log(b"Routes registered. Entering event loop.\n");

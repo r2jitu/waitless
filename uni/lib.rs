@@ -24,6 +24,10 @@ mod unikernel;
 #[cfg(platform_native)]
 pub mod native;
 
+pub mod heap;
+pub mod owned;
+pub use owned::{Box, Buffer};
+
 pub mod http;
 
 // ---- Backend dispatch --------------------------------------------------------

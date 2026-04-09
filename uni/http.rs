@@ -169,15 +169,18 @@ impl Route {
 
 struct ActiveConn {
     conn: Option<TcpStream>,
-    buf: [u8; BUF_SIZE],
+    /// Heap-allocated receive buffer (BUF_SIZE bytes). Owning the bytes
+    /// off-heap keeps `Server` small enough to live on the stack while
+    /// being constructed in `Server::new()`.
+    buf: crate::Buffer,
     buf_len: usize,
 }
 
 impl ActiveConn {
-    const fn new() -> Self {
+    fn new() -> Self {
         ActiveConn {
             conn: None,
-            buf: [0; BUF_SIZE],
+            buf: crate::Buffer::new(BUF_SIZE),
             buf_len: 0,
         }
     }
@@ -190,10 +193,10 @@ struct CoreHttp {
 }
 
 impl CoreHttp {
-    const fn new() -> Self {
+    fn new() -> Self {
         CoreHttp {
             listener: None,
-            active: [const { ActiveConn::new() }; MAX_ACTIVE],
+            active: core::array::from_fn(|_| ActiveConn::new()),
         }
     }
 }
@@ -215,13 +218,17 @@ static SERVER_PTR: core::sync::atomic::AtomicPtr<Server> =
 static LISTEN_PORT: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
 
 impl Server {
-    pub const fn new() -> Self {
-        Server {
+    /// Allocate a `Server`, including its per-connection receive buffers,
+    /// on the heap. The returned `Box<Server>` is the only handle; callers
+    /// typically `Box::leak` it to get a `&'static mut Server` for the
+    /// duration of the program.
+    pub fn new_boxed() -> crate::Box<Self> {
+        crate::Box::new(Server {
             routes: [const { Route::new() }; MAX_ROUTES],
             route_count: 0,
             default_handler: None,
-            cores: [const { CoreHttp::new() }; MAX_CORES],
-        }
+            cores: core::array::from_fn(|_| CoreHttp::new()),
+        })
     }
 
     /// Register an exact-path handler.
