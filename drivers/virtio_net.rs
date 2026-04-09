@@ -807,11 +807,12 @@ pub fn flush_tx_staging() {
     }
     TX_PENDING.store(false, Ordering::Release);
     let n = kernel::percpu::num_cores();
+    let mut buf = [0u8; 1514];
     for i in 0..n {
         unsafe {
             let core = kernel::percpu::get(i);
-            while let Some(pkt) = core.tx_staging.pop() {
-                send_on_qp(0, pkt);
+            while let Some(len) = core.tx_staging.pop_into(&mut buf) {
+                send_on_qp(0, &buf[..len]);
             }
         }
     }

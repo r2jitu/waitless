@@ -106,10 +106,12 @@ fn main() {
 
     // Verify TX staging from each AP
     let mut tx_ok = 0u32;
+    let mut buf = [0u8; 1514];
     for i in 1..num_cores {
         unsafe {
             let core = kernel::percpu::get(i);
-            if let Some(data) = core.tx_staging.pop() {
+            if let Some(n) = core.tx_staging.pop_into(&mut buf) {
+                let data = &buf[..n];
                 if data.len() >= 2 && data[0] == i as u8 && data[1] == 0xAA {
                     tx_ok += 1;
                 }

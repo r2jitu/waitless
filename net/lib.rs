@@ -242,10 +242,11 @@ fn net_poll_cb(core_id: u32) -> bool {
 
 fn net_drain_cb(core_id: u32) -> bool {
     let mut did_work = false;
+    let mut buf = [0u8; 1514];
     unsafe {
         let core = percpu::get(core_id);
-        while let Some(frame) = core.rx_inbox.pop() {
-            net_receive(frame);
+        while let Some(len) = core.rx_inbox.pop_into(&mut buf) {
+            net_receive(&buf[..len]);
             did_work = true;
         }
     }
