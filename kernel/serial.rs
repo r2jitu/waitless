@@ -116,11 +116,18 @@ mod aarch64 {
     const CR_TXE: u32 = 1 << 8;
     const CR_RXE: u32 = 1 << 9;
 
-    #[derive(Clone, Copy, PartialEq)]
-    enum Backend { None, Pl011, Virtio }
+    /// Serial backend, encoded as a `u8` so it can live in an `AtomicU8`:
+    /// 0 = None, 1 = Pl011, 2 = Virtio. Set during `init()` on the BSP
+    /// and read by every core.
+    const BACKEND_NONE: u8 = 0;
+    const BACKEND_PL011: u8 = 1;
+    const BACKEND_VIRTIO: u8 = 2;
+    static BACKEND: core::sync::atomic::AtomicU8 =
+        core::sync::atomic::AtomicU8::new(BACKEND_NONE);
 
-    static mut BACKEND: Backend = Backend::None;
-    static mut UART_BASE: u64 = 0;
+    /// PL011 MMIO base. Set in `pl011_init`; read by every PL011 access.
+    static UART_BASE: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
 
     unsafe extern "C" {
         fn pci_init();
@@ -133,26 +140,28 @@ mod aarch64 {
     #[inline(always)]
     unsafe fn pl011_read(off: u64) -> u32 {
         unsafe {
-            ptr::read_volatile((UART_BASE + off) as *const u32)
+            let base = UART_BASE.load(core::sync::atomic::Ordering::Relaxed);
+            ptr::read_volatile((base + off) as *const u32)
         }
     }
 
     #[inline(always)]
     unsafe fn pl011_write(off: u64, val: u32) {
         unsafe {
-            ptr::write_volatile((UART_BASE + off) as *mut u32, val);
+            let base = UART_BASE.load(core::sync::atomic::Ordering::Relaxed);
+            ptr::write_volatile((base + off) as *mut u32, val);
         }
     }
 
     unsafe fn pl011_init(base: u64) {
         unsafe {
-            UART_BASE = base;
+            UART_BASE.store(base, core::sync::atomic::Ordering::Release);
             pl011_write(PL011_CR, 0);           // disable UART
             pl011_write(PL011_IBRD, 13);        // 115200 @ 24 MHz
             pl011_write(PL011_FBRD, 1);
             pl011_write(PL011_LCR_H, (3 << 5) | (1 << 4)); // 8N1, FIFO on
             pl011_write(PL011_CR, CR_UARTEN | CR_TXE | CR_RXE);
-            BACKEND = Backend::Pl011;
+            BACKEND.store(BACKEND_PL011, core::sync::atomic::Ordering::Release);
         }
     }
 
@@ -170,7 +179,7 @@ mod aarch64 {
             if fdt.virtio_count > 0 {
                 for i in 0..fdt.virtio_count as usize {
                     if virtio_console_init_mmio(fdt.virtio_bases[i]) {
-                        BACKEND = Backend::Virtio;
+                        BACKEND.store(BACKEND_VIRTIO, core::sync::atomic::Ordering::Release);
                         return;
                     }
                 }
@@ -180,7 +189,7 @@ mod aarch64 {
             if fdt.pcie_ecam_base != 0 {
                 pci_init();
                 if virtio_console_init_pci() {
-                    BACKEND = Backend::Virtio;
+                    BACKEND.store(BACKEND_VIRTIO, core::sync::atomic::Ordering::Release);
                     return;
                 }
             }
@@ -191,30 +200,30 @@ mod aarch64 {
 
     pub unsafe fn putc(c: u8) {
         unsafe {
-            match BACKEND {
-                Backend::Virtio => virtio_console_putc(c),
-                Backend::None => {},
-                Backend::Pl011 => {
+            match BACKEND.load(core::sync::atomic::Ordering::Acquire) {
+                BACKEND_VIRTIO => virtio_console_putc(c),
+                BACKEND_PL011 => {
                     // Wait for TX FIFO not full
                     while (pl011_read(PL011_FR) & FR_TXFF) != 0 {}
                     pl011_write(PL011_DR, c as u32);
                 }
+                _ => {}
             }
         }
     }
 
     pub unsafe fn try_getc() -> i32 {
         unsafe {
-            match BACKEND {
-                Backend::Virtio => virtio_console_try_getc(),
-                Backend::None => -1,
-                Backend::Pl011 => {
+            match BACKEND.load(core::sync::atomic::Ordering::Acquire) {
+                BACKEND_VIRTIO => virtio_console_try_getc(),
+                BACKEND_PL011 => {
                     if (pl011_read(PL011_FR) & FR_RXFE) == 0 {
                         (pl011_read(PL011_DR) & 0xFF) as i32
                     } else {
                         -1
                     }
                 }
+                _ => -1,
             }
         }
     }
