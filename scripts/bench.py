@@ -421,6 +421,7 @@ def main():
     # Kill stale processes
     subprocess.run(["pkill", "-9", "-f", "qemu-system"], capture_output=True)
     subprocess.run(["pkill", "-9", "-f", "run-vz"], capture_output=True)
+    subprocess.run(["pkill", "-9", "-f", "webserver_native"], capture_output=True)
     time.sleep(2)
 
     # Create environment instances (build happens before each test group
@@ -434,8 +435,22 @@ def main():
 
     # Collect results: results[(env_name, cpus, workload_name)] = (rps, p50, p99)
     results = {}
+    _current = {"env": None, "proc": None}  # for cleanup on Ctrl-C
 
-    for env_name, env in envs.items():
+    def _kill_current():
+        if _current["proc"] is not None and _current["env"] is not None:
+            try:
+                _current["env"].stop(_current["proc"])
+            except Exception:
+                pass
+            _current["proc"] = None
+        subprocess.run(["pkill", "-9", "-f", "qemu-system"], capture_output=True)
+        subprocess.run(["pkill", "-9", "-f", "run-vz"], capture_output=True)
+        subprocess.run(["pkill", "-9", "-f", "webserver_native"], capture_output=True)
+
+    try:
+      for env_name, env in envs.items():
+        _current["env"] = env
         # Rebuild before each environment group (bazel-bin is shared).
         print(f"\n==> Building {env.label}...")
         env.build()
@@ -458,6 +473,7 @@ def main():
                 port = next_port()
 
                 proc = start_env_verified(env, cpus, port)
+                _current["proc"] = proc
                 if proc is None:
                     print(f"    {wname:<20s} SKIP (not ready)")
                     results[(env_name, cpus, wname)] = (0, "", "")
@@ -479,7 +495,12 @@ def main():
                     print(f"    {wname:<20s} {pps:>10.0f} pkt/s")
 
                 env.stop(proc)
+                _current["proc"] = None
                 wait_port_pool()
+    except KeyboardInterrupt:
+        print("\nInterrupted — cleaning up...")
+        _kill_current()
+        sys.exit(1)
 
     # ── Summary table ────────────────────────────────────────────────────────
 
