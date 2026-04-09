@@ -23,7 +23,9 @@ use core::ptr;
 // Dependencies
 // ============================================================================
 
+use crate::once::InitOnce;
 use crate::serial;
+use crate::sync::Spinlock;
 use crate::types::{BootInfo, MEM_AVAILABLE};
 
 unsafe extern "C" {
@@ -141,27 +143,34 @@ impl FrameAllocator {
     }
 }
 
-static mut FRAME_ALLOC: FrameAllocator = FrameAllocator::ZEROED;
+// SAFETY: FrameAllocator owns a `*mut u8` (the bitmap data pointer)
+// pointing into kernel-owned memory. The pointer is never aliased; only
+// the lock holder accesses the bitmap. Send is sound because the lock
+// transfers exclusive access between cores.
+unsafe impl Send for FrameAllocator {}
+
+/// Frame allocator behind a spinlock. The previous `static mut
+/// FRAME_ALLOC` was a Tier-1 footgun from the original safety audit:
+/// every alloc/free path was unlocked, so concurrent post-boot
+/// allocation from any AP would race the bitmap.
+static FRAME_ALLOC: Spinlock<FrameAllocator> = Spinlock::new(FrameAllocator::ZEROED);
 
 // ============================================================================
 // Address translation state
 // ============================================================================
 
+// Fields are only consumed by phys_to_virt/virt_to_phys on x86_64; on
+// aarch64 the translation is identity-mapped and the fields are dead.
+#[allow(dead_code)]
 struct AddressSpace {
     hhdm_offset: u64,
     kernel_phys_base: u64,
     kernel_virt_base: u64,
 }
 
-impl AddressSpace {
-    const ZEROED: Self = Self {
-        hhdm_offset: 0,
-        kernel_phys_base: 0,
-        kernel_virt_base: 0,
-    };
-}
-
-static mut ADDR_SPACE: AddressSpace = AddressSpace::ZEROED;
+/// Address space configuration. Init once during boot, read-only
+/// thereafter; no lock needed.
+static ADDR_SPACE: InitOnce<AddressSpace> = InitOnce::new();
 
 // ============================================================================
 // Kernel heap allocator
@@ -193,7 +202,14 @@ impl Heap {
     };
 }
 
-static mut HEAP: Heap = Heap::ZEROED;
+// SAFETY: Heap owns raw pointers (start/end/head). The pointers are
+// never aliased; only the lock holder mutates the free list. Send is
+// sound because the lock transfers exclusive access between cores.
+unsafe impl Send for Heap {}
+
+/// Kernel heap behind a spinlock. Same Tier-1 fix as FRAME_ALLOC: any
+/// concurrent kmalloc/kfree from APs would race the free-list pointers.
+static HEAP: Spinlock<Heap> = Spinlock::new(Heap::ZEROED);
 
 // ============================================================================
 // Helper
@@ -209,20 +225,27 @@ fn align_up_page(val: u64) -> u64 {
 // ============================================================================
 
 pub fn init(info: *const BootInfo) {
-    unsafe {
-    let info = &*info;
+    // SAFETY: caller passes a valid BootInfo pointer that lives for the
+    // duration of init. Init runs single-threaded on the BSP before any
+    // AP starts, so the locks below are taken without contention.
+    let info = unsafe { &*info };
 
-    // ---- Phase 1: Compute total memory and max physical address ----
-    ADDR_SPACE.hhdm_offset = info.hhdm_offset;
-    ADDR_SPACE.kernel_phys_base = info.kernel_phys_base;
-    ADDR_SPACE.kernel_virt_base = info.kernel_virt_base;
-    FRAME_ALLOC.total_memory = 0;
+    // ---- Phase 1: Publish address-space config ----
+    ADDR_SPACE.init(AddressSpace {
+        hhdm_offset: info.hhdm_offset,
+        kernel_phys_base: info.kernel_phys_base,
+        kernel_virt_base: info.kernel_virt_base,
+    });
+
+    // ---- Phase 2: Compute memory layout under the FRAME_ALLOC lock ----
+    let mut fa = FRAME_ALLOC.lock();
+    fa.total_memory = 0;
     let mut max_physical_addr: u64 = 0;
 
     for i in 0..info.memory_map_count as usize {
         let region = &info.memory_map[i];
         if region.region_type == MEM_AVAILABLE {
-            FRAME_ALLOC.total_memory += region.length;
+            fa.total_memory += region.length;
             let end = region.base + region.length;
             if end > max_physical_addr {
                 max_physical_addr = end;
@@ -232,11 +255,10 @@ pub fn init(info: *const BootInfo) {
 
     klog!(
         "  Physical memory: {} MB (max addr {:#x})\n",
-        FRAME_ALLOC.total_memory / (1024 * 1024),
+        fa.total_memory / (1024 * 1024),
         max_physical_addr
     );
 
-    // ---- Phase 2: Set up frame bitmap ----
     // When the kernel is linked in the higher half (Limine boot),
     // _kernel_end is a virtual address like 0xFFFFFFFF801xxxxx.
     // Compute the physical end using the phys/virt base from BootInfo.
@@ -247,9 +269,9 @@ pub fn init(info: *const BootInfo) {
         kern_end_ptr
     };
 
-    FRAME_ALLOC.total_frames = max_physical_addr / PAGE_SIZE;
-    let bitmap_byte_size = Bitmap::byte_size(FRAME_ALLOC.total_frames);
-    FRAME_ALLOC.bitmap.num_bits = FRAME_ALLOC.total_frames;
+    fa.total_frames = max_physical_addr / PAGE_SIZE;
+    let bitmap_byte_size = Bitmap::byte_size(fa.total_frames);
+    fa.bitmap.num_bits = fa.total_frames;
 
     // Find where to place the bitmap + heap.
     let needed = align_up_page(bitmap_byte_size) + HEAP_SIZE as u64;
@@ -259,9 +281,6 @@ pub fn init(info: *const BootInfo) {
     // If YES (QEMU: kernel loaded inside RAM): place right after kernel.
     // If NO  (VZ: kernel image at 0x0, RAM at 0x70000000): search for the
     //         largest available region so the heap lands in actual RAM.
-    //         This is important on VZ where the hypervisor Stage-2 page tables
-    //         only mark the FDT-described RAM (0x70000000+) as inner-shareable,
-    //         which is required for atomic RMW (LDXR/STXR) to work.
     let kern_end_in_ram = (0..info.memory_map_count as usize).any(|i| {
         let r = &info.memory_map[i];
         r.region_type == MEM_AVAILABLE
@@ -293,11 +312,11 @@ pub fn init(info: *const BootInfo) {
     }
 
     let bitmap_phys = placement_phys;
-    FRAME_ALLOC.bitmap.data = (ADDR_SPACE.hhdm_offset + bitmap_phys) as *mut u8;
+    fa.bitmap.data = (info.hhdm_offset + bitmap_phys) as *mut u8;
 
     // Start: all frames used (0xFF = all bits set)
-    FRAME_ALLOC.bitmap.fill(0xFF);
-    FRAME_ALLOC.used_frames = FRAME_ALLOC.total_frames;
+    unsafe { fa.bitmap.fill(0xFF); }
+    fa.used_frames = fa.total_frames;
 
     // ---- Phase 3: Free available regions from memory map ----
     for i in 0..info.memory_map_count as usize {
@@ -310,111 +329,122 @@ pub fn init(info: *const BootInfo) {
         let mut addr = start;
         while addr < end {
             let frame = addr / PAGE_SIZE;
-            if frame < FRAME_ALLOC.total_frames && FRAME_ALLOC.bitmap.test(frame) {
-                FRAME_ALLOC.bitmap.clear(frame);
-                FRAME_ALLOC.used_frames -= 1;
+            if frame < fa.total_frames && fa.bitmap.test(frame) {
+                fa.bitmap.clear(frame);
+                fa.used_frames -= 1;
             }
             addr += PAGE_SIZE;
         }
     }
 
     // Reserve kernel image (physical) + bitmap
-    FRAME_ALLOC.mark_frames_used(info.kernel_phys_base, kern_end_phys);
+    unsafe {
+        fa.mark_frames_used(info.kernel_phys_base, kern_end_phys);
+    }
     let bitmap_end_phys = bitmap_phys + align_up_page(bitmap_byte_size);
-    FRAME_ALLOC.mark_frames_used(bitmap_phys, bitmap_end_phys);
+    unsafe {
+        fa.mark_frames_used(bitmap_phys, bitmap_end_phys);
+    }
 
     klog!(
         "  Frame allocator: {} total frames, {} free frames\n",
-        FRAME_ALLOC.total_frames,
-        FRAME_ALLOC.total_frames - FRAME_ALLOC.used_frames
+        fa.total_frames,
+        fa.total_frames - fa.used_frames
     );
 
     // ---- Phase 4: Set up the kernel heap ----
     let heap_phys = bitmap_end_phys;
-    HEAP.start = (ADDR_SPACE.hhdm_offset + heap_phys) as *mut u8;
-    HEAP.end = HEAP.start.add(HEAP_SIZE);
+    let heap_start = (info.hhdm_offset + heap_phys) as *mut u8;
 
-    // Mark heap pages as used in the frame allocator
-    FRAME_ALLOC.mark_frames_used(heap_phys, heap_phys + HEAP_SIZE as u64);
+    // Mark heap pages as used in the frame allocator (still under fa lock).
+    unsafe {
+        fa.mark_frames_used(heap_phys, heap_phys + HEAP_SIZE as u64);
+    }
+    drop(fa); // release frame allocator before taking heap lock
 
-    // Initialize the heap with a single large free block
-    HEAP.head = HEAP.start as *mut BlockHeader;
-    (*HEAP.head).size = (HEAP_SIZE - core::mem::size_of::<BlockHeader>()) as u64;
-    (*HEAP.head).next = ptr::null_mut();
-    (*HEAP.head).free = true;
+    let mut heap = HEAP.lock();
+    heap.start = heap_start;
+    // SAFETY: heap_start was just allocated above; HEAP_SIZE bytes are
+    // reserved for us in the frame allocator.
+    unsafe {
+        heap.end = heap.start.add(HEAP_SIZE);
+        // Initialize the heap with a single large free block
+        heap.head = heap.start as *mut BlockHeader;
+        (*heap.head).size = (HEAP_SIZE - core::mem::size_of::<BlockHeader>()) as u64;
+        (*heap.head).next = ptr::null_mut();
+        (*heap.head).free = true;
+    }
 
     klog!(
         "  Heap: {} KB at phys {:#x}\n",
         HEAP_SIZE / 1024,
         heap_phys
     );
-    } // unsafe
 }
 
 pub fn alloc_frame() -> u64 {
-    unsafe {
-        // Linear scan for the first free frame
-        for i in 0..FRAME_ALLOC.total_frames {
-            if !FRAME_ALLOC.bitmap.test(i) {
-                FRAME_ALLOC.bitmap.set(i);
-                FRAME_ALLOC.used_frames += 1;
-                return i * PAGE_SIZE;
-            }
+    let mut fa = FRAME_ALLOC.lock();
+    // Linear scan for the first free frame
+    for i in 0..fa.total_frames {
+        if !fa.bitmap.test(i) {
+            fa.bitmap.set(i);
+            fa.used_frames += 1;
+            return i * PAGE_SIZE;
         }
-        klog!("mm::alloc_frame: out of physical memory!\n");
-        0
     }
+    klog!("mm::alloc_frame: out of physical memory!\n");
+    0
 }
 
 /// Allocate `count` contiguous physical pages. Returns physical address or 0 on failure.
 pub fn alloc_pages(count: usize) -> u64 {
-    unsafe {
-        let total = FRAME_ALLOC.total_frames as usize;
-        'outer: for start in 0..total {
-            if start + count > total {
-                break;
-            }
-            for j in 0..count {
-                if FRAME_ALLOC.bitmap.test((start + j) as u64) {
-                    continue 'outer;
-                }
-            }
-            // Found contiguous run
-            for j in 0..count {
-                FRAME_ALLOC.bitmap.set((start + j) as u64);
-            }
-            FRAME_ALLOC.used_frames += count as u64;
-            return (start as u64) * PAGE_SIZE;
+    let mut fa = FRAME_ALLOC.lock();
+    let total = fa.total_frames as usize;
+    'outer: for start in 0..total {
+        if start + count > total {
+            break;
         }
-        klog!("mm::alloc_pages: out of physical memory!\n");
-        0
+        for j in 0..count {
+            if fa.bitmap.test((start + j) as u64) {
+                continue 'outer;
+            }
+        }
+        // Found contiguous run
+        for j in 0..count {
+            fa.bitmap.set((start + j) as u64);
+        }
+        fa.used_frames += count as u64;
+        return (start as u64) * PAGE_SIZE;
     }
+    klog!("mm::alloc_pages: out of physical memory!\n");
+    0
 }
 
 pub fn free_frame(addr: u64) {
-    unsafe {
-        let frame = addr / PAGE_SIZE;
-        if frame >= FRAME_ALLOC.total_frames {
-            return;
-        }
-        if FRAME_ALLOC.bitmap.test(frame) {
-            FRAME_ALLOC.bitmap.clear(frame);
-            FRAME_ALLOC.used_frames -= 1;
-        }
+    let mut fa = FRAME_ALLOC.lock();
+    let frame = addr / PAGE_SIZE;
+    if frame >= fa.total_frames {
+        return;
+    }
+    if fa.bitmap.test(frame) {
+        fa.bitmap.clear(frame);
+        fa.used_frames -= 1;
     }
 }
 
 pub fn kmalloc(size: usize) -> *mut u8 {
+    if size == 0 {
+        return ptr::null_mut();
+    }
+
+    // Align up to 16 bytes
+    let size = (size + 15) & !15;
+
+    let heap = HEAP.lock();
+    // SAFETY: hold the lock; nobody else mutates heap.head or any block.
     unsafe {
-        if size == 0 {
-            return ptr::null_mut();
-        }
-
-        // Align up to 16 bytes
-        let size = (size + 15) & !15;
-
         // First-fit search
-        let mut current = HEAP.head;
+        let mut current = heap.head;
         while !current.is_null() {
             if (*current).free && (*current).size >= size as u64 {
                 // Split the block if it's significantly larger
@@ -436,24 +466,26 @@ pub fn kmalloc(size: usize) -> *mut u8 {
             }
             current = (*current).next;
         }
-
-        klog!("mm::kmalloc: out of heap memory (requested {} bytes)!\n", size);
-        ptr::null_mut()
     }
+
+    klog!("mm::kmalloc: out of heap memory (requested {} bytes)!\n", size);
+    ptr::null_mut()
 }
 
 pub fn kfree(ptr: *mut u8) {
-    unsafe {
-        if ptr.is_null() {
-            return;
-        }
+    if ptr.is_null() {
+        return;
+    }
 
+    let heap = HEAP.lock();
+    // SAFETY: hold the lock; nobody else mutates the free list.
+    unsafe {
         let header_size = core::mem::size_of::<BlockHeader>();
         let block = ptr.sub(header_size) as *mut BlockHeader;
 
         // Sanity check: pointer within heap?
         let block_addr = block as *mut u8;
-        if block_addr < HEAP.start || block_addr >= HEAP.end {
+        if block_addr < heap.start || block_addr >= heap.end {
             klog!("mm::kfree: pointer outside the heap!\n");
             return;
         }
@@ -473,7 +505,7 @@ pub fn kfree(ptr: *mut u8) {
 
         // Coalesce with previous block if free (O(n) walk)
         let mut prev: *mut BlockHeader = ptr::null_mut();
-        let mut current = HEAP.head;
+        let mut current = heap.head;
         while !current.is_null() && current != block {
             prev = current;
             current = (*current).next;
@@ -486,11 +518,12 @@ pub fn kfree(ptr: *mut u8) {
 }
 
 pub fn get_total_memory() -> usize {
-    unsafe { FRAME_ALLOC.total_memory as usize }
+    FRAME_ALLOC.lock().total_memory as usize
 }
 
 pub fn get_free_memory() -> usize {
-    unsafe { ((FRAME_ALLOC.total_frames - FRAME_ALLOC.used_frames) * PAGE_SIZE) as usize }
+    let fa = FRAME_ALLOC.lock();
+    ((fa.total_frames - fa.used_frames) * PAGE_SIZE) as usize
 }
 
 pub fn phys_to_virt(phys: u64) -> *mut u8 {
@@ -499,8 +532,8 @@ pub fn phys_to_virt(phys: u64) -> *mut u8 {
         phys as *mut u8
     }
     #[cfg(target_arch = "x86_64")]
-    unsafe {
-        (ADDR_SPACE.hhdm_offset + phys) as *mut u8
+    {
+        (ADDR_SPACE.get().hhdm_offset + phys) as *mut u8
     }
 }
 
@@ -510,14 +543,15 @@ pub fn virt_to_phys(virt: *const u8) -> u64 {
         virt as u64
     }
     #[cfg(target_arch = "x86_64")]
-    unsafe {
+    {
         let addr = virt as u64;
+        let asp = ADDR_SPACE.get();
         // Check kernel virtual range first (higher addresses than HHDM)
-        if ADDR_SPACE.kernel_virt_base != 0 && addr >= ADDR_SPACE.kernel_virt_base {
-            return addr - ADDR_SPACE.kernel_virt_base + ADDR_SPACE.kernel_phys_base;
+        if asp.kernel_virt_base != 0 && addr >= asp.kernel_virt_base {
+            return addr - asp.kernel_virt_base + asp.kernel_phys_base;
         }
-        if ADDR_SPACE.hhdm_offset != 0 && addr >= ADDR_SPACE.hhdm_offset {
-            return addr - ADDR_SPACE.hhdm_offset;
+        if asp.hhdm_offset != 0 && addr >= asp.hhdm_offset {
+            return addr - asp.hhdm_offset;
         }
         addr // identity-mapped
     }
