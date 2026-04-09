@@ -346,10 +346,11 @@ final class NetBridge {
         let dataOff = 8
         let dataLen = udpLen - dataOff
         guard dataLen > 0 else { return }
+        _ = srcPort // (VM source port, e.g. 7 for echo — not used for lookup)
 
-        // The VM's reply has srcPort = VM service port (e.g. 7 for echo).
-        // Look up the host client by the VM's source port.
-        guard var clientAddr = udpClients[srcPort] else { return }
+        // The VM echoes back with dstPort = original client source port.
+        // Look up the host client by that port so each sender gets its own echo.
+        guard var clientAddr = udpClients[dstPort] else { return }
         _ = withUnsafePointer(to: &clientAddr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
                 sendto(udpFD, udp + dataOff, dataLen, 0, sa,
@@ -497,11 +498,12 @@ final class NetBridge {
                             }
                         }
                         if r <= 0 { break }
-                        // Store client address keyed by VM destination port (7 = echo)
+                        // Store client address keyed by client's source port so
+                        // each concurrent sender gets its own echo reply.
                         let vmDstPort: UInt16 = 7
-                        udpClients[vmDstPort] = clientAddr
-                        // Inject as Ethernet/IP/UDP frame into VM
                         let srcPort = UInt16(bigEndian: clientAddr.sin_port)
+                        udpClients[srcPort] = clientAddr
+                        // Inject as Ethernet/IP/UDP frame into VM
                         udpToVM(srcPort: srcPort, dstPort: vmDstPort,
                                 payload: rxBuf, payloadLen: r)
                     }
