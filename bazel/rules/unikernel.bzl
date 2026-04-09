@@ -50,7 +50,10 @@ def unikernel_binary(name, app, visibility = None):
         visibility: Bazel visibility specification.
     """
 
-    _unikernel_deps = [app, "//boot:entry", "//boot:limine", "//boot:libc"]
+    # Common deps for both .elf paths. boot_asm (x86_64 multiboot/PVH stub)
+    # is added per-target below since it's incompatible with higher-half
+    # linking and only needed for the QEMU direct-boot ELF.
+    _common_deps = [app, "//boot:entry", "//boot:limine", "//boot:libc"]
     _unikernel_flags = UNIKERNEL_RUSTC_FLAGS + _LINK_FLAGS + _LINK_FLAGS_ARCH
 
     # ── Unikernel ELF ────────────────────────────────────────────────────
@@ -58,7 +61,10 @@ def unikernel_binary(name, app, visibility = None):
         name = name + ".elf",
         crate_name = name + "_elf",
         srcs = ["//bazel/rules:unikernel_main.rs"],
-        deps = _unikernel_deps,
+        deps = _common_deps + select({
+            "//bazel/platforms:x86_64": ["//boot:boot_asm"],
+            "//conditions:default": [],
+        }),
         linker_script = select({
             "//bazel/platforms:aarch64": "//bazel/toolchain:unikernel_arm64.ld",
             "//conditions:default": "//bazel/toolchain:unikernel.ld",
@@ -91,19 +97,21 @@ def unikernel_binary(name, app, visibility = None):
     )
 
     # ── Limine higher-half ELF (x86_64 Limine boot) ─────────────────────
+    #
+    # Uses a standalone linker script (unikernel_limine.ld) that places
+    # the kernel at 0xFFFFFFFF80100000. Excludes //boot:boot_asm because
+    # boot.S has 32-bit absolute relocations that can't reach higher-half;
+    # Limine enters at limine_entry() directly so the multiboot stub
+    # isn't needed. The runner_iso config also adds `-Ccode-model=kernel`
+    # globally so all Rust crates emit R_X86_64_32S (signed) relocations
+    # that fit the top-2GB region.
     rust_binary(
         name = name + ".limine.elf",
         crate_name = name + "_limine_elf",
         srcs = ["//bazel/rules:unikernel_main.rs"],
-        deps = _unikernel_deps,
-        data = ["//bazel/toolchain:unikernel_limine.ld"],
-        linker_script = "//bazel/toolchain:unikernel.ld",
-        rustc_flags = _unikernel_flags + [
-            "-C",
-            "link-arg=-T",
-            "-C",
-            "link-arg=bazel/toolchain/unikernel_limine.ld",
-        ],
+        deps = _common_deps,
+        linker_script = "//bazel/toolchain:unikernel_limine.ld",
+        rustc_flags = _unikernel_flags,
         visibility = visibility,
     )
 

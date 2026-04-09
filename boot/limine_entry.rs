@@ -157,11 +157,16 @@ static LIMINE_START_MARKER: [u64; 4] = [
     0x785c6ed015d3e316, 0x181e920a7852b9d9,
 ];
 
-// Base revision (revision 3)
+// Base revision 0: provides an unconditional 4GB identity map AND HHDM
+// coverage of *every* memory-map region, so the kernel can read MMIO
+// (Local APIC at 0xFEE00000, virtio-pci BARs, etc.) via either the
+// identity map or HHDM. Revisions 1+ dropped the 4GB identity map and
+// progressively narrowed HHDM coverage, requiring the kernel to set up
+// its own page-table entries for MMIO regions.
 #[used]
 #[unsafe(link_section = ".limine_requests")]
 static LIMINE_BASE_REVISION: [u64; 3] = [
-    0xf9562b2d5c95a6c8, 0x6a7b384944536bdc, 3,
+    0xf9562b2d5c95a6c8, 0x6a7b384944536bdc, 0,
 ];
 
 // Memory map request

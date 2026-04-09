@@ -17,8 +17,16 @@ extern crate net;
 extern crate uni;
 
 // Boot assembly — compiled by LLVM's integrated assembler via global_asm!.
-#[cfg(target_arch = "x86_64")]
-core::arch::global_asm!(include_str!("x86_64/boot.S"), options(att_syntax));
+//
+// x86_64 boot.S contains 32-bit absolute relocations (R_X86_64_32)
+// targeting .boot_bss that cannot be linked into a higher-half ELF
+// (Limine boot), so it lives in a separate `boot_asm` crate that the
+// .limine.elf target excludes. Limine enters at `limine_entry()`
+// directly and does not need the multiboot/PVH stub.
+//
+// `idt_stubs.S` (PC-relative jumps + .quad table) and `ap_boot.S`
+// (movabs + small absolute trampoline-relative offsets) are higher-half
+// safe and stay here so SMP works under both boot paths.
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(include_str!("x86_64/idt_stubs.S"), options(att_syntax));
 #[cfg(target_arch = "x86_64")]

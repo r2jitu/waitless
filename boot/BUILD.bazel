@@ -14,13 +14,11 @@ rust_static_library(
     srcs = ["entry.rs"],
     compile_data = select({
         "//bazel/platforms:x86_64": [
-            "x86_64/boot.S",
             "x86_64/idt_stubs.S",
             "x86_64/ap_boot.S",
         ],
         "//bazel/platforms:aarch64": ["aarch64/boot.S"],
         "//conditions:default": [
-            "x86_64/boot.S",
             "x86_64/idt_stubs.S",
             "x86_64/ap_boot.S",
         ],
@@ -33,6 +31,17 @@ rust_static_library(
         "//net",
         "//uni",
     ],
+)
+
+# x86_64 multiboot/PVH boot stub (boot.S only).
+# Excluded from the Limine higher-half target: boot.S contains 32-bit
+# absolute relocations targeting `.boot_bss` that cannot be linked into
+# a higher-half ELF, and Limine doesn't need the multiboot stub anyway.
+rust_static_library(
+    name = "boot_asm",
+    srcs = ["boot_asm.rs"],
+    compile_data = ["x86_64/boot.S"],
+    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
 )
 
 rust_static_library(
