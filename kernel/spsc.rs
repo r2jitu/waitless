@@ -4,9 +4,20 @@
 // Used for: pinned task queues, per-core inbox (Tier 2 RX delivery),
 // and per-core TX staging buffers.
 //
-// No atomics on the fast path when used single-threaded.
-// Uses Acquire/Release on head/tail for cross-core SPSC (inbox/TX staging).
+// `push` and `pop` both take `&self`: the producer and the consumer
+// hold *shared* references to the same `Ring` and synchronise via the
+// atomic `head` / `tail` indices, with the buffer slots in `UnsafeCell`
+// for interior mutability. This is what makes a true cross-core SPSC
+// queue sound in Rust — taking `&mut self` on either side would
+// require aliased mutable references when the producer and consumer
+// run on different cores, which is undefined behaviour.
+//
+// Soundness rule (NOT enforced by the type system, must be upheld by
+// callers): at most one thread/core ever calls `push`, and at most
+// one ever calls `pop`. The producer and consumer may be different
+// cores. `len`/`is_empty` may be called from anywhere.
 
+use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// Fixed capacity. Must be a power of 2.
@@ -15,40 +26,55 @@ const MASK: usize = CAPACITY - 1;
 
 /// SPSC ring buffer for fixed-size items.
 pub struct Ring<T: Copy + Default> {
-    buffer: [T; CAPACITY],
+    buffer: [UnsafeCell<T>; CAPACITY],
     head: AtomicUsize, // consumer reads from head
     tail: AtomicUsize, // producer writes to tail
 }
 
+// SAFETY: cross-core sharing is sound provided the SPSC discipline above
+// is followed: one producer, one consumer, synchronisation via the atomic
+// head/tail with Acquire/Release ordering. The `T: Send` bound ensures the
+// item can be transferred between cores.
+unsafe impl<T: Copy + Default + Send> Sync for Ring<T> {}
+
 impl<T: Copy + Default> Ring<T> {
     pub const fn new() -> Self {
         Ring {
-            buffer: [T::DEFAULT; CAPACITY],
+            buffer: [const { UnsafeCell::new(T::DEFAULT) }; CAPACITY],
             head: AtomicUsize::new(0),
             tail: AtomicUsize::new(0),
         }
     }
 
     /// Push an item (producer only). Returns false if full.
-    pub fn push(&mut self, item: T) -> bool {
+    pub fn push(&self, item: T) -> bool {
         let tail = self.tail.load(Ordering::Relaxed);
         let head = self.head.load(Ordering::Acquire);
         if tail - head >= CAPACITY {
             return false;
         }
-        self.buffer[tail & MASK] = item;
+        // SAFETY: only the producer writes to buffer slots, and the slot
+        // at index (tail & MASK) is not visible to the consumer until we
+        // perform the release-store on `tail` below. The acquire-load on
+        // `head` above ensures the consumer is finished with this slot
+        // (the previous wrap of it) before we overwrite.
+        unsafe { *self.buffer[tail & MASK].get() = item; }
         self.tail.store(tail + 1, Ordering::Release);
         true
     }
 
     /// Pop an item (consumer only). Returns None if empty.
-    pub fn pop(&mut self) -> Option<T> {
+    pub fn pop(&self) -> Option<T> {
         let head = self.head.load(Ordering::Relaxed);
         let tail = self.tail.load(Ordering::Acquire);
         if head >= tail {
             return None;
         }
-        let item = self.buffer[head & MASK];
+        // SAFETY: head < tail (acquire-loaded above) means the producer
+        // has finished writing this slot and released `tail`. Only the
+        // consumer reads slot contents before its own release-store on
+        // `head`, so the read does not race with any other reader.
+        let item = unsafe { *self.buffer[head & MASK].get() };
         self.head.store(head + 1, Ordering::Release);
         Some(item)
     }
@@ -89,7 +115,7 @@ mod tests {
 
     #[test]
     fn push_pop() {
-        let mut r = Ring::<usize>::new();
+        let r = Ring::<usize>::new();
         assert!(r.is_empty());
         assert!(r.push(42));
         assert_eq!(r.len(), 1);
@@ -99,7 +125,7 @@ mod tests {
 
     #[test]
     fn fifo_order() {
-        let mut r = Ring::<usize>::new();
+        let r = Ring::<usize>::new();
         r.push(1);
         r.push(2);
         r.push(3);
@@ -111,13 +137,13 @@ mod tests {
 
     #[test]
     fn pop_empty() {
-        let mut r = Ring::<usize>::new();
+        let r = Ring::<usize>::new();
         assert!(r.pop().is_none());
     }
 
     #[test]
     fn capacity_full() {
-        let mut r = Ring::<usize>::new();
+        let r = Ring::<usize>::new();
         for i in 0..CAPACITY {
             assert!(r.push(i));
         }
@@ -127,7 +153,7 @@ mod tests {
 
     #[test]
     fn wrap_around() {
-        let mut r = Ring::<usize>::new();
+        let r = Ring::<usize>::new();
         for round in 0..3 {
             for i in 0..100 {
                 assert!(r.push(round * 100 + i));
@@ -137,5 +163,49 @@ mod tests {
             }
             assert!(r.is_empty());
         }
+    }
+
+    /// Cross-thread SPSC: producer thread and consumer thread share the
+    /// same Ring via shared references. This is the case the unikernel
+    /// actually exercises (one core pushes, another pops). It would be
+    /// undefined behaviour if push/pop took `&mut self`.
+    #[test]
+    fn spsc_two_threads() {
+        use std::sync::Arc;
+        use std::thread;
+
+        const N: usize = 10_000;
+        let r = Arc::new(Ring::<usize>::new());
+        let producer = {
+            let r = Arc::clone(&r);
+            thread::spawn(move || {
+                let mut i = 0;
+                while i < N {
+                    if r.push(i) {
+                        i += 1;
+                    } else {
+                        std::thread::yield_now();
+                    }
+                }
+            })
+        };
+        let consumer = {
+            let r = Arc::clone(&r);
+            thread::spawn(move || {
+                let mut next = 0;
+                while next < N {
+                    match r.pop() {
+                        Some(v) => {
+                            assert_eq!(v, next);
+                            next += 1;
+                        }
+                        None => std::thread::yield_now(),
+                    }
+                }
+            })
+        };
+        producer.join().unwrap();
+        consumer.join().unwrap();
+        assert!(r.is_empty());
     }
 }
