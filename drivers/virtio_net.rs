@@ -800,9 +800,11 @@ pub fn flush_tx_staging() {
     if !TX_PENDING.load(Ordering::Acquire) {
         return;
     }
-    // Only one core should flush at a time.
-    if TX_LOCK.load(Ordering::Acquire) != 0 { return; }
-    TX_LOCK.store(1, Ordering::Release);
+    // Only one core should flush at a time. tx_try_lock() uses CAS on
+    // QEMU/KVM (race-free) and load/store on vz_compat (best-effort).
+    if !tx_try_lock() {
+        return;
+    }
     TX_PENDING.store(false, Ordering::Release);
     let n = kernel::percpu::num_cores();
     for i in 0..n {
