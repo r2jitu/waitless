@@ -169,13 +169,11 @@ impl TcpConnection {
 
 // Per-core connection pools. Core N owns POOLS[N].
 //
-// Each `TcpConnection` is wrapped in an `UnsafeCell` so cores share the
-// `POOLS` static via shared references rather than aliased `&mut`. The
-// previous `pool(core) -> &'static mut [TcpConnection; N]` was the same
-// `static mut + &mut` aliasing UB that was just fixed in `kernel::percpu`:
-// two cores calling `pool()` with different ids both formed `&mut` into
-// the single static, which is undefined behaviour even when the
-// underlying memory accesses target disjoint slots.
+// Each `TcpConnection` is wrapped in `TcpConnCell` (an `UnsafeCell`
+// newtype) so cores share the `POOLS` static via shared references
+// rather than aliased `&mut`. The outer per-core array is held in
+// `kernel::percpu::PerCpu`, which provides typed `current(&CurrentCore)`
+// access without manual unsafe at the call site.
 //
 // SAFETY discipline (enforced by flow-hash routing in net/lib.rs and by
 // the API's `cpu_id()` calls): the connection at `POOLS[core][slot]` is
@@ -188,21 +186,26 @@ struct TcpConnCell(core::cell::UnsafeCell<TcpConnection>);
 // SAFETY: per-core ownership documented above; each core only mutates
 // its own slots, no two threads ever hold &mut to the same TcpConnection.
 unsafe impl Sync for TcpConnCell {}
+unsafe impl Send for TcpConnCell {}
 impl TcpConnCell {
     const fn new() -> Self {
         TcpConnCell(core::cell::UnsafeCell::new(TcpConnection::new()))
     }
 }
 
-static POOLS: [[TcpConnCell; CONNECTIONS_PER_CORE]; MAX_CORES] =
-    [const { [const { TcpConnCell::new() }; CONNECTIONS_PER_CORE] }; MAX_CORES];
+type CoreSlots = [TcpConnCell; CONNECTIONS_PER_CORE];
+
+static POOLS: kernel::percpu::PerCpu<CoreSlots, MAX_CORES> =
+    kernel::percpu::PerCpu::new(
+        [const { [const { TcpConnCell::new() }; CONNECTIONS_PER_CORE] }; MAX_CORES],
+    );
 
 /// Get a `*mut TcpConnection` for `(core, slot)`. The caller must
 /// uphold the per-core ownership discipline (only the owning core may
 /// dereference the resulting pointer mutably).
 #[inline]
 fn conn_ptr(core: u32, slot: usize) -> *mut TcpConnection {
-    POOLS[core as usize][slot].0.get()
+    POOLS.at(core)[slot].0.get()
 }
 
 /// TCP initial-sequence-number counter. Atomic on QEMU/KVM; on
