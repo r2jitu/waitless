@@ -3,7 +3,7 @@
 // Uses PSCI CPU_ON to start secondary cores (APs). Core 0 (BSP) calls
 // this after all init is complete.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::serial;
 use crate::mm;
@@ -24,7 +24,15 @@ struct CoreState {
 }
 
 static mut CORES: [CoreState; MAX_CORES] = [const { CoreState { stack_top: 0 } }; MAX_CORES];
-static mut NUM_CORES_ONLINE: u32 = 1; // BSP is always online
+
+/// Number of cores that have come online (BSP + APs that called `ap_entry`).
+///
+/// On QEMU/KVM this is incremented via `fetch_add`. On VZ (vz_compat) atomic
+/// RMW instructions fault on guest RAM, so we fall back to a non-atomic
+/// volatile read-then-write — but on VZ secondary cores boot strictly
+/// sequentially under our current setup, so the lost-update race that's
+/// fatal on QEMU/KVM cannot fire on VZ.
+static NUM_CORES_ONLINE: AtomicU32 = AtomicU32::new(1); // BSP is always online
 
 /// Get the current CPU's logical core index.
 ///
@@ -54,7 +62,7 @@ pub fn init_tls(id: u32) {
 
 /// Returns the number of cores that have booted.
 pub fn num_cores_online() -> u32 {
-    unsafe { core::ptr::read_volatile(&NUM_CORES_ONLINE) }
+    NUM_CORES_ONLINE.load(Ordering::Acquire)
 }
 
 /// PSCI CPU_ON via HVC (QEMU virt uses PSCI 0.2 conduit=hvc).
@@ -147,8 +155,17 @@ unsafe extern "C" fn ap_entry(_stack_top: u64) -> ! {
         core::arch::asm!("msr daifclr, #0x2", options(nomem, nostack));
 
         // Mark this core as online.
-        let n = core::ptr::read_volatile(&NUM_CORES_ONLINE);
-        core::ptr::write_volatile(&raw mut NUM_CORES_ONLINE, n + 1);
+        //
+        // On QEMU/KVM use `fetch_add`. On VZ atomic RMW faults, so emulate
+        // RMW with a load+store; safe because vz_compat boots APs strictly
+        // sequentially (one CPU_ON at a time, BSP waits for `online`).
+        #[cfg(not(vz_compat))]
+        NUM_CORES_ONLINE.fetch_add(1, Ordering::AcqRel);
+        #[cfg(vz_compat)]
+        {
+            let n = NUM_CORES_ONLINE.load(Ordering::Acquire);
+            NUM_CORES_ONLINE.store(n + 1, Ordering::Release);
+        }
 
         // Log
         let id = cpu_id();
