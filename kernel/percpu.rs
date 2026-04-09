@@ -231,8 +231,11 @@ impl PerCore {
 }
 
 /// Global array of per-core state. Initialized by core 0 during boot
-/// (single-threaded), then read-shared from all cores.
-static mut CORES: [PerCore; MAX_CORES] = [const { PerCore::new(0) }; MAX_CORES];
+/// (single-threaded), then read-shared from all cores via the `PerCpu`
+/// primitive (which encapsulates the `[UnsafeCell<T>; N]` + per-core
+/// indexing pattern that this module used to open-code).
+static CORES: PerCpu<PerCore, MAX_CORES> =
+    PerCpu::new([const { PerCore::new(0) }; MAX_CORES]);
 static mut NUM_CORES: u32 = 1;
 
 /// AP poll function: registered by the network layer, called by APs in
@@ -252,9 +255,18 @@ pub unsafe fn init(count: u32) {
     unsafe {
         let n = count.min(MAX_CORES as u32);
         NUM_CORES = n;
-        let cores = &raw mut CORES;
-        for i in 0..n {
-            (*cores)[i as usize].id = i;
+    }
+    // Stamp each core's id into its slot. We bypass the `current()`
+    // accessor here because at boot time the id field hasn't been
+    // written yet — the convention "PerCore.id == its slot index" is
+    // what we're establishing right now.
+    let n = unsafe { NUM_CORES };
+    for i in 0..n {
+        // SAFETY: init runs single-threaded on the BSP before APs
+        // start; no other core has a reference to any slot yet.
+        unsafe {
+            let slot = CORES.at(i) as *const PerCore as *mut PerCore;
+            (*slot).id = i;
         }
     }
 }
@@ -265,9 +277,7 @@ pub unsafe fn init(count: u32) {
 /// Multiple cores may safely call this concurrently — interior mutability
 /// (`Atomic*`, `UnsafeCell` behind SPSC discipline) makes shared access sound.
 pub unsafe fn get(id: u32) -> &'static PerCore {
-    // Use raw pointer + reborrow to avoid taking a `&mut` to a `static mut`
-    // (which would be UB if any other core also held a reference).
-    unsafe { &(*(&raw const CORES))[id as usize] }
+    CORES.at(id)
 }
 
 /// Get the total number of cores.
@@ -339,13 +349,11 @@ impl CurrentCore {
     }
 
     /// Get a shared reference to this core's `PerCore` state. Safe by
-    /// construction: `id` came from `cpu_id()` and percpu::init() runs
-    /// before any AP starts.
+    /// construction: the token proves we're running on `core(self.id)`,
+    /// and `PerCpu::current` returns the corresponding slot.
     #[inline(always)]
     pub fn percore(&self) -> &'static PerCore {
-        // SAFETY: `enter()`/`from_id_unchecked` produce a token with a
-        // valid id; init() runs before any holder of a token can exist.
-        unsafe { get(self.id) }
+        CORES.current(self)
     }
 }
 
@@ -366,5 +374,96 @@ pub fn ap_poll_fn() -> Option<fn(u32) -> bool> {
         // SAFETY: only `set_ap_poll_fn` writes here, and it always writes a
         // valid `fn(u32) -> bool` pointer.
         Some(unsafe { core::mem::transmute::<*mut (), fn(u32) -> bool>(p) })
+    }
+}
+
+// ============================================================================
+// PerCpu<T, const N>: typed per-core array
+// ============================================================================
+//
+// The "array of N per-core slots" pattern was open-coded in five places
+// before this primitive (CORES, RxInbox/TxStaging pool/ready, tcp::POOLS,
+// uni::native::THREADS, net::lib::WAKEUP). Each got the indexing right but
+// the *pattern* repeated, with subtly different access functions and
+// `unsafe { ... }` justifications.
+//
+// `PerCpu<T, N>` consolidates the pattern: N slots stored in `UnsafeCell<T>`,
+// accessed via either:
+//   - `current(&CurrentCore) -> &T` — safe, returns the slot owned by the
+//     calling core (the token proves we're on it)
+//   - `at(id) -> &T` — needs the caller to follow the per-core ownership
+//     discipline (e.g. only the owning core mutates), but is safe at the
+//     reference level since cross-core read of fields with interior
+//     mutability is fine
+//
+// `T` itself must use interior mutability (Atomic*, UnsafeCell) for any
+// mutation — the same convention as `kernel::percpu::PerCore`.
+//
+// Zero cost: `PerCpu<T, N>` is `repr(transparent)` over `[UnsafeCell<T>; N]`.
+// `current()` inlines to a single array index using the token's id (which
+// itself is one register move from the TLS read in `enter()`). The
+// `unsafe impl Sync` is the only unsafe in the type; the safety contract
+// is documented as "T must be Sync OR the caller must use the per-core
+// ownership discipline."
+
+/// Typed per-CPU array of `N` slots of `T`.
+#[repr(transparent)]
+pub struct PerCpu<T, const N: usize> {
+    slots: [core::cell::UnsafeCell<T>; N],
+}
+
+// SAFETY: PerCpu provides shared (`&T`) access only. T is responsible
+// for its own interior mutability (Atomic*, UnsafeCell, lock, etc.).
+// We require T: Sync because cross-core read access is shared, and
+// T: Send because the slot is logically transferable between cores
+// (though in practice each slot is owned by one core).
+unsafe impl<T: Sync + Send, const N: usize> Sync for PerCpu<T, N> {}
+
+impl<T, const N: usize> PerCpu<T, N> {
+    /// Construct from an array of N initial values. Const-callable so
+    /// the array can live in a `static`.
+    #[inline]
+    pub const fn new(values: [T; N]) -> Self {
+        // Convert [T; N] -> [UnsafeCell<T>; N] field-by-field via ptr
+        // copy. This is the only way to do the conversion in const
+        // context as of stable Rust. SAFETY: UnsafeCell<T> is
+        // repr(transparent) over T, so the layouts match exactly.
+        let cells: [core::cell::UnsafeCell<T>; N] = unsafe {
+            let cells = core::mem::ManuallyDrop::new(values);
+            core::ptr::read(&cells as *const _ as *const [core::cell::UnsafeCell<T>; N])
+        };
+        PerCpu { slots: cells }
+    }
+
+    /// Get a shared reference to the slot for the current core.
+    /// Safe by construction: the `&CurrentCore` token proves we hold
+    /// exclusive access to the calling core's identity, and the slot's
+    /// inner `T` uses interior mutability for any actual mutation.
+    #[inline(always)]
+    pub fn current(&self, cc: &CurrentCore) -> &T {
+        // SAFETY: cc.id() is the calling core's id; reading from the
+        // slot returns a `&T` whose mutation discipline is T's job.
+        // PerCpu just guarantees that two different cores get
+        // different slots.
+        unsafe { &*self.slots[cc.id() as usize].get() }
+    }
+
+    /// Get a shared reference to slot `id`. Safe at the reference level
+    /// (T uses interior mutability), but the caller is responsible for
+    /// the per-core ownership convention if they intend to mutate.
+    /// Useful for cross-core read access (e.g. core 0 walking every
+    /// per-core inbox) and for indexing into a slot whose id was
+    /// computed elsewhere.
+    #[inline(always)]
+    pub fn at(&self, id: u32) -> &T {
+        // SAFETY: same as current(); cross-core access is sound at the
+        // reference level because T provides its own synchronisation.
+        unsafe { &*self.slots[id as usize].get() }
+    }
+
+    /// Number of slots.
+    #[inline(always)]
+    pub const fn len(&self) -> usize {
+        N
     }
 }
