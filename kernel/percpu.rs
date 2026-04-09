@@ -275,6 +275,80 @@ pub fn num_cores() -> u32 {
     unsafe { NUM_CORES }
 }
 
+// ============================================================================
+// CurrentCore token: zero-cost proof-of-current-core for typed accessors
+// ============================================================================
+//
+// `CurrentCore` is a non-Send, non-Sync, zero-sized token whose existence
+// proves the holder is running on the core whose id is recorded inside it.
+// It's obtained by calling `CurrentCore::enter()`, which reads the TLS
+// register (TPIDR_EL1 / GS_BASE) once. Subsequent uses of the token avoid
+// the syscall-equivalent of re-reading the TLS register on every access.
+//
+// The token's value is in encoding the per-core ownership rule that
+// otherwise lives in comments: "this code path runs on the core whose
+// id == cpu_id() at the time of entry." Methods that take `&CurrentCore`
+// can rely on that invariant for lock-free per-core mutation.
+//
+// Zero cost: `CurrentCore` is a `repr(C)` ZST containing only `id: u32`,
+// so it occupies one register at most. `enter()` inlines to a single TLS
+// register read. The `!Send`/`!Sync` markers are PhantomData<*mut ()> —
+// ZSTs that produce no codegen. The end result is exactly the same
+// machine code as `let id = cpu_id();` followed by manual checks.
+
+/// Token proving that the holder is currently running on `core(id)`.
+/// Cannot be sent to or shared with another thread/core.
+#[derive(Clone, Copy)]
+pub struct CurrentCore {
+    id: u32,
+    _not_send: core::marker::PhantomData<*mut ()>,
+}
+
+impl CurrentCore {
+    /// Read the current core id from the TLS register and bind it into
+    /// a token. Cheap (one MRS or `mov gs:[0], eax`).
+    #[inline(always)]
+    pub fn enter() -> Self {
+        CurrentCore {
+            id: crate::cpu_id(),
+            _not_send: core::marker::PhantomData,
+        }
+    }
+
+    /// Construct a token from a core id the caller already knows is
+    /// the current core (e.g., from the event loop callback dispatch
+    /// which threaded `cpu_id()` through earlier). Saves the second
+    /// TLS read that `enter()` would do.
+    ///
+    /// SAFETY: caller must guarantee that `id == cpu_id()` at the time
+    /// of the call AND that the token does not outlive the iteration
+    /// (which can never happen across threads because `CurrentCore` is
+    /// `!Send`).
+    #[inline(always)]
+    pub unsafe fn from_id_unchecked(id: u32) -> Self {
+        CurrentCore {
+            id,
+            _not_send: core::marker::PhantomData,
+        }
+    }
+
+    /// The id of the core this token represents.
+    #[inline(always)]
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+
+    /// Get a shared reference to this core's `PerCore` state. Safe by
+    /// construction: `id` came from `cpu_id()` and percpu::init() runs
+    /// before any AP starts.
+    #[inline(always)]
+    pub fn percore(&self) -> &'static PerCore {
+        // SAFETY: `enter()`/`from_id_unchecked` produce a token with a
+        // valid id; init() runs before any holder of a token can exist.
+        unsafe { get(self.id) }
+    }
+}
+
 /// Register the AP poll function (called by net layer during init).
 /// Release-stores the pointer so APs that observe it via acquire-load
 /// also see all writes that happened-before this store.

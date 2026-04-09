@@ -273,14 +273,16 @@ fn net_poll_cb(core_id: u32) -> bool {
 }
 
 fn net_drain_cb(core_id: u32) -> bool {
+    // SAFETY: the kernel event loop only calls this callback with the
+    // current core's id; we threaded that id through, so it matches
+    // `cpu_id()` at this exact moment without needing a second TLS read.
+    let cc = unsafe { percpu::CurrentCore::from_id_unchecked(core_id) };
+    let core = cc.percore(); // SAFE access via the token
     let mut did_work = false;
     let mut buf = [0u8; 1514];
-    unsafe {
-        let core = percpu::get(core_id);
-        while let Some(len) = core.rx_inbox.pop_into(&mut buf) {
-            net_receive(&buf[..len]);
-            did_work = true;
-        }
+    while let Some(len) = core.rx_inbox.pop_into(&mut buf) {
+        net_receive(&buf[..len]);
+        did_work = true;
     }
     did_work
 }
