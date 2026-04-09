@@ -1,4 +1,4 @@
-// kernel/x86_64/gdt.rs -- Global Descriptor Table implementation (Rust port of gdt.cc)
+// kernel/x86_64/gdt.rs -- Global Descriptor Table implementation
 //
 // Sets up the flat-model GDT for x86_64 long mode:
 //   Entry 0: Null descriptor

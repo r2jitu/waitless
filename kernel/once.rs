@@ -1,26 +1,18 @@
 // kernel/once.rs — `InitOnce<T>`: write-once cell, multi-reader.
 //
-// The dominant avoidable-unsafe pattern in this codebase is:
+// One core calls `init(value)` exactly once; afterward every core may call
+// `get() -> &T` from any context. The cell uses an `AtomicBool` initialised
+// flag and an `UnsafeCell<MaybeUninit<T>>` payload, with a release/acquire
+// pair so writes performed before `init` are visible to any reader that
+// observes the flag set.
 //
-//     static mut FOO: T = T::ZEROED;
-//     // ...write FOO once during single-threaded boot...
-//     // ...read FOO from many cores forever after...
+// On `cfg(vz_compat)` the init guard degrades to load+store (VZ.framework
+// rejects atomic RMW on guest RAM). This is sound because every caller in
+// the kernel initialises its `InitOnce` on the BSP during single-threaded
+// boot.
 //
-// `InitOnce<T>` replaces that pattern with a tiny safe-API primitive.
-// One core calls `init(value)` exactly once; afterward, every core may
-// call `get() -> &T` from any context. The cell internally uses an
-// `AtomicBool` initialised flag and an `UnsafeCell<MaybeUninit<T>>`
-// payload, with a release/acquire pair so any data written before
-// `init` is visible to readers that observe `initialized = true`.
-//
-// On vz_compat (atomic RMW faults on guest RAM) the init guard falls
-// back to non-atomic load+store, which is sound because all current
-// callers initialise on the BSP during single-threaded boot.
-//
-// This is the no_std equivalent of `std::sync::OnceLock<T>` minus the
+// This is the `no_std` equivalent of `std::sync::OnceLock<T>` minus the
 // init-on-first-read closure (init is explicit) and minus poisoning.
-// It runs under Miri without warnings and ships unit + multi-thread
-// integration tests.
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;

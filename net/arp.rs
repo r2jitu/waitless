@@ -31,6 +31,21 @@ struct ArpPacket {
 // SAFETY: repr(C, packed), all fields are POD integers/byte arrays.
 unsafe impl FromBytes for ArpPacket {}
 
+impl ArpPacket {
+    /// View this packet as a `&[u8]` of exactly its 28-byte wire size.
+    /// Safe because `ArpPacket` is `repr(C, packed)` POD.
+    fn as_bytes(&self) -> &[u8] {
+        // SAFETY: ArpPacket is repr(C, packed) with no padding and only
+        // POD fields, so any bit pattern is a valid byte slice.
+        unsafe {
+            core::slice::from_raw_parts(
+                self as *const _ as *const u8,
+                core::mem::size_of::<ArpPacket>(),
+            )
+        }
+    }
+}
+
 const ARP_OP_REQUEST: u16 = 1;
 const ARP_OP_REPLY: u16 = 2;
 
@@ -114,8 +129,7 @@ fn arp_request(target_ip: Ipv4Addr) {
         target_mac: MacAddr::ZERO,
         target_ip,
     };
-    let data = unsafe { core::slice::from_raw_parts(&pkt as *const _ as *const u8, 28) };
-    ethernet_send(MacAddr::BROADCAST, ETHERTYPE_ARP, data);
+    ethernet_send(MacAddr::BROADCAST, ETHERTYPE_ARP, pkt.as_bytes());
     // On VZ (vz_compat), this call stages the ARP request rather than sending
     // it directly. When arp_resolve is spinning (not running the event loop),
     // net_flush_cb never fires, so core 0 stays in WFI until a VirtIO RX
@@ -160,13 +174,12 @@ pub fn arp_receive(data: &[u8]) {
             target_mac: sender_mac,
             target_ip: sender_ip,
         };
-        let data = unsafe { core::slice::from_raw_parts(&reply as *const _ as *const u8, 28) };
-        ethernet_send(sender_mac, ETHERTYPE_ARP, data);
+        ethernet_send(sender_mac, ETHERTYPE_ARP, reply.as_bytes());
     }
 }
 
 pub fn arp_resolve(ip: Ipv4Addr) -> Option<MacAddr> {
-    if ip == Ipv4Addr::BROADCAST || ip.addr == 0xFFFFFFFF {
+    if ip == Ipv4Addr::BROADCAST {
         return Some(MacAddr::BROADCAST);
     }
     if ip == Ipv4Addr::ANY {
@@ -224,8 +237,7 @@ pub fn arp_announce() {
         target_mac: MacAddr::BROADCAST,
         target_ip: our_ip,
     };
-    let data = unsafe { core::slice::from_raw_parts(&pkt as *const _ as *const u8, 28) };
-    ethernet_send(MacAddr::BROADCAST, ETHERTYPE_ARP, data);
+    ethernet_send(MacAddr::BROADCAST, ETHERTYPE_ARP, pkt.as_bytes());
 }
 
 fn arp_poll_callback(frame: &[u8]) {

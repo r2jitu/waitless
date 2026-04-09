@@ -16,8 +16,7 @@ use crate::once::InitOnce;
 // FDT Info struct — device tree discovery results
 // ============================================================================
 
-/// Device information discovered from the FDT.
-/// Layout must match kernel/aarch64/fdt.h fdt::Info exactly.
+/// Device information discovered by parsing the FDT during boot.
 #[repr(C)]
 pub struct FdtInfo {
     pub uart_base: u64,

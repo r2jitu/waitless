@@ -31,7 +31,7 @@ struct IrqGuard {
 impl IrqGuard {
     #[inline]
     fn new() -> Self {
-        unsafe { arch_mask_irq() };
+        arch_mask_irq();
         IrqGuard { _no_send: core::marker::PhantomData }
     }
 }
@@ -39,7 +39,7 @@ impl IrqGuard {
 impl Drop for IrqGuard {
     #[inline]
     fn drop(&mut self) {
-        unsafe { arch_unmask_irq() };
+        arch_unmask_irq();
     }
 }
 
@@ -53,41 +53,49 @@ pub fn wait_for_events() {
         let _irq = IrqGuard::new();
         drivers::virtio_net::arm_rx_interrupts();
         if !drivers::virtio_net::has_pending_rx() && !drivers::virtio_net::has_pending_tx() {
-            unsafe { arch_idle() };
+            arch_idle();
         }
         drivers::virtio_net::flush_tx_staging();
         // _irq dropped here → unmask.
     } else {
-        unsafe { arch_cpu_relax() };
+        arch_cpu_relax();
     }
 }
 
-// ---- Architecture primitives (inline assembly) --------------------------------
+// ---- Architecture primitives ------------------------------------------------
+//
+// These are all safe to call from any context — they only affect the current
+// core and have no caller-supplied invariants. The asm! invocations are
+// genuinely unsafe (since the macro is `unsafe`) but the safety scope is
+// confined to "execute this instruction on the current CPU", which is always
+// sound. The functions therefore expose a safe API.
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
-unsafe fn arch_mask_irq() {
-    // no-op on x86 — idle() uses sti;hlt;cli internally
+fn arch_mask_irq() {
+    // no-op on x86 — idle() uses sti;hlt;cli atomically.
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
-unsafe fn arch_unmask_irq() {
-    // no-op on x86
+fn arch_unmask_irq() {
+    // no-op on x86 — see arch_mask_irq.
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
-unsafe fn arch_idle() {
+fn arch_idle() {
+    // STI;HLT;CLI — atomic idle pattern on x86. SAFETY: privileged but
+    // sound on the current CPU.
     unsafe {
-        // STI;HLT;CLI — atomic idle pattern on x86
         core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
-unsafe fn arch_cpu_relax() {
+fn arch_cpu_relax() {
+    // SAFETY: PAUSE is a hint, always sound.
     unsafe {
         core::arch::asm!("pause", options(nomem, nostack));
     }
@@ -95,16 +103,18 @@ unsafe fn arch_cpu_relax() {
 
 #[cfg(target_arch = "aarch64")]
 #[inline]
-unsafe fn arch_mask_irq() {
+fn arch_mask_irq() {
+    // Mask IRQ only (DAIF.I) — never touch FIQ, VZ uses it.
+    // SAFETY: affects the current CPU's PSTATE only.
     unsafe {
-        // Mask IRQ only (DAIF.I) — never touch FIQ, VZ uses it
         core::arch::asm!("msr daifset, #0x2", options(nomem, nostack));
     }
 }
 
 #[cfg(target_arch = "aarch64")]
 #[inline]
-unsafe fn arch_unmask_irq() {
+fn arch_unmask_irq() {
+    // SAFETY: affects the current CPU's PSTATE only.
     unsafe {
         core::arch::asm!("msr daifclr, #0x2", options(nomem, nostack));
     }
@@ -112,7 +122,9 @@ unsafe fn arch_unmask_irq() {
 
 #[cfg(target_arch = "aarch64")]
 #[inline]
-unsafe fn arch_idle() {
+fn arch_idle() {
+    // SAFETY: arms the per-CPU virtual timer and issues WFI on the current
+    // CPU. No caller-supplied invariants.
     unsafe {
         let freq: u64;
         core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq);
@@ -128,7 +140,8 @@ unsafe fn arch_idle() {
 
 #[cfg(target_arch = "aarch64")]
 #[inline]
-unsafe fn arch_cpu_relax() {
+fn arch_cpu_relax() {
+    // SAFETY: YIELD is a hint, always sound.
     unsafe {
         core::arch::asm!("yield", options(nomem, nostack));
     }

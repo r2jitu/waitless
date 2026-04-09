@@ -419,7 +419,8 @@ pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
             send_segment(src_ip, dst_port, src_port, c.snd_nxt, c.rcv_nxt, TCP_SYN | TCP_ACK, &[]);
         }
         unsafe {
-            (*conn_ptr(core, slot)).snd_nxt = (*conn_ptr(core, slot)).snd_nxt.wrapping_add(1);
+            let cp = conn_ptr(core, slot);
+            (*cp).snd_nxt = (*cp).snd_nxt.wrapping_add(1);
         }
         return;
     }

@@ -1,34 +1,22 @@
 // kernel/sync.rs — `Spinlock<T>`: typed RAII spinlock for shared mutable state.
 //
-// The "shared mutable state behind a CAS spinlock with paired lock/unlock"
-// pattern existed in three places before this primitive:
+// `Spinlock<T>` owns the protected data and hands out access only through a
+// guard:
 //
-//   * `kernel::serial::SerialTxGuard` — bespoke RAII guard around the
-//     serial TX spinlock.
-//   * `drivers::virtio_net::TxLockGuard` — bespoke RAII guard around the
-//     VirtIO TX queue spinlock.
-//   * `kernel::mm::{HEAP, FRAME_ALLOC}` — NOT locked at all (the only
-//     remaining Tier-1 footgun from the original safety audit).
+//   * `Spinlock::new(value)` consumes `value`. The only way to reach the
+//     interior is `lock() -> SpinlockGuard<T>`, which derefs to `&mut T`.
+//   * The guard is RAII — `Drop::drop` releases the lock. There is no
+//     `unlock()` API, so paired lock/unlock bugs are impossible.
+//   * The guard is `!Send` (`PhantomData<*mut ()>`), so it cannot leak
+//     across cores.
+//   * On `cfg(vz_compat)` the lock degrades to load+store with the same
+//     single-writer discipline, because VZ.framework rejects atomic RMW
+//     on guest RAM (see `project_vz_atomic_limitation.md`).
 //
-// Each bespoke guard duplicated the same CAS-or-vz_compat-fallback logic.
-// `Spinlock<T>` consolidates them into one audited type that:
-//
-//   * Owns the protected data: `Spinlock::new(value)` consumes `value`,
-//     and access is only via `lock() -> SpinlockGuard<T>` which derefs
-//     to `&mut T`.
-//   * Is RAII: the guard releases on Drop. Cannot forget to unlock,
-//     cannot double-unlock.
-//   * Is `!Send` for the guard (PhantomData<*mut ()>) so it can't escape
-//     the acquiring core.
-//   * Has a `cfg(vz_compat)` fallback to load+store (since VZ rejects
-//     atomic RMW), with the same single-writer guarantees the previous
-//     bespoke guards relied on.
-//
-// Zero cost: `Spinlock<T>` is `repr(C)` over an `AtomicBool` flag and an
-// `UnsafeCell<T>`. `lock()` inlines to a CAS loop (or a load+store on
-// vz_compat). `Drop::drop` inlines to one `store(false, Release)`. Field
-// access through `SpinlockGuard::deref_mut` is the same machine code as
-// a raw `*mut T` dereference.
+// Layout is `repr(C)` over an `AtomicBool` flag and an `UnsafeCell<T>`.
+// `lock()` inlines to a CAS loop (or a load+store on vz_compat); `Drop`
+// inlines to one `store(false, Release)`; field access through the guard
+// compiles to the same code as a raw `*mut T` dereference.
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};

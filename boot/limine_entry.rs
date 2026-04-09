@@ -30,7 +30,7 @@ core::arch::global_asm!(
     "    mov %rax, %cr4",
     "    xor %rbp, %rbp",
     "    and $-16, %rsp",
-    "    call limine_entry_cpp",
+    "    call limine_entry",
     "1: cli",
     "    hlt",
     "    jmp 1b",
@@ -175,7 +175,7 @@ static mut MEMMAP_REQUEST: MemmapRequest = MemmapRequest {
 
 // Entry point request
 // On x86_64, the stub (limine_boot.S) enables SSE before calling Rust.
-// On aarch64, Limine calls limine_entry_cpp directly.
+// On aarch64, Limine calls limine_entry directly.
 #[used]
 #[unsafe(link_section = ".limine_requests")]
 static mut ENTRY_POINT_REQUEST: EntryPointRequest = EntryPointRequest {
@@ -185,7 +185,7 @@ static mut ENTRY_POINT_REQUEST: EntryPointRequest = EntryPointRequest {
     #[cfg(target_arch = "x86_64")]
     entry: limine_entry_stub,
     #[cfg(target_arch = "aarch64")]
-    entry: limine_entry_cpp,
+    entry: limine_entry,
 };
 
 #[cfg(target_arch = "x86_64")]
@@ -261,7 +261,7 @@ static mut LIMINE_BOOT_INFO: BootInfo = BootInfo {
 };
 
 #[unsafe(no_mangle)]
-pub extern "C" fn limine_entry_cpp() {
+pub unsafe extern "C" fn limine_entry() {
     unsafe {
         // Build the BootInfo in a local first; commit to LIMINE_BOOT_INFO
         // once at the end. This avoids forming an `&mut LIMINE_BOOT_INFO`

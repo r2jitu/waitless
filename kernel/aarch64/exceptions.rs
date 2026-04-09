@@ -437,7 +437,7 @@ pub fn init() {
 }
 
 /// Register an IRQ handler (aarch64 GIC).
-/// On x86_64 this is a no-op — IDT registration goes through idt.cc.
+/// On x86_64 this is a no-op — IDT registration goes through `kernel::x86_64::idt`.
 pub fn register_irq(irq: u32, handler: fn(u32)) {
     #[cfg(target_arch = "aarch64")]
     unsafe { aarch64::register_irq(irq, handler); }

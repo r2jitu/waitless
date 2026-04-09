@@ -38,7 +38,7 @@ pub struct Ipv4Addr {
 
 impl Ipv4Addr {
     pub const ANY: Self = Ipv4Addr { addr: 0 };
-    pub const BROADCAST: Self = Ipv4Addr { addr: 0xFFFFFFFF };
+    pub const BROADCAST: Self = Ipv4Addr { addr: 0xFFFF_FFFF };
 
     pub fn from(a: u8, b: u8, c: u8, d: u8) -> Self {
         Ipv4Addr {
@@ -198,7 +198,7 @@ mod tests {
     #[test]
     fn ipv4_addr_constants() {
         assert_eq!(Ipv4Addr::ANY.addr, 0);
-        assert_eq!(Ipv4Addr::BROADCAST.addr, 0xFFFFFFFF);
+        assert_eq!(Ipv4Addr::BROADCAST.addr, 0xFFFF_FFFF);
     }
 
     #[test]

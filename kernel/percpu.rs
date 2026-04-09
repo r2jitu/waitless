@@ -236,7 +236,13 @@ impl PerCore {
 /// indexing pattern that this module used to open-code).
 static CORES: PerCpu<PerCore, MAX_CORES> =
     PerCpu::new([const { PerCore::new(0) }; MAX_CORES]);
-static mut NUM_CORES: u32 = 1;
+
+/// Number of online cores. Set once by `init()` on the BSP, then read
+/// by every core. AtomicU32 with Relaxed ordering — there is no other
+/// shared state synchronised by this counter; cores merely query it
+/// to know how many slots in `CORES` are valid.
+static NUM_CORES: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(1);
 
 /// AP poll function: registered by the network layer, called by APs in
 /// their event loop. Returns true if work was done.
@@ -252,15 +258,12 @@ static AP_POLL_FN: core::sync::atomic::AtomicPtr<()> =
 /// once, single-threaded, before any AP starts and before any call to
 /// `get()`. After init, all access is via shared `&'static PerCore`.
 pub unsafe fn init(count: u32) {
-    unsafe {
-        let n = count.min(MAX_CORES as u32);
-        NUM_CORES = n;
-    }
+    let n = count.min(MAX_CORES as u32);
+    NUM_CORES.store(n, core::sync::atomic::Ordering::Release);
     // Stamp each core's id into its slot. We bypass the `current()`
     // accessor here because at boot time the id field hasn't been
     // written yet — the convention "PerCore.id == its slot index" is
     // what we're establishing right now.
-    let n = unsafe { NUM_CORES };
     for i in 0..n {
         // SAFETY: init runs single-threaded on the BSP before APs
         // start; no other core has a reference to any slot yet.
@@ -282,7 +285,7 @@ pub unsafe fn get(id: u32) -> &'static PerCore {
 
 /// Get the total number of cores.
 pub fn num_cores() -> u32 {
-    unsafe { NUM_CORES }
+    NUM_CORES.load(core::sync::atomic::Ordering::Acquire)
 }
 
 // ============================================================================

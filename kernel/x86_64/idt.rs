@@ -1,10 +1,10 @@
-// kernel/x86_64/idt.rs -- Interrupt Descriptor Table implementation (Rust port)
+// kernel/x86_64/idt.rs -- Interrupt Descriptor Table implementation
 //
 // This file sets up the full x86_64 IDT:
 //   1. Remaps the 8259 PIC to vectors 32-47
 //   2. Installs 256 ISR stubs (defined in idt_stubs.S) into the IDT
 //   3. Loads the IDTR
-//   4. Provides a common C-linkage dispatcher called from assembly
+//   4. Provides a common dispatcher called from the assembly stubs
 //
 // The ISR assembly stubs and their table are defined in a separate .S file.
 // That file provides `isr_stub_table`: an array of 256 function pointers.

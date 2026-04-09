@@ -199,64 +199,70 @@ fn dhcp_receive(frame: &[u8]) {
 
 fn build_dhcp_base() -> DhcpPacket {
     let mac = ethernet_our_mac();
-    let mut pkt: DhcpPacket = unsafe { core::mem::zeroed() };
-    pkt.op = 1; // BOOTREQUEST
-    pkt.htype = 1; // Ethernet
-    pkt.hlen = 6;
-    pkt.xid = DHCP_STATE.lock().xid;
-    pkt.flags = htons(0x8000); // Broadcast
-    pkt.magic_cookie = htonl(0x63825363);
-    pkt.chaddr[..6].copy_from_slice(&mac.bytes);
-    pkt
+    let mut chaddr = [0u8; 16];
+    chaddr[..6].copy_from_slice(&mac.bytes);
+    DhcpPacket {
+        op: 1,    // BOOTREQUEST
+        htype: 1, // Ethernet
+        hlen: 6,
+        hops: 0,
+        xid: DHCP_STATE.lock().xid,
+        secs: 0,
+        flags: htons(0x8000), // Broadcast
+        ciaddr: Ipv4Addr::ANY,
+        yiaddr: Ipv4Addr::ANY,
+        siaddr: Ipv4Addr::ANY,
+        giaddr: Ipv4Addr::ANY,
+        chaddr,
+        sname: [0; 64],
+        file: [0; 128],
+        magic_cookie: htonl(0x63825363),
+    }
 }
 
-fn dhcp_send_discover() {
-    // Build Ethernet + IP + UDP + DHCP frame
-    let mut frame = [0u8; 590]; // 14 eth + 20 ip + 8 udp + dhcp
+const DHCP_OFFSET: usize = 14 + 20 + 8;
+
+/// Build the Ethernet/IP/UDP/DHCP-base prologue into `frame` and return the
+/// option-write position (start of DHCP options).
+fn dhcp_frame_prologue(frame: &mut [u8]) -> usize {
     let our_mac = ethernet_our_mac();
 
-    // Ethernet header
     let eth = unsafe { &mut *(frame.as_mut_ptr() as *mut EthernetHeader) };
     eth.dst = MacAddr::BROADCAST;
     eth.src = our_mac;
     eth.ethertype = htons(ETHERTYPE_IPV4);
 
-    // DHCP packet
     let dhcp_base = build_dhcp_base();
-    let dhcp_offset = 14 + 20 + 8;
     unsafe {
         ptr::copy_nonoverlapping(
             &dhcp_base as *const _ as *const u8,
-            frame.as_mut_ptr().add(dhcp_offset),
+            frame.as_mut_ptr().add(DHCP_OFFSET),
             240,
         );
     }
 
-    // DHCP options
-    let mut opt_pos = dhcp_offset + 240;
-    frame[opt_pos] = 53; frame[opt_pos + 1] = 1; frame[opt_pos + 2] = DHCP_DISCOVER; opt_pos += 3;
-    // Parameter request list
-    frame[opt_pos] = 55; frame[opt_pos + 1] = 3; frame[opt_pos + 2] = 1; frame[opt_pos + 3] = 3; frame[opt_pos + 4] = 6; opt_pos += 5;
-    frame[opt_pos] = 255; opt_pos += 1;
+    DHCP_OFFSET + 240
+}
 
+/// Pad to BOOTP minimum, fill in UDP/IP headers + checksum, and return the
+/// total wire length to send.
+fn dhcp_frame_finalize(frame: &mut [u8], mut opt_pos: usize) -> usize {
     // Pad DHCP payload to minimum 300 bytes (RFC 2131 / BOOTP minimum)
-    let min_dhcp_end = dhcp_offset + 300;
+    let min_dhcp_end = DHCP_OFFSET + 300;
     if opt_pos < min_dhcp_end {
         opt_pos = min_dhcp_end;
     }
 
-    let dhcp_len = opt_pos - dhcp_offset;
+    let dhcp_len = opt_pos - DHCP_OFFSET;
     let udp_len = 8 + dhcp_len;
     let ip_total = 20 + udp_len;
 
-    // UDP header
     let udp = unsafe { &mut *(frame.as_mut_ptr().add(14 + 20) as *mut UdpHeader) };
     udp.src_port = htons(68);
     udp.dst_port = htons(67);
     udp.length = htons(udp_len as u16);
     udp.checksum = 0;
 
-    // IP header
     let ip = unsafe { &mut *(frame.as_mut_ptr().add(14) as *mut Ipv4Header) };
     ip.version_ihl = 0x45;
     ip.total_length = htons(ip_total as u16);
@@ -267,35 +273,32 @@ fn dhcp_send_discover() {
     ip.checksum = 0;
     ip.checksum = unsafe { checksum(frame.as_ptr().add(14) as *const u8, 20) };
 
-    drivers::virtio_net::send(&frame[..14 + ip_total]);
+    14 + ip_total
+}
+
+fn dhcp_send_discover() {
+    let mut frame = [0u8; 590]; // 14 eth + 20 ip + 8 udp + dhcp
+
+    let mut opt_pos = dhcp_frame_prologue(&mut frame);
+    frame[opt_pos] = 53; frame[opt_pos + 1] = 1; frame[opt_pos + 2] = DHCP_DISCOVER; opt_pos += 3;
+    // Parameter request list
+    frame[opt_pos] = 55; frame[opt_pos + 1] = 3; frame[opt_pos + 2] = 1; frame[opt_pos + 3] = 3; frame[opt_pos + 4] = 6; opt_pos += 5;
+    frame[opt_pos] = 255; opt_pos += 1;
+
+    let total = dhcp_frame_finalize(&mut frame, opt_pos);
+    drivers::virtio_net::send(&frame[..total]);
 }
 
 fn dhcp_send_request() {
     let mut frame = [0u8; 590];
-    let our_mac = ethernet_our_mac();
 
-    let eth = unsafe { &mut *(frame.as_mut_ptr() as *mut EthernetHeader) };
-    eth.dst = MacAddr::BROADCAST;
-    eth.src = our_mac;
-    eth.ethertype = htons(ETHERTYPE_IPV4);
-
-    let dhcp_base = build_dhcp_base();
-    let dhcp_offset = 14 + 20 + 8;
-    unsafe {
-        ptr::copy_nonoverlapping(
-            &dhcp_base as *const _ as *const u8,
-            frame.as_mut_ptr().add(dhcp_offset),
-            240,
-        );
-    }
+    let mut opt_pos = dhcp_frame_prologue(&mut frame);
 
     let (offered_ip, server_ip) = {
         let s = DHCP_STATE.lock();
         (s.offered_ip, s.server_ip)
     };
 
-    // DHCP options
-    let mut opt_pos = dhcp_offset + 240;
     frame[opt_pos] = 53; frame[opt_pos + 1] = 1; frame[opt_pos + 2] = DHCP_REQUEST; opt_pos += 3;
     // Requested IP
     let ip_bytes = offered_ip.octets();
@@ -311,33 +314,8 @@ fn dhcp_send_request() {
     frame[opt_pos] = 55; frame[opt_pos + 1] = 3; frame[opt_pos + 2] = 1; frame[opt_pos + 3] = 3; frame[opt_pos + 4] = 6; opt_pos += 5;
     frame[opt_pos] = 255; opt_pos += 1;
 
-    // Pad DHCP payload to minimum 300 bytes (RFC 2131 / BOOTP minimum)
-    let min_dhcp_end = dhcp_offset + 300;
-    if opt_pos < min_dhcp_end {
-        opt_pos = min_dhcp_end;
-    }
-
-    let dhcp_len = opt_pos - dhcp_offset;
-    let udp_len = 8 + dhcp_len;
-    let ip_total = 20 + udp_len;
-
-    let udp = unsafe { &mut *(frame.as_mut_ptr().add(14 + 20) as *mut UdpHeader) };
-    udp.src_port = htons(68);
-    udp.dst_port = htons(67);
-    udp.length = htons(udp_len as u16);
-    udp.checksum = 0;
-
-    let ip = unsafe { &mut *(frame.as_mut_ptr().add(14) as *mut Ipv4Header) };
-    ip.version_ihl = 0x45;
-    ip.total_length = htons(ip_total as u16);
-    ip.ttl = 64;
-    ip.protocol = PROTO_UDP;
-    ip.src = Ipv4Addr::ANY;
-    ip.dst = Ipv4Addr::BROADCAST;
-    ip.checksum = 0;
-    ip.checksum = unsafe { checksum(frame.as_ptr().add(14) as *const u8, 20) };
-
-    drivers::virtio_net::send(&frame[..14 + ip_total]);
+    let total = dhcp_frame_finalize(&mut frame, opt_pos);
+    drivers::virtio_net::send(&frame[..total]);
 }
 
 fn dhcp_poll_wait(timeout_ms: u32) -> bool {

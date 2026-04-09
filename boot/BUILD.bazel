@@ -6,7 +6,7 @@ package(default_visibility = ["//visibility:public"])
 exports_files(["limine.conf"])
 
 # Boot/entry code — rust_static_library targets that provide #[no_mangle]
-# symbols resolved at link time by assembly (kernel_main, limine_entry_cpp,
+# symbols resolved at link time by assembly (kernel_main, limine_entry,
 # memcpy). Separate from the clean kernel library crate.
 
 rust_static_library(

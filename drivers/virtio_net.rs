@@ -61,6 +61,21 @@ struct TxBuf {
     data: [u8; MAX_ETH_FRAME],
 }
 
+impl TxBuf {
+    const ZERO: Self = TxBuf {
+        hdr: VirtioNetHeader {
+            flags: 0,
+            gso_type: 0,
+            hdr_len: 0,
+            gso_size: 0,
+            csum_start: 0,
+            csum_offset: 0,
+            num_buffers: 0,
+        },
+        data: [0; MAX_ETH_FRAME],
+    };
+}
+
 // Transport state
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Transport {
@@ -84,7 +99,7 @@ struct QueuePairState {
 
 impl QueuePairState {
     const ZEROED: Self = QueuePairState {
-        tx_pool: unsafe { core::mem::zeroed() },
+        tx_pool: [const { TxBuf::ZERO }; TX_POOL_SIZE],
         tx_pool_used: [false; TX_POOL_SIZE],
         rx_buffers: [ptr::null_mut(); RX_BUFFERS],
     };
@@ -216,14 +231,15 @@ fn init_pci_modern() -> bool {
         let rx_qsize = vpci_get_queue_size(dev);
         let rx_notify_off = vpci_get_queue_notify_off(dev);
         let rx_notify = vpci_queue_notify_addr(dev, rx_notify_off);
-        let rx_addrs = unsafe {
-            match (*ndev()).rx_queues[pair].init_pci_modern(rx_qsize, rx_notify, rx_qi) {
-                Some(a) => a,
-                None => {
-                    log(b"virtio_net: failed to init RX queue\n");
-                    vpci_set_status(dev, STATUS_FAILED);
-                    return false;
-                }
+        // SAFETY: ndev() returns the singleton; per-qp init runs once during boot
+        // before any other core touches rx_queues[pair].
+        let rx_init = unsafe { (*ndev()).rx_queues[pair].init_pci_modern(rx_qsize, rx_notify, rx_qi) };
+        let rx_addrs = match rx_init {
+            Some(a) => a,
+            None => {
+                log(b"virtio_net: failed to init RX queue\n");
+                vpci_set_status(dev, STATUS_FAILED);
+                return false;
             }
         };
         vpci_set_queue_addrs(dev, rx_addrs.0, rx_addrs.1, rx_addrs.2);
@@ -234,14 +250,14 @@ fn init_pci_modern() -> bool {
         let tx_qsize = vpci_get_queue_size(dev);
         let tx_notify_off = vpci_get_queue_notify_off(dev);
         let tx_notify = vpci_queue_notify_addr(dev, tx_notify_off);
-        let tx_addrs = unsafe {
-            match (*ndev()).tx_queues[pair].init_pci_modern(tx_qsize, tx_notify, tx_qi) {
-                Some(a) => a,
-                None => {
-                    log(b"virtio_net: failed to init TX queue\n");
-                    vpci_set_status(dev, STATUS_FAILED);
-                    return false;
-                }
+        // SAFETY: see RX comment above.
+        let tx_init = unsafe { (*ndev()).tx_queues[pair].init_pci_modern(tx_qsize, tx_notify, tx_qi) };
+        let tx_addrs = match tx_init {
+            Some(a) => a,
+            None => {
+                log(b"virtio_net: failed to init TX queue\n");
+                vpci_set_status(dev, STATUS_FAILED);
+                return false;
             }
         };
         vpci_set_queue_addrs(dev, tx_addrs.0, tx_addrs.1, tx_addrs.2);
@@ -256,15 +272,18 @@ fn init_pci_modern() -> bool {
         if ctrl_qsize > 0 {
             let ctrl_notify_off = vpci_get_queue_notify_off(dev);
             let ctrl_notify = vpci_queue_notify_addr(dev, ctrl_notify_off);
-            let ctrl_addrs = unsafe {
-                match (*ndev()).ctrl_queue.init_pci_modern(ctrl_qsize, ctrl_notify, ctrl_qi) {
-                    Some(a) => a,
-                    None => {
-                        log(b"virtio_net: failed to init CTRL queue\n");
-                        // Non-fatal: fall back to single queue
-                        (*ndev()).num_queue_pairs = 1; (*ndev()).has_mq = false;
-                        (0, 0, 0) // won't be used
+            // SAFETY: single-threaded boot init.
+            let ctrl_init = unsafe { (*ndev()).ctrl_queue.init_pci_modern(ctrl_qsize, ctrl_notify, ctrl_qi) };
+            let ctrl_addrs = match ctrl_init {
+                Some(a) => a,
+                None => {
+                    log(b"virtio_net: failed to init CTRL queue\n");
+                    // Non-fatal: fall back to single queue
+                    unsafe {
+                        (*ndev()).num_queue_pairs = 1;
+                        (*ndev()).has_mq = false;
                     }
+                    (0, 0, 0) // won't be used
                 }
             };
             if ctrl_addrs.0 != 0 {
@@ -644,8 +663,7 @@ fn tx_drain() {
 
 // ---- IRQ handler -----------------------------------------------------------
 
-// x86_64: extern "C" fn() wrapper for the idt.cc trampoline
-#[cfg(target_arch = "x86_64")]
+// x86_64: extern "C" fn() wrapper for the IDT stub trampoline
 #[cfg(target_arch = "x86_64")]
 unsafe extern "C" fn irq_handler_x86(_frame: *mut kernel::x86_64::idt::InterruptFrame) {
     irq_handler(0);
