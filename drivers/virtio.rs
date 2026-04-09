@@ -9,7 +9,7 @@ use crate::{
     vz_config_delay,
 };
 use crate::pci::{
-    PCI_DEVICES, read_config, write_config, find_device,
+    pci_device, read_config, write_config, find_device,
     enable_bus_mastering_inner, read_bar64,
 };
 #[cfg(target_arch = "aarch64")]
@@ -51,6 +51,7 @@ const CC_QUEUE_DEVICE_HI: u64 = 0x34;
 
 pub(crate) const VIRTIO_PCI_MAX_DEVICES: usize = 8;
 
+#[derive(Clone, Copy)]
 pub(crate) struct VirtioPciDevice {
     pub pci_idx: usize,         // index into PCI_DEVICES
     pub common_cfg: u64,        // MMIO address of common_cfg
@@ -83,14 +84,35 @@ impl VirtioPciDevice {
     };
 }
 
-pub(crate) static mut VPCI_DEVICES: [VirtioPciDevice; VIRTIO_PCI_MAX_DEVICES] =
-    [VirtioPciDevice::ZERO; VIRTIO_PCI_MAX_DEVICES];
-pub(crate) static mut VPCI_DEVICE_COUNT: usize = 0;
+/// VirtIO-PCI device table. Filled during init by `vpci_find`; read
+/// thereafter as snapshots via `vpci_device(idx)`. Same shape as
+/// `pci::PCI_DEVICES`.
+pub(crate) struct VpciTable {
+    pub(crate) devices: [VirtioPciDevice; VIRTIO_PCI_MAX_DEVICES],
+    pub(crate) count: usize,
+}
+
+impl VpciTable {
+    const fn new() -> Self {
+        VpciTable {
+            devices: [VirtioPciDevice::ZERO; VIRTIO_PCI_MAX_DEVICES],
+            count: 0,
+        }
+    }
+}
+
+pub(crate) static VPCI_DEVICES: kernel::sync::Spinlock<VpciTable> =
+    kernel::sync::Spinlock::new(VpciTable::new());
+
+/// Snapshot of `VPCI_DEVICES[idx]` returned by value.
+pub(crate) fn vpci_device(idx: usize) -> VirtioPciDevice {
+    VPCI_DEVICES.lock().devices[idx]
+}
 
 /// Resolve a PCI BAR to a CPU virtual address. Maps above-4GB ranges on aarch64.
 fn resolve_bar(pci_idx: usize, bar_idx: usize) -> u64 {
-    let dev = unsafe { &PCI_DEVICES[pci_idx] };
-    let addr = read_bar64(dev, bar_idx);
+    let dev = pci_device(pci_idx);
+    let addr = read_bar64(&dev, bar_idx);
     if addr == 0 { return 0; }
 
     #[cfg(target_arch = "aarch64")]
@@ -103,7 +125,7 @@ fn resolve_bar(pci_idx: usize, bar_idx: usize) -> u64 {
 
 /// Parse PCI capability list to find virtio-specific config structures.
 fn vpci_parse_caps(dev: &mut VirtioPciDevice) -> bool {
-    let pci = unsafe { &PCI_DEVICES[dev.pci_idx] };
+    let pci = pci_device(dev.pci_idx);
     let (bus, slot, func) = (pci.bus, pci.slot, pci.func);
 
     // Check capabilities bit in Status register
@@ -171,20 +193,21 @@ pub(crate) fn vpci_find(virtio_device_type: u16) -> Option<usize> {
     let pci_idx = find_device(0x1AF4, modern_id)
         .or_else(|| find_device(0x1AF4, transitional_id))?;
 
-    unsafe {
-        if VPCI_DEVICE_COUNT >= VIRTIO_PCI_MAX_DEVICES { return None; }
-        let idx = VPCI_DEVICE_COUNT;
-        let dev = &mut VPCI_DEVICES[idx];
-        *dev = VirtioPciDevice::ZERO;
-        dev.pci_idx = pci_idx;
+    enable_bus_mastering_inner(pci_device(pci_idx).slot);
 
-        enable_bus_mastering_inner(PCI_DEVICES[pci_idx].slot);
-
-        if !vpci_parse_caps(dev) { return None; }
-
-        VPCI_DEVICE_COUNT += 1;
-        Some(idx)
+    // Build the VPCI entry in a local, then commit to the table.
+    let mut dev = VirtioPciDevice::ZERO;
+    dev.pci_idx = pci_idx;
+    if !vpci_parse_caps(&mut dev) {
+        return None;
     }
+
+    let mut table = VPCI_DEVICES.lock();
+    if table.count >= VIRTIO_PCI_MAX_DEVICES { return None; }
+    let idx = table.count;
+    table.devices[idx] = dev;
+    table.count += 1;
+    Some(idx)
 }
 
 // VirtIO PCI transport operations via common_cfg MMIO

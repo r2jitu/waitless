@@ -5,6 +5,7 @@ use crate::{log, mmio_read32, mmio_write32, mmio_read16, mmio_write16};
 use crate::map_device_range;
 #[cfg(target_arch = "aarch64")]
 use kernel::aarch64::fdt;
+use kernel::sync::Spinlock;
 
 #[cfg(target_arch = "x86_64")]
 use crate::{outl, inl};
@@ -40,13 +41,31 @@ impl PciDevice {
     };
 }
 
-pub(crate) static mut PCI_DEVICES: [PciDevice; PCI_MAX_DEVICES] = [PciDevice::ZERO; PCI_MAX_DEVICES];
-pub(crate) static mut PCI_DEVICE_COUNT: usize = 0;
+/// Discovered PCI devices + how many slots are filled. Behind a
+/// spinlock so any future cross-core read/write is sound. The bus scan
+/// fills the table during init (BSP, single-threaded); the rest of the
+/// driver layer reads it via `find_device`/`pci_devices_get`.
+pub(crate) struct PciDeviceTable {
+    pub(crate) devices: [PciDevice; PCI_MAX_DEVICES],
+    pub(crate) count: usize,
+}
+
+impl PciDeviceTable {
+    const fn new() -> Self {
+        PciDeviceTable {
+            devices: [PciDevice::ZERO; PCI_MAX_DEVICES],
+            count: 0,
+        }
+    }
+}
+
+pub(crate) static PCI_DEVICES: Spinlock<PciDeviceTable> =
+    Spinlock::new(PciDeviceTable::new());
 
 /// Init guard. Replaces a `static mut bool` checked-then-set, which would
-/// let two cores both pass the guard and double-scan the bus, racing on
-/// `PCI_DEVICES`/`PCI_DEVICE_COUNT`. `compare_exchange` makes the
-/// "first caller wins, others bail" intent race-free.
+/// let two cores both pass the guard and double-scan the bus.
+/// `compare_exchange` makes the "first caller wins, others bail" intent
+/// race-free.
 ///
 /// On vz_compat (where atomic RMW faults), fall back to a non-atomic
 /// load+store. PCI init is single-threaded on every backend in practice
@@ -58,15 +77,35 @@ static PCI_INITIALIZED: core::sync::atomic::AtomicBool =
 
 // ---- Config space access (arch-specific unsafe core) ------------------------
 
+/// ECAM base. Set once in init_inner from FDT, read by every config
+/// access. AtomicU64 with Relaxed ordering — the publish happens once
+/// during single-threaded boot, all subsequent reads see the same
+/// value, and the volatile MMIO ops on the resulting address provide
+/// the actual hardware ordering.
 #[cfg(target_arch = "aarch64")]
-pub(crate) static mut G_ECAM_BASE: u64 = 0x40_1000_0000;
+pub(crate) static G_ECAM_BASE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0x40_1000_0000);
+/// MMIO allocation pool cursor. Mutated by `assign_bars` during the
+/// init bus scan; the spinlock around it serialises future cross-core
+/// scans (currently only the BSP scans, but the lock makes it safe).
 #[cfg(target_arch = "aarch64")]
-pub(crate) static mut G_PCI_MEM_NEXT: u64 = 0x1000_0000; // MMIO allocation pool
+pub(crate) static G_PCI_MEM_NEXT: Spinlock<u64> = Spinlock::new(0x1000_0000);
 
 #[cfg(target_arch = "x86_64")]
 const PCI_CONFIG_ADDR: u16 = 0x0CF8;
 #[cfg(target_arch = "x86_64")]
 const PCI_CONFIG_DATA: u16 = 0x0CFC;
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn ecam_addr(bus: u8, slot: u8, func: u8, offset: u8) -> u64 {
+    let base = G_ECAM_BASE.load(core::sync::atomic::Ordering::Relaxed);
+    base
+        + ((bus as u64) << 20)
+        + ((slot as u64) << 15)
+        + ((func as u64) << 12)
+        + (offset as u64)
+}
 
 /// Read 32-bit PCI config register (offset must be 4-byte aligned).
 pub(crate) fn read_config(bus: u8, slot: u8, func: u8, offset: u8) -> u32 {
@@ -83,12 +122,7 @@ pub(crate) fn read_config(bus: u8, slot: u8, func: u8, offset: u8) -> u32 {
         }
         #[cfg(target_arch = "aarch64")]
         {
-            let ecam_addr = G_ECAM_BASE
-                + ((bus as u64) << 20)
-                + ((slot as u64) << 15)
-                + ((func as u64) << 12)
-                + ((offset as u64) & 0xFC);
-            mmio_read32(ecam_addr)
+            mmio_read32(ecam_addr(bus, slot, func, offset & 0xFC))
         }
     }
 }
@@ -108,12 +142,7 @@ pub(crate) fn write_config(bus: u8, slot: u8, func: u8, offset: u8, val: u32) {
         }
         #[cfg(target_arch = "aarch64")]
         {
-            let ecam_addr = G_ECAM_BASE
-                + ((bus as u64) << 20)
-                + ((slot as u64) << 15)
-                + ((func as u64) << 12)
-                + ((offset as u64) & 0xFC);
-            mmio_write32(ecam_addr, val);
+            mmio_write32(ecam_addr(bus, slot, func, offset & 0xFC), val);
         }
     }
 }
@@ -121,28 +150,14 @@ pub(crate) fn write_config(bus: u8, slot: u8, func: u8, offset: u8, val: u32) {
 /// Read 16-bit PCI config register (aarch64 ECAM supports sub-dword access).
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn read_config16(bus: u8, slot: u8, func: u8, offset: u8) -> u16 {
-    unsafe {
-        let ecam_addr = G_ECAM_BASE
-            + ((bus as u64) << 20)
-            + ((slot as u64) << 15)
-            + ((func as u64) << 12)
-            + (offset as u64);
-        mmio_read16(ecam_addr)
-    }
+    unsafe { mmio_read16(ecam_addr(bus, slot, func, offset)) }
 }
 
 /// Write 16-bit PCI config register.
 /// Critical for Command register (offset 0x04) to avoid clobbering Status.
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn write_config16(bus: u8, slot: u8, func: u8, offset: u8, val: u16) {
-    unsafe {
-        let ecam_addr = G_ECAM_BASE
-            + ((bus as u64) << 20)
-            + ((slot as u64) << 15)
-            + ((func as u64) << 12)
-            + (offset as u64);
-        mmio_write16(ecam_addr, val);
-    }
+    unsafe { mmio_write16(ecam_addr(bus, slot, func, offset), val); }
 }
 
 // ---- BAR assignment (aarch64 only) ------------------------------------------
@@ -157,6 +172,8 @@ fn assign_bars(dev: &mut PciDevice) {
     let cmd = read_config16(dev.bus, dev.slot, dev.func, 0x04);
     if (cmd & 0x02) != 0 { return; } // Already enabled
 
+    let mut mmio_next = G_PCI_MEM_NEXT.lock();
+
     let mut i = 0;
     while i < 6 {
         let bar_val = dev.bar[i];
@@ -170,26 +187,26 @@ fn assign_bars(dev: &mut PciDevice) {
             continue;
         }
 
-        unsafe {
-            if is_io {
-                // Skip I/O BARs on aarch64
-            } else if is_64bit {
-                let alloc = (G_PCI_MEM_NEXT + 0x3F_FFFF) & !0x3F_FFFF; // 4MB align
-                write_config(dev.bus, dev.slot, dev.func, (0x10 + i * 4) as u8, (alloc as u32) | (bar_val & 0x0F));
-                write_config(dev.bus, dev.slot, dev.func, (0x10 + (i + 1) * 4) as u8, (alloc >> 32) as u32);
-                dev.bar[i] = (alloc as u32) | (bar_val & 0x0F);
-                dev.bar[i + 1] = (alloc >> 32) as u32;
-                G_PCI_MEM_NEXT = alloc + 0x40_0000; // 4MB block
-            } else {
-                let alloc = (G_PCI_MEM_NEXT + 0x3F_FFFF) & !0x3F_FFFF; // 4MB align
-                write_config(dev.bus, dev.slot, dev.func, (0x10 + i * 4) as u8, (alloc as u32) | (bar_val & 0x0F));
-                dev.bar[i] = (alloc as u32) | (bar_val & 0x0F);
-                G_PCI_MEM_NEXT = alloc + 0x40_0000;
-            }
+        if is_io {
+            // Skip I/O BARs on aarch64
+        } else if is_64bit {
+            let alloc = (*mmio_next + 0x3F_FFFF) & !0x3F_FFFF; // 4MB align
+            write_config(dev.bus, dev.slot, dev.func, (0x10 + i * 4) as u8, (alloc as u32) | (bar_val & 0x0F));
+            write_config(dev.bus, dev.slot, dev.func, (0x10 + (i + 1) * 4) as u8, (alloc >> 32) as u32);
+            dev.bar[i] = (alloc as u32) | (bar_val & 0x0F);
+            dev.bar[i + 1] = (alloc >> 32) as u32;
+            *mmio_next = alloc + 0x40_0000; // 4MB block
+        } else {
+            let alloc = (*mmio_next + 0x3F_FFFF) & !0x3F_FFFF; // 4MB align
+            write_config(dev.bus, dev.slot, dev.func, (0x10 + i * 4) as u8, (alloc as u32) | (bar_val & 0x0F));
+            dev.bar[i] = (alloc as u32) | (bar_val & 0x0F);
+            *mmio_next = alloc + 0x40_0000;
         }
 
         i += if is_64bit { 2 } else { 1 };
     }
+
+    drop(mmio_next);
 
     // Enable I/O + Memory Space + Bus Master
     let new_cmd = cmd | 0x07;
@@ -234,11 +251,11 @@ fn probe_function(bus: u8, slot: u8, func: u8) -> bool {
         }
     }
 
-    unsafe {
-        if PCI_DEVICE_COUNT < PCI_MAX_DEVICES {
-            PCI_DEVICES[PCI_DEVICE_COUNT] = dev;
-            PCI_DEVICE_COUNT += 1;
-        }
+    let mut table = PCI_DEVICES.lock();
+    if table.count < PCI_MAX_DEVICES {
+        let idx = table.count;
+        table.devices[idx] = dev;
+        table.count += 1;
     }
 
     true
@@ -267,17 +284,17 @@ fn init_inner() {
     log(b"[PCI] Scanning bus 0...\n");
 
     #[cfg(target_arch = "aarch64")]
-    unsafe {
+    {
         let fdt = fdt::info();
         if fdt.pcie_ecam_base != 0 {
-            G_ECAM_BASE = fdt.pcie_ecam_base;
-            if G_ECAM_BASE >= 0x1_0000_0000 {
-                map_device_range(G_ECAM_BASE, fdt.pcie_ecam_size);
+            G_ECAM_BASE.store(fdt.pcie_ecam_base, core::sync::atomic::Ordering::Relaxed);
+            if fdt.pcie_ecam_base >= 0x1_0000_0000 {
+                map_device_range(fdt.pcie_ecam_base, fdt.pcie_ecam_size);
             }
         }
         if fdt.pci_mmio32_base != 0 {
             // Reserve first 4MB for console (init_vz uses base directly)
-            G_PCI_MEM_NEXT = fdt.pci_mmio32_base + 0x40_0000;
+            *G_PCI_MEM_NEXT.lock() = fdt.pci_mmio32_base + 0x40_0000;
         }
     }
 
@@ -299,14 +316,20 @@ fn init_inner() {
 }
 
 pub(crate) fn find_device(vendor_id: u16, device_id: u16) -> Option<usize> {
-    unsafe {
-        for i in 0..PCI_DEVICE_COUNT {
-            if PCI_DEVICES[i].vendor_id == vendor_id && PCI_DEVICES[i].device_id == device_id {
-                return Some(i);
-            }
+    let table = PCI_DEVICES.lock();
+    for i in 0..table.count {
+        if table.devices[i].vendor_id == vendor_id && table.devices[i].device_id == device_id {
+            return Some(i);
         }
     }
     None
+}
+
+/// Snapshot of `PCI_DEVICES[idx]` returned by value. PciDevice is Copy
+/// so this is a cheap struct copy out from under the lock; the caller
+/// can then read fields/BARs without holding the lock.
+pub(crate) fn pci_device(idx: usize) -> PciDevice {
+    PCI_DEVICES.lock().devices[idx]
 }
 
 pub(crate) fn enable_bus_mastering_inner(slot: u8) {

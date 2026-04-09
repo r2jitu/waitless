@@ -6,7 +6,6 @@
 // public APIs are safe where possible.
 
 #![no_std]
-#![allow(static_mut_refs)]
 #![allow(dead_code, unused_imports)]  // register constants + arch-conditional imports
 
 use core::arch::asm;

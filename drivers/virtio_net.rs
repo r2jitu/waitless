@@ -11,9 +11,9 @@ use crate::{
 };
 #[cfg(target_arch = "aarch64")]
 use kernel::aarch64::{exceptions, fdt};
-use crate::pci::{PCI_DEVICES, read_config, find_device, enable_bus_mastering_inner};
+use crate::pci::{pci_device, read_config, find_device, enable_bus_mastering_inner};
 use crate::virtio::{
-    VPCI_DEVICES, Virtqueue,
+    vpci_device, Virtqueue,
     vpci_find, vpci_reset, vpci_set_status, vpci_get_status,
     vpci_read_features, vpci_write_features,
     vpci_select_queue, vpci_get_queue_size, vpci_get_queue_notify_off,
@@ -165,7 +165,8 @@ fn init_pci_modern() -> bool {
 
     log(b"virtio_net: found modern virtio-pci net device\n");
 
-    let dev = unsafe { &VPCI_DEVICES[vpci_idx] };
+    let dev_snap = vpci_device(vpci_idx);
+    let dev = &dev_snap;
 
     vpci_reset(dev);
     vpci_set_status(dev, STATUS_ACKNOWLEDGE);
@@ -525,7 +526,8 @@ fn init_legacy_pci() -> bool {
         None => return false,
     };
 
-    let dev = unsafe { &PCI_DEVICES[pci_idx] };
+    let dev_snap = pci_device(pci_idx);
+    let dev = &dev_snap;
     log(b"virtio_net: found legacy PCI device\n");
 
     // Verify subsystem device ID = 1 (network)
@@ -657,7 +659,8 @@ fn irq_handler(_irq: u32) {
         // Acknowledge device interrupt
         match (*ndev()).transport {
             Transport::ModernPci { vpci_idx } => {
-                vpci_read_isr(&VPCI_DEVICES[vpci_idx]);
+                let dev = vpci_device(vpci_idx);
+                vpci_read_isr(&dev);
             }
             #[cfg(target_arch = "aarch64")]
             Transport::Mmio { base, .. } => {
@@ -1000,7 +1003,7 @@ pub fn enable_irq() {
 
             match (*ndev()).transport {
                 Transport::ModernPci { vpci_idx } if fdt.gic_dist_base != 0 => {
-                    let slot = PCI_DEVICES[VPCI_DEVICES[vpci_idx].pci_idx].slot;
+                    let slot = pci_device(vpci_device(vpci_idx).pci_idx).slot;
                     let intid = if (slot as usize) < 8 { fdt.pci_irqs[slot as usize] } else { 0 };
                     if intid != 0 {
                         (*ndev()).rx_queues[0].enable_interrupts();
@@ -1025,7 +1028,7 @@ pub fn enable_irq() {
         #[cfg(target_arch = "x86_64")]
         {
             if let Transport::LegacyPci { pci_idx, .. } = (*ndev()).transport {
-                let dev = &PCI_DEVICES[pci_idx];
+                let dev = pci_device(pci_idx);
                 let irq_reg = read_config(dev.bus, dev.slot, dev.func, 0x3C);
                 let irq_line = (irq_reg & 0xFF) as u8;
                 if irq_line < 16 {
