@@ -148,6 +148,9 @@ impl Vm {
         check(unsafe { hv_vcpu_create(&mut vcpu, &mut exit_ptr, ptr::null_mut()) })
             .map_err(|e| format!("hv_vcpu_create: {e}"))?;
 
+        // Enable vtimer (doesn't work on HVF, but set it up anyway).
+        unsafe { hv_vcpu_set_vtimer_mask(vcpu, false); }
+
         // 6. Set MPIDR_EL1 (RES1 bit 31 + affinity 0 = CPU 0).
         check(unsafe { hv_vcpu_set_sys_reg(vcpu, HvSysReg::MpidrEl1, 0x8000_0000) })
             .map_err(|e| format!("set MPIDR: {e}"))?;
@@ -224,6 +227,19 @@ impl Vm {
             std::sync::atomic::Ordering::Release,
         );
 
+        // Host-side 1ms timer: fire SPI 35 to wake WFI.
+        // HVF's vtimer doesn't work (VTIMER_ACTIVATED never fires),
+        // so we use a host thread to ensure WFI wakes within 1ms.
+        std::thread::spawn(|| {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                // Re-assert SPI 35 in case it was deasserted by INTERRUPT_ACK.
+                // If already asserted, this is a no-op. If the guest is in WFI,
+                // this wakes it to check for new frames via check_rx.
+                unsafe { hv_gic_set_spi(35, true); }
+            }
+        });
+
         let mut _exit_count: u64 = 0;
         loop {
             check(unsafe { hv_vcpu_run(self.vcpu) })
@@ -263,14 +279,18 @@ impl Vm {
                     }
                 }
                 HV_EXIT_REASON_VTIMER_ACTIVATED => {
-                    // The virtual timer fired. HVF auto-masks it.
-                    // Make the VTimer PPI (INTID 27) pending in the vGIC
-                    // so the guest's timer ISR runs on the next entry.
-                    let _ = unsafe { hv_gic_set_spi(VTIMER_INTID, true) };
-                    // Note: INTID 27 is a PPI, not an SPI. hv_gic_set_spi
-                    // might not work for PPIs. If the guest's timer ISR
-                    // doesn't fire, we'll need hv_vcpu_set_pending_interrupt
-                    // instead. TODO: verify empirically.
+                    // The virtual timer fired. HVF auto-masks it on exit.
+                    // Set PPI 27 (vtimer) pending via GICR_ISPENDR0.
+                    // hv_gic_set_spi doesn't work for PPIs (INTID < 32).
+                    const GICR_ISPENDR0: u32 = 0x10200;
+                    unsafe {
+                        // Set PPI 27 pending in the redistributor.
+                        hv_gic_set_redistributor_reg(
+                            self.vcpu, GICR_ISPENDR0, 1u64 << VTIMER_INTID,
+                        );
+                        // Unmask vtimer so future timer fires cause exits.
+                        hv_vcpu_set_vtimer_mask(self.vcpu, false);
+                    }
                 }
                 HV_EXIT_REASON_CANCELED => {
                     // IO thread kicked us via hv_vcpus_exit. check_rx()

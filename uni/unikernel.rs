@@ -128,7 +128,8 @@ fn arch_idle() {
     unsafe {
         let freq: u64;
         core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq);
-        let tval = if freq / 10 == 0 { 1u64 } else { freq / 10 };
+        // 1ms timer (freq/1000). Wakes WFI promptly for networking.
+        let tval = if freq / 1000 == 0 { 1u64 } else { freq / 1000 };
         core::arch::asm!("msr cntv_tval_el0, {}", in(reg) tval);
         core::arch::asm!("msr cntv_ctl_el0, {}", in(reg) 1u64); // ENABLE
         core::arch::asm!("isb", options(nomem, nostack));
