@@ -13,6 +13,61 @@ use std::sync::Mutex;
 use crate::hvf;
 use crate::virtio;
 
+// FFI for vmnet and GCD APIs.
+extern "C" {
+    fn dispatch_queue_create(
+        label: *const std::ffi::c_char,
+        attr: *const std::ffi::c_void,
+    ) -> *mut std::ffi::c_void;
+    fn vmnet_interface_set_event_callback(
+        interface: *mut std::ffi::c_void,
+        event_mask: u32,
+        queue: *mut std::ffi::c_void,
+        handler: *mut std::ffi::c_void,
+    ) -> u32;
+    fn vmnet_read(
+        interface: *mut std::ffi::c_void,
+        packets: *mut libc::iovec,  // actually *mut vmpktdesc
+        pktcnt: *mut i32,
+    ) -> u32;
+}
+
+/// Batch-read from vmnet (up to 128 packets).
+/// Returns frames read from the raw vmnet C API.
+unsafe fn vmnet_batch_read(iface_ref: *mut std::ffi::c_void) -> Vec<Vec<u8>> {
+    const MAX_PKTS: usize = 128;
+    let mut bufs = [[0u8; 2048]; MAX_PKTS];
+    let mut iovecs: [libc::iovec; MAX_PKTS] = std::mem::zeroed();
+    // vmpktdesc layout: { vm_pkt_size: usize, vm_pkt_iov: *mut iovec, vm_pkt_iovcnt: u32, vm_flags: u32 }
+    #[repr(C)]
+    struct VmPktDesc {
+        vm_pkt_size: usize,
+        vm_pkt_iov: *mut libc::iovec,
+        vm_pkt_iovcnt: u32,
+        vm_flags: u32,
+    }
+    let mut descs: [VmPktDesc; MAX_PKTS] = std::mem::zeroed();
+    for i in 0..MAX_PKTS {
+        iovecs[i].iov_base = bufs[i].as_mut_ptr() as *mut _;
+        iovecs[i].iov_len = 2048;
+        descs[i].vm_pkt_size = 2048;
+        descs[i].vm_pkt_iov = &mut iovecs[i];
+        descs[i].vm_pkt_iovcnt = 1;
+        descs[i].vm_flags = 0;
+    }
+    let mut pktcnt = MAX_PKTS as i32;
+    let rc = vmnet_read(iface_ref, descs.as_mut_ptr() as *mut _, &mut pktcnt);
+    if rc != 1000 || pktcnt <= 0 { return Vec::new(); }
+    let mut frames = Vec::with_capacity(pktcnt as usize);
+    for i in 0..pktcnt as usize {
+        let len = descs[i].vm_pkt_size;
+        if len > 0 && len <= 2048 {
+            frames.push(bufs[i][..len].to_vec());
+        }
+    }
+    frames
+}
+
 /// Virtio net header size (12 bytes for VIRTIO_F_VERSION_1).
 const VIRTIO_NET_HDR_SIZE: usize = 12;
 
@@ -25,39 +80,35 @@ unsafe impl Send for SendIface {}
 /// Global vmnet interface, behind a Mutex because read/write need &mut.
 static IFACE: Mutex<Option<SendIface>> = Mutex::new(None);
 
-/// Start a vmnet host-mode interface and spawn an RX polling thread.
-/// Returns the MAC address assigned by vmnet.
+/// Start vmnet via a helper subprocess. Returns the MAC address.
+/// The helper owns the vmnet interface in a separate process to avoid
+/// GCD thread starvation from hv_vcpu_run in the parent.
 pub fn start() -> Result<[u8; 6], String> {
-    let iface = vmnet::Interface::new(
-        vmnet::mode::Mode::Host(Default::default()),
-        Default::default(),
-    ).map_err(|e| format!("vmnet::Interface::new: {e:?}"))?;
+    let (mac_bytes, child_fd) = crate::vmnet_helper::spawn()?;
+    HELPER_FD.store(child_fd as usize, std::sync::atomic::Ordering::Release);
 
-    // Extract MAC from parameters.
-    let params: Vec<vmnet::parameters::Parameter> = iface.parameters().into();
-    let mut mac_bytes = [0u8; 6];
-    for p in &params {
-        if let vmnet::parameters::Parameter::MACAddress(ref s) = p {
-            // MAC is like "aa:bb:cc:dd:ee:ff"
-            let parts: Vec<&str> = s.split(':').collect();
-            if parts.len() == 6 {
-                for (i, part) in parts.iter().enumerate() {
-                    mac_bytes[i] = u8::from_str_radix(part, 16).unwrap_or(0);
-                }
+    // Spawn RX reader thread: reads datagrams from the helper socket.
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 2048];
+        loop {
+            let n = unsafe {
+                libc::recv(child_fd, buf.as_mut_ptr() as *mut _, buf.len(), 0)
+            };
+            if n <= 0 {
+                std::thread::sleep(std::time::Duration::from_micros(50));
+                continue;
+            }
+            let frame = &buf[..n as usize];
+            snoop_dhcp_ack(frame);
+            RX_PENDING.lock().unwrap().push_back(frame.to_vec());
+            // Kick the vCPU.
+            unsafe { hvf::hv_gic_set_spi(35, true); }
+            let vcpu = VCPU_ID.load(std::sync::atomic::Ordering::Relaxed);
+            if vcpu != 0 {
+                unsafe { hvf::hv_vcpus_exit(&vcpu as *const u64, 1); }
             }
         }
-    }
-
-    // Print all vmnet parameters for diagnostics.
-    for p in &params {
-        eprintln!("(vmnet) param: {p:?}");
-    }
-
-    *IFACE.lock().unwrap() = Some(SendIface(iface));
-
-    // Set up event-driven IO: PACKETS_AVAILABLE callback reads from
-    // vmnet on the GCD thread. TX writes go directly via IFACE_PTR.
-    start_io();
+    });
 
     Ok(mac_bytes)
 }
@@ -135,12 +186,13 @@ pub fn process_tx() {
         unsafe { core::arch::asm!("dsb sy", options(nostack)); }
         drop(dev_lock);
 
-        // Write frames directly to vmnet (no queue, no Mutex).
-        let ptr = IFACE_PTR.load(std::sync::atomic::Ordering::Acquire);
-        if ptr != 0 {
-            let iface = unsafe { &mut *(ptr as *mut SendIface) };
+        // Send frames to the helper subprocess via Unix socket.
+        let fd = HELPER_FD.load(std::sync::atomic::Ordering::Acquire) as i32;
+        if fd > 0 {
             for frame in &frames {
-                let _ = iface.0.write(frame);
+                unsafe {
+                    libc::send(fd, frame.as_ptr() as *const _, frame.len(), 0);
+                }
             }
         }
 
@@ -153,6 +205,9 @@ pub fn process_tx() {
 /// vCPU thread to inject them via check_rx().
 static RX_PENDING: Mutex<VecDeque<Vec<u8>>> = Mutex::new(VecDeque::new());
 
+/// File descriptor for the helper subprocess socket.
+static HELPER_FD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 
 /// vCPU ID for hv_vcpus_exit kicks. Set by the vCPU thread before run().
 pub static VCPU_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -163,25 +218,42 @@ pub static VCPU_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// implementation uses internal serialization.
 static IFACE_PTR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Raw InterfaceRef for batch reads via the C API.
+static VMNET_IFACE_REF: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Read all available frames from vmnet and push to RX_PENDING.
-/// Returns true if any frames were read.
+/// Uses batch read (up to 128 packets per vmnet_read call).
 unsafe fn drain_vmnet_rx() -> bool {
-    let ptr = IFACE_PTR.load(std::sync::atomic::Ordering::Acquire);
-    if ptr == 0 { return false; }
-    let iface = &mut *(ptr as *mut SendIface);
-    let mut buf = [0u8; 2048];
-    let mut got_any = false;
-    loop {
-        match iface.0.read(&mut buf) {
-            Ok(n) if n > 0 => {
-                snoop_dhcp_ack(&buf[..n]);
-                RX_PENDING.lock().unwrap().push_back(buf[..n].to_vec());
-                got_any = true;
+    let iface_ref = VMNET_IFACE_REF.load(std::sync::atomic::Ordering::Acquire) as *mut std::ffi::c_void;
+    if iface_ref.is_null() {
+        // Fallback to single-packet read via the Rust crate.
+        let ptr = IFACE_PTR.load(std::sync::atomic::Ordering::Acquire);
+        if ptr == 0 { return false; }
+        let iface = &mut *(ptr as *mut SendIface);
+        let mut buf = [0u8; 2048];
+        let mut got_any = false;
+        loop {
+            match iface.0.read(&mut buf) {
+                Ok(n) if n > 0 => {
+                    snoop_dhcp_ack(&buf[..n]);
+                    RX_PENDING.lock().unwrap().push_back(buf[..n].to_vec());
+                    got_any = true;
+                }
+                _ => break,
             }
-            _ => break,
         }
+        return got_any;
     }
-    got_any
+
+    // Batch read via raw C API.
+    let frames = vmnet_batch_read(iface_ref);
+    if frames.is_empty() { return false; }
+    let mut pending = RX_PENDING.lock().unwrap();
+    for frame in &frames {
+        snoop_dhcp_ack(frame);
+        pending.push_back(frame.clone());
+    }
+    true
 }
 
 /// Notify the vCPU that new RX frames are available.
@@ -203,14 +275,93 @@ fn start_io() {
     let ptr = Box::into_raw(Box::new(iface));
     IFACE_PTR.store(ptr as usize, std::sync::atomic::Ordering::Release);
 
-    // RX polling thread: reads every 1ms with burst draining.
-    // The GCD callback alone fires ~5/sec which is too slow.
+    // Create a high-priority serial dispatch queue for vmnet events.
+    // The default global queue used by the vmnet Rust crate gets starved
+    // by hv_vcpu_run (which monopolizes the vCPU thread in the kernel).
+    // A dedicated queue with user-interactive QoS ensures GCD schedules
+    // the vmnet callback promptly on a separate core.
+    extern "C" {
+        fn dispatch_queue_create_with_target(
+            label: *const std::ffi::c_char,
+            attr: *const std::ffi::c_void,
+            target: *mut std::ffi::c_void,
+        ) -> *mut std::ffi::c_void;
+        fn dispatch_get_global_queue(
+            identifier: isize,
+            flags: usize,
+        ) -> *mut std::ffi::c_void;
+    }
+    // QOS_CLASS_USER_INTERACTIVE = 0x21
+    let hi_queue = unsafe { dispatch_get_global_queue(0x21, 0) };
+    let serial_queue = unsafe {
+        dispatch_queue_create_with_target(
+            c"com.unikernel.vmnet".as_ptr(),
+            std::ptr::null(),  // NULL = serial
+            hi_queue,          // target = user-interactive global queue
+        )
+    };
+
+    // Get the raw InterfaceRef for batch reads via the C API.
+    // vmnet::Interface struct layout: queue(*void), interface(*void), ...
+    let iface_ref: *mut std::ffi::c_void = unsafe {
+        let base = &(*ptr).0 as *const vmnet::Interface as *const u8;
+        *(base.add(std::mem::size_of::<*mut std::ffi::c_void>()) as *const *mut std::ffi::c_void)
+    };
+    VMNET_IFACE_REF.store(iface_ref as usize, std::sync::atomic::Ordering::Release);
+
+    // Register PACKETS_AVAILABLE callback on the serial queue.
+    // Use a raw Objective-C block (ABI-compatible struct) instead
+    // of depending on the `block` crate.
+    #[repr(C)]
+    struct Block {
+        isa: *const std::ffi::c_void,
+        flags: i32,
+        reserved: i32,
+        invoke: unsafe extern "C" fn(*mut Block, u32, *mut std::ffi::c_void),
+        descriptor: *const BlockDescriptor,
+    }
+    #[repr(C)]
+    struct BlockDescriptor {
+        reserved: u64,
+        size: u64,
+    }
+    static DESCRIPTOR: BlockDescriptor = BlockDescriptor {
+        reserved: 0,
+        size: std::mem::size_of::<Block>() as u64,
+    };
+    unsafe extern "C" fn invoke_cb(_block: *mut Block, _events: u32, _xdict: *mut std::ffi::c_void) {
+        if drain_vmnet_rx() {
+            kick_vcpu();
+        }
+    }
+    extern "C" { static _NSConcreteGlobalBlock: *const std::ffi::c_void; }
+    static mut BLOCK: Block = Block {
+        isa: std::ptr::null(), // set below
+        flags: 1 << 28, // BLOCK_IS_GLOBAL
+        reserved: 0,
+        invoke: invoke_cb,
+        descriptor: &DESCRIPTOR,
+    };
+    unsafe {
+        BLOCK.isa = _NSConcreteGlobalBlock;
+        let rc = vmnet_interface_set_event_callback(
+            iface_ref,
+            1, // VMNET_INTERFACE_PACKETS_AVAILABLE
+            serial_queue,
+            &mut BLOCK as *mut _ as *mut std::ffi::c_void,
+        );
+        if rc != 1000 {
+            eprintln!("(vmnet) set_event_callback on serial queue failed: rc={rc}");
+        }
+    }
+
+    // Fallback polling thread in case the serial queue callback isn't
+    // enough. 1ms poll with burst drain.
     std::thread::spawn(|| {
         loop {
             unsafe {
                 if drain_vmnet_rx() {
                     kick_vcpu();
-                    // After finding packets, drain aggressively.
                     loop {
                         std::thread::sleep(std::time::Duration::from_micros(100));
                         if !drain_vmnet_rx() { break; }
@@ -222,8 +373,6 @@ fn start_io() {
         }
     });
 }
-
-static RX_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Snoop DHCP ACK frames to learn the VM's IP and set up port forwarding.
 /// Called from the RX thread for every received frame.
@@ -381,9 +530,10 @@ fn proxy_connection(
 /// coherency — host writes to guest RAM are only guaranteed visible to
 /// the guest when done from the same CPU context.
 pub fn check_rx() {
+
     static RX_LAST: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
 
-    // Drain ALL buffered frames from the RX thread.
+    // Drain ALL buffered frames from the callback/polling thread.
     let mut injected = 0u32;
 
     loop {

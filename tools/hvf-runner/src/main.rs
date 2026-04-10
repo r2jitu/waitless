@@ -13,6 +13,7 @@ mod pl011;
 mod terminal;
 mod virtio;
 mod vm;
+mod vmnet_helper;
 mod vmnet_net;
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
