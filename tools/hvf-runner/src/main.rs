@@ -11,6 +11,7 @@ mod fdt;
 mod hvf;
 mod pl011;
 mod terminal;
+mod virtio;
 mod vm;
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);

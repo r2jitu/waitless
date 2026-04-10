@@ -13,6 +13,7 @@ use crate::decoder;
 use crate::fdt;
 use crate::hvf::*;
 use crate::pl011;
+use crate::virtio;
 
 // ── Guest physical memory layout ─────────────────────────────────────────────
 // Mirrors QEMU `virt` machine defaults so the same kernel binary boots
@@ -213,6 +214,12 @@ impl Vm {
                 .map_err(|e| format!("set {reg:?}: {e}"))?;
         }
 
+        // 11. Initialize the virtio-mmio net device.
+        let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56]; // same as QEMU default
+        *virtio::DEVICE.lock().unwrap() = Some(
+            virtio::VirtioNet::new(mac, ram_host, RAM_BASE)
+        );
+
         Ok(Vm { ram_host, ram_size: ram_mapped, vcpu, exit_ptr })
     }
 
@@ -386,11 +393,23 @@ impl Vm {
         } else if fault_ipa >= VIRTIO_MMIO_BASE
             && fault_ipa < VIRTIO_MMIO_BASE + VIRTIO_MMIO_SIZE
         {
-            // Phase 2 will handle this. For now, return zeros on reads
-            // and ignore writes — the kernel probes the device and
-            // moves on if it doesn't respond.
-            if !access.is_write && access.rt < 31 {
-                self.set_reg(HvReg::gpr(access.rt as u32), 0);
+            let offset = fault_ipa - VIRTIO_MMIO_BASE;
+            let mut dev = virtio::DEVICE.lock().unwrap();
+            let dev = dev.as_mut().unwrap();
+            if access.is_write {
+                let val = if access.rt == 31 { 0 } else {
+                    self.get_reg(HvReg::gpr(access.rt as u32)) as u32
+                };
+                let is_notify = dev.write(offset, val);
+                if is_notify {
+                    // TODO Phase 2: process TX queue, inject RX from vmnet
+                    eprintln!("(debug) QUEUE_NOTIFY queue={val}");
+                }
+            } else {
+                let val = dev.read(offset);
+                if access.rt < 31 {
+                    self.set_reg(HvReg::gpr(access.rt as u32), val as u64);
+                }
             }
         } else {
             // Unknown device address. Return 0 on reads, ignore writes.
