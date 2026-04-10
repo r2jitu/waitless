@@ -231,10 +231,22 @@ impl Vm {
     /// Run the vCPU until the guest executes PSCI SYSTEM_OFF or an
     /// unrecoverable error occurs.
     pub fn run(&mut self) -> Result<(), String> {
+        // Publish vCPU ID so the RX thread can kick us via hv_vcpus_exit.
+        crate::vmnet_net::VCPU_ID.store(
+            self.vcpu,
+            std::sync::atomic::Ordering::Release,
+        );
+
         let mut exit_count: u64 = 0;
         loop {
             check(unsafe { hv_vcpu_run(self.vcpu) })
                 .map_err(|e| format!("hv_vcpu_run: {e}"))?;
+
+            // Check for pending RX frames on every exit. This is the
+            // only safe point to inject frames because it runs in the
+            // vCPU thread context (guaranteeing cache coherency with
+            // the guest's view of RAM).
+            crate::vmnet_net::check_rx();
 
             let exit = unsafe { &*self.exit_ptr };
             exit_count += 1;
@@ -399,6 +411,7 @@ impl Vm {
             && fault_ipa < VIRTIO_MMIO_BASE + VIRTIO_MMIO_SIZE
         {
             let offset = fault_ipa - VIRTIO_MMIO_BASE;
+
             let mut notify_queue: Option<u32> = None;
             {
                 let mut dev_lock = virtio::DEVICE.lock().unwrap();
@@ -407,9 +420,6 @@ impl Vm {
                     let val = if access.rt == 31 { 0 } else {
                         self.get_reg(HvReg::gpr(access.rt as u32)) as u32
                     };
-                    if offset == 0x050 {
-                        eprintln!("(virtio) QUEUE_NOTIFY queue={val}");
-                    }
                     if dev.write(offset, val) {
                         notify_queue = Some(val);
                     }

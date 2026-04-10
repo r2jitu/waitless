@@ -7,6 +7,7 @@
 //
 // Requires root privileges for vmnet_start_interface in shared mode.
 
+use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use crate::hvf;
@@ -55,8 +56,11 @@ pub fn start() -> Result<[u8; 6], String> {
 
     *IFACE.lock().unwrap() = Some(SendIface(iface));
 
-    // Spawn RX polling thread.
-    std::thread::spawn(rx_loop);
+    // Spawn an RX thread that reads frames from vmnet and wakes the
+    // vCPU via hv_vcpus_exit. The actual frame injection into the guest
+    // virtqueue happens in check_rx() on the vCPU thread for cache
+    // coherency. The RX thread just buffers the frames and kicks.
+    std::thread::spawn(rx_notify_loop);
 
     Ok(mac_bytes)
 }
@@ -129,9 +133,10 @@ pub fn process_tx() {
     TX_LAST.store(last, std::sync::atomic::Ordering::Relaxed);
 
     if !frames.is_empty() {
-        eprintln!("(vmnet-tx) sending {} frames", frames.len());
         dev.interrupt_status |= 1;
-        drop(dev_lock); // release virtio lock before vmnet I/O
+        // DSB to flush used-ring writes to guest before releasing lock.
+        unsafe { core::arch::asm!("dsb sy", options(nostack)); }
+        drop(dev_lock);
 
         // Send all frames to vmnet.
         let mut iface_lock = IFACE.lock().unwrap();
@@ -149,13 +154,18 @@ pub fn process_tx() {
     }
 }
 
-/// RX polling loop: reads frames from vmnet and injects into guest RX queue.
-fn rx_loop() {
-    static RX_LAST: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
-    let mut buf = vec![0u8; 2048];
+/// Pending RX frames buffered by the background thread, waiting for the
+/// vCPU thread to inject them via check_rx().
+static RX_PENDING: Mutex<VecDeque<Vec<u8>>> = Mutex::new(VecDeque::new());
 
+/// vCPU ID for hv_vcpus_exit kicks. Set by the vCPU thread before run().
+pub static VCPU_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Background thread: reads frames from vmnet, buffers them, and kicks
+/// the vCPU so check_rx() runs.
+fn rx_notify_loop() {
+    let mut buf = [0u8; 2048];
     loop {
-        // Read a frame from vmnet.
         let n = {
             let mut iface_lock = IFACE.lock().unwrap();
             match iface_lock.as_mut() {
@@ -171,57 +181,72 @@ fn rx_loop() {
             std::thread::sleep(std::time::Duration::from_millis(1));
             continue;
         }
-        eprintln!("(vmnet-rx) got {n} byte frame");
-        // Debug: show first few bytes (should be Ethernet header)
-        if n >= 14 {
-            eprintln!("(vmnet-rx) dst={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} src={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ethertype={:02x}{:02x}",
-                buf[0],buf[1],buf[2],buf[3],buf[4],buf[5],
-                buf[6],buf[7],buf[8],buf[9],buf[10],buf[11],
-                buf[12],buf[13]);
-        }
 
-        // Inject into guest RX queue.
+        // Buffer the frame.
+        RX_PENDING.lock().unwrap().push_back(buf[..n].to_vec());
+
+        // Kick the vCPU so it exits and check_rx() runs.
+        let vcpu = VCPU_ID.load(std::sync::atomic::Ordering::Relaxed);
+        if vcpu != 0 {
+            unsafe { hvf::hv_vcpus_exit(&vcpu as *const u64, 1); }
+        }
+    }
+}
+
+/// Check for pending RX frames from vmnet and inject into guest RX queue.
+/// Called from the vCPU thread during MMIO dispatch to ensure cache
+/// coherency — host writes to guest RAM are only guaranteed visible to
+/// the guest when done from the same CPU context.
+pub fn check_rx() {
+    static RX_LAST: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+    // Drain ALL buffered frames from the RX thread.
+    let mut injected = 0u32;
+
+    loop {
+        let frame = match RX_PENDING.lock().unwrap().pop_front() {
+            Some(f) => f,
+            None => break,
+        };
+        let buf = &frame;
+        let n = buf.len();
+
         let mut dev_lock = virtio::DEVICE.lock().unwrap();
         let dev = match dev_lock.as_mut() {
             Some(d) => d,
-            None => continue,
+            None => break,
         };
 
-        let q = dev.queue(0); // RX queue
-        if !q.ready { continue; }
+        let q = dev.queue(0);
+        if !q.ready { break; }
 
         let desc_base = q.desc_addr();
         let avail_base = q.avail_addr();
         let used_base = q.used_addr();
         let qsize = q.num as u16;
-        if qsize == 0 { continue; }
+        if qsize == 0 { break; }
 
         let avail_idx = unsafe {
-            let p = dev.gpa_to_host(avail_base + 2) as *const u16;
-            core::ptr::read_volatile(p)
+            core::ptr::read_volatile(dev.gpa_to_host(avail_base + 2) as *const u16)
         };
         let mut last = RX_LAST.load(std::sync::atomic::Ordering::Relaxed);
 
-        if last == avail_idx {
-            eprintln!("(vmnet-rx) no free RX buffers (last={last} avail_idx={avail_idx})");
-            continue;
-        }
-        eprintln!("(vmnet-rx) injecting into RX queue: last={last} avail_idx={avail_idx} qsize={qsize}");
+        if last == avail_idx { break; } // no free descriptors
 
         let ring_idx = last & (qsize - 1);
         let desc_idx = unsafe {
-            let p = dev.gpa_to_host(avail_base + 4 + ring_idx as u64 * 2) as *const u16;
-            core::ptr::read_volatile(p)
+            core::ptr::read_volatile(
+                dev.gpa_to_host(avail_base + 4 + ring_idx as u64 * 2) as *const u16
+            )
         };
 
-        let (addr, _buf_len) = unsafe {
-            let dp = dev.gpa_to_host(desc_base + desc_idx as u64 * 16);
-            let a = core::ptr::read_unaligned(dp as *const u64);
-            let l = core::ptr::read_unaligned(dp.add(8) as *const u32);
-            (a, l as usize)
+        let addr = unsafe {
+            core::ptr::read_unaligned(
+                dev.gpa_to_host(desc_base + desc_idx as u64 * 16) as *const u64
+            )
         };
 
-        // Write virtio_net_hdr (12 zero bytes) + frame.
+        // Write virtio_net_hdr (12 zero bytes) + frame into descriptor buffer.
         let total_len = VIRTIO_NET_HDR_SIZE + n;
         unsafe {
             let dest = dev.gpa_to_host(addr);
@@ -229,26 +254,32 @@ fn rx_loop() {
             core::ptr::copy_nonoverlapping(buf.as_ptr(), dest.add(VIRTIO_NET_HDR_SIZE), n);
         }
 
-        // Mark as used.
+        // Update used ring.
         let used_idx = unsafe {
-            let p = dev.gpa_to_host(used_base + 2) as *const u16;
-            core::ptr::read_volatile(p)
+            core::ptr::read_volatile(dev.gpa_to_host(used_base + 2) as *const u16)
         };
-        let used_ring_idx = used_idx & (qsize - 1);
         unsafe {
-            let entry = dev.gpa_to_host(used_base + 4 + used_ring_idx as u64 * 8);
+            let entry = dev.gpa_to_host(used_base + 4 + (used_idx & (qsize - 1)) as u64 * 8);
             core::ptr::write_unaligned(entry as *mut u32, desc_idx as u32);
             core::ptr::write_unaligned(entry.add(4) as *mut u32, total_len as u32);
-            let idx_ptr = dev.gpa_to_host(used_base + 2) as *mut u16;
-            core::ptr::write_volatile(idx_ptr, used_idx.wrapping_add(1));
+            core::ptr::write_volatile(
+                dev.gpa_to_host(used_base + 2) as *mut u16,
+                used_idx.wrapping_add(1),
+            );
         }
 
-        last = last.wrapping_add(1);
-        RX_LAST.store(last, std::sync::atomic::Ordering::Relaxed);
-
-        // Interrupt the guest.
+        RX_LAST.store(last.wrapping_add(1), std::sync::atomic::Ordering::Relaxed);
         dev.interrupt_status |= 1;
-        drop(dev_lock);
+        injected += 1;
+    }
+
+    if injected > 0 {
+        // Ensure all writes to guest RAM (descriptor data + used ring)
+        // are visible to the guest vCPU before it resumes. On Apple
+        // Silicon, the host and guest share the Inner Shareable domain,
+        // so DSB SY makes host writes visible at L2 before the guest's
+        // dcache lookup can bypass them.
+        unsafe { core::arch::asm!("dsb sy", options(nostack)); }
         unsafe { hvf::hv_gic_set_spi(35, true); }
     }
 }

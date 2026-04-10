@@ -133,7 +133,13 @@ impl VirtioNet {
                 if qi < NUM_QUEUES { self.queues[qi].ready as u32 } else { 0 }
             }
             STATUS => self.status,
-            INTERRUPT_STATUS => self.interrupt_status,
+            INTERRUPT_STATUS => {
+                let v = self.interrupt_status;
+                if v != 0 {
+                    eprintln!("(virtio) INTERRUPT_STATUS read -> {v:#x}");
+                }
+                v
+            }
             // Device config: MAC address at offset 0x100..0x105
             off if off >= CONFIG_BASE && off < CONFIG_BASE + 8 => {
                 let cfg_off = (off - CONFIG_BASE) as usize;
