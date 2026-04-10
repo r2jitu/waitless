@@ -148,8 +148,7 @@ impl Vm {
         check(unsafe { hv_vcpu_create(&mut vcpu, &mut exit_ptr, ptr::null_mut()) })
             .map_err(|e| format!("hv_vcpu_create: {e}"))?;
 
-        // Enable vtimer (doesn't work on HVF, but set it up anyway).
-        unsafe { hv_vcpu_set_vtimer_mask(vcpu, false); }
+        // vtimer starts masked — unmasked conditionally in the run loop.
 
         // 6. Set MPIDR_EL1 (RES1 bit 31 + affinity 0 = CPU 0).
         check(unsafe { hv_vcpu_set_sys_reg(vcpu, HvSysReg::MpidrEl1, 0x8000_0000) })
@@ -227,28 +226,21 @@ impl Vm {
             std::sync::atomic::Ordering::Release,
         );
 
-        // Host-side 1ms timer: fire SPI 35 to wake WFI.
-        // HVF's vtimer doesn't work (VTIMER_ACTIVATED never fires),
-        // so we use a host thread to ensure WFI wakes within 1ms.
-        std::thread::spawn(|| {
-            loop {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-                // Re-assert SPI 35 in case it was deasserted by INTERRUPT_ACK.
-                // If already asserted, this is a no-op. If the guest is in WFI,
-                // this wakes it to check for new frames via check_rx.
-                unsafe { hv_gic_set_spi(35, true); }
-            }
-        });
+        let mut vtimer_masked = false;
+        let mut vtimer_pending = false;
+        // No host-side SPI timer — rely on vtimer + set_pending_interrupt.
 
         let mut _exit_count: u64 = 0;
         loop {
+            // Inject pending vtimer IRQ before entering the guest.
+            // hv_vcpu_set_pending_interrupt is auto-cleared after run.
+            if vtimer_pending {
+                unsafe { hv_vcpu_set_pending_interrupt(self.vcpu, 0, true); }
+            }
+
             check(unsafe { hv_vcpu_run(self.vcpu) })
                 .map_err(|e| format!("hv_vcpu_run: {e}"))?;
 
-            // Check for pending RX frames on every exit. This is the
-            // only safe point to inject frames because it runs in the
-            // vCPU thread context (guaranteeing cache coherency with
-            // the guest's view of RAM).
             crate::vmnet_net::check_rx();
 
             let exit = unsafe { &*self.exit_ptr };
@@ -277,20 +269,28 @@ impl Vm {
                             ));
                         }
                     }
+
+                    // After every exception exit: check if the guest
+                    // cleared the vtimer. If so, unmask it so the next
+                    // timer arm causes a VTIMER_ACTIVATED exit.
+                    if vtimer_masked {
+                        let cntv_ctl = self.get_sys_reg(HvSysReg::CntvCtlEl0);
+                        let enabled = cntv_ctl & 1;
+                        let istatus = (cntv_ctl >> 1) & 1;
+                        let imask = (cntv_ctl >> 2) & 1;
+                        // Timer no longer asserting — safe to unmask.
+                        if enabled == 0 || imask != 0 || istatus == 0 {
+                            unsafe { hv_vcpu_set_vtimer_mask(self.vcpu, false); }
+                            vtimer_masked = false;
+                            vtimer_pending = false;
+                        }
+                    }
                 }
                 HV_EXIT_REASON_VTIMER_ACTIVATED => {
-                    // The virtual timer fired. HVF auto-masks it on exit.
-                    // Set PPI 27 (vtimer) pending via GICR_ISPENDR0.
-                    // hv_gic_set_spi doesn't work for PPIs (INTID < 32).
-                    const GICR_ISPENDR0: u32 = 0x10200;
-                    unsafe {
-                        // Set PPI 27 pending in the redistributor.
-                        hv_gic_set_redistributor_reg(
-                            self.vcpu, GICR_ISPENDR0, 1u64 << VTIMER_INTID,
-                        );
-                        // Unmask vtimer so future timer fires cause exits.
-                        hv_vcpu_set_vtimer_mask(self.vcpu, false);
-                    }
+                    // The virtual timer fired. HVF auto-masks it.
+                    // Don't unmask — the guest ISR needs to clear it first.
+                    vtimer_masked = true;
+                    vtimer_pending = true;
                 }
                 HV_EXIT_REASON_CANCELED => {
                     // IO thread kicked us via hv_vcpus_exit. check_rx()
@@ -455,6 +455,12 @@ impl Vm {
 
     fn set_reg(&self, reg: HvReg, value: u64) {
         unsafe { hv_vcpu_set_reg(self.vcpu, reg, value) };
+    }
+
+    fn get_sys_reg(&self, reg: HvSysReg) -> u64 {
+        let mut v: u64 = 0;
+        unsafe { hv_vcpu_get_sys_reg(self.vcpu, reg, &mut v) };
+        v
     }
 }
 
