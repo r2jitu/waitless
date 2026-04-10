@@ -137,15 +137,8 @@ pub fn process_tx() {
         unsafe { core::arch::asm!("dsb sy", options(nostack)); }
         drop(dev_lock);
 
-        // Send all frames to vmnet.
-        let mut iface_lock = IFACE.lock().unwrap();
-        if let Some(ref mut iface) = *iface_lock {
-            for frame in &frames {
-                if let Err(e) = iface.0.write(frame) {
-                    eprintln!("(vmnet-tx) write error: {e:?}");
-                }
-            }
-        }
+        // Queue frames for the IO thread (which owns the vmnet interface).
+        TX_OUTBOUND.lock().unwrap().extend(frames);
 
         // Interrupt the guest.
         unsafe { hvf::hv_gic_set_spi(35, true); }
@@ -156,6 +149,11 @@ pub fn process_tx() {
 /// vCPU thread to inject them via check_rx().
 static RX_PENDING: Mutex<VecDeque<Vec<u8>>> = Mutex::new(VecDeque::new());
 
+/// Pending TX frames from the vCPU thread, waiting for the RX/IO thread
+/// to write them to vmnet. This avoids sharing the vmnet interface
+/// between threads (eliminates IFACE mutex contention).
+static TX_OUTBOUND: Mutex<VecDeque<Vec<u8>>> = Mutex::new(VecDeque::new());
+
 /// vCPU ID for hv_vcpus_exit kicks. Set by the vCPU thread before run().
 pub static VCPU_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -163,22 +161,26 @@ pub static VCPU_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// the vCPU so check_rx() runs.
 fn rx_notify_loop() {
     let mut buf = [0u8; 2048];
+    // Take ownership of the vmnet interface — only this thread touches it.
+    let mut iface = IFACE.lock().unwrap().take().unwrap();
+
     loop {
-        let n = {
-            let mut iface_lock = IFACE.lock().unwrap();
-            match iface_lock.as_mut() {
-                Some(iface) => match iface.0.read(&mut buf) {
-                    Ok(n) if n > 0 => n,
-                    _ => 0,
-                },
-                None => 0,
+        // 1. Drain TX outbound queue → write to vmnet.
+        {
+            let mut txq = TX_OUTBOUND.lock().unwrap();
+            while let Some(frame) = txq.pop_front() {
+                let _ = iface.0.write(&frame);
+            }
+        }
+
+        // 2. Read from vmnet.
+        let n = match iface.0.read(&mut buf) {
+            Ok(n) if n > 0 => n,
+            _ => {
+                std::thread::yield_now();
+                continue;
             }
         };
-
-        if n == 0 {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-            continue;
-        }
 
         // Snoop DHCP ACK to learn VM's IP and set up port forwarding.
         snoop_dhcp_ack(&buf[..n]);

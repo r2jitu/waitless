@@ -46,6 +46,10 @@ const VIRTIO_VENDOR: u32 = 0x554d_4551; // "QEMU" — convention
 
 // Feature bits we offer (word 0 only; word 1 = VIRTIO_F_VERSION_1 implied by v2)
 const VIRTIO_NET_F_MAC: u32 = 1 << 5;
+// Vendor extension: device exposes per-queue used_idx at config offset 0x110.
+// Allows guests to read used_idx via MMIO trap instead of from shared RAM,
+// working around dcache coherency issues on Apple HVF.
+const VIRTIO_F_USED_IDX_MMIO: u32 = 1 << 24;
 
 // Status bits
 const STATUS_FEATURES_OK: u32 = 8;
@@ -127,7 +131,7 @@ impl VirtioNet {
             VENDOR_ID => VIRTIO_VENDOR,
             DEVICE_FEATURES => {
                 match self.device_features_sel {
-                    0 => VIRTIO_NET_F_MAC,
+                    0 => VIRTIO_NET_F_MAC | VIRTIO_F_USED_IDX_MMIO,
                     1 => 1, // VIRTIO_F_VERSION_1 (bit 0 of word 1 = feature bit 32)
                     _ => 0,
                 }
@@ -138,7 +142,12 @@ impl VirtioNet {
                 if qi < NUM_QUEUES { self.queues[qi].ready as u32 } else { 0 }
             }
             STATUS => self.status,
-            INTERRUPT_STATUS => self.interrupt_status,
+            INTERRUPT_STATUS => {
+                // Pack RX used_idx into upper 16 bits when
+                // VIRTIO_F_USED_IDX_MMIO is negotiated. The guest
+                // extracts it without an extra MMIO exit.
+                self.interrupt_status | ((self.used_idx[0] as u32) << 16)
+            }
             // Device config: MAC address at offset 0x100..0x105
             off if off >= CONFIG_BASE && off < CONFIG_BASE + 8 => {
                 let cfg_off = (off - CONFIG_BASE) as usize;

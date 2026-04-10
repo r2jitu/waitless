@@ -5,7 +5,7 @@ use core::ptr;
 use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
 use crate::{
-    log, dsb_st, dc_civac_range,
+    log, dsb_st,
     virtio_read32, virtio_write32, virtio_read8, virtio_write8,
     vz_init_delay,
 };
@@ -22,7 +22,7 @@ use crate::virtio::{
     STATUS_ACKNOWLEDGE, STATUS_DRIVER, STATUS_DRIVER_OK, STATUS_FEATURES_OK, STATUS_FAILED,
     VIRTIO_NET_F_MAC, VIRTIO_NET_F_MRG_RXBUF, VIRTIO_NET_F_STATUS,
     VIRTIO_NET_F_MQ, VIRTIO_NET_F_CTRL_VQ,
-    VIRTIO_RING_F_EVENT_IDX,
+    VIRTIO_RING_F_EVENT_IDX, VIRTIO_F_USED_IDX_MMIO,
     VREG_DEVICE_FEATURES, VREG_GUEST_FEATURES, VREG_DEVICE_STATUS, VREG_ISR_STATUS,
     VREG_DEVICE_CONFIG,
     MMIO_BASE, MMIO_MAGIC_VALUE, MMIO_VERSION, MMIO_DEVICE_ID,
@@ -451,6 +451,7 @@ fn init_mmio() -> bool {
 
     // Feature negotiation
     let mut guest_features: u32 = 0;
+    let mut has_used_idx_mmio = false;
     unsafe {
         if is_v2 {
             virtio_write32(io_base + MMIO_DEVICE_FEATURES_SEL, 0);
@@ -458,6 +459,10 @@ fn init_mmio() -> bool {
             if (dev_features & VIRTIO_NET_F_MAC) != 0 { guest_features |= VIRTIO_NET_F_MAC; }
             if (dev_features & VIRTIO_NET_F_STATUS) != 0 { guest_features |= VIRTIO_NET_F_STATUS; }
             if (dev_features & VIRTIO_NET_F_MRG_RXBUF) != 0 { guest_features |= VIRTIO_NET_F_MRG_RXBUF; }
+            if (dev_features & VIRTIO_F_USED_IDX_MMIO) != 0 {
+                guest_features |= VIRTIO_F_USED_IDX_MMIO;
+                has_used_idx_mmio = true;
+            }
 
             virtio_write32(io_base + MMIO_DRIVER_FEATURES_SEL, 0);
             virtio_write32(io_base + MMIO_GUEST_FEATURES, guest_features);
@@ -490,6 +495,10 @@ fn init_mmio() -> bool {
         if !(*ndev()).tx_queues[0].init_legacy(io_base, 1, true, is_v2) {
             log(b"virtio_net: failed to init TX queue\n");
             return false;
+        }
+        if has_used_idx_mmio {
+            (*ndev()).rx_queues[0].used_idx_mmio = true;
+            (*ndev()).tx_queues[0].used_idx_mmio = true;
         }
     }
 
@@ -868,6 +877,13 @@ pub fn poll_qp(qp: usize, callback: fn(&[u8])) -> i32 {
         if let Transport::None = (*ndev()).transport { return 0; }
     }
 
+    // For VIRTIO_F_USED_IDX_MMIO devices: read INTERRUPT_STATUS once
+    // per poll cycle to get the device-side used_idx (packed in upper
+    // 16 bits). This single MMIO read replaces per-get_used() reads.
+    unsafe {
+        (*ndev()).rx_queues[qp].poll_interrupt_status();
+    }
+
     if kernel::percpu::num_cores() <= 1 {
         tx_drain_qp(qp);
     } else if let Some(_g) = TX_LOCK.try_lock() {
@@ -884,9 +900,6 @@ pub fn poll_qp(qp: usize, callback: fn(&[u8])) -> i32 {
             if used_len > VIRTIO_NET_HDR_SIZE as u32 {
                 let frame_len = (used_len - VIRTIO_NET_HDR_SIZE as u32) as usize;
                 let frame_data = buf.add(VIRTIO_NET_HDR_SIZE);
-                // Invalidate dcache for the descriptor buffer so we read
-                // fresh data written by the HVF host (different VMID).
-                dc_civac_range(buf, used_len as usize);
                 let slice = core::slice::from_raw_parts(frame_data, frame_len);
                 callback(slice);
             }
@@ -980,8 +993,6 @@ pub fn poll_batch_qp(qp: usize, batch: &mut RxBatch) {
 
             if used_len > VIRTIO_NET_HDR_SIZE as u32 {
                 let frame_len = (used_len - VIRTIO_NET_HDR_SIZE as u32) as usize;
-                // Invalidate dcache for the descriptor buffer (HVF host writes).
-                dc_civac_range(buf, used_len as usize);
                 if batch.len + 2 + frame_len <= batch.data.len() {
                     let len_bytes = (frame_len as u16).to_le_bytes();
                     batch.data[batch.len] = len_bytes[0];

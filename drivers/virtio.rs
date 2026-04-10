@@ -3,7 +3,7 @@
 use core::ptr;
 
 use crate::{
-    log, dsb_st, dsb_ld, dsb_sy, dc_civac_range,
+    log, dsb_st, dsb_ld, dsb_sy,
     mmio_read32, mmio_write32, mmio_read16, mmio_write16, mmio_read8, mmio_write8,
     virtio_read32, virtio_write32, virtio_read16, virtio_write16, virtio_read8, virtio_write8,
     vz_config_delay,
@@ -360,6 +360,10 @@ pub(crate) const VIRTIO_NET_F_STATUS: u32 = 1 << 16;
 pub(crate) const VIRTIO_NET_F_MQ: u32 = 1 << 22;
 pub(crate) const VIRTIO_NET_F_CTRL_VQ: u32 = 1 << 17;
 pub(crate) const VIRTIO_RING_F_EVENT_IDX: u32 = 1 << 29;
+/// Vendor extension: device exposes per-queue used_idx at config offset 0x110.
+/// When set, get_used() reads used_idx via MMIO trap instead of from shared
+/// RAM, working around dcache coherency issues on Apple HVF.
+pub(crate) const VIRTIO_F_USED_IDX_MMIO: u32 = 1 << 24;
 
 // ============================================================================
 // Split Virtqueue
@@ -410,6 +414,10 @@ pub(crate) struct Virtqueue {
     pub queue_index: u16,
     pub is_mmio: bool,
     pub event_idx: bool,
+    /// Device supports MMIO-based used_idx read (VIRTIO_F_USED_IDX_MMIO).
+    pub used_idx_mmio: bool,
+    /// Cached used_idx from last poll_interrupt_status() call.
+    pub mmio_cached_used_idx: u16,
 }
 
 impl Virtqueue {
@@ -426,6 +434,8 @@ impl Virtqueue {
         queue_index: 0,
         is_mmio: false,
         event_idx: false,
+        used_idx_mmio: false,
+        mmio_cached_used_idx: 0,
     };
 
     /// Allocate ring memory and set up descriptor free list.
@@ -602,25 +612,27 @@ impl Virtqueue {
 
     /// Check for completed buffers in the used ring.
     /// Returns (descriptor_head_id, bytes_written) or None.
+    /// Read INTERRUPT_STATUS and extract the device-side used_idx
+    /// packed in the upper 16 bits (VIRTIO_F_USED_IDX_MMIO extension).
+    /// Call once per poll cycle; get_used() then uses the cached value.
+    pub fn poll_interrupt_status(&mut self) -> u32 {
+        if self.used_idx_mmio {
+            let val = unsafe { virtio_read32(self.io_base + MMIO_INTERRUPT_STATUS) };
+            // Upper 16 bits = RX used_idx from device.
+            self.mmio_cached_used_idx = (val >> 16) as u16;
+            val & 0xFFFF
+        } else {
+            0
+        }
+    }
+
     pub fn get_used(&mut self) -> Option<(u16, u32)> {
-        // On virtio-mmio (HVF), the host writes used->idx from a different
-        // dcache context. Reading the used ring from guest RAM may return
-        // stale data. Instead, read the device-config register at offset
-        // 0x110 which the host keeps in sync, delivered via MMIO trap.
-        let cur_used_idx = if self.is_mmio {
-            let val = unsafe { virtio_read32(self.io_base + 0x110) };
-            if self.queue_index == 0 { val as u16 } else { (val >> 16) as u16 }
+        let cur_used_idx = if self.used_idx_mmio {
+            self.mmio_cached_used_idx
         } else {
             dsb_ld();
             self.used_idx()
         };
-
-        // Also invalidate dcache for the used ring elements (id + len)
-        // and descriptor buffer data, since these are also host-written.
-        if self.is_mmio {
-            dc_civac_range(self.used as *const u8, 4 + 8 * self.queue_size as usize);
-        }
-
         if self.last_used_idx == cur_used_idx { return None; }
 
         let used_slot = self.last_used_idx & (self.queue_size - 1);
