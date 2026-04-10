@@ -116,7 +116,7 @@ def run_wrk_parallel(port, endpoint, threads, conns, duration, instances):
     return total_rps, p50, p99
 
 
-def run_udp(port, senders, duration):
+def run_udp(port, senders, duration, async_mode=False):
     """Run UDP echo benchmark using the compiled C client.
 
     The C client (scripts/udp_bench) uses fork() for parallelism,
@@ -124,33 +124,39 @@ def run_udp(port, senders, duration):
     implementation to ~50k pkt/s regardless of sender count. The C
     client also collects a per-packet latency histogram from sender 0.
 
+    In async mode (--async), each sender uses separate send/recv threads
+    to pipeline sends without waiting for replies. This measures the
+    maximum sustainable throughput — analogous to how wrk pipelines
+    HTTP requests over keep-alive connections.
+
     Falls back to the old Python implementation if the C binary isn't
     found (first run before compilation).
     """
     udp_bin = os.path.join(SCRIPT_DIR, "udp_bench")
     if not os.path.isfile(udp_bin):
-        # Try to compile it.
         src = os.path.join(SCRIPT_DIR, "udp_bench.c")
         if os.path.isfile(src):
-            subprocess.run(["cc", "-O2", "-o", udp_bin, src],
+            subprocess.run(["cc", "-O2", "-o", udp_bin, src, "-lpthread"],
                            capture_output=True, timeout=30)
 
     if os.path.isfile(udp_bin):
         try:
-            r = subprocess.run(
-                [udp_bin, str(port), str(senders), str(duration)],
-                capture_output=True, text=True, timeout=duration + 30)
+            cmd = [udp_bin, str(port), str(senders), str(duration)]
+            if async_mode:
+                cmd.append("--async")
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=duration + 30)
             for line in r.stdout.split("\n"):
                 if line.startswith("RESULT "):
                     parts = line.split()
                     pps = float(parts[1])
-                    p50 = f"{int(parts[2])}us"
-                    p99 = f"{int(parts[3])}us"
+                    p50 = f"{int(parts[2])}us" if int(parts[2]) > 0 else ""
+                    p99 = f"{int(parts[3])}us" if int(parts[3]) > 0 else ""
                     return pps, p50, p99
         except Exception:
             pass
 
-    # Fallback: old Python implementation (GIL-limited).
+    # Fallback: old Python implementation (GIL-limited, sync only).
     recv = [0] * senders
     def sender(idx):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -414,7 +420,9 @@ WORKLOADS = [
      "parallel": True,
      "desc": "/compute × 8 conn (CPU-bound, parallel clients for multi-core scaling)"},
     {"name": "udp_8s",     "type": "udp", "endpoint": "",         "threads": 0, "conns": 8,
-     "desc": "UDP echo × 8 senders"},
+     "desc": "UDP echo × 8 senders (sync round-trip)"},
+    {"name": "udp_8s_async", "type": "udp_async", "endpoint": "",  "threads": 0, "conns": 8,
+     "desc": "UDP echo × 8 senders (pipelined async)"},
 ]
 
 
@@ -534,10 +542,15 @@ def main():
                             port, w["endpoint"], w["threads"], w["conns"], duration)
                     results[(env_name, cpus, wname)] = (rps, p50, p99)
                     print(f"    {wname:<20s} {rps:>10.0f} req/s  p50={p50}  p99={p99}")
-                else:
+                elif w["type"] == "udp":
                     pps, p50, p99 = run_udp(port + 1, w["conns"], duration)
                     results[(env_name, cpus, wname)] = (pps, p50, p99)
                     print(f"    {wname:<20s} {pps:>10.0f} pkt/s  p50={p50}  p99={p99}")
+                elif w["type"] == "udp_async":
+                    pps, p50, p99 = run_udp(port + 1, w["conns"], duration,
+                                            async_mode=True)
+                    results[(env_name, cpus, wname)] = (pps, p50, p99)
+                    print(f"    {wname:<20s} {pps:>10.0f} pkt/s  (async recv rate)")
 
                 env.stop(proc)
                 _current["proc"] = None
