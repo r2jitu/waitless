@@ -37,6 +37,10 @@ use kernel::mm::{kmalloc, virt_to_phys, phys_to_virt};
 // VirtIO-net constants and types
 // ============================================================================
 
+/// Set by the IRQ handler when SPI 35 fires with new RX frames.
+/// The poll path checks this instead of doing an MMIO read every iteration.
+static IRQ_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 const RX_BUFFERS: usize = 64;
 const BUFFER_SIZE: u32 = 2048;
 const TX_POOL_SIZE: usize = 64;
@@ -695,6 +699,8 @@ fn irq_handler(_irq: u32) {
                 // Extract used_idx packed in upper 16 bits (HVF extension).
                 if (*ndev()).rx_queues[0].used_idx_mmio {
                     (*ndev()).rx_queues[0].mmio_cached_used_idx = (isr >> 16) as u16;
+                    // Signal that frames may be available for the poll path.
+                    IRQ_PENDING.store(true, core::sync::atomic::Ordering::Release);
                 }
                 virtio_write32(base + MMIO_INTERRUPT_ACK, isr & 0xFFFF);
             }
@@ -885,11 +891,11 @@ pub fn poll_qp(qp: usize, callback: fn(&[u8])) -> i32 {
         if let Transport::None = (*ndev()).transport { return 0; }
     }
 
-    // For VIRTIO_F_USED_IDX_MMIO devices: read INTERRUPT_STATUS once
-    // per poll cycle. This MMIO exit also runs check_rx() on the host,
-    // injecting any pending RX frames into the used ring.
-    unsafe {
-        (*ndev()).rx_queues[qp].poll_interrupt_status();
+    // For VIRTIO_F_USED_IDX_MMIO devices: the IRQ handler already
+    // cached the used_idx when it read INTERRUPT_STATUS. Just consume
+    // the flag — no extra MMIO exit needed.
+    if IRQ_PENDING.swap(false, core::sync::atomic::Ordering::Acquire) {
+        // used_idx was cached by irq_handler; get_used() will find it.
     }
 
     if kernel::percpu::num_cores() <= 1 {

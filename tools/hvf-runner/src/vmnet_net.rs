@@ -55,13 +55,8 @@ pub fn start() -> Result<[u8; 6], String> {
 
     *IFACE.lock().unwrap() = Some(SendIface(iface));
 
-    // Set up TX wake channel.
-    let (tx_wake_tx, tx_wake_rx) = std::sync::mpsc::channel::<()>();
-    *TX_WAKE.lock().unwrap() = Some(tx_wake_tx);
-    *TX_WAKE_RX.lock().unwrap() = Some(tx_wake_rx);
-
     // Set up event-driven IO: PACKETS_AVAILABLE callback reads from
-    // vmnet on the GCD thread; a separate thread drains TX.
+    // vmnet on the GCD thread. TX writes go directly via IFACE_PTR.
     start_io();
 
     Ok(mac_bytes)
@@ -140,11 +135,13 @@ pub fn process_tx() {
         unsafe { core::arch::asm!("dsb sy", options(nostack)); }
         drop(dev_lock);
 
-        // Queue frames for the IO thread (which owns the vmnet interface).
-        TX_OUTBOUND.lock().unwrap().extend(frames);
-        // Wake the IO thread to drain TX immediately.
-        if let Some(ref tx) = *TX_WAKE.lock().unwrap() {
-            let _ = tx.send(());
+        // Write frames directly to vmnet (no queue, no Mutex).
+        let ptr = IFACE_PTR.load(std::sync::atomic::Ordering::Acquire);
+        if ptr != 0 {
+            let iface = unsafe { &mut *(ptr as *mut SendIface) };
+            for frame in &frames {
+                let _ = iface.0.write(frame);
+            }
         }
 
         // Interrupt the guest.
@@ -156,85 +153,70 @@ pub fn process_tx() {
 /// vCPU thread to inject them via check_rx().
 static RX_PENDING: Mutex<VecDeque<Vec<u8>>> = Mutex::new(VecDeque::new());
 
-/// Pending TX frames from the vCPU thread, waiting for the RX/IO thread
-/// to write them to vmnet. This avoids sharing the vmnet interface
-/// between threads (eliminates IFACE mutex contention).
-static TX_OUTBOUND: Mutex<VecDeque<Vec<u8>>> = Mutex::new(VecDeque::new());
 
 /// vCPU ID for hv_vcpus_exit kicks. Set by the vCPU thread before run().
 pub static VCPU_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Channel sender to wake the TX drain thread when frames are queued.
-static TX_WAKE: Mutex<Option<std::sync::mpsc::Sender<()>>> = Mutex::new(None);
+/// Raw pointer to vmnet interface for lock-free access.
+/// SAFETY: vmnet's C API (vmnet_read/vmnet_write) is thread-safe.
+/// The Rust crate doesn't mark it Send+Sync but the underlying C
+/// implementation uses internal serialization.
+static IFACE_PTR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Set up event-driven vmnet IO.
+/// Read all available frames from vmnet and push to RX_PENDING.
+/// Returns true if any frames were read.
+unsafe fn drain_vmnet_rx() -> bool {
+    let ptr = IFACE_PTR.load(std::sync::atomic::Ordering::Acquire);
+    if ptr == 0 { return false; }
+    let iface = &mut *(ptr as *mut SendIface);
+    let mut buf = [0u8; 2048];
+    let mut got_any = false;
+    loop {
+        match iface.0.read(&mut buf) {
+            Ok(n) if n > 0 => {
+                snoop_dhcp_ack(&buf[..n]);
+                RX_PENDING.lock().unwrap().push_back(buf[..n].to_vec());
+                got_any = true;
+            }
+            _ => break,
+        }
+    }
+    if got_any {
+        hvf::hv_gic_set_spi(35, true);
+        let vcpu = VCPU_ID.load(std::sync::atomic::Ordering::Relaxed);
+        if vcpu != 0 {
+            hvf::hv_vcpus_exit(&vcpu as *const u64, 1);
+        }
+    }
+    got_any
+}
+
+/// Set up vmnet IO: event callback + polling thread.
 ///
-/// Registers PACKETS_AVAILABLE callback that reads frames directly from
-/// vmnet inside the GCD callback — matching QEMU's approach. A separate
-/// thread drains the TX outbound queue.
+/// The GCD callback handles burst delivery. A 500µs polling thread
+/// catches frames that arrive between callbacks (vmnet coalesces
+/// PACKETS_AVAILABLE events at ~5/sec).
 fn start_io() {
-    use std::sync::Arc;
+    // Leak the interface into a raw pointer for lock-free access.
+    let iface = IFACE.lock().unwrap().take().unwrap();
+    let ptr = Box::into_raw(Box::new(iface));
+    IFACE_PTR.store(ptr as usize, std::sync::atomic::Ordering::Release);
 
-    // Take ownership of the vmnet interface behind an Arc<Mutex>.
-    let iface = {
-        let mut guard = IFACE.lock().unwrap();
-        Arc::new(Mutex::new(guard.take().unwrap()))
-    };
-
-    // Register PACKETS_AVAILABLE callback — reads happen here on the GCD thread.
-    let rx_iface = Arc::clone(&iface);
-    {
-        let mut guard = iface.lock().unwrap();
-        guard.0.set_event_callback(vmnet::Events::PACKETS_AVAILABLE, move |_, _| {
-            let mut guard = rx_iface.lock().unwrap();
-            let mut buf = [0u8; 2048];
-            // Drain ALL available packets.
-            loop {
-                match guard.0.read(&mut buf) {
-                    Ok(n) if n > 0 => {
-                        snoop_dhcp_ack(&buf[..n]);
-                        RX_PENDING.lock().unwrap().push_back(buf[..n].to_vec());
-                    }
-                    _ => break,
-                }
-            }
-            // Fire SPI 35 to wake the vCPU from WFI. The IRQ handler
-            // will read INTERRUPT_STATUS (triggering check_rx via the
-            // MMIO exit) and cache the used_idx.
-            // Note: hv_vcpus_exit doesn't wake a WFI'd vCPU, but SPI does.
-            unsafe { hvf::hv_gic_set_spi(35, true); }
-            // Also kick the vCPU in case it's not in WFI.
-            let vcpu = VCPU_ID.load(std::sync::atomic::Ordering::Relaxed);
-            if vcpu != 0 {
-                unsafe { hvf::hv_vcpus_exit(&vcpu as *const u64, 1); }
-            }
+    // Register PACKETS_AVAILABLE callback.
+    unsafe {
+        (*ptr).0.set_event_callback(vmnet::Events::PACKETS_AVAILABLE, move |_, _| {
+            drain_vmnet_rx();
         }).expect("set_event_callback failed");
     }
 
-    // TX drain thread: writes guest TX frames to vmnet.
-    let tx_iface = Arc::clone(&iface);
-    std::thread::spawn(move || {
+    // Polling thread: reads every 500µs to catch inter-callback frames.
+    std::thread::spawn(|| {
         loop {
-            let frames: Vec<Vec<u8>> = {
-                let mut txq = TX_OUTBOUND.lock().unwrap();
-                txq.drain(..).collect()
-            };
-            if frames.is_empty() {
-                if let Some(ref rx) = *TX_WAKE_RX.lock().unwrap() {
-                    let _ = rx.recv();
-                }
-                continue;
-            }
-            let mut guard = tx_iface.lock().unwrap();
-            for frame in &frames {
-                let _ = guard.0.write(frame);
-            }
+            std::thread::sleep(std::time::Duration::from_micros(50));
+            unsafe { drain_vmnet_rx(); }
         }
     });
 }
-
-/// Channel for TX thread wake.
-static TX_WAKE_RX: Mutex<Option<std::sync::mpsc::Receiver<()>>> = Mutex::new(None);
 
 /// Snoop DHCP ACK frames to learn the VM's IP and set up port forwarding.
 /// Called from the RX thread for every received frame.
