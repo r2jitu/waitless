@@ -125,28 +125,22 @@ mod aarch64 {
     const CR_TXE: u32 = 1 << 8;
     const CR_RXE: u32 = 1 << 9;
 
-    /// Serial backend, encoded as a `u8` so it can live in an `AtomicU8`:
-    /// 0 = None, 1 = Pl011, 2 = Virtio. Set during `init()` on the BSP
-    /// and read by every core.
-    const BACKEND_NONE: u8 = 0;
-    const BACKEND_PL011: u8 = 1;
-    const BACKEND_VIRTIO: u8 = 2;
-    static BACKEND: core::sync::atomic::AtomicU8 =
-        core::sync::atomic::AtomicU8::new(BACKEND_NONE);
+    /// Discovered console backend. Set exactly once by `init()` on the
+    /// BSP after FDT discovery, then read by every core. `InitOnce`
+    /// gives us release/acquire publication and proper enum dispatch
+    /// without magic-number constants.
+    enum SerialBackend {
+        Pl011 { base: u64 },
+        Virtio,
+    }
 
-    /// Resolved PL011 register handle. Populated by `pl011_init` after
-    /// FDT discovery; read by every PL011 access. Stored as the raw
-    /// base address (AtomicU64) since the typed reference can't go
-    /// into a static directly without an unsafe const initializer.
-    static PL011_BASE: core::sync::atomic::AtomicU64 =
-        core::sync::atomic::AtomicU64::new(0);
+    static BACKEND: crate::once::InitOnce<SerialBackend> = crate::once::InitOnce::new();
 
     #[inline(always)]
-    fn pl011() -> &'static Pl011Regs {
-        let base = PL011_BASE.load(core::sync::atomic::Ordering::Relaxed);
-        // SAFETY: PL011_BASE is set exactly once in pl011_init from a
-        // valid FDT-discovered MMIO base; subsequent loads return the
-        // same address. The Pl011Regs layout matches the ARM TRM.
+    fn pl011_at(base: u64) -> &'static Pl011Regs {
+        // SAFETY: caller passes a base discovered from the FDT, which
+        // points at a valid PL011 device. The Pl011Regs layout matches
+        // the ARM TRM.
         unsafe { mmio::at::<Pl011Regs>(base) }
     }
 
@@ -159,14 +153,12 @@ mod aarch64 {
     }
 
     fn pl011_init(base: u64) {
-        PL011_BASE.store(base, core::sync::atomic::Ordering::Release);
-        let r = pl011();
+        let r = pl011_at(base);
         r.cr.write(0);                      // disable UART
         r.ibrd.write(13);                   // 115200 @ 24 MHz
         r.fbrd.write(1);
         r.lcr_h.write((3 << 5) | (1 << 4)); // 8N1, FIFO on
         r.cr.write(CR_UARTEN | CR_TXE | CR_RXE);
-        BACKEND.store(BACKEND_PL011, core::sync::atomic::Ordering::Release);
     }
 
     pub unsafe fn init() {
@@ -176,6 +168,7 @@ mod aarch64 {
             // Prefer PL011 if FDT found one (QEMU path)
             if fdt.uart_base != 0 {
                 pl011_init(fdt.uart_base);
+                BACKEND.init(SerialBackend::Pl011 { base: fdt.uart_base });
                 return;
             }
 
@@ -183,7 +176,7 @@ mod aarch64 {
             if fdt.virtio_count > 0 {
                 for i in 0..fdt.virtio_count as usize {
                     if virtio_console_init_mmio(fdt.virtio_bases[i]) {
-                        BACKEND.store(BACKEND_VIRTIO, core::sync::atomic::Ordering::Release);
+                        BACKEND.init(SerialBackend::Virtio);
                         return;
                     }
                 }
@@ -193,7 +186,7 @@ mod aarch64 {
             if fdt.pcie_ecam_base != 0 {
                 pci_init();
                 if virtio_console_init_pci() {
-                    BACKEND.store(BACKEND_VIRTIO, core::sync::atomic::Ordering::Release);
+                    BACKEND.init(SerialBackend::Virtio);
                     return;
                 }
             }
@@ -203,30 +196,30 @@ mod aarch64 {
     }
 
     pub unsafe fn putc(c: u8) {
-        match BACKEND.load(core::sync::atomic::Ordering::Acquire) {
-            BACKEND_VIRTIO => unsafe { virtio_console_putc(c) },
-            BACKEND_PL011 => {
-                let r = pl011();
+        match BACKEND.try_get() {
+            Some(SerialBackend::Virtio) => unsafe { virtio_console_putc(c) },
+            Some(SerialBackend::Pl011 { base }) => {
+                let r = pl011_at(*base);
                 // Wait for TX FIFO not full
                 while (r.fr.read() & FR_TXFF) != 0 {}
                 r.dr.write(c as u32);
             }
-            _ => {}
+            None => {}
         }
     }
 
     pub unsafe fn try_getc() -> i32 {
-        match BACKEND.load(core::sync::atomic::Ordering::Acquire) {
-            BACKEND_VIRTIO => unsafe { virtio_console_try_getc() },
-            BACKEND_PL011 => {
-                let r = pl011();
+        match BACKEND.try_get() {
+            Some(SerialBackend::Virtio) => unsafe { virtio_console_try_getc() },
+            Some(SerialBackend::Pl011 { base }) => {
+                let r = pl011_at(*base);
                 if (r.fr.read() & FR_RXFE) == 0 {
                     (r.dr.read() & 0xFF) as i32
                 } else {
                     -1
                 }
             }
-            _ => -1,
+            None => -1,
         }
     }
 }

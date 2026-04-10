@@ -245,14 +245,10 @@ static NUM_CORES: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(1);
 
 /// AP poll function: registered by the network layer, called by APs in
-/// their event loop. Returns true if work was done.
-///
-/// Stored as `AtomicPtr<()>` rather than `static mut` so the cross-core
-/// publish/subscribe is a real release/acquire pair, not a volatile read
-/// (which is not a synchronisation primitive). The `Option<fn>` is encoded
-/// as a nullable raw pointer: null = `None`, non-null = `Some(fn)`.
-static AP_POLL_FN: core::sync::atomic::AtomicPtr<()> =
-    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+/// their event loop. Returns true if work was done. Stored as a typed
+/// `AtomicFn` so cross-core publish/subscribe is a real release/acquire
+/// pair without per-call-site fn-pointer transmutes.
+static AP_POLL_FN: crate::sync::AtomicFn<fn(u32) -> bool> = crate::sync::AtomicFn::null();
 
 /// Initialize per-core state for `count` cores. Must be called exactly
 /// once, single-threaded, before any AP starts and before any call to
@@ -361,23 +357,15 @@ impl CurrentCore {
 }
 
 /// Register the AP poll function (called by net layer during init).
-/// Release-stores the pointer so APs that observe it via acquire-load
+/// Release-stores via `AtomicFn` so APs that observe it via acquire-load
 /// also see all writes that happened-before this store.
 pub fn set_ap_poll_fn(f: fn(u32) -> bool) {
-    AP_POLL_FN.store(f as *mut (), core::sync::atomic::Ordering::Release);
+    AP_POLL_FN.store(f);
 }
 
 /// Get the AP poll function (called by APs in their event loop).
-/// Acquire-loads to pair with `set_ap_poll_fn`'s release-store.
 pub fn ap_poll_fn() -> Option<fn(u32) -> bool> {
-    let p = AP_POLL_FN.load(core::sync::atomic::Ordering::Acquire);
-    if p.is_null() {
-        None
-    } else {
-        // SAFETY: only `set_ap_poll_fn` writes here, and it always writes a
-        // valid `fn(u32) -> bool` pointer.
-        Some(unsafe { core::mem::transmute::<*mut (), fn(u32) -> bool>(p) })
-    }
+    AP_POLL_FN.load()
 }
 
 // ============================================================================

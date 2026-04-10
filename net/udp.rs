@@ -5,12 +5,14 @@
 
 #![no_std]
 
+extern crate kernel;
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
 extern crate net_ipv4 as ipv4;
 
-use core::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU16, Ordering};
 use from_bytes::FromBytes;
+use kernel::sync::AtomicFn;
 use types::{Ipv4Addr, CONFIG, tcp_checksum, htons, ntohs};
 use ipv4::{ipv4_send, PROTO_UDP};
 
@@ -27,30 +29,6 @@ unsafe impl FromBytes for UdpHeader {}
 
 type UdpHandlerFn = fn([u8; 4], u16, &[u8]);
 
-/// Atomic cell for a typed function pointer. Hides the unsafe transmute
-/// behind a safe API: `store` takes a typed fn, `load` returns one.
-struct AtomicHandlerFn(AtomicUsize);
-
-impl AtomicHandlerFn {
-    const fn new() -> Self {
-        AtomicHandlerFn(AtomicUsize::new(0))
-    }
-    fn store(&self, f: UdpHandlerFn) {
-        self.0.store(f as usize, Ordering::Release);
-    }
-    fn load(&self) -> Option<UdpHandlerFn> {
-        let v = self.0.load(Ordering::Acquire);
-        if v == 0 {
-            None
-        } else {
-            // SAFETY: only `store(f)` writes this field, and `f`'s type
-            // is statically `UdpHandlerFn`. The bit pattern is therefore
-            // a valid `UdpHandlerFn` whenever `v != 0`.
-            Some(unsafe { core::mem::transmute::<usize, UdpHandlerFn>(v) })
-        }
-    }
-}
-
 const MAX_HANDLERS: usize = 8;
 
 /// Port→handler dispatch table. Each slot is `(port, handler_fn)`.
@@ -65,11 +43,11 @@ static HANDLER_PORTS: [AtomicU16; MAX_HANDLERS] = [
     AtomicU16::new(0), AtomicU16::new(0), AtomicU16::new(0), AtomicU16::new(0),
     AtomicU16::new(0), AtomicU16::new(0), AtomicU16::new(0), AtomicU16::new(0),
 ];
-static HANDLER_FNS: [AtomicHandlerFn; MAX_HANDLERS] = [
-    AtomicHandlerFn::new(), AtomicHandlerFn::new(),
-    AtomicHandlerFn::new(), AtomicHandlerFn::new(),
-    AtomicHandlerFn::new(), AtomicHandlerFn::new(),
-    AtomicHandlerFn::new(), AtomicHandlerFn::new(),
+static HANDLER_FNS: [AtomicFn<UdpHandlerFn>; MAX_HANDLERS] = [
+    AtomicFn::null(), AtomicFn::null(),
+    AtomicFn::null(), AtomicFn::null(),
+    AtomicFn::null(), AtomicFn::null(),
+    AtomicFn::null(), AtomicFn::null(),
 ];
 
 /// Register a handler for incoming UDP packets on a specific port.

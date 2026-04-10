@@ -208,12 +208,11 @@ pub fn arp_resolve(ip: Ipv4Addr) -> Option<MacAddr> {
     for _retry in 0..3 {
         arp_request(target);
         for _poll in 0..200_000 {
-            // Try to drain the RX queue from this core. poll_if_safe
-            // returns immediately on a non-distributor core; on the
-            // distributor core it processes incoming frames including
-            // any ARP reply, which updates the cache that arp_lookup
-            // reads on the next iteration.
-            drivers::virtio_net::poll_if_safe(arp_poll_callback);
+            // Drain the RX queue. poll() takes the TX_LOCK try-lock
+            // around the queue access, so concurrent calls across cores
+            // are serialised; an ARP reply observed here updates the
+            // cache that arp_lookup reads on the next iteration.
+            drivers::virtio_net::poll(arp_poll_callback);
             if let Some(mac) = ARP_CACHE.lock().lookup(target) {
                 return Some(mac);
             }

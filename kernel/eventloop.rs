@@ -7,72 +7,26 @@
 // After the app's main() returns, all cores enter eventloop::run().
 // The loop runs until shutdown.
 
-use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
+
+use crate::sync::AtomicFn;
 
 /// Callback types. All receive core_id, return true if work was done.
 type PollFn = fn(u32) -> bool;
+type VoidFn = fn();
+type BoolFn = fn() -> bool;
+type IdleFn = fn(u32);
 
-/// Registered callbacks. Each is published as an `AtomicPtr<()>` (null = not
-/// set, non-null = function pointer). The release-store on registration
-/// pairs with the acquire-load in `run()` so that any data written before
-/// registration is visible to the consumer cores. Volatile reads/writes
-/// (the previous design) are NOT a synchronisation primitive — they prevent
-/// the access itself from being optimised away but neither establish a
-/// happens-before edge nor prevent surrounding memory accesses from being
-/// reordered around them.
-static NET_POLL: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
-static NET_DRAIN: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
-static NET_FLUSH: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
-static SERVICE: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
-static CHECK_SHUTDOWN: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
-static IDLE: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
-
-#[inline]
-fn store_fn(slot: &AtomicPtr<()>, f: usize) {
-    slot.store(f as *mut (), Ordering::Release);
-}
-
-#[inline]
-fn load_poll(slot: &AtomicPtr<()>) -> Option<PollFn> {
-    let p = slot.load(Ordering::Acquire);
-    if p.is_null() {
-        None
-    } else {
-        // SAFETY: only the matching `set_*` writes here, and it always
-        // writes a valid `PollFn`.
-        Some(unsafe { core::mem::transmute::<*mut (), PollFn>(p) })
-    }
-}
-
-#[inline]
-fn load_void(slot: &AtomicPtr<()>) -> Option<fn()> {
-    let p = slot.load(Ordering::Acquire);
-    if p.is_null() {
-        None
-    } else {
-        Some(unsafe { core::mem::transmute::<*mut (), fn()>(p) })
-    }
-}
-
-#[inline]
-fn load_bool(slot: &AtomicPtr<()>) -> Option<fn() -> bool> {
-    let p = slot.load(Ordering::Acquire);
-    if p.is_null() {
-        None
-    } else {
-        Some(unsafe { core::mem::transmute::<*mut (), fn() -> bool>(p) })
-    }
-}
-
-#[inline]
-fn load_idle(slot: &AtomicPtr<()>) -> Option<fn(u32)> {
-    let p = slot.load(Ordering::Acquire);
-    if p.is_null() {
-        None
-    } else {
-        Some(unsafe { core::mem::transmute::<*mut (), fn(u32)>(p) })
-    }
-}
+/// Registered callbacks. Each `AtomicFn<F>` publishes a typed function
+/// pointer with `Release` ordering on store / `Acquire` on load, so any
+/// data the registrant wrote before publication is visible to consumer
+/// cores when they observe the slot.
+static NET_POLL: AtomicFn<PollFn> = AtomicFn::null();
+static NET_DRAIN: AtomicFn<PollFn> = AtomicFn::null();
+static NET_FLUSH: AtomicFn<VoidFn> = AtomicFn::null();
+static SERVICE: AtomicFn<PollFn> = AtomicFn::null();
+static CHECK_SHUTDOWN: AtomicFn<BoolFn> = AtomicFn::null();
+static IDLE: AtomicFn<IdleFn> = AtomicFn::null();
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static READY: AtomicBool = AtomicBool::new(false);
@@ -80,27 +34,27 @@ static READY: AtomicBool = AtomicBool::new(false);
 // ---- Registration API (called during boot/app init) ----
 
 pub fn set_net_poll(f: PollFn) {
-    store_fn(&NET_POLL, f as usize);
+    NET_POLL.store(f);
 }
 
 pub fn set_net_drain(f: PollFn) {
-    store_fn(&NET_DRAIN, f as usize);
+    NET_DRAIN.store(f);
 }
 
-pub fn set_net_flush(f: fn()) {
-    store_fn(&NET_FLUSH, f as usize);
+pub fn set_net_flush(f: VoidFn) {
+    NET_FLUSH.store(f);
 }
 
 pub fn set_service(f: PollFn) {
-    store_fn(&SERVICE, f as usize);
+    SERVICE.store(f);
 }
 
-pub fn set_check_shutdown(f: fn() -> bool) {
-    store_fn(&CHECK_SHUTDOWN, f as usize);
+pub fn set_check_shutdown(f: BoolFn) {
+    CHECK_SHUTDOWN.store(f);
 }
 
-pub fn set_idle(f: fn(u32)) {
-    store_fn(&IDLE, f as usize);
+pub fn set_idle(f: IdleFn) {
+    IDLE.store(f);
 }
 
 /// Signal that the app has finished initialization and the event loop
@@ -145,17 +99,17 @@ pub fn run(core_id: u32) -> ! {
         let mut did_work = false;
 
         // 1. Network poll: try to distribute RX + flush TX (rotating distributor)
-        if let Some(f) = load_poll(&NET_POLL) {
+        if let Some(f) = NET_POLL.load() {
             if f(core_id) { did_work = true; poll_work += 1; }
         }
 
         // 2. Drain this core's inbox
-        if let Some(f) = load_poll(&NET_DRAIN) {
+        if let Some(f) = NET_DRAIN.load() {
             if f(core_id) { did_work = true; drain_work += 1; }
         }
 
         // 3. App service (connections, handlers)
-        if let Some(f) = load_poll(&SERVICE) {
+        if let Some(f) = SERVICE.load() {
             if f(core_id) { did_work = true; service_work += 1; }
         }
 
@@ -179,7 +133,7 @@ pub fn run(core_id: u32) -> ! {
 
         // 4. Check for shutdown (every 64 iterations to avoid MMIO overhead)
         if loops & 63 == 0 {
-            if let Some(f) = load_bool(&CHECK_SHUTDOWN) {
+            if let Some(f) = CHECK_SHUTDOWN.load() {
                 if f() {
                     request_shutdown();
                     break;
@@ -195,7 +149,7 @@ pub fn run(core_id: u32) -> ! {
             consecutive_idle = consecutive_idle.saturating_add(1);
 
             // Flush before sleeping (responses may be staged).
-            if let Some(f) = load_void(&NET_FLUSH) {
+            if let Some(f) = NET_FLUSH.load() {
                 f();
             }
 
@@ -207,7 +161,7 @@ pub fn run(core_id: u32) -> ! {
                 for _ in 0..100u32 { core::hint::spin_loop(); }
             } else {
                 // Heavy idle: deep sleep (interrupt-armed)
-                if let Some(f) = load_idle(&IDLE) {
+                if let Some(f) = IDLE.load() {
                     f(core_id);
                 } else {
                     #[cfg(target_arch = "aarch64")]

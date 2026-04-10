@@ -71,14 +71,15 @@ static PCI_INITIALIZED: core::sync::atomic::AtomicBool =
 
 // ---- Config space access (arch-specific unsafe core) ------------------------
 
-/// ECAM base. Set once in init_inner from FDT, read by every config
-/// access. AtomicU64 with Relaxed ordering — the publish happens once
-/// during single-threaded boot, all subsequent reads see the same
-/// value, and the volatile MMIO ops on the resulting address provide
-/// the actual hardware ordering.
+/// ECAM base. Set once in `init_inner` from FDT (with a fallback
+/// constant for platforms that don't supply an ECAM node), read by
+/// every config-space access. `InitOnce` gives release/acquire
+/// publication; the volatile MMIO ops on the resulting address
+/// provide the actual hardware ordering.
 #[cfg(target_arch = "aarch64")]
-pub(crate) static G_ECAM_BASE: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0x40_1000_0000);
+const ECAM_BASE_DEFAULT: u64 = 0x40_1000_0000;
+#[cfg(target_arch = "aarch64")]
+pub(crate) static G_ECAM_BASE: kernel::once::InitOnce<u64> = kernel::once::InitOnce::new();
 /// MMIO allocation pool cursor. Mutated by `assign_bars` during the
 /// init bus scan; the spinlock around it serialises future cross-core
 /// scans (currently only the BSP scans, but the lock makes it safe).
@@ -93,7 +94,7 @@ const PCI_CONFIG_DATA: u16 = 0x0CFC;
 #[cfg(target_arch = "aarch64")]
 #[inline]
 fn ecam_addr(bus: u8, slot: u8, func: u8, offset: u8) -> u64 {
-    let base = G_ECAM_BASE.load(core::sync::atomic::Ordering::Relaxed);
+    let base = *G_ECAM_BASE.get();
     base
         + ((bus as u64) << 20)
         + ((slot as u64) << 15)
@@ -270,14 +271,19 @@ fn init_inner() {
     #[cfg(target_arch = "aarch64")]
     {
         let fdt = fdt::info();
-        if fdt.pcie_ecam_base != 0 {
-            G_ECAM_BASE.store(fdt.pcie_ecam_base, core::sync::atomic::Ordering::Relaxed);
+        let ecam = if fdt.pcie_ecam_base != 0 {
             if fdt.pcie_ecam_base >= 0x1_0000_0000 {
                 map_device_range(fdt.pcie_ecam_base, fdt.pcie_ecam_size);
             }
-        }
+            fdt.pcie_ecam_base
+        } else {
+            ECAM_BASE_DEFAULT
+        };
+        G_ECAM_BASE.init(ecam);
         if fdt.pci_mmio32_base != 0 {
-            // Reserve first 4MB for console (init_vz uses base directly)
+            // Reserve the first 4 MB of the PCI MMIO32 window for the
+            // virtio-console device, which assigns its BAR directly from
+            // pci_mmio32_base before this allocator runs.
             *G_PCI_MEM_NEXT.lock() = fdt.pci_mmio32_base + 0x40_0000;
         }
     }

@@ -111,6 +111,7 @@ rust_library(
         ":from_bytes",
         ":types",
         ":ipv4",
+        "//kernel",
     ],
 )
 

@@ -783,23 +783,27 @@ static TX_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 /// raw-pointer accessors; this lock just provides mutual exclusion.
 static TX_LOCK: kernel::sync::Spinlock<()> = kernel::sync::Spinlock::new(());
 
-/// Send a frame. Tier 1 (multi-queue): each core sends on its own queue pair.
-/// Tier 2 (single-queue): core sends directly if single-core, stages if multi-core.
-/// Any core can flush staging via flush_tx_staging().
+/// Send a frame. Two paths:
+///   * Multi-queue device: each core sends on its own per-core queue pair
+///     with no locking.
+///   * Single-queue (or extra cores beyond `num_queue_pairs`): push to a
+///     per-core SPSC staging ring and flag `TX_PENDING`. Any core can later
+///     batch-flush all staged frames into the shared queue under `TX_LOCK`
+///     via `flush_tx_staging()`. The staging path is a throughput
+///     optimisation — it lets `send()` stay non-blocking on hot paths while
+///     a single core drains all rings under one lock acquisition.
 pub fn send(data: &[u8]) {
     let cc = kernel::percpu::CurrentCore::enter();
     let id = cc.id();
     let nqp = unsafe { (*ndev()).num_queue_pairs };
     if nqp > 1 && (id as u16) < nqp {
-        // Tier 1: send directly on this core's queue pair. No locking needed.
+        // Per-core queue pair: no contention, no locking.
         send_on_qp(id as usize, data);
     } else if kernel::percpu::num_cores() <= 1 {
-        // Single-core: send directly (no staging needed).
+        // Single-core: no contention possible, send directly.
         send_on_qp(0, data);
     } else {
-        // Tier 2 multi-core: always stage. The load/store lock isn't safe
-        // for concurrent VirtIO TX queue access (race window between load
-        // and store). Staging is lock-free (per-core buffers).
+        // Single shared queue, multiple cores: stage to per-core ring.
         cc.percore().tx_staging.push(data);
         TX_PENDING.store(true, Ordering::Release);
     }
@@ -839,15 +843,6 @@ pub fn flush_tx_staging() {
 pub fn poll(
     callback: fn(&[u8]),
 ) -> i32 {
-    poll_qp(0, callback)
-}
-
-/// Poll the RX queue from any core. Concurrent calls across cores are
-/// serialised via the `TX_LOCK` try-lock that `poll_qp` takes around the
-/// queue access. Kept as a separate name from `poll` so call sites that
-/// historically distinguished "safe to poll from this core" continue to
-/// read clearly.
-pub fn poll_if_safe(callback: fn(&[u8])) -> i32 {
     poll_qp(0, callback)
 }
 
