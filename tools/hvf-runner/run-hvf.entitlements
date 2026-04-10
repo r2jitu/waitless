@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Required to call hv_vm_create / hv_vcpu_create / hv_gic_create.
+         Without this entitlement, Hypervisor.framework returns HV_DENIED
+         at runtime and the runner prints a clear diagnostic pointing here.
+
+         Note: this is deliberately NOT com.apple.security.virtualization
+         (which is what scripts/run-vz.entitlements uses for VZ.framework).
+         HVF and VZ are separate frameworks with separate entitlements. -->
+    <key>com.apple.security.hypervisor</key>
+    <true/>
+</dict>
+</plist>

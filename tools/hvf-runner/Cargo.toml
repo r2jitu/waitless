@@ -1,0 +1,42 @@
+[package]
+name = "hvf-runner"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.86"
+description = "Apple Hypervisor.framework runner for a bare-metal aarch64 unikernel"
+publish = false
+# Intentionally self-contained: the crate is designed to be extracted into
+# its own repository later via `git subtree split tools/hvf-runner`.
+
+[lib]
+# We ship a small library so the binary and the smoke example can share
+# the FFI bindings and the decoder without duplication. The binary is
+# defined below.
+path = "src/lib.rs"
+
+[[bin]]
+name = "run-hvf"
+path = "src/main.rs"
+
+[[example]]
+name = "smoke"
+path = "examples/smoke.rs"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+# Single-purpose, single-process, single-owner tool. We want the smallest,
+# fastest binary possible, and we want any crash to be an immediate abort
+# rather than an unwind (which could leave the kernel's host process in
+# a half-valid state mid-run).
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+panic = "abort"
+strip = "symbols"
+
+[profile.dev]
+# Mirror release-mode panic behaviour so panics during development
+# don't behave differently from panics in CI.
+panic = "abort"
