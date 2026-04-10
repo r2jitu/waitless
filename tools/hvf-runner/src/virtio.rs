@@ -89,6 +89,10 @@ pub struct VirtioNet {
     /// Host pointer to the start of guest RAM (for translating GPAs to host).
     ram_host: *mut u8,
     ram_base: u64,
+    /// Current used_idx for each queue, updated by check_rx/process_tx.
+    /// Read by the guest via device config at offset 0x110+queue*2
+    /// to bypass dcache coherency issues on HVF.
+    pub used_idx: [u16; NUM_QUEUES],
 }
 
 // SAFETY: ram_host is a stable mapping for the VM's lifetime; only one
@@ -110,6 +114,7 @@ impl VirtioNet {
             mac,
             ram_host,
             ram_base,
+            used_idx: [0; NUM_QUEUES],
         }
     }
 
@@ -133,13 +138,7 @@ impl VirtioNet {
                 if qi < NUM_QUEUES { self.queues[qi].ready as u32 } else { 0 }
             }
             STATUS => self.status,
-            INTERRUPT_STATUS => {
-                let v = self.interrupt_status;
-                if v != 0 {
-                    eprintln!("(virtio) INTERRUPT_STATUS read -> {v:#x}");
-                }
-                v
-            }
+            INTERRUPT_STATUS => self.interrupt_status,
             // Device config: MAC address at offset 0x100..0x105
             off if off >= CONFIG_BASE && off < CONFIG_BASE + 8 => {
                 let cfg_off = (off - CONFIG_BASE) as usize;
@@ -150,6 +149,12 @@ impl VirtioNet {
                     }
                 }
                 val
+            }
+            // Device config: per-queue used_idx at offset 0x110 (RX=q0), 0x114 (TX=q1)
+            // Returns used_idx[0] | (used_idx[1] << 16) as a single 32-bit read.
+            // Guest reads this via MMIO to bypass dcache coherency issues.
+            0x110 => {
+                self.used_idx[0] as u32 | ((self.used_idx[1] as u32) << 16)
             }
             _ => 0,
         }
@@ -215,6 +220,13 @@ impl VirtioNet {
             }
             INTERRUPT_ACK => {
                 self.interrupt_status &= !value;
+                // Deassert the SPI when all interrupt bits are cleared.
+                // SPI 35 is level-triggered — if we don't deassert it,
+                // the GIC re-fires the IRQ immediately after EOI and the
+                // kernel gets stuck in an infinite interrupt loop.
+                if self.interrupt_status == 0 {
+                    unsafe { crate::hvf::hv_gic_set_spi(35, false); }
+                }
             }
             QUEUE_NOTIFY => {
                 // value = queue index being notified

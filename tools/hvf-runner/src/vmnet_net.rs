@@ -28,7 +28,7 @@ static IFACE: Mutex<Option<SendIface>> = Mutex::new(None);
 /// Start a vmnet shared-mode interface and spawn an RX polling thread.
 /// Returns the MAC address assigned by vmnet.
 pub fn start() -> Result<[u8; 6], String> {
-    let mut iface = vmnet::Interface::new(
+    let iface = vmnet::Interface::new(
         vmnet::mode::Mode::Shared(Default::default()),
         Default::default(),
     ).map_err(|e| format!("vmnet::Interface::new: {e:?}"))?;
@@ -53,21 +53,6 @@ pub fn start() -> Result<[u8; 6], String> {
         mac_bytes[0], mac_bytes[1], mac_bytes[2],
         mac_bytes[3], mac_bytes[4], mac_bytes[5],
     );
-
-    // Add port forwarding: host:8080 → VM:80
-    // The kernel uses fallback IP 10.0.2.15 when DHCP fails, so we
-    // forward to that address. vmnet handles the NAT mapping.
-    let vm_addr: std::net::Ipv4Addr = "10.0.2.15".parse().unwrap();
-    match iface.port_forwarding_rule_add(
-        vmnet::port_forwarding::AddressFamily::Ipv4,
-        vmnet::port_forwarding::Protocol::Tcp,
-        8080,
-        std::net::IpAddr::V4(vm_addr),
-        80,
-    ) {
-        Ok(()) => eprintln!("(vmnet) port forward: host:8080 → 10.0.2.15:80"),
-        Err(e) => eprintln!("(vmnet) port forwarding failed: {e:?}"),
-    }
 
     *IFACE.lock().unwrap() = Some(SendIface(iface));
 
@@ -157,9 +142,8 @@ pub fn process_tx() {
         let mut iface_lock = IFACE.lock().unwrap();
         if let Some(ref mut iface) = *iface_lock {
             for frame in &frames {
-                match iface.0.write(frame) {
-                    Ok(n) => eprintln!("(vmnet-tx) wrote {n} bytes"),
-                    Err(e) => eprintln!("(vmnet-tx) write error: {e:?}"),
+                if let Err(e) = iface.0.write(frame) {
+                    eprintln!("(vmnet-tx) write error: {e:?}");
                 }
             }
         }
@@ -197,6 +181,9 @@ fn rx_notify_loop() {
             continue;
         }
 
+        // Snoop DHCP ACK to learn VM's IP and set up port forwarding.
+        snoop_dhcp_ack(&buf[..n]);
+
         // Buffer the frame.
         RX_PENDING.lock().unwrap().push_back(buf[..n].to_vec());
 
@@ -206,6 +193,157 @@ fn rx_notify_loop() {
             unsafe { hvf::hv_vcpus_exit(&vcpu as *const u64, 1); }
         }
     }
+}
+
+/// Snoop DHCP ACK frames to learn the VM's IP and set up port forwarding.
+/// Called from the RX thread for every received frame.
+fn snoop_dhcp_ack(frame: &[u8]) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static FORWARDED: AtomicBool = AtomicBool::new(false);
+    if FORWARDED.load(Ordering::Relaxed) { return; }
+
+    // Minimum: 14 (eth) + 20 (ip) + 8 (udp) + 240 (dhcp base) + 4 (option 53)
+    if frame.len() < 286 { return; }
+
+    // Check ethertype = IPv4 (0x0800)
+    if frame[12] != 0x08 || frame[13] != 0x00 { return; }
+
+    // Check IP protocol = UDP (17)
+    let ip_hdr_len = ((frame[14] & 0x0F) as usize) * 4;
+    let ip_start = 14;
+    if frame[ip_start + 9] != 17 { return; }
+
+    // Check UDP src=67, dst=68 (DHCP server → client)
+    let udp_start = ip_start + ip_hdr_len;
+    if udp_start + 8 > frame.len() { return; }
+    let src_port = u16::from_be_bytes([frame[udp_start], frame[udp_start + 1]]);
+    let dst_port = u16::from_be_bytes([frame[udp_start + 2], frame[udp_start + 3]]);
+    if src_port != 67 || dst_port != 68 { return; }
+
+    // DHCP starts at udp_start + 8
+    let dhcp_start = udp_start + 8;
+    if dhcp_start + 240 > frame.len() { return; }
+
+    // op=2 (BOOTREPLY)
+    if frame[dhcp_start] != 2 { return; }
+
+    // yiaddr at offset 16 from DHCP start
+    let yiaddr = std::net::Ipv4Addr::new(
+        frame[dhcp_start + 16], frame[dhcp_start + 17],
+        frame[dhcp_start + 18], frame[dhcp_start + 19],
+    );
+
+    // Parse options to find msg_type=5 (ACK)
+    let magic_offset = dhcp_start + 236;
+    if magic_offset + 4 > frame.len() { return; }
+    if &frame[magic_offset..magic_offset + 4] != &[0x63, 0x82, 0x53, 0x63] { return; }
+
+    let opts_start = magic_offset + 4;
+    let mut i = opts_start;
+    let mut msg_type = 0u8;
+    while i < frame.len() {
+        let opt = frame[i];
+        if opt == 255 { break; }
+        if opt == 0 { i += 1; continue; }
+        if i + 1 >= frame.len() { break; }
+        let opt_len = frame[i + 1] as usize;
+        if i + 2 + opt_len > frame.len() { break; }
+        if opt == 53 && opt_len >= 1 { msg_type = frame[i + 2]; }
+        i += 2 + opt_len;
+    }
+
+    if msg_type != 5 { return; } // Only on ACK
+
+    eprintln!("(vmnet) DHCP ACK: VM IP = {yiaddr}");
+
+    // Spawn a TCP proxy: listen on localhost:8080, forward to VM:80.
+    let ip = yiaddr;
+    FORWARDED.store(true, Ordering::Relaxed);
+    std::thread::spawn(move || {
+        tcp_proxy(ip, 8080, 80);
+    });
+}
+
+/// Simple TCP proxy: listen on localhost:host_port, forward to vm_ip:vm_port.
+fn tcp_proxy(vm_ip: std::net::Ipv4Addr, host_port: u16, vm_port: u16) {
+    use std::net::{TcpListener, TcpStream, SocketAddr};
+
+    let listener = match TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], host_port))) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("(proxy) failed to bind localhost:{host_port}: {e}");
+            return;
+        }
+    };
+    eprintln!("(proxy) listening on localhost:{host_port} → {vm_ip}:{vm_port}");
+
+    for stream in listener.incoming() {
+        let client = match stream {
+            Ok(s) => s,
+            Err(e) => { eprintln!("(proxy) accept error: {e}"); continue; }
+        };
+
+        let vm_addr = SocketAddr::from((vm_ip, vm_port));
+        let vm_ip_copy = vm_ip;
+        std::thread::spawn(move || {
+            let upstream = match TcpStream::connect_timeout(
+                &vm_addr,
+                std::time::Duration::from_secs(5),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("(proxy) connect to {vm_ip_copy}:{vm_port} failed: {e}");
+                    return;
+                }
+            };
+            proxy_connection(client, upstream);
+        });
+    }
+}
+
+fn proxy_connection(
+    mut client: std::net::TcpStream,
+    mut upstream: std::net::TcpStream,
+) {
+    use std::io::{Read, Write};
+
+    let mut client2 = match client.try_clone() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let mut upstream2 = match upstream.try_clone() {
+        Ok(u) => u,
+        Err(_) => return,
+    };
+
+    // Client → Upstream
+    let h1 = std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = match client.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            if upstream.write_all(&buf[..n]).is_err() { break; }
+        }
+        let _ = upstream.shutdown(std::net::Shutdown::Write);
+    });
+
+    // Upstream → Client
+    let h2 = std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = match upstream2.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            if client2.write_all(&buf[..n]).is_err() { break; }
+        }
+        let _ = client2.shutdown(std::net::Shutdown::Write);
+    });
+
+    let _ = h1.join();
+    let _ = h2.join();
 }
 
 /// Check for pending RX frames from vmnet and inject into guest RX queue.
@@ -244,7 +382,7 @@ pub fn check_rx() {
         let avail_idx = unsafe {
             core::ptr::read_volatile(dev.gpa_to_host(avail_base + 2) as *const u16)
         };
-        let mut last = RX_LAST.load(std::sync::atomic::Ordering::Relaxed);
+        let last = RX_LAST.load(std::sync::atomic::Ordering::Relaxed);
 
         if last == avail_idx { break; } // no free descriptors
 
@@ -273,17 +411,18 @@ pub fn check_rx() {
         let used_idx = unsafe {
             core::ptr::read_volatile(dev.gpa_to_host(used_base + 2) as *const u16)
         };
+        let new_used_idx = used_idx.wrapping_add(1);
         unsafe {
             let entry = dev.gpa_to_host(used_base + 4 + (used_idx & (qsize - 1)) as u64 * 8);
             core::ptr::write_unaligned(entry as *mut u32, desc_idx as u32);
             core::ptr::write_unaligned(entry.add(4) as *mut u32, total_len as u32);
             core::ptr::write_volatile(
                 dev.gpa_to_host(used_base + 2) as *mut u16,
-                used_idx.wrapping_add(1),
+                new_used_idx,
             );
         }
-
         RX_LAST.store(last.wrapping_add(1), std::sync::atomic::Ordering::Relaxed);
+        dev.used_idx[0] = new_used_idx; // Update MMIO-visible used_idx
         dev.interrupt_status |= 1;
         injected += 1;
     }

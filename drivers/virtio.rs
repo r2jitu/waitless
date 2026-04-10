@@ -3,7 +3,7 @@
 use core::ptr;
 
 use crate::{
-    log, dsb_st, dsb_ld, dsb_sy,
+    log, dsb_st, dsb_ld, dsb_sy, dc_civac_range,
     mmio_read32, mmio_write32, mmio_read16, mmio_write16, mmio_read8, mmio_write8,
     virtio_read32, virtio_write32, virtio_read16, virtio_write16, virtio_read8, virtio_write8,
     vz_config_delay,
@@ -603,9 +603,24 @@ impl Virtqueue {
     /// Check for completed buffers in the used ring.
     /// Returns (descriptor_head_id, bytes_written) or None.
     pub fn get_used(&mut self) -> Option<(u16, u32)> {
-        dsb_ld();
+        // On virtio-mmio (HVF), the host writes used->idx from a different
+        // dcache context. Reading the used ring from guest RAM may return
+        // stale data. Instead, read the device-config register at offset
+        // 0x110 which the host keeps in sync, delivered via MMIO trap.
+        let cur_used_idx = if self.is_mmio {
+            let val = unsafe { virtio_read32(self.io_base + 0x110) };
+            if self.queue_index == 0 { val as u16 } else { (val >> 16) as u16 }
+        } else {
+            dsb_ld();
+            self.used_idx()
+        };
 
-        let cur_used_idx = self.used_idx();
+        // Also invalidate dcache for the used ring elements (id + len)
+        // and descriptor buffer data, since these are also host-written.
+        if self.is_mmio {
+            dc_civac_range(self.used as *const u8, 4 + 8 * self.queue_size as usize);
+        }
+
         if self.last_used_idx == cur_used_idx { return None; }
 
         let used_slot = self.last_used_idx & (self.queue_size - 1);

@@ -5,7 +5,7 @@ use core::ptr;
 use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
 use crate::{
-    log, dsb_st,
+    log, dsb_st, dc_civac_range,
     virtio_read32, virtio_write32, virtio_read8, virtio_write8,
     vz_init_delay,
 };
@@ -840,6 +840,22 @@ pub fn flush_tx_staging() {
     // _guard released at end of scope.
 }
 
+/// Read the virtio INTERRUPT_STATUS register. This is a no-op from the
+/// kernel's perspective (the value is discarded), but on HVF it forces
+/// an MMIO exit that lets the host inject pending RX frames. Called from
+/// DHCP's poll-wait loop to ensure DHCP replies are delivered during the
+/// tight polling window where no other MMIO exits occur.
+pub fn poke_interrupt_status() {
+    unsafe {
+        match (*ndev()).transport {
+            Transport::Mmio { base, .. } => {
+                virtio_read32(base + MMIO_INTERRUPT_STATUS);
+            }
+            _ => {}
+        }
+    }
+}
+
 pub fn poll(
     callback: fn(&[u8]),
 ) -> i32 {
@@ -868,6 +884,9 @@ pub fn poll_qp(qp: usize, callback: fn(&[u8])) -> i32 {
             if used_len > VIRTIO_NET_HDR_SIZE as u32 {
                 let frame_len = (used_len - VIRTIO_NET_HDR_SIZE as u32) as usize;
                 let frame_data = buf.add(VIRTIO_NET_HDR_SIZE);
+                // Invalidate dcache for the descriptor buffer so we read
+                // fresh data written by the HVF host (different VMID).
+                dc_civac_range(buf, used_len as usize);
                 let slice = core::slice::from_raw_parts(frame_data, frame_len);
                 callback(slice);
             }
@@ -961,6 +980,8 @@ pub fn poll_batch_qp(qp: usize, batch: &mut RxBatch) {
 
             if used_len > VIRTIO_NET_HDR_SIZE as u32 {
                 let frame_len = (used_len - VIRTIO_NET_HDR_SIZE as u32) as usize;
+                // Invalidate dcache for the descriptor buffer (HVF host writes).
+                dc_civac_range(buf, used_len as usize);
                 if batch.len + 2 + frame_len <= batch.data.len() {
                     let len_bytes = (frame_len as u16).to_le_bytes();
                     batch.data[batch.len] = len_bytes[0];

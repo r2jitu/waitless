@@ -117,42 +117,30 @@ fn dhcp_receive(frame: &[u8]) {
         return;
     }
 
-    if ethertype != ETHERTYPE_IPV4 {
-        return;
-    }
+    if ethertype != ETHERTYPE_IPV4 { return; }
     let ip_hdr = match Ipv4Header::try_ref_from(payload) {
         Some(h) => h,
         None => return,
     };
-    if ip_hdr.protocol != PROTO_UDP {
-        return;
-    }
+    if ip_hdr.protocol != PROTO_UDP { return; }
     let ip_hdr_len = ((ip_hdr.version_ihl & 0x0F) as usize) * 4;
-    if payload.len() < ip_hdr_len {
-        return;
-    }
+    if payload.len() < ip_hdr_len { return; }
 
     let udp = match UdpHeader::try_ref_from(&payload[ip_hdr_len..]) {
         Some(h) => h,
         None => return,
     };
-    if ntohs(udp.dst_port) != 68 || ntohs(udp.src_port) != 67 {
-        return;
-    }
+    if ntohs(udp.dst_port) != 68 || ntohs(udp.src_port) != 67 { return; }
 
     let dhcp_offset = ip_hdr_len + 8;
-    if payload.len() < dhcp_offset {
-        return;
-    }
+    if payload.len() < dhcp_offset { return; }
     let dhcp = match DhcpPacket::try_ref_from(&payload[dhcp_offset..]) {
         Some(h) => h,
         None => return,
     };
     let xid = dhcp.xid;
     let cookie = dhcp.magic_cookie;
-    if xid != DHCP_STATE.lock().xid || cookie != htonl(0x63825363) {
-        return;
-    }
+    if xid != DHCP_STATE.lock().xid || cookie != htonl(0x63825363) { return; }
 
     // Parse options
     let opts_start = dhcp_offset + 240;
@@ -326,14 +314,23 @@ fn dhcp_send_request() {
     drivers::virtio_net::send(&frame[..total]);
 }
 
-fn dhcp_poll_wait(timeout_ms: u32) -> bool {
+fn dhcp_poll_wait(timeout_ms: u32, wait_for_ack: bool) -> bool {
     for _ in 0..timeout_ms {
-        // Poll aggressively within each ms to keep latency low
+        // Poll aggressively within each ms to keep latency low.
+        // The poke_interrupt_status() call reads the virtio MMIO
+        // INTERRUPT_STATUS register, which forces a VM exit on HVF
+        // and lets the host inject any pending RX frames before
+        // we check the used ring. Without this, the tight poll
+        // loop never triggers an MMIO exit and the host can't
+        // deliver DHCP replies during the timeout window.
+        drivers::virtio_net::poke_interrupt_status();
         for _ in 0..100 {
             drivers::virtio_net::poll(dhcp_receive);
             let s = DHCP_STATE.lock();
-            if s.got_offer || s.got_ack {
-                return true;
+            if wait_for_ack {
+                if s.got_ack { return true; }
+            } else {
+                if s.got_offer { return true; }
             }
         }
         udelay(1000); // 1ms
@@ -353,7 +350,7 @@ pub fn discover() -> bool {
     // Phase 1: DISCOVER → OFFER
     for _attempt in 0..5 {
         dhcp_send_discover();
-        if dhcp_poll_wait(2000) && DHCP_STATE.lock().got_offer {
+        if dhcp_poll_wait(2000, false) && DHCP_STATE.lock().got_offer {
             break;
         }
     }
@@ -365,7 +362,7 @@ pub fn discover() -> bool {
     DHCP_STATE.lock().got_ack = false;
     for _attempt in 0..5 {
         dhcp_send_request();
-        if dhcp_poll_wait(2000) && DHCP_STATE.lock().got_ack {
+        if dhcp_poll_wait(2000, true) && DHCP_STATE.lock().got_ack {
             break;
         }
     }
@@ -389,7 +386,7 @@ pub fn discover() -> bool {
     {
         let o = CONFIG.ip().octets();
         let mut msg = *b"dhcp: configured IP xxx.xxx.xxx.xxx\n";
-        let mut pos = 22;
+        let mut pos = 20;
         for (idx, &b) in o.iter().enumerate() {
             if b >= 100 { msg[pos] = b'0' + b / 100; pos += 1; }
             if b >= 10 { msg[pos] = b'0' + (b / 10) % 10; pos += 1; }

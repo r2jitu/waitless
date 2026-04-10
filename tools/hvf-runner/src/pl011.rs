@@ -24,6 +24,7 @@ const DR: u64 = 0x000;
 const FR: u64 = 0x018;
 
 /// Flag register bits.
+#[allow(dead_code)]
 const FR_TXFF: u32 = 1 << 5; // TX FIFO full
 const FR_RXFE: u32 = 1 << 4; // RX FIFO empty
 

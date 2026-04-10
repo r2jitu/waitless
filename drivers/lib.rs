@@ -55,6 +55,34 @@ pub(crate) fn dsb_sy() {
     compiler_fence(Ordering::SeqCst);
 }
 
+// ---- Cache maintenance ------------------------------------------------------
+
+/// Invalidate dcache line(s) covering `[addr, addr+len)` so subsequent
+/// reads fetch from the Point of Coherency (L2/DRAM) instead of stale L1.
+/// Required on HVF where the host writes to guest RAM from a different
+/// VMID context whose stores are visible at PoC but not in the guest's
+/// L1 dcache.
+#[inline(always)]
+pub(crate) fn dc_civac_range(addr: *const u8, len: usize) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        // Apple Silicon cache line = 64 bytes. Align down to line boundary.
+        let start = (addr as usize) & !63;
+        let end = (addr as usize) + len;
+        let mut a = start;
+        while a < end {
+            asm!("dc civac, {}", in(reg) a, options(nostack, preserves_flags));
+            a += 64;
+        }
+        asm!("dsb sy", options(nostack, preserves_flags));
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = (addr, len);
+        // x86 is cache-coherent across all agents; no action needed.
+    }
+}
+
 // ---- Volatile MMIO ----------------------------------------------------------
 
 /// # Safety: addr must be a valid, mapped MMIO address.

@@ -88,10 +88,8 @@ impl Vm {
                 hv_vm_config_get_max_ipa_size(&mut max_ipa);
                 hv_vm_config_get_default_ipa_size(&mut default_ipa);
             }
-            eprintln!("(debug) IPA: default={default_ipa} max={max_ipa}");
             if max_ipa > default_ipa {
-                let rc = unsafe { hv_vm_config_set_ipa_size(vm_cfg, max_ipa) };
-                eprintln!("(debug) set IPA size to {max_ipa}: rc={rc}");
+                let _ = unsafe { hv_vm_config_set_ipa_size(vm_cfg, max_ipa) };
             }
         }
         check(unsafe { hv_vm_create(vm_cfg) })
@@ -124,14 +122,12 @@ impl Vm {
         let ecam_size: usize = 1024 * 1024; // 1 MB
         let mut ecam_ptr: *mut c_void = ptr::null_mut();
         let rc = unsafe { hv_vm_allocate(&mut ecam_ptr, ecam_size, 0) };
-        eprintln!("(debug) ECAM alloc: rc={rc} ptr={ecam_ptr:?}");
         if rc == HV_SUCCESS && !ecam_ptr.is_null() {
             unsafe { ptr::write_bytes(ecam_ptr as *mut u8, 0xff, ecam_size); }
-            let rc = unsafe {
+            let _ = unsafe {
                 hv_vm_map(ecam_ptr, 0x40_1000_0000, ecam_size,
                           HV_MEMORY_READ | HV_MEMORY_WRITE)
             };
-            eprintln!("(debug) ECAM map at 0x4010000000: rc={rc}");
         }
 
         // 4. Create native vGIC (must be before vCPU creation).
@@ -197,15 +193,6 @@ impl Vm {
             );
         }
 
-        // Verify DTB magic in guest RAM.
-        let dtb_magic = unsafe {
-            ptr::read_unaligned(ram_host.add(DTB_OFFSET as usize) as *const u32)
-        };
-        eprintln!(
-            "(debug) DTB at offset 0x{:x}: magic=0x{:08x} (expected 0xd00dfeed), {} bytes",
-            DTB_OFFSET, u32::from_be(dtb_magic), dtb.len()
-        );
-
         // 10. Set initial register state.
         //   PC    = RAM_BASE (kernel entry point)
         //   X0    = DTB physical address
@@ -237,7 +224,7 @@ impl Vm {
             std::sync::atomic::Ordering::Release,
         );
 
-        let mut exit_count: u64 = 0;
+        let mut _exit_count: u64 = 0;
         loop {
             check(unsafe { hv_vcpu_run(self.vcpu) })
                 .map_err(|e| format!("hv_vcpu_run: {e}"))?;
@@ -249,20 +236,7 @@ impl Vm {
             crate::vmnet_net::check_rx();
 
             let exit = unsafe { &*self.exit_ptr };
-            exit_count += 1;
-            if exit_count <= 20 || exit_count % 100000 == 0 {
-                let pc = self.get_reg(HvReg::Pc);
-                let x9 = self.get_reg(HvReg::X9);
-                let x0 = self.get_reg(HvReg::X0);
-                let x1 = self.get_reg(HvReg::X1);
-                let x2 = self.get_reg(HvReg::X2);
-                eprintln!(
-                    "(debug) exit #{exit_count}: reason={} EC=0x{:x} PA=0x{:x} PC=0x{pc:x} x0=0x{x0:x} x1=0x{x1:x} x2=0x{x2:x} x9=0x{x9:x}",
-                    exit.reason,
-                    esr_ec(exit.exception.syndrome),
-                    exit.exception.physical_address,
-                );
-            }
+            _exit_count += 1;
 
             match exit.reason {
                 HV_EXIT_REASON_EXCEPTION => {
