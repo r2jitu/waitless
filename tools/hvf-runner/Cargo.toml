@@ -25,6 +25,7 @@ path = "examples/smoke.rs"
 [dependencies]
 libc = "0.2"
 vm-fdt = "0.3"
+vmnet = "0.5"
 # applevisor provides safe HVF bindings. We currently use our own raw FFI
 # in src/hvf.rs because the smoke test was built before applevisor was
 # evaluated. Migration to applevisor is a follow-up — the FDT fix is the

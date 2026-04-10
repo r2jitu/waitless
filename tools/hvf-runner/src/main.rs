@@ -13,6 +13,7 @@ mod pl011;
 mod terminal;
 mod virtio;
 mod vm;
+mod vmnet_net;
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
@@ -69,8 +70,21 @@ fn main() {
 
     eprintln!("==> HVF runner: booting {kernel_path} ({ram_mib} MB RAM)");
 
+    // Start vmnet interface (requires root for shared mode).
+    let vmnet_mac = match vmnet_net::start() {
+        Ok(mac) => mac,
+        Err(e) => {
+            // vmnet failed — boot without networking (still useful for
+            // testing serial/PL011/GIC). Use a fallback MAC.
+            eprintln!("run-hvf: vmnet failed: {e}");
+            eprintln!("  (vmnet shared mode requires root — try: sudo run-hvf ...)");
+            eprintln!("  Continuing without networking.");
+            [0x52, 0x54, 0x00, 0x12, 0x34, 0x56]
+        }
+    };
+
     // Create and run the VM.
-    let mut vm = match vm::Vm::new(kernel_path, ram_mib) {
+    let mut vm = match vm::Vm::new_with_mac(kernel_path, ram_mib, vmnet_mac) {
         Ok(vm) => vm,
         Err(e) => {
             terminal::restore();

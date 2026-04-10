@@ -48,9 +48,15 @@ pub struct Vm {
 }
 
 impl Vm {
+    /// Create a VM with a default MAC address.
+    #[allow(dead_code)]
+    pub fn new(kernel_path: &str, ram_mib: usize) -> Result<Self, String> {
+        Self::new_with_mac(kernel_path, ram_mib, [0x52, 0x54, 0x00, 0x12, 0x34, 0x56])
+    }
+
     /// Create a VM, allocate RAM, set up vGIC, create vCPU, load kernel,
     /// generate FDT, configure initial register state.
-    pub fn new(kernel_path: &str, ram_mib: usize) -> Result<Self, String> {
+    pub fn new_with_mac(kernel_path: &str, ram_mib: usize, mac: [u8; 6]) -> Result<Self, String> {
         let ram_size_fdt = ram_mib * 1024 * 1024;
         // Map twice the FDT-declared size. The kernel's boot.S maps the
         // first 4 GB as 1 GB L1 blocks, so guest accesses past the FDT
@@ -215,7 +221,6 @@ impl Vm {
         }
 
         // 11. Initialize the virtio-mmio net device.
-        let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56]; // same as QEMU default
         *virtio::DEVICE.lock().unwrap() = Some(
             virtio::VirtioNet::new(mac, ram_host, RAM_BASE)
         );
@@ -394,21 +399,27 @@ impl Vm {
             && fault_ipa < VIRTIO_MMIO_BASE + VIRTIO_MMIO_SIZE
         {
             let offset = fault_ipa - VIRTIO_MMIO_BASE;
-            let mut dev = virtio::DEVICE.lock().unwrap();
-            let dev = dev.as_mut().unwrap();
-            if access.is_write {
-                let val = if access.rt == 31 { 0 } else {
-                    self.get_reg(HvReg::gpr(access.rt as u32)) as u32
-                };
-                let is_notify = dev.write(offset, val);
-                if is_notify {
-                    // TODO Phase 2: process TX queue, inject RX from vmnet
-                    eprintln!("(debug) QUEUE_NOTIFY queue={val}");
+            let mut notify_queue: Option<u32> = None;
+            {
+                let mut dev_lock = virtio::DEVICE.lock().unwrap();
+                let dev = dev_lock.as_mut().unwrap();
+                if access.is_write {
+                    let val = if access.rt == 31 { 0 } else {
+                        self.get_reg(HvReg::gpr(access.rt as u32)) as u32
+                    };
+                    if dev.write(offset, val) {
+                        notify_queue = Some(val);
+                    }
+                } else {
+                    let val = dev.read(offset);
+                    if access.rt < 31 {
+                        self.set_reg(HvReg::gpr(access.rt as u32), val as u64);
+                    }
                 }
-            } else {
-                let val = dev.read(offset);
-                if access.rt < 31 {
-                    self.set_reg(HvReg::gpr(access.rt as u32), val as u64);
+            } // dev_lock released
+            if let Some(queue) = notify_queue {
+                if queue == 1 {
+                    crate::vmnet_net::process_tx();
                 }
             }
         } else {

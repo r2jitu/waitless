@@ -54,9 +54,9 @@ const QUEUE_SIZE: u32 = 256;
 const NUM_QUEUES: usize = 2; // RX=0, TX=1
 
 #[derive(Default)]
-struct QueueState {
-    num: u32,
-    ready: bool,
+pub struct QueueState {
+    pub num: u32,
+    pub ready: bool,
     desc_lo: u32,
     desc_hi: u32,
     driver_lo: u32,
@@ -66,13 +66,13 @@ struct QueueState {
 }
 
 impl QueueState {
-    fn desc_addr(&self) -> u64 {
+    pub fn desc_addr(&self) -> u64 {
         (self.desc_hi as u64) << 32 | self.desc_lo as u64
     }
-    fn avail_addr(&self) -> u64 {
+    pub fn avail_addr(&self) -> u64 {
         (self.driver_hi as u64) << 32 | self.driver_lo as u64
     }
-    fn used_addr(&self) -> u64 {
+    pub fn used_addr(&self) -> u64 {
         (self.device_hi as u64) << 32 | self.device_lo as u64
     }
 }
@@ -84,7 +84,7 @@ pub struct VirtioNet {
     driver_features: [u32; 2], // word 0 and word 1
     queue_sel: u32,
     queues: [QueueState; NUM_QUEUES],
-    interrupt_status: u32,
+    pub interrupt_status: u32,
     mac: [u8; 6],
     /// Host pointer to the start of guest RAM (for translating GPAs to host).
     ram_host: *mut u8,
