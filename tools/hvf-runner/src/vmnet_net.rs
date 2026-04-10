@@ -28,7 +28,7 @@ static IFACE: Mutex<Option<SendIface>> = Mutex::new(None);
 /// Start a vmnet shared-mode interface and spawn an RX polling thread.
 /// Returns the MAC address assigned by vmnet.
 pub fn start() -> Result<[u8; 6], String> {
-    let iface = vmnet::Interface::new(
+    let mut iface = vmnet::Interface::new(
         vmnet::mode::Mode::Shared(Default::default()),
         Default::default(),
     ).map_err(|e| format!("vmnet::Interface::new: {e:?}"))?;
@@ -53,6 +53,21 @@ pub fn start() -> Result<[u8; 6], String> {
         mac_bytes[0], mac_bytes[1], mac_bytes[2],
         mac_bytes[3], mac_bytes[4], mac_bytes[5],
     );
+
+    // Add port forwarding: host:8080 → VM:80
+    // The kernel uses fallback IP 10.0.2.15 when DHCP fails, so we
+    // forward to that address. vmnet handles the NAT mapping.
+    let vm_addr: std::net::Ipv4Addr = "10.0.2.15".parse().unwrap();
+    match iface.port_forwarding_rule_add(
+        vmnet::port_forwarding::AddressFamily::Ipv4,
+        vmnet::port_forwarding::Protocol::Tcp,
+        8080,
+        std::net::IpAddr::V4(vm_addr),
+        80,
+    ) {
+        Ok(()) => eprintln!("(vmnet) port forward: host:8080 → 10.0.2.15:80"),
+        Err(e) => eprintln!("(vmnet) port forwarding failed: {e:?}"),
+    }
 
     *IFACE.lock().unwrap() = Some(SendIface(iface));
 
