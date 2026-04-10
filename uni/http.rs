@@ -312,6 +312,7 @@ impl Server {
             };
 
             if conn.is_closed() {
+                conn.close(); // Send FIN if in CloseWait.
                 self.cores[core_id as usize].active[i].conn = None;
                 self.cores[core_id as usize].active[i].buf_len = 0;
                 had_work = true;

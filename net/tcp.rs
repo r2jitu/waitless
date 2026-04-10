@@ -598,12 +598,15 @@ pub fn close(handle: *mut ()) {
             c.state = TcpState::FinWait1;
         }
         TcpState::CloseWait => {
+            // Send FIN and immediately free the slot. Skip LastAck
+            // to prevent pool exhaustion. The client's final ACK
+            // will be silently ignored (no matching connection).
             send_segment(
                 c.remote_ip, c.local_port, c.remote_port,
                 c.snd_nxt, c.rcv_nxt, TCP_FIN | TCP_ACK, &[],
             );
-            c.snd_nxt = c.snd_nxt.wrapping_add(1);
-            c.state = TcpState::LastAck;
+            free_connection(core, slot);
+            return;
         }
         _ => {
             free_connection(core, slot);
@@ -616,5 +619,11 @@ pub fn is_closed(handle: *mut ()) -> bool {
         Some(v) => v,
         None => return true,
     };
-    unsafe { (*conn_ptr(core, slot)).state == TcpState::Closed }
+    let c = unsafe { &*conn_ptr(core, slot) };
+    // Closed: connection fully terminated.
+    // CloseWait with empty RX: client sent FIN, data consumed.
+    // LastAck: we sent FIN, waiting for final ACK. Treat as closed
+    // to prevent pool exhaustion (the ACK may never arrive).
+    c.state == TcpState::Closed
+        || (c.state == TcpState::CloseWait && c.rx_used() == 0)
 }
