@@ -78,8 +78,6 @@ pub fn spawn() -> Result<([u8; 6], i32), String> {
 
     // Main loop: poll vmnet + socket.
     let mut buf = [0u8; 2048];
-    let mut rx_count: u64 = 0;
-    let mut tx_count: u64 = 0;
 
     loop {
         // 1. Read from vmnet → send to parent.
@@ -87,7 +85,6 @@ pub fn spawn() -> Result<([u8; 6], i32), String> {
             match iface.read(&mut buf) {
                 Ok(n) if n > 0 => {
                     let rc = unsafe { libc::send(child_fd, buf.as_ptr() as *const _, n, libc::MSG_DONTWAIT) };
-                    rx_count += 1;
                 }
                 _ => break,
             }
@@ -100,7 +97,6 @@ pub fn spawn() -> Result<([u8; 6], i32), String> {
             };
             if n <= 0 { break; }
             let _ = iface.write(&buf[..n as usize]);
-            tx_count += 1;
         }
 
         std::thread::sleep(std::time::Duration::from_micros(50));

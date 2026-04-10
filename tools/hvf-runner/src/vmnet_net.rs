@@ -101,9 +101,12 @@ pub fn start() -> Result<[u8; 6], String> {
             let frame = &buf[..n as usize];
             snoop_dhcp_ack(frame);
             RX_PENDING.lock().unwrap().push_back(frame.to_vec());
-            // Signal that frames are available (debounced — don't kick
-            // on every frame to avoid VM exit thrashing).
+            // Kick the vCPU to run check_rx immediately.
             unsafe { hvf::hv_gic_set_spi(35, true); }
+            let vcpu = VCPU_ID.load(std::sync::atomic::Ordering::Relaxed);
+            if vcpu != 0 {
+                unsafe { hvf::hv_vcpus_exit(&vcpu as *const u64, 1); }
+            }
         }
     });
 

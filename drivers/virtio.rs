@@ -669,9 +669,12 @@ impl Virtqueue {
 
     pub fn has_used(&mut self) -> bool {
         if self.used_idx_mmio {
-            // On HVF, rely on the IRQ handler's cached used_idx.
-            // Don't do an MMIO read here — it causes a vCPU exit.
-            // The SPI will wake us from WFI when frames are available.
+            // Check cached value first. If stale, do one MMIO read
+            // to trigger check_rx and get fresh used_idx. This prevents
+            // false-negative before WFI (which causes multi-hundred-ms stalls).
+            if self.last_used_idx == self.mmio_cached_used_idx {
+                self.poll_interrupt_status();
+            }
             self.last_used_idx != self.mmio_cached_used_idx
         } else {
             self.last_used_idx != self.used_idx()
