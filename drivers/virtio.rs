@@ -628,7 +628,16 @@ impl Virtqueue {
 
     pub fn get_used(&mut self) -> Option<(u16, u32)> {
         let cur_used_idx = if self.used_idx_mmio {
-            self.mmio_cached_used_idx
+            // First check the cached value (no MMIO exit).
+            // If stale, do one MMIO read to refresh — this also
+            // triggers check_rx on the host, injecting any pending frames.
+            let cached = self.mmio_cached_used_idx;
+            if cached == self.last_used_idx {
+                self.poll_interrupt_status();
+                self.mmio_cached_used_idx
+            } else {
+                cached
+            }
         } else {
             dsb_ld();
             self.used_idx()
