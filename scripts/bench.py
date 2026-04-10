@@ -47,11 +47,11 @@ def wait_port_pool(threshold=500, timeout=8):
         time.sleep(1)
 
 
-def wait_http(port, timeout=90):
+def wait_http(port, timeout=90, host="localhost"):
     for _ in range(timeout):
         try:
             r = subprocess.run(
-                ["curl", "-sf", "--max-time", "2", f"http://localhost:{port}/health"],
+                ["curl", "-sf", "--max-time", "2", f"http://{host}:{port}/health"],
                 capture_output=True, timeout=5)
             if r.returncode == 0:
                 return True
@@ -61,12 +61,12 @@ def wait_http(port, timeout=90):
     return False
 
 
-def run_wrk(port, endpoint, threads, conns, duration):
+def run_wrk(port, endpoint, threads, conns, duration, host="localhost"):
     try:
         r = subprocess.run(
             ["wrk", f"-t{threads}", f"-c{conns}", f"-d{duration}s",
              "--timeout", "10s", "--latency",
-             f"http://localhost:{port}{endpoint}"],
+             f"http://{host}:{port}{endpoint}"],
             capture_output=True, text=True, timeout=duration + 15)
         rps, p50, p99 = 0.0, "", ""
         for line in r.stdout.split("\n"):
@@ -81,7 +81,7 @@ def run_wrk(port, endpoint, threads, conns, duration):
         return 0.0, "", ""
 
 
-def run_wrk_parallel(port, endpoint, threads, conns, duration, instances):
+def run_wrk_parallel(port, endpoint, threads, conns, duration, instances, host="localhost"):
     """Run `instances` parallel wrk processes and aggregate results.
 
     Each process is a separate OS client with its own TCP source-port range,
@@ -100,7 +100,7 @@ def run_wrk_parallel(port, endpoint, threads, conns, duration, instances):
     lock = threading.Lock()
 
     def run_one(idx):
-        r = run_wrk(port, endpoint, per_threads, per_conns, duration)
+        r = run_wrk(port, endpoint, per_threads, per_conns, duration, host=host)
         with lock:
             all_results[idx] = r
 
@@ -365,10 +365,81 @@ class NativeEnv:
         return f"Native {cpus}t"
 
 
+class HvfEnv:
+    name = "hvf"
+    label = "HVF+vmnet"
+
+    def build(self):
+        subprocess.run(
+            ["bazel", "build", "--config=qemu",
+             "//apps/webserver:webserver.img"],
+            capture_output=True, cwd=PROJECT_ROOT, timeout=120)
+        # Build the HVF runner via cargo (not yet in Bazel).
+        subprocess.run(
+            ["cargo", "build", "--release"],
+            capture_output=True,
+            cwd=os.path.join(PROJECT_ROOT, "tools/hvf-runner"), timeout=120)
+        subprocess.run(
+            ["codesign", "--force", "--sign", "-", "--entitlements",
+             os.path.join(PROJECT_ROOT, "tools/hvf-runner/run-hvf.entitlements"),
+             os.path.join(PROJECT_ROOT, "tools/hvf-runner/target/release/run-hvf")],
+            capture_output=True, timeout=30)
+
+    # In host mode, vmnet creates a direct host↔VM network.
+    # The VM gets an IP via DHCP (typically 192.168.18.2).
+    # The bench connects directly to the VM IP, no proxy needed.
+    vm_ip = "192.168.18.2"
+
+    def start(self, cpus, port):
+        img = os.path.join(PROJECT_ROOT, "bazel-bin/apps/webserver/webserver.img")
+        run_hvf = os.path.join(PROJECT_ROOT, "tools/hvf-runner/target/release/run-hvf")
+        log = open(f"/tmp/hvf_{port}.log", "w")
+        return subprocess.Popen(
+            ["sudo", run_hvf, img],
+            stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+
+    def wait_proxy_ready(self, port, proc, timeout=30):
+        """Wait for the VM to be reachable on the vmnet host-mode subnet."""
+        import socket as _socket
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                return False
+            try:
+                s = _socket.socket()
+                s.settimeout(0.5)
+                s.connect((self.vm_ip, 80))
+                s.close()
+                return True
+            except (_socket.timeout, ConnectionRefusedError, OSError):
+                time.sleep(0.2)
+        return False
+
+    def stop(self, proc):
+        if proc and proc.poll() is None:
+            # sudo spawns run-hvf as a child; kill the process group.
+            subprocess.run(["sudo", "kill", "-TERM", str(proc.pid)],
+                           capture_output=True, timeout=5)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                subprocess.run(["sudo", "pkill", "-f", "run-hvf"],
+                               capture_output=True, timeout=5)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+        time.sleep(1)
+
+    def core_label(self, cpus):
+        return f"HVF {cpus}c"
+
+
 ENV_MAP = {
     "qemu": QemuEnv,
     "qemu-arm": QemuAarch64Env,
     "vz": VzEnv,
+    "hvf": HvfEnv,
     "docker": DockerEnv,
     "native": NativeEnv,
 }
@@ -385,19 +456,22 @@ def start_env_verified(env, cpus, port):
     if proc is None:
         return None
 
-    if isinstance(env, VzEnv):
+    if isinstance(env, (VzEnv, HvfEnv)):
         # Phase 1: wait for proxy TCP port to be connectable (fast, <1s normally).
-        if not env.wait_proxy_ready(port, proc, timeout=30):
+        # HVF host-mode: connect directly to VM IP:80. VZ: use the requested port.
+        proxy_port = 80 if isinstance(env, HvfEnv) else port
+        if not env.wait_proxy_ready(proxy_port, proc, timeout=30):
             env.stop(proc)
-            # Retry once — VZ network interface may not have been released yet.
+            # Retry once — network interface may not have been released yet.
             proc = env.start(cpus, port)
             if proc is None:
                 return None
-            if not env.wait_proxy_ready(port, proc, timeout=30):
+            if not env.wait_proxy_ready(proxy_port, proc, timeout=30):
                 env.stop(proc)
                 return None
         # Phase 2: poll HTTP until the VM finishes booting.
-        if wait_http(port):
+        http_host = env.vm_ip if isinstance(env, HvfEnv) else "localhost"
+        if wait_http(proxy_port, host=http_host):
             return proc
         env.stop(proc)
         return None
@@ -515,15 +589,18 @@ def main():
                 wname = w["name"]
                 port = next_port()
 
+                bench_port = port
+
                 proc = start_env_verified(env, cpus, port)
                 _current["proc"] = proc
                 if proc is None:
                     print(f"    {wname:<20s} SKIP (not ready)")
                     # Print last few lines of serial log to show why it failed.
-                    if isinstance(env, VzEnv):
+                    if isinstance(env, (VzEnv, HvfEnv)):
+                        prefix = "hvf" if isinstance(env, HvfEnv) else "vz"
                         for suffix, label in [(".serial.log", "serial"), (".log", "stderr")]:
                             try:
-                                with open(f"/tmp/vz_{port}{suffix}") as lf:
+                                with open(f"/tmp/{prefix}_{port}{suffix}") as lf:
                                     lines = lf.read().strip().splitlines()
                                     for l in lines[-8:]:
                                         print(f"      {label}: {l}")
@@ -533,21 +610,27 @@ def main():
                     wait_port_pool()
                     continue
 
+                # HVF host-mode: connect directly to VM IP on port 80.
+                wrk_host = env.vm_ip if isinstance(env, HvfEnv) else "localhost"
+                wrk_port = 80 if isinstance(env, HvfEnv) else bench_port
+
                 if w["type"] == "tcp":
                     if w.get("parallel") and cpus > 1:
                         rps, p50, p99 = run_wrk_parallel(
-                            port, w["endpoint"], w["threads"], w["conns"], duration, cpus)
+                            wrk_port, w["endpoint"], w["threads"], w["conns"], duration, cpus,
+                            host=wrk_host)
                     else:
                         rps, p50, p99 = run_wrk(
-                            port, w["endpoint"], w["threads"], w["conns"], duration)
+                            wrk_port, w["endpoint"], w["threads"], w["conns"], duration,
+                            host=wrk_host)
                     results[(env_name, cpus, wname)] = (rps, p50, p99)
                     print(f"    {wname:<20s} {rps:>10.0f} req/s  p50={p50}  p99={p99}")
                 elif w["type"] == "udp":
-                    pps, p50, p99 = run_udp(port + 1, w["conns"], duration)
+                    pps, p50, p99 = run_udp(bench_port + 1, w["conns"], duration)
                     results[(env_name, cpus, wname)] = (pps, p50, p99)
                     print(f"    {wname:<20s} {pps:>10.0f} pkt/s  p50={p50}  p99={p99}")
                 elif w["type"] == "udp_async":
-                    pps, p50, p99 = run_udp(port + 1, w["conns"], duration,
+                    pps, p50, p99 = run_udp(bench_port + 1, w["conns"], duration,
                                             async_mode=True)
                     results[(env_name, cpus, wname)] = (pps, p50, p99)
                     print(f"    {wname:<20s} {pps:>10.0f} pkt/s  (async recv rate)")

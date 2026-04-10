@@ -25,11 +25,11 @@ unsafe impl Send for SendIface {}
 /// Global vmnet interface, behind a Mutex because read/write need &mut.
 static IFACE: Mutex<Option<SendIface>> = Mutex::new(None);
 
-/// Start a vmnet shared-mode interface and spawn an RX polling thread.
+/// Start a vmnet host-mode interface and spawn an RX polling thread.
 /// Returns the MAC address assigned by vmnet.
 pub fn start() -> Result<[u8; 6], String> {
     let iface = vmnet::Interface::new(
-        vmnet::mode::Mode::Shared(Default::default()),
+        vmnet::mode::Mode::Host(Default::default()),
         Default::default(),
     ).map_err(|e| format!("vmnet::Interface::new: {e:?}"))?;
 
@@ -48,11 +48,10 @@ pub fn start() -> Result<[u8; 6], String> {
         }
     }
 
-    eprintln!(
-        "(vmnet) interface up: MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        mac_bytes[0], mac_bytes[1], mac_bytes[2],
-        mac_bytes[3], mac_bytes[4], mac_bytes[5],
-    );
+    // Print all vmnet parameters for diagnostics.
+    for p in &params {
+        eprintln!("(vmnet) param: {p:?}");
+    }
 
     *IFACE.lock().unwrap() = Some(SendIface(iface));
 
