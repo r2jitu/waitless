@@ -31,9 +31,13 @@ The HVF runner aims to be a small, focused tool that:
 - Boots **the same `webserver.img`** that runs in production cloud, with
   zero kernel changes.
 - Emulates only the device set the kernel actually needs: PL011 UART and
-  one virtio-mmio net device. Uses HVF's native vGIC for everything else.
-- Reuses the existing `NetBridge` from `tools/run-vz/run-vz.swift` (or
-  whichever path it lives in by the time you read this).
+  virtio-mmio net device(s). Uses HVF's native vGIC for everything else.
+- Uses **`vmnet.framework`** for networking — no userspace TCP proxy.
+  The VM gets a real macOS network interface with NAT, eliminating the
+  ~40µs per-request NetBridge round-trip that limits VZ today.
+- Supports **multiqueue virtio-net** (N queue pairs, one per core) so
+  network throughput scales with core count. VZ is limited to a single
+  queue pair; our custom runner removes that ceiling.
 - Provides a cloud-faithful device model — same memory layout the QEMU
   `virt` machine and Firecracker present.
 
@@ -232,57 +236,131 @@ virtio_net: virtio-mmio net device found`. DHCP will hang because
 queue notifications aren't handled yet — that's the boundary between
 Phase 1 and Phase 2.
 
-### Phase 2 — virtio-mmio + NetBridge (~3 days, the meat)
+### Phase 2 — virtio-mmio + vmnet networking (~3-4 days)
 
-Goal: kernel completes boot, DHCP succeeds, HTTP server listens, `curl
-http://localhost:18080/` returns the homepage byte-identical to QEMU+TCG.
+Goal: kernel completes boot, DHCP succeeds via vmnet NAT, HTTP server
+listens, `curl http://localhost:18080/` returns the homepage. Single
+queue pair initially (multiqueue comes in Phase 3).
 
 | New file | Approx LoC | Purpose |
 |---|---|---|
 | `src/virtio.rs` | ~450 | virtio-mmio register file + virtio-net backend |
-| `src/net_bridge.rs` | ~550 | Rust port of the Swift `NetBridge` (zero-copy, kqueue) |
+| `src/vmnet.rs` | ~350 | vmnet.framework FFI + shared-mode interface lifecycle |
 
-**Layout decisions to mirror krunkit / Firecracker**:
-- virtio-net at IPA `0xa000000` with INTID 35 (SPI 3)
+**Why vmnet instead of NetBridge**: the VZ runner's `NetBridge` is a
+userspace TCP/UDP/ARP/DHCP proxy that adds ~40µs of round-trip latency
+per HTTP request (benchmark: health_c1 p50 = 58µs VZ vs 17µs native).
+Every packet traverses 6-8 userspace context switches and two
+socketpair crossings. vmnet.framework eliminates all of this — the VM
+gets a real macOS network interface and packets flow through the kernel
+network stack, not a userspace proxy.
+
+**vmnet.framework integration**:
+
+  vmnet operates at the Ethernet frame level via `vmnet_read()` /
+  `vmnet_write()` — exactly what virtio-net needs. The integration:
+
+  1. Call `vmnet_start_interface()` with `VMNET_SHARED_MODE` (NAT).
+     The completion handler receives the interface parameters including
+     the assigned subnet, gateway IP, and MAC address.
+  2. Register a `VMNET_INTERFACE_PACKETS_AVAILABLE` event callback on
+     a dispatch queue — this fires when the host has frames for the VM.
+  3. In the callback, `vmnet_read()` a batch of frames and inject them
+     into the guest's virtio-net RX queue, then `hv_gic_set_spi()` to
+     wake the guest.
+  4. When the guest writes `QUEUE_NOTIFY` for the TX queue, walk the
+     TX avail ring, extract frames, and `vmnet_write()` them out.
+  5. `vmnet_stop_interface()` on shutdown.
+
+  vmnet supports `vmnet_enable_virtio_header_key` — when enabled, all
+  packets include the 12-byte `virtio_net_hdr` natively. This means
+  zero translation between vmnet and the guest virtqueue: the header
+  vmnet produces is exactly what the guest expects to find prepended
+  to each RX descriptor, and the header the guest writes in each TX
+  descriptor is exactly what vmnet expects. No stripping, no prepending.
+
+  vmnet also supports `vmnet_enable_checksum_offload_key` for TCP/UDP
+  checksum offload, which reduces guest CPU time per packet.
+
+  Port forwarding (host:8080 → VM:80) uses the new macOS 26 API
+  `vmnet_interface_add_port_forwarding_rule()`, or falls back to
+  reading the assigned VM IP from the interface params and printing
+  it so the user can curl directly.
+
+**Privilege requirement**: `vmnet_start_interface()` in shared mode
+  requires root. Two options:
+
+  1. **Run the whole runner as root** (`sudo run-hvf ...`). Simplest
+     for local dev. HVF itself works fine from root.
+  2. **Split-privilege helper** (like lima's `socket_vmnet`): a small
+     setuid binary that creates the vmnet interface, passes the
+     interface handle (or a socketpair fd) to the unprivileged runner
+     via SCM_RIGHTS, then exits. The runner never runs as root.
+
+  Start with option 1 for Phase 2. Option 2 is a polish item for
+  Phase 4 or later.
+
+**Entitlements**: `VMNET_SHARED_MODE` does NOT require the restricted
+  `com.apple.vm.networking` entitlement (that's bridged mode only).
+  The existing `run-hvf.entitlements` with `com.apple.security.hypervisor`
+  is sufficient. Add `-framework vmnet` to link flags in `build.rs`.
+
+**Layout decisions**:
+- Single virtio-mmio net device at IPA `0xa000000`, INTID 35 (SPI 3)
 - 64-deep queues, version-1 only
-- One TX queue, one RX queue (no multiqueue for Phase 2)
-- Negotiate `VIRTIO_F_VERSION_1 | VIRTIO_NET_F_MAC` only
+- Negotiate `VIRTIO_F_VERSION_1 | VIRTIO_NET_F_MAC | VIRTIO_NET_F_CSUM`
+- MAC address: use the MAC vmnet assigns (from interface params)
+- IP/subnet: vmnet provides DHCP natively — the kernel's existing
+  DHCP client will get an address from vmnet's built-in DHCP server
 
-**Interrupt delivery**: with native vGIC, the RX thread calls
-`hv_gic_set_spi(35, true)` whenever it injects a frame. The kernel's
-existing `arch::idle()` path WFIs and is woken automatically by the
-vGIC — no polling hack needed.
+**Verification**: `curl -sS -m 5 http://<vm-ip>:80/` returns HTTP 200.
+The VM IP is printed on startup from the vmnet interface params. If
+port forwarding is available: `curl http://localhost:18080/`.
 
-**NetBridge port**: currently the Swift implementation lives in
-`scripts/run-vz.swift` lines 159-562 (or wherever it ends up after
-the `tools/run-vz/` move planned in the parent task list). The port
-is line-by-line, with these Rust improvements:
-- `Box<[u8; 65536]>` TX/RX buffers, allocated once, reused forever
-- `libc::kevent` directly for the event loop (no `tokio`/`mio` dep)
-- Connection table as `HashMap<u16, ProxyConn>`
-- All packet construction via `&mut [u8]` slices, no `Vec` allocation
+### Phase 3 — Multiqueue virtio-net (~2 days)
 
-**Verification**: `curl -sS -m 5 http://localhost:18080/` returns
-HTTP 200 with the kernel homepage; diff against the QEMU+TCG output
-should be empty.
+Goal: scale network throughput with core count. health_c8 on 3 cores
+should improve from ~1.3× (single-queue ceiling) to ~2.5× scaling.
 
-### Phase 3 — Performance tuning (~1 day)
+**What changes**:
 
-Goals:
-- ≥500 req/s minimum (matches QEMU+TCG floor)
-- ≥1500 req/s stretch (beats VZ)
+The kernel already supports multiqueue virtio-net — `drivers/virtio_net.rs`
+has `num_queue_pairs`, per-QP `send_on_qp()` / `poll_qp()`, and negotiates
+`VIRTIO_NET_F_MQ` + `VIRTIO_NET_F_CTRL_VQ` if the device offers them.
+All the work is on the runner side.
 
-Likely tuning levers (in priority order):
-1. Coalesce SPI signals — don't call `hv_gic_set_spi(35)` per RX frame;
-   batch with a 1 ms timer or kick only when the kernel has acked the
-   previous interrupt.
-2. Split `virtio_net` mutex into per-direction state (TX is vCPU-only;
-   RX is bridge-thread-only) so the only cross-thread state is
-   `interrupt_status`, which can be `AtomicU32`.
-3. Pin the vCPU thread to a P-core via `pthread_set_qos_class_self_np
-   (QOS_CLASS_USER_INTERACTIVE, 0)`.
-4. `#[inline]` aggressively on the gpa→host translation and packet
-   builders.
+| Change | Details |
+|---|---|
+| Feature bits | Add `VIRTIO_NET_F_MQ` to device features |
+| Device config | Set `max_virtqueue_pairs = N` at offset 0x100 |
+| Queues | Create `2*N + 1` virtqueues (N TX + N RX + 1 ctrl) |
+| Ctrl virtqueue | Handle `VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET` command |
+| vmnet | One vmnet interface shared across all queue pairs (vmnet is thread-safe for read/write) |
+| SPI delivery | Each queue pair gets its own SPI (INTID 35, 36, ..., 35+N-1) so per-core interrupts work |
+
+**Per-core threading model**:
+
+  With multiqueue, the runner needs one thread per vCPU (already the
+  case from Phase 1 for SMP) plus one dispatch thread for vmnet RX
+  events. The vmnet RX callback distributes incoming frames across
+  RX queues by flow hash (mirroring the kernel's distributor), then
+  fires the per-queue SPI. Each vCPU thread handles its own TX queue
+  notifications directly.
+
+**Performance targets** (from benchmark analysis):
+- health_c8 3c: ≥100k req/s (vs 55,944 on VZ today)
+- compute_c8 3c: ~19k req/s (unchanged — CPU-bound, not network-bound)
+- health_c1: ≥25k req/s (vs 16,584 on VZ — vmnet eliminates proxy)
+
+### Phase 3.5 — Performance tuning (~1 day)
+
+Likely tuning levers after multiqueue is working:
+1. Coalesce SPI signals — batch per-queue kicks with a µs-scale timer
+   or kick only when the kernel has acked the previous interrupt.
+2. `vmnet_read` / `vmnet_write` batch sizes — read/write up to
+   `vmnet_read_max_packets_key` packets per call.
+3. Pin vCPU threads to P-cores via `pthread_set_qos_class_self_np`.
+4. `#[inline]` on gpa→host translation and queue-walk hot paths.
 
 ### Phase 4 — Bazel integration + dispatch (~half a day)
 
@@ -326,11 +404,17 @@ Read-only references the runner needs to be aware of:
   offsets. Authoritative for the device emulator.
 - [drivers/virtio_net.rs](../../drivers/virtio_net.rs) — virtio-net
   init sequence; tells you which feature bits to offer.
-- `tools/run-vz/run-vz.swift` (or `scripts/run-vz.swift`, depending
-  on whether the move has happened) — `NetBridge` source to port to
-  Rust.
 - `<Hypervisor/hv.h>` and friends in the macOS SDK — the FFI surface
   is documented in `src/hvf.rs`.
+- `<vmnet/vmnet.h>` in the macOS SDK — vmnet.framework API for
+  `vmnet_start_interface` (shared mode), `vmnet_read`, `vmnet_write`,
+  `vmnet_interface_add_port_forwarding_rule` (macOS 26+), and
+  `vmnet_enable_virtio_header_key`. Link with `-framework vmnet`.
+- [tools/run-vz/run-vz.swift](../run-vz/run-vz.swift) — the existing
+  VZ runner's `NetBridge` (lines 159-562) is **not** being ported;
+  vmnet replaces it entirely. The file is useful only as reference
+  for the CLI surface (PROXY_READY protocol, terminal raw mode,
+  Ctrl-C handling) which we do replicate.
 
 Verify the smoke test still passes before adding any new code in
 Phase 1, so you have a known-good baseline.
