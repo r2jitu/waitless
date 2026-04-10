@@ -211,9 +211,28 @@ primary_entry:
 
 setup_mmu:
     // ---- MAIR_EL1 ----------------------------------------------------------
-    // Attr0 = 0x00 → device nGnRnE (no gathering, no reordering, no early write ack)
-    // Attr1 = 0xFF → normal inner+outer write-back, read/write allocate
-    ldr     x0, =0x00FF
+    //
+    // CRITICAL: this layout is not arbitrary — it must match the OVMF /
+    // U-Boot / Linux convention with Normal Write-Back at AttrIdx 3.
+    //
+    // Apple Silicon HVF (verified empirically on M2) inspects the
+    // descriptor's AttrIdx and only enables the guest exclusive monitor
+    // (LDXR/STXR and LSE atomics) when it points at a "standard" MAIR
+    // slot. Earlier versions of this file used MAIR_EL1 = 0x00FF with
+    // WB at AttrIdx 1 — semantically identical per the ARMv8 spec, but
+    // HVF rejected every LDXR/CASAL with DFSC=0x35 ("Unsupported
+    // Exclusive or Atomic access") because slot 1 is normally where
+    // the standard convention puts Device-nGnRE, not WB.
+    //
+    // The current value matches Linux's `pgtable-prot.h` and OVMF's
+    // ArmMmuLib defaults, so HVF is happy and every other hypervisor
+    // (QEMU/KVM/VZ/TCG) treats it identically to the old layout.
+    //
+    //   Attr0 = 0x00  Device nGnRnE       (used by L2_DEVICE_BLOCK in mmu.rs)
+    //   Attr1 = 0x44  Normal NC in/out    (unused, kept for layout parity)
+    //   Attr2 = 0xBB  Normal WT in/out    (unused)
+    //   Attr3 = 0xFF  Normal WB in/out RW (used by all kernel/RAM mappings)
+    ldr     x0, =0xFFBB4400
     msr     mair_el1, x0
 
     // ---- TCR_EL1 -----------------------------------------------------------
@@ -237,27 +256,27 @@ setup_mmu:
     adrp    x1, boot_l1_table
     add     x1, x1, :lo12:boot_l1_table
 
-    // Block descriptor flags:
-    //   Normal 1GB block  = PA | AttrIdx=1 | AF=1 | SH=11 | valid = PA | 0x0705
+    // Block descriptor flags (must match the MAIR_EL1 layout above):
+    //   Normal 1GB block  = PA | AttrIdx=3 | AF=1 | SH=11 | valid = PA | 0x070d
     //   Device 1GB block  = PA | AttrIdx=0 | AF=1 | SH=00 | valid = PA | 0x0401
     // bits [1:0]=01: block descriptor, bits [4:2]=AttrIndx, bit[10]=AF, bits[9:8]=SH
 
     // Entries 0-3: all normal-cached (covers 0x00000000–0xFFFFFFFF)
     // Entry 0 covers VZ RAM (0x00000000) and QEMU low-MMIO region;
     // QEMU TCG intercepts MMIO by device registration (page attrs irrelevant).
-    ldr     x0, =0x0000000000000705    // PA=0x00000000, normal cached, AF=1
+    ldr     x0, =0x000000000000070d    // PA=0x00000000, normal cached, AF=1
     str     x0, [x1, #0]
 
     // Entry 1: normal memory (RAM at 0x40000000 — QEMU virt RAM base)
-    ldr     x0, =0x0000000040000705
+    ldr     x0, =0x000000004000070d
     str     x0, [x1, #8]
 
     // Entry 2: normal memory (0x80000000)
-    ldr     x0, =0x0000000080000705
+    ldr     x0, =0x000000008000070d
     str     x0, [x1, #16]
 
     // Entry 3: normal memory (0xC0000000)
-    ldr     x0, =0x00000000C0000705
+    ldr     x0, =0x00000000C000070d
     str     x0, [x1, #24]
 
     // Entry 256: device memory (PCIe ECAM, 0x4000000000–0x43FFFFFFFF)
@@ -533,8 +552,10 @@ ap_trampoline:
     msr     cpacr_el1, x0
     isb
 
-    // Set MAIR_EL1 (same values as BSP setup_mmu)
-    ldr     x0, =0x00FF
+    // Set MAIR_EL1 — must match the BSP setup_mmu layout exactly
+    // (Apple Silicon HVF requires WB at AttrIdx=3; see the long
+    // explanation in setup_mmu).
+    ldr     x0, =0xFFBB4400
     msr     mair_el1, x0
 
     // Set TCR_EL1
