@@ -517,6 +517,15 @@ def main():
 
     # ── Summary table ────────────────────────────────────────────────────────
 
+    # Restore blocking mode on stdout. Child processes (QEMU, run-vz) can
+    # leave fd 1 in O_NONBLOCK state because macOS shares file-description
+    # flags across fork+exec, and VZ.framework's internal dispatch sets
+    # non-blocking on inherited fds. Without this, the summary print()
+    # calls below raise BlockingIOError(errno 35) on long lines.
+    import fcntl
+    fl = fcntl.fcntl(sys.stdout.fileno(), fcntl.F_GETFL)
+    fcntl.fcntl(sys.stdout.fileno(), fcntl.F_SETFL, fl & ~os.O_NONBLOCK)
+
     # Build column list: (env_name, cpus) pairs that have data
     columns = []
     for env_name in env_names:
