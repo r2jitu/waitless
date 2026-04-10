@@ -181,42 +181,49 @@ unsafe fn drain_vmnet_rx() -> bool {
             _ => break,
         }
     }
-    if got_any {
-        hvf::hv_gic_set_spi(35, true);
-        let vcpu = VCPU_ID.load(std::sync::atomic::Ordering::Relaxed);
-        if vcpu != 0 {
-            hvf::hv_vcpus_exit(&vcpu as *const u64, 1);
-        }
-    }
     got_any
+}
+
+/// Notify the vCPU that new RX frames are available.
+fn kick_vcpu() {
+    unsafe { hvf::hv_gic_set_spi(35, true); }
+    let vcpu = VCPU_ID.load(std::sync::atomic::Ordering::Relaxed);
+    if vcpu != 0 {
+        unsafe { hvf::hv_vcpus_exit(&vcpu as *const u64, 1); }
+    }
 }
 
 /// Set up vmnet IO: event callback + polling thread.
 ///
-/// The GCD callback handles burst delivery. A 500µs polling thread
-/// catches frames that arrive between callbacks (vmnet coalesces
-/// PACKETS_AVAILABLE events at ~5/sec).
+/// The GCD callback reads packets and returns immediately (no blocking
+/// HVF calls). A separate notify thread kicks the vCPU asynchronously.
 fn start_io() {
     // Leak the interface into a raw pointer for lock-free access.
     let iface = IFACE.lock().unwrap().take().unwrap();
     let ptr = Box::into_raw(Box::new(iface));
     IFACE_PTR.store(ptr as usize, std::sync::atomic::Ordering::Release);
 
-    // Register PACKETS_AVAILABLE callback.
-    unsafe {
-        (*ptr).0.set_event_callback(vmnet::Events::PACKETS_AVAILABLE, move |_, _| {
-            drain_vmnet_rx();
-        }).expect("set_event_callback failed");
-    }
-
-    // Polling thread: reads every 500µs to catch inter-callback frames.
+    // RX polling thread: reads every 1ms with burst draining.
+    // The GCD callback alone fires ~5/sec which is too slow.
     std::thread::spawn(|| {
         loop {
-            std::thread::sleep(std::time::Duration::from_micros(50));
-            unsafe { drain_vmnet_rx(); }
+            unsafe {
+                if drain_vmnet_rx() {
+                    kick_vcpu();
+                    // After finding packets, drain aggressively.
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_micros(100));
+                        if !drain_vmnet_rx() { break; }
+                        kick_vcpu();
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
     });
 }
+
+static RX_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Snoop DHCP ACK frames to learn the VM's IP and set up port forwarding.
 /// Called from the RX thread for every received frame.
