@@ -178,7 +178,7 @@ def unikernel_binary(name, app, visibility = None):
             "//conditions:default": ["//bazel/rules:run_native.sh"],
         }),
         data = select({
-            "//bazel/platforms:runner_vz": [":" + name + ".img", "//scripts:run_vz"],
+            "//bazel/platforms:runner_vz": [":" + name + ".img", "//tools/run-vz:run_vz"],
             "//bazel/platforms:runner_qemu": [":" + name + ".elf", ":" + name + ".img"],
             "//bazel/platforms:runner_iso": [":" + name + ".iso"],
             "//conditions:default": [":" + name + "_native"],
@@ -186,7 +186,7 @@ def unikernel_binary(name, app, visibility = None):
         env = select({
             "//bazel/platforms:runner_vz": {
                 "UNIKERNEL_IMG_RELPATH": native.package_name() + "/" + name + ".img",
-                "UNIKERNEL_VZ_RELPATH": "scripts/run-vz",
+                "UNIKERNEL_VZ_RELPATH": "tools/run-vz/run-vz",
             },
             "//bazel/platforms:runner_qemu": {
                 "UNIKERNEL_ELF_RELPATH": native.package_name() + "/" + name + ".elf",

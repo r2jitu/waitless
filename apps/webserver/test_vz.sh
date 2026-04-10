@@ -18,7 +18,7 @@ FAILURES=0
 trap cleanup_vm EXIT
 
 IMG="${RUNFILES}/_main/apps/webserver/webserver.img"
-VZ_BIN="${RUNFILES}/_main/scripts/run-vz"
+VZ_BIN="${RUNFILES}/_main/tools/run-vz/run-vz"
 
 [[ -f "$IMG" ]]    || { echo "ERROR: webserver.img not found at $IMG" >&2; exit 1; }
 [[ -f "$VZ_BIN" ]] || { echo "SKIP: run-vz binary not found"; exit 0; }

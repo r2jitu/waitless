@@ -71,10 +71,10 @@ fi
 # Set UNIKERNEL_RUNNER=qemu to skip VZ and use QEMU TCG instead.
 RUNNER="${UNIKERNEL_RUNNER:-vz}"
 if [ "$HOST_OS" = "Darwin" ] && [ "$HOST_ARCH" = "arm64" ] && [ "$RUNNER" != "qemu" ]; then
-    RUN_VZ="$PROJECT_ROOT/bazel-bin/scripts/run-vz"
+    RUN_VZ="$PROJECT_ROOT/bazel-bin/tools/run-vz/run-vz"
 
     # Always build via Bazel — fast no-op if run-vz.swift hasn't changed.
-    (cd "$PROJECT_ROOT" && bazel build //scripts:run_vz)
+    (cd "$PROJECT_ROOT" && bazel build //tools/run-vz:run_vz)
 
     # run-vz requires a raw ARM64 binary image (.img), not an ELF.
     # When called via "bazel run", run_wrapper.sh already provides a .img.

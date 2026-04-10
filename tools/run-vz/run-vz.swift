@@ -1,7 +1,7 @@
-// scripts/run-vz.swift — Boot an ARM64 unikernel via Apple Virtualization.framework
+// tools/run-vz/run-vz.swift — Boot an ARM64 unikernel via Apple Virtualization.framework
 //
 // Build (run-local.sh does this automatically on first use):
-//   swiftc run-vz.swift -o run-vz -framework Virtualization
+//   bazel build //tools/run-vz:run_vz
 //
 // Usage:
 //   run-vz <path-to.img> [host-port]
