@@ -99,7 +99,7 @@ pub fn spawn() -> Result<([u8; 6], i32), String> {
             let _ = iface.write(&buf[..n as usize]);
         }
 
-        std::thread::sleep(std::time::Duration::from_micros(50));
+        std::thread::yield_now();
     }
 }
 

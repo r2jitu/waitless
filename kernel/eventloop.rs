@@ -113,6 +113,12 @@ pub fn run(core_id: u32) -> ! {
             if f(core_id) { did_work = true; service_work += 1; }
         }
 
+        // 3b. Flush TX after service — responses must be sent immediately
+        // so keep-alive follow-up requests arrive promptly.
+        if did_work {
+            if let Some(f) = NET_FLUSH.load() { f(); }
+        }
+
         // Periodic diagnostics (every ~1M loops)
         let print_interval = if core_id == 0 { 0x3FFFF } else { 0x1FFF };
         if loops & print_interval == 0 && loops > 0 {
@@ -157,7 +163,10 @@ pub fn run(core_id: u32) -> ! {
             // This reduces wasted HLT/WFI wakeups under MTTCG where
             // HLT doesn't properly block the host thread.
             if consecutive_idle < 8 {
-                // Light idle: brief spin, stay responsive for incoming work
+                // Light idle: brief spin. Each iteration triggers a
+                // get_used() MMIO auto-refetch (~5µs per VM exit).
+                // 200 iterations × 5µs ≈ 1ms of polling before WFI,
+                // covering the vmnet round-trip for keep-alive requests.
                 for _ in 0..100u32 { core::hint::spin_loop(); }
             } else {
                 // Heavy idle: deep sleep (interrupt-armed)
