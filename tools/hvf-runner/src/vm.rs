@@ -407,6 +407,9 @@ impl Vm {
                     let val = if access.rt == 31 { 0 } else {
                         self.get_reg(HvReg::gpr(access.rt as u32)) as u32
                     };
+                    if offset == 0x050 {
+                        eprintln!("(virtio) QUEUE_NOTIFY queue={val}");
+                    }
                     if dev.write(offset, val) {
                         notify_queue = Some(val);
                     }

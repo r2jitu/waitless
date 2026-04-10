@@ -129,6 +129,7 @@ pub fn process_tx() {
     TX_LAST.store(last, std::sync::atomic::Ordering::Relaxed);
 
     if !frames.is_empty() {
+        eprintln!("(vmnet-tx) sending {} frames", frames.len());
         dev.interrupt_status |= 1;
         drop(dev_lock); // release virtio lock before vmnet I/O
 
@@ -136,7 +137,10 @@ pub fn process_tx() {
         let mut iface_lock = IFACE.lock().unwrap();
         if let Some(ref mut iface) = *iface_lock {
             for frame in &frames {
-                let _ = iface.0.write(frame);
+                match iface.0.write(frame) {
+                    Ok(n) => eprintln!("(vmnet-tx) wrote {n} bytes"),
+                    Err(e) => eprintln!("(vmnet-tx) write error: {e:?}"),
+                }
             }
         }
 
@@ -167,6 +171,14 @@ fn rx_loop() {
             std::thread::sleep(std::time::Duration::from_millis(1));
             continue;
         }
+        eprintln!("(vmnet-rx) got {n} byte frame");
+        // Debug: show first few bytes (should be Ethernet header)
+        if n >= 14 {
+            eprintln!("(vmnet-rx) dst={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} src={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ethertype={:02x}{:02x}",
+                buf[0],buf[1],buf[2],buf[3],buf[4],buf[5],
+                buf[6],buf[7],buf[8],buf[9],buf[10],buf[11],
+                buf[12],buf[13]);
+        }
 
         // Inject into guest RX queue.
         let mut dev_lock = virtio::DEVICE.lock().unwrap();
@@ -191,8 +203,10 @@ fn rx_loop() {
         let mut last = RX_LAST.load(std::sync::atomic::Ordering::Relaxed);
 
         if last == avail_idx {
-            continue; // no free RX buffers
+            eprintln!("(vmnet-rx) no free RX buffers (last={last} avail_idx={avail_idx})");
+            continue;
         }
+        eprintln!("(vmnet-rx) injecting into RX queue: last={last} avail_idx={avail_idx} qsize={qsize}");
 
         let ring_idx = last & (qsize - 1);
         let desc_idx = unsafe {
