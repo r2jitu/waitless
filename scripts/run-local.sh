@@ -67,18 +67,42 @@ if [ ! -f "$KERNEL" ]; then
     exit 1
 fi
 
-# ── macOS arm64 → VZ.framework (hardware-accelerated) ────────────────────────
-# Set UNIKERNEL_RUNNER=qemu to skip VZ and use QEMU TCG instead.
-RUNNER="${UNIKERNEL_RUNNER:-vz}"
-if [ "$HOST_OS" = "Darwin" ] && [ "$HOST_ARCH" = "arm64" ] && [ "$RUNNER" != "qemu" ]; then
+# ── macOS arm64 → HVF or VZ.framework (hardware-accelerated) ─────────────────
+# UNIKERNEL_RUNNER: hvf (default), vz, or qemu.
+# HVF requires root (for vmnet). Falls back to VZ if HVF is unavailable.
+RUNNER="${UNIKERNEL_RUNNER:-hvf}"
+if [ "$HOST_OS" = "Darwin" ] && [ "$HOST_ARCH" = "arm64" ] && [ "$RUNNER" = "hvf" ]; then
+    RUN_HVF="$PROJECT_ROOT/tools/hvf-runner/target/release/run-hvf"
+
+    # Build via cargo + codesign.
+    (cd "$PROJECT_ROOT/tools/hvf-runner" && cargo build --release --quiet 2>/dev/null && \
+     codesign --force --sign - --entitlements run-hvf.entitlements target/release/run-hvf 2>/dev/null)
+
+    IMG="$KERNEL"
+    if [[ "$KERNEL" == *.elf ]]; then
+        IMG="${KERNEL%.elf}.img"
+        if [ ! -f "$IMG" ]; then
+            echo "Error: run-hvf requires a raw binary image, not an ELF."
+            echo "       Expected: $IMG"
+            exit 1
+        fi
+    fi
+
+    if [ -x "$RUN_HVF" ]; then
+        echo "==> Starting HVF runner (requires root for vmnet)"
+        exec sudo "$RUN_HVF" "$IMG"
+    else
+        echo "Warning: HVF runner not found, falling back to VZ"
+        RUNNER="vz"
+    fi
+fi
+
+if [ "$HOST_OS" = "Darwin" ] && [ "$HOST_ARCH" = "arm64" ] && [ "$RUNNER" = "vz" ]; then
     RUN_VZ="$PROJECT_ROOT/bazel-bin/tools/run-vz/run-vz"
 
     # Always build via Bazel — fast no-op if run-vz.swift hasn't changed.
     (cd "$PROJECT_ROOT" && bazel build //tools/run-vz:run_vz)
 
-    # run-vz requires a raw ARM64 binary image (.img), not an ELF.
-    # When called via "bazel run", run_wrapper.sh already provides a .img.
-    # When called with a .elf, look for a pre-built .img alongside it.
     IMG="$KERNEL"
     if [[ "$KERNEL" == *.elf ]]; then
         IMG="${KERNEL%.elf}.img"

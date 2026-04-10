@@ -90,6 +90,11 @@ config_setting(
 )
 
 config_setting(
+    name = "runner_hvf",
+    define_values = {"uni_runner": "hvf"},
+)
+
+config_setting(
     name = "runner_iso",
     define_values = {"uni_runner": "iso"},
 )

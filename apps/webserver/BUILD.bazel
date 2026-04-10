@@ -27,12 +27,17 @@ sh_test(
     name = "test",
     timeout = "long",
     srcs = select({
+        "//bazel/platforms:runner_hvf": ["test_hvf.sh"],
         "//bazel/platforms:runner_vz": ["test_vz.sh"],
         "//bazel/platforms:runner_qemu": ["test_qemu.sh"],
         "//bazel/platforms:runner_iso": ["test_iso.sh"],
         "//conditions:default": ["test_native.sh"],
     }),
     data = select({
+        "//bazel/platforms:runner_hvf": [
+            ":webserver.img",
+            "//scripts:helpers.sh",
+        ],
         "//bazel/platforms:runner_vz": [
             ":webserver.img",
             "//scripts:helpers.sh",
