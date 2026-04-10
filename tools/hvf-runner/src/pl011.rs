@@ -1,0 +1,82 @@
+// tools/hvf-runner/src/pl011.rs
+//
+// PL011 UART emulation. Only the registers the kernel actually touches
+// are implemented; everything else is RAZ/WI (read-as-zero, write-ignore).
+//
+// The kernel's PL011 driver (kernel/serial.rs) uses:
+//   DR   (0x000) — data register: write = TX byte, read = RX byte
+//   FR   (0x018) — flag register: bit 5 = TXFF, bit 4 = RXFE
+//   IBRD (0x024) — integer baud rate divisor (write, ignored by us)
+//   FBRD (0x028) — fractional baud rate divisor (write, ignored)
+//   LCR_H(0x02C) — line control (write, ignored)
+//   CR   (0x030) — control register (write, ignored — we're always "on")
+
+use std::collections::VecDeque;
+use std::io::Write;
+use std::sync::Mutex;
+
+/// Shared RX buffer. Stdin reader thread pushes bytes; the vCPU thread's
+/// MMIO handler pops them on DR reads.
+pub static RX_BUF: Mutex<VecDeque<u8>> = Mutex::new(VecDeque::new());
+
+/// PL011 register offsets (from ARM PrimeCell PL011 r1p5 TRM).
+const DR: u64 = 0x000;
+const FR: u64 = 0x018;
+
+/// Flag register bits.
+const FR_TXFF: u32 = 1 << 5; // TX FIFO full
+const FR_RXFE: u32 = 1 << 4; // RX FIFO empty
+
+/// Handle a guest MMIO read from the PL011 region.
+pub fn mmio_read(offset: u64, _size: u8) -> u64 {
+    match offset {
+        DR => {
+            // Pop one byte from the RX buffer, or 0 if empty.
+            RX_BUF
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(0) as u64
+        }
+        FR => {
+            // TX is never full (we flush synchronously to stdout).
+            // RX is empty if the stdin buffer has nothing.
+            let rxfe = if RX_BUF.lock().unwrap().is_empty() {
+                FR_RXFE
+            } else {
+                0
+            };
+            rxfe as u64
+        }
+        // All other registers: read-as-zero.
+        _ => 0,
+    }
+}
+
+/// Handle a guest MMIO write to the PL011 region.
+pub fn mmio_write(offset: u64, _size: u8, value: u64) {
+    match offset {
+        DR => {
+            let byte = value as u8;
+            // Buffer output and flush on newline or when the buffer
+            // gets large, to avoid one syscall per character.
+            //
+            // We use a thread-local buffer because the vCPU thread is
+            // the only writer and we don't want to lock on every byte.
+            thread_local! {
+                static BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+            }
+            BUF.with(|buf| {
+                let mut buf = buf.borrow_mut();
+                buf.push(byte);
+                if byte == b'\n' || buf.len() >= 256 {
+                    let _ = std::io::stdout().write_all(&buf);
+                    let _ = std::io::stdout().flush();
+                    buf.clear();
+                }
+            });
+        }
+        // IBRD, FBRD, LCR_H, CR, etc. — all writes ignored.
+        _ => {}
+    }
+}

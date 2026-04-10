@@ -283,6 +283,18 @@ unsafe extern "C" {
     // actually delivers them.
     pub fn hv_gic_get_distributor_reg(reg: u32, value: *mut u64) -> hv_return_t;
     pub fn hv_gic_set_distributor_reg(reg: u32, value: u64) -> hv_return_t;
+
+    // GIC redistributor register access (per-vCPU).
+    pub fn hv_gic_get_redistributor_reg(
+        vcpu: hv_vcpu_t,
+        reg: u32,
+        value: *mut u64,
+    ) -> hv_return_t;
+    pub fn hv_gic_set_redistributor_reg(
+        vcpu: hv_vcpu_t,
+        reg: u32,
+        value: u64,
+    ) -> hv_return_t;
 }
 
 // ─── Error handling ──────────────────────────────────────────────────────────
