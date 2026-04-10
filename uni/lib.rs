@@ -259,4 +259,5 @@ impl TcpStream {
     pub fn is_closed(&self) -> bool {
         backend::tcp_is_closed(self.0)
     }
+
 }
