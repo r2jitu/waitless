@@ -862,7 +862,11 @@ pub fn poke_interrupt_status() {
     unsafe {
         match (*ndev()).transport {
             Transport::Mmio { base, .. } => {
-                virtio_read32(base + MMIO_INTERRUPT_STATUS);
+                let isr = virtio_read32(base + MMIO_INTERRUPT_STATUS);
+                // Cache used_idx from upper 16 bits (HVF extension).
+                if (*ndev()).rx_queues[0].used_idx_mmio {
+                    (*ndev()).rx_queues[0].mmio_cached_used_idx = (isr >> 16) as u16;
+                }
             }
             _ => {}
         }
@@ -882,8 +886,8 @@ pub fn poll_qp(qp: usize, callback: fn(&[u8])) -> i32 {
     }
 
     // For VIRTIO_F_USED_IDX_MMIO devices: read INTERRUPT_STATUS once
-    // per poll cycle to get the device-side used_idx (packed in upper
-    // 16 bits). This single MMIO read replaces per-get_used() reads.
+    // per poll cycle. This MMIO exit also runs check_rx() on the host,
+    // injecting any pending RX frames into the used ring.
     unsafe {
         (*ndev()).rx_queues[qp].poll_interrupt_status();
     }

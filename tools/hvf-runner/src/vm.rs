@@ -273,8 +273,8 @@ impl Vm {
                     // instead. TODO: verify empirically.
                 }
                 HV_EXIT_REASON_CANCELED => {
-                    // RX notify thread kicked us. check_rx() already
-                    // ran at the top of the loop. Just resume.
+                    // IO thread kicked us via hv_vcpus_exit. check_rx()
+                    // already ran at the top of the loop. Just resume.
                 }
                 _ => {
                     return Err(format!("unknown exit reason: {}", exit.reason));
