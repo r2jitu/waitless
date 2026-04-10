@@ -208,27 +208,13 @@ fn conn_ptr(core: u32, slot: usize) -> *mut TcpConnection {
     POOLS.at(core)[slot].0.get()
 }
 
-/// TCP initial-sequence-number counter. Atomic on QEMU/KVM; on
-/// vz_compat (atomic RMW faults) fall back to volatile read+write,
-/// where duplicates are harmless for TCP ISN.
-#[cfg(not(vz_compat))]
+/// TCP initial-sequence-number counter.
 static SEQ_COUNTER: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(100_000);
-#[cfg(vz_compat)]
-static mut SEQ_COUNTER: u32 = 100_000;
 
 #[inline]
 fn next_seq() -> u32 {
-    #[cfg(not(vz_compat))]
-    {
-        SEQ_COUNTER.fetch_add(64_000, core::sync::atomic::Ordering::Relaxed)
-    }
-    #[cfg(vz_compat)]
-    unsafe {
-        let s = core::ptr::read_volatile(&raw const SEQ_COUNTER);
-        core::ptr::write_volatile(&raw mut SEQ_COUNTER, s.wrapping_add(64_000));
-        s
-    }
+    SEQ_COUNTER.fetch_add(64_000, core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Encode a connection handle from core + slot index.

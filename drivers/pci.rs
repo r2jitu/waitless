@@ -66,12 +66,6 @@ pub(crate) static PCI_DEVICES: Spinlock<PciDeviceTable> =
 /// let two cores both pass the guard and double-scan the bus.
 /// `compare_exchange` makes the "first caller wins, others bail" intent
 /// race-free.
-///
-/// On vz_compat (where atomic RMW faults), fall back to a non-atomic
-/// load+store. PCI init is single-threaded on every backend in practice
-/// (called from `kernel_boot` on the BSP before any AP starts), so the
-/// fallback is safe; the atomic CAS guards against future code that
-/// accidentally re-enters from another core.
 static PCI_INITIALIZED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -263,22 +257,12 @@ fn probe_function(bus: u8, slot: u8, func: u8) -> bool {
 
 fn init_inner() {
     use core::sync::atomic::Ordering;
-    #[cfg(not(vz_compat))]
+    // Race-free claim: only the first caller proceeds.
+    if PCI_INITIALIZED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
     {
-        // Race-free claim: only the first caller proceeds.
-        if PCI_INITIALIZED
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
-    }
-    #[cfg(vz_compat)]
-    {
-        // VZ rejects atomic RMW. PCI init is single-threaded on VZ, so a
-        // load+store guard is sufficient.
-        if PCI_INITIALIZED.load(Ordering::Acquire) { return; }
-        PCI_INITIALIZED.store(true, Ordering::Release);
+        return;
     }
 
     log(b"[PCI] Scanning bus 0...\n");

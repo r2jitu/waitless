@@ -32,26 +32,14 @@ static MULTICORE_INIT: core::sync::atomic::AtomicBool = core::sync::atomic::Atom
 static WAKEUP: [core::sync::atomic::AtomicBool; percpu::MAX_CORES] =
     [const { core::sync::atomic::AtomicBool::new(false) }; percpu::MAX_CORES];
 
-/// RX poll lock: 0 = free, 1 = held. Uses load/store (not CAS) because
-/// VZ.framework rejects all atomic RMW on guest RAM. The lock is best-effort:
-/// two cores may both see 0 and enter, but the VirtIO RX queue is drained
-/// quickly so the race window is tiny and the worst case is a redundant poll.
+/// RX poll lock: 0 = free, 1 = held. CAS-based; only one core wins
+/// the right to drain the RX queue at a time.
 static RX_LOCK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// Diagnostic counters. Atomic (Relaxed) on QEMU/KVM; volatile RMW on
-/// vz_compat where atomic RMW faults — best-effort either way.
-#[cfg(not(vz_compat))]
+/// Diagnostic counters.
 static RX_LOCK_GOT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-#[cfg(not(vz_compat))]
 static RX_LOCK_MISS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-#[cfg(not(vz_compat))]
 static FRAMES_DISTRIBUTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-#[cfg(vz_compat)]
-static mut RX_LOCK_GOT: u64 = 0;
-#[cfg(vz_compat)]
-static mut RX_LOCK_MISS: u64 = 0;
-#[cfg(vz_compat)]
-static mut FRAMES_DISTRIBUTED: u64 = 0;
 
 
 /// Poll the network device and dispatch received frames through the
@@ -69,8 +57,6 @@ pub fn poll() -> bool {
     }
 
     // Tier 2: multi-core with software distribution.
-    // On VZ, only core 0 reaches here (net_poll_cb blocks other cores).
-    // poll_tier2 uses load/store for RX_LOCK under vz_compat.
     poll_tier2(num_cores)
 }
 
@@ -85,36 +71,18 @@ fn poll_tier2(num_cores: u32) -> bool {
     }
 
     // Try to become the distributor.
-    let got_lock = if cfg!(vz_compat) {
-        // VZ: load/store — VZ does not virtualize the exclusive monitor
-        // (both LDXR/STXR and LSE CAS → DFSC 0x35). On VZ, net_poll_cb
-        // only allows core 0 to poll, so contention is impossible; this
-        // is never racy in practice.
-        if RX_LOCK.load(core::sync::atomic::Ordering::Acquire) != 0 { false }
-        else { RX_LOCK.store(1, core::sync::atomic::Ordering::Release); true }
-    } else {
-        // QEMU/KVM: proper CAS (safe under true parallelism).
-        RX_LOCK.compare_exchange(0, 1,
+    let got_lock = RX_LOCK
+        .compare_exchange(
+            0, 1,
             core::sync::atomic::Ordering::Acquire,
-            core::sync::atomic::Ordering::Relaxed).is_ok()
-    };
+            core::sync::atomic::Ordering::Relaxed,
+        )
+        .is_ok();
     if !got_lock {
-        #[cfg(not(vz_compat))]
-        { RX_LOCK_MISS.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
-        #[cfg(vz_compat)]
-        unsafe {
-            let v = core::ptr::read_volatile(&raw const RX_LOCK_MISS);
-            core::ptr::write_volatile(&raw mut RX_LOCK_MISS, v.wrapping_add(1));
-        }
+        RX_LOCK_MISS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         return false;
     }
-    #[cfg(not(vz_compat))]
-    { RX_LOCK_GOT.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
-    #[cfg(vz_compat)]
-    unsafe {
-        let v = core::ptr::read_volatile(&raw const RX_LOCK_GOT);
-        core::ptr::write_volatile(&raw mut RX_LOCK_GOT, v.wrapping_add(1));
-    }
+    RX_LOCK_GOT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
     // Flush TX staging first — responses from previous cycle.
     drivers::virtio_net::flush_tx_staging();
@@ -131,13 +99,7 @@ fn poll_tier2(num_cores: u32) -> bool {
 
     let had_frames = count > 0;
     if had_frames {
-        #[cfg(not(vz_compat))]
-        { FRAMES_DISTRIBUTED.fetch_add(count as u64, core::sync::atomic::Ordering::Relaxed); }
-        #[cfg(vz_compat)]
-        unsafe {
-            let v = core::ptr::read_volatile(&raw const FRAMES_DISTRIBUTED);
-            core::ptr::write_volatile(&raw mut FRAMES_DISTRIBUTED, v.wrapping_add(count as u64));
-        }
+        FRAMES_DISTRIBUTED.fetch_add(count as u64, core::sync::atomic::Ordering::Relaxed);
         let any_wakeup = (1..num_cores as usize)
             .any(|i| WAKEUP[i].load(core::sync::atomic::Ordering::Relaxed));
         if any_wakeup {
@@ -262,13 +224,9 @@ pub fn init_eventloop() {
     kernel::eventloop::set_net_flush(net_flush_cb);
 }
 
-fn net_poll_cb(core_id: u32) -> bool {
-    // VZ: only core 0 polls VirtIO (serializes queue access without CAS).
-    // Core 0 distributes to AP inboxes; APs only drain their inbox.
-    // QEMU: any core can be the rotating distributor.
-    if cfg!(vz_compat) && core_id != 0 {
-        return false;
-    }
+fn net_poll_cb(_core_id: u32) -> bool {
+    // Any core can become the rotating distributor; the RX_LOCK CAS
+    // in poll_tier2 picks one winner per cycle.
     if RX_LOCK.load(core::sync::atomic::Ordering::Relaxed) != 0 {
         return false;
     }

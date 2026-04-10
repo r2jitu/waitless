@@ -9,14 +9,11 @@
 //     `unlock()` API, so paired lock/unlock bugs are impossible.
 //   * The guard is `!Send` (`PhantomData<*mut ()>`), so it cannot leak
 //     across cores.
-//   * On `cfg(vz_compat)` the lock degrades to load+store with the same
-//     single-writer discipline, because VZ.framework rejects atomic RMW
-//     on guest RAM (see `project_vz_atomic_limitation.md`).
 //
 // Layout is `repr(C)` over an `AtomicBool` flag and an `UnsafeCell<T>`.
-// `lock()` inlines to a CAS loop (or a load+store on vz_compat); `Drop`
-// inlines to one `store(false, Release)`; field access through the guard
-// compiles to the same code as a raw `*mut T` dereference.
+// `lock()` inlines to a CAS loop, `Drop` inlines to one
+// `store(false, Release)`, and field access through the guard compiles
+// to the same code as a raw `*mut T` dereference.
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
@@ -50,35 +47,19 @@ impl<T> Spinlock<T> {
     /// releases the lock automatically on drop.
     #[inline]
     pub fn lock(&self) -> SpinlockGuard<'_, T> {
-        #[cfg(not(vz_compat))]
+        // CAS-based spin: standard pattern. compare_exchange_weak is
+        // cheaper than the strong variant on architectures where the
+        // cache line ping-pongs (it can fail spuriously, which is fine
+        // here since we're already in a loop).
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
         {
-            // CAS-based spin: standard pattern. compare_exchange_weak is
-            // cheaper than the strong variant on architectures where the
-            // cache line ping-pongs (it can fail spuriously, which is fine
-            // here since we're already in a loop).
-            while self
-                .locked
-                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
-            {
-                // Backoff: hint to the CPU that we're spin-waiting.
-                while self.locked.load(Ordering::Relaxed) {
-                    core::hint::spin_loop();
-                }
-            }
-        }
-        #[cfg(vz_compat)]
-        {
-            // VZ rejects atomic RMW. Fall back to load+store. Sound only
-            // because the existing call sites (serial::puts, virtio TX,
-            // mm allocator) either run single-threaded during boot or
-            // restrict to a single core via other means (vz_compat
-            // BSP-only checks). The lock is still RAII so callers don't
-            // need to know which variant is in use.
-            while self.locked.load(Ordering::Acquire) {
+            // Backoff: hint to the CPU that we're spin-waiting.
+            while self.locked.load(Ordering::Relaxed) {
                 core::hint::spin_loop();
             }
-            self.locked.store(true, Ordering::Release);
         }
         SpinlockGuard {
             lock: self,
@@ -92,23 +73,10 @@ impl<T> Spinlock<T> {
     /// the next poll cycle retry).
     #[inline]
     pub fn try_lock(&self) -> Option<SpinlockGuard<'_, T>> {
-        let acquired = {
-            #[cfg(not(vz_compat))]
-            {
-                self.locked
-                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                    .is_ok()
-            }
-            #[cfg(vz_compat)]
-            {
-                if self.locked.load(Ordering::Acquire) {
-                    false
-                } else {
-                    self.locked.store(true, Ordering::Release);
-                    true
-                }
-            }
-        };
+        let acquired = self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok();
         if acquired {
             Some(SpinlockGuard {
                 lock: self,

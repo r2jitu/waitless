@@ -54,10 +54,9 @@ static mut CON_RX_NOTIFY: u64 = 0;
 
 // TX/RX ring index state. Atomic so cross-core access is data-race-free at
 // the language level. The actual TX serialisation is done by the caller
-// (kernel::serial holds a spinlock around the whole `puts`/`putc` call on
-// QEMU/KVM, and restricts to BSP-only on vz_compat). Atomic ops here defend
-// against future callers that bypass that lock and let Miri verify the
-// soundness of any concurrent test.
+// (kernel::serial holds a spinlock around the whole `puts`/`putc` call).
+// Atomic ops here defend against future callers that bypass that lock and
+// let Miri verify the soundness of any concurrent test.
 use core::sync::atomic::{AtomicU16, Ordering};
 static CON_TX_AVAIL_IDX: AtomicU16 = AtomicU16::new(0);
 static CON_TX_LAST_USED: AtomicU16 = AtomicU16::new(0);

@@ -73,23 +73,13 @@ static HANDLER_FNS: [AtomicHandlerFn; MAX_HANDLERS] = [
 ];
 
 /// Register a handler for incoming UDP packets on a specific port.
-/// On QEMU/KVM uses CAS to claim a slot race-free; on vz_compat (where
-/// atomic RMW faults) falls back to load+store, which is sound because
-/// `bind` runs from app init on the BSP single-threaded.
+/// Uses CAS to claim a slot race-free.
 pub fn bind(port: u16, handler: UdpHandlerFn) {
     if port == 0 { return; }
     for i in 0..MAX_HANDLERS {
-        #[cfg(not(vz_compat))]
         let claimed = HANDLER_PORTS[i]
             .compare_exchange(0, port, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok();
-        #[cfg(vz_compat)]
-        let claimed = if HANDLER_PORTS[i].load(Ordering::Acquire) == 0 {
-            HANDLER_PORTS[i].store(port, Ordering::Release);
-            true
-        } else {
-            false
-        };
 
         if claimed {
             HANDLER_FNS[i].store(handler);

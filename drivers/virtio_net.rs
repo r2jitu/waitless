@@ -793,8 +793,8 @@ pub fn send(data: &[u8]) {
     if nqp > 1 && (id as u16) < nqp {
         // Tier 1: send directly on this core's queue pair. No locking needed.
         send_on_qp(id as usize, data);
-    } else if kernel::percpu::num_cores() <= 1 || (cfg!(vz_compat) && id == 0) {
-        // Single-core or VZ core 0: send directly (no staging needed).
+    } else if kernel::percpu::num_cores() <= 1 {
+        // Single-core: send directly (no staging needed).
         send_on_qp(0, data);
     } else {
         // Tier 2 multi-core: always stage. The load/store lock isn't safe
@@ -811,21 +811,8 @@ pub fn has_pending_tx() -> bool {
 }
 
 /// Flush all per-core TX staging buffers into the VirtIO TX queue.
-/// On VZ (vz_compat), only core 0 flushes — the load/store TX_LOCK is not
-/// truly atomic, and concurrent VirtIO queue access from APs would race.
-/// APs only stage TX; core 0 drains all staging during its poll cycle.
+/// Any core may call this; concurrent calls are serialised via TX_LOCK.
 pub fn flush_tx_staging() {
-    // On VZ, restrict flushing to core 0 to avoid concurrent VirtIO TX access.
-    // The load/store TX_LOCK cannot safely exclude APs from racing with core 0.
-    // Instead, wake core 0 so it flushes on our behalf — otherwise core 0 stays
-    // in WFI waiting for a VirtIO RX interrupt that can't arrive until the client
-    // receives the response, causing a deadlock.
-    if cfg!(vz_compat) && kernel::cpu_id() != 0 {
-        if TX_PENDING.load(Ordering::Acquire) {
-            kernel::wake_core0();
-        }
-        return;
-    }
     if !TX_PENDING.load(Ordering::Acquire) {
         return;
     }
@@ -855,20 +842,12 @@ pub fn poll(
     poll_qp(0, callback)
 }
 
-/// Poll the RX queue only if safe to do so on the calling core.
-///
-/// On VZ (vz_compat), the VirtIO exclusive monitor is not virtualized:
-/// only core 0 may safely access the VirtIO RX queue.  AP cores must not
-/// call poll_qp concurrently with core 0's event loop — the shared
-/// `last_used_idx` and descriptor free-list would be corrupted.
-///
-/// When called from a non-core-0 AP on VZ this returns 0 immediately.
-/// The caller should spin on its expected side-effect (e.g. arp_lookup)
-/// while core 0's event loop processes the reply via distribute_frame.
+/// Poll the RX queue from any core. Concurrent calls across cores are
+/// serialised via the `TX_LOCK` try-lock that `poll_qp` takes around the
+/// queue access. Kept as a separate name from `poll` so call sites that
+/// historically distinguished "safe to poll from this core" continue to
+/// read clearly.
 pub fn poll_if_safe(callback: fn(&[u8])) -> i32 {
-    if cfg!(vz_compat) && kernel::cpu_id() != 0 {
-        return 0;
-    }
     poll_qp(0, callback)
 }
 

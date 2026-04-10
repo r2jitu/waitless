@@ -26,12 +26,6 @@ struct CoreState {
 static mut CORES: [CoreState; MAX_CORES] = [const { CoreState { stack_top: 0 } }; MAX_CORES];
 
 /// Number of cores that have come online (BSP + APs that called `ap_entry`).
-///
-/// On QEMU/KVM this is incremented via `fetch_add`. On VZ (vz_compat) atomic
-/// RMW instructions fault on guest RAM, so we fall back to a non-atomic
-/// volatile read-then-write — but on VZ secondary cores boot strictly
-/// sequentially under our current setup, so the lost-update race that's
-/// fatal on QEMU/KVM cannot fire on VZ.
 static NUM_CORES_ONLINE: AtomicU32 = AtomicU32::new(1); // BSP is always online
 
 /// Get the current CPU's logical core index.
@@ -155,17 +149,7 @@ unsafe extern "C" fn ap_entry(_stack_top: u64) -> ! {
         core::arch::asm!("msr daifclr, #0x2", options(nomem, nostack));
 
         // Mark this core as online.
-        //
-        // On QEMU/KVM use `fetch_add`. On VZ atomic RMW faults, so emulate
-        // RMW with a load+store; safe because vz_compat boots APs strictly
-        // sequentially (one CPU_ON at a time, BSP waits for `online`).
-        #[cfg(not(vz_compat))]
         NUM_CORES_ONLINE.fetch_add(1, Ordering::AcqRel);
-        #[cfg(vz_compat)]
-        {
-            let n = NUM_CORES_ONLINE.load(Ordering::Acquire);
-            NUM_CORES_ONLINE.store(n + 1, Ordering::Release);
-        }
 
         // Log
         let id = cpu_id();

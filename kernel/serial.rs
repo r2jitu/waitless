@@ -246,24 +246,7 @@ static SHUTDOWN_REQUESTED: core::sync::atomic::AtomicBool = core::sync::atomic::
 /// Wraps `()` because we don't need to protect any inner data — the
 /// underlying serial state is owned by the device-specific putc/puts
 /// implementations. The lock just provides mutual exclusion.
-///
-/// On vz_compat the lock falls back to load+store (atomic RMW faults
-/// on VZ guest RAM); see `kernel::sync::Spinlock` for details.
-#[cfg(not(vz_compat))]
 static SERIAL_TX_LOCK: crate::sync::Spinlock<()> = crate::sync::Spinlock::new(());
-
-/// On vz_compat we cannot take a real lock; restrict console TX to the BSP.
-#[cfg(vz_compat)]
-fn vz_is_bsp() -> bool {
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        let mpidr: u64;
-        core::arch::asm!("mrs {}, MPIDR_EL1", out(reg) mpidr, options(nomem, nostack));
-        (mpidr & 0xFF) == 0
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    { true }
-}
 
 pub fn init() {
     unsafe {
@@ -275,9 +258,6 @@ pub fn init() {
 }
 
 pub fn putc(c: u8) {
-    #[cfg(vz_compat)]
-    if !vz_is_bsp() { return; }
-    #[cfg(not(vz_compat))]
     let _guard = SERIAL_TX_LOCK.lock();
     unsafe {
         #[cfg(target_arch = "x86_64")]
@@ -289,12 +269,9 @@ pub fn putc(c: u8) {
 }
 
 pub fn puts(s: &[u8]) {
-    #[cfg(vz_compat)]
-    if !vz_is_bsp() { return; }
     // Take the lock once around the whole string so multi-core log
     // lines don't interleave at byte granularity. RAII releases on
     // scope exit.
-    #[cfg(not(vz_compat))]
     let _guard = SERIAL_TX_LOCK.lock();
     for &c in s {
         if c == b'\n' { unsafe {

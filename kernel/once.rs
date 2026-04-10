@@ -6,11 +6,6 @@
 // pair so writes performed before `init` are visible to any reader that
 // observes the flag set.
 //
-// On `cfg(vz_compat)` the init guard degrades to load+store (VZ.framework
-// rejects atomic RMW on guest RAM). This is sound because every caller in
-// the kernel initialises its `InitOnce` on the BSP during single-threaded
-// boot.
-//
 // This is the `no_std` equivalent of `std::sync::OnceLock<T>` minus the
 // init-on-first-read closure (init is explicit) and minus poisoning.
 
@@ -38,41 +33,26 @@ impl<T> InitOnce<T> {
     }
 
     /// Initialise the cell with `v`. Panics if called more than once.
-    /// On QEMU/KVM uses `compare_exchange` so concurrent racing inits
-    /// are detected; on vz_compat (no atomic RMW) falls back to
-    /// load+store, which is sound because all callers init on the BSP
-    /// during single-threaded boot.
+    /// Uses `compare_exchange` so concurrent racing inits are detected
+    /// at runtime; only the first caller wins.
     pub fn init(&self, v: T) {
-        #[cfg(not(vz_compat))]
+        // Race-free claim: only the first caller wins; the loser
+        // panics rather than silently dropping its value.
+        if self
+            .initialized
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
         {
-            // Race-free claim: only the first caller wins; the loser
-            // panics rather than silently dropping its value.
-            if self
-                .initialized
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                panic!("InitOnce::init called twice");
-            }
-            // SAFETY: we just claimed the slot; no other writer can race.
-            unsafe { (*self.value.get()).write(v); }
-            // Republish via release fence so the value write is visible
-            // before any subsequent acquire-load on `initialized`. The
-            // CAS above already had AcqRel ordering, but we need the
-            // value write to happen-before subsequent loads of
-            // `initialized`. Re-store to publish.
-            self.initialized.store(true, Ordering::Release);
+            panic!("InitOnce::init called twice");
         }
-        #[cfg(vz_compat)]
-        {
-            if self.initialized.load(Ordering::Acquire) {
-                panic!("InitOnce::init called twice");
-            }
-            // SAFETY: vz_compat boots APs sequentially; init runs on the
-            // BSP before APs start.
-            unsafe { (*self.value.get()).write(v); }
-            self.initialized.store(true, Ordering::Release);
-        }
+        // SAFETY: we just claimed the slot; no other writer can race.
+        unsafe { (*self.value.get()).write(v); }
+        // Republish via release fence so the value write is visible
+        // before any subsequent acquire-load on `initialized`. The
+        // CAS above already had AcqRel ordering, but we need the
+        // value write to happen-before subsequent loads of
+        // `initialized`. Re-store to publish.
+        self.initialized.store(true, Ordering::Release);
     }
 
     /// Get a shared reference to the initialised value. Panics if
