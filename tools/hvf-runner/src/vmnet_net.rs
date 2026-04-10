@@ -139,6 +139,10 @@ pub fn process_tx() {
 
         // Queue frames for the IO thread (which owns the vmnet interface).
         TX_OUTBOUND.lock().unwrap().extend(frames);
+        // Wake the IO thread to drain TX immediately.
+        if let Some(ref tx) = *TX_WAKE.lock().unwrap() {
+            let _ = tx.try_send(());
+        }
 
         // Interrupt the guest.
         unsafe { hvf::hv_gic_set_spi(35, true); }
@@ -157,41 +161,78 @@ static TX_OUTBOUND: Mutex<VecDeque<Vec<u8>>> = Mutex::new(VecDeque::new());
 /// vCPU ID for hv_vcpus_exit kicks. Set by the vCPU thread before run().
 pub static VCPU_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Background thread: reads frames from vmnet, buffers them, and kicks
-/// the vCPU so check_rx() runs.
+/// Channel sender to wake the IO thread when TX frames are queued.
+static TX_WAKE: Mutex<Option<std::sync::mpsc::SyncSender<()>>> = Mutex::new(None);
+
+/// Background IO thread: event-driven read from vmnet + drain TX queue.
+///
+/// Uses vmnet's PACKETS_AVAILABLE event callback (via GCD dispatch queue)
+/// to wake only when data is available, instead of busy-polling. This
+/// eliminates the ~100ms latency caused by yield_now() scheduler jitter.
 fn rx_notify_loop() {
     let mut buf = [0u8; 2048];
     // Take ownership of the vmnet interface — only this thread touches it.
     let mut iface = IFACE.lock().unwrap().take().unwrap();
 
+    // Unified wake channel: vmnet RX callback and TX path both signal here.
+    let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel::<()>(1);
+
+    // Register event callback: vmnet signals us when packets are available.
+    let rx_wake = wake_tx.clone();
+    iface.0.set_event_callback(vmnet::Events::PACKETS_AVAILABLE, move |_, _| {
+        let _ = rx_wake.try_send(());
+    }).expect("set_event_callback failed");
+
+    // Store the TX sender so process_tx() can wake us.
+    *TX_WAKE.lock().unwrap() = Some(wake_tx);
+
+    let mut io_count: u64 = 0;
+
     loop {
+        io_count += 1;
+
         // 1. Drain TX outbound queue → write to vmnet.
         {
             let mut txq = TX_OUTBOUND.lock().unwrap();
             while let Some(frame) = txq.pop_front() {
+                let t = std::time::Instant::now();
                 let _ = iface.0.write(&frame);
+                if io_count <= 50 {
+                    eprintln!("(io) vmnet_write: {:?}", t.elapsed());
+                }
             }
         }
 
-        // 2. Read from vmnet.
-        let n = match iface.0.read(&mut buf) {
-            Ok(n) if n > 0 => n,
-            _ => {
-                std::thread::yield_now();
-                continue;
+        // 2. Read ALL available packets from vmnet (non-blocking).
+        let mut got_any = false;
+        loop {
+            let t = std::time::Instant::now();
+            match iface.0.read(&mut buf) {
+                Ok(n) if n > 0 => {
+                    if io_count <= 50 {
+                        eprintln!("(io) vmnet_read({n}B): {:?}", t.elapsed());
+                    }
+                    snoop_dhcp_ack(&buf[..n]);
+                    RX_PENDING.lock().unwrap().push_back(buf[..n].to_vec());
+                    got_any = true;
+                }
+                _ => break,
             }
-        };
+        }
 
-        // Snoop DHCP ACK to learn VM's IP and set up port forwarding.
-        snoop_dhcp_ack(&buf[..n]);
+        if got_any {
+            let vcpu = VCPU_ID.load(std::sync::atomic::Ordering::Relaxed);
+            if vcpu != 0 {
+                unsafe { hvf::hv_vcpus_exit(&vcpu as *const u64, 1); }
+            }
+            continue;
+        }
 
-        // Buffer the frame.
-        RX_PENDING.lock().unwrap().push_back(buf[..n].to_vec());
-
-        // Kick the vCPU so it exits and check_rx() runs.
-        let vcpu = VCPU_ID.load(std::sync::atomic::Ordering::Relaxed);
-        if vcpu != 0 {
-            unsafe { hvf::hv_vcpus_exit(&vcpu as *const u64, 1); }
+        // 3. Block until woken by RX event callback or TX queue.
+        let t = std::time::Instant::now();
+        let _ = wake_rx.recv();
+        if io_count <= 50 {
+            eprintln!("(io) wake after {:?}", t.elapsed());
         }
     }
 }

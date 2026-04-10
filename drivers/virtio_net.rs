@@ -692,7 +692,11 @@ fn irq_handler(_irq: u32) {
             #[cfg(target_arch = "aarch64")]
             Transport::Mmio { base, .. } => {
                 let isr = virtio_read32(base + MMIO_INTERRUPT_STATUS);
-                virtio_write32(base + MMIO_INTERRUPT_ACK, isr);
+                // Extract used_idx packed in upper 16 bits (HVF extension).
+                if (*ndev()).rx_queues[0].used_idx_mmio {
+                    (*ndev()).rx_queues[0].mmio_cached_used_idx = (isr >> 16) as u16;
+                }
+                virtio_write32(base + MMIO_INTERRUPT_ACK, isr & 0xFFFF);
             }
             #[cfg(target_arch = "x86_64")]
             Transport::LegacyPci { base, .. } => {

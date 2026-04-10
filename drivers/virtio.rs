@@ -658,8 +658,14 @@ impl Virtqueue {
         Some((id, len))
     }
 
-    pub fn has_used(&self) -> bool {
-        self.last_used_idx != self.used_idx()
+    pub fn has_used(&mut self) -> bool {
+        if self.used_idx_mmio {
+            // Read INTERRUPT_STATUS to get fresh used_idx from device.
+            self.poll_interrupt_status();
+            self.last_used_idx != self.mmio_cached_used_idx
+        } else {
+            self.last_used_idx != self.used_idx()
+        }
     }
 
     pub fn enable_interrupts(&mut self) {
