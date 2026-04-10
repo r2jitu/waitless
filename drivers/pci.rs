@@ -271,14 +271,18 @@ fn init_inner() {
     #[cfg(target_arch = "aarch64")]
     {
         let fdt = fdt::info();
-        let ecam = if fdt.pcie_ecam_base != 0 {
-            if fdt.pcie_ecam_base >= 0x1_0000_0000 {
-                map_device_range(fdt.pcie_ecam_base, fdt.pcie_ecam_size);
-            }
-            fdt.pcie_ecam_base
-        } else {
-            ECAM_BASE_DEFAULT
-        };
+        if fdt.pcie_ecam_base == 0 {
+            // No PCI host bridge in FDT — skip the bus scan entirely.
+            // This is normal for virtio-mmio-only platforms (Firecracker,
+            // custom HVF runner). The virtio-net init will find devices
+            // via FDT virtio-mmio nodes instead.
+            log(b"[PCI] No ECAM in FDT, skipping\n");
+            return;
+        }
+        let ecam = fdt.pcie_ecam_base;
+        if ecam >= 0x1_0000_0000 {
+            map_device_range(ecam, fdt.pcie_ecam_size);
+        }
         G_ECAM_BASE.init(ecam);
         if fdt.pci_mmio32_base != 0 {
             // Reserve the first 4 MB of the PCI MMIO32 window for the

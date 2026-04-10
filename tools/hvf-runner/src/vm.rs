@@ -68,8 +68,26 @@ impl Vm {
         // that guarantees no stage-2 fault from any normal-cached access.
         let ram_mapped = 1024 * 1024 * 1024; // 1 GB
 
-        // 1. Create the VM.
-        check(unsafe { hv_vm_create(ptr::null_mut()) })
+        // 1. Create the VM with a large enough IPA space.
+        // The kernel's PCI ECAM fallback is at 0x4010000000 (274 GB),
+        // which requires at least 39-bit IPA. Use a VM config to
+        // request sufficient IPA size.
+        let vm_cfg = unsafe { hv_vm_config_create() };
+        if !vm_cfg.is_null() {
+            // Query and set max IPA size.
+            let mut max_ipa: u32 = 0;
+            let mut default_ipa: u32 = 0;
+            unsafe {
+                hv_vm_config_get_max_ipa_size(&mut max_ipa);
+                hv_vm_config_get_default_ipa_size(&mut default_ipa);
+            }
+            eprintln!("(debug) IPA: default={default_ipa} max={max_ipa}");
+            if max_ipa > default_ipa {
+                let rc = unsafe { hv_vm_config_set_ipa_size(vm_cfg, max_ipa) };
+                eprintln!("(debug) set IPA size to {max_ipa}: rc={rc}");
+            }
+        }
+        check(unsafe { hv_vm_create(vm_cfg) })
             .map_err(|e| format!("hv_vm_create: {e}"))?;
 
         // 2. Allocate guest RAM.
@@ -89,6 +107,25 @@ impl Vm {
             )
         })
         .map_err(|e| format!("hv_vm_map: {e}"))?;
+
+        // 3b. Map a 1 MB region at the default PCIe ECAM address so the
+        // kernel's PCI bus scan (which falls back to ECAM_BASE_DEFAULT =
+        // 0x4010000000 when no PCI node is in the FDT) reads all zeros
+        // instead of faulting on unmapped IPA. The scan finds no devices
+        // and completes harmlessly. This is cheaper than adding a full
+        // PCI node to the FDT.
+        let ecam_size: usize = 1024 * 1024; // 1 MB
+        let mut ecam_ptr: *mut c_void = ptr::null_mut();
+        let rc = unsafe { hv_vm_allocate(&mut ecam_ptr, ecam_size, 0) };
+        eprintln!("(debug) ECAM alloc: rc={rc} ptr={ecam_ptr:?}");
+        if rc == HV_SUCCESS && !ecam_ptr.is_null() {
+            unsafe { ptr::write_bytes(ecam_ptr as *mut u8, 0xff, ecam_size); }
+            let rc = unsafe {
+                hv_vm_map(ecam_ptr, 0x40_1000_0000, ecam_size,
+                          HV_MEMORY_READ | HV_MEMORY_WRITE)
+            };
+            eprintln!("(debug) ECAM map at 0x4010000000: rc={rc}");
+        }
 
         // 4. Create native vGIC (must be before vCPU creation).
         let gic_cfg = unsafe { hv_gic_config_create() };
@@ -306,9 +343,6 @@ impl Vm {
             let offset = fault_ipa - PL011_BASE;
             if access.is_write {
                 let val = if access.rt == 31 { 0 } else { self.get_reg(HvReg::gpr(access.rt as u32)) };
-                if exit_count <= 500 && offset == 0 {
-                    eprintln!("(debug) PL011 DR write: 0x{:02x} = {:?}", val as u8, val as u8 as char);
-                }
                 pl011::mmio_write(offset, access.size, val);
             } else {
                 let val = pl011::mmio_read(offset, access.size);

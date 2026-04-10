@@ -209,9 +209,14 @@ unsafe extern "C" {
     ) -> hv_return_t;
     pub fn hv_vm_deallocate(uva: *mut c_void, size: usize) -> hv_return_t;
 
-    // VM configuration object — used to opt into EL2 guest support and
-    // (on macOS 26+) to select the stage-2 IPA granule.
+    // VM configuration object.
     pub fn hv_vm_config_create() -> hv_vm_config_t;
+    pub fn hv_vm_config_get_max_ipa_size(out: *mut u32) -> hv_return_t;
+    pub fn hv_vm_config_get_default_ipa_size(out: *mut u32) -> hv_return_t;
+    pub fn hv_vm_config_set_ipa_size(
+        config: hv_vm_config_t,
+        ipa_bit_length: u32,
+    ) -> hv_return_t;
     pub fn hv_vm_config_get_el2_supported(out: *mut bool) -> hv_return_t;
     pub fn hv_vm_config_set_el2_enabled(
         config: hv_vm_config_t,
@@ -220,7 +225,7 @@ unsafe extern "C" {
     pub fn hv_vm_config_get_default_ipa_granule(out: *mut u32) -> hv_return_t;
     pub fn hv_vm_config_set_ipa_granule(
         config: hv_vm_config_t,
-        granule: u32, // HV_IPA_GRANULE_4KB = 0, HV_IPA_GRANULE_16KB = 1
+        granule: u32,
     ) -> hv_return_t;
 
     // vCPU lifecycle
