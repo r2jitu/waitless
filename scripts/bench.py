@@ -117,6 +117,40 @@ def run_wrk_parallel(port, endpoint, threads, conns, duration, instances):
 
 
 def run_udp(port, senders, duration):
+    """Run UDP echo benchmark using the compiled C client.
+
+    The C client (scripts/udp_bench) uses fork() for parallelism,
+    avoiding the Python GIL that throttled the old threading-based
+    implementation to ~50k pkt/s regardless of sender count. The C
+    client also collects a per-packet latency histogram from sender 0.
+
+    Falls back to the old Python implementation if the C binary isn't
+    found (first run before compilation).
+    """
+    udp_bin = os.path.join(SCRIPT_DIR, "udp_bench")
+    if not os.path.isfile(udp_bin):
+        # Try to compile it.
+        src = os.path.join(SCRIPT_DIR, "udp_bench.c")
+        if os.path.isfile(src):
+            subprocess.run(["cc", "-O2", "-o", udp_bin, src],
+                           capture_output=True, timeout=30)
+
+    if os.path.isfile(udp_bin):
+        try:
+            r = subprocess.run(
+                [udp_bin, str(port), str(senders), str(duration)],
+                capture_output=True, text=True, timeout=duration + 30)
+            for line in r.stdout.split("\n"):
+                if line.startswith("RESULT "):
+                    parts = line.split()
+                    pps = float(parts[1])
+                    p50 = f"{int(parts[2])}us"
+                    p99 = f"{int(parts[3])}us"
+                    return pps, p50, p99
+        except Exception:
+            pass
+
+    # Fallback: old Python implementation (GIL-limited).
     recv = [0] * senders
     def sender(idx):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -132,11 +166,9 @@ def run_udp(port, senders, duration):
                 pass
         s.close()
     threads = [threading.Thread(target=sender, args=(i,)) for i in range(senders)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    return sum(recv) / duration
+    for t in threads: t.start()
+    for t in threads: t.join()
+    return sum(recv) / duration, "", ""
 
 
 # ── Environment runners ──────────────────────────────────────────────────────
@@ -503,9 +535,9 @@ def main():
                     results[(env_name, cpus, wname)] = (rps, p50, p99)
                     print(f"    {wname:<20s} {rps:>10.0f} req/s  p50={p50}  p99={p99}")
                 else:
-                    pps = run_udp(port + 1, w["conns"], duration)
-                    results[(env_name, cpus, wname)] = (pps, "", "")
-                    print(f"    {wname:<20s} {pps:>10.0f} pkt/s")
+                    pps, p50, p99 = run_udp(port + 1, w["conns"], duration)
+                    results[(env_name, cpus, wname)] = (pps, p50, p99)
+                    print(f"    {wname:<20s} {pps:>10.0f} pkt/s  p50={p50}  p99={p99}")
 
                 env.stop(proc)
                 _current["proc"] = None

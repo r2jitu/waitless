@@ -26,3 +26,4 @@ rust-project.json
 .cache/
 scripts/run-vz
 bench/webserver_native
+scripts/udp_bench
