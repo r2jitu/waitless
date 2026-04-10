@@ -464,10 +464,20 @@ pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
     // Process FIN
     if flags & TCP_FIN != 0 {
         c.rcv_nxt = c.rcv_nxt.wrapping_add(1);
-        // Send FIN+ACK to close our side immediately, then free.
-        // This is aggressive but prevents connection pool exhaustion.
-        send_segment(src_ip, dst_port, src_port, c.snd_nxt, c.rcv_nxt, TCP_FIN | TCP_ACK, &[]);
-        free_connection(core, slot);
+        send_segment(src_ip, dst_port, src_port, c.snd_nxt, c.rcv_nxt, TCP_ACK, &[]);
+
+        match c.state {
+            TcpState::Established | TcpState::SynReceived => {
+                c.state = TcpState::CloseWait;
+            }
+            TcpState::FinWait1 => {
+                free_connection(core, slot);
+            }
+            TcpState::FinWait2 => {
+                free_connection(core, slot);
+            }
+            _ => {}
+        }
     }
 }
 
