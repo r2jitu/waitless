@@ -1088,3 +1088,16 @@ pub fn arm_rx_interrupts() {
 pub fn has_pending_rx() -> bool {
     unsafe { (*ndev()).rx_queues[0].has_used() }
 }
+
+/// Enable deferred TX kick mode. After this, kick() on the TX queue
+/// is a no-op; the caller must call flush_tx_kick() to issue the
+/// actual MMIO write. Batches multiple send_segment() calls into
+/// one virtio notification, reducing MMIO exits.
+pub fn enable_deferred_tx_kick() {
+    unsafe { (*ndev()).tx_queues[0].set_deferred_kick(true); }
+}
+
+/// Flush deferred TX kick — issues one MMIO notify for all batched TX.
+pub fn flush_tx_kick() {
+    unsafe { (*ndev()).tx_queues[0].flush_kick(); }
+}

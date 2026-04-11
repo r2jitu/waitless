@@ -222,6 +222,9 @@ pub fn init_eventloop() {
     kernel::eventloop::set_net_poll(net_poll_cb);
     kernel::eventloop::set_net_drain(net_drain_cb);
     kernel::eventloop::set_net_flush(net_flush_cb);
+    // Batch TX kicks: defer MMIO writes until net_flush_cb, reducing
+    // exits per HTTP response from N segments to 1 notification.
+    drivers::virtio_net::enable_deferred_tx_kick();
 }
 
 fn net_poll_cb(_core_id: u32) -> bool {
@@ -250,6 +253,7 @@ fn net_drain_cb(core_id: u32) -> bool {
 
 fn net_flush_cb() {
     drivers::virtio_net::flush_tx_staging();
+    drivers::virtio_net::flush_tx_kick();
 }
 
 fn fmt_u32(buf: &mut [u8], mut val: u32) -> usize {

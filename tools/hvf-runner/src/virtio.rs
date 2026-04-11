@@ -229,18 +229,8 @@ impl VirtioNet {
             }
             INTERRUPT_ACK => {
                 self.interrupt_status &= !value;
-                // Deassert SPI only if no more RX frames are pending.
-                // If RX_PENDING has frames, keep SPI asserted so the
-                // guest re-enters the IRQ handler immediately and
-                // check_rx can inject them.
                 if self.interrupt_status == 0 {
-                    let has_pending = !crate::vmnet_net::rx_pending_empty();
-                    if !has_pending {
-                        unsafe { crate::hvf::hv_gic_set_spi(35, false); }
-                    } else {
-                        // Re-assert interrupt for the next handler invocation.
-                        self.interrupt_status |= 1;
-                    }
+                    unsafe { crate::hvf::hv_gic_set_spi(35, false); }
                 }
             }
             QUEUE_NOTIFY => {

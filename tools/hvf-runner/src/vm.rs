@@ -220,12 +220,6 @@ impl Vm {
     /// Run the vCPU until the guest executes PSCI SYSTEM_OFF or an
     /// unrecoverable error occurs.
     pub fn run(&mut self) -> Result<(), String> {
-        // Publish vCPU ID so the RX thread can kick us via hv_vcpus_exit.
-        crate::vmnet_net::VCPU_ID.store(
-            self.vcpu,
-            std::sync::atomic::Ordering::Release,
-        );
-
         let mut vtimer_masked = false;
         let mut vtimer_pending = false;
         // No host-side SPI timer — rely on vtimer + set_pending_interrupt.

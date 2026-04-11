@@ -418,6 +418,9 @@ pub(crate) struct Virtqueue {
     pub used_idx_mmio: bool,
     /// Cached used_idx from last poll_interrupt_status() call.
     pub mmio_cached_used_idx: u16,
+    /// Deferred kick: set by kick(), cleared by flush_kick().
+    /// Batches multiple add_buf+kick into a single MMIO notify write.
+    pub pending_kick: bool,
 }
 
 impl Virtqueue {
@@ -436,6 +439,7 @@ impl Virtqueue {
         event_idx: false,
         used_idx_mmio: false,
         mmio_cached_used_idx: 0,
+        pending_kick: false,
     };
 
     /// Allocate ring memory and set up descriptor free list.
@@ -598,15 +602,37 @@ impl Virtqueue {
     }
 
     /// Notify the device that new buffers are available.
-    pub fn kick(&self) {
+    /// For TX queues with pending_kick, defers the actual MMIO write
+    /// until flush_kick() — batching multiple segments into one exit.
+    pub fn kick(&mut self) {
+        if self.pending_kick {
+            // Already deferred — actual write happens in flush_kick().
+            return;
+        }
+        self.kick_now();
+    }
+
+    /// Immediate kick — always writes MMIO.
+    fn kick_now(&self) {
         dsb_st();
         if self.notify_addr != 0 {
-            // Modern PCI: write queue_index to MMIO notify address
             unsafe { ptr::write_volatile(self.notify_addr as *mut u16, self.queue_index); }
         } else if self.is_mmio {
             unsafe { virtio_write32(self.io_base + MMIO_QUEUE_NOTIFY, self.queue_index as u32); }
         } else {
             unsafe { virtio_write16(self.io_base + VREG_QUEUE_NOTIFY, self.queue_index); }
+        }
+    }
+
+    /// Enable deferred kick mode. kick() becomes a no-op until flush_kick().
+    pub fn set_deferred_kick(&mut self, defer: bool) {
+        self.pending_kick = defer;
+    }
+
+    /// Flush a deferred kick — issues one MMIO write for all batched buffers.
+    pub fn flush_kick(&mut self) {
+        if self.pending_kick {
+            self.kick_now();
         }
     }
 

@@ -264,6 +264,7 @@ fn send_segment(
     seq: u32,
     ack: u32,
     flags: u8,
+    window: u16,
     payload: &[u8],
 ) {
     let payload_len = payload.len().min(MSS);
@@ -280,7 +281,7 @@ fn send_segment(
         hdr.ack = htonl(ack);
         hdr.data_offset = 0x50;
         hdr.flags = flags;
-        hdr.window = htons(RX_BUF_SIZE as u16);
+        hdr.window = htons(window);
         hdr.checksum = 0;
         hdr.urgent = 0;
 
@@ -402,7 +403,7 @@ pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
         // Send SYN+ACK
         {
             let c = unsafe { &*conn_ptr(core, slot) };
-            send_segment(src_ip, dst_port, src_port, c.snd_nxt, c.rcv_nxt, TCP_SYN | TCP_ACK, &[]);
+            send_segment(src_ip, dst_port, src_port, c.snd_nxt, c.rcv_nxt, TCP_SYN | TCP_ACK, RX_BUF_SIZE as u16, &[]);
         }
         unsafe {
             let cp = conn_ptr(core, slot);
@@ -462,14 +463,14 @@ pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
         } else if seq_lt(seq, c.rcv_nxt) {
             // Duplicate/retransmitted segment — send ACK immediately so the
             // sender knows we already have this data (fast retransmit signal).
-            send_segment(src_ip, dst_port, src_port, c.snd_nxt, c.rcv_nxt, TCP_ACK, &[]);
+            send_segment(src_ip, dst_port, src_port, c.snd_nxt, c.rcv_nxt, TCP_ACK, c.rx_free() as u16, &[]);
         }
     }
 
     // Process FIN
     if flags & TCP_FIN != 0 {
         c.rcv_nxt = c.rcv_nxt.wrapping_add(1);
-        send_segment(src_ip, dst_port, src_port, c.snd_nxt, c.rcv_nxt, TCP_ACK, &[]);
+        send_segment(src_ip, dst_port, src_port, c.snd_nxt, c.rcv_nxt, TCP_ACK, c.rx_free() as u16, &[]);
 
         match c.state {
             TcpState::Established | TcpState::SynReceived => {
@@ -578,6 +579,7 @@ pub fn send(handle: *mut (), data: &[u8]) -> i32 {
             c.snd_nxt,
             c.rcv_nxt,
             TCP_ACK | TCP_PSH,
+            c.rx_free() as u16,
             &data[sent..sent + chunk],
         );
         c.snd_nxt = c.snd_nxt.wrapping_add(chunk as u32);
@@ -597,18 +599,15 @@ pub fn close(handle: *mut ()) {
         TcpState::Established => {
             send_segment(
                 c.remote_ip, c.local_port, c.remote_port,
-                c.snd_nxt, c.rcv_nxt, TCP_FIN | TCP_ACK, &[],
+                c.snd_nxt, c.rcv_nxt, TCP_FIN | TCP_ACK, 0, &[],
             );
             c.snd_nxt = c.snd_nxt.wrapping_add(1);
             c.state = TcpState::FinWait1;
         }
         TcpState::CloseWait => {
-            // Send FIN and immediately free the slot. Skip LastAck
-            // to prevent pool exhaustion. The client's final ACK
-            // will be silently ignored (no matching connection).
             send_segment(
                 c.remote_ip, c.local_port, c.remote_port,
-                c.snd_nxt, c.rcv_nxt, TCP_FIN | TCP_ACK, &[],
+                c.snd_nxt, c.rcv_nxt, TCP_FIN | TCP_ACK, 0, &[],
             );
             free_connection(core, slot);
             return;
