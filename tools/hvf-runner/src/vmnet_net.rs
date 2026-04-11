@@ -80,32 +80,56 @@ unsafe impl Send for SendIface {}
 /// Global vmnet interface, behind a Mutex because read/write need &mut.
 static IFACE: Mutex<Option<SendIface>> = Mutex::new(None);
 
-/// Start vmnet via a helper subprocess. Returns the MAC address.
-/// The helper owns the vmnet interface in a separate process to avoid
-/// GCD thread starvation from hv_vcpu_run in the parent.
+/// Start vmnet in-process. Returns the MAC address.
+/// A dedicated high-priority thread polls vmnet_read directly.
 pub fn start() -> Result<[u8; 6], String> {
-    let (mac_bytes, child_fd) = crate::vmnet_helper::spawn()?;
-    HELPER_FD.store(child_fd as usize, std::sync::atomic::Ordering::Release);
+    let iface = vmnet::Interface::new(
+        vmnet::mode::Mode::Host(Default::default()),
+        Default::default(),
+    ).map_err(|e| format!("vmnet::Interface::new: {e:?}"))?;
 
-    // Spawn RX reader thread: reads datagrams from the helper socket.
-    std::thread::spawn(move || {
+    let params: Vec<vmnet::parameters::Parameter> = iface.parameters().into();
+    let mut mac_bytes = [0u8; 6];
+    for p in &params {
+        if let vmnet::parameters::Parameter::MACAddress(ref s) = p {
+            let parts: Vec<&str> = s.split(':').collect();
+            if parts.len() == 6 {
+                for (i, part) in parts.iter().enumerate() {
+                    mac_bytes[i] = u8::from_str_radix(part, 16).unwrap_or(0);
+                }
+            }
+        }
+    }
+    for p in &params { eprintln!("(vmnet) {p:?}"); }
+
+    // Leak the interface for lock-free access from multiple threads.
+    let ptr = Box::into_raw(Box::new(SendIface(iface)));
+    IFACE_PTR.store(ptr as usize, std::sync::atomic::Ordering::Release);
+
+    // Spawn RX polling thread with real-time priority.
+    std::thread::spawn(|| {
+        extern "C" {
+            fn pthread_set_qos_class_self_np(qos: u32, rel: i32) -> i32;
+        }
+        unsafe { pthread_set_qos_class_self_np(0x21, 0); }
+
+        let iface = unsafe { &mut *(IFACE_PTR.load(std::sync::atomic::Ordering::Acquire) as *mut SendIface) };
         let mut buf = [0u8; 2048];
         loop {
-            let n = unsafe {
-                libc::recv(child_fd, buf.as_mut_ptr() as *mut _, buf.len(), 0)
-            };
-            if n <= 0 {
-                std::thread::sleep(std::time::Duration::from_micros(50));
-                continue;
-            }
-            let frame = &buf[..n as usize];
-            snoop_dhcp_ack(frame);
-            RX_PENDING.lock().unwrap().push_back(frame.to_vec());
-            // Kick the vCPU to run check_rx immediately.
-            unsafe { hvf::hv_gic_set_spi(35, true); }
-            let vcpu = VCPU_ID.load(std::sync::atomic::Ordering::Relaxed);
-            if vcpu != 0 {
-                unsafe { hvf::hv_vcpus_exit(&vcpu as *const u64, 1); }
+            match iface.0.read(&mut buf) {
+                Ok(n) if n > 0 => {
+                    let frame = &buf[..n];
+                    snoop_dhcp_ack(frame);
+                    RX_PENDING.lock().unwrap().push_back(frame.to_vec());
+                    unsafe { hvf::hv_gic_set_spi(35, true); }
+                    let vcpu = VCPU_ID.load(std::sync::atomic::Ordering::Relaxed);
+                    if vcpu != 0 {
+                        unsafe { hvf::hv_vcpus_exit(&vcpu as *const u64, 1); }
+                    }
+                }
+                _ => {
+                    std::thread::yield_now();
+                }
             }
         }
     });
@@ -186,13 +210,12 @@ pub fn process_tx() {
         unsafe { core::arch::asm!("dsb sy", options(nostack)); }
         drop(dev_lock);
 
-        // Send frames to the helper subprocess via Unix socket.
-        let fd = HELPER_FD.load(std::sync::atomic::Ordering::Acquire) as i32;
-        if fd > 0 {
+        // Write frames directly to vmnet.
+        let ptr = IFACE_PTR.load(std::sync::atomic::Ordering::Acquire);
+        if ptr != 0 {
+            let iface = unsafe { &mut *(ptr as *mut SendIface) };
             for frame in &frames {
-                unsafe {
-                    libc::send(fd, frame.as_ptr() as *const _, frame.len(), 0);
-                }
+                let _ = iface.0.write(frame);
             }
         }
 
@@ -205,8 +228,6 @@ pub fn process_tx() {
 /// vCPU thread to inject them via check_rx().
 static RX_PENDING: Mutex<VecDeque<Vec<u8>>> = Mutex::new(VecDeque::new());
 
-/// File descriptor for the helper subprocess socket.
-static HELPER_FD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Check if RX_PENDING has frames waiting.
 pub fn rx_pending_empty() -> bool {
