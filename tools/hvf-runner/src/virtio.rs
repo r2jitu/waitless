@@ -136,32 +136,16 @@ impl QueueSnapshot {
     }
 }
 
-/// RX queue snapshot, published after QUEUE_READY=1.
-static RX_SNAP: Mutex<QueueSnapshot> = Mutex::new(QueueSnapshot::EMPTY);
-/// TX queue snapshot.
-static TX_SNAP: Mutex<QueueSnapshot> = Mutex::new(QueueSnapshot::EMPTY);
+/// Queue snapshots — set once at QUEUE_READY, immutable after.
+static RX_SNAP: std::sync::OnceLock<QueueSnapshot> = std::sync::OnceLock::new();
+static TX_SNAP: std::sync::OnceLock<QueueSnapshot> = std::sync::OnceLock::new();
 
-/// Publish the RX queue snapshot for the IO thread.
-pub fn publish_rx_queue() {
-    let dev = DEVICE.lock().unwrap();
-    if let Some(d) = dev.as_ref() {
-        let q = &d.queues[0]; // RX queue
-        if q.ready {
-            *RX_SNAP.lock().unwrap() = QueueSnapshot {
-                ram_host: d.ram_host,
-                ram_base: d.ram_base,
-                desc_addr: q.desc_addr(),
-                avail_addr: q.avail_addr(),
-                used_addr: q.used_addr(),
-                qsize: q.num as u16,
-                ready: true,
-            };
-        }
-    }
+pub fn rx_queue_snapshot() -> QueueSnapshot {
+    RX_SNAP.get().copied().unwrap_or(QueueSnapshot::EMPTY)
 }
-
-pub fn rx_queue_snapshot() -> QueueSnapshot { *RX_SNAP.lock().unwrap() }
-pub fn tx_queue_snapshot() -> QueueSnapshot { *TX_SNAP.lock().unwrap() }
+pub fn tx_queue_snapshot() -> QueueSnapshot {
+    TX_SNAP.get().copied().unwrap_or(QueueSnapshot::EMPTY)
+}
 
 impl VirtioNet {
     pub fn new(mac: [u8; 6], ram_host: *mut u8, ram_base: u64) -> Self {
@@ -256,8 +240,8 @@ impl VirtioNet {
                             ready: true,
                         };
                         match qi {
-                            0 => { *RX_SNAP.lock().unwrap() = snap; }
-                            1 => { *TX_SNAP.lock().unwrap() = snap; }
+                            0 => { let _ = RX_SNAP.set(snap); }
+                            1 => { let _ = TX_SNAP.set(snap); }
                             _ => {}
                         }
                     }
