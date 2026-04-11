@@ -186,12 +186,10 @@ impl VirtioNet {
             }
             STATUS => self.status,
             INTERRUPT_STATUS => {
-                // Auto-deassert: return current status, then clear and
-                // deassert SPI. Guest with VIRTIO_F_HVF_OPT skips the
-                // INTERRUPT_ACK write, saving one MMIO exit per interrupt.
+                // SPI is edge-pulsed (assert+deassert) so it's already
+                // low when the guest reads this. Just return and clear.
                 let val = self.interrupt_status;
                 self.interrupt_status = 0;
-                unsafe { crate::hvf::hv_gic_set_spi(35, false); }
                 val
             }
             // Device config: MAC address at offset 0x100..0x105

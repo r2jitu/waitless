@@ -704,16 +704,16 @@ fn irq_handler(_irq: u32) {
             }
             #[cfg(target_arch = "aarch64")]
             Transport::Mmio { base, .. } => {
-                let isr = virtio_read32(base + MMIO_INTERRUPT_STATUS);
-                // Extract used_idx packed in upper 16 bits (HVF extension).
-                if (*ndev()).rx_queues[0].used_idx_mmio {
-                    (*ndev()).rx_queues[0].mmio_cached_used_idx = (isr >> 16) as u16;
-                }
-                // Signal that frames may be available for the poll path.
-                IRQ_PENDING.store(true, core::sync::atomic::Ordering::Release);
-                // HVF_OPT: host auto-deasserted SPI on the read above.
-                // Skip the ACK write to save one MMIO exit.
-                if !(*ndev()).hvf_opt {
+                if (*ndev()).hvf_opt {
+                    // HVF_OPT: host pulses SPI (edge-triggered), no ISR
+                    // read or ACK needed. Just signal the poll path.
+                    IRQ_PENDING.store(true, core::sync::atomic::Ordering::Release);
+                } else {
+                    let isr = virtio_read32(base + MMIO_INTERRUPT_STATUS);
+                    if (*ndev()).rx_queues[0].used_idx_mmio {
+                        (*ndev()).rx_queues[0].mmio_cached_used_idx = (isr >> 16) as u16;
+                    }
+                    IRQ_PENDING.store(true, core::sync::atomic::Ordering::Release);
                     virtio_write32(base + MMIO_INTERRUPT_ACK, isr & 0xFFFF);
                 }
             }

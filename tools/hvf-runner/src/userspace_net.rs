@@ -190,7 +190,7 @@ fn io_thread(listen_fd: i32, mac: [u8; 6]) {
             drop(replies);
             if any {
                 unsafe { core::arch::asm!("dsb sy", options(nostack)); }
-                unsafe { hvf::hv_gic_set_spi(35, true); }
+                unsafe { hvf::hv_gic_set_spi(35, true); hvf::hv_gic_set_spi(35, false); }
             }
         }
 
@@ -207,7 +207,7 @@ fn io_thread(listen_fd: i32, mac: [u8; 6]) {
             }
             if flushed {
                 unsafe { core::arch::asm!("dsb sy", options(nostack)); }
-                unsafe { hvf::hv_gic_set_spi(35, true); }
+                unsafe { hvf::hv_gic_set_spi(35, true); hvf::hv_gic_set_spi(35, false); }
             }
         }
 
@@ -339,7 +339,7 @@ fn io_thread(listen_fd: i32, mac: [u8; 6]) {
         }
         if injected {
             unsafe { core::arch::asm!("dsb sy", options(nostack)); }
-            unsafe { hvf::hv_gic_set_spi(35, true); }
+            unsafe { hvf::hv_gic_set_spi(35, true); hvf::hv_gic_set_spi(35, false); }
         }
 
         // Periodically clean up closed connections (state=2, host_fd=-1).
@@ -370,7 +370,7 @@ fn accept_connections(io: &mut IoState, snap: &virtio::QueueSnapshot) {
         if snap.ready {
             inject_frame(frame.as_slice(), snap, &mut io.rx_last);
             unsafe { core::arch::asm!("dsb sy", options(nostack)); }
-            unsafe { hvf::hv_gic_set_spi(35, true); }
+            unsafe { hvf::hv_gic_set_spi(35, true); hvf::hv_gic_set_spi(35, false); }
         } else { TX_REPLIES.lock().unwrap().push_back(frame); }
         CONNS.lock().unwrap().insert(src_port, ProxyConn {
             host_fd: client_fd, src_port, my_seq: 1001, peer_ack: 0,
