@@ -131,7 +131,7 @@ impl VirtioNet {
             VENDOR_ID => VIRTIO_VENDOR,
             DEVICE_FEATURES => {
                 match self.device_features_sel {
-                    0 => VIRTIO_NET_F_MAC | VIRTIO_F_USED_IDX_MMIO,
+                    0 => VIRTIO_NET_F_MAC, // No USED_IDX_MMIO — guest reads used->idx from RAM directly
                     1 => 1, // VIRTIO_F_VERSION_1 (bit 0 of word 1 = feature bit 32)
                     _ => 0,
                 }

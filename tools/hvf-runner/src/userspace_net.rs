@@ -352,6 +352,13 @@ fn io_thread(listen_fd: i32, mac: [u8; 6]) {
             if pollfds[i + 2].revents & (libc::POLLIN | libc::POLLHUP) == 0 { continue; }
             read_one_socket(&mut io, i, rx_ring);
         }
+
+        // 6. If we pushed any frames to the RX ring, assert SPI 35
+        // to wake the vCPU from WFI. Without this, the guest sleeps
+        // ~215µs in hv_vcpu_run() before waking up to poll.
+        if !rx_ring.is_empty() {
+            unsafe { crate::hvf::hv_gic_set_spi(35, true); }
+        }
     }
 }
 
