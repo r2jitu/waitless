@@ -136,6 +136,8 @@ impl QueueSnapshot {
 
 /// RX queue snapshot, published after QUEUE_READY=1.
 static RX_SNAP: Mutex<QueueSnapshot> = Mutex::new(QueueSnapshot::EMPTY);
+/// TX queue snapshot.
+static TX_SNAP: Mutex<QueueSnapshot> = Mutex::new(QueueSnapshot::EMPTY);
 
 /// Publish the RX queue snapshot for the IO thread.
 pub fn publish_rx_queue() {
@@ -156,10 +158,8 @@ pub fn publish_rx_queue() {
     }
 }
 
-/// Get the RX queue snapshot (for the IO thread).
-pub fn rx_queue_snapshot() -> QueueSnapshot {
-    *RX_SNAP.lock().unwrap()
-}
+pub fn rx_queue_snapshot() -> QueueSnapshot { *RX_SNAP.lock().unwrap() }
+pub fn tx_queue_snapshot() -> QueueSnapshot { *TX_SNAP.lock().unwrap() }
 
 impl VirtioNet {
     pub fn new(mac: [u8; 6], ram_host: *mut u8, ram_base: u64) -> Self {
@@ -244,10 +244,9 @@ impl VirtioNet {
                 let qi = self.queue_sel as usize;
                 if qi < NUM_QUEUES {
                     self.queues[qi].ready = value != 0;
-                    if qi == 0 && value != 0 {
-                        // RX queue ready — publish snapshot for IO thread.
-                        let q = &self.queues[0];
-                        *RX_SNAP.lock().unwrap() = QueueSnapshot {
+                    if value != 0 && qi < NUM_QUEUES {
+                        let q = &self.queues[qi];
+                        let snap = QueueSnapshot {
                             ram_host: self.ram_host,
                             ram_base: self.ram_base,
                             desc_addr: q.desc_addr(),
@@ -256,6 +255,11 @@ impl VirtioNet {
                             qsize: q.num as u16,
                             ready: true,
                         };
+                        match qi {
+                            0 => { *RX_SNAP.lock().unwrap() = snap; }
+                            1 => { *TX_SNAP.lock().unwrap() = snap; }
+                            _ => {}
+                        }
                     }
                 }
             }
