@@ -314,12 +314,6 @@ fn io_thread(listen_fd: i32, mac: [u8; 6]) {
             if !rx_ring.push(&frame) { break; }
         }
 
-        // After writing responses, immediately try to read new requests
-        // from ALL sockets (non-blocking). This eliminates the second
-        // poll() call that would otherwise add ~100µs of latency while
-        // waiting for wrk to send its next request.
-        read_all_sockets(&mut io, rx_ring);
-
         if ready <= 0 { continue; }
 
         // 4. Accept new connections.
