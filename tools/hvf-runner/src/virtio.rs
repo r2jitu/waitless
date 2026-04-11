@@ -123,7 +123,7 @@ impl VirtioNet {
     }
 
     /// Handle a guest MMIO read.
-    pub fn read(&self, offset: u64) -> u32 {
+    pub fn read(&mut self, offset: u64) -> u32 {
         match offset {
             MAGIC_VALUE => VIRTIO_MAGIC,
             VERSION => VIRTIO_VERSION_2,
@@ -143,9 +143,10 @@ impl VirtioNet {
             }
             STATUS => self.status,
             INTERRUPT_STATUS => {
-                // Pack RX used_idx into upper 16 bits when
-                // VIRTIO_F_USED_IDX_MMIO is negotiated. The guest
-                // extracts it without an extra MMIO exit.
+                // Guest is polling — inject all buffered RX frames first.
+                // Pass &mut self so flush_rx can access the device directly
+                // (we already hold DEVICE lock, can't re-lock).
+                crate::userspace_net::flush_rx_into(self);
                 self.interrupt_status | ((self.used_idx[0] as u32) << 16)
             }
             // Device config: MAC address at offset 0x100..0x105
