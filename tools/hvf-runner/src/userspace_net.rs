@@ -189,106 +189,51 @@ fn io_thread(listen_fd: i32, mac: [u8; 6]) {
             accept_connections(&mut io, &snap);
         }
 
-        // Zero-copy RX: snapshot conn info → release lock → read() into guest RAM.
-        const HDR_LEN: usize = VIRTIO_NET_HDR_SIZE + 14 + 20 + 20; // 66 bytes
-        const MAX_PAYLOAD: usize = 1460;
+        // Snapshot ready fds (brief lock), then read without lock.
+        let ready_fds: Vec<(u16, i32)> = {
+            let conns = CONNS.lock().unwrap();
+            (0..conns.len())
+                .filter(|&i| i + 1 < io.pollfds.len()
+                    && io.pollfds[i + 1].revents & (libc::POLLIN | libc::POLLHUP) != 0
+                    && conns[i].host_fd >= 0)
+                .map(|i| (conns[i].src_port, conns[i].host_fd))
+                .collect()
+        };
 
-        struct ConnSnap { port: u16, fd: i32, seq: u32, ack: u32 }
+        // Read from sockets (no lock held).
+        struct ReadResult { port: u16, data: Vec<u8>, eof: bool }
+        let mut reads: Vec<ReadResult> = Vec::new();
+        for &(port, fd) in &ready_fds {
+            let n = unsafe {
+                libc::read(fd, io.read_buf.as_mut_ptr() as *mut _, io.read_buf.len())
+            };
+            if n == 0 { reads.push(ReadResult { port, data: Vec::new(), eof: true }); }
+            else if n > 0 { reads.push(ReadResult { port, data: io.read_buf[..n as usize].to_vec(), eof: false }); }
+        }
+
+        // Process read results (brief lock for state updates, match by port).
         let mut injected = false;
-
-        if snap.ready {
-            // Brief lock: snapshot ready connections.
-            let snaps: Vec<ConnSnap> = {
-                let conns = CONNS.lock().unwrap();
-                (0..conns.len())
-                    .filter(|&i| i + 1 < io.pollfds.len()
-                        && io.pollfds[i + 1].revents & (libc::POLLIN | libc::POLLHUP) != 0
-                        && conns[i].host_fd >= 0 && conns[i].state == 1)
-                    .map(|i| ConnSnap {
-                        port: conns[i].src_port, fd: conns[i].host_fd,
-                        seq: conns[i].my_seq, ack: conns[i].peer_ack,
-                    })
-                    .collect()
-            }; // lock released
-
-            // Read directly into guest descriptor buffers (no lock held).
-            struct RxResult { port: u16, seq_advance: u32, eof: bool }
-            let mut results: Vec<RxResult> = Vec::new();
-
-            for cs in &snaps {
-                let avail_idx = unsafe {
-                    core::ptr::read_volatile(snap.gpa_to_host(snap.avail_addr + 2) as *const u16)
-                };
-                if io.rx_last == avail_idx { break; } // ring full
-                let ring_idx = io.rx_last & (snap.qsize - 1);
-                let desc_idx = unsafe {
-                    core::ptr::read_volatile(
-                        snap.gpa_to_host(snap.avail_addr + 4 + ring_idx as u64 * 2) as *const u16)
-                };
-                let buf_addr = unsafe {
-                    core::ptr::read_unaligned(
-                        snap.gpa_to_host(snap.desc_addr + desc_idx as u64 * 16) as *const u64)
-                };
-                let guest_buf = snap.gpa_to_host(buf_addr);
-
-                // read() payload directly into guest RAM.
-                let payload_ptr = unsafe { guest_buf.add(HDR_LEN) };
-                let n = unsafe { libc::read(cs.fd, payload_ptr as *mut _, MAX_PAYLOAD) };
-                if n <= 0 {
-                    if n == 0 { results.push(RxResult { port: cs.port, seq_advance: 0, eof: true }); }
-                    continue;
-                }
-                let payload_len = n as usize;
-
-                // Write headers around the payload already in guest RAM.
-                let total = write_tcp_frame_around_payload(
-                    guest_buf, &GUEST_MAC, GW_IP, VM_IP,
-                    cs.port, 80, cs.seq, cs.ack, 0x18, payload_len);
-
-                // Update used ring.
-                let used_idx = io.rx_last;
-                unsafe {
-                    let entry = snap.gpa_to_host(snap.used_addr + 4 + (used_idx & (snap.qsize - 1)) as u64 * 8);
-                    core::ptr::write_unaligned(entry as *mut u32, desc_idx as u32);
-                    core::ptr::write_unaligned(entry.add(4) as *mut u32, total as u32);
-                    core::ptr::write_volatile(snap.gpa_to_host(snap.used_addr + 2) as *mut u16,
-                        used_idx.wrapping_add(1));
-                }
-                io.rx_last = io.rx_last.wrapping_add(1);
-                results.push(RxResult { port: cs.port, seq_advance: payload_len as u32, eof: false });
-                injected = true;
-            }
-
-            // Brief lock: update seq counters and handle EOFs.
-            if !results.is_empty() {
-                let mut conns = CONNS.lock().unwrap();
-                for r in &results {
-                    if let Some(c) = conns.iter_mut().find(|c| c.src_port == r.port) {
-                        if r.eof {
-                            let frame = build_tcp_frame(&GUEST_MAC, GW_IP, VM_IP,
-                                c.src_port, 80, c.my_seq, c.peer_ack, 0x11, &[]);
-                            c.my_seq = c.my_seq.wrapping_add(1);
-                            c.state = 2;
-                            inject_frame(&frame, &snap, &mut io.rx_last);
-                            injected = true;
-                        } else {
-                            c.my_seq = c.my_seq.wrapping_add(r.seq_advance);
-                        }
-                    }
-                }
-            }
-        } else {
-            // RX queue not ready — buffer in pending.
+        if !reads.is_empty() {
             let mut conns = CONNS.lock().unwrap();
-            for i in 0..conns.len() {
-                if i + 1 >= io.pollfds.len() { break; }
-                if io.pollfds[i + 1].revents & (libc::POLLIN | libc::POLLHUP) == 0 { continue; }
-                let c = &mut conns[i];
-                if c.host_fd < 0 { continue; }
-                let n = unsafe {
-                    libc::read(c.host_fd, io.read_buf.as_mut_ptr() as *mut _, io.read_buf.len())
+            for r in &reads {
+                let c = match conns.iter_mut().find(|c| c.src_port == r.port) {
+                    Some(c) => c, None => continue,
                 };
-                if n > 0 { c.pending.extend_from_slice(&io.read_buf[..n as usize]); }
+                if r.eof {
+                    if c.state == 1 {
+                        let frame = build_tcp_frame(&GUEST_MAC, GW_IP, VM_IP,
+                            c.src_port, 80, c.my_seq, c.peer_ack, 0x11, &[]);
+                        c.my_seq = c.my_seq.wrapping_add(1);
+                        c.state = 2;
+                        if snap.ready { inject_frame(&frame, &snap, &mut io.rx_last); injected = true; }
+                        else { io.reply_queue.push_back(frame); }
+                    }
+                } else if c.state == 1 && snap.ready {
+                    inject_data_frames(c, &r.data, &GUEST_MAC, &snap, &mut io.rx_last, &mut io.frame_buf);
+                    injected = true;
+                } else {
+                    c.pending.extend_from_slice(&r.data);
+                }
             }
         }
         if injected {
@@ -593,60 +538,6 @@ fn write_tcp_frame(buf: &mut [u8], dst_mac: &[u8; 6], src_ip: [u8; 4], dst_ip: [
     buf[ts+16] = (tc >> 8) as u8; buf[ts+17] = (tc & 0xff) as u8;
 
     total
-}
-
-/// Write TCP frame headers around payload already at buf[66..66+payload_len].
-/// The payload was read() directly into guest RAM; we just write headers before it.
-/// Returns total frame length.
-fn write_tcp_frame_around_payload(buf: *mut u8, dst_mac: &[u8; 6],
-    src_ip: [u8; 4], dst_ip: [u8; 4], src_port: u16, dst_port: u16,
-    seq: u32, ack: u32, flags: u8, payload_len: usize) -> usize {
-    let tcp_len = 20 + payload_len;
-    let ip_total = 20 + tcp_len;
-    let total = VIRTIO_NET_HDR_SIZE + 14 + ip_total;
-    // Write into guest RAM via raw pointer (payload is already there).
-    let b = unsafe { std::slice::from_raw_parts_mut(buf, VIRTIO_NET_HDR_SIZE + 14 + 20 + 20) };
-    write_tcp_frame_headers(b, dst_mac, src_ip, dst_ip, src_port, dst_port,
-        seq, ack, flags, ip_total, tcp_len);
-    // Compute TCP checksum over header + payload.
-    let tcp_start = VIRTIO_NET_HDR_SIZE + 14 + 20;
-    let tcp_seg = unsafe { std::slice::from_raw_parts(buf.add(tcp_start), tcp_len) };
-    let tc = tcp_checksum(&src_ip, &dst_ip, tcp_seg);
-    unsafe {
-        *buf.add(tcp_start + 16) = (tc >> 8) as u8;
-        *buf.add(tcp_start + 17) = (tc & 0xff) as u8;
-    }
-    total
-}
-
-/// Write just the headers (virtio + eth + ip + tcp) into buf[..66].
-/// Does NOT write payload (caller handles that). Sets checksum placeholders.
-fn write_tcp_frame_headers(buf: &mut [u8], dst_mac: &[u8; 6],
-    src_ip: [u8; 4], dst_ip: [u8; 4], src_port: u16, dst_port: u16,
-    seq: u32, ack: u32, flags: u8, ip_total: usize, tcp_len: usize) {
-    buf[..VIRTIO_NET_HDR_SIZE].fill(0);
-    let mut o = VIRTIO_NET_HDR_SIZE;
-    buf[o..o+6].copy_from_slice(dst_mac); o += 6;
-    buf[o..o+6].copy_from_slice(&GW_MAC); o += 6;
-    buf[o..o+2].copy_from_slice(&0x0800u16.to_be_bytes()); o += 2;
-    let is = o;
-    buf[o] = 0x45; buf[o+1] = 0; o += 2;
-    buf[o..o+2].copy_from_slice(&(ip_total as u16).to_be_bytes()); o += 2;
-    buf[o..o+4].copy_from_slice(&[0,0,0x40,0]); o += 4;
-    buf[o] = 64; buf[o+1] = 6; o += 2;
-    buf[o..o+2].fill(0); o += 2;
-    buf[o..o+4].copy_from_slice(&src_ip); o += 4;
-    buf[o..o+4].copy_from_slice(&dst_ip); o += 4;
-    let cs = ipv4_checksum(&buf[is..is+20]);
-    buf[is+10] = (cs >> 8) as u8; buf[is+11] = (cs & 0xff) as u8;
-    let ts = o;
-    buf[o..o+2].copy_from_slice(&src_port.to_be_bytes()); o += 2;
-    buf[o..o+2].copy_from_slice(&dst_port.to_be_bytes()); o += 2;
-    buf[o..o+4].copy_from_slice(&seq.to_be_bytes()); o += 4;
-    buf[o..o+4].copy_from_slice(&ack.to_be_bytes()); o += 4;
-    buf[o] = 0x50; buf[o+1] = flags; o += 2;
-    buf[o..o+2].copy_from_slice(&0xffffu16.to_be_bytes()); o += 2;
-    buf[o..o+4].fill(0); // checksum + urgent (filled later)
 }
 
 /// Allocating wrapper — used for TX_REPLIES (queued frames need ownership).
