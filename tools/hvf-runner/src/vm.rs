@@ -141,10 +141,7 @@ impl Vm {
         let ram_mapped = 1024 * 1024 * 1024; // 1 GB
 
         // Determine vCPU count: performance cores, capped at 4.
-        // Multi-core + multi-queue: IO thread must distribute RX across
-        // all queue pairs for full throughput. Currently injects into
-        // queue 0 only. Keep at 1 core until IO distribution is added.
-        let cpu_count = 1; // perf_core_count().min(MAX_VCPUS).min(4).max(1);
+        let cpu_count = perf_core_count().min(MAX_VCPUS).min(4).max(1);
         eprintln!("  vCPU count: {cpu_count}");
 
         // 1. Create the VM with a large enough IPA space.
@@ -206,16 +203,6 @@ impl Vm {
         check(unsafe { hv_gic_create(gic_cfg) })
             .map_err(|e| format!("hv_gic_create: {e}"))?;
 
-        // 4b. Route virtio SPI (INTID 35) to core 0 only.
-        // GICD_IROUTER for INTID N is at offset 0x6000 + N*8.
-        // Value 0x0 = Aff3:2:1:0 = 0:0:0:0 (core 0 specifically).
-        // Default is 0x80000000 (Interrupt_Routing_Mode=1, any PE).
-        if cpu_count > 1 {
-            let intid = 32 + VIRTIO_MMIO_SPI; // SPI 3 → INTID 35
-            let irouter_off = (0x6000 + intid * 8) as u32;
-            unsafe { hv_gic_set_distributor_reg(irouter_off, 0x0); }
-        }
-
         // 5. Create vCPU 0 only. Secondary vCPUs are created on their
         // own threads during PSCI CPU_ON — HVF requires hv_vcpu_create
         // to be called from the thread that will run the vCPU.
@@ -240,6 +227,16 @@ impl Vm {
                 exit_ptr: ptr::null_mut(),
                 running: AtomicBool::new(false),
             }));
+        }
+
+        // 5b. Route virtio SPI (INTID 35) to core 0 only so the interrupt
+        // doesn't broadcast to all cores (which causes WFI wake storms).
+        // GICD_IROUTER for INTID N is at offset 0x6000 + N*8.
+        // Value 0x0 = Aff0=0 (core 0). Default 0x80000000 = any PE.
+        if cpu_count > 1 {
+            let intid = 32 + VIRTIO_MMIO_SPI; // SPI 3 → INTID 35
+            let irouter_off = (0x6000 + intid * 8) as u32;
+            unsafe { hv_gic_set_distributor_reg(irouter_off, 0x0); }
         }
 
         // 6. Query the redistributor base HVF assigned (for the FDT).

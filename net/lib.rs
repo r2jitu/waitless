@@ -100,10 +100,16 @@ fn poll_tier2(num_cores: u32) -> bool {
     let had_frames = count > 0;
     if had_frames {
         FRAMES_DISTRIBUTED.fetch_add(count as u64, core::sync::atomic::Ordering::Relaxed);
-        let any_wakeup = (1..num_cores as usize)
-            .any(|i| WAKEUP[i].load(core::sync::atomic::Ordering::Relaxed));
-        if any_wakeup {
-            kernel::wake_cores();
+        // Wake only the specific cores that received inbox data.
+        // Broadcast wake_cores() is expensive on HVF: each SGI causes
+        // a WFI wake (~5µs) on every core, even if it has no work.
+        for i in 1..num_cores as usize {
+            if WAKEUP[i].load(core::sync::atomic::Ordering::Relaxed) {
+                #[cfg(target_arch = "aarch64")]
+                kernel::aarch64::smp::send_sgi_to(i as u32);
+                #[cfg(target_arch = "x86_64")]
+                kernel::send_ipi(i as u32);
+            }
         }
     }
 
