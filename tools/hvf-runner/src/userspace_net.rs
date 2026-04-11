@@ -149,6 +149,9 @@ pub fn check_rx() {
             host_fd: client_fd, src_port, my_seq: 1001, peer_ack: 0,
             state: 0, pending: Vec::new(),
         });
+        // New connection — poll immediately to pick up wrk's request
+        // data that may already be in the kernel socket buffer.
+        net.poll_now = true;
     }
 
     // 2. Non-blocking read from active connections.
