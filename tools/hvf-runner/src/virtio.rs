@@ -46,10 +46,11 @@ const VIRTIO_VENDOR: u32 = 0x554d_4551; // "QEMU" — convention
 
 // Feature bits we offer (word 0 only; word 1 = VIRTIO_F_VERSION_1 implied by v2)
 const VIRTIO_NET_F_MAC: u32 = 1 << 5;
-// Vendor extension: device exposes per-queue used_idx at config offset 0x110.
-// Allows guests to read used_idx via MMIO trap instead of from shared RAM,
-// working around dcache coherency issues on Apple HVF.
-// VIRTIO_F_USED_IDX_MMIO removed — guest reads used->idx from RAM directly.
+// Vendor extension: HVF host-polling optimizations.
+// When negotiated, the host auto-deasserts SPI on INTERRUPT_STATUS read
+// (guest skips INTERRUPT_ACK write) and the host polls the RX avail ring
+// directly (guest skips RX kick). Saves 2+ MMIO exits per request.
+const VIRTIO_F_HVF_OPT: u32 = 1 << 25;
 
 // Status bits
 const STATUS_FEATURES_OK: u32 = 8;
@@ -173,7 +174,7 @@ impl VirtioNet {
             VENDOR_ID => VIRTIO_VENDOR,
             DEVICE_FEATURES => {
                 match self.device_features_sel {
-                    0 => VIRTIO_NET_F_MAC, // No USED_IDX_MMIO — guest reads used->idx from RAM directly
+                    0 => VIRTIO_NET_F_MAC | VIRTIO_F_HVF_OPT,
                     1 => 1, // VIRTIO_F_VERSION_1 (bit 0 of word 1 = feature bit 32)
                     _ => 0,
                 }
@@ -185,9 +186,13 @@ impl VirtioNet {
             }
             STATUS => self.status,
             INTERRUPT_STATUS => {
-                // IO thread injects RX frames directly into guest RAM.
-                // No flush needed here — used_idx is updated by IO thread.
-                self.interrupt_status
+                // Auto-deassert: return current status, then clear and
+                // deassert SPI. Guest with VIRTIO_F_HVF_OPT skips the
+                // INTERRUPT_ACK write, saving one MMIO exit per interrupt.
+                let val = self.interrupt_status;
+                self.interrupt_status = 0;
+                unsafe { crate::hvf::hv_gic_set_spi(35, false); }
+                val
             }
             // Device config: MAC address at offset 0x100..0x105
             off if off >= CONFIG_BASE && off < CONFIG_BASE + 8 => {

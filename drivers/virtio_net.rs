@@ -22,7 +22,7 @@ use crate::virtio::{
     STATUS_ACKNOWLEDGE, STATUS_DRIVER, STATUS_DRIVER_OK, STATUS_FEATURES_OK, STATUS_FAILED,
     VIRTIO_NET_F_MAC, VIRTIO_NET_F_MRG_RXBUF, VIRTIO_NET_F_STATUS,
     VIRTIO_NET_F_MQ, VIRTIO_NET_F_CTRL_VQ,
-    VIRTIO_RING_F_EVENT_IDX, VIRTIO_F_USED_IDX_MMIO,
+    VIRTIO_RING_F_EVENT_IDX, VIRTIO_F_USED_IDX_MMIO, VIRTIO_F_HVF_OPT,
     VREG_DEVICE_FEATURES, VREG_GUEST_FEATURES, VREG_DEVICE_STATUS, VREG_ISR_STATUS,
     VREG_DEVICE_CONFIG,
     MMIO_BASE, MMIO_MAGIC_VALUE, MMIO_VERSION, MMIO_DEVICE_ID,
@@ -126,6 +126,7 @@ struct NetDevice {
     irq_idle_available: bool,
     guest_features: u32,
     has_mq: bool,                       // VIRTIO_NET_F_MQ negotiated
+    hvf_opt: bool,                      // VIRTIO_F_HVF_OPT negotiated
 }
 
 impl NetDevice {
@@ -140,6 +141,7 @@ impl NetDevice {
         irq_idle_available: false,
         guest_features: 0,
         has_mq: false,
+        hvf_opt: false,
     };
 }
 
@@ -467,6 +469,9 @@ fn init_mmio() -> bool {
                 guest_features |= VIRTIO_F_USED_IDX_MMIO;
                 has_used_idx_mmio = true;
             }
+            if (dev_features & VIRTIO_F_HVF_OPT) != 0 {
+                guest_features |= VIRTIO_F_HVF_OPT;
+            }
 
             virtio_write32(io_base + MMIO_DRIVER_FEATURES_SEL, 0);
             virtio_write32(io_base + MMIO_GUEST_FEATURES, guest_features);
@@ -541,6 +546,10 @@ fn init_mmio() -> bool {
     unsafe {
         (*ndev()).transport = Transport::Mmio { base: io_base, is_v2 };
         (*ndev()).guest_features = guest_features;
+        (*ndev()).hvf_opt = (guest_features & VIRTIO_F_HVF_OPT) != 0;
+    }
+    if unsafe { (*ndev()).hvf_opt } {
+        log(b"virtio_net: HVF optimizations enabled (no ACK, no RX kick)\n");
     }
     log(b"virtio_net: initialization complete (MMIO)\n");
     true
@@ -699,10 +708,14 @@ fn irq_handler(_irq: u32) {
                 // Extract used_idx packed in upper 16 bits (HVF extension).
                 if (*ndev()).rx_queues[0].used_idx_mmio {
                     (*ndev()).rx_queues[0].mmio_cached_used_idx = (isr >> 16) as u16;
-                    // Signal that frames may be available for the poll path.
-                    IRQ_PENDING.store(true, core::sync::atomic::Ordering::Release);
                 }
-                virtio_write32(base + MMIO_INTERRUPT_ACK, isr & 0xFFFF);
+                // Signal that frames may be available for the poll path.
+                IRQ_PENDING.store(true, core::sync::atomic::Ordering::Release);
+                // HVF_OPT: host auto-deasserted SPI on the read above.
+                // Skip the ACK write to save one MMIO exit.
+                if !(*ndev()).hvf_opt {
+                    virtio_write32(base + MMIO_INTERRUPT_ACK, isr & 0xFFFF);
+                }
             }
             #[cfg(target_arch = "x86_64")]
             Transport::LegacyPci { base, .. } => {
@@ -924,7 +937,8 @@ pub fn poll_qp(qp: usize, callback: fn(&[u8])) -> i32 {
             count += 1;
         }
 
-        if count > 0 {
+        if count > 0 && !(*ndev()).hvf_opt {
+            // HVF_OPT: host polls avail ring directly, no kick needed.
             (*ndev()).rx_queues[qp].kick();
         }
         // Re-arm EVENT_IDX: update used_event to current used->idx so VZ fires
@@ -1024,7 +1038,8 @@ pub fn poll_batch_qp(qp: usize, batch: &mut RxBatch) {
             (*ndev()).rx_queues[qp].add_buf(buf_phys, BUFFER_SIZE, 0, 1);
         }
 
-        if batch.count > 0 {
+        if batch.count > 0 && !(*ndev()).hvf_opt {
+            // HVF_OPT: host polls avail ring directly, no kick needed.
             (*ndev()).rx_queues[0].kick();
         }
     }

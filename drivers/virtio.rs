@@ -364,6 +364,10 @@ pub(crate) const VIRTIO_RING_F_EVENT_IDX: u32 = 1 << 29;
 /// When set, get_used() reads used_idx via MMIO trap instead of from shared
 /// RAM, working around dcache coherency issues on Apple HVF.
 pub(crate) const VIRTIO_F_USED_IDX_MMIO: u32 = 1 << 24;
+/// Vendor extension: HVF host-polling optimizations.
+/// When set, INTERRUPT_STATUS read auto-clears on host (guest skips
+/// INTERRUPT_ACK write) and host polls RX avail ring (guest skips RX kick).
+pub(crate) const VIRTIO_F_HVF_OPT: u32 = 1 << 25;
 
 // ============================================================================
 // Split Virtqueue
