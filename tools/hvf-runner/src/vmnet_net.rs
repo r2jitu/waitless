@@ -13,61 +13,6 @@ use std::sync::Mutex;
 use crate::hvf;
 use crate::virtio;
 
-// FFI for vmnet and GCD APIs.
-extern "C" {
-    fn dispatch_queue_create(
-        label: *const std::ffi::c_char,
-        attr: *const std::ffi::c_void,
-    ) -> *mut std::ffi::c_void;
-    fn vmnet_interface_set_event_callback(
-        interface: *mut std::ffi::c_void,
-        event_mask: u32,
-        queue: *mut std::ffi::c_void,
-        handler: *mut std::ffi::c_void,
-    ) -> u32;
-    fn vmnet_read(
-        interface: *mut std::ffi::c_void,
-        packets: *mut libc::iovec,  // actually *mut vmpktdesc
-        pktcnt: *mut i32,
-    ) -> u32;
-}
-
-/// Batch-read from vmnet (up to 128 packets).
-/// Returns frames read from the raw vmnet C API.
-unsafe fn vmnet_batch_read(iface_ref: *mut std::ffi::c_void) -> Vec<Vec<u8>> {
-    const MAX_PKTS: usize = 128;
-    let mut bufs = [[0u8; 2048]; MAX_PKTS];
-    let mut iovecs: [libc::iovec; MAX_PKTS] = std::mem::zeroed();
-    // vmpktdesc layout: { vm_pkt_size: usize, vm_pkt_iov: *mut iovec, vm_pkt_iovcnt: u32, vm_flags: u32 }
-    #[repr(C)]
-    struct VmPktDesc {
-        vm_pkt_size: usize,
-        vm_pkt_iov: *mut libc::iovec,
-        vm_pkt_iovcnt: u32,
-        vm_flags: u32,
-    }
-    let mut descs: [VmPktDesc; MAX_PKTS] = std::mem::zeroed();
-    for i in 0..MAX_PKTS {
-        iovecs[i].iov_base = bufs[i].as_mut_ptr() as *mut _;
-        iovecs[i].iov_len = 2048;
-        descs[i].vm_pkt_size = 2048;
-        descs[i].vm_pkt_iov = &mut iovecs[i];
-        descs[i].vm_pkt_iovcnt = 1;
-        descs[i].vm_flags = 0;
-    }
-    let mut pktcnt = MAX_PKTS as i32;
-    let rc = vmnet_read(iface_ref, descs.as_mut_ptr() as *mut _, &mut pktcnt);
-    if rc != 1000 || pktcnt <= 0 { return Vec::new(); }
-    let mut frames = Vec::with_capacity(pktcnt as usize);
-    for i in 0..pktcnt as usize {
-        let len = descs[i].vm_pkt_size;
-        if len > 0 && len <= 2048 {
-            frames.push(bufs[i][..len].to_vec());
-        }
-    }
-    frames
-}
-
 /// Virtio net header size (12 bytes for VIRTIO_F_VERSION_1).
 const VIRTIO_NET_HDR_SIZE: usize = 12;
 
@@ -76,9 +21,6 @@ const VIRTIO_NET_HDR_SIZE: usize = 12;
 /// not marked as such in the Rust crate).
 struct SendIface(vmnet::Interface);
 unsafe impl Send for SendIface {}
-
-/// Global vmnet interface, behind a Mutex because read/write need &mut.
-static IFACE: Mutex<Option<SendIface>> = Mutex::new(None);
 
 /// Start vmnet in-process. Returns the MAC address.
 /// A dedicated high-priority thread polls vmnet_read directly.
@@ -244,168 +186,12 @@ pub static VCPU_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// implementation uses internal serialization.
 static IFACE_PTR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Raw InterfaceRef for batch reads via the C API.
-static VMNET_IFACE_REF: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// Read all available frames from vmnet and push to RX_PENDING.
-/// Uses batch read (up to 128 packets per vmnet_read call).
-unsafe fn drain_vmnet_rx() -> bool {
-    let iface_ref = VMNET_IFACE_REF.load(std::sync::atomic::Ordering::Acquire) as *mut std::ffi::c_void;
-    if iface_ref.is_null() {
-        // Fallback to single-packet read via the Rust crate.
-        let ptr = IFACE_PTR.load(std::sync::atomic::Ordering::Acquire);
-        if ptr == 0 { return false; }
-        let iface = &mut *(ptr as *mut SendIface);
-        let mut buf = [0u8; 2048];
-        let mut got_any = false;
-        loop {
-            match iface.0.read(&mut buf) {
-                Ok(n) if n > 0 => {
-                    snoop_dhcp_ack(&buf[..n]);
-                    RX_PENDING.lock().unwrap().push_back(buf[..n].to_vec());
-                    got_any = true;
-                }
-                _ => break,
-            }
-        }
-        return got_any;
-    }
-
-    // Batch read via raw C API.
-    let frames = vmnet_batch_read(iface_ref);
-    if frames.is_empty() { return false; }
-    let mut pending = RX_PENDING.lock().unwrap();
-    for frame in &frames {
-        snoop_dhcp_ack(frame);
-        pending.push_back(frame.clone());
-    }
-    true
-}
-
-/// Notify the vCPU that new RX frames are available.
-fn kick_vcpu() {
-    unsafe { hvf::hv_gic_set_spi(35, true); }
-    let vcpu = VCPU_ID.load(std::sync::atomic::Ordering::Relaxed);
-    if vcpu != 0 {
-        unsafe { hvf::hv_vcpus_exit(&vcpu as *const u64, 1); }
-    }
-}
-
-/// Set up vmnet IO: event callback + polling thread.
-///
-/// The GCD callback reads packets and returns immediately (no blocking
-/// HVF calls). A separate notify thread kicks the vCPU asynchronously.
-fn start_io() {
-    // Leak the interface into a raw pointer for lock-free access.
-    let iface = IFACE.lock().unwrap().take().unwrap();
-    let ptr = Box::into_raw(Box::new(iface));
-    IFACE_PTR.store(ptr as usize, std::sync::atomic::Ordering::Release);
-
-    // Create a high-priority serial dispatch queue for vmnet events.
-    // The default global queue used by the vmnet Rust crate gets starved
-    // by hv_vcpu_run (which monopolizes the vCPU thread in the kernel).
-    // A dedicated queue with user-interactive QoS ensures GCD schedules
-    // the vmnet callback promptly on a separate core.
-    extern "C" {
-        fn dispatch_queue_create_with_target(
-            label: *const std::ffi::c_char,
-            attr: *const std::ffi::c_void,
-            target: *mut std::ffi::c_void,
-        ) -> *mut std::ffi::c_void;
-        fn dispatch_get_global_queue(
-            identifier: isize,
-            flags: usize,
-        ) -> *mut std::ffi::c_void;
-    }
-    // QOS_CLASS_USER_INTERACTIVE = 0x21
-    let hi_queue = unsafe { dispatch_get_global_queue(0x21, 0) };
-    let serial_queue = unsafe {
-        dispatch_queue_create_with_target(
-            c"com.unikernel.vmnet".as_ptr(),
-            std::ptr::null(),  // NULL = serial
-            hi_queue,          // target = user-interactive global queue
-        )
-    };
-
-    // Get the raw InterfaceRef for batch reads via the C API.
-    // vmnet::Interface struct layout: queue(*void), interface(*void), ...
-    let iface_ref: *mut std::ffi::c_void = unsafe {
-        let base = &(*ptr).0 as *const vmnet::Interface as *const u8;
-        *(base.add(std::mem::size_of::<*mut std::ffi::c_void>()) as *const *mut std::ffi::c_void)
-    };
-    VMNET_IFACE_REF.store(iface_ref as usize, std::sync::atomic::Ordering::Release);
-
-    // Register PACKETS_AVAILABLE callback on the serial queue.
-    // Use a raw Objective-C block (ABI-compatible struct) instead
-    // of depending on the `block` crate.
-    #[repr(C)]
-    struct Block {
-        isa: *const std::ffi::c_void,
-        flags: i32,
-        reserved: i32,
-        invoke: unsafe extern "C" fn(*mut Block, u32, *mut std::ffi::c_void),
-        descriptor: *const BlockDescriptor,
-    }
-    #[repr(C)]
-    struct BlockDescriptor {
-        reserved: u64,
-        size: u64,
-    }
-    static DESCRIPTOR: BlockDescriptor = BlockDescriptor {
-        reserved: 0,
-        size: std::mem::size_of::<Block>() as u64,
-    };
-    unsafe extern "C" fn invoke_cb(_block: *mut Block, _events: u32, _xdict: *mut std::ffi::c_void) {
-        if drain_vmnet_rx() {
-            kick_vcpu();
-        }
-    }
-    extern "C" { static _NSConcreteGlobalBlock: *const std::ffi::c_void; }
-    static mut BLOCK: Block = Block {
-        isa: std::ptr::null(), // set below
-        flags: 1 << 28, // BLOCK_IS_GLOBAL
-        reserved: 0,
-        invoke: invoke_cb,
-        descriptor: &DESCRIPTOR,
-    };
-    unsafe {
-        BLOCK.isa = _NSConcreteGlobalBlock;
-        let rc = vmnet_interface_set_event_callback(
-            iface_ref,
-            1, // VMNET_INTERFACE_PACKETS_AVAILABLE
-            serial_queue,
-            &mut BLOCK as *mut _ as *mut std::ffi::c_void,
-        );
-        if rc != 1000 {
-            eprintln!("(vmnet) set_event_callback on serial queue failed: rc={rc}");
-        }
-    }
-
-    // Fallback polling thread in case the serial queue callback isn't
-    // enough. 1ms poll with burst drain.
-    std::thread::spawn(|| {
-        loop {
-            unsafe {
-                if drain_vmnet_rx() {
-                    kick_vcpu();
-                    loop {
-                        std::thread::sleep(std::time::Duration::from_micros(100));
-                        if !drain_vmnet_rx() { break; }
-                        kick_vcpu();
-                    }
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-    });
-}
-
-/// Snoop DHCP ACK frames to learn the VM's IP and set up port forwarding.
+/// Snoop DHCP ACK frames to learn the VM's IP address.
 /// Called from the RX thread for every received frame.
 fn snoop_dhcp_ack(frame: &[u8]) {
     use std::sync::atomic::{AtomicBool, Ordering};
-    static FORWARDED: AtomicBool = AtomicBool::new(false);
-    if FORWARDED.load(Ordering::Relaxed) { return; }
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.load(Ordering::Relaxed) { return; }
 
     // Minimum: 14 (eth) + 20 (ip) + 8 (udp) + 240 (dhcp base) + 4 (option 53)
     if frame.len() < 286 { return; }
@@ -459,107 +245,28 @@ fn snoop_dhcp_ack(frame: &[u8]) {
 
     if msg_type != 5 { return; } // Only on ACK
 
-    eprintln!("(vmnet) DHCP ACK: VM IP = {yiaddr}");
+    DONE.store(true, Ordering::Relaxed);
 
-    // Spawn a TCP proxy: listen on localhost:8080, forward to VM:80.
-    let ip = yiaddr;
-    FORWARDED.store(true, Ordering::Relaxed);
-    std::thread::spawn(move || {
-        tcp_proxy(ip, 8080, 80);
-    });
-}
-
-/// Simple TCP proxy: listen on localhost:host_port, forward to vm_ip:vm_port.
-fn tcp_proxy(vm_ip: std::net::Ipv4Addr, host_port: u16, vm_port: u16) {
-    use std::net::{TcpListener, TcpStream, SocketAddr};
-
-    let listener = match TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], host_port))) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("(proxy) failed to bind localhost:{host_port}: {e}");
-            return;
-        }
-    };
-    eprintln!("(proxy) listening on localhost:{host_port} → {vm_ip}:{vm_port}");
-
-    for stream in listener.incoming() {
-        let client = match stream {
-            Ok(s) => s,
-            Err(e) => { eprintln!("(proxy) accept error: {e}"); continue; }
-        };
-
-        let vm_addr = SocketAddr::from((vm_ip, vm_port));
-        let vm_ip_copy = vm_ip;
-        std::thread::spawn(move || {
-            let upstream = match TcpStream::connect_timeout(
-                &vm_addr,
-                std::time::Duration::from_secs(5),
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("(proxy) connect to {vm_ip_copy}:{vm_port} failed: {e}");
-                    return;
-                }
-            };
-            proxy_connection(client, upstream);
-        });
-    }
-}
-
-fn proxy_connection(
-    mut client: std::net::TcpStream,
-    mut upstream: std::net::TcpStream,
-) {
-    use std::io::{Read, Write};
-
-    let mut client2 = match client.try_clone() {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    let mut upstream2 = match upstream.try_clone() {
-        Ok(u) => u,
-        Err(_) => return,
-    };
-
-    // Client → Upstream
-    let h1 = std::thread::spawn(move || {
-        let mut buf = [0u8; 8192];
-        loop {
-            let n = match client.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
-            };
-            if upstream.write_all(&buf[..n]).is_err() { break; }
-        }
-        let _ = upstream.shutdown(std::net::Shutdown::Write);
-    });
-
-    // Upstream → Client
-    let h2 = std::thread::spawn(move || {
-        let mut buf = [0u8; 8192];
-        loop {
-            let n = match upstream2.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
-            };
-            if client2.write_all(&buf[..n]).is_err() { break; }
-        }
-        let _ = client2.shutdown(std::net::Shutdown::Write);
-    });
-
-    let _ = h1.join();
-    let _ = h2.join();
+    // vmnet host-mode gives the VM a routable IP on the bridge interface.
+    // Connect directly — no proxy needed.
+    eprintln!();
+    eprintln!("  VM ready: http://{yiaddr}:80/");
+    eprintln!("  Benchmark: wrk -t1 -c1 -d10s http://{yiaddr}:80/health");
+    eprintln!();
 }
 
 /// Check for pending RX frames from vmnet and inject into guest RX queue.
 /// Called from the vCPU thread during MMIO dispatch to ensure cache
 /// coherency — host writes to guest RAM are only guaranteed visible to
 /// the guest when done from the same CPU context.
+///
+/// CRITICAL: frames that can't be injected (RX ring full) are pushed
+/// back to RX_PENDING. The original code silently dropped them, causing
+/// ~18% packet loss, TCP retransmission stalls, and connection leaks.
 pub fn check_rx() {
 
     static RX_LAST: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
 
-    // Drain ALL buffered frames from the callback/polling thread.
     let mut injected = 0u32;
 
     loop {
@@ -573,11 +280,18 @@ pub fn check_rx() {
         let mut dev_lock = virtio::DEVICE.lock().unwrap();
         let dev = match dev_lock.as_mut() {
             Some(d) => d,
-            None => break,
+            None => {
+                // Device not ready — put frame back.
+                RX_PENDING.lock().unwrap().push_front(frame);
+                break;
+            }
         };
 
         let q = dev.queue(0);
-        if !q.ready { break; }
+        if !q.ready {
+            RX_PENDING.lock().unwrap().push_front(frame);
+            break;
+        }
 
         let desc_base = q.desc_addr();
         let avail_base = q.avail_addr();
@@ -590,7 +304,11 @@ pub fn check_rx() {
         };
         let last = RX_LAST.load(std::sync::atomic::Ordering::Relaxed);
 
-        if last == avail_idx { break; } // no free descriptors
+        if last == avail_idx {
+            // No free descriptors — put frame back for next call.
+            RX_PENDING.lock().unwrap().push_front(frame);
+            break;
+        }
 
         let ring_idx = last & (qsize - 1);
         let desc_idx = unsafe {

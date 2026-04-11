@@ -455,8 +455,13 @@ pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
             let pushed = c.rx_push(&payload[..payload_len]);
             c.rcv_nxt = c.rcv_nxt.wrapping_add(pushed as u32);
             c.rcv_wnd = c.rx_free() as u16;
-            send_segment(src_ip, dst_port, src_port, c.snd_nxt, c.rcv_nxt, TCP_ACK, &[]);
+            // Defer ACK — it will be piggybacked on the next outgoing data
+            // segment (the HTTP response). Sending a separate pure ACK here
+            // doubles the segment count and triggers macOS delayed-ACK
+            // interactions that cause ~250ms stalls on keep-alive connections.
         } else if seq_lt(seq, c.rcv_nxt) {
+            // Duplicate/retransmitted segment — send ACK immediately so the
+            // sender knows we already have this data (fast retransmit signal).
             send_segment(src_ip, dst_port, src_port, c.snd_nxt, c.rcv_nxt, TCP_ACK, &[]);
         }
     }

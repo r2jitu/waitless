@@ -174,7 +174,15 @@ struct ActiveConn {
     /// being constructed in `Server::new()`.
     buf: crate::Buffer,
     buf_len: usize,
+    /// Idle counter: incremented each service_core() call when no data
+    /// arrives. Reset to 0 on activity. Used to close stale connections
+    /// and reclaim slots (prevents pool exhaustion from abandoned clients).
+    idle_ticks: u32,
 }
+
+/// Close idle connections after this many service ticks with no data.
+/// At ~800K ticks/sec (single-core event loop), 4M ticks ≈ 5 seconds.
+const IDLE_TIMEOUT_TICKS: u32 = 4_000_000;
 
 impl ActiveConn {
     fn new() -> Self {
@@ -182,6 +190,7 @@ impl ActiveConn {
             conn: None,
             buf: crate::Buffer::new(BUF_SIZE),
             buf_len: 0,
+            idle_ticks: 0,
         }
     }
 }
@@ -315,6 +324,7 @@ impl Server {
                 conn.close(); // Send FIN if in CloseWait.
                 self.cores[core_id as usize].active[i].conn = None;
                 self.cores[core_id as usize].active[i].buf_len = 0;
+                self.cores[core_id as usize].active[i].idle_ticks = 0;
                 had_work = true;
                 continue;
             }
@@ -325,7 +335,19 @@ impl Server {
                 if avail > 0 {
                     let got = conn.recv(&mut self.cores[core_id as usize].active[i].buf[buf_len..buf_len + avail]);
                     self.cores[core_id as usize].active[i].buf_len += got;
+                    self.cores[core_id as usize].active[i].idle_ticks = 0;
                     had_work = true;
+                }
+            } else {
+                // No data — bump idle counter and close if stale.
+                self.cores[core_id as usize].active[i].idle_ticks =
+                    self.cores[core_id as usize].active[i].idle_ticks.saturating_add(1);
+                if self.cores[core_id as usize].active[i].idle_ticks >= IDLE_TIMEOUT_TICKS {
+                    conn.close();
+                    self.cores[core_id as usize].active[i].conn = None;
+                    self.cores[core_id as usize].active[i].buf_len = 0;
+                    self.cores[core_id as usize].active[i].idle_ticks = 0;
+                    continue;
                 }
             }
 
@@ -346,12 +368,14 @@ impl Server {
                     };
 
                     send_response(conn, &resp, !want_close);
+                    self.cores[core_id as usize].active[i].idle_ticks = 0;
                     had_work = true;
 
                     if want_close {
                         conn.close();
                         self.cores[core_id as usize].active[i].conn = None;
                         self.cores[core_id as usize].active[i].buf_len = 0;
+                        self.cores[core_id as usize].active[i].idle_ticks = 0;
                     } else {
                         let remaining = buf_len - consumed;
                         if remaining > 0 {
