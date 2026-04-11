@@ -173,12 +173,14 @@ def unikernel_binary(name, app, visibility = None):
         name = name + "_run",
         srcs = select({
             "//bazel/platforms:runner_vz": ["//bazel/rules:run_vz.sh"],
+            "//bazel/platforms:runner_hvf": ["//bazel/rules:run_hvf.sh"],
             "//bazel/platforms:runner_qemu": ["//bazel/rules:run_qemu.sh"],
             "//bazel/platforms:runner_iso": ["//bazel/rules:run_iso.sh"],
             "//conditions:default": ["//bazel/rules:run_native.sh"],
         }),
         data = select({
             "//bazel/platforms:runner_vz": [":" + name + ".img", "//tools/run-vz:run_vz"],
+            "//bazel/platforms:runner_hvf": [":" + name + ".img", "//tools/hvf-runner:run_hvf"],
             "//bazel/platforms:runner_qemu": [":" + name + ".elf", ":" + name + ".img"],
             "//bazel/platforms:runner_iso": [":" + name + ".iso"],
             "//conditions:default": [":" + name + "_native"],
@@ -187,6 +189,10 @@ def unikernel_binary(name, app, visibility = None):
             "//bazel/platforms:runner_vz": {
                 "UNIKERNEL_IMG_RELPATH": native.package_name() + "/" + name + ".img",
                 "UNIKERNEL_VZ_RELPATH": "tools/run-vz/run-vz",
+            },
+            "//bazel/platforms:runner_hvf": {
+                "UNIKERNEL_IMG_RELPATH": native.package_name() + "/" + name + ".img",
+                "UNIKERNEL_HVF_RELPATH": "tools/hvf-runner/run-hvf",
             },
             "//bazel/platforms:runner_qemu": {
                 "UNIKERNEL_ELF_RELPATH": native.package_name() + "/" + name + ".elf",

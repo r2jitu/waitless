@@ -13,6 +13,10 @@ build:vz   --define=uni_runner=vz
 # --config=qemu → unikernel via QEMU (platform from .bazelrc.local for host arch)
 build:qemu --define=uni_runner=qemu
 
+# --config=hvf  → ARM64 unikernel, HVF (macOS arm64, Apple Hypervisor.framework)
+build:hvf  --platforms=//bazel/platforms:aarch64_unikernel
+build:hvf  --define=uni_runner=hvf
+
 # --config=iso  → x86_64 unikernel via Limine ISO + QEMU
 build:iso  --platforms=//bazel/platforms:x86_64_unikernel
 build:iso  --define=uni_runner=iso
@@ -23,6 +27,9 @@ build:iso  --define=uni_runner=iso
 # ── Full triplet configs ───────────────────────────────────────────────────────
 build:aarch64-vz   --platforms=//bazel/platforms:aarch64_unikernel
 build:aarch64-vz   --define=uni_runner=vz
+
+build:aarch64-hvf  --platforms=//bazel/platforms:aarch64_unikernel
+build:aarch64-hvf  --define=uni_runner=hvf
 
 build:aarch64-qemu --platforms=//bazel/platforms:aarch64_unikernel
 build:aarch64-qemu --define=uni_runner=qemu

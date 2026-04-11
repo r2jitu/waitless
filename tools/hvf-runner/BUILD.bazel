@@ -1,0 +1,34 @@
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "run-hvf.entitlements",
+])
+
+# Build the HVF runner from Rust source via cargo and codesign it.
+# Produces bazel-bin/tools/hvf-runner/run-hvf, a macOS arm64 command-line
+# binary with the com.apple.security.hypervisor entitlement.
+#
+# Usage: bazel build //tools/hvf-runner:run_hvf
+#
+# Why genrule with local=True instead of rules_rust:
+#   - The project's .bazelrc.local sets --platforms=aarch64_unikernel which
+#     conflicts with rules_rust's host toolchain resolution.
+#   - local=True means the cmd runs on the exec (host) machine regardless of
+#     the Bazel target platform, so --platforms=aarch64_unikernel doesn't
+#     interfere.
+genrule(
+    name = "run_hvf",
+    srcs = glob(["src/**/*.rs"]) + [
+        "Cargo.toml",
+        "Cargo.lock",
+        "build.rs",
+        "run-hvf.entitlements",
+    ],
+    outs = ["run-hvf"],
+    cmd = " && ".join([
+        "cargo build --release --manifest-path $(location Cargo.toml)",
+        "cp $$(dirname $(location Cargo.toml))/target/release/run-hvf $@",
+        "codesign --sign - --entitlements $(location run-hvf.entitlements) --force $@",
+    ]),
+    local = True,
+)
