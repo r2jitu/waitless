@@ -46,6 +46,8 @@ struct IoState {
     read_buf: [u8; 2048],
     reply_queue: VecDeque<Vec<u8>>,
     rx_last: u16,
+    pollfds: Vec<libc::pollfd>,
+    frame_buf: [u8; 2048], // stack buffer for frame construction (no heap alloc)
 }
 
 pub fn start(port: u16) -> Result<[u8; 6], String> {
@@ -137,6 +139,7 @@ fn io_thread(listen_fd: i32, mac: [u8; 6]) {
     let mut io = IoState {
         listen_fd, next_port: 40000, guest_mac: mac,
         read_buf: [0u8; 2048], reply_queue: VecDeque::new(), rx_last: 0,
+        pollfds: Vec::with_capacity(64), frame_buf: [0u8; 2048],
     };
     io.reply_queue.push_back(build_grat_arp(&mac));
 
@@ -158,7 +161,7 @@ fn io_thread(listen_fd: i32, mac: [u8; 6]) {
             for c in conns.iter_mut() {
                 if c.state == 1 && !c.pending.is_empty() {
                     let p = std::mem::take(&mut c.pending);
-                    inject_data_frames(c, &p, &GUEST_MAC, &snap, &mut io.rx_last);
+                    inject_data_frames(c, &p, &GUEST_MAC, &snap, &mut io.rx_last, &mut io.frame_buf);
                     flushed = true;
                 }
             }
@@ -169,20 +172,20 @@ fn io_thread(listen_fd: i32, mac: [u8; 6]) {
         }
 
         let conns = CONNS.lock().unwrap();
-        let mut pollfds: Vec<libc::pollfd> = Vec::with_capacity(1 + conns.len());
-        pollfds.push(libc::pollfd { fd: listen_fd, events: libc::POLLIN, revents: 0 });
+        io.pollfds.clear();
+        io.pollfds.push(libc::pollfd { fd: listen_fd, events: libc::POLLIN, revents: 0 });
         for c in conns.iter() {
-            pollfds.push(libc::pollfd {
+            io.pollfds.push(libc::pollfd {
                 fd: if c.host_fd >= 0 && c.state < 2 { c.host_fd } else { -1 },
                 events: libc::POLLIN, revents: 0,
             });
         }
         drop(conns);
 
-        let ready = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as u32, 5) };
+        let ready = unsafe { libc::poll(io.pollfds.as_mut_ptr(), io.pollfds.len() as u32, 5) };
         if ready <= 0 { continue; }
 
-        if pollfds[0].revents & libc::POLLIN != 0 {
+        if io.pollfds[0].revents & libc::POLLIN != 0 {
             accept_connections(&mut io, &snap);
         }
 
@@ -190,8 +193,8 @@ fn io_thread(listen_fd: i32, mac: [u8; 6]) {
         let ready_fds: Vec<(u16, i32)> = {
             let conns = CONNS.lock().unwrap();
             (0..conns.len())
-                .filter(|&i| i + 1 < pollfds.len()
-                    && pollfds[i + 1].revents & (libc::POLLIN | libc::POLLHUP) != 0
+                .filter(|&i| i + 1 < io.pollfds.len()
+                    && io.pollfds[i + 1].revents & (libc::POLLIN | libc::POLLHUP) != 0
                     && conns[i].host_fd >= 0)
                 .map(|i| (conns[i].src_port, conns[i].host_fd))
                 .collect()
@@ -226,7 +229,7 @@ fn io_thread(listen_fd: i32, mac: [u8; 6]) {
                         else { io.reply_queue.push_back(frame); }
                     }
                 } else if c.state == 1 && snap.ready {
-                    inject_data_frames(c, &r.data, &GUEST_MAC, &snap, &mut io.rx_last);
+                    inject_data_frames(c, &r.data, &GUEST_MAC, &snap, &mut io.rx_last, &mut io.frame_buf);
                     injected = true;
                 } else {
                     c.pending.extend_from_slice(&r.data);
@@ -236,6 +239,14 @@ fn io_thread(listen_fd: i32, mac: [u8; 6]) {
         if injected {
             unsafe { core::arch::asm!("dsb sy", options(nostack)); }
             unsafe { hvf::hv_gic_set_spi(35, true); }
+        }
+
+        // Periodically clean up closed connections (state=2, host_fd=-1).
+        static mut CLEANUP_CTR: u32 = 0;
+        unsafe { CLEANUP_CTR += 1; }
+        if unsafe { CLEANUP_CTR } % 1000 == 0 {
+            let mut conns = CONNS.lock().unwrap();
+            conns.retain(|c| c.state < 2 || c.host_fd >= 0);
         }
     }
 }
@@ -301,15 +312,16 @@ fn inject_frame(frame: &[u8], snap: &virtio::QueueSnapshot, rx_last: &mut u16) -
 }
 
 fn inject_data_frames(c: &mut ProxyConn, data: &[u8], mac: &[u8; 6],
-                      snap: &virtio::QueueSnapshot, rx_last: &mut u16) {
+                      snap: &virtio::QueueSnapshot, rx_last: &mut u16,
+                      frame_buf: &mut [u8; 2048]) {
     let mut off = 0;
     while off < data.len() {
         let chunk = (data.len() - off).min(1460);
-        let frame = build_tcp_frame(mac, GW_IP, VM_IP, c.src_port, 80,
+        let len = write_tcp_frame(frame_buf, mac, GW_IP, VM_IP, c.src_port, 80,
             c.my_seq, c.peer_ack, 0x18, &data[off..off + chunk]);
         c.my_seq = c.my_seq.wrapping_add(chunk as u32);
         off += chunk;
-        inject_frame(&frame, snap, rx_last);
+        inject_frame(&frame_buf[..len], snap, rx_last);
     }
 }
 
@@ -389,7 +401,17 @@ fn handle_tcp(tcp: &[u8]) {
         1 => {
             if !payload.is_empty() {
                 c.peer_ack = seq.wrapping_add(payload.len() as u32);
-                unsafe { libc::write(c.host_fd, payload.as_ptr() as *const _, payload.len()); }
+                // Write all payload bytes (handle short writes).
+                let mut written = 0usize;
+                while written < payload.len() {
+                    let n = unsafe {
+                        libc::write(c.host_fd,
+                            payload.as_ptr().add(written) as *const _,
+                            payload.len() - written)
+                    };
+                    if n <= 0 { break; } // error or would-block
+                    written += n as usize;
+                }
                 replies.push_back(build_tcp_frame(&GUEST_MAC, GW_IP, VM_IP,
                     c.src_port, src_port, c.my_seq, c.peer_ack, 0x10, &[]));
             }
@@ -471,27 +493,61 @@ fn build_grat_arp(mac: &[u8; 6]) -> Vec<u8> {
     a.extend_from_slice(mac); a.extend_from_slice(&GW_IP); a
 }
 
+/// Write a TCP frame into `buf`. Returns the total frame length.
+/// Header layout: [virtio_net_hdr 12B][Eth 14B][IP 20B][TCP 20B][payload]
+fn write_tcp_frame(buf: &mut [u8], dst_mac: &[u8; 6], src_ip: [u8; 4], dst_ip: [u8; 4],
+    src_port: u16, dst_port: u16, seq: u32, ack: u32,
+    flags: u8, payload: &[u8]) -> usize {
+    let tcp_len = 20 + payload.len();
+    let ip_total = 20 + tcp_len;
+    let total = VIRTIO_NET_HDR_SIZE + 14 + ip_total;
+    debug_assert!(total <= buf.len());
+
+    // Virtio-net header (12 zero bytes).
+    buf[..VIRTIO_NET_HDR_SIZE].fill(0);
+    let mut o = VIRTIO_NET_HDR_SIZE;
+
+    // Ethernet header.
+    buf[o..o+6].copy_from_slice(dst_mac); o += 6;
+    buf[o..o+6].copy_from_slice(&GW_MAC); o += 6;
+    buf[o..o+2].copy_from_slice(&0x0800u16.to_be_bytes()); o += 2;
+
+    // IPv4 header.
+    let is = o;
+    buf[o] = 0x45; buf[o+1] = 0; o += 2;
+    buf[o..o+2].copy_from_slice(&(ip_total as u16).to_be_bytes()); o += 2;
+    buf[o..o+4].copy_from_slice(&[0,0,0x40,0]); o += 4;
+    buf[o] = 64; buf[o+1] = 6; o += 2;
+    buf[o..o+2].fill(0); o += 2; // checksum placeholder
+    buf[o..o+4].copy_from_slice(&src_ip); o += 4;
+    buf[o..o+4].copy_from_slice(&dst_ip); o += 4;
+    let cs = ipv4_checksum(&buf[is..is+20]);
+    buf[is+10] = (cs >> 8) as u8; buf[is+11] = (cs & 0xff) as u8;
+
+    // TCP header.
+    let ts = o;
+    buf[o..o+2].copy_from_slice(&src_port.to_be_bytes()); o += 2;
+    buf[o..o+2].copy_from_slice(&dst_port.to_be_bytes()); o += 2;
+    buf[o..o+4].copy_from_slice(&seq.to_be_bytes()); o += 4;
+    buf[o..o+4].copy_from_slice(&ack.to_be_bytes()); o += 4;
+    buf[o] = 0x50; buf[o+1] = flags; o += 2;
+    buf[o..o+2].copy_from_slice(&0xffffu16.to_be_bytes()); o += 2;
+    buf[o..o+4].fill(0); o += 4; // checksum + urgent ptr
+    buf[o..o+payload.len()].copy_from_slice(payload); o += payload.len();
+    let tc = tcp_checksum(&src_ip, &dst_ip, &buf[ts..ts+tcp_len]);
+    buf[ts+16] = (tc >> 8) as u8; buf[ts+17] = (tc & 0xff) as u8;
+
+    total
+}
+
+/// Allocating wrapper — used for TX_REPLIES (queued frames need ownership).
 fn build_tcp_frame(dst_mac: &[u8; 6], src_ip: [u8; 4], dst_ip: [u8; 4],
     src_port: u16, dst_port: u16, seq: u32, ack: u32,
     flags: u8, payload: &[u8]) -> Vec<u8> {
-    let tl = 20 + payload.len(); let it = 20 + tl;
-    let mut p = Vec::with_capacity(VIRTIO_NET_HDR_SIZE + 14 + it);
-    p.extend_from_slice(&[0u8; VIRTIO_NET_HDR_SIZE]);
-    p.extend_from_slice(dst_mac); p.extend_from_slice(&GW_MAC);
-    p.extend_from_slice(&0x0800u16.to_be_bytes());
-    let is = p.len();
-    p.push(0x45); p.push(0); p.extend_from_slice(&(it as u16).to_be_bytes());
-    p.extend_from_slice(&[0,0,0x40,0]); p.push(64); p.push(6);
-    p.extend_from_slice(&[0,0]); p.extend_from_slice(&src_ip); p.extend_from_slice(&dst_ip);
-    let cs = ipv4_checksum(&p[is..is+20]);
-    p[is+10] = (cs >> 8) as u8; p[is+11] = (cs & 0xff) as u8;
-    let ts = p.len();
-    p.extend_from_slice(&src_port.to_be_bytes()); p.extend_from_slice(&dst_port.to_be_bytes());
-    p.extend_from_slice(&seq.to_be_bytes()); p.extend_from_slice(&ack.to_be_bytes());
-    p.push(0x50); p.push(flags); p.extend_from_slice(&0xffffu16.to_be_bytes());
-    p.extend_from_slice(&[0,0,0,0]); p.extend_from_slice(payload);
-    let tc = tcp_checksum(&src_ip, &dst_ip, &p[ts..]);
-    p[ts+16] = (tc >> 8) as u8; p[ts+17] = (tc & 0xff) as u8; p
+    let total = VIRTIO_NET_HDR_SIZE + 14 + 20 + 20 + payload.len();
+    let mut buf = vec![0u8; total];
+    write_tcp_frame(&mut buf, dst_mac, src_ip, dst_ip, src_port, dst_port, seq, ack, flags, payload);
+    buf
 }
 
 fn ipv4_checksum(h: &[u8]) -> u16 {
