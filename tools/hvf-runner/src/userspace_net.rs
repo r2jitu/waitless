@@ -71,7 +71,6 @@ struct IoState {
     next_port: u16,
     guest_mac: [u8; 6],
     read_buf: [u8; 2048],
-    reply_queue: VecDeque<TxFrame>,
     rx_last: u16,
     pollfds: Vec<libc::pollfd>,
     poll_ports: Vec<u16>,  // maps pollfd index → src_port (for HashMap lookup)
@@ -164,23 +163,36 @@ pub fn process_tx() {
 fn io_thread(listen_fd: i32, mac: [u8; 6]) {
     let mut io = IoState {
         listen_fd, next_port: 40000, guest_mac: mac,
-        read_buf: [0u8; 2048], reply_queue: VecDeque::new(), rx_last: 0,
+        read_buf: [0u8; 2048], rx_last: 0,
         pollfds: Vec::with_capacity(64), poll_ports: Vec::with_capacity(64),
         frame_buf: [0u8; 2048],
     };
-    io.reply_queue.push_back(build_grat_arp_frame(&mac));
+    TX_REPLIES.lock().unwrap().push_back(build_grat_arp_frame(&mac));
     let mut cleanup_ctr: u32 = 0;
 
     loop {
         let snap = virtio::rx_queue_snapshot();
-        // Drain reply frames from vCPU thread (ARP, TCP ACK, DHCP).
+        // Drain reply frames from vCPU thread directly into guest RAM.
+        // Holding TX_REPLIES lock while injecting (~200ns/frame) is faster
+        // than the double-copy through an intermediate reply_queue.
         {
+            let mut any = false;
             let mut replies = TX_REPLIES.lock().unwrap();
-            while let Some(f) = replies.pop_front() {
-                io.reply_queue.push_back(f);
+            if snap.ready {
+                while let Some(f) = replies.pop_front() {
+                    if !inject_frame(f.as_slice(), &snap, &mut io.rx_last) {
+                        replies.push_front(f);
+                        break;
+                    }
+                    any = true;
+                }
+            }
+            drop(replies);
+            if any {
+                unsafe { core::arch::asm!("dsb sy", options(nostack)); }
+                unsafe { hvf::hv_gic_set_spi(35, true); }
             }
         }
-        if snap.ready { flush_reply_queue(&mut io, &snap); }
 
         // Flush pending data for connections that just became ESTABLISHED.
         if snap.ready {
@@ -359,7 +371,7 @@ fn accept_connections(io: &mut IoState, snap: &virtio::QueueSnapshot) {
             inject_frame(frame.as_slice(), snap, &mut io.rx_last);
             unsafe { core::arch::asm!("dsb sy", options(nostack)); }
             unsafe { hvf::hv_gic_set_spi(35, true); }
-        } else { io.reply_queue.push_back(frame); }
+        } else { TX_REPLIES.lock().unwrap().push_back(frame); }
         CONNS.lock().unwrap().insert(src_port, ProxyConn {
             host_fd: client_fd, src_port, my_seq: 1001, peer_ack: 0,
             state: ConnState::SynSent, pending: Vec::new(),
@@ -413,17 +425,6 @@ fn inject_data_frames(c: &mut ProxyConn, data: &[u8], mac: &[u8; 6],
     }
 }
 
-fn flush_reply_queue(io: &mut IoState, snap: &virtio::QueueSnapshot) {
-    let mut any = false;
-    while let Some(frame) = io.reply_queue.pop_front() {
-        if !inject_frame(frame.as_slice(), snap, &mut io.rx_last) { io.reply_queue.push_front(frame); break; }
-        any = true;
-    }
-    if any {
-        unsafe { core::arch::asm!("dsb sy", options(nostack)); }
-        unsafe { hvf::hv_gic_set_spi(35, true); }
-    }
-}
 
 // ── Guest TX (vCPU thread) ──────────────────────────────────────────────────
 
@@ -515,7 +516,21 @@ fn handle_tcp(tcp: &[u8]) {
         s
     }; // CONNS lock released
 
-    // Do I/O and reply queueing outside the lock.
+    // write() outside both CONNS and TX_REPLIES locks — no contention.
+    if snap.state == ConnState::Established && !payload.is_empty() {
+        let mut written = 0usize;
+        while written < payload.len() {
+            let n = unsafe {
+                libc::write(snap.fd,
+                    payload.as_ptr().add(written) as *const _,
+                    payload.len() - written)
+            };
+            if n <= 0 { break; }
+            written += n as usize;
+        }
+    }
+
+    // Brief lock: just push reply frames (no write() held).
     let mut replies = TX_REPLIES.lock().unwrap();
     match snap.state {
         ConnState::SynSent => {
@@ -527,17 +542,6 @@ fn handle_tcp(tcp: &[u8]) {
         }
         ConnState::Established => {
             if !payload.is_empty() {
-                // write() outside CONNS lock — no contention with IO thread.
-                let mut written = 0usize;
-                while written < payload.len() {
-                    let n = unsafe {
-                        libc::write(snap.fd,
-                            payload.as_ptr().add(written) as *const _,
-                            payload.len() - written)
-                    };
-                    if n <= 0 { break; }
-                    written += n as usize;
-                }
                 let ack = seq.wrapping_add(payload.len() as u32);
                 replies.push_back(build_tcp_frame_fixed(&GUEST_MAC, GW_IP, VM_IP,
                     snap.port, src_port, snap.seq, ack, 0x10, &[]));
