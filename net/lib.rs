@@ -3,6 +3,10 @@
 // Re-exports per-protocol sub-crates and provides full-stack
 // poll/dispatch that ties them together.
 //
+// Tier 1 (multi-queue): each core polls its own RX queue pair directly.
+// No distributor, no RX_LOCK, no inbox. TX goes through per-core queue
+// pairs with deferred kick. Activated when num_queue_pairs > 1.
+//
 // Tier 2 (single-queue): core 0 polls VirtIO, classifies frames
 // by flow hash, and distributes to per-core RX inboxes. APs drain
 // their inbox and process packets. TX from APs goes through staging
@@ -46,8 +50,10 @@ static FRAMES_DISTRIBUTED: core::sync::atomic::AtomicU64 = core::sync::atomic::A
 /// full stack: Ethernet -> ARP/IPv4 -> TCP/UDP.
 ///
 /// In single-core mode, all processing happens here.
-/// In Tier 2 multi-core mode, any idle core can become the distributor
-/// by acquiring the RX lock. This avoids dedicating a core to distribution.
+/// In Tier 1 multi-queue mode, each core polls its own RX queue pair
+/// directly — no distributor, no RX_LOCK, no inbox.
+/// In Tier 2 single-queue mode, any idle core can become the distributor
+/// by acquiring the RX lock.
 /// Returns true if any network work was done.
 pub fn poll() -> bool {
     let num_cores = percpu::num_cores();
@@ -56,8 +62,33 @@ pub fn poll() -> bool {
         return drivers::virtio_net::poll(net_receive) > 0;
     }
 
-    // Tier 2: multi-core with software distribution.
+    // Tier 1: multi-queue — each core polls its own RX queue pair.
+    if drivers::virtio_net::num_queue_pairs() > 1 {
+        return poll_tier1();
+    }
+
+    // Tier 2: single-queue with software distribution.
     poll_tier2(num_cores)
+}
+
+/// Tier 1 poll: each core polls its own RX queue pair directly.
+/// No distributor, no RX_LOCK, no inbox.
+fn poll_tier1() -> bool {
+    if !MULTICORE_INIT.load(core::sync::atomic::Ordering::Relaxed) {
+        MULTICORE_INIT.store(true, core::sync::atomic::Ordering::Relaxed);
+        let nqp = drivers::virtio_net::num_queue_pairs();
+        kernel::serial::puts(b"[net] Tier 1: per-core RX queues (");
+        let mut buf = [0u8; 4];
+        let len = fmt_u32(&mut buf, nqp as u32);
+        kernel::serial::puts(&buf[..len]);
+        kernel::serial::puts(b" queue pairs)\n");
+    }
+    let core = kernel::cpu_id();
+    let nqp = drivers::virtio_net::num_queue_pairs() as u32;
+    // Each core polls its own queue pair; overflow cores share qp 0.
+    let qp = if core < nqp { core as usize } else { 0 };
+    let count = drivers::virtio_net::poll_qp(qp, net_receive);
+    count > 0
 }
 
 fn poll_tier2(num_cores: u32) -> bool {
@@ -234,7 +265,11 @@ pub fn init_eventloop() {
 }
 
 fn net_poll_cb(_core_id: u32) -> bool {
-    // Any core can become the rotating distributor; the RX_LOCK CAS
+    // Tier 1 (multi-queue): every core polls its own queue — no lock.
+    if drivers::virtio_net::num_queue_pairs() > 1 {
+        return poll();
+    }
+    // Tier 2: any core can become the rotating distributor; the RX_LOCK CAS
     // in poll_tier2 picks one winner per cycle.
     if RX_LOCK.load(core::sync::atomic::Ordering::Relaxed) != 0 {
         return false;
@@ -258,10 +293,16 @@ fn net_drain_cb(core_id: u32) -> bool {
 }
 
 fn net_flush_cb() {
-    drivers::virtio_net::flush_tx_staging();
-    // Only kick if new TX buffers were actually added. Skipping
-    // redundant kicks saves ~7 MMIO exits/request at high concurrency.
-    drivers::virtio_net::flush_tx_kick_if_dirty();
+    let nqp = drivers::virtio_net::num_queue_pairs();
+    if nqp > 1 {
+        // Tier 1: each core flushes its own TX queue pair. No staging needed.
+        drivers::virtio_net::flush_tx_kick_if_dirty();
+    } else {
+        drivers::virtio_net::flush_tx_staging();
+        // Only kick if new TX buffers were actually added. Skipping
+        // redundant kicks saves ~7 MMIO exits/request at high concurrency.
+        drivers::virtio_net::flush_tx_kick_if_dirty();
+    }
 }
 
 

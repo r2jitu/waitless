@@ -1150,7 +1150,10 @@ pub fn has_pending_rx() -> bool {
 /// actual MMIO write. Batches multiple send_segment() calls into
 /// one virtio notification, reducing MMIO exits.
 pub fn enable_deferred_tx_kick() {
-    unsafe { (*ndev()).tx_queues[0].set_deferred_kick(true); }
+    let nqp = unsafe { (*ndev()).num_queue_pairs } as usize;
+    for qp in 0..nqp {
+        unsafe { (*ndev()).tx_queues[qp].set_deferred_kick(true); }
+    }
 }
 
 /// Flush deferred TX kick — issues one MMIO notify for all batched TX.
@@ -1160,6 +1163,14 @@ pub fn flush_tx_kick() {
 }
 
 /// Flush only if dirty. Returns true if a kick was issued.
+/// In multi-queue mode, flushes the calling core's TX queue pair.
 pub fn flush_tx_kick_if_dirty() -> bool {
-    unsafe { (*ndev()).tx_queues[0].flush_kick_if_dirty() }
+    let nqp = unsafe { (*ndev()).num_queue_pairs };
+    if nqp > 1 {
+        let core = kernel::cpu_id() as usize;
+        let qp = if core < nqp as usize { core } else { 0 };
+        unsafe { (*ndev()).tx_queues[qp].flush_kick_if_dirty() }
+    } else {
+        unsafe { (*ndev()).tx_queues[0].flush_kick_if_dirty() }
+    }
 }

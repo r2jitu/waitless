@@ -11,7 +11,7 @@
 
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::decoder;
@@ -19,6 +19,26 @@ use crate::fdt;
 use crate::hvf::*;
 use crate::pl011;
 use crate::virtio;
+
+// ── Global vCPU handles for IO thread wakeup ────────────────────────────────
+// Stored as AtomicU64 so the IO thread can read without locking.
+// Set once when each vCPU is created; never modified after.
+static VCPU_HANDLES: [AtomicU64; MAX_VCPUS] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_VCPUS]
+};
+
+/// Wake a specific vCPU by kicking it out of hv_vcpu_run (WFI).
+/// Called from the IO thread after injecting frames into a core's RX queue.
+/// Safe to call even if the vCPU isn't in WFI — it will just be a no-op
+/// (HV_EXIT_REASON_CANCELED is handled in the run loop).
+pub fn wake_vcpu(core_id: usize) {
+    if core_id >= MAX_VCPUS { return; }
+    let handle = VCPU_HANDLES[core_id].load(Ordering::Acquire);
+    if handle != 0 {
+        unsafe { hv_vcpus_exit(&handle as *const u64 as *const _, 1); }
+    }
+}
 
 // ── Guest physical memory layout ─────────────────────────────────────────────
 // Mirrors QEMU `virt` machine defaults so the same kernel binary boots
@@ -35,6 +55,7 @@ const VIRTIO_MMIO_SPI: u32 = 3; // INTID = SPI + 32 = 35
 
 /// Where we park the generated DTB in guest RAM (4 MB into RAM).
 const DTB_OFFSET: u64 = 0x0040_0000;
+
 
 // PSCI function IDs (SMC64 convention).
 const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
@@ -214,6 +235,8 @@ impl Vm {
                 .map_err(|e| format!("hv_vcpu_create(cpu 0): {e}"))?;
             check(unsafe { hv_vcpu_set_sys_reg(vcpu, HvSysReg::MpidrEl1, 0x8000_0000) })
                 .map_err(|e| format!("set MPIDR(cpu 0): {e}"))?;
+            // Publish handle for IO thread wakeup.
+            VCPU_HANDLES[0].store(vcpu, Ordering::Release);
             vcpus.push(Arc::new(VcpuInfo {
                 vcpu,
                 exit_ptr,
@@ -478,6 +501,8 @@ fn handle_hvc(
                             eprintln!("vcpu-{target_id}: hv_vcpu_create failed: 0x{rc:x}");
                             return;
                         }
+                        // Publish handle for IO thread wakeup.
+                        VCPU_HANDLES[target_id].store(new_vcpu, Ordering::Release);
                         // Set MPIDR.
                         let mpidr = 0x8000_0000u64 | (target_id as u64);
                         unsafe { hv_vcpu_set_sys_reg(new_vcpu, HvSysReg::MpidrEl1, mpidr); }
