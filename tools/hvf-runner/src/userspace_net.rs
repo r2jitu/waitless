@@ -227,9 +227,16 @@ pub fn process_tx() {
 
 fn io_thread(listen_fd: i32, udp_fd: i32, mac: [u8; 6]) {
     // Read cpu_count from the virtio device (= num_queue_pairs).
-    let cpu_count = {
-        let dev = virtio::DEVICE.lock().unwrap();
-        dev.as_ref().map(|d| d.num_queue_pairs as usize).unwrap_or(1)
+    // The device is created after the IO thread starts, so spin-wait
+    // for it to appear.
+    let cpu_count = loop {
+        {
+            let dev = virtio::DEVICE.lock().unwrap();
+            if let Some(d) = dev.as_ref() {
+                break d.num_queue_pairs as usize;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     };
     let mut io = IoState {
         listen_fd, udp_fd, next_port: 40000, guest_mac: mac,
@@ -428,7 +435,16 @@ fn io_thread(listen_fd: i32, udp_fd: i32, mac: [u8; 6]) {
                         used_idx.wrapping_add(1));
                 }
                 *rlast = rlast.wrapping_add(1);
-                if multi_queue { woken[qp] = true; }
+                if multi_queue {
+                    woken[qp] = true;
+                    if qp > 0 {
+                        // Debug: verify secondary queue injection
+                        let new_used = unsafe {
+                            core::ptr::read_volatile(qsnap.gpa_to_host(qsnap.used_addr + 2) as *const u16)
+                        };
+                        eprintln!("  IO: injected qp={qp} qi={} used_idx={new_used} avail_idx={avail_idx}", qp * 2);
+                    }
+                }
                 results.push(RxResult { port: cs.port, seq_advance: payload_len as u32, eof: false, queue_pair: qp });
                 injected = true;
             }
@@ -600,6 +616,16 @@ fn inject_frame(frame: &[u8], snap: &virtio::QueueSnapshot, rx_last: &mut u16) -
         core::ptr::write_unaligned(entry.add(4) as *mut u32, frame.len() as u32);
         core::ptr::write_volatile(snap.gpa_to_host(snap.used_addr + 2) as *mut u16,
             used_idx.wrapping_add(1));
+        // Flush the cache line containing used->idx so the guest PE sees it.
+        // Apple Silicon HVF should be cache-coherent, but empirically the
+        // guest reads stale used->idx on secondary queues without this.
+        let used_ptr = snap.gpa_to_host(snap.used_addr + 2);
+        core::arch::asm!(
+            "dc cvau, {addr}",
+            "dsb sy",
+            addr = in(reg) used_ptr,
+            options(nostack),
+        );
     }
     *rx_last = last.wrapping_add(1);
     true
