@@ -10,6 +10,7 @@ mod decoder;
 mod fdt;
 mod hvf;
 mod pl011;
+mod spsc;
 mod terminal;
 mod virtio;
 mod vm;
