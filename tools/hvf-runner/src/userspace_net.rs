@@ -157,34 +157,51 @@ fn io_thread(listen_fd: i32, mac: [u8; 6]) {
             accept_connections(&mut io, &snap);
         }
 
+        // Snapshot ready fds (brief lock), then read/inject without lock.
+        let ready_fds: Vec<(usize, i32)> = {
+            let conns = CONNS.lock().unwrap();
+            (0..conns.len())
+                .filter(|&i| i + 1 < pollfds.len()
+                    && pollfds[i + 1].revents & (libc::POLLIN | libc::POLLHUP) != 0
+                    && conns[i].host_fd >= 0)
+                .map(|i| (i, conns[i].host_fd))
+                .collect()
+        }; // lock released
+
+        // Read from sockets (no lock held — read() can block briefly).
+        struct ReadResult { idx: usize, data: Vec<u8>, eof: bool }
+        let mut reads: Vec<ReadResult> = Vec::new();
+        for &(idx, fd) in &ready_fds {
+            let n = unsafe {
+                libc::read(fd, io.read_buf.as_mut_ptr() as *mut _, io.read_buf.len())
+            };
+            if n == 0 { reads.push(ReadResult { idx, data: Vec::new(), eof: true }); }
+            else if n > 0 { reads.push(ReadResult { idx, data: io.read_buf[..n as usize].to_vec(), eof: false }); }
+        }
+
+        // Process read results (brief lock for state updates).
         let mut injected = false;
-        {
+        if !reads.is_empty() {
             let mut conns = CONNS.lock().unwrap();
-            for i in 0..conns.len() {
-                if i + 1 >= pollfds.len() { break; }
-                if pollfds[i + 1].revents & (libc::POLLIN | libc::POLLHUP) == 0 { continue; }
-                let fd = conns[i].host_fd;
-                if fd < 0 { continue; }
-                let n = unsafe {
-                    libc::read(fd, io.read_buf.as_mut_ptr() as *mut _, io.read_buf.len())
-                };
-                if n == 0 {
-                    if conns[i].state == 1 {
+            for r in &reads {
+                if r.idx >= conns.len() { continue; }
+                if r.eof {
+                    if conns[r.idx].state == 1 {
                         let frame = build_tcp_frame(&io.guest_mac, GW_IP, VM_IP,
-                            conns[i].src_port, 80, conns[i].my_seq, conns[i].peer_ack, 0x11, &[]);
-                        conns[i].my_seq = conns[i].my_seq.wrapping_add(1);
-                        conns[i].state = 2;
+                            conns[r.idx].src_port, 80, conns[r.idx].my_seq,
+                            conns[r.idx].peer_ack, 0x11, &[]);
+                        conns[r.idx].my_seq = conns[r.idx].my_seq.wrapping_add(1);
+                        conns[r.idx].state = 2;
                         if snap.ready { inject_frame(&frame, &snap); injected = true; }
                         else { io.reply_queue.push_back(frame); }
                     }
-                } else if n > 0 {
-                    let data = io.read_buf[..n as usize].to_vec();
-                    let c = &mut conns[i];
+                } else {
+                    let c = &mut conns[r.idx];
                     if c.state == 1 && snap.ready {
-                        inject_data_frames(c, &data, &io.guest_mac, &snap);
+                        inject_data_frames(c, &r.data, &io.guest_mac, &snap);
                         injected = true;
                     } else {
-                        c.pending.extend_from_slice(&data);
+                        c.pending.extend_from_slice(&r.data);
                     }
                 }
             }
