@@ -425,6 +425,10 @@ pub(crate) struct Virtqueue {
     /// Deferred kick: set by kick(), cleared by flush_kick().
     /// Batches multiple add_buf+kick into a single MMIO notify write.
     pub pending_kick: bool,
+    /// True if add_buf was called since last flush_kick(). Prevents
+    /// flush_kick from issuing a spurious MMIO write when no new
+    /// buffers were added.
+    pub kick_dirty: bool,
 }
 
 impl Virtqueue {
@@ -444,6 +448,7 @@ impl Virtqueue {
         used_idx_mmio: false,
         mmio_cached_used_idx: 0,
         pending_kick: false,
+        kick_dirty: false,
     };
 
     /// Allocate ring memory and set up descriptor free list.
@@ -609,6 +614,7 @@ impl Virtqueue {
     /// For TX queues with pending_kick, defers the actual MMIO write
     /// until flush_kick() — batching multiple segments into one exit.
     pub fn kick(&mut self) {
+        self.kick_dirty = true;
         if self.pending_kick {
             // Already deferred — actual write happens in flush_kick().
             return;
@@ -634,9 +640,25 @@ impl Virtqueue {
     }
 
     /// Flush a deferred kick — issues one MMIO write for all batched buffers.
+    /// Always kicks if pending (even if not dirty). Used on the idle path
+    /// where the kick serves as a yield-to-host to let the IO thread run.
     pub fn flush_kick(&mut self) {
         if self.pending_kick {
+            self.kick_dirty = false;
             self.kick_now();
+        }
+    }
+
+    /// Flush only if dirty. Returns true if a kick was actually issued.
+    /// Use this on the work path; the idle path should call kick_now()
+    /// directly to yield to the host (even with nothing to send).
+    pub fn flush_kick_if_dirty(&mut self) -> bool {
+        if self.pending_kick && self.kick_dirty {
+            self.kick_dirty = false;
+            self.kick_now();
+            true
+        } else {
+            false
         }
     }
 

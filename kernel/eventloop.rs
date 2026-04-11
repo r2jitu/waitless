@@ -24,6 +24,7 @@ type IdleFn = fn(u32);
 static NET_POLL: AtomicFn<PollFn> = AtomicFn::null();
 static NET_DRAIN: AtomicFn<PollFn> = AtomicFn::null();
 static NET_FLUSH: AtomicFn<VoidFn> = AtomicFn::null();
+static NET_IDLE_FLUSH: AtomicFn<VoidFn> = AtomicFn::null();
 static SERVICE: AtomicFn<PollFn> = AtomicFn::null();
 static CHECK_SHUTDOWN: AtomicFn<BoolFn> = AtomicFn::null();
 static IDLE: AtomicFn<IdleFn> = AtomicFn::null();
@@ -43,6 +44,10 @@ pub fn set_net_drain(f: PollFn) {
 
 pub fn set_net_flush(f: VoidFn) {
     NET_FLUSH.store(f);
+}
+
+pub fn set_net_idle_flush(f: VoidFn) {
+    NET_IDLE_FLUSH.store(f);
 }
 
 pub fn set_service(f: PollFn) {
@@ -154,8 +159,12 @@ pub fn run(core_id: u32) -> ! {
             idle_count += 1;
             consecutive_idle = consecutive_idle.saturating_add(1);
 
-            // Flush before sleeping (responses may be staged).
-            if let Some(f) = NET_FLUSH.load() {
+            // Flush before sleeping. Uses idle flush (always kicks) rather
+            // than work flush (skip if not dirty). On HVF the kick MMIO
+            // exit yields to the host so the IO thread can inject frames.
+            if let Some(f) = NET_IDLE_FLUSH.load() {
+                f();
+            } else if let Some(f) = NET_FLUSH.load() {
                 f();
             }
 

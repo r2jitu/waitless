@@ -1113,6 +1113,12 @@ pub fn enable_deferred_tx_kick() {
 }
 
 /// Flush deferred TX kick — issues one MMIO notify for all batched TX.
+/// Only kicks if new buffers were added since last flush (kick_dirty).
 pub fn flush_tx_kick() {
     unsafe { (*ndev()).tx_queues[0].flush_kick(); }
+}
+
+/// Flush only if dirty. Returns true if a kick was issued.
+pub fn flush_tx_kick_if_dirty() -> bool {
+    unsafe { (*ndev()).tx_queues[0].flush_kick_if_dirty() }
 }
