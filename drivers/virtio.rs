@@ -352,6 +352,9 @@ pub(crate) const STATUS_FAILED: u8 = 128;
 pub(crate) const VIRTQ_DESC_F_NEXT: u16 = 1;
 pub(crate) const VIRTQ_DESC_F_WRITE: u16 = 2;
 pub(crate) const VIRTQ_AVAIL_F_NO_INTERRUPT: u16 = 1;
+/// Device sets this on used->flags to tell the driver: don't send
+/// notifications for this queue. Standard virtio spec §2.7.13.
+pub(crate) const VIRTQ_USED_F_NO_NOTIFY: u16 = 1;
 
 // Feature bits
 pub(crate) const VIRTIO_NET_F_MAC: u32 = 1 << 5;
@@ -364,10 +367,6 @@ pub(crate) const VIRTIO_RING_F_EVENT_IDX: u32 = 1 << 29;
 /// When set, get_used() reads used_idx via MMIO trap instead of from shared
 /// RAM, working around dcache coherency issues on Apple HVF.
 pub(crate) const VIRTIO_F_USED_IDX_MMIO: u32 = 1 << 24;
-/// Vendor extension: HVF host-polling optimizations.
-/// When set, INTERRUPT_STATUS read auto-clears on host (guest skips
-/// INTERRUPT_ACK write) and host polls RX avail ring (guest skips RX kick).
-pub(crate) const VIRTIO_F_HVF_OPT: u32 = 1 << 25;
 
 // ============================================================================
 // Split Virtqueue
@@ -622,8 +621,13 @@ impl Virtqueue {
         self.kick_now();
     }
 
-    /// Immediate kick — always writes MMIO.
+    /// Immediate kick — writes MMIO unless device says NO_NOTIFY.
     fn kick_now(&self) {
+        // Standard virtio: check if device suppressed notifications.
+        let used_flags = unsafe { ptr::read_volatile(&(*self.used).flags) };
+        if used_flags & VIRTQ_USED_F_NO_NOTIFY != 0 {
+            return;
+        }
         dsb_st();
         if self.notify_addr != 0 {
             unsafe { ptr::write_volatile(self.notify_addr as *mut u16, self.queue_index); }

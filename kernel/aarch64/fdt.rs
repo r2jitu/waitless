@@ -21,6 +21,8 @@ pub struct FdtInfo {
     pub uart_base: u64,
     pub virtio_bases: [u64; 32],
     pub virtio_irqs: [u32; 32],
+    /// Per-device interrupt flags from FDT. Bit 0: 1=edge, 0=level.
+    pub virtio_irq_flags: [u32; 32],
     pub virtio_count: i32,
     pub gic_dist_base: u64,
     pub gic_redist_base: u64,
@@ -40,6 +42,7 @@ impl FdtInfo {
         uart_base: 0,
         virtio_bases: [0; 32],
         virtio_irqs: [0; 32],
+        virtio_irq_flags: [0; 32],
         virtio_count: 0,
         gic_dist_base: 0,
         gic_redist_base: 0,
@@ -86,11 +89,14 @@ fn translate_gic_irq(int_type: u32, int_num: u32) -> u32 {
 }
 
 #[cfg(target_arch = "aarch64")]
-fn parse_first_interrupt(prop: &[u8]) -> Option<u32> {
+/// Parse `interrupts = <type spi_num flags>` from FDT.
+/// Returns (intid, flags) where flags bit 0 = 1 for edge-triggered.
+fn parse_first_interrupt(prop: &[u8]) -> Option<(u32, u32)> {
     if prop.len() < 12 { return None; }
     let int_type = be32(prop);
     let int_num = be32(&prop[4..]);
-    Some(translate_gic_irq(int_type, int_num))
+    let flags = be32(&prop[8..]);
+    Some((translate_gic_irq(int_type, int_num), flags))
 }
 
 // ============================================================================
@@ -246,13 +252,14 @@ fn scan_for_virtio(node: &fdt::node::FdtNode<'_, '_>, info: &mut FdtInfo) {
         Some(r) => r.starting_address as u64,
         None => return,
     };
-    let irq = node
+    let (irq, irq_flags) = node
         .property("interrupts")
         .and_then(|p| parse_first_interrupt(p.value))
-        .unwrap_or(0);
+        .unwrap_or((0, 0));
     let idx = info.virtio_count as usize;
     info.virtio_bases[idx] = base;
     info.virtio_irqs[idx] = irq;
+    info.virtio_irq_flags[idx] = irq_flags;
     info.virtio_count += 1;
 }
 

@@ -46,11 +46,6 @@ const VIRTIO_VENDOR: u32 = 0x554d_4551; // "QEMU" — convention
 
 // Feature bits we offer (word 0 only; word 1 = VIRTIO_F_VERSION_1 implied by v2)
 const VIRTIO_NET_F_MAC: u32 = 1 << 5;
-// Vendor extension: HVF host-polling optimizations.
-// When negotiated, the host auto-deasserts SPI on INTERRUPT_STATUS read
-// (guest skips INTERRUPT_ACK write) and the host polls the RX avail ring
-// directly (guest skips RX kick). Saves 2+ MMIO exits per request.
-const VIRTIO_F_HVF_OPT: u32 = 1 << 25;
 
 // Status bits
 const STATUS_FEATURES_OK: u32 = 8;
@@ -174,7 +169,7 @@ impl VirtioNet {
             VENDOR_ID => VIRTIO_VENDOR,
             DEVICE_FEATURES => {
                 match self.device_features_sel {
-                    0 => VIRTIO_NET_F_MAC | VIRTIO_F_HVF_OPT,
+                    0 => VIRTIO_NET_F_MAC,
                     1 => 1, // VIRTIO_F_VERSION_1 (bit 0 of word 1 = feature bit 32)
                     _ => 0,
                 }
@@ -243,7 +238,16 @@ impl VirtioNet {
                             ready: true,
                         };
                         match qi {
-                            0 => { let _ = RX_SNAP.set(snap); }
+                            0 => {
+                                // Tell driver: don't notify us for RX —
+                                // we poll the avail ring directly.
+                                // VIRTQ_USED_F_NO_NOTIFY = bit 0.
+                                unsafe {
+                                    let flags_ptr = snap.gpa_to_host(snap.used_addr) as *mut u16;
+                                    core::ptr::write_volatile(flags_ptr, 1);
+                                }
+                                let _ = RX_SNAP.set(snap);
+                            }
                             1 => { let _ = TX_SNAP.set(snap); }
                             _ => {}
                         }
