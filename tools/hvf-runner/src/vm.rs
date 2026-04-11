@@ -235,8 +235,6 @@ impl Vm {
             check(unsafe { hv_vcpu_run(self.vcpu) })
                 .map_err(|e| format!("hv_vcpu_run: {e}"))?;
 
-            crate::userspace_net::check_rx();
-
             let exit = unsafe { &*self.exit_ptr };
             _exit_count += 1;
 

@@ -49,7 +49,7 @@ const VIRTIO_NET_F_MAC: u32 = 1 << 5;
 // Vendor extension: device exposes per-queue used_idx at config offset 0x110.
 // Allows guests to read used_idx via MMIO trap instead of from shared RAM,
 // working around dcache coherency issues on Apple HVF.
-const VIRTIO_F_USED_IDX_MMIO: u32 = 1 << 24;
+// VIRTIO_F_USED_IDX_MMIO removed — guest reads used->idx from RAM directly.
 
 // Status bits
 const STATUS_FEATURES_OK: u32 = 8;
@@ -199,11 +199,9 @@ impl VirtioNet {
             }
             STATUS => self.status,
             INTERRUPT_STATUS => {
-                // Guest is polling — inject all buffered RX frames first.
-                // Pass &mut self so flush_rx can access the device directly
-                // (we already hold DEVICE lock, can't re-lock).
-                crate::userspace_net::flush_rx_into(self);
-                self.interrupt_status | ((self.used_idx[0] as u32) << 16)
+                // IO thread injects RX frames directly into guest RAM.
+                // No flush needed here — used_idx is updated by IO thread.
+                self.interrupt_status
             }
             // Device config: MAC address at offset 0x100..0x105
             off if off >= CONFIG_BASE && off < CONFIG_BASE + 8 => {
