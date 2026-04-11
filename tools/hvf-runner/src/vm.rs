@@ -141,8 +141,9 @@ impl Vm {
         let ram_mapped = 1024 * 1024 * 1024; // 1 GB
 
         // Determine vCPU count: performance cores, capped at 4.
-        // TODO: re-enable after multi-queue virtio-net eliminates
-        // single-queue contention and SPI broadcast overhead.
+        // Multi-core + multi-queue: IO thread must distribute RX across
+        // all queue pairs for full throughput. Currently injects into
+        // queue 0 only. Keep at 1 core until IO distribution is added.
         let cpu_count = 1; // perf_core_count().min(MAX_VCPUS).min(4).max(1);
         eprintln!("  vCPU count: {cpu_count}");
 
@@ -301,7 +302,7 @@ impl Vm {
 
         // 10. Initialize the virtio-mmio net device.
         *virtio::DEVICE.lock().unwrap() = Some(
-            virtio::VirtioNet::new(mac, ram_host, RAM_BASE)
+            virtio::VirtioNet::new(mac, ram_host, RAM_BASE, cpu_count)
         );
 
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -630,8 +631,12 @@ fn handle_mmio(
             }
         } // dev_lock released
         if let Some(queue) = notify_queue {
-            if queue == 1 {
-                crate::userspace_net::process_tx();
+            let ctrl_qi = virtio::ctrl_queue_index() as u32;
+            if queue & 1 == 1 {
+                // Odd queue index = TX queue
+                crate::userspace_net::process_tx_queue(queue);
+            } else if queue == ctrl_qi {
+                virtio::handle_ctrl_queue();
             }
         }
     } else {

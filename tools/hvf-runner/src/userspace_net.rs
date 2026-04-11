@@ -154,16 +154,24 @@ pub fn start(port: u16) -> Result<[u8; 6], String> {
 
 /// TX QUEUE_NOTIFY handler. Uses TX QueueSnapshot for lock-free guest
 /// RAM access. Only takes DEVICE lock briefly for interrupt_status.
-pub fn process_tx() {
+/// Accepts the queue index (odd = TX queue) to support multi-queue.
+pub fn process_tx_queue(queue_idx: u32) {
     use std::cell::Cell;
-    thread_local! { static TX_LAST: Cell<u16> = const { Cell::new(0) }; }
-    let tx = virtio::tx_queue_snapshot();
+    thread_local! {
+        static TX_LAST_MAP: Cell<[u16; 9]> = const { Cell::new([0u16; 9]) };
+    }
+    let tx = virtio::queue_snapshot(queue_idx as usize);
     if !tx.ready { return; }
+
+    // Map queue_idx to a slot in the per-thread last array (TX queues: 1,3,5,7,... → slots 0..8)
+    let slot = (queue_idx / 2) as usize;
+    if slot >= 9 { return; }
 
     let avail_idx = unsafe {
         core::ptr::read_volatile(tx.gpa_to_host(tx.avail_addr + 2) as *const u16)
     };
-    let mut last = TX_LAST.with(|c| c.get());
+    let mut lasts = TX_LAST_MAP.with(|c| c.get());
+    let mut last = lasts[slot];
     if last == avail_idx { return; }
 
     while last != avail_idx {
@@ -196,12 +204,19 @@ pub fn process_tx() {
         }
         last = last.wrapping_add(1);
     }
-    TX_LAST.with(|c| c.set(last));
+    lasts[slot] = last;
+    TX_LAST_MAP.with(|c| c.set(lasts));
     unsafe { core::arch::asm!("dsb sy", options(nostack)); }
     // No SPI assert here — ACK frames queued in TX_REPLIES will be
     // injected by the IO thread, which asserts SPI after injection.
     // Asserting here caused a spurious interrupt (guest polls, finds
     // no new RX, wastes an MMIO exit).
+}
+
+/// Backward-compat wrapper for single-queue callers.
+#[allow(dead_code)]
+pub fn process_tx() {
+    process_tx_queue(1);
 }
 
 // ── IO / RX thread ──────────────────────────────────────────────────────────

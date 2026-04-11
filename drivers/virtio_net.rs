@@ -458,6 +458,7 @@ fn init_mmio() -> bool {
     // Feature negotiation
     let mut guest_features: u32 = 0;
     let mut has_used_idx_mmio = false;
+    let mut has_mq = false;
     unsafe {
         if is_v2 {
             virtio_write32(io_base + MMIO_DEVICE_FEATURES_SEL, 0);
@@ -469,6 +470,10 @@ fn init_mmio() -> bool {
                 guest_features |= VIRTIO_F_USED_IDX_MMIO;
                 has_used_idx_mmio = true;
             }
+            if (dev_features & VIRTIO_NET_F_MQ) != 0 { guest_features |= VIRTIO_NET_F_MQ; }
+            if (dev_features & VIRTIO_NET_F_CTRL_VQ) != 0 { guest_features |= VIRTIO_NET_F_CTRL_VQ; }
+            has_mq = (guest_features & VIRTIO_NET_F_MQ) != 0
+                  && (guest_features & VIRTIO_NET_F_CTRL_VQ) != 0;
             virtio_write32(io_base + MMIO_DRIVER_FEATURES_SEL, 0);
             virtio_write32(io_base + MMIO_GUEST_FEATURES, guest_features);
             virtio_write32(io_base + MMIO_DRIVER_FEATURES_SEL, 1);
@@ -491,19 +496,44 @@ fn init_mmio() -> bool {
         }
     }
 
-    // Init RX and TX queues
-    unsafe {
-        if !(*ndev()).rx_queues[0].init_legacy(io_base, 0, true, is_v2) {
-            log(b"virtio_net: failed to init RX queue\n");
-            return false;
+    // Determine number of queue pairs
+    let desired_pairs = fdt::info().cpu_count as u16;
+    let max_pairs = if has_mq {
+        let cfg_val = unsafe { virtio_read32(io_base + MMIO_DEVICE_CONFIG + 8) };
+        ((cfg_val & 0xFFFF) as u16).max(1)
+    } else {
+        1
+    };
+    let num_pairs = desired_pairs.min(max_pairs).min(MAX_QUEUE_PAIRS as u16);
+
+    // Init N queue pairs (RX=2i, TX=2i+1)
+    for pair in 0..num_pairs as usize {
+        let rx_qi = (pair * 2) as u16;
+        let tx_qi = (pair * 2 + 1) as u16;
+        unsafe {
+            if !(*ndev()).rx_queues[pair].init_legacy(io_base, rx_qi, true, is_v2) {
+                log(b"virtio_net: failed to init RX queue\n");
+                return false;
+            }
+            if !(*ndev()).tx_queues[pair].init_legacy(io_base, tx_qi, true, is_v2) {
+                log(b"virtio_net: failed to init TX queue\n");
+                return false;
+            }
+            if has_used_idx_mmio {
+                (*ndev()).rx_queues[pair].used_idx_mmio = true;
+                (*ndev()).tx_queues[pair].used_idx_mmio = true;
+            }
         }
-        if !(*ndev()).tx_queues[0].init_legacy(io_base, 1, true, is_v2) {
-            log(b"virtio_net: failed to init TX queue\n");
-            return false;
-        }
-        if has_used_idx_mmio {
-            (*ndev()).rx_queues[0].used_idx_mmio = true;
-            (*ndev()).tx_queues[0].used_idx_mmio = true;
+    }
+
+    // Init ctrl VQ if MQ negotiated and num_pairs > 1
+    if has_mq && num_pairs > 1 {
+        let ctrl_qi = (2 * max_pairs) as u16;
+        unsafe {
+            if !(*ndev()).ctrl_queue.init_legacy(io_base, ctrl_qi, true, is_v2) {
+                log(b"virtio_net: failed to init ctrl queue, falling back to 1 pair\n");
+                has_mq = false;
+            }
         }
     }
 
@@ -519,20 +549,21 @@ fn init_mmio() -> bool {
         (*ndev()).mac[5] = ((hi >> 8) & 0xff) as u8;
     }
 
-    // Allocate RX buffers
-    for i in 0..RX_BUFFERS {
-        let alloc = kmalloc(BUFFER_SIZE as usize + 2);
-        if alloc.is_null() { return false; }
-        let buf = unsafe { alloc.add(2) };
-        unsafe {
-            ptr::write_bytes(buf, 0, VIRTIO_NET_HDR_SIZE);
-            (*ndev()).qp_state[0].rx_buffers[i] = buf;
-            let buf_phys = virt_to_phys(buf);
-            (*ndev()).rx_queues[0].add_buf(buf_phys, BUFFER_SIZE, 0, 1);
+    // Allocate RX buffers for all queue pairs
+    for pair in 0..num_pairs as usize {
+        for i in 0..RX_BUFFERS {
+            let alloc = kmalloc(BUFFER_SIZE as usize + 2);
+            if alloc.is_null() { return false; }
+            let buf = unsafe { alloc.add(2) };
+            unsafe {
+                ptr::write_bytes(buf, 0, VIRTIO_NET_HDR_SIZE);
+                (*ndev()).qp_state[pair].rx_buffers[i] = buf;
+                let buf_phys = virt_to_phys(buf);
+                (*ndev()).rx_queues[pair].add_buf(buf_phys, BUFFER_SIZE, 0, 1);
+            }
         }
+        unsafe { (*ndev()).rx_queues[pair].kick(); }
     }
-
-    unsafe { (*ndev()).rx_queues[0].kick(); }
 
     // DRIVER_OK
     let mut final_status = (STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_DRIVER_OK) as u32;
@@ -542,6 +573,20 @@ fn init_mmio() -> bool {
     unsafe {
         (*ndev()).transport = Transport::Mmio { base: io_base, is_v2 };
         (*ndev()).guest_features = guest_features;
+        (*ndev()).num_queue_pairs = num_pairs;
+        (*ndev()).has_mq = has_mq && num_pairs > 1;
+    }
+
+    // Send MQ activation command via ctrl VQ
+    if unsafe { (*ndev()).has_mq } {
+        ctrl_mq_set_pairs(num_pairs);
+    }
+
+    // Log result
+    if num_pairs > 1 {
+        log(b"virtio_net: multi-queue: ");
+        log(&[b'0' + (num_pairs as u8 % 10)]);
+        log(b" queue pairs (MMIO)\n");
     }
     log(b"virtio_net: initialization complete (MMIO)\n");
     true
