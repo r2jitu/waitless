@@ -235,7 +235,7 @@ impl Vm {
             check(unsafe { hv_vcpu_run(self.vcpu) })
                 .map_err(|e| format!("hv_vcpu_run: {e}"))?;
 
-            crate::vmnet_net::check_rx();
+            crate::userspace_net::check_rx();
 
             let exit = unsafe { &*self.exit_ptr };
             _exit_count += 1;
@@ -421,7 +421,7 @@ impl Vm {
             } // dev_lock released
             if let Some(queue) = notify_queue {
                 if queue == 1 {
-                    crate::vmnet_net::process_tx();
+                    crate::userspace_net::process_tx();
                 }
             }
         } else {
