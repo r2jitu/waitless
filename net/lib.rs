@@ -225,7 +225,6 @@ pub fn init_eventloop() {
     // Batch TX kicks: defer MMIO writes until net_flush_cb, reducing
     // exits per HTTP response from N segments to 1 notification.
     drivers::virtio_net::enable_deferred_tx_kick();
-    kernel::eventloop::set_net_idle_flush(net_idle_flush_cb);
 }
 
 fn net_poll_cb(_core_id: u32) -> bool {
@@ -259,14 +258,6 @@ fn net_flush_cb() {
     drivers::virtio_net::flush_tx_kick_if_dirty();
 }
 
-/// Idle flush: always kicks even if not dirty. On HVF, the kick MMIO
-/// exit acts as a yield to the host, letting the IO thread inject
-/// pending RX frames. Without this, the guest spin-loops in-guest
-/// and the IO thread's SPI takes longer to take effect.
-fn net_idle_flush_cb() {
-    drivers::virtio_net::flush_tx_staging();
-    drivers::virtio_net::flush_tx_kick();
-}
 
 fn fmt_u32(buf: &mut [u8], mut val: u32) -> usize {
     if val == 0 { buf[0] = b'0'; return 1; }

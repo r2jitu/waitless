@@ -24,7 +24,6 @@ type IdleFn = fn(u32);
 static NET_POLL: AtomicFn<PollFn> = AtomicFn::null();
 static NET_DRAIN: AtomicFn<PollFn> = AtomicFn::null();
 static NET_FLUSH: AtomicFn<VoidFn> = AtomicFn::null();
-static NET_IDLE_FLUSH: AtomicFn<VoidFn> = AtomicFn::null();
 static SERVICE: AtomicFn<PollFn> = AtomicFn::null();
 static CHECK_SHUTDOWN: AtomicFn<BoolFn> = AtomicFn::null();
 static IDLE: AtomicFn<IdleFn> = AtomicFn::null();
@@ -44,10 +43,6 @@ pub fn set_net_drain(f: PollFn) {
 
 pub fn set_net_flush(f: VoidFn) {
     NET_FLUSH.store(f);
-}
-
-pub fn set_net_idle_flush(f: VoidFn) {
-    NET_IDLE_FLUSH.store(f);
 }
 
 pub fn set_service(f: PollFn) {
@@ -95,7 +90,6 @@ pub fn run(core_id: u32) -> ! {
     let mut drain_work: u64 = 0;
     let mut service_work: u64 = 0;
     let mut idle_count: u64 = 0;
-    let mut consecutive_idle: u32 = 0;
 
     loop {
         if loops & 63 == 0 && is_shutdown() { break; }
@@ -154,39 +148,24 @@ pub fn run(core_id: u32) -> ! {
 
         // 5. Idle if no work
         if did_work {
-            consecutive_idle = 0;
+            // work done — loop immediately
         } else {
             idle_count += 1;
-            consecutive_idle = consecutive_idle.saturating_add(1);
 
-            // Flush before sleeping. Uses idle flush (always kicks) rather
-            // than work flush (skip if not dirty). On HVF the kick MMIO
-            // exit yields to the host so the IO thread can inject frames.
-            if let Some(f) = NET_IDLE_FLUSH.load() {
-                f();
-            } else if let Some(f) = NET_FLUSH.load() {
+            // Flush before sleeping (responses may be staged).
+            if let Some(f) = NET_FLUSH.load() {
                 f();
             }
 
-            // Graduated backoff: spin briefly first, then deep sleep.
-            // This reduces wasted HLT/WFI wakeups under MTTCG where
-            // HLT doesn't properly block the host thread.
-            if consecutive_idle < 8 {
-                // Light idle: brief spin. Each iteration triggers a
-                // get_used() MMIO auto-refetch (~5µs per VM exit).
-                // 200 iterations × 5µs ≈ 1ms of polling before WFI,
-                // covering the vmnet round-trip for keep-alive requests.
-                for _ in 0..100u32 { core::hint::spin_loop(); }
+            // Sleep until interrupt. WFI/HLT yields the CPU to the
+            // host; the hypervisor resumes us when an interrupt fires.
+            if let Some(f) = IDLE.load() {
+                f(core_id);
             } else {
-                // Heavy idle: deep sleep (interrupt-armed)
-                if let Some(f) = IDLE.load() {
-                    f(core_id);
-                } else {
-                    #[cfg(target_arch = "aarch64")]
-                    unsafe { core::arch::asm!("wfi", options(nomem, nostack)); }
-                    #[cfg(target_arch = "x86_64")]
-                    unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
-                }
+                #[cfg(target_arch = "aarch64")]
+                unsafe { core::arch::asm!("wfi", options(nomem, nostack)); }
+                #[cfg(target_arch = "x86_64")]
+                unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
             }
         }
     }
