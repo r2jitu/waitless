@@ -367,14 +367,14 @@ class NativeEnv:
 
 class HvfEnv:
     name = "hvf"
-    label = "HVF+vmnet"
+    label = "HVF"
+    udp_port_offset = 10000  # host UDP port = guest port + 10000
 
     def build(self):
         subprocess.run(
             ["bazel", "build", "--config=qemu",
              "//apps/webserver:webserver.img"],
             capture_output=True, cwd=PROJECT_ROOT, timeout=120)
-        # Build the HVF runner via cargo (not yet in Bazel).
         subprocess.run(
             ["cargo", "build", "--release"],
             capture_output=True,
@@ -385,51 +385,28 @@ class HvfEnv:
              os.path.join(PROJECT_ROOT, "tools/hvf-runner/target/release/run-hvf")],
             capture_output=True, timeout=30)
 
-    # In host mode, vmnet creates a direct host↔VM network.
-    # The VM gets an IP via DHCP (typically 192.168.18.2).
-    # The bench connects directly to the VM IP, no proxy needed.
-    vm_ip = "192.168.18.2"
-
     def start(self, cpus, port):
         img = os.path.join(PROJECT_ROOT, "bazel-bin/apps/webserver/webserver.img")
         run_hvf = os.path.join(PROJECT_ROOT, "tools/hvf-runner/target/release/run-hvf")
         log = open(f"/tmp/hvf_{port}.log", "w")
+        # Userspace proxy: no sudo, TCP on localhost:port, UDP on localhost:port+10000
         return subprocess.Popen(
-            ["sudo", run_hvf, img],
+            [run_hvf, img, "128", str(port)],
             stdin=subprocess.DEVNULL, stdout=log, stderr=log)
 
     def wait_proxy_ready(self, port, proc, timeout=30):
-        """Wait for the VM to be reachable on the vmnet host-mode subnet."""
-        import socket as _socket
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if proc.poll() is not None:
-                return False
-            try:
-                s = _socket.socket()
-                s.settimeout(0.5)
-                s.connect((self.vm_ip, 80))
-                s.close()
-                return True
-            except (_socket.timeout, ConnectionRefusedError, OSError):
-                time.sleep(0.2)
-        return False
+        """Wait for the HTTP server to be reachable on the proxy port."""
+        return wait_http(port, timeout)
 
     def stop(self, proc):
         if proc and proc.poll() is None:
-            # sudo spawns run-hvf as a child; kill the process group.
-            subprocess.run(["sudo", "kill", "-TERM", str(proc.pid)],
-                           capture_output=True, timeout=5)
+            proc.terminate()
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                subprocess.run(["sudo", "pkill", "-f", "run-hvf"],
-                               capture_output=True, timeout=5)
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    pass
-        time.sleep(1)
+                proc.kill()
+                proc.wait(timeout=3)
+        time.sleep(0.5)
 
     def core_label(self, cpus):
         return f"HVF {cpus}c"
@@ -458,20 +435,17 @@ def start_env_verified(env, cpus, port):
 
     if isinstance(env, (VzEnv, HvfEnv)):
         # Phase 1: wait for proxy TCP port to be connectable (fast, <1s normally).
-        # HVF host-mode: connect directly to VM IP:80. VZ: use the requested port.
-        proxy_port = 80 if isinstance(env, HvfEnv) else port
-        if not env.wait_proxy_ready(proxy_port, proc, timeout=30):
+        if not env.wait_proxy_ready(port, proc, timeout=30):
             env.stop(proc)
             # Retry once — network interface may not have been released yet.
             proc = env.start(cpus, port)
             if proc is None:
                 return None
-            if not env.wait_proxy_ready(proxy_port, proc, timeout=30):
+            if not env.wait_proxy_ready(port, proc, timeout=30):
                 env.stop(proc)
                 return None
         # Phase 2: poll HTTP until the VM finishes booting.
-        http_host = env.vm_ip if isinstance(env, HvfEnv) else "localhost"
-        if wait_http(proxy_port, host=http_host):
+        if wait_http(port):
             return proc
         env.stop(proc)
         return None
@@ -610,9 +584,8 @@ def main():
                     wait_port_pool()
                     continue
 
-                # HVF host-mode: connect directly to VM IP on port 80.
-                wrk_host = env.vm_ip if isinstance(env, HvfEnv) else "localhost"
-                wrk_port = 80 if isinstance(env, HvfEnv) else bench_port
+                wrk_host = "localhost"
+                wrk_port = bench_port
 
                 if w["type"] == "tcp":
                     if w.get("parallel") and cpus > 1:
@@ -626,11 +599,13 @@ def main():
                     results[(env_name, cpus, wname)] = (rps, p50, p99)
                     print(f"    {wname:<20s} {rps:>10.0f} req/s  p50={p50}  p99={p99}")
                 elif w["type"] == "udp":
-                    pps, p50, p99 = run_udp(bench_port + 1, w["conns"], duration)
+                    udp_off = getattr(env, 'udp_port_offset', 1)
+                    pps, p50, p99 = run_udp(bench_port + udp_off, w["conns"], duration)
                     results[(env_name, cpus, wname)] = (pps, p50, p99)
                     print(f"    {wname:<20s} {pps:>10.0f} pkt/s  p50={p50}  p99={p99}")
                 elif w["type"] == "udp_async":
-                    pps, p50, p99 = run_udp(bench_port + 1, w["conns"], duration,
+                    udp_off = getattr(env, 'udp_port_offset', 1)
+                    pps, p50, p99 = run_udp(bench_port + udp_off, w["conns"], duration,
                                             async_mode=True)
                     results[(env_name, cpus, wname)] = (pps, p50, p99)
                     print(f"    {wname:<20s} {pps:>10.0f} pkt/s  (async recv rate)")
