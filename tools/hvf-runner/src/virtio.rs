@@ -130,7 +130,9 @@ impl QueueSnapshot {
 
     #[inline]
     pub fn gpa_to_host(&self, gpa: u64) -> *mut u8 {
-        unsafe { self.ram_host.add((gpa - self.ram_base) as usize) }
+        let offset = gpa.wrapping_sub(self.ram_base) as usize;
+        debug_assert!(offset < 1024 * 1024 * 1024, "GPA 0x{gpa:x} outside RAM");
+        unsafe { self.ram_host.add(offset) }
     }
 }
 

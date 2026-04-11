@@ -110,12 +110,19 @@ pub enum HvReg {
 }
 
 impl HvReg {
-    /// X0..X30 as a runtime index. Panics for non-GPR registers.
+    /// X0..X30 as a runtime index. Panics for index > 30.
     pub fn gpr(index: u32) -> Self {
-        assert!(index <= 30, "gpr index out of range: {index}");
-        // SAFETY: values 0..=30 map directly to X0..X30 variants by
-        // construction of the enum above.
-        unsafe { std::mem::transmute::<u32, HvReg>(index) }
+        const GPRS: [HvReg; 31] = [
+            HvReg::X0,  HvReg::X1,  HvReg::X2,  HvReg::X3,
+            HvReg::X4,  HvReg::X5,  HvReg::X6,  HvReg::X7,
+            HvReg::X8,  HvReg::X9,  HvReg::X10, HvReg::X11,
+            HvReg::X12, HvReg::X13, HvReg::X14, HvReg::X15,
+            HvReg::X16, HvReg::X17, HvReg::X18, HvReg::X19,
+            HvReg::X20, HvReg::X21, HvReg::X22, HvReg::X23,
+            HvReg::X24, HvReg::X25, HvReg::X26, HvReg::X27,
+            HvReg::X28, HvReg::X29, HvReg::X30,
+        ];
+        GPRS[index as usize]
     }
 }
 

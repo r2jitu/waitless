@@ -21,12 +21,19 @@ const VM_IP: [u8; 4] = [10, 0, 2, 15];
 const GW_IP: [u8; 4] = [10, 0, 2, 2];
 const BROADCAST_IP: [u8; 4] = [255, 255, 255, 255];
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ConnState {
+    SynSent = 0,
+    Established = 1,
+    Closed = 2,
+}
+
 struct ProxyConn {
     host_fd: i32,
     src_port: u16,
     my_seq: u32,
     peer_ack: u32,
-    state: u8,
+    state: ConnState,
     pending: Vec<u8>,
 }
 
@@ -82,15 +89,15 @@ pub fn start(port: u16) -> Result<[u8; 6], String> {
 /// TX QUEUE_NOTIFY handler. Uses TX QueueSnapshot for lock-free guest
 /// RAM access. Only takes DEVICE lock briefly for interrupt_status.
 pub fn process_tx() {
-    // TX_LAST: vCPU thread only, no sync needed.
-    static mut TX_LAST: u16 = 0;
+    use std::cell::Cell;
+    thread_local! { static TX_LAST: Cell<u16> = const { Cell::new(0) }; }
     let tx = virtio::tx_queue_snapshot();
     if !tx.ready { return; }
 
     let avail_idx = unsafe {
         core::ptr::read_volatile(tx.gpa_to_host(tx.avail_addr + 2) as *const u16)
     };
-    let mut last = unsafe { TX_LAST };
+    let mut last = TX_LAST.with(|c| c.get());
     if last == avail_idx { return; }
 
     while last != avail_idx {
@@ -123,7 +130,7 @@ pub fn process_tx() {
         }
         last = last.wrapping_add(1);
     }
-    unsafe { TX_LAST = last; }
+    TX_LAST.with(|c| c.set(last));
     unsafe { core::arch::asm!("dsb sy", options(nostack)); }
 
     // Brief lock just for interrupt_status.
@@ -142,6 +149,7 @@ fn io_thread(listen_fd: i32, mac: [u8; 6]) {
         pollfds: Vec::with_capacity(64), frame_buf: [0u8; 2048],
     };
     io.reply_queue.push_back(build_grat_arp(&mac));
+    let mut cleanup_ctr: u32 = 0;
 
     loop {
         let snap = virtio::rx_queue_snapshot();
@@ -159,7 +167,7 @@ fn io_thread(listen_fd: i32, mac: [u8; 6]) {
             let mut conns = CONNS.lock().unwrap();
             let mut flushed = false;
             for c in conns.iter_mut() {
-                if c.state == 1 && !c.pending.is_empty() {
+                if c.state == ConnState::Established && !c.pending.is_empty() {
                     let p = std::mem::take(&mut c.pending);
                     inject_data_frames(c, &p, &GUEST_MAC, &snap, &mut io.rx_last, &mut io.frame_buf);
                     flushed = true;
@@ -176,7 +184,7 @@ fn io_thread(listen_fd: i32, mac: [u8; 6]) {
         io.pollfds.push(libc::pollfd { fd: listen_fd, events: libc::POLLIN, revents: 0 });
         for c in conns.iter() {
             io.pollfds.push(libc::pollfd {
-                fd: if c.host_fd >= 0 && c.state < 2 { c.host_fd } else { -1 },
+                fd: if c.host_fd >= 0 && c.state < ConnState::Closed { c.host_fd } else { -1 },
                 events: libc::POLLIN, revents: 0,
             });
         }
@@ -203,7 +211,7 @@ fn io_thread(listen_fd: i32, mac: [u8; 6]) {
                 (0..conns.len())
                     .filter(|&i| i + 1 < io.pollfds.len()
                         && io.pollfds[i + 1].revents & (libc::POLLIN | libc::POLLHUP) != 0
-                        && conns[i].host_fd >= 0 && conns[i].state == 1)
+                        && conns[i].host_fd >= 0 && conns[i].state == ConnState::Established)
                     .map(|i| ConnSnap {
                         port: conns[i].src_port, fd: conns[i].host_fd,
                         seq: conns[i].my_seq, ack: conns[i].peer_ack,
@@ -268,7 +276,7 @@ fn io_thread(listen_fd: i32, mac: [u8; 6]) {
                             let frame = build_tcp_frame(&GUEST_MAC, GW_IP, VM_IP,
                                 c.src_port, 80, c.my_seq, c.peer_ack, 0x11, &[]);
                             c.my_seq = c.my_seq.wrapping_add(1);
-                            c.state = 2;
+                            c.state = ConnState::Closed;
                             inject_frame(&frame, &snap, &mut io.rx_last);
                             injected = true;
                         } else {
@@ -297,11 +305,10 @@ fn io_thread(listen_fd: i32, mac: [u8; 6]) {
         }
 
         // Periodically clean up closed connections (state=2, host_fd=-1).
-        static mut CLEANUP_CTR: u32 = 0;
-        unsafe { CLEANUP_CTR += 1; }
-        if unsafe { CLEANUP_CTR } % 1000 == 0 {
+        cleanup_ctr = cleanup_ctr.wrapping_add(1);
+        if cleanup_ctr % 1000 == 0 {
             let mut conns = CONNS.lock().unwrap();
-            conns.retain(|c| c.state < 2 || c.host_fd >= 0);
+            conns.retain(|c| c.state < ConnState::Closed || c.host_fd >= 0);
         }
     }
 }
@@ -329,7 +336,7 @@ fn accept_connections(io: &mut IoState, snap: &virtio::QueueSnapshot) {
         } else { io.reply_queue.push_back(frame); }
         CONNS.lock().unwrap().push(ProxyConn {
             host_fd: client_fd, src_port, my_seq: 1001, peer_ack: 0,
-            state: 0, pending: Vec::new(),
+            state: ConnState::SynSent, pending: Vec::new(),
         });
     }
 }
@@ -438,22 +445,22 @@ fn handle_tcp(tcp: &[u8]) {
     if flags & 0x04 != 0 {
         // RST — mark closed, IO thread will clean up.
         if let Some(c) = conns.iter_mut().find(|c| c.src_port == dst_port) {
-            c.state = 2;
+            c.state = ConnState::Closed;
         }
         return;
     }
     let c = match conns.iter_mut().find(|c| c.src_port == dst_port) { Some(c) => c, None => return };
     let mut replies = TX_REPLIES.lock().unwrap();
     match c.state {
-        0 => {
+        ConnState::SynSent => {
             if flags & 0x12 == 0x12 {
-                c.peer_ack = seq.wrapping_add(1); c.state = 1;
+                c.peer_ack = seq.wrapping_add(1); c.state = ConnState::Established;
                 replies.push_back(build_tcp_frame(&GUEST_MAC, GW_IP, VM_IP,
                     c.src_port, 80, c.my_seq, c.peer_ack, 0x10, &[]));
                 // Pending data will be flushed by IO thread.
             }
         }
-        1 => {
+        ConnState::Established => {
             if !payload.is_empty() {
                 c.peer_ack = seq.wrapping_add(payload.len() as u32);
                 // Write all payload bytes (handle short writes).
@@ -474,7 +481,7 @@ fn handle_tcp(tcp: &[u8]) {
                 c.peer_ack = c.peer_ack.wrapping_add(1);
                 replies.push_back(build_tcp_frame(&GUEST_MAC, GW_IP, VM_IP,
                     c.src_port, src_port, c.my_seq, c.peer_ack, 0x11, &[]));
-                c.my_seq = c.my_seq.wrapping_add(1); c.state = 2;
+                c.my_seq = c.my_seq.wrapping_add(1); c.state = ConnState::Closed;
                 unsafe { libc::close(c.host_fd); } c.host_fd = -1;
             }
         }
