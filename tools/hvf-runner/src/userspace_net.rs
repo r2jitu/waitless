@@ -122,6 +122,8 @@ pub fn start(port: u16) -> Result<[u8; 6], String> {
 pub fn flush_rx_into(dev: &mut virtio::VirtioNet) {
     let ring = unsafe { match RX_RING.as_ref() { Some(r) => r, None => return } };
 
+    if ring.is_empty() { return; }
+
     static RX_LAST: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
 
     let q = dev.queue(0);
@@ -138,7 +140,7 @@ pub fn flush_rx_into(dev: &mut virtio::VirtioNet) {
             core::ptr::read_volatile(dev.gpa_to_host(avail_base + 2) as *const u16)
         };
         let last = RX_LAST.load(std::sync::atomic::Ordering::Relaxed);
-        if last == avail_idx { return; } // ring full — frame lost (rare)
+        if last == avail_idx { return; }
 
         let ring_idx = last & (qsize - 1);
         let desc_idx = unsafe {
@@ -309,8 +311,14 @@ fn io_thread(listen_fd: i32, mac: [u8; 6]) {
 
         // Push any reply frames (ARP/TCP ACKs) to the RX ring.
         while let Some(frame) = io.reply_queue.pop_front() {
-            if !rx_ring.push(&frame) { break; } // ring full — drop
+            if !rx_ring.push(&frame) { break; }
         }
+
+        // After writing responses, immediately try to read new requests
+        // from ALL sockets (non-blocking). This eliminates the second
+        // poll() call that would otherwise add ~100µs of latency while
+        // waiting for wrk to send its next request.
+        read_all_sockets(&mut io, rx_ring);
 
         if ready <= 0 { continue; }
 
@@ -344,39 +352,50 @@ fn io_thread(listen_fd: i32, mac: [u8; 6]) {
             }
         }
 
-        // 5. Read from connections that have data.
+        // 5. Read from connections reported ready by poll().
         for i in 0..io.conns.len() {
             if i + 2 >= pollfds.len() { break; }
             if pollfds[i + 2].revents & (libc::POLLIN | libc::POLLHUP) == 0 { continue; }
-            let fd = io.conns[i].host_fd;
-            if fd < 0 { continue; }
+            read_one_socket(&mut io, i, rx_ring);
+        }
+    }
+}
 
-            let n = unsafe {
-                libc::read(fd, io.read_buf.as_mut_ptr() as *mut _, io.read_buf.len())
-            };
-            if n == 0 {
-                // EOF.
-                if io.conns[i].state == 1 {
-                    let mac = io.guest_mac;
-                    let c = &mut io.conns[i];
-                    let frame = build_tcp_frame(
-                        &mac, GW_IP, VM_IP, c.src_port, 80,
-                        c.my_seq, c.peer_ack, 0x11, &[],
-                    );
-                    c.my_seq = c.my_seq.wrapping_add(1);
-                    c.state = 2;
-                    rx_ring.push(&frame);
-                }
-            } else if n > 0 {
-                let data = &io.read_buf[..n as usize];
-                let mac = io.guest_mac;
-                let c = &mut io.conns[i];
-                if c.state == 1 {
-                    push_data_frames(c, data, &mac, rx_ring);
-                } else {
-                    c.pending.extend_from_slice(data);
-                }
-            }
+/// Non-blocking read from ALL active sockets. Called after TX drain
+/// to pick up wrk's next requests without a second poll() syscall.
+fn read_all_sockets(io: &mut IoState, rx_ring: &SpscRing<256>) {
+    for i in 0..io.conns.len() {
+        read_one_socket(io, i, rx_ring);
+    }
+}
+
+/// Non-blocking read from one socket.
+fn read_one_socket(io: &mut IoState, i: usize, rx_ring: &SpscRing<256>) {
+    let fd = io.conns[i].host_fd;
+    if fd < 0 { return; }
+    let n = unsafe {
+        libc::read(fd, io.read_buf.as_mut_ptr() as *mut _, io.read_buf.len())
+    };
+    if n == 0 {
+        if io.conns[i].state == 1 {
+            let mac = io.guest_mac;
+            let c = &mut io.conns[i];
+            let frame = build_tcp_frame(
+                &mac, GW_IP, VM_IP, c.src_port, 80,
+                c.my_seq, c.peer_ack, 0x11, &[],
+            );
+            c.my_seq = c.my_seq.wrapping_add(1);
+            c.state = 2;
+            rx_ring.push(&frame);
+        }
+    } else if n > 0 {
+        let data = &io.read_buf[..n as usize];
+        let mac = io.guest_mac;
+        let c = &mut io.conns[i];
+        if c.state == 1 {
+            push_data_frames(c, data, &mac, rx_ring);
+        } else {
+            c.pending.extend_from_slice(data);
         }
     }
 }

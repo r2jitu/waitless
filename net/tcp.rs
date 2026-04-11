@@ -64,7 +64,7 @@ struct TcpHeader {
 // SAFETY: repr(C, packed), all fields are POD integers.
 unsafe impl FromBytes for TcpHeader {}
 
-const CONNECTIONS_PER_CORE: usize = 32;
+const CONNECTIONS_PER_CORE: usize = 128;
 const MAX_CORES: usize = 8;
 const RX_BUF_SIZE: usize = 8192;
 const MSS: usize = 1460;

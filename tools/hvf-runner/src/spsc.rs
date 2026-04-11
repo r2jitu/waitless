@@ -100,6 +100,13 @@ impl<const CAP: usize> SpscRing<CAP> {
         let head = self.head.val.load(Ordering::Acquire);
         tail == head
     }
+
+    /// Number of frames in the ring.
+    pub fn len(&self) -> usize {
+        let tail = self.tail.val.load(Ordering::Relaxed);
+        let head = self.head.val.load(Ordering::Acquire);
+        head.wrapping_sub(tail)
+    }
 }
 
 // SAFETY: The ring is designed for cross-thread use (producer on one thread,

@@ -147,7 +147,7 @@ pub type Handler = fn(&Request) -> Response;
 // ---- Server -----------------------------------------------------------------
 
 const MAX_ROUTES: usize = 64;
-const MAX_ACTIVE: usize = 8; // per core
+const MAX_ACTIVE: usize = 64; // per core
 const BUF_SIZE: usize = 8192;
 const MAX_CORES: usize = 8;
 
