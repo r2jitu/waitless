@@ -21,6 +21,7 @@ pub fn generate(
     gicd_base: u64,
     gicr_base: u64,
     uart_base: u64,
+    cpu_count: usize,
     virtio_devices: &[VirtioMmioDesc],
 ) -> Vec<u8> {
     let mut fdt = FdtWriter::new().unwrap();
@@ -31,21 +32,31 @@ pub fn generate(
     fdt.property_u32("#size-cells", 2).unwrap();
     fdt.property_string("compatible", "linux,dummy-virt").unwrap();
 
+    // /psci — the guest uses HVC-based PSCI for CPU_ON/SYSTEM_OFF.
+    let psci = fdt.begin_node("psci").unwrap();
+    fdt.property_string("compatible", "arm,psci-0.2").unwrap();
+    fdt.property_string("method", "hvc").unwrap();
+    fdt.end_node(psci).unwrap();
+
     // /cpus
     let cpus = fdt.begin_node("cpus").unwrap();
     fdt.property_u32("#address-cells", 1).unwrap();
     fdt.property_u32("#size-cells", 0).unwrap();
-    let cpu0 = fdt.begin_node("cpu@0").unwrap();
-    fdt.property_string("device_type", "cpu").unwrap();
-    fdt.property_string("compatible", "arm,cortex-a72").unwrap();
-    fdt.property_u32("reg", 0).unwrap();
-    fdt.end_node(cpu0).unwrap();
+    for i in 0..cpu_count {
+        let cpu = fdt.begin_node(&format!("cpu@{i}")).unwrap();
+        fdt.property_string("device_type", "cpu").unwrap();
+        fdt.property_string("compatible", "arm,cortex-a72").unwrap();
+        fdt.property_u32("reg", i as u32).unwrap();
+        if cpu_count > 1 {
+            fdt.property_string("enable-method", "psci").unwrap();
+        }
+        fdt.end_node(cpu).unwrap();
+    }
     fdt.end_node(cpus).unwrap();
 
     // /memory@XXXXXXXX
     let mem = fdt.begin_node(&format!("memory@{ram_base:x}")).unwrap();
     fdt.property_string("device_type", "memory").unwrap();
-    // reg = <base_hi base_lo size_hi size_lo>
     fdt.property_array_u64("reg", &[ram_base, ram_size]).unwrap();
     fdt.end_node(mem).unwrap();
 
@@ -59,14 +70,15 @@ pub fn generate(
     fdt.end_node(uart).unwrap();
 
     // /intc@XXXXXXXX — GICv3
+    // Redistributor region: N CPUs × 0x20000 bytes per CPU (2 frames).
+    let gicr_size = (cpu_count as u64) * 0x2_0000;
     let gic = fdt.begin_node(&format!("intc@{gicd_base:x}")).unwrap();
     fdt.property_string("compatible", "arm,gic-v3").unwrap();
     fdt.property_u32("#interrupt-cells", 3).unwrap();
     fdt.property_null("interrupt-controller").unwrap();
-    // reg: distributor (64KB) + redistributor (128KB)
     fdt.property_array_u64("reg", &[
         gicd_base, 0x1_0000,
-        gicr_base, 0x2_0000,
+        gicr_base, gicr_size,
     ]).unwrap();
     fdt.end_node(gic).unwrap();
 
