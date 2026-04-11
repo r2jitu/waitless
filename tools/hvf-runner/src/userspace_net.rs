@@ -11,6 +11,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::hvf;
 use crate::virtio;
@@ -20,6 +21,12 @@ const GW_MAC: [u8; 6] = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
 const VM_IP: [u8; 4] = [10, 0, 2, 15];
 const GW_IP: [u8; 4] = [10, 0, 2, 2];
 const BROADCAST_IP: [u8; 4] = [255, 255, 255, 255];
+
+/// UDP relay port (host port 7 → guest port 7 by default).
+/// Guest UDP port relayed to the host. Host binds port + 10000 to
+/// avoid requiring root for privileged ports (< 1024).
+const UDP_GUEST_PORT: u16 = 7;
+const UDP_HOST_PORT: u16 = 10007;
 
 /// Fixed-size frame buffer — eliminates per-request heap allocation.
 /// Covers all reply frame types: TCP ACK (66B), ARP (54B), DHCP (~400B).
@@ -64,10 +71,19 @@ static CONNS: std::sync::LazyLock<Mutex<HashMap<u16, ProxyConn>>> =
 /// Uses fixed-size TxFrame to avoid per-request heap allocation.
 static TX_REPLIES: Mutex<VecDeque<TxFrame>> = Mutex::new(VecDeque::new());
 
+/// UDP relay: socket fd (set once by start(), read by vCPU thread in handle_udp).
+static UDP_FD: AtomicI32 = AtomicI32::new(-1);
+
+/// UDP relay: maps guest-visible src_port → external client sockaddr for return path.
+/// Written by IO thread (on incoming UDP), read by vCPU thread (on guest TX).
+static UDP_CLIENTS: Mutex<Option<HashMap<u16, libc::sockaddr_in>>> =
+    Mutex::new(None);
+
 const GUEST_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 
 struct IoState {
     listen_fd: i32,
+    udp_fd: i32,
     next_port: u16,
     guest_mac: [u8; 6],
     read_buf: [u8; 2048],
@@ -98,9 +114,39 @@ pub fn start(port: u16) -> Result<[u8; 6], String> {
         libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
         fd
     };
-    std::thread::spawn(move || { io_thread(listen_fd, mac); });
+    // Create UDP relay socket (non-fatal if bind fails).
+    let udp_fd = unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+        if fd >= 0 {
+            let one: i32 = 1;
+            libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR,
+                             &one as *const _ as *const _, 4);
+            let mut addr: libc::sockaddr_in = std::mem::zeroed();
+            addr.sin_family = libc::AF_INET as u8;
+            addr.sin_port = UDP_HOST_PORT.to_be();
+            addr.sin_addr.s_addr = u32::from_be_bytes([127, 0, 0, 1]).to_be();
+            if libc::bind(fd, &addr as *const _ as *const _, std::mem::size_of_val(&addr) as u32) < 0 {
+                let e = std::io::Error::last_os_error();
+                eprintln!("  warning: UDP bind({UDP_HOST_PORT}) failed: {e}");
+                libc::close(fd);
+                -1
+            } else {
+                libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+                fd
+            }
+        } else { -1 }
+    };
+    if udp_fd >= 0 {
+        UDP_FD.store(udp_fd, Ordering::Relaxed);
+        *UDP_CLIENTS.lock().unwrap() = Some(HashMap::new());
+    }
+    std::thread::spawn(move || { io_thread(listen_fd, udp_fd, mac); });
     eprintln!();
     eprintln!("  VM network: 10.0.2.15 (userspace, zero-copy)");
+    eprintln!("  TCP relay:  localhost:{port} -> guest:80");
+    if udp_fd >= 0 {
+        eprintln!("  UDP relay:  localhost:{UDP_HOST_PORT} -> guest:{UDP_GUEST_PORT}");
+    }
     eprintln!("  Benchmark:  wrk -t1 -c1 -d10s http://localhost:{port}/health");
     eprintln!();
     Ok(mac)
@@ -160,9 +206,9 @@ pub fn process_tx() {
 
 // ── IO / RX thread ──────────────────────────────────────────────────────────
 
-fn io_thread(listen_fd: i32, mac: [u8; 6]) {
+fn io_thread(listen_fd: i32, udp_fd: i32, mac: [u8; 6]) {
     let mut io = IoState {
-        listen_fd, next_port: 40000, guest_mac: mac,
+        listen_fd, udp_fd, next_port: 40000, guest_mac: mac,
         read_buf: [0u8; 2048], rx_last: 0,
         pollfds: Vec::with_capacity(64), poll_ports: Vec::with_capacity(64),
         frame_buf: [0u8; 2048],
@@ -216,6 +262,11 @@ fn io_thread(listen_fd: i32, mac: [u8; 6]) {
         io.poll_ports.clear();
         io.pollfds.push(libc::pollfd { fd: listen_fd, events: libc::POLLIN, revents: 0 });
         io.poll_ports.push(0); // placeholder for listen fd
+        io.pollfds.push(libc::pollfd {
+            fd: if io.udp_fd >= 0 { io.udp_fd } else { -1 },
+            events: libc::POLLIN, revents: 0,
+        });
+        io.poll_ports.push(0); // placeholder for UDP fd
         for c in conns.values() {
             io.pollfds.push(libc::pollfd {
                 fd: if c.host_fd >= 0 && c.state < ConnState::Closed { c.host_fd } else { -1 },
@@ -232,6 +283,11 @@ fn io_thread(listen_fd: i32, mac: [u8; 6]) {
             accept_connections(&mut io, &snap);
         }
 
+        // UDP relay: incoming datagrams from external clients → inject into guest.
+        if io.pollfds[1].revents & libc::POLLIN != 0 && snap.ready {
+            handle_udp_rx(&mut io, &snap);
+        }
+
         // Zero-copy RX: snapshot conn info → release lock → read() into guest RAM.
         const HDR_LEN: usize = VIRTIO_NET_HDR_SIZE + 14 + 20 + 20; // 66 bytes
         const MAX_PAYLOAD: usize = 1460;
@@ -243,7 +299,7 @@ fn io_thread(listen_fd: i32, mac: [u8; 6]) {
             // Brief lock: snapshot ready connections using poll_ports for O(1) lookup.
             let snaps: Vec<ConnSnap> = {
                 let conns = CONNS.lock().unwrap();
-                (1..io.pollfds.len()) // skip index 0 (listen fd)
+                (2..io.pollfds.len()) // skip index 0 (listen fd) and 1 (UDP fd)
                     .filter(|&i| io.pollfds[i].revents & (libc::POLLIN | libc::POLLHUP) != 0)
                     .filter_map(|i| {
                         let port = io.poll_ports[i];
@@ -325,7 +381,7 @@ fn io_thread(listen_fd: i32, mac: [u8; 6]) {
         } else {
             // RX queue not ready — buffer in pending.
             let mut conns = CONNS.lock().unwrap();
-            for i in 1..io.pollfds.len() {
+            for i in 2..io.pollfds.len() {
                 if io.pollfds[i].revents & (libc::POLLIN | libc::POLLHUP) == 0 { continue; }
                 let port = io.poll_ports[i];
                 if let Some(c) = conns.get_mut(&port) {
@@ -376,6 +432,43 @@ fn accept_connections(io: &mut IoState, snap: &virtio::QueueSnapshot) {
             host_fd: client_fd, src_port, my_seq: 1001, peer_ack: 0,
             state: ConnState::SynSent, pending: Vec::new(),
         });
+    }
+}
+
+/// Handle incoming UDP datagrams from external clients → inject into guest RX ring.
+fn handle_udp_rx(io: &mut IoState, snap: &virtio::QueueSnapshot) {
+    loop {
+        let mut client_addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        let mut addr_len: libc::socklen_t = std::mem::size_of::<libc::sockaddr_in>() as u32;
+        let n = unsafe {
+            libc::recvfrom(io.udp_fd, io.read_buf.as_mut_ptr() as *mut _,
+                io.read_buf.len(), 0,
+                &mut client_addr as *mut _ as *mut libc::sockaddr,
+                &mut addr_len)
+        };
+        if n <= 0 { break; }
+        let payload_len = n as usize;
+
+        // Extract the client's ephemeral port (network byte order → host).
+        let client_port = u16::from_be(client_addr.sin_port);
+
+        // Store the client address for the return path (guest TX → external client).
+        {
+            let mut guard = UDP_CLIENTS.lock().unwrap();
+            if let Some(ref mut m) = *guard {
+                m.insert(client_port, client_addr);
+            }
+        }
+
+        // Build Eth+IP+UDP frame wrapping the payload, inject into guest RX ring.
+        // Source: GW_IP:client_port → Dest: VM_IP:UDP_GUEST_PORT
+        let frame_len = build_udp_frame(&mut io.frame_buf, &io.guest_mac,
+            GW_IP, VM_IP, client_port, UDP_GUEST_PORT,
+            &io.read_buf[..payload_len]);
+        if inject_frame(&io.frame_buf[..frame_len], snap, &mut io.rx_last) {
+            unsafe { core::arch::asm!("dsb sy", options(nostack)); }
+            unsafe { hvf::hv_gic_set_spi(35, true); hvf::hv_gic_set_spi(35, false); }
+        }
     }
 }
 
@@ -558,8 +651,30 @@ fn handle_tcp(tcp: &[u8]) {
 
 fn handle_udp(udp: &[u8]) {
     if udp.len() < 8 { return; }
-    if u16::from_be_bytes([udp[0], udp[1]]) == 68 && u16::from_be_bytes([udp[2], udp[3]]) == 67 {
+    let src_port = u16::from_be_bytes([udp[0], udp[1]]);
+    let dst_port = u16::from_be_bytes([udp[2], udp[3]]);
+    // DHCP: guest port 68 → server port 67.
+    if src_port == 68 && dst_port == 67 {
         handle_dhcp(&udp[8..]);
+        return;
+    }
+    // General UDP relay: guest → external client.
+    let fd = UDP_FD.load(Ordering::Relaxed);
+    if fd < 0 { return; }
+    let payload = &udp[8..];
+    if payload.is_empty() { return; }
+    // Look up the external client address by the destination port
+    // (which is the ephemeral port we assigned when the client sent to us).
+    let client_addr = {
+        let guard = UDP_CLIENTS.lock().unwrap();
+        guard.as_ref().and_then(|m| m.get(&dst_port).copied())
+    };
+    if let Some(addr) = client_addr {
+        unsafe {
+            libc::sendto(fd, payload.as_ptr() as *const _, payload.len(),
+                0, &addr as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in>() as u32);
+        }
     }
 }
 
@@ -748,6 +863,65 @@ fn build_tcp_frame_fixed(dst_mac: &[u8; 6], src_ip: [u8; 4], dst_ip: [u8; 4],
     f.len = write_tcp_frame(&mut f.data, dst_mac, src_ip, dst_ip,
         src_port, dst_port, seq, ack, flags, payload) as u16;
     f
+}
+
+/// Build a UDP frame: [virtio_net_hdr 12B][Eth 14B][IP 20B][UDP 8B][payload].
+/// Returns total frame length written into `buf`.
+fn build_udp_frame(buf: &mut [u8], dst_mac: &[u8; 6],
+    src_ip: [u8; 4], dst_ip: [u8; 4],
+    src_port: u16, dst_port: u16, payload: &[u8]) -> usize {
+    let udp_len = 8 + payload.len();
+    let ip_total = 20 + udp_len;
+    let total = VIRTIO_NET_HDR_SIZE + 14 + ip_total;
+    debug_assert!(total <= buf.len());
+
+    // Virtio-net header (12 zero bytes).
+    buf[..VIRTIO_NET_HDR_SIZE].fill(0);
+    let mut o = VIRTIO_NET_HDR_SIZE;
+
+    // Ethernet header.
+    buf[o..o+6].copy_from_slice(dst_mac); o += 6;
+    buf[o..o+6].copy_from_slice(&GW_MAC); o += 6;
+    buf[o..o+2].copy_from_slice(&0x0800u16.to_be_bytes()); o += 2;
+
+    // IPv4 header.
+    let is = o;
+    buf[o] = 0x45; buf[o+1] = 0; o += 2;
+    buf[o..o+2].copy_from_slice(&(ip_total as u16).to_be_bytes()); o += 2;
+    buf[o..o+4].copy_from_slice(&[0,0,0x40,0]); o += 4; // id=0, DF, frag=0
+    buf[o] = 64; buf[o+1] = 17; o += 2; // TTL=64, protocol=UDP
+    buf[o..o+2].fill(0); o += 2; // checksum placeholder
+    buf[o..o+4].copy_from_slice(&src_ip); o += 4;
+    buf[o..o+4].copy_from_slice(&dst_ip); o += 4;
+    let cs = ipv4_checksum(&buf[is..is+20]);
+    buf[is+10] = (cs >> 8) as u8; buf[is+11] = (cs & 0xff) as u8;
+
+    // UDP header.
+    let us = o;
+    buf[o..o+2].copy_from_slice(&src_port.to_be_bytes()); o += 2;
+    buf[o..o+2].copy_from_slice(&dst_port.to_be_bytes()); o += 2;
+    buf[o..o+2].copy_from_slice(&(udp_len as u16).to_be_bytes()); o += 2;
+    buf[o..o+2].fill(0); o += 2; // checksum placeholder
+    buf[o..o+payload.len()].copy_from_slice(payload); o += payload.len();
+    let uc = udp_checksum(&src_ip, &dst_ip, &buf[us..us+udp_len]);
+    buf[us+6] = (uc >> 8) as u8; buf[us+7] = (uc & 0xff) as u8;
+
+    total
+}
+
+fn udp_checksum(si: &[u8; 4], di: &[u8; 4], seg: &[u8]) -> u16 {
+    let mut s: u32 = 0;
+    s += ((si[0] as u32)<<8)|si[1] as u32; s += ((si[2] as u32)<<8)|si[3] as u32;
+    s += ((di[0] as u32)<<8)|di[1] as u32; s += ((di[2] as u32)<<8)|di[3] as u32;
+    s += 17; // protocol = UDP
+    s += seg.len() as u32;
+    let mut i = 0;
+    while i+1 < seg.len() { s += ((seg[i] as u32)<<8)|seg[i+1] as u32; i += 2; }
+    if i < seg.len() { s += (seg[i] as u32) << 8; }
+    while s >> 16 != 0 { s = (s & 0xffff) + (s >> 16); }
+    let r = !(s as u16);
+    // UDP checksum of 0x0000 is transmitted as 0xFFFF (RFC 768).
+    if r == 0 { 0xffff } else { r }
 }
 
 fn ipv4_checksum(h: &[u8]) -> u16 {
