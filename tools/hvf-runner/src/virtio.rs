@@ -105,6 +105,62 @@ unsafe impl Send for VirtioNet {}
 
 pub static DEVICE: Mutex<Option<VirtioNet>> = Mutex::new(None);
 
+/// Snapshot of queue addresses + RAM mapping for lock-free access
+/// from the IO/RX thread. Published once after guest driver init.
+#[derive(Clone, Copy)]
+pub struct QueueSnapshot {
+    pub ram_host: *mut u8,
+    pub ram_base: u64,
+    pub desc_addr: u64,
+    pub avail_addr: u64,
+    pub used_addr: u64,
+    pub qsize: u16,
+    pub ready: bool,
+}
+
+unsafe impl Send for QueueSnapshot {}
+unsafe impl Sync for QueueSnapshot {}
+
+impl QueueSnapshot {
+    pub const EMPTY: Self = QueueSnapshot {
+        ram_host: std::ptr::null_mut(),
+        ram_base: 0, desc_addr: 0, avail_addr: 0, used_addr: 0,
+        qsize: 0, ready: false,
+    };
+
+    #[inline]
+    pub fn gpa_to_host(&self, gpa: u64) -> *mut u8 {
+        unsafe { self.ram_host.add((gpa - self.ram_base) as usize) }
+    }
+}
+
+/// RX queue snapshot, published after QUEUE_READY=1.
+static RX_SNAP: Mutex<QueueSnapshot> = Mutex::new(QueueSnapshot::EMPTY);
+
+/// Publish the RX queue snapshot for the IO thread.
+pub fn publish_rx_queue() {
+    let dev = DEVICE.lock().unwrap();
+    if let Some(d) = dev.as_ref() {
+        let q = &d.queues[0]; // RX queue
+        if q.ready {
+            *RX_SNAP.lock().unwrap() = QueueSnapshot {
+                ram_host: d.ram_host,
+                ram_base: d.ram_base,
+                desc_addr: q.desc_addr(),
+                avail_addr: q.avail_addr(),
+                used_addr: q.used_addr(),
+                qsize: q.num as u16,
+                ready: true,
+            };
+        }
+    }
+}
+
+/// Get the RX queue snapshot (for the IO thread).
+pub fn rx_queue_snapshot() -> QueueSnapshot {
+    *RX_SNAP.lock().unwrap()
+}
+
 impl VirtioNet {
     pub fn new(mac: [u8; 6], ram_host: *mut u8, ram_base: u64) -> Self {
         VirtioNet {
@@ -186,7 +242,22 @@ impl VirtioNet {
             }
             QUEUE_READY => {
                 let qi = self.queue_sel as usize;
-                if qi < NUM_QUEUES { self.queues[qi].ready = value != 0; }
+                if qi < NUM_QUEUES {
+                    self.queues[qi].ready = value != 0;
+                    if qi == 0 && value != 0 {
+                        // RX queue ready — publish snapshot for IO thread.
+                        let q = &self.queues[0];
+                        *RX_SNAP.lock().unwrap() = QueueSnapshot {
+                            ram_host: self.ram_host,
+                            ram_base: self.ram_base,
+                            desc_addr: q.desc_addr(),
+                            avail_addr: q.avail_addr(),
+                            used_addr: q.used_addr(),
+                            qsize: q.num as u16,
+                            ready: true,
+                        };
+                    }
+                }
             }
             QUEUE_DESC_LOW => {
                 let qi = self.queue_sel as usize;
