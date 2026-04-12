@@ -262,18 +262,19 @@ class KvmEnv:
         cmd = ["qemu-system-x86_64", "-accel", "kvm", "-cpu", "host",
                "-m", "128", "-smp", str(cpus), "-nographic",
                "-serial", f"file:/tmp/bench_{port}.log", "-no-reboot"]
-        dev = f"virtio-net-pci,mac={self.GUEST_MAC}"
         # The host tap0 is created with IFF_MULTI_QUEUE; QEMU rejects
         # opening it with queues=1 ("could not configure /dev/net/tun:
         # Invalid argument"), so use max(cpus, 2) on the netdev side.
-        # The device still negotiates only `cpus` queue pairs to the
-        # guest because max_virtqueue_pairs reflects what the netdev
-        # exposes; the guest uses min(desired, max).
         nqueues = max(cpus, 2)
         netdev = (f"tap,id=net0,ifname={self.TAP_IF},script=no,downscript=no,"
                   f"vhost=on,queues={nqueues}")
-        if cpus > 1:
-            dev += f",mq=on,vectors={2*cpus+2}"
+        # Always pass `mq=on` and `vectors` on the device, even at 1c.
+        # Without it, vhost-net silently drops UDP under high send rates
+        # when the netdev has more queues than the device exposes (the
+        # guest still negotiates only `cpus` queue pairs because the
+        # driver gates activation on cpu count, but the device side
+        # needs mq=on to wire up vhost properly with the multi-queue tap).
+        dev = f"virtio-net-pci,mac={self.GUEST_MAC},mq=on,vectors={2*nqueues+2}"
         cmd += ["-device", f"{dev},netdev=net0",
                 "-netdev", netdev,
                 "-kernel", elf]
@@ -556,15 +557,17 @@ WORKLOADS = [
      "threads": 1, "conns": 1,
      "desc": "/compute × 1 conn (single-flow CPU)"},
 
-    # Multi-core throughput: connections + threads scale with cpus.
-    # `parallel: True` spawns one wrk per core so the client side
-    # never bottlenecks before the server does.
+    # Multi-core throughput: connections + wrk threads scale with cpus.
+    # A single multi-threaded wrk process beats `N parallel wrk × 1
+    # thread` on Linux/tap (the parallel mode was a workaround for
+    # macOS loopback SO_REUSEPORT not hashing source ports — irrelevant
+    # here, and the per-process fork+epoll overhead just hurts).
     {"name": "health_max", "type": "tcp", "endpoint": "/health",
-     "threads_per_core": 1, "conns_per_core": 16, "parallel": True,
-     "desc": "/health throughput (16 conn × cpus, parallel wrk)"},
+     "threads_per_core": 1, "conns_per_core": 32,
+     "desc": "/health throughput (32 conn × cpus)"},
     {"name": "compute_max", "type": "tcp", "endpoint": "/compute",
-     "threads_per_core": 1, "conns_per_core": 8, "parallel": True,
-     "desc": "/compute throughput (8 conn × cpus, parallel wrk)"},
+     "threads_per_core": 1, "conns_per_core": 8,
+     "desc": "/compute throughput (8 conn × cpus)"},
 
     # UDP echo: senders also scale with cpus so the client load grows
     # alongside the server. udp_bench caps at 64 senders total.
