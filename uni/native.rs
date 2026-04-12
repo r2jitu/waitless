@@ -77,6 +77,7 @@ struct SockAddrIn {
     sin_zero: [u8; 8],
 }
 
+#[cfg(target_os = "macos")]
 #[repr(C)]
 struct Timespec {
     tv_sec: i64,
