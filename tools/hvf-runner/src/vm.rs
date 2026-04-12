@@ -162,7 +162,7 @@ impl Vm {
         let ram_mapped = 1024 * 1024 * 1024; // 1 GB
 
         // Determine vCPU count: performance cores, capped at 4.
-        let cpu_count = perf_core_count().min(MAX_VCPUS).min(4).max(1);
+        let cpu_count = 1; // TODO: multi-core gated, see known issues
         eprintln!("  vCPU count: {cpu_count}");
 
         // 1. Create the VM with a large enough IPA space.
