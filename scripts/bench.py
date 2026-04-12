@@ -212,6 +212,43 @@ class QemuEnv:
         return f"QEMU {cpus}c" + (" MTTCG" if cpus > 1 else "")
 
 
+class KvmEnv:
+    name = "kvm"
+    label = "QEMU x86_64 KVM"
+
+    # Path to pre-staged ELF; set via --elf. If None, bazel build runs.
+    elf_override = None
+
+    def build(self):
+        if self.elf_override:
+            return  # Pre-staged binary; nothing to build.
+        subprocess.run(
+            ["bazel", "build", "--config=x86_64-qemu", "//apps/webserver:webserver.elf"],
+            capture_output=True, cwd=PROJECT_ROOT, timeout=120)
+
+    def start(self, cpus, port):
+        elf = self.elf_override or os.path.join(
+            PROJECT_ROOT, "bazel-bin/apps/webserver/webserver.elf")
+        cmd = ["qemu-system-x86_64", "-accel", "kvm", "-cpu", "host",
+               "-m", "128", "-smp", str(cpus), "-nographic",
+               "-serial", f"file:/tmp/bench_{port}.log", "-no-reboot"]
+        dev = "virtio-net-pci"
+        if cpus > 1:
+            dev += f",mq=on,vectors={2*cpus+2}"
+        cmd += ["-device", f"{dev},netdev=net0",
+                "-netdev", f"user,id=net0,hostfwd=tcp::{port}-:80,hostfwd=udp::{port+1}-:7",
+                "-kernel", elf]
+        return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def stop(self, proc):
+        if proc and proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+    def core_label(self, cpus):
+        return f"KVM {cpus}c"
+
+
 class QemuAarch64Env:
     name = "qemu-arm"
     label = "QEMU aarch64 TCG"
@@ -415,6 +452,7 @@ class HvfEnv:
 
 ENV_MAP = {
     "qemu": QemuEnv,
+    "kvm": KvmEnv,
     "qemu-arm": QemuAarch64Env,
     "vz": VzEnv,
     "hvf": HvfEnv,
@@ -485,6 +523,8 @@ def main():
                         help="Specific workload name (default: all)")
     parser.add_argument("--duration", type=int, default=5,
                         help="Seconds per test (default: 5)")
+    parser.add_argument("--elf", default=None,
+                        help="Pre-built ELF path (kvm env only; skips bazel build)")
     args = parser.parse_args()
 
     duration = args.duration
@@ -524,6 +564,8 @@ def main():
             print(f"Unknown env: {name}. Available: {','.join(ENV_MAP.keys())}")
             sys.exit(1)
         envs[name] = ENV_MAP[name]()
+        if name == "kvm" and args.elf:
+            envs[name].elf_override = os.path.abspath(args.elf)
 
     # Collect results: results[(env_name, cpus, workload_name)] = (rps, p50, p99)
     results = {}
