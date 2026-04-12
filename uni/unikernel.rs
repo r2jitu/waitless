@@ -123,8 +123,16 @@ fn arch_unmask_irq() {
 #[cfg(target_arch = "aarch64")]
 #[inline]
 fn arch_idle() {
-    // SAFETY: arms the per-CPU virtual timer and issues WFI on the current
-    // CPU. No caller-supplied invariants.
+    // If the HVF runner advertised a yield register, write to it instead
+    // of WFI. The write causes a stage-2 fault; the runner parks this
+    // vCPU thread at zero CPU cost until the IO thread has data.
+    let yield_addr = kernel::aarch64::fdt::info().yield_mmio_base;
+    if yield_addr != 0 {
+        unsafe { core::ptr::write_volatile(yield_addr as *mut u32, 0); }
+        return;
+    }
+
+    // Fallback: vtimer + WFI (QEMU / VZ / other hypervisors).
     unsafe {
         let freq: u64;
         core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq);

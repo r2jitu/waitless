@@ -35,6 +35,11 @@ pub struct FdtInfo {
     pub pci_mmio32_size: u64,
     pub pci_irqs: [u32; 8],
     pub cpu_count: u32,
+    /// HVF cooperative yield MMIO base address. When non-zero, the guest
+    /// writes to this address instead of executing WFI, allowing the HVF
+    /// runner to park the vCPU thread at zero CPU cost. Discovered from
+    /// an `hvf-yield` FDT node (only present in HVF runner FDTs).
+    pub yield_mmio_base: u64,
 }
 
 impl FdtInfo {
@@ -55,6 +60,7 @@ impl FdtInfo {
         pci_mmio32_size: 0,
         pci_irqs: [0; 8],
         cpu_count: 0,
+        yield_mmio_base: 0,
     };
 }
 
@@ -230,6 +236,13 @@ fn extract_info(fdt: &fdt::Fdt) -> FdtInfo {
         }
         if let Some(imap) = pci.property("interrupt-map") {
             parse_pci_interrupt_map(imap.value, &mut info.pci_irqs);
+        }
+    }
+
+    // HVF cooperative yield register.
+    if let Some(node) = fdt.find_compatible(&["hvf,yield"]) {
+        if let Some(reg) = node.reg().and_then(|mut r| r.next()) {
+            info.yield_mmio_base = reg.starting_address as u64;
         }
     }
 

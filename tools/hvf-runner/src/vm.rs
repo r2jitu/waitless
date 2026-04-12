@@ -12,7 +12,7 @@
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::decoder;
 use crate::fdt;
@@ -28,12 +28,48 @@ static VCPU_HANDLES: [AtomicU64; MAX_VCPUS] = {
     [INIT; MAX_VCPUS]
 };
 
-/// Wake a specific vCPU by kicking it out of hv_vcpu_run (WFI).
-/// Called from the IO thread after injecting frames into a core's RX queue.
-/// Safe to call even if the vCPU isn't in WFI — it will just be a no-op
-/// (HV_EXIT_REASON_CANCELED is handled in the run loop).
+// ── Per-vCPU parking state for cooperative yield ──────────────────────────
+// When the guest writes to YIELD_MMIO_BASE, the vCPU thread parks on the
+// condvar. The IO thread signals it via wake_vcpu() when data arrives.
+// The Mutex<bool> flag prevents missed wakeups: the IO thread sets it to
+// true before signaling, and the yield handler checks it before parking.
+struct VcpuPark {
+    mu: Mutex<bool>,
+    cv: Condvar,
+}
+
+static VCPU_PARKS: [VcpuPark; MAX_VCPUS] = {
+    const INIT: VcpuPark = VcpuPark {
+        mu: Mutex::new(false),
+        cv: Condvar::new(),
+    };
+    [INIT; MAX_VCPUS]
+};
+
+/// Park the current vCPU thread until wake_vcpu() signals it.
+/// Called from the run loop when the guest writes to the yield MMIO register.
+fn park_vcpu(vcpu_id: usize) {
+    let park = &VCPU_PARKS[vcpu_id];
+    let mut guard = park.mu.lock().unwrap();
+    while !*guard {
+        guard = park.cv.wait(guard).unwrap();
+    }
+    *guard = false;
+}
+
+/// Wake a specific vCPU. Called from the IO thread after injecting frames.
+/// Signals the cooperative-yield condvar (in case the vCPU is parked) AND
+/// kicks hv_vcpu_run via hv_vcpus_exit (in case it's in WFI).
 pub fn wake_vcpu(core_id: usize) {
     if core_id >= MAX_VCPUS { return; }
+    // Signal condvar — wakes the thread if parked in park_vcpu().
+    {
+        let mut pending = VCPU_PARKS[core_id].mu.lock().unwrap();
+        *pending = true;
+        VCPU_PARKS[core_id].cv.notify_one();
+    }
+    // Also kick hv_vcpu_run in case the vCPU is inside hv_vcpu_run
+    // (not parked). The resulting CANCELED exit is harmless.
     let handle = VCPU_HANDLES[core_id].load(Ordering::Acquire);
     if handle != 0 {
         unsafe { hv_vcpus_exit(&handle as *const u64 as *const _, 1); }
@@ -73,6 +109,12 @@ const VTIMER_INTID: u32 = 27;
 /// Maximum number of vCPUs we support.
 const MAX_VCPUS: usize = 8;
 
+// ── Cooperative yield — guest MMIO write parks the vCPU thread ─────────────
+// Address chosen right after PL011 (0x09000000). Not mapped in stage-2,
+// so a guest access causes a data abort that we intercept in the run loop.
+const YIELD_MMIO_BASE: u64 = 0x0900_1000;
+const YIELD_MMIO_SIZE: u64 = 0x1000;
+
 // ── Thread-safe raw pointer wrapper ─────────────────────────────────────────
 
 /// Wrapper for a raw pointer that is safe to send across threads.
@@ -110,50 +152,19 @@ pub struct Vm {
     shutdown: Arc<AtomicBool>,
 }
 
-/// Query the number of performance cores on this Mac.
-fn perf_core_count() -> usize {
-    let mut count: u32 = 0;
-    let mut len = std::mem::size_of::<u32>();
-    let name = c"hw.perflevel0.physicalcpu";
-    let ret = unsafe {
-        libc::sysctlbyname(
-            name.as_ptr(),
-            &mut count as *mut _ as *mut _,
-            &mut len,
-            ptr::null_mut(),
-            0,
-        )
-    };
-    if ret == 0 && count > 0 {
-        count as usize
-    } else {
-        // Fallback: total physical CPUs.
-        let mut total: u32 = 0;
-        let mut tlen = std::mem::size_of::<u32>();
-        let tname = c"hw.physicalcpu";
-        unsafe {
-            libc::sysctlbyname(
-                tname.as_ptr(),
-                &mut total as *mut _ as *mut _,
-                &mut tlen,
-                ptr::null_mut(),
-                0,
-            );
-        }
-        if total > 0 { total as usize } else { 1 }
-    }
-}
-
 impl Vm {
-    /// Create a VM with a default MAC address.
-    #[allow(dead_code)]
-    pub fn new(kernel_path: &str, ram_mib: usize) -> Result<Self, String> {
-        Self::new_with_mac(kernel_path, ram_mib, [0x52, 0x54, 0x00, 0x12, 0x34, 0x56])
-    }
-
-    /// Create a VM, allocate RAM, set up vGIC, create N vCPUs, load kernel,
-    /// generate FDT, configure initial register state for vCPU 0.
-    pub fn new_with_mac(kernel_path: &str, ram_mib: usize, mac: [u8; 6]) -> Result<Self, String> {
+    /// Create a VM, allocate RAM, set up vGIC, create `cpu_count` vCPUs,
+    /// load kernel, generate FDT, configure initial register state for vCPU 0.
+    ///
+    /// `cpu_count` is clamped to [1, MAX_VCPUS]. 1 vCPU is the default and
+    /// tends to be optimal for this workload; cooperative MMIO yield keeps
+    /// idle vCPUs at zero CPU, so multi-core is also safe to use.
+    pub fn new_with_config(
+        kernel_path: &str,
+        ram_mib: usize,
+        cpu_count: usize,
+        mac: [u8; 6],
+    ) -> Result<Self, String> {
         let ram_size_fdt = ram_mib * 1024 * 1024;
         // Map a full 1 GB (the L1 page-table block size) regardless of
         // the FDT-declared RAM size. boot.S maps L1[1] as a 1 GB Normal
@@ -161,8 +172,7 @@ impl Vm {
         // init zeroes memory past the declared boundary.
         let ram_mapped = 1024 * 1024 * 1024; // 1 GB
 
-        // Determine vCPU count: performance cores, capped at 4.
-        let cpu_count = 1; // TODO: multi-core gated, see known issues
+        let cpu_count = cpu_count.clamp(1, MAX_VCPUS);
         eprintln!("  vCPU count: {cpu_count}");
 
         // 1. Create the VM with a large enough IPA space.
@@ -391,7 +401,18 @@ fn run_vcpu(
                         }
                     }
                     EC_DATA_ABORT_LOWER | EC_DATA_ABORT_SAME => {
-                        handle_mmio(vcpu, exit, ram_host, ram_size)?;
+                        let fault_ipa = exit.exception.physical_address;
+                        if fault_ipa >= YIELD_MMIO_BASE
+                            && fault_ipa < YIELD_MMIO_BASE + YIELD_MMIO_SIZE
+                        {
+                            // Cooperative yield — park this vCPU until
+                            // the IO thread has data for it.
+                            park_vcpu(vcpu_id);
+                            let pc = get_reg(vcpu, HvReg::Pc);
+                            set_reg(vcpu, HvReg::Pc, pc + 4);
+                        } else {
+                            handle_mmio(vcpu, exit, ram_host, ram_size)?;
+                        }
                     }
                     _ => {
                         return Err(format!(
@@ -451,10 +472,16 @@ fn handle_hvc(
         PSCI_SYSTEM_OFF | PSCI_SYSTEM_RESET => {
             // Signal all vCPUs to stop.
             shutdown.store(true, Ordering::Release);
-            // Kick all running vCPUs out of hv_vcpu_run so they see
-            // the shutdown flag.
-            for vi in all_vcpus {
+            // Wake all running vCPUs — both parked (condvar) and
+            // in hv_vcpu_run (hv_vcpus_exit) — so they see the
+            // shutdown flag.
+            for (i, vi) in all_vcpus.iter().enumerate() {
                 if vi.running.load(Ordering::Acquire) {
+                    {
+                        let mut pending = VCPU_PARKS[i].mu.lock().unwrap();
+                        *pending = true;
+                        VCPU_PARKS[i].cv.notify_one();
+                    }
                     let _ = unsafe {
                         hv_vcpus_exit(&vi.vcpu as *const _, 1)
                     };

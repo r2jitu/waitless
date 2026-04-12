@@ -390,8 +390,9 @@ class HvfEnv:
         run_hvf = os.path.join(PROJECT_ROOT, "tools/hvf-runner/target/release/run-hvf")
         log = open(f"/tmp/hvf_{port}.log", "w")
         # Userspace proxy: no sudo, TCP on localhost:port, UDP on localhost:port+10000
+        # Positional args to run-hvf: <img> <ram_mib> <host_port> <vcpus>
         return subprocess.Popen(
-            [run_hvf, img, "128", str(port)],
+            [run_hvf, img, "128", str(port), str(cpus)],
             stdin=subprocess.DEVNULL, stdout=log, stderr=log)
 
     def wait_proxy_ready(self, port, proc, timeout=30):

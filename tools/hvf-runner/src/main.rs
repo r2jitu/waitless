@@ -20,13 +20,15 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: run-hvf <path-to.img> [ram_mib]");
+        eprintln!("Usage: run-hvf <path-to.img> [ram_mib] [host_port] [vcpus]");
         eprintln!("  Boots an ARM64 kernel image under Apple Hypervisor.framework.");
+        eprintln!("  Defaults: ram_mib=128, host_port=8080, vcpus=1.");
         eprintln!("  Requires codesign with com.apple.security.hypervisor entitlement.");
         std::process::exit(1);
     }
     let kernel_path = &args[1];
     let ram_mib: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(128);
+    let cpu_count: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1);
 
     // macOS version gate: hv_gic_create requires macOS 15+.
     let os_ver = os_version();
@@ -81,7 +83,7 @@ fn main() {
     };
 
     // Create and run the VM.
-    let mut vm = match vm::Vm::new_with_mac(kernel_path, ram_mib, vmnet_mac) {
+    let mut vm = match vm::Vm::new_with_config(kernel_path, ram_mib, cpu_count, vmnet_mac) {
         Ok(vm) => vm,
         Err(e) => {
             terminal::restore();

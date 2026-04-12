@@ -92,6 +92,16 @@ pub fn generate(
         fdt.end_node(node).unwrap();
     }
 
+    // /hvf-yield@9001000 — cooperative yield register.
+    // The guest writes to this MMIO address instead of executing WFI.
+    // The HVF runner intercepts the stage-2 fault and parks the vCPU
+    // thread until the IO thread has data for it (zero host CPU while
+    // idle). QEMU/VZ FDTs omit this node, so the guest falls back to WFI.
+    let yield_node = fdt.begin_node("hvf-yield@9001000").unwrap();
+    fdt.property_string("compatible", "hvf,yield").unwrap();
+    fdt.property_array_u64("reg", &[0x0900_1000, 0x1000]).unwrap();
+    fdt.end_node(yield_node).unwrap();
+
     fdt.end_node(root).unwrap();
     fdt.finish().unwrap()
 }

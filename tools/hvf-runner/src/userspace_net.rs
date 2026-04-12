@@ -281,6 +281,9 @@ fn io_thread(listen_fd: i32, udp_fd: i32, mac: [u8; 6]) {
                         if woken[qp] { crate::vm::wake_vcpu(qp); }
                     }
                 } else {
+                    // Single-queue: wake the (only) vCPU (may be parked on
+                    // cooperative-yield condvar) and deliver the virtio SPI.
+                    crate::vm::wake_vcpu(0);
                     unsafe { hvf::hv_gic_set_spi(35, true); hvf::hv_gic_set_spi(35, false); }
                 }
             }
@@ -314,6 +317,7 @@ fn io_thread(listen_fd: i32, udp_fd: i32, mac: [u8; 6]) {
                         if woken[qp] { crate::vm::wake_vcpu(qp); }
                     }
                 } else {
+                    crate::vm::wake_vcpu(0);
                     unsafe { hvf::hv_gic_set_spi(35, true); hvf::hv_gic_set_spi(35, false); }
                 }
             }
@@ -496,6 +500,7 @@ fn io_thread(listen_fd: i32, udp_fd: i32, mac: [u8; 6]) {
                     if woken[qp] { crate::vm::wake_vcpu(qp); }
                 }
             } else {
+                crate::vm::wake_vcpu(0);
                 unsafe { hvf::hv_gic_set_spi(35, true); hvf::hv_gic_set_spi(35, false); }
             }
         }
@@ -541,6 +546,7 @@ fn accept_connections(io: &mut IoState, snap: &virtio::QueueSnapshot) {
             if multi_queue {
                 crate::vm::wake_vcpu(qp);
             } else {
+                crate::vm::wake_vcpu(0);
                 unsafe { hvf::hv_gic_set_spi(35, true); hvf::hv_gic_set_spi(35, false); }
             }
         } else { TX_REPLIES.lock().unwrap().push_back(frame); }
@@ -584,6 +590,7 @@ fn handle_udp_rx(io: &mut IoState, snap: &virtio::QueueSnapshot) {
             &io.read_buf[..payload_len]);
         if inject_frame(&io.frame_buf[..frame_len], snap, &mut io.rx_last) {
             unsafe { core::arch::asm!("dsb sy", options(nostack)); }
+            crate::vm::wake_vcpu(0);
             unsafe { hvf::hv_gic_set_spi(35, true); hvf::hv_gic_set_spi(35, false); }
         }
     }

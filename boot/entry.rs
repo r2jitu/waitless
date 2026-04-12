@@ -510,17 +510,24 @@ unsafe fn kernel_boot(info: &BootInfo) {
 }
 
 /// Event loop idle callback. Core-aware:
-/// - Core 0: arm VirtIO RX notifications + WFI/HLT (wakes on RX interrupt)
-/// - Other cores: lightweight sleep (WFI on aarch64, HLT on x86)
-///   Wakes when the distributor sends SGI after distributing packets.
-///   WFI is used (not WFE) because WFE wakes from any SEV (spurious), which
-///   starves the VZ TCP proxy thread. wake_cores() sends SGI so WFI wakes correctly.
+/// - Core 0: arm VirtIO RX notifications + yield/WFI (wakes on data or interrupt)
+/// - Other cores: yield/WFI (wakes when the IO thread or distributor sends data)
+///   On the HVF runner, yield MMIO parks the thread at zero CPU cost.
+///   On QEMU/VZ, WFI is used (not WFE) because WFE wakes from any SEV (spurious),
+///   which starves the VZ TCP proxy thread. wake_cores() sends SGI so WFI wakes correctly.
 fn idle_cb(core_id: u32) {
     if core_id == 0 || kernel::percpu::num_cores() <= 1 {
         uni::wait_for_events();
     } else {
         #[cfg(target_arch = "aarch64")]
-        unsafe { core::arch::asm!("wfi", options(nomem, nostack)); }
+        {
+            let yield_addr = kernel::aarch64::fdt::info().yield_mmio_base;
+            if yield_addr != 0 {
+                unsafe { core::ptr::write_volatile(yield_addr as *mut u32, core_id); }
+            } else {
+                unsafe { core::arch::asm!("wfi", options(nomem, nostack)); }
+            }
+        }
         #[cfg(target_arch = "x86_64")]
         unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
     }
