@@ -94,13 +94,15 @@ ssh "$SSH_HOST" "mkdir -p ~/$REMOTE_DIR && chmod -R u+w ~/$REMOTE_DIR"
 # rsync preserves mtimes so subsequent runs skip unchanged files.
 rsync -az --partial "${sync_files[@]}" "$SSH_HOST:$REMOTE_DIR/"
 
-# Build udp_bench on the remote if missing or stale, and ensure the tap0
-# backend is wired up for the kvm env. Both are no-ops if already current.
+# Build udp_bench on the remote if missing or stale, and force-recreate
+# tap0 so vhost-net starts the bench with a clean slate (stale tap state
+# from a prior run can break the very first udp_async test).
 ssh "$SSH_HOST" "cd $REMOTE_DIR && \
     if [ ! -f udp_bench ] || [ udp_bench.c -nt udp_bench ]; then \
         cc -O2 -o udp_bench udp_bench.c -lpthread; \
     fi && \
     chmod +x bench-tap-setup.sh && \
+    sudo ip link del tap0 2>/dev/null; \
     sudo ./bench-tap-setup.sh"
 
 # Run bench.py on the remote.

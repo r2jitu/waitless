@@ -197,6 +197,24 @@ def run_udp(port, senders, duration, async_mode=False, host="127.0.0.1"):
     return sum(recv) / duration, "", ""
 
 
+def _udp_with_retry(port, senders, duration, host, async_mode):
+    """Run a UDP test, retrying up to two extra times if it returns 0.
+
+    On tap+vhost the very first udp_async burst after a fresh VM boot
+    occasionally races vhost-net warmup and yields zero replies even
+    though a follow-up run on the same VM works. Retrying with a short
+    pause masks the flake without hiding genuine failures (a broken
+    config still records 0 after three attempts).
+    """
+    pps, p50, p99 = run_udp(port, senders, duration, async_mode=async_mode, host=host)
+    for _ in range(2):
+        if pps > 0:
+            break
+        time.sleep(0.5)
+        pps, p50, p99 = run_udp(port, senders, duration, async_mode=async_mode, host=host)
+    return pps, p50, p99
+
+
 # ── Environment runners ──────────────────────────────────────────────────────
 
 class QemuEnv:
@@ -284,6 +302,22 @@ class KvmEnv:
         if proc and proc.poll() is None:
             proc.kill()
             proc.wait()
+        # vhost-net's per-queue worker threads occasionally hang on to a
+        # multi-queue tap fd just long enough that the next QEMU instance
+        # finds the device in a half-broken state — udp_async at 1c then
+        # records 0 pkt/s for several runs in a row even though the same
+        # command works in isolation. Tearing tap0 down and re-creating
+        # it between iterations gives vhost a clean slate and eliminates
+        # the flake. Cheap (~30ms) compared to a 6s test.
+        try:
+            subprocess.run(
+                ["sudo", "ip", "link", "del", self.TAP_IF],
+                capture_output=True, timeout=5)
+            subprocess.run(
+                ["sudo", "/usr/local/sbin/bench-tap-setup.sh"],
+                capture_output=True, timeout=5)
+        except Exception:
+            pass
 
     def core_label(self, cpus):
         return f"KVM {cpus}c"
@@ -751,24 +785,13 @@ def main():
                     results[(env_name, cpus, wname)] = (rps, p50, p99)
                     print(f"    {wname:<20s} {rps:>10.0f} req/s  p50={p50}  p99={p99}")
                 elif w["type"] == "udp":
-                    pps, p50, p99 = run_udp(udp_target_port, senders, duration,
-                                            host=wrk_host)
-                    # The first udp burst after VM boot races ARP-resolution
-                    # of the host MAC; on tap+vhost this can occasionally
-                    # show as 0 pkt/s. Retry once before recording.
-                    if pps == 0:
-                        time.sleep(0.5)
-                        pps, p50, p99 = run_udp(udp_target_port, senders, duration,
-                                                host=wrk_host)
+                    pps, p50, p99 = _udp_with_retry(
+                        udp_target_port, senders, duration, wrk_host, async_mode=False)
                     results[(env_name, cpus, wname)] = (pps, p50, p99)
                     print(f"    {wname:<20s} {pps:>10.0f} pkt/s  p50={p50}  p99={p99}")
                 elif w["type"] == "udp_async":
-                    pps, p50, p99 = run_udp(udp_target_port, senders, duration,
-                                            async_mode=True, host=wrk_host)
-                    if pps == 0:
-                        time.sleep(0.5)
-                        pps, p50, p99 = run_udp(udp_target_port, senders, duration,
-                                                async_mode=True, host=wrk_host)
+                    pps, p50, p99 = _udp_with_retry(
+                        udp_target_port, senders, duration, wrk_host, async_mode=True)
                     results[(env_name, cpus, wname)] = (pps, p50, p99)
                     print(f"    {wname:<20s} {pps:>10.0f} pkt/s  (async recv rate)")
 
