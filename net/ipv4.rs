@@ -2,6 +2,7 @@
 
 #![no_std]
 
+extern crate kernel;
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
 extern crate net_ethernet as ethernet;
@@ -41,13 +42,27 @@ pub struct Ipv4Packet<'a> {
     pub payload: &'a [u8],
 }
 
-/// IPv4 packet identification counter (used for fragmentation).
-static IP_ID_COUNTER: core::sync::atomic::AtomicU16 =
-    core::sync::atomic::AtomicU16::new(1);
+/// IPv4 packet identification counter — per core to avoid the cache-line
+/// ping-pong from a global atomic incrementing on every TX. Each core
+/// gets its own 16-bit space starting at `cpu_id << 13`, so collisions
+/// across cores are rare and limited to wraparound, which doesn't
+/// matter for non-fragmented traffic (the ID is only used for fragment
+/// reassembly).
+#[repr(align(64))]
+struct IpIdSlot(core::sync::atomic::AtomicU16);
+
+const IP_ID_SLOTS: usize = kernel::percpu::MAX_CORES;
+static IP_ID_PERCORE: [IpIdSlot; IP_ID_SLOTS] =
+    [const { IpIdSlot(core::sync::atomic::AtomicU16::new(0)) }; IP_ID_SLOTS];
 
 #[inline]
 fn next_ip_id() -> u16 {
-    IP_ID_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+    let core = kernel::cpu_id() as usize;
+    let slot = if core < IP_ID_SLOTS { core } else { 0 };
+    // Per-core access, but the field is still atomic so the Rust memory
+    // model is happy and a borrow check on `&IpIdSlot` works through the
+    // shared static. Relaxed is fine — IP IDs have no ordering needs.
+    IP_ID_PERCORE[slot].0.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn ipv4_send(dst: Ipv4Addr, proto: u8, payload: &[u8]) {

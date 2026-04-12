@@ -989,7 +989,11 @@ pub fn poll_qp(qp: usize, callback: fn(&[u8])) -> i32 {
         // used_idx was cached by irq_handler; get_used() will find it.
     }
 
-    if kernel::percpu::num_cores() <= 1 {
+    // Tier 1 (per-core RX queue) — qp is owned by this core, no
+    // lock needed. Tier 2 (single shared queue) — serialise via
+    // TX_LOCK so cores don't race the same TX descriptors.
+    let nqp = unsafe { (*ndev()).num_queue_pairs };
+    if kernel::percpu::num_cores() <= 1 || (nqp as usize) > 1 {
         tx_drain_qp(qp);
     } else if let Some(_g) = TX_LOCK.try_lock() {
         tx_drain_qp(qp);
@@ -1080,8 +1084,10 @@ pub fn poll_batch_qp(qp: usize, batch: &mut RxBatch) {
         if let Transport::None = (*ndev()).transport { return; }
     }
 
-    // Drain TX completions (under lock when multi-core).
-    if kernel::percpu::num_cores() <= 1 {
+    // Drain TX completions. Tier 1 owns qp per core (no lock needed),
+    // Tier 2 has the single shared queue and must serialise.
+    let nqp = unsafe { (*ndev()).num_queue_pairs };
+    if kernel::percpu::num_cores() <= 1 || (nqp as usize) > 1 {
         tx_drain_qp(qp);
     } else if let Some(_g) = TX_LOCK.try_lock() {
         tx_drain_qp(qp);

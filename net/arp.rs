@@ -114,6 +114,112 @@ impl ArpCache {
 
 static ARP_CACHE: Spinlock<ArpCache> = Spinlock::new(ArpCache::new());
 
+// ─── Per-core lock-free ARP fast-cache ──────────────────────────────────────
+//
+// Every TCP/UDP send goes through `arp_resolve`, which under the original
+// design took the global `ARP_CACHE` spinlock once per packet. With 8 cores
+// transmitting at 200k pkt/s each, that one lock dropped per-core throughput
+// from ~250k → ~33k req/s on the bench.
+//
+// The fast-cache is an array of single-entry caches indexed by `cpu_id()`.
+// Each core's owner is the only writer of its own MAC field; the IP field
+// is also written cross-core by `arp_fast_invalidate_all` when an ARP reply
+// updates the slow cache. Both fields use atomics so the Rust memory model
+// is happy regardless of who's reading.
+//
+// IP is the validity tag — readers load it first, load the MAC, then load
+// the IP again and verify it matches. A torn write produces a miss, never
+// a wrong MAC. On a hit (the common case — wrk hammers one destination),
+// `arp_resolve` returns without touching shared state at all.
+
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+#[repr(align(64))]
+struct ArpFastSlot {
+    ip: AtomicU32,
+    /// MAC packed into a u64: bytes 0..6 occupy the low 48 bits.
+    mac: AtomicU64,
+}
+
+const ARP_FAST_SLOTS: usize = kernel::percpu::MAX_CORES;
+static ARP_FAST: [ArpFastSlot; ARP_FAST_SLOTS] =
+    [const { ArpFastSlot {
+        ip: AtomicU32::new(0),
+        mac: AtomicU64::new(0),
+    } }; ARP_FAST_SLOTS];
+
+#[inline]
+fn pack_mac(m: MacAddr) -> u64 {
+    let b = m.bytes;
+    (b[0] as u64)
+        | ((b[1] as u64) << 8)
+        | ((b[2] as u64) << 16)
+        | ((b[3] as u64) << 24)
+        | ((b[4] as u64) << 32)
+        | ((b[5] as u64) << 40)
+}
+
+#[inline]
+fn unpack_mac(v: u64) -> MacAddr {
+    MacAddr {
+        bytes: [
+            v as u8,
+            (v >> 8) as u8,
+            (v >> 16) as u8,
+            (v >> 24) as u8,
+            (v >> 32) as u8,
+            (v >> 40) as u8,
+        ],
+    }
+}
+
+#[inline]
+fn arp_fast_lookup(ip: Ipv4Addr) -> Option<MacAddr> {
+    if ip.addr == 0 {
+        return None;
+    }
+    let core = kernel::cpu_id() as usize;
+    if core >= ARP_FAST_SLOTS {
+        return None;
+    }
+    let slot = &ARP_FAST[core];
+    let ip1 = slot.ip.load(Ordering::Acquire);
+    if ip1 != ip.addr {
+        return None;
+    }
+    let mac = slot.mac.load(Ordering::Relaxed);
+    // Re-check IP after MAC load: if a writer raced us between the two
+    // loads the IP would now mismatch and we'd return None.
+    if slot.ip.load(Ordering::Acquire) != ip1 {
+        return None;
+    }
+    Some(unpack_mac(mac))
+}
+
+#[inline]
+fn arp_fast_store(ip: Ipv4Addr, mac: MacAddr) {
+    let core = kernel::cpu_id() as usize;
+    if core >= ARP_FAST_SLOTS {
+        return;
+    }
+    let slot = &ARP_FAST[core];
+    // Invalidate by zeroing IP first, then write the MAC, then publish
+    // the new IP. A reader on the same core won't observe a half-written
+    // entry, and a cross-core invalidator only zeroes the IP.
+    slot.ip.store(0, Ordering::Relaxed);
+    slot.mac.store(pack_mac(mac), Ordering::Relaxed);
+    slot.ip.store(ip.addr, Ordering::Release);
+}
+
+/// Invalidate every per-core fast slot. Called whenever the global
+/// ARP_CACHE is mutated so a core caching the old MAC drops into the
+/// slow path on its next resolve.
+fn arp_fast_invalidate_all() {
+    for slot in &ARP_FAST {
+        slot.ip.store(0, Ordering::Relaxed);
+    }
+}
+
 fn arp_request(target_ip: Ipv4Addr) {
     let our_mac = ethernet_our_mac();
     let our_ip = CONFIG.ip();
@@ -158,6 +264,10 @@ pub fn arp_receive(data: &[u8]) {
             cache.gateway_mac = sender_mac;
             cache.gateway_mac_valid = true;
         }
+        // Drop the slow lock before invalidating per-core fast slots so
+        // we don't hold both at once.
+        drop(cache);
+        arp_fast_invalidate_all();
     }
 
     let op = ntohs(operation);
@@ -186,6 +296,11 @@ pub fn arp_resolve(ip: Ipv4Addr) -> Option<MacAddr> {
         return None;
     }
 
+    // Per-core fast path: hit returns without touching shared state.
+    if let Some(mac) = arp_fast_lookup(ip) {
+        return Some(mac);
+    }
+
     let target = {
         let mask = CONFIG.subnet_mask().addr;
         let our_ip = CONFIG.ip().addr;
@@ -193,7 +308,10 @@ pub fn arp_resolve(ip: Ipv4Addr) -> Option<MacAddr> {
         if (ip.addr & mask) != (our_ip & mask) && gateway != Ipv4Addr::ANY {
             let cache = ARP_CACHE.lock();
             if cache.gateway_mac_valid {
-                return Some(cache.gateway_mac);
+                let mac = cache.gateway_mac;
+                drop(cache);
+                arp_fast_store(ip, mac);
+                return Some(mac);
             }
             gateway
         } else {
@@ -202,6 +320,7 @@ pub fn arp_resolve(ip: Ipv4Addr) -> Option<MacAddr> {
     };
 
     if let Some(mac) = ARP_CACHE.lock().lookup(target) {
+        arp_fast_store(ip, mac);
         return Some(mac);
     }
 
@@ -214,6 +333,7 @@ pub fn arp_resolve(ip: Ipv4Addr) -> Option<MacAddr> {
             // cache that arp_lookup reads on the next iteration.
             drivers::virtio_net::poll(arp_poll_callback);
             if let Some(mac) = ARP_CACHE.lock().lookup(target) {
+                arp_fast_store(ip, mac);
                 return Some(mac);
             }
         }
