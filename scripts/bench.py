@@ -547,19 +547,33 @@ def start_env_verified(env, cpus, port):
 # ── Workload definitions ─────────────────────────────────────────────────────
 
 WORKLOADS = [
-    {"name": "health_c1",  "type": "tcp", "endpoint": "/health",  "threads": 1, "conns": 1,
-     "desc": "/health × 1 conn (single-flow IO)"},
-    {"name": "health_c8",  "type": "tcp", "endpoint": "/health",  "threads": 2, "conns": 8,
-     "desc": "/health × 8 conn (IO-bound)"},
-    {"name": "compute_c1", "type": "tcp", "endpoint": "/compute", "threads": 1, "conns": 1,
+    # Single-flow latency baselines: keep one connection regardless of
+    # cpu count. Throughput reflects per-request cost on one core.
+    {"name": "health_c1", "type": "tcp", "endpoint": "/health",
+     "threads": 1, "conns": 1,
+     "desc": "/health × 1 conn (single-flow latency)"},
+    {"name": "compute_c1", "type": "tcp", "endpoint": "/compute",
+     "threads": 1, "conns": 1,
      "desc": "/compute × 1 conn (single-flow CPU)"},
-    {"name": "compute_c8", "type": "tcp", "endpoint": "/compute", "threads": 2, "conns": 8,
-     "parallel": True,
-     "desc": "/compute × 8 conn (CPU-bound, parallel clients for multi-core scaling)"},
-    {"name": "udp_8s",     "type": "udp", "endpoint": "",         "threads": 0, "conns": 8,
-     "desc": "UDP echo × 8 senders (sync round-trip)"},
-    {"name": "udp_8s_async", "type": "udp_async", "endpoint": "",  "threads": 0, "conns": 8,
-     "desc": "UDP echo × 8 senders (pipelined async)"},
+
+    # Multi-core throughput: connections + threads scale with cpus.
+    # `parallel: True` spawns one wrk per core so the client side
+    # never bottlenecks before the server does.
+    {"name": "health_max", "type": "tcp", "endpoint": "/health",
+     "threads_per_core": 1, "conns_per_core": 16, "parallel": True,
+     "desc": "/health throughput (16 conn × cpus, parallel wrk)"},
+    {"name": "compute_max", "type": "tcp", "endpoint": "/compute",
+     "threads_per_core": 1, "conns_per_core": 8, "parallel": True,
+     "desc": "/compute throughput (8 conn × cpus, parallel wrk)"},
+
+    # UDP echo: senders also scale with cpus so the client load grows
+    # alongside the server. udp_bench caps at 64 senders total.
+    {"name": "udp_sync", "type": "udp", "endpoint": "",
+     "senders_per_core": 4,
+     "desc": "UDP echo × 4 senders/core (sync round-trip)"},
+    {"name": "udp_async", "type": "udp_async", "endpoint": "",
+     "senders_per_core": 4,
+     "desc": "UDP echo × 4 senders/core (pipelined async)"},
 ]
 
 
@@ -707,24 +721,39 @@ def main():
                     udp_off = getattr(env, 'udp_port_offset', 1)
                     udp_target_port = bench_port + udp_off
 
+                # Workloads that scale with cpu count compute their final
+                # conn / thread / sender counts here. Static workloads keep
+                # the literal "conns" / "threads" fields.
+                conns = w.get("conns", 0)
+                threads = w.get("threads", 0)
+                if "conns_per_core" in w:
+                    conns = w["conns_per_core"] * cpus
+                if "threads_per_core" in w:
+                    threads = max(1, w["threads_per_core"] * cpus)
+                senders = w.get("conns", 0)
+                if "senders_per_core" in w:
+                    senders = max(1, w["senders_per_core"] * cpus)
+                # udp_bench caps senders at 64 and below 1.
+                senders = max(1, min(64, senders))
+
                 if w["type"] == "tcp":
                     if w.get("parallel") and cpus > 1:
                         rps, p50, p99 = run_wrk_parallel(
-                            wrk_port, w["endpoint"], w["threads"], w["conns"], duration, cpus,
+                            wrk_port, w["endpoint"], threads, conns, duration, cpus,
                             host=wrk_host)
                     else:
                         rps, p50, p99 = run_wrk(
-                            wrk_port, w["endpoint"], w["threads"], w["conns"], duration,
+                            wrk_port, w["endpoint"], threads, conns, duration,
                             host=wrk_host)
                     results[(env_name, cpus, wname)] = (rps, p50, p99)
                     print(f"    {wname:<20s} {rps:>10.0f} req/s  p50={p50}  p99={p99}")
                 elif w["type"] == "udp":
-                    pps, p50, p99 = run_udp(udp_target_port, w["conns"], duration,
+                    pps, p50, p99 = run_udp(udp_target_port, senders, duration,
                                             host=wrk_host)
                     results[(env_name, cpus, wname)] = (pps, p50, p99)
                     print(f"    {wname:<20s} {pps:>10.0f} pkt/s  p50={p50}  p99={p99}")
                 elif w["type"] == "udp_async":
-                    pps, p50, p99 = run_udp(udp_target_port, w["conns"], duration,
+                    pps, p50, p99 = run_udp(udp_target_port, senders, duration,
                                             async_mode=True, host=wrk_host)
                     results[(env_name, cpus, wname)] = (pps, p50, p99)
                     print(f"    {wname:<20s} {pps:>10.0f} pkt/s  (async recv rate)")
