@@ -123,6 +123,10 @@ struct NetDevice {
     qp_state: [QueuePairState; MAX_QUEUE_PAIRS],
     mac: [u8; 6],
     num_queue_pairs: u16,               // 1 = single-queue, >1 = multi-queue
+    /// Number of queue pairs the device has been initialized for. Stays
+    /// fixed after init; used by `activate_multi_queue()` to know how
+    /// many pairs to activate via VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET.
+    negotiated_queue_pairs: u16,
     irq_idle_available: bool,
     guest_features: u32,
     has_mq: bool,                       // VIRTIO_NET_F_MQ negotiated
@@ -138,6 +142,7 @@ impl NetDevice {
         qp_state: [const { QueuePairState::ZEROED }; MAX_QUEUE_PAIRS],
         mac: [0; 6],
         num_queue_pairs: 1,
+        negotiated_queue_pairs: 1,
         irq_idle_available: false,
         guest_features: 0,
         has_mq: false,
@@ -342,57 +347,96 @@ fn init_pci_modern() -> bool {
     unsafe {
         (*ndev()).transport = Transport::ModernPci { vpci_idx };
         (*ndev()).guest_features = guest_features;
-        (*ndev()).num_queue_pairs = num_pairs;
+        // Multi-queue is NOT activated yet — defer until after DHCP. The
+        // device starts with only queue pair 0 active per spec, so DHCP
+        // (which polls qp 0 only) reliably receives its replies. Once
+        // DHCP completes, boot/entry.rs calls activate_multi_queue() to
+        // promote to N pairs and engage Tier 1 RX polling.
+        (*ndev()).num_queue_pairs = 1;
+        (*ndev()).negotiated_queue_pairs = num_pairs;
         (*ndev()).has_mq = has_mq && num_pairs > 1;
     }
 
-    // Send MQ activation command via control VQ
-    if unsafe { (*ndev()).has_mq } {
-        ctrl_mq_set_pairs(num_pairs);
-    }
-
-    // Log result
     if num_pairs > 1 {
-        log(b"virtio_net: multi-queue: ");
+        log(b"virtio_net: multi-queue available: ");
         log(&[b'0' + (num_pairs as u8 % 10)]);
-        log(b" queue pairs\n");
+        log(b" pairs (deferred until after DHCP)\n");
     }
     log(b"virtio_net: initialization complete (PCI modern)\n");
     true
 }
 
+/// Promote the device from single-queue to multi-queue. Sends
+/// VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET via the control VQ; on success,
+/// updates `num_queue_pairs` so Tier 1 per-core polling engages.
+///
+/// Called from boot/entry.rs AFTER DHCP succeeds. Activating multi-
+/// queue earlier causes the host (vhost-net + tap) to RSS-hash
+/// incoming packets across queue pairs, and DHCP — which only polls
+/// queue 0 — never sees its replies.
+///
+/// No-op if MQ wasn't negotiated, only one pair is desired, or this
+/// has already been called.
+pub fn activate_multi_queue() {
+    unsafe {
+        let dev = &mut *ndev();
+        if !dev.has_mq || dev.negotiated_queue_pairs <= 1 {
+            return;
+        }
+        if dev.num_queue_pairs == dev.negotiated_queue_pairs {
+            return; // already active
+        }
+        let target = dev.negotiated_queue_pairs;
+        ctrl_mq_set_pairs(target);
+        // ctrl_mq_set_pairs clears has_mq on failure; check before
+        // committing the new num_queue_pairs.
+        if (*ndev()).has_mq {
+            (*ndev()).num_queue_pairs = target;
+            log(b"virtio_net: multi-queue: ");
+            log(&[b'0' + (target as u8 % 10)]);
+            log(b" queue pairs\n");
+        }
+    }
+}
+
 /// Send VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET to activate N queue pairs.
 fn ctrl_mq_set_pairs(num_pairs: u16) {
-    // Control VQ uses a specific format:
-    //   Descriptor 0: class(1) + cmd(1) header (device-readable)
-    //   Descriptor 1: data (device-readable) — num_pairs as u16
-    //   Descriptor 2: ack byte (device-writable)
+    // Control VQ command format (spec 1.2 §5.1.6.5):
+    //   struct virtio_net_ctrl_hdr { u8 class; u8 cmd; }   (device-readable)
+    //   command-specific data...                            (device-readable)
+    //   u8 ack                                              (device-writable)
     //
-    // We use a simple stack buffer for the command.
-    // Control VQ command: class(1) + cmd(1) + data(2) contiguous, then ack(1)
-    let pairs_le = num_pairs.to_le_bytes();
-    let mut cmd_buf = [0u8; 4];
-    cmd_buf[0] = 4; // VIRTIO_NET_CTRL_MQ
-    cmd_buf[1] = 0; // VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET
-    cmd_buf[2] = pairs_le[0];
-    cmd_buf[3] = pairs_le[1];
-
-    let ack: u8 = 0xFF;
+    // QEMU's virtio-net requires the header and data to live in distinct
+    // descriptors; packing { class, cmd, data } into a single 4-byte
+    // buffer triggers "virtio-net ctrl missing headers" and the command
+    // is silently rejected.
+    let hdr: [u8; 2] = [
+        4, // class: VIRTIO_NET_CTRL_MQ
+        0, // cmd:   VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET
+    ];
+    let data: [u8; 2] = num_pairs.to_le_bytes();
+    let mut ack: u8 = 0xFF;
 
     unsafe {
-        let cmd_phys = virt_to_phys(cmd_buf.as_ptr());
+        let hdr_phys = virt_to_phys(hdr.as_ptr());
+        let data_phys = virt_to_phys(data.as_ptr());
         let ack_phys = virt_to_phys(&ack as *const u8);
 
-        (*ndev()).ctrl_queue.add_buf(cmd_phys, 4, 1, 0);
-        (*ndev()).ctrl_queue.add_buf(ack_phys, 1, 0, 1);
+        (*ndev()).ctrl_queue.add_chain(&[
+            (hdr_phys, 2, false),  // readable: class + cmd
+            (data_phys, 2, false), // readable: num_pairs u16
+            (ack_phys, 1, true),   // writable: ack byte
+        ]);
         (*ndev()).ctrl_queue.kick();
 
-        // Wait for completion
+        // Wait for completion.
         for _ in 0..1_000_000u32 {
             if (*ndev()).ctrl_queue.get_used().is_some() { break; }
         }
         let _ = (*ndev()).ctrl_queue.get_used();
 
+        // Re-read ack through the raw pointer to defeat constant folding.
+        ack = core::ptr::read_volatile(&ack as *const u8);
         if ack == 0 {
             log(b"virtio_net: MQ activated\n");
         } else {
@@ -573,20 +617,16 @@ fn init_mmio() -> bool {
     unsafe {
         (*ndev()).transport = Transport::Mmio { base: io_base, is_v2 };
         (*ndev()).guest_features = guest_features;
-        (*ndev()).num_queue_pairs = num_pairs;
+        // See init_pci_modern: defer multi-queue activation until after DHCP.
+        (*ndev()).num_queue_pairs = 1;
+        (*ndev()).negotiated_queue_pairs = num_pairs;
         (*ndev()).has_mq = has_mq && num_pairs > 1;
     }
 
-    // Send MQ activation command via ctrl VQ
-    if unsafe { (*ndev()).has_mq } {
-        ctrl_mq_set_pairs(num_pairs);
-    }
-
-    // Log result
     if num_pairs > 1 {
-        log(b"virtio_net: multi-queue: ");
+        log(b"virtio_net: multi-queue available: ");
         log(&[b'0' + (num_pairs as u8 % 10)]);
-        log(b" queue pairs (MMIO)\n");
+        log(b" pairs (MMIO, deferred until after DHCP)\n");
     }
     log(b"virtio_net: initialization complete (MMIO)\n");
     true

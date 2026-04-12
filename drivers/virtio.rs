@@ -564,6 +564,44 @@ impl Virtqueue {
         true
     }
 
+    /// Add a multi-segment buffer chain to the available ring.
+    ///
+    /// Each element of `segs` is `(phys_addr, len, writeable)`. The
+    /// `writeable = true` segments become device-writable descriptors
+    /// (VIRTQ_DESC_F_WRITE); per the spec all readable segments must
+    /// come first, followed by writable segments.
+    ///
+    /// Used by control-VQ commands where the header, data, and ack
+    /// byte live in distinct buffers and must each occupy their own
+    /// descriptor — QEMU 10 rejects a single descriptor that bundles
+    /// header + data even when the total byte count matches.
+    pub fn add_chain(&mut self, segs: &[(u64, u32, bool)]) -> i32 {
+        let total = segs.len() as u16;
+        if total == 0 || self.num_free < total { return -1; }
+
+        let head = self.free_head;
+        let mut idx = head;
+        for (i, &(phys, len, writeable)) in segs.iter().enumerate() {
+            let d = self.desc_mut(idx);
+            d.addr = phys;
+            d.len = len;
+            d.flags = if writeable { VIRTQ_DESC_F_WRITE } else { 0 };
+            if (i as u16) < total - 1 { d.flags |= VIRTQ_DESC_F_NEXT; }
+            idx = d.next;
+        }
+
+        self.free_head = idx;
+        self.num_free -= total;
+
+        let avail_idx = self.avail_idx();
+        let ring_slot = avail_idx & (self.queue_size - 1);
+        self.set_avail_ring(ring_slot, head);
+        dsb_st();
+        self.set_avail_idx(avail_idx.wrapping_add(1));
+
+        head as i32
+    }
+
     /// Add a buffer chain to the available ring.
     /// Returns head descriptor index, or -1 on failure.
     pub fn add_buf(&mut self, buf_phys: u64, buf_len: u32, out_count: u16, in_count: u16) -> i32 {

@@ -431,6 +431,12 @@ unsafe fn kernel_boot(info: &BootInfo) {
             );
         }
 
+        // Promote virtio-net to multi-queue if the device negotiated MQ.
+        // Deferred until now because activating MQ enables host-side RSS,
+        // which sprays incoming frames across queue pairs and breaks
+        // single-queue DHCP polling.
+        drivers::virtio_net::activate_multi_queue();
+
         klog!("[INIT] TCP stack (Rust)...\n");
         net::tcp::init();
 
@@ -516,6 +522,13 @@ unsafe fn kernel_boot(info: &BootInfo) {
 ///   On QEMU/VZ, WFI is used (not WFE) because WFE wakes from any SEV (spurious),
 ///   which starves the VZ TCP proxy thread. wake_cores() sends SGI so WFI wakes correctly.
 fn idle_cb(core_id: u32) {
+    // Tier 1 multi-queue: each AP polls its own RX queue and has no
+    // MSI-X vector wired up, so we can't HLT — return immediately to
+    // busy-poll. CPU pegs at 100% but RX latency is bounded by the
+    // poll loop, not interrupt delivery.
+    if drivers::virtio_net::num_queue_pairs() > 1 && core_id > 0 {
+        return;
+    }
     if core_id == 0 || kernel::percpu::num_cores() <= 1 {
         uni::wait_for_events();
     } else {
