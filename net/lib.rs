@@ -40,6 +40,21 @@ static WAKEUP: [core::sync::atomic::AtomicBool; percpu::MAX_CORES] =
 /// the right to drain the RX queue at a time.
 static RX_LOCK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// Per-core "just distributed" fairness flag. Set after a core wins the
+/// distributor role and releases the lock. On the next `net_poll_cb`
+/// the same core checks this flag: if set, it clears it and yields the
+/// cycle so another core gets first shot at the lock. If no other core
+/// actually took over, this core reclaims the role naturally on the
+/// cycle after (no stall: the yield is a single iteration, and we still
+/// wake on the next RX interrupt).
+///
+/// Without this flag, the core that happens to spend more time idle
+/// wins the `try_lock` CAS race consistently (because it's first to
+/// try after each release), so the "rotating distributor" never
+/// actually rotates under asymmetric load.
+static JUST_DISTRIBUTED: [core::sync::atomic::AtomicBool; percpu::MAX_CORES] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; percpu::MAX_CORES];
+
 /// Diagnostic counters.
 static RX_LOCK_GOT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static RX_LOCK_MISS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -101,6 +116,20 @@ fn poll_tier2(num_cores: u32) -> bool {
         kernel::serial::puts(b" cores)\n");
     }
 
+    let my_core = kernel::cpu_id();
+
+    // Cooperative yield for fair rotation: if we just distributed on the
+    // previous cycle, skip this attempt so another (presumably busier)
+    // core has first shot at the lock. We still wake on the next RX
+    // interrupt and will reclaim the role on the cycle after if no one
+    // else takes over.
+    if num_cores > 1
+        && JUST_DISTRIBUTED[my_core as usize]
+            .swap(false, core::sync::atomic::Ordering::Relaxed)
+    {
+        return false;
+    }
+
     // Try to become the distributor.
     let got_lock = RX_LOCK
         .compare_exchange(
@@ -124,6 +153,13 @@ fn poll_tier2(num_cores: u32) -> bool {
     }
 
     let count = drivers::virtio_net::poll(distribute_frame);
+
+    // Mark ourselves as "just distributed" — our next poll attempt will
+    // yield, giving other cores first shot at the lock.
+    if num_cores > 1 {
+        JUST_DISTRIBUTED[my_core as usize]
+            .store(true, core::sync::atomic::Ordering::Relaxed);
+    }
 
     // Release lock.
     RX_LOCK.store(0, core::sync::atomic::Ordering::Release);
@@ -233,9 +269,18 @@ pub fn net_receive(frame: &[u8]) {
     }
 }
 
-/// Flow hash: map a 4-tuple to a core index.
-/// In Tier 2, core 0 is the dedicated distributor — it shouldn't also
-/// handle application connections. Hash to cores 1..N only (when multi-core).
+/// Flow hash: map a 4-tuple to a core index for Tier 2 distribution.
+///
+/// Tier 2 uses a rotating distributor: any idle core can try_lock the
+/// RX_LOCK and become the distributor for one poll cycle. Flows are
+/// hashed across all cores, and the current distributor processes its
+/// own flows inline while pushing other cores' flows to their inbox.
+///
+/// Uses FNV-1a over the 4-tuple followed by a Murmur3 fmix32 so that
+/// `% num_cores` is uniform even when inputs vary in only one field
+/// (e.g. wrk opens N connections from the same src IP to the same
+/// dst port — without the finalizer all flows collapse to a single
+/// core on `num_cores = 2`, which was masking the multi-core path).
 fn flow_hash(src_ip: u32, dst_ip: u32, src_port: u16, dst_port: u16, num_cores: u32) -> u32 {
     let mut h: u32 = 2166136261; // FNV offset basis
     h ^= src_ip;
@@ -246,6 +291,12 @@ fn flow_hash(src_ip: u32, dst_ip: u32, src_port: u16, dst_port: u16, num_cores: 
     h = h.wrapping_mul(16777619);
     h ^= dst_port as u32;
     h = h.wrapping_mul(16777619);
+    // Murmur3 fmix32 — make low bits depend uniformly on the whole input.
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x85ebca6b);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0xc2b2ae35);
+    h ^= h >> 16;
     h % num_cores
 }
 
