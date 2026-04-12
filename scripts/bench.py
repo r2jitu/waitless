@@ -753,11 +753,22 @@ def main():
                 elif w["type"] == "udp":
                     pps, p50, p99 = run_udp(udp_target_port, senders, duration,
                                             host=wrk_host)
+                    # The first udp burst after VM boot races ARP-resolution
+                    # of the host MAC; on tap+vhost this can occasionally
+                    # show as 0 pkt/s. Retry once before recording.
+                    if pps == 0:
+                        time.sleep(0.5)
+                        pps, p50, p99 = run_udp(udp_target_port, senders, duration,
+                                                host=wrk_host)
                     results[(env_name, cpus, wname)] = (pps, p50, p99)
                     print(f"    {wname:<20s} {pps:>10.0f} pkt/s  p50={p50}  p99={p99}")
                 elif w["type"] == "udp_async":
                     pps, p50, p99 = run_udp(udp_target_port, senders, duration,
                                             async_mode=True, host=wrk_host)
+                    if pps == 0:
+                        time.sleep(0.5)
+                        pps, p50, p99 = run_udp(udp_target_port, senders, duration,
+                                                async_mode=True, host=wrk_host)
                     results[(env_name, cpus, wname)] = (pps, p50, p99)
                     print(f"    {wname:<20s} {pps:>10.0f} pkt/s  (async recv rate)")
 
