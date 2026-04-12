@@ -52,13 +52,13 @@ static long percentile(struct result *r, double pct) {
 
 // ── Sync sender ───────────────────────────────────────────────────────────────
 
-static void run_sync(int port, int duration, int collect_lat,
+static void run_sync(const char *host, int port, int duration, int collect_lat,
                      struct result *out) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in dst = {0};
     dst.sin_family = AF_INET;
     dst.sin_port = htons(port);
-    inet_pton(AF_INET, "127.0.0.1", &dst.sin_addr);
+    inet_pton(AF_INET, host, &dst.sin_addr);
 
     struct timeval tv = {0, 50000}; // 50ms timeout
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -114,12 +114,12 @@ static void *async_recv_thread(void *arg) {
     return NULL;
 }
 
-static void run_async(int port, int duration, struct result *out) {
+static void run_async(const char *host, int port, int duration, struct result *out) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in dst = {0};
     dst.sin_family = AF_INET;
     dst.sin_port = htons(port);
-    inet_pton(AF_INET, "127.0.0.1", &dst.sin_addr);
+    inet_pton(AF_INET, host, &dst.sin_addr);
 
     int bufsz = 4 * 1024 * 1024;
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof(bufsz));
@@ -163,13 +163,18 @@ static void run_async(int port, int duration, struct result *out) {
 int main(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr,
-            "Usage: udp_bench <port> <senders> <duration_sec> [--async]\n");
+            "Usage: udp_bench <port> <senders> <duration_sec> [--async] [--host=IP]\n");
         return 1;
     }
     int port = atoi(argv[1]);
     int senders = atoi(argv[2]);
     int duration = atoi(argv[3]);
-    int async_mode = argc > 4 && strcmp(argv[4], "--async") == 0;
+    int async_mode = 0;
+    const char *host = "127.0.0.1";
+    for (int i = 4; i < argc; i++) {
+        if (strcmp(argv[i], "--async") == 0) async_mode = 1;
+        else if (strncmp(argv[i], "--host=", 7) == 0) host = argv[i] + 7;
+    }
 
     if (senders < 1 || senders > 64) {
         fprintf(stderr, "senders must be 1-64\n");
@@ -187,9 +192,9 @@ int main(int argc, char **argv) {
         pids[i] = fork();
         if (pids[i] == 0) {
             if (async_mode)
-                run_async(port, duration, &results[i]);
+                run_async(host, port, duration, &results[i]);
             else
-                run_sync(port, duration, i == 0, &results[i]);
+                run_sync(host, port, duration, i == 0, &results[i]);
             _exit(0);
         }
     }

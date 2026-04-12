@@ -22,6 +22,11 @@ import sys
 import threading
 import time
 
+# Force line-buffered stdout so the bench output streams live over SSH
+# pipes (otherwise piping `gcp-bench.sh ... | tail` swallows everything
+# until exit and the bench appears stuck).
+sys.stdout.reconfigure(line_buffering=True)
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 PORT_COUNTER = [38000]
@@ -47,8 +52,15 @@ def wait_port_pool(threshold=500, timeout=8):
         time.sleep(1)
 
 
-def wait_http(port, timeout=90, host="localhost"):
-    for _ in range(timeout):
+def wait_http(port, timeout=20, host="localhost"):
+    """Poll http://host:port/health once a second up to `timeout` seconds.
+
+    A real boot reaches HTTP-ready in 1–3 seconds, so 20 s is generous and
+    a 90 s default just means failures take 90 s to surface — which made
+    the bench look stuck for many minutes during the tap+vhost rollout.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         try:
             r = subprocess.run(
                 ["curl", "-sf", "--max-time", "2", f"http://{host}:{port}/health"],
@@ -62,12 +74,16 @@ def wait_http(port, timeout=90, host="localhost"):
 
 
 def run_wrk(port, endpoint, threads, conns, duration, host="localhost"):
+    # Hard-cap wrk's per-request timeout at 5 s so a stuck server can't
+    # peg latency at the wrk default of 2 s and still appear "running"
+    # for the entire duration. The subprocess timeout is `duration + 10`
+    # so even a wedged wrk only blocks the bench by 10 s past its run.
     try:
         r = subprocess.run(
             ["wrk", f"-t{threads}", f"-c{conns}", f"-d{duration}s",
-             "--timeout", "10s", "--latency",
+             "--timeout", "5s", "--latency",
              f"http://{host}:{port}{endpoint}"],
-            capture_output=True, text=True, timeout=duration + 15)
+            capture_output=True, text=True, timeout=duration + 10)
         rps, p50, p99 = 0.0, "", ""
         for line in r.stdout.split("\n"):
             if "Requests/sec" in line:
@@ -77,8 +93,10 @@ def run_wrk(port, endpoint, threads, conns, duration, host="localhost"):
             elif "99%" in line:
                 p99 = line.split()[1]
         return rps, p50, p99
+    except subprocess.TimeoutExpired:
+        return 0.0, "TIMEOUT", "TIMEOUT"
     except Exception:
-        return 0.0, "", ""
+        return 0.0, "ERROR", "ERROR"
 
 
 def run_wrk_parallel(port, endpoint, threads, conns, duration, instances, host="localhost"):
@@ -116,7 +134,7 @@ def run_wrk_parallel(port, endpoint, threads, conns, duration, instances, host="
     return total_rps, p50, p99
 
 
-def run_udp(port, senders, duration, async_mode=False):
+def run_udp(port, senders, duration, async_mode=False, host="127.0.0.1"):
     """Run UDP echo benchmark using the compiled C client.
 
     The C client (scripts/udp_bench) uses fork() for parallelism,
@@ -144,8 +162,10 @@ def run_udp(port, senders, duration, async_mode=False):
             cmd = [udp_bin, str(port), str(senders), str(duration)]
             if async_mode:
                 cmd.append("--async")
+            if host != "127.0.0.1":
+                cmd.append(f"--host={host}")
             r = subprocess.run(cmd, capture_output=True, text=True,
-                               timeout=duration + 30)
+                               timeout=duration + 10)
             for line in r.stdout.split("\n"):
                 if line.startswith("RESULT "):
                     parts = line.split()
@@ -216,6 +236,14 @@ class KvmEnv:
     name = "kvm"
     label = "QEMU x86_64 KVM"
 
+    # Guest IP served by dnsmasq on the GCP host tap0; see
+    # /usr/local/sbin/bench-tap-setup.sh. Fixed MAC pins this address.
+    TAP_IF = "tap0"
+    GUEST_MAC = "52:54:00:12:34:56"
+    GUEST_IP = "10.20.30.10"
+    GUEST_PORT = 80
+    GUEST_UDP_PORT = 7
+
     # Path to pre-staged ELF; set via --elf. If None, bazel build runs.
     elf_override = None
 
@@ -229,18 +257,25 @@ class KvmEnv:
     def start(self, cpus, port):
         elf = self.elf_override or os.path.join(
             PROJECT_ROOT, "bazel-bin/apps/webserver/webserver.elf")
+        # tap backend with vhost-net + multi-queue. Multi-queue is only
+        # requested when cpus > 1 because QEMU rejects queues=1 on tap.
         cmd = ["qemu-system-x86_64", "-accel", "kvm", "-cpu", "host",
                "-m", "128", "-smp", str(cpus), "-nographic",
                "-serial", f"file:/tmp/bench_{port}.log", "-no-reboot"]
-        dev = "virtio-net-pci"
+        dev = f"virtio-net-pci,mac={self.GUEST_MAC}"
+        # The host tap0 is created with IFF_MULTI_QUEUE; QEMU rejects
+        # opening it with queues=1 ("could not configure /dev/net/tun:
+        # Invalid argument"), so use max(cpus, 2) on the netdev side.
+        # The device still negotiates only `cpus` queue pairs to the
+        # guest because max_virtqueue_pairs reflects what the netdev
+        # exposes; the guest uses min(desired, max).
+        nqueues = max(cpus, 2)
+        netdev = (f"tap,id=net0,ifname={self.TAP_IF},script=no,downscript=no,"
+                  f"vhost=on,queues={nqueues}")
         if cpus > 1:
-            # NOTE: slirp user netdev is single-queue, so max_virtqueue_pairs=1
-            # is advertised regardless of mq=on. The unikernel lands in Tier 2
-            # (software distribution) for KVM user-net. mq=on + vectors is
-            # retained for the (eventual) tap-backed case.
             dev += f",mq=on,vectors={2*cpus+2}"
         cmd += ["-device", f"{dev},netdev=net0",
-                "-netdev", f"user,id=net0,hostfwd=tcp::{port}-:80,hostfwd=udp::{port+1}-:7",
+                "-netdev", netdev,
                 "-kernel", elf]
         return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -498,6 +533,11 @@ def start_env_verified(env, cpus, port):
             return proc
         env.stop(proc)
         return None
+    elif isinstance(env, KvmEnv):
+        if wait_http(env.GUEST_PORT, host=env.GUEST_IP):
+            return proc
+        env.stop(proc)
+        return None
     else:
         if wait_http(port):
             return proc
@@ -622,6 +662,7 @@ def main():
             if isinstance(env, VzEnv) and cpus != core_counts[0]:
                 time.sleep(10)
 
+            consecutive_skips = 0
             for w in workloads:
                 wname = w["name"]
                 port = next_port()
@@ -645,10 +686,26 @@ def main():
                                 pass
                     results[(env_name, cpus, wname)] = (0, "", "")
                     wait_port_pool()
+                    consecutive_skips += 1
+                    if consecutive_skips >= 3:
+                        print(f"    -- 3 consecutive SKIPs on {label}; aborting "
+                              f"this core-count to avoid wedging the bench.")
+                        break
                     continue
+                consecutive_skips = 0
 
-                wrk_host = "localhost"
-                wrk_port = bench_port
+                # KvmEnv uses a tap backend with a fixed guest IP/ports
+                # rather than localhost hostfwd; other envs keep the old
+                # localhost+ephemeral-port default.
+                if isinstance(env, KvmEnv):
+                    wrk_host = env.GUEST_IP
+                    wrk_port = env.GUEST_PORT
+                    udp_target_port = env.GUEST_UDP_PORT
+                else:
+                    wrk_host = "localhost"
+                    wrk_port = bench_port
+                    udp_off = getattr(env, 'udp_port_offset', 1)
+                    udp_target_port = bench_port + udp_off
 
                 if w["type"] == "tcp":
                     if w.get("parallel") and cpus > 1:
@@ -662,14 +719,13 @@ def main():
                     results[(env_name, cpus, wname)] = (rps, p50, p99)
                     print(f"    {wname:<20s} {rps:>10.0f} req/s  p50={p50}  p99={p99}")
                 elif w["type"] == "udp":
-                    udp_off = getattr(env, 'udp_port_offset', 1)
-                    pps, p50, p99 = run_udp(bench_port + udp_off, w["conns"], duration)
+                    pps, p50, p99 = run_udp(udp_target_port, w["conns"], duration,
+                                            host=wrk_host)
                     results[(env_name, cpus, wname)] = (pps, p50, p99)
                     print(f"    {wname:<20s} {pps:>10.0f} pkt/s  p50={p50}  p99={p99}")
                 elif w["type"] == "udp_async":
-                    udp_off = getattr(env, 'udp_port_offset', 1)
-                    pps, p50, p99 = run_udp(bench_port + udp_off, w["conns"], duration,
-                                            async_mode=True)
+                    pps, p50, p99 = run_udp(udp_target_port, w["conns"], duration,
+                                            async_mode=True, host=wrk_host)
                     results[(env_name, cpus, wname)] = (pps, p50, p99)
                     print(f"    {wname:<20s} {pps:>10.0f} pkt/s  (async recv rate)")
 

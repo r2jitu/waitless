@@ -76,7 +76,8 @@ if [ $do_build -eq 1 ]; then
     fi
 fi
 
-sync_files=("$SCRIPT_DIR/bench.py" "$SCRIPT_DIR/udp_bench.c")
+sync_files=("$SCRIPT_DIR/bench.py" "$SCRIPT_DIR/udp_bench.c"
+            "$SCRIPT_DIR/bench-tap-setup.sh")
 if [ $need_kvm -eq 1 ]; then
     ELF="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver.elf"
     [ -f "$ELF" ] || { echo "error: $ELF not found; run without --no-build" >&2; exit 1; }
@@ -93,13 +94,22 @@ ssh "$SSH_HOST" "mkdir -p ~/$REMOTE_DIR && chmod -R u+w ~/$REMOTE_DIR"
 # rsync preserves mtimes so subsequent runs skip unchanged files.
 rsync -az --partial "${sync_files[@]}" "$SSH_HOST:$REMOTE_DIR/"
 
-# Build udp_bench on the remote if missing or stale.
+# Build udp_bench on the remote if missing or stale, and ensure the tap0
+# backend is wired up for the kvm env. Both are no-ops if already current.
 ssh "$SSH_HOST" "cd $REMOTE_DIR && \
     if [ ! -f udp_bench ] || [ udp_bench.c -nt udp_bench ]; then \
         cc -O2 -o udp_bench udp_bench.c -lpthread; \
-    fi"
+    fi && \
+    chmod +x bench-tap-setup.sh && \
+    sudo ./bench-tap-setup.sh"
 
-# Run bench.py on the remote. Use -tt so Ctrl-C here kills the remote process.
+# Run bench.py on the remote.
+#
+# `-tt` allocates a PTY so Ctrl-C kills the remote process — but a PTY
+# also makes ssh wait for an exit event before flushing. We force python
+# to be unbuffered with `-u` and bench.py reconfigures stdout to line-
+# buffered, so output streams in real time even when the caller pipes
+# this script through `tee` or `tail`.
 echo "==> Running bench.py on $SSH_HOST: ${bench_args[*]}"
 echo ""
-ssh -tt "$SSH_HOST" "cd $REMOTE_DIR && python3 bench.py ${bench_args[*]}"
+ssh -tt "$SSH_HOST" "cd $REMOTE_DIR && python3 -u bench.py ${bench_args[*]}"
