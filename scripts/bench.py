@@ -376,14 +376,20 @@ class NativeEnv:
     name = "native"
     label = "Native (POSIX)"
 
+    # Path to pre-staged native binary; set via --native-bin. If None, bazel build runs.
+    bin_override = None
+
     def build(self):
+        if self.bin_override:
+            return  # Pre-staged binary; nothing to build.
         config = "aarch64-macos" if platform.machine() in ("arm64", "aarch64") else "x86_64-linux"
         subprocess.run(
             ["bazel", "build", f"--config={config}", "//apps/webserver:webserver_native"],
             capture_output=True, cwd=PROJECT_ROOT, timeout=120)
 
     def start(self, cpus, port):
-        bin_path = os.path.join(PROJECT_ROOT, "bazel-bin/apps/webserver/webserver_native")
+        bin_path = self.bin_override or os.path.join(
+            PROJECT_ROOT, "bazel-bin/apps/webserver/webserver_native")
         if not os.path.exists(bin_path):
             return None
         env = os.environ.copy()
@@ -524,7 +530,9 @@ def main():
     parser.add_argument("--duration", type=int, default=5,
                         help="Seconds per test (default: 5)")
     parser.add_argument("--elf", default=None,
-                        help="Pre-built ELF path (kvm env only; skips bazel build)")
+                        help="Pre-built ELF path (kvm env; skips bazel build)")
+    parser.add_argument("--native-bin", default=None,
+                        help="Pre-built native binary path (native env; skips bazel build)")
     args = parser.parse_args()
 
     duration = args.duration
@@ -553,7 +561,10 @@ def main():
     # Kill stale processes
     subprocess.run(["pkill", "-9", "-f", "qemu-system"], capture_output=True)
     subprocess.run(["pkill", "-9", "-f", "run-vz"], capture_output=True)
-    subprocess.run(["pkill", "-9", "-f", "webserver_native"], capture_output=True)
+    # Anchor to argv[0] to avoid matching our own bench.py cmdline when
+    # --native-bin /path/webserver_native is passed.
+    subprocess.run(["pkill", "-9", "-f", r"^\S*/webserver_native( |$)"],
+                   capture_output=True)
     time.sleep(2)
 
     # Create environment instances (build happens before each test group
@@ -566,6 +577,8 @@ def main():
         envs[name] = ENV_MAP[name]()
         if name == "kvm" and args.elf:
             envs[name].elf_override = os.path.abspath(args.elf)
+        if name == "native" and args.native_bin:
+            envs[name].bin_override = os.path.abspath(args.native_bin)
 
     # Collect results: results[(env_name, cpus, workload_name)] = (rps, p50, p99)
     results = {}
@@ -580,7 +593,10 @@ def main():
             _current["proc"] = None
         subprocess.run(["pkill", "-9", "-f", "qemu-system"], capture_output=True)
         subprocess.run(["pkill", "-9", "-f", "run-vz"], capture_output=True)
-        subprocess.run(["pkill", "-9", "-f", "webserver_native"], capture_output=True)
+        # Anchor to argv[0] to avoid matching our own bench.py cmdline when
+    # --native-bin /path/webserver_native is passed.
+    subprocess.run(["pkill", "-9", "-f", r"^\S*/webserver_native( |$)"],
+                   capture_output=True)
 
     try:
       for env_name, env in envs.items():

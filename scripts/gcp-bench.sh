@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # gcp-bench.sh — Run bench.py on the GCP KVM host.
 #
-# Both the unikernel VM and the workload generator run on the remote host
-# (loopback between wrk and the guest) for lowest-overhead measurements.
+# Both the unikernel VM (or native binary) and the workload generator
+# run on the remote host (loopback only) for lowest-overhead measurements.
 #
 # Usage:
-#   ./scripts/gcp-bench.sh                           # 1,2,4,8 cores, all workloads
+#   ./scripts/gcp-bench.sh                           # kvm + native, 1,2,4,8 cores
+#   ./scripts/gcp-bench.sh --env kvm                 # kvm only
+#   ./scripts/gcp-bench.sh --env native              # native Linux only
 #   ./scripts/gcp-bench.sh --cores 1,4 --duration 10
 #   ./scripts/gcp-bench.sh --workload compute_c8
 #   ./scripts/gcp-bench.sh --no-build                # skip local rebuild
@@ -23,45 +25,73 @@ REMOTE_DIR="${GCP_REMOTE_DIR:-bench}"
 # Default args; overridden by user-supplied flags.
 DEFAULT_CORES="1,2,4,8"
 DEFAULT_DURATION="10"
+DEFAULT_ENV="kvm,native"
 
 do_build=1
 bench_args=()
 have_cores=0
 have_duration=0
-for arg in "$@"; do
+env_arg=""
+i=0
+argv=("$@")
+while [ $i -lt ${#argv[@]} ]; do
+    arg="${argv[$i]}"
     case "$arg" in
         --no-build) do_build=0 ;;
         --cores|--cores=*) have_cores=1; bench_args+=("$arg") ;;
         --duration|--duration=*) have_duration=1; bench_args+=("$arg") ;;
+        --env) i=$((i+1)); env_arg="${argv[$i]}" ;;
+        --env=*) env_arg="${arg#--env=}" ;;
         *) bench_args+=("$arg") ;;
     esac
+    i=$((i+1))
 done
 [ $have_cores    -eq 0 ] && bench_args+=(--cores "$DEFAULT_CORES")
 [ $have_duration -eq 0 ] && bench_args+=(--duration "$DEFAULT_DURATION")
+[ -z "$env_arg" ] && env_arg="$DEFAULT_ENV"
+bench_args+=(--env "$env_arg")
 
-# Always run the kvm env on the remote host.
-bench_args+=(--env kvm --elf "\$HOME/$REMOTE_DIR/webserver.elf")
+# Decide which binaries we need based on the env list.
+need_kvm=0
+need_native=0
+case ",$env_arg," in *,kvm,*)    need_kvm=1 ;; esac
+case ",$env_arg," in *,native,*) need_native=1 ;; esac
 
-if [ $do_build -eq 1 ]; then
-    echo "==> Building webserver.elf (x86_64-qemu)..."
-    cd "$PROJECT_ROOT"
-    bazel build --config=x86_64-qemu //apps/webserver:webserver.elf
+if [ $need_kvm -eq 1 ]; then
+    bench_args+=(--elf "\$HOME/$REMOTE_DIR/webserver.elf")
+fi
+if [ $need_native -eq 1 ]; then
+    bench_args+=(--native-bin "\$HOME/$REMOTE_DIR/webserver_native")
 fi
 
-ELF="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver.elf"
-if [ ! -f "$ELF" ]; then
-    echo "error: $ELF not found; run without --no-build" >&2
-    exit 1
+if [ $do_build -eq 1 ]; then
+    cd "$PROJECT_ROOT"
+    if [ $need_kvm -eq 1 ]; then
+        echo "==> Building webserver.elf (x86_64-qemu)..."
+        bazel build --config=x86_64-qemu //apps/webserver:webserver.elf
+    fi
+    if [ $need_native -eq 1 ]; then
+        echo "==> Building webserver_native (x86_64-linux)..."
+        bazel build --config=x86_64-linux //apps/webserver:webserver_native
+    fi
+fi
+
+sync_files=("$SCRIPT_DIR/bench.py" "$SCRIPT_DIR/udp_bench.c")
+if [ $need_kvm -eq 1 ]; then
+    ELF="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver.elf"
+    [ -f "$ELF" ] || { echo "error: $ELF not found; run without --no-build" >&2; exit 1; }
+    sync_files+=("$ELF")
+fi
+if [ $need_native -eq 1 ]; then
+    NBIN="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver_native"
+    [ -f "$NBIN" ] || { echo "error: $NBIN not found; run without --no-build" >&2; exit 1; }
+    sync_files+=("$NBIN")
 fi
 
 echo "==> Syncing files to $SSH_HOST:~/$REMOTE_DIR/..."
-ssh "$SSH_HOST" "mkdir -p ~/$REMOTE_DIR"
+ssh "$SSH_HOST" "mkdir -p ~/$REMOTE_DIR && chmod -R u+w ~/$REMOTE_DIR"
 # rsync preserves mtimes so subsequent runs skip unchanged files.
-rsync -az --partial \
-    "$ELF" \
-    "$SCRIPT_DIR/bench.py" \
-    "$SCRIPT_DIR/udp_bench.c" \
-    "$SSH_HOST:$REMOTE_DIR/"
+rsync -az --partial "${sync_files[@]}" "$SSH_HOST:$REMOTE_DIR/"
 
 # Build udp_bench on the remote if missing or stale.
 ssh "$SSH_HOST" "cd $REMOTE_DIR && \
