@@ -68,10 +68,10 @@ multiboot_header_end:
 
 .section .boot_bss, "aw", @nobits
 
-// 64KB kernel stack (grows downward from stack_top)
+// 256KB kernel stack (grows downward from stack_top)
 .align 16
 stack_bottom:
-    .space 65536
+    .space 262144
 stack_top:
 
 // Bootstrap page tables — identity map the first 4GB with 2MB pages.

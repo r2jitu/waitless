@@ -49,7 +49,7 @@ macro_rules! klog {
 
 const PAGE_SIZE: u64 = 4096;
 const MIN_BLOCK_SIZE: usize = 16;
-const HEAP_SIZE: usize = 16 * 1024 * 1024; // 16 MB
+const HEAP_SIZE: usize = 32 * 1024 * 1024; // 32 MB
 
 // ============================================================================
 // Bitmap type — bounds-checked access to a raw pointer + bit count
