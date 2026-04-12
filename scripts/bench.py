@@ -234,6 +234,10 @@ class KvmEnv:
                "-serial", f"file:/tmp/bench_{port}.log", "-no-reboot"]
         dev = "virtio-net-pci"
         if cpus > 1:
+            # NOTE: slirp user netdev is single-queue, so max_virtqueue_pairs=1
+            # is advertised regardless of mq=on. The unikernel lands in Tier 2
+            # (software distribution) for KVM user-net. mq=on + vectors is
+            # retained for the (eventual) tap-backed case.
             dev += f",mq=on,vectors={2*cpus+2}"
         cmd += ["-device", f"{dev},netdev=net0",
                 "-netdev", f"user,id=net0,hostfwd=tcp::{port}-:80,hostfwd=udp::{port+1}-:7",
