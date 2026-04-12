@@ -918,16 +918,14 @@ pub fn flush_tx_staging() {
 /// DHCP's poll-wait loop to ensure DHCP replies are delivered during the
 /// tight polling window where no other MMIO exits occur.
 pub fn poke_interrupt_status() {
+    #[cfg(target_arch = "aarch64")]
     unsafe {
-        match (*ndev()).transport {
-            Transport::Mmio { base, .. } => {
-                let isr = virtio_read32(base + MMIO_INTERRUPT_STATUS);
-                // Cache used_idx from upper 16 bits (HVF extension).
-                if (*ndev()).rx_queues[0].used_idx_mmio {
-                    (*ndev()).rx_queues[0].mmio_cached_used_idx = (isr >> 16) as u16;
-                }
+        if let Transport::Mmio { base, .. } = (*ndev()).transport {
+            let isr = virtio_read32(base + MMIO_INTERRUPT_STATUS);
+            // Cache used_idx from upper 16 bits (HVF extension).
+            if (*ndev()).rx_queues[0].used_idx_mmio {
+                (*ndev()).rx_queues[0].mmio_cached_used_idx = (isr >> 16) as u16;
             }
-            _ => {}
         }
     }
 }
