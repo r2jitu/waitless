@@ -134,7 +134,8 @@ def run_wrk_parallel(port, endpoint, threads, conns, duration, instances, host="
     return total_rps, p50, p99
 
 
-def run_udp(port, senders, duration, async_mode=False, host="127.0.0.1"):
+def run_udp(port, senders, duration, async_mode=False, host="127.0.0.1",
+            rate_per_sender=0):
     """Run UDP echo benchmark using the compiled C client.
 
     The C client (scripts/udp_bench) uses fork() for parallelism,
@@ -142,10 +143,12 @@ def run_udp(port, senders, duration, async_mode=False, host="127.0.0.1"):
     implementation to ~50k pkt/s regardless of sender count. The C
     client also collects a per-packet latency histogram from sender 0.
 
-    In async mode (--async), each sender uses separate send/recv threads
-    to pipeline sends without waiting for replies. This measures the
-    maximum sustainable throughput — analogous to how wrk pipelines
-    HTTP requests over keep-alive connections.
+    In async mode (--async), each sender process forks a child that
+    does the blocking recv() loop in parallel with the send loop —
+    split across processes so the send spin can't starve recv on a
+    single core. When `rate_per_sender` is set, each sender paces its
+    sendto() loop to that many packets/sec, modelling realistic
+    concurrent clients instead of blasting the server.
 
     Falls back to the old Python implementation if the C binary isn't
     found (first run before compilation).
@@ -162,6 +165,8 @@ def run_udp(port, senders, duration, async_mode=False, host="127.0.0.1"):
             cmd = [udp_bin, str(port), str(senders), str(duration)]
             if async_mode:
                 cmd.append("--async")
+                if rate_per_sender > 0:
+                    cmd.append(f"--rate={rate_per_sender}")
             if host != "127.0.0.1":
                 cmd.append(f"--host={host}")
             r = subprocess.run(cmd, capture_output=True, text=True,
@@ -197,7 +202,7 @@ def run_udp(port, senders, duration, async_mode=False, host="127.0.0.1"):
     return sum(recv) / duration, "", ""
 
 
-def _udp_with_retry(port, senders, duration, host, async_mode):
+def _udp_with_retry(port, senders, duration, host, async_mode, rate_per_sender=0):
     """Run a UDP test, retrying up to two extra times if it returns 0.
 
     On tap+vhost the very first udp_async burst after a fresh VM boot
@@ -206,12 +211,14 @@ def _udp_with_retry(port, senders, duration, host, async_mode):
     pause masks the flake without hiding genuine failures (a broken
     config still records 0 after three attempts).
     """
-    pps, p50, p99 = run_udp(port, senders, duration, async_mode=async_mode, host=host)
+    pps, p50, p99 = run_udp(port, senders, duration, async_mode=async_mode,
+                            host=host, rate_per_sender=rate_per_sender)
     for _ in range(2):
         if pps > 0:
             break
         time.sleep(0.5)
-        pps, p50, p99 = run_udp(port, senders, duration, async_mode=async_mode, host=host)
+        pps, p50, p99 = run_udp(port, senders, duration, async_mode=async_mode,
+                                host=host, rate_per_sender=rate_per_sender)
     return pps, p50, p99
 
 
@@ -734,8 +741,10 @@ def main():
                     print(f"    {wname:<20s} {pps:>10.0f} pkt/s  p50={p50}  p99={p99}")
                 elif w["type"] == "udp_async":
                     time.sleep(0.5)
+                    rate = w.get("rate_per_sender", 0)
                     pps, p50, p99 = _udp_with_retry(
-                        udp_target_port, senders, duration, wrk_host, async_mode=True)
+                        udp_target_port, senders, duration, wrk_host,
+                        async_mode=True, rate_per_sender=rate)
                     results[(env_name, cpus, wname)] = (pps, p50, p99)
                     print(f"    {wname:<20s} {pps:>10.0f} pkt/s  (async recv rate)")
 
