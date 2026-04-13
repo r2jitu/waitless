@@ -235,10 +235,22 @@ impl NativeConn {
     }
 }
 
+/// One UDP sibling fd owned by a worker thread. Populated at
+/// `native_udp_bind` time, one entry per `-p udp:...` relay. Drained
+/// inline from `collect_events` when the kqueue/epoll reports the fd
+/// ready — no dedicated RX thread, matches HVF's inline-poll design.
+#[derive(Clone, Copy)]
+struct UdpSibling {
+    fd: i32,
+    binding_idx: usize,
+}
+
 struct ThreadState {
     conns: [NativeConn; CONNS_PER_THREAD],
     eq_fd: i32,  // kqueue (macOS) or epoll (Linux) fd
     thread_id: u32,
+    udp_sibs: [UdpSibling; MAX_UDP_BINDINGS],
+    udp_sib_count: usize,
 }
 
 impl ThreadState {
@@ -247,7 +259,16 @@ impl ThreadState {
             conns: [NativeConn::empty(); CONNS_PER_THREAD],
             eq_fd: -1,
             thread_id: id,
+            udp_sibs: [UdpSibling { fd: -1, binding_idx: 0 }; MAX_UDP_BINDINGS],
+            udp_sib_count: 0,
         }
+    }
+
+    fn add_udp_sibling(&mut self, fd: i32, binding_idx: usize) {
+        if self.udp_sib_count >= MAX_UDP_BINDINGS { return; }
+        self.udp_sibs[self.udp_sib_count] = UdpSibling { fd, binding_idx };
+        self.udp_sib_count += 1;
+        self.register_fd(fd);
     }
 
     fn init_event_queue(&mut self) {
@@ -322,18 +343,22 @@ impl ThreadState {
         }
     }
 
-    /// Non-blocking poll: check for ready fds without waiting.
-    fn poll_events(&mut self) {
-        self.collect_events(0);
+    /// Non-blocking poll: check for ready fds without waiting. Returns
+    /// `true` if any UDP sibling was drained (inline-dispatched to its
+    /// handler) so the event loop can keep itself busy instead of
+    /// sleeping after UDP work.
+    fn poll_events(&mut self) -> bool {
+        self.collect_events(0)
     }
 
     /// Blocking wait: sleep until at least one fd is ready (up to 10ms).
     fn wait_for_events(&mut self) {
-        self.collect_events(10);
+        let _ = self.collect_events(10);
     }
 
-    fn collect_events(&mut self, timeout_ms: i32) {
+    fn collect_events(&mut self, timeout_ms: i32) -> bool {
         const MAX_EVENTS: usize = 64;
+        let mut udp_work = false;
         unsafe {
             #[cfg(target_os = "macos")]
             {
@@ -347,9 +372,7 @@ impl ThreadState {
                                events.as_mut_ptr(), MAX_EVENTS as i32, &ts);
                 for i in 0..n.max(0) as usize {
                     let fd = events[i].udata as i32;
-                    for c in self.conns.iter_mut() {
-                        if c.fd == fd { c.has_pending_data = true; break; }
-                    }
+                    if self.dispatch_ready_fd(fd) { udp_work = true; }
                 }
             }
             #[cfg(target_os = "linux")]
@@ -358,12 +381,56 @@ impl ThreadState {
                 let n = epoll_wait(self.eq_fd, events.as_mut_ptr(), MAX_EVENTS as i32, timeout_ms);
                 for i in 0..n.max(0) as usize {
                     let fd = events[i].data as i32;
-                    for c in self.conns.iter_mut() {
-                        if c.fd == fd { c.has_pending_data = true; break; }
-                    }
+                    if self.dispatch_ready_fd(fd) { udp_work = true; }
                 }
             }
         }
+        udp_work
+    }
+
+    /// Handle a single ready fd: UDP siblings get drained and dispatched
+    /// inline (matches HVF's inline-poll design); TCP fds just get
+    /// `has_pending_data = true` so the app's recv path picks them up.
+    /// Returns `true` iff a UDP sibling was drained — TCP flagging
+    /// alone isn't "work" for the event loop because the app's service
+    /// step is what actually consumes it.
+    fn dispatch_ready_fd(&mut self, fd: i32) -> bool {
+        for i in 0..self.udp_sib_count {
+            if self.udp_sibs[i].fd == fd {
+                drain_udp_sibling(fd, self.udp_sibs[i].binding_idx);
+                return true;
+            }
+        }
+        for c in self.conns.iter_mut() {
+            if c.fd == fd { c.has_pending_data = true; break; }
+        }
+        false
+    }
+}
+
+/// Drain a UDP sibling non-blockingly until `recvfrom` returns EAGAIN,
+/// dispatching the app handler for each datagram. Called from the
+/// worker thread's `collect_events` when its kqueue/epoll reports the
+/// sibling ready.
+fn drain_udp_sibling(fd: i32, binding_idx: usize) {
+    let handler = unsafe {
+        match UDP_BINDINGS[binding_idx] {
+            Some(ref b) => b.handler,
+            None => return,
+        }
+    };
+    let mut buf = [0u8; 65536];
+    loop {
+        let mut src_addr: SockAddrIn = unsafe { core::mem::zeroed() };
+        let mut addr_len = core::mem::size_of::<SockAddrIn>() as u32;
+        let n = unsafe {
+            recvfrom(fd, buf.as_mut_ptr(), buf.len(), 0,
+                     &mut src_addr, &mut addr_len)
+        };
+        if n <= 0 { break; }
+        let src_ip = src_addr.sin_addr.to_be_bytes();
+        let src_port = u16::from_be(src_addr.sin_port);
+        handler(src_ip, src_port, &buf[..n as usize]);
     }
 }
 
@@ -419,7 +486,6 @@ unsafe extern "C" fn sigint_handler(_sig: i32) {
 fn init_native() {
     unsafe {
         pthread_key_create(&mut TLS_KEY, 0);
-        pthread_key_create(&mut UDP_FD_TLS_KEY, 0);
 
         let p = getenv(b"PORT\0".as_ptr());
         if !p.is_null() && *p != 0 {
@@ -449,12 +515,13 @@ fn init_native() {
         signal(SIGPIPE, SIG_IGN);
     }
 
-    // Register TCP IO poll with the event loop.
-    // UDP has its own dedicated thread (spawned in native_udp_bind).
-    crate::register_io_poll(|_worker_id| {
-        tcp_poll();
-        false
-    });
+    // Register the IO poll callback. This runs on every worker's
+    // event-loop tick and drains the worker's kqueue/epoll: TCP fd
+    // readiness flips `has_pending_data` on matching conns, and UDP
+    // sibling readiness triggers inline `recvfrom`+handler dispatch.
+    // No dedicated RX threads — same inline-poll pattern as the HVF
+    // runner's vCPU loop.
+    crate::register_io_poll(|_worker_id| tcp_poll());
 }
 
 // ============================================================================
@@ -478,8 +545,8 @@ pub fn wait_for_events() {
     thread_state(current_thread_id()).wait_for_events();
 }
 
-pub fn poll_events() {
-    thread_state(current_thread_id()).poll_events();
+pub fn poll_events() -> bool {
+    thread_state(current_thread_id()).poll_events()
 }
 
 // ---- TCP (per-thread) -------------------------------------------------------
@@ -621,8 +688,13 @@ pub fn tcp_is_closed(handle: *mut ()) -> bool {
     unsafe { c.is_null() || (*c).closed }
 }
 
-pub fn tcp_poll() {
-    thread_state(current_thread_id()).poll_events();
+/// Pump the worker's event queue non-blockingly. Flips
+/// `has_pending_data` on any TCP conn that became readable and drains
+/// any UDP sibling that fired (dispatching the app handler inline).
+/// Returns `true` iff a UDP sibling was drained — tells the event
+/// loop to skip its idle sleep and run another iteration.
+pub fn tcp_poll() -> bool {
+    thread_state(current_thread_id()).poll_events()
 }
 
 /// Register the shared listen socket with this worker's kqueue/epoll.
@@ -666,25 +738,10 @@ static mut UDP_COUNT: usize = 0;
 static mut UDP_PORT_BASE: u16 = 0;
 /// Default UDP port used by the app (first bound port, set on first bind call).
 static mut UDP_DEFAULT_PORT: u16 = 0;
-/// pthread TLS key carrying the current UDP sibling fd for the
-/// running handler. `udp_thread_fn` writes its sibling fd here before
-/// dispatching the handler so `native_udp_send` can reply on the same
-/// socket without a global lookup.
-static mut UDP_FD_TLS_KEY: usize = 0;
 
-fn set_current_udp_fd(fd: i32) {
-    // Store fd+1 so the default-zero TLS slot maps to "unset".
-    unsafe { pthread_setspecific(UDP_FD_TLS_KEY, (fd + 1) as usize as *const u8); }
-}
-
-fn current_udp_fd() -> i32 {
-    let v = unsafe { pthread_getspecific(UDP_FD_TLS_KEY) } as usize;
-    if v == 0 { -1 } else { v as i32 - 1 }
-}
-
-/// Open one SO_REUSEPORT-bound UDP sibling socket on `bind_port`. All
-/// siblings of a relay share the same port — kernel distributes
-/// incoming datagrams across them by 4-tuple hash.
+/// Open one non-blocking SO_REUSEPORT-bound UDP sibling socket on
+/// `bind_port`. All siblings of a relay share the same port — kernel
+/// distributes incoming datagrams across them by 4-tuple hash.
 fn open_udp_sibling(bind_port: u16) -> i32 {
     unsafe {
         let fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -711,9 +768,7 @@ fn open_udp_sibling(bind_port: u16) -> i32 {
             return -1;
         }
 
-        // Sibling stays blocking — its dedicated thread blocks on recvfrom().
-        let flags = fcntl(fd, F_GETFL, 0i32);
-        fcntl(fd, F_SETFL, flags & !O_NONBLOCK);
+        set_nonblocking(fd);
         fd
     }
 }
@@ -732,15 +787,15 @@ pub fn native_udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
         };
 
         // Open NUM_THREADS SO_REUSEPORT siblings so the kernel
-        // distributes incoming datagrams across them. Each sibling
-        // gets its own dedicated worker thread blocking on recvfrom.
+        // distributes incoming datagrams across the group by 4-tuple
+        // hash. Each worker thread owns sibling `i` and polls it
+        // inline via its own kqueue/epoll — no dedicated RX thread.
         let want = NUM_THREADS.max(1);
         let mut fds = [-1i32; MAX_THREADS];
         let mut got = 0usize;
         for i in 0..want {
             let fd = open_udp_sibling(bind_port);
             if fd < 0 {
-                // First sibling failure is fatal; later are best-effort.
                 if i == 0 { return; }
                 break;
             }
@@ -757,60 +812,35 @@ pub fn native_udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
         });
         UDP_COUNT += 1;
 
-        // Spawn one dedicated UDP RX thread per sibling. Each blocks
-        // on its own fd's recvfrom and dispatches the handler inline.
-        for sibling in 0..got {
-            let arg = ((binding_idx as usize) << 16) | sibling;
-            let mut thread: PthreadT = 0;
-            pthread_create(&mut thread, ptr::null(), udp_thread_fn, arg as *mut u8);
+        // Register each sibling in its owning worker's event queue.
+        // `native_udp_bind` runs on the main thread before workers
+        // start, but each worker's kqueue/epoll fd is already live
+        // (set up in `init_native`), so we can push registrations
+        // from here.
+        for worker_id in 0..got {
+            THREADS[worker_id].add_udp_sibling(fds[worker_id], binding_idx);
         }
     }
-}
-
-extern "C" fn udp_thread_fn(arg: *mut u8) -> *mut u8 {
-    let packed = arg as usize;
-    let binding_idx = packed >> 16;
-    let sibling_idx = packed & 0xffff;
-    let mut buf = [0u8; 65536];
-    let (fd, handler) = unsafe {
-        match UDP_BINDINGS[binding_idx] {
-            Some(ref b) => (b.fds[sibling_idx], b.handler),
-            None => return ptr::null_mut(),
-        }
-    };
-    // Publish our sibling fd so native_udp_send replies on the same
-    // socket the request arrived on.
-    set_current_udp_fd(fd);
-    loop {
-        unsafe {
-            let mut src_addr: SockAddrIn = core::mem::zeroed();
-            let mut addr_len = core::mem::size_of::<SockAddrIn>() as u32;
-            let n = recvfrom(fd, buf.as_mut_ptr(), buf.len(), 0,
-                             &mut src_addr, &mut addr_len);
-            if n <= 0 { break; }
-            let src_ip = src_addr.sin_addr.to_be_bytes();
-            let src_port = u16::from_be(src_addr.sin_port);
-            handler(src_ip, src_port, &buf[..n as usize]);
-        }
-    }
-    ptr::null_mut()
 }
 
 pub fn native_udp_send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
     unsafe {
-        // Fast path: handler running on a UDP RX thread — reply on the
-        // sibling fd that received the request, so we hit the same
-        // kernel socket lock and the source port is already correct.
-        let mut send_fd = current_udp_fd();
-        if send_fd < 0 {
-            // Slow path: caller is not a UDP RX thread (e.g. a TCP
-            // worker). Use sibling 0 of the matching binding.
-            for i in 0..UDP_COUNT {
-                if let Some(ref b) = UDP_BINDINGS[i] {
-                    if b.app_port == src_port && b.sibling_count > 0 {
-                        send_fd = b.fds[0];
-                        break;
-                    }
+        // Handler runs inline on a worker thread after its kqueue
+        // reported the sibling ready. Reply on that worker's own
+        // sibling — same kernel socket lock as the recv, and the
+        // source port is already equal to the relay port, which keeps
+        // NAT path-correct.
+        let tid = current_thread_id() as usize;
+        let mut send_fd = -1;
+        for i in 0..UDP_COUNT {
+            if let Some(ref b) = UDP_BINDINGS[i] {
+                if b.app_port == src_port && b.sibling_count > 0 {
+                    send_fd = if tid < b.sibling_count && b.fds[tid] >= 0 {
+                        b.fds[tid]
+                    } else {
+                        b.fds[0]
+                    };
+                    break;
                 }
             }
         }
