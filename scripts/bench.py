@@ -134,6 +134,36 @@ def run_wrk_parallel(port, endpoint, threads, conns, duration, instances, host="
     return total_rps, p50, p99
 
 
+def _udp_bench_bin():
+    """Return the path to the compiled udp_bench binary, building if needed."""
+    udp_bin = os.path.join(SCRIPT_DIR, "udp_bench")
+    if not os.path.isfile(udp_bin):
+        src = os.path.join(SCRIPT_DIR, "udp_bench.c")
+        if os.path.isfile(src):
+            subprocess.run(["cc", "-O2", "-o", udp_bin, src, "-lpthread"],
+                           capture_output=True, timeout=30)
+    return udp_bin if os.path.isfile(udp_bin) else None
+
+
+def _parse_udp_bench_output(stdout):
+    """Parse SENT and RESULT lines from udp_bench stdout.
+
+    Returns (recv_pps, sent_pps, p50, p99) where sent_pps is None for
+    sync mode (no SENT line).
+    """
+    recv_pps = sent_pps = None
+    p50 = p99 = ""
+    for line in stdout.split("\n"):
+        if line.startswith("SENT "):
+            sent_pps = float(line.split()[1])
+        elif line.startswith("RESULT "):
+            parts = line.split()
+            recv_pps = float(parts[1])
+            p50 = f"{int(parts[2])}us" if int(parts[2]) > 0 else ""
+            p99 = f"{int(parts[3])}us" if int(parts[3]) > 0 else ""
+    return recv_pps, sent_pps, p50, p99
+
+
 def run_udp(port, senders, duration, async_mode=False, host="127.0.0.1",
             rate_per_sender=0):
     """Run UDP echo benchmark using the compiled C client.
@@ -153,14 +183,8 @@ def run_udp(port, senders, duration, async_mode=False, host="127.0.0.1",
     Falls back to the old Python implementation if the C binary isn't
     found (first run before compilation).
     """
-    udp_bin = os.path.join(SCRIPT_DIR, "udp_bench")
-    if not os.path.isfile(udp_bin):
-        src = os.path.join(SCRIPT_DIR, "udp_bench.c")
-        if os.path.isfile(src):
-            subprocess.run(["cc", "-O2", "-o", udp_bin, src, "-lpthread"],
-                           capture_output=True, timeout=30)
-
-    if os.path.isfile(udp_bin):
+    udp_bin = _udp_bench_bin()
+    if udp_bin:
         try:
             cmd = [udp_bin, str(port), str(senders), str(duration)]
             if async_mode:
@@ -171,13 +195,9 @@ def run_udp(port, senders, duration, async_mode=False, host="127.0.0.1",
                 cmd.append(f"--host={host}")
             r = subprocess.run(cmd, capture_output=True, text=True,
                                timeout=duration + 10)
-            for line in r.stdout.split("\n"):
-                if line.startswith("RESULT "):
-                    parts = line.split()
-                    pps = float(parts[1])
-                    p50 = f"{int(parts[2])}us" if int(parts[2]) > 0 else ""
-                    p99 = f"{int(parts[3])}us" if int(parts[3]) > 0 else ""
-                    return pps, p50, p99
+            recv_pps, _, p50, p99 = _parse_udp_bench_output(r.stdout)
+            if recv_pps is not None:
+                return recv_pps, p50, p99
         except Exception:
             pass
 
@@ -220,6 +240,91 @@ def _udp_with_retry(port, senders, duration, host, async_mode, rate_per_sender=0
         pps, p50, p99 = run_udp(port, senders, duration, async_mode=async_mode,
                                 host=host, rate_per_sender=rate_per_sender)
     return pps, p50, p99
+
+
+def udp_peak_rate(port, senders, host, threshold=0.99, probe_duration=2,
+                  start_rate=1000, max_rate=4_000_000):
+    """Find the peak aggregate UDP echo rate that sustains ≥ `threshold`
+    delivery, via exponential ramp + binary search.
+
+    Each probe runs udp_bench in async mode with `--rate=R` per sender,
+    so the offered load is `R * senders`. The probe returns (recv, sent)
+    aggregated across all senders; we accept the rate if `recv / sent >=
+    threshold`.
+
+    Phase 1 (ramp): start at `start_rate`, double the per-sender rate
+    until delivery falls below threshold. This finds a `[good, bad]`
+    bracket in log₂ steps.
+
+    Phase 2 (bisect): bisect inside the bracket for ~4 iterations to
+    tighten to within ~10% of the true max.
+
+    Returns (peak_total_pps, last_delivery_ratio). `peak_total_pps`
+    is recv-side aggregate at the highest accepted rate; if even the
+    lowest probe failed, returns (0, 0.0).
+    """
+    udp_bin = _udp_bench_bin()
+    if udp_bin is None:
+        return 0, 0.0
+
+    def probe(per_sender_rate):
+        cmd = [udp_bin, str(port), str(senders), str(probe_duration),
+               "--async", f"--rate={per_sender_rate}"]
+        if host != "127.0.0.1":
+            cmd.append(f"--host={host}")
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=probe_duration + 10)
+        except Exception:
+            return 0.0, 0.0
+        recv, sent, _, _ = _parse_udp_bench_output(r.stdout)
+        if recv is None or sent is None or sent == 0:
+            return 0.0, 0.0
+        return recv, sent
+
+    def passes(per_sender_rate):
+        recv, sent = probe(per_sender_rate)
+        ratio = recv / sent if sent > 0 else 0.0
+        return ratio >= threshold, recv, ratio
+
+    # Phase 1: exponential ramp.
+    rate = start_rate
+    last_good_rate = 0
+    last_good_recv = 0.0
+    last_good_ratio = 0.0
+    first_bad_rate = None
+    while rate * senders <= max_rate:
+        ok, recv, ratio = passes(rate)
+        if ok:
+            last_good_rate = rate
+            last_good_recv = recv
+            last_good_ratio = ratio
+            rate *= 2
+        else:
+            first_bad_rate = rate
+            break
+
+    if last_good_rate == 0:
+        # Even the lowest rate failed.
+        return 0, 0.0
+    if first_bad_rate is None:
+        # Hit max_rate while still passing — return whatever we got.
+        return int(last_good_recv), last_good_ratio
+
+    # Phase 2: bisect [last_good_rate, first_bad_rate] for ~4 rounds.
+    lo, hi = last_good_rate, first_bad_rate
+    for _ in range(4):
+        mid = (lo + hi) // 2
+        if mid <= lo:
+            break
+        ok, recv, ratio = passes(mid)
+        if ok:
+            lo = mid
+            last_good_recv = recv
+            last_good_ratio = ratio
+        else:
+            hi = mid
+    return int(last_good_recv), last_good_ratio
 
 
 # ── Environment runners ──────────────────────────────────────────────────────
@@ -556,14 +661,29 @@ WORKLOADS = [
      "threads_per_core": 1, "conns_per_core": 8,
      "desc": "/compute throughput (8 conn × cpus)"},
 
-    # UDP echo: senders also scale with cpus so the client load grows
-    # alongside the server. udp_bench caps at 64 senders total.
+    # UDP echo benchmarks.
+    #
+    # `udp_sync` measures single-flow round-trip latency: 1 sender, sync
+    # ping-pong, p50/p99 reported. The number is RTT-bound and machine-
+    # independent in shape — same workload on every host, only the
+    # absolute latency varies.
+    #
+    # `udp_peak` measures peak sustained server throughput: a binary
+    # search over per-sender pacing rate, reporting the highest
+    # aggregate rate that achieves ≥ 99% delivery from a fixed 8
+    # concurrent senders. The fixed sender count is intentional —
+    # tying senders to vCPUs would conflate "more senders = more
+    # concurrency" with "more vCPUs = more capacity" and make
+    # cross-platform comparisons meaningless. Software RSS in the
+    # HVF runner / hardware RSS in tap+vhost distributes the 8 flows
+    # across vCPUs naturally via 4-tuple hash, so the same workload
+    # exercises both Tier 1 (KVM) and Tier 2 (HVF) paths.
     {"name": "udp_sync", "type": "udp", "endpoint": "",
-     "senders_per_core": 4,
-     "desc": "UDP echo × 4 senders/core (sync round-trip)"},
-    {"name": "udp_async", "type": "udp_async", "endpoint": "",
-     "senders_per_core": 4,
-     "desc": "UDP echo × 4 senders/core (pipelined async)"},
+     "senders": 1,
+     "desc": "UDP echo single-flow latency (1 sender, sync RTT)"},
+    {"name": "udp_peak", "type": "udp_peak", "endpoint": "",
+     "senders": 8,
+     "desc": "UDP echo peak rate at ≥99% delivery (8 concurrent senders)"},
 ]
 
 
@@ -705,14 +825,18 @@ def main():
 
                 # Workloads that scale with cpu count compute their final
                 # conn / thread / sender counts here. Static workloads keep
-                # the literal "conns" / "threads" fields.
+                # the literal "conns" / "threads" / "senders" fields.
                 conns = w.get("conns", 0)
                 threads = w.get("threads", 0)
                 if "conns_per_core" in w:
                     conns = w["conns_per_core"] * cpus
                 if "threads_per_core" in w:
                     threads = max(1, w["threads_per_core"] * cpus)
-                senders = w.get("conns", 0)
+                # UDP workloads use a fixed sender count by default —
+                # tying senders to vCPUs would conflate the workload's
+                # client-side concurrency with the server's core count
+                # and make scaling curves impossible to read.
+                senders = w.get("senders", 0)
                 if "senders_per_core" in w:
                     senders = max(1, w["senders_per_core"] * cpus)
                 # udp_bench caps senders at 64 and below 1.
@@ -747,6 +871,12 @@ def main():
                         async_mode=True, rate_per_sender=rate)
                     results[(env_name, cpus, wname)] = (pps, p50, p99)
                     print(f"    {wname:<20s} {pps:>10.0f} pkt/s  (async recv rate)")
+                elif w["type"] == "udp_peak":
+                    time.sleep(0.5)
+                    pps, ratio = udp_peak_rate(
+                        udp_target_port, senders, wrk_host)
+                    results[(env_name, cpus, wname)] = (pps, "", "")
+                    print(f"    {wname:<20s} {pps:>10.0f} pkt/s  ({ratio*100:.0f}% delivery, {senders} senders)")
 
                 env.stop(proc)
                 _current["proc"] = None
