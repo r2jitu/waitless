@@ -138,6 +138,50 @@ static CPU_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// across workers without partitioning the port space.
 static NEXT_PROXY_SRC_PORT: AtomicU16 = AtomicU16::new(40000);
 
+/// Round-robin index for distributing newly-accepted TCP connections
+/// across vCPUs. The accept thread takes `fetch_add(1) % cpu_count`
+/// and inserts the new conn into that vCPU's `WORKERS[N].conns`.
+static NEXT_TARGET_VCPU: AtomicUsize = AtomicUsize::new(0);
+
+/// Per-vCPU wake pipe. The accept thread writes one byte to
+/// `write_fd` to doorbell the matching vCPU; the vCPU polls
+/// `read_fd` alongside its other fds and drains the pipe on wake.
+struct WakePipe {
+    read_fd: i32,
+    write_fd: i32,
+}
+
+static VCPU_WAKE_PIPES: OnceLock<Vec<WakePipe>> = OnceLock::new();
+
+fn make_wake_pipe() -> Result<WakePipe, String> {
+    let mut fds = [0i32; 2];
+    let r = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    if r != 0 {
+        return Err(format!("pipe: {}", std::io::Error::last_os_error()));
+    }
+    unsafe {
+        libc::fcntl(fds[0], libc::F_SETFL, libc::O_NONBLOCK);
+        libc::fcntl(fds[1], libc::F_SETFL, libc::O_NONBLOCK);
+    }
+    Ok(WakePipe { read_fd: fds[0], write_fd: fds[1] })
+}
+
+/// Doorbell a specific vCPU. Wakes a parked `vcpu_poll` via the wake
+/// pipe AND kicks an in-guest vCPU via `hv_vcpus_exit`. Either
+/// operation alone is idempotent and harmless if the vCPU was in the
+/// other state.
+fn wake_vcpu(target: usize) {
+    if let Some(pipes) = VCPU_WAKE_PIPES.get() {
+        if let Some(p) = pipes.get(target) {
+            let buf = [0u8; 1];
+            unsafe {
+                libc::write(p.write_fd, buf.as_ptr() as *const _, 1);
+            }
+        }
+    }
+    crate::vm::wake_vcpu(target);
+}
+
 /// Look up shared state for a worker/vCPU. Panics only if `start()`
 /// hasn't run, which shouldn't happen since both worker and vCPU
 /// threads are spawned after `start()` populates `WORKERS`.
@@ -192,51 +236,54 @@ struct UdpRelay {
     guest_port: u16,
 }
 
-/// Per-worker thread-local state. One of these lives on each worker
-/// thread's stack for the thread's lifetime; the shared state that's
-/// also touched by the paired vCPU thread lives in `worker_shared(id)`.
+/// Per-vCPU IoState. One per vCPU; lives in `VCPU_IOS` and is locked
+/// only by the vCPU thread that owns it. TCP listen fds are NOT here
+/// — they live on the dedicated accept thread, which assigns new
+/// conns into `WORKERS[id].conns` directly. The vCPU's iteration
+/// polls its UDP siblings, its assigned TCP conn fds, and its wake
+/// pipe (which the accept thread doorbells when handing it a new
+/// conn so the vCPU breaks out of `poll(10ms)` immediately).
 struct IoState {
-    /// The worker's id (== its queue pair, == its vCPU id).
+    /// The vCPU's id (== its queue pair).
     id: usize,
-    /// TCP listen sockets owned by this worker — one per `-p tcp:H:G`
-    /// mapping, all SO_REUSEPORT-bound so the kernel distributes
-    /// incoming SYNs across the per-worker listen group.
-    listens: Vec<TcpListen>,
-    /// UDP relay sockets owned by this worker — one per `-p udp:H:G`
+    /// UDP relay sockets owned by this vCPU — one per `-p udp:H:G`
     /// mapping. Each entry holds exactly one fd (the sibling the
-    /// kernel hands this worker via SO_REUSEPORT distribution).
+    /// kernel hands this vCPU via SO_REUSEPORT distribution).
     udps: Vec<UdpRelay>,
+    /// Read end of the per-vCPU wake pipe. Polled in `pollfds` so a
+    /// write from the accept thread breaks the blocking poll. The
+    /// payload is a doorbell — drained and discarded.
+    wake_pipe_read: i32,
     guest_mac: [u8; 6],
     read_buf: [u8; 2048],
     rx_last: u16,
     pollfds: Vec<libc::pollfd>,
     /// Guest-visible ephemeral src_port for each `Conn`-slot pollfd.
-    /// Indices `[0, fixed_slots)` map to listens/udps and are filled
-    /// with 0 placeholders; only `[fixed_slots..]` entries are valid.
+    /// Indices `[0, fixed_slots)` map to wake pipe / udps and are
+    /// filled with 0 placeholders; only `[fixed_slots..]` entries
+    /// are valid.
     conn_ports: Vec<u16>,
     frame_buf: [u8; 2048],
-    /// Worker-0 broadcasts a gratuitous ARP on its first iteration so
-    /// the host learns our MAC. Bookkeeping moved off the stack now
-    /// that the iteration is invoked from the vCPU thread.
+    /// vCPU 0 broadcasts a gratuitous ARP on its first iteration so
+    /// the host learns our MAC. Bookkeeping kept here so it survives
+    /// across `vcpu_poll` calls.
     primed: bool,
-    /// Drives the periodic closed-conn cleanup pass. Was a stack local
-    /// inside `worker_thread`; lifted to survive across `vcpu_poll`s.
+    /// Drives the periodic closed-conn cleanup pass.
     cleanup_ctr: u32,
 }
 
-/// Open a TCP listen socket bound to `(127.0.0.1, host_port)` with
-/// both `SO_REUSEADDR` and `SO_REUSEPORT` set. Multiple workers share
-/// the same port via `SO_REUSEPORT` — the kernel distributes incoming
-/// SYNs across the group so each worker accepts connections locally
-/// with no cross-worker handoff.
+/// Open a non-blocking TCP listen socket bound to
+/// `(127.0.0.1, host_port)`. Owned by the dedicated accept thread —
+/// only one fd per `-p tcp:` mapping, no `SO_REUSEPORT` siblings.
+/// macOS doesn't distribute TCP across `SO_REUSEPORT` listeners, so
+/// software round-robin from the accept thread is what gets us
+/// per-vCPU work distribution.
 fn bind_listen(host_port: u16) -> Result<i32, String> {
     unsafe {
         let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
         if fd < 0 { return Err(format!("tcp socket(): {}", std::io::Error::last_os_error())); }
         let one: i32 = 1;
         libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR,
-                         &one as *const _ as *const _, 4);
-        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT,
                          &one as *const _ as *const _, 4);
         let mut addr: libc::sockaddr_in = std::mem::zeroed();
         addr.sin_family = libc::AF_INET as u8;
@@ -308,16 +355,14 @@ pub fn start(mappings: &[PortMapping], cpu_count: usize) -> Result<[u8; 6], Stri
     let mac: [u8; 6] = GUEST_MAC;
     let cpu_count = cpu_count.max(1);
 
-    // One sibling per worker per TCP mapping, all SO_REUSEPORT-bound
-    // to the same host port — kernel distributes incoming SYNs across
-    // the group so each worker accepts connections on its own listen
-    // fd with no shared accept lock.
-    let mut per_worker_listens: Vec<Vec<TcpListen>> =
-        (0..cpu_count).map(|_| Vec::new()).collect();
-    // Similarly for UDP: `open_udp_relay` already gives us N SO_REUSEPORT
-    // siblings per mapping. We slice them one-per-worker here and also
-    // keep the flat `relay_table` around for the vCPU-side `handle_udp`
-    // TX fd lookup.
+    // One TCP listen fd per mapping — owned by the dedicated accept
+    // thread, NOT the vCPUs. macOS SO_REUSEPORT does not distribute
+    // TCP across listener siblings, so the accept thread picks the
+    // target vCPU in software (round-robin via NEXT_TARGET_VCPU) and
+    // hands the new conn to the matching `WORKERS[N].conns`.
+    let mut listens: Vec<TcpListen> = Vec::new();
+    // UDP keeps per-vCPU SO_REUSEPORT siblings — that mechanism does
+    // distribute on macOS. Each vCPU drains its own sibling inline.
     let mut per_worker_udps: Vec<Vec<UdpRelay>> =
         (0..cpu_count).map(|_| Vec::new()).collect();
     let mut relay_table: Vec<UdpRelayFds> = Vec::new();
@@ -325,11 +370,8 @@ pub fn start(mappings: &[PortMapping], cpu_count: usize) -> Result<[u8; 6], Stri
     for m in mappings {
         match m.proto {
             Proto::Tcp => {
-                for worker_id in 0..cpu_count {
-                    let fd = bind_listen(m.host)?;
-                    per_worker_listens[worker_id]
-                        .push(TcpListen { fd, guest_port: m.guest });
-                }
+                let fd = bind_listen(m.host)?;
+                listens.push(TcpListen { fd, guest_port: m.guest });
             }
             Proto::Udp => match open_udp_relay(m.host, cpu_count) {
                 Ok(fds) => {
@@ -354,8 +396,7 @@ pub fn start(mappings: &[PortMapping], cpu_count: usize) -> Result<[u8; 6], Stri
         UDP_RELAYS.set(relay_table).ok();
     }
 
-    // One WorkerShared entry per worker, all initialised before any
-    // vCPU runs.
+    // One WorkerShared entry per vCPU, populated before any vCPU runs.
     let mut workers: Vec<WorkerShared> = Vec::with_capacity(cpu_count);
     for _ in 0..cpu_count {
         workers.push(WorkerShared::new());
@@ -363,18 +404,25 @@ pub fn start(mappings: &[PortMapping], cpu_count: usize) -> Result<[u8; 6], Stri
     WORKERS.set(workers).ok();
     CPU_COUNT.store(cpu_count, Ordering::Release);
 
-    // Inline-poll design: build one `IoState` per vCPU and stash it in
-    // `VCPU_IOS`. The vCPU threads themselves call `vcpu_poll()` to run
-    // one polling iteration between `hv_vcpu_run` invocations. No worker
-    // threads are spawned — the vCPU thread is the worker.
+    // Per-vCPU wake pipes. The accept thread doorbells the target vCPU
+    // via these so a parked `vcpu_poll(10ms)` returns immediately
+    // instead of waiting up to 10 ms after a SYN handoff.
+    let mut wake_pipes: Vec<WakePipe> = Vec::with_capacity(cpu_count);
+    for _ in 0..cpu_count {
+        wake_pipes.push(make_wake_pipe()?);
+    }
+    let wake_reads: Vec<i32> = wake_pipes.iter().map(|p| p.read_fd).collect();
+    VCPU_WAKE_PIPES.set(wake_pipes).ok();
+
+    // Build per-vCPU IoState. No TCP listens here — the accept thread
+    // owns them. Each IoState gets the read end of its wake pipe.
     let mut vcpu_ios: Vec<Mutex<IoState>> = Vec::with_capacity(cpu_count);
     for id in 0..cpu_count {
-        let listens = std::mem::take(&mut per_worker_listens[id]);
         let udps = std::mem::take(&mut per_worker_udps[id]);
         vcpu_ios.push(Mutex::new(IoState {
             id,
-            listens,
             udps,
+            wake_pipe_read: wake_reads[id],
             guest_mac: mac,
             read_buf: [0u8; 2048],
             rx_last: 0,
@@ -386,6 +434,16 @@ pub fn start(mappings: &[PortMapping], cpu_count: usize) -> Result<[u8; 6], Stri
         }));
     }
     VCPU_IOS.set(vcpu_ios).ok();
+
+    // Spawn the dedicated TCP accept thread. It owns every TCP listen
+    // fd; on each accept it round-robin-assigns the new conn to a
+    // vCPU's `WORKERS[N].conns` and doorbells via wake_vcpu(N).
+    if !listens.is_empty() {
+        let listens_for_thread = listens.clone();
+        std::thread::spawn(move || {
+            accept_thread(listens_for_thread, cpu_count);
+        });
+    }
 
     eprintln!();
     eprintln!("  VM network: 10.0.2.15 (userspace, zero-copy)");
@@ -586,13 +644,16 @@ fn poll_worker_iteration(
         }
     }
 
-    // ── Build pollfds: our listens, our UDP siblings, our conns ────
+    // ── Build pollfds: wake pipe, UDP siblings, our assigned conns ─
+    // Slot 0 is the wake pipe — written to by the accept thread when
+    // it hands us a new conn so we break out of `poll(timeout_ms)`
+    // immediately instead of waiting up to the full timeout.
     io.pollfds.clear();
     io.conn_ports.clear();
-    for l in &io.listens {
-        io.pollfds.push(libc::pollfd { fd: l.fd, events: libc::POLLIN, revents: 0 });
-        io.conn_ports.push(0);
-    }
+    io.pollfds.push(libc::pollfd {
+        fd: io.wake_pipe_read, events: libc::POLLIN, revents: 0,
+    });
+    io.conn_ports.push(0);
     let udp_slot_start = io.pollfds.len();
     for u in &io.udps {
         for &fd in &u.fds {
@@ -617,13 +678,18 @@ fn poll_worker_iteration(
     };
     if ready <= 0 { return any_injected; }
 
-    // ── Accept new TCP connections on any of our listen fds ────────
-    for i in 0..io.listens.len() {
-        if io.pollfds[i].revents & libc::POLLIN != 0 {
-            let gp = io.listens[i].guest_port;
-            let fd = io.listens[i].fd;
-            accept_connections(io, &qsnap, fd, gp, single_queue);
-            any_injected = true;
+    // ── Drain wake pipe doorbell ───────────────────────────────────
+    // The bytes are just signals from the accept thread; the actual
+    // new conn was already inserted into `WORKERS[id].conns` and the
+    // SYN frame into `tx_replies` before the doorbell. We drain the
+    // pipe here so it doesn't keep firing on subsequent polls.
+    if io.pollfds[0].revents & libc::POLLIN != 0 {
+        let mut tmp = [0u8; 64];
+        loop {
+            let n = unsafe {
+                libc::read(io.wake_pipe_read, tmp.as_mut_ptr() as *mut _, tmp.len())
+            };
+            if n <= 0 { break; }
         }
     }
 
@@ -767,48 +833,83 @@ fn poll_worker_iteration(
     any_injected
 }
 
-fn accept_connections(io: &mut IoState, qsnap: &virtio::QueueSnapshot,
-                      listen_fd: i32, guest_port: u16, single_queue: bool) {
-    let shared = worker_shared(io.id);
-    loop {
-        let client_fd = unsafe {
-            libc::accept(listen_fd, std::ptr::null_mut(), std::ptr::null_mut())
-        };
-        if client_fd < 0 { break; }
-        unsafe {
-            libc::fcntl(client_fd, libc::F_SETFL, libc::O_NONBLOCK);
-            let one: i32 = 1;
-            libc::setsockopt(client_fd, libc::IPPROTO_TCP, libc::TCP_NODELAY,
-                             &one as *const _ as *const _, 4);
-        }
-        // Global atomic so src_ports don't collide across workers.
-        let mut src_port = NEXT_PROXY_SRC_PORT.fetch_add(1, Ordering::Relaxed);
-        if src_port >= 60000 {
-            // Wrap: use CAS to reset to 40000. Only one worker wins the reset;
-            // everyone else just fetch_adds again.
-            let _ = NEXT_PROXY_SRC_PORT.compare_exchange(
-                src_port + 1, 40000, Ordering::Relaxed, Ordering::Relaxed);
-            src_port = NEXT_PROXY_SRC_PORT.fetch_add(1, Ordering::Relaxed);
-        }
+/// Allocate the next guest-visible pseudo-ephemeral source port.
+/// Wraps in [40000, 60000); used to give each accepted TCP conn a
+/// unique 5-tuple from the guest's point of view.
+fn alloc_src_port() -> u16 {
+    let mut p = NEXT_PROXY_SRC_PORT.fetch_add(1, Ordering::Relaxed);
+    if p >= 60000 {
+        let _ = NEXT_PROXY_SRC_PORT.compare_exchange(
+            p + 1, 40000, Ordering::Relaxed, Ordering::Relaxed);
+        p = NEXT_PROXY_SRC_PORT.fetch_add(1, Ordering::Relaxed);
+    }
+    p
+}
 
-        let frame = build_tcp_frame_fixed(&io.guest_mac, GW_IP, VM_IP,
-            src_port, guest_port, 1000, 0, 0x02, &[]);
-        if qsnap.ready {
-            inject_frame(frame.as_slice(), qsnap, &mut io.rx_last);
-            unsafe { core::arch::asm!("dsb sy", options(nostack)); }
-            if single_queue {
-                unsafe { hvf::hv_gic_set_spi(35, true); hvf::hv_gic_set_spi(35, false); }
+/// Dedicated TCP accept thread. Owns every TCP listen fd (no
+/// SO_REUSEPORT siblings — see `bind_listen` for why). Polls them
+/// indefinitely; each `accept()` builds a SYN frame, picks a target
+/// vCPU round-robin, inserts the new conn into `WORKERS[N].conns`,
+/// pushes the SYN into `WORKERS[N].tx_replies`, and doorbells
+/// `wake_vcpu(N)` so the target picks it up immediately.
+///
+/// Established-conn RX is NOT done here — the vCPU thread still
+/// polls its own assigned conn fds inline. Only the listen fd lives
+/// on this thread, so the vCPU isn't blocked on accept latency
+/// while it's deep in `hv_vcpu_run` (which matters a lot for
+/// compute-bound workloads where the vCPU stays in-guest for ms at
+/// a time).
+fn accept_thread(listens: Vec<TcpListen>, cpu_count: usize) {
+    // Wait for virtio init — there's nothing to inject into until
+    // the device is up.
+    loop {
+        if virtio::DEVICE.lock().unwrap().is_some() { break; }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let mut pollfds: Vec<libc::pollfd> = listens.iter()
+        .map(|l| libc::pollfd { fd: l.fd, events: libc::POLLIN, revents: 0 })
+        .collect();
+
+    loop {
+        let r = unsafe {
+            libc::poll(pollfds.as_mut_ptr(), pollfds.len() as u32, 100)
+        };
+        if r <= 0 { continue; }
+
+        for (i, pfd) in pollfds.iter().enumerate() {
+            if pfd.revents & libc::POLLIN == 0 { continue; }
+            let listen = listens[i];
+            loop {
+                let client_fd = unsafe {
+                    libc::accept(listen.fd, std::ptr::null_mut(), std::ptr::null_mut())
+                };
+                if client_fd < 0 { break; }
+                unsafe {
+                    libc::fcntl(client_fd, libc::F_SETFL, libc::O_NONBLOCK);
+                    let one: i32 = 1;
+                    libc::setsockopt(client_fd, libc::IPPROTO_TCP, libc::TCP_NODELAY,
+                                     &one as *const _ as *const _, 4);
+                }
+
+                let src_port = alloc_src_port();
+                let target = NEXT_TARGET_VCPU.fetch_add(1, Ordering::Relaxed) % cpu_count;
+
+                let frame = build_tcp_frame_fixed(&GUEST_MAC, GW_IP, VM_IP,
+                    src_port, listen.guest_port, 1000, 0, 0x02, &[]);
+
+                let shared = worker_shared(target);
+                shared.tx_replies.lock().unwrap().push_back(frame);
+                shared.conns.lock().unwrap().insert(src_port, ProxyConn {
+                    host_fd: client_fd, src_port, guest_port: listen.guest_port,
+                    my_seq: 1001, peer_ack: 0,
+                    state: ConnState::SynSent, pending: Vec::new(),
+                    queue_pair: target,
+                });
+
+                wake_vcpu(target);
             }
-            // Multi-queue: no kick — handled by inline polling.
-        } else {
-            shared.tx_replies.lock().unwrap().push_back(frame);
         }
-        shared.conns.lock().unwrap().insert(src_port, ProxyConn {
-            host_fd: client_fd, src_port, guest_port,
-            my_seq: 1001, peer_ack: 0,
-            state: ConnState::SynSent, pending: Vec::new(),
-            queue_pair: io.id,
-        });
     }
 }
 

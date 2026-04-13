@@ -28,6 +28,20 @@ static VCPU_HANDLES: [AtomicU64; MAX_VCPUS] = {
     [INIT; MAX_VCPUS]
 };
 
+/// Kick a specific vCPU out of `hv_vcpu_run`. Used by the userspace
+/// net accept thread to doorbell a vCPU when it hands it a new conn —
+/// pairs with the wake pipe in `userspace_net::wake_vcpu`. The
+/// resulting CANCELED exit is harmless; the run loop calls
+/// `vcpu_poll(0)` before re-entering the guest, which picks up the
+/// new conn from `WORKERS[id].conns`.
+pub fn wake_vcpu(core_id: usize) {
+    if core_id >= MAX_VCPUS { return; }
+    let handle = VCPU_HANDLES[core_id].load(Ordering::Acquire);
+    if handle != 0 {
+        unsafe { hv_vcpus_exit(&handle as *const u64 as *const _, 1); }
+    }
+}
+
 // ── Guest physical memory layout ─────────────────────────────────────────────
 // Mirrors QEMU `virt` machine defaults so the same kernel binary boots
 // under both QEMU+TCG and this runner.
