@@ -293,12 +293,7 @@ class KvmEnv:
         # driver gates activation on cpu count, but the device side
         # needs mq=on to wire up vhost properly with the multi-queue tap).
         #
-        # rx_queue_size=1024 (default 256) — gives vhost-net more ring
-        # slots to absorb high-rate bursts (udp_async sends ~1.4M pkt/s
-        # at 1c, which overruns the default ring before the guest can
-        # drain). tx_queue_size is capped at 256 in QEMU 10.
-        dev = (f"virtio-net-pci,mac={self.GUEST_MAC},mq=on,vectors={2*nqueues+2},"
-               f"rx_queue_size=1024")
+        dev = f"virtio-net-pci,mac={self.GUEST_MAC},mq=on,vectors={2*nqueues+2}"
         cmd += ["-device", f"{dev},netdev=net0",
                 "-netdev", netdev,
                 "-kernel", elf]
@@ -791,11 +786,17 @@ def main():
                     results[(env_name, cpus, wname)] = (rps, p50, p99)
                     print(f"    {wname:<20s} {rps:>10.0f} req/s  p50={p50}  p99={p99}")
                 elif w["type"] == "udp":
+                    # Let wait_http's TCP teardown settle before firing a
+                    # UDP burst — without this the first sender very
+                    # occasionally wins a race against vhost-net's
+                    # per-queue worker thread and the test records 0.
+                    time.sleep(0.5)
                     pps, p50, p99 = _udp_with_retry(
                         udp_target_port, senders, duration, wrk_host, async_mode=False)
                     results[(env_name, cpus, wname)] = (pps, p50, p99)
                     print(f"    {wname:<20s} {pps:>10.0f} pkt/s  p50={p50}  p99={p99}")
                 elif w["type"] == "udp_async":
+                    time.sleep(0.5)
                     pps, p50, p99 = _udp_with_retry(
                         udp_target_port, senders, duration, wrk_host, async_mode=True)
                     results[(env_name, cpus, wname)] = (pps, p50, p99)
