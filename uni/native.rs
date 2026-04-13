@@ -52,6 +52,11 @@ const SO_REUSEADDR: i32 = 0x0004;
 #[cfg(target_os = "linux")]
 const SO_REUSEADDR: i32 = 2;
 
+#[cfg(target_os = "macos")]
+const SO_REUSEPORT: i32 = 0x0200;
+#[cfg(target_os = "linux")]
+const SO_REUSEPORT: i32 = 15;
+
 
 #[cfg(target_os = "linux")]
 const MSG_NOSIGNAL: i32 = 0x4000;
@@ -414,6 +419,7 @@ unsafe extern "C" fn sigint_handler(_sig: i32) {
 fn init_native() {
     unsafe {
         pthread_key_create(&mut TLS_KEY, 0);
+        pthread_key_create(&mut UDP_FD_TLS_KEY, 0);
 
         let p = getenv(b"PORT\0".as_ptr());
         if !p.is_null() && *p != 0 {
@@ -638,8 +644,17 @@ pub fn tcp_register_shared_listener() {
 
 const MAX_UDP_BINDINGS: usize = 8;
 
+/// One UDP relay. Holds `NUM_THREADS` SO_REUSEPORT sibling sockets all
+/// bound to the same host port. Incoming datagrams are distributed
+/// across the siblings by the kernel (4-tuple hash) so each UDP worker
+/// thread blocks on its own fd's `recvfrom` and runs the app handler
+/// inline. Replies use the receiving thread's sibling fd (set in the
+/// `CURRENT_UDP_FD` TLS slot before the handler call), which keeps the
+/// reply source port equal to the relay port (NAT-correct) and avoids
+/// cross-thread contention on a single kernel socket lock.
 struct UdpBinding {
-    fd: i32,
+    fds: [i32; MAX_THREADS],
+    sibling_count: usize,
     app_port: u16,  // port as requested by app (used for send-side lookup)
     handler: fn([u8; 4], u16, &[u8]),
 }
@@ -651,26 +666,33 @@ static mut UDP_COUNT: usize = 0;
 static mut UDP_PORT_BASE: u16 = 0;
 /// Default UDP port used by the app (first bound port, set on first bind call).
 static mut UDP_DEFAULT_PORT: u16 = 0;
+/// pthread TLS key carrying the current UDP sibling fd for the
+/// running handler. `udp_thread_fn` writes its sibling fd here before
+/// dispatching the handler so `native_udp_send` can reply on the same
+/// socket without a global lookup.
+static mut UDP_FD_TLS_KEY: usize = 0;
 
-pub fn native_udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
+fn set_current_udp_fd(fd: i32) {
+    // Store fd+1 so the default-zero TLS slot maps to "unset".
+    unsafe { pthread_setspecific(UDP_FD_TLS_KEY, (fd + 1) as usize as *const u8); }
+}
+
+fn current_udp_fd() -> i32 {
+    let v = unsafe { pthread_getspecific(UDP_FD_TLS_KEY) } as usize;
+    if v == 0 { -1 } else { v as i32 - 1 }
+}
+
+/// Open one SO_REUSEPORT-bound UDP sibling socket on `bind_port`. All
+/// siblings of a relay share the same port — kernel distributes
+/// incoming datagrams across them by 4-tuple hash.
+fn open_udp_sibling(bind_port: u16) -> i32 {
     unsafe {
-        if UDP_COUNT >= MAX_UDP_BINDINGS { return; }
-
-        // If UDP_PORT env var is set, remap ports: the first app UDP port maps
-        // to UDP_PORT, subsequent ports offset from there.
-        let bind_port = if UDP_PORT_BASE != 0 {
-            if UDP_DEFAULT_PORT == 0 { UDP_DEFAULT_PORT = port; }
-            UDP_PORT_BASE + (port - UDP_DEFAULT_PORT)
-        } else {
-            port
-        };
-
         let fd = socket(AF_INET, SOCK_DGRAM, 0);
-        if fd < 0 { return; }
+        if fd < 0 { return -1; }
 
         let opt: i32 = 1;
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, 4);
-        set_nonblocking(fd);
+        setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, 4);
 
         let addr = SockAddrIn {
             #[cfg(target_os = "macos")]
@@ -686,35 +708,81 @@ pub fn native_udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
 
         if bind(fd, &addr, core::mem::size_of::<SockAddrIn>() as u32) < 0 {
             close(fd);
-            return;
+            return -1;
         }
 
-        // Make the socket blocking — the dedicated UDP thread will block on
-        // recvfrom() instead of busy-polling.
+        // Sibling stays blocking — its dedicated thread blocks on recvfrom().
         let flags = fcntl(fd, F_GETFL, 0i32);
         fcntl(fd, F_SETFL, flags & !O_NONBLOCK);
+        fd
+    }
+}
 
-        UDP_BINDINGS[UDP_COUNT] = Some(UdpBinding { fd, app_port: port, handler });
+pub fn native_udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
+    unsafe {
+        if UDP_COUNT >= MAX_UDP_BINDINGS { return; }
+
+        // If UDP_PORT env var is set, remap ports: the first app UDP port maps
+        // to UDP_PORT, subsequent ports offset from there.
+        let bind_port = if UDP_PORT_BASE != 0 {
+            if UDP_DEFAULT_PORT == 0 { UDP_DEFAULT_PORT = port; }
+            UDP_PORT_BASE + (port - UDP_DEFAULT_PORT)
+        } else {
+            port
+        };
+
+        // Open NUM_THREADS SO_REUSEPORT siblings so the kernel
+        // distributes incoming datagrams across them. Each sibling
+        // gets its own dedicated worker thread blocking on recvfrom.
+        let want = NUM_THREADS.max(1);
+        let mut fds = [-1i32; MAX_THREADS];
+        let mut got = 0usize;
+        for i in 0..want {
+            let fd = open_udp_sibling(bind_port);
+            if fd < 0 {
+                // First sibling failure is fatal; later are best-effort.
+                if i == 0 { return; }
+                break;
+            }
+            fds[i] = fd;
+            got += 1;
+        }
+
+        let binding_idx = UDP_COUNT;
+        UDP_BINDINGS[binding_idx] = Some(UdpBinding {
+            fds,
+            sibling_count: got,
+            app_port: port,
+            handler,
+        });
         UDP_COUNT += 1;
 
-        // Spawn a dedicated thread that blocks on recvfrom() and dispatches
-        // the handler inline — no interleaving with TCP connection scanning.
-        let idx = UDP_COUNT - 1;
-        let mut thread: PthreadT = 0;
-        pthread_create(&mut thread, ptr::null(), udp_thread_fn, idx as *mut u8);
+        // Spawn one dedicated UDP RX thread per sibling. Each blocks
+        // on its own fd's recvfrom and dispatches the handler inline.
+        for sibling in 0..got {
+            let arg = ((binding_idx as usize) << 16) | sibling;
+            let mut thread: PthreadT = 0;
+            pthread_create(&mut thread, ptr::null(), udp_thread_fn, arg as *mut u8);
+        }
     }
 }
 
 extern "C" fn udp_thread_fn(arg: *mut u8) -> *mut u8 {
-    let idx = arg as usize;
+    let packed = arg as usize;
+    let binding_idx = packed >> 16;
+    let sibling_idx = packed & 0xffff;
     let mut buf = [0u8; 65536];
+    let (fd, handler) = unsafe {
+        match UDP_BINDINGS[binding_idx] {
+            Some(ref b) => (b.fds[sibling_idx], b.handler),
+            None => return ptr::null_mut(),
+        }
+    };
+    // Publish our sibling fd so native_udp_send replies on the same
+    // socket the request arrived on.
+    set_current_udp_fd(fd);
     loop {
         unsafe {
-            let binding = match UDP_BINDINGS[idx] {
-                Some(ref b) => (b.fd, b.app_port, b.handler),
-                None => break,
-            };
-            let (fd, _app_port, handler) = binding;
             let mut src_addr: SockAddrIn = core::mem::zeroed();
             let mut addr_len = core::mem::size_of::<SockAddrIn>() as u32;
             let n = recvfrom(fd, buf.as_mut_ptr(), buf.len(), 0,
@@ -730,13 +798,19 @@ extern "C" fn udp_thread_fn(arg: *mut u8) -> *mut u8 {
 
 pub fn native_udp_send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
     unsafe {
-        // Find the binding for src_port (app port) to get the fd
-        let mut send_fd = -1;
-        for i in 0..UDP_COUNT {
-            if let Some(ref b) = UDP_BINDINGS[i] {
-                if b.app_port == src_port {
-                    send_fd = b.fd;
-                    break;
+        // Fast path: handler running on a UDP RX thread — reply on the
+        // sibling fd that received the request, so we hit the same
+        // kernel socket lock and the source port is already correct.
+        let mut send_fd = current_udp_fd();
+        if send_fd < 0 {
+            // Slow path: caller is not a UDP RX thread (e.g. a TCP
+            // worker). Use sibling 0 of the matching binding.
+            for i in 0..UDP_COUNT {
+                if let Some(ref b) = UDP_BINDINGS[i] {
+                    if b.app_port == src_port && b.sibling_count > 0 {
+                        send_fd = b.fds[0];
+                        break;
+                    }
                 }
             }
         }
