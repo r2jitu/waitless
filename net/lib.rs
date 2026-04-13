@@ -319,6 +319,9 @@ pub fn init_eventloop() {
     kernel::eventloop::set_net_poll(net_poll_cb);
     kernel::eventloop::set_net_drain(net_drain_cb);
     kernel::eventloop::set_net_flush(net_flush_cb);
+    // NAPI re-arm: right before the event loop HLTs, re-enable RX
+    // notifications on this core's queue pair and re-check the ring.
+    kernel::eventloop::set_net_rearm_rx(drivers::virtio_net::rearm_rx_napi);
     // Batch TX kicks: defer MMIO writes until net_flush_cb, reducing
     // exits per HTTP response from N segments to 1 notification.
     drivers::virtio_net::enable_deferred_tx_kick();

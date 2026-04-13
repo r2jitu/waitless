@@ -522,20 +522,9 @@ unsafe fn kernel_boot(info: &BootInfo) {
 ///   On QEMU/VZ, WFI is used (not WFE) because WFE wakes from any SEV (spurious),
 ///   which starves the VZ TCP proxy thread. wake_cores() sends SGI so WFI wakes correctly.
 fn idle_cb(core_id: u32) {
-    // Tier 1 multi-queue: each AP polls its own RX queue and has no
-    // MSI-X vector wired up, so we can't HLT — return immediately to
-    // busy-poll. CPU pegs at 100% but RX latency is bounded by the
-    // poll loop, not interrupt delivery.
-    if drivers::virtio_net::num_queue_pairs() > 1 && core_id > 0 {
-        return;
-    }
-    // Same story for core 0 (or any core in single-queue mode) when
-    // the transport can't deliver an RX interrupt: without a wake-up
-    // source, HLT blocks until the APIC timer fires, which on x86_64
-    // ModernPci means missing any packet burst shorter than ~10ms.
-    // `irq_idle_supported` is only true for LegacyPCI (INTx wired) or
-    // aarch64 GIC-backed paths; ModernPci on x86_64 currently returns
-    // false, and we busy-poll to keep latency bounded.
+    // No wake-up source → busy-poll. (Happens when the transport
+    // doesn't expose any IRQ path: aarch64 without GIC configured,
+    // legacy PCI without an IRQ line, etc.)
     if !drivers::virtio_net::irq_idle_supported() {
         return;
     }

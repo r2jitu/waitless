@@ -9,10 +9,11 @@
 # Use `--keep-running` to skip the post-run stop (handy for iterative
 # debug sessions where you're about to run another bench).
 #
-# Default cores are 1,2,4 — the GCP host is 8 vCPUs, and running the
-# unikernel with 8 vCPUs leaves no headroom for wrk + vhost-net
-# kthreads, so scaling numbers are artificially depressed. Pass
-# `--cores 1,2,4,8` if you want to see that ceiling.
+# Default cores are 1,2,3 — the GCP host is 8 vCPUs, and the fair
+# upper bound for a scaling comparison leaves room for wrk + per-
+# queue vhost-net kthreads (each vCPU gets its own vhost kthread).
+# 3 vCPUs + 3 vhost kthreads + wrk = ~7 busy threads, which fits
+# comfortably. Pass `--cores 1,2,4,8` if you want to see the ceiling.
 #
 # Usage:
 #   ./scripts/gcp-bench.sh                           # kvm + native, 1,2,4 cores
@@ -33,7 +34,7 @@ SSH_HOST="${GCP_SSH_HOST:-gcp}"
 REMOTE_DIR="${GCP_REMOTE_DIR:-bench}"
 
 # Default args; overridden by user-supplied flags.
-DEFAULT_CORES="1,2,4"
+DEFAULT_CORES="1,2,3"
 DEFAULT_DURATION="10"
 DEFAULT_ENV="kvm,native"
 

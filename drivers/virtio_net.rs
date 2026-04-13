@@ -13,12 +13,14 @@ use crate::{
 use kernel::aarch64::{exceptions, fdt};
 use crate::pci::{pci_device, read_config, find_device, enable_bus_mastering_inner};
 use crate::virtio::{
-    vpci_device, Virtqueue,
+    vpci_device, Virtqueue, VirtioPciDevice,
     vpci_find, vpci_reset, vpci_set_status, vpci_get_status,
     vpci_read_features, vpci_write_features,
     vpci_select_queue, vpci_get_queue_size, vpci_get_queue_notify_off,
     vpci_queue_notify_addr, vpci_set_queue_addrs, vpci_enable_queue,
     vpci_read_dev_cfg8, vpci_read_dev_cfg16, vpci_read_isr,
+    vpci_set_queue_msix_vector, vpci_set_config_msix_vector,
+    vpci_msix_enable, vpci_msix_write_entry,
     STATUS_ACKNOWLEDGE, STATUS_DRIVER, STATUS_DRIVER_OK, STATUS_FEATURES_OK, STATUS_FAILED,
     VIRTIO_NET_F_MAC, VIRTIO_NET_F_MRG_RXBUF, VIRTIO_NET_F_STATUS,
     VIRTIO_NET_F_MQ, VIRTIO_NET_F_CTRL_VQ,
@@ -1163,19 +1165,104 @@ pub fn enable_irq() {
 
         #[cfg(target_arch = "x86_64")]
         {
-            if let Transport::LegacyPci { pci_idx, .. } = (*ndev()).transport {
-                let dev = pci_device(pci_idx);
-                let irq_reg = read_config(dev.bus, dev.slot, dev.func, 0x3C);
-                let irq_line = (irq_reg & 0xFF) as u8;
-                if irq_line < 16 {
-                    (*ndev()).rx_queues[0].enable_interrupts();
-                    kernel::x86_64::idt::register_handler(32 + irq_line, irq_handler_x86);
-                    kernel::x86_64::idt::enable_irq(irq_line);
-                    (*ndev()).irq_idle_available = true;
+            match (*ndev()).transport {
+                Transport::LegacyPci { pci_idx, .. } => {
+                    let dev = pci_device(pci_idx);
+                    let irq_reg = read_config(dev.bus, dev.slot, dev.func, 0x3C);
+                    let irq_line = (irq_reg & 0xFF) as u8;
+                    if irq_line < 16 {
+                        (*ndev()).rx_queues[0].enable_interrupts();
+                        kernel::x86_64::idt::register_handler(32 + irq_line, irq_handler_x86);
+                        kernel::x86_64::idt::enable_irq(irq_line);
+                        (*ndev()).irq_idle_available = true;
+                    }
                 }
+                Transport::ModernPci { vpci_idx } => {
+                    let dev = vpci_device(vpci_idx);
+                    if dev.msix_cap_off != 0 && dev.msix_table != 0 {
+                        init_msix_x86(&dev, (*ndev()).num_queue_pairs as usize);
+                        // Enable notifications on each RX queue pair so the
+                        // first incoming packet triggers an MSI-X entry we
+                        // unmasked in init_msix_x86.
+                        let nqp = (*ndev()).num_queue_pairs as usize;
+                        for qp in 0..nqp {
+                            (*ndev()).rx_queues[qp].enable_interrupts();
+                        }
+                        (*ndev()).irq_idle_available = true;
+                    }
+                }
+                _ => {}
             }
         }
     }
+}
+
+/// Wire MSI-X for ModernPCI on x86_64. One vector per RX queue pair;
+/// each vector is steered to the owning vCPU's Local APIC so `arch::idle`
+/// on that core wakes directly on its own RX queue. TX queues and the
+/// config-change vector are set to VIRTIO_MSI_NO_VECTOR because the
+/// driver polls TX completions itself.
+///
+/// Must be called with all queue pairs already enabled and before
+/// DRIVER_OK is set (which the `enable_irq` caller arranges: in the
+/// current flow enable_irq runs from the boot path after DRIVER_OK,
+/// and QEMU's virtio-net happily accepts MSI-X vector updates then).
+#[cfg(target_arch = "x86_64")]
+fn init_msix_x86(dev: &VirtioPciDevice, num_pairs: usize) {
+    const NO_VEC: u16 = 0xFFFF;
+    // IDT base for virtio-net MSI-X vectors. Sits above the PIC/APIC
+    // timer range and well under the spurious vector (0xFF). One
+    // vector per RX queue pair — up to MAX_QUEUE_PAIRS.
+    const MSIX_IDT_BASE: u8 = 0x60;
+
+    // Enable MSI-X in the device's PCI config.
+    vpci_msix_enable(dev, true);
+
+    // Config-change interrupt: unused.
+    vpci_set_config_msix_vector(dev, NO_VEC);
+
+    let topo = kernel::x86_64::acpi::topology();
+    let cpu_count = topo.cpu_count as usize;
+
+    for qp in 0..num_pairs {
+        // Steer each queue pair's RX IRQ at the vCPU that owns it.
+        let target_cpu = if qp < cpu_count { qp } else { 0 };
+        let apic_id = topo.apic_ids[target_cpu] as u64;
+        let idt_vector = MSIX_IDT_BASE + qp as u8;
+        // MSI address (Intel SDM 10.11.1): 0xFEE0_0000 | dest<<12.
+        // MSI data: low byte = vector, rest zero (fixed delivery, edge).
+        let addr = 0xFEE0_0000u64 | (apic_id << 12);
+        let data = idt_vector as u32;
+        vpci_msix_write_entry(dev, qp as u16, addr, data, false);
+
+        // Install the IDT handler for this vector. All per-queue
+        // handlers share one implementation that reads the current
+        // core's id and sets the RX_PENDING flag for that core.
+        kernel::x86_64::idt::register_handler(idt_vector, msix_rx_isr_trampoline);
+
+        // Point the RX queue at the vector; TX stays unvectored.
+        let rx_qi = (qp * 2) as u16;
+        let tx_qi = (qp * 2 + 1) as u16;
+        vpci_select_queue(dev, rx_qi);
+        vpci_set_queue_msix_vector(dev, qp as u16);
+        vpci_select_queue(dev, tx_qi);
+        vpci_set_queue_msix_vector(dev, NO_VEC);
+    }
+
+    log(b"virtio_net: MSI-X enabled (");
+    log(&[b'0' + (num_pairs as u8 % 10)]);
+    log(b" RX vectors)\n");
+}
+
+/// ISR trampoline for all virtio-net MSI-X RX vectors.
+/// Sets `IRQ_PENDING` so the event-loop poll drains the queue on the
+/// next iteration. Fires on the target vCPU because the MSI address
+/// was programmed with that vCPU's LAPIC id.
+#[cfg(target_arch = "x86_64")]
+unsafe extern "C" fn msix_rx_isr_trampoline(
+    _frame: *mut kernel::x86_64::idt::InterruptFrame,
+) {
+    IRQ_PENDING.store(true, core::sync::atomic::Ordering::Release);
 }
 
 pub fn irq_idle_supported() -> bool {
@@ -1188,6 +1275,28 @@ pub fn arm_rx_interrupts() {
 
 pub fn has_pending_rx() -> bool {
     unsafe { (*ndev()).rx_queues[0].has_used() }
+}
+
+/// NAPI re-arm for the event loop: enable RX notifications on the
+/// queue pair that `core_id` owns, then re-check for work that arrived
+/// in the arm window. Returns true iff the caller should skip HLT and
+/// loop back to poll.
+///
+/// Tier 1 multi-queue: each core owns `rx_queues[core_id]`.
+/// Tier 2 / single-queue: every core arms queue 0, and only the core
+/// currently acting as distributor (whichever wins the RX_LOCK in the
+/// net crate) actually reads from it.
+pub fn rearm_rx_napi(core_id: u32) -> bool {
+    unsafe {
+        let nqp = (*ndev()).num_queue_pairs;
+        let qp = if nqp > 1 && (core_id as u16) < nqp {
+            core_id as usize
+        } else {
+            0
+        };
+        (*ndev()).rx_queues[qp].enable_interrupts();
+        (*ndev()).rx_queues[qp].has_used()
+    }
 }
 
 /// Enable deferred TX kick mode. After this, kick() on the TX queue

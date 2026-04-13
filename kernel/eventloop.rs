@@ -27,6 +27,14 @@ static NET_FLUSH: AtomicFn<VoidFn> = AtomicFn::null();
 static SERVICE: AtomicFn<PollFn> = AtomicFn::null();
 static CHECK_SHUTDOWN: AtomicFn<BoolFn> = AtomicFn::null();
 static IDLE: AtomicFn<IdleFn> = AtomicFn::null();
+/// Re-arm RX notifications for this core right before we HLT/WFI.
+/// Returns true if work became available during the arm (a packet
+/// arrived in the tiny window between the driver's last poll and
+/// writing out the used-event sentinel). When that happens the loop
+/// skips the idle and goes around again. See the NAPI pattern in
+/// the event loop below.
+type ArmFn = fn(u32) -> bool;
+static NET_REARM_RX: AtomicFn<ArmFn> = AtomicFn::null();
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static READY: AtomicBool = AtomicBool::new(false);
@@ -55,6 +63,10 @@ pub fn set_check_shutdown(f: BoolFn) {
 
 pub fn set_idle(f: IdleFn) {
     IDLE.store(f);
+}
+
+pub fn set_net_rearm_rx(f: ArmFn) {
+    NET_REARM_RX.store(f);
 }
 
 /// Signal that the app has finished initialization and the event loop
@@ -155,6 +167,16 @@ pub fn run(core_id: u32) -> ! {
             // Flush before sleeping (responses may be staged).
             if let Some(f) = NET_FLUSH.load() {
                 f();
+            }
+
+            // NAPI-style re-arm: tell the device to notify us on the
+            // next RX. The callback returns true if a packet already
+            // landed between the last poll and now, in which case we
+            // skip HLT and loop so we don't miss it.
+            if let Some(arm) = NET_REARM_RX.load() {
+                if arm(core_id) {
+                    continue;
+                }
             }
 
             // Sleep until interrupt. WFI/HLT yields the CPU to the

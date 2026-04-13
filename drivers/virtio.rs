@@ -59,11 +59,13 @@ pub(crate) struct VirtioPciDevice {
     pub device_cfg: u64,        // MMIO address of device-specific cfg
     pub isr_cfg: u64,           // MMIO address of ISR cap
     pub notify_off_multiplier: u32,
-    #[cfg(target_arch = "aarch64")]
+    /// Offset into PCI config space of the MSI-X capability structure,
+    /// or 0 if the device doesn't expose one.
     pub msix_cap_off: u8,
-    #[cfg(target_arch = "aarch64")]
+    /// CPU virtual address of the MSI-X message table (BAR + offset).
     pub msix_table: u64,
-    #[cfg(target_arch = "aarch64")]
+    /// Number of entries in the MSI-X message table (message-control
+    /// register's TableSize field + 1). Zero if MSI-X isn't supported.
     pub msix_table_size: u16,
 }
 
@@ -75,11 +77,8 @@ impl VirtioPciDevice {
         device_cfg: 0,
         isr_cfg: 0,
         notify_off_multiplier: 0,
-        #[cfg(target_arch = "aarch64")]
         msix_cap_off: 0,
-        #[cfg(target_arch = "aarch64")]
         msix_table: 0,
-        #[cfg(target_arch = "aarch64")]
         msix_table_size: 0,
     };
 }
@@ -141,9 +140,23 @@ fn vpci_parse_caps(dev: &mut VirtioPciDevice) -> bool {
         let cap_vndr = (hdr & 0xFF) as u8;
         let cap_next = ((hdr >> 8) & 0xFF) as u8;
 
-        #[cfg(target_arch = "aarch64")]
         if cap_vndr == PCI_CAP_ID_MSIX && dev.msix_cap_off == 0 {
+            // MSI-X capability layout (PCIe base 3.0 §6.8.2):
+            //   +0  cap id | next
+            //   +2  message control  (bit 15 = enable, bit 14 = func mask,
+            //                         bits 10..0 = TableSize - 1)
+            //   +4  Table Offset/BIR (bits 2..0 = BAR index, rest = offset)
+            //   +8  PBA   Offset/BIR
             dev.msix_cap_off = cap_ptr;
+            let mc = (read_config(bus, slot, func, cap_ptr) >> 16) as u16;
+            dev.msix_table_size = (mc & 0x7FF) + 1;
+            let tbl_word = read_config(bus, slot, func, cap_ptr.wrapping_add(4));
+            let bar_idx = (tbl_word & 0x7) as usize;
+            let offset = (tbl_word & !0x7) as u64;
+            let bar_base = resolve_bar(dev.pci_idx, bar_idx);
+            if bar_base != 0 {
+                dev.msix_table = bar_base + offset;
+            }
         }
 
         if cap_vndr == PCI_CAP_ID_VNDR {
@@ -291,9 +304,51 @@ pub(crate) fn vpci_read_isr(dev: &VirtioPciDevice) -> u8 {
     unsafe { mmio_read8(dev.isr_cfg) }
 }
 
-#[cfg(target_arch = "aarch64")]
 pub(crate) fn vpci_set_queue_msix_vector(dev: &VirtioPciDevice, vector: u16) {
     unsafe { mmio_write16(dev.common_cfg + CC_QUEUE_MSIX_VECTOR, vector); }
+}
+
+pub(crate) fn vpci_set_config_msix_vector(dev: &VirtioPciDevice, vector: u16) {
+    unsafe { mmio_write16(dev.common_cfg + CC_CONFIG_MSIX_VECTOR, vector); }
+}
+
+/// Toggle the `MSI-X Enable` bit in the device's message-control word.
+/// The function-mask bit is cleared so individual entries control
+/// delivery via their own per-vector mask.
+pub(crate) fn vpci_msix_enable(dev: &VirtioPciDevice, enable: bool) {
+    if dev.msix_cap_off == 0 { return; }
+    let pci = pci_device(dev.pci_idx);
+    let cap = dev.msix_cap_off;
+    let word = read_config(pci.bus, pci.slot, pci.func, cap);
+    let mc = ((word >> 16) & 0xFFFF) as u16;
+    let new_mc: u16 = if enable {
+        (mc | 0x8000) & !0x4000 // set Enable, clear FuncMask
+    } else {
+        mc & !0x8000
+    };
+    let new_word = (word & 0x0000_FFFF) | ((new_mc as u32) << 16);
+    write_config(pci.bus, pci.slot, pci.func, cap, new_word);
+}
+
+/// Program one MSI-X table entry: address, data, and mask bit.
+/// Each entry is 16 bytes: addr_lo, addr_hi, data, vector_ctrl.
+pub(crate) fn vpci_msix_write_entry(
+    dev: &VirtioPciDevice,
+    entry: u16,
+    addr: u64,
+    data: u32,
+    masked: bool,
+) {
+    if dev.msix_table == 0 || entry >= dev.msix_table_size {
+        return;
+    }
+    let slot = dev.msix_table + (entry as u64) * 16;
+    unsafe {
+        mmio_write32(slot,        addr as u32);
+        mmio_write32(slot + 4,   (addr >> 32) as u32);
+        mmio_write32(slot + 8,    data);
+        mmio_write32(slot + 12,   if masked { 1 } else { 0 });
+    }
 }
 
 // ============================================================================
