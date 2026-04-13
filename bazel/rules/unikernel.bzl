@@ -37,8 +37,8 @@ def unikernel_binary(name, app, visibility = None):
     The application is a rust_library with a #[uni::main] entry point.
 
     Targets produced:
-      - <name>.elf        : Bare-metal ELF (QEMU direct boot, VZ)
-      - <name>.img        : Raw binary (ARM64 VZ.framework / QEMU -kernel)
+      - <name>.elf        : Bare-metal ELF (QEMU direct boot)
+      - <name>.img        : Raw binary (HVF runner / QEMU -kernel on aarch64)
       - <name>.limine.elf : Higher-half ELF (Limine bootloader)
       - <name>.iso        : Limine-bootable ISO (BIOS + UEFI)
       - <name>_native     : Native POSIX binary (host OS, no VM)
@@ -172,24 +172,18 @@ def unikernel_binary(name, app, visibility = None):
     sh_binary(
         name = name + "_run",
         srcs = select({
-            "//bazel/platforms:runner_vz": ["//bazel/rules:run_vz.sh"],
             "//bazel/platforms:runner_hvf": ["//bazel/rules:run_hvf.sh"],
             "//bazel/platforms:runner_qemu": ["//bazel/rules:run_qemu.sh"],
             "//bazel/platforms:runner_iso": ["//bazel/rules:run_iso.sh"],
             "//conditions:default": ["//bazel/rules:run_native.sh"],
         }),
         data = select({
-            "//bazel/platforms:runner_vz": [":" + name + ".img", "//tools/run-vz:run_vz"],
             "//bazel/platforms:runner_hvf": [":" + name + ".img", "//tools/hvf-runner:run_hvf"],
             "//bazel/platforms:runner_qemu": [":" + name + ".elf", ":" + name + ".img"],
             "//bazel/platforms:runner_iso": [":" + name + ".iso"],
             "//conditions:default": [":" + name + "_native"],
         }),
         env = select({
-            "//bazel/platforms:runner_vz": {
-                "UNIKERNEL_IMG_RELPATH": native.package_name() + "/" + name + ".img",
-                "UNIKERNEL_VZ_RELPATH": "tools/run-vz/run-vz",
-            },
             "//bazel/platforms:runner_hvf": {
                 "UNIKERNEL_IMG_RELPATH": native.package_name() + "/" + name + ".img",
                 "UNIKERNEL_HVF_RELPATH": "tools/hvf-runner/run-hvf",

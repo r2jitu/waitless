@@ -19,7 +19,7 @@ platform(
 # ── Runtime constraint ─────────────────────────────────────────────────────────
 # Distinguishes native host builds (os:macos or os:linux) from bare-metal
 # unikernel builds (os:none).  Used in target_compatible_with to gate targets
-# that only make sense as host binaries (native app binary, VZ runner).
+# that only make sense as host binaries (native app binary, HVF runner).
 constraint_setting(name = "runtime")
 
 constraint_value(
@@ -79,11 +79,6 @@ config_setting(
 # ── Runner selection ──────────────────────────────────────────────────────────
 # Set via --define=uni_runner=<value>; used in select() by unikernel_binary().
 # Default (no define) = native POSIX binary.
-config_setting(
-    name = "runner_vz",
-    define_values = {"uni_runner": "vz"},
-)
-
 config_setting(
     name = "runner_qemu",
     define_values = {"uni_runner": "qemu"},

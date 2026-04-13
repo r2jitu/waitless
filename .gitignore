@@ -24,6 +24,5 @@ rust-project.json
 
 # Cached artifacts
 .cache/
-scripts/run-vz
 bench/webserver_native
 scripts/udp_bench

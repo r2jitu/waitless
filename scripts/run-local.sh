@@ -12,7 +12,7 @@
 # The kernel path may be a raw binary (.img) or ELF (.elf).
 # If no path is given, builds and runs the webserver example.
 # Runner is selected automatically:
-#   • macOS arm64  → VZ.framework (Apple Virtualization, hardware-accelerated)
+#   • macOS arm64  → HVF runner (Apple Hypervisor.framework, in-tree Rust)
 #   • macOS x86_64 → QEMU with HVF if available
 #   • Linux        → QEMU with KVM if /dev/kvm is accessible
 #
@@ -46,7 +46,7 @@ if [ -z "$KERNEL" ]; then
     cd "$PROJECT_ROOT"
 
     if [ "$HOST_OS" = "Darwin" ] && [ "$HOST_ARCH" = "arm64" ]; then
-        # macOS arm64: build raw binary image for VZ.framework (run-vz).
+        # macOS arm64: build raw binary image for the HVF runner.
         # .bazelrc.local sets --platforms=aarch64_unikernel by default.
         bazel build //apps/webserver:webserver.img
         KERNEL="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver.img"
@@ -67,9 +67,8 @@ if [ ! -f "$KERNEL" ]; then
     exit 1
 fi
 
-# ── macOS arm64 → HVF or VZ.framework (hardware-accelerated) ─────────────────
-# UNIKERNEL_RUNNER: hvf (default), vz, or qemu.
-# HVF requires root (for vmnet). Falls back to VZ if HVF is unavailable.
+# ── macOS arm64 → HVF runner (hardware-accelerated) ──────────────────────────
+# UNIKERNEL_RUNNER: hvf (default) or qemu.
 RUNNER="${UNIKERNEL_RUNNER:-hvf}"
 if [ "$HOST_OS" = "Darwin" ] && [ "$HOST_ARCH" = "arm64" ] && [ "$RUNNER" = "hvf" ]; then
     RUN_HVF="$PROJECT_ROOT/tools/hvf-runner/target/release/run-hvf"
@@ -88,34 +87,13 @@ if [ "$HOST_OS" = "Darwin" ] && [ "$HOST_ARCH" = "arm64" ] && [ "$RUNNER" = "hvf
         fi
     fi
 
-    if [ -x "$RUN_HVF" ]; then
-        echo "==> Starting HVF runner (requires root for vmnet)"
-        exec sudo "$RUN_HVF" "$IMG"
-    else
-        echo "Warning: HVF runner not found, falling back to VZ"
-        RUNNER="vz"
+    if [ ! -x "$RUN_HVF" ]; then
+        echo "Error: HVF runner not found at $RUN_HVF"
+        echo "       Build it: cd tools/hvf-runner && cargo build --release"
+        exit 1
     fi
-fi
-
-if [ "$HOST_OS" = "Darwin" ] && [ "$HOST_ARCH" = "arm64" ] && [ "$RUNNER" = "vz" ]; then
-    RUN_VZ="$PROJECT_ROOT/bazel-bin/tools/run-vz/run-vz"
-
-    # Always build via Bazel — fast no-op if run-vz.swift hasn't changed.
-    (cd "$PROJECT_ROOT" && bazel build //tools/run-vz:run_vz)
-
-    IMG="$KERNEL"
-    if [[ "$KERNEL" == *.elf ]]; then
-        IMG="${KERNEL%.elf}.img"
-        if [ ! -f "$IMG" ]; then
-            echo "Error: run-vz requires a raw binary image, not an ELF."
-            echo "       Expected: $IMG"
-            echo "       Build it: bazel build //apps/webserver:webserver.img"
-            exit 1
-        fi
-    fi
-
-    # run-vz prints its own startup banner; no need to echo here.
-    exec "$RUN_VZ" "$IMG" "$HOST_PORT"
+    echo "==> Starting HVF runner"
+    exec "$RUN_HVF" "$IMG"
 fi
 
 # ── Common QEMU output flags ──────────────────────────────────────────────────

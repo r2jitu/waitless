@@ -13,6 +13,3 @@ sh_binary(
     srcs = ["make-limine-iso.sh"],
     data = ["//boot:limine.conf"],
 )
-
-# The VZ.framework runner moved to //tools/run-vz:run_vz alongside the
-# tools/hvf-runner crate. Update any references.

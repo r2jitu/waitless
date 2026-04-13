@@ -6,10 +6,6 @@ build --action_env=PATH
 build --@rules_rust//:extra_rustc_flags=-Cpanic=abort,-Copt-level=2,-Dwarnings
 
 # ── Shorthand configs ─────────────────────────────────────────────────────────
-# --config=vz   → ARM64 unikernel, VZ.framework (macOS arm64)
-build:vz   --platforms=//bazel/platforms:aarch64_unikernel
-build:vz   --define=uni_runner=vz
-
 # --config=qemu → unikernel via QEMU (platform from .bazelrc.local for host arch)
 build:qemu --define=uni_runner=qemu
 
@@ -25,9 +21,6 @@ build:iso  --define=uni_runner=iso
 # setup-dev.sh generates: build:native --platforms=//bazel/platforms:native_<host>
 
 # ── Full triplet configs ───────────────────────────────────────────────────────
-build:aarch64-vz   --platforms=//bazel/platforms:aarch64_unikernel
-build:aarch64-vz   --define=uni_runner=vz
-
 build:aarch64-hvf  --platforms=//bazel/platforms:aarch64_unikernel
 build:aarch64-hvf  --define=uni_runner=hvf
 

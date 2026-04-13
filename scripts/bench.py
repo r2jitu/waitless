@@ -3,13 +3,13 @@
 
 Usage:
     python3 scripts/bench.py                                  # default: QEMU x86_64, 1 vs 4 cores
-    python3 scripts/bench.py --env vz                         # VZ 1 vs 4 cores
-    python3 scripts/bench.py --env qemu,vz                    # both environments
-    python3 scripts/bench.py --env all                        # QEMU + VZ + Docker + native
+    python3 scripts/bench.py --env hvf                        # HVF 1 vs 4 cores
+    python3 scripts/bench.py --env qemu,hvf                   # both environments
+    python3 scripts/bench.py --env all                        # QEMU + HVF + Docker + native
     python3 scripts/bench.py --cores 1,2,4,8                  # custom core counts
     python3 scripts/bench.py --workload compute_c8            # single workload
     python3 scripts/bench.py --duration 10                    # longer runs
-    python3 scripts/bench.py --env vz --cores 1,4             # VZ multi-core scaling
+    python3 scripts/bench.py --env hvf --cores 1,4            # HVF multi-core scaling
 """
 
 import argparse
@@ -352,64 +352,6 @@ class QemuAarch64Env:
         return f"ARM {cpus}c"
 
 
-class VzEnv:
-    name = "vz"
-    label = "VZ.framework"
-
-    def build(self):
-        subprocess.run(
-            ["bazel", "build", "--config=aarch64-vz",
-             "//apps/webserver:webserver.img", "//scripts:run_vz"],
-            capture_output=True, cwd=PROJECT_ROOT, timeout=120)
-
-    def start(self, cpus, port):
-        img = os.path.join(PROJECT_ROOT, "bazel-bin/apps/webserver/webserver.img")
-        run_vz = os.path.join(PROJECT_ROOT, "bazel-bin/scripts/run-vz")
-        env = os.environ.copy()
-        env["UNIKERNEL_CPUS"] = str(cpus)
-        env["UNIKERNEL_MEMORY"] = "128"
-        log_err = open(f"/tmp/vz_{port}.log", "w")
-        log_out = open(f"/tmp/vz_{port}.serial.log", "w")
-        return subprocess.Popen(
-            [run_vz, img, str(port)],
-            stdin=subprocess.DEVNULL, stdout=log_out, stderr=log_err,
-            env=env)
-
-    def wait_proxy_ready(self, port, proc, timeout=30):
-        """Wait until the TCP proxy port is accepting connections.
-
-        run-vz calls listen() before PROXY_READY is printed; a successful
-        TCP connect means the proxy socket is bound and the VM is about to
-        receive its first frame. This avoids pipe/sentinel complexity entirely.
-        """
-        import socket as _socket
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if proc.poll() is not None:
-                return False
-            try:
-                s = _socket.socket()
-                s.settimeout(0.5)
-                s.connect(('127.0.0.1', port))
-                s.close()
-                return True
-            except (_socket.timeout, ConnectionRefusedError, OSError):
-                time.sleep(0.1)
-        return False
-
-    def stop(self, proc):
-        if proc and proc.poll() is None:
-            proc.kill()
-            proc.wait()
-        # VZ.framework tears down the VM asynchronously; give it time
-        # to release the virtual network interface before the next start.
-        # 2-core VMs need longer — VZ holds vCPU thread resources for ~15s.
-        time.sleep(15)
-
-    def core_label(self, cpus):
-        return f"VZ {cpus}c"
-
-
 class DockerEnv:
     name = "docker"
     label = "Docker/Linux"
@@ -535,7 +477,6 @@ ENV_MAP = {
     "qemu": QemuEnv,
     "kvm": KvmEnv,
     "qemu-arm": QemuAarch64Env,
-    "vz": VzEnv,
     "hvf": HvfEnv,
     "docker": DockerEnv,
     "native": NativeEnv,
@@ -545,7 +486,7 @@ ENV_MAP = {
 def start_env_verified(env, cpus, port):
     """Start env and verify HTTP readiness.
 
-    For VZ: wait for PROXY_READY sentinel (proxy ports bound), then poll
+    For HVF: wait for the proxy TCP port to be connectable, then poll
     HTTP for the VM to finish booting. Retry once if first attempt fails.
     For other envs: poll HTTP directly, no retry.
     """
@@ -553,7 +494,7 @@ def start_env_verified(env, cpus, port):
     if proc is None:
         return None
 
-    if isinstance(env, (VzEnv, HvfEnv)):
+    if isinstance(env, HvfEnv):
         # Phase 1: wait for proxy TCP port to be connectable (fast, <1s normally).
         if not env.wait_proxy_ready(port, proc, timeout=30):
             env.stop(proc)
@@ -618,7 +559,7 @@ WORKLOADS = [
 def main():
     parser = argparse.ArgumentParser(description="Unikernel benchmark")
     parser.add_argument("--env", default="qemu",
-                        help="Environments: qemu,vz,docker,native,all (comma-separated)")
+                        help="Environments: qemu,hvf,docker,native,all (comma-separated)")
     parser.add_argument("--cores", default="1,4",
                         help="Core counts to test (comma-separated)")
     parser.add_argument("--workload", default=None,
@@ -635,9 +576,9 @@ def main():
     core_counts = [int(c) for c in args.cores.split(",")]
 
     if args.env == "all":
-        env_names = ["qemu", "qemu-arm", "vz", "docker", "native"]
+        env_names = ["qemu", "qemu-arm", "hvf", "docker", "native"]
     elif args.env == "vm":
-        env_names = ["qemu", "qemu-arm", "vz"]
+        env_names = ["qemu", "qemu-arm", "hvf"]
     else:
         env_names = [e.strip() for e in args.env.split(",")]
 
@@ -651,12 +592,11 @@ def main():
 
     # These environments only run single-core benchmarks.
     # ARM TCG: no MTTCG support.
-    # VZ: multi-core now supported (distributor enabled; TCP proxy handles c=8 load).
     single_core_only = {"docker", "qemu-arm"}
 
     # Kill stale processes
     subprocess.run(["pkill", "-9", "-f", "qemu-system"], capture_output=True)
-    subprocess.run(["pkill", "-9", "-f", "run-vz"], capture_output=True)
+    subprocess.run(["pkill", "-9", "-f", "run-hvf"], capture_output=True)
     # Anchor to argv[0] to avoid matching our own bench.py cmdline when
     # --native-bin /path/webserver_native is passed.
     subprocess.run(["pkill", "-9", "-f", r"^\S*/webserver_native( |$)"],
@@ -688,11 +628,11 @@ def main():
                 pass
             _current["proc"] = None
         subprocess.run(["pkill", "-9", "-f", "qemu-system"], capture_output=True)
-        subprocess.run(["pkill", "-9", "-f", "run-vz"], capture_output=True)
+        subprocess.run(["pkill", "-9", "-f", "run-hvf"], capture_output=True)
         # Anchor to argv[0] to avoid matching our own bench.py cmdline when
-    # --native-bin /path/webserver_native is passed.
-    subprocess.run(["pkill", "-9", "-f", r"^\S*/webserver_native( |$)"],
-                   capture_output=True)
+        # --native-bin /path/webserver_native is passed.
+        subprocess.run(["pkill", "-9", "-f", r"^\S*/webserver_native( |$)"],
+                       capture_output=True)
 
     try:
       for env_name, env in envs.items():
@@ -708,12 +648,6 @@ def main():
             label = env.core_label(cpus)
             print(f"\n==> {label}")
 
-            # VZ: extra pause before each core-count group except the first.
-            # After running N VMs at a given core count, VZ.framework needs
-            # additional time to settle before the first VM of the next group.
-            if isinstance(env, VzEnv) and cpus != core_counts[0]:
-                time.sleep(10)
-
             consecutive_skips = 0
             for w in workloads:
                 wname = w["name"]
@@ -726,11 +660,10 @@ def main():
                 if proc is None:
                     print(f"    {wname:<20s} SKIP (not ready)")
                     # Print last few lines of serial log to show why it failed.
-                    if isinstance(env, (VzEnv, HvfEnv)):
-                        prefix = "hvf" if isinstance(env, HvfEnv) else "vz"
+                    if isinstance(env, HvfEnv):
                         for suffix, label in [(".serial.log", "serial"), (".log", "stderr")]:
                             try:
-                                with open(f"/tmp/{prefix}_{port}{suffix}") as lf:
+                                with open(f"/tmp/hvf_{port}{suffix}") as lf:
                                     lines = lf.read().strip().splitlines()
                                     for l in lines[-8:]:
                                         print(f"      {label}: {l}")
@@ -812,11 +745,10 @@ def main():
 
     # ── Summary table ────────────────────────────────────────────────────────
 
-    # Restore blocking mode on stdout. Child processes (QEMU, run-vz) can
+    # Restore blocking mode on stdout. Child processes (QEMU, run-hvf) can
     # leave fd 1 in O_NONBLOCK state because macOS shares file-description
-    # flags across fork+exec, and VZ.framework's internal dispatch sets
-    # non-blocking on inherited fds. Without this, the summary print()
-    # calls below raise BlockingIOError(errno 35) on long lines.
+    # flags across fork+exec. Without this, the summary print() calls below
+    # raise BlockingIOError(errno 35) on long lines.
     import fcntl
     fl = fcntl.fcntl(sys.stdout.fileno(), fcntl.F_GETFL)
     fcntl.fcntl(sys.stdout.fileno(), fcntl.F_SETFL, fl & ~os.O_NONBLOCK)
