@@ -201,9 +201,7 @@ fn distribute_frame(frame: &[u8]) {
             ethernet::ETHERTYPE_IPV4 => {
                 if let Some(pkt) = ipv4::ipv4_receive(payload) {
                     // Snoop (src_ip, src_mac) into the ARP fast cache if
-                    // the peer is on our subnet. Avoids a blocking ARP
-                    // request on the first reply when the first packet
-                    // we see from a peer is an IPv4 datagram, not an ARP.
+                    // the peer is on our subnet.
                     if ipv4::same_subnet(pkt.src) {
                         arp::arp_learn(pkt.src, src_mac);
                     }
@@ -264,7 +262,7 @@ pub fn net_receive(frame: &[u8]) {
             ethernet::ETHERTYPE_ARP => arp::arp_receive(payload),
             ethernet::ETHERTYPE_IPV4 => {
                 if let Some(pkt) = ipv4::ipv4_receive(payload) {
-                    // See the matching comment in `distribute_frame`.
+                    // See matching comment in distribute_frame.
                     if ipv4::same_subnet(pkt.src) {
                         arp::arp_learn(pkt.src, src_mac);
                     }

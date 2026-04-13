@@ -275,7 +275,13 @@ fn init_pci_modern() -> bool {
         vpci_enable_queue(dev);
     }
 
-    // Init control VQ if multi-queue (queue index = 2*max_pairs)
+    // Init control VQ only when we'll actually use it (multi-queue
+    // activation via MQ_VQ_PAIRS_SET). Initialising ctrl for single
+    // queue and then leaving it untouched appears to wedge the RX
+    // path on QEMU 10 vhost-net — the device happily delivers the
+    // first few packets (DHCP) but subsequent traffic is silently
+    // dropped. Leaving ctrl uninitialised in the single-queue case
+    // avoids the wedge.
     if has_mq && num_pairs > 1 {
         let ctrl_qi = (2 * max_pairs) as u16;
         vpci_select_queue(dev, ctrl_qi);
@@ -284,17 +290,18 @@ fn init_pci_modern() -> bool {
             let ctrl_notify_off = vpci_get_queue_notify_off(dev);
             let ctrl_notify = vpci_queue_notify_addr(dev, ctrl_notify_off);
             // SAFETY: single-threaded boot init.
-            let ctrl_init = unsafe { (*ndev()).ctrl_queue.init_pci_modern(ctrl_qsize, ctrl_notify, ctrl_qi) };
+            let ctrl_init = unsafe {
+                (*ndev()).ctrl_queue.init_pci_modern(ctrl_qsize, ctrl_notify, ctrl_qi)
+            };
             let ctrl_addrs = match ctrl_init {
                 Some(a) => a,
                 None => {
                     log(b"virtio_net: failed to init CTRL queue\n");
-                    // Non-fatal: fall back to single queue
                     unsafe {
                         (*ndev()).num_queue_pairs = 1;
                         (*ndev()).has_mq = false;
                     }
-                    (0, 0, 0) // won't be used
+                    (0, 0, 0)
                 }
             };
             if ctrl_addrs.0 != 0 {
@@ -347,11 +354,11 @@ fn init_pci_modern() -> bool {
     unsafe {
         (*ndev()).transport = Transport::ModernPci { vpci_idx };
         (*ndev()).guest_features = guest_features;
-        // Multi-queue is NOT activated yet — defer until after DHCP. The
-        // device starts with only queue pair 0 active per spec, so DHCP
-        // (which polls qp 0 only) reliably receives its replies. Once
-        // DHCP completes, boot/entry.rs calls activate_multi_queue() to
-        // promote to N pairs and engage Tier 1 RX polling.
+        // Multi-queue is NOT activated yet — defer until after DHCP.
+        // DHCP only polls queue 0, so we want the device to keep its
+        // default single-pair behaviour until DHCP completes. Once it
+        // does, boot/entry.rs calls activate_multi_queue() to promote
+        // to N pairs and engage Tier 1 RX polling.
         (*ndev()).num_queue_pairs = 1;
         (*ndev()).negotiated_queue_pairs = num_pairs;
         (*ndev()).has_mq = has_mq && num_pairs > 1;
@@ -366,17 +373,13 @@ fn init_pci_modern() -> bool {
     true
 }
 
-/// Promote the device from single-queue to multi-queue. Sends
-/// VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET via the control VQ; on success,
-/// updates `num_queue_pairs` so Tier 1 per-core polling engages.
-///
-/// Called from boot/entry.rs AFTER DHCP succeeds. Activating multi-
-/// queue earlier causes the host (vhost-net + tap) to RSS-hash
-/// incoming packets across queue pairs, and DHCP — which only polls
-/// queue 0 — never sees its replies.
-///
-/// No-op if MQ wasn't negotiated, only one pair is desired, or this
-/// has already been called.
+/// Promote the device from single-queue to multi-queue after DHCP.
+/// No-op for single-queue (count=1) because telling vhost-net to
+/// "use 1 pair" via MQ_VQ_PAIRS_SET(1) appears to wedge the RX path
+/// on QEMU 10 — packets stop arriving in the guest even though the
+/// send-side still looks healthy. Leaving the count unset means
+/// vhost-net falls back to its default single-pair behaviour, which
+/// empirically works fine for 1-vCPU guests.
 pub fn activate_multi_queue() {
     unsafe {
         let dev = &mut *ndev();
@@ -388,8 +391,6 @@ pub fn activate_multi_queue() {
         }
         let target = dev.negotiated_queue_pairs;
         ctrl_mq_set_pairs(target);
-        // ctrl_mq_set_pairs clears has_mq on failure; check before
-        // committing the new num_queue_pairs.
         if (*ndev()).has_mq {
             (*ndev()).num_queue_pairs = target;
             log(b"virtio_net: multi-queue: ");

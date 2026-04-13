@@ -529,6 +529,16 @@ fn idle_cb(core_id: u32) {
     if drivers::virtio_net::num_queue_pairs() > 1 && core_id > 0 {
         return;
     }
+    // Same story for core 0 (or any core in single-queue mode) when
+    // the transport can't deliver an RX interrupt: without a wake-up
+    // source, HLT blocks until the APIC timer fires, which on x86_64
+    // ModernPci means missing any packet burst shorter than ~10ms.
+    // `irq_idle_supported` is only true for LegacyPCI (INTx wired) or
+    // aarch64 GIC-backed paths; ModernPci on x86_64 currently returns
+    // false, and we busy-poll to keep latency bounded.
+    if !drivers::virtio_net::irq_idle_supported() {
+        return;
+    }
     if core_id == 0 || kernel::percpu::num_cores() <= 1 {
         uni::wait_for_events();
     } else {
