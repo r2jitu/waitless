@@ -12,7 +12,7 @@
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
 
 use crate::decoder;
 use crate::fdt;
@@ -27,54 +27,6 @@ static VCPU_HANDLES: [AtomicU64; MAX_VCPUS] = {
     const INIT: AtomicU64 = AtomicU64::new(0);
     [INIT; MAX_VCPUS]
 };
-
-// ── Per-vCPU parking state for cooperative yield ──────────────────────────
-// When the guest writes to YIELD_MMIO_BASE, the vCPU thread parks on the
-// condvar. The IO thread signals it via wake_vcpu() when data arrives.
-// The Mutex<bool> flag prevents missed wakeups: the IO thread sets it to
-// true before signaling, and the yield handler checks it before parking.
-struct VcpuPark {
-    mu: Mutex<bool>,
-    cv: Condvar,
-}
-
-static VCPU_PARKS: [VcpuPark; MAX_VCPUS] = {
-    const INIT: VcpuPark = VcpuPark {
-        mu: Mutex::new(false),
-        cv: Condvar::new(),
-    };
-    [INIT; MAX_VCPUS]
-};
-
-/// Park the current vCPU thread until wake_vcpu() signals it.
-/// Called from the run loop when the guest writes to the yield MMIO register.
-fn park_vcpu(vcpu_id: usize) {
-    let park = &VCPU_PARKS[vcpu_id];
-    let mut guard = park.mu.lock().unwrap();
-    while !*guard {
-        guard = park.cv.wait(guard).unwrap();
-    }
-    *guard = false;
-}
-
-/// Wake a specific vCPU. Called from the IO thread after injecting frames.
-/// Signals the cooperative-yield condvar (in case the vCPU is parked) AND
-/// kicks hv_vcpu_run via hv_vcpus_exit (in case it's in WFI).
-pub fn wake_vcpu(core_id: usize) {
-    if core_id >= MAX_VCPUS { return; }
-    // Signal condvar — wakes the thread if parked in park_vcpu().
-    {
-        let mut pending = VCPU_PARKS[core_id].mu.lock().unwrap();
-        *pending = true;
-        VCPU_PARKS[core_id].cv.notify_one();
-    }
-    // Also kick hv_vcpu_run in case the vCPU is inside hv_vcpu_run
-    // (not parked). The resulting CANCELED exit is harmless.
-    let handle = VCPU_HANDLES[core_id].load(Ordering::Acquire);
-    if handle != 0 {
-        unsafe { hv_vcpus_exit(&handle as *const u64 as *const _, 1); }
-    }
-}
 
 // ── Guest physical memory layout ─────────────────────────────────────────────
 // Mirrors QEMU `virt` machine defaults so the same kernel binary boots
@@ -376,6 +328,11 @@ fn run_vcpu(
             return Ok(());
         }
 
+        // Inline-poll: drain host fds non-blockingly before re-entering
+        // the guest. Replaces the spawned-worker-thread design — the
+        // vCPU thread itself owns the host fds for its queue pair.
+        crate::userspace_net::vcpu_poll(vcpu_id, 0);
+
         // Inject pending vtimer IRQ before entering the guest.
         if vtimer_pending {
             unsafe { hv_vcpu_set_pending_interrupt(vcpu, 0, true); }
@@ -405,9 +362,17 @@ fn run_vcpu(
                         if fault_ipa >= YIELD_MMIO_BASE
                             && fault_ipa < YIELD_MMIO_BASE + YIELD_MMIO_SIZE
                         {
-                            // Cooperative yield — park this vCPU until
-                            // the IO thread has data for it.
-                            park_vcpu(vcpu_id);
+                            // Cooperative yield — block in the inline
+                            // poll until host I/O arrives. The vCPU
+                            // thread itself does the polling now, so
+                            // there's no separate worker to wait on.
+                            // Cap each poll at 10ms so we re-check the
+                            // global shutdown flag promptly.
+                            while !shutdown.load(Ordering::Acquire) {
+                                if crate::userspace_net::vcpu_poll(vcpu_id, 10) {
+                                    break;
+                                }
+                            }
                             let pc = get_reg(vcpu, HvReg::Pc);
                             set_reg(vcpu, HvReg::Pc, pc + 4);
                         } else {
@@ -470,18 +435,14 @@ fn handle_hvc(
 
     match x0 {
         PSCI_SYSTEM_OFF | PSCI_SYSTEM_RESET => {
-            // Signal all vCPUs to stop.
+            // Signal all vCPUs to stop. The inline-poll idle loop
+            // checks `shutdown` between 10ms `poll(2)` waits, so any
+            // vCPU sitting in the cooperative-yield path observes it
+            // promptly. vCPUs inside `hv_vcpu_run` get kicked out via
+            // `hv_vcpus_exit`; the resulting CANCELED exit is harmless.
             shutdown.store(true, Ordering::Release);
-            // Wake all running vCPUs — both parked (condvar) and
-            // in hv_vcpu_run (hv_vcpus_exit) — so they see the
-            // shutdown flag.
-            for (i, vi) in all_vcpus.iter().enumerate() {
+            for vi in all_vcpus.iter() {
                 if vi.running.load(Ordering::Acquire) {
-                    {
-                        let mut pending = VCPU_PARKS[i].mu.lock().unwrap();
-                        *pending = true;
-                        VCPU_PARKS[i].cv.notify_one();
-                    }
                     let _ = unsafe {
                         hv_vcpus_exit(&vi.vcpu as *const _, 1)
                     };

@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, OnceLock};
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 
 use crate::hvf;
 use crate::virtio;
@@ -119,6 +119,19 @@ impl WorkerShared {
 /// worker threads) or `CURRENT_VCPU.get()` (for vCPU threads).
 static WORKERS: OnceLock<Vec<WorkerShared>> = OnceLock::new();
 
+/// Per-vCPU IoState: the host-fd-side state that used to live on the
+/// stack of a dedicated worker thread. With the inline-poll design,
+/// the vCPU thread itself reaches in and runs one polling iteration
+/// before re-entering `hv_vcpu_run`. There is no contention on the
+/// outer `Mutex` — only the matching vCPU thread ever takes it — but
+/// `Mutex` is convenient for `Send + Sync`.
+static VCPU_IOS: OnceLock<Vec<Mutex<IoState>>> = OnceLock::new();
+
+/// Total vCPU count (==# of workers/queue pairs). Stored once by
+/// `start()` so `vcpu_poll()` can pick the right `single_queue` mode
+/// without threading the count through every call.
+static CPU_COUNT: AtomicUsize = AtomicUsize::new(0);
+
 /// Global atomic source-port allocator for incoming TCP connections.
 /// Each accept across *any* worker grabs the next value via fetch_add,
 /// wrapping in [40000, 60000). Keeps the guest-visible 5-tuples unique
@@ -202,6 +215,13 @@ struct IoState {
     /// with 0 placeholders; only `[fixed_slots..]` entries are valid.
     conn_ports: Vec<u16>,
     frame_buf: [u8; 2048],
+    /// Worker-0 broadcasts a gratuitous ARP on its first iteration so
+    /// the host learns our MAC. Bookkeeping moved off the stack now
+    /// that the iteration is invoked from the vCPU thread.
+    primed: bool,
+    /// Drives the periodic closed-conn cleanup pass. Was a stack local
+    /// inside `worker_thread`; lifted to survive across `vcpu_poll`s.
+    cleanup_ctr: u32,
 }
 
 /// Open a TCP listen socket bound to `(127.0.0.1, host_port)` with
@@ -335,23 +355,37 @@ pub fn start(mappings: &[PortMapping], cpu_count: usize) -> Result<[u8; 6], Stri
     }
 
     // One WorkerShared entry per worker, all initialised before any
-    // worker or vCPU thread runs.
+    // vCPU runs.
     let mut workers: Vec<WorkerShared> = Vec::with_capacity(cpu_count);
     for _ in 0..cpu_count {
         workers.push(WorkerShared::new());
     }
     WORKERS.set(workers).ok();
+    CPU_COUNT.store(cpu_count, Ordering::Release);
 
-    // Spawn the worker threads. Each owns its listen/UDP sibling fds
-    // and injects exclusively into queue pair `id`, so no two workers
-    // ever write to the same virtio ring.
+    // Inline-poll design: build one `IoState` per vCPU and stash it in
+    // `VCPU_IOS`. The vCPU threads themselves call `vcpu_poll()` to run
+    // one polling iteration between `hv_vcpu_run` invocations. No worker
+    // threads are spawned — the vCPU thread is the worker.
+    let mut vcpu_ios: Vec<Mutex<IoState>> = Vec::with_capacity(cpu_count);
     for id in 0..cpu_count {
         let listens = std::mem::take(&mut per_worker_listens[id]);
         let udps = std::mem::take(&mut per_worker_udps[id]);
-        std::thread::spawn(move || {
-            worker_thread(id, cpu_count, listens, udps, mac);
-        });
+        vcpu_ios.push(Mutex::new(IoState {
+            id,
+            listens,
+            udps,
+            guest_mac: mac,
+            read_buf: [0u8; 2048],
+            rx_last: 0,
+            pollfds: Vec::with_capacity(64),
+            conn_ports: Vec::with_capacity(64),
+            frame_buf: [0u8; 2048],
+            primed: false,
+            cleanup_ctr: 0,
+        }));
     }
+    VCPU_IOS.set(vcpu_ios).ok();
 
     eprintln!();
     eprintln!("  VM network: 10.0.2.15 (userspace, zero-copy)");
@@ -448,294 +482,289 @@ pub fn process_tx() {
     process_tx_queue(1);
 }
 
-// ── RX worker thread (per queue pair) ───────────────────────────────────────
+// ── Inline polling: vCPU thread runs the worker iteration ──────────────────
+//
+// The vCPU thread itself owns its `IoState` (looked up in `VCPU_IOS`)
+// and runs one polling iteration via `vcpu_poll()` between
+// `hv_vcpu_run` invocations. Replaces the old N spawned worker threads.
+//
+// Each vCPU/queue-pair is the only writer to its own RX ring, so
+// there's no lock on the ring itself. Shared state with the rest of
+// the runner (tx_replies queue, conns map, udp_clients map) lives in
+// `WORKERS[id]` and is touched only by this same vCPU thread, so the
+// inner mutexes are uncontended.
 
-/// One worker thread per queue pair. Each worker is paired with exactly
-/// one vCPU (worker id == queue pair index == vCPU id) and owns every
-/// host-side fd that's going to produce RX work for that queue:
+/// Run one polling iteration for `vcpu_id`: drain reply frames, flush
+/// pending TCP data, poll host fds with `timeout_ms`, accept incoming
+/// TCP, drain UDP siblings, and stream zero-copy TCP RX into the guest
+/// ring. Returns `true` if anything was injected (so an idle-loop
+/// caller knows to break out and re-enter the guest).
 ///
-///   * its own TCP listen fds (SO_REUSEPORT-bound, kernel distributes
-///     incoming SYNs across the per-worker listen group)
-///   * its own UDP relay sibling (SO_REUSEPORT-bound, kernel distributes
-///     incoming datagrams by 4-tuple hash across the per-worker group)
-///   * every TCP conn fd from the `accept()`s it performed locally
-///
-/// Because each worker is the ONLY writer to its queue pair's RX ring,
-/// there are no cross-worker injections and no lock on the ring itself.
-/// Shared state with the paired vCPU (conns map, tx_replies queue,
-/// udp_clients map) lives in `WORKERS[id]` with one Mutex per field;
-/// contention is limited to the worker thread + its one paired vCPU.
-fn worker_thread(
-    id: usize,
-    cpu_count: usize,
-    listens: Vec<TcpListen>,
-    udps: Vec<UdpRelay>,
-    mac: [u8; 6],
-) {
-    // Wait for the virtio device to initialize before we start reading
-    // its queues. The device is created after these threads are spawned.
-    loop {
-        let dev = virtio::DEVICE.lock().unwrap();
-        if let Some(d) = dev.as_ref() {
-            // Sanity: we should never have more workers than queue pairs.
-            debug_assert!((id as u16) < d.num_queue_pairs);
-            break;
-        }
-        drop(dev);
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-
-    let shared = worker_shared(id);
-    let mut io = IoState {
-        id,
-        listens,
-        udps,
-        guest_mac: mac,
-        read_buf: [0u8; 2048],
-        rx_last: 0,
-        pollfds: Vec::with_capacity(64),
-        conn_ports: Vec::with_capacity(64),
-        frame_buf: [0u8; 2048],
+/// `timeout_ms` is forwarded directly to `poll(2)`. Pass `0` for the
+/// non-blocking tick before each `hv_vcpu_run`, or a small positive
+/// value (e.g. 10) from the cooperative-yield idle path so the vCPU
+/// blocks in `poll` instead of burning the host CPU.
+pub fn vcpu_poll(vcpu_id: usize, timeout_ms: i32) -> bool {
+    let ios = match VCPU_IOS.get() {
+        Some(v) => v,
+        None => return false,
     };
-    // Worker 0 broadcasts the gratuitous ARP on startup so the host sees
-    // our MAC. Other workers don't need to — one ARP is enough.
-    if id == 0 {
-        shared.tx_replies.lock().unwrap().push_back(build_grat_arp_frame(&mac));
-    }
-    let mut cleanup_ctr: u32 = 0;
+    if vcpu_id >= ios.len() { return false; }
+    let cpu_count = CPU_COUNT.load(Ordering::Acquire);
+    let mut io = ios[vcpu_id].lock().unwrap();
+    poll_worker_iteration(&mut io, cpu_count, timeout_ms)
+}
+
+fn poll_worker_iteration(
+    io: &mut IoState,
+    cpu_count: usize,
+    timeout_ms: i32,
+) -> bool {
+    let id = io.id;
     let single_queue = cpu_count <= 1;
+    let shared = worker_shared(id);
 
-    loop {
-        // In multi-queue mode, each worker's queue pair is (id*2, id*2+1).
-        // In single-queue mode, there's one shared queue pair at (0, 1).
-        let qsnap = if single_queue {
-            virtio::rx_queue_snapshot()
-        } else {
-            virtio::queue_snapshot(id * 2)
-        };
+    // First call: worker 0 broadcasts a gratuitous ARP so the host
+    // learns our MAC. Done here (instead of `start()`) so the frame is
+    // injected from the vCPU thread that owns the queue.
+    if !io.primed {
+        if id == 0 {
+            shared.tx_replies.lock().unwrap().push_back(build_grat_arp_frame(&io.guest_mac));
+        }
+        io.primed = true;
+    }
 
-        // ── Drain reply frames produced by our paired vCPU ─────────────
-        {
-            let mut replies = shared.tx_replies.lock().unwrap();
-            let mut any = false;
-            while let Some(f) = replies.pop_front() {
-                if !qsnap.ready || !inject_frame(f.as_slice(), &qsnap, &mut io.rx_last) {
-                    replies.push_front(f);
-                    break;
-                }
-                any = true;
+    // In multi-queue mode, each worker's queue pair is (id*2, id*2+1).
+    // In single-queue mode, there's one shared queue pair at (0, 1).
+    let qsnap = if single_queue {
+        virtio::rx_queue_snapshot()
+    } else {
+        virtio::queue_snapshot(id * 2)
+    };
+
+    let mut any_injected = false;
+
+    // ── Drain reply frames staged by handle_tcp/handle_udp/handle_arp ──
+    {
+        let mut replies = shared.tx_replies.lock().unwrap();
+        let mut any = false;
+        while let Some(f) = replies.pop_front() {
+            if !qsnap.ready || !inject_frame(f.as_slice(), &qsnap, &mut io.rx_last) {
+                replies.push_front(f);
+                break;
             }
-            drop(replies);
-            if any {
-                unsafe { core::arch::asm!("dsb sy", options(nostack)); }
-                if single_queue {
-                    crate::vm::wake_vcpu(0);
-                    unsafe { hvf::hv_gic_set_spi(35, true); hvf::hv_gic_set_spi(35, false); }
-                } else {
-                    crate::vm::wake_vcpu(id);
-                }
+            any = true;
+        }
+        drop(replies);
+        if any {
+            unsafe { core::arch::asm!("dsb sy", options(nostack)); }
+            if single_queue {
+                unsafe { hvf::hv_gic_set_spi(35, true); hvf::hv_gic_set_spi(35, false); }
+            }
+            any_injected = true;
+        }
+    }
+
+    // ── Flush pending data for conns that just became ESTABLISHED ──
+    {
+        let mut conns = shared.conns.lock().unwrap();
+        let mut flushed = false;
+        for c in conns.values_mut() {
+            if c.state == ConnState::Established && !c.pending.is_empty() && qsnap.ready {
+                let p = std::mem::take(&mut c.pending);
+                inject_data_frames(c, &p, &GUEST_MAC, &qsnap, &mut io.rx_last, &mut io.frame_buf);
+                flushed = true;
             }
         }
-
-        // ── Flush pending data for conns that just became ESTABLISHED ──
-        {
-            let mut conns = shared.conns.lock().unwrap();
-            let mut flushed = false;
-            for c in conns.values_mut() {
-                if c.state == ConnState::Established && !c.pending.is_empty() && qsnap.ready {
-                    let p = std::mem::take(&mut c.pending);
-                    inject_data_frames(c, &p, &GUEST_MAC, &qsnap, &mut io.rx_last, &mut io.frame_buf);
-                    flushed = true;
-                }
+        drop(conns);
+        if flushed {
+            unsafe { core::arch::asm!("dsb sy", options(nostack)); }
+            if single_queue {
+                unsafe { hvf::hv_gic_set_spi(35, true); hvf::hv_gic_set_spi(35, false); }
             }
-            drop(conns);
-            if flushed {
-                unsafe { core::arch::asm!("dsb sy", options(nostack)); }
-                if single_queue {
-                    crate::vm::wake_vcpu(0);
-                    unsafe { hvf::hv_gic_set_spi(35, true); hvf::hv_gic_set_spi(35, false); }
-                } else {
-                    crate::vm::wake_vcpu(id);
-                }
-            }
+            any_injected = true;
         }
+    }
 
-        // ── Build pollfds: our listens, our UDP siblings, our conns ────
-        io.pollfds.clear();
-        io.conn_ports.clear();
-        for l in &io.listens {
-            io.pollfds.push(libc::pollfd { fd: l.fd, events: libc::POLLIN, revents: 0 });
+    // ── Build pollfds: our listens, our UDP siblings, our conns ────
+    io.pollfds.clear();
+    io.conn_ports.clear();
+    for l in &io.listens {
+        io.pollfds.push(libc::pollfd { fd: l.fd, events: libc::POLLIN, revents: 0 });
+        io.conn_ports.push(0);
+    }
+    let udp_slot_start = io.pollfds.len();
+    for u in &io.udps {
+        for &fd in &u.fds {
+            io.pollfds.push(libc::pollfd { fd, events: libc::POLLIN, revents: 0 });
             io.conn_ports.push(0);
         }
-        let udp_slot_start = io.pollfds.len();
-        for u in &io.udps {
-            for &fd in &u.fds {
-                io.pollfds.push(libc::pollfd { fd, events: libc::POLLIN, revents: 0 });
-                io.conn_ports.push(0);
-            }
-        }
-        let fixed_slots = io.pollfds.len();
-        {
-            let conns = shared.conns.lock().unwrap();
-            for c in conns.values() {
-                io.pollfds.push(libc::pollfd {
-                    fd: if c.host_fd >= 0 && c.state < ConnState::Closed { c.host_fd } else { -1 },
-                    events: libc::POLLIN, revents: 0,
-                });
-                io.conn_ports.push(c.src_port);
-            }
-        }
-
-        let ready = unsafe { libc::poll(io.pollfds.as_mut_ptr(), io.pollfds.len() as u32, 5) };
-        if ready <= 0 { continue; }
-
-        // ── Accept new TCP connections on any of our listen fds ────────
-        for i in 0..io.listens.len() {
-            if io.pollfds[i].revents & libc::POLLIN != 0 {
-                let gp = io.listens[i].guest_port;
-                let fd = io.listens[i].fd;
-                accept_connections(&mut io, &qsnap, fd, gp, single_queue);
-            }
-        }
-
-        // ── Drain UDP relay siblings that fired ────────────────────────
-        {
-            let mut slot = udp_slot_start;
-            let udp_drain: Vec<(i32, u16)> = io.udps.iter()
-                .flat_map(|u| u.fds.iter().map(move |&fd| (fd, u.guest_port)))
-                .collect();
-            for (fd, gp) in udp_drain {
-                let revents = io.pollfds[slot].revents;
-                slot += 1;
-                if revents & libc::POLLIN != 0 {
-                    handle_udp_rx(&mut io, &qsnap, fd, gp, single_queue);
-                }
-            }
-        }
-
-        // ── Zero-copy RX from established TCP conns ────────────────────
-        const HDR_LEN: usize = VIRTIO_NET_HDR_SIZE + 14 + 20 + 20;
-        const MAX_PAYLOAD: usize = 1460;
-        struct ConnSnap { port: u16, guest_port: u16, fd: i32, seq: u32, ack: u32 }
-
-        if qsnap.ready {
-            let snaps: Vec<ConnSnap> = {
-                let conns = shared.conns.lock().unwrap();
-                (fixed_slots..io.pollfds.len())
-                    .filter(|&i| io.pollfds[i].revents & (libc::POLLIN | libc::POLLHUP) != 0)
-                    .filter_map(|i| {
-                        let port = io.conn_ports[i];
-                        conns.get(&port).and_then(|c| {
-                            if c.host_fd >= 0 && c.state == ConnState::Established {
-                                Some(ConnSnap {
-                                    port, guest_port: c.guest_port, fd: c.host_fd,
-                                    seq: c.my_seq, ack: c.peer_ack,
-                                })
-                            } else { None }
-                        })
-                    })
-                    .collect()
-            };
-
-            struct RxResult { port: u16, seq_advance: u32, eof: bool }
-            let mut results: Vec<RxResult> = Vec::new();
-            let mut injected = false;
-
-            for cs in &snaps {
-                if !qsnap.ready { continue; }
-
-                let avail_idx = unsafe {
-                    core::ptr::read_volatile(qsnap.gpa_to_host(qsnap.avail_addr + 2) as *const u16)
-                };
-                if io.rx_last == avail_idx { continue; }
-                let ring_idx = io.rx_last & (qsnap.qsize - 1);
-                let desc_idx = unsafe {
-                    core::ptr::read_volatile(
-                        qsnap.gpa_to_host(qsnap.avail_addr + 4 + ring_idx as u64 * 2) as *const u16)
-                };
-                let buf_addr = unsafe {
-                    core::ptr::read_unaligned(
-                        qsnap.gpa_to_host(qsnap.desc_addr + desc_idx as u64 * 16) as *const u64)
-                };
-                let guest_buf = qsnap.gpa_to_host(buf_addr);
-
-                let payload_ptr = unsafe { guest_buf.add(HDR_LEN) };
-                let n = unsafe { libc::read(cs.fd, payload_ptr as *mut _, MAX_PAYLOAD) };
-                if n <= 0 {
-                    if n == 0 {
-                        results.push(RxResult { port: cs.port, seq_advance: 0, eof: true });
-                    }
-                    continue;
-                }
-                let payload_len = n as usize;
-
-                let total = write_tcp_frame_around_payload(
-                    guest_buf, &GUEST_MAC, GW_IP, VM_IP,
-                    cs.port, cs.guest_port, cs.seq, cs.ack, 0x18, payload_len);
-
-                let used_idx = io.rx_last;
-                unsafe {
-                    let entry = qsnap.gpa_to_host(qsnap.used_addr + 4 + (used_idx & (qsnap.qsize - 1)) as u64 * 8);
-                    core::ptr::write_unaligned(entry as *mut u32, desc_idx as u32);
-                    core::ptr::write_unaligned(entry.add(4) as *mut u32, total as u32);
-                    core::ptr::write_volatile(qsnap.gpa_to_host(qsnap.used_addr + 2) as *mut u16,
-                        used_idx.wrapping_add(1));
-                }
-                io.rx_last = io.rx_last.wrapping_add(1);
-                results.push(RxResult { port: cs.port, seq_advance: payload_len as u32, eof: false });
-                injected = true;
-            }
-
-            if !results.is_empty() {
-                let mut conns = shared.conns.lock().unwrap();
-                for r in &results {
-                    if let Some(c) = conns.get_mut(&r.port) {
-                        if r.eof {
-                            let frame = build_tcp_frame_fixed(&GUEST_MAC, GW_IP, VM_IP,
-                                c.src_port, c.guest_port, c.my_seq, c.peer_ack, 0x11, &[]);
-                            c.my_seq = c.my_seq.wrapping_add(1);
-                            c.state = ConnState::Closed;
-                            inject_frame(frame.as_slice(), &qsnap, &mut io.rx_last);
-                            injected = true;
-                        } else {
-                            c.my_seq = c.my_seq.wrapping_add(r.seq_advance);
-                        }
-                    }
-                }
-            }
-
-            if injected {
-                unsafe { core::arch::asm!("dsb sy", options(nostack)); }
-                if single_queue {
-                    crate::vm::wake_vcpu(0);
-                    unsafe { hvf::hv_gic_set_spi(35, true); hvf::hv_gic_set_spi(35, false); }
-                } else {
-                    crate::vm::wake_vcpu(id);
-                }
-            }
-        } else {
-            // RX queue not ready — buffer data in pending.
-            let mut conns = shared.conns.lock().unwrap();
-            for i in fixed_slots..io.pollfds.len() {
-                if io.pollfds[i].revents & (libc::POLLIN | libc::POLLHUP) == 0 { continue; }
-                let port = io.conn_ports[i];
-                if let Some(c) = conns.get_mut(&port) {
-                    if c.host_fd < 0 { continue; }
-                    let n = unsafe {
-                        libc::read(c.host_fd, io.read_buf.as_mut_ptr() as *mut _, io.read_buf.len())
-                    };
-                    if n > 0 { c.pending.extend_from_slice(&io.read_buf[..n as usize]); }
-                }
-            }
-        }
-
-        // Periodic closed-conn cleanup.
-        cleanup_ctr = cleanup_ctr.wrapping_add(1);
-        if cleanup_ctr % 1000 == 0 {
-            let mut conns = shared.conns.lock().unwrap();
-            conns.retain(|_, c| c.state < ConnState::Closed || c.host_fd >= 0);
+    }
+    let fixed_slots = io.pollfds.len();
+    {
+        let conns = shared.conns.lock().unwrap();
+        for c in conns.values() {
+            io.pollfds.push(libc::pollfd {
+                fd: if c.host_fd >= 0 && c.state < ConnState::Closed { c.host_fd } else { -1 },
+                events: libc::POLLIN, revents: 0,
+            });
+            io.conn_ports.push(c.src_port);
         }
     }
+
+    let ready = unsafe {
+        libc::poll(io.pollfds.as_mut_ptr(), io.pollfds.len() as u32, timeout_ms)
+    };
+    if ready <= 0 { return any_injected; }
+
+    // ── Accept new TCP connections on any of our listen fds ────────
+    for i in 0..io.listens.len() {
+        if io.pollfds[i].revents & libc::POLLIN != 0 {
+            let gp = io.listens[i].guest_port;
+            let fd = io.listens[i].fd;
+            accept_connections(io, &qsnap, fd, gp, single_queue);
+            any_injected = true;
+        }
+    }
+
+    // ── Drain UDP relay siblings that fired ────────────────────────
+    {
+        let mut slot = udp_slot_start;
+        let udp_drain: Vec<(i32, u16)> = io.udps.iter()
+            .flat_map(|u| u.fds.iter().map(move |&fd| (fd, u.guest_port)))
+            .collect();
+        for (fd, gp) in udp_drain {
+            let revents = io.pollfds[slot].revents;
+            slot += 1;
+            if revents & libc::POLLIN != 0 {
+                handle_udp_rx(io, &qsnap, fd, gp, single_queue);
+                any_injected = true;
+            }
+        }
+    }
+
+    // ── Zero-copy RX from established TCP conns ────────────────────
+    const HDR_LEN: usize = VIRTIO_NET_HDR_SIZE + 14 + 20 + 20;
+    const MAX_PAYLOAD: usize = 1460;
+    struct ConnSnap { port: u16, guest_port: u16, fd: i32, seq: u32, ack: u32 }
+
+    if qsnap.ready {
+        let snaps: Vec<ConnSnap> = {
+            let conns = shared.conns.lock().unwrap();
+            (fixed_slots..io.pollfds.len())
+                .filter(|&i| io.pollfds[i].revents & (libc::POLLIN | libc::POLLHUP) != 0)
+                .filter_map(|i| {
+                    let port = io.conn_ports[i];
+                    conns.get(&port).and_then(|c| {
+                        if c.host_fd >= 0 && c.state == ConnState::Established {
+                            Some(ConnSnap {
+                                port, guest_port: c.guest_port, fd: c.host_fd,
+                                seq: c.my_seq, ack: c.peer_ack,
+                            })
+                        } else { None }
+                    })
+                })
+                .collect()
+        };
+
+        struct RxResult { port: u16, seq_advance: u32, eof: bool }
+        let mut results: Vec<RxResult> = Vec::new();
+        let mut injected = false;
+
+        for cs in &snaps {
+            if !qsnap.ready { continue; }
+
+            let avail_idx = unsafe {
+                core::ptr::read_volatile(qsnap.gpa_to_host(qsnap.avail_addr + 2) as *const u16)
+            };
+            if io.rx_last == avail_idx { continue; }
+            let ring_idx = io.rx_last & (qsnap.qsize - 1);
+            let desc_idx = unsafe {
+                core::ptr::read_volatile(
+                    qsnap.gpa_to_host(qsnap.avail_addr + 4 + ring_idx as u64 * 2) as *const u16)
+            };
+            let buf_addr = unsafe {
+                core::ptr::read_unaligned(
+                    qsnap.gpa_to_host(qsnap.desc_addr + desc_idx as u64 * 16) as *const u64)
+            };
+            let guest_buf = qsnap.gpa_to_host(buf_addr);
+
+            let payload_ptr = unsafe { guest_buf.add(HDR_LEN) };
+            let n = unsafe { libc::read(cs.fd, payload_ptr as *mut _, MAX_PAYLOAD) };
+            if n <= 0 {
+                if n == 0 {
+                    results.push(RxResult { port: cs.port, seq_advance: 0, eof: true });
+                }
+                continue;
+            }
+            let payload_len = n as usize;
+
+            let total = write_tcp_frame_around_payload(
+                guest_buf, &GUEST_MAC, GW_IP, VM_IP,
+                cs.port, cs.guest_port, cs.seq, cs.ack, 0x18, payload_len);
+
+            let used_idx = io.rx_last;
+            unsafe {
+                let entry = qsnap.gpa_to_host(qsnap.used_addr + 4 + (used_idx & (qsnap.qsize - 1)) as u64 * 8);
+                core::ptr::write_unaligned(entry as *mut u32, desc_idx as u32);
+                core::ptr::write_unaligned(entry.add(4) as *mut u32, total as u32);
+                core::ptr::write_volatile(qsnap.gpa_to_host(qsnap.used_addr + 2) as *mut u16,
+                    used_idx.wrapping_add(1));
+            }
+            io.rx_last = io.rx_last.wrapping_add(1);
+            results.push(RxResult { port: cs.port, seq_advance: payload_len as u32, eof: false });
+            injected = true;
+        }
+
+        if !results.is_empty() {
+            let mut conns = shared.conns.lock().unwrap();
+            for r in &results {
+                if let Some(c) = conns.get_mut(&r.port) {
+                    if r.eof {
+                        let frame = build_tcp_frame_fixed(&GUEST_MAC, GW_IP, VM_IP,
+                            c.src_port, c.guest_port, c.my_seq, c.peer_ack, 0x11, &[]);
+                        c.my_seq = c.my_seq.wrapping_add(1);
+                        c.state = ConnState::Closed;
+                        inject_frame(frame.as_slice(), &qsnap, &mut io.rx_last);
+                        injected = true;
+                    } else {
+                        c.my_seq = c.my_seq.wrapping_add(r.seq_advance);
+                    }
+                }
+            }
+        }
+
+        if injected {
+            unsafe { core::arch::asm!("dsb sy", options(nostack)); }
+            if single_queue {
+                unsafe { hvf::hv_gic_set_spi(35, true); hvf::hv_gic_set_spi(35, false); }
+            }
+            any_injected = true;
+        }
+    } else {
+        // RX queue not ready — buffer data in pending.
+        let mut conns = shared.conns.lock().unwrap();
+        for i in fixed_slots..io.pollfds.len() {
+            if io.pollfds[i].revents & (libc::POLLIN | libc::POLLHUP) == 0 { continue; }
+            let port = io.conn_ports[i];
+            if let Some(c) = conns.get_mut(&port) {
+                if c.host_fd < 0 { continue; }
+                let n = unsafe {
+                    libc::read(c.host_fd, io.read_buf.as_mut_ptr() as *mut _, io.read_buf.len())
+                };
+                if n > 0 { c.pending.extend_from_slice(&io.read_buf[..n as usize]); }
+            }
+        }
+    }
+
+    // Periodic closed-conn cleanup.
+    io.cleanup_ctr = io.cleanup_ctr.wrapping_add(1);
+    if io.cleanup_ctr % 1000 == 0 {
+        let mut conns = shared.conns.lock().unwrap();
+        conns.retain(|_, c| c.state < ConnState::Closed || c.host_fd >= 0);
+    }
+
+    any_injected
 }
 
 fn accept_connections(io: &mut IoState, qsnap: &virtio::QueueSnapshot,
@@ -768,11 +797,9 @@ fn accept_connections(io: &mut IoState, qsnap: &virtio::QueueSnapshot,
             inject_frame(frame.as_slice(), qsnap, &mut io.rx_last);
             unsafe { core::arch::asm!("dsb sy", options(nostack)); }
             if single_queue {
-                crate::vm::wake_vcpu(0);
                 unsafe { hvf::hv_gic_set_spi(35, true); hvf::hv_gic_set_spi(35, false); }
-            } else {
-                crate::vm::wake_vcpu(io.id);
             }
+            // Multi-queue: no kick — handled by inline polling.
         } else {
             shared.tx_replies.lock().unwrap().push_back(frame);
         }
@@ -838,14 +865,14 @@ fn handle_udp_rx(io: &mut IoState, qsnap: &virtio::QueueSnapshot,
     }
     unsafe { core::arch::asm!("dsb sy", options(nostack)); }
     if single_queue {
-        crate::vm::wake_vcpu(0);
         unsafe {
             hvf::hv_gic_set_spi(35, true);
             hvf::hv_gic_set_spi(35, false);
         }
-    } else {
-        crate::vm::wake_vcpu(io.id);
     }
+    // Multi-queue: no kick — we're already on the vCPU thread, the
+    // guest will see the new RX frames as soon as we return to it.
+    let _ = io.id;
 }
 
 fn inject_frame(frame: &[u8], snap: &virtio::QueueSnapshot, rx_last: &mut u16) -> bool {
