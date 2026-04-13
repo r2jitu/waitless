@@ -10,8 +10,7 @@
 // No SPSC rings, no wake pipe, no Mutex on the hot path.
 
 use std::collections::VecDeque;
-use std::sync::{Condvar, Mutex, OnceLock};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use crate::hvf;
 use crate::virtio;
@@ -107,34 +106,6 @@ static UDP_RELAYS: OnceLock<Vec<(i32, u16)>> = OnceLock::new();
 /// in `handle_udp` when the guest sends a reply.
 static UDP_CLIENTS: Mutex<Option<HashMap<(u16, u16), libc::sockaddr_in>>> =
     Mutex::new(None);
-
-/// UDP reply queue: vCPU thread enqueues guest-originated replies here
-/// instead of calling `sendto()` inline. A dedicated sender thread
-/// drains this queue and issues the syscalls so the vCPU can return to
-/// guest execution immediately.
-///
-/// Why this matters: profiling with `sample` showed the vCPU thread
-/// spending ~79% of its wall time in `__sendto` during high-rate UDP
-/// echo tests, leaving only ~20% for actual guest execution. Moving
-/// sendto off the critical path frees the guest to process packets at
-/// nearly the sync-mode ceiling and turns the async test into a real
-/// throughput measurement instead of a syscall-latency measurement.
-const UDP_REPLY_MAX_PAYLOAD: usize = 1472; // IPv4 payload minus UDP header
-#[derive(Clone, Copy)]
-struct UdpReply {
-    fd: i32,
-    addr: libc::sockaddr_in,
-    len: u16,
-    buf: [u8; UDP_REPLY_MAX_PAYLOAD],
-}
-static UDP_TX_QUEUE: Mutex<VecDeque<UdpReply>> = Mutex::new(VecDeque::new());
-static UDP_TX_CVAR: Condvar = Condvar::new();
-/// Lock-free "work pending" flag. Producer sets Release after pushing;
-/// sender thread checks Acquire in its spin loop to avoid grabbing the
-/// mutex until there is actually work to drain. Without this the spin
-/// path contends with the vCPU producer on the queue mutex and adds
-/// p50 RTT latency to every sync-style single-packet echo.
-static UDP_TX_PENDING: AtomicBool = AtomicBool::new(false);
 
 const GUEST_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 
@@ -246,10 +217,6 @@ pub fn start(mappings: &[PortMapping]) -> Result<[u8; 6], String> {
         let table: Vec<(i32, u16)> = udps.iter().map(|u| (u.fd, u.guest_port)).collect();
         UDP_RELAYS.set(table).ok();
         *UDP_CLIENTS.lock().unwrap() = Some(HashMap::new());
-        // Dedicated sender thread: drains the UDP reply queue and calls
-        // sendto() off the vCPU's critical path. Only spawn if at least
-        // one UDP forward exists — otherwise there's nothing to send.
-        std::thread::spawn(udp_sender_thread);
     }
 
     let listens_for_thread = listens.clone();
@@ -269,19 +236,6 @@ pub fn start(mappings: &[PortMapping]) -> Result<[u8; 6], String> {
     }
     eprintln!();
     Ok(mac)
-}
-
-/// Per-thread flag controlling whether `handle_udp` does its `sendto()`
-/// inline or hands off to the dedicated UDP sender thread.
-///
-/// Inline is faster for single-packet TX batches (sync-style RTT echo)
-/// because the sender thread handoff adds 10-20µs of wakeup latency per
-/// request. Offloading is faster for multi-packet batches because it
-/// frees the vCPU to run more guest code in parallel with the `sendto()`s.
-/// `process_tx_queue` picks the mode based on how many frames are
-/// currently queued in the ring.
-thread_local! {
-    static UDP_INLINE_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 
 /// TX QUEUE_NOTIFY handler. Uses TX QueueSnapshot for lock-free guest
@@ -305,20 +259,6 @@ pub fn process_tx_queue(queue_idx: u32) {
     let mut lasts = TX_LAST_MAP.with(|c| c.get());
     let mut last = lasts[slot];
     if last == avail_idx { return; }
-
-    // Pick send strategy for this batch. Short bursts (≤ 8 frames)
-    // stay inline — the sender-thread handoff adds ~15µs of wakeup
-    // latency per datagram, which dominates the RTT on sync-style
-    // single-flow echo traffic and drops sync throughput ~20%. Deep
-    // bursts (> 8 frames) go to the sender thread so the vCPU can
-    // return to guest execution instead of syscalling through N
-    // sendto()s in a row. Profiling at 128k paced UDP showed the vCPU
-    // spending ~77% of its wall time in `__sendto` with pure inline,
-    // starving the guest event loop; with this split, async throughput
-    // climbs from ~118k to ~127k at the same input rate while sync
-    // latency is unaffected.
-    let depth = avail_idx.wrapping_sub(last);
-    UDP_INLINE_MODE.with(|m| m.set(depth <= 8));
 
     while last != avail_idx {
         let ring_idx = last & (tx.qsize - 1);
@@ -1009,10 +949,10 @@ fn handle_udp(udp: &[u8]) {
     // The guest's frame has src_port=<guest-side listener> (matches the
     // GUEST in one of our `-p udp:HOST:GUEST` mappings) and
     // dst_port=<client ephemeral>. We look up the external sockaddr by
-    // the `(src_port, dst_port)` pair and either send inline or hand the
-    // datagram to the UDP sender thread, depending on UDP_INLINE_MODE.
+    // the `(src_port, dst_port)` pair and send via whichever host socket
+    // handles `src_port`.
     let payload = &udp[8..];
-    if payload.is_empty() || payload.len() > UDP_REPLY_MAX_PAYLOAD { return; }
+    if payload.is_empty() { return; }
     let fd = match UDP_RELAYS.get() {
         Some(table) => match table.iter().find(|(_, gp)| *gp == src_port) {
             Some((fd, _)) => *fd,
@@ -1020,101 +960,15 @@ fn handle_udp(udp: &[u8]) {
         },
         None => return,
     };
-    let addr = {
+    let client_addr = {
         let guard = UDP_CLIENTS.lock().unwrap();
-        match guard.as_ref().and_then(|m| m.get(&(src_port, dst_port)).copied()) {
-            Some(a) => a,
-            None => return,
-        }
+        guard.as_ref().and_then(|m| m.get(&(src_port, dst_port)).copied())
     };
-    // Inline fast path for latency-sensitive low-depth TX batches:
-    // the vCPU was processing a short TX burst (sync-style RTT echo),
-    // so skipping the sender-thread handoff gives us ~15µs lower p50.
-    if UDP_INLINE_MODE.with(|m| m.get()) {
+    if let Some(addr) = client_addr {
         unsafe {
-            libc::sendto(
-                fd,
-                payload.as_ptr() as *const _,
-                payload.len(),
-                0,
-                &addr as *const _ as *const libc::sockaddr,
-                std::mem::size_of::<libc::sockaddr_in>() as u32,
-            );
-        }
-        return;
-    }
-
-    // Offload path: vCPU was in the middle of a multi-frame TX batch,
-    // queue the datagram and let the sender thread issue the syscall
-    // so the vCPU can return to guest execution and keep draining.
-    let mut reply = UdpReply {
-        fd,
-        addr,
-        len: payload.len() as u16,
-        buf: [0u8; UDP_REPLY_MAX_PAYLOAD],
-    };
-    reply.buf[..payload.len()].copy_from_slice(payload);
-    {
-        let mut q = UDP_TX_QUEUE.lock().unwrap();
-        q.push_back(reply);
-    }
-    UDP_TX_PENDING.store(true, Ordering::Release);
-    UDP_TX_CVAR.notify_one();
-}
-
-/// Dedicated UDP sender thread. Drains `UDP_TX_QUEUE` and issues
-/// `sendto()` per datagram. Spawned once from `start()` after the
-/// relay sockets are bound.
-///
-/// Wake-up strategy: first spin on the lock-free `UDP_TX_PENDING`
-/// flag for `SPIN_ITERS` iterations (empirically covers one sync
-/// round-trip without touching the mutex), then fall back to a
-/// condvar wait. The spin path matters for sync-style single-packet
-/// RTT traffic — with just a condvar wait we'd add one cross-thread
-/// wakeup syscall per RTT (~10-20µs), dropping sync throughput ~20%.
-/// Crucially the spin uses `UDP_TX_PENDING` and NOT `q.lock()` — if
-/// we took the mutex every spin iteration we'd contend with the
-/// vCPU producer and push its p50 RTT from ~15µs to ~50µs.
-fn udp_sender_thread() {
-    let mut local: VecDeque<UdpReply> = VecDeque::with_capacity(256);
-    const SPIN_ITERS: u32 = 4000;
-    loop {
-        // Wait (spin → park) for work to arrive.
-        let mut have_work = UDP_TX_PENDING.swap(false, Ordering::Acquire);
-        if !have_work {
-            for _ in 0..SPIN_ITERS {
-                std::hint::spin_loop();
-                if UDP_TX_PENDING.swap(false, Ordering::Acquire) {
-                    have_work = true;
-                    break;
-                }
-            }
-        }
-        if !have_work {
-            // Long idle — park on the condvar so we don't burn a core
-            // while no UDP traffic is flowing. The producer signals
-            // the condvar on every push, so we're guaranteed a wakeup.
-            let mut q = UDP_TX_QUEUE.lock().unwrap();
-            while q.is_empty() && !UDP_TX_PENDING.load(Ordering::Acquire) {
-                q = UDP_TX_CVAR.wait(q).unwrap();
-            }
-            UDP_TX_PENDING.store(false, Ordering::Release);
-            std::mem::swap(&mut *q, &mut local);
-        } else {
-            let mut q = UDP_TX_QUEUE.lock().unwrap();
-            std::mem::swap(&mut *q, &mut local);
-        }
-        for r in local.drain(..) {
-            unsafe {
-                libc::sendto(
-                    r.fd,
-                    r.buf.as_ptr() as *const _,
-                    r.len as usize,
-                    0,
-                    &r.addr as *const _ as *const libc::sockaddr,
-                    std::mem::size_of::<libc::sockaddr_in>() as u32,
-                );
-            }
+            libc::sendto(fd, payload.as_ptr() as *const _, payload.len(),
+                0, &addr as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in>() as u32);
         }
     }
 }
