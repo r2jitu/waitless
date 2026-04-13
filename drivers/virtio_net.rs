@@ -1025,9 +1025,13 @@ pub fn poll_qp(qp: usize, callback: fn(&[u8])) -> i32 {
         if count > 0 {
             (*ndev()).rx_queues[qp].kick();
         }
-        // Re-arm EVENT_IDX: update used_event to current used->idx so VZ fires
-        // the next interrupt when the next frame arrives.
-        (*ndev()).rx_queues[qp].enable_interrupts();
+        // NOTE: we deliberately do NOT re-arm RX interrupts here.
+        // With MSI-X + EVENT_IDX, writing `used_event = used_idx` on
+        // every poll causes the device to fire an interrupt for the
+        // NEXT packet regardless — so every poll was triggering a
+        // per-packet IRQ storm and a VM-exit round-trip per request
+        // (~13% throughput hit on health_max). The NAPI path arms
+        // once via rearm_rx_napi() right before HLT instead.
     }
 
     count

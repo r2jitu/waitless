@@ -109,9 +109,12 @@ instance_status=$("$SCRIPT_DIR/gcp.sh" status 2>/dev/null | awk 'NR>1 {print $2}
 if [ "$instance_status" = "TERMINATED" ] || [ "$instance_status" = "STOPPED" ]; then
     echo "==> Instance is $instance_status — starting..."
     "$SCRIPT_DIR/gcp.sh" start >/dev/null
-    # Wait until SSH comes up (up to 60s).
+    # Wait until SSH comes up (up to 60s). accept-new auto-adds the
+    # fresh host key for the rolled-over external IP.
     for _try in $(seq 1 60); do
-        if ssh -o ConnectTimeout=3 -o BatchMode=yes "$SSH_HOST" true 2>/dev/null; then
+        if ssh -o ConnectTimeout=3 -o BatchMode=yes \
+               -o StrictHostKeyChecking=accept-new \
+               "$SSH_HOST" true 2>/dev/null; then
             break
         fi
         sleep 1

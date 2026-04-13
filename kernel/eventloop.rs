@@ -102,6 +102,19 @@ pub fn run(core_id: u32) -> ! {
     let mut drain_work: u64 = 0;
     let mut service_work: u64 = 0;
     let mut idle_count: u64 = 0;
+    // Consecutive iterations with did_work == false. Used to spin for
+    // a short window before we commit to HLT/WFI, so back-to-back
+    // interactive requests don't eat an IRQ round-trip each.
+    let mut idle_streak: u32 = 0;
+
+    // How many no-work iterations to spin through before arming the
+    // next RX IRQ and going idle. Each iteration is a full poll +
+    // drain + service cycle and costs ~200ns; 64 iterations is
+    // ~13µs, longer than one KVM exit+enter round-trip, so a client
+    // sending keep-alive requests is almost guaranteed to catch the
+    // next packet without an IRQ. Tunable — higher values burn more
+    // CPU on idle, lower values hurt single-flow throughput.
+    const IDLE_SPIN_BEFORE_HLT: u32 = 64;
 
     loop {
         if loops & 63 == 0 && is_shutdown() { break; }
@@ -160,9 +173,21 @@ pub fn run(core_id: u32) -> ! {
 
         // 5. Idle if no work
         if did_work {
-            // work done — loop immediately
+            idle_streak = 0;
         } else {
             idle_count += 1;
+            idle_streak += 1;
+
+            // Busy-poll for a short window before committing to HLT.
+            // A pure "did_work==false → HLT" policy pays one IRQ
+            // round-trip per request on interactive TCP (SYN, then
+            // ACK, then GET, …) which costs several microseconds each
+            // and caps per-core throughput. Spinning for a brief
+            // window after the queue empties catches follow-up packets
+            // without leaving poll mode.
+            if idle_streak < IDLE_SPIN_BEFORE_HLT {
+                continue;
+            }
 
             // Flush before sleeping (responses may be staged).
             if let Some(f) = NET_FLUSH.load() {
@@ -175,12 +200,14 @@ pub fn run(core_id: u32) -> ! {
             // skip HLT and loop so we don't miss it.
             if let Some(arm) = NET_REARM_RX.load() {
                 if arm(core_id) {
+                    idle_streak = 0;
                     continue;
                 }
             }
 
             // Sleep until interrupt. WFI/HLT yields the CPU to the
             // host; the hypervisor resumes us when an interrupt fires.
+            idle_streak = 0;
             if let Some(f) = IDLE.load() {
                 f(core_id);
             } else {
