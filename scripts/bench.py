@@ -292,7 +292,13 @@ class KvmEnv:
         # guest still negotiates only `cpus` queue pairs because the
         # driver gates activation on cpu count, but the device side
         # needs mq=on to wire up vhost properly with the multi-queue tap).
-        dev = f"virtio-net-pci,mac={self.GUEST_MAC},mq=on,vectors={2*nqueues+2}"
+        #
+        # rx_queue_size=1024 (default 256) — gives vhost-net more ring
+        # slots to absorb high-rate bursts (udp_async sends ~1.4M pkt/s
+        # at 1c, which overruns the default ring before the guest can
+        # drain). tx_queue_size is capped at 256 in QEMU 10.
+        dev = (f"virtio-net-pci,mac={self.GUEST_MAC},mq=on,vectors={2*nqueues+2},"
+               f"rx_queue_size=1024")
         cmd += ["-device", f"{dev},netdev=net0",
                 "-netdev", netdev,
                 "-kernel", elf]

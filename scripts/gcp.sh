@@ -82,6 +82,10 @@ case "$cmd" in
         echo "    Waiting for SSH..."
         sleep 5
         local_ip=$(_update_ssh_ip)
+        # Drop any stale known_hosts entry for the new IP — GCE re-rolls
+        # the external IP on every start so the old fingerprint is
+        # almost always wrong for the new host at the same address.
+        ssh-keygen -R "$local_ip" >/dev/null 2>&1 || true
         echo "    External IP: $local_ip (SSH config updated)"
         echo "    Connect: ssh $SSH_HOST"
         ;;
