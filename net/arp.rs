@@ -211,14 +211,6 @@ fn arp_fast_store(ip: Ipv4Addr, mac: MacAddr) {
     slot.ip.store(ip.addr, Ordering::Release);
 }
 
-/// Invalidate every per-core fast slot. Called whenever the global
-/// ARP_CACHE is mutated so a core caching the old MAC drops into the
-/// slow path on its next resolve.
-fn arp_fast_invalidate_all() {
-    for slot in &ARP_FAST {
-        slot.ip.store(0, Ordering::Relaxed);
-    }
-}
 
 fn arp_request(target_ip: Ipv4Addr) {
     let our_mac = ethernet_our_mac();
@@ -286,10 +278,15 @@ pub fn arp_receive(data: &[u8]) {
             cache.gateway_mac = sender_mac;
             cache.gateway_mac_valid = true;
         }
-        // Drop the slow lock before invalidating per-core fast slots so
-        // we don't hold both at once.
         drop(cache);
-        arp_fast_invalidate_all();
+        // Publish the fresh mapping into the current core's fast cache.
+        // We deliberately do NOT invalidate other cores' slots: under
+        // high load (udp_async) the only peer a core ever resolves is
+        // the wrk/udp_bench client, the mapping never really changes,
+        // and blowing away a hot entry just forces the next TX to fall
+        // into the slow-path spin inside arp_resolve — which in turn
+        // discards every non-ARP frame the poll loop sees.
+        arp_fast_store(sender_ip, sender_mac);
     }
 
     let op = ntohs(operation);
