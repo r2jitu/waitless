@@ -168,7 +168,7 @@ fn main() {
     eprintln!("==> HVF runner: booting {} ({} MB RAM)", parsed.kernel_path, parsed.ram_mib);
 
     // Start userspace networking (no vmnet, no root required).
-    let vmnet_mac = match userspace_net::start(&parsed.mappings) {
+    let vmnet_mac = match userspace_net::start(&parsed.mappings, parsed.cpu_count) {
         Ok(mac) => mac,
         Err(e) => {
             eprintln!("run-hvf: network failed: {e}");

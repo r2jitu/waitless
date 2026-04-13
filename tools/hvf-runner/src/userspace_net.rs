@@ -89,12 +89,22 @@ static CONNS: std::sync::LazyLock<Mutex<HashMap<u16, ProxyConn>>> =
 /// Uses fixed-size TxFrame to avoid per-request heap allocation.
 static TX_REPLIES: Mutex<VecDeque<TxFrame>> = Mutex::new(VecDeque::new());
 
-/// UDP relay table: one host fd per guest UDP port, published once by
-/// `start()` and read by the vCPU thread in `handle_udp`. `OnceLock`
-/// guarantees the vCPU thread never observes a partially-initialized
-/// table — `start()` fills it before spawning the io_thread, which
-/// happens before the VM is created.
-static UDP_RELAYS: OnceLock<Vec<(i32, u16)>> = OnceLock::new();
+/// UDP relay table: one entry per `-p udp:H:G` forward. Each entry
+/// stores `cpu_count` sibling sockets all bound to the same host port
+/// via `SO_REUSEPORT`, plus the guest port. Incoming datagrams are
+/// distributed across the siblings by the kernel (io_thread polls all
+/// of them), and reply sends pick `fds[current_vcpu]` so multi-core
+/// TX doesn't serialise on one kernel socket. All siblings share the
+/// same source port, so replies carry the original relay port as their
+/// source — NAT-correct.
+///
+/// Published once by `start()` before the io_thread or any vCPU runs,
+/// so readers can rely on observing the fully-initialised table.
+struct UdpRelayFds {
+    guest_port: u16,
+    fds: Vec<i32>,
+}
+static UDP_RELAYS: OnceLock<Vec<UdpRelayFds>> = OnceLock::new();
 
 /// UDP return-path lookup: `(guest_port, client_ephemeral_port)` →
 /// external client sockaddr. Keyed on `guest_port` as well as the client
@@ -116,10 +126,15 @@ struct TcpListen {
     guest_port: u16,
 }
 
-/// Per-UDP-relay-socket state.
-#[derive(Clone, Copy)]
+/// Per-UDP-relay state. Each relay has `cpu_count` sibling sockets all
+/// bound to the same host port via `SO_REUSEPORT`. The kernel distributes
+/// incoming datagrams across the group (macOS hashes, Linux RSS on 3.9+),
+/// so io_thread polls *every* sibling to catch RX on whichever one was
+/// chosen. On TX, `handle_udp` picks the sibling for the current vCPU
+/// to avoid cross-core contention on the kernel send-path lock.
+#[derive(Clone)]
 struct UdpRelay {
-    fd: i32,
+    fds: Vec<i32>,
     guest_port: u16,
 }
 
@@ -164,17 +179,21 @@ fn bind_listen(host_port: u16) -> Result<i32, String> {
     }
 }
 
-fn bind_udp(host_port: u16) -> Result<i32, String> {
+/// Open a UDP sibling socket: `SO_REUSEPORT`-bound to
+/// `(127.0.0.1, host_port)`, `O_NONBLOCK`, with 16 MiB send and
+/// receive buffers. All siblings of a relay share one port; the
+/// kernel distributes incoming packets across them and reply sends
+/// go out whichever one the current vCPU picks.
+fn open_udp_sibling(host_port: u16) -> Result<i32, String> {
     unsafe {
         let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
         if fd < 0 { return Err(format!("udp socket(): {}", std::io::Error::last_os_error())); }
         let one: i32 = 1;
         libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR,
                          &one as *const _ as *const _, 4);
-        // Large socket buffers absorb bursty high-concurrency udp_async
-        // loads without dropping at the host kernel. 16 MiB on each side
-        // is a no-cost sizing on macOS/Linux and keeps the bottleneck in
-        // the guest's event loop rather than in our queue.
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT,
+                         &one as *const _ as *const _, 4);
+        // Big buffers so bursty UDP doesn't drop at the host kernel.
         let bufsz: i32 = 16 * 1024 * 1024;
         libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF,
                          &bufsz as *const _ as *const _, 4);
@@ -194,19 +213,44 @@ fn bind_udp(host_port: u16) -> Result<i32, String> {
     }
 }
 
-pub fn start(mappings: &[PortMapping]) -> Result<[u8; 6], String> {
+/// Open `cpu_count` sibling sockets for a UDP relay port. At least one
+/// must succeed; caller reports the error if none do.
+fn open_udp_relay(host_port: u16, cpu_count: usize) -> Result<Vec<i32>, String> {
+    let mut fds = Vec::with_capacity(cpu_count);
+    for i in 0..cpu_count {
+        match open_udp_sibling(host_port) {
+            Ok(fd) => fds.push(fd),
+            Err(e) if i == 0 => return Err(e),
+            Err(e) => {
+                eprintln!("  warning: relay {host_port} sibling {i}: {e}");
+                break;
+            }
+        }
+    }
+    Ok(fds)
+}
+
+pub fn start(mappings: &[PortMapping], cpu_count: usize) -> Result<[u8; 6], String> {
     let mac: [u8; 6] = GUEST_MAC;
+    let cpu_count = cpu_count.max(1);
 
     let mut listens: Vec<TcpListen> = Vec::new();
     let mut udps: Vec<UdpRelay> = Vec::new();
+    let mut relay_table: Vec<UdpRelayFds> = Vec::new();
     for m in mappings {
         match m.proto {
             Proto::Tcp => {
                 let fd = bind_listen(m.host)?;
                 listens.push(TcpListen { fd, guest_port: m.guest });
             }
-            Proto::Udp => match bind_udp(m.host) {
-                Ok(fd) => udps.push(UdpRelay { fd, guest_port: m.guest }),
+            Proto::Udp => match open_udp_relay(m.host, cpu_count) {
+                Ok(fds) => {
+                    udps.push(UdpRelay { fds: fds.clone(), guest_port: m.guest });
+                    relay_table.push(UdpRelayFds {
+                        guest_port: m.guest,
+                        fds,
+                    });
+                }
                 // UDP bind is non-fatal — keep TCP working even if UDP port is taken.
                 Err(e) => eprintln!("  warning: {e}"),
             },
@@ -214,8 +258,7 @@ pub fn start(mappings: &[PortMapping]) -> Result<[u8; 6], String> {
     }
 
     if !udps.is_empty() {
-        let table: Vec<(i32, u16)> = udps.iter().map(|u| (u.fd, u.guest_port)).collect();
-        UDP_RELAYS.set(table).ok();
+        UDP_RELAYS.set(relay_table).ok();
         *UDP_CLIENTS.lock().unwrap() = Some(HashMap::new());
     }
 
@@ -238,6 +281,15 @@ pub fn start(mappings: &[PortMapping]) -> Result<[u8; 6], String> {
     Ok(mac)
 }
 
+/// Per-vCPU thread-local: the id of the vCPU whose TX queue notify
+/// we are currently handling. Read by `handle_udp` to pick the right
+/// per-vCPU TX fd from `UDP_RELAYS`. Set at the top of `process_tx_queue`
+/// from `queue_idx / 2` — in Tier 1 multi-queue, vCPU N owns TX queue
+/// index 2N+1, so `queue_idx / 2` is the vCPU id.
+thread_local! {
+    static CURRENT_VCPU: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// TX QUEUE_NOTIFY handler. Uses TX QueueSnapshot for lock-free guest
 /// RAM access. Only takes DEVICE lock briefly for interrupt_status.
 /// Accepts the queue index (odd = TX queue) to support multi-queue.
@@ -252,6 +304,10 @@ pub fn process_tx_queue(queue_idx: u32) {
     // Map queue_idx to a slot in the per-thread last array (TX queues: 1,3,5,7,... → slots 0..8)
     let slot = (queue_idx / 2) as usize;
     if slot >= 9 { return; }
+
+    // Remember which vCPU we're processing for — `handle_udp` uses it
+    // to pick its per-vCPU TX socket.
+    CURRENT_VCPU.with(|c| c.set(slot));
 
     let avail_idx = unsafe {
         core::ptr::read_volatile(tx.gpa_to_host(tx.avail_addr + 2) as *const u16)
@@ -406,7 +462,10 @@ fn io_thread(listens: Vec<TcpListen>, udps: Vec<UdpRelay>, mac: [u8; 6]) {
         }
 
         // ── Build pollfds ──────────────────────────────────────────────
-        // Layout (variable): N listens, M udp relays, then conn fds.
+        // Layout (variable): N listens, then all UDP sibling fds (one
+        // slot per fd across every relay, because with SO_REUSEPORT
+        // inbound is distributed across siblings and we have to poll
+        // them all), then conn fds.
         // `conn_ports[i]` is the guest-visible ephemeral src_port for
         // slot i, and is only valid in the `[fixed_slots..]` range.
         let conns = CONNS.lock().unwrap();
@@ -416,9 +475,14 @@ fn io_thread(listens: Vec<TcpListen>, udps: Vec<UdpRelay>, mac: [u8; 6]) {
             io.pollfds.push(libc::pollfd { fd: l.fd, events: libc::POLLIN, revents: 0 });
             io.conn_ports.push(0);
         }
+        // Track where each UDP relay's sibling slots start so we can
+        // map back from a fired pollfd to (relay index, fd).
+        let udp_slot_start = io.pollfds.len();
         for u in &io.udps {
-            io.pollfds.push(libc::pollfd { fd: u.fd, events: libc::POLLIN, revents: 0 });
-            io.conn_ports.push(0);
+            for &fd in &u.fds {
+                io.pollfds.push(libc::pollfd { fd, events: libc::POLLIN, revents: 0 });
+                io.conn_ports.push(0);
+            }
         }
         let fixed_slots = io.pollfds.len(); // slots above this are conns
         for c in conns.values() {
@@ -441,14 +505,21 @@ fn io_thread(listens: Vec<TcpListen>, udps: Vec<UdpRelay>, mac: [u8; 6]) {
                 accept_connections(&mut io, &snap, fd, gp);
             }
         }
-        // Drain UDP relays that fired. Each mapping has its own socket.
-        let listens_count = io.listens.len();
-        for j in 0..io.udps.len() {
-            let idx = listens_count + j;
-            if io.pollfds[idx].revents & libc::POLLIN != 0 {
-                let fd = io.udps[j].fd;
-                let gp = io.udps[j].guest_port;
-                handle_udp_rx(&mut io, fd, gp);
+        // Drain UDP relays. Walk every sibling slot; on any POLLIN,
+        // call handle_udp_rx with the fd that fired.
+        {
+            let mut slot = udp_slot_start;
+            // Snapshot (fd, guest_port) pairs so we don't re-borrow io.udps
+            // inside the loop that also borrows io mutably.
+            let udp_drain: Vec<(i32, u16)> = io.udps.iter()
+                .flat_map(|u| u.fds.iter().map(move |&fd| (fd, u.guest_port)))
+                .collect();
+            for (fd, gp) in udp_drain {
+                let revents = io.pollfds[slot].revents;
+                slot += 1;
+                if revents & libc::POLLIN != 0 {
+                    handle_udp_rx(&mut io, fd, gp);
+                }
             }
         }
 
@@ -976,16 +1047,27 @@ fn handle_udp(udp: &[u8]) {
     //
     // The guest's frame has src_port=<guest-side listener> (matches the
     // GUEST in one of our `-p udp:HOST:GUEST` mappings) and
-    // dst_port=<client ephemeral>. We look up the external sockaddr by
-    // the `(src_port, dst_port)` pair and send via whichever host socket
-    // handles `src_port`.
+    // dst_port=<client ephemeral>. Pick the TX fd for the current vCPU
+    // from the relay's SO_REUSEPORT pool so multi-core TX doesn't
+    // serialise on a shared kernel socket lock. The TX siblings are all
+    // bound to the same host port, so packet source port == relay port
+    // — NAT-correct.
     let payload = &udp[8..];
     if payload.is_empty() { return; }
+    let vcpu_id = CURRENT_VCPU.with(|c| c.get());
     let fd = match UDP_RELAYS.get() {
-        Some(table) => match table.iter().find(|(_, gp)| *gp == src_port) {
-            Some((fd, _)) => *fd,
-            None => return,
-        },
+        Some(table) => {
+            let relay = match table.iter().find(|r| r.guest_port == src_port) {
+                Some(r) => r,
+                None => return,
+            };
+            // Per-vCPU sibling fd; fall back to sibling 0 if the
+            // vCPU id is out of range (shouldn't happen).
+            match relay.fds.get(vcpu_id).or_else(|| relay.fds.first()) {
+                Some(&fd) => fd,
+                None => return,
+            }
+        }
         None => return,
     };
     let client_addr = {
