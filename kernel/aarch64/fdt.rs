@@ -143,8 +143,8 @@ fn parse_pci_mmio32(ranges: &[u8]) -> Option<(u64, u64)> {
 // PCI interrupt-map parser — slot → GIC INTID
 // ============================================================================
 //
-// `interrupt-map` is variable-width but for QEMU virt and Apple VZ it's
-// 40 bytes per entry:
+// `interrupt-map` is variable-width but for QEMU virt and Apple hypervisors
+// it's 40 bytes per entry:
 //   child_addr  (3 cells = 12 bytes): pci unit address (slot in bits 11-15 of [0])
 //   child_int   (1 cell  =  4 bytes): pin
 //   parent      (1 cell  =  4 bytes): phandle
@@ -305,8 +305,8 @@ pub fn init(dtb_addr: u64) {
             return;
         }
         // SAFETY: On bare-metal aarch64 the DTB is loaded by the firmware
-        // (QEMU/VZ/Limine) at a stable physical address that's identity-
-        // mapped or HHDM-mapped. The fdt crate reads the header to find
+        // (QEMU or the HVF runner) at a stable physical address that's
+        // identity- or HHDM-mapped. The fdt crate reads the header to find
         // the total length, then bounds-checks every subsequent access.
         let parsed = unsafe { fdt::Fdt::from_ptr(dtb_addr as *const u8) }
             .map(|fdt| extract_info(&fdt))

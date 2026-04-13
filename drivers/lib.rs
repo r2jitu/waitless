@@ -239,23 +239,6 @@ pub(crate) unsafe fn virtio_write8(base: u64, val: u8) {
     }
 }
 
-/// VZ async delay — Apple VZ processes config writes asynchronously.
-/// Must be called after writing VirtIO status or feature registers.
-#[inline(never)]
-pub(crate) fn vz_config_delay() {
-    for _ in 0..10_000 {
-        unsafe { asm!("nop", options(nostack, preserves_flags)); }
-    }
-}
-
-/// Long VZ delay — after DRIVER_OK, VZ needs time to initialize.
-#[inline(never)]
-pub(crate) fn vz_init_delay() {
-    for _ in 0..1_000_000 {
-        unsafe { asm!("nop", options(nostack, preserves_flags)); }
-    }
-}
-
 // ============================================================================
 // Submodules
 // ============================================================================

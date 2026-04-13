@@ -1,8 +1,8 @@
 // kernel/exceptions.rs — ARM64 exception handling + GIC init
 //
 // Installs the vector table (defined in boot.S) and initialises the ARM GIC
-// so we can receive IRQs.  Supports both GICv2 (QEMU virt) and GICv3 (Apple
-// VZ.framework).
+// so we can receive IRQs. Supports both GICv2 (QEMU virt) and GICv3 (HVF
+// and modern QEMU configurations).
 //
 // On x86_64 this module provides no-op stubs.
 
@@ -248,7 +248,8 @@ mod aarch64 {
         let it_lines = (typer & 0x1F) + 1;
         let num_irqs = it_lines * 32;
 
-        // Check if distributor is already configured (VZ pre-inits vGIC)
+        // Check if the distributor is already configured — some hypervisors
+        // (notably HVF's native vGIC) pre-init it and we should not stomp.
         let ctlr = d.ctlr.read();
         let already_configured = (ctlr & GICD_CTLR_ENABLE_GRP1_NS) != 0;
 

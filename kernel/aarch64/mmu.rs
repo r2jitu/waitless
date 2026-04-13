@@ -64,8 +64,9 @@ mod aarch64 {
                 continue;
             }
 
-            // Skip if already in the first 4GB (mapped as normal-cached by boot.S;
-            // VZ Stage-2 overrides to device for MMIO regions)
+            // Skip if already in the first 4GB (mapped as normal-cached by
+            // boot.S; the hypervisor's Stage-2 tables override the attribute
+            // to device for MMIO regions without guest involvement).
             if l1_idx < 4 {
                 gb += 1 << 30;
                 continue;

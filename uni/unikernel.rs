@@ -104,7 +104,7 @@ fn arch_cpu_relax() {
 #[cfg(target_arch = "aarch64")]
 #[inline]
 fn arch_mask_irq() {
-    // Mask IRQ only (DAIF.I) — never touch FIQ, VZ uses it.
+    // Mask IRQ only (DAIF.I) — leave FIQ alone, Apple hypervisors reserve it.
     // SAFETY: affects the current CPU's PSTATE only.
     unsafe {
         core::arch::asm!("msr daifset, #0x2", options(nomem, nostack));
@@ -132,7 +132,8 @@ fn arch_idle() {
         return;
     }
 
-    // Fallback: vtimer + WFI (QEMU / VZ / other hypervisors).
+    // Fallback: vtimer + WFI (QEMU and other hypervisors without the
+    // hvf-yield register).
     unsafe {
         let freq: u64;
         core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq);

@@ -200,7 +200,7 @@ pub fn send_sgi_to(target_core: u32) {
 /// This is just a wakeup signal — all real work happens in the event loop.
 pub fn sgi_handler(_irq: u32) {
     // Intentionally empty. The IPI wakes the core from WFI; the event
-    // loop polls for work. Avoids LDXR/STXR which VZ doesn't handle.
+    // loop polls for work.
 }
 
 /// Get the total IPI count (for testing).

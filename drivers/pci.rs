@@ -157,7 +157,9 @@ pub(crate) fn write_config16(bus: u8, slot: u8, func: u8, offset: u8, val: u16) 
 
 // ---- BAR assignment (aarch64 only) ------------------------------------------
 
-/// Assign BARs from the MMIO pool. NEVER probes with 0xFFFFFFFF (crashes VZ).
+/// Assign BARs from the MMIO pool. NEVER probe the BAR size by writing
+/// 0xFFFFFFFF — some hypervisors (notably Apple Virtualization.framework)
+/// abort the guest on that write. Allocate blindly from the pool instead.
 #[cfg(target_arch = "aarch64")]
 fn assign_bars(dev: &mut PciDevice) {
     // Only assign for endpoint devices (header type 0x00)

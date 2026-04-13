@@ -690,7 +690,7 @@ pub fn native_udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
         }
 
         // Make the socket blocking — the dedicated UDP thread will block on
-        // recvfrom(), matching the VZ proxy's dedicated kqueue thread model.
+        // recvfrom() instead of busy-polling.
         let flags = fcntl(fd, F_GETFL, 0i32);
         fcntl(fd, F_SETFL, flags & !O_NONBLOCK);
 
@@ -699,7 +699,6 @@ pub fn native_udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
 
         // Spawn a dedicated thread that blocks on recvfrom() and dispatches
         // the handler inline — no interleaving with TCP connection scanning.
-        // This matches the VZ Swift proxy's dedicated kqueue UDP loop.
         let idx = UDP_COUNT - 1;
         let mut thread: PthreadT = 0;
         pthread_create(&mut thread, ptr::null(), udp_thread_fn, idx as *mut u8);

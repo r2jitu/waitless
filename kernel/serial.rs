@@ -5,8 +5,8 @@
 //   x86_64: COM1 serial port (I/O port 0x3F8), 115200 baud, 8N1.
 //
 //   aarch64: Runtime backend selection based on FDT discovery:
-//     - PL011 UART (QEMU "virt" machine)
-//     - VirtIO console (VZ.framework or any PCI platform)
+//     - PL011 UART (QEMU "virt" machine, HVF runner)
+//     - VirtIO console (PCI-based platforms)
 //     - Falls back to no-op if nothing found.
 //
 // Provides a core::fmt::Write implementation (SerialWriter) for formatted
@@ -182,7 +182,7 @@ mod aarch64 {
                 }
             }
 
-            // PCI VirtIO console (VZ.framework and other PCI platforms)
+            // PCI VirtIO console (PCI-based platforms)
             if fdt.pcie_ecam_base != 0 {
                 pci_init();
                 if virtio_console_init_pci() {

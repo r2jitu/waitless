@@ -238,8 +238,8 @@ fn kernel_end_phys(info: &BootInfo) -> u64 {
 
 /// Choose where to place the frame bitmap and heap given a memory map.
 /// Identity-mapped boot puts them right after the kernel image; higher-half
-/// (Limine) and VZ (kernel image outside RAM) search for the largest
-/// available region with enough space.
+/// boots (Limine) search the memory map for the largest available region
+/// with enough space since the kernel image may live outside main RAM.
 fn pick_placement_phys(info: &BootInfo, kern_end_phys: u64, needed: u64) -> u64 {
     let kern_end_in_ram = (0..info.memory_map_count as usize).any(|i| {
         let r = &info.memory_map[i];

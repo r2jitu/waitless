@@ -1,4 +1,4 @@
-// drivers/virtio_console.rs — VirtIO console device for VZ.framework and QEMU
+// drivers/virtio_console.rs — VirtIO console device for modern PCI platforms.
 
 use core::arch::asm;
 use core::ptr;
@@ -6,7 +6,6 @@ use core::ptr;
 use crate::{
     dsb_st, dsb_sy,
     mmio_read32, mmio_write32,
-    vz_config_delay, vz_init_delay,
 };
 use crate::virtio::{
     vpci_find, vpci_reset, vpci_set_status, vpci_get_status,
@@ -195,7 +194,7 @@ fn con_init_mmio(base_addr: u64) -> bool {
     true
 }
 
-// ---- PCI console init (VZ.framework) -----------------------------------------
+// ---- PCI console init --------------------------------------------------------
 
 fn con_init_pci() -> bool {
     // Find console device (type 3) using Rust PCI infrastructure
@@ -208,17 +207,12 @@ fn con_init_pci() -> bool {
     let dev = &dev_snap;
 
     vpci_reset(dev);
-    vz_config_delay();
     vpci_set_status(dev, STATUS_ACKNOWLEDGE);
-    vz_config_delay();
     vpci_set_status(dev, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
-    vz_config_delay();
 
     vpci_write_features(dev, 0, 0);
     vpci_write_features(dev, 1, 1); // VIRTIO_F_VERSION_1
-    vz_config_delay();
     vpci_set_status(dev, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK);
-    vz_config_delay();
     if (vpci_get_status(dev) & STATUS_FEATURES_OK) == 0 {
         vpci_set_status(dev, STATUS_FAILED);
         return false;
@@ -288,8 +282,6 @@ fn con_init_pci() -> bool {
 
     // Kick RX queue
     unsafe { ptr::write_volatile(rx_notify as *mut u16, 0); }
-
-    vz_init_delay(); // VZ needs time after DRIVER_OK
 
     unsafe {
         CON_BASE = 1; // sentinel

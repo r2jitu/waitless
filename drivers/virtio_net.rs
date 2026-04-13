@@ -7,7 +7,6 @@ use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 use crate::{
     log, dsb_st,
     virtio_read32, virtio_write32, virtio_read8, virtio_write8,
-    vz_init_delay,
 };
 #[cfg(target_arch = "aarch64")]
 use kernel::aarch64::{exceptions, fdt};
@@ -43,7 +42,7 @@ use kernel::mm::{kmalloc, virt_to_phys, phys_to_virt};
 /// The poll path checks this instead of doing an MMIO read every iteration.
 static IRQ_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-const RX_BUFFERS: usize = 64;
+const RX_BUFFERS: usize = 256;
 const BUFFER_SIZE: u32 = 2048;
 const TX_POOL_SIZE: usize = 64;
 const VIRTIO_NET_HDR_SIZE: usize = 12; // VirtioNetHeader (with num_buffers)
@@ -183,7 +182,7 @@ pub fn num_queue_pairs() -> u16 {
     unsafe { (*ndev()).num_queue_pairs }
 }
 
-// ---- Modern PCI init (VZ.framework + QEMU modern) --------------------------
+// ---- Modern PCI init (VirtIO 1.0+) -----------------------------------------
 
 fn init_pci_modern() -> bool {
     let vpci_idx = match vpci_find(1) { // virtio device type 1 = net
@@ -201,7 +200,9 @@ fn init_pci_modern() -> bool {
     vpci_set_status(dev, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
 
     let dev_features = vpci_read_features(dev, 0);
-    // Accept all offered word-0 features (VZ may require CSUM/INDIRECT_DESC)
+    // Accept every offered word-0 feature. Some hypervisors (notably Apple
+    // Virtualization.framework) require CSUM/INDIRECT_DESC and reject us if
+    // we don't ack them, and there's nothing in word-0 we'd want to refuse.
     let guest_features = dev_features;
 
     // Check for multi-queue support
@@ -351,7 +352,6 @@ fn init_pci_modern() -> bool {
     for pair in 0..num_pairs as usize {
         unsafe { (*ndev()).rx_queues[pair].kick(); }
     }
-    vz_init_delay(); // VZ needs time after DRIVER_OK
 
     unsafe {
         (*ndev()).transport = Transport::ModernPci { vpci_idx };
@@ -857,6 +857,12 @@ fn send_on_qp(qp: usize, data: &[u8]) {
             }
         }
         if let Some(s) = found { break s; }
+        // Force any deferred kick to fire so the host can process
+        // the pending TX batch and produce completions. With deferred
+        // kicks + a host that delivers RX in big batches (HVF), we'd
+        // otherwise deadlock here: the kick we're waiting on is
+        // sitting in kick_dirty, not in the MMIO register.
+        unsafe { (*ndev()).tx_queues[qp].flush_kick(); }
         tx_drain_qp(qp);
         compiler_fence(Ordering::SeqCst);
     };
@@ -1025,13 +1031,6 @@ pub fn poll_qp(qp: usize, callback: fn(&[u8])) -> i32 {
         if count > 0 {
             (*ndev()).rx_queues[qp].kick();
         }
-        // NOTE: we deliberately do NOT re-arm RX interrupts here.
-        // With MSI-X + EVENT_IDX, writing `used_event = used_idx` on
-        // every poll causes the device to fire an interrupt for the
-        // NEXT packet regardless — so every poll was triggering a
-        // per-packet IRQ storm and a VM-exit round-trip per request
-        // (~13% throughput hit on health_max). The NAPI path arms
-        // once via rearm_rx_napi() right before HLT instead.
     }
 
     count

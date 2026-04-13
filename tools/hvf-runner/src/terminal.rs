@@ -1,7 +1,6 @@
 // tools/hvf-runner/src/terminal.rs
 //
-// Terminal raw-mode helpers. Mirrors the Swift `enableRawInput` /
-// `restoreTerminal` pair from tools/run-vz/run-vz.swift.
+// Terminal raw-mode helpers.
 //
 // In raw mode: no echo, no line buffering, no signal processing
 // (Ctrl-C becomes byte 0x03 forwarded to the guest's serial RX).

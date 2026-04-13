@@ -2,7 +2,7 @@
 //
 // Called from boot.S after the processor is in 64-bit mode with a valid stack.
 // On x86_64: RDI = multiboot2 info physical address.
-// On aarch64: x0  = DTB physical address (QEMU or VZ.framework).
+// On aarch64: x0  = DTB physical address (QEMU or HVF runner).
 //
 // Initialises every subsystem in dependency order, then calls uni_main().
 
@@ -453,7 +453,8 @@ unsafe fn kernel_boot(info: &BootInfo) {
                 // CPU interface (bit 0 of GICR_ISENABLER0 is 0), so WFI never returns.
                 exceptions::register_irq(0, smp::sgi_handler);
             }
-            // Unmask IRQ only (not FIQ — VZ uses FIQ for hypervisor)
+            // Unmask IRQ only; leave FIQ masked since Apple hypervisors
+            // reserve FIQ for themselves and unmasking it crashes the guest.
             if fdt.gic_dist_base != 0 {
                 core::arch::asm!("msr daifclr, #0x2", options(nomem, nostack));
             }
@@ -519,8 +520,9 @@ unsafe fn kernel_boot(info: &BootInfo) {
 /// - Core 0: arm VirtIO RX notifications + yield/WFI (wakes on data or interrupt)
 /// - Other cores: yield/WFI (wakes when the IO thread or distributor sends data)
 ///   On the HVF runner, yield MMIO parks the thread at zero CPU cost.
-///   On QEMU/VZ, WFI is used (not WFE) because WFE wakes from any SEV (spurious),
-///   which starves the VZ TCP proxy thread. wake_cores() sends SGI so WFI wakes correctly.
+///   We use WFI and not WFE: WFE wakes from any SEV (including spurious ones),
+///   which starved the host-side TCP proxy thread on Apple hypervisors.
+///   `wake_cores()` sends SGI so WFI wakes correctly.
 fn idle_cb(core_id: u32) {
     // No wake-up source → busy-poll. (Happens when the transport
     // doesn't expose any IRQ path: aarch64 without GIC configured,

@@ -1,13 +1,10 @@
 /* unikernel_arm64.ld — Linker script for ARM64 unikernel (PIE)
  *
  * Link address: 0x00000000
- * Runtime load addresses:
- *   QEMU virt: loaded at 0x40000000 (RAM base)
- *   VZ.framework: loaded at 0x00000000 (RAM base)
- *
- * At runtime boot.S processes .rela.dyn (R_AARCH64_RELATIVE entries) to
- * fix up all absolute pointers before any C++ code runs.  QEMU adds
- * 0x40000000 to each pointer; VZ adds 0 (no-op).  Single binary, two hosts.
+ * Runtime load address: 0x40000000 (QEMU virt RAM base, also used by the
+ * HVF runner). Kept PIE so boot.S's R_AARCH64_RELATIVE relocation loop
+ * can be re-targeted at a different load address without re-linking —
+ * useful if a future runner maps RAM somewhere else.
  *
  * Section layout:
  *   .text.boot  — Linux ARM64 Image header + primary_entry (MUST be first)

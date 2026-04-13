@@ -6,7 +6,6 @@ use crate::{
     log, dsb_st, dsb_ld, dsb_sy,
     mmio_read32, mmio_write32, mmio_read16, mmio_write16, mmio_read8, mmio_write8,
     virtio_read32, virtio_write32, virtio_read16, virtio_write16, virtio_read8, virtio_write8,
-    vz_config_delay,
 };
 use crate::pci::{
     pci_device, read_config, write_config, find_device,
@@ -236,7 +235,6 @@ pub(crate) fn vpci_reset(dev: &VirtioPciDevice) {
 
 pub(crate) fn vpci_set_status(dev: &VirtioPciDevice, status: u8) {
     unsafe { mmio_write8(dev.common_cfg + CC_DEVICE_STATUS, status); }
-    vz_config_delay();
 }
 
 pub(crate) fn vpci_get_status(dev: &VirtioPciDevice) -> u8 {
@@ -255,7 +253,6 @@ pub(crate) fn vpci_write_features(dev: &VirtioPciDevice, word: u32, features: u3
         mmio_write32(dev.common_cfg + CC_DRIVER_FEATURE_SELECT, word);
         mmio_write32(dev.common_cfg + CC_DRIVER_FEATURE, features);
     }
-    vz_config_delay();
 }
 
 pub(crate) fn vpci_select_queue(dev: &VirtioPciDevice, idx: u16) {

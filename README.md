@@ -6,7 +6,7 @@
 
 A bare-metal unikernel written in Rust that boots directly into an application with no OS, no syscalls, and no context switches. All I/O is handled via direct in-process function calls.
 
-Runs on **x86_64** and **ARM64 (aarch64)** via QEMU, VZ.framework, and Limine ISO.
+Runs on **x86_64** and **ARM64 (aarch64)** via QEMU, Apple Hypervisor.framework (HVF), and Limine ISO.
 
 ## Architecture
 
@@ -47,7 +47,7 @@ curl http://localhost:8080/health
 
 ```bash
 # Unikernel (bare-metal)
-bazel build --config=vz   //apps/webserver:webserver.elf    # ARM64 VZ.framework
+bazel build --config=hvf  //apps/webserver:webserver.img    # ARM64 HVF runner (macOS)
 bazel build --config=qemu //apps/webserver:webserver.elf    # QEMU (host arch)
 bazel build --config=x86_64-qemu //apps/webserver:webserver.elf
 
@@ -63,7 +63,7 @@ bazel build --config=x86_64-iso //apps/webserver:webserver.iso
 
 ```bash
 bazel test //apps/webserver:test                        # native (no VM)
-bazel test --config=vz   //apps/webserver:test          # VZ.framework
+bazel test --config=hvf  //apps/webserver:test          # HVF runner (macOS arm64)
 bazel test --config=qemu //apps/webserver:test          # QEMU (host arch)
 bazel test --config=x86_64-qemu //apps/webserver:test   # QEMU x86_64
 ```
@@ -122,7 +122,7 @@ unikernel/
 │   ├── pci.rs              PCI bus scan, BAR assignment
 │   ├── virtio.rs           VirtIO transport (modern PCI + MMIO)
 │   ├── virtio_net.rs       Network device (TX/RX, IRQ)
-│   └── virtio_console.rs   Console device (VZ.framework)
+│   └── virtio_console.rs   VirtIO console device (PCI-based platforms)
 ├── kernel/                 Kernel library crate (clean Rust)
 │   ├── serial.rs           UART (COM1 / PL011 / VirtIO console)
 │   ├── mm.rs               Physical frame allocator + heap
@@ -150,4 +150,4 @@ unikernel/
 ./scripts/bench.sh
 ```
 
-Measures throughput and latency across VZ.framework, QEMU TCG, Docker/Linux, and native macOS.
+Measures throughput and latency across the HVF runner, QEMU TCG, Docker/Linux, and native macOS.

@@ -1,10 +1,10 @@
 // kernel/aarch64/boot.S — ARM64 boot entry point
 //
-// Implements the Linux ARM64 Image boot protocol so QEMU "-kernel" can load
-// and execute this binary directly.  On entry from QEMU or VZ.framework:
+// Implements the Linux ARM64 Image boot protocol so QEMU "-kernel" and the
+// HVF runner can load and execute this binary directly. On entry:
 //   x0  = physical address of the Device Tree Blob (DTB)
 //   x1-x3 = 0 (reserved)
-//   PC  = load address (0x40000000 for QEMU virt, 0x00000000 for VZ)
+//   PC  = load address (0x40000000 for QEMU virt and the HVF runner)
 //   EL  = EL2 or EL1, MMU off, caches off
 //
 // The kernel is linked at 0x00000000 with -fPIC/--pie (PIE).
@@ -66,8 +66,9 @@ primary_entry:
     //
     // The kernel is linked at 0x00000000 with --pie.  The actual load address
     // (load_base) differs from the link address:
-    //   QEMU:   loaded at 0x40000000 → load_base = 0x40000000
-    //   VZ:     loaded at 0x00000000 → load_base = 0 (all adds are no-ops)
+    //   QEMU / HVF runner: loaded at 0x40000000 → load_base = 0x40000000
+    // We still process the relocation table unconditionally so a different
+    // load address works without touching boot.S.
     //
     // For each R_AARCH64_RELATIVE entry (r_info & 0xFFFFFFFF == 1027 / 0x403):
     //   *(load_base + r_offset) = load_base + r_addend
@@ -128,7 +129,7 @@ primary_entry:
 
 .Lel1_entry:
     // ---- Mask all interrupts (DAIF = 0xF) ----------------------------------
-    // VZ.framework starts the guest at EL1 directly (no EL2 eret) with
+    // Some hypervisors start the guest at EL1 directly (no EL2 eret) with
     // DAIF potentially unmasked.  Any IRQ before we handle it properly
     // would call exception_handler(1) → panic → WFE loop → VM killed.
     // Mask here unconditionally before any other EL1 setup.
@@ -197,15 +198,15 @@ primary_entry:
 //   TTBR0 → L1 table (512 × 8-byte entries, each covers 1GB)
 //
 // Mapping (all first-4GB as normal-cached):
-//   L1[  0]: 0x0000_0000_0000 – 0x0000_003F_FFFF  (1GB, normal cached) — VZ RAM / GIC MMIO
-//   L1[  1]: 0x0000_4000_0000 – 0x0000_7FFF_FFFF  (1GB, normal cached) — QEMU virt RAM
+//   L1[  0]: 0x0000_0000_0000 – 0x0000_003F_FFFF  (1GB, normal cached) — low MMIO / GIC
+//   L1[  1]: 0x0000_4000_0000 – 0x0000_7FFF_FFFF  (1GB, normal cached) — main RAM
 //   L1[  2]: 0x0000_8000_0000 – 0x0000_BFFF_FFFF  (1GB, normal cached) — more RAM
 //   L1[  3]: 0x0000_C000_0000 – 0x0000_FFFF_FFFF  (1GB, normal cached) — more RAM
 //   L1[256]: 0x0040_0000_0000 – 0x0040_3FFF_FFFF  (1GB, device nGnRnE) — PCIe ECAM
 //
 // Why all-normal-cached for the first 4GB?
 //   • QEMU TCG: intercepts MMIO by device registration, ignoring Stage-1 attrs.
-//   • VZ/HVF/KVM: hypervisor Stage-2 maps MMIO regions as device, overriding
+//   • HVF/KVM: hypervisor Stage-2 maps MMIO regions as device, overriding
 //     the guest Stage-1 normal-cached setting.  No guest GIC driver needed.
 // ============================================================================
 
@@ -226,7 +227,7 @@ setup_mmu:
     //
     // The current value matches Linux's `pgtable-prot.h` and OVMF's
     // ArmMmuLib defaults, so HVF is happy and every other hypervisor
-    // (QEMU/KVM/VZ/TCG) treats it identically to the old layout.
+    // (QEMU/KVM/TCG) treats it identically to the old layout.
     //
     //   Attr0 = 0x00  Device nGnRnE       (used by L2_DEVICE_BLOCK in mmu.rs)
     //   Attr1 = 0x44  Normal NC in/out    (unused, kept for layout parity)
@@ -262,7 +263,7 @@ setup_mmu:
     // bits [1:0]=01: block descriptor, bits [4:2]=AttrIndx, bit[10]=AF, bits[9:8]=SH
 
     // Entries 0-3: all normal-cached (covers 0x00000000–0xFFFFFFFF)
-    // Entry 0 covers VZ RAM (0x00000000) and QEMU low-MMIO region;
+    // Entry 0 covers the QEMU low-MMIO region (GIC, UART, virtio-mmio);
     // QEMU TCG intercepts MMIO by device registration (page attrs irrelevant).
     ldr     x0, =0x000000000000070d    // PA=0x00000000, normal cached, AF=1
     str     x0, [x1, #0]

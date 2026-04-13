@@ -6,9 +6,9 @@
          Without this entitlement, Hypervisor.framework returns HV_DENIED
          at runtime and the runner prints a clear diagnostic pointing here.
 
-         Note: this is deliberately NOT com.apple.security.virtualization
-         (which is what scripts/run-vz.entitlements uses for VZ.framework).
-         HVF and VZ are separate frameworks with separate entitlements. -->
+         Note: this is com.apple.security.hypervisor, not
+         com.apple.security.virtualization — the latter is for the
+         higher-level Virtualization.framework and does not grant HVF. -->
     <key>com.apple.security.hypervisor</key>
     <true/>
 </dict>

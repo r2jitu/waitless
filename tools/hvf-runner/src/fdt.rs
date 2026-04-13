@@ -96,7 +96,8 @@ pub fn generate(
     // The guest writes to this MMIO address instead of executing WFI.
     // The HVF runner intercepts the stage-2 fault and parks the vCPU
     // thread until the IO thread has data for it (zero host CPU while
-    // idle). QEMU/VZ FDTs omit this node, so the guest falls back to WFI.
+    // idle). QEMU FDTs omit this node, so the guest falls back to WFI
+    // automatically when it runs on QEMU instead.
     let yield_node = fdt.begin_node("hvf-yield@9001000").unwrap();
     fdt.property_string("compatible", "hvf,yield").unwrap();
     fdt.property_array_u64("reg", &[0x0900_1000, 0x1000]).unwrap();

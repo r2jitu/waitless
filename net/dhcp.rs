@@ -382,7 +382,8 @@ pub fn discover() -> bool {
     };
     CONFIG.store(net_config);
 
-    // Log the configured IP (bench.sh VZ path looks for this)
+    // Log the configured IP so host-side runners can grep the serial
+    // stream for the guest address before forwarding traffic to it.
     {
         let o = CONFIG.ip().octets();
         let mut msg = *b"dhcp: configured IP xxx.xxx.xxx.xxx\n";

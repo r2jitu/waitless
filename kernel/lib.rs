@@ -51,8 +51,9 @@ pub fn send_ipi(target_core: u32) {
 }
 
 /// Lightweight wakeup: signal all sleeping cores that work is available.
-/// Uses SEV (aarch64 QEMU) or IPI broadcast. On VZ, SEV may not
-/// propagate between vCPUs, so we also send SGI as fallback.
+/// On aarch64 SEV is cheap but some hypervisors (Apple's in particular)
+/// don't reliably propagate it between vCPUs, so we always follow up with
+/// an SGI to each AP. On x86_64 we broadcast IPIs directly.
 #[inline]
 pub fn wake_cores() {
     let n = percpu::num_cores();
@@ -60,7 +61,7 @@ pub fn wake_cores() {
     #[cfg(target_arch = "aarch64")]
     {
         unsafe { core::arch::asm!("sev", options(nomem, nostack)); }
-        // Also send SGI — VZ may not propagate SEV between vCPU threads.
+        // SGI fallback — needed when SEV doesn't propagate across vCPU threads.
         for i in 1..n {
             aarch64::smp::send_sgi_to(i);
         }
