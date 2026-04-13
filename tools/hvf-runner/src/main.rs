@@ -2,6 +2,18 @@
 //
 // CLI entry point for the HVF runner. Parses arguments, enables raw
 // terminal mode, spawns a stdin reader thread, creates and runs the VM.
+//
+// CLI:
+//   run-hvf <path-to.img> [OPTIONS]
+//
+// Options:
+//   --ram=MB              Guest RAM in MiB (default: 128)
+//   --cpus=N              vCPU count (default: 1)
+//   -p PROTO:HOST:GUEST   Port forward (repeatable).
+//                         PROTO = tcp | udp.
+//                         Default if no -p given:
+//                             -p tcp:8080:80 -p udp:18080:7
+//   -h, --help            Show usage
 
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,20 +27,104 @@ mod virtio;
 mod vm;
 mod userspace_net;
 
+use userspace_net::{PortMapping, Proto};
+
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+fn usage(prog: &str) {
+    eprintln!("Usage: {prog} <path-to.img> [OPTIONS]");
+    eprintln!("  Boots an ARM64 kernel image under Apple Hypervisor.framework.");
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  --ram=MB              Guest RAM in MiB (default: 128)");
+    eprintln!("  --cpus=N              vCPU count (default: 1)");
+    eprintln!("  -p PROTO:HOST:GUEST   Port forward (repeatable).");
+    eprintln!("                        PROTO = tcp | udp.");
+    eprintln!("                        Default: -p tcp:8080:80 -p udp:18080:7");
+    eprintln!("  -h, --help            Show this help");
+    eprintln!();
+    eprintln!("Requires codesign with com.apple.security.hypervisor entitlement.");
+}
+
+fn parse_port_mapping(spec: &str) -> Result<PortMapping, String> {
+    let mut parts = spec.splitn(3, ':');
+    let proto_s = parts.next().ok_or_else(|| format!("empty mapping"))?;
+    let host_s = parts.next().ok_or_else(|| format!("missing host port in '{spec}'"))?;
+    let guest_s = parts.next().ok_or_else(|| format!("missing guest port in '{spec}'"))?;
+    let proto = match proto_s {
+        "tcp" => Proto::Tcp,
+        "udp" => Proto::Udp,
+        other => return Err(format!("unknown proto '{other}' in '{spec}' (want tcp or udp)")),
+    };
+    let host: u16 = host_s.parse().map_err(|_| format!("bad host port '{host_s}'"))?;
+    let guest: u16 = guest_s.parse().map_err(|_| format!("bad guest port '{guest_s}'"))?;
+    Ok(PortMapping { proto, host, guest })
+}
+
+struct Args {
+    kernel_path: String,
+    ram_mib: usize,
+    cpu_count: usize,
+    mappings: Vec<PortMapping>,
+}
+
+fn parse_args(argv: &[String]) -> Result<Args, String> {
+    let prog = argv.first().cloned().unwrap_or_else(|| "run-hvf".into());
+    if argv.len() < 2 {
+        usage(&prog);
+        return Err("missing <path-to.img>".into());
+    }
+    let mut kernel_path: Option<String> = None;
+    let mut ram_mib: usize = 128;
+    let mut cpu_count: usize = 1;
+    let mut mappings: Vec<PortMapping> = Vec::new();
+
+    let mut i = 1;
+    while i < argv.len() {
+        let a = &argv[i];
+        if a == "-h" || a == "--help" {
+            usage(&prog);
+            std::process::exit(0);
+        } else if let Some(v) = a.strip_prefix("--ram=") {
+            ram_mib = v.parse().map_err(|_| format!("bad --ram value '{v}'"))?;
+        } else if let Some(v) = a.strip_prefix("--cpus=") {
+            cpu_count = v.parse().map_err(|_| format!("bad --cpus value '{v}'"))?;
+        } else if a == "-p" {
+            i += 1;
+            let v = argv.get(i).ok_or_else(|| "-p expects a value".to_string())?;
+            mappings.push(parse_port_mapping(v)?);
+        } else if let Some(v) = a.strip_prefix("-p=") {
+            mappings.push(parse_port_mapping(v)?);
+        } else if a.starts_with('-') {
+            return Err(format!("unknown option '{a}'"));
+        } else if kernel_path.is_none() {
+            kernel_path = Some(a.clone());
+        } else {
+            return Err(format!("unexpected positional argument '{a}'"));
+        }
+        i += 1;
+    }
+
+    let kernel_path = kernel_path.ok_or_else(|| "missing <path-to.img>".to_string())?;
+
+    // Default port forwards if none given: HTTP on 8080→80 and UDP echo on 18080→7.
+    if mappings.is_empty() {
+        mappings.push(PortMapping { proto: Proto::Tcp, host: 8080, guest: 80 });
+        mappings.push(PortMapping { proto: Proto::Udp, host: 18080, guest: 7 });
+    }
+
+    Ok(Args { kernel_path, ram_mib, cpu_count, mappings })
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: run-hvf <path-to.img> [ram_mib] [host_port] [vcpus]");
-        eprintln!("  Boots an ARM64 kernel image under Apple Hypervisor.framework.");
-        eprintln!("  Defaults: ram_mib=128, host_port=8080, vcpus=1.");
-        eprintln!("  Requires codesign with com.apple.security.hypervisor entitlement.");
-        std::process::exit(1);
-    }
-    let kernel_path = &args[1];
-    let ram_mib: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(128);
-    let cpu_count: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1);
+    let parsed = match parse_args(&args) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("run-hvf: {e}");
+            std::process::exit(1);
+        }
+    };
 
     // macOS version gate: hv_gic_create requires macOS 15+.
     let os_ver = os_version();
@@ -44,7 +140,6 @@ fn main() {
     terminal::enable_raw();
 
     // Install a cleanup handler for abnormal exits.
-    // (Ctrl-C is handled by the guest via serial, not by SIGINT.)
     let orig_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         terminal::restore();
@@ -58,7 +153,7 @@ fn main() {
         let mut buf = [0u8; 64];
         while !SHUTDOWN.load(Ordering::Relaxed) {
             match handle.read(&mut buf) {
-                Ok(0) => break, // EOF
+                Ok(0) => break,
                 Ok(n) => {
                     let mut rx = pl011::RX_BUF.lock().unwrap();
                     for &b in &buf[..n] {
@@ -70,11 +165,10 @@ fn main() {
         }
     });
 
-    eprintln!("==> HVF runner: booting {kernel_path} ({ram_mib} MB RAM)");
+    eprintln!("==> HVF runner: booting {} ({} MB RAM)", parsed.kernel_path, parsed.ram_mib);
 
     // Start userspace networking (no vmnet, no root required).
-    let host_port: u16 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(8080);
-    let vmnet_mac = match userspace_net::start(host_port) {
+    let vmnet_mac = match userspace_net::start(&parsed.mappings) {
         Ok(mac) => mac,
         Err(e) => {
             eprintln!("run-hvf: network failed: {e}");
@@ -83,7 +177,7 @@ fn main() {
     };
 
     // Create and run the VM.
-    let mut vm = match vm::Vm::new_with_config(kernel_path, ram_mib, cpu_count, vmnet_mac) {
+    let mut vm = match vm::Vm::new_with_config(&parsed.kernel_path, parsed.ram_mib, parsed.cpu_count, vmnet_mac) {
         Ok(vm) => vm,
         Err(e) => {
             terminal::restore();

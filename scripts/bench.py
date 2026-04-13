@@ -449,10 +449,14 @@ class HvfEnv:
         img = os.path.join(PROJECT_ROOT, "bazel-bin/apps/webserver/webserver.img")
         run_hvf = os.path.join(PROJECT_ROOT, "tools/hvf-runner/target/release/run-hvf")
         log = open(f"/tmp/hvf_{port}.log", "w")
-        # Userspace proxy: no sudo, TCP on localhost:port, UDP on localhost:port+10000
-        # Positional args to run-hvf: <img> <ram_mib> <host_port> <vcpus>
+        udp_port = port + self.udp_port_offset
+        # -p tcp:HOST:GUEST forwards HTTP to guest:80; -p udp:HOST:GUEST
+        # forwards the UDP echo test to guest:7.
         return subprocess.Popen(
-            [run_hvf, img, "128", str(port), str(cpus)],
+            [run_hvf, img,
+             "--ram=128", f"--cpus={cpus}",
+             "-p", f"tcp:{port}:80",
+             "-p", f"udp:{udp_port}:7"],
             stdin=subprocess.DEVNULL, stdout=log, stderr=log)
 
     def wait_proxy_ready(self, port, proc, timeout=30):

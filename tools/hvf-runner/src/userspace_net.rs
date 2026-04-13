@@ -10,8 +10,7 @@
 // No SPSC rings, no wake pipe, no Mutex on the hot path.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use crate::hvf;
 use crate::virtio;
@@ -22,11 +21,24 @@ const VM_IP: [u8; 4] = [10, 0, 2, 15];
 const GW_IP: [u8; 4] = [10, 0, 2, 2];
 const BROADCAST_IP: [u8; 4] = [255, 255, 255, 255];
 
-/// UDP relay port (host port 7 → guest port 7 by default).
-/// Guest UDP port relayed to the host. Host binds port + 10000 to
-/// avoid requiring root for privileged ports (< 1024).
-const UDP_GUEST_PORT: u16 = 7;
-const UDP_HOST_PORT: u16 = 10007;
+/// Protocol for a user-specified port forward.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Proto {
+    Tcp,
+    Udp,
+}
+
+/// A single `host:guest` forward rule, either TCP or UDP.
+///
+/// The CLI parses `-p tcp:H:G` / `-p udp:H:G` into a `Vec<PortMapping>`
+/// which is passed to `start()`. Multiple forwards of the same proto are
+/// supported; each gets its own listen socket.
+#[derive(Clone, Copy, Debug)]
+pub struct PortMapping {
+    pub proto: Proto,
+    pub host: u16,
+    pub guest: u16,
+}
 
 /// Fixed-size frame buffer — eliminates per-request heap allocation.
 /// Covers all reply frame types: TCP ACK (66B), ARP (54B), DHCP (~400B).
@@ -56,6 +68,10 @@ enum ConnState {
 struct ProxyConn {
     host_fd: i32,
     src_port: u16,
+    /// Guest-side listening port that this connection targets — used as
+    /// the `dst_port` in every TCP frame we synthesize for the guest.
+    /// Populated from the `PortMapping` the listen socket was created for.
+    guest_port: u16,
     my_seq: u32,
     peer_ack: u32,
     state: ConnState,
@@ -73,19 +89,45 @@ static CONNS: std::sync::LazyLock<Mutex<HashMap<u16, ProxyConn>>> =
 /// Uses fixed-size TxFrame to avoid per-request heap allocation.
 static TX_REPLIES: Mutex<VecDeque<TxFrame>> = Mutex::new(VecDeque::new());
 
-/// UDP relay: socket fd (set once by start(), read by vCPU thread in handle_udp).
-static UDP_FD: AtomicI32 = AtomicI32::new(-1);
+/// UDP relay table: one host fd per guest UDP port, published once by
+/// `start()` and read by the vCPU thread in `handle_udp`. `OnceLock`
+/// guarantees the vCPU thread never observes a partially-initialized
+/// table — `start()` fills it before spawning the io_thread, which
+/// happens before the VM is created.
+static UDP_RELAYS: OnceLock<Vec<(i32, u16)>> = OnceLock::new();
 
-/// UDP relay: maps guest-visible src_port → external client sockaddr for return path.
-/// Written by IO thread (on incoming UDP), read by vCPU thread (on guest TX).
-static UDP_CLIENTS: Mutex<Option<HashMap<u16, libc::sockaddr_in>>> =
+/// UDP return-path lookup: `(guest_port, client_ephemeral_port)` →
+/// external client sockaddr. Keyed on `guest_port` as well as the client
+/// port so two UDP forwards on different guest ports don't collide if a
+/// client happens to use the same ephemeral port on both.
+///
+/// Written by the IO thread on each incoming datagram (right before
+/// injecting the frame into the guest ring). Read by the vCPU thread
+/// in `handle_udp` when the guest sends a reply.
+static UDP_CLIENTS: Mutex<Option<HashMap<(u16, u16), libc::sockaddr_in>>> =
     Mutex::new(None);
 
 const GUEST_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 
+/// Per-listen-socket state.
+#[derive(Clone, Copy)]
+struct TcpListen {
+    fd: i32,
+    guest_port: u16,
+}
+
+/// Per-UDP-relay-socket state.
+#[derive(Clone, Copy)]
+struct UdpRelay {
+    fd: i32,
+    guest_port: u16,
+}
+
 struct IoState {
-    listen_fd: i32,
-    udp_fd: i32,
+    /// All TCP listen sockets, one per `-p tcp:H:G` mapping.
+    listens: Vec<TcpListen>,
+    /// All UDP relay sockets, one per `-p udp:H:G` mapping.
+    udps: Vec<UdpRelay>,
     next_port: u16,
     guest_mac: [u8; 6],
     read_buf: [u8; 2048],
@@ -93,65 +135,96 @@ struct IoState {
     rx_lasts: [u16; 8],        // Per-queue-pair RX last indices (Tier 1)
     cpu_count: usize,          // Number of vCPUs (= num_queue_pairs)
     pollfds: Vec<libc::pollfd>,
-    poll_ports: Vec<u16>,  // maps pollfd index → src_port (for HashMap lookup)
+    /// Guest-visible ephemeral src_port for each `Conn`-slot pollfd.
+    /// Indices `[0, fixed_slots)` map to listens/udps and are filled
+    /// with 0 placeholders; only `[fixed_slots..]` entries are valid.
+    conn_ports: Vec<u16>,
     frame_buf: [u8; 2048],
 }
 
-pub fn start(port: u16) -> Result<[u8; 6], String> {
-    let mac: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
-    let listen_fd = unsafe {
+fn bind_listen(host_port: u16) -> Result<i32, String> {
+    unsafe {
         let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
-        if fd < 0 { return Err("socket() failed".into()); }
+        if fd < 0 { return Err(format!("tcp socket(): {}", std::io::Error::last_os_error())); }
         let one: i32 = 1;
         libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR,
                          &one as *const _ as *const _, 4);
         let mut addr: libc::sockaddr_in = std::mem::zeroed();
         addr.sin_family = libc::AF_INET as u8;
-        addr.sin_port = port.to_be();
+        addr.sin_port = host_port.to_be();
         addr.sin_addr.s_addr = u32::from_be_bytes([127, 0, 0, 1]).to_be();
         if libc::bind(fd, &addr as *const _ as *const _, std::mem::size_of_val(&addr) as u32) < 0 {
             let e = std::io::Error::last_os_error();
             libc::close(fd);
-            return Err(format!("bind({port}): {e}"));
+            return Err(format!("tcp bind({host_port}): {e}"));
         }
         libc::listen(fd, 128);
         libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
-        fd
-    };
-    // Create UDP relay socket (non-fatal if bind fails).
-    let udp_fd = unsafe {
+        Ok(fd)
+    }
+}
+
+fn bind_udp(host_port: u16) -> Result<i32, String> {
+    unsafe {
         let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
-        if fd >= 0 {
-            let one: i32 = 1;
-            libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR,
-                             &one as *const _ as *const _, 4);
-            let mut addr: libc::sockaddr_in = std::mem::zeroed();
-            addr.sin_family = libc::AF_INET as u8;
-            addr.sin_port = UDP_HOST_PORT.to_be();
-            addr.sin_addr.s_addr = u32::from_be_bytes([127, 0, 0, 1]).to_be();
-            if libc::bind(fd, &addr as *const _ as *const _, std::mem::size_of_val(&addr) as u32) < 0 {
-                let e = std::io::Error::last_os_error();
-                eprintln!("  warning: UDP bind({UDP_HOST_PORT}) failed: {e}");
-                libc::close(fd);
-                -1
-            } else {
-                libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
-                fd
+        if fd < 0 { return Err(format!("udp socket(): {}", std::io::Error::last_os_error())); }
+        let one: i32 = 1;
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR,
+                         &one as *const _ as *const _, 4);
+        let mut addr: libc::sockaddr_in = std::mem::zeroed();
+        addr.sin_family = libc::AF_INET as u8;
+        addr.sin_port = host_port.to_be();
+        addr.sin_addr.s_addr = u32::from_be_bytes([127, 0, 0, 1]).to_be();
+        if libc::bind(fd, &addr as *const _ as *const _, std::mem::size_of_val(&addr) as u32) < 0 {
+            let e = std::io::Error::last_os_error();
+            libc::close(fd);
+            return Err(format!("udp bind({host_port}): {e}"));
+        }
+        libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+        Ok(fd)
+    }
+}
+
+pub fn start(mappings: &[PortMapping]) -> Result<[u8; 6], String> {
+    let mac: [u8; 6] = GUEST_MAC;
+
+    let mut listens: Vec<TcpListen> = Vec::new();
+    let mut udps: Vec<UdpRelay> = Vec::new();
+    for m in mappings {
+        match m.proto {
+            Proto::Tcp => {
+                let fd = bind_listen(m.host)?;
+                listens.push(TcpListen { fd, guest_port: m.guest });
             }
-        } else { -1 }
-    };
-    if udp_fd >= 0 {
-        UDP_FD.store(udp_fd, Ordering::Relaxed);
+            Proto::Udp => match bind_udp(m.host) {
+                Ok(fd) => udps.push(UdpRelay { fd, guest_port: m.guest }),
+                // UDP bind is non-fatal — keep TCP working even if UDP port is taken.
+                Err(e) => eprintln!("  warning: {e}"),
+            },
+        }
+    }
+
+    if !udps.is_empty() {
+        let table: Vec<(i32, u16)> = udps.iter().map(|u| (u.fd, u.guest_port)).collect();
+        UDP_RELAYS.set(table).ok();
         *UDP_CLIENTS.lock().unwrap() = Some(HashMap::new());
     }
-    std::thread::spawn(move || { io_thread(listen_fd, udp_fd, mac); });
+
+    let listens_for_thread = listens.clone();
+    let udps_for_thread = udps.clone();
+    std::thread::spawn(move || { io_thread(listens_for_thread, udps_for_thread, mac); });
+
     eprintln!();
     eprintln!("  VM network: 10.0.2.15 (userspace, zero-copy)");
-    eprintln!("  TCP relay:  localhost:{port} -> guest:80");
-    if udp_fd >= 0 {
-        eprintln!("  UDP relay:  localhost:{UDP_HOST_PORT} -> guest:{UDP_GUEST_PORT}");
+    for m in mappings.iter().filter(|m| m.proto == Proto::Tcp) {
+        eprintln!("  TCP relay:  localhost:{} -> guest:{}", m.host, m.guest);
     }
-    eprintln!("  Benchmark:  wrk -t1 -c1 -d10s http://localhost:{port}/health");
+    for m in mappings.iter().filter(|m| m.proto == Proto::Udp) {
+        eprintln!("  UDP relay:  localhost:{} -> guest:{}", m.host, m.guest);
+    }
+    if let Some(first_tcp) = mappings.iter().find(|m| m.proto == Proto::Tcp) {
+        eprintln!("  Benchmark:  wrk -t1 -c1 -d10s http://localhost:{}/health", first_tcp.host);
+    }
     eprintln!();
     Ok(mac)
 }
@@ -225,7 +298,7 @@ pub fn process_tx() {
 
 // ── IO / RX thread ──────────────────────────────────────────────────────────
 
-fn io_thread(listen_fd: i32, udp_fd: i32, mac: [u8; 6]) {
+fn io_thread(listens: Vec<TcpListen>, udps: Vec<UdpRelay>, mac: [u8; 6]) {
     // Read cpu_count from the virtio device (= num_queue_pairs).
     // The device is created after the IO thread starts, so spin-wait
     // for it to appear.
@@ -239,10 +312,10 @@ fn io_thread(listen_fd: i32, udp_fd: i32, mac: [u8; 6]) {
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
     let mut io = IoState {
-        listen_fd, udp_fd, next_port: 40000, guest_mac: mac,
+        listens, udps, next_port: 40000, guest_mac: mac,
         read_buf: [0u8; 2048], rx_last: 0,
         rx_lasts: [0u16; 8], cpu_count,
-        pollfds: Vec::with_capacity(64), poll_ports: Vec::with_capacity(64),
+        pollfds: Vec::with_capacity(64), conn_ports: Vec::with_capacity(64),
         frame_buf: [0u8; 2048],
     };
     TX_REPLIES.lock().unwrap().push_back(build_grat_arp_frame(&mac));
@@ -324,42 +397,57 @@ fn io_thread(listen_fd: i32, udp_fd: i32, mac: [u8; 6]) {
         }
 
         // ── Build pollfds ──────────────────────────────────────────────
+        // Layout (variable): N listens, M udp relays, then conn fds.
+        // `conn_ports[i]` is the guest-visible ephemeral src_port for
+        // slot i, and is only valid in the `[fixed_slots..]` range.
         let conns = CONNS.lock().unwrap();
         io.pollfds.clear();
-        io.poll_ports.clear();
-        io.pollfds.push(libc::pollfd { fd: listen_fd, events: libc::POLLIN, revents: 0 });
-        io.poll_ports.push(0); // placeholder for listen fd
-        io.pollfds.push(libc::pollfd {
-            fd: if io.udp_fd >= 0 { io.udp_fd } else { -1 },
-            events: libc::POLLIN, revents: 0,
-        });
-        io.poll_ports.push(0); // placeholder for UDP fd
+        io.conn_ports.clear();
+        for l in &io.listens {
+            io.pollfds.push(libc::pollfd { fd: l.fd, events: libc::POLLIN, revents: 0 });
+            io.conn_ports.push(0);
+        }
+        for u in &io.udps {
+            io.pollfds.push(libc::pollfd { fd: u.fd, events: libc::POLLIN, revents: 0 });
+            io.conn_ports.push(0);
+        }
+        let fixed_slots = io.pollfds.len(); // slots above this are conns
         for c in conns.values() {
             io.pollfds.push(libc::pollfd {
                 fd: if c.host_fd >= 0 && c.state < ConnState::Closed { c.host_fd } else { -1 },
                 events: libc::POLLIN, revents: 0,
             });
-            io.poll_ports.push(c.src_port);
+            io.conn_ports.push(c.src_port);
         }
         drop(conns);
 
         let ready = unsafe { libc::poll(io.pollfds.as_mut_ptr(), io.pollfds.len() as u32, 5) };
         if ready <= 0 { continue; }
 
-        if io.pollfds[0].revents & libc::POLLIN != 0 {
-            accept_connections(&mut io, &snap);
+        // Accept new TCP connections on any listen socket that fired.
+        for i in 0..io.listens.len() {
+            if io.pollfds[i].revents & libc::POLLIN != 0 {
+                let gp = io.listens[i].guest_port;
+                let fd = io.listens[i].fd;
+                accept_connections(&mut io, &snap, fd, gp);
+            }
         }
-
-        // UDP relay: incoming datagrams from external clients → inject into guest.
-        if io.pollfds[1].revents & libc::POLLIN != 0 && snap.ready {
-            handle_udp_rx(&mut io, &snap);
+        // Drain UDP relays that fired. Each mapping has its own socket.
+        let listens_count = io.listens.len();
+        for j in 0..io.udps.len() {
+            let idx = listens_count + j;
+            if io.pollfds[idx].revents & libc::POLLIN != 0 && snap.ready {
+                let fd = io.udps[j].fd;
+                let gp = io.udps[j].guest_port;
+                handle_udp_rx(&mut io, &snap, fd, gp);
+            }
         }
 
         // ── Zero-copy RX: read() into guest RAM ───────────────────────
         const HDR_LEN: usize = VIRTIO_NET_HDR_SIZE + 14 + 20 + 20; // 66 bytes
         const MAX_PAYLOAD: usize = 1460;
 
-        struct ConnSnap { port: u16, fd: i32, seq: u32, ack: u32, queue_pair: usize }
+        struct ConnSnap { port: u16, guest_port: u16, fd: i32, seq: u32, ack: u32, queue_pair: usize }
         let mut woken = [false; 8];
         let mut injected = false;
 
@@ -371,16 +459,21 @@ fn io_thread(listen_fd: i32, udp_fd: i32, mac: [u8; 6]) {
         };
 
         if any_rx_ready {
-            // Brief lock: snapshot ready connections using poll_ports for O(1) lookup.
+            // Brief lock: snapshot ready connections. Skip the fixed-slot
+            // entries (listens + UDP relays) at the head of pollfds — only
+            // conn-section entries can produce RX data.
             let snaps: Vec<ConnSnap> = {
                 let conns = CONNS.lock().unwrap();
-                (2..io.pollfds.len()) // skip index 0 (listen fd) and 1 (UDP fd)
+                (fixed_slots..io.pollfds.len())
                     .filter(|&i| io.pollfds[i].revents & (libc::POLLIN | libc::POLLHUP) != 0)
                     .filter_map(|i| {
-                        let port = io.poll_ports[i];
+                        let port = io.conn_ports[i];
                         conns.get(&port).and_then(|c| {
                             if c.host_fd >= 0 && c.state == ConnState::Established {
-                                Some(ConnSnap { port, fd: c.host_fd, seq: c.my_seq, ack: c.peer_ack, queue_pair: c.queue_pair })
+                                Some(ConnSnap {
+                                    port, guest_port: c.guest_port, fd: c.host_fd,
+                                    seq: c.my_seq, ack: c.peer_ack, queue_pair: c.queue_pair,
+                                })
                             } else { None }
                         })
                     })
@@ -427,7 +520,7 @@ fn io_thread(listen_fd: i32, udp_fd: i32, mac: [u8; 6]) {
                 // Write headers around the payload already in guest RAM.
                 let total = write_tcp_frame_around_payload(
                     guest_buf, &GUEST_MAC, GW_IP, VM_IP,
-                    cs.port, 80, cs.seq, cs.ack, 0x18, payload_len);
+                    cs.port, cs.guest_port, cs.seq, cs.ack, 0x18, payload_len);
 
                 // Update used ring.
                 let used_idx = *rlast;
@@ -460,7 +553,7 @@ fn io_thread(listen_fd: i32, udp_fd: i32, mac: [u8; 6]) {
                     if let Some(c) = conns.get_mut(&r.port) {
                         if r.eof {
                             let frame = build_tcp_frame_fixed(&GUEST_MAC, GW_IP, VM_IP,
-                                c.src_port, 80, c.my_seq, c.peer_ack, 0x11, &[]);
+                                c.src_port, c.guest_port, c.my_seq, c.peer_ack, 0x11, &[]);
                             c.my_seq = c.my_seq.wrapping_add(1);
                             c.state = ConnState::Closed;
                             let qp = r.queue_pair;
@@ -481,9 +574,9 @@ fn io_thread(listen_fd: i32, udp_fd: i32, mac: [u8; 6]) {
         } else {
             // RX queue not ready — buffer in pending.
             let mut conns = CONNS.lock().unwrap();
-            for i in 2..io.pollfds.len() {
+            for i in fixed_slots..io.pollfds.len() {
                 if io.pollfds[i].revents & (libc::POLLIN | libc::POLLHUP) == 0 { continue; }
-                let port = io.poll_ports[i];
+                let port = io.conn_ports[i];
                 if let Some(c) = conns.get_mut(&port) {
                     if c.host_fd < 0 { continue; }
                     let n = unsafe {
@@ -514,11 +607,12 @@ fn io_thread(listen_fd: i32, udp_fd: i32, mac: [u8; 6]) {
     }
 }
 
-fn accept_connections(io: &mut IoState, snap: &virtio::QueueSnapshot) {
+fn accept_connections(io: &mut IoState, snap: &virtio::QueueSnapshot,
+                      listen_fd: i32, guest_port: u16) {
     let multi_queue = io.cpu_count > 1;
     loop {
         let client_fd = unsafe {
-            libc::accept(io.listen_fd, std::ptr::null_mut(), std::ptr::null_mut())
+            libc::accept(listen_fd, std::ptr::null_mut(), std::ptr::null_mut())
         };
         if client_fd < 0 { break; }
         unsafe {
@@ -534,7 +628,7 @@ fn accept_connections(io: &mut IoState, snap: &virtio::QueueSnapshot) {
         let qp = if multi_queue { src_port as usize % io.cpu_count } else { 0 };
 
         let frame = build_tcp_frame_fixed(&io.guest_mac, GW_IP, VM_IP,
-            src_port, 80, 1000, 0, 0x02, &[]);
+            src_port, guest_port, 1000, 0, 0x02, &[]);
         let (qsnap, rlast) = if multi_queue && qp < io.cpu_count {
             (virtio::queue_snapshot(qp * 2), &mut io.rx_lasts[qp])
         } else {
@@ -551,7 +645,8 @@ fn accept_connections(io: &mut IoState, snap: &virtio::QueueSnapshot) {
             }
         } else { TX_REPLIES.lock().unwrap().push_back(frame); }
         CONNS.lock().unwrap().insert(src_port, ProxyConn {
-            host_fd: client_fd, src_port, my_seq: 1001, peer_ack: 0,
+            host_fd: client_fd, src_port, guest_port,
+            my_seq: 1001, peer_ack: 0,
             state: ConnState::SynSent, pending: Vec::new(),
             queue_pair: qp,
         });
@@ -559,12 +654,34 @@ fn accept_connections(io: &mut IoState, snap: &virtio::QueueSnapshot) {
 }
 
 /// Handle incoming UDP datagrams from external clients → inject into guest RX ring.
-fn handle_udp_rx(io: &mut IoState, snap: &virtio::QueueSnapshot) {
+///
+/// Called once per UDP relay socket that fired POLLIN. `fd` is the host
+/// socket and `guest_port` is the guest-side UDP port that this relay
+/// targets (the `GUEST` in `-p udp:HOST:GUEST`). All injected frames
+/// carry `dst_port = guest_port`.
+fn handle_udp_rx(io: &mut IoState, snap: &virtio::QueueSnapshot, fd: i32, guest_port: u16) {
+    // Drain everything the socket has queued and inject as many frames
+    // as the RX ring can hold. Firing the GIC SPI is an `hv_gic_set_spi`
+    // hypercall that costs microseconds; firing it per-packet at
+    // 300k+ pkt/s burns the io_thread and starves the vCPU, so batch-
+    // fire exactly once at the end.
+    //
+    // Critically, we also fire SPI if we pulled socket data but
+    // couldn't inject (ring full). Under the NAPI idle pattern the
+    // guest is HLTed on WFI waiting for the next SPI, and a full
+    // ring means "the guest has more buffers to re-arm"; if we
+    // stayed silent because we couldn't inject, guest + host would
+    // deadlock — guest waiting for a wake, host waiting for buffers.
+    // Firing SPI unblocks the guest so it can poll, drain, and
+    // re-arm; the next io_thread round then injects successfully.
+    let mut any_injected = false;
+    let mut ring_full_pending = false;
+
     loop {
         let mut client_addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
         let mut addr_len: libc::socklen_t = std::mem::size_of::<libc::sockaddr_in>() as u32;
         let n = unsafe {
-            libc::recvfrom(io.udp_fd, io.read_buf.as_mut_ptr() as *mut _,
+            libc::recvfrom(fd, io.read_buf.as_mut_ptr() as *mut _,
                 io.read_buf.len(), 0,
                 &mut client_addr as *mut _ as *mut libc::sockaddr,
                 &mut addr_len)
@@ -572,26 +689,43 @@ fn handle_udp_rx(io: &mut IoState, snap: &virtio::QueueSnapshot) {
         if n <= 0 { break; }
         let payload_len = n as usize;
 
-        // Extract the client's ephemeral port (network byte order → host).
         let client_port = u16::from_be(client_addr.sin_port);
 
-        // Store the client address for the return path (guest TX → external client).
+        // Register the sender → sockaddr mapping BEFORE inject_frame
+        // publishes the packet into the guest ring. Otherwise the
+        // guest (especially under busy-poll) can see the RX, process
+        // it, and call handle_udp for the reply before we've updated
+        // UDP_CLIENTS — handle_udp's lookup returns None and the reply
+        // is silently dropped. Keyed on `(guest_port, client_port)` so
+        // two UDP forwards on different guest ports never collide.
         {
             let mut guard = UDP_CLIENTS.lock().unwrap();
             if let Some(ref mut m) = *guard {
-                m.insert(client_port, client_addr);
+                m.insert((guest_port, client_port), client_addr);
             }
         }
 
         // Build Eth+IP+UDP frame wrapping the payload, inject into guest RX ring.
-        // Source: GW_IP:client_port → Dest: VM_IP:UDP_GUEST_PORT
         let frame_len = build_udp_frame(&mut io.frame_buf, &io.guest_mac,
-            GW_IP, VM_IP, client_port, UDP_GUEST_PORT,
+            GW_IP, VM_IP, client_port, guest_port,
             &io.read_buf[..payload_len]);
-        if inject_frame(&io.frame_buf[..frame_len], snap, &mut io.rx_last) {
-            unsafe { core::arch::asm!("dsb sy", options(nostack)); }
-            crate::vm::wake_vcpu(0);
-            unsafe { hvf::hv_gic_set_spi(35, true); hvf::hv_gic_set_spi(35, false); }
+        if !inject_frame(&io.frame_buf[..frame_len], snap, &mut io.rx_last) {
+            // Ring full — drop this packet but keep draining so the
+            // socket buffer doesn't overflow (the kernel's drop is
+            // worse than ours because it breaks poll()). We'll still
+            // fire SPI at the end to kick the guest into catching up.
+            ring_full_pending = true;
+            continue;
+        }
+        any_injected = true;
+    }
+
+    if any_injected || ring_full_pending {
+        unsafe { core::arch::asm!("dsb sy", options(nostack)); }
+        crate::vm::wake_vcpu(0);
+        unsafe {
+            hvf::hv_gic_set_spi(35, true);
+            hvf::hv_gic_set_spi(35, false);
         }
     }
 }
@@ -644,7 +778,7 @@ fn inject_data_frames(c: &mut ProxyConn, data: &[u8], mac: &[u8; 6],
     let mut off = 0;
     while off < data.len() {
         let chunk = (data.len() - off).min(1460);
-        let len = write_tcp_frame(frame_buf, mac, GW_IP, VM_IP, c.src_port, 80,
+        let len = write_tcp_frame(frame_buf, mac, GW_IP, VM_IP, c.src_port, c.guest_port,
             c.my_seq, c.peer_ack, 0x18, &data[off..off + chunk]);
         c.my_seq = c.my_seq.wrapping_add(chunk as u32);
         off += chunk;
@@ -705,7 +839,7 @@ fn handle_tcp(tcp: &[u8]) {
     let payload = if tcp.len() > data_offset { &tcp[data_offset..] } else { &[] };
 
     // Snapshot connection state under brief lock — don't hold across write().
-    struct TxSnap { fd: i32, port: u16, seq: u32, ack: u32, state: ConnState, queue_pair: usize }
+    struct TxSnap { fd: i32, port: u16, guest_port: u16, seq: u32, ack: u32, state: ConnState, queue_pair: usize }
     let snap = {
         let mut conns = CONNS.lock().unwrap();
         if flags & 0x04 != 0 {
@@ -717,7 +851,10 @@ fn handle_tcp(tcp: &[u8]) {
         let c = match conns.get_mut(&dst_port) {
             Some(c) => c, None => return,
         };
-        let s = TxSnap { fd: c.host_fd, port: c.src_port, seq: c.my_seq, ack: c.peer_ack, state: c.state, queue_pair: c.queue_pair };
+        let s = TxSnap {
+            fd: c.host_fd, port: c.src_port, guest_port: c.guest_port,
+            seq: c.my_seq, ack: c.peer_ack, state: c.state, queue_pair: c.queue_pair,
+        };
         // Update state eagerly (before dropping lock).
         match c.state {
             ConnState::SynSent => {
@@ -764,7 +901,7 @@ fn handle_tcp(tcp: &[u8]) {
             if flags & 0x12 == 0x12 {
                 let ack = seq.wrapping_add(1);
                 let mut f = build_tcp_frame_fixed(&GUEST_MAC, GW_IP, VM_IP,
-                    snap.port, 80, snap.seq, ack, 0x10, &[]);
+                    snap.port, snap.guest_port, snap.seq, ack, 0x10, &[]);
                 f.queue_pair = snap.queue_pair as u8;
                 replies.push_back(f);
             }
@@ -799,15 +936,24 @@ fn handle_udp(udp: &[u8]) {
         return;
     }
     // General UDP relay: guest → external client.
-    let fd = UDP_FD.load(Ordering::Relaxed);
-    if fd < 0 { return; }
+    //
+    // The guest's frame has src_port=<guest-side listener> (matches the
+    // GUEST in one of our `-p udp:HOST:GUEST` mappings) and
+    // dst_port=<client ephemeral>. We look up the external sockaddr by
+    // the `(src_port, dst_port)` pair and send via whichever host socket
+    // handles `src_port`.
     let payload = &udp[8..];
     if payload.is_empty() { return; }
-    // Look up the external client address by the destination port
-    // (which is the ephemeral port we assigned when the client sent to us).
+    let fd = match UDP_RELAYS.get() {
+        Some(table) => match table.iter().find(|(_, gp)| *gp == src_port) {
+            Some((fd, _)) => *fd,
+            None => return,
+        },
+        None => return,
+    };
     let client_addr = {
         let guard = UDP_CLIENTS.lock().unwrap();
-        guard.as_ref().and_then(|m| m.get(&dst_port).copied())
+        guard.as_ref().and_then(|m| m.get(&(src_port, dst_port)).copied())
     };
     if let Some(addr) = client_addr {
         unsafe {

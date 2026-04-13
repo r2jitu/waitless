@@ -92,8 +92,11 @@ if [ "$HOST_OS" = "Darwin" ] && [ "$HOST_ARCH" = "arm64" ] && [ "$RUNNER" = "hvf
         echo "       Build it: cd tools/hvf-runner && cargo build --release"
         exit 1
     fi
-    echo "==> Starting HVF runner"
-    exec "$RUN_HVF" "$IMG"
+    UDP_HOST_PORT=$((HOST_PORT + 10000))
+    exec "$RUN_HVF" "$IMG" \
+        "--ram=${MEMORY}" "--cpus=${CPUS}" \
+        -p "tcp:${HOST_PORT}:80" \
+        -p "udp:${UDP_HOST_PORT}:7"
 fi
 
 # ── Common QEMU output flags ──────────────────────────────────────────────────
