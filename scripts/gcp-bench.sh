@@ -4,13 +4,23 @@
 # Both the unikernel VM (or native binary) and the workload generator
 # run on the remote host (loopback only) for lowest-overhead measurements.
 #
+# By default the script starts the instance if it's STOPPED, runs the
+# bench, and stops it again at the end so minimum compute is billed.
+# Use `--keep-running` to skip the post-run stop (handy for iterative
+# debug sessions where you're about to run another bench).
+#
+# Default cores are 1,2,4 — the GCP host is 8 vCPUs, and running the
+# unikernel with 8 vCPUs leaves no headroom for wrk + vhost-net
+# kthreads, so scaling numbers are artificially depressed. Pass
+# `--cores 1,2,4,8` if you want to see that ceiling.
+#
 # Usage:
-#   ./scripts/gcp-bench.sh                           # kvm + native, 1,2,4,8 cores
+#   ./scripts/gcp-bench.sh                           # kvm + native, 1,2,4 cores
 #   ./scripts/gcp-bench.sh --env kvm                 # kvm only
-#   ./scripts/gcp-bench.sh --env native              # native Linux only
 #   ./scripts/gcp-bench.sh --cores 1,4 --duration 10
-#   ./scripts/gcp-bench.sh --workload compute_c8
+#   ./scripts/gcp-bench.sh --workload health_max
 #   ./scripts/gcp-bench.sh --no-build                # skip local rebuild
+#   ./scripts/gcp-bench.sh --keep-running            # don't stop host after
 #
 # Any args not consumed here are forwarded to bench.py verbatim.
 
@@ -23,11 +33,12 @@ SSH_HOST="${GCP_SSH_HOST:-gcp}"
 REMOTE_DIR="${GCP_REMOTE_DIR:-bench}"
 
 # Default args; overridden by user-supplied flags.
-DEFAULT_CORES="1,2,4,8"
+DEFAULT_CORES="1,2,4"
 DEFAULT_DURATION="10"
 DEFAULT_ENV="kvm,native"
 
 do_build=1
+do_stop=1
 bench_args=()
 have_cores=0
 have_duration=0
@@ -38,6 +49,7 @@ while [ $i -lt ${#argv[@]} ]; do
     arg="${argv[$i]}"
     case "$arg" in
         --no-build) do_build=0 ;;
+        --keep-running) do_stop=0 ;;
         --cores|--cores=*) have_cores=1; bench_args+=("$arg") ;;
         --duration|--duration=*) have_duration=1; bench_args+=("$arg") ;;
         --env) i=$((i+1)); env_arg="${argv[$i]}" ;;
@@ -87,6 +99,27 @@ if [ $need_native -eq 1 ]; then
     NBIN="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver_native"
     [ -f "$NBIN" ] || { echo "error: $NBIN not found; run without --no-build" >&2; exit 1; }
     sync_files+=("$NBIN")
+fi
+
+# Auto-start the instance if it's stopped, so the user doesn't have to
+# remember to spin it up manually. `gcp.sh start` also refreshes the
+# SSH config HostName since GCE re-rolls the external IP.
+instance_status=$("$SCRIPT_DIR/gcp.sh" status 2>/dev/null | awk 'NR>1 {print $2}' || true)
+if [ "$instance_status" = "TERMINATED" ] || [ "$instance_status" = "STOPPED" ]; then
+    echo "==> Instance is $instance_status — starting..."
+    "$SCRIPT_DIR/gcp.sh" start >/dev/null
+    # Wait until SSH comes up (up to 60s).
+    for _try in $(seq 1 60); do
+        if ssh -o ConnectTimeout=3 -o BatchMode=yes "$SSH_HOST" true 2>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
+fi
+
+# Stop the instance on exit (including Ctrl-C), unless `--keep-running`.
+if [ $do_stop -eq 1 ]; then
+    trap '"$SCRIPT_DIR/gcp.sh" stop >/dev/null 2>&1 || true' EXIT
 fi
 
 echo "==> Syncing files to $SSH_HOST:~/$REMOTE_DIR/..."
