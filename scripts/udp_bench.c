@@ -18,8 +18,18 @@
 //                drop cascade more than steady-state server capacity,
 //                so prefer paced runs for headline numbers.
 //
+// Client parallelism:
+//   --client-cpus=N   Run async mode with N worker threads (default 1).
+//                     Senders are partitioned evenly across threads.
+//                     bench.py sets this to match the server's vCPU
+//                     count so client and server get the same share of
+//                     the host; without it a single-threaded bench can
+//                     become the throughput ceiling at multi-core
+//                     server configurations.
+//
 // Build: cc -O2 -o udp_bench scripts/udp_bench.c -lpthread
 // Usage: udp_bench <port> <senders> <duration_sec> [--async] [--rate=PPS]
+//                  [--client-cpus=N]
 //
 // Reports machine-readable RESULT line on stdout for bench.py, plus
 // human-readable details on stderr.
@@ -275,13 +285,30 @@ static void run_async_multi(const char *host, int port, int duration,
     free(fds);
 }
 
+// ── Async pthread worker ─────────────────────────────────────────────────────
+
+struct async_thread_args {
+    const char *host;
+    int port;
+    int duration;
+    int n_senders;
+    long rate_pps;
+    struct result *out;
+};
+
+static void *async_thread_entry(void *arg) {
+    struct async_thread_args *a = arg;
+    run_async_multi(a->host, a->port, a->duration, a->n_senders, a->rate_pps, a->out);
+    return NULL;
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 int main(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr,
             "Usage: udp_bench <port> <senders> <duration_sec>"
-            " [--async] [--host=IP] [--rate=PPS]\n");
+            " [--async] [--host=IP] [--rate=PPS] [--client-cpus=N]\n");
         return 1;
     }
     int port = atoi(argv[1]);
@@ -289,17 +316,22 @@ int main(int argc, char **argv) {
     int duration = atoi(argv[3]);
     int async_mode = 0;
     long rate_pps = 0; // 0 = no rate cap (blast)
+    int client_cpus = 1;
     const char *host = "127.0.0.1";
     for (int i = 4; i < argc; i++) {
         if (strcmp(argv[i], "--async") == 0) async_mode = 1;
         else if (strncmp(argv[i], "--host=", 7) == 0) host = argv[i] + 7;
         else if (strncmp(argv[i], "--rate=", 7) == 0) rate_pps = atol(argv[i] + 7);
+        else if (strncmp(argv[i], "--client-cpus=", 14) == 0) client_cpus = atoi(argv[i] + 14);
     }
 
     if (senders < 1 || senders > 64) {
         fprintf(stderr, "senders must be 1-64\n");
         return 1;
     }
+    if (client_cpus < 1) client_cpus = 1;
+    if (client_cpus > senders) client_cpus = senders;
+    if (client_cpus > 32) client_cpus = 32;
 
     size_t shm_size = sizeof(struct result) * senders;
     struct result *results = mmap(NULL, shm_size,
@@ -308,8 +340,39 @@ int main(int argc, char **argv) {
     memset(results, 0, shm_size);
 
     if (async_mode) {
-        // Single process, single thread, N non-blocking sockets.
-        run_async_multi(host, port, duration, senders, rate_pps, results);
+        // Async mode: N pthread workers, senders partitioned across them.
+        // At client_cpus=1 this collapses back to a single poll-multiplex
+        // thread, matching the prior behaviour exactly.
+        pthread_t tids[32];
+        struct async_thread_args targs[32];
+        int base = senders / client_cpus;
+        int extra = senders % client_cpus;
+        int offset = 0;
+        int n_threads = 0;
+        for (int t = 0; t < client_cpus; t++) {
+            int n = base + (t < extra ? 1 : 0);
+            if (n <= 0) continue;
+            targs[n_threads] = (struct async_thread_args){
+                .host = host,
+                .port = port,
+                .duration = duration,
+                .n_senders = n,
+                .rate_pps = rate_pps,
+                .out = &results[offset],
+            };
+            if (pthread_create(&tids[n_threads], NULL,
+                               async_thread_entry, &targs[n_threads]) != 0) {
+                perror("pthread_create");
+                // Run inline as fallback.
+                run_async_multi(host, port, duration, n, rate_pps, &results[offset]);
+            } else {
+                n_threads++;
+            }
+            offset += n;
+        }
+        for (int t = 0; t < n_threads; t++) {
+            pthread_join(tids[t], NULL);
+        }
     } else {
         // Sync mode: fork-per-sender so each sender's blocking
         // sendto/recvfrom doesn't serialise with the others.

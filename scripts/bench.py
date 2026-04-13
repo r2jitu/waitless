@@ -165,7 +165,7 @@ def _parse_udp_bench_output(stdout):
 
 
 def run_udp(port, senders, duration, async_mode=False, host="127.0.0.1",
-            rate_per_sender=0):
+            rate_per_sender=0, client_cpus=1):
     """Run UDP echo benchmark using the compiled C client.
 
     The C client (scripts/udp_bench) uses fork() for parallelism,
@@ -180,6 +180,11 @@ def run_udp(port, senders, duration, async_mode=False, host="127.0.0.1",
     sendto() loop to that many packets/sec, modelling realistic
     concurrent clients instead of blasting the server.
 
+    `client_cpus` controls how many pthread workers drive the async
+    senders in parallel — setting it equal to the server's vCPU count
+    keeps the client from becoming the throughput ceiling at multi-core
+    server configurations.
+
     Falls back to the old Python implementation if the C binary isn't
     found (first run before compilation).
     """
@@ -191,6 +196,8 @@ def run_udp(port, senders, duration, async_mode=False, host="127.0.0.1",
                 cmd.append("--async")
                 if rate_per_sender > 0:
                     cmd.append(f"--rate={rate_per_sender}")
+                if client_cpus > 1:
+                    cmd.append(f"--client-cpus={client_cpus}")
             if host != "127.0.0.1":
                 cmd.append(f"--host={host}")
             r = subprocess.run(cmd, capture_output=True, text=True,
@@ -243,7 +250,7 @@ def _udp_with_retry(port, senders, duration, host, async_mode, rate_per_sender=0
 
 
 def udp_peak_rate(port, senders, host, threshold=0.99, probe_duration=3,
-                  start_rate=1000, max_rate=4_000_000):
+                  start_rate=1000, max_rate=4_000_000, client_cpus=1):
     """Find the peak aggregate UDP echo rate that sustains ≥ `threshold`
     delivery, via exponential ramp + binary search.
 
@@ -251,6 +258,10 @@ def udp_peak_rate(port, senders, host, threshold=0.99, probe_duration=3,
     so the offered load is `R * senders`. The probe returns (recv, sent)
     aggregated across all senders; we accept the rate if `recv / sent >=
     threshold`.
+
+    `client_cpus` controls how many pthread workers the client uses in
+    each probe — the caller sets this equal to the server's vCPU count
+    so the client's CPU budget scales with the server under test.
 
     Phase 1 (ramp): start at `start_rate`, double the per-sender rate
     until delivery falls below threshold. This finds a `[good, bad]`
@@ -270,6 +281,8 @@ def udp_peak_rate(port, senders, host, threshold=0.99, probe_duration=3,
     def probe(per_sender_rate):
         cmd = [udp_bin, str(port), str(senders), str(probe_duration),
                "--async", f"--rate={per_sender_rate}"]
+        if client_cpus > 1:
+            cmd.append(f"--client-cpus={client_cpus}")
         if host != "127.0.0.1":
             cmd.append(f"--host={host}")
         try:
@@ -873,10 +886,15 @@ def main():
                     print(f"    {wname:<20s} {pps:>10.0f} pkt/s  (async recv rate)")
                 elif w["type"] == "udp_peak":
                     time.sleep(0.5)
+                    # Match client pthread workers to the server's vCPU
+                    # count so the client's CPU budget scales with the
+                    # server under test — a single-threaded client
+                    # becomes the throughput ceiling at >1 vCPU.
                     pps, ratio = udp_peak_rate(
-                        udp_target_port, senders, wrk_host)
+                        udp_target_port, senders, wrk_host,
+                        client_cpus=cpus)
                     results[(env_name, cpus, wname)] = (pps, "", "")
-                    print(f"    {wname:<20s} {pps:>10.0f} pkt/s  ({ratio*100:.0f}% delivery, {senders} senders)")
+                    print(f"    {wname:<20s} {pps:>10.0f} pkt/s  ({ratio*100:.0f}% delivery, {senders}s/{cpus}t)")
 
                 env.stop(proc)
                 _current["proc"] = None
