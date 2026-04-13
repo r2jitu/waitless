@@ -171,6 +171,15 @@ fn bind_udp(host_port: u16) -> Result<i32, String> {
         let one: i32 = 1;
         libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR,
                          &one as *const _ as *const _, 4);
+        // Large socket buffers absorb bursty high-concurrency udp_async
+        // loads without dropping at the host kernel. 16 MiB on each side
+        // is a no-cost sizing on macOS/Linux and keeps the bottleneck in
+        // the guest's event loop rather than in our queue.
+        let bufsz: i32 = 16 * 1024 * 1024;
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF,
+                         &bufsz as *const _ as *const _, 4);
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF,
+                         &bufsz as *const _ as *const _, 4);
         let mut addr: libc::sockaddr_in = std::mem::zeroed();
         addr.sin_family = libc::AF_INET as u8;
         addr.sin_port = host_port.to_be();
