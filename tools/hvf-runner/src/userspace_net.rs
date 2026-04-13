@@ -445,10 +445,10 @@ fn io_thread(listens: Vec<TcpListen>, udps: Vec<UdpRelay>, mac: [u8; 6]) {
         let listens_count = io.listens.len();
         for j in 0..io.udps.len() {
             let idx = listens_count + j;
-            if io.pollfds[idx].revents & libc::POLLIN != 0 && snap.ready {
+            if io.pollfds[idx].revents & libc::POLLIN != 0 {
                 let fd = io.udps[j].fd;
                 let gp = io.udps[j].guest_port;
-                handle_udp_rx(&mut io, &snap, fd, gp);
+                handle_udp_rx(&mut io, fd, gp);
             }
         }
 
@@ -668,23 +668,18 @@ fn accept_connections(io: &mut IoState, snap: &virtio::QueueSnapshot,
 /// socket and `guest_port` is the guest-side UDP port that this relay
 /// targets (the `GUEST` in `-p udp:HOST:GUEST`). All injected frames
 /// carry `dst_port = guest_port`.
-fn handle_udp_rx(io: &mut IoState, snap: &virtio::QueueSnapshot, fd: i32, guest_port: u16) {
-    // Drain everything the socket has queued and inject as many frames
-    // as the RX ring can hold. Firing the GIC SPI is an `hv_gic_set_spi`
-    // hypercall that costs microseconds; firing it per-packet at
-    // 300k+ pkt/s burns the io_thread and starves the vCPU, so batch-
-    // fire exactly once at the end.
-    //
-    // Critically, we also fire SPI if we pulled socket data but
-    // couldn't inject (ring full). Under the NAPI idle pattern the
-    // guest is HLTed on WFI waiting for the next SPI, and a full
-    // ring means "the guest has more buffers to re-arm"; if we
-    // stayed silent because we couldn't inject, guest + host would
-    // deadlock — guest waiting for a wake, host waiting for buffers.
-    // Firing SPI unblocks the guest so it can poll, drain, and
-    // re-arm; the next io_thread round then injects successfully.
+///
+/// Software RSS: each datagram is hashed by client source port and
+/// injected into the matching guest RX queue pair, so a high-concurrency
+/// UDP workload from N distinct client sockets fans out across all N
+/// vCPUs rather than piling onto queue 0 / core 0. Mirrors what the
+/// KVM tap+vhost path gets for free from the kernel's 4-tuple RSS.
+fn handle_udp_rx(io: &mut IoState, fd: i32, guest_port: u16) {
+    let multi_queue = io.cpu_count > 1;
+    let nqp = io.cpu_count;
+    let mut woken = [false; 8];
+    let mut ring_full = [false; 8];
     let mut any_injected = false;
-    let mut ring_full_pending = false;
 
     loop {
         let mut client_addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
@@ -714,23 +709,56 @@ fn handle_udp_rx(io: &mut IoState, snap: &virtio::QueueSnapshot, fd: i32, guest_
             }
         }
 
-        // Build Eth+IP+UDP frame wrapping the payload, inject into guest RX ring.
+        // Pick a queue pair via software RSS. Single-queue setups use
+        // qp 0 (and drain `io.rx_last`); multi-queue setups hash by
+        // client port so distinct senders land on distinct vCPUs.
+        let qp = if multi_queue { (client_port as usize) % nqp } else { 0 };
+        let qsnap = if multi_queue {
+            virtio::queue_snapshot(qp * 2)
+        } else {
+            virtio::rx_queue_snapshot()
+        };
+        if !qsnap.ready {
+            ring_full[qp] = true;
+            continue;
+        }
+        let rlast = if multi_queue {
+            &mut io.rx_lasts[qp]
+        } else {
+            &mut io.rx_last
+        };
+
+        // Build Eth+IP+UDP frame wrapping the payload, inject into the
+        // target queue's RX ring.
         let frame_len = build_udp_frame(&mut io.frame_buf, &io.guest_mac,
             GW_IP, VM_IP, client_port, guest_port,
             &io.read_buf[..payload_len]);
-        if !inject_frame(&io.frame_buf[..frame_len], snap, &mut io.rx_last) {
-            // Ring full — drop this packet but keep draining so the
-            // socket buffer doesn't overflow (the kernel's drop is
-            // worse than ours because it breaks poll()). We'll still
-            // fire SPI at the end to kick the guest into catching up.
-            ring_full_pending = true;
+        if !inject_frame(&io.frame_buf[..frame_len], &qsnap, rlast) {
+            // Ring full on this queue — drop this packet but keep
+            // draining the socket so its buffer doesn't overflow. The
+            // target vCPU gets poked at the end so it catches up.
+            ring_full[qp] = true;
             continue;
         }
         any_injected = true;
+        woken[qp] = true;
     }
 
-    if any_injected || ring_full_pending {
-        unsafe { core::arch::asm!("dsb sy", options(nostack)); }
+    if !any_injected && !ring_full.iter().any(|&x| x) {
+        return;
+    }
+    unsafe { core::arch::asm!("dsb sy", options(nostack)); }
+    if multi_queue {
+        // In Tier 1 multi-queue mode each vCPU parks on the hvf-yield
+        // MMIO register; wake_vcpu unblocks the specific one.
+        for qp in 0..nqp {
+            if woken[qp] || ring_full[qp] {
+                crate::vm::wake_vcpu(qp);
+            }
+        }
+    } else {
+        // Single-queue fallback: core 0 is sleeping on WFI/hvf-yield;
+        // wake it and pulse the shared virtio SPI.
         crate::vm::wake_vcpu(0);
         unsafe {
             hvf::hv_gic_set_spi(35, true);
