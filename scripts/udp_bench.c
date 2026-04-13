@@ -303,6 +303,10 @@ int main(int argc, char **argv) {
 
     if (async_mode) {
         double send_rate = total_sent / max_elapsed;
+        // SENT line lets consumers compute delivery ratio directly
+        // instead of re-deriving it from the --rate target. Printed
+        // before RESULT so the parser sees both after one read.
+        printf("SENT %.0f\n", send_rate);
         printf("RESULT %.0f %ld %ld %ld\n", pps, p50, p99, p999);
         fprintf(stderr, "UDP echo (async): %d sender(s), %ds\n",
                 senders, duration);
