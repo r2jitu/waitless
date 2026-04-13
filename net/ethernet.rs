@@ -89,11 +89,3 @@ pub fn ethernet_parse(frame: &[u8]) -> Option<(u16, &[u8])> {
     let ethertype = hdr.ethertype;
     Some((u16::from_be(ethertype), &frame[HEADER_LEN..]))
 }
-
-/// Same as `ethernet_parse` but also returns the source MAC. Used by
-/// the receive path to seed the ARP fast-cache from any incoming
-/// frame, so the first reply doesn't pay an ARP resolve round-trip.
-pub fn ethernet_parse_full(frame: &[u8]) -> Option<(MacAddr, u16, &[u8])> {
-    let hdr = EthernetHeader::try_ref_from(frame)?;
-    Some((hdr.src, u16::from_be(hdr.ethertype), &frame[HEADER_LEN..]))
-}

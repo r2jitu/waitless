@@ -245,28 +245,6 @@ fn arp_request(target_ip: Ipv4Addr) {
     drivers::virtio_net::flush_tx_staging();
 }
 
-/// Snoop a peer's MAC from any received L2 frame with a usable
-/// (src_ip, src_mac) pair. Populates the per-core fast cache only
-/// — the slow cache stays filled exclusively from actual ARP
-/// replies — which gives us instant first-packet replies without
-/// ever firing an ARP request for peers that already talked to us.
-///
-/// The caller must ensure `src_ip` is in our subnet (off-subnet
-/// traffic comes from the gateway's MAC, not the IP's own MAC, so
-/// snooping that mapping would be wrong). In practice this is
-/// called from ipv4 receive with the Ethernet src MAC and the IP
-/// header's src IP after the subnet check.
-pub fn arp_learn(src_ip: Ipv4Addr, src_mac: MacAddr) {
-    if src_ip == Ipv4Addr::ANY
-        || src_ip == Ipv4Addr::BROADCAST
-        || src_mac == MacAddr::BROADCAST
-        || src_mac == MacAddr::ZERO
-    {
-        return;
-    }
-    arp_fast_store(src_ip, src_mac);
-}
-
 pub fn arp_receive(data: &[u8]) {
     let pkt = match ArpPacket::try_ref_from(data) {
         Some(p) => p,

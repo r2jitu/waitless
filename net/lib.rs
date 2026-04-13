@@ -192,7 +192,7 @@ fn distribute_frame(frame: &[u8]) {
     let num_cores = percpu::num_cores();
 
     // Parse enough of the frame to classify by protocol and flow.
-    if let Some((src_mac, ethertype, payload)) = ethernet::ethernet_parse_full(frame) {
+    if let Some((ethertype, payload)) = ethernet::ethernet_parse(frame) {
         match ethertype {
             ethernet::ETHERTYPE_ARP => {
                 // ARP: always core 0 (modifies shared ARP cache).
@@ -200,13 +200,6 @@ fn distribute_frame(frame: &[u8]) {
             }
             ethernet::ETHERTYPE_IPV4 => {
                 if let Some(pkt) = ipv4::ipv4_receive(payload) {
-                    // Snoop (src_ip, src_mac) into the ARP fast cache if
-                    // the peer is on our subnet. Avoids a blocking ARP
-                    // request on the first reply when the first packet
-                    // we see from a peer is an IPv4 datagram, not an ARP.
-                    if ipv4::same_subnet(pkt.src) {
-                        arp::arp_learn(pkt.src, src_mac);
-                    }
                     // Extract ports for flow hash (TCP and UDP both have ports at offset 0-3).
                     let (src_port, dst_port) = if pkt.payload.len() >= 4 {
                         (u16::from_be_bytes([pkt.payload[0], pkt.payload[1]]),
@@ -259,15 +252,11 @@ fn distribute_frame(frame: &[u8]) {
 /// Called on core 0 for single-core mode and ARP/TCP frames,
 /// and on any core for distributed frames via ap_poll.
 pub fn net_receive(frame: &[u8]) {
-    if let Some((src_mac, ethertype, payload)) = ethernet::ethernet_parse_full(frame) {
+    if let Some((ethertype, payload)) = ethernet::ethernet_parse(frame) {
         match ethertype {
             ethernet::ETHERTYPE_ARP => arp::arp_receive(payload),
             ethernet::ETHERTYPE_IPV4 => {
                 if let Some(pkt) = ipv4::ipv4_receive(payload) {
-                    // See the matching comment in `distribute_frame`.
-                    if ipv4::same_subnet(pkt.src) {
-                        arp::arp_learn(pkt.src, src_mac);
-                    }
                     match pkt.protocol {
                         ipv4::PROTO_TCP => tcp::tcp_receive(pkt.src, pkt.dst, pkt.payload),
                         ipv4::PROTO_UDP => udp::udp_receive(pkt.src, pkt.dst, pkt.payload),

@@ -55,17 +55,6 @@ const IP_ID_SLOTS: usize = kernel::percpu::MAX_CORES;
 static IP_ID_PERCORE: [IpIdSlot; IP_ID_SLOTS] =
     [const { IpIdSlot(core::sync::atomic::AtomicU16::new(0)) }; IP_ID_SLOTS];
 
-/// True if `ip` is in the same IPv4 subnet as our configured address.
-/// Used by receive-side ARP snooping: only snoop (src_ip, src_mac)
-/// pairs when the sender is on our LAN segment (off-subnet traffic's
-/// L2 src MAC is the gateway's, not the ip's own MAC).
-pub fn same_subnet(ip: Ipv4Addr) -> bool {
-    let mask = CONFIG.subnet_mask().addr;
-    if mask == 0 { return false; }
-    let our_ip = CONFIG.ip().addr;
-    (ip.addr & mask) == (our_ip & mask)
-}
-
 #[inline]
 fn next_ip_id() -> u16 {
     let core = kernel::cpu_id() as usize;
