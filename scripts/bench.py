@@ -242,7 +242,7 @@ def _udp_with_retry(port, senders, duration, host, async_mode, rate_per_sender=0
     return pps, p50, p99
 
 
-def udp_peak_rate(port, senders, host, threshold=0.99, probe_duration=2,
+def udp_peak_rate(port, senders, host, threshold=0.99, probe_duration=3,
                   start_rate=1000, max_rate=4_000_000):
     """Find the peak aggregate UDP echo rate that sustains ≥ `threshold`
     delivery, via exponential ramp + binary search.

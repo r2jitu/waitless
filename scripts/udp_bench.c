@@ -3,23 +3,20 @@
 // Two modes:
 //   1. Sync mode (default): N sender processes, each doing synchronous
 //      sendto/recvfrom. Measures round-trip latency and throughput.
-//   2. Async mode (--async): each sender process forks a child that
-//      does the blocking recv() loop, while the parent blasts sendto()
-//      in a tight loop. Split across processes so the send loop can't
-//      starve the recv loop on one CPU — the old single-process
-//      pthread model capped at ~75k recv/s because the send thread
-//      held a core and recvmsg() timed out for replies it could have
-//      drained if it had gotten scheduled. Shared memory carries the
-//      counters back to the parent.
+//   2. Async mode (--async): single process, single thread. N
+//      non-blocking sockets multiplexed via poll(). One loop drives
+//      all sends (paced or blast) and drains all replies — no fork,
+//      no pthread, no scheduler contention. Total client CPU is
+//      one core (vs the old fork-per-sender design which used 2N
+//      processes and scheduler-thrashed against the runner).
 //
 // Pacing:
-//   --rate=PPS   Throttle each async sender to PPS packets/sec. Models
-//                realistic concurrency: many clients each at a sustainable
-//                rate rather than a few blasting the server to oblivion.
-//                Without a rate cap the sender floods the runner and
-//                huge numbers of packets are dropped at the RX ring,
-//                making the reported recv rate a measure of overflow
-//                loss instead of steady-state server throughput.
+//   --rate=PPS   Throttle each async sender to PPS packets/sec. The
+//                aggregate offered load is `PPS * senders`. Without
+//                a rate cap senders blast as fast as the loop can
+//                send; the recv rate is then a measure of host-side
+//                drop cascade more than steady-state server capacity,
+//                so prefer paced runs for headline numbers.
 //
 // Build: cc -O2 -o udp_bench scripts/udp_bench.c -lpthread
 // Usage: udp_bench <port> <senders> <duration_sec> [--async] [--rate=PPS]
@@ -32,6 +29,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -129,115 +127,152 @@ static void run_sync(const char *host, int port, int duration, int collect_lat,
     close(fd);
 }
 
-// ── Async sender (pipelined: send process + recv child process) ──────────────
+// ── Async multi-socket sender (single process, single thread) ────────────────
 //
-// The previous design ran send and recv as two pthreads in one process. On
-// loopback, sendto() at 300k+ pps CPU-binds the send thread so thoroughly
-// that the recv thread rarely gets a scheduler slice — which manifests as
-// recv() blocking past the recv timeout and reporting far fewer replies
-// than were actually delivered. Splitting the recv loop into a child
-// process gives it its own CPU and eliminates the starvation.
+// All N senders run inside one event loop. Each sender owns a non-blocking
+// UDP socket. The loop:
+//   1. Computes how many packets *should* have been sent by now based on
+//      monotonic clock and aggregate target rate.
+//   2. Sends the deficit, distributing round-robin across sockets, capped
+//      at 64 per cycle so recv doesn't starve.
+//   3. poll()s all sockets (with a timeout sized to the next send deadline)
+//      and drains everything readable.
+// Total client cost: one CPU. The previous fork-per-sender design used 2N
+// processes (N senders + N recv children) and on a 4c bench config left
+// 16 client processes scheduler-thrashing with the runner — bench
+// numbers were dominated by client/runner CPU contention rather than
+// server throughput.
 
-/// Async child: drains replies in a tight blocking recv loop. Writes the
-/// running count into shared memory so the parent can read it. Exits when
-/// it sees SIGUSR1 from the parent (parent raises it after the send loop
-/// finishes and the reply buffer is drained).
-static volatile sig_atomic_t g_stop_recv = 0;
-static void async_recv_sigusr1(int _sig) { (void)_sig; g_stop_recv = 1; }
-
-static void async_recv_child(int fd, _Atomic long *received_out) {
-    struct sigaction sa = {0};
-    sa.sa_handler = async_recv_sigusr1;
-    sigaction(SIGUSR1, &sa, NULL);
-    char rbuf[256];
-    while (!g_stop_recv) {
-        ssize_t r = recv(fd, rbuf, sizeof(rbuf), 0);
-        if (r > 0) {
-            atomic_fetch_add_explicit(received_out, 1, memory_order_relaxed);
-        } else if (r < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
-    }
-    _exit(0);
+static double now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1e6 + (double)ts.tv_nsec / 1e3;
 }
 
-static void run_async(const char *host, int port, int duration, long rate_pps,
-                      struct result *out) {
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+static void drain_sockets(struct pollfd *pfds, int n_senders, long *received) {
+    char rbuf[256];
+    for (int i = 0; i < n_senders; i++) {
+        if (!(pfds[i].revents & POLLIN)) continue;
+        while (1) {
+            ssize_t r = recv(pfds[i].fd, rbuf, sizeof(rbuf), 0);
+            if (r <= 0) break;
+            received[i]++;
+        }
+        pfds[i].revents = 0;
+    }
+}
+
+/// Run async multi-sender benchmark in one process/thread.
+/// `rate_pps` is per-sender (0 = blast). Writes per-sender counters
+/// into `out_per_sender[0..n_senders]`.
+static void run_async_multi(const char *host, int port, int duration,
+                            int n_senders, long rate_pps,
+                            struct result *out_per_sender) {
     struct sockaddr_in dst = {0};
     if (resolve_host(host, port, &dst) != 0) {
         fprintf(stderr, "resolve_host(%s) failed\n", host);
-        close(fd);
         return;
     }
 
-    // Big socket buffers so bursts don't drop at either the send-queue
-    // egress or the reply ingress. 16 MB is ~100ms of 1500-byte packets
-    // at 100k pps, giving the drain loop room to breathe.
-    int bufsz = 16 * 1024 * 1024;
-    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof(bufsz));
-    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufsz, sizeof(bufsz));
+    int *fds = calloc(n_senders, sizeof(int));
+    long *sent = calloc(n_senders, sizeof(long));
+    long *received = calloc(n_senders, sizeof(long));
+    struct pollfd *pfds = calloc(n_senders, sizeof(struct pollfd));
+    if (!fds || !sent || !received || !pfds) { perror("calloc"); return; }
 
-    // Shared-memory counter the child writes to. We use _Atomic long so
-    // both processes see consistent updates without any extra locking.
-    _Atomic long *received = mmap(NULL, sizeof(_Atomic long),
-        PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
-    if (received == MAP_FAILED) { perror("mmap(recv counter)"); close(fd); return; }
-    atomic_store_explicit(received, 0, memory_order_relaxed);
-
-    pid_t recv_pid = fork();
-    if (recv_pid == 0) {
-        async_recv_child(fd, received);
-        _exit(0);
+    const int bufsz = 16 * 1024 * 1024;
+    for (int i = 0; i < n_senders; i++) {
+        fds[i] = socket(AF_INET, SOCK_DGRAM, 0);
+        if (fds[i] < 0) { perror("socket"); return; }
+        setsockopt(fds[i], SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof(bufsz));
+        setsockopt(fds[i], SOL_SOCKET, SO_RCVBUF, &bufsz, sizeof(bufsz));
+        int flags = fcntl(fds[i], F_GETFL, 0);
+        fcntl(fds[i], F_SETFL, flags | O_NONBLOCK);
+        // Bind to ephemeral so each sender has a distinct source port —
+        // that's what gives the runner's software RSS / KVM's tap RSS
+        // something to hash on.
+        struct sockaddr_in src = {0};
+        src.sin_family = AF_INET;
+        src.sin_port = 0;
+        src.sin_addr.s_addr = htonl(INADDR_ANY);
+        bind(fds[i], (struct sockaddr *)&src, sizeof(src));
+        pfds[i].fd = fds[i];
+        pfds[i].events = POLLIN;
     }
 
-    char buf[64] = "bench";
-    long sent = 0;
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    double t0_s = t0.tv_sec + t0.tv_nsec / 1e9;
-    double end = t0_s + duration;
-    // Nanoseconds per packet when pacing is enabled. rate_pps <= 0 → no cap.
-    const double ns_per_pkt = (rate_pps > 0) ? (1e9 / (double)rate_pps) : 0.0;
+    const long total_rate = (rate_pps > 0) ? (long)rate_pps * n_senders : 0;
+    const double start = now_us();
+    const double end = start + (double)duration * 1e6;
+    char sbuf[64] = "bench";
+    long total_sent = 0;
+    int rr = 0;
 
     while (1) {
-        sendto(fd, buf, 5, 0, (struct sockaddr *)&dst, sizeof(dst));
-        sent++;
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        double now_s = t1.tv_sec + t1.tv_nsec / 1e9;
-        if (now_s >= end) break;
-        if (ns_per_pkt > 0.0) {
-            // Target time for packet N+1 = t0 + (N+1) * ns_per_pkt. If we're
-            // ahead of schedule, sleep; if we're behind, keep going.
-            double target = t0_s + ((double)(sent + 1)) * ns_per_pkt / 1e9;
-            double delta_s = target - now_s;
-            if (delta_s > 0.0) {
-                if (delta_s > 0.001) usleep((useconds_t)(delta_s * 1e6));
-                // For sub-ms sleeps, busy-wait to hit the target more exactly.
-                else while (1) {
-                    struct timespec ts;
-                    clock_gettime(CLOCK_MONOTONIC, &ts);
-                    double s = ts.tv_sec + ts.tv_nsec / 1e9;
-                    if (s >= target) break;
-                }
+        double now = now_us();
+        if (now >= end) break;
+
+        // Compute how many packets should have been sent by now.
+        long target;
+        if (total_rate > 0) {
+            target = (long)((now - start) * (double)total_rate / 1e6);
+        } else {
+            // Blast mode: keep sending up to 64 per cycle, drain in between.
+            target = total_sent + 64;
+        }
+
+        // Send the deficit, capped per cycle so we don't starve recv.
+        int burst = 0;
+        while (total_sent < target && burst < 64) {
+            ssize_t r = sendto(fds[rr], sbuf, 5, 0,
+                               (struct sockaddr *)&dst, sizeof(dst));
+            if (r > 0) {
+                sent[rr]++;
+                total_sent++;
+            } else if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                // Send buffer full on this socket; try the next one.
             }
+            rr = (rr + 1) % n_senders;
+            burst++;
+        }
+
+        // Compute poll timeout: how long until the next send is due, in ms.
+        int timeout_ms = 0;
+        if (total_rate > 0 && total_sent >= target) {
+            double next_us = start + ((double)(total_sent + 1) * 1e6
+                                       / (double)total_rate);
+            double dt = next_us - now;
+            if (dt > 1000.0) {
+                timeout_ms = (int)(dt / 1000.0);
+                if (timeout_ms > 50) timeout_ms = 50;
+            }
+        }
+
+        if (poll(pfds, n_senders, timeout_ms) > 0) {
+            drain_sockets(pfds, n_senders, received);
         }
     }
 
-    // Let replies drain, then stop the child.
-    usleep(100000);
-    kill(recv_pid, SIGUSR1);
-    int status;
-    waitpid(recv_pid, &status, 0);
+    // Final drain: wait up to ~100ms for in-flight replies.
+    double drain_until = now_us() + 100000.0;
+    while (now_us() < drain_until) {
+        if (poll(pfds, n_senders, 10) > 0) {
+            drain_sockets(pfds, n_senders, received);
+        }
+    }
 
-    out->elapsed = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
-    out->sent = sent;
-    out->count = atomic_load_explicit(received, memory_order_relaxed);
-    memset(out->buckets, 0, sizeof(out->buckets));
-    out->overflow = 0;
-    munmap((void *)received, sizeof(_Atomic long));
-    close(fd);
+    const double elapsed_s = (now_us() - start) / 1e6;
+    for (int i = 0; i < n_senders; i++) {
+        out_per_sender[i].count = received[i];
+        out_per_sender[i].sent = sent[i];
+        out_per_sender[i].elapsed = elapsed_s;
+        memset(out_per_sender[i].buckets, 0, sizeof(out_per_sender[i].buckets));
+        out_per_sender[i].overflow = 0;
+        close(fds[i]);
+    }
+    free(pfds);
+    free(received);
+    free(sent);
+    free(fds);
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -272,19 +307,23 @@ int main(int argc, char **argv) {
     if (results == MAP_FAILED) { perror("mmap"); return 1; }
     memset(results, 0, shm_size);
 
-    pid_t pids[64];
-    for (int i = 0; i < senders; i++) {
-        pids[i] = fork();
-        if (pids[i] == 0) {
-            if (async_mode)
-                run_async(host, port, duration, rate_pps, &results[i]);
-            else
+    if (async_mode) {
+        // Single process, single thread, N non-blocking sockets.
+        run_async_multi(host, port, duration, senders, rate_pps, results);
+    } else {
+        // Sync mode: fork-per-sender so each sender's blocking
+        // sendto/recvfrom doesn't serialise with the others.
+        pid_t pids[64];
+        for (int i = 0; i < senders; i++) {
+            pids[i] = fork();
+            if (pids[i] == 0) {
                 run_sync(host, port, duration, i == 0, &results[i]);
-            _exit(0);
+                _exit(0);
+            }
         }
+        for (int i = 0; i < senders; i++)
+            waitpid(pids[i], NULL, 0);
     }
-    for (int i = 0; i < senders; i++)
-        waitpid(pids[i], NULL, 0);
 
     long total_recv = 0, total_sent = 0;
     double max_elapsed = 0;
