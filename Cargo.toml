@@ -38,6 +38,12 @@ bitflags = { version = "2", default-features = false }
 fdt = { version = "0.1.5", default-features = false }
 limine = { version = "0.5.0", default-features = false }
 
+# Warnings are errors for every workspace member's cargo-standalone
+# build. Bazel builds get the same policy via the `-Dwarnings` flag in
+# `.bazelrc`'s `extra_rustc_flags`, so CI and IDE behaviour match.
+[workspace.lints.rust]
+warnings = "deny"
+
 # Profiles must live at the workspace root, not in member crates.
 # Single-purpose, single-process tools — small/fast/abort-on-panic.
 [profile.release]

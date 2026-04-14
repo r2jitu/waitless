@@ -14,5 +14,10 @@ path = "src/main.rs"
 libc = { workspace = true }
 vm-fdt = { workspace = true }
 
+# Inherit `warnings = "deny"` from the workspace root. Bazel builds
+# get the same via `-Dwarnings` in .bazelrc.
+[lints]
+workspace = true
+
 # `[profile.*]` lives in the workspace root Cargo.toml — it would
 # only be ignored here.

@@ -15,9 +15,6 @@
 //                             -p tcp:8080:80 -p udp:18080:7
 //   -h, --help            Show usage
 
-// Warnings are errors — no stale dead code or unused imports sneak past CI.
-#![deny(warnings)]
-
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 
