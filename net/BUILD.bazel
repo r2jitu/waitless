@@ -163,6 +163,48 @@ rust_test(
     rustc_flags = ["-Cpanic=unwind"],
 )
 
+# TLS 1.3 record layer: wraps plaintext records in TLSCiphertext using
+# //net:tls's TrafficKey (AEAD seal/open with per-sequence nonce).
+# Pure protocol logic — no I/O, no state beyond what the caller owns.
+rust_library(
+    name = "tls_record",
+    srcs = ["tls_record.rs"],
+    crate_root = "tls_record.rs",
+    crate_name = "net_tls_record",
+    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    deps = [
+        ":tls",
+        ":tls_crypto",
+    ],
+)
+
+# NOTE: no tls_record_test — same panic-strategy conflict as //net:tls.
+# Coverage will come from the end-to-end //apps/test_tls integration
+# test once the server state machine lands.
+
+# TLS 1.3 server-side handshake state machine. Ties together
+# //net:tls_handshake (message framing), //net:tls_record (AEAD
+# record layer), //net:tls (key schedule) and RustCrypto primitives
+# (sha2 / hmac / ed25519-dalek) to drive a sans-io handshake from
+# ClientHello to Established.
+rust_library(
+    name = "tls_server",
+    srcs = ["tls_server.rs"],
+    crate_root = "tls_server.rs",
+    crate_name = "net_tls_server",
+    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    deps = [
+        ":tls",
+        ":tls_crypto",
+        ":tls_handshake",
+        ":tls_record",
+        "//kernel",
+        "@crates//:ed25519-dalek",
+        "@crates//:hmac",
+        "@crates//:sha2",
+    ],
+)
+
 # TLS 1.3 sans-io core: key schedule, HKDF-Expand-Label, transcript,
 # X25519 wrapper, AEAD glue. Uses RustCrypto sha2/hmac/hkdf + our own
 # tls_crypto for the record AEAD. Shared by the TLS-over-TCP server
@@ -222,6 +264,7 @@ rust_library(
         ":tcp",
         ":udp",
         ":dhcp",
+        ":tls_server",
         "//drivers",
         "//kernel",
     ],

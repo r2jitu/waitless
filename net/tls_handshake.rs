@@ -16,18 +16,23 @@
 // responsible for record layer framing (TLSPlaintext / TLSCiphertext)
 // and for piping bytes into and out of the TCP stream.
 //
-// Scope of this first cut:
+// Scope:
 // - Handshake message header encode/decode
-// - `ClientHello` parser: legacy fields + the three TLS 1.3 extensions
-//   we actually need (supported_versions, key_share, supported_groups).
+// - `ClientHello` parser: legacy fields + the TLS 1.3 extensions we need
+//   (supported_versions, key_share, supported_groups).
 // - `ServerHello` builder for TLS_CHACHA20_POLY1305_SHA256 + X25519.
+// - `EncryptedExtensions`, `Certificate`, `CertificateVerify`, `Finished`
+//   builders covering the server side of the TLS 1.3 handshake.
+// - `Finished` parser for client's response.
 //
 // Explicitly out of scope (future work):
-// - EncryptedExtensions / Certificate / CertificateVerify / Finished
-// - signature_algorithms extension parsing
+// - signature_algorithms extension parsing / enforcement (we unconditionally
+//   pick Ed25519 since that's what our dev cert uses)
 // - Pre-shared key / 0-RTT extensions
 // - Session tickets / resumption
 // - Alert record format
+// - X.509 DER parsing beyond "treat the cert as an opaque byte blob to
+//   include in Certificate.certificate_list"
 
 #![no_std]
 
@@ -70,12 +75,23 @@ pub mod cipher_suite {
     pub const TLS_CHACHA20_POLY1305_SHA256: u16 = 0x1303;
 }
 
+/// SignatureScheme values from RFC 8446 §4.2.3. We only implement one.
+pub mod sig_scheme {
+    /// Ed25519 signatures. Used by our dev cert in CertificateVerify.
+    pub const ED25519: u16 = 0x0807;
+}
+
 /// TLS 1.2 legacy_version value used in the outer ClientHello /
 /// ServerHello header for middlebox compatibility.
 pub const LEGACY_VERSION_TLS12: u16 = 0x0303;
 
 /// The real version, as advertised in `supported_versions`.
 pub const VERSION_TLS13: u16 = 0x0304;
+
+/// TLS 1.3 uses SHA-256 as its transcript hash for every cipher suite
+/// we support (`TLS_CHACHA20_POLY1305_SHA256`). All code that needs a
+/// transcript digest should assume 32-byte outputs.
+pub const HASH_LEN: usize = 32;
 
 // ============================================================================
 // Handshake framing
@@ -370,6 +386,172 @@ pub fn build_server_hello(
 }
 
 // ============================================================================
+// EncryptedExtensions builder (RFC 8446 §4.3.1)
+// ============================================================================
+
+/// Build an EncryptedExtensions message body. For our use case the
+/// extensions list is empty — we don't negotiate ALPN, SNI, early data,
+/// supported_groups_in_eerror, or any of the other things that go here.
+/// An empty body is just `[0x00, 0x00]` (u16 extensions_length = 0).
+///
+/// Returns the number of bytes written. `out` must have at least 2 bytes.
+pub fn build_encrypted_extensions(out: &mut [u8]) -> Option<usize> {
+    if out.len() < 2 {
+        return None;
+    }
+    // Extensions length = 0.
+    out[0] = 0;
+    out[1] = 0;
+    Some(2)
+}
+
+// ============================================================================
+// Certificate builder (RFC 8446 §4.4.2)
+// ============================================================================
+
+/// Build a TLS 1.3 `Certificate` message body with a single cert entry.
+///
+/// Wire format:
+/// ```text
+/// struct {
+///     opaque certificate_request_context<0..2^8-1>;
+///     CertificateEntry certificate_list<0..2^24-1>;
+/// } Certificate;
+///
+/// struct {
+///     opaque cert_data<1..2^24-1>;   /* X.509 DER */
+///     Extension extensions<0..2^16-1>; /* empty for us */
+/// } CertificateEntry;
+/// ```
+///
+/// `cert_der` is the single X.509 DER cert we're sending. We don't support
+/// cert chains in this first cut — if the client needs intermediates they
+/// must already trust the leaf directly (self-signed dev cert case).
+///
+/// Returns the number of bytes written. The layout is deterministic so
+/// the caller can predict the total size as:
+///   1 (ctx len=0) + 3 (list len) + 3 (cert len) + cert_der.len() + 2 (ext len=0)
+pub fn build_certificate(cert_der: &[u8], out: &mut [u8]) -> Option<usize> {
+    let entry_len = 3 + cert_der.len() + 2; // cert_len(3) + cert_der + ext_len(2)
+    let total = 1 + 3 + entry_len; // ctx_len(1) + list_len(3) + entry
+    if out.len() < total || cert_der.len() > 0xff_ffff {
+        return None;
+    }
+
+    let mut p = 0;
+    // certificate_request_context: 0 bytes
+    out[p] = 0;
+    p += 1;
+    // certificate_list length (uint24, big-endian)
+    out[p] = ((entry_len >> 16) & 0xff) as u8;
+    out[p + 1] = ((entry_len >> 8) & 0xff) as u8;
+    out[p + 2] = (entry_len & 0xff) as u8;
+    p += 3;
+    // CertificateEntry: cert_data length (uint24)
+    out[p] = ((cert_der.len() >> 16) & 0xff) as u8;
+    out[p + 1] = ((cert_der.len() >> 8) & 0xff) as u8;
+    out[p + 2] = (cert_der.len() & 0xff) as u8;
+    p += 3;
+    // cert_data
+    out[p..p + cert_der.len()].copy_from_slice(cert_der);
+    p += cert_der.len();
+    // extensions (u16 length = 0)
+    out[p] = 0;
+    out[p + 1] = 0;
+    p += 2;
+
+    debug_assert_eq!(p, total);
+    Some(p)
+}
+
+// ============================================================================
+// CertificateVerify builder (RFC 8446 §4.4.3)
+// ============================================================================
+
+/// The "content to sign" for the server's CertificateVerify message.
+/// RFC 8446 §4.4.3 specifies:
+///
+///     64 bytes of 0x20 | "TLS 1.3, server CertificateVerify" | 0x00 | transcript_hash
+///
+/// Returns the exact bytes that must be fed into the signature function.
+/// Output length = 64 + 33 + 1 + HASH_LEN = 130.
+pub fn sign_content_server_cert_verify(
+    transcript_hash: &[u8; HASH_LEN],
+    out: &mut [u8; 130],
+) {
+    // 64 bytes of 0x20 padding
+    out[0..64].fill(0x20);
+    // Context string — exactly as quoted in the RFC.
+    let ctx = b"TLS 1.3, server CertificateVerify";
+    out[64..64 + ctx.len()].copy_from_slice(ctx);
+    debug_assert_eq!(ctx.len(), 33);
+    // Separator byte 0x00
+    out[64 + 33] = 0x00;
+    // Transcript hash
+    out[64 + 33 + 1..].copy_from_slice(transcript_hash);
+}
+
+/// Build a CertificateVerify message body from a pre-computed Ed25519
+/// signature over `sign_content_server_cert_verify(...)`.
+///
+/// Wire format:
+/// ```text
+/// struct {
+///     SignatureScheme algorithm;      /* u16 */
+///     opaque signature<0..2^16-1>;    /* 64 bytes for Ed25519 */
+/// } CertificateVerify;
+/// ```
+///
+/// Caller is responsible for actually computing the signature (we don't
+/// want this module to depend on `ed25519-dalek`; that's `//net:tls_server`'s
+/// job).
+pub fn build_certificate_verify(
+    signature: &[u8],
+    out: &mut [u8],
+) -> Option<usize> {
+    let total = 2 + 2 + signature.len();
+    if out.len() < total || signature.len() > 0xffff {
+        return None;
+    }
+    out[0..2].copy_from_slice(&sig_scheme::ED25519.to_be_bytes());
+    out[2..4].copy_from_slice(&(signature.len() as u16).to_be_bytes());
+    out[4..4 + signature.len()].copy_from_slice(signature);
+    Some(total)
+}
+
+// ============================================================================
+// Finished builder + parser (RFC 8446 §4.4.4)
+// ============================================================================
+
+/// Build a Finished message body. The body IS the verify_data — there's
+/// no extra framing inside a Finished message.
+///
+/// Caller computes `verify_data = HMAC(finished_key, transcript_hash)`
+/// and passes it here. For `TLS_CHACHA20_POLY1305_SHA256` (our only suite)
+/// the output is 32 bytes (SHA-256 HMAC).
+pub fn build_finished(verify_data: &[u8], out: &mut [u8]) -> Option<usize> {
+    let n = verify_data.len();
+    if out.len() < n {
+        return None;
+    }
+    out[..n].copy_from_slice(verify_data);
+    Some(n)
+}
+
+/// Parse a Finished message body. Simply exposes the verify_data bytes
+/// so the caller can constant-time-compare them against the expected
+/// HMAC.
+pub fn parse_finished(body: &[u8]) -> Result<&[u8], ParseError> {
+    // TLS 1.3 Finished has no inner framing — the whole body is
+    // verify_data. Length must equal the HMAC output (HASH_LEN for
+    // SHA-256 suites).
+    if body.len() != HASH_LEN {
+        return Err(ParseError::BadLength);
+    }
+    Ok(body)
+}
+
+// ============================================================================
 // Small byte reader helper
 // ============================================================================
 
@@ -559,5 +741,91 @@ mod tests {
     fn parse_client_hello_rejects_truncated() {
         let buf = [0x03, 0x03, 0xaa]; // 3 bytes, nowhere near enough
         assert!(ClientHello::parse(&buf).is_err());
+    }
+
+    #[test]
+    fn encrypted_extensions_is_empty_extension_list() {
+        let mut out = [0u8; 8];
+        let n = build_encrypted_extensions(&mut out).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(&out[..n], &[0x00, 0x00]);
+    }
+
+    #[test]
+    fn certificate_single_entry_layout() {
+        // 10-byte fake cert DER.
+        let cert_der = [
+            0xde, 0xad, 0xbe, 0xef, 0xfe, 0xed, 0xfa, 0xce, 0x00, 0x01,
+        ];
+        let mut out = [0u8; 64];
+        let n = build_certificate(&cert_der, &mut out).unwrap();
+
+        // Expected: ctx_len(1) + list_len(3) + cert_len(3) + cert(10) + ext_len(2) = 19
+        assert_eq!(n, 19);
+        // certificate_request_context length = 0
+        assert_eq!(out[0], 0);
+        // certificate_list length = 15 (3 cert_len + 10 cert + 2 ext)
+        assert_eq!(&out[1..4], &[0, 0, 15]);
+        // cert_data length = 10
+        assert_eq!(&out[4..7], &[0, 0, 10]);
+        // cert_data
+        assert_eq!(&out[7..17], &cert_der[..]);
+        // extensions length = 0
+        assert_eq!(&out[17..19], &[0, 0]);
+    }
+
+    #[test]
+    fn certificate_verify_layout_for_ed25519() {
+        // Fake 64-byte Ed25519 signature (all 0x11).
+        let sig = [0x11u8; 64];
+        let mut out = [0u8; 128];
+        let n = build_certificate_verify(&sig, &mut out).unwrap();
+
+        // algorithm(2) + sig_len(2) + sig(64) = 68
+        assert_eq!(n, 68);
+        // algorithm = Ed25519 = 0x0807
+        assert_eq!(&out[0..2], &[0x08, 0x07]);
+        // signature length = 64
+        assert_eq!(&out[2..4], &[0x00, 0x40]);
+        // signature bytes
+        assert_eq!(&out[4..68], &sig[..]);
+    }
+
+    #[test]
+    fn cert_verify_sign_content_matches_rfc8446() {
+        // RFC 8446 §4.4.3: the content to sign is
+        //   64 * 0x20 | "TLS 1.3, server CertificateVerify" | 0x00 | transcript_hash
+        let transcript = [0x42u8; HASH_LEN];
+        let mut content = [0u8; 130];
+        sign_content_server_cert_verify(&transcript, &mut content);
+
+        // First 64 bytes are all 0x20.
+        assert!(content[..64].iter().all(|&b| b == 0x20));
+        // Next 33 bytes are the context string.
+        assert_eq!(&content[64..97], b"TLS 1.3, server CertificateVerify");
+        // Separator byte.
+        assert_eq!(content[97], 0x00);
+        // Transcript hash.
+        assert_eq!(&content[98..130], &transcript[..]);
+    }
+
+    #[test]
+    fn finished_build_and_parse_roundtrip() {
+        let verify_data = [0x55u8; HASH_LEN];
+        let mut out = [0u8; 64];
+        let n = build_finished(&verify_data, &mut out).unwrap();
+        assert_eq!(n, HASH_LEN);
+        assert_eq!(&out[..n], &verify_data[..]);
+
+        let parsed = parse_finished(&out[..n]).unwrap();
+        assert_eq!(parsed, &verify_data[..]);
+    }
+
+    #[test]
+    fn finished_parse_rejects_wrong_length() {
+        // Short
+        assert!(parse_finished(&[0u8; 16]).is_err());
+        // Long
+        assert!(parse_finished(&[0u8; 64]).is_err());
     }
 }

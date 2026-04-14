@@ -23,6 +23,7 @@ pub extern crate net_ipv4 as ipv4;
 pub extern crate net_tcp as tcp;
 pub extern crate net_udp as udp;
 pub extern crate net_dhcp as dhcp;
+pub extern crate net_tls_server as tls_server;
 
 use kernel::percpu;
 

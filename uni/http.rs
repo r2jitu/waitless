@@ -8,9 +8,36 @@
 // own active connection set. Core 0 runs the main event loop; APs run
 // HTTP service via the percpu ap_poll hook. Routes are shared (read-only).
 //
-// All buffers are fixed-size, stack/static allocated. No heap.
+// HTTPS: `Server::run_tls(port, config)` wraps each accepted connection
+// in a `net_tls_server::TlsServer`. The service loop funnels incoming
+// TCP bytes through the TLS state machine, feeds decrypted plaintext
+// into the same HTTP parser, encrypts responses back out. From the
+// request-handler's perspective nothing changes — the `Request` and
+// `Response` types are identical.
 
 use crate::{TcpListener, TcpStream};
+
+// Re-export the TLS config type so apps can write `uni::http::TlsServerConfig`
+// without caring which platform they're on. On the unikernel platform this
+// is the real type from `//net:tls_server`; on native it's a lightweight
+// stub (TLS isn't wired up for the POSIX backend).
+#[cfg(platform_unikernel)]
+pub use net::tls_server::TlsServerConfig;
+
+/// Native-build stub for `TlsServerConfig`. Apps can construct it but
+/// `run_tls()` on native ignores the config and falls back to plain HTTP.
+#[cfg(platform_native)]
+pub struct TlsServerConfig {
+    pub cert_der: &'static [u8],
+    pub signing_seed: [u8; 32],
+}
+
+#[cfg(platform_native)]
+impl TlsServerConfig {
+    pub fn from_dev_cert(cert_der: &'static [u8], _pkcs8_key: &[u8]) -> Option<Self> {
+        Some(TlsServerConfig { cert_der, signing_seed: [0u8; 32] })
+    }
+}
 
 // ---- HTTP types -------------------------------------------------------------
 
@@ -178,6 +205,12 @@ struct ActiveConn {
     /// arrives. Reset to 0 on activity. Used to close stale connections
     /// and reclaim slots (prevents pool exhaustion from abandoned clients).
     idle_ticks: u32,
+    /// Per-connection TLS state (when the server is in HTTPS mode).
+    /// `None` for plain HTTP connections. Unikernel-only because the
+    /// TLS 1.3 state machine lives in `//net:tls_server`, which isn't
+    /// available on the native POSIX build.
+    #[cfg(platform_unikernel)]
+    tls: Option<crate::Box<net::tls_server::TlsServer>>,
 }
 
 /// Close idle connections after this many service ticks with no data.
@@ -191,6 +224,8 @@ impl ActiveConn {
             buf: crate::Buffer::new(BUF_SIZE),
             buf_len: 0,
             idle_ticks: 0,
+            #[cfg(platform_unikernel)]
+            tls: None,
         }
     }
 }
@@ -225,6 +260,14 @@ static SERVER_PTR: core::sync::atomic::AtomicPtr<Server> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 // Listen port (needed by native worker threads to create SO_REUSEPORT listeners).
 static LISTEN_PORT: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
+
+// TLS server configuration, published by `run_tls()`. None = plain HTTP.
+// A raw pointer because `TlsServerConfig` isn't Send+Sync in the generic
+// sense and we never form an `&mut`; readers dereference with Acquire
+// and only read the immutable cert/key bytes.
+#[cfg(platform_unikernel)]
+static TLS_CONFIG_PTR: core::sync::atomic::AtomicPtr<net::tls_server::TlsServerConfig> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
 impl Server {
     /// Allocate a `Server`, including its per-connection receive buffers,
@@ -294,16 +337,63 @@ impl Server {
         // and native.rs::main() handles thread management.
     }
 
+    /// Start listening on `port` with TLS 1.3 wrapping for every
+    /// accepted connection. The same HTTP routes apply — clients see
+    /// an HTTPS endpoint, handlers see a `Request` / `Response` the
+    /// same way they would for plain HTTP.
+    ///
+    /// `config` must outlive the server. Typically constructed from
+    /// a `include_bytes!`-baked dev cert + PKCS#8 key (see
+    /// `apps/webserver/dev_certs/`) and `Box::leak`-ed to get a
+    /// `&'static TlsServerConfig`.
+    ///
+    /// Unikernel-only; on native, TLS is not currently supported and
+    /// this function falls through to plain `run()`.
+    #[cfg(platform_unikernel)]
+    pub fn run_tls(&mut self, port: u16, config: &'static TlsServerConfig) {
+        // Publish the config pointer so the per-connection accept
+        // path can find it. `config` is `'static`, so the cast is
+        // sound for the program's lifetime.
+        TLS_CONFIG_PTR.store(
+            config as *const _ as *mut _,
+            core::sync::atomic::Ordering::Release,
+        );
+        self.listen(port);
+        crate::set_ready();
+    }
+
+    #[cfg(platform_native)]
+    pub fn run_tls(&mut self, port: u16, _config: &'static TlsServerConfig) {
+        crate::log(b"http: run_tls() not supported on native; falling back to plain HTTP\n");
+        self.run(port);
+    }
+
     /// Service connections for a specific core. Returns true if any work was done.
     fn service_core(&mut self, core_id: u32) -> bool {
         let mut had_work = false;
 
-        // Accept new connections
+        // Accept new connections. When the server is in TLS mode, each
+        // accepted TcpStream also gets a freshly-allocated TlsServer
+        // with a random X25519 ephemeral keypair. Construction costs
+        // ~13 KB of stack while we initialise the state machine before
+        // moving it into the heap via `crate::Box`.
         if let Some(listener) = self.cores[core_id as usize].listener {
             while let Some(stream) = listener.accept() {
                 had_work = true;
                 if let Some(ac) = alloc_active(&mut self.cores[core_id as usize].active) {
                     ac.conn = Some(stream);
+                    #[cfg(platform_unikernel)]
+                    {
+                        let tls_cfg_ptr =
+                            TLS_CONFIG_PTR.load(core::sync::atomic::Ordering::Acquire);
+                        if !tls_cfg_ptr.is_null() {
+                            let mut seed = [0u8; 32];
+                            kernel::rng::fill_bytes(&mut seed);
+                            ac.tls = Some(crate::Box::new(
+                                net::tls_server::TlsServer::new(seed),
+                            ));
+                        }
+                    }
                 } else {
                     crate::log(b"http: too many connections, dropping\n");
                     stream.close();
@@ -325,18 +415,36 @@ impl Server {
                 self.cores[core_id as usize].active[i].conn = None;
                 self.cores[core_id as usize].active[i].buf_len = 0;
                 self.cores[core_id as usize].active[i].idle_ticks = 0;
+                #[cfg(platform_unikernel)]
+                { self.cores[core_id as usize].active[i].tls = None; }
                 had_work = true;
                 continue;
             }
 
+            // ── Read from TCP. TLS path funnels bytes through the ──
+            // state machine; plain path goes direct to `buf`.
             if conn.has_data() {
-                let buf_len = self.cores[core_id as usize].active[i].buf_len;
-                let avail = BUF_SIZE - buf_len;
-                if avail > 0 {
-                    let got = conn.recv(&mut self.cores[core_id as usize].active[i].buf[buf_len..buf_len + avail]);
-                    self.cores[core_id as usize].active[i].buf_len += got;
-                    self.cores[core_id as usize].active[i].idle_ticks = 0;
-                    had_work = true;
+                had_work = true;
+                self.cores[core_id as usize].active[i].idle_ticks = 0;
+                #[cfg(platform_unikernel)]
+                let is_tls =
+                    self.cores[core_id as usize].active[i].tls.is_some();
+                #[cfg(platform_native)]
+                let is_tls = false;
+
+                if is_tls {
+                    #[cfg(platform_unikernel)]
+                    self.tls_ingest(core_id, i, conn);
+                } else {
+                    let buf_len = self.cores[core_id as usize].active[i].buf_len;
+                    let avail = BUF_SIZE - buf_len;
+                    if avail > 0 {
+                        let got = conn.recv(
+                            &mut self.cores[core_id as usize].active[i].buf
+                                [buf_len..buf_len + avail],
+                        );
+                        self.cores[core_id as usize].active[i].buf_len += got;
+                    }
                 }
             } else {
                 // No data — bump idle counter and close if stale.
@@ -347,6 +455,8 @@ impl Server {
                     self.cores[core_id as usize].active[i].conn = None;
                     self.cores[core_id as usize].active[i].buf_len = 0;
                     self.cores[core_id as usize].active[i].idle_ticks = 0;
+                    #[cfg(platform_unikernel)]
+                    { self.cores[core_id as usize].active[i].tls = None; }
                     continue;
                 }
             }
@@ -367,7 +477,7 @@ impl Server {
                         None => Response::not_found(),
                     };
 
-                    send_response(conn, &resp, !want_close);
+                    self.send_response_via(core_id, i, conn, &resp, !want_close);
                     self.cores[core_id as usize].active[i].idle_ticks = 0;
                     had_work = true;
 
@@ -376,6 +486,8 @@ impl Server {
                         self.cores[core_id as usize].active[i].conn = None;
                         self.cores[core_id as usize].active[i].buf_len = 0;
                         self.cores[core_id as usize].active[i].idle_ticks = 0;
+                        #[cfg(platform_unikernel)]
+                        { self.cores[core_id as usize].active[i].tls = None; }
                     } else {
                         let remaining = buf_len - consumed;
                         if remaining > 0 {
@@ -387,11 +499,121 @@ impl Server {
                     conn.close();
                     self.cores[core_id as usize].active[i].conn = None;
                     self.cores[core_id as usize].active[i].buf_len = 0;
+                    #[cfg(platform_unikernel)]
+                    { self.cores[core_id as usize].active[i].tls = None; }
                 }
             }
         }
 
         had_work
+    }
+
+    /// Ingest TLS bytes from TCP for a single connection: read raw
+    /// bytes from the socket, push them through the TLS state machine,
+    /// drain any outbound TLS bytes the state machine produced back to
+    /// the socket, and copy any plaintext the state machine decrypted
+    /// into the per-connection `buf` for the HTTP parser to consume.
+    ///
+    /// Only called when the connection is known to be in TLS mode.
+    #[cfg(platform_unikernel)]
+    fn tls_ingest(&mut self, core_id: u32, conn_idx: usize, conn: TcpStream) {
+        // Need an owned pointer to the TlsServerConfig. It's 'static.
+        let tls_cfg_ptr = TLS_CONFIG_PTR.load(core::sync::atomic::Ordering::Acquire);
+        if tls_cfg_ptr.is_null() {
+            return;
+        }
+        // SAFETY: pointer is stored by run_tls() before listen() is
+        // called, and points at a caller-owned 'static config.
+        let tls_cfg: &'static net::tls_server::TlsServerConfig = unsafe { &*tls_cfg_ptr };
+
+        let ac = &mut self.cores[core_id as usize].active[conn_idx];
+        let Some(tls) = ac.tls.as_mut() else { return; };
+
+        // Pull raw bytes off TCP into the TLS state machine. Loop to
+        // drain the kernel TCP buffer in one go.
+        let mut tmp = [0u8; 2048];
+        loop {
+            let got = conn.recv(&mut tmp);
+            if got == 0 {
+                break;
+            }
+            tls.push_rx(&tmp[..got]);
+        }
+
+        // Advance the state machine as far as possible.
+        if tls.advance(tls_cfg).is_err() {
+            // Fatal handshake failure — drop the connection.
+            conn.close();
+            ac.conn = None;
+            ac.buf_len = 0;
+            ac.idle_ticks = 0;
+            ac.tls = None;
+            return;
+        }
+
+        // Drain outgoing TLS bytes the state machine produced (server
+        // flight during handshake, or encrypted responses during
+        // application data phase).
+        let mut out = [0u8; 2048];
+        loop {
+            let n = tls.pop_tx(&mut out);
+            if n == 0 {
+                break;
+            }
+            conn.send(&out[..n]);
+        }
+
+        // Copy any decrypted plaintext into the HTTP parse buffer.
+        // `buf` is shared with the plain-HTTP path and holds HTTP
+        // request bytes regardless of whether they arrived over TLS.
+        let space = BUF_SIZE - ac.buf_len;
+        if space > 0 {
+            let start = ac.buf_len;
+            let n = tls.pop_plaintext(&mut ac.buf[start..start + space]);
+            ac.buf_len += n;
+        }
+    }
+
+    /// Send `resp` on `conn`, routing through TLS if the connection
+    /// has an active `TlsServer`. The plain-HTTP path preserves the
+    /// original `send_response(conn, &resp, keep_alive)` shape.
+    fn send_response_via(
+        &mut self,
+        core_id: u32,
+        conn_idx: usize,
+        conn: TcpStream,
+        resp: &Response,
+        keep_alive: bool,
+    ) {
+        #[cfg(platform_unikernel)]
+        {
+            let ac = &mut self.cores[core_id as usize].active[conn_idx];
+            if let Some(tls) = ac.tls.as_mut() {
+                // Build the HTTP response into a temporary stack
+                // buffer, then feed it to TLS as application data.
+                let mut w = BufWriter::new();
+                write_response_into(&mut w, resp, keep_alive);
+                if tls.send_app_data(w.as_bytes()).is_err() {
+                    conn.close();
+                    ac.conn = None;
+                    ac.buf_len = 0;
+                    ac.tls = None;
+                    return;
+                }
+                let mut out = [0u8; 2048];
+                loop {
+                    let n = tls.pop_tx(&mut out);
+                    if n == 0 {
+                        break;
+                    }
+                    conn.send(&out[..n]);
+                }
+                return;
+            }
+        }
+        // Fall through to plain-HTTP send on native or when tls is None.
+        let _ = (core_id, conn_idx);
+        send_response(conn, resp, keep_alive);
     }
 
     fn find_handler(&self, path: &[u8]) -> Option<Handler> {
@@ -601,20 +823,31 @@ impl core::fmt::Write for BufWriter {
 }
 
 fn send_response(conn: TcpStream, resp: &Response, keep_alive: bool) {
+    let mut w = BufWriter::new();
+    write_response_into(&mut w, resp, keep_alive);
+    conn.send(w.as_bytes());
+}
+
+/// Serialise an HTTP/1.1 response into a `BufWriter`. Split out so
+/// the TLS path can reuse it and feed the bytes through `TlsServer`
+/// instead of straight to `conn.send`.
+fn write_response_into(w: &mut BufWriter, resp: &Response, keep_alive: bool) {
     use core::fmt::Write;
 
     let body = resp.body_bytes();
     let content_type = resp.content_type_bytes();
     let conn_header = if keep_alive { "keep-alive" } else { "close" };
 
-    let mut w = BufWriter::new();
     let _ = write!(w, "HTTP/1.1 {} {}\r\n", resp.status, status_text(resp.status));
     let _ = write!(w, "Content-Type: ");
     w.push(content_type);
-    let _ = write!(w, "\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n", body.len(), conn_header);
+    let _ = write!(
+        w,
+        "\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
+        body.len(),
+        conn_header
+    );
     w.push(body);
-
-    conn.send(w.as_bytes());
 }
 
 // ---- Helper functions -------------------------------------------------------
