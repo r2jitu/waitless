@@ -45,24 +45,25 @@ limine = { version = "0.5.0", default-features = false }
 sha2 = { version = "0.10", default-features = false }
 hmac = { version = "0.12", default-features = false }
 hkdf = { version = "0.12", default-features = false }
-# AEAD for TLS 1.3 record encryption: hand-rolled ChaCha20-Poly1305
-# lives in `//net:tls_crypto` rather than depending on the RustCrypto
-# crate. Reasons (investigation 2026-04-14):
+# Audited AEAD for TLS 1.3 record encryption. We ship the full set
+# so rustls / quinn-proto can pick any:
 #
-# - `aes-gcm` pulls in `polyval`, whose GHASH pclmulqdq path crashes
-#   LLVM on `x86_64-unknown-none` ("Do not know how to split the
-#   result of this operator!") regardless of the `+sse2,+aes,+pclmul`
-#   feature combo we try.
-# - `chacha20poly1305` + `poly1305` both bail on `x86_64-unknown-none`
-#   via their SIMD auto-detect paths; `poly1305` has no `force-soft`
-#   feature flag.
-# - ChaCha20-Poly1305 is ~150 lines of Rust; writing it ourselves
-#   costs less than fighting crate_universe for x86_64 feature gates
-#   and keeps us portable across both architectures.
+# - `aes-gcm` + `polyval` for TLS_AES_128_GCM_SHA256 / _256_
+# - `chacha20poly1305` + `poly1305` + `chacha20` for
+#   TLS_CHACHA20_POLY1305_SHA256
 #
-# The other primitives we DO pull from RustCrypto (sha2, hmac, hkdf,
-# x25519, p256, ed25519) all build cleanly on both bare-metal targets
-# after the curve25519-dalek build-script backend override below.
+# All of these unconditionally emit `__m128i` / pclmulqdq intrinsic
+# code on x86_64 (auto-selected at compile time, runtime-dispatched
+# via `cpufeatures`). The stock `x86_64-unknown-none` target spec
+# has `+soft-float,-sse` which makes LLVM bail with "Do not know how
+# to split the result of this operator!" when it tries to legalise
+# those intrinsics without register support. We fix it per-crate in
+# MODULE.bazel via a `crate.annotation` that passes
+# `-Ctarget-feature=-soft-float,+sse,+sse2,...` — the kernel already
+# enables SSE at boot (CR4.OSFXSR) and our cooperative scheduler
+# never preempts, so kernel-side SIMD is safe.
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 # Key exchange: X25519 is the only MTI group for TLS 1.3 and QUIC.
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
 # ECDSA verification for P-256 server certificates (common with self-signed

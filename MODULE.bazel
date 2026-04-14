@@ -82,13 +82,62 @@ crate.from_cargo(
     ],
 )
 
-# curve25519-dalek's build.rs auto-selects the "simd" backend for
-# x86_64, which requires AVX2 intrinsics our bare-metal target doesn't
-# enable. Force the portable "serial" backend via the env var the
-# build script reads; the same override works on aarch64 where there's
-# no NEON-specific backend to choose from anyway.
+# ── x86_64-unknown-none target-feature overrides for crypto ────────────────
+#
+# The stock `x86_64-unknown-none` target has
+# `features: "-mmx,-sse,+soft-float"` baked in. That makes LLVM
+# refuse to compile any crate that uses `__m128i` / pclmulqdq /
+# SSE intrinsics, because there's no register class for 128-bit
+# vector types under `+soft-float`, and LLVM bails with:
+#     rustc-LLVM ERROR: Do not know how to split the result of
+#     this operator!
+# (rust-lang/rust#87642, #92760, #136544).
+#
+# Every RustCrypto AEAD auto-compiles both a SIMD path and a software
+# path, dispatched at runtime by `cpufeatures`, so we can't just
+# "runtime-select" our way out — both paths must compile.
+#
+# Fix: per-crate `rustc_flags` annotation that explicitly turns
+# `-soft-float` off and turns SSE/AVX/AES/PCLMUL on. The kernel
+# already enables SSE at boot (CR4.OSFXSR|OSXMMEXCPT in
+# `kernel/limine_boot.S`) and our scheduler is cooperative — nothing
+# preempts kernel code — so using SSE/AVX registers in the kernel
+# is safe without any FXSAVE/XSAVE dance. x86_64-v3 baseline
+# (Haswell, 2013) matches what every cloud VM runs today.
+#
+# These flags apply to ALL target triples the crate compiles for,
+# but rustc silently ignores `+sse2` and friends on non-x86 targets
+# (with a warning), so aarch64 builds remain unaffected.
+#
+# Crates listed: any crate in the TLS 1.3 transitive graph that
+# either uses SIMD intrinsics directly or hits the LLVM bug via
+# `u128` math.
+X86_CRYPTO_FEATURES = "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmul,+fma,+bmi1,+bmi2"
+
+[
+    crate.annotation(
+        crate = name,
+        rustc_flags = [X86_CRYPTO_FEATURES],
+    )
+    for name in (
+        "aes",
+        "aes-gcm",
+        "chacha20",
+        "chacha20poly1305",
+        "ghash",
+        "poly1305",
+        "polyval",
+    )
+]
+
+# curve25519-dalek needs BOTH the target-feature flag (its field
+# element arithmetic runs into the same LLVM legalisation issue
+# via `u128` math) AND a build-script override to force the
+# portable "serial" backend instead of the "simd" one that assumes
+# AVX2 is on by default.
 crate.annotation(
     crate = "curve25519-dalek",
+    rustc_flags = [X86_CRYPTO_FEATURES],
     build_script_env = {
         "CARGO_CFG_CURVE25519_DALEK_BACKEND": "serial",
     },

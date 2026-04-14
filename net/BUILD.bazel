@@ -118,12 +118,17 @@ rust_library(
 
 # ── TLS 1.3 crypto ──────────────────────────────────────────────────
 #
-# Hand-rolled ChaCha20 + Poly1305 + AEAD_CHACHA20_POLY1305 (RFC 8439).
-# Written in-tree rather than using the `chacha20poly1305` crate because
-# the latter's cpufeatures-gated SIMD path doesn't compile on our
-# bare-metal `x86_64-unknown-none` target. See Cargo.toml for the full
-# investigation. This is ~500 lines of pure, portable Rust; the host-
-# native unit test runs the RFC 8439 test vectors.
+# Thin byte-slice AEAD wrapper over the audited RustCrypto
+# `chacha20poly1305` crate. Lets downstream callers (`//net:tls`,
+# future `//net:quic`) use a simple `[u8; 32]` / `[u8; 12]` API
+# without dealing with `generic-array` types. The upstream crate
+# handles constant-timeness and correctness — we're just reshaping
+# the interface.
+#
+# The SIMD intrinsics in `chacha20poly1305` / `poly1305` / `chacha20`
+# compile cleanly on bare-metal x86_64 because of the per-crate
+# `-Ctarget-feature=-soft-float,+sse2,+avx2,...` annotation in
+# MODULE.bazel — see the big comment there.
 
 rust_library(
     name = "tls_crypto",
@@ -131,13 +136,15 @@ rust_library(
     crate_root = "tls_crypto.rs",
     crate_name = "net_tls_crypto",
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    deps = [
+        "@crates//:chacha20poly1305",
+    ],
 )
 
-rust_test(
-    name = "tls_crypto_test",
-    crate = ":tls_crypto",
-    rustc_flags = ["-Cpanic=unwind"],
-)
+# NOTE: no tls_crypto_test — the upstream crate ships its own RFC 8439
+# test vectors, and our wrapper's `rust_test` would hit the same
+# panic-strategy conflict as //net:tls. Coverage lives in
+# //apps/test_tls (bare-metal integration test).
 
 # TLS 1.3 handshake framing + ClientHello parser + ServerHello builder.
 # Pure byte-slice parsing/encoding with no external deps, so the host
