@@ -253,26 +253,18 @@ def _udp_with_retry(port, senders, duration, host, async_mode, rate_per_sender=0
     return pps, p50, p99
 
 
-def udp_peak_concurrent(port, slots_per_thread, duration, host, client_cpus=1,
-                        timeout_ms=100):
-    """Run udp_bench in --concurrent (windowed) mode and return peak
-    server throughput.
+_UDP_PEAK_LEVELS = [32, 64, 128, 256, 512]
 
-    Each of `client_cpus` pthread workers maintains `slots_per_thread`
-    in-flight UDP requests on its own dedicated SO_REUSEPORT-bound
-    sockets. A slot fires its next request only after the previous
-    reply arrives or its timeout expires (default 100 ms), so the
-    aggregate offered load is server-driven — no rate to tune, no
-    binary search. Throughput plateaus at the server's real capacity;
-    loss% surfaces if the server is over-saturated.
 
-    Returns `(recv_pps, loss_pct, p50, p99)`. `recv_pps == 0` if the
-    bench binary couldn't be invoked.
+def _udp_concurrent_probe(port, slots_per_thread, duration, host,
+                          client_cpus, timeout_ms):
+    """Run one windowed udp_bench probe and return the parsed result.
+
+    Returns `(recv_pps, loss_pct, p50, p99)`. All zeros on failure.
     """
     udp_bin = _udp_bench_bin()
     if udp_bin is None:
         return 0.0, 0.0, "", ""
-
     cmd = [udp_bin, str(port), str(slots_per_thread), str(duration),
            "--concurrent", f"--timeout={timeout_ms}"]
     if client_cpus > 1:
@@ -284,11 +276,52 @@ def udp_peak_concurrent(port, slots_per_thread, duration, host, client_cpus=1,
                            timeout=duration + 30)
     except Exception:
         return 0.0, 0.0, "", ""
-
     recv, _, p50, p99, loss = _parse_udp_bench_output(r.stdout)
     if recv is None:
         return 0.0, 0.0, "", ""
     return recv, loss or 0.0, p50, p99
+
+
+def udp_peak_concurrent(port, duration, host, client_cpus=1, timeout_ms=100):
+    """Find peak windowed-UDP throughput by sweeping the concurrency
+    levels in `_UDP_PEAK_LEVELS` and taking the max.
+
+    Runs udp_bench in --concurrent mode at each per-thread slot count
+    in turn and picks the run with the highest recv rate. We probe
+    the whole ladder instead of stopping early on a non-improving
+    doubling — 2 s probes are noisy enough on tap/vhost and KVM that
+    an early stop gets fooled (KVM 2c was reporting 460k at N=64 and
+    bailing before reaching N=128 where it sustains 700k+). Max-of-N
+    is robust to those single-probe dips at the cost of running the
+    full ladder every time.
+
+    Each probe's duration is `duration / len(_UDP_PEAK_LEVELS)`
+    (floor 2 s) so the total bench time is roughly `duration`.
+
+    Returns `(recv_pps, loss_pct, p50, p99, n_slots_per_thread)` for
+    the level that achieved `recv_pps`. All zeros if every probe
+    failed.
+    """
+    probe_duration = max(2, duration // len(_UDP_PEAK_LEVELS))
+    best_pps = 0.0
+    best_loss = 0.0
+    best_p50 = ""
+    best_p99 = ""
+    best_n = _UDP_PEAK_LEVELS[0]
+
+    for n in _UDP_PEAK_LEVELS:
+        pps, loss, p50, p99 = _udp_concurrent_probe(
+            port, n, probe_duration, host, client_cpus, timeout_ms)
+        if pps <= 0:
+            continue
+        if pps > best_pps:
+            best_pps = pps
+            best_loss = loss
+            best_p50 = p50
+            best_p99 = p99
+            best_n = n
+
+    return best_pps, best_loss, best_p50, best_p99, best_n
 
 
 # ── Environment runners ──────────────────────────────────────────────────────
@@ -633,23 +666,24 @@ WORKLOADS = [
     # only the absolute latency varies.
     #
     # `udp_peak` measures peak sustained server throughput via a
-    # windowed (in-flight) bench. Each of `cpus` client pthread
-    # workers maintains `slots_per_thread=128` outstanding UDP
-    # requests on its own SO_REUSEPORT-bound sockets — so total
-    # in-flight = 128 * cpus. A slot fires its next request only
-    # after its previous reply arrives or its 100ms timeout expires.
-    # No rate-paced binary search; throughput plateaus at the
-    # server's real capacity, and `loss%` surfaces if the server
-    # over-saturates. Each slot has a distinct ephemeral source port
-    # so SO_REUSEPORT 4-tuple hashing distributes load across all
-    # server siblings (Tier 1 KVM hardware RSS + Tier 2 HVF software
-    # RSS both exercised the same way).
+    # windowed (in-flight) bench with adaptive concurrency. For each
+    # (env, cpus), probes `N in {32,64,128,256,512}` per client
+    # thread, doubling until throughput stops improving by >5%. Each
+    # of `cpus` client pthread workers maintains N outstanding UDP
+    # requests on its own SO_REUSEPORT-bound sockets; a slot fires
+    # its next request only after its previous reply arrives or its
+    # 100 ms timeout expires. No rate-paced binary search;
+    # throughput plateaus at the server's real capacity, and `loss%`
+    # surfaces if the server over-saturates. Each slot has a
+    # distinct ephemeral source port so SO_REUSEPORT 4-tuple hashing
+    # distributes load across all server siblings (Tier 1 KVM
+    # hardware RSS + Tier 2 HVF software RSS both exercised the same
+    # way).
     {"name": "udp_sync", "type": "udp", "endpoint": "",
      "senders": 1,
      "desc": "UDP echo single-flow latency (1 sender, sync RTT)"},
     {"name": "udp_peak", "type": "udp_peak", "endpoint": "",
-     "slots_per_thread": 128,
-     "desc": "UDP echo peak throughput (128 in-flight per client thread, windowed)"},
+     "desc": "UDP echo peak throughput (windowed + adaptive concurrency ramp)"},
 ]
 
 
@@ -839,18 +873,17 @@ def main():
                     print(f"    {wname:<20s} {pps:>10.0f} pkt/s  (async recv rate)")
                 elif w["type"] == "udp_peak":
                     time.sleep(0.5)
-                    # Windowed mode: each client pthread worker keeps
-                    # `slots_per_thread` UDP requests in-flight on
-                    # distinct sockets, so total in-flight scales with
-                    # server cores. No rate to tune; throughput
-                    # plateaus at the server's real capacity.
-                    slots_per_thread = w.get("slots_per_thread", 128)
-                    pps, loss_pct, p50, p99 = udp_peak_concurrent(
-                        udp_target_port, slots_per_thread, duration,
-                        wrk_host, client_cpus=cpus)
+                    # Windowed mode with adaptive concurrency ramp:
+                    # probe per-thread slot counts [32..512] and pick
+                    # the level where throughput plateaus, so each
+                    # platform gets the concurrency that actually
+                    # exposes its ceiling without over-pressuring it.
+                    pps, loss_pct, p50, p99, best_n = udp_peak_concurrent(
+                        udp_target_port, duration, wrk_host,
+                        client_cpus=cpus)
                     results[(env_name, cpus, wname)] = (pps, p50, p99)
                     print(f"    {wname:<20s} {pps:>10.0f} pkt/s  "
-                          f"({loss_pct:.1f}% loss, {slots_per_thread}x{cpus} in-flight)")
+                          f"({best_n}x{cpus} in-flight, {loss_pct:.1f}% loss)")
 
                 env.stop(proc)
                 _current["proc"] = None
