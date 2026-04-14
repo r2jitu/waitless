@@ -139,6 +139,23 @@ rust_test(
     rustc_flags = ["-Cpanic=unwind"],
 )
 
+# TLS 1.3 handshake framing + ClientHello parser + ServerHello builder.
+# Pure byte-slice parsing/encoding with no external deps, so the host
+# unit tests work without the panic-strategy conflict.
+rust_library(
+    name = "tls_handshake",
+    srcs = ["tls_handshake.rs"],
+    crate_root = "tls_handshake.rs",
+    crate_name = "net_tls_handshake",
+    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+)
+
+rust_test(
+    name = "tls_handshake_test",
+    crate = ":tls_handshake",
+    rustc_flags = ["-Cpanic=unwind"],
+)
+
 # TLS 1.3 sans-io core: key schedule, HKDF-Expand-Label, transcript,
 # X25519 wrapper, AEAD glue. Uses RustCrypto sha2/hmac/hkdf + our own
 # tls_crypto for the record AEAD. Shared by the TLS-over-TCP server
