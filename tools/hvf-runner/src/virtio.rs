@@ -4,11 +4,30 @@
 //
 // Implements the register file at a single MMIO address (0x0a000000).
 // The kernel's virtio_net::init_mmio() probes this device, negotiates
-// features, sets up queues (RX=0, TX=1), and drives it via QUEUE_NOTIFY.
+// features, sets up queues (2 per vCPU + 1 ctrl), and drives it via
+// QUEUE_NOTIFY. Packet I/O lives in `userspace_net.rs`, which owns
+// the `QueueSnapshot`s this module publishes via `QUEUE_SNAPS`.
 //
-// This module handles the config-space interaction only. The actual
-// packet I/O (reading/writing virtqueue descriptors, interfacing with
-// vmnet) will be added when vmnet.rs is wired up.
+// ── SAFETY contract for the raw-pointer code in this module ──────
+//
+// All `unsafe { ... }` blocks here do raw-pointer reads and writes
+// into guest RAM through the host mapping:
+//
+//   `ram_host + (gpa - ram_base) → *mut u8`
+//
+// The guest RAM mapping is created by `Vm::new_with_config` via
+// `hv_vm_allocate` + `hv_vm_map` and lives for the entire VM
+// lifetime. `QueueSnapshot` captures `{ram_host, ram_base, qsize,
+// desc_addr, avail_addr, used_addr}` once at `QUEUE_READY` time and
+// is published through `OnceLock` — the snapshot is immutable after
+// publication, so readers on other threads see a consistent view.
+//
+// The `gpa_to_host` helper debug-asserts that the offset is inside
+// the 1 GB mapping; the same bound holds in production (the guest
+// driver can't point a descriptor outside its own ring). Writes to
+// the used ring are bounded by `qsize` from the snapshot; reads
+// from the avail ring use `read_volatile` to pick up publication
+// by the guest driver.
 
 use std::sync::Mutex;
 use std::sync::OnceLock;

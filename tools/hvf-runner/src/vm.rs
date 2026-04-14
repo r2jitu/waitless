@@ -8,6 +8,44 @@
 //
 // Multi-core: vCPU 0 runs on the caller's thread. Secondary vCPUs are
 // started on demand via PSCI CPU_ON, each on its own OS thread.
+//
+// ── SAFETY contract for the HVF FFI in this module ─────────────────
+//
+// Every `unsafe { hv_* }` call site in this file relies on the same
+// small set of invariants and we don't repeat the SAFETY comment at
+// each call. The invariants are:
+//
+// 1. `hv_vcpu_create` / `hv_vcpu_run` / `hv_vcpu_set_reg` / etc. must
+//    be invoked from the *same OS thread* that created the vCPU. We
+//    enforce this by construction: vCPU 0 is created and run on the
+//    caller's thread; secondary vCPUs are created inside the pthread
+//    spawned in `handle_hvc`'s `PSCI_CPU_ON` branch and never touched
+//    from any other thread. `VCPU_HANDLES[i]` is published with
+//    `Release` after creation and loaded with `Acquire` by readers.
+//
+// 2. `hv_vcpus_exit` is the *one* HVF call that is explicitly allowed
+//    from a non-owner thread. Used by `wake_vcpu` (called from
+//    `userspace_net`'s accept thread) and by `handle_hvc`'s
+//    SYSTEM_OFF branch to doorbell other vCPUs. The pointer passed
+//    in is a stack local holding the target `hv_vcpu_t` handle,
+//    valid for the duration of the call.
+//
+// 3. Pointers passed to `hv_vm_allocate` / `hv_vm_map` are null or
+//    point at a valid `*mut c_void` we wrote ourselves; the mapping
+//    lives for the VM's lifetime (`drop(Vm)` deallocates, but
+//    nothing calls `drop` while a vCPU is running).
+//
+// 4. `exit_ptr` (`HvVcpuExit *`) is a stable pointer returned by
+//    `hv_vcpu_create` and lives as long as the vCPU. We dereference
+//    it (`&*exit_ptr`) only between `hv_vcpu_run` calls on the
+//    same thread.
+//
+// 5. The inline `asm!` blocks in the idle path (`wfi`, `hlt`) have
+//    no memory effects (`nomem, nostack`) and carry no input/output
+//    registers; they can't violate Rust's aliasing rules.
+//
+// Call sites that break from this pattern carry their own SAFETY
+// comment inline.
 
 use std::ffi::c_void;
 use std::ptr;
@@ -38,6 +76,10 @@ pub fn wake_vcpu(core_id: usize) {
     if core_id >= MAX_VCPUS { return; }
     let handle = VCPU_HANDLES[core_id].load(Ordering::Acquire);
     if handle != 0 {
+        // SAFETY: `hv_vcpus_exit` is the one HVF FFI that's allowed
+        // from a thread other than the vCPU's owner (module contract
+        // invariant 2). The pointer is a stack local holding the
+        // `handle` we just loaded; it's valid for the call duration.
         unsafe { hv_vcpus_exit(&handle as *const u64 as *const _, 1); }
     }
 }

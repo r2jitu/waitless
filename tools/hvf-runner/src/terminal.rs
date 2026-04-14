@@ -12,6 +12,9 @@ static SAVED: OnceLock<libc::termios> = OnceLock::new();
 /// Switch stdin to raw mode. Saves the original termios for restore.
 /// No-op if stdin is not a TTY.
 pub fn enable_raw() {
+    // SAFETY: all four libc calls are straight FFI on `STDIN_FILENO`;
+    // `orig` is a stack-local `termios` written only by `tcgetattr`
+    // and read only by us. `SAVED.set` publishes a copy.
     unsafe {
         if libc::isatty(libc::STDIN_FILENO) == 0 {
             return;
@@ -34,6 +37,9 @@ pub fn enable_raw() {
 /// never called or stdin is not a TTY.
 pub fn restore() {
     if let Some(orig) = SAVED.get() {
+        // SAFETY: `orig` is the saved termios from `enable_raw`,
+        // still owned by `SAVED` (a `OnceLock`). We pass a shared
+        // reference; `tcsetattr` treats it as read-only.
         unsafe {
             libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, orig);
         }

@@ -2,12 +2,54 @@
 //
 // Userspace TCP/IP proxy — zero-copy, no intermediate buffers.
 //
-// RX thread: poll() on sockets → construct frames directly in guest
-//   RAM (virtio used ring) → assert SPI 35 to wake guest.
-// vCPU thread: on TX QUEUE_NOTIFY → read frames from guest RAM →
-//   write() directly to host sockets.
+// Architecture (see MEMORY.md's "HVF Runner" section for the full
+// picture):
 //
-// No SPSC rings, no wake pipe, no Mutex on the hot path.
+// - One dedicated TCP accept thread owns every TCP listen fd. On
+//   accept it round-robin-picks a target vCPU, inserts a new
+//   `ProxyConn` into `WORKERS[N].conns`, pushes the SYN frame into
+//   `tx_replies`, and doorbells the target via a wake pipe +
+//   `hv_vcpus_exit`. macOS SO_REUSEPORT does not distribute TCP, so
+//   software round-robin is how we get multi-vCPU load-spreading.
+//
+// - Each vCPU thread owns its `IoState` (`VCPU_IOS[id]`) and runs
+//   `vcpu_poll()` between `hv_vcpu_run` invocations. Per tick it
+//   drains `tx_replies`, polls its own wake pipe + UDP relay
+//   sibling + assigned TCP conn fds, and injects replies straight
+//   into its queue-pair's RX ring. No separate RX worker threads.
+//
+// - UDP uses per-vCPU SO_REUSEPORT sibling sockets; the kernel
+//   distributes incoming datagrams across the group by 4-tuple hash,
+//   so no software RSS is needed on the UDP path.
+//
+// ── SAFETY contract for the libc FFI in this module ───────────────
+//
+// Every `unsafe { libc::* }` call site in this file relies on the
+// same small set of invariants:
+//
+// 1. All `sockaddr_in` pointers are stack locals we wrote ourselves
+//    right before the call; the referenced memory is live for the
+//    duration.
+//
+// 2. `recvfrom` / `sendto` / `read` / `write` / `recv` / `send`
+//    buffers are either stack arrays on `IoState` or raw pointers
+//    into guest RAM returned by `QueueSnapshot::gpa_to_host`. Guest
+//    RAM lives for the whole VM lifetime (see `vm.rs` SAFETY
+//    contract); the `IoState` buffers live as long as the enclosing
+//    `Mutex<IoState>` lock, which the calling thread holds.
+//
+// 3. `inject_frame` / `write_tcp_frame_around_payload` cast the host
+//    pointer returned by `gpa_to_host` to `*mut u8` and write up to
+//    `MAX_REPLY_FRAME` / `HDR_LEN + MAX_PAYLOAD` bytes. The virtio
+//    descriptor size is checked against these constants by the
+//    guest driver (we trust the guest to size its own RX buffers).
+//
+// 4. The `dsb sy` / `dc cvau` inline asm is `options(nostack)` with
+//    one register input (`addr`) and no memory effects; it can't
+//    alias anything visible to Rust.
+//
+// Call sites that break from this pattern carry their own SAFETY
+// comment inline.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, OnceLock};
