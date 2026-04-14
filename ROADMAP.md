@@ -847,27 +847,94 @@ add up to ~600 pages of state machine that we won't deliver to parity.
 - **`mvfst` / `msquic`** — both depend on Schannel/OpenSSL/fizz +
   C++ runtime + platform abstractions. Too heavy for a unikernel.
 
-**Recommended path forward:**
+**Recommended path forward (2026-04-14 pivot): roll our own QUIC.**
 
-1. Ship audited TLS-over-TCP first (see 3b). HTTPS on TCP is real and
-   useful and uses the same rustls + RustCrypto + kernel::rng stack.
-2. **Revisit quinn-proto** in 3-6 months: track `quinn-rs/quinn#579`
-   for upstream movement on no_std. The blockers are well-scoped
-   (Instant, io::Error) and quinn maintainers seem amenable in
-   principle, just unprioritised.
-3. **Or**: maintain a vendored fork of `quinn-proto` with a small
-   no_std patch (replace `std::time::Instant` with a
-   project-supplied trait, remove `io::Error` propagation in favour
-   of `quinn-proto`'s own error type). Estimated: 200-500 lines of
-   patch surface, ongoing rebase cost on every quinn release. Not
-   recommended unless we need HTTP/3 urgently.
+The general-purpose QUIC implementations (quinn, quiche, s2n-quic,
+neqo) all carry design assumptions that are actively wrong for a
+unikernel with cooperative per-core event loops:
 
-**Tasks (deferred):**
+- They assume **preemptive threading** and wrap connection state in
+  `Arc<Mutex<...>>` so it can migrate between worker threads. We
+  already pin every TCP/UDP connection to a single core via flow
+  hash (`net/lib.rs:flow_hash` → `poll_tier1` / `poll_tier2`), so
+  the `Arc<Mutex<>>` is pure overhead.
+- They assume **generic async runtimes** (tokio, futures) and box
+  every future so it can be `.await`-ed from any executor. Our
+  event loop already owns the connection; we can call the state
+  machine inline from the poll callback with no indirection.
+- They assume **abstracted I/O** via sans-io buffer APIs because
+  they have to be portable to `epoll` / `kqueue` / `io_uring` /
+  Windows IOCP. We have exactly one I/O backend (virtio-net RX/TX
+  queues) and we own it end-to-end.
+- They assume **general-purpose crypto provider indirection** (the
+  `rustls::CryptoProvider` trait, quinn's `ClientConfig` /
+  `ServerConfig` boxes). We ship exactly one cipher suite
+  (`TLS_CHACHA20_POLY1305_SHA256`) and one kx group (X25519), so
+  we can call `chacha20poly1305_seal` / `open` directly.
 
-- [ ] Wait for `quinn-proto` no_std support OR vendor a patched fork
-- [ ] `//net:quic` wrapper crate around `quinn-proto`
-- [ ] HTTP/3 — defer until QUIC works
-- [ ] External-client interop via `curl --http3` / `h2load --h3`
+A purpose-built QUIC implementation for this unikernel can:
+
+- Store connection state inline in the per-core connection pool
+  (no `Arc`, no `Mutex`), same pattern as the existing TCP stack.
+- Drive the state machine from `net::poll()` at the exact moment
+  a UDP datagram arrives, on the owning core, with zero cross-core
+  traffic for the hot path.
+- Integrate directly with our event loop's NAPI-style idle/wake
+  (WFI + RX interrupt) — "async" isn't a layer, it's the one and
+  only execution model.
+- Share record-layer code with the existing TLS-over-TCP path
+  (`//net:tls_crypto`'s `chacha20poly1305_seal`/`open`), since both
+  use the same AEAD after the handshake.
+- Reuse rustls 0.23's `UnbufferedServerConnection` / `ClientConnection`
+  for the **TLS handshake only** (it's sans-io and works `no_std`),
+  then extract the traffic secrets via `rustls::quic::*` exports
+  and drive QUIC packet protection ourselves.
+
+The trade-off is surface area — QUIC is ~600 pages of RFCs (9000,
+9001, 9002, 9114, …) and we won't ship parity with quinn. Scope
+discipline is critical:
+
+**In scope (v1):**
+- TLS 1.3 handshake via rustls Unbuffered + `rustls::quic`
+- Initial / Handshake / 1-RTT packet number spaces
+- STREAM frames (one direction, server-initiated only initially)
+- ACK, CONNECTION_CLOSE, PING
+- Loss detection with fixed RTO (not pacing/BBR)
+- Server-side 1-RTT key update
+
+**Out of scope (v1):**
+- 0-RTT
+- Connection migration
+- Path validation / PMTUD
+- Datagram extension
+- Version negotiation
+- Retry tokens
+- ECN
+- Qlog tracing
+- Client-side (we're a server)
+
+**Tasks (live):**
+
+- [ ] `//net:tls_server` — rustls `UnbufferedServerConnection` wrapper
+      over `net::tcp::TcpStream` (prerequisite; the handshake logic
+      is shared with QUIC)
+- [ ] `//net:quic_wire` — QUIC long/short header parsing, packet
+      number decoding, variable-length integers (RFC 9000 §16-17)
+- [ ] `//net:quic_crypto` — packet protection using
+      `//net:tls_crypto`'s AEAD + HKDF-Expand-Label from `//net:tls`
+      (QUIC's packet-protection key derivation reuses the same
+      cascade with different labels; we already have it)
+- [ ] `//net:quic` — connection state machine, Initial → Handshake →
+      1-RTT progression, STREAM/ACK frame handling
+- [ ] `//uni:http3` / `//uni:http_quic` — HTTP/3 over QUIC streams
+      (HEADERS + DATA frames, static QPACK table only)
+- [ ] External-client interop: `curl --http3 --cacert dev_cert.pem
+      https://unikernel.local:8443/health` succeeds
+
+**Fallback**: if the own-QUIC implementation stalls (complexity or
+scope creep), the Hermit / libstd option in "Deferred work" is the
+escape hatch. It unlocks `quinn-proto` unchanged at the cost of the
+bazel+nightly migration.
 
 ---
 
@@ -1119,6 +1186,60 @@ tickets. Required when:
 Implementation: read CNTVCT_EL0 / TSC, multiply by frequency to get
 nanoseconds since boot, add a boot-time wall-clock estimate (PSCI
 on aarch64, ACPI/CMOS on x86_64). ~30 lines.
+
+### Option: switch to `x86_64-unknown-hermit` to unlock full libstd
+
+Parked as a viable-but-not-chosen pivot (2026-04-14 spike). The idea:
+target `x86_64-unknown-hermit` / `aarch64-unknown-hermit` instead of
+`*-unknown-none`, build std from source via `-Z build-std`, supply
+the `sys_*` C-ABI symbols that `hermit-abi` declares from a tiny
+in-kernel shim. Unlocks full libstd including `rustls::ServerConnection`,
+`quinn-proto` unchanged, `parking_lot`, `tracing`, `std::time::Instant`,
+`std::io::Error`, and every other std-gated crate.
+
+**Spike findings (`/tmp/hermit_spike/`, throwaway cargo project):**
+
+- Builds a binary linking `rustls 0.23.38` + `rustls-rustcrypto 0.0.2-alpha`
+  + `quinn-proto 0.11.14` + all RustCrypto AEADs + all of std in
+  ~40s from a clean cache on nightly rustc. Final ELF is 862 KB,
+  597 KB of `.text`, zero undefined symbols.
+- **Exactly 16 `sys_*` / libc symbols** need implementing, and the
+  list does NOT grow when rustls or quinn-proto are added to the
+  graph — they're fully covered by Instant + Mutex + RwLock + heap
+  + stdout paths that hello-world already exercises:
+  - libc: `memcpy`, `memmove`, `memset`, `memcmp`, `strlen`
+  - allocator: `sys_malloc`, `sys_free`, `sys_realloc`
+  - time: `sys_clock_gettime`
+  - random: `sys_read_entropy`
+  - futex: `sys_futex_wait`, `sys_futex_wake`
+  - i/o + lifecycle: `sys_write`, `sys_writev`, `sys_exit`, `sys_abort`
+- **Bonus**: the cpufeatures/LLVM SIMD-legalisation issue disappears
+  entirely. The hermit target spec already has `+sse,+sse2,+avx,+avx2,...`
+  in its baseline, so `polyval`/`poly1305`/`chacha20` AVX2 intrinsics
+  compile without any per-crate annotations. We'd delete the
+  `X86_CRYPTO_FEATURES` block from `MODULE.bazel`.
+- **Measured effort for the shim**: ~220 lines of Rust forwarding to
+  our existing `kernel::mm::kmalloc/kfree`, `kernel::rng::fill_bytes`,
+  `kernel::serial`, and `kernel::arch::shutdown`. Futex is the only
+  non-trivial piece (~50 lines using SEV/WFE on aarch64, IPI on
+  x86_64). **~1-2 days** of focused code, not 2-4 weeks.
+
+**The remaining unknown is bazel + `-Z build-std` integration**.
+`rules_rust` supports `build_std` via an experimental attribute but
+the ergonomics of mixing a nightly toolchain into our existing
+stable-pinned bazel workspace are not measured. Estimated a few
+more days.
+
+**Why we're NOT doing this right now:** the user prefers to
+prototype our own QUIC implementation on top of the existing
+`#![no_std]` stack (rustls `UnbufferedServerConnection` + our own
+`net::tcp`), treating Hermit as a fallback if the own-QUIC path
+stalls. Revisit Hermit if: (a) we hit an ecosystem wall that
+requires std (`thiserror`, `tracing`, `parking_lot`, `tokio`, …),
+(b) the bazel+nightly cost seems worth the ecosystem unlock, or
+(c) the own-QUIC work is too slow.
+
+**Trigger for revisit**: any of the three above.
 
 ### Sans-io key schedule / hand-rolled handshake (`//net:tls`,
 ### `//net:tls_handshake`)
