@@ -14,6 +14,29 @@ fi
 echo "==> Installing LLVM (clang, ld.lld, llvm-ar, llvm-nm)..."
 brew install llvm
 
+echo "==> Installing rustup (host toolchain for cargo standalone builds)..."
+if ! command -v rustup &>/dev/null; then
+    brew install rustup
+    rustup default stable 2>/dev/null || true
+fi
+
+# crate_universe (rules_rust 0.56) + modern cargo cache layout mismatch.
+# cargo-bazel looks up the crate registry at the legacy git-protocol
+# hash directory, but modern cargo writes to the sparse-protocol hash
+# directory. The two hashes differ and crate_universe fails with
+# `Failed to get crate from cache` for any crate that isn't already
+# in the legacy directory. Fix by mirroring the sparse cache onto
+# the git-protocol path. Idempotent. Remove this once rules_rust gets
+# upgraded to a release that supports the `lockfile` JSON attribute
+# (~0.62+) which makes cargo-bazel offline.
+echo "==> Mirroring cargo registry index for crate_universe..."
+SPARSE_DIR="$HOME/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f"
+GIT_DIR="$HOME/.cargo/registry/index/index.crates.io-6f17d22bba15001f"
+if [ -d "$SPARSE_DIR" ] && [ -d "$GIT_DIR" ]; then
+    cp -Rn "$SPARSE_DIR/.cache/" "$GIT_DIR/.cache/" 2>/dev/null || true
+    echo "  (sparse → git index cache mirrored)"
+fi
+
 LLVM_PREFIX="$(brew --prefix llvm)"
 echo "  LLVM installed at: $LLVM_PREFIX"
 
