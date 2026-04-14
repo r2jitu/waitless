@@ -26,3 +26,7 @@ rust-project.json
 .cache/
 bench/webserver_native
 scripts/udp_bench
+
+# Cargo standalone build artefacts (under tools/hvf-runner). The
+# bazel build goes through crate_universe and writes elsewhere.
+target/

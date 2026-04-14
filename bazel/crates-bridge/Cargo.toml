@@ -1,0 +1,23 @@
+# Placeholder workspace member.
+#
+# The bare-metal kernel/uni/limine rust_library targets aren't
+# cargo-aware (they're `#![no_std]`, target `*-unknown-none`, and
+# build with bazel-only flags). To make crate_universe aware of the
+# external crates they need, this stub lists the deps as a workspace
+# member, which forces them into the spliced Cargo.lock so the
+# `@crates//:bitflags` / `@crates//:fdt` / `@crates//:limine` labels
+# get generated.
+#
+# This crate is never compiled by bazel or cargo at runtime — its
+# only purpose is dependency registration for crate_universe.
+
+[package]
+name = "crates-bridge"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+bitflags = { workspace = true }
+fdt = { workspace = true }
+limine = { workspace = true }

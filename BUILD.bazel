@@ -1,5 +1,15 @@
 package(default_visibility = ["//visibility:public"])
 
+# Mark the workspace Cargo.toml plus the bazel-side lockfile as
+# labels so the crate_universe extension in MODULE.bazel can read
+# them. (Cargo.Bazel.lock is the bazel-managed lockfile, separate
+# from the cargo-managed Cargo.lock that lives next to it.)
+exports_files([
+    "Cargo.toml",
+    "Cargo.Bazel.lock",
+    ".cargo/config.toml",
+])
+
 # Regenerate rust-project.json for rust-analyzer:
 #   bazel run //:rust_analyzer
 alias(

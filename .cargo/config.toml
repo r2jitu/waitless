@@ -1,0 +1,5 @@
+# Cargo config used by both the host cargo build (for the
+# tools/hvf-runner workspace) and crate_universe's cargo-bazel
+# splice. Intentionally minimal: an empty file is sufficient and
+# matches the upstream rules_rust example
+# (examples/crate_universe/cargo_workspace/.cargo/config.toml).

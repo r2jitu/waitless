@@ -1,0 +1,4 @@
+package(default_visibility = ["//visibility:public"])
+
+# Mark Cargo.toml as a label so the crate_universe extension can read it.
+exports_files(["Cargo.toml"])

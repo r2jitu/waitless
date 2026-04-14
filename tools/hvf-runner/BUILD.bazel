@@ -1,34 +1,53 @@
+load("@rules_rust//rust:defs.bzl", "rust_binary")
+
 package(default_visibility = ["//visibility:public"])
 
 exports_files([
+    "Cargo.toml",
     "run-hvf.entitlements",
 ])
 
-# Build the HVF runner from Rust source via cargo and codesign it.
-# Produces bazel-bin/tools/hvf-runner/run-hvf, a macOS arm64 command-line
-# binary with the com.apple.security.hypervisor entitlement.
+# Native HVF runner. Built as a host-tool aarch64 macOS binary (see
+# `target_compatible_with`); the Hypervisor framework is pulled in
+# via `#[link(name = "Hypervisor", kind = "framework")]` in
+# `src/hvf.rs`, so no explicit `rustc_flags` are needed here.
+# Cargo.toml is the source of truth for crate deps; @crates//:libc /
+# @crates//:vm-fdt come from crate_universe (see MODULE.bazel) which
+# reads the same file.
 #
-# Usage: bazel build //tools/hvf-runner:run_hvf
-#
-# Why genrule with local=True instead of rules_rust:
-#   - The project's .bazelrc.local sets --platforms=aarch64_unikernel which
-#     conflicts with rules_rust's host toolchain resolution.
-#   - local=True means the cmd runs on the exec (host) machine regardless of
-#     the Bazel target platform, so --platforms=aarch64_unikernel doesn't
-#     interfere.
+# This target is unsigned. Consumers should depend on `:run_hvf`
+# below, which codesigns the binary with the Hypervisor entitlement
+# (required by `hv_vm_create`). Internal name has an `_` so the
+# genrule below can produce a file named `run-hvf` without colliding.
+rust_binary(
+    name = "run_hvf_unsigned",
+    srcs = glob(["src/**/*.rs"]),
+    edition = "2021",
+    target_compatible_with = [
+        "@platforms//os:macos",
+        "@platforms//cpu:aarch64",
+    ],
+    deps = [
+        "@crates//:libc",
+        "@crates//:vm-fdt",
+    ],
+)
+
+# Codesigned binary — what consumers (bench.py, run-local.sh,
+# test_hvf.sh, the `bazel run` wrapper) actually execute. Output
+# path is `bazel-bin/tools/hvf-runner/run-hvf`, matching what every
+# consumer already uses.
 genrule(
     name = "run_hvf",
-    srcs = glob(["src/**/*.rs"]) + [
-        "Cargo.toml",
-        "Cargo.lock",
-        "build.rs",
+    srcs = [
+        ":run_hvf_unsigned",
         "run-hvf.entitlements",
     ],
     outs = ["run-hvf"],
     cmd = " && ".join([
-        "cargo build --release --manifest-path $(location Cargo.toml)",
-        "cp $$(dirname $(location Cargo.toml))/target/release/run-hvf $@",
-        "codesign --sign - --entitlements $(location run-hvf.entitlements) --force $@",
+        "cp $(location :run_hvf_unsigned) $@",
+        "chmod +w $@",
+        "codesign --sign - --entitlements $(location run-hvf.entitlements) --force $@ 2>/dev/null",
     ]),
-    local = True,
+    executable = True,
 )

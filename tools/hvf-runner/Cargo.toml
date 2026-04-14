@@ -5,34 +5,14 @@ edition = "2021"
 rust-version = "1.86"
 description = "Apple Hypervisor.framework runner for a bare-metal aarch64 unikernel"
 publish = false
-# Intentionally self-contained: the crate is designed to be extracted into
-# its own repository later via `git subtree split tools/hvf-runner`.
 
 [[bin]]
 name = "run-hvf"
 path = "src/main.rs"
 
 [dependencies]
-libc = "0.2"
-vm-fdt = "0.3"
-# applevisor provides safe HVF bindings. We currently use our own raw FFI
-# in src/hvf.rs because the smoke test was built before applevisor was
-# evaluated. Migration to applevisor is a follow-up — the FDT fix is the
-# immediate priority.
-# applevisor = { version = "1.0", features = ["macos-15-0", "macos-12-1"] }
+libc = { workspace = true }
+vm-fdt = { workspace = true }
 
-[profile.release]
-# Single-purpose, single-process, single-owner tool. We want the smallest,
-# fastest binary possible, and we want any crash to be an immediate abort
-# rather than an unwind (which could leave the kernel's host process in
-# a half-valid state mid-run).
-lto = "fat"
-codegen-units = 1
-opt-level = 3
-panic = "abort"
-strip = "symbols"
-
-[profile.dev]
-# Mirror release-mode panic behaviour so panics during development
-# don't behave differently from panics in CI.
-panic = "abort"
+# `[profile.*]` lives in the workspace root Cargo.toml — it would
+# only be ignored here.
