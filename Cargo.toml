@@ -101,7 +101,7 @@ getrandom = { version = "0.2", default-features = false, features = ["custom"] }
 # Features disabled: `aws_lc_rs`, `ring`, `prefer-post-quantum` (all
 # pull C toolchains / std). We keep `logging` for debug, `tls12` off
 # (1.3-only), and rely on rustls-rustcrypto for the crypto provider.
-rustls = { version = "0.23", default-features = false, features = ["logging"] }
+rustls = { version = "0.23", default-features = false, features = ["logging", "custom-provider"] }
 rustls-rustcrypto = { version = "0.0.2-alpha", default-features = false, features = ["alloc", "zeroize"] }
 rustls-pki-types = { version = "1", default-features = false, features = ["alloc"] }
 

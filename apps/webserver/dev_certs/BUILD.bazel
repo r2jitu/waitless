@@ -1,0 +1,12 @@
+package(default_visibility = ["//visibility:public"])
+
+# Pre-generated self-signed Ed25519 dev cert. Loaded into unikernel
+# binaries via include_bytes!() — see README.md for the regeneration
+# story and the deferred-work entry in ROADMAP.md for the production
+# cert + RNG path.
+exports_files([
+    "dev_cert.der",
+    "dev_key.der",
+    "dev_cert.pem",
+    "dev_key.pem",
+])

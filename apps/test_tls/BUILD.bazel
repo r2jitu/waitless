@@ -8,12 +8,19 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "app",
     srcs = ["main.rs"],
+    compile_data = [
+        "//apps/webserver/dev_certs:dev_cert.der",
+        "//apps/webserver/dev_certs:dev_key.der",
+    ],
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
     deps = [
         "//kernel",
         "//uni",
         "//net:tls",
         "//net:tls_crypto",
+        "@crates//:rustls",
+        "@crates//:rustls-pki-types",
+        "@crates//:rustls-rustcrypto",
     ],
 )
 

@@ -1,5 +1,5 @@
 {
-  "checksum": "bb6471cefb2fe541bf1ff21629aa607ebf98060d0643899f3cef8590cb333745",
+  "checksum": "b61bd63a9ebeb812d737012031b31975d07d9f606a7340266f301319c18e6834",
   "crates": {
     "aead 0.5.2": {
       "name": "aead",
@@ -4470,6 +4470,7 @@
         ],
         "crate_features": {
           "common": [
+            "custom-provider",
             "log",
             "logging"
           ],
