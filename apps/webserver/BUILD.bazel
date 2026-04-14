@@ -39,6 +39,7 @@ sh_test(
     data = select({
         "//bazel/platforms:runner_hvf": [
             ":webserver.img",
+            "//apps/webserver/dev_certs:dev_cert.pem",
             "//tools/hvf-runner:run_hvf",
             "//scripts:helpers.sh",
         ],
