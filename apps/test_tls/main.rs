@@ -320,6 +320,15 @@ fn main() {
             fail(b"rustls_server_config");
             failures += 1;
         }
+
+        // NOTE: a real in-memory client/server handshake test would
+        // be the next obvious step but `rustls::ServerConnection` /
+        // `ClientConnection` are both gated behind `feature = "std"`.
+        // The no_std handshake API is `UnbufferedServerConnection` /
+        // `UnbufferedClientConnection`, which has a substantially
+        // different (and more verbose) byte-buffer interface.
+        // Deferred — see ROADMAP.md → "Deferred work" → TLS handshake
+        // exercise.
     }
 
     // ---- 7. kernel::rng — fill_bytes produces non-trivial output ------
