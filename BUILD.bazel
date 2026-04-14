@@ -13,9 +13,13 @@ exports_files([
     ".cargo/config.toml",
 ])
 
-# Regenerate rust-project.json for rust-analyzer:
-#   bazel run //:rust_analyzer
+# rust-analyzer auto-discovery target. VS Code's rust-analyzer
+# extension calls this via `.vscode/settings.json` whenever it needs
+# fresh project metadata; we don't have to regenerate manually.
+# Wrapped by `scripts/discover-rust-project.sh` so the IDE bazel
+# invocation uses an isolated `--output_base` and doesn't fight the
+# CLI bazel server for locks.
 alias(
-    name = "rust_analyzer",
-    actual = "@rules_rust//tools/rust_analyzer:gen_rust_project",
+    name = "discover_rust_project",
+    actual = "@rules_rust//tools/rust_analyzer:discover_bazel_rust_project",
 )

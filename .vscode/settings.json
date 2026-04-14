@@ -1,0 +1,34 @@
+{
+    // rust-analyzer auto-discovery via rules_rust.
+    //
+    // Whenever the IDE needs project metadata (project open, BUILD
+    // file edit, etc.), it runs `scripts/discover-rust-project.sh`,
+    // which shells out to bazel and asks rules_rust for the current
+    // crate graph. No `rust-project.json` to regenerate by hand.
+    //
+    // `filesToWatch` triggers a refresh on edits to BUILD files and
+    // MODULE.bazel — adding a dependency in the right place is
+    // reflected in completion / go-to-def almost immediately.
+    "rust-analyzer.workspace.discoverConfig": {
+        "command": [
+            "${workspaceFolder}/scripts/discover-rust-project.sh",
+            "{arg}"
+        ],
+        "progressLabel": "rules_rust",
+        "filesToWatch": [
+            "BUILD",
+            "BUILD.bazel",
+            "MODULE.bazel",
+            "Cargo.toml"
+        ]
+    },
+
+    // Don't run `cargo check` — bazel is the build system. The
+    // unikernel kernel/uni crates aren't even cargo-buildable.
+    "rust-analyzer.check.overrideCommand": [],
+    "rust-analyzer.cargo.buildScripts.enable": false,
+
+    // Show inlay hints for type information in the editor margin.
+    "rust-analyzer.inlayHints.typeHints.enable": true,
+    "rust-analyzer.inlayHints.parameterHints.enable": true
+}

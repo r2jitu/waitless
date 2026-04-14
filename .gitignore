@@ -13,8 +13,12 @@ bazel-agent-*
 # Editors
 *.swp
 *.swo
-.vscode/
 .idea/
+
+# VS Code: commit shareable settings (rust-analyzer wiring), ignore
+# everything else (per-user launch.json, tasks.json, debug state).
+.vscode/*
+!.vscode/settings.json
 
 # Claude Code
 .claude/

@@ -10,8 +10,11 @@ build --@rules_rust//:extra_rustc_flags=-Cpanic=abort,-Copt-level=2,-Dwarnings
 # unikernel target platform but runs on the host (sh_test wrapping a
 # binary), so the new behaviour rejects it. Until we add a proper
 # platform transition for tests, opt out of the new default and fall
-# back to the bazel 7/8 behaviour.
-test --@bazel_tools//tools/test:incompatible_use_default_test_toolchain=false
+# back to the bazel 7/8 behaviour. `common` (instead of `test`) so
+# the flag applies to `bazel build` too — the rust-analyzer
+# discover_bazel_rust_project tool runs `bazel build //...` and trips
+# on test targets in transitive analysis if the flag isn't visible.
+common --@bazel_tools//tools/test:incompatible_use_default_test_toolchain=false
 
 # ── Shorthand configs ─────────────────────────────────────────────────────────
 # --config=qemu → unikernel via QEMU (platform from .bazelrc.local for host arch)
