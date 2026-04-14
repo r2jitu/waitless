@@ -44,19 +44,15 @@ mod backend {
     pub fn num_workers() -> u32 { kernel::percpu::num_cores() }
     pub fn set_service(f: fn(u32) -> bool) { kernel::eventloop::set_service(f); }
     pub fn set_ready() { kernel::eventloop::set_ready(); }
-    #[allow(dead_code)]
-    pub fn run(id: u32) -> ! { kernel::eventloop::run(id) }
     pub fn request_shutdown() { kernel::eventloop::request_shutdown(); }
 
     /// Register an IO poll callback. On unikernel, this is handled by
     /// kernel::eventloop callbacks (net_poll, net_drain, etc). For app-level
     /// IO sources, this is a placeholder — real registration goes through
-    /// kernel::eventloop directly.
-    #[allow(dead_code)]
-    pub fn register_io_poll(_f: fn(u32) -> bool) {
-        // Unikernel IO sources register with kernel::eventloop directly
-        // (e.g., net::init_eventloop sets net_poll/net_drain/net_flush).
-    }
+    /// kernel::eventloop directly. The no-op body is intentional — apps
+    /// that target both unikernel and native can call this unconditionally
+    /// and the unikernel side is simply a shim.
+    pub fn register_io_poll(_f: fn(u32) -> bool) {}
 }
 
 #[cfg(platform_native)]

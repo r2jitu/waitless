@@ -23,7 +23,11 @@ pub static RX_BUF: Mutex<VecDeque<u8>> = Mutex::new(VecDeque::new());
 const DR: u64 = 0x000;
 const FR: u64 = 0x018;
 
-/// Flag register bits.
+/// Flag register bits. We always emulate the TX FIFO as empty (writes
+/// always succeed on the host stdio sink), so FR_TXFF isn't read — but
+/// it's part of the register layout the kernel may inspect, and
+/// documenting the full shape of FR here is more helpful than pretending
+/// the bit doesn't exist.
 #[allow(dead_code)]
 const FR_TXFF: u32 = 1 << 5; // TX FIFO full
 const FR_RXFE: u32 = 1 << 4; // RX FIFO empty

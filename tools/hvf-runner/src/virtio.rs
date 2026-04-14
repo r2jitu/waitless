@@ -94,7 +94,9 @@ pub struct VirtioNet {
     /// Host pointer to the start of guest RAM (for translating GPAs to host).
     ram_host: *mut u8,
     ram_base: u64,
-    /// Current used_idx for each queue, updated by check_rx/process_tx.
+    /// Current used_idx for each queue, updated by the vCPU thread's
+    /// inline RX/TX drains in `userspace_net::poll_worker_iteration` /
+    /// `process_tx_queue`.
     /// Read by the guest via device config at offset 0x110+queue*2
     /// to bypass dcache coherency issues on HVF.
     pub used_idx: [u16; MAX_QUEUES],

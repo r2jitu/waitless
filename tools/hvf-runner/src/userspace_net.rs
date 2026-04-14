@@ -531,12 +531,6 @@ pub fn process_tx_queue(queue_idx: u32) {
     // no new RX, wastes an MMIO exit).
 }
 
-/// Backward-compat wrapper for single-queue callers.
-#[allow(dead_code)]
-pub fn process_tx() {
-    process_tx_queue(1);
-}
-
 // ── Inline polling: vCPU thread runs the worker iteration ──────────────────
 //
 // The vCPU thread itself owns its `IoState` (looked up in `VCPU_IOS`)
