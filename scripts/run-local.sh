@@ -143,11 +143,16 @@ if [ "$HOST_OS" = "Darwin" ] && [ "$HOST_ARCH" = "arm64" ]; then
         fi
     fi
 
+    # Multi-queue: aarch64 uses virtio-mmio (no PCI, no MSI-X). The driver
+    # still negotiates VIRTIO_NET_F_MQ and creates N queue pairs; QEMU's
+    # virtio-net-device accepts neither `mq=on` nor `vectors=` flags on
+    # -device, so no extra args needed here.
+    #
     # Must use TCG — Apple Hypervisor.framework doesn't guarantee ISV=1 in
     # ESR_EL2 for MMIO exits, causing QEMU to assert in hvf_handle_exception.
     exec qemu-system-aarch64 \
         -machine virt \
-        -accel tcg \
+        -accel tcg,thread=multi \
         -kernel "$IMG" \
         -m "${MEMORY}" \
         -smp "${CPUS}" \
@@ -198,14 +203,24 @@ if [ "$HOST_OS" = "Linux" ]; then
             echo "Install with: sudo apt install qemu-system-x86"
             exit 1
         fi
+        # Multi-queue on virtio-net-pci: mq=on + vectors=2N+2 (one per
+        # RX + one per TX + config + ctrl). netdev queues=N so QEMU
+        # allocates N host queue pairs. Guest driver negotiates MQ and
+        # activates N pairs via CTRL_MQ_VQ_PAIRS_SET after DHCP.
+        DEVICE="virtio-net-pci,netdev=net0"
+        NETDEV="user,id=net0,hostfwd=tcp::${HOST_PORT}-:80"
+        if [ "${CPUS}" -gt 1 ]; then
+            DEVICE="virtio-net-pci,netdev=net0,mq=on,vectors=$((2*CPUS+2))"
+            NETDEV="user,id=net0,hostfwd=tcp::${HOST_PORT}-:80,queues=${CPUS}"
+        fi
         exec qemu-system-x86_64 \
             -kernel "$KERNEL" \
             -m "${MEMORY}" \
             -smp "${CPUS}" \
             -cpu qemu64 \
             "${QEMU_OUTPUT[@]}" \
-            -device virtio-net-pci,netdev=net0 \
-            -netdev "user,id=net0,hostfwd=tcp::${HOST_PORT}-:80" \
+            -device "$DEVICE" \
+            -netdev "$NETDEV" \
             "${KVM_FLAGS[@]}"
     fi
 fi
@@ -216,6 +231,13 @@ if ! command -v qemu-system-x86_64 &>/dev/null; then
     exit 1
 fi
 
+DEVICE="virtio-net-pci,netdev=net0"
+NETDEV="user,id=net0,hostfwd=tcp::${HOST_PORT}-:80"
+if [ "${CPUS}" -gt 1 ]; then
+    DEVICE="virtio-net-pci,netdev=net0,mq=on,vectors=$((2*CPUS+2))"
+    NETDEV="user,id=net0,hostfwd=tcp::${HOST_PORT}-:80,queues=${CPUS}"
+fi
+
 QEMU_X86=(
     qemu-system-x86_64
     -kernel "$KERNEL"
@@ -223,8 +245,8 @@ QEMU_X86=(
     -smp "${CPUS}"
     -cpu qemu64
     "${QEMU_OUTPUT[@]}"
-    -device virtio-net-pci,netdev=net0
-    -netdev "user,id=net0,hostfwd=tcp::${HOST_PORT}-:80"
+    -device "$DEVICE"
+    -netdev "$NETDEV"
 )
 
 if sysctl -n kern.hv_support 2>/dev/null | grep -q '^1$'; then

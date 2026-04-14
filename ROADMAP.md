@@ -514,32 +514,50 @@ bazel test //apps/test_smp:test --config=qemu  # same on QEMU
 # Webserver still runs single-core here — cores boot but networking is next
 ```
 
-### 2b. Tier 1: multi-queue + MSI-X (QEMU)
+### 2b. Tier 1: multi-queue + MSI-X
 
-- [ ] Negotiate `VIRTIO_NET_F_MQ` feature bit
-- [ ] Create N queue pairs (one per core)
-- [ ] MSI-X setup: allocate vectors, program MSI-X table
-- [ ] MSI-X affinity: route each vector to owning core (APIC / GICv2M)
-- [ ] RSS configuration: program indirection table + hash key
-- [ ] Per-core RX/TX poll in event loop
-- [ ] Log which core handles each HTTP request
-- [ ] QEMU flags: `-smp N`, `mq=on,queues=N,vectors=2N+2`
-- [ ] Extend bench.sh: compare 1-core vs 2-core vs 4-core throughput
+- [x] Negotiate `VIRTIO_NET_F_MQ` feature bit (modern PCI + MMIO paths)
+- [x] Create N queue pairs (one per core) via `max_virtqueue_pairs` device config
+- [x] Control VQ + `VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET` command to activate N pairs after DHCP
+- [x] MSI-X setup on x86_64 ModernPCI: parse capability, write table, enable
+- [x] MSI-X per-core affinity on x86_64: each RX vector → owning vCPU's LAPIC (ACPI topology)
+- [x] Per-core RX poll in event loop: each core polls `rx_queues[core_id]` with NAPI rearm
+- [x] Per-core TX path: deferred kick, `flush_tx_kick_if_dirty()` uses per-core TX queue
+- [x] Tier auto-detection (runtime branch on `has_mq && num_queue_pairs > 1`)
+- [x] bench.py `QemuEnv` / `KvmEnv` pass `mq=on,vectors=2N+2` + `queues=N` (tap/vhost)
+- [x] bench.py compares 1-core vs N-core throughput by default
+- [x] HVF runner (Apple Silicon native): multi-queue Tier 1 via SO_REUSEPORT UDP siblings + TCP accept dispatcher
+- [x] Local `scripts/run-local.sh`: pass `mq=on,queues=N,vectors=2N+2` when `UNIKERNEL_CPUS > 1`
+
+**Not implemented / deferred:**
+- [ ] **aarch64 QEMU MSI routing** — virtio-mmio driver creates N queue pairs but only
+      registers an IRQ for queue 0 (single SPI from FDT `interrupts`). Multi-queue still
+      works functionally because the event loop spins before HLTing (`IDLE_SPIN_BEFORE_HLT`),
+      but non-core-0 cores don't wake *directly* on their own queue. aarch64 TCG multi-core
+      bench (`qemu-arm`) is single-core-only in `bench.py` anyway. Fix requires GICv2M or
+      ITS integration; parked behind HVF (which already has full Tier 1 via the native runner).
+- [ ] **Explicit RSS** — no `VIRTIO_NET_F_RSS` / indirection table. QEMU's virtio-net
+      automatically flow-hashes across queue pairs when `mq=on`, which is what we currently
+      rely on. Good enough until we see a workload that proves otherwise.
 
 **Tests:**
-- [ ] Integration: `test_multiqueue` — boot with `-smp 4, mq=on,queues=4`, verify 4 queue pairs negotiated
-- [ ] Integration: `test_msix_affinity` — verify MSI-X vectors route to correct cores
-- [ ] Integration: `test_rss_distribution` — send from multiple source ports, verify packets land on different cores
-- [ ] Integration: HTTP smoke tests with `-smp 4` (regression)
+- [x] Integration: x86_64 QEMU TCG + KVM boot with `-smp 4, mq=on, queues=4`, 4 pairs negotiated
+      (verified via serial log "virtio_net: multi-queue: 4 queue pairs")
+- [x] Integration: HTTP + UDP smoke tests with `-smp 4` across x86_64 TCG, x86_64 KVM, HVF
+- [x] Integration: `/compute` scales near-linearly with core count on x86_64 MTTCG (4 cores)
 
 **Try it (the big milestone):**
 ```bash
-# Webserver on 4 cores — serial shows requests handled by different cores
-bazel run //apps/webserver:run   # with -smp 4 in run script
-# Benchmark: compare 1 vs 4 cores
-UNIKERNEL_CPUS=1 ./scripts/bench.sh   # baseline
-UNIKERNEL_CPUS=4 ./scripts/bench.sh   # expect ~linear scaling
-# Watch serial output for "core 2: GET /health from 10.0.2.2:54321"
+# Webserver on 4 cores — each core owns its own virtio queue pair
+UNIKERNEL_CPUS=4 ./scripts/run-local.sh
+# Serial: "virtio_net: MSI-X enabled (4 RX vectors)"
+#         "virtio_net: MQ activated"
+#         "[net] Tier 1: per-core RX queues (4 queue pairs)"
+
+# Compare 1 vs 4 cores
+python3 scripts/bench.py --env hvf --cores 1,4           # HVF on Apple Silicon
+python3 scripts/bench.py --env qemu --cores 1,4          # x86_64 TCG
+python3 scripts/bench.py --env kvm  --cores 1,4          # x86_64 KVM (GCP)
 ```
 
 ### 2c. Tier 2: software distribution (VZ + single-queue)
@@ -566,25 +584,13 @@ UNIKERNEL_CPUS=4 ./scripts/bench.sh   # expect ~linear scaling
 - [x] Direct RX distribution (no batch buffer copy)
 - [x] Try-lock direct TX send (bypass staging when uncontended)
 - [x] Graduated idle backoff (reduce MTTCG wasted wakeups)
-- [ ] Tier auto-detection: MQ offered -> Tier 1, else -> Tier 2 (deferred to 2b)
+- [x] Tier auto-detection: `net::poll()` branches on `drivers::virtio_net::num_queue_pairs()`
+      — MQ negotiated → Tier 1 path (`poll_tier1`), else → Tier 2 (`poll_tier2`).
 
-**Multi-core scaling results (x86_64 MTTCG, 4 cores):**
-
-| Workload | 1-core | 4-core | Scaling |
-|----------|--------|--------|---------|
-| /health c=1 | 15,452 | 6,979 | 0.45x (single-conn, no parallelism) |
-| /health c=8 | 17,130 | 22,303 | 1.30x (IO-bound, VirtIO limited) |
-| /compute c=1 | 3,165 | 3,231 | 1.02x (single-conn) |
-| /compute c=8 | ~3,900 | ~13,900 | **3.5-3.8x** (CPU-bound, near-linear) |
-
-**Known limitations:**
-
-- [ ] **VZ multi-core TCP**: VZ TCP proxy routes all connections from single source
-- [ ] **VZ exclusive monitor**: VZ rejects all atomic RMW on guest RAM (DFSC 0x35).
-  Workaround: volatile read-modify-write for counters. Root cause: VZ Stage-2
-  correctly for some BSS addresses. Workaround in place (volatile writes),
-  but limits use of Rust atomics on VZ. May need to relocate atomics to
-  a dedicated memory region or use ARMv8.1 LSE atomics.
+**Historical note (VZ.framework):** Tier 2 was originally built to get multi-core working
+under VZ.framework, which has no multi-queue and forces all INTx to core 0. VZ is no
+longer the local dev runner on Apple Silicon (the native HVF runner in `tools/hvf-runner`
+replaced it; see MEMORY.md). Tier 2 is still the code path for any single-queue platform.
 
 **Tests:**
 - [x] Integration: HTTP + UDP tests pass with -smp 4 on both arches
@@ -667,7 +673,7 @@ Maybe 100 lines. Sits between IPv4 and QUIC.
 - [x] Checksum calculation (reuses tcp_checksum with proto=17)
 - [x] Port-based dispatch: bind(port, handler), up to 8 handlers
 - [x] ipv4_receive dispatches PROTO_UDP to udp_receive
-- [ ] `//net:udp` as separate Bazel target (currently part of //net:net)
+- [x] `//net:udp` as separate Bazel target (deps: types, from_bytes, ipv4, kernel)
 
 **Tests:**
 - [x] Unit: UDP checksum computation + verification
