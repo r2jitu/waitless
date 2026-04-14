@@ -127,8 +127,6 @@ X86_CRYPTO_FEATURES = "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse
         "ghash",
         "poly1305",
         "polyval",
-        "rsa",
-        "rustls-rustcrypto",
     )
 ]
 

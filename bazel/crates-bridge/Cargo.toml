@@ -32,6 +32,3 @@ p256 = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand_core = { workspace = true }
 getrandom = { workspace = true }
-rustls = { workspace = true }
-rustls-rustcrypto = { workspace = true }
-rustls-pki-types = { workspace = true }

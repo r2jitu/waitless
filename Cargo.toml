@@ -41,27 +41,42 @@ limine = { version = "0.5.0", default-features = false }
 # TLS 1.3 crypto primitives from the RustCrypto project. Pure Rust,
 # no_std + alloc compatible. Pulled in via crates-bridge so the
 # bare-metal kernel/uni rust_library targets can use them directly.
-# Versions chosen to be the latest stable as of 2026-04.
+#
+# Design note (2026-04-14): we DELIBERATELY do NOT use `rustls` +
+# `rustls-rustcrypto` despite them building for our target. Reasons:
+#
+#   - rustls forces every handshake message through `Vec<u8>` and
+#     wraps connection state in `Arc<ServerConfig>` / `Arc<dyn
+#     ResolvesServerCert>` / ... Our kernel heap isn't slabbed and our
+#     per-core model doesn't need atomic refcounts. The
+#     allocation-plus-vtable overhead is pure cost.
+#   - `rustls-rustcrypto 0.0.2-alpha` is explicitly marked
+#     "DO NOT USE IN PRODUCTION" by upstream.
+#   - QUIC's packet protection bypasses rustls's record layer anyway;
+#     wiring rustls now means half-in-half-out when we get to QUIC.
+#
+# Instead we use the audited RustCrypto *primitives* directly and
+# build our own TLS 1.3 handshake + record layer in `//net:tls_*`.
+# Everything the crypto audit cares about (AEAD / HKDF / signatures /
+# kx) comes from RustCrypto; the TLS state machine is protocol logic
+# we own, with RFC 8448 test vectors for correctness.
 sha2 = { version = "0.10", default-features = false }
 hmac = { version = "0.12", default-features = false }
 hkdf = { version = "0.12", default-features = false }
-# Audited AEAD for TLS 1.3 record encryption. We ship the full set
-# so rustls / quinn-proto can pick any:
+# Audited AEAD for TLS 1.3 record encryption.
+#   - aes-gcm + polyval for TLS_AES_128_GCM_SHA256 / _256_ (future)
+#   - chacha20poly1305 + poly1305 + chacha20 for our MTI suite,
+#     TLS_CHACHA20_POLY1305_SHA256.
 #
-# - `aes-gcm` + `polyval` for TLS_AES_128_GCM_SHA256 / _256_
-# - `chacha20poly1305` + `poly1305` + `chacha20` for
-#   TLS_CHACHA20_POLY1305_SHA256
-#
-# All of these unconditionally emit `__m128i` / pclmulqdq intrinsic
-# code on x86_64 (auto-selected at compile time, runtime-dispatched
-# via `cpufeatures`). The stock `x86_64-unknown-none` target spec
-# has `+soft-float,-sse` which makes LLVM bail with "Do not know how
-# to split the result of this operator!" when it tries to legalise
-# those intrinsics without register support. We fix it per-crate in
-# MODULE.bazel via a `crate.annotation` that passes
-# `-Ctarget-feature=-soft-float,+sse,+sse2,...` — the kernel already
-# enables SSE at boot (CR4.OSFXSR) and our cooperative scheduler
-# never preempts, so kernel-side SIMD is safe.
+# Every RustCrypto AEAD auto-compiles both a SIMD intrinsic path AND
+# a software path, dispatched at runtime via `cpufeatures`, so BOTH
+# must compile. The stock `x86_64-unknown-none` target has
+# `+soft-float,-sse` baked in and LLVM bails with "Do not know how
+# to split the result of this operator!" (rust-lang/rust#87642,
+# #92760). Fixed per-crate in MODULE.bazel via `crate.annotation`
+# with `-Ctarget-feature=-soft-float,+sse,+sse2,...`. The kernel
+# already enables SSE at boot (CR4.OSFXSR) and our cooperative
+# scheduler never preempts, so kernel-side SIMD is safe.
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 # Direct dep on the chacha20 stream cipher so `kernel::rng` can use
@@ -71,39 +86,19 @@ chacha20poly1305 = { version = "0.10", default-features = false, features = ["al
 chacha20 = { version = "0.9", default-features = false, features = ["zeroize"] }
 # Key exchange: X25519 is the only MTI group for TLS 1.3 and QUIC.
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
-# ECDSA verification for P-256 server certificates (common with self-signed
-# dev certs).
+# ECDSA for P-256 server certificates (if we ever ship them).
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8"] }
-# Ed25519 signatures for a simpler cert option.
+# Ed25519 signatures — used to sign the TLS 1.3 CertificateVerify
+# message with our checked-in dev cert's Ed25519 private key.
 ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
-# Random: `rand_core` trait + entropy source. We supply our own RNG
-# from the kernel (jitter + cycle counter), this is just the trait.
+# Random: `rand_core` trait. Actual entropy comes from `kernel::rng`.
 rand_core = { version = "0.6", default-features = false }
 
-# `getrandom` 0.2.x is pulled in transitively by rand_core / rustls-
-# rustcrypto / curve25519-dalek. Bare-metal targets are not on
-# getrandom's "supported" list, so it `compile_error!`s unless we
-# enable the `custom` backend feature and supply our own implementation
-# via the `register_custom_getrandom!` macro. The implementation lives
-# in `//kernel:rng` (ChaCha20 reseeded from TSC/CNTVCT jitter — see
-# the deferred work in ROADMAP for a properly seeded path).
-#
-# We declare it at the workspace level so Cargo's feature unification
-# makes the `custom` backend active for every consumer of getrandom.
+# `getrandom` 0.2.x is pulled in transitively by rand_core /
+# curve25519-dalek. Bare-metal targets aren't on its supported list
+# so we enable the `custom` backend feature and register our callback
+# via `kernel::rng::register_custom_getrandom!`.
 getrandom = { version = "0.2", default-features = false, features = ["custom"] }
-
-# TLS 1.3 stack. rustls 0.23 supports no_std via `default-features=false`,
-# rustls-rustcrypto supplies the audited pure-Rust crypto provider
-# (built on the RustCrypto primitives we already compile for bare metal
-# thanks to the target-feature annotations in MODULE.bazel). See
-# //net:tls integration for how the server is wired up.
-#
-# Features disabled: `aws_lc_rs`, `ring`, `prefer-post-quantum` (all
-# pull C toolchains / std). We keep `logging` for debug, `tls12` off
-# (1.3-only), and rely on rustls-rustcrypto for the crypto provider.
-rustls = { version = "0.23", default-features = false, features = ["logging", "custom-provider"] }
-rustls-rustcrypto = { version = "0.0.2-alpha", default-features = false, features = ["alloc", "zeroize"] }
-rustls-pki-types = { version = "1", default-features = false, features = ["alloc"] }
 
 # Warnings are errors for every workspace member's cargo-standalone
 # build. Bazel builds get the same policy via the `-Dwarnings` flag in

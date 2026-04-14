@@ -14,51 +14,11 @@
 
 #![no_std]
 
-extern crate alloc;
 extern crate kernel;
 extern crate uni;
 
 extern crate net_tls as tls;
 extern crate net_tls_crypto as tls_crypto;
-extern crate rustls;
-extern crate rustls_pki_types;
-extern crate rustls_rustcrypto;
-
-use alloc::sync::Arc;
-use alloc::vec;
-
-/// Tiny `ResolvesServerCert` impl that hands back the same cert for
-/// every SNI. Sufficient for a one-cert dev server; production servers
-/// would multiplex on `client_hello.server_name()`.
-#[derive(Debug)]
-struct StaticResolver {
-    ck: Arc<rustls::sign::CertifiedKey>,
-}
-
-impl rustls::server::ResolvesServerCert for StaticResolver {
-    fn resolve(
-        &self,
-        _client_hello: rustls::server::ClientHello<'_>,
-    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
-        Some(self.ck.clone())
-    }
-}
-
-/// Always-zero `TimeProvider` for our no_std build. We never validate
-/// cert expiry on the server side (we don't auth the client) and TLS
-/// 1.3 ticket lifetimes aren't in play either, so the wall clock is
-/// unused. If/when we add session resumption or client auth, swap in
-/// a real CNTVCT_EL0 / TSC-driven implementation.
-#[derive(Debug)]
-struct NoTimeProvider;
-
-impl rustls::time_provider::TimeProvider for NoTimeProvider {
-    fn current_time(&self) -> Option<rustls_pki_types::UnixTime> {
-        Some(rustls_pki_types::UnixTime::since_unix_epoch(
-            core::time::Duration::from_secs(0),
-        ))
-    }
-}
 
 fn logn(msg: &[u8]) {
     uni::log(msg);
@@ -240,98 +200,7 @@ fn main() {
         }
     }
 
-    // ---- 6. Build a real rustls ServerConfig from the dev cert --------
-    // Proves the entire rustls 0.23 + rustls-rustcrypto + RustCrypto
-    // primitives + kernel::rng stack links and runs on bare metal:
-    // load the checked-in dev cert + key, narrow the provider to
-    // TLS_CHACHA20_POLY1305_SHA256 + X25519, build a ServerConfig.
-    // Doesn't drive a handshake yet — that needs a TCP socket on a
-    // listening port and is the next step.
-    {
-        const DEV_CERT_DER: &[u8] =
-            include_bytes!("../../apps/webserver/dev_certs/dev_cert.der");
-        const DEV_KEY_DER: &[u8] =
-            include_bytes!("../../apps/webserver/dev_certs/dev_key.der");
-
-        // Reshape the static byte slices into the rustls-pki-types
-        // wrappers. The `_static` constructors avoid an alloc.
-        let cert = rustls_pki_types::CertificateDer::from(DEV_CERT_DER);
-        let key = rustls_pki_types::PrivateKeyDer::Pkcs8(
-            rustls_pki_types::PrivatePkcs8KeyDer::from(DEV_KEY_DER),
-        );
-
-        // Pick the rustls-rustcrypto provider, narrow it to the one
-        // suite + group we ship.
-        let mut provider = rustls_rustcrypto::provider();
-        provider
-            .cipher_suites
-            .retain(|cs| cs.suite() == rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256);
-        provider
-            .kx_groups
-            .retain(|g| g.name() == rustls::NamedGroup::X25519);
-
-        let suites_ok = !provider.cipher_suites.is_empty();
-        let kx_ok = !provider.kx_groups.is_empty();
-
-        // Resolve the server cert via the cert resolver.
-        let signing_key = match provider.key_provider.load_private_key(key) {
-            Ok(sk) => sk,
-            Err(_) => {
-                fail(b"rustls_load_private_key");
-                failures += 1;
-                logn(b"TLS test complete. Shutting down.\n");
-                return;
-            }
-        };
-        let certified_key = rustls::sign::CertifiedKey::new(vec![cert], signing_key);
-        let resolver: Arc<dyn rustls::server::ResolvesServerCert> =
-            Arc::new(StaticResolver { ck: Arc::new(certified_key) });
-
-        // Build ServerConfig (TLS 1.3 only, anonymous client).
-        // `builder_with_provider` is gated on `feature = "std"`; the
-        // no_std API is `builder_with_details` which takes both the
-        // crypto provider and an explicit TimeProvider. We supply a
-        // do-nothing time provider since we're not validating cert
-        // expiry on the server side (no client certs).
-        let provider_arc = Arc::new(provider);
-        let time_provider: Arc<dyn rustls::time_provider::TimeProvider> =
-            Arc::new(NoTimeProvider);
-        let config_builder = rustls::ServerConfig::builder_with_details(
-            provider_arc.clone(),
-            time_provider,
-        )
-        .with_protocol_versions(&[&rustls::version::TLS13]);
-        let config_builder = match config_builder {
-            Ok(b) => b,
-            Err(_) => {
-                fail(b"rustls_protocol_versions");
-                failures += 1;
-                logn(b"TLS test complete. Shutting down.\n");
-                return;
-            }
-        };
-        let _config: rustls::ServerConfig = config_builder
-            .with_no_client_auth()
-            .with_cert_resolver(resolver);
-
-        if suites_ok && kx_ok {
-            pass(b"rustls_server_config");
-        } else {
-            fail(b"rustls_server_config");
-            failures += 1;
-        }
-
-        // NOTE: a real in-memory client/server handshake test would
-        // be the next obvious step but `rustls::ServerConnection` /
-        // `ClientConnection` are both gated behind `feature = "std"`.
-        // The no_std handshake API is `UnbufferedServerConnection` /
-        // `UnbufferedClientConnection`, which has a substantially
-        // different (and more verbose) byte-buffer interface.
-        // Deferred — see ROADMAP.md → "Deferred work" → TLS handshake
-        // exercise.
-    }
-
-    // ---- 7. kernel::rng — fill_bytes produces non-trivial output ------
+    // ---- 6. kernel::rng — fill_bytes produces non-trivial output ------
     // Smoke-tests the seed-collection-from-cycle-counter path AND the
     // ChaCha20 keystream expansion. We can't check randomness quality
     // in a unit test, but we CAN check (a) the same RNG state produces
