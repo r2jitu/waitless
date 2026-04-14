@@ -6,7 +6,7 @@ module(
 bazel_dep(name = "rules_cc", version = "0.1.1")
 bazel_dep(name = "rules_shell", version = "0.6.1")
 bazel_dep(name = "platforms", version = "0.0.10")
-bazel_dep(name = "rules_rust", version = "0.62.0")
+bazel_dep(name = "rules_rust", version = "0.68.1")
 
 # Patch rules_rust to add aarch64-unknown-none to the platform registry.
 # Without this, crate_universe marks crates as incompatible for our
@@ -32,7 +32,7 @@ rust.toolchain(
         "aarch64-unknown-none",
         "x86_64-unknown-linux-musl",
     ],
-    versions = ["1.86.0"],
+    versions = ["1.91.1"],
 )
 use_repo(rust, "rust_toolchains")
 

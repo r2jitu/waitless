@@ -2,7 +2,7 @@
 name = "hvf-runner"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.86"
+rust-version = "1.91"
 description = "Apple Hypervisor.framework runner for a bare-metal aarch64 unikernel"
 publish = false
 
