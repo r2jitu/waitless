@@ -540,12 +540,17 @@ class HvfEnv:
     udp_port_offset = 10000  # host UDP port = guest port + 10000
 
     def build(self):
-        # Single bazel call builds both the guest image and the HVF
-        # runner (codesigning is wired into the runner's genrule).
+        # Two bazel calls because the runner is a host tool and
+        # webserver.img needs `--config=qemu` (which sets the
+        # aarch64_unikernel target platform). Combining them in one
+        # invocation makes bazel try to build the runner under the
+        # unikernel platform and fail its `target_compatible_with`.
+        subprocess.run(
+            ["bazel", "build", "//tools/hvf-runner:run_hvf"],
+            capture_output=True, cwd=PROJECT_ROOT, timeout=240)
         subprocess.run(
             ["bazel", "build", "--config=qemu",
-             "//apps/webserver:webserver.img",
-             "//tools/hvf-runner:run_hvf"],
+             "//apps/webserver:webserver.img"],
             capture_output=True, cwd=PROJECT_ROOT, timeout=240)
 
     def start(self, cpus, port):
