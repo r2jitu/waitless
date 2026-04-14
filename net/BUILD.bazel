@@ -116,6 +116,29 @@ rust_library(
     ],
 )
 
+# ── TLS 1.3 crypto ──────────────────────────────────────────────────
+#
+# Hand-rolled ChaCha20 + Poly1305 + AEAD_CHACHA20_POLY1305 (RFC 8439).
+# Written in-tree rather than using the `chacha20poly1305` crate because
+# the latter's cpufeatures-gated SIMD path doesn't compile on our
+# bare-metal `x86_64-unknown-none` target. See Cargo.toml for the full
+# investigation. This is ~500 lines of pure, portable Rust; the host-
+# native unit test runs the RFC 8439 test vectors.
+
+rust_library(
+    name = "tls_crypto",
+    srcs = ["tls_crypto.rs"],
+    crate_root = "tls_crypto.rs",
+    crate_name = "net_tls_crypto",
+    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+)
+
+rust_test(
+    name = "tls_crypto_test",
+    crate = ":tls_crypto",
+    rustc_flags = ["-Cpanic=unwind"],
+)
+
 rust_library(
     name = "dhcp",
     srcs = ["dhcp.rs"],
