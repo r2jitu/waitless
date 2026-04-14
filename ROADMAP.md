@@ -688,22 +688,69 @@ bazel test --config=aarch64-qemu //apps/webserver:test # HTTP + UDP echo (aarch6
 
 ### 3b. TLS 1.3 crypto
 
-QUIC mandates TLS 1.3. Options:
-- **`ring`** — AWS's crypto library, `no_std` compatible core
-- **`rustls`** — higher level, may need `alloc` but not `std`
-- **Manual**: implement TLS 1.3 handshake + AES-GCM using `ring` primitives
+QUIC mandates TLS 1.3. Path taken (2026-04-14): hybrid — pull the
+TLS 1.3 primitives we need from RustCrypto via crate_universe, and
+hand-roll ChaCha20-Poly1305 in-tree so we avoid the `cpufeatures`
+SIMD paths that don't compile for `x86_64-unknown-none`.
 
-Minimum viable: one cipher suite (TLS_AES_128_GCM_SHA256), server-only,
-no client certs, no 0-RTT.
+Cipher suite: `TLS_CHACHA20_POLY1305_SHA256` (the TLS 1.3 MTI suite
+that doesn't need AES-NI / polyval). No AES-GCM for now —
+`aes-gcm` + `polyval` trip LLVM legalisation on bare-metal x86_64
+and the fix would require fighting per-crate target features.
 
-- [ ] Select and integrate crypto library via crate_universe
-- [ ] TLS 1.3 handshake (server-side)
-- [ ] AES-128-GCM encrypt/decrypt
-- [ ] Certificate handling (self-signed for dev)
+- [x] RustCrypto primitives via crate_universe: `sha2`, `hmac`, `hkdf`,
+      `x25519-dalek`, `p256`, `ed25519-dalek`, `rand_core`. All build
+      on both `x86_64-unknown-none` and `aarch64-unknown-none` after
+      a `curve25519-dalek` build-script `CARGO_CFG_CURVE25519_DALEK_BACKEND=serial`
+      override in MODULE.bazel.
+- [x] `#[global_allocator]` in `uni::heap` forwarding to
+      `kernel::mm::kmalloc/kfree`, needed for the RustCrypto crates'
+      internal `alloc::*` use. Native builds still use the libc default.
+- [x] `//net:tls_crypto` — hand-rolled ChaCha20 + Poly1305 +
+      `AEAD_CHACHA20_POLY1305` (RFC 8439). Host unit tests cover the
+      RFC 8439 test vectors (§2.3.2 block, §2.5.2 MAC, §2.8.2 AEAD
+      round-trip + tamper detection).
+- [x] `//net:tls` — TLS 1.3 sans-io core: `HKDF-Expand-Label`,
+      `Derive-Secret`, `Transcript` (running SHA-256 with snapshots),
+      `TrafficKey` (seal/open with per-seq nonce from RFC 8446 §5.3),
+      `KeySchedule` walking early → handshake → application stages,
+      `X25519ServerKey` for key exchange. Depends on sha2/hmac/hkdf/
+      x25519-dalek + `//net:tls_crypto`.
+- [x] `//net:tls_handshake` — handshake message framing, strict
+      `ClientHello` parser (supported_versions, supported_groups,
+      key_share extensions), `build_server_hello()`. Pure byte-slice,
+      zero external deps, 5 host unit tests.
+- [x] `//apps/test_tls` — in-kernel integration test. Boots the real
+      unikernel via the HVF runner and runs AEAD roundtrip, AEAD
+      tamper detection, X25519 roundtrip, HKDF-Expand-Label,
+      full key schedule cascade, record-level TrafficKey roundtrip,
+      and per-seq nonce variation. All 7 pass on bare metal.
+- [ ] EncryptedExtensions / Certificate / CertificateVerify / Finished
+      message builders.
+- [ ] Sans-io server handshake state machine tying the above together.
+- [ ] Certificate story: self-signed Ed25519 generated at boot vs
+      hardcoded PEM vs parsed from bundled bytes. (Design decision
+      pending — see end-of-session notes.)
 
 **Tests:**
-- [ ] Unit: TLS record parsing, handshake state machine
+- [x] Unit: ChaCha20 block, Poly1305 MAC, AEAD roundtrip, tamper
+      detect (`//net:tls_crypto_test`, RFC 8439 vectors)
+- [x] Unit: handshake framing, `ClientHello` parser, `ServerHello`
+      layout (`//net:tls_handshake_test`, 5 tests)
+- [x] Integration: TLS primitive end-to-end on bare metal
+      (`//apps/test_tls`, 7 stages)
 - [ ] Integration: TLS handshake completes with external client
+      (`openssl s_client` / `curl --tls13`)
+
+**Try it:**
+```bash
+# Host unit tests
+bazel test //net:tls_crypto_test //net:tls_handshake_test
+# Bare-metal integration test
+bazel build --config=aarch64-hvf //apps/test_tls:test_tls.img
+bazel-bin/tools/hvf-runner/run-hvf bazel-bin/apps/test_tls/test_tls.img
+# Serial: "TLS TESTS: ALL PASSED"
+```
 
 ### 3c. QUIC implementation
 
