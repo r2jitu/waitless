@@ -444,6 +444,48 @@ pub fn free_frame(addr: u64) {
     }
 }
 
+// ============================================================================
+// Global allocator
+// ============================================================================
+//
+// `#[global_allocator]` is required for any crate transitively pulling
+// in `alloc::*` types. Forwarding straight to kmalloc/kfree gives every
+// downstream crate (RustCrypto, rustls, anything else) a working heap
+// without any extra wiring, and keeps the alloc decision in one place.
+//
+// The allocator only compiles for bare-metal targets (`os = "none"`).
+// Native host builds use libstd's default allocator.
+//
+// `#[used]` keeps the linker from garbage-collecting the symbol when
+// no in-tree code mentions it explicitly, since `#[global_allocator]`
+// resolution happens at the rustc-driver level rather than via a
+// normal symbol reference.
+
+#[cfg(target_os = "none")]
+pub struct KernelAllocator;
+
+#[cfg(target_os = "none")]
+unsafe impl core::alloc::GlobalAlloc for KernelAllocator {
+    unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+        // SAFETY: kmalloc is a safe function (returns null on OOM)
+        // wrapped here to satisfy the unsafe trait.
+        debug_assert!(
+            layout.align() <= 16,
+            "kernel::mm::KernelAllocator can't honour align > 16",
+        );
+        kmalloc(layout.size())
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, _layout: core::alloc::Layout) {
+        kfree(ptr);
+    }
+}
+
+#[cfg(target_os = "none")]
+#[global_allocator]
+#[used]
+pub static GLOBAL_ALLOCATOR: KernelAllocator = KernelAllocator;
+
 pub fn kmalloc(size: usize) -> *mut u8 {
     if size == 0 {
         return ptr::null_mut();

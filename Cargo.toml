@@ -64,6 +64,11 @@ hkdf = { version = "0.12", default-features = false }
 # never preempts, so kernel-side SIMD is safe.
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+# Direct dep on the chacha20 stream cipher so `kernel::rng` can use
+# it as the expander for its seed-derived keystream RNG. Pulled in
+# transitively by chacha20poly1305 anyway, but listing it explicitly
+# gives us a top-level `@crates//:chacha20` Bazel label.
+chacha20 = { version = "0.9", default-features = false, features = ["zeroize"] }
 # Key exchange: X25519 is the only MTI group for TLS 1.3 and QUIC.
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
 # ECDSA verification for P-256 server certificates (common with self-signed
@@ -74,6 +79,31 @@ ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] 
 # Random: `rand_core` trait + entropy source. We supply our own RNG
 # from the kernel (jitter + cycle counter), this is just the trait.
 rand_core = { version = "0.6", default-features = false }
+
+# `getrandom` 0.2.x is pulled in transitively by rand_core / rustls-
+# rustcrypto / curve25519-dalek. Bare-metal targets are not on
+# getrandom's "supported" list, so it `compile_error!`s unless we
+# enable the `custom` backend feature and supply our own implementation
+# via the `register_custom_getrandom!` macro. The implementation lives
+# in `//kernel:rng` (ChaCha20 reseeded from TSC/CNTVCT jitter — see
+# the deferred work in ROADMAP for a properly seeded path).
+#
+# We declare it at the workspace level so Cargo's feature unification
+# makes the `custom` backend active for every consumer of getrandom.
+getrandom = { version = "0.2", default-features = false, features = ["custom"] }
+
+# TLS 1.3 stack. rustls 0.23 supports no_std via `default-features=false`,
+# rustls-rustcrypto supplies the audited pure-Rust crypto provider
+# (built on the RustCrypto primitives we already compile for bare metal
+# thanks to the target-feature annotations in MODULE.bazel). See
+# //net:tls integration for how the server is wired up.
+#
+# Features disabled: `aws_lc_rs`, `ring`, `prefer-post-quantum` (all
+# pull C toolchains / std). We keep `logging` for debug, `tls12` off
+# (1.3-only), and rely on rustls-rustcrypto for the crypto provider.
+rustls = { version = "0.23", default-features = false, features = ["logging"] }
+rustls-rustcrypto = { version = "0.0.2-alpha", default-features = false, features = ["alloc", "zeroize"] }
+rustls-pki-types = { version = "1", default-features = false, features = ["alloc"] }
 
 # Warnings are errors for every workspace member's cargo-standalone
 # build. Bazel builds get the same policy via the `-Dwarnings` flag in

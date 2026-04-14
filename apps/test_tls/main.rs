@@ -14,6 +14,7 @@
 
 #![no_std]
 
+extern crate kernel;
 extern crate uni;
 
 extern crate net_tls as tls;
@@ -195,6 +196,29 @@ fn main() {
             pass(b"traffic_key_per_seq_nonce");
         } else {
             fail(b"traffic_key_per_seq_nonce");
+            failures += 1;
+        }
+    }
+
+    // ---- 6. kernel::rng — fill_bytes produces non-trivial output ------
+    // Smoke-tests the seed-collection-from-cycle-counter path AND the
+    // ChaCha20 keystream expansion. We can't check randomness quality
+    // in a unit test, but we CAN check (a) the same RNG state produces
+    // a non-zero buffer, (b) two consecutive 32-byte fills produce
+    // different output, and (c) calling it never panics or hangs.
+    {
+        let mut buf1 = [0u8; 32];
+        let mut buf2 = [0u8; 32];
+        kernel::rng::fill_bytes(&mut buf1);
+        kernel::rng::fill_bytes(&mut buf2);
+
+        let nonzero = buf1.iter().any(|&b| b != 0);
+        let differ = buf1 != buf2;
+
+        if nonzero && differ {
+            pass(b"kernel_rng_fill_bytes");
+        } else {
+            fail(b"kernel_rng_fill_bytes");
             failures += 1;
         }
     }

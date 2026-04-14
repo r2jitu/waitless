@@ -14,6 +14,7 @@ rust_library(
         "mmio.rs",
         "once.rs",
         "percpu.rs",
+        "rng.rs",
         "spsc.rs",
         "sync.rs",
         "timer.rs",
@@ -40,7 +41,11 @@ rust_library(
         "//conditions:default": [],
     }),
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
-    deps = select({
+    deps = [
+        "@crates//:chacha20",
+        "@crates//:getrandom",
+        "@crates//:sha2",
+    ] + select({
         "//bazel/platforms:aarch64": ["@crates//:fdt"],
         "//conditions:default": [],
     }),
