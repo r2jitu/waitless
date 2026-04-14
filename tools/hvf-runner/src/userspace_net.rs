@@ -49,7 +49,6 @@ const MAX_REPLY_FRAME: usize = 600;
 struct TxFrame {
     data: [u8; MAX_REPLY_FRAME],
     len: u16,
-    queue_pair: u8,  // Which RX queue pair to inject into (Tier 1).
 }
 
 impl TxFrame {
@@ -77,7 +76,6 @@ struct ProxyConn {
     peer_ack: u32,
     state: ConnState,
     pending: Vec<u8>,
-    queue_pair: usize,  // Which RX queue pair to inject into (Tier 1).
 }
 
 // Per-worker shared state. In the N-worker design, each queue pair has
@@ -224,15 +222,14 @@ struct TcpListen {
     guest_port: u16,
 }
 
-/// Per-UDP-relay state. Each relay has `cpu_count` sibling sockets all
-/// bound to the same host port via `SO_REUSEPORT`. The kernel distributes
-/// incoming datagrams across the group (macOS hashes, Linux RSS on 3.9+),
-/// so io_thread polls *every* sibling to catch RX on whichever one was
-/// chosen. On TX, `handle_udp` picks the sibling for the current vCPU
-/// to avoid cross-core contention on the kernel send-path lock.
-#[derive(Clone)]
+/// One UDP-relay sibling, scoped to a single vCPU's IoState. The
+/// enclosing relay opens `cpu_count` SO_REUSEPORT-bound siblings at
+/// `start()` time; vCPU `N` owns sibling `N`, and `UDP_RELAYS` below
+/// keeps a flat `Vec<i32>` so the TX-side `handle_udp` can still look
+/// up "this vCPU's sibling" when the guest sends a reply.
+#[derive(Clone, Copy)]
 struct UdpRelay {
-    fds: Vec<i32>,
+    fd: i32,
     guest_port: u16,
 }
 
@@ -377,7 +374,7 @@ pub fn start(mappings: &[PortMapping], cpu_count: usize) -> Result<[u8; 6], Stri
                 Ok(fds) => {
                     for (worker_id, &fd) in fds.iter().enumerate() {
                         per_worker_udps[worker_id].push(UdpRelay {
-                            fds: vec![fd],
+                            fd,
                             guest_port: m.guest,
                         });
                     }
@@ -460,11 +457,11 @@ pub fn start(mappings: &[PortMapping], cpu_count: usize) -> Result<[u8; 6], Stri
     Ok(mac)
 }
 
-/// Per-vCPU thread-local: the id of the vCPU whose TX queue notify
-/// we are currently handling. Read by `handle_udp` to pick the right
-/// per-vCPU TX fd from `UDP_RELAYS`. Set at the top of `process_tx_queue`
-/// from `queue_idx / 2` — in Tier 1 multi-queue, vCPU N owns TX queue
-/// index 2N+1, so `queue_idx / 2` is the vCPU id.
+// Per-vCPU thread-local: the id of the vCPU whose TX queue notify
+// we are currently handling. Read by `handle_udp` to pick the right
+// per-vCPU TX fd from `UDP_RELAYS`. Set at the top of `process_tx_queue`
+// from `queue_idx / 2` — in Tier 1 multi-queue, vCPU N owns TX queue
+// index 2N+1, so `queue_idx / 2` is the vCPU id.
 thread_local! {
     static CURRENT_VCPU: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -656,10 +653,8 @@ fn poll_worker_iteration(
     io.conn_ports.push(0);
     let udp_slot_start = io.pollfds.len();
     for u in &io.udps {
-        for &fd in &u.fds {
-            io.pollfds.push(libc::pollfd { fd, events: libc::POLLIN, revents: 0 });
-            io.conn_ports.push(0);
-        }
+        io.pollfds.push(libc::pollfd { fd: u.fd, events: libc::POLLIN, revents: 0 });
+        io.conn_ports.push(0);
     }
     let fixed_slots = io.pollfds.len();
     {
@@ -695,14 +690,11 @@ fn poll_worker_iteration(
 
     // ── Drain UDP relay siblings that fired ────────────────────────
     {
-        let mut slot = udp_slot_start;
         let udp_drain: Vec<(i32, u16)> = io.udps.iter()
-            .flat_map(|u| u.fds.iter().map(move |&fd| (fd, u.guest_port)))
+            .map(|u| (u.fd, u.guest_port))
             .collect();
-        for (fd, gp) in udp_drain {
-            let revents = io.pollfds[slot].revents;
-            slot += 1;
-            if revents & libc::POLLIN != 0 {
+        for (i, (fd, gp)) in udp_drain.into_iter().enumerate() {
+            if io.pollfds[udp_slot_start + i].revents & libc::POLLIN != 0 {
                 handle_udp_rx(io, &qsnap, fd, gp, single_queue);
                 any_injected = true;
             }
@@ -904,7 +896,6 @@ fn accept_thread(listens: Vec<TcpListen>, cpu_count: usize) {
                     host_fd: client_fd, src_port, guest_port: listen.guest_port,
                     my_seq: 1001, peer_ack: 0,
                     state: ConnState::SynSent, pending: Vec::new(),
-                    queue_pair: target,
                 });
 
                 wake_vcpu(target);
@@ -1049,7 +1040,7 @@ fn handle_arp(arp: &[u8]) {
     if u16::from_be_bytes([arp[6], arp[7]]) != 1 { return; }
     if arp[24..28] != GW_IP { return; }
     let guest_mac: [u8; 6] = arp[8..14].try_into().unwrap_or([0; 6]);
-    let mut f = TxFrame { data: [0u8; MAX_REPLY_FRAME], len: 0, queue_pair: 0 };
+    let mut f = TxFrame { data: [0u8; MAX_REPLY_FRAME], len: 0, };
     {
         let b = &mut f.data;
         let mut o = VIRTIO_NET_HDR_SIZE; // virtio-net hdr (zeroed)
@@ -1242,7 +1233,7 @@ fn handle_dhcp(bootp: &[u8]) {
     let reply_type: u8 = if msg_type == 1 { 2 } else { 5 };
     let guest_mac: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
     // Build DHCP reply directly in a TxFrame (cold path, boot only).
-    let mut f = TxFrame { data: [0u8; MAX_REPLY_FRAME], len: 0, queue_pair: 0 };
+    let mut f = TxFrame { data: [0u8; MAX_REPLY_FRAME], len: 0, };
     let b = &mut f.data;
     let mut o = VIRTIO_NET_HDR_SIZE; // skip virtio-net hdr (zeroed)
     b[o..o+6].fill(0xff); o += 6; b[o..o+6].copy_from_slice(&GW_MAC); o += 6;
@@ -1283,7 +1274,7 @@ fn handle_dhcp(bootp: &[u8]) {
 // ── Packet construction ─────────────────────────────────────────────────────
 
 fn build_grat_arp_frame(mac: &[u8; 6]) -> TxFrame {
-    let mut f = TxFrame { data: [0u8; MAX_REPLY_FRAME], len: 0, queue_pair: 0 };
+    let mut f = TxFrame { data: [0u8; MAX_REPLY_FRAME], len: 0, };
     let b = &mut f.data;
     let mut o = VIRTIO_NET_HDR_SIZE; // virtio-net hdr (zeroed)
     b[o..o+6].fill(0xff); o += 6;
@@ -1341,7 +1332,7 @@ fn write_tcp_frame(buf: &mut [u8], dst_mac: &[u8; 6], src_ip: [u8; 4], dst_ip: [
     buf[o] = 0x50; buf[o+1] = flags; o += 2;
     buf[o..o+2].copy_from_slice(&0xffffu16.to_be_bytes()); o += 2;
     buf[o..o+4].fill(0); o += 4; // checksum + urgent ptr
-    buf[o..o+payload.len()].copy_from_slice(payload); o += payload.len();
+    buf[o..o+payload.len()].copy_from_slice(payload);
     let tc = tcp_checksum(&src_ip, &dst_ip, &buf[ts..ts+tcp_len]);
     buf[ts+16] = (tc >> 8) as u8; buf[ts+17] = (tc & 0xff) as u8;
 
@@ -1360,7 +1351,7 @@ fn write_tcp_frame_around_payload(buf: *mut u8, dst_mac: &[u8; 6],
     // Write into guest RAM via raw pointer (payload is already there).
     let b = unsafe { std::slice::from_raw_parts_mut(buf, VIRTIO_NET_HDR_SIZE + 14 + 20 + 20) };
     write_tcp_frame_headers(b, dst_mac, src_ip, dst_ip, src_port, dst_port,
-        seq, ack, flags, ip_total, tcp_len);
+        seq, ack, flags, ip_total);
     // Compute TCP checksum over header + payload.
     let tcp_start = VIRTIO_NET_HDR_SIZE + 14 + 20;
     let tcp_seg = unsafe { std::slice::from_raw_parts(buf.add(tcp_start), tcp_len) };
@@ -1376,7 +1367,7 @@ fn write_tcp_frame_around_payload(buf: *mut u8, dst_mac: &[u8; 6],
 /// Does NOT write payload (caller handles that). Sets checksum placeholders.
 fn write_tcp_frame_headers(buf: &mut [u8], dst_mac: &[u8; 6],
     src_ip: [u8; 4], dst_ip: [u8; 4], src_port: u16, dst_port: u16,
-    seq: u32, ack: u32, flags: u8, ip_total: usize, tcp_len: usize) {
+    seq: u32, ack: u32, flags: u8, ip_total: usize) {
     buf[..VIRTIO_NET_HDR_SIZE].fill(0);
     let mut o = VIRTIO_NET_HDR_SIZE;
     buf[o..o+6].copy_from_slice(dst_mac); o += 6;
@@ -1392,7 +1383,6 @@ fn write_tcp_frame_headers(buf: &mut [u8], dst_mac: &[u8; 6],
     buf[o..o+4].copy_from_slice(&dst_ip); o += 4;
     let cs = ipv4_checksum(&buf[is..is+20]);
     buf[is+10] = (cs >> 8) as u8; buf[is+11] = (cs & 0xff) as u8;
-    let ts = o;
     buf[o..o+2].copy_from_slice(&src_port.to_be_bytes()); o += 2;
     buf[o..o+2].copy_from_slice(&dst_port.to_be_bytes()); o += 2;
     buf[o..o+4].copy_from_slice(&seq.to_be_bytes()); o += 4;
@@ -1406,7 +1396,7 @@ fn write_tcp_frame_headers(buf: &mut [u8], dst_mac: &[u8; 6],
 fn build_tcp_frame_fixed(dst_mac: &[u8; 6], src_ip: [u8; 4], dst_ip: [u8; 4],
     src_port: u16, dst_port: u16, seq: u32, ack: u32,
     flags: u8, payload: &[u8]) -> TxFrame {
-    let mut f = TxFrame { data: [0u8; MAX_REPLY_FRAME], len: 0, queue_pair: 0 };
+    let mut f = TxFrame { data: [0u8; MAX_REPLY_FRAME], len: 0, };
     f.len = write_tcp_frame(&mut f.data, dst_mac, src_ip, dst_ip,
         src_port, dst_port, seq, ack, flags, payload) as u16;
     f
@@ -1449,7 +1439,7 @@ fn build_udp_frame(buf: &mut [u8], dst_mac: &[u8; 6],
     buf[o..o+2].copy_from_slice(&dst_port.to_be_bytes()); o += 2;
     buf[o..o+2].copy_from_slice(&(udp_len as u16).to_be_bytes()); o += 2;
     buf[o..o+2].fill(0); o += 2; // checksum placeholder
-    buf[o..o+payload.len()].copy_from_slice(payload); o += payload.len();
+    buf[o..o+payload.len()].copy_from_slice(payload);
     let uc = udp_checksum(&src_ip, &dst_ip, &buf[us..us+udp_len]);
     buf[us+6] = (uc >> 8) as u8; buf[us+7] = (uc & 0xff) as u8;
 

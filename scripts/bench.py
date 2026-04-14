@@ -540,23 +540,17 @@ class HvfEnv:
     udp_port_offset = 10000  # host UDP port = guest port + 10000
 
     def build(self):
+        # Single bazel call builds both the guest image and the HVF
+        # runner (codesigning is wired into the runner's genrule).
         subprocess.run(
             ["bazel", "build", "--config=qemu",
-             "//apps/webserver:webserver.img"],
-            capture_output=True, cwd=PROJECT_ROOT, timeout=120)
-        subprocess.run(
-            ["cargo", "build", "--release"],
-            capture_output=True,
-            cwd=os.path.join(PROJECT_ROOT, "tools/hvf-runner"), timeout=120)
-        subprocess.run(
-            ["codesign", "--force", "--sign", "-", "--entitlements",
-             os.path.join(PROJECT_ROOT, "tools/hvf-runner/run-hvf.entitlements"),
-             os.path.join(PROJECT_ROOT, "tools/hvf-runner/target/release/run-hvf")],
-            capture_output=True, timeout=30)
+             "//apps/webserver:webserver.img",
+             "//tools/hvf-runner:run_hvf"],
+            capture_output=True, cwd=PROJECT_ROOT, timeout=240)
 
     def start(self, cpus, port):
         img = os.path.join(PROJECT_ROOT, "bazel-bin/apps/webserver/webserver.img")
-        run_hvf = os.path.join(PROJECT_ROOT, "tools/hvf-runner/target/release/run-hvf")
+        run_hvf = os.path.join(PROJECT_ROOT, "bazel-bin/tools/hvf-runner/run-hvf")
         log = open(f"/tmp/hvf_{port}.log", "w")
         udp_port = port + self.udp_port_offset
         # -p tcp:HOST:GUEST forwards HTTP to guest:80; -p udp:HOST:GUEST

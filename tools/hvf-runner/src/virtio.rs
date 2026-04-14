@@ -100,8 +100,6 @@ pub struct VirtioNet {
     pub used_idx: [u16; MAX_QUEUES],
     /// Number of queue pairs (N). Total queues = 2*N (+ 1 ctrl if MQ).
     pub num_queue_pairs: u16,
-    /// CPU count for MQ support.
-    cpu_count: usize,
 }
 
 // SAFETY: ram_host is a stable mapping for the VM's lifetime; only one
@@ -156,12 +154,10 @@ pub fn queue_snapshot(index: usize) -> QueueSnapshot {
     }
 }
 
-/// Backward-compat aliases for the IO thread (queue 0 = RX, queue 1 = TX).
+/// Convenience alias for the single-queue-pair fallback path
+/// (queue 0 = RX, queue 1 = TX when cpu_count == 1).
 pub fn rx_queue_snapshot() -> QueueSnapshot {
     queue_snapshot(0)
-}
-pub fn tx_queue_snapshot() -> QueueSnapshot {
-    queue_snapshot(1)
 }
 
 impl VirtioNet {
@@ -182,7 +178,6 @@ impl VirtioNet {
             ram_base,
             used_idx: [0; MAX_QUEUES],
             num_queue_pairs: nqp,
-            cpu_count,
         }
     }
 
@@ -348,16 +343,6 @@ impl VirtioNet {
             _ => {}
         }
         false
-    }
-
-    /// Translate a guest physical address to a host pointer.
-    pub unsafe fn gpa_to_host(&self, gpa: u64) -> *mut u8 {
-        self.ram_host.add((gpa - self.ram_base) as usize)
-    }
-
-    /// Get a reference to a queue's state.
-    pub fn queue(&self, index: usize) -> &QueueState {
-        &self.queues[index]
     }
 
     /// The ctrl queue index: 2 * num_queue_pairs.

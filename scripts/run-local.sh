@@ -71,11 +71,10 @@ fi
 # UNIKERNEL_RUNNER: hvf (default) or qemu.
 RUNNER="${UNIKERNEL_RUNNER:-hvf}"
 if [ "$HOST_OS" = "Darwin" ] && [ "$HOST_ARCH" = "arm64" ] && [ "$RUNNER" = "hvf" ]; then
-    RUN_HVF="$PROJECT_ROOT/tools/hvf-runner/target/release/run-hvf"
+    RUN_HVF="$PROJECT_ROOT/bazel-bin/tools/hvf-runner/run-hvf"
 
-    # Build via cargo + codesign.
-    (cd "$PROJECT_ROOT/tools/hvf-runner" && cargo build --release --quiet 2>/dev/null && \
-     codesign --force --sign - --entitlements run-hvf.entitlements target/release/run-hvf 2>/dev/null)
+    # Build via bazel (the genrule invokes cargo + codesign internally).
+    (cd "$PROJECT_ROOT" && bazel build //tools/hvf-runner:run_hvf 2>/dev/null)
 
     IMG="$KERNEL"
     if [[ "$KERNEL" == *.elf ]]; then
@@ -89,7 +88,7 @@ if [ "$HOST_OS" = "Darwin" ] && [ "$HOST_ARCH" = "arm64" ] && [ "$RUNNER" = "hvf
 
     if [ ! -x "$RUN_HVF" ]; then
         echo "Error: HVF runner not found at $RUN_HVF"
-        echo "       Build it: cd tools/hvf-runner && cargo build --release"
+        echo "       Build it: bazel build //tools/hvf-runner:run_hvf"
         exit 1
     fi
     UDP_HOST_PORT=$((HOST_PORT + 10000))

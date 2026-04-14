@@ -1,18 +1,17 @@
 #!/usr/bin/env bash
 # apps/webserver/test_hvf.sh — Boot webserver via HVF runner, verify HTTP.
-# macOS arm64 only, requires root (for vmnet). Skips on other platforms.
+# macOS arm64 only; skips on other platforms.
 #
-#   bazel test //apps/webserver:test_hvf
+#   bazel test //apps/webserver:test
+#
+# The HVF runner uses a userspace TCP/UDP proxy (no vmnet, no root).
+# Default forwards: -p tcp:8080:80 -p udp:18080:7. The test points wrk
+# at localhost:8080.
 
 set -euo pipefail
 
 if [[ "$(uname -s)" != "Darwin" ]] || [[ "$(uname -m)" != "arm64" ]]; then
     echo "SKIP: HVF runner only works on macOS arm64"
-    exit 0
-fi
-
-if [[ "$(id -u)" -ne 0 ]]; then
-    echo "SKIP: HVF runner with vmnet requires root (try: sudo bazel test ...)"
     exit 0
 fi
 
@@ -23,30 +22,20 @@ FAILURES=0
 trap cleanup_vm EXIT
 
 IMG="${RUNFILES}/_main/apps/webserver/webserver.img"
+HVF_BIN="${RUNFILES}/_main/tools/hvf-runner/run-hvf"
 [[ -f "$IMG" ]] || { echo "ERROR: webserver.img not found at $IMG" >&2; exit 1; }
-
-# Build the HVF runner via cargo (not yet a Bazel target).
-PROJECT_ROOT="${RUNFILES}/_main"
-HVF_DIR="${PROJECT_ROOT}/tools/hvf-runner"
-HVF_BIN="${HVF_DIR}/target/release/run-hvf"
-if [[ ! -x "$HVF_BIN" ]]; then
-    echo "==> Building HVF runner..."
-    (cd "$HVF_DIR" && cargo build --release --quiet 2>/dev/null) || { echo "SKIP: cargo build failed"; exit 0; }
-    codesign --force --sign - --entitlements "${HVF_DIR}/run-hvf.entitlements" "$HVF_BIN" 2>/dev/null
-fi
-[[ -x "$HVF_BIN" ]] || { echo "SKIP: run-hvf binary not found"; exit 0; }
+[[ -x "$HVF_BIN" ]] || { echo "ERROR: run-hvf not found at $HVF_BIN" >&2; exit 1; }
 
 VM_LOG="$(mktemp /tmp/unikernel_hvf_test_XXXXXX.log)"
 
-# HVF host-mode: VM is at 192.168.18.2:80 (no proxy port needed).
-VM_HOST="192.168.18.2"
-VM_PORT="80"
+# Userspace proxy: guest HTTP on :80 is forwarded to localhost:8080.
+VM_HOST="127.0.0.1"
+VM_PORT="8080"
 
 echo "==> Booting webserver via HVF runner..."
-"$HVF_BIN" "$IMG" >"$VM_LOG" 2>&1 &
+"$HVF_BIN" "$IMG" -p "tcp:${VM_PORT}:80" >"$VM_LOG" 2>&1 &
 VM_PID=$!
 
-# Wait for the VM to be reachable (DHCP + event loop startup).
 if ! wait_http "$VM_PORT" 30 "$VM_PID" "$VM_HOST"; then
     echo "ERROR: not ready after 30s" >&2; cat "$VM_LOG" >&2; exit 1
 fi

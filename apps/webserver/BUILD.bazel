@@ -35,6 +35,7 @@ sh_test(
     data = select({
         "//bazel/platforms:runner_hvf": [
             ":webserver.img",
+            "//tools/hvf-runner:run_hvf",
             "//scripts:helpers.sh",
         ],
         "//bazel/platforms:runner_qemu": [

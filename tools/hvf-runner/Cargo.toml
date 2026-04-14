@@ -8,19 +8,9 @@ publish = false
 # Intentionally self-contained: the crate is designed to be extracted into
 # its own repository later via `git subtree split tools/hvf-runner`.
 
-[lib]
-# We ship a small library so the binary and the smoke example can share
-# the FFI bindings and the decoder without duplication. The binary is
-# defined below.
-path = "src/lib.rs"
-
 [[bin]]
 name = "run-hvf"
 path = "src/main.rs"
-
-[[example]]
-name = "smoke"
-path = "examples/smoke.rs"
 
 [dependencies]
 libc = "0.2"
