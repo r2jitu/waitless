@@ -6,7 +6,7 @@ module(
 bazel_dep(name = "rules_cc", version = "0.1.1")
 bazel_dep(name = "rules_shell", version = "0.6.1")
 bazel_dep(name = "platforms", version = "0.0.10")
-bazel_dep(name = "rules_rust", version = "0.56.0")
+bazel_dep(name = "rules_rust", version = "0.62.0")
 
 # Patch rules_rust to add aarch64-unknown-none to the platform registry.
 # Without this, crate_universe marks crates as incompatible for our
@@ -36,12 +36,11 @@ rust.toolchain(
 )
 use_repo(rust, "rust_toolchains")
 
-# Pin host tools (cargo, rustc used during dep resolution) to 1.86.0 too.
-# Default in rules_rust 0.56.0 is 1.83 which doesn't understand
-# `edition = "2024"` in dependency Cargo.toml files (stabilised in 1.85).
-rust_host_tools = use_extension("@rules_rust//rust:extensions.bzl", "rust_host_tools")
-rust_host_tools.host_tools(version = "1.86.0", edition = "2024")
-use_repo(rust_host_tools, "rust_host_tools")
+# rules_rust 0.69+ auto-creates a `rust_host_tools` repo whose
+# version tracks `rust.toolchain(versions=...)` above, so an
+# explicit `rust_host_tools.host_tools(...)` is no longer needed
+# (and conflicts with the default). 1.86.0 is recent enough to
+# parse `edition = "2024"` in dependency Cargo.toml files.
 
 register_toolchains("@rust_toolchains//:all")
 
@@ -59,13 +58,17 @@ crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
 crate.from_cargo(
     name = "crates",
     cargo_config = "//:.cargo/config.toml",
-    # Bazel-side lockfile, distinct from the cargo-managed Cargo.lock.
-    # Mirrors rules_rust's own examples/crate_universe/cargo_workspace
-    # pattern: cargo-bazel maintains its own resolved view of the dep
-    # graph in a separate file so cargo and bazel can drift on minor
-    # versions without breaking each other. Refreshed via
-    # `CARGO_BAZEL_REPIN=true bazel sync --only=crates`.
+    # Bazel-side cargo lockfile, distinct from the cargo-managed
+    # Cargo.lock. Mirrors rules_rust's examples/crate_universe/
+    # cargo_workspace pattern.
     cargo_lockfile = "//:Cargo.Bazel.lock",
+    # JSON lockfile recording resolved download URLs + checksums.
+    # With this present cargo-bazel can resolve everything offline
+    # from the JSON without consulting cargo's local registry cache,
+    # so the sparse vs git-protocol cache hash mismatch we used to
+    # work around in scripts/setup-dev.sh is no longer an issue.
+    # Refreshed via `CARGO_BAZEL_REPIN=true bazel sync --only=crates`.
+    lockfile = "//:cargo-bazel-lock.json",
     manifests = [
         "//:Cargo.toml",
         "//tools/hvf-runner:Cargo.toml",
