@@ -253,7 +253,7 @@ def _udp_with_retry(port, senders, duration, host, async_mode, rate_per_sender=0
     return pps, p50, p99
 
 
-_UDP_PEAK_LEVELS = [32, 64, 128, 256, 512]
+_UDP_PEAK_LEVELS = [8, 16, 32, 64, 128, 256, 512]
 
 
 def _udp_concurrent_probe(port, slots_per_thread, duration, host,
