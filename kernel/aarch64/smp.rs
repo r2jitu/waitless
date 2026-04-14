@@ -101,7 +101,9 @@ pub unsafe fn start_secondary_cores(cpu_count: u32) {
         // Start the AP at the assembly trampoline (handles MMU + VBAR setup).
         // stack_top passed as context_id (x0 when AP starts).
         unsafe extern "C" { fn ap_trampoline(); }
-        let entry = ap_trampoline as u64;
+        // Cast through a function pointer first; rust 1.93+ rejects
+        // casting a function item directly to an integer.
+        let entry = ap_trampoline as unsafe extern "C" fn() as u64;
         let ret = psci_cpu_on(i as u64, entry, stack_top);
         if ret != 0 {
             serial::puts(b"[SMP] PSCI CPU_ON failed\n");

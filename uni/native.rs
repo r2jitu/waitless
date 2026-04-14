@@ -510,8 +510,11 @@ fn init_native() {
             THREADS[i].init_event_queue();
         }
 
-        signal(SIGINT, sigint_handler as usize);
-        signal(SIGTERM, sigint_handler as usize);
+        // Cast through a function pointer first; rust 1.93+ rejects
+        // casting a function item directly to an integer.
+        let h = sigint_handler as unsafe extern "C" fn(i32) as usize;
+        signal(SIGINT, h);
+        signal(SIGTERM, h);
         signal(SIGPIPE, SIG_IGN);
     }
 
