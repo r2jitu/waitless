@@ -159,8 +159,17 @@ static FRAME_ALLOC: Spinlock<FrameAllocator> = Spinlock::new(FrameAllocator::ZER
 // Address translation state
 // ============================================================================
 
-// Fields are only consumed by phys_to_virt/virt_to_phys on x86_64; on
-// aarch64 the translation is identity-mapped and the fields are dead.
+/// Address space configuration captured from the bootloader (Limine
+/// on x86_64, a zero-filled instance on aarch64). `phys_to_virt` and
+/// `virt_to_phys` consume the three fields on x86_64 to translate
+/// across the higher-half direct map; on aarch64 the kernel uses an
+/// identity map and the translation functions just return their input,
+/// so the fields are read but never acted on.
+///
+/// The `#[allow(dead_code)]` covers the aarch64 build only — on that
+/// target the struct is populated but the fields are never read. It
+/// stays because removing it would force the init code to become
+/// cfg-gated too, which is more churn for less clarity.
 #[allow(dead_code)]
 struct AddressSpace {
     hhdm_offset: u64,

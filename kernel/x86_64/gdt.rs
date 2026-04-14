@@ -61,6 +61,28 @@ struct Tss {
 // ---------------------------------------------------------------------------
 // Static storage (bare-metal, single-threaded)
 // ---------------------------------------------------------------------------
+//
+// Why the per-use `#[allow(static_mut_refs)]` attributes below:
+//
+// `GDT_ENTRIES`, `TSS`, and `GDTR` are populated by `init()` on the
+// BSP during boot, *before* any AP has been started via
+// `kernel::x86_64::smp::boot_aps`, and *before* any interrupt
+// handler runs (the IDT isn't loaded yet either). From that point on
+// they are read-only — APs call `load_on_ap()` which only reads the
+// BSP-initialised GDTR, it never rewrites these statics. So the
+// `&mut GDT_ENTRIES[..]` borrows in `set_entry` / `set_tss_entry` and
+// the in-place writes to `TSS.iopb_offset` / `GDTR.{limit,base}` all
+// happen on a single thread with no concurrent readers, which is
+// exactly the case `static_mut_refs` is warning about not handling
+// safely in general. The warning is a correct heuristic that doesn't
+// apply here.
+//
+// Long-term we could move these into `InitOnce` / a `Spinlock`-wrapped
+// struct like the other boot-time singletons; the reason they stay as
+// `static mut` is that `lgdt` takes a raw pointer and the GDT entries
+// have to be in memory that the CPU can physically see during the
+// `retfq` segment reload — any smart-pointer indirection would have
+// to unwrap to the same address anyway.
 
 // 5 entries: null + code + data + TSS low (8 bytes) + TSS high (8 bytes)
 static mut GDT_ENTRIES: [GdtEntry; 5] = [GdtEntry {
