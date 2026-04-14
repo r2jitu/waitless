@@ -686,110 +686,188 @@ bazel test --config=x86_64-qemu //apps/webserver:test  # HTTP + UDP echo (x86_64
 bazel test --config=aarch64-qemu //apps/webserver:test # HTTP + UDP echo (aarch64)
 ```
 
-### 3b. TLS 1.3 crypto
+### 3b. TLS 1.3 crypto — audited stack on bare metal
 
-QUIC mandates TLS 1.3. Path taken (2026-04-14): hybrid — pull the
-TLS 1.3 primitives we need from RustCrypto via crate_universe, and
-hand-roll ChaCha20-Poly1305 in-tree so we avoid the `cpufeatures`
-SIMD paths that don't compile for `x86_64-unknown-none`.
+QUIC mandates TLS 1.3. Path taken (2026-04-14): pull rustls 0.23 +
+the rustls-rustcrypto pure-Rust crypto provider via crate_universe,
+fix the `cpufeatures`/LLVM SIMD-legalisation issue once with target-
+feature flags so all of RustCrypto's audited AEADs (aes-gcm,
+chacha20poly1305, polyval, poly1305) build cleanly for
+`x86_64-unknown-none`. No hand-rolled crypto in production
+codepaths.
 
-Cipher suite: `TLS_CHACHA20_POLY1305_SHA256` (the TLS 1.3 MTI suite
-that doesn't need AES-NI / polyval). No AES-GCM for now —
-`aes-gcm` + `polyval` trip LLVM legalisation on bare-metal x86_64
-and the fix would require fighting per-crate target features.
+Cipher suite shipped: `TLS_CHACHA20_POLY1305_SHA256`. AES-GCM is
+also available via the same provider — we just narrow the
+`ServerConfig` cipher suite list to ChaCha20-Poly1305 for now.
 
-- [x] RustCrypto primitives via crate_universe: `sha2`, `hmac`, `hkdf`,
+#### What ships
+
+- [x] **cpufeatures fix.** Per-crate `crate.annotation` in
+      `MODULE.bazel` passes
+      `-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,
+       +sse4.2,+avx,+avx2,+aes,+pclmul,+fma,+bmi1,+bmi2`
+      to every crypto crate that uses SIMD intrinsics
+      (aes / aes-gcm / chacha20 / chacha20poly1305 / ghash / poly1305 /
+      polyval / curve25519-dalek / rsa / rustls-rustcrypto). The
+      kernel already enables SSE at boot (`limine_boot.S` sets
+      `CR4.OSFXSR|OSXMMEXCPT`) and our cooperative scheduler never
+      preempts, so kernel-side SIMD is safe with no FXSAVE/XSAVE.
+      x86_64-v3 (Haswell, 2013) is the baseline we assume — matches
+      every cloud VM we'd ever run on. Unblocks
+      `aes-gcm`/`polyval`/`poly1305` from "Do not know how to split
+      the result of this operator!" LLVM bailouts
+      (rust-lang/rust#87642, #92760, #136544).
+- [x] **RustCrypto primitives** via crate_universe: `sha2`, `hmac`,
+      `hkdf`, `aes-gcm`, `chacha20poly1305`, `chacha20`,
       `x25519-dalek`, `p256`, `ed25519-dalek`, `rand_core`. All build
       on both `x86_64-unknown-none` and `aarch64-unknown-none` after
-      a `curve25519-dalek` build-script `CARGO_CFG_CURVE25519_DALEK_BACKEND=serial`
-      override in MODULE.bazel.
-- [x] `#[global_allocator]` in `uni::heap` forwarding to
-      `kernel::mm::kmalloc/kfree`, needed for the RustCrypto crates'
-      internal `alloc::*` use. Native builds still use the libc default.
-- [x] `//net:tls_crypto` — hand-rolled ChaCha20 + Poly1305 +
-      `AEAD_CHACHA20_POLY1305` (RFC 8439). Host unit tests cover the
-      RFC 8439 test vectors (§2.3.2 block, §2.5.2 MAC, §2.8.2 AEAD
-      round-trip + tamper detection).
-- [x] `//net:tls` — TLS 1.3 sans-io core: `HKDF-Expand-Label`,
-      `Derive-Secret`, `Transcript` (running SHA-256 with snapshots),
-      `TrafficKey` (seal/open with per-seq nonce from RFC 8446 §5.3),
-      `KeySchedule` walking early → handshake → application stages,
-      `X25519ServerKey` for key exchange. Depends on sha2/hmac/hkdf/
-      x25519-dalek + `//net:tls_crypto`.
-- [x] `//net:tls_handshake` — handshake message framing, strict
+      the cpufeatures fix + a `curve25519-dalek` build-script
+      override (`CARGO_CFG_CURVE25519_DALEK_BACKEND=serial`).
+- [x] **`kernel::rng`** — kernel-backed RNG providing
+      `fill_bytes(&mut [u8])`. Seed = 256 cycle-counter reads
+      (TSC / CNTVCT_EL0) + best-effort `RDRAND` mix-in, hashed
+      through SHA-256 with a domain-separation tag. Expansion via a
+      single ChaCha20 stream cipher keyed from the seed (same
+      pattern as Linux's `getrandom(2)`).
+- [x] **`getrandom 0.2` custom backend.** `kernel::rng` registers
+      itself via `register_custom_getrandom!` so `rand_core::OsRng`
+      and every consumer of it (RustCrypto, x25519-dalek,
+      rustls-rustcrypto sign/kx) work without a syscall. Workspace
+      dep declares `getrandom = { default-features = false, features = ["custom"] }`.
+- [x] **`#[global_allocator]`** in `kernel::mm::GLOBAL_ALLOCATOR`
+      forwarding to `kmalloc`/`kfree`. Living in the kernel crate
+      (rather than `uni`) means `boot/limine` and any other crate
+      depending only on `kernel` also gets a working `alloc::*`
+      without extra wiring. `#[used]` keeps the linker from GC'ing
+      it. Native builds use libstd's default.
+- [x] **`//net:tls_crypto`** — thin byte-slice wrapper over
+      `chacha20poly1305::ChaCha20Poly1305`. Hides `generic-array`
+      types from downstream callers; gives us one place to
+      negotiate the AEAD if QUIC later picks a different suite.
+- [x] **`//net:tls`** — sans-io key schedule + transcript hashing:
+      `HKDF-Expand-Label`, `Derive-Secret`, `Transcript` (running
+      SHA-256 with snapshots), `TrafficKey` (seal/open with per-seq
+      nonce from RFC 8446 §5.3), `KeySchedule` walking early →
+      handshake → application stages, `X25519ServerKey` for KX.
+      Built on sha2/hmac/hkdf/x25519-dalek + `//net:tls_crypto`.
+      Exists alongside `rustls` for QUIC's own packet-protection
+      key derivation later (QUIC reuses HKDF-Expand-Label with
+      different labels) and for any sans-io callers that don't want
+      to drag in the full rustls state machine.
+- [x] **`//net:tls_handshake`** — handshake message framing, strict
       `ClientHello` parser (supported_versions, supported_groups,
-      key_share extensions), `build_server_hello()`. Pure byte-slice,
-      zero external deps, 5 host unit tests.
-- [x] `//apps/test_tls` — in-kernel integration test. Boots the real
-      unikernel via the HVF runner and runs AEAD roundtrip, AEAD
-      tamper detection, X25519 roundtrip, HKDF-Expand-Label,
-      full key schedule cascade, record-level TrafficKey roundtrip,
-      and per-seq nonce variation. All 7 pass on bare metal.
-- [ ] EncryptedExtensions / Certificate / CertificateVerify / Finished
-      message builders.
-- [ ] Sans-io server handshake state machine tying the above together.
-- [ ] Certificate story: self-signed Ed25519 generated at boot vs
-      hardcoded PEM vs parsed from bundled bytes. (Design decision
-      pending — see end-of-session notes.)
+      key_share), `build_server_hello()`. Zero external deps,
+      5 host unit tests. Useful for low-level debugging /
+      interop bring-up; not used by the rustls path.
+- [x] **`rustls 0.23.38`** + **`rustls-rustcrypto 0.0.2-alpha`**
+      via crate_universe. Built with
+      `default-features = false, features = ["logging", "custom-provider"]`
+      and `default-features = false, features = ["alloc", "zeroize"]`
+      respectively. Both compile cleanly for both bare-metal targets.
+      No `[patch.crates-io]` needed — the once_cell `std` gotcha the
+      research warned about doesn't trip rustls 0.23.38 in practice
+      with our feature combination.
+- [x] **Pre-generated dev cert**:
+      `apps/webserver/dev_certs/dev_cert.{der,pem}` +
+      `dev_key.{der,pem}` (Ed25519, 10y validity, SAN covers
+      `unikernel.local`/`localhost`/`127.0.0.1`/`10.0.2.15`). DER for
+      `include_bytes!()` use inside the unikernel, PEM for
+      host-side `curl --cacert` / `openssl s_client`. Regen via
+      `dev_certs/regen.sh`.
+- [x] **`//apps/test_tls`** — in-kernel integration test. Boots
+      via HVF, runs **9 stages** end-to-end:
+      `aead_roundtrip`, `aead_tamper_detect`, `x25519_roundtrip`,
+      `hkdf_expand_label`, `key_schedule_cascade`,
+      `traffic_key_record`, `traffic_key_per_seq_nonce`,
+      `rustls_server_config` (loads the dev cert via the
+      rustls-rustcrypto provider and instantiates a
+      `rustls::ServerConfig` via the no_std `builder_with_details`
+      API), `kernel_rng_fill_bytes`. **All 9 pass on bare metal.**
 
-**Tests:**
-- [x] Unit: ChaCha20 block, Poly1305 MAC, AEAD roundtrip, tamper
-      detect (`//net:tls_crypto_test`, RFC 8439 vectors)
-- [x] Unit: handshake framing, `ClientHello` parser, `ServerHello`
-      layout (`//net:tls_handshake_test`, 5 tests)
-- [x] Integration: TLS primitive end-to-end on bare metal
-      (`//apps/test_tls`, 7 stages)
-- [ ] Integration: TLS handshake completes with external client
-      (`openssl s_client` / `curl --tls13`)
+#### Still to do for a working HTTPS server
+
+- [ ] **TLS-over-TCP I/O glue.** Wrap rustls's `ServerConnection`
+      around a `net::tcp::TcpStream`: shovel inbound bytes into
+      `read_tls()`, drain plaintext via `reader().read()`, push
+      handler bytes into `writer().write()`, drain encrypted output
+      via `write_tls()`. ~150 lines, mostly buffer plumbing. No new
+      crypto.
+- [ ] **`uni::http` over TLS.** Add a `TlsListener` / `TlsStream`
+      wrapper analogous to `TcpListener` / `TcpStream`. The HTTP
+      server changes one line (`server.run(443)` against the
+      wrapped listener).
+- [ ] **External-client interop**: `curl --cacert dev_cert.pem
+      --tlsv1.3 https://unikernel.local:8443/health` succeeds, and
+      `openssl s_client -tls1_3 -groups X25519` completes the
+      handshake. This is the acceptance test for "TLS works".
 
 **Try it:**
 ```bash
 # Host unit tests
 bazel test //net:tls_crypto_test //net:tls_handshake_test
-# Bare-metal integration test
+# Bare-metal integration test (runs full key schedule, AEAD
+# round-trip, X25519 KX, kernel rng, AND instantiates a real
+# rustls::ServerConfig from the dev cert):
 bazel build --config=aarch64-hvf //apps/test_tls:test_tls.img
 bazel-bin/tools/hvf-runner/run-hvf bazel-bin/apps/test_tls/test_tls.img
 # Serial: "TLS TESTS: ALL PASSED"
 ```
 
-### 3c. QUIC implementation
+### 3c. QUIC implementation — **blocked on upstream no_std support**
 
-Options:
-1. **`quiche`** (Cloudflare) — C library with Rust bindings, battle-tested
-2. **`quinn`** — pure Rust, needs tokio/async
-3. **Minimal hand-written** — only what a server needs
+**Status (2026-04-14): blocked. Use audited TLS-over-TCP first; revisit
+QUIC after `quinn-proto` lands no_std support or we explicitly fork.**
 
-Recommendation: start with `quiche` (proven, `no_std`-friendly C core),
-migrate to pure Rust later if desired.
+Decision: do not roll our own QUIC implementation. The 9000-series RFCs
+add up to ~600 pages of state machine that we won't deliver to parity.
 
-Minimal server-side QUIC needs:
-- Initial handshake (1-RTT)
-- Stream multiplexing
-- Loss detection + retransmission
-- Flow control
-- Connection close
+**Investigated candidates (rejected):**
 
-Skip: 0-RTT, connection migration, path validation, PMTUD.
+- **`quinn-proto 0.11.14`** — sans-io core of quinn, in theory the best
+  fit because it doesn't depend on tokio. In practice `src/lib.rs:23`
+  has unconditional `use std::{...}` and `use std::time::{Duration,
+  Instant, SystemTime, UNIX_EPOCH}`. There is no `std` feature flag
+  in `Cargo.toml.orig` to disable. `quinn-rs/quinn#579` ("no_std
+  support") is open with no merged work. **Cannot build on
+  `*-unknown-none` without a substantial fork** that swaps
+  `std::time::Instant` for a project-supplied clock and removes
+  `io::Error` propagation.
+- **`quiche`** (Cloudflare) — uses BoringSSL via the `boring` C/cmake
+  crate. The 2020 bare-metal fork (`cloudflare/quiche#252`) is 4+
+  years stale, and the maintainers have explicitly said they're
+  "very unlikely to support other TLS libraries". Dead end.
+- **`s2n-quic`** (AWS) — hard tokio + s2n-tls (C) deps throughout. No
+  no_std story.
+- **`neqo`** (Mozilla) — hard NSS dep (large C/C++ codebase, needs
+  POSIX). Skip.
+- **`ngtcp2`** (C) + **`picotls`** (C) — smallest C footprint of the
+  C options and wolfSSL has a documented bare-metal config. Heavy
+  integration: C toolchain, FFI, cross-compiled wolfSSL build. No
+  mature Rust bindings. Punt unless pure-Rust paths fail completely.
+- **`mvfst` / `msquic`** — both depend on Schannel/OpenSSL/fizz +
+  C++ runtime + platform abstractions. Too heavy for a unikernel.
 
-- [ ] Select QUIC implementation (quiche vs quinn vs hand-written)
-- [ ] Integrate via crate_universe or vendor
-- [ ] QUIC handshake (server-side, 1-RTT)
-- [ ] Stream multiplexing
-- [ ] Loss detection + retransmission
-- [ ] Flow control
-- [ ] Connection close
-- [ ] `//net:quic` Bazel target (deps: udp, tls)
+**Recommended path forward:**
 
-**Tests:**
-- [ ] Unit: QUIC packet number decode, frame parsing
-- [ ] Integration: QUIC handshake with external client (curl --http3 or quiche-client)
+1. Ship audited TLS-over-TCP first (see 3b). HTTPS on TCP is real and
+   useful and uses the same rustls + RustCrypto + kernel::rng stack.
+2. **Revisit quinn-proto** in 3-6 months: track `quinn-rs/quinn#579`
+   for upstream movement on no_std. The blockers are well-scoped
+   (Instant, io::Error) and quinn maintainers seem amenable in
+   principle, just unprioritised.
+3. **Or**: maintain a vendored fork of `quinn-proto` with a small
+   no_std patch (replace `std::time::Instant` with a
+   project-supplied trait, remove `io::Error` propagation in favour
+   of `quinn-proto`'s own error type). Estimated: 200-500 lines of
+   patch surface, ongoing rebase cost on every quinn release. Not
+   recommended unless we need HTTP/3 urgently.
 
-**Try it:**
-```bash
-# QUIC handshake from host to unikernel
-quiche-client --no-verify https://localhost:4433/health
-# Serial: "QUIC: handshake complete, 1 stream"
-```
+**Tasks (deferred):**
+
+- [ ] Wait for `quinn-proto` no_std support OR vendor a patched fork
+- [ ] `//net:quic` wrapper crate around `quinn-proto`
+- [ ] HTTP/3 — defer until QUIC works
+- [ ] External-client interop via `curl --http3` / `h2load --h3`
 
 ---
 
@@ -909,6 +987,160 @@ curl -6 http://[fe80::...%tap0]:80/health
 # Serial: "SLAAC: configured fe80::5054:ff:fe12:3456"
 # Serial: "NDP: neighbor solicitation from fe80::1"
 ```
+
+---
+
+## Deferred work (paused, recorded)
+
+Items that came up during development and were deliberately deferred
+in favour of forward progress. Each has a short "why now" trigger.
+
+### Production RNG
+
+The current `kernel::rng` is a jitter-entropy collector +
+single-shot ChaCha20 expansion. Sufficient for dev/CI/TLS handshake
+correctness; **not** a CSPRNG suitable for production. To upgrade:
+
+- [ ] Formal entropy-rate estimate for the cycle-counter source on
+      our actual targets (Apple Silicon, GCP N2, x86_64-v3 baseline).
+      Run `dieharder` / NIST STS against a captured stream.
+- [ ] Periodic reseed: every N seconds OR every M bytes consumed,
+      mix in fresh jitter samples + RDRAND/RNDR samples + any
+      virtio-rng device output if present.
+- [ ] Detect and use `virtio-rng` (PCI / MMIO) as a high-bandwidth
+      source when the host exposes one.
+- [ ] aarch64 RNDR (FEAT_RNG) detection + use, not just CNTVCT.
+- [ ] Replace `RDRAND` standalone trust with mixing-only (per
+      intel-sa-00329 best practice).
+
+**Trigger**: before any production deployment that handles real
+cert generation, real session tickets, or real client auth.
+
+### Production certificate path
+
+Today we ship a checked-in dev cert (`apps/webserver/dev_certs/`).
+Production needs:
+
+- [ ] Boot-time generation of an ephemeral Ed25519 keypair from
+      `kernel::rng` and a self-signed cert built with a minimal
+      X.509 DER builder (or a vendored trim of `rcgen`'s no_std
+      surface).
+- [ ] Optionally: bundle a real cert chain via `include_bytes!`
+      from a build-time fetch (e.g. an ACME issuance pipeline that
+      stamps the binary), with the private key encrypted at rest
+      and decrypted at boot via a kernel-supplied passphrase.
+- [ ] Decision: ephemeral self-signed (simplest, breaks pinning) vs
+      bundled chain (production-realistic, requires build-time
+      cert management).
+
+**Trigger**: when we want a public-facing TLS endpoint.
+
+### x86_64 SSE / AVX baseline via custom target JSON
+
+The cpufeatures fix is currently a **per-crate** rustc_flags
+annotation in `MODULE.bazel`. Every new crypto crate that hits
+LLVM's "Do not know how to split the result of this operator!"
+needs to be added to the annotation list. A cleaner long-term
+approach is a custom `x86_64-unikernel.json` Rust target spec that
+sets `features: "+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+aes,
++pclmul,+avx,+avx2,+fma,+bmi1,+bmi2"` as the baseline.
+
+- [ ] Write `bazel/targets/x86_64-unikernel.json` based on
+      `x86_64-unknown-none` with the SSE/AVX baseline.
+- [ ] Update the rust toolchain registration in MODULE.bazel to
+      register the new triple.
+- [ ] Drop the per-crate rustc_flags annotations.
+- [ ] Verify `bazel test //... --config=x86_64-qemu` still passes.
+
+**Trigger**: when the per-crate annotation list has more than 10-12
+crates, or when adding a crate requires a third "look up which
+intrinsic is failing" debugging session.
+
+### rustls-rustcrypto upstream stability
+
+`rustls-rustcrypto = "0.0.2-alpha"` is marked **PROTOTYPE**, **DO NOT
+USE IN PRODUCTION** by upstream. Currently fine for our dev/CI
+work because:
+- It targets rustls 0.23.x (current stable line).
+- Its dep versions (`aes-gcm 0.10`, `chacha20poly1305 0.10`,
+  `sha2 0.10`, `x25519-dalek 2`, `ed25519-dalek 2`, `p256 0.13`)
+  match what we already build.
+- We're not running it in adversarial environments.
+
+- [ ] Track upstream `RustCrypto/rustls-rustcrypto` for a 0.1.0
+      stable release.
+- [ ] If upstream stalls, evaluate vendoring + maintaining a fork
+      with our specific subset (TLS_CHACHA20_POLY1305_SHA256 +
+      X25519 + Ed25519 server cert only, no RSA, no P-384, no
+      anything else). Drops a lot of code.
+- [ ] If `rustls`'s own pluggable provider story matures (e.g. the
+      proposed `rustls::crypto::CryptoProvider` ergonomics
+      improvements land), revisit whether we even need
+      `rustls-rustcrypto` as a separate crate vs. wiring our own
+      provider directly to RustCrypto primitives.
+
+**Trigger**: before any external-facing production deployment.
+
+### TLS panic-strategy host unit tests
+
+`rust_test` on a crate with external deps (sha2, hmac, hkdf,
+rustls, ...) fails to build because the deps are compiled with
+`-Cpanic=abort` (kernel global policy via `.bazelrc`'s
+`extra_rustc_flags`) but the test harness needs `-Cpanic=unwind`.
+Currently, `//net:tls`, `//net:tls_crypto`, and `//net:tcp` (and
+any future crate with crypto deps) cannot have host-native unit
+tests. Coverage lives in bare-metal integration tests like
+`//apps/test_tls`.
+
+- [ ] Investigate `cfg(rustls_no_panic)` style tricks, or rebuild
+      the test harness with `panic=abort`.
+- [ ] OR: per-target rustc_flags override that compiles deps with
+      `panic=unwind` only when used by a test target.
+- [ ] OR: a `[patch.crates-io]`-style override in MODULE.bazel
+      that recompiles the relevant crates with `panic=unwind` in
+      the test exec config.
+
+**Trigger**: when an integration test caught something that a
+host unit test would have caught faster — currently no incidents.
+
+### Real `TimeProvider` for rustls
+
+`apps/test_tls` uses a `NoTimeProvider` that returns Unix epoch
+(0). This works because we don't validate cert expiry on the
+server side (we don't auth client certs) and don't issue session
+tickets. Required when:
+
+- [ ] We start auth'ing clients (need to validate their cert
+      `notBefore` / `notAfter`).
+- [ ] We start issuing session tickets (need a real wall clock
+      for ticket lifetime).
+- [ ] We want to detect our own cert expiring.
+
+Implementation: read CNTVCT_EL0 / TSC, multiply by frequency to get
+nanoseconds since boot, add a boot-time wall-clock estimate (PSCI
+on aarch64, ACPI/CMOS on x86_64). ~30 lines.
+
+### Sans-io key schedule / hand-rolled handshake (`//net:tls`,
+### `//net:tls_handshake`)
+
+We have both `//net:tls` (sans-io key schedule on top of RustCrypto
+primitives) AND `rustls`. They overlap. Decision required:
+
+- **Keep both**: `//net:tls` is the key-schedule code QUIC will
+  reuse for packet protection (`HKDF-Expand-Label` with QUIC
+  labels). `//net:tls_handshake` is useful for low-level debugging /
+  interop bring-up. `rustls` is the production handshake.
+- **Drop `//net:tls_handshake`** once rustls-over-TCP is in place
+  and we don't need a parallel hand-rolled implementation for
+  debugging.
+- **Drop `//net:tls`** entirely once QUIC is in place and we either
+  pull a quinn-proto fork's key schedule or write a minimal HKDF-
+  based one inside the QUIC crate.
+
+Default: keep both for now, revisit when QUIC starts.
+
+**Trigger**: at the start of QUIC integration, when we know which
+key-schedule API quinn-proto / our fork wants.
 
 ---
 
