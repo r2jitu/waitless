@@ -34,7 +34,7 @@ vm-fdt = "0.3"
 #   - fdt 0.1.5 is the last 0.1.x; 0.2.x changes the parser API
 #   - limine 0.5.0 is the last version under the original maintainer;
 #     0.6.x needs nightly `ptr_metadata` which we can't use on stable
-bitflags = { version = "2.9.1", default-features = false }
+bitflags = { version = "2", default-features = false }
 fdt = { version = "0.1.5", default-features = false }
 limine = { version = "0.5.0", default-features = false }
 
