@@ -38,6 +38,42 @@ bitflags = { version = "2", default-features = false }
 fdt = { version = "0.1.5", default-features = false }
 limine = { version = "0.5.0", default-features = false }
 
+# TLS 1.3 crypto primitives from the RustCrypto project. Pure Rust,
+# no_std + alloc compatible. Pulled in via crates-bridge so the
+# bare-metal kernel/uni rust_library targets can use them directly.
+# Versions chosen to be the latest stable as of 2026-04.
+sha2 = { version = "0.10", default-features = false }
+hmac = { version = "0.12", default-features = false }
+hkdf = { version = "0.12", default-features = false }
+# AEAD for TLS 1.3 record encryption: hand-rolled ChaCha20-Poly1305
+# lives in `//net:tls_crypto` rather than depending on the RustCrypto
+# crate. Reasons (investigation 2026-04-14):
+#
+# - `aes-gcm` pulls in `polyval`, whose GHASH pclmulqdq path crashes
+#   LLVM on `x86_64-unknown-none` ("Do not know how to split the
+#   result of this operator!") regardless of the `+sse2,+aes,+pclmul`
+#   feature combo we try.
+# - `chacha20poly1305` + `poly1305` both bail on `x86_64-unknown-none`
+#   via their SIMD auto-detect paths; `poly1305` has no `force-soft`
+#   feature flag.
+# - ChaCha20-Poly1305 is ~150 lines of Rust; writing it ourselves
+#   costs less than fighting crate_universe for x86_64 feature gates
+#   and keeps us portable across both architectures.
+#
+# The other primitives we DO pull from RustCrypto (sha2, hmac, hkdf,
+# x25519, p256, ed25519) all build cleanly on both bare-metal targets
+# after the curve25519-dalek build-script backend override below.
+# Key exchange: X25519 is the only MTI group for TLS 1.3 and QUIC.
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
+# ECDSA verification for P-256 server certificates (common with self-signed
+# dev certs).
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8"] }
+# Ed25519 signatures for a simpler cert option.
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
+# Random: `rand_core` trait + entropy source. We supply our own RNG
+# from the kernel (jitter + cycle counter), this is just the trait.
+rand_core = { version = "0.6", default-features = false }
+
 # Warnings are errors for every workspace member's cargo-standalone
 # build. Bazel builds get the same policy via the `-Dwarnings` flag in
 # `.bazelrc`'s `extra_rustc_flags`, so CI and IDE behaviour match.

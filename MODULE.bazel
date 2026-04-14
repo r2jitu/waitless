@@ -81,4 +81,17 @@ crate.from_cargo(
         "x86_64-unknown-linux-gnu",
     ],
 )
+
+# curve25519-dalek's build.rs auto-selects the "simd" backend for
+# x86_64, which requires AVX2 intrinsics our bare-metal target doesn't
+# enable. Force the portable "serial" backend via the env var the
+# build script reads; the same override works on aarch64 where there's
+# no NEON-specific backend to choose from anyway.
+crate.annotation(
+    crate = "curve25519-dalek",
+    build_script_env = {
+        "CARGO_CFG_CURVE25519_DALEK_BACKEND": "serial",
+    },
+)
+
 use_repo(crate, "crates")
