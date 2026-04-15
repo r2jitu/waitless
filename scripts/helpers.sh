@@ -128,3 +128,135 @@ check_http() {
         return 1
     fi
 }
+
+# ── HTTPS helpers ────────────────────────────────────────────────────────────
+# The hand-rolled TLS 1.3 server ships with an Ed25519 dev cert. macOS's
+# system LibreSSL 3.3.6 can't verify Ed25519, so we require a real
+# OpenSSL 3.x (typically Homebrew). All HTTPS helpers below assume the
+# caller has set:
+#   OPENSSL     — path to openssl binary (set by find_openssl_3x)
+#   VM_HOST     — default 127.0.0.1
+#   VM_PORT     — port the server is listening on
+#   DEV_CERT    — path to dev_cert.pem (for `-CAfile`)
+#   VM_SNI      — SNI / Host: header (default unikernel.local)
+
+# Find a usable OpenSSL 3.x binary. Sets OPENSSL on success and returns 0;
+# returns 1 if only LibreSSL / older OpenSSL is available (caller should
+# typically `exit 0` with a SKIP message in that case).
+find_openssl_3x() {
+    local candidate ver
+    for candidate in \
+            /opt/homebrew/bin/openssl \
+            /opt/homebrew/opt/openssl@3/bin/openssl \
+            /usr/local/bin/openssl \
+            /usr/local/opt/openssl@3/bin/openssl \
+            openssl; do
+        if command -v "$candidate" &>/dev/null; then
+            ver="$("$candidate" version 2>&1 || true)"
+            if [[ "$ver" == OpenSSL\ 3.* ]]; then
+                OPENSSL="$candidate"
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+# Bounded command runner. macOS has no GNU `timeout`; use perl (always
+# present) to fork+exec the child under an alarm and escalate TERM→KILL
+# on expiry. Exits 124 on timeout, otherwise the child's exit code.
+# Usage: run_timeout SECONDS CMD [ARGS...]
+run_timeout() {
+    perl -e '
+        my $t = shift;
+        my $pid = fork // die "fork: $!";
+        if ($pid == 0) { exec { $ARGV[0] } @ARGV or exit 127; }
+        local $SIG{ALRM} = sub {
+            kill TERM => $pid;
+            select undef, undef, undef, 0.5;
+            kill KILL => $pid;
+        };
+        alarm $t;
+        waitpid $pid, 0;
+        alarm 0;
+        exit(($? & 127) ? 124 : ($? >> 8));
+    ' "$@"
+}
+
+# Issue one HTTPS request, bounded by run_timeout. Prints the raw response
+# (headers + body) to stdout, discards openssl stderr. Exit 124 if the
+# handshake or response hangs (e.g. server wedged mid-connection), 0
+# otherwise regardless of HTTP status — callers parse the status line.
+#
+# Usage: https_get PATH [TIMEOUT_S]
+https_get() {
+    local path="$1" timeout_s="${2:-5}"
+    local host="${VM_HOST:-127.0.0.1}"
+    local sni="${VM_SNI:-unikernel.local}"
+    printf 'GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n' "$path" "$sni" | \
+        run_timeout "$timeout_s" \
+            "$OPENSSL" s_client -connect "${host}:${VM_PORT}" -tls1_3 \
+                -CAfile "$DEV_CERT" -servername "$sni" -quiet 2>/dev/null
+}
+
+# Poll until the server returns HTTP/1.1 200 on `path`. Bounded by
+# `timeout` total seconds; if `pid` is non-empty, bails early when that
+# PID dies. Returns 0 when the server answers 200, 1 on timeout.
+#
+# Usage: wait_https PATH TIMEOUT [PID]
+wait_https() {
+    local path="$1" timeout="$2" pid="${3:-}"
+    local elapsed=0 status_line
+    while :; do
+        status_line="$(https_get "$path" 3 | head -1 | tr -d '\r' || true)"
+        [[ "$status_line" == HTTP/1.1\ 200* ]] && return 0
+        if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then return 1; fi
+        if [[ $elapsed -ge $timeout ]]; then return 1; fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+}
+
+# Test an HTTPS endpoint. Returns 0 on pass, 1 on fail.
+# Usage: check_https DESC PATH WANT_STATUS [WANT_BODY]
+check_https() {
+    local desc="$1" path="$2" want_status="$3" want_body="${4:-}"
+    local resp status_line ok=1
+    resp="$(https_get "$path" 10)"
+    status_line="$(echo "$resp" | head -1 | tr -d '\r')"
+    if [[ "$status_line" == "HTTP/1.1 $want_status"* ]]; then
+        if [[ -n "$want_body" ]] && ! echo "$resp" | grep -q "$want_body"; then
+            echo "  FAIL: $desc — missing '$want_body' in body"
+            return 1
+        fi
+        echo "  PASS: $desc"
+        return 0
+    fi
+    echo "  FAIL: $desc — got '$status_line', expected HTTP/1.1 $want_status"
+    return 1
+}
+
+# Run a burst of N sequential HTTPS GETs against `path`; all must return
+# HTTP/1.1 200. Regression guard for rapid-reconnect races in the guest
+# TLS state machine and/or userspace TCP relay. Returns 0 on full pass,
+# 1 on any failure.
+#
+# Usage: burst_https DESC PATH N
+burst_https() {
+    local desc="$1" path="$2" n="$3"
+    local fails=0 status_line i
+    echo "==> ${desc}: ${n} sequential HTTPS GETs to ${path}..."
+    for i in $(seq 1 "$n"); do
+        status_line="$(https_get "$path" 5 | head -1 | tr -d '\r' || true)"
+        if [[ "$status_line" != "HTTP/1.1 200"* ]]; then
+            fails=$((fails + 1))
+            [[ $fails -le 3 ]] && echo "  req $i: got '${status_line}'"
+        fi
+    done
+    if [[ $fails -eq 0 ]]; then
+        echo "  PASS: burst (${n}/${n})"
+        return 0
+    fi
+    echo "  FAIL: burst — ${fails}/${n} requests failed"
+    return 1
+}
