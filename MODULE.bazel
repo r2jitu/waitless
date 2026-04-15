@@ -122,10 +122,7 @@ X86_CRYPTO_FEATURES = "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse
     for name in (
         "aes",
         "aes-gcm",
-        "chacha20",
-        "chacha20poly1305",
         "ghash",
-        "poly1305",
         "polyval",
         # p256 + its big-int transitive deps also do `u128` math that
         # trips the soft-float legalization bug on x86_64-unknown-none.
@@ -136,6 +133,28 @@ X86_CRYPTO_FEATURES = "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse
         "crypto-bigint",
     )
 ]
+
+# chacha20 and poly1305 get an extra `--cfg=..._force_soft` on top
+# of the target-feature fix — something in their x86 SIMD backends
+# (not AVX2; SSE2 is also affected) produces incorrect ciphertext
+# on x86_64-unknown-none targets. The RFC 8439 known-answer test
+# in apps/test_tls fails both ct_ok and tag_ok on x86_64 with the
+# SIMD path enabled, and bypassing SIMD at the crate level makes
+# it pass again. Both crates explicitly document
+# `chacha20_force_soft` / `poly1305_force_soft` as the way to
+# pick the portable constant-time software backend.
+crate.annotation(
+    crate = "chacha20",
+    rustc_flags = [X86_CRYPTO_FEATURES, "--cfg=chacha20_force_soft"],
+)
+crate.annotation(
+    crate = "chacha20poly1305",
+    rustc_flags = [X86_CRYPTO_FEATURES],
+)
+crate.annotation(
+    crate = "poly1305",
+    rustc_flags = [X86_CRYPTO_FEATURES, "--cfg=poly1305_force_soft"],
+)
 
 # curve25519-dalek needs BOTH the target-feature flag (its field
 # element arithmetic runs into the same LLVM legalisation issue

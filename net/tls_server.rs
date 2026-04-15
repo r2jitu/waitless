@@ -424,6 +424,35 @@ mod trace {
     #[cfg(not(tls_debug))]
     pub fn step(_msg: &[u8]) {}
 
+    /// Dump `bytes` as a hex string prefixed with `label`. Wraps
+    /// every 32 bytes for readability. Used to compare server
+    /// flight contents across platforms when debugging handshake
+    /// correctness bugs.
+    #[cfg(tls_debug)]
+    pub fn hex_dump(label: &[u8], bytes: &[u8]) {
+        serial::puts(b"[tls] ");
+        serial::puts(label);
+        serial::puts(b" (");
+        put_u16_dec(bytes.len() as u16);
+        serial::puts(b" bytes):\n");
+        const HEX: &[u8] = b"0123456789abcdef";
+        let mut buf = [0u8; 3];
+        buf[2] = b' ';
+        for (i, &b) in bytes.iter().enumerate() {
+            buf[0] = HEX[(b >> 4) as usize];
+            buf[1] = HEX[(b & 0xf) as usize];
+            serial::puts(&buf);
+            if (i + 1) % 32 == 0 {
+                serial::puts(b"\n");
+            }
+        }
+        if bytes.len() % 32 != 0 {
+            serial::puts(b"\n");
+        }
+    }
+    #[cfg(not(tls_debug))]
+    pub fn hex_dump(_label: &[u8], _bytes: &[u8]) {}
+
     #[cfg(tls_debug)]
     pub fn do_client_finished_entry(rx_len: usize, first_byte: Option<u8>) {
         serial::puts(b"[tls] do_client_finished entered, rx_len=");

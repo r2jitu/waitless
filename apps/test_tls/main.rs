@@ -81,6 +81,112 @@ fn main() {
         }
     }
 
+    // ---- 1b. Large-plaintext AEAD round-trip ---------------------------
+    // Live handshake Certificate records are ~580 bytes of plaintext,
+    // way past the 32-byte smoke test above. Any data-length-dependent
+    // bug in the SIMD path (e.g. wrong block-count handling at a
+    // specific size threshold) wouldn't show up in the small test but
+    // would cripple the real handshake — which is exactly what we saw
+    // on x86_64-unknown-none TCG after enabling `+avx,+avx2`. This
+    // test seals a 600-byte buffer and verifies the round-trip is
+    // byte-exact, catching any corruption from AVX emulation /
+    // length-gating bugs at its source.
+    {
+        let key = [0x77u8; 32];
+        let nonce = [0x33u8; 12];
+        let aad = b"5-byte";
+        let mut original = [0u8; 600];
+        // Fill with a non-trivial pattern so any XOR-then-XOR-back bug
+        // (where the stream is all-zero for parts of the buffer) is
+        // visible as a position-dependent mismatch.
+        for (i, b) in original.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(37).wrapping_add(1);
+        }
+        let mut buf = [0u8; 600];
+        buf.copy_from_slice(&original);
+
+        let tag = tls_crypto::chacha20poly1305_seal(&key, &nonce, aad, &mut buf);
+
+        // Ciphertext must differ from plaintext at >90% of positions
+        // (probabilistically certain for any real stream cipher).
+        let mut differ = 0usize;
+        for i in 0..600 {
+            if buf[i] != original[i] { differ += 1; }
+        }
+        let ct_looks_encrypted = differ > 540;
+
+        // Round-trip.
+        let opened = tls_crypto::chacha20poly1305_open(&key, &nonce, aad, &mut buf, &tag);
+        let pt_recovered = opened.is_ok() && buf == original;
+
+        if ct_looks_encrypted && pt_recovered {
+            pass(b"aead_roundtrip_large");
+        } else {
+            fail(b"aead_roundtrip_large");
+            failures += 1;
+        }
+    }
+
+    // ---- 1c. AEAD known-answer vector (RFC 8439 §2.8.2) ---------------
+    // The round-trip tests above only prove seal(open(x)) == x — a bug
+    // that produces consistent-but-wrong ciphertext (e.g. XOR with the
+    // wrong stream) would still pass. This test pins seal() output
+    // against the RFC 8439 known-answer vector so we catch that case.
+    // If this fails but the round-trip passes, something in the chacha20
+    // or poly1305 SIMD path is producing a self-consistent but
+    // incorrect keystream.
+    {
+        let key: [u8; 32] = [
+            0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,
+            0x88, 0x89, 0x8a, 0x8b, 0x8c, 0x8d, 0x8e, 0x8f,
+            0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97,
+            0x98, 0x99, 0x9a, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f,
+        ];
+        let nonce: [u8; 12] = [
+            0x07, 0x00, 0x00, 0x00,
+            0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47,
+        ];
+        let aad: [u8; 12] = [
+            0x50, 0x51, 0x52, 0x53, 0xc0, 0xc1, 0xc2, 0xc3,
+            0xc4, 0xc5, 0xc6, 0xc7,
+        ];
+        let plaintext: &[u8] = b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
+        let expected_ct: [u8; 114] = [
+            0xd3, 0x1a, 0x8d, 0x34, 0x64, 0x8e, 0x60, 0xdb, 0x7b, 0x86, 0xaf, 0xbc,
+            0x53, 0xef, 0x7e, 0xc2, 0xa4, 0xad, 0xed, 0x51, 0x29, 0x6e, 0x08, 0xfe,
+            0xa9, 0xe2, 0xb5, 0xa7, 0x36, 0xee, 0x62, 0xd6, 0x3d, 0xbe, 0xa4, 0x5e,
+            0x8c, 0xa9, 0x67, 0x12, 0x82, 0xfa, 0xfb, 0x69, 0xda, 0x92, 0x72, 0x8b,
+            0x1a, 0x71, 0xde, 0x0a, 0x9e, 0x06, 0x0b, 0x29, 0x05, 0xd6, 0xa5, 0xb6,
+            0x7e, 0xcd, 0x3b, 0x36, 0x92, 0xdd, 0xbd, 0x7f, 0x2d, 0x77, 0x8b, 0x8c,
+            0x98, 0x03, 0xae, 0xe3, 0x28, 0x09, 0x1b, 0x58, 0xfa, 0xb3, 0x24, 0xe4,
+            0xfa, 0xd6, 0x75, 0x94, 0x55, 0x85, 0x80, 0x8b, 0x48, 0x31, 0xd7, 0xbc,
+            0x3f, 0xf4, 0xde, 0xf0, 0x8e, 0x4b, 0x7a, 0x9d, 0xe5, 0x76, 0xd2, 0x65,
+            0x86, 0xce, 0xc6, 0x4b, 0x61, 0x16,
+        ];
+        let expected_tag: [u8; 16] = [
+            0x1a, 0xe1, 0x0b, 0x59, 0x4f, 0x09, 0xe2, 0x6a,
+            0x7e, 0x90, 0x2e, 0xcb, 0xd0, 0x60, 0x06, 0x91,
+        ];
+
+        let mut buf = [0u8; 114];
+        buf.copy_from_slice(plaintext);
+        let tag = tls_crypto::chacha20poly1305_seal(&key, &nonce, &aad, &mut buf);
+
+        let ct_ok = buf == expected_ct;
+        let tag_ok = tag == expected_tag;
+
+        if ct_ok && tag_ok {
+            pass(b"aead_rfc8439_known_answer");
+        } else {
+            fail(b"aead_rfc8439_known_answer");
+            logn(b"      ct_ok=");
+            logn(if ct_ok { b"true " } else { b"false " });
+            logn(b"tag_ok=");
+            logn(if tag_ok { b"true\n" } else { b"false\n" });
+            failures += 1;
+        }
+    }
+
     // ---- 2. X25519 round-trip ------------------------------------------
     // Both "client" and "server" generate an ephemeral key, exchange
     // public keys, and check the derived shared secret matches.

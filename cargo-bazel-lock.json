@@ -1,5 +1,5 @@
 {
-  "checksum": "f447203c22229babf32d7f70b020b297e79b4108de5c0a65f28398a1f9387732",
+  "checksum": "1b7ed1fc5738b5f76a7814ea459b9d29a045aa49ef47b657b317ce492e3f63f3",
   "crates": {
     "aead 0.5.2": {
       "name": "aead",
@@ -428,7 +428,8 @@
         "edition": "2021",
         "rustc_flags": {
           "common": [
-            "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmul,+fma,+bmi1,+bmi2"
+            "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmul,+fma,+bmi1,+bmi2",
+            "--cfg=chacha20_force_soft"
           ],
           "selects": {}
         },
@@ -2316,7 +2317,8 @@
         "edition": "2021",
         "rustc_flags": {
           "common": [
-            "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmul,+fma,+bmi1,+bmi2"
+            "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmul,+fma,+bmi1,+bmi2",
+            "--cfg=poly1305_force_soft"
           ],
           "selects": {}
         },
