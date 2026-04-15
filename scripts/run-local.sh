@@ -217,7 +217,7 @@ if [ "$HOST_OS" = "Linux" ]; then
             -kernel "$KERNEL" \
             -m "${MEMORY}" \
             -smp "${CPUS}" \
-            -cpu qemu64 \
+            -cpu max \
             "${QEMU_OUTPUT[@]}" \
             -device "$DEVICE" \
             -netdev "$NETDEV" \
@@ -243,14 +243,18 @@ QEMU_X86=(
     -kernel "$KERNEL"
     -m "${MEMORY}"
     -smp "${CPUS}"
-    -cpu qemu64
     "${QEMU_OUTPUT[@]}"
     -device "$DEVICE"
     -netdev "$NETDEV"
 )
 
+# `-cpu host` is the right choice under HVF (pass-through host
+# features, including AVX, which our compiled crypto needs).
+# `-cpu max` is the fallback under pure TCG — it enables every
+# feature QEMU can simulate, including AVX. Pre-AVX `qemu64`
+# crashes the TLS init scalar mult with #UD.
 if sysctl -n kern.hv_support 2>/dev/null | grep -q '^1$'; then
-    exec "${QEMU_X86[@]}" -accel hvf
+    exec "${QEMU_X86[@]}" -cpu host -accel hvf
 else
-    exec "${QEMU_X86[@]}"
+    exec "${QEMU_X86[@]}" -cpu max
 fi

@@ -540,7 +540,13 @@ class QemuEnv:
 
     def start(self, cpus, port):
         elf = os.path.join(PROJECT_ROOT, "bazel-bin/apps/webserver/webserver.elf")
-        cmd = ["qemu-system-x86_64", "-cpu", "qemu64",
+        # `-cpu max` instead of `-cpu qemu64`: the compiled crypto
+        # code (p256 / chacha20poly1305 / etc.) is annotated with
+        # `+avx,+avx2` in MODULE.bazel and crashes with #UD the
+        # first time it emits an AVX instruction on a pre-AVX CPU
+        # model. `qemu64` is pre-AVX; `max` enables every feature
+        # TCG can simulate.
+        cmd = ["qemu-system-x86_64", "-cpu", "max",
                "-m", "128", "-smp", str(cpus), "-nographic",
                "-serial", f"file:/tmp/bench_{port}.log", "-no-reboot"]
         if cpus > 1:
@@ -1060,15 +1066,29 @@ def main():
                 if proc is None:
                     print(f"    {wname:<20s} SKIP (not ready)")
                     # Print last few lines of serial log to show why it failed.
+                    # Each env writes its guest serial somewhere different;
+                    # the tail almost always holds the boot panic or the
+                    # last-seen DHCP / network message that explains why
+                    # `wait_http` never reached the guest.
                     if isinstance(env, HvfEnv):
-                        for suffix, label in [(".serial.log", "serial"), (".log", "stderr")]:
-                            try:
-                                with open(f"/tmp/hvf_{port}{suffix}") as lf:
-                                    lines = lf.read().strip().splitlines()
-                                    for l in lines[-8:]:
-                                        print(f"      {label}: {l}")
-                            except Exception:
-                                pass
+                        serial_sources = [
+                            (f"/tmp/hvf_{port}.serial.log", "serial"),
+                            (f"/tmp/hvf_{port}.log", "stderr"),
+                        ]
+                    elif isinstance(env, (KvmEnv, QemuEnv, QemuAarch64Env)):
+                        serial_sources = [(f"/tmp/bench_{port}.log", "serial")]
+                    else:
+                        serial_sources = []
+                    for path, label in serial_sources:
+                        try:
+                            with open(path) as lf:
+                                lines = lf.read().strip().splitlines()
+                                if not lines:
+                                    print(f"      {label}: (empty)")
+                                for l in lines[-12:]:
+                                    print(f"      {label}: {l}")
+                        except Exception:
+                            pass
                     results[(env_name, cpus, wname)] = (0, "", "")
                     wait_port_pool()
                     consecutive_skips += 1

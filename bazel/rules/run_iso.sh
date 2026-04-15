@@ -23,4 +23,4 @@ echo "==> http://localhost:${PORT}/"
 echo "==> https://localhost:${TLS_PORT}/  (self-signed dev cert — use curl -k)"
 
 run_qemu "$PORT" "$TLS_PORT" "${UNIKERNEL_MEMORY:-128}" \
-    -cpu qemu64 -cdrom "$WS/bazel-bin/${UNIKERNEL_ISO_RELPATH}"
+    -cpu max -cdrom "$WS/bazel-bin/${UNIKERNEL_ISO_RELPATH}"

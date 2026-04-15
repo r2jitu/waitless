@@ -25,16 +25,36 @@ detect_qemu() {
         [[ -f "$KERNEL_ARG" ]] || { echo "error: .img not found: $KERNEL_ARG" >&2; return 1; }
     else
         QEMU_BIN="qemu-system-x86_64"
-        QEMU_MACHINE=(-cpu qemu64)
         VIRTIO_DEV="virtio-net-pci"
         KERNEL_ARG="$elf"
-        # HVF/KVM only when host arch matches guest
+        # CPU model choice:
+        #
+        #   - Accelerated (KVM/HVF):  -cpu host  pass-through so the
+        #     guest sees the real host's feature set. On any modern
+        #     GCP / Apple Silicon x86 host that includes AVX/AVX2,
+        #     which our p256 + chacha20poly1305 builds rely on.
+        #
+        #   - TCG emulation:  -cpu max  enables every feature TCG
+        #     can simulate, including AVX. `-cpu qemu64` (the QEMU
+        #     default) is pre-AVX and makes the compiled crypto
+        #     crates crash with #UD the first time they emit a
+        #     VMOVDQU — we learned this the hard way when TLS init
+        #     started doing a d*G scalar mult at boot time.
+        #
+        # HVF on Apple Silicon arm64 never accelerates x86 guests,
+        # so that branch only ever activates on an x86_64 macOS host
+        # (which in practice doesn't exist anymore — every current
+        # Mac is aarch64).
         if [[ "$(uname -m)" = "x86_64" ]]; then
             if [[ "$(uname -s)" = "Darwin" ]] && sysctl -n kern.hv_support 2>/dev/null | grep -q '^1$'; then
-                QEMU_MACHINE+=(-accel hvf)
+                QEMU_MACHINE=(-cpu host -accel hvf)
             elif [[ "$(uname -s)" = "Linux" ]] && [[ -r /dev/kvm ]]; then
-                QEMU_MACHINE+=(-accel kvm)
+                QEMU_MACHINE=(-cpu host -accel kvm)
+            else
+                QEMU_MACHINE=(-cpu max)
             fi
+        else
+            QEMU_MACHINE=(-cpu max)
         fi
     fi
 }
