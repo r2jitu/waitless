@@ -185,6 +185,18 @@ pub use backend::{log, config_port, check_shutdown, wait_for_events, tcp_poll};
 pub use backend::{num_workers, set_service, set_ready, request_shutdown, register_io_poll};
 pub use backend::tcp_listen_on;
 
+/// Current core / worker ID. On unikernel this reads the percpu TLS
+/// register (~2 cycles). On native there's no per-thread state, so
+/// this returns 0 — native handlers should not rely on per-core
+/// scratch storage.
+#[inline]
+pub fn cpu_id() -> u32 {
+    #[cfg(platform_unikernel)]
+    { kernel::cpu_id() }
+    #[cfg(platform_native)]
+    { 0 }
+}
+
 // ---- UDP --------------------------------------------------------------------
 
 /// Bind a UDP port handler. Callback receives (src_ip_octets, src_port, payload).

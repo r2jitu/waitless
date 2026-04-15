@@ -5,6 +5,7 @@
 #![no_std]
 
 extern crate uni;
+use core::cell::UnsafeCell;
 use uni::http::{Request, Response, Server, TlsServerConfig};
 
 // Checked-in self-signed ECDSA P-256 dev cert + private key, baked
@@ -72,6 +73,46 @@ fn compute_work() -> u32 {
     h
 }
 
+// ---- /tls_profile scratch buffers -----------------------------------------
+//
+// The TLS handshake profiler (in `//net:tls_server`) accumulates
+// per-stage timings across every handshake; the `/tls_profile`
+// endpoint renders those totals as plain text. `Response` just
+// carries raw byte pointers, so the formatter needs a backing buffer
+// that outlives the handler return. We use one 4 KB buffer per core,
+// indexed by `uni::cpu_id()`, so two handlers on different cores can
+// render reports concurrently without racing on the same scratch.
+// Within a single core, `service_core` runs the handler and
+// `send_response` back-to-back, so the buffer only needs to survive
+// until the bytes hit the TX path — exactly what a per-core slot
+// gives us.
+const MAX_CORES: usize = 8;
+const PROFILE_BUF_LEN: usize = 4096;
+struct ProfileSlot(UnsafeCell<[u8; PROFILE_BUF_LEN]>);
+unsafe impl Sync for ProfileSlot {}
+static PROFILE_BUFS: [ProfileSlot; MAX_CORES] = [
+    ProfileSlot(UnsafeCell::new([0u8; PROFILE_BUF_LEN])),
+    ProfileSlot(UnsafeCell::new([0u8; PROFILE_BUF_LEN])),
+    ProfileSlot(UnsafeCell::new([0u8; PROFILE_BUF_LEN])),
+    ProfileSlot(UnsafeCell::new([0u8; PROFILE_BUF_LEN])),
+    ProfileSlot(UnsafeCell::new([0u8; PROFILE_BUF_LEN])),
+    ProfileSlot(UnsafeCell::new([0u8; PROFILE_BUF_LEN])),
+    ProfileSlot(UnsafeCell::new([0u8; PROFILE_BUF_LEN])),
+    ProfileSlot(UnsafeCell::new([0u8; PROFILE_BUF_LEN])),
+];
+
+fn tls_profile_response() -> Response {
+    let id = (uni::cpu_id() as usize) % MAX_CORES;
+    // SAFETY: each core uses its own slot (indexed by cpu_id), and
+    // service_core runs the handler + send_response back-to-back on
+    // one core without yielding, so no concurrent aliasing is
+    // possible. The raw pointer stored in `Response` points into
+    // this same slot for exactly that duration.
+    let buf: &mut [u8; PROFILE_BUF_LEN] = unsafe { &mut *PROFILE_BUFS[id].0.get() };
+    let n = uni::http::tls_profile_report(buf);
+    Response::ok(b"text/plain", &buf[..n])
+}
+
 fn handle_request(req: &Request) -> Response {
     match req.path() {
         b"/" => Response::ok(b"text/html", INDEX_HTML),
@@ -82,6 +123,11 @@ fn handle_request(req: &Request) -> Response {
             // as dead code (the return value would otherwise be unused).
             core::hint::black_box(compute_work());
             Response::ok(b"application/json", b"{\"status\":\"computed\"}")
+        }
+        b"/tls_profile" => tls_profile_response(),
+        b"/tls_profile_reset" => {
+            uni::http::tls_profile_reset();
+            Response::ok(b"text/plain", b"tls profile reset\n")
         }
         _ => Response::not_found(),
     }

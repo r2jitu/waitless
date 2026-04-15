@@ -29,13 +29,37 @@ pub use net::tls_server::TlsServerConfig;
 #[cfg(platform_native)]
 pub struct TlsServerConfig {
     pub cert_der: &'static [u8],
-    pub signing_seed: [u8; 32],
 }
 
 #[cfg(platform_native)]
 impl TlsServerConfig {
     pub fn from_dev_cert(cert_der: &'static [u8], _pkcs8_key: &[u8]) -> Option<Self> {
-        Some(TlsServerConfig { cert_der, signing_seed: [0u8; 32] })
+        Some(TlsServerConfig { cert_der })
+    }
+}
+
+/// Format the TLS handshake profile into `out`. Returns the number of
+/// bytes written. Apps can serve this as the body of a debug endpoint
+/// (`/tls_profile`) to inspect per-stage handshake timings. Returns 0
+/// on native (no hand-rolled TLS, nothing to profile).
+pub fn tls_profile_report(out: &mut [u8]) -> usize {
+    #[cfg(platform_unikernel)]
+    {
+        net::tls_server::profile::report(out)
+    }
+    #[cfg(platform_native)]
+    {
+        let _ = out;
+        0
+    }
+}
+
+/// Reset the TLS handshake profile accumulators. Useful between
+/// benchmark runs.
+pub fn tls_profile_reset() {
+    #[cfg(platform_unikernel)]
+    {
+        net::tls_server::profile::reset();
     }
 }
 

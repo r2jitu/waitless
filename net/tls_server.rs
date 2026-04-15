@@ -87,11 +87,20 @@ pub struct TlsServerConfig {
     /// parse it, because the client's job is to verify it (or not,
     /// in the `curl -k` case).
     pub cert_der: &'static [u8],
-    /// The ECDSA P-256 private scalar that corresponds to the cert's
-    /// public key. 32-byte raw scalar (NOT a PKCS#8 blob — the caller
-    /// extracts the bytes from the `dev_key.der` file via
-    /// `extract_p256_d_from_pkcs8`).
-    pub signing_seed: [u8; 32],
+    /// Pre-constructed ECDSA P-256 signing key. Built once at config
+    /// creation so the handshake hot path doesn't re-derive it on
+    /// every connection.
+    ///
+    /// Why this matters: `SigningKey::from_slice(seed)` internally
+    /// runs `PublicKey::from_secret_scalar(&secret_scalar)` to
+    /// populate the `verifying_key` field of the returned key (the
+    /// `verifying` feature is on by default). That's a full P-256
+    /// scalar multiplication (`d*G`) that we'd otherwise pay on
+    /// every handshake even though we never look at the verifying
+    /// key. Caching the constructed `SigningKey` eliminates that
+    /// redundant scalar mult from the critical path — profiling
+    /// showed it was ~half of the 346µs the raw `sign()` call took.
+    pub signing_key: SigningKey,
 }
 
 impl TlsServerConfig {
@@ -100,12 +109,14 @@ impl TlsServerConfig {
     /// is a PKCS#8 `PrivateKeyInfo` wrapping an RFC 5915 `ECPrivateKey`
     /// SEQUENCE, which contains the 32-byte private scalar.
     ///
-    /// Returns `None` if the PKCS#8 blob isn't the expected shape.
+    /// Returns `None` if the PKCS#8 blob isn't the expected shape or
+    /// the extracted scalar isn't a valid P-256 private key.
     pub fn from_dev_cert(cert_der: &'static [u8], pkcs8_key: &[u8]) -> Option<Self> {
         let seed = extract_p256_d_from_pkcs8(pkcs8_key)?;
+        let signing_key = SigningKey::from_slice(&seed).ok()?;
         Some(TlsServerConfig {
             cert_der,
-            signing_seed: seed,
+            signing_key,
         })
     }
 }
@@ -589,6 +600,278 @@ mod trace {
     }
 }
 
+// ============================================================================
+// Per-stage handshake profiler
+// ============================================================================
+//
+// Always-on cycle-counter accumulator for each stage of
+// `do_client_hello`. Uses `kernel::time::now_cycles()` which is a
+// single instruction on both archs (~1ns) so the overhead per
+// handshake is dwarfed by any individual stage. Totals live in
+// module-level atomics; `report()` formats a human-readable dump
+// that the webserver exposes at `/tls_profile`.
+pub mod profile {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use kernel::time;
+
+    /// Stage identifier. Indexes into `TOTAL` / `WORST`.
+    #[derive(Clone, Copy)]
+    #[repr(usize)]
+    pub enum Stage {
+        /// ClientHello parse (record + handshake framing + extension walk).
+        Parse = 0,
+        /// ServerHello build + plaintext record encode.
+        ServerHello = 1,
+        /// X25519 ECDHE: `ephemeral.shared_secret(&client_pub)`.
+        Ecdhe = 2,
+        /// HKDF cascade for handshake traffic secrets
+        /// (`KeySchedule::enter_handshake`).
+        HkdfHs = 3,
+        /// EncryptedExtensions build + seal.
+        EncExt = 4,
+        /// Certificate build + seal.
+        Cert = 5,
+        /// CertificateVerify: SigningKey::from_slice + ECDSA P-256 sign
+        /// (RFC 6979 det-k + SHA-256 + scalar mult) + DER encode.
+        CvSign = 6,
+        /// CertificateVerify seal (record-layer AEAD only, no sig work).
+        CvSeal = 7,
+        /// ServerFinished: HMAC over transcript + build + seal.
+        Finished = 8,
+        /// HKDF cascade for application traffic secrets
+        /// (`KeySchedule::enter_application`).
+        HkdfAp = 9,
+    }
+
+    const N_STAGES: usize = 10;
+
+    const STAGE_NAMES: [&[u8]; N_STAGES] = [
+        b"parse     ",
+        b"srvhello  ",
+        b"ecdhe     ",
+        b"hkdf_hs   ",
+        b"encext    ",
+        b"cert      ",
+        b"cv_sign   ",
+        b"cv_seal   ",
+        b"finished  ",
+        b"hkdf_ap   ",
+    ];
+
+    // Per-stage totals. Each handshake adds its elapsed cycles to the
+    // matching slot; `handshakes` counts completed handshakes so the
+    // formatter can compute the mean.
+    static TOTAL: [AtomicU64; N_STAGES] = [
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+    static WORST: [AtomicU64; N_STAGES] = [
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+    static HANDSHAKES: AtomicU64 = AtomicU64::new(0);
+
+    /// Start a handshake profile — returns an opaque cycle timestamp
+    /// that callers thread through `mark()` to partition the handshake
+    /// into stages.
+    #[inline(always)]
+    pub fn start() -> u64 {
+        time::now_cycles()
+    }
+
+    /// Record the cycles elapsed from `prev` to now into `stage`, and
+    /// return the current cycle counter (to be passed as `prev` to
+    /// the next `mark()` call). This lets the caller walk through the
+    /// handshake with a single live cycle timestamp and no extra
+    /// locals per stage.
+    #[inline(always)]
+    pub fn mark(stage: Stage, prev: u64) -> u64 {
+        let now = time::now_cycles();
+        let delta = now.wrapping_sub(prev);
+        let idx = stage as usize;
+        TOTAL[idx].fetch_add(delta, Ordering::Relaxed);
+        // Update the per-stage worst-case with a compare-and-swap
+        // retry loop. Contention here is benign — each slot is hit
+        // from the vCPU that owns the connection, and the bound on
+        // cross-core writes is the number of cores.
+        let mut cur = WORST[idx].load(Ordering::Relaxed);
+        while delta > cur {
+            match WORST[idx].compare_exchange_weak(
+                cur, delta, Ordering::Relaxed, Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => cur = observed,
+            }
+        }
+        now
+    }
+
+    /// Count a completed handshake. Called once at the end of
+    /// `do_client_hello` after the final `mark()`.
+    #[inline(always)]
+    pub fn bump_count() {
+        HANDSHAKES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Reset all accumulators to zero. Useful for A/B benchmarking
+    /// — hit `/tls_profile_reset` between runs.
+    pub fn reset() {
+        for s in TOTAL.iter() {
+            s.store(0, Ordering::Relaxed);
+        }
+        for s in WORST.iter() {
+            s.store(0, Ordering::Relaxed);
+        }
+        HANDSHAKES.store(0, Ordering::Relaxed);
+    }
+
+    /// Format the accumulated stats into `out` as ASCII. Returns the
+    /// number of bytes written. Shape (fixed-width columns):
+    /// ```text
+    /// TLS handshake profile (N handshakes, X cyc/us)
+    /// stage        total_us    mean_ns  worst_ns    pct
+    /// parse                42       123       456   1.2
+    /// srvhello            ...
+    /// ...
+    /// total              1378
+    /// ```
+    pub fn report(out: &mut [u8]) -> usize {
+        let cyc_per_us = time::cycles_per_us().max(1);
+        let n_hs = HANDSHAKES.load(Ordering::Relaxed);
+
+        let mut totals = [0u64; N_STAGES];
+        let mut worsts = [0u64; N_STAGES];
+        let mut grand_total: u64 = 0;
+        for i in 0..N_STAGES {
+            totals[i] = TOTAL[i].load(Ordering::Relaxed);
+            worsts[i] = WORST[i].load(Ordering::Relaxed);
+            grand_total = grand_total.saturating_add(totals[i]);
+        }
+
+        let mut w = Writer::new(out);
+        w.puts(b"TLS handshake profile (");
+        w.put_u64(n_hs);
+        w.puts(b" handshakes, ");
+        w.put_u64(cyc_per_us);
+        w.puts(b" cyc/us)\n");
+        w.puts(b"stage        total_us  mean_ns  worst_ns  pct\n");
+        for i in 0..N_STAGES {
+            let total_us = totals[i] / cyc_per_us;
+            let mean_ns = if n_hs > 0 {
+                // cycles -> ns: cycles * 1000 / cyc_per_us
+                (totals[i].saturating_mul(1000) / n_hs) / cyc_per_us
+            } else {
+                0
+            };
+            let worst_ns = worsts[i].saturating_mul(1000) / cyc_per_us;
+            let pct_x10 = if grand_total > 0 {
+                (totals[i].saturating_mul(1000)) / grand_total
+            } else {
+                0
+            };
+            w.puts(STAGE_NAMES[i]);
+            w.put_u64_right(total_us, 10);
+            w.put_u64_right(mean_ns, 9);
+            w.put_u64_right(worst_ns, 10);
+            w.puts(b"  ");
+            w.put_u64(pct_x10 / 10);
+            w.putc(b'.');
+            w.put_u64(pct_x10 % 10);
+            w.putc(b'\n');
+        }
+        w.puts(b"total       ");
+        if n_hs > 0 {
+            let mean_total_ns =
+                (grand_total.saturating_mul(1000) / n_hs) / cyc_per_us;
+            w.put_u64(mean_total_ns / 1000);
+            w.puts(b".");
+            let frac = mean_total_ns % 1000;
+            if frac < 100 {
+                w.putc(b'0');
+            }
+            if frac < 10 {
+                w.putc(b'0');
+            }
+            w.put_u64(frac);
+            w.puts(b"us mean per handshake\n");
+        } else {
+            w.puts(b"(no handshakes sampled yet)\n");
+        }
+        w.len()
+    }
+
+    // ── tiny byte-buffer writer ─────────────────────────────────────
+    struct Writer<'a> {
+        buf: &'a mut [u8],
+        pos: usize,
+    }
+
+    impl<'a> Writer<'a> {
+        fn new(buf: &'a mut [u8]) -> Self {
+            Writer { buf, pos: 0 }
+        }
+        fn len(&self) -> usize {
+            self.pos
+        }
+        fn putc(&mut self, c: u8) {
+            if self.pos < self.buf.len() {
+                self.buf[self.pos] = c;
+                self.pos += 1;
+            }
+        }
+        fn puts(&mut self, s: &[u8]) {
+            let n = core::cmp::min(s.len(), self.buf.len() - self.pos);
+            self.buf[self.pos..self.pos + n].copy_from_slice(&s[..n]);
+            self.pos += n;
+        }
+        fn put_u64(&mut self, mut v: u64) {
+            if v == 0 {
+                self.putc(b'0');
+                return;
+            }
+            let mut digits = [0u8; 20];
+            let mut n = 0;
+            while v > 0 {
+                digits[n] = b'0' + (v % 10) as u8;
+                v /= 10;
+                n += 1;
+            }
+            while n > 0 {
+                n -= 1;
+                self.putc(digits[n]);
+            }
+        }
+        /// Right-justify a u64 in `width` columns (space-padded).
+        fn put_u64_right(&mut self, v: u64, width: usize) {
+            let mut digits = [0u8; 20];
+            let mut n = 0;
+            let mut t = v;
+            if t == 0 {
+                digits[0] = b'0';
+                n = 1;
+            } else {
+                while t > 0 {
+                    digits[n] = b'0' + (t % 10) as u8;
+                    t /= 10;
+                    n += 1;
+                }
+            }
+            let pad = width.saturating_sub(n);
+            for _ in 0..pad {
+                self.putc(b' ');
+            }
+            while n > 0 {
+                n -= 1;
+                self.putc(digits[n]);
+            }
+        }
+    }
+}
+
 impl TlsServer {
     /// Create a fresh TlsServer with a random X25519 keypair.
     /// `seed` is 32 bytes of entropy for the ephemeral key — caller
@@ -800,6 +1083,10 @@ impl TlsServer {
         if self.rx_len < record::HEADER_LEN {
             return Ok(());
         }
+        // Begin per-stage cycle profile. `t` threads through each
+        // stage boundary via `profile::mark()` until the handshake is
+        // complete.
+        let t = profile::start();
         // Peek at the plaintext record. `Truncated` means the record
         // is fragmented across TCP segments and we need to wait for
         // more bytes — NOT a fatal error.
@@ -848,6 +1135,7 @@ impl TlsServer {
         // `body`/`hs_body` borrows are invalid; we've already extracted
         // everything we need into owned locals.
         self.drain_rx(consumed);
+        let t = profile::mark(profile::Stage::Parse, t);
 
         // ── Generate and emit ServerHello ──────────────────────────
         // Server random: 32 bytes of entropy.
@@ -881,15 +1169,18 @@ impl TlsServer {
 
         // Update transcript with ServerHello.
         self.transcript.update(&sh_msg[..sh_msg_len]);
+        let t = profile::mark(profile::Stage::ServerHello, t);
 
         // ── Compute shared secret + derive handshake traffic keys ──
         let shared = ephemeral.shared_secret(&client_x25519_pub);
+        let t = profile::mark(profile::Stage::Ecdhe, t);
         let transcript_h1 = self.transcript.snapshot();
         let hs_secrets = self.schedule.enter_handshake(&shared, &transcript_h1);
         self.client_hs_secret = Some(hs_secrets.client_hs);
         self.server_hs_secret = Some(hs_secrets.server_hs);
         self.client_hs_tk = Some(TrafficKey::from_secret(&hs_secrets.client_hs));
         let mut server_hs_tk = TrafficKey::from_secret(&hs_secrets.server_hs);
+        let t = profile::mark(profile::Stage::HkdfHs, t);
 
         // ── Middlebox-compat: emit a plaintext ChangeCipherSpec ────
         // RFC 8446 §D.4: a TLS 1.3 server that wants to interop with
@@ -924,6 +1215,7 @@ impl TlsServer {
         self.transcript.update(&ee_msg[..ee_msg_len]);
         self.seal_handshake_record(&mut server_hs_tk, &ee_msg[..ee_msg_len])?;
         trace::step(b"[tls] EncryptedExtensions sealed\n");
+        let t = profile::mark(profile::Stage::EncExt, t);
 
         // Certificate
         // Build into a stack buffer; 2 KB handles our 500-ish-byte dev cert.
@@ -940,6 +1232,7 @@ impl TlsServer {
         self.transcript.update(&cert_msg[..cert_msg_len]);
         self.seal_handshake_record(&mut server_hs_tk, &cert_msg[..cert_msg_len])?;
         trace::step(b"[tls] Certificate sealed\n");
+        let t = profile::mark(profile::Stage::Cert, t);
 
         // CertificateVerify: sign the transcript hash through Certificate.
         // ECDSA P-256 + SHA-256 per TLS 1.3 sig_scheme::ECDSA_SECP256R1_SHA256.
@@ -948,15 +1241,17 @@ impl TlsServer {
         // RFC 6979 deterministic `k` so we don't need an RNG here.
         // The returned Signature is then DER-encoded into the
         // `SEQUENCE { INTEGER r, INTEGER s }` shape TLS 1.3 requires
-        // on the wire.
+        // on the wire. The SigningKey itself is pre-constructed in
+        // the shared TlsServerConfig so we don't pay a redundant
+        // `d*G` scalar multiplication per handshake just to populate
+        // the unused `verifying_key` field.
         let transcript_hash = self.transcript.snapshot();
         let mut sign_content = [0u8; 130];
         sign_content_server_cert_verify(&transcript_hash, &mut sign_content);
-        let signing_key = SigningKey::from_slice(&config.signing_seed)
-            .map_err(|_| TlsError::Internal)?;
-        let signature: EcdsaSignature = signing_key.sign(&sign_content);
+        let signature: EcdsaSignature = config.signing_key.sign(&sign_content);
         let der_sig = signature.to_der();
         let signature_bytes: &[u8] = der_sig.as_bytes();
+        let t = profile::mark(profile::Stage::CvSign, t);
 
         let mut cv_body = [0u8; 128];
         let cv_body_len =
@@ -971,6 +1266,7 @@ impl TlsServer {
         self.transcript.update(&cv_msg[..cv_msg_len]);
         self.seal_handshake_record(&mut server_hs_tk, &cv_msg[..cv_msg_len])?;
         trace::step(b"[tls] CertificateVerify sealed\n");
+        let t = profile::mark(profile::Stage::CvSeal, t);
 
         // Server Finished
         // verify_data = HMAC(finished_key, Transcript-Hash(CH ... CertVerify))
@@ -990,6 +1286,7 @@ impl TlsServer {
         self.transcript.update(&sf_msg[..sf_msg_len]);
         self.seal_handshake_record(&mut server_hs_tk, &sf_msg[..sf_msg_len])?;
         trace::step(b"[tls] ServerFinished sealed, entering WaitClientFinished\n");
+        let t = profile::mark(profile::Stage::Finished, t);
 
         // Store the updated server handshake traffic key (its seq
         // counter has advanced across the 4 sealed records).
@@ -1001,6 +1298,8 @@ impl TlsServer {
         let app_secrets = self.schedule.enter_application(&transcript_h2);
         self.client_ap_tk = Some(TrafficKey::from_secret(&app_secrets.client_ap));
         self.server_ap_tk = Some(TrafficKey::from_secret(&app_secrets.server_ap));
+        profile::mark(profile::Stage::HkdfAp, t);
+        profile::bump_count();
 
         self.state = State::WaitClientFinished;
         Ok(())

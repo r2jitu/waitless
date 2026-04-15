@@ -1,17 +1,73 @@
 // kernel/time.rs — Hardware timing utilities.
 
+/// Read the monotonic hardware cycle counter — TSC on x86_64,
+/// CNTVCT_EL0 on aarch64. Used for micro-benchmarking hot paths
+/// (e.g. per-stage TLS handshake profiling). Cheap: a single
+/// instruction on both architectures.
+#[inline(always)]
+pub fn now_cycles() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let lo: u32;
+        let hi: u32;
+        core::arch::asm!(
+            "rdtsc",
+            out("eax") lo,
+            out("edx") hi,
+            options(nomem, nostack, preserves_flags),
+        );
+        ((hi as u64) << 32) | (lo as u64)
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let v: u64;
+        core::arch::asm!(
+            "mrs {0}, cntvct_el0",
+            out(reg) v,
+            options(nomem, nostack, preserves_flags),
+        );
+        v
+    }
+}
+
+/// Hardware cycle-counter frequency in ticks per microsecond.
+///
+/// aarch64: reads CNTFRQ_EL0 directly (architectural virtual
+/// counter frequency, typically 24 MHz on Apple Silicon).
+/// x86_64: reuses the PIT-calibrated TSC rate from `udelay`.
+#[cfg(target_arch = "aarch64")]
+pub fn cycles_per_us() -> u64 {
+    let freq: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {0}, cntfrq_el0",
+            out(reg) freq,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    (freq / 1_000_000).max(1)
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn cycles_per_us() -> u64 {
+    // Force calibration via a zero-length udelay if not yet done.
+    udelay(0);
+    X86_TSC_PER_US.load(core::sync::atomic::Ordering::Relaxed).max(1)
+}
+
+#[cfg(target_arch = "x86_64")]
+static X86_TSC_PER_US: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 /// Busy-wait for approximately `us` microseconds.
 #[cfg(target_arch = "x86_64")]
 pub fn udelay(us: u32) {
-    // Calibration cache: TSC ticks per microsecond. AtomicU64 because
-    // multiple cores may call udelay() concurrently and the first call
-    // calibrates. The calibration result is a constant property of the
-    // host so a benign double-calibrate is harmless; the atomic just
-    // makes the publish/observe race-free at the language level.
-    static TSC_PER_US: core::sync::atomic::AtomicU64 =
-        core::sync::atomic::AtomicU64::new(0);
-
-    let mut tsc_per_us = TSC_PER_US.load(core::sync::atomic::Ordering::Relaxed);
+    // Calibration cache lives in the module-level `X86_TSC_PER_US`
+    // atomic so `cycles_per_us()` can share the same result.
+    // Multiple cores may call udelay() concurrently and the first
+    // call calibrates; the calibration result is a constant property
+    // of the host so a benign double-calibrate is harmless.
+    let mut tsc_per_us = X86_TSC_PER_US.load(core::sync::atomic::Ordering::Relaxed);
     if tsc_per_us == 0 {
         unsafe {
             const PIT_COUNT: u16 = 11932; // ~10ms
@@ -30,7 +86,7 @@ pub fn udelay(us: u32) {
             let elapsed = x86_rdtsc() - start;
             tsc_per_us = (elapsed / 10000).max(1);
         }
-        TSC_PER_US.store(tsc_per_us, core::sync::atomic::Ordering::Relaxed);
+        X86_TSC_PER_US.store(tsc_per_us, core::sync::atomic::Ordering::Relaxed);
     }
     let end = x86_rdtsc() + tsc_per_us * (us as u64);
     while x86_rdtsc() < end {
