@@ -222,6 +222,23 @@ fn wake_vcpu(target: usize) {
     crate::vm::wake_vcpu(target);
 }
 
+/// Doorbell every registered vCPU. Used by the stdin reader thread
+/// after pushing a byte into `pl011::RX_BUF` so any parked vCPU wakes
+/// from its cooperative yield loop promptly instead of waiting up to
+/// the next 10 ms `vcpu_poll` timeout. No-op if `start()` hasn't run
+/// (which can happen if userspace_net init failed before vCPUs exist).
+pub fn wake_all_vcpus() {
+    if let Some(pipes) = VCPU_WAKE_PIPES.get() {
+        let buf = [0u8; 1];
+        for p in pipes {
+            unsafe { libc::write(p.write_fd, buf.as_ptr() as *const _, 1); }
+        }
+        for i in 0..pipes.len() {
+            crate::vm::wake_vcpu(i);
+        }
+    }
+}
+
 /// Look up shared state for a worker/vCPU. Panics only if `start()`
 /// hasn't run, which shouldn't happen since both worker and vCPU
 /// threads are spawned after `start()` populates `WORKERS`.

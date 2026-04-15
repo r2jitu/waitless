@@ -424,7 +424,20 @@ fn run_vcpu(
                             // there's no separate worker to wait on.
                             // Cap each poll at 10ms so we re-check the
                             // global shutdown flag promptly.
+                            //
+                            // Also break if the stdin reader has pushed
+                            // a byte into pl011::RX_BUF. Otherwise a
+                            // parked vCPU would never notice Ctrl-C
+                            // (the 0x03 sits in RX_BUF but the guest
+                            // can't run to poll the pl011 MMIO while
+                            // it's stuck in this loop), and the only
+                            // way out would be a network packet or the
+                            // global shutdown flag — neither of which
+                            // Ctrl-C produces on its own.
                             while !shutdown.load(Ordering::Acquire) {
+                                if crate::pl011::rx_has_data() {
+                                    break;
+                                }
                                 if crate::userspace_net::vcpu_poll(vcpu_id, 10) {
                                     break;
                                 }

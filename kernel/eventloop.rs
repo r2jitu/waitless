@@ -239,12 +239,26 @@ pub fn run(core_id: u32) -> ! {
 
     #[cfg(target_arch = "aarch64")]
     unsafe {
-        // PSCI CPU_OFF for APs, shutdown for BSP
+        // APs: PSCI CPU_OFF (0x8400_0002) and park in WFI.
+        // BSP: PSCI SYSTEM_OFF (0x8400_0008) — actually powers the
+        // machine off. Previously the BSP branch fell into `loop wfi`
+        // without ever issuing SYSTEM_OFF, so Ctrl-C would break out
+        // of the event loop, print the `[evloop] …` diagnostic, and
+        // then hang forever waiting for a signal that never came
+        // (the hvf-runner's handle_hvc only exits on SYSTEM_OFF).
         if core_id != 0 {
             core::arch::asm!(
                 "hvc #0",
                 in("x0") 0x8400_0002u64,
                 options(nostack, nomem),
+            );
+        } else {
+            core::arch::asm!(
+                "movz x0, #0x8400, lsl #16",
+                "movk x0, #0x0008",
+                "hvc #0",
+                out("x0") _,
+                options(nomem, nostack),
             );
         }
         loop { core::arch::asm!("wfi"); }

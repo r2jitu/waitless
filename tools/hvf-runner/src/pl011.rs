@@ -19,6 +19,14 @@ use std::sync::Mutex;
 /// MMIO handler pops them on DR reads.
 pub static RX_BUF: Mutex<VecDeque<u8>> = Mutex::new(VecDeque::new());
 
+/// True if the guest's pl011 has at least one byte waiting to be read.
+/// Used by the vm cooperative-yield loop to break out of a parked vCPU
+/// so that Ctrl-C (forwarded as a raw 0x03 byte via `enable_raw`) can
+/// reach the guest's serial RX path for graceful shutdown.
+pub fn rx_has_data() -> bool {
+    !RX_BUF.lock().unwrap().is_empty()
+}
+
 /// PL011 register offsets (from ARM PrimeCell PL011 r1p5 TRM).
 const DR: u64 = 0x000;
 const FR: u64 = 0x018;

@@ -146,7 +146,11 @@ fn main() {
         orig_hook(info);
     }));
 
-    // Spawn stdin reader thread — pushes bytes into pl011::RX_BUF.
+    // Spawn stdin reader thread — pushes bytes into pl011::RX_BUF and
+    // kicks every vCPU so a parked cooperative-yield loop wakes up
+    // promptly. Without the wake, the guest would only notice a Ctrl-C
+    // on the next 10 ms vcpu_poll timeout (or never, if it's deeply
+    // parked) — see vm.rs yield loop comment for the full chain.
     std::thread::spawn(|| {
         let stdin = std::io::stdin();
         let mut handle = stdin.lock();
@@ -155,10 +159,13 @@ fn main() {
             match handle.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let mut rx = pl011::RX_BUF.lock().unwrap();
-                    for &b in &buf[..n] {
-                        rx.push_back(b);
+                    {
+                        let mut rx = pl011::RX_BUF.lock().unwrap();
+                        for &b in &buf[..n] {
+                            rx.push_back(b);
+                        }
                     }
+                    userspace_net::wake_all_vcpus();
                 }
                 Err(_) => break,
             }
