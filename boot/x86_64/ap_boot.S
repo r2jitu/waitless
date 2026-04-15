@@ -78,10 +78,38 @@ mov $0x10, %ax
     // Load stack
     mov (0x8FF8), %rsp
 
-    // Enable SSE
+    // Enable SSE + (optionally) AVX register state. Matches the
+    // BSP sequence in `boot/x86_64/boot.S`: OSFXSR + OSXMMEXCPT
+    // unconditionally, then OSXSAVE + XSETBV only if the CPU
+    // reports XSAVE support via CPUID (so this still works on
+    // pre-AVX CPU models like `qemu64`). Rust crypto crates
+    // compiled with `+avx,+avx2` in MODULE.bazel emit YMM
+    // instructions from per-core AP code paths (TLS handshake
+    // state touched by the profiler hot path among them), so
+    // the AP must land in the same CPU state as the BSP.
     mov %cr4, %rax
-    or  $(3 << 9), %rax
+    or  $(1 << 9) | (1 << 10), %rax
     mov %rax, %cr4
+
+    mov $1, %eax
+    cpuid
+    test $(1 << 26), %ecx           // CPUID.01h:ECX.XSAVE
+    jz ap_sse_only
+
+    mov %cr4, %rax
+    or  $(1 << 18), %rax            // CR4.OSXSAVE
+    mov %rax, %cr4
+
+    mov $0xD, %eax
+    xor %ecx, %ecx
+    cpuid
+    and $0x7, %eax                  // x87|SSE|AVX AND supported
+
+    xor %rcx, %rcx
+    xor %rdx, %rdx
+    xsetbv
+
+ap_sse_only:
 
     // Call Rust AP entry via absolute address (trampoline is copied to 0x8000,
     // so relative call would use wrong offset)

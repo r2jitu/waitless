@@ -32,7 +32,22 @@ use limine::request::DeviceTreeBlobRequest;
 #[cfg(target_arch = "x86_64")]
 use limine::request::RsdpRequest;
 
-// x86_64 SSE enable stub — Limine doesn't enable SSE before calling our entry.
+// x86_64 SSE + AVX enable stub — Limine drops us in 64-bit mode
+// with MMU + paging but does NOT enable the OS-level bits the
+// compiler needs before executing SIMD instructions. Matches
+// the BSP sequence in `boot/x86_64/boot.S`:
+//
+//   - CR4.OSFXSR (9) + CR4.OSXMMEXCPT (10) unconditionally so
+//     any XMM instruction (the common SSE2 path) works.
+//   - CR4.OSXSAVE (18) + XSETBV only if CPUID reports XSAVE, so
+//     the kernel still boots on pre-AVX CPUs that lack XSAVE.
+//   - XCR0 is masked with CPUID.0Dh:EAX so we only enable bits
+//     (x87|SSE|AVX) that the CPU actually supports.
+//
+// Without this, p256 / chacha20poly1305 / etc. compiled with
+// the MODULE.bazel `+avx,+avx2` annotation crash with `#UD` on
+// the first YMM instruction — manifests as a silent guest hang
+// during TLS config init.
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(
     ".section .text",
@@ -42,12 +57,27 @@ core::arch::global_asm!(
     "    mov %cr4, %rax",
     "    or  $(1 << 9) | (1 << 10), %rax",
     "    mov %rax, %cr4",
+    "    mov $1, %eax",
+    "    cpuid",
+    "    test $(1 << 26), %ecx",   // CPUID.01h:ECX.XSAVE
+    "    jz 2f",
+    "    mov %cr4, %rax",
+    "    or  $(1 << 18), %rax",    // CR4.OSXSAVE
+    "    mov %rax, %cr4",
+    "    mov $0xD, %eax",
+    "    xor %ecx, %ecx",
+    "    cpuid",
+    "    and $0x7, %eax",          // x87|SSE|AVX AND supported
+    "    xor %rcx, %rcx",
+    "    xor %rdx, %rdx",
+    "    xsetbv",
+    "2:",
     "    xor %rbp, %rbp",
     "    and $-16, %rsp",
     "    call limine_entry",
-    "1: cli",
+    "3: cli",
     "    hlt",
-    "    jmp 1b",
+    "    jmp 3b",
     options(att_syntax),
 );
 

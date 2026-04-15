@@ -200,12 +200,56 @@ long_mode:
     mov %ax, %gs
     mov %ax, %ss
 
-    // Enable SSE/SSE2: set CR4.OSFXSR (bit 9) and CR4.OSXMMEXCPT (bit 10).
-    // Without OSFXSR, any xmm/sse instruction raises #UD.
-    // The compiler may emit xorps/movups for bulk memory operations (zero_bss).
+    // Enable SSE/SSE2 and (if the CPU supports it) AVX register
+    // state. Rust code compiled with the MODULE.bazel crypto
+    // annotations (+avx,+avx2,+aes,+pclmul,+bmi1,+bmi2) will emit
+    // VEX-encoded YMM instructions for p256 / chacha20poly1305 /
+    // etc., and those raise #UD unless BOTH the CPU reports AVX
+    // supported AND the OS has enabled XSAVE + flipped XCR0.AVX.
+    //
+    //   1. CR4.OSFXSR    (bit  9) — always. Required for any xmm.
+    //   2. CR4.OSXMMEXCPT (bit 10) — always. Handle #XM instead of #UD.
+    //   3. CR4.OSXSAVE   (bit 18) — only if CPUID.01h:ECX.XSAVE[26].
+    //   4. XCR0          ← x87|SSE|AVX — only if OSXSAVE was enabled,
+    //                     and only for XCR0 bits the CPU reports
+    //                     supported via CPUID.0Dh:EAX. Setting a bit
+    //                     the CPU doesn't support faults #GP.
+    //
+    // On KVM with -cpu host on any modern x86_64 host, all three
+    // gates are open and we end up with full AVX. On TCG with the
+    // conservative `-cpu qemu64` (no XSAVE, no AVX), the CPUID
+    // check skips steps 3/4, we still get working SSE2, and any
+    // AVX instruction in compiled code will trap later — that's
+    // a user problem (don't run AVX-compiled code on a pre-AVX
+    // CPU model) but it isn't a boot problem.
     mov %cr4, %rax
     or  $(1 << 9) | (1 << 10), %rax
     mov %rax, %cr4
+
+    // Does the CPU support XSAVE at all?
+    mov $1, %eax
+    cpuid
+    test $(1 << 26), %ecx          // CPUID.01h:ECX.XSAVE
+    jz  sse_only                   // no XSAVE → leave OSXSAVE unset
+
+    // Has XSAVE. Turn on OSXSAVE so XSETBV is legal.
+    mov %cr4, %rax
+    or  $(1 << 18), %rax
+    mov %rax, %cr4
+
+    // CPUID.0Dh:EAX returns the set of XCR0 bits the CPU supports.
+    // Mask it with our desired bits (x87|SSE|AVX = 0x7) so we only
+    // enable what the CPU will actually accept.
+    mov $0xD, %eax
+    xor %ecx, %ecx
+    cpuid
+    and $0x7, %eax                 // x87|SSE|AVX AND supported
+
+    xor %rcx, %rcx                 // XCR0 index
+    xor %rdx, %rdx                 // upper 32 bits = 0
+    xsetbv
+
+sse_only:
 
     // Set up the kernel stack
     lea stack_top(%rip), %rsp
