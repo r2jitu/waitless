@@ -223,6 +223,131 @@ fn main() {
         }
     }
 
+    // ---- 7. RFC 8448 §3 known-answer test for TLS 1.3 key schedule ----
+    // RFC 8448 publishes a complete TLS 1.3 handshake trace with all
+    // intermediate secrets exposed. We feed the published ECDHE
+    // private keys + transcript hash through our key schedule and
+    // check that the derived handshake_traffic_secrets match the
+    // RFC's expected outputs byte-for-byte.
+    //
+    // This is the strongest correctness signal we have for the
+    // HKDF-Expand-Label / Derive-Secret cascade: a single bug in
+    // the label format, the transcript-hash-as-context wiring, or
+    // the salt/PRK ordering in HKDF-Extract would produce a
+    // different-but-internally-consistent secret, which our
+    // self-roundtrip tests can't catch but RFC 8448 catches
+    // immediately.
+    {
+        // Inputs from RFC 8448 §3 "Simple 1-RTT Handshake":
+        //
+        // Client ephemeral X25519 private key:
+        let client_priv: [u8; 32] = [
+            0x49, 0xaf, 0x42, 0xba, 0x7f, 0x79, 0x94, 0x85,
+            0x2d, 0x71, 0x3e, 0xf2, 0x78, 0x4b, 0xcb, 0xca,
+            0xa7, 0x91, 0x1d, 0xe2, 0x6a, 0xdc, 0x56, 0x42,
+            0xcb, 0x63, 0x45, 0x40, 0xe7, 0xea, 0x50, 0x05,
+        ];
+        // Server ephemeral X25519 private key:
+        let server_priv: [u8; 32] = [
+            0xb1, 0x58, 0x0e, 0xea, 0xdf, 0x6d, 0xd5, 0x89,
+            0xb8, 0xef, 0x4f, 0x2d, 0x56, 0x52, 0x57, 0x8c,
+            0xc8, 0x10, 0xe9, 0x98, 0x01, 0x91, 0xec, 0x8d,
+            0x05, 0x83, 0x08, 0xce, 0xa2, 0x16, 0xa2, 0x1e,
+        ];
+        // Transcript hash after ClientHello..ServerHello (exact
+        // bytes of these records are in the RFC; our test trusts
+        // SHA-256 to be correct and starts from the published
+        // hash output):
+        let expected_transcript_after_sh: [u8; 32] = [
+            0x86, 0x0c, 0x06, 0xed, 0xc0, 0x78, 0x58, 0xee,
+            0x8e, 0x78, 0xf0, 0xe7, 0x42, 0x8c, 0x58, 0xed,
+            0xd6, 0xb4, 0x3f, 0x2c, 0xa3, 0xe6, 0xe9, 0x5f,
+            0x02, 0xed, 0x06, 0x3c, 0xf0, 0xe1, 0xca, 0xd8,
+        ];
+        // Expected outputs from the RFC:
+        let expected_client_hs_traffic: [u8; 32] = [
+            0xb3, 0xed, 0xdb, 0x12, 0x6e, 0x06, 0x7f, 0x35,
+            0xa7, 0x80, 0xb3, 0xab, 0xf4, 0x5e, 0x2d, 0x8f,
+            0x3b, 0x1a, 0x95, 0x07, 0x38, 0xf5, 0x2e, 0x96,
+            0x00, 0x74, 0x6a, 0x0e, 0x27, 0xa5, 0x5a, 0x21,
+        ];
+        let expected_server_hs_traffic: [u8; 32] = [
+            0xb6, 0x7b, 0x7d, 0x69, 0x0c, 0xc1, 0x6c, 0x4e,
+            0x75, 0xe5, 0x42, 0x13, 0xcb, 0x2d, 0x37, 0xb4,
+            0xe9, 0xc9, 0x12, 0xbc, 0xde, 0xd9, 0x10, 0x5d,
+            0x42, 0xbe, 0xfd, 0x59, 0xd3, 0x91, 0xad, 0x38,
+        ];
+
+        // Compute ECDHE shared secret via our X25519 wrapper. Use
+        // server side (priv + client public derived from client priv);
+        // the result is symmetric so this matches what the RFC would
+        // see on either end.
+        let client_kp = tls::X25519ServerKey::from_seed(client_priv);
+        let server_kp = tls::X25519ServerKey::from_seed(server_priv);
+        let client_pub = client_kp.public_bytes();
+        let shared = server_kp.shared_secret(&client_pub);
+
+        // Run the cascade.
+        let mut sched = tls::KeySchedule::new_without_psk();
+        let secrets =
+            sched.enter_handshake(&shared, &expected_transcript_after_sh);
+
+        let client_ok = secrets.client_hs == expected_client_hs_traffic;
+        let server_ok = secrets.server_hs == expected_server_hs_traffic;
+
+        if client_ok && server_ok {
+            pass(b"rfc8448_handshake_secrets");
+        } else {
+            fail(b"rfc8448_handshake_secrets");
+            if !client_ok {
+                logn(b"  client_hs mismatch\n");
+            }
+            if !server_ok {
+                logn(b"  server_hs mismatch\n");
+            }
+            failures += 1;
+        }
+
+        // ---- 7b. enter_application produces the RFC's app traffic secrets
+        // The transcript is now hashed through ServerFinished (RFC §3
+        // gives this hash directly); enter_application internally
+        // does derive→Master Secret→derive client/server app secrets.
+        let expected_transcript_after_sfin: [u8; 32] = [
+            0x96, 0x08, 0x10, 0x2a, 0x0f, 0x1c, 0xcc, 0x6d,
+            0xb6, 0x25, 0x0b, 0x7b, 0x7e, 0x41, 0x7b, 0x1a,
+            0x00, 0x0e, 0xaa, 0xda, 0x3d, 0xaa, 0xe4, 0x77,
+            0x7a, 0x76, 0x86, 0xc9, 0xff, 0x83, 0xdf, 0x13,
+        ];
+        let expected_client_ap_traffic: [u8; 32] = [
+            0x9e, 0x40, 0x64, 0x6c, 0xe7, 0x9a, 0x7f, 0x9d,
+            0xc0, 0x5a, 0xf8, 0x88, 0x9b, 0xce, 0x65, 0x52,
+            0x87, 0x5a, 0xfa, 0x0b, 0x06, 0xdf, 0x00, 0x87,
+            0xf7, 0x92, 0xeb, 0xb7, 0xc1, 0x75, 0x04, 0xa5,
+        ];
+        let expected_server_ap_traffic: [u8; 32] = [
+            0xa1, 0x1a, 0xf9, 0xf0, 0x55, 0x31, 0xf8, 0x56,
+            0xad, 0x47, 0x11, 0x6b, 0x45, 0xa9, 0x50, 0x32,
+            0x82, 0x04, 0xb4, 0xf4, 0x4b, 0xfb, 0x6b, 0x3a,
+            0x4b, 0x4f, 0x1f, 0x3f, 0xcb, 0x63, 0x16, 0x43,
+        ];
+
+        let app = sched.enter_application(&expected_transcript_after_sfin);
+        let cap_ok = app.client_ap == expected_client_ap_traffic;
+        let sap_ok = app.server_ap == expected_server_ap_traffic;
+        if cap_ok && sap_ok {
+            pass(b"rfc8448_application_secrets");
+        } else {
+            fail(b"rfc8448_application_secrets");
+            if !cap_ok {
+                logn(b"  client_ap mismatch\n");
+            }
+            if !sap_ok {
+                logn(b"  server_ap mismatch\n");
+            }
+            failures += 1;
+        }
+    }
+
     // ---- Final tally ----------------------------------------------------
     if failures == 0 {
         logn(b"TLS TESTS: ALL PASSED\n");
