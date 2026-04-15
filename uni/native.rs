@@ -444,14 +444,51 @@ static mut CONFIG_PORT: u16 = 0;
 static mut CONFIG_TLS_PORT: u16 = 0;
 pub static mut SHUTDOWN: bool = false;
 
-// ── Shared listen socket ──────────────────────────────────────────────────────
+// ── Shared listen sockets ─────────────────────────────────────────────────────
 // macOS SO_REUSEPORT does not distribute connections across sockets. Instead,
-// all workers share a single nonblocking listen socket. Each worker registers
-// it with its own kqueue/epoll. The worker whose kqueue fires first calls
-// accept(); others see EAGAIN and go back to sleep. No dedicated thread, no
-// pipes — mirrors the unikernel's per-core polling model.
+// all workers share a single nonblocking listen socket per port. Each worker
+// registers it with its own kqueue/epoll. The worker whose kqueue fires first
+// calls accept(); others see EAGAIN and go back to sleep. No dedicated thread,
+// no pipes — mirrors the unikernel's per-core polling model.
+//
+// Multiple ports (e.g. HTTP on 8080 + HTTPS on 8443) are supported via a
+// small fixed table: each `tcp_listen(port)` call is deduplicated by port,
+// and all workers register every current fd with their kqueue/epoll so any
+// of them can accept either flavour of connection.
 
-static mut SHARED_LISTEN_FD: i32 = -1;
+const MAX_SHARED_LISTENERS: usize = 4;
+
+/// `(port, fd)` pairs for every listener currently active. Indexed up to
+/// `SHARED_LISTEN_COUNT`. Entries are never removed during a normal run;
+/// the process exits on shutdown.
+static mut SHARED_LISTEN_PORTS: [u16; MAX_SHARED_LISTENERS] = [0; MAX_SHARED_LISTENERS];
+static mut SHARED_LISTEN_FDS:   [i32; MAX_SHARED_LISTENERS] = [-1; MAX_SHARED_LISTENERS];
+static mut SHARED_LISTEN_COUNT: usize = 0;
+
+/// Look up (or create) a shared listener for `port`. Returns the fd, or
+/// -1 if bind/listen failed. Must only be called with the shared-listener
+/// table guarded by the init sequence (no concurrent callers at this
+/// point: `Server::listen_tls` runs on the main thread before any worker
+/// has entered its event loop).
+unsafe fn shared_listen_get_or_create(port: u16) -> i32 {
+    unsafe {
+        for i in 0..SHARED_LISTEN_COUNT {
+            if SHARED_LISTEN_PORTS[i] == port {
+                return SHARED_LISTEN_FDS[i];
+            }
+        }
+        if SHARED_LISTEN_COUNT >= MAX_SHARED_LISTENERS {
+            return -1;
+        }
+        let fd = make_listener(port, true);
+        if fd < 0 { return -1; }
+        let idx = SHARED_LISTEN_COUNT;
+        SHARED_LISTEN_PORTS[idx] = port;
+        SHARED_LISTEN_FDS[idx] = fd;
+        SHARED_LISTEN_COUNT = idx + 1;
+        fd
+    }
+}
 
 /// Get the current thread's state. Thread ID is stored in a thread-local-like
 /// fashion by passing it through the worker function argument.
@@ -616,19 +653,16 @@ pub fn tcp_listen_for(port: u16, worker_id: u32) -> *mut () {
 
     unsafe {
         if NUM_THREADS > 1 {
-            // Multi-thread: single shared nonblocking listen socket.
-            // Create it once on the first call, then hand each worker a handle
-            // pointing at the same fd. Registration with each worker's
-            // kqueue/epoll happens in tcp_register_shared_listener() once the
-            // worker thread is actually running.
-            if SHARED_LISTEN_FD < 0 {
-                let fd = make_listener(port, true);  // nonblocking
-                if fd < 0 { return ptr::null_mut(); }
-                SHARED_LISTEN_FD = fd;
-            }
+            // Multi-thread: one shared nonblocking listen socket per port
+            // (so HTTP on 8080 and HTTPS on 8443 each get their own fd,
+            // but the fd is shared across all workers). All workers'
+            // kqueue/epoll instances end up watching both fds and any of
+            // them can accept either flavour of connection.
+            let fd = shared_listen_get_or_create(port);
+            if fd < 0 { return ptr::null_mut(); }
             let c = ts.alloc_conn();
             if c.is_null() { return ptr::null_mut(); }
-            (*c).fd = SHARED_LISTEN_FD;
+            (*c).fd = fd;
             (*c).is_listener = true;
             (*c).is_shared_listener = true;
             c as *mut ()
@@ -719,15 +753,21 @@ pub fn tcp_poll() -> bool {
     thread_state(current_thread_id()).poll_events()
 }
 
-/// Register the shared listen socket with this worker's kqueue/epoll.
-/// Called once per worker thread once it's running. In multi-thread mode the
-/// shared fd is watched by all workers simultaneously; whichever kqueue fires
-/// first calls accept() and the rest see EAGAIN.
+/// Register every shared listen socket with this worker's kqueue/epoll.
+/// Called once per worker thread once it's running. In multi-thread mode
+/// the shared fds are watched by all workers simultaneously; whichever
+/// kqueue fires first calls accept() and the rest see EAGAIN. We iterate
+/// the full `SHARED_LISTEN_FDS` table so that workers pick up both the
+/// HTTP listener and (if configured) the HTTPS listener — missing either
+/// one silently drops accept events for that port.
 pub fn tcp_register_shared_listener() {
     let tid = current_thread_id();
     unsafe {
-        if SHARED_LISTEN_FD >= 0 {
-            thread_state(tid).register_fd(SHARED_LISTEN_FD);
+        for i in 0..SHARED_LISTEN_COUNT {
+            let fd = SHARED_LISTEN_FDS[i];
+            if fd >= 0 {
+                thread_state(tid).register_fd(fd);
+            }
         }
     }
 }
