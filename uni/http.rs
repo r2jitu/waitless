@@ -230,16 +230,25 @@ impl ActiveConn {
     }
 }
 
-/// Per-core HTTP state: listener + active connections.
+/// Per-core HTTP state: up to one plain-HTTP listener, up to one
+/// HTTPS listener, and the shared active-connection pool. Both
+/// listeners feed into the same pool; a connection is marked TLS
+/// (via `ActiveConn.tls`) based on which listener accepted it.
 struct CoreHttp {
-    listener: Option<TcpListener>,
+    /// Plain HTTP listener (e.g. port 80). `None` if the server
+    /// isn't serving plain HTTP on this core.
+    http_listener: Option<TcpListener>,
+    /// HTTPS listener (e.g. port 443). `None` if the server isn't
+    /// serving TLS on this core.
+    tls_listener: Option<TcpListener>,
     active: [ActiveConn; MAX_ACTIVE],
 }
 
 impl CoreHttp {
     fn new() -> Self {
         CoreHttp {
-            listener: None,
+            http_listener: None,
+            tls_listener: None,
             active: core::array::from_fn(|_| ActiveConn::new()),
         }
     }
@@ -258,13 +267,16 @@ pub struct Server {
 // pointer without forming `&mut` to a `static mut`.
 static SERVER_PTR: core::sync::atomic::AtomicPtr<Server> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
-// Listen port (needed by native worker threads to create SO_REUSEPORT listeners).
-static LISTEN_PORT: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
+// Plain HTTP listen port (needed by native worker threads to create
+// SO_REUSEPORT listeners after main() returns). 0 = not listening on HTTP.
+static HTTP_LISTEN_PORT: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
+// HTTPS listen port — same purpose as HTTP_LISTEN_PORT but for TLS.
+static TLS_LISTEN_PORT: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
 
-// TLS server configuration, published by `run_tls()`. None = plain HTTP.
-// A raw pointer because `TlsServerConfig` isn't Send+Sync in the generic
-// sense and we never form an `&mut`; readers dereference with Acquire
-// and only read the immutable cert/key bytes.
+// TLS server configuration, published by `listen_tls()` for connection-
+// creation to find. Raw pointer because `TlsServerConfig` isn't
+// Send+Sync in the generic sense and we never form an `&mut`; readers
+// dereference with Acquire and only read the immutable cert/key bytes.
 #[cfg(platform_unikernel)]
 static TLS_CONFIG_PTR: core::sync::atomic::AtomicPtr<net::tls_server::TlsServerConfig> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
@@ -302,97 +314,158 @@ impl Server {
         self.default_handler = Some(handler);
     }
 
-    /// Create TCP listeners and register the HTTP service callback.
-    /// Non-blocking: returns immediately. The event loop (kernel or native)
-    /// will call the service callback on each worker.
+    /// Add a plain-HTTP listener on `port`. Creates a TCP listener on
+    /// every worker (SO_REUSEPORT on native, per-core pool on
+    /// unikernel). Non-blocking — returns immediately. Combine with
+    /// `listen_tls()` and `run()` to serve both HTTP and HTTPS on
+    /// different ports with shared routes:
+    ///
+    /// ```ignore
+    /// server.listen(80);                       // plain HTTP
+    /// server.listen_tls(443, tls_config);      // HTTPS
+    /// server.run();                            // enter event loop
+    /// ```
     pub fn listen(&mut self, port: u16) {
         let nw = crate::num_workers();
 
         // Create a listener per worker (SO_REUSEPORT on native,
         // per-core TCP pool on unikernel).
+        let mut ok_any = false;
         for i in 0..nw {
             let handle = crate::tcp_listen_on(i, port);
             if handle.is_null() {
-                crate::log(b"http: failed to create TCP listener\n");
+                crate::log(b"http: failed to create HTTP listener\n");
                 if i == 0 { return; }
             } else {
-                self.cores[i as usize].listener = Some(TcpListener(handle));
+                self.cores[i as usize].http_listener = Some(TcpListener(handle));
+                ok_any = true;
             }
         }
+        if !ok_any { return; }
 
         SERVER_PTR.store(self as *mut Server, core::sync::atomic::Ordering::Release);
-        LISTEN_PORT.store(port, core::sync::atomic::Ordering::Release);
+        HTTP_LISTEN_PORT.store(port, core::sync::atomic::Ordering::Release);
         crate::set_service(http_service_cb);
 
-        crate::log(b"http: listening\n");
+        crate::log(b"http: listening (plain)\n");
     }
 
-    /// Start listening and enter the event loop. Blocks until shutdown.
-    /// On unikernel: enters kernel event loop on core 0.
-    /// On native: returns to main() which spawns worker threads.
-    pub fn run(&mut self, port: u16) {
-        self.listen(port);
-        crate::set_ready();
-        // On unikernel, this blocks forever. On native, it returns
-        // and native.rs::main() handles thread management.
-    }
-
-    /// Start listening on `port` with TLS 1.3 wrapping for every
-    /// accepted connection. The same HTTP routes apply — clients see
-    /// an HTTPS endpoint, handlers see a `Request` / `Response` the
-    /// same way they would for plain HTTP.
+    /// Add an HTTPS (TLS 1.3) listener on `port`. Same semantics as
+    /// `listen()` but wraps each accepted connection in a `TlsServer`
+    /// using `config`. Routes registered via `route()` /
+    /// `default_handler()` apply to both HTTP and HTTPS listeners
+    /// identically.
     ///
-    /// `config` must outlive the server. Typically constructed from
-    /// a `include_bytes!`-baked dev cert + PKCS#8 key (see
+    /// `config` must outlive the server. Typically built from a
+    /// `include_bytes!`-baked dev cert + PKCS#8 key (see
     /// `apps/webserver/dev_certs/`) and `Box::leak`-ed to get a
     /// `&'static TlsServerConfig`.
     ///
-    /// Unikernel-only; on native, TLS is not currently supported and
-    /// this function falls through to plain `run()`.
+    /// Unikernel-only. On native this is a no-op log — native builds
+    /// don't ship a TLS implementation; for HTTPS testing, boot the
+    /// unikernel.
     #[cfg(platform_unikernel)]
-    pub fn run_tls(&mut self, port: u16, config: &'static TlsServerConfig) {
-        // Publish the config pointer so the per-connection accept
-        // path can find it. `config` is `'static`, so the cast is
-        // sound for the program's lifetime.
+    pub fn listen_tls(&mut self, port: u16, config: &'static TlsServerConfig) {
+        // Publish the config pointer for the accept path.
         TLS_CONFIG_PTR.store(
             config as *const _ as *mut _,
             core::sync::atomic::Ordering::Release,
         );
-        self.listen(port);
-        crate::set_ready();
+
+        let nw = crate::num_workers();
+        let mut ok_any = false;
+        for i in 0..nw {
+            let handle = crate::tcp_listen_on(i, port);
+            if handle.is_null() {
+                crate::log(b"http: failed to create HTTPS listener\n");
+                if i == 0 { return; }
+            } else {
+                self.cores[i as usize].tls_listener = Some(TcpListener(handle));
+                ok_any = true;
+            }
+        }
+        if !ok_any { return; }
+
+        SERVER_PTR.store(self as *mut Server, core::sync::atomic::Ordering::Release);
+        TLS_LISTEN_PORT.store(port, core::sync::atomic::Ordering::Release);
+        crate::set_service(http_service_cb);
+
+        crate::log(b"http: listening (TLS)\n");
     }
 
     #[cfg(platform_native)]
-    pub fn run_tls(&mut self, port: u16, _config: &'static TlsServerConfig) {
-        crate::log(b"http: run_tls() not supported on native; falling back to plain HTTP\n");
-        self.run(port);
+    pub fn listen_tls(&mut self, _port: u16, _config: &'static TlsServerConfig) {
+        crate::log(b"http: listen_tls() not supported on native; ignoring\n");
+    }
+
+    /// Enter the event loop with whatever listeners have been
+    /// configured via `listen()` / `listen_tls()`. Blocks until
+    /// shutdown on unikernel; returns to `native::main()` on native
+    /// where the POSIX worker threads take over.
+    pub fn run(&mut self) {
+        crate::set_ready();
+    }
+
+    /// Convenience: one plain HTTP listener + run. Same as
+    /// `listen(port); run();`. Matches the original single-listener
+    /// API for apps that don't need TLS.
+    pub fn run_http(&mut self, port: u16) {
+        self.listen(port);
+        self.run();
+    }
+
+    /// Convenience: one HTTPS listener + run. Same as
+    /// `listen_tls(port, config); run();`.
+    pub fn run_tls(&mut self, port: u16, config: &'static TlsServerConfig) {
+        self.listen_tls(port, config);
+        self.run();
     }
 
     /// Service connections for a specific core. Returns true if any work was done.
     fn service_core(&mut self, core_id: u32) -> bool {
         let mut had_work = false;
 
-        // Accept new connections. When the server is in TLS mode, each
-        // accepted TcpStream also gets a freshly-allocated TlsServer
-        // with a random X25519 ephemeral keypair. Construction costs
-        // ~13 KB of stack while we initialise the state machine before
-        // moving it into the heap via `crate::Box`.
-        if let Some(listener) = self.cores[core_id as usize].listener {
+        // Accept new connections from both listeners. Connections from
+        // the plain HTTP listener are inserted with `tls=None`;
+        // connections from the TLS listener are wrapped in a freshly
+        // allocated `TlsServer`. Both share the same per-core
+        // `active` pool so one HTTP client and one HTTPS client can
+        // coexist without interfering.
+        if let Some(listener) = self.cores[core_id as usize].http_listener {
             while let Some(stream) = listener.accept() {
                 had_work = true;
                 if let Some(ac) = alloc_active(&mut self.cores[core_id as usize].active) {
                     ac.conn = Some(stream);
                     #[cfg(platform_unikernel)]
-                    {
-                        let tls_cfg_ptr =
-                            TLS_CONFIG_PTR.load(core::sync::atomic::Ordering::Acquire);
-                        if !tls_cfg_ptr.is_null() {
-                            let mut seed = [0u8; 32];
-                            kernel::rng::fill_bytes(&mut seed);
-                            ac.tls = Some(crate::Box::new(
-                                net::tls_server::TlsServer::new(seed),
-                            ));
-                        }
+                    { ac.tls = None; }
+                } else {
+                    crate::log(b"http: too many connections, dropping\n");
+                    stream.close();
+                    break;
+                }
+            }
+        }
+        #[cfg(platform_unikernel)]
+        if let Some(listener) = self.cores[core_id as usize].tls_listener {
+            while let Some(stream) = listener.accept() {
+                had_work = true;
+                if let Some(ac) = alloc_active(&mut self.cores[core_id as usize].active) {
+                    ac.conn = Some(stream);
+                    let tls_cfg_ptr =
+                        TLS_CONFIG_PTR.load(core::sync::atomic::Ordering::Acquire);
+                    if !tls_cfg_ptr.is_null() {
+                        let mut seed = [0u8; 32];
+                        kernel::rng::fill_bytes(&mut seed);
+                        ac.tls = Some(crate::Box::new(
+                            net::tls_server::TlsServer::new(seed),
+                        ));
+                    } else {
+                        // Shouldn't happen — listen_tls() always sets
+                        // TLS_CONFIG_PTR before creating the listener.
+                        // Defensive: close the conn.
+                        crate::log(b"http: tls listener but no config, dropping\n");
+                        stream.close();
+                        ac.conn = None;
                     }
                 } else {
                     crate::log(b"http: too many connections, dropping\n");
@@ -600,6 +673,16 @@ impl Server {
                     ac.tls = None;
                     return;
                 }
+                // If the response is closing the connection, queue a
+                // TLS close_notify alert before draining tx so the peer
+                // sees a clean TLS shutdown followed by a clean TCP FIN.
+                // This silences OpenSSL's "unexpected eof while reading"
+                // warning and lets well-behaved clients (curl, browsers)
+                // distinguish between a deliberate close and a dropped
+                // connection.
+                if !keep_alive {
+                    let _ = tls.close_notify();
+                }
                 let mut out = [0u8; 2048];
                 loop {
                     let n = tls.pop_tx(&mut out);
@@ -645,19 +728,30 @@ fn alloc_active(active: &mut [ActiveConn; MAX_ACTIVE]) -> Option<&mut ActiveConn
 
 /// Event loop service callback: service HTTP connections on this core.
 /// Network poll + inbox drain are handled by the event loop itself.
-/// Add a listener for a specific worker. Called by native worker threads
-/// to create their own SO_REUSEPORT listener.
+/// Add per-worker SO_REUSEPORT listeners on native. Called by native
+/// worker threads after they spawn; re-creates whatever listeners
+/// were configured via `listen()` / `listen_tls()` on core 0.
 pub fn add_worker_listener(worker_id: u32) {
-    let port = LISTEN_PORT.load(core::sync::atomic::Ordering::Acquire);
     let raw = SERVER_PTR.load(core::sync::atomic::Ordering::Acquire);
     if raw.is_null() { return; }
-    // SAFETY: SERVER_PTR is published once via Release in `Server::start`;
+    // SAFETY: SERVER_PTR is published once via Release in `Server::listen`;
     // the matching Acquire load above synchronises with that store. The
     // pointee outlives the program (it's the app's `static mut SERVER`).
     let server = unsafe { &mut *raw };
-    let handle = crate::tcp_listen_on(worker_id, port);
-    if !handle.is_null() {
-        server.cores[worker_id as usize].listener = Some(TcpListener(handle));
+
+    let http_port = HTTP_LISTEN_PORT.load(core::sync::atomic::Ordering::Acquire);
+    if http_port != 0 {
+        let handle = crate::tcp_listen_on(worker_id, http_port);
+        if !handle.is_null() {
+            server.cores[worker_id as usize].http_listener = Some(TcpListener(handle));
+        }
+    }
+    let tls_port = TLS_LISTEN_PORT.load(core::sync::atomic::Ordering::Acquire);
+    if tls_port != 0 {
+        let handle = crate::tcp_listen_on(worker_id, tls_port);
+        if !handle.is_null() {
+            server.cores[worker_id as usize].tls_listener = Some(TcpListener(handle));
+        }
     }
 }
 

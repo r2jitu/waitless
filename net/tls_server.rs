@@ -656,6 +656,51 @@ impl TlsServer {
         n
     }
 
+    /// Emit a TLS 1.3 `close_notify` alert record (RFC 8446 §6.1)
+    /// into the TX buffer and move the connection to `State::Closed`.
+    ///
+    /// The alert is `[level=warning(1), description=close_notify(0)]`
+    /// — 2 bytes of plaintext wrapped in an `alert`-type record and
+    /// encrypted under the current server application traffic key.
+    /// After this call, the caller is expected to drain `tx_buf` onto
+    /// the wire and then close the underlying TCP connection. No
+    /// further `send_app_data` / `advance` calls should be made.
+    ///
+    /// Silently no-ops if the connection is not in `Established` (we
+    /// don't send alerts during a half-complete handshake because
+    /// the traffic keys may not exist yet — closing the TCP without
+    /// an alert is the conservative thing in that case).
+    pub fn close_notify(&mut self) -> Result<(), TlsError> {
+        if self.state != State::Established {
+            // No traffic keys, nothing we can cleanly encrypt.
+            // Caller should just close TCP.
+            self.state = State::Closed;
+            return Ok(());
+        }
+        let tk = self
+            .server_ap_tk
+            .as_mut()
+            .ok_or(TlsError::Internal)?;
+        let alert_body: [u8; 2] = [1, 0]; // warning(1), close_notify(0)
+        let needed = record::HEADER_LEN + alert_body.len() + 1 + record::TAG_LEN;
+        if TX_BUF_LEN - self.tx_len < needed {
+            // No space for the alert; give up cleanly rather than
+            // wedging. Caller will close TCP; peer will see an
+            // unexpected eof but at least nothing crashes.
+            self.state = State::Closed;
+            return Ok(());
+        }
+        let n = record_seal(
+            tk,
+            content_type::ALERT,
+            &alert_body,
+            &mut self.tx_buf[self.tx_len..],
+        )?;
+        self.tx_len += n;
+        self.state = State::Closed;
+        Ok(())
+    }
+
     /// Encrypt `plaintext` into a TLSCiphertext application_data record
     /// and append it to the TX buffer. Only valid in `Established` state.
     pub fn send_app_data(&mut self, plaintext: &[u8]) -> Result<(), TlsError> {

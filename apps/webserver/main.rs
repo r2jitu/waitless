@@ -90,10 +90,21 @@ fn handle_request(req: &Request) -> Response {
 
 // ---- Application entry point ------------------------------------------------
 
+/// Plain HTTP listener port. `uni::config_port` lets the runner
+/// override this via env var (e.g. for per-test fixtures); we pass
+/// 80 as the default.
+const HTTP_PORT: u16 = 80;
+
+/// HTTPS listener port. Runs alongside HTTP so apps can be reached
+/// over both protocols with the same routes. The HVF runner / QEMU
+/// user-mode networking forward a host port to this one for local
+/// testing (conventionally 8080 → :80 and 8443 → :443).
+const HTTPS_PORT: u16 = 443;
+
 #[uni::main]
 fn main() {
     uni::log(b"Starting Rust HTTP server...\n");
-    let port = uni::config_port(80);
+    let http_port = uni::config_port(HTTP_PORT);
 
     // Start UDP echo server on port 7
     fn udp_echo(src_ip: [u8; 4], src_port: u16, data: &[u8]) {
@@ -109,20 +120,24 @@ fn main() {
     let server: &'static mut Server = uni::Box::leak(Server::new_boxed());
     server.default_handler(handle_request);
 
-    // Parse the checked-in dev cert + ECDSA P-256 key once at boot. On
-    // the unikernel platform this gives us a valid TlsServerConfig;
-    // on native it's a stub, and `run_tls()` falls back to plain HTTP.
-    let config: &'static TlsServerConfig = match TlsServerConfig::from_dev_cert(
-        DEV_CERT_DER,
-        DEV_KEY_PKCS8_DER,
-    ) {
-        Some(cfg) => uni::Box::leak(uni::Box::new(cfg)),
-        None => {
-            uni::log(b"TLS: failed to parse dev key; serving plain HTTP.\n");
-            server.run(port);
-            return;
+    // Plain HTTP is always on.
+    server.listen(http_port);
+
+    // HTTPS is added alongside when the dev cert parses. The same
+    // routes serve both listeners — handlers don't care whether a
+    // given request arrived over TLS or not.
+    match TlsServerConfig::from_dev_cert(DEV_CERT_DER, DEV_KEY_PKCS8_DER) {
+        Some(cfg) => {
+            let config: &'static TlsServerConfig =
+                uni::Box::leak(uni::Box::new(cfg));
+            uni::log(b"TLS: dev cert loaded. Serving HTTPS.\n");
+            server.listen_tls(HTTPS_PORT, config);
         }
-    };
-    uni::log(b"TLS: dev cert loaded. Serving HTTPS.\n");
-    server.run_tls(port, config);
+        None => {
+            uni::log(b"TLS: failed to parse dev key; HTTPS disabled.\n");
+        }
+    }
+
+    uni::log(b"Entering event loop.\n");
+    server.run();
 }
