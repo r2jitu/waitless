@@ -456,10 +456,29 @@ pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
             let pushed = c.rx_push(&payload[..payload_len]);
             c.rcv_nxt = c.rcv_nxt.wrapping_add(pushed as u32);
             c.rcv_wnd = c.rx_free() as u16;
-            // Defer ACK — it will be piggybacked on the next outgoing data
-            // segment (the HTTP response). Sending a separate pure ACK here
-            // doubles the segment count and triggers macOS delayed-ACK
-            // interactions that cause ~250ms stalls on keep-alive connections.
+            // Send an immediate ACK. The previous version of this code
+            // deferred ACKs to piggyback on the next outbound data
+            // segment (avoiding a stall on macOS's delayed-ACK
+            // interaction with our own output), but that assumed the
+            // app would always have outbound data to send right after
+            // receiving input — true on keep-alive /health requests,
+            // false on the TLS handshake path where the server has no
+            // imminent response after receiving, say, the client's
+            // Finished. Without an immediate ACK here the Linux peer
+            // waits out its delayed-ACK timer (~40ms) before sending
+            // its next handshake record, which capped GCP KVM's
+            // `tls_handshake_max` at ~20 hs/s.
+            //
+            // The immediate ACK does double segment count on the pure
+            // receive path (one ACK + one eventual data segment,
+            // rather than one data segment carrying the ACK), which
+            // on our existing benches costs ~2-3 % on
+            // `health_max` / `health_tls_max` — well worth eating to
+            // unbreak the handshake path. If the macOS delayed-ACK
+            // regression from the old comment shows up again we'll
+            // want a real timer-based ACK coalescer rather than
+            // pinning this to "next data segment".
+            send_segment(src_ip, dst_port, src_port, c.snd_nxt, c.rcv_nxt, TCP_ACK, c.rx_free() as u16, &[]);
         } else if seq_lt(seq, c.rcv_nxt) {
             // Duplicate/retransmitted segment — send ACK immediately so the
             // sender knows we already have this data (fast retransmit signal).

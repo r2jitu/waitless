@@ -57,6 +57,23 @@ const SO_REUSEPORT: i32 = 0x0200;
 #[cfg(target_os = "linux")]
 const SO_REUSEPORT: i32 = 15;
 
+// TCP_NODELAY lives at the `IPPROTO_TCP` socket level on both
+// Linux (6) and macOS (6). Disabling Nagle on every accepted
+// client socket matters a *lot* on the TLS handshake path:
+// the server writes the flight as 5 consecutive `send()` calls
+// (ServerHello, CCS, EE, Certificate, CertVerify, Finished),
+// each of which is a small buffer, and with Nagle on the kernel
+// batches them waiting for the previous segment to be ACKed.
+// Combined with Linux's delayed-ACK on the client side this
+// produces the classic ~40ms-per-round-trip deadlock, which
+// showed up as tls_handshake_max at ~20 hs/s on GCP KVM (a
+// hundredfold regression versus macOS HVF on the same binary).
+const IPPROTO_TCP: i32 = 6;
+#[cfg(target_os = "macos")]
+const TCP_NODELAY: i32 = 0x01;
+#[cfg(target_os = "linux")]
+const TCP_NODELAY: i32 = 1;
+
 
 #[cfg(target_os = "linux")]
 const MSG_NOSIGNAL: i32 = 0x4000;
@@ -694,6 +711,16 @@ pub fn tcp_accept(handle: *mut ()) -> *mut () {
             return ptr::null_mut();
         }
         set_nonblocking(fd);
+        // Disable Nagle on the accepted client socket. See the
+        // comment on `TCP_NODELAY` above for the full story — short
+        // version: the TLS handshake server flight is 5 small
+        // consecutive `send()` calls, and with Nagle + Linux
+        // delayed-ACK in play the client ends up waiting ~40ms for
+        // each segment's ACK before sending its Finished. That
+        // alone accounted for a ~150x regression in
+        // `tls_handshake_max` on GCP.
+        let opt: i32 = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, 4);
         let c = ts.alloc_conn();
         if c.is_null() { close(fd); return ptr::null_mut(); }
         (*c).fd = fd;

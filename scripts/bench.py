@@ -189,6 +189,17 @@ def _tls_handshake_worker(args):
         try:
             s = sock_mod.create_connection((connect_host, port), timeout=5)
             s.setsockopt(sock_mod.SOL_SOCKET, sock_mod.SO_LINGER, linger)
+            # TCP_NODELAY on the client side too. The Python ssl
+            # module writes each TLS record via a separate
+            # send() call during the client-side handshake
+            # (ClientHello → ChangeCipherSpec + Finished → the
+            # HTTP GET body). With Nagle on, Linux coalesces
+            # those sends with delayed-ACK and the handshake
+            # stalls ~40 ms per round-trip, capping
+            # `tls_handshake_max` at ~20 hs/s on GCP. Disabling
+            # it here matches the server-side fix in
+            # `uni/native.rs::tcp_accept`.
+            s.setsockopt(sock_mod.IPPROTO_TCP, sock_mod.TCP_NODELAY, 1)
             ssock = ctx.wrap_socket(s, server_hostname="unikernel.local")
             ssock.send(request)
             resp = b""
