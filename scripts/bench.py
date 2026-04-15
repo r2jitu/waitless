@@ -99,6 +99,131 @@ def run_wrk(port, endpoint, threads, conns, duration, host="localhost"):
         return 0.0, "ERROR", "ERROR"
 
 
+def run_wrk_https(port, endpoint, threads, conns, duration, host="localhost"):
+    """Like `run_wrk` but issues `https://...` requests against a TLS
+    1.3 endpoint. Brew's wrk is linked against OpenSSL and defaults
+    to `SSL_VERIFY_NONE`, so our self-signed dev cert works without
+    any extra `-k`/`--insecure` flag.
+
+    Inside a single wrk session, all requests on the same connection
+    reuse the same TLS context (keep-alive). With `conns=1` this
+    means one full handshake at the start, then record-layer-only
+    request/response cycles for the rest of the run — the right
+    workload for measuring per-request hot-path latency over TLS.
+    """
+    try:
+        r = subprocess.run(
+            ["wrk", f"-t{threads}", f"-c{conns}", f"-d{duration}s",
+             "--timeout", "5s", "--latency",
+             f"https://{host}:{port}{endpoint}"],
+            capture_output=True, text=True, timeout=duration + 10)
+        rps, p50, p99 = 0.0, "", ""
+        for line in r.stdout.split("\n"):
+            if "Requests/sec" in line:
+                rps = float(line.split()[1])
+            elif "50%" in line:
+                p50 = line.split()[1]
+            elif "99%" in line:
+                p99 = line.split()[1]
+        return rps, p50, p99
+    except subprocess.TimeoutExpired:
+        return 0.0, "TIMEOUT", "TIMEOUT"
+    except Exception:
+        return 0.0, "ERROR", "ERROR"
+
+
+def run_tls_handshake_rate(port, endpoint, duration, host="localhost",
+                           parallelism=4):
+    """Measure full TLS 1.3 handshake throughput.
+
+    Spawns `parallelism` worker threads; each one repeatedly:
+      1. Opens a TCP connection to (host, port)
+      2. Completes the TLS 1.3 handshake (X25519 + ECDSA + ChaCha20-Poly1305)
+      3. Sends one HTTP/1.1 GET with `Connection: close`
+      4. Reads the response
+      5. Closes the connection (TCP FIN + TIME_WAIT)
+
+    Runs for `duration` seconds and returns
+    `(handshakes_per_sec, p50_us_string, p99_us_string)`.
+
+    Why parallelism=4 by default: macOS's ephemeral-port pool +
+    30-second TIME_WAIT caps sustained close-once throughput at
+    roughly 500 conn/s. Four concurrent workers stays well under
+    that ceiling and gives a stable measurement instead of a
+    cliff-edge stall when ports run out.
+
+    The Python `ssl` module fronts whatever TLS library is bundled
+    with the current Python — on macOS that's typically OpenSSL
+    3.x via Homebrew Python or LibreSSL via the system Python.
+    Both support TLS 1.3 + ECDSA P-256 + X25519, so either works
+    against our server.
+    """
+    import ssl
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+        ctx.maximum_version = ssl.TLSVersion.TLSv1_3
+    except AttributeError:
+        pass
+
+    request = (
+        f"GET {endpoint} HTTP/1.1\r\n"
+        f"Host: {host}\r\n"
+        f"Connection: close\r\n\r\n"
+    ).encode()
+
+    deadline = time.monotonic() + duration
+    latencies_us = []  # list[int]
+    lock = threading.Lock()
+    errors = [0]
+
+    def worker():
+        local_lat = []
+        local_err = 0
+        while time.monotonic() < deadline:
+            t0 = time.monotonic_ns()
+            try:
+                sock = socket.create_connection((host, port), timeout=5)
+                ssock = ctx.wrap_socket(sock, server_hostname="unikernel.local")
+                ssock.send(request)
+                resp = b""
+                while b"\r\n\r\n" not in resp and len(resp) < 4096:
+                    chunk = ssock.recv(4096)
+                    if not chunk:
+                        break
+                    resp += chunk
+                ssock.close()
+                if b"200" in resp[:32]:
+                    elapsed_us = (time.monotonic_ns() - t0) // 1000
+                    local_lat.append(elapsed_us)
+                else:
+                    local_err += 1
+            except Exception:
+                local_err += 1
+        with lock:
+            latencies_us.extend(local_lat)
+            errors[0] += local_err
+
+    ts = [threading.Thread(target=worker) for _ in range(parallelism)]
+    start = time.monotonic()
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    elapsed = time.monotonic() - start
+
+    if not latencies_us or elapsed == 0:
+        return 0.0, "ERROR", "ERROR"
+    rps = len(latencies_us) / elapsed
+    latencies_us.sort()
+    p50 = latencies_us[len(latencies_us) // 2]
+    p99_idx = min(len(latencies_us) - 1, (len(latencies_us) * 99) // 100)
+    p99 = latencies_us[p99_idx]
+    return rps, f"{p50}us", f"{p99}us"
+
+
 def run_wrk_parallel(port, endpoint, threads, conns, duration, instances, host="localhost"):
     """Run `instances` parallel wrk processes and aggregate results.
 
@@ -329,6 +454,7 @@ def udp_peak_concurrent(port, duration, host, client_cpus=1, timeout_ms=100):
 class QemuEnv:
     name = "qemu"
     label = "QEMU x86_64 TCG"
+    tls_port_offset = 1000   # host TLS port = guest HTTP port + 1000
 
     def build(self):
         subprocess.run(
@@ -345,8 +471,12 @@ class QemuEnv:
         dev = "virtio-net-pci"
         if cpus > 1:
             dev += f",mq=on,vectors={2*cpus+2}"
+        tls_port = port + self.tls_port_offset
         cmd += ["-device", f"{dev},netdev=net0",
-                "-netdev", f"user,id=net0,hostfwd=tcp::{port}-:80,hostfwd=udp::{port+1}-:7",
+                "-netdev",
+                (f"user,id=net0,hostfwd=tcp::{port}-:80,"
+                 f"hostfwd=tcp::{tls_port}-:443,"
+                 f"hostfwd=udp::{port+1}-:7"),
                 "-kernel", elf]
         return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -369,6 +499,7 @@ class KvmEnv:
     GUEST_MAC = "52:54:00:12:34:56"
     GUEST_IP = "10.20.30.10"
     GUEST_PORT = 80
+    GUEST_TLS_PORT = 443
     GUEST_UDP_PORT = 7
 
     # Path to pre-staged ELF; set via --elf. If None, bazel build runs.
@@ -436,6 +567,7 @@ class KvmEnv:
 class QemuAarch64Env:
     name = "qemu-arm"
     label = "QEMU aarch64 TCG"
+    tls_port_offset = 1000   # host TLS port = guest HTTP port + 1000
 
     def build(self):
         subprocess.run(
@@ -444,11 +576,15 @@ class QemuAarch64Env:
 
     def start(self, cpus, port):
         img = os.path.join(PROJECT_ROOT, "bazel-bin/apps/webserver/webserver.img")
+        tls_port = port + self.tls_port_offset
         cmd = ["qemu-system-aarch64", "-machine", "virt", "-cpu", "max",
                "-m", "128", "-smp", str(cpus), "-nographic",
                "-serial", f"file:/tmp/bench_{port}.log", "-no-reboot",
                "-device", "virtio-net-device,netdev=net0",
-               "-netdev", f"user,id=net0,hostfwd=tcp::{port}-:80,hostfwd=udp::{port+1}-:7",
+               "-netdev",
+               (f"user,id=net0,hostfwd=tcp::{port}-:80,"
+                f"hostfwd=tcp::{tls_port}-:443,"
+                f"hostfwd=udp::{port+1}-:7"),
                "-kernel", img]
         return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -538,6 +674,7 @@ class HvfEnv:
     name = "hvf"
     label = "HVF"
     udp_port_offset = 10000  # host UDP port = guest port + 10000
+    tls_port_offset = 1000   # host TLS port = guest HTTP port + 1000
 
     def build(self):
         # Two bazel calls because the runner is a host tool and
@@ -558,12 +695,15 @@ class HvfEnv:
         run_hvf = os.path.join(PROJECT_ROOT, "bazel-bin/tools/hvf-runner/run-hvf")
         log = open(f"/tmp/hvf_{port}.log", "w")
         udp_port = port + self.udp_port_offset
-        # -p tcp:HOST:GUEST forwards HTTP to guest:80; -p udp:HOST:GUEST
-        # forwards the UDP echo test to guest:7.
+        tls_port = port + self.tls_port_offset
+        # -p tcp:HOST:GUEST forwards HTTP to guest:80; -p tcp:HOST:443
+        # forwards HTTPS to guest:443; -p udp:HOST:GUEST forwards the
+        # UDP echo test to guest:7.
         return subprocess.Popen(
             [run_hvf, img,
              "--ram=128", f"--cpus={cpus}",
              "-p", f"tcp:{port}:80",
+             "-p", f"tcp:{tls_port}:443",
              "-p", f"udp:{udp_port}:7"],
             stdin=subprocess.DEVNULL, stdout=log, stderr=log)
 
@@ -683,6 +823,35 @@ WORKLOADS = [
      "desc": "UDP echo single-flow latency (1 sender, sync RTT)"},
     {"name": "udp_peak", "type": "udp_peak", "endpoint": "",
      "desc": "UDP echo peak throughput (windowed + adaptive concurrency ramp)"},
+
+    # ── TLS 1.3 workloads ────────────────────────────────────────────
+    #
+    # `health_tls_c1` is the HTTPS analogue of `health_c1`: a single
+    # keep-alive connection sending /health requests over TLS 1.3 +
+    # ECDSA P-256 + ChaCha20-Poly1305. The TLS handshake happens once
+    # at the start of the run and amortises over `duration` seconds
+    # of record-layer-only requests, so this number isolates the
+    # hot-path encryption + record framing cost from the (much
+    # larger) one-time handshake cost. Compare against `health_c1`
+    # to see the per-request TLS overhead.
+    #
+    # `tls_handshake_rate` is the opposite: each "request" is a fresh
+    # TCP+TLS connection, exercising the full ECDSA sign + X25519
+    # ECDHE + key schedule + handshake message encoding cost on
+    # every iteration. This is the metric that matters for clients
+    # that don't keep connections alive (curl, wget, browsers
+    # opening tabs, etc.) and for measuring the cold-path cost of
+    # our hand-rolled TLS implementation.
+    {"name": "health_tls_c1", "type": "https", "endpoint": "/health",
+     "threads": 1, "conns": 1,
+     "desc": "/health × 1 conn over TLS 1.3 (record-layer hot path)"},
+    {"name": "health_tls_max", "type": "https", "endpoint": "/health",
+     "threads_per_core": 1, "conns_per_core": 32,
+     "desc": "/health throughput over TLS (32 conn × cpus, keep-alive)"},
+    {"name": "tls_handshake_rate", "type": "tls_handshake",
+     "endpoint": "/health",
+     "parallelism": 4,
+     "desc": "TLS 1.3 full handshake + GET + close, sustained"},
 ]
 
 
@@ -815,10 +984,13 @@ def main():
                 if isinstance(env, KvmEnv):
                     wrk_host = env.GUEST_IP
                     wrk_port = env.GUEST_PORT
+                    tls_target_port = env.GUEST_TLS_PORT
                     udp_target_port = env.GUEST_UDP_PORT
                 else:
                     wrk_host = "localhost"
                     wrk_port = bench_port
+                    tls_off = getattr(env, 'tls_port_offset', 1000)
+                    tls_target_port = bench_port + tls_off
                     udp_off = getattr(env, 'udp_port_offset', 1)
                     udp_target_port = bench_port + udp_off
 
@@ -852,6 +1024,26 @@ def main():
                             host=wrk_host)
                     results[(env_name, cpus, wname)] = (rps, p50, p99)
                     print(f"    {wname:<20s} {rps:>10.0f} req/s  p50={p50}  p99={p99}")
+                elif w["type"] == "https":
+                    # wrk over https://. Self-signed dev cert is fine
+                    # because wrk doesn't verify by default.
+                    rps, p50, p99 = run_wrk_https(
+                        tls_target_port, w["endpoint"], threads, conns, duration,
+                        host=wrk_host)
+                    results[(env_name, cpus, wname)] = (rps, p50, p99)
+                    print(f"    {wname:<20s} {rps:>10.0f} req/s  p50={p50}  p99={p99}")
+                elif w["type"] == "tls_handshake":
+                    # Connection-per-request: each iteration opens a
+                    # fresh TCP socket, completes the full TLS 1.3
+                    # handshake, sends one GET, reads the response,
+                    # closes. Measures handshake throughput, not
+                    # record-layer throughput.
+                    par = w.get("parallelism", 4)
+                    rps, p50, p99 = run_tls_handshake_rate(
+                        tls_target_port, w["endpoint"], duration,
+                        host=wrk_host, parallelism=par)
+                    results[(env_name, cpus, wname)] = (rps, p50, p99)
+                    print(f"    {wname:<20s} {rps:>10.0f} hs/s   p50={p50}  p99={p99}")
                 elif w["type"] == "udp":
                     # Let wait_http's TCP teardown settle before firing a
                     # UDP burst — without this the first sender very
