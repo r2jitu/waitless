@@ -383,14 +383,36 @@ impl TlsServer {
 
     /// Advance the state machine as far as possible with what's in
     /// `rx_buf`. Returns the current state.
+    ///
+    /// Loops until no further progress is possible: each state handler
+    /// processes at most one record, but a single caller push may have
+    /// delivered multiple records across state-transition boundaries
+    /// (e.g. ClientChangeCipherSpec + ClientFinished + first
+    /// application_data record all arrive in one TCP segment). Without
+    /// the loop, the handler that transitions WaitClientFinished →
+    /// Established would consume Finished and return, leaving the app
+    /// data record stranded in `rx_buf` until the next caller push —
+    /// which for a short HTTPS request never comes, wedging the conn.
     pub fn advance(&mut self, config: &TlsServerConfig) -> Result<State, TlsError> {
-        match self.state {
-            State::WaitClientHello => self.do_client_hello(config)?,
-            State::WaitClientFinished => self.do_client_finished()?,
-            State::Established => self.do_app_data()?,
-            State::Closed | State::Failed => {}
+        loop {
+            let before_state = self.state;
+            let before_rx = self.rx_len;
+            let before_pt = self.pt_len;
+            let before_tx = self.tx_len;
+            match self.state {
+                State::WaitClientHello => self.do_client_hello(config)?,
+                State::WaitClientFinished => self.do_client_finished()?,
+                State::Established => self.do_app_data()?,
+                State::Closed | State::Failed => return Ok(self.state),
+            }
+            let progressed = self.state != before_state
+                || self.rx_len != before_rx
+                || self.pt_len != before_pt
+                || self.tx_len != before_tx;
+            if !progressed {
+                return Ok(self.state);
+            }
         }
-        Ok(self.state)
     }
 
     pub fn state(&self) -> State {
