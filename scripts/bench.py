@@ -919,23 +919,34 @@ WORKLOADS = [
     # larger) one-time handshake cost. Compare against `health_c1`
     # to see the per-request TLS overhead.
     #
-    # `tls_handshake_rate` is the opposite: each "request" is a fresh
+    # `tls_handshake_max` is the opposite: each "request" is a fresh
     # TCP+TLS connection, exercising the full ECDSA sign + X25519
     # ECDHE + key schedule + handshake message encoding cost on
     # every iteration. This is the metric that matters for clients
     # that don't keep connections alive (curl, wget, browsers
     # opening tabs, etc.) and for measuring the cold-path cost of
     # our hand-rolled TLS implementation.
+    #
+    # Client parallelism is scaled with `--cores` via
+    # `parallelism_per_core` to match the other `_max` workloads:
+    # 4 client workers per server core gives enough in-flight
+    # handshakes to keep every server core busy without any worker
+    # stalling on the server's previous handshake. This was
+    # originally a fixed 4-worker constant, but that meant the
+    # server was oversubscribed 4× at 1c and the client became the
+    # bottleneck at 3c+ because it couldn't push enough pressure.
+    # Scaling with cores keeps the workload shape comparable
+    # across core counts the way health_tls_max does.
     {"name": "health_tls_c1", "type": "https", "endpoint": "/health",
      "threads": 1, "conns": 1,
      "desc": "/health × 1 conn over TLS 1.3 (record-layer hot path)"},
     {"name": "health_tls_max", "type": "https", "endpoint": "/health",
      "threads_per_core": 1, "conns_per_core": 32,
      "desc": "/health throughput over TLS (32 conn × cpus, keep-alive)"},
-    {"name": "tls_handshake_rate", "type": "tls_handshake",
+    {"name": "tls_handshake_max", "type": "tls_handshake",
      "endpoint": "/health",
-     "parallelism": 4,
-     "desc": "TLS 1.3 full handshake + GET + close, sustained"},
+     "parallelism_per_core": 4,
+     "desc": "TLS 1.3 full handshake + GET + close (4 workers × cpus)"},
 ]
 
 
@@ -1127,8 +1138,10 @@ def main():
                     # fresh TCP socket, completes the full TLS 1.3
                     # handshake, sends one GET, reads the response,
                     # closes. Measures handshake throughput, not
-                    # record-layer throughput.
-                    par = w.get("parallelism", 4)
+                    # record-layer throughput. Client parallelism
+                    # scales with server cpus to keep all server
+                    # cores busy (mirrors the _max HTTP workloads).
+                    par = w.get("parallelism_per_core", 4) * cpus
                     rps, p50, p99 = run_tls_handshake_rate(
                         tls_target_port, w["endpoint"], duration,
                         host=wrk_host, parallelism=par)
