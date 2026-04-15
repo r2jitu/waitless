@@ -946,7 +946,7 @@ def main():
     parser.add_argument("--cores", default="1,4",
                         help="Core counts to test (comma-separated)")
     parser.add_argument("--workload", default=None,
-                        help="Specific workload name (default: all)")
+                        help="Workload name(s), comma-separated (default: all)")
     parser.add_argument("--duration", type=int, default=5,
                         help="Seconds per test (default: 5)")
     parser.add_argument("--elf", default=None,
@@ -967,11 +967,17 @@ def main():
 
     workloads = WORKLOADS
     if args.workload:
-        workloads = [w for w in WORKLOADS if w["name"] == args.workload]
-        if not workloads:
-            print(f"Unknown workload: {args.workload}")
+        # Comma-separated list; preserve the order the user supplied
+        # rather than the WORKLOADS declaration order (useful for
+        # running a specific sequence like "health_c1,health_tls_c1").
+        requested = [w.strip() for w in args.workload.split(",") if w.strip()]
+        by_name = {w["name"]: w for w in WORKLOADS}
+        unknown = [name for name in requested if name not in by_name]
+        if unknown:
+            print(f"Unknown workload(s): {', '.join(unknown)}")
             print(f"Available: {', '.join(w['name'] for w in WORKLOADS)}")
             sys.exit(1)
+        workloads = [by_name[name] for name in requested]
 
     # These environments only run single-core benchmarks.
     # ARM TCG: no MTTCG support.
