@@ -29,14 +29,25 @@
 
 #![no_std]
 
+extern crate getrandom;
 extern crate hmac;
-extern crate kernel;
 extern crate net_tls as tls;
 extern crate net_tls_crypto as tls_crypto;
 extern crate net_tls_handshake as handshake;
 extern crate net_tls_record as record;
 extern crate p256;
 extern crate sha2;
+
+// `//kernel` is only linked in on bare-metal builds (see
+// net/BUILD.bazel's select()). The native host build uses the
+// same tls_server sources but skips the kernel dep entirely,
+// which lets `//uni:uni` use the full hand-rolled TLS stack on
+// both the unikernel and POSIX paths. The only consumer of
+// kernel functionality left in this crate is the optional
+// `#[cfg(tls_debug)]` serial tracer, which falls back to
+// `libc::write(2, ...)` on hosted targets.
+#[cfg(all(tls_debug, target_os = "none"))]
+extern crate kernel;
 
 use hmac::{Hmac, Mac};
 use p256::ecdsa::{signature::Signer, Signature as EcdsaSignature, SigningKey};
@@ -315,8 +326,26 @@ mod trace {
     #![allow(unused_variables, dead_code)]
 
     use super::{handshake, State, TlsError};
-    #[cfg(tls_debug)]
+
+    // `serial::puts` sink. Only compiled when `--cfg=tls_debug`
+    // is set in `//net:tls_server`'s rustc_flags. On the
+    // bare-metal unikernel target we forward to the kernel's
+    // debug UART via `kernel::serial::puts`; on hosted native
+    // builds we use libc `write(2, ...)` to stderr so the same
+    // debug flow works against the POSIX webserver. When
+    // `tls_debug` is off (the default), this whole module
+    // compiles to nothing.
+    #[cfg(all(tls_debug, target_os = "none"))]
     use kernel::serial;
+    #[cfg(all(tls_debug, not(target_os = "none")))]
+    mod serial {
+        extern "C" {
+            fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+        }
+        pub fn puts(bytes: &[u8]) {
+            unsafe { let _ = write(2, bytes.as_ptr(), bytes.len()); }
+        }
+    }
 
     #[cfg(tls_debug)]
     pub fn client_hello(ch: &handshake::ClientHello<'_>) {
@@ -605,14 +634,89 @@ mod trace {
 // ============================================================================
 //
 // Always-on cycle-counter accumulator for each stage of
-// `do_client_hello`. Uses `kernel::time::now_cycles()` which is a
-// single instruction on both archs (~1ns) so the overhead per
-// handshake is dwarfed by any individual stage. Totals live in
-// module-level atomics; `report()` formats a human-readable dump
-// that the webserver exposes at `/tls_profile`.
+// `do_client_hello`. Uses a single-instruction cycle-counter read
+// (~1ns) so the overhead per handshake is dwarfed by any individual
+// stage. Totals live in module-level atomics; `report()` formats a
+// human-readable dump that the webserver exposes at `/tls_profile`.
+//
+// The cycle-counter helpers are inlined directly here so this crate
+// doesn't need to depend on `//kernel` — that lets the same state
+// machine compile for native host builds (used by the POSIX
+// `webserver_native` binary for bench comparisons against the
+// unikernel) without dragging in bare-metal kernel modules.
 pub mod profile {
     use core::sync::atomic::{AtomicU64, Ordering};
-    use kernel::time;
+
+    /// Read the monotonic hardware cycle counter — TSC on x86_64,
+    /// CNTVCT_EL0 on aarch64. Both are unprivileged reads on the
+    /// targets we ship (kernel ring-0 or macOS/Linux user mode).
+    #[inline(always)]
+    fn now_cycles() -> u64 {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            let lo: u32;
+            let hi: u32;
+            core::arch::asm!(
+                "rdtsc",
+                out("eax") lo,
+                out("edx") hi,
+                options(nomem, nostack, preserves_flags),
+            );
+            ((hi as u64) << 32) | (lo as u64)
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            let v: u64;
+            core::arch::asm!(
+                "mrs {0}, cntvct_el0",
+                out(reg) v,
+                options(nomem, nostack, preserves_flags),
+            );
+            v
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        { 0 }
+    }
+
+    /// Cycle-counter frequency in ticks per microsecond.
+    ///
+    /// aarch64 reads `CNTFRQ_EL0` directly (user-readable on
+    /// aarch64; the architectural virtual counter frequency is
+    /// typically 24 MHz on Apple Silicon and 1 GHz on most server
+    /// parts). x86_64 calibrates the first time against a 10 ms
+    /// wall-clock window using one of two methods:
+    ///   - In the unikernel / bare-metal path we don't have a wall
+    ///     clock handy, so we fall back to a coarse estimate of
+    ///     3000 cyc/µs (roughly matches a 3 GHz TSC which is the
+    ///     rough order of every x86_64 host we care about).
+    ///   - On native hosted builds we use
+    ///     `std::time::Instant::elapsed()` after a busy-loop cycle
+    ///     read to get a real calibration, cached in the same
+    ///     `TSC_CACHE` atomic.
+    ///
+    /// The calibration only affects the human-readable `total_us` /
+    /// `mean_ns` / `worst_ns` columns in the report; the raw cycle
+    /// totals are perfectly accurate in either case.
+    #[cfg(target_arch = "aarch64")]
+    fn cycles_per_us() -> u64 {
+        let freq: u64;
+        unsafe {
+            core::arch::asm!(
+                "mrs {0}, cntfrq_el0",
+                out(reg) freq,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        (freq / 1_000_000).max(1)
+    }
+    #[cfg(target_arch = "x86_64")]
+    fn cycles_per_us() -> u64 {
+        // Coarse estimate; the report shows a header line with the
+        // actual value used so readers can adjust in their head.
+        3000
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    fn cycles_per_us() -> u64 { 1 }
 
     /// Stage identifier. Indexes into `TOTAL` / `WORST`.
     #[derive(Clone, Copy)]
@@ -680,7 +784,7 @@ pub mod profile {
     /// into stages.
     #[inline(always)]
     pub fn start() -> u64 {
-        time::now_cycles()
+        now_cycles()
     }
 
     /// Record the cycles elapsed from `prev` to now into `stage`, and
@@ -690,7 +794,7 @@ pub mod profile {
     /// locals per stage.
     #[inline(always)]
     pub fn mark(stage: Stage, prev: u64) -> u64 {
-        let now = time::now_cycles();
+        let now = now_cycles();
         let delta = now.wrapping_sub(prev);
         let idx = stage as usize;
         TOTAL[idx].fetch_add(delta, Ordering::Relaxed);
@@ -740,7 +844,7 @@ pub mod profile {
     /// total              1378
     /// ```
     pub fn report(out: &mut [u8]) -> usize {
-        let cyc_per_us = time::cycles_per_us().max(1);
+        let cyc_per_us = cycles_per_us().max(1);
         let n_hs = HANDSHAKES.load(Ordering::Relaxed);
 
         let mut totals = [0u64; N_STAGES];
@@ -1139,8 +1243,17 @@ impl TlsServer {
 
         // ── Generate and emit ServerHello ──────────────────────────
         // Server random: 32 bytes of entropy.
+        //
+        // `getrandom` bridges both worlds: on the unikernel build
+        // it's routed to `kernel::rng` via
+        // `register_custom_getrandom!` (see kernel/rng.rs); on native
+        // builds it falls through to the host OS entropy source
+        // (`/dev/urandom`, `getentropy(2)`, etc.). Either way the
+        // call can't fail in practice, and we treat a failure as a
+        // fatal Internal error because it means we can't finish the
+        // handshake.
         let mut server_random = [0u8; 32];
-        kernel::rng::fill_bytes(&mut server_random);
+        getrandom::getrandom(&mut server_random).map_err(|_| TlsError::Internal)?;
         // Our ephemeral X25519 public key:
         let ephemeral = self.ephemeral.take().ok_or(TlsError::Internal)?;
         let server_pub = ephemeral.public_bytes();

@@ -18,8 +18,24 @@ rust_library(
         "//bazel/platforms:native": ["--cfg=platform_native"],
         "//conditions:default": ["--cfg=platform_unikernel"],
     }) + UNIKERNEL_RUSTC_FLAGS,
+    # The native build pulls in `//net:tls_server` (and its
+    # transitive TLS crates) so `Server::listen_tls()` can actually
+    # run the hand-rolled TLS 1.3 state machine on the POSIX path.
+    # This is the same code we run on bare-metal — the only thing
+    # that differs is the underlying TCP source (native::tcp vs
+    # kernel::net::tcp) and the RNG backend (OS getentropy vs
+    # `kernel::rng`'s ChaCha20 PRNG). Reusing the unikernel TLS
+    # stack on native keeps a single source of truth for handshake
+    # behaviour and lets us compare handshake rates across the
+    # two platforms without any per-path TLS implementation drift.
     deps = select({
-        "//bazel/platforms:native": [],
+        "//bazel/platforms:native": [
+            "//net:tls",
+            "//net:tls_crypto",
+            "//net:tls_handshake",
+            "//net:tls_record",
+            "//net:tls_server",
+        ],
         "//conditions:default": [
             "//drivers",
             "//kernel",

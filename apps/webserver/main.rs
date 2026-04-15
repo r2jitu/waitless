@@ -151,6 +151,7 @@ const HTTPS_PORT: u16 = 443;
 fn main() {
     uni::log(b"Starting Rust HTTP server...\n");
     let http_port = uni::config_port(HTTP_PORT);
+    let https_port = uni::config_tls_port(HTTPS_PORT);
 
     // Start UDP echo server on port 7
     fn udp_echo(src_ip: [u8; 4], src_port: u16, data: &[u8]) {
@@ -177,7 +178,7 @@ fn main() {
             let config: &'static TlsServerConfig =
                 uni::Box::leak(uni::Box::new(cfg));
             uni::log(b"TLS: dev cert loaded. Serving HTTPS.\n");
-            server.listen_tls(HTTPS_PORT, config);
+            server.listen_tls(https_port, config);
         }
         None => {
             uni::log(b"TLS: failed to parse dev key; HTTPS disabled.\n");

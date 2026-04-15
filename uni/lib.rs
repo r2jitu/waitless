@@ -18,6 +18,24 @@ extern crate drivers;
 #[cfg(platform_unikernel)]
 extern crate net;
 
+// The hand-rolled TLS 1.3 state machine from `//net:tls_server`
+// is used on BOTH platforms so there's a single source of truth
+// for handshake behaviour. On the unikernel it's reached via the
+// umbrella `net::tls_server` path (already imported above); on
+// native we need a direct `extern crate` because the umbrella
+// `//net:net` isn't built on the hosted target (it depends on
+// //kernel for TCP). Aliased via a helper `net` module so
+// `uni/http.rs` can keep writing `net::tls_server::X` on both
+// platforms.
+#[cfg(platform_native)]
+extern crate net_tls_server as net_tls_server_impl;
+#[cfg(platform_native)]
+pub mod net {
+    pub mod tls_server {
+        pub use crate::net_tls_server_impl::*;
+    }
+}
+
 #[cfg(platform_unikernel)]
 mod unikernel;
 
@@ -34,7 +52,7 @@ pub mod http;
 
 #[cfg(platform_unikernel)]
 mod backend {
-    pub use crate::unikernel::{log, config_port, check_shutdown, wait_for_events};
+    pub use crate::unikernel::{log, config_port, config_tls_port, check_shutdown, wait_for_events};
     pub use net::tcp::{listen as tcp_listen, accept as tcp_accept, has_data as tcp_has_data,
                        recv as tcp_recv, send as tcp_send, close as tcp_close,
                        is_closed as tcp_is_closed, listen_on_core as tcp_listen_on};
@@ -57,7 +75,7 @@ mod backend {
 
 #[cfg(platform_native)]
 mod backend {
-    pub use crate::native::{log, config_port, check_shutdown, wait_for_events,
+    pub use crate::native::{log, config_port, config_tls_port, check_shutdown, wait_for_events,
                             tcp_listen, tcp_accept, tcp_has_data,
                             tcp_recv, tcp_send, tcp_close, tcp_is_closed, tcp_poll};
 
@@ -181,7 +199,7 @@ mod backend {
 
 // ---- Re-exported platform functions ------------------------------------------
 
-pub use backend::{log, config_port, check_shutdown, wait_for_events, tcp_poll};
+pub use backend::{log, config_port, config_tls_port, check_shutdown, wait_for_events, tcp_poll};
 pub use backend::{num_workers, set_service, set_ready, request_shutdown, register_io_poll};
 pub use backend::tcp_listen_on;
 

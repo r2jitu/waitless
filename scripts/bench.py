@@ -714,6 +714,12 @@ class DockerEnv:
 class NativeEnv:
     name = "native"
     label = "Native (POSIX)"
+    # Offset added to the HTTP port to pick a non-overlapping TLS
+    # port. Mirrors the VM envs' `tls_port_offset`. Picked to sit
+    # well above the ephemeral port range so it doesn't collide with
+    # outbound sockets, and to be predictable for the bench
+    # dispatch loop.
+    tls_port_offset = 1000
 
     # Path to pre-staged native binary; set via --native-bin. If None, bazel build runs.
     bin_override = None
@@ -733,6 +739,7 @@ class NativeEnv:
             return None
         env = os.environ.copy()
         env["PORT"] = str(port)
+        env["TLS_PORT"] = str(port + self.tls_port_offset)
         env["UDP_PORT"] = str(port + 1)
         env["THREADS"] = str(cpus)
         return subprocess.Popen(

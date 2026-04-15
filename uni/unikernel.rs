@@ -12,6 +12,13 @@ pub fn config_port(default_port: u16) -> u16 {
     default_port
 }
 
+/// TLS port override stub. On the unikernel there are no env
+/// variables, so the caller-supplied default is the only source
+/// of truth; the real override lives in the native backend.
+pub fn config_tls_port(default_port: u16) -> u16 {
+    default_port
+}
+
 pub fn check_shutdown() -> bool {
     serial::check_shutdown()
 }

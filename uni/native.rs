@@ -441,6 +441,7 @@ fn drain_udp_sibling(fd: i32, binding_idx: usize) {
 static mut THREADS: [ThreadState; MAX_THREADS] = [const { ThreadState::new(0) }; MAX_THREADS];
 pub static mut NUM_THREADS: usize = 1;
 static mut CONFIG_PORT: u16 = 0;
+static mut CONFIG_TLS_PORT: u16 = 0;
 pub static mut SHUTDOWN: bool = false;
 
 // ── Shared listen socket ──────────────────────────────────────────────────────
@@ -492,6 +493,15 @@ fn init_native() {
             CONFIG_PORT = parse_u16(p);
         }
 
+        // TLS listener port override. bench.py / tests set this to
+        // a high port to avoid the privileged-port bind on Linux
+        // (macOS lets non-root bind anywhere, but we can't rely on
+        // that cross-platform).
+        let tp = getenv(b"TLS_PORT\0".as_ptr());
+        if !tp.is_null() && *tp != 0 {
+            CONFIG_TLS_PORT = parse_u16(tp);
+        }
+
         let u = getenv(b"UDP_PORT\0".as_ptr());
         if !u.is_null() && *u != 0 {
             UDP_PORT_BASE = parse_u16(u);
@@ -537,6 +547,15 @@ pub fn log(msg: &[u8]) {
 
 pub fn config_port(default_port: u16) -> u16 {
     let port = unsafe { CONFIG_PORT };
+    if port != 0 { port } else { default_port }
+}
+
+/// TLS port override, populated from the `TLS_PORT` environment
+/// variable at `init_native()` time. Returns the override when
+/// set, otherwise the caller-supplied default (typically 443).
+/// Mirrors `config_port` but for the HTTPS listener.
+pub fn config_tls_port(default_port: u16) -> u16 {
+    let port = unsafe { CONFIG_TLS_PORT };
     if port != 0 { port } else { default_port }
 }
 

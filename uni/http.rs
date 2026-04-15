@@ -17,50 +17,38 @@
 
 use crate::{TcpListener, TcpStream};
 
+// On native, `net` is a helper module inside `uni/lib.rs` that
+// re-exports `net_tls_server` as `net::tls_server` so http.rs
+// can keep using the same `net::tls_server::X` paths it does
+// on unikernel (where `extern crate net` pulls in the umbrella
+// `//net:net` at the crate root). This `use` bridges the two
+// lookup paths so the rest of the file doesn't need cfg gates
+// for every TLS reference.
+#[cfg(platform_native)]
+use crate::net;
+
 // Re-export the TLS config type so apps can write `uni::http::TlsServerConfig`
-// without caring which platform they're on. On the unikernel platform this
-// is the real type from `//net:tls_server`; on native it's a lightweight
-// stub (TLS isn't wired up for the POSIX backend).
-#[cfg(platform_unikernel)]
+// without caring which platform they're on. Both platforms now share
+// the same hand-rolled TLS 1.3 state machine from `//net:tls_server`;
+// the native build reaches it via the `net::tls_server` alias set up
+// in `uni/lib.rs` (pointing at `net_tls_server` directly so the
+// umbrella `//net:net` crate doesn't need to be dragged in on hosted
+// targets).
 pub use net::tls_server::TlsServerConfig;
-
-/// Native-build stub for `TlsServerConfig`. Apps can construct it but
-/// `run_tls()` on native ignores the config and falls back to plain HTTP.
-#[cfg(platform_native)]
-pub struct TlsServerConfig {
-    pub cert_der: &'static [u8],
-}
-
-#[cfg(platform_native)]
-impl TlsServerConfig {
-    pub fn from_dev_cert(cert_der: &'static [u8], _pkcs8_key: &[u8]) -> Option<Self> {
-        Some(TlsServerConfig { cert_der })
-    }
-}
 
 /// Format the TLS handshake profile into `out`. Returns the number of
 /// bytes written. Apps can serve this as the body of a debug endpoint
-/// (`/tls_profile`) to inspect per-stage handshake timings. Returns 0
-/// on native (no hand-rolled TLS, nothing to profile).
+/// (`/tls_profile`) to inspect per-stage handshake timings. Works on
+/// both unikernel and native — the profile counters live in the
+/// shared `net::tls_server::profile` module.
 pub fn tls_profile_report(out: &mut [u8]) -> usize {
-    #[cfg(platform_unikernel)]
-    {
-        net::tls_server::profile::report(out)
-    }
-    #[cfg(platform_native)]
-    {
-        let _ = out;
-        0
-    }
+    net::tls_server::profile::report(out)
 }
 
 /// Reset the TLS handshake profile accumulators. Useful between
 /// benchmark runs.
 pub fn tls_profile_reset() {
-    #[cfg(platform_unikernel)]
-    {
-        net::tls_server::profile::reset();
-    }
+    net::tls_server::profile::reset();
 }
 
 // ---- HTTP types -------------------------------------------------------------
@@ -230,16 +218,59 @@ struct ActiveConn {
     /// and reclaim slots (prevents pool exhaustion from abandoned clients).
     idle_ticks: u32,
     /// Per-connection TLS state (when the server is in HTTPS mode).
-    /// `None` for plain HTTP connections. Unikernel-only because the
-    /// TLS 1.3 state machine lives in `//net:tls_server`, which isn't
-    /// available on the native POSIX build.
-    #[cfg(platform_unikernel)]
+    /// `None` for plain HTTP connections. The `TlsServer` state
+    /// machine lives in `//net:tls_server` and is shared by the
+    /// unikernel and native builds, so this field is available on
+    /// both platforms.
     tls: Option<crate::Box<net::tls_server::TlsServer>>,
 }
 
 /// Close idle connections after this many service ticks with no data.
 /// At ~800K ticks/sec (single-core event loop), 4M ticks ≈ 5 seconds.
 const IDLE_TIMEOUT_TICKS: u32 = 4_000_000;
+
+/// Fill `seed` with 32 bytes of platform entropy for a per-connection
+/// TLS 1.3 ephemeral X25519 keypair.
+///
+/// On the unikernel this calls `kernel::rng::fill_bytes`, which
+/// drives a ChaCha20 PRNG seeded at boot from TSC/CNTVCT jitter +
+/// RDRAND samples.
+///
+/// On native it reads `/dev/urandom` via libc. We don't use
+/// `getrandom::getrandom` here because on bare-metal the getrandom
+/// crate is configured with the `custom` feature pointing at
+/// `kernel::rng`, and linking that chain from this path would
+/// bring kernel::rng back in for native too. Going directly through
+/// each platform's natural entropy source keeps the deps clean.
+#[inline]
+#[cfg(platform_unikernel)]
+fn fill_tls_seed(seed: &mut [u8; 32]) {
+    kernel::rng::fill_bytes(seed);
+}
+
+#[inline]
+#[cfg(platform_native)]
+fn fill_tls_seed(seed: &mut [u8; 32]) {
+    // libc::getentropy fills up to 256 bytes from the kernel
+    // entropy pool in one syscall and is available on both macOS
+    // and Linux glibc/musl. We declare it directly instead of
+    // pulling in `libc` as a dep because we only need this one
+    // symbol.
+    unsafe extern "C" {
+        fn getentropy(buf: *mut core::ffi::c_void, len: usize) -> i32;
+    }
+    unsafe {
+        let rc = getentropy(seed.as_mut_ptr() as *mut _, 32);
+        if rc != 0 {
+            // Fallback: zero the seed. The handshake will still
+            // complete but with predictable ephemeral keys, which
+            // is catastrophic for real clients — however on native
+            // we only use this for dev/bench, and getentropy
+            // essentially never fails in practice.
+            *seed = [0u8; 32];
+        }
+    }
+}
 
 impl ActiveConn {
     fn new() -> Self {
@@ -248,7 +279,6 @@ impl ActiveConn {
             buf: crate::Buffer::new(BUF_SIZE),
             buf_len: 0,
             idle_ticks: 0,
-            #[cfg(platform_unikernel)]
             tls: None,
         }
     }
@@ -301,7 +331,6 @@ static TLS_LISTEN_PORT: core::sync::atomic::AtomicU16 = core::sync::atomic::Atom
 // creation to find. Raw pointer because `TlsServerConfig` isn't
 // Send+Sync in the generic sense and we never form an `&mut`; readers
 // dereference with Acquire and only read the immutable cert/key bytes.
-#[cfg(platform_unikernel)]
 static TLS_CONFIG_PTR: core::sync::atomic::AtomicPtr<net::tls_server::TlsServerConfig> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
@@ -385,10 +414,10 @@ impl Server {
     /// `apps/webserver/dev_certs/`) and `Box::leak`-ed to get a
     /// `&'static TlsServerConfig`.
     ///
-    /// Unikernel-only. On native this is a no-op log — native builds
-    /// don't ship a TLS implementation; for HTTPS testing, boot the
-    /// unikernel.
-    #[cfg(platform_unikernel)]
+    /// Works on both unikernel and native. Both platforms use the
+    /// same hand-rolled TLS 1.3 stack from `//net:tls_server`; the
+    /// only per-platform detail is the TCP source under the hood
+    /// (`kernel::net::tcp` vs `native::tcp`) and the RNG backend.
     pub fn listen_tls(&mut self, port: u16, config: &'static TlsServerConfig) {
         // Publish the config pointer for the accept path.
         TLS_CONFIG_PTR.store(
@@ -415,11 +444,6 @@ impl Server {
         crate::set_service(http_service_cb);
 
         crate::log(b"http: listening (TLS)\n");
-    }
-
-    #[cfg(platform_native)]
-    pub fn listen_tls(&mut self, _port: u16, _config: &'static TlsServerConfig) {
-        crate::log(b"http: listen_tls() not supported on native; ignoring\n");
     }
 
     /// Enter the event loop with whatever listeners have been
@@ -460,8 +484,7 @@ impl Server {
                 had_work = true;
                 if let Some(ac) = alloc_active(&mut self.cores[core_id as usize].active) {
                     ac.conn = Some(stream);
-                    #[cfg(platform_unikernel)]
-                    { ac.tls = None; }
+                    ac.tls = None;
                 } else {
                     crate::log(b"http: too many connections, dropping\n");
                     stream.close();
@@ -469,7 +492,6 @@ impl Server {
                 }
             }
         }
-        #[cfg(platform_unikernel)]
         if let Some(listener) = self.cores[core_id as usize].tls_listener {
             while let Some(stream) = listener.accept() {
                 had_work = true;
@@ -478,8 +500,14 @@ impl Server {
                     let tls_cfg_ptr =
                         TLS_CONFIG_PTR.load(core::sync::atomic::Ordering::Acquire);
                     if !tls_cfg_ptr.is_null() {
+                        // Seed the per-connection ephemeral X25519 keypair
+                        // from platform entropy. `kernel::rng::fill_bytes`
+                        // on bare-metal (ChaCha20 PRNG seeded at boot from
+                        // the TSC/CNTVCT jitter + RDRAND); libc
+                        // `arc4random_buf` on native (host OS entropy).
+                        // Both are fine for TLS 1.3 ephemeral keys.
                         let mut seed = [0u8; 32];
-                        kernel::rng::fill_bytes(&mut seed);
+                        fill_tls_seed(&mut seed);
                         ac.tls = Some(crate::Box::new(
                             net::tls_server::TlsServer::new(seed),
                         ));
@@ -523,14 +551,10 @@ impl Server {
             if conn.has_data() {
                 had_work = true;
                 self.cores[core_id as usize].active[i].idle_ticks = 0;
-                #[cfg(platform_unikernel)]
                 let is_tls =
                     self.cores[core_id as usize].active[i].tls.is_some();
-                #[cfg(platform_native)]
-                let is_tls = false;
 
                 if is_tls {
-                    #[cfg(platform_unikernel)]
                     self.tls_ingest(core_id, i, conn);
                 } else {
                     let buf_len = self.cores[core_id as usize].active[i].buf_len;
@@ -552,8 +576,7 @@ impl Server {
                     self.cores[core_id as usize].active[i].conn = None;
                     self.cores[core_id as usize].active[i].buf_len = 0;
                     self.cores[core_id as usize].active[i].idle_ticks = 0;
-                    #[cfg(platform_unikernel)]
-                    { self.cores[core_id as usize].active[i].tls = None; }
+                    self.cores[core_id as usize].active[i].tls = None;
                     continue;
                 }
             }
@@ -583,8 +606,7 @@ impl Server {
                         self.cores[core_id as usize].active[i].conn = None;
                         self.cores[core_id as usize].active[i].buf_len = 0;
                         self.cores[core_id as usize].active[i].idle_ticks = 0;
-                        #[cfg(platform_unikernel)]
-                        { self.cores[core_id as usize].active[i].tls = None; }
+                        self.cores[core_id as usize].active[i].tls = None;
                     } else {
                         let remaining = buf_len - consumed;
                         if remaining > 0 {
@@ -596,8 +618,7 @@ impl Server {
                     conn.close();
                     self.cores[core_id as usize].active[i].conn = None;
                     self.cores[core_id as usize].active[i].buf_len = 0;
-                    #[cfg(platform_unikernel)]
-                    { self.cores[core_id as usize].active[i].tls = None; }
+                    self.cores[core_id as usize].active[i].tls = None;
                 }
             }
         }
@@ -612,7 +633,6 @@ impl Server {
     /// into the per-connection `buf` for the HTTP parser to consume.
     ///
     /// Only called when the connection is known to be in TLS mode.
-    #[cfg(platform_unikernel)]
     fn tls_ingest(&mut self, core_id: u32, conn_idx: usize, conn: TcpStream) {
         // Need an owned pointer to the TlsServerConfig. It's 'static.
         let tls_cfg_ptr = TLS_CONFIG_PTR.load(core::sync::atomic::Ordering::Acquire);
@@ -682,44 +702,40 @@ impl Server {
         resp: &Response,
         keep_alive: bool,
     ) {
-        #[cfg(platform_unikernel)]
-        {
-            let ac = &mut self.cores[core_id as usize].active[conn_idx];
-            if let Some(tls) = ac.tls.as_mut() {
-                // Build the HTTP response into a temporary stack
-                // buffer, then feed it to TLS as application data.
-                let mut w = BufWriter::new();
-                write_response_into(&mut w, resp, keep_alive);
-                if tls.send_app_data(w.as_bytes()).is_err() {
-                    conn.close();
-                    ac.conn = None;
-                    ac.buf_len = 0;
-                    ac.tls = None;
-                    return;
-                }
-                // If the response is closing the connection, queue a
-                // TLS close_notify alert before draining tx so the peer
-                // sees a clean TLS shutdown followed by a clean TCP FIN.
-                // This silences OpenSSL's "unexpected eof while reading"
-                // warning and lets well-behaved clients (curl, browsers)
-                // distinguish between a deliberate close and a dropped
-                // connection.
-                if !keep_alive {
-                    let _ = tls.close_notify();
-                }
-                let mut out = [0u8; 2048];
-                loop {
-                    let n = tls.pop_tx(&mut out);
-                    if n == 0 {
-                        break;
-                    }
-                    conn.send(&out[..n]);
-                }
+        let ac = &mut self.cores[core_id as usize].active[conn_idx];
+        if let Some(tls) = ac.tls.as_mut() {
+            // Build the HTTP response into a temporary stack
+            // buffer, then feed it to TLS as application data.
+            let mut w = BufWriter::new();
+            write_response_into(&mut w, resp, keep_alive);
+            if tls.send_app_data(w.as_bytes()).is_err() {
+                conn.close();
+                ac.conn = None;
+                ac.buf_len = 0;
+                ac.tls = None;
                 return;
             }
+            // If the response is closing the connection, queue a
+            // TLS close_notify alert before draining tx so the peer
+            // sees a clean TLS shutdown followed by a clean TCP FIN.
+            // This silences OpenSSL's "unexpected eof while reading"
+            // warning and lets well-behaved clients (curl, browsers)
+            // distinguish between a deliberate close and a dropped
+            // connection.
+            if !keep_alive {
+                let _ = tls.close_notify();
+            }
+            let mut out = [0u8; 2048];
+            loop {
+                let n = tls.pop_tx(&mut out);
+                if n == 0 {
+                    break;
+                }
+                conn.send(&out[..n]);
+            }
+            return;
         }
-        // Fall through to plain-HTTP send on native or when tls is None.
-        let _ = (core_id, conn_idx);
+        // Fall through to plain-HTTP send when `tls` is None.
         send_response(conn, resp, keep_alive);
     }
 

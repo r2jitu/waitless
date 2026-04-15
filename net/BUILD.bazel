@@ -223,16 +223,25 @@ rust_library(
         "--check-cfg=cfg(tls_debug)",
         "--check-cfg=cfg(test)",
     ],
+    # The kernel dep is bare-metal-only: the `#[cfg(tls_debug)]`
+    # trace module uses `kernel::serial::puts` on `target_os="none"`
+    # targets and `libc::write` on hosted targets. The rest of
+    # tls_server has no kernel dependency, so the same source
+    # compiles for native POSIX builds too and lets `//uni:uni`
+    # drive the full TLS stack on both paths.
     deps = [
         ":tls",
         ":tls_crypto",
         ":tls_handshake",
         ":tls_record",
-        "//kernel",
+        "@crates//:getrandom",
         "@crates//:hmac",
         "@crates//:p256",
         "@crates//:sha2",
-    ],
+    ] + select({
+        "//bazel/platforms:native": [],
+        "//conditions:default": ["//kernel"],
+    }),
 )
 
 # TLS 1.3 sans-io core: key schedule, HKDF-Expand-Label, transcript,
