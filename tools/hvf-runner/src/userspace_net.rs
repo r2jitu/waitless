@@ -819,6 +819,11 @@ fn poll_worker_iteration(
                             c.src_port, c.guest_port, c.my_seq, c.peer_ack, 0x11, &[]);
                         c.my_seq = c.my_seq.wrapping_add(1);
                         c.state = ConnState::Closed;
+                        // Mirror the guest-initiated FIN path in handle_tcp:
+                        // drop the host fd now so the kernel socket leaves
+                        // CLOSE_WAIT instead of leaking until process exit.
+                        unsafe { libc::close(c.host_fd); }
+                        c.host_fd = -1;
                         inject_frame(frame.as_slice(), &qsnap, &mut io.rx_last);
                         injected = true;
                     } else {
