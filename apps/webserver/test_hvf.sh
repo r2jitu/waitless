@@ -64,26 +64,51 @@ echo "==> Booting webserver via HVF runner (HTTPS on :${VM_PORT})..."
 "$HVF_BIN" "$IMG" -p "tcp:${VM_PORT}:80" >"$VM_LOG" 2>&1 &
 VM_PID=$!
 
-# Poll the TLS handshake until it succeeds (up to 30s).
-# openssl s_client returns 0 if it can connect and complete the handshake.
-echo "==> Waiting for TLS handshake to succeed..."
+# Bounded command runner. macOS lacks GNU `timeout`; use perl (always
+# present) to fork+exec the child under an alarm and escalate TERM→KILL
+# if it runs long. Exit 124 on timeout, otherwise the child's exit code.
+run_timeout() {
+    perl -e '
+        my $t = shift;
+        my $pid = fork // die "fork: $!";
+        if ($pid == 0) { exec { $ARGV[0] } @ARGV or exit 127; }
+        local $SIG{ALRM} = sub {
+            kill TERM => $pid;
+            select undef, undef, undef, 0.5;
+            kill KILL => $pid;
+        };
+        alarm $t;
+        waitpid $pid, 0;
+        alarm 0;
+        exit(($? & 127) ? 124 : ($? >> 8));
+    ' "$@"
+}
+
+# Issue one HTTPS request (bounded). Prints the response, exits 124 if
+# openssl hangs (e.g. the hvf-runner TCP relay is up but the guest hasn't
+# bound port 80 yet, so bytes go into a void and no response flows back).
+https_get() {
+    local path="$1" timeout_s="${2:-5}"
+    printf 'GET %s HTTP/1.1\r\nHost: unikernel.local\r\nConnection: close\r\n\r\n' "$path" | \
+        run_timeout "$timeout_s" "$OPENSSL" s_client -connect "${VM_HOST}:${VM_PORT}" -tls1_3 \
+            -CAfile "$DEV_CERT" -servername unikernel.local -quiet 2>/dev/null
+}
+
+# Poll readiness with real HTTP GETs (up to 30s).  The old probe piped
+# `echo ""` into openssl and grepped the output, but the server (correctly)
+# waits for a complete request line and openssl therefore never exits —
+# wedging the first loop iteration before `sleep 1` is reached.
+echo "==> Waiting for HTTPS server to come up..."
 ready=0
 for _ in $(seq 1 30); do
-    if echo "" | "$OPENSSL" s_client -connect "${VM_HOST}:${VM_PORT}" -tls1_3 \
-            -CAfile "$DEV_CERT" -servername unikernel.local -quiet \
-            2>/dev/null | grep -q "HTTP\|--END-OF-BUFFER--" 2>/dev/null; then
-        ready=1; break
-    fi
-    # Simpler check: openssl exit-code after a handshake-only run.
-    if echo "" | "$OPENSSL" s_client -connect "${VM_HOST}:${VM_PORT}" -tls1_3 \
-            -CAfile "$DEV_CERT" -servername unikernel.local -quiet \
-            </dev/null 2>&1 | grep -q "Cipher is TLS_CHACHA20_POLY1305_SHA256"; then
+    status_line=$(https_get /health 3 | head -1 | tr -d '\r' || true)
+    if [[ "$status_line" == HTTP/1.1\ 200* ]]; then
         ready=1; break
     fi
     sleep 1
 done
 if [[ $ready -eq 0 ]]; then
-    echo "ERROR: TLS server not ready after 30s" >&2
+    echo "ERROR: HTTPS server not ready after 30s" >&2
     cat "$VM_LOG" >&2
     exit 1
 fi
@@ -92,9 +117,7 @@ fi
 check_https() {
     local name="$1" path="$2" expect_status="$3" expect_body="${4:-}"
     local response
-    response=$(printf 'GET %s HTTP/1.1\r\nHost: unikernel.local\r\nConnection: close\r\n\r\n' "$path" | \
-        "$OPENSSL" s_client -connect "${VM_HOST}:${VM_PORT}" -tls1_3 \
-            -CAfile "$DEV_CERT" -servername unikernel.local -quiet 2>/dev/null)
+    response=$(https_get "$path" 10)
     local status_line
     status_line=$(echo "$response" | head -1 | tr -d '\r')
     if [[ "$status_line" == "HTTP/1.1 $expect_status"* ]]; then
