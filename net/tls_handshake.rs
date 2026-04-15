@@ -27,7 +27,7 @@
 //
 // Explicitly out of scope (future work):
 // - signature_algorithms extension parsing / enforcement (we unconditionally
-//   pick Ed25519 since that's what our dev cert uses)
+//   pick ECDSA P-256 + SHA-256 since that's what our dev cert uses)
 // - Pre-shared key / 0-RTT extensions
 // - Session tickets / resumption
 // - Alert record format
@@ -77,8 +77,14 @@ pub mod cipher_suite {
 
 /// SignatureScheme values from RFC 8446 §4.2.3. We only implement one.
 pub mod sig_scheme {
-    /// Ed25519 signatures. Used by our dev cert in CertificateVerify.
-    pub const ED25519: u16 = 0x0807;
+    /// ECDSA over secp256r1 (NIST P-256) with SHA-256 hash.
+    /// Used by our dev cert in CertificateVerify. This is also the
+    /// first scheme in every modern client's preference list (Chrome,
+    /// Firefox, Safari, curl, ...), so interop is essentially free.
+    /// We picked it over ed25519 (0x0807) because Chromium-family
+    /// browsers don't advertise ed25519 for server-auth signatures
+    /// and reject an Ed25519-signed CertVerify with illegal_parameter.
+    pub const ECDSA_SECP256R1_SHA256: u16 = 0x0403;
 }
 
 /// TLS 1.2 legacy_version value used in the outer ClientHello /
@@ -158,11 +164,39 @@ pub struct ClientHello<'a> {
     /// Client random (32 bytes, used as ClientHello.random).
     pub random: &'a [u8; 32],
     /// The client's X25519 public key, from its key_share extension.
-    pub x25519_client_pub: [u8; 32],
+    /// `None` if the client didn't send an X25519 key_share — e.g.
+    /// a PQ-enabled Chromium that sent only an x25519mlkem768 share.
+    /// Callers can still use the rest of the parsed ClientHello for
+    /// diagnostics or (once supported) to issue HelloRetryRequest.
+    pub x25519_client_pub: Option<[u8; 32]>,
     /// Did the client offer TLS 1.3 in supported_versions?
     pub offers_tls13: bool,
     /// Did the client list X25519 in supported_groups?
     pub offers_x25519: bool,
+    /// DEBUG: every (group_id, key_len) tuple observed in the key_share
+    /// extension, in the order sent by the client. Populated by the
+    /// parser so upper layers can log what the client offered — useful
+    /// for diagnosing rejected handshakes from PQ-enabled browsers that
+    /// send only `x25519mlkem768` (group 0x11ec) without a plain
+    /// `x25519` (group 0x001d) share. Up to 8 entries are recorded;
+    /// anything past that is silently dropped (ClientHellos with >8
+    /// key_shares are vanishingly rare).
+    pub observed_key_shares: [(u16, u16); 8],
+    pub observed_key_share_count: u8,
+    /// DEBUG: the first 16 group IDs the client listed in
+    /// `supported_groups`. Lets us tell "client knows X25519 but didn't
+    /// precompute a key for it" (HelloRetryRequest case) from "client
+    /// genuinely doesn't know X25519" (hopeless case).
+    pub observed_supported_groups: [u16; 16],
+    pub observed_supported_group_count: u8,
+    /// DEBUG: every signature scheme the client listed in its
+    /// `signature_algorithms` extension. BoringSSL (Chrome/Arc) rejects
+    /// a server CertVerify whose algorithm isn't in this list with
+    /// `illegal_parameter(47)` — and Chrome's default list has
+    /// historically omitted ed25519 for server auth, which breaks our
+    /// hand-rolled ed25519-signing server.
+    pub observed_sig_algs: [u16; 32],
+    pub observed_sig_alg_count: u8,
 }
 
 impl<'a> ClientHello<'a> {
@@ -221,6 +255,12 @@ impl<'a> ClientHello<'a> {
         let mut offers_tls13 = false;
         let mut offers_x25519 = false;
         let mut x25519_client_pub: Option<[u8; 32]> = None;
+        let mut observed_key_shares = [(0u16, 0u16); 8];
+        let mut observed_key_share_count: u8 = 0;
+        let mut observed_supported_groups = [0u16; 16];
+        let mut observed_supported_group_count: u8 = 0;
+        let mut observed_sig_algs = [0u16; 32];
+        let mut observed_sig_alg_count: u8 = 0;
 
         while !er.is_empty() {
             let ext_type = er.read_u16()?;
@@ -254,6 +294,13 @@ impl<'a> ClientHello<'a> {
                         if g == named_group::X25519 {
                             offers_x25519 = true;
                         }
+                        if (observed_supported_group_count as usize)
+                            < observed_supported_groups.len()
+                        {
+                            observed_supported_groups
+                                [observed_supported_group_count as usize] = g;
+                            observed_supported_group_count += 1;
+                        }
                         j += 2;
                     }
                 }
@@ -266,11 +313,37 @@ impl<'a> ClientHello<'a> {
                     while !kr2.is_empty() {
                         let group = kr2.read_u16()?;
                         let key_exchange = kr2.read_vector_u16()?;
+                        if (observed_key_share_count as usize)
+                            < observed_key_shares.len()
+                        {
+                            observed_key_shares
+                                [observed_key_share_count as usize] =
+                                (group, key_exchange.len() as u16);
+                            observed_key_share_count += 1;
+                        }
                         if group == named_group::X25519 && key_exchange.len() == 32 {
                             let mut pk = [0u8; 32];
                             pk.copy_from_slice(key_exchange);
                             x25519_client_pub = Some(pk);
                         }
+                    }
+                }
+                ext_type::SIGNATURE_ALGORITHMS => {
+                    // signature_algorithms extension body: opaque<2..2^16-2>
+                    // of u16 SignatureScheme values.
+                    let mut sr = Reader::new(ext_data);
+                    let algs = sr.read_vector_u16()?;
+                    if algs.len() % 2 != 0 {
+                        return Err(ParseError::BadExtension);
+                    }
+                    let mut j = 0;
+                    while j < algs.len() {
+                        let a = u16::from_be_bytes([algs[j], algs[j + 1]]);
+                        if (observed_sig_alg_count as usize) < observed_sig_algs.len() {
+                            observed_sig_algs[observed_sig_alg_count as usize] = a;
+                            observed_sig_alg_count += 1;
+                        }
+                        j += 2;
                     }
                 }
                 _ => { /* ignore extensions we don't care about */ }
@@ -280,9 +353,11 @@ impl<'a> ClientHello<'a> {
         if !offers_tls13 {
             return Err(ParseError::Unsupported);
         }
-        let x25519_client_pub = x25519_client_pub.ok_or(ParseError::Unsupported)?;
         // `offers_x25519` is advisory; if the client sent a key_share we
         // accept it regardless of whether they listed it in supported_groups.
+        // The lack of an X25519 key_share is NOT an error here — callers
+        // inspect `x25519_client_pub.is_none()` and can either drop the
+        // handshake or (someday) issue HelloRetryRequest.
 
         Ok(ClientHello {
             legacy_session_id,
@@ -290,6 +365,12 @@ impl<'a> ClientHello<'a> {
             x25519_client_pub,
             offers_tls13,
             offers_x25519,
+            observed_key_shares,
+            observed_key_share_count,
+            observed_supported_groups,
+            observed_supported_group_count,
+            observed_sig_algs,
+            observed_sig_alg_count,
         })
     }
 }
@@ -491,20 +572,22 @@ pub fn sign_content_server_cert_verify(
     out[64 + 33 + 1..].copy_from_slice(transcript_hash);
 }
 
-/// Build a CertificateVerify message body from a pre-computed Ed25519
-/// signature over `sign_content_server_cert_verify(...)`.
+/// Build a CertificateVerify message body from a pre-computed ECDSA
+/// signature over `sign_content_server_cert_verify(...)`. The signature
+/// must be in ASN.1 DER form — `SEQUENCE { INTEGER r, INTEGER s }` —
+/// which is what TLS 1.3 (RFC 8446 §4.2.3) mandates for ECDSA. Length
+/// is variable (~70–72 bytes) because r and s get sign-extended by DER.
 ///
 /// Wire format:
 /// ```text
 /// struct {
-///     SignatureScheme algorithm;      /* u16 */
-///     opaque signature<0..2^16-1>;    /* 64 bytes for Ed25519 */
+///     SignatureScheme algorithm;      /* u16 = 0x0403 for P-256 */
+///     opaque signature<0..2^16-1>;    /* DER-encoded r,s INTEGER pair */
 /// } CertificateVerify;
 /// ```
 ///
 /// Caller is responsible for actually computing the signature (we don't
-/// want this module to depend on `ed25519-dalek`; that's `//net:tls_server`'s
-/// job).
+/// want this module to depend on `p256`; that's `//net:tls_server`'s job).
 pub fn build_certificate_verify(
     signature: &[u8],
     out: &mut [u8],
@@ -513,7 +596,7 @@ pub fn build_certificate_verify(
     if out.len() < total || signature.len() > 0xffff {
         return None;
     }
-    out[0..2].copy_from_slice(&sig_scheme::ED25519.to_be_bytes());
+    out[0..2].copy_from_slice(&sig_scheme::ECDSA_SECP256R1_SHA256.to_be_bytes());
     out[2..4].copy_from_slice(&(signature.len() as u16).to_be_bytes());
     out[4..4 + signature.len()].copy_from_slice(signature);
     Some(total)
@@ -732,7 +815,7 @@ mod tests {
         let parsed = ClientHello::parse(&ch[..q]).expect("parse failed");
         assert!(parsed.offers_tls13);
         assert!(parsed.offers_x25519);
-        assert_eq!(parsed.x25519_client_pub, client_pub);
+        assert_eq!(parsed.x25519_client_pub, Some(client_pub));
         assert_eq!(parsed.legacy_session_id.len(), 0);
         assert_eq!(parsed.random, &[0x11u8; 32]);
     }
@@ -775,20 +858,21 @@ mod tests {
     }
 
     #[test]
-    fn certificate_verify_layout_for_ed25519() {
-        // Fake 64-byte Ed25519 signature (all 0x11).
-        let sig = [0x11u8; 64];
+    fn certificate_verify_layout_for_ecdsa_p256() {
+        // Fake 71-byte DER ECDSA signature (realistic typical length
+        // for P-256: 2 + 2*(1+1+32) ≈ 70-72 bytes).
+        let sig = [0x22u8; 71];
         let mut out = [0u8; 128];
         let n = build_certificate_verify(&sig, &mut out).unwrap();
 
-        // algorithm(2) + sig_len(2) + sig(64) = 68
-        assert_eq!(n, 68);
-        // algorithm = Ed25519 = 0x0807
-        assert_eq!(&out[0..2], &[0x08, 0x07]);
-        // signature length = 64
-        assert_eq!(&out[2..4], &[0x00, 0x40]);
+        // algorithm(2) + sig_len(2) + sig(71) = 75
+        assert_eq!(n, 75);
+        // algorithm = ecdsa_secp256r1_sha256 = 0x0403
+        assert_eq!(&out[0..2], &[0x04, 0x03]);
+        // signature length = 71
+        assert_eq!(&out[2..4], &[0x00, 0x47]);
         // signature bytes
-        assert_eq!(&out[4..68], &sig[..]);
+        assert_eq!(&out[4..75], &sig[..]);
     }
 
     #[test]

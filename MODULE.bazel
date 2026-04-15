@@ -127,6 +127,13 @@ X86_CRYPTO_FEATURES = "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse
         "ghash",
         "poly1305",
         "polyval",
+        # p256 + its big-int transitive deps also do `u128` math that
+        # trips the soft-float legalization bug on x86_64-unknown-none.
+        # Same fix as the AEADs above.
+        "p256",
+        "primeorder",
+        "elliptic-curve",
+        "crypto-bigint",
     )
 ]
 

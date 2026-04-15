@@ -2,13 +2,13 @@
 
 **DO NOT USE IN PRODUCTION.**
 
-Pre-generated self-signed Ed25519 certificate + private key for local
-development and integration testing of the unikernel TLS / QUIC server.
+Pre-generated self-signed ECDSA P-256 certificate + private key for
+local development and integration testing of the unikernel TLS server.
 
 Files:
 
-- `dev_cert.der` / `dev_cert.pem` — X.509 v3 self-signed CA certificate
-- `dev_key.der` / `dev_key.pem`  — PKCS#8 Ed25519 private key
+- `dev_cert.der` / `dev_cert.pem` — X.509 v3 self-signed certificate
+- `dev_key.der` / `dev_key.pem`  — PKCS#8 ECDSA P-256 private key
 - `regen.sh`                     — regeneration script
 
 The `.der` files are what the unikernel server loads via `include_bytes!`.
@@ -18,9 +18,15 @@ the host.
 
 ## Details
 
-- Signature algorithm: **Ed25519** (no per-handshake randomness dance
-  like ECDSA, compact 32-byte keys, fastest pure-Rust verification in
-  the rustls-rustcrypto provider)
+- Signature algorithm: **ECDSA with SHA-256 on NIST P-256** (TLS 1.3
+  `sig_scheme 0x0403 = ecdsa_secp256r1_sha256`). We originally used
+  Ed25519 (0x0807) — simpler and faster — but Chromium-family
+  browsers (Chrome, Arc, Edge, Brave, ...) don't advertise ed25519 in
+  their TLS 1.3 `signature_algorithms` extension for server auth, so
+  they reject our CertVerify with `illegal_parameter(47)` and show
+  `ERR_SSL_PROTOCOL_ERROR`. macOS's bundled LibreSSL also refuses
+  Ed25519 signature verification. ECDSA P-256 is the first scheme in
+  every modern client's preference list and works everywhere.
 - Subject: `CN=unikernel.local, O=UniKernel Dev, OU=Development Only`
 - SAN: `DNS:unikernel.local, DNS:localhost, IP:127.0.0.1, IP:10.0.2.15`
   covers the hostnames used by `run-local.sh` HVF / QEMU user-mode
@@ -34,10 +40,14 @@ the host.
 Run `./regen.sh` from this directory, OR manually:
 
 ```bash
-openssl genpkey -algorithm ED25519 -out dev_key.pem
+openssl genpkey -algorithm EC \
+    -pkeyopt ec_paramgen_curve:P-256 \
+    -pkeyopt ec_param_enc:named_curve \
+    -out dev_key.pem
 openssl req -new -x509 -key dev_key.pem -out dev_cert.pem -days 3650 \
     -subj "/CN=unikernel.local/O=UniKernel Dev/OU=Development Only" \
-    -addext "subjectAltName=DNS:unikernel.local,DNS:localhost,IP:127.0.0.1,IP:10.0.2.15"
+    -addext "subjectAltName=DNS:unikernel.local,DNS:localhost,IP:127.0.0.1,IP:10.0.2.15" \
+    -sha256
 openssl pkey  -in dev_key.pem  -outform DER -out dev_key.der
 openssl x509  -in dev_cert.pem -outform DER -out dev_cert.der
 ```

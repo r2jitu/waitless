@@ -1,6 +1,6 @@
 package(default_visibility = ["//visibility:public"])
 
-# Pre-generated self-signed Ed25519 dev cert. Loaded into unikernel
+# Pre-generated self-signed ECDSA P-256 dev cert. Loaded into unikernel
 # binaries via include_bytes!() — see README.md for the regeneration
 # story and the deferred-work entry in ROADMAP.md for the production
 # cert + RNG path.

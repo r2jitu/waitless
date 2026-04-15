@@ -10,7 +10,7 @@
 //   - TLS 1.3 only (no fallback)
 //   - TLS_CHACHA20_POLY1305_SHA256 only
 //   - X25519 key exchange only
-//   - Ed25519 server certificate only
+//   - ECDSA P-256 + SHA-256 server certificate only
 //   - No client authentication
 //   - No session resumption / tickets
 //   - No 0-RTT
@@ -29,17 +29,17 @@
 
 #![no_std]
 
-extern crate ed25519_dalek;
 extern crate hmac;
 extern crate kernel;
 extern crate net_tls as tls;
 extern crate net_tls_crypto as tls_crypto;
 extern crate net_tls_handshake as handshake;
 extern crate net_tls_record as record;
+extern crate p256;
 extern crate sha2;
 
-use ed25519_dalek::{Signer, SigningKey};
 use hmac::{Hmac, Mac};
+use p256::ecdsa::{signature::Signer, Signature as EcdsaSignature, SigningKey};
 use sha2::Sha256;
 
 use handshake::{
@@ -69,7 +69,7 @@ pub const RX_BUF_LEN: usize = 4 * 1024;
 
 /// Max raw TLS bytes we emit during the server flight
 /// (ServerHello + CCS + encrypted {EncExt, Certificate, CertVerify,
-/// Finished}). A typical self-signed Ed25519 dev cert is ~500 bytes
+/// Finished}). A typical self-signed ECDSA P-256 dev cert is ~550 bytes
 /// so the flight fits in ~1.5 KB; 4 KB is generous room.
 pub const TX_BUF_LEN: usize = 4 * 1024;
 
@@ -87,22 +87,22 @@ pub struct TlsServerConfig {
     /// parse it, because the client's job is to verify it (or not,
     /// in the `curl -k` case).
     pub cert_der: &'static [u8],
-    /// The Ed25519 private key that corresponds to the cert's public
-    /// key. 32-byte raw seed (NOT a PKCS#8 blob — the caller extracts
-    /// the seed bytes from the `dev_key.der` file).
+    /// The ECDSA P-256 private scalar that corresponds to the cert's
+    /// public key. 32-byte raw scalar (NOT a PKCS#8 blob — the caller
+    /// extracts the bytes from the `dev_key.der` file via
+    /// `extract_p256_d_from_pkcs8`).
     pub signing_seed: [u8; 32],
 }
 
 impl TlsServerConfig {
     /// Load from our checked-in dev cert. The dev key DER from
-    /// `openssl genpkey -algorithm ED25519 -outform DER` is a PKCS#8
-    /// wrapper of the 32-byte raw seed. The exact PKCS#8 layout for
-    /// Ed25519 is well-defined (RFC 8410) and the seed lives at a
-    /// fixed offset; we extract it here.
+    /// `openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256`
+    /// is a PKCS#8 `PrivateKeyInfo` wrapping an RFC 5915 `ECPrivateKey`
+    /// SEQUENCE, which contains the 32-byte private scalar.
     ///
     /// Returns `None` if the PKCS#8 blob isn't the expected shape.
     pub fn from_dev_cert(cert_der: &'static [u8], pkcs8_key: &[u8]) -> Option<Self> {
-        let seed = extract_ed25519_seed_from_pkcs8(pkcs8_key)?;
+        let seed = extract_p256_d_from_pkcs8(pkcs8_key)?;
         Some(TlsServerConfig {
             cert_der,
             signing_seed: seed,
@@ -110,57 +110,62 @@ impl TlsServerConfig {
     }
 }
 
-/// Extract the 32-byte Ed25519 private seed from a minimal PKCS#8
-/// `PrivateKeyInfo` DER blob produced by `openssl genpkey -algorithm
-/// ED25519`. We look for the octet-string inside the octet-string
-/// that wraps the raw key.
+/// Extract the 32-byte private scalar `d` from a PKCS#8 `PrivateKeyInfo`
+/// DER encoding of an ECDSA P-256 key (as produced by `openssl genpkey
+/// -algorithm EC -pkeyopt ec_paramgen_curve:P-256`).
 ///
-/// The format (RFC 5958 / RFC 8410) is:
+/// The layout is:
 /// ```text
-///   30 2e         SEQUENCE (46 bytes)
-///     02 01 00    INTEGER 0  (version)
-///     30 05       SEQUENCE (5 bytes)
-///       06 03 2b 65 70    OID 1.3.101.112 (Ed25519)
-///     04 22       OCTET STRING (34 bytes)
-///       04 20     OCTET STRING (32 bytes)
-///         <seed>  -- 32 bytes
+///   SEQUENCE
+///     INTEGER 0                              (PKCS#8 version)
+///     SEQUENCE                               (AlgorithmIdentifier)
+///       OID 1.2.840.10045.2.1                (id-ecPublicKey)
+///       OID 1.2.840.10045.3.1.7              (prime256v1 = secp256r1)
+///     OCTET STRING containing
+///       SEQUENCE                             (ECPrivateKey, RFC 5915)
+///         INTEGER 1                          (version)
+///         OCTET STRING <d>                   (32-byte private scalar)
+///         [0] explicit parameters (optional)
+///         [1] explicit publicKey  (optional)
 /// ```
 ///
-/// The nested OCTET STRING structure is because the PKCS#8 wrapper
-/// wraps the algorithm-specific encoding, which for Ed25519 is itself
-/// an OCTET STRING around the seed (RFC 8410 §7).
-fn extract_ed25519_seed_from_pkcs8(blob: &[u8]) -> Option<[u8; 32]> {
-    // Minimum plausible size.
-    if blob.len() < 48 {
+/// We check that the prime256v1 OID appears in the blob, then scan for
+/// `02 01 01 04 20` — the ECPrivateKey `version = 1` INTEGER followed
+/// by the `OCTET STRING length = 32` header. The 32 bytes right after
+/// that header are the private scalar. Deliberately narrow-minded: we
+/// only parse our own checked-in dev key, not arbitrary PKCS#8.
+fn extract_p256_d_from_pkcs8(blob: &[u8]) -> Option<[u8; 32]> {
+    // Sanity-check the prime256v1 OID appears somewhere in the header.
+    // Bytes: 06 08 2a 86 48 ce 3d 03 01 07
+    //        ^  ^-- length
+    //        OID tag
+    const P256_OID: &[u8] = &[0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
+    if blob.len() < P256_OID.len() + 5 + 32 {
         return None;
     }
-    // We just scan for the trailing `04 20 <32 bytes>` and check
-    // the preceding bytes look like Ed25519. This is fragile for
-    // arbitrary inputs but robust for a fixed, generated-once file.
-    if blob.len() < 34 {
-        return None;
-    }
-    let seed_tag = &blob[blob.len() - 34..blob.len() - 32];
-    if seed_tag != [0x04, 0x20] {
-        return None;
-    }
-    // Check the Ed25519 OID appears somewhere in the prefix.
-    const ED25519_OID: &[u8] = &[0x06, 0x03, 0x2b, 0x65, 0x70];
     let mut found_oid = false;
-    if blob.len() >= ED25519_OID.len() + 34 {
-        for start in 0..=blob.len() - ED25519_OID.len() - 34 {
-            if &blob[start..start + ED25519_OID.len()] == ED25519_OID {
-                found_oid = true;
-                break;
-            }
+    for start in 0..=blob.len() - P256_OID.len() {
+        if &blob[start..start + P256_OID.len()] == P256_OID {
+            found_oid = true;
+            break;
         }
     }
     if !found_oid {
         return None;
     }
-    let mut seed = [0u8; 32];
-    seed.copy_from_slice(&blob[blob.len() - 32..]);
-    Some(seed)
+
+    // Scan for `02 01 01 04 20` (ECPrivateKey version=1 +
+    // 32-byte OCTET STRING header) and take the 32 bytes after.
+    const D_HEADER: &[u8] = &[0x02, 0x01, 0x01, 0x04, 0x20];
+    for start in 0..=blob.len() - D_HEADER.len() - 32 {
+        if &blob[start..start + D_HEADER.len()] == D_HEADER {
+            let d_offset = start + D_HEADER.len();
+            let mut d = [0u8; 32];
+            d.copy_from_slice(&blob[d_offset..d_offset + 32]);
+            return Some(d);
+        }
+    }
+    None
 }
 
 // ============================================================================
@@ -278,6 +283,310 @@ pub struct TlsServer {
     // compute server Finished and then derive the master secret.
     server_hs_secret: Option<[u8; HASH_LEN]>,
     client_hs_secret: Option<[u8; HASH_LEN]>,
+}
+
+// ============================================================================
+// Compile-time-gated handshake tracing
+// ============================================================================
+//
+// Enable with `--cfg=tls_debug` in rustc_flags on //net:tls_server when
+// you need to diagnose a broken handshake. When disabled (the default),
+// every function in `trace` is a no-op stub with no arguments read —
+// the compiler optimizes them to nothing, so there's zero runtime cost
+// and zero code-size overhead in the release binary.
+//
+// The corresponding debug fields in `handshake::ClientHello` (e.g.
+// `observed_key_shares`) are populated unconditionally by the parser —
+// they're tiny (<200 bytes of stack data per ClientHello) and the cost
+// is negligible given the parser only runs once per connection, so
+// it's not worth the conditional-compilation complexity to gate them.
+mod trace {
+    #![allow(unused_variables, dead_code)]
+
+    use super::{handshake, State, TlsError};
+    #[cfg(tls_debug)]
+    use kernel::serial;
+
+    #[cfg(tls_debug)]
+    pub fn client_hello(ch: &handshake::ClientHello<'_>) {
+        serial::puts(b"[tls-debug] ClientHello key_shares: ");
+        if ch.observed_key_share_count == 0 {
+            serial::puts(b"(none)");
+        } else {
+            for i in 0..ch.observed_key_share_count as usize {
+                let (group, key_len) = ch.observed_key_shares[i];
+                if i > 0 {
+                    serial::puts(b", ");
+                }
+                serial::puts(b"group=0x");
+                put_u16_hex(group);
+                serial::puts(b"(");
+                put_group_name(group);
+                serial::puts(b") len=");
+                put_u16_dec(key_len);
+            }
+        }
+        serial::puts(b"\n[tls-debug] ClientHello supported_groups: ");
+        if ch.observed_supported_group_count == 0 {
+            serial::puts(b"(none)");
+        } else {
+            for i in 0..ch.observed_supported_group_count as usize {
+                let g = ch.observed_supported_groups[i];
+                if i > 0 {
+                    serial::puts(b", ");
+                }
+                serial::puts(b"0x");
+                put_u16_hex(g);
+                serial::puts(b"(");
+                put_group_name(g);
+                serial::puts(b")");
+            }
+        }
+        serial::puts(b"\n[tls-debug] ClientHello signature_algorithms: ");
+        if ch.observed_sig_alg_count == 0 {
+            serial::puts(b"(none)");
+        } else {
+            let mut offers_p256 = false;
+            for i in 0..ch.observed_sig_alg_count as usize {
+                let a = ch.observed_sig_algs[i];
+                if a == 0x0403 {
+                    offers_p256 = true;
+                }
+                if i > 0 {
+                    serial::puts(b", ");
+                }
+                serial::puts(b"0x");
+                put_u16_hex(a);
+                serial::puts(b"(");
+                put_sig_alg_name(a);
+                serial::puts(b")");
+            }
+            serial::puts(b"\n[tls-debug] offers_ecdsa_p256=");
+            serial::puts(if offers_p256 { b"true" } else { b"false" });
+        }
+        serial::puts(b"\n[tls-debug] has_x25519_share=");
+        serial::puts(if ch.x25519_client_pub.is_some() {
+            b"true"
+        } else {
+            b"false"
+        });
+        serial::puts(b" offers_x25519=");
+        serial::puts(if ch.offers_x25519 { b"true" } else { b"false" });
+        serial::puts(b"\n");
+    }
+    #[cfg(not(tls_debug))]
+    pub fn client_hello(_ch: &handshake::ClientHello<'_>) {}
+
+    #[cfg(tls_debug)]
+    pub fn step(msg: &[u8]) {
+        serial::puts(msg);
+    }
+    #[cfg(not(tls_debug))]
+    pub fn step(_msg: &[u8]) {}
+
+    #[cfg(tls_debug)]
+    pub fn do_client_finished_entry(rx_len: usize, first_byte: Option<u8>) {
+        serial::puts(b"[tls] do_client_finished entered, rx_len=");
+        put_u16_dec(rx_len as u16);
+        serial::puts(b"\n");
+        if let Some(b) = first_byte {
+            serial::puts(b"[tls]   first byte (content_type) = 0x");
+            put_u16_hex(b as u16);
+            serial::puts(b"\n");
+        }
+    }
+    #[cfg(not(tls_debug))]
+    pub fn do_client_finished_entry(_rx_len: usize, _first_byte: Option<u8>) {}
+
+    #[cfg(tls_debug)]
+    pub fn waiting_for_bytes(have: usize, need: usize) {
+        serial::puts(b"[tls]   waiting for more bytes (have ");
+        put_u16_dec(have as u16);
+        serial::puts(b", need ");
+        put_u16_dec(need as u16);
+        serial::puts(b")\n");
+    }
+    #[cfg(not(tls_debug))]
+    pub fn waiting_for_bytes(_have: usize, _need: usize) {}
+
+    #[cfg(tls_debug)]
+    pub fn record_header(content_type: u8, total_len: usize) {
+        serial::puts(b"[tls]   full record arrived, content_type=0x");
+        put_u16_hex(content_type as u16);
+        serial::puts(b" len=");
+        put_u16_dec(total_len as u16);
+        serial::puts(b"\n");
+    }
+    #[cfg(not(tls_debug))]
+    pub fn record_header(_content_type: u8, _total_len: usize) {}
+
+    #[cfg(tls_debug)]
+    pub fn decrypted_record(inner_type: u8, pt_len: usize) {
+        serial::puts(b"[tls]   decrypted, inner_type=0x");
+        put_u16_hex(inner_type as u16);
+        serial::puts(b" pt_len=");
+        put_u16_dec(pt_len as u16);
+        serial::puts(b"\n");
+    }
+    #[cfg(not(tls_debug))]
+    pub fn decrypted_record(_inner_type: u8, _pt_len: usize) {}
+
+    #[cfg(tls_debug)]
+    pub fn alert_received(level: u8, desc: u8) {
+        serial::puts(b"[tls]   client sent ALERT level=");
+        put_u16_dec(level as u16);
+        serial::puts(b" desc=");
+        put_u16_dec(desc as u16);
+        serial::puts(b" (");
+        serial::puts(alert_name(desc));
+        serial::puts(b")\n");
+    }
+    #[cfg(not(tls_debug))]
+    pub fn alert_received(_level: u8, _desc: u8) {}
+
+    #[cfg(tls_debug)]
+    pub fn error(state: State, err: &TlsError) {
+        serial::puts(b"[tls] ERROR in state=");
+        serial::puts(state_name(state));
+        serial::puts(b" err=");
+        serial::puts(err_name(err));
+        serial::puts(b"\n");
+    }
+    #[cfg(not(tls_debug))]
+    pub fn error(_state: State, _err: &TlsError) {}
+
+    // ── Internal formatting helpers (compiled only with tls_debug) ──────
+    #[cfg(tls_debug)]
+    fn put_u16_hex(v: u16) {
+        let hex = b"0123456789abcdef";
+        let buf = [
+            hex[((v >> 12) & 0xf) as usize],
+            hex[((v >> 8) & 0xf) as usize],
+            hex[((v >> 4) & 0xf) as usize],
+            hex[(v & 0xf) as usize],
+        ];
+        serial::puts(&buf);
+    }
+
+    #[cfg(tls_debug)]
+    fn put_u16_dec(mut v: u16) {
+        if v == 0 {
+            serial::puts(b"0");
+            return;
+        }
+        let mut buf = [0u8; 6];
+        let mut n = 0;
+        while v > 0 {
+            buf[n] = b'0' + (v % 10) as u8;
+            v /= 10;
+            n += 1;
+        }
+        let mut out = [0u8; 6];
+        for i in 0..n {
+            out[i] = buf[n - 1 - i];
+        }
+        serial::puts(&out[..n]);
+    }
+
+    #[cfg(tls_debug)]
+    fn put_group_name(g: u16) {
+        let name: &[u8] = match g {
+            0x0017 => b"secp256r1",
+            0x0018 => b"secp384r1",
+            0x0019 => b"secp521r1",
+            0x001d => b"x25519",
+            0x001e => b"x448",
+            0x0100 => b"ffdhe2048",
+            0x0101 => b"ffdhe3072",
+            0x11ec => b"x25519mlkem768",
+            0x6399 => b"x25519kyber768draft00",
+            _ => b"?",
+        };
+        serial::puts(name);
+    }
+
+    #[cfg(tls_debug)]
+    fn put_sig_alg_name(a: u16) {
+        let name: &[u8] = match a {
+            0x0201 => b"rsa_pkcs1_sha1",
+            0x0203 => b"ecdsa_sha1",
+            0x0401 => b"rsa_pkcs1_sha256",
+            0x0403 => b"ecdsa_secp256r1_sha256",
+            0x0501 => b"rsa_pkcs1_sha384",
+            0x0503 => b"ecdsa_secp384r1_sha384",
+            0x0601 => b"rsa_pkcs1_sha512",
+            0x0603 => b"ecdsa_secp521r1_sha512",
+            0x0804 => b"rsa_pss_rsae_sha256",
+            0x0805 => b"rsa_pss_rsae_sha384",
+            0x0806 => b"rsa_pss_rsae_sha512",
+            0x0807 => b"ed25519",
+            0x0808 => b"ed448",
+            0x0809 => b"rsa_pss_pss_sha256",
+            0x080a => b"rsa_pss_pss_sha384",
+            0x080b => b"rsa_pss_pss_sha512",
+            _ => b"?",
+        };
+        serial::puts(name);
+    }
+
+    #[cfg(tls_debug)]
+    fn state_name(s: State) -> &'static [u8] {
+        match s {
+            State::WaitClientHello => b"WaitClientHello",
+            State::WaitClientFinished => b"WaitClientFinished",
+            State::Established => b"Established",
+            State::Closed => b"Closed",
+            State::Failed => b"Failed",
+        }
+    }
+
+    #[cfg(tls_debug)]
+    fn err_name(e: &TlsError) -> &'static [u8] {
+        match e {
+            TlsError::ParseError(_) => b"ParseError",
+            TlsError::RecordError(_) => b"RecordError",
+            TlsError::UnsupportedClient => b"UnsupportedClient",
+            TlsError::AeadFailed => b"AeadFailed",
+            TlsError::TxBufTooSmall => b"TxBufTooSmall",
+            TlsError::BadClientFinished => b"BadClientFinished",
+            TlsError::UnexpectedRecord => b"UnexpectedRecord",
+            TlsError::Internal => b"Internal",
+        }
+    }
+
+    #[cfg(tls_debug)]
+    fn alert_name(desc: u8) -> &'static [u8] {
+        match desc {
+            0 => b"close_notify",
+            10 => b"unexpected_message",
+            20 => b"bad_record_mac",
+            22 => b"record_overflow",
+            40 => b"handshake_failure",
+            42 => b"bad_certificate",
+            43 => b"unsupported_certificate",
+            44 => b"certificate_revoked",
+            45 => b"certificate_expired",
+            46 => b"certificate_unknown",
+            47 => b"illegal_parameter",
+            48 => b"unknown_ca",
+            49 => b"access_denied",
+            50 => b"decode_error",
+            51 => b"decrypt_error",
+            70 => b"protocol_version",
+            71 => b"insufficient_security",
+            80 => b"internal_error",
+            86 => b"inappropriate_fallback",
+            90 => b"user_canceled",
+            109 => b"missing_extension",
+            110 => b"unsupported_extension",
+            112 => b"unrecognized_name",
+            113 => b"bad_certificate_status_response",
+            115 => b"unknown_psk_identity",
+            116 => b"certificate_required",
+            120 => b"no_application_protocol",
+            _ => b"?",
+        }
+    }
 }
 
 impl TlsServer {
@@ -399,11 +708,15 @@ impl TlsServer {
             let before_rx = self.rx_len;
             let before_pt = self.pt_len;
             let before_tx = self.tx_len;
-            match self.state {
-                State::WaitClientHello => self.do_client_hello(config)?,
-                State::WaitClientFinished => self.do_client_finished()?,
-                State::Established => self.do_app_data()?,
+            let step_result: Result<(), TlsError> = match self.state {
+                State::WaitClientHello => self.do_client_hello(config),
+                State::WaitClientFinished => self.do_client_finished(),
+                State::Established => self.do_app_data(),
                 State::Closed | State::Failed => return Ok(self.state),
+            };
+            if let Err(e) = step_result {
+                trace::error(before_state, &e);
+                return Err(e);
             }
             let progressed = self.state != before_state
                 || self.rx_len != before_rx
@@ -472,11 +785,14 @@ impl TlsServer {
         // borrow into `self.rx_buf` and continue.
         let (client_x25519_pub, session_id_echo, sid_len) = {
             let ch = ClientHello::parse(hs_body).map_err(|_| TlsError::UnsupportedClient)?;
+            trace::client_hello(&ch);
             let mut sid = [0u8; 32];
             let sid_len = ch.legacy_session_id.len();
             sid[..sid_len].copy_from_slice(ch.legacy_session_id);
-            (ch.x25519_client_pub, sid, sid_len)
+            let pub_key = ch.x25519_client_pub.ok_or(TlsError::UnsupportedClient)?;
+            (pub_key, sid, sid_len)
         };
+        trace::step(b"[tls] ClientHello parsed\n");
 
         // Update transcript with the full handshake message (body is
         // still borrowed into self.rx_buf; that's fine — transcript
@@ -516,6 +832,7 @@ impl TlsServer {
             &mut self.tx_buf[self.tx_len..],
         )?;
         self.tx_len += sh_rec_len;
+        trace::step(b"[tls] ServerHello emitted\n");
 
         // Update transcript with ServerHello.
         self.transcript.update(&sh_msg[..sh_msg_len]);
@@ -561,6 +878,7 @@ impl TlsServer {
         .ok_or(TlsError::Internal)?;
         self.transcript.update(&ee_msg[..ee_msg_len]);
         self.seal_handshake_record(&mut server_hs_tk, &ee_msg[..ee_msg_len])?;
+        trace::step(b"[tls] EncryptedExtensions sealed\n");
 
         // Certificate
         // Build into a stack buffer; 2 KB handles our 500-ish-byte dev cert.
@@ -576,18 +894,28 @@ impl TlsServer {
         .ok_or(TlsError::Internal)?;
         self.transcript.update(&cert_msg[..cert_msg_len]);
         self.seal_handshake_record(&mut server_hs_tk, &cert_msg[..cert_msg_len])?;
+        trace::step(b"[tls] Certificate sealed\n");
 
         // CertificateVerify: sign the transcript hash through Certificate.
+        // ECDSA P-256 + SHA-256 per TLS 1.3 sig_scheme::ECDSA_SECP256R1_SHA256.
+        // `SigningKey::sign` pre-hashes the message with SHA-256 (the
+        // signature::Signer impl for p256::ecdsa::SigningKey) and uses
+        // RFC 6979 deterministic `k` so we don't need an RNG here.
+        // The returned Signature is then DER-encoded into the
+        // `SEQUENCE { INTEGER r, INTEGER s }` shape TLS 1.3 requires
+        // on the wire.
         let transcript_hash = self.transcript.snapshot();
         let mut sign_content = [0u8; 130];
         sign_content_server_cert_verify(&transcript_hash, &mut sign_content);
-        let signing_key = SigningKey::from_bytes(&config.signing_seed);
-        let signature = signing_key.sign(&sign_content);
-        let signature_bytes = signature.to_bytes();
+        let signing_key = SigningKey::from_slice(&config.signing_seed)
+            .map_err(|_| TlsError::Internal)?;
+        let signature: EcdsaSignature = signing_key.sign(&sign_content);
+        let der_sig = signature.to_der();
+        let signature_bytes: &[u8] = der_sig.as_bytes();
 
         let mut cv_body = [0u8; 128];
         let cv_body_len =
-            build_certificate_verify(&signature_bytes, &mut cv_body).ok_or(TlsError::Internal)?;
+            build_certificate_verify(signature_bytes, &mut cv_body).ok_or(TlsError::Internal)?;
         let mut cv_msg = [0u8; 150];
         let cv_msg_len = encode_handshake(
             msg_type::CERTIFICATE_VERIFY,
@@ -597,6 +925,7 @@ impl TlsServer {
         .ok_or(TlsError::Internal)?;
         self.transcript.update(&cv_msg[..cv_msg_len]);
         self.seal_handshake_record(&mut server_hs_tk, &cv_msg[..cv_msg_len])?;
+        trace::step(b"[tls] CertificateVerify sealed\n");
 
         // Server Finished
         // verify_data = HMAC(finished_key, Transcript-Hash(CH ... CertVerify))
@@ -615,6 +944,7 @@ impl TlsServer {
         .ok_or(TlsError::Internal)?;
         self.transcript.update(&sf_msg[..sf_msg_len]);
         self.seal_handshake_record(&mut server_hs_tk, &sf_msg[..sf_msg_len])?;
+        trace::step(b"[tls] ServerFinished sealed, entering WaitClientFinished\n");
 
         // Store the updated server handshake traffic key (its seq
         // counter has advanced across the 4 sealed records).
@@ -649,6 +979,10 @@ impl TlsServer {
     /// encrypted record under the client handshake traffic key and
     /// expects it to contain a Finished message.
     fn do_client_finished(&mut self) -> Result<(), TlsError> {
+        trace::do_client_finished_entry(
+            self.rx_len,
+            if self.rx_len >= 1 { Some(self.rx_buf[0]) } else { None },
+        );
         // Skip any middlebox-compat ChangeCipherSpec the client sends
         // (plaintext record with content_type 20, 1-byte body = 0x01).
         loop {
@@ -667,6 +1001,7 @@ impl TlsServer {
                     Err(e) => return Err(e.into()),
                 };
             self.drain_rx(consumed);
+            trace::step(b"[tls]   skipped ChangeCipherSpec\n");
         }
 
         // Need a full encrypted record.
@@ -676,8 +1011,10 @@ impl TlsServer {
         let record_len_field = u16::from_be_bytes([self.rx_buf[3], self.rx_buf[4]]) as usize;
         let total = record::HEADER_LEN + record_len_field;
         if self.rx_len < total {
+            trace::waiting_for_bytes(self.rx_len, total);
             return Ok(());
         }
+        trace::record_header(self.rx_buf[0], total);
 
         // Decrypt in place under the client handshake traffic key.
         let tk = self
@@ -685,6 +1022,10 @@ impl TlsServer {
             .as_mut()
             .ok_or(TlsError::Internal)?;
         let (inner_type, pt, consumed) = record_open(tk, &mut self.rx_buf[..total])?;
+        trace::decrypted_record(inner_type, pt.len());
+        if inner_type == content_type::ALERT && pt.len() >= 2 {
+            trace::alert_received(pt[0], pt[1]);
+        }
         if inner_type != content_type::HANDSHAKE {
             return Err(TlsError::UnexpectedRecord);
         }
@@ -715,6 +1056,7 @@ impl TlsServer {
         let expected_verify = hmac_sha256(&client_finished_key, &self.transcript.snapshot());
 
         if !ct_eq_32(client_verify, &expected_verify) {
+            trace::step(b"[tls]   BadClientFinished: verify_data mismatch\n");
             return Err(TlsError::BadClientFinished);
         }
 
@@ -724,6 +1066,7 @@ impl TlsServer {
         self.drain_rx(consumed);
 
         self.state = State::Established;
+        trace::step(b"[tls] Client Finished verified -> Established\n");
         Ok(())
     }
 
@@ -839,24 +1182,32 @@ mod tests {
     }
 
     #[test]
-    fn extract_ed25519_seed_matches_known_shape() {
-        // Hand-assembled PKCS#8 matching the openssl genpkey -algorithm
-        // ED25519 -outform DER output:
-        //   30 2e 02 01 00 30 05 06 03 2b 65 70 04 22 04 20 <32 bytes>
-        let mut blob = [0u8; 48];
-        blob[0..14].copy_from_slice(&[
-            0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22,
+    fn extract_p256_d_matches_known_shape() {
+        // Hand-assembled PKCS#8 matching the openssl genpkey -algorithm EC
+        // -pkeyopt ec_paramgen_curve:P-256 -outform DER output, stripped
+        // down to just the parts our extractor checks for:
+        //   * the prime256v1 OID (06 08 2a 86 48 ce 3d 03 01 07) somewhere
+        //     in the AlgorithmIdentifier
+        //   * the ECPrivateKey `version=1` INTEGER followed by a 32-byte
+        //     OCTET STRING containing the private scalar (02 01 01 04 20
+        //     <32 bytes>)
+        let mut blob = [0u8; 64];
+        // id-ecPublicKey + prime256v1 OIDs (just the prime256v1 OID is
+        // required by our extractor; id-ecPublicKey is a real-blob detail).
+        blob[0..10].copy_from_slice(&[
+            0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07,
         ]);
-        blob[14] = 0x04;
-        blob[15] = 0x20;
-        for (i, slot) in blob[16..48].iter_mut().enumerate() {
+        // ECPrivateKey version=1 + OCTET STRING length=32 header.
+        blob[10..15].copy_from_slice(&[0x02, 0x01, 0x01, 0x04, 0x20]);
+        // Scalar: 32 bytes of 0, 1, 2, ... 31.
+        for (i, slot) in blob[15..47].iter_mut().enumerate() {
             *slot = i as u8;
         }
-        let seed = extract_ed25519_seed_from_pkcs8(&blob).expect("parse");
+        let d = extract_p256_d_from_pkcs8(&blob).expect("parse");
         let mut expected = [0u8; 32];
         for (i, slot) in expected.iter_mut().enumerate() {
             *slot = i as u8;
         }
-        assert_eq!(seed, expected);
+        assert_eq!(d, expected);
     }
 }

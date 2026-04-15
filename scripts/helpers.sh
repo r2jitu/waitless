@@ -130,30 +130,36 @@ check_http() {
 }
 
 # ── HTTPS helpers ────────────────────────────────────────────────────────────
-# The hand-rolled TLS 1.3 server ships with an Ed25519 dev cert. macOS's
-# system LibreSSL 3.3.6 can't verify Ed25519, so we require a real
-# OpenSSL 3.x (typically Homebrew). All HTTPS helpers below assume the
-# caller has set:
-#   OPENSSL     — path to openssl binary (set by find_openssl_3x)
+# The hand-rolled TLS 1.3 server uses an ECDSA P-256 dev cert +
+# TLS_CHACHA20_POLY1305_SHA256, both of which every TLS 1.3 client
+# supports — including macOS's bundled LibreSSL 3.x. All HTTPS helpers
+# below assume the caller has set:
+#   OPENSSL     — path to openssl binary (set by find_openssl)
 #   VM_HOST     — default 127.0.0.1
 #   VM_PORT     — port the server is listening on
 #   DEV_CERT    — path to dev_cert.pem (for `-CAfile`)
 #   VM_SNI      — SNI / Host: header (default unikernel.local)
 
-# Find a usable OpenSSL 3.x binary. Sets OPENSSL on success and returns 0;
-# returns 1 if only LibreSSL / older OpenSSL is available (caller should
-# typically `exit 0` with a SKIP message in that case).
-find_openssl_3x() {
+# Find any TLS-1.3-capable openssl binary. We prefer Homebrew OpenSSL 3
+# when present because its `-groups` / `-sigalgs` flags are handy for
+# debugging handshakes, but macOS system LibreSSL also works. Sets
+# OPENSSL on success and returns 0; returns 1 if nothing is found
+# (caller can `exit 0` with a SKIP message in that case).
+find_openssl() {
     local candidate ver
     for candidate in \
             /opt/homebrew/bin/openssl \
             /opt/homebrew/opt/openssl@3/bin/openssl \
             /usr/local/bin/openssl \
             /usr/local/opt/openssl@3/bin/openssl \
+            /usr/bin/openssl \
             openssl; do
         if command -v "$candidate" &>/dev/null; then
             ver="$("$candidate" version 2>&1 || true)"
-            if [[ "$ver" == OpenSSL\ 3.* ]]; then
+            # Accept OpenSSL 1.1.1+ / OpenSSL 3.x / LibreSSL 3.x.
+            if [[ "$ver" == OpenSSL\ 3.* ]] \
+                    || [[ "$ver" == OpenSSL\ 1.1.1* ]] \
+                    || [[ "$ver" == LibreSSL\ 3.* ]]; then
                 OPENSSL="$candidate"
                 return 0
             fi

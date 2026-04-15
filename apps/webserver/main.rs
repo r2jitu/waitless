@@ -7,8 +7,8 @@
 extern crate uni;
 use uni::http::{Request, Response, Server, TlsServerConfig};
 
-// Checked-in self-signed Ed25519 dev cert + private key, baked into
-// the binary via include_bytes!. See `apps/webserver/dev_certs/README.md`
+// Checked-in self-signed ECDSA P-256 dev cert + private key, baked
+// into the binary via include_bytes!. See `apps/webserver/dev_certs/README.md`
 // for details and the regen.sh script. DO NOT USE IN PRODUCTION.
 const DEV_CERT_DER: &[u8] = include_bytes!("dev_certs/dev_cert.der");
 const DEV_KEY_PKCS8_DER: &[u8] = include_bytes!("dev_certs/dev_key.der");
@@ -109,7 +109,7 @@ fn main() {
     let server: &'static mut Server = uni::Box::leak(Server::new_boxed());
     server.default_handler(handle_request);
 
-    // Parse the checked-in dev cert + Ed25519 key once at boot. On
+    // Parse the checked-in dev cert + ECDSA P-256 key once at boot. On
     // the unikernel platform this gives us a valid TlsServerConfig;
     // on native it's a stub, and `run_tls()` falls back to plain HTTP.
     let config: &'static TlsServerConfig = match TlsServerConfig::from_dev_cert(

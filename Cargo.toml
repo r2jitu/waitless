@@ -86,11 +86,13 @@ chacha20poly1305 = { version = "0.10", default-features = false, features = ["al
 chacha20 = { version = "0.9", default-features = false, features = ["zeroize"] }
 # Key exchange: X25519 is the only MTI group for TLS 1.3 and QUIC.
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
-# ECDSA for P-256 server certificates (if we ever ship them).
-p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8"] }
-# Ed25519 signatures — used to sign the TLS 1.3 CertificateVerify
-# message with our checked-in dev cert's Ed25519 private key.
-ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
+# ECDSA P-256 + SHA-256 — the signature algorithm our TLS 1.3 server
+# uses for CertVerify. Picked over ed25519 because Chromium-family
+# browsers (Chrome, Arc, Edge, ...) and macOS LibreSSL don't support
+# ed25519 for server auth; ECDSA P-256 is universally supported.
+# `ecdsa` feature brings in the signing primitive; we hand-roll the
+# PKCS#8 extraction so we don't need the `pkcs8` feature.
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 # Random: `rand_core` trait. Actual entropy comes from `kernel::rng`.
 rand_core = { version = "0.6", default-features = false }
 

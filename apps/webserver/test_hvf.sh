@@ -5,9 +5,10 @@
 #   bazel test --config=hvf //apps/webserver:test
 #
 # The HVF runner uses a userspace TCP/UDP proxy (no vmnet, no root).
-# The webserver is HTTPS-only (TLS 1.3 + Ed25519 dev cert); the shared
-# helpers drive the handshake through Homebrew's openssl s_client
-# because macOS LibreSSL doesn't support Ed25519 cert verification.
+# The webserver is HTTPS-only (TLS 1.3 + ECDSA P-256 dev cert); the
+# shared helpers in scripts/helpers.sh drive the handshake via
+# `openssl s_client`. Any TLS-1.3-capable openssl is fine — including
+# macOS's bundled LibreSSL — since ECDSA P-256 is universally supported.
 #
 # Default forward: -p tcp:8443:80. The test points openssl at localhost:8443.
 
@@ -21,8 +22,8 @@ fi
 RUNFILES="${RUNFILES_DIR:-${BASH_SOURCE[0]%.sh}.runfiles}"
 source "${RUNFILES}/_main/scripts/helpers.sh"
 
-if ! find_openssl_3x; then
-    echo "SKIP: OpenSSL 3.x not found (LibreSSL doesn't support our Ed25519 dev cert)"
+if ! find_openssl; then
+    echo "SKIP: no TLS-1.3-capable openssl found (need OpenSSL 1.1.1+ / 3.x or LibreSSL 3.x)"
     exit 0
 fi
 echo "==> Using $($OPENSSL version)"

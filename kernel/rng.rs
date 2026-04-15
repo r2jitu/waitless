@@ -1,7 +1,7 @@
 // kernel/rng.rs — Kernel random number generator.
 //
 // Provides a `getrandom` custom backend so that crates pulling in
-// `rand_core::OsRng` (RustCrypto AEADs, x25519-dalek, ed25519-dalek,
+// `rand_core::OsRng` (RustCrypto AEADs, x25519-dalek, p256,
 // rustls-rustcrypto, ...) can fill buffers without an OS syscall.
 //
 // Construction:
