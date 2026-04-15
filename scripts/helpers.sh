@@ -82,10 +82,10 @@ start_qemu() {
 }
 
 # Exec QEMU interactively (for `bazel run` targets).
-# Usage: run_qemu PORT MEMORY [EXTRA_QEMU_ARGS...]
+# Usage: run_qemu PORT TLS_PORT MEMORY [EXTRA_QEMU_ARGS...]
 # Prereq: QEMU_BIN and VIRTIO_DEV must be set (via detect_qemu or manually).
 run_qemu() {
-    local port="$1" memory="$2"; shift 2
+    local port="$1" tls_port="$2" memory="$3"; shift 3
     exec "$QEMU_BIN" \
         "$@" \
         -m "$memory" -smp 1 \
@@ -93,7 +93,7 @@ run_qemu() {
         -chardev stdio,id=s0,signal=off -serial chardev:s0 \
         -no-reboot \
         -device "${VIRTIO_DEV}",netdev=net0 \
-        -netdev "user,id=net0,hostfwd=tcp::${port}-:80"
+        -netdev "user,id=net0,hostfwd=tcp::${port}-:80,hostfwd=tcp::${tls_port}-:443"
 }
 
 # ── HTTP helpers ─────────────────────────────────────────────────────────────
