@@ -37,15 +37,20 @@ rust_binary(
 # test_hvf.sh, the `bazel run` wrapper) actually execute. Output
 # path is `bazel-bin/tools/hvf-runner/run-hvf`, matching what every
 # consumer already uses.
+#
+# `run_hvf_unsigned` goes in `tools` (exec cfg), not `srcs` (target
+# cfg), so it's built for the host platform even when --config=hvf
+# has pushed the rest of the build onto //bazel/platforms:aarch64_unikernel.
+# Without this, target-cfg rules like //apps/webserver:run that pull
+# this genrule into `data` drag the inner rust_binary onto the
+# unikernel platform and fail its os:macos constraint.
 genrule(
     name = "run_hvf",
-    srcs = [
-        ":run_hvf_unsigned",
-        "run-hvf.entitlements",
-    ],
+    srcs = ["run-hvf.entitlements"],
+    tools = [":run_hvf_unsigned"],
     outs = ["run-hvf"],
     cmd = " && ".join([
-        "cp $(location :run_hvf_unsigned) $@",
+        "cp $(execpath :run_hvf_unsigned) $@",
         "chmod +w $@",
         "codesign --sign - --entitlements $(location run-hvf.entitlements) --force $@ 2>/dev/null",
     ]),
