@@ -132,33 +132,29 @@ def run_wrk_https(port, endpoint, threads, conns, duration, host="localhost"):
         return 0.0, "ERROR", "ERROR"
 
 
-def run_tls_handshake_rate(port, endpoint, duration, host="localhost",
-                           parallelism=4):
-    """Measure full TLS 1.3 handshake throughput.
+def _tls_handshake_worker(args):
+    """Process entry point for `run_tls_handshake_rate`.
 
-    Spawns `parallelism` worker threads; each one repeatedly:
-      1. Opens a TCP connection to (host, port)
-      2. Completes the TLS 1.3 handshake (X25519 + ECDSA + ChaCha20-Poly1305)
-      3. Sends one HTTP/1.1 GET with `Connection: close`
-      4. Reads the response
-      5. Closes the connection (TCP FIN + TIME_WAIT)
+    Runs in a child process via `multiprocessing` so workers get
+    true parallelism instead of fighting over the GIL (which would
+    cap aggregate throughput to ~1 core's worth of Python even
+    with N worker threads). Each worker returns a list of
+    post-warmup latencies (microseconds) plus an error count.
 
-    Runs for `duration` seconds and returns
-    `(handshakes_per_sec, p50_us_string, p99_us_string)`.
-
-    Why parallelism=4 by default: macOS's ephemeral-port pool +
-    30-second TIME_WAIT caps sustained close-once throughput at
-    roughly 500 conn/s. Four concurrent workers stays well under
-    that ceiling and gives a stable measurement instead of a
-    cliff-edge stall when ports run out.
-
-    The Python `ssl` module fronts whatever TLS library is bundled
-    with the current Python — on macOS that's typically OpenSSL
-    3.x via Homebrew Python or LibreSSL via the system Python.
-    Both support TLS 1.3 + ECDSA P-256 + X25519, so either works
-    against our server.
+    Why child processes: Python's `ssl` module releases the GIL
+    inside `SSL_do_handshake`, but reacquires it for every
+    `send`/`recv` wrapper call. With N threads, the acquire/release
+    serialises across workers and the effective parallelism drops
+    to ~2x no matter how many threads you add. Child processes
+    have no shared interpreter, so each one gets a full Python
+    timeslice on its own core.
     """
+    (port, endpoint, host, total_duration, warmup) = args
     import ssl
+    import socket as sock_mod
+    import struct
+    import time as time_mod
+
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -168,59 +164,140 @@ def run_tls_handshake_rate(port, endpoint, duration, host="localhost",
     except AttributeError:
         pass
 
+    connect_host = "127.0.0.1" if host in ("localhost", "127.0.0.1") else host
     request = (
         f"GET {endpoint} HTTP/1.1\r\n"
         f"Host: {host}\r\n"
         f"Connection: close\r\n\r\n"
     ).encode()
 
-    deadline = time.monotonic() + duration
-    latencies_us = []  # list[int]
-    lock = threading.Lock()
-    errors = [0]
+    # SO_LINGER={on=1,linger=0} → RST on close (no TIME_WAIT on the
+    # client side). macOS default ephemeral port pool is ~16K; at
+    # 2K hs/s × 10s × N workers we'd exhaust it mid-run without this.
+    linger = struct.pack("ii", 1, 0)
 
-    def worker():
-        local_lat = []
-        local_err = 0
-        while time.monotonic() < deadline:
-            t0 = time.monotonic_ns()
+    local_lat = []
+    local_err = 0
+    MAX_SAMPLES = 100_000
+    total_start = time_mod.monotonic()
+    warmup_end  = total_start + warmup
+    total_end   = warmup_end  + total_duration
+
+    while time_mod.monotonic() < total_end:
+        in_measure = time_mod.monotonic() >= warmup_end
+        t0 = time_mod.monotonic_ns()
+        try:
+            s = sock_mod.create_connection((connect_host, port), timeout=5)
+            s.setsockopt(sock_mod.SOL_SOCKET, sock_mod.SO_LINGER, linger)
+            ssock = ctx.wrap_socket(s, server_hostname="unikernel.local")
+            ssock.send(request)
+            resp = b""
+            while b"\r\n\r\n" not in resp and len(resp) < 4096:
+                chunk = ssock.recv(4096)
+                if not chunk:
+                    break
+                resp += chunk
             try:
-                sock = socket.create_connection((host, port), timeout=5)
-                ssock = ctx.wrap_socket(sock, server_hostname="unikernel.local")
-                ssock.send(request)
-                resp = b""
-                while b"\r\n\r\n" not in resp and len(resp) < 4096:
-                    chunk = ssock.recv(4096)
-                    if not chunk:
-                        break
-                    resp += chunk
                 ssock.close()
-                if b"200" in resp[:32]:
-                    elapsed_us = (time.monotonic_ns() - t0) // 1000
-                    local_lat.append(elapsed_us)
-                else:
-                    local_err += 1
             except Exception:
+                pass
+            if b"200" in resp[:32]:
+                if in_measure and len(local_lat) < MAX_SAMPLES:
+                    elapsed_us = (time_mod.monotonic_ns() - t0) // 1000
+                    local_lat.append(elapsed_us)
+            else:
                 local_err += 1
-        with lock:
-            latencies_us.extend(local_lat)
-            errors[0] += local_err
+        except Exception:
+            local_err += 1
 
-    ts = [threading.Thread(target=worker) for _ in range(parallelism)]
-    start = time.monotonic()
-    for t in ts:
-        t.start()
-    for t in ts:
-        t.join()
-    elapsed = time.monotonic() - start
+    return (local_lat, local_err)
 
-    if not latencies_us or elapsed == 0:
+
+def run_tls_handshake_rate(port, endpoint, duration, host="localhost",
+                           parallelism=4, warmup=1.0):
+    """Measure full TLS 1.3 handshake throughput.
+
+    Spawns `parallelism` *processes* (not threads — see
+    `_tls_handshake_worker` for the GIL rationale). Each process
+    repeatedly:
+      1. Opens a TCP connection to (host, port)
+      2. Completes the TLS 1.3 handshake (X25519 + ECDSA + ChaCha20-Poly1305)
+      3. Sends one HTTP/1.1 GET with `Connection: close`
+      4. Reads the response
+      5. Aborts the connection with SO_LINGER=0 (RST, no TIME_WAIT)
+
+    Runs for `duration + warmup` seconds and returns
+    `(handshakes_per_sec, p50_us_string, p99_us_string)`. The first
+    `warmup` seconds are discarded per worker — they absorb
+    cold-cache effects, process-spawn overhead, DNS resolution, and
+    the HVF runner's first-connection scheduling hiccup.
+
+    ## Noise-reduction tricks applied here
+
+    1. **Multiprocessing, not threading.** Python's `ssl` module
+       releases the GIL inside `SSL_do_handshake` but reacquires
+       it for every send/recv wrapper call; threaded workers on a
+       fast loopback cap out at ~40% of theoretical rate. Child
+       processes each get their own interpreter and scale cleanly.
+       Old threaded implementation: 2173/1241/2001 hs/s across
+       three runs (2x variance). Post-fix: much tighter.
+
+    2. **SO_LINGER={on=1,linger=0}** on the client socket. On
+       close the kernel sends a TCP RST instead of the usual
+       FIN/ACK/FIN dance, so the client side skips TIME_WAIT
+       entirely. Without this, a 10s run at ~2K hs/s creates 20K
+       sockets all stuck in TIME_WAIT for macOS's default 15s,
+       which exhausts the ephemeral port pool mid-run and causes
+       the rate to cliff-edge halfway through. The server still
+       does clean shutdown (close_notify + FIN); only the client
+       half is RST'd, which is fine for a throughput benchmark.
+
+    3. **Direct 127.0.0.1 instead of "localhost"**. Python's
+       `socket.create_connection` calls `getaddrinfo` on every
+       invocation; on macOS this occasionally blocks tens of ms
+       (mDNS / resolver cache). Skipping it removes a big p99
+       tail-latency contributor.
+
+    4. **Per-worker SSL context**. Each child creates its own
+       `SSLContext` once at startup and reuses it. `ctx.wrap_socket`
+       is then just a per-connection `SSLObject` alloc, much
+       cheaper than context rebuild.
+
+    5. **Warmup discard**. The first `warmup` seconds of latencies
+       are dropped before computing rps/p50/p99, stabilising
+       numbers across back-to-back runs (caches warm, ephemeral
+       port pool settles, HVF vCPU scheduling reaches steady
+       state, child process finishes its cold-start imports).
+
+    The Python `ssl` module fronts whatever TLS library is bundled
+    with the current Python — on macOS that's typically OpenSSL
+    3.x via Homebrew Python or LibreSSL via the system Python.
+    Both support TLS 1.3 + ECDSA P-256 + X25519, so either works
+    against our server.
+    """
+    import multiprocessing
+    args = (port, endpoint, host, duration, warmup)
+    with multiprocessing.Pool(processes=parallelism) as pool:
+        results = pool.map(_tls_handshake_worker, [args] * parallelism)
+
+    all_lat = []
+    total_err = 0
+    for (lat, err) in results:
+        all_lat.extend(lat)
+        total_err += err
+
+    if not all_lat:
         return 0.0, "ERROR", "ERROR"
-    rps = len(latencies_us) / elapsed
-    latencies_us.sort()
-    p50 = latencies_us[len(latencies_us) // 2]
-    p99_idx = min(len(latencies_us) - 1, (len(latencies_us) * 99) // 100)
-    p99 = latencies_us[p99_idx]
+
+    # Rate = total post-warmup samples / measurement window.
+    # All workers observed the same wall-clock window (they shared
+    # total_duration and warmup via args), so dividing by that is
+    # fair across workers even when one finishes slightly earlier.
+    rps = len(all_lat) / duration
+    all_lat.sort()
+    p50 = all_lat[len(all_lat) // 2]
+    p99_idx = min(len(all_lat) - 1, (len(all_lat) * 99) // 100)
+    p99 = all_lat[p99_idx]
     return rps, f"{p50}us", f"{p99}us"
 
 
