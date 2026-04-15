@@ -21,6 +21,8 @@
 #   ssh       Open an interactive SSH session
 #   run       Build locally, push binary, run with KVM (http://localhost:PORT/)
 #   test      Build locally, push binary, run HTTP+UDP tests with KVM
+#   serve     Build, push, launch KVM detached with public :80/:443 bindings
+#   serve-stop  Kill the detached serve VM (leaves the GCP instance running)
 
 set -euo pipefail
 
@@ -34,6 +36,7 @@ SSH_HOST="${GCP_SSH_HOST:-gcp}"
 MEMORY="${UNIKERNEL_MEMORY:-128}"
 CPUS="${UNIKERNEL_CPUS:-1}"
 HOST_PORT="${UNIKERNEL_PORT:-8080}"
+TLS_HOST_PORT="${UNIKERNEL_TLS_PORT:-8443}"
 TEST_PORT=19099
 
 cmd="${1:-help}"
@@ -106,24 +109,75 @@ case "$cmd" in
 
     run)
         _build; _push
-
-        # Refresh IP in case instance was restarted
         _update_ssh_ip > /dev/null 2>&1 || true
 
+        # Launch QEMU detached on the remote with serial → /tmp/webserver.log
+        # and hostfwd bound to 127.0.0.1 on the instance (only reachable
+        # through the -L tunnels we open below). Running detached is what
+        # lets Ctrl-C actually work: we tail the log through a cooked-mode
+        # ssh (no -t), so a local SIGINT fires the EXIT trap, which kills
+        # the remote VM via a side-channel ssh. The old interactive path
+        # used `-chardev stdio,signal=off`, which silently drops the 0x03
+        # byte somewhere in the SSH-PTY → remote-PTY → QEMU stdin chain.
+        ssh "$SSH_HOST" "sudo pkill -f '[q]emu-system-x86_64.*webserver.elf' 2>/dev/null; true"
+        ssh "$SSH_HOST" bash -s "$MEMORY" "$CPUS" "$HOST_PORT" "$TLS_HOST_PORT" <<'REMOTE'
+set -euo pipefail
+MEMORY="$1"; CPUS="$2"; HTTP_PORT="$3"; TLS_PORT="$4"
+
+DEVICE="virtio-net-pci,netdev=net0"
+NETDEV="user,id=net0,hostfwd=tcp:127.0.0.1:${HTTP_PORT}-:80,hostfwd=tcp:127.0.0.1:${TLS_PORT}-:443"
+if [[ "$CPUS" -gt 1 ]]; then
+    DEVICE="virtio-net-pci,netdev=net0,mq=on,vectors=$((2*CPUS+2))"
+    NETDEV="${NETDEV},queues=${CPUS}"
+fi
+
+sudo rm -f /tmp/webserver.log /tmp/qemu.out
+nohup sudo qemu-system-x86_64 \
+    -accel kvm \
+    -kernel "$HOME/webserver.elf" \
+    -m "$MEMORY" -smp "$CPUS" \
+    -cpu host \
+    -device "$DEVICE" \
+    -netdev "$NETDEV" \
+    -serial file:/tmp/webserver.log \
+    -display none -no-reboot \
+    </dev/null >/tmp/qemu.out 2>&1 &
+disown
+
+for i in $(seq 1 60); do
+    if curl -sf --max-time 2 "http://127.0.0.1:${HTTP_PORT}/health" >/dev/null 2>&1; then
+        exit 0
+    fi
+    if ! pgrep -f "qemu-system-x86_64.*webserver.elf" >/dev/null; then
+        echo "ERROR: qemu exited early" >&2
+        tail -40 /tmp/qemu.out /tmp/webserver.log 2>/dev/null >&2 || true
+        exit 1
+    fi
+    sleep 0.5
+done
+echo "ERROR: http not ready after 30s" >&2
+tail -40 /tmp/webserver.log 2>/dev/null >&2 || true
+exit 1
+REMOTE
+
+        _gcp_run_cleanup() {
+            trap - EXIT INT TERM
+            echo ""
+            echo "==> Stopping remote VM..."
+            ssh "$SSH_HOST" "sudo pkill -f '[q]emu-system-x86_64.*webserver.elf' 2>/dev/null; true" >/dev/null 2>&1 || true
+        }
+        trap '_gcp_run_cleanup' EXIT INT TERM
+
         echo "==> Running on GCP with KVM..."
-        echo "    URL: http://localhost:${HOST_PORT}/"
-        echo "    Serial console below. Press Ctrl-C to stop."
+        echo "    HTTP:  http://localhost:${HOST_PORT}/"
+        echo "    HTTPS: https://localhost:${TLS_HOST_PORT}/  (self-signed — use curl -k)"
+        echo "    Serial log below. Press Ctrl-C to stop."
         echo ""
-        ssh -tt -L "${HOST_PORT}:localhost:${HOST_PORT}" "$SSH_HOST" \
-            "qemu-system-x86_64 \
-                -accel kvm \
-                -kernel ~/webserver.elf \
-                -m ${MEMORY} -smp ${CPUS} \
-                -cpu qemu64 \
-                -device virtio-net-pci,netdev=net0 \
-                -netdev user,id=net0,hostfwd=tcp::${HOST_PORT}-:80 \
-                -chardev stdio,id=s0,signal=off -serial chardev:s0 \
-                -display none -no-reboot"
+        ssh \
+            -L "${HOST_PORT}:localhost:${HOST_PORT}" \
+            -L "${TLS_HOST_PORT}:localhost:${TLS_HOST_PORT}" \
+            "$SSH_HOST" \
+            "sudo tail -n +1 -F /tmp/webserver.log" || true
         ;;
 
     test)
@@ -142,7 +196,7 @@ VM_LOG=$(mktemp)
 qemu-system-x86_64 \
     -accel kvm \
     -kernel ~/webserver.elf -m 128 \
-    -cpu qemu64 \
+    -cpu host \
     -device virtio-net-pci,netdev=net0 \
     -netdev "user,id=net0,hostfwd=tcp::${PORT}-:80,hostfwd=udp::${UDP_PORT}-:7" \
     -serial "file:${VM_LOG}" -display none -no-reboot &
@@ -207,18 +261,87 @@ echo "$FAILURES TEST(S) FAILED"; tail -40 "$VM_LOG" >&2; exit 1
 REMOTE
         ;;
 
+    serve)
+        _build; _push
+
+        ext_ip=$(_update_ssh_ip)
+
+        echo "==> Launching detached KVM serve on GCP (public :80/:443)..."
+        ssh "$SSH_HOST" bash -s "$MEMORY" "$CPUS" <<'REMOTE'
+set -euo pipefail
+MEMORY="$1"
+CPUS="$2"
+
+sudo pkill -f '[q]emu-system-x86_64.*webserver.elf' 2>/dev/null || true
+sleep 0.5
+
+DEVICE="virtio-net-pci,netdev=net0"
+NETDEV="user,id=net0,hostfwd=tcp::80-:80,hostfwd=tcp::443-:443"
+if [[ "$CPUS" -gt 1 ]]; then
+    DEVICE="virtio-net-pci,netdev=net0,mq=on,vectors=$((2*CPUS+2))"
+    NETDEV="user,id=net0,hostfwd=tcp::80-:80,hostfwd=tcp::443-:443,queues=${CPUS}"
+fi
+
+sudo rm -f /tmp/webserver.log /tmp/qemu.out
+nohup sudo qemu-system-x86_64 \
+    -accel kvm \
+    -kernel "$HOME/webserver.elf" \
+    -m "$MEMORY" -smp "$CPUS" \
+    -cpu host \
+    -device "$DEVICE" \
+    -netdev "$NETDEV" \
+    -serial file:/tmp/webserver.log \
+    -display none -no-reboot \
+    </dev/null >/tmp/qemu.out 2>&1 &
+disown
+
+echo "    Waiting for HTTP on :80..."
+for i in $(seq 1 30); do
+    if curl -sf --max-time 2 http://localhost/health >/dev/null 2>&1; then
+        echo "    Ready in ${i}s"; exit 0
+    fi
+    if ! pgrep -f "qemu-system-x86_64.*webserver.elf" >/dev/null; then
+        echo "ERROR: QEMU exited early" >&2
+        tail -40 /tmp/qemu.out /tmp/webserver.log >&2 || true
+        exit 1
+    fi
+    sleep 1
+done
+echo "ERROR: HTTP not ready after 30s" >&2
+tail -40 /tmp/webserver.log >&2 || true
+exit 1
+REMOTE
+
+        echo ""
+        echo "==> Public endpoints:"
+        echo "     HTTP:  http://${ext_ip}/"
+        echo "     HTTPS: https://${ext_ip}/   (self-signed dev cert — use curl -k)"
+        echo ""
+        echo "    Serial log: ssh ${SSH_HOST} 'sudo tail -f /tmp/webserver.log'"
+        echo "    Stop VM:    ./scripts/gcp.sh serve-stop"
+        echo "    Stop inst:  ./scripts/gcp.sh stop"
+        ;;
+
+    serve-stop)
+        echo "==> Stopping detached serve VM..."
+        ssh "$SSH_HOST" 'sudo pkill -f '[q]emu-system-x86_64.*webserver.elf' || true'
+        echo "    (GCP instance still running; use './scripts/gcp.sh stop' to halt it.)"
+        ;;
+
     help|*)
         cat <<'USAGE'
 Usage: ./scripts/gcp.sh <command>
 
 Commands:
-  status    Show instance status and external IP
-  start     Start the instance
-  stop      Stop the instance (no compute charge while stopped)
-  ip        Print current external IP
-  ssh       Open an interactive SSH session
-  run       Build locally, push binary, run with KVM (port-forwarded to localhost)
-  test      Build locally, push binary, run HTTP+UDP tests with KVM
+  status      Show instance status and external IP
+  start       Start the instance
+  stop        Stop the instance (no compute charge while stopped)
+  ip          Print current external IP
+  ssh         Open an interactive SSH session
+  run         Build, push, run with KVM (SSH-tunnelled to localhost)
+  test        Build, push, run HTTP+UDP tests with KVM
+  serve       Build, push, launch detached KVM with public :80/:443 bindings
+  serve-stop  Kill the detached serve VM (leaves the GCP instance running)
 
 Environment:
   GCP_PROJECT=unikernel-dev    GCP project (default: unikernel-dev)
@@ -228,6 +351,7 @@ Environment:
   UNIKERNEL_MEMORY=128         VM memory in MB
   UNIKERNEL_CPUS=1             vCPU count
   UNIKERNEL_PORT=8080          Local port forwarded to VM port 80 (run only)
+  UNIKERNEL_TLS_PORT=8443      Local port forwarded to VM port 443 (run only)
 USAGE
         ;;
 esac
