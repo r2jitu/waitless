@@ -28,7 +28,12 @@ pub fn enable_raw() {
         let mut raw = orig;
         raw.c_lflag &= !(libc::ISIG | libc::ICANON | libc::ECHO | libc::IEXTEN);
         raw.c_iflag &= !(libc::ICRNL | libc::IXON);
-        raw.c_oflag &= !libc::OPOST;
+        // Intentionally leave c_oflag alone (do NOT clear OPOST like a
+        // textbook cfmakeraw() would). stdout here is the user's
+        // interactive tty, and we want the normal ONLCR mapping of `\n`
+        // → `\r\n` for our own eprintln! banners. The guest's serial
+        // writes already emit explicit CRLF, so leaving OPOST on just
+        // produces a harmless extra \r on those lines.
         libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &raw);
     }
 }
