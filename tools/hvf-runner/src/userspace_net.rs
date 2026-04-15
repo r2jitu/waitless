@@ -805,7 +805,17 @@ fn poll_worker_iteration(
                         &one as *const _ as *const _, 4,
                     );
                 }
-                let src_port = alloc_src_port();
+                // Flow-hash-aware src_port selection: pick a port
+                // whose 4-tuple hashes to the current vCPU's bucket
+                // under the guest's `net/lib.rs::flow_hash`. That
+                // keeps the conn on a single core end-to-end —
+                // without it, ~(cpu_count-1)/cpu_count of accepted
+                // connections would land on one guest core and
+                // bounce to another via the SPSC `rx_inbox` on
+                // every packet.
+                let src_port = alloc_src_port_for_vcpu(
+                    io.id, cpu_count, listen.guest_port,
+                );
                 let frame = build_tcp_frame_fixed(
                     &GUEST_MAC, GW_IP, VM_IP,
                     src_port, listen.guest_port, 1000, 0, 0x02, &[],
@@ -983,6 +993,82 @@ fn alloc_src_port() -> u16 {
         p = NEXT_PROXY_SRC_PORT.fetch_add(1, Ordering::Relaxed);
     }
     p
+}
+
+/// Flow-hash a synthetic 4-tuple the same way the guest does in
+/// `net/lib.rs::flow_hash`. The guest uses this to decide which
+/// core owns a given TCP connection's state, so mirroring the
+/// computation here lets us pick an ephemeral src_port at accept
+/// time whose hash lands on the *current* vCPU. That keeps the
+/// packet on the same core end-to-end: this vCPU injects the SYN
+/// into its own RX queue pair, the guest's vCPU N receives it,
+/// runs the same flow hash, gets N, and processes the packet
+/// inline instead of pushing it to another core's SPSC `rx_inbox`.
+///
+/// Both builds are little-endian on our target hardware
+/// (aarch64-apple-darwin for the runner, aarch64-unknown-none for
+/// the guest), so `u32::from_le_bytes` matches the raw byte-read
+/// the guest does on its `Ipv4Header` struct field. Keep this in
+/// sync with `net/lib.rs::flow_hash` — the whole point of mirroring
+/// it is that the two have to produce the same answer for the
+/// same 4-tuple.
+fn flow_hash_for_guest(
+    src_ip: [u8; 4],
+    dst_ip: [u8; 4],
+    src_port: u16,
+    dst_port: u16,
+    num_cores: u32,
+) -> u32 {
+    let sip = u32::from_le_bytes(src_ip);
+    let dip = u32::from_le_bytes(dst_ip);
+    let mut h: u32 = 2166136261; // FNV offset basis
+    h ^= sip;
+    h = h.wrapping_mul(16777619);
+    h ^= dip;
+    h = h.wrapping_mul(16777619);
+    h ^= src_port as u32;
+    h = h.wrapping_mul(16777619);
+    h ^= dst_port as u32;
+    h = h.wrapping_mul(16777619);
+    // Murmur3 fmix32.
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x85ebca6b);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0xc2b2ae35);
+    h ^= h >> 16;
+    h % num_cores
+}
+
+/// Allocate an ephemeral src_port whose flow hash lands on
+/// `target_vcpu` for the given 4-tuple shape. Loops over
+/// candidates from `NEXT_PROXY_SRC_PORT` until it finds a match or
+/// exhausts a bounded budget (4 × cpu_count ≈ the expected number
+/// of tries for a uniform hash over `cpu_count` buckets, with
+/// headroom). Falls back to a plain `alloc_src_port()` on budget
+/// exhaustion so the accept never stalls — the odd mis-hashed
+/// connection just pays the SPSC `rx_inbox` cross-core hop on the
+/// guest side, same as pre-Option-2 behaviour.
+///
+/// For `cpu_count == 1` there's only one bucket and every port
+/// matches; the loop body finishes on the first try.
+fn alloc_src_port_for_vcpu(
+    target_vcpu: usize,
+    cpu_count: usize,
+    dst_port: u16,
+) -> u16 {
+    if cpu_count <= 1 {
+        return alloc_src_port();
+    }
+    let ncores = cpu_count as u32;
+    let budget = cpu_count * 4;
+    for _ in 0..budget {
+        let p = alloc_src_port();
+        let bucket = flow_hash_for_guest(GW_IP, VM_IP, p, dst_port, ncores);
+        if bucket as usize == target_vcpu {
+            return p;
+        }
+    }
+    alloc_src_port()
 }
 
 /// Drain a UDP relay sibling fd owned by this worker, injecting frames
