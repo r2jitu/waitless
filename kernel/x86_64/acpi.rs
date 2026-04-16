@@ -16,6 +16,17 @@ const MADT_SIG: [u8; 4] = *b"APIC";
 /// Maximum number of CPUs we track.
 const MAX_CPUS: usize = 8;
 
+/// Sanity cap on any ACPI table length. Real firmware tables are well
+/// under a page; anything larger means the length field is corrupted
+/// (or, on a hostile hypervisor, crafted). We refuse to walk past this.
+const MAX_TABLE_LEN: usize = 64 * 1024;
+
+/// ACPI SDT header size (4-byte sig, 4-byte len, ...).
+const SDT_HEADER_LEN: usize = 36;
+
+/// MADT-specific header: SDT + LAPIC address (4) + flags (4).
+const MADT_HEADER_LEN: usize = 44;
+
 /// Discovered CPU info.
 pub struct CpuTopology {
     pub cpu_count: u32,
@@ -50,15 +61,20 @@ unsafe fn find_rsdp() -> u64 {
 }
 
 /// Walk the RSDT pointed to by `rsdt_phys` and return the physical address
-/// of the first MADT (signature "APIC"). Returns 0 if not found.
+/// of the first MADT (signature "APIC"). Returns 0 if not found or if the
+/// RSDT length field is obviously bogus.
 ///
 /// SAFETY: caller must ensure `rsdt_phys` points to a valid RSDT.
 unsafe fn find_madt(rsdt_phys: u64) -> u64 {
     let rsdt_len = *((rsdt_phys + 4) as *const u32) as usize;
-    let entry_count = (rsdt_len - 36) / 4; // 36-byte header, 4-byte entries
+    if rsdt_len < SDT_HEADER_LEN || rsdt_len > MAX_TABLE_LEN {
+        return 0;
+    }
+    let entry_count = (rsdt_len - SDT_HEADER_LEN) / 4;
 
     for i in 0..entry_count {
-        let entry_phys = *((rsdt_phys + 36 + (i as u64) * 4) as *const u32) as u64;
+        let entry_phys = *((rsdt_phys + SDT_HEADER_LEN as u64 + (i as u64) * 4)
+            as *const u32) as u64;
         if entry_phys == 0 { continue; }
         let sig = entry_phys as *const [u8; 4];
         if *sig == MADT_SIG {
@@ -73,14 +89,24 @@ unsafe fn find_madt(rsdt_phys: u64) -> u64 {
 ///
 /// SAFETY: caller must ensure `madt_addr` points to a valid MADT.
 unsafe fn parse_madt_entries(madt_addr: u64, topo: &mut CpuTopology) -> u32 {
-    let madt_len = *((madt_addr + 4) as *const u32) as usize;
-    let mut offset = 44usize; // MADT header is 44 bytes
+    let raw_len = *((madt_addr + 4) as *const u32) as usize;
+    // Cap at MAX_TABLE_LEN so a corrupt length can't drag us off the end
+    // of physical memory. raw_len < header is an unusable table.
+    if raw_len < MADT_HEADER_LEN {
+        return 0;
+    }
+    let madt_len = core::cmp::min(raw_len, MAX_TABLE_LEN);
+    let mut offset = MADT_HEADER_LEN;
     let mut count = 0u32;
 
     while offset + 2 <= madt_len {
         let entry_type = *((madt_addr + offset as u64) as *const u8);
         let entry_len = *((madt_addr + offset as u64 + 1) as *const u8) as usize;
-        if entry_len == 0 { break; }
+        // Malformed entry: zero-length would loop forever; oversize would
+        // skip past the end of the table into unrelated memory.
+        if entry_len < 2 || offset + entry_len > madt_len {
+            break;
+        }
 
         if entry_type == 0 && entry_len >= 8 {
             // Local APIC entry: type(1) + len(1) + acpi_processor_id(1) +
