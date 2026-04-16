@@ -34,7 +34,7 @@ GCP_ZONE="${GCP_ZONE:-us-west1-a}"
 GCP_INSTANCE="${GCP_INSTANCE:-kvm-vm}"
 SSH_HOST="${GCP_SSH_HOST:-gcp}"
 MEMORY="${UNIKERNEL_MEMORY:-128}"
-CPUS="${UNIKERNEL_CPUS:-1}"
+CPUS="${UNIKERNEL_CPUS:-$(ssh "$SSH_HOST" nproc 2>/dev/null || echo 1)}"
 TEST_PORT=19099
 
 # pkill/pgrep -f pattern for the running guest. The character-class
@@ -189,8 +189,11 @@ QEMU_PATTERN="$1"; MEMORY="$2"; CPUS="$3"
 DEVICE="virtio-net-pci,netdev=net0"
 NETDEV="user,id=net0,hostfwd=tcp::80-:80,hostfwd=tcp::443-:443"
 if [[ "$CPUS" -gt 1 ]]; then
+    # mq + vectors advertise multi-queue to the guest so the virtio-net
+    # driver creates per-core queue pairs for multi-core distribution.
+    # `queues=` is NOT set: user-mode networking (-netdev user) only
+    # supports one host queue (unlike tap+vhost which does real MQ).
     DEVICE="virtio-net-pci,netdev=net0,mq=on,vectors=$((2*CPUS+2))"
-    NETDEV="${NETDEV},queues=${CPUS}"
 fi
 
 sudo rm -f /tmp/webserver.sock /tmp/qemu.out
@@ -369,8 +372,11 @@ QEMU_PATTERN="$1"; MEMORY="$2"; CPUS="$3"
 DEVICE="virtio-net-pci,netdev=net0"
 NETDEV="user,id=net0,hostfwd=tcp::80-:80,hostfwd=tcp::443-:443"
 if [[ "$CPUS" -gt 1 ]]; then
+    # mq + vectors advertise multi-queue to the guest so the virtio-net
+    # driver creates per-core queue pairs for multi-core distribution.
+    # `queues=` is NOT set: user-mode networking (-netdev user) only
+    # supports one host queue (unlike tap+vhost which does real MQ).
     DEVICE="virtio-net-pci,netdev=net0,mq=on,vectors=$((2*CPUS+2))"
-    NETDEV="${NETDEV},queues=${CPUS}"
 fi
 
 sudo rm -f /tmp/webserver.log /tmp/qemu.out
@@ -440,7 +446,7 @@ Environment:
   GCP_INSTANCE=kvm-vm          Instance name
   GCP_SSH_HOST=gcp             SSH config alias
   UNIKERNEL_MEMORY=128         VM memory in MB
-  UNIKERNEL_CPUS=1             vCPU count
+  UNIKERNEL_CPUS=<nproc>        vCPU count (default: all host cores)
 USAGE
         ;;
 esac
