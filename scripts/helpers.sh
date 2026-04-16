@@ -70,7 +70,44 @@ cleanup_vm() {
     [[ -n "${VM_LOG:-}" ]] && rm -f "$VM_LOG" || true
 }
 
-# Start QEMU in background.
+# ── Shared QEMU arg builder ──────────────────────────────────────────────────
+# Canonical port-forward layout for every QEMU invocation in this project:
+#
+#   TCP  PORT     -> guest :80   (plain HTTP)
+#   TCP  PORT+1   -> guest :443  (HTTPS)
+#   UDP  PORT+2   -> guest :7    (UDP echo)
+#
+# Both start_qemu (background, tests) and run_qemu (foreground, `bazel run`)
+# route through _qemu_net_args so the forwards cannot drift between them.
+# run-local.sh uses the same helpers, so the interactive and test paths
+# stay in lockstep by construction.
+#
+# `_qemu_net_args PORT CPUS` prints the `-device … -netdev …` pair.
+_qemu_net_args() {
+    local port="$1" cpus="$2"
+    local dev_extra=""
+    # Enable VirtIO multi-queue for PCI devices with multiple vCPUs.
+    # MMIO devices (virtio-net-device) don't support mq parameter.
+    if [[ "$cpus" -gt 1 ]] && [[ "$VIRTIO_DEV" == *"-pci"* ]]; then
+        local vectors=$(( 2 * cpus + 2 ))
+        dev_extra=",mq=on,vectors=$vectors,queues=$cpus"
+    fi
+    local netdev_extra=""
+    # user-mode netdev supports queues= only alongside PCI multi-queue.
+    if [[ "$cpus" -gt 1 ]] && [[ "$VIRTIO_DEV" == *"-pci"* ]]; then
+        netdev_extra=",queues=$cpus"
+    fi
+    local forwards="hostfwd=tcp::${port}-:80"
+    forwards+=",hostfwd=tcp::$((port+1))-:443"
+    forwards+=",hostfwd=udp::$((port+2))-:7"
+    printf '%s\n' \
+        "-device" "${VIRTIO_DEV}${dev_extra},netdev=net0" \
+        "-netdev" "user,id=net0,${forwards}${netdev_extra}"
+}
+
+# Start QEMU in the background (for tests). TCP 80, TCP 443, UDP 7 all
+# forwarded per the _qemu_net_args layout above.
+#
 # Usage: start_qemu PORT [LOG] [EXTRA_QEMU_ARGS...]
 #   LOG: log file path; omit or pass "" to create a tempfile (sets VM_LOG).
 # Prereq: QEMU_BIN and VIRTIO_DEV must be set (via detect_qemu or manually).
@@ -82,38 +119,36 @@ start_qemu() {
         log="$VM_LOG"
     fi
     local cpus="${UNIKERNEL_CPUS:-1}"
-    local dev_extra=""
-    # Enable VirtIO multi-queue for PCI devices with multiple vCPUs.
-    # MMIO devices (virtio-net-device) don't support mq parameter.
-    # user-mode netdev doesn't support queues= parameter.
-    if [[ "$cpus" -gt 1 ]] && [[ "$VIRTIO_DEV" == *"-pci"* ]]; then
-        local vectors=$(( 2 * cpus + 2 ))
-        dev_extra=",mq=on,vectors=$vectors"
-    fi
+    local net_args=()
+    while IFS= read -r line; do net_args+=("$line"); done < <(_qemu_net_args "$port" "$cpus")
     "$QEMU_BIN" \
         "$@" \
         -m 128 -smp "$cpus" -nographic \
         -serial "file:${log}" \
         -no-reboot \
-        -device "${VIRTIO_DEV}${dev_extra}",netdev=net0 \
-        -netdev "user,id=net0,hostfwd=tcp::${port}-:80,hostfwd=udp::$((port+1))-:7" \
+        "${net_args[@]}" \
         &>/dev/null &
     VM_PID=$!
 }
 
-# Exec QEMU interactively (for `bazel run` targets).
-# Usage: run_qemu PORT TLS_PORT MEMORY [EXTRA_QEMU_ARGS...]
+# Exec QEMU interactively (for `bazel run` and scripts/run-local.sh). Same
+# forward layout as start_qemu — differences are only stdio serial +
+# foreground exec.
+#
+# Usage: run_qemu PORT MEMORY [EXTRA_QEMU_ARGS...]
 # Prereq: QEMU_BIN and VIRTIO_DEV must be set (via detect_qemu or manually).
 run_qemu() {
-    local port="$1" tls_port="$2" memory="$3"; shift 3
+    local port="$1" memory="$2"; shift 2
+    local cpus="${UNIKERNEL_CPUS:-1}"
+    local net_args=()
+    while IFS= read -r line; do net_args+=("$line"); done < <(_qemu_net_args "$port" "$cpus")
     exec "$QEMU_BIN" \
         "$@" \
-        -m "$memory" -smp 1 \
+        -m "$memory" -smp "$cpus" \
         -display none -monitor none \
         -chardev stdio,id=s0,signal=off -serial chardev:s0 \
         -no-reboot \
-        -device "${VIRTIO_DEV}",netdev=net0 \
-        -netdev "user,id=net0,hostfwd=tcp::${port}-:80,hostfwd=tcp::${tls_port}-:443"
+        "${net_args[@]}"
 }
 
 # ── HTTP helpers ─────────────────────────────────────────────────────────────

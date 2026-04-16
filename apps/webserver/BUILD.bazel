@@ -46,11 +46,13 @@ sh_test(
         "//bazel/platforms:runner_qemu": [
             ":webserver.elf",
             ":webserver.img",
+            "//apps/webserver/dev_certs:dev_cert.pem",
             "//scripts:helpers.sh",
         ],
         "//bazel/platforms:runner_iso": [
             ":webserver.iso",
             ":webserver.limine.elf",
+            "//apps/webserver/dev_certs:dev_cert.pem",
             "//scripts:helpers.sh",
         ],
         "//conditions:default": [

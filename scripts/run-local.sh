@@ -18,24 +18,28 @@
 #
 # Environment variables:
 #   UNIKERNEL_RUNNER=qemu  Force QEMU even on macOS arm64 (TCG, no HW accel)
-#   UNIKERNEL_PORT=8080    Host port forwarded to VM port 80
+#   UNIKERNEL_PORT=8080    Base host port:
+#                            http://localhost:$PORT/
+#                            https://localhost:$((PORT+1))/
+#                            udp  ::$((PORT+2)) → guest :7
 #   UNIKERNEL_MEMORY=128   VM memory in MB
 #   UNIKERNEL_CPUS=1       Number of vCPUs
 #
-# Port 8080 on localhost is forwarded to port 80 in the VM.
-# Access the web server at: http://localhost:8080/
+# QEMU invocation goes through scripts/helpers.sh::run_qemu, the exact
+# same helper that sh_test targets use via start_qemu — so test and
+# interactive launches stay in lockstep by construction.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "$SCRIPT_DIR/helpers.sh"
 
 HOST_OS="$(uname -s)"     # Darwin or Linux
 HOST_ARCH="$(uname -m)"   # arm64/aarch64 or x86_64
 
-# Memory allocation (MB), vCPU count, host port
 MEMORY="${UNIKERNEL_MEMORY:-128}"
-CPUS="${UNIKERNEL_CPUS:-1}"
+export UNIKERNEL_CPUS="${UNIKERNEL_CPUS:-1}"   # read by _qemu_net_args
 HOST_PORT="${UNIKERNEL_PORT:-8080}"
 
 KERNEL="${1:-}"
@@ -45,13 +49,9 @@ if [ -z "$KERNEL" ]; then
     echo "==> Building webserver for ${HOST_ARCH}..."
     cd "$PROJECT_ROOT"
 
-    if [ "$HOST_OS" = "Darwin" ] && [ "$HOST_ARCH" = "arm64" ]; then
-        # macOS arm64: build raw binary image for the HVF runner.
-        # .bazelrc.local sets --platforms=aarch64_unikernel by default.
-        bazel build //apps/webserver:webserver.img
-        KERNEL="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver.img"
-    elif [ "$HOST_ARCH" = "arm64" ] || [ "$HOST_ARCH" = "aarch64" ]; then
-        # Linux arm64: build raw binary for QEMU -kernel (PIE ELF loads wrong).
+    if [ "$HOST_ARCH" = "arm64" ] || [ "$HOST_ARCH" = "aarch64" ]; then
+        # aarch64: build raw .img (HVF runner and QEMU -kernel both need it;
+        # the PIE ELF doesn't relocate cleanly under -kernel).
         bazel build //apps/webserver:webserver.img
         KERNEL="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver.img"
     else
@@ -62,199 +62,60 @@ if [ -z "$KERNEL" ]; then
     echo "==> Built: $KERNEL"
 fi
 
-if [ ! -f "$KERNEL" ]; then
-    echo "Error: kernel not found: $KERNEL"
-    exit 1
-fi
+[[ -f "$KERNEL" ]] || { echo "Error: kernel not found: $KERNEL"; exit 1; }
 
-# ── macOS arm64 → HVF runner (hardware-accelerated) ──────────────────────────
-# UNIKERNEL_RUNNER: hvf (default) or qemu.
+echo "==> Starting unikernel (OS=${HOST_OS} arch=${HOST_ARCH})"
+echo "    Memory: ${MEMORY}MB  CPUs: ${UNIKERNEL_CPUS}"
+echo "    HTTP  http://localhost:${HOST_PORT}/         → guest :80"
+echo "    HTTPS https://localhost:$((HOST_PORT+1))/    → guest :443  (curl -k)"
+echo "    UDP   localhost:$((HOST_PORT+2))             → guest :7"
+echo "    Serial console below.  Press Ctrl-C to exit."
+echo ""
+
+# ── macOS arm64 → HVF runner (hardware-accelerated, default) ─────────────────
 RUNNER="${UNIKERNEL_RUNNER:-hvf}"
 if [ "$HOST_OS" = "Darwin" ] && [ "$HOST_ARCH" = "arm64" ] && [ "$RUNNER" = "hvf" ]; then
     RUN_HVF="$PROJECT_ROOT/bazel-bin/tools/hvf-runner/run-hvf"
-
-    # Build via bazel (the genrule invokes cargo + codesign internally).
     (cd "$PROJECT_ROOT" && bazel build //tools/hvf-runner:run_hvf 2>/dev/null)
 
     IMG="$KERNEL"
     if [[ "$KERNEL" == *.elf ]]; then
         IMG="${KERNEL%.elf}.img"
-        if [ ! -f "$IMG" ]; then
-            echo "Error: run-hvf requires a raw binary image, not an ELF."
-            echo "       Expected: $IMG"
-            exit 1
-        fi
+        [[ -f "$IMG" ]] || { echo "Error: run-hvf needs raw .img at $IMG"; exit 1; }
     fi
+    [[ -x "$RUN_HVF" ]] || { echo "Error: run-hvf missing: bazel build //tools/hvf-runner:run_hvf"; exit 1; }
 
-    if [ ! -x "$RUN_HVF" ]; then
-        echo "Error: HVF runner not found at $RUN_HVF"
-        echo "       Build it: bazel build //tools/hvf-runner:run_hvf"
-        exit 1
-    fi
-    UDP_HOST_PORT=$((HOST_PORT + 10000))
     exec "$RUN_HVF" "$IMG" \
-        "--ram=${MEMORY}" "--cpus=${CPUS}" \
+        "--ram=${MEMORY}" "--cpus=${UNIKERNEL_CPUS}" \
         -p "tcp:${HOST_PORT}:80" \
-        -p "udp:${UDP_HOST_PORT}:7"
+        -p "tcp:$((HOST_PORT+1)):443" \
+        -p "udp:$((HOST_PORT+2)):7"
 fi
 
-# ── Common QEMU output flags ──────────────────────────────────────────────────
-# -display none                 : no graphical window
-# -monitor none                 : no QEMU monitor
-# -chardev stdio,id=s0,signal=off : serial on stdio; "signal=off" (the QEMU
-#                                   default) disables ISIG so Ctrl-C is passed
-#                                   to the VM as byte 0x03 instead of generating
-#                                   SIGINT.  The kernel detects 0x03 in the
-#                                   serial RX FIFO, stops the server, and calls
-#                                   PSCI/ACPI power-off so QEMU exits cleanly.
-# -serial chardev:s0            : attach serial port to the chardev above
-# -no-reboot                    : exit instead of rebooting on RESET
+# ── QEMU path (Linux any arch, macOS x86_64, macOS arm64 with RUNNER=qemu) ──
+detect_qemu "$KERNEL"
 
-echo "==> Starting QEMU (OS=${HOST_OS} arch=${HOST_ARCH})"
-echo "    Memory: ${MEMORY}MB  CPUs: ${CPUS}"
-echo "    Network: http://localhost:${HOST_PORT}/ -> VM port 80"
-echo "    Serial console below.  Press Ctrl-C to exit."
-echo ""
-
-QEMU_OUTPUT=(
-    -display none
-    -monitor none
-    -chardev stdio,id=s0,signal=off
-    -serial chardev:s0
-    -no-reboot
-)
-
-# ── macOS arm64 + QEMU (UNIKERNEL_RUNNER=qemu) ───────────────────────────────
-if [ "$HOST_OS" = "Darwin" ] && [ "$HOST_ARCH" = "arm64" ]; then
-    if ! command -v qemu-system-aarch64 &>/dev/null; then
-        echo "Error: qemu-system-aarch64 not found. Install with: brew install qemu"
-        exit 1
-    fi
-
-    # QEMU needs .img (raw binary), not .elf.
-    IMG="$KERNEL"
-    if [[ "$KERNEL" == *.elf ]]; then
-        IMG="${KERNEL%.elf}.img"
-        if [ ! -f "$IMG" ]; then
-            echo "Error: QEMU -kernel needs a raw binary image for aarch64."
-            echo "       Expected: $IMG"
-            echo "       Build it: bazel build //apps/webserver:webserver.img"
-            exit 1
-        fi
-    fi
-
-    # Multi-queue: aarch64 uses virtio-mmio (no PCI, no MSI-X). The driver
-    # still negotiates VIRTIO_NET_F_MQ and creates N queue pairs; QEMU's
-    # virtio-net-device accepts neither `mq=on` nor `vectors=` flags on
-    # -device, so no extra args needed here.
-    #
-    # Must use TCG — Apple Hypervisor.framework doesn't guarantee ISV=1 in
-    # ESR_EL2 for MMIO exits, causing QEMU to assert in hvf_handle_exception.
-    exec qemu-system-aarch64 \
-        -machine virt \
-        -accel tcg,thread=multi \
-        -kernel "$IMG" \
-        -m "${MEMORY}" \
-        -smp "${CPUS}" \
-        -cpu max \
-        "${QEMU_OUTPUT[@]}" \
-        -device virtio-net-device,netdev=net0 \
-        -netdev "user,id=net0,hostfwd=tcp::${HOST_PORT}-:80"
+ACCEL=()
+if [ "$HOST_OS" = "Linux" ] && [ -r /dev/kvm ]; then
+    ACCEL=(-accel kvm)
+    echo "    KVM acceleration enabled."
+elif [ "$HOST_OS" = "Darwin" ] && [ "$HOST_ARCH" = "arm64" ]; then
+    # Apple Hypervisor.framework on arm64 doesn't guarantee ISV=1 in
+    # ESR_EL2 for MMIO exits, so QEMU+HVF asserts on the first virtio
+    # MMIO access. TCG only.
+    ACCEL=(-accel tcg,thread=multi)
+elif [ "$HOST_OS" = "Darwin" ] && [ "$HOST_ARCH" = "x86_64" ] && \
+     sysctl -n kern.hv_support 2>/dev/null | grep -q '^1$'; then
+    ACCEL=(-accel hvf)
 fi
 
-# ── Linux → QEMU with KVM auto-detect ────────────────────────────────────────
-if [ "$HOST_OS" = "Linux" ]; then
-    KVM_FLAGS=()
-    if [ -r /dev/kvm ]; then
-        KVM_FLAGS=(-accel kvm)
-        echo "    KVM acceleration enabled."
-    fi
-
-    if [ "$HOST_ARCH" = "aarch64" ] || [ "$HOST_ARCH" = "arm64" ]; then
-        if ! command -v qemu-system-aarch64 &>/dev/null; then
-            echo "Error: qemu-system-aarch64 not found."
-            echo "Install with: sudo apt install qemu-system-arm"
-            exit 1
-        fi
-        IMG="$KERNEL"
-        if [[ "$KERNEL" == *.elf ]]; then
-            IMG="${KERNEL%.elf}.img"
-            if [ ! -f "$IMG" ]; then
-                echo "Error: QEMU -kernel needs a raw binary image for aarch64."
-                echo "       Expected: $IMG"
-                echo "       Build it: bazel build //apps/webserver:webserver.img"
-                exit 1
-            fi
-        fi
-
-        exec qemu-system-aarch64 \
-            -machine virt \
-            -kernel "$IMG" \
-            -m "${MEMORY}" \
-            -smp "${CPUS}" \
-            "${QEMU_OUTPUT[@]}" \
-            -device virtio-net-device,netdev=net0 \
-            -netdev "user,id=net0,hostfwd=tcp::${HOST_PORT}-:80" \
-            -cpu max \
-            "${KVM_FLAGS[@]}"
-    else
-        if ! command -v qemu-system-x86_64 &>/dev/null; then
-            echo "Error: qemu-system-x86_64 not found."
-            echo "Install with: sudo apt install qemu-system-x86"
-            exit 1
-        fi
-        # Multi-queue on virtio-net-pci: mq=on + vectors=2N+2 (one per
-        # RX + one per TX + config + ctrl). netdev queues=N so QEMU
-        # allocates N host queue pairs. Guest driver negotiates MQ and
-        # activates N pairs via CTRL_MQ_VQ_PAIRS_SET after DHCP.
-        DEVICE="virtio-net-pci,netdev=net0"
-        NETDEV="user,id=net0,hostfwd=tcp::${HOST_PORT}-:80"
-        if [ "${CPUS}" -gt 1 ]; then
-            DEVICE="virtio-net-pci,netdev=net0,mq=on,vectors=$((2*CPUS+2))"
-            NETDEV="user,id=net0,hostfwd=tcp::${HOST_PORT}-:80,queues=${CPUS}"
-        fi
-        exec qemu-system-x86_64 \
-            -kernel "$KERNEL" \
-            -m "${MEMORY}" \
-            -smp "${CPUS}" \
-            -cpu max \
-            "${QEMU_OUTPUT[@]}" \
-            -device "$DEVICE" \
-            -netdev "$NETDEV" \
-            "${KVM_FLAGS[@]}"
-    fi
+# QEMU_MACHINE was populated by detect_qemu; covers -machine virt on
+# aarch64 and -cpu (max/host) per accel. For the ISO/Limine path a
+# caller passes -cdrom; this script always uses -kernel.
+if [[ "$HOST_ARCH" = "arm64" || "$HOST_ARCH" = "aarch64" ]] && [[ "$KERNEL" == *.elf ]]; then
+    IMG="${KERNEL%.elf}.img"
+    [[ -f "$IMG" ]] || { echo "Error: QEMU -kernel on aarch64 needs raw .img at $IMG"; exit 1; }
+    KERNEL_ARG="$IMG"
 fi
 
-# ── macOS x86_64 → QEMU with HVF ─────────────────────────────────────────────
-if ! command -v qemu-system-x86_64 &>/dev/null; then
-    echo "Error: qemu-system-x86_64 not found. Install with: brew install qemu"
-    exit 1
-fi
-
-DEVICE="virtio-net-pci,netdev=net0"
-NETDEV="user,id=net0,hostfwd=tcp::${HOST_PORT}-:80"
-if [ "${CPUS}" -gt 1 ]; then
-    DEVICE="virtio-net-pci,netdev=net0,mq=on,vectors=$((2*CPUS+2))"
-    NETDEV="user,id=net0,hostfwd=tcp::${HOST_PORT}-:80,queues=${CPUS}"
-fi
-
-QEMU_X86=(
-    qemu-system-x86_64
-    -kernel "$KERNEL"
-    -m "${MEMORY}"
-    -smp "${CPUS}"
-    "${QEMU_OUTPUT[@]}"
-    -device "$DEVICE"
-    -netdev "$NETDEV"
-)
-
-# `-cpu host` is the right choice under HVF (pass-through host
-# features, including AVX, which our compiled crypto needs).
-# `-cpu max` is the fallback under pure TCG — it enables every
-# feature QEMU can simulate, including AVX. Pre-AVX `qemu64`
-# crashes the TLS init scalar mult with #UD.
-if sysctl -n kern.hv_support 2>/dev/null | grep -q '^1$'; then
-    exec "${QEMU_X86[@]}" -cpu host -accel hvf
-else
-    exec "${QEMU_X86[@]}" -cpu max
-fi
+run_qemu "$HOST_PORT" "$MEMORY" "${QEMU_MACHINE[@]}" "${ACCEL[@]}" -kernel "$KERNEL_ARG"
