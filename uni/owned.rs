@@ -53,7 +53,11 @@ impl<T: ?Sized> Box<T> {
     /// Consume the box and return a `&'static mut T`. The allocation is
     /// never freed; intended only for boot-time singletons whose lifetime
     /// is the entire program. Equivalent to `alloc::Box::leak`.
+    ///
+    /// Discarding the returned reference silently leaks the allocation
+    /// with no way to recover it, so the `#[must_use]` is strict.
     #[inline]
+    #[must_use = "the leaked reference is the only access to this allocation"]
     pub fn leak(self) -> &'static mut T {
         let raw = self.ptr.as_ptr();
         mem::forget(self);
