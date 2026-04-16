@@ -17,7 +17,13 @@ SELF_NAME="$(basename "$0")"
 ISO="${SELF_DIR}/${SELF_NAME}.iso"
 [[ -f "$ISO" ]] || { echo "ERROR: .iso not found at $ISO" >&2; exit 1; }
 
-ROOT="$(cd "$SELF_DIR/../.." && pwd)"
+# Walk upward from $SELF_DIR until we hit the helpers.sh marker —
+# survives arbitrary target nesting depth.
+ROOT="$SELF_DIR"
+while [[ "$ROOT" != "/" ]] && [[ ! -f "$ROOT/scripts/helpers.sh" ]]; do
+    ROOT="$(dirname "$ROOT")"
+done
+[[ -f "$ROOT/scripts/helpers.sh" ]] || { echo "ERROR: scripts/helpers.sh not found (searched upward from $SELF_DIR)" >&2; exit 1; }
 source "$ROOT/scripts/helpers.sh"
 
 QEMU_BIN="qemu-system-x86_64"

@@ -59,6 +59,29 @@ detect_qemu() {
     fi
 }
 
+# ── Launcher root discovery ──────────────────────────────────────────────────
+# Given the directory of a `bazel/rules/run_*.sh` script (which sits at
+# `<root>/<pkg>/<app>` in the runfiles or bazel-bin tree), walk upward until
+# we find the workspace/runfiles root — identified by `scripts/helpers.sh`
+# which is a data dep of every unikernel_binary target. This is more
+# robust than a hardcoded `../..`, which would break for a target defined
+# at a non-standard depth (e.g. `apps/foo/bar/myapp`).
+#
+# The caller sources this file AFTER calling this (chicken-and-egg), so
+# the function is duplicated as a small inline helper in each run_*.sh.
+# Keeping a reference copy here for the docs / single-point-of-change
+# review path.
+#
+# unikernel_launcher_root() {
+#     local d="$1"
+#     while [[ "$d" != "/" ]]; do
+#         [[ -f "$d/scripts/helpers.sh" ]] && { printf '%s\n' "$d"; return 0; }
+#         d="$(dirname "$d")"
+#     done
+#     echo "ERROR: couldn't locate scripts/helpers.sh from $1" >&2
+#     return 1
+# }
+
 # ── VM lifecycle ─────────────────────────────────────────────────────────────
 # Kill background VM and remove log file.
 # Usage: trap cleanup_vm EXIT

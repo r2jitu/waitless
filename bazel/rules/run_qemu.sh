@@ -21,7 +21,14 @@ SELF_NAME="$(basename "$0")"
 ELF="${SELF_DIR}/${SELF_NAME}.elf"
 [[ -f "$ELF" ]] || { echo "ERROR: .elf not found at $ELF" >&2; exit 1; }
 
-ROOT="$(cd "$SELF_DIR/../.." && pwd)"
+# Find the workspace/runfiles root by walking upward until we hit the
+# helpers.sh marker. More robust than a hardcoded `../..` — survives
+# arbitrary nesting depth.
+ROOT="$SELF_DIR"
+while [[ "$ROOT" != "/" ]] && [[ ! -f "$ROOT/scripts/helpers.sh" ]]; do
+    ROOT="$(dirname "$ROOT")"
+done
+[[ -f "$ROOT/scripts/helpers.sh" ]] || { echo "ERROR: scripts/helpers.sh not found (searched upward from $SELF_DIR)" >&2; exit 1; }
 source "$ROOT/scripts/helpers.sh"
 
 detect_qemu "$ELF"

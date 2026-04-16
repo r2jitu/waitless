@@ -22,12 +22,15 @@ SELF_NAME="$(basename "$0")"
 IMG="${SELF_DIR}/${SELF_NAME}.img"
 [[ -f "$IMG" ]] || { echo "ERROR: .img not found at $IMG" >&2; exit 1; }
 
-# Runfiles root is two levels up from apps/<app>/ (i.e., _main/).
-# In both bazel run and test-subprocess contexts the launcher sits at
-# <root>/<pkg>/<name>, so stripping two components gets the root.
-ROOT="$(cd "$SELF_DIR/../.." && pwd)"
+# Walk upward from $SELF_DIR until we find the workspace/runfiles root
+# (identified by `scripts/helpers.sh`, a data dep of every
+# unikernel_binary). Survives targets at arbitrary nesting depth.
+ROOT="$SELF_DIR"
+while [[ "$ROOT" != "/" ]] && [[ ! -f "$ROOT/tools/hvf-runner/run-hvf" ]]; do
+    ROOT="$(dirname "$ROOT")"
+done
 HVF="$ROOT/tools/hvf-runner/run-hvf"
-[[ -x "$HVF" ]] || { echo "ERROR: run-hvf not found at $HVF" >&2; exit 1; }
+[[ -x "$HVF" ]] || { echo "ERROR: run-hvf not found (searched upward from $SELF_DIR)" >&2; exit 1; }
 
 PORT="${UNIKERNEL_PORT:-8080}"
 TLS_PORT="${UNIKERNEL_TLS_PORT:-8443}"

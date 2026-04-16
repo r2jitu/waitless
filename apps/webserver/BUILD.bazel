@@ -22,44 +22,23 @@ unikernel_binary(
     app = ":app",
 )
 
-# Boot + Ctrl-C regression test. Sends a Ctrl-C byte to the guest serial
-# under load and checks the VM exits within a short deadline — a guard
-# against event-loop-starvation bugs (e.g. the virtio IRQ storm that used
-# to wedge both HTTP and the shutdown path).
-sh_test(
-    name = "test_ctrlc",
-    timeout = "short",
-    srcs = ["test_ctrlc.sh"],
-    data = ["//scripts:helpers.sh"] + select({
-        "//bazel/platforms:runner_hvf": [
-            ":webserver.img",
-            "//tools/hvf-runner:run_hvf",
-        ],
-        "//bazel/platforms:runner_qemu": [
-            ":webserver.elf",
-            ":webserver.img",
-        ],
-        "//conditions:default": [],
-    }),
-    tags = [
-        "exclusive",
-        "local",
-    ],
-)
-
-# One test script covers every runner: the test depends on the :webserver
-# launcher as a data dep and spawns it as a subprocess, then probes the
-# three service ports. Runner-specific launch logic stays exactly in the
-# :webserver target — the test doesn't need to know about HVF vs QEMU vs
-# ISO vs native.
+# One test covers every runner: it lists :webserver (the launcher) as a
+# data dep, spawns it as a subprocess, and probes HTTP / HTTPS / UDP,
+# plus a PTY-driven Ctrl-C regression check. Runner-specific launch
+# logic lives in the :webserver target — the test doesn't need to know
+# HVF from QEMU from ISO from native.
+#
+# sh_test is a thin wrapper (test.sh) that exec's the real
+# unittest-based test.py. rules_python isn't wired in this project;
+# if that changes the test target can switch to py_test unchanged.
 sh_test(
     name = "test",
     timeout = "long",
     srcs = ["test.sh"],
     data = [
+        ":test.py",
         ":webserver",
         "//apps/webserver/dev_certs:dev_cert.pem",
-        "//scripts:helpers.sh",
     ],
     tags = [
         "exclusive",
