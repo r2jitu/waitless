@@ -14,15 +14,15 @@
 # Usage: ./scripts/gcp.sh <command>
 #
 # Commands:
-#   status    Show instance status
-#   start     Start the instance
-#   stop      Stop the instance (no compute charge while stopped)
-#   ip        Print the current external IP (changes on each start)
-#   ssh       Open an interactive SSH session
-#   run       Build locally, push binary, run with KVM (http://localhost:PORT/)
-#   test      Build locally, push binary, run HTTP+UDP tests with KVM
-#   serve     Build, push, launch KVM detached with public :80/:443 bindings
-#   serve-stop  Kill the detached serve VM (leaves the GCP instance running)
+#   status   Show instance status and external IP
+#   start    Start the instance
+#   stop     Stop the instance (no compute charge while stopped)
+#   ip       Print current external IP
+#   ssh      Open an interactive SSH session
+#   run      Build, push, run KVM with public :80/:443 + interactive serial
+#   test     Build, push, run HTTP+UDP tests with KVM
+#   serve    Build, push, run KVM detached with public :80/:443
+#   kill     Kill the remote VM (leaves the GCP instance running)
 
 set -euo pipefail
 
@@ -35,9 +35,13 @@ GCP_INSTANCE="${GCP_INSTANCE:-kvm-vm}"
 SSH_HOST="${GCP_SSH_HOST:-gcp}"
 MEMORY="${UNIKERNEL_MEMORY:-128}"
 CPUS="${UNIKERNEL_CPUS:-1}"
-HOST_PORT="${UNIKERNEL_PORT:-8080}"
-TLS_HOST_PORT="${UNIKERNEL_TLS_PORT:-8443}"
 TEST_PORT=19099
+
+# pkill/pgrep -f pattern for the running guest. The character-class
+# trick (`[q]emu…`) is load-bearing: without it the literal regex
+# appears in pkill's own argv, and the regex self-matches the caller
+# process, so bash/ssh exits 255 mid-cleanup.
+QEMU_PATTERN='[q]emu-system-x86_64.*webserver.elf'
 
 cmd="${1:-help}"
 
@@ -47,17 +51,29 @@ _gcloud() {
         --zone="$GCP_ZONE"
 }
 
+_ext_ip() {
+    _gcloud describe "$GCP_INSTANCE" \
+        --format='get(networkInterfaces[0].accessConfigs[0].natIP)'
+}
+
 _update_ssh_ip() {
     local ip
-    ip=$(_gcloud describe "$GCP_INSTANCE" \
-        --format='get(networkInterfaces[0].accessConfigs[0].natIP)')
+    ip=$(_ext_ip)
     if [ -z "$ip" ] || [ "$ip" = "None" ]; then
         echo "error: no external IP found" >&2
         return 1
     fi
-    # Update the HostName in ~/.ssh/config
+    # Portable in-place sed: GNU accepts `-i ''`, BSD requires `-i
+    # <suffix>`, so we write a .bak and delete it afterwards to keep
+    # ~/.ssh clean.
     sed -i.bak "/^Host ${SSH_HOST}$/,/^Host / s/HostName .*/HostName ${ip}/" ~/.ssh/config
+    rm -f ~/.ssh/config.bak
     echo "$ip"
+}
+
+_kill_remote_vm() {
+    ssh "$SSH_HOST" "sudo pkill -f '$QEMU_PATTERN' 2>/dev/null; true" \
+        >/dev/null 2>&1 || true
 }
 
 _build() {
@@ -84,12 +100,12 @@ case "$cmd" in
         _gcloud start "$GCP_INSTANCE"
         echo "    Waiting for SSH..."
         sleep 5
-        local_ip=$(_update_ssh_ip)
+        ip=$(_update_ssh_ip)
         # Drop any stale known_hosts entry for the new IP — GCE re-rolls
         # the external IP on every start so the old fingerprint is
         # almost always wrong for the new host at the same address.
-        ssh-keygen -R "$local_ip" >/dev/null 2>&1 || true
-        echo "    External IP: $local_ip (SSH config updated)"
+        ssh-keygen -R "$ip" >/dev/null 2>&1 || true
+        echo "    External IP: $ip (SSH config updated)"
         echo "    Connect: ssh $SSH_HOST"
         ;;
 
@@ -99,8 +115,7 @@ case "$cmd" in
         ;;
 
     ip)
-        _gcloud describe "$GCP_INSTANCE" \
-            --format='get(networkInterfaces[0].accessConfigs[0].natIP)'
+        _ext_ip
         ;;
 
     ssh)
@@ -119,24 +134,24 @@ case "$cmd" in
         fi
 
         _build; _push
-        _update_ssh_ip > /dev/null 2>&1 || true
+        ext_ip=$(_update_ssh_ip)
 
-        # Architecture: remote QEMU exposes its guest serial as a unix
-        # domain socket (`-chardev socket`). We forward that socket over
-        # SSH's native unix-socket tunneling so it shows up locally, then
-        # drive the local tty in raw mode with socat. Every keystroke
-        # becomes a raw byte delivered to the guest's UART RX — Ctrl-C is
-        # 0x03, arrow keys are CSI, etc. The kernel's existing serial RX
-        # path (serial::check_shutdown polls for 0x03 → arch::shutdown →
-        # ACPI/PSCI) drives graceful shutdown on Ctrl-C; socat's own
-        # escape (Ctrl-]) disconnects without touching the VM.
-        ssh "$SSH_HOST" "sudo pkill -f '[q]emu-system-x86_64.*webserver.elf' 2>/dev/null; true"
-        ssh "$SSH_HOST" bash -s "$MEMORY" "$CPUS" "$HOST_PORT" "$TLS_HOST_PORT" <<'REMOTE'
+        # Remote QEMU binds hostfwd to 0.0.0.0:80 / :443 on the instance
+        # so the VM is directly reachable at the public IP (gated by the
+        # `allow-unikernel` firewall rule), and exposes the guest serial
+        # over a unix-domain socket. We forward ONLY the serial socket
+        # over SSH (no TCP tunnels needed — the VM is public), then drive
+        # the local tty in raw mode with socat. Every keystroke is a raw
+        # byte to the guest UART RX: Ctrl-C (0x03) → serial::check_shutdown
+        # → arch_shutdown → ACPI S5 → clean QEMU exit; Ctrl-] is socat's
+        # escape char and detaches without touching the VM.
+        _kill_remote_vm
+        ssh "$SSH_HOST" bash -s "$QEMU_PATTERN" "$MEMORY" "$CPUS" <<'REMOTE'
 set -euo pipefail
-MEMORY="$1"; CPUS="$2"; HTTP_PORT="$3"; TLS_PORT="$4"
+QEMU_PATTERN="$1"; MEMORY="$2"; CPUS="$3"
 
 DEVICE="virtio-net-pci,netdev=net0"
-NETDEV="user,id=net0,hostfwd=tcp:127.0.0.1:${HTTP_PORT}-:80,hostfwd=tcp:127.0.0.1:${TLS_PORT}-:443"
+NETDEV="user,id=net0,hostfwd=tcp::80-:80,hostfwd=tcp::443-:443"
 if [[ "$CPUS" -gt 1 ]]; then
     DEVICE="virtio-net-pci,netdev=net0,mq=on,vectors=$((2*CPUS+2))"
     NETDEV="${NETDEV},queues=${CPUS}"
@@ -156,13 +171,14 @@ nohup sudo qemu-system-x86_64 \
     </dev/null >/tmp/qemu.out 2>&1 &
 disown
 
-# Wait for socket to appear; chmod it so the ssh-forwarding user can connect
-for i in $(seq 1 80); do
+# Wait for the socket file and chmod it so the sshd-forwarding user
+# (which is not root) can connect to the qemu-owned socket.
+for _ in $(seq 1 80); do
     if [[ -S /tmp/webserver.sock ]]; then
         sudo chmod 666 /tmp/webserver.sock
         break
     fi
-    if ! pgrep -f "qemu-system-x86_64.*webserver.elf" >/dev/null; then
+    if ! pgrep -f "$QEMU_PATTERN" >/dev/null; then
         echo "ERROR: qemu exited before socket appeared" >&2
         tail -40 /tmp/qemu.out 2>/dev/null >&2 || true
         exit 1
@@ -171,12 +187,13 @@ for i in $(seq 1 80); do
 done
 [[ -S /tmp/webserver.sock ]] || { echo "ERROR: serial socket not created" >&2; exit 1; }
 
-# Wait for HTTP to be reachable
-for i in $(seq 1 60); do
-    if curl -sf --max-time 2 "http://127.0.0.1:${HTTP_PORT}/health" >/dev/null 2>&1; then
+# Wait for HTTP to respond. Once the health endpoint is up, we know
+# TLS is listening too (same event-loop setup path).
+for _ in $(seq 1 60); do
+    if curl -sf --max-time 2 http://127.0.0.1/health >/dev/null 2>&1; then
         exit 0
     fi
-    if ! pgrep -f "qemu-system-x86_64.*webserver.elf" >/dev/null; then
+    if ! pgrep -f "$QEMU_PATTERN" >/dev/null; then
         echo "ERROR: qemu exited early" >&2
         tail -40 /tmp/qemu.out 2>/dev/null >&2 || true
         exit 1
@@ -194,14 +211,14 @@ REMOTE
         _gcp_run_cleanup() {
             trap - EXIT INT TERM
             echo ""
-            # If the VM is still alive, the user detached via Ctrl-]
-            # (or something killed socat before the kernel shut down):
-            # kill it explicitly. If the VM already exited on its own
-            # — the Ctrl-C → ACPI S5 path — pkill is a no-op but we say
-            # so for clarity.
-            if ssh "$SSH_HOST" "pgrep -f '[q]emu-system-x86_64.*webserver.elf'" >/dev/null 2>&1; then
+            # If the VM is still alive the user detached via Ctrl-] (or
+            # something killed socat before the kernel shut down): kill
+            # it explicitly. If the VM already exited on its own — the
+            # Ctrl-C → ACPI S5 path — _kill_remote_vm is a no-op but we
+            # still print a friendly message.
+            if ssh "$SSH_HOST" "pgrep -f '$QEMU_PATTERN'" >/dev/null 2>&1; then
                 echo "==> Stopping remote VM..."
-                ssh "$SSH_HOST" "sudo pkill -f '[q]emu-system-x86_64.*webserver.elf' 2>/dev/null; true" >/dev/null 2>&1 || true
+                _kill_remote_vm
             else
                 echo "==> VM exited."
             fi
@@ -210,27 +227,25 @@ REMOTE
         }
         trap '_gcp_run_cleanup' EXIT INT TERM
 
-        # Background ssh master: two TCP tunnels for HTTP/HTTPS plus a
-        # unix-socket tunnel for the guest serial. ControlMaster so we
-        # can cleanly shut it down via `ssh -O exit` from the trap.
+        # Background SSH ControlMaster with a single unix-socket tunnel
+        # for the guest serial. HTTP/HTTPS aren't tunneled — they bind
+        # publicly on the instance and are reachable at the external IP.
         ssh -fN \
             -o ControlMaster=yes \
             -o ControlPath="$SSH_CTRL" \
             -o ExitOnForwardFailure=yes \
-            -L "${HOST_PORT}:localhost:${HOST_PORT}" \
-            -L "${TLS_HOST_PORT}:localhost:${TLS_HOST_PORT}" \
             -L "${LOCAL_SOCK}:/tmp/webserver.sock" \
             "$SSH_HOST"
 
-        for i in $(seq 1 20); do
+        for _ in $(seq 1 20); do
             [[ -S "$LOCAL_SOCK" ]] && break
             sleep 0.1
         done
         [[ -S "$LOCAL_SOCK" ]] || { echo "ERROR: local socket forward not established" >&2; exit 1; }
 
         echo "==> Running on GCP with KVM..."
-        echo "    HTTP:   http://localhost:${HOST_PORT}/"
-        echo "    HTTPS:  https://localhost:${TLS_HOST_PORT}/  (self-signed — curl -k)"
+        echo "    HTTP:   http://${ext_ip}/"
+        echo "    HTTPS:  https://${ext_ip}/  (self-signed — curl -k)"
         echo "    Serial: interactive (Ctrl-C → VM graceful shutdown; Ctrl-] → detach)"
         echo ""
         # rawer = no ICANON/ECHO/ISIG/IEXTEN/OPOST etc — pure byte relay.
@@ -321,23 +336,19 @@ REMOTE
 
     serve)
         _build; _push
-
         ext_ip=$(_update_ssh_ip)
 
-        echo "==> Launching detached KVM serve on GCP (public :80/:443)..."
-        ssh "$SSH_HOST" bash -s "$MEMORY" "$CPUS" <<'REMOTE'
+        echo "==> Launching detached KVM on GCP (public :80/:443)..."
+        _kill_remote_vm
+        ssh "$SSH_HOST" bash -s "$QEMU_PATTERN" "$MEMORY" "$CPUS" <<'REMOTE'
 set -euo pipefail
-MEMORY="$1"
-CPUS="$2"
-
-sudo pkill -f '[q]emu-system-x86_64.*webserver.elf' 2>/dev/null || true
-sleep 0.5
+QEMU_PATTERN="$1"; MEMORY="$2"; CPUS="$3"
 
 DEVICE="virtio-net-pci,netdev=net0"
 NETDEV="user,id=net0,hostfwd=tcp::80-:80,hostfwd=tcp::443-:443"
 if [[ "$CPUS" -gt 1 ]]; then
     DEVICE="virtio-net-pci,netdev=net0,mq=on,vectors=$((2*CPUS+2))"
-    NETDEV="user,id=net0,hostfwd=tcp::80-:80,hostfwd=tcp::443-:443,queues=${CPUS}"
+    NETDEV="${NETDEV},queues=${CPUS}"
 fi
 
 sudo rm -f /tmp/webserver.log /tmp/qemu.out
@@ -358,7 +369,7 @@ for i in $(seq 1 30); do
     if curl -sf --max-time 2 http://localhost/health >/dev/null 2>&1; then
         echo "    Ready in ${i}s"; exit 0
     fi
-    if ! pgrep -f "qemu-system-x86_64.*webserver.elf" >/dev/null; then
+    if ! pgrep -f "$QEMU_PATTERN" >/dev/null; then
         echo "ERROR: QEMU exited early" >&2
         tail -40 /tmp/qemu.out /tmp/webserver.log >&2 || true
         exit 1
@@ -373,16 +384,16 @@ REMOTE
         echo ""
         echo "==> Public endpoints:"
         echo "     HTTP:  http://${ext_ip}/"
-        echo "     HTTPS: https://${ext_ip}/   (self-signed dev cert — use curl -k)"
+        echo "     HTTPS: https://${ext_ip}/   (self-signed dev cert — curl -k)"
         echo ""
         echo "    Serial log: ssh ${SSH_HOST} 'sudo tail -f /tmp/webserver.log'"
-        echo "    Stop VM:    ./scripts/gcp.sh serve-stop"
+        echo "    Stop VM:    ./scripts/gcp.sh kill"
         echo "    Stop inst:  ./scripts/gcp.sh stop"
         ;;
 
-    serve-stop)
-        echo "==> Stopping detached serve VM..."
-        ssh "$SSH_HOST" 'sudo pkill -f '[q]emu-system-x86_64.*webserver.elf' || true'
+    kill)
+        echo "==> Stopping remote VM..."
+        _kill_remote_vm
         echo "    (GCP instance still running; use './scripts/gcp.sh stop' to halt it.)"
         ;;
 
@@ -391,25 +402,23 @@ REMOTE
 Usage: ./scripts/gcp.sh <command>
 
 Commands:
-  status      Show instance status and external IP
-  start       Start the instance
-  stop        Stop the instance (no compute charge while stopped)
-  ip          Print current external IP
-  ssh         Open an interactive SSH session
-  run         Build, push, run with KVM (SSH-tunnelled to localhost)
-  test        Build, push, run HTTP+UDP tests with KVM
-  serve       Build, push, launch detached KVM with public :80/:443 bindings
-  serve-stop  Kill the detached serve VM (leaves the GCP instance running)
+  status   Show instance status and external IP
+  start    Start the instance
+  stop     Stop the instance (no compute charge while stopped)
+  ip       Print current external IP
+  ssh      Open an interactive SSH session
+  run      Build, push, run KVM with public :80/:443 + interactive serial
+  test     Build, push, run HTTP+UDP tests with KVM
+  serve    Build, push, run KVM detached with public :80/:443
+  kill     Kill the remote VM (leaves the GCP instance running)
 
 Environment:
-  GCP_PROJECT=unikernel-dev    GCP project (default: unikernel-dev)
-  GCP_ZONE=us-west1-a          GCP zone (default: us-west1-a)
-  GCP_INSTANCE=kvm-vm          Instance name (default: kvm-vm)
-  GCP_SSH_HOST=gcp             SSH config alias (default: gcp)
+  GCP_PROJECT=unikernel-dev    GCP project
+  GCP_ZONE=us-west1-a          GCP zone
+  GCP_INSTANCE=kvm-vm          Instance name
+  GCP_SSH_HOST=gcp             SSH config alias
   UNIKERNEL_MEMORY=128         VM memory in MB
   UNIKERNEL_CPUS=1             vCPU count
-  UNIKERNEL_PORT=8080          Local port forwarded to VM port 80 (run only)
-  UNIKERNEL_TLS_PORT=8443      Local port forwarded to VM port 443 (run only)
 USAGE
         ;;
 esac
