@@ -102,25 +102,8 @@ unsafe extern "C" {
 // Formatted output helper
 // ============================================================================
 
-fn klog(args: core::fmt::Arguments) {
-    struct W;
-    impl core::fmt::Write for W {
-        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            for b in s.bytes() {
-                if b == b'\n' {
-                    serial::putc(b'\r');
-                }
-                serial::putc(b);
-            }
-            Ok(())
-        }
-    }
-    use core::fmt::Write;
-    let _ = W.write_fmt(args);
-}
-
 macro_rules! klog {
-    ($($arg:tt)*) => { klog(core::format_args!($($arg)*)) };
+    ($($arg:tt)*) => { serial::write_fmt(core::format_args!($($arg)*)) };
 }
 
 // ============================================================================

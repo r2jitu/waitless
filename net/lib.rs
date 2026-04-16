@@ -93,11 +93,11 @@ fn poll_tier1() -> bool {
     if !MULTICORE_INIT.load(core::sync::atomic::Ordering::Relaxed) {
         MULTICORE_INIT.store(true, core::sync::atomic::Ordering::Relaxed);
         let nqp = drivers::virtio_net::num_queue_pairs();
-        kernel::serial::puts(b"[net] Tier 1: per-core RX queues (");
-        let mut buf = [0u8; 4];
-        let len = fmt_u32(&mut buf, nqp as u32);
-        kernel::serial::puts(&buf[..len]);
-        kernel::serial::puts(b" queue pairs)\n");
+        // One write_fmt holds SERIAL_TX_LOCK for the whole line so a
+        // concurrent klog! on another core can't slip in mid-message.
+        kernel::serial::write_fmt(format_args!(
+            "[net] Tier 1: per-core RX queues ({} queue pairs)\n", nqp
+        ));
     }
     let core = kernel::cpu_id();
     let nqp = drivers::virtio_net::num_queue_pairs() as u32;
@@ -110,11 +110,9 @@ fn poll_tier1() -> bool {
 fn poll_tier2(num_cores: u32) -> bool {
     if !MULTICORE_INIT.load(core::sync::atomic::Ordering::Relaxed) {
         MULTICORE_INIT.store(true, core::sync::atomic::Ordering::Relaxed);
-        kernel::serial::puts(b"[net] Tier 2: software distribution (");
-        let mut buf = [0u8; 4];
-        let len = fmt_u32(&mut buf, num_cores);
-        kernel::serial::puts(&buf[..len]);
-        kernel::serial::puts(b" cores)\n");
+        kernel::serial::write_fmt(format_args!(
+            "[net] Tier 2: software distribution ({} cores)\n", num_cores
+        ));
     }
 
     let my_core = kernel::cpu_id();
@@ -369,12 +367,3 @@ fn net_flush_cb() {
     }
 }
 
-
-fn fmt_u32(buf: &mut [u8], mut val: u32) -> usize {
-    if val == 0 { buf[0] = b'0'; return 1; }
-    let mut tmp = [0u8; 10];
-    let mut len = 0;
-    while val > 0 { tmp[len] = b'0' + (val % 10) as u8; val /= 10; len += 1; }
-    for i in 0..len { buf[i] = tmp[len - 1 - i]; }
-    len
-}

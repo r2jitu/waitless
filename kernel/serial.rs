@@ -328,24 +328,37 @@ pub fn rx_isr() {
 // core::fmt::Write implementation for Rust callers
 // ============================================================================
 
-/// Serial writer for use with core::fmt::Write.
-/// Usage: `write!(SerialWriter, "hello {}", 42)`
-pub struct SerialWriter;
+/// Serial writer for use with core::fmt::Write. Used internally by
+/// `serial::write_fmt` while SERIAL_TX_LOCK is held — emits bytes
+/// directly via the arch-specific UART helpers without re-acquiring
+/// the lock. Do NOT call this from anywhere that doesn't already
+/// hold the lock; that's why it's private.
+struct LockedWriter;
 
-impl core::fmt::Write for SerialWriter {
+impl core::fmt::Write for LockedWriter {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         for b in s.bytes() {
-            if b == b'\n' {
-                putc(b'\r');
+            unsafe {
+                if b == b'\n' {
+                    #[cfg(target_arch = "x86_64")] x86::putc(b'\r');
+                    #[cfg(target_arch = "aarch64")] aarch64::putc(b'\r');
+                }
+                #[cfg(target_arch = "x86_64")] x86::putc(b);
+                #[cfg(target_arch = "aarch64")] aarch64::putc(b);
             }
-            putc(b);
         }
         Ok(())
     }
 }
 
-/// Formatted serial output from Rust code.
+/// Formatted serial output from Rust code. Hold SERIAL_TX_LOCK once
+/// around the whole format operation so multi-chunk format machinery
+/// (which calls `write_str` once per literal/argument segment) can't
+/// be interleaved by another core's serial output. Without this, two
+/// concurrent klog!s line-mangle into things like
+/// `[net] Tier 1: per-core RX queues ([BOOT] En8 queue pairs)`.
 pub fn write_fmt(args: core::fmt::Arguments) {
     use core::fmt::Write;
-    let _ = SerialWriter.write_fmt(args);
+    let _guard = SERIAL_TX_LOCK.lock();
+    let _ = LockedWriter.write_fmt(args);
 }
