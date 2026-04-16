@@ -104,6 +104,51 @@ _replace_remote_vm() {
     fi
 }
 
+# Bring up a multi-queue tap0 + dnsmasq lease + iptables NAT so the
+# guest is reachable at the public IP via DNAT and outbound from the
+# guest is MASQUERADE'd. Idempotent — fast on subsequent runs.
+#
+# Why tap+vhost instead of `-netdev user`: SLIRP user-mode networking
+# only has one host-side queue regardless of the device's mq=on, so
+# the guest always negotiates max_virtqueue_pairs=1 and our virtio-net
+# driver falls back to Tier 2 software distribution. tap+vhost-net
+# gives us real per-core queue pairs, with one ksoftirqd-style worker
+# thread per queue on the host side.
+GUEST_MAC="52:54:00:12:34:56"
+GUEST_IP="10.20.30.10"
+TAP_NET_CIDR="10.20.30.0/24"
+TAP_HOST_IP="10.20.30.1"
+_setup_remote_tap_nat() {
+    ssh "$SSH_HOST" sudo bash -s "$GUEST_IP" <<'NET'
+set -e
+GUEST_IP="$1"
+USER_NAME="${SUDO_USER:-jitudas}"
+PUB_IF=$(ip -o -4 route show default | awk '{print $5; exit}')
+
+# tap0 multi-queue (matches /usr/local/sbin/bench-tap-setup.sh layout
+# so bench.py and gcp.sh share the same interface and dnsmasq lease).
+if ! ip link show tap0 >/dev/null 2>&1; then
+    ip tuntap add dev tap0 mode tap multi_queue user "$USER_NAME"
+    ip addr add 10.20.30.1/24 dev tap0
+fi
+ip link set tap0 up
+
+# dnsmasq leases ${GUEST_IP} to the fixed guest MAC; restart only when
+# stopped so we don't churn DHCP between back-to-back launches.
+systemctl is-active --quiet dnsmasq || systemctl restart dnsmasq
+
+# IP forwarding + NAT plumbing.
+sysctl -wq net.ipv4.ip_forward=1
+
+_add_nat() { iptables -t nat -C "$@" 2>/dev/null || iptables -t nat -A "$@"; }
+_add_nat POSTROUTING -s 10.20.30.0/24 -o "$PUB_IF" -j MASQUERADE
+for port in 80 443; do
+    _add_nat PREROUTING -i "$PUB_IF" -p tcp --dport "$port" \
+        -j DNAT --to-destination "${GUEST_IP}:${port}"
+done
+NET
+}
+
 _build() {
     echo "==> Building webserver.elf..."
     cd "$PROJECT_ROOT"
@@ -164,37 +209,34 @@ case "$cmd" in
         _build; _push
         ext_ip=$(_update_ssh_ip)
         _replace_remote_vm
+        _setup_remote_tap_nat
 
-        # Remote QEMU binds hostfwd to 0.0.0.0:80 / :443 on the instance
-        # so the VM is directly reachable at the public IP (gated by the
-        # `allow-unikernel` firewall rule), and exposes the guest serial
-        # over a unix-domain socket. We forward ONLY that serial socket
-        # over SSH (no TCP tunnels needed — the VM is public), then drive
-        # the local tty in raw mode with socat. Every keystroke becomes
-        # a raw byte to the guest UART RX: Ctrl-C (0x03) → serial::
-        # check_shutdown → arch_shutdown → ACPI S5 → clean QEMU exit.
-        # Ctrl-] is socat's escape char and detaches without touching
-        # the VM.
+        # tap+vhost-net replaces user-mode networking so the device
+        # actually has per-queue host workers (real MQ; the guest
+        # negotiates max_virtqueue_pairs from the device's config and
+        # promotes to N pairs in activate_multi_queue()). The fixed
+        # GUEST_MAC pins dnsmasq's lease to GUEST_IP so the kernel
+        # always comes up at the same address, and iptables PREROUTING
+        # DNAT (set up by _setup_remote_tap_nat) forwards external
+        # :80/:443 there.
         #
-        # `wait=on` on the chardev blocks qemu's main loop at chardev
-        # init until the first client connects, so local socat captures
-        # the very first boot line instead of racing a boot that already
-        # happened. The tradeoff is we can't curl /health from the
-        # remote launcher — the guest hasn't started yet — so readiness
-        # is the user's eyeballs on the interactive console.
-        ssh "$SSH_HOST" bash -s "$QEMU_PATTERN" "$MEMORY" "$CPUS" <<'REMOTE'
+        # The serial chardev is a unix-domain socket forwarded over SSH;
+        # local socat drives the tty in raw mode. wait=on blocks qemu's
+        # main loop at chardev init until the first client connects, so
+        # local socat captures the very first boot line — the tradeoff
+        # is we can't probe /health from the remote launcher (the guest
+        # hasn't started yet); readiness is the user's eyeballs on the
+        # interactive console.
+        ssh "$SSH_HOST" bash -s "$QEMU_PATTERN" "$MEMORY" "$CPUS" "$GUEST_MAC" <<'REMOTE'
 set -euo pipefail
-QEMU_PATTERN="$1"; MEMORY="$2"; CPUS="$3"
+QEMU_PATTERN="$1"; MEMORY="$2"; CPUS="$3"; GUEST_MAC="$4"
 
-DEVICE="virtio-net-pci,netdev=net0"
-NETDEV="user,id=net0,hostfwd=tcp::80-:80,hostfwd=tcp::443-:443"
-if [[ "$CPUS" -gt 1 ]]; then
-    # mq + vectors advertise multi-queue to the guest so the virtio-net
-    # driver creates per-core queue pairs for multi-core distribution.
-    # `queues=` is NOT set: user-mode networking (-netdev user) only
-    # supports one host queue (unlike tap+vhost which does real MQ).
-    DEVICE="virtio-net-pci,netdev=net0,mq=on,vectors=$((2*CPUS+2))"
-fi
+# Multi-queue tap requires queues>=2 (QEMU rejects queues=1 on a
+# multi-queue tap, see bench.py KvmEnv comment). vectors=2N+2 covers
+# one MSI-X for each RX, each TX, plus config + ctrl.
+NQUEUES=$(( CPUS > 1 ? CPUS : 2 ))
+NETDEV="tap,id=net0,ifname=tap0,script=no,downscript=no,vhost=on,queues=${NQUEUES}"
+DEVICE="virtio-net-pci,netdev=net0,mac=${GUEST_MAC},mq=on,vectors=$((2*NQUEUES+2))"
 
 sudo rm -f /tmp/webserver.sock /tmp/qemu.out
 nohup sudo qemu-system-x86_64 \
@@ -363,21 +405,16 @@ REMOTE
         _build; _push
         ext_ip=$(_update_ssh_ip)
         _replace_remote_vm
+        _setup_remote_tap_nat
 
         echo "==> Launching detached KVM on GCP (public :80/:443)..."
-        ssh "$SSH_HOST" bash -s "$QEMU_PATTERN" "$MEMORY" "$CPUS" <<'REMOTE'
+        ssh "$SSH_HOST" bash -s "$QEMU_PATTERN" "$MEMORY" "$CPUS" "$GUEST_MAC" "$GUEST_IP" <<'REMOTE'
 set -euo pipefail
-QEMU_PATTERN="$1"; MEMORY="$2"; CPUS="$3"
+QEMU_PATTERN="$1"; MEMORY="$2"; CPUS="$3"; GUEST_MAC="$4"; GUEST_IP="$5"
 
-DEVICE="virtio-net-pci,netdev=net0"
-NETDEV="user,id=net0,hostfwd=tcp::80-:80,hostfwd=tcp::443-:443"
-if [[ "$CPUS" -gt 1 ]]; then
-    # mq + vectors advertise multi-queue to the guest so the virtio-net
-    # driver creates per-core queue pairs for multi-core distribution.
-    # `queues=` is NOT set: user-mode networking (-netdev user) only
-    # supports one host queue (unlike tap+vhost which does real MQ).
-    DEVICE="virtio-net-pci,netdev=net0,mq=on,vectors=$((2*CPUS+2))"
-fi
+NQUEUES=$(( CPUS > 1 ? CPUS : 2 ))
+NETDEV="tap,id=net0,ifname=tap0,script=no,downscript=no,vhost=on,queues=${NQUEUES}"
+DEVICE="virtio-net-pci,netdev=net0,mac=${GUEST_MAC},mq=on,vectors=$((2*NQUEUES+2))"
 
 sudo rm -f /tmp/webserver.log /tmp/qemu.out
 nohup sudo qemu-system-x86_64 \
@@ -392,9 +429,9 @@ nohup sudo qemu-system-x86_64 \
     </dev/null >/tmp/qemu.out 2>&1 &
 disown
 
-echo "    Waiting for HTTP on :80..."
+echo "    Waiting for HTTP on guest ${GUEST_IP}:80..."
 for i in $(seq 1 30); do
-    if curl -sf --max-time 2 http://localhost/health >/dev/null 2>&1; then
+    if curl -sf --max-time 2 "http://${GUEST_IP}/health" >/dev/null 2>&1; then
         echo "    Ready in ${i}s"; exit 0
     fi
     if ! pgrep -f "$QEMU_PATTERN" >/dev/null; then
