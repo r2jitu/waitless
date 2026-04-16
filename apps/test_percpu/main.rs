@@ -90,8 +90,9 @@ fn main() {
         if done >= expected { break; }
     }
 
-    // Print results
-    for i in 1..num_cores {
+    // Print results — include core 0 (its test runs inline, so it's
+    // always populated) so the test harness can assert on every core.
+    for i in 0..num_cores {
         let result = RESULTS[i as usize].load(Ordering::Acquire);
         uni::log(b"Core ");
         uni::log(&[b'0' + (i as u8 % 10)]);

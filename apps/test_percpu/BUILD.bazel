@@ -1,5 +1,5 @@
+load("@rules_python//python:defs.bzl", "py_test")
 load("@rules_rust//rust:defs.bzl", "rust_library")
-load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 load("//bazel/rules:unikernel.bzl", "unikernel_binary")
 
@@ -20,15 +20,15 @@ unikernel_binary(
     app = ":app",
 )
 
-sh_test(
+py_test(
     name = "test",
     timeout = "long",
-    srcs = ["test_percpu.sh"],
+    srcs = ["test.py"],
+    deps = ["//scripts:test_helpers"],
     data = select({
         "//bazel/platforms:runner_qemu": [
             ":test_percpu.elf",
             ":test_percpu.img",
-            "//scripts:helpers.sh",
         ],
         "//conditions:default": [],
     }),

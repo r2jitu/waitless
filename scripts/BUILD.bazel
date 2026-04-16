@@ -1,3 +1,4 @@
+load("@rules_python//python:defs.bzl", "py_library")
 load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
 
 package(default_visibility = ["//visibility:public"])
@@ -11,4 +12,15 @@ sh_binary(
     name = "make_limine_iso",
     srcs = ["make-limine-iso.sh"],
     data = ["//boot:limine.conf"],
+)
+
+# Shared Python utilities for py_test integration tests: QEMU detection,
+# launcher lifecycle (backgrounded + PTY), HTTP/HTTPS/UDP probes. Replaces
+# the bash-side helpers.sh for test targets. The interactive `bazel run`
+# launchers (bazel/rules/run_*.sh) keep using helpers.sh — no reason to
+# drag Python into an exec path.
+py_library(
+    name = "test_helpers",
+    srcs = ["test_helpers.py"],
+    imports = ["."],  # so tests can `import test_helpers` directly.
 )

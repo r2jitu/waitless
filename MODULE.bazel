@@ -4,9 +4,24 @@ module(
 )
 
 bazel_dep(name = "rules_cc", version = "0.1.1")
+bazel_dep(name = "rules_python", version = "0.40.0")
 bazel_dep(name = "rules_shell", version = "0.6.1")
 bazel_dep(name = "platforms", version = "0.0.10")
 bazel_dep(name = "rules_rust", version = "0.69.0")
+
+# Use the autodetecting Python toolchain — just invokes whatever
+# `/usr/bin/env python3` finds on the host. Avoids the toolchain-
+# resolution dead-end we hit with the hermetic toolchain: it gets
+# registered with @platforms//os:{linux,macos,...} constraints, so
+# under --config=hvf (target platform = aarch64_unikernel with
+# os:none) Bazel can't find a matching toolchain even though the
+# test itself runs on the host.
+#
+# The autodetecting toolchain has no `target_compatible_with`, so
+# resolution succeeds regardless of the target platform, and the
+# host's Python gets used at exec time — exactly what an integration
+# test that spawns the guest needs.
+register_toolchains("@bazel_tools//tools/python:autodetecting_toolchain")
 
 # Patch rules_rust to add aarch64-unknown-none to the platform registry.
 # Without this, crate_universe marks crates as incompatible for our

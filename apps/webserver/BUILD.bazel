@@ -1,5 +1,5 @@
+load("@rules_python//python:defs.bzl", "py_test")
 load("@rules_rust//rust:defs.bzl", "rust_library")
-load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 load("//bazel/rules:unikernel.bzl", "unikernel_binary")
 
@@ -27,16 +27,12 @@ unikernel_binary(
 # plus a PTY-driven Ctrl-C regression check. Runner-specific launch
 # logic lives in the :webserver target — the test doesn't need to know
 # HVF from QEMU from ISO from native.
-#
-# sh_test is a thin wrapper (test.sh) that exec's the real
-# unittest-based test.py. rules_python isn't wired in this project;
-# if that changes the test target can switch to py_test unchanged.
-sh_test(
+py_test(
     name = "test",
     timeout = "long",
-    srcs = ["test.sh"],
+    srcs = ["test.py"],
+    deps = ["//scripts:test_helpers"],
     data = [
-        ":test.py",
         ":webserver",
         "//apps/webserver/dev_certs:dev_cert.pem",
     ],
