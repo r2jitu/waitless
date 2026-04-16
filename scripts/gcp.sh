@@ -108,17 +108,28 @@ case "$cmd" in
         ;;
 
     run)
+        if ! command -v socat >/dev/null 2>&1; then
+            echo "error: 'socat' not found — install it first:" >&2
+            case "$(uname -s)" in
+                Darwin) echo "  brew install socat" >&2 ;;
+                Linux)  echo "  sudo apt install socat   # Debian/Ubuntu" >&2
+                        echo "  sudo dnf install socat   # Fedora/RHEL" >&2 ;;
+            esac
+            exit 1
+        fi
+
         _build; _push
         _update_ssh_ip > /dev/null 2>&1 || true
 
-        # Launch QEMU detached on the remote with serial → /tmp/webserver.log
-        # and hostfwd bound to 127.0.0.1 on the instance (only reachable
-        # through the -L tunnels we open below). Running detached is what
-        # lets Ctrl-C actually work: we tail the log through a cooked-mode
-        # ssh (no -t), so a local SIGINT fires the EXIT trap, which kills
-        # the remote VM via a side-channel ssh. The old interactive path
-        # used `-chardev stdio,signal=off`, which silently drops the 0x03
-        # byte somewhere in the SSH-PTY → remote-PTY → QEMU stdin chain.
+        # Architecture: remote QEMU exposes its guest serial as a unix
+        # domain socket (`-chardev socket`). We forward that socket over
+        # SSH's native unix-socket tunneling so it shows up locally, then
+        # drive the local tty in raw mode with socat. Every keystroke
+        # becomes a raw byte delivered to the guest's UART RX — Ctrl-C is
+        # 0x03, arrow keys are CSI, etc. The kernel's existing serial RX
+        # path (serial::check_shutdown polls for 0x03 → arch::shutdown →
+        # ACPI/PSCI) drives graceful shutdown on Ctrl-C; socat's own
+        # escape (Ctrl-]) disconnects without touching the VM.
         ssh "$SSH_HOST" "sudo pkill -f '[q]emu-system-x86_64.*webserver.elf' 2>/dev/null; true"
         ssh "$SSH_HOST" bash -s "$MEMORY" "$CPUS" "$HOST_PORT" "$TLS_HOST_PORT" <<'REMOTE'
 set -euo pipefail
@@ -131,7 +142,7 @@ if [[ "$CPUS" -gt 1 ]]; then
     NETDEV="${NETDEV},queues=${CPUS}"
 fi
 
-sudo rm -f /tmp/webserver.log /tmp/qemu.out
+sudo rm -f /tmp/webserver.sock /tmp/qemu.out
 nohup sudo qemu-system-x86_64 \
     -accel kvm \
     -kernel "$HOME/webserver.elf" \
@@ -139,45 +150,92 @@ nohup sudo qemu-system-x86_64 \
     -cpu host \
     -device "$DEVICE" \
     -netdev "$NETDEV" \
-    -serial file:/tmp/webserver.log \
+    -chardev socket,id=s0,path=/tmp/webserver.sock,server=on,wait=off \
+    -serial chardev:s0 \
     -display none -no-reboot \
     </dev/null >/tmp/qemu.out 2>&1 &
 disown
 
+# Wait for socket to appear; chmod it so the ssh-forwarding user can connect
+for i in $(seq 1 80); do
+    if [[ -S /tmp/webserver.sock ]]; then
+        sudo chmod 666 /tmp/webserver.sock
+        break
+    fi
+    if ! pgrep -f "qemu-system-x86_64.*webserver.elf" >/dev/null; then
+        echo "ERROR: qemu exited before socket appeared" >&2
+        tail -40 /tmp/qemu.out 2>/dev/null >&2 || true
+        exit 1
+    fi
+    sleep 0.1
+done
+[[ -S /tmp/webserver.sock ]] || { echo "ERROR: serial socket not created" >&2; exit 1; }
+
+# Wait for HTTP to be reachable
 for i in $(seq 1 60); do
     if curl -sf --max-time 2 "http://127.0.0.1:${HTTP_PORT}/health" >/dev/null 2>&1; then
         exit 0
     fi
     if ! pgrep -f "qemu-system-x86_64.*webserver.elf" >/dev/null; then
         echo "ERROR: qemu exited early" >&2
-        tail -40 /tmp/qemu.out /tmp/webserver.log 2>/dev/null >&2 || true
+        tail -40 /tmp/qemu.out 2>/dev/null >&2 || true
         exit 1
     fi
     sleep 0.5
 done
 echo "ERROR: http not ready after 30s" >&2
-tail -40 /tmp/webserver.log 2>/dev/null >&2 || true
 exit 1
 REMOTE
+
+        LOCAL_SOCK="/tmp/gcp-webserver-$$.sock"
+        SSH_CTRL="/tmp/gcp-run-ctrl-$$"
+        rm -f "$LOCAL_SOCK" "$SSH_CTRL"
 
         _gcp_run_cleanup() {
             trap - EXIT INT TERM
             echo ""
-            echo "==> Stopping remote VM..."
-            ssh "$SSH_HOST" "sudo pkill -f '[q]emu-system-x86_64.*webserver.elf' 2>/dev/null; true" >/dev/null 2>&1 || true
+            # If the VM is still alive, the user detached via Ctrl-]
+            # (or something killed socat before the kernel shut down):
+            # kill it explicitly. If the VM already exited on its own
+            # — the Ctrl-C → ACPI S5 path — pkill is a no-op but we say
+            # so for clarity.
+            if ssh "$SSH_HOST" "pgrep -f '[q]emu-system-x86_64.*webserver.elf'" >/dev/null 2>&1; then
+                echo "==> Stopping remote VM..."
+                ssh "$SSH_HOST" "sudo pkill -f '[q]emu-system-x86_64.*webserver.elf' 2>/dev/null; true" >/dev/null 2>&1 || true
+            else
+                echo "==> VM exited."
+            fi
+            ssh -O exit -S "$SSH_CTRL" "$SSH_HOST" 2>/dev/null || true
+            rm -f "$LOCAL_SOCK" "$SSH_CTRL"
         }
         trap '_gcp_run_cleanup' EXIT INT TERM
 
-        echo "==> Running on GCP with KVM..."
-        echo "    HTTP:  http://localhost:${HOST_PORT}/"
-        echo "    HTTPS: https://localhost:${TLS_HOST_PORT}/  (self-signed — use curl -k)"
-        echo "    Serial log below. Press Ctrl-C to stop."
-        echo ""
-        ssh \
+        # Background ssh master: two TCP tunnels for HTTP/HTTPS plus a
+        # unix-socket tunnel for the guest serial. ControlMaster so we
+        # can cleanly shut it down via `ssh -O exit` from the trap.
+        ssh -fN \
+            -o ControlMaster=yes \
+            -o ControlPath="$SSH_CTRL" \
+            -o ExitOnForwardFailure=yes \
             -L "${HOST_PORT}:localhost:${HOST_PORT}" \
             -L "${TLS_HOST_PORT}:localhost:${TLS_HOST_PORT}" \
-            "$SSH_HOST" \
-            "sudo tail -n +1 -F /tmp/webserver.log" || true
+            -L "${LOCAL_SOCK}:/tmp/webserver.sock" \
+            "$SSH_HOST"
+
+        for i in $(seq 1 20); do
+            [[ -S "$LOCAL_SOCK" ]] && break
+            sleep 0.1
+        done
+        [[ -S "$LOCAL_SOCK" ]] || { echo "ERROR: local socket forward not established" >&2; exit 1; }
+
+        echo "==> Running on GCP with KVM..."
+        echo "    HTTP:   http://localhost:${HOST_PORT}/"
+        echo "    HTTPS:  https://localhost:${TLS_HOST_PORT}/  (self-signed — curl -k)"
+        echo "    Serial: interactive (Ctrl-C → VM graceful shutdown; Ctrl-] → detach)"
+        echo ""
+        # rawer = no ICANON/ECHO/ISIG/IEXTEN/OPOST etc — pure byte relay.
+        # escape=0x1d = Ctrl-] disconnects socat without forwarding the byte.
+        socat -,rawer,escape=0x1d UNIX-CONNECT:"$LOCAL_SOCK" || true
         ;;
 
     test)
