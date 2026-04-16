@@ -1,29 +1,38 @@
 #!/usr/bin/env bash
-# bazel/rules/run_qemu.sh — Run unikernel via QEMU (auto-detects arch from ELF)
+# bazel/rules/run_qemu.sh — Run unikernel via QEMU (auto-detects arch from ELF).
 #
-#   bazel run //apps/webserver:run_qemu
-#   bazel run --config=x86_64 //apps/webserver:run_qemu
+# Runs from two contexts without caring which:
+#   1. `bazel run --config=aarch64-qemu|x86_64-qemu //apps/webserver:webserver`
+#   2. sh_test subprocess via :webserver in data.
 #
-# Env: UNIKERNEL_PORT   — base host port (default 8080):
-#                         http://localhost:$PORT/
-#                         https://localhost:$((PORT+1))/
-#                         udp  ::$((PORT+2))  -> guest :7
-#      UNIKERNEL_MEMORY — guest RAM in MB     (default 128)
+# Artefacts (.elf, .img) are resolved as siblings of this script; helpers.sh
+# is found via the runfiles root.
+#
+# Env:
+#   UNIKERNEL_PORT     — host HTTP port   (default 8080) → guest :80
+#   UNIKERNEL_TLS_PORT — host HTTPS port  (default 8443) → guest :443
+#   UNIKERNEL_UDP_PORT — host UDP port    (default 8007) → guest :7
+#   UNIKERNEL_MEMORY   — guest RAM in MB  (default 128)
+#   UNIKERNEL_CPUS     — guest vCPU count (default 1)
 set -euo pipefail
 
-[[ -z "${BUILD_WORKSPACE_DIRECTORY:-}" ]] && { echo "error: use 'bazel run'" >&2; exit 1; }
-WS="$BUILD_WORKSPACE_DIRECTORY"
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+SELF_NAME="$(basename "$0")"
+ELF="${SELF_DIR}/${SELF_NAME}.elf"
+[[ -f "$ELF" ]] || { echo "ERROR: .elf not found at $ELF" >&2; exit 1; }
 
-source "$WS/scripts/helpers.sh"
+ROOT="$(cd "$SELF_DIR/../.." && pwd)"
+source "$ROOT/scripts/helpers.sh"
 
-ELF="$WS/bazel-bin/${UNIKERNEL_ELF_RELPATH}"
 detect_qemu "$ELF"
 
 PORT="${UNIKERNEL_PORT:-8080}"
+TLS_PORT="${UNIKERNEL_TLS_PORT:-8443}"
+UDP_PORT="${UNIKERNEL_UDP_PORT:-8007}"
 
 echo "==> http://localhost:${PORT}/"
-echo "==> https://localhost:$((PORT+1))/  (self-signed dev cert — use curl -k)"
-echo "==> udp  ::$((PORT+2)) → guest :7"
+echo "==> https://localhost:${TLS_PORT}/  (self-signed dev cert — use curl -k)"
+echo "==> udp  ::${UDP_PORT} → guest :7"
 
-run_qemu "$PORT" "${UNIKERNEL_MEMORY:-128}" \
+run_qemu "$PORT" "$TLS_PORT" "$UDP_PORT" "${UNIKERNEL_MEMORY:-128}" \
     "${QEMU_MACHINE[@]}" -kernel "$KERNEL_ARG"

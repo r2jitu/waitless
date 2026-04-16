@@ -1,26 +1,43 @@
 #!/usr/bin/env bash
-# bazel/rules/run_hvf.sh — Run unikernel via HVF (macOS arm64, Apple Hypervisor.framework)
+# bazel/rules/run_hvf.sh — Run unikernel via the HVF runner (macOS arm64).
 #
-#   bazel run --config=hvf //apps/webserver:run
+# Runs from two contexts without caring which:
+#   1. `bazel run --config=hvf //apps/webserver:webserver`
+#   2. sh_test subprocess via :webserver in data.
 #
-# Env: UNIKERNEL_PORT     — plain HTTP host port (default 8080, → guest:80)
-#      UNIKERNEL_TLS_PORT — HTTPS host port      (default 8443, → guest:443)
-#      UNIKERNEL_MEMORY   — guest RAM in MB      (default 128)
-#      UNIKERNEL_CPUS     — guest vCPU count     (default 1)
+# This script sits next to `<app>.img` in the runfiles tree, so the image
+# is resolved via $0's sibling. The run-hvf binary is always at
+# `tools/hvf-runner/run-hvf`, found via the runfiles root.
+#
+# Env:
+#   UNIKERNEL_PORT     — host HTTP port   (default 8080) → guest :80
+#   UNIKERNEL_TLS_PORT — host HTTPS port  (default 8443) → guest :443
+#   UNIKERNEL_UDP_PORT — host UDP port    (default 8007) → guest :7
+#   UNIKERNEL_MEMORY   — guest RAM in MB  (default 128)
+#   UNIKERNEL_CPUS     — guest vCPU count (default 1)
 set -euo pipefail
 
-[[ -z "${BUILD_WORKSPACE_DIRECTORY:-}" ]] && { echo "error: use 'bazel run'" >&2; exit 1; }
-WS="$BUILD_WORKSPACE_DIRECTORY"
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+SELF_NAME="$(basename "$0")"
+IMG="${SELF_DIR}/${SELF_NAME}.img"
+[[ -f "$IMG" ]] || { echo "ERROR: .img not found at $IMG" >&2; exit 1; }
+
+# Runfiles root is two levels up from apps/<app>/ (i.e., _main/).
+# In both bazel run and test-subprocess contexts the launcher sits at
+# <root>/<pkg>/<name>, so stripping two components gets the root.
+ROOT="$(cd "$SELF_DIR/../.." && pwd)"
+HVF="$ROOT/tools/hvf-runner/run-hvf"
+[[ -x "$HVF" ]] || { echo "ERROR: run-hvf not found at $HVF" >&2; exit 1; }
 
 PORT="${UNIKERNEL_PORT:-8080}"
 TLS_PORT="${UNIKERNEL_TLS_PORT:-8443}"
-UDP_PORT=$((PORT + 10000))
+UDP_PORT="${UNIKERNEL_UDP_PORT:-8007}"
 
 echo "==> http://localhost:${PORT}/"
 echo "==> https://localhost:${TLS_PORT}/  (self-signed dev cert — use curl -k)"
+echo "==> udp  ::${UDP_PORT} → guest :7"
 
-exec "$WS/bazel-bin/${UNIKERNEL_HVF_RELPATH}" \
-    "$WS/bazel-bin/${UNIKERNEL_IMG_RELPATH}" \
+exec "$HVF" "$IMG" \
     "--ram=${UNIKERNEL_MEMORY:-128}" \
     "--cpus=${UNIKERNEL_CPUS:-1}" \
     -p "tcp:${PORT}:80" \

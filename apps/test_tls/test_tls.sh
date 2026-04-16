@@ -45,7 +45,8 @@ else
 
     PORT="${TEST_PORT:-18299}"
     echo "==> Booting test_tls in $QEMU_BIN..."
-    start_qemu "$PORT" "" "${QEMU_MACHINE[@]}" -kernel "$KERNEL_ARG"
+    # test_tls runs its crypto checks over serial; the network forwards are unused.
+    start_qemu "$PORT" "$((PORT+1))" "$((PORT+2))" "" "${QEMU_MACHINE[@]}" -kernel "$KERNEL_ARG"
 fi
 
 # Wait up to 20 s for "TLS TESTS:" line (either PASS or FAIL).

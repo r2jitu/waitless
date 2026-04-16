@@ -21,7 +21,9 @@ export UNIKERNEL_CPUS=$EXPECTED_CPUS
 
 PORT="${TEST_PORT:-18199}"
 echo "==> Booting test_smp with $EXPECTED_CPUS cores in $QEMU_BIN..."
-start_qemu "$PORT" "" "${QEMU_MACHINE[@]}" -kernel "$KERNEL_ARG"
+# test_smp doesn't exercise networking, but start_qemu requires three port
+# args; give it distinct values anyway.
+start_qemu "$PORT" "$((PORT+1))" "$((PORT+2))" "" "${QEMU_MACHINE[@]}" -kernel "$KERNEL_ARG"
 
 # Wait for the app to finish (it prints "SMP test complete" then shuts down)
 for i in $(seq 1 30); do

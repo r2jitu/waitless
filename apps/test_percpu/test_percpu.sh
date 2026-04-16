@@ -22,7 +22,8 @@ export UNIKERNEL_CPUS=$EXPECTED_CPUS
 
 PORT="${TEST_PORT:-18299}"
 echo "==> Booting test_percpu with $EXPECTED_CPUS cores in $QEMU_BIN..."
-start_qemu "$PORT" "" "${QEMU_MACHINE[@]}" -kernel "$KERNEL_ARG"
+# test_percpu doesn't exercise networking; give start_qemu placeholder ports.
+start_qemu "$PORT" "$((PORT+1))" "$((PORT+2))" "" "${QEMU_MACHINE[@]}" -kernel "$KERNEL_ARG"
 
 # Wait for the app to finish
 for i in $(seq 1 30); do

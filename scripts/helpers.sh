@@ -71,18 +71,21 @@ cleanup_vm() {
 }
 
 # ── Shared QEMU arg builder ──────────────────────────────────────────────────
-# Canonical port-forward layout for every QEMU invocation in this project:
+# Canonical port-forward layout for every QEMU invocation in this project.
+# The three service ports are configured independently so user-facing defaults
+# can stay conventional (80/443/7) rather than tied to a single base offset:
 #
-#   TCP  PORT     -> guest :80   (plain HTTP)
-#   TCP  PORT+1   -> guest :443  (HTTPS)
-#   UDP  PORT+2   -> guest :7    (UDP echo)
+#   host:HTTP_PORT  -> guest :80   (plain HTTP)
+#   host:TLS_PORT   -> guest :443  (HTTPS)
+#   host:UDP_PORT   -> guest :7    (UDP echo)
 #
 # Both start_qemu (background, tests) and run_qemu (foreground, `bazel run`)
 # route through _qemu_net_args so the forwards cannot drift between them.
 #
-# `_qemu_net_args PORT CPUS` prints the `-device … -netdev …` pair.
+# `_qemu_net_args HTTP_PORT TLS_PORT UDP_PORT CPUS` prints the
+# `-device … -netdev …` pair.
 _qemu_net_args() {
-    local port="$1" cpus="$2"
+    local http_port="$1" tls_port="$2" udp_port="$3" cpus="$4"
     local dev_extra=""
     # Enable VirtIO multi-queue for PCI devices with multiple vCPUs.
     # MMIO devices (virtio-net-device) don't support mq parameter.
@@ -95,30 +98,31 @@ _qemu_net_args() {
     if [[ "$cpus" -gt 1 ]] && [[ "$VIRTIO_DEV" == *"-pci"* ]]; then
         netdev_extra=",queues=$cpus"
     fi
-    local forwards="hostfwd=tcp::${port}-:80"
-    forwards+=",hostfwd=tcp::$((port+1))-:443"
-    forwards+=",hostfwd=udp::$((port+2))-:7"
+    local forwards="hostfwd=tcp::${http_port}-:80"
+    forwards+=",hostfwd=tcp::${tls_port}-:443"
+    forwards+=",hostfwd=udp::${udp_port}-:7"
     printf '%s\n' \
         "-device" "${VIRTIO_DEV}${dev_extra},netdev=net0" \
         "-netdev" "user,id=net0,${forwards}${netdev_extra}"
 }
 
-# Start QEMU in the background (for tests). TCP 80, TCP 443, UDP 7 all
-# forwarded per the _qemu_net_args layout above.
+# Start QEMU in the background (for tests). Forwards HTTP + HTTPS + UDP.
 #
-# Usage: start_qemu PORT [LOG] [EXTRA_QEMU_ARGS...]
-#   LOG: log file path; omit or pass "" to create a tempfile (sets VM_LOG).
+# Usage: start_qemu HTTP_PORT TLS_PORT UDP_PORT [LOG] [EXTRA_QEMU_ARGS...]
+#   LOG: log file path; pass "" to create a tempfile (sets VM_LOG).
 # Prereq: QEMU_BIN and VIRTIO_DEV must be set (via detect_qemu or manually).
 # Sets: VM_PID; sets VM_LOG if LOG is empty.
 start_qemu() {
-    local port="$1" log="${2:-}"; shift 2
+    local http_port="$1" tls_port="$2" udp_port="$3" log="${4:-}"
+    shift 4
     if [[ -z "$log" ]]; then
         VM_LOG="$(mktemp /tmp/unikernel_test_XXXXXXXX)"
         log="$VM_LOG"
     fi
     local cpus="${UNIKERNEL_CPUS:-1}"
     local net_args=()
-    while IFS= read -r line; do net_args+=("$line"); done < <(_qemu_net_args "$port" "$cpus")
+    while IFS= read -r line; do net_args+=("$line"); done \
+        < <(_qemu_net_args "$http_port" "$tls_port" "$udp_port" "$cpus")
     "$QEMU_BIN" \
         "$@" \
         -m 128 -smp "$cpus" -nographic \
@@ -133,13 +137,15 @@ start_qemu() {
 # layout as start_qemu — differences are only stdio serial + foreground
 # exec.
 #
-# Usage: run_qemu PORT MEMORY [EXTRA_QEMU_ARGS...]
+# Usage: run_qemu HTTP_PORT TLS_PORT UDP_PORT MEMORY [EXTRA_QEMU_ARGS...]
 # Prereq: QEMU_BIN and VIRTIO_DEV must be set (via detect_qemu or manually).
 run_qemu() {
-    local port="$1" memory="$2"; shift 2
+    local http_port="$1" tls_port="$2" udp_port="$3" memory="$4"
+    shift 4
     local cpus="${UNIKERNEL_CPUS:-1}"
     local net_args=()
-    while IFS= read -r line; do net_args+=("$line"); done < <(_qemu_net_args "$port" "$cpus")
+    while IFS= read -r line; do net_args+=("$line"); done \
+        < <(_qemu_net_args "$http_port" "$tls_port" "$udp_port" "$cpus")
     exec "$QEMU_BIN" \
         "$@" \
         -m "$memory" -smp "$cpus" \

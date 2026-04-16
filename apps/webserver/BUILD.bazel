@@ -47,38 +47,20 @@ sh_test(
     ],
 )
 
+# One test script covers every runner: the test depends on the :webserver
+# launcher as a data dep and spawns it as a subprocess, then probes the
+# three service ports. Runner-specific launch logic stays exactly in the
+# :webserver target — the test doesn't need to know about HVF vs QEMU vs
+# ISO vs native.
 sh_test(
     name = "test",
     timeout = "long",
-    srcs = select({
-        "//bazel/platforms:runner_hvf": ["test_hvf.sh"],
-        "//bazel/platforms:runner_qemu": ["test_qemu.sh"],
-        "//bazel/platforms:runner_iso": ["test_iso.sh"],
-        "//conditions:default": ["test_native.sh"],
-    }),
-    data = select({
-        "//bazel/platforms:runner_hvf": [
-            ":webserver.img",
-            "//apps/webserver/dev_certs:dev_cert.pem",
-            "//tools/hvf-runner:run_hvf",
-            "//scripts:helpers.sh",
-        ],
-        "//bazel/platforms:runner_qemu": [
-            ":webserver.elf",
-            ":webserver.img",
-            "//apps/webserver/dev_certs:dev_cert.pem",
-            "//scripts:helpers.sh",
-        ],
-        "//bazel/platforms:runner_iso": [
-            ":webserver.iso",
-            ":webserver.limine.elf",
-            "//apps/webserver/dev_certs:dev_cert.pem",
-            "//scripts:helpers.sh",
-        ],
-        "//conditions:default": [
-            ":webserver_native",
-        ],
-    }),
+    srcs = ["test.sh"],
+    data = [
+        ":webserver",
+        "//apps/webserver/dev_certs:dev_cert.pem",
+        "//scripts:helpers.sh",
+    ],
     tags = [
         "exclusive",
         "local",
