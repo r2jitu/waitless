@@ -35,15 +35,20 @@ pub(crate) fn hmac_sha256(key: &[u8; HASH_LEN], data: &[u8]) -> [u8; HASH_LEN] {
 /// Constant-time equality for two 32-byte slices. `a` is a slice so
 /// the caller can pass a byte slice from a parsed message; we check
 /// the length up front.
+///
+/// Each byte is XORed and OR-accumulated, and the accumulator is fed
+/// through `core::hint::black_box` so rustc can't short-circuit the
+/// loop once `diff` is non-zero. That preserves the constant-time
+/// property without pulling in the `subtle` crate.
 pub(crate) fn ct_eq_32(a: &[u8], b: &[u8; HASH_LEN]) -> bool {
     if a.len() != HASH_LEN {
         return false;
     }
     let mut diff = 0u8;
     for i in 0..HASH_LEN {
-        diff |= a[i] ^ b[i];
+        diff = core::hint::black_box(diff | (a[i] ^ b[i]));
     }
-    diff == 0
+    core::hint::black_box(diff) == 0
 }
 
 #[cfg(test)]
