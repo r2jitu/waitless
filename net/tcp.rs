@@ -208,13 +208,18 @@ fn conn_ptr(core: u32, slot: usize) -> *mut TcpConnection {
     POOLS.at(core)[slot].0.get()
 }
 
-/// TCP initial-sequence-number counter.
-static SEQ_COUNTER: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(100_000);
-
+/// Draw a per-connection initial sequence number.
+///
+/// Previously this was a global counter that stepped by 64 000, which
+/// made the ISN trivially guessable and invited off-path sequence
+/// injection. Each new connection now gets a fresh 32-bit sample from
+/// the kernel RNG (ChaCha20 keystream, seeded from jitter + RDRAND on
+/// x86). One ChaCha block / connection is well below SYN cost.
 #[inline]
 fn next_seq() -> u32 {
-    SEQ_COUNTER.fetch_add(64_000, core::sync::atomic::Ordering::Relaxed)
+    let mut buf = [0u8; 4];
+    kernel::rng::fill_bytes(&mut buf);
+    u32::from_ne_bytes(buf)
 }
 
 /// Encode a connection handle from core + slot index.
