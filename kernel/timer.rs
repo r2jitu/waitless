@@ -38,6 +38,7 @@ impl Slot {
         }
     }
 
+    #[must_use = "an ignored `false` silently drops the timer"]
     fn insert(&mut self, timer: Timer) -> bool {
         if self.count >= MAX_PER_SLOT {
             return false;
@@ -63,6 +64,11 @@ impl TimerWheel {
     }
 
     /// Insert a timer that fires at the given deadline tick.
+    ///
+    /// Returns `false` if the target slot is already at `MAX_PER_SLOT`
+    /// capacity. Callers MUST check and handle the drop — a silent
+    /// `false` on the timer path will hang network retransmit logic.
+    #[must_use = "an ignored `false` silently drops the timer"]
     pub fn insert(&mut self, timer: Timer) -> bool {
         let slot_idx = (timer.deadline as usize) & WHEEL_MASK;
         self.slots[slot_idx].insert(timer)
@@ -94,12 +100,19 @@ impl TimerWheel {
             let slot_idx = (self.current_tick as usize) & WHEEL_MASK;
             let slot = &mut self.slots[slot_idx];
 
-            // Fire timers whose deadline <= now
+            // Fire timers whose deadline <= now.
+            //
+            // Invariant: `slot.timers[0..slot.count]` are always
+            // `Some`; `insert()` / swap-remove maintain this. If a
+            // future refactor breaks that invariant the `None` branch
+            // skips the slot rather than panicking in the timer ISR.
             let mut i = 0;
             while i < slot.count {
-                let deadline = slot.timers[i].unwrap().deadline;
-                if deadline <= now {
-                    let timer = slot.timers[i].unwrap();
+                let Some(timer) = slot.timers[i] else {
+                    i += 1;
+                    continue;
+                };
+                if timer.deadline <= now {
                     // Swap-remove
                     slot.count -= 1;
                     slot.timers[i] = slot.timers[slot.count];
@@ -202,6 +215,10 @@ impl PendingTimers {
     }
 
     /// Push a timer (any core can call). Lock-free.
+    ///
+    /// Returns `false` if the global pending pool is exhausted —
+    /// callers must propagate that up rather than assume success.
+    #[must_use = "an ignored `false` silently drops the timer"]
     pub fn push(&self, timer: Timer) -> bool {
         let node = match alloc_node() {
             Some(n) => n,
@@ -218,21 +235,23 @@ impl PendingTimers {
     }
 
     /// Drain all pending timers into the given wheel (owning core only).
-    pub fn drain_into(&self, wheel: &mut TimerWheel) -> usize {
+    /// Returns `(inserted, dropped)` — `dropped` counts timers whose
+    /// target wheel slot was full at drain time.
+    pub fn drain_into(&self, wheel: &mut TimerWheel) -> (usize, usize) {
         // Atomically take the entire list
         let head = self.head.swap(0, Ordering::AcqRel);
-        let mut count = 0;
+        let mut inserted = 0;
+        let mut dropped = 0;
         let mut node_ptr = head;
         while node_ptr != 0 {
             let node = node_ptr as *mut TimerNode;
             let next = unsafe { (*node).next };
             let timer = unsafe { (*node).timer };
-            wheel.insert(timer);
+            if wheel.insert(timer) { inserted += 1; } else { dropped += 1; }
             free_node(node);
-            count += 1;
             node_ptr = next;
         }
-        count
+        (inserted, dropped)
     }
 }
 
@@ -258,7 +277,7 @@ mod tests {
     fn insert_and_fire() {
         reset_counters();
         let mut wheel = TimerWheel::new();
-        wheel.insert(Timer { deadline: 5, func: test_handler, arg: 42 });
+        assert!(wheel.insert(Timer { deadline: 5, func: test_handler, arg: 42 }));
         assert_eq!(wheel.count(), 1);
 
         // Advance to tick 4 — timer shouldn't fire
@@ -277,8 +296,8 @@ mod tests {
         reset_counters();
         let mut wheel = TimerWheel::new();
         // Deadlines 256 apart map to the same slot (WHEEL_SIZE=256)
-        wheel.insert(Timer { deadline: 10, func: test_handler, arg: 1 });
-        wheel.insert(Timer { deadline: 10, func: test_handler, arg: 2 });
+        assert!(wheel.insert(Timer { deadline: 10, func: test_handler, arg: 1 }));
+        assert!(wheel.insert(Timer { deadline: 10, func: test_handler, arg: 2 }));
         assert_eq!(wheel.count(), 2);
         wheel.advance(10);
         assert_eq!(FIRE_COUNT.load(Ordering::Relaxed), 2);
@@ -287,7 +306,7 @@ mod tests {
     #[test]
     fn cancel_timer() {
         let mut wheel = TimerWheel::new();
-        wheel.insert(Timer { deadline: 100, func: test_handler, arg: 99 });
+        assert!(wheel.insert(Timer { deadline: 100, func: test_handler, arg: 99 }));
         assert_eq!(wheel.count(), 1);
         assert!(wheel.cancel(99));
         assert_eq!(wheel.count(), 0);
@@ -303,9 +322,9 @@ mod tests {
     fn fire_order() {
         reset_counters();
         let mut wheel = TimerWheel::new();
-        wheel.insert(Timer { deadline: 1, func: test_handler, arg: 10 });
-        wheel.insert(Timer { deadline: 3, func: test_handler, arg: 30 });
-        wheel.insert(Timer { deadline: 2, func: test_handler, arg: 20 });
+        assert!(wheel.insert(Timer { deadline: 1, func: test_handler, arg: 10 }));
+        assert!(wheel.insert(Timer { deadline: 3, func: test_handler, arg: 30 }));
+        assert!(wheel.insert(Timer { deadline: 2, func: test_handler, arg: 20 }));
 
         wheel.advance(3);
         // All three should have fired
@@ -317,7 +336,7 @@ mod tests {
     fn advance_past_deadline() {
         reset_counters();
         let mut wheel = TimerWheel::new();
-        wheel.insert(Timer { deadline: 5, func: test_handler, arg: 55 });
+        assert!(wheel.insert(Timer { deadline: 5, func: test_handler, arg: 55 }));
         // Advance far past the deadline
         wheel.advance(100);
         assert_eq!(FIRE_COUNT.load(Ordering::Relaxed), 1);
