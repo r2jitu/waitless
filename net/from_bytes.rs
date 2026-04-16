@@ -141,9 +141,12 @@ mod tests {
     fn try_read_from_copies() {
         let bytes = [0x12, 0x34, 0x78, 0x56, 0x34, 0x12, 0xAB];
         let hdr: Hdr = Hdr::try_read_from(&bytes).unwrap();
-        // After read_from, bytes can be modified without affecting hdr.
+        // Mutate a local copy after the read; hdr should be unaffected.
+        // (`hdr.a` is read into a local because Hdr is #[repr(packed)]
+        //  and taking a reference to a packed field is undefined.)
         let mut bytes_copy = bytes;
         bytes_copy[0] = 0xFF;
+        assert_eq!(bytes_copy[0], 0xFF);
         let a = hdr.a;
         assert_eq!(a, 0x3412);
     }

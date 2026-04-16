@@ -260,55 +260,77 @@ mod tests {
     use super::*;
     use core::sync::atomic::AtomicU32;
 
-    static FIRE_COUNT: AtomicU32 = AtomicU32::new(0);
-    static LAST_ARG: AtomicU32 = AtomicU32::new(0);
+    // Test handlers count fires through a per-test `Counters` struct
+    // whose address is passed as the Timer's `arg`. Each test owns its
+    // own Counters, so cargo test's parallel runner won't race on a
+    // global counter the way the previous `static FIRE_COUNT` did.
 
-    fn test_handler(arg: usize) {
-        FIRE_COUNT.fetch_add(1, Ordering::Relaxed);
-        LAST_ARG.store(arg as u32, Ordering::Relaxed);
+    struct Counters {
+        fired: AtomicU32,
+        last_arg: AtomicU32,
     }
 
-    fn reset_counters() {
-        FIRE_COUNT.store(0, Ordering::Relaxed);
-        LAST_ARG.store(0, Ordering::Relaxed);
+    impl Counters {
+        fn new() -> Box<Self> {
+            Box::new(Counters {
+                fired: AtomicU32::new(0),
+                last_arg: AtomicU32::new(0),
+            })
+        }
+    }
+
+    fn mk_timer(deadline: u64, user_arg: u32, c: &Counters) -> Timer {
+        // `user_arg` is passed to the handler via Counters.last_arg so
+        // tests can verify which timer fired; Timer.arg is reserved
+        // for the Counters pointer.
+        c.last_arg.store(user_arg, Ordering::Relaxed);
+        Timer { deadline, func: bump, arg: c as *const Counters as usize }
+    }
+
+    fn bump(arg: usize) {
+        let c = unsafe { &*(arg as *const Counters) };
+        c.fired.fetch_add(1, Ordering::Relaxed);
     }
 
     #[test]
     fn insert_and_fire() {
-        reset_counters();
+        let c = Counters::new();
         let mut wheel = TimerWheel::new();
-        assert!(wheel.insert(Timer { deadline: 5, func: test_handler, arg: 42 }));
+        assert!(wheel.insert(mk_timer(5, 42, &c)));
         assert_eq!(wheel.count(), 1);
 
         // Advance to tick 4 — timer shouldn't fire
         wheel.advance(4);
-        assert_eq!(FIRE_COUNT.load(Ordering::Relaxed), 0);
+        assert_eq!(c.fired.load(Ordering::Relaxed), 0);
 
         // Advance to tick 5 — timer fires
         wheel.advance(5);
-        assert_eq!(FIRE_COUNT.load(Ordering::Relaxed), 1);
-        assert_eq!(LAST_ARG.load(Ordering::Relaxed), 42);
+        assert_eq!(c.fired.load(Ordering::Relaxed), 1);
+        assert_eq!(c.last_arg.load(Ordering::Relaxed), 42);
         assert_eq!(wheel.count(), 0);
     }
 
     #[test]
     fn multiple_timers_same_slot() {
-        reset_counters();
+        let c = Counters::new();
         let mut wheel = TimerWheel::new();
         // Deadlines 256 apart map to the same slot (WHEEL_SIZE=256)
-        assert!(wheel.insert(Timer { deadline: 10, func: test_handler, arg: 1 }));
-        assert!(wheel.insert(Timer { deadline: 10, func: test_handler, arg: 2 }));
+        assert!(wheel.insert(mk_timer(10, 1, &c)));
+        assert!(wheel.insert(mk_timer(10, 2, &c)));
         assert_eq!(wheel.count(), 2);
         wheel.advance(10);
-        assert_eq!(FIRE_COUNT.load(Ordering::Relaxed), 2);
+        assert_eq!(c.fired.load(Ordering::Relaxed), 2);
     }
 
     #[test]
     fn cancel_timer() {
+        let c = Counters::new();
         let mut wheel = TimerWheel::new();
-        assert!(wheel.insert(Timer { deadline: 100, func: test_handler, arg: 99 }));
+        let timer = mk_timer(100, 99, &c);
+        let arg = timer.arg;
+        assert!(wheel.insert(timer));
         assert_eq!(wheel.count(), 1);
-        assert!(wheel.cancel(99));
+        assert!(wheel.cancel(arg));
         assert_eq!(wheel.count(), 0);
     }
 
@@ -320,25 +342,25 @@ mod tests {
 
     #[test]
     fn fire_order() {
-        reset_counters();
+        let c = Counters::new();
         let mut wheel = TimerWheel::new();
-        assert!(wheel.insert(Timer { deadline: 1, func: test_handler, arg: 10 }));
-        assert!(wheel.insert(Timer { deadline: 3, func: test_handler, arg: 30 }));
-        assert!(wheel.insert(Timer { deadline: 2, func: test_handler, arg: 20 }));
+        assert!(wheel.insert(mk_timer(1, 10, &c)));
+        assert!(wheel.insert(mk_timer(3, 30, &c)));
+        assert!(wheel.insert(mk_timer(2, 20, &c)));
 
         wheel.advance(3);
         // All three should have fired
-        assert_eq!(FIRE_COUNT.load(Ordering::Relaxed), 3);
+        assert_eq!(c.fired.load(Ordering::Relaxed), 3);
         assert_eq!(wheel.count(), 0);
     }
 
     #[test]
     fn advance_past_deadline() {
-        reset_counters();
+        let c = Counters::new();
         let mut wheel = TimerWheel::new();
-        assert!(wheel.insert(Timer { deadline: 5, func: test_handler, arg: 55 }));
+        assert!(wheel.insert(mk_timer(5, 55, &c)));
         // Advance far past the deadline
         wheel.advance(100);
-        assert_eq!(FIRE_COUNT.load(Ordering::Relaxed), 1);
+        assert_eq!(c.fired.load(Ordering::Relaxed), 1);
     }
 }
