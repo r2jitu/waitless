@@ -14,10 +14,23 @@
 
 #![no_std]
 
-#[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }
-
 extern crate kernel;
+
+// Log the panic to serial (if it's been initialised) before halting.
+// The bare `loop {}` fallback used previously meant a Limine-path
+// panic hung the VM with no diagnostic — painful when a regression
+// shows up only on the ISO config.
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo) -> ! {
+    kernel::serial::puts(b"PANIC in limine_entry\n");
+    loop {
+        #[cfg(target_arch = "aarch64")]
+        unsafe { core::arch::asm!("wfe", options(nomem, nostack)); }
+        #[cfg(target_arch = "x86_64")]
+        unsafe { core::arch::asm!("cli", "hlt", options(nomem, nostack)); }
+    }
+}
+
 use kernel::types::{BootInfo, MemoryRegion, Protocol, MEM_AVAILABLE, MEM_RESERVED, MAX_MEMORY_REGIONS};
 
 use limine::BaseRevision;
