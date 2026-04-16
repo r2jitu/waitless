@@ -610,7 +610,7 @@ boot_stack_bottom:
 boot_stack_top:
 
 // L1 page table — must be 4KB-aligned (each entry = 8 bytes, 512 entries)
-// Global so mmu.cc can add L2 table entries for device memory above 4GB.
+// Global so kernel::aarch64::mmu can add L2 table entries for device memory above 4GB.
 .align 12
 .global boot_l1_table
 boot_l1_table:

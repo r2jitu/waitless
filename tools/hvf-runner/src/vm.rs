@@ -107,10 +107,10 @@ const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
 const PSCI_CPU_ON: u64 = 0xC400_0003;
 const PSCI_SUCCESS: u64 = 0;
 const PSCI_ALREADY_ON: u64 = (-4i64) as u64;
-#[allow(dead_code)]
 const PSCI_NOT_SUPPORTED: u64 = (-1i64) as u64;
 
-// Virtual timer PPI (INTID 27).
+// Virtual timer PPI (INTID 27). Not currently injected by the runner
+// but wanted as soon as we add vtimer support, so keep the constant.
 #[allow(dead_code)]
 const VTIMER_INTID: u32 = 27;
 

@@ -1,12 +1,11 @@
-// kernel/x86_64/idt_stubs.S — x86_64 ISR (Interrupt Service Routine) stubs
+// boot/x86_64/idt_stubs.S — x86_64 ISR (Interrupt Service Routine) stubs
 //
-// This file defines the low-level interrupt entry points for all 256 IDT
-// vectors on x86_64. It was extracted from the inline assembly in idt.cc
-// into a standalone .S file.
+// Low-level interrupt entry points for all 256 IDT vectors on x86_64.
+// The high-level handlers live in kernel::x86_64::idt.
 //
 // Contents:
 //   1. isr_common      — common interrupt entry point. Saves all GP registers,
-//                         calls isr_common_handler (C/C++/Rust), restores
+//                         calls isr_common_handler (Rust), restores
 //                         registers, and returns via iretq.
 //   2. isr_stub_0..255 — per-vector stubs. Each normalizes the stack by
 //                         pushing a dummy error code (0) if the CPU didn't
