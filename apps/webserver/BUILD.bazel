@@ -22,11 +22,6 @@ unikernel_binary(
     app = ":app",
 )
 
-alias(
-    name = "run",
-    actual = ":webserver_run",
-)
-
 # Boot + Ctrl-C regression test. Sends a Ctrl-C byte to the guest serial
 # under load and checks the VM exits within a short deadline — a guard
 # against event-loop-starvation bugs (e.g. the virtio IRQ storm that used

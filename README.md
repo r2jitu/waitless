@@ -37,7 +37,7 @@ Runs on **x86_64** and **ARM64 (aarch64)** via QEMU, Apple Hypervisor.framework 
 brew install bazel qemu
 
 # Build and run (auto-detects host architecture)
-bazel run //apps/webserver:webserver_run
+bazel run //apps/webserver:webserver
 
 # Test
 curl http://localhost:8080/health

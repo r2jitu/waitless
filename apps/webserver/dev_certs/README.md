@@ -29,8 +29,8 @@ the host.
   every modern client's preference list and works everywhere.
 - Subject: `CN=unikernel.local, O=UniKernel Dev, OU=Development Only`
 - SAN: `DNS:unikernel.local, DNS:localhost, IP:127.0.0.1, IP:10.0.2.15`
-  covers the hostnames used by `run-local.sh` HVF / QEMU user-mode
-  networking, and the default HVF userspace-proxy IP.
+  covers the hostnames used by the `bazel run` HVF / QEMU user-mode
+  networking paths, and the default HVF userspace-proxy IP.
 - Validity: **10 years** from the day the cert was generated. We'll
   regenerate when we care about a cleaner CN or when the dev key
   rotates. For CI purposes this means no near-term expiry anxiety.

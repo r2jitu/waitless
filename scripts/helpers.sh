@@ -79,8 +79,6 @@ cleanup_vm() {
 #
 # Both start_qemu (background, tests) and run_qemu (foreground, `bazel run`)
 # route through _qemu_net_args so the forwards cannot drift between them.
-# run-local.sh uses the same helpers, so the interactive and test paths
-# stay in lockstep by construction.
 #
 # `_qemu_net_args PORT CPUS` prints the `-device … -netdev …` pair.
 _qemu_net_args() {
@@ -131,9 +129,9 @@ start_qemu() {
     VM_PID=$!
 }
 
-# Exec QEMU interactively (for `bazel run` and scripts/run-local.sh). Same
-# forward layout as start_qemu — differences are only stdio serial +
-# foreground exec.
+# Exec QEMU interactively (for `bazel run //path:name`). Same forward
+# layout as start_qemu — differences are only stdio serial + foreground
+# exec.
 #
 # Usage: run_qemu PORT MEMORY [EXTRA_QEMU_ARGS...]
 # Prereq: QEMU_BIN and VIRTIO_DEV must be set (via detect_qemu or manually).

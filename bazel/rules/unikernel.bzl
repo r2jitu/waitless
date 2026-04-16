@@ -37,12 +37,14 @@ def unikernel_binary(name, app, visibility = None):
     The application is a rust_library with a #[uni::main] entry point.
 
     Targets produced:
+      - <name>            : Unified launcher — `bazel run //path:name` picks
+                            the runner from the active platform config
+                            (hvf / qemu / iso / native).
       - <name>.elf        : Bare-metal ELF (QEMU direct boot)
       - <name>.img        : Raw binary (HVF runner / QEMU -kernel on aarch64)
       - <name>.limine.elf : Higher-half ELF (Limine bootloader)
       - <name>.iso        : Limine-bootable ISO (BIOS + UEFI)
       - <name>_native     : Native POSIX binary (host OS, no VM)
-      - <name>_run        : Unified launcher (runner selected by --config)
 
     Args:
         name: Base name for all output targets.
@@ -168,9 +170,9 @@ def unikernel_binary(name, app, visibility = None):
         visibility = visibility,
     )
 
-    # ── Unified launcher ─────────────────────────────────────────────────
+    # ── Unified launcher — the rule's top-level target is itself runnable ───
     sh_binary(
-        name = name + "_run",
+        name = name,
         srcs = select({
             "//bazel/platforms:runner_hvf": ["//bazel/rules:run_hvf.sh"],
             "//bazel/platforms:runner_qemu": ["//bazel/rules:run_qemu.sh"],

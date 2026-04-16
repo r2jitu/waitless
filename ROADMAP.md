@@ -573,7 +573,7 @@ bazel test //apps/test_smp:test --config=qemu  # same on QEMU
 - [x] bench.py `QemuEnv` / `KvmEnv` pass `mq=on,vectors=2N+2` + `queues=N` (tap/vhost)
 - [x] bench.py compares 1-core vs N-core throughput by default
 - [x] HVF runner (Apple Silicon native): multi-queue Tier 1 via SO_REUSEPORT UDP siblings + TCP accept dispatcher
-- [x] Local `scripts/run-local.sh`: pass `mq=on,queues=N,vectors=2N+2` when `UNIKERNEL_CPUS > 1`
+- [x] `bazel run //apps/webserver:webserver`: pass `mq=on,queues=N,vectors=2N+2` when `UNIKERNEL_CPUS > 1`
 
 **Not implemented / deferred:**
 - [ ] **aarch64 QEMU MSI routing** — virtio-mmio driver creates N queue pairs but only
@@ -595,7 +595,7 @@ bazel test //apps/test_smp:test --config=qemu  # same on QEMU
 **Try it (the big milestone):**
 ```bash
 # Webserver on 4 cores — each core owns its own virtio queue pair
-UNIKERNEL_CPUS=4 ./scripts/run-local.sh
+UNIKERNEL_CPUS=4 bazel run //apps/webserver:webserver
 # Serial: "virtio_net: MSI-X enabled (4 RX vectors)"
 #         "virtio_net: MQ activated"
 #         "[net] Tier 1: per-core RX queues (4 queue pairs)"

@@ -33,10 +33,10 @@ rust_binary(
     ],
 )
 
-# Codesigned binary — what consumers (bench.py, run-local.sh,
-# test_hvf.sh, the `bazel run` wrapper) actually execute. Output
-# path is `bazel-bin/tools/hvf-runner/run-hvf`, matching what every
-# consumer already uses.
+# Codesigned binary — what consumers (bench.py, test_hvf.sh, the
+# `bazel run //apps/webserver:webserver` wrapper) actually execute.
+# Output path is `bazel-bin/tools/hvf-runner/run-hvf`, matching what
+# every consumer already uses.
 #
 # `run_hvf_unsigned` goes in `tools` (exec cfg), not `srcs` (target
 # cfg), so it's built for the host platform even when --config=hvf
