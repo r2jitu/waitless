@@ -337,7 +337,12 @@ pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
     // SAFETY for the closures below: per-core ownership — only this
     // core (== `core`) is touching POOLS[core][*].
 
-    // RST handling
+    // RST handling.
+    //
+    // RFC 5961 §3.2: a blind off-path attacker with knowledge of the
+    // 4-tuple could otherwise send `RST, seq=<anything>` to tear the
+    // connection down. Only accept the reset if seq == rcv_nxt (the
+    // strict in-sequence position). Any other seq is silently dropped.
     if flags & TCP_RST != 0 {
         for i in 0..CONNECTIONS_PER_CORE {
             let c = unsafe { &*conn_ptr(core, i) };
@@ -347,7 +352,9 @@ pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
                 && c.local_port == dst_port
                 && c.remote_port == src_port
             {
-                free_connection(core, i);
+                if seq == c.rcv_nxt {
+                    free_connection(core, i);
+                }
                 return;
             }
         }
@@ -486,8 +493,15 @@ pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
         }
     }
 
-    // Process FIN
-    if flags & TCP_FIN != 0 {
+    // Process FIN.
+    //
+    // A FIN is in-sequence iff its own seq number (seq + payload_len)
+    // equals our current rcv_nxt. Anything else — including an
+    // off-path FIN with a guessed seq or a delayed retransmission
+    // whose FIN was already consumed — is ignored. Advancing rcv_nxt
+    // unconditionally (as the previous version did) let any FIN-bit
+    // segment close the connection and desync the receive stream.
+    if flags & TCP_FIN != 0 && seq.wrapping_add(payload_len as u32) == c.rcv_nxt {
         c.rcv_nxt = c.rcv_nxt.wrapping_add(1);
         send_segment(src_ip, dst_port, src_port, c.snd_nxt, c.rcv_nxt, TCP_ACK, c.rx_free() as u16, &[]);
 
