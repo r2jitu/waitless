@@ -798,21 +798,21 @@ fn irq_handler(_irq: u32) {
             }
             #[cfg(target_arch = "aarch64")]
             Transport::Mmio { base, .. } => {
-                if (*ndev()).irq_edge {
-                    // Edge-triggered SPI: the GIC consumed the edge on
-                    // delivery. No ISR read or ACK write needed — the
-                    // INTID already identified this as virtio-net.
-                    IRQ_PENDING.store(true, core::sync::atomic::Ordering::Release);
-                } else {
-                    // Level-triggered: must read ISR and write ACK to
-                    // deassert the SPI line.
-                    let isr = virtio_read32(base + MMIO_INTERRUPT_STATUS);
-                    if (*ndev()).rx_queues[0].used_idx_mmio {
-                        (*ndev()).rx_queues[0].mmio_cached_used_idx = (isr >> 16) as u16;
-                    }
-                    IRQ_PENDING.store(true, core::sync::atomic::Ordering::Release);
-                    virtio_write32(base + MMIO_INTERRUPT_ACK, isr & 0xFFFF);
+                // Always read ISR and write INTERRUPT_ACK. The FDT
+                // `interrupts` flag (edge vs level) describes how the
+                // GIC samples the line, not how the virtio-mmio device
+                // implements interrupt signalling on the other side —
+                // QEMU's virtio-mmio sets the line via
+                // `!!vdev->isr` and keeps it asserted until the guest
+                // acks, so skipping the ACK (which commit 6d7d749
+                // did for an HVF-specific edge-pulse extension) causes
+                // an unending IRQ storm on stock QEMU.
+                let isr = virtio_read32(base + MMIO_INTERRUPT_STATUS);
+                if (*ndev()).rx_queues[0].used_idx_mmio {
+                    (*ndev()).rx_queues[0].mmio_cached_used_idx = (isr >> 16) as u16;
                 }
+                IRQ_PENDING.store(true, core::sync::atomic::Ordering::Release);
+                virtio_write32(base + MMIO_INTERRUPT_ACK, isr & 0xFFFF);
             }
             #[cfg(target_arch = "x86_64")]
             Transport::LegacyPci { base, .. } => {

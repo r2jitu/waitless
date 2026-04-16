@@ -833,12 +833,37 @@ impl Virtqueue {
             // Write used_event = used->idx after avail->ring[queue_size]
             let cur_used_idx = self.used_idx();
             self.set_used_event(cur_used_idx);
-            dsb_st();
         }
+        // Flush the flag / used_event write to main memory BEFORE the
+        // device next polls them. Without this DSB, the device can
+        // read stale avail->flags (and miss the re-enable, or keep
+        // firing after a disable); with weakly-ordered aarch64 that's
+        // not a theoretical concern — it was the root cause of a
+        // virtio-mmio IRQ storm on QEMU aarch64 where disable_interrupts
+        // appeared ignored.
+        dsb_st();
     }
 
     pub fn disable_interrupts(&mut self) {
         self.set_avail_flags(VIRTQ_AVAIL_F_NO_INTERRUPT);
+        if self.event_idx {
+            // Under VIRTIO_F_EVENT_IDX the device ignores avail->flags
+            // and consults used_event instead (virtio 1.2 §2.7.10 / the
+            // vhost vring_need_event formula:
+            //   notify ⇔ (new - used_event - 1) < (new - old)
+            // all u16 wrap). Writing `used_event = used_idx - 1` makes
+            // that evaluate (N - (U-1) - 1) < (N - (U-1)) — i.e.
+            // 1 < 1, false — for every single-batch ADD, so the device
+            // stays silent until enable_interrupts() writes a fresh
+            // used_event. Matches the Linux virtio-ring
+            // `virtqueue_disable_cb_split` approach.
+            let cur = self.used_idx();
+            self.set_used_event(cur.wrapping_sub(1));
+        }
+        // DSB for the same reason as enable_interrupts: ensure the
+        // suppression is visible before the device next reads the
+        // flags / used_event and decides whether to notify.
+        dsb_st();
     }
 
     // ---- Ring buffer access helpers ----
