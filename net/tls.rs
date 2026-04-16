@@ -44,6 +44,25 @@ pub const KEY_LEN: usize = 32;
 /// TLS 1.3 AEAD nonce length (all currently-defined suites use 12 bytes).
 pub const IV_LEN: usize = 12;
 
+/// Overwrite `buf` with zeroes in a way that the optimiser cannot elide.
+///
+/// Rust's compiler is free to skip a final write to a local that's about
+/// to go out of scope; wrapping each byte in a `write_volatile` plus a
+/// full compiler fence prevents that for the window where key material
+/// still lives in an AEAD key / traffic secret. Not bullet-proof against
+/// register / cache residue (we don't flush caches or scrub registers),
+/// but it raises the bar meaningfully and matches the hygiene level of
+/// the `zeroize` crate without pulling in another dep on the bare-metal
+/// target.
+pub fn secure_zero(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        // SAFETY: `b` is a mutable reference to one byte owned by this
+        // slice; write_volatile with `0u8` is always valid.
+        unsafe { core::ptr::write_volatile(b, 0); }
+    }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
 // ============================================================================
 // HKDF-Expand-Label (RFC 8446 §7.1)
 // ============================================================================
@@ -193,6 +212,13 @@ pub struct TrafficKey {
     pub seq: u64,
 }
 
+impl Drop for TrafficKey {
+    fn drop(&mut self) {
+        secure_zero(&mut self.key);
+        secure_zero(&mut self.iv);
+    }
+}
+
 impl TrafficKey {
     /// Derive `(key, iv)` from a 32-byte traffic secret via
     /// `HKDF-Expand-Label(secret, "key"/"iv", "", …)`.
@@ -249,11 +275,24 @@ pub struct KeySchedule {
     secret: [u8; HASH_LEN],
 }
 
+impl Drop for KeySchedule {
+    fn drop(&mut self) {
+        secure_zero(&mut self.secret);
+    }
+}
+
 /// The two traffic-secret outputs from the handshake stage.
 #[derive(Clone)]
 pub struct HandshakeSecrets {
     pub client_hs: [u8; HASH_LEN],
     pub server_hs: [u8; HASH_LEN],
+}
+
+impl Drop for HandshakeSecrets {
+    fn drop(&mut self) {
+        secure_zero(&mut self.client_hs);
+        secure_zero(&mut self.server_hs);
+    }
 }
 
 /// The two traffic-secret outputs from the application stage, plus the
@@ -263,6 +302,14 @@ pub struct ApplicationSecrets {
     pub client_ap: [u8; HASH_LEN],
     pub server_ap: [u8; HASH_LEN],
     pub exporter: [u8; HASH_LEN],
+}
+
+impl Drop for ApplicationSecrets {
+    fn drop(&mut self) {
+        secure_zero(&mut self.client_ap);
+        secure_zero(&mut self.server_ap);
+        secure_zero(&mut self.exporter);
+    }
 }
 
 impl KeySchedule {

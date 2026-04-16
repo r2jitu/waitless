@@ -318,6 +318,21 @@ pub struct TlsServer {
     pub(crate) client_hs_secret: Option<[u8; HASH_LEN]>,
 }
 
+impl Drop for TlsServer {
+    fn drop(&mut self) {
+        // TrafficKey / KeySchedule have their own Drop impls that
+        // wipe `key` / `iv` / `secret`. The raw handshake-secret
+        // arrays in this struct are separately held, so scrub them
+        // here before the backing memory is released back to kmalloc.
+        if let Some(mut s) = self.server_hs_secret.take() {
+            tls::secure_zero(&mut s);
+        }
+        if let Some(mut s) = self.client_hs_secret.take() {
+            tls::secure_zero(&mut s);
+        }
+    }
+}
+
 impl TlsServer {
     /// Create a fresh TlsServer with a random X25519 keypair.
     /// `seed` is 32 bytes of entropy for the ephemeral key — caller
