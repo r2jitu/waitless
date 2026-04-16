@@ -264,7 +264,22 @@ pub fn run(core_id: u32) -> ! {
         loop { core::arch::asm!("wfi"); }
     }
     #[cfg(target_arch = "x86_64")]
-    loop { unsafe { core::arch::asm!("hlt"); } }
+    unsafe {
+        // BSP: ACPI S5 (soft off) via PM1_CNT. Same port/value triples
+        // as boot::arch_shutdown — try QEMU/KVM (0x604 ← 0x2000), the
+        // old Bochs value (0x604 ← 0x3400), and VirtualBox (0xb004 ←
+        // 0x2000). The aarch64 branch above issues PSCI SYSTEM_OFF; on
+        // x86 this used to fall straight into `loop { hlt }`, so Ctrl-C
+        // would break the event loop, print `[evloop] …`, and hang
+        // forever with QEMU still running. APs just HLT: when the BSP
+        // successfully writes PM1_CNT, QEMU tears the whole VM down.
+        if core_id == 0 {
+            core::arch::asm!("out dx, ax", in("dx") 0x0604u16, in("ax") 0x2000u16, options(nomem, nostack));
+            core::arch::asm!("out dx, ax", in("dx") 0x0604u16, in("ax") 0x3400u16, options(nomem, nostack));
+            core::arch::asm!("out dx, ax", in("dx") 0xb004u16, in("ax") 0x2000u16, options(nomem, nostack));
+        }
+        loop { core::arch::asm!("cli", "hlt", options(nomem, nostack)); }
+    }
 }
 
 fn print_u64(mut val: u64) {
