@@ -46,8 +46,8 @@ echo "==> Booting webserver via HVF runner (HTTPS on :${VM_PORT})..."
 "$HVF_BIN" "$IMG" -p "tcp:${VM_PORT}:443" >"$VM_LOG" 2>&1 &
 VM_PID=$!
 
-if ! wait_https /health 30 "$VM_PID"; then
-    echo "ERROR: HTTPS server not ready after 30s" >&2
+if ! wait_https /health 10 "$VM_PID"; then
+    echo "ERROR: HTTPS server not ready after 10s" >&2
     cat "$VM_LOG" >&2
     exit 1
 fi

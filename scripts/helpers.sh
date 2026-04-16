@@ -117,16 +117,17 @@ run_qemu() {
 }
 
 # ── HTTP helpers ─────────────────────────────────────────────────────────────
-# Wait for an HTTP endpoint to respond.
-# Usage: wait_http PORT [TIMEOUT] [PID] [HOST] [ENDPOINT]
+# Wait for an HTTP endpoint to respond. A booted webserver answers in a few
+# ms; a broken one never does. Poll every 500 ms with a 1 s curl timeout so
+# failures surface in seconds, not the full window.
+# Usage: wait_http PORT [TIMEOUT_SEC] [PID] [HOST] [ENDPOINT]
 wait_http() {
-    local port=$1 timeout=${2:-60} pid=${3:-""} host=${4:-"127.0.0.1"} endpoint=${5:-"/"}
-    local elapsed=0
-    while ! curl -sf --max-time 3 "http://${host}:${port}${endpoint}" >/dev/null 2>&1; do
-        if [[ $elapsed -ge $timeout ]]; then return 1; fi
+    local port=$1 timeout=${2:-15} pid=${3:-""} host=${4:-"127.0.0.1"} endpoint=${5:-"/"}
+    local deadline=$(($(date +%s) + timeout))
+    while ! curl -sf --max-time 1 "http://${host}:${port}${endpoint}" >/dev/null 2>&1; do
+        if [[ $(date +%s) -ge $deadline ]]; then return 1; fi
         if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then return 1; fi
-        sleep 1
-        elapsed=$((elapsed + 1))
+        sleep 0.5
     done
     return 0
 }
@@ -232,14 +233,14 @@ https_get() {
 # Usage: wait_https PATH TIMEOUT [PID]
 wait_https() {
     local path="$1" timeout="$2" pid="${3:-}"
-    local elapsed=0 status_line
+    local deadline=$(($(date +%s) + timeout))
+    local status_line
     while :; do
-        status_line="$(https_get "$path" 3 | head -1 | tr -d '\r' || true)"
+        status_line="$(https_get "$path" 2 | head -1 | tr -d '\r' || true)"
         [[ "$status_line" == HTTP/1.1\ 200* ]] && return 0
         if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then return 1; fi
-        if [[ $elapsed -ge $timeout ]]; then return 1; fi
-        sleep 1
-        elapsed=$((elapsed + 1))
+        if [[ $(date +%s) -ge $deadline ]]; then return 1; fi
+        sleep 0.5
     done
 }
 

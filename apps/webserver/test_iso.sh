@@ -32,8 +32,8 @@ PORT="${TEST_PORT:-18097}"
 echo "==> Booting webserver from Limine ISO in $QEMU_BIN (port $PORT)..."
 start_qemu "$PORT" "" -cpu max -cdrom "$ISO"
 
-if ! wait_http "$PORT" 90 "$VM_PID"; then
-    echo "ERROR: not ready after 90s" >&2; cat "$VM_LOG" >&2; exit 1
+if ! wait_http "$PORT" 15 "$VM_PID"; then
+    echo "ERROR: not ready after 15s" >&2; cat "$VM_LOG" >&2; exit 1
 fi
 
 echo ""; echo "==> Running HTTP tests (Limine ISO)..."
