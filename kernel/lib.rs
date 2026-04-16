@@ -47,6 +47,11 @@ pub fn send_ipi(target_core: u32) {
     {
         let topo = x86_64::acpi::topology();
         let apic_id = topo.apic_ids[target_core as usize] as u32;
+        // SAFETY: send_ipi writes to the Local APIC ICR via MMIO at a
+        // page that BSP init has mapped RW. The vector 0x40 is the
+        // wake IPI bound to an idle handler (see x86_64::apic::init),
+        // and the destination APIC ID came from the ACPI-parsed
+        // topology, so it names a CPU that was present at boot.
         unsafe { x86_64::apic::send_ipi(apic_id, 0x40); }
     }
 }
@@ -61,6 +66,8 @@ pub fn wake_cores() {
     if n <= 1 { return; }
     #[cfg(target_arch = "aarch64")]
     {
+        // SAFETY: `sev` (Send Event) is a hint instruction with no
+        // memory or register side effects; nomem + nostack is accurate.
         unsafe { core::arch::asm!("sev", options(nomem, nostack)); }
         // SGI fallback — needed when SEV doesn't propagate across vCPU threads.
         for i in 1..n {
@@ -80,6 +87,7 @@ pub fn wake_cores() {
 pub fn wake_core0() {
     #[cfg(target_arch = "aarch64")]
     {
+        // SAFETY: see wake_cores — `sev` is a hint with no side effects.
         unsafe { core::arch::asm!("sev", options(nomem, nostack)); }
         aarch64::smp::send_sgi_to(0);
     }

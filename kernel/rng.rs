@@ -57,6 +57,9 @@ fn read_cycle_counter() -> u64 {
     unsafe {
         let lo: u32;
         let hi: u32;
+        // SAFETY: RDTSC is unprivileged on every x86_64 target we run
+        // (CR4.TSD is cleared during BSP init) and has no effect
+        // beyond writing EDX:EAX, which we claim via `out`.
         core::arch::asm!(
             "rdtsc",
             out("eax") lo,
@@ -68,6 +71,9 @@ fn read_cycle_counter() -> u64 {
     #[cfg(target_arch = "aarch64")]
     unsafe {
         let v: u64;
+        // SAFETY: CNTVCT_EL0 is the unprivileged virtual counter;
+        // MRS from it is always permitted at EL1 and has no side
+        // effects beyond writing the destination register.
         core::arch::asm!(
             "mrs {0}, cntvct_el0",
             out(reg) v,
@@ -89,6 +95,9 @@ fn read_cycle_counter() -> u64 {
 fn try_rdrand() -> Option<u64> {
     let value: u64;
     let ok: u8;
+    // SAFETY: RDRAND is unprivileged and has no memory or stack
+    // effects; it writes the named output register and sets CF.
+    // We don't use `preserves_flags` because SETC reads CF.
     unsafe {
         core::arch::asm!(
             "rdrand {0}",
