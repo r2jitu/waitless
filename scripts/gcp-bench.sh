@@ -89,8 +89,12 @@ if [ $do_build -eq 1 ]; then
     fi
 fi
 
-sync_files=("$SCRIPT_DIR/bench.py" "$SCRIPT_DIR/udp_bench.c"
-            "$SCRIPT_DIR/bench-tap-setup.sh")
+# rsync the `scripts/bench/` package directory + the bench.py shim;
+# the shim adds its own directory to sys.path so `from bench.cli
+# import main` resolves to the sibling package. udp_bench.c and
+# bench-tap-setup.sh ride along inside `bench/` and are located via
+# `os.path.dirname(__file__)` — no bazel runfiles machinery.
+sync_files=("$SCRIPT_DIR/bench.py" "$SCRIPT_DIR/bench")
 if [ $need_kvm -eq 1 ]; then
     ELF="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver.elf"
     [ -f "$ELF" ] || { echo "error: $ELF not found; run without --no-build" >&2; exit 1; }
@@ -131,24 +135,19 @@ ssh "$SSH_HOST" "mkdir -p ~/$REMOTE_DIR && chmod -R u+w ~/$REMOTE_DIR"
 # rsync preserves mtimes so subsequent runs skip unchanged files.
 rsync -az --partial "${sync_files[@]}" "$SSH_HOST:$REMOTE_DIR/"
 
-# Build udp_bench on the remote if missing or stale, and force-recreate
-# tap0 so vhost-net starts the bench with a clean slate (stale tap state
-# from a prior run can break the very first udp_async test).
-ssh "$SSH_HOST" "cd $REMOTE_DIR && \
-    if [ ! -f udp_bench ] || [ udp_bench.c -nt udp_bench ]; then \
-        cc -O2 -o udp_bench udp_bench.c -lpthread; \
-    fi && \
-    chmod +x bench-tap-setup.sh && \
-    sudo ip link del tap0 2>/dev/null; \
-    sudo ./bench-tap-setup.sh"
-
 # Run bench.py on the remote.
+#
+# bench.py is a 3-line shim that imports bench.cli; sys.path[0] is
+# its own dir (~/bench) so the sibling `bench/` package resolves.
+# KvmEnv.build() does tap0 + NAT setup by invoking the colocated
+# bench-tap-setup.sh, and the workloads module compiles udp_bench
+# on first UDP test. No pre-steps needed here.
 #
 # `-tt` allocates a PTY so Ctrl-C kills the remote process — but a PTY
 # also makes ssh wait for an exit event before flushing. We force python
-# to be unbuffered with `-u` and bench.py reconfigures stdout to line-
-# buffered, so output streams in real time even when the caller pipes
-# this script through `tee` or `tail`.
+# to be unbuffered with `-u` and cli.main() reconfigures stdout to
+# line-buffered, so output streams in real time even when the caller
+# pipes this script through `tee` or `tail`.
 echo "==> Running bench.py on $SSH_HOST: ${bench_args[*]}"
 echo ""
 ssh -tt "$SSH_HOST" "cd $REMOTE_DIR && python3 -u bench.py ${bench_args[*]}"

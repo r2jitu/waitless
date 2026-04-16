@@ -1,4 +1,4 @@
-// scripts/udp_bench.c — High-performance UDP echo benchmark client.
+// scripts/bench/udp_bench.c — High-performance UDP echo benchmark client.
 //
 // Three modes:
 //   1. Sync mode (default): N sender processes, each doing synchronous
@@ -37,7 +37,7 @@
 //                     count so the client's CPU budget scales with
 //                     the server under test.
 //
-// Build: cc -O2 -o udp_bench scripts/udp_bench.c -lpthread
+// Build: cc -O2 -o udp_bench scripts/bench/udp_bench.c -lpthread
 // Usage: udp_bench <port> <senders> <duration_sec>
 //                  [--async] [--concurrent] [--host=IP]
 //                  [--rate=PPS] [--client-cpus=N] [--timeout=MS]

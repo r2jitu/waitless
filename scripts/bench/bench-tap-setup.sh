@@ -7,12 +7,12 @@
 # pins to 10.20.30.10, so the bench harness can connect to the guest
 # at a known address.
 #
-# Run on the GCP host (or any Linux host running the bench):
-#   sudo ./bench-tap-setup.sh [user]
-#
-# Or install once and re-run on every bench:
-#   sudo cp scripts/bench-tap-setup.sh /usr/local/sbin/
-#   sudo /usr/local/sbin/bench-tap-setup.sh jitudas
+# This script is bundled as a runfile of //scripts/bench and invoked
+# by `KvmEnv.build()` / `KvmEnv.stop()` through the bazel runfiles
+# lookup, so bench.zip ships its own copy — no /usr/local/sbin
+# install required on the bench host. The script stays idempotent,
+# so calling it before every KVM test is cheap and resets any stale
+# tap state left by a prior run.
 #
 # Requires: ip (iproute2), dnsmasq, and a /etc/dnsmasq.d/unikernel-bench.conf
 # with at minimum:

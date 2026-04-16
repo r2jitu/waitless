@@ -29,7 +29,7 @@ rust-project.json
 # Cached artifacts
 .cache/
 bench/webserver_native
-scripts/udp_bench
+__pycache__/
 
 # Cargo standalone build artefacts (under tools/hvf-runner). The
 # bazel build goes through crate_universe and writes elsewhere.
