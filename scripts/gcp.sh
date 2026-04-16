@@ -72,8 +72,36 @@ _update_ssh_ip() {
 }
 
 _kill_remote_vm() {
-    ssh "$SSH_HOST" "sudo pkill -f '$QEMU_PATTERN' 2>/dev/null; true" \
-        >/dev/null 2>&1 || true
+    # Remove any running guest AND wait for it to actually exit before
+    # returning, so the next `run`/`serve` can re-bind :80/:443 without
+    # racing a dying qemu. SIGTERM first (qemu catches it and shuts
+    # down the machine cleanly), SIGKILL fallback after 3 s.
+    ssh "$SSH_HOST" bash -s "$QEMU_PATTERN" <<'REMOTE' >/dev/null 2>&1 || true
+set -u
+PAT="$1"
+pgrep -f "$PAT" >/dev/null 2>&1 || exit 0
+sudo pkill -f "$PAT" 2>/dev/null || true
+for _ in $(seq 1 30); do
+    pgrep -f "$PAT" >/dev/null 2>&1 || exit 0
+    sleep 0.1
+done
+sudo pkill -9 -f "$PAT" 2>/dev/null || true
+for _ in $(seq 1 20); do
+    pgrep -f "$PAT" >/dev/null 2>&1 || exit 0
+    sleep 0.1
+done
+exit 1
+REMOTE
+}
+
+# Print "Stopping existing remote VM..." and invoke _kill_remote_vm,
+# but only when there's actually a guest running. Silent fast path
+# when the instance is clean.
+_replace_remote_vm() {
+    if ssh "$SSH_HOST" "pgrep -f '$QEMU_PATTERN'" >/dev/null 2>&1; then
+        echo "==> Stopping existing remote VM..."
+        _kill_remote_vm
+    fi
 }
 
 _build() {
@@ -135,17 +163,25 @@ case "$cmd" in
 
         _build; _push
         ext_ip=$(_update_ssh_ip)
+        _replace_remote_vm
 
         # Remote QEMU binds hostfwd to 0.0.0.0:80 / :443 on the instance
         # so the VM is directly reachable at the public IP (gated by the
         # `allow-unikernel` firewall rule), and exposes the guest serial
-        # over a unix-domain socket. We forward ONLY the serial socket
+        # over a unix-domain socket. We forward ONLY that serial socket
         # over SSH (no TCP tunnels needed — the VM is public), then drive
-        # the local tty in raw mode with socat. Every keystroke is a raw
-        # byte to the guest UART RX: Ctrl-C (0x03) → serial::check_shutdown
-        # → arch_shutdown → ACPI S5 → clean QEMU exit; Ctrl-] is socat's
-        # escape char and detaches without touching the VM.
-        _kill_remote_vm
+        # the local tty in raw mode with socat. Every keystroke becomes
+        # a raw byte to the guest UART RX: Ctrl-C (0x03) → serial::
+        # check_shutdown → arch_shutdown → ACPI S5 → clean QEMU exit.
+        # Ctrl-] is socat's escape char and detaches without touching
+        # the VM.
+        #
+        # `wait=on` on the chardev blocks qemu's main loop at chardev
+        # init until the first client connects, so local socat captures
+        # the very first boot line instead of racing a boot that already
+        # happened. The tradeoff is we can't curl /health from the
+        # remote launcher — the guest hasn't started yet — so readiness
+        # is the user's eyeballs on the interactive console.
         ssh "$SSH_HOST" bash -s "$QEMU_PATTERN" "$MEMORY" "$CPUS" <<'REMOTE'
 set -euo pipefail
 QEMU_PATTERN="$1"; MEMORY="$2"; CPUS="$3"
@@ -165,18 +201,19 @@ nohup sudo qemu-system-x86_64 \
     -cpu host \
     -device "$DEVICE" \
     -netdev "$NETDEV" \
-    -chardev socket,id=s0,path=/tmp/webserver.sock,server=on,wait=off \
+    -chardev socket,id=s0,path=/tmp/webserver.sock,server=on,wait=on \
     -serial chardev:s0 \
     -display none -no-reboot \
     </dev/null >/tmp/qemu.out 2>&1 &
 disown
 
-# Wait for the socket file and chmod it so the sshd-forwarding user
-# (which is not root) can connect to the qemu-owned socket.
+# Wait for the listener socket to appear (qemu's listen() happens
+# before it blocks in accept()) and chmod it so the sshd-forwarding
+# user — not root — can connect through.
 for _ in $(seq 1 80); do
     if [[ -S /tmp/webserver.sock ]]; then
         sudo chmod 666 /tmp/webserver.sock
-        break
+        exit 0
     fi
     if ! pgrep -f "$QEMU_PATTERN" >/dev/null; then
         echo "ERROR: qemu exited before socket appeared" >&2
@@ -185,22 +222,7 @@ for _ in $(seq 1 80); do
     fi
     sleep 0.1
 done
-[[ -S /tmp/webserver.sock ]] || { echo "ERROR: serial socket not created" >&2; exit 1; }
-
-# Wait for HTTP to respond. Once the health endpoint is up, we know
-# TLS is listening too (same event-loop setup path).
-for _ in $(seq 1 60); do
-    if curl -sf --max-time 2 http://127.0.0.1/health >/dev/null 2>&1; then
-        exit 0
-    fi
-    if ! pgrep -f "$QEMU_PATTERN" >/dev/null; then
-        echo "ERROR: qemu exited early" >&2
-        tail -40 /tmp/qemu.out 2>/dev/null >&2 || true
-        exit 1
-    fi
-    sleep 0.5
-done
-echo "ERROR: http not ready after 30s" >&2
+echo "ERROR: serial socket not created after 8s" >&2
 exit 1
 REMOTE
 
@@ -337,9 +359,9 @@ REMOTE
     serve)
         _build; _push
         ext_ip=$(_update_ssh_ip)
+        _replace_remote_vm
 
         echo "==> Launching detached KVM on GCP (public :80/:443)..."
-        _kill_remote_vm
         ssh "$SSH_HOST" bash -s "$QEMU_PATTERN" "$MEMORY" "$CPUS" <<'REMOTE'
 set -euo pipefail
 QEMU_PATTERN="$1"; MEMORY="$2"; CPUS="$3"
