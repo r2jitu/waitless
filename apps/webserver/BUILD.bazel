@@ -27,6 +27,31 @@ alias(
     actual = ":webserver_run",
 )
 
+# Boot + Ctrl-C regression test. Sends a Ctrl-C byte to the guest serial
+# under load and checks the VM exits within a short deadline — a guard
+# against event-loop-starvation bugs (e.g. the virtio IRQ storm that used
+# to wedge both HTTP and the shutdown path).
+sh_test(
+    name = "test_ctrlc",
+    timeout = "short",
+    srcs = ["test_ctrlc.sh"],
+    data = ["//scripts:helpers.sh"] + select({
+        "//bazel/platforms:runner_hvf": [
+            ":webserver.img",
+            "//tools/hvf-runner:run_hvf",
+        ],
+        "//bazel/platforms:runner_qemu": [
+            ":webserver.elf",
+            ":webserver.img",
+        ],
+        "//conditions:default": [],
+    }),
+    tags = [
+        "exclusive",
+        "local",
+    ],
+)
+
 sh_test(
     name = "test",
     timeout = "long",
