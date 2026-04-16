@@ -61,12 +61,27 @@ use limine::request::RsdpRequest;
 // the MODULE.bazel `+avx,+avx2` annotation crash with `#UD` on
 // the first YMM instruction — manifests as a silent guest hang
 // during TLS config init.
+//
+// Also switches to our own 256 KiB stack before calling the Rust
+// entry. Limine's default stack is only 64 KiB, which
+// Server::new_boxed (+ TlsServerConfig::from_dev_cert + the
+// RustCrypto scalar-mult temporaries) overruns, triple-faulting
+// the guest the moment main() starts. Matches boot/x86_64/boot.S
+// where the multiboot path uses a 256 KiB stack_top.
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(
+    ".section .bss",
+    ".align 16",
+    ".global limine_stack_bottom",
+    "limine_stack_bottom:",
+    "    .space 262144",          // 256 KiB
+    ".global limine_stack_top",
+    "limine_stack_top:",
     ".section .text",
     ".code64",
     ".global limine_entry_stub",
     "limine_entry_stub:",
+    "    lea limine_stack_top(%rip), %rsp",
     "    mov %cr4, %rax",
     "    or  $(1 << 9) | (1 << 10), %rax",
     "    mov %rax, %cr4",
