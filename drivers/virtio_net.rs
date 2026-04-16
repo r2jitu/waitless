@@ -49,6 +49,19 @@ const VIRTIO_NET_HDR_SIZE: usize = 12; // VirtioNetHeader (with num_buffers)
 const MAX_ETH_FRAME: usize = 1514;
 const MAX_QUEUE_PAIRS: usize = 8;
 
+/// NAPI-style IP-header alignment shift. Layout of each RX buffer:
+///
+///   [virtio_net_hdr (12)][eth hdr (14)][IP hdr ...]
+///
+/// kmalloc returns 4-byte-aligned pointers, so the IP header lands at
+/// `buf + 26` — not 4-aligned, which on aarch64 makes the network
+/// stack's u32 reads (src/dst IP, checksum) fall back to the slow
+/// misaligned path. Shifting the DMA target by 2 moves the IP header
+/// to `buf + 28`, back on a 4-byte boundary. The x86 legacy-mmio
+/// init path (`init_legacy_mmio`) intentionally skips this shift —
+/// x86 handles misaligned loads at full speed.
+const RX_IP_ALIGN: usize = 2;
+
 #[repr(C, packed)]
 struct VirtioNetHeader {
     flags: u8,
@@ -326,16 +339,17 @@ fn init_pci_modern() -> bool {
         unsafe { (*ndev()).mac[i as usize] = vpci_read_dev_cfg8(dev, i); }
     }
 
-    // Allocate and populate RX buffers for all queue pairs
+    // Allocate and populate RX buffers for all queue pairs.
+    // See RX_IP_ALIGN for why the DMA target is shifted by 2 bytes.
     for pair in 0..num_pairs as usize {
         for i in 0..RX_BUFFERS {
-            let alloc = kmalloc(BUFFER_SIZE as usize + 2);
+            let alloc = kmalloc(BUFFER_SIZE as usize + RX_IP_ALIGN);
             if alloc.is_null() {
                 log(b"virtio_net: failed to allocate RX buffer\n");
                 vpci_set_status(dev, STATUS_FAILED);
                 return false;
             }
-            let buf = unsafe { alloc.add(2) };
+            let buf = unsafe { alloc.add(RX_IP_ALIGN) };
             unsafe {
                 ptr::write_bytes(buf, 0, VIRTIO_NET_HDR_SIZE);
                 (*ndev()).qp_state[pair].rx_buffers[i] = buf;
@@ -596,12 +610,12 @@ fn init_mmio() -> bool {
         (*ndev()).mac[5] = ((hi >> 8) & 0xff) as u8;
     }
 
-    // Allocate RX buffers for all queue pairs
+    // Allocate RX buffers for all queue pairs. See RX_IP_ALIGN.
     for pair in 0..num_pairs as usize {
         for i in 0..RX_BUFFERS {
-            let alloc = kmalloc(BUFFER_SIZE as usize + 2);
+            let alloc = kmalloc(BUFFER_SIZE as usize + RX_IP_ALIGN);
             if alloc.is_null() { return false; }
-            let buf = unsafe { alloc.add(2) };
+            let buf = unsafe { alloc.add(RX_IP_ALIGN) };
             unsafe {
                 ptr::write_bytes(buf, 0, VIRTIO_NET_HDR_SIZE);
                 (*ndev()).qp_state[pair].rx_buffers[i] = buf;
