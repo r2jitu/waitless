@@ -10,7 +10,7 @@
 # `openssl s_client`. Any TLS-1.3-capable openssl is fine — including
 # macOS's bundled LibreSSL — since ECDSA P-256 is universally supported.
 #
-# Default forward: -p tcp:8443:80. The test points openssl at localhost:8443.
+# Default forward: -p tcp:8443:443. The test points openssl at localhost:8443.
 
 set -euo pipefail
 
@@ -43,7 +43,7 @@ VM_HOST="127.0.0.1"
 VM_PORT="8443"
 
 echo "==> Booting webserver via HVF runner (HTTPS on :${VM_PORT})..."
-"$HVF_BIN" "$IMG" -p "tcp:${VM_PORT}:80" >"$VM_LOG" 2>&1 &
+"$HVF_BIN" "$IMG" -p "tcp:${VM_PORT}:443" >"$VM_LOG" 2>&1 &
 VM_PID=$!
 
 if ! wait_https /health 30 "$VM_PID"; then
