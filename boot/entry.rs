@@ -400,10 +400,10 @@ unsafe fn kernel_boot(info: &BootInfo) {
     #[cfg(target_arch = "aarch64")]
     kernel::aarch64::smp::init_tls(0);
 
-    klog!("[INIT] PCI bus scan (Rust)...\n");
+    klog!("[INIT] PCI bus scan...\n");
     drivers::pci::init();
 
-    klog!("[INIT] Virtio-net driver (Rust)...\n");
+    klog!("[INIT] Virtio-net driver...\n");
     let net_ok = drivers::virtio_net::init();
     if !net_ok {
         klog!("       [WARN] No virtio-net device found.\n");
@@ -417,7 +417,7 @@ unsafe fn kernel_boot(info: &BootInfo) {
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
         );
 
-        klog!("[INIT] DHCP (Rust)...\n");
+        klog!("[INIT] DHCP...\n");
         let dhcp_ok = net::dhcp::discover();
         if dhcp_ok {
             klog!("       IP obtained successfully\n");
@@ -437,7 +437,7 @@ unsafe fn kernel_boot(info: &BootInfo) {
         // single-queue DHCP polling.
         drivers::virtio_net::activate_multi_queue();
 
-        klog!("[INIT] TCP stack (Rust)...\n");
+        klog!("[INIT] TCP stack...\n");
         net::tcp::init();
 
         klog!("[INIT] Interrupt-driven idle...\n");

@@ -1278,7 +1278,7 @@ def main():
     print("=" * (24 + 14 * len(columns) + 10))
     print(f"  Duration: {duration}s | /compute: 100K hash iters | /health: static JSON")
     if any(c > 1 for c in core_counts):
-        print(f"  Multi-core: MTTCG (x86_64) or hardware (VZ)")
+        print(f"  Multi-core: MTTCG (x86_64) or hardware (HVF/KVM)")
     print("=" * (24 + 14 * len(columns) + 10))
 
 

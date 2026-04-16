@@ -39,7 +39,7 @@ background: #1a1a2e; border-radius: 4px; }\
 Application (this server)\n\
     |  direct function call\n\
     v\n\
-HTTP parser (Rust)\n\
+HTTP parser\n\
     |  uni:: interface\n\
     v\n\
 TCP stack (uni::tcp)\n\
@@ -54,7 +54,7 @@ Network backend\n\
 <li><a href='/health'>/health</a> \xe2\x80\x94 health check (JSON)</li>\
 <li><a href='/stats'>/stats</a> \xe2\x80\x94 runtime statistics</li>\
 </ul>\
-<p><small>Built with UniKernel v0.1.0 (Rust)</small></p>\
+<p><small>UniKernel v0.1.0</small></p>\
 </body></html>";
 
 const HEALTH_JSON: &[u8] = b"{\"status\":\"ok\",\"runtime\":\"unikernel\",\"version\":\"0.1.0\"}";
@@ -149,7 +149,7 @@ const HTTPS_PORT: u16 = 443;
 
 #[uni::main]
 fn main() {
-    uni::log(b"Starting Rust HTTP server...\n");
+    uni::log(b"Starting HTTP server...\n");
     let http_port = uni::config_port(HTTP_PORT);
     let https_port = uni::config_tls_port(HTTPS_PORT);
 
