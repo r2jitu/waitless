@@ -203,7 +203,13 @@ rust_library(
 # in tls_server.rs compiles to no-op stubs with zero runtime cost.
 rust_library(
     name = "tls_server",
-    srcs = ["tls_server.rs"],
+    srcs = [
+        "tls_server.rs",
+        "tls_server_handlers.rs",
+        "tls_server_keys.rs",
+        "tls_server_profile.rs",
+        "tls_server_trace.rs",
+    ],
     crate_root = "tls_server.rs",
     crate_name = "net_tls_server",
     # `--check-cfg=cfg(tls_debug)` declares the custom cfg to rustc's
