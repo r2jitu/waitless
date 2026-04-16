@@ -34,8 +34,22 @@ GCP_ZONE="${GCP_ZONE:-us-west1-a}"
 GCP_INSTANCE="${GCP_INSTANCE:-kvm-vm}"
 SSH_HOST="${GCP_SSH_HOST:-gcp}"
 MEMORY="${UNIKERNEL_MEMORY:-128}"
-CPUS="${UNIKERNEL_CPUS:-$(ssh "$SSH_HOST" nproc 2>/dev/null || echo 1)}"
 TEST_PORT=19099
+
+# Resolve the guest vCPU count — `UNIKERNEL_CPUS` if set, else the
+# remote host's `nproc`. Deferred into a function (rather than a
+# top-level `$(...)` assignment) so `gcp.sh status`/`stop`/`ip` don't
+# ssh to the instance just to populate a variable they never read —
+# when the instance is TERMINATED that ssh blocks on TCP retries for
+# ~75 s, which made every `gcp-bench.sh` invocation look hung right
+# after the build step finished.
+_cpus() {
+    if [ -n "${UNIKERNEL_CPUS:-}" ]; then
+        echo "$UNIKERNEL_CPUS"
+    else
+        ssh "$SSH_HOST" nproc 2>/dev/null || echo 1
+    fi
+}
 
 # pkill/pgrep -f pattern for the running guest. The character-class
 # trick (`[q]emu…`) is load-bearing: without it the literal regex
@@ -125,8 +139,8 @@ GUEST_IP="$1"
 USER_NAME="${SUDO_USER:-jitudas}"
 PUB_IF=$(ip -o -4 route show default | awk '{print $5; exit}')
 
-# tap0 multi-queue (matches /usr/local/sbin/bench-tap-setup.sh layout
-# so bench.py and gcp.sh share the same interface and dnsmasq lease).
+# tap0 multi-queue (matches scripts/bench/bench-tap-setup.sh layout
+# so bench.zip and gcp.sh share the same interface and dnsmasq lease).
 if ! ip link show tap0 >/dev/null 2>&1; then
     ip tuntap add dev tap0 mode tap multi_queue user "$USER_NAME"
     ip addr add 10.20.30.1/24 dev tap0
@@ -227,7 +241,7 @@ case "$cmd" in
         # is we can't probe /health from the remote launcher (the guest
         # hasn't started yet); readiness is the user's eyeballs on the
         # interactive console.
-        ssh "$SSH_HOST" bash -s "$QEMU_PATTERN" "$MEMORY" "$CPUS" "$GUEST_MAC" <<'REMOTE'
+        ssh "$SSH_HOST" bash -s "$QEMU_PATTERN" "$MEMORY" "$(_cpus)" "$GUEST_MAC" <<'REMOTE'
 set -euo pipefail
 QEMU_PATTERN="$1"; MEMORY="$2"; CPUS="$3"; GUEST_MAC="$4"
 
@@ -408,7 +422,7 @@ REMOTE
         _setup_remote_tap_nat
 
         echo "==> Launching detached KVM on GCP (public :80/:443)..."
-        ssh "$SSH_HOST" bash -s "$QEMU_PATTERN" "$MEMORY" "$CPUS" "$GUEST_MAC" "$GUEST_IP" <<'REMOTE'
+        ssh "$SSH_HOST" bash -s "$QEMU_PATTERN" "$MEMORY" "$(_cpus)" "$GUEST_MAC" "$GUEST_IP" <<'REMOTE'
 set -euo pipefail
 QEMU_PATTERN="$1"; MEMORY="$2"; CPUS="$3"; GUEST_MAC="$4"; GUEST_IP="$5"
 
