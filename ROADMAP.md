@@ -6,6 +6,21 @@ optional via Bazel deps — you pick exactly what you need.
 
 ## Design Principles
 
+- **The executor IS the kernel**: `async fn` is the *only* execution
+  model, not a layer on top of a callback loop. No tokio, no smol, no
+  two-layer scheduling. QUIC connections, TLS handshakes, and HTTP
+  handlers are all `async fn`s polled directly by the per-core event
+  loop. No other Rust stack makes this claim — Tokio/smol run above
+  Linux, Embassy is single-threaded microcontroller-tuned, Hermit
+  targets libstd. The combination of multi-core + lock-free + no_std
+  + async-as-scheduler is the differentiation thesis.
+- **QUIC over TCP as structural advantage, not just modernity**: TCP
+  has decades of kernel offload (TSO/GSO/kTLS) that a userspace server
+  fights against. QUIC is userspace by definition — every byte crosses
+  the syscall boundary on Linux. A unikernel eliminates that boundary
+  specifically for QUIC. This is the one workload where unikernels
+  have a measurable structural advantage on commodity hardware, not
+  just a vibes-based one.
 - **Modern over legacy**: QUIC over TCP, IPv6 over IPv4, NDP over ARP
 - **Deps as feature selection**: app declares what it needs via Bazel deps — unused protocols never compile
 - **No preemption, no locks**: cooperative scheduling, lock-free data structures only
@@ -106,6 +121,37 @@ the kernel. No syscalls, no epoll indirection, no context switches.
 
 Every core is a worker. No dedicated cores, no preemption, no scheduler.
 Same event loop: poll -> process -> steal -> sleep.
+
+### North Star: async runtime foundation, then QUIC on top
+
+Phase 2a-c shipped a callback-based event loop that scales multi-core
+HTTP and TLS. That shape does not scale to QUIC. Every QUIC connection
+has N concurrent streams, loss-detection timers, pacing timers, key
+updates, and a handshake flight interleaving on one connection state.
+Expressing that as callbacks produces the `Arc<Mutex<Connection>>`
+mess that quinn and msquic carry around. `async fn` with `.await` is
+the clean expression — and the compiler generates the state machine
+for free.
+
+**Ordering decision (2026-04-15)**: a minimal async runtime (§2f task
+trait + §2g Waker/executor, ~300 LOC together) lands **before** QUIC
+(§3c), not after. Rationale:
+
+- Doing QUIC first as a hand-rolled state machine and later retrofitting
+  async = rewrite the biggest chunk of code in the repo twice.
+- Doing a "complete" async runtime first with no consumer = guess at
+  what primitives QUIC needs, build the wrong thing, over-engineer.
+- Doing a **minimum** runtime first (spawn, Timer, UdpRecv) and then
+  writing QUIC as its first real consumer = runtime evolves to fit
+  the workload; no wasted code on either side.
+
+**Scope discipline**: async adoption is opt-in per protocol. The
+existing TCP/TLS/HTTP callback path keeps running unchanged. QUIC
+uses async from day 1. TCP/TLS/HTTP migrate only if/when there's a
+concrete win. This avoids a "port everything" detour blocking QUIC.
+
+Work stealing (§2d), perf regression tests (§2h), and full TCP/HTTP
+async migration stay parked until after QUIC is end-to-end.
 
 ### Platform compatibility matrix
 
@@ -606,7 +652,16 @@ UNIKERNEL_CPUS=4 bazel test --config=x86_64-qemu //apps/webserver:test --test_en
 ./scripts/bench_udp.sh
 ```
 
-### 2d. Work stealing
+### 2d. Work stealing — parked (post-QUIC optimization)
+
+Deferred until after QUIC is end-to-end. Work stealing is a
+CPU-heavy-task optimization (TLS encrypt, QUIC crypto, compression).
+For a webserver where most tasks are connection-bound and short-lived,
+RSS flow-hash pinning already distributes load well. Re-evaluate once
+QUIC ships and we have a concrete workload showing imbalance.
+
+Data structures are already in tree (deque + SPSC ring), so pulling
+this forward later is pure event-loop wiring.
 
 - [x] Per-core SPSC ring for pinned tasks/inbox/TX staging (kernel/spsc.rs, 5 tests)
 - [x] Per-core Chase-Lev deque for stealable tasks (kernel/deque.rs)
@@ -636,18 +691,77 @@ UNIKERNEL_CPUS=4 bazel test --config=x86_64-qemu //apps/webserver:test --test_en
 - [ ] Integration: `test_timer_fire` — set timers on different cores, verify correct fire times
 - [ ] Integration: `test_cross_core_timer` — stolen task arms timer on remote core, verify it fires
 
-### 2f. Task trait + closure-based tasks
+### 2f. Task trait + pinned task slots — **next**
 
-- [ ] `trait Task { fn run(self); }` interface
-- [ ] Closure wrapper implementing Task
-- [ ] Event loop processes tasks via trait
+Minimum abstraction that unifies the three wake sources (packet,
+timer, IRQ) and preps for §2g's `Future` integration. Not an
+executor yet — just the arena + trait. Shape mirrors `Future::poll`
+so §2g is a bolt-on, not a rewrite.
 
-### 2g. Async/await support (future evolution)
+- [ ] `trait Task { fn poll(self: Pin<&mut Self>) -> TaskState; }` —
+      returns `Pending` / `Ready` / `Done`.
+- [ ] Per-core task slot arena: fixed-size array of
+      `TaskSlot { state: AtomicU8, task: Option<Pin<Box<dyn Task>>> }`.
+      Slots indexed by `u16`; waker identity = `(core_id, slot_idx)`
+      encoded in a `usize`. No `Arc`, no per-waker vtable.
+- [ ] `spawn(task) -> TaskHandle` onto current core's arena.
+- [ ] Event loop integration: after poll/drain/service, scan arena
+      for `state == Ready` slots, clear, call `poll()`.
+- [ ] `yield_now()`: sets `state = Ready` and returns `Pending`.
 
-- [ ] `Reactor`: VirtIO interrupts -> `Waker` notifications
-- [ ] `Spawner`: `spawn(async { ... })` enqueues future as task
-- [ ] Event loop: `future.poll()` instead of `closure()`
-- [ ] Pin/Waker integration
+**Tests:**
+- [ ] Unit: arena spawn/free/reclaim semantics.
+- [ ] Integration: `apps/test_async` spawns one task per core, each
+      task announces its core id and increments a shared counter.
+
+### 2g. Async/await (`Future` + `Waker` + minimal executor) — **next**
+
+Layer Rust's `async fn` on top of §2f's task slots. Minimum viable
+executor: no combinators (`select!`/`join!`), no tokio/smol compat —
+just enough primitives for QUIC to `.await` what it needs.
+
+- [ ] `RawWakerVTable` (clone/wake/wake_by_ref/drop) that flips the
+      target slot's `state` atomic. Waker data = encoded
+      `(core_id, slot_idx)`. ~40 lines unsafe. Same-core wake is a
+      relaxed store; cross-core wake issues an IPI.
+- [ ] `spawn<F: Future<Output=()> + 'static>(f: F)` boxes the
+      future into §2f's arena. Per-core bump allocator
+      ([kernel/bump.rs](kernel/bump.rs)) already handles allocation;
+      typical future size is a few hundred bytes.
+- [ ] Reactor primitives (only what QUIC needs v1):
+      - `Timer::sleep_until(deadline).await` — parks waker in
+        [kernel/timer.rs](kernel/timer.rs) wheel (data structure
+        exists; wire it into the event loop here).
+      - `UdpRecv::recv_from(&mut buf).await` — parks waker on
+        per-core UDP inbox; `net::poll_tier1/2` wakes it on arrival.
+      - `TcpListener::accept().await` — parks waker on listener's
+        ready queue (optional for QUIC, nice for migrating HTTP later).
+- [ ] Event loop shim: `service()` drains ready slots and calls
+      `future.as_mut().poll(&mut Context::new(&waker))`. No change
+      to poll/drain/idle phases.
+- [ ] Smoke test: `apps/test_async` — task sleeps 10ms, reads a UDP
+      datagram, echoes it, exits. Proves spawn + timer waker + IO
+      waker all work end-to-end.
+
+**Explicit non-goals:**
+- Porting TCP/TLS/HTTP to async (they work; migrate only if a win).
+- `select!`/`join!` macros (QUIC will need concurrent awaits; use
+  explicit `poll` on sub-futures until we have a clear pattern).
+- `Send + Sync` bounds (per-core affinity is the whole point).
+- Async-debugging tooling (stuck-poll diagnostics, task dumps) —
+  add when we get burned.
+
+**Tests:**
+- [ ] Unit (host): Waker clone/wake correctness under miri.
+- [ ] Integration: `apps/test_async` end-to-end on HVF + QEMU + native.
+- [ ] Integration: spawn 1000 `Timer::sleep_until` tasks, verify all
+      fire within ±1ms of deadline.
+
+**Try it:**
+```bash
+bazel test //apps/test_async:test --config=hvf
+# Serial: "async: timer fired, udp echoed, goodbye"
+```
 
 ### 2h. Performance regression tests
 
@@ -897,11 +1011,16 @@ python3 scripts/bench.py --env hvf,native --cores 1,2,3 \
       but would let us exercise PMULL on aarch64 and AES-NI on
       x86_64 if a peak-throughput workload ever demands it.
 
-### 3c. QUIC implementation — roll our own on top of `//net:tls_server`
+### 3c. QUIC implementation — roll our own on `//net:tls_server` + the async runtime
 
-**Status (2026-04-15)**: not started. Phase 3b shipped, so
-the prerequisite (a working sans-io TLS 1.3 server we own
-end-to-end) is now in tree as `//net:tls_server`. Next phase.
+**Status (2026-04-15)**: not started, gated on Phase 2f+2g (the async
+runtime foundation — see "North Star" at the top of Phase 2). Phase
+3b shipped the TLS 1.3 prereq. QUIC will be the **first real consumer
+of the async runtime** — each connection is an `async fn handle_quic(
+conn: QuicConn)` with `.await` on UDP recv, stream readable, and
+loss/pacing timers. This is exactly the design QUIC was shaped for,
+and it's why we're going async-first rather than writing QUIC as yet
+another hand-rolled state machine on top of a callback loop.
 
 Decision: roll our own QUIC implementation. We're not going to
 ship parity with quinn — the 9000-series RFCs add up to ~600
@@ -1010,6 +1129,10 @@ The trade-off is surface area. Scope discipline is critical:
 
 **Tasks (live):**
 
+- [ ] **Prerequisite: §2f + §2g async runtime foundation.** QUIC
+      connections are `async fn` from day 1 — they `.await` UDP recv,
+      timer fire, and stream readable. Land the minimal runtime first
+      so QUIC drives its own API requirements instead of us guessing.
 - [ ] **`//net:tls_server` "QUIC mode"** — extension of the
       existing state machine that emits handshake messages as
       raw bytes (no TLS record framing) for QUIC's CRYPTO
@@ -1477,12 +1600,16 @@ sh_test(name = "test", srcs = ["test.sh"], data = [":test_smp.elf"])
 | 2a. SMP boot (AP spin-up) | ✅ done | Medium | Foundation for all multi-core | None |
 | 2b. Tier 1: multi-queue + MSI-X | ✅ done | Large | Per-core queues (QEMU + HVF) | 2a |
 | 2c. Tier 2: software distribution | ✅ done | Medium | Multi-core on single-queue platforms | 2a |
-| 2d-h. Work stealing + async | parked | Medium | Multi-core efficiency | 2a-c |
+| 2f. Task trait + pinned slots | **next** | Small | Foundation for async | 2a-c |
+| 2g. Async/await (Future + Waker + executor) | **next** | Medium | The differentiation thesis | 2f |
 | 3a. UDP | ✅ done | Small | Enables QUIC | None |
 | 3b. TLS 1.3 (hand-rolled) | ✅ done | Large | Required for QUIC | 1b |
-| 3c. QUIC | **next** | Large | Modern transport | 3a, 3b |
+| 3c. QUIC (as `async fn`) | after 2g | Large | Modern transport + runtime consumer | 3a, 3b, 2g |
 | 4. HTTP/3 | not started | Medium | Modern HTTP | 3c |
 | 5. IPv6 + NDP | not started | Medium | Drop IPv4 legacy | None |
+| 2d. Work stealing | parked (post-QUIC) | Medium | CPU-task efficiency | 2a-c |
+| 2e. Timer wheel event-loop wiring | absorbed into 2g | Small | Async timers | 2a |
+| 2h. Perf regression tests | parked (post-QUIC) | Medium | Prevent regressions | 2a-c |
 
 **Where we are now (2026-04-15):** through phase 3b. The
 hand-rolled TLS 1.3 stack runs cleanly on x86_64 KVM, x86_64
@@ -1491,14 +1618,24 @@ TCG, aarch64 HVF, aarch64 QEMU TCG, and native POSIX
 (`tls_handshake_max`, `health_tls_c1`, `health_tls_max`),
 including a remote GCP wrapper (`scripts/gcp-bench.sh`).
 
-**Next on deck:** Phase 3c (QUIC), riding on `//net:tls_server`
-for the handshake. Optional pre-step: session resumption in
-the deferred-work section, which would benefit both the
-TLS-over-TCP path and the future TLS-over-QUIC path.
+**Next on deck:** Phase **2f + 2g** (async runtime foundation),
+then Phase **3c** (QUIC as `async fn` on top). The async runtime
+lands first — minimum scope (task trait + `RawWakerVTable` +
+`Timer::sleep_until` + `UdpRecv::recv_from`), ~300 LOC — precisely
+so QUIC can drive its own API requirements rather than us guessing
+at what primitives to expose. The existing TCP/TLS/HTTP callback
+path keeps running unchanged; async adoption is opt-in per protocol.
 
-The original suggested order was
-`1a → 1b → 3a → 2a → 2c → 2b → 3b → 3c → 4 → 5 → 2d-h`
-and we've followed it through 3b (with detours: x86_64
-correctness, HVF runner inline accept, and the SigningKey
-caching profile-driven optimisation). 3c → 4 → 5 → 2d-h
-remains the right shape for what's left.
+Revised order for what's left:
+`2f → 2g → 3c → 4 (HTTP/3) → 5 (IPv6/NDP) → 2d/2h (work stealing
++ perf tests, post-QUIC)`.
+
+**The thesis we're committing to**: `async fn` is the *only* execution
+model, not a layer. Tokio/smol run above Linux; Embassy is
+single-core microcontroller; Hermit targets libstd. A multi-core,
+lock-free, no_std, QUIC-first Rust runtime where the executor IS the
+kernel has no prior art. That's the differentiation bet — and it
+compounds with the architectural decisions already shipped (per-core
+lock-free queues, flow-hash connection pinning, hand-rolled TLS 1.3,
+native HVF runner). Each of those ingredients has some equivalent
+elsewhere; the combination does not.
