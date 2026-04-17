@@ -1,11 +1,25 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 // kernel/x86_64/acpi.rs — Minimal ACPI parser for CPU topology.
 //
-// Finds RSDP in BIOS memory, parses RSDT, finds MADT, extracts
-// Local APIC entries to discover CPU count and APIC IDs.
+// Finds RSDP (from a boot-protocol hint when available, otherwise by
+// scanning the legacy BIOS area), walks RSDT/XSDT → MADT, and
+// extracts Local APIC entries to discover CPU count and APIC IDs.
 
 use crate::once::InitOnce;
 use crate::serial;
+use crate::mm;
+
+/// RSDP physical address supplied by the boot loader (Limine, PVH),
+/// populated by `set_rsdp()` before `detect_cpus()` runs. 0 means
+/// "fall back to scanning 0xE0000–0xFFFFF". UEFI firmware (GCE's OVMF
+/// path) doesn't put the RSDP in that legacy range, so on those
+/// platforms the boot-loader hint is the only way to find it.
+static BOOT_RSDP_PADDR: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+pub fn set_rsdp(paddr: u64) {
+    BOOT_RSDP_PADDR.store(paddr, core::sync::atomic::Ordering::Relaxed);
+}
 
 /// ACPI RSDP signature: "RSD PTR "
 const RSDP_SIG: [u8; 8] = *b"RSD PTR ";
@@ -37,19 +51,32 @@ pub struct CpuTopology {
 /// `detect_cpus()` before any AP starts.
 static TOPOLOGY: InitOnce<CpuTopology> = InitOnce::new();
 
-/// Scan the BIOS area (0xE0000–0xFFFFF) for the RSDP signature, verify the
-/// 20-byte checksum, and return its physical address. Returns 0 if not found.
+/// Read a `T` from physical address `phys`, going through the HHDM
+/// mapping. Needed because the higher-half Limine kernel has no
+/// identity map for low physical memory — a naked `*(phys as *const T)`
+/// would fault. On flat-identity boot paths (multiboot2/PVH) this is
+/// a no-op (HHDM offset is 0).
 ///
-/// SAFETY: dereferences raw pointers to BIOS memory; only safe to call on
-/// x86_64 with identity-mapped low memory available.
-unsafe fn find_rsdp() -> u64 {
+/// SAFETY: `phys` must point to a valid, readable `T`.
+unsafe fn read_phys<T: Copy>(phys: u64) -> T {
+    *(mm::phys_to_virt(phys) as *const T)
+}
+
+/// Scan the legacy BIOS area (0xE0000–0xFFFFF) for the RSDP signature.
+/// Returns the physical address, or 0 if not present. Only meaningful
+/// under SeaBIOS-style legacy firmware; UEFI (e.g. GCE's OVMF) does
+/// NOT put the RSDP here, which is why we prefer the boot-protocol
+/// hint in `detect_cpus` and only fall back to this as a last resort.
+///
+/// SAFETY: reads arbitrary low physical memory via phys_to_virt.
+unsafe fn find_rsdp_bios_scan() -> u64 {
     let mut addr = 0xE0000u64;
     while addr < 0x100000 {
-        let ptr = addr as *const [u8; 8];
-        if *ptr == RSDP_SIG {
+        let sig: [u8; 8] = read_phys(addr);
+        if sig == RSDP_SIG {
             let mut sum: u8 = 0;
             for i in 0..20 {
-                sum = sum.wrapping_add(*((addr + i) as *const u8));
+                sum = sum.wrapping_add(read_phys::<u8>(addr + i));
             }
             if sum == 0 {
                 return addr;
@@ -60,24 +87,27 @@ unsafe fn find_rsdp() -> u64 {
     0
 }
 
-/// Walk the RSDT pointed to by `rsdt_phys` and return the physical address
-/// of the first MADT (signature "APIC"). Returns 0 if not found or if the
-/// RSDT length field is obviously bogus.
-///
-/// SAFETY: caller must ensure `rsdt_phys` points to a valid RSDT.
-unsafe fn find_madt(rsdt_phys: u64) -> u64 {
-    let rsdt_len = *((rsdt_phys + 4) as *const u32) as usize;
-    if rsdt_len < SDT_HEADER_LEN || rsdt_len > MAX_TABLE_LEN {
+/// Walk an RSDT (entry_size=4) or XSDT (entry_size=8) at `sdt_phys`
+/// and return the physical address of the first MADT (signature "APIC"),
+/// or 0 if absent or the length field is obviously bogus.
+unsafe fn find_madt(sdt_phys: u64, entry_size: u64) -> u64 {
+    let sdt_len: u32 = read_phys(sdt_phys + 4);
+    let sdt_len = sdt_len as usize;
+    if sdt_len < SDT_HEADER_LEN || sdt_len > MAX_TABLE_LEN {
         return 0;
     }
-    let entry_count = (rsdt_len - SDT_HEADER_LEN) / 4;
+    let entry_count = (sdt_len - SDT_HEADER_LEN) as u64 / entry_size;
 
     for i in 0..entry_count {
-        let entry_phys = *((rsdt_phys + SDT_HEADER_LEN as u64 + (i as u64) * 4)
-            as *const u32) as u64;
+        let entry_phys_addr = sdt_phys + SDT_HEADER_LEN as u64 + i * entry_size;
+        let entry_phys: u64 = if entry_size == 8 {
+            read_phys::<u64>(entry_phys_addr)
+        } else {
+            read_phys::<u32>(entry_phys_addr) as u64
+        };
         if entry_phys == 0 { continue; }
-        let sig = entry_phys as *const [u8; 4];
-        if *sig == MADT_SIG {
+        let sig: [u8; 4] = read_phys(entry_phys);
+        if sig == MADT_SIG {
             return entry_phys;
         }
     }
@@ -89,7 +119,8 @@ unsafe fn find_madt(rsdt_phys: u64) -> u64 {
 ///
 /// SAFETY: caller must ensure `madt_addr` points to a valid MADT.
 unsafe fn parse_madt_entries(madt_addr: u64, topo: &mut CpuTopology) -> u32 {
-    let raw_len = *((madt_addr + 4) as *const u32) as usize;
+    let raw_len: u32 = read_phys(madt_addr + 4);
+    let raw_len = raw_len as usize;
     // Cap at MAX_TABLE_LEN so a corrupt length can't drag us off the end
     // of physical memory. raw_len < header is an unusable table.
     if raw_len < MADT_HEADER_LEN {
@@ -100,8 +131,8 @@ unsafe fn parse_madt_entries(madt_addr: u64, topo: &mut CpuTopology) -> u32 {
     let mut count = 0u32;
 
     while offset + 2 <= madt_len {
-        let entry_type = *((madt_addr + offset as u64) as *const u8);
-        let entry_len = *((madt_addr + offset as u64 + 1) as *const u8) as usize;
+        let entry_type: u8 = read_phys(madt_addr + offset as u64);
+        let entry_len = read_phys::<u8>(madt_addr + offset as u64 + 1) as usize;
         // Malformed entry: zero-length would loop forever; oversize would
         // skip past the end of the table into unrelated memory.
         if entry_len < 2 || offset + entry_len > madt_len {
@@ -111,8 +142,8 @@ unsafe fn parse_madt_entries(madt_addr: u64, topo: &mut CpuTopology) -> u32 {
         if entry_type == 0 && entry_len >= 8 {
             // Local APIC entry: type(1) + len(1) + acpi_processor_id(1) +
             // apic_id(1) + flags(4). Bit 0 = enabled, bit 1 = online capable.
-            let apic_id = *((madt_addr + offset as u64 + 3) as *const u8);
-            let flags = *((madt_addr + offset as u64 + 4) as *const u32);
+            let apic_id: u8 = read_phys(madt_addr + offset as u64 + 3);
+            let flags: u32 = read_phys(madt_addr + offset as u64 + 4);
             if (flags & 0x3) != 0 && (count as usize) < MAX_CPUS {
                 topo.apic_ids[count as usize] = apic_id;
                 count += 1;
@@ -149,18 +180,37 @@ pub unsafe fn detect_cpus() -> u32 {
         apic_ids: [0; MAX_CPUS],
     };
 
-    let rsdp_addr = find_rsdp();
+    // Prefer the boot-protocol RSDP hint; only fall back to the BIOS
+    // scan when no loader told us where to look. UEFI firmware (GCE's
+    // OVMF path) doesn't put the RSDP in 0xE0000–0xFFFFF, so the scan
+    // fails there — which is exactly how "ACPI: RSDP not found" and
+    // a silent single-core boot showed up on GCE.
+    let rsdp_addr = BOOT_RSDP_PADDR.load(core::sync::atomic::Ordering::Relaxed);
+    let rsdp_addr = if rsdp_addr != 0 { rsdp_addr } else { find_rsdp_bios_scan() };
     if rsdp_addr == 0 {
         return finish(topo, b"       ACPI: RSDP not found\n");
     }
 
-    // RSDP: RSDT address at offset 16 (4 bytes).
-    let rsdt_phys = *((rsdp_addr + 16) as *const u32) as u64;
-    if rsdt_phys == 0 {
-        return finish(topo, b"       ACPI: RSDT address is 0\n");
+    // ACPI 1.0 RSDP carries a 32-bit RSDT pointer at offset 16.
+    // ACPI 2.0+ (revision >= 2) adds an 8-byte XSDT pointer at offset
+    // 24 with 64-bit entries. Modern firmware — and every UEFI path —
+    // reports rev=2, and may leave the old RSDT pointer 0.
+    let revision: u8 = read_phys(rsdp_addr + 15);
+    let (sdt_phys, entry_size) = if revision >= 2 {
+        let xsdt: u64 = read_phys(rsdp_addr + 24);
+        if xsdt != 0 {
+            (xsdt, 8u64)
+        } else {
+            (read_phys::<u32>(rsdp_addr + 16) as u64, 4u64)
+        }
+    } else {
+        (read_phys::<u32>(rsdp_addr + 16) as u64, 4u64)
+    };
+    if sdt_phys == 0 {
+        return finish(topo, b"       ACPI: RSDT/XSDT address is 0\n");
     }
 
-    let madt_addr = find_madt(rsdt_phys);
+    let madt_addr = find_madt(sdt_phys, entry_size);
     if madt_addr == 0 {
         return finish(topo, b"       ACPI: MADT not found\n");
     }

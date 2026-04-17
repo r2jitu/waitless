@@ -37,6 +37,13 @@ pub struct BootInfo {
     pub kernel_phys_base: u64,
     pub kernel_virt_base: u64,
     pub hhdm_offset: u64,
+    /// x86_64 ACPI RSDP physical address, as supplied by the boot
+    /// protocol (Limine RSDP request, PVH start_info, etc). 0 means
+    /// "unknown — fall back to scanning the BIOS area". The legacy
+    /// 0xE0000–0xFFFFF scan only works under SeaBIOS; UEFI firmware
+    /// (e.g. GCE's OVMF path) puts the RSDP elsewhere and the scan
+    /// comes up empty, so we ignore ACPI and boot single-core.
+    pub rsdp_paddr: u64,
 }
 
 impl BootInfo {
@@ -54,6 +61,7 @@ impl BootInfo {
             kernel_phys_base: 0,
             kernel_virt_base: 0,
             hhdm_offset: 0,
+            rsdp_paddr: 0,
         }
     }
 }

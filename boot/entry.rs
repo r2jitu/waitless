@@ -96,6 +96,12 @@ unsafe extern "C" {
     // Linker-generated symbols
     static __bss_start: u8;
     static __bss_end: u8;
+
+    // Defined in boot/limine_entry.rs. Releases every non-BSP CPU
+    // parked by Limine's MP request into the kernel's AP entry path
+    // and returns the total CPU count Limine found.
+    #[cfg(target_arch = "x86_64")]
+    fn start_aps_via_limine_mp() -> u32;
 }
 
 // ============================================================================
@@ -130,6 +136,8 @@ mod boot_shim_x86 {
     // Multiboot2 structures
     const MULTIBOOT_TAG_END: u32 = 0;
     const MULTIBOOT_TAG_MMAP: u32 = 6;
+    const MULTIBOOT_TAG_ACPI_OLD: u32 = 14; // ACPI 1.0 RSDP copy
+    const MULTIBOOT_TAG_ACPI_NEW: u32 = 15; // ACPI 2.0+ RSDP copy
     const MULTIBOOT_MEMORY_AVAILABLE: u32 = 1;
 
     // PVH (Xen HVM) — used by QEMU 10.x
@@ -166,6 +174,7 @@ mod boot_shim_x86 {
         info.kernel_phys_base = 0;
         info.kernel_virt_base = 0;
         info.hhdm_offset = 0;
+        info.rsdp_paddr = 0;
 
         if boot_info_addr == 0 {
             info.memory_map[0] = MemoryRegion {
@@ -205,6 +214,7 @@ mod boot_shim_x86 {
                 count += 1;
             }
             info.memory_map_count = count as i32;
+            info.rsdp_paddr = hvm.rsdp_paddr;
             klog!("  Boot protocol: PVH ({} memory regions)\n", count);
             return;
         }
@@ -223,6 +233,16 @@ mod boot_shim_x86 {
                 }
                 if tag_type == MULTIBOOT_TAG_MMAP {
                     mmap_addr = tag_addr;
+                }
+                // Multiboot2 ACPI tags 14/15 embed a copy of the RSDP
+                // starting at byte 8 of the tag (right after type+size).
+                // We just need the address of that copy — the RSDP
+                // parser reads the signature/revision/RSDT/XSDT fields
+                // from there regardless of which tag carried it.
+                if (tag_type == MULTIBOOT_TAG_ACPI_OLD || tag_type == MULTIBOOT_TAG_ACPI_NEW)
+                    && info.rsdp_paddr == 0
+                {
+                    info.rsdp_paddr = tag_addr + 8;
                 }
                 tag_addr = (tag_addr + tag_size as u64 + 7) & !7;
             }
@@ -462,10 +482,28 @@ unsafe fn kernel_boot(info: &BootInfo) {
     }
     #[cfg(target_arch = "x86_64")]
     {
+        // Boot-protocol RSDP hint — without this, UEFI paths (GCE's
+        // OVMF) fall through to the legacy BIOS-area scan which
+        // doesn't find anything.
+        kernel::x86_64::acpi::set_rsdp(info.rsdp_paddr);
         let cpu_count = kernel::x86_64::acpi::detect_cpus();
         kernel::percpu::init(cpu_count);
         if cpu_count > 1 {
-            kernel::x86_64::smp::start_secondary_cores(cpu_count);
+            match info.protocol {
+                Protocol::Limine => {
+                    // Limine already parked APs in long mode during
+                    // its own boot. Write `limine_ap_stub` into each
+                    // non-BSP `goto_address` to release them into
+                    // ap_entry_via_limine, then block on the count.
+                    let total = start_aps_via_limine_mp();
+                    kernel::x86_64::smp::wait_for_cores_online(total);
+                }
+                _ => {
+                    // Multiboot2 / PVH: classic INIT-SIPI-SIPI with
+                    // the AP trampoline at physical 0x8000.
+                    kernel::x86_64::smp::start_secondary_cores(cpu_count);
+                }
+            }
         }
     }
 

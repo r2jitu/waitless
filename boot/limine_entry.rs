@@ -43,7 +43,7 @@ use limine::request::{
 #[cfg(target_arch = "aarch64")]
 use limine::request::DeviceTreeBlobRequest;
 #[cfg(target_arch = "x86_64")]
-use limine::request::RsdpRequest;
+use limine::request::{RsdpRequest, MpRequest};
 
 // x86_64 SSE + AVX enable stub — Limine drops us in 64-bit mode
 // with MMU + paging but does NOT enable the OS-level bits the
@@ -148,6 +148,20 @@ static DTB_REQUEST: DeviceTreeBlobRequest = DeviceTreeBlobRequest::new();
 #[unsafe(link_section = ".limine_requests")]
 static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
 
+// Limine MP request. The presence of this static tells Limine to
+// start every AP during its own pre-boot phase via INIT-SIPI-SIPI
+// and park it in long mode, awaiting a `goto_address` write from us.
+//
+// Default flags (no X2APIC). Combined with treating
+// BOOTLOADER_RECLAIMABLE as RESERVED (see memory-map handling above),
+// this boots cleanly on both QEMU TCG and GCE KVM + OVMF. The earlier
+// reset-loop symptom on GCE was our frame allocator handing out
+// Limine's AP-stack memory, not anything about APIC mode.
+#[cfg(target_arch = "x86_64")]
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+pub static MP_REQUEST: MpRequest = MpRequest::new();
+
 #[used]
 #[unsafe(link_section = ".limine_requests_start")]
 static REQUESTS_START: RequestsStartMarker = RequestsStartMarker::new();
@@ -172,6 +186,7 @@ static mut LIMINE_BOOT_INFO: BootInfo = BootInfo {
     kernel_phys_base: 0,
     kernel_virt_base: 0,
     hhdm_offset: 0,
+    rsdp_paddr: 0,
 };
 
 #[unsafe(no_mangle)]
@@ -187,6 +202,7 @@ pub unsafe extern "C" fn limine_entry() {
         kernel_phys_base: 0,
         kernel_virt_base: 0,
         hhdm_offset: 0,
+        rsdp_paddr: 0,
     };
 
     // HHDM offset.
@@ -202,12 +218,23 @@ pub unsafe extern "C" fn limine_entry() {
     }
 
     // Memory map.
+    //
+    // We mark BOOTLOADER_RECLAIMABLE as RESERVED, NOT available. With
+    // the MP request enabled, Limine uses bootloader-reclaimable
+    // memory for AP stacks and state — the APs are parked there until
+    // we write their `goto_address` fields, and if we hand that memory
+    // to our frame allocator and then zero-fill a virtqueue ring into
+    // it, the APs triple-fault and take the VM down with them (seen
+    // on GCE KVM on 2026-04-16). The spec says we *can* reclaim this
+    // region once the kernel is done with Limine, but that would
+    // require tracking when it's safe and we don't need the memory
+    // badly enough (10 MiB on GCE is a rounding error for our 8 GiB).
     if let Some(resp) = MEMORY_MAP_REQUEST.get_response() {
         let mut count = 0i32;
         for entry in resp.entries() {
             if count as usize >= MAX_MEMORY_REGIONS { break; }
             let region_type = match entry.entry_type {
-                EntryType::USABLE | EntryType::BOOTLOADER_RECLAIMABLE => MEM_AVAILABLE,
+                EntryType::USABLE => MEM_AVAILABLE,
                 _ => MEM_RESERVED,
             };
             info.memory_map[count as usize] = MemoryRegion {
@@ -219,6 +246,20 @@ pub unsafe extern "C" fn limine_entry() {
             count += 1;
         }
         info.memory_map_count = count;
+    }
+
+    // x86_64: ACPI RSDP physical address. Limine hands us an
+    // HHDM-mapped virtual pointer (base revision 0/1 default), so
+    // convert back to physical by subtracting hhdm_offset. On GCE's
+    // UEFI boot path the legacy 0xE0000–0xFFFFF BIOS scan in
+    // acpi::detect_cpus comes up empty; without this plumbing the
+    // kernel silently falls back to single-core.
+    #[cfg(target_arch = "x86_64")]
+    if let Some(resp) = RSDP_REQUEST.get_response() {
+        let virt = resp.address() as u64;
+        if virt != 0 && virt >= info.hhdm_offset {
+            info.rsdp_paddr = virt - info.hhdm_offset;
+        }
     }
 
     // aarch64: DTB for FDT-based device discovery.
@@ -244,3 +285,43 @@ pub unsafe extern "C" fn limine_entry() {
         kernel_boot_from_bootinfo(&raw const LIMINE_BOOT_INFO);
     }
 }
+
+// ============================================================================
+// Limine MP AP startup (x86_64 only).
+//
+// `limine_ap_stub` matches Limine's required `fn(&Cpu) -> !` callback
+// shape. Limine calls it on each AP once we write the stub's address
+// to the corresponding `Cpu::goto_address`; by then the AP is already
+// in long mode on Limine's page tables with a 64 KiB stack. We just
+// extract the LAPIC ID and forward to the kernel crate's AP entry
+// — keeping `limine::mp::Cpu` references out of `kernel`.
+// ============================================================================
+
+#[cfg(target_arch = "x86_64")]
+unsafe extern "C" fn limine_ap_stub(cpu: &limine::mp::Cpu) -> ! {
+    unsafe { kernel::x86_64::smp::ap_entry_via_limine(cpu.lapic_id) }
+}
+
+/// Release every non-BSP CPU parked by Limine's MP request into
+/// `limine_ap_stub`. Returns the total CPU count Limine reported
+/// (including the BSP), or 1 if the MP response is missing.
+///
+/// no_mangle + extern "C" so boot/entry.rs can call this by linker
+/// name without pulling the limine crate into its dep list.
+#[cfg(target_arch = "x86_64")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn start_aps_via_limine_mp() -> u32 {
+    let resp = match MP_REQUEST.get_response() {
+        Some(r) => r,
+        None => return 1,
+    };
+    let bsp = resp.bsp_lapic_id();
+    let cpus = resp.cpus();
+    for cpu in cpus {
+        if cpu.lapic_id != bsp {
+            cpu.goto_address.write(limine_ap_stub);
+        }
+    }
+    cpus.len() as u32
+}
+

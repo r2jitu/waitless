@@ -62,7 +62,63 @@ pub fn num_cores_online() -> u32 {
     NUM_CORES_ONLINE.load(Ordering::Acquire)
 }
 
-/// Boot secondary cores. Called by core 0 after all init.
+/// AP entry point for the Limine MP boot path.
+///
+/// Called from a short `extern "C" fn(&Cpu) -> !` wrapper in
+/// `boot/limine_entry.rs`: Limine has already put the AP in long
+/// mode on its own page tables + a 64 KiB stack from Limine's AP
+/// pool, and the wrapper extracts the LAPIC ID from the `Cpu` struct
+/// before calling us. Keeping the `Cpu` type confined to the boot
+/// crate lets `kernel` avoid a build-time dep on the limine crate.
+pub unsafe extern "C" fn ap_entry_via_limine(apic_id: u32) -> ! {
+    super::gdt::load_on_ap();
+    apic::init_ap();
+
+    let topo = super::acpi::topology();
+    let mut logical_id = 0u32;
+    for i in 0..topo.cpu_count as usize {
+        if topo.apic_ids[i] as u32 == apic_id {
+            logical_id = i as u32;
+            break;
+        }
+    }
+    init_tls(logical_id);
+    super::idt::load_idt_on_ap();
+
+    NUM_CORES_ONLINE.fetch_add(1, Ordering::SeqCst);
+
+    let id = cpu_id();
+    let mut buf = [0u8; 24];
+    let mut pos = 0;
+    for &b in b"[SMP] core " { buf[pos] = b; pos += 1; }
+    pos += fmt_u32(&mut buf[pos..], id);
+    for &b in b" online\n" { buf[pos] = b; pos += 1; }
+    serial::puts(&buf[..pos]);
+
+    core::arch::asm!("sti", options(nomem, nostack));
+    crate::eventloop::run(id);
+}
+
+/// Wait for `count` cores to reach their online-announcement point
+/// (including the BSP). Used by the Limine-MP path in boot/entry.rs
+/// after releasing APs to `ap_entry_via_limine`.
+pub fn wait_for_cores_online(count: u32) {
+    for _ in 0..100_000_000u64 {
+        if num_cores_online() >= count { break; }
+        core::hint::spin_loop();
+    }
+    let online = num_cores_online();
+    let mut buf = [0u8; 40];
+    let mut pos = 0;
+    for &b in b"[SMP] " { buf[pos] = b; pos += 1; }
+    pos += fmt_u32(&mut buf[pos..], online);
+    for &b in b"/" { buf[pos] = b; pos += 1; }
+    pos += fmt_u32(&mut buf[pos..], count);
+    for &b in b" cores online\n" { buf[pos] = b; pos += 1; }
+    serial::puts(&buf[..pos]);
+}
+
+/// Boot secondary cores via INIT-SIPI-SIPI (Multiboot2 / PVH path).
 pub unsafe fn start_secondary_cores(cpu_count: u32) {
     if cpu_count <= 1 {
         return;
@@ -70,7 +126,11 @@ pub unsafe fn start_secondary_cores(cpu_count: u32) {
     let count = cpu_count.min(MAX_CORES as u32);
     serial::puts(b"[SMP] Starting secondary cores...\n");
 
-    // Copy AP trampoline to low memory
+    // Copy AP trampoline to physical 0x8000. Multiboot2 / PVH leave
+    // low memory identity-mapped, so we can write there by virtual
+    // address directly; this path never runs under Limine (Limine
+    // uses its own MP request via ap_entry_via_limine), so no HHDM
+    // indirection needed here.
     unsafe extern "C" {
         static ap_trampoline_start: u8;
         static ap_trampoline_end: u8;
@@ -86,7 +146,10 @@ pub unsafe fn start_secondary_cores(cpu_count: u32) {
     let gdt_ptr_addr = (AP_TRAMPOLINE_ADDR + 0xF00) as *mut u8;
     setup_ap_gdt(gdt_ptr_addr);
 
-    // Get the current PML4 address (CR3)
+    // AP inherits BSP's CR3: under Multiboot2 / PVH that PML4 already
+    // identity-maps low memory (including the trampoline page at
+    // 0x8000) and the kernel's load range, which is exactly what the
+    // trampoline's real-mode → long-mode transition needs.
     let cr3: u64;
     core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
 
