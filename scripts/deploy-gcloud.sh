@@ -24,8 +24,14 @@
 #   ./scripts/deploy-gcloud.sh stop         # stop the VM (preserves disk)
 #   ./scripts/deploy-gcloud.sh start        # start a stopped VM
 #   ./scripts/deploy-gcloud.sh ip           # print current external IP
-#   ./scripts/deploy-gcloud.sh delete       # delete the VM (keeps images)
-#   ./scripts/deploy-gcloud.sh purge        # delete VM + all images + all GCS tarballs
+#   ./scripts/deploy-gcloud.sh delete       # delete the VM (keeps image)
+#   ./scripts/deploy-gcloud.sh clean-stale  # remove orphan images + tarballs
+#                                           #   (leftovers from timestamped names)
+#   ./scripts/deploy-gcloud.sh purge        # delete VM + image + all GCS objects
+#
+# Each deploy overwrites the previous image and tarball in place
+# (single stable name + GCE image delete-then-create), so nothing
+# accumulates across deploys.
 #
 # Env overrides:
 #   UNIKERNEL_GCE_PROJECT, UNIKERNEL_GCE_ZONE, UNIKERNEL_GCE_MACHINE,
@@ -42,11 +48,17 @@ NAME="${UNIKERNEL_GCE_NAME:-unikernel-webserver}"
 ZONE="${UNIKERNEL_GCE_ZONE:-us-west1-a}"
 MACHINE_TYPE="${UNIKERNEL_GCE_MACHINE:-n2-standard-2}"
 BUCKET="${UNIKERNEL_GCS_BUCKET:-${NAME}-images}"
-TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
-IMAGE_NAME="${NAME}-${TIMESTAMP}"
-WORKDIR="/tmp/${IMAGE_NAME}"
+
+# Single-slot deploy: the image / tarball / workdir all use stable
+# names, so each deploy just overwrites the previous one. GCE images
+# are immutable, so we delete-before-create to update in place; GCS
+# objects just get overwritten by `gsutil cp`. Avoids the
+# unbounded-history accumulation you get with timestamped names.
+IMAGE_NAME="${NAME}-image"
+TARBALL_NAME="disk.raw.tar.gz"
+WORKDIR="/tmp/${NAME}-deploy"
 DISK_FILE="${WORKDIR}/disk.raw"
-TARBALL="${WORKDIR}/${IMAGE_NAME}.tar.gz"
+TARBALL="${WORKDIR}/${TARBALL_NAME}"
 
 PROJECT="${UNIKERNEL_GCE_PROJECT:-$(gcloud config get-value project 2>/dev/null || true)}"
 
@@ -82,7 +94,7 @@ build_disk() {
     # uploaded tarball stays small (~1 MB).
     truncate -s 10G "$DISK_FILE"
 
-    echo "==> Packaging ${IMAGE_NAME}.tar.gz (disk.raw at tar root)..."
+    echo "==> Packaging ${TARBALL_NAME} (disk.raw at tar root)..."
     # GCE's custom-image importer wants a GNU-format tar with a single
     # sparse disk.raw at the root. macOS BSD tar only produces PAX or
     # ustar (no `--format=gnu` / `oldgnu`), and its PAX output carries
@@ -134,15 +146,27 @@ deploy() {
     gsutil ls "gs://$BUCKET" >/dev/null 2>&1 \
         || gsutil mb -l "${ZONE%-*}" "gs://$BUCKET"
 
-    echo "==> Uploading tarball to GCS..."
-    gsutil cp "$TARBALL" "gs://$BUCKET/${IMAGE_NAME}.tar.gz"
+    echo "==> Uploading tarball to GCS (overwrites previous)..."
+    gsutil cp "$TARBALL" "gs://$BUCKET/${TARBALL_NAME}"
+
+    # Delete any existing image with our stable name before re-creating.
+    # GCE images are immutable once created, so "update in place" is
+    # really delete + create. The only downtime is the ~10 s between
+    # these calls, and a running VM that was cloned from the old image
+    # keeps running — the image isn't read after VM creation.
+    if gcloud compute images describe "$IMAGE_NAME" --project="$PROJECT" \
+           >/dev/null 2>&1; then
+        echo "==> Deleting old GCE image: $IMAGE_NAME"
+        gcloud compute images delete "$IMAGE_NAME" \
+            --project="$PROJECT" --quiet
+    fi
 
     # UEFI_COMPATIBLE lets the image boot on OVMF-backed machine types
     # (c3, t2a, anything Arm). The Limine ISO carries both BIOS and
     # UEFI bootloaders, so it works either way.
     echo "==> Creating GCE image: $IMAGE_NAME"
     gcloud compute images create "$IMAGE_NAME" \
-        --source-uri="gs://$BUCKET/${IMAGE_NAME}.tar.gz" \
+        --source-uri="gs://$BUCKET/${TARBALL_NAME}" \
         --family=unikernel \
         --guest-os-features=UEFI_COMPATIBLE \
         --project="$PROJECT" \
@@ -188,7 +212,7 @@ deploy() {
   Cleanup:
     gcloud compute instances delete $NAME --zone=$ZONE --project=$PROJECT --quiet
     gcloud compute images delete $IMAGE_NAME --project=$PROJECT --quiet
-    gsutil rm gs://$BUCKET/${IMAGE_NAME}.tar.gz
+    gsutil rm gs://$BUCKET/${TARBALL_NAME}
 =========================================
 EOF
 }
@@ -258,6 +282,46 @@ delete_vm() {
         || echo "(instance already gone)"
 }
 
+# Sweep out orphaned images + tarballs from the old timestamped-name
+# scheme. After switching to stable names, anything not matching
+# $IMAGE_NAME / $TARBALL_NAME is leftover junk. Safe to run any time;
+# a live VM references its own cloned disk, not the image, so deleting
+# stale images doesn't affect running instances.
+clean_stale() {
+    _require_project
+    echo "==> Cleaning stale images + GCS objects in $PROJECT..."
+
+    local stale_images
+    stale_images="$(gcloud compute images list \
+        --filter="family=unikernel AND name!=$IMAGE_NAME" \
+        --format='value(name)' --project="$PROJECT" 2>/dev/null)"
+    if [ -n "$stale_images" ]; then
+        local n
+        n=$(echo "$stale_images" | wc -l | tr -d ' ')
+        echo "    deleting $n stale image(s)"
+        # shellcheck disable=SC2086
+        gcloud compute images delete $stale_images \
+            --project="$PROJECT" --quiet
+    else
+        echo "    no stale images"
+    fi
+
+    if gsutil ls "gs://$BUCKET" >/dev/null 2>&1; then
+        local stale_objs
+        stale_objs="$(gsutil ls "gs://$BUCKET/" 2>/dev/null \
+            | grep -v "/${TARBALL_NAME}\$" || true)"
+        if [ -n "$stale_objs" ]; then
+            local n
+            n=$(echo "$stale_objs" | wc -l | tr -d ' ')
+            echo "    deleting $n stale GCS object(s)"
+            # shellcheck disable=SC2086
+            gsutil -m rm $stale_objs
+        else
+            echo "    no stale GCS objects"
+        fi
+    fi
+}
+
 # Full teardown: VM, every image in the `unikernel` family, every
 # tarball in the GCS bucket, and the firewall rule. Intended for
 # "I'm done with this experiment, zero it all out."
@@ -309,6 +373,7 @@ case "$MODE" in
     stop)        stop_vm ;;
     start)       start_vm ;;
     delete)      delete_vm ;;
+    clean-stale) clean_stale ;;
     purge)       purge ;;
-    *) echo "Usage: $0 {build-only|qemu-test|deploy|serial|logs|status|ip|stop|start|delete|purge}" >&2; exit 1 ;;
+    *) echo "Usage: $0 {build-only|qemu-test|deploy|serial|logs|status|ip|stop|start|delete|clean-stale|purge}" >&2; exit 1 ;;
 esac
