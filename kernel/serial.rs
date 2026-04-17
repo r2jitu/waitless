@@ -278,6 +278,20 @@ pub fn puts(s: &[u8]) {
     }
 }
 
+/// Print a u64 as 0x-prefixed lowercase hex. Used by panic/exception
+/// handlers where formatting via core::fmt would be risky (e.g. from
+/// within an ISR). Takes the same serial lock as `puts`.
+pub fn print_hex(v: u64) {
+    let mut buf = [0u8; 18];
+    buf[0] = b'0';
+    buf[1] = b'x';
+    for i in 0..16 {
+        let nib = ((v >> (60 - i * 4)) & 0xf) as u8;
+        buf[2 + i] = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 };
+    }
+    puts(&buf);
+}
+
 pub fn try_getc() -> i32 {
     unsafe {
         #[cfg(target_arch = "x86_64")]

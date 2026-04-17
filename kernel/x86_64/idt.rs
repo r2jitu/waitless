@@ -253,9 +253,28 @@ pub unsafe extern "C" fn isr_common_handler(frame: *mut InterruptFrame) {
         return;
     }
 
-    // Unhandled CPU exception — print simple diagnostic and halt
+    // Unhandled CPU exception — print diagnostic and halt
     if vector < 32 {
-        crate::serial::puts(b"\n!!! UNHANDLED EXCEPTION !!!\nSystem halted.\n");
+        let rip = (*frame).rip;
+        let err = (*frame).error_code;
+        let rsp = (*frame).rsp;
+        let rflags = (*frame).rflags;
+        let mut cr2: u64;
+        asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack));
+        crate::serial::puts(b"\n!!! UNHANDLED EXCEPTION !!!\n");
+        crate::serial::puts(b"  vector=");
+        crate::serial::print_hex(vector as u64);
+        crate::serial::puts(b" err=");
+        crate::serial::print_hex(err);
+        crate::serial::puts(b"\n  rip=");
+        crate::serial::print_hex(rip);
+        crate::serial::puts(b" rsp=");
+        crate::serial::print_hex(rsp);
+        crate::serial::puts(b"\n  rflags=");
+        crate::serial::print_hex(rflags);
+        crate::serial::puts(b" cr2=");
+        crate::serial::print_hex(cr2);
+        crate::serial::puts(b"\nSystem halted.\n");
         loop {
             asm!("cli", "hlt", options(nomem, nostack));
         }
