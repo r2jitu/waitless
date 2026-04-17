@@ -1,163 +1,314 @@
 #!/usr/bin/env bash
-# deploy-gcloud.sh — Deploy a unikernel to Google Cloud Compute Engine
+# deploy-gcloud.sh — Deploy the unikernel as a GCE custom image.
+#
+# Builds //apps/webserver:webserver.iso (Limine hybrid BIOS+UEFI ISO),
+# wraps it as a GCE-compatible disk.raw.tar.gz, uploads to GCS, creates
+# a custom image, and launches a VM with serial-port logging enabled.
+#
+# The Limine hybrid ISO boots unchanged on GCE SeaBIOS: the protective
+# MBR written by `limine bios-install` is a valid boot sector, so the
+# ISO functions as a raw disk image (isohybrid-style). UEFI_COMPATIBLE
+# is tagged on the image so OVMF-backed machine types also work.
 #
 # Prerequisites:
-#   brew install google-cloud-sdk
-#   gcloud auth login
-#   gcloud config set project YOUR_PROJECT
+#   brew install google-cloud-sdk xorriso
+#   gcloud auth login && gcloud config set project YOUR_PROJECT
 #
 # Usage:
-#   ./scripts/deploy-gcloud.sh [name] [path-to-elf]
+#   ./scripts/deploy-gcloud.sh build-only   # build disk.raw locally; stop
+#   ./scripts/deploy-gcloud.sh qemu-test    # build + boot in local QEMU
+#   ./scripts/deploy-gcloud.sh deploy       # full deploy (default)
+#   ./scripts/deploy-gcloud.sh serial       # one-shot dump of serial port 1
+#   ./scripts/deploy-gcloud.sh logs         # follow serial port of current VM
+#   ./scripts/deploy-gcloud.sh status       # show instance state + external IP
+#   ./scripts/deploy-gcloud.sh stop         # stop the VM (preserves disk)
+#   ./scripts/deploy-gcloud.sh start        # start a stopped VM
+#   ./scripts/deploy-gcloud.sh ip           # print current external IP
+#   ./scripts/deploy-gcloud.sh delete       # delete the VM (keeps images)
+#   ./scripts/deploy-gcloud.sh purge        # delete VM + all images + all GCS tarballs
 #
-# This script:
-#   1. Builds the unikernel (if no ELF path given)
-#   2. Creates a bootable raw disk image with GRUB + multiboot2
-#   3. Uploads to a GCS bucket
-#   4. Creates a GCE custom image
-#   5. Launches a VM instance with the image
-#
-# The VM uses a e2-micro instance with a virtio-net NIC (GCE default).
+# Env overrides:
+#   UNIKERNEL_GCE_PROJECT, UNIKERNEL_GCE_ZONE, UNIKERNEL_GCE_MACHINE,
+#   UNIKERNEL_GCS_BUCKET, UNIKERNEL_GCE_NAME
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-NAME="${1:-unikernel-webserver}"
-ELF="${2:-}"
-ZONE="${UNIKERNEL_GCE_ZONE:-us-central1-a}"
-MACHINE_TYPE="${UNIKERNEL_GCE_MACHINE:-e2-micro}"
+MODE="${1:-deploy}"
+
+NAME="${UNIKERNEL_GCE_NAME:-unikernel-webserver}"
+ZONE="${UNIKERNEL_GCE_ZONE:-us-west1-a}"
+MACHINE_TYPE="${UNIKERNEL_GCE_MACHINE:-n2-standard-2}"
 BUCKET="${UNIKERNEL_GCS_BUCKET:-${NAME}-images}"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 IMAGE_NAME="${NAME}-${TIMESTAMP}"
-DISK_FILE="/tmp/${IMAGE_NAME}.raw"
+WORKDIR="/tmp/${IMAGE_NAME}"
+DISK_FILE="${WORKDIR}/disk.raw"
+TARBALL="${WORKDIR}/${IMAGE_NAME}.tar.gz"
 
-# --- Resolve the project ID ---
-PROJECT="$(gcloud config get-value project 2>/dev/null)"
-if [ -z "$PROJECT" ]; then
-    echo "Error: No GCP project set. Run: gcloud config set project YOUR_PROJECT"
-    exit 1
-fi
+PROJECT="${UNIKERNEL_GCE_PROJECT:-$(gcloud config get-value project 2>/dev/null || true)}"
 
-echo "==> GCP Project: $PROJECT"
-echo "    Zone: $ZONE"
-echo "    Machine: $MACHINE_TYPE"
-
-# --- Build if needed ---
-if [ -z "$ELF" ]; then
-    echo "==> Building webserver..."
-    cd "$PROJECT_ROOT"
-    bazel build //apps/webserver:webserver.elf 2>&1
-    ELF="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver.elf"
-fi
-
-if [ ! -f "$ELF" ]; then
-    echo "Error: ELF not found: $ELF"
-    exit 1
-fi
-
-# --- Create a bootable raw disk image ---
-# GCE requires a raw disk image with a valid partition table and GRUB bootloader.
-# We create a minimal disk: MBR + ext2 partition + GRUB + kernel ELF.
-
-echo "==> Creating bootable disk image..."
-
-DISK_SIZE_MB=256
-
-# Create sparse file
-dd if=/dev/zero of="$DISK_FILE" bs=1M count=0 seek=$DISK_SIZE_MB 2>/dev/null
-
-# If grub-mkrescue is available, create a proper bootable image
-if command -v grub-mkrescue &>/dev/null; then
-    ISODIR="$(mktemp -d)"
-    mkdir -p "$ISODIR/boot/grub"
-    cp "$ELF" "$ISODIR/boot/kernel.elf"
-    cat > "$ISODIR/boot/grub/grub.cfg" <<'GRUB_EOF'
-set timeout=0
-set default=0
-menuentry "unikernel" {
-    multiboot2 /boot/kernel.elf
-    boot
+_require_project() {
+    if [ -z "$PROJECT" ]; then
+        echo "Error: no GCP project set (env UNIKERNEL_GCE_PROJECT or gcloud config)" >&2
+        exit 1
+    fi
 }
-GRUB_EOF
-    grub-mkrescue -o "$DISK_FILE" "$ISODIR" 2>/dev/null
-    rm -rf "$ISODIR"
-    echo "    Created bootable image with GRUB"
-else
-    # Fallback: raw image with kernel at offset 1MB (requires custom boot in cloud-init or PVH)
-    echo "    Warning: grub-mkrescue not found. Creating raw image with embedded ELF."
-    echo "    Install grub: brew install grub (or use a Linux build host)"
-    dd if="$ELF" of="$DISK_FILE" bs=1M seek=1 conv=notrunc 2>/dev/null
-fi
 
-# GCE requires the image name to end in .raw and be tarred+gzipped
-echo "==> Compressing disk image..."
-TARBALL="/tmp/${IMAGE_NAME}.tar.gz"
-cd /tmp
-tar -czf "$TARBALL" "$(basename "$DISK_FILE")"
+# --- Build disk.raw from the Limine ISO ---
+# GCE expects a tarball containing a single file named exactly "disk.raw"
+# at the tar root, sized to a whole number of GB (>= 1 GB).
+build_disk() {
+    echo "==> Building //apps/webserver:webserver.iso (x86_64) ..."
+    cd "$PROJECT_ROOT"
+    # --config=x86_64-iso overrides .bazelrc.local's default platform,
+    # which on arm64 dev hosts would otherwise produce an aarch64 ISO
+    # that GCE's x86 machine types can't boot.
+    bazel build --config=x86_64-iso //apps/webserver:webserver.iso
+    local iso="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver.iso"
+    [ -f "$iso" ] || { echo "ERROR: ISO not produced: $iso" >&2; exit 1; }
 
-# --- Upload to GCS ---
-echo "==> Ensuring GCS bucket exists: gs://$BUCKET"
-gsutil ls "gs://$BUCKET" &>/dev/null || gsutil mb -l "${ZONE%-*}" "gs://$BUCKET"
+    rm -rf "$WORKDIR"
+    mkdir -p "$WORKDIR"
+    cp "$iso" "$DISK_FILE"
+    chmod u+w "$DISK_FILE"
+    # GCE's custom-image importer requires: uncompressed disk.raw
+    # size >= 10 GiB, as a multiple of 1 GiB. Learned on 2026-04-16:
+    # 1 GiB (or no pad at all) both get rejected with
+    # "The tar archive is not a valid image." 10 GiB works. The
+    # padding is pure zeroes and compresses to nothing, so the
+    # uploaded tarball stays small (~1 MB).
+    truncate -s 10G "$DISK_FILE"
 
-echo "==> Uploading image to GCS..."
-gsutil cp "$TARBALL" "gs://$BUCKET/${IMAGE_NAME}.tar.gz"
+    echo "==> Packaging ${IMAGE_NAME}.tar.gz (disk.raw at tar root)..."
+    # GCE's custom-image importer wants a GNU-format tar with a single
+    # sparse disk.raw at the root. macOS BSD tar only produces PAX or
+    # ustar (no `--format=gnu` / `oldgnu`), and its PAX output carries
+    # `PaxHeader/…` entries GCE rejects. Python's stdlib tarfile can
+    # emit GNU format directly and handles sparse-encoding correctly,
+    # so we drive the packaging from a small inline script instead of
+    # tar(1).
+    python3 - "$WORKDIR" "$TARBALL" <<'PY'
+import os, sys, tarfile
+workdir, out = sys.argv[1], sys.argv[2]
+with tarfile.open(out, "w:gz", format=tarfile.GNU_FORMAT) as t:
+    t.add(os.path.join(workdir, "disk.raw"), arcname="disk.raw")
+PY
 
-# --- Create GCE image ---
-echo "==> Creating GCE image: $IMAGE_NAME"
-gcloud compute images create "$IMAGE_NAME" \
-    --source-uri="gs://$BUCKET/${IMAGE_NAME}.tar.gz" \
-    --family="unikernel" \
-    --guest-os-features=VIRTIO_SCSI_MULTIQUEUE \
-    --project="$PROJECT" \
-    --quiet
+    echo "    Disk:    $DISK_FILE ($(du -h "$DISK_FILE" | awk '{print $1}') on-disk)"
+    echo "    Tarball: $TARBALL ($(du -h "$TARBALL" | awk '{print $1}'))"
+}
 
-# --- Launch VM ---
-echo "==> Launching VM instance: $NAME"
-gcloud compute instances create "$NAME" \
-    --zone="$ZONE" \
-    --machine-type="$MACHINE_TYPE" \
-    --image="$IMAGE_NAME" \
-    --image-project="$PROJECT" \
-    --tags="http-server" \
-    --metadata=serial-port-enable=TRUE \
-    --project="$PROJECT" \
-    --quiet 2>&1 || true
+# --- Local QEMU smoke test ---
+# Boots the same disk.raw we're about to upload, so any boot failure
+# surfaces here instead of on GCE. SeaBIOS + virtio-net-pci + virtio-blk
+# matches the GCE hardware profile closely enough that a successful boot
+# here is a strong signal.
+qemu_test() {
+    if ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
+        echo "ERROR: qemu-system-x86_64 not found; install via 'brew install qemu'" >&2
+        exit 1
+    fi
+    echo "==> Booting disk.raw in QEMU (Ctrl-a x to exit)..."
+    # -cpu max is load-bearing: the p256 + chacha20poly1305 crates use
+    # AVX / BMI2 intrinsics. QEMU's default qemu64 CPU omits both, so
+    # the TLS cert parse at boot fires #UD on VMOVUPS/MULX. Real GCP
+    # hardware (Skylake+) has these features natively.
+    qemu-system-x86_64 \
+        -cpu max \
+        -machine q35 -m 256 -nographic \
+        -drive if=virtio,format=raw,file="$DISK_FILE" \
+        -netdev user,id=n0,hostfwd=tcp::18080-:80,hostfwd=tcp::18443-:443 \
+        -device virtio-net-pci,netdev=n0 \
+        -serial mon:stdio
+}
 
-# --- Create firewall rule for HTTP ---
-echo "==> Ensuring HTTP firewall rule..."
-gcloud compute firewall-rules create allow-http-unikernel \
-    --allow=tcp:80 \
-    --target-tags=http-server \
-    --project="$PROJECT" \
-    --quiet 2>/dev/null || true
+# --- Upload + image create + VM launch ---
+deploy() {
+    _require_project
+    echo "==> GCP project: $PROJECT   zone: $ZONE   machine: $MACHINE_TYPE"
 
-# --- Get external IP ---
-EXTERNAL_IP="$(gcloud compute instances describe "$NAME" \
-    --zone="$ZONE" \
-    --format='get(networkInterfaces[0].accessConfigs[0].natIP)' \
-    --project="$PROJECT" 2>/dev/null)"
+    echo "==> Ensuring GCS bucket: gs://$BUCKET"
+    gsutil ls "gs://$BUCKET" >/dev/null 2>&1 \
+        || gsutil mb -l "${ZONE%-*}" "gs://$BUCKET"
 
-echo ""
-echo "========================================="
-echo "  Deployment complete!"
-echo "========================================="
-echo "  Instance: $NAME"
-echo "  Zone:     $ZONE"
-echo "  IP:       $EXTERNAL_IP"
-echo "  URL:      http://$EXTERNAL_IP/"
-echo ""
-echo "  View serial console:"
-echo "    gcloud compute instances get-serial-port-output $NAME --zone=$ZONE"
-echo ""
-echo "  SSH (for debugging):"
-echo "    gcloud compute instances describe $NAME --zone=$ZONE"
-echo ""
-echo "  Cleanup:"
-echo "    gcloud compute instances delete $NAME --zone=$ZONE --quiet"
-echo "    gcloud compute images delete $IMAGE_NAME --quiet"
-echo "    gsutil rm gs://$BUCKET/${IMAGE_NAME}.tar.gz"
-echo "========================================="
+    echo "==> Uploading tarball to GCS..."
+    gsutil cp "$TARBALL" "gs://$BUCKET/${IMAGE_NAME}.tar.gz"
 
-# Cleanup local temp files
-rm -f "$DISK_FILE" "$TARBALL"
+    # UEFI_COMPATIBLE lets the image boot on OVMF-backed machine types
+    # (c3, t2a, anything Arm). The Limine ISO carries both BIOS and
+    # UEFI bootloaders, so it works either way.
+    echo "==> Creating GCE image: $IMAGE_NAME"
+    gcloud compute images create "$IMAGE_NAME" \
+        --source-uri="gs://$BUCKET/${IMAGE_NAME}.tar.gz" \
+        --family=unikernel \
+        --guest-os-features=UEFI_COMPATIBLE \
+        --project="$PROJECT" \
+        --quiet
+
+    echo "==> Launching VM: $NAME"
+    gcloud compute instances create "$NAME" \
+        --zone="$ZONE" \
+        --machine-type="$MACHINE_TYPE" \
+        --image="$IMAGE_NAME" \
+        --image-project="$PROJECT" \
+        --tags=http-server \
+        --metadata=serial-port-enable=TRUE \
+        --project="$PROJECT" \
+        --quiet
+
+    gcloud compute firewall-rules create allow-http-unikernel \
+        --allow=tcp:80,tcp:443 \
+        --target-tags=http-server \
+        --project="$PROJECT" \
+        --quiet 2>/dev/null || true
+
+    local ip
+    ip="$(gcloud compute instances describe "$NAME" \
+        --zone="$ZONE" --project="$PROJECT" \
+        --format='get(networkInterfaces[0].accessConfigs[0].natIP)')"
+
+    cat <<EOF
+
+=========================================
+  Deployment complete!
+=========================================
+  Instance: $NAME   Zone: $ZONE   IP: $ip
+  URL:      http://$ip/
+
+  Tail serial console (first boot messages go here):
+    gcloud compute instances get-serial-port-output $NAME \\
+        --zone=$ZONE --project=$PROJECT
+
+  Or via this script:
+    $0 logs
+
+  Cleanup:
+    gcloud compute instances delete $NAME --zone=$ZONE --project=$PROJECT --quiet
+    gcloud compute images delete $IMAGE_NAME --project=$PROJECT --quiet
+    gsutil rm gs://$BUCKET/${IMAGE_NAME}.tar.gz
+=========================================
+EOF
+}
+
+read_serial() {
+    _require_project
+    gcloud compute instances get-serial-port-output "$NAME" \
+        --zone="$ZONE" --project="$PROJECT"
+}
+
+tail_serial() {
+    _require_project
+    echo "==> Following serial port 1 of $NAME (Ctrl-C to stop)..." >&2
+    local start=0
+    while true; do
+        local out
+        out="$(gcloud compute instances get-serial-port-output "$NAME" \
+                  --zone="$ZONE" --project="$PROJECT" --start="$start" 2>/dev/null || true)"
+        if [ -n "$out" ]; then
+            printf '%s' "$out"
+            start=$(( start + ${#out} ))
+        fi
+        sleep 2
+    done
+}
+
+show_status() {
+    _require_project
+    gcloud compute instances describe "$NAME" \
+        --zone="$ZONE" --project="$PROJECT" \
+        --format='table(name,status,machineType.basename(),networkInterfaces[0].accessConfigs[0].natIP:label=EXTERNAL_IP)' \
+        2>&1 || echo "(instance not found)"
+}
+
+show_ip() {
+    _require_project
+    gcloud compute instances describe "$NAME" \
+        --zone="$ZONE" --project="$PROJECT" \
+        --format='get(networkInterfaces[0].accessConfigs[0].natIP)' 2>/dev/null
+}
+
+stop_vm() {
+    _require_project
+    echo "==> Stopping $NAME..."
+    gcloud compute instances stop "$NAME" \
+        --zone="$ZONE" --project="$PROJECT" --quiet
+}
+
+start_vm() {
+    _require_project
+    echo "==> Starting $NAME..."
+    gcloud compute instances start "$NAME" \
+        --zone="$ZONE" --project="$PROJECT" --quiet
+    local ip
+    ip="$(show_ip)"
+    echo "    External IP: $ip   URL: http://$ip/"
+}
+
+# Delete the VM only. Keeps images so you can redeploy without
+# rebuilding + reuploading; keeps the firewall rule so a later
+# `deploy` doesn't need to recreate it.
+delete_vm() {
+    _require_project
+    echo "==> Deleting instance $NAME..."
+    gcloud compute instances delete "$NAME" \
+        --zone="$ZONE" --project="$PROJECT" --quiet 2>&1 \
+        || echo "(instance already gone)"
+}
+
+# Full teardown: VM, every image in the `unikernel` family, every
+# tarball in the GCS bucket, and the firewall rule. Intended for
+# "I'm done with this experiment, zero it all out."
+purge() {
+    _require_project
+    echo "==> Purging VM, images, bucket, and firewall rule in $PROJECT..."
+
+    gcloud compute instances delete "$NAME" \
+        --zone="$ZONE" --project="$PROJECT" --quiet 2>/dev/null \
+        && echo "    instance: deleted" \
+        || echo "    instance: (not present)"
+
+    # Delete every image in the unikernel family. `--filter` keeps us
+    # from nuking unrelated images that happen to live in the same
+    # project.
+    local images
+    images="$(gcloud compute images list \
+        --filter="family=unikernel" \
+        --format='value(name)' --project="$PROJECT" 2>/dev/null)"
+    if [ -n "$images" ]; then
+        # shellcheck disable=SC2086
+        gcloud compute images delete $images --project="$PROJECT" --quiet
+        echo "    images:   deleted $(echo "$images" | wc -l | tr -d ' ')"
+    else
+        echo "    images:   (none)"
+    fi
+
+    if gsutil ls "gs://$BUCKET" >/dev/null 2>&1; then
+        gsutil -m rm -r "gs://$BUCKET" 2>/dev/null || true
+        echo "    bucket:   deleted gs://$BUCKET"
+    else
+        echo "    bucket:   (not present)"
+    fi
+
+    gcloud compute firewall-rules delete allow-http-unikernel \
+        --project="$PROJECT" --quiet 2>/dev/null \
+        && echo "    firewall: deleted" \
+        || echo "    firewall: (not present)"
+}
+
+case "$MODE" in
+    build-only)  build_disk ;;
+    qemu-test)   build_disk; qemu_test ;;
+    deploy)      build_disk; deploy ;;
+    serial)      read_serial ;;
+    logs)        tail_serial ;;
+    status)      show_status ;;
+    ip)          show_ip ;;
+    stop)        stop_vm ;;
+    start)       start_vm ;;
+    delete)      delete_vm ;;
+    purge)       purge ;;
+    *) echo "Usage: $0 {build-only|qemu-test|deploy|serial|logs|status|ip|stop|start|delete|purge}" >&2; exit 1 ;;
+esac
