@@ -219,12 +219,9 @@ struct TxQueue {
     /// the TX doorbell after submitting.
     fill_cnt: u32,
     /// Last-seen value of `counter_array[counter_index]`. Drives
-    /// TX buffer recycling.
+    /// TX slot recycling (a slot is reusable once done_cnt passes
+    /// its fill_cnt).
     done_cnt: u32,
-    /// Bytes used in the QPL FIFO ahead of what's been completed.
-    /// Packets pack sequentially and wrap.
-    qpl_head: u32,
-    qpl_avail: u32,
 }
 
 /// Per-queue RX metadata. Also QPL-backed: incoming frames are
@@ -811,9 +808,16 @@ const RX_BUFFER_SIZE: u16 = 2048;
 /// the IP header lands 4-byte-aligned in the RX buffer.
 const _GVE_RX_PAD: u16 = 2;
 
-/// TX QPL size in pages. `tx_desc_cnt / GVE_QPL_DIVISOR` from the
-/// reference driver = 1024 / 16 = 64 pages = 256 KiB of TX staging.
-const TX_QPL_PAGES: u32 = 64;
+/// TX QPL size in pages. One 4 KiB page per ring slot — slot `i`
+/// always writes to QPL offset `i * PAGE_SIZE`, mirroring the RX
+/// layout. This lets us skip a real FIFO allocator: ring slot
+/// reuse waits on the device's `counter_array[counter_index]`,
+/// and the page for that slot is only written while the slot is
+/// free (`fill_cnt - done_cnt < ring_entries` gate in `send()`).
+/// Reference driver's `tx_desc_cnt / GVE_QPL_DIVISOR = 64` packs
+/// multiple packets per page and needs a full FIFO packer; not
+/// worth the code for Phase 2 when RAM is cheap.
+const TX_QPL_PAGES: u32 = TX_RING_ENTRIES as u32;
 /// RX QPL size in pages. The reference driver allocates
 /// `rx_desc_cnt` pages — one full page per ring entry, even though
 /// each packet only uses the first 2 KiB of that page. Smaller
@@ -1059,8 +1063,6 @@ fn create_tx_qp0() -> bool {
             counter_index,
             fill_cnt: 0,
             done_cnt: 0,
-            qpl_head: 0,
-            qpl_avail: TX_QPL_PAGES * PAGE_SIZE,
         });
     }
     log(b"[gvnic] TX queue 0 created, db_offset=");
@@ -1382,155 +1384,109 @@ struct RxSnap {
 
 // ---- TX ------------------------------------------------------------------
 
-/// Reclaim TX FIFO space based on the device's event counter —
-/// counter_array[tx.counter_index] is a big-endian u32 the device
-/// bumps by 1 each time it consumes a TX descriptor.
+/// Reclaim TX slots from the device's completion counter.
+/// `counter_array[tx.counter_index]` is a big-endian u32 the device
+/// bumps by 1 each time it finishes transmitting a descriptor; we
+/// read it + publish the advanced `done_cnt` so `send()` can see
+/// which ring slots are safe to reuse.
 fn tx_drain() {
-    let (counter_va, counter_index, done_cnt);
+    let (counter_va, counter_index);
     {
         let st = STATE.lock();
-        let s = match st.as_ref() {
-            Some(s) => s,
-            None => return,
-        };
-        let res = match s.resources.as_ref() {
-            Some(r) => r,
-            None => return,
-        };
-        let tx = match s.tx.as_ref() {
-            Some(t) => t,
-            None => return,
-        };
+        let s = match st.as_ref() { Some(s) => s, None => return };
+        let res = match s.resources.as_ref() { Some(r) => r, None => return };
+        let tx = match s.tx.as_ref() { Some(t) => t, None => return };
         counter_va = res.counter_array_va;
         counter_index = tx.counter_index;
-        done_cnt = tx.done_cnt;
     }
 
     let counter_ptr = counter_va as *const u32;
     let raw = unsafe { ptr::read_volatile(counter_ptr.add(counter_index as usize)) };
     let nic_done = u32::from_be(raw);
 
-    let completed = nic_done.wrapping_sub(done_cnt);
-    if completed == 0 {
-        return;
-    }
-
-    // With a simple FIFO packing strategy, reclaiming a completion
-    // doesn't free a specific region — we just remember that
-    // `nic_done` descriptors are done. The per-packet byte
-    // accounting is tracked separately by `qpl_head` / `qpl_avail`
-    // since packets don't round-trip through the QPL one-for-one
-    // (a single packet may occupy multiple cache lines + padding).
     let mut st = STATE.lock();
-    if let Some(s) = st.as_mut() {
-        if let Some(tx) = s.tx.as_mut() {
+    if let Some(tx) = st.as_mut().and_then(|s| s.tx.as_mut()) {
+        // The counter is monotonic; only advance `done_cnt`.
+        if nic_done.wrapping_sub(tx.done_cnt) != 0 {
             tx.done_cnt = nic_done;
-            // Reclaim all bytes ahead of the done mark. Phase 2's
-            // FIFO packer is simple enough that this is sound: we
-            // never overlap a write that's still in flight with
-            // reclaim because `send()` fails if
-            // `qpl_head` would pass `done_cnt`'s boundary.
-            tx.qpl_avail = tx.qpl_size;
-            tx.qpl_head = 0;
         }
     }
 }
 
 /// Submit a single-segment packet. Returns `true` on success, `false`
-/// if there's no TX ring slot / QPL space available — caller's
-/// expected to drop on false. Frames > `TX_MAX_PKT_LEN` are
-/// rejected.
+/// when the TX ring has no free slots (device hasn't caught up) or
+/// the frame exceeds `TX_MAX_PKT_LEN`. Per-slot QPL pages are 4 KiB
+/// so packets up to one page land naturally at `slot * PAGE_SIZE`.
 pub fn send(data: &[u8]) -> bool {
-    if data.len() == 0 || data.len() > TX_MAX_PKT_LEN {
+    if data.is_empty() || data.len() > TX_MAX_PKT_LEN {
         return false;
     }
 
     tx_drain();
 
-    let (ring_va, ring_entries, fill_cnt, qpl_va, qpl_head, db_offset, bar2_va) = {
+    let (ring_va, ring_entries, fill_cnt, done_cnt, qpl_va, db_offset, bar2_va) = {
         let st = STATE.lock();
-        let s = match st.as_ref() {
-            Some(s) => s,
-            None => return false,
-        };
-        let res = match s.resources.as_ref() {
-            Some(r) => r,
-            None => return false,
-        };
-        let tx = match s.tx.as_ref() {
-            Some(t) => t,
-            None => return false,
-        };
+        let s = match st.as_ref() { Some(s) => s, None => return false };
+        let res = match s.resources.as_ref() { Some(r) => r, None => return false };
+        let tx = match s.tx.as_ref() { Some(t) => t, None => return false };
         (
             tx.ring_va,
             tx.ring_entries,
             tx.fill_cnt,
+            tx.done_cnt,
             tx.qpl_base_va,
-            tx.qpl_head,
             tx.db_offset,
             res.bar2_va,
         )
     };
 
-    // Copy the packet into the TX QPL at the current FIFO head.
-    // Phase 2 doesn't wrap: if the packet doesn't fit before the
-    // QPL end, we drop. A wrap-around implementation lands in
-    // Phase 4 alongside the per-core rings.
-    let pkt_end = qpl_head as usize + data.len();
-    let qpl_size_bytes = {
-        let st = STATE.lock();
-        st.as_ref()
-            .and_then(|s| s.tx.as_ref())
-            .map(|t| t.qpl_size as usize)
-            .unwrap_or(0)
-    };
-    if pkt_end > qpl_size_bytes {
-        // FIFO ran out of contiguous room — drop + let tx_drain()
-        // catch up next time. (qpl_head resets to 0 in tx_drain
-        // when it runs.)
+    // Gate on ring capacity. Without this check, a flood of sends
+    // wraps past `done_cnt` and rewrites descriptors the device is
+    // still processing — the root cause of the ~50 % drop rate
+    // observed on GCE before this fix.
+    let in_flight = fill_cnt.wrapping_sub(done_cnt);
+    if in_flight >= ring_entries as u32 {
         return false;
     }
 
-    let dst = (qpl_va + qpl_head as u64) as *mut u8;
+    let mask = (ring_entries - 1) as u32;
+    let slot = (fill_cnt & mask) as usize;
+
+    // Each slot owns a single 4 KiB QPL page; its byte offset is
+    // `slot * PAGE_SIZE`. Since the slot is only reused after the
+    // device signals completion (the in_flight gate above), the
+    // device can't be reading this page while we memcpy a new
+    // packet into it.
+    let qpl_offset = (slot as u32) * PAGE_SIZE;
+    let dst = (qpl_va + qpl_offset as u64) as *mut u8;
     unsafe {
         ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
     }
 
-    // Build the TX descriptor at ring[fill_cnt & mask]. gve_tx_pkt_desc:
+    // Build the TX descriptor. gve_tx_pkt_desc layout:
     //   u8  type_flags       (GVE_TXD_STD = 0)
     //   u8  l4_csum_offset   (0 — no offload in Phase 2)
     //   u8  l4_hdr_offset    (0)
     //   u8  desc_cnt         (1 — single-segment packet)
-    //   u16 len              (be)
-    //   u16 seg_len          (be)
-    //   u64 seg_addr         (be — QPL offset in QPL mode)
-    let mask = (ring_entries - 1) as u32;
-    let slot = (fill_cnt & mask) as usize;
+    //   u16 len              (be, total packet length)
+    //   u16 seg_len          (be, this segment length)
+    //   u64 seg_addr         (be, QPL byte offset in QPL mode)
     let desc_ptr = (ring_va as *mut u8).wrapping_add(slot * TX_DESC_SIZE);
     let mut desc = [0u8; TX_DESC_SIZE];
-    desc[0] = 0;             // type_flags: GVE_TXD_STD
-    desc[1] = 0;             // l4_csum_offset
-    desc[2] = 0;             // l4_hdr_offset
-    desc[3] = 1;             // desc_cnt
+    desc[3] = 1;
     put_be16(&mut desc, 4, data.len() as u16);
     put_be16(&mut desc, 6, data.len() as u16);
-    put_be64(&mut desc, 8, qpl_head as u64);
+    put_be64(&mut desc, 8, qpl_offset as u64);
     unsafe {
         core::ptr::copy_nonoverlapping(desc.as_ptr(), desc_ptr, TX_DESC_SIZE);
     }
 
-    // Advance cursors + kick the doorbell.
     let new_fill = fill_cnt.wrapping_add(1);
-    // The doorbell value is the new fill count (monotonic).
     doorbell_write(bar2_va, db_offset, new_fill);
 
     let mut st = STATE.lock();
-    if let Some(s) = st.as_mut() {
-        if let Some(tx) = s.tx.as_mut() {
-            tx.fill_cnt = new_fill;
-            tx.qpl_head = pkt_end as u32;
-            tx.qpl_avail = tx.qpl_avail.saturating_sub(data.len() as u32);
-        }
+    if let Some(tx) = st.as_mut().and_then(|s| s.tx.as_mut()) {
+        tx.fill_cnt = new_fill;
     }
     true
 }
