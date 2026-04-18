@@ -75,6 +75,23 @@ const OP_CONFIGURE_DEVICE_RESOURCES: u32 = 0x2;
 const OP_REGISTER_PAGE_LIST: u32 = 0x3;
 const OP_CREATE_TX_QUEUE: u32 = 0x5;
 const OP_CREATE_RX_QUEUE: u32 = 0x6;
+const OP_CONFIGURE_RSS: u32 = 0xA;
+
+/// RSS hash algorithm value (Toeplitz). Matches Linux's
+/// `ETH_RSS_HASH_TOP = 1`. The device only implements Toeplitz.
+const RSS_HASH_ALG_TOEPLITZ: u8 = 1;
+
+/// `enum gve_rss_hash_type` bit positions (from the Linux header).
+/// Our mask enables 4-tuple hashing for TCP + UDP on v4 and v6 —
+/// that's what real traffic hits. Anything else falls back to
+/// whatever LUT slot 0 maps to.
+const RSS_HASH_TCPV4: u16 = 1 << 1;
+const RSS_HASH_TCPV6: u16 = 1 << 4;
+const RSS_HASH_UDPV4: u16 = 1 << 6;
+const RSS_HASH_UDPV6: u16 = 1 << 7;
+
+const RSS_KEY_SIZE: usize = 40;
+const RSS_LUT_SIZE: usize = 128;
 
 /// Marker for GQI_RDA mode (raw DMA addressing). In QPL mode the
 /// `queue_page_list_id` field of CREATE_*_QUEUE is the real QPL id
@@ -164,11 +181,21 @@ struct State {
     /// Phase 2 resources — filled once CONFIGURE_DEVICE_RESOURCES
     /// succeeds. `None` between DESCRIBE_DEVICE and that point.
     resources: Option<DeviceResources>,
-    /// TX / RX queues (one pair for Phase 2; later phases grow this
-    /// into per-core arrays).
-    tx: Option<TxQueue>,
-    rx: Option<RxQueue>,
+    /// Number of active queue pairs. <= MAX_QUEUE_PAIRS. Set by
+    /// `init()` after all queues come up. Tier 1 polling in
+    /// `net::poll_tier1` walks `0..num_qp`.
+    num_qp: u16,
+    /// TX / RX queues. Indexed by queue-pair number 0..num_qp.
+    /// Phase 4 uses one pair per vCPU; multi-queue RX distribution
+    /// happens inside the NIC via CONFIGURE_RSS.
+    tx: [Option<TxQueue>; MAX_QUEUE_PAIRS],
+    rx: [Option<RxQueue>; MAX_QUEUE_PAIRS],
 }
+
+/// Matches `drivers::virtio_net::MAX_QUEUE_PAIRS`. Upper bound for
+/// `net_rx_counts()` / `net_rx_used_cursors()` array sizes so the
+/// two drivers stay signature-compatible.
+const MAX_QUEUE_PAIRS: usize = 8;
 
 /// Device-wide resources negotiated via CONFIGURE_DEVICE_RESOURCES.
 /// The device owns these DMA regions for its lifetime; the driver
@@ -420,8 +447,9 @@ pub fn init() -> bool {
             mtu: 0,
             num_event_counters: 0,
             resources: None,
-            tx: None,
-            rx: None,
+            num_qp: 0,
+            tx: [const { None }; MAX_QUEUE_PAIRS],
+            rx: [const { None }; MAX_QUEUE_PAIRS],
         });
     }
 
@@ -454,20 +482,64 @@ pub fn init() -> bool {
     }
     let bar2_va = phys_to_virt(bar2_phys) as u64;
 
-    if !configure_device_resources(bar2_va) {
+    // Decide how many queue pairs to bring up. `default_num_queues`
+    // is what GCE advertises for this machine type (2 on
+    // n2-standard-2); `max_tx/rx_queues` is the hardware ceiling.
+    // We cap at MAX_QUEUE_PAIRS because the /stats + net layer
+    // APIs are sized to that constant.
+    let (default_nq, max_tx, max_rx) = {
+        let st = STATE.lock();
+        let s = st.as_ref().unwrap();
+        (s.default_num_queues as u32, s.max_tx_queues, s.max_rx_queues)
+    };
+    let num_qp = default_nq
+        .min(max_tx)
+        .min(max_rx)
+        .min(MAX_QUEUE_PAIRS as u32)
+        .max(1);
+
+    if !configure_device_resources(bar2_va, num_qp) {
         return false;
     }
 
-    if !create_tx_qp0() {
-        return false;
+    for qp in 0..num_qp {
+        if !create_tx_qp(qp) {
+            log(b"[gvnic] TX queue create failed at qp=");
+            log_u32(qp);
+            log(b"\n");
+            return false;
+        }
     }
-    if !create_rx_qp0() {
-        return false;
+    for qp in 0..num_qp {
+        if !create_rx_qp(qp, num_qp) {
+            log(b"[gvnic] RX queue create failed at qp=");
+            log_u32(qp);
+            log(b"\n");
+            return false;
+        }
     }
+
+    {
+        let mut st = STATE.lock();
+        if let Some(s) = st.as_mut() {
+            s.num_qp = num_qp as u16;
+        }
+    }
+
     post_initial_rx();
 
+    // Attempt to configure RSS so the device distributes incoming
+    // flows across our queue pairs by 4-tuple hash. Not fatal if
+    // rejected — the driver can still run on qp 0 — but we log it
+    // so the /stats output makes sense.
+    if num_qp > 1 {
+        configure_rss(num_qp);
+    }
+
     GVNIC_OK.store(true, Ordering::Release);
-    log(b"[gvnic] ready\n");
+    log(b"[gvnic] ready (");
+    log_u32(num_qp);
+    log(b" queue pairs)\n");
     true
 }
 
@@ -829,19 +901,20 @@ const RX_QPL_PAGES: u32 = RX_RING_ENTRIES as u32;
 const PAGE_SIZE: u32 = 4096;
 
 /// QPL IDs the driver assigns to itself. The spec just requires
-/// uniqueness across live QPLs, so small integers work.
-const TX_QPL_ID: u32 = 0;
-const RX_QPL_ID: u32 = 1;
+/// uniqueness across live QPLs, so we pack TX ids into the low
+/// half and RX ids above them. `tx_qpl_id(i)` = i, `rx_qpl_id(i)`
+/// = MAX_QUEUE_PAIRS + i.
+#[inline] fn tx_qpl_id(qp: u32) -> u32 { qp }
+#[inline] fn rx_qpl_id(qp: u32) -> u32 { qp + MAX_QUEUE_PAIRS as u32 }
 
-/// Notification-block ids used in Phase 2. TX queues get the first
-/// `num_tx` ids, RX queues get the next `num_rx`. That matches
-/// how the reference driver lays them out and avoids collisions
-/// (two queues can't share the same ntfy_id — the device rejects
-/// the second CREATE with INVALID_ARGUMENT).
-const NTFY_ID_TX_QP0: u32 = 0;
-const NTFY_ID_RX_QP0: u32 = 1;
+/// Notification-block ids. TX queues claim the first `num_qp`
+/// slots, RX queues the next `num_qp`. Matches the reference
+/// driver's layout and avoids the "two queues can't share an
+/// ntfy_id" rejection.
+#[inline] fn tx_ntfy_id(qp: u32) -> u32 { qp }
+#[inline] fn rx_ntfy_id(num_qp: u32, qp: u32) -> u32 { num_qp + qp }
 
-fn configure_device_resources(bar2_va: u64) -> bool {
+fn configure_device_resources(bar2_va: u64, num_qp: u32) -> bool {
     // Pull the device-advertised counter count out of state. This is
     // the value we must match — Linux passes this straight through
     // to the admin-queue command. Hardcoding a number here once
@@ -893,12 +966,12 @@ fn configure_device_resources(bar2_va: u64) -> bool {
     put_be64(&mut cmd.bytes, 8, counter_phys);
     put_be64(&mut cmd.bytes, 16, irq_db_phys);
     put_be32(&mut cmd.bytes, 24, num_event_counters);
-    // num_irq_dbs = one notification block per active queue. Phase 2
-    // creates 1 TX + 1 RX = 2 queues, so 2 blocks. Linux passes
-    // `num_ntfy_blks` which is sized by MSI-X; we poll-only but the
-    // device still wants a valid count here matching the irq-db
-    // array we allocated.
-    put_be32(&mut cmd.bytes, 28, 2);
+    // num_irq_dbs = one notification block per active queue.
+    // `num_qp * 2` covers both TX and RX queue pairs. Linux derives
+    // this from the MSI-X count; we poll-only but the device still
+    // wants a valid count here matching what the CREATE_*_QUEUE
+    // ntfy_ids will reference.
+    put_be32(&mut cmd.bytes, 28, num_qp * 2);
     put_be32(&mut cmd.bytes, 32, IRQ_DB_STRIDE);
     put_be32(&mut cmd.bytes, 36, 0);
     cmd.bytes[40] = QF_GQI_QPL;
@@ -971,6 +1044,75 @@ fn register_page_list(page_list_id: u32, base_phys: u64, num_pages: u32) -> bool
     true
 }
 
+/// Issue CONFIGURE_RSS so the device hashes incoming flows across
+/// the `num_qp` active queue pairs. We build a 128-entry
+/// indirection table that cycles `qp = i % num_qp` and a static
+/// 40-byte Toeplitz key (any bit-diverse constant works for
+/// driver-controlled hashing; Microsoft's classic MS-DRSH test
+/// key would be overkill for this use case).
+///
+/// Returns true on success. On failure we log and continue —
+/// the driver still works with queue 0 handling all traffic.
+fn configure_rss(num_qp: u32) -> bool {
+    // RSS key: 40 bytes. Pick an arbitrary, evenly-bit-weighted
+    // pattern so each byte contributes to the hash. The device
+    // hashes the TCP/UDP 4-tuple through the Toeplitz transform
+    // using this key — only the distribution shape matters, not
+    // the specific bytes.
+    let mut key = [0u8; RSS_KEY_SIZE];
+    for i in 0..RSS_KEY_SIZE {
+        key[i] = ((i as u32).wrapping_mul(0x9E3779B1) >> 24) as u8;
+    }
+
+    // LUT: 128 entries of be32 queue index. Cycle through the
+    // active qps so 4-tuple hash distribution maps evenly.
+    let mut lut_bytes = [0u8; RSS_LUT_SIZE * 4];
+    for i in 0..RSS_LUT_SIZE {
+        let q = (i as u32) % num_qp;
+        lut_bytes[i * 4..i * 4 + 4].copy_from_slice(&q.to_be_bytes());
+    }
+
+    let key_phys = alloc_pages(1);
+    let lut_phys = alloc_pages(1);
+    if key_phys == 0 || lut_phys == 0 {
+        log(b"[gvnic] RSS alloc failed\n");
+        return false;
+    }
+    unsafe {
+        let key_va = phys_to_virt(key_phys);
+        ptr::copy_nonoverlapping(key.as_ptr(), key_va, RSS_KEY_SIZE);
+        let lut_va = phys_to_virt(lut_phys);
+        ptr::copy_nonoverlapping(lut_bytes.as_ptr(), lut_va, lut_bytes.len());
+    }
+
+    // Payload (24 bytes at offset 8):
+    //   u16 hash_types    (be)
+    //   u8  hash_alg      (1 = Toeplitz)
+    //   u8  reserved
+    //   u16 hash_key_size (be)
+    //   u16 hash_lut_size (be)
+    //   u64 hash_key_addr (be, DMA)
+    //   u64 hash_lut_addr (be, DMA)
+    let mut cmd = AdminqCommand::ZERO;
+    put_be32(&mut cmd.bytes, 0, OP_CONFIGURE_RSS);
+    let hash_types = RSS_HASH_TCPV4 | RSS_HASH_TCPV6 | RSS_HASH_UDPV4 | RSS_HASH_UDPV6;
+    put_be16(&mut cmd.bytes, 8, hash_types);
+    cmd.bytes[10] = RSS_HASH_ALG_TOEPLITZ;
+    put_be16(&mut cmd.bytes, 12, RSS_KEY_SIZE as u16);
+    put_be16(&mut cmd.bytes, 14, RSS_LUT_SIZE as u16);
+    put_be64(&mut cmd.bytes, 16, key_phys);
+    put_be64(&mut cmd.bytes, 24, lut_phys);
+
+    if !execute_cmd(b"CONFIGURE_RSS", &cmd) {
+        log(b"[gvnic] RSS not configured (falling back to single-queue delivery)\n");
+        return false;
+    }
+    log(b"[gvnic] RSS configured across ");
+    log_u32(num_qp);
+    log(b" queue pairs\n");
+    true
+}
+
 /// Allocate a contiguous physical region of `num_pages` 4 KiB pages.
 /// Returns (phys, va). Both will be nonzero on success; logs + returns
 /// (0, 0) on failure.
@@ -984,7 +1126,7 @@ fn alloc_contig(num_pages: usize) -> (u64, u64) {
     (phys, va)
 }
 
-fn create_tx_qp0() -> bool {
+fn create_tx_qp(qp: u32) -> bool {
     // ── Allocate TX ring (one page of 16-byte descriptors) ──────────────
     let (ring_phys, ring_va) = alloc_contig(1);
     if ring_phys == 0 {
@@ -1006,7 +1148,7 @@ fn create_tx_qp0() -> bool {
         log(b"[gvnic] failed to alloc TX QPL pages\n");
         return false;
     }
-    if !register_page_list(TX_QPL_ID, qpl_phys, TX_QPL_PAGES) {
+    if !register_page_list(tx_qpl_id(qp), qpl_phys, TX_QPL_PAGES) {
         return false;
     }
 
@@ -1025,11 +1167,11 @@ fn create_tx_qp0() -> bool {
     //   u8[4] padding
     let mut cmd = AdminqCommand::ZERO;
     put_be32(&mut cmd.bytes, 0, OP_CREATE_TX_QUEUE);
-    put_be32(&mut cmd.bytes, 8, 0); // queue_id = 0
+    put_be32(&mut cmd.bytes, 8, qp);
     put_be64(&mut cmd.bytes, 16, qres_phys);
     put_be64(&mut cmd.bytes, 24, ring_phys);
-    put_be32(&mut cmd.bytes, 32, TX_QPL_ID);
-    put_be32(&mut cmd.bytes, 36, NTFY_ID_TX_QP0);
+    put_be32(&mut cmd.bytes, 32, tx_qpl_id(qp));
+    put_be32(&mut cmd.bytes, 36, tx_ntfy_id(qp));
     put_be16(&mut cmd.bytes, 48, TX_RING_ENTRIES);
 
     if !execute_cmd(b"CREATE_TX_QUEUE", &cmd) {
@@ -1051,21 +1193,23 @@ fn create_tx_qp0() -> bool {
 
     let mut st = STATE.lock();
     if let Some(s) = st.as_mut() {
-        s.tx = Some(TxQueue {
+        s.tx[qp as usize] = Some(TxQueue {
             ring_va,
             ring_entries: TX_RING_ENTRIES,
             qres_va,
             qpl_base_va: qpl_va,
             qpl_base_phys: qpl_phys,
             qpl_size: TX_QPL_PAGES * PAGE_SIZE,
-            qpl_id: TX_QPL_ID,
+            qpl_id: tx_qpl_id(qp),
             db_offset: db_index * 4,
             counter_index,
             fill_cnt: 0,
             done_cnt: 0,
         });
     }
-    log(b"[gvnic] TX queue 0 created, db_offset=");
+    log(b"[gvnic] TX queue ");
+    log_u32(qp);
+    log(b" created, db_offset=");
     log_u32(db_index * 4);
     log(b" counter_index=");
     log_u32(counter_index);
@@ -1073,7 +1217,7 @@ fn create_tx_qp0() -> bool {
     true
 }
 
-fn create_rx_qp0() -> bool {
+fn create_rx_qp(qp: u32, num_qp: u32) -> bool {
     // ── Completion ring (64-byte descriptors, device-written) ───────────
     let compl_pages = ((RX_RING_ENTRIES as u32) * 64 + PAGE_SIZE - 1) / PAGE_SIZE;
     let (compl_phys, compl_va) = alloc_contig(compl_pages as usize);
@@ -1102,7 +1246,7 @@ fn create_rx_qp0() -> bool {
         log(b"[gvnic] failed to alloc RX QPL pages\n");
         return false;
     }
-    if !register_page_list(RX_QPL_ID, qpl_phys, RX_QPL_PAGES) {
+    if !register_page_list(rx_qpl_id(qp), qpl_phys, RX_QPL_PAGES) {
         return false;
     }
 
@@ -1141,13 +1285,13 @@ fn create_rx_qp0() -> bool {
     //   u8[5] padding
     let mut cmd = AdminqCommand::ZERO;
     put_be32(&mut cmd.bytes, 0, OP_CREATE_RX_QUEUE);
-    put_be32(&mut cmd.bytes, 8, 0); // queue_id = 0
-    put_be32(&mut cmd.bytes, 12, 0); // index = 0
-    put_be32(&mut cmd.bytes, 20, NTFY_ID_RX_QP0);
+    put_be32(&mut cmd.bytes, 8, qp);
+    put_be32(&mut cmd.bytes, 12, qp);
+    put_be32(&mut cmd.bytes, 20, rx_ntfy_id(num_qp, qp));
     put_be64(&mut cmd.bytes, 24, qres_phys);
     put_be64(&mut cmd.bytes, 32, compl_phys);
     put_be64(&mut cmd.bytes, 40, data_phys);
-    put_be32(&mut cmd.bytes, 48, RX_QPL_ID);
+    put_be32(&mut cmd.bytes, 48, rx_qpl_id(qp));
     put_be16(&mut cmd.bytes, 52, RX_RING_ENTRIES);
     put_be16(&mut cmd.bytes, 54, RX_BUFFER_SIZE);
 
@@ -1165,7 +1309,7 @@ fn create_rx_qp0() -> bool {
 
     let mut st = STATE.lock();
     if let Some(s) = st.as_mut() {
-        s.rx = Some(RxQueue {
+        s.rx[qp as usize] = Some(RxQueue {
             compl_va,
             data_va,
             ring_entries: RX_RING_ENTRIES,
@@ -1173,7 +1317,7 @@ fn create_rx_qp0() -> bool {
             qpl_base_va: qpl_va,
             qpl_base_phys: qpl_phys,
             qpl_size: RX_QPL_PAGES * PAGE_SIZE,
-            qpl_id: RX_QPL_ID,
+            qpl_id: rx_qpl_id(qp),
             db_offset: db_index * 4,
             counter_index,
             fill_cnt: 0,
@@ -1181,7 +1325,9 @@ fn create_rx_qp0() -> bool {
             expected_seq: 1,
         });
     }
-    log(b"[gvnic] RX queue 0 created, db_offset=");
+    log(b"[gvnic] RX queue ");
+    log_u32(qp);
+    log(b" created, db_offset=");
     log_u32(db_index * 4);
     log(b" counter_index=");
     log_u32(counter_index);
@@ -1237,26 +1383,27 @@ fn post_initial_rx() {
     // After CREATE_RX_QUEUE the data-slot ring is pre-populated with
     // (slot → QPL offset) but the device doesn't consider any slot
     // "available" until the driver bumps the data doorbell. Writing
-    // `ring_entries` here hands every slot to the device in one
-    // shot so it can start depositing frames immediately.
-    let (bar2_va, rx_db_offset, fill_cnt_to_advertise) = {
+    // `ring_entries` per queue hands every slot to the device in one
+    // shot so it can start depositing frames immediately. Walk all
+    // queue pairs we've brought up.
+    let posts: [(u64, u32, u32); MAX_QUEUE_PAIRS] = {
         let mut st = STATE.lock();
-        let s = match st.as_mut() {
-            Some(s) => s,
-            None => return,
-        };
-        let res = match s.resources.as_ref() {
-            Some(r) => r,
-            None => return,
-        };
-        let rx = match s.rx.as_mut() {
-            Some(r) => r,
-            None => return,
-        };
-        rx.fill_cnt = rx.ring_entries as u32;
-        (res.bar2_va, rx.db_offset, rx.fill_cnt)
+        let s = match st.as_mut() { Some(s) => s, None => return };
+        let bar2_va = match s.resources.as_ref() { Some(r) => r.bar2_va, None => return };
+        let mut out = [(0u64, 0u32, 0u32); MAX_QUEUE_PAIRS];
+        for qp in 0..MAX_QUEUE_PAIRS {
+            if let Some(rx) = s.rx[qp].as_mut() {
+                rx.fill_cnt = rx.ring_entries as u32;
+                out[qp] = (bar2_va, rx.db_offset, rx.fill_cnt);
+            }
+        }
+        out
     };
-    doorbell_write(bar2_va, rx_db_offset, fill_cnt_to_advertise);
+    for (bar2_va, db_offset, fill_cnt) in posts.iter() {
+        if *bar2_va != 0 {
+            doorbell_write(*bar2_va, *db_offset, *fill_cnt);
+        }
+    }
     log(b"[gvnic] posted initial RX buffers\n");
 }
 
@@ -1272,30 +1419,26 @@ fn doorbell_write(bar2_va: u64, offset: u32, value: u32) {
 
 // ---- RX ------------------------------------------------------------------
 
-/// Drain the RX completion ring for queue-pair 0, invoking
-/// `callback` for each frame. Returns number of frames delivered.
+/// Drain the RX completion ring for the given queue pair,
+/// invoking `callback` for each frame. Returns number of frames
+/// delivered.
 ///
 /// Progress is detected by sequence number, not producer index:
 /// each completion descriptor carries `flags_seq` whose low 3 bits
 /// cycle 1..7. When the next descriptor's sequence matches what
 /// we're expecting, it's a new completion.
-pub fn poll_qp0(callback: fn(&[u8])) -> u32 {
+pub fn poll_qp_inner(qp: usize, callback: fn(&[u8])) -> u32 {
+    if qp >= MAX_QUEUE_PAIRS {
+        return 0;
+    }
+
     // Snapshot what we need — we don't want to hold the global lock
     // across the callback (which may call back into `send()`).
     let snap = {
         let st = STATE.lock();
-        let s = match st.as_ref() {
-            Some(s) => s,
-            None => return 0,
-        };
-        let rx = match s.rx.as_ref() {
-            Some(r) => r,
-            None => return 0,
-        };
-        let res = match s.resources.as_ref() {
-            Some(r) => r,
-            None => return 0,
-        };
+        let s = match st.as_ref() { Some(s) => s, None => return 0 };
+        let rx = match s.rx[qp].as_ref() { Some(r) => r, None => return 0 };
+        let res = match s.resources.as_ref() { Some(r) => r, None => return 0 };
         RxSnap {
             compl_va: rx.compl_va,
             qpl_base_va: rx.qpl_base_va,
@@ -1359,12 +1502,10 @@ pub fn poll_qp0(callback: fn(&[u8])) -> u32 {
 
         // Commit cursor advances back to state.
         let mut st = STATE.lock();
-        if let Some(s) = st.as_mut() {
-            if let Some(rx) = s.rx.as_mut() {
-                rx.cons_cnt = cons;
-                rx.expected_seq = expected;
-                rx.fill_cnt = new_fill;
-            }
+        if let Some(rx) = st.as_mut().and_then(|s| s.rx[qp].as_mut()) {
+            rx.cons_cnt = cons;
+            rx.expected_seq = expected;
+            rx.fill_cnt = new_fill;
         }
     }
 
@@ -1384,18 +1525,18 @@ struct RxSnap {
 
 // ---- TX ------------------------------------------------------------------
 
-/// Reclaim TX slots from the device's completion counter.
+/// Reclaim TX slots on `qp` from the device's completion counter.
 /// `counter_array[tx.counter_index]` is a big-endian u32 the device
 /// bumps by 1 each time it finishes transmitting a descriptor; we
 /// read it + publish the advanced `done_cnt` so `send()` can see
 /// which ring slots are safe to reuse.
-fn tx_drain() {
+fn tx_drain_qp(qp: usize) {
     let (counter_va, counter_index);
     {
         let st = STATE.lock();
         let s = match st.as_ref() { Some(s) => s, None => return };
         let res = match s.resources.as_ref() { Some(r) => r, None => return };
-        let tx = match s.tx.as_ref() { Some(t) => t, None => return };
+        let tx = match s.tx[qp].as_ref() { Some(t) => t, None => return };
         counter_va = res.counter_array_va;
         counter_index = tx.counter_index;
     }
@@ -1405,7 +1546,7 @@ fn tx_drain() {
     let nic_done = u32::from_be(raw);
 
     let mut st = STATE.lock();
-    if let Some(tx) = st.as_mut().and_then(|s| s.tx.as_mut()) {
+    if let Some(tx) = st.as_mut().and_then(|s| s.tx[qp].as_mut()) {
         // The counter is monotonic; only advance `done_cnt`.
         if nic_done.wrapping_sub(tx.done_cnt) != 0 {
             tx.done_cnt = nic_done;
@@ -1413,22 +1554,21 @@ fn tx_drain() {
     }
 }
 
-/// Submit a single-segment packet. Returns `true` on success, `false`
-/// when the TX ring has no free slots (device hasn't caught up) or
-/// the frame exceeds `TX_MAX_PKT_LEN`. Per-slot QPL pages are 4 KiB
-/// so packets up to one page land naturally at `slot * PAGE_SIZE`.
-pub fn send(data: &[u8]) -> bool {
-    if data.is_empty() || data.len() > TX_MAX_PKT_LEN {
+/// Submit a single-segment packet on queue pair `qp`. Returns
+/// `true` on success, `false` when the ring has no free slots
+/// (device hasn't caught up) or the frame exceeds `TX_MAX_PKT_LEN`.
+pub fn send_on_qp(qp: usize, data: &[u8]) -> bool {
+    if qp >= MAX_QUEUE_PAIRS || data.is_empty() || data.len() > TX_MAX_PKT_LEN {
         return false;
     }
 
-    tx_drain();
+    tx_drain_qp(qp);
 
     let (ring_va, ring_entries, fill_cnt, done_cnt, qpl_va, db_offset, bar2_va) = {
         let st = STATE.lock();
         let s = match st.as_ref() { Some(s) => s, None => return false };
         let res = match s.resources.as_ref() { Some(r) => r, None => return false };
-        let tx = match s.tx.as_ref() { Some(t) => t, None => return false };
+        let tx = match s.tx[qp].as_ref() { Some(t) => t, None => return false };
         (
             tx.ring_va,
             tx.ring_entries,
@@ -1485,10 +1625,27 @@ pub fn send(data: &[u8]) -> bool {
     doorbell_write(bar2_va, db_offset, new_fill);
 
     let mut st = STATE.lock();
-    if let Some(tx) = st.as_mut().and_then(|s| s.tx.as_mut()) {
+    if let Some(tx) = st.as_mut().and_then(|s| s.tx[qp].as_mut()) {
         tx.fill_cnt = new_fill;
     }
     true
+}
+
+/// Per-core TX. Picks the queue pair matching `cpu_id()` when that
+/// fits within `num_qp`, else falls back to qp 0. Matches the
+/// virtio-net "send on your own core's queue" semantics so Tier 1
+/// scaling keeps working.
+pub fn send(data: &[u8]) -> bool {
+    let num_qp = {
+        let st = STATE.lock();
+        st.as_ref().map(|s| s.num_qp as u32).unwrap_or(0)
+    };
+    if num_qp == 0 {
+        return false;
+    }
+    let core = kernel::cpu_id();
+    let qp = if core < num_qp { core as usize } else { 0 };
+    send_on_qp(qp, data)
 }
 
 // ---- virtio-net-compatible public surface --------------------------------
@@ -1506,10 +1663,14 @@ pub fn get_mac(mac_out: *mut u8) {
     }
 }
 
-/// Active queue pair count. Phase 2 is single-queue; multi-queue
-/// support is in a later phase.
+/// Active queue pair count. Drives `net::poll_tier1` — when > 1
+/// the kernel switches to per-core queue polling.
 pub fn num_queue_pairs() -> u16 {
-    if GVNIC_OK.load(Ordering::Acquire) { 1 } else { 0 }
+    if !GVNIC_OK.load(Ordering::Acquire) {
+        return 0;
+    }
+    let st = STATE.lock();
+    st.as_ref().map(|s| s.num_qp).unwrap_or(0)
 }
 
 /// Per-queue RX frame count. Matches the array signature of
@@ -1518,38 +1679,46 @@ pub fn num_queue_pairs() -> u16 {
 pub fn rx_counts() -> [u64; 8] {
     let mut out = [0u64; 8];
     let st = STATE.lock();
-    if let Some(rx) = st.as_ref().and_then(|s| s.rx.as_ref()) {
-        out[0] = rx.cons_cnt as u64;
+    if let Some(s) = st.as_ref() {
+        for qp in 0..MAX_QUEUE_PAIRS.min(out.len()) {
+            if let Some(rx) = s.rx[qp].as_ref() {
+                out[qp] = rx.cons_cnt as u64;
+            }
+        }
     }
     out
 }
 
 /// Per-queue used-ring cursors. For gvnic we don't have a
 /// virtio-style "used ring" — the closest analogs are the
-/// completion ring's sequence cursor (driver-side) and fill count
-/// (driver-side). Return `(fill_cnt, cons_cnt)` which is what
-/// virtio_net's `rx_used_cursors` semantics convey: "where the
-/// device is vs. where we are."
+/// completion ring's fill count (posted to device) and cons count
+/// (consumed by driver). Return `(fill_cnt, cons_cnt)` which maps
+/// naturally onto virtio's `(device_idx, driver_cursor)`
+/// interpretation in `/stats`.
 pub fn rx_used_cursors() -> [(u16, u16); 8] {
     let mut out = [(0u16, 0u16); 8];
     let st = STATE.lock();
-    if let Some(rx) = st.as_ref().and_then(|s| s.rx.as_ref()) {
-        out[0] = (rx.fill_cnt as u16, rx.cons_cnt as u16);
+    if let Some(s) = st.as_ref() {
+        for qp in 0..MAX_QUEUE_PAIRS.min(out.len()) {
+            if let Some(rx) = s.rx[qp].as_ref() {
+                out[qp] = (rx.fill_cnt as u16, rx.cons_cnt as u16);
+            }
+        }
     }
     out
 }
 
-/// Thin alias that matches `drivers::virtio_net::poll_qp(qp, cb)`'s
-/// return type. Phase 2 ignores `qp` (single queue).
-pub fn poll_qp(_qp: usize, callback: fn(&[u8])) -> i32 {
-    poll_qp0(callback) as i32
+/// Per-queue RX poll. Mirrors `drivers::virtio_net::poll_qp(qp, cb)`
+/// so Tier 1 per-core polling in `net::poll_tier1` works unchanged.
+pub fn poll_qp(qp: usize, callback: fn(&[u8])) -> i32 {
+    poll_qp_inner(qp, callback) as i32
 }
 
-/// Drain the RX queue with the given callback. Compatible with
-/// `drivers::virtio_net::poll`. Phase 2 has a single queue so this
-/// and `poll_qp(0, cb)` are equivalent.
+/// Single-queue convenience — polls qp 0 only. Used by callers
+/// that are either single-queue (DHCP) or explicitly want a
+/// single-queue path (Tier 2 distribute loop).
 pub fn poll(callback: fn(&[u8])) -> i32 {
-    poll_qp0(callback) as i32
+    poll_qp_inner(0, callback) as i32
 }
 
 // ---- Serial logging helpers ------------------------------------------------
