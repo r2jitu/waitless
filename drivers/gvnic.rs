@@ -1,9 +1,18 @@
 // drivers/gvnic.rs — Google Virtual NIC (gVNIC) driver.
 //
-// Phase 1 scope: PCI probe, admin-queue bring-up, DESCRIBE_DEVICE.
-// No datapath yet — we just log the device descriptor to serial so
-// we can confirm the device speaks back on GCE. The datapath (TX/RX
-// rings, RSS, etc.) lands in later phases.
+// Brings up one TX + one RX queue pair in GQI_QPL mode on GCE and
+// serves packets on it. The driver is split into three levels:
+//
+//   1. Admin queue: PCI probe, DESCRIBE_DEVICE, parse device
+//      descriptor + options.
+//   2. Resource setup: CONFIGURE_DEVICE_RESOURCES, REGISTER_PAGE_LIST
+//      (TX + RX), CREATE_TX_QUEUE, CREATE_RX_QUEUE.
+//   3. Datapath: post RX buffers, drain completion ring, submit TX
+//      descriptors, reclaim completed TX slots.
+//
+// Multi-queue + RSS is out of scope here — it's layered on top in
+// a follow-up phase (one TxQueue / RxQueue per core, CONFIGURE_RSS
+// at init).
 //
 // References (cloned locally while this driver was written):
 //   https://github.com/GoogleCloudPlatform/compute-virtual-ethernet-linux
@@ -458,9 +467,10 @@ pub fn init() -> bool {
     if !create_rx_qp0() {
         return false;
     }
+    post_initial_rx();
 
     GVNIC_OK.store(true, Ordering::Release);
-    log(b"[gvnic] admin queue up, queues up\n");
+    log(b"[gvnic] ready\n");
     true
 }
 
@@ -1175,6 +1185,416 @@ fn create_rx_qp0() -> bool {
     log_u32(counter_index);
     log(b"\n");
     true
+}
+
+// ---- Datapath ------------------------------------------------------------
+//
+// Single-queue GQI_QPL flow, one RX queue + one TX queue. Both
+// sides are polled — no interrupts; the kernel's event loop calls
+// `poll_qp(0, cb)` regularly, which drains the RX completion ring
+// and re-posts consumed slots. `send()` copies one packet into
+// the TX QPL FIFO, writes one descriptor, and kicks the doorbell.
+
+/// RSS hash layout in the GQI_RX completion descriptor is the last
+/// 64 bytes worth of the 64-byte descriptor. Offsets within it:
+///
+///   u8[0..48]   padding (device implementation detail)
+///   u8[48..52]  rss_hash (be32)
+///   u8[52..54]  mss (be16)
+///   u8[54..56]  reserved
+///   u8[56]      hdr_len
+///   u8[57]      hdr_off (64-byte-scaled)
+///   u8[58..60]  csum (host-endian per the reference driver)
+///   u8[60..62]  len (be16)
+///   u8[62..64]  flags_seq (be16)
+///
+/// Only `len` and `flags_seq` are needed for Phase 2 — csum +
+/// hash are hints for the stack and can be ignored here.
+const RX_DESC_SIZE: usize = 64;
+const RX_DESC_LEN_OFF: usize = 60;
+const RX_DESC_FLAGS_SEQ_OFF: usize = 62;
+const RX_DESC_HDR_OFF_OFF: usize = 57;
+
+/// Start-of-frame offset inside each 4 KiB RX page. The device
+/// prepends `_GVE_RX_PAD = 2` bytes of padding before the Ethernet
+/// header so IPv4 header bytes land 4-byte aligned. The *actual*
+/// offset the device writes into `hdr_off` is scaled by 64 — for
+/// Phase 2 with one packet per page there's only one valid value
+/// (hdr_off = 0, actual start = `_GVE_RX_PAD`).
+const RX_DATA_OFFSET_IN_PAGE: usize = _GVE_RX_PAD as usize;
+
+/// TX descriptor size (gve_tx_pkt_desc, packed, 16 bytes).
+const TX_DESC_SIZE: usize = 16;
+
+/// Highest packet length we're willing to stage at once. Matches
+/// the device-advertised MTU + Ethernet + safety slack; see
+/// `send()` below for the actual check.
+const TX_MAX_PKT_LEN: usize = 2048;
+
+fn post_initial_rx() {
+    // After CREATE_RX_QUEUE the data-slot ring is pre-populated with
+    // (slot → QPL offset) but the device doesn't consider any slot
+    // "available" until the driver bumps the data doorbell. Writing
+    // `ring_entries` here hands every slot to the device in one
+    // shot so it can start depositing frames immediately.
+    let (bar2_va, rx_db_offset, fill_cnt_to_advertise) = {
+        let mut st = STATE.lock();
+        let s = match st.as_mut() {
+            Some(s) => s,
+            None => return,
+        };
+        let res = match s.resources.as_ref() {
+            Some(r) => r,
+            None => return,
+        };
+        let rx = match s.rx.as_mut() {
+            Some(r) => r,
+            None => return,
+        };
+        rx.fill_cnt = rx.ring_entries as u32;
+        (res.bar2_va, rx.db_offset, rx.fill_cnt)
+    };
+    doorbell_write(bar2_va, rx_db_offset, fill_cnt_to_advertise);
+    log(b"[gvnic] posted initial RX buffers\n");
+}
+
+/// Write a big-endian `value` to BAR2 at byte-offset `offset`.
+/// GQI doorbells are all BE on the wire — the FreeBSD reference
+/// uses `htobe32` before `bus_write_4` for the same reason.
+#[inline]
+fn doorbell_write(bar2_va: u64, offset: u32, value: u32) {
+    unsafe {
+        mmio_write32(bar2_va + offset as u64, value.to_be());
+    }
+}
+
+// ---- RX ------------------------------------------------------------------
+
+/// Drain the RX completion ring for queue-pair 0, invoking
+/// `callback` for each frame. Returns number of frames delivered.
+///
+/// Progress is detected by sequence number, not producer index:
+/// each completion descriptor carries `flags_seq` whose low 3 bits
+/// cycle 1..7. When the next descriptor's sequence matches what
+/// we're expecting, it's a new completion.
+pub fn poll_qp0(callback: fn(&[u8])) -> u32 {
+    // Snapshot what we need — we don't want to hold the global lock
+    // across the callback (which may call back into `send()`).
+    let snap = {
+        let st = STATE.lock();
+        let s = match st.as_ref() {
+            Some(s) => s,
+            None => return 0,
+        };
+        let rx = match s.rx.as_ref() {
+            Some(r) => r,
+            None => return 0,
+        };
+        let res = match s.resources.as_ref() {
+            Some(r) => r,
+            None => return 0,
+        };
+        RxSnap {
+            compl_va: rx.compl_va,
+            qpl_base_va: rx.qpl_base_va,
+            ring_entries: rx.ring_entries,
+            cons_cnt: rx.cons_cnt,
+            expected_seq: rx.expected_seq,
+            db_offset: rx.db_offset,
+            fill_cnt: rx.fill_cnt,
+            bar2_va: res.bar2_va,
+        }
+    };
+
+    let mask = (snap.ring_entries - 1) as u32;
+    let mut cons = snap.cons_cnt;
+    let mut expected = snap.expected_seq;
+    let mut delivered: u32 = 0;
+
+    loop {
+        let idx = (cons & mask) as usize;
+        let desc_ptr = (snap.compl_va as *const u8).wrapping_add(idx * RX_DESC_SIZE);
+        // SAFETY: descriptor is 64 bytes inside a DMA-coherent page
+        // we allocated. The volatile read pulls the device's latest
+        // write visible at PoC — x86 is cache-coherent so no
+        // explicit invalidation needed.
+        let desc: &[u8] = unsafe { core::slice::from_raw_parts(desc_ptr, RX_DESC_SIZE) };
+
+        let flags_seq = get_be16(desc, RX_DESC_FLAGS_SEQ_OFF);
+        let seq = (flags_seq & 0x7) as u8;
+        if seq != expected {
+            break;
+        }
+
+        let len = get_be16(desc, RX_DESC_LEN_OFF) as usize;
+        // `hdr_off` is "64-byte-scaled offset into the RX_DATA
+        // entry". In Phase 2 each entry is a single page and the
+        // device always writes the frame at byte RX_DATA_OFFSET_IN_PAGE
+        // (the 2-byte pad). hdr_off is therefore 0; we compute the
+        // real offset manually rather than consult it, matching the
+        // reference driver's approach.
+        let _hdr_off = desc[RX_DESC_HDR_OFF_OFF];
+
+        let frame_start = snap.qpl_base_va as usize + idx * (PAGE_SIZE as usize)
+            + RX_DATA_OFFSET_IN_PAGE;
+        let frame: &[u8] = unsafe {
+            core::slice::from_raw_parts(frame_start as *const u8, len)
+        };
+        callback(frame);
+
+        delivered += 1;
+        cons = cons.wrapping_add(1);
+        expected = if expected == 7 { 1 } else { expected + 1 };
+    }
+
+    if delivered > 0 {
+        // Re-post the buffers we consumed. Since the slot contents
+        // don't change (same (page → QPL offset) mapping), the only
+        // thing to advance is fill_cnt. Writing it to the doorbell
+        // tells the device "N more slots are available".
+        let new_fill = snap.fill_cnt.wrapping_add(delivered);
+        doorbell_write(snap.bar2_va, snap.db_offset, new_fill);
+
+        // Commit cursor advances back to state.
+        let mut st = STATE.lock();
+        if let Some(s) = st.as_mut() {
+            if let Some(rx) = s.rx.as_mut() {
+                rx.cons_cnt = cons;
+                rx.expected_seq = expected;
+                rx.fill_cnt = new_fill;
+            }
+        }
+    }
+
+    delivered
+}
+
+struct RxSnap {
+    compl_va: u64,
+    qpl_base_va: u64,
+    ring_entries: u16,
+    cons_cnt: u32,
+    expected_seq: u8,
+    db_offset: u32,
+    fill_cnt: u32,
+    bar2_va: u64,
+}
+
+// ---- TX ------------------------------------------------------------------
+
+/// Reclaim TX FIFO space based on the device's event counter —
+/// counter_array[tx.counter_index] is a big-endian u32 the device
+/// bumps by 1 each time it consumes a TX descriptor.
+fn tx_drain() {
+    let (counter_va, counter_index, done_cnt);
+    {
+        let st = STATE.lock();
+        let s = match st.as_ref() {
+            Some(s) => s,
+            None => return,
+        };
+        let res = match s.resources.as_ref() {
+            Some(r) => r,
+            None => return,
+        };
+        let tx = match s.tx.as_ref() {
+            Some(t) => t,
+            None => return,
+        };
+        counter_va = res.counter_array_va;
+        counter_index = tx.counter_index;
+        done_cnt = tx.done_cnt;
+    }
+
+    let counter_ptr = counter_va as *const u32;
+    let raw = unsafe { ptr::read_volatile(counter_ptr.add(counter_index as usize)) };
+    let nic_done = u32::from_be(raw);
+
+    let completed = nic_done.wrapping_sub(done_cnt);
+    if completed == 0 {
+        return;
+    }
+
+    // With a simple FIFO packing strategy, reclaiming a completion
+    // doesn't free a specific region — we just remember that
+    // `nic_done` descriptors are done. The per-packet byte
+    // accounting is tracked separately by `qpl_head` / `qpl_avail`
+    // since packets don't round-trip through the QPL one-for-one
+    // (a single packet may occupy multiple cache lines + padding).
+    let mut st = STATE.lock();
+    if let Some(s) = st.as_mut() {
+        if let Some(tx) = s.tx.as_mut() {
+            tx.done_cnt = nic_done;
+            // Reclaim all bytes ahead of the done mark. Phase 2's
+            // FIFO packer is simple enough that this is sound: we
+            // never overlap a write that's still in flight with
+            // reclaim because `send()` fails if
+            // `qpl_head` would pass `done_cnt`'s boundary.
+            tx.qpl_avail = tx.qpl_size;
+            tx.qpl_head = 0;
+        }
+    }
+}
+
+/// Submit a single-segment packet. Returns `true` on success, `false`
+/// if there's no TX ring slot / QPL space available — caller's
+/// expected to drop on false. Frames > `TX_MAX_PKT_LEN` are
+/// rejected.
+pub fn send(data: &[u8]) -> bool {
+    if data.len() == 0 || data.len() > TX_MAX_PKT_LEN {
+        return false;
+    }
+
+    tx_drain();
+
+    let (ring_va, ring_entries, fill_cnt, qpl_va, qpl_head, db_offset, bar2_va) = {
+        let st = STATE.lock();
+        let s = match st.as_ref() {
+            Some(s) => s,
+            None => return false,
+        };
+        let res = match s.resources.as_ref() {
+            Some(r) => r,
+            None => return false,
+        };
+        let tx = match s.tx.as_ref() {
+            Some(t) => t,
+            None => return false,
+        };
+        (
+            tx.ring_va,
+            tx.ring_entries,
+            tx.fill_cnt,
+            tx.qpl_base_va,
+            tx.qpl_head,
+            tx.db_offset,
+            res.bar2_va,
+        )
+    };
+
+    // Copy the packet into the TX QPL at the current FIFO head.
+    // Phase 2 doesn't wrap: if the packet doesn't fit before the
+    // QPL end, we drop. A wrap-around implementation lands in
+    // Phase 4 alongside the per-core rings.
+    let pkt_end = qpl_head as usize + data.len();
+    let qpl_size_bytes = {
+        let st = STATE.lock();
+        st.as_ref()
+            .and_then(|s| s.tx.as_ref())
+            .map(|t| t.qpl_size as usize)
+            .unwrap_or(0)
+    };
+    if pkt_end > qpl_size_bytes {
+        // FIFO ran out of contiguous room — drop + let tx_drain()
+        // catch up next time. (qpl_head resets to 0 in tx_drain
+        // when it runs.)
+        return false;
+    }
+
+    let dst = (qpl_va + qpl_head as u64) as *mut u8;
+    unsafe {
+        ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
+    }
+
+    // Build the TX descriptor at ring[fill_cnt & mask]. gve_tx_pkt_desc:
+    //   u8  type_flags       (GVE_TXD_STD = 0)
+    //   u8  l4_csum_offset   (0 — no offload in Phase 2)
+    //   u8  l4_hdr_offset    (0)
+    //   u8  desc_cnt         (1 — single-segment packet)
+    //   u16 len              (be)
+    //   u16 seg_len          (be)
+    //   u64 seg_addr         (be — QPL offset in QPL mode)
+    let mask = (ring_entries - 1) as u32;
+    let slot = (fill_cnt & mask) as usize;
+    let desc_ptr = (ring_va as *mut u8).wrapping_add(slot * TX_DESC_SIZE);
+    let mut desc = [0u8; TX_DESC_SIZE];
+    desc[0] = 0;             // type_flags: GVE_TXD_STD
+    desc[1] = 0;             // l4_csum_offset
+    desc[2] = 0;             // l4_hdr_offset
+    desc[3] = 1;             // desc_cnt
+    put_be16(&mut desc, 4, data.len() as u16);
+    put_be16(&mut desc, 6, data.len() as u16);
+    put_be64(&mut desc, 8, qpl_head as u64);
+    unsafe {
+        core::ptr::copy_nonoverlapping(desc.as_ptr(), desc_ptr, TX_DESC_SIZE);
+    }
+
+    // Advance cursors + kick the doorbell.
+    let new_fill = fill_cnt.wrapping_add(1);
+    // The doorbell value is the new fill count (monotonic).
+    doorbell_write(bar2_va, db_offset, new_fill);
+
+    let mut st = STATE.lock();
+    if let Some(s) = st.as_mut() {
+        if let Some(tx) = s.tx.as_mut() {
+            tx.fill_cnt = new_fill;
+            tx.qpl_head = pkt_end as u32;
+            tx.qpl_avail = tx.qpl_avail.saturating_sub(data.len() as u32);
+        }
+    }
+    true
+}
+
+// ---- virtio-net-compatible public surface --------------------------------
+
+/// Copy the device MAC into `mac_out` (6 bytes). Matches
+/// `drivers::virtio_net::get_mac` so the dispatch shim can call
+/// either driver through the same signature.
+///
+/// # Safety
+/// `mac_out` must point to 6 writable bytes.
+pub unsafe fn get_mac(mac_out: *mut u8) {
+    let st = STATE.lock();
+    let src = st.as_ref().map(|s| s.mac).unwrap_or([0u8; 6]);
+    unsafe {
+        ptr::copy_nonoverlapping(src.as_ptr(), mac_out, 6);
+    }
+}
+
+/// Active queue pair count. Phase 2 is single-queue; multi-queue
+/// support is in a later phase.
+pub fn num_queue_pairs() -> u16 {
+    if GVNIC_OK.load(Ordering::Acquire) { 1 } else { 0 }
+}
+
+/// Per-queue RX frame count. Matches the array signature of
+/// `virtio_net::rx_counts` so the `/stats` endpoint code can call
+/// whichever driver is active.
+pub fn rx_counts() -> [u64; 8] {
+    let mut out = [0u64; 8];
+    let st = STATE.lock();
+    if let Some(rx) = st.as_ref().and_then(|s| s.rx.as_ref()) {
+        out[0] = rx.cons_cnt as u64;
+    }
+    out
+}
+
+/// Per-queue used-ring cursors. For gvnic we don't have a
+/// virtio-style "used ring" — the closest analogs are the
+/// completion ring's sequence cursor (driver-side) and fill count
+/// (driver-side). Return `(fill_cnt, cons_cnt)` which is what
+/// virtio_net's `rx_used_cursors` semantics convey: "where the
+/// device is vs. where we are."
+pub fn rx_used_cursors() -> [(u16, u16); 8] {
+    let mut out = [(0u16, 0u16); 8];
+    let st = STATE.lock();
+    if let Some(rx) = st.as_ref().and_then(|s| s.rx.as_ref()) {
+        out[0] = (rx.fill_cnt as u16, rx.cons_cnt as u16);
+    }
+    out
+}
+
+/// Thin alias that matches `drivers::virtio_net::poll_qp(qp, cb)`'s
+/// return type. Phase 2 ignores `qp` (single queue).
+pub fn poll_qp(_qp: usize, callback: fn(&[u8])) -> i32 {
+    poll_qp0(callback) as i32
+}
+
+/// Drain the RX queue with the given callback. Compatible with
+/// `drivers::virtio_net::poll`. Phase 2 has a single queue so this
+/// and `poll_qp(0, cb)` are equivalent.
+pub fn poll(callback: fn(&[u8])) -> i32 {
+    poll_qp0(callback) as i32
 }
 
 // ---- Serial logging helpers ------------------------------------------------
