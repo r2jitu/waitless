@@ -248,4 +248,5 @@ pub mod virtio;
 pub mod virtio_net;
 pub mod virtio_console;
 pub mod gvnic;
+pub mod net;
 

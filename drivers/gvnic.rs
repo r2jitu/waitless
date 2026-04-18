@@ -1537,13 +1537,12 @@ pub fn send(data: &[u8]) -> bool {
 
 // ---- virtio-net-compatible public surface --------------------------------
 
-/// Copy the device MAC into `mac_out` (6 bytes). Matches
-/// `drivers::virtio_net::get_mac` so the dispatch shim can call
-/// either driver through the same signature.
-///
-/// # Safety
-/// `mac_out` must point to 6 writable bytes.
-pub unsafe fn get_mac(mac_out: *mut u8) {
+/// Copy the device MAC into `mac_out` (6 bytes). Matches the
+/// signature of `drivers::virtio_net::get_mac` so the dispatch
+/// shim can call either driver the same way. The caller is
+/// responsible for `mac_out` pointing at 6 writable bytes — same
+/// unwritten contract virtio-net's version has.
+pub fn get_mac(mac_out: *mut u8) {
     let st = STATE.lock();
     let src = st.as_ref().map(|s| s.mac).unwrap_or([0u8; 6]);
     unsafe {

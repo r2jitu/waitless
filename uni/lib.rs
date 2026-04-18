@@ -230,7 +230,7 @@ pub fn udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
 /// or just ignore the tail zeros.
 #[cfg(platform_unikernel)]
 pub fn net_rx_counts() -> [u64; 8] {
-    drivers::virtio_net::rx_counts()
+    drivers::net::rx_counts()
 }
 #[cfg(platform_native)]
 pub fn net_rx_counts() -> [u64; 8] { [0; 8] }
@@ -239,19 +239,19 @@ pub fn net_rx_counts() -> [u64; 8] { [0; 8] }
 /// activation on Tier 1 paths). 1 for single-queue / Tier 2.
 #[cfg(platform_unikernel)]
 pub fn net_num_queue_pairs() -> u16 {
-    drivers::virtio_net::num_queue_pairs()
+    drivers::net::num_queue_pairs()
 }
 #[cfg(platform_native)]
 pub fn net_num_queue_pairs() -> u16 { 1 }
 
 /// Per-RX-queue `(device_idx, driver_cursor)` used-ring snapshots.
-/// See `drivers::virtio_net::rx_used_cursors` for interpretation —
+/// See `drivers::net::rx_used_cursors` for interpretation —
 /// lets `/stats` surface whether traffic is stuck on the device side
 /// (Andromeda not distributing) vs. the driver side (we're not
 /// polling qp N fast enough).
 #[cfg(platform_unikernel)]
 pub fn net_rx_used_cursors() -> [(u16, u16); 8] {
-    drivers::virtio_net::rx_used_cursors()
+    drivers::net::rx_used_cursors()
 }
 #[cfg(platform_native)]
 pub fn net_rx_used_cursors() -> [(u16, u16); 8] { [(0, 0); 8] }

@@ -51,18 +51,18 @@ impl Drop for IrqGuard {
 }
 
 pub fn wait_for_events() {
-    drivers::virtio_net::flush_tx_staging();
+    drivers::net::flush_tx_staging();
 
-    if drivers::virtio_net::irq_idle_supported() {
+    if drivers::net::irq_idle_supported() {
         // RAII: mask on construction, unmask on Drop. Even if `arch_idle`
         // is added later that may early-return or panic, IRQs are
         // guaranteed to be unmasked by the guard's drop.
         let _irq = IrqGuard::new();
-        drivers::virtio_net::arm_rx_interrupts();
-        if !drivers::virtio_net::has_pending_rx() && !drivers::virtio_net::has_pending_tx() {
+        drivers::net::arm_rx_interrupts();
+        if !drivers::net::has_pending_rx() && !drivers::net::has_pending_tx() {
             arch_idle();
         }
-        drivers::virtio_net::flush_tx_staging();
+        drivers::net::flush_tx_staging();
         // _irq dropped here → unmask.
     } else {
         arch_cpu_relax();

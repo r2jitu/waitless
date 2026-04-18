@@ -40,7 +40,7 @@ static OUR_MAC_PACKED: core::sync::atomic::AtomicU64 =
 /// Cache our MAC address. Called once at boot after virtio-net init.
 pub fn init_mac() {
     let mut bytes = [0u8; 6];
-    drivers::virtio_net::get_mac(bytes.as_mut_ptr());
+    drivers::net::get_mac(bytes.as_mut_ptr());
     let packed = (bytes[0] as u64)
         | ((bytes[1] as u64) << 8)
         | ((bytes[2] as u64) << 16)
@@ -79,7 +79,7 @@ pub fn ethernet_send(dst: MacAddr, ethertype: u16, payload: &[u8]) {
         let payload_len = payload.len().min(1500);
         ptr::copy_nonoverlapping(payload.as_ptr(), p.add(HEADER_LEN), payload_len);
 
-        drivers::virtio_net::send(core::slice::from_raw_parts(p, HEADER_LEN + payload_len));
+        drivers::net::send(core::slice::from_raw_parts(p, HEADER_LEN + payload_len));
     }
 }
 

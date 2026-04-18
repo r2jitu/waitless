@@ -282,7 +282,7 @@ fn dhcp_send_discover() {
     frame[opt_pos] = 255; opt_pos += 1;
 
     let total = dhcp_frame_finalize(&mut frame, opt_pos);
-    drivers::virtio_net::send(&frame[..total]);
+    drivers::net::send(&frame[..total]);
 }
 
 fn dhcp_send_request() {
@@ -311,7 +311,7 @@ fn dhcp_send_request() {
     frame[opt_pos] = 255; opt_pos += 1;
 
     let total = dhcp_frame_finalize(&mut frame, opt_pos);
-    drivers::virtio_net::send(&frame[..total]);
+    drivers::net::send(&frame[..total]);
 }
 
 fn dhcp_poll_wait(timeout_ms: u32, wait_for_ack: bool) -> bool {
@@ -323,9 +323,9 @@ fn dhcp_poll_wait(timeout_ms: u32, wait_for_ack: bool) -> bool {
         // we check the used ring. Without this, the tight poll
         // loop never triggers an MMIO exit and the host can't
         // deliver DHCP replies during the timeout window.
-        drivers::virtio_net::poke_interrupt_status();
+        drivers::net::poke_interrupt_status();
         for _ in 0..100 {
-            drivers::virtio_net::poll(dhcp_receive);
+            drivers::net::poll(dhcp_receive);
             let s = DHCP_STATE.lock();
             if wait_for_ack {
                 if s.got_ack { return true; }

@@ -234,7 +234,7 @@ fn arp_request(target_ip: Ipv4Addr) {
     // arrives — but that can't happen until the ARP request is sent. One
     // targeted flush_tx_staging call breaks the deadlock by waking core 0.
     // Fires at most 3 times per arp_resolve (once per retry), not thousands.
-    drivers::virtio_net::flush_tx_staging();
+    drivers::net::flush_tx_staging();
 }
 
 /// Snoop a peer's MAC from any received L2 frame with a usable
@@ -350,7 +350,7 @@ pub fn arp_resolve(ip: Ipv4Addr) -> Option<MacAddr> {
             // around the queue access, so concurrent calls across cores
             // are serialised; an ARP reply observed here updates the
             // cache that arp_lookup reads on the next iteration.
-            drivers::virtio_net::poll(arp_poll_callback);
+            drivers::net::poll(arp_poll_callback);
             if let Some(mac) = ARP_CACHE.lock().lookup(target) {
                 arp_fast_store(ip, mac);
                 return Some(mac);

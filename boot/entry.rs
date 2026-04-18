@@ -412,23 +412,18 @@ unsafe fn kernel_boot(info: &BootInfo) {
     klog!("[INIT] PCI bus scan...\n");
     drivers::pci::init();
 
-    // gVNIC probe (Phase 1 scaffolding). Returns false on virtio-net
-    // GCE VMs / kvm-vm / HVF — existing virtio path keeps working
-    // unchanged. When the VM is booted with nic-type=GVNIC, this
-    // brings up the admin queue and logs the device descriptor so
-    // we can see what GCE advertises.
-    klog!("[INIT] gVNIC probe...\n");
-    let _gvnic_ok = drivers::gvnic::init();
-
-    klog!("[INIT] Virtio-net driver...\n");
-    let net_ok = drivers::virtio_net::init();
+    // NIC bring-up. `drivers::net::init()` tries gVNIC first
+    // (preferred on GCE — native RSS multi-queue) then falls back
+    // to virtio-net (kvm-vm, HVF, default GCE instances).
+    klog!("[INIT] NIC driver...\n");
+    let net_ok = drivers::net::init();
     if !net_ok {
-        klog!("       [WARN] No virtio-net device found.\n");
+        klog!("       [WARN] No NIC found (neither gVNIC nor virtio-net).\n");
     } else {
         // Cache MAC address for multi-core safe access.
         net::ethernet::init_mac();
         let mut mac = [0u8; 6];
-        drivers::virtio_net::get_mac(mac.as_mut_ptr());
+        drivers::net::get_mac(mac.as_mut_ptr());
         klog!(
             "       MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
@@ -452,13 +447,13 @@ unsafe fn kernel_boot(info: &BootInfo) {
         // Deferred until now because activating MQ enables host-side RSS,
         // which sprays incoming frames across queue pairs and breaks
         // single-queue DHCP polling.
-        drivers::virtio_net::activate_multi_queue();
+        drivers::net::activate_multi_queue();
 
         klog!("[INIT] TCP stack...\n");
         net::tcp::init();
 
         klog!("[INIT] Interrupt-driven idle...\n");
-        drivers::virtio_net::enable_irq();
+        drivers::net::enable_irq();
 
         #[cfg(target_arch = "aarch64")]
         {
@@ -561,7 +556,7 @@ fn idle_cb(core_id: u32) {
     // No wake-up source → busy-poll. (Happens when the transport
     // doesn't expose any IRQ path: aarch64 without GIC configured,
     // legacy PCI without an IRQ line, etc.)
-    if !drivers::virtio_net::irq_idle_supported() {
+    if !drivers::net::irq_idle_supported() {
         return;
     }
     if core_id == 0 || kernel::percpu::num_cores() <= 1 {

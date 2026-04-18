@@ -70,11 +70,11 @@ pub fn poll() -> bool {
     let num_cores = percpu::num_cores();
 
     if num_cores <= 1 {
-        return drivers::virtio_net::poll(net_receive) > 0;
+        return drivers::net::poll(net_receive) > 0;
     }
 
     // Tier 1: multi-queue — each core polls its own RX queue pair.
-    if drivers::virtio_net::num_queue_pairs() > 1 {
+    if drivers::net::num_queue_pairs() > 1 {
         return poll_tier1();
     }
 
@@ -87,7 +87,7 @@ pub fn poll() -> bool {
 fn poll_tier1() -> bool {
     if !MULTICORE_INIT.load(core::sync::atomic::Ordering::Relaxed) {
         MULTICORE_INIT.store(true, core::sync::atomic::Ordering::Relaxed);
-        let nqp = drivers::virtio_net::num_queue_pairs();
+        let nqp = drivers::net::num_queue_pairs();
         // One write_fmt holds SERIAL_TX_LOCK for the whole line so a
         // concurrent klog! on another core can't slip in mid-message.
         kernel::serial::write_fmt(format_args!(
@@ -95,10 +95,10 @@ fn poll_tier1() -> bool {
         ));
     }
     let core = kernel::cpu_id();
-    let nqp = drivers::virtio_net::num_queue_pairs() as u32;
+    let nqp = drivers::net::num_queue_pairs() as u32;
     // Each core polls its own queue pair; overflow cores share qp 0.
     let qp = if core < nqp { core as usize } else { 0 };
-    let count = drivers::virtio_net::poll_qp(qp, net_receive);
+    let count = drivers::net::poll_qp(qp, net_receive);
     count > 0
 }
 
@@ -137,14 +137,14 @@ fn poll_tier2(num_cores: u32) -> bool {
     }
 
     // Flush TX staging first — responses from previous cycle.
-    drivers::virtio_net::flush_tx_staging();
+    drivers::net::flush_tx_staging();
 
     // Poll VirtIO RX and distribute directly (no batch buffer copy).
     for i in 0..num_cores as usize {
         WAKEUP[i].store(false, core::sync::atomic::Ordering::Relaxed);
     }
 
-    let count = drivers::virtio_net::poll(distribute_frame);
+    let count = drivers::net::poll(distribute_frame);
 
     // Mark ourselves as "just distributed" — our next poll attempt will
     // yield, giving other cores first shot at the lock.
@@ -172,7 +172,7 @@ fn poll_tier2(num_cores: u32) -> bool {
     }
 
     // Flush TX (APs may have responded during distribution).
-    drivers::virtio_net::flush_tx_staging();
+    drivers::net::flush_tx_staging();
 
     had_frames
 }
@@ -312,15 +312,15 @@ pub fn init_eventloop() {
     kernel::eventloop::set_net_flush(net_flush_cb);
     // NAPI re-arm: right before the event loop HLTs, re-enable RX
     // notifications on this core's queue pair and re-check the ring.
-    kernel::eventloop::set_net_rearm_rx(drivers::virtio_net::rearm_rx_napi);
+    kernel::eventloop::set_net_rearm_rx(drivers::net::rearm_rx_napi);
     // Batch TX kicks: defer MMIO writes until net_flush_cb, reducing
     // exits per HTTP response from N segments to 1 notification.
-    drivers::virtio_net::enable_deferred_tx_kick();
+    drivers::net::enable_deferred_tx_kick();
 }
 
 fn net_poll_cb(_core_id: u32) -> bool {
     // Tier 1 (multi-queue): every core polls its own queue — no lock.
-    if drivers::virtio_net::num_queue_pairs() > 1 {
+    if drivers::net::num_queue_pairs() > 1 {
         return poll();
     }
     // Tier 2: any core can become the rotating distributor; the RX_LOCK CAS
@@ -347,15 +347,15 @@ fn net_drain_cb(core_id: u32) -> bool {
 }
 
 fn net_flush_cb() {
-    let nqp = drivers::virtio_net::num_queue_pairs();
+    let nqp = drivers::net::num_queue_pairs();
     if nqp > 1 {
         // Tier 1: each core flushes its own TX queue pair. No staging needed.
-        drivers::virtio_net::flush_tx_kick_if_dirty();
+        drivers::net::flush_tx_kick_if_dirty();
     } else {
-        drivers::virtio_net::flush_tx_staging();
+        drivers::net::flush_tx_staging();
         // Only kick if new TX buffers were actually added. Skipping
         // redundant kicks saves ~7 MMIO exits/request at high concurrency.
-        drivers::virtio_net::flush_tx_kick_if_dirty();
+        drivers::net::flush_tx_kick_if_dirty();
     }
 }
 
