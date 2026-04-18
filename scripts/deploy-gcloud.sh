@@ -173,11 +173,20 @@ deploy() {
         --quiet
 
     echo "==> Launching VM: $NAME"
+    # queue-count=2 asks the vNIC backend to expose two virtio-net
+    # queue pairs so the guest's driver can run Tier 1 per-core
+    # polling instead of Tier 2 software distribution. Matches
+    # n2-standard-2's 2 vCPUs. GCE's virtio-net is strictly legacy
+    # v0.95 (no modern PCI caps, can't negotiate VIRTIO_F_VERSION_1)
+    # — legacy MQ works once the ctrl-vq activation dance is done
+    # correctly. See `CtrlMqBuf` static + ctrl_mq_set_pairs in
+    # virtio_net.rs for the contiguous-buffer layout that GCE needs.
     gcloud compute instances create "$NAME" \
         --zone="$ZONE" \
         --machine-type="$MACHINE_TYPE" \
         --image="$IMAGE_NAME" \
         --image-project="$PROJECT" \
+        --network-interface="network=default,queue-count=2" \
         --tags=http-server \
         --metadata=serial-port-enable=TRUE \
         --project="$PROJECT" \

@@ -393,6 +393,12 @@ unsafe fn kernel_boot(info: &BootInfo) {
 
     #[cfg(target_arch = "x86_64")]
     {
+        // Seed the RSDP hint before virtio-net::init() — its MQ
+        // negotiation calls detect_cpus() to pick how many queue
+        // pairs to request. The BIOS-area scan fallback fails under
+        // UEFI (GCE's OVMF), so without this MQ stays at 1 pair.
+        kernel::x86_64::acpi::set_rsdp(info.rsdp_paddr);
+
         klog!("[INIT] Local APIC...\n");
         kernel::x86_64::apic::init();
     }
@@ -482,10 +488,9 @@ unsafe fn kernel_boot(info: &BootInfo) {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        // Boot-protocol RSDP hint — without this, UEFI paths (GCE's
-        // OVMF) fall through to the legacy BIOS-area scan which
-        // doesn't find anything.
-        kernel::x86_64::acpi::set_rsdp(info.rsdp_paddr);
+        // set_rsdp already called earlier (before Local APIC init)
+        // so virtio-net MQ saw the right CPU count; detect_cpus()
+        // here just returns the cached topology.
         let cpu_count = kernel::x86_64::acpi::detect_cpus();
         kernel::percpu::init(cpu_count);
         if cpu_count > 1 {

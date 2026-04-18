@@ -6,7 +6,7 @@ use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
 use crate::{
     log, dsb_st,
-    virtio_read32, virtio_write32, virtio_read8, virtio_write8,
+    virtio_read32, virtio_write32, virtio_read16, virtio_read8, virtio_write8,
 };
 #[cfg(target_arch = "aarch64")]
 use kernel::aarch64::{exceptions, fdt};
@@ -416,6 +416,31 @@ pub fn activate_multi_queue() {
     }
 }
 
+/// Backing memory for ctrl-vq commands. Placed in kernel BSS (.bss)
+/// so its physical address lives with the kernel image — Limine
+/// loads us below 4 GiB on every machine we've seen. GCE's legacy
+/// virtio backend silently halts RX on all queues if the MQ ctrl
+/// command's buffers live above 4 GiB or aren't contiguous, so we
+/// park everything in one static 16-byte chunk and chain into it.
+///
+/// Layout, single contiguous buffer:
+///   [0..2]   class, cmd  (readable by device)
+///   [2..4]   u16 num_pairs (LE, readable)
+///   [4..8]   padding for alignment
+///   [8..9]   ack byte (writable by device)
+#[repr(C, align(16))]
+struct CtrlMqBuf {
+    hdr_class: u8,
+    hdr_cmd: u8,
+    data: [u8; 2],
+    _pad: [u8; 4],
+    ack: u8,
+    _tail: [u8; 7],
+}
+static mut CTRL_MQ_BUF: CtrlMqBuf = CtrlMqBuf {
+    hdr_class: 0, hdr_cmd: 0, data: [0; 2], _pad: [0; 4], ack: 0, _tail: [0; 7],
+};
+
 /// Send VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET to activate N queue pairs.
 fn ctrl_mq_set_pairs(num_pairs: u16) {
     // Control VQ command format (spec 1.2 §5.1.6.5):
@@ -427,22 +452,29 @@ fn ctrl_mq_set_pairs(num_pairs: u16) {
     // descriptors; packing { class, cmd, data } into a single 4-byte
     // buffer triggers "virtio-net ctrl missing headers" and the command
     // is silently rejected.
-    let hdr: [u8; 2] = [
-        4, // class: VIRTIO_NET_CTRL_MQ
-        0, // cmd:   VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET
-    ];
-    let data: [u8; 2] = num_pairs.to_le_bytes();
-    let mut ack: u8 = 0xFF;
-
     unsafe {
-        let hdr_phys = virt_to_phys(hdr.as_ptr());
-        let data_phys = virt_to_phys(data.as_ptr());
-        let ack_phys = virt_to_phys(&ack as *const u8);
+        // Write into the static buffer (guaranteed low-memory / contiguous).
+        let buf_ptr = &raw mut CTRL_MQ_BUF;
+        (*buf_ptr).hdr_class = 4; // VIRTIO_NET_CTRL_MQ
+        (*buf_ptr).hdr_cmd = 0;   // VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET
+        (*buf_ptr).data = num_pairs.to_le_bytes();
+        (*buf_ptr).ack = 0xFF;
+
+        // Descriptor layout: two descriptors. One readable segment
+        // covers class+cmd+data packed contiguously (4 bytes); one
+        // writable segment is the ack byte. GCE's vhost requires the
+        // header-plus-data portion to live in a single contiguous
+        // buffer in low memory — the older "3 separate descriptors"
+        // variant works on QEMU but makes GCE silently halt RX
+        // delivery on all queues. Keeping hdr+data together, ack
+        // separate, matches what legacy Linux virtio-net actually
+        // sends for `virtio_net_ctrl_simple_hdr`.
+        let hdrdata_phys = virt_to_phys(&(*buf_ptr).hdr_class as *const u8);
+        let ack_phys     = virt_to_phys(&(*buf_ptr).ack as *const u8);
 
         (*ndev()).ctrl_queue.add_chain(&[
-            (hdr_phys, 2, false),  // readable: class + cmd
-            (data_phys, 2, false), // readable: num_pairs u16
-            (ack_phys, 1, true),   // writable: ack byte
+            (hdrdata_phys, 4, false), // readable: class + cmd + num_pairs
+            (ack_phys,     1, true),  // writable: ack byte
         ]);
         (*ndev()).ctrl_queue.kick();
 
@@ -452,8 +484,7 @@ fn ctrl_mq_set_pairs(num_pairs: u16) {
         }
         let _ = (*ndev()).ctrl_queue.get_used();
 
-        // Re-read ack through the raw pointer to defeat constant folding.
-        ack = core::ptr::read_volatile(&ack as *const u8);
+        let ack = core::ptr::read_volatile(&(*buf_ptr).ack as *const u8);
         if ack == 0 {
             log(b"virtio_net: MQ activated\n");
         } else {
@@ -463,6 +494,7 @@ fn ctrl_mq_set_pairs(num_pairs: u16) {
         }
     }
 }
+
 
 // ---- MMIO init (aarch64 QEMU) ----------------------------------------------
 
@@ -693,12 +725,20 @@ fn init_legacy_pci() -> bool {
         virtio_write8(io_base + VREG_DEVICE_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
     }
 
-    // Feature negotiation
+    // Feature negotiation. Legacy virtio-pci only exposes word 0
+    // (32 bits), so VIRTIO_F_VERSION_1 (bit 32) is out of reach —
+    // which matches GCE: its virtio-net backend is hard-locked to
+    // legacy v0.95 and rejects modern feature negotiation outright.
+    // MQ (bit 22) and CTRL_VQ (bit 17) live in word 0 and are safe.
     let dev_features = unsafe { virtio_read32(io_base + VREG_DEVICE_FEATURES) };
     let mut guest_features: u32 = 0;
     if (dev_features & VIRTIO_NET_F_MAC) != 0 { guest_features |= VIRTIO_NET_F_MAC; }
     if (dev_features & VIRTIO_NET_F_STATUS) != 0 { guest_features |= VIRTIO_NET_F_STATUS; }
     if (dev_features & VIRTIO_NET_F_MRG_RXBUF) != 0 { guest_features |= VIRTIO_NET_F_MRG_RXBUF; }
+    if (dev_features & VIRTIO_NET_F_MQ) != 0 { guest_features |= VIRTIO_NET_F_MQ; }
+    if (dev_features & VIRTIO_NET_F_CTRL_VQ) != 0 { guest_features |= VIRTIO_NET_F_CTRL_VQ; }
+    let has_mq = (guest_features & VIRTIO_NET_F_MQ) != 0
+              && (guest_features & VIRTIO_NET_F_CTRL_VQ) != 0;
     unsafe { virtio_write32(io_base + VREG_GUEST_FEATURES, guest_features); }
 
     // FEATURES_OK
@@ -713,15 +753,50 @@ fn init_legacy_pci() -> bool {
         }
     }
 
-    // Init RX and TX queues
-    unsafe {
-        if !(*ndev()).rx_queues[0].init_legacy(io_base, 0, false, false) {
-            log(b"virtio_net: failed to init RX queue\n");
-            return false;
+    // Determine how many queue pairs to set up. Device config layout
+    // in legacy mode (MSI-X off, always our case): MAC[6] + STATUS[2]
+    // + max_virtqueue_pairs[2] starts at VREG_DEVICE_CONFIG + 8.
+    #[cfg(target_arch = "x86_64")]
+    let desired_pairs = unsafe { kernel::x86_64::acpi::detect_cpus() as u16 };
+    #[cfg(not(target_arch = "x86_64"))]
+    let desired_pairs = 1u16;
+    let max_pairs = if has_mq {
+        unsafe { virtio_read16(io_base + VREG_DEVICE_CONFIG + 8).max(1) }
+    } else {
+        1
+    };
+    let num_pairs = desired_pairs.min(max_pairs).min(MAX_QUEUE_PAIRS as u16);
+
+    // Queue init order: ALL RX and TX pairs fully allocated and
+    // their PFNs published via VREG_QUEUE_ADDRESS *before* we send
+    // the MQ control command. GCE's backend drops RX delivery if it
+    // sees VQ_PAIRS_SET before every pair's ring is programmed.
+    for pair in 0..num_pairs as usize {
+        let rx_qi = (pair * 2) as u16;
+        let tx_qi = (pair * 2 + 1) as u16;
+        unsafe {
+            if !(*ndev()).rx_queues[pair].init_legacy(io_base, rx_qi, false, false) {
+                log(b"virtio_net: failed to init RX queue\n");
+                return false;
+            }
+            if !(*ndev()).tx_queues[pair].init_legacy(io_base, tx_qi, false, false) {
+                log(b"virtio_net: failed to init TX queue\n");
+                return false;
+            }
         }
-        if !(*ndev()).tx_queues[0].init_legacy(io_base, 1, false, false) {
-            log(b"virtio_net: failed to init TX queue\n");
-            return false;
+    }
+
+    // Control VQ at index 2*max_pairs. Only initialised when we
+    // intend to activate multi-queue — see the vhost-net wedge in
+    // init_pci_modern's comment.
+    let mut has_mq_final = has_mq;
+    if has_mq && num_pairs > 1 {
+        let ctrl_qi = (2 * max_pairs) as u16;
+        unsafe {
+            if !(*ndev()).ctrl_queue.init_legacy(io_base, ctrl_qi, false, false) {
+                log(b"virtio_net: failed to init ctrl queue, falling back to 1 pair\n");
+                has_mq_final = false;
+            }
         }
     }
 
@@ -730,29 +805,46 @@ fn init_legacy_pci() -> bool {
         unsafe { (*ndev()).mac[i as usize] = virtio_read8(io_base + VREG_DEVICE_CONFIG + i); }
     }
 
-    // Allocate RX buffers (no +2 alignment shift on x86)
-    for i in 0..RX_BUFFERS {
-        let buf = kmalloc(BUFFER_SIZE as usize);
-        if buf.is_null() { return false; }
-        unsafe {
-            ptr::write_bytes(buf, 0, VIRTIO_NET_HDR_SIZE);
-            (*ndev()).qp_state[0].rx_buffers[i] = buf;
-            let buf_phys = virt_to_phys(buf);
-            (*ndev()).rx_queues[0].add_buf(buf_phys, BUFFER_SIZE, 0, 1);
+    // Populate RX buffers for every queue pair (kick happens after
+    // DRIVER_OK; the virtio spec says pre-DRIVER_OK kicks are
+    // undefined and some backends drop them).
+    for pair in 0..num_pairs as usize {
+        for i in 0..RX_BUFFERS {
+            let buf = kmalloc(BUFFER_SIZE as usize);
+            if buf.is_null() { return false; }
+            unsafe {
+                ptr::write_bytes(buf, 0, VIRTIO_NET_HDR_SIZE);
+                (*ndev()).qp_state[pair].rx_buffers[i] = buf;
+                let buf_phys = virt_to_phys(buf);
+                (*ndev()).rx_queues[pair].add_buf(buf_phys, BUFFER_SIZE, 0, 1);
+            }
         }
     }
 
-    unsafe { (*ndev()).rx_queues[0].kick(); }
-
-    // DRIVER_OK
+    // DRIVER_OK — queues must be fully set up by this point.
     unsafe {
         virtio_write8(io_base + VREG_DEVICE_STATUS,
                       STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
     }
 
+    for pair in 0..num_pairs as usize {
+        unsafe { (*ndev()).rx_queues[pair].kick(); }
+    }
+
     unsafe {
         (*ndev()).transport = Transport::LegacyPci { base: io_base, pci_idx };
         (*ndev()).guest_features = guest_features;
+        // DHCP needs single-queue (it only polls qp 0); boot/entry
+        // later calls activate_multi_queue() to promote to N pairs.
+        (*ndev()).num_queue_pairs = 1;
+        (*ndev()).negotiated_queue_pairs = num_pairs;
+        (*ndev()).has_mq = has_mq_final && num_pairs > 1;
+    }
+
+    if num_pairs > 1 {
+        log(b"virtio_net: multi-queue available: ");
+        log(&[b'0' + (num_pairs as u8 % 10)]);
+        log(b" pairs (legacy PCI, deferred until after DHCP)\n");
     }
     log(b"virtio_net: initialization complete (legacy PCI)\n");
     true
