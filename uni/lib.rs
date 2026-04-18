@@ -223,6 +223,27 @@ pub fn udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
     net::udp::bind(port, handler);
 }
 
+/// Per-queue RX frame counts. Indexed by queue-pair number; zeros
+/// for unused queues. Useful for debugging RSS / flow-hash imbalance
+/// under Tier 1 multi-queue. Max array size matches the driver's
+/// MAX_QUEUE_PAIRS (8); consumers should take `[..num_queue_pairs()]`
+/// or just ignore the tail zeros.
+#[cfg(platform_unikernel)]
+pub fn net_rx_counts() -> [u64; 8] {
+    drivers::virtio_net::rx_counts()
+}
+#[cfg(platform_native)]
+pub fn net_rx_counts() -> [u64; 8] { [0; 8] }
+
+/// Number of virtio-net queue pairs actually active (after MQ
+/// activation on Tier 1 paths). 1 for single-queue / Tier 2.
+#[cfg(platform_unikernel)]
+pub fn net_num_queue_pairs() -> u16 {
+    drivers::virtio_net::num_queue_pairs()
+}
+#[cfg(platform_native)]
+pub fn net_num_queue_pairs() -> u16 { 1 }
+
 /// Send a UDP datagram.
 #[cfg(platform_unikernel)]
 pub fn udp_send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {

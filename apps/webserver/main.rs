@@ -59,8 +59,57 @@ Network backend\n\
 
 const HEALTH_JSON: &[u8] = b"{\"status\":\"ok\",\"runtime\":\"unikernel\",\"version\":\"0.1.0\"}";
 
-const STATS_JSON: &[u8] =
-    b"{\"connections_active\":0,\"total_requests\":0,\"memory_free_mb\":0,\"uptime_seconds\":0}";
+// /stats returns per-queue RX frame counts so we can see how the
+// virtio-net device is distributing flows across queue pairs under
+// Tier 1 multi-queue. A diagnostic response — not a production
+// dashboard. One buffer per core so two concurrent handlers don't
+// race on the same scratch.
+const STATS_BUF_LEN: usize = 512;
+struct StatsSlot(UnsafeCell<[u8; STATS_BUF_LEN]>);
+unsafe impl Sync for StatsSlot {}
+static STATS_BUFS: [StatsSlot; MAX_CORES] =
+    [const { StatsSlot(UnsafeCell::new([0u8; STATS_BUF_LEN])) }; MAX_CORES];
+
+fn stats_response() -> Response {
+    let id = (uni::cpu_id() as usize) % MAX_CORES;
+    // SAFETY: per-core slot, handler + send_response run back-to-back
+    // on one core without yielding.
+    let buf: &mut [u8; STATS_BUF_LEN] = unsafe { &mut *STATS_BUFS[id].0.get() };
+    let counts = uni::net_rx_counts();
+    let nqp = uni::net_num_queue_pairs() as usize;
+    let n = fmt_stats(buf, &counts, nqp);
+    Response::ok(b"application/json", &buf[..n])
+}
+
+fn fmt_stats(buf: &mut [u8], counts: &[u64; 8], nqp: usize) -> usize {
+    let mut n = 0;
+    let prefix = b"{\"rx_frames\":[";
+    buf[..prefix.len()].copy_from_slice(prefix);
+    n += prefix.len();
+    for i in 0..nqp.min(counts.len()) {
+        if i > 0 { buf[n] = b','; n += 1; }
+        n += fmt_u64(&mut buf[n..], counts[i]);
+    }
+    let suffix = b"],\"num_queue_pairs\":";
+    buf[n..n + suffix.len()].copy_from_slice(suffix);
+    n += suffix.len();
+    n += fmt_u64(&mut buf[n..], nqp as u64);
+    buf[n] = b'}';
+    n + 1
+}
+
+fn fmt_u64(buf: &mut [u8], mut v: u64) -> usize {
+    if v == 0 { buf[0] = b'0'; return 1; }
+    let mut tmp = [0u8; 20];
+    let mut len = 0;
+    while v > 0 {
+        tmp[len] = b'0' + (v % 10) as u8;
+        v /= 10;
+        len += 1;
+    }
+    for i in 0..len { buf[i] = tmp[len - 1 - i]; }
+    len
+}
 
 /// CPU-intensive work: iterative hash (FNV-1a, 100K iterations).
 /// Dominates per-request cost, making multi-core distribution visible.
@@ -117,7 +166,7 @@ fn handle_request(req: &Request) -> Response {
     match req.path() {
         b"/" => Response::ok(b"text/html", INDEX_HTML),
         b"/health" => Response::ok(b"application/json", HEALTH_JSON),
-        b"/stats" => Response::ok(b"application/json", STATS_JSON),
+        b"/stats" => stats_response(),
         b"/compute" => {
             // black_box prevents the compiler from eliminating compute_work()
             // as dead code (the return value would otherwise be unused).

@@ -1091,6 +1091,22 @@ pub fn poll(
     poll_qp(0, callback)
 }
 
+/// Per-queue RX counters. Incremented once per consumed frame.
+/// Read via `rx_counts()` from app code (e.g. the /stats handler)
+/// to see which queues are actually getting traffic — useful for
+/// diagnosing RSS / flow-hash distribution under Tier 1 MQ.
+static RX_COUNTS: [core::sync::atomic::AtomicU64; MAX_QUEUE_PAIRS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_QUEUE_PAIRS];
+
+/// Snapshot of per-queue RX frame counts.
+pub fn rx_counts() -> [u64; MAX_QUEUE_PAIRS] {
+    let mut out = [0u64; MAX_QUEUE_PAIRS];
+    for i in 0..MAX_QUEUE_PAIRS {
+        out[i] = RX_COUNTS[i].load(core::sync::atomic::Ordering::Relaxed);
+    }
+    out
+}
+
 /// Poll a specific queue pair for received frames.
 pub fn poll_qp(qp: usize, callback: fn(&[u8])) -> i32 {
     unsafe {
@@ -1136,6 +1152,12 @@ pub fn poll_qp(qp: usize, callback: fn(&[u8])) -> i32 {
 
         if count > 0 {
             (*ndev()).rx_queues[qp].kick();
+            if qp < MAX_QUEUE_PAIRS {
+                RX_COUNTS[qp].fetch_add(
+                    count as u64,
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+            }
         }
     }
 
