@@ -56,11 +56,6 @@ static RX_LOCK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::n
 static JUST_DISTRIBUTED: [core::sync::atomic::AtomicBool; percpu::MAX_CORES] =
     [const { core::sync::atomic::AtomicBool::new(false) }; percpu::MAX_CORES];
 
-/// Diagnostic counters.
-static RX_LOCK_GOT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static RX_LOCK_MISS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static FRAMES_DISTRIBUTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
 
 /// Poll the network device and dispatch received frames through the
 /// full stack: Ethernet -> ARP/IPv4 -> TCP/UDP.
@@ -138,10 +133,8 @@ fn poll_tier2(num_cores: u32) -> bool {
         )
         .is_ok();
     if !got_lock {
-        RX_LOCK_MISS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         return false;
     }
-    RX_LOCK_GOT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
     // Flush TX staging first — responses from previous cycle.
     drivers::virtio_net::flush_tx_staging();
@@ -165,7 +158,6 @@ fn poll_tier2(num_cores: u32) -> bool {
 
     let had_frames = count > 0;
     if had_frames {
-        FRAMES_DISTRIBUTED.fetch_add(count as u64, core::sync::atomic::Ordering::Relaxed);
         // Wake only the specific cores that received inbox data.
         // Broadcast wake_cores() is expensive on HVF: each SGI causes
         // a WFI wake (~5µs) on every core, even if it has no work.
