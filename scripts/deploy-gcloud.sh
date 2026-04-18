@@ -139,81 +139,61 @@ qemu_test() {
 
 # --- Upload + image create + VM launch ---
 #
-# Deploy DAG (wall-time drops from ~2 min sequential to ~40 s):
+# Deploy DAG (overlaps the independent operations instead of running
+# strictly sequentially):
 #
-#   bucket ensure                (fast, fires upload + deletes)
-#   ├── gsutil cp tarball          ──┐
-#   ├── images delete (stale)      ──┤          ┌─ instance delete
-#   └──────────────────────────┘    │          │
-#   wait upload + img-del           │          │
-#   │                               │          │
-#   ├─ images create                │          │
-#   │                               │          │
-#   wait img-create + vm-del ───────┴──────────┘
-#   │
-#   instances create
+#   upload  ┐
+#   img-del ┼── wait → images create ──┐
+#   vm-del  ┘                          │
+#           └──────── still running ───┤
+#                                     wait → instances create
 #
-# The old VM's boot disk was cloned from the old image at
-# instance-create time; tearing down both concurrently is safe.
-# Image create only depends on upload + the old image being gone;
-# instance create is the only step that depends on the old VM
-# being gone, so it's worth letting image create start early.
+# `images create` is a ~2 min GCP-backend import we can't shrink from
+# the guest side; everything else is <30 s. Overlapping VM delete
+# with image create saves the one chunk of wall time we have control
+# over. The old VM's boot disk was cloned from the old image at
+# instance-create time, so tearing them down concurrently is safe.
+# For fast local iteration use `scripts/gcp.sh serve` — it pushes the
+# ELF to kvm-vm and reloads in ~5 s.
 deploy() {
     _require_project
     echo "==> GCP project: $PROJECT   zone: $ZONE   machine: $MACHINE_TYPE"
 
-    # Seconds-since-start helper for per-stage timing. macOS `date`
-    # lacks `+%N`, and we don't need sub-second precision anyway.
-    local t0 t_prev
-    t0=$(date +%s)
-    t_prev=$t0
-    _tstep() {
-        local now label="$1"
-        now=$(date +%s)
-        echo "    [t+$(( now - t0 ))s Δ$(( now - t_prev ))s] $label"
-        t_prev=$now
-    }
-
     echo "==> Ensuring GCS bucket: gs://$BUCKET"
     gsutil ls "gs://$BUCKET" >/dev/null 2>&1 \
         || gsutil mb -l "${ZONE%-*}" "gs://$BUCKET"
-    _tstep "bucket check"
 
     # Fire the three independent teardown / upload operations in
     # parallel. All are idempotent and safe to run unconditionally.
-    # Each backgrounded block reports its own completion timestamp.
+    # (Image create is the ~2 min GCP backend import step — nothing
+    # we can do guest-side to shrink it; we at least overlap VM
+    # delete with it below.)
     echo "==> Upload + cleanup (parallel) ..."
-    local par_start=$t_prev
     (
-        gsutil -q cp "$TARBALL" "gs://$BUCKET/${TARBALL_NAME}"
-        echo "    [+$(( $(date +%s) - par_start ))s] upload: done"
+        gsutil -q cp "$TARBALL" "gs://$BUCKET/${TARBALL_NAME}" \
+            && echo "    upload: done"
     ) &
     local upload_pid=$!
     (
-        if gcloud compute instances delete "$NAME" \
-               --zone="$ZONE" --project="$PROJECT" --quiet \
-               >/dev/null 2>&1; then
-            echo "    [+$(( $(date +%s) - par_start ))s] vm delete: done"
-        else
-            echo "    [+$(( $(date +%s) - par_start ))s] vm delete: (not present)"
-        fi
+        gcloud compute instances delete "$NAME" \
+            --zone="$ZONE" --project="$PROJECT" --quiet \
+            >/dev/null 2>&1 \
+            && echo "    vm delete: done" \
+            || echo "    vm delete: (not present)"
     ) &
     local vm_del_pid=$!
     (
-        if gcloud compute images delete "$IMAGE_NAME" \
-               --project="$PROJECT" --quiet \
-               >/dev/null 2>&1; then
-            echo "    [+$(( $(date +%s) - par_start ))s] image delete: done"
-        else
-            echo "    [+$(( $(date +%s) - par_start ))s] image delete: (not present)"
-        fi
+        gcloud compute images delete "$IMAGE_NAME" \
+            --project="$PROJECT" --quiet \
+            >/dev/null 2>&1 \
+            && echo "    image delete: done" \
+            || echo "    image delete: (not present)"
     ) &
     local img_del_pid=$!
 
     # Image create waits only for upload + old-image-gone; VM delete
     # keeps running in parallel with image creation.
     wait "$upload_pid" "$img_del_pid"
-    _tstep "upload + image-delete"
 
     # UEFI_COMPATIBLE lets the image boot on OVMF-backed machine types
     # (c3, t2a, anything Arm). The Limine ISO carries both BIOS and
@@ -225,11 +205,9 @@ deploy() {
         --guest-os-features=UEFI_COMPATIBLE \
         --project="$PROJECT" \
         --quiet
-    _tstep "image create"
 
     # Instance create needs the old VM gone too.
     wait "$vm_del_pid"
-    _tstep "wait for vm-delete"
 
     echo "==> Launching VM: $NAME"
     # queue-count=2 asks the vNIC backend to expose two virtio-net
@@ -250,7 +228,6 @@ deploy() {
         --metadata=serial-port-enable=TRUE \
         --project="$PROJECT" \
         --quiet
-    _tstep "instance create"
 
     gcloud compute firewall-rules create allow-http-unikernel \
         --allow=tcp:80,tcp:443 \
@@ -434,13 +411,7 @@ purge() {
 case "$MODE" in
     build-only)  build_disk ;;
     qemu-test)   build_disk; qemu_test ;;
-    deploy)
-        _deploy_t0=$(date +%s)
-        build_disk
-        echo "    [build_disk: $(( $(date +%s) - _deploy_t0 ))s]"
-        deploy
-        echo "==> Total deploy wall time: $(( $(date +%s) - _deploy_t0 ))s"
-        ;;
+    deploy)      build_disk; deploy ;;
     serial)      read_serial ;;
     logs)        tail_serial ;;
     status)      show_status ;;
