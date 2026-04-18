@@ -59,8 +59,24 @@ const ADMINQ_SIZE: usize = 4096; // single page, required by PFN addressing
 const ADMINQ_SLOTS: usize = 64;  // ADMINQ_SIZE / sizeof(AdminqCommand)
 const CMD_SIZE: usize = 64;
 
-// Admin queue opcodes (only the ones Phase 1 needs are named).
+// Admin queue opcodes (names match the enum in the reference
+// driver's `gve_adminq.h`). We only use a subset.
 const OP_DESCRIBE_DEVICE: u32 = 0x1;
+const OP_CONFIGURE_DEVICE_RESOURCES: u32 = 0x2;
+const OP_REGISTER_PAGE_LIST: u32 = 0x3;
+const OP_CREATE_TX_QUEUE: u32 = 0x5;
+const OP_CREATE_RX_QUEUE: u32 = 0x6;
+
+/// Marker for GQI_RDA mode (raw DMA addressing). In QPL mode the
+/// `queue_page_list_id` field of CREATE_*_QUEUE is the real QPL id
+/// we got from REGISTER_PAGE_LIST.
+const GVE_RAW_ADDRESSING_QPL_ID: u32 = 0xFFFFFFFF;
+
+/// Values for `CONFIGURE_DEVICE_RESOURCES.queue_format`.
+const QF_GQI_RDA: u8 = 0x1;
+const QF_GQI_QPL: u8 = 0x2;
+const QF_DQO_RDA: u8 = 0x3;
+const QF_DQO_QPL: u8 = 0x4;
 
 // Adminq completion statuses.
 const STATUS_UNSET: u32 = 0x0;
@@ -131,6 +147,107 @@ struct State {
     rx_queue_entries: u16,
     default_num_queues: u16,
     mtu: u16,
+    /// Number of event counters the device advertises. Sized by
+    /// DESCRIBE_DEVICE's `counters` field. CONFIGURE_DEVICE_RESOURCES
+    /// allocates a DMA array of this size that the device writes
+    /// TX-completion counters into.
+    num_event_counters: u16,
+    /// Phase 2 resources — filled once CONFIGURE_DEVICE_RESOURCES
+    /// succeeds. `None` between DESCRIBE_DEVICE and that point.
+    resources: Option<DeviceResources>,
+    /// TX / RX queues (one pair for Phase 2; later phases grow this
+    /// into per-core arrays).
+    tx: Option<TxQueue>,
+    rx: Option<RxQueue>,
+}
+
+/// Device-wide resources negotiated via CONFIGURE_DEVICE_RESOURCES.
+/// The device owns these DMA regions for its lifetime; the driver
+/// just tells it where they live.
+struct DeviceResources {
+    /// Counter array (device writes per-TX-queue completion counts
+    /// and other stats here). One 32-bit counter per slot.
+    counter_array_va: u64,
+    counter_array_phys: u64,
+    /// IRQ doorbell block. Even though we're polling, the device
+    /// requires a valid IRQ doorbell region and per-queue index.
+    /// Each entry is a cache-line-aligned `u32` the device reads to
+    /// decide whether to raise MSI-X.
+    irq_db_va: u64,
+    irq_db_phys: u64,
+    /// Virtual address of BAR2 (per-queue doorbell register window).
+    /// `queue_resources->db_index * 4` is the byte offset of a given
+    /// queue's doorbell here.
+    bar2_va: u64,
+}
+
+/// Per-queue TX metadata. GQI_QPL format: outbound packets are
+/// memcpy'd into a pre-registered Queue Page List, and the
+/// descriptor carries an offset into that list (not a DMA address).
+struct TxQueue {
+    /// Descriptor ring — one page of 256 × 16-byte `gve_tx_pkt_desc`.
+    /// (We size at `min(tx_queue_entries, 256)` so it fits in 4 KiB.)
+    /// Stored as a VA; the device holds the physical address it was
+    /// given via CREATE_TX_QUEUE.
+    ring_va: u64,
+    ring_entries: u16,
+    /// Queue-resources page. The device populates
+    /// `{db_index, counter_index}` here right after CREATE_TX_QUEUE
+    /// returns so the driver can find its doorbell / counter slot.
+    qres_va: u64,
+    /// QPL backing storage — contiguous pages the device sees as a
+    /// linear byte range; our TX packets live here for the device to
+    /// read. Phase 2 uses a single contiguous alloc for simplicity.
+    qpl_base_va: u64,
+    qpl_base_phys: u64,
+    qpl_size: u32, // bytes
+    qpl_id: u32,   // returned by REGISTER_PAGE_LIST
+    /// Doorbell offset into BAR2 (bytes). Set once we read back the
+    /// `db_index` the device wrote into `qres_va`.
+    db_offset: u32,
+    counter_index: u32,
+    /// Monotonically-increasing packet producer counter. Written to
+    /// the TX doorbell after submitting.
+    fill_cnt: u32,
+    /// Last-seen value of `counter_array[counter_index]`. Drives
+    /// TX buffer recycling.
+    done_cnt: u32,
+    /// Bytes used in the QPL FIFO ahead of what's been completed.
+    /// Packets pack sequentially and wrap.
+    qpl_head: u32,
+    qpl_avail: u32,
+}
+
+/// Per-queue RX metadata. Also QPL-backed: incoming frames are
+/// DMA'd into pre-registered pages; the completion descriptor
+/// tells us which offset.
+struct RxQueue {
+    /// Completion descriptor ring — `ring_entries × 64` bytes.
+    compl_va: u64,
+    /// Data-slot ring — `ring_entries × 8` bytes. Slot `i` holds
+    /// a big-endian QPL offset the device will write buffer `i` to.
+    data_va: u64,
+    ring_entries: u16,
+    /// Queue-resources page (same layout as TX).
+    qres_va: u64,
+    /// RX QPL backing storage. Big: 1024 pages = 4 MiB on GCE.
+    qpl_base_va: u64,
+    qpl_base_phys: u64,
+    qpl_size: u32,
+    qpl_id: u32,
+    /// Doorbell for advancing the RX data-ring fill counter — we
+    /// write the total number of posted slots here (monotonic).
+    db_offset: u32,
+    counter_index: u32,
+    /// How many slots have been advertised to the device (matches
+    /// the value last written to the RX doorbell).
+    fill_cnt: u32,
+    /// How many completions we've consumed. Phase 2b drives this.
+    cons_cnt: u32,
+    /// Expected `flags_seq` sequence byte (low 3 bits, cycles 1..7;
+    /// 0 is reserved). Used to detect new completions without
+    /// reading a separate producer index.
+    expected_seq: u8,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -295,6 +412,10 @@ pub fn init() -> bool {
             rx_queue_entries: 0,
             default_num_queues: 0,
             mtu: 0,
+            num_event_counters: 0,
+            resources: None,
+            tx: None,
+            rx: None,
         });
     }
 
@@ -304,8 +425,42 @@ pub fn init() -> bool {
         return false;
     }
 
+    // ── Phase 2: bring up one TX + one RX queue in GQI_QPL mode ──────────
+    //
+    // Everything below is speculative until we've confirmed the
+    // advertised queue format is one we support. GCE currently
+    // advertises GQI_QPL only (see reference_gce_gvnic.md); we
+    // error out for anything else.
+    let fmt = STATE.lock().as_ref().and_then(|s| s.queue_format);
+    match fmt {
+        Some(QueueFormat::GqiQpl) => {}
+        Some(_) => {
+            log(b"[gvnic] only GQI_QPL supported in Phase 2 - aborting\n");
+            return false;
+        }
+        None => return false,
+    }
+
+    let bar2_phys = pci::read_bar64(&dev, 2);
+    if bar2_phys == 0 {
+        log(b"[gvnic] BAR2 is zero - cannot reach per-queue doorbells\n");
+        return false;
+    }
+    let bar2_va = phys_to_virt(bar2_phys) as u64;
+
+    if !configure_device_resources(bar2_va) {
+        return false;
+    }
+
+    if !create_tx_qp0() {
+        return false;
+    }
+    if !create_rx_qp0() {
+        return false;
+    }
+
     GVNIC_OK.store(true, Ordering::Release);
-    log(b"[gvnic] admin queue up, DESCRIBE_DEVICE ok\n");
+    log(b"[gvnic] admin queue up, queues up\n");
     true
 }
 
@@ -387,10 +542,15 @@ fn parse_device_descriptor(desc_virt: *mut u8) -> bool {
     let header_len = 40;
     let header: &[u8] = unsafe { core::slice::from_raw_parts(desc_virt, header_len) };
 
+    let max_registered_pages = u64::from_be_bytes([
+        header[0], header[1], header[2], header[3],
+        header[4], header[5], header[6], header[7],
+    ]);
     let tx_entries = get_be16(header, 10);
     let rx_entries = get_be16(header, 12);
     let default_num_queues = get_be16(header, 14);
     let mtu = get_be16(header, 16);
+    let counters = get_be16(header, 18);
     let rx_pages_per_qpl = get_be16(header, 22);
     let mut mac = [0u8; 6];
     mac.copy_from_slice(&header[24..30]);
@@ -405,8 +565,12 @@ fn parse_device_descriptor(desc_virt: *mut u8) -> bool {
     log_u32(tx_entries as u32);
     log(b" rx_entries=");
     log_u32(rx_entries as u32);
+    log(b" counters=");
+    log_u32(counters as u32);
     log(b" rx_pages_per_qpl=");
     log_u32(rx_pages_per_qpl as u32);
+    log(b" max_registered_pages=");
+    log_u32(max_registered_pages as u32);
     log(b"\n");
     log(b"[gvnic] mac=");
     log_mac(&mac);
@@ -455,6 +619,32 @@ fn parse_device_descriptor(desc_virt: *mut u8) -> bool {
             });
         }
 
+        // MODIFY_RING (option id 6, len 12): tells us the allowed
+        // min/max ring sizes. The device rejects CREATE_*_QUEUE
+        // with INVALID_ARGUMENT when the ring size is out of this
+        // range, so log it so sizing decisions have numbers behind
+        // them. Payload layout:
+        //   u32 supported_features_mask
+        //   u16 max_rx, u16 max_tx
+        //   u16 min_rx, u16 min_tx
+        if id == 6 && len == 12 && offset + 8 + 12 <= end {
+            let payload: &[u8] =
+                unsafe { core::slice::from_raw_parts(desc_virt.add(offset + 8), 12) };
+            let max_rx = get_be16(payload, 4);
+            let max_tx = get_be16(payload, 6);
+            let min_rx = get_be16(payload, 8);
+            let min_tx = get_be16(payload, 10);
+            log(b"[gvnic]   MODIFY_RING min_rx=");
+            log_u32(min_rx as u32);
+            log(b" max_rx=");
+            log_u32(max_rx as u32);
+            log(b" min_tx=");
+            log_u32(min_tx as u32);
+            log(b" max_tx=");
+            log_u32(max_tx as u32);
+            log(b"\n");
+        }
+
         offset += 8 + len;
     }
 
@@ -474,6 +664,7 @@ fn parse_device_descriptor(desc_virt: *mut u8) -> bool {
         s.rx_queue_entries = rx_entries;
         s.default_num_queues = default_num_queues;
         s.mtu = mtu;
+        s.num_event_counters = counters;
         s.queue_format = best;
     }
     true
@@ -527,6 +718,30 @@ fn submit_and_wait(cmd: &AdminqCommand) -> bool {
     false
 }
 
+/// Submit `cmd`, wait for the device, and check that the
+/// per-command status is PASSED. Logs and returns false on any
+/// failure (timeout or non-zero status). Used by every admin-queue
+/// command after DESCRIBE_DEVICE.
+fn execute_cmd(opcode_label: &[u8], cmd: &AdminqCommand) -> bool {
+    if !submit_and_wait(cmd) {
+        log(b"[gvnic] ");
+        log(opcode_label);
+        log(b": timeout\n");
+        return false;
+    }
+    let slot = current_slot_before_kick();
+    let status = unsafe { read_slot_status(slot) };
+    if status != STATUS_PASSED {
+        log(b"[gvnic] ");
+        log(opcode_label);
+        log(b": status=");
+        log_hex32(status);
+        log(b"\n");
+        return false;
+    }
+    true
+}
+
 fn current_slot_before_kick() -> usize {
     // After submit_and_wait returns, the slot we just used is
     // (prod_cnt - 1) & mask. Read it back to pick up the device's
@@ -542,6 +757,424 @@ unsafe fn read_slot_status(slot_idx: usize) -> u32 {
     let slot_ptr = (s.adminq_va as *const AdminqCommand).wrapping_add(slot_idx);
     let slot = unsafe { &*slot_ptr };
     get_be32(&slot.bytes, 4)
+}
+
+/// Read a field the device wrote into a DMA-coherent buffer the
+/// driver allocated. Equivalent to `ptr::read_volatile` on the byte
+/// range. Having this as a named helper makes the descriptor-
+/// parsing sites easier to audit — each one is "device wrote here".
+#[inline]
+unsafe fn slice_at<'a>(va: u64, len: usize) -> &'a [u8] {
+    unsafe { core::slice::from_raw_parts(va as *const u8, len) }
+}
+
+// ---- Phase 2: resource + queue bring-up -----------------------------------
+//
+// These issue the sequence of admin-queue commands that takes the
+// device from "admin queue up" to "one TX + one RX queue usable".
+// No packets flow yet; Phase 2b adds the datapath.
+//
+// Wire-level command layouts are documented inline at each builder
+// so the admin-queue reference file doesn't have to be open to
+// follow along. Sizes + field offsets are from the FreeBSD
+// `gve_adminq.h`; the payload lives at offset 8 within the 64-byte
+// command (opcode + status + 56 bytes of per-command data).
+
+/// IRQ doorbell entry stride. The device treats each doorbell as a
+/// cache-line-aligned `u32`, which on all our targets is 64 bytes.
+const IRQ_DB_STRIDE: u32 = 64;
+
+/// TX + RX ring sizes — must be within the MODIFY_RING option's
+/// advertised [min, max]. On GCE n2-standard-2 that's [256, 2048]
+/// for TX and [512, 2048] for RX. Picking the minimum keeps the
+/// per-queue DMA footprint small: with a GQI_QPL RX QPL at one
+/// page per entry, 1024 entries means 4 MiB of RX buffers (and the
+/// device rejected that registration with FAILED_PRECONDITION on
+/// our side). 512 / 256 keeps the driver happy and is plenty for
+/// a single-queue bring-up.
+const TX_RING_ENTRIES: u16 = 256;
+const RX_RING_ENTRIES: u16 = 512;
+/// RX buffer size in bytes (matches GVE_DEFAULT_RX_BUFFER_SIZE =
+/// 2048 from the reference driver; one packet per buffer).
+const RX_BUFFER_SIZE: u16 = 2048;
+/// 2-byte padding the device inserts before the Ethernet frame so
+/// the IP header lands 4-byte-aligned in the RX buffer.
+const _GVE_RX_PAD: u16 = 2;
+
+/// TX QPL size in pages. `tx_desc_cnt / GVE_QPL_DIVISOR` from the
+/// reference driver = 1024 / 16 = 64 pages = 256 KiB of TX staging.
+const TX_QPL_PAGES: u32 = 64;
+/// RX QPL size in pages. The reference driver allocates
+/// `rx_desc_cnt` pages — one full page per ring entry, even though
+/// each packet only uses the first 2 KiB of that page. Smaller
+/// allocations are silently rejected by the device with
+/// FAILED_PRECONDITION. `rx_pages_per_qpl = 1024` in the device
+/// descriptor matches `rx_desc_cnt`, confirming this 1:1 sizing.
+const RX_QPL_PAGES: u32 = RX_RING_ENTRIES as u32;
+
+const PAGE_SIZE: u32 = 4096;
+
+/// QPL IDs the driver assigns to itself. The spec just requires
+/// uniqueness across live QPLs, so small integers work.
+const TX_QPL_ID: u32 = 0;
+const RX_QPL_ID: u32 = 1;
+
+/// Notification-block ids used in Phase 2. TX queues get the first
+/// `num_tx` ids, RX queues get the next `num_rx`. That matches
+/// how the reference driver lays them out and avoids collisions
+/// (two queues can't share the same ntfy_id — the device rejects
+/// the second CREATE with INVALID_ARGUMENT).
+const NTFY_ID_TX_QP0: u32 = 0;
+const NTFY_ID_RX_QP0: u32 = 1;
+
+fn configure_device_resources(bar2_va: u64) -> bool {
+    // Pull the device-advertised counter count out of state. This is
+    // the value we must match — Linux passes this straight through
+    // to the admin-queue command. Hardcoding a number here once
+    // caused the device to reject the command with INVALID_ARGUMENT.
+    let num_event_counters = {
+        let st = STATE.lock();
+        st.as_ref().map(|s| s.num_event_counters).unwrap_or(0)
+    } as u32;
+    if num_event_counters == 0 {
+        log(b"[gvnic] device advertised zero event counters\n");
+        return false;
+    }
+
+    // Allocate counter array + irq-db array. Both live for the
+    // lifetime of the driver; we never unregister them.
+    let counter_phys = alloc_pages(1);
+    if counter_phys == 0 {
+        log(b"[gvnic] failed to alloc counter array\n");
+        return false;
+    }
+    let counter_va = phys_to_virt(counter_phys) as u64;
+    unsafe { ptr::write_bytes(counter_va as *mut u8, 0, PAGE_SIZE as usize); }
+
+    // IRQ-db array: one entry per notification block. Each entry is
+    // IRQ_DB_STRIDE bytes (a full cache line) to avoid false sharing
+    // between the device's writes. Size at 2 × 64 = 128 B; rounds
+    // up to one page.
+    let irq_db_phys = alloc_pages(1);
+    if irq_db_phys == 0 {
+        log(b"[gvnic] failed to alloc irq-db array\n");
+        return false;
+    }
+    let irq_db_va = phys_to_virt(irq_db_phys) as u64;
+    unsafe { ptr::write_bytes(irq_db_va as *mut u8, 0, PAGE_SIZE as usize); }
+
+    // Build CONFIGURE_DEVICE_RESOURCES. Payload layout (40 bytes
+    // at offset 8 of the command):
+    //
+    //   u64  counter_array (be, DMA)
+    //   u64  irq_db_addr   (be, DMA)
+    //   u32  num_counters  (be)
+    //   u32  num_irq_dbs   (be)
+    //   u32  irq_db_stride (be, 64 for our cache-line layout)
+    //   u32  ntfy_blk_msix_base_idx (be, = 0 when we don't use MSI-X)
+    //   u8   queue_format
+    //   u8[7] padding
+    let mut cmd = AdminqCommand::ZERO;
+    put_be32(&mut cmd.bytes, 0, OP_CONFIGURE_DEVICE_RESOURCES);
+    put_be64(&mut cmd.bytes, 8, counter_phys);
+    put_be64(&mut cmd.bytes, 16, irq_db_phys);
+    put_be32(&mut cmd.bytes, 24, num_event_counters);
+    // num_irq_dbs = one notification block per active queue. Phase 2
+    // creates 1 TX + 1 RX = 2 queues, so 2 blocks. Linux passes
+    // `num_ntfy_blks` which is sized by MSI-X; we poll-only but the
+    // device still wants a valid count here matching the irq-db
+    // array we allocated.
+    put_be32(&mut cmd.bytes, 28, 2);
+    put_be32(&mut cmd.bytes, 32, IRQ_DB_STRIDE);
+    put_be32(&mut cmd.bytes, 36, 0);
+    cmd.bytes[40] = QF_GQI_QPL;
+
+    if !execute_cmd(b"CONFIGURE_DEVICE_RESOURCES", &cmd) {
+        return false;
+    }
+
+    let mut st = STATE.lock();
+    if let Some(s) = st.as_mut() {
+        s.resources = Some(DeviceResources {
+            counter_array_va: counter_va,
+            counter_array_phys: counter_phys,
+            irq_db_va,
+            irq_db_phys,
+            bar2_va,
+        });
+    }
+    log(b"[gvnic] device resources configured\n");
+    true
+}
+
+/// Register `num_pages` physically-contiguous pages starting at
+/// `base_phys` as a new QPL with `page_list_id`. Returns false if
+/// the device rejects the registration.
+fn register_page_list(page_list_id: u32, base_phys: u64, num_pages: u32) -> bool {
+    // The device wants an array of per-page DMA addresses (be64
+    // each) in a separate DMA-coherent buffer. 8 bytes per page,
+    // rounded up. A 1024-page RX QPL needs 2 pages here.
+    let list_bytes = (num_pages as usize) * 8;
+    let list_pages = (list_bytes + (PAGE_SIZE as usize) - 1) / (PAGE_SIZE as usize);
+    let page_addrs_phys = alloc_pages(list_pages);
+    if page_addrs_phys == 0 {
+        log(b"[gvnic] failed to alloc page-address list\n");
+        return false;
+    }
+    let page_addrs_va = phys_to_virt(page_addrs_phys);
+    unsafe { ptr::write_bytes(page_addrs_va, 0, list_pages * PAGE_SIZE as usize); }
+
+    // Fill in the per-page addresses. The QPL is contiguous, so
+    // the i-th page is at base_phys + i*4096.
+    for i in 0..num_pages as usize {
+        let page_addr = base_phys + (i as u64) * (PAGE_SIZE as u64);
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&page_addr.to_be_bytes());
+        unsafe {
+            ptr::copy_nonoverlapping(
+                buf.as_ptr(),
+                (page_addrs_va as *mut u8).add(i * 8),
+                8,
+            );
+        }
+    }
+
+    // Payload layout (24 bytes at offset 8):
+    //   u32  page_list_id (be)
+    //   u32  num_pages    (be)
+    //   u64  page_address_list_addr (be, DMA)
+    //   u64  page_size    (be, 4096)
+    let mut cmd = AdminqCommand::ZERO;
+    put_be32(&mut cmd.bytes, 0, OP_REGISTER_PAGE_LIST);
+    put_be32(&mut cmd.bytes, 8, page_list_id);
+    put_be32(&mut cmd.bytes, 12, num_pages);
+    put_be64(&mut cmd.bytes, 16, page_addrs_phys);
+    put_be64(&mut cmd.bytes, 24, PAGE_SIZE as u64);
+
+    if !execute_cmd(b"REGISTER_PAGE_LIST", &cmd) {
+        return false;
+    }
+    true
+}
+
+/// Allocate a contiguous physical region of `num_pages` 4 KiB pages.
+/// Returns (phys, va). Both will be nonzero on success; logs + returns
+/// (0, 0) on failure.
+fn alloc_contig(num_pages: usize) -> (u64, u64) {
+    let phys = alloc_pages(num_pages);
+    if phys == 0 {
+        return (0, 0);
+    }
+    let va = phys_to_virt(phys) as u64;
+    unsafe { ptr::write_bytes(va as *mut u8, 0, num_pages * PAGE_SIZE as usize); }
+    (phys, va)
+}
+
+fn create_tx_qp0() -> bool {
+    // ── Allocate TX ring (one page of 16-byte descriptors) ──────────────
+    let (ring_phys, ring_va) = alloc_contig(1);
+    if ring_phys == 0 {
+        log(b"[gvnic] failed to alloc TX ring\n");
+        return false;
+    }
+
+    // ── Allocate queue_resources page (device writes db_index +
+    //    counter_index here once CREATE_TX_QUEUE returns) ─────────────────
+    let (qres_phys, qres_va) = alloc_contig(1);
+    if qres_phys == 0 {
+        log(b"[gvnic] failed to alloc TX queue_resources\n");
+        return false;
+    }
+
+    // ── Allocate + register the TX QPL ───────────────────────────────────
+    let (qpl_phys, qpl_va) = alloc_contig(TX_QPL_PAGES as usize);
+    if qpl_phys == 0 {
+        log(b"[gvnic] failed to alloc TX QPL pages\n");
+        return false;
+    }
+    if !register_page_list(TX_QPL_ID, qpl_phys, TX_QPL_PAGES) {
+        return false;
+    }
+
+    // ── CREATE_TX_QUEUE command ─────────────────────────────────────────
+    //
+    // Payload layout (48 bytes at offset 8):
+    //   u32  queue_id
+    //   u32  reserved
+    //   u64  queue_resources_addr (be, DMA)
+    //   u64  tx_ring_addr (be, DMA)
+    //   u32  queue_page_list_id (be)
+    //   u32  ntfy_id (be)
+    //   u64  tx_comp_ring_addr (DQO only — zero here)
+    //   u16  tx_ring_size (be)
+    //   u16  tx_comp_ring_size (DQO only — zero)
+    //   u8[4] padding
+    let mut cmd = AdminqCommand::ZERO;
+    put_be32(&mut cmd.bytes, 0, OP_CREATE_TX_QUEUE);
+    put_be32(&mut cmd.bytes, 8, 0); // queue_id = 0
+    put_be64(&mut cmd.bytes, 16, qres_phys);
+    put_be64(&mut cmd.bytes, 24, ring_phys);
+    put_be32(&mut cmd.bytes, 32, TX_QPL_ID);
+    put_be32(&mut cmd.bytes, 36, NTFY_ID_TX_QP0);
+    put_be16(&mut cmd.bytes, 48, TX_RING_ENTRIES);
+
+    if !execute_cmd(b"CREATE_TX_QUEUE", &cmd) {
+        return false;
+    }
+
+    // Read back db_index + counter_index. Layout of
+    // `gve_queue_resources`:
+    //   u32 db_index (be, device -> guest)
+    //   u32 counter_index (be, device -> guest)
+    //   u8[56] reserved
+    let db_index;
+    let counter_index;
+    unsafe {
+        let bytes = slice_at(qres_va, 8);
+        db_index = get_be32(bytes, 0);
+        counter_index = get_be32(bytes, 4);
+    }
+
+    let mut st = STATE.lock();
+    if let Some(s) = st.as_mut() {
+        s.tx = Some(TxQueue {
+            ring_va,
+            ring_entries: TX_RING_ENTRIES,
+            qres_va,
+            qpl_base_va: qpl_va,
+            qpl_base_phys: qpl_phys,
+            qpl_size: TX_QPL_PAGES * PAGE_SIZE,
+            qpl_id: TX_QPL_ID,
+            db_offset: db_index * 4,
+            counter_index,
+            fill_cnt: 0,
+            done_cnt: 0,
+            qpl_head: 0,
+            qpl_avail: TX_QPL_PAGES * PAGE_SIZE,
+        });
+    }
+    log(b"[gvnic] TX queue 0 created, db_offset=");
+    log_u32(db_index * 4);
+    log(b" counter_index=");
+    log_u32(counter_index);
+    log(b"\n");
+    true
+}
+
+fn create_rx_qp0() -> bool {
+    // ── Completion ring (64-byte descriptors, device-written) ───────────
+    let compl_pages = ((RX_RING_ENTRIES as u32) * 64 + PAGE_SIZE - 1) / PAGE_SIZE;
+    let (compl_phys, compl_va) = alloc_contig(compl_pages as usize);
+    if compl_phys == 0 {
+        log(b"[gvnic] failed to alloc RX completion ring\n");
+        return false;
+    }
+
+    // ── Data-slot ring (8 bytes each, driver-written QPL offsets) ──────
+    let data_pages = ((RX_RING_ENTRIES as u32) * 8 + PAGE_SIZE - 1) / PAGE_SIZE;
+    let (data_phys, data_va) = alloc_contig(data_pages as usize);
+    if data_phys == 0 {
+        log(b"[gvnic] failed to alloc RX data ring\n");
+        return false;
+    }
+
+    let (qres_phys, qres_va) = alloc_contig(1);
+    if qres_phys == 0 {
+        log(b"[gvnic] failed to alloc RX queue_resources\n");
+        return false;
+    }
+
+    // ── RX QPL ───────────────────────────────────────────────────────────
+    let (qpl_phys, qpl_va) = alloc_contig(RX_QPL_PAGES as usize);
+    if qpl_phys == 0 {
+        log(b"[gvnic] failed to alloc RX QPL pages\n");
+        return false;
+    }
+    if !register_page_list(RX_QPL_ID, qpl_phys, RX_QPL_PAGES) {
+        return false;
+    }
+
+    // Pre-fill the data-slot ring: slot `i` points at QPL offset
+    // `i * PAGE_SIZE`. Each ring entry gets a whole 4 KiB page even
+    // though packets only use the first 2 KiB — that's how the
+    // reference driver lays it out and what the device expects
+    // (rx_pages_per_qpl == rx_desc_cnt).
+    for i in 0..RX_RING_ENTRIES as usize {
+        let offset: u64 = (i as u64) * (PAGE_SIZE as u64);
+        let bytes = offset.to_be_bytes();
+        unsafe {
+            ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                (data_va as *mut u8).add(i * 8),
+                8,
+            );
+        }
+    }
+
+    // ── CREATE_RX_QUEUE ─────────────────────────────────────────────────
+    //
+    // Payload (56 bytes at offset 8):
+    //   u32  queue_id
+    //   u32  index
+    //   u32  reserved
+    //   u32  ntfy_id
+    //   u64  queue_resources_addr (DMA)
+    //   u64  rx_desc_ring_addr (DMA — completion ring in GQI)
+    //   u64  rx_data_ring_addr (DMA — slot ring in GQI)
+    //   u32  queue_page_list_id
+    //   u16  rx_ring_size
+    //   u16  packet_buffer_size
+    //   u16  rx_buff_ring_size (DQO only — zero)
+    //   u8   enable_rsc
+    //   u8[5] padding
+    let mut cmd = AdminqCommand::ZERO;
+    put_be32(&mut cmd.bytes, 0, OP_CREATE_RX_QUEUE);
+    put_be32(&mut cmd.bytes, 8, 0); // queue_id = 0
+    put_be32(&mut cmd.bytes, 12, 0); // index = 0
+    put_be32(&mut cmd.bytes, 20, NTFY_ID_RX_QP0);
+    put_be64(&mut cmd.bytes, 24, qres_phys);
+    put_be64(&mut cmd.bytes, 32, compl_phys);
+    put_be64(&mut cmd.bytes, 40, data_phys);
+    put_be32(&mut cmd.bytes, 48, RX_QPL_ID);
+    put_be16(&mut cmd.bytes, 52, RX_RING_ENTRIES);
+    put_be16(&mut cmd.bytes, 54, RX_BUFFER_SIZE);
+
+    if !execute_cmd(b"CREATE_RX_QUEUE", &cmd) {
+        return false;
+    }
+
+    let db_index;
+    let counter_index;
+    unsafe {
+        let bytes = slice_at(qres_va, 8);
+        db_index = get_be32(bytes, 0);
+        counter_index = get_be32(bytes, 4);
+    }
+
+    let mut st = STATE.lock();
+    if let Some(s) = st.as_mut() {
+        s.rx = Some(RxQueue {
+            compl_va,
+            data_va,
+            ring_entries: RX_RING_ENTRIES,
+            qres_va,
+            qpl_base_va: qpl_va,
+            qpl_base_phys: qpl_phys,
+            qpl_size: RX_QPL_PAGES * PAGE_SIZE,
+            qpl_id: RX_QPL_ID,
+            db_offset: db_index * 4,
+            counter_index,
+            fill_cnt: 0,
+            cons_cnt: 0,
+            expected_seq: 1,
+        });
+    }
+    log(b"[gvnic] RX queue 0 created, db_offset=");
+    log_u32(db_index * 4);
+    log(b" counter_index=");
+    log_u32(counter_index);
+    log(b"\n");
+    true
 }
 
 // ---- Serial logging helpers ------------------------------------------------
