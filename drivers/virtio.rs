@@ -939,9 +939,17 @@ impl Virtqueue {
     }
 
     /// Read used->idx (volatile, device writes this).
-    fn used_idx(&self) -> u16 {
+    pub(crate) fn used_idx(&self) -> u16 {
         // SAFETY: used points to a valid VirtqUsed header.
         unsafe { ptr::read_volatile(&(*self.used).idx) }
+    }
+
+    /// Read our cached cursor into the used ring — how many used
+    /// entries the driver has already consumed. Paired with
+    /// `used_idx()`: if `used_idx() > last_used_cursor()` the device
+    /// has delivered frames we haven't picked up yet.
+    pub(crate) fn last_used_cursor(&self) -> u16 {
+        self.last_used_idx
     }
 
     /// Write avail->flags (volatile).

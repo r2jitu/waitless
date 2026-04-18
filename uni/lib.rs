@@ -244,6 +244,18 @@ pub fn net_num_queue_pairs() -> u16 {
 #[cfg(platform_native)]
 pub fn net_num_queue_pairs() -> u16 { 1 }
 
+/// Per-RX-queue `(device_idx, driver_cursor)` used-ring snapshots.
+/// See `drivers::virtio_net::rx_used_cursors` for interpretation —
+/// lets `/stats` surface whether traffic is stuck on the device side
+/// (Andromeda not distributing) vs. the driver side (we're not
+/// polling qp N fast enough).
+#[cfg(platform_unikernel)]
+pub fn net_rx_used_cursors() -> [(u16, u16); 8] {
+    drivers::virtio_net::rx_used_cursors()
+}
+#[cfg(platform_native)]
+pub fn net_rx_used_cursors() -> [(u16, u16); 8] { [(0, 0); 8] }
+
 /// Send a UDP datagram.
 #[cfg(platform_unikernel)]
 pub fn udp_send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {

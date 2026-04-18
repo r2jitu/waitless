@@ -1107,6 +1107,37 @@ pub fn rx_counts() -> [u64; MAX_QUEUE_PAIRS] {
     out
 }
 
+/// Raw used-ring cursors per RX queue:
+///   [ (device_idx, driver_cursor), ... ]
+///
+/// `device_idx` is the volatile `used->idx` the device advances as
+/// it writes RX buffers. `driver_cursor` is the driver's local
+/// `last_used_idx`, incremented each time `poll_qp` consumes one.
+///
+/// Use the two together to tell where traffic is getting stuck:
+///   device_idx == driver_cursor == 0   → device never delivered here
+///   device_idx >  driver_cursor        → device delivered but we're
+///                                        not polling fast enough / at all
+///   device_idx == driver_cursor, both large → healthy: fully drained
+pub fn rx_used_cursors() -> [(u16, u16); MAX_QUEUE_PAIRS] {
+    let mut out = [(0u16, 0u16); MAX_QUEUE_PAIRS];
+    // Only negotiated queues are actually initialised — the rest have
+    // null `used` pointers and reading `used_idx()` on them would
+    // page-fault in the kernel. `negotiated_queue_pairs` caps the
+    // loop at what `init_pci_*` / `init_legacy_pci` wired up.
+    let n = unsafe { (*ndev()).negotiated_queue_pairs as usize }
+        .min(MAX_QUEUE_PAIRS);
+    unsafe {
+        for i in 0..n {
+            out[i] = (
+                (*ndev()).rx_queues[i].used_idx(),
+                (*ndev()).rx_queues[i].last_used_cursor(),
+            );
+        }
+    }
+    out
+}
+
 /// Poll a specific queue pair for received frames.
 pub fn poll_qp(qp: usize, callback: fn(&[u8])) -> i32 {
     unsafe {

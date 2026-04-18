@@ -76,23 +76,45 @@ fn stats_response() -> Response {
     // on one core without yielding.
     let buf: &mut [u8; STATS_BUF_LEN] = unsafe { &mut *STATS_BUFS[id].0.get() };
     let counts = uni::net_rx_counts();
+    let cursors = uni::net_rx_used_cursors();
     let nqp = uni::net_num_queue_pairs() as usize;
-    let n = fmt_stats(buf, &counts, nqp);
+    let n = fmt_stats(buf, &counts, &cursors, nqp);
     Response::ok(b"application/json", &buf[..n])
 }
 
-fn fmt_stats(buf: &mut [u8], counts: &[u64; 8], nqp: usize) -> usize {
+fn fmt_stats(
+    buf: &mut [u8],
+    counts: &[u64; 8],
+    cursors: &[(u16, u16); 8],
+    nqp: usize,
+) -> usize {
     let mut n = 0;
-    let prefix = b"{\"rx_frames\":[";
-    buf[..prefix.len()].copy_from_slice(prefix);
-    n += prefix.len();
+    let push = |buf: &mut [u8], n: &mut usize, s: &[u8]| {
+        buf[*n..*n + s.len()].copy_from_slice(s);
+        *n += s.len();
+    };
+
+    push(buf, &mut n, b"{\"rx_frames\":[");
     for i in 0..nqp.min(counts.len()) {
         if i > 0 { buf[n] = b','; n += 1; }
         n += fmt_u64(&mut buf[n..], counts[i]);
     }
-    let suffix = b"],\"num_queue_pairs\":";
-    buf[n..n + suffix.len()].copy_from_slice(suffix);
-    n += suffix.len();
+    // Per-queue used-ring snapshot: device_idx is what Andromeda /
+    // vhost advanced to, cursor is where we polled up to. If
+    // device_idx moves but counts stays 0, we have a polling bug.
+    // If neither moves, the host-side isn't delivering to that
+    // queue at all (legacy virtio RSS failure on GCE).
+    push(buf, &mut n, b"],\"rx_used_dev\":[");
+    for i in 0..nqp.min(cursors.len()) {
+        if i > 0 { buf[n] = b','; n += 1; }
+        n += fmt_u64(&mut buf[n..], cursors[i].0 as u64);
+    }
+    push(buf, &mut n, b"],\"rx_used_drv\":[");
+    for i in 0..nqp.min(cursors.len()) {
+        if i > 0 { buf[n] = b','; n += 1; }
+        n += fmt_u64(&mut buf[n..], cursors[i].1 as u64);
+    }
+    push(buf, &mut n, b"],\"num_queue_pairs\":");
     n += fmt_u64(&mut buf[n..], nqp as u64);
     buf[n] = b'}';
     n + 1
