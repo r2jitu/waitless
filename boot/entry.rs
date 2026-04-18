@@ -412,6 +412,14 @@ unsafe fn kernel_boot(info: &BootInfo) {
     klog!("[INIT] PCI bus scan...\n");
     drivers::pci::init();
 
+    // gVNIC probe (Phase 1 scaffolding). Returns false on virtio-net
+    // GCE VMs / kvm-vm / HVF — existing virtio path keeps working
+    // unchanged. When the VM is booted with nic-type=GVNIC, this
+    // brings up the admin queue and logs the device descriptor so
+    // we can see what GCE advertises.
+    klog!("[INIT] gVNIC probe...\n");
+    let _gvnic_ok = drivers::gvnic::init();
+
     klog!("[INIT] Virtio-net driver...\n");
     let net_ok = drivers::virtio_net::init();
     if !net_ok {

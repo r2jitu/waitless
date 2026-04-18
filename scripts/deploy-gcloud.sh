@@ -196,13 +196,17 @@ deploy() {
     wait "$upload_pid" "$img_del_pid"
 
     # UEFI_COMPATIBLE lets the image boot on OVMF-backed machine types
-    # (c3, t2a, anything Arm). The Limine ISO carries both BIOS and
-    # UEFI bootloaders, so it works either way.
+    # (c3, t2a, anything Arm). GVNIC advertises the image as
+    # gVNIC-capable so instances can be launched with --nic-type=GVNIC
+    # without GCE rejecting it; setting it unconditionally is safe
+    # even for virtio-net deployments (GCE just ignores the flag when
+    # the instance doesn't request GVNIC). The Limine ISO carries
+    # both BIOS and UEFI bootloaders, so it boots either way.
     echo "==> Creating GCE image: $IMAGE_NAME"
     gcloud compute images create "$IMAGE_NAME" \
         --source-uri="gs://$BUCKET/${TARBALL_NAME}" \
         --family=unikernel \
-        --guest-os-features=UEFI_COMPATIBLE \
+        --guest-os-features=UEFI_COMPATIBLE,GVNIC \
         --project="$PROJECT" \
         --quiet
 
@@ -210,20 +214,31 @@ deploy() {
     wait "$vm_del_pid"
 
     echo "==> Launching VM: $NAME"
-    # queue-count=2 asks the vNIC backend to expose two virtio-net
-    # queue pairs so the guest's driver can run Tier 1 per-core
-    # polling instead of Tier 2 software distribution. Matches
-    # n2-standard-2's 2 vCPUs. GCE's virtio-net is strictly legacy
-    # v0.95 (no modern PCI caps, can't negotiate VIRTIO_F_VERSION_1)
-    # — legacy MQ works once the ctrl-vq activation dance is done
-    # correctly. See `CtrlMqBuf` static + ctrl_mq_set_pairs in
-    # virtio_net.rs for the contiguous-buffer layout that GCE needs.
+    # NIC selection: virtio-net (default) or gVNIC (GVNIC_NIC=1).
+    #
+    # virtio-net on GCE is strictly legacy v0.95 (no modern PCI caps,
+    # can't negotiate VIRTIO_F_VERSION_1). Legacy MQ works once the
+    # ctrl-vq activation dance is done correctly — see `CtrlMqBuf` +
+    # ctrl_mq_set_pairs in virtio_net.rs. But GCE's Andromeda backend
+    # doesn't actually hash RX across queues for virtio, so Tier 1
+    # multi-queue lands all flows on qp 0 (see reference_gce_legacy_mq.md).
+    #
+    # gVNIC is Google's own NIC format; RSS multi-queue works natively.
+    # The `nic-type=GVNIC` flag switches the vNIC backend. Requires the
+    # image to carry the GVNIC guest-os-feature (set on image create).
+    local nic_args
+    if [[ "${GVNIC_NIC:-}" == "1" ]]; then
+        echo "    (using gVNIC; guest driver must support Google VNIC)"
+        nic_args="nic-type=GVNIC,queue-count=2"
+    else
+        nic_args="queue-count=2"
+    fi
     gcloud compute instances create "$NAME" \
         --zone="$ZONE" \
         --machine-type="$MACHINE_TYPE" \
         --image="$IMAGE_NAME" \
         --image-project="$PROJECT" \
-        --network-interface="network=default,queue-count=2" \
+        --network-interface="network=default,${nic_args}" \
         --tags=http-server \
         --metadata=serial-port-enable=TRUE \
         --project="$PROJECT" \
