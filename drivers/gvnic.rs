@@ -33,7 +33,7 @@ use crate::{log, mmio_read32, mmio_write32};
 use crate::pci;
 use core::mem::size_of;
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use kernel::mm::{alloc_pages, phys_to_virt};
 use kernel::sync::Spinlock;
 
@@ -243,12 +243,14 @@ struct TxQueue {
     db_offset: u32,
     counter_index: u32,
     /// Monotonically-increasing packet producer counter. Written to
-    /// the TX doorbell after submitting.
-    fill_cnt: u32,
+    /// the TX doorbell after submitting. Atomic so one core can
+    /// publish (send path) while any other core reads it (e.g. for
+    /// a deferred-kick check or a `/stats` snapshot).
+    fill_cnt: AtomicU32,
     /// Last-seen value of `counter_array[counter_index]`. Drives
     /// TX slot recycling (a slot is reusable once done_cnt passes
     /// its fill_cnt).
-    done_cnt: u32,
+    done_cnt: AtomicU32,
 }
 
 /// Per-queue RX metadata. Also QPL-backed: incoming frames are
@@ -274,13 +276,15 @@ struct RxQueue {
     counter_index: u32,
     /// How many slots have been advertised to the device (matches
     /// the value last written to the RX doorbell).
-    fill_cnt: u32,
-    /// How many completions we've consumed. Phase 2b drives this.
-    cons_cnt: u32,
+    fill_cnt: AtomicU32,
+    /// How many completions we've consumed. Only written by the
+    /// core that polls this queue in Tier 1 mode; atomic so
+    /// `/stats` can snapshot from any other core without a lock.
+    cons_cnt: AtomicU32,
     /// Expected `flags_seq` sequence byte (low 3 bits, cycles 1..7;
     /// 0 is reserved). Used to detect new completions without
     /// reading a separate producer index.
-    expected_seq: u8,
+    expected_seq: AtomicU8,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -304,10 +308,29 @@ impl QueueFormat {
 
 static STATE: Spinlock<Option<State>> = Spinlock::new(None);
 
-// AtomicU64 cell used to publish the BAR0 virtual address cheaply —
-// the hot register accessors want it without grabbing the state
-// lock. Set before GVNIC_OK flips true.
+// Lock-free hot-path state — published at init time, then read
+// without the big `STATE` spinlock so `poll_qp` / `send_on_qp` can
+// run on multiple cores concurrently without serialising through
+// a shared lock. Each of these atomics is written exactly once at
+// init and only read afterward (except the queue-cursor fields
+// inside TxQueue/RxQueue, which are their own atomics).
+
+// BAR0 virtual address (admin-queue register window).
 static BAR0: AtomicU64 = AtomicU64::new(0);
+// BAR2 virtual address (per-queue doorbell register window).
+static BAR2_VA: AtomicU64 = AtomicU64::new(0);
+// DMA counter array VA (device writes TX completion counts here).
+static COUNTER_ARRAY_VA: AtomicU64 = AtomicU64::new(0);
+// Active queue pair count. Published once init is done so
+// `num_queue_pairs()` can read it without taking STATE.
+static NUM_QP: AtomicU16 = AtomicU16::new(0);
+// Per-queue-pair TxQueue / RxQueue pointers. Each queue struct is
+// allocated on the heap (`uni::Box::leak`) and never freed; the
+// pointer is published here once CREATE_*_QUEUE succeeds.
+static TX_QUEUES: [AtomicPtr<TxQueue>; MAX_QUEUE_PAIRS] =
+    [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_QUEUE_PAIRS];
+static RX_QUEUES: [AtomicPtr<RxQueue>; MAX_QUEUE_PAIRS] =
+    [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_QUEUE_PAIRS];
 
 // ---- Big-endian field helpers ---------------------------------------------
 
@@ -525,6 +548,7 @@ pub fn init() -> bool {
             s.num_qp = num_qp as u16;
         }
     }
+    NUM_QP.store(num_qp as u16, Ordering::Release);
 
     post_initial_rx();
 
@@ -980,16 +1004,24 @@ fn configure_device_resources(bar2_va: u64, num_qp: u32) -> bool {
         return false;
     }
 
-    let mut st = STATE.lock();
-    if let Some(s) = st.as_mut() {
-        s.resources = Some(DeviceResources {
-            counter_array_va: counter_va,
-            counter_array_phys: counter_phys,
-            irq_db_va,
-            irq_db_phys,
-            bar2_va,
-        });
+    {
+        let mut st = STATE.lock();
+        if let Some(s) = st.as_mut() {
+            s.resources = Some(DeviceResources {
+                counter_array_va: counter_va,
+                counter_array_phys: counter_phys,
+                irq_db_va,
+                irq_db_phys,
+                bar2_va,
+            });
+        }
     }
+    // Publish for the lock-free hot path. These values are read by
+    // `send_on_qp` / `tx_drain_qp` on every packet; going through
+    // `STATE.lock()` on a shared spinlock would serialise all TX
+    // across cores.
+    BAR2_VA.store(bar2_va, Ordering::Release);
+    COUNTER_ARRAY_VA.store(counter_va, Ordering::Release);
     log(b"[gvnic] device resources configured\n");
     true
 }
@@ -1191,21 +1223,30 @@ fn create_tx_qp(qp: u32) -> bool {
         counter_index = get_be32(bytes, 4);
     }
 
-    let mut st = STATE.lock();
-    if let Some(s) = st.as_mut() {
-        s.tx[qp as usize] = Some(TxQueue {
-            ring_va,
-            ring_entries: TX_RING_ENTRIES,
-            qres_va,
-            qpl_base_va: qpl_va,
-            qpl_base_phys: qpl_phys,
-            qpl_size: TX_QPL_PAGES * PAGE_SIZE,
-            qpl_id: tx_qpl_id(qp),
-            db_offset: db_index * 4,
-            counter_index,
-            fill_cnt: 0,
-            done_cnt: 0,
-        });
+    {
+        let mut st = STATE.lock();
+        if let Some(s) = st.as_mut() {
+            s.tx[qp as usize] = Some(TxQueue {
+                ring_va,
+                ring_entries: TX_RING_ENTRIES,
+                qres_va,
+                qpl_base_va: qpl_va,
+                qpl_base_phys: qpl_phys,
+                qpl_size: TX_QPL_PAGES * PAGE_SIZE,
+                qpl_id: tx_qpl_id(qp),
+                db_offset: db_index * 4,
+                counter_index,
+                fill_cnt: AtomicU32::new(0),
+                done_cnt: AtomicU32::new(0),
+            });
+            // Publish a raw pointer to the TxQueue living inside State
+            // so the hot path (`send_on_qp`) can reach it without
+            // taking the STATE spinlock. State is only ever written
+            // to once, so the Option's `Some` variant sits at a
+            // stable address for the rest of the driver's life.
+            let ptr = s.tx[qp as usize].as_ref().unwrap() as *const TxQueue as *mut TxQueue;
+            TX_QUEUES[qp as usize].store(ptr, Ordering::Release);
+        }
     }
     log(b"[gvnic] TX queue ");
     log_u32(qp);
@@ -1307,23 +1348,27 @@ fn create_rx_qp(qp: u32, num_qp: u32) -> bool {
         counter_index = get_be32(bytes, 4);
     }
 
-    let mut st = STATE.lock();
-    if let Some(s) = st.as_mut() {
-        s.rx[qp as usize] = Some(RxQueue {
-            compl_va,
-            data_va,
-            ring_entries: RX_RING_ENTRIES,
-            qres_va,
-            qpl_base_va: qpl_va,
-            qpl_base_phys: qpl_phys,
-            qpl_size: RX_QPL_PAGES * PAGE_SIZE,
-            qpl_id: rx_qpl_id(qp),
-            db_offset: db_index * 4,
-            counter_index,
-            fill_cnt: 0,
-            cons_cnt: 0,
-            expected_seq: 1,
-        });
+    {
+        let mut st = STATE.lock();
+        if let Some(s) = st.as_mut() {
+            s.rx[qp as usize] = Some(RxQueue {
+                compl_va,
+                data_va,
+                ring_entries: RX_RING_ENTRIES,
+                qres_va,
+                qpl_base_va: qpl_va,
+                qpl_base_phys: qpl_phys,
+                qpl_size: RX_QPL_PAGES * PAGE_SIZE,
+                qpl_id: rx_qpl_id(qp),
+                db_offset: db_index * 4,
+                counter_index,
+                fill_cnt: AtomicU32::new(0),
+                cons_cnt: AtomicU32::new(0),
+                expected_seq: AtomicU8::new(1),
+            });
+            let ptr = s.rx[qp as usize].as_ref().unwrap() as *const RxQueue as *mut RxQueue;
+            RX_QUEUES[qp as usize].store(ptr, Ordering::Release);
+        }
     }
     log(b"[gvnic] RX queue ");
     log_u32(qp);
@@ -1386,23 +1431,18 @@ fn post_initial_rx() {
     // `ring_entries` per queue hands every slot to the device in one
     // shot so it can start depositing frames immediately. Walk all
     // queue pairs we've brought up.
-    let posts: [(u64, u32, u32); MAX_QUEUE_PAIRS] = {
-        let mut st = STATE.lock();
-        let s = match st.as_mut() { Some(s) => s, None => return };
-        let bar2_va = match s.resources.as_ref() { Some(r) => r.bar2_va, None => return };
-        let mut out = [(0u64, 0u32, 0u32); MAX_QUEUE_PAIRS];
-        for qp in 0..MAX_QUEUE_PAIRS {
-            if let Some(rx) = s.rx[qp].as_mut() {
-                rx.fill_cnt = rx.ring_entries as u32;
-                out[qp] = (bar2_va, rx.db_offset, rx.fill_cnt);
-            }
-        }
-        out
-    };
-    for (bar2_va, db_offset, fill_cnt) in posts.iter() {
-        if *bar2_va != 0 {
-            doorbell_write(*bar2_va, *db_offset, *fill_cnt);
-        }
+    let bar2_va = BAR2_VA.load(Ordering::Acquire);
+    for qp in 0..MAX_QUEUE_PAIRS {
+        let rx_ptr = RX_QUEUES[qp].load(Ordering::Acquire);
+        if rx_ptr.is_null() { continue; }
+        // SAFETY: pointer published with Release, only null means
+        // "not installed". RxQueue's non-atomic fields are only
+        // written during init (before this Release); reading them
+        // here through Acquire is a valid synchronisation.
+        let rx = unsafe { &*rx_ptr };
+        let fill = rx.ring_entries as u32;
+        rx.fill_cnt.store(fill, Ordering::Release);
+        doorbell_write(bar2_va, rx.db_offset, fill);
     }
     log(b"[gvnic] posted initial RX buffers\n");
 }
@@ -1431,38 +1471,31 @@ pub fn poll_qp_inner(qp: usize, callback: fn(&[u8])) -> u32 {
     if qp >= MAX_QUEUE_PAIRS {
         return 0;
     }
+    let rx_ptr = RX_QUEUES[qp].load(Ordering::Acquire);
+    if rx_ptr.is_null() {
+        return 0;
+    }
+    // SAFETY: pointer is published once after init. RxQueue's
+    // non-atomic fields (ring_va, db_offset, …) are only written
+    // during init under STATE lock, before the Release publish;
+    // Acquire above synchronises with that. Mutable fields
+    // (cons_cnt, expected_seq, fill_cnt) are AtomicU32/U8, which
+    // tolerate concurrent access if another core ever calls in —
+    // though in Tier 1 each queue is polled by exactly one core.
+    let rx = unsafe { &*rx_ptr };
+    let bar2_va = BAR2_VA.load(Ordering::Acquire);
 
-    // Snapshot what we need — we don't want to hold the global lock
-    // across the callback (which may call back into `send()`).
-    let snap = {
-        let st = STATE.lock();
-        let s = match st.as_ref() { Some(s) => s, None => return 0 };
-        let rx = match s.rx[qp].as_ref() { Some(r) => r, None => return 0 };
-        let res = match s.resources.as_ref() { Some(r) => r, None => return 0 };
-        RxSnap {
-            compl_va: rx.compl_va,
-            qpl_base_va: rx.qpl_base_va,
-            ring_entries: rx.ring_entries,
-            cons_cnt: rx.cons_cnt,
-            expected_seq: rx.expected_seq,
-            db_offset: rx.db_offset,
-            fill_cnt: rx.fill_cnt,
-            bar2_va: res.bar2_va,
-        }
-    };
-
-    let mask = (snap.ring_entries - 1) as u32;
-    let mut cons = snap.cons_cnt;
-    let mut expected = snap.expected_seq;
+    let mask = (rx.ring_entries - 1) as u32;
+    let mut cons = rx.cons_cnt.load(Ordering::Relaxed);
+    let mut expected = rx.expected_seq.load(Ordering::Relaxed);
     let mut delivered: u32 = 0;
 
     loop {
         let idx = (cons & mask) as usize;
-        let desc_ptr = (snap.compl_va as *const u8).wrapping_add(idx * RX_DESC_SIZE);
-        // SAFETY: descriptor is 64 bytes inside a DMA-coherent page
-        // we allocated. The volatile read pulls the device's latest
-        // write visible at PoC — x86 is cache-coherent so no
-        // explicit invalidation needed.
+        let desc_ptr = (rx.compl_va as *const u8).wrapping_add(idx * RX_DESC_SIZE);
+        // SAFETY: descriptor is 64 bytes inside a DMA-coherent page.
+        // x86 is cache-coherent so a volatile read is sufficient
+        // to see the device's writes.
         let desc: &[u8] = unsafe { core::slice::from_raw_parts(desc_ptr, RX_DESC_SIZE) };
 
         let flags_seq = get_be16(desc, RX_DESC_FLAGS_SEQ_OFF);
@@ -1472,15 +1505,7 @@ pub fn poll_qp_inner(qp: usize, callback: fn(&[u8])) -> u32 {
         }
 
         let len = get_be16(desc, RX_DESC_LEN_OFF) as usize;
-        // `hdr_off` is "64-byte-scaled offset into the RX_DATA
-        // entry". In Phase 2 each entry is a single page and the
-        // device always writes the frame at byte RX_DATA_OFFSET_IN_PAGE
-        // (the 2-byte pad). hdr_off is therefore 0; we compute the
-        // real offset manually rather than consult it, matching the
-        // reference driver's approach.
-        let _hdr_off = desc[RX_DESC_HDR_OFF_OFF];
-
-        let frame_start = snap.qpl_base_va as usize + idx * (PAGE_SIZE as usize)
+        let frame_start = rx.qpl_base_va as usize + idx * (PAGE_SIZE as usize)
             + RX_DATA_OFFSET_IN_PAGE;
         let frame: &[u8] = unsafe {
             core::slice::from_raw_parts(frame_start as *const u8, len)
@@ -1493,64 +1518,31 @@ pub fn poll_qp_inner(qp: usize, callback: fn(&[u8])) -> u32 {
     }
 
     if delivered > 0 {
-        // Re-post the buffers we consumed. Since the slot contents
-        // don't change (same (page → QPL offset) mapping), the only
-        // thing to advance is fill_cnt. Writing it to the doorbell
-        // tells the device "N more slots are available".
-        let new_fill = snap.fill_cnt.wrapping_add(delivered);
-        doorbell_write(snap.bar2_va, snap.db_offset, new_fill);
-
-        // Commit cursor advances back to state.
-        let mut st = STATE.lock();
-        if let Some(rx) = st.as_mut().and_then(|s| s.rx[qp].as_mut()) {
-            rx.cons_cnt = cons;
-            rx.expected_seq = expected;
-            rx.fill_cnt = new_fill;
-        }
+        let new_fill = rx.fill_cnt.load(Ordering::Relaxed).wrapping_add(delivered);
+        rx.cons_cnt.store(cons, Ordering::Relaxed);
+        rx.expected_seq.store(expected, Ordering::Relaxed);
+        rx.fill_cnt.store(new_fill, Ordering::Relaxed);
+        doorbell_write(bar2_va, rx.db_offset, new_fill);
     }
 
     delivered
 }
 
-struct RxSnap {
-    compl_va: u64,
-    qpl_base_va: u64,
-    ring_entries: u16,
-    cons_cnt: u32,
-    expected_seq: u8,
-    db_offset: u32,
-    fill_cnt: u32,
-    bar2_va: u64,
-}
-
 // ---- TX ------------------------------------------------------------------
 
 /// Reclaim TX slots on `qp` from the device's completion counter.
-/// `counter_array[tx.counter_index]` is a big-endian u32 the device
-/// bumps by 1 each time it finishes transmitting a descriptor; we
-/// read it + publish the advanced `done_cnt` so `send()` can see
-/// which ring slots are safe to reuse.
-fn tx_drain_qp(qp: usize) {
-    let (counter_va, counter_index);
-    {
-        let st = STATE.lock();
-        let s = match st.as_ref() { Some(s) => s, None => return };
-        let res = match s.resources.as_ref() { Some(r) => r, None => return };
-        let tx = match s.tx[qp].as_ref() { Some(t) => t, None => return };
-        counter_va = res.counter_array_va;
-        counter_index = tx.counter_index;
-    }
-
+/// Lock-free fast path — reads TxQueue via the pre-published
+/// pointer + device counter via an atomic.
+#[inline]
+fn tx_drain(tx: &TxQueue) {
+    let counter_va = COUNTER_ARRAY_VA.load(Ordering::Acquire);
+    if counter_va == 0 { return; }
     let counter_ptr = counter_va as *const u32;
-    let raw = unsafe { ptr::read_volatile(counter_ptr.add(counter_index as usize)) };
+    let raw = unsafe { ptr::read_volatile(counter_ptr.add(tx.counter_index as usize)) };
     let nic_done = u32::from_be(raw);
-
-    let mut st = STATE.lock();
-    if let Some(tx) = st.as_mut().and_then(|s| s.tx[qp].as_mut()) {
-        // The counter is monotonic; only advance `done_cnt`.
-        if nic_done.wrapping_sub(tx.done_cnt) != 0 {
-            tx.done_cnt = nic_done;
-        }
+    let prev = tx.done_cnt.load(Ordering::Relaxed);
+    if nic_done.wrapping_sub(prev) != 0 {
+        tx.done_cnt.store(nic_done, Ordering::Relaxed);
     }
 }
 
@@ -1561,35 +1553,26 @@ pub fn send_on_qp(qp: usize, data: &[u8]) -> bool {
     if qp >= MAX_QUEUE_PAIRS || data.is_empty() || data.len() > TX_MAX_PKT_LEN {
         return false;
     }
+    let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
+    if tx_ptr.is_null() { return false; }
+    let tx = unsafe { &*tx_ptr };
+    let bar2_va = BAR2_VA.load(Ordering::Acquire);
 
-    tx_drain_qp(qp);
+    tx_drain(tx);
 
-    let (ring_va, ring_entries, fill_cnt, done_cnt, qpl_va, db_offset, bar2_va) = {
-        let st = STATE.lock();
-        let s = match st.as_ref() { Some(s) => s, None => return false };
-        let res = match s.resources.as_ref() { Some(r) => r, None => return false };
-        let tx = match s.tx[qp].as_ref() { Some(t) => t, None => return false };
-        (
-            tx.ring_va,
-            tx.ring_entries,
-            tx.fill_cnt,
-            tx.done_cnt,
-            tx.qpl_base_va,
-            tx.db_offset,
-            res.bar2_va,
-        )
-    };
+    let fill_cnt = tx.fill_cnt.load(Ordering::Relaxed);
+    let done_cnt = tx.done_cnt.load(Ordering::Relaxed);
 
     // Gate on ring capacity. Without this check, a flood of sends
     // wraps past `done_cnt` and rewrites descriptors the device is
     // still processing — the root cause of the ~50 % drop rate
     // observed on GCE before this fix.
     let in_flight = fill_cnt.wrapping_sub(done_cnt);
-    if in_flight >= ring_entries as u32 {
+    if in_flight >= tx.ring_entries as u32 {
         return false;
     }
 
-    let mask = (ring_entries - 1) as u32;
+    let mask = (tx.ring_entries - 1) as u32;
     let slot = (fill_cnt & mask) as usize;
 
     // Each slot owns a single 4 KiB QPL page; its byte offset is
@@ -1598,7 +1581,7 @@ pub fn send_on_qp(qp: usize, data: &[u8]) -> bool {
     // device can't be reading this page while we memcpy a new
     // packet into it.
     let qpl_offset = (slot as u32) * PAGE_SIZE;
-    let dst = (qpl_va + qpl_offset as u64) as *mut u8;
+    let dst = (tx.qpl_base_va + qpl_offset as u64) as *mut u8;
     unsafe {
         ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
     }
@@ -1611,7 +1594,7 @@ pub fn send_on_qp(qp: usize, data: &[u8]) -> bool {
     //   u16 len              (be, total packet length)
     //   u16 seg_len          (be, this segment length)
     //   u64 seg_addr         (be, QPL byte offset in QPL mode)
-    let desc_ptr = (ring_va as *mut u8).wrapping_add(slot * TX_DESC_SIZE);
+    let desc_ptr = (tx.ring_va as *mut u8).wrapping_add(slot * TX_DESC_SIZE);
     let mut desc = [0u8; TX_DESC_SIZE];
     desc[3] = 1;
     put_be16(&mut desc, 4, data.len() as u16);
@@ -1622,12 +1605,8 @@ pub fn send_on_qp(qp: usize, data: &[u8]) -> bool {
     }
 
     let new_fill = fill_cnt.wrapping_add(1);
-    doorbell_write(bar2_va, db_offset, new_fill);
-
-    let mut st = STATE.lock();
-    if let Some(tx) = st.as_mut().and_then(|s| s.tx[qp].as_mut()) {
-        tx.fill_cnt = new_fill;
-    }
+    tx.fill_cnt.store(new_fill, Ordering::Relaxed);
+    doorbell_write(bar2_va, tx.db_offset, new_fill);
     true
 }
 
@@ -1636,10 +1615,7 @@ pub fn send_on_qp(qp: usize, data: &[u8]) -> bool {
 /// virtio-net "send on your own core's queue" semantics so Tier 1
 /// scaling keeps working.
 pub fn send(data: &[u8]) -> bool {
-    let num_qp = {
-        let st = STATE.lock();
-        st.as_ref().map(|s| s.num_qp as u32).unwrap_or(0)
-    };
+    let num_qp = NUM_QP.load(Ordering::Acquire) as u32;
     if num_qp == 0 {
         return false;
     }
@@ -1665,25 +1641,19 @@ pub fn get_mac(mac_out: *mut u8) {
 
 /// Active queue pair count. Drives `net::poll_tier1` — when > 1
 /// the kernel switches to per-core queue polling.
+#[inline]
 pub fn num_queue_pairs() -> u16 {
-    if !GVNIC_OK.load(Ordering::Acquire) {
-        return 0;
-    }
-    let st = STATE.lock();
-    st.as_ref().map(|s| s.num_qp).unwrap_or(0)
+    NUM_QP.load(Ordering::Acquire)
 }
 
-/// Per-queue RX frame count. Matches the array signature of
-/// `virtio_net::rx_counts` so the `/stats` endpoint code can call
-/// whichever driver is active.
+/// Per-queue RX frame count. Lock-free snapshot — uses the atomic
+/// cons_cnt on each live queue.
 pub fn rx_counts() -> [u64; 8] {
     let mut out = [0u64; 8];
-    let st = STATE.lock();
-    if let Some(s) = st.as_ref() {
-        for qp in 0..MAX_QUEUE_PAIRS.min(out.len()) {
-            if let Some(rx) = s.rx[qp].as_ref() {
-                out[qp] = rx.cons_cnt as u64;
-            }
+    for qp in 0..MAX_QUEUE_PAIRS.min(out.len()) {
+        let rx_ptr = RX_QUEUES[qp].load(Ordering::Acquire);
+        if !rx_ptr.is_null() {
+            out[qp] = unsafe { (*rx_ptr).cons_cnt.load(Ordering::Relaxed) as u64 };
         }
     }
     out
@@ -1697,12 +1667,14 @@ pub fn rx_counts() -> [u64; 8] {
 /// interpretation in `/stats`.
 pub fn rx_used_cursors() -> [(u16, u16); 8] {
     let mut out = [(0u16, 0u16); 8];
-    let st = STATE.lock();
-    if let Some(s) = st.as_ref() {
-        for qp in 0..MAX_QUEUE_PAIRS.min(out.len()) {
-            if let Some(rx) = s.rx[qp].as_ref() {
-                out[qp] = (rx.fill_cnt as u16, rx.cons_cnt as u16);
-            }
+    for qp in 0..MAX_QUEUE_PAIRS.min(out.len()) {
+        let rx_ptr = RX_QUEUES[qp].load(Ordering::Acquire);
+        if !rx_ptr.is_null() {
+            let rx = unsafe { &*rx_ptr };
+            out[qp] = (
+                rx.fill_cnt.load(Ordering::Relaxed) as u16,
+                rx.cons_cnt.load(Ordering::Relaxed) as u16,
+            );
         }
     }
     out
