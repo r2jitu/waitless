@@ -153,11 +153,17 @@ unikernel/
 
 ### Apples-to-apples vs native Linux, same network path
 
-Both targets on GCE `n2-highcpu-4` VMs with gVNIC (4 queue pairs),
-same us-west1-a zone, benched from a separate VM over the VPC
-(`wrk -t4 -d15s` from `kvm-vm`). The two targets share a
-hardware + network topology — the unikernel isn't getting a
-loopback shortcut.
+Both targets on GCE `n2-highcpu-4` VMs with **gVNIC** (4 queue
+pairs), same `us-west1-a` zone, benched from a separate VM over
+the VPC (`wrk -t4 -d15s` from `kvm-vm`). Same NIC, same queue
+count, same wrk client — the unikernel isn't getting a loopback
+shortcut or a lighter network stack underneath.
+
+Crucially, **Linux is running its mature in-tree `gve` driver**
+(`drivers/net/ethernet/google/gve/`, thousands of lines, years
+of tuning); **the unikernel is running the from-scratch gVNIC
+driver in [`drivers/gvnic.rs`](drivers/gvnic.rs)**. Linux should
+win on driver maturity alone. It doesn't.
 
 | Workload            | Native Linux | **Unikernel** | Δ |
 |---------------------|-------------:|--------------:|:-:|
@@ -167,15 +173,18 @@ loopback shortcut.
 | `health_tls_max`    |    183,700   |  **294,500**  | **+60 %** |
 | `udp_peak` (pkt/s)  |    566,500   |  **787,000**  | **+39 %** |
 
-The unikernel wins every workload. `/health` doubles at higher
-concurrency (`c256`) because there's no POSIX syscall cost, no
-user/kernel boundary copies, and the TCP stack lives in the same
-address space as the HTTP handler. gVNIC's native Toeplitz RSS
-gives us per-core RX queues with zero software distribution
-overhead.
+The unikernel wins every workload because the architecture pays
+off more than driver polish does. No POSIX syscalls, no
+user/kernel boundary copies, no context switches — the HTTP
+handler, TCP state machine, and NIC queue all run in the same
+address space on the same core. gVNIC's Toeplitz RSS gives us
+per-core RX queues with zero software distribution, and the
+TCP 4-tuple lookup is O(1) via a per-core open-addressed hash.
+`/health` doubles at `c256` because the per-packet overhead
+gap widens as the connection count grows.
 
 Earlier numbers that showed native at ~497 k rps were measured
-on kvm-vm localhost (kernel-to-kernel socket, no NIC, no
+on `kvm-vm` localhost (kernel-to-kernel socket, no NIC, no
 Ethernet framing). That's not a fair comparison; over a real
 network path, native pays its full POSIX + general-purpose-TCP
 overhead and the unikernel pulls ahead.
