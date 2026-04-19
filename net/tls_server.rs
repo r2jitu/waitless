@@ -35,6 +35,11 @@
 
 #![no_std]
 
+// `alloc` backs any per-connection buffers and future dynamic
+// allocation in this crate. The global allocator is the kernel's
+// talc-backed heap on bare-metal, libstd's default on native.
+extern crate alloc;
+
 extern crate getrandom;
 extern crate hmac;
 extern crate net_tls as tls;

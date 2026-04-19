@@ -8,6 +8,12 @@
 
 #![no_std]
 
+// `extern crate alloc` makes the `alloc` crate's types (`Box`, `Vec`,
+// `String`, …) visible to this crate and to apps built on top of it.
+// On bare-metal the backing allocator is `kernel::mm::GLOBAL_ALLOCATOR`
+// (talc); on native host builds, libstd's own global allocator.
+extern crate alloc;
+
 // Re-export the #[uni::main] proc macro.
 pub use uni_macros::main;
 

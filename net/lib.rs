@@ -14,6 +14,10 @@
 
 #![no_std]
 
+// See kernel/lib.rs for rationale — `alloc::*` is backed by the
+// kernel's global allocator on bare-metal, libstd's default on native.
+extern crate alloc;
+
 extern crate drivers;
 extern crate kernel;
 pub extern crate net_types as types;

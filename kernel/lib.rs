@@ -5,6 +5,13 @@
 
 #![no_std]
 
+// `extern crate alloc` makes `alloc::boxed::Box`, `alloc::vec::Vec`,
+// `alloc::string::String`, etc. available to kernel code. The kernel's
+// `#[global_allocator]` (see `mm::GLOBAL_ALLOCATOR`) backs every
+// allocation — so downstream crates that depend on `//kernel` get a
+// working heap without any extra wiring.
+extern crate alloc;
+
 pub mod types;
 pub mod sync;
 pub mod serial;

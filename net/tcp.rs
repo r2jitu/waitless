@@ -6,6 +6,7 @@
 
 #![no_std]
 
+extern crate alloc;
 extern crate kernel;
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
