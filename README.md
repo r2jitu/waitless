@@ -6,7 +6,7 @@
 
 A bare-metal unikernel written in Rust that boots directly into an application with no OS, no syscalls, and no context switches. All I/O is handled via direct in-process function calls.
 
-Runs on **x86_64** and **ARM64 (aarch64)** via QEMU, Apple Hypervisor.framework (HVF), and Limine ISO.
+Runs on **x86_64** and **ARM64 (aarch64)** via QEMU, Apple Hypervisor.framework (HVF), Limine ISO (BIOS/UEFI), and Google Compute Engine.
 
 ## Architecture
 
@@ -15,13 +15,16 @@ Runs on **x86_64** and **ARM64 (aarch64)** via QEMU, Apple Hypervisor.framework 
 │           Application               │  apps/webserver/
 │         #[uni::main]                │
 ├─────────────────────────────────────┤
-│    Platform Abstraction (uni)       │  uni/ (HTTP, TCP, logging)
+│    Platform Abstraction (uni)       │  uni/ (HTTP, TCP, TLS 1.3, logging)
 ├─────────────────────────────────────┤
-│       Network Stack (net)           │  net/ (TCP, IPv4, ARP, DHCP, Ethernet)
+│       Network Stack (net)           │  net/ (TCP, IPv4, ARP, DHCP, Ethernet,
+│                                     │        TLS 1.3 server, 4-tuple hash)
 ├─────────────────────────────────────┤
-│     Drivers (virtio-net, PCI)       │  drivers/ (PCI, VirtIO, VirtIO-net)
+│     Drivers (virtio-net, gVNIC,     │  drivers/ (PCI, VirtIO, virtio-net,
+│              PCI)                   │            gVNIC, net dispatch shim)
 ├─────────────────────────────────────┤
-│       Kernel (serial, mm, ...)      │  kernel/ (types, serial, mm, fdt, mmu,
+│       Kernel (serial, mm, SMP...)   │  kernel/ (serial, mm, fdt, mmu,
+│                                     │          percpu, eventloop,
 │                                     │          exceptions, x86_64 gdt/idt)
 ├─────────────────────────────────────┤
 │        Boot / Entry                 │  boot/ (entry.rs, limine, boot.S)
@@ -29,6 +32,11 @@ Runs on **x86_64** and **ARM64 (aarch64)** via QEMU, Apple Hypervisor.framework 
          x86_64          aarch64
      (Multiboot2/PVH)  (Linux Image/DTB)
 ```
+
+SMP via Limine's MP request on x86_64; one TX + RX queue pair per
+vCPU under Tier 1 polling, with Toeplitz-hashed RSS on gVNIC so
+each core's flows stay on that core. TCP 4-tuple lookups are
+O(1) via a per-core open-addressed hash table.
 
 ## Quick Start
 
@@ -108,46 +116,105 @@ unikernel_binary(
 
 ```
 unikernel/
-├── apps/webserver/         Application (HTTP server example)
+├── apps/webserver/         HTTP + HTTPS example (include_bytes! dev cert)
 ├── uni/                    Platform abstraction crate
 │   ├── lib.rs              TcpListener, TcpStream, log, config
-│   ├── http.rs             HTTP/1.1 server
+│   ├── http.rs             HTTP/1.1 server (+ TLS wrapper)
 │   ├── unikernel.rs        Unikernel backend (serial, idle)
 │   ├── native.rs           Native POSIX backend (sockets)
 │   └── macros/             #[uni::main] proc macro
 ├── net/                    Network stack crate
-│   ├── ethernet.rs, arp.rs, ipv4.rs, tcp.rs, dhcp.rs
-│   └── types.rs            MacAddr, Ipv4Addr, checksum
+│   ├── ethernet.rs, arp.rs, ipv4.rs, udp.rs, dhcp.rs
+│   ├── tcp.rs              TCP + per-core 4-tuple hash table
+│   ├── tls_server.rs       TLS 1.3 state machine (hand-rolled)
+│   └── tls_handshake.rs    ECDSA P-256 + X25519 + ChaCha20-Poly1305
 ├── drivers/                Device driver crate
 │   ├── pci.rs              PCI bus scan, BAR assignment
 │   ├── virtio.rs           VirtIO transport (modern PCI + MMIO)
-│   ├── virtio_net.rs       Network device (TX/RX, IRQ)
-│   └── virtio_console.rs   VirtIO console device (PCI-based platforms)
+│   ├── virtio_net.rs       VirtIO-net driver (TX/RX, legacy MQ)
+│   ├── virtio_console.rs   VirtIO console (for VZ.framework + HVF)
+│   ├── gvnic.rs            Google Virtual NIC driver (GQI_QPL + RSS)
+│   └── net.rs              Runtime NIC dispatch (gVNIC → virtio fallback)
 ├── kernel/                 Kernel library crate (clean Rust)
-│   ├── serial.rs           UART (COM1 / PL011 / VirtIO console)
-│   ├── mm.rs               Physical frame allocator + heap
-│   ├── fdt.rs              Device tree parser (aarch64)
-│   ├── mmu.rs              Page table management
+│   ├── serial.rs, mm.rs, percpu.rs, eventloop.rs, sync.rs
 │   ├── exceptions.rs       GIC interrupt controller (aarch64)
-│   └── x86_64/             GDT, IDT, PIC (x86_64)
-├── boot/                   Boot/entry code (unsafe, asm, #[no_mangle])
-│   ├── entry.rs            Kernel init sequence + global_asm!(boot.S)
-│   ├── limine_entry.rs     Limine boot protocol
-│   ├── libc.rs             memcpy/memset (compiler intrinsics)
+│   └── x86_64/             GDT, IDT, APIC, SMP bring-up (Limine MP)
+├── boot/
+│   ├── entry.rs            Kernel init sequence
+│   ├── limine_entry.rs     Limine boot protocol + AP trampoline
 │   ├── x86_64/boot.S       Multiboot2/PVH entry, page tables, long mode
-│   ├── x86_64/idt_stubs.S  256 ISR stubs
 │   └── aarch64/boot.S      ARM64 Image header, relocations, MMU
-├── bazel/
-│   ├── rules/              unikernel_binary() macro, runner scripts
-│   ├── toolchain/          CC toolchain config, linker scripts
-│   └── platforms/          Platform definitions
-└── scripts/                Benchmark, deployment, test helpers
+├── tools/hvf-runner/       Native HVF runner (macOS arm64 dev loop)
+├── bazel/                  Toolchain + platform configs
+└── scripts/                bench.py, gcp-bench.sh, deploy-gcloud.sh, ...
 ```
 
-## Benchmarks
+## Performance
+
+### Apples-to-apples vs native Linux, same network path
+
+Both targets on GCE `n2-highcpu-4` VMs with gVNIC (4 queue pairs),
+same us-west1-a zone, benched from a separate VM over the VPC
+(`wrk -t4 -d15s` from `kvm-vm`). The two targets share a
+hardware + network topology — the unikernel isn't getting a
+loopback shortcut.
+
+| Workload            | Native Linux | **Unikernel** | Δ |
+|---------------------|-------------:|--------------:|:-:|
+| `/health`      c128 |    278,000   |  **499,000**  | **+79 %** |
+| `/health`      c256 |    255,000   |  **514,000**  | **+102 %** |
+| `/compute`     c100 |     28,700   |   **32,900**  | **+15 %** |
+| `health_tls_max`    |    183,700   |  **294,500**  | **+60 %** |
+| `udp_peak` (pkt/s)  |    566,500   |  **787,000**  | **+39 %** |
+
+The unikernel wins every workload. `/health` doubles at higher
+concurrency (`c256`) because there's no POSIX syscall cost, no
+user/kernel boundary copies, and the TCP stack lives in the same
+address space as the HTTP handler. gVNIC's native Toeplitz RSS
+gives us per-core RX queues with zero software distribution
+overhead.
+
+Earlier numbers that showed native at ~497 k rps were measured
+on kvm-vm localhost (kernel-to-kernel socket, no NIC, no
+Ethernet framing). That's not a fair comparison; over a real
+network path, native pays its full POSIX + general-purpose-TCP
+overhead and the unikernel pulls ahead.
+
+### Alternate NICs on GCE
+
+Same `n2-highcpu-4` host, `/health 4t/c128`:
+
+| NIC                       | rps | notes |
+|---------------------------|----:|-------|
+| virtio-net                | — (bench fails) | GCE's legacy virtio backend stalls under `wrk -c128` bursts |
+| gVNIC, `queue-count=2`    | 411,000 | one physical core effectively — HT pair shares L1 |
+| **gVNIC, `queue-count=4`**| **499,000** | one queue per vCPU; Toeplitz RSS; TCP hash table |
+
+### Running the benchmark
+
+From a VM in the same region as the deployed unikernel:
 
 ```bash
-./scripts/bench.sh
+python3 scripts/bench.py --env remote --target 10.138.x.y \
+    --cores 4 --duration 15
 ```
 
-Measures throughput and latency across the HVF runner, QEMU TCG, Docker/Linux, and native macOS.
+`scripts/gcp-bench.sh` wraps this for the kvm-vm path and
+also runs the nested-KVM / native reference targets.
+
+## Deploying to GCE
+
+```bash
+# From your workstation — builds image + creates instance
+./scripts/deploy-gcloud.sh deploy
+
+# Defaults: n2-highcpu-4 + gVNIC + queue-count=4. Override via env:
+UNIKERNEL_GCE_MACHINE=n2-standard-2 QUEUE_COUNT=2 \
+    ./scripts/deploy-gcloud.sh deploy
+
+# Tail the serial console (boot log ends with `Entering event loop.`)
+./scripts/deploy-gcloud.sh logs
+
+# Stop / delete
+./scripts/deploy-gcloud.sh purge
+```
