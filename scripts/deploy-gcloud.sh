@@ -46,7 +46,7 @@ MODE="${1:-deploy}"
 
 NAME="${UNIKERNEL_GCE_NAME:-unikernel-webserver}"
 ZONE="${UNIKERNEL_GCE_ZONE:-us-west1-a}"
-MACHINE_TYPE="${UNIKERNEL_GCE_MACHINE:-n2-standard-2}"
+MACHINE_TYPE="${UNIKERNEL_GCE_MACHINE:-n2-highcpu-4}"
 BUCKET="${UNIKERNEL_GCS_BUCKET:-${NAME}-images}"
 
 # Single-slot deploy: the image / tarball / workdir all use stable
@@ -227,11 +227,11 @@ deploy() {
     # The `nic-type=GVNIC` flag switches the vNIC backend. Requires the
     # image to carry the GVNIC guest-os-feature (set on image create).
     # QUEUE_COUNT: number of RX+TX queue pairs to request from the
-    # vNIC backend. Should match the guest's vCPU count so each core
-    # owns a queue pair under Tier 1. Defaults to 2 for backward
-    # compat with n2-standard-2 benches; set QUEUE_COUNT=4 for
-    # n2-highcpu-4 etc. gVNIC honours up to 8 per instance.
-    local qc="${QUEUE_COUNT:-2}"
+    # vNIC backend. Should match the guest's vCPU count so each
+    # core owns a queue pair under Tier 1. Default 4 to match the
+    # default n2-highcpu-4 machine type; override for other sizes.
+    # gVNIC honours up to 8 per instance.
+    local qc="${QUEUE_COUNT:-4}"
     local nic_args
     if [[ "${GVNIC_NIC:-}" == "1" ]]; then
         echo "    (using gVNIC, queue-count=${qc}; guest driver must support Google VNIC)"
