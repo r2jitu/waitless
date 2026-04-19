@@ -200,6 +200,129 @@ static POOLS: kernel::percpu::PerCpu<CoreSlots, MAX_CORES> =
         [const { [const { TcpConnCell::new() }; CONNECTIONS_PER_CORE] }; MAX_CORES],
     );
 
+// ---- Per-core 4-tuple → slot hash table ------------------------------------
+//
+// The hot RX path needs to map (src_ip, src_port, dst_port) to the
+// TcpConnection slot hosting that flow. A linear scan over
+// `CONNECTIONS_PER_CORE` slots per packet was costing ~10 % of a
+// core at 113 k rps with 32 live conns. An open-addressed hash table
+// with a simple Fibonacci hash lookup is effectively O(1).
+//
+// Per-core, single-writer discipline. All state lives in the
+// `TcpHashCore::keys` + `slots` pair, protected by the same
+// "only the owning core touches its slot" contract as `POOLS`.
+//
+// Key packing: `(ip << 32) | (rport << 16) | lport | (1 << 63)`.
+// The top-bit flag makes "key == 0" the unambiguous empty marker.
+const TCP_HASH_SIZE: usize = 256;
+const TCP_HASH_MASK: usize = TCP_HASH_SIZE - 1;
+
+struct TcpHashCore {
+    keys: core::cell::UnsafeCell<[u64; TCP_HASH_SIZE]>,
+    slots: core::cell::UnsafeCell<[u16; TCP_HASH_SIZE]>,
+}
+unsafe impl Sync for TcpHashCore {}
+unsafe impl Send for TcpHashCore {}
+impl TcpHashCore {
+    const fn new() -> Self {
+        TcpHashCore {
+            keys: core::cell::UnsafeCell::new([0; TCP_HASH_SIZE]),
+            slots: core::cell::UnsafeCell::new([0; TCP_HASH_SIZE]),
+        }
+    }
+}
+
+static TCP_HASH: kernel::percpu::PerCpu<TcpHashCore, MAX_CORES> =
+    kernel::percpu::PerCpu::new(
+        [const { TcpHashCore::new() }; MAX_CORES],
+    );
+
+#[inline]
+fn tcp_hash_key(src_ip: Ipv4Addr, src_port: u16, dst_port: u16) -> u64 {
+    let ip = u32::from_be_bytes(src_ip.octets()) as u64;
+    (ip << 32) | ((src_port as u64) << 16) | (dst_port as u64) | (1u64 << 63)
+}
+
+#[inline]
+fn tcp_hash_bucket(key: u64) -> usize {
+    // Fibonacci hash — multiplies by 2^64/phi and takes the top
+    // bits. Fast (one imul), good distribution for arbitrary
+    // 64-bit keys.
+    let h = key.wrapping_mul(0x9E3779B97F4A7C15);
+    (h >> (64 - 8)) as usize
+}
+
+fn tcp_hash_find(core: u32, key: u64) -> Option<usize> {
+    let h = TCP_HASH.at(core);
+    // SAFETY: per-core ownership, only the owning core reads/writes.
+    let keys = unsafe { &*h.keys.get() };
+    let slots = unsafe { &*h.slots.get() };
+    let start = tcp_hash_bucket(key);
+    for i in 0..TCP_HASH_SIZE {
+        let idx = (start + i) & TCP_HASH_MASK;
+        let k = keys[idx];
+        if k == 0 { return None; }
+        if k == key { return Some(slots[idx] as usize); }
+    }
+    None
+}
+
+fn tcp_hash_insert(core: u32, key: u64, slot: usize) {
+    let h = TCP_HASH.at(core);
+    let keys = unsafe { &mut *h.keys.get() };
+    let slots = unsafe { &mut *h.slots.get() };
+    let start = tcp_hash_bucket(key);
+    for i in 0..TCP_HASH_SIZE {
+        let idx = (start + i) & TCP_HASH_MASK;
+        if keys[idx] == 0 || keys[idx] == key {
+            keys[idx] = key;
+            slots[idx] = slot as u16;
+            return;
+        }
+    }
+    // Table full — CONNECTIONS_PER_CORE=128 < TCP_HASH_SIZE=256,
+    // so this path is effectively unreachable under normal load.
+}
+
+fn tcp_hash_remove(core: u32, key: u64) {
+    let h = TCP_HASH.at(core);
+    let keys = unsafe { &mut *h.keys.get() };
+    let slots = unsafe { &mut *h.slots.get() };
+    let start = tcp_hash_bucket(key);
+    // First find the entry.
+    let mut found_idx = None;
+    for i in 0..TCP_HASH_SIZE {
+        let idx = (start + i) & TCP_HASH_MASK;
+        let k = keys[idx];
+        if k == 0 { return; }
+        if k == key { found_idx = Some(idx); break; }
+    }
+    let idx = match found_idx {
+        Some(i) => i,
+        None => return,
+    };
+    keys[idx] = 0;
+    slots[idx] = 0;
+    // Back-shift the open-addressing run so later probes for keys
+    // that collided past this slot still find them. Stop at the
+    // first empty slot.
+    let mut i = (idx + 1) & TCP_HASH_MASK;
+    while keys[i] != 0 {
+        let moving_key = keys[i];
+        let moving_slot = slots[i];
+        keys[i] = 0;
+        slots[i] = 0;
+        // Re-insert the displaced entry from its ideal bucket.
+        let mut new_idx = tcp_hash_bucket(moving_key);
+        while keys[new_idx] != 0 {
+            new_idx = (new_idx + 1) & TCP_HASH_MASK;
+        }
+        keys[new_idx] = moving_key;
+        slots[new_idx] = moving_slot;
+        i = (i + 1) & TCP_HASH_MASK;
+    }
+}
+
 /// Get a `*mut TcpConnection` for `(core, slot)`. The caller must
 /// uphold the per-core ownership discipline (only the owning core may
 /// dereference the resulting pointer mutably).
@@ -256,6 +379,13 @@ fn alloc_connection(core: u32) -> Option<usize> {
 fn free_connection(core: u32, slot: usize) {
     // SAFETY: per-core ownership.
     let c = unsafe { &mut *conn_ptr(core, slot) };
+    // Remove this connection's 4-tuple from the per-core hash index
+    // so future packets won't hit a stale entry. No-op for listeners
+    // (they aren't inserted).
+    if c.state != TcpState::Closed && c.state != TcpState::Listen {
+        let key = tcp_hash_key(c.remote_ip, c.remote_port, c.local_port);
+        tcp_hash_remove(core, key);
+    }
     // Assigning a fresh TcpConnection drops the old one, which runs
     // the Drop impl on `rx_buf: Option<KBox<[u8]>>` — KBox::drop calls
     // kfree. No manual kfree needed.
@@ -412,6 +542,12 @@ pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
             c.rx_tail = 0;
         }
 
+        // Publish this 4-tuple to the per-core hash index so the
+        // subsequent ACK + data segments land in `tcp_hash_find`
+        // with one probe instead of a 128-slot linear scan.
+        let key = tcp_hash_key(src_ip, src_port, dst_port);
+        tcp_hash_insert(core, key, slot);
+
         // Send SYN+ACK
         {
             let c = unsafe { &*conn_ptr(core, slot) };
@@ -424,28 +560,23 @@ pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
         return;
     }
 
-    // Find existing connection on this core
-    let conn_slot = {
-        let mut found = None;
-        for i in 0..CONNECTIONS_PER_CORE {
-            let c = unsafe { &*conn_ptr(core, i) };
-            if c.state != TcpState::Closed
-                && c.state != TcpState::Listen
-                && c.remote_ip == src_ip
-                && c.local_port == dst_port
-                && c.remote_port == src_port
-            {
-                found = Some(i);
-                break;
-            }
-        }
-        found
-    };
-
-    let slot = match conn_slot {
-        Some(i) => i,
+    // O(1) hash lookup by 4-tuple (replaces an O(128) linear scan
+    // that used to dominate cost on the RX hot path under
+    // wrk-c128 load). Also verify state — the linear scan used to
+    // filter out Closed/Listen implicitly; with the hash we must
+    // guard against stale entries left behind if any transition to
+    // Closed took a path that skipped `free_connection`.
+    let key = tcp_hash_key(src_ip, src_port, dst_port);
+    let slot = match tcp_hash_find(core, key) {
+        Some(s) => s,
         None => return,
     };
+    {
+        let c = unsafe { &*conn_ptr(core, slot) };
+        if c.state == TcpState::Closed || c.state == TcpState::Listen {
+            return;
+        }
+    }
 
     let c = unsafe { &mut *conn_ptr(core, slot) };
 
