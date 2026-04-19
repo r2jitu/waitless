@@ -251,6 +251,13 @@ struct TxQueue {
     /// TX slot recycling (a slot is reusable once done_cnt passes
     /// its fill_cnt).
     done_cnt: AtomicU32,
+    /// Last value written to this queue's TX doorbell. Used by the
+    /// deferred-kick path — `send_on_qp` updates `fill_cnt` but
+    /// only writes the doorbell if the caller explicitly asks
+    /// (via `flush_tx_kick_if_dirty_qp`) or if the ring is about
+    /// to stall. Batching doorbell writes across a poll iteration
+    /// cuts the per-packet MMIO-exit count on GCE.
+    last_kicked: AtomicU32,
 }
 
 /// Per-queue RX metadata. Also QPL-backed: incoming frames are
@@ -324,6 +331,12 @@ static COUNTER_ARRAY_VA: AtomicU64 = AtomicU64::new(0);
 // Active queue pair count. Published once init is done so
 // `num_queue_pairs()` can read it without taking STATE.
 static NUM_QP: AtomicU16 = AtomicU16::new(0);
+// Deferred-kick enable. When true, `send_on_qp` skips the TX
+// doorbell write; callers must periodically call
+// `flush_tx_kick_if_dirty()` (the kernel event loop does this
+// once per iteration after the service callback). Cuts MMIO
+// exits by ~Nx where N is average packets per poll batch.
+static DEFERRED_KICK: AtomicBool = AtomicBool::new(false);
 // Per-queue-pair TxQueue / RxQueue pointers. Each queue struct is
 // allocated on the heap (`uni::Box::leak`) and never freed; the
 // pointer is published here once CREATE_*_QUEUE succeeds.
@@ -1086,15 +1099,19 @@ fn register_page_list(page_list_id: u32, base_phys: u64, num_pages: u32) -> bool
 /// Returns true on success. On failure we log and continue —
 /// the driver still works with queue 0 handling all traffic.
 fn configure_rss(num_qp: u32) -> bool {
-    // RSS key: 40 bytes. Pick an arbitrary, evenly-bit-weighted
-    // pattern so each byte contributes to the hash. The device
-    // hashes the TCP/UDP 4-tuple through the Toeplitz transform
-    // using this key — only the distribution shape matters, not
-    // the specific bytes.
-    let mut key = [0u8; RSS_KEY_SIZE];
-    for i in 0..RSS_KEY_SIZE {
-        key[i] = ((i as u32).wrapping_mul(0x9E3779B1) >> 24) as u8;
-    }
+    // Use Microsoft's standard Toeplitz RSS key. It's the
+    // well-tested 40-byte key every Linux / Windows NIC driver
+    // defaults to, and produces well-distributed hashes for
+    // realistic 4-tuples. Our first attempt used a synthetic key
+    // (`i * 0x9E3779B1 >> 24`) which happened to hash ~99 % of
+    // wrk's flows onto qp 0 on n2-highcpu-4.
+    let key: [u8; RSS_KEY_SIZE] = [
+        0x6d, 0x5a, 0x56, 0xda, 0x25, 0x5b, 0x0e, 0xc2,
+        0x41, 0x67, 0x25, 0x3d, 0x43, 0xa3, 0x8f, 0xb0,
+        0xd0, 0xca, 0x2b, 0xcb, 0xae, 0x7b, 0x30, 0xb4,
+        0x77, 0xcb, 0x2d, 0xa3, 0x80, 0x30, 0xf2, 0x0c,
+        0x6a, 0x42, 0xb7, 0x3b, 0xbe, 0xac, 0x01, 0xfa,
+    ];
 
     // LUT: 128 entries of be32 queue index. Cycle through the
     // active qps so 4-tuple hash distribution maps evenly.
@@ -1238,6 +1255,7 @@ fn create_tx_qp(qp: u32) -> bool {
                 counter_index,
                 fill_cnt: AtomicU32::new(0),
                 done_cnt: AtomicU32::new(0),
+                last_kicked: AtomicU32::new(0),
             });
             // Publish a raw pointer to the TxQueue living inside State
             // so the hot path (`send_on_qp`) can reach it without
@@ -1490,7 +1508,14 @@ pub fn poll_qp_inner(qp: usize, callback: fn(&[u8])) -> u32 {
     let mut expected = rx.expected_seq.load(Ordering::Relaxed);
     let mut delivered: u32 = 0;
 
-    loop {
+    // Batch limit. A runaway (matching-seq loop, or huge single
+    // burst) could otherwise monopolise this core; the event loop
+    // wouldn't get a chance to flush TX, check shutdown, etc. 64
+    // packets per poll call is plenty for throughput and keeps us
+    // responsive.
+    const MAX_BATCH: u32 = 64;
+
+    while delivered < MAX_BATCH {
         let idx = (cons & mask) as usize;
         let desc_ptr = (rx.compl_va as *const u8).wrapping_add(idx * RX_DESC_SIZE);
         // SAFETY: descriptor is 64 bytes inside a DMA-coherent page.
@@ -1605,9 +1630,71 @@ pub fn send_on_qp(qp: usize, data: &[u8]) -> bool {
     }
 
     let new_fill = fill_cnt.wrapping_add(1);
-    tx.fill_cnt.store(new_fill, Ordering::Relaxed);
-    doorbell_write(bar2_va, tx.db_offset, new_fill);
+    tx.fill_cnt.store(new_fill, Ordering::Release);
+
+    // Deferred-kick path: the doorbell write costs a VM-exit on
+    // GCE's gVNIC backend. If the event-loop integration promises
+    // to call `flush_tx_kick_if_dirty()` before idling, we can
+    // batch many sends into one doorbell. Force a kick anyway when
+    // the ring is near full — otherwise a sustained burst with no
+    // flush would stall waiting for completions the device hasn't
+    // been told about.
+    let near_full = new_fill.wrapping_sub(done_cnt) >= (tx.ring_entries as u32) - 16;
+    if !DEFERRED_KICK.load(Ordering::Relaxed) || near_full {
+        doorbell_write(bar2_va, tx.db_offset, new_fill);
+        tx.last_kicked.store(new_fill, Ordering::Relaxed);
+    }
     true
+}
+
+/// Flush the deferred TX kick for the given queue pair. Returns
+/// true if a doorbell write was issued. Called by the event loop
+/// after each service pass to push whatever `send_on_qp` batched
+/// onto the wire before the CPU sits idle.
+pub fn flush_tx_kick_if_dirty_qp(qp: usize) -> bool {
+    if qp >= MAX_QUEUE_PAIRS { return false; }
+    let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
+    if tx_ptr.is_null() { return false; }
+    let tx = unsafe { &*tx_ptr };
+    let fill = tx.fill_cnt.load(Ordering::Relaxed);
+    let kicked = tx.last_kicked.load(Ordering::Relaxed);
+    if fill == kicked {
+        return false;
+    }
+    let bar2_va = BAR2_VA.load(Ordering::Acquire);
+    doorbell_write(bar2_va, tx.db_offset, fill);
+    tx.last_kicked.store(fill, Ordering::Relaxed);
+    true
+}
+
+/// Flush the current core's TX queue if dirty. Mirrors
+/// `drivers::virtio_net::flush_tx_kick_if_dirty` so the shim in
+/// `drivers::net` can dispatch through the same signature.
+pub fn flush_tx_kick_if_dirty() -> bool {
+    let num_qp = NUM_QP.load(Ordering::Acquire) as u32;
+    if num_qp == 0 { return false; }
+    let core = kernel::cpu_id();
+    let qp = if core < num_qp { core as usize } else { 0 };
+    flush_tx_kick_if_dirty_qp(qp)
+}
+
+/// Flush every TX queue's pending kick. Not strictly needed in
+/// per-core-queue Tier 1 mode (each core's `flush_tx_kick_if_dirty`
+/// covers its own queue), but useful if something batches sends
+/// across cores. Called from the shim's `flush_tx_staging()`.
+pub fn flush_all_tx_kicks() {
+    let n = NUM_QP.load(Ordering::Acquire) as usize;
+    for qp in 0..n.min(MAX_QUEUE_PAIRS) {
+        flush_tx_kick_if_dirty_qp(qp);
+    }
+}
+
+/// Turn on batched TX doorbells. Called once by the kernel after
+/// it has wired `flush_tx_kick_if_dirty` into the event loop —
+/// without that guarantee the device would never see the doorbell
+/// writes and TX would stall once the ring fills.
+pub fn enable_deferred_tx_kick() {
+    DEFERRED_KICK.store(true, Ordering::Release);
 }
 
 /// Per-core TX. Picks the queue pair matching `cpu_id()` when that
@@ -1686,11 +1773,17 @@ pub fn poll_qp(qp: usize, callback: fn(&[u8])) -> i32 {
     poll_qp_inner(qp, callback) as i32
 }
 
-/// Single-queue convenience — polls qp 0 only. Used by callers
-/// that are either single-queue (DHCP) or explicitly want a
-/// single-queue path (Tier 2 distribute loop).
+/// Non-per-core poll. Callers (DHCP bring-up, Tier 2 distribute)
+/// don't know which RX queue a given packet landed on, so walk
+/// every live queue. RSS is active by the time `init()` returns,
+/// and DHCP's reply may hash onto any queue — not just qp 0.
 pub fn poll(callback: fn(&[u8])) -> i32 {
-    poll_qp_inner(0, callback) as i32
+    let n = NUM_QP.load(Ordering::Acquire) as usize;
+    let mut total: u32 = 0;
+    for qp in 0..n.min(MAX_QUEUE_PAIRS) {
+        total = total.saturating_add(poll_qp_inner(qp, callback));
+    }
+    total as i32
 }
 
 // ---- Serial logging helpers ------------------------------------------------

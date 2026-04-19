@@ -102,14 +102,18 @@ pub fn send(data: &[u8]) {
 // ---- Virtio-only knobs — no-op on gVNIC ----------------------------------
 
 pub fn flush_tx_staging() {
-    if !use_gvnic() {
+    if use_gvnic() {
+        // gVNIC has no staging queue; the doorbell-coalesced path
+        // may have dirty queues across cores, so flush everything.
+        gvnic::flush_all_tx_kicks();
+    } else {
         virtio_net::flush_tx_staging();
     }
 }
 
 pub fn flush_tx_kick_if_dirty() -> bool {
     if use_gvnic() {
-        false
+        gvnic::flush_tx_kick_if_dirty()
     } else {
         virtio_net::flush_tx_kick_if_dirty()
     }
@@ -157,7 +161,9 @@ pub fn rearm_rx_napi(core_id: u32) -> bool {
 }
 
 pub fn enable_deferred_tx_kick() {
-    if !use_gvnic() {
+    if use_gvnic() {
+        gvnic::enable_deferred_tx_kick();
+    } else {
         virtio_net::enable_deferred_tx_kick();
     }
 }

@@ -96,9 +96,15 @@ fn poll_tier1() -> bool {
     }
     let core = kernel::cpu_id();
     let nqp = drivers::net::num_queue_pairs() as u32;
-    // Each core polls its own queue pair; overflow cores share qp 0.
-    let qp = if core < nqp { core as usize } else { 0 };
-    let count = drivers::net::poll_qp(qp, net_receive);
+    // Only cores with `core < nqp` poll RX — two cores hammering the
+    // same queue race on the cursor atomics and double-deliver /
+    // miss packets. Cores beyond nqp still do service work (they
+    // run handlers for connections whose RX landed on a polling
+    // core); they just don't drive the NIC directly.
+    if core >= nqp {
+        return false;
+    }
+    let count = drivers::net::poll_qp(core as usize, net_receive);
     count > 0
 }
 
