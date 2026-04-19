@@ -1,5 +1,5 @@
 {
-  "checksum": "1b7ed1fc5738b5f76a7814ea459b9d29a045aa49ef47b657b317ce492e3f63f3",
+  "checksum": "1e14d3d42b522338227652b384e63d84cb1ef03e91ec289b21fffe64873a9a96",
   "crates": {
     "aead 0.5.2": {
       "name": "aead",
@@ -760,6 +760,10 @@
             {
               "id": "sha2 0.10.9",
               "target": "sha2"
+            },
+            {
+              "id": "talc 4.4.3",
+              "target": "talc"
             },
             {
               "id": "x25519-dalek 2.0.1",
@@ -3107,6 +3111,50 @@
       ],
       "license_file": "LICENSE-APACHE"
     },
+    "talc 4.4.3": {
+      "name": "talc",
+      "version": "4.4.3",
+      "package_url": "https://github.com/SFBdragon/talc",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/talc/4.4.3/download",
+          "sha256": "a3ae828aa394de34c7de08f522d1b86bd1c182c668d27da69caadda00590f26d"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "talc",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "talc",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "counters"
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "4.4.3"
+      },
+      "license": "MIT",
+      "license_ids": [
+        "MIT"
+      ],
+      "license_file": "LICENSE.md"
+    },
     "typenum 1.19.0": {
       "name": "typenum",
       "version": "1.19.0",
@@ -3554,6 +3602,7 @@
     "p256 0.13.2",
     "rand_core 0.6.4",
     "sha2 0.10.9",
+    "talc 4.4.3",
     "vm-fdt 0.3.0",
     "x25519-dalek 2.0.1"
   ],

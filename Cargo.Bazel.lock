@@ -130,6 +130,7 @@ dependencies = [
  "p256",
  "rand_core",
  "sha2",
+ "talc",
  "x25519-dalek",
 ]
 
@@ -506,6 +507,12 @@ dependencies = [
  "quote",
  "unicode-ident",
 ]
+
+[[package]]
+name = "talc"
+version = "4.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3ae828aa394de34c7de08f522d1b86bd1c182c668d27da69caadda00590f26d"
 
 [[package]]
 name = "typenum"

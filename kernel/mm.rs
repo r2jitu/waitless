@@ -8,16 +8,23 @@
 //    available region for Limine higher-half boot).
 //
 // 2. Kernel heap allocator:
-//    A classic free-list allocator with block headers. Each block has a
-//    header containing {size, next pointer, free flag}. kmalloc() walks the
-//    free list (first-fit), splitting if the block is significantly larger
-//    than requested. kfree() marks the block as free and coalesces with
-//    physically adjacent free blocks.
+//    Thin wrapper over `talc` (a segregated-free-list allocator) behind
+//    our own `Spinlock`. O(log n) alloc + free, honest arbitrary-alignment
+//    support, and per-heap byte-level counters for `/heap`-style
+//    observability. Replaces the previous hand-rolled first-fit +
+//    O(n) backward-coalescing free list.
 //
 //    The heap starts after the frame bitmap and grows upward. We pre-allocate
-//    a fixed heap region (16MB) from the available physical memory.
+//    a fixed heap region (HEAP_SIZE bytes) from the available physical
+//    memory and `claim` it into talc during `init_heap`.
 
-use core::ptr;
+use core::alloc::Layout;
+use core::ptr::{self, NonNull};
+
+#[cfg(target_os = "none")]
+use core::alloc::GlobalAlloc;
+
+use talc::{ErrOnOom, Span, Talc};
 
 // ============================================================================
 // Dependencies
@@ -48,7 +55,6 @@ macro_rules! klog {
 // ============================================================================
 
 const PAGE_SIZE: u64 = 4096;
-const MIN_BLOCK_SIZE: usize = 16;
 const HEAP_SIZE: usize = 32 * 1024 * 1024; // 32 MB
 
 // ============================================================================
@@ -185,40 +191,24 @@ static ADDR_SPACE: InitOnce<AddressSpace> = InitOnce::new();
 // Kernel heap allocator
 // ============================================================================
 
-/// Block header for the heap free-list allocator.
-/// Must be exactly 24 bytes so payload is 16-byte aligned.
-#[repr(C)]
-struct BlockHeader {
-    size: u64,              // Size of usable region (excluding header)
-    next: *mut BlockHeader, // Next block in physical memory order
-    free: bool,             // true if this block is available
-    _padding: [u8; 7],     // Pad to 24 bytes
-}
+/// Kernel heap behind a spinlock. `Talc<ErrOnOom>` is a segregated
+/// free-list allocator; `claim()` is called once during `init_heap`
+/// with the pre-reserved heap span. Every downstream allocation
+/// (GlobalAlloc path + legacy `kmalloc`/`kfree`) funnels through
+/// this single static.
+static HEAP: Spinlock<Talc<ErrOnOom>> = Spinlock::new(Talc::new(ErrOnOom));
 
-const _: () = assert!(core::mem::size_of::<BlockHeader>() == 24);
-
-struct Heap {
-    start: *mut u8,
-    end: *mut u8,
-    head: *mut BlockHeader,
-}
-
-impl Heap {
-    const ZEROED: Self = Self {
-        start: ptr::null_mut(),
-        end: ptr::null_mut(),
-        head: ptr::null_mut(),
-    };
-}
-
-// SAFETY: Heap owns raw pointers (start/end/head). The pointers are
-// never aliased; only the lock holder mutates the free list. Send is
-// sound because the lock transfers exclusive access between cores.
-unsafe impl Send for Heap {}
-
-/// Kernel heap behind a spinlock. Same Tier-1 fix as FRAME_ALLOC: any
-/// concurrent kmalloc/kfree from APs would race the free-list pointers.
-static HEAP: Spinlock<Heap> = Spinlock::new(Heap::ZEROED);
+/// Prefix size for legacy `kmalloc`/`kfree`. The C-style API
+/// doesn't carry the original allocation size at free time, so we
+/// stash the `size` as a leading `usize` and shift the returned
+/// pointer past it. 16 bytes of padding keeps the user-visible
+/// pointer aligned to 16 bytes — the previous allocator's guarantee
+/// that some callers (e.g. virtio-net DMA buffer carving) rely on.
+///
+/// Only paid by `kmalloc`/`kfree` callers. The GlobalAlloc path
+/// (used by `alloc::boxed::Box`, `alloc::vec::Vec`, etc.) knows the
+/// layout at free time and pays zero overhead.
+const KMALLOC_PREFIX: usize = 16;
 
 // ============================================================================
 // Helper
@@ -355,20 +345,24 @@ fn init_frame_allocator(info: &BootInfo, kern_end_phys: u64) -> u64 {
     bitmap_end_phys
 }
 
-/// Set up the kernel heap as a single large free block at `heap_phys`.
+/// Hand the pre-reserved heap span to `talc`. Called once during boot
+/// on the BSP before any AP starts, so the lock below is uncontended.
 fn init_heap(hhdm_offset: u64, heap_phys: u64) {
     let heap_start = (hhdm_offset + heap_phys) as *mut u8;
+    // SAFETY: `heap_start .. heap_start + HEAP_SIZE` is a contiguous
+    // range of valid, exclusive, unused memory — `init_frame_allocator`
+    // just reserved those pages in the frame bitmap, and nothing else
+    // has handed them out. `Span::from_base_size` is const + infallible;
+    // `claim` is sound given that precondition.
+    let span = Span::from_base_size(heap_start, HEAP_SIZE);
     let mut heap = HEAP.lock();
-    heap.start = heap_start;
-    // SAFETY: heap_start points to HEAP_SIZE bytes that init_frame_allocator
-    // already reserved in the frame allocator.
     unsafe {
-        heap.end = heap.start.add(HEAP_SIZE);
-        heap.head = heap.start as *mut BlockHeader;
-        (*heap.head).size = (HEAP_SIZE - core::mem::size_of::<BlockHeader>()) as u64;
-        (*heap.head).next = ptr::null_mut();
-        (*heap.head).free = true;
+        if heap.claim(span).is_err() {
+            klog!("  Heap: talc::claim failed ({} bytes)!\n", HEAP_SIZE);
+            return;
+        }
     }
+    drop(heap);
 
     klog!(
         "  Heap: {} KB at phys {:#x}\n",
@@ -448,36 +442,56 @@ pub fn free_frame(addr: u64) {
 // Global allocator
 // ============================================================================
 //
-// `#[global_allocator]` is required for any crate transitively pulling
-// in `alloc::*` types. Forwarding straight to kmalloc/kfree gives every
-// downstream crate (RustCrypto, rustls, anything else) a working heap
-// without any extra wiring, and keeps the alloc decision in one place.
+// `#[global_allocator]` forwards the GlobalAlloc trait (used by
+// `alloc::boxed::Box`, `alloc::vec::Vec`, RustCrypto internals, …)
+// into `HEAP.lock().malloc/free`. The layout is known at both alloc
+// and dealloc time so no side-channel size tracking is needed here.
 //
-// The allocator only compiles for bare-metal targets (`os = "none"`).
-// Native host builds use libstd's default allocator.
-//
-// `#[used]` keeps the linker from garbage-collecting the symbol when
-// no in-tree code mentions it explicitly, since `#[global_allocator]`
-// resolution happens at the rustc-driver level rather than via a
-// normal symbol reference.
+// Only compiled for bare-metal targets; native host builds use libstd's
+// default allocator via std. `#[used]` keeps the linker from GC'ing
+// the symbol since rustc's `#[global_allocator]` machinery resolves
+// it at driver level rather than via a normal symbol reference.
 
 #[cfg(target_os = "none")]
 pub struct KernelAllocator;
 
 #[cfg(target_os = "none")]
-unsafe impl core::alloc::GlobalAlloc for KernelAllocator {
-    unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
-        // SAFETY: kmalloc is a safe function (returns null on OOM)
-        // wrapped here to satisfy the unsafe trait.
-        debug_assert!(
-            layout.align() <= 16,
-            "kernel::mm::KernelAllocator can't honour align > 16",
-        );
-        kmalloc(layout.size())
+unsafe impl GlobalAlloc for KernelAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if layout.size() == 0 {
+            // `talc::malloc` requires non-zero size; the GlobalAlloc
+            // contract lets us return any non-null well-aligned pointer
+            // for ZSTs. A dangling pointer at the requested alignment
+            // is both sound and ubiquitous (alloc::alloc::alloc does
+            // the same).
+            return core::ptr::without_provenance_mut(layout.align());
+        }
+        let mut heap = HEAP.lock();
+        // SAFETY: size is non-zero (checked above); the spinlock grants
+        // exclusive access to the allocator state.
+        match unsafe { heap.malloc(layout) } {
+            Ok(nn) => nn.as_ptr(),
+            Err(()) => {
+                drop(heap);
+                klog!(
+                    "mm::alloc: OOM ({} bytes, align {})\n",
+                    layout.size(),
+                    layout.align()
+                );
+                ptr::null_mut()
+            }
+        }
     }
 
-    unsafe fn dealloc(&self, ptr: *mut u8, _layout: core::alloc::Layout) {
-        kfree(ptr);
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if layout.size() == 0 {
+            return;
+        }
+        let Some(nn) = NonNull::new(ptr) else { return };
+        let mut heap = HEAP.lock();
+        // SAFETY: caller guarantees `ptr` came from a previous `alloc`
+        // with a matching `layout`; the spinlock grants exclusive access.
+        unsafe { heap.free(nn, layout) };
     }
 }
 
@@ -486,88 +500,108 @@ unsafe impl core::alloc::GlobalAlloc for KernelAllocator {
 #[used]
 pub static GLOBAL_ALLOCATOR: KernelAllocator = KernelAllocator;
 
+/// Layout the legacy `kmalloc` path uses. The 16-byte prefix stores
+/// the user-requested size so `kfree` can reconstruct the exact layout
+/// that was handed to `talc::malloc`.
+fn kmalloc_layout(user_size: usize) -> Option<Layout> {
+    let total = user_size.checked_add(KMALLOC_PREFIX)?;
+    Layout::from_size_align(total, KMALLOC_PREFIX).ok()
+}
+
+/// Legacy size-only malloc, retained for DMA-buffer call sites in
+/// `drivers/virtio_net.rs` and a handful of wrapper types that
+/// predate `#[global_allocator]`. Stores the requested size in a
+/// 16-byte prefix so `kfree` can recover the layout.
+///
+/// Prefer `alloc::boxed::Box` / `alloc::alloc::alloc` for new code —
+/// those skip the prefix overhead.
 pub fn kmalloc(size: usize) -> *mut u8 {
     if size == 0 {
         return ptr::null_mut();
     }
+    let Some(layout) = kmalloc_layout(size) else {
+        return ptr::null_mut();
+    };
 
-    // Align up to 16 bytes
-    let size = (size + 15) & !15;
-
-    let heap = HEAP.lock();
-    // SAFETY: hold the lock; nobody else mutates heap.head or any block.
-    unsafe {
-        // First-fit search
-        let mut current = heap.head;
-        while !current.is_null() {
-            if (*current).free && (*current).size >= size as u64 {
-                // Split the block if it's significantly larger
-                let header_size = core::mem::size_of::<BlockHeader>();
-                if (*current).size >= (size + header_size + MIN_BLOCK_SIZE) as u64 {
-                    let new_block = (current as *mut u8).add(header_size + size) as *mut BlockHeader;
-                    (*new_block).size = (*current).size - size as u64 - header_size as u64;
-                    (*new_block).next = (*current).next;
-                    (*new_block).free = true;
-
-                    (*current).size = size as u64;
-                    (*current).next = new_block;
-                }
-
-                (*current).free = false;
-
-                // Return pointer just past the header
-                return (current as *mut u8).add(header_size);
-            }
-            current = (*current).next;
+    let mut heap = HEAP.lock();
+    // SAFETY: non-zero size checked; lock grants exclusive access.
+    let raw = match unsafe { heap.malloc(layout) } {
+        Ok(nn) => nn.as_ptr(),
+        Err(()) => {
+            drop(heap);
+            klog!("mm::kmalloc: OOM ({} bytes)\n", size);
+            return ptr::null_mut();
         }
-    }
+    };
+    drop(heap);
 
-    klog!("mm::kmalloc: out of heap memory (requested {} bytes)!\n", size);
-    ptr::null_mut()
+    // Stash the size in the prefix and hand the caller the payload.
+    // SAFETY: `raw` is 16-byte aligned and points to `size + 16` bytes
+    // of exclusive storage; writing a `usize` to the first word is
+    // within bounds and properly aligned.
+    unsafe {
+        (raw as *mut usize).write(size);
+        raw.add(KMALLOC_PREFIX)
+    }
 }
 
 pub fn kfree(ptr: *mut u8) {
     if ptr.is_null() {
         return;
     }
-
-    let heap = HEAP.lock();
-    // SAFETY: hold the lock; nobody else mutates the free list.
+    // SAFETY: `ptr` came from `kmalloc` which returned `raw + 16`, so
+    // `ptr - 16` is the original talc allocation and the first word is
+    // the size we stored.
     unsafe {
-        let header_size = core::mem::size_of::<BlockHeader>();
-        let block = ptr.sub(header_size) as *mut BlockHeader;
-
-        // Sanity check: pointer within heap?
-        let block_addr = block as *mut u8;
-        if block_addr < heap.start || block_addr >= heap.end {
-            klog!("mm::kfree: pointer outside the heap!\n");
+        let raw = ptr.sub(KMALLOC_PREFIX);
+        let size = (raw as *const usize).read();
+        let Some(layout) = kmalloc_layout(size) else {
+            klog!("mm::kfree: corrupt size prefix\n");
             return;
-        }
+        };
+        let Some(nn) = NonNull::new(raw) else { return };
+        let mut heap = HEAP.lock();
+        heap.free(nn, layout);
+    }
+}
 
-        if (*block).free {
-            klog!("mm::kfree: double free detected!\n");
-            return;
-        }
+// ============================================================================
+// Heap statistics
+// ============================================================================
 
-        (*block).free = true;
+/// Point-in-time snapshot of the kernel heap. Populated from `talc`'s
+/// built-in counters (`counters` feature) — no second pass over the
+/// free list is needed.
+#[derive(Debug, Clone, Copy)]
+pub struct HeapStats {
+    /// Bytes currently in flight (sum of live allocation sizes).
+    pub allocated_bytes: usize,
+    /// Bytes claimed but not allocated (free holes in the heap).
+    pub available_bytes: usize,
+    /// Total bytes the allocator controls (~HEAP_SIZE, minus a few
+    /// bytes of talc bookkeeping).
+    pub claimed_bytes: usize,
+    /// Number of live allocations.
+    pub allocation_count: usize,
+    /// Number of free holes (fragmentation indicator).
+    pub fragment_count: usize,
+    /// Cumulative allocations since boot — useful as an
+    /// "allocator hot or cold?" sanity check.
+    pub total_allocation_count: u64,
+}
 
-        // Coalesce with next block if free
-        if !(*block).next.is_null() && (*(*block).next).free {
-            (*block).size += header_size as u64 + (*(*block).next).size;
-            (*block).next = (*(*block).next).next;
-        }
-
-        // Coalesce with previous block if free (O(n) walk)
-        let mut prev: *mut BlockHeader = ptr::null_mut();
-        let mut current = heap.head;
-        while !current.is_null() && current != block {
-            prev = current;
-            current = (*current).next;
-        }
-        if !prev.is_null() && (*prev).free {
-            (*prev).size += header_size as u64 + (*block).size;
-            (*prev).next = (*block).next;
-        }
+/// Snapshot the kernel heap. Cheap: `talc` maintains the counters
+/// inline, so this is O(1) plus the spinlock.
+pub fn heap_stats() -> HeapStats {
+    let heap = HEAP.lock();
+    let c = heap.get_counters();
+    HeapStats {
+        allocated_bytes: c.allocated_bytes,
+        available_bytes: c.available_bytes,
+        claimed_bytes: c.claimed_bytes,
+        allocation_count: c.allocation_count,
+        fragment_count: c.fragment_count,
+        total_allocation_count: c.total_allocation_count,
     }
 }
 

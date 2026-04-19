@@ -45,6 +45,7 @@ rust_library(
         "@crates//:chacha20",
         "@crates//:getrandom",
         "@crates//:sha2",
+        "@crates//:talc",
     ] + select({
         "//bazel/platforms:aarch64": ["@crates//:fdt"],
         "//conditions:default": [],

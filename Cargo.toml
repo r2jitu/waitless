@@ -102,6 +102,19 @@ rand_core = { version = "0.6", default-features = false }
 # via `kernel::rng::register_custom_getrandom!`.
 getrandom = { version = "0.2", default-features = false, features = ["custom"] }
 
+# Kernel heap allocator. `talc` is a no_std segregated-free-list
+# allocator with O(log n) alloc/free and honest arbitrary-alignment
+# support. Replaces the hand-rolled first-fit + O(n) coalescing
+# allocator that previously lived in `kernel/mm.rs`.
+#
+# We wrap it in our own `Spinlock<Talc<ErrOnOom>>` rather than using
+# `Talck<spin::Mutex<...>, ...>` so we don't pull the `spin` crate
+# into the kernel — the kernel already has a battle-tested spinlock.
+#
+# `counters` exposes used/free byte counters for `/heap` observability
+# without requiring a second pass over the free list at query time.
+talc = { version = "4", default-features = false, features = ["counters"] }
+
 # Warnings are errors for every workspace member's cargo-standalone
 # build. Bazel builds get the same policy via the `-Dwarnings` flag in
 # `.bazelrc`'s `extra_rustc_flags`, so CI and IDE behaviour match.

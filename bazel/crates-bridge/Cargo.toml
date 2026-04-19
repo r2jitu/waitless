@@ -31,3 +31,4 @@ x25519-dalek = { workspace = true }
 p256 = { workspace = true }
 rand_core = { workspace = true }
 getrandom = { workspace = true }
+talc = { workspace = true }
