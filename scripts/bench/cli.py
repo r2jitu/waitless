@@ -17,6 +17,7 @@ from .envs import (
     KvmEnv,
     QemuAarch64Env,
     QemuEnv,
+    RemoteEnv,
     start_env_verified,
 )
 from .workloads import (
@@ -140,6 +141,10 @@ def main():
                         help="Pre-built ELF path (kvm env; skips bazel build)")
     parser.add_argument("--native-bin", default=None,
                         help="Pre-built native binary path (native env; skips bazel build)")
+    parser.add_argument("--target", default=None,
+                        help="Target IP for --env remote (e.g. the GCE "
+                             "unikernel-webserver internal IP). Required when "
+                             "--env remote is used.")
     args = parser.parse_args()
 
     duration = args.duration
@@ -191,6 +196,11 @@ def main():
             envs[name].elf_override = os.path.abspath(args.elf)
         if name == "native" and args.native_bin:
             envs[name].bin_override = os.path.abspath(args.native_bin)
+        if name == "remote":
+            if not args.target:
+                print("--env remote requires --target <ip>")
+                sys.exit(1)
+            envs[name].GUEST_IP = args.target
 
     # Collect results: results[(env_name, cpus, workload_name)] = (rps, p50, p99)
     results = {}
@@ -272,7 +282,7 @@ def main():
                 # KvmEnv uses a tap backend with a fixed guest IP/ports
                 # rather than localhost hostfwd; other envs keep the old
                 # localhost+ephemeral-port default.
-                if isinstance(env, KvmEnv):
+                if isinstance(env, (KvmEnv, RemoteEnv)):
                     wrk_host = env.GUEST_IP
                     wrk_port = env.GUEST_PORT
                     tls_target_port = env.GUEST_TLS_PORT

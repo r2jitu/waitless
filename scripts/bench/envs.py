@@ -329,6 +329,46 @@ class HvfEnv:
         return f"HVF {cpus}c"
 
 
+class RemoteEnv:
+    """Bench target that's already running somewhere else. No build, no
+    start, no stop — just a reachable `ip:port` the workload hits.
+    Intended for benching a dedicated unikernel VM (e.g. the
+    `unikernel-webserver` GCE instance) rather than a VM we spawn
+    locally. Set `--target 10.0.0.1` on the CLI; leave `--cores` as
+    whatever the remote VM actually has so the `*_per_core` workloads
+    scale pressure correctly.
+    """
+
+    name = "remote"
+    label = "Remote"
+
+    # Matches KvmEnv so `isinstance` branches that dispatch on
+    # "has GUEST_IP/PORT" pick up the same values. Override GUEST_IP
+    # via CLI `--target`.
+    GUEST_IP = None
+    GUEST_PORT = 80
+    GUEST_TLS_PORT = 443
+    GUEST_UDP_PORT = 7
+
+    def __init__(self):
+        # Non-None sentinel so `_current["proc"]` cleanup logic treats
+        # a started RemoteEnv as "running". It's never actually exec'd.
+        self._sentinel = object()
+
+    def build(self):
+        pass
+
+    def start(self, cpus, port):
+        # `cpus` and `port` are ignored — the remote VM is what it is.
+        return self._sentinel
+
+    def stop(self, proc):
+        pass
+
+    def core_label(self, cpus):
+        return f"Remote {cpus}c"
+
+
 ENV_MAP = {
     "qemu": QemuEnv,
     "kvm": KvmEnv,
@@ -336,6 +376,7 @@ ENV_MAP = {
     "hvf": HvfEnv,
     "docker": DockerEnv,
     "native": NativeEnv,
+    "remote": RemoteEnv,
 }
 
 
@@ -366,7 +407,7 @@ def start_env_verified(env, cpus, port):
             return proc
         env.stop(proc)
         return None
-    elif isinstance(env, KvmEnv):
+    elif isinstance(env, (KvmEnv, RemoteEnv)):
         if wait_http(env.GUEST_PORT, host=env.GUEST_IP):
             return proc
         env.stop(proc)
