@@ -214,18 +214,21 @@ deploy() {
     wait "$vm_del_pid"
 
     echo "==> Launching VM: $NAME"
-    # NIC selection: virtio-net (default) or gVNIC (GVNIC_NIC=1).
+    # NIC selection: gVNIC (default) or legacy virtio-net (LEGACY_VIRTIO_NIC=1).
+    #
+    # gVNIC is Google's own NIC format; real Toeplitz RSS spreads
+    # 4-tuples across queues so Tier 1 multi-queue actually uses all
+    # cores. The `nic-type=GVNIC` flag switches the vNIC backend;
+    # the image carries the GVNIC guest-os-feature (set on image
+    # create above). See reference_gce_gvnic.md.
     #
     # virtio-net on GCE is strictly legacy v0.95 (no modern PCI caps,
-    # can't negotiate VIRTIO_F_VERSION_1). Legacy MQ works once the
-    # ctrl-vq activation dance is done correctly — see `CtrlMqBuf` +
-    # ctrl_mq_set_pairs in virtio_net.rs. But GCE's Andromeda backend
-    # doesn't actually hash RX across queues for virtio, so Tier 1
-    # multi-queue lands all flows on qp 0 (see reference_gce_legacy_mq.md).
+    # can't negotiate VIRTIO_F_VERSION_1). Legacy MQ activates but
+    # GCE's Andromeda backend doesn't actually hash RX across queues
+    # for virtio — all flows land on qp 0 (see
+    # reference_gce_legacy_mq.md). Kept behind LEGACY_VIRTIO_NIC=1
+    # for A/B comparison only.
     #
-    # gVNIC is Google's own NIC format; RSS multi-queue works natively.
-    # The `nic-type=GVNIC` flag switches the vNIC backend. Requires the
-    # image to carry the GVNIC guest-os-feature (set on image create).
     # QUEUE_COUNT: number of RX+TX queue pairs to request from the
     # vNIC backend. Should match the guest's vCPU count so each
     # core owns a queue pair under Tier 1. Default 4 to match the
@@ -233,11 +236,12 @@ deploy() {
     # gVNIC honours up to 8 per instance.
     local qc="${QUEUE_COUNT:-4}"
     local nic_args
-    if [[ "${GVNIC_NIC:-}" == "1" ]]; then
-        echo "    (using gVNIC, queue-count=${qc}; guest driver must support Google VNIC)"
-        nic_args="nic-type=GVNIC,queue-count=${qc}"
-    else
+    if [[ "${LEGACY_VIRTIO_NIC:-}" == "1" ]]; then
+        echo "    (using legacy virtio-net, queue-count=${qc} — RX pins to qp0 on GCE)"
         nic_args="queue-count=${qc}"
+    else
+        echo "    (using gVNIC, queue-count=${qc})"
+        nic_args="nic-type=GVNIC,queue-count=${qc}"
     fi
     gcloud compute instances create "$NAME" \
         --zone="$ZONE" \
