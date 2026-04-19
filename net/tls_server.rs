@@ -49,6 +49,9 @@ extern crate net_tls_record as record;
 extern crate p256;
 extern crate sha2;
 
+use alloc::alloc::{alloc_zeroed, Layout};
+use alloc::boxed::Box;
+
 // `//kernel` is only linked in on bare-metal builds (see
 // net/BUILD.bazel's select()). The native host build uses the
 // same tls_server sources but skips the kernel dep entirely,
@@ -82,11 +85,10 @@ mod handlers;
 // Tunables
 // ============================================================================
 //
-// Buffer sizes chosen so `Box::new(TlsServer::new(...))` doesn't
-// overflow a 64 KB kernel stack during construction. Rust's Box::new
-// constructs the value on the stack before moving it to the heap,
-// and a debug build doesn't always elide that — so keep the combined
-// buffer footprint well under half the stack.
+// rx/tx/pt buffers are heap-allocated via `zeroed_boxed_slice` in
+// `TlsServer::new` (see below), so these sizes don't impact the
+// boot stack. Sized to fit a typical ClientHello / server flight /
+// HTTP/1.1 request respectively; 4 KB is generous for all three.
 
 /// Max raw TLS bytes we buffer from the peer before advancing the
 /// state machine. Sized to hold a typical ClientHello (~500 bytes)
@@ -292,17 +294,19 @@ pub struct TlsServer {
     pub(crate) error: Option<TlsError>,
 
     // Raw TLS bytes received from peer (may contain partial or
-    // multiple records).
-    pub(crate) rx_buf: [u8; RX_BUF_LEN],
+    // multiple records). Heap-allocated so the 4 KB footprint lands
+    // on the heap at connection-accept time instead of reserving
+    // the bytes inline for every pre-allocated `TlsServer` slot.
+    pub(crate) rx_buf: Box<[u8]>,
     pub(crate) rx_len: usize,
 
     // Raw TLS bytes waiting to be sent to peer.
-    pub(crate) tx_buf: [u8; TX_BUF_LEN],
+    pub(crate) tx_buf: Box<[u8]>,
     pub(crate) tx_len: usize,
     pub(crate) tx_pos: usize, // how many bytes we've handed out via pop_tx()
 
     // Decrypted application data waiting to be consumed by the app.
-    pub(crate) pt_buf: [u8; PT_BUF_LEN],
+    pub(crate) pt_buf: Box<[u8]>,
     pub(crate) pt_len: usize,
     pub(crate) pt_pos: usize,
 
@@ -328,13 +332,43 @@ impl Drop for TlsServer {
         // TrafficKey / KeySchedule have their own Drop impls that
         // wipe `key` / `iv` / `secret`. The raw handshake-secret
         // arrays in this struct are separately held, so scrub them
-        // here before the backing memory is released back to kmalloc.
+        // here before the backing memory is released back to the
+        // global allocator. (rx/tx/pt Box<[u8]> drops are safe to
+        // leave as-is — they hold ciphertext and decrypted request
+        // plaintext, which isn't secret key material.)
         if let Some(mut s) = self.server_hs_secret.take() {
             tls::secure_zero(&mut s);
         }
         if let Some(mut s) = self.client_hs_secret.take() {
             tls::secure_zero(&mut s);
         }
+    }
+}
+
+/// Allocate a zero-filled `Box<[u8]>` directly on the heap via
+/// `alloc_zeroed`, bypassing any `[0u8; N]` stack temporary.
+/// Critical for this module because a stack-constructed then
+/// moved-to-heap `[0u8; 4096]` array could blow the boot stack
+/// before optimisation — `alloc_zeroed` writes straight to the
+/// new allocation.
+///
+/// OOM aborts (`handle_alloc_error`); TlsServer::new is called
+/// from connection-accept, and refusing an HTTPS conn at the
+/// kernel-OOM level would cascade into aborting the connection
+/// anyway, so we let the global allocator's OOM handler run.
+fn zeroed_boxed_slice(len: usize) -> Box<[u8]> {
+    let layout = Layout::from_size_align(len, 1).expect("valid layout");
+    // SAFETY: non-zero size (RX/TX/PT_BUF_LEN are all 4 KB > 0);
+    // u8 has no invalid bit patterns so zero-initialised memory is
+    // a valid `[u8]`; Box::from_raw takes ownership of the
+    // freshly-allocated slice pointer.
+    unsafe {
+        let raw = alloc_zeroed(layout);
+        if raw.is_null() {
+            alloc::alloc::handle_alloc_error(layout);
+        }
+        let slice = core::slice::from_raw_parts_mut(raw, len);
+        Box::from_raw(slice)
     }
 }
 
@@ -346,12 +380,12 @@ impl TlsServer {
         TlsServer {
             state: State::WaitClientHello,
             error: None,
-            rx_buf: [0; RX_BUF_LEN],
+            rx_buf: zeroed_boxed_slice(RX_BUF_LEN),
             rx_len: 0,
-            tx_buf: [0; TX_BUF_LEN],
+            tx_buf: zeroed_boxed_slice(TX_BUF_LEN),
             tx_len: 0,
             tx_pos: 0,
-            pt_buf: [0; PT_BUF_LEN],
+            pt_buf: zeroed_boxed_slice(PT_BUF_LEN),
             pt_len: 0,
             pt_pos: 0,
             transcript: Transcript::new(),
