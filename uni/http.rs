@@ -138,28 +138,64 @@ impl Request {
 
 // ---- Response ---------------------------------------------------------------
 
+/// Body storage for a `Response`. Either a borrowed byte slice (the
+/// common case: `&'static [u8]` for compile-time strings like
+/// INDEX_HTML / HEALTH_JSON), or a heap-owned `Box<[u8]>` for
+/// dynamically rendered bodies (e.g. `/stats` / `/heap` /
+/// `/tls_profile`). The enum is `#[repr(C)]` so `body_bytes` compiles
+/// to a single conditional branch per access, not a vtable jump.
+pub enum ResponseBody {
+    /// A borrowed byte slice with lifetime that outlives `Response`.
+    /// Stored as a raw pointer pair so the struct keeps its current
+    /// `Send + Sync` properties without needing a lifetime parameter.
+    /// Callers must ensure the bytes outlive the handler return /
+    /// `send_response` call, which is always true for the `&'static`
+    /// case that `Response::ok` covers.
+    Static { ptr: *const u8, len: usize },
+    /// A heap-owned byte slice. Dropped when `Response` drops, which
+    /// happens after `send_response` has copied the bytes into the
+    /// outbound TCP/TLS buffer.
+    Owned(alloc::boxed::Box<[u8]>),
+}
+
 pub struct Response {
     pub status: i32,
     content_type: *const u8,
     content_type_len: usize,
-    body: *const u8,
-    body_len: usize,
+    body: ResponseBody,
 }
 
-// Response stores pointers to caller-owned data. Safe because Response
-// is always used within a single function scope (handler returns it,
-// send_response consumes it immediately).
+// Response is Send/Sync: the Static variant stores borrowed raw
+// pointers whose targets live as long as the handler, and Owned
+// holds a Box<[u8]> which is itself Send/Sync.
 unsafe impl Send for Response {}
 unsafe impl Sync for Response {}
 
 impl Response {
+    /// Build a 200 OK with a borrowed body. Zero-allocation common case.
     pub fn ok(content_type: &[u8], body: &[u8]) -> Self {
         Response {
             status: 200,
             content_type: content_type.as_ptr(),
             content_type_len: content_type.len(),
-            body: body.as_ptr(),
-            body_len: body.len(),
+            body: ResponseBody::Static {
+                ptr: body.as_ptr(),
+                len: body.len(),
+            },
+        }
+    }
+
+    /// Build a 200 OK with a heap-owned body. Used by handlers that
+    /// render JSON/text dynamically into a `Box<[u8]>` (e.g. via
+    /// `vec![...].into_boxed_slice()`) rather than pointing into a
+    /// fixed static scratch buffer. The allocation drops when the
+    /// response drops — caller doesn't need to manage its lifetime.
+    pub fn ok_owned(content_type: &[u8], body: alloc::boxed::Box<[u8]>) -> Self {
+        Response {
+            status: 200,
+            content_type: content_type.as_ptr(),
+            content_type_len: content_type.len(),
+            body: ResponseBody::Owned(body),
         }
     }
 
@@ -168,13 +204,24 @@ impl Response {
             status: 404,
             content_type: b"text/plain".as_ptr(),
             content_type_len: 10,
-            body: b"Not Found".as_ptr(),
-            body_len: 9,
+            body: ResponseBody::Static {
+                ptr: b"Not Found".as_ptr(),
+                len: 9,
+            },
         }
     }
 
     fn body_bytes(&self) -> &[u8] {
-        unsafe { core::slice::from_raw_parts(self.body, self.body_len) }
+        match &self.body {
+            // SAFETY: the Static variant is constructed from a
+            // caller-provided `&[u8]` whose lifetime covers the
+            // handler return + send_response copy. See the comment
+            // on ResponseBody::Static.
+            ResponseBody::Static { ptr, len } => unsafe {
+                core::slice::from_raw_parts(*ptr, *len)
+            },
+            ResponseBody::Owned(b) => b,
+        }
     }
     fn content_type_bytes(&self) -> &[u8] {
         unsafe { core::slice::from_raw_parts(self.content_type, self.content_type_len) }

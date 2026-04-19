@@ -7,7 +7,7 @@
 extern crate alloc;
 extern crate uni;
 use alloc::boxed::Box;
-use core::cell::UnsafeCell;
+use alloc::vec;
 use uni::http::{Request, Response, Server, TlsServerConfig};
 
 // Checked-in self-signed ECDSA P-256 dev cert + private key, baked
@@ -64,24 +64,19 @@ const HEALTH_JSON: &[u8] = b"{\"status\":\"ok\",\"runtime\":\"unikernel\",\"vers
 // /stats returns per-queue RX frame counts so we can see how the
 // virtio-net device is distributing flows across queue pairs under
 // Tier 1 multi-queue. A diagnostic response — not a production
-// dashboard. One buffer per core so two concurrent handlers don't
-// race on the same scratch.
+// dashboard. Body is rendered into a heap-allocated buffer per
+// request via `Response::ok_owned`, which drops the allocation
+// after `send_response` copies the bytes out.
 const STATS_BUF_LEN: usize = 512;
-struct StatsSlot(UnsafeCell<[u8; STATS_BUF_LEN]>);
-unsafe impl Sync for StatsSlot {}
-static STATS_BUFS: [StatsSlot; MAX_CORES] =
-    [const { StatsSlot(UnsafeCell::new([0u8; STATS_BUF_LEN])) }; MAX_CORES];
 
 fn stats_response() -> Response {
-    let id = (uni::cpu_id() as usize) % MAX_CORES;
-    // SAFETY: per-core slot, handler + send_response run back-to-back
-    // on one core without yielding.
-    let buf: &mut [u8; STATS_BUF_LEN] = unsafe { &mut *STATS_BUFS[id].0.get() };
+    let mut buf = vec![0u8; STATS_BUF_LEN];
     let counts = uni::net_rx_counts();
     let cursors = uni::net_rx_used_cursors();
     let nqp = uni::net_num_queue_pairs() as usize;
-    let n = fmt_stats(buf, &counts, &cursors, nqp);
-    Response::ok(b"application/json", &buf[..n])
+    let n = fmt_stats(buf.as_mut_slice(), &counts, &cursors, nqp);
+    buf.truncate(n);
+    Response::ok_owned(b"application/json", buf.into_boxed_slice())
 }
 
 fn fmt_stats(
@@ -136,24 +131,16 @@ fn fmt_u64(buf: &mut [u8], mut v: u64) -> usize {
 }
 
 // /heap returns a snapshot of kernel heap utilisation (allocated /
-// available / claimed / fragmentation). Served from a per-core scratch
-// buffer mirroring the /stats pattern: `service_core` runs handler and
-// send_response back-to-back on one core, so the slot only needs to
-// outlive the handler return.
+// available / claimed / fragmentation). Body is rendered into a
+// per-request heap buffer via `Response::ok_owned`.
 const HEAP_BUF_LEN: usize = 256;
-struct HeapSlot(UnsafeCell<[u8; HEAP_BUF_LEN]>);
-unsafe impl Sync for HeapSlot {}
-static HEAP_BUFS: [HeapSlot; MAX_CORES] =
-    [const { HeapSlot(UnsafeCell::new([0u8; HEAP_BUF_LEN])) }; MAX_CORES];
 
 fn heap_response() -> Response {
-    let id = (uni::cpu_id() as usize) % MAX_CORES;
-    // SAFETY: per-core slot, handler + send_response on one core
-    // back-to-back.
-    let buf: &mut [u8; HEAP_BUF_LEN] = unsafe { &mut *HEAP_BUFS[id].0.get() };
+    let mut buf = vec![0u8; HEAP_BUF_LEN];
     let stats = uni::heap_stats();
-    let n = fmt_heap(buf, &stats);
-    Response::ok(b"application/json", &buf[..n])
+    let n = fmt_heap(buf.as_mut_slice(), &stats);
+    buf.truncate(n);
+    Response::ok_owned(b"application/json", buf.into_boxed_slice())
 }
 
 fn fmt_heap(buf: &mut [u8], s: &uni::HeapStats) -> usize {
@@ -189,44 +176,17 @@ fn compute_work() -> u32 {
     h
 }
 
-// ---- /tls_profile scratch buffers -----------------------------------------
-//
-// The TLS handshake profiler (in `//net:tls_server`) accumulates
-// per-stage timings across every handshake; the `/tls_profile`
-// endpoint renders those totals as plain text. `Response` just
-// carries raw byte pointers, so the formatter needs a backing buffer
-// that outlives the handler return. We use one 4 KB buffer per core,
-// indexed by `uni::cpu_id()`, so two handlers on different cores can
-// render reports concurrently without racing on the same scratch.
-// Within a single core, `service_core` runs the handler and
-// `send_response` back-to-back, so the buffer only needs to survive
-// until the bytes hit the TX path — exactly what a per-core slot
-// gives us.
-const MAX_CORES: usize = 8;
+// /tls_profile renders the TLS handshake profiler's accumulated
+// per-stage timings (maintained in //net:tls_server) as plain text.
+// The maximum report length is ~4 KB; we allocate a per-request
+// buffer via `Response::ok_owned`.
 const PROFILE_BUF_LEN: usize = 4096;
-struct ProfileSlot(UnsafeCell<[u8; PROFILE_BUF_LEN]>);
-unsafe impl Sync for ProfileSlot {}
-static PROFILE_BUFS: [ProfileSlot; MAX_CORES] = [
-    ProfileSlot(UnsafeCell::new([0u8; PROFILE_BUF_LEN])),
-    ProfileSlot(UnsafeCell::new([0u8; PROFILE_BUF_LEN])),
-    ProfileSlot(UnsafeCell::new([0u8; PROFILE_BUF_LEN])),
-    ProfileSlot(UnsafeCell::new([0u8; PROFILE_BUF_LEN])),
-    ProfileSlot(UnsafeCell::new([0u8; PROFILE_BUF_LEN])),
-    ProfileSlot(UnsafeCell::new([0u8; PROFILE_BUF_LEN])),
-    ProfileSlot(UnsafeCell::new([0u8; PROFILE_BUF_LEN])),
-    ProfileSlot(UnsafeCell::new([0u8; PROFILE_BUF_LEN])),
-];
 
 fn tls_profile_response() -> Response {
-    let id = (uni::cpu_id() as usize) % MAX_CORES;
-    // SAFETY: each core uses its own slot (indexed by cpu_id), and
-    // service_core runs the handler + send_response back-to-back on
-    // one core without yielding, so no concurrent aliasing is
-    // possible. The raw pointer stored in `Response` points into
-    // this same slot for exactly that duration.
-    let buf: &mut [u8; PROFILE_BUF_LEN] = unsafe { &mut *PROFILE_BUFS[id].0.get() };
-    let n = uni::http::tls_profile_report(buf);
-    Response::ok(b"text/plain", &buf[..n])
+    let mut buf = vec![0u8; PROFILE_BUF_LEN];
+    let n = uni::http::tls_profile_report(buf.as_mut_slice());
+    buf.truncate(n);
+    Response::ok_owned(b"text/plain", buf.into_boxed_slice())
 }
 
 fn handle_request(req: &Request) -> Response {
