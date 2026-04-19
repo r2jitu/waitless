@@ -264,6 +264,42 @@ pub fn udp_send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
     net::udp::send(dst_ip, src_port, dst_port, data);
 }
 
+// ---- Heap stats -------------------------------------------------------------
+
+/// Platform-agnostic snapshot of the allocator: byte counts plus live-
+/// allocation counters. Zero-cost to call on bare-metal (reads talc's
+/// counters under the spinlock); returns zeros on native since
+/// libstd's allocator doesn't expose equivalent accounting.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HeapStats {
+    pub allocated_bytes: usize,
+    pub available_bytes: usize,
+    pub claimed_bytes: usize,
+    pub allocation_count: usize,
+    pub fragment_count: usize,
+    pub total_allocation_count: u64,
+}
+
+/// Snapshot the heap. Cheap on bare-metal (O(1) + spinlock); best-
+/// effort zero on native.
+#[cfg(platform_unikernel)]
+pub fn heap_stats() -> HeapStats {
+    let s = kernel::mm::heap_stats();
+    HeapStats {
+        allocated_bytes: s.allocated_bytes,
+        available_bytes: s.available_bytes,
+        claimed_bytes: s.claimed_bytes,
+        allocation_count: s.allocation_count,
+        fragment_count: s.fragment_count,
+        total_allocation_count: s.total_allocation_count,
+    }
+}
+
+#[cfg(platform_native)]
+pub fn heap_stats() -> HeapStats {
+    HeapStats::default()
+}
+
 #[cfg(platform_native)]
 pub fn udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
     native::native_udp_bind(port, handler);

@@ -135,6 +135,49 @@ fn fmt_u64(buf: &mut [u8], mut v: u64) -> usize {
     len
 }
 
+// /heap returns a snapshot of kernel heap utilisation (allocated /
+// available / claimed / fragmentation). Served from a per-core scratch
+// buffer mirroring the /stats pattern: `service_core` runs handler and
+// send_response back-to-back on one core, so the slot only needs to
+// outlive the handler return.
+const HEAP_BUF_LEN: usize = 256;
+struct HeapSlot(UnsafeCell<[u8; HEAP_BUF_LEN]>);
+unsafe impl Sync for HeapSlot {}
+static HEAP_BUFS: [HeapSlot; MAX_CORES] =
+    [const { HeapSlot(UnsafeCell::new([0u8; HEAP_BUF_LEN])) }; MAX_CORES];
+
+fn heap_response() -> Response {
+    let id = (uni::cpu_id() as usize) % MAX_CORES;
+    // SAFETY: per-core slot, handler + send_response on one core
+    // back-to-back.
+    let buf: &mut [u8; HEAP_BUF_LEN] = unsafe { &mut *HEAP_BUFS[id].0.get() };
+    let stats = uni::heap_stats();
+    let n = fmt_heap(buf, &stats);
+    Response::ok(b"application/json", &buf[..n])
+}
+
+fn fmt_heap(buf: &mut [u8], s: &uni::HeapStats) -> usize {
+    let mut n = 0;
+    let push = |buf: &mut [u8], n: &mut usize, s: &[u8]| {
+        buf[*n..*n + s.len()].copy_from_slice(s);
+        *n += s.len();
+    };
+    push(buf, &mut n, b"{\"allocated_bytes\":");
+    n += fmt_u64(&mut buf[n..], s.allocated_bytes as u64);
+    push(buf, &mut n, b",\"available_bytes\":");
+    n += fmt_u64(&mut buf[n..], s.available_bytes as u64);
+    push(buf, &mut n, b",\"claimed_bytes\":");
+    n += fmt_u64(&mut buf[n..], s.claimed_bytes as u64);
+    push(buf, &mut n, b",\"allocation_count\":");
+    n += fmt_u64(&mut buf[n..], s.allocation_count as u64);
+    push(buf, &mut n, b",\"fragment_count\":");
+    n += fmt_u64(&mut buf[n..], s.fragment_count as u64);
+    push(buf, &mut n, b",\"total_allocation_count\":");
+    n += fmt_u64(&mut buf[n..], s.total_allocation_count);
+    buf[n] = b'}';
+    n + 1
+}
+
 /// CPU-intensive work: iterative hash (FNV-1a, 100K iterations).
 /// Dominates per-request cost, making multi-core distribution visible.
 fn compute_work() -> u32 {
@@ -191,6 +234,7 @@ fn handle_request(req: &Request) -> Response {
         b"/" => Response::ok(b"text/html", INDEX_HTML),
         b"/health" => Response::ok(b"application/json", HEALTH_JSON),
         b"/stats" => stats_response(),
+        b"/heap" => heap_response(),
         b"/compute" => {
             // black_box prevents the compiler from eliminating compute_work()
             // as dead code (the return value would otherwise be unused).
