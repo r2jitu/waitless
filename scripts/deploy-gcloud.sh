@@ -226,12 +226,18 @@ deploy() {
     # gVNIC is Google's own NIC format; RSS multi-queue works natively.
     # The `nic-type=GVNIC` flag switches the vNIC backend. Requires the
     # image to carry the GVNIC guest-os-feature (set on image create).
+    # QUEUE_COUNT: number of RX+TX queue pairs to request from the
+    # vNIC backend. Should match the guest's vCPU count so each core
+    # owns a queue pair under Tier 1. Defaults to 2 for backward
+    # compat with n2-standard-2 benches; set QUEUE_COUNT=4 for
+    # n2-highcpu-4 etc. gVNIC honours up to 8 per instance.
+    local qc="${QUEUE_COUNT:-2}"
     local nic_args
     if [[ "${GVNIC_NIC:-}" == "1" ]]; then
-        echo "    (using gVNIC; guest driver must support Google VNIC)"
-        nic_args="nic-type=GVNIC,queue-count=2"
+        echo "    (using gVNIC, queue-count=${qc}; guest driver must support Google VNIC)"
+        nic_args="nic-type=GVNIC,queue-count=${qc}"
     else
-        nic_args="queue-count=2"
+        nic_args="queue-count=${qc}"
     fi
     gcloud compute instances create "$NAME" \
         --zone="$ZONE" \
