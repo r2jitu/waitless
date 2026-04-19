@@ -338,7 +338,7 @@ static NUM_QP: AtomicU16 = AtomicU16::new(0);
 // exits by ~Nx where N is average packets per poll batch.
 static DEFERRED_KICK: AtomicBool = AtomicBool::new(false);
 // Per-queue-pair TxQueue / RxQueue pointers. Each queue struct is
-// allocated on the heap (`uni::Box::leak`) and never freed; the
+// allocated on the heap (`Box::leak`) and never freed; the
 // pointer is published here once CREATE_*_QUEUE succeeds.
 static TX_QUEUES: [AtomicPtr<TxQueue>; MAX_QUEUE_PAIRS] =
     [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_QUEUE_PAIRS];

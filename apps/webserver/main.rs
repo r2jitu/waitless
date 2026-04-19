@@ -4,7 +4,9 @@
 
 #![no_std]
 
+extern crate alloc;
 extern crate uni;
+use alloc::boxed::Box;
 use core::cell::UnsafeCell;
 use uni::http::{Request, Response, Server, TlsServerConfig};
 
@@ -235,7 +237,7 @@ fn main() {
     // `Box::leak` extends the lifetime to 'static so worker threads and AP
     // service callbacks can keep accessing it via SERVER_PTR after main()
     // returns on native (on unikernel `run()` blocks forever).
-    let server: &'static mut Server = uni::Box::leak(Server::new_boxed());
+    let server: &'static mut Server = Box::leak(Server::new_boxed());
     server.default_handler(handle_request);
 
     // Plain HTTP is always on.
@@ -247,7 +249,7 @@ fn main() {
     match TlsServerConfig::from_dev_cert(DEV_CERT_DER, DEV_KEY_PKCS8_DER) {
         Some(cfg) => {
             let config: &'static TlsServerConfig =
-                uni::Box::leak(uni::Box::new(cfg));
+                Box::leak(Box::new(cfg));
             uni::log(b"TLS: dev cert loaded. Serving HTTPS.\n");
             server.listen_tls(https_port, config);
         }

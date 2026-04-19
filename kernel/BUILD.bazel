@@ -9,7 +9,6 @@ rust_library(
         "bump.rs",
         "deque.rs",
         "eventloop.rs",
-        "kbox.rs",
         "lib.rs",
         "mmio.rs",
         "once.rs",

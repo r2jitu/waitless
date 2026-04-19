@@ -15,6 +15,8 @@
 // request-handler's perspective nothing changes — the `Request` and
 // `Response` types are identical.
 
+use alloc::boxed::Box;
+
 use crate::{TcpListener, TcpStream};
 
 // On native, `net` is a helper module inside `uni/lib.rs` that
@@ -211,7 +213,7 @@ struct ActiveConn {
     /// Heap-allocated receive buffer (BUF_SIZE bytes). Owning the bytes
     /// off-heap keeps `Server` small enough to live on the stack while
     /// being constructed in `Server::new()`.
-    buf: crate::Buffer,
+    buf: Box<[u8]>,
     buf_len: usize,
     /// Idle counter: incremented each service_core() call when no data
     /// arrives. Reset to 0 on activity. Used to close stale connections
@@ -222,7 +224,7 @@ struct ActiveConn {
     /// machine lives in `//net:tls_server` and is shared by the
     /// unikernel and native builds, so this field is available on
     /// both platforms.
-    tls: Option<crate::Box<net::tls_server::TlsServer>>,
+    tls: Option<Box<net::tls_server::TlsServer>>,
 }
 
 /// Close idle connections after this many service ticks with no data.
@@ -274,9 +276,15 @@ fn fill_tls_seed(seed: &mut [u8; 32]) {
 
 impl ActiveConn {
     fn new() -> Self {
+        // Heap-allocated zero-filled receive buffer. `vec!` uses the
+        // global allocator; `panic=abort` on OOM is acceptable here
+        // because this runs once per pool slot during boot, well
+        // before any connection traffic — if the heap can't fit the
+        // pool, the kernel is DOA regardless.
+        let buf: Box<[u8]> = alloc::vec![0u8; BUF_SIZE].into_boxed_slice();
         ActiveConn {
             conn: None,
-            buf: crate::Buffer::new(BUF_SIZE),
+            buf,
             buf_len: 0,
             idle_ticks: 0,
             tls: None,
@@ -339,8 +347,8 @@ impl Server {
     /// on the heap. The returned `Box<Server>` is the only handle; callers
     /// typically `Box::leak` it to get a `&'static mut Server` for the
     /// duration of the program.
-    pub fn new_boxed() -> crate::Box<Self> {
-        crate::Box::new(Server {
+    pub fn new_boxed() -> Box<Self> {
+        Box::new(Server {
             routes: [const { Route::new() }; MAX_ROUTES],
             route_count: 0,
             default_handler: None,
@@ -508,7 +516,7 @@ impl Server {
                         // Both are fine for TLS 1.3 ephemeral keys.
                         let mut seed = [0u8; 32];
                         fill_tls_seed(&mut seed);
-                        ac.tls = Some(crate::Box::new(
+                        ac.tls = Some(Box::new(
                             net::tls_server::TlsServer::new(seed),
                         ));
                     } else {

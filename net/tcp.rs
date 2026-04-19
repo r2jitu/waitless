@@ -13,11 +13,33 @@ extern crate net_types as types;
 extern crate net_ipv4 as ipv4;
 extern crate bitflags;
 
+use alloc::alloc::{alloc_zeroed, Layout};
+use alloc::boxed::Box;
 use core::ptr;
 use from_bytes::FromBytes;
-use kernel::kbox::KBox;
 use types::{Ipv4Addr, CONFIG, tcp_checksum, htons, ntohs, htonl, ntohl};
 use ipv4::{ipv4_send, PROTO_TCP};
+
+/// Heap-allocate a zero-filled `Box<[u8]>` of `len` bytes, returning
+/// `None` on OOM instead of aborting. `vec![0u8; len].into_boxed_slice()`
+/// would panic on failure; we refuse the connection instead.
+fn try_zeroed_boxed_slice(len: usize) -> Option<Box<[u8]>> {
+    if len == 0 {
+        return None;
+    }
+    let layout = Layout::from_size_align(len, 1).ok()?;
+    // SAFETY: non-zero size, u8 has no invalid bit patterns so
+    // zero-initialised memory is a valid `[u8]`; Box::from_raw
+    // takes ownership of the freshly-allocated slice pointer.
+    unsafe {
+        let raw = alloc_zeroed(layout);
+        if raw.is_null() {
+            return None;
+        }
+        let slice = core::slice::from_raw_parts_mut(raw, len);
+        Some(Box::from_raw(slice))
+    }
+}
 
 bitflags::bitflags! {
     struct TcpFlags: u8 {
@@ -80,11 +102,10 @@ pub struct TcpConnection {
     rcv_nxt: u32,
     rcv_wnd: u16,
     /// Owned RX ring buffer. `None` until the connection is accepted
-    /// (allocated in `tcp_receive` SYN handling), then a `KBox<[u8]>`
-    /// of length `RX_BUF_SIZE`. Drop runs `kfree` automatically when
-    /// the connection is reset, eliminating the manual `kfree` that
-    /// the previous `*mut u8` field required.
-    rx_buf: Option<KBox<[u8]>>,
+    /// (allocated in `tcp_receive` SYN handling), then a `Box<[u8]>`
+    /// of length `RX_BUF_SIZE`. Drop returns the bytes to the global
+    /// allocator automatically when the connection is reset.
+    rx_buf: Option<Box<[u8]>>,
     rx_head: usize,
     rx_tail: usize,
     listener_port: u16,
@@ -388,8 +409,8 @@ fn free_connection(core: u32, slot: usize) {
         tcp_hash_remove(core, key);
     }
     // Assigning a fresh TcpConnection drops the old one, which runs
-    // the Drop impl on `rx_buf: Option<KBox<[u8]>>` — KBox::drop calls
-    // kfree. No manual kfree needed.
+    // the Drop impl on `rx_buf: Option<Box<[u8]>>` — Box::drop returns
+    // the bytes to the global allocator. No manual kfree needed.
     *c = TcpConnection::new();
 }
 
@@ -536,9 +557,11 @@ pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
             c.listener_port = dst_port;
             c.accepted = false;
 
-            // Allocate RX buffer. KBox handles kmalloc + auto-kfree;
-            // no manual free is needed when the connection is reset.
-            c.rx_buf = KBox::<[u8]>::try_new_zeroed_slice(RX_BUF_SIZE);
+            // Allocate RX buffer. Box drops back to the global
+            // allocator automatically when the connection is reset;
+            // `try_zeroed_boxed_slice` returns None on OOM so we
+            // refuse the connection instead of aborting.
+            c.rx_buf = try_zeroed_boxed_slice(RX_BUF_SIZE);
             c.rx_head = 0;
             c.rx_tail = 0;
         }

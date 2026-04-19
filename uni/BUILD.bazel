@@ -6,11 +6,9 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "uni",
     srcs = [
-        "heap.rs",
         "http.rs",
         "lib.rs",
         "native.rs",
-        "owned.rs",
         "unikernel.rs",
     ],
     proc_macro_deps = ["//uni/macros:uni_macros"],
