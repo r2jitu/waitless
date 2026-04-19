@@ -71,6 +71,57 @@ pub fn num_cores_online() -> u32 {
 /// before calling us. Keeping the `Cpu` type confined to the boot
 /// crate lets `kernel` avoid a build-time dep on the limine crate.
 pub unsafe extern "C" fn ap_entry_via_limine(apic_id: u32) -> ! {
+    // Enable SSE + AVX on this AP. Limine puts us in long mode but
+    // doesn't touch CR4 / XCR0 — those are per-CPU register bits the
+    // BSP configures for itself in `boot/limine_entry.rs`'s asm stub,
+    // and every other core has to repeat. Without this, the first
+    // AVX / YMM / BMI2 instruction the TLS stack runs on an AP
+    // (p256 scalar-mult, chacha20 mixing, etc.) raises #UD and
+    // halts the core — observed as silent TLS timeouts on GCE
+    // n2-highcpu-4 where the TLS handshake happened to land on an
+    // AP.
+    //
+    // Sequence matches `limine_entry_stub` in boot/limine_entry.rs:
+    //   - CR4.OSFXSR (9) + CR4.OSXMMEXCPT (10) unconditionally.
+    //   - CR4.OSXSAVE (18) + XSETBV only if CPUID reports XSAVE.
+    //   - XCR0 masked by CPUID.0Dh:EAX to avoid enabling features
+    //     the CPU doesn't actually support.
+    unsafe {
+        core::arch::asm!(
+            // push/pop rbx manually: LLVM reserves rbx as the base
+            // pointer in inline asm and rejects it as an operand,
+            // but CPUID clobbers ebx. Saving it around each CPUID
+            // sidesteps the restriction without needing a separate
+            // global_asm stub.
+            "mov %cr4, %rax",
+            "or  $(1 << 9) | (1 << 10), %rax",
+            "mov %rax, %cr4",
+            "mov $1, %eax",
+            "push %rbx",
+            "cpuid",
+            "pop %rbx",
+            "test $(1 << 26), %ecx",
+            "jz 2f",
+            "mov %cr4, %rax",
+            "or  $(1 << 18), %rax",
+            "mov %rax, %cr4",
+            "mov $0xD, %eax",
+            "xor %ecx, %ecx",
+            "push %rbx",
+            "cpuid",
+            "pop %rbx",
+            "and $0x7, %eax",
+            "xor %rcx, %rcx",
+            "xor %rdx, %rdx",
+            "xsetbv",
+            "2:",
+            out("rax") _,
+            out("rcx") _,
+            out("rdx") _,
+            options(att_syntax),
+        );
+    }
+
     super::gdt::load_on_ap();
     apic::init_ap();
 
