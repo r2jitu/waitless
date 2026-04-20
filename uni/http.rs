@@ -368,6 +368,11 @@ pub struct Server {
     route_count: usize,
     default_handler: Option<Handler>,
     cores: [CoreHttp; MAX_CORES],
+    /// TLS server config, populated by `listen_tls()`. `None` for
+    /// plain-HTTP-only servers. Owning the config here (instead of in
+    /// a global) means an app can run multiple `Server` instances
+    /// with different certs on different ports — nothing is shared.
+    tls_config: Option<net::tls_server::TlsServerConfig>,
 }
 
 // Global server pointer for AP poll callback / native worker threads.
@@ -382,13 +387,6 @@ static HTTP_LISTEN_PORT: core::sync::atomic::AtomicU16 = core::sync::atomic::Ato
 // HTTPS listen port — same purpose as HTTP_LISTEN_PORT but for TLS.
 static TLS_LISTEN_PORT: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
 
-// TLS server configuration, published by `listen_tls()` for connection-
-// creation to find. Raw pointer because `TlsServerConfig` isn't
-// Send+Sync in the generic sense and we never form an `&mut`; readers
-// dereference with Acquire and only read the immutable cert/key bytes.
-static TLS_CONFIG_PTR: core::sync::atomic::AtomicPtr<net::tls_server::TlsServerConfig> =
-    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
-
 impl Server {
     /// Allocate a `Server`, including its per-connection receive buffers,
     /// on the heap. The returned `Box<Server>` is the only handle; callers
@@ -400,6 +398,7 @@ impl Server {
             route_count: 0,
             default_handler: None,
             cores: core::array::from_fn(|_| CoreHttp::new()),
+            tls_config: None,
         })
     }
 
@@ -464,21 +463,17 @@ impl Server {
     /// `default_handler()` apply to both HTTP and HTTPS listeners
     /// identically.
     ///
-    /// `config` must outlive the server. Typically built from a
-    /// `include_bytes!`-baked dev cert + PKCS#8 key (see
-    /// `apps/webserver/dev_certs/`) and `Box::leak`-ed to get a
-    /// `&'static TlsServerConfig`.
+    /// `config` is moved into the `Server` instance and lives as long
+    /// as this server does. An app can construct multiple `Server`
+    /// instances each with their own `TlsServerConfig` — cert/key
+    /// state is never global.
     ///
     /// Works on both unikernel and native. Both platforms use the
     /// same hand-rolled TLS 1.3 stack from `//net:tls_server`; the
     /// only per-platform detail is the TCP source under the hood
     /// (`kernel::net::tcp` vs `native::tcp`) and the RNG backend.
-    pub fn listen_tls(&mut self, port: u16, config: &'static TlsServerConfig) {
-        // Publish the config pointer for the accept path.
-        TLS_CONFIG_PTR.store(
-            config as *const _ as *mut _,
-            core::sync::atomic::Ordering::Release,
-        );
+    pub fn listen_tls(&mut self, port: u16, config: TlsServerConfig) {
+        self.tls_config = Some(config);
 
         let nw = crate::num_workers();
         let mut ok_any = false;
@@ -519,7 +514,7 @@ impl Server {
 
     /// Convenience: one HTTPS listener + run. Same as
     /// `listen_tls(port, config); run();`.
-    pub fn run_tls(&mut self, port: u16, config: &'static TlsServerConfig) {
+    pub fn run_tls(&mut self, port: u16, config: TlsServerConfig) {
         self.listen_tls(port, config);
         self.run();
     }
@@ -548,13 +543,12 @@ impl Server {
             }
         }
         if let Some(listener) = self.cores[core_id as usize].tls_listener {
+            let has_tls_config = self.tls_config.is_some();
             while let Some(stream) = listener.accept() {
                 had_work = true;
                 if let Some(ac) = alloc_active(&mut self.cores[core_id as usize].active) {
                     ac.conn = Some(stream);
-                    let tls_cfg_ptr =
-                        TLS_CONFIG_PTR.load(core::sync::atomic::Ordering::Acquire);
-                    if !tls_cfg_ptr.is_null() {
+                    if has_tls_config {
                         // Seed the per-connection ephemeral X25519 keypair
                         // from platform entropy. `kernel::rng::fill_bytes`
                         // on bare-metal (ChaCha20 PRNG seeded at boot from
@@ -567,8 +561,8 @@ impl Server {
                             net::tls_server::TlsServer::new(seed),
                         ));
                     } else {
-                        // Shouldn't happen — listen_tls() always sets
-                        // TLS_CONFIG_PTR before creating the listener.
+                        // Shouldn't happen — `listen_tls()` always sets
+                        // `self.tls_config` before creating the listener.
                         // Defensive: close the conn.
                         crate::log(b"http: tls listener but no config, dropping\n");
                         stream.close();
@@ -689,16 +683,13 @@ impl Server {
     ///
     /// Only called when the connection is known to be in TLS mode.
     fn tls_ingest(&mut self, core_id: u32, conn_idx: usize, conn: TcpStream) {
-        // Need an owned pointer to the TlsServerConfig. It's 'static.
-        let tls_cfg_ptr = TLS_CONFIG_PTR.load(core::sync::atomic::Ordering::Acquire);
-        if tls_cfg_ptr.is_null() {
-            return;
-        }
-        // SAFETY: pointer is stored by run_tls() before listen() is
-        // called, and points at a caller-owned 'static config.
-        let tls_cfg: &'static net::tls_server::TlsServerConfig = unsafe { &*tls_cfg_ptr };
+        // Destructure `self` so we can borrow `tls_config` immutably
+        // and `cores[...]` mutably at the same time — the borrow
+        // checker only does this split for direct field access.
+        let Self { tls_config, cores, .. } = self;
+        let Some(tls_cfg) = tls_config.as_ref() else { return };
 
-        let ac = &mut self.cores[core_id as usize].active[conn_idx];
+        let ac = &mut cores[core_id as usize].active[conn_idx];
         let Some(tls) = ac.tls.as_mut() else { return; };
 
         // Pull raw bytes off TCP into the TLS state machine. Loop to

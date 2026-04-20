@@ -249,13 +249,12 @@ fn main() {
 
     // HTTPS is added alongside when the dev cert parses. The same
     // routes serve both listeners — handlers don't care whether a
-    // given request arrived over TLS or not.
+    // given request arrived over TLS or not. The cert/key is moved
+    // into `server` as a field; no global, no leak.
     match TlsServerConfig::from_dev_cert(DEV_CERT_DER, DEV_KEY_PKCS8_DER) {
         Some(cfg) => {
-            let config: &'static TlsServerConfig =
-                Box::leak(Box::new(cfg));
             uni::log(b"TLS: dev cert loaded. Serving HTTPS.\n");
-            server.listen_tls(https_port, config);
+            server.listen_tls(https_port, cfg);
         }
         None => {
             uni::log(b"TLS: failed to parse dev key; HTTPS disabled.\n");
