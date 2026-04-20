@@ -337,9 +337,13 @@ static NUM_QP: AtomicU16 = AtomicU16::new(0);
 // once per iteration after the service callback). Cuts MMIO
 // exits by ~Nx where N is average packets per poll batch.
 static DEFERRED_KICK: AtomicBool = AtomicBool::new(false);
-// Per-queue-pair TxQueue / RxQueue pointers. Each queue struct is
-// allocated on the heap (`Box::leak`) and never freed; the
-// pointer is published here once CREATE_*_QUEUE succeeds.
+// Per-queue-pair TxQueue / RxQueue pointers. Each queue struct
+// lives inside the driver's `static Spinlock<State>` — `State.tx[qp]` /
+// `State.rx[qp]` is a `Some(...)` slot at a stable address for the
+// lifetime of the driver. These AtomicPtrs publish raw pointers into
+// those slots once `CREATE_*_QUEUE` succeeds, so the hot path
+// (`send_on_qp`, `rx_poll_qp`) can reach the queue without taking the
+// STATE spinlock.
 static TX_QUEUES: [AtomicPtr<TxQueue>; MAX_QUEUE_PAIRS] =
     [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_QUEUE_PAIRS];
 static RX_QUEUES: [AtomicPtr<RxQueue>; MAX_QUEUE_PAIRS] =
