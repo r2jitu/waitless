@@ -23,7 +23,8 @@
 //     dispatching packets); the kernel's `set_ready` → AP-wakeup
 //     publish covers the cross-core happens-before.
 
-#![no_std]
+// See .bazelrc for why this is `cfg_attr(not(test), no_std)` and not bare `#![no_std]`.
+#![cfg_attr(not(test), no_std)]
 
 // `atomic_fn` is the shared leaf crate that provides `AtomicFn<F>`
 // (also used by `kernel::sync` and `uni/lib.rs`'s native backend).

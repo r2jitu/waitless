@@ -1,5 +1,5 @@
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
-load("//bazel/rules:rust.bzl", "HOST_TEST_RUSTC_FLAGS", "UNIKERNEL_RUSTC_FLAGS")
+load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -52,45 +52,41 @@ rust_library(
     }),
 )
 
-# Host-native unit tests for lock-free data structures.
+# Host-native unit tests for lock-free data structures. panic=unwind
+# is supplied via `.bazelrc`'s `test --extra_rustc_flag=-Cpanic=unwind`
+# — see that file for the full explanation.
 rust_test(
     name = "deque_test",
     srcs = ["deque.rs"],
     crate_root = "deque.rs",
-    rustc_flags = HOST_TEST_RUSTC_FLAGS,
 )
 
 rust_test(
     name = "bump_test",
     srcs = ["bump.rs"],
     crate_root = "bump.rs",
-    rustc_flags = HOST_TEST_RUSTC_FLAGS,
 )
 
 rust_test(
     name = "spsc_test",
     srcs = ["spsc.rs"],
     crate_root = "spsc.rs",
-    rustc_flags = HOST_TEST_RUSTC_FLAGS,
 )
 
 rust_test(
     name = "once_test",
     srcs = ["once.rs"],
     crate_root = "once.rs",
-    rustc_flags = HOST_TEST_RUSTC_FLAGS,
 )
 
 rust_test(
     name = "sync_test",
     srcs = ["sync.rs"],
     crate_root = "sync.rs",
-    rustc_flags = HOST_TEST_RUSTC_FLAGS,
 )
 
 rust_test(
     name = "timer_test",
     srcs = ["timer.rs"],
     crate_root = "timer.rs",
-    rustc_flags = HOST_TEST_RUSTC_FLAGS,
 )

@@ -26,7 +26,22 @@
 // so mis-parameterisation fails at compile time instead of
 // silently truncating under `transmute_copy`.
 
-#![no_std]
+// Two ways this crate ends up built without `#![no_std]` — both
+// needed to let rustc accept `panic=unwind` (required by libtest
+// and by the `rust_test` targets that dep on `:atomic_fn_unwind`):
+//
+//   * `cfg(test)` — when this file is the direct `crate_root` of
+//     a `rust_test` (`//util/atomic_fn:atomic_fn_test`), rustc
+//     enables `--test` cfg so the crate picks up std prelude /
+//     test harness.
+//   * `feature = "std"` — enabled by the `:atomic_fn_unwind`
+//     sibling `rust_library` which consumers tag into their
+//     test dep chain to get a panic=unwind rlib of this crate.
+//
+// Either disables `#![no_std]`. Production builds of `:atomic_fn`
+// have neither, so `#![no_std]` is still active on the bare-metal
+// side and `panic=abort` is the natural target default.
+#![cfg_attr(all(not(test), not(feature = "std")), no_std)]
 
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicUsize, Ordering};

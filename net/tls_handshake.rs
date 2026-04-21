@@ -34,7 +34,8 @@
 // - X.509 DER parsing beyond "treat the cert as an opaque byte blob to
 //   include in Certificate.certificate_list"
 
-#![no_std]
+// See .bazelrc for why this is `cfg_attr(not(test), no_std)` and not bare `#![no_std]`.
+#![cfg_attr(not(test), no_std)]
 
 // ============================================================================
 // Constants

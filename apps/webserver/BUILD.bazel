@@ -37,6 +37,14 @@ py_test(
         "//apps/webserver/dev_certs:dev_cert.pem",
     ],
     tags = [
+        # `integration` is filtered out of `bazel test //...` by
+        # default (.bazelrc's `test --test_tag_filters=-integration`)
+        # — the integration test rebuilds the webserver unikernel
+        # binary, and that build can't see the test-verb's
+        # `panic=unwind` override. Users run this test via
+        # `bazel test --config=hvf //apps/webserver:test`, which
+        # re-asserts `panic=abort` for the bare-metal rebuild.
+        "integration",
         "exclusive",
         "local",
     ],

@@ -1,9 +1,53 @@
 # ── Global ────────────────────────────────────────────────────────────────────
 build --action_env=PATH
 
-# Rust compiler flags applied to all crates (panic=abort for no_std,
-# opt-level=2 to match the C++ -O2 in the bare-metal toolchain).
+# Rust compiler flags applied to all crates. Default panic=abort
+# because every rust_library in this repo is `#![no_std]` (or
+# `#![cfg_attr(not(test), no_std)]`, which stays no_std outside
+# `--test`), and rustc rejects `panic=unwind` on a no_std crate.
 build --@rules_rust//:extra_rustc_flags=-Cpanic=abort,-Copt-level=2,-Dwarnings
+
+# `bazel test` overrides panic=abort → unwind for every rustc
+# invocation. Sound because:
+#   * Test source files use `#![cfg_attr(not(test), no_std)]`, so
+#     under `--test` they flip to std — panic=unwind becomes
+#     legal. (Non-test library builds still see `#![no_std]`.)
+#   * Integration tests (py_tests that spawn unikernel binaries)
+#     are tagged `integration` and filtered out by default. Users
+#     run them with `--config=hvf` etc., which reset the panic
+#     flag back to abort for the unikernel-binary rebuild.
+#   * A `rust_test` using `crate = ":foo"` rebuilds its own crate
+#     under `--test` (that side picks up std via cfg_attr) but
+#     the *dep* rlibs of `:foo` are not `--test`-compiled — they
+#     stay no_std, and linking them into a panic=unwind binary
+#     still fails. For that shape we declare a sibling
+#     `rust_library` with `rustc_flags = HOST_TEST_RUSTC_FLAGS`
+#     and `crate_features = ["std"]` so the dep recompiles with
+#     unwind too (see `//util/atomic_fn:atomic_fn_unwind`).
+test --@rules_rust//:extra_rustc_flag=-Cpanic=unwind
+test --test_tag_filters=-integration
+
+# Unikernel configs re-assert panic=abort so an
+# `bazel test --config=hvf //apps/webserver:test` (integration
+# test) rebuilds the bare-metal binary with abort — overriding
+# the `test`-verb's unwind. They also clear the `integration`
+# tag filter so users running with an explicit unikernel config
+# actually get their integration tests (the filter's whole point
+# is to skip them when no config is passed).
+build:hvf  --@rules_rust//:extra_rustc_flag=-Cpanic=abort
+build:hvf  --test_tag_filters=
+build:iso  --@rules_rust//:extra_rustc_flag=-Cpanic=abort
+build:iso  --test_tag_filters=
+build:qemu --@rules_rust//:extra_rustc_flag=-Cpanic=abort
+build:qemu --test_tag_filters=
+build:aarch64-hvf   --@rules_rust//:extra_rustc_flag=-Cpanic=abort
+build:aarch64-hvf   --test_tag_filters=
+build:aarch64-qemu  --@rules_rust//:extra_rustc_flag=-Cpanic=abort
+build:aarch64-qemu  --test_tag_filters=
+build:x86_64-qemu   --@rules_rust//:extra_rustc_flag=-Cpanic=abort
+build:x86_64-qemu   --test_tag_filters=
+build:x86_64-iso    --@rules_rust//:extra_rustc_flag=-Cpanic=abort
+build:x86_64-iso    --test_tag_filters=
 
 # Bazel 9 made the default test toolchain require an exec platform that
 # matches every target-platform constraint. Our test target uses the

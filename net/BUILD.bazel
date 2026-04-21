@@ -1,5 +1,5 @@
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
-load("//bazel/rules:rust.bzl", "HOST_TEST_RUSTC_FLAGS", "UNIKERNEL_RUSTC_FLAGS")
+load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -16,7 +16,6 @@ rust_library(
 rust_test(
     name = "types_test",
     crate = ":types",
-    rustc_flags = HOST_TEST_RUSTC_FLAGS,
 )
 
 # Safe `try_ref_from(&[u8]) -> Option<&Self>` for packed packet headers.
@@ -33,7 +32,6 @@ rust_library(
 rust_test(
     name = "from_bytes_test",
     crate = ":from_bytes",
-    rustc_flags = HOST_TEST_RUSTC_FLAGS,
 )
 
 # IP protocol dispatch registry — replaces hardcoded TCP/UDP match in
@@ -61,7 +59,6 @@ rust_test(
     name = "protocol_test",
     srcs = ["protocol.rs"],
     crate_root = "protocol.rs",
-    rustc_flags = HOST_TEST_RUSTC_FLAGS,
     deps = ["//util/atomic_fn:atomic_fn_unwind"],
 )
 
@@ -70,7 +67,6 @@ rust_test(
 rust_test(
     name = "protocol_tests",
     srcs = ["protocol_tests.rs"],
-    rustc_flags = HOST_TEST_RUSTC_FLAGS,
 )
 
 rust_library(
@@ -189,7 +185,6 @@ rust_library(
 rust_test(
     name = "tls_handshake_test",
     crate = ":tls_handshake",
-    rustc_flags = HOST_TEST_RUSTC_FLAGS,
 )
 
 # TLS 1.3 record layer: wraps plaintext records in TLSCiphertext using

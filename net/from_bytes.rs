@@ -25,7 +25,8 @@
 // `try_ref_from` checks length and reads via `core::ptr::read_unaligned`
 // to handle the (usually-zero, but possible) misalignment cleanly.
 
-#![no_std]
+// See .bazelrc for why this is `cfg_attr(not(test), no_std)` and not bare `#![no_std]`.
+#![cfg_attr(not(test), no_std)]
 
 /// Marker trait for types that can be safely reinterpreted from a byte
 /// slice. Safety: implementers MUST be `#[repr(C, packed)]` (alignment

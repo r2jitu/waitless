@@ -12,36 +12,25 @@ UNIKERNEL_RUSTC_FLAGS = select({
     "//conditions:default": [],
 })
 
-# Host-native `rust_test` targets need `-Cpanic=unwind` so the libtest
-# harness can catch assertion panics. Every rust_test in the repo
-# sets this via `rustc_flags = HOST_TEST_RUSTC_FLAGS`.
+# Panic strategy is handled in `.bazelrc`:
 #
-# Why it can't move to `.bazelrc`:
+#   * Global: `-Cpanic=abort` — every rlib in this repo is
+#     `#![cfg_attr(not(test), no_std)]` (or bare `#![no_std]`), and
+#     rustc rejects `panic=unwind` on a no_std crate.
 #
-#   * A global `build --extra_rustc_flag=-Cpanic=unwind` would apply
-#     to every crate, including our `#![no_std]` libraries. Rustc
-#     rejects the combination ("unwinding panics are not supported
-#     without std") and the bare-metal build fails.
+#   * `test` verb appends `-Cpanic=unwind` so rust_test targets
+#     get the unwinding libtest harness. Test source files flip
+#     to std under `--test` cfg via `cfg_attr(not(test), no_std)`,
+#     so the unwind strategy is legal there.
 #
-#   * A `test --extra_rustc_flag=-Cpanic=unwind` override applies
-#     to every rustc invocation that `bazel test` triggers, which
-#     includes the unikernel binaries pulled in as `data` by
-#     integration tests (e.g. `//apps/webserver:test` → `:webserver`
-#     unikernel ELF). Same no_std breakage.
+#   * Integration tests tagged `integration` are filtered out of
+#     the default `bazel test` set. Users run them with
+#     `--config=hvf` / `=iso` / `=qemu`, which re-assert
+#     `-Cpanic=abort` so the unikernel binary rebuilds cleanly.
 #
-#   * rules_rust doesn't ship a per-target transition that would
-#     rebuild only a `rust_test`'s own rustc invocation with unwind
-#     (Cargo auto-does this — see the Cargo book's profiles page
-#     under "Test profile" — but Bazel's equivalent is not there).
-#
-# For the dep-chain variant of this problem — a `rust_test` with
-# `crate = ":foo"` rebuilding `foo` with panic=unwind but linking
-# against a library dep compiled panic=abort — the pattern is to
-# declare a sibling `rust_library` of the dep with the same
-# `crate_name` but `rustc_flags = HOST_TEST_RUSTC_FLAGS`. See
-# `//util:atomic_fn` / `:atomic_fn_unwind` and the `//net:protocol_test`
-# that depends on the unwind variant. Multi-target-per-source is
-# ugly but contained — we'd need a full Bazel transition to drop
-# it, which is substantial Starlark outside the init-redesign
-# plan's scope.
-HOST_TEST_RUSTC_FLAGS = ["-Cpanic=unwind"]
+#   * The one residual awkwardness: a `rust_test` that
+#     `crate = ":foo"` pulls `:foo`'s dep rlibs (which stay
+#     no_std under the test verb because dep compilation doesn't
+#     get `--test`). For that case we ship a sibling dep target
+#     with `crate_features = ["std"]` so the dep also compiles
+#     as std + unwind — see `//util/atomic_fn:atomic_fn_unwind`.

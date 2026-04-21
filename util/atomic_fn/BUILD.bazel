@@ -1,5 +1,5 @@
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
-load("//bazel/rules:rust.bzl", "HOST_TEST_RUSTC_FLAGS", "UNIKERNEL_RUSTC_FLAGS")
+load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -39,13 +39,12 @@ rust_library(
 rust_library(
     name = "atomic_fn_unwind",
     srcs = ["lib.rs"],
+    crate_features = ["std"],
     crate_name = "atomic_fn",
     crate_root = "lib.rs",
-    rustc_flags = HOST_TEST_RUSTC_FLAGS,
 )
 
 rust_test(
     name = "atomic_fn_test",
     crate = ":atomic_fn",
-    rustc_flags = HOST_TEST_RUSTC_FLAGS,
 )
