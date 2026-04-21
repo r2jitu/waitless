@@ -1015,9 +1015,10 @@ pub extern "C" fn main() -> i32 {
             }
         }
 
-        // App teardown — runs `App::destroy` on whatever the user
-        // handed to `uni::run_app`. Idempotent; ordered after workers
-        // have stopped touching app state. See `uni::lib::shutdown_and_drop`.
+        // App teardown — drops whatever the user handed to
+        // `uni::run` (firing its `Drop` impl). Idempotent; ordered
+        // after workers have stopped touching app state. See
+        // `uni::lib::shutdown_and_drop`.
         crate::shutdown_and_drop();
     }
     0

@@ -38,8 +38,8 @@ ROOT = runfiles_root()
 LAUNCHER = ROOT / "apps" / "webserver" / "webserver"
 DEV_CERT = ROOT / "apps" / "webserver" / "dev_certs" / "dev_cert.pem"
 # Matches both unikernel boot (`[BOOT] Entering event loop on core 0.`)
-# and native POSIX (`Entering event loop.` from uni::main before
-# server.run()).
+# and native POSIX (`Entering event loop.` from the app's boot()
+# function before server.run()).
 BOOT_MARKER = b"Entering event loop"
 
 PORT = int(os.environ.get("TEST_PORT", 18080))

@@ -13,7 +13,7 @@ Runs on **x86_64** and **ARM64 (aarch64)** via QEMU, Apple Hypervisor.framework 
 ```
 ┌─────────────────────────────────────┐
 │           Application               │  apps/webserver/
-│         #[uni::main]                │
+│         #[uni::boot]                │
 ├─────────────────────────────────────┤
 │    Platform Abstraction (uni)       │  uni/ (HTTP, TCP, TLS 1.3, logging)
 ├─────────────────────────────────────┤
@@ -83,13 +83,24 @@ bazel test --config=x86_64-qemu //apps/webserver:test   # QEMU x86_64
 extern crate uni;
 use uni::http::{Request, Response, Server};
 
-#[uni::main]
-fn main() {
-    let mut server = /* ... */;
-    server.default_handler(|req: &Request| {
-        Response::ok(b"text/plain", b"Hello from bare metal!")
-    });
-    server.run(uni::config_port(80));
+struct MyApp { _server: alloc::boxed::Box<Server> }
+impl uni::App for MyApp {}
+
+impl MyApp {
+    fn new() -> Self {
+        let mut server = Server::new_boxed();
+        server.default_handler(|req: &Request| {
+            Response::ok(b"text/plain", b"Hello from bare metal!")
+        });
+        server.listen(uni::config_port(80));
+        server.run();
+        MyApp { _server: server }
+    }
+}
+
+#[uni::boot]
+fn boot() {
+    uni::run(MyApp::new());
 }
 ```
 
@@ -122,7 +133,7 @@ unikernel/
 │   ├── http.rs             HTTP/1.1 server (+ TLS wrapper)
 │   ├── unikernel.rs        Unikernel backend (serial, idle)
 │   ├── native.rs           Native POSIX backend (sockets)
-│   └── macros/             #[uni::main] proc macro
+│   └── macros/             #[uni::boot] proc macro
 ├── net/                    Network stack crate
 │   ├── ethernet.rs, arp.rs, ipv4.rs, udp.rs, dhcp.rs
 │   ├── tcp.rs              TCP + per-core 4-tuple hash table

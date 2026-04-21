@@ -231,13 +231,12 @@ const HTTPS_PORT: u16 = 443;
 /// program's top-level type; the runtime takes ownership via
 /// `uni::run` and drops it on graceful shutdown.
 ///
-/// `server` is accessed by the HTTP service callback via
+/// The server is accessed by the HTTP service callback via
 /// `http::SERVER_PTR`, which `Server::listen`/`listen_tls` publish
-/// during setup — so the field is read indirectly at runtime, hence
-/// the lint allow here.
-#[allow(dead_code)]
+/// during setup — so the field is held for ownership only, not read
+/// through `&self` in any of this struct's methods.
 struct WebServerApp {
-    server: alloc::boxed::Box<Server>,
+    _server: alloc::boxed::Box<Server>,
 }
 
 impl uni::App for WebServerApp {}
@@ -281,14 +280,14 @@ impl WebServerApp {
         uni::log(b"Entering event loop.\n");
         server.run();
 
-        WebServerApp { server }
+        WebServerApp { _server: server }
     }
 }
 
 impl Drop for WebServerApp {
     fn drop(&mut self) {
         uni::log(b"[app] shutting down\n");
-        // Field drops cascade from here: `server` tears down
+        // Field drops cascade from here: `_server` tears down
         // listeners, active conns, TLS config, RX buffers, the lot.
     }
 }

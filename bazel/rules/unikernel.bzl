@@ -34,7 +34,7 @@ _LINK_FLAGS_ARCH = select({
 def unikernel_binary(name, app, visibility = None):
     """Package a Rust application into bootable unikernel images.
 
-    The application is a rust_library with a #[uni::main] entry point.
+    The application is a rust_library with a #[uni::boot] entry point.
 
     Targets produced:
       - <name>            : Unified launcher — `bazel run //path:name` picks
@@ -48,7 +48,7 @@ def unikernel_binary(name, app, visibility = None):
 
     Args:
         name: Base name for all output targets.
-        app: A rust_library target with a #[uni::main] entry point.
+        app: A rust_library target with a #[uni::boot] entry point.
         visibility: Bazel visibility specification.
     """
 
