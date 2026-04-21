@@ -45,6 +45,7 @@ pub mod native;
 
 pub mod boot_info;
 pub mod http;
+pub mod rng;
 
 pub use boot_info::{boot_info, BootInfo, NicInfo};
 

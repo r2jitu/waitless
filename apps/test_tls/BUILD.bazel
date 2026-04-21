@@ -10,8 +10,11 @@ rust_library(
     name = "app",
     srcs = ["main.rs"],
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    # No `//kernel` dep: the test used to hit `kernel::rng` directly,
+    # which pinned the app to the unikernel platform; it now goes
+    # through `uni::rng::fill_bytes` (platform-agnostic wrapper), so
+    # the whole test runs natively too.
     deps = [
-        "//kernel",
         "//uni",
         "//net:tls",
         "//net:tls_crypto",
@@ -23,24 +26,18 @@ unikernel_binary(
     app = ":app",
 )
 
-# TLS primitives smoke test — drives the handshake / AEAD stack
-# inside a real guest boot. The app calls `kernel::rng::fill_bytes`
-# directly, so native is excluded (the kernel RNG is unikernel-only;
-# porting would require a cfg-gated host backend — not worth it for
-# a smoke test that the guest variants already cover). ISO variants
-# are also skipped: same guest code as QEMU, just a different boot
-# path (already validated by the `.iso` genrule building cleanly).
+# TLS primitives smoke test. Uses `uni::rng::fill_bytes` (cfg-
+# switched between kernel RNG on unikernel and getentropy(2) on
+# native), so the same source runs under every variant in the
+# default test set — no explicit `variants = [...]` needed. Native
+# is the fastest runner (no VM boot) and catches regressions in
+# the crypto routines orders of magnitude faster than HVF/QEMU.
 unikernel_app_test(
     name = "test",
     app_base = "test_tls",
     test_rule = py_test,
     srcs = ["test.py"],
     deps = ["//scripts:test_helpers"],
-    variants = [
-        "hvf",
-        "qemu_aarch64",
-        "qemu_x86_64",
-    ],
     tags = [
         "exclusive",
         "local",

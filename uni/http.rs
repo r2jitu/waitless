@@ -279,48 +279,9 @@ struct ActiveConn {
 /// At ~800K ticks/sec (single-core event loop), 4M ticks ≈ 5 seconds.
 const IDLE_TIMEOUT_TICKS: u32 = 4_000_000;
 
-/// Fill `seed` with 32 bytes of platform entropy for a per-connection
-/// TLS 1.3 ephemeral X25519 keypair.
-///
-/// On the unikernel this calls `kernel::rng::fill_bytes`, which
-/// drives a ChaCha20 PRNG seeded at boot from TSC/CNTVCT jitter +
-/// RDRAND samples.
-///
-/// On native it reads `/dev/urandom` via libc. We don't use
-/// `getrandom::getrandom` here because on bare-metal the getrandom
-/// crate is configured with the `custom` feature pointing at
-/// `kernel::rng`, and linking that chain from this path would
-/// bring kernel::rng back in for native too. Going directly through
-/// each platform's natural entropy source keeps the deps clean.
-#[inline]
-#[cfg(platform_unikernel)]
-fn fill_tls_seed(seed: &mut [u8; 32]) {
-    kernel::rng::fill_bytes(seed);
-}
-
-#[inline]
-#[cfg(platform_native)]
-fn fill_tls_seed(seed: &mut [u8; 32]) {
-    // libc::getentropy fills up to 256 bytes from the kernel
-    // entropy pool in one syscall and is available on both macOS
-    // and Linux glibc/musl. We declare it directly instead of
-    // pulling in `libc` as a dep because we only need this one
-    // symbol.
-    unsafe extern "C" {
-        fn getentropy(buf: *mut core::ffi::c_void, len: usize) -> i32;
-    }
-    unsafe {
-        let rc = getentropy(seed.as_mut_ptr() as *mut _, 32);
-        if rc != 0 {
-            // Fallback: zero the seed. The handshake will still
-            // complete but with predictable ephemeral keys, which
-            // is catastrophic for real clients — however on native
-            // we only use this for dev/bench, and getentropy
-            // essentially never fails in practice.
-            *seed = [0u8; 32];
-        }
-    }
-}
+// `uni::rng::fill_bytes` handles the platform cfg-switch — see
+// that module for the backend split (kernel::rng on unikernel,
+// getentropy(2) on native).
 
 impl ActiveConn {
     fn new() -> Self {
@@ -535,7 +496,7 @@ impl Server {
                         // `arc4random_buf` on native (host OS entropy).
                         // Both are fine for TLS 1.3 ephemeral keys.
                         let mut seed = [0u8; 32];
-                        fill_tls_seed(&mut seed);
+                        crate::rng::fill_bytes(&mut seed);
                         ac.tls = Some(Box::new(
                             net::tls_server::TlsServer::new(seed),
                         ));
