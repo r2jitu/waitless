@@ -920,7 +920,7 @@ fn irq_handler(_irq: u32) {
 // ============================================================================
 
 /// Set when `init()` has returned `true`. Mirrors
-/// `gvnic::probe_ok()` so the `EthernetDriver` trait impl can
+/// `gve::probe_ok()` so the `EthernetDriver` trait impl can
 /// report which driver actually bound hardware at boot. Read
 /// via `probe_ok()` below; do not read directly.
 static PROBE_OK: core::sync::atomic::AtomicBool =

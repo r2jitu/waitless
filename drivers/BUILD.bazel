@@ -6,7 +6,7 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "drivers",
     srcs = [
-        "gvnic.rs",
+        "gve.rs",
         "lib.rs",
         "net.rs",
         "pci.rs",

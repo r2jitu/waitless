@@ -247,6 +247,6 @@ pub mod pci;
 pub mod virtio;
 pub mod virtio_net;
 pub mod virtio_console;
-pub mod gvnic;
+pub mod gve;
 pub mod net;
 

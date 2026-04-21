@@ -1,4 +1,10 @@
-// drivers/gvnic.rs — Google Virtual NIC (gVNIC) driver.
+// drivers/gve.rs — Google Virtual Ethernet (gve) driver.
+//
+// Renamed from `gvnic.rs` in Phase 5 step 3 to match Linux / the
+// upstream Google driver name. "gVNIC" is GCE's branding for the
+// virtual NIC product; the driver itself is `gve`. The module name
+// and symbols all say `gve`; comments reference "gVNIC" when
+// talking about the GCE product surface (e.g., instance flags).
 //
 // Brings up one TX + one RX queue pair in GQI_QPL mode on GCE and
 // serves packets on it. The driver is split into three levels:
@@ -1850,3 +1856,51 @@ const _: () = {
     assert!(size_of::<AdminqCommand>() == CMD_SIZE);
     assert!(ADMINQ_SIZE / CMD_SIZE == ADMINQ_SLOTS);
 };
+
+// ============================================================================
+// Phase 5: EthernetDriver trait adapter
+// ============================================================================
+//
+// `GveDriver` adapts the existing module-level functions to the
+// `EthernetDriver` trait contract. Registered via
+// `register_ethernet_driver!` so the `.uni_drivers_ethernet` section
+// walker picks it up. Actual probing still runs via the legacy
+// `drivers::net::init()` path today — Phase 5 Step 5 flips
+// `Net::enable` to drive the probe directly.
+
+use uni_net_driver::{EthernetDriver, NicError, NicHandle};
+
+pub struct GveDriver;
+
+impl EthernetDriver for GveDriver {
+    fn name(&self) -> &'static str {
+        // Match Linux and Google's upstream driver name; "gVNIC" is
+        // GCE's product branding, but the driver itself is `gve`.
+        "gve"
+    }
+
+    fn probe(&self) -> Option<NicHandle> {
+        if probe_ok() {
+            Some(NicHandle::new())
+        } else {
+            None
+        }
+    }
+
+    fn send(&self, _handle: &NicHandle, frame: &[u8]) -> Result<(), NicError> {
+        // Module-level `send()` drops on error; surface no
+        // back-pressure for now. §2g's async layer can grow
+        // `NicError::TxQueueFull` when it has a retry loop.
+        send(frame);
+        Ok(())
+    }
+
+    fn poll_rx(&self, _handle: &NicHandle, cb: fn(&[u8])) -> usize {
+        let n = poll(cb);
+        if n < 0 { 0 } else { n as usize }
+    }
+}
+
+pub static GVE_DRIVER: GveDriver = GveDriver;
+
+uni_net_driver::register_ethernet_driver!(GVE_DRIVER);

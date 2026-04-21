@@ -23,7 +23,7 @@ pub const MAX_NICS: usize = 4;
 /// Description of one network interface as reported at boot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NicInfo {
-    /// Driver kind: e.g. `"virtio-net"`, `"gvnic"`, `"posix"`.
+    /// Driver kind: e.g. `"virtio-net"`, `"gve"`, `"posix"`.
     pub name: &'static str,
     /// Link-layer address.
     pub mac: [u8; 6],
