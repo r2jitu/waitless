@@ -19,6 +19,12 @@ set -euo pipefail
 
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 SELF_NAME="$(basename "$0")"
+# Variant wrappers (from `unikernel_variants`) symlink this script
+# at `<app>_<variant>`; the underlying artefacts stay named after
+# the base `<app>` target, so strip the known variant suffixes.
+for _suffix in _hvf _iso _qemu_aarch64 _qemu_x86_64; do
+    SELF_NAME="${SELF_NAME%$_suffix}"
+done
 IMG="${SELF_DIR}/${SELF_NAME}.img"
 [[ -f "$IMG" ]] || { echo "ERROR: .img not found at $IMG" >&2; exit 1; }
 

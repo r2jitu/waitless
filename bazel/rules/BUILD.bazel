@@ -1,4 +1,4 @@
-load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
+load("@bazel_skylib//rules:common_settings.bzl", "bool_flag", "string_flag")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -31,4 +31,23 @@ bool_flag(
 config_setting(
     name = "tests_need_std_on",
     flag_values = {":tests_need_std": "True"},
+)
+
+# Which runner the `:<name>` unikernel_binary launcher targets. Set
+# either by the `.bazelrc` `build:hvf` / `build:qemu` / `build:iso`
+# shortcut configs (whole-build override) or by the per-variant
+# transitions in `//bazel/rules:variants.bzl` (sub-graph-scoped
+# override for `:<name>_hvf` / `:<name>_iso` / etc.). Previously this
+# lived on `--define=uni_runner=<val>`, but Starlark transitions
+# cannot set `--define`, so we migrated to a user-defined
+# `string_flag` (which transitions DO support).
+string_flag(
+    name = "uni_runner",
+    build_setting_default = "native",
+    values = [
+        "native",
+        "hvf",
+        "qemu",
+        "iso",
+    ],
 )

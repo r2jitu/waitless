@@ -43,31 +43,31 @@ common --@bazel_tools//tools/test:incompatible_use_default_test_toolchain=false
 
 # ── Shorthand configs ─────────────────────────────────────────────────────────
 # --config=qemu → unikernel via QEMU (platform from .bazelrc.local for host arch)
-build:qemu --define=uni_runner=qemu
+build:qemu --//bazel/rules:uni_runner=qemu
 
 # --config=hvf  → ARM64 unikernel, HVF (macOS arm64, Apple Hypervisor.framework)
 build:hvf  --platforms=//bazel/platforms:aarch64_unikernel
-build:hvf  --define=uni_runner=hvf
+build:hvf  --//bazel/rules:uni_runner=hvf
 
 # --config=iso  → x86_64 unikernel via Limine ISO + QEMU
 build:iso  --platforms=//bazel/platforms:x86_64_unikernel
-build:iso  --define=uni_runner=iso
+build:iso  --//bazel/rules:uni_runner=iso
 
 # --config=native → native POSIX binary (platform from .bazelrc.local for host)
 # setup-dev.sh generates: build:native --platforms=//bazel/platforms:native_<host>
 
 # ── Full triplet configs ───────────────────────────────────────────────────────
 build:aarch64-hvf  --platforms=//bazel/platforms:aarch64_unikernel
-build:aarch64-hvf  --define=uni_runner=hvf
+build:aarch64-hvf  --//bazel/rules:uni_runner=hvf
 
 build:aarch64-qemu --platforms=//bazel/platforms:aarch64_unikernel
-build:aarch64-qemu --define=uni_runner=qemu
+build:aarch64-qemu --//bazel/rules:uni_runner=qemu
 
 build:x86_64-qemu  --platforms=//bazel/platforms:x86_64_unikernel
-build:x86_64-qemu  --define=uni_runner=qemu
+build:x86_64-qemu  --//bazel/rules:uni_runner=qemu
 
 build:x86_64-iso   --platforms=//bazel/platforms:x86_64_unikernel
-build:x86_64-iso   --define=uni_runner=iso
+build:x86_64-iso   --//bazel/rules:uni_runner=iso
 
 build:aarch64-macos --platforms=//bazel/platforms:aarch64_macos
 build:x86_64-linux  --platforms=//bazel/platforms:x86_64_linux

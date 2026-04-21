@@ -77,19 +77,22 @@ config_setting(
 )
 
 # ── Runner selection ──────────────────────────────────────────────────────────
-# Set via --define=uni_runner=<value>; used in select() by unikernel_binary().
-# Default (no define) = native POSIX binary.
+# Matches the `//bazel/rules:uni_runner` string_flag (default "native",
+# one of "native" / "hvf" / "qemu" / "iso"). Used by unikernel_binary()'s
+# `srcs` / `data` select() to pick the right launcher script + data
+# deps. `.bazelrc` shortcut configs (`build:hvf` etc.) and per-variant
+# transitions in `//bazel/rules:variants.bzl` both flip the flag.
 config_setting(
     name = "runner_qemu",
-    define_values = {"uni_runner": "qemu"},
+    flag_values = {"//bazel/rules:uni_runner": "qemu"},
 )
 
 config_setting(
     name = "runner_hvf",
-    define_values = {"uni_runner": "hvf"},
+    flag_values = {"//bazel/rules:uni_runner": "hvf"},
 )
 
 config_setting(
     name = "runner_iso",
-    define_values = {"uni_runner": "iso"},
+    flag_values = {"//bazel/rules:uni_runner": "iso"},
 )
