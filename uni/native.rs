@@ -1025,8 +1025,9 @@ extern "C" fn worker_thread(arg: *mut u8) -> *mut u8 {
     ptr::null_mut()
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn main() -> i32 {
+/// Native-binary entry point — called from `bazel/rules/native_main.rs`'s
+/// `fn main()`. Returns the process exit code.
+pub fn run() -> i32 {
     init_native();
     unsafe {
         uni_main();

@@ -88,14 +88,6 @@ _qemu_x86_64_transition = _make_variant_transition(
     uni_runner = "qemu",
 )
 
-# Native doesn't change platform (the binary runs on the host), but
-# still needs to reset `-Cpanic=abort` + `tests_need_std = False` so
-# the `:<name>_native_bin` rust_binary + its no_std deps compile
-# under the `bazel test` verb (which applies panic=unwind globally).
-_native_transition = _make_variant_transition(
-    platform = None,
-    uni_runner = "native",
-)
 
 # ── Variant rule helpers ───────────────────────────────────────────────────
 
@@ -173,21 +165,6 @@ def _iso_impl(ctx):
         executable = launcher,
         runfiles = ctx.runfiles(files = [launcher, iso, ctx.file.helpers]),
     )]
-
-def _native_impl(ctx):
-    # Native's "launcher" is just the underlying `:<name>_native_bin`
-    # rust_binary — no VM, no wrapper script, no image artefact. We
-    # re-expose it under this rule's name (dropping the `_bin`
-    # suffix) so `:<name>_native` stays the user-facing target even
-    # though the rust_binary is declared under an internal name.
-    # The transition on `src` just resets `panic=abort` +
-    # `tests_need_std=False` — it doesn't flip platform.
-    src = ctx.attr.src[0][DefaultInfo]
-    src_exe = src.files_to_run.executable
-    out = ctx.actions.declare_file(ctx.label.name)
-    ctx.actions.symlink(output = out, target_file = src_exe, is_executable = True)
-    runfiles = src.default_runfiles.merge(ctx.runfiles(files = [out]))
-    return [DefaultInfo(executable = out, runfiles = runfiles)]
 
 def _qemu_impl(ctx):
     # Both .elf and .img ship together: x86_64 QEMU reads the ELF
@@ -305,24 +282,6 @@ def _make_qemu_variant(variant_transition):
 _qemu_aarch64_variant = _make_qemu_variant(_qemu_aarch64_transition)
 _qemu_x86_64_variant = _make_qemu_variant(_qemu_x86_64_transition)
 
-# Native wrapper rule. Unlike the VM variants, there's no launcher
-# template to expand — the transitioned rust_binary IS the
-# executable — so the rule just symlinks it through under the
-# variant's public name (`:<app>_native` → actual rust_binary at
-# `:<app>_native_bin`).
-_native_variant = rule(
-    implementation = _native_impl,
-    executable = True,
-    attrs = dict(_ALLOWLIST_ATTR, **{
-        "src": attr.label(
-            cfg = _native_transition,
-            mandatory = True,
-            executable = True,
-            doc = "The underlying :<name>_native_bin rust_binary (transitioned).",
-        ),
-    }),
-)
-
 # ── Variant specs — single source of truth ───────────────────────────────
 #
 # Each spec wires a suffix ("hvf", "iso", "qemu_<arch>") to:
@@ -386,15 +345,16 @@ _VARIANT_SPECS = [
         in_default_test_set = True,
     ),
     struct(
-        # Native: the underlying rust_binary lives at
-        # `:<name>_native_bin` (internal); the variant rule
-        # re-exposes it as `:<name>_native` under a transition
-        # that resets `panic=abort` + `tests_need_std=False` so
-        # the binary and its no_std deps compile cleanly under
-        # `bazel test` (which sets panic=unwind globally).
+        # Native: `:<name>_native` is a plain rust_binary declared
+        # by `unikernel_binary` itself (native_main.rs links libstd,
+        # so no transition or wrapper is required for the `bazel
+        # test` verb's panic=unwind to work). `rule_fn = None`
+        # signals `unikernel_variants` to skip target creation; the
+        # spec entry is still present so `unikernel_app_test` fans
+        # out across native too — fast, no VM boot.
         suffix = "native",
-        rule_fn = _native_variant,
-        src_attrs = {"src": "_native_bin"},
+        rule_fn = None,
+        src_attrs = {},
         host_attrs = {},
         host_compat = ["//bazel/platforms:native"],
         extra_test_tags = [],
@@ -409,7 +369,14 @@ _DEFAULT_TEST_VARIANT_SUFFIXES = tuple([
 ])
 
 def _instantiate_variant(spec, name, base, visibility):
-    """Invoke `spec.rule_fn` with attrs derived from `spec` + `base`."""
+    """Invoke `spec.rule_fn` with attrs derived from `spec` + `base`.
+
+    `rule_fn = None` means the target is produced elsewhere — native's
+    `:<base>_native` is declared directly by `unikernel_binary` — so
+    this helper is a no-op for that spec.
+    """
+    if spec.rule_fn == None:
+        return
     kwargs = {}
     for attr_name, suffix in spec.src_attrs.items():
         kwargs[attr_name] = ":" + base + suffix

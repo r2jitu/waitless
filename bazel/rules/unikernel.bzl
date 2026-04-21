@@ -42,15 +42,18 @@ def unikernel_binary(name, app, visibility = None):
       - <name>.limine.elf : Higher-half ELF (Limine bootloader)
       - <name>.iso        : Limine-bootable ISO (BIOS + UEFI)
 
-    Runnable targets produced (via `unikernel_variants`):
-      - <name>_native       : Native POSIX binary (host OS, no VM).
+    Runnable targets:
+      - <name>_native       : Native POSIX binary (host OS, no VM,
+                              declared here directly).
       - <name>_hvf          : aarch64 unikernel + HVF runner.
       - <name>_iso          : x86_64 unikernel + Limine ISO in QEMU.
       - <name>_qemu_aarch64 : aarch64 unikernel + QEMU TCG.
       - <name>_qemu_x86_64  : x86_64 unikernel + QEMU TCG.
 
-    (The internal `<name>_native_bin` rust_binary is what the
-    variant rule wraps — use `:<name>_native` as a caller.)
+    The VM variants are generated via `unikernel_variants`; native
+    is a plain rust_binary because `native_main.rs` links libstd
+    (so `bazel test`'s `-Cpanic=unwind` works without a Bazel
+    transition resetting it).
 
     Args:
         name: Base name for all output targets.
@@ -171,15 +174,14 @@ def unikernel_binary(name, app, visibility = None):
 
     # ── Native POSIX binary ──────────────────────────────────────────────
     #
-    # Declared under the internal `_native_bin` name; the variant rule
-    # in `//bazel/rules:variants.bzl` wraps it under a transition that
-    # resets `panic=abort` + `tests_need_std=False` for this sub-graph
-    # and re-exposes the result as `:<name>_native` (the user-facing
-    # target). The transition is needed because `bazel test` sets
-    # `-Cpanic=unwind` globally and this binary's no_std transitive
-    # deps refuse to compile under that.
+    # Directly runnable as `:<name>_native` — no variant wrapper,
+    # no transition. `native_main.rs` is a std binary (libstd
+    # provides panic handler / allocator / eh_personality); the
+    # dep-chain rlibs (uni, uni-net, net/*, app) stay `#![no_std]`
+    # but compile cleanly under any panic strategy because rlibs
+    # don't own a panic handler.
     rust_binary(
-        name = name + "_native_bin",
+        name = name + "_native",
         srcs = ["//bazel/rules:native_main.rs"],
         deps = [app, "//uni"],
         rustc_flags = select({
@@ -195,16 +197,6 @@ def unikernel_binary(name, app, visibility = None):
                 "link-arg=-lc",
             ],
         }),
-        # `manual` keeps this out of `//...` wildcard expansion.
-        # Without it, `bazel test //...` tries to build `_native_bin`
-        # directly under the outer test-verb config (panic=unwind),
-        # which fails against its no_std transitive deps. The variant
-        # wrapper in `//bazel/rules:variants.bzl` reaches it via an
-        # explicit `cfg = _native_transition` label attr that resets
-        # panic=abort — that path (`//...` → `:<name>_native` →
-        # transition → `:<name>_native_bin`) exercises full compile +
-        # link, so real errors aren't hidden.
-        tags = ["manual"],
         target_compatible_with = ["//bazel/platforms:native"],
         visibility = visibility,
     )
