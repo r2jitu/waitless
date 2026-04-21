@@ -23,16 +23,21 @@ unikernel_binary(
     app = ":app",
 )
 
-# TLS primitives smoke test — full handshake / AEAD stack inside
-# a real guest boot. Default variant set (hvf + qemu_<arch>); the
-# ISO boot path is already covered by :test_tls_iso as a runnable
-# target even though it's skipped from the default test fan-out.
+# TLS primitives smoke test — drives the handshake / AEAD stack
+# inside a real guest boot, so native (which doesn't boot a guest)
+# is excluded. ISO is also skipped — same crypto code, different
+# boot path (already covered by binary-level ISO builds).
 unikernel_app_test(
     name = "test",
     app_base = "test_tls",
     test_rule = py_test,
     srcs = ["test.py"],
     deps = ["//scripts:test_helpers"],
+    variants = [
+        "hvf",
+        "qemu_aarch64",
+        "qemu_x86_64",
+    ],
     tags = [
         "exclusive",
         "local",

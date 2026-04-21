@@ -28,14 +28,16 @@ class PerCoreStateTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         # Each per-variant py_test passes `env = {"LAUNCHER_NAME": "test_percpu_qemu_<arch>"}`.
-        # The variant rule symlinks the transitioned .elf as
-        # `<LAUNCHER_NAME>.elf` alongside the launcher.
+        # The variant rule symlinks the transitioned .elf + .img as
+        # `<LAUNCHER_NAME>.{elf,img}` alongside the launcher.
         launcher_name = os.environ["LAUNCHER_NAME"]
-        elf = runfiles_root() / "apps" / "test_percpu" / f"{launcher_name}.elf"
+        pkg = runfiles_root() / "apps" / "test_percpu"
+        elf = pkg / f"{launcher_name}.elf"
+        img = pkg / f"{launcher_name}.img"
         if not elf.is_file():
             raise unittest.SkipTest(f"{launcher_name}.elf not found at {elf}")
         cls.launcher = spawn_qemu(
-            elf, cpus=EXPECTED_CPUS, memory_mb=128,
+            elf, img_path=img, cpus=EXPECTED_CPUS, memory_mb=128,
             log_prefix="test_percpu",
         )
         if cls.launcher is None:

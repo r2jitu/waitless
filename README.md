@@ -53,27 +53,35 @@ curl http://localhost:8080/health
 
 ## Build Configurations
 
+Every `unikernel_binary(name, app)` generates one runnable target per
+runner (see `bazel/rules/variants.bzl`); pick the one you want by
+target name — no `--config=` flags required.
+
 ```bash
-# Unikernel (bare-metal)
-bazel build --config=hvf  //apps/webserver:webserver.img    # ARM64 HVF runner (macOS)
-bazel build --config=qemu //apps/webserver:webserver.elf    # QEMU (host arch)
-bazel build --config=x86_64-qemu //apps/webserver:webserver.elf
+# Unikernel (bare-metal) — each variant is a self-contained launcher.
+bazel run //apps/webserver:webserver_hvf            # aarch64 HVF runner (macOS)
+bazel run //apps/webserver:webserver_qemu_aarch64   # aarch64 QEMU TCG
+bazel run //apps/webserver:webserver_qemu_x86_64   # x86_64 QEMU TCG
+bazel run //apps/webserver:webserver_iso            # x86_64 Limine ISO via QEMU
 
-# Native (POSIX sockets, no VM)
-bazel build --config=aarch64-macos //apps/webserver:webserver_native
-bazel build --config=x86_64-linux  //apps/webserver:webserver_native
-
-# Limine ISO (BIOS + UEFI)
-bazel build --config=x86_64-iso //apps/webserver:webserver.iso
+# Native (POSIX sockets, no VM) — built under the outer host platform.
+bazel run //apps/webserver:webserver_native
 ```
 
 ## Testing
 
 ```bash
-bazel test //apps/webserver:test                        # native (no VM)
-bazel test --config=hvf  //apps/webserver:test          # HVF runner (macOS arm64)
-bazel test --config=qemu //apps/webserver:test          # QEMU (host arch)
-bazel test --config=x86_64-qemu //apps/webserver:test   # QEMU x86_64
+# Full matrix: runs every applicable variant per app. HVF auto-skips on Linux.
+bazel test //...
+
+# Filter by runner — all HVF tests, all qemu tests (both arches), etc.
+bazel test --test_tag_filters=hvf          //...
+bazel test --test_tag_filters=qemu         //...
+bazel test --test_tag_filters=qemu_x86_64  //...
+bazel test --test_tag_filters=native       //...
+
+# Single variant of one app.
+bazel test //apps/webserver:test_hvf
 ```
 
 ## Writing an Application

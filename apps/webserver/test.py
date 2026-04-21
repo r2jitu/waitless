@@ -50,6 +50,25 @@ PORT = int(os.environ.get("TEST_PORT", 18080))
 TLS_PORT = int(os.environ.get("TEST_TLS_PORT", 18443))
 UDP_PORT = int(os.environ.get("TEST_UDP_PORT", 18007))
 
+
+def _launcher_env(port: int, tls_port: int, udp_port: int) -> dict[str, str]:
+    """Env vars spanning every launcher variant.
+
+    VM launchers (hvf / qemu_*) read `UNIKERNEL_*` to set up host→guest
+    port forwards. The native binary (`webserver_native`, direct
+    rust_binary — no launcher script) reads `PORT` / `TLS_PORT` /
+    `UDP_PORT` to pick its listen sockets. Setting both keeps the
+    caller ignorant of which variant LAUNCHER points at.
+    """
+    return {
+        "UNIKERNEL_PORT": str(port),
+        "UNIKERNEL_TLS_PORT": str(tls_port),
+        "UNIKERNEL_UDP_PORT": str(udp_port),
+        "PORT": str(port),
+        "TLS_PORT": str(tls_port),
+        "UDP_PORT": str(udp_port),
+    }
+
 if not (LAUNCHER.is_file() and os.access(LAUNCHER, os.X_OK)):
     sys.exit(f"ERROR: launcher missing / not executable: {LAUNCHER}")
 
@@ -61,11 +80,7 @@ class WebserverServiceTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.launcher = spawn_backgrounded(
             LAUNCHER,
-            env={
-                "UNIKERNEL_PORT": str(PORT),
-                "UNIKERNEL_TLS_PORT": str(TLS_PORT),
-                "UNIKERNEL_UDP_PORT": str(UDP_PORT),
-            },
+            env=_launcher_env(PORT, TLS_PORT, UDP_PORT),
             log_prefix="webserver_svc",
         )
         if not wait_http_ready(PORT, timeout=20.0):
@@ -169,11 +184,7 @@ class WebserverShutdownTest(unittest.TestCase):
         port, tls_port, udp_port = PORT + 100, TLS_PORT + 100, UDP_PORT + 100
         pty_launcher = PtyLauncher(
             LAUNCHER,
-            env={
-                "UNIKERNEL_PORT": str(port),
-                "UNIKERNEL_TLS_PORT": str(tls_port),
-                "UNIKERNEL_UDP_PORT": str(udp_port),
-            },
+            env=_launcher_env(port, tls_port, udp_port),
         )
         stop_hammer = [False]
         try:

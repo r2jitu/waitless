@@ -599,8 +599,8 @@ Apps that don't need TLS drop `uni-tls` from deps. Hello becomes
   binary reduction for non-TLS apps — biggest single binary win.
 - **Test:** the existing TLS integration test (apps/test_tls)
   stays valid; webserver integration test keeps running;
-  verify `bazel build //apps/hello:hello --config=hvf` succeeds
-  without uni-tls dep
+  verify `bazel build //apps/hello:hello_hvf` succeeds without
+  a uni-tls dep
 
 ### Phase 7: `static_mut` sweep + virtio-console consolidation + `AtomicFn<F>` crate
 
@@ -779,8 +779,8 @@ include those tests or a written rationale for omission.
 ### Binary size
 
 ```bash
-bazel build --config=hvf //apps/hello:hello //apps/webserver:webserver
-ls -l bazel-bin/apps/{hello,webserver}/*.img
+bazel build //apps/hello:hello_hvf //apps/webserver:webserver_hvf
+ls -l bazel-bin/apps/{hello,webserver}/*_hvf.img
 ```
 
 Size regressions: hello ≤ 50 KB, webserver ≤ 100 KB, except

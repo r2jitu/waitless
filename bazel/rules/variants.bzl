@@ -51,24 +51,25 @@ rust_binary — a direct host executable, no launcher script required.)
 # from _VARIANT_SPECS below.
 
 def _make_variant_transition(platform, uni_runner):
+    outputs = [
+        "//bazel/rules:uni_runner",
+        "@rules_rust//:extra_rustc_flag",
+        "//bazel/rules:tests_need_std",
+    ]
+    if platform != None:
+        outputs.append("//command_line_option:platforms")
+
     def _impl(_settings, _attr):
-        return {
-            "//command_line_option:platforms": platform,
+        out = {
             "//bazel/rules:uni_runner": uni_runner,
             "@rules_rust//:extra_rustc_flag": ["-Cpanic=abort"],
             "//bazel/rules:tests_need_std": False,
         }
+        if platform != None:
+            out["//command_line_option:platforms"] = platform
+        return out
 
-    return transition(
-        implementation = _impl,
-        inputs = [],
-        outputs = [
-            "//command_line_option:platforms",
-            "//bazel/rules:uni_runner",
-            "@rules_rust//:extra_rustc_flag",
-            "//bazel/rules:tests_need_std",
-        ],
-    )
+    return transition(implementation = _impl, inputs = [], outputs = outputs)
 
 _hvf_transition = _make_variant_transition(
     platform = "//bazel/platforms:aarch64_unikernel",
@@ -85,6 +86,15 @@ _qemu_aarch64_transition = _make_variant_transition(
 _qemu_x86_64_transition = _make_variant_transition(
     platform = "//bazel/platforms:x86_64_unikernel",
     uni_runner = "qemu",
+)
+
+# Native doesn't change platform (the binary runs on the host), but
+# still needs to reset `-Cpanic=abort` + `tests_need_std = False` so
+# the `:<name>_native_bin` rust_binary + its no_std deps compile
+# under the `bazel test` verb (which applies panic=unwind globally).
+_native_transition = _make_variant_transition(
+    platform = None,
+    uni_runner = "native",
 )
 
 # ── Variant rule helpers ───────────────────────────────────────────────────
@@ -164,13 +174,28 @@ def _iso_impl(ctx):
         runfiles = ctx.runfiles(files = [launcher, iso, ctx.file.helpers]),
     )]
 
+def _native_impl(ctx):
+    # Native's "launcher" is just the underlying `:<name>_native_bin`
+    # rust_binary — no VM, no wrapper script, no image artefact. We
+    # re-expose it under this rule's name (dropping the `_bin`
+    # suffix) so `:<name>_native` stays the user-facing target even
+    # though the rust_binary is declared under an internal name.
+    # The transition on `src` just resets `panic=abort` +
+    # `tests_need_std=False` — it doesn't flip platform.
+    src = ctx.attr.src[0][DefaultInfo]
+    src_exe = src.files_to_run.executable
+    out = ctx.actions.declare_file(ctx.label.name)
+    ctx.actions.symlink(output = out, target_file = src_exe, is_executable = True)
+    runfiles = src.default_runfiles.merge(ctx.runfiles(files = [out]))
+    return [DefaultInfo(executable = out, runfiles = runfiles)]
+
 def _qemu_impl(ctx):
     # Both .elf and .img ship together: x86_64 QEMU reads the ELF
     # directly via `-kernel`, aarch64 QEMU needs the raw .img (the
-    # ELF is PIE and QEMU can't load it). `detect_qemu()` in
-    # scripts/test_helpers.py derives the .img path from the .elf
-    # path via `with_suffix(".img")`; keeping them co-located with
-    # matching basenames satisfies both code paths.
+    # ELF is PIE and QEMU can't load it). The launcher passes both
+    # explicitly to `detect_qemu` in helpers.sh, so we just
+    # symlink each under a co-located name and substitute both
+    # tokens — no implicit path derivation.
     elf = _symlink_into_outdir(
         ctx,
         ctx.attr.elf[0][DefaultInfo].files.to_list()[0],
@@ -183,6 +208,7 @@ def _qemu_impl(ctx):
     )
     launcher = _expand_launcher(ctx, {
         "%ELF%": elf.basename,
+        "%IMG%": img.basename,
         "%HELPERS%": _relpath_from_launcher_to(ctx, ctx.file.helpers),
     })
     return [DefaultInfo(
@@ -279,6 +305,24 @@ def _make_qemu_variant(variant_transition):
 _qemu_aarch64_variant = _make_qemu_variant(_qemu_aarch64_transition)
 _qemu_x86_64_variant = _make_qemu_variant(_qemu_x86_64_transition)
 
+# Native wrapper rule. Unlike the VM variants, there's no launcher
+# template to expand — the transitioned rust_binary IS the
+# executable — so the rule just symlinks it through under the
+# variant's public name (`:<app>_native` → actual rust_binary at
+# `:<app>_native_bin`).
+_native_variant = rule(
+    implementation = _native_impl,
+    executable = True,
+    attrs = dict(_ALLOWLIST_ATTR, **{
+        "src": attr.label(
+            cfg = _native_transition,
+            mandatory = True,
+            executable = True,
+            doc = "The underlying :<name>_native_bin rust_binary (transitioned).",
+        ),
+    }),
+)
+
 # ── Variant specs — single source of truth ───────────────────────────────
 #
 # Each spec wires a suffix ("hvf", "iso", "qemu_<arch>") to:
@@ -304,6 +348,7 @@ _VARIANT_SPECS = [
         src_attrs = {"img": ".img"},
         host_attrs = {"hvf_runner": "//tools/hvf-runner:run_hvf"},
         host_compat = ["@platforms//os:macos"],  # Hypervisor.framework.
+        extra_test_tags = [],
         in_default_test_set = True,
     ),
     struct(
@@ -312,6 +357,7 @@ _VARIANT_SPECS = [
         src_attrs = {"iso": ".iso"},
         host_attrs = {},
         host_compat = [],  # QEMU x86_64 TCG runs anywhere.
+        extra_test_tags = [],
         # Excluded from the default test set: the guest code under
         # test is identical to the QEMU variants (same app binary),
         # and we already exercise Limine boot at binary-build time.
@@ -325,6 +371,9 @@ _VARIANT_SPECS = [
         src_attrs = {"elf": ".elf", "img": ".img"},
         host_attrs = {},
         host_compat = [],
+        # `qemu` is an umbrella tag so `--test_tag_filters=qemu`
+        # picks up both architectures in one shot.
+        extra_test_tags = ["qemu"],
         in_default_test_set = True,
     ),
     struct(
@@ -333,6 +382,22 @@ _VARIANT_SPECS = [
         src_attrs = {"elf": ".elf", "img": ".img"},
         host_attrs = {},
         host_compat = [],
+        extra_test_tags = ["qemu"],
+        in_default_test_set = True,
+    ),
+    struct(
+        # Native: the underlying rust_binary lives at
+        # `:<name>_native_bin` (internal); the variant rule
+        # re-exposes it as `:<name>_native` under a transition
+        # that resets `panic=abort` + `tests_need_std=False` so
+        # the binary and its no_std deps compile cleanly under
+        # `bazel test` (which sets panic=unwind globally).
+        suffix = "native",
+        rule_fn = _native_variant,
+        src_attrs = {"src": "_native_bin"},
+        host_attrs = {},
+        host_compat = ["//bazel/platforms:native"],
+        extra_test_tags = [],
         in_default_test_set = True,
     ),
 ]
@@ -417,11 +482,15 @@ def unikernel_app_test(name, app_base, test_rule, extra_data = None, variants = 
         fail("unikernel_app_test: `target_compatible_with` is set per-variant " +
              "from `host_compat` in variants.bzl; drop it from your call.")
 
-    # Default `main` from `srcs[0]` if the caller didn't pass one
-    # explicitly. Saves every BUILD file from repeating `main =
-    # srcs[0]` boilerplate.
-    if "srcs" in kwargs and "main" not in kwargs:
-        kwargs["main"] = kwargs["srcs"][0]
+    # Pull `srcs` and common tags out of kwargs. Each variant gets
+    # its own copy of the source file (see below), so we consume
+    # `srcs` here and supply per-variant lists inside the loop.
+    srcs = kwargs.pop("srcs", None)
+    if not srcs or len(srcs) != 1:
+        fail("unikernel_app_test: `srcs` must be a single-element list " +
+             "(the test entry-point script).")
+    src_file = srcs[0]
+    caller_tags = list(kwargs.pop("tags", []))
 
     selected = variants if variants != None else _DEFAULT_TEST_VARIANT_SUFFIXES
     for suffix in selected:
@@ -432,13 +501,30 @@ def unikernel_app_test(name, app_base, test_rule, extra_data = None, variants = 
             ))
         spec = _SUFFIX_TO_SPEC[suffix]
         launcher_name = app_base + "_" + suffix
-        # Append the variant suffix as a test tag so users can filter
-        # the matrix via `--test_tag_filters=hvf` (all HVF tests across
-        # every app), `--test_tag_filters=qemu_aarch64`, etc. Caller-
-        # supplied tags are preserved.
-        variant_tags = list(kwargs.pop("tags", [])) + [suffix]
+        # Per-variant source copy. py_test registers a `PyCompile`
+        # action keyed on its srcs, and multiple py_test targets
+        # sharing the same source file collide on the resulting
+        # `__pycache__/<stem>.cpython-*.pyc` output. Giving every
+        # variant its own file (same content, unique name) sidesteps
+        # the collision — trivially works for any test_rule that
+        # accepts `srcs`, and is a no-op for rules that don't run a
+        # compile step on their sources.
+        variant_src = name + "_" + suffix + "_src.py"
+        native.genrule(
+            name = name + "_" + suffix + "_src",
+            srcs = [src_file],
+            outs = [variant_src],
+            cmd = "cp $< $@",
+        )
+        # Tags: caller-supplied + the variant's own suffix + any
+        # umbrella tags from the spec (e.g. "qemu" for both qemu
+        # archs). Lets `--test_tag_filters=hvf` / `=qemu` /
+        # `=qemu_aarch64` all work.
+        variant_tags = caller_tags + [suffix] + list(spec.extra_test_tags)
         test_rule(
             name = name + "_" + suffix,
+            srcs = [variant_src],
+            main = variant_src,
             data = [":" + launcher_name] + (extra_data or []),
             env = {"LAUNCHER_NAME": launcher_name},
             target_compatible_with = spec.host_compat,

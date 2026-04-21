@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Generated launcher for the `_qemu_<arch>` variant of a unikernel_binary
-# target. The variant rule symlinks the guest ELF, the helpers library,
-# and the app's .img (aarch64 -machine virt ROM) next to this script
-# under the filenames substituted into %ELF% / @@IMG@@ / %HELPERS%,
-# so everything lives in this script's directory.
+# target. The variant rule symlinks the guest ELF and the raw .img
+# next to this script under the filenames substituted into %ELF% /
+# %IMG%, and passes a launcher-relative path to //scripts:helpers.sh
+# via %HELPERS%. Both ELF and IMG are handed to detect_qemu explicitly
+# — aarch64 QEMU consumes the .img, x86_64 QEMU consumes the .elf.
 #
 # Env:
 #   UNIKERNEL_PORT     — host HTTP port   (default 8080) → guest :80
@@ -15,11 +16,12 @@ set -euo pipefail
 
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 ELF="$SELF_DIR/%ELF%"
+IMG="$SELF_DIR/%IMG%"
 HELPERS="$SELF_DIR/%HELPERS%"
 # shellcheck disable=SC1090
 source "$HELPERS"
 
-detect_qemu "$ELF"
+detect_qemu "$ELF" "$IMG"
 
 PORT="${UNIKERNEL_PORT:-8080}"
 TLS_PORT="${UNIKERNEL_TLS_PORT:-8443}"

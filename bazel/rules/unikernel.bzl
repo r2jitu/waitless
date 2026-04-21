@@ -42,12 +42,15 @@ def unikernel_binary(name, app, visibility = None):
       - <name>.limine.elf : Higher-half ELF (Limine bootloader)
       - <name>.iso        : Limine-bootable ISO (BIOS + UEFI)
 
-    Runnable targets produced:
+    Runnable targets produced (via `unikernel_variants`):
       - <name>_native       : Native POSIX binary (host OS, no VM).
       - <name>_hvf          : aarch64 unikernel + HVF runner.
       - <name>_iso          : x86_64 unikernel + Limine ISO in QEMU.
       - <name>_qemu_aarch64 : aarch64 unikernel + QEMU TCG.
       - <name>_qemu_x86_64  : x86_64 unikernel + QEMU TCG.
+
+    (The internal `<name>_native_bin` rust_binary is what the
+    variant rule wraps — use `:<name>_native` as a caller.)
 
     Args:
         name: Base name for all output targets.
@@ -152,8 +155,16 @@ def unikernel_binary(name, app, visibility = None):
     )
 
     # ── Native POSIX binary ──────────────────────────────────────────────
+    #
+    # Declared under the internal `_native_bin` name; the variant rule
+    # in `//bazel/rules:variants.bzl` wraps it under a transition that
+    # resets `panic=abort` + `tests_need_std=False` for this sub-graph
+    # and re-exposes the result as `:<name>_native` (the user-facing
+    # target). The transition is needed because `bazel test` sets
+    # `-Cpanic=unwind` globally and this binary's no_std transitive
+    # deps refuse to compile under that.
     rust_binary(
-        name = name + "_native",
+        name = name + "_native_bin",
         srcs = ["//bazel/rules:native_main.rs"],
         deps = [app, "//uni"],
         rustc_flags = select({

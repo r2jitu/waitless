@@ -12,10 +12,18 @@
 # ── QEMU configuration ──────────────────────────────────────────────────────
 # Detect QEMU binary, machine args, and virtio device type from an ELF.
 #
-# Usage: detect_qemu "$ELF"
+# Usage: detect_qemu "$ELF" "$IMG"
 # Sets:  QEMU_BIN  QEMU_MACHINE  VIRTIO_DEV  KERNEL_ARG
+#
+# Caller supplies both the ELF and the corresponding raw binary
+# (.img). aarch64 QEMU loads the .img, x86_64 QEMU loads the .elf;
+# the detector only decides between the two. The old behaviour
+# derived .img from the .elf path by suffix substitution, which
+# coupled the layout to the runner script's sibling-file convention
+# — giving callers explicit control removes that coupling.
 detect_qemu() {
     local elf="$1"
+    local img="$2"
     local info
     info="$(file "$elf" 2>/dev/null || echo "")"
 
@@ -23,8 +31,7 @@ detect_qemu() {
         QEMU_BIN="qemu-system-aarch64"
         QEMU_MACHINE=(-machine virt -cpu max)
         VIRTIO_DEV="virtio-net-device"
-        # aarch64 QEMU needs raw .img, not ELF
-        KERNEL_ARG="${elf%.elf}.img"
+        KERNEL_ARG="$img"
         [[ -f "$KERNEL_ARG" ]] || { echo "error: .img not found: $KERNEL_ARG" >&2; return 1; }
     else
         QEMU_BIN="qemu-system-x86_64"

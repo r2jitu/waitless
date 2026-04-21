@@ -108,8 +108,8 @@ Required for pulling in crypto (`ring`), QUIC (`quiche`/`quinn`), etc.
 
 **Try it:**
 ```bash
-bazel build --config=aarch64-qemu @crates//:bitflags   # compiles for bare-metal aarch64
-bazel build --config=x86_64-qemu @crates//:bitflags    # compiles for bare-metal x86_64
+bazel build --platforms=//bazel/platforms:aarch64_unikernel @crates//:bitflags   # bare-metal aarch64
+bazel build --platforms=//bazel/platforms:x86_64_unikernel  @crates//:bitflags   # bare-metal x86_64
 ```
 
 ---
@@ -555,8 +555,8 @@ INIT-SIPI-SIPI after init is done.
 
 **Try it:**
 ```bash
-bazel test //apps/test_smp:test                # serial: "core 0 online" .. "core 3 online"
-bazel test //apps/test_smp:test --config=qemu  # same on QEMU
+bazel test //apps/test_smp:test_qemu_aarch64   # serial: "core 0 online" .. "core 3 online"
+bazel test //apps/test_smp:test_qemu_x86_64    # same on x86_64 QEMU
 # Webserver still runs single-core here — cores boot but networking is next
 ```
 
@@ -645,8 +645,8 @@ replaced it; see MEMORY.md). Tier 2 is still the code path for any single-queue 
 
 **Try it:**
 ```bash
-UNIKERNEL_CPUS=4 bazel test --config=aarch64-qemu //apps/webserver:test --test_env=UNIKERNEL_CPUS=4
-UNIKERNEL_CPUS=4 bazel test --config=x86_64-qemu //apps/webserver:test --test_env=UNIKERNEL_CPUS=4
+UNIKERNEL_CPUS=4 bazel test //apps/webserver:test_qemu_aarch64 --test_env=UNIKERNEL_CPUS=4
+UNIKERNEL_CPUS=4 bazel test //apps/webserver:test_qemu_x86_64  --test_env=UNIKERNEL_CPUS=4
 # Serial: "[net] Tier 2: software distribution (4 cores)"
 # UDP multi-core benchmark:
 ./scripts/bench_udp.sh
@@ -759,7 +759,7 @@ just enough primitives for QUIC to `.await` what it needs.
 
 **Try it:**
 ```bash
-bazel test //apps/test_async:test --config=hvf
+bazel test //apps/test_async:test_hvf
 # Serial: "async: timer fired, udp echoed, goodbye"
 ```
 
@@ -796,8 +796,8 @@ Maybe 100 lines. Sits between IPv4 and QUIC.
 **Try it:**
 ```bash
 bazel test //net:types_test                          # unit tests (includes UDP checksum)
-bazel test --config=x86_64-qemu //apps/webserver:test  # HTTP + UDP echo (x86_64)
-bazel test --config=aarch64-qemu //apps/webserver:test # HTTP + UDP echo (aarch64)
+bazel test //apps/webserver:test_qemu_x86_64   # HTTP + UDP echo (x86_64)
+bazel test //apps/webserver:test_qemu_aarch64  # HTTP + UDP echo (aarch64)
 ```
 
 ### 3b. TLS 1.3 — hand-rolled, sans-io, audited primitives
@@ -970,13 +970,12 @@ refuse it for server auth — see commit `6cc283a`).
 **Try it:**
 ```bash
 # In-kernel integration test (12 primitives + RFC vectors)
-bazel build --config=qemu //apps/test_tls:test_tls.img
-bazel-bin/tools/hvf-runner/run-hvf bazel-bin/apps/test_tls/test_tls.img
+bazel test //apps/test_tls:test_hvf
 # Serial: "TLS TESTS: ALL PASSED"
 
 # Live TLS server on the unikernel
-bazel run //apps/webserver:run                 # native (POSIX)
-bazel run --config=hvf //apps/webserver:run    # HVF arm64
+bazel run //apps/webserver:webserver_native    # native (POSIX)
+bazel run //apps/webserver:webserver_hvf       # HVF arm64
 curl -k https://localhost:8443/health
 echo | openssl s_client -connect localhost:8443 -tls1_3 -brief
 
@@ -1341,7 +1340,7 @@ sets `features: "+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+aes,
 - [ ] Update the rust toolchain registration in MODULE.bazel to
       register the new triple.
 - [ ] Drop the per-crate rustc_flags annotations.
-- [ ] Verify `bazel test //... --config=x86_64-qemu` still passes.
+- [ ] Verify `bazel test --test_tag_filters=qemu_x86_64 //...` still passes.
 
 **Trigger**: when the per-crate annotation list has more than 10-12
 crates, or when adding a crate requires a third "look up which
@@ -1586,8 +1585,9 @@ sh_test(name = "test", srcs = ["test.sh"], data = [":test_smp.elf"])
 ### Naming convention
 
 - Unit tests: `bazel test //net:ethernet_test`, `//kernel:mm_test`
-- Integration tests: `bazel test //apps/test_smp:test`
-- Configs: `--config=qemu`, `--config=vz`, `--config=x86_64-qemu`
+- Integration tests: `bazel test //apps/test_smp:test_qemu_aarch64`
+  (per-variant; see `bazel/rules/variants.bzl`). Filter the full
+  matrix via `--test_tag_filters=hvf` / `=qemu` / `=qemu_x86_64`.
 
 ---
 

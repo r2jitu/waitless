@@ -59,9 +59,10 @@ class TlsPrimitiveTest(unittest.TestCase):
             cls.launcher = Launcher(proc=proc, log_path=log_path)
         else:
             elf = pkg / f"{launcher_name}.elf"
+            img = pkg / f"{launcher_name}.img"
             if not elf.is_file():
                 raise RuntimeError(f"{launcher_name}.elf not found at {elf}")
-            cls.launcher = spawn_qemu(elf, cpus=1, memory_mb=128,
+            cls.launcher = spawn_qemu(elf, img_path=img, cpus=1, memory_mb=128,
                                       log_prefix=launcher_name)
             if cls.launcher is None:
                 raise unittest.SkipTest("no qemu-system-* on PATH for this ELF")

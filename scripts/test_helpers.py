@@ -53,11 +53,18 @@ class QemuConfig:
     kernel_arg: str  # Path to .elf (x86) or .img (aarch64) for `-kernel`.
 
 
-def detect_qemu(elf_path: Path) -> Optional[QemuConfig]:
+def detect_qemu(elf_path: Path, img_path: Optional[Path] = None) -> Optional[QemuConfig]:
     """Pick the right qemu-system-* + machine args for an ELF.
 
     Returns None if the matching qemu binary isn't on $PATH — caller
     should SKIP the test.
+
+    `img_path` is the raw binary consumed by aarch64 QEMU via
+    `-kernel` (the ELF is PIE, QEMU can't load it). Optional for
+    backwards compatibility; defaults to `elf_path.with_suffix(".img")`.
+    Variant-launcher callers pass both paths explicitly so the test
+    harness doesn't have to mirror the runner script's co-located-
+    file convention.
     """
     info = _file_magic(elf_path)
     host_arch = os.uname().machine
@@ -67,8 +74,7 @@ def detect_qemu(elf_path: Path) -> Optional[QemuConfig]:
         binary = "qemu-system-aarch64"
         machine = ["-machine", "virt", "-cpu", "max"]
         virtio_dev = "virtio-net-device"
-        # aarch64 QEMU needs the raw .img, not the PIE ELF.
-        kernel_arg = str(elf_path.with_suffix(".img"))
+        kernel_arg = str(img_path if img_path else elf_path.with_suffix(".img"))
         if not Path(kernel_arg).exists():
             raise FileNotFoundError(f".img not found: {kernel_arg}")
     else:
@@ -209,6 +215,7 @@ def spawn_backgrounded(
 def spawn_qemu(
     elf_path: Path,
     *,
+    img_path: Optional[Path] = None,
     cpus: int = 1,
     memory_mb: int = 128,
     extra_args: Optional[list[str]] = None,
@@ -217,10 +224,12 @@ def spawn_qemu(
     """Boot `elf_path` under QEMU in the background (no network forwards).
 
     For tests whose only output channel is the serial log — SMP boot
-    checks, per-core state tests, TLS primitive smoke tests. Returns
-    None if the matching qemu-system-* isn't on $PATH (caller SKIPs).
+    checks, per-core state tests, TLS primitive smoke tests. `img_path`
+    is the raw-binary companion to `elf_path` used by aarch64 QEMU;
+    passed through to `detect_qemu`. Returns None if the matching
+    qemu-system-* isn't on $PATH (caller SKIPs).
     """
-    qemu = detect_qemu(elf_path)
+    qemu = detect_qemu(elf_path, img_path)
     if qemu is None:
         return None
 

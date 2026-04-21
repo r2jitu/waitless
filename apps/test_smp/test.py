@@ -32,14 +32,16 @@ class SmpBootTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         # Each per-variant py_test passes `env = {"LAUNCHER_NAME": "test_smp_qemu_<arch>"}`.
-        # The variant rule symlinks the transitioned .elf as
-        # `<LAUNCHER_NAME>.elf` alongside the launcher.
+        # The variant rule symlinks the transitioned .elf + .img as
+        # `<LAUNCHER_NAME>.{elf,img}` alongside the launcher.
         launcher_name = os.environ["LAUNCHER_NAME"]
-        elf = runfiles_root() / "apps" / "test_smp" / f"{launcher_name}.elf"
+        pkg = runfiles_root() / "apps" / "test_smp"
+        elf = pkg / f"{launcher_name}.elf"
+        img = pkg / f"{launcher_name}.img"
         if not elf.is_file():
             raise unittest.SkipTest(f"{launcher_name}.elf not found at {elf}")
         cls.launcher = spawn_qemu(
-            elf, cpus=EXPECTED_CPUS, memory_mb=128,
+            elf, img_path=img, cpus=EXPECTED_CPUS, memory_mb=128,
             log_prefix="test_smp",
         )
         if cls.launcher is None:
@@ -72,12 +74,18 @@ class SmpBootTest(unittest.TestCase):
         self.assertIn("SMP test complete.", self.serial)
 
     def test_ipi_round_trip(self) -> None:
-        """Core 0 → core 1 SGI 0 delivery.
+        """Core 0 → core 1 SGI 0 delivery (aarch64-only).
 
         Regression guard: `sgi_handler` must increment IPI_COUNT (the
         production path uses the SGI purely as a WFI wakeup, but the
-        test asserts on the counter — see kernel/aarch64/smp.rs).
+        test asserts on the counter — see kernel/aarch64/smp.rs). The
+        test_smp app emits the `IPI test:` marker only under
+        `#[cfg(target_arch = "aarch64")]`; on x86_64 there's no
+        equivalent IPI path plumbed yet, so this assertion is
+        skipped.
         """
+        if "aarch64" not in os.environ["LAUNCHER_NAME"]:
+            self.skipTest("IPI test is aarch64-specific; x86_64 path not wired up")
         self.assertIn("IPI test: PASS", self.serial,
                       "IPI was not received — sgi_handler / ICC_SGI1_EL1 path broken")
 

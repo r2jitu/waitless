@@ -292,9 +292,11 @@ class HvfEnv:
 
     def start(self, cpus, port):
         root = _project_root()
+        # `:webserver_hvf`'s runfiles bundle the guest .img (co-
+        # located symlink) and the host hvf-runner binary (natural
+        # runfile path, not symlinked).
         img = os.path.join(root, "bazel-bin/apps/webserver/webserver_hvf.img")
-        run_hvf = os.path.join(root,
-                               "bazel-bin/apps/webserver/webserver_hvf.runner")
+        run_hvf = os.path.join(root, "bazel-bin/tools/hvf-runner/run-hvf")
         log = open(f"/tmp/hvf_{port}.log", "w")
         udp_port = port + self.udp_port_offset
         tls_port = port + self.tls_port_offset
