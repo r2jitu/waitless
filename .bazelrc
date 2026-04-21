@@ -22,6 +22,14 @@ build --action_env=PATH
 build --@rules_rust//:extra_rustc_flags=-Cpanic=abort,-Copt-level=2,-Dwarnings
 test  --@rules_rust//:extra_rustc_flag=-Cpanic=unwind
 
+# `bazel test` flips //bazel/rules:tests_need_std=True so
+# `#![cfg_attr(not(feature = "std"), no_std)]` crates (currently
+# just //util/atomic_fn) pick up `crate_features = ["std"]` and
+# compile as std + panic=unwind to link into libtest harnesses.
+# `integration_data` transitions reset the flag back to False for
+# their sub-graph so unikernel rlibs stay no_std in-process.
+test --//bazel/rules:tests_need_std=True
+
 # Bazel 9 made the default test toolchain require an exec platform that
 # matches every target-platform constraint. Our test target uses the
 # unikernel target platform but runs on the host (sh_test wrapping a

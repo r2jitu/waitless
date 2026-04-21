@@ -28,18 +28,23 @@
 
 // Two ways this crate ends up built without `#![no_std]` — both
 // needed to let rustc accept `panic=unwind` (required by libtest
-// and by the `rust_test` targets that dep on `:atomic_fn_unwind`):
+// and by any `rust_test` whose dep chain reaches this crate):
 //
 //   * `cfg(test)` — when this file is the direct `crate_root` of
 //     a `rust_test` (`//util/atomic_fn:atomic_fn_test`), rustc
 //     enables `--test` cfg so the crate picks up std prelude /
 //     test harness.
-//   * `feature = "std"` — enabled by the `:atomic_fn_unwind`
-//     sibling `rust_library` which consumers tag into their
-//     test dep chain to get a panic=unwind rlib of this crate.
+//   * `feature = "std"` — added by `//util/atomic_fn:atomic_fn`'s
+//     `crate_features = select({...})` when the
+//     `//bazel/rules:tests_need_std` bool_flag is True (set by
+//     `.bazelrc`'s `test` verb). This covers the dep-without-
+//     `--test` case: e.g. `//net:protocol_test` drags in this
+//     crate via `protocol.rs`'s dep list, not via `--test`, so
+//     `cfg(test)` doesn't fire here — the feature flag does.
 //
-// Either disables `#![no_std]`. Production builds of `:atomic_fn`
-// have neither, so `#![no_std]` is still active on the bare-metal
+// Either disables `#![no_std]`. Production builds have neither
+// (the flag defaults False, integration_data transitions reset
+// it to False), so `#![no_std]` stays active on the bare-metal
 // side and `panic=abort` is the natural target default.
 #![cfg_attr(all(not(test), not(feature = "std")), no_std)]
 

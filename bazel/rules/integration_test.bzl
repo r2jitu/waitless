@@ -41,12 +41,21 @@ def _abort_panic_impl(_settings, _attr):
         # `extra_rustc_flags` too, but with identical orderings the
         # last wins and that stays abort.
         "@rules_rust//:extra_rustc_flag": ["-Cpanic=abort"],
+        # Reset `//bazel/rules:tests_need_std` to False so the
+        # `atomic_fn`-style `crate_features = select({...: ["std"]})`
+        # picks the no_std branch inside this sub-graph. Without this,
+        # the test-verb-set True value would leak in and compile
+        # unikernel rlibs as std.
+        "//bazel/rules:tests_need_std": False,
     }
 
 _abort_panic_transition = transition(
     implementation = _abort_panic_impl,
     inputs = [],
-    outputs = ["@rules_rust//:extra_rustc_flag"],
+    outputs = [
+        "@rules_rust//:extra_rustc_flag",
+        "//bazel/rules:tests_need_std",
+    ],
 )
 
 def _integration_data_impl(ctx):

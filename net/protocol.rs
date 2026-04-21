@@ -28,10 +28,9 @@
 
 // `atomic_fn` is the shared leaf crate that provides `AtomicFn<F>`
 // (also used by `kernel::sync` and `uni/lib.rs`'s native backend).
-// `//net:protocol_test` depends on `//util/atomic_fn:atomic_fn_unwind`
-// instead of the default `:atomic_fn` rlib — same crate name, same
-// source, but rebuilt with `panic=unwind` to match the test harness.
-// See the comment on `:atomic_fn_unwind` for why two variants exist.
+// Under `bazel test`, atomic_fn rebuilds with `feature = "std"` via
+// the `//bazel/rules:tests_need_std` flag, giving the test binary a
+// std + panic=unwind rlib to link against. See atomic_fn/BUILD.bazel.
 extern crate atomic_fn;
 
 use atomic_fn::AtomicFn;

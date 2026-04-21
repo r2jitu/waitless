@@ -15,33 +15,26 @@ package(default_visibility = ["//visibility:public"])
 #   * //kernel: re-exports as `kernel::sync::AtomicFn` for compat.
 #   * //net:protocol: drops its private `FnSlot` wrapper.
 #   * //uni:uni (native backend): `IO_POLL` / `SERVICE` slots.
+#
+# `crate_features = ["std"]` is toggled on by the
+# `//bazel/rules:tests_need_std` bool_flag (set True by
+# `.bazelrc`'s `test` verb). Under that flag the source's
+# `cfg_attr(all(not(test), not(feature = "std")), no_std)` leaves
+# the crate as std + panic=unwind, so it can link into a
+# `rust_test` binary even when the test uses `crate = ":foo"` and
+# the dep subgraph doesn't get `--test`. Under the default build
+# the flag is False, crate_features is empty, and `#![no_std]`
+# stays on — same production rlib as before.
 rust_library(
     name = "atomic_fn",
     srcs = ["lib.rs"],
+    crate_features = select({
+        "//bazel/rules:tests_need_std_on": ["std"],
+        "//conditions:default": [],
+    }),
     crate_name = "atomic_fn",
     crate_root = "lib.rs",
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
-)
-
-# panic=unwind variant of the same source, for `rust_test` targets
-# that `crate = ":foo"` a library whose deps transitively include
-# `atomic_fn`. Without this, the test binary is built
-# `panic=unwind` but the library's deps are `panic=abort` and
-# rustc refuses to link them ("crate `atomic_fn` requires panic
-# strategy `abort` which is incompatible…"). Two library targets
-# with the same `crate_name` but different `rustc_flags` give us
-# per-consumer panic-strategy selection.
-#
-# Downstream `rust_test` targets depend on `:atomic_fn_unwind`
-# directly (replacing `:atomic_fn` in their dep list); the
-# production `rust_library` / unikernel-binary graph still uses
-# `:atomic_fn`. See `//net:protocol_test`.
-rust_library(
-    name = "atomic_fn_unwind",
-    srcs = ["lib.rs"],
-    crate_features = ["std"],
-    crate_name = "atomic_fn",
-    crate_root = "lib.rs",
 )
 
 rust_test(

@@ -29,8 +29,14 @@ UNIKERNEL_RUSTC_FLAGS = select({
 #     `-Cpanic=abort` so the unikernel binary rebuilds cleanly.
 #
 #   * The one residual awkwardness: a `rust_test` that
-#     `crate = ":foo"` pulls `:foo`'s dep rlibs (which stay
-#     no_std under the test verb because dep compilation doesn't
-#     get `--test`). For that case we ship a sibling dep target
-#     with `crate_features = ["std"]` so the dep also compiles
-#     as std + unwind — see `//util/atomic_fn:atomic_fn_unwind`.
+#     `crate = ":foo"` (or that `srcs =` foo's source directly)
+#     pulls `:foo`'s dep rlibs. Those deps don't get `--test`, so
+#     their `#![cfg_attr(not(test), no_std)]` stays active and
+#     rustc refuses panic=unwind on no_std. Fix: the
+#     `//bazel/rules:tests_need_std` bool_flag flips to True under
+#     the `test` verb, and affected crates (currently just
+#     `//util/atomic_fn`) `select()` on the matching config_setting
+#     to inject `crate_features = ["std"]`, flipping themselves to
+#     std + unwind for the duration of the test build. Transitions
+#     (e.g. `integration_data`) that re-enter the production sub-
+#     graph reset the flag to False.

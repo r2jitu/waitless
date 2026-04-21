@@ -1,3 +1,5 @@
+load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
+
 package(default_visibility = ["//visibility:public"])
 
 exports_files([
@@ -8,3 +10,25 @@ exports_files([
     "native_main.rs",
     "unikernel_main.rs",
 ])
+
+# `bazel test` flips this to True via `.bazelrc`. Crates that are
+# `#![cfg_attr(not(feature = "std"), no_std)]` select on the
+# matching `:tests_need_std_on` config_setting below to pick up
+# `crate_features = ["std"]` when True, so they compile as std +
+# panic=unwind under the test verb (satisfying libtest) but stay
+# no_std + panic=abort for production unikernel builds.
+#
+# Transitions that re-enter the production sub-graph from under
+# `bazel test` (e.g. `integration_data` wrapping a unikernel_binary
+# as test data) must include `"//bazel/rules:tests_need_std": False`
+# in their transition outputs, otherwise the sub-graph inherits
+# `True` and the std-feature select fires where it shouldn't.
+bool_flag(
+    name = "tests_need_std",
+    build_setting_default = False,
+)
+
+config_setting(
+    name = "tests_need_std_on",
+    flag_values = {":tests_need_std": "True"},
+)
