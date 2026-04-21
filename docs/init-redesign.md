@@ -602,7 +602,7 @@ Apps that don't need TLS drop `uni-tls` from deps. Hello becomes
   verify `bazel build //apps/hello:hello --config=hvf` succeeds
   without uni-tls dep
 
-### Phase 7: `static_mut` sweep + virtio-console consolidation
+### Phase 7: `static_mut` sweep + virtio-console consolidation + `AtomicFn<F>` crate
 
 46 `static mut` → 0. Each migrates to:
 - `InitOnce<T>` (publish-once)
@@ -612,15 +612,74 @@ Apps that don't need TLS drop `uni-tls` from deps. Hello becomes
 Includes `drivers/virtio_console.rs`'s 12 statics → one
 `InitOnce<VirtioConsole>`.
 
+**Also carve out a shared `AtomicFn<F>` utility.** Two sites already
+store fn pointers via `AtomicPtr<()>` + `transmute`:
+
+- `//net:protocol`'s `FnSlot` — the TCP/UDP dispatch registry
+  (landed in Phase 2).
+- `uni/lib.rs`'s native-backend `IO_POLL` + `SERVICE` statics —
+  `fn(u32) -> bool` callbacks for the POSIX worker event loop
+  (`load_poll` in the `#[cfg(platform_native)] mod backend`).
+
+The second site falls under this phase's `static_mut` / global-
+consolidation scope anyway, so lifting both onto a shared
+`AtomicFn<F>` pays for itself:
+
+```rust
+// New crate: //util:atomic_fn — zero deps beyond `core::`, so
+// downstream `rust_test` targets don't inherit the panic-strategy
+// conflict that any //kernel dep would bring in.
+pub struct AtomicFn<F: Copy> {
+    ptr: AtomicPtr<()>,
+    _marker: PhantomData<F>,
+}
+
+impl<F: Copy> AtomicFn<F> {
+    pub const fn empty() -> Self { /* ... */ }
+    pub fn set(&self, f: F) {
+        // Compile-time assertion: F is pointer-sized. Works on
+        // stable Rust 1.79+ because the const block captures F's
+        // layout.
+        const {
+            assert!(core::mem::size_of::<F>() == core::mem::size_of::<*mut ()>());
+            assert!(core::mem::align_of::<F>() == core::mem::align_of::<*mut ()>());
+        }
+        let raw: *mut () = unsafe { core::mem::transmute_copy(&f) };
+        self.ptr.store(raw, Ordering::Release);
+    }
+    #[inline]
+    pub fn load(&self) -> Option<F> {
+        let p = self.ptr.load(Ordering::Acquire);
+        if p.is_null() { None }
+        else { Some(unsafe { core::mem::transmute_copy(&p) }) }
+    }
+    pub fn clear(&self) { self.ptr.store(ptr::null_mut(), Ordering::Release); }
+}
+```
+
+Why not do it now (Phase 2/3): a new Bazel crate that would only be
+used at one site is pure overhead — the second consumer (`IO_POLL`)
+isn't touched until this phase. We evaluated `crossbeam-utils::AtomicCell`
+and the `atomic` crate as alternatives; both fall back to locks on
+targets without a native lock-free primitive for `size_of::<T>()`,
+which defeats the "no runtime cost" goal. A 30-line local utility
+beats a dep.
+
 - **Effort:** 3-4 d
 - **Async prep:** clean state layout for §2g to hang Waker slots
   off of
 - **Perf:** neutral. `InitOnce::get()` is an atomic load; same
-  cost as static access after first init.
-- **Test:** CI check that `rg '^\s*static mut' src/` returns 0.
-  Each converted file keeps its existing tests; add specific
-  tests for formerly-unsafe invariants where practical (e.g.,
-  "GDT entries don't change after `init`")
+  cost as static access after first init. `AtomicFn<F>::load()` is
+  one acquire-load + one null-check + one transmute — identical to
+  what both call sites already emit.
+- **Test:**
+  - CI check that `rg '^\s*static mut' src/` returns 0.
+  - New `//util:atomic_fn_test` (host-native): size/align asserts,
+    set/clear/load round-trip with a `fn(u32)->bool` handler,
+    const-constructibility for `static` use.
+  - Each converted file keeps its existing tests; add specific
+    tests for formerly-unsafe invariants where practical (e.g.,
+    "GDT entries don't change after `init`").
 
 ### Phase 8: Event-loop hooks + opt-in SMP
 
@@ -674,7 +733,7 @@ Binary sizes (HVF `.img`): hello 1.9 MB, webserver 2.0 MB.
 | 4 | delete auto-init | ⏳ | — | — | |
 | 5 | NIC driver carveouts | ⏳ | — | — | |
 | 6 | uni-tls carveout | ⏳ | — | -900 KB expected | |
-| 7 | static_mut sweep | ⏳ | — | — | |
+| 7 | static_mut sweep + `AtomicFn<F>` | ⏳ | — | — | Also carves out `//util:atomic_fn`, consolidating `//net:protocol`'s `FnSlot` and `uni/lib.rs`'s native `IO_POLL`/`SERVICE` statics. |
 | 8 | hooks + SMP opt-in | ⏳ | — | — | |
 
 Status legend: ⏳ not started · 🟡 in progress · 🟢 complete · 🔴 blocked
