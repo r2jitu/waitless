@@ -25,8 +25,62 @@
 
 #![no_std]
 
-use core::ptr;
-use core::sync::atomic::{AtomicPtr, Ordering};
+// `atomic_fn` is the shared leaf crate that provides `AtomicFn<F>`
+// (also used by `kernel::sync` and `uni/lib.rs`'s native backend).
+// Gated `cfg(not(test))` because the `//net:protocol_test` rust_test
+// rebuilds this crate with panic=unwind, while `atomic_fn` ships
+// panic=abort; mixing the two fails to link. The test path picks up
+// a local `AtomicFn` shim below with the same API — small duplication,
+// but keeps Registry-specific coverage alive without the
+// Bazel-per-dep build variants that proper solution would need.
+#[cfg(not(test))]
+extern crate atomic_fn;
+#[cfg(not(test))]
+use atomic_fn::AtomicFn;
+
+#[cfg(test)]
+use test_shim::AtomicFn;
+
+#[cfg(test)]
+mod test_shim {
+    //! Test-only copy of `atomic_fn::AtomicFn` — see the comment at
+    //! the top of this file for why it's here. Mirrors the
+    //! production API shape so the rest of the file is cfg-agnostic.
+    use core::marker::PhantomData;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    pub struct AtomicFn<F: Copy> {
+        bits: AtomicUsize,
+        _phantom: PhantomData<fn() -> F>,
+    }
+
+    unsafe impl<F: Copy> Send for AtomicFn<F> {}
+    unsafe impl<F: Copy> Sync for AtomicFn<F> {}
+
+    impl<F: Copy> AtomicFn<F> {
+        pub const fn null() -> Self {
+            AtomicFn { bits: AtomicUsize::new(0), _phantom: PhantomData }
+        }
+        pub fn store(&self, f: F) {
+            let bits: usize = unsafe { core::mem::transmute_copy(&f) };
+            self.bits.store(bits, Ordering::Release);
+        }
+        pub fn load(&self) -> Option<F> {
+            let bits = self.bits.load(Ordering::Acquire);
+            if bits == 0 {
+                None
+            } else {
+                Some(unsafe { core::mem::transmute_copy(&bits) })
+            }
+        }
+        pub fn clear(&self) {
+            self.bits.store(0, Ordering::Release);
+        }
+        pub fn is_some(&self) -> bool {
+            self.bits.load(Ordering::Acquire) != 0
+        }
+    }
+}
 
 /// IPv4 protocol number for TCP (RFC 793).
 pub const PROTO_TCP: u8 = 6;
@@ -51,58 +105,21 @@ pub enum Slot {
     Udp,
 }
 
-// ---- FnSlot: one-place wrapper over the AtomicPtr / transmute -------------
-//
-// Stores a `ProtocolHandler` atomically with "no handler" represented by
-// `null`. Uses `AtomicPtr<()>` so the store side is a safe `as *mut ()`
-// cast; the load side still needs `transmute` to recover the fn pointer,
-// but that unsafety lives in one function.
-
-struct FnSlot(AtomicPtr<()>);
-
-impl FnSlot {
-    const fn empty() -> Self {
-        FnSlot(AtomicPtr::new(ptr::null_mut()))
-    }
-
-    /// Publish `handler` to this slot. Uses `Release` so concurrent
-    /// readers that observe a non-null pointer via any Acquire (or
-    /// via a later synchronisation point like the kernel's
-    /// `set_ready`) see a fully-formed function pointer.
-    fn set(&self, handler: ProtocolHandler) {
-        self.0.store(handler as *mut (), Ordering::Release);
-    }
-
-    /// Clear the slot — only used by tests; production never drops
-    /// a registered handler.
-    fn clear(&self) {
-        self.0.store(ptr::null_mut(), Ordering::Release);
-    }
-
-    /// Hot-path read. `Acquire` pairs with `set`'s `Release` store
-    /// for an unambiguous happens-before guarantee on every target
-    /// (x86_64 load-acquire is a plain load; aarch64 emits a single
-    /// LDAR). A `Relaxed` load would be sound given the kernel's
-    /// boot-time publish fence (`set_ready`), but the HVF bench
-    /// noise floor (~2-3 % per run) can't reliably distinguish it
-    /// from `Acquire`, so we keep the safer ordering.
-    #[inline]
-    fn load(&self) -> Option<ProtocolHandler> {
-        let ptr = self.0.load(Ordering::Acquire);
-        if ptr.is_null() {
-            None
-        } else {
-            // SAFETY: `ptr` was stored by `set` via the safe
-            // `handler as *mut ()` cast — the inverse transmute
-            // back to `fn(..)` is sound because function pointers
-            // and data pointers share representation on every
-            // platform we target (x86_64 + aarch64 ELF ABI).
-            Some(unsafe { core::mem::transmute::<*mut (), ProtocolHandler>(ptr) })
-        }
-    }
-}
-
 // ---- Registry -------------------------------------------------------------
+//
+// Each protocol slot is an `atomic_fn::AtomicFn<ProtocolHandler>` —
+// the same primitive used by `kernel::sync::AtomicFn` and the
+// native backend's IO-poll registry. One typed `transmute`-shaped
+// site lives inside `AtomicFn`, not once per field as the
+// previous hand-rolled `FnSlot` had.
+//
+// Ordering: `AtomicFn::store` is Release, `load` is Acquire.
+// Pairs for an unambiguous happens-before on every target
+// (x86_64 load-acquire is a plain load; aarch64 emits LDAR).
+// A Relaxed load would be sound given the kernel's boot-time
+// publish fence (`set_ready`), but the HVF bench noise floor
+// (~2–3% per run) can't reliably distinguish it from Acquire,
+// so we keep the safer ordering.
 
 /// Dispatch table for IP protocol handlers. Named slots for the
 /// protocols we ship (TCP, UDP); unknown protos drop silently on
@@ -110,23 +127,23 @@ impl FnSlot {
 /// field, so runtime filtering is required there — unlike the
 /// writer side, which is typed).
 pub struct Registry {
-    tcp: FnSlot,
-    udp: FnSlot,
+    tcp: AtomicFn<ProtocolHandler>,
+    udp: AtomicFn<ProtocolHandler>,
 }
 
 impl Registry {
     pub const fn new() -> Self {
         Registry {
-            tcp: FnSlot::empty(),
-            udp: FnSlot::empty(),
+            tcp: AtomicFn::null(),
+            udp: AtomicFn::null(),
         }
     }
 
-    /// The only place that maps `Slot → FnSlot`. Every public
-    /// method routes through here, so adding a new protocol is a
-    /// one-field + one-match-arm edit.
+    /// The only place that maps `Slot → AtomicFn` slot. Every
+    /// public method routes through here, so adding a new protocol
+    /// is a one-field + one-match-arm edit.
     #[inline]
-    fn slot_for(&self, slot: Slot) -> &FnSlot {
+    fn slot_for(&self, slot: Slot) -> &AtomicFn<ProtocolHandler> {
         match slot {
             Slot::Tcp => &self.tcp,
             Slot::Udp => &self.udp,
@@ -149,7 +166,7 @@ impl Registry {
     /// Install `handler` for `slot`. Idempotent: a second call
     /// replaces the previous handler.
     pub fn register(&self, slot: Slot, handler: ProtocolHandler) {
-        self.slot_for(slot).set(handler);
+        self.slot_for(slot).store(handler);
     }
 
     /// Drop any handler for `slot`. Only exercised by tests — in
@@ -162,7 +179,7 @@ impl Registry {
     /// Whether `slot` currently has a handler. Not used on the hot
     /// path — intended for tests and `/stats`-style diagnostics.
     pub fn is_registered(&self, slot: Slot) -> bool {
-        self.slot_for(slot).load().is_some()
+        self.slot_for(slot).is_some()
     }
 
     /// Hot-path dispatch: call the handler for `proto` if any.
@@ -188,7 +205,7 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::sync::atomic::AtomicUsize;
+    use core::sync::atomic::{AtomicUsize, Ordering};
 
     fn ip(a: u8, b: u8, c: u8, d: u8) -> u32 {
         u32::from_ne_bytes([a, b, c, d])

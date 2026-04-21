@@ -37,15 +37,17 @@ rust_test(
 )
 
 # IP protocol dispatch registry — replaces hardcoded TCP/UDP match in
-# `net::net_receive`. One relaxed load + one indirect call per packet.
-# Zero-dep (only `core`) so `rust_test` doesn't hit the panic-strategy
-# conflict that dep chains through `:types` would otherwise trigger.
+# `net::net_receive`. One acquire load + one indirect call per packet.
+# Depends only on `//util:atomic_fn` (itself a zero-dep leaf crate),
+# so `rust_test` still avoids the panic-strategy conflict that dep
+# chains through `:types` or `//kernel` would otherwise trigger.
 rust_library(
     name = "protocol",
     srcs = ["protocol.rs"],
     crate_root = "protocol.rs",
     crate_name = "net_protocol",
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    deps = ["//util/atomic_fn"],
 )
 
 rust_test(
