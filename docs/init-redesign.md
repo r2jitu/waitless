@@ -634,17 +634,110 @@ Deps: all 6 crates. Binary: ~2 MB.
 
 For reference — NOT part of this plan's scope.
 
+### User-facing shape: async lifecycle on the App trait
+
+The kernel's scheduler becomes an async runtime in §2g, so the
+App trait grows async lifecycle methods. User code keeps the same
+structural shape we landed on in this plan:
+
 ```rust
+struct HelloApp {
+    server: alloc::boxed::Box<Server>,
+    net: Net,
+}
+
+impl uni::App for HelloApp {
+    async fn start(&mut self) {
+        // Spawn the HTTP server as a persistent background task.
+        // `uni::spawn` adds it to the executor's task arena; the
+        // runtime polls all spawned tasks until they complete or
+        // shutdown fires.
+        uni::spawn(self.server.serve(80));
+    }
+
+    async fn stop(&mut self) {
+        // Graceful drain: close the listener, let in-flight
+        // requests finish. Executor polls this to completion
+        // before calling Drop.
+        self.server.shutdown().await;
+    }
+}
+
+impl HelloApp {
+    fn new() -> Self {
+        let net = Net::enable(NetBringUp::Dhcp).expect("DHCP failed");
+        let server = Server::new_boxed(&net);
+        HelloApp { server, net }
+    }
+}
+
 #[uni::boot]
-async fn boot() {
-    let net = Net::enable(NetBringUp::Dhcp).await.expect("DHCP");
-    let mut server = Server::new_boxed(&net);
-    server.route(b"/", async |_| Response::ok(b"text/plain", b"Hi!\n"));
-    server.serve(80).await;  // runs until shutdown
+fn boot() {
+    uni::run(HelloApp::new());
 }
 ```
 
-Getting from Phase 8's sync shape to this async shape is a
-contained ROADMAP §2g task — it's adding Waker hooks on top of
-the poll-based primitives Phase 2-6 already delivered, plus a
-small update to the `#[uni::boot]` macro to wrap async bodies.
+The App trait's async methods default to empty, so simple apps
+(plain marker impl + `new` + Drop) still work unchanged:
+
+```rust
+// Trait sketch (§2g lands this):
+pub trait App: 'static {
+    fn start(&mut self) -> impl Future<Output = ()> + Send { async {} }
+    fn stop(&mut self) -> impl Future<Output = ()> + Send { async {} }
+}
+```
+
+### Runtime lifecycle
+
+The four-stage runtime model:
+
+```
+1. Sync boot (BSP):
+      uni_main() → uni::run(MyApp::new())
+         → APP_SLOT ← Box<app>
+
+2. Runtime polls lifecycle:
+      app.start().await       ← on executor; can spawn tasks
+
+3. Runtime drives task arena:
+      loop { arena.poll_all(); if shutdown { break } }
+      ← spawned server task, timer tasks, etc. run here
+
+4. Shutdown signaled:
+      app.stop().await         ← graceful drain, await in-flight
+      drop(app)                ← field Drop cascade
+```
+
+`start` spawns persistent tasks and returns. `stop` awaits them
+to drain. Drop runs after `stop` completes, using the ordering
+Phase 8 already established.
+
+### Why `start`/`stop`, not `boot().await`
+
+Embassy/Tokio conventions put everything inside an `async fn main`
+that runs until done. That shape works but loses the App trait we
+invested in:
+
+- `serve(80).await` at top level = no typed app handle; no
+  structured lifecycle transitions; multiple services need explicit
+  `join!`/`select!`
+- `App::start`/`stop` = typed app as the central anchor;
+  transitions are named events; multiple services compose via
+  `uni::spawn` within `start`
+
+The `App` trait with async lifecycle methods preserves everything
+Phases 0-8 built. `serve(80).await` is an internal building block
+that lives *inside* a `start` method or a spawned task, not at
+the top level of user code.
+
+### What §2g adds on top of Phase 8
+
+- Task arena + `uni::spawn(fn)` (ROADMAP §2f)
+- Executor driving `app.start().await` / `app.stop().await`
+- Waker hooks on poll-based primitives Phases 2-6 already delivered
+- `#[uni::boot]` macro gains an async-aware `uni::run` variant;
+  the user's `fn boot()` stays sync (just constructs + hands off)
+
+No restructuring of types, no new module boundaries — async is
+additive on top of the structural shape this plan delivers.
