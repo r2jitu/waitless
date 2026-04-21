@@ -1,36 +1,61 @@
-// uni/net.rs — `Net::enable` API (Phases 3 + 4).
+// uni-net/lib.rs — net-stack crate.
 //
-// Apps call `Net::enable(NetBringUp::Dhcp)` (or `Static { … }`) at
-// startup to bring the network stack online. After Phase 4 there is
-// no boot-path fallback: an app that doesn't call `enable` gets no
-// network. This mirrors `uni::run`: explicit, typed, app-driven.
+// Carved out of `uni::net` (the module) so driver crates
+// (`uni-driver-virtio-net`, `uni-driver-gve` in Phase 5 Step 3+)
+// can implement `EthernetDriver` without creating a `drivers → uni`
+// dep cycle. Apps still reach the same surface via `uni::net::*`
+// and `uni::{NetError, DhcpError, NicError}` — `uni/lib.rs` re-
+// exports this crate unchanged so no app-side imports move.
 //
-// State shape:
+// Layout:
+//   * `error` module — NetError / DhcpError / NicError + From
+//     chain. Shared with driver crates (`NicError`) and boot code
+//     (`NetError`). Standalone-testable.
+//   * `Net::enable` API — Phases 3/4.
+//   * `EthernetDriver` trait + `register_ethernet_driver!` macro
+//     + `linked_ethernet_drivers()` walker — Phase 5 Step 1.
 //
-//   static NET: NetSlot = NetSlot::empty();
+// On native the bring-up path is a no-op: POSIX sockets come
+// pre-configured. Only the umbrella's `tls_server` is pulled in
+// (for the hand-rolled TLS 1.3 state machine shared across both
+// platforms).
+
+#![no_std]
+
+// `alloc` for Box<Net> in the module-level slot.
+extern crate alloc;
+
+// ---- Umbrella re-export ---------------------------------------------------
 //
-// On success `enable` allocates a `Box<Net>` and parks it in the
-// slot. Subsequent `enable` calls see `Some(_)` and return
-// `Err(NetError::AlreadyEnabled)`. `uni::shutdown_and_drop` clears
-// the slot on graceful exit, symmetric with the `App` slot.
-//
-// Net is zero-sized today. Phase 5/6 carve out `uni-net` as a
-// standalone crate and that's when fields like `config`,
-// `udp_handlers`, `dhcp_state`, `dispatcher` move in — touching them
-// now would need the protocol sub-crates to depend on `uni::net`,
-// which inverts the current dep graph. The slot shape is already in
-// place so the field additions are a focused follow-up rather than a
-// whole-tree reshape.
+// Bare-metal side pulls the full `net` umbrella (tcp/udp/arp/ipv4/
+// tls_server/types/…); native pulls just `net_tls_server` for the
+// hand-rolled TLS state machine. Re-exported publicly at the
+// crate root so `uni/http.rs` can keep writing
+// `net::tls_server::X` / `net::tcp::X` via the `uni::net` alias in
+// `uni/lib.rs`.
+
+#[cfg(platform_unikernel)]
+extern crate net as net_umbrella;
+
+#[cfg(platform_unikernel)]
+pub use net_umbrella::*;
+
+#[cfg(platform_native)]
+extern crate net_tls_server as net_tls_server_impl;
+
+#[cfg(platform_native)]
+pub mod tls_server {
+    pub use crate::net_tls_server_impl::*;
+}
+
+// ---- Error types ----------------------------------------------------------
+
+pub mod error;
+pub use error::{DhcpError, NetError, NicError};
+
+// ---- Public net-stack API -------------------------------------------------
 
 use core::cell::UnsafeCell;
-
-pub use crate::error::{DhcpError, NetError, NicError};
-
-// Re-export the umbrella crate's contents (TCP, UDP, TLS server,
-// types, …) under `crate::net::*` for internal `uni::*` consumers
-// only. Keeps `uni/http.rs` and the backend module in `uni/lib.rs`
-// writing `net::tls_server::X` / `net::tcp::X` unchanged.
-pub(crate) use crate::net_umbrella::*;
 
 /// IPv4 octets, network-order storage. Defined locally (rather than
 /// re-exported from `net_types`) so the API compiles on both
@@ -82,9 +107,7 @@ pub struct Net {
 //
 // Mirrors the `APP_SLOT` pattern in `uni/lib.rs`: a single static
 // holding `Option<Box<Net>>`, written only on the boot CPU, cleared
-// only from `uni::shutdown_and_drop` (also BSP). `Box<Net>` for a
-// zero-sized `Net` doesn't allocate — `Box` uses a dangling pointer
-// for ZSTs — so the slot is currently "presence/absence" only.
+// only from `uni::shutdown_and_drop` (also BSP).
 
 struct NetSlot(UnsafeCell<Option<alloc::boxed::Box<Net>>>);
 
@@ -99,9 +122,6 @@ impl NetSlot {
 //     thread on native).
 //   - `clear_on_shutdown` runs from `uni::shutdown_and_drop`, called
 //     only from the BSP shutdown branch of the kernel event loop.
-// Manual `Sync` lets the static hold it without requiring
-// `Box<Net>: Sync` (there are no inner fields today, but future
-// additions shouldn't force a `Send + Sync` bound on every field).
 unsafe impl Sync for NetSlot {}
 
 static NET: NetSlot = NetSlot::empty();
@@ -122,7 +142,7 @@ impl Net {
             return Err(NetError::AlreadyEnabled);
         }
         bringup(cfg)?;
-        // Park a `Box<Net>` in the slot so `is_some()` reflects
+        // Park a `Box<Net>` in the slot so `is_enabled()` reflects
         // "someone successfully called enable". The returned handle
         // is a separate ZST — both are free to pass around.
         // SAFETY: BSP-only access.
@@ -139,7 +159,7 @@ impl Net {
     pub fn local_ip(&self) -> Ipv4Addr {
         #[cfg(platform_unikernel)]
         {
-            let o = crate::net_umbrella::types::CONFIG.ip().octets();
+            let o = crate::types::CONFIG.ip().octets();
             Ipv4Addr(o)
         }
         #[cfg(platform_native)]
@@ -153,8 +173,6 @@ impl Net {
 }
 
 /// Whether the stack is currently enabled (the slot holds a `Box<Net>`).
-/// Phase 4+ this is the single source of truth; Phase 3's legacy
-/// auto-init fallback has been removed.
 pub fn is_enabled() -> bool {
     // SAFETY: BSP-only access; see `unsafe impl Sync for NetSlot`.
     unsafe { (*NET.0.get()).is_some() }
@@ -163,7 +181,7 @@ pub fn is_enabled() -> bool {
 /// Clear the NET slot. Called from `uni::shutdown_and_drop` on the
 /// graceful-shutdown path so a re-entrant runtime (native's
 /// `main` → rerun) sees a fresh slot. Idempotent.
-pub(crate) fn clear_on_shutdown() {
+pub fn clear_on_shutdown() {
     // SAFETY: BSP-only; see the slot's `unsafe impl Sync`. `take`
     // replaces with `None`, dropping the Box (ZST alloc = no-op).
     let taken = unsafe { (*NET.0.get()).take() };
@@ -178,7 +196,7 @@ pub(crate) fn clear_on_shutdown() {
 fn bringup(cfg: NetBringUp) -> Result<(), NetError> {
     match cfg {
         NetBringUp::Dhcp => {
-            if crate::net_umbrella::bringup_dhcp() {
+            if net_umbrella::bringup_dhcp() {
                 Ok(())
             } else {
                 // No implicit static fallback — surfacing the
@@ -188,7 +206,7 @@ fn bringup(cfg: NetBringUp) -> Result<(), NetError> {
             }
         }
         NetBringUp::Static { ip, gateway, netmask } => {
-            crate::net_umbrella::bringup_static(
+            net_umbrella::bringup_static(
                 to_net_ipv4(ip),
                 to_net_ipv4(gateway),
                 to_net_ipv4(netmask),
@@ -208,13 +226,13 @@ fn bringup(_cfg: NetBringUp) -> Result<(), NetError> {
     Ok(())
 }
 
-/// `uni::net::Ipv4Addr` → bare-metal `net_types::Ipv4Addr`. Kept as
-/// a standalone helper rather than a `From` impl so we don't need a
-/// cross-crate orphan dance (the two types live in different crates).
+/// `uni_net::Ipv4Addr` → bare-metal `net_types::Ipv4Addr`. Kept as a
+/// standalone helper rather than a `From` impl so we don't need a
+/// cross-crate orphan dance.
 #[cfg(platform_unikernel)]
-fn to_net_ipv4(a: Ipv4Addr) -> crate::net_umbrella::types::Ipv4Addr {
+fn to_net_ipv4(a: Ipv4Addr) -> net_umbrella::types::Ipv4Addr {
     let [o0, o1, o2, o3] = a.0;
-    crate::net_umbrella::types::Ipv4Addr::from(o0, o1, o2, o3)
+    net_umbrella::types::Ipv4Addr::from(o0, o1, o2, o3)
 }
 
 // ============================================================================
@@ -227,11 +245,6 @@ fn to_net_ipv4(a: Ipv4Addr) -> crate::net_umbrella::types::Ipv4Addr {
 // `[__start_uni_drivers_ethernet, __stop_uni_drivers_ethernet)` at
 // boot. Zero runtime registration overhead; "no driver linked" is an
 // empty section and walks to an empty slice (no probe, no call).
-//
-// Phase 5 Step 1 (this commit) wires the trait, macro, walker, and
-// linker-script section. Steps 2–4 migrate `drivers/virtio_net.rs`
-// and `drivers/gvnic.rs` onto the trait; Phase 5 as a whole closes
-// with each driver in its own `uni-driver-*` crate.
 
 /// Opaque handle identifying a successfully-probed NIC. Drivers that
 /// support multiple NIC instances can use it to distinguish them;
@@ -244,7 +257,7 @@ pub struct NicHandle {
 impl NicHandle {
     /// Construct a handle. Meant for driver `probe()` implementations;
     /// framework code never constructs one directly. `pub` so driver
-    /// crates (which live outside `uni::net`) can return handles.
+    /// crates (which live outside `uni_net`) can return handles.
     pub const fn new() -> Self {
         NicHandle { _private: () }
     }
@@ -307,22 +320,17 @@ pub struct EthernetDriverReg {
 ///
 /// ```ignore
 /// struct VirtioNetDriver;
-/// impl uni::net::EthernetDriver for VirtioNetDriver { /* ... */ }
+/// impl uni_net::EthernetDriver for VirtioNetDriver { /* ... */ }
 /// static DRIVER: VirtioNetDriver = VirtioNetDriver;
-/// uni::net::register_ethernet_driver!(DRIVER);
+/// uni_net::register_ethernet_driver!(DRIVER);
 /// ```
-///
-/// The macro references `$crate::net::EthernetDriverReg`, which
-/// resolves to `uni::net::EthernetDriverReg` when the macro is
-/// re-exported at the crate root (Phase 5 Step 4 will add that
-/// re-export once driver crates land outside `uni`).
 #[macro_export]
 macro_rules! register_ethernet_driver {
     ($driver:expr) => {
         #[used]
         #[unsafe(link_section = ".uni_drivers_ethernet")]
-        static ETHERNET_DRIVER_REG: $crate::net::EthernetDriverReg =
-            $crate::net::EthernetDriverReg { driver: &$driver };
+        static ETHERNET_DRIVER_REG: $crate::EthernetDriverReg =
+            $crate::EthernetDriverReg { driver: &$driver };
     };
 }
 

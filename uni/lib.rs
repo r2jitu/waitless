@@ -21,32 +21,15 @@ pub use uni_macros::boot;
 extern crate kernel;
 #[cfg(platform_unikernel)]
 extern crate drivers;
-// Bare-metal net umbrella crate. Renamed from plain `net` in Phase
-// 3 so the name doesn't collide with this crate's own `pub mod net`
-// (which hosts the `Net::enable` API and, in Phase 5, becomes the
-// `uni-net` crate). The `pub mod net` below re-exports everything
-// from `net_umbrella::*`, so downstream `uni::net::{tcp, udp,
-// tls_server, …}` paths keep working unchanged.
-#[cfg(platform_unikernel)]
-extern crate net as net_umbrella;
 
-// The hand-rolled TLS 1.3 state machine from `//net:tls_server`
-// is used on BOTH platforms so there's a single source of truth
-// for handshake behaviour. On the unikernel it's reached via the
-// umbrella `net_umbrella::tls_server` path (already imported above);
-// on native we need a direct `extern crate` because the umbrella
-// `//net:net` isn't built on the hosted target (it depends on
-// //kernel for TCP). Aliased via a helper `net_umbrella` module so
-// `uni/net.rs` can keep writing `net_umbrella::tls_server::X` on
-// both platforms.
-#[cfg(platform_native)]
-extern crate net_tls_server as net_tls_server_impl;
-#[cfg(platform_native)]
-pub mod net_umbrella {
-    pub mod tls_server {
-        pub use crate::net_tls_server_impl::*;
-    }
-}
+// The net stack (`Net::enable`, `NetBringUp`, `EthernetDriver`,
+// error types, plus the full umbrella of TCP/UDP/ARP/IPv4/DHCP/TLS
+// on bare-metal) lives in the `uni-net` crate. Re-exported at
+// `uni::net::*` for app compat — existing `use uni::net::Net;` and
+// `use uni::{NetError, …};` imports work unchanged. Driver crates
+// (Phase 5 Step 3+) will depend on `uni-net` directly to avoid the
+// `drivers → uni` cycle.
+pub extern crate uni_net as net;
 
 #[cfg(platform_unikernel)]
 mod unikernel;
@@ -55,12 +38,23 @@ mod unikernel;
 pub mod native;
 
 pub mod boot_info;
-pub mod error;
 pub mod http;
-pub mod net;
 
 pub use boot_info::{boot_info, BootInfo, NicInfo};
-pub use error::{DhcpError, NetError, NicError};
+
+/// Back-compat re-export: `uni::{NetError, DhcpError, NicError}`
+/// resolve to `uni_net::error::*`. Apps that want the subsystem
+/// split explicit can also `use uni::error::NetError` (via the
+/// `error` module alias below) or `use uni_net::NetError` directly.
+pub use net::{DhcpError, NetError, NicError};
+
+/// Back-compat alias for `uni::error::*`. Phase 1 put the error
+/// types at `uni::error`; Phase 5-prereq moved them to `uni_net`
+/// so driver crates can see them. This alias keeps imports like
+/// `use uni::error::NetError` resolving.
+pub mod error {
+    pub use crate::net::{DhcpError, NetError, NicError};
+}
 
 // ----------------------------------------------------------------------------
 // App framework — the runtime's handle on the user's program

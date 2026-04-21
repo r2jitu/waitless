@@ -7,11 +7,9 @@ rust_library(
     name = "uni",
     srcs = [
         "boot_info.rs",
-        "error.rs",
         "http.rs",
         "lib.rs",
         "native.rs",
-        "net.rs",
         "unikernel.rs",
     ],
     proc_macro_deps = ["//uni/macros:uni_macros"],
@@ -19,28 +17,21 @@ rust_library(
         "//bazel/platforms:native": ["--cfg=platform_native"],
         "//conditions:default": ["--cfg=platform_unikernel"],
     }) + UNIKERNEL_RUSTC_FLAGS,
-    # The native build pulls in `//net:tls_server` (and its
-    # transitive TLS crates) so `Server::listen_tls()` can actually
-    # run the hand-rolled TLS 1.3 state machine on the POSIX path.
-    # This is the same code we run on bare-metal — the only thing
-    # that differs is the underlying TCP source (native::tcp vs
-    # kernel::net::tcp) and the RNG backend (OS getentropy vs
-    # `kernel::rng`'s ChaCha20 PRNG). Reusing the unikernel TLS
-    # stack on native keeps a single source of truth for handshake
-    # behaviour and lets us compare handshake rates across the
-    # two platforms without any per-path TLS implementation drift.
-    deps = select({
-        "//bazel/platforms:native": [
-            "//net:tls",
-            "//net:tls_crypto",
-            "//net:tls_handshake",
-            "//net:tls_record",
-            "//net:tls_server",
-        ],
+    # `//uni-net` owns everything net-stack-related (Net::enable,
+    # NetBringUp, error types, EthernetDriver trait, and the
+    # transitive TCP/UDP/TLS umbrella). `uni` re-exports it as
+    # `uni::net` so apps don't need to learn a new import path.
+    #
+    # The native build also gets uni-net; its deps resolve to just
+    # the hand-rolled TLS 1.3 state machine (POSIX sockets cover
+    # everything else). Bare-metal builds additionally pull in
+    # //drivers for the stats queries (`net_rx_counts` etc.) that
+    # surface through `uni::*` to apps.
+    deps = ["//uni-net:uni_net"] + select({
+        "//bazel/platforms:native": [],
         "//conditions:default": [
             "//drivers",
             "//kernel",
-            "//net",
         ],
     }),
 )
@@ -53,13 +44,5 @@ rust_test(
     name = "boot_info_test",
     srcs = ["boot_info.rs"],
     crate_root = "boot_info.rs",
-    rustc_flags = ["-Cpanic=unwind"],
-)
-
-# Host-native unit tests for the shared error hierarchy.
-rust_test(
-    name = "error_test",
-    srcs = ["error.rs"],
-    crate_root = "error.rs",
     rustc_flags = ["-Cpanic=unwind"],
 )

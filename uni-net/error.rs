@@ -1,8 +1,9 @@
-// uni/error.rs — Shared error hierarchy for the init-redesign.
+// uni-net/error.rs — Shared error hierarchy for the net stack.
 //
-// Defined up-front (before the Phase 5/6 crate carveouts) so the
-// soon-to-be-split crates don't each invent incompatible enums that
-// have to be unified later.
+// Moved out of `uni::error` as part of the uni-net crate carveout —
+// these errors flow across the crate boundary (driver implementers,
+// app bring-up code), so they live at the level that owns the net
+// API. `uni::error` keeps a compat re-export.
 //
 // Design rules:
 //   1. Every error fits in ≤ 2 pointers (16 bytes on 64-bit). Keeps
@@ -20,7 +21,7 @@
 // standalone `rust_test` for host-native unit tests, mirroring
 // `uni/boot_info.rs`.
 
-#![allow(dead_code)] // Variants will be constructed by Phase 3+ code.
+#![allow(dead_code)] // Some variants are populated by Phase 5+ code.
 
 use core::fmt;
 
@@ -160,9 +161,6 @@ mod tests {
 
     #[test]
     fn question_mark_lifts_inner_to_outer() {
-        // Simulated call-site: a helper returns Result<(), NicError>,
-        // the caller returns Result<(), NetError>. `?` should lift
-        // via `From<NicError> for NetError`.
         fn inner() -> Result<(), NicError> { Err(NicError::HwFault) }
         fn outer() -> Result<(), NetError> {
             inner()?;
@@ -184,8 +182,6 @@ mod tests {
     #[test]
     fn display_renders_chain() {
         use core::fmt::Write as _;
-        // Tests compile with std; `String` is available via the
-        // test harness linkage. `error.rs` itself stays `core`-only.
         let mut s = ::std::string::String::new();
         let e: NetError = DhcpError::Timeout.into();
         let _ = write!(s, "{}", e);
