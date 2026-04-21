@@ -27,7 +27,10 @@ rust_library(
     # everything else). Bare-metal builds additionally pull in
     # //drivers for the stats queries (`net_rx_counts` etc.) that
     # surface through `uni::*` to apps.
-    deps = ["//uni-net:uni_net"] + select({
+    deps = [
+        "//uni-net:uni_net",
+        "//util/atomic_fn",
+    ] + select({
         "//bazel/platforms:native": [],
         "//conditions:default": [
             "//drivers",

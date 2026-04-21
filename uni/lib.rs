@@ -22,6 +22,12 @@ extern crate kernel;
 #[cfg(platform_unikernel)]
 extern crate drivers;
 
+// `atomic_fn::AtomicFn<F>` — typed atomic fn-pointer cell. Only the
+// native backend currently uses it (for `IO_POLL` / `SERVICE`), but
+// we depend unconditionally so `mod backend` stays
+// platform-uniform shape-wise.
+extern crate atomic_fn;
+
 // The net stack (`Net::enable`, `NetBringUp`, `EthernetDriver`,
 // error types, plus the full umbrella of TCP/UDP/ARP/IPv4/DHCP/TLS
 // on bare-metal) lives in the `uni-net` crate. Re-exported at
@@ -201,37 +207,27 @@ mod backend {
     // Same pattern as the unikernel: register callbacks, all workers run
     // the same loop. On native, "worker" = OS thread.
 
-    use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use atomic_fn::AtomicFn;
 
     type PollFn = fn(u32) -> bool;
 
-    /// Up to 4 IO poll callbacks (network, storage, ...). Each slot is an
-    /// `AtomicPtr<()>` (null = empty, non-null = `PollFn`); `IO_POLL_COUNT`
-    /// is the number of slots that have been claimed. Slots are filled in
-    /// order during init by `register_io_poll`, then read by all worker
-    /// threads. Volatile reads/writes (the previous design) are NOT a
-    /// synchronisation primitive in the Rust memory model.
+    /// Up to 4 IO poll callbacks (network, storage, ...). Each slot is
+    /// an `AtomicFn<PollFn>` — null = empty, published value = callback.
+    /// `IO_POLL_COUNT` tracks the number of slots that have been
+    /// claimed. Slots are filled in order during init by
+    /// `register_io_poll`, then read by all worker threads.
+    /// `AtomicFn`'s own Release/Acquire pair gives us the cross-thread
+    /// happens-before that a `volatile *mut ()` previously didn't.
     const IO_POLL_MAX: usize = 4;
-    static IO_POLL: [AtomicPtr<()>; IO_POLL_MAX] = [
-        AtomicPtr::new(core::ptr::null_mut()),
-        AtomicPtr::new(core::ptr::null_mut()),
-        AtomicPtr::new(core::ptr::null_mut()),
-        AtomicPtr::new(core::ptr::null_mut()),
+    static IO_POLL: [AtomicFn<PollFn>; IO_POLL_MAX] = [
+        AtomicFn::null(),
+        AtomicFn::null(),
+        AtomicFn::null(),
+        AtomicFn::null(),
     ];
     static IO_POLL_COUNT: AtomicUsize = AtomicUsize::new(0);
-    static SERVICE: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
-
-    #[inline]
-    fn load_poll(slot: &AtomicPtr<()>) -> Option<PollFn> {
-        let p = slot.load(Ordering::Acquire);
-        if p.is_null() {
-            None
-        } else {
-            // SAFETY: only `register_io_poll`/`set_service` write here, and
-            // both write valid `PollFn` pointers.
-            Some(unsafe { core::mem::transmute::<*mut (), PollFn>(p) })
-        }
-    }
+    static SERVICE: AtomicFn<PollFn> = AtomicFn::null();
 
     // NUM_WORKERS removed: num_workers() now reads native::NUM_THREADS directly.
     static READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -250,7 +246,7 @@ mod backend {
     pub fn register_io_poll(f: PollFn) {
         let idx = IO_POLL_COUNT.fetch_add(1, Ordering::AcqRel);
         if idx < IO_POLL_MAX {
-            IO_POLL[idx].store(f as *mut (), Ordering::Release);
+            IO_POLL[idx].store(f);
         } else {
             // Roll back to keep IO_POLL_COUNT bounded.
             IO_POLL_COUNT.store(IO_POLL_MAX, Ordering::Release);
@@ -258,11 +254,11 @@ mod backend {
     }
 
     pub fn set_service(f: PollFn) {
-        SERVICE.store(f as *mut (), Ordering::Release);
+        SERVICE.store(f);
     }
 
     pub fn get_service() -> Option<PollFn> {
-        load_poll(&SERVICE)
+        SERVICE.load()
     }
 
     pub fn set_ready() {
@@ -297,7 +293,7 @@ mod backend {
             // 1. IO poll callbacks (network, future storage, etc)
             let n = IO_POLL_COUNT.load(Ordering::Acquire).min(IO_POLL_MAX);
             for i in 0..n {
-                if let Some(f) = load_poll(&IO_POLL[i]) {
+                if let Some(f) = IO_POLL[i].load() {
                     if f(worker_id) { did_work = true; }
                 }
             }
