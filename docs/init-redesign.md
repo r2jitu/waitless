@@ -668,7 +668,7 @@ Binary sizes (HVF `.img`): hello 1.9 MB, webserver 2.0 MB.
 | # | Phase | Status | Regression | Bin Δ | Notes |
 |---|---|---|---|---|---|
 | 0 | boot_info | 🟢 | none (additive only) | hello +<1 KB, webserver +<1 KB | `uni::boot_info()` populated from `boot/entry.rs` (unikernel) and `init_native` (native). Host-native unit test (`//uni:boot_info_test`, 7 cases) + webserver serial-log grep integration check. No hot-path touched. |
-| 1 | error types | ⏳ | — | — | |
+| 1 | error types | 🟢 | none (types only) | none | `uni::error::{NetError, DhcpError, NicError}` with `From` impls (`NicError → NetError`, `DhcpError → NetError`). All errors `Copy + ≤ 16 B` (const-asserted). Host-native unit test (`//uni:error_test`, 7 cases including `?`-operator chains and size invariants). `TlsError` stays in `net/tls_server.rs` until Phase 6. |
 | 2 | Net structural prep | ⏳ | — | — | |
 | 3 | Net::enable | ⏳ | — | — | |
 | 4 | delete auto-init | ⏳ | — | — | |

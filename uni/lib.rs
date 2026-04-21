@@ -49,9 +49,11 @@ mod unikernel;
 pub mod native;
 
 pub mod boot_info;
+pub mod error;
 pub mod http;
 
 pub use boot_info::{boot_info, BootInfo, NicInfo};
+pub use error::{DhcpError, NetError, NicError};
 
 // ----------------------------------------------------------------------------
 // App framework — the runtime's handle on the user's program

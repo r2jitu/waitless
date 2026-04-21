@@ -7,6 +7,7 @@ rust_library(
     name = "uni",
     srcs = [
         "boot_info.rs",
+        "error.rs",
         "http.rs",
         "lib.rs",
         "native.rs",
@@ -51,5 +52,13 @@ rust_test(
     name = "boot_info_test",
     srcs = ["boot_info.rs"],
     crate_root = "boot_info.rs",
+    rustc_flags = ["-Cpanic=unwind"],
+)
+
+# Host-native unit tests for the shared error hierarchy.
+rust_test(
+    name = "error_test",
+    srcs = ["error.rs"],
+    crate_root = "error.rs",
     rustc_flags = ["-Cpanic=unwind"],
 )
