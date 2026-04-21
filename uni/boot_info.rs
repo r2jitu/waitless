@@ -59,7 +59,9 @@ pub struct BootInfo {
 }
 
 /// Builder payload for `init_boot_info`. Backends populate this once
-/// per boot from platform-specific sources.
+/// per boot from platform-specific sources. Not part of the app-facing
+/// API — apps just call `boot_info()`.
+#[doc(hidden)]
 pub struct BootInfoParams {
     pub ram_bytes: usize,
     pub num_cpus: u32,
@@ -134,9 +136,11 @@ static BOOT_INFO: InitOnce<BootInfo> = InitOnce::new();
 
 /// Publish the final boot-time snapshot. Called exactly once per
 /// boot, from the platform backend (bare-metal boot entry on the
-/// unikernel, `init_native` on POSIX) before `uni_main` runs.
+/// unikernel, `init_native` on POSIX) before `uni_main` runs. Not
+/// part of the app-facing API.
 ///
 /// Panics if called twice.
+#[doc(hidden)]
 pub fn init_boot_info(p: BootInfoParams) {
     let count = (p.nic_count as usize).min(MAX_NICS);
     NICS_STORAGE.init(p.nics);

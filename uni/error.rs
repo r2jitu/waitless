@@ -184,17 +184,12 @@ mod tests {
     #[test]
     fn display_renders_chain() {
         use core::fmt::Write as _;
-        let mut s = alloc_string_like();
+        // Tests compile with std; `String` is available via the
+        // test harness linkage. `error.rs` itself stays `core`-only.
+        let mut s = ::std::string::String::new();
         let e: NetError = DhcpError::Timeout.into();
         let _ = write!(s, "{}", e);
         assert_eq!(s.as_str(), "dhcp: dhcp timeout");
-    }
-
-    /// Minimal std::String substitute so the `Display` test stays
-    /// inside this file (which is compiled as a standalone test crate
-    /// with access to `std`). Uses `std::string::String` directly.
-    fn alloc_string_like() -> ::std::string::String {
-        ::std::string::String::new()
     }
 
     #[test]
