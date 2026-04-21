@@ -35,6 +35,18 @@ SECTIONS {
         *(.rodata .rodata.*)
     }
 
+    /* Ethernet driver registration table (Phase 5 of the init redesign).
+       Each linked `uni-driver-*` crate emits one EthernetDriverReg into
+       this section via register_ethernet_driver!; `Net::enable` walks
+       [__start, __stop) to discover registered drivers. Empty when no
+       driver crate is linked (compute-only apps). ALIGN(8) matches the
+       two-pointer alignment of `&'static dyn EthernetDriver`. */
+    .uni_drivers_ethernet ALIGN(8) : {
+        __start_uni_drivers_ethernet = .;
+        KEEP(*(.uni_drivers_ethernet))
+        __stop_uni_drivers_ethernet = .;
+    }
+
     /* Limine boot protocol requests — contiguous, between start/end markers.
        Limine scans the ELF for these sections to discover boot requests. */
     .limine_requests_start ALIGN(8) : {
