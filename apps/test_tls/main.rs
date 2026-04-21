@@ -36,8 +36,8 @@ fn fail(name: &[u8]) {
     logn(b"\n");
 }
 
-#[uni::main]
-fn main() {
+#[uni::boot]
+fn boot() {
     logn(b"TLS 1.3 primitive test starting.\n");
 
     let mut failures = 0u32;

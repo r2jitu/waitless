@@ -1,43 +1,44 @@
-// uni/macros/lib.rs — Proc macro for #[uni::main]
+// uni/macros/lib.rs — Proc macro for `#[uni::boot]`.
 //
-// Transforms a plain `fn main() -> i32` into the platform-specific
-// entry point:
+// The unikernel's platform entry point is a C-ABI symbol named
+// `uni_main` — the bare-metal boot code and native's `main` both
+// resolve it at link time. Users write a regular Rust function and
+// tag it with `#[uni::boot]`; the macro renames it to `uni_main`
+// and gives it the required `extern "C"` / no-mangle attributes.
 //
-//   Unikernel: #[no_mangle] pub extern "C" fn uni_main() -> i32
-//   Native:    #[no_mangle] pub extern "C" fn uni_main() -> i32
-//
-// Both platforms resolve uni_main at link time — the unikernel's
-// kernel/entry.rs calls it after boot, and the native binary's
-// native_main.rs calls it after init.
+// The macro does no body transformation: it preserves the function
+// body exactly, so the user's `fn boot()` behaves like any normal
+// Rust function during execution.
 
 extern crate proc_macro;
 use proc_macro::TokenStream;
 
-/// Marks a function as the unikernel application entry point.
+/// Marks a function as the unikernel entry point. The platform
+/// runtime (`kernel::entry` on bare metal, `native::main` on
+/// POSIX) calls the resulting `uni_main` symbol after init.
 ///
-/// # Example
+/// The function is a normal Rust function; typical shape is:
+///
 /// ```ignore
-/// #[uni::main]
-/// fn main() -> i32 {
-///     // application code
-///     0
+/// #[uni::boot]
+/// fn boot() {
+///     uni::run(MyApp::new());
 /// }
 /// ```
 ///
-/// Expands to a `#[no_mangle] pub extern "C" fn uni_main()` that the
-/// platform runtime calls after initialization.
+/// For pure "run code and halt" programs (e.g. test binaries),
+/// the body can just contain that code without calling `uni::run`.
 #[proc_macro_attribute]
-pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn boot(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let source = item.to_string();
 
-    // Extract the function body (everything between the first { and last })
+    // Extract the function body — everything from the first `{`.
     let body_start = match source.find('{') {
         Some(i) => i,
         None => return item,
     };
     let body = &source[body_start..];
 
-    // Generate the entry point
     let output = format!(
         r#"
 #[unsafe(no_mangle)]

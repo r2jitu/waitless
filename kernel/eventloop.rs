@@ -27,6 +27,12 @@ static NET_FLUSH: AtomicFn<VoidFn> = AtomicFn::null();
 static SERVICE: AtomicFn<PollFn> = AtomicFn::null();
 static CHECK_SHUTDOWN: AtomicFn<BoolFn> = AtomicFn::null();
 static IDLE: AtomicFn<IdleFn> = AtomicFn::null();
+/// Invoked on the BSP exactly once, right after the loop breaks and
+/// before the machine powers off. Lets upper layers (e.g. `uni`'s
+/// App dispatch) run `destroy`-style teardown while the heap is
+/// still intact. Nothing else in the kernel depends on a running
+/// app at this point, so ordering is simple.
+static ON_SHUTDOWN: AtomicFn<VoidFn> = AtomicFn::null();
 /// Re-arm RX notifications for this core right before we HLT/WFI.
 /// Returns true if work became available during the arm (a packet
 /// arrived in the tiny window between the driver's last poll and
@@ -63,6 +69,13 @@ pub fn set_check_shutdown(f: BoolFn) {
 
 pub fn set_idle(f: IdleFn) {
     IDLE.store(f);
+}
+
+/// Register a teardown callback invoked on the BSP between the event
+/// loop exit and the architectural power-off. `uni` uses this to run
+/// `App::destroy` with the heap still live.
+pub fn set_on_shutdown(f: VoidFn) {
+    ON_SHUTDOWN.store(f);
 }
 
 pub fn set_net_rearm_rx(f: ArmFn) {
@@ -233,6 +246,15 @@ pub fn run(core_id: u32) -> ! {
     crate::serial::puts(b" idle=");
     print_u64(idle_count);
     crate::serial::puts(b"\n");
+
+    // App teardown — only the BSP runs this, and it runs before the
+    // architectural power-off (which never returns). APs fall through
+    // to their own CPU_OFF below without touching app state.
+    if core_id == 0 {
+        if let Some(f) = ON_SHUTDOWN.load() {
+            f();
+        }
+    }
 
     // Shutdown — allow APs to print before exiting
     for _ in 0..100_000u32 { core::hint::spin_loop(); }

@@ -1,12 +1,13 @@
 // UniKernel Example: HTTP Web Server
 //
-// Pure application logic. #[uni::main] handles the platform entry point.
+// Pure application logic. `#[uni::boot]` marks the entry point; the
+// `WebServerApp` type holds long-lived state (the HTTP server) and
+// gets handed to the runtime via `uni::run`.
 
 #![no_std]
 
 extern crate alloc;
 extern crate uni;
-use alloc::boxed::Box;
 use alloc::vec;
 use uni::http::{Request, Response, Server, TlsServerConfig};
 
@@ -211,7 +212,7 @@ fn handle_request(req: &Request) -> Response {
 }
 
 
-// ---- Application entry point ------------------------------------------------
+// ---- Application ------------------------------------------------------------
 
 /// Plain HTTP listener port. `uni::config_port` lets the runner
 /// override this via env var (e.g. for per-test fixtures); we pass
@@ -224,43 +225,75 @@ const HTTP_PORT: u16 = 80;
 /// testing (conventionally 8080 → :80 and 8443 → :443).
 const HTTPS_PORT: u16 = 443;
 
-#[uni::main]
-fn main() {
-    uni::log(b"Starting HTTP server...\n");
-    let http_port = uni::config_port(HTTP_PORT);
-    let https_port = uni::config_tls_port(HTTPS_PORT);
+/// Long-lived state for the webserver program. Holds the HTTP
+/// `Server` (which in turn owns listeners, the per-core connection
+/// pool, and the TLS config). `impl uni::App` marks it as the
+/// program's top-level type; the runtime takes ownership via
+/// `uni::run` and drops it on graceful shutdown.
+///
+/// `server` is accessed by the HTTP service callback via
+/// `http::SERVER_PTR`, which `Server::listen`/`listen_tls` publish
+/// during setup — so the field is read indirectly at runtime, hence
+/// the lint allow here.
+#[allow(dead_code)]
+struct WebServerApp {
+    server: alloc::boxed::Box<Server>,
+}
 
-    // Start UDP echo server on port 7
-    fn udp_echo(src_ip: [u8; 4], src_port: u16, data: &[u8]) {
-        uni::udp_send(src_ip, 7, src_port, data);
-    }
-    uni::udp_bind(7, udp_echo);
-    uni::log(b"UDP echo server on port 7\n");
+impl uni::App for WebServerApp {}
 
-    // Allocate the Server (and its per-connection buffers) on the heap.
-    // `Box::leak` extends the lifetime to 'static so worker threads and AP
-    // service callbacks can keep accessing it via SERVER_PTR after main()
-    // returns on native (on unikernel `run()` blocks forever).
-    let server: &'static mut Server = Box::leak(Server::new_boxed());
-    server.default_handler(handle_request);
+impl WebServerApp {
+    fn new() -> Self {
+        uni::log(b"Starting HTTP server...\n");
+        let http_port = uni::config_port(HTTP_PORT);
+        let https_port = uni::config_tls_port(HTTPS_PORT);
 
-    // Plain HTTP is always on.
-    server.listen(http_port);
-
-    // HTTPS is added alongside when the dev cert parses. The same
-    // routes serve both listeners — handlers don't care whether a
-    // given request arrived over TLS or not. The cert/key is moved
-    // into `server` as a field; no global, no leak.
-    match TlsServerConfig::from_dev_cert(DEV_CERT_DER, DEV_KEY_PKCS8_DER) {
-        Some(cfg) => {
-            uni::log(b"TLS: dev cert loaded. Serving HTTPS.\n");
-            server.listen_tls(https_port, cfg);
+        // UDP echo server on port 7.
+        fn udp_echo(src_ip: [u8; 4], src_port: u16, data: &[u8]) {
+            uni::udp_send(src_ip, 7, src_port, data);
         }
-        None => {
-            uni::log(b"TLS: failed to parse dev key; HTTPS disabled.\n");
-        }
-    }
+        uni::udp_bind(7, udp_echo);
+        uni::log(b"UDP echo server on port 7\n");
 
-    uni::log(b"Entering event loop.\n");
-    server.run();
+        // Allocate Server (and its per-connection buffers) on the
+        // heap. The WebServerApp wrapper moves the Box into its own
+        // field; the runtime moves WebServerApp into its slot; no
+        // leak, no globals, ownership is explicit throughout.
+        let mut server = Server::new_boxed();
+        server.default_handler(handle_request);
+        server.listen(http_port);
+
+        // HTTPS alongside when the dev cert parses. cert/key moves
+        // into `server` as a field.
+        match TlsServerConfig::from_dev_cert(
+            DEV_CERT_DER,
+            DEV_KEY_PKCS8_DER,
+        ) {
+            Some(cfg) => {
+                uni::log(b"TLS: dev cert loaded. Serving HTTPS.\n");
+                server.listen_tls(https_port, cfg);
+            }
+            None => {
+                uni::log(b"TLS: failed to parse dev key; HTTPS disabled.\n");
+            }
+        }
+
+        uni::log(b"Entering event loop.\n");
+        server.run();
+
+        WebServerApp { server }
+    }
+}
+
+impl Drop for WebServerApp {
+    fn drop(&mut self) {
+        uni::log(b"[app] shutting down\n");
+        // Field drops cascade from here: `server` tears down
+        // listeners, active conns, TLS config, RX buffers, the lot.
+    }
+}
+
+#[uni::boot]
+fn boot() {
+    uni::run(WebServerApp::new());
 }

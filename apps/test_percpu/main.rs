@@ -48,8 +48,8 @@ fn test_service(core_id: u32) -> bool {
     true
 }
 
-#[uni::main]
-fn main() {
+#[uni::boot]
+fn boot() {
     uni::log(b"Per-core state test starting.\n");
 
     let num_cores = kernel::percpu::num_cores();
