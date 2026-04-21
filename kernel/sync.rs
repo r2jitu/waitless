@@ -141,81 +141,22 @@ impl<'a, T> Drop for SpinlockGuard<'a, T> {
 // AtomicFn<F> — typed atomic function pointer
 // ============================================================================
 //
-// Wraps an `AtomicUsize` storing the bit pattern of an `F` (which must be
-// a function pointer type — `fn(...) -> ...`). Provides a type-safe
-// `store(f)` / `load() -> Option<F>` API so call sites don't have to do
-// raw pointer transmutes for every callback slot they want to publish.
+// The implementation lives in `//util:atomic_fn` (crate
+// `atomic_fn`) as part of Phase 7's consolidation: `net_protocol`'s
+// registry and `uni/lib.rs`'s native IO-poll slots share the same
+// pattern but can't depend on `//kernel` without inheriting the
+// RustCrypto / talc deps that break `rust_test`'s panic=unwind.
+// Extracting the primitive to a no-dep leaf crate gives every
+// consumer the same type.
 //
-// Used by the event loop and percpu callback registries (and elsewhere)
-// for "publish a fn pointer once at boot, read it from any core later".
-// `Release` on store and `Acquire` on load establish the happens-before
-// edge with any data the registrant wrote before publication.
-
-use core::marker::PhantomData;
-use core::sync::atomic::AtomicUsize;
-
-pub struct AtomicFn<F: Copy> {
-    bits: AtomicUsize,
-    _phantom: PhantomData<fn() -> F>,
-}
-
-// SAFETY: AtomicFn only stores a fn-pointer bit pattern, which is Copy
-// and pointer-sized. AtomicUsize provides the cross-thread synchronisation.
-unsafe impl<F: Copy> Send for AtomicFn<F> {}
-unsafe impl<F: Copy> Sync for AtomicFn<F> {}
-
-impl<F: Copy> AtomicFn<F> {
-    /// Create an empty (null) cell.
-    #[inline]
-    pub const fn null() -> Self {
-        // Compile-time check: F must be pointer-sized. transmute_copy
-        // would silently truncate / over-read otherwise.
-        // We can't use static_assert here cleanly in const context;
-        // the size mismatch surfaces in `store`/`load` instead.
-        AtomicFn {
-            bits: AtomicUsize::new(0),
-            _phantom: PhantomData,
-        }
-    }
-
-    /// Publish `f`. Subsequent `load()` calls observe `Some(f)` (or a
-    /// later store).
-    #[inline]
-    pub fn store(&self, f: F) {
-        const {
-            assert!(
-                core::mem::size_of::<F>() == core::mem::size_of::<usize>(),
-                "AtomicFn<F>: F must be pointer-sized (a fn pointer)"
-            );
-        }
-        // SAFETY: F is fn-pointer-sized (checked above) and the caller
-        // statically asserts F is a fn-pointer type by parameterising
-        // AtomicFn at the right type. fn pointers and usize have
-        // identical bit patterns under transmute.
-        let bits: usize = unsafe { core::mem::transmute_copy(&f) };
-        self.bits.store(bits, Ordering::Release);
-    }
-
-    /// Load the published `F`, or `None` if no store has happened yet.
-    #[inline]
-    pub fn load(&self) -> Option<F> {
-        const {
-            assert!(
-                core::mem::size_of::<F>() == core::mem::size_of::<usize>(),
-                "AtomicFn<F>: F must be pointer-sized (a fn pointer)"
-            );
-        }
-        let bits = self.bits.load(Ordering::Acquire);
-        if bits == 0 {
-            None
-        } else {
-            // SAFETY: only `store(f)` writes here, and `f`'s type is
-            // statically `F`. The bit pattern is therefore a valid `F`
-            // whenever `bits != 0`.
-            Some(unsafe { core::mem::transmute_copy(&bits) })
-        }
-    }
-}
+// Re-exported here so existing `kernel::sync::AtomicFn` imports
+// keep resolving unchanged. Gated on `not(test)` so the
+// `//kernel:sync_test` rust_test target (which compiles this file
+// as a standalone `panic=unwind` binary and only exercises
+// `Spinlock`) doesn't pull in the `atomic_fn` crate and hit the
+// `panic=abort` vs `=unwind` mismatch.
+#[cfg(not(test))]
+pub use atomic_fn::AtomicFn;
 
 #[cfg(test)]
 mod tests {

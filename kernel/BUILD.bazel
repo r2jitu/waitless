@@ -41,6 +41,7 @@ rust_library(
     }),
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
     deps = [
+        "//util/atomic_fn",
         "@crates//:chacha20",
         "@crates//:getrandom",
         "@crates//:sha2",

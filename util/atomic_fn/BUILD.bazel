@@ -1,0 +1,30 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
+
+package(default_visibility = ["//visibility:public"])
+
+# util/atomic_fn — typed atomic function-pointer cell.
+#
+# Zero-dep leaf crate (only `core::`). Extracted from
+# `kernel::sync::AtomicFn` so downstream callers that can't depend
+# on `//kernel` (because doing so pulls in RustCrypto / talc /
+# panic=abort chains that break rust_test's panic=unwind runtime)
+# can still reach the same primitive.
+#
+# Consumers after Phase 7:
+#   * //kernel: re-exports as `kernel::sync::AtomicFn` for compat.
+#   * //net:protocol: drops its private `FnSlot` wrapper.
+#   * //uni:uni (native backend): `IO_POLL` / `SERVICE` slots.
+rust_library(
+    name = "atomic_fn",
+    srcs = ["lib.rs"],
+    crate_name = "atomic_fn",
+    crate_root = "lib.rs",
+    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+)
+
+rust_test(
+    name = "atomic_fn_test",
+    crate = ":atomic_fn",
+    rustc_flags = ["-Cpanic=unwind"],
+)
