@@ -7,6 +7,7 @@ into bootable kernel images using rustc + rust-lld.
 load("@rules_rust//rust:defs.bzl", "rust_binary")
 load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
 load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
+load("//bazel/rules:variants.bzl", "unikernel_variants")
 
 # Bare-metal linker flags (passed to rust-lld via -C link-arg).
 _LINK_FLAGS = [
@@ -194,3 +195,12 @@ def unikernel_binary(name, app, visibility = None):
         }),
         visibility = visibility,
     )
+
+    # ── Per-runner variants — `:<name>_hvf` / `_iso` / `_qemu_<arch>` ────
+    # Each variant wraps the unified launcher above under a Bazel
+    # transition that pins the matching platform + runner selection +
+    # `-Cpanic=abort`. `bazel run :<name>_hvf` is a drop-in for
+    # `bazel run --config=hvf :<name>` — but without invalidating the
+    # other variants' analysis cache when switching runners, and
+    # `bazel test //...` can cover the full runner matrix in one shot.
+    unikernel_variants(src = ":" + name, visibility = visibility)
