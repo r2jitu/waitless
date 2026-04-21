@@ -8,6 +8,7 @@ round-tripped through each AP, etc.
 
 from __future__ import annotations
 
+import os
 import unittest
 
 from scripts.test_helpers import (
@@ -26,9 +27,13 @@ class PerCoreStateTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        elf = runfiles_root() / "apps" / "test_percpu" / "test_percpu.elf"
+        # Each per-variant py_test passes `env = {"LAUNCHER_NAME": "test_percpu_qemu_<arch>"}`.
+        # The variant rule symlinks the transitioned .elf as
+        # `<LAUNCHER_NAME>.elf` alongside the launcher.
+        launcher_name = os.environ["LAUNCHER_NAME"]
+        elf = runfiles_root() / "apps" / "test_percpu" / f"{launcher_name}.elf"
         if not elf.is_file():
-            raise unittest.SkipTest(f"test_percpu.elf not found at {elf}")
+            raise unittest.SkipTest(f"{launcher_name}.elf not found at {elf}")
         cls.launcher = spawn_qemu(
             elf, cpus=EXPECTED_CPUS, memory_mb=128,
             log_prefix="test_percpu",

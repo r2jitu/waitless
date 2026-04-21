@@ -37,11 +37,12 @@ class QemuEnv:
 
     def build(self):
         subprocess.run(
-            ["bazel", "build", "--config=x86_64-qemu", "//apps/webserver:webserver.elf"],
+            ["bazel", "build", "//apps/webserver:webserver_qemu_x86_64"],
             capture_output=True, cwd=_project_root(), timeout=120)
 
     def start(self, cpus, port):
-        elf = os.path.join(_project_root(), "bazel-bin/apps/webserver/webserver.elf")
+        elf = os.path.join(_project_root(),
+                           "bazel-bin/apps/webserver/webserver_qemu_x86_64.elf")
         # `-cpu max` instead of `-cpu qemu64`: the compiled crypto
         # code (p256 / chacha20poly1305 / etc.) is annotated with
         # `+avx,+avx2` in MODULE.bazel and crashes with #UD the
@@ -93,8 +94,7 @@ class KvmEnv:
     def build(self):
         if not self.elf_override:
             subprocess.run(
-                ["bazel", "build", "--config=x86_64-qemu",
-                 "//apps/webserver:webserver.elf"],
+                ["bazel", "build", "//apps/webserver:webserver_qemu_x86_64"],
                 capture_output=True, cwd=_project_root(), timeout=120)
         # Ensure tap0 + dnsmasq + NAT are up before the first qemu
         # launch. Idempotent (the script itself is), so re-running
@@ -107,7 +107,8 @@ class KvmEnv:
 
     def start(self, cpus, port):
         elf = self.elf_override or os.path.join(
-            _project_root(), "bazel-bin/apps/webserver/webserver.elf")
+            _project_root(),
+            "bazel-bin/apps/webserver/webserver_qemu_x86_64.elf")
         # tap backend with vhost-net + multi-queue. Multi-queue is only
         # requested when cpus > 1 because QEMU rejects queues=1 on tap.
         cmd = ["qemu-system-x86_64", "-accel", "kvm", "-cpu", "host",
@@ -165,11 +166,12 @@ class QemuAarch64Env:
 
     def build(self):
         subprocess.run(
-            ["bazel", "build", "--config=aarch64-qemu", "//apps/webserver:webserver.img"],
+            ["bazel", "build", "//apps/webserver:webserver_qemu_aarch64"],
             capture_output=True, cwd=_project_root(), timeout=120)
 
     def start(self, cpus, port):
-        img = os.path.join(_project_root(), "bazel-bin/apps/webserver/webserver.img")
+        img = os.path.join(_project_root(),
+                           "bazel-bin/apps/webserver/webserver_qemu_aarch64.img")
         tls_port = port + self.tls_port_offset
         cmd = ["qemu-system-aarch64", "-machine", "virt", "-cpu", "max",
                "-m", "128", "-smp", str(cpus), "-nographic",
@@ -279,24 +281,20 @@ class HvfEnv:
     tls_port_offset = 1000   # host TLS port = guest HTTP port + 1000
 
     def build(self):
-        # Two bazel calls because the runner is a host tool and
-        # webserver.img needs `--config=qemu` (which sets the
-        # aarch64_unikernel target platform). Combining them in one
-        # invocation makes bazel try to build the runner under the
-        # unikernel platform and fail its `target_compatible_with`.
-        root = _project_root()
+        # `:webserver_hvf` bundles both the transitioned aarch64
+        # unikernel .img and the host-built HVF runner under one
+        # target — the variant rule's transition scopes the
+        # platform override to just the guest-side sub-graph, so a
+        # single `bazel build` covers both.
         subprocess.run(
-            ["bazel", "build", "//tools/hvf-runner:run_hvf"],
-            capture_output=True, cwd=root, timeout=240)
-        subprocess.run(
-            ["bazel", "build", "--config=qemu",
-             "//apps/webserver:webserver.img"],
-            capture_output=True, cwd=root, timeout=240)
+            ["bazel", "build", "//apps/webserver:webserver_hvf"],
+            capture_output=True, cwd=_project_root(), timeout=240)
 
     def start(self, cpus, port):
         root = _project_root()
-        img = os.path.join(root, "bazel-bin/apps/webserver/webserver.img")
-        run_hvf = os.path.join(root, "bazel-bin/tools/hvf-runner/run-hvf")
+        img = os.path.join(root, "bazel-bin/apps/webserver/webserver_hvf.img")
+        run_hvf = os.path.join(root,
+                               "bazel-bin/apps/webserver/webserver_hvf.runner")
         log = open(f"/tmp/hvf_{port}.log", "w")
         udp_port = port + self.udp_port_offset
         tls_port = port + self.tls_port_offset

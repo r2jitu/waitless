@@ -3,10 +3,12 @@ load("@bazel_skylib//rules:common_settings.bzl", "bool_flag", "string_flag")
 package(default_visibility = ["//visibility:public"])
 
 exports_files([
-    "run_native.sh",
-    "run_hvf.sh",
-    "run_qemu.sh",
-    "run_iso.sh",
+    # Per-variant launcher templates, consumed by //bazel/rules:variants.bzl.
+    # Each contains %TOKEN% placeholders that the variant rule's
+    # `ctx.actions.expand_template` substitutes with runfile filenames.
+    "run_hvf.sh.tmpl",
+    "run_iso.sh.tmpl",
+    "run_qemu.sh.tmpl",
     "native_main.rs",
     "unikernel_main.rs",
 ])
@@ -18,11 +20,10 @@ exports_files([
 # panic=unwind under the test verb (satisfying libtest) but stay
 # no_std + panic=abort for production unikernel builds.
 #
-# Transitions that re-enter the production sub-graph from under
-# `bazel test` (e.g. `integration_data` wrapping a unikernel_binary
-# as test data) must include `"//bazel/rules:tests_need_std": False`
-# in their transition outputs, otherwise the sub-graph inherits
-# `True` and the std-feature select fires where it shouldn't.
+# Per-variant transitions in `//bazel/rules:variants.bzl` re-enter
+# the production sub-graph from under `bazel test` and reset this
+# flag to False, so unikernel rlibs pulled in as variant data stay
+# no_std.
 bool_flag(
     name = "tests_need_std",
     build_setting_default = False,
@@ -33,14 +34,14 @@ config_setting(
     flag_values = {":tests_need_std": "True"},
 )
 
-# Which runner the `:<name>` unikernel_binary launcher targets. Set
-# either by the `.bazelrc` `build:hvf` / `build:qemu` / `build:iso`
-# shortcut configs (whole-build override) or by the per-variant
-# transitions in `//bazel/rules:variants.bzl` (sub-graph-scoped
-# override for `:<name>_hvf` / `:<name>_iso` / etc.). Previously this
-# lived on `--define=uni_runner=<val>`, but Starlark transitions
-# cannot set `--define`, so we migrated to a user-defined
-# `string_flag` (which transitions DO support).
+# Runner selector consumed by `//bazel/platforms`'s runner
+# config_settings, which the unikernel_binary macro's `srcs` /
+# `data` select() queries. Flipped by the per-variant transitions
+# in `//bazel/rules:variants.bzl`; no whole-build `.bazelrc` config
+# sets it (runner selection is per-target, not per-invocation).
+# Previously this lived on `--define=uni_runner=<val>`, but
+# Starlark transitions cannot set `--define`, so we migrated to a
+# user-defined `string_flag` (which transitions DO support).
 string_flag(
     name = "uni_runner",
     build_setting_default = "native",

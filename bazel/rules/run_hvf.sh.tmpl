@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Generated launcher for the `_hvf` variant of a unikernel_binary target.
+# The variant rule symlinks the guest image and the host HVF runner next
+# to this script under the filenames substituted into %IMG% / %RUNNER%,
+# so every runfile lives in this script's directory. No suffix stripping,
+# no upward-walk for sibling discovery.
+#
+# Env:
+#   UNIKERNEL_PORT     — host HTTP port   (default 8080) → guest :80
+#   UNIKERNEL_TLS_PORT — host HTTPS port  (default 8443) → guest :443
+#   UNIKERNEL_UDP_PORT — host UDP port    (default 8007) → guest :7
+#   UNIKERNEL_MEMORY   — guest RAM in MB  (default 128)
+#   UNIKERNEL_CPUS     — guest vCPU count (default 1)
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+IMG="$SELF_DIR/%IMG%"
+RUNNER="$SELF_DIR/%RUNNER%"
+
+PORT="${UNIKERNEL_PORT:-8080}"
+TLS_PORT="${UNIKERNEL_TLS_PORT:-8443}"
+UDP_PORT="${UNIKERNEL_UDP_PORT:-8007}"
+
+echo "==> http://localhost:${PORT}/"
+echo "==> https://localhost:${TLS_PORT}/  (self-signed dev cert — use curl -k)"
+echo "==> udp  ::${UDP_PORT} → guest :7"
+
+exec "$RUNNER" "$IMG" \
+    "--ram=${UNIKERNEL_MEMORY:-128}" \
+    "--cpus=${UNIKERNEL_CPUS:-1}" \
+    -p "tcp:${PORT}:80" \
+    -p "tcp:${TLS_PORT}:443" \
+    -p "udp:${UDP_PORT}:7"

@@ -80,11 +80,11 @@ fi
 if [ $do_build -eq 1 ]; then
     cd "$PROJECT_ROOT"
     if [ $need_kvm -eq 1 ]; then
-        echo "==> Building webserver.elf (x86_64-qemu)..."
-        bazel build --config=x86_64-qemu //apps/webserver:webserver.elf
+        echo "==> Building :webserver_qemu_x86_64..."
+        bazel build //apps/webserver:webserver_qemu_x86_64
     fi
     if [ $need_native -eq 1 ]; then
-        echo "==> Building webserver_native (x86_64-linux)..."
+        echo "==> Building :webserver_native (x86_64-linux)..."
         bazel build --config=x86_64-linux //apps/webserver:webserver_native
     fi
 fi

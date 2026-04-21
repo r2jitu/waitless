@@ -23,10 +23,12 @@ UNIKERNEL_RUSTC_FLAGS = select({
 #     to std under `--test` cfg via `cfg_attr(not(test), no_std)`,
 #     so the unwind strategy is legal there.
 #
-#   * Integration tests tagged `integration` are filtered out of
-#     the default `bazel test` set. Users run them with
-#     `--config=hvf` / `=iso` / `=qemu`, which re-assert
-#     `-Cpanic=abort` so the unikernel binary rebuilds cleanly.
+#   * Integration tests are per-variant (`:test_hvf`, `:test_iso`,
+#     `:test_qemu_<arch>`) and depend on the matching unikernel
+#     variant target. The variant rule in
+#     `//bazel/rules:variants.bzl` applies a Bazel transition that
+#     re-asserts `-Cpanic=abort` on the unikernel sub-graph, so the
+#     test-verb unwind override never reaches the no_std rlibs.
 #
 #   * The one residual awkwardness: a `rust_test` that
 #     `crate = ":foo"` (or that `srcs =` foo's source directly)
@@ -37,6 +39,6 @@ UNIKERNEL_RUSTC_FLAGS = select({
 #     the `test` verb, and affected crates (currently just
 #     `//util/atomic_fn`) `select()` on the matching config_setting
 #     to inject `crate_features = ["std"]`, flipping themselves to
-#     std + unwind for the duration of the test build. Transitions
-#     (e.g. `integration_data`) that re-enter the production sub-
-#     graph reset the flag to False.
+#     std + unwind for the duration of the test build. Variant
+#     transitions re-enter the production sub-graph with the flag
+#     reset to False.

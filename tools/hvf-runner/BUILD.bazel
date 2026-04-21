@@ -33,17 +33,16 @@ rust_binary(
     ],
 )
 
-# Codesigned binary — what consumers (bench.py, test_hvf.sh, the
-# `bazel run //apps/webserver:webserver` wrapper) actually execute.
-# Output path is `bazel-bin/tools/hvf-runner/run-hvf`, matching what
-# every consumer already uses.
+# Codesigned binary — what consumers (bench.py, the `_hvf_variant`
+# rule in //bazel/rules:variants.bzl) actually execute. Output path
+# is `bazel-bin/tools/hvf-runner/run-hvf`.
 #
 # `run_hvf_unsigned` goes in `tools` (exec cfg), not `srcs` (target
-# cfg), so it's built for the host platform even when --config=hvf
-# has pushed the rest of the build onto //bazel/platforms:aarch64_unikernel.
-# Without this, target-cfg rules like //apps/webserver:run that pull
-# this genrule into `data` drag the inner rust_binary onto the
-# unikernel platform and fail its os:macos constraint.
+# cfg), so it's built for the host platform regardless of what the
+# outer build is targeting. Without this, target-cfg rules that
+# depend on this genrule (e.g. a variant rule running under its
+# aarch64_unikernel transition) would drag the inner rust_binary
+# onto the unikernel platform and fail its os:macos constraint.
 genrule(
     name = "run_hvf",
     srcs = ["run-hvf.entitlements"],

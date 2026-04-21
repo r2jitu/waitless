@@ -1,8 +1,8 @@
 load("@rules_python//python:defs.bzl", "py_test")
 load("@rules_rust//rust:defs.bzl", "rust_library")
-load("//bazel/rules:integration_test.bzl", "integration_data")
 load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 load("//bazel/rules:unikernel.bzl", "unikernel_binary")
+load("//bazel/rules:variants.bzl", "unikernel_app_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -23,33 +23,20 @@ unikernel_binary(
     app = ":app",
 )
 
-# `integration_data` wraps `:webserver` under a one-hop Bazel transition
-# that re-asserts `-Cpanic=abort` for the unikernel dep-graph. Without
-# it, `bazel test`'s `-Cpanic=unwind` default (needed by the libtest
-# harness) would propagate to the `data = [":webserver"]` subgraph and
-# fail to compile the `#![no_std]` rlibs. See `integration_test.bzl`
-# for the full rationale.
-integration_data(
-    name = "webserver_for_test",
-    src = ":webserver",
-)
-
-# One test covers every runner: it lists :webserver (via the wrapper
-# above) as a data dep, spawns it as a subprocess, and probes HTTP /
-# HTTPS / UDP, plus a PTY-driven Ctrl-C regression check. Runner-
-# specific launch logic lives in the :webserver target — the test
-# doesn't need to know HVF from QEMU from ISO from native.
-py_test(
+# Per-variant integration tests (generates `:test_hvf`, `:test_iso`,
+# `:test_qemu_aarch64`, `:test_qemu_x86_64`). test.py reads
+# `LAUNCHER_NAME` from env to resolve the per-variant runfile —
+# runner-agnostic. HVF auto-skips on non-macOS hosts.
+unikernel_app_test(
     name = "test",
-    timeout = "long",
+    app_base = "webserver",
+    test_rule = py_test,
     srcs = ["test.py"],
     deps = ["//scripts:test_helpers"],
-    data = [
-        ":webserver_for_test",
-        "//apps/webserver/dev_certs:dev_cert.pem",
-    ],
+    extra_data = ["//apps/webserver/dev_certs:dev_cert.pem"],
     tags = [
         "exclusive",
         "local",
     ],
+    timeout = "long",
 )

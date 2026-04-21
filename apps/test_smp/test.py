@@ -31,9 +31,13 @@ class SmpBootTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        elf = runfiles_root() / "apps" / "test_smp" / "test_smp.elf"
+        # Each per-variant py_test passes `env = {"LAUNCHER_NAME": "test_smp_qemu_<arch>"}`.
+        # The variant rule symlinks the transitioned .elf as
+        # `<LAUNCHER_NAME>.elf` alongside the launcher.
+        launcher_name = os.environ["LAUNCHER_NAME"]
+        elf = runfiles_root() / "apps" / "test_smp" / f"{launcher_name}.elf"
         if not elf.is_file():
-            raise unittest.SkipTest(f"test_smp.elf not found at {elf}")
+            raise unittest.SkipTest(f"{launcher_name}.elf not found at {elf}")
         cls.launcher = spawn_qemu(
             elf, cpus=EXPECTED_CPUS, memory_mb=128,
             log_prefix="test_smp",

@@ -7,9 +7,9 @@ cascade, traffic-key record roundtrip) inside a real unikernel boot
 rather than a host unit test. Passes if the serial log contains
 `TLS TESTS: ALL PASSED` and no `[tls] FAIL`.
 
-Picks the runner from what's actually in runfiles (run-hvf or
-<name>.elf) rather than host arch — so `--config=aarch64-qemu` runs
-under QEMU on a macOS arm64 host instead of defaulting to HVF.
+Dispatches on `LAUNCHER_NAME` (set by the per-variant py_test's
+`env` attr): `test_tls_hvf` → run-hvf on the co-located .img;
+`test_tls_qemu_<arch>` → spawn_qemu on the co-located .elf.
 """
 
 from __future__ import annotations
@@ -36,13 +36,16 @@ class TlsPrimitiveTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         root = runfiles_root()
-        hvf = root / "tools" / "hvf-runner" / "run-hvf"
-        elf = root / "apps" / "test_tls" / "test_tls.elf"
-        img = root / "apps" / "test_tls" / "test_tls.img"
+        launcher_name = os.environ["LAUNCHER_NAME"]
+        pkg = root / "apps" / "test_tls"
 
-        if hvf.is_file() and os.access(hvf, os.X_OK):
+        if launcher_name == "test_tls_hvf":
+            hvf = pkg / f"{launcher_name}.runner"
+            img = pkg / f"{launcher_name}.img"
+            if not (hvf.is_file() and os.access(hvf, os.X_OK)):
+                raise unittest.SkipTest(f"HVF runner not executable: {hvf}")
             if not img.is_file():
-                raise RuntimeError(f"test_tls.img not found at {img}")
+                raise RuntimeError(f"{launcher_name}.img not found at {img}")
             fd, log_path_str = tempfile.mkstemp(
                 prefix="test_tls_hvf_", suffix=".log",
             )
@@ -54,13 +57,14 @@ class TlsPrimitiveTest(unittest.TestCase):
                     stdout=log_fd, stderr=log_fd, stdin=subprocess.DEVNULL,
                 )
             cls.launcher = Launcher(proc=proc, log_path=log_path)
-        elif elf.is_file():
+        else:
+            elf = pkg / f"{launcher_name}.elf"
+            if not elf.is_file():
+                raise RuntimeError(f"{launcher_name}.elf not found at {elf}")
             cls.launcher = spawn_qemu(elf, cpus=1, memory_mb=128,
-                                      log_prefix="test_tls_qemu")
+                                      log_prefix=launcher_name)
             if cls.launcher is None:
                 raise unittest.SkipTest("no qemu-system-* on PATH for this ELF")
-        else:
-            raise unittest.SkipTest("no runner available (no run-hvf / .elf)")
 
         # Wait for the TLS test summary line. 20 s covers TCG under
         # heavy crypto.

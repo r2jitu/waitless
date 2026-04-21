@@ -35,7 +35,11 @@ from scripts.test_helpers import (
 
 
 ROOT = runfiles_root()
-LAUNCHER = ROOT / "apps" / "webserver" / "webserver"
+# Each per-variant py_test passes `env = {"LAUNCHER_NAME": "webserver_<variant>"}`;
+# test.py resolves that runfile relative to its own package. No fallback:
+# an unset env var is a BUILD bug, not a runtime-selectable default.
+LAUNCHER_NAME = os.environ["LAUNCHER_NAME"]
+LAUNCHER = ROOT / "apps" / "webserver" / LAUNCHER_NAME
 DEV_CERT = ROOT / "apps" / "webserver" / "dev_certs" / "dev_cert.pem"
 # Matches both unikernel boot (`[BOOT] Entering event loop on core 0.`)
 # and native POSIX (`Entering event loop.` from the app's boot()

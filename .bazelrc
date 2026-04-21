@@ -12,13 +12,11 @@ build --action_env=PATH
 # source file uses `#![cfg_attr(not(test), no_std)]` — under `--test`
 # they flip to std.
 #
-# Integration tests (py_tests that spawn unikernel binaries) depend
-# on their target binaries through `//bazel/rules:integration_test.bzl`'s
-# `integration_data` wrapper, which applies a Bazel transition that
-# pins `-Cpanic=abort` for the wrapped sub-graph — so the test-verb
-# unwind override never reaches the no_std dep-chain. Users run them
-# with `bazel test //apps/foo:test` (no config gymnastics, no
-# tag filter).
+# Per-variant unikernel targets (:<app>_hvf / _iso / _qemu_<arch>)
+# apply a Bazel transition via //bazel/rules:variants.bzl that
+# re-asserts `-Cpanic=abort` on the unikernel sub-graph, so under
+# `bazel test //apps/foo:test_hvf` the test-verb unwind override
+# never reaches the no_std unikernel rlibs.
 build --@rules_rust//:extra_rustc_flags=-Cpanic=abort,-Copt-level=2,-Dwarnings
 test  --@rules_rust//:extra_rustc_flag=-Cpanic=unwind
 
@@ -26,8 +24,8 @@ test  --@rules_rust//:extra_rustc_flag=-Cpanic=unwind
 # `#![cfg_attr(not(feature = "std"), no_std)]` crates (currently
 # just //util/atomic_fn) pick up `crate_features = ["std"]` and
 # compile as std + panic=unwind to link into libtest harnesses.
-# `integration_data` transitions reset the flag back to False for
-# their sub-graph so unikernel rlibs stay no_std in-process.
+# Per-variant transitions reset the flag back to False for their
+# sub-graph so unikernel rlibs stay no_std in-process.
 test --//bazel/rules:tests_need_std=True
 
 # Bazel 9 made the default test toolchain require an exec platform that
@@ -41,42 +39,18 @@ test --//bazel/rules:tests_need_std=True
 # on test targets in transitive analysis if the flag isn't visible.
 common --@bazel_tools//tools/test:incompatible_use_default_test_toolchain=false
 
-# ── Shorthand configs ─────────────────────────────────────────────────────────
-# --config=qemu → unikernel via QEMU (platform from .bazelrc.local for host arch)
-build:qemu --//bazel/rules:uni_runner=qemu
-
-# --config=hvf  → ARM64 unikernel, HVF (macOS arm64, Apple Hypervisor.framework)
-build:hvf  --platforms=//bazel/platforms:aarch64_unikernel
-build:hvf  --//bazel/rules:uni_runner=hvf
-
-# --config=iso  → x86_64 unikernel via Limine ISO + QEMU
-build:iso  --platforms=//bazel/platforms:x86_64_unikernel
-build:iso  --//bazel/rules:uni_runner=iso
-
-# --config=native → native POSIX binary (platform from .bazelrc.local for host)
-# setup-dev.sh generates: build:native --platforms=//bazel/platforms:native_<host>
-
-# ── Full triplet configs ───────────────────────────────────────────────────────
-build:aarch64-hvf  --platforms=//bazel/platforms:aarch64_unikernel
-build:aarch64-hvf  --//bazel/rules:uni_runner=hvf
-
-build:aarch64-qemu --platforms=//bazel/platforms:aarch64_unikernel
-build:aarch64-qemu --//bazel/rules:uni_runner=qemu
-
-build:x86_64-qemu  --platforms=//bazel/platforms:x86_64_unikernel
-build:x86_64-qemu  --//bazel/rules:uni_runner=qemu
-
-build:x86_64-iso   --platforms=//bazel/platforms:x86_64_unikernel
-build:x86_64-iso   --//bazel/rules:uni_runner=iso
-
+# ── Platform-only configs (runner is picked per-target, not per-build) ──────
+# `--config=aarch64-macos` / `--config=x86_64-linux` are host-platform
+# overrides for multi-arch dev boxes / remote CI. They don't pick a
+# runner; that's the variant target's job. `bazel build :webserver_hvf`
+# runs fine under any host-platform default because the variant's
+# transition pins the guest platform internally.
 build:aarch64-macos --platforms=//bazel/platforms:aarch64_macos
 build:x86_64-linux  --platforms=//bazel/platforms:x86_64_linux
 
 # ── Fallback default (overridden by .bazelrc.local on dev machines) ───────────
 # setup-dev.sh generates .bazelrc.local; on Apple Silicon it sets:
 #   build --platforms=//bazel/platforms:aarch64_macos  (native, no VM)
-#   build:native  --platforms=//bazel/platforms:aarch64_macos
-#   build:qemu    --platforms=//bazel/platforms:aarch64_unikernel
 # On a fresh checkout without .bazelrc.local, x86_64 unikernel is the default.
 build --platforms=//bazel/platforms:x86_64_unikernel
 

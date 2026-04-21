@@ -2,6 +2,7 @@ load("@rules_python//python:defs.bzl", "py_test")
 load("@rules_rust//rust:defs.bzl", "rust_library")
 load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 load("//bazel/rules:unikernel.bzl", "unikernel_binary")
+load("//bazel/rules:variants.bzl", "unikernel_app_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -20,20 +21,18 @@ unikernel_binary(
     app = ":app",
 )
 
-py_test(
+# SMP boot + IPI test — QEMU-only (needs `-smp 4`; HVF's
+# single-NUMA Hypervisor.framework path isn't wired up for this app).
+unikernel_app_test(
     name = "test",
-    timeout = "long",
+    app_base = "test_smp",
+    test_rule = py_test,
     srcs = ["test.py"],
     deps = ["//scripts:test_helpers"],
-    data = select({
-        "//bazel/platforms:runner_qemu": [
-            ":test_smp.elf",
-            ":test_smp.img",
-        ],
-        "//conditions:default": [],
-    }),
+    variants = ["qemu_aarch64", "qemu_x86_64"],
     tags = [
         "exclusive",
         "local",
     ],
+    timeout = "long",
 )

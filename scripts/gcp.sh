@@ -164,13 +164,13 @@ NET
 }
 
 _build() {
-    echo "==> Building webserver.elf..."
+    echo "==> Building :webserver_qemu_x86_64..."
     cd "$PROJECT_ROOT"
-    bazel build --config=x86_64-qemu //apps/webserver:webserver.elf
+    bazel build //apps/webserver:webserver_qemu_x86_64
 }
 
 _push() {
-    local elf="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver.elf"
+    local elf="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver_qemu_x86_64.elf"
     echo "==> Copying image to GCP..."
     cat "$elf" | ssh "$SSH_HOST" "cat > ~/webserver.elf"
 }

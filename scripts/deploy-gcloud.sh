@@ -73,13 +73,14 @@ _require_project() {
 # GCE expects a tarball containing a single file named exactly "disk.raw"
 # at the tar root, sized to a whole number of GB (>= 1 GB).
 build_disk() {
-    echo "==> Building //apps/webserver:webserver.iso (x86_64) ..."
+    echo "==> Building //apps/webserver:webserver_iso ..."
     cd "$PROJECT_ROOT"
-    # --config=x86_64-iso overrides .bazelrc.local's default platform,
-    # which on arm64 dev hosts would otherwise produce an aarch64 ISO
-    # that GCE's x86 machine types can't boot.
-    bazel build --config=x86_64-iso //apps/webserver:webserver.iso
-    local iso="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver.iso"
+    # `:webserver_iso` is the x86_64 ISO variant — its transition
+    # pins `platforms = x86_64_unikernel` regardless of the host
+    # default, so arm64 dev hosts still produce an x86 ISO that
+    # GCE's x86 machine types can boot.
+    bazel build //apps/webserver:webserver_iso
+    local iso="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver_iso.iso"
     [ -f "$iso" ] || { echo "ERROR: ISO not produced: $iso" >&2; exit 1; }
 
     rm -rf "$WORKDIR"

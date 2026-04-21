@@ -1,168 +1,447 @@
 """Per-runner variant targets for unikernel apps.
 
-For each `unikernel_binary(name, app)` — declared via the sibling
-`unikernel_variants(name, app)` macro — this file produces one
-runnable `:<name>_<variant>` target per supported runner.
+For each `unikernel_binary(name, app)` declaration, this file
+produces one runnable `:<name>_<variant>` target per supported
+runner, plus a sibling `unikernel_app_test(name, app_base, test_rule,
+...)` macro that fans a test target out across the same variant
+list. Adding a new variant is a single edit to `_VARIANT_SPECS`
+below; every app + app-test picks it up automatically.
 
-Each variant wraps the shared `:<name>` sh_binary launcher under a
-Bazel transition that pins the matching target platform + runner
-selection + `-Cpanic=abort` for the variant's dep sub-graph. `bazel
-run //apps/webserver:webserver_hvf` is a drop-in for
-`bazel run --config=hvf //apps/webserver:webserver`, but because the
-transition is a per-target attribute (not a whole-build flag) the
-analysis cache is preserved across variants — `bazel test //...`
-can cover the full runner matrix in one invocation without
-invalidating the other runners' artifacts.
+Each variant rule transitions its target-side deps (ELF / IMG / ISO)
+into the matching platform + `uni_runner` + `-Cpanic=abort` sub-
+configuration, symlinks them into the rule's own output directory
+under filenames that encode the variant name, and template-expands
+a per-variant launcher script with those filenames baked in. Net
+effect:
 
-Variants produced:
+  * Every runfile the launcher touches lives in its own directory —
+    no upward-walk, no suffix-stripping, no `basename $0` parsing.
+  * Switching runners keeps the analysis cache warm — `bazel build
+    :webserver_hvf :webserver_iso` resolves both in one go.
+  * `bazel test //...` covers the full runner matrix without
+    `--config=` flag gymnastics. HVF variants carry
+    `target_compatible_with = [@platforms//os:macos]` so they
+    auto-skip on Linux; every other variant runs anywhere QEMU is
+    available.
+
+Variants produced (names & platform compat defined in _VARIANT_SPECS):
   * `:<name>_hvf`          — aarch64 unikernel + native HVF runner.
   * `:<name>_iso`          — x86_64 unikernel + Limine ISO in QEMU.
   * `:<name>_qemu_aarch64` — aarch64 unikernel + QEMU TCG.
   * `:<name>_qemu_x86_64`  — x86_64 unikernel + QEMU TCG.
 
-(Native builds already have a dedicated `:<name>_native` produced
-by `unikernel_binary` — a rust_binary, not a launcher — so they
-need no wrapping.)
-
-The old `:<name>` launcher stays as-is for now — variants are
-additive so existing `bazel run --config=hvf //...` workflows keep
-working during the migration.
+(Native is already covered by `unikernel_binary`'s `:<name>_native`
+rust_binary — a direct host executable, no launcher script required.)
 """
 
-# Transitions that flip the sub-graph into each variant's config.
-# Outputs:
-#   * `//command_line_option:platforms` — target platform (unikernel
-#                                         arch variant; native omitted).
-#   * `//bazel/rules:uni_runner`        — `hvf` / `iso` / `qemu` / `native`
-#                                         string_flag driving the
-#                                         unikernel_binary launcher's
-#                                         select()s on runner.
-#   * `@rules_rust//:extra_rustc_flag`  — `-Cpanic=abort` so under the
-#                                         `test` verb (which sets
-#                                         panic=unwind globally) the
-#                                         unikernel rlibs still compile.
-#   * `//bazel/rules:tests_need_std`    — False so `atomic_fn`'s feature-
-#                                         gated no_std stays on.
+# ── Transitions ────────────────────────────────────────────────────────────
 #
-# One transition per variant (Starlark doesn't allow closure-generated
-# transitions at load time), factored via `_make_variant_transition`.
+# Each transition flips the same four keys:
+#
+#   * `//command_line_option:platforms` — target platform.
+#   * `//bazel/rules:uni_runner`        — string_flag driving runner
+#                                         config_settings.
+#   * `@rules_rust//:extra_rustc_flag`  — `-Cpanic=abort` (overrides
+#                                         the `test`-verb unwind).
+#   * `//bazel/rules:tests_need_std`    — False so atomic_fn stays
+#                                         no_std inside the sub-graph.
+#
+# Starlark requires `transition()` at .bzl load time, so we build the
+# four concrete objects here via the shared helper and reference them
+# from _VARIANT_SPECS below.
 
 def _make_variant_transition(platform, uni_runner):
     def _impl(_settings, _attr):
-        out = {
+        return {
+            "//command_line_option:platforms": platform,
             "//bazel/rules:uni_runner": uni_runner,
             "@rules_rust//:extra_rustc_flag": ["-Cpanic=abort"],
             "//bazel/rules:tests_need_std": False,
         }
-        if platform:
-            out["//command_line_option:platforms"] = platform
-        return out
-
-    outputs = [
-        "//bazel/rules:uni_runner",
-        "@rules_rust//:extra_rustc_flag",
-        "//bazel/rules:tests_need_std",
-    ]
-    if platform:
-        outputs.append("//command_line_option:platforms")
 
     return transition(
         implementation = _impl,
         inputs = [],
-        outputs = outputs,
+        outputs = [
+            "//command_line_option:platforms",
+            "//bazel/rules:uni_runner",
+            "@rules_rust//:extra_rustc_flag",
+            "//bazel/rules:tests_need_std",
+        ],
     )
 
 _hvf_transition = _make_variant_transition(
     platform = "//bazel/platforms:aarch64_unikernel",
     uni_runner = "hvf",
 )
-
 _iso_transition = _make_variant_transition(
     platform = "//bazel/platforms:x86_64_unikernel",
     uni_runner = "iso",
 )
-
 _qemu_aarch64_transition = _make_variant_transition(
     platform = "//bazel/platforms:aarch64_unikernel",
     uni_runner = "qemu",
 )
-
 _qemu_x86_64_transition = _make_variant_transition(
     platform = "//bazel/platforms:x86_64_unikernel",
     uni_runner = "qemu",
 )
 
+# ── Variant rule helpers ───────────────────────────────────────────────────
 
-# Wrapper rule: exposes the transitioned `src` as a new executable
-# target with this rule's name. A symlink in the rule's output
-# directory gives Bazel an executable to hand to `bazel run`, and
-# the src's runfiles (the .img / .elf / .iso + helpers.sh) are
-# preserved — so the runner script (sitting next to the symlink in
-# the runfiles tree) finds its sibling artefacts via $0's directory,
-# exactly as it does today under `--config=<runner>`.
-#
-# One rule per variant because Starlark transitions are attr-cfg, not
-# parameterised at rule-build time.
-def _variant_impl(ctx):
-    src = ctx.attr.src[0]  # `cfg = transition` makes `src` a 1-list
-    src_exe = src[DefaultInfo].files_to_run.executable
+def _symlink_into_outdir(ctx, src_file, out_name):
+    """Declare an output named `out_name` and symlink `src_file` to it."""
+    out = ctx.actions.declare_file(out_name)
+    ctx.actions.symlink(output = out, target_file = src_file)
+    return out
 
-    # Symlink the transitioned src's executable to a file named after
-    # this rule. `basename $0` in the runner script will be e.g.
-    # `webserver_hvf`; the script strips the `_<variant>` suffix to
-    # locate sibling artefacts (which keep the original `<name>.img`
-    # naming from the underlying unikernel_binary).
+def _expand_launcher(ctx, substitutions):
+    """Expand the rule's `_template` attr to a named-after-target executable."""
     out = ctx.actions.declare_file(ctx.label.name)
-    ctx.actions.symlink(output = out, target_file = src_exe, is_executable = True)
+    ctx.actions.expand_template(
+        template = ctx.file._template,
+        output = out,
+        substitutions = substitutions,
+        is_executable = True,
+    )
+    return out
 
+def _relpath_from_launcher_to(ctx, target_file):
+    """Return `$SELF_DIR`-relative path from launcher to `target_file`.
+
+    The launcher is declared at `<package>/<name>` in runfiles; its
+    runtime `$SELF_DIR` is the package directory. To reach a file at
+    `target_file.short_path`, we walk up `package_depth` levels to
+    the runfiles root and then down via `short_path`. Lets us
+    reference shared runfiles (e.g. `//scripts:helpers.sh`) without
+    symlinking a per-variant copy next to the launcher.
+    """
+    package_depth = ctx.label.package.count("/") + 1 if ctx.label.package else 0
+    return ("../" * package_depth) + target_file.short_path
+
+# Per-variant rule implementations. Each takes exactly the attrs its
+# runner script consumes, symlinks them into co-located files, and
+# returns a launcher that references them by fixed `%TOKEN%` names.
+#
+# Note on `ctx.attr.X` vs `ctx.attr.X[0]`: attrs declared with
+# `cfg = <some_transition>` resolve to a *list* (one Target per
+# output config — even when, as here, the transition is single-
+# valued), so they need the `[0]` dereference. Attrs without `cfg`
+# resolve to a plain Target. Mixing both in the same impl is a
+# paper-cut but idiomatic for Bazel.
+
+def _hvf_impl(ctx):
+    img = _symlink_into_outdir(
+        ctx,
+        ctx.attr.img[0][DefaultInfo].files.to_list()[0],
+        ctx.label.name + ".img",
+    )
+    # `hvf_runner` is a host-cfg label (no [0], no transition); consume
+    # it from its natural runfiles path via a launcher-relative path,
+    # same pattern used for `helpers.sh` in the iso / qemu variants.
+    runner = ctx.attr.hvf_runner[DefaultInfo].files.to_list()[0]
+    launcher = _expand_launcher(ctx, {
+        "%IMG%": img.basename,
+        "%RUNNER%": _relpath_from_launcher_to(ctx, runner),
+    })
     return [DefaultInfo(
-        executable = out,
-        runfiles = src[DefaultInfo].default_runfiles,
+        executable = launcher,
+        runfiles = ctx.runfiles(files = [launcher, img, runner]),
     )]
 
-def _make_variant_rule(variant_transition):
-    return rule(
-        implementation = _variant_impl,
-        executable = True,
-        attrs = {
-            "src": attr.label(
-                cfg = variant_transition,
-                executable = True,
-                mandatory = True,
-                doc = "The base unikernel sh_binary launcher to wrap.",
-            ),
-            "_allowlist_function_transition": attr.label(
-                default = "@bazel_tools//tools/allowlists/function_transition_allowlist",
-            ),
-        },
+def _iso_impl(ctx):
+    iso = _symlink_into_outdir(
+        ctx,
+        ctx.attr.iso[0][DefaultInfo].files.to_list()[0],
+        ctx.label.name + ".iso",
     )
+    launcher = _expand_launcher(ctx, {
+        "%ISO%": iso.basename,
+        "%HELPERS%": _relpath_from_launcher_to(ctx, ctx.file.helpers),
+    })
+    return [DefaultInfo(
+        executable = launcher,
+        runfiles = ctx.runfiles(files = [launcher, iso, ctx.file.helpers]),
+    )]
 
-_hvf_variant = _make_variant_rule(_hvf_transition)
-_iso_variant = _make_variant_rule(_iso_transition)
-_qemu_aarch64_variant = _make_variant_rule(_qemu_aarch64_transition)
-_qemu_x86_64_variant = _make_variant_rule(_qemu_x86_64_transition)
+def _qemu_impl(ctx):
+    # Both .elf and .img ship together: x86_64 QEMU reads the ELF
+    # directly via `-kernel`, aarch64 QEMU needs the raw .img (the
+    # ELF is PIE and QEMU can't load it). `detect_qemu()` in
+    # scripts/test_helpers.py derives the .img path from the .elf
+    # path via `with_suffix(".img")`; keeping them co-located with
+    # matching basenames satisfies both code paths.
+    elf = _symlink_into_outdir(
+        ctx,
+        ctx.attr.elf[0][DefaultInfo].files.to_list()[0],
+        ctx.label.name + ".elf",
+    )
+    img = _symlink_into_outdir(
+        ctx,
+        ctx.attr.img[0][DefaultInfo].files.to_list()[0],
+        ctx.label.name + ".img",
+    )
+    launcher = _expand_launcher(ctx, {
+        "%ELF%": elf.basename,
+        "%HELPERS%": _relpath_from_launcher_to(ctx, ctx.file.helpers),
+    })
+    return [DefaultInfo(
+        executable = launcher,
+        runfiles = ctx.runfiles(files = [launcher, elf, img, ctx.file.helpers]),
+    )]
 
-def unikernel_variants(src, visibility = None):
-    """Generate `:<src>_<variant>` runnable targets for every runner.
+_ALLOWLIST_ATTR = {
+    "_allowlist_function_transition": attr.label(
+        default = "@bazel_tools//tools/allowlists/function_transition_allowlist",
+    ),
+}
 
-    Each variant's transition re-builds `src`'s sub-graph under the
-    matching platform + runner, so all variants share declaration
-    but land in independent configurations. Variant names are
-    derived from `src`'s target name — e.g. `src = ":webserver"`
-    yields `:webserver_hvf`, `:webserver_iso`, etc.
+# `_HELPERS_ATTR` is shared by every variant rule whose launcher sources
+# //scripts:helpers.sh (iso + qemu_*). HVF doesn't — its launcher just
+# `exec`s the HVF runner directly.
+_HELPERS_ATTR = {
+    "helpers": attr.label(
+        default = "//scripts:helpers.sh",
+        allow_single_file = True,
+    ),
+}
 
-    Unconventionally no `name` argument: the macro generates
-    multiple targets with distinct derived names, so a `name` would
-    either shadow the underlying target (tripping buildifier's
-    duplicated-name check) or force the caller to repeat `src`.
+def _build_variant_rule(impl, template, extra_attrs):
+    """Build a variant rule with the common plumbing baked in.
+
+    All variant rules share: executable=True, the function_transition
+    allowlist, and a `_template` attr. They differ in their impl,
+    their launcher template, and which label attrs they expose
+    (what goes through the transition, what's host-cfg, what's a
+    shared helper, …).
 
     Args:
-      src: unified launcher target (the `:<name>` produced by
-        `unikernel_binary`).
+      impl: Starlark impl function for the rule.
+      template: launcher template label (e.g. run_hvf.sh.tmpl).
+      extra_attrs: dict of variant-specific attr.* declarations.
+    """
+    return rule(
+        implementation = impl,
+        executable = True,
+        attrs = dict(
+            _ALLOWLIST_ATTR,
+            _template = attr.label(default = template, allow_single_file = True),
+            **extra_attrs
+        ),
+    )
+
+_hvf_variant = _build_variant_rule(
+    impl = _hvf_impl,
+    template = "//bazel/rules:run_hvf.sh.tmpl",
+    extra_attrs = {
+        "img": attr.label(
+            cfg = _hvf_transition,
+            mandatory = True,
+            doc = "The <name>.img of the underlying unikernel_binary (transitioned).",
+        ),
+        "hvf_runner": attr.label(
+            mandatory = True,
+            doc = "Host-platform HVF runner binary (built in outer config).",
+        ),
+    },
+)
+
+_iso_variant = _build_variant_rule(
+    impl = _iso_impl,
+    template = "//bazel/rules:run_iso.sh.tmpl",
+    extra_attrs = dict(_HELPERS_ATTR, **{
+        "iso": attr.label(
+            cfg = _iso_transition,
+            mandatory = True,
+            doc = "The <name>.iso of the underlying unikernel_binary (transitioned).",
+        ),
+    }),
+)
+
+def _make_qemu_variant(variant_transition):
+    return _build_variant_rule(
+        impl = _qemu_impl,
+        template = "//bazel/rules:run_qemu.sh.tmpl",
+        extra_attrs = dict(_HELPERS_ATTR, **{
+            "elf": attr.label(
+                cfg = variant_transition,
+                mandatory = True,
+                doc = "The <name>.elf of the underlying unikernel_binary (transitioned).",
+            ),
+            "img": attr.label(
+                cfg = variant_transition,
+                mandatory = True,
+                doc = "The <name>.img of the underlying unikernel_binary (transitioned).",
+            ),
+        }),
+    )
+
+_qemu_aarch64_variant = _make_qemu_variant(_qemu_aarch64_transition)
+_qemu_x86_64_variant = _make_qemu_variant(_qemu_x86_64_transition)
+
+# ── Variant specs — single source of truth ───────────────────────────────
+#
+# Each spec wires a suffix ("hvf", "iso", "qemu_<arch>") to:
+#   * `rule_fn`           — the Starlark rule function that
+#                           instantiates the variant target.
+#   * `src_attrs`         — attrs to fill from the app's package
+#                           (e.g. `{"img": ".img"}` → `:<base>.img`).
+#   * `host_attrs`        — attrs that are plain host labels, not
+#                           derived from `base` (e.g. the hvf_runner).
+#   * `host_compat`       — the `target_compatible_with` the variant
+#                           executable carries. `bazel test //...`
+#                           auto-skips variants the current host
+#                           doesn't satisfy (hvf → macOS only;
+#                           qemu_* and iso run anywhere with QEMU).
+#   * `in_default_test_set` — whether `unikernel_app_test` includes
+#                             this variant when the caller doesn't
+#                             pass an explicit `variants = [...]`.
+
+_VARIANT_SPECS = [
+    struct(
+        suffix = "hvf",
+        rule_fn = _hvf_variant,
+        src_attrs = {"img": ".img"},
+        host_attrs = {"hvf_runner": "//tools/hvf-runner:run_hvf"},
+        host_compat = ["@platforms//os:macos"],  # Hypervisor.framework.
+        in_default_test_set = True,
+    ),
+    struct(
+        suffix = "iso",
+        rule_fn = _iso_variant,
+        src_attrs = {"iso": ".iso"},
+        host_attrs = {},
+        host_compat = [],  # QEMU x86_64 TCG runs anywhere.
+        # Excluded from the default test set: the guest code under
+        # test is identical to the QEMU variants (same app binary),
+        # and we already exercise Limine boot at binary-build time.
+        # Apps that want ISO test coverage opt in via
+        # `variants = [..., "iso"]`.
+        in_default_test_set = False,
+    ),
+    struct(
+        suffix = "qemu_aarch64",
+        rule_fn = _qemu_aarch64_variant,
+        src_attrs = {"elf": ".elf", "img": ".img"},
+        host_attrs = {},
+        host_compat = [],
+        in_default_test_set = True,
+    ),
+    struct(
+        suffix = "qemu_x86_64",
+        rule_fn = _qemu_x86_64_variant,
+        src_attrs = {"elf": ".elf", "img": ".img"},
+        host_attrs = {},
+        host_compat = [],
+        in_default_test_set = True,
+    ),
+]
+
+_SUFFIX_TO_SPEC = {spec.suffix: spec for spec in _VARIANT_SPECS}
+_ALL_VARIANT_SUFFIXES = tuple([v.suffix for v in _VARIANT_SPECS])
+_DEFAULT_TEST_VARIANT_SUFFIXES = tuple([
+    v.suffix for v in _VARIANT_SPECS if v.in_default_test_set
+])
+
+def _instantiate_variant(spec, name, base, visibility):
+    """Invoke `spec.rule_fn` with attrs derived from `spec` + `base`."""
+    kwargs = {}
+    for attr_name, suffix in spec.src_attrs.items():
+        kwargs[attr_name] = ":" + base + suffix
+    for attr_name, label in spec.host_attrs.items():
+        kwargs[attr_name] = label
+    spec.rule_fn(
+        name = name,
+        target_compatible_with = spec.host_compat,
+        visibility = visibility,
+        **kwargs
+    )
+
+# ── Public macros ─────────────────────────────────────────────────────────
+
+# buildifier: disable=unnamed-macro
+def unikernel_variants(name, visibility = None):
+    """Generate `:<name>_<variant>` runnable targets for every runner in _VARIANT_SPECS.
+
+    Called from `unikernel_binary` after the artefact targets are
+    declared (`:<name>.img` / `:<name>.elf` / `:<name>.iso` must
+    exist in the same package).
+
+    `name` is a prefix for the generated targets, not a target of
+    its own — the underlying unikernel_binary intentionally does
+    not expose a unified `:<name>` launcher.
+
+    Args:
+      name: target-name prefix (matches the enclosing unikernel_binary).
       visibility: Bazel visibility for the generated variants.
     """
-    base = src.rsplit(":", 1)[-1] if ":" in src else src.rsplit("/", 1)[-1]
-    _hvf_variant(name = base + "_hvf", src = src, visibility = visibility)
-    _iso_variant(name = base + "_iso", src = src, visibility = visibility)
-    _qemu_aarch64_variant(name = base + "_qemu_aarch64", src = src, visibility = visibility)
-    _qemu_x86_64_variant(name = base + "_qemu_x86_64", src = src, visibility = visibility)
+    for spec in _VARIANT_SPECS:
+        _instantiate_variant(spec, name + "_" + spec.suffix, name, visibility)
+
+def unikernel_app_test(name, app_base, test_rule, extra_data = None, variants = None, **kwargs):
+    """Generate `:<name>_<variant>` test targets for every requested runner.
+
+    For each variant produced by `unikernel_variants(name = app_base)`,
+    instantiate `test_rule` with the variant target added as a data
+    dep and `LAUNCHER_NAME` set in the test env so the test script
+    can resolve the variant's co-located runfiles.
+
+    The macro is `test_rule`-agnostic so callers are free to use
+    py_test today and (say) a custom rule tomorrow — every current
+    app happens to use py_test but nothing here assumes it.
+
+    Each generated test target is tagged with its variant suffix
+    (`hvf`, `qemu_aarch64`, …) so users can filter the matrix via
+    `bazel test --test_tag_filters=hvf //...` (all HVF tests) or
+    `--test_tag_filters=qemu_aarch64 //...` (only aarch64 QEMU).
+
+    Args:
+      name: base name for the test targets (`:<name>_<variant>`).
+      app_base: name passed to the app's `unikernel_binary` —
+        the variant targets it generated are `:<app_base>_<variant>`.
+      test_rule: test-rule function to instantiate (e.g. py_test,
+        sh_test). Caller loads + passes it in directly.
+      extra_data: additional data files the test needs besides the
+        variant target (e.g. dev certs).
+      variants: subset of variant suffixes to fan out across; omit
+        for the default set (every variant except `iso`, since ISO
+        tests the same guest code as QEMU with a different boot
+        sequence). Tests that want ISO coverage or narrower cuts
+        pass an explicit list.
+      **kwargs: forwarded to every test_rule call (`srcs`, `deps`,
+        `tags`, `timeout`, …). `target_compatible_with` is reserved
+        — the macro sets it from the variant spec, so passing it in
+        `kwargs` is an error.
+    """
+    if "target_compatible_with" in kwargs:
+        fail("unikernel_app_test: `target_compatible_with` is set per-variant " +
+             "from `host_compat` in variants.bzl; drop it from your call.")
+
+    # Default `main` from `srcs[0]` if the caller didn't pass one
+    # explicitly. Saves every BUILD file from repeating `main =
+    # srcs[0]` boilerplate.
+    if "srcs" in kwargs and "main" not in kwargs:
+        kwargs["main"] = kwargs["srcs"][0]
+
+    selected = variants if variants != None else _DEFAULT_TEST_VARIANT_SUFFIXES
+    for suffix in selected:
+        if suffix not in _SUFFIX_TO_SPEC:
+            fail("unikernel_app_test: unknown variant '{}' (known: {})".format(
+                suffix,
+                ", ".join(_ALL_VARIANT_SUFFIXES),
+            ))
+        spec = _SUFFIX_TO_SPEC[suffix]
+        launcher_name = app_base + "_" + suffix
+        # Append the variant suffix as a test tag so users can filter
+        # the matrix via `--test_tag_filters=hvf` (all HVF tests across
+        # every app), `--test_tag_filters=qemu_aarch64`, etc. Caller-
+        # supplied tags are preserved.
+        variant_tags = list(kwargs.pop("tags", [])) + [suffix]
+        test_rule(
+            name = name + "_" + suffix,
+            data = [":" + launcher_name] + (extra_data or []),
+            env = {"LAUNCHER_NAME": launcher_name},
+            target_compatible_with = spec.host_compat,
+            tags = variant_tags,
+            **kwargs
+        )

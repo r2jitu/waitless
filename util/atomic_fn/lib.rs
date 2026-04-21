@@ -43,9 +43,10 @@
 //     `cfg(test)` doesn't fire here — the feature flag does.
 //
 // Either disables `#![no_std]`. Production builds have neither
-// (the flag defaults False, integration_data transitions reset
-// it to False), so `#![no_std]` stays active on the bare-metal
-// side and `panic=abort` is the natural target default.
+// (the flag defaults False, variant-target transitions in
+// //bazel/rules:variants.bzl reset it to False), so `#![no_std]`
+// stays active on the bare-metal side and `panic=abort` is the
+// natural target default.
 #![cfg_attr(all(not(test), not(feature = "std")), no_std)]
 
 use core::marker::PhantomData;

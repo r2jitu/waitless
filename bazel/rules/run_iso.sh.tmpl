@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Generated launcher for the `_iso` variant of a unikernel_binary target.
+# The variant rule symlinks the Limine ISO and the helpers library next
+# to this script under the filenames substituted into %ISO% /
+# %HELPERS%, so every runfile lives in this script's directory.
+#
+# Env:
+#   UNIKERNEL_PORT     — host HTTP port   (default 8080) → guest :80
+#   UNIKERNEL_TLS_PORT — host HTTPS port  (default 8443) → guest :443
+#   UNIKERNEL_UDP_PORT — host UDP port    (default 8007) → guest :7
+#   UNIKERNEL_MEMORY   — guest RAM in MB  (default 128)
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+ISO="$SELF_DIR/%ISO%"
+HELPERS="$SELF_DIR/%HELPERS%"
+# shellcheck disable=SC1090
+source "$HELPERS"
+
+PORT="${UNIKERNEL_PORT:-8080}"
+TLS_PORT="${UNIKERNEL_TLS_PORT:-8443}"
+UDP_PORT="${UNIKERNEL_UDP_PORT:-8007}"
+
+echo "==> http://localhost:${PORT}/"
+echo "==> https://localhost:${TLS_PORT}/  (self-signed dev cert — use curl -k)"
+echo "==> udp  ::${UDP_PORT} → guest :7"
+
+run_qemu "$PORT" "$TLS_PORT" "$UDP_PORT" "${UNIKERNEL_MEMORY:-128}" \
+    -cpu max -cdrom "$ISO"

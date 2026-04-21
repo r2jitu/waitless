@@ -5,7 +5,6 @@ into bootable kernel images using rustc + rust-lld.
 """
 
 load("@rules_rust//rust:defs.bzl", "rust_binary")
-load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
 load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 load("//bazel/rules:variants.bzl", "unikernel_variants")
 
@@ -37,15 +36,18 @@ def unikernel_binary(name, app, visibility = None):
 
     The application is a rust_library with a #[uni::boot] entry point.
 
-    Targets produced:
-      - <name>            : Unified launcher — `bazel run //path:name` picks
-                            the runner from the active platform config
-                            (hvf / qemu / iso / native).
+    Artifact targets produced:
       - <name>.elf        : Bare-metal ELF (QEMU direct boot)
       - <name>.img        : Raw binary (HVF runner / QEMU -kernel on aarch64)
       - <name>.limine.elf : Higher-half ELF (Limine bootloader)
       - <name>.iso        : Limine-bootable ISO (BIOS + UEFI)
-      - <name>_native     : Native POSIX binary (host OS, no VM)
+
+    Runnable targets produced:
+      - <name>_native       : Native POSIX binary (host OS, no VM).
+      - <name>_hvf          : aarch64 unikernel + HVF runner.
+      - <name>_iso          : x86_64 unikernel + Limine ISO in QEMU.
+      - <name>_qemu_aarch64 : aarch64 unikernel + QEMU TCG.
+      - <name>_qemu_x86_64  : x86_64 unikernel + QEMU TCG.
 
     Args:
         name: Base name for all output targets.
@@ -171,36 +173,10 @@ def unikernel_binary(name, app, visibility = None):
         visibility = visibility,
     )
 
-    # ── Unified launcher — the rule's top-level target is itself runnable ───
-    # The run_*.sh scripts find the app's artefacts via $0-relative paths
-    # (they sit next to <name>.elf / <name>.img / <name>.iso / <name>_native
-    # in the runfiles tree), so no env={} substitutions are needed. That
-    # lets :webserver be spawned both via `bazel run` and as a subprocess
-    # from an sh_test that lists :webserver in its `data` — the sh_binary
-    # `env` block is only applied in `bazel run` context and would
-    # therefore be useless for the subprocess path.
-    sh_binary(
-        name = name,
-        srcs = select({
-            "//bazel/platforms:runner_hvf": ["//bazel/rules:run_hvf.sh"],
-            "//bazel/platforms:runner_qemu": ["//bazel/rules:run_qemu.sh"],
-            "//bazel/platforms:runner_iso": ["//bazel/rules:run_iso.sh"],
-            "//conditions:default": ["//bazel/rules:run_native.sh"],
-        }),
-        data = ["//scripts:helpers.sh"] + select({
-            "//bazel/platforms:runner_hvf": [":" + name + ".img", "//tools/hvf-runner:run_hvf"],
-            "//bazel/platforms:runner_qemu": [":" + name + ".elf", ":" + name + ".img"],
-            "//bazel/platforms:runner_iso": [":" + name + ".iso"],
-            "//conditions:default": [":" + name + "_native"],
-        }),
-        visibility = visibility,
-    )
-
     # ── Per-runner variants — `:<name>_hvf` / `_iso` / `_qemu_<arch>` ────
-    # Each variant wraps the unified launcher above under a Bazel
-    # transition that pins the matching platform + runner selection +
-    # `-Cpanic=abort`. `bazel run :<name>_hvf` is a drop-in for
-    # `bazel run --config=hvf :<name>` — but without invalidating the
-    # other variants' analysis cache when switching runners, and
-    # `bazel test //...` can cover the full runner matrix in one shot.
-    unikernel_variants(src = ":" + name, visibility = visibility)
+    # Each variant is a runnable target that transitions its sub-graph
+    # into the matching platform + runner + `-Cpanic=abort` config, so
+    # `bazel run :<name>_hvf` boots the HVF variant, `bazel run
+    # :<name>_iso` boots the Limine ISO, etc. — no `--config=` flag,
+    # analysis cache preserved across variants.
+    unikernel_variants(name = name, visibility = visibility)
