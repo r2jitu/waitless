@@ -8,6 +8,16 @@ exports_files(["limine.conf"])
 # Boot/entry code — rust_static_library targets that provide #[no_mangle]
 # symbols resolved at link time by assembly (kernel_main, limine_entry,
 # memcpy). Separate from the clean kernel library crate.
+#
+# Every target here is unikernel-only (`#![no_std]`, links against boot
+# assembly, has no meaning on a host OS). They carry
+# `target_compatible_with = ["@platforms//os:none"]` so `bazel build
+# //...` on a host platform skips them as incompatible rather than
+# failing to compile no_std code under the host's unwind-friendly
+# defaults. Variant transitions (//bazel/rules:variants.bzl) set the
+# target platform to aarch64/x86_64 _unikernel (both `os:none`), so
+# they compile fine through the variant dep chain.
+_UNIKERNEL_ONLY = ["@platforms//os:none"]
 
 rust_static_library(
     name = "entry",
@@ -25,6 +35,7 @@ rust_static_library(
     }),
     crate_root = "entry.rs",
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    target_compatible_with = _UNIKERNEL_ONLY,
     deps = [
         "//drivers",
         "//kernel",
@@ -42,12 +53,14 @@ rust_static_library(
     srcs = ["boot_asm.rs"],
     compile_data = ["x86_64/boot.S"],
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    target_compatible_with = _UNIKERNEL_ONLY,
 )
 
 rust_static_library(
     name = "limine",
     srcs = ["limine_entry.rs"],
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    target_compatible_with = _UNIKERNEL_ONLY,
     deps = [
         "//kernel",
         "@crates//:limine",
@@ -58,4 +71,5 @@ rust_static_library(
     name = "libc",
     srcs = ["libc.rs"],
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    target_compatible_with = _UNIKERNEL_ONLY,
 )

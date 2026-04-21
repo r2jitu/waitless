@@ -64,6 +64,17 @@ def unikernel_binary(name, app, visibility = None):
     _common_deps = [app, "//boot:entry", "//boot:limine", "//boot:libc"]
     _unikernel_flags = UNIKERNEL_RUSTC_FLAGS + _LINK_FLAGS + _LINK_FLAGS_ARCH
 
+    # Unikernel artefact targets (.elf, .img, .limine.elf, .iso)
+    # are marked `target_compatible_with = ["@platforms//os:none"]`
+    # — they only make sense under a bare-metal target platform, so
+    # `bazel build //...` on a host platform skips them cleanly
+    # rather than failing to compile no_std code / emit unikernel-
+    # specific link sections. Variant transitions
+    # (//bazel/rules:variants.bzl) flip the platform to aarch64 /
+    # x86_64 `_unikernel` (both `os:none`), so the variant dep-chain
+    # (`:<name>_hvf` → `:<name>.img` → `:<name>.elf`) builds fine.
+    _unikernel_only = ["@platforms//os:none"]
+
     # ── Unikernel ELF ────────────────────────────────────────────────────
     rust_binary(
         name = name + ".elf",
@@ -78,6 +89,7 @@ def unikernel_binary(name, app, visibility = None):
             "//conditions:default": "//bazel/toolchain:unikernel.ld",
         }),
         rustc_flags = _unikernel_flags,
+        target_compatible_with = _unikernel_only,
         visibility = visibility,
     )
 
@@ -101,6 +113,7 @@ def unikernel_binary(name, app, visibility = None):
             fi
             $$OC -O binary $(location :{name_elf}) $@
         """.format(name_elf = name + ".elf"),
+        target_compatible_with = _unikernel_only,
         visibility = visibility,
     )
 
@@ -120,6 +133,7 @@ def unikernel_binary(name, app, visibility = None):
         deps = _common_deps,
         linker_script = "//bazel/toolchain:unikernel_limine.ld",
         rustc_flags = _unikernel_flags,
+        target_compatible_with = _unikernel_only,
         visibility = visibility,
     )
 
@@ -151,6 +165,7 @@ def unikernel_binary(name, app, visibility = None):
         }),
         tools = ["//scripts:make_limine_iso"],
         local = True,
+        target_compatible_with = _unikernel_only,
         visibility = visibility,
     )
 
@@ -180,6 +195,16 @@ def unikernel_binary(name, app, visibility = None):
                 "link-arg=-lc",
             ],
         }),
+        # `manual` keeps this out of `//...` wildcard expansion.
+        # Without it, `bazel test //...` tries to build `_native_bin`
+        # directly under the outer test-verb config (panic=unwind),
+        # which fails against its no_std transitive deps. The variant
+        # wrapper in `//bazel/rules:variants.bzl` reaches it via an
+        # explicit `cfg = _native_transition` label attr that resets
+        # panic=abort — that path (`//...` → `:<name>_native` →
+        # transition → `:<name>_native_bin`) exercises full compile +
+        # link, so real errors aren't hidden.
+        tags = ["manual"],
         target_compatible_with = ["//bazel/platforms:native"],
         visibility = visibility,
     )

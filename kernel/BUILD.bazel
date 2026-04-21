@@ -40,6 +40,13 @@ rust_library(
         "//conditions:default": [],
     }),
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    # Unikernel-only: links against MMU / APIC / IDT / boot-section
+    # code that only makes sense under a bare-metal target. Host
+    # compilation hits mach-o-unfriendly `#[link_section = ".boot_bss"]`
+    # annotations. The rust_tests below are independent — they
+    # `srcs = [...]` specific files directly and don't depend on this
+    # library.
+    target_compatible_with = ["@platforms//os:none"],
     deps = [
         "//util/atomic_fn",
         "@crates//:chacha20",
