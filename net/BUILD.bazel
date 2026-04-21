@@ -50,10 +50,19 @@ rust_library(
     deps = ["//util/atomic_fn"],
 )
 
+# `crate = ":protocol"` would rebuild `protocol` with `--test` and
+# the production `:atomic_fn` rlib. The rlib is panic=abort and the
+# test binary is panic=unwind — linker rejects. `srcs =
+# ["protocol.rs"]` with an explicit `:atomic_fn_unwind` dep
+# side-steps the issue: the test binary rebuilds protocol.rs
+# against a panic=unwind variant of the same `atomic_fn` crate
+# (same `crate_name`, different `rustc_flags`). No inline shim.
 rust_test(
     name = "protocol_test",
-    crate = ":protocol",
+    srcs = ["protocol.rs"],
+    crate_root = "protocol.rs",
     rustc_flags = HOST_TEST_RUSTC_FLAGS,
+    deps = ["//util/atomic_fn:atomic_fn_unwind"],
 )
 
 # Protocol parsing tests — host-native, tests raw byte parsing for all protocols.

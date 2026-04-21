@@ -27,60 +27,13 @@
 
 // `atomic_fn` is the shared leaf crate that provides `AtomicFn<F>`
 // (also used by `kernel::sync` and `uni/lib.rs`'s native backend).
-// Gated `cfg(not(test))` because the `//net:protocol_test` rust_test
-// rebuilds this crate with panic=unwind, while `atomic_fn` ships
-// panic=abort; mixing the two fails to link. The test path picks up
-// a local `AtomicFn` shim below with the same API — small duplication,
-// but keeps Registry-specific coverage alive without the
-// Bazel-per-dep build variants that proper solution would need.
-#[cfg(not(test))]
+// `//net:protocol_test` depends on `//util/atomic_fn:atomic_fn_unwind`
+// instead of the default `:atomic_fn` rlib — same crate name, same
+// source, but rebuilt with `panic=unwind` to match the test harness.
+// See the comment on `:atomic_fn_unwind` for why two variants exist.
 extern crate atomic_fn;
-#[cfg(not(test))]
+
 use atomic_fn::AtomicFn;
-
-#[cfg(test)]
-use test_shim::AtomicFn;
-
-#[cfg(test)]
-mod test_shim {
-    //! Test-only copy of `atomic_fn::AtomicFn` — see the comment at
-    //! the top of this file for why it's here. Mirrors the
-    //! production API shape so the rest of the file is cfg-agnostic.
-    use core::marker::PhantomData;
-    use core::sync::atomic::{AtomicUsize, Ordering};
-
-    pub struct AtomicFn<F: Copy> {
-        bits: AtomicUsize,
-        _phantom: PhantomData<fn() -> F>,
-    }
-
-    unsafe impl<F: Copy> Send for AtomicFn<F> {}
-    unsafe impl<F: Copy> Sync for AtomicFn<F> {}
-
-    impl<F: Copy> AtomicFn<F> {
-        pub const fn null() -> Self {
-            AtomicFn { bits: AtomicUsize::new(0), _phantom: PhantomData }
-        }
-        pub fn store(&self, f: F) {
-            let bits: usize = unsafe { core::mem::transmute_copy(&f) };
-            self.bits.store(bits, Ordering::Release);
-        }
-        pub fn load(&self) -> Option<F> {
-            let bits = self.bits.load(Ordering::Acquire);
-            if bits == 0 {
-                None
-            } else {
-                Some(unsafe { core::mem::transmute_copy(&bits) })
-            }
-        }
-        pub fn clear(&self) {
-            self.bits.store(0, Ordering::Release);
-        }
-        pub fn is_some(&self) -> bool {
-            self.bits.load(Ordering::Acquire) != 0
-        }
-    }
-}
 
 /// IPv4 protocol number for TCP (RFC 793).
 pub const PROTO_TCP: u8 = 6;

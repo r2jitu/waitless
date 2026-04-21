@@ -16,7 +16,7 @@ UNIKERNEL_RUSTC_FLAGS = select({
 # harness can catch assertion panics. Every rust_test in the repo
 # sets this via `rustc_flags = HOST_TEST_RUSTC_FLAGS`.
 #
-# Why we can't move this to `.bazelrc`:
+# Why it can't move to `.bazelrc`:
 #
 #   * A global `build --extra_rustc_flag=-Cpanic=unwind` would apply
 #     to every crate, including our `#![no_std]` libraries. Rustc
@@ -34,15 +34,14 @@ UNIKERNEL_RUSTC_FLAGS = select({
 #     (Cargo auto-does this — see the Cargo book's profiles page
 #     under "Test profile" — but Bazel's equivalent is not there).
 #
-#   * `#![cfg_attr(not(test), no_std)]` lets an individual crate
-#     flip to std when built as its own test, but when a rust_test
-#     on crate A links rlib B built as no_std + panic=abort, the
-#     linker still rejects the combination. Workaround: inline
-#     cfg(test) shim of the dep's type (see `net/protocol.rs`).
-#
-# Every OSS Bazel/rust_no_std project lands on the same per-target
-# flag pattern. Landing a custom Bazel transition to rebuild test
-# deps with panic=unwind is possible but substantial Starlark work
-# and outside the scope of the init-redesign plan. Revisit if/when
-# the shim count grows beyond a single site.
+# For the dep-chain variant of this problem — a `rust_test` with
+# `crate = ":foo"` rebuilding `foo` with panic=unwind but linking
+# against a library dep compiled panic=abort — the pattern is to
+# declare a sibling `rust_library` of the dep with the same
+# `crate_name` but `rustc_flags = HOST_TEST_RUSTC_FLAGS`. See
+# `//util:atomic_fn` / `:atomic_fn_unwind` and the `//net:protocol_test`
+# that depends on the unwind variant. Multi-target-per-source is
+# ugly but contained — we'd need a full Bazel transition to drop
+# it, which is substantial Starlark outside the init-redesign
+# plan's scope.
 HOST_TEST_RUSTC_FLAGS = ["-Cpanic=unwind"]

@@ -23,6 +23,27 @@ rust_library(
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
 )
 
+# panic=unwind variant of the same source, for `rust_test` targets
+# that `crate = ":foo"` a library whose deps transitively include
+# `atomic_fn`. Without this, the test binary is built
+# `panic=unwind` but the library's deps are `panic=abort` and
+# rustc refuses to link them ("crate `atomic_fn` requires panic
+# strategy `abort` which is incompatible…"). Two library targets
+# with the same `crate_name` but different `rustc_flags` give us
+# per-consumer panic-strategy selection.
+#
+# Downstream `rust_test` targets depend on `:atomic_fn_unwind`
+# directly (replacing `:atomic_fn` in their dep list); the
+# production `rust_library` / unikernel-binary graph still uses
+# `:atomic_fn`. See `//net:protocol_test`.
+rust_library(
+    name = "atomic_fn_unwind",
+    srcs = ["lib.rs"],
+    crate_name = "atomic_fn",
+    crate_root = "lib.rs",
+    rustc_flags = HOST_TEST_RUSTC_FLAGS,
+)
+
 rust_test(
     name = "atomic_fn_test",
     crate = ":atomic_fn",
