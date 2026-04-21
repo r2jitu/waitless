@@ -21,14 +21,15 @@ unikernel_binary(
     app = ":app",
 )
 
-# Per-core state test — QEMU-only (needs `-smp 4`).
+# Per-core state test. Runs on HVF (real aarch64 hardware) + both
+# QEMU TCG arches. Native excluded (test exercises kernel::percpu).
 unikernel_app_test(
     name = "test",
     app_base = "test_percpu",
     test_rule = py_test,
     srcs = ["test.py"],
     deps = ["//scripts:test_helpers"],
-    variants = ["qemu_aarch64", "qemu_x86_64"],
+    variants = ["hvf", "qemu_aarch64", "qemu_x86_64"],
     tags = [
         "exclusive",
         "local",

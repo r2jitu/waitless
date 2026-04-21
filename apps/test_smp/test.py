@@ -1,21 +1,28 @@
 #!/usr/bin/env python3
 """apps/test_smp/test.py — SMP boot + IPI delivery integration test.
 
-Boots test_smp.elf with 4 vCPUs under QEMU, waits for the app's
-"SMP test complete" marker, then asserts against the serial log:
+Boots the test_smp app with 4 vCPUs, waits for the app's "SMP test
+complete" marker, then asserts against the serial log:
   * All 4 cores come online.
   * Each AP logs its own online message.
   * The app reached main and shut down.
   * The IPI round-trip from core 0 to core 1 succeeded.
+
+Dispatches on `LAUNCHER_NAME`:
+  * `test_smp_hvf`         → run-hvf on the .img (aarch64 real hw).
+  * `test_smp_qemu_<arch>` → spawn_qemu on the .elf (TCG emulation).
 """
 
 from __future__ import annotations
 
 import os
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
 from scripts.test_helpers import (
+    Launcher,
     runfiles_root,
     spawn_qemu,
     wait_for_marker,
@@ -31,21 +38,42 @@ class SmpBootTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        # Each per-variant py_test passes `env = {"LAUNCHER_NAME": "test_smp_qemu_<arch>"}`.
+        # Each per-variant py_test passes `env = {"LAUNCHER_NAME": ...}`.
         # The variant rule symlinks the transitioned .elf + .img as
-        # `<LAUNCHER_NAME>.{elf,img}` alongside the launcher.
+        # `<LAUNCHER_NAME>.{elf,img}` alongside the launcher; the HVF
+        # runner binary lives at its natural `tools/hvf-runner/run-hvf`
+        # runfiles path.
         launcher_name = os.environ["LAUNCHER_NAME"]
-        pkg = runfiles_root() / "apps" / "test_smp"
-        elf = pkg / f"{launcher_name}.elf"
+        root = runfiles_root()
+        pkg = root / "apps" / "test_smp"
         img = pkg / f"{launcher_name}.img"
-        if not elf.is_file():
-            raise unittest.SkipTest(f"{launcher_name}.elf not found at {elf}")
-        cls.launcher = spawn_qemu(
-            elf, img_path=img, cpus=EXPECTED_CPUS, memory_mb=128,
-            log_prefix="test_smp",
-        )
-        if cls.launcher is None:
-            raise unittest.SkipTest("no qemu-system-* on PATH for this ELF")
+        if not img.is_file():
+            raise unittest.SkipTest(f"{launcher_name}.img not found at {img}")
+
+        if launcher_name == "test_smp_hvf":
+            hvf = root / "tools" / "hvf-runner" / "run-hvf"
+            if not (hvf.is_file() and os.access(hvf, os.X_OK)):
+                raise unittest.SkipTest(f"HVF runner not executable: {hvf}")
+            fd, log_path_str = tempfile.mkstemp(prefix="test_smp_hvf_", suffix=".log")
+            os.close(fd)
+            log_path = Path(log_path_str)
+            with open(log_path, "wb") as log_fd:
+                proc = subprocess.Popen(
+                    [str(hvf), str(img),
+                     f"--ram=128", f"--cpus={EXPECTED_CPUS}"],
+                    stdout=log_fd, stderr=log_fd, stdin=subprocess.DEVNULL,
+                )
+            cls.launcher = Launcher(proc=proc, log_path=log_path)
+        else:
+            elf = pkg / f"{launcher_name}.elf"
+            if not elf.is_file():
+                raise unittest.SkipTest(f"{launcher_name}.elf not found at {elf}")
+            cls.launcher = spawn_qemu(
+                elf, img_path=img, cpus=EXPECTED_CPUS, memory_mb=128,
+                log_prefix="test_smp",
+            )
+            if cls.launcher is None:
+                raise unittest.SkipTest("no qemu-system-* on PATH for this ELF")
 
         # The app prints the completion marker then self-shuts-down.
         # 15 s is generous for TCG on a slow host.

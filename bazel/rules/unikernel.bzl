@@ -46,7 +46,8 @@ def unikernel_binary(name, app, visibility = None):
       - <name>_native       : Native POSIX binary (host OS, no VM,
                               declared here directly).
       - <name>_hvf          : aarch64 unikernel + HVF runner.
-      - <name>_iso          : x86_64 unikernel + Limine ISO in QEMU.
+      - <name>_iso_x86_64   : x86_64 unikernel + Limine ISO (cloud boot).
+      - <name>_iso_aarch64  : aarch64 unikernel + Limine ISO (ARM cloud).
       - <name>_qemu_aarch64 : aarch64 unikernel + QEMU TCG.
       - <name>_qemu_x86_64  : x86_64 unikernel + QEMU TCG.
 

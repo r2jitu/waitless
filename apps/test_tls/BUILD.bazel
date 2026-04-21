@@ -24,9 +24,12 @@ unikernel_binary(
 )
 
 # TLS primitives smoke test — drives the handshake / AEAD stack
-# inside a real guest boot, so native (which doesn't boot a guest)
-# is excluded. ISO is also skipped — same crypto code, different
-# boot path (already covered by binary-level ISO builds).
+# inside a real guest boot. The app calls `kernel::rng::fill_bytes`
+# directly, so native is excluded (the kernel RNG is unikernel-only;
+# porting would require a cfg-gated host backend — not worth it for
+# a smoke test that the guest variants already cover). ISO variants
+# are also skipped: same guest code as QEMU, just a different boot
+# path (already validated by the `.iso` genrule building cleanly).
 unikernel_app_test(
     name = "test",
     app_base = "test_tls",

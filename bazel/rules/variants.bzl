@@ -26,7 +26,8 @@ effect:
 
 Variants produced (names & platform compat defined in _VARIANT_SPECS):
   * `:<name>_hvf`          — aarch64 unikernel + native HVF runner.
-  * `:<name>_iso`          — x86_64 unikernel + Limine ISO in QEMU.
+  * `:<name>_iso_x86_64`   — x86_64 unikernel + Limine ISO (cloud boot).
+  * `:<name>_iso_aarch64`  — aarch64 unikernel + Limine ISO (ARM cloud).
   * `:<name>_qemu_aarch64` — aarch64 unikernel + QEMU TCG.
   * `:<name>_qemu_x86_64`  — x86_64 unikernel + QEMU TCG.
 
@@ -75,8 +76,12 @@ _hvf_transition = _make_variant_transition(
     platform = "//bazel/platforms:aarch64_unikernel",
     uni_runner = "hvf",
 )
-_iso_transition = _make_variant_transition(
+_iso_x86_64_transition = _make_variant_transition(
     platform = "//bazel/platforms:x86_64_unikernel",
+    uni_runner = "iso",
+)
+_iso_aarch64_transition = _make_variant_transition(
+    platform = "//bazel/platforms:aarch64_unikernel",
     uni_runner = "iso",
 )
 _qemu_aarch64_transition = _make_variant_transition(
@@ -249,17 +254,21 @@ _hvf_variant = _build_variant_rule(
     },
 )
 
-_iso_variant = _build_variant_rule(
-    impl = _iso_impl,
-    template = "//bazel/rules:run_iso.sh.tmpl",
-    extra_attrs = dict(_HELPERS_ATTR, **{
-        "iso": attr.label(
-            cfg = _iso_transition,
-            mandatory = True,
-            doc = "The <name>.iso of the underlying unikernel_binary (transitioned).",
-        ),
-    }),
-)
+def _make_iso_variant(variant_transition):
+    return _build_variant_rule(
+        impl = _iso_impl,
+        template = "//bazel/rules:run_iso.sh.tmpl",
+        extra_attrs = dict(_HELPERS_ATTR, **{
+            "iso": attr.label(
+                cfg = variant_transition,
+                mandatory = True,
+                doc = "The <name>.iso of the underlying unikernel_binary (transitioned).",
+            ),
+        }),
+    )
+
+_iso_x86_64_variant = _make_iso_variant(_iso_x86_64_transition)
+_iso_aarch64_variant = _make_iso_variant(_iso_aarch64_transition)
 
 def _make_qemu_variant(variant_transition):
     return _build_variant_rule(
@@ -310,18 +319,31 @@ _VARIANT_SPECS = [
         extra_test_tags = [],
         in_default_test_set = True,
     ),
+    # ISO variants exist for both arches because the primary use
+    # case is cloud deployment (GCE custom images, AWS Graviton /
+    # ARM bare-metal), not local dev. Both carry the `iso` umbrella
+    # tag so `--test_tag_filters=iso` runs both archs. Excluded from
+    # the default test set: the guest CODE exercised is identical to
+    # the QEMU variants (same app binary) — the Limine boot path is
+    # already validated by the `.iso` genrule itself succeeding.
+    # Apps that want runtime ISO-boot coverage opt in via
+    # `variants = [..., "iso_x86_64", "iso_aarch64"]`.
     struct(
-        suffix = "iso",
-        rule_fn = _iso_variant,
+        suffix = "iso_x86_64",
+        rule_fn = _iso_x86_64_variant,
         src_attrs = {"iso": ".iso"},
         host_attrs = {},
-        host_compat = [],  # QEMU x86_64 TCG runs anywhere.
-        extra_test_tags = [],
-        # Excluded from the default test set: the guest code under
-        # test is identical to the QEMU variants (same app binary),
-        # and we already exercise Limine boot at binary-build time.
-        # Apps that want ISO test coverage opt in via
-        # `variants = [..., "iso"]`.
+        host_compat = [],
+        extra_test_tags = ["iso"],
+        in_default_test_set = False,
+    ),
+    struct(
+        suffix = "iso_aarch64",
+        rule_fn = _iso_aarch64_variant,
+        src_attrs = {"iso": ".iso"},
+        host_attrs = {},
+        host_compat = [],
+        extra_test_tags = ["iso"],
         in_default_test_set = False,
     ),
     struct(

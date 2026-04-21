@@ -3,8 +3,7 @@
 
 Drives //net:tls_crypto + //net:tls through a full-stack boot
 (AEAD roundtrip + tamper, X25519, HKDF-Expand-Label, key schedule
-cascade, traffic-key record roundtrip) inside a real unikernel boot
-rather than a host unit test. Passes if the serial log contains
+cascade, traffic-key record roundtrip). Passes if the log contains
 `TLS TESTS: ALL PASSED` and no `[tls] FAIL`.
 
 Dispatches on `LAUNCHER_NAME` (set by the per-variant py_test's
@@ -40,7 +39,12 @@ class TlsPrimitiveTest(unittest.TestCase):
         pkg = root / "apps" / "test_tls"
 
         if launcher_name == "test_tls_hvf":
-            hvf = pkg / f"{launcher_name}.runner"
+            # The hvf runner lives at its natural runfiles path
+            # (`tools/hvf-runner/run-hvf`), not co-located next to the
+            # launcher — the variant rule hands it to the template
+            # via a relpath substitution rather than a per-variant
+            # symlink. The guest .img IS co-located, same as qemu.
+            hvf = root / "tools" / "hvf-runner" / "run-hvf"
             img = pkg / f"{launcher_name}.img"
             if not (hvf.is_file() and os.access(hvf, os.X_OK)):
                 raise unittest.SkipTest(f"HVF runner not executable: {hvf}")

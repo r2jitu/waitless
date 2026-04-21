@@ -21,15 +21,16 @@ unikernel_binary(
     app = ":app",
 )
 
-# SMP boot + IPI test — QEMU-only (needs `-smp 4`; HVF's
-# single-NUMA Hypervisor.framework path isn't wired up for this app).
+# SMP boot + IPI test. Runs on HVF (real aarch64 hardware) + both
+# QEMU TCG arches. Native is excluded: the test's core/IPI path
+# goes through `kernel::*` which is unikernel-only.
 unikernel_app_test(
     name = "test",
     app_base = "test_smp",
     test_rule = py_test,
     srcs = ["test.py"],
     deps = ["//scripts:test_helpers"],
-    variants = ["qemu_aarch64", "qemu_x86_64"],
+    variants = ["hvf", "qemu_aarch64", "qemu_x86_64"],
     tags = [
         "exclusive",
         "local",
