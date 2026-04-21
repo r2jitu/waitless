@@ -258,10 +258,10 @@ class NativeEnv:
         if not os.path.exists(bin_path):
             return None
         env = os.environ.copy()
-        env["PORT"] = str(port)
-        env["TLS_PORT"] = str(port + self.tls_port_offset)
-        env["UDP_PORT"] = str(port + 1)
-        env["THREADS"] = str(cpus)
+        env["UNIKERNEL_PORT"] = str(port)
+        env["UNIKERNEL_TLS_PORT"] = str(port + self.tls_port_offset)
+        env["UNIKERNEL_UDP_PORT"] = str(port + 1)
+        env["UNIKERNEL_CPUS"] = str(cpus)
         return subprocess.Popen(
             [bin_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
 

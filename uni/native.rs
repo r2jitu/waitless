@@ -577,16 +577,10 @@ fn init_native() {
     unsafe {
         pthread_key_create(&mut TLS_KEY, 0);
 
-        // `UNIKERNEL_PORT` / `UNIKERNEL_TLS_PORT` / `UNIKERNEL_UDP_PORT` /
-        // `UNIKERNEL_CPUS` are the canonical env-var names — they
-        // match what the HVF / QEMU / ISO variant launchers honor,
-        // so test harnesses, `bench.py`, and `bazel run` all use the
-        // same spelling regardless of which runner a caller picks.
-        // The unprefixed fallbacks (`PORT`, `TLS_PORT`, `UDP_PORT`,
-        // `THREADS`) stay in place so older scripts keep working; new
-        // callers should prefer the `UNIKERNEL_*` form.
+        // `UNIKERNEL_*` env-var names match what the HVF / QEMU /
+        // ISO variant launchers honor, so callers use the same
+        // spelling regardless of which runner LAUNCHER points at.
         let p = getenv(b"UNIKERNEL_PORT\0".as_ptr());
-        let p = if p.is_null() || *p == 0 { getenv(b"PORT\0".as_ptr()) } else { p };
         if !p.is_null() && *p != 0 {
             CONFIG_PORT = parse_u16(p);
         }
@@ -596,20 +590,17 @@ fn init_native() {
         // (macOS lets non-root bind anywhere, but we can't rely on
         // that cross-platform).
         let tp = getenv(b"UNIKERNEL_TLS_PORT\0".as_ptr());
-        let tp = if tp.is_null() || *tp == 0 { getenv(b"TLS_PORT\0".as_ptr()) } else { tp };
         if !tp.is_null() && *tp != 0 {
             CONFIG_TLS_PORT = parse_u16(tp);
         }
 
         let u = getenv(b"UNIKERNEL_UDP_PORT\0".as_ptr());
-        let u = if u.is_null() || *u == 0 { getenv(b"UDP_PORT\0".as_ptr()) } else { u };
         if !u.is_null() && *u != 0 {
             UDP_PORT_BASE = parse_u16(u);
         }
 
         // Determine thread count from environment or CPU count
         let t = getenv(b"UNIKERNEL_CPUS\0".as_ptr());
-        let t = if t.is_null() || *t == 0 { getenv(b"THREADS\0".as_ptr()) } else { t };
         if !t.is_null() && *t != 0 {
             NUM_THREADS = parse_u16(t) as usize;
         } else {
