@@ -530,38 +530,38 @@ unsafe fn kernel_boot(info: &BootInfo) {
     klog!("\n[BOOT] All subsystems ready. Starting application.\n\n");
     uni_main();
 
-    // Phase 3 auto-init fallback. Any app that didn't call
-    // `uni::net::Net::enable` (typically because it doesn't do
-    // networking at all, like test_smp / test_percpu / test_tls)
-    // gets the legacy DHCP-with-10.0.2.15/24-fallback so it boots
-    // unchanged. Skip when the app requested shutdown from
+    // Post-uni_main network finalisation. Two steps:
+    //
+    //   1. Auto-init fallback — apps that didn't call
+    //      `uni::net::Net::enable` (typically because they don't
+    //      do networking at all — test_smp / test_percpu /
+    //      test_tls) get the legacy DHCP-with-10.0.2.15/24
+    //      fallback so they boot unchanged.
+    //
+    //   2. Multi-queue activation — MQ enables host-side RSS,
+    //      which sprays incoming frames across queue pairs and
+    //      breaks single-queue DHCP polling, so it must come
+    //      AFTER DHCP (whether Net::enable or the fallback ran
+    //      it).
+    //
+    // Both steps skip when the app requested shutdown inside
     // uni_main — a DHCP timeout would add ~10 s to the exit of
     // those tests.
-    if net_ok
-        && !kernel::eventloop::is_shutdown()
-        && !uni::net::was_enabled()
-    {
-        klog!("[INIT] DHCP (auto-init fallback)...\n");
-        if net::bringup_dhcp() {
-            klog!("       IP obtained successfully\n");
-        } else {
-            klog!("       [WARN] DHCP failed, using 10.0.2.15/24\n");
-            net::bringup_static(
-                net::types::Ipv4Addr::from(10, 0, 2, 15),
-                net::types::Ipv4Addr::from(10, 0, 2, 2),
-                net::types::Ipv4Addr::from(255, 255, 255, 0),
-            );
-        }
-        uni::net::mark_enabled_by_auto_init();
-    }
-
-    // Now that DHCP has run (via Net::enable inside uni_main OR
-    // via the fallback above), promote virtio-net to multi-queue
-    // if the device negotiated MQ. Activating MQ enables host-
-    // side RSS, which sprays incoming frames across queue pairs
-    // and breaks single-queue DHCP polling — so MQ activation
-    // must come AFTER DHCP.
     if net_ok && !kernel::eventloop::is_shutdown() {
+        if !uni::net::was_enabled() {
+            klog!("[INIT] DHCP (auto-init fallback)...\n");
+            if net::bringup_dhcp() {
+                klog!("       IP obtained successfully\n");
+            } else {
+                klog!("       [WARN] DHCP failed, using 10.0.2.15/24\n");
+                net::bringup_static(
+                    net::types::Ipv4Addr::from(10, 0, 2, 15),
+                    net::types::Ipv4Addr::from(10, 0, 2, 2),
+                    net::types::Ipv4Addr::from(255, 255, 255, 0),
+                );
+            }
+            uni::net::mark_enabled_by_auto_init();
+        }
         drivers::net::activate_multi_queue();
     }
 

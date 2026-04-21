@@ -160,9 +160,9 @@ fn bringup(cfg: NetBringUp) -> Result<(), NetError> {
         }
         NetBringUp::Static { ip, gateway, netmask } => {
             crate::net_umbrella::bringup_static(
-                to_net_ipv4(ip.0),
-                to_net_ipv4(gateway.0),
-                to_net_ipv4(netmask.0),
+                to_net_ipv4(ip),
+                to_net_ipv4(gateway),
+                to_net_ipv4(netmask),
             );
             Ok(())
         }
@@ -178,7 +178,11 @@ fn bringup(_cfg: NetBringUp) -> Result<(), NetError> {
     Ok(())
 }
 
+/// `uni::net::Ipv4Addr` → bare-metal `net_types::Ipv4Addr`. Kept as
+/// a standalone helper rather than a `From` impl so we don't need a
+/// cross-crate orphan dance (the two types live in different crates).
 #[cfg(platform_unikernel)]
-fn to_net_ipv4(o: [u8; 4]) -> crate::net_umbrella::types::Ipv4Addr {
-    crate::net_umbrella::types::Ipv4Addr::from(o[0], o[1], o[2], o[3])
+fn to_net_ipv4(a: Ipv4Addr) -> crate::net_umbrella::types::Ipv4Addr {
+    let [o0, o1, o2, o3] = a.0;
+    crate::net_umbrella::types::Ipv4Addr::from(o0, o1, o2, o3)
 }

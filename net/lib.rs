@@ -63,8 +63,8 @@ fn udp_dispatch(src: u32, dst: u32, payload: &[u8]) {
 /// forthcoming `Net::enable` constructor (Phase 3) so apps that go
 /// through the new API don't depend on boot-path ordering.
 pub fn init_stack() {
-    REGISTRY.register(ipv4::PROTO_TCP, tcp_dispatch);
-    REGISTRY.register(ipv4::PROTO_UDP, udp_dispatch);
+    REGISTRY.register(protocol::Slot::Tcp, tcp_dispatch);
+    REGISTRY.register(protocol::Slot::Udp, udp_dispatch);
 }
 
 // ============================================================================
