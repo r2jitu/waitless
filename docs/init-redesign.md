@@ -1,9 +1,9 @@
 # Init Redesign Plan
 
 Prerequisite work to prepare the codebase for **ROADMAP §2f/§2g
-(async runtime)** and **ROADMAP §3c (QUIC)**. Restructures the
-init sequence, module boundaries, and global state into shapes
-that those phases can build on cleanly.
+(async runtime)** and **ROADMAP §3c (QUIC)**. Restructures init,
+module boundaries, and global state into shapes those phases can
+build on cleanly.
 
 **Not a new feature delivery.** Every phase is refactor + API
 reshaping. Feature work resumes at ROADMAP §2f once this plan
@@ -13,158 +13,122 @@ completes.
 
 ## Status
 
-**Started:** not yet (as of 2026-04-20)
-**Prerequisite commits landed:** `b50f3a4` (uni::App framework)
-through `70a6f4a` (apps/hello minimal example)
-**Blocks:** ROADMAP §2f (task arena), §2g (async executor), §3c (QUIC)
-
-See the [Progress tracker](#progress-tracker) below for phase-by-
-phase status.
+**Started:** not yet.
+**Prerequisites landed:** `b50f3a4` (uni::App) through `70a6f4a`
+(apps/hello). Bench baseline captured below.
+**Blocks:** ROADMAP §2f/§2g/§3c.
 
 ---
 
 ## Why this plan exists
 
-The current kernel init sequence auto-initializes every subsystem
-regardless of whether the app uses it, AND every binary links
-every subsystem regardless of whether the app references it:
+The kernel auto-initializes every subsystem whether or not the app
+needs it, AND every binary links every subsystem whether or not
+the app references it:
 
-- **Runtime cost:** DHCP retries on boot, ~several MB of TCP
-  connection pool reserved at boot, event-loop slots bound to
-  subsystems the app didn't ask for.
-- **Binary size:** a minimal HTTP hello world is 1.9 MB on
-  aarch64 HVF because the full TLS stack (~900 KB of RustCrypto),
-  DHCP, and multi-driver NIC dispatch are always linked. Measured:
-  `hello.img` ≈ `webserver.img`, delta only ~16 KB.
-- **Architectural debt:** 8 scattered globals for network state,
-  46 `static mut` across 16 files, drivers with 9 separate atomics
-  for one device's state. Hard to reason about, hard to test.
+- **Runtime cost:** DHCP retries, MB of TCP pool reserved at boot,
+  8 scattered globals per subsystem.
+- **Binary size:** hello world is 1.9 MB because the full TLS
+  stack (~900 KB) + drivers + DHCP are always linked. `hello.img`
+  ≈ `webserver.img` (delta ~16 KB).
+- **Architectural debt:** 46 `static mut` across 16 files; driver
+  state scattered across up to 9 separate atomics.
 
-Once ROADMAP §2g lands an async executor, all of this becomes
-harder to refactor — the executor hangs off of structure that
-already exists. The cost of doing it in the wrong shape first is
-rewriting twice. This plan gets the shape right first.
+Once ROADMAP §2g lands an async executor, this becomes harder —
+async code will hang off whatever shape exists. The cost of doing
+it in the wrong shape first is rewriting twice. This plan gets the
+shape right first.
 
 ---
 
 ## Design principles
 
 ### 1. One anchor per subsystem
-
-The `uni::App` prototype established the pattern: one global slot
-(`APP_SLOT`) holds a `Box<dyn App>`; all app state is reachable
-through it. This plan applies the same principle everywhere:
-
-- `Net::enable()` populates `NET: static Option<Box<Net>>`
-- Each NIC driver crate has one `InitOnce<Driver>` anchor
-- `Smp::enable()` populates `SMP: static Option<SmpState>`
-- Arch tables (GDT / IDT / TSS) collapse to one `InitOnce` each
-
-**Rule:** if a subsystem has 3+ statics, consolidate to one anchor.
+Each subsystem with 3+ statics collapses to one `InitOnce<Anchor>`.
+The `APP_SLOT` / `Box<dyn App>` pattern from `b50f3a4` is the template.
 
 ### 2. The crate IS the API
+One or two public types per crate; implementation details stay
+inside. Cross-crate extension happens via plain functions, not
+extension traits (which hide methods from rustdoc).
 
-Each crate's public surface is one or two types + their methods.
-Implementation details stay inside. Extension across crate
-boundaries happens via extension traits, not by exposing internals.
-
-### 3. No hidden dependencies
-
-A crate's API must be usable without knowing about anyone else's
-globals. If a function requires some other subsystem to have been
-initialized, that's expressed in the type system — e.g., by
-taking `&Net` as a parameter, which can only come from
-`Net::enable()`.
+### 3. Explicit dependencies in the type system
+If a function requires some subsystem to be up, that's a parameter
+(like `&Net`), not a global. Capability tokens proxy for side
+effects but are visible in the signature.
 
 ### 4. POSIX shapes aren't destiny
+No protection boundary, no syscall cost — don't owe backwards
+compat to `listen/accept/recv/send`. Prefer:
+- **Handler APIs over accept loops.** Framework runs the loop;
+  app declares per-connection/per-request handlers.
+- **Poll primitives over blocking calls.** `try_recv(buf) -> Option<usize>`
+  as the core; sync/async versions both wrap it.
+- **Transport-agnostic at the protocol layer.** `uni-http`
+  doesn't know about TCP specifically; takes a trait-bounded
+  transport. QUIC slots in the same way.
 
-This is a unikernel — no protection boundary, no syscall cost, no
-kernel/user copy enforcement. We don't owe backwards compatibility
-to the `listen/accept/recv/send` programming model.
+### 5. Each phase makes async easier
+Every decision evaluated against "does this help §2g land
+cleanly?" Target contributions:
+- Poll-based primitive APIs
+- Per-core arenas matching §2f's task-slot layout
+- Capability tokens that become executor context objects
 
-Three concrete consequences:
-
-1. **Hide accept loops behind handlers.** Apps shouldn't write
-   `loop { stream = listener.accept(); ... }`. The framework runs
-   the loop.
-2. **Primitives are poll-based with explicit Wakers.** Every
-   transport primitive exposes `try_recv(buf) -> Option<usize>`
-   and `register_waker(&Waker)`. Sync and async both wrap these.
-3. **Transport agnostic at the protocol layer.** `uni-http`
-   doesn't know about TCP specifically; it takes a listener
-   that implements a trait. Swappable for QUIC at HTTP/3.
-
-### 5. Every phase makes async easier
-
-Phases 0-8 are evaluated against: **"does this make ROADMAP
-§2g's async executor easier or harder?"** Each phase contributes
-one of:
-
-- Poll-based primitive APIs that Futures wrap cleanly
-- Per-connection / per-request state structured for Waker parking
-- Capability tokens that become executor "context" objects
-- Per-core arenas that match §2f's task-slot layout
-
-The "Async prep" note on each phase spells out what it adds.
+**Caveat:** phases 0-8 deliver *structural* shape (modular crates,
+consolidated state, handler APIs). They don't speculate on §2g's
+Waker design. §2g adds Waker hooks when it knows what it needs.
 
 ### 6. Perf invariant: neutral-or-better per phase
-
-**No phase lands if it regresses benchmarks by more than 2% on
-HVF single-core.** See [Benchmark protocol](#benchmark-protocol)
-for exact workloads and thresholds. Anti-regression mitigations
-baked in per-phase:
-
-- Hot-path per-core arrays stay `InitOnce<PerCore<…>>` statics
-  with direct addressing; `Net` owns them logically, not
-  physically.
-- NIC driver dispatch compiles to direct calls in the common
-  "one driver linked" case; trait-object fallback only when
-  multiple drivers are present.
-- Async polling is Waker-driven (phase 9+), matching today's
-  callback dispatch cost within ~5 ns.
+No phase lands if it regresses benchmarks by more than 2% (hard
+gate on `health_max`, `udp_peak`, `health_tls_max`; others ±2%
+tolerance for HVF noise). Mitigations documented per phase.
 
 ---
 
-## Target crate layout
+## Target crate layout (6 crates, not 13)
 
 ```
-uni                    — App trait, uni::run, log, boot_info, #[uni::boot]
-uni-kernel             — primitives: Spinlock, InitOnce, AtomicFn, PerCpu,
-                         eventloop, mm, time, percpu
-uni-net                — L3: NIC driver trait, ARP, IPv4, protocol registry,
-                         Net capability
-uni-udp                — UDP datagram API (thin layer on Net)
-uni-tcp                — TCP stack as a library (TcpStack::enable(&net))
-uni-http               — HTTP/1.1 over a transport (takes &TcpStack)
-uni-tls                — TLS 1.3 extension trait + config
-uni-dhcp               — DHCP client (Net::enable_dhcp)
-uni-net-static         — static IP config (Net::enable_static)
+uni                    — core: App trait, uni::run, log, boot_info, #[uni::boot]
+uni-net                — L3 + TCP + UDP + ARP + DHCP + static-IP
+                         (internal submodules; one public boundary)
+uni-http               — HTTP/1.1 over a transport
+uni-tls                — TLS 1.3 config + wrapping functions
 uni-driver-virtio-net  — driver crate
 uni-driver-gvnic       — driver crate
-uni-driver-nic-all     — meta: both drivers + boot-time dispatch
-
-(ROADMAP §3c adds uni-quic and §4c adds uni-http3 on top of this.)
 ```
+
+**Why 6, not 13:** earlier drafts split `uni-udp`, `uni-tcp`,
+`uni-dhcp`, `uni-net-static` as separate crates. Each is 100-300
+LOC — workspace overhead outweighs the "include what you use"
+benefit at that grain. The big size wins come from:
+- `uni-tls` (~900 KB — huge)
+- Per-driver crates (~100 KB each)
+- Deleting `uni-net` entirely for compute-only apps
+
+Those benefits are captured by the 6-crate split. Finer grain
+adds `Cargo.toml`/`BUILD.bazel`/rust-analyzer overhead without
+proportional payoff.
 
 Dependency graph:
 
 ```
-uni-kernel
-    ↑
-  uni ←─── uni-net ←── uni-udp, uni-tcp
-                   ↑                  ↑
-                uni-driver-*       uni-http ←─── uni-tls
-                                      ↑
-apps/webserver: uni, uni-http, uni-tls, uni-dhcp, uni-driver-nic-all
-apps/hello:     uni, uni-http, uni-net-static, uni-driver-virtio-net
-apps/compute:   uni
+uni ←── uni-net ←── uni-driver-virtio-net, uni-driver-gvnic
+           ↑
+        uni-http ←── uni-tls
 ```
+
+Apps depend on the minimum they need:
+
+| App | Deps | Binary target |
+|---|---|---|
+| compute | `uni` | ~400 KB |
+| hello (plain HTTP) | `uni`, `uni-http`, `uni-driver-virtio-net` | ~1 MB |
+| webserver (HTTP + TLS) | `uni`, `uni-http`, `uni-tls`, `uni-driver-{virtio-net,gvnic}` | ~2 MB |
 
 ---
 
-## API boundary per crate
-
-One or two types + their methods. Internals stay internal.
+## API boundaries
 
 ### `uni` (core)
 
@@ -182,487 +146,464 @@ pub struct BootInfo {
     pub nics: &'static [NicInfo],
     pub rtc_epoch: Option<u64>,
 }
-
-#[uni::boot] // proc macro
-fn boot() { uni::run(MyApp::new()); }
 ```
+
+**Native:** works identically; `boot_info()` populates RAM/CPU from
+sysctl on native.
 
 ### `uni-net`
 
 ```rust
 pub struct Net { /* opaque */ }
 
+// Constructor lives in uni-net; config comes in as an enum so
+// DHCP vs static-IP is runtime-chosen without a separate crate.
+pub enum NetBringUp {
+    Dhcp,
+    Static { ip: Ipv4Addr, gateway: Ipv4Addr, netmask: Ipv4Addr },
+}
+
 impl Net {
+    pub fn enable(cfg: NetBringUp) -> Result<Net, NetError>;
     pub fn local_ip(&self) -> Ipv4Addr;
-    pub fn mac(&self) -> [u8; 6];
-    // Protocol layers register here; not a user API:
-    pub(crate) fn register_protocol(&self, proto: u8, rx: fn(Ipv4Packet));
+    pub fn listen_tcp(&self, port: u16) -> TcpListener;
+    pub fn bind_udp(&self, port: u16) -> UdpSocket;
 }
 
-pub trait NicDriver {
-    fn probe() -> Option<NicHandle>;
-    fn poll_rx(&self, cb: impl FnMut(&[u8])) -> usize;  // async-ready: returns immediately
-    fn send(&self, frame: &[u8]) -> Result<(), NicError>;
-    fn register_rx_waker(&self, waker: &Waker);         // stub in Phase 3, live in Phase 9
-}
-
-// Link-time driver registration
-#[macro_export]
-macro_rules! register_driver { ($ty:ty) => { ... } }
-```
-
-`Net::enable_dhcp` and `Net::enable_static` live in sibling crates
-(`uni-dhcp` / `uni-net-static`) as extension traits. `uni-net` has
-no dep on either.
-
-### `uni-tcp`
-
-```rust
-pub struct TcpStack { /* opaque — conn pool, hash tables */ }
-
-impl TcpStack {
-    pub fn enable(net: &Net) -> Self;          // allocates conn pool, registers IP proto 6
-    pub fn listen(&self, port: u16) -> TcpListener;
-}
-
-pub struct TcpListener { /* handler-based, no accept() */ }
-
+pub struct TcpListener { /* handler-based */ }
 impl TcpListener {
-    // Sync version:
     pub fn serve(&self, handler: impl Fn(TcpStream) + Send + Sync + 'static);
-    // Async version (Phase 9+):
-    pub fn accept(&self) -> impl Future<Output = TcpStream>;
+    // Async wrapper in §2g: `pub async fn accept(&self) -> TcpStream`
 }
 
-pub struct TcpStream { /* poll-based primitive */ }
-
+pub struct TcpStream { /* poll-based core */ }
 impl TcpStream {
     pub fn try_recv(&mut self, buf: &mut [u8]) -> Option<usize>;
     pub fn try_send(&mut self, data: &[u8]) -> Option<usize>;
-    pub fn register_rx_waker(&mut self, waker: &Waker);
-    pub fn register_tx_waker(&mut self, waker: &Waker);
-    // Async adapters (Phase 9+):
-    pub fn recv(&mut self, buf: &mut [u8]) -> impl Future<Output = usize>;
-    pub fn send(&mut self, data: &[u8]) -> impl Future<Output = usize>;
+    // §2g wraps as async recv/send.
 }
 ```
+
+**NIC driver registration:** drivers implement a `NicDriver` trait
+(defined in `uni-net`) and register at link time via a
+`register_driver!` macro. `Net::enable` walks the link-time
+registry to find a working driver.
+
+**Native:** `Net` on native is a thin `libc::socket` wrapper;
+same public API, different internal implementation via
+`#[cfg(platform_native)]`.
 
 ### `uni-http`
 
 ```rust
 pub struct Server { /* opaque */ }
-
 impl Server {
-    pub fn new_boxed(tcp: &TcpStack) -> Box<Self>;  // takes TCP, not Net
+    pub fn new_boxed(net: &Net) -> Box<Self>;
     pub fn route(&mut self, path: &[u8], handler: Handler);
     pub fn default_handler(&mut self, handler: Handler);
     pub fn listen(&mut self, port: u16);
 }
 
 pub type Handler = fn(&Request) -> Response;
-// Async handler (Phase 9+): async fn(&Request) -> Response
+// Request/Response types elided; unchanged from today
 ```
 
-### `uni-tls` (extension trait)
+**Native:** uses `uni-net`'s native libc-socket backend
+transparently.
+
+### `uni-tls`
 
 ```rust
 pub struct TlsServerConfig { /* opaque */ }
-
-pub trait TlsExt {
-    fn listen_tls(&mut self, port: u16, cfg: TlsServerConfig);
+impl TlsServerConfig {
+    pub fn from_dev_cert(cert_der: &[u8], pkcs8_key: &[u8]) -> Option<Self>;
 }
 
-impl TlsExt for uni_http::Server { ... }
+// Plain function — not an extension trait.
+pub fn listen_tls(server: &mut Server, port: u16, cfg: TlsServerConfig);
 ```
 
-Apps do `use uni_tls::TlsExt;` to activate. Without the import
-(and dep), the method doesn't exist — TLS code isn't linked.
+Apps write `uni_tls::listen_tls(&mut server, 443, cfg)`.
+Cross-crate extension without trait gymnastics.
+
+**Native:** pure crypto + state machine; identical on both
+platforms.
+
+### Driver crates
+
+```rust
+pub struct VirtioNetDriver;
+impl uni_net::NicDriver for VirtioNetDriver { /* ... */ }
+uni_net::register_driver!(VirtioNetDriver);
+```
+
+**Native:** these crates have no native backend — they're
+unikernel-only. Their `BUILD.bazel` uses a `select({})` to become
+an empty target on native, so `uni-http` on native doesn't
+transitively pull them.
 
 ---
 
-## Migration phases
+## Migration phases (in execution order)
 
-| Phase | Scope | Effort | Async prep | Perf |
-|---|---|---|---|---|
-| 0 | `uni::boot_info()` | 1-2 d | BootInfo will be passed to runtime init | Neutral |
-| 1 | `Net::enable()` + flag-day global collapse | 6-7 d | Protocol registry + poll-based NIC trait | Neutral (mitigations below) |
-| 2 | `uni-tcp` carveout with handler-not-loop API | 3-4 d | Handler shape = async fn shape | Neutral |
-| 3 | NIC driver carveouts + state consolidation | 3-4 d | `register_rx_waker` stub becomes live in Phase 9 | Neutral |
-| 4 | `uni-tls` carveout | 4-5 d | Already sans-io, async-ready | Neutral |
-| 5 | DHCP + static-IP carveouts | 3 d | — | Neutral |
-| 6 | Event-loop hooks (`on_idle`, `on_tick`) | 2-3 d | Hooks become async task primitives | Neutral |
-| 7 | SMP opt-in | 3-5 d | Per-core executor already fits this | Neutral or better (single-core saves init) |
-| 8 | `static mut` sweep + virtio-console consolidation | 3-5 d | Cleaner state for Waker slots to live in | Neutral |
-
-Total: ~27-36 days focused work. Each phase is an independent PR;
-each validates against benchmarks before merging.
-
-**After Phase 8:** ROADMAP §2f task arena + §2g async executor +
-§3c QUIC resume on the clean foundation.
+Phases numbered to match execution order. Effort + async-prep +
+perf + test notes per phase.
 
 ### Phase 0: `uni::boot_info()`
 
 Populate a `BootInfo` struct in `kernel::entry` after ACPI/FDT
 parsing + NIC discovery. Expose via `uni::boot_info()`. Apps
-optionally use it in `new()`.
+optionally use it in their constructors.
 
-**Async prep:** the future async executor's init takes
-`&BootInfo` to size per-core task arenas based on actual CPU
-count rather than `MAX_CORES`.
+- **Effort:** 1-2 d
+- **Async prep:** §2g's executor takes `&BootInfo` at init for
+  per-core sizing
+- **Perf:** neutral (data populated at boot, read on demand)
+- **Test:** add a host-native unit test that constructs a
+  `BootInfo` with representative values and asserts accessors;
+  add a webserver integration check that logs `boot_info()` and
+  greps the serial output
 
-**Perf impact:** zero (data populated at boot, read on demand).
+### Phase 1: Error types
 
-### Phase 1: `Net::enable()` + flag-day global collapse
+Design a shared error hierarchy before any crate splits. Defining
+errors up-front means later crate carveouts don't each invent
+incompatible enums that have to be unified later.
 
-One big PR that:
-
-1. Introduces `Net::enable_dhcp()` / `Net::enable_static(cfg)`.
-2. Deletes kernel-level auto-init of DHCP/ARP/IP/TCP.
-3. Moves scattered globals into `Net`:
-   - `net::types::CONFIG` → `Net.config`
-   - `net::udp::HANDLER_*` → `Net.udp_handlers`
-   - `net::dhcp::DHCP_STATE` → `Net.dhcp_state` (behind `uni-dhcp` cfg)
-   - `uni::http::SERVER_PTR` / `TLS_CONFIG_PTR` → fields on Server
-   - `net::lib::{MULTICORE_INIT, WAKEUP, RX_LOCK, JUST_DISTRIBUTED}`
-     → `Net.dispatcher`
-4. Wraps hot-path per-core arrays in `InitOnce<PerCore<…>>` so
-   memory isn't reserved until `Net::enable()` runs.
-5. Introduces the protocol registry (`Net::register_protocol`) —
-   TCP and UDP both use it from day one.
-6. Defines `NicDriver` trait with poll-based `poll_rx` and
-   `register_rx_waker` (latter is a no-op stub until Phase 9).
-7. Migrates all 4 in-tree apps.
-
-**Async prep:** the protocol registry is the async reactor's RX
-dispatch point. `register_rx_waker` slot exists from day one;
-Phase 9 wires it up.
-
-**Perf impact:** must be neutral. Mitigations:
-- Hot-path per-core arrays (`TCP_POOLS`, `ARP_FAST`) stay
-  statically addressable; `Net` references them, doesn't mediate
-  access.
-- `Net::current()` loaded once at the top of hot paths, cached
-  locally.
-- Protocol registry: 8-entry array, direct indexed lookup, ~1 ns
-  per packet. Validated before merge.
-
-### Phase 2: `uni-tcp` carveout with handler-not-loop API
-
-Split `net::tcp` into a separate crate. Reshape the public API to
-handler-based:
+Add `uni-kernel::error` (or similar) with:
 
 ```rust
-// Old:
-let listener = TcpListener::bind(port)?;
-loop { let stream = listener.accept()?; ... }
-
-// New:
-let listener = tcp.listen(port);
-listener.serve(|stream| { ... });  // framework runs the accept loop
+pub enum NetError { NoNic, Dhcp(DhcpError), Driver(&'static str), ... }
+pub enum DhcpError { Timeout, BadReply, NoOffer, ... }
+pub enum NicError { ... }
+pub enum TlsError { ... }  // already exists in net/tls_server.rs
 ```
 
-**Async prep:** `serve(handler)` naturally becomes
-`serve(async move |stream| { ... })` in Phase 9. The sync
-version is just `executor.block_on(...)`.
+Document `From` impls between them (`From<DhcpError> for NetError`,
+`From<NicError> for NetError`).
 
-`try_recv` / `try_send` primitives become the raw interface;
-async `recv` / `send` are thin Future wrappers in Phase 9.
+- **Effort:** 1-2 d
+- **Async prep:** errors flow through `Result<T, _>` async
+  signatures naturally
+- **Perf:** neutral (just types + impls)
+- **Test:** unit tests for `From` chains; ensure size_of each
+  error is ≤ 2 pointers to avoid bloating `Result<_, E>` call sites
 
-**Perf impact:** neutral. Handler dispatch is already what HTTP
-does internally; TCP joining that pattern removes one layer of
-indirection (was: TCP stream → accept loop → HTTP handler; now:
-TCP stream → handler directly).
+### Phase 2: `Net` structural prep (no API change yet)
 
-### Phase 3: NIC driver carveouts + state consolidation
+Sub-phase that sets up the protocol registry and hot-path
+`InitOnce<PerCore<…>>` wrappers without changing any public API.
+Auto-init still runs; `Net::enable_*` doesn't exist yet.
+
+What this does:
+- Wrap `net::tcp::CONNECTIONS`, `net::arp::ARP_FAST`,
+  `net::ipv4::IP_ID_PERCORE` in `InitOnce<PerCore<…>>`. Memory
+  isn't reserved at kernel boot; it's claimed on first call from
+  `net::init_stack()` (which auto-init still invokes).
+- Introduce `net::protocol::Registry` — a small struct with
+  `register(proto: u8, handler: fn(pkt))` method. Have TCP and
+  UDP register through it instead of hardcoded dispatch in
+  `net::lib::net_receive()`.
+
+No user-visible change. Pure internal refactor.
+
+- **Effort:** 2 d
+- **Async prep:** the protocol registry is the dispatch point
+  async RX will hook
+- **Perf:** neutral — must verify. Risk: `InitOnce::get()` is
+  an atomic load instead of static-address dereference.
+  Mitigation: amortize per hot function (`let pools = CONNECTIONS.get()`
+  at the top, subsequent accesses direct). Validate with
+  `health_max` + `udp_peak` benchmarks.
+- **Test:** unit test the protocol registry (register, receive,
+  unregister). `static_mut` count shouldn't change.
+
+### Phase 3: `Net::enable_*` + migrate apps
+
+Introduce the `Net::enable(NetBringUp)` API. Auto-init still runs
+as fallback for apps that don't call it. Migrate in-tree apps
+(webserver, hello) to use `Net::enable` explicitly.
+
+Test apps (test_smp, test_percpu, test_tls) don't need networking
+— no change.
+
+- **Effort:** 2 d
+- **Async prep:** `Net` now owns protocol registry from Phase 2
+- **Perf:** neutral — `Net::enable` is boot-path only
+- **Test:** integration test that `Net::enable(NetBringUp::Static { ... })`
+  skips DHCP; integration test that omitting it falls back to
+  auto-init (the existing behavior)
+
+### Phase 4: Delete auto-init, consolidate globals into `Net`
+
+Remove the kernel-level auto-init path. Move the remaining
+scattered globals into `Net`:
+
+- `net::types::CONFIG` → `Net.config`
+- `net::udp::HANDLER_*` → `Net.udp_handlers`
+- `net::dhcp::DHCP_STATE` → `Net.dhcp_state`
+- `net::lib::{MULTICORE_INIT, WAKEUP, RX_LOCK, JUST_DISTRIBUTED}`
+  → `Net.dispatcher`
+- `uni::http::SERVER_PTR` / `TLS_CONFIG_PTR` → fields on `Server`
+  / `TlsServerConfig`
+
+After this phase, apps that don't call `Net::enable` get no
+network. 8 global slots collapse to 1 (`NET: static Option<Box<Net>>`).
+
+- **Effort:** 2-3 d
+- **Async prep:** Net is the single anchor; async executor's
+  network bindings reach state through `Net::current()`
+- **Perf:** neutral. Hot-path arrays still `InitOnce<PerCore<…>>`
+  from Phase 2; Net just holds a `&'static` reference.
+- **Test:** run webserver integration test; check that
+  `NET.is_none()` before `Net::enable` returns and after app
+  exits; unit test: `Net::enable` twice returns `Err`
+
+### Phase 5: NIC driver carveouts + state consolidation
 
 Split `drivers/virtio_net.rs` and `drivers/gvnic.rs` into
-separate crates. Each driver crate collapses its 6-9 scattered
-statics into one `InitOnce<Driver>` anchor implementing
-`uni_net::NicDriver`.
+`uni-driver-virtio-net` and `uni-driver-gvnic` crates. Each
+driver crate collapses its scattered state into ONE
+`InitOnce<Driver>` anchor implementing `NicDriver`.
 
-`uni-driver-nic-all` is a meta-crate depending on both drivers
-plus the boot-time dispatch logic.
+No `register_rx_waker` stub in the trait — §2g adds that when
+it designs the Waker layer.
 
-**Async prep:** `NicDriver::register_rx_waker(&Waker)` is now a
-real slot in each driver. Phase 9 wakes the network executor
-when an RX IRQ fires.
+Multi-driver "nic-all" shape: apps depend on both driver crates
+directly. No meta-crate needed.
 
-**Perf impact:** neutral. Single-driver deployments get direct
-calls (no vtable); multi-driver deployments get one indirect
-call per packet (~1 ns, below bench-noise floor). Driver state
-consolidation doesn't change access patterns — hot-path atomics
-stay where they were, just moved from separate statics into
-fields of one `Driver` struct at the same cache-line positions.
+- **Effort:** 3-4 d
+- **Async prep:** driver state is now in a clean struct; §2g
+  can add Waker hooks as fields later without touching the
+  public NicDriver trait
+- **Perf:** neutral. Single-driver apps get direct calls.
+  Multi-driver apps pay ~1 ns per indirect call through
+  `&dyn NicDriver`. Must confirm with isolated micro-bench:
+  1M calls of `driver.send(&frame)` with one vs. multiple
+  drivers linked, compare to today's direct-dispatch baseline.
+- **Test:** driver registration macro unit tests; ensure a
+  binary linked with zero drivers fails to `Net::enable` cleanly
+  (not panic)
 
-### Phase 4: `uni-tls` carveout
+### Phase 6: `uni-tls` carveout
 
-Move `net/tls_*` into a new `uni-tls` crate. Introduce `TlsExt`
-extension trait. `uni-http::Server` stays TLS-unaware — apps
-opt into TLS by importing `uni-tls`.
+Move `net/tls_*` into a new `uni-tls` crate. Expose TLS via a
+plain function `uni_tls::listen_tls(&mut Server, port, cfg)` —
+not an extension trait.
 
-**Async prep:** TLS state machine is already sans-io; Phase 9
-wraps `tls.advance(cfg)` in an async frame. No additional prep.
+Apps that don't need TLS drop `uni-tls` from deps. Hello becomes
+~1 MB (down from 1.9 MB).
 
-**Perf impact:** neutral for TLS workloads (same code path).
-~900 KB binary size savings for non-TLS apps (hello drops from
-1.9 MB to ~1 MB).
+- **Effort:** 4 d
+- **Async prep:** TLS state machine is sans-io; §2g wraps
+  `tls.advance()` in an async frame
+- **Perf:** neutral for TLS workloads (same code path). ~900 KB
+  binary reduction for non-TLS apps — biggest single binary win.
+- **Test:** the existing TLS integration test (apps/test_tls)
+  stays valid; webserver integration test keeps running;
+  verify `bazel build //apps/hello:hello --config=hvf` succeeds
+  without uni-tls dep
 
-### Phase 5: DHCP + static-IP carveouts
+### Phase 7: `static_mut` sweep + virtio-console consolidation
 
-`net/dhcp.rs` → `uni-dhcp`. New `uni-net-static`. Core TCP/IP
-stays in `uni-net`. `Net::enable_dhcp()` / `Net::enable_static(cfg)`
-are extension traits on Net.
-
-**Async prep:** DHCP state machine becomes async-friendly —
-`uni-dhcp` can ship both sync (loop until lease) and async
-(Future<Output = Lease>) in Phase 9.
-
-**Perf impact:** neutral.
-
-### Phase 6: Event-loop hooks
-
-`uni::on_idle(f)`, `uni::on_tick(f)` for apps that inject
-background work. Current `kernel::eventloop` has 8 hardcoded
-callback slots; these add 2 app-facing ones.
-
-**Async prep:** these become `Timer::every(duration).stream()`
-and similar in Phase 9. The hooks are fallbacks for sync apps;
-async apps use reactor primitives directly.
-
-**Perf impact:** additive, neutral.
-
-### Phase 7: SMP opt-in
-
-`uni::smp::enable()` brings up APs; otherwise they stay parked.
-Single-core apps drop SMP bring-up code and the per-core arena
-machinery falls out of the binary.
-
-**Async prep:** per-core task arenas (ROADMAP §2f) assume SMP
-bring-up has happened OR opts into single-core mode. Capability
-handle returned by `Smp::enable()` becomes executor context.
-
-**Perf impact:** neutral when enabled; better for single-core
-apps (shorter boot, smaller binary).
-
-### Phase 8: `static mut` sweep + virtio-console consolidation
-
-46 `static mut` across 16 files → 0. Each case migrates to:
-
+46 `static mut` → 0. Each migrates to:
 - `InitOnce<T>` (publish-once)
 - `Spinlock<T>` (shared mutable)
 - `UnsafeCell<T>` + `unsafe impl Sync` (single-threaded by contract)
 
-Also: `drivers/virtio_console.rs` 12 statics → one `InitOnce<VirtioConsole>`.
+Includes `drivers/virtio_console.rs`'s 12 statics → one
+`InitOnce<VirtioConsole>`.
 
-**Async prep:** clean state representation for async to hang
-Waker slots off of.
+- **Effort:** 3-4 d
+- **Async prep:** clean state layout for §2g to hang Waker slots
+  off of
+- **Perf:** neutral. `InitOnce::get()` is an atomic load; same
+  cost as static access after first init.
+- **Test:** CI check that `rg '^\s*static mut' src/` returns 0.
+  Each converted file keeps its existing tests; add specific
+  tests for formerly-unsafe invariants where practical (e.g.,
+  "GDT entries don't change after `init`")
 
-**Perf impact:** neutral. `InitOnce::get()` is an atomic load,
-same cost as direct static access after first init.
+### Phase 8: Event-loop hooks + opt-in SMP
+
+Combined because they're both additive event-loop extensions.
+
+- `uni::on_idle(f)` and `uni::on_tick(f)` for apps injecting
+  background work
+- `uni::smp::enable()` brings up APs; otherwise they stay parked.
+  Single-core apps drop SMP bring-up from the boot path and arch
+  multi-core machinery from the binary.
+
+- **Effort:** 4-5 d
+- **Async prep:** hooks become §2g reactor primitives
+- **Perf:** additive-neutral for enabled; single-core apps save
+  boot time (not measured by current bench)
+- **Test:** integration test for single-core boot skipping AP
+  bring-up (measure boot-log milestones); unit test for
+  multiple `on_tick` callbacks composing
 
 ---
 
 ## Progress tracker
 
-Update this table as phases land. Perf numbers from HVF 1-core on
-Apple Silicon (M-series).
+### Baseline (commit 70a6f4a, 2026-04-20)
 
-### Baseline (pre-redesign, commit 70a6f4a)
+Measured via `python3 scripts/bench.py --env hvf --cores 1`:
 
-Measured 2026-04-20 via `python3 scripts/bench.py --env hvf --cores 1`:
-
-| Workload | Baseline | Notes |
+| Workload | Baseline | Gate |
 |---|---|---|
-| health_c1         | 35,500 req/s | Single-flow HTTP latency floor |
-| compute_c1        | 6,500 req/s  | Single-flow CPU-bound |
-| health_max        | 194,000 req/s | **Keep-alive HTTP throughput** |
-| compute_max       | 8,000 req/s  | Multi-conn CPU-bound |
-| udp_sync          | 32,000 pkt/s | Single-flow UDP echo |
-| udp_peak          | 184,000 pkt/s | **Max UDP datagram rate** |
-| health_tls_c1     | 28,000 req/s | Single-flow TLS latency |
-| health_tls_max    | 124,000 req/s | **Keep-alive TLS throughput** |
-| tls_handshake_max | 3,300 hs/s   | Full-handshake TLS rate |
+| health_c1 | 35,500 req/s | ±2% |
+| compute_c1 | 6,500 req/s | ±2% |
+| **health_max** | **194,000 req/s** | **hard, ±2%** |
+| compute_max | 8,000 req/s | ±2% |
+| udp_sync | 32,000 pkt/s | ±2% |
+| **udp_peak** | **184,000 pkt/s** | **hard, ±2%** |
+| health_tls_c1 | 28,000 req/s | ±2% |
+| **health_tls_max** | **124,000 req/s** | **hard, ±2%** |
+| tls_handshake_max | 3,300 hs/s | ±2% |
 
-Bolded entries are the three workloads that most commonly regress
-under refactors. These are the primary gates.
+Binary sizes (HVF `.img`): hello 1.9 MB, webserver 2.0 MB.
+`static_mut` count: 46 across 16 files.
 
-### Binary sizes (baseline)
+### Per-phase status
 
-Measured at commit 70a6f4a:
-
-| App | `.img` (HVF aarch64) | `_native` (POSIX) |
-|---|---|---|
-| hello     | 1.9 MB | 192 KB |
-| webserver | 2.0 MB | 196 KB |
-
-### Per-phase tracker
-
-| Phase | Status | Before | After | Binary delta | Notes |
+| # | Phase | Status | Regression | Bin Δ | Notes |
 |---|---|---|---|---|---|
-| 0 | ⏳ not started | — | — | — | |
-| 1 | ⏳ not started | — | — | — | |
-| 2 | ⏳ not started | — | — | — | |
-| 3 | ⏳ not started | — | — | — | |
-| 4 | ⏳ not started | — | — | — | |
-| 5 | ⏳ not started | — | — | — | |
-| 6 | ⏳ not started | — | — | — | |
-| 7 | ⏳ not started | — | — | — | |
-| 8 | ⏳ not started | — | — | — | |
+| 0 | boot_info | ⏳ | — | — | |
+| 1 | error types | ⏳ | — | — | |
+| 2 | Net structural prep | ⏳ | — | — | |
+| 3 | Net::enable | ⏳ | — | — | |
+| 4 | delete auto-init | ⏳ | — | — | |
+| 5 | NIC driver carveouts | ⏳ | — | — | |
+| 6 | uni-tls carveout | ⏳ | — | -900 KB expected | |
+| 7 | static_mut sweep | ⏳ | — | — | |
+| 8 | hooks + SMP opt-in | ⏳ | — | — | |
 
-Status legend: ⏳ not started, 🟡 in progress, 🟢 complete,
-🔴 blocked (perf regression or design issue).
+Status legend: ⏳ not started · 🟡 in progress · 🟢 complete · 🔴 blocked
 
 ---
 
-## Benchmark protocol
+## Validation protocol
 
-### Running the suite
+Each phase's PR must include:
+
+### Benchmark diff
 
 ```bash
-# Before starting a phase:
-git checkout <phase-base-commit>
-python3 scripts/bench.py --env hvf --cores 1 > bench-phase-N-before.txt
+# Before starting phase:
+git checkout <phase-base>
+python3 scripts/bench.py --env hvf --cores 1 > bench-phaseN-before.txt
 
-# After the phase's PR:
-git checkout <phase-head-commit>
-python3 scripts/bench.py --env hvf --cores 1 > bench-phase-N-after.txt
-
-# Compare:
-diff bench-phase-N-before.txt bench-phase-N-after.txt
+# After phase:
+python3 scripts/bench.py --env hvf --cores 1 > bench-phaseN-after.txt
+diff bench-phaseN-before.txt bench-phaseN-after.txt
 ```
 
-### Pass criteria per phase
+**Hard gate:** `health_max`, `udp_peak`, `health_tls_max` regressions
+> 2% are stop-the-line.
 
-All of:
+### Targeted micro-benchmarks
 
-1. **`bazel test //kernel/... //net/... --config=hvf //apps/webserver:test`
-   all green.**
-2. **Per-workload regression ≤ 2%** vs. the phase's baseline. Bolded
-   workloads (`health_max`, `udp_peak`, `health_tls_max`) are hard
-   gates; others have a ±2% tolerance for HVF scheduling noise.
-3. **Binary size regression ≤ 50 KB** for `apps/hello`, `≤ 100 KB`
-   for `apps/webserver`. Phase 4 should show a ~900 KB REDUCTION
-   for hello (no TLS); other phases should be approximately
-   neutral.
-4. **Zero increase in `static_mut` count** (target trajectory is
-   downward toward zero by end of Phase 8).
+Phases with localized perf risk add a dedicated micro-bench:
 
-Any phase that can't hit pass criteria is stop-the-line: fix the
-design before merging.
+- **Phase 2:** `InitOnce::get()` × 1M vs. direct-static access.
+  Threshold: ≤ 3ns/iter difference.
+- **Phase 5:** `NicDriver::send()` indirect vs. direct. Single-
+  driver link: zero delta expected. Multi-driver: ≤ 2ns/iter.
 
-### Measuring binary size
+These are Rust `#[bench]`-style tests under `bazel test`, not
+scripts/bench.
+
+### Test coverage
+
+Each phase's section above includes a **Test:** line. PRs must
+include those tests or a written rationale for omission.
+
+### Binary size
 
 ```bash
 bazel build --config=hvf //apps/hello:hello //apps/webserver:webserver
-ls -l bazel-bin/apps/hello/hello.img bazel-bin/apps/webserver/webserver.img
+ls -l bazel-bin/apps/{hello,webserver}/*.img
 ```
 
-### Measuring `static_mut` count
+Size regressions: hello ≤ 50 KB, webserver ≤ 100 KB, except
+Phase 6 which should REDUCE hello by ~900 KB.
+
+### `static_mut` trajectory
 
 ```bash
-# From repo root:
 rg --stats '^\s*static mut\s+\w+' kernel/ uni/ net/ drivers/ apps/ boot/
-# Target trajectory:
-#   Today:        46
-#   After Phase 8: 0
+# Phase 0-6: non-increasing
+# Phase 7: drops to 0
 ```
 
 ---
 
 ## Hand-off to ROADMAP
 
-After Phase 8 lands, this plan is complete. Next planned work:
+After Phase 8, feature work resumes:
 
-- **ROADMAP §2f** — Task trait + pinned task slots (~300 LOC)
-- **ROADMAP §2g** — Async/await (`Future` + `Waker` + minimal
-  executor)
-- **ROADMAP §3c** — QUIC end-to-end (the first real async consumer)
+- **ROADMAP §2f** — Task trait + pinned task slots
+- **ROADMAP §2g** — Async/await executor (the big one)
+- **ROADMAP §3c** — QUIC (§2g's first real consumer)
 - **ROADMAP §4** — HTTP/3
 - **ROADMAP §5** — IPv6 + NDP
 
-The "async prep" notes on each init-redesign phase document
-exactly what each phase contributes to §2g's executor landing
-cleanly on the restructured codebase.
+The async-prep notes on each phase document exactly what this
+plan contributes to §2g.
 
 ---
 
 ## When to start
 
-None of the triggers in the earlier plan version are active as of
-2026-04-20 (no RAM budget pressure, no compute-only workload, no
-out-of-tree apps). This plan sits ready to pick up when one of the
-following becomes pressing:
+Triggers (none active as of 2026-04-20):
+- Starting ROADMAP §2f/§2g async work
+- Binary-size pressure on a specific deployment
+- A compute-only app materializing
+- `static_mut` tech debt causing concrete issues
 
-- Starting ROADMAP §2f/§2g async work — this plan is prerequisite
-- Starting ROADMAP §3c QUIC work — same
-- Wanting sub-1 MB binaries for a specific deployment
-- Noticing that `static mut` tech debt is growing
-
-When any of those fire, the first session's prompt is:
+Session prompt to start:
 
 ```
-Implement the init redesign, starting with Phase 0. Plan:
-docs/init-redesign.md. Bench baseline is captured in the
-plan's Progress tracker. Each phase is an independent PR;
-each PR must pass the Benchmark protocol's criteria before
-merging. Update the Progress tracker as each phase lands.
+Implement the init redesign starting with Phase 0. Plan:
+docs/init-redesign.md. Baseline bench numbers + per-phase
+tracker at the bottom of the plan. Each phase is an independent
+PR; each must pass the Validation protocol before merging.
+Update the Progress tracker table as phases land.
 ```
 
 ---
 
 ## Appendix: target app shapes after Phase 8
 
-### `apps/compute/main.rs` (hypothetical pure-compute)
-
-```rust
-#![no_std]
-extern crate uni;
-
-struct ComputeApp;
-impl uni::App for ComputeApp {}
-
-#[uni::boot]
-fn boot() {
-    uni::log(b"compute app\n");
-    loop { core::hint::black_box(fibonacci(40)); }
-}
-```
-
-Deps: `["//uni"]`. Binary: ~400 KB.
-
-### `apps/hello/main.rs` (after plan)
+### `apps/hello/main.rs`
 
 ```rust
 #![no_std]
 extern crate alloc;
 extern crate uni;
-
-use uni_http::{Server, Request, Response};
-use uni_net::Net;
-use uni_net_static::{StaticIpConfig, NetStaticExt};
-use uni_tcp::TcpStack;
+use uni::http::{Server, Request, Response};
+use uni_net::{Net, NetBringUp, Ipv4Addr};
 
 struct HelloApp {
     _server: alloc::boxed::Box<Server>,
-    _tcp: TcpStack,
     _net: Net,
 }
 impl uni::App for HelloApp {}
 
 impl HelloApp {
     fn new() -> Self {
-        let net = Net::enable_static(StaticIpConfig {
-            ip: [10, 0, 2, 15].into(),
-            gateway: [10, 0, 2, 2].into(),
-            netmask: [255, 255, 255, 0].into(),
+        let net = Net::enable(NetBringUp::Static {
+            ip: Ipv4Addr([10, 0, 2, 15]),
+            gateway: Ipv4Addr([10, 0, 2, 2]),
+            netmask: Ipv4Addr([255, 255, 255, 0]),
         }).unwrap();
-        let tcp = TcpStack::enable(&net);
 
-        let mut server = Server::new_boxed(&tcp);
+        let mut server = Server::new_boxed(&net);
         server.default_handler(|_| Response::ok(b"text/plain", b"Hello!\n"));
         server.listen(uni::config_port(80));
 
-        HelloApp { _server: server, _tcp: tcp, _net: net }
+        HelloApp { _server: server, _net: net }
     }
 }
 
@@ -670,79 +611,40 @@ impl HelloApp {
 fn boot() { uni::run(HelloApp::new()); }
 ```
 
-Deps: `["//uni", "//uni-http", "//uni-tcp", "//uni-net-static",
-"//uni-driver-virtio-net"]`. Binary: ~1 MB.
+Deps: `uni`, `uni-net`, `uni-http`, `uni-driver-virtio-net`.
+Binary: ~1 MB.
 
-### `apps/webserver/main.rs` (after plan)
+### `apps/webserver/main.rs`
 
 ```rust
-#![no_std]
-extern crate alloc;
-extern crate uni;
-
-use uni_http::{Server, Request, Response};
-use uni_net::Net;
-use uni_dhcp::NetDhcpExt;
-use uni_tcp::TcpStack;
-use uni_tls::{TlsServerConfig, TlsExt};
-use uni_udp::UdpSocket;
-
-struct WebServerApp {
-    _server: alloc::boxed::Box<Server>,
-    _tcp: TcpStack,
-    _net: Net,
+let net = Net::enable(NetBringUp::Dhcp).expect("DHCP failed");
+let mut server = Server::new_boxed(&net);
+server.default_handler(handle_request);
+server.listen(uni::config_port(80));
+if let Some(cfg) = TlsServerConfig::from_dev_cert(CERT, KEY) {
+    uni_tls::listen_tls(&mut server, uni::config_port(443), cfg);
 }
-impl uni::App for WebServerApp {}
-
-impl WebServerApp {
-    fn new() -> Self {
-        let net = Net::enable_dhcp().expect("DHCP failed");
-        let tcp = TcpStack::enable(&net);
-
-        let udp = net.bind_udp(7);
-        udp.on_recv(udp_echo);
-
-        let mut server = Server::new_boxed(&tcp);
-        server.default_handler(handle_request);
-        server.listen(uni::config_port(80));
-
-        if let Some(cfg) = TlsServerConfig::from_dev_cert(DEV_CERT, DEV_KEY) {
-            server.listen_tls(uni::config_port(443), cfg);
-        }
-
-        WebServerApp { _server: server, _tcp: tcp, _net: net }
-    }
-}
-
-#[uni::boot]
-fn boot() { uni::run(WebServerApp::new()); }
 ```
 
-Deps: `["//uni", "//uni-http", "//uni-tls", "//uni-tcp",
-"//uni-udp", "//uni-dhcp", "//uni-driver-nic-all"]`. Binary: ~2 MB.
+Deps: all 6 crates. Binary: ~2 MB.
 
 ---
 
-## After async lands (ROADMAP §2g complete)
+## Post-plan: what async looks like (ROADMAP §2g territory)
 
-This section describes the target shape AFTER ROADMAP §2g lands,
-for reference. NOT part of this plan's scope.
+For reference — NOT part of this plan's scope.
 
 ```rust
 #[uni::boot]
 async fn boot() {
-    let net = Net::enable_dhcp().await.expect("DHCP failed");
-    let tcp = TcpStack::enable(&net);
-
-    let server = Server::new(&tcp)
-        .default_handler(async |req| Response::ok(b"text/plain", b"Hi!\n"))
-        .listen(80);
-
-    server.serve().await;  // runs until shutdown
+    let net = Net::enable(NetBringUp::Dhcp).await.expect("DHCP");
+    let mut server = Server::new_boxed(&net);
+    server.route(b"/", async |_| Response::ok(b"text/plain", b"Hi!\n"));
+    server.serve(80).await;  // runs until shutdown
 }
 ```
 
-The transition from Phase 8 shape to async shape is small — the
-phases in this plan deliberately choose handler-based,
-poll-primitive APIs that wrap into async cleanly without
-restructuring the type system again.
+Getting from Phase 8's sync shape to this async shape is a
+contained ROADMAP §2g task — it's adding Waker hooks on top of
+the poll-based primitives Phase 2-6 already delivered, plus a
+small update to the `#[uni::boot]` macro to wrap async bodies.
