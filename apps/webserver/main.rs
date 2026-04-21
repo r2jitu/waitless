@@ -1,23 +1,121 @@
 // UniKernel Example: HTTP Web Server
 //
-// Pure application logic. `#[uni::boot]` marks the entry point; the
-// `WebServerApp` type holds long-lived state (the HTTP server) and
-// gets handed to the runtime via `uni::run`.
+// `#[uni::boot]` marks the entry point; the `WebServerApp` type
+// holds long-lived state (the HTTP server) and gets handed to the
+// runtime via `uni::run`. Request handlers and diagnostic endpoints
+// are defined further down.
 
 #![no_std]
 
 extern crate alloc;
 extern crate uni;
-use alloc::vec;
+
+use alloc::format;
+use alloc::string::String;
+use core::fmt::Write as _;
+
 use uni::http::{Request, Response, Server, TlsServerConfig};
 
-// Checked-in self-signed ECDSA P-256 dev cert + private key, baked
-// into the binary via include_bytes!. See `apps/webserver/dev_certs/README.md`
-// for details and the regen.sh script. DO NOT USE IN PRODUCTION.
-const DEV_CERT_DER: &[u8] = include_bytes!("dev_certs/dev_cert.der");
-const DEV_KEY_PKCS8_DER: &[u8] = include_bytes!("dev_certs/dev_key.der");
+// ---- Application ------------------------------------------------------------
 
-// ---- Request handlers -------------------------------------------------------
+/// Plain HTTP listener port. `uni::config_port` lets the runner
+/// override this via env var; the argument is the default.
+const HTTP_PORT: u16 = 80;
+
+/// HTTPS listener port. Runs alongside HTTP so apps can be reached
+/// over both protocols with the same routes. The HVF runner / QEMU
+/// user-mode networking forward host ports to these (conventionally
+/// 8080 → :80 and 8443 → :443).
+const HTTPS_PORT: u16 = 443;
+
+/// Holds the long-lived state of the webserver program.
+struct WebServerApp {
+    _server: alloc::boxed::Box<Server>,
+}
+
+impl uni::App for WebServerApp {}
+
+impl WebServerApp {
+    fn new() -> Self {
+        uni::log(b"Starting HTTP server...\n");
+        let http_port = uni::config_port(HTTP_PORT);
+        let https_port = uni::config_tls_port(HTTPS_PORT);
+
+        uni::udp_bind(7, udp_echo);
+        uni::log(b"UDP echo server on port 7\n");
+
+        let mut server = Server::new_boxed();
+        server.default_handler(handle_request);
+        server.listen(http_port);
+
+        if let Some(cfg) = TlsServerConfig::from_dev_cert(DEV_CERT_DER, DEV_KEY_PKCS8_DER) {
+            uni::log(b"TLS: dev cert loaded. Serving HTTPS.\n");
+            server.listen_tls(https_port, cfg);
+        } else {
+            uni::log(b"TLS: failed to parse dev key; HTTPS disabled.\n");
+        }
+
+        uni::log(b"Entering event loop.\n");
+        WebServerApp { _server: server }
+    }
+}
+
+impl Drop for WebServerApp {
+    fn drop(&mut self) {
+        uni::log(b"[app] shutting down\n");
+        // Field drops cascade from here: `_server` tears down
+        // listeners, active conns, TLS config, RX buffers.
+    }
+}
+
+#[uni::boot]
+fn boot() {
+    uni::run(WebServerApp::new());
+}
+
+// ---- Request dispatch + route handlers --------------------------------------
+
+fn handle_request(req: &Request) -> Response {
+    match req.path() {
+        b"/" => Response::ok(b"text/html", INDEX_HTML),
+        b"/health" => Response::ok(b"application/json", HEALTH_JSON),
+        b"/stats" => stats_response(),
+        b"/heap" => heap_response(),
+        b"/compute" => {
+            // black_box prevents the compiler from eliminating compute_work()
+            // as dead code (the return value would otherwise be unused).
+            core::hint::black_box(compute_work());
+            Response::ok(b"application/json", b"{\"status\":\"computed\"}")
+        }
+        b"/tls_profile" => tls_profile_response(),
+        b"/tls_profile_reset" => {
+            uni::http::tls_profile_reset();
+            Response::ok(b"text/plain", b"tls profile reset\n")
+        }
+        _ => Response::not_found(),
+    }
+}
+
+fn udp_echo(src_ip: [u8; 4], src_port: u16, data: &[u8]) {
+    uni::udp_send(src_ip, 7, src_port, data);
+}
+
+/// CPU-intensive work: iterative FNV-1a over 100K inputs. Dominates
+/// per-request cost, making multi-core distribution visible under
+/// `/compute` benchmarks.
+fn compute_work() -> u32 {
+    let mut h: u32 = 2166136261;
+    for i in 0..100_000u32 {
+        h ^= i;
+        h = h.wrapping_mul(16777619);
+    }
+    h
+}
+
+// ---- Static resources -------------------------------------------------------
+
+const HEALTH_JSON: &[u8] =
+    b"{\"status\":\"ok\",\"runtime\":\"unikernel\",\"version\":\"0.1.0\"}";
 
 const INDEX_HTML: &[u8] = b"<!DOCTYPE html>\
 <html><head><title>UniKernel</title>\
@@ -60,238 +158,70 @@ Network backend\n\
 <p><small>UniKernel v0.1.0</small></p>\
 </body></html>";
 
-const HEALTH_JSON: &[u8] = b"{\"status\":\"ok\",\"runtime\":\"unikernel\",\"version\":\"0.1.0\"}";
+// Checked-in self-signed ECDSA P-256 dev cert + private key, baked
+// into the binary via include_bytes!. See apps/webserver/dev_certs/
+// README.md for details and the regen.sh script. DO NOT USE IN
+// PRODUCTION.
+const DEV_CERT_DER: &[u8] = include_bytes!("dev_certs/dev_cert.der");
+const DEV_KEY_PKCS8_DER: &[u8] = include_bytes!("dev_certs/dev_key.der");
 
-// /stats returns per-queue RX frame counts so we can see how the
-// virtio-net device is distributing flows across queue pairs under
-// Tier 1 multi-queue. A diagnostic response — not a production
-// dashboard. Body is rendered into a heap-allocated buffer per
-// request via `Response::ok_owned`, which drops the allocation
-// after `send_response` copies the bytes out.
-const STATS_BUF_LEN: usize = 512;
+// ---- Diagnostic endpoints ---------------------------------------------------
 
+/// Per-queue RX frame counts + used-ring cursors, so we can see how
+/// the NIC is distributing flows under Tier 1 multi-queue. A
+/// diagnostic, not a production dashboard. If `device_idx` moves
+/// but `counts` stays 0, there's a polling bug; if neither moves,
+/// the host side isn't delivering to that queue.
 fn stats_response() -> Response {
-    let mut buf = vec![0u8; STATS_BUF_LEN];
     let counts = uni::net_rx_counts();
     let cursors = uni::net_rx_used_cursors();
     let nqp = uni::net_num_queue_pairs() as usize;
-    let n = fmt_stats(buf.as_mut_slice(), &counts, &cursors, nqp);
-    buf.truncate(n);
-    Response::ok_owned(b"application/json", buf.into_boxed_slice())
-}
 
-fn fmt_stats(
-    buf: &mut [u8],
-    counts: &[u64; 8],
-    cursors: &[(u16, u16); 8],
-    nqp: usize,
-) -> usize {
-    let mut n = 0;
-    let push = |buf: &mut [u8], n: &mut usize, s: &[u8]| {
-        buf[*n..*n + s.len()].copy_from_slice(s);
-        *n += s.len();
-    };
-
-    push(buf, &mut n, b"{\"rx_frames\":[");
+    let mut body = String::from("{\"rx_frames\":[");
     for i in 0..nqp.min(counts.len()) {
-        if i > 0 { buf[n] = b','; n += 1; }
-        n += fmt_u64(&mut buf[n..], counts[i]);
+        if i > 0 { body.push(','); }
+        let _ = write!(body, "{}", counts[i]);
     }
-    // Per-queue used-ring snapshot: device_idx is what Andromeda /
-    // vhost advanced to, cursor is where we polled up to. If
-    // device_idx moves but counts stays 0, we have a polling bug.
-    // If neither moves, the host-side isn't delivering to that
-    // queue at all (legacy virtio RSS failure on GCE).
-    push(buf, &mut n, b"],\"rx_used_dev\":[");
+    body.push_str("],\"rx_used_dev\":[");
     for i in 0..nqp.min(cursors.len()) {
-        if i > 0 { buf[n] = b','; n += 1; }
-        n += fmt_u64(&mut buf[n..], cursors[i].0 as u64);
+        if i > 0 { body.push(','); }
+        let _ = write!(body, "{}", cursors[i].0);
     }
-    push(buf, &mut n, b"],\"rx_used_drv\":[");
+    body.push_str("],\"rx_used_drv\":[");
     for i in 0..nqp.min(cursors.len()) {
-        if i > 0 { buf[n] = b','; n += 1; }
-        n += fmt_u64(&mut buf[n..], cursors[i].1 as u64);
+        if i > 0 { body.push(','); }
+        let _ = write!(body, "{}", cursors[i].1);
     }
-    push(buf, &mut n, b"],\"num_queue_pairs\":");
-    n += fmt_u64(&mut buf[n..], nqp as u64);
-    buf[n] = b'}';
-    n + 1
+    let _ = write!(body, "],\"num_queue_pairs\":{}}}", nqp);
+
+    Response::ok_owned(b"application/json", body.into_bytes().into_boxed_slice())
 }
 
-fn fmt_u64(buf: &mut [u8], mut v: u64) -> usize {
-    if v == 0 { buf[0] = b'0'; return 1; }
-    let mut tmp = [0u8; 20];
-    let mut len = 0;
-    while v > 0 {
-        tmp[len] = b'0' + (v % 10) as u8;
-        v /= 10;
-        len += 1;
-    }
-    for i in 0..len { buf[i] = tmp[len - 1 - i]; }
-    len
-}
-
-// /heap returns a snapshot of kernel heap utilisation (allocated /
-// available / claimed / fragmentation). Body is rendered into a
-// per-request heap buffer via `Response::ok_owned`.
-const HEAP_BUF_LEN: usize = 256;
-
+/// Snapshot of kernel heap utilisation (allocated / available /
+/// claimed / fragmentation).
 fn heap_response() -> Response {
-    let mut buf = vec![0u8; HEAP_BUF_LEN];
-    let stats = uni::heap_stats();
-    let n = fmt_heap(buf.as_mut_slice(), &stats);
-    buf.truncate(n);
-    Response::ok_owned(b"application/json", buf.into_boxed_slice())
+    let s = uni::heap_stats();
+    let body = format!(
+        "{{\"allocated_bytes\":{},\"available_bytes\":{},\"claimed_bytes\":{},\
+         \"allocation_count\":{},\"fragment_count\":{},\"total_allocation_count\":{}}}",
+        s.allocated_bytes,
+        s.available_bytes,
+        s.claimed_bytes,
+        s.allocation_count,
+        s.fragment_count,
+        s.total_allocation_count,
+    );
+    Response::ok_owned(b"application/json", body.into_bytes().into_boxed_slice())
 }
 
-fn fmt_heap(buf: &mut [u8], s: &uni::HeapStats) -> usize {
-    let mut n = 0;
-    let push = |buf: &mut [u8], n: &mut usize, s: &[u8]| {
-        buf[*n..*n + s.len()].copy_from_slice(s);
-        *n += s.len();
-    };
-    push(buf, &mut n, b"{\"allocated_bytes\":");
-    n += fmt_u64(&mut buf[n..], s.allocated_bytes as u64);
-    push(buf, &mut n, b",\"available_bytes\":");
-    n += fmt_u64(&mut buf[n..], s.available_bytes as u64);
-    push(buf, &mut n, b",\"claimed_bytes\":");
-    n += fmt_u64(&mut buf[n..], s.claimed_bytes as u64);
-    push(buf, &mut n, b",\"allocation_count\":");
-    n += fmt_u64(&mut buf[n..], s.allocation_count as u64);
-    push(buf, &mut n, b",\"fragment_count\":");
-    n += fmt_u64(&mut buf[n..], s.fragment_count as u64);
-    push(buf, &mut n, b",\"total_allocation_count\":");
-    n += fmt_u64(&mut buf[n..], s.total_allocation_count);
-    buf[n] = b'}';
-    n + 1
-}
-
-/// CPU-intensive work: iterative hash (FNV-1a, 100K iterations).
-/// Dominates per-request cost, making multi-core distribution visible.
-fn compute_work() -> u32 {
-    let mut h: u32 = 2166136261;
-    for i in 0..100_000u32 {
-        h ^= i;
-        h = h.wrapping_mul(16777619);
-    }
-    h
-}
-
-// /tls_profile renders the TLS handshake profiler's accumulated
-// per-stage timings (maintained in //net:tls_server) as plain text.
-// The maximum report length is ~4 KB; we allocate a per-request
-// buffer via `Response::ok_owned`.
+/// TLS handshake profiler output as plain text. The profiler fills
+/// a caller-provided byte slice (see `net::tls_server::profile`),
+/// so this path stays on the `Vec<u8>` API rather than `format!`.
 const PROFILE_BUF_LEN: usize = 4096;
 
 fn tls_profile_response() -> Response {
-    let mut buf = vec![0u8; PROFILE_BUF_LEN];
+    let mut buf = alloc::vec![0u8; PROFILE_BUF_LEN];
     let n = uni::http::tls_profile_report(buf.as_mut_slice());
     buf.truncate(n);
     Response::ok_owned(b"text/plain", buf.into_boxed_slice())
-}
-
-fn handle_request(req: &Request) -> Response {
-    match req.path() {
-        b"/" => Response::ok(b"text/html", INDEX_HTML),
-        b"/health" => Response::ok(b"application/json", HEALTH_JSON),
-        b"/stats" => stats_response(),
-        b"/heap" => heap_response(),
-        b"/compute" => {
-            // black_box prevents the compiler from eliminating compute_work()
-            // as dead code (the return value would otherwise be unused).
-            core::hint::black_box(compute_work());
-            Response::ok(b"application/json", b"{\"status\":\"computed\"}")
-        }
-        b"/tls_profile" => tls_profile_response(),
-        b"/tls_profile_reset" => {
-            uni::http::tls_profile_reset();
-            Response::ok(b"text/plain", b"tls profile reset\n")
-        }
-        _ => Response::not_found(),
-    }
-}
-
-
-// ---- Application ------------------------------------------------------------
-
-/// Plain HTTP listener port. `uni::config_port` lets the runner
-/// override this via env var (e.g. for per-test fixtures); we pass
-/// 80 as the default.
-const HTTP_PORT: u16 = 80;
-
-/// HTTPS listener port. Runs alongside HTTP so apps can be reached
-/// over both protocols with the same routes. The HVF runner / QEMU
-/// user-mode networking forward a host port to this one for local
-/// testing (conventionally 8080 → :80 and 8443 → :443).
-const HTTPS_PORT: u16 = 443;
-
-/// Long-lived state for the webserver program. Holds the HTTP
-/// `Server` (which in turn owns listeners, the per-core connection
-/// pool, and the TLS config). `impl uni::App` marks it as the
-/// program's top-level type; the runtime takes ownership via
-/// `uni::run` and drops it on graceful shutdown.
-///
-/// The server is accessed by the HTTP service callback via
-/// `http::SERVER_PTR`, which `Server::listen`/`listen_tls` publish
-/// during setup — so the field is held for ownership only, not read
-/// through `&self` in any of this struct's methods.
-struct WebServerApp {
-    _server: alloc::boxed::Box<Server>,
-}
-
-impl uni::App for WebServerApp {}
-
-impl WebServerApp {
-    fn new() -> Self {
-        uni::log(b"Starting HTTP server...\n");
-        let http_port = uni::config_port(HTTP_PORT);
-        let https_port = uni::config_tls_port(HTTPS_PORT);
-
-        // UDP echo server on port 7.
-        fn udp_echo(src_ip: [u8; 4], src_port: u16, data: &[u8]) {
-            uni::udp_send(src_ip, 7, src_port, data);
-        }
-        uni::udp_bind(7, udp_echo);
-        uni::log(b"UDP echo server on port 7\n");
-
-        // Allocate Server (and its per-connection buffers) on the
-        // heap. The WebServerApp wrapper moves the Box into its own
-        // field; the runtime moves WebServerApp into its slot; no
-        // leak, no globals, ownership is explicit throughout.
-        let mut server = Server::new_boxed();
-        server.default_handler(handle_request);
-        server.listen(http_port);
-
-        // HTTPS alongside when the dev cert parses. cert/key moves
-        // into `server` as a field.
-        match TlsServerConfig::from_dev_cert(
-            DEV_CERT_DER,
-            DEV_KEY_PKCS8_DER,
-        ) {
-            Some(cfg) => {
-                uni::log(b"TLS: dev cert loaded. Serving HTTPS.\n");
-                server.listen_tls(https_port, cfg);
-            }
-            None => {
-                uni::log(b"TLS: failed to parse dev key; HTTPS disabled.\n");
-            }
-        }
-
-        uni::log(b"Entering event loop.\n");
-
-        WebServerApp { _server: server }
-    }
-}
-
-impl Drop for WebServerApp {
-    fn drop(&mut self) {
-        uni::log(b"[app] shutting down\n");
-        // Field drops cascade from here: `_server` tears down
-        // listeners, active conns, TLS config, RX buffers, the lot.
-    }
-}
-
-#[uni::boot]
-fn boot() {
-    uni::run(WebServerApp::new());
 }
