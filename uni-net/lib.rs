@@ -1,29 +1,40 @@
 // uni-net/lib.rs — net-stack crate.
 //
-// Carved out of `uni::net` (the module) so driver crates
-// (`uni-driver-virtio-net`, `uni-driver-gve` in Phase 5 Step 3+)
-// can implement `EthernetDriver` without creating a `drivers → uni`
+// Carved out of `uni::net` (the module) so driver crates can
+// implement `EthernetDriver` without creating a `drivers → uni`
 // dep cycle. Apps still reach the same surface via `uni::net::*`
 // and `uni::{NetError, DhcpError, NicError}` — `uni/lib.rs` re-
 // exports this crate unchanged so no app-side imports move.
 //
 // Layout:
-//   * `error` module — NetError / DhcpError / NicError + From
-//     chain. Shared with driver crates (`NicError`) and boot code
-//     (`NetError`). Standalone-testable.
-//   * `Net::enable` API — Phases 3/4.
-//   * `EthernetDriver` trait + `register_ethernet_driver!` macro
-//     + `linked_ethernet_drivers()` walker — Phase 5 Step 1.
-//
-// On native the bring-up path is a no-op: POSIX sockets come
-// pre-configured. Only the umbrella's `tls_server` is pulled in
-// (for the hand-rolled TLS 1.3 state machine shared across both
-// platforms).
+//   * `uni_net_driver` (leaf crate) — the driver contract
+//     (EthernetDriver trait, NicHandle, error types,
+//     registration macro, section walker). Split out so driver
+//     crates depend on it without inheriting the full net stack.
+//     Re-exported from this crate's root.
+//   * `Net::enable` API — Phases 3/4, lives in this file.
+//   * Umbrella re-export — brings tcp/udp/arp/ipv4/tls_server from
+//     the bare-metal `net` umbrella, or just `tls_server` on native.
 
 #![no_std]
 
 // `alloc` for Box<Net> in the module-level slot.
 extern crate alloc;
+
+// Re-export the driver API (trait + macro + walker + errors +
+// NicHandle) so `uni_net::EthernetDriver` and friends resolve
+// unchanged. The leaf crate owns the definitions.
+extern crate uni_net_driver;
+pub use uni_net_driver::{
+    linked_ethernet_drivers, DhcpError, EthernetDriver, EthernetDriverReg, NetError,
+    NicError, NicHandle,
+};
+
+// Re-export the registration macro at this crate root too. Apps /
+// driver crates that depend on `uni_net` can write
+// `uni_net::register_ethernet_driver!(…)` instead of reaching for
+// `uni_net_driver`.
+pub use uni_net_driver::register_ethernet_driver;
 
 // ---- Umbrella re-export ---------------------------------------------------
 //
@@ -47,11 +58,6 @@ extern crate net_tls_server as net_tls_server_impl;
 pub mod tls_server {
     pub use crate::net_tls_server_impl::*;
 }
-
-// ---- Error types ----------------------------------------------------------
-
-pub mod error;
-pub use error::{DhcpError, NetError, NicError};
 
 // ---- Public net-stack API -------------------------------------------------
 
@@ -233,143 +239,4 @@ fn bringup(_cfg: NetBringUp) -> Result<(), NetError> {
 fn to_net_ipv4(a: Ipv4Addr) -> net_umbrella::types::Ipv4Addr {
     let [o0, o1, o2, o3] = a.0;
     net_umbrella::types::Ipv4Addr::from(o0, o1, o2, o3)
-}
-
-// ============================================================================
-// Phase 5: ethernet driver registration mechanism
-// ============================================================================
-//
-// Drivers register at LINK time via `register_ethernet_driver!`, which
-// emits one `EthernetDriverReg` into the `.uni_drivers_ethernet`
-// section. The kernel discovers linked drivers by walking
-// `[__start_uni_drivers_ethernet, __stop_uni_drivers_ethernet)` at
-// boot. Zero runtime registration overhead; "no driver linked" is an
-// empty section and walks to an empty slice (no probe, no call).
-
-/// Opaque handle identifying a successfully-probed NIC. Drivers that
-/// support multiple NIC instances can use it to distinguish them;
-/// single-NIC drivers can treat it as a presence token.
-#[derive(Clone, Copy, Debug)]
-pub struct NicHandle {
-    _private: (),
-}
-
-impl NicHandle {
-    /// Construct a handle. Meant for driver `probe()` implementations;
-    /// framework code never constructs one directly. `pub` so driver
-    /// crates (which live outside `uni_net`) can return handles.
-    pub const fn new() -> Self {
-        NicHandle { _private: () }
-    }
-}
-
-impl Default for NicHandle {
-    fn default() -> Self { NicHandle::new() }
-}
-
-/// The ethernet driver contract. Implementors hand ethernet frames
-/// to `uni_net` on RX and accept ethernet frames from `uni_net` on
-/// TX. Phase 5 doesn't add Waker / async hooks — §2g's executor will
-/// grow those on the same type (or a subtrait) when it knows what it
-/// needs.
-///
-/// Intentionally NOT `pub fn init()` + free functions: a trait lets
-/// a single `dyn EthernetDriver` sit in the linker section, giving
-/// `Net::enable` one call shape to probe and one to dispatch
-/// through. Multi-driver apps pay the same indirect-call cost per
-/// packet as the current `drivers::net::use_gvnic()` branch, without
-/// the hardcoded driver names.
-pub trait EthernetDriver: 'static + Sync {
-    /// Short identifier used by diagnostics and `boot_info()`. Stable
-    /// strings preferred (`"virtio-net"`, `"gve"`).
-    fn name(&self) -> &'static str;
-
-    /// Try to bring up the NIC. `None` = this driver doesn't match
-    /// the hardware present (e.g. `gve` probing a QEMU host that
-    /// doesn't expose a Google NIC). `Net::enable` walks probes in
-    /// link order and uses the first success.
-    fn probe(&self) -> Option<NicHandle>;
-
-    /// Transmit one ethernet frame. Returns `NicError::TxQueueFull`
-    /// when the caller should retry later.
-    fn send(&self, handle: &NicHandle, frame: &[u8]) -> Result<(), NicError>;
-
-    /// Drain any received frames, invoking `cb` once per frame.
-    /// Returns the number of frames delivered. Zero means "no RX
-    /// pending right now" — the caller should go idle.
-    fn poll_rx(&self, handle: &NicHandle, cb: &mut dyn FnMut(&[u8])) -> usize;
-}
-
-/// A link-time driver registration. One instance per linked driver
-/// crate, placed in the `.uni_drivers_ethernet` section by
-/// `register_ethernet_driver!`.
-#[repr(C)]
-pub struct EthernetDriverReg {
-    /// Implementation placed behind a `&'static dyn` so the
-    /// registration entry has a known layout (fat pointer: vtable
-    /// + data, both pointer-sized). ALIGN(8) in the linker script
-    /// matches that layout.
-    pub driver: &'static dyn EthernetDriver,
-}
-
-/// Register a driver with `uni_net` at link time. Expands to a
-/// `static` in the `.uni_drivers_ethernet` section, which
-/// `Net::enable` discovers via the section-boundary symbols.
-///
-/// Usage inside a driver crate:
-///
-/// ```ignore
-/// struct VirtioNetDriver;
-/// impl uni_net::EthernetDriver for VirtioNetDriver { /* ... */ }
-/// static DRIVER: VirtioNetDriver = VirtioNetDriver;
-/// uni_net::register_ethernet_driver!(DRIVER);
-/// ```
-#[macro_export]
-macro_rules! register_ethernet_driver {
-    ($driver:expr) => {
-        #[used]
-        #[unsafe(link_section = ".uni_drivers_ethernet")]
-        static ETHERNET_DRIVER_REG: $crate::EthernetDriverReg =
-            $crate::EthernetDriverReg { driver: &$driver };
-    };
-}
-
-// Section-boundary symbols, provided by the linker script for every
-// unikernel target. On `platform_native` these don't exist (no custom
-// linker script), so the `linked_ethernet_drivers()` accessor always
-// returns an empty slice there — matches the reality that native
-// doesn't use ethernet drivers at all.
-#[cfg(platform_unikernel)]
-unsafe extern "Rust" {
-    static __start_uni_drivers_ethernet: EthernetDriverReg;
-    static __stop_uni_drivers_ethernet: EthernetDriverReg;
-}
-
-/// All ethernet drivers linked into this binary. Empty if no
-/// `uni-driver-*` crate is in the dep graph (compute-only apps). One
-/// `unsafe` block — every other step of the registration mechanism
-/// is safe Rust.
-#[cfg(platform_unikernel)]
-pub fn linked_ethernet_drivers() -> &'static [EthernetDriverReg] {
-    // SAFETY: the linker guarantees `__start_*` ≤ `__stop_*` and
-    // that `[start, stop)` is a contiguous run of `EthernetDriverReg`
-    // values (the registration macro is the only writer of the
-    // section, and it only emits `EthernetDriverReg` statics). Each
-    // entry is fully initialised before boot code runs, because
-    // `#[used]` + `#[link_section]` statics live in `.rodata` and
-    // are materialised at link time, not at runtime.
-    unsafe {
-        let start = &__start_uni_drivers_ethernet as *const EthernetDriverReg;
-        let end = &__stop_uni_drivers_ethernet as *const EthernetDriverReg;
-        let count = end.offset_from(start) as usize;
-        core::slice::from_raw_parts(start, count)
-    }
-}
-
-/// Native builds have no linker section, so always return empty.
-/// Apps on native reach the network through POSIX sockets, not
-/// ethernet drivers.
-#[cfg(platform_native)]
-pub fn linked_ethernet_drivers() -> &'static [EthernetDriverReg] {
-    &[]
 }

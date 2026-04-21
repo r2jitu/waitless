@@ -1,9 +1,10 @@
 // uni-net/error.rs — Shared error hierarchy for the net stack.
 //
-// Moved out of `uni::error` as part of the uni-net crate carveout —
-// these errors flow across the crate boundary (driver implementers,
-// app bring-up code), so they live at the level that owns the net
-// API. `uni::error` keeps a compat re-export.
+// Lives in the leaf `uni_net_driver` crate so the `EthernetDriver`
+// trait can reference `NicError` in its signature, and so driver
+// crates depend on just this leaf rather than the full `uni_net`.
+// `uni_net` re-exports the types so apps keep writing `uni_net::
+// NetError` and `uni::NetError` unchanged.
 //
 // Design rules:
 //   1. Every error fits in ≤ 2 pointers (16 bytes on 64-bit). Keeps
@@ -11,15 +12,13 @@
 //   2. Errors are `Copy + Debug + PartialEq` so callers can pattern-
 //      match on them and tests can assert specific values.
 //   3. Conversions chain upward: driver/DHCP failures bubble into
-//      `NetError`. Never downward — nothing in this crate converts a
-//      `NetError` into a `DhcpError`.
+//      `NetError`. Never downward.
 //   4. TlsError currently lives in `net/tls_server.rs` (pre-existing).
 //      It joins this hierarchy in Phase 6 when `uni-tls` is carved
 //      out; no conversions are defined here yet.
 //
-// Self-contained (only `core::`) so this file can compile as a
-// standalone `rust_test` for host-native unit tests, mirroring
-// `uni/boot_info.rs`.
+// Self-contained (only `core::`) so this file also compiles as a
+// standalone `rust_test` for host-native unit tests.
 
 #![allow(dead_code)] // Some variants are populated by Phase 5+ code.
 
@@ -122,10 +121,6 @@ impl From<DhcpError> for NetError {
 }
 
 // ---- Size invariants -------------------------------------------------------
-//
-// All error types must fit in ≤ 2 pointers (16 bytes on 64-bit) so
-// `Result<T, E>` stays compact at every call site. Enforced at compile
-// time via `const _: () = assert!(...)`.
 
 const MAX_ERROR_BYTES: usize = 2 * core::mem::size_of::<usize>();
 

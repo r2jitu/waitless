@@ -3,24 +3,46 @@ load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 
 package(default_visibility = ["//visibility:public"])
 
-# uni-net — the net-stack crate carved out of `uni::net`.
+# ── Leaf: uni_net_driver (ethernet driver contract) ─────────────────
 #
-# Owns `Net::enable` + `NetBringUp` + `Ipv4Addr`, the
-# `NetError` / `DhcpError` / `NicError` hierarchy, and the Phase 5
-# `EthernetDriver` / `register_ethernet_driver!` registration
-# machinery. Apps keep importing these via `uni::net::*` and
-# `uni::{NetError, …}` — `//uni:uni` re-exports this crate.
+# Tiny no-dep crate that hosts the `EthernetDriver` trait plus its
+# support types (`NicHandle`, `NicError`) and the link-time registry
+# machinery (`EthernetDriverReg`, `register_ethernet_driver!`,
+# `linked_ethernet_drivers()`).
 #
-# Driver crates (`uni-driver-virtio-net`, `uni-driver-gve` in later
-# Phase 5 steps) will depend on this crate for the `EthernetDriver`
-# trait and the `register_ethernet_driver!` macro, without pulling
-# in `//uni`. That's the whole point of the carveout: break the
-# `drivers → uni` cycle that would otherwise prevent the driver
-# split.
+# Sits here rather than inside the main `uni_net` crate so driver
+# crates (`drivers`, and the forthcoming `//uni-driver-virtio-net`
+# / `//uni-driver-gve`) can depend on just this one leaf without
+# pulling in the full net stack. Concretely it breaks the cycle
+#
+#     drivers → uni_net → net (umbrella) → drivers
+#
+# that would otherwise appear the moment `drivers/virtio_net.rs`
+# does `impl EthernetDriver`.
+rust_library(
+    name = "driver",
+    srcs = [
+        "driver.rs",
+        "error.rs",
+    ],
+    crate_name = "uni_net_driver",
+    crate_root = "driver.rs",
+    rustc_flags = select({
+        "//bazel/platforms:native": ["--cfg=platform_native"],
+        "//conditions:default": ["--cfg=platform_unikernel"],
+    }) + UNIKERNEL_RUSTC_FLAGS,
+)
+
+# ── Main uni_net crate ─────────────────────────────────────────────
+#
+# Owns `Net::enable` + `NetBringUp` + `Ipv4Addr`, the `NetError` /
+# `DhcpError` hierarchy, and re-exports the full `driver` surface
+# and the bare-metal net umbrella. Apps keep importing via
+# `uni::net::*` and `uni::{NetError, …}` — `//uni:uni` re-exports
+# this crate.
 rust_library(
     name = "uni_net",
     srcs = [
-        "error.rs",
         "lib.rs",
     ],
     crate_name = "uni_net",
@@ -29,11 +51,7 @@ rust_library(
         "//bazel/platforms:native": ["--cfg=platform_native"],
         "//conditions:default": ["--cfg=platform_unikernel"],
     }) + UNIKERNEL_RUSTC_FLAGS,
-    # Native build uses only the hand-rolled TLS 1.3 state machine
-    # (everything else goes through POSIX sockets). Bare-metal
-    # builds pull the full `//net` umbrella for TCP / UDP / ARP /
-    # IPv4 / DHCP / TLS server.
-    deps = select({
+    deps = [":driver"] + select({
         "//bazel/platforms:native": [
             "//net:tls",
             "//net:tls_crypto",
@@ -47,10 +65,7 @@ rust_library(
     }),
 )
 
-# Host-native unit tests for the shared error hierarchy. Runs as a
-# standalone test crate (no deps on alloc / kernel / net) so it
-# sidesteps the panic-strategy conflict that dep chains through
-# `//kernel` or the RustCrypto deps would trigger.
+# Host-native unit tests for the shared error hierarchy.
 rust_test(
     name = "error_test",
     srcs = ["error.rs"],

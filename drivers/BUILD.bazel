@@ -16,5 +16,8 @@ rust_library(
     ],
     crate_root = "lib.rs",
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
-    deps = ["//kernel"],
+    deps = [
+        "//kernel",
+        "//uni-net:driver",
+    ],
 )

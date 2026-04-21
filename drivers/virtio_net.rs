@@ -919,21 +919,45 @@ fn irq_handler(_irq: u32) {
 // Public API — VirtIO-net
 // ============================================================================
 
+/// Set when `init()` has returned `true`. Mirrors
+/// `gvnic::probe_ok()` so the `EthernetDriver` trait impl can
+/// report which driver actually bound hardware at boot. Read
+/// via `probe_ok()` below; do not read directly.
+static PROBE_OK: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 pub fn init() -> bool {
     log(b"virtio_net: initializing...\n");
 
     #[cfg(target_arch = "aarch64")]
     {
-        if init_mmio() { return true; }
+        if init_mmio() {
+            PROBE_OK.store(true, core::sync::atomic::Ordering::Release);
+            return true;
+        }
     }
     // Try modern PCI first (supports multi-queue), fall back to legacy.
-    if init_pci_modern() { return true; }
+    if init_pci_modern() {
+        PROBE_OK.store(true, core::sync::atomic::Ordering::Release);
+        return true;
+    }
     #[cfg(target_arch = "x86_64")]
     {
-        return init_legacy_pci();
+        if init_legacy_pci() {
+            PROBE_OK.store(true, core::sync::atomic::Ordering::Release);
+            return true;
+        }
+        return false;
     }
     #[cfg(not(target_arch = "x86_64"))]
     false
+}
+
+/// Whether `init()` successfully bound a VirtIO-net NIC. Used by
+/// the Phase 5 `EthernetDriver` trait impl (`VirtioNetDriver`) to
+/// decide whether probing should return `Some(NicHandle)`.
+pub fn probe_ok() -> bool {
+    PROBE_OK.load(core::sync::atomic::Ordering::Acquire)
 }
 
 pub fn get_mac(mac_out: *mut u8) {
@@ -1490,3 +1514,52 @@ pub fn flush_tx_kick_if_dirty() -> bool {
         unsafe { (*ndev()).tx_queues[0].flush_kick_if_dirty() }
     }
 }
+
+// ============================================================================
+// Phase 5: EthernetDriver trait adapter
+// ============================================================================
+//
+// `VirtioNetDriver` is a ZST that adapts the existing module-level
+// functions to the `EthernetDriver` trait contract. Registered via
+// `register_ethernet_driver!` so the `.uni_drivers_ethernet` section
+// walker picks it up. Actual probing still runs via the legacy
+// `drivers::net::init()` path today — Phase 5 Step 5 flips
+// `Net::enable` to drive the probe directly.
+
+use uni_net_driver::{EthernetDriver, NicError, NicHandle};
+
+pub struct VirtioNetDriver;
+
+impl EthernetDriver for VirtioNetDriver {
+    fn name(&self) -> &'static str {
+        "virtio-net"
+    }
+
+    fn probe(&self) -> Option<NicHandle> {
+        if probe_ok() {
+            Some(NicHandle::new())
+        } else {
+            None
+        }
+    }
+
+    fn send(&self, _handle: &NicHandle, frame: &[u8]) -> Result<(), NicError> {
+        // `send()` is fire-and-forget — the driver stages full
+        // queues onto the per-core TX ring rather than surfacing
+        // back-pressure. Return `Ok(())` always; Phase 5 Step 5's
+        // Net::enable + §2g's async layer can grow richer
+        // semantics when they need them.
+        send(frame);
+        Ok(())
+    }
+
+    fn poll_rx(&self, _handle: &NicHandle, cb: fn(&[u8])) -> usize {
+        // `poll` returns an `i32` count of frames drained.
+        let n = poll(cb);
+        if n < 0 { 0 } else { n as usize }
+    }
+}
+
+pub static VIRTIO_NET_DRIVER: VirtioNetDriver = VirtioNetDriver;
+
+uni_net_driver::register_ethernet_driver!(VIRTIO_NET_DRIVER);
