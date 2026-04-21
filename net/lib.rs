@@ -27,7 +27,45 @@ pub extern crate net_ipv4 as ipv4;
 pub extern crate net_tcp as tcp;
 pub extern crate net_udp as udp;
 pub extern crate net_dhcp as dhcp;
+pub extern crate net_protocol as protocol;
 pub extern crate net_tls_server as tls_server;
+
+// Process-wide IP protocol dispatch table. Populated by `init_stack`
+// at boot; consulted on the hot path by `net_receive` /
+// `distribute_frame`.
+pub static REGISTRY: protocol::Registry = protocol::Registry::new();
+
+// Thin wrappers converting the u32-IP registry ABI to the
+// Ipv4Addr-typed `tcp_receive` / `udp_receive` entry points. Kept
+// here (rather than inside each protocol crate) so `net_protocol`
+// stays dependency-free and its rust_test avoids the panic-strategy
+// conflict that `:types` would drag in.
+fn tcp_dispatch(src: u32, dst: u32, payload: &[u8]) {
+    tcp::tcp_receive(
+        types::Ipv4Addr { addr: src },
+        types::Ipv4Addr { addr: dst },
+        payload,
+    );
+}
+fn udp_dispatch(src: u32, dst: u32, payload: &[u8]) {
+    udp::udp_receive(
+        types::Ipv4Addr { addr: src },
+        types::Ipv4Addr { addr: dst },
+        payload,
+    );
+}
+
+/// One-shot wiring of TCP/UDP into the protocol registry. Idempotent
+/// — re-registration replaces the previous handler, which is harmless
+/// since the handler pointers are stable link-time addresses.
+///
+/// Called from `boot/entry.rs` after `tcp::init()`; also by the
+/// forthcoming `Net::enable` constructor (Phase 3) so apps that go
+/// through the new API don't depend on boot-path ordering.
+pub fn init_stack() {
+    REGISTRY.register(ipv4::PROTO_TCP, tcp_dispatch);
+    REGISTRY.register(ipv4::PROTO_UDP, udp_dispatch);
+}
 
 use kernel::percpu;
 
@@ -218,20 +256,15 @@ fn distribute_frame(frame: &[u8]) {
                     );
 
                     let my_core = kernel::cpu_id();
-                    if target == my_core {
-                        // Target is the current core — process inline (no inbox).
-                        match pkt.protocol {
-                            ipv4::PROTO_TCP => tcp::tcp_receive(pkt.src, pkt.dst, pkt.payload),
-                            ipv4::PROTO_UDP => udp::udp_receive(pkt.src, pkt.dst, pkt.payload),
-                            _ => {}
-                        }
-                    } else if num_cores <= 1 {
-                        // Single-core fallback.
-                        match pkt.protocol {
-                            ipv4::PROTO_TCP => tcp::tcp_receive(pkt.src, pkt.dst, pkt.payload),
-                            ipv4::PROTO_UDP => udp::udp_receive(pkt.src, pkt.dst, pkt.payload),
-                            _ => {}
-                        }
+                    if target == my_core || num_cores <= 1 {
+                        // Target is this core (or we're running
+                        // single-core) — dispatch inline via the
+                        // protocol registry. Unknown protocols fall
+                        // through silently, same as the previous
+                        // hardcoded match.
+                        REGISTRY.dispatch(
+                            pkt.protocol, pkt.src.addr, pkt.dst.addr, pkt.payload,
+                        );
                     } else {
                         // Distribute to target core's RX inbox.
                         // SAFETY: percpu::init() runs before any AP starts;
@@ -267,11 +300,9 @@ pub fn net_receive(frame: &[u8]) {
                     if ipv4::same_subnet(pkt.src) {
                         arp::arp_learn(pkt.src, src_mac);
                     }
-                    match pkt.protocol {
-                        ipv4::PROTO_TCP => tcp::tcp_receive(pkt.src, pkt.dst, pkt.payload),
-                        ipv4::PROTO_UDP => udp::udp_receive(pkt.src, pkt.dst, pkt.payload),
-                        _ => {}
-                    }
+                    REGISTRY.dispatch(
+                        pkt.protocol, pkt.src.addr, pkt.dst.addr, pkt.payload,
+                    );
                 }
             }
             _ => {}

@@ -452,6 +452,11 @@ unsafe fn kernel_boot(info: &BootInfo) {
         klog!("[INIT] TCP stack...\n");
         net::tcp::init();
 
+        // Populate the IP protocol-dispatch registry. After this
+        // `net_receive` routes TCP/UDP packets through
+        // `net::REGISTRY` instead of a hardcoded match.
+        net::init_stack();
+
         klog!("[INIT] Interrupt-driven idle...\n");
         drivers::net::enable_irq();
 

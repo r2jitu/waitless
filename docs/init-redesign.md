@@ -669,7 +669,7 @@ Binary sizes (HVF `.img`): hello 1.9 MB, webserver 2.0 MB.
 |---|---|---|---|---|---|
 | 0 | boot_info | 🟢 | none (additive only) | hello +<1 KB, webserver +<1 KB | `uni::boot_info()` populated from `boot/entry.rs` (unikernel) and `init_native` (native). Host-native unit test (`//uni:boot_info_test`, 7 cases) + webserver serial-log grep integration check. No hot-path touched. |
 | 1 | error types | 🟢 | none (types only) | none | `uni::error::{NetError, DhcpError, NicError}` with `From` impls (`NicError → NetError`, `DhcpError → NetError`). All errors `Copy + ≤ 16 B` (const-asserted). Host-native unit test (`//uni:error_test`, 7 cases including `?`-operator chains and size invariants). `TlsError` stays in `net/tls_server.rs` until Phase 6. |
-| 2 | Net structural prep | ⏳ | — | — | |
+| 2 | Net structural prep | 🟡 | TBD (registry pending bench validation on HVF) | none | **Protocol registry landed**: new `net_protocol` crate with `Registry::{register,unregister,dispatch}` + `//net:protocol_test` (5 cases). Hot-path TCP/UDP dispatch in `net_receive` / `distribute_frame` now routes through `net::REGISTRY`; `net::init_stack()` wires TCP+UDP at boot. One relaxed load + one indirect call per packet replaces the old hardcoded match — expected cost parity. **Deferred**: `InitOnce<PerCore<…>>` wrappers for `CONNECTIONS` / `ARP_FAST` / `IP_ID_PERCORE` — mechanical refactor but needs `health_max` / `udp_peak` bench runs to confirm the amortized-load mitigation. |
 | 3 | Net::enable | ⏳ | — | — | |
 | 4 | delete auto-init | ⏳ | — | — | |
 | 5 | NIC driver carveouts | ⏳ | — | — | |

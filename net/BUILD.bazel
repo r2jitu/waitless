@@ -36,6 +36,24 @@ rust_test(
     rustc_flags = ["-Cpanic=unwind"],
 )
 
+# IP protocol dispatch registry — replaces hardcoded TCP/UDP match in
+# `net::net_receive`. One relaxed load + one indirect call per packet.
+# Zero-dep (only `core`) so `rust_test` doesn't hit the panic-strategy
+# conflict that dep chains through `:types` would otherwise trigger.
+rust_library(
+    name = "protocol",
+    srcs = ["protocol.rs"],
+    crate_root = "protocol.rs",
+    crate_name = "net_protocol",
+    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+)
+
+rust_test(
+    name = "protocol_test",
+    crate = ":protocol",
+    rustc_flags = ["-Cpanic=unwind"],
+)
+
 # Protocol parsing tests — host-native, tests raw byte parsing for all protocols.
 # No deps on bare-metal crates (panic=abort incompatible with test harness).
 rust_test(
@@ -309,6 +327,7 @@ rust_library(
         ":tcp",
         ":udp",
         ":dhcp",
+        ":protocol",
         ":tls_server",
         "//drivers",
         "//kernel",
