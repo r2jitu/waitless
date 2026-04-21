@@ -184,6 +184,10 @@ unsafe extern "C" {
     fn sysconf(name: i32) -> i64;
 
     #[cfg(target_os = "macos")]
+    fn sysctlbyname(name: *const u8, oldp: *mut u8, oldlenp: *mut usize,
+                    newp: *const u8, newlen: usize) -> i32;
+
+    #[cfg(target_os = "macos")]
     fn __error() -> *mut i32;
     #[cfg(target_os = "linux")]
     fn __errno_location() -> *mut i32;
@@ -226,6 +230,37 @@ pub fn num_cpus() -> usize {
     const SC_NPROCESSORS_ONLN: i32 = 84;
     let n = unsafe { sysconf(SC_NPROCESSORS_ONLN) };
     if n > 0 { n as usize } else { 1 }
+}
+
+/// Total physical RAM, in bytes, as reported by the host. Zero means
+/// "unknown" (portability fallback). macOS reads `hw.memsize`;
+/// Linux multiplies `_SC_PHYS_PAGES` by `_SC_PAGESIZE`.
+fn host_ram_bytes() -> usize {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let mut val: u64 = 0;
+        let mut len = core::mem::size_of::<u64>();
+        let name = b"hw.memsize\0".as_ptr();
+        if sysctlbyname(name, &mut val as *mut u64 as *mut u8, &mut len,
+                        core::ptr::null(), 0) == 0 {
+            return val as usize;
+        }
+        0
+    }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        const SC_PAGESIZE: i32 = 30;
+        const SC_PHYS_PAGES: i32 = 85;
+        let pages = sysconf(SC_PHYS_PAGES);
+        let page = sysconf(SC_PAGESIZE);
+        if pages > 0 && page > 0 {
+            (pages as usize).saturating_mul(page as usize)
+        } else {
+            0
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    { 0 }
 }
 
 // ============================================================================
@@ -589,6 +624,19 @@ fn init_native() {
     // No dedicated RX threads — same inline-poll pattern as the HVF
     // runner's vCPU loop.
     crate::register_io_poll(|_worker_id| tcp_poll());
+
+    // Publish the boot-time snapshot. The native backend has no NIC
+    // driver (POSIX sockets go through the host stack), so `nics` is
+    // empty.
+    use crate::boot_info::{BootInfoParams, NicInfo, MAX_NICS};
+    crate::boot_info::init_boot_info(BootInfoParams {
+        ram_bytes: host_ram_bytes(),
+        num_cpus: num_cpus() as u32,
+        boot_args: "",
+        nics: [NicInfo::EMPTY; MAX_NICS],
+        nic_count: 0,
+        rtc_epoch: None,
+    });
 }
 
 // ============================================================================

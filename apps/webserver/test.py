@@ -138,6 +138,18 @@ class WebserverServiceTest(unittest.TestCase):
     def test_udp_echo(self) -> None:
         self.assertEqual(udp_echo(port=UDP_PORT), b"hello")
 
+    # ── Phase 0: boot_info surfaces through the serial log ───────
+    def test_boot_info_logged(self) -> None:
+        """Webserver's startup log must contain a BOOT_INFO line sourced
+        from `uni::boot_info()`. This is the Phase 0 integration check
+        for the init-redesign plan — it confirms `boot_info()` is wired
+        up on whichever runner this test happens to be executing under
+        (hvf / qemu / iso / native)."""
+        log = self.launcher.log_path.read_bytes()
+        self.assertIn(b"BOOT_INFO ram=", log,
+                      f"BOOT_INFO line missing from serial log (length={len(log)})")
+        self.assertIn(b"cpus=", log)
+
 
 class WebserverShutdownTest(unittest.TestCase):
     """Verify a Ctrl-C byte on the guest serial shuts the VM down promptly.

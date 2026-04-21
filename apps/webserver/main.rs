@@ -37,6 +37,7 @@ impl uni::App for WebServerApp {}
 
 impl WebServerApp {
     fn new() -> Self {
+        log_boot_info();
         uni::log(b"Starting HTTP server...\n");
         let http_port = uni::config_port(HTTP_PORT);
         let https_port = uni::config_tls_port(HTTPS_PORT);
@@ -98,6 +99,35 @@ fn handle_request(req: &Request) -> Response {
 
 fn udp_echo(src_ip: [u8; 4], src_port: u16, data: &[u8]) {
     uni::udp_send(src_ip, 7, src_port, data);
+}
+
+/// Emit the contents of `uni::boot_info()` at startup. The line tags
+/// (`BOOT_INFO ram=...`) are stable so the webserver integration test
+/// can grep them out of the serial log.
+fn log_boot_info() {
+    let bi = uni::boot_info();
+    let mut line: String = String::new();
+    let _ = write!(
+        line,
+        "BOOT_INFO ram={} cpus={} nics={} boot_args=\"{}\"\n",
+        bi.ram_bytes,
+        bi.num_cpus,
+        bi.nics.len(),
+        bi.boot_args,
+    );
+    uni::log(line.as_bytes());
+    for (i, nic) in bi.nics.iter().enumerate() {
+        let mut l: String = String::new();
+        let _ = write!(
+            l,
+            "BOOT_INFO nic[{}] name={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} qps={}\n",
+            i,
+            nic.name,
+            nic.mac[0], nic.mac[1], nic.mac[2], nic.mac[3], nic.mac[4], nic.mac[5],
+            nic.num_queue_pairs,
+        );
+        uni::log(l.as_bytes());
+    }
 }
 
 /// CPU-intensive work: iterative FNV-1a over 100K inputs. Dominates

@@ -1,4 +1,4 @@
-load("@rules_rust//rust:defs.bzl", "rust_library")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 
 package(default_visibility = ["//visibility:public"])
@@ -6,6 +6,7 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "uni",
     srcs = [
+        "boot_info.rs",
         "http.rs",
         "lib.rs",
         "native.rs",
@@ -40,4 +41,15 @@ rust_library(
             "//net",
         ],
     }),
+)
+
+# Host-native unit tests for the self-contained boot_info module.
+# boot_info.rs uses only `core::`, so compiling it as a standalone
+# test crate exercises the struct layout + InitOnce without pulling
+# in kernel/drivers/net.
+rust_test(
+    name = "boot_info_test",
+    srcs = ["boot_info.rs"],
+    crate_root = "boot_info.rs",
+    rustc_flags = ["-Cpanic=unwind"],
 )

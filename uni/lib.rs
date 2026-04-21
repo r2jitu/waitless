@@ -48,7 +48,10 @@ mod unikernel;
 #[cfg(platform_native)]
 pub mod native;
 
+pub mod boot_info;
 pub mod http;
+
+pub use boot_info::{boot_info, BootInfo, NicInfo};
 
 // ----------------------------------------------------------------------------
 // App framework — the runtime's handle on the user's program

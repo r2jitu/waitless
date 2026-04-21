@@ -522,6 +522,10 @@ unsafe fn kernel_boot(info: &BootInfo) {
         kernel::eventloop::set_idle(idle_cb);
     }
 
+    // Publish the read-only boot snapshot to apps. Must run after
+    // SMP and NIC init so `num_cpus` and `nics` are final.
+    publish_boot_info(net_ok);
+
     klog!("\n[BOOT] All subsystems ready. Starting application.\n\n");
     uni_main();
 
@@ -543,6 +547,40 @@ unsafe fn kernel_boot(info: &BootInfo) {
 
     arch_shutdown();
     }
+}
+
+/// Populate `uni::boot_info()` from kernel + driver state. Called
+/// exactly once during `kernel_boot` after SMP and NIC init. Apps
+/// read the resulting snapshot via `uni::boot_info()` to size
+/// per-core buffers, log runtime identity, etc.
+fn publish_boot_info(net_ok: bool) {
+    use uni::boot_info::{BootInfoParams, NicInfo, MAX_NICS};
+
+    let mut nics = [NicInfo::EMPTY; MAX_NICS];
+    let mut nic_count: u8 = 0;
+    if net_ok {
+        let mut mac = [0u8; 6];
+        drivers::net::get_mac(mac.as_mut_ptr());
+        nics[0] = NicInfo {
+            name: drivers::net::driver_name(),
+            mac,
+            num_queue_pairs: drivers::net::num_queue_pairs(),
+        };
+        nic_count = 1;
+    }
+
+    uni::boot_info::init_boot_info(BootInfoParams {
+        ram_bytes: kernel::mm::get_total_memory(),
+        num_cpus: kernel::percpu::num_cores(),
+        // No kernel command line plumbed through the boot shim yet —
+        // expose an empty string so apps can still rely on the field.
+        boot_args: "",
+        nics,
+        nic_count,
+        // RTC isn't queried at boot yet. Left `None`; a future phase
+        // can plumb ACPI FADT CMOS / FDT rtc.
+        rtc_epoch: None,
+    });
 }
 
 /// Event loop idle callback. Core-aware:

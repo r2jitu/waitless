@@ -55,6 +55,12 @@ pub fn num_queue_pairs() -> u16 {
     }
 }
 
+/// Short identifier of the active driver. Used by `uni::boot_info()`
+/// to label the NIC entry and by diagnostic endpoints.
+pub fn driver_name() -> &'static str {
+    if use_gvnic() { "gvnic" } else { "virtio-net" }
+}
+
 pub fn activate_multi_queue() {
     // gVNIC has a different multi-queue model (CONFIGURE_RSS +
     // per-core queues are set up at driver init, Phase 4). On the
