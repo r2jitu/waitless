@@ -94,8 +94,8 @@ uni-net                — L3 + TCP + UDP + ARP + DHCP + static-IP
                          (internal submodules; one public boundary)
 uni-http               — HTTP/1.1 over a transport
 uni-tls                — TLS 1.3 config + wrapping functions
-uni-driver-virtio-net  — driver crate
-uni-driver-gvnic       — driver crate
+uni-driver-virtio-net  — VirtIO ethernet driver (QEMU, HVF, most VMs)
+uni-driver-gve         — Google Virtual Ethernet driver (GCE) — renamed from gvnic
 ```
 
 **Why 6, not 13:** earlier drafts split `uni-udp`, `uni-tcp`,
@@ -113,7 +113,7 @@ proportional payoff.
 Dependency graph:
 
 ```
-uni ←── uni-net ←── uni-driver-virtio-net, uni-driver-gvnic
+uni ←── uni-net ←── uni-driver-virtio-net, uni-driver-gve
            ↑
         uni-http ←── uni-tls
 ```
@@ -124,7 +124,7 @@ Apps depend on the minimum they need:
 |---|---|---|
 | compute | `uni` | ~400 KB |
 | hello (plain HTTP) | `uni`, `uni-http`, `uni-driver-virtio-net` | ~1 MB |
-| webserver (HTTP + TLS) | `uni`, `uni-http`, `uni-tls`, `uni-driver-{virtio-net,gvnic}` | ~2 MB |
+| webserver (HTTP + TLS) | `uni`, `uni-http`, `uni-tls`, `uni-driver-{virtio-net,gve}` | ~2 MB |
 
 ---
 
@@ -184,12 +184,12 @@ impl TcpStream {
 }
 ```
 
-**NIC driver registration:** drivers implement a `NicDriver` trait
-(defined in `uni-net`) and register at link time by placing a
-registration struct in a dedicated linker section
-(`.uni_drivers_nic`). `Net::enable` walks the section to discover
-linked drivers and probes them in order. See
-[Driver registration mechanism](#driver-registration-mechanism)
+**Ethernet driver registration:** drivers implement the
+`EthernetDriver` trait (defined in `uni-net`) and register at
+link time by placing a registration struct in a dedicated linker
+section (`.uni_drivers_ethernet`). `Net::enable` walks the
+section to discover linked drivers and probes them in order.
+See [Driver registration mechanism](#driver-registration-mechanism)
 below for the full pattern.
 
 **Native:** `Net` on native is a thin `libc::socket` wrapper;
@@ -236,8 +236,8 @@ platforms.
 
 ```rust
 pub struct VirtioNetDriver;
-impl uni_net::NicDriver for VirtioNetDriver { /* ... */ }
-uni_net::register_nic_driver!(VirtioNetDriver);
+impl uni_net::EthernetDriver for VirtioNetDriver { /* ... */ }
+uni_net::register_ethernet_driver!(VirtioNetDriver);
 ```
 
 **Native:** these crates have no native backend — they're
@@ -256,37 +256,55 @@ driver crate places a `static` registration struct in a section
 named after its subsystem. `uni-net::Net::enable` walks the
 section at boot to discover linked drivers.
 
+### Terminology: ethernet, not NIC
+
+We name the trait `EthernetDriver` (not `NicDriver`) because the
+trait's contract is specifically **ethernet frames in, ethernet
+frames out**. Both virtio-net and gVNIC/gVE present as virtualized
+ethernet NICs — they emit ethernet frames (14-byte header,
+src/dst MAC, EtherType, payload). If we ever added wifi or
+another L2, it'd need a separate trait (different frame format,
+different state semantics like association / authentication),
+not a unified "NIC" abstraction trying to cover both.
+
+Naming by L2 protocol also clarifies the caller relationship:
+`net/ethernet.rs` is the consumer; `EthernetDriver` implementers
+are the producers. "NIC" is too vague — could be ethernet, wifi,
+loopback, or virtual.
+
 ### Section naming: subsystem-scoped, not generic
 
-Each subsystem owns its own section, named `.uni_drivers_<kind>`.
-For NICs that's `.uni_drivers_nic`. The `_nic` suffix matters:
-it leaves the naming open for future subsystems without requiring
-a refactor.
+Each subsystem owns its own section, named `.uni_drivers_<kind>`
+or equivalent. For ethernet drivers that's `.uni_drivers_ethernet`.
+The suffix matters: it leaves the naming open for future
+subsystems without requiring a refactor.
 
 Not planned but enabled by the naming:
 
 | Subsystem | Section | If ever added |
 |---|---|---|
-| NICs | `.uni_drivers_nic` | Phase 5 below |
+| Ethernet drivers | `.uni_drivers_ethernet` | Phase 5 below |
 | Block storage | `.uni_drivers_block` | future |
 | Filesystems | `.uni_filesystems` | future |
 | IP protocols | `.uni_protocols` | possibly Phase 2 |
+| WiFi (if ever) | `.uni_drivers_wifi` | hypothetical |
 
-Each has its own registration type (`NicDriverReg`, future
+Each has its own registration type (`EthernetDriverReg`, future
 `BlockDriverReg`, etc.) and its own macro
-(`register_nic_driver!`, future `register_block_driver!`). Type
-safety stays local to the subsystem; no shared cross-type section.
+(`register_ethernet_driver!`, future `register_block_driver!`).
+Type safety stays local to the subsystem; no shared cross-type
+section.
 
-**This plan only implements `.uni_drivers_nic`.** The other
+**This plan only implements `.uni_drivers_ethernet`.** The other
 sections are future work if/when those subsystems materialize.
 Naming is reserved now to avoid a rename later.
 
-### How it works for NIC drivers
+### How it works for ethernet drivers
 
 ```rust
 // uni-net/src/driver.rs
 
-pub trait NicDriver: 'static + Sync {
+pub trait EthernetDriver: 'static + Sync {
     fn name(&self) -> &'static str;
     fn probe(&self) -> Option<NicHandle>;
     fn send(&self, h: &NicHandle, frame: &[u8]) -> Result<(), NicError>;
@@ -294,16 +312,16 @@ pub trait NicDriver: 'static + Sync {
 }
 
 #[repr(C)]
-pub struct NicDriverReg {
-    pub driver: &'static dyn NicDriver,
+pub struct EthernetDriverReg {
+    pub driver: &'static dyn EthernetDriver,
 }
 
 #[macro_export]
-macro_rules! register_nic_driver {
+macro_rules! register_ethernet_driver {
     ($driver:expr) => {
-        #[unsafe(link_section = ".uni_drivers_nic")]
+        #[unsafe(link_section = ".uni_drivers_ethernet")]
         #[used]
-        static NIC_DRIVER_REG: $crate::NicDriverReg = $crate::NicDriverReg {
+        static ETHERNET_DRIVER_REG: $crate::EthernetDriverReg = $crate::EthernetDriverReg {
             driver: &$driver,
         };
     };
@@ -312,14 +330,14 @@ macro_rules! register_nic_driver {
 // Walker — the one unsafe block. Generalizes to future subsystems
 // via the same pattern (different section name + type).
 extern "Rust" {
-    static __start_uni_drivers_nic: NicDriverReg;
-    static __stop_uni_drivers_nic: NicDriverReg;
+    static __start_uni_drivers_ethernet: EthernetDriverReg;
+    static __stop_uni_drivers_ethernet: EthernetDriverReg;
 }
 
-fn linked_drivers() -> &'static [NicDriverReg] {
+fn linked_ethernet_drivers() -> &'static [EthernetDriverReg] {
     unsafe {
-        let start = &__start_uni_drivers_nic as *const NicDriverReg;
-        let end = &__stop_uni_drivers_nic as *const NicDriverReg;
+        let start = &__start_uni_drivers_ethernet as *const EthernetDriverReg;
+        let end = &__stop_uni_drivers_ethernet as *const EthernetDriverReg;
         let count = end.offset_from(start) as usize;
         core::slice::from_raw_parts(start, count)
     }
@@ -327,7 +345,7 @@ fn linked_drivers() -> &'static [NicDriverReg] {
 
 impl Net {
     pub fn enable(cfg: NetBringUp) -> Result<Net, NetError> {
-        let drivers = linked_drivers();
+        let drivers = linked_ethernet_drivers();
         if drivers.is_empty() {
             return Err(NetError::NoDriver);
         }
@@ -346,10 +364,10 @@ impl Net {
 Each target-specific linker script gets:
 
 ```
-.uni_drivers_nic : ALIGN(8) {
-    __start_uni_drivers_nic = .;
-    KEEP(*(.uni_drivers_nic))
-    __stop_uni_drivers_nic = .;
+.uni_drivers_ethernet : ALIGN(8) {
+    __start_uni_drivers_ethernet = .;
+    KEEP(*(.uni_drivers_ethernet))
+    __stop_uni_drivers_ethernet = .;
 }
 ```
 
@@ -378,7 +396,7 @@ adds its own section to the same scripts. No churn to the pattern.
   documented + small. Everything else (trait impls, registration
   macro) is safe Rust.
 - **Empty section is empty.** Compute-only app with no driver
-  crates linked: `__start_* == __stop_*`, `linked_drivers()`
+  crates linked: `__start_* == __stop_*`, `linked_ethernet_drivers()`
   returns empty slice, `Net::enable` returns `NoDriver`
   immediately. Zero wasted bytes.
 
@@ -510,28 +528,36 @@ network. 8 global slots collapse to 1 (`NET: static Option<Box<Net>>`).
   `NET.is_none()` before `Net::enable` returns and after app
   exits; unit test: `Net::enable` twice returns `Err`
 
-### Phase 5: NIC driver carveouts + state consolidation
+### Phase 5: Ethernet driver carveouts + state consolidation
 
 Splits `drivers/virtio_net.rs` and `drivers/gvnic.rs` into
-`uni-driver-virtio-net` and `uni-driver-gvnic` crates. Each
-driver crate collapses its scattered state into ONE
-`InitOnce<Driver>` anchor implementing `NicDriver`, and registers
-itself via `uni_net::register_nic_driver!(Driver)`.
+`uni-driver-virtio-net` and `uni-driver-gve` crates. Each driver
+crate collapses its scattered state into ONE `InitOnce<Driver>`
+anchor implementing `EthernetDriver`, and registers itself via
+`uni_net::register_ethernet_driver!(Driver)`.
+
+**gvnic → gve rename, as part of this phase.** `drivers/gvnic.rs`
+is Google's driver; Linux calls it `gve` (Google Virtual
+Ethernet), and Google uses "gve" for the driver and "gVNIC" for
+the product. To match Linux convention and avoid conflating the
+driver with the NIC, the file becomes `gve.rs` and the crate
+becomes `uni-driver-gve`. `uni-driver-virtio-net` keeps its name
+(matches VirtIO spec terminology).
 
 **Prerequisites (land as part of this phase, BEFORE carving):**
 
-1. `NicDriver` trait + `NicDriverReg` + `register_nic_driver!`
+1. `EthernetDriver` trait + `EthernetDriverReg` + `register_ethernet_driver!`
    macro land in `uni-net`. See the
    [Driver registration mechanism](#driver-registration-mechanism)
    section above for the concrete code.
-2. `.uni_drivers_nic` section added to all three unikernel linker
+2. `.uni_drivers_ethernet` section added to all three unikernel linker
    scripts (`unikernel_x86_64.ld`, `unikernel_aarch64.ld`,
    `unikernel_limine.ld`) — ~5 lines each.
 3. `Net::enable` walks the section to find drivers.
 
 With those in place, carving each driver is a move-and-register
-operation: move files into the new crate, impl `NicDriver`,
-add one `register_nic_driver!` line at module root.
+operation: move files into the new crate, impl `EthernetDriver`,
+add one `register_ethernet_driver!` line at module root.
 
 No `register_rx_waker` stub on the trait — §2g adds that when
 it designs the Waker layer.
@@ -543,15 +569,15 @@ needed.
 - **Effort:** 3-4 d
 - **Async prep:** driver state is now in a clean struct; §2g
   can add Waker hooks as fields later without touching the
-  public NicDriver trait
+  public EthernetDriver trait
 - **Perf:** neutral. Single-driver apps get direct calls
   through the section walk's single indirect call per packet
   (~1-2 ns, below bench-noise floor). Multi-driver apps pay
-  same per-packet cost (one `&dyn NicDriver` call). Must
+  same per-packet cost (one `&dyn EthernetDriver` call). Must
   confirm with isolated micro-bench: 1M calls of
   `driver.send(&frame)` with one vs. multiple drivers linked,
   compare to today's direct-dispatch baseline.
-- **Test:** `register_nic_driver!` macro unit tests (section
+- **Test:** `register_ethernet_driver!` macro unit tests (section
   boundary detection with 0 / 1 / 2 registered drivers);
   verify `Net::enable` returns `NoDriver` cleanly when zero
   crates linked; verify single-driver app probes successfully;
@@ -680,7 +706,7 @@ Phases with localized perf risk add a dedicated micro-bench:
 
 - **Phase 2:** `InitOnce::get()` × 1M vs. direct-static access.
   Threshold: ≤ 3ns/iter difference.
-- **Phase 5:** `NicDriver::send()` indirect vs. direct. Single-
+- **Phase 5:** `EthernetDriver::send()` indirect vs. direct. Single-
   driver link: zero delta expected. Multi-driver: ≤ 2ns/iter.
 
 These are Rust `#[bench]`-style tests under `bazel test`, not
