@@ -78,31 +78,40 @@ bazel test --config=x86_64-qemu //apps/webserver:test   # QEMU x86_64
 
 ## Writing an Application
 
+The minimal example — a single-route HTTP server that responds with
+plain text (see [apps/hello](apps/hello) for the full source):
+
 ```rust
 #![no_std]
+extern crate alloc;
 extern crate uni;
 use uni::http::{Request, Response, Server};
 
-struct MyApp { _server: alloc::boxed::Box<Server> }
-impl uni::App for MyApp {}
+struct HelloApp { _server: alloc::boxed::Box<Server> }
 
-impl MyApp {
+impl uni::App for HelloApp {}
+
+impl HelloApp {
     fn new() -> Self {
         let mut server = Server::new_boxed();
-        server.default_handler(|req: &Request| {
-            Response::ok(b"text/plain", b"Hello from bare metal!")
-        });
+        server.default_handler(hello);
         server.listen(uni::config_port(80));
-        server.run();
-        MyApp { _server: server }
+        HelloApp { _server: server }
     }
+}
+
+fn hello(_: &Request) -> Response {
+    Response::ok(b"text/plain", b"Hello from bare metal!\n")
 }
 
 #[uni::boot]
 fn boot() {
-    uni::run(MyApp::new());
+    uni::run(HelloApp::new());
 }
 ```
+
+For a richer example with HTTPS, multiple routes, and diagnostic
+endpoints, see [apps/webserver](apps/webserver).
 
 ```python
 # apps/myapp/BUILD.bazel
@@ -127,7 +136,8 @@ unikernel_binary(
 
 ```
 unikernel/
-├── apps/webserver/         HTTP + HTTPS example (include_bytes! dev cert)
+├── apps/hello/             Minimal HTTP hello-world example (~30 LOC)
+├── apps/webserver/         Full demo: HTTP + HTTPS + diagnostics
 ├── uni/                    Platform abstraction crate
 │   ├── lib.rs              TcpListener, TcpStream, log, config
 │   ├── http.rs             HTTP/1.1 server (+ TLS wrapper)

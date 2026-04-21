@@ -1,0 +1,21 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
+load("//bazel/rules:unikernel.bzl", "unikernel_binary")
+
+package(default_visibility = ["//visibility:public"])
+
+# Minimal hello-world app — the shortest possible unikernel binary
+# that still handles HTTP. Serves as the README's framework example;
+# contrast with //apps/webserver for a richer demo (TLS, multiple
+# routes, diagnostics).
+rust_library(
+    name = "app",
+    srcs = ["main.rs"],
+    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    deps = ["//uni"],
+)
+
+unikernel_binary(
+    name = "hello",
+    app = ":app",
+)
