@@ -56,17 +56,15 @@ def _launcher_env(port: int, tls_port: int, udp_port: int) -> dict[str, str]:
 
     VM launchers (hvf / qemu_*) read `UNIKERNEL_*` to set up host→guest
     port forwards. The native binary (`webserver_native`, direct
-    rust_binary — no launcher script) reads `PORT` / `TLS_PORT` /
-    `UDP_PORT` to pick its listen sockets. Setting both keeps the
-    caller ignorant of which variant LAUNCHER points at.
+    rust_binary — no launcher script) also reads `UNIKERNEL_*`
+    (legacy `PORT` / `TLS_PORT` / `UDP_PORT` still honored as a
+    fallback in `uni::native` for old scripts). Unified name keeps
+    the caller ignorant of which variant LAUNCHER points at.
     """
     return {
         "UNIKERNEL_PORT": str(port),
         "UNIKERNEL_TLS_PORT": str(tls_port),
         "UNIKERNEL_UDP_PORT": str(udp_port),
-        "PORT": str(port),
-        "TLS_PORT": str(tls_port),
-        "UDP_PORT": str(udp_port),
     }
 
 if not (LAUNCHER.is_file() and os.access(LAUNCHER, os.X_OK)):
