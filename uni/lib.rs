@@ -107,6 +107,9 @@ static APP_SLOT: AppSlot =
 /// Returns immediately; the kernel event loop (unikernel) or
 /// native C main (native) takes over from here.
 ///
+/// Signals the event loop that app initialization is complete, so
+/// worker cores can begin servicing requests.
+///
 /// On graceful shutdown, the runtime drops the box — your app's
 /// `Drop` impl runs, then field destructors cascade.
 pub fn run<A: App>(app: A) {
@@ -116,6 +119,7 @@ pub fn run<A: App>(app: A) {
         *APP_SLOT.0.get() = Some(boxed);
     }
     install_shutdown_hook();
+    backend::set_ready();
 }
 
 /// Invoked from the event-loop exit path (unikernel BSP after the

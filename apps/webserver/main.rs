@@ -278,7 +278,6 @@ impl WebServerApp {
         }
 
         uni::log(b"Entering event loop.\n");
-        server.run();
 
         WebServerApp { _server: server }
     }

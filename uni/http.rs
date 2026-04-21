@@ -1,19 +1,20 @@
 // uni/http.rs — HTTP/1.1 server library (pure Rust, no_std)
 //
-// Non-blocking cooperative model: Server::run() polls the network stack,
-// accepts connections, reads data, parses HTTP requests, dispatches to
-// handlers, and sends responses.
+// Non-blocking cooperative model: the kernel event loop polls the
+// network stack, accepts connections, reads data, parses HTTP
+// requests, dispatches to handlers, and sends responses.
 //
-// Multi-core: each core creates its own TCP listener and maintains its
-// own active connection set. Core 0 runs the main event loop; APs run
-// HTTP service via the percpu ap_poll hook. Routes are shared (read-only).
+// Multi-core: each core creates its own TCP listener and maintains
+// its own active connection set. Core 0 runs the main event loop;
+// APs run HTTP service via the percpu ap_poll hook. Routes are
+// shared (read-only).
 //
-// HTTPS: `Server::run_tls(port, config)` wraps each accepted connection
-// in a `net_tls_server::TlsServer`. The service loop funnels incoming
-// TCP bytes through the TLS state machine, feeds decrypted plaintext
-// into the same HTTP parser, encrypts responses back out. From the
-// request-handler's perspective nothing changes — the `Request` and
-// `Response` types are identical.
+// HTTPS: `Server::listen_tls(port, config)` wraps each accepted
+// connection in a `net_tls_server::TlsServer`. The service loop
+// funnels incoming TCP bytes through the TLS state machine, feeds
+// decrypted plaintext into the same HTTP parser, encrypts responses
+// back out. From the request-handler's perspective nothing changes
+// — the `Request` and `Response` types are identical.
 
 use alloc::boxed::Box;
 
@@ -424,14 +425,15 @@ impl Server {
     /// Add a plain-HTTP listener on `port`. Creates a TCP listener on
     /// every worker (SO_REUSEPORT on native, per-core pool on
     /// unikernel). Non-blocking — returns immediately. Combine with
-    /// `listen_tls()` and `run()` to serve both HTTP and HTTPS on
-    /// different ports with shared routes:
+    /// `listen_tls()` to serve both HTTP and HTTPS on different
+    /// ports with shared routes:
     ///
     /// ```ignore
     /// server.listen(80);                       // plain HTTP
     /// server.listen_tls(443, tls_config);      // HTTPS
-    /// server.run();                            // enter event loop
     /// ```
+    /// The workers start servicing requests once `uni::run(app)`
+    /// signals readiness.
     pub fn listen(&mut self, port: u16) {
         let nw = crate::num_workers();
 
@@ -494,29 +496,6 @@ impl Server {
         crate::set_service(http_service_cb);
 
         crate::log(b"http: listening (TLS)\n");
-    }
-
-    /// Enter the event loop with whatever listeners have been
-    /// configured via `listen()` / `listen_tls()`. Blocks until
-    /// shutdown on unikernel; returns to `native::main()` on native
-    /// where the POSIX worker threads take over.
-    pub fn run(&mut self) {
-        crate::set_ready();
-    }
-
-    /// Convenience: one plain HTTP listener + run. Same as
-    /// `listen(port); run();`. Matches the original single-listener
-    /// API for apps that don't need TLS.
-    pub fn run_http(&mut self, port: u16) {
-        self.listen(port);
-        self.run();
-    }
-
-    /// Convenience: one HTTPS listener + run. Same as
-    /// `listen_tls(port, config); run();`.
-    pub fn run_tls(&mut self, port: u16, config: TlsServerConfig) {
-        self.listen_tls(port, config);
-        self.run();
     }
 
     /// Service connections for a specific core. Returns true if any work was done.
