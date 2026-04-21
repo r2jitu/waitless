@@ -1,5 +1,6 @@
 load("@rules_python//python:defs.bzl", "py_test")
 load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//bazel/rules:integration_test.bzl", "integration_data")
 load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 load("//bazel/rules:unikernel.bzl", "unikernel_binary")
 
@@ -22,29 +23,32 @@ unikernel_binary(
     app = ":app",
 )
 
-# One test covers every runner: it lists :webserver (the launcher) as a
-# data dep, spawns it as a subprocess, and probes HTTP / HTTPS / UDP,
-# plus a PTY-driven Ctrl-C regression check. Runner-specific launch
-# logic lives in the :webserver target — the test doesn't need to know
-# HVF from QEMU from ISO from native.
+# `integration_data` wraps `:webserver` under a one-hop Bazel transition
+# that re-asserts `-Cpanic=abort` for the unikernel dep-graph. Without
+# it, `bazel test`'s `-Cpanic=unwind` default (needed by the libtest
+# harness) would propagate to the `data = [":webserver"]` subgraph and
+# fail to compile the `#![no_std]` rlibs. See `integration_test.bzl`
+# for the full rationale.
+integration_data(
+    name = "webserver_for_test",
+    src = ":webserver",
+)
+
+# One test covers every runner: it lists :webserver (via the wrapper
+# above) as a data dep, spawns it as a subprocess, and probes HTTP /
+# HTTPS / UDP, plus a PTY-driven Ctrl-C regression check. Runner-
+# specific launch logic lives in the :webserver target — the test
+# doesn't need to know HVF from QEMU from ISO from native.
 py_test(
     name = "test",
     timeout = "long",
     srcs = ["test.py"],
     deps = ["//scripts:test_helpers"],
     data = [
-        ":webserver",
+        ":webserver_for_test",
         "//apps/webserver/dev_certs:dev_cert.pem",
     ],
     tags = [
-        # `integration` is filtered out of `bazel test //...` by
-        # default (.bazelrc's `test --test_tag_filters=-integration`)
-        # — the integration test rebuilds the webserver unikernel
-        # binary, and that build can't see the test-verb's
-        # `panic=unwind` override. Users run this test via
-        # `bazel test --config=hvf //apps/webserver:test`, which
-        # re-asserts `panic=abort` for the bare-metal rebuild.
-        "integration",
         "exclusive",
         "local",
     ],
