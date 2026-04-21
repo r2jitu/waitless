@@ -530,38 +530,21 @@ unsafe fn kernel_boot(info: &BootInfo) {
     klog!("\n[BOOT] All subsystems ready. Starting application.\n\n");
     uni_main();
 
-    // Post-uni_main network finalisation. Two steps:
+    // Post-uni_main: promote virtio-net to multi-queue if the
+    // device negotiated MQ. Apps that wanted networking have
+    // already called `uni::net::Net::enable` from `uni_main`,
+    // which ran DHCP (or applied a static config) in single-queue
+    // mode; activating MQ here enables host-side RSS for the
+    // steady-state traffic. MQ activation breaks single-queue
+    // DHCP polling (host-side RSS sprays frames across queues),
+    // so it has to come AFTER the app's Net::enable call.
     //
-    //   1. Auto-init fallback — apps that didn't call
-    //      `uni::net::Net::enable` (typically because they don't
-    //      do networking at all — test_smp / test_percpu /
-    //      test_tls) get the legacy DHCP-with-10.0.2.15/24
-    //      fallback so they boot unchanged.
-    //
-    //   2. Multi-queue activation — MQ enables host-side RSS,
-    //      which sprays incoming frames across queue pairs and
-    //      breaks single-queue DHCP polling, so it must come
-    //      AFTER DHCP (whether Net::enable or the fallback ran
-    //      it).
-    //
-    // Both steps skip when the app requested shutdown inside
-    // uni_main — a DHCP timeout would add ~10 s to the exit of
-    // those tests.
+    // Phase 4 deleted the auto-init DHCP fallback — apps that
+    // don't call `Net::enable` get no network. Test apps
+    // (test_smp, test_percpu, test_tls) don't use networking and
+    // are unaffected. MQ activation is also skipped on a shutdown
+    // request so those tests exit promptly.
     if net_ok && !kernel::eventloop::is_shutdown() {
-        if !uni::net::was_enabled() {
-            klog!("[INIT] DHCP (auto-init fallback)...\n");
-            if net::bringup_dhcp() {
-                klog!("       IP obtained successfully\n");
-            } else {
-                klog!("       [WARN] DHCP failed, using 10.0.2.15/24\n");
-                net::bringup_static(
-                    net::types::Ipv4Addr::from(10, 0, 2, 15),
-                    net::types::Ipv4Addr::from(10, 0, 2, 2),
-                    net::types::Ipv4Addr::from(255, 255, 255, 0),
-                );
-            }
-            uni::net::mark_enabled_by_auto_init();
-        }
         drivers::net::activate_multi_queue();
     }
 

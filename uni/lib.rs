@@ -152,6 +152,12 @@ pub fn shutdown_and_drop() {
     // runs the concrete A's Drop impl (if any), and returns the
     // allocation to the heap.
     drop(taken);
+
+    // Tear down the Phase-4 NET slot symmetrically. The Box is a
+    // ZST today, so the drop is a no-op allocation-wise, but the
+    // `Option::take` resets `is_enabled()` to false — useful on
+    // native if the runtime is ever re-entered.
+    net::clear_on_shutdown();
 }
 
 /// Route `shutdown_and_drop` into the platform-specific event-loop

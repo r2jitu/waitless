@@ -1,30 +1,35 @@
-// uni/net.rs — Phase 3 `Net::enable` API.
+// uni/net.rs — `Net::enable` API (Phases 3 + 4).
 //
 // Apps call `Net::enable(NetBringUp::Dhcp)` (or `Static { … }`) at
-// startup to bring the network stack online explicitly. Existing
-// code that doesn't call it still works: `boot/entry.rs` runs an
-// auto-init fallback (DHCP) after `uni_main` returns unless
-// `Net::enable` was already called.
+// startup to bring the network stack online. After Phase 4 there is
+// no boot-path fallback: an app that doesn't call `enable` gets no
+// network. This mirrors `uni::run`: explicit, typed, app-driven.
 //
-// Phase 4 removes the fallback and promotes `Net::enable` from
-// "forward-compat" to the only bring-up path. Phases 5/6 carve out
-// `uni-net` as a dedicated crate; this module becomes that crate's
-// `lib.rs` at that point. Until then `Net` is a module inside `uni`
-// to avoid adding a new crate ahead of need.
+// State shape:
+//
+//   static NET: NetSlot = NetSlot::empty();
+//
+// On success `enable` allocates a `Box<Net>` and parks it in the
+// slot. Subsequent `enable` calls see `Some(_)` and return
+// `Err(NetError::AlreadyEnabled)`. `uni::shutdown_and_drop` clears
+// the slot on graceful exit, symmetric with the `App` slot.
+//
+// Net is zero-sized today. Phase 5/6 carve out `uni-net` as a
+// standalone crate and that's when fields like `config`,
+// `udp_handlers`, `dhcp_state`, `dispatcher` move in — touching them
+// now would need the protocol sub-crates to depend on `uni::net`,
+// which inverts the current dep graph. The slot shape is already in
+// place so the field additions are a focused follow-up rather than a
+// whole-tree reshape.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::cell::UnsafeCell;
 
 pub use crate::error::{NetError, DhcpError};
 
 // Re-export the umbrella crate's contents (TCP, UDP, TLS server,
 // types, …) under `crate::net::*` for internal `uni::*` consumers
 // only. Keeps `uni/http.rs` and the backend module in `uni/lib.rs`
-// writing `net::tls_server::X` / `net::tcp::X` unchanged. The
-// re-export is `pub(crate)` so external apps don't see it — they
-// interact with networking through the curated `Net::enable`,
-// `Ipv4Addr`, `NetBringUp` surface defined below. Phase 5 replaces
-// this module with a standalone `uni-net` crate; the narrow
-// re-export gives us a single namespace to carve out.
+// writing `net::tls_server::X` / `net::tcp::X` unchanged.
 pub(crate) use crate::net_umbrella::*;
 
 /// IPv4 octets, network-order storage. Defined locally (rather than
@@ -62,43 +67,68 @@ pub enum NetBringUp {
     },
 }
 
-/// Opaque handle returned by `Net::enable`. Holding one signals
-/// "the app has brought up the stack explicitly" — used by the
-/// boot path's auto-init fallback check (see `was_enabled`).
+/// Opaque handle returned by `Net::enable`. Phase 4 wires the real
+/// storage (a `Box<Net>` parked in the module-level `NET` slot);
+/// future phases grow per-subsystem fields onto this type.
 ///
-/// Phase 4 will attach fields (config, dispatcher, UDP handlers)
-/// to this type. For now it's zero-sized so apps can hand it
-/// around freely without worrying about ownership semantics.
+/// Zero-sized today, so copying the handle around is free. The
+/// private field prevents users from synthesising one without going
+/// through `enable`.
 pub struct Net {
-    // Private field so users can't synthesize a `Net` without
-    // calling `enable` (which is the thing that sets the flag).
     _private: (),
 }
 
-/// Flag observed by `boot/entry.rs` after `uni_main` returns to
-/// decide whether to run the DHCP fallback. Set by `Net::enable`;
-/// never cleared.
-static ENABLED: AtomicBool = AtomicBool::new(false);
+// ---- NET slot --------------------------------------------------------------
+//
+// Mirrors the `APP_SLOT` pattern in `uni/lib.rs`: a single static
+// holding `Option<Box<Net>>`, written only on the boot CPU, cleared
+// only from `uni::shutdown_and_drop` (also BSP). `Box<Net>` for a
+// zero-sized `Net` doesn't allocate — `Box` uses a dangling pointer
+// for ZSTs — so the slot is currently "presence/absence" only.
+
+struct NetSlot(UnsafeCell<Option<alloc::boxed::Box<Net>>>);
+
+impl NetSlot {
+    const fn empty() -> Self {
+        NetSlot(UnsafeCell::new(None))
+    }
+}
+
+// SAFETY: every read/write of `NET` is on the boot CPU:
+//   - `Net::enable` runs from `uni_main` (BSP on unikernel, main
+//     thread on native).
+//   - `clear_on_shutdown` runs from `uni::shutdown_and_drop`, called
+//     only from the BSP shutdown branch of the kernel event loop.
+// Manual `Sync` lets the static hold it without requiring
+// `Box<Net>: Sync` (there are no inner fields today, but future
+// additions shouldn't force a `Send + Sync` bound on every field).
+unsafe impl Sync for NetSlot {}
+
+static NET: NetSlot = NetSlot::empty();
 
 impl Net {
-    /// Bring the network stack online. On success returns an opaque
-    /// handle whose presence signals "the app drove bring-up"; the
-    /// boot-path auto-init fallback is skipped after a successful
-    /// `enable`. On failure the ENABLED flag is left clear so apps
-    /// can retry with a different config (typical pattern:
-    /// `enable(Dhcp).or_else(|_| enable(Static{…}))`).
+    /// Bring the network stack online. On success stores a
+    /// `Box<Net>` in the module-level slot and returns a handle.
     ///
-    /// Subsequent calls after a successful `enable` return
-    /// `Err(NetError::AlreadyEnabled)` — a second bring-up would
-    /// be a misuse.
+    /// Failure semantics: the slot is **not** populated on failure,
+    /// so apps can retry with a different config. The typical
+    /// pattern is `enable(Dhcp).or_else(|_| enable(Static{…}))`.
+    ///
+    /// Calling `enable` twice after a successful bring-up returns
+    /// `Err(NetError::AlreadyEnabled)`.
     pub fn enable(cfg: NetBringUp) -> Result<Net, NetError> {
-        if ENABLED.load(Ordering::Acquire) {
+        // SAFETY: BSP-only access; see `unsafe impl Sync for NetSlot`.
+        if unsafe { (*NET.0.get()).is_some() } {
             return Err(NetError::AlreadyEnabled);
         }
         bringup(cfg)?;
-        // Commit the flag only after bring-up succeeded — a failed
-        // DHCP shouldn't lock out a Static retry.
-        ENABLED.store(true, Ordering::Release);
+        // Park a `Box<Net>` in the slot so `is_some()` reflects
+        // "someone successfully called enable". The returned handle
+        // is a separate ZST — both are free to pass around.
+        // SAFETY: BSP-only access.
+        unsafe {
+            *NET.0.get() = Some(alloc::boxed::Box::new(Net { _private: () }));
+        }
         Ok(Net { _private: () })
     }
 
@@ -122,20 +152,22 @@ impl Net {
     }
 }
 
-/// Whether `Net::enable` has been called. Consulted by the boot
-/// path's auto-init fallback; should not be used by app code.
-#[doc(hidden)]
-pub fn was_enabled() -> bool {
-    ENABLED.load(Ordering::Acquire)
+/// Whether the stack is currently enabled (the slot holds a `Box<Net>`).
+/// Phase 4+ this is the single source of truth; Phase 3's legacy
+/// auto-init fallback has been removed.
+pub fn is_enabled() -> bool {
+    // SAFETY: BSP-only access; see `unsafe impl Sync for NetSlot`.
+    unsafe { (*NET.0.get()).is_some() }
 }
 
-/// Mark `Net` as enabled WITHOUT going through the public `enable`
-/// path. Called by the boot-path auto-init fallback so a later
-/// `Net::enable` returns `AlreadyEnabled` rather than re-running
-/// DHCP. Not part of the public API.
-#[doc(hidden)]
-pub fn mark_enabled_by_auto_init() {
-    ENABLED.store(true, Ordering::Release);
+/// Clear the NET slot. Called from `uni::shutdown_and_drop` on the
+/// graceful-shutdown path so a re-entrant runtime (native's
+/// `main` → rerun) sees a fresh slot. Idempotent.
+pub(crate) fn clear_on_shutdown() {
+    // SAFETY: BSP-only; see the slot's `unsafe impl Sync`. `take`
+    // replaces with `None`, dropping the Box (ZST alloc = no-op).
+    let taken = unsafe { (*NET.0.get()).take() };
+    drop(taken);
 }
 
 // ----------------------------------------------------------------------------
@@ -151,10 +183,7 @@ fn bringup(cfg: NetBringUp) -> Result<(), NetError> {
             } else {
                 // No implicit static fallback — surfacing the
                 // timeout lets callers decide whether to retry
-                // with `NetBringUp::Static{…}` or panic. The
-                // legacy auto-init path in `boot/entry.rs` still
-                // does its own DHCP-then-10.0.2.15/24 fallback
-                // for apps that don't call `Net::enable` at all.
+                // with `NetBringUp::Static{…}` or panic.
                 Err(NetError::Dhcp(DhcpError::Timeout))
             }
         }
@@ -173,8 +202,9 @@ fn bringup(cfg: NetBringUp) -> Result<(), NetError> {
 fn bringup(_cfg: NetBringUp) -> Result<(), NetError> {
     // The native backend runs over POSIX sockets; the host
     // manages interface configuration. `Net::enable` is
-    // essentially a typed hand-off: the flag lets forward-compat
-    // code (Phase 4+) distinguish explicit vs implicit bring-up.
+    // essentially a typed hand-off: the slot lets forward-compat
+    // code distinguish explicit vs implicit bring-up (there is no
+    // implicit path post-Phase-4).
     Ok(())
 }
 
