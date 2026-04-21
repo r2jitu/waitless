@@ -28,15 +28,6 @@ test  --@rules_rust//:extra_rustc_flag=-Cpanic=unwind
 # sub-graph so unikernel rlibs stay no_std in-process.
 test --//bazel/rules:tests_need_std=True
 
-# Bazel 9's default test toolchain requires an exec platform that
-# matches every target-platform constraint. Our rust_tests inherit
-# the host platform (`aarch64_macos` / `x86_64_linux`) which carries
-# a custom `:native` constraint that isn't on `@platforms//host:host`,
-# so resolution fails. Opt out of the new default. `common` (not
-# `test`) so it also applies during `bazel build` for rust-analyzer's
-# `discover_bazel_rust_project` transitive-analysis walk.
-common --@bazel_tools//tools/test:incompatible_use_default_test_toolchain=false
-
 # ── Platform-only configs (runner is picked per-target, not per-build) ──────
 # `--config=aarch64-macos` / `--config=x86_64-linux` are host-platform
 # overrides for multi-arch dev boxes / remote CI. They don't pick a

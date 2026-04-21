@@ -40,6 +40,19 @@ register_toolchains(
     "//bazel/toolchain:cc_toolchain_x86_64_linux",
 )
 
+# Register our custom host platforms (`aarch64_macos`, `x86_64_linux`,
+# `aarch64_linux`) as execution platforms so Bazel 9's default test
+# toolchain can resolve them. Without this, rust_tests whose target
+# platform matches our host (carrying the custom `:native` constraint)
+# fail toolchain resolution because the built-in `@platforms//host:host`
+# exec platform lacks that constraint — which is why we previously set
+# `incompatible_use_default_test_toolchain=false` in `.bazelrc`.
+register_execution_platforms(
+    "//bazel/platforms:aarch64_macos",
+    "//bazel/platforms:x86_64_linux",
+    "//bazel/platforms:aarch64_linux",
+)
+
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
 rust.toolchain(
     edition = "2024",
