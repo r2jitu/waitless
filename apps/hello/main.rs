@@ -12,20 +12,31 @@ extern crate alloc;
 extern crate uni;
 
 use uni::http::{Request, Response, Server};
+use uni::net::{Net, NetBringUp};
 
 /// The app: holds the HTTP server for the program's lifetime.
 struct HelloApp {
     _server: alloc::boxed::Box<Server>,
+    _net: Net,
 }
 
 impl uni::App for HelloApp {}
 
 impl HelloApp {
     fn new() -> Self {
+        // Bring up networking explicitly (Phase 3 API). `enable`
+        // runs DHCP and on failure applies the 10.0.2.15/24
+        // fallback so the stack is always usable from here on.
+        // We unwrap: the fallback makes a transient error case
+        // invisible, so any Err surfaces a real misconfiguration
+        // (e.g., NIC driver missing) we'd want to see.
+        let net = Net::enable(NetBringUp::Dhcp)
+            .expect("Net::enable failed — NIC driver missing?");
+
         let mut server = Server::new_boxed();
         server.default_handler(hello);
         server.listen(uni::config_port(80));
-        HelloApp { _server: server }
+        HelloApp { _server: server, _net: net }
     }
 }
 

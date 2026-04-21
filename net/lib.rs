@@ -67,6 +67,43 @@ pub fn init_stack() {
     REGISTRY.register(ipv4::PROTO_UDP, udp_dispatch);
 }
 
+// ============================================================================
+// Phase 3: IP-config bring-up primitives
+// ============================================================================
+//
+// `uni::net::Net::enable(NetBringUp)` dispatches here. Kept as plain
+// free functions (rather than a single enum-taking API) because the
+// `NetBringUp` enum lives in `uni::net` and this crate can't depend on
+// `uni`. Each function is idempotent: safe to call multiple times or
+// after auto-init has already populated `CONFIG`.
+
+/// Run DHCP DISCOVER/REQUEST and store the resulting `NetConfig`.
+/// Returns `true` on success, `false` if the server didn't answer.
+/// On failure the caller is expected to fall back to a static config
+/// (or leave `CONFIG` empty and accept no networking).
+pub fn bringup_dhcp() -> bool {
+    dhcp::discover()
+}
+
+/// Apply a static IP configuration without consulting DHCP.
+/// `netmask` uses CIDR-style dotted-octets; `dns` is left at 0.0.0.0
+/// because the network stack doesn't resolve names.
+pub fn bringup_static(
+    ip: types::Ipv4Addr,
+    gateway: types::Ipv4Addr,
+    netmask: types::Ipv4Addr,
+) {
+    let ip_o = ip.octets();
+    let mask_o = netmask.octets();
+    let gw_o = gateway.octets();
+    dhcp::set_fallback_config(
+        ip_o[0], ip_o[1], ip_o[2], ip_o[3],
+        mask_o[0], mask_o[1], mask_o[2], mask_o[3],
+        gw_o[0], gw_o[1], gw_o[2], gw_o[3],
+        0, 0, 0, 0, // DNS — unused
+    );
+}
+
 use kernel::percpu;
 
 /// Whether multi-core distribution has been initialized.

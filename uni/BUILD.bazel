@@ -11,6 +11,7 @@ rust_library(
         "http.rs",
         "lib.rs",
         "native.rs",
+        "net.rs",
         "unikernel.rs",
     ],
     proc_macro_deps = ["//uni/macros:uni_macros"],

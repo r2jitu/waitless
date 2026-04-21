@@ -429,25 +429,21 @@ unsafe fn kernel_boot(info: &BootInfo) {
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
         );
 
-        klog!("[INIT] DHCP...\n");
-        let dhcp_ok = net::dhcp::discover();
-        if dhcp_ok {
-            klog!("       IP obtained successfully\n");
-        } else {
-            klog!("       [WARN] DHCP failed, using 10.0.2.15/24\n");
-            net::dhcp::set_fallback_config(
-                10, 0, 2, 15,      // IP
-                255, 255, 255, 0,   // subnet
-                10, 0, 2, 2,       // gateway
-                10, 0, 2, 3,       // DNS
-            );
-        }
-
-        // Promote virtio-net to multi-queue if the device negotiated MQ.
-        // Deferred until now because activating MQ enables host-side RSS,
-        // which sprays incoming frames across queue pairs and breaks
-        // single-queue DHCP polling.
-        drivers::net::activate_multi_queue();
+        // IP-config bring-up is Phase-3-deferred: apps typically
+        // call `uni::net::Net::enable(NetBringUp::Dhcp)` as their
+        // first action, which runs DHCP (or applies a static
+        // config) from inside uni_main. If uni_main returns
+        // without having enabled the stack, the block further
+        // down triggers the legacy "DHCP or 10.0.2.15/24 fallback"
+        // path so pre-existing apps keep working unchanged.
+        //
+        // `drivers::net::activate_multi_queue()` must run AFTER
+        // DHCP finishes — activating MQ enables host-side RSS,
+        // which sprays incoming frames across queue pairs and
+        // breaks single-queue DHCP polling. Moved to the
+        // post-uni_main block below so both the Net::enable path
+        // and the auto-init fallback run DHCP in single-queue mode
+        // first.
 
         klog!("[INIT] TCP stack...\n");
         net::tcp::init();
@@ -533,6 +529,41 @@ unsafe fn kernel_boot(info: &BootInfo) {
 
     klog!("\n[BOOT] All subsystems ready. Starting application.\n\n");
     uni_main();
+
+    // Phase 3 auto-init fallback. Any app that didn't call
+    // `uni::net::Net::enable` (typically because it doesn't do
+    // networking at all, like test_smp / test_percpu / test_tls)
+    // gets the legacy DHCP-with-10.0.2.15/24-fallback so it boots
+    // unchanged. Skip when the app requested shutdown from
+    // uni_main — a DHCP timeout would add ~10 s to the exit of
+    // those tests.
+    if net_ok
+        && !kernel::eventloop::is_shutdown()
+        && !uni::net::was_enabled()
+    {
+        klog!("[INIT] DHCP (auto-init fallback)...\n");
+        if net::bringup_dhcp() {
+            klog!("       IP obtained successfully\n");
+        } else {
+            klog!("       [WARN] DHCP failed, using 10.0.2.15/24\n");
+            net::bringup_static(
+                net::types::Ipv4Addr::from(10, 0, 2, 15),
+                net::types::Ipv4Addr::from(10, 0, 2, 2),
+                net::types::Ipv4Addr::from(255, 255, 255, 0),
+            );
+        }
+        uni::net::mark_enabled_by_auto_init();
+    }
+
+    // Now that DHCP has run (via Net::enable inside uni_main OR
+    // via the fallback above), promote virtio-net to multi-queue
+    // if the device negotiated MQ. Activating MQ enables host-
+    // side RSS, which sprays incoming frames across queue pairs
+    // and breaks single-queue DHCP polling — so MQ activation
+    // must come AFTER DHCP.
+    if net_ok && !kernel::eventloop::is_shutdown() {
+        drivers::net::activate_multi_queue();
+    }
 
     // App init complete — signal APs to start their event loops.
     kernel::eventloop::set_ready();
