@@ -147,6 +147,41 @@ impl Net {
         if unsafe { (*NET.0.get()).is_some() } {
             return Err(NetError::AlreadyEnabled);
         }
+
+        // Phase 5 Step 5: validate that a driver registered via
+        // `register_ethernet_driver!` is linked AND has probed
+        // successfully. Returns `NoDriver` if the binary has no
+        // driver crate linked at all (empty linker section) and
+        // `NoNic` if drivers are linked but none bound hardware.
+        //
+        // On bare-metal today the legacy `drivers::net::init()`
+        // path in `boot/entry.rs` runs before `uni_main` and sets
+        // each driver's `probe_ok` flag; our `probe()` impls
+        // surface that flag. Phase 5 Step 6 (future) will remove
+        // the legacy init and have `probe()` own the full device
+        // bring-up.
+        //
+        // Native builds skip this check — `linked_ethernet_drivers()`
+        // is stubbed to `&[]` there and networking flows through
+        // POSIX sockets, not ethernet drivers.
+        #[cfg(platform_unikernel)]
+        {
+            let drivers = uni_net_driver::linked_ethernet_drivers();
+            if drivers.is_empty() {
+                return Err(NetError::NoDriver);
+            }
+            let mut any_probed = false;
+            for reg in drivers {
+                if reg.driver.probe().is_some() {
+                    any_probed = true;
+                    break;
+                }
+            }
+            if !any_probed {
+                return Err(NetError::NoNic);
+            }
+        }
+
         bringup(cfg)?;
         // Park a `Box<Net>` in the slot so `is_enabled()` reflects
         // "someone successfully called enable". The returned handle
