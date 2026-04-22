@@ -65,6 +65,13 @@ pub trait EthernetDriver: 'static + Sync {
     /// the hardware present (e.g. `gve` probing a QEMU host that
     /// doesn't expose a Google NIC). `Net::enable` walks probes in
     /// link order and uses the first success.
+    ///
+    /// Historically a thin `probe_ok`-flag check that assumed
+    /// `drivers::net::init()` had already run. In the Step-6 world
+    /// this owns the full bring-up: drivers that `probe()` calls the
+    /// device-specific init code, cache success state, and return
+    /// `Some` iff the hardware came up. Idempotent — calling twice
+    /// returns the cached answer.
     fn probe(&self) -> Option<NicHandle>;
 
     /// Transmit one ethernet frame. Returns `NicError::TxQueueFull`
@@ -85,6 +92,67 @@ pub trait EthernetDriver: 'static + Sync {
     /// capture state can still dispatch through a static — that's
     /// what `net::net_receive` does today.
     fn poll_rx(&self, handle: &NicHandle, cb: fn(&[u8])) -> usize;
+
+    // ── Extended dispatcher methods (plan's Step 6) ─────────────────────
+    //
+    // These mirror the `drivers::net::*` API surface so `drivers/net.rs`
+    // can dispatch through the trait instead of statically linking both
+    // NIC crates. Defaults are no-ops (`false` / `[0; _]` / empty MAC)
+    // for polling-only / single-queue drivers; virtio overrides most,
+    // gve inherits most defaults.
+
+    /// Fill the 6-byte MAC into `out`. Default writes 00:00:00:00:00:00.
+    fn get_mac(&self, _handle: &NicHandle, _out: *mut u8) {}
+
+    /// Active queue pairs after bring-up. Default 1 (single-queue).
+    fn num_queue_pairs(&self, _handle: &NicHandle) -> u16 { 1 }
+
+    /// Negotiate multi-queue. Default no-op (drivers with their own
+    /// MQ setup at init, like gve, don't need this hook).
+    fn activate_multi_queue(&self, _handle: &NicHandle) {}
+
+    /// Install MSI-X or equivalent interrupt wiring. Default no-op
+    /// for polling-only drivers.
+    fn enable_irq(&self, _handle: &NicHandle) {}
+
+    /// Poll a specific queue pair. Default routes to `poll_rx` — fine
+    /// for single-queue drivers. Multi-queue drivers override.
+    fn poll_qp(&self, handle: &NicHandle, _qp: usize, cb: fn(&[u8])) -> i32 {
+        self.poll_rx(handle, cb) as i32
+    }
+
+    /// Flush staged TX packets. Default no-op (no staging pool).
+    fn flush_tx_staging(&self, _handle: &NicHandle) {}
+
+    /// Kick TX if any queue has dirty doorbell state. Default false.
+    fn flush_tx_kick_if_dirty(&self, _handle: &NicHandle) -> bool { false }
+
+    /// NAPI-style idle supported? Default false.
+    fn irq_idle_supported(&self, _handle: &NicHandle) -> bool { false }
+
+    /// Arm RX-pending interrupt before idle. Default no-op.
+    fn arm_rx_interrupts(&self, _handle: &NicHandle) {}
+
+    /// RX pending right now? Default false (polling always works).
+    fn has_pending_rx(&self, _handle: &NicHandle) -> bool { false }
+
+    /// TX pending right now? Default false.
+    fn has_pending_tx(&self, _handle: &NicHandle) -> bool { false }
+
+    /// NAPI re-arm, per-core. Default false.
+    fn rearm_rx_napi(&self, _handle: &NicHandle, _core_id: u32) -> bool { false }
+
+    /// Enable deferred TX kick optimisation. Default no-op.
+    fn enable_deferred_tx_kick(&self, _handle: &NicHandle) {}
+
+    /// Poke interrupt status (virtio MMIO ISR ack). Default no-op.
+    fn poke_interrupt_status(&self, _handle: &NicHandle) {}
+
+    /// Per-queue RX frame counts. Default all zeros.
+    fn rx_counts(&self, _handle: &NicHandle) -> [u64; 8] { [0; 8] }
+
+    /// Per-queue `(device_idx, driver_cursor)` snapshots. Default zeros.
+    fn rx_used_cursors(&self, _handle: &NicHandle) -> [(u16, u16); 8] { [(0, 0); 8] }
 }
 
 // ---- Link-time registry ---------------------------------------------------
@@ -165,4 +233,39 @@ pub fn linked_ethernet_drivers() -> &'static [EthernetDriverReg] {
 #[cfg(not(target_os = "none"))]
 pub fn linked_ethernet_drivers() -> &'static [EthernetDriverReg] {
     &[]
+}
+
+// ---- Active driver slot ---------------------------------------------------
+//
+// Filled once by the first `probe()`-successful driver during
+// `drivers::net::init()` (or, on native, never). `drivers/net.rs`
+// dispatches through `active_driver()` instead of calling specific
+// NIC crates statically, which lets `//drivers:drivers` drop its
+// direct deps on the NIC crates and lets apps pick their driver set.
+
+use core::sync::atomic::{AtomicPtr, Ordering};
+
+static ACTIVE_DRIVER: AtomicPtr<EthernetDriverReg> =
+    AtomicPtr::new(core::ptr::null_mut());
+
+/// Install `reg` as the active driver. Called once by
+/// `drivers::net::init()` (first successful probe wins).
+pub fn set_active_driver(reg: &'static EthernetDriverReg) {
+    ACTIVE_DRIVER.store(reg as *const _ as *mut _, Ordering::Release);
+}
+
+/// Return the currently-active ethernet driver, if any. Returns
+/// `None` before the first `probe()` success and on native (no
+/// linker section → nothing to set).
+pub fn active_driver() -> Option<&'static dyn EthernetDriver> {
+    let p = ACTIVE_DRIVER.load(Ordering::Acquire);
+    if p.is_null() {
+        None
+    } else {
+        // SAFETY: `set_active_driver` only stores pointers to
+        // `&'static EthernetDriverReg` values from the linker
+        // section; the Release/Acquire pair above synchronises the
+        // store with readers. Pointer is never reused or freed.
+        unsafe { Some((*(p as *const EthernetDriverReg)).driver) }
+    }
 }
