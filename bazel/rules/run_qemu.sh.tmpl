@@ -2,16 +2,10 @@
 # Generated launcher for the `_qemu_<arch>` variant of a unikernel_binary
 # target. The variant rule symlinks the guest ELF and the raw .img
 # next to this script under the filenames substituted into %ELF% /
-# %IMG%, and passes a launcher-relative path to //scripts:helpers.sh
-# via %HELPERS%. Both ELF and IMG are handed to detect_qemu explicitly
-# — aarch64 QEMU consumes the .img, x86_64 QEMU consumes the .elf.
-#
-# Env:
-#   UNIKERNEL_PORT     — host HTTP port   (default 8080) → guest :80
-#   UNIKERNEL_TLS_PORT — host HTTPS port  (default 8443) → guest :443
-#   UNIKERNEL_UDP_PORT — host UDP port    (default 8007) → guest :7
-#   UNIKERNEL_MEMORY   — guest RAM in MB  (default 128)
-#   UNIKERNEL_CPUS     — guest vCPU count (default 1)
+# %IMG%; `//scripts:helpers.sh` is accessible via the launcher-
+# relative path substituted into %HELPERS%; `%HOSTFWD%` is the
+# hostfwd string built from the app's `port_forwards` attr, with
+# env-var defaults baked in per forward.
 set -euo pipefail
 
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -23,13 +17,8 @@ source "$HELPERS"
 
 detect_qemu "$ELF" "$IMG"
 
-PORT="${UNIKERNEL_PORT:-8080}"
-TLS_PORT="${UNIKERNEL_TLS_PORT:-8443}"
-UDP_PORT="${UNIKERNEL_UDP_PORT:-8007}"
-
-echo "==> http://localhost:${PORT}/"
-echo "==> https://localhost:${TLS_PORT}/  (self-signed dev cert — use curl -k)"
-echo "==> udp  ::${UDP_PORT} → guest :7"
-
-run_qemu "$PORT" "$TLS_PORT" "$UDP_PORT" "${UNIKERNEL_MEMORY:-128}" \
+run_qemu \
+    "${UNIKERNEL_MEMORY:-%DEFAULT_RAM%}" \
+    "${UNIKERNEL_CPUS:-%DEFAULT_CPUS%}" \
+    "%HOSTFWD%" \
     "${QEMU_MACHINE[@]}" -kernel "$KERNEL_ARG"

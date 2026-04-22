@@ -70,53 +70,41 @@ detect_qemu() {
 }
 
 # ── Shared QEMU arg builder ──────────────────────────────────────────────────
-# Canonical port-forward layout: three independent ports so user-facing
-# defaults stay conventional (80 / 443 / 7):
 #
-#   host:HTTP_PORT  -> guest :80   (plain HTTP)
-#   host:TLS_PORT   -> guest :443  (HTTPS)
-#   host:UDP_PORT   -> guest :7    (UDP echo)
+# Exec QEMU interactively (for `bazel run //path:name`).
 #
-# `_qemu_net_args HTTP_PORT TLS_PORT UDP_PORT CPUS` prints the
-# `-device … -netdev …` pair.
-_qemu_net_args() {
-    local http_port="$1" tls_port="$2" udp_port="$3" cpus="$4"
+# Usage: run_qemu MEMORY CPUS HOSTFWD [EXTRA_QEMU_ARGS...]
+#   HOSTFWD is a comma-joined list of QEMU `hostfwd=…` forwards,
+#   e.g. `hostfwd=tcp::8080-:80,hostfwd=udp::8007-:7`. Built by the
+#   per-variant launcher template from each app's `port_forwards`
+#   attr on `unikernel_binary`. Empty string = no port forwarding.
+# Prereq: QEMU_BIN and VIRTIO_DEV must be set (via detect_qemu).
+run_qemu() {
+    local memory="$1" cpus="$2" hostfwd="$3"
+    shift 3
+
     local dev_extra=""
-    # Enable VirtIO multi-queue for PCI devices with multiple vCPUs.
-    # MMIO devices (virtio-net-device) don't support mq parameter.
+    local netdev_extra=""
+    # VirtIO multi-queue is PCI-only; MMIO (virtio-net-device) doesn't
+    # support the `mq=on,vectors=…,queues=…` trio.
     if [[ "$cpus" -gt 1 ]] && [[ "$VIRTIO_DEV" == *"-pci"* ]]; then
         local vectors=$(( 2 * cpus + 2 ))
         dev_extra=",mq=on,vectors=$vectors,queues=$cpus"
-    fi
-    local netdev_extra=""
-    # user-mode netdev supports queues= only alongside PCI multi-queue.
-    if [[ "$cpus" -gt 1 ]] && [[ "$VIRTIO_DEV" == *"-pci"* ]]; then
         netdev_extra=",queues=$cpus"
     fi
-    local forwards="hostfwd=tcp::${http_port}-:80"
-    forwards+=",hostfwd=tcp::${tls_port}-:443"
-    forwards+=",hostfwd=udp::${udp_port}-:7"
-    printf '%s\n' \
-        "-device" "${VIRTIO_DEV}${dev_extra},netdev=net0" \
-        "-netdev" "user,id=net0,${forwards}${netdev_extra}"
-}
 
-# Exec QEMU interactively (for `bazel run //path:name`).
-#
-# Usage: run_qemu HTTP_PORT TLS_PORT UDP_PORT MEMORY [EXTRA_QEMU_ARGS...]
-# Prereq: QEMU_BIN and VIRTIO_DEV must be set (via detect_qemu or manually).
-run_qemu() {
-    local http_port="$1" tls_port="$2" udp_port="$3" memory="$4"
-    shift 4
-    local cpus="${UNIKERNEL_CPUS:-1}"
-    local net_args=()
-    while IFS= read -r line; do net_args+=("$line"); done \
-        < <(_qemu_net_args "$http_port" "$tls_port" "$udp_port" "$cpus")
+    local netdev="user,id=net0"
+    if [[ -n "$hostfwd" ]]; then
+        netdev+=",${hostfwd}"
+    fi
+    netdev+="${netdev_extra}"
+
     exec "$QEMU_BIN" \
         "$@" \
         -m "$memory" -smp "$cpus" \
         -display none -monitor none \
         -chardev stdio,id=s0,signal=off -serial chardev:s0 \
         -no-reboot \
-        "${net_args[@]}"
+        -device "${VIRTIO_DEV}${dev_extra},netdev=net0" \
+        -netdev "$netdev"
 }

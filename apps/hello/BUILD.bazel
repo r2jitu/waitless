@@ -1,6 +1,7 @@
 load("@rules_rust//rust:defs.bzl", "rust_library")
 load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 load("//bazel/rules:unikernel.bzl", "unikernel_binary")
+load("//bazel/rules:variants.bzl", "port_fwd")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -15,7 +16,12 @@ rust_library(
     deps = ["//uni"],
 )
 
+# hello only serves plain HTTP, so the launcher only needs one
+# forward — HTTPS + UDP echo forwards would just sit idle.
 unikernel_binary(
     name = "hello",
     app = ":app",
+    port_forwards = [
+        port_fwd("tcp", env = "UNIKERNEL_PORT", default_host = 8080, guest = 80),
+    ],
 )

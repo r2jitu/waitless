@@ -31,7 +31,13 @@ _LINK_FLAGS_ARCH = select({
     "//conditions:default": ["-C", "link-arg=-static", "-C", "link-arg=--no-pie"],
 })
 
-def unikernel_binary(name, app, visibility = None):
+def unikernel_binary(
+        name,
+        app,
+        port_forwards = None,
+        ram_mb = 128,
+        cpus = 1,
+        visibility = None):
     """Package a Rust application into bootable unikernel images.
 
     The application is a rust_library with a #[uni::boot] entry point.
@@ -59,6 +65,16 @@ def unikernel_binary(name, app, visibility = None):
     Args:
         name: Base name for all output targets.
         app: A rust_library target with a #[uni::boot] entry point.
+        port_forwards: list of entries built via `port_fwd()` (see
+          `//bazel/rules:variants.bzl`). Each entry baked into the
+          variant launchers as a `host_port → guest_port` forward,
+          with `UNIKERNEL_*`-style env vars overriding the host port
+          at run time. Defaults to `DEFAULT_PORT_FORWARDS` (HTTP 80 +
+          HTTPS 443 + UDP 7).
+        ram_mb: default guest RAM in MB, overridable at run time
+          via `UNIKERNEL_MEMORY`.
+        cpus: default vCPU count, overridable at run time via
+          `UNIKERNEL_CPUS`.
         visibility: Bazel visibility specification.
     """
 
@@ -206,6 +222,14 @@ def unikernel_binary(name, app, visibility = None):
     # Each variant is a runnable target that transitions its sub-graph
     # into the matching platform + runner + `-Cpanic=abort` config, so
     # `bazel run :<name>_hvf` boots the HVF variant, `bazel run
-    # :<name>_iso` boots the Limine ISO, etc. — no `--config=` flag,
-    # analysis cache preserved across variants.
-    unikernel_variants(name = name, visibility = visibility)
+    # :<name>_iso_x86_64` boots the Limine ISO, etc. — no `--config=`
+    # flag, analysis cache preserved across variants. The VM-shape
+    # config (port forwards, RAM, CPUs) passes through to each
+    # variant's launcher template.
+    unikernel_variants(
+        name = name,
+        port_forwards = port_forwards,
+        ram_mb = ram_mb,
+        cpus = cpus,
+        visibility = visibility,
+    )
