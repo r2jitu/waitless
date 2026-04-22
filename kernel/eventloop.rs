@@ -147,6 +147,13 @@ pub fn run(core_id: u32) -> ! {
             if f(core_id) { did_work = true; service_work += 1; }
         }
 
+        // 3a. Async runtime: advance timers (drain pending MPSC + fire
+        // expired), then poll every ready task slot in the per-core
+        // arena. Spawned futures live here. See kernel::executor.
+        if crate::executor::tick(core_id) {
+            did_work = true;
+        }
+
         // 3b. Flush TX after service — responses must be sent immediately
         // so keep-alive follow-up requests arrive promptly.
         if did_work {

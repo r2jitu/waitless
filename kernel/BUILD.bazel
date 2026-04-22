@@ -10,6 +10,7 @@ rust_library(
         "cpu.rs",
         "deque.rs",
         "eventloop.rs",
+        "executor.rs",
         "lib.rs",
         "mm.rs",
         "mmio.rs",

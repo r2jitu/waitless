@@ -691,57 +691,58 @@ this forward later is pure event-loop wiring.
 - [ ] Integration: `test_timer_fire` — set timers on different cores, verify correct fire times
 - [ ] Integration: `test_cross_core_timer` — stolen task arms timer on remote core, verify it fires
 
-### 2f. Task trait + pinned task slots — **next**
+### 2f. Task arena + event-loop integration — first cut shipped
 
-Minimum abstraction that unifies the three wake sources (packet,
-timer, IRQ) and preps for §2g's `Future` integration. Not an
-executor yet — just the arena + trait. Shape mirrors `Future::poll`
-so §2g is a bolt-on, not a rewrite.
+Per-core slot arena + `spawn` + event-loop hook. Collapsed with §2g
+because using `Future` directly (instead of inventing a separate
+`Task` trait with the same shape) is simpler.
 
-- [ ] `trait Task { fn poll(self: Pin<&mut Self>) -> TaskState; }` —
-      returns `Pending` / `Ready` / `Done`.
-- [ ] Per-core task slot arena: fixed-size array of
-      `TaskSlot { state: AtomicU8, task: Option<Pin<Box<dyn Task>>> }`.
-      Slots indexed by `u16`; waker identity = `(core_id, slot_idx)`
-      encoded in a `usize`. No `Arc`, no per-waker vtable.
-- [ ] `spawn(task) -> TaskHandle` onto current core's arena.
-- [ ] Event loop integration: after poll/drain/service, scan arena
-      for `state == Ready` slots, clear, call `poll()`.
-- [ ] `yield_now()`: sets `state = Ready` and returns `Pending`.
+- [x] Per-core task slot arena ([kernel/executor.rs](kernel/executor.rs)):
+      fixed `[TaskSlot; 64]` per core, slot = `{ ready: AtomicBool,
+      used: AtomicBool, future: UnsafeCell<Option<Pin<Box<dyn
+      Future<Output=()>>>>> }`. Waker identity = `*const TaskSlot`
+      into static `ARENAS`, no `Arc`.
+- [x] `spawn<F: Future<Output=()> + 'static>(f: F)` onto current
+      core's arena. CAS on `used` serialises spawn; `Err(())` when
+      full.
+- [x] Event loop integration: [kernel/eventloop.rs](kernel/eventloop.rs)
+      calls `executor::tick(core_id)` after `SERVICE` — drains the
+      per-core `pending_timers` MPSC into the wheel, advances the
+      wheel, then polls every ready slot.
+- [ ] `yield_now()` — defer until a concrete user needs it.
 
 **Tests:**
-- [ ] Unit: arena spawn/free/reclaim semantics.
-- [ ] Integration: `apps/test_async` spawns one task per core, each
-      task announces its core id and increments a shared counter.
+- [x] Integration: [apps/test_async](apps/test_async) green on HVF,
+      QEMU aarch64, QEMU x86_64. Spawns an async task that sleeps
+      50ms, nested-spawns, sleeps 10ms, shuts down.
+- [ ] Unit: arena spawn/free/reclaim semantics (host).
 
-### 2g. Async/await (`Future` + `Waker` + minimal executor) — **next**
+### 2g. Async/await (`Future` + `Waker` + minimal executor) — first cut shipped
 
-Layer Rust's `async fn` on top of §2f's task slots. Minimum viable
-executor: no combinators (`select!`/`join!`), no tokio/smol compat —
-just enough primitives for QUIC to `.await` what it needs.
+Same file as §2f. Enough to write QUIC-flavoured `async fn` for the
+primitives QUIC needs; more reactor primitives land as QUIC demands.
 
-- [ ] `RawWakerVTable` (clone/wake/wake_by_ref/drop) that flips the
-      target slot's `state` atomic. Waker data = encoded
-      `(core_id, slot_idx)`. ~40 lines unsafe. Same-core wake is a
-      relaxed store; cross-core wake issues an IPI.
-- [ ] `spawn<F: Future<Output=()> + 'static>(f: F)` boxes the
-      future into §2f's arena. Per-core bump allocator
-      ([kernel/bump.rs](kernel/bump.rs)) already handles allocation;
-      typical future size is a few hundred bytes.
-- [ ] Reactor primitives (only what QUIC needs v1):
-      - `Timer::sleep_until(deadline).await` — parks waker in
-        [kernel/timer.rs](kernel/timer.rs) wheel (data structure
-        exists; wire it into the event loop here).
-      - `UdpRecv::recv_from(&mut buf).await` — parks waker on
-        per-core UDP inbox; `net::poll_tier1/2` wakes it on arrival.
-      - `TcpListener::accept().await` — parks waker on listener's
-        ready queue (optional for QUIC, nice for migrating HTTP later).
-- [ ] Event loop shim: `service()` drains ready slots and calls
-      `future.as_mut().poll(&mut Context::new(&waker))`. No change
-      to poll/drain/idle phases.
-- [ ] Smoke test: `apps/test_async` — task sleeps 10ms, reads a UDP
-      datagram, echoes it, exits. Proves spawn + timer waker + IO
-      waker all work end-to-end.
+- [x] `RawWakerVTable` (clone/wake/wake_by_ref/drop) that flips the
+      target slot's `ready` atomic. Waker data = `*const TaskSlot`
+      directly, ~20 lines unsafe. Same-core wake is a release store;
+      cross-core wake is deferred (sleeping target notices on its
+      next `idle_bounded` tick).
+- [x] `spawn<F: Future<Output=()> + 'static>(f: F)` boxes the future
+      into the per-core arena via the global talc heap.
+- [x] Reactor: `Sleep::until(deadline).await` / `sleep_us(us)` —
+      parks the task's waker in the per-core timer wheel, cancels
+      on `Drop` so a stale fire can't hit a reused slot.
+- [ ] Reactor: `UdpRecv::recv_from(&mut buf).await` — not yet; QUIC
+      will land this.
+- [ ] Reactor: `TcpListener::accept().await` — optional; migrate
+      HTTP only if a concrete win.
+- [x] Event loop shim: tick drains the wheel, scans ready slots, calls
+      `future.as_mut().poll(&mut cx)`. No change to poll/drain/idle.
+- [x] Smoke test: `apps/test_async` — spawn + timer + nested-spawn +
+      graceful shutdown. Exercises the full stack.
+- [x] Perf: timer wheel fast-paths empty state in
+      [kernel/timer.rs](kernel/timer.rs) — first `advance()` after
+      boot would otherwise walk ~10⁶ empty ticks (µs-since-boot).
 
 **Explicit non-goals:**
 - Porting TCP/TLS/HTTP to async (they work; migrate only if a win).
@@ -750,17 +751,21 @@ just enough primitives for QUIC to `.await` what it needs.
 - `Send + Sync` bounds (per-core affinity is the whole point).
 - Async-debugging tooling (stuck-poll diagnostics, task dumps) —
   add when we get burned.
+- Cross-core IPI on wake — target core picks up the wake on its next
+  `idle_bounded` timer tick; bounded-latency, not zero-latency.
 
 **Tests:**
+- [x] Integration: `apps/test_async` end-to-end on HVF + QEMU.
+      Native deferred (kernel::executor is bare-metal-only today).
 - [ ] Unit (host): Waker clone/wake correctness under miri.
-- [ ] Integration: `apps/test_async` end-to-end on HVF + QEMU + native.
 - [ ] Integration: spawn 1000 `Timer::sleep_until` tasks, verify all
       fire within ±1ms of deadline.
 
 **Try it:**
 ```bash
 bazel test //apps/test_async:test_hvf
-# Serial: "async: timer fired, udp echoed, goodbye"
+bazel test //apps/test_async:test_qemu_aarch64 //apps/test_async:test_qemu_x86_64
+# Serial: "test_async: task woke up" → "test_async: nested task done"
 ```
 
 ### 2h. Performance regression tests
@@ -1601,8 +1606,8 @@ sh_test(name = "test", srcs = ["test.sh"], data = [":test_smp.elf"])
 | 2a. SMP boot (AP spin-up) | ✅ done | Medium | Foundation for all multi-core | None |
 | 2b. Tier 1: multi-queue + MSI-X | ✅ done | Large | Per-core queues (QEMU + HVF) | 2a |
 | 2c. Tier 2: software distribution | ✅ done | Medium | Multi-core on single-queue platforms | 2a |
-| 2f. Task trait + pinned slots | **next** | Small | Foundation for async | 2a-c |
-| 2g. Async/await (Future + Waker + executor) | **next** | Medium | The differentiation thesis | 2f |
+| 2f. Task arena + event-loop integration | ✅ first cut | Small | Foundation for async | 2a-c |
+| 2g. Async/await (Future + Waker + executor) | ✅ first cut | Medium | The differentiation thesis | 2f |
 | 3a. UDP | ✅ done | Small | Enables QUIC | None |
 | 3b. TLS 1.3 (hand-rolled) | ✅ done | Large | Required for QUIC | 1b |
 | 3c. QUIC (as `async fn`) | after 2g | Large | Modern transport + runtime consumer | 3a, 3b, 2g |
@@ -1619,16 +1624,16 @@ TCG, aarch64 HVF, aarch64 QEMU TCG, and native POSIX
 (`tls_handshake_max`, `health_tls_c1`, `health_tls_max`),
 including a remote GCP wrapper (`scripts/gcp-bench.sh`).
 
-**Next on deck:** Phase **2f + 2g** (async runtime foundation),
-then Phase **3c** (QUIC as `async fn` on top). The async runtime
-lands first — minimum scope (task trait + `RawWakerVTable` +
-`Timer::sleep_until` + `UdpRecv::recv_from`), ~300 LOC — precisely
-so QUIC can drive its own API requirements rather than us guessing
-at what primitives to expose. The existing TCP/TLS/HTTP callback
-path keeps running unchanged; async adoption is opt-in per protocol.
+**Next on deck:** Phase **3c** (QUIC as `async fn`). §2f + §2g
+first cut shipped: [kernel/executor.rs](kernel/executor.rs) is the
+per-core task arena + `RawWakerVTable` + `Sleep::until` reactor,
+wired into the event loop; [apps/test_async](apps/test_async) is the
+smoke test, green on HVF and both QEMU arches. `UdpRecv::recv_from`
+/ `TcpListener::accept` reactors land alongside QUIC since QUIC is
+the first real consumer that pins their API shape.
 
 Revised order for what's left:
-`2f → 2g → 3c → 4 (HTTP/3) → 5 (IPv6/NDP) → 2d/2h (work stealing
+`3c (QUIC) → 4 (HTTP/3) → 5 (IPv6/NDP) → 2d/2h (work stealing
 + perf tests, post-QUIC)`.
 
 **The thesis we're committing to**: `async fn` is the *only* execution

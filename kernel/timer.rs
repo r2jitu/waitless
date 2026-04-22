@@ -53,6 +53,10 @@ impl Slot {
 pub struct TimerWheel {
     slots: [Slot; WHEEL_SIZE],
     current_tick: u64,
+    /// Running count of live timers. Maintained by `insert`/`cancel`/
+    /// `advance` so `count()` is O(1) — and so `advance` can fast-path
+    /// an empty wheel without walking every tick from 0 on first call.
+    total: usize,
 }
 
 impl TimerWheel {
@@ -60,6 +64,7 @@ impl TimerWheel {
         TimerWheel {
             slots: [const { Slot::new() }; WHEEL_SIZE],
             current_tick: 0,
+            total: 0,
         }
     }
 
@@ -71,7 +76,12 @@ impl TimerWheel {
     #[must_use = "an ignored `false` silently drops the timer"]
     pub fn insert(&mut self, timer: Timer) -> bool {
         let slot_idx = (timer.deadline as usize) & WHEEL_MASK;
-        self.slots[slot_idx].insert(timer)
+        if self.slots[slot_idx].insert(timer) {
+            self.total += 1;
+            true
+        } else {
+            false
+        }
     }
 
     /// Cancel a timer by arg value. Returns true if found and removed.
@@ -84,6 +94,7 @@ impl TimerWheel {
                         slot.count -= 1;
                         slot.timers[i] = slot.timers[slot.count];
                         slot.timers[slot.count] = None;
+                        self.total -= 1;
                         return true;
                     }
                 }
@@ -95,6 +106,13 @@ impl TimerWheel {
     /// Advance to `now` and fire all expired timers.
     /// Calls each timer's function inline. Returns number of timers fired.
     pub fn advance(&mut self, now: u64) -> usize {
+        // Fast path: empty wheel, jump current_tick forward instead of
+        // walking every slot from the last advance (could be millions
+        // of ticks on first call after boot — `now` is "µs since boot").
+        if self.total == 0 {
+            self.current_tick = now.saturating_add(1);
+            return 0;
+        }
         let mut fired = 0;
         while self.current_tick <= now {
             let slot_idx = (self.current_tick as usize) & WHEEL_MASK;
@@ -117,6 +135,7 @@ impl TimerWheel {
                     slot.count -= 1;
                     slot.timers[i] = slot.timers[slot.count];
                     slot.timers[slot.count] = None;
+                    self.total -= 1;
                     // Fire
                     (timer.func)(timer.arg);
                     fired += 1;
@@ -132,11 +151,7 @@ impl TimerWheel {
 
     /// Number of timers currently scheduled.
     pub fn count(&self) -> usize {
-        let mut total = 0;
-        for slot in self.slots.iter() {
-            total += slot.count;
-        }
-        total
+        self.total
     }
 }
 
