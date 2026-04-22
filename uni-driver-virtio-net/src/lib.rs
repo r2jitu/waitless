@@ -1,17 +1,25 @@
-// drivers/virtio_net.rs — VirtIO network device: TX/RX, feature negotiation, IRQ
+// uni-driver-virtio-net/src/lib.rs — VirtIO network device driver.
+// Moved from `drivers/virtio_net.rs` in Phase 5 Step 4 carveout.
+
+#![no_std]
+#![allow(dead_code, unused_imports)]
+
+extern crate drivers_infra;
+extern crate kernel;
+extern crate uni_net_driver;
 
 use core::arch::asm;
 use core::ptr;
 use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
-use crate::{
+use drivers_infra::{
     log, dsb_st,
     virtio_read32, virtio_write32, virtio_read16, virtio_read8, virtio_write8,
 };
 #[cfg(target_arch = "aarch64")]
 use kernel::aarch64::{exceptions, fdt};
-use crate::pci::{pci_device, read_config, find_device, enable_bus_mastering_inner};
-use crate::virtio::{
+use drivers_infra::pci::{pci_device, read_config, find_device, enable_bus_mastering_inner};
+use drivers_infra::virtio::{
     vpci_device, Virtqueue, VirtioPciDevice,
     vpci_find, vpci_reset, vpci_set_status, vpci_get_status,
     vpci_read_features, vpci_write_features,

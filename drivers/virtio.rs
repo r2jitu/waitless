@@ -21,7 +21,7 @@ use kernel::mm::{alloc_frame, phys_to_virt};
 
 // PCI capability IDs
 const PCI_CAP_ID_VNDR: u8 = 0x09;
-pub(crate) const PCI_CAP_ID_MSIX: u8 = 0x11;
+pub const PCI_CAP_ID_MSIX: u8 = 0x11;
 
 // virtio_pci_cap cfg_type values
 const VIRTIO_PCI_CAP_COMMON_CFG: u8 = 1;
@@ -34,11 +34,11 @@ const CC_DEVICE_FEATURE_SELECT: u64 = 0x00;
 const CC_DEVICE_FEATURE: u64 = 0x04;
 const CC_DRIVER_FEATURE_SELECT: u64 = 0x08;
 const CC_DRIVER_FEATURE: u64 = 0x0c;
-pub(crate) const CC_CONFIG_MSIX_VECTOR: u64 = 0x10;
+pub const CC_CONFIG_MSIX_VECTOR: u64 = 0x10;
 const CC_DEVICE_STATUS: u64 = 0x14;
 const CC_QUEUE_SELECT: u64 = 0x16;
 const CC_QUEUE_SIZE: u64 = 0x18;
-pub(crate) const CC_QUEUE_MSIX_VECTOR: u64 = 0x1a;
+pub const CC_QUEUE_MSIX_VECTOR: u64 = 0x1a;
 const CC_QUEUE_ENABLE: u64 = 0x1c;
 const CC_QUEUE_NOTIFY_OFF: u64 = 0x1e;
 const CC_QUEUE_DESC_LO: u64 = 0x20;
@@ -48,10 +48,10 @@ const CC_QUEUE_DRIVER_HI: u64 = 0x2c;
 const CC_QUEUE_DEVICE_LO: u64 = 0x30;
 const CC_QUEUE_DEVICE_HI: u64 = 0x34;
 
-pub(crate) const VIRTIO_PCI_MAX_DEVICES: usize = 8;
+pub const VIRTIO_PCI_MAX_DEVICES: usize = 8;
 
 #[derive(Clone, Copy)]
-pub(crate) struct VirtioPciDevice {
+pub struct VirtioPciDevice {
     pub pci_idx: usize,         // index into PCI_DEVICES
     pub common_cfg: u64,        // MMIO address of common_cfg
     pub notify_base: u64,       // MMIO address of notify cap
@@ -69,7 +69,7 @@ pub(crate) struct VirtioPciDevice {
 }
 
 impl VirtioPciDevice {
-    pub(crate) const ZERO: Self = VirtioPciDevice {
+    pub const ZERO: Self = VirtioPciDevice {
         pci_idx: 0,
         common_cfg: 0,
         notify_base: 0,
@@ -85,7 +85,7 @@ impl VirtioPciDevice {
 /// VirtIO-PCI device table. Filled during init by `vpci_find`; read
 /// thereafter as snapshots via `vpci_device(idx)`. Same shape as
 /// `pci::PCI_DEVICES`.
-pub(crate) struct VpciTable {
+pub struct VpciTable {
     pub(crate) devices: [VirtioPciDevice; VIRTIO_PCI_MAX_DEVICES],
     pub(crate) count: usize,
 }
@@ -99,11 +99,11 @@ impl VpciTable {
     }
 }
 
-pub(crate) static VPCI_DEVICES: kernel::sync::Spinlock<VpciTable> =
+pub static VPCI_DEVICES: kernel::sync::Spinlock<VpciTable> =
     kernel::sync::Spinlock::new(VpciTable::new());
 
 /// Snapshot of `VPCI_DEVICES[idx]` returned by value.
-pub(crate) fn vpci_device(idx: usize) -> VirtioPciDevice {
+pub fn vpci_device(idx: usize) -> VirtioPciDevice {
     VPCI_DEVICES.lock().devices[idx]
 }
 
@@ -197,7 +197,7 @@ fn vpci_parse_caps(dev: &mut VirtioPciDevice) -> bool {
 /// Find a modern virtio-pci device by type (1=net, 3=console).
 /// Tries non-transitional ID (0x1040+type) first, then transitional
 /// ID (0x1000-range) which QEMU uses by default.
-pub(crate) fn vpci_find(virtio_device_type: u16) -> Option<usize> {
+pub fn vpci_find(virtio_device_type: u16) -> Option<usize> {
     let modern_id = 0x1040 + virtio_device_type;
     // Transitional IDs: net=0x1000, block=0x1001, console=0x1003
     let transitional_id = 0x1000 + virtio_device_type - 1;
@@ -224,7 +224,7 @@ pub(crate) fn vpci_find(virtio_device_type: u16) -> Option<usize> {
 
 // VirtIO PCI transport operations via common_cfg MMIO
 
-pub(crate) fn vpci_reset(dev: &VirtioPciDevice) {
+pub fn vpci_reset(dev: &VirtioPciDevice) {
     unsafe {
         mmio_write8(dev.common_cfg + CC_DEVICE_STATUS, 0);
         while mmio_read8(dev.common_cfg + CC_DEVICE_STATUS) != 0 {
@@ -233,37 +233,37 @@ pub(crate) fn vpci_reset(dev: &VirtioPciDevice) {
     }
 }
 
-pub(crate) fn vpci_set_status(dev: &VirtioPciDevice, status: u8) {
+pub fn vpci_set_status(dev: &VirtioPciDevice, status: u8) {
     unsafe { mmio_write8(dev.common_cfg + CC_DEVICE_STATUS, status); }
 }
 
-pub(crate) fn vpci_get_status(dev: &VirtioPciDevice) -> u8 {
+pub fn vpci_get_status(dev: &VirtioPciDevice) -> u8 {
     unsafe { mmio_read8(dev.common_cfg + CC_DEVICE_STATUS) }
 }
 
-pub(crate) fn vpci_read_features(dev: &VirtioPciDevice, word: u32) -> u32 {
+pub fn vpci_read_features(dev: &VirtioPciDevice, word: u32) -> u32 {
     unsafe {
         mmio_write32(dev.common_cfg + CC_DEVICE_FEATURE_SELECT, word);
         mmio_read32(dev.common_cfg + CC_DEVICE_FEATURE)
     }
 }
 
-pub(crate) fn vpci_write_features(dev: &VirtioPciDevice, word: u32, features: u32) {
+pub fn vpci_write_features(dev: &VirtioPciDevice, word: u32, features: u32) {
     unsafe {
         mmio_write32(dev.common_cfg + CC_DRIVER_FEATURE_SELECT, word);
         mmio_write32(dev.common_cfg + CC_DRIVER_FEATURE, features);
     }
 }
 
-pub(crate) fn vpci_select_queue(dev: &VirtioPciDevice, idx: u16) {
+pub fn vpci_select_queue(dev: &VirtioPciDevice, idx: u16) {
     unsafe { mmio_write16(dev.common_cfg + CC_QUEUE_SELECT, idx); }
 }
 
-pub(crate) fn vpci_get_queue_size(dev: &VirtioPciDevice) -> u16 {
+pub fn vpci_get_queue_size(dev: &VirtioPciDevice) -> u16 {
     unsafe { mmio_read16(dev.common_cfg + CC_QUEUE_SIZE) }
 }
 
-pub(crate) fn vpci_set_queue_addrs(dev: &VirtioPciDevice, desc: u64, avail: u64, used: u64) {
+pub fn vpci_set_queue_addrs(dev: &VirtioPciDevice, desc: u64, avail: u64, used: u64) {
     unsafe {
         mmio_write32(dev.common_cfg + CC_QUEUE_DESC_LO, desc as u32);
         mmio_write32(dev.common_cfg + CC_QUEUE_DESC_HI, (desc >> 32) as u32);
@@ -274,45 +274,45 @@ pub(crate) fn vpci_set_queue_addrs(dev: &VirtioPciDevice, desc: u64, avail: u64,
     }
 }
 
-pub(crate) fn vpci_enable_queue(dev: &VirtioPciDevice) {
+pub fn vpci_enable_queue(dev: &VirtioPciDevice) {
     unsafe { mmio_write16(dev.common_cfg + CC_QUEUE_ENABLE, 1); }
 }
 
-pub(crate) fn vpci_get_queue_notify_off(dev: &VirtioPciDevice) -> u16 {
+pub fn vpci_get_queue_notify_off(dev: &VirtioPciDevice) -> u16 {
     unsafe { mmio_read16(dev.common_cfg + CC_QUEUE_NOTIFY_OFF) }
 }
 
-pub(crate) fn vpci_queue_notify_addr(dev: &VirtioPciDevice, notify_off: u16) -> u64 {
+pub fn vpci_queue_notify_addr(dev: &VirtioPciDevice, notify_off: u16) -> u64 {
     dev.notify_base + (notify_off as u64) * (dev.notify_off_multiplier as u64)
 }
 
-pub(crate) fn vpci_read_dev_cfg8(dev: &VirtioPciDevice, offset: u32) -> u8 {
+pub fn vpci_read_dev_cfg8(dev: &VirtioPciDevice, offset: u32) -> u8 {
     if dev.device_cfg == 0 { return 0; }
     unsafe { mmio_read8(dev.device_cfg + offset as u64) }
 }
 
-pub(crate) fn vpci_read_dev_cfg16(dev: &VirtioPciDevice, offset: u32) -> u16 {
+pub fn vpci_read_dev_cfg16(dev: &VirtioPciDevice, offset: u32) -> u16 {
     if dev.device_cfg == 0 { return 0; }
     unsafe { mmio_read16(dev.device_cfg + offset as u64) }
 }
 
-pub(crate) fn vpci_read_isr(dev: &VirtioPciDevice) -> u8 {
+pub fn vpci_read_isr(dev: &VirtioPciDevice) -> u8 {
     if dev.isr_cfg == 0 { return 0; }
     unsafe { mmio_read8(dev.isr_cfg) }
 }
 
-pub(crate) fn vpci_set_queue_msix_vector(dev: &VirtioPciDevice, vector: u16) {
+pub fn vpci_set_queue_msix_vector(dev: &VirtioPciDevice, vector: u16) {
     unsafe { mmio_write16(dev.common_cfg + CC_QUEUE_MSIX_VECTOR, vector); }
 }
 
-pub(crate) fn vpci_set_config_msix_vector(dev: &VirtioPciDevice, vector: u16) {
+pub fn vpci_set_config_msix_vector(dev: &VirtioPciDevice, vector: u16) {
     unsafe { mmio_write16(dev.common_cfg + CC_CONFIG_MSIX_VECTOR, vector); }
 }
 
 /// Toggle the `MSI-X Enable` bit in the device's message-control word.
 /// The function-mask bit is cleared so individual entries control
 /// delivery via their own per-vector mask.
-pub(crate) fn vpci_msix_enable(dev: &VirtioPciDevice, enable: bool) {
+pub fn vpci_msix_enable(dev: &VirtioPciDevice, enable: bool) {
     if dev.msix_cap_off == 0 { return; }
     let pci = pci_device(dev.pci_idx);
     let cap = dev.msix_cap_off;
@@ -329,7 +329,7 @@ pub(crate) fn vpci_msix_enable(dev: &VirtioPciDevice, enable: bool) {
 
 /// Program one MSI-X table entry: address, data, and mask bit.
 /// Each entry is 16 bytes: addr_lo, addr_hi, data, vector_ctrl.
-pub(crate) fn vpci_msix_write_entry(
+pub fn vpci_msix_write_entry(
     dev: &VirtioPciDevice,
     entry: u16,
     addr: u64,
@@ -353,72 +353,72 @@ pub(crate) fn vpci_msix_write_entry(
 // ============================================================================
 
 // Legacy PCI I/O register offsets
-pub(crate) const VREG_DEVICE_FEATURES: u64 = 0x00;
-pub(crate) const VREG_GUEST_FEATURES: u64 = 0x04;
-pub(crate) const VREG_QUEUE_ADDRESS: u64 = 0x08;
-pub(crate) const VREG_QUEUE_SIZE: u64 = 0x0C;
-pub(crate) const VREG_QUEUE_SELECT: u64 = 0x0E;
-pub(crate) const VREG_QUEUE_NOTIFY: u64 = 0x10;
-pub(crate) const VREG_DEVICE_STATUS: u64 = 0x12;
-pub(crate) const VREG_ISR_STATUS: u64 = 0x13;
-pub(crate) const VREG_DEVICE_CONFIG: u64 = 0x14;
+pub const VREG_DEVICE_FEATURES: u64 = 0x00;
+pub const VREG_GUEST_FEATURES: u64 = 0x04;
+pub const VREG_QUEUE_ADDRESS: u64 = 0x08;
+pub const VREG_QUEUE_SIZE: u64 = 0x0C;
+pub const VREG_QUEUE_SELECT: u64 = 0x0E;
+pub const VREG_QUEUE_NOTIFY: u64 = 0x10;
+pub const VREG_DEVICE_STATUS: u64 = 0x12;
+pub const VREG_ISR_STATUS: u64 = 0x13;
+pub const VREG_DEVICE_CONFIG: u64 = 0x14;
 
 // Virtio-MMIO register offsets (aarch64 QEMU)
-pub(crate) const MMIO_BASE: u64 = 0x0a00_0000;
-pub(crate) const MMIO_MAGIC_VALUE: u64 = 0x000;
-pub(crate) const MMIO_VERSION: u64 = 0x004;
-pub(crate) const MMIO_DEVICE_ID: u64 = 0x008;
-pub(crate) const MMIO_HOST_FEATURES: u64 = 0x010;
-pub(crate) const MMIO_DEVICE_FEATURES_SEL: u64 = 0x014;
-pub(crate) const MMIO_GUEST_FEATURES: u64 = 0x020;
-pub(crate) const MMIO_DRIVER_FEATURES_SEL: u64 = 0x024;
-pub(crate) const MMIO_GUEST_PAGE_SIZE: u64 = 0x028;
-pub(crate) const MMIO_QUEUE_SEL: u64 = 0x030;
-pub(crate) const MMIO_QUEUE_NUM_MAX: u64 = 0x034;
-pub(crate) const MMIO_QUEUE_NUM: u64 = 0x038;
-pub(crate) const MMIO_QUEUE_ALIGN: u64 = 0x03c;
-pub(crate) const MMIO_QUEUE_PFN: u64 = 0x040;
-pub(crate) const MMIO_QUEUE_READY: u64 = 0x044;
-pub(crate) const MMIO_QUEUE_NOTIFY: u64 = 0x050;
-pub(crate) const MMIO_INTERRUPT_STATUS: u64 = 0x060;
-pub(crate) const MMIO_INTERRUPT_ACK: u64 = 0x064;
-pub(crate) const MMIO_STATUS: u64 = 0x070;
-pub(crate) const MMIO_DEVICE_CONFIG: u64 = 0x100;
-pub(crate) const MMIO_MAGIC: u32 = 0x74726976;
+pub const MMIO_BASE: u64 = 0x0a00_0000;
+pub const MMIO_MAGIC_VALUE: u64 = 0x000;
+pub const MMIO_VERSION: u64 = 0x004;
+pub const MMIO_DEVICE_ID: u64 = 0x008;
+pub const MMIO_HOST_FEATURES: u64 = 0x010;
+pub const MMIO_DEVICE_FEATURES_SEL: u64 = 0x014;
+pub const MMIO_GUEST_FEATURES: u64 = 0x020;
+pub const MMIO_DRIVER_FEATURES_SEL: u64 = 0x024;
+pub const MMIO_GUEST_PAGE_SIZE: u64 = 0x028;
+pub const MMIO_QUEUE_SEL: u64 = 0x030;
+pub const MMIO_QUEUE_NUM_MAX: u64 = 0x034;
+pub const MMIO_QUEUE_NUM: u64 = 0x038;
+pub const MMIO_QUEUE_ALIGN: u64 = 0x03c;
+pub const MMIO_QUEUE_PFN: u64 = 0x040;
+pub const MMIO_QUEUE_READY: u64 = 0x044;
+pub const MMIO_QUEUE_NOTIFY: u64 = 0x050;
+pub const MMIO_INTERRUPT_STATUS: u64 = 0x060;
+pub const MMIO_INTERRUPT_ACK: u64 = 0x064;
+pub const MMIO_STATUS: u64 = 0x070;
+pub const MMIO_DEVICE_CONFIG: u64 = 0x100;
+pub const MMIO_MAGIC: u32 = 0x74726976;
 // MMIO v2 separate ring address registers
-pub(crate) const MMIO_QUEUE_DESC_LOW: u64 = 0x080;
-pub(crate) const MMIO_QUEUE_DESC_HIGH: u64 = 0x084;
-pub(crate) const MMIO_QUEUE_DRIVER_LOW: u64 = 0x090;
-pub(crate) const MMIO_QUEUE_DRIVER_HIGH: u64 = 0x094;
-pub(crate) const MMIO_QUEUE_DEVICE_LOW: u64 = 0x0a0;
-pub(crate) const MMIO_QUEUE_DEVICE_HIGH: u64 = 0x0a4;
+pub const MMIO_QUEUE_DESC_LOW: u64 = 0x080;
+pub const MMIO_QUEUE_DESC_HIGH: u64 = 0x084;
+pub const MMIO_QUEUE_DRIVER_LOW: u64 = 0x090;
+pub const MMIO_QUEUE_DRIVER_HIGH: u64 = 0x094;
+pub const MMIO_QUEUE_DEVICE_LOW: u64 = 0x0a0;
+pub const MMIO_QUEUE_DEVICE_HIGH: u64 = 0x0a4;
 
 // Device status bits
-pub(crate) const STATUS_ACKNOWLEDGE: u8 = 1;
-pub(crate) const STATUS_DRIVER: u8 = 2;
-pub(crate) const STATUS_DRIVER_OK: u8 = 4;
-pub(crate) const STATUS_FEATURES_OK: u8 = 8;
-pub(crate) const STATUS_FAILED: u8 = 128;
+pub const STATUS_ACKNOWLEDGE: u8 = 1;
+pub const STATUS_DRIVER: u8 = 2;
+pub const STATUS_DRIVER_OK: u8 = 4;
+pub const STATUS_FEATURES_OK: u8 = 8;
+pub const STATUS_FAILED: u8 = 128;
 
 // Virtqueue descriptor flags
-pub(crate) const VIRTQ_DESC_F_NEXT: u16 = 1;
-pub(crate) const VIRTQ_DESC_F_WRITE: u16 = 2;
-pub(crate) const VIRTQ_AVAIL_F_NO_INTERRUPT: u16 = 1;
+pub const VIRTQ_DESC_F_NEXT: u16 = 1;
+pub const VIRTQ_DESC_F_WRITE: u16 = 2;
+pub const VIRTQ_AVAIL_F_NO_INTERRUPT: u16 = 1;
 /// Device sets this on used->flags to tell the driver: don't send
 /// notifications for this queue. Standard virtio spec §2.7.13.
-pub(crate) const VIRTQ_USED_F_NO_NOTIFY: u16 = 1;
+pub const VIRTQ_USED_F_NO_NOTIFY: u16 = 1;
 
 // Feature bits
-pub(crate) const VIRTIO_NET_F_MAC: u32 = 1 << 5;
-pub(crate) const VIRTIO_NET_F_MRG_RXBUF: u32 = 1 << 15;
-pub(crate) const VIRTIO_NET_F_STATUS: u32 = 1 << 16;
-pub(crate) const VIRTIO_NET_F_MQ: u32 = 1 << 22;
-pub(crate) const VIRTIO_NET_F_CTRL_VQ: u32 = 1 << 17;
-pub(crate) const VIRTIO_RING_F_EVENT_IDX: u32 = 1 << 29;
+pub const VIRTIO_NET_F_MAC: u32 = 1 << 5;
+pub const VIRTIO_NET_F_MRG_RXBUF: u32 = 1 << 15;
+pub const VIRTIO_NET_F_STATUS: u32 = 1 << 16;
+pub const VIRTIO_NET_F_MQ: u32 = 1 << 22;
+pub const VIRTIO_NET_F_CTRL_VQ: u32 = 1 << 17;
+pub const VIRTIO_RING_F_EVENT_IDX: u32 = 1 << 29;
 /// Vendor extension: device exposes per-queue used_idx at config offset 0x110.
 /// When set, get_used() reads used_idx via MMIO trap instead of from shared
 /// RAM, working around dcache coherency issues on Apple HVF.
-pub(crate) const VIRTIO_F_USED_IDX_MMIO: u32 = 1 << 24;
+pub const VIRTIO_F_USED_IDX_MMIO: u32 = 1 << 24;
 
 // ============================================================================
 // Split Virtqueue
@@ -426,7 +426,7 @@ pub(crate) const VIRTIO_F_USED_IDX_MMIO: u32 = 1 << 24;
 
 // Virtqueue descriptor (must match hardware layout: 16 bytes packed)
 #[repr(C, packed)]
-pub(crate) struct VirtqDesc {
+pub struct VirtqDesc {
     pub addr: u64,
     pub len: u32,
     pub flags: u16,
@@ -435,7 +435,7 @@ pub(crate) struct VirtqDesc {
 
 // Available ring header (naturally aligned, no padding)
 #[repr(C)]
-pub(crate) struct VirtqAvail {
+pub struct VirtqAvail {
     pub flags: u16,
     pub idx: u16,
     // ring[queue_size] follows, then used_event (u16)
@@ -443,20 +443,20 @@ pub(crate) struct VirtqAvail {
 
 // Used ring element (naturally aligned)
 #[repr(C)]
-pub(crate) struct VirtqUsedElem {
+pub struct VirtqUsedElem {
     pub id: u32,
     pub len: u32,
 }
 
 // Used ring header (naturally aligned)
 #[repr(C)]
-pub(crate) struct VirtqUsed {
+pub struct VirtqUsed {
     pub flags: u16,
     pub idx: u16,
     // ring[queue_size] of VirtqUsedElem follows
 }
 
-pub(crate) struct Virtqueue {
+pub struct Virtqueue {
     pub descs: *mut VirtqDesc,
     pub avail: *mut VirtqAvail,
     pub used: *mut VirtqUsed,
@@ -483,7 +483,7 @@ pub(crate) struct Virtqueue {
 }
 
 impl Virtqueue {
-    pub(crate) const ZERO: Self = Virtqueue {
+    pub const ZERO: Self = Virtqueue {
         descs: ptr::null_mut(),
         avail: ptr::null_mut(),
         used: ptr::null_mut(),
@@ -939,7 +939,7 @@ impl Virtqueue {
     }
 
     /// Read used->idx (volatile, device writes this).
-    pub(crate) fn used_idx(&self) -> u16 {
+    pub fn used_idx(&self) -> u16 {
         // SAFETY: used points to a valid VirtqUsed header.
         unsafe { ptr::read_volatile(&(*self.used).idx) }
     }
@@ -948,7 +948,7 @@ impl Virtqueue {
     /// entries the driver has already consumed. Paired with
     /// `used_idx()`: if `used_idx() > last_used_cursor()` the device
     /// has delivered frames we haven't picked up yet.
-    pub(crate) fn last_used_cursor(&self) -> u16 {
+    pub fn last_used_cursor(&self) -> u16 {
         self.last_used_idx
     }
 

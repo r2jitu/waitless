@@ -1,0 +1,24 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
+
+package(default_visibility = ["//visibility:public"])
+
+# uni-driver-virtio-net — VirtIO ethernet driver.
+#
+# Moved out of `//drivers` in Phase 5 Step 4 of init-redesign.md so
+# apps that don't need VirtIO networking can drop it from their dep
+# closure. Depends only on `//drivers:infra` for MMIO / PCI /
+# VirtIO transport helpers — no dep on `//drivers` itself, so the
+# outer umbrella can dispatch to us without forming a cycle.
+rust_library(
+    name = "uni_driver_virtio_net",
+    srcs = ["src/lib.rs"],
+    crate_name = "uni_driver_virtio_net",
+    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    target_compatible_with = ["@platforms//os:none"],
+    deps = [
+        "//drivers:infra",
+        "//kernel",
+        "//uni-net:driver",
+    ],
+)

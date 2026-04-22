@@ -1,4 +1,7 @@
-// drivers/gve.rs — Google Virtual Ethernet (gve) driver.
+// uni-driver-gve/src/lib.rs — Google Virtual Ethernet (gve) driver.
+// Moved from `drivers/gve.rs` in Phase 5 Step 4 carveout.
+//
+// Historical note:
 //
 // Renamed from `gvnic.rs` in Phase 5 step 3 to match Linux / the
 // upstream Google driver name. "gVNIC" is GCE's branding for the
@@ -35,8 +38,15 @@
 // `reg_read32` / `reg_write32` helpers below swap on read/write so
 // the rest of the code works in natural host-endian `u32`s.
 
-use crate::{log, mmio_read32, mmio_write32};
-use crate::pci;
+#![no_std]
+#![allow(dead_code, unused_imports)]
+
+extern crate drivers_infra;
+extern crate kernel;
+extern crate uni_net_driver;
+
+use drivers_infra::{log, mmio_read32, mmio_write32};
+use drivers_infra::pci;
 use core::mem::size_of;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};

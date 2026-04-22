@@ -22,7 +22,10 @@
 // Phase 2 and has no TX staging pool, so the callers' contracts
 // are already satisfied.
 
-use crate::{gve, virtio_net};
+// `gve` and `virtio_net` are external crates now (phase 5 step 4);
+// bring them in as local aliases via the crate-level `extern crate`
+// declarations in `lib.rs`.
+use crate::{virtio_net, gve};
 
 #[inline]
 fn use_gve() -> bool {

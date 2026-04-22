@@ -1,0 +1,23 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
+
+package(default_visibility = ["//visibility:public"])
+
+# uni-driver-gve — Google Virtual Ethernet driver (GCE).
+#
+# Moved out of `//drivers` in Phase 5 Step 4 of init-redesign.md.
+# Depends only on `//drivers:infra` (MMIO + PCI). Notably does NOT
+# depend on `//drivers:infra`'s VirtIO transport — gve has its own
+# BAR-register ABI that doesn't go through VirtIO.
+rust_library(
+    name = "uni_driver_gve",
+    srcs = ["src/lib.rs"],
+    crate_name = "uni_driver_gve",
+    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    target_compatible_with = ["@platforms//os:none"],
+    deps = [
+        "//drivers:infra",
+        "//kernel",
+        "//uni-net:driver",
+    ],
+)

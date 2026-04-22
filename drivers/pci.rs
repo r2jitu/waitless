@@ -14,11 +14,11 @@ use crate::{outl, inl};
 // PCI subsystem
 // ============================================================================
 
-pub(crate) const PCI_MAX_DEVICES: usize = 64;
+pub const PCI_MAX_DEVICES: usize = 64;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
-pub(crate) struct PciDevice {
+pub struct PciDevice {
     pub bus: u8,
     pub slot: u8,
     pub func: u8,
@@ -32,7 +32,7 @@ pub(crate) struct PciDevice {
 }
 
 impl PciDevice {
-    pub(crate) const ZERO: Self = PciDevice {
+    pub const ZERO: Self = PciDevice {
         bus: 0, slot: 0, func: 0,
         vendor_id: 0, device_id: 0,
         class_code: 0, subclass: 0, prog_if: 0,
@@ -45,7 +45,7 @@ impl PciDevice {
 /// spinlock so any future cross-core read/write is sound. The bus scan
 /// fills the table during init (BSP, single-threaded); the rest of the
 /// driver layer reads it via `find_device`/`pci_devices_get`.
-pub(crate) struct PciDeviceTable {
+pub struct PciDeviceTable {
     pub(crate) devices: [PciDevice; PCI_MAX_DEVICES],
     pub(crate) count: usize,
 }
@@ -59,7 +59,7 @@ impl PciDeviceTable {
     }
 }
 
-pub(crate) static PCI_DEVICES: Spinlock<PciDeviceTable> =
+pub static PCI_DEVICES: Spinlock<PciDeviceTable> =
     Spinlock::new(PciDeviceTable::new());
 
 /// Init guard. Replaces a `static mut bool` checked-then-set, which would
@@ -79,12 +79,12 @@ static PCI_INITIALIZED: core::sync::atomic::AtomicBool =
 #[cfg(target_arch = "aarch64")]
 const ECAM_BASE_DEFAULT: u64 = 0x40_1000_0000;
 #[cfg(target_arch = "aarch64")]
-pub(crate) static G_ECAM_BASE: kernel::once::InitOnce<u64> = kernel::once::InitOnce::new();
+pub static G_ECAM_BASE: kernel::once::InitOnce<u64> = kernel::once::InitOnce::new();
 /// MMIO allocation pool cursor. Mutated by `assign_bars` during the
 /// init bus scan; the spinlock around it serialises future cross-core
 /// scans (currently only the BSP scans, but the lock makes it safe).
 #[cfg(target_arch = "aarch64")]
-pub(crate) static G_PCI_MEM_NEXT: Spinlock<u64> = Spinlock::new(0x1000_0000);
+pub static G_PCI_MEM_NEXT: Spinlock<u64> = Spinlock::new(0x1000_0000);
 
 #[cfg(target_arch = "x86_64")]
 const PCI_CONFIG_ADDR: u16 = 0x0CF8;
@@ -103,7 +103,7 @@ fn ecam_addr(bus: u8, slot: u8, func: u8, offset: u8) -> u64 {
 }
 
 /// Read 32-bit PCI config register (offset must be 4-byte aligned).
-pub(crate) fn read_config(bus: u8, slot: u8, func: u8, offset: u8) -> u32 {
+pub fn read_config(bus: u8, slot: u8, func: u8, offset: u8) -> u32 {
     unsafe {
         #[cfg(target_arch = "x86_64")]
         {
@@ -123,7 +123,7 @@ pub(crate) fn read_config(bus: u8, slot: u8, func: u8, offset: u8) -> u32 {
 }
 
 /// Write 32-bit PCI config register.
-pub(crate) fn write_config(bus: u8, slot: u8, func: u8, offset: u8, val: u32) {
+pub fn write_config(bus: u8, slot: u8, func: u8, offset: u8, val: u32) {
     unsafe {
         #[cfg(target_arch = "x86_64")]
         {
@@ -144,14 +144,14 @@ pub(crate) fn write_config(bus: u8, slot: u8, func: u8, offset: u8, val: u32) {
 
 /// Read 16-bit PCI config register (aarch64 ECAM supports sub-dword access).
 #[cfg(target_arch = "aarch64")]
-pub(crate) fn read_config16(bus: u8, slot: u8, func: u8, offset: u8) -> u16 {
+pub fn read_config16(bus: u8, slot: u8, func: u8, offset: u8) -> u16 {
     unsafe { mmio_read16(ecam_addr(bus, slot, func, offset)) }
 }
 
 /// Write 16-bit PCI config register.
 /// Critical for Command register (offset 0x04) to avoid clobbering Status.
 #[cfg(target_arch = "aarch64")]
-pub(crate) fn write_config16(bus: u8, slot: u8, func: u8, offset: u8, val: u16) {
+pub fn write_config16(bus: u8, slot: u8, func: u8, offset: u8, val: u16) {
     unsafe { mmio_write16(ecam_addr(bus, slot, func, offset), val); }
 }
 
@@ -311,7 +311,7 @@ fn init_inner() {
     log(b"[PCI] Scan complete\n");
 }
 
-pub(crate) fn find_device(vendor_id: u16, device_id: u16) -> Option<usize> {
+pub fn find_device(vendor_id: u16, device_id: u16) -> Option<usize> {
     let table = PCI_DEVICES.lock();
     for i in 0..table.count {
         if table.devices[i].vendor_id == vendor_id && table.devices[i].device_id == device_id {
@@ -324,11 +324,11 @@ pub(crate) fn find_device(vendor_id: u16, device_id: u16) -> Option<usize> {
 /// Snapshot of `PCI_DEVICES[idx]` returned by value. PciDevice is Copy
 /// so this is a cheap struct copy out from under the lock; the caller
 /// can then read fields/BARs without holding the lock.
-pub(crate) fn pci_device(idx: usize) -> PciDevice {
+pub fn pci_device(idx: usize) -> PciDevice {
     PCI_DEVICES.lock().devices[idx]
 }
 
-pub(crate) fn enable_bus_mastering_inner(slot: u8) {
+pub fn enable_bus_mastering_inner(slot: u8) {
     #[cfg(target_arch = "aarch64")]
     {
         let cmd = read_config16(0, slot, 0, 0x04);
@@ -342,7 +342,7 @@ pub(crate) fn enable_bus_mastering_inner(slot: u8) {
 }
 
 /// Read 64-bit BAR address from a device.
-pub(crate) fn read_bar64(dev: &PciDevice, bar_idx: usize) -> u64 {
+pub fn read_bar64(dev: &PciDevice, bar_idx: usize) -> u64 {
     let bar0 = dev.bar[bar_idx];
     let is_io = (bar0 & 1) != 0;
     if is_io {

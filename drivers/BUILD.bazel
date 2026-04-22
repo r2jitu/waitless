@@ -3,21 +3,55 @@ load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 
 package(default_visibility = ["//visibility:public"])
 
+# ── Shared infrastructure ─────────────────────────────────────────
+#
+# MMIO helpers, PCI bus enumeration, VirtIO transport (legacy +
+# modern PCI + MMIO), virtio-console. Each NIC driver crate
+# (`//uni-driver-virtio-net`, `//uni-driver-gve`) depends on this
+# target; the outer `:drivers` target below layers a dispatcher over
+# both.
+#
+# Kept as a sibling target (not a separate directory) because
+# everything here is tightly coupled — common helpers + PCI/VirtIO
+# probe infra + the virtio-console FFI — and moving them to a
+# separate directory gains nothing.
 rust_library(
-    name = "drivers",
+    name = "infra",
     srcs = [
-        "gve.rs",
-        "lib.rs",
-        "net.rs",
+        "infra.rs",
         "pci.rs",
         "virtio.rs",
         "virtio_console.rs",
-        "virtio_net.rs",
     ],
-    crate_root = "lib.rs",
+    crate_root = "infra.rs",
+    crate_name = "drivers_infra",
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
     deps = [
         "//kernel",
         "//uni-net:driver",
+    ],
+)
+
+# ── Outer driver-umbrella crate (`drivers`) ───────────────────────
+#
+# Owns `drivers::net` (NIC dispatcher) plus a `pub use drivers_infra::*`
+# re-export so existing callers keep seeing `drivers::pci::init`,
+# `drivers::mmio_read32`, etc. Depends on both NIC crates for the
+# dispatcher — no cycle because NIC crates only depend on `:infra`,
+# not on this target.
+rust_library(
+    name = "drivers",
+    srcs = [
+        "lib.rs",
+        "net.rs",
+    ],
+    crate_root = "lib.rs",
+    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    deps = [
+        ":infra",
+        "//kernel",
+        "//uni-net:driver",
+        "//uni-driver-virtio-net:uni_driver_virtio_net",
+        "//uni-driver-gve:uni_driver_gve",
     ],
 )
