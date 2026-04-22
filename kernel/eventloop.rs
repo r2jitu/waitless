@@ -27,6 +27,12 @@ static NET_FLUSH: AtomicFn<VoidFn> = AtomicFn::null();
 static SERVICE: AtomicFn<PollFn> = AtomicFn::null();
 static CHECK_SHUTDOWN: AtomicFn<BoolFn> = AtomicFn::null();
 static IDLE: AtomicFn<IdleFn> = AtomicFn::null();
+/// App tick hook from `uni::on_tick`. Fires at the top of every
+/// event-loop iteration, regardless of work; side-effect only.
+/// Additive next to `SERVICE` — `SERVICE` carries app logic that
+/// returns work/no-work, `TICK` is a register for periodic
+/// maintenance (metrics, GC, cache expiry, …).
+static TICK: AtomicFn<IdleFn> = AtomicFn::null();
 /// Invoked on the BSP exactly once, right after the loop breaks and
 /// before the machine powers off. Lets upper layers (e.g. `uni`'s
 /// App dispatch) run `destroy`-style teardown while the heap is
@@ -69,6 +75,10 @@ pub fn set_check_shutdown(f: BoolFn) {
 
 pub fn set_idle(f: IdleFn) {
     IDLE.store(f);
+}
+
+pub fn set_tick(f: IdleFn) {
+    TICK.store(f);
 }
 
 /// Register a teardown callback invoked on the BSP between the event
@@ -129,6 +139,9 @@ pub fn run(core_id: u32) -> ! {
     loop {
         if loops & 63 == 0 && is_shutdown() { break; }
         loops += 1;
+
+        // 0. App tick hook — fires every iteration regardless of work.
+        if let Some(f) = TICK.load() { f(core_id); }
 
         let mut did_work = false;
 

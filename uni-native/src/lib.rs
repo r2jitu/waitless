@@ -1067,6 +1067,15 @@ static IO_POLL_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SERVICE: AtomicFn<PollFn> = AtomicFn::null();
 static READY: AtomicBool = AtomicBool::new(false);
 
+/// App hooks from `uni::on_tick` / `uni::on_idle`. `tick` fires at
+/// the top of every worker-loop iteration; `idle` fires just before
+/// `wait_for_events` when the loop has nothing else to do. Both are
+/// additive next to `SERVICE` — `SERVICE` carries app logic that
+/// returns work/no-work; these hooks are side-effect-only.
+type HookFn = fn(u32);
+static TICK: AtomicFn<HookFn> = AtomicFn::null();
+static IDLE: AtomicFn<HookFn> = AtomicFn::null();
+
 /// Register an IO poll callback (network, storage, etc). Multiple
 /// sources can be registered; all are called each iteration. Designed
 /// to be called from a single init thread; the atomic fetch_add
@@ -1090,6 +1099,14 @@ fn get_service() -> Option<PollFn> {
     SERVICE.load()
 }
 
+pub fn set_tick(f: HookFn) {
+    TICK.store(f);
+}
+
+pub fn set_idle(f: HookFn) {
+    IDLE.store(f);
+}
+
 pub fn set_ready() {
     READY.store(true, Ordering::Release);
 }
@@ -1109,6 +1126,9 @@ pub fn run_worker(worker_id: u32) {
     loop {
         if check_shutdown() { break; }
 
+        // 0. App tick hook — fires every iteration.
+        if let Some(f) = TICK.load() { f(worker_id); }
+
         let mut did_work = false;
 
         // 1. IO poll callbacks (network, future storage, etc)
@@ -1126,6 +1146,7 @@ pub fn run_worker(worker_id: u32) {
 
         // 3. Idle if no work
         if !did_work {
+            if let Some(f) = IDLE.load() { f(worker_id); }
             wait_for_events();
         }
     }
