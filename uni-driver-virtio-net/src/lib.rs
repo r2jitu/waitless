@@ -1551,7 +1551,15 @@ impl EthernetDriver for VirtioNetDriver {
     }
 
     fn probe(&self) -> Option<NicHandle> {
+        // Short-circuit via the cached flag — `init()` is NOT
+        // idempotent (it re-runs the full PCI/MMIO probe, queue
+        // realloc, MSI-X rebind), and calling it a second time after
+        // the TCP stack is up corrupts in-flight state. Check first,
+        // then do the real bring-up only on the first call.
         if probe_ok() {
+            return Some(NicHandle::new());
+        }
+        if init() {
             Some(NicHandle::new())
         } else {
             None
@@ -1573,6 +1581,27 @@ impl EthernetDriver for VirtioNetDriver {
         let n = poll(cb);
         if n < 0 { 0 } else { n as usize }
     }
+
+    // Overrides for the extended dispatcher surface. These route to
+    // the crate-level free functions that the old `drivers::net::*`
+    // dispatcher used to call directly.
+
+    fn get_mac(&self, _handle: &NicHandle, out: *mut u8) { get_mac(out) }
+    fn num_queue_pairs(&self, _handle: &NicHandle) -> u16 { num_queue_pairs() }
+    fn activate_multi_queue(&self, _handle: &NicHandle) { activate_multi_queue() }
+    fn enable_irq(&self, _handle: &NicHandle) { enable_irq() }
+    fn poll_qp(&self, _handle: &NicHandle, qp: usize, cb: fn(&[u8])) -> i32 { poll_qp(qp, cb) }
+    fn flush_tx_staging(&self, _handle: &NicHandle) { flush_tx_staging() }
+    fn flush_tx_kick_if_dirty(&self, _handle: &NicHandle) -> bool { flush_tx_kick_if_dirty() }
+    fn irq_idle_supported(&self, _handle: &NicHandle) -> bool { irq_idle_supported() }
+    fn arm_rx_interrupts(&self, _handle: &NicHandle) { arm_rx_interrupts() }
+    fn has_pending_rx(&self, _handle: &NicHandle) -> bool { has_pending_rx() }
+    fn has_pending_tx(&self, _handle: &NicHandle) -> bool { has_pending_tx() }
+    fn rearm_rx_napi(&self, _handle: &NicHandle, core_id: u32) -> bool { rearm_rx_napi(core_id) }
+    fn enable_deferred_tx_kick(&self, _handle: &NicHandle) { enable_deferred_tx_kick() }
+    fn poke_interrupt_status(&self, _handle: &NicHandle) { poke_interrupt_status() }
+    fn rx_counts(&self, _handle: &NicHandle) -> [u64; 8] { rx_counts() }
+    fn rx_used_cursors(&self, _handle: &NicHandle) -> [(u16, u16); 8] { rx_used_cursors() }
 }
 
 pub static VIRTIO_NET_DRIVER: VirtioNetDriver = VirtioNetDriver;

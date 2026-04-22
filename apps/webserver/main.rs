@@ -11,6 +11,18 @@ extern crate alloc;
 extern crate uni;
 extern crate uni_http;
 extern crate uni_tls;
+// Pull NIC driver crates into the link closure for their
+// `register_ethernet_driver!` link-section entries. Without these
+// declarations, rustc drops the rlibs (nothing else in the binary
+// references them) and `linked_ethernet_drivers()` is empty at
+// runtime. `os = "none"` gate matches the BUILD `select`: on native
+// neither crate is in the dep graph (POSIX sockets replace NIC).
+// Runtime picks whichever probes successfully — virtio-net for
+// QEMU / HVF / default GCE, gve for GCE --nic-type=GVNIC.
+#[cfg(target_os = "none")]
+extern crate uni_driver_virtio_net;
+#[cfg(target_os = "none")]
+extern crate uni_driver_gve;
 
 use alloc::format;
 use alloc::string::String;

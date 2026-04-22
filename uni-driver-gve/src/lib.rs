@@ -1890,7 +1890,14 @@ impl EthernetDriver for GveDriver {
     }
 
     fn probe(&self) -> Option<NicHandle> {
+        // Short-circuit via the cached flag. `init()` internally
+        // already short-circuits on `GVNIC_OK`, but we mirror
+        // virtio-net's shape here so the trait contract — "probe()
+        // is cheap on repeat calls" — holds uniformly.
         if probe_ok() {
+            return Some(NicHandle::new());
+        }
+        if init() {
             Some(NicHandle::new())
         } else {
             None
@@ -1909,6 +1916,20 @@ impl EthernetDriver for GveDriver {
         let n = poll(cb);
         if n < 0 { 0 } else { n as usize }
     }
+
+    // Overrides for extras gve actually implements (polling-only, no
+    // TX staging / MSI-X / NAPI). Most default no-ops from the trait
+    // are already correct for gve — we override only the ones where
+    // gve has a real answer.
+
+    fn get_mac(&self, _handle: &NicHandle, out: *mut u8) { get_mac(out) }
+    fn num_queue_pairs(&self, _handle: &NicHandle) -> u16 { num_queue_pairs() }
+    fn poll_qp(&self, _handle: &NicHandle, qp: usize, cb: fn(&[u8])) -> i32 { poll_qp(qp, cb) }
+    fn flush_tx_staging(&self, _handle: &NicHandle) { flush_all_tx_kicks() }
+    fn flush_tx_kick_if_dirty(&self, _handle: &NicHandle) -> bool { flush_tx_kick_if_dirty() }
+    fn enable_deferred_tx_kick(&self, _handle: &NicHandle) { enable_deferred_tx_kick() }
+    fn rx_counts(&self, _handle: &NicHandle) -> [u64; 8] { rx_counts() }
+    fn rx_used_cursors(&self, _handle: &NicHandle) -> [(u16, u16); 8] { rx_used_cursors() }
 }
 
 pub static GVE_DRIVER: GveDriver = GveDriver;

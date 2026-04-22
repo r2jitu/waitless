@@ -1,205 +1,141 @@
-// drivers/net.rs — NIC dispatch shim.
+// drivers/net.rs — NIC dispatch through `uni_net_driver::active_driver()`.
 //
-// Two drivers live in this crate: `virtio_net` and `gve` (Google's
-// Virtual Ethernet driver, the product of which is branded "gVNIC"
-// at the GCE layer — the driver is `gve` in Linux, Google's own
-// codebase, and now ours). Only one can be active on a given boot:
-// virtio-net when the instance was launched with a virtio NIC,
-// `gve` when it was launched with `--network-interface=nic-type=GVNIC`.
-// The rest of the system (net/, boot/, uni/) shouldn't care which —
-// it just wants `poll`, `send`, `get_mac`, etc. to do the right
-// thing.
+// Phase 5 Step 6: drop the static `gve::X` / `virtio_net::X` calls in
+// favour of trait-dispatch on the winner of the `linked_ethernet_
+// drivers()` walk. `drivers::net::init()` runs that walk, installs the
+// first `probe()`-successful driver into the active slot, and every
+// other entry point reads the slot and trait-dispatches.
 //
-// This module is that "which" decision in one place. Each public
-// function checks `gve::probe_ok()` (which flips to `true` at the
-// end of `gve::init()` on a successful bring-up) and dispatches;
-// virtio-net wins by default when `gve` didn't come up. Everything
-// is inlined so the extra branch is a one-cycle tax on the hot
-// path.
+// With the static refs gone, `//drivers:drivers` no longer has to
+// depend on `//uni-driver-virtio-net` and `//uni-driver-gve` — apps
+// pick whichever driver(s) they want via their own BUILD deps. No
+// driver linked → `linked_ethernet_drivers()` is empty, `init()`
+// returns `false`, every other dispatcher entry is a no-op.
 //
-// Virtio-specific knobs (MSI-X, TX staging, NAPI idle) become
-// no-ops when `gve` is the active driver — `gve` is polling-only in
-// Phase 2 and has no TX staging pool, so the callers' contracts
-// are already satisfied.
+// The indirection cost is one atomic load + one vtable call per
+// dispatcher call — the same shape the `use_gve()` branch had
+// before, plus the load.
 
-// `gve` and `virtio_net` are external crates now (phase 5 step 4);
-// bring them in as local aliases via the crate-level `extern crate`
-// declarations in `lib.rs`.
-use crate::{virtio_net, gve};
+use uni_net_driver::{active_driver, linked_ethernet_drivers, set_active_driver, NicHandle};
 
-#[inline]
-fn use_gve() -> bool {
-    gve::probe_ok()
-}
+/// Canonical NicHandle passed to every trait call. Each driver today
+/// has a single device, so the handle's payload (empty) is unused.
+/// Using a `static` so we can pass `&'static NicHandle` to every
+/// trait method that takes `&NicHandle` without constructing a fresh
+/// temporary each call.
+static HANDLE: NicHandle = NicHandle::new();
 
 // ---- Init / lifecycle -----------------------------------------------------
 
-/// Probe both drivers. Tries `gve` first (the preferred NIC on
-/// GCE — native RSS multi-queue). Falls back to virtio-net, which
-/// is what kvm-vm, HVF, and default-GCE instances expose.
-/// Returns `true` if either driver came up.
+/// Walk the linker-section-registered driver table, try each driver's
+/// `probe()`, install the first success as active. Returns `true` if
+/// any driver came up. Called from `boot/entry.rs` before `uni_main`.
 pub fn init() -> bool {
-    if gve::init() {
-        return true;
+    for reg in linked_ethernet_drivers() {
+        if reg.driver.probe().is_some() {
+            set_active_driver(reg);
+            return true;
+        }
     }
-    virtio_net::init()
+    false
 }
 
 pub fn get_mac(mac_out: *mut u8) {
-    if use_gve() {
-        gve::get_mac(mac_out)
-    } else {
-        virtio_net::get_mac(mac_out)
+    if let Some(d) = active_driver() {
+        d.get_mac(&HANDLE, mac_out);
     }
 }
 
 pub fn num_queue_pairs() -> u16 {
-    if use_gve() {
-        gve::num_queue_pairs()
-    } else {
-        virtio_net::num_queue_pairs()
-    }
+    active_driver().map(|d| d.num_queue_pairs(&HANDLE)).unwrap_or(1)
 }
 
 /// Short identifier of the active driver. Used by `uni::boot_info()`
 /// to label the NIC entry and by diagnostic endpoints.
 pub fn driver_name() -> &'static str {
-    if use_gve() { "gve" } else { "virtio-net" }
+    active_driver().map(|d| d.name()).unwrap_or("none")
 }
 
 pub fn activate_multi_queue() {
-    // `gve` has a different multi-queue model (CONFIGURE_RSS +
-    // per-core queues are set up at driver init, Phase 4). On the
-    // virtio-net path this triggers the legacy ctrl-vq MQ dance.
-    if !use_gve() {
-        virtio_net::activate_multi_queue();
+    if let Some(d) = active_driver() {
+        d.activate_multi_queue(&HANDLE);
     }
 }
 
 pub fn enable_irq() {
-    // Virtio-net registers MSI-X vectors here. `gve` is polling-only
-    // for now — if interrupt support lands later it'll be wired up
-    // inside `gve::init()` instead.
-    if !use_gve() {
-        virtio_net::enable_irq();
+    if let Some(d) = active_driver() {
+        d.enable_irq(&HANDLE);
     }
 }
 
 // ---- RX / TX datapath -----------------------------------------------------
 
 pub fn poll(callback: fn(&[u8])) -> i32 {
-    if use_gve() {
-        gve::poll(callback)
-    } else {
-        virtio_net::poll(callback)
-    }
+    active_driver().map(|d| d.poll_rx(&HANDLE, callback) as i32).unwrap_or(0)
 }
 
 pub fn poll_qp(qp: usize, callback: fn(&[u8])) -> i32 {
-    if use_gve() {
-        gve::poll_qp(qp, callback)
-    } else {
-        virtio_net::poll_qp(qp, callback)
-    }
+    active_driver().map(|d| d.poll_qp(&HANDLE, qp, callback)).unwrap_or(0)
 }
 
 pub fn send(data: &[u8]) {
-    if use_gve() {
-        gve::send(data);
-    } else {
-        virtio_net::send(data)
+    if let Some(d) = active_driver() {
+        let _ = d.send(&HANDLE, data);
     }
 }
 
-// ---- Virtio-only knobs — no-op on gve ------------------------------------
+// ---- Idle / TX-flush knobs -----------------------------------------------
 
 pub fn flush_tx_staging() {
-    if use_gve() {
-        // `gve` has no staging queue; the doorbell-coalesced path
-        // may have dirty queues across cores, so flush everything.
-        gve::flush_all_tx_kicks();
-    } else {
-        virtio_net::flush_tx_staging();
+    if let Some(d) = active_driver() {
+        d.flush_tx_staging(&HANDLE);
     }
 }
 
 pub fn flush_tx_kick_if_dirty() -> bool {
-    if use_gve() {
-        gve::flush_tx_kick_if_dirty()
-    } else {
-        virtio_net::flush_tx_kick_if_dirty()
-    }
+    active_driver().map(|d| d.flush_tx_kick_if_dirty(&HANDLE)).unwrap_or(false)
 }
 
 pub fn irq_idle_supported() -> bool {
-    // `gve` does not (yet) support NAPI-style idle: the event loop
-    // keeps polling. Return false here so the caller's idle-path
-    // fallback stays engaged.
-    if use_gve() {
-        false
-    } else {
-        virtio_net::irq_idle_supported()
-    }
+    active_driver().map(|d| d.irq_idle_supported(&HANDLE)).unwrap_or(false)
 }
 
 pub fn arm_rx_interrupts() {
-    if !use_gve() {
-        virtio_net::arm_rx_interrupts();
+    if let Some(d) = active_driver() {
+        d.arm_rx_interrupts(&HANDLE);
     }
 }
 
 pub fn has_pending_rx() -> bool {
-    if use_gve() {
-        false
-    } else {
-        virtio_net::has_pending_rx()
-    }
+    active_driver().map(|d| d.has_pending_rx(&HANDLE)).unwrap_or(false)
 }
 
 pub fn has_pending_tx() -> bool {
-    if use_gve() {
-        false
-    } else {
-        virtio_net::has_pending_tx()
-    }
+    active_driver().map(|d| d.has_pending_tx(&HANDLE)).unwrap_or(false)
 }
 
 pub fn rearm_rx_napi(core_id: u32) -> bool {
-    if use_gve() {
-        false
-    } else {
-        virtio_net::rearm_rx_napi(core_id)
-    }
+    active_driver().map(|d| d.rearm_rx_napi(&HANDLE, core_id)).unwrap_or(false)
 }
 
 pub fn enable_deferred_tx_kick() {
-    if use_gve() {
-        gve::enable_deferred_tx_kick();
-    } else {
-        virtio_net::enable_deferred_tx_kick();
+    if let Some(d) = active_driver() {
+        d.enable_deferred_tx_kick(&HANDLE);
     }
 }
 
 pub fn poke_interrupt_status() {
-    if !use_gve() {
-        virtio_net::poke_interrupt_status();
+    if let Some(d) = active_driver() {
+        d.poke_interrupt_status(&HANDLE);
     }
 }
 
 // ---- Diagnostics (/stats) ------------------------------------------------
 
 pub fn rx_counts() -> [u64; 8] {
-    if use_gve() {
-        gve::rx_counts()
-    } else {
-        virtio_net::rx_counts()
-    }
+    active_driver().map(|d| d.rx_counts(&HANDLE)).unwrap_or([0; 8])
 }
 
 pub fn rx_used_cursors() -> [(u16, u16); 8] {
-    if use_gve() {
-        gve::rx_used_cursors()
-    } else {
-        virtio_net::rx_used_cursors()
-    }
+    active_driver().map(|d| d.rx_used_cursors(&HANDLE)).unwrap_or([(0, 0); 8])
 }

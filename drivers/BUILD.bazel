@@ -35,9 +35,14 @@ rust_library(
 #
 # Owns `drivers::net` (NIC dispatcher) plus a `pub use drivers_infra::*`
 # re-export so existing callers keep seeing `drivers::pci::init`,
-# `drivers::mmio_read32`, etc. Depends on both NIC crates for the
-# dispatcher — no cycle because NIC crates only depend on `:infra`,
-# not on this target.
+# `drivers::mmio_read32`, etc.
+#
+# No dep on specific NIC crates — the dispatcher trait-dispatches
+# through `uni_net_driver::active_driver()`. Apps add whichever
+# NIC driver crate(s) they want (`//uni-driver-virtio-net`,
+# `//uni-driver-gve`) to their own BUILD deps; those crates
+# register themselves via `register_ethernet_driver!` at link
+# time, and `drivers::net::init()` picks the winner on probe.
 rust_library(
     name = "drivers",
     srcs = [
@@ -49,7 +54,6 @@ rust_library(
     deps = [
         ":infra",
         "//kernel",
-        "//uni-driver-virtio-net:uni_driver_virtio_net",
-        "//uni-driver-gve:uni_driver_gve",
+        "//uni-net:driver",
     ],
 )
