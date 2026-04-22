@@ -13,8 +13,24 @@ completes.
 
 ## Status
 
-**Complete.** All eight migration phases landed — see the per-phase
-table below and the commit trail ending `6d2f093`.
+**Plan deliverables complete.** All eight migration phases landed
+in their scoped form — see the per-phase table below. Two items
+tagged as follow-on work stay open because they depend on
+structural changes the plan didn't originally scope:
+
+  * **Phase 4 Net-owned field migration** — moving `CONFIG` /
+    `HANDLER_*` / `DHCP_STATE` / `{MULTICORE_INIT, WAKEUP, RX_LOCK,
+    JUST_DISTRIBUTED}` / `SERVER_PTR` / `TLS_CONFIG_PTR` into
+    `uni_net::Net` fields requires inverting the net-stack sub-
+    crate deps (currently umbrella → sub-crates; would need
+    sub-crates to reach `Net`). Plan noted this as "Phase 5/6
+    reshape the crate boundaries" work; those reshapes happened for
+    TLS and drivers but not for the net sub-crates themselves.
+
+  * **Phase 5 Step 6** — probe-driven init replacing the legacy
+    `drivers::net::*` dispatch. Plan explicitly labelled "future"
+    from the outset.
+
 **Prerequisites landed:** `b50f3a4` (uni::App) through `70a6f4a`
 (apps/hello). Bench baseline captured below.
 **Unblocks:** ROADMAP §2f/§2g/§3c.
