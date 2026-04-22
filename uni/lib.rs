@@ -208,11 +208,12 @@ mod backend {
         rx_used_cursors as net_rx_used_cursors,
     };
 
-    // Event loop
-    pub fn num_workers() -> u32 { kernel::percpu::num_cores() }
-    pub fn set_service(f: fn(u32) -> bool) { kernel::eventloop::set_service(f); }
-    pub fn set_ready() { kernel::eventloop::set_ready(); }
-    pub fn request_shutdown() { kernel::eventloop::request_shutdown(); }
+    // Event loop — pure re-exports, matching the native backend's
+    // `pub use uni_native::…` style. `num_workers` is aliased from
+    // the kernel's `num_cores` (same signature, cleaner app-facing
+    // name).
+    pub use kernel::percpu::num_cores as num_workers;
+    pub use kernel::eventloop::{set_service, set_ready, request_shutdown};
 
     /// Register an IO poll callback. On unikernel, this is handled by
     /// kernel::eventloop callbacks (net_poll, net_drain, etc). For app-level
