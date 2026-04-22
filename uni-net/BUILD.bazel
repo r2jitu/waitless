@@ -46,16 +46,8 @@ rust_library(
     crate_root = "lib.rs",
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
     deps = [":driver"] + select({
-        "//bazel/platforms:native": [
-            "//net:tls",
-            "//net:tls_crypto",
-            "//net:tls_handshake",
-            "//net:tls_record",
-            "//net:tls_server",
-        ],
-        "//conditions:default": [
-            "//net",
-        ],
+        "//bazel/platforms:native": [],
+        "//conditions:default": ["//net"],
     }),
 )
 

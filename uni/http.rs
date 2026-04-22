@@ -9,49 +9,62 @@
 // APs run HTTP service via the percpu ap_poll hook. Routes are
 // shared (read-only).
 //
-// HTTPS: `Server::listen_tls(port, config)` wraps each accepted
-// connection in a `net_tls_server::TlsServer`. The service loop
-// funnels incoming TCP bytes through the TLS state machine, feeds
-// decrypted plaintext into the same HTTP parser, encrypts responses
-// back out. From the request-handler's perspective nothing changes
-// — the `Request` and `Response` types are identical.
+// HTTPS: TLS is injected from `//uni-tls` via the free function
+// `uni_tls::listen_tls(&mut server, port, cfg)`, which hands us a
+// `Box<dyn TlsAdapter>`. The service loop funnels incoming TCP
+// bytes through that trait object, feeds decrypted plaintext into
+// the same HTTP parser, encrypts responses back out. From the
+// request-handler's perspective nothing changes — `Request` and
+// `Response` are the same whether the transport is plain or TLS.
+//
+// The trait-object boundary means `uni::http::Server` itself has
+// no dependency on TLS or crypto code — apps that don't pull
+// `uni-tls` in don't link any of it.
 
 use alloc::boxed::Box;
 
 use crate::{TcpListener, TcpStream};
 
-// On native, `net` is a helper module inside `uni/lib.rs` that
-// re-exports `net_tls_server` as `net::tls_server` so http.rs
-// can keep using the same `net::tls_server::X` paths it does
-// on unikernel (where `extern crate net` pulls in the umbrella
-// `//net:net` at the crate root). This `use` bridges the two
-// lookup paths so the rest of the file doesn't need cfg gates
-// for every TLS reference.
-#[cfg(not(target_os = "none"))]
-use crate::net;
+// ── TLS injection boundary ─────────────────────────────────────────────
+//
+// `uni-tls` implements these traits over its sans-io TLS 1.3 state
+// machine; nothing else in the tree does. Making the boundary
+// trait-object-based keeps the generated code for `Server` free of
+// any TLS / crypto references when no `TlsAdapter` is installed.
+//
+// Shape mirrors the sans-io primitives exposed by
+// `net_tls_server::TlsServer`:
+//
+//   push_rx         → feed ciphertext bytes off the wire
+//   advance         → drive the handshake + state transitions
+//   pop_tx          → drain ciphertext bytes to send back out
+//   pop_plaintext   → drain decrypted request bytes for HTTP parse
+//   send_app_data   → queue a plaintext response for encryption
+//   close_notify    → queue a TLS shutdown alert before FIN
 
-// Re-export the TLS config type so apps can write `uni::http::TlsServerConfig`
-// without caring which platform they're on. Both platforms now share
-// the same hand-rolled TLS 1.3 state machine from `//net:tls_server`;
-// the native build reaches it via the `net::tls_server` alias set up
-// in `uni/lib.rs` (pointing at `net_tls_server` directly so the
-// umbrella `//net:net` crate doesn't need to be dragged in on hosted
-// targets).
-pub use net::tls_server::TlsServerConfig;
-
-/// Format the TLS handshake profile into `out`. Returns the number of
-/// bytes written. Apps can serve this as the body of a debug endpoint
-/// (`/tls_profile`) to inspect per-stage handshake timings. Works on
-/// both unikernel and native — the profile counters live in the
-/// shared `net::tls_server::profile` module.
-pub fn tls_profile_report(out: &mut [u8]) -> usize {
-    net::tls_server::profile::report(out)
+/// Adapter held by `Server` while TLS is enabled. Creates a per-
+/// connection state machine each time the server accepts on a TLS
+/// listener. `Send + Sync` because it's shared across all worker
+/// cores; `'static` because it lives in a long-lived server.
+pub trait TlsAdapter: Send + Sync + 'static {
+    /// Build a fresh per-connection state machine. `seed` is 32
+    /// bytes of platform entropy the caller has already pulled from
+    /// the RNG.
+    fn new_connection(&self, seed: [u8; 32]) -> Box<dyn TlsConnection>;
 }
 
-/// Reset the TLS handshake profile accumulators. Useful between
-/// benchmark runs.
-pub fn tls_profile_reset() {
-    net::tls_server::profile::reset();
+/// Per-connection TLS state. Accessed by one worker at a time (the
+/// one that owns the `ActiveConn`), so `Send` is sufficient — no
+/// `Sync` required.
+pub trait TlsConnection: Send + 'static {
+    fn push_rx(&mut self, bytes: &[u8]);
+    /// Drive the handshake / state transitions. `Err(())` means a
+    /// fatal error and the caller should drop the connection.
+    fn advance(&mut self) -> Result<(), ()>;
+    fn pop_tx(&mut self, out: &mut [u8]) -> usize;
+    fn pop_plaintext(&mut self, out: &mut [u8]) -> usize;
+    fn send_app_data(&mut self, data: &[u8]) -> Result<(), ()>;
+    fn close_notify(&mut self) -> Result<(), ()>;
 }
 
 // ---- HTTP types -------------------------------------------------------------
@@ -268,11 +281,11 @@ struct ActiveConn {
     /// and reclaim slots (prevents pool exhaustion from abandoned clients).
     idle_ticks: u32,
     /// Per-connection TLS state (when the server is in HTTPS mode).
-    /// `None` for plain HTTP connections. The `TlsServer` state
-    /// machine lives in `//net:tls_server` and is shared by the
-    /// unikernel and native builds, so this field is available on
-    /// both platforms.
-    tls: Option<Box<net::tls_server::TlsServer>>,
+    /// `None` for plain HTTP connections. The trait object comes
+    /// from `TlsAdapter::new_connection` — uni-tls implements it
+    /// over the sans-io state machine in `//net:tls_server`, but
+    /// `Server` itself is TLS-agnostic.
+    tls: Option<Box<dyn TlsConnection>>,
 }
 
 /// Close idle connections after this many service ticks with no data.
@@ -330,11 +343,13 @@ pub struct Server {
     route_count: usize,
     default_handler: Option<Handler>,
     cores: [CoreHttp; MAX_CORES],
-    /// TLS server config, populated by `listen_tls()`. `None` for
-    /// plain-HTTP-only servers. Owning the config here (instead of in
-    /// a global) means an app can run multiple `Server` instances
-    /// with different certs on different ports — nothing is shared.
-    tls_config: Option<net::tls_server::TlsServerConfig>,
+    /// TLS adapter, populated by `listen_tls()`. `None` for
+    /// plain-HTTP-only servers. Each accepted HTTPS connection
+    /// goes through `adapter.new_connection(seed)` to get its own
+    /// `TlsConnection`. Owning the adapter here (rather than in a
+    /// global) means an app can run multiple `Server` instances
+    /// with different certs / configs.
+    tls_adapter: Option<Box<dyn TlsAdapter>>,
 }
 
 // Global server pointer for AP poll callback / native worker threads.
@@ -360,7 +375,7 @@ impl Server {
             route_count: 0,
             default_handler: None,
             cores: core::array::from_fn(|_| CoreHttp::new()),
-            tls_config: None,
+            tls_adapter: None,
         })
     }
 
@@ -420,23 +435,20 @@ impl Server {
         crate::log(b"http: listening (plain)\n");
     }
 
-    /// Add an HTTPS (TLS 1.3) listener on `port`. Same semantics as
-    /// `listen()` but wraps each accepted connection in a `TlsServer`
-    /// using `config`. Routes registered via `route()` /
+    /// Add an HTTPS (TLS 1.3) listener on `port`, with `adapter`
+    /// supplying the per-connection state machine. Same semantics
+    /// as `listen()` otherwise — routes registered via `route()` /
     /// `default_handler()` apply to both HTTP and HTTPS listeners
     /// identically.
     ///
-    /// `config` is moved into the `Server` instance and lives as long
-    /// as this server does. An app can construct multiple `Server`
-    /// instances each with their own `TlsServerConfig` — cert/key
-    /// state is never global.
-    ///
-    /// Works on both unikernel and native. Both platforms use the
-    /// same hand-rolled TLS 1.3 stack from `//net:tls_server`; the
-    /// only per-platform detail is the TCP source under the hood
-    /// (`kernel::net::tcp` vs `native::tcp`) and the RNG backend.
-    pub fn listen_tls(&mut self, port: u16, config: TlsServerConfig) {
-        self.tls_config = Some(config);
+    /// Callers in application code use `uni_tls::listen_tls(&mut
+    /// server, port, cfg)` rather than calling this method directly
+    /// — that free function constructs the `TlsAdapter` internally.
+    /// The raw-adapter form stays `pub` so `uni-tls` (or a future
+    /// alternate TLS implementation) can install itself without
+    /// going through a private hook.
+    pub fn listen_tls(&mut self, port: u16, adapter: Box<dyn TlsAdapter>) {
+        self.tls_adapter = Some(adapter);
 
         let nw = crate::num_workers();
         let mut ok_any = false;
@@ -483,12 +495,11 @@ impl Server {
             }
         }
         if let Some(listener) = self.cores[core_id as usize].tls_listener {
-            let has_tls_config = self.tls_config.is_some();
             while let Some(stream) = listener.accept() {
                 had_work = true;
                 if let Some(ac) = alloc_active(&mut self.cores[core_id as usize].active) {
                     ac.conn = Some(stream);
-                    if has_tls_config {
+                    if let Some(adapter) = self.tls_adapter.as_ref() {
                         // Seed the per-connection ephemeral X25519 keypair
                         // from platform entropy. `kernel::rng::fill_bytes`
                         // on bare-metal (ChaCha20 PRNG seeded at boot from
@@ -497,14 +508,12 @@ impl Server {
                         // Both are fine for TLS 1.3 ephemeral keys.
                         let mut seed = [0u8; 32];
                         crate::rng::fill_bytes(&mut seed);
-                        ac.tls = Some(Box::new(
-                            net::tls_server::TlsServer::new(seed),
-                        ));
+                        ac.tls = Some(adapter.new_connection(seed));
                     } else {
                         // Shouldn't happen — `listen_tls()` always sets
-                        // `self.tls_config` before creating the listener.
+                        // `self.tls_adapter` before creating the listener.
                         // Defensive: close the conn.
-                        crate::log(b"http: tls listener but no config, dropping\n");
+                        crate::log(b"http: tls listener but no adapter, dropping\n");
                         stream.close();
                         ac.conn = None;
                     }
@@ -529,8 +538,7 @@ impl Server {
                 self.cores[core_id as usize].active[i].conn = None;
                 self.cores[core_id as usize].active[i].buf_len = 0;
                 self.cores[core_id as usize].active[i].idle_ticks = 0;
-                #[cfg(target_os = "none")]
-                { self.cores[core_id as usize].active[i].tls = None; }
+                self.cores[core_id as usize].active[i].tls = None;
                 had_work = true;
                 continue;
             }
@@ -623,13 +631,7 @@ impl Server {
     ///
     /// Only called when the connection is known to be in TLS mode.
     fn tls_ingest(&mut self, core_id: u32, conn_idx: usize, conn: TcpStream) {
-        // Destructure `self` so we can borrow `tls_config` immutably
-        // and `cores[...]` mutably at the same time — the borrow
-        // checker only does this split for direct field access.
-        let Self { tls_config, cores, .. } = self;
-        let Some(tls_cfg) = tls_config.as_ref() else { return };
-
-        let ac = &mut cores[core_id as usize].active[conn_idx];
+        let ac = &mut self.cores[core_id as usize].active[conn_idx];
         let Some(tls) = ac.tls.as_mut() else { return; };
 
         // Pull raw bytes off TCP into the TLS state machine. Loop to
@@ -643,8 +645,9 @@ impl Server {
             tls.push_rx(&tmp[..got]);
         }
 
-        // Advance the state machine as far as possible.
-        if tls.advance(tls_cfg).is_err() {
+        // Advance the state machine as far as possible. The trait
+        // impl carries its own config reference, so no extra param.
+        if tls.advance().is_err() {
             // Fatal handshake failure — drop the connection.
             conn.close();
             ac.conn = None;

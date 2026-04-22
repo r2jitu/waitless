@@ -9,13 +9,15 @@
 
 extern crate alloc;
 extern crate uni;
+extern crate uni_tls;
 
 use alloc::format;
 use alloc::string::String;
 use core::fmt::Write as _;
 
-use uni::http::{Request, Response, Server, TlsServerConfig};
+use uni::http::{Request, Response, Server};
 use uni::net::{Net, NetBringUp};
+use uni_tls::TlsServerConfig;
 
 // ---- Application ------------------------------------------------------------
 
@@ -71,7 +73,7 @@ impl WebServerApp {
 
         if let Some(cfg) = TlsServerConfig::from_dev_cert(DEV_CERT_DER, DEV_KEY_PKCS8_DER) {
             uni::log(b"TLS: dev cert loaded. Serving HTTPS.\n");
-            server.listen_tls(https_port, cfg);
+            uni_tls::listen_tls(&mut server, https_port, cfg);
         } else {
             uni::log(b"TLS: failed to parse dev key; HTTPS disabled.\n");
         }
@@ -110,7 +112,7 @@ fn handle_request(req: &Request) -> Response {
         }
         b"/tls_profile" => tls_profile_response(),
         b"/tls_profile_reset" => {
-            uni::http::tls_profile_reset();
+            uni_tls::tls_profile_reset();
             Response::ok(b"text/plain", b"tls profile reset\n")
         }
         _ => Response::not_found(),
@@ -271,7 +273,7 @@ const PROFILE_BUF_LEN: usize = 4096;
 
 fn tls_profile_response() -> Response {
     let mut buf = alloc::vec![0u8; PROFILE_BUF_LEN];
-    let n = uni::http::tls_profile_report(buf.as_mut_slice());
+    let n = uni_tls::tls_profile_report(buf.as_mut_slice());
     buf.truncate(n);
     Response::ok_owned(b"text/plain", buf.into_boxed_slice())
 }

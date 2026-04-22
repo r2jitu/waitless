@@ -38,26 +38,16 @@ pub use uni_net_driver::register_ethernet_driver;
 
 // ---- Umbrella re-export ---------------------------------------------------
 //
-// Bare-metal side pulls the full `net` umbrella (tcp/udp/arp/ipv4/
-// tls_server/types/…); native pulls just `net_tls_server` for the
-// hand-rolled TLS state machine. Re-exported publicly at the
-// crate root so `uni/http.rs` can keep writing
-// `net::tls_server::X` / `net::tcp::X` via the `uni::net` alias in
-// `uni/lib.rs`.
+// Bare-metal pulls the full `net` umbrella (tcp/udp/arp/ipv4/types/…)
+// and re-exports it at `uni::net::*`. Native doesn't pull `//net` at
+// all — Phase 6 of init-redesign.md moved TLS out to `//uni-tls` and
+// the rest of the net stack is unikernel-only.
 
 #[cfg(target_os = "none")]
 extern crate net as net_umbrella;
 
 #[cfg(target_os = "none")]
 pub use net_umbrella::*;
-
-#[cfg(not(target_os = "none"))]
-extern crate net_tls_server as net_tls_server_impl;
-
-#[cfg(not(target_os = "none"))]
-pub mod tls_server {
-    pub use crate::net_tls_server_impl::*;
-}
 
 // ---- Public net-stack API -------------------------------------------------
 

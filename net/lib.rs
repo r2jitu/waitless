@@ -28,7 +28,6 @@ pub extern crate net_tcp as tcp;
 pub extern crate net_udp as udp;
 pub extern crate net_dhcp as dhcp;
 pub extern crate net_protocol as protocol;
-pub extern crate net_tls_server as tls_server;
 
 // Process-wide IP protocol dispatch table. Populated by `init_stack`
 // at boot; consulted on the hot path by `net_receive` /
