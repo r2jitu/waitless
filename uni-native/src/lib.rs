@@ -19,12 +19,18 @@
 // and go back to sleep. No dedicated acceptor thread, no pipes — mirrors the
 // unikernel's per-core event loop model where each core polls the accept queue.
 //
-// NOTE: several `static mut` globals for thread / UDP / listener state.
-// They're sound by current convention (init from a single thread before
-// workers start, then mutated only by their owning worker). The lint
-// allow is crate-local.
-#![allow(static_mut_refs)]
+// Backend state is split by how each slot is actually used:
+//
+//   * `AtomicBool` / `AtomicUsize` for scalars that are read across
+//     threads (SHUTDOWN, NUM_THREADS, TLS_KEY, UDP_COUNT,
+//     SHARED_LISTEN_COUNT).
+//   * `UnsafeCell<…>` for collections the workers touch through
+//     per-slot ownership (THREADS — each worker only its own slot;
+//     SHARED_LISTEN_PORTS/FDS — filled on the BSP before workers
+//     start; UDP_BINDINGS — same). Per the single-owner / init-once
+//     pattern from plan Phase 7 (init-redesign.md).
 
+use std::cell::UnsafeCell;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use atomic_fn::AtomicFn;
@@ -466,7 +472,7 @@ impl ThreadState {
 /// sibling ready.
 fn drain_udp_sibling(fd: i32, binding_idx: usize) {
     let handler = unsafe {
-        match UDP_BINDINGS[binding_idx] {
+        match (*UDP_BINDINGS.0.get())[binding_idx] {
             Some(ref b) => b.handler,
             None => return,
         }
@@ -490,9 +496,25 @@ fn drain_udp_sibling(fd: i32, binding_idx: usize) {
 // Global state
 // ============================================================================
 
-static mut THREADS: [ThreadState; MAX_THREADS] = [const { ThreadState::new(0) }; MAX_THREADS];
-static mut NUM_THREADS: usize = 1;
-static mut SHUTDOWN: bool = false;
+// Per-thread state. Written exclusively during init_native (BSP) and
+// then by each worker's own slot afterwards — no cross-thread
+// mutation. UnsafeCell + unsafe impl Sync encodes the contract.
+struct ThreadsSlot(UnsafeCell<[ThreadState; MAX_THREADS]>);
+// SAFETY: each worker mutates only its own slot; BSP-only init
+// populates all slots before workers start.
+unsafe impl Sync for ThreadsSlot {}
+static THREADS: ThreadsSlot = ThreadsSlot(
+    UnsafeCell::new([const { ThreadState::new(0) }; MAX_THREADS])
+);
+
+/// Populated once by `init_native` from UNIKERNEL_CPUS / num_cpus;
+/// then read by all worker paths. Atomic so cross-thread reads are
+/// race-free without the `&static mut` dance.
+static NUM_THREADS: AtomicUsize = AtomicUsize::new(1);
+
+/// Set by the SIGINT/SIGTERM handler on any thread; polled by every
+/// worker. AtomicBool is the natural fit.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 // ── Shared listen sockets ─────────────────────────────────────────────────────
 // macOS SO_REUSEPORT does not distribute connections across sockets. Instead,
@@ -511,9 +533,23 @@ const MAX_SHARED_LISTENERS: usize = 4;
 /// `(port, fd)` pairs for every listener currently active. Indexed up to
 /// `SHARED_LISTEN_COUNT`. Entries are never removed during a normal run;
 /// the process exits on shutdown.
-static mut SHARED_LISTEN_PORTS: [u16; MAX_SHARED_LISTENERS] = [0; MAX_SHARED_LISTENERS];
-static mut SHARED_LISTEN_FDS:   [i32; MAX_SHARED_LISTENERS] = [-1; MAX_SHARED_LISTENERS];
-static mut SHARED_LISTEN_COUNT: usize = 0;
+// Shared-listener table. Filled exclusively on the main thread
+// before any worker starts (HTTP `Server::listen{,_tls}` runs on
+// thread 0 during `uni_main`). After that, workers only read via
+// `tcp_register_shared_listener`.
+struct SharedListenSlot(UnsafeCell<SharedListenTable>);
+struct SharedListenTable {
+    ports: [u16; MAX_SHARED_LISTENERS],
+    fds: [i32; MAX_SHARED_LISTENERS],
+}
+// SAFETY: table is frozen after init (see contract above).
+unsafe impl Sync for SharedListenSlot {}
+
+static SHARED_LISTEN: SharedListenSlot = SharedListenSlot(UnsafeCell::new(SharedListenTable {
+    ports: [0; MAX_SHARED_LISTENERS],
+    fds: [-1; MAX_SHARED_LISTENERS],
+}));
+static SHARED_LISTEN_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Look up (or create) a shared listener for `port`. Returns the fd, or
 /// -1 if bind/listen failed. Must only be called with the shared-listener
@@ -522,20 +558,22 @@ static mut SHARED_LISTEN_COUNT: usize = 0;
 /// has entered its event loop).
 unsafe fn shared_listen_get_or_create(port: u16) -> i32 {
     unsafe {
-        for i in 0..SHARED_LISTEN_COUNT {
-            if SHARED_LISTEN_PORTS[i] == port {
-                return SHARED_LISTEN_FDS[i];
+        let table = &mut *SHARED_LISTEN.0.get();
+        let count = SHARED_LISTEN_COUNT.load(Ordering::Acquire);
+        for i in 0..count {
+            if table.ports[i] == port {
+                return table.fds[i];
             }
         }
-        if SHARED_LISTEN_COUNT >= MAX_SHARED_LISTENERS {
+        if count >= MAX_SHARED_LISTENERS {
             return -1;
         }
         let fd = make_listener(port, true);
         if fd < 0 { return -1; }
-        let idx = SHARED_LISTEN_COUNT;
-        SHARED_LISTEN_PORTS[idx] = port;
-        SHARED_LISTEN_FDS[idx] = fd;
-        SHARED_LISTEN_COUNT = idx + 1;
+        let idx = count;
+        table.ports[idx] = port;
+        table.fds[idx] = fd;
+        SHARED_LISTEN_COUNT.store(idx + 1, Ordering::Release);
         fd
     }
 }
@@ -544,7 +582,9 @@ unsafe fn shared_listen_get_or_create(port: u16) -> i32 {
 /// fashion by passing it through the worker function argument.
 /// For the main thread (thread 0), we access THREADS[0] directly.
 fn thread_state(id: u32) -> &'static mut ThreadState {
-    unsafe { &mut THREADS[id as usize] }
+    // SAFETY: each worker only ever mutates its own slot; BSP-only
+    // init writes across all slots before workers start.
+    unsafe { &mut (*THREADS.0.get())[id as usize] }
 }
 
 // ============================================================================
@@ -557,23 +597,28 @@ fn thread_state(id: u32) -> &'static mut ThreadState {
 // kqueue/epoll fd.
 //
 // pthread_key_t: usize on both macOS and Linux (unsigned long / unsigned int).
-static mut TLS_KEY: usize = 0;
+/// Populated once by `init_native` via `pthread_key_create`; then
+/// read by every worker thread to look up its own thread ID slot.
+/// `pthread_key_t` fits in a `usize` on both macOS and Linux.
+static TLS_KEY: AtomicUsize = AtomicUsize::new(0);
 
 fn set_current_thread_id(id: u32) {
-    unsafe { pthread_setspecific(TLS_KEY, id as usize as *const u8); }
+    unsafe { pthread_setspecific(TLS_KEY.load(Ordering::Acquire), id as usize as *const u8); }
 }
 
 fn current_thread_id() -> u32 {
-    unsafe { pthread_getspecific(TLS_KEY) as u32 }
+    unsafe { pthread_getspecific(TLS_KEY.load(Ordering::Acquire)) as u32 }
 }
 
 unsafe extern "C" fn sigint_handler(_sig: i32) {
-    unsafe { SHUTDOWN = true; }
+    SHUTDOWN.store(true, Ordering::Release);
 }
 
 fn init_native() {
     unsafe {
-        pthread_key_create(&mut TLS_KEY, 0);
+        let mut key: usize = 0;
+        pthread_key_create(&mut key, 0);
+        TLS_KEY.store(key, Ordering::Release);
 
         // Per-port overrides (`UNIKERNEL_<PROTO>_<GUEST>`) are read
         // lazily from `config_port` / `config_tls_port` /
@@ -583,14 +628,16 @@ fn init_native() {
         // regardless of which runner LAUNCHER points at.
 
         // Determine thread count from environment or CPU count.
-        NUM_THREADS = std::env::var("UNIKERNEL_CPUS")
+        let num_threads = std::env::var("UNIKERNEL_CPUS")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or_else(|| num_cpus().min(MAX_THREADS));
+        NUM_THREADS.store(num_threads, Ordering::Release);
 
-        for i in 0..NUM_THREADS {
-            THREADS[i].thread_id = i as u32;
-            THREADS[i].init_event_queue();
+        let threads = &mut *THREADS.0.get();
+        for i in 0..num_threads {
+            threads[i].thread_id = i as u32;
+            threads[i].init_event_queue();
         }
 
         // Cast through a function pointer first; rust 1.93+ rejects
@@ -632,11 +679,11 @@ pub fn config_tls_port(default_port: u16) -> u16 {
 }
 
 pub fn check_shutdown() -> bool {
-    unsafe { SHUTDOWN }
+    SHUTDOWN.load(Ordering::Acquire)
 }
 
 pub fn request_shutdown() {
-    unsafe { SHUTDOWN = true; }
+    SHUTDOWN.store(true, Ordering::Release);
 }
 
 pub fn wait_for_events() {
@@ -651,7 +698,7 @@ pub fn num_workers() -> u32 {
     // NUM_THREADS is set by init_native() from UNIKERNEL_CPUS or
     // num_cpus() as default. Use it directly — don't override with
     // num_cpus().
-    unsafe { NUM_THREADS as u32 }
+    NUM_THREADS.load(Ordering::Acquire) as u32
 }
 
 // ---- TCP (per-thread) -------------------------------------------------------
@@ -702,7 +749,7 @@ pub fn tcp_listen_for(port: u16, worker_id: u32) -> *mut () {
     let ts = thread_state(tid);
 
     unsafe {
-        if NUM_THREADS > 1 {
+        if NUM_THREADS.load(Ordering::Acquire) > 1 {
             // Multi-thread: one shared nonblocking listen socket per port
             // (so HTTP on 8080 and HTTPS on 8443 each get their own fd,
             // but the fd is shared across all workers). All workers'
@@ -823,8 +870,10 @@ pub fn tcp_poll() -> bool {
 fn tcp_register_shared_listener() {
     let tid = current_thread_id();
     unsafe {
-        for i in 0..SHARED_LISTEN_COUNT {
-            let fd = SHARED_LISTEN_FDS[i];
+        let table = &*SHARED_LISTEN.0.get();
+        let count = SHARED_LISTEN_COUNT.load(Ordering::Acquire);
+        for i in 0..count {
+            let fd = table.fds[i];
             if fd >= 0 {
                 thread_state(tid).register_fd(fd);
             }
@@ -852,9 +901,16 @@ struct UdpBinding {
     handler: fn([u8; 4], u16, &[u8]),
 }
 
-static mut UDP_BINDINGS: [Option<UdpBinding>; MAX_UDP_BINDINGS] =
-    [const { None }; MAX_UDP_BINDINGS];
-static mut UDP_COUNT: usize = 0;
+// UDP relay table. Entries written by `udp_bind` on the main thread
+// (before workers start); workers read their owned sibling fd from
+// the entry.
+struct UdpBindingsSlot(UnsafeCell<[Option<UdpBinding>; MAX_UDP_BINDINGS]>);
+// SAFETY: populated only on the main thread during `uni_main`; read
+// from workers afterwards without further mutation.
+unsafe impl Sync for UdpBindingsSlot {}
+static UDP_BINDINGS: UdpBindingsSlot =
+    UdpBindingsSlot(UnsafeCell::new([const { None }; MAX_UDP_BINDINGS]));
+static UDP_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Open one non-blocking SO_REUSEPORT-bound UDP sibling socket on
 /// `bind_port`. All siblings of a relay share the same port — kernel
@@ -892,7 +948,8 @@ fn open_udp_sibling(bind_port: u16) -> i32 {
 
 pub fn udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
     unsafe {
-        if UDP_COUNT >= MAX_UDP_BINDINGS { return; }
+        let count = UDP_COUNT.load(Ordering::Acquire);
+        if count >= MAX_UDP_BINDINGS { return; }
 
         // Per-port override keyed on the app's requested port:
         // `UNIKERNEL_UDP_<port>` swaps in a different host-bind
@@ -904,7 +961,7 @@ pub fn udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
         // distributes incoming datagrams across the group by 4-tuple
         // hash. Each worker thread owns sibling `i` and polls it
         // inline via its own kqueue/epoll — no dedicated RX thread.
-        let want = NUM_THREADS.max(1);
+        let want = NUM_THREADS.load(Ordering::Acquire).max(1);
         let mut fds = [-1i32; MAX_THREADS];
         let mut got = 0usize;
         for i in 0..want {
@@ -917,21 +974,22 @@ pub fn udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
             got += 1;
         }
 
-        let binding_idx = UDP_COUNT;
-        UDP_BINDINGS[binding_idx] = Some(UdpBinding {
+        let binding_idx = count;
+        (*UDP_BINDINGS.0.get())[binding_idx] = Some(UdpBinding {
             fds,
             sibling_count: got,
             app_port: port,
             handler,
         });
-        UDP_COUNT += 1;
+        UDP_COUNT.store(binding_idx + 1, Ordering::Release);
 
         // Register each sibling in its owning worker's event queue.
         // `udp_bind` runs on the main thread before workers start,
         // but each worker's kqueue/epoll fd is already live (set up
         // in `init_native`), so we can push registrations from here.
+        let threads = &mut *THREADS.0.get();
         for worker_id in 0..got {
-            THREADS[worker_id].add_udp_sibling(fds[worker_id], binding_idx);
+            threads[worker_id].add_udp_sibling(fds[worker_id], binding_idx);
         }
     }
 }
@@ -945,8 +1003,10 @@ pub fn udp_send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
         // NAT path-correct.
         let tid = current_thread_id() as usize;
         let mut send_fd = -1;
-        for i in 0..UDP_COUNT {
-            if let Some(ref b) = UDP_BINDINGS[i] {
+        let bindings = &*UDP_BINDINGS.0.get();
+        let count = UDP_COUNT.load(Ordering::Acquire);
+        for i in 0..count {
+            if let Some(ref b) = bindings[i] {
                 if b.app_port == src_port && b.sibling_count > 0 {
                     send_fd = if tid < b.sibling_count && b.fds[tid] >= 0 {
                         b.fds[tid]
@@ -1126,7 +1186,7 @@ pub fn run(config: RunConfig) -> i32 {
         // In multi-thread mode, tcp_listen() created the shared listen
         // socket and per-worker handles. add_worker_listener creates
         // the remaining worker handles before their threads start.
-        let num_threads = NUM_THREADS;
+        let num_threads = NUM_THREADS.load(Ordering::Acquire);
         for i in 1..num_threads {
             set_current_thread_id(i as u32);
             (config.add_worker_listener)(i as u32);
