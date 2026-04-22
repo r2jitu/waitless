@@ -2,9 +2,9 @@
 //
 // Provides safe Rust types: TcpListener, TcpStream, log(), config_port(), etc.
 //
-// Backend is cfg-dispatched on `target_os`:
-//   - target_os = "none"         → unikernel module (kernel crate) + net
-//   - !target_os = "none" (unix) → uni_native crate (POSIX sockets + stdio)
+// Backend is cfg-dispatched on `target_os` via two sibling crates:
+//   - target_os = "none"         → uni_kernel (bare-metal glue)
+//   - !target_os = "none" (unix) → uni_native (POSIX sockets + stdio)
 
 #![no_std]
 
@@ -21,6 +21,8 @@ pub use uni_macros::boot;
 extern crate kernel;
 #[cfg(target_os = "none")]
 extern crate drivers;
+#[cfg(target_os = "none")]
+extern crate uni_kernel;
 
 #[cfg(not(target_os = "none"))]
 extern crate uni_native;
@@ -33,9 +35,6 @@ extern crate uni_native;
 // (Phase 5 Step 3+) will depend on `uni-net` directly to avoid the
 // `drivers → uni` cycle.
 pub extern crate uni_net as net;
-
-#[cfg(target_os = "none")]
-mod unikernel;
 
 /// Native-binary entry — called from `bazel/rules/native_main.rs`'s
 /// `fn main()`. Runs the host POSIX event loop (all of which lives in
@@ -196,7 +195,7 @@ fn install_shutdown_hook() {}
 
 #[cfg(target_os = "none")]
 mod backend {
-    pub use crate::unikernel::{log, config_port, config_tls_port, check_shutdown, wait_for_events};
+    pub use uni_kernel::{log, config_port, config_tls_port, check_shutdown, wait_for_events};
     pub use net::tcp::{listen as tcp_listen, accept as tcp_accept, has_data as tcp_has_data,
                        recv as tcp_recv, send as tcp_send, close as tcp_close,
                        is_closed as tcp_is_closed, listen_on_core as tcp_listen_on};

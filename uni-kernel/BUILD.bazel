@@ -1,0 +1,32 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
+
+package(default_visibility = ["//visibility:public"])
+
+# uni-kernel — bare-metal backend for `uni` (unikernel builds).
+# Sibling of `uni-native`: both sit behind `uni`'s `mod backend`
+# dispatch, picked by `target_os` via the select() in `//uni:uni`.
+#
+# Owns the glue that translates `uni`'s cross-platform API shape
+# (log, config_port, check_shutdown, wait_for_events, …) onto the
+# kernel crate's primitives, plus the arch-specific idle path
+# (WFI / hvf-yield / STI;HLT;CLI) that `wait_for_events` drives.
+# Kept separate from `uni` so `uni`'s public source stays
+# target-agnostic — symmetric with `uni-native` living outside
+# `uni` for the std split.
+#
+# target_compatible_with = //bazel/platforms:os_none keeps this
+# crate out of native `bazel build //...` configurations — it has
+# no reason to compile there (no kernel / drivers / bare-metal
+# asm on the host).
+rust_library(
+    name = "uni_kernel",
+    srcs = ["src/lib.rs"],
+    crate_name = "uni_kernel",
+    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    target_compatible_with = ["@platforms//os:none"],
+    deps = [
+        "//drivers",
+        "//kernel",
+    ],
+)

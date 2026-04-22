@@ -1,4 +1,18 @@
-// uni/unikernel.rs — Unikernel backend: lifecycle/config functions
+// uni-kernel/src/lib.rs — Bare-metal backend for the `uni` runtime.
+//
+// Sibling of `uni-native`: both fit behind `uni`'s `mod backend`
+// dispatch. This crate owns the glue that maps `uni`'s
+// cross-platform API (log, config_port, check_shutdown,
+// wait_for_events) onto `kernel::serial` + `drivers::net` +
+// arch-specific idle primitives.
+//
+// Kept separate from `uni` itself so `uni`'s public source stays
+// target-agnostic — symmetric with `uni-native` sitting next to
+// `uni` because of the std split. Here the split is purely about
+// where the bare-metal glue lives; `uni-kernel` is still
+// `#![no_std]` like everything under `uni`.
+
+#![no_std]
 
 use kernel::serial;
 
