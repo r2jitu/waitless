@@ -161,7 +161,7 @@ unikernel/
 │   ├── pci.rs              PCI bus scan, BAR assignment
 │   ├── virtio.rs           VirtIO transport (modern PCI + MMIO)
 │   ├── virtio_net.rs       VirtIO-net driver (TX/RX, legacy MQ)
-│   ├── virtio_console.rs   VirtIO console (for VZ.framework + HVF)
+│   ├── virtio_console.rs   VirtIO console (HVF)
 │   ├── gvnic.rs            Google Virtual NIC driver (GQI_QPL + RSS)
 │   └── net.rs              Runtime NIC dispatch (gVNIC → virtio fallback)
 ├── kernel/                 Kernel library crate (clean Rust)

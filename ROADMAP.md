@@ -155,13 +155,13 @@ async migration stay parked until after QUIC is end-to-end.
 
 ### Platform compatibility matrix
 
-| Feature | QEMU x86_64 | QEMU aarch64 (TCG) | VZ.framework |
-|---------|-------------|---------------------|--------------|
-| SMP | Yes (`-smp N`) | Yes (`-smp N`) | Yes (`cpuCount`) |
-| Multi-queue | Yes (`mq=on,queues=N`) | Yes (same) | No (single queue) |
-| MSI-X | Yes (APIC routing) | Partial (no ITS, use GICv2M) | No (INTx only) |
-| RSS | Yes (in-QEMU or eBPF) | Yes (same) | No (needs multi-queue) |
-| Per-core timers | Yes (APIC timer) | Yes (CNTV_EL0) | Yes (CNTV_EL0, quirky) |
+| Feature | QEMU x86_64 | QEMU aarch64 (TCG) | HVF (macOS arm64) |
+|---------|-------------|---------------------|--------------------|
+| SMP | Yes (`-smp N`) | Yes (`-smp N`) | Yes (`--cpus N`) |
+| Multi-queue | Yes (`mq=on,queues=N`) | Yes (same) | Yes (`num_queue_pairs`) |
+| MSI-X | Yes (APIC routing) | Partial (no ITS, use GICv2M) | Yes (GICv3) |
+| RSS | Yes (in-QEMU or eBPF) | Yes (same) | Software (host-fd poll per vCPU) |
+| Per-core timers | Yes (APIC timer) | Yes (CNTV_EL0) | Yes (CNTV_EL0) |
 | IPI | Yes (APIC ICR) | Yes (GIC SGI) | Yes (GIC SGI) |
 | Per-core IRQ routing | Yes (MSI-X -> LAPIC) | Partial (MSI->SPI->IROUTER) | No (all to one core) |
 
@@ -1531,8 +1531,9 @@ shows the 250 ms p99 the deferred-ACK code was guarding against.
 
 ### Virtio-vsock
 
-Replace virtio-net for VM<->host communication. No Ethernet/IP overhead.
-Pairs with VZ.framework for ultra-low-latency host communication.
+Replace virtio-net for VM<->host communication. No Ethernet/IP
+overhead. Useful for HVF / QEMU-on-macOS ultra-low-latency host
+communication.
 
 - [ ] virtio-vsock driver
 - [ ] Host communication API
