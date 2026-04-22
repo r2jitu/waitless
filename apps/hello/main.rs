@@ -10,9 +10,10 @@
 
 extern crate alloc;
 extern crate uni;
+extern crate uni_http;
 
-use uni::http::{Request, Response, Server};
 use uni::net::{Net, NetBringUp};
+use uni_http::{Request, Response, Server};
 
 /// The app: holds the HTTP server for the program's lifetime.
 struct HelloApp {

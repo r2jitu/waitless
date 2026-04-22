@@ -38,9 +38,12 @@ pub extern crate uni_net as net;
 
 /// Native-binary entry — called from `bazel/rules/native_main.rs`'s
 /// `fn main()`. Runs the host POSIX event loop (all of which lives in
-/// the `uni_native` crate), plugging in the three uni-side lifecycle
-/// hooks (`boot_info_fn`, `add_worker_listener`, `shutdown_fn`) that
-/// `uni_native` would otherwise need a dep back on `uni` to reach.
+/// the `uni_native` crate), plugging in the two uni-side lifecycle
+/// hooks (`boot_info_fn`, `shutdown_fn`) that `uni_native` would
+/// otherwise need a dep back on `uni` to reach. HTTP-specific
+/// per-worker setup registers separately via
+/// `uni::set_add_worker_listener` (called by `uni-http`) so
+/// compute-only apps don't have to know about it.
 #[cfg(not(target_os = "none"))]
 pub fn native_run() -> i32 {
     use crate::boot_info::{BootInfoParams, NicInfo, MAX_NICS};
@@ -56,13 +59,25 @@ pub fn native_run() -> i32 {
                 rtc_epoch: None,
             });
         },
-        add_worker_listener: crate::http::add_worker_listener,
         shutdown_fn: crate::shutdown_and_drop,
     })
 }
 
+/// Register a per-worker pre-spawn hook. On native, `uni_native`'s
+/// `run()` invokes it for workers 1..NUM_THREADS before
+/// `pthread_create`, so HTTP-like crates can materialise per-worker
+/// SO_REUSEPORT listener fds. On unikernel this is a no-op — every
+/// core runs `kernel::eventloop::run` directly and creates its own
+/// listener via the per-core `Server::listen` loop. `uni-http` calls
+/// this at `Server::new_boxed` time.
+pub fn set_add_worker_listener(f: fn(u32)) {
+    #[cfg(not(target_os = "none"))]
+    uni_native::set_add_worker_listener(f);
+    #[cfg(target_os = "none")]
+    let _ = f;
+}
+
 pub mod boot_info;
-pub mod http;
 pub mod rng;
 
 pub use boot_info::{boot_info, BootInfo, NicInfo};
@@ -267,7 +282,15 @@ mod backend {
 
 pub use backend::{log, config_port, config_tls_port, check_shutdown, wait_for_events, tcp_poll};
 pub use backend::{num_workers, set_service, set_ready, request_shutdown, register_io_poll};
-pub use backend::tcp_listen_on;
+
+/// Create a TCP listener on `port`, bound to a specific worker.
+/// `uni_http` uses this to set up per-worker SO_REUSEPORT listeners
+/// after the main thread creates the first one. Apps shouldn't
+/// normally need this; use `TcpListener::bind` for ordinary cases.
+pub fn tcp_listen_on(worker_id: u32, port: u16) -> Option<TcpListener> {
+    let p = backend::tcp_listen_on(worker_id, port);
+    if p.is_null() { None } else { Some(TcpListener(p)) }
+}
 
 
 /// Current core / worker ID. On unikernel this reads the percpu TLS

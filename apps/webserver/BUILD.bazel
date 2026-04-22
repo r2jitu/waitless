@@ -17,6 +17,7 @@ rust_library(
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
     deps = [
         "//uni",
+        "//uni-http:uni_http",
         "//uni-tls:uni_tls",
     ],
 )

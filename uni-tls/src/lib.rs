@@ -1,8 +1,8 @@
 // uni-tls/src/lib.rs — TLS 1.3 carveout.
 //
 // Adapts the sans-io server state machine in `net_tls_server` onto
-// the `uni::http::{TlsAdapter, TlsConnection}` traits so
-// `uni::http::Server` can accept HTTPS connections without any
+// the `uni_http::{TlsAdapter, TlsConnection}` traits so
+// `uni_http::Server` can accept HTTPS connections without any
 // direct dependency on TLS code. Apps that don't import `uni-tls`
 // link zero bytes of TLS / crypto — that's the binary-size win
 // Phase 6 of init-redesign.md calls for.
@@ -10,7 +10,7 @@
 // Public surface is tiny: the free function `listen_tls` (replaces
 // the old `Server::listen_tls` method), the re-exported
 // `TlsServerConfig`, and two diagnostic helpers that used to live
-// on `uni::http`.
+// on `uni_http`.
 
 #![no_std]
 
@@ -29,7 +29,7 @@ pub use net_tls_server::TlsServerConfig;
 /// wrapped in an adapter and handed to the server via its
 /// `listen_tls` entry, which is TLS-agnostic. Clone-friendly —
 /// multiple ports can share the same config cheaply.
-pub fn listen_tls(server: &mut uni::http::Server, port: u16, cfg: TlsServerConfig) {
+pub fn listen_tls(server: &mut uni_http::Server, port: u16, cfg: TlsServerConfig) {
     server.listen_tls(port, Box::new(TlsAdapterImpl { cfg: Arc::new(cfg) }));
 }
 
@@ -60,8 +60,8 @@ struct TlsAdapterImpl {
     cfg: Arc<TlsServerConfig>,
 }
 
-impl uni::http::TlsAdapter for TlsAdapterImpl {
-    fn new_connection(&self, seed: [u8; 32]) -> Box<dyn uni::http::TlsConnection> {
+impl uni_http::TlsAdapter for TlsAdapterImpl {
+    fn new_connection(&self, seed: [u8; 32]) -> Box<dyn uni_http::TlsConnection> {
         Box::new(TlsConnImpl {
             tls: net_tls_server::TlsServer::new(seed),
             cfg: self.cfg.clone(),
@@ -74,7 +74,7 @@ struct TlsConnImpl {
     cfg: Arc<TlsServerConfig>,
 }
 
-impl uni::http::TlsConnection for TlsConnImpl {
+impl uni_http::TlsConnection for TlsConnImpl {
     fn push_rx(&mut self, bytes: &[u8]) {
         self.tls.push_rx(bytes);
     }

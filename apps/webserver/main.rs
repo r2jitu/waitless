@@ -9,14 +9,15 @@
 
 extern crate alloc;
 extern crate uni;
+extern crate uni_http;
 extern crate uni_tls;
 
 use alloc::format;
 use alloc::string::String;
 use core::fmt::Write as _;
 
-use uni::http::{Request, Response, Server};
 use uni::net::{Net, NetBringUp};
+use uni_http::{Request, Response, Server};
 use uni_tls::TlsServerConfig;
 
 // ---- Application ------------------------------------------------------------

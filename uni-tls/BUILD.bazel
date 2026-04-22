@@ -7,18 +7,18 @@ package(default_visibility = ["//visibility:public"])
 #
 # The hand-rolled sans-io TLS 1.3 server lives in `//net:tls_server`
 # (+ its sub-crates `tls`, `tls_crypto`, `tls_handshake`, `tls_record`).
-# `uni-tls` adapts those onto `uni::http::{TlsAdapter, TlsConnection}`
+# `uni-tls` adapts those onto `uni_http::{TlsAdapter, TlsConnection}`
 # so the HTTP `Server` stays TLS-unaware — apps that don't depend on
 # this crate don't link any TLS / crypto code. ~900 KB binary saving
 # for compute-only and plain-HTTP apps (init-redesign Phase 6).
 #
 # Public surface:
-#   * `uni_tls::listen_tls(&mut uni::http::Server, port, cfg)`
+#   * `uni_tls::listen_tls(&mut uni_http::Server, port, cfg)`
 #     — the free function that replaces the old
 #       `Server::listen_tls(port, cfg)` method.
 #   * `uni_tls::TlsServerConfig` — re-export of the config struct.
 #   * `uni_tls::{tls_profile_report, tls_profile_reset}` — diagnostic
-#     helpers (moved from `uni::http`).
+#     helpers (moved from `uni_http`).
 rust_library(
     name = "uni_tls",
     srcs = ["src/lib.rs"],
@@ -26,6 +26,6 @@ rust_library(
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
     deps = [
         "//net:tls_server",
-        "//uni",
+        "//uni-http:uni_http",
     ],
 )

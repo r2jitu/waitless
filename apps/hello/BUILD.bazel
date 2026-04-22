@@ -12,7 +12,10 @@ rust_library(
     name = "app",
     srcs = ["main.rs"],
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
-    deps = ["//uni"],
+    deps = [
+        "//uni",
+        "//uni-http:uni_http",
+    ],
 )
 
 # hello only serves plain HTTP, so the launcher only needs one

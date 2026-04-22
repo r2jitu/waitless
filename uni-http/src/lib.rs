@@ -1,4 +1,9 @@
-// uni/http.rs — HTTP/1.1 server library (pure Rust, no_std)
+// uni-http/src/lib.rs — HTTP/1.1 server library.
+//
+// Moved out of `//uni` so apps that don't serve HTTP skip the
+// parser + handler + connection-pool code. Public surface is
+// `uni_http::{Server, Request, Response, Method, Handler,
+// TlsAdapter, TlsConnection}`.
 //
 // Non-blocking cooperative model: the kernel event loop polls the
 // network stack, accepts connections, reads data, parses HTTP
@@ -17,13 +22,18 @@
 // request-handler's perspective nothing changes — `Request` and
 // `Response` are the same whether the transport is plain or TLS.
 //
-// The trait-object boundary means `uni::http::Server` itself has
+// The trait-object boundary means `uni_http::Server` itself has
 // no dependency on TLS or crypto code — apps that don't pull
 // `uni-tls` in don't link any of it.
 
+#![no_std]
+
+extern crate alloc;
+extern crate uni;
+
 use alloc::boxed::Box;
 
-use crate::{TcpListener, TcpStream};
+use uni::{TcpListener, TcpStream};
 
 // ── TLS injection boundary ─────────────────────────────────────────────
 //
@@ -369,7 +379,13 @@ impl Server {
     /// on the heap. The returned `Box<Server>` is the only handle; callers
     /// typically `Box::leak` it to get a `&'static mut Server` for the
     /// duration of the program.
+    ///
+    /// Also registers `add_worker_listener` with the native runtime —
+    /// on native builds, `uni_native::run` invokes that hook for each
+    /// worker thread before spawn so SO_REUSEPORT listeners exist on
+    /// every worker. Unikernel is a no-op via `uni`'s dispatch.
     pub fn new_boxed() -> Box<Self> {
+        uni::set_add_worker_listener(add_worker_listener);
         Box::new(Server {
             routes: [const { Route::new() }; MAX_ROUTES],
             route_count: 0,
@@ -382,7 +398,7 @@ impl Server {
     /// Register an exact-path handler.
     pub fn route(&mut self, path: &[u8], handler: Handler) {
         if self.route_count >= MAX_ROUTES {
-            crate::log(b"http: too many routes\n");
+            uni::log(b"http: too many routes\n");
             return;
         }
         let r = &mut self.routes[self.route_count];
@@ -411,28 +427,30 @@ impl Server {
     /// The workers start servicing requests once `uni::run(app)`
     /// signals readiness.
     pub fn listen(&mut self, port: u16) {
-        let nw = crate::num_workers();
+        let nw = uni::num_workers();
 
         // Create a listener per worker (SO_REUSEPORT on native,
         // per-core TCP pool on unikernel).
         let mut ok_any = false;
         for i in 0..nw {
-            let handle = crate::tcp_listen_on(i, port);
-            if handle.is_null() {
-                crate::log(b"http: failed to create HTTP listener\n");
-                if i == 0 { return; }
-            } else {
-                self.cores[i as usize].http_listener = Some(TcpListener(handle));
-                ok_any = true;
+            match uni::tcp_listen_on(i, port) {
+                Some(listener) => {
+                    self.cores[i as usize].http_listener = Some(listener);
+                    ok_any = true;
+                }
+                None => {
+                    uni::log(b"http: failed to create HTTP listener\n");
+                    if i == 0 { return; }
+                }
             }
         }
         if !ok_any { return; }
 
         SERVER_PTR.store(self as *mut Server, core::sync::atomic::Ordering::Release);
         HTTP_LISTEN_PORT.store(port, core::sync::atomic::Ordering::Release);
-        crate::set_service(http_service_cb);
+        uni::set_service(http_service_cb);
 
-        crate::log(b"http: listening (plain)\n");
+        uni::log(b"http: listening (plain)\n");
     }
 
     /// Add an HTTPS (TLS 1.3) listener on `port`, with `adapter`
@@ -450,25 +468,27 @@ impl Server {
     pub fn listen_tls(&mut self, port: u16, adapter: Box<dyn TlsAdapter>) {
         self.tls_adapter = Some(adapter);
 
-        let nw = crate::num_workers();
+        let nw = uni::num_workers();
         let mut ok_any = false;
         for i in 0..nw {
-            let handle = crate::tcp_listen_on(i, port);
-            if handle.is_null() {
-                crate::log(b"http: failed to create HTTPS listener\n");
-                if i == 0 { return; }
-            } else {
-                self.cores[i as usize].tls_listener = Some(TcpListener(handle));
-                ok_any = true;
+            match uni::tcp_listen_on(i, port) {
+                Some(listener) => {
+                    self.cores[i as usize].tls_listener = Some(listener);
+                    ok_any = true;
+                }
+                None => {
+                    uni::log(b"http: failed to create HTTPS listener\n");
+                    if i == 0 { return; }
+                }
             }
         }
         if !ok_any { return; }
 
         SERVER_PTR.store(self as *mut Server, core::sync::atomic::Ordering::Release);
         TLS_LISTEN_PORT.store(port, core::sync::atomic::Ordering::Release);
-        crate::set_service(http_service_cb);
+        uni::set_service(http_service_cb);
 
-        crate::log(b"http: listening (TLS)\n");
+        uni::log(b"http: listening (TLS)\n");
     }
 
     /// Service connections for a specific core. Returns true if any work was done.
@@ -488,7 +508,7 @@ impl Server {
                     ac.conn = Some(stream);
                     ac.tls = None;
                 } else {
-                    crate::log(b"http: too many connections, dropping\n");
+                    uni::log(b"http: too many connections, dropping\n");
                     stream.close();
                     break;
                 }
@@ -507,18 +527,18 @@ impl Server {
                         // `arc4random_buf` on native (host OS entropy).
                         // Both are fine for TLS 1.3 ephemeral keys.
                         let mut seed = [0u8; 32];
-                        crate::rng::fill_bytes(&mut seed);
+                        uni::rng::fill_bytes(&mut seed);
                         ac.tls = Some(adapter.new_connection(seed));
                     } else {
                         // Shouldn't happen — `listen_tls()` always sets
                         // `self.tls_adapter` before creating the listener.
                         // Defensive: close the conn.
-                        crate::log(b"http: tls listener but no adapter, dropping\n");
+                        uni::log(b"http: tls listener but no adapter, dropping\n");
                         stream.close();
                         ac.conn = None;
                     }
                 } else {
-                    crate::log(b"http: too many connections, dropping\n");
+                    uni::log(b"http: too many connections, dropping\n");
                     stream.close();
                     break;
                 }
@@ -770,16 +790,14 @@ pub fn add_worker_listener(worker_id: u32) {
 
     let http_port = HTTP_LISTEN_PORT.load(core::sync::atomic::Ordering::Acquire);
     if http_port != 0 {
-        let handle = crate::tcp_listen_on(worker_id, http_port);
-        if !handle.is_null() {
-            server.cores[worker_id as usize].http_listener = Some(TcpListener(handle));
+        if let Some(listener) = uni::tcp_listen_on(worker_id, http_port) {
+            server.cores[worker_id as usize].http_listener = Some(listener);
         }
     }
     let tls_port = TLS_LISTEN_PORT.load(core::sync::atomic::Ordering::Acquire);
     if tls_port != 0 {
-        let handle = crate::tcp_listen_on(worker_id, tls_port);
-        if !handle.is_null() {
-            server.cores[worker_id as usize].tls_listener = Some(TcpListener(handle));
+        if let Some(listener) = uni::tcp_listen_on(worker_id, tls_port) {
+            server.cores[worker_id as usize].tls_listener = Some(listener);
         }
     }
 }

@@ -1067,6 +1067,18 @@ static IO_POLL_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SERVICE: AtomicFn<PollFn> = AtomicFn::null();
 static READY: AtomicBool = AtomicBool::new(false);
 
+/// Optional per-worker pre-spawn hook. HTTP-like crates that need
+/// per-worker TCP listeners (SO_REUSEPORT siblings) register here;
+/// `run()` invokes it for workers 1..NUM_THREADS after `uni_main`
+/// and before `pthread_create`. Apps without per-worker setup
+/// leave it null.
+static ADD_WORKER_LISTENER: AtomicFn<fn(u32)> = AtomicFn::null();
+
+/// Install a per-worker pre-spawn hook — see `ADD_WORKER_LISTENER`.
+pub fn set_add_worker_listener(f: fn(u32)) {
+    ADD_WORKER_LISTENER.store(f);
+}
+
 /// Register an IO poll callback (network, storage, etc). Multiple
 /// sources can be registered; all are called each iteration. Designed
 /// to be called from a single init thread; the atomic fetch_add
@@ -1150,22 +1162,20 @@ extern "C" fn worker_thread(arg: *mut u8) -> *mut u8 {
     ptr::null_mut()
 }
 
-/// Config for `run()`. Holds the three uni-side hooks we'd otherwise
+/// Config for `run()`. Holds the two uni-side hooks we'd otherwise
 /// need to call across the crate boundary:
 ///
 ///   * `boot_info_fn` — fills `uni::boot_info` with the native host's
 ///     CPU count / RAM bytes right after thread-pool init.
-///   * `add_worker_listener` — called once per non-primary worker
-///     before threads are spawned, so the HTTP server can materialise
-///     per-worker listen handles.
 ///   * `shutdown_fn` — called after all workers join, to drop the app
 ///     box and clear the net slot (`uni::shutdown_and_drop`).
 ///
-/// Keeping these as explicit params (rather than static slots) means
-/// no hot-path indirection and no ordering worries on initialisation.
+/// HTTP-like per-worker pre-spawn hooks (SO_REUSEPORT listeners) are
+/// registered separately via `set_add_worker_listener` — they're
+/// optional and only set by `uni-http`, so carrying them here would
+/// force every native app to know about them.
 pub struct RunConfig {
     pub boot_info_fn: fn(num_cpus: u32, ram_bytes: usize),
-    pub add_worker_listener: fn(worker_id: u32),
     pub shutdown_fn: fn(),
 }
 
@@ -1184,12 +1194,15 @@ pub fn run(config: RunConfig) -> i32 {
         uni_main();
         // uni_main called server.run() → tcp_listen() on thread 0.
         // In multi-thread mode, tcp_listen() created the shared listen
-        // socket and per-worker handles. add_worker_listener creates
-        // the remaining worker handles before their threads start.
+        // socket and per-worker handles. If `uni-http` (or similar)
+        // registered a per-worker hook, call it now to create the
+        // remaining worker handles before their threads start.
         let num_threads = NUM_THREADS.load(Ordering::Acquire);
-        for i in 1..num_threads {
-            set_current_thread_id(i as u32);
-            (config.add_worker_listener)(i as u32);
+        if let Some(f) = ADD_WORKER_LISTENER.load() {
+            for i in 1..num_threads {
+                set_current_thread_id(i as u32);
+                f(i as u32);
+            }
         }
         set_current_thread_id(0);
 
