@@ -131,8 +131,7 @@ mod aarch64 {
     // IRQ handler table. Registered on the BSP during boot via
     // `register_irq_handler`; read from the exception handler on any
     // core. Per-slot writes + reads are single-word and tearing-safe
-    // on aarch64, which matches the pre-refactor invariant. Wrapped
-    // in `UnsafeCell` + `unsafe impl Sync` per init-redesign Phase 7.
+    // on aarch64. Wrapped in `UnsafeCell` + `unsafe impl Sync`.
     struct IrqHandlersSlot(core::cell::UnsafeCell<[Option<fn(u32)>; MAX_IRQS]>);
     // SAFETY: single-writer (BSP) with single-word slot stores; readers
     // only observe fully-published handler pointers.

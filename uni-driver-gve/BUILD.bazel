@@ -5,9 +5,8 @@ package(default_visibility = ["//visibility:public"])
 
 # uni-driver-gve — Google Virtual Ethernet driver (GCE).
 #
-# Moved out of `//drivers` in Phase 5 Step 4 of init-redesign.md.
 # Depends only on `//drivers:infra` (MMIO + PCI). Notably does NOT
-# depend on `//drivers:infra`'s VirtIO transport — gve has its own
+# use `//drivers:infra`'s VirtIO transport — gve has its own
 # BAR-register ABI that doesn't go through VirtIO.
 rust_library(
     name = "uni_driver_gve",

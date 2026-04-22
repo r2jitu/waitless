@@ -40,8 +40,8 @@ pub use uni_net_driver::register_ethernet_driver;
 //
 // Bare-metal pulls the full `net` umbrella (tcp/udp/arp/ipv4/types/…)
 // and re-exports it at `uni::net::*`. Native doesn't pull `//net` at
-// all — Phase 6 of init-redesign.md moved TLS out to `//uni-tls` and
-// the rest of the net stack is unikernel-only.
+// all — TLS lives in `//uni-tls` and the rest of the net stack is
+// unikernel-only.
 
 #[cfg(target_os = "none")]
 extern crate net as net_umbrella;
@@ -89,9 +89,8 @@ pub enum NetBringUp {
     },
 }
 
-/// Opaque handle returned by `Net::enable`. Phase 4 wires the real
-/// storage (a `Box<Net>` parked in the module-level `NET` slot);
-/// future phases grow per-subsystem fields onto this type.
+/// Opaque handle returned by `Net::enable`. Backed by a `Box<Net>`
+/// parked in the module-level `NET` slot.
 ///
 /// Zero-sized today, so copying the handle around is free. The
 /// private field prevents users from synthesising one without going
@@ -139,18 +138,13 @@ impl Net {
             return Err(NetError::AlreadyEnabled);
         }
 
-        // Phase 5 Step 5: validate that a driver registered via
-        // `register_ethernet_driver!` is linked AND has probed
-        // successfully. Returns `NoDriver` if the binary has no
-        // driver crate linked at all (empty linker section) and
-        // `NoNic` if drivers are linked but none bound hardware.
-        //
-        // On bare-metal today the legacy `drivers::net::init()`
-        // path in `boot/entry.rs` runs before `uni_main` and sets
-        // each driver's `probe_ok` flag; our `probe()` impls
-        // surface that flag. Phase 5 Step 6 (future) will remove
-        // the legacy init and have `probe()` own the full device
-        // bring-up.
+        // Validate that a driver registered via `register_ethernet_
+        // driver!` is linked AND has probed successfully. Returns
+        // `NoDriver` if the binary has no driver crate linked at all
+        // (empty linker section) and `NoNic` if drivers are linked
+        // but none bound hardware. `probe()` short-circuits on a
+        // cached flag set by `drivers::net::init()` at boot, so this
+        // walk is cheap.
         //
         // Native builds skip this check — `linked_ethernet_drivers()`
         // is stubbed to `&[]` there and networking flows through

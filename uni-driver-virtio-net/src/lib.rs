@@ -1,5 +1,4 @@
 // uni-driver-virtio-net/src/lib.rs — VirtIO network device driver.
-// Moved from `drivers/virtio_net.rs` in Phase 5 Step 4 carveout.
 
 #![no_std]
 #![allow(dead_code, unused_imports)]
@@ -447,7 +446,6 @@ struct CtrlMqBuf {
 }
 // CTRL-VQ scratch. Only written from `ctrl_mq_set_pairs`, which the
 // driver init path calls once on the BSP before any AP is running.
-// `UnsafeCell` + `unsafe impl Sync` per init-redesign Phase 7.
 struct CtrlMqBufSlot(core::cell::UnsafeCell<CtrlMqBuf>);
 // SAFETY: BSP-only during driver init; no concurrent access.
 unsafe impl Sync for CtrlMqBufSlot {}
@@ -969,8 +967,8 @@ pub fn init() -> bool {
 }
 
 /// Whether `init()` successfully bound a VirtIO-net NIC. Used by
-/// the Phase 5 `EthernetDriver` trait impl (`VirtioNetDriver`) to
-/// decide whether probing should return `Some(NicHandle)`.
+/// the `EthernetDriver` trait impl (`VirtioNetDriver`) to decide
+/// whether probing should return `Some(NicHandle)`.
 pub fn probe_ok() -> bool {
     PROBE_OK.load(core::sync::atomic::Ordering::Acquire)
 }
@@ -1531,15 +1529,13 @@ pub fn flush_tx_kick_if_dirty() -> bool {
 }
 
 // ============================================================================
-// Phase 5: EthernetDriver trait adapter
+// EthernetDriver trait adapter
 // ============================================================================
 //
 // `VirtioNetDriver` is a ZST that adapts the existing module-level
 // functions to the `EthernetDriver` trait contract. Registered via
 // `register_ethernet_driver!` so the `.uni_drivers_ethernet` section
-// walker picks it up. Actual probing still runs via the legacy
-// `drivers::net::init()` path today — Phase 5 Step 5 flips
-// `Net::enable` to drive the probe directly.
+// walker picks it up from `drivers::net::init()`.
 
 use uni_net_driver::{EthernetDriver, NicError, NicHandle};
 
@@ -1569,9 +1565,8 @@ impl EthernetDriver for VirtioNetDriver {
     fn send(&self, _handle: &NicHandle, frame: &[u8]) -> Result<(), NicError> {
         // `send()` is fire-and-forget — the driver stages full
         // queues onto the per-core TX ring rather than surfacing
-        // back-pressure. Return `Ok(())` always; Phase 5 Step 5's
-        // Net::enable + §2g's async layer can grow richer
-        // semantics when they need them.
+        // back-pressure. Return `Ok(())` always; a future async
+        // layer can grow richer semantics when it needs them.
         send(frame);
         Ok(())
     }

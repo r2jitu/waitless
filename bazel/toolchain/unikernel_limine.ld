@@ -66,9 +66,9 @@ SECTIONS {
         *(.rodata .rodata.*)
     } :rodata
 
-    /* Ethernet driver registration table (Phase 5 of the init redesign).
-       Each linked `uni-driver-*` crate emits one EthernetDriverReg into
-       this section via register_ethernet_driver!; `Net::enable` walks
+    /* Ethernet driver registration table. Each linked `uni-driver-*`
+       crate emits one EthernetDriverReg into this section via
+       register_ethernet_driver!; `drivers::net::init` walks
        [__start, __stop) to discover registered drivers. Empty when no
        driver crate is linked (compute-only apps). ALIGN(8) matches the
        two-pointer alignment of `&'static dyn EthernetDriver`. `:rodata`

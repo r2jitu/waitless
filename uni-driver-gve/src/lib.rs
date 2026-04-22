@@ -1,13 +1,10 @@
 // uni-driver-gve/src/lib.rs — Google Virtual Ethernet (gve) driver.
-// Moved from `drivers/gve.rs` in Phase 5 Step 4 carveout.
 //
-// Historical note:
-//
-// Renamed from `gvnic.rs` in Phase 5 step 3 to match Linux / the
-// upstream Google driver name. "gVNIC" is GCE's branding for the
-// virtual NIC product; the driver itself is `gve`. The module name
-// and symbols all say `gve`; comments reference "gVNIC" when
-// talking about the GCE product surface (e.g., instance flags).
+// Naming: "gVNIC" is GCE's branding for the virtual NIC product;
+// the driver itself is `gve` (matches Linux / the upstream Google
+// driver name). The module name and symbols all say `gve`; comments
+// reference "gVNIC" when talking about the GCE product surface
+// (e.g., instance flags).
 //
 // Brings up one TX + one RX queue pair in GQI_QPL mode on GCE and
 // serves packets on it. The driver is split into three levels:
@@ -128,12 +125,11 @@ const STATUS_PASSED: u32 = 0x1;
 const DEVICE_DESCRIPTOR_VERSION: u32 = 1;
 
 // Maximum time we'll poll the event counter for a single command.
-// Linux allows many seconds here; for Phase 1 we just need generous
-// room for the device to service DESCRIBE_DEVICE in a freshly-booted
-// VM.
+// Linux allows many seconds here; we need generous room for the
+// device to service DESCRIBE_DEVICE in a freshly-booted VM.
 const ADMINQ_WAIT_SPINS: u32 = 10_000_000;
 
-// Device-option ids (only the ones we care to log at Phase 1).
+// Device-option ids (only the ones we care to log).
 const OPT_ID_GQI_RDA: u16 = 0x2;
 const OPT_ID_GQI_QPL: u16 = 0x3;
 const OPT_ID_DQO_RDA: u16 = 0x4;
@@ -177,12 +173,12 @@ struct State {
     /// is how we wait for completion.
     prod_cnt: u32,
     /// Negotiated queue format — filled in by DESCRIBE_DEVICE.
-    /// `None` until init runs. Phase 2+ reads this to pick a datapath.
+    /// `None` until init runs. Read by queue bring-up to pick a datapath.
     queue_format: Option<QueueFormat>,
     /// MAC from the device descriptor. Populated by DESCRIBE_DEVICE.
     mac: [u8; 6],
     /// Device-advertised caps from the device descriptor. Logged
-    /// from init; consumed by later phases when they size rings.
+    /// from init; consumed by queue bring-up when sizing rings.
     max_tx_queues: u32,
     max_rx_queues: u32,
     tx_queue_entries: u16,
@@ -194,7 +190,7 @@ struct State {
     /// allocates a DMA array of this size that the device writes
     /// TX-completion counters into.
     num_event_counters: u16,
-    /// Phase 2 resources — filled once CONFIGURE_DEVICE_RESOURCES
+    /// Device-wide resources — filled once CONFIGURE_DEVICE_RESOURCES
     /// succeeds. `None` between DESCRIBE_DEVICE and that point.
     resources: Option<DeviceResources>,
     /// Number of active queue pairs. <= MAX_QUEUE_PAIRS. Set by
@@ -202,8 +198,8 @@ struct State {
     /// `net::poll_tier1` walks `0..num_qp`.
     num_qp: u16,
     /// TX / RX queues. Indexed by queue-pair number 0..num_qp.
-    /// Phase 4 uses one pair per vCPU; multi-queue RX distribution
-    /// happens inside the NIC via CONFIGURE_RSS.
+    /// One pair per vCPU; multi-queue RX distribution happens
+    /// inside the NIC via CONFIGURE_RSS.
     tx: [Option<TxQueue>; MAX_QUEUE_PAIRS],
     rx: [Option<RxQueue>; MAX_QUEUE_PAIRS],
 }
@@ -249,7 +245,7 @@ struct TxQueue {
     qres_va: u64,
     /// QPL backing storage — contiguous pages the device sees as a
     /// linear byte range; our TX packets live here for the device to
-    /// read. Phase 2 uses a single contiguous alloc for simplicity.
+    /// read. Single contiguous alloc — simpler than page-by-page.
     qpl_base_va: u64,
     qpl_base_phys: u64,
     qpl_size: u32, // bytes
@@ -515,7 +511,7 @@ pub fn init() -> bool {
         return false;
     }
 
-    // ── Phase 2: bring up one TX + one RX queue in GQI_QPL mode ──────────
+    // ── Queue bring-up: one TX + one RX in GQI_QPL mode ──────────────────
     //
     // Everything below is speculative until we've confirmed the
     // advertised queue format is one we support. GCE currently
@@ -525,7 +521,7 @@ pub fn init() -> bool {
     match fmt {
         Some(QueueFormat::GqiQpl) => {}
         Some(_) => {
-            log(b"[gvnic] only GQI_QPL supported in Phase 2 - aborting\n");
+            log(b"[gvnic] only GQI_QPL supported - aborting\n");
             return false;
         }
         None => return false,
@@ -609,7 +605,7 @@ pub fn probe_ok() -> bool {
 //
 // One admin-queue command, one response DMA page. Submit, poll the
 // event counter, parse the device descriptor, walk its option list,
-// and remember everything Phase 2+ will need.
+// and remember everything queue bring-up will need.
 
 fn describe_device() -> bool {
     // Allocate a response page. The device writes the device
@@ -716,8 +712,8 @@ fn parse_device_descriptor(desc_virt: *mut u8) -> bool {
 
     // Walk the option list. For each option, print its id + length
     // and record the best queue-format we see. Preference order
-    // matches Linux: DQO_RDA > DQO_QPL > GQI_RDA > GQI_QPL. We only
-    // commit to one; Phase 2 will use it to pick a datapath.
+    // matches Linux: DQO_RDA > DQO_QPL > GQI_RDA > GQI_QPL. Queue
+    // bring-up reads the commit via `queue_format`.
     let mut best: Option<QueueFormat> = None;
     let mut offset = header_len;
     let end = if total_len > 0 && total_len <= ADMINQ_SIZE {
@@ -738,9 +734,8 @@ fn parse_device_descriptor(desc_virt: *mut u8) -> bool {
         log(b"\n");
 
         // Promote `best` if this option is higher priority than what
-        // we've seen so far. We target GQI_RDA for Phase 2 (simplest
-        // from-scratch datapath), but Phase 1 just records what the
-        // device advertised.
+        // we've seen so far. GCE currently advertises GQI_QPL only;
+        // this loop is structured for future formats.
         let fmt = match id {
             OPT_ID_DQO_RDA => Some(QueueFormat::DqoRda),
             OPT_ID_DQO_QPL => Some(QueueFormat::DqoQpl),
@@ -904,11 +899,11 @@ unsafe fn slice_at<'a>(va: u64, len: usize) -> &'a [u8] {
     unsafe { core::slice::from_raw_parts(va as *const u8, len) }
 }
 
-// ---- Phase 2: resource + queue bring-up -----------------------------------
+// ---- Resource + queue bring-up --------------------------------------------
 //
 // These issue the sequence of admin-queue commands that takes the
 // device from "admin queue up" to "one TX + one RX queue usable".
-// No packets flow yet; Phase 2b adds the datapath.
+// The datapath (packet send/receive) is further down.
 //
 // Wire-level command layouts are documented inline at each builder
 // so the admin-queue reference file doesn't have to be open to
@@ -945,7 +940,7 @@ const _GVE_RX_PAD: u16 = 2;
 /// free (`fill_cnt - done_cnt < ring_entries` gate in `send()`).
 /// Reference driver's `tx_desc_cnt / GVE_QPL_DIVISOR = 64` packs
 /// multiple packets per page and needs a full FIFO packer; not
-/// worth the code for Phase 2 when RAM is cheap.
+/// worth the code when RAM is cheap.
 const TX_QPL_PAGES: u32 = TX_RING_ENTRIES as u32;
 /// RX QPL size in pages. The reference driver allocates
 /// `rx_desc_cnt` pages — one full page per ring entry, even though
@@ -1439,7 +1434,7 @@ fn create_rx_qp(qp: u32, num_qp: u32) -> bool {
 ///   u8[60..62]  len (be16)
 ///   u8[62..64]  flags_seq (be16)
 ///
-/// Only `len` and `flags_seq` are needed for Phase 2 — csum +
+/// Only `len` and `flags_seq` are needed by this driver — csum +
 /// hash are hints for the stack and can be ignored here.
 const RX_DESC_SIZE: usize = 64;
 const RX_DESC_LEN_OFF: usize = 60;
@@ -1449,8 +1444,8 @@ const RX_DESC_HDR_OFF_OFF: usize = 57;
 /// Start-of-frame offset inside each 4 KiB RX page. The device
 /// prepends `_GVE_RX_PAD = 2` bytes of padding before the Ethernet
 /// header so IPv4 header bytes land 4-byte aligned. The *actual*
-/// offset the device writes into `hdr_off` is scaled by 64 — for
-/// Phase 2 with one packet per page there's only one valid value
+/// offset the device writes into `hdr_off` is scaled by 64 — with
+/// one packet per page there's only one valid value
 /// (hdr_off = 0, actual start = `_GVE_RX_PAD`).
 const RX_DATA_OFFSET_IN_PAGE: usize = _GVE_RX_PAD as usize;
 
@@ -1633,7 +1628,7 @@ pub fn send_on_qp(qp: usize, data: &[u8]) -> bool {
 
     // Build the TX descriptor. gve_tx_pkt_desc layout:
     //   u8  type_flags       (GVE_TXD_STD = 0)
-    //   u8  l4_csum_offset   (0 — no offload in Phase 2)
+    //   u8  l4_csum_offset   (0 — no checksum offload)
     //   u8  l4_hdr_offset    (0)
     //   u8  desc_cnt         (1 — single-segment packet)
     //   u16 len              (be, total packet length)
@@ -1857,8 +1852,8 @@ fn log_mac(mac: &[u8; 6]) {
 // ---- Keep the compiler honest about unused bits ----------------------------
 //
 // `DEVICE_STATUS_RESET`, `STATUS_UNSET`, and `size_of::<AdminqCommand>`
-// are only touched by later phases / diagnostics; reference them
-// once here so Phase 1 still compiles with `-D unused`.
+// are only touched by diagnostics; reference them once here so the
+// crate still compiles with `-D unused`.
 const _: () = {
     let _ = DEVICE_STATUS_RESET;
     let _ = STATUS_UNSET;
@@ -1868,15 +1863,13 @@ const _: () = {
 };
 
 // ============================================================================
-// Phase 5: EthernetDriver trait adapter
+// EthernetDriver trait adapter
 // ============================================================================
 //
 // `GveDriver` adapts the existing module-level functions to the
 // `EthernetDriver` trait contract. Registered via
 // `register_ethernet_driver!` so the `.uni_drivers_ethernet` section
-// walker picks it up. Actual probing still runs via the legacy
-// `drivers::net::init()` path today — Phase 5 Step 5 flips
-// `Net::enable` to drive the probe directly.
+// walker picks it up from `drivers::net::init()`.
 
 use uni_net_driver::{EthernetDriver, NicError, NicHandle};
 

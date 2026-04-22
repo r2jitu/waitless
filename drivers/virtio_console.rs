@@ -47,9 +47,7 @@ const CON_USED_OFF: usize = 4096;
 #[repr(C, align(4096))]
 struct ConQueueMem([u8; 8192]);
 
-/// All driver state in one struct. Individual `static mut` globals
-/// (`CON_TX_MEM`, `CON_BASE`, `CON_PCI_MODE`, …) collapsed to fields
-/// here per init-redesign.md Phase 7.
+/// All driver state in one struct.
 #[repr(C, align(4096))]  // Alignment propagates from ConQueueMem.
 struct VirtioConsole {
     tx_mem: ConQueueMem,

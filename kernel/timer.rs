@@ -156,11 +156,10 @@ struct TimerNode {
 
 const PENDING_POOL_SIZE: usize = 64;
 
-// Pool storage. `static_mut` replaced with an `UnsafeCell`-wrapped
-// slot (plan Phase 7) — the nodes themselves are mutated exclusively
-// through raw pointers once `init_pool` has built the free list, so
-// the single-owner contract is preserved. Lock-free alloc/free use
-// the atomic head pointer.
+// Pool storage. `UnsafeCell`-wrapped: the nodes themselves are
+// mutated exclusively through raw pointers once `init_pool` has
+// built the free list, so the single-owner contract is preserved.
+// Lock-free alloc/free use the atomic head pointer.
 struct PoolSlot(core::cell::UnsafeCell<[TimerNode; PENDING_POOL_SIZE]>);
 // SAFETY: `init_pool` runs once (guarded by `PENDING_POOL_INIT`);
 // after that, node mutation goes through raw pointers + atomics.

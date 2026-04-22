@@ -342,7 +342,6 @@ mod boot_shim_fdt {
 
 // Scratch for the legacy entry's BootInfo — populated by the arch-
 // specific shim, then handed to `kernel_boot` as an immutable ref.
-// `UnsafeCell` + `unsafe impl Sync` per Phase 7.
 struct BootInfoSlot(core::cell::UnsafeCell<BootInfo>);
 // SAFETY: BSP-only during boot; the shim writes it and `kernel_boot`
 // reads it, both on the same thread with no overlap.
@@ -541,8 +540,7 @@ unsafe fn kernel_boot(info: &BootInfo) {
     // DHCP polling (host-side RSS sprays frames across queues),
     // so it has to come AFTER the app's Net::enable call.
     //
-    // Phase 4 deleted the auto-init DHCP fallback — apps that
-    // don't call `Net::enable` get no network. Test apps
+    // Apps that don't call `Net::enable` get no network. Test apps
     // (test_smp, test_percpu, test_tls) don't use networking and
     // are unaffected. MQ activation is also skipped on a shutdown
     // request so those tests exit promptly.

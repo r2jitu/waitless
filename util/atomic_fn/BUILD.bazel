@@ -11,9 +11,9 @@ package(default_visibility = ["//visibility:public"])
 # panic=abort chains that break rust_test's panic=unwind runtime)
 # can still reach the same primitive.
 #
-# Consumers after Phase 7:
+# Consumers:
 #   * //kernel: re-exports as `kernel::sync::AtomicFn` for compat.
-#   * //net:protocol: drops its private `FnSlot` wrapper.
+#   * //net:protocol: protocol-registry callback slot.
 #   * //uni:uni (native backend): `IO_POLL` / `SERVICE` slots.
 #
 # `crate_features = ["std"]` is toggled on by the

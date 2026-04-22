@@ -57,24 +57,19 @@ fn udp_dispatch(src: u32, dst: u32, payload: &[u8]) {
 /// One-shot wiring of TCP/UDP into the protocol registry. Idempotent
 /// — re-registration replaces the previous handler, which is harmless
 /// since the handler pointers are stable link-time addresses.
-///
-/// Called from `boot/entry.rs` after `tcp::init()`; also by the
-/// forthcoming `Net::enable` constructor (Phase 3) so apps that go
-/// through the new API don't depend on boot-path ordering.
 pub fn init_stack() {
     REGISTRY.register(protocol::Slot::Tcp, tcp_dispatch);
     REGISTRY.register(protocol::Slot::Udp, udp_dispatch);
 }
 
 // ============================================================================
-// Phase 3: IP-config bring-up primitives
+// IP-config bring-up primitives
 // ============================================================================
 //
 // `uni::net::Net::enable(NetBringUp)` dispatches here. Kept as plain
 // free functions (rather than a single enum-taking API) because the
 // `NetBringUp` enum lives in `uni::net` and this crate can't depend on
-// `uni`. Each function is idempotent: safe to call multiple times or
-// after auto-init has already populated `CONFIG`.
+// `uni`. Each function is idempotent.
 
 /// Run DHCP DISCOVER/REQUEST and store the resulting `NetConfig`.
 /// Returns `true` on success, `false` if the server didn't answer.

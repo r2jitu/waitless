@@ -17,7 +17,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Maximum number of NICs describable in a single `BootInfo`. The
 /// kernel currently activates at most one NIC per boot; four slots
-/// gives headroom for multiple driver crates in Phase 5 and beyond.
+/// gives headroom for multi-NIC configurations.
 pub const MAX_NICS: usize = 4;
 
 /// Description of one network interface as reported at boot.

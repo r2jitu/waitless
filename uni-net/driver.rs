@@ -46,9 +46,8 @@ impl Default for NicHandle {
 
 /// The ethernet driver contract. Implementors hand ethernet frames
 /// to `uni_net` on RX and accept ethernet frames from `uni_net` on
-/// TX. Phase 5 doesn't add Waker / async hooks — §2g's executor will
-/// grow those on the same type (or a subtrait) when it knows what it
-/// needs.
+/// TX. No Waker / async hooks today — a future async executor can
+/// grow those on the same type (or a subtrait).
 ///
 /// Intentionally NOT `pub fn init()` + free functions: a trait lets
 /// a single `dyn EthernetDriver` sit in the linker section, giving
@@ -93,7 +92,7 @@ pub trait EthernetDriver: 'static + Sync {
     /// what `net::net_receive` does today.
     fn poll_rx(&self, handle: &NicHandle, cb: fn(&[u8])) -> usize;
 
-    // ── Extended dispatcher methods (plan's Step 6) ─────────────────────
+    // ── Extended dispatcher methods ─────────────────────────────────────
     //
     // These mirror the `drivers::net::*` API surface so `drivers/net.rs`
     // can dispatch through the trait instead of statically linking both

@@ -97,10 +97,10 @@ struct DescriptorTablePtr {
 // Static storage
 // ============================================================================
 //
-// `IDT_ENTRIES`, `IDTR`, and `HANDLERS` collapsed into one
-// `UnsafeCell<IdtState>` per init-redesign.md Phase 7. Single-owner
-// discipline: `init()` writes on the BSP during boot (before any AP
-// is running). `register_handler()` writes `HANDLERS` from the BSP.
+// `IDT_ENTRIES`, `IDTR`, and `HANDLERS` live in one
+// `UnsafeCell<IdtState>`. Single-owner discipline: `init()` writes
+// on the BSP during boot (before any AP is running).
+// `register_handler()` writes `HANDLERS` from the BSP.
 // `load_idt_on_ap` only reads `IDTR`. The ISR dispatcher reads
 // `HANDLERS[vector]` from any core in interrupt context; per-slot
 // writes + reads are single-word and thus tearing-safe on x86_64,

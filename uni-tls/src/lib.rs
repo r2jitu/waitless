@@ -4,13 +4,10 @@
 // the `uni_http::{TlsAdapter, TlsConnection}` traits so
 // `uni_http::Server` can accept HTTPS connections without any
 // direct dependency on TLS code. Apps that don't import `uni-tls`
-// link zero bytes of TLS / crypto — that's the binary-size win
-// Phase 6 of init-redesign.md calls for.
+// link zero bytes of TLS / crypto.
 //
-// Public surface is tiny: the free function `listen_tls` (replaces
-// the old `Server::listen_tls` method), the re-exported
-// `TlsServerConfig`, and two diagnostic helpers that used to live
-// on `uni_http`.
+// Public surface is tiny: the free function `listen_tls`, the
+// re-exported `TlsServerConfig`, and two diagnostic helpers.
 
 #![no_std]
 

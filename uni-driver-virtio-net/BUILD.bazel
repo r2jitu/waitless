@@ -5,11 +5,9 @@ package(default_visibility = ["//visibility:public"])
 
 # uni-driver-virtio-net — VirtIO ethernet driver.
 #
-# Moved out of `//drivers` in Phase 5 Step 4 of init-redesign.md so
-# apps that don't need VirtIO networking can drop it from their dep
-# closure. Depends only on `//drivers:infra` for MMIO / PCI /
-# VirtIO transport helpers — no dep on `//drivers` itself, so the
-# outer umbrella can dispatch to us without forming a cycle.
+# Depends only on `//drivers:infra` for MMIO / PCI / VirtIO transport
+# helpers — no dep on `//drivers` itself, so the outer umbrella can
+# dispatch to us without forming a cycle.
 rust_library(
     name = "uni_driver_virtio_net",
     srcs = ["src/lib.rs"],

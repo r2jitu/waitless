@@ -27,8 +27,7 @@
 //   * `UnsafeCell<…>` for collections the workers touch through
 //     per-slot ownership (THREADS — each worker only its own slot;
 //     SHARED_LISTEN_PORTS/FDS — filled on the BSP before workers
-//     start; UDP_BINDINGS — same). Per the single-owner / init-once
-//     pattern from plan Phase 7 (init-redesign.md).
+//     start; UDP_BINDINGS — same).
 
 use std::cell::UnsafeCell;
 use std::ptr;

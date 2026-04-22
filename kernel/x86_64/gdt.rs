@@ -80,8 +80,6 @@ struct Tss {
 // overhead.
 
 /// Aggregate of every persistently-mutated piece of GDT state.
-/// Individual `static mut` globals (`GDT_ENTRIES`, `TSS`, `GDTR`)
-/// collapsed to fields here per init-redesign.md Phase 7.
 struct GdtState {
     /// 5 entries: null + code + data + TSS low (8 bytes) + TSS high (8 bytes).
     entries: [GdtEntry; 5],

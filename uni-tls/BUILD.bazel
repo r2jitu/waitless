@@ -10,7 +10,7 @@ package(default_visibility = ["//visibility:public"])
 # `uni-tls` adapts those onto `uni_http::{TlsAdapter, TlsConnection}`
 # so the HTTP `Server` stays TLS-unaware — apps that don't depend on
 # this crate don't link any TLS / crypto code. ~900 KB binary saving
-# for compute-only and plain-HTTP apps (init-redesign Phase 6).
+# for compute-only and plain-HTTP apps.
 #
 # Public surface:
 #   * `uni_tls::listen_tls(&mut uni_http::Server, port, cfg)`

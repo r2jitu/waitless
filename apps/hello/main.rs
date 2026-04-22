@@ -33,12 +33,8 @@ impl uni::App for HelloApp {}
 
 impl HelloApp {
     fn new() -> Self {
-        // Bring up networking explicitly (Phase 3 API). `enable`
-        // runs DHCP and on failure applies the 10.0.2.15/24
-        // fallback so the stack is always usable from here on.
-        // We unwrap: the fallback makes a transient error case
-        // invisible, so any Err surfaces a real misconfiguration
-        // (e.g., NIC driver missing) we'd want to see.
+        // Bring up networking. `.expect` keeps this example minimal —
+        // webserver/main.rs shows the DHCP→Static fallback pattern.
         let net = Net::enable(NetBringUp::Dhcp)
             .expect("Net::enable failed — NIC driver missing?");
 

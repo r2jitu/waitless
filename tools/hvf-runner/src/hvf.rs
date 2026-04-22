@@ -1,19 +1,13 @@
 // tools/hvf-runner/src/hvf.rs
 //
 // FFI bindings and thin safe wrappers for Apple Hypervisor.framework.
-// Scoped to what the Phase 0 smoke tests need:
+// Covers what the runner actually uses:
 //   - hv_vm_create / hv_vm_destroy / hv_vm_map
 //   - hv_vcpu_create / hv_vcpu_run / hv_vcpu_destroy
 //   - hv_vcpu_get_reg / hv_vcpu_set_reg
 //   - hv_vcpu_get_sys_reg / hv_vcpu_set_sys_reg
 //   - hv_gic_config_create / hv_gic_config_set_*_base / hv_gic_create
 //   - hv_gic_set_spi / hv_gic_get_redistributor_base
-//
-// Phase 1 will extend this with additional sys reg enum values, exit reason
-// decoding helpers, and wrapper structs (Vm, Vcpu) that own their handles
-// and clean up on drop. For now we keep the shape minimal so the smoke
-// test can go directly to the raw calls where that is clearer than a
-// safe wrapper.
 //
 // All function signatures here were transcribed directly from the SDK
 // headers at:
@@ -127,7 +121,7 @@ impl HvReg {
 }
 
 // ─── System registers (from hv_vcpu_types.h, enum hv_sys_reg) ────────────────
-// Only the ones Phase 0 and Phase 1 need. More will be added later.
+// Only the ones this runner actually uses.
 
 #[repr(u16)]
 #[derive(Copy, Clone, Debug)]

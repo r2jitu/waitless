@@ -27,8 +27,7 @@ struct CoreState {
 // (`start_secondary_cores`) before the targeted AP starts reading it —
 // `stack_top` is handed to PSCI CPU_ON as the context id, which the AP
 // picks up in x0 on entry. `UnsafeCell` + `unsafe impl Sync` captures
-// the single-writer-during-boot contract without the `static_mut_refs`
-// footgun (plan Phase 7).
+// the single-writer-during-boot contract without `static_mut`.
 struct CoreArraySlot(core::cell::UnsafeCell<[CoreState; MAX_CORES]>);
 // SAFETY: BSP-only writes during boot; APs consume stack_top via PSCI
 // context_id, not by reading back through this static.

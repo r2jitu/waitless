@@ -142,11 +142,10 @@ impl<'a, T> Drop for SpinlockGuard<'a, T> {
 // ============================================================================
 //
 // The implementation lives in `//util:atomic_fn` (crate
-// `atomic_fn`) as part of Phase 7's consolidation: `net_protocol`'s
-// registry and `uni/lib.rs`'s native IO-poll slots share the same
-// pattern but can't depend on `//kernel` without inheriting the
-// RustCrypto / talc deps that break `rust_test`'s panic=unwind.
-// Extracting the primitive to a no-dep leaf crate gives every
+// `atomic_fn`): `net_protocol`'s registry and `uni/lib.rs`'s native
+// IO-poll slots share the same pattern but can't depend on `//kernel`
+// without inheriting the RustCrypto / talc deps that break
+// `rust_test`'s panic=unwind. A no-dep leaf crate gives every
 // consumer the same type.
 //
 // Re-exported here so existing `kernel::sync::AtomicFn` imports

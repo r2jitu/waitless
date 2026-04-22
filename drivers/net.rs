@@ -1,20 +1,12 @@
 // drivers/net.rs — NIC dispatch through `uni_net_driver::active_driver()`.
 //
-// Phase 5 Step 6: drop the static `gve::X` / `virtio_net::X` calls in
-// favour of trait-dispatch on the winner of the `linked_ethernet_
-// drivers()` walk. `drivers::net::init()` runs that walk, installs the
-// first `probe()`-successful driver into the active slot, and every
-// other entry point reads the slot and trait-dispatches.
+// `init()` walks `linked_ethernet_drivers()`, calls `probe()` on each,
+// and installs the first success into the active-driver slot. Every
+// other entry point reads the slot and trait-dispatches. No driver
+// linked → `linked_ethernet_drivers()` is empty, `init()` returns
+// `false`, every other dispatcher entry is a no-op.
 //
-// With the static refs gone, `//drivers:drivers` no longer has to
-// depend on `//uni-driver-virtio-net` and `//uni-driver-gve` — apps
-// pick whichever driver(s) they want via their own BUILD deps. No
-// driver linked → `linked_ethernet_drivers()` is empty, `init()`
-// returns `false`, every other dispatcher entry is a no-op.
-//
-// The indirection cost is one atomic load + one vtable call per
-// dispatcher call — the same shape the `use_gve()` branch had
-// before, plus the load.
+// Cost per dispatcher call: one atomic load + one vtable call.
 
 use uni_net_driver::{active_driver, linked_ethernet_drivers, set_active_driver, NicHandle};
 

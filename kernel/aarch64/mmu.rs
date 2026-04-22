@@ -32,7 +32,7 @@ mod aarch64 {
     // AFTER enabling the MMU using boot_l1_table. If L2 tables were in .bss,
     // they'd be zeroed while the MMU is live, causing page faults.
     //
-    // Pool + cursor live in one UnsafeCell-wrapped struct (plan Phase 7).
+    // Pool + cursor live in one UnsafeCell-wrapped struct.
     // Single-owner discipline: `map_device_range` only runs from the BSP
     // during boot before APs are started.
     struct L2Pool {

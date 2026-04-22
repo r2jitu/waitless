@@ -13,14 +13,13 @@
 //      match on them and tests can assert specific values.
 //   3. Conversions chain upward: driver/DHCP failures bubble into
 //      `NetError`. Never downward.
-//   4. TlsError currently lives in `net/tls_server.rs` (pre-existing).
-//      It joins this hierarchy in Phase 6 when `uni-tls` is carved
-//      out; no conversions are defined here yet.
+//   4. TlsError lives in `net/tls_server.rs` — it doesn't join this
+//      hierarchy yet and no conversions are defined here.
 //
 // Self-contained (only `core::`) so this file also compiles as a
 // standalone `rust_test` for host-native unit tests.
 
-#![allow(dead_code)] // Some variants are populated by Phase 5+ code.
+#![allow(dead_code)] // Some variants are reserved for future use.
 
 use core::fmt;
 
@@ -88,7 +87,7 @@ impl fmt::Display for DhcpError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetError {
     /// No ethernet driver is linked into the binary. Add a driver
-    /// crate dep (Phase 5 wires `uni-driver-virtio-net` / `-gve`).
+    /// crate dep (e.g. `//uni-driver-virtio-net`, `//uni-driver-gve`).
     NoDriver,
     /// At least one driver was linked but none found a NIC to bind.
     NoNic,

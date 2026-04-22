@@ -31,9 +31,7 @@ extern crate uni_native;
 // error types, plus the full umbrella of TCP/UDP/ARP/IPv4/DHCP/TLS
 // on bare-metal) lives in the `uni-net` crate. Re-exported at
 // `uni::net::*` for app compat — existing `use uni::net::Net;` and
-// `use uni::{NetError, …};` imports work unchanged. Driver crates
-// (Phase 5 Step 3+) will depend on `uni-net` directly to avoid the
-// `drivers → uni` cycle.
+// `use uni::{NetError, …};` imports work unchanged.
 pub extern crate uni_net as net;
 
 /// Native-binary entry — called from `bazel/rules/native_main.rs`'s
@@ -88,9 +86,8 @@ pub use boot_info::{boot_info, BootInfo, NicInfo};
 /// `error` module alias below) or `use uni_net::NetError` directly.
 pub use net::{DhcpError, NetError, NicError};
 
-/// Back-compat alias for `uni::error::*`. Phase 1 put the error
-/// types at `uni::error`; Phase 5-prereq moved them to `uni_net`
-/// so driver crates can see them. This alias keeps imports like
+/// `uni::error::*` — alias module. Error types live in `uni_net`
+/// so driver crates can see them; this alias keeps imports like
 /// `use uni::error::NetError` resolving.
 pub mod error {
     pub use crate::net::{DhcpError, NetError, NicError};

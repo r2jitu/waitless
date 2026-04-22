@@ -56,7 +56,6 @@ impl WebServerApp {
     fn new() -> Self {
         log_boot_info();
 
-        // Bring up the network stack explicitly (Phase 3 API).
         // Try DHCP first; on timeout (typical under minimal tap
         // networks) fall back to a static 10.0.2.15/24 config so
         // the app still boots. `Net::enable` leaves the ENABLED
