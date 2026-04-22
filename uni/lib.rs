@@ -37,32 +37,29 @@ pub extern crate uni_net as net;
 #[cfg(platform_unikernel)]
 mod unikernel;
 
-/// Back-compat shim: `bazel/rules/native_main.rs` calls
-/// `uni::native::run()` to enter the native event loop. The
-/// platform backend itself lives in the `uni-native` crate (std
-/// rlib); this wrapper plugs uni-side callbacks (`boot_info_fn`,
-/// `add_worker_listener`, `shutdown_fn`) into `uni_native::run`
-/// so `uni_native` never needs to depend back on `uni`.
+/// Native-binary entry — called from `bazel/rules/native_main.rs`'s
+/// `fn main()`. Runs the host POSIX event loop (all of which lives in
+/// the `uni_native` crate), plugging in the three uni-side lifecycle
+/// hooks (`boot_info_fn`, `add_worker_listener`, `shutdown_fn`) that
+/// `uni_native` would otherwise need a dep back on `uni` to reach.
 #[cfg(platform_native)]
-pub mod native {
+pub fn native_run() -> i32 {
     use crate::boot_info::{BootInfoParams, NicInfo, MAX_NICS};
 
-    pub fn run() -> i32 {
-        uni_native::run(uni_native::RunConfig {
-            boot_info_fn: |num_cpus, ram_bytes| {
-                crate::boot_info::init_boot_info(BootInfoParams {
-                    ram_bytes,
-                    num_cpus,
-                    boot_args: "",
-                    nics: [NicInfo::EMPTY; MAX_NICS],
-                    nic_count: 0,
-                    rtc_epoch: None,
-                });
-            },
-            add_worker_listener: crate::http::add_worker_listener,
-            shutdown_fn: crate::shutdown_and_drop,
-        })
-    }
+    uni_native::run(uni_native::RunConfig {
+        boot_info_fn: |num_cpus, ram_bytes| {
+            crate::boot_info::init_boot_info(BootInfoParams {
+                ram_bytes,
+                num_cpus,
+                boot_args: "",
+                nics: [NicInfo::EMPTY; MAX_NICS],
+                nic_count: 0,
+                rtc_epoch: None,
+            });
+        },
+        add_worker_listener: crate::http::add_worker_listener,
+        shutdown_fn: crate::shutdown_and_drop,
+    })
 }
 
 pub mod boot_info;
