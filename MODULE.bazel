@@ -134,19 +134,27 @@ crate.from_cargo(
 # is safe without any FXSAVE/XSAVE dance. x86_64-v3 baseline
 # (Haswell, 2013) matches what every cloud VM runs today.
 #
-# These flags apply to ALL target triples the crate compiles for,
-# but rustc silently ignores `+sse2` and friends on non-x86 targets
-# (with a warning), so aarch64 builds remain unaffected.
+# Scoped via `crate.annotation_select` to the x86_64 triples only.
+# Setting these flags unconditionally makes LLVM emit a warning for
+# every feature on every non-x86 compilation ("'+sse2' is not a
+# recognized feature for this target (ignoring feature)" × every
+# flag × every affected crate), flooding the aarch64 build log.
 #
 # Crates listed: any crate in the TLS 1.3 transitive graph that
 # either uses SIMD intrinsics directly or hits the LLVM bug via
 # `u128` math.
-X86_CRYPTO_FEATURES = "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmul,+fma,+bmi1,+bmi2"
+_X86_CRYPTO_FLAG = "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmul,+fma,+bmi1,+bmi2"
+
+_X86_TRIPLES = [
+    "x86_64-unknown-none",
+    "x86_64-unknown-linux-gnu",
+]
 
 [
-    crate.annotation(
+    crate.annotation_select(
         crate = name,
-        rustc_flags = [X86_CRYPTO_FEATURES],
+        triples = _X86_TRIPLES,
+        rustc_flags = [_X86_CRYPTO_FLAG],
     )
     for name in (
         "aes",
@@ -160,39 +168,36 @@ X86_CRYPTO_FEATURES = "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse
         "primeorder",
         "elliptic-curve",
         "crypto-bigint",
+        "chacha20",
+        "chacha20poly1305",
+        "poly1305",
+        "curve25519-dalek",
     )
 ]
 
-# chacha20 and poly1305 get an extra `--cfg=..._force_soft` on top
-# of the target-feature fix — something in their x86 SIMD backends
-# (not AVX2; SSE2 is also affected) produces incorrect ciphertext
-# on x86_64-unknown-none targets. The RFC 8439 known-answer test
-# in apps/test_tls fails both ct_ok and tag_ok on x86_64 with the
-# SIMD path enabled, and bypassing SIMD at the crate level makes
-# it pass again. Both crates explicitly document
-# `chacha20_force_soft` / `poly1305_force_soft` as the way to
-# pick the portable constant-time software backend.
+# chacha20 and poly1305 get an extra `--cfg=..._force_soft` — something
+# in their x86 SIMD backends (not AVX2; SSE2 is also affected) produces
+# incorrect ciphertext on x86_64-unknown-none targets. The RFC 8439
+# known-answer test in apps/test_tls fails both ct_ok and tag_ok on
+# x86_64 with the SIMD path enabled, and bypassing SIMD at the crate
+# level makes it pass again. Both crates explicitly document
+# `chacha20_force_soft` / `poly1305_force_soft` as the way to pick the
+# portable constant-time software backend. Applied on all triples
+# (non-x86 builds don't hit the SIMD path anyway; belt-and-suspenders).
 crate.annotation(
     crate = "chacha20",
-    rustc_flags = [X86_CRYPTO_FEATURES, "--cfg=chacha20_force_soft"],
-)
-crate.annotation(
-    crate = "chacha20poly1305",
-    rustc_flags = [X86_CRYPTO_FEATURES],
+    rustc_flags = ["--cfg=chacha20_force_soft"],
 )
 crate.annotation(
     crate = "poly1305",
-    rustc_flags = [X86_CRYPTO_FEATURES, "--cfg=poly1305_force_soft"],
+    rustc_flags = ["--cfg=poly1305_force_soft"],
 )
 
-# curve25519-dalek needs BOTH the target-feature flag (its field
-# element arithmetic runs into the same LLVM legalisation issue
-# via `u128` math) AND a build-script override to force the
+# curve25519-dalek also needs a build-script override to force the
 # portable "serial" backend instead of the "simd" one that assumes
-# AVX2 is on by default.
+# AVX2 is on by default. (The target-feature flag is handled above.)
 crate.annotation(
     crate = "curve25519-dalek",
-    rustc_flags = [X86_CRYPTO_FEATURES],
     build_script_env = {
         "CARGO_CFG_CURVE25519_DALEK_BACKEND": "serial",
     },
