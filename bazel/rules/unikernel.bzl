@@ -8,6 +8,62 @@ load("@rules_rust//rust:defs.bzl", "rust_binary")
 load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 load("//bazel/rules:variants.bzl", "unikernel_variants")
 
+# ── Public launch-config helpers ─────────────────────────────────────────
+#
+# `port_fwd` lives here alongside `unikernel_binary` (not in
+# `variants.bzl`) so apps only pull one `.bzl` for the rule + its
+# attr-construction helpers. Lists of these go into
+# `unikernel_binary(port_forwards = [...])`.
+
+def port_fwd(proto, env, default_host, guest):
+    """Build a validated port-forward entry for the `port_forwards` attr.
+
+    Encodes the four fields into a colon-delimited string (Bazel
+    attrs can't hold structs), with validation up front so errors
+    surface at macro-call time rather than deep inside rule
+    analysis.
+
+    Example:
+        port_fwd("tcp", env = "UNIKERNEL_PORT",
+                 default_host = 8080, guest = 80)
+
+    At runtime the variant launcher forwards
+        host:${UNIKERNEL_PORT:-8080} → guest tcp:80
+    i.e. callers override the host port by exporting `UNIKERNEL_PORT`
+    before `bazel run :<app>_<variant>`, while the guest-side port
+    the app listens on is baked in at build time.
+
+    Args:
+      proto: `"tcp"` or `"udp"`.
+      env: env-var name users set to override the host port at run time.
+      default_host: host port used when `env` is unset.
+      guest: guest-side port the app listens on.
+
+    Returns:
+      A colon-delimited string `"<proto>:<env>:<default_host>:<guest>"`
+      ready to be dropped into a `port_forwards = [...]` list.
+    """
+    if proto not in ("tcp", "udp"):
+        fail("port_fwd: proto must be 'tcp' or 'udp', got '{}'".format(proto))
+    if not env or ":" in env:
+        fail("port_fwd: env must be a non-empty identifier with no colons, got '{}'".format(env))
+    if type(default_host) != "int" or default_host <= 0 or default_host > 65535:
+        fail("port_fwd: default_host must be a TCP/UDP port (1–65535), got '{}'".format(default_host))
+    if type(guest) != "int" or guest <= 0 or guest > 65535:
+        fail("port_fwd: guest must be a TCP/UDP port (1–65535), got '{}'".format(guest))
+    return "{}:{}:{}:{}".format(proto, env, default_host, guest)
+
+# Standard HTTP + HTTPS + UDP-echo port layout used by
+# `apps/webserver`. Exported for other apps that want the same
+# three forwards; apps with different needs list their own
+# `port_fwd()` entries (or rely on the `[]` default for
+# non-interactive test apps).
+HTTP_HTTPS_UDP_FORWARDS = [
+    port_fwd("tcp", env = "UNIKERNEL_PORT", default_host = 8080, guest = 80),
+    port_fwd("tcp", env = "UNIKERNEL_TLS_PORT", default_host = 8443, guest = 443),
+    port_fwd("udp", env = "UNIKERNEL_UDP_PORT", default_host = 8007, guest = 7),
+]
+
 # Bare-metal linker flags (passed to rust-lld via -C link-arg).
 _LINK_FLAGS = [
     "-C",
@@ -34,7 +90,7 @@ _LINK_FLAGS_ARCH = select({
 def unikernel_binary(
         name,
         app,
-        port_forwards = None,
+        port_forwards = [],
         ram_mb = 128,
         cpus = 1,
         visibility = None):
@@ -65,12 +121,13 @@ def unikernel_binary(
     Args:
         name: Base name for all output targets.
         app: A rust_library target with a #[uni::boot] entry point.
-        port_forwards: list of entries built via `port_fwd()` (see
-          `//bazel/rules:variants.bzl`). Each entry baked into the
-          variant launchers as a `host_port → guest_port` forward,
-          with `UNIKERNEL_*`-style env vars overriding the host port
-          at run time. Defaults to `DEFAULT_PORT_FORWARDS` (HTTP 80 +
-          HTTPS 443 + UDP 7).
+        port_forwards: list of entries built via `port_fwd()`. Each
+          entry baked into the variant launchers as a `host_port →
+          guest_port` forward, with `UNIKERNEL_*`-style env vars
+          overriding the host port at run time. Defaults to `[]`
+          (no forwards) so non-interactive test apps stay clean;
+          server apps opt in with `port_forwards =
+          HTTP_HTTPS_UDP_FORWARDS` (or their own list).
         ram_mb: default guest RAM in MB, overridable at run time
           via `UNIKERNEL_MEMORY`.
         cpus: default vCPU count, overridable at run time via

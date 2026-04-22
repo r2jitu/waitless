@@ -16,9 +16,12 @@ rust_library(
     ],
 )
 
+# Defaults to 4 vCPUs because the per-core state tests need them.
+# Serial-log-only assertions → no port forwards needed.
 unikernel_binary(
     name = "test_percpu",
     app = ":app",
+    cpus = 4,
 )
 
 # Per-core state test. Runs on HVF (real aarch64 hardware) + both

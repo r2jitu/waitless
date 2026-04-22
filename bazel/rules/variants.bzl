@@ -126,54 +126,6 @@ def _relpath_from_launcher_to(ctx, target_file):
     package_depth = ctx.label.package.count("/") + 1 if ctx.label.package else 0
     return ("../" * package_depth) + target_file.short_path
 
-def port_fwd(proto, env, default_host, guest):
-    """Build a validated port-forward entry for the `port_forwards` attr.
-
-    Encodes the four fields into a colon-delimited string (Bazel
-    attrs can't hold structs), with validation up front so errors
-    surface at macro-call time rather than deep inside rule
-    analysis.
-
-    Example:
-        port_fwd("tcp", env = "UNIKERNEL_PORT",
-                 default_host = 8080, guest = 80)
-
-    At runtime the variant launcher forwards
-        host:${UNIKERNEL_PORT:-8080} → guest tcp:80
-    i.e. callers override the host port by exporting `UNIKERNEL_PORT`
-    before `bazel run :<app>_<variant>`, while the guest-side port
-    the app listens on is baked in at build time.
-
-    Args:
-      proto: `"tcp"` or `"udp"`.
-      env: env-var name users set to override the host port at run time.
-      default_host: host port used when `env` is unset.
-      guest: guest-side port the app listens on.
-
-    Returns:
-      A colon-delimited string `"<proto>:<env>:<default_host>:<guest>"`
-      ready to be dropped into a `port_forwards = [...]` list.
-    """
-    if proto not in ("tcp", "udp"):
-        fail("port_fwd: proto must be 'tcp' or 'udp', got '{}'".format(proto))
-    if not env or ":" in env:
-        fail("port_fwd: env must be a non-empty identifier with no colons, got '{}'".format(env))
-    if type(default_host) != "int" or default_host <= 0 or default_host > 65535:
-        fail("port_fwd: default_host must be a TCP/UDP port (1–65535), got '{}'".format(default_host))
-    if type(guest) != "int" or guest <= 0 or guest > 65535:
-        fail("port_fwd: guest must be a TCP/UDP port (1–65535), got '{}'".format(guest))
-    return "{}:{}:{}:{}".format(proto, env, default_host, guest)
-
-# Default port-forward config — applies to apps that don't override
-# via `unikernel_binary(port_forwards = [...])`. Shaped for the
-# richest current app (apps/webserver: HTTP + HTTPS + UDP echo) so
-# most callers can omit the attr.
-DEFAULT_PORT_FORWARDS = [
-    port_fwd("tcp", env = "UNIKERNEL_PORT",     default_host = 8080, guest = 80),
-    port_fwd("tcp", env = "UNIKERNEL_TLS_PORT", default_host = 8443, guest = 443),
-    port_fwd("udp", env = "UNIKERNEL_UDP_PORT", default_host = 8007, guest = 7),
-]
-
 def _parse_port_forward(entry):
     """Split a `proto:env:default_host:guest` entry into its parts.
 
@@ -571,15 +523,17 @@ def _instantiate_variant(spec, name, base, vm_config, visibility):
 # buildifier: disable=unnamed-macro
 def unikernel_variants(
         name,
-        port_forwards = None,
-        ram_mb = 128,
-        cpus = 1,
+        port_forwards,
+        ram_mb,
+        cpus,
         visibility = None):
     """Generate `:<name>_<variant>` runnable targets for every runner in _VARIANT_SPECS.
 
     Called from `unikernel_binary` after the artefact targets are
     declared (`:<name>.img` / `:<name>.elf` / `:<name>.iso` must
-    exist in the same package).
+    exist in the same package). Every config arg is required —
+    `unikernel_binary` handles defaults (`port_fwd()` entries,
+    `ram_mb=128`, `cpus=1`) so this internal macro stays explicit.
 
     `name` is a prefix for the generated targets, not a target of
     its own — the underlying unikernel_binary intentionally does
@@ -587,15 +541,14 @@ def unikernel_variants(
 
     Args:
       name: target-name prefix (matches the enclosing unikernel_binary).
-      port_forwards: per-app forwarding config (see DEFAULT_PORT_FORWARDS).
-        Each entry is "<proto>:<host_env_var>:<default_host_port>:<guest_port>".
-        Defaults to the 3-port HTTP/HTTPS/UDP layout webserver uses.
+      port_forwards: per-app forwarding config (entries built via
+        `port_fwd()` in unikernel.bzl).
       ram_mb: default guest RAM in MB (overridable via UNIKERNEL_MEMORY).
       cpus: default vCPU count (overridable via UNIKERNEL_CPUS).
       visibility: Bazel visibility for the generated variants.
     """
     vm_config = struct(
-        port_forwards = port_forwards if port_forwards != None else DEFAULT_PORT_FORWARDS,
+        port_forwards = port_forwards,
         ram_mb = ram_mb,
         cpus = cpus,
     )

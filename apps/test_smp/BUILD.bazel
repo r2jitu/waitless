@@ -16,9 +16,13 @@ rust_library(
     ],
 )
 
+# Defaults to 4 vCPUs because the whole point of the test is
+# exercising SMP startup + IPI delivery. Serial-log-only
+# assertions → no port forwards needed (the default is `[]`).
 unikernel_binary(
     name = "test_smp",
     app = ":app",
+    cpus = 4,
 )
 
 # SMP boot + IPI test. Runs on HVF (real aarch64 hardware) + both

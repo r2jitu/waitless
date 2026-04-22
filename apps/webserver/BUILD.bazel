@@ -1,7 +1,7 @@
 load("@rules_python//python:defs.bzl", "py_test")
 load("@rules_rust//rust:defs.bzl", "rust_library")
 load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
-load("//bazel/rules:unikernel.bzl", "unikernel_binary")
+load("//bazel/rules:unikernel.bzl", "HTTP_HTTPS_UDP_FORWARDS", "unikernel_binary")
 load("//bazel/rules:variants.bzl", "unikernel_app_test")
 
 package(default_visibility = ["//visibility:public"])
@@ -21,6 +21,7 @@ rust_library(
 unikernel_binary(
     name = "webserver",
     app = ":app",
+    port_forwards = HTTP_HTTPS_UDP_FORWARDS,
 )
 
 # Per-variant integration tests (generates `:test_hvf`, `:test_iso`,
