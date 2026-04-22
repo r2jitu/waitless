@@ -1,7 +1,9 @@
 // drivers/virtio_console.rs — VirtIO console device for modern PCI platforms.
 
 use core::arch::asm;
+use core::cell::UnsafeCell;
 use core::ptr;
+use core::sync::atomic::{AtomicU16, Ordering};
 
 use crate::{
     dsb_st, dsb_sy,
@@ -30,42 +32,74 @@ use crate::virtio::{
 //
 // Uses static BSS memory for ring buffers so it can init before mm::init().
 // Two queues: RX (queue 0) = host->guest, TX (queue 1) = guest->host.
+//
+// State lives in one `UnsafeCell<VirtioConsole>` — `static mut` replaced
+// with interior mutability and an `unsafe impl Sync`. Single-threaded by
+// contract: `kernel::serial` holds a spinlock around every `puts` /
+// `putc` / `try_getc` call, so no concurrent mutation ever reaches us.
 // ============================================================================
 
 const CON_QS: usize = 16;
 const CON_AVAIL_OFF: usize = CON_QS * 16; // 256
 const CON_USED_OFF: usize = 4096;
 
-// Static ring memory (page-aligned, in BSS)
+// Queue-ring storage (page-aligned, in BSS).
 #[repr(C, align(4096))]
 struct ConQueueMem([u8; 8192]);
 
-static mut CON_TX_MEM: ConQueueMem = ConQueueMem([0; 8192]);
-static mut CON_RX_MEM: ConQueueMem = ConQueueMem([0; 8192]);
+/// All driver state in one struct. Individual `static mut` globals
+/// (`CON_TX_MEM`, `CON_BASE`, `CON_PCI_MODE`, …) collapsed to fields
+/// here per init-redesign.md Phase 7.
+#[repr(C, align(4096))]  // Alignment propagates from ConQueueMem.
+struct VirtioConsole {
+    tx_mem: ConQueueMem,
+    rx_mem: ConQueueMem,
+    tx_buf: [u8; 1],
+    rx_bufs: [u8; CON_QS],
+    /// Non-zero = initialized. `1` is used as a sentinel on the PCI
+    /// path (the real MMIO base doesn't apply there).
+    base: u64,
+    pci_mode: bool,
+    tx_notify: u64,
+    rx_notify: u64,
+}
 
-static mut CON_TX_BUF: [u8; 1] = [0];
-static mut CON_RX_BUFS: [u8; CON_QS] = [0; CON_QS];
+impl VirtioConsole {
+    const fn new() -> Self {
+        Self {
+            tx_mem: ConQueueMem([0; 8192]),
+            rx_mem: ConQueueMem([0; 8192]),
+            tx_buf: [0; 1],
+            rx_bufs: [0; CON_QS],
+            base: 0,
+            pci_mode: false,
+            tx_notify: 0,
+            rx_notify: 0,
+        }
+    }
+}
 
-static mut CON_BASE: u64 = 0; // non-zero = initialized
-static mut CON_PCI_MODE: bool = false;
-static mut CON_TX_NOTIFY: u64 = 0;
-static mut CON_RX_NOTIFY: u64 = 0;
+struct ConsoleSlot(UnsafeCell<VirtioConsole>);
+// SAFETY: all mutation is serialised by `kernel::serial`'s spinlock
+// (see module-level comment).
+unsafe impl Sync for ConsoleSlot {}
+
+static CONSOLE: ConsoleSlot =
+    ConsoleSlot(UnsafeCell::new(VirtioConsole::new()));
 
 // TX/RX ring index state. Atomic so cross-core access is data-race-free at
 // the language level. The actual TX serialisation is done by the caller
 // (kernel::serial holds a spinlock around the whole `puts`/`putc` call).
 // Atomic ops here defend against future callers that bypass that lock and
 // let Miri verify the soundness of any concurrent test.
-use core::sync::atomic::{AtomicU16, Ordering};
 static CON_TX_AVAIL_IDX: AtomicU16 = AtomicU16::new(0);
 static CON_TX_LAST_USED: AtomicU16 = AtomicU16::new(0);
 static CON_RX_AVAIL_IDX: AtomicU16 = AtomicU16::new(0);
 static CON_RX_LAST_USED: AtomicU16 = AtomicU16::new(0);
 
-
 // Ring accessors. Helpers take a raw pointer to the queue memory rather
-// than a reference, so the call sites can use `&raw mut CON_TX_MEM` and
-// avoid the `static_mut_refs` lint without restructuring the data.
+// than a reference, so the call sites can use `&raw mut con.tx_mem` and
+// avoid borrow-checker contortions.
 // SAFETY: caller must pass a pointer to a valid `ConQueueMem` and uphold
 // the per-byte access discipline.
 
@@ -158,38 +192,42 @@ fn con_init_mmio(base_addr: u64) -> bool {
             mmio_write32(base_addr + MMIO_GUEST_PAGE_SIZE, 4096);
         }
 
-        // Zero ring memory
-        ptr::write_bytes((*(&raw mut CON_RX_MEM)).0.as_mut_ptr(), 0, 8192);
-        ptr::write_bytes((*(&raw mut CON_TX_MEM)).0.as_mut_ptr(), 0, 8192);
+        // SAFETY: console access is serialised by kernel::serial — no
+        // concurrent readers or writers are live during init.
+        let con = &mut *CONSOLE.0.get();
 
-        if !con_init_mmio_queue(base_addr, 0, &raw mut CON_RX_MEM, is_v2) { return false; }
-        if !con_init_mmio_queue(base_addr, 1, &raw mut CON_TX_MEM, is_v2) { return false; }
+        // Zero ring memory
+        ptr::write_bytes(con.rx_mem.0.as_mut_ptr(), 0, 8192);
+        ptr::write_bytes(con.tx_mem.0.as_mut_ptr(), 0, 8192);
+
+        if !con_init_mmio_queue(base_addr, 0, &raw mut con.rx_mem, is_v2) { return false; }
+        if !con_init_mmio_queue(base_addr, 1, &raw mut con.tx_mem, is_v2) { return false; }
 
         // Pre-populate RX descriptors
         for i in 0..CON_QS {
-            ptr::write_volatile(con_desc_addr(&raw mut CON_RX_MEM, i),
-                                (&raw const CON_RX_BUFS as *const u8).add(i) as u64);
-            ptr::write_volatile(con_desc_len(&raw mut CON_RX_MEM, i), 1);
-            ptr::write_volatile(con_desc_flags(&raw mut CON_RX_MEM, i), VIRTQ_DESC_F_WRITE);
-            ptr::write_volatile(con_avail_ring(&raw mut CON_RX_MEM, i), i as u16);
+            ptr::write_volatile(con_desc_addr(&raw mut con.rx_mem, i),
+                                con.rx_bufs.as_ptr().add(i) as u64);
+            ptr::write_volatile(con_desc_len(&raw mut con.rx_mem, i), 1);
+            ptr::write_volatile(con_desc_flags(&raw mut con.rx_mem, i), VIRTQ_DESC_F_WRITE);
+            ptr::write_volatile(con_avail_ring(&raw mut con.rx_mem, i), i as u16);
         }
         CON_RX_AVAIL_IDX.store(CON_QS as u16, Ordering::Relaxed);
         dsb_st();
-        ptr::write_volatile(con_avail_idx_reg(&raw mut CON_RX_MEM), CON_QS as u16);
+        ptr::write_volatile(con_avail_idx_reg(&raw mut con.rx_mem), CON_QS as u16);
         dsb_sy();
         mmio_write32(base_addr + MMIO_QUEUE_NOTIFY, 0);
 
         // TX descriptor 0
-        ptr::write_volatile(con_desc_addr(&raw mut CON_TX_MEM, 0), (&raw const CON_TX_BUF as *const u8) as u64);
-        ptr::write_volatile(con_desc_len(&raw mut CON_TX_MEM, 0), 1);
-        ptr::write_volatile(con_desc_flags(&raw mut CON_TX_MEM, 0), 0);
+        ptr::write_volatile(con_desc_addr(&raw mut con.tx_mem, 0), con.tx_buf.as_ptr() as u64);
+        ptr::write_volatile(con_desc_len(&raw mut con.tx_mem, 0), 1);
+        ptr::write_volatile(con_desc_flags(&raw mut con.tx_mem, 0), 0);
 
         let mut final_status = (STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_DRIVER_OK) as u32;
         if is_v2 { final_status |= STATUS_FEATURES_OK as u32; }
         mmio_write32(base_addr + MMIO_STATUS, final_status);
 
-        CON_BASE = base_addr;
-        CON_PCI_MODE = false;
+        con.base = base_addr;
+        con.pci_mode = false;
     }
     true
 }
@@ -218,34 +256,34 @@ fn con_init_pci() -> bool {
         return false;
     }
 
+    // SAFETY: console access is serialised by kernel::serial — no
+    // concurrent readers or writers are live during init.
+    let con = unsafe { &mut *CONSOLE.0.get() };
+
     unsafe {
-        ptr::write_bytes((*(&raw mut CON_RX_MEM)).0.as_mut_ptr(), 0, 8192);
-        ptr::write_bytes((*(&raw mut CON_TX_MEM)).0.as_mut_ptr(), 0, 8192);
+        ptr::write_bytes(con.rx_mem.0.as_mut_ptr(), 0, 8192);
+        ptr::write_bytes(con.tx_mem.0.as_mut_ptr(), 0, 8192);
     }
 
     // Init RX queue (0)
     vpci_select_queue(dev, 0);
     let qmax = vpci_get_queue_size(dev);
     if qmax == 0 { return false; }
-    unsafe {
-        let desc_addr = (*(&raw const CON_RX_MEM)).0.as_ptr() as u64;
-        let avail_addr = desc_addr + CON_AVAIL_OFF as u64;
-        let used_addr = desc_addr + CON_USED_OFF as u64;
-        vpci_set_queue_addrs(dev, desc_addr, avail_addr, used_addr);
-        vpci_enable_queue(dev);
-    }
+    let desc_addr = con.rx_mem.0.as_ptr() as u64;
+    let avail_addr = desc_addr + CON_AVAIL_OFF as u64;
+    let used_addr = desc_addr + CON_USED_OFF as u64;
+    vpci_set_queue_addrs(dev, desc_addr, avail_addr, used_addr);
+    vpci_enable_queue(dev);
 
     // Init TX queue (1)
     vpci_select_queue(dev, 1);
     let qmax_tx = vpci_get_queue_size(dev);
     if qmax_tx == 0 { return false; }
-    unsafe {
-        let desc_addr = (*(&raw const CON_TX_MEM)).0.as_ptr() as u64;
-        let avail_addr = desc_addr + CON_AVAIL_OFF as u64;
-        let used_addr = desc_addr + CON_USED_OFF as u64;
-        vpci_set_queue_addrs(dev, desc_addr, avail_addr, used_addr);
-        vpci_enable_queue(dev);
-    }
+    let desc_addr = con.tx_mem.0.as_ptr() as u64;
+    let avail_addr = desc_addr + CON_AVAIL_OFF as u64;
+    let used_addr = desc_addr + CON_USED_OFF as u64;
+    vpci_set_queue_addrs(dev, desc_addr, avail_addr, used_addr);
+    vpci_enable_queue(dev);
 
     // Get notify addresses
     vpci_select_queue(dev, 0);
@@ -259,21 +297,21 @@ fn con_init_pci() -> bool {
     // Pre-populate RX descriptors
     unsafe {
         for i in 0..CON_QS {
-            ptr::write_volatile(con_desc_addr(&raw mut CON_RX_MEM, i),
-                                (&raw const CON_RX_BUFS as *const u8).add(i) as u64);
-            ptr::write_volatile(con_desc_len(&raw mut CON_RX_MEM, i), 1);
-            ptr::write_volatile(con_desc_flags(&raw mut CON_RX_MEM, i), VIRTQ_DESC_F_WRITE);
-            ptr::write_volatile(con_avail_ring(&raw mut CON_RX_MEM, i), i as u16);
+            ptr::write_volatile(con_desc_addr(&raw mut con.rx_mem, i),
+                                con.rx_bufs.as_ptr().add(i) as u64);
+            ptr::write_volatile(con_desc_len(&raw mut con.rx_mem, i), 1);
+            ptr::write_volatile(con_desc_flags(&raw mut con.rx_mem, i), VIRTQ_DESC_F_WRITE);
+            ptr::write_volatile(con_avail_ring(&raw mut con.rx_mem, i), i as u16);
         }
         CON_RX_AVAIL_IDX.store(CON_QS as u16, Ordering::Relaxed);
         dsb_st();
-        ptr::write_volatile(con_avail_idx_reg(&raw mut CON_RX_MEM), CON_QS as u16);
+        ptr::write_volatile(con_avail_idx_reg(&raw mut con.rx_mem), CON_QS as u16);
         dsb_sy();
 
         // TX descriptor 0
-        ptr::write_volatile(con_desc_addr(&raw mut CON_TX_MEM, 0), (&raw const CON_TX_BUF as *const u8) as u64);
-        ptr::write_volatile(con_desc_len(&raw mut CON_TX_MEM, 0), 1);
-        ptr::write_volatile(con_desc_flags(&raw mut CON_TX_MEM, 0), 0);
+        ptr::write_volatile(con_desc_addr(&raw mut con.tx_mem, 0), con.tx_buf.as_ptr() as u64);
+        ptr::write_volatile(con_desc_len(&raw mut con.tx_mem, 0), 1);
+        ptr::write_volatile(con_desc_flags(&raw mut con.tx_mem, 0), 0);
     }
 
     // DRIVER_OK
@@ -283,27 +321,27 @@ fn con_init_pci() -> bool {
     // Kick RX queue
     unsafe { ptr::write_volatile(rx_notify as *mut u16, 0); }
 
-    unsafe {
-        CON_BASE = 1; // sentinel
-        CON_PCI_MODE = true;
-        CON_TX_NOTIFY = tx_notify;
-        CON_RX_NOTIFY = rx_notify;
-    }
+    con.base = 1; // sentinel
+    con.pci_mode = true;
+    con.tx_notify = tx_notify;
+    con.rx_notify = rx_notify;
     true
 }
 
 // ---- Console I/O ------------------------------------------------------------
 
 fn con_putc(c: u8) {
+    // SAFETY: console access is serialised by kernel::serial.
+    let con = unsafe { &mut *CONSOLE.0.get() };
     unsafe {
-        if CON_BASE == 0 { return; }
+        if con.base == 0 { return; }
 
         let mut tx_avail = CON_TX_AVAIL_IDX.load(Ordering::Relaxed);
         let mut tx_last = CON_TX_LAST_USED.load(Ordering::Relaxed);
 
         // Spin until previous TX completes
         while tx_last < tx_avail {
-            let u = ptr::read_volatile(con_used_idx_reg(&raw const CON_TX_MEM));
+            let u = ptr::read_volatile(con_used_idx_reg(&raw const con.tx_mem));
             if u != tx_last {
                 tx_last = u;
                 CON_TX_LAST_USED.store(u, Ordering::Relaxed);
@@ -314,70 +352,72 @@ fn con_putc(c: u8) {
             asm!("pause", options(nostack, preserves_flags));
         }
 
-        (*(&raw mut CON_TX_BUF))[0] = c;
+        con.tx_buf[0] = c;
 
         dsb_st();
         let slot = (tx_avail % CON_QS as u16) as usize;
-        ptr::write_volatile(con_avail_ring(&raw mut CON_TX_MEM, slot), 0);
+        ptr::write_volatile(con_avail_ring(&raw mut con.tx_mem, slot), 0);
         dsb_st();
-        ptr::write_volatile(con_avail_idx_reg(&raw mut CON_TX_MEM), tx_avail + 1);
+        ptr::write_volatile(con_avail_idx_reg(&raw mut con.tx_mem), tx_avail + 1);
         tx_avail += 1;
         CON_TX_AVAIL_IDX.store(tx_avail, Ordering::Relaxed);
         dsb_sy();
 
         // Kick TX queue
-        if CON_PCI_MODE {
-            ptr::write_volatile(CON_TX_NOTIFY as *mut u16, 1);
+        if con.pci_mode {
+            ptr::write_volatile(con.tx_notify as *mut u16, 1);
         } else {
-            mmio_write32(CON_BASE + MMIO_QUEUE_NOTIFY, 1);
+            mmio_write32(con.base + MMIO_QUEUE_NOTIFY, 1);
         }
 
         // Spin until TX completes
-        while ptr::read_volatile(con_used_idx_reg(&raw const CON_TX_MEM)) == tx_last {
+        while ptr::read_volatile(con_used_idx_reg(&raw const con.tx_mem)) == tx_last {
             #[cfg(target_arch = "aarch64")]
             asm!("yield", options(nostack, preserves_flags));
             #[cfg(target_arch = "x86_64")]
             asm!("pause", options(nostack, preserves_flags));
         }
-        let new_last = ptr::read_volatile(con_used_idx_reg(&raw const CON_TX_MEM));
+        let new_last = ptr::read_volatile(con_used_idx_reg(&raw const con.tx_mem));
         CON_TX_LAST_USED.store(new_last, Ordering::Relaxed);
     }
 }
 
 fn con_try_getc() -> i32 {
+    // SAFETY: console access is serialised by kernel::serial.
+    let con = unsafe { &mut *CONSOLE.0.get() };
     unsafe {
-        if CON_BASE == 0 { return -1; }
+        if con.base == 0 { return -1; }
 
         let rx_last = CON_RX_LAST_USED.load(Ordering::Relaxed);
-        let used_idx = ptr::read_volatile(con_used_idx_reg(&raw const CON_RX_MEM));
+        let used_idx = ptr::read_volatile(con_used_idx_reg(&raw const con.rx_mem));
         if used_idx == rx_last { return -1; }
 
         let slot = (rx_last % CON_QS as u16) as usize;
-        let desc_id = ptr::read_volatile(con_used_ring_id(&raw const CON_RX_MEM, slot)) as usize;
-        let c = (*(&raw const CON_RX_BUFS))[desc_id] as i32;
+        let desc_id = ptr::read_volatile(con_used_ring_id(&raw const con.rx_mem, slot)) as usize;
+        let c = con.rx_bufs[desc_id] as i32;
         let new_rx_last = rx_last + 1;
         CON_RX_LAST_USED.store(new_rx_last, Ordering::Relaxed);
 
         // Resubmit descriptor
-        ptr::write_volatile(con_desc_addr(&raw mut CON_RX_MEM, desc_id),
-                            (&raw const CON_RX_BUFS as *const u8).add(desc_id) as u64);
-        ptr::write_volatile(con_desc_len(&raw mut CON_RX_MEM, desc_id), 1);
-        ptr::write_volatile(con_desc_flags(&raw mut CON_RX_MEM, desc_id), VIRTQ_DESC_F_WRITE);
+        ptr::write_volatile(con_desc_addr(&raw mut con.rx_mem, desc_id),
+                            con.rx_bufs.as_ptr().add(desc_id) as u64);
+        ptr::write_volatile(con_desc_len(&raw mut con.rx_mem, desc_id), 1);
+        ptr::write_volatile(con_desc_flags(&raw mut con.rx_mem, desc_id), VIRTQ_DESC_F_WRITE);
 
         let rx_avail = CON_RX_AVAIL_IDX.load(Ordering::Relaxed);
         dsb_st();
         let avail_slot = (rx_avail % CON_QS as u16) as usize;
-        ptr::write_volatile(con_avail_ring(&raw mut CON_RX_MEM, avail_slot), desc_id as u16);
+        ptr::write_volatile(con_avail_ring(&raw mut con.rx_mem, avail_slot), desc_id as u16);
         dsb_st();
-        ptr::write_volatile(con_avail_idx_reg(&raw mut CON_RX_MEM), rx_avail + 1);
+        ptr::write_volatile(con_avail_idx_reg(&raw mut con.rx_mem), rx_avail + 1);
         CON_RX_AVAIL_IDX.store(rx_avail + 1, Ordering::Relaxed);
         dsb_sy();
 
         // Kick RX queue
-        if CON_PCI_MODE {
-            ptr::write_volatile(CON_RX_NOTIFY as *mut u16, 0);
+        if con.pci_mode {
+            ptr::write_volatile(con.rx_notify as *mut u16, 0);
         } else {
-            mmio_write32(CON_BASE + MMIO_QUEUE_NOTIFY, 0);
+            mmio_write32(con.base + MMIO_QUEUE_NOTIFY, 0);
         }
 
         c
