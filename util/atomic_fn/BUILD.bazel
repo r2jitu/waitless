@@ -40,4 +40,5 @@ rust_library(
 rust_test(
     name = "atomic_fn_test",
     crate = ":atomic_fn",
+    size = "small",
 )

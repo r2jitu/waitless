@@ -66,34 +66,40 @@ rust_test(
     name = "deque_test",
     srcs = ["deque.rs"],
     crate_root = "deque.rs",
+    size = "small",
 )
 
 rust_test(
     name = "bump_test",
     srcs = ["bump.rs"],
     crate_root = "bump.rs",
+    size = "small",
 )
 
 rust_test(
     name = "spsc_test",
     srcs = ["spsc.rs"],
     crate_root = "spsc.rs",
+    size = "small",
 )
 
 rust_test(
     name = "once_test",
     srcs = ["once.rs"],
     crate_root = "once.rs",
+    size = "small",
 )
 
 rust_test(
     name = "sync_test",
     srcs = ["sync.rs"],
     crate_root = "sync.rs",
+    size = "small",
 )
 
 rust_test(
     name = "timer_test",
     srcs = ["timer.rs"],
     crate_root = "timer.rs",
+    size = "small",
 )

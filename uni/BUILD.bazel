@@ -48,4 +48,5 @@ rust_test(
     name = "boot_info_test",
     srcs = ["boot_info.rs"],
     crate_root = "boot_info.rs",
+    size = "small",
 )

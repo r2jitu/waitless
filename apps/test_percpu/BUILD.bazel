@@ -37,5 +37,5 @@ unikernel_app_test(
         "exclusive",
         "local",
     ],
-    timeout = "long",
+    timeout = "short",
 )

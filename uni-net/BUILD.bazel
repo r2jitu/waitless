@@ -70,4 +70,5 @@ rust_test(
     name = "error_test",
     srcs = ["error.rs"],
     crate_root = "error.rs",
+    size = "small",
 )
