@@ -29,8 +29,8 @@ register_toolchains("@bazel_tools//tools/python:autodetecting_toolchain")
 # aarch64 bare-metal target. x86_64-unknown-none is already registered.
 single_version_override(
     module_name = "rules_rust",
-    patches = ["//bazel/patches:rules_rust_aarch64_none.patch"],
     patch_strip = 1,
+    patches = ["//bazel/patches:rules_rust_aarch64_none.patch"],
 )
 
 register_toolchains(
@@ -153,8 +153,8 @@ _X86_TRIPLES = [
 [
     crate.annotation_select(
         crate = name,
-        triples = _X86_TRIPLES,
         rustc_flags = [_X86_CRYPTO_FLAG],
+        triples = _X86_TRIPLES,
     )
     for name in (
         "aes",
@@ -197,10 +197,9 @@ crate.annotation(
 # portable "serial" backend instead of the "simd" one that assumes
 # AVX2 is on by default. (The target-feature flag is handled above.)
 crate.annotation(
-    crate = "curve25519-dalek",
     build_script_env = {
         "CARGO_CFG_CURVE25519_DALEK_BACKEND": "serial",
     },
+    crate = "curve25519-dalek",
 )
-
 use_repo(crate, "crates")

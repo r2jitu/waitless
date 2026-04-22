@@ -1,5 +1,5 @@
 load("@rules_rust//rust:defs.bzl", "rust_library")
-load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS", "rust_test")
+load("//bazel/rules:rust.bzl", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -8,15 +8,14 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "types",
     srcs = ["types.rs"],
-    crate_root = "types.rs",
     crate_name = "net_types",
-    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    crate_root = "types.rs",
 )
 
 rust_test(
     name = "types_test",
-    crate = ":types",
     size = "small",
+    crate = ":types",
 )
 
 # Safe `try_ref_from(&[u8]) -> Option<&Self>` for packed packet headers.
@@ -25,15 +24,14 @@ rust_test(
 rust_library(
     name = "from_bytes",
     srcs = ["from_bytes.rs"],
-    crate_root = "from_bytes.rs",
     crate_name = "net_from_bytes",
-    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    crate_root = "from_bytes.rs",
 )
 
 rust_test(
     name = "from_bytes_test",
-    crate = ":from_bytes",
     size = "small",
+    crate = ":from_bytes",
 )
 
 # IP protocol dispatch registry — replaces hardcoded TCP/UDP match in
@@ -44,9 +42,8 @@ rust_test(
 rust_library(
     name = "protocol",
     srcs = ["protocol.rs"],
-    crate_root = "protocol.rs",
     crate_name = "net_protocol",
-    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    crate_root = "protocol.rs",
     deps = ["//util/atomic_fn"],
 )
 
@@ -61,26 +58,25 @@ rust_library(
 # and are still no_std + abort. No sibling target, no inline shim.
 rust_test(
     name = "protocol_test",
+    size = "small",
     srcs = ["protocol.rs"],
     crate_root = "protocol.rs",
     deps = ["//util/atomic_fn"],
-    size = "small",
 )
 
 # Protocol parsing tests — host-native, tests raw byte parsing for all protocols.
 # No deps on bare-metal crates (panic=abort incompatible with test harness).
 rust_test(
     name = "protocol_tests",
-    srcs = ["protocol_tests.rs"],
     size = "small",
+    srcs = ["protocol_tests.rs"],
 )
 
 rust_library(
     name = "ethernet",
     srcs = ["ethernet.rs"],
-    crate_root = "ethernet.rs",
     crate_name = "net_ethernet",
-    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    crate_root = "ethernet.rs",
     deps = [
         ":from_bytes",
         ":types",
@@ -91,13 +87,12 @@ rust_library(
 rust_library(
     name = "arp",
     srcs = ["arp.rs"],
-    crate_root = "arp.rs",
     crate_name = "net_arp",
-    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    crate_root = "arp.rs",
     deps = [
+        ":ethernet",
         ":from_bytes",
         ":types",
-        ":ethernet",
         "//drivers",
         "//kernel",
     ],
@@ -106,14 +101,13 @@ rust_library(
 rust_library(
     name = "ipv4",
     srcs = ["ipv4.rs"],
-    crate_root = "ipv4.rs",
     crate_name = "net_ipv4",
-    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    crate_root = "ipv4.rs",
     deps = [
+        ":arp",
+        ":ethernet",
         ":from_bytes",
         ":types",
-        ":ethernet",
-        ":arp",
         "//kernel",
     ],
 )
@@ -121,13 +115,12 @@ rust_library(
 rust_library(
     name = "tcp",
     srcs = ["tcp.rs"],
-    crate_root = "tcp.rs",
     crate_name = "net_tcp",
-    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    crate_root = "tcp.rs",
     deps = [
         ":from_bytes",
-        ":types",
         ":ipv4",
+        ":types",
         "//kernel",
         "@crates//:bitflags",
     ],
@@ -136,13 +129,12 @@ rust_library(
 rust_library(
     name = "udp",
     srcs = ["udp.rs"],
-    crate_root = "udp.rs",
     crate_name = "net_udp",
-    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    crate_root = "udp.rs",
     deps = [
         ":from_bytes",
-        ":types",
         ":ipv4",
+        ":types",
         "//kernel",
     ],
 )
@@ -164,9 +156,8 @@ rust_library(
 rust_library(
     name = "tls_crypto",
     srcs = ["tls_crypto.rs"],
-    crate_root = "tls_crypto.rs",
     crate_name = "net_tls_crypto",
-    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    crate_root = "tls_crypto.rs",
     deps = [
         "@crates//:chacha20poly1305",
     ],
@@ -183,15 +174,14 @@ rust_library(
 rust_library(
     name = "tls_handshake",
     srcs = ["tls_handshake.rs"],
-    crate_root = "tls_handshake.rs",
     crate_name = "net_tls_handshake",
-    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    crate_root = "tls_handshake.rs",
 )
 
 rust_test(
     name = "tls_handshake_test",
-    crate = ":tls_handshake",
     size = "small",
+    crate = ":tls_handshake",
 )
 
 # TLS 1.3 record layer: wraps plaintext records in TLSCiphertext using
@@ -200,9 +190,8 @@ rust_test(
 rust_library(
     name = "tls_record",
     srcs = ["tls_record.rs"],
-    crate_root = "tls_record.rs",
     crate_name = "net_tls_record",
-    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    crate_root = "tls_record.rs",
     deps = [
         ":tls",
         ":tls_crypto",
@@ -241,8 +230,8 @@ rust_library(
         "tls_server_profile.rs",
         "tls_server_trace.rs",
     ],
-    crate_root = "tls_server.rs",
     crate_name = "net_tls_server",
+    crate_root = "tls_server.rs",
     # `--check-cfg=cfg(tls_debug)` declares the custom cfg to rustc's
     # unexpected-cfg lint so that `#[cfg(tls_debug)]` doesn't warn
     # when the flag is absent (the common case). Project-wide
@@ -256,7 +245,7 @@ rust_library(
     # block at the bottom of tls_server.rs is never built as a
     # rust_test target (no panic=unwind toolchain for it) but still
     # needs to be syntactically valid.
-    rustc_flags = UNIKERNEL_RUSTC_FLAGS + [
+    rustc_flags = [
         "--check-cfg=cfg(tls_debug)",
         "--check-cfg=cfg(test)",
     ],
@@ -288,9 +277,8 @@ rust_library(
 rust_library(
     name = "tls",
     srcs = ["tls.rs"],
-    crate_root = "tls.rs",
     crate_name = "net_tls",
-    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    crate_root = "tls.rs",
     deps = [
         ":tls_crypto",
         "@crates//:hkdf",
@@ -312,15 +300,14 @@ rust_library(
 rust_library(
     name = "dhcp",
     srcs = ["dhcp.rs"],
-    crate_root = "dhcp.rs",
     crate_name = "net_dhcp",
-    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
+    crate_root = "dhcp.rs",
     deps = [
-        ":from_bytes",
-        ":types",
-        ":ethernet",
         ":arp",
+        ":ethernet",
+        ":from_bytes",
         ":ipv4",
+        ":types",
         "//drivers",
         "//kernel",
     ],
@@ -331,16 +318,15 @@ rust_library(
 rust_library(
     name = "net",
     srcs = ["lib.rs"],
-    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
     deps = [
-        ":types",
-        ":ethernet",
         ":arp",
-        ":ipv4",
-        ":tcp",
-        ":udp",
         ":dhcp",
+        ":ethernet",
+        ":ipv4",
         ":protocol",
+        ":tcp",
+        ":types",
+        ":udp",
         "//drivers",
         "//kernel",
     ],

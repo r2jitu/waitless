@@ -6,7 +6,6 @@ into bootable kernel images using rustc + rust-lld.
 
 load("@bazel_skylib//rules:write_file.bzl", "write_file")
 load("@rules_rust//rust:defs.bzl", "rust_binary")
-load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 load("//bazel/rules:variants.bzl", "unikernel_variants")
 
 # ── Public launch-config helpers ─────────────────────────────────────────
@@ -97,6 +96,47 @@ def _label_crate_name(label):
         target = label.rsplit("/", 1)[-1]
     return target.replace("-", "_")
 
+# Threads `-Cpanic=abort` (+ aarch64 PIC, required by the PIE kernel's
+# runtime relocations) through every rlib in the dep graph for direct
+# `bazel build :<name>.elf` invocations. The variant rules in
+# `//bazel/rules:variants.bzl` do the same for `:<name>_{hvf,iso_*,qemu_*}`.
+def _unikernel_elf_transition_impl(settings, _attr):
+    is_aarch64 = any([
+        p.package == "bazel/platforms" and p.name.startswith("aarch64")
+        for p in settings["//command_line_option:platforms"]
+    ])
+    flags = ["-Cpanic=abort"]
+    if is_aarch64:
+        flags = flags + ["-Crelocation-model=pic"]
+    return {"@rules_rust//:extra_rustc_flag": flags}
+
+_unikernel_elf_transition = transition(
+    implementation = _unikernel_elf_transition_impl,
+    inputs = ["//command_line_option:platforms"],
+    outputs = ["@rules_rust//:extra_rustc_flag"],
+)
+
+def _unikernel_elf_impl(ctx):
+    binary = ctx.attr.binary[0]
+    return [DefaultInfo(
+        files = binary[DefaultInfo].files,
+        runfiles = binary[DefaultInfo].default_runfiles,
+    )]
+
+_unikernel_elf = rule(
+    implementation = _unikernel_elf_impl,
+    attrs = {
+        "binary": attr.label(
+            cfg = _unikernel_elf_transition,
+            mandatory = True,
+            allow_files = True,
+        ),
+        "_allowlist_function_transition": attr.label(
+            default = "@bazel_tools//tools/allowlists/function_transition_allowlist",
+        ),
+    },
+)
+
 def unikernel_binary(
         name,
         app,
@@ -169,23 +209,13 @@ def unikernel_binary(
     # is added per-target below since it's incompatible with higher-half
     # linking and only needed for the QEMU direct-boot ELF.
     _common_deps = [app, "//boot:entry", "//boot:limine", "//boot:libc"] + drivers
-    _unikernel_flags = UNIKERNEL_RUSTC_FLAGS + _LINK_FLAGS + _LINK_FLAGS_ARCH
+    _unikernel_flags = _LINK_FLAGS + _LINK_FLAGS_ARCH
 
-    # ── Generated unikernel_main.rs ──────────────────────────────────────
-    #
-    # Each NIC driver crate registers itself via
-    # `register_ethernet_driver!`, which emits a `#[used]` static into
-    # the `.uni_drivers_ethernet` linker section. Without a path-level
-    # reference from the binary crate, rustc does rlib-level DCE and
-    # the whole rlib (and thus the section entry) gets dropped. So we
-    # generate a per-binary main.rs that `extern crate`s each driver
-    # at the binary crate root — rustc honours `extern crate` in a
-    # binary crate as a link-forcing reference.
-    #
-    # We can't put the `extern crate` inside a sub-rlib (e.g. a shim
-    # library): rustc's rlib DCE kicks in one level up — if nothing in
-    # the binary reaches items in the shim's rlib, the shim is dropped
-    # and its `extern crate` declarations go with it.
+    # Per-binary main.rs with `extern crate` for each driver. rustc
+    # drops rlibs with no path reference from the binary crate root,
+    # which would kill the `#[used]` entries in `.uni_drivers_ethernet`.
+    # Must be the binary crate root: the same `extern crate` inside a
+    # sub-rlib is itself DCE'd.
     main_src_rule = name + "_main_src"
     main_rs = name + "_unikernel_main.rs"
     main_content = [
@@ -218,7 +248,7 @@ def unikernel_binary(
 
     # ── Unikernel ELF ────────────────────────────────────────────────────
     rust_binary(
-        name = name + ".elf",
+        name = name + ".elf_inner",
         crate_name = name + "_elf",
         srcs = [":" + main_src_rule],
         crate_root = main_rs,
@@ -231,6 +261,12 @@ def unikernel_binary(
             "//conditions:default": "//bazel/toolchain:unikernel.ld",
         }),
         rustc_flags = _unikernel_flags,
+        target_compatible_with = _unikernel_only,
+        visibility = ["//visibility:private"],
+    )
+    _unikernel_elf(
+        name = name + ".elf",
+        binary = ":" + name + ".elf_inner",
         target_compatible_with = _unikernel_only,
         visibility = visibility,
     )
@@ -273,13 +309,19 @@ def unikernel_binary(
     # globally so all Rust crates emit R_X86_64_32S (signed) relocations
     # that fit the top-2GB region.
     rust_binary(
-        name = name + ".limine.elf",
+        name = name + ".limine.elf_inner",
         crate_name = name + "_limine_elf",
         srcs = [":" + main_src_rule],
         crate_root = main_rs,
         deps = _common_deps,
         linker_script = "//bazel/toolchain:unikernel_limine.ld",
         rustc_flags = _unikernel_flags,
+        target_compatible_with = _unikernel_only,
+        visibility = ["//visibility:private"],
+    )
+    _unikernel_elf(
+        name = name + ".limine.elf",
+        binary = ":" + name + ".limine.elf_inner",
         target_compatible_with = _unikernel_only,
         visibility = visibility,
     )

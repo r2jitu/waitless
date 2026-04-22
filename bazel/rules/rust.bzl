@@ -1,18 +1,12 @@
 """Shared Rust build configuration for unikernel crates.
 
 Common rustc_flags (panic=abort, opt-level=2) are set globally in .bazelrc
-via --@rules_rust//:extra_rustc_flags. This file provides the per-target
-symbolic flag lists.
+via --@rules_rust//:extra_rustc_flags. `-Cpanic=abort` and aarch64 PIC
+are threaded through unikernel binaries via Bazel transitions in
+`//bazel/rules:{unikernel,variants}.bzl` — see those files.
 """
 
 load("@rules_rust//rust:defs.bzl", _rust_proc_macro = "rust_proc_macro", _rust_test = "rust_test")
-
-# ARM64 unikernel targets need PIC for position-independent ELF
-# (boot.S applies relocations at runtime). x86_64 and native don't.
-UNIKERNEL_RUSTC_FLAGS = select({
-    "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
-    "//conditions:default": [],
-})
 
 # `bazel build ...` would otherwise try to compile every rust_test
 # under the global `-Cpanic=abort`, which rustc rejects for test

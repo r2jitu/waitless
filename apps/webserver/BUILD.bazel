@@ -1,6 +1,5 @@
 load("@rules_python//python:defs.bzl", "py_test")
 load("@rules_rust//rust:defs.bzl", "rust_library")
-load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 load("//bazel/rules:unikernel.bzl", "port_fwd", "unikernel_binary")
 load("//bazel/rules:variants.bzl", "unikernel_app_test")
 
@@ -14,7 +13,6 @@ rust_library(
         "//apps/webserver/dev_certs:dev_cert.der",
         "//apps/webserver/dev_certs:dev_key.der",
     ],
-    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
     deps = [
         "//uni",
         "//uni-http",

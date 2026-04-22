@@ -1,5 +1,4 @@
 load("@rules_rust//rust:defs.bzl", "rust_library")
-load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -23,7 +22,6 @@ rust_library(
     name = "uni-kernel",
     srcs = ["src/lib.rs"],
     crate_name = "uni_kernel",
-    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
     target_compatible_with = ["@platforms//os:none"],
     deps = [
         "//drivers",

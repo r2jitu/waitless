@@ -1,5 +1,4 @@
 load("@rules_rust//rust:defs.bzl", "rust_library")
-load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 load("//bazel/rules:unikernel.bzl", "port_fwd", "unikernel_binary")
 
 package(default_visibility = ["//visibility:public"])
@@ -11,7 +10,6 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "app",
     srcs = ["main.rs"],
-    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
     deps = [
         "//uni",
         "//uni-http",

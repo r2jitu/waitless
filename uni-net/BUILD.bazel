@@ -1,5 +1,5 @@
 load("@rules_rust//rust:defs.bzl", "rust_library")
-load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS", "rust_test")
+load("//bazel/rules:rust.bzl", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -27,7 +27,6 @@ rust_library(
     ],
     crate_name = "uni_net_driver",
     crate_root = "driver.rs",
-    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
 )
 
 # ── Main uni_net crate ─────────────────────────────────────────────
@@ -44,7 +43,6 @@ rust_library(
     ],
     crate_name = "uni_net",
     crate_root = "lib.rs",
-    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
     deps = [":driver"] + select({
         "//bazel/platforms:native": [],
         "//conditions:default": ["//net"],

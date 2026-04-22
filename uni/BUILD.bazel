@@ -1,5 +1,5 @@
 load("@rules_rust//rust:defs.bzl", "rust_library")
-load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS", "rust_test")
+load("//bazel/rules:rust.bzl", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -11,7 +11,6 @@ rust_library(
         "rng.rs",
     ],
     proc_macro_deps = ["//uni/macros:uni_macros"],
-    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
     # `//uni-net` owns everything net-stack-related (Net::enable,
     # NetBringUp, error types, EthernetDriver trait, and the
     # transitive TCP/UDP/TLS umbrella). `uni` re-exports it as

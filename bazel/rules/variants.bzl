@@ -42,16 +42,16 @@ rust_binary — a direct host executable, no launcher script required.)
 #   * `//command_line_option:platforms` — target platform.
 #   * `//bazel/rules:uni_runner`        — string_flag driving runner
 #                                         config_settings.
-#   * `@rules_rust//:extra_rustc_flag`  — `-Cpanic=abort` (overrides
-#                                         the `test`-verb unwind).
+#   * `@rules_rust//:extra_rustc_flag`  — `-Cpanic=abort`, plus aarch64
+#                                         PIC (PIE kernel + runtime
+#                                         relocations in boot.S).
+#                                         Propagates to every rlib in
+#                                         the sub-graph; leaf BUILDs
+#                                         don't set `rustc_flags`.
 #   * `//bazel/rules:tests_need_std`    — False so atomic_fn stays
 #                                         no_std inside the sub-graph.
-#
-# Starlark requires `transition()` at .bzl load time, so we build the
-# four concrete objects here via the shared helper and reference them
-# from _VARIANT_SPECS below.
 
-def _make_variant_transition(platform, uni_runner):
+def _make_variant_transition(platform, uni_runner, target_arch):
     outputs = [
         "//bazel/rules:uni_runner",
         "@rules_rust//:extra_rustc_flag",
@@ -60,10 +60,14 @@ def _make_variant_transition(platform, uni_runner):
     if platform != None:
         outputs.append("//command_line_option:platforms")
 
+    rustc_flags = ["-Cpanic=abort"]
+    if target_arch == "aarch64":
+        rustc_flags = rustc_flags + ["-Crelocation-model=pic"]
+
     def _impl(_settings, _attr):
         out = {
             "//bazel/rules:uni_runner": uni_runner,
-            "@rules_rust//:extra_rustc_flag": ["-Cpanic=abort"],
+            "@rules_rust//:extra_rustc_flag": rustc_flags,
             "//bazel/rules:tests_need_std": False,
         }
         if platform != None:
@@ -75,24 +79,28 @@ def _make_variant_transition(platform, uni_runner):
 _hvf_transition = _make_variant_transition(
     platform = "//bazel/platforms:aarch64_unikernel",
     uni_runner = "hvf",
+    target_arch = "aarch64",
 )
 _iso_x86_64_transition = _make_variant_transition(
     platform = "//bazel/platforms:x86_64_unikernel",
     uni_runner = "iso",
+    target_arch = "x86_64",
 )
 _iso_aarch64_transition = _make_variant_transition(
     platform = "//bazel/platforms:aarch64_unikernel",
     uni_runner = "iso",
+    target_arch = "aarch64",
 )
 _qemu_aarch64_transition = _make_variant_transition(
     platform = "//bazel/platforms:aarch64_unikernel",
     uni_runner = "qemu",
+    target_arch = "aarch64",
 )
 _qemu_x86_64_transition = _make_variant_transition(
     platform = "//bazel/platforms:x86_64_unikernel",
     uni_runner = "qemu",
+    target_arch = "x86_64",
 )
-
 
 # ── Variant rule helpers ───────────────────────────────────────────────────
 
@@ -195,6 +203,7 @@ def _hvf_impl(ctx):
         ctx.attr.img[0][DefaultInfo].files.to_list()[0],
         ctx.label.name + ".img",
     )
+
     # `hvf_runner` is a host-cfg label (no [0], no transition); consume
     # it from its natural runfiles path via a launcher-relative path,
     # same pattern used for `helpers.sh` in the iso / qemu variants.
@@ -512,7 +521,9 @@ _VARIANT_SPECS = [
 _SUFFIX_TO_SPEC = {spec.suffix: spec for spec in _VARIANT_SPECS}
 _ALL_VARIANT_SUFFIXES = tuple([v.suffix for v in _VARIANT_SPECS])
 _DEFAULT_TEST_VARIANT_SUFFIXES = tuple([
-    v.suffix for v in _VARIANT_SPECS if v.in_default_test_set
+    v.suffix
+    for v in _VARIANT_SPECS
+    if v.in_default_test_set
 ])
 
 def _instantiate_variant(spec, name, base, vm_config, visibility):
@@ -529,6 +540,7 @@ def _instantiate_variant(spec, name, base, vm_config, visibility):
         kwargs[attr_name] = ":" + base + suffix
     for attr_name, label in spec.host_attrs.items():
         kwargs[attr_name] = label
+
     # Per-runner port-forward attr (e.g. HVF's `hvf_port_flags` vs
     # QEMU/ISO's `qemu_hostfwd`) — spec picks the builder.
     kwargs.update(spec.port_forward_kwargs(vm_config.port_forwards))
@@ -642,6 +654,7 @@ def unikernel_app_test(name, app_base, test_rule, extra_data = None, variants = 
             ))
         spec = _SUFFIX_TO_SPEC[suffix]
         launcher_name = app_base + "_" + suffix
+
         # Per-variant source copy. py_test registers a `PyCompile`
         # action keyed on its srcs, and multiple py_test targets
         # sharing the same source file collide on the resulting
@@ -657,6 +670,7 @@ def unikernel_app_test(name, app_base, test_rule, extra_data = None, variants = 
             outs = [variant_src],
             cmd = "cp $< $@",
         )
+
         # Tags: caller-supplied + the variant's own suffix + any
         # umbrella tags from the spec (e.g. "qemu" for both qemu
         # archs). Lets `--test_tag_filters=hvf` / `=qemu` /

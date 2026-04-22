@@ -46,7 +46,6 @@ rust_binary(
 genrule(
     name = "run_hvf",
     srcs = ["run-hvf.entitlements"],
-    tools = [":run_hvf_unsigned"],
     outs = ["run-hvf"],
     cmd = " && ".join([
         "cp $(execpath :run_hvf_unsigned) $@",
@@ -54,4 +53,5 @@ genrule(
         "codesign --sign - --entitlements $(location run-hvf.entitlements) --force $@ 2>/dev/null",
     ]),
     executable = True,
+    tools = [":run_hvf_unsigned"],
 )

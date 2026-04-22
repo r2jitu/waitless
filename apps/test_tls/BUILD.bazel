@@ -1,6 +1,5 @@
 load("@rules_python//python:defs.bzl", "py_test")
 load("@rules_rust//rust:defs.bzl", "rust_library")
-load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 load("//bazel/rules:unikernel.bzl", "unikernel_binary")
 load("//bazel/rules:variants.bzl", "unikernel_app_test")
 
@@ -9,15 +8,14 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "app",
     srcs = ["main.rs"],
-    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
     # No `//kernel` dep: the test used to hit `kernel::rng` directly,
     # which pinned the app to the unikernel platform; it now goes
     # through `uni::rng::fill_bytes` (platform-agnostic wrapper), so
     # the whole test runs natively too.
     deps = [
-        "//uni",
         "//net:tls",
         "//net:tls_crypto",
+        "//uni",
     ],
 )
 
@@ -34,13 +32,13 @@ unikernel_binary(
 # the crypto routines orders of magnitude faster than HVF/QEMU.
 unikernel_app_test(
     name = "test",
-    app_base = "test_tls",
-    test_rule = py_test,
+    timeout = "short",
     srcs = ["test.py"],
-    deps = ["//scripts:test_helpers"],
+    app_base = "test_tls",
     tags = [
         "exclusive",
         "local",
     ],
-    timeout = "short",
+    test_rule = py_test,
+    deps = ["//scripts:test_helpers"],
 )

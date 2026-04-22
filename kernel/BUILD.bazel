@@ -1,5 +1,5 @@
 load("@rules_rust//rust:defs.bzl", "rust_library")
-load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS", "rust_test")
+load("//bazel/rules:rust.bzl", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -11,16 +11,16 @@ rust_library(
         "deque.rs",
         "eventloop.rs",
         "lib.rs",
+        "mm.rs",
         "mmio.rs",
         "once.rs",
         "percpu.rs",
         "rng.rs",
+        "serial.rs",
         "spsc.rs",
         "sync.rs",
-        "timer.rs",
-        "mm.rs",
-        "serial.rs",
         "time.rs",
+        "timer.rs",
         "types.rs",
     ] + select({
         "//bazel/platforms:x86_64": [
@@ -34,13 +34,12 @@ rust_library(
         "//bazel/platforms:aarch64": [
             "aarch64/exceptions.rs",
             "aarch64/fdt.rs",
-            "aarch64/mod.rs",
             "aarch64/mmu.rs",
+            "aarch64/mod.rs",
             "aarch64/smp.rs",
         ],
         "//conditions:default": [],
     }),
-    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
     # Unikernel-only: links against MMU / APIC / IDT / boot-section
     # code that only makes sense under a bare-metal target. Host
     # compilation hits mach-o-unfriendly `#[link_section = ".boot_bss"]`
@@ -65,42 +64,42 @@ rust_library(
 # — see that file for the full explanation.
 rust_test(
     name = "deque_test",
+    size = "small",
     srcs = ["deque.rs"],
     crate_root = "deque.rs",
-    size = "small",
 )
 
 rust_test(
     name = "bump_test",
+    size = "small",
     srcs = ["bump.rs"],
     crate_root = "bump.rs",
-    size = "small",
 )
 
 rust_test(
     name = "spsc_test",
+    size = "small",
     srcs = ["spsc.rs"],
     crate_root = "spsc.rs",
-    size = "small",
 )
 
 rust_test(
     name = "once_test",
+    size = "small",
     srcs = ["once.rs"],
     crate_root = "once.rs",
-    size = "small",
 )
 
 rust_test(
     name = "sync_test",
+    size = "small",
     srcs = ["sync.rs"],
     crate_root = "sync.rs",
-    size = "small",
 )
 
 rust_test(
     name = "timer_test",
+    size = "small",
     srcs = ["timer.rs"],
     crate_root = "timer.rs",
-    size = "small",
 )
