@@ -48,7 +48,24 @@ fi
 [[ -f "$LIMINE_CONF" ]] || die "limine.conf not found: $LIMINE_CONF"
 
 # --- Fetch Limine binaries (cached in project root) ---
+#
+# Multiple `*.iso` genrules can run in parallel (one per app) and
+# they all point at the same cache dir, so the fetch + build steps
+# need a cross-process lock. `mkdir` is atomic on every POSIX
+# filesystem — first caller wins the directory, others spin on its
+# existence. macOS has no `flock(1)`, so we can't use that.
 LIMINE_DIR="$PROJECT_ROOT/.cache/limine"
+LIMINE_LOCK="$PROJECT_ROOT/.cache/.limine.lock"
+mkdir -p "$PROJECT_ROOT/.cache"
+
+ISO_ROOT=""
+cleanup() {
+    rmdir "$LIMINE_LOCK" 2>/dev/null || true
+    [[ -n "$ISO_ROOT" ]] && rm -rf "$ISO_ROOT"
+}
+trap cleanup EXIT
+
+while ! mkdir "$LIMINE_LOCK" 2>/dev/null; do sleep 0.2; done
 
 if [[ ! -d "$LIMINE_DIR" ]]; then
     echo "[ISO] Fetching Limine bootloader..."
@@ -62,9 +79,10 @@ if [[ ! -f "$LIMINE_DIR/limine" ]]; then
     make -C "$LIMINE_DIR" 2>/dev/null
 fi
 
+rmdir "$LIMINE_LOCK" 2>/dev/null || true
+
 # --- Create ISO directory structure ---
 ISO_ROOT=$(mktemp -d)
-trap 'rm -rf "$ISO_ROOT"' EXIT
 
 mkdir -p "$ISO_ROOT/boot/limine"
 mkdir -p "$ISO_ROOT/EFI/BOOT"
