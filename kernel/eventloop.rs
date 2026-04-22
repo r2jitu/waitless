@@ -102,10 +102,7 @@ pub fn is_shutdown() -> bool {
 pub fn run(core_id: u32) -> ! {
     // Wait for the app to finish initialization before processing.
     while !READY.load(Ordering::Acquire) && !is_shutdown() {
-        #[cfg(target_arch = "aarch64")]
-        unsafe { core::arch::asm!("wfi", options(nomem, nostack)); }
-        #[cfg(target_arch = "x86_64")]
-        unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
+        crate::cpu::idle_unbounded();
     }
 
 
@@ -224,10 +221,7 @@ pub fn run(core_id: u32) -> ! {
             if let Some(f) = IDLE.load() {
                 f(core_id);
             } else {
-                #[cfg(target_arch = "aarch64")]
-                unsafe { core::arch::asm!("wfi", options(nomem, nostack)); }
-                #[cfg(target_arch = "x86_64")]
-                unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
+                crate::cpu::idle_unbounded();
             }
         }
     }

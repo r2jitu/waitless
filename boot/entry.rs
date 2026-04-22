@@ -619,17 +619,19 @@ fn idle_cb(core_id: u32) {
     if core_id == 0 || kernel::percpu::num_cores() <= 1 {
         uni::wait_for_events();
     } else {
+        // AP idle. On aarch64 + HVF we write the core_id to the
+        // yield register (vs the BSP's `write 0`) so the runner
+        // knows which vCPU thread to park. Falls back to a plain
+        // WFI/HLT when the yield register isn't present.
         #[cfg(target_arch = "aarch64")]
         {
             let yield_addr = kernel::aarch64::fdt::info().yield_mmio_base;
             if yield_addr != 0 {
                 unsafe { core::ptr::write_volatile(yield_addr as *mut u32, core_id); }
-            } else {
-                unsafe { core::arch::asm!("wfi", options(nomem, nostack)); }
+                return;
             }
         }
-        #[cfg(target_arch = "x86_64")]
-        unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
+        kernel::cpu::idle_unbounded();
     }
 }
 

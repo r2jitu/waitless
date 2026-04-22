@@ -7,6 +7,7 @@ rust_library(
     name = "kernel",
     srcs = [
         "bump.rs",
+        "cpu.rs",
         "deque.rs",
         "eventloop.rs",
         "lib.rs",
