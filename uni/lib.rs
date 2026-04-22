@@ -201,6 +201,12 @@ mod backend {
                        recv as tcp_recv, send as tcp_send, close as tcp_close,
                        is_closed as tcp_is_closed, listen_on_core as tcp_listen_on};
     pub use net::poll as tcp_poll;
+    pub use net::udp::{bind as udp_bind, send as udp_send};
+    pub use drivers::net::{
+        rx_counts as net_rx_counts,
+        num_queue_pairs as net_num_queue_pairs,
+        rx_used_cursors as net_rx_used_cursors,
+    };
 
     // Event loop
     pub fn num_workers() -> u32 { kernel::percpu::num_cores() }
@@ -215,6 +221,20 @@ mod backend {
     /// that target both unikernel and native can call this unconditionally
     /// and the unikernel side is simply a shim.
     pub fn register_io_poll(_f: fn(u32) -> bool) {}
+
+    /// Heap counters from the bare-metal talc allocator. Cheap —
+    /// O(1) read under the allocator spinlock.
+    pub fn heap_stats() -> crate::HeapStats {
+        let s = kernel::mm::heap_stats();
+        crate::HeapStats {
+            allocated_bytes: s.allocated_bytes,
+            available_bytes: s.available_bytes,
+            claimed_bytes: s.claimed_bytes,
+            allocation_count: s.allocation_count,
+            fragment_count: s.fragment_count,
+            total_allocation_count: s.total_allocation_count,
+        }
+    }
 }
 
 /// Native-platform dispatch — pure re-export from the `uni_native`
@@ -222,14 +242,25 @@ mod backend {
 /// event loop). Sits behind the same `mod backend` shape as the
 /// unikernel dispatch above so the cross-platform `pub use
 /// backend::…` block below works uniformly.
+///
+/// Driver-specific queries (`net_rx_counts` etc.) are stubs here —
+/// native has no NIC driver; POSIX sockets go through the host stack.
+/// Likewise `heap_stats` returns `Default` because libstd's allocator
+/// doesn't expose the talc-style counters.
 #[cfg(not(target_os = "none"))]
 mod backend {
     pub use uni_native::{
         log, config_port, config_tls_port, check_shutdown, wait_for_events,
         tcp_listen, tcp_accept, tcp_has_data, tcp_recv, tcp_send, tcp_close,
-        tcp_is_closed, tcp_poll, tcp_listen_on,
+        tcp_is_closed, tcp_poll, tcp_listen_on, udp_bind, udp_send,
         num_workers, register_io_poll, set_service, set_ready, request_shutdown,
     };
+
+    pub fn net_rx_counts() -> [u64; 8] { [0; 8] }
+    pub fn net_num_queue_pairs() -> u16 { 1 }
+    pub fn net_rx_used_cursors() -> [(u16, u16); 8] { [(0, 0); 8] }
+
+    pub fn heap_stats() -> crate::HeapStats { crate::HeapStats::default() }
 }
 
 // ---- Re-exported platform functions ------------------------------------------
@@ -253,49 +284,38 @@ pub fn cpu_id() -> u32 {
 // ---- UDP --------------------------------------------------------------------
 
 /// Bind a UDP port handler. Callback receives (src_ip_octets, src_port, payload).
-#[cfg(target_os = "none")]
 pub fn udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
-    net::udp::bind(port, handler);
+    backend::udp_bind(port, handler);
 }
+
+/// Send a UDP datagram.
+pub fn udp_send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
+    backend::udp_send(dst_ip, src_port, dst_port, data);
+}
+
+// ---- NIC driver diagnostics -------------------------------------------------
+//
+// Unikernel paths return driver-reported counters; native stubs out all
+// three (no NIC driver — POSIX sockets go through the host stack) so
+// callers stay platform-agnostic.
 
 /// Per-queue RX frame counts. Indexed by queue-pair number; zeros
 /// for unused queues. Useful for debugging RSS / flow-hash imbalance
 /// under Tier 1 multi-queue. Max array size matches the driver's
 /// MAX_QUEUE_PAIRS (8); consumers should take `[..num_queue_pairs()]`
 /// or just ignore the tail zeros.
-#[cfg(target_os = "none")]
-pub fn net_rx_counts() -> [u64; 8] {
-    drivers::net::rx_counts()
-}
-#[cfg(not(target_os = "none"))]
-pub fn net_rx_counts() -> [u64; 8] { [0; 8] }
+pub fn net_rx_counts() -> [u64; 8] { backend::net_rx_counts() }
 
 /// Number of virtio-net queue pairs actually active (after MQ
 /// activation on Tier 1 paths). 1 for single-queue / Tier 2.
-#[cfg(target_os = "none")]
-pub fn net_num_queue_pairs() -> u16 {
-    drivers::net::num_queue_pairs()
-}
-#[cfg(not(target_os = "none"))]
-pub fn net_num_queue_pairs() -> u16 { 1 }
+pub fn net_num_queue_pairs() -> u16 { backend::net_num_queue_pairs() }
 
 /// Per-RX-queue `(device_idx, driver_cursor)` used-ring snapshots.
 /// See `drivers::net::rx_used_cursors` for interpretation —
 /// lets `/stats` surface whether traffic is stuck on the device side
 /// (Andromeda not distributing) vs. the driver side (we're not
 /// polling qp N fast enough).
-#[cfg(target_os = "none")]
-pub fn net_rx_used_cursors() -> [(u16, u16); 8] {
-    drivers::net::rx_used_cursors()
-}
-#[cfg(not(target_os = "none"))]
-pub fn net_rx_used_cursors() -> [(u16, u16); 8] { [(0, 0); 8] }
-
-/// Send a UDP datagram.
-#[cfg(target_os = "none")]
-pub fn udp_send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
-    net::udp::send(dst_ip, src_port, dst_port, data);
-}
+pub fn net_rx_used_cursors() -> [(u16, u16); 8] { backend::net_rx_used_cursors() }
 
 // ---- Heap stats -------------------------------------------------------------
 
@@ -315,33 +335,7 @@ pub struct HeapStats {
 
 /// Snapshot the heap. Cheap on bare-metal (O(1) + spinlock); best-
 /// effort zero on native.
-#[cfg(target_os = "none")]
-pub fn heap_stats() -> HeapStats {
-    let s = kernel::mm::heap_stats();
-    HeapStats {
-        allocated_bytes: s.allocated_bytes,
-        available_bytes: s.available_bytes,
-        claimed_bytes: s.claimed_bytes,
-        allocation_count: s.allocation_count,
-        fragment_count: s.fragment_count,
-        total_allocation_count: s.total_allocation_count,
-    }
-}
-
-#[cfg(not(target_os = "none"))]
-pub fn heap_stats() -> HeapStats {
-    HeapStats::default()
-}
-
-#[cfg(not(target_os = "none"))]
-pub fn udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
-    uni_native::udp_bind(port, handler);
-}
-
-#[cfg(not(target_os = "none"))]
-pub fn udp_send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
-    uni_native::udp_send(dst_ip, src_port, dst_port, data);
-}
+pub fn heap_stats() -> HeapStats { backend::heap_stats() }
 
 // ---- TcpListener ------------------------------------------------------------
 
