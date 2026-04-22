@@ -216,6 +216,50 @@ fn parse_u16(s: *const u8) -> u16 {
     n as u16
 }
 
+/// Read the `UNIKERNEL_<PROTO>_<GUEST>` env-var override (e.g.
+/// `UNIKERNEL_TCP_80`), returning the parsed port or `None` when
+/// unset / empty. Matches the name derivation baked into the VM
+/// launchers by `variants.bzl`, so `UNIKERNEL_TCP_80=18080
+/// :<app>_native` and `… :<app>_hvf` both bind to the same host
+/// port.
+///
+/// `proto` must be one of the ASCII strings `"TCP"` / `"UDP"`.
+/// Hand-rolled byte buffer (no_std, no `alloc::format!`): builds
+/// `UNIKERNEL_<proto>_<port>\0` on the stack and hands it to
+/// `getenv`. 24 bytes fits `UNIKERNEL_TCP_65535\0` with room to
+/// spare.
+fn read_port_env(proto: &[u8; 3], guest_port: u16) -> Option<u16> {
+    let mut buf = [0u8; 24];
+    let prefix = b"UNIKERNEL_";
+    let mut i = 0;
+    for &c in prefix { buf[i] = c; i += 1; }
+    for &c in proto    { buf[i] = c; i += 1; }
+    buf[i] = b'_'; i += 1;
+
+    // Decimal-encode the port in place, least-significant-first,
+    // then reverse. Single-digit case bypasses the reverse for
+    // brevity. Bytes past the last digit stay zero from the
+    // initialiser, so the buffer is already NUL-terminated.
+    let start = i;
+    let mut n = guest_port;
+    if n == 0 {
+        buf[i] = b'0';
+    } else {
+        while n > 0 {
+            buf[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            i += 1;
+        }
+        buf[start..i].reverse();
+    }
+
+    unsafe {
+        let p = getenv(buf.as_ptr());
+        if p.is_null() || *p == 0 { return None; }
+        Some(parse_u16(p))
+    }
+}
+
 fn set_nonblocking(fd: i32) {
     unsafe {
         let flags = fcntl(fd, F_GETFL, 0i32);
@@ -492,8 +536,6 @@ fn drain_udp_sibling(fd: i32, binding_idx: usize) {
 
 static mut THREADS: [ThreadState; MAX_THREADS] = [const { ThreadState::new(0) }; MAX_THREADS];
 pub static mut NUM_THREADS: usize = 1;
-static mut CONFIG_PORT: u16 = 0;
-static mut CONFIG_TLS_PORT: u16 = 0;
 pub static mut SHUTDOWN: bool = false;
 
 // ── Shared listen sockets ─────────────────────────────────────────────────────
@@ -577,27 +619,12 @@ fn init_native() {
     unsafe {
         pthread_key_create(&mut TLS_KEY, 0);
 
-        // `UNIKERNEL_*` env-var names match what the HVF / QEMU /
-        // ISO variant launchers honor, so callers use the same
-        // spelling regardless of which runner LAUNCHER points at.
-        let p = getenv(b"UNIKERNEL_PORT\0".as_ptr());
-        if !p.is_null() && *p != 0 {
-            CONFIG_PORT = parse_u16(p);
-        }
-
-        // TLS listener port override. bench.py / tests set this to
-        // a high port to avoid the privileged-port bind on Linux
-        // (macOS lets non-root bind anywhere, but we can't rely on
-        // that cross-platform).
-        let tp = getenv(b"UNIKERNEL_TLS_PORT\0".as_ptr());
-        if !tp.is_null() && *tp != 0 {
-            CONFIG_TLS_PORT = parse_u16(tp);
-        }
-
-        let u = getenv(b"UNIKERNEL_UDP_PORT\0".as_ptr());
-        if !u.is_null() && *u != 0 {
-            UDP_PORT_BASE = parse_u16(u);
-        }
+        // Per-port overrides (`UNIKERNEL_<PROTO>_<GUEST>`) are read
+        // lazily from `config_port` / `config_tls_port` /
+        // `native_udp_bind`, keyed by the caller-supplied default
+        // port — same derivation as `variants.bzl` bakes into the
+        // VM launcher templates. Callers use the same spelling
+        // regardless of which runner LAUNCHER points at.
 
         // Determine thread count from environment or CPU count
         let t = getenv(b"UNIKERNEL_CPUS\0".as_ptr());
@@ -651,17 +678,16 @@ pub fn log(msg: &[u8]) {
 }
 
 pub fn config_port(default_port: u16) -> u16 {
-    let port = unsafe { CONFIG_PORT };
-    if port != 0 { port } else { default_port }
+    read_port_env(b"TCP", default_port).unwrap_or(default_port)
 }
 
-/// TLS port override, populated from the `TLS_PORT` environment
-/// variable at `init_native()` time. Returns the override when
-/// set, otherwise the caller-supplied default (typically 443).
-/// Mirrors `config_port` but for the HTTPS listener.
+/// TLS port override. Reads `UNIKERNEL_TCP_<default_port>` — TLS runs
+/// over TCP, so the namespace is shared with plain HTTP. bench.py /
+/// tests set this to a high port to avoid the privileged-port bind
+/// on Linux (macOS lets non-root bind anywhere, but we can't rely
+/// on that cross-platform).
 pub fn config_tls_port(default_port: u16) -> u16 {
-    let port = unsafe { CONFIG_TLS_PORT };
-    if port != 0 { port } else { default_port }
+    read_port_env(b"TCP", default_port).unwrap_or(default_port)
 }
 
 pub fn check_shutdown() -> bool {
@@ -874,10 +900,6 @@ struct UdpBinding {
 static mut UDP_BINDINGS: [Option<UdpBinding>; MAX_UDP_BINDINGS] =
     [const { None }; MAX_UDP_BINDINGS];
 static mut UDP_COUNT: usize = 0;
-/// Base UDP port override from UDP_PORT env var (0 = use app-requested port).
-static mut UDP_PORT_BASE: u16 = 0;
-/// Default UDP port used by the app (first bound port, set on first bind call).
-static mut UDP_DEFAULT_PORT: u16 = 0;
 
 /// Open one non-blocking SO_REUSEPORT-bound UDP sibling socket on
 /// `bind_port`. All siblings of a relay share the same port — kernel
@@ -917,14 +939,11 @@ pub fn native_udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
     unsafe {
         if UDP_COUNT >= MAX_UDP_BINDINGS { return; }
 
-        // If UDP_PORT env var is set, remap ports: the first app UDP port maps
-        // to UDP_PORT, subsequent ports offset from there.
-        let bind_port = if UDP_PORT_BASE != 0 {
-            if UDP_DEFAULT_PORT == 0 { UDP_DEFAULT_PORT = port; }
-            UDP_PORT_BASE + (port - UDP_DEFAULT_PORT)
-        } else {
-            port
-        };
+        // Per-port override keyed on the app's requested port:
+        // `UNIKERNEL_UDP_<port>` swaps in a different host-bind
+        // port. Each app-requested UDP port has its own knob — no
+        // shared base + offset remapping.
+        let bind_port = read_port_env(b"UDP", port).unwrap_or(port);
 
         // Open NUM_THREADS SO_REUSEPORT siblings so the kernel
         // distributes incoming datagrams across the group by 4-tuple

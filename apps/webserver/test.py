@@ -54,17 +54,17 @@ UDP_PORT = int(os.environ.get("TEST_UDP_PORT", 18007))
 def _launcher_env(port: int, tls_port: int, udp_port: int) -> dict[str, str]:
     """Env vars spanning every launcher variant.
 
-    VM launchers (hvf / qemu_*) read `UNIKERNEL_*` to set up host→guest
-    port forwards. The native binary (`webserver_native`, direct
-    rust_binary — no launcher script) also reads `UNIKERNEL_*`
-    (legacy `PORT` / `TLS_PORT` / `UDP_PORT` still honored as a
-    fallback in `uni::native` for old scripts). Unified name keeps
-    the caller ignorant of which variant LAUNCHER points at.
+    Name convention is `UNIKERNEL_<PROTO>_<GUEST>` — derived from
+    the guest-side port the app binds, matching `port_fwd()` in
+    BUILD and `variants.bzl`'s launcher templates. VM launchers
+    (hvf / qemu_*) and the native binary (`uni::native::
+    read_port_env`) both read this name, so the caller can stay
+    ignorant of which variant LAUNCHER points at.
     """
     return {
-        "UNIKERNEL_PORT": str(port),
-        "UNIKERNEL_TLS_PORT": str(tls_port),
-        "UNIKERNEL_UDP_PORT": str(udp_port),
+        "UNIKERNEL_TCP_80": str(port),
+        "UNIKERNEL_TCP_443": str(tls_port),
+        "UNIKERNEL_UDP_7": str(udp_port),
     }
 
 if not (LAUNCHER.is_file() and os.access(LAUNCHER, os.X_OK)):

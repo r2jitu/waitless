@@ -15,43 +15,45 @@ load("//bazel/rules:variants.bzl", "unikernel_variants")
 # attr-construction helpers. Lists of these go into
 # `unikernel_binary(port_forwards = [...])`.
 
-def port_fwd(proto, env, default_host, guest):
+def port_fwd(proto, guest, host):
     """Build a validated port-forward entry for the `port_forwards` attr.
 
-    Encodes the four fields into a colon-delimited string (Bazel
-    attrs can't hold structs), with validation up front so errors
-    surface at macro-call time rather than deep inside rule
-    analysis.
+    Returns a struct with the three fields, validated up front so
+    errors surface at macro-call time rather than deep inside rule
+    analysis. The struct is carried through the `unikernel_binary`
+    → `unikernel_variants` macro chain and serialised into a
+    `string_list` attr only at the rule boundary (callers never
+    see the encoding).
 
     Example:
-        port_fwd("tcp", env = "UNIKERNEL_PORT",
-                 default_host = 8080, guest = 80)
+        port_fwd("tcp", guest = 80, host = 8080)
 
-    At runtime the variant launcher forwards
-        host:${UNIKERNEL_PORT:-8080} → guest tcp:80
-    i.e. callers override the host port by exporting `UNIKERNEL_PORT`
-    before `bazel run :<app>_<variant>`, while the guest-side port
-    the app listens on is baked in at build time.
+    Semantics:
+      * `guest` is fixed — baked into the variant launcher; matches
+        the port the app listens on inside the guest.
+      * `host` is the default external port the launcher exposes.
+      * At runtime, `UNIKERNEL_<PROTO>_<GUEST>` (e.g.
+        `UNIKERNEL_TCP_80`) overrides the host port; otherwise
+        `host` is used. Same convention is honored by the native
+        binary (`:<name>_native`), so users override ports the
+        same way regardless of runner.
 
     Args:
       proto: `"tcp"` or `"udp"`.
-      env: env-var name users set to override the host port at run time.
-      default_host: host port used when `env` is unset.
-      guest: guest-side port the app listens on.
+      guest: guest-side port the app listens on (fixed).
+      host: default external host port.
 
     Returns:
-      A colon-delimited string `"<proto>:<env>:<default_host>:<guest>"`
-      ready to be dropped into a `port_forwards = [...]` list.
+      A `struct(proto, guest, host)` ready to be dropped into a
+      `port_forwards = [...]` list.
     """
     if proto not in ("tcp", "udp"):
         fail("port_fwd: proto must be 'tcp' or 'udp', got '{}'".format(proto))
-    if not env or ":" in env:
-        fail("port_fwd: env must be a non-empty identifier with no colons, got '{}'".format(env))
-    if type(default_host) != "int" or default_host <= 0 or default_host > 65535:
-        fail("port_fwd: default_host must be a TCP/UDP port (1–65535), got '{}'".format(default_host))
+    if type(host) != "int" or host <= 0 or host > 65535:
+        fail("port_fwd: host must be a TCP/UDP port (1–65535), got '{}'".format(host))
     if type(guest) != "int" or guest <= 0 or guest > 65535:
         fail("port_fwd: guest must be a TCP/UDP port (1–65535), got '{}'".format(guest))
-    return "{}:{}:{}:{}".format(proto, env, default_host, guest)
+    return struct(proto = proto, guest = guest, host = host)
 
 
 # Bare-metal linker flags (passed to rust-lld via -C link-arg).

@@ -126,53 +126,57 @@ def _relpath_from_launcher_to(ctx, target_file):
     package_depth = ctx.label.package.count("/") + 1 if ctx.label.package else 0
     return ("../" * package_depth) + target_file.short_path
 
-def _parse_port_forward(entry):
-    """Split a `proto:env:default_host:guest` entry into its parts.
+# ── Port-forward launcher-string builders ────────────────────────────────
+#
+# `port_fwd()` in unikernel.bzl returns a `struct(proto, guest, host)`.
+# These helpers turn a list of such structs into the finished launcher
+# argument string for each runner (HVF `-p` flags / QEMU `hostfwd=…`
+# entries). Rule attrs can't hold structs, so we format up-front at
+# macro time and pass the single resulting string through a `string`
+# attr — no encode / parse pair on the rule-impl side.
+#
+# Env-var override name is derived as `UNIKERNEL_<PROTO>_<GUEST>`
+# (e.g. `UNIKERNEL_TCP_80`). Same convention is honored by the
+# native binary (`uni::native`), so users override the host port
+# the same way regardless of runner. Bash-style default expansion
+# — `${…:-<host>}` — falls back to the BUILD-declared default.
 
-    Used by the variant rule's impl to re-expand the encoded string
-    at template-substitution time. The encoding is stable because
-    callers only construct these via `port_fwd()` above.
-    """
-    parts = entry.split(":")
-    if len(parts) != 4:
-        fail(
-            "port_forwards entry '{}' malformed; build entries with `port_fwd(...)`".format(entry),
-        )
-    return struct(
-        proto = parts[0],
-        host_env = parts[1],
-        default_host = parts[2],
-        guest_port = parts[3],
-    )
+def _port_fwd_env_var(pf):
+    """Derive the runtime override env-var name for a port_fwd() struct."""
+    return "UNIKERNEL_{}_{}".format(pf.proto.upper(), pf.guest)
 
 def _build_hvf_port_flags(port_forwards):
     """Build HVF runner `-p proto:host:guest` arg string."""
     parts = []
-    for entry in port_forwards:
-        f = _parse_port_forward(entry)
-        parts.append('-p "{proto}:${{{env}:-{default}}}:{guest}"'.format(
+    for f in port_forwards:
+        parts.append('-p "{proto}:${{{env}:-{host}}}:{guest}"'.format(
             proto = f.proto,
-            env = f.host_env,
-            default = f.default_host,
-            guest = f.guest_port,
+            env = _port_fwd_env_var(f),
+            host = f.host,
+            guest = f.guest,
         ))
     return " ".join(parts)
 
 def _build_qemu_hostfwd(port_forwards):
     """Build QEMU `user,…,hostfwd=…,hostfwd=…` forward string."""
     parts = []
-    for entry in port_forwards:
-        f = _parse_port_forward(entry)
-        # Bash-style default expansion. helpers.sh's run_qemu passes
-        # the resulting string into `-netdev user,…,<hostfwd>` where
-        # bash re-evaluates `${VAR:-default}` in context.
-        parts.append("hostfwd={proto}::${{{env}:-{default}}}-:{guest}".format(
+    for f in port_forwards:
+        # helpers.sh's run_qemu passes this into
+        # `-netdev user,…,<hostfwd>` where bash re-evaluates
+        # `${VAR:-default}` in context.
+        parts.append("hostfwd={proto}::${{{env}:-{host}}}-:{guest}".format(
             proto = f.proto,
-            env = f.host_env,
-            default = f.default_host,
-            guest = f.guest_port,
+            env = _port_fwd_env_var(f),
+            host = f.host,
+            guest = f.guest,
         ))
     return ",".join(parts)
+
+def _hvf_port_forward_kwargs(port_forwards):
+    return {"hvf_port_flags": _build_hvf_port_flags(port_forwards)}
+
+def _qemu_port_forward_kwargs(port_forwards):
+    return {"qemu_hostfwd": _build_qemu_hostfwd(port_forwards)}
 
 # Per-variant rule implementations. Each takes exactly the attrs its
 # runner script consumes, symlinks them into co-located files, and
@@ -198,7 +202,7 @@ def _hvf_impl(ctx):
     launcher = _expand_launcher(ctx, {
         "%IMG%": img.basename,
         "%RUNNER%": _relpath_from_launcher_to(ctx, runner),
-        "%PORT_FLAGS%": _build_hvf_port_flags(ctx.attr.port_forwards),
+        "%PORT_FLAGS%": ctx.attr.hvf_port_flags,
         "%DEFAULT_RAM%": str(ctx.attr.default_ram_mb),
         "%DEFAULT_CPUS%": str(ctx.attr.default_cpus),
     })
@@ -216,7 +220,7 @@ def _iso_impl(ctx):
     launcher = _expand_launcher(ctx, {
         "%ISO%": iso.basename,
         "%HELPERS%": _relpath_from_launcher_to(ctx, ctx.file.helpers),
-        "%HOSTFWD%": _build_qemu_hostfwd(ctx.attr.port_forwards),
+        "%HOSTFWD%": ctx.attr.qemu_hostfwd,
         "%DEFAULT_RAM%": str(ctx.attr.default_ram_mb),
         "%DEFAULT_CPUS%": str(ctx.attr.default_cpus),
         "%QEMU_BIN%": ctx.attr._qemu_bin,
@@ -249,7 +253,7 @@ def _qemu_impl(ctx):
         "%ELF%": elf.basename,
         "%IMG%": img.basename,
         "%HELPERS%": _relpath_from_launcher_to(ctx, ctx.file.helpers),
-        "%HOSTFWD%": _build_qemu_hostfwd(ctx.attr.port_forwards),
+        "%HOSTFWD%": ctx.attr.qemu_hostfwd,
         "%DEFAULT_RAM%": str(ctx.attr.default_ram_mb),
         "%DEFAULT_CPUS%": str(ctx.attr.default_cpus),
     })
@@ -274,15 +278,14 @@ _HELPERS_ATTR = {
     ),
 }
 
-# Every variant rule takes `port_forwards`, `default_ram_mb`,
-# and `default_cpus` — the impl substitutes them into its launcher
-# template. Runtime `UNIKERNEL_MEMORY` / `UNIKERNEL_CPUS` env-vars
-# still override per-invocation; these set the defaults that kick
-# in when no env override is present.
+# Every variant rule takes `default_ram_mb` and `default_cpus` — the
+# impl substitutes them into its launcher template. Runtime
+# `UNIKERNEL_MEMORY` / `UNIKERNEL_CPUS` env-vars still override
+# per-invocation; these set the defaults that kick in when no env
+# override is present. Port-forward config is injected per-variant
+# via `hvf_port_flags` / `qemu_hostfwd` (pre-formatted launcher
+# strings built in the macro).
 _VM_CONFIG_ATTRS = {
-    "port_forwards": attr.string_list(
-        doc = "Per-app port-forwarding config; see DEFAULT_PORT_FORWARDS.",
-    ),
     "default_ram_mb": attr.int(
         default = 128,
         doc = "Default guest RAM in MB (overridable via UNIKERNEL_MEMORY).",
@@ -330,6 +333,9 @@ _hvf_variant = _build_variant_rule(
             mandatory = True,
             doc = "Host-platform HVF runner binary (built in outer config).",
         ),
+        "hvf_port_flags": attr.string(
+            doc = "Pre-formatted `-p` flags; built by `_build_hvf_port_flags`.",
+        ),
     }),
 )
 
@@ -350,6 +356,9 @@ def _make_iso_variant(variant_transition, qemu_bin, virtio_dev, qemu_machine):
                     cfg = variant_transition,
                     mandatory = True,
                     doc = "The <name>.iso of the underlying unikernel_binary (transitioned).",
+                ),
+                "qemu_hostfwd": attr.string(
+                    doc = "Pre-formatted QEMU `hostfwd=…` string; built by `_build_qemu_hostfwd`.",
                 ),
                 "_qemu_bin": attr.string(default = qemu_bin),
                 "_virtio_dev": attr.string(default = virtio_dev),
@@ -388,6 +397,9 @@ def _make_qemu_variant(variant_transition):
                     mandatory = True,
                     doc = "The <name>.img of the underlying unikernel_binary (transitioned).",
                 ),
+                "qemu_hostfwd": attr.string(
+                    doc = "Pre-formatted QEMU `hostfwd=…` string; built by `_build_qemu_hostfwd`.",
+                ),
             }
         ),
     )
@@ -419,6 +431,7 @@ _VARIANT_SPECS = [
         rule_fn = _hvf_variant,
         src_attrs = {"img": ".img"},
         host_attrs = {"hvf_runner": "//tools/hvf-runner:run_hvf"},
+        port_forward_kwargs = _hvf_port_forward_kwargs,
         host_compat = ["@platforms//os:macos"],  # Hypervisor.framework.
         extra_test_tags = [],
         in_default_test_set = True,
@@ -437,6 +450,7 @@ _VARIANT_SPECS = [
         rule_fn = _iso_x86_64_variant,
         src_attrs = {"iso": ".iso"},
         host_attrs = {},
+        port_forward_kwargs = _qemu_port_forward_kwargs,
         host_compat = [],
         extra_test_tags = ["iso"],
         in_default_test_set = False,
@@ -446,6 +460,7 @@ _VARIANT_SPECS = [
         rule_fn = _iso_aarch64_variant,
         src_attrs = {"iso": ".iso"},
         host_attrs = {},
+        port_forward_kwargs = _qemu_port_forward_kwargs,
         host_compat = [],
         extra_test_tags = ["iso"],
         in_default_test_set = False,
@@ -455,6 +470,7 @@ _VARIANT_SPECS = [
         rule_fn = _qemu_aarch64_variant,
         src_attrs = {"elf": ".elf", "img": ".img"},
         host_attrs = {},
+        port_forward_kwargs = _qemu_port_forward_kwargs,
         host_compat = [],
         # `qemu` is an umbrella tag so `--test_tag_filters=qemu`
         # picks up both architectures in one shot.
@@ -466,6 +482,7 @@ _VARIANT_SPECS = [
         rule_fn = _qemu_x86_64_variant,
         src_attrs = {"elf": ".elf", "img": ".img"},
         host_attrs = {},
+        port_forward_kwargs = _qemu_port_forward_kwargs,
         host_compat = [],
         extra_test_tags = ["qemu"],
         in_default_test_set = True,
@@ -482,6 +499,7 @@ _VARIANT_SPECS = [
         rule_fn = None,
         src_attrs = {},
         host_attrs = {},
+        port_forward_kwargs = None,
         host_compat = ["//bazel/platforms:native"],
         extra_test_tags = [],
         in_default_test_set = True,
@@ -508,9 +526,11 @@ def _instantiate_variant(spec, name, base, vm_config, visibility):
         kwargs[attr_name] = ":" + base + suffix
     for attr_name, label in spec.host_attrs.items():
         kwargs[attr_name] = label
+    # Per-runner port-forward attr (e.g. HVF's `hvf_port_flags` vs
+    # QEMU/ISO's `qemu_hostfwd`) — spec picks the builder.
+    kwargs.update(spec.port_forward_kwargs(vm_config.port_forwards))
     spec.rule_fn(
         name = name,
-        port_forwards = vm_config.port_forwards,
         default_ram_mb = vm_config.ram_mb,
         default_cpus = vm_config.cpus,
         target_compatible_with = spec.host_compat,

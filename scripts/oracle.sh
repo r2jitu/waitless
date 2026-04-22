@@ -29,7 +29,7 @@ SSH_HOST="${ORACLE_SSH_HOST:-oracle}"
 INSTANCE_OCID="${ORACLE_INSTANCE_OCID:-}"
 MEMORY="${UNIKERNEL_MEMORY:-128}"
 CPUS="${UNIKERNEL_CPUS:-1}"
-HOST_PORT="${UNIKERNEL_PORT:-8080}"
+HOST_PORT="${UNIKERNEL_TCP_80:-8080}"
 TEST_PORT=19099  # internal port for automated tests (avoids conflicts)
 
 cmd="${1:-help}"
@@ -212,7 +212,7 @@ Environment:
   ORACLE_INSTANCE_OCID=ocid1... Instance OCID for start/stop
   UNIKERNEL_MEMORY=128          VM memory in MB
   UNIKERNEL_CPUS=1              vCPU count
-  UNIKERNEL_PORT=8080           Local port forwarded to VM port 80 (run only)
+  UNIKERNEL_TCP_80=8080         Local port forwarded to VM port 80 (run only)
 USAGE
         ;;
 esac

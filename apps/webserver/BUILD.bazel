@@ -22,9 +22,9 @@ unikernel_binary(
     name = "webserver",
     app = ":app",
     port_forwards = [
-        port_fwd("tcp", env = "UNIKERNEL_PORT", default_host = 8080, guest = 80),
-        port_fwd("tcp", env = "UNIKERNEL_TLS_PORT", default_host = 8443, guest = 443),
-        port_fwd("udp", env = "UNIKERNEL_UDP_PORT", default_host = 8007, guest = 7),
+        port_fwd("tcp", guest = 80, host = 8080),
+        port_fwd("tcp", guest = 443, host = 8443),
+        port_fwd("udp", guest = 7, host = 8007),
     ],
 )
 
