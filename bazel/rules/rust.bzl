@@ -5,7 +5,7 @@ via --@rules_rust//:extra_rustc_flags. This file provides the per-target
 symbolic flag lists.
 """
 
-load("@rules_rust//rust:defs.bzl", _rust_proc_macro = "rust_proc_macro")
+load("@rules_rust//rust:defs.bzl", _rust_proc_macro = "rust_proc_macro", _rust_test = "rust_test")
 
 # ARM64 unikernel targets need PIC for position-independent ELF
 # (boot.S applies relocations at runtime). x86_64 and native don't.
@@ -13,6 +13,22 @@ UNIKERNEL_RUSTC_FLAGS = select({
     "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
     "//conditions:default": [],
 })
+
+# `bazel build ...` would otherwise try to compile every rust_test
+# under the global `-Cpanic=abort`, which rustc rejects for test
+# binaries ("building tests with panic=abort is not supported without
+# `-Zpanic_abort_tests`"). Only the `test` verb flips
+# `//bazel/rules:tests_need_std=True` (and adds `-Cpanic=unwind`), so
+# gate rust_test compatibility on that flag — wildcard builds skip
+# these targets, `bazel test ...` still picks them up.
+def rust_test(**kwargs):
+    if "target_compatible_with" in kwargs:
+        fail("rust_test: unikernel wrapper owns target_compatible_with")
+    kwargs["target_compatible_with"] = select({
+        "//bazel/rules:tests_need_std_on": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    })
+    _rust_test(**kwargs)
 
 # Proc-macros are dylibs loaded into rustc, so a panic in the macro
 # unwinds into the compiler. rustc warns ("building proc macro crate
