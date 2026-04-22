@@ -10,6 +10,7 @@
 // data segment registers to the kernel data selector.
 
 use core::arch::asm;
+use core::cell::UnsafeCell;
 use core::mem;
 
 // Segment selectors
@@ -62,57 +63,70 @@ struct Tss {
 // Static storage (bare-metal, single-threaded)
 // ---------------------------------------------------------------------------
 //
-// Why the per-use `#[allow(static_mut_refs)]` attributes below:
+// The GDT state (entries, TSS, GDTR) lives in one `UnsafeCell<GdtState>`
+// behind a `GdtSlot(unsafe impl Sync)` wrapper. Single-owner discipline:
+// `init()` writes on the BSP during boot, *before* any AP has been
+// started via `kernel::x86_64::smp::boot_aps` and *before* any
+// interrupt handler runs (the IDT isn't loaded yet either). After that
+// point the state is read-only — `load_on_ap()` only reads the
+// BSP-initialised GDTR, never writes. `set_kernel_stack` rewrites
+// `TSS.rsp0` from the BSP-only context-switch path.
 //
-// `GDT_ENTRIES`, `TSS`, and `GDTR` are populated by `init()` on the
-// BSP during boot, *before* any AP has been started via
-// `kernel::x86_64::smp::boot_aps`, and *before* any interrupt
-// handler runs (the IDT isn't loaded yet either). From that point on
-// they are read-only — APs call `load_on_ap()` which only reads the
-// BSP-initialised GDTR, it never rewrites these statics. So the
-// `&mut GDT_ENTRIES[..]` borrows in `set_entry` / `set_tss_entry` and
-// the in-place writes to `TSS.iopb_offset` / `GDTR.{limit,base}` all
-// happen on a single thread with no concurrent readers, which is
-// exactly the case `static_mut_refs` is warning about not handling
-// safely in general. The warning is a correct heuristic that doesn't
-// apply here.
-//
-// Long-term we could move these into `InitOnce` / a `Spinlock`-wrapped
-// struct like the other boot-time singletons; the reason they stay as
-// `static mut` is that `lgdt` takes a raw pointer and the GDT entries
-// have to be in memory that the CPU can physically see during the
-// `retfq` segment reload — any smart-pointer indirection would have
-// to unwrap to the same address anyway.
+// We can't use `InitOnce<Box<_>>` because `lgdt` takes a raw pointer
+// and the GDT entries have to live in memory that the CPU can
+// physically see during the `retfq` segment reload — any heap
+// indirection would unwrap to the same address anyway. UnsafeCell is
+// the right primitive: plain static storage, interior mutability, no
+// overhead.
 
-// 5 entries: null + code + data + TSS low (8 bytes) + TSS high (8 bytes)
-static mut GDT_ENTRIES: [GdtEntry; 5] = [GdtEntry {
-    limit_low: 0,
-    base_low: 0,
-    base_middle: 0,
-    access: 0,
-    granularity: 0,
-    base_high: 0,
-}; 5];
+/// Aggregate of every persistently-mutated piece of GDT state.
+/// Individual `static mut` globals (`GDT_ENTRIES`, `TSS`, `GDTR`)
+/// collapsed to fields here per init-redesign.md Phase 7.
+struct GdtState {
+    /// 5 entries: null + code + data + TSS low (8 bytes) + TSS high (8 bytes).
+    entries: [GdtEntry; 5],
+    tss: Tss,
+    gdtr: DescriptorTablePtr,
+}
 
-static mut TSS: Tss = Tss {
-    reserved0: 0,
-    rsp0: 0,
-    rsp1: 0,
-    rsp2: 0,
-    reserved1: 0,
-    ist1: 0,
-    ist2: 0,
-    ist3: 0,
-    ist4: 0,
-    ist5: 0,
-    ist6: 0,
-    ist7: 0,
-    reserved2: 0,
-    reserved3: 0,
-    iopb_offset: 0,
-};
+impl GdtState {
+    const fn new() -> Self {
+        Self {
+            entries: [GdtEntry {
+                limit_low: 0,
+                base_low: 0,
+                base_middle: 0,
+                access: 0,
+                granularity: 0,
+                base_high: 0,
+            }; 5],
+            tss: Tss {
+                reserved0: 0,
+                rsp0: 0,
+                rsp1: 0,
+                rsp2: 0,
+                reserved1: 0,
+                ist1: 0,
+                ist2: 0,
+                ist3: 0,
+                ist4: 0,
+                ist5: 0,
+                ist6: 0,
+                ist7: 0,
+                reserved2: 0,
+                reserved3: 0,
+                iopb_offset: 0,
+            },
+            gdtr: DescriptorTablePtr { limit: 0, base: 0 },
+        }
+    }
+}
 
-static mut GDTR: DescriptorTablePtr = DescriptorTablePtr { limit: 0, base: 0 };
+struct GdtSlot(UnsafeCell<GdtState>);
+// SAFETY: all mutation is single-threaded by contract (see module comment).
+unsafe impl Sync for GdtSlot {}
+
+static GDT: GdtSlot = GdtSlot(UnsafeCell::new(GdtState::new()));
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -120,8 +134,9 @@ static mut GDTR: DescriptorTablePtr = DescriptorTablePtr { limit: 0, base: 0 };
 
 /// Encode a standard 8-byte GDT entry.
 fn set_entry(index: usize, base: u32, limit: u32, access: u8, flags: u8) {
-    #[allow(static_mut_refs)]
-    let entry = unsafe { &mut GDT_ENTRIES[index] };
+    // SAFETY: BSP-only during `init()` — see module-level comment.
+    let gdt = unsafe { &mut *GDT.0.get() };
+    let entry = &mut gdt.entries[index];
     entry.limit_low = (limit & 0xFFFF) as u16;
     entry.base_low = (base & 0xFFFF) as u16;
     entry.base_middle = ((base >> 16) & 0xFF) as u8;
@@ -133,9 +148,11 @@ fn set_entry(index: usize, base: u32, limit: u32, access: u8, flags: u8) {
 /// Set up the 16-byte TSS descriptor at GDT index `index` (and `index+1`).
 /// A system segment descriptor in long mode is 16 bytes.
 fn set_tss_entry(index: usize, base: u64, limit: u32) {
+    // SAFETY: BSP-only during `init()` — see module-level comment.
+    let gdt = unsafe { &mut *GDT.0.get() };
+
     // First 8 bytes (standard descriptor format)
-    #[allow(static_mut_refs)]
-    let entry = unsafe { &mut GDT_ENTRIES[index] };
+    let entry = &mut gdt.entries[index];
     entry.limit_low = (limit & 0xFFFF) as u16;
     entry.base_low = (base & 0xFFFF) as u16;
     entry.base_middle = ((base >> 16) & 0xFF) as u8;
@@ -145,8 +162,7 @@ fn set_tss_entry(index: usize, base: u64, limit: u32) {
     entry.base_high = ((base >> 24) & 0xFF) as u8;
 
     // Second 8 bytes: upper 32 bits of base address + reserved
-    #[allow(static_mut_refs)]
-    let upper = unsafe { &mut GDT_ENTRIES[index + 1] };
+    let upper = &mut gdt.entries[index + 1];
     let base_upper = ((base >> 32) & 0xFFFFFFFF) as u32;
     // Write base_upper into the first 4 bytes of the slot
     upper.limit_low = (base_upper & 0xFFFF) as u16;
@@ -166,14 +182,14 @@ fn set_tss_entry(index: usize, base: u64, limit: u32) {
 /// Loads the GDTR, reloads all segment registers, and loads the TSS.
 pub fn init() {
     unsafe {
+        // SAFETY: BSP-only during boot — see module-level comment.
+        let gdt = &mut *GDT.0.get();
+
         // Zero out the TSS
-        core::ptr::write_bytes(&raw mut TSS as *mut u8, 0, mem::size_of::<Tss>());
+        core::ptr::write_bytes(&raw mut gdt.tss as *mut u8, 0, mem::size_of::<Tss>());
 
         // Set the I/O permission bitmap offset past the end of the TSS
-        #[allow(static_mut_refs)]
-        {
-            TSS.iopb_offset = mem::size_of::<Tss>() as u16;
-        }
+        gdt.tss.iopb_offset = mem::size_of::<Tss>() as u16;
 
         // Entry 0: Null descriptor
         set_entry(0, 0, 0, 0, 0);
@@ -189,19 +205,14 @@ pub fn init() {
         set_entry(2, 0, 0xFFFFF, 0x92, 0xC0);
 
         // Entry 3-4: TSS descriptor (16 bytes, selector 0x18)
-        #[allow(static_mut_refs)]
-        let tss_base = &TSS as *const Tss as u64;
+        let tss_base = &raw const gdt.tss as u64;
         set_tss_entry(3, tss_base, (mem::size_of::<Tss>() - 1) as u32);
 
         // Load the GDTR
-        #[allow(static_mut_refs)]
-        {
-            GDTR.limit = (mem::size_of::<[GdtEntry; 5]>() - 1) as u16;
-            GDTR.base = &GDT_ENTRIES as *const _ as u64;
-        }
+        gdt.gdtr.limit = (mem::size_of::<[GdtEntry; 5]>() - 1) as u16;
+        gdt.gdtr.base = &raw const gdt.entries as *const _ as u64;
 
-        #[allow(static_mut_refs)]
-        let gdtr_ptr = &GDTR as *const DescriptorTablePtr;
+        let gdtr_ptr = &raw const gdt.gdtr;
         asm!("lgdt [{}]", in(reg) gdtr_ptr, options(nostack));
 
         // Reload CS via far return, then set data segment registers
@@ -233,8 +244,8 @@ pub fn init() {
 /// Load the BSP's GDT on an AP. Reloads segment registers for the new GDT layout.
 pub fn load_on_ap() {
     unsafe {
-        #[allow(static_mut_refs)]
-        let gdtr_ptr = &GDTR as *const DescriptorTablePtr;
+        // SAFETY: GDT state is immutable after BSP init — APs only read it.
+        let gdtr_ptr = &raw const (*GDT.0.get()).gdtr;
         asm!("lgdt [{}]", in(reg) gdtr_ptr, options(nostack));
 
         // Reload CS via far return, then reload data segments.
@@ -261,8 +272,6 @@ pub fn load_on_ap() {
 /// Set the kernel stack pointer in the TSS.
 /// When an interrupt occurs in ring 3, the CPU switches RSP to this value.
 pub fn set_kernel_stack(stack: u64) {
-    #[allow(static_mut_refs)]
-    unsafe {
-        TSS.rsp0 = stack;
-    }
+    // SAFETY: BSP-only; same contract as `init()`.
+    unsafe { (*GDT.0.get()).tss.rsp0 = stack; }
 }

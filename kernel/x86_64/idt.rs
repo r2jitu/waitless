@@ -10,6 +10,7 @@
 // That file provides `isr_stub_table`: an array of 256 function pointers.
 
 use core::arch::asm;
+use core::cell::UnsafeCell;
 
 // ============================================================================
 // Interrupt frame — matches the stack layout built by ISR stubs + CPU
@@ -95,12 +96,40 @@ struct DescriptorTablePtr {
 // ============================================================================
 // Static storage
 // ============================================================================
+//
+// `IDT_ENTRIES`, `IDTR`, and `HANDLERS` collapsed into one
+// `UnsafeCell<IdtState>` per init-redesign.md Phase 7. Single-owner
+// discipline: `init()` writes on the BSP during boot (before any AP
+// is running). `register_handler()` writes `HANDLERS` from the BSP.
+// `load_idt_on_ap` only reads `IDTR`. The ISR dispatcher reads
+// `HANDLERS[vector]` from any core in interrupt context; per-slot
+// writes + reads are single-word and thus tearing-safe on x86_64,
+// which matches the pre-refactor invariant.
+//
+// `InitOnce<Box<_>>` isn't viable: `lidt` takes a raw pointer and
+// the IDT must live where the CPU can physically see it.
 
-static mut IDT_ENTRIES: [IdtEntry; 256] = [IdtEntry::ZEROED; 256];
+struct IdtState {
+    entries: [IdtEntry; 256],
+    idtr: DescriptorTablePtr,
+    handlers: [Option<InterruptHandler>; 256],
+}
 
-static mut IDTR: DescriptorTablePtr = DescriptorTablePtr { limit: 0, base: 0 };
+impl IdtState {
+    const fn new() -> Self {
+        Self {
+            entries: [IdtEntry::ZEROED; 256],
+            idtr: DescriptorTablePtr { limit: 0, base: 0 },
+            handlers: [None; 256],
+        }
+    }
+}
 
-static mut HANDLERS: [Option<InterruptHandler>; 256] = [None; 256];
+struct IdtSlot(UnsafeCell<IdtState>);
+// SAFETY: see module-level contract above.
+unsafe impl Sync for IdtSlot {}
+
+static IDT: IdtSlot = IdtSlot(UnsafeCell::new(IdtState::new()));
 
 // ============================================================================
 // ISR stub table — defined in idt_stubs.S
@@ -196,7 +225,7 @@ fn pic_remap() {
 
 unsafe fn set_idt_entry(vector: usize, handler_addr: u64, selector: u16, ist: u8, type_attr: u8) {
     unsafe {
-        IDT_ENTRIES[vector] = IdtEntry {
+        (*IDT.0.get()).entries[vector] = IdtEntry {
             offset_low: (handler_addr & 0xFFFF) as u16,
             selector,
             ist: ist & 0x07,
@@ -221,7 +250,7 @@ pub unsafe extern "C" fn isr_common_handler(frame: *mut InterruptFrame) {
     let vector = (*frame).vector as usize;
 
     // Dispatch to registered handler if one exists
-    if let Some(handler) = HANDLERS[vector] {
+    if let Some(handler) = (*IDT.0.get()).handlers[vector] {
         handler(frame);
         // Send EOI for hardware IRQs (vectors 32-47) via PIC
         if vector >= 32 && vector < 48 {
@@ -293,9 +322,11 @@ const KERNEL_CODE_SELECTOR: u16 = 0x08;
 /// and load the IDTR.
 pub fn init() {
     unsafe {
+        let idt = &mut *IDT.0.get();
+
         // Clear all handlers
-        for i in 0..256 {
-            HANDLERS[i] = None;
+        for h in idt.handlers.iter_mut() {
+            *h = None;
         }
 
         // Remap the 8259 PIC so hardware IRQs don't overlap CPU exceptions
@@ -310,9 +341,9 @@ pub fn init() {
         }
 
         // Load the IDTR
-        IDTR.limit = (core::mem::size_of::<[IdtEntry; 256]>() - 1) as u16;
-        IDTR.base = &raw const IDT_ENTRIES as u64;
-        asm!("lidt [{}]", in(reg) &raw const IDTR, options(nostack));
+        idt.idtr.limit = (core::mem::size_of::<[IdtEntry; 256]>() - 1) as u16;
+        idt.idtr.base = &raw const idt.entries as u64;
+        asm!("lidt [{}]", in(reg) &raw const idt.idtr, options(nostack));
     }
 }
 
@@ -321,7 +352,7 @@ pub fn init() {
 /// to the saved register state.
 pub fn register_handler(vector: u8, handler: InterruptHandler) {
     unsafe {
-        HANDLERS[vector as usize] = Some(handler);
+        (*IDT.0.get()).handlers[vector as usize] = Some(handler);
     }
 }
 
@@ -342,7 +373,7 @@ pub fn enable_irq(irq: u8) {
 /// Load the IDT on an AP (same IDT as BSP). APs share the IDT and handler table.
 pub fn load_idt_on_ap() {
     unsafe {
-        asm!("lidt [{}]", in(reg) &raw const IDTR, options(nostack));
+        asm!("lidt [{}]", in(reg) &raw const (*IDT.0.get()).idtr, options(nostack));
     }
 }
 
