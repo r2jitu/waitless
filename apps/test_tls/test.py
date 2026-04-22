@@ -6,94 +6,38 @@ Drives //net:tls_crypto + //net:tls through a full-stack boot
 cascade, traffic-key record roundtrip). Passes if the log contains
 `TLS TESTS: ALL PASSED` and no `[tls] FAIL`.
 
-Dispatches on `LAUNCHER_NAME` (set by the per-variant py_test's
-`env` attr):
-  * `test_tls_hvf`         → run-hvf on the co-located .img.
-  * `test_tls_qemu_<arch>` → spawn_qemu on the co-located .elf.
-  * `test_tls_native`      → spawn the native rust_binary directly
-                             (fast: same crypto routines, no VM).
+The per-variant launcher owns the runner-specific invocation
+(HVF / QEMU / native); this test just spawns it as a subprocess
+and scrapes stdout.
 """
 
 from __future__ import annotations
 
 import os
-import subprocess
-import tempfile
 import time
 import unittest
-from pathlib import Path
 
 from scripts.test_helpers import (
-    Launcher,
     runfiles_root,
-    spawn_qemu,
+    spawn_backgrounded,
     wait_for_marker,
 )
 
 
 class TlsPrimitiveTest(unittest.TestCase):
-    launcher: Launcher | None = None
+    launcher = None
     serial: str = ""
 
     @classmethod
     def setUpClass(cls) -> None:
-        root = runfiles_root()
         launcher_name = os.environ["LAUNCHER_NAME"]
-        pkg = root / "apps" / "test_tls"
-
-        if launcher_name == "test_tls_native":
-            native_bin = pkg / launcher_name
-            if not (native_bin.is_file() and os.access(native_bin, os.X_OK)):
-                raise RuntimeError(
-                    f"native binary not found / not executable: {native_bin}"
-                )
-            fd, log_path_str = tempfile.mkstemp(
-                prefix="test_tls_native_", suffix=".log",
-            )
-            os.close(fd)
-            log_path = Path(log_path_str)
-            with open(log_path, "wb") as log_fd:
-                proc = subprocess.Popen(
-                    [str(native_bin)],
-                    stdout=log_fd, stderr=log_fd, stdin=subprocess.DEVNULL,
-                )
-            cls.launcher = Launcher(proc=proc, log_path=log_path)
-        elif launcher_name == "test_tls_hvf":
-            # The hvf runner lives at its natural runfiles path
-            # (`tools/hvf-runner/run-hvf`), not co-located next to the
-            # launcher — the variant rule hands it to the template
-            # via a relpath substitution rather than a per-variant
-            # symlink. The guest .img IS co-located, same as qemu.
-            hvf = root / "tools" / "hvf-runner" / "run-hvf"
-            img = pkg / f"{launcher_name}.img"
-            if not (hvf.is_file() and os.access(hvf, os.X_OK)):
-                raise unittest.SkipTest(f"HVF runner not executable: {hvf}")
-            if not img.is_file():
-                raise RuntimeError(f"{launcher_name}.img not found at {img}")
-            fd, log_path_str = tempfile.mkstemp(
-                prefix="test_tls_hvf_", suffix=".log",
-            )
-            os.close(fd)
-            log_path = Path(log_path_str)
-            with open(log_path, "wb") as log_fd:
-                proc = subprocess.Popen(
-                    [str(hvf), str(img), "--ram=128", "--cpus=1"],
-                    stdout=log_fd, stderr=log_fd, stdin=subprocess.DEVNULL,
-                )
-            cls.launcher = Launcher(proc=proc, log_path=log_path)
-        else:
-            elf = pkg / f"{launcher_name}.elf"
-            img = pkg / f"{launcher_name}.img"
-            if not elf.is_file():
-                raise RuntimeError(f"{launcher_name}.elf not found at {elf}")
-            cls.launcher = spawn_qemu(elf, img_path=img, cpus=1, memory_mb=128,
-                                      log_prefix=launcher_name)
-            if cls.launcher is None:
-                raise unittest.SkipTest("no qemu-system-* on PATH for this ELF")
+        launcher_path = runfiles_root() / "apps" / "test_tls" / launcher_name
+        if not (launcher_path.is_file() and os.access(launcher_path, os.X_OK)):
+            raise unittest.SkipTest(f"launcher not executable: {launcher_path}")
+        cls.launcher = spawn_backgrounded(launcher_path, log_prefix=launcher_name)
 
         # Wait for the TLS test summary line. 20 s covers TCG under
         # heavy crypto.
-        assert cls.launcher is not None
         if not wait_for_marker(cls.launcher, "TLS TESTS:", timeout=20.0):
             cls.launcher.cleanup()
             raise RuntimeError("guest never printed 'TLS TESTS:' line")

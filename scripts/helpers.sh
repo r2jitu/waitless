@@ -85,9 +85,14 @@ run_qemu() {
 
     local dev_extra=""
     local netdev_extra=""
-    # VirtIO multi-queue is PCI-only; MMIO (virtio-net-device) doesn't
-    # support the `mq=on,vectors=…,queues=…` trio.
-    if [[ "$cpus" -gt 1 ]] && [[ "$VIRTIO_DEV" == *"-pci"* ]]; then
+    # VirtIO multi-queue is PCI-only (MMIO's `virtio-net-device`
+    # doesn't support the `mq=on,vectors=…,queues=…` trio) AND
+    # requires at least one hostfwd — QEMU's user-mode netdev
+    # rejects `queues=N` when there are no port forwards to spray
+    # across the queues ("Invalid parameter 'queues'"). Apps with
+    # `port_forwards = []` (e.g. the headless SMP tests) get a
+    # single-queue netdev even when booting multi-core.
+    if [[ "$cpus" -gt 1 ]] && [[ "$VIRTIO_DEV" == *"-pci"* ]] && [[ -n "$hostfwd" ]]; then
         local vectors=$(( 2 * cpus + 2 ))
         dev_extra=",mq=on,vectors=$vectors,queues=$cpus"
         netdev_extra=",queues=$cpus"

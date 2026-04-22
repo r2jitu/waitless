@@ -1,17 +1,16 @@
 """scripts/test_helpers.py — Shared utilities for Python integration tests.
 
-Replaces the bash-side `scripts/helpers.sh` for test targets. Each app's
-test.py imports from here to get:
+Each app's test.py imports from here to get:
 
   * Runfiles discovery (`runfiles_root()`).
-  * QEMU runner detection (`detect_qemu()`).
   * Launcher spawning — backgrounded (for probes) or PTY-driven (for
     Ctrl-C / log-based tests).
   * HTTP / HTTPS / UDP probe helpers.
 
-The bash `helpers.sh` sticks around for `bazel/rules/run_*.sh` interactive
-launchers — those stay bash-native so `bazel run` keeps working without a
-Python round-trip.
+Tests invoke the app's per-variant launcher target directly (from
+`//bazel/rules:variants.bzl`), so the previous in-Python QEMU-arg
+builder / detector is gone — the launcher owns all runner-specific
+invocation.
 """
 
 from __future__ import annotations
@@ -20,7 +19,6 @@ import http.client
 import os
 import pty
 import select
-import shutil
 import signal
 import socket
 import ssl
@@ -41,114 +39,6 @@ def runfiles_root() -> Path:
     if rf:
         return Path(rf) / "_main"
     return Path(f"{sys.argv[0]}.runfiles") / "_main"
-
-
-# ── QEMU runner detection ───────────────────────────────────────────────────
-
-@dataclass
-class QemuConfig:
-    binary: str
-    machine: list[str]
-    virtio_dev: str
-    kernel_arg: str  # Path to .elf (x86) or .img (aarch64) for `-kernel`.
-
-
-def detect_qemu(elf_path: Path, img_path: Optional[Path] = None) -> Optional[QemuConfig]:
-    """Pick the right qemu-system-* + machine args for an ELF.
-
-    Returns None if the matching qemu binary isn't on $PATH — caller
-    should SKIP the test.
-
-    `img_path` is the raw binary consumed by aarch64 QEMU via
-    `-kernel` (the ELF is PIE, QEMU can't load it). Optional for
-    backwards compatibility; defaults to `elf_path.with_suffix(".img")`.
-    Variant-launcher callers pass both paths explicitly so the test
-    harness doesn't have to mirror the runner script's co-located-
-    file convention.
-    """
-    info = _file_magic(elf_path)
-    host_arch = os.uname().machine
-    host_os = os.uname().sysname
-
-    if "ARM aarch64" in info:
-        binary = "qemu-system-aarch64"
-        machine = ["-machine", "virt", "-cpu", "max"]
-        virtio_dev = "virtio-net-device"
-        kernel_arg = str(img_path if img_path else elf_path.with_suffix(".img"))
-        if not Path(kernel_arg).exists():
-            raise FileNotFoundError(f".img not found: {kernel_arg}")
-    else:
-        binary = "qemu-system-x86_64"
-        virtio_dev = "virtio-net-pci"
-        kernel_arg = str(elf_path)
-        # -cpu host under HVF/KVM, -cpu max under TCG; see the old bash
-        # detect_qemu for rationale around AVX + qemu64.
-        if host_arch == "x86_64":
-            if host_os == "Darwin" and _mac_has_hvf():
-                machine = ["-cpu", "host", "-accel", "hvf"]
-            elif host_os == "Linux" and os.access("/dev/kvm", os.R_OK):
-                machine = ["-cpu", "host", "-accel", "kvm"]
-            else:
-                machine = ["-cpu", "max"]
-        else:
-            machine = ["-cpu", "max"]
-
-    if not shutil.which(binary):
-        return None
-
-    return QemuConfig(
-        binary=binary,
-        machine=machine,
-        virtio_dev=virtio_dev,
-        kernel_arg=kernel_arg,
-    )
-
-
-def _file_magic(path: Path) -> str:
-    try:
-        return subprocess.check_output(["file", "-b", str(path)], text=True)
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return ""
-
-
-def _mac_has_hvf() -> bool:
-    try:
-        out = subprocess.check_output(
-            ["sysctl", "-n", "kern.hv_support"], text=True
-        ).strip()
-        return out == "1"
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return False
-
-
-# ── QEMU args builder ───────────────────────────────────────────────────────
-
-def qemu_net_args(
-    *, http_port: int, tls_port: int, udp_port: int,
-    virtio_dev: str, cpus: int = 1,
-) -> list[str]:
-    """Canonical port-forward `-device ... -netdev ...` pair.
-
-    Same layout as scripts/helpers.sh::_qemu_net_args — HTTP on :80,
-    HTTPS on :443, UDP echo on :7.
-    """
-    dev_extra = ""
-    netdev_extra = ""
-    if cpus > 1 and "-pci" in virtio_dev:
-        # MMIO devices (virtio-net-device) don't support mq / vectors;
-        # user-mode netdev's queues= only pairs with PCI multi-queue.
-        vectors = 2 * cpus + 2
-        dev_extra = f",mq=on,vectors={vectors},queues={cpus}"
-        netdev_extra = f",queues={cpus}"
-    forwards = (
-        f"hostfwd=tcp::{http_port}-:80"
-        f",hostfwd=tcp::{tls_port}-:443"
-        f",hostfwd=udp::{udp_port}-:7"
-    )
-    return [
-        "-device", f"{virtio_dev}{dev_extra},netdev=net0",
-        "-netdev", f"user,id=net0,{forwards}{netdev_extra}",
-    ]
 
 
 # ── Launcher lifecycle ──────────────────────────────────────────────────────
@@ -210,48 +100,6 @@ def spawn_backgrounded(
     return Launcher(proc=proc, log_path=log_path)
 
 
-# ── Direct QEMU spawn (for serial-log tests: test_smp, test_percpu, etc.) ───
-
-def spawn_qemu(
-    elf_path: Path,
-    *,
-    img_path: Optional[Path] = None,
-    cpus: int = 1,
-    memory_mb: int = 128,
-    extra_args: Optional[list[str]] = None,
-    log_prefix: str = "unikernel_qemu",
-) -> Optional[Launcher]:
-    """Boot `elf_path` under QEMU in the background (no network forwards).
-
-    For tests whose only output channel is the serial log — SMP boot
-    checks, per-core state tests, TLS primitive smoke tests. `img_path`
-    is the raw-binary companion to `elf_path` used by aarch64 QEMU;
-    passed through to `detect_qemu`. Returns None if the matching
-    qemu-system-* isn't on $PATH (caller SKIPs).
-    """
-    qemu = detect_qemu(elf_path, img_path)
-    if qemu is None:
-        return None
-
-    fd, log_path_str = tempfile.mkstemp(prefix=f"{log_prefix}_", suffix=".log")
-    os.close(fd)
-    log_path = Path(log_path_str)
-    argv = [
-        qemu.binary,
-        *qemu.machine,
-        "-m", str(memory_mb), "-smp", str(cpus), "-nographic",
-        "-serial", f"file:{log_path}",
-        "-no-reboot",
-        "-device", f"{qemu.virtio_dev},netdev=net0",
-        "-netdev", "user,id=net0",
-        *(extra_args or []),
-        "-kernel", qemu.kernel_arg,
-    ]
-    proc = subprocess.Popen(
-        argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        stdin=subprocess.DEVNULL,
-    )
-    return Launcher(proc=proc, log_path=log_path)
 
 
 def wait_for_marker(launcher: Launcher, marker: str, *, timeout: float) -> bool:
