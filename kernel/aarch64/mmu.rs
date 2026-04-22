@@ -16,6 +16,7 @@
 #[cfg(target_arch = "aarch64")]
 mod aarch64 {
     use core::arch::asm;
+    use core::cell::UnsafeCell;
 
     // L1 page table set up by boot.S — in .boot_bss, not zeroed by BSS clear.
     unsafe extern "C" {
@@ -30,9 +31,24 @@ mod aarch64 {
     // L2 tables must be in .boot_bss (not .bss) because boot.S zeros .bss
     // AFTER enabling the MMU using boot_l1_table. If L2 tables were in .bss,
     // they'd be zeroed while the MMU is live, causing page faults.
+    //
+    // Pool + cursor live in one UnsafeCell-wrapped struct (plan Phase 7).
+    // Single-owner discipline: `map_device_range` only runs from the BSP
+    // during boot before APs are started.
+    struct L2Pool {
+        tables: [[u64; 512]; MAX_L2_TABLES],
+        next: usize,
+    }
+
+    struct L2PoolSlot(UnsafeCell<L2Pool>);
+    // SAFETY: all mutation is single-threaded on the BSP during boot.
+    unsafe impl Sync for L2PoolSlot {}
+
     #[unsafe(link_section = ".boot_bss")]
-    static mut L2_TABLES: [[u64; 512]; MAX_L2_TABLES] = [[0; 512]; MAX_L2_TABLES];
-    static mut L2_NEXT: usize = 0;
+    static L2_POOL: L2PoolSlot = L2PoolSlot(UnsafeCell::new(L2Pool {
+        tables: [[0; 512]; MAX_L2_TABLES],
+        next: 0,
+    }));
 
     // Descriptor bits (same as boot.S):
     //   L1 table entry:  [addr of L2 table | 0x3] (bits[1:0] = 0b11 = table)
@@ -81,11 +97,12 @@ mod aarch64 {
                 l2 = (l1_entry & !0xFFF_u64) as *mut u64;
             } else {
                 // Need a new L2 table
-                if L2_NEXT >= MAX_L2_TABLES {
+                let pool = &mut *L2_POOL.0.get();
+                if pool.next >= MAX_L2_TABLES {
                     return; // out of L2 tables
                 }
-                l2 = L2_TABLES[L2_NEXT].as_mut_ptr();
-                L2_NEXT += 1;
+                l2 = pool.tables[pool.next].as_mut_ptr();
+                pool.next += 1;
 
                 // If there was a block descriptor, preserve it by filling
                 // the L2 table with equivalent 2MB blocks
