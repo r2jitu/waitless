@@ -27,10 +27,7 @@ rust_library(
     ],
     crate_name = "uni_net_driver",
     crate_root = "driver.rs",
-    rustc_flags = select({
-        "//bazel/platforms:native": ["--cfg=platform_native"],
-        "//conditions:default": ["--cfg=platform_unikernel"],
-    }) + UNIKERNEL_RUSTC_FLAGS,
+    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
 )
 
 # ── Main uni_net crate ─────────────────────────────────────────────
@@ -47,10 +44,7 @@ rust_library(
     ],
     crate_name = "uni_net",
     crate_root = "lib.rs",
-    rustc_flags = select({
-        "//bazel/platforms:native": ["--cfg=platform_native"],
-        "//conditions:default": ["--cfg=platform_unikernel"],
-    }) + UNIKERNEL_RUSTC_FLAGS,
+    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
     deps = [":driver"] + select({
         "//bazel/platforms:native": [
             "//net:tls",

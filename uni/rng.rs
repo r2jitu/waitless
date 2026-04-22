@@ -2,9 +2,9 @@
 //
 // Thin cfg-switch over the two backends:
 //
-//   * `platform_unikernel` → `kernel::rng::fill_bytes` (the kernel-
+//   * `target_os = "none"` → `kernel::rng::fill_bytes` (the kernel-
 //     side PRNG, seeded at boot from `getrandom` via `chacha20`).
-//   * `platform_native`    → `getentropy(2)` (POSIX; available on
+//   * else (unix host)     → `getentropy(2)` (POSIX; available on
 //     macOS + Linux glibc/musl).
 //
 // Callers (TLS handshake seed, test harness, …) get one name
@@ -14,12 +14,12 @@
 // natively without pulling the kernel crate into the native
 // dep-chain.
 
-#[cfg(platform_unikernel)]
+#[cfg(target_os = "none")]
 pub fn fill_bytes(buf: &mut [u8]) {
     kernel::rng::fill_bytes(buf);
 }
 
-#[cfg(platform_native)]
+#[cfg(not(target_os = "none"))]
 pub fn fill_bytes(buf: &mut [u8]) {
     // libc::getentropy fills up to 256 bytes from the host kernel's
     // entropy pool in one syscall. We declare it by hand rather

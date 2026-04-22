@@ -2,9 +2,9 @@
 //
 // Provides safe Rust types: TcpListener, TcpStream, log(), config_port(), etc.
 //
-// Backend selected at compile time via #[cfg]:
-//   - platform_unikernel: unikernel module (lifecycle) + net_stack (TCP)
-//   - platform_native:    native module (POSIX sockets + stdio)
+// Backend is cfg-dispatched on `target_os`:
+//   - target_os = "none"         → unikernel module (kernel crate) + net
+//   - !target_os = "none" (unix) → uni_native crate (POSIX sockets + stdio)
 
 #![no_std]
 
@@ -17,12 +17,12 @@ extern crate alloc;
 // Re-export the #[uni::boot] proc macro.
 pub use uni_macros::boot;
 
-#[cfg(platform_unikernel)]
+#[cfg(target_os = "none")]
 extern crate kernel;
-#[cfg(platform_unikernel)]
+#[cfg(target_os = "none")]
 extern crate drivers;
 
-#[cfg(platform_native)]
+#[cfg(not(target_os = "none"))]
 extern crate uni_native;
 
 // The net stack (`Net::enable`, `NetBringUp`, `EthernetDriver`,
@@ -34,7 +34,7 @@ extern crate uni_native;
 // `drivers → uni` cycle.
 pub extern crate uni_net as net;
 
-#[cfg(platform_unikernel)]
+#[cfg(target_os = "none")]
 mod unikernel;
 
 /// Native-binary entry — called from `bazel/rules/native_main.rs`'s
@@ -42,7 +42,7 @@ mod unikernel;
 /// the `uni_native` crate), plugging in the three uni-side lifecycle
 /// hooks (`boot_info_fn`, `add_worker_listener`, `shutdown_fn`) that
 /// `uni_native` would otherwise need a dep back on `uni` to reach.
-#[cfg(platform_native)]
+#[cfg(not(target_os = "none"))]
 pub fn native_run() -> i32 {
     use crate::boot_info::{BootInfoParams, NicInfo, MAX_NICS};
 
@@ -159,7 +159,7 @@ pub fn run<A: App>(app: A) {
 /// exactly once. Idempotent: `Option::take` clears the slot on
 /// first call.
 pub fn shutdown_and_drop() {
-    #[cfg(platform_unikernel)]
+    #[cfg(target_os = "none")]
     debug_assert_eq!(
         kernel::cpu_id(),
         0,
@@ -182,19 +182,19 @@ pub fn shutdown_and_drop() {
 
 /// Route `shutdown_and_drop` into the platform-specific event-loop
 /// exit path. Called once during `run`.
-#[cfg(platform_unikernel)]
+#[cfg(target_os = "none")]
 fn install_shutdown_hook() {
     kernel::eventloop::set_on_shutdown(shutdown_and_drop);
 }
 
 /// Native's C `main` calls `shutdown_and_drop` directly after
 /// `pthread_join`. Nothing to register at the kernel side.
-#[cfg(platform_native)]
+#[cfg(not(target_os = "none"))]
 fn install_shutdown_hook() {}
 
 // ---- Backend dispatch --------------------------------------------------------
 
-#[cfg(platform_unikernel)]
+#[cfg(target_os = "none")]
 mod backend {
     pub use crate::unikernel::{log, config_port, config_tls_port, check_shutdown, wait_for_events};
     pub use net::tcp::{listen as tcp_listen, accept as tcp_accept, has_data as tcp_has_data,
@@ -222,7 +222,7 @@ mod backend {
 /// event loop). Sits behind the same `mod backend` shape as the
 /// unikernel dispatch above so the cross-platform `pub use
 /// backend::…` block below works uniformly.
-#[cfg(platform_native)]
+#[cfg(not(target_os = "none"))]
 mod backend {
     pub use uni_native::{
         log, config_port, config_tls_port, check_shutdown, wait_for_events,
@@ -244,16 +244,16 @@ pub use backend::tcp_listen_on;
 /// scratch storage.
 #[inline]
 pub fn cpu_id() -> u32 {
-    #[cfg(platform_unikernel)]
+    #[cfg(target_os = "none")]
     { kernel::cpu_id() }
-    #[cfg(platform_native)]
+    #[cfg(not(target_os = "none"))]
     { 0 }
 }
 
 // ---- UDP --------------------------------------------------------------------
 
 /// Bind a UDP port handler. Callback receives (src_ip_octets, src_port, payload).
-#[cfg(platform_unikernel)]
+#[cfg(target_os = "none")]
 pub fn udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
     net::udp::bind(port, handler);
 }
@@ -263,20 +263,20 @@ pub fn udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
 /// under Tier 1 multi-queue. Max array size matches the driver's
 /// MAX_QUEUE_PAIRS (8); consumers should take `[..num_queue_pairs()]`
 /// or just ignore the tail zeros.
-#[cfg(platform_unikernel)]
+#[cfg(target_os = "none")]
 pub fn net_rx_counts() -> [u64; 8] {
     drivers::net::rx_counts()
 }
-#[cfg(platform_native)]
+#[cfg(not(target_os = "none"))]
 pub fn net_rx_counts() -> [u64; 8] { [0; 8] }
 
 /// Number of virtio-net queue pairs actually active (after MQ
 /// activation on Tier 1 paths). 1 for single-queue / Tier 2.
-#[cfg(platform_unikernel)]
+#[cfg(target_os = "none")]
 pub fn net_num_queue_pairs() -> u16 {
     drivers::net::num_queue_pairs()
 }
-#[cfg(platform_native)]
+#[cfg(not(target_os = "none"))]
 pub fn net_num_queue_pairs() -> u16 { 1 }
 
 /// Per-RX-queue `(device_idx, driver_cursor)` used-ring snapshots.
@@ -284,15 +284,15 @@ pub fn net_num_queue_pairs() -> u16 { 1 }
 /// lets `/stats` surface whether traffic is stuck on the device side
 /// (Andromeda not distributing) vs. the driver side (we're not
 /// polling qp N fast enough).
-#[cfg(platform_unikernel)]
+#[cfg(target_os = "none")]
 pub fn net_rx_used_cursors() -> [(u16, u16); 8] {
     drivers::net::rx_used_cursors()
 }
-#[cfg(platform_native)]
+#[cfg(not(target_os = "none"))]
 pub fn net_rx_used_cursors() -> [(u16, u16); 8] { [(0, 0); 8] }
 
 /// Send a UDP datagram.
-#[cfg(platform_unikernel)]
+#[cfg(target_os = "none")]
 pub fn udp_send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
     net::udp::send(dst_ip, src_port, dst_port, data);
 }
@@ -315,7 +315,7 @@ pub struct HeapStats {
 
 /// Snapshot the heap. Cheap on bare-metal (O(1) + spinlock); best-
 /// effort zero on native.
-#[cfg(platform_unikernel)]
+#[cfg(target_os = "none")]
 pub fn heap_stats() -> HeapStats {
     let s = kernel::mm::heap_stats();
     HeapStats {
@@ -328,17 +328,17 @@ pub fn heap_stats() -> HeapStats {
     }
 }
 
-#[cfg(platform_native)]
+#[cfg(not(target_os = "none"))]
 pub fn heap_stats() -> HeapStats {
     HeapStats::default()
 }
 
-#[cfg(platform_native)]
+#[cfg(not(target_os = "none"))]
 pub fn udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
     uni_native::udp_bind(port, handler);
 }
 
-#[cfg(platform_native)]
+#[cfg(not(target_os = "none"))]
 pub fn udp_send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
     uni_native::udp_send(dst_ip, src_port, dst_port, data);
 }

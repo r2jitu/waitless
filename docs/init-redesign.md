@@ -194,7 +194,7 @@ below for the full pattern.
 
 **Native:** `Net` on native is a thin `libc::socket` wrapper;
 same public API, different internal implementation via
-`#[cfg(platform_native)]`.
+`#[cfg(not(target_os = "none"))]`.
 
 ### `uni-http`
 
@@ -617,9 +617,8 @@ store fn pointers via `AtomicPtr<()>` + `transmute`:
 
 - `//net:protocol`'s `FnSlot` — the TCP/UDP dispatch registry
   (landed in Phase 2).
-- `uni/lib.rs`'s native-backend `IO_POLL` + `SERVICE` statics —
-  `fn(u32) -> bool` callbacks for the POSIX worker event loop
-  (`load_poll` in the `#[cfg(platform_native)] mod backend`).
+- `uni-native/src/lib.rs`'s `IO_POLL` + `SERVICE` statics —
+  `fn(u32) -> bool` callbacks for the POSIX worker event loop.
 
 The second site falls under this phase's `static_mut` / global-
 consolidation scope anyway, so lifting both onto a shared

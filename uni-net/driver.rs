@@ -128,11 +128,11 @@ macro_rules! register_ethernet_driver {
 }
 
 // Section-boundary symbols, provided by the linker script for every
-// unikernel target. On `platform_native` these don't exist (no custom
+// unikernel target. On native hosts these don't exist (no custom
 // linker script), so the `linked_ethernet_drivers()` accessor always
 // returns an empty slice there — matches the reality that native
 // doesn't use ethernet drivers at all.
-#[cfg(platform_unikernel)]
+#[cfg(target_os = "none")]
 unsafe extern "Rust" {
     static __start_uni_drivers_ethernet: EthernetDriverReg;
     static __stop_uni_drivers_ethernet: EthernetDriverReg;
@@ -142,7 +142,7 @@ unsafe extern "Rust" {
 /// `uni-driver-*` crate is in the dep graph (compute-only apps). One
 /// `unsafe` block — every other step of the registration mechanism
 /// is safe Rust.
-#[cfg(platform_unikernel)]
+#[cfg(target_os = "none")]
 pub fn linked_ethernet_drivers() -> &'static [EthernetDriverReg] {
     // SAFETY: the linker guarantees `__start_*` ≤ `__stop_*` and
     // that `[start, stop)` is a contiguous run of `EthernetDriverReg`
@@ -162,7 +162,7 @@ pub fn linked_ethernet_drivers() -> &'static [EthernetDriverReg] {
 /// Native builds have no linker section, so always return empty.
 /// Apps on native reach the network through POSIX sockets, not
 /// ethernet drivers.
-#[cfg(platform_native)]
+#[cfg(not(target_os = "none"))]
 pub fn linked_ethernet_drivers() -> &'static [EthernetDriverReg] {
     &[]
 }

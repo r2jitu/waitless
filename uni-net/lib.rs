@@ -45,16 +45,16 @@ pub use uni_net_driver::register_ethernet_driver;
 // `net::tls_server::X` / `net::tcp::X` via the `uni::net` alias in
 // `uni/lib.rs`.
 
-#[cfg(platform_unikernel)]
+#[cfg(target_os = "none")]
 extern crate net as net_umbrella;
 
-#[cfg(platform_unikernel)]
+#[cfg(target_os = "none")]
 pub use net_umbrella::*;
 
-#[cfg(platform_native)]
+#[cfg(not(target_os = "none"))]
 extern crate net_tls_server as net_tls_server_impl;
 
-#[cfg(platform_native)]
+#[cfg(not(target_os = "none"))]
 pub mod tls_server {
     pub use crate::net_tls_server_impl::*;
 }
@@ -64,9 +64,10 @@ pub mod tls_server {
 use core::cell::UnsafeCell;
 
 /// IPv4 octets, network-order storage. Defined locally (rather than
-/// re-exported from `net_types`) so the API compiles on both
-/// `platform_unikernel` and `platform_native`. The bare-metal
-/// backend converts via the private `to_net_ipv4` helper below.
+/// re-exported from `net_types`) so the API compiles on both the
+/// bare-metal (`target_os = "none"`) and native backends. The
+/// bare-metal backend converts via the private `to_net_ipv4` helper
+/// below.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ipv4Addr(pub [u8; 4]);
 
@@ -164,7 +165,7 @@ impl Net {
         // Native builds skip this check — `linked_ethernet_drivers()`
         // is stubbed to `&[]` there and networking flows through
         // POSIX sockets, not ethernet drivers.
-        #[cfg(platform_unikernel)]
+        #[cfg(target_os = "none")]
         {
             let drivers = uni_net_driver::linked_ethernet_drivers();
             if drivers.is_empty() {
@@ -198,12 +199,12 @@ impl Net {
     /// actually produced one (shouldn't happen under normal
     /// config; present for symmetry with Phase-8 Net APIs).
     pub fn local_ip(&self) -> Ipv4Addr {
-        #[cfg(platform_unikernel)]
+        #[cfg(target_os = "none")]
         {
             let o = crate::types::CONFIG.ip().octets();
             Ipv4Addr(o)
         }
-        #[cfg(platform_native)]
+        #[cfg(not(target_os = "none"))]
         {
             // Native runs over POSIX sockets — we don't manage
             // the interface address. Return UNSPECIFIED so apps
@@ -233,7 +234,7 @@ pub fn clear_on_shutdown() {
 // Backend dispatch — unikernel vs native
 // ----------------------------------------------------------------------------
 
-#[cfg(platform_unikernel)]
+#[cfg(target_os = "none")]
 fn bringup(cfg: NetBringUp) -> Result<(), NetError> {
     match cfg {
         NetBringUp::Dhcp => {
@@ -257,7 +258,7 @@ fn bringup(cfg: NetBringUp) -> Result<(), NetError> {
     }
 }
 
-#[cfg(platform_native)]
+#[cfg(not(target_os = "none"))]
 fn bringup(_cfg: NetBringUp) -> Result<(), NetError> {
     // The native backend runs over POSIX sockets; the host
     // manages interface configuration. `Net::enable` is
@@ -270,7 +271,7 @@ fn bringup(_cfg: NetBringUp) -> Result<(), NetError> {
 /// `uni_net::Ipv4Addr` → bare-metal `net_types::Ipv4Addr`. Kept as a
 /// standalone helper rather than a `From` impl so we don't need a
 /// cross-crate orphan dance.
-#[cfg(platform_unikernel)]
+#[cfg(target_os = "none")]
 fn to_net_ipv4(a: Ipv4Addr) -> net_umbrella::types::Ipv4Addr {
     let [o0, o1, o2, o3] = a.0;
     net_umbrella::types::Ipv4Addr::from(o0, o1, o2, o3)

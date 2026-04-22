@@ -27,7 +27,7 @@ use crate::{TcpListener, TcpStream};
 // `//net:net` at the crate root). This `use` bridges the two
 // lookup paths so the rest of the file doesn't need cfg gates
 // for every TLS reference.
-#[cfg(platform_native)]
+#[cfg(not(target_os = "none"))]
 use crate::net;
 
 // Re-export the TLS config type so apps can write `uni::http::TlsServerConfig`
@@ -529,7 +529,7 @@ impl Server {
                 self.cores[core_id as usize].active[i].conn = None;
                 self.cores[core_id as usize].active[i].buf_len = 0;
                 self.cores[core_id as usize].active[i].idle_ticks = 0;
-                #[cfg(platform_unikernel)]
+                #[cfg(target_os = "none")]
                 { self.cores[core_id as usize].active[i].tls = None; }
                 had_work = true;
                 continue;

@@ -13,10 +13,7 @@ rust_library(
         "unikernel.rs",
     ],
     proc_macro_deps = ["//uni/macros:uni_macros"],
-    rustc_flags = select({
-        "//bazel/platforms:native": ["--cfg=platform_native"],
-        "//conditions:default": ["--cfg=platform_unikernel"],
-    }) + UNIKERNEL_RUSTC_FLAGS,
+    rustc_flags = UNIKERNEL_RUSTC_FLAGS,
     # `//uni-net` owns everything net-stack-related (Net::enable,
     # NetBringUp, error types, EthernetDriver trait, and the
     # transitive TCP/UDP/TLS umbrella). `uni` re-exports it as
