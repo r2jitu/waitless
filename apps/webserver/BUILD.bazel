@@ -4,15 +4,6 @@ load("//bazel/rules:rust.bzl", "UNIKERNEL_RUSTC_FLAGS")
 load("//bazel/rules:unikernel.bzl", "port_fwd", "unikernel_binary")
 load("//bazel/rules:variants.bzl", "unikernel_app_test")
 
-# HTTP / HTTPS / UDP-echo port layout specific to this app. Declared
-# here rather than in a shared .bzl file because no other current
-# app uses all three forwards.
-_WEBSERVER_PORT_FORWARDS = [
-    port_fwd("tcp", env = "UNIKERNEL_PORT", default_host = 8080, guest = 80),
-    port_fwd("tcp", env = "UNIKERNEL_TLS_PORT", default_host = 8443, guest = 443),
-    port_fwd("udp", env = "UNIKERNEL_UDP_PORT", default_host = 8007, guest = 7),
-]
-
 package(default_visibility = ["//visibility:public"])
 
 # Application library — pure business logic, no platform boilerplate.
@@ -30,7 +21,11 @@ rust_library(
 unikernel_binary(
     name = "webserver",
     app = ":app",
-    port_forwards = _WEBSERVER_PORT_FORWARDS,
+    port_forwards = [
+        port_fwd("tcp", env = "UNIKERNEL_PORT", default_host = 8080, guest = 80),
+        port_fwd("tcp", env = "UNIKERNEL_TLS_PORT", default_host = 8443, guest = 443),
+        port_fwd("udp", env = "UNIKERNEL_UDP_PORT", default_host = 8007, guest = 7),
+    ],
 )
 
 # Per-variant integration tests (generates `:test_hvf`, `:test_iso`,
