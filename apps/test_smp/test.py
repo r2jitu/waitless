@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """apps/test_smp/test.py — SMP boot + IPI delivery integration test.
 
-Boots the test_smp launcher (which itself handles the per-variant
-QEMU / HVF invocation, including the 4-vCPU default from the
-unikernel_binary attr), waits for the app's "SMP test complete"
-marker, then asserts against the serial log:
+Boots the test_smp launcher (which handles the per-variant QEMU /
+HVF invocation, including the 4-vCPU default from the
+unikernel_binary attr) via `run_variant_and_capture`, then asserts
+against the captured serial log:
   * All 4 cores come online.
   * Each AP logs its own online message.
   * The app reached main and shut down.
@@ -16,40 +16,20 @@ from __future__ import annotations
 import os
 import unittest
 
-from scripts.test_helpers import (
-    runfiles_root,
-    spawn_backgrounded,
-    wait_for_marker,
-)
+from scripts.test_helpers import run_variant_and_capture
 
 
 EXPECTED_CPUS = 4
 
 
 class SmpBootTest(unittest.TestCase):
-    launcher = None
     serial: str = ""
 
     @classmethod
     def setUpClass(cls) -> None:
-        launcher_name = os.environ["LAUNCHER_NAME"]
-        launcher_path = runfiles_root() / "apps" / "test_smp" / launcher_name
-        if not (launcher_path.is_file() and os.access(launcher_path, os.X_OK)):
-            raise unittest.SkipTest(f"launcher not executable: {launcher_path}")
-        cls.launcher = spawn_backgrounded(launcher_path, log_prefix=launcher_name)
-
-        # The app prints the completion marker then self-shuts-down.
-        # 15 s is generous for TCG on a slow host.
-        if not wait_for_marker(cls.launcher, "SMP test complete", timeout=15.0):
-            cls.launcher.cleanup()
-            raise RuntimeError("guest never printed 'SMP test complete'")
-        cls.launcher.terminate()
-        cls.serial = cls.launcher.log_path.read_text(errors="replace")
-
-    @classmethod
-    def tearDownClass(cls) -> None:
-        if cls.launcher is not None:
-            cls.launcher.cleanup()
+        cls.serial = run_variant_and_capture(
+            "test_smp", marker="SMP test complete", timeout=15.0,
+        )
 
     def test_all_cores_online(self) -> None:
         self.assertIn(f"{EXPECTED_CPUS}/{EXPECTED_CPUS} cores online", self.serial)

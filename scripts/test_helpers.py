@@ -100,6 +100,33 @@ def spawn_backgrounded(
     return Launcher(proc=proc, log_path=log_path)
 
 
+def run_variant_and_capture(
+    package: str, *, marker: str, timeout: float,
+) -> str:
+    """Spawn the `LAUNCHER_NAME` variant in `apps/<package>`, wait for
+    `marker`, terminate, and return the captured serial log.
+
+    Encapsulates the "boot, wait for a terminal marker, assert on the
+    log" pattern used by apps that don't probe the guest over the
+    network (test_smp, test_percpu, test_tls). setUpClass shrinks to
+    one call; the launcher's lifecycle + temp-log cleanup happen
+    inside this function.
+    """
+    import unittest  # local — this helper is only used in test setUp paths.
+    launcher_name = os.environ["LAUNCHER_NAME"]
+    launcher_path = runfiles_root() / "apps" / package / launcher_name
+    if not (launcher_path.is_file() and os.access(launcher_path, os.X_OK)):
+        raise unittest.SkipTest(f"launcher not executable: {launcher_path}")
+    launcher = spawn_backgrounded(launcher_path, log_prefix=launcher_name)
+    try:
+        if not wait_for_marker(launcher, marker, timeout=timeout):
+            raise RuntimeError(
+                f"guest never printed {marker!r} within {timeout}s"
+            )
+        launcher.terminate()
+        return launcher.log_path.read_text(errors="replace")
+    finally:
+        launcher.cleanup()
 
 
 def wait_for_marker(launcher: Launcher, marker: str, *, timeout: float) -> bool:
