@@ -53,16 +53,6 @@ def port_fwd(proto, env, default_host, guest):
         fail("port_fwd: guest must be a TCP/UDP port (1–65535), got '{}'".format(guest))
     return "{}:{}:{}:{}".format(proto, env, default_host, guest)
 
-# Standard HTTP + HTTPS + UDP-echo port layout used by
-# `apps/webserver`. Exported for other apps that want the same
-# three forwards; apps with different needs list their own
-# `port_fwd()` entries (or rely on the `[]` default for
-# non-interactive test apps).
-HTTP_HTTPS_UDP_FORWARDS = [
-    port_fwd("tcp", env = "UNIKERNEL_PORT", default_host = 8080, guest = 80),
-    port_fwd("tcp", env = "UNIKERNEL_TLS_PORT", default_host = 8443, guest = 443),
-    port_fwd("udp", env = "UNIKERNEL_UDP_PORT", default_host = 8007, guest = 7),
-]
 
 # Bare-metal linker flags (passed to rust-lld via -C link-arg).
 _LINK_FLAGS = [
