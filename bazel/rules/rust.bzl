@@ -5,12 +5,23 @@ via --@rules_rust//:extra_rustc_flags. This file provides the per-target
 symbolic flag lists.
 """
 
+load("@rules_rust//rust:defs.bzl", _rust_proc_macro = "rust_proc_macro")
+
 # ARM64 unikernel targets need PIC for position-independent ELF
 # (boot.S applies relocations at runtime). x86_64 and native don't.
 UNIKERNEL_RUSTC_FLAGS = select({
     "//bazel/platforms:aarch64": ["-C", "relocation-model=pic"],
     "//conditions:default": [],
 })
+
+# Proc-macros are dylibs loaded into rustc, so a panic in the macro
+# unwinds into the compiler. rustc warns ("building proc macro crate
+# with `panic=abort` may crash the compiler...") on every proc-macro
+# target under the global `-Cpanic=abort`. Pin `-Cpanic=unwind` via
+# the target's own `rustc_flags` — those are appended AFTER
+# `extra_rustc_flags`, so the unwind flag is last-wins.
+def rust_proc_macro(rustc_flags = [], **kwargs):
+    _rust_proc_macro(rustc_flags = rustc_flags + ["-Cpanic=unwind"], **kwargs)
 
 # Panic strategy is handled in `.bazelrc`:
 #
