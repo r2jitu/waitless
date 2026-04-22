@@ -156,12 +156,22 @@ struct TimerNode {
 
 const PENDING_POOL_SIZE: usize = 64;
 
-static mut PENDING_POOL: [TimerNode; PENDING_POOL_SIZE] = [const {
+// Pool storage. `static_mut` replaced with an `UnsafeCell`-wrapped
+// slot (plan Phase 7) — the nodes themselves are mutated exclusively
+// through raw pointers once `init_pool` has built the free list, so
+// the single-owner contract is preserved. Lock-free alloc/free use
+// the atomic head pointer.
+struct PoolSlot(core::cell::UnsafeCell<[TimerNode; PENDING_POOL_SIZE]>);
+// SAFETY: `init_pool` runs once (guarded by `PENDING_POOL_INIT`);
+// after that, node mutation goes through raw pointers + atomics.
+unsafe impl Sync for PoolSlot {}
+
+static PENDING_POOL: PoolSlot = PoolSlot(core::cell::UnsafeCell::new([const {
     TimerNode {
         timer: Timer { deadline: 0, func: noop, arg: 0 },
         next: 0,
     }
-}; PENDING_POOL_SIZE];
+}; PENDING_POOL_SIZE]));
 
 static PENDING_POOL_HEAD: AtomicUsize = AtomicUsize::new(0);
 static PENDING_POOL_INIT: AtomicUsize = AtomicUsize::new(0);
@@ -173,12 +183,13 @@ fn init_pool() {
         return;
     }
     unsafe {
+        let pool = &mut *PENDING_POOL.0.get();
         // Build free list
         for i in 0..PENDING_POOL_SIZE - 1 {
-            PENDING_POOL[i].next = &PENDING_POOL[i + 1] as *const _ as usize;
+            pool[i].next = &raw const pool[i + 1] as usize;
         }
-        PENDING_POOL[PENDING_POOL_SIZE - 1].next = 0;
-        PENDING_POOL_HEAD.store(&PENDING_POOL[0] as *const _ as usize, Ordering::Release);
+        pool[PENDING_POOL_SIZE - 1].next = 0;
+        PENDING_POOL_HEAD.store(&raw const pool[0] as usize, Ordering::Release);
     }
 }
 

@@ -437,9 +437,16 @@ struct CtrlMqBuf {
     ack: u8,
     _tail: [u8; 7],
 }
-static mut CTRL_MQ_BUF: CtrlMqBuf = CtrlMqBuf {
+// CTRL-VQ scratch. Only written from `ctrl_mq_set_pairs`, which the
+// driver init path calls once on the BSP before any AP is running.
+// `UnsafeCell` + `unsafe impl Sync` per init-redesign Phase 7.
+struct CtrlMqBufSlot(core::cell::UnsafeCell<CtrlMqBuf>);
+// SAFETY: BSP-only during driver init; no concurrent access.
+unsafe impl Sync for CtrlMqBufSlot {}
+
+static CTRL_MQ_BUF: CtrlMqBufSlot = CtrlMqBufSlot(core::cell::UnsafeCell::new(CtrlMqBuf {
     hdr_class: 0, hdr_cmd: 0, data: [0; 2], _pad: [0; 4], ack: 0, _tail: [0; 7],
-};
+}));
 
 /// Send VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET to activate N queue pairs.
 fn ctrl_mq_set_pairs(num_pairs: u16) {
@@ -454,7 +461,7 @@ fn ctrl_mq_set_pairs(num_pairs: u16) {
     // is silently rejected.
     unsafe {
         // Write into the static buffer (guaranteed low-memory / contiguous).
-        let buf_ptr = &raw mut CTRL_MQ_BUF;
+        let buf_ptr = CTRL_MQ_BUF.0.get();
         (*buf_ptr).hdr_class = 4; // VIRTIO_NET_CTRL_MQ
         (*buf_ptr).hdr_cmd = 0;   // VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET
         (*buf_ptr).data = num_pairs.to_le_bytes();

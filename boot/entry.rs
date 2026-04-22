@@ -340,7 +340,15 @@ mod boot_shim_fdt {
 // Shared boot sequence
 // ============================================================================
 
-static mut G_BOOT_INFO: BootInfo = BootInfo::zeroed();
+// Scratch for the legacy entry's BootInfo — populated by the arch-
+// specific shim, then handed to `kernel_boot` as an immutable ref.
+// `UnsafeCell` + `unsafe impl Sync` per Phase 7.
+struct BootInfoSlot(core::cell::UnsafeCell<BootInfo>);
+// SAFETY: BSP-only during boot; the shim writes it and `kernel_boot`
+// reads it, both on the same thread with no overlap.
+unsafe impl Sync for BootInfoSlot {}
+
+static G_BOOT_INFO: BootInfoSlot = BootInfoSlot(core::cell::UnsafeCell::new(BootInfo::zeroed()));
 
 unsafe fn kernel_boot(info: &BootInfo) {
     unsafe {
@@ -671,15 +679,14 @@ pub unsafe extern "C" fn kernel_main(boot_info_addr: u64) {
         }
 
         // SAFETY: G_BOOT_INFO is touched only here during single-
-        // threaded boot before any AP starts. Reborrow through a raw
-        // pointer to satisfy the static_mut_refs lint.
-        boot_shim_fdt::shim(&mut *(&raw mut G_BOOT_INFO), boot_info_addr);
+        // threaded boot before any AP starts.
+        boot_shim_fdt::shim(&mut *G_BOOT_INFO.0.get(), boot_info_addr);
     }
 
     #[cfg(target_arch = "x86_64")]
-    boot_shim_x86::shim(&mut *(&raw mut G_BOOT_INFO), boot_info_addr);
+    boot_shim_x86::shim(&mut *G_BOOT_INFO.0.get(), boot_info_addr);
 
-    kernel_boot(&*(&raw const G_BOOT_INFO));
+    kernel_boot(&*G_BOOT_INFO.0.get());
     }
 }
 

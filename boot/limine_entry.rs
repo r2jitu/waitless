@@ -178,7 +178,15 @@ unsafe extern "C" {
     fn kernel_boot_from_bootinfo(info: *const BootInfo);
 }
 
-static mut LIMINE_BOOT_INFO: BootInfo = BootInfo {
+// Populated once by `limine_entry` during boot, then treated as
+// read-only for the life of the kernel (kernel_boot_from_bootinfo
+// only reads). `UnsafeCell` + `unsafe impl Sync` per Phase 7.
+struct LimineBootInfoSlot(core::cell::UnsafeCell<BootInfo>);
+// SAFETY: single write on the BSP before `kernel_boot_from_bootinfo`
+// is called; immutable afterwards.
+unsafe impl Sync for LimineBootInfoSlot {}
+
+static LIMINE_BOOT_INFO: LimineBootInfoSlot = LimineBootInfoSlot(core::cell::UnsafeCell::new(BootInfo {
     protocol: Protocol::Limine,
     memory_map_count: 0,
     memory_map: [MemoryRegion { base: 0, length: 0, region_type: 0, _pad: 0 }; MAX_MEMORY_REGIONS],
@@ -187,7 +195,7 @@ static mut LIMINE_BOOT_INFO: BootInfo = BootInfo {
     kernel_virt_base: 0,
     hhdm_offset: 0,
     rsdp_paddr: 0,
-};
+}));
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn limine_entry() {
@@ -281,8 +289,8 @@ pub unsafe extern "C" fn limine_entry() {
 
     // Commit the populated BootInfo to the static and call into the kernel.
     unsafe {
-        core::ptr::write(&raw mut LIMINE_BOOT_INFO, info);
-        kernel_boot_from_bootinfo(&raw const LIMINE_BOOT_INFO);
+        core::ptr::write(LIMINE_BOOT_INFO.0.get(), info);
+        kernel_boot_from_bootinfo(LIMINE_BOOT_INFO.0.get() as *const BootInfo);
     }
 }
 

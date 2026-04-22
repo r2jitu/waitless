@@ -15,8 +15,14 @@ const MAX_CORES: usize = 8;
 // Per-core test results: 0 = pending, 1 = pass, 2 = fail
 static RESULTS: [AtomicU8; MAX_CORES] = [const { AtomicU8::new(0) }; MAX_CORES];
 
-// Per-core test data: each core should see its own ID here
-static mut TEST_DATA: [u32; MAX_CORES] = [0xFFFFFFFF; MAX_CORES];
+// Per-core test data: each core should see its own ID here.
+// Seeded from the boot thread before APs spin up; read by each AP's
+// `test_service` callback. Single-writer boot contract + per-slot
+// read from each AP → `UnsafeCell` + `unsafe impl Sync`.
+struct TestDataSlot(core::cell::UnsafeCell<[u32; MAX_CORES]>);
+unsafe impl Sync for TestDataSlot {}
+static TEST_DATA: TestDataSlot =
+    TestDataSlot(core::cell::UnsafeCell::new([0xFFFFFFFF; MAX_CORES]));
 
 fn test_service(core_id: u32) -> bool {
     // Only run the test once per core
@@ -34,7 +40,7 @@ fn test_service(core_id: u32) -> bool {
         }
 
         // Verify we can see our test data
-        if TEST_DATA[core_id as usize] != core_id {
+        if (*TEST_DATA.0.get())[core_id as usize] != core_id {
             RESULTS[core_id as usize].store(2, Ordering::Release);
             return true;
         }
@@ -65,7 +71,7 @@ fn boot() {
 
     // Write test data for each core
     for i in 0..num_cores {
-        unsafe { TEST_DATA[i as usize] = i; }
+        unsafe { (*TEST_DATA.0.get())[i as usize] = i; }
     }
 
     // Register service callback

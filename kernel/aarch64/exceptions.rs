@@ -127,7 +127,19 @@ mod aarch64 {
     // ---- IRQ handler table ------------------------------------------------
 
     const MAX_IRQS: usize = 256;
-    static mut IRQ_HANDLERS: [Option<fn(u32)>; MAX_IRQS] = [None; MAX_IRQS];
+
+    // IRQ handler table. Registered on the BSP during boot via
+    // `register_irq_handler`; read from the exception handler on any
+    // core. Per-slot writes + reads are single-word and tearing-safe
+    // on aarch64, which matches the pre-refactor invariant. Wrapped
+    // in `UnsafeCell` + `unsafe impl Sync` per init-redesign Phase 7.
+    struct IrqHandlersSlot(core::cell::UnsafeCell<[Option<fn(u32)>; MAX_IRQS]>);
+    // SAFETY: single-writer (BSP) with single-word slot stores; readers
+    // only observe fully-published handler pointers.
+    unsafe impl Sync for IrqHandlersSlot {}
+
+    static IRQ_HANDLERS: IrqHandlersSlot =
+        IrqHandlersSlot(core::cell::UnsafeCell::new([None; MAX_IRQS]));
 
     // ---- Exception handler (called from vector stubs in boot.S) -----------
 
@@ -156,7 +168,7 @@ mod aarch64 {
                 let intid = (iar & 0xFF_FFFF) as u32;
                 if intid < 1020 {
                     if (intid as usize) < MAX_IRQS {
-                        if let Some(handler) = IRQ_HANDLERS[intid as usize] {
+                        if let Some(handler) = (*IRQ_HANDLERS.0.get())[intid as usize] {
                             handler(intid);
                         }
                     }
@@ -167,7 +179,7 @@ mod aarch64 {
                 let irq = iar & 0x3FF;
                 if irq < 1020 {
                     if (irq as usize) < MAX_IRQS {
-                        if let Some(handler) = IRQ_HANDLERS[irq as usize] {
+                        if let Some(handler) = (*IRQ_HANDLERS.0.get())[irq as usize] {
                             handler(irq);
                         }
                     }
@@ -401,7 +413,7 @@ mod aarch64 {
             if (irq as usize) >= MAX_IRQS {
                 return;
             }
-            IRQ_HANDLERS[irq as usize] = Some(handler);
+            (*IRQ_HANDLERS.0.get())[irq as usize] = Some(handler);
 
             if !GIC.is_initialized() || gicd_base() == 0 {
                 return;
