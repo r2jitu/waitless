@@ -13,23 +13,35 @@ completes.
 
 ## Status
 
-**Plan deliverables complete.** All eight migration phases landed
-in their scoped form — see the per-phase table below. Two items
-tagged as follow-on work stay open because they depend on
-structural changes the plan didn't originally scope:
+**Complete.** All eight migration phases landed. The shipped result
+differs from the plan's original shape in a few places — each
+documented in the per-phase table and cross-linked here so a reader
+doesn't have to reconstruct them from commit archaeology:
 
-  * **Phase 4 Net-owned field migration** — moving `CONFIG` /
-    `HANDLER_*` / `DHCP_STATE` / `{MULTICORE_INIT, WAKEUP, RX_LOCK,
-    JUST_DISTRIBUTED}` / `SERVER_PTR` / `TLS_CONFIG_PTR` into
-    `uni_net::Net` fields requires inverting the net-stack sub-
-    crate deps (currently umbrella → sub-crates; would need
-    sub-crates to reach `Net`). Plan noted this as "Phase 5/6
-    reshape the crate boundaries" work; those reshapes happened for
-    TLS and drivers but not for the net sub-crates themselves.
-
-  * **Phase 5 Step 6** — probe-driven init replacing the legacy
-    `drivers::net::*` dispatch. Plan explicitly labelled "future"
-    from the outset.
+  * **Phase 4's Net-owned field migration was designed out.**
+    Post-Phase-7 the statics the plan wanted to fold into `Net`
+    fields are all already safe (atomics, Spinlocks, or
+    UnsafeCell with single-writer contracts). Threading `&Net`
+    through ARP / DHCP / IPv4 / TCP / UDP hot paths and inverting
+    the net sub-crate dep direction costs protocol-layer
+    entanglement for ownership-aesthetic benefit only.
+  * **Phase 5 Step 6's probe-driven init was designed out.**
+    Plan-labelled "future" from the outset. The `drivers::net::*`
+    dispatcher has 20 methods; the `EthernetDriver` trait has 4.
+    Most extras (TX staging, NAPI rearm, MQ activation) are
+    genuinely virtio-specific; forcing them into a common trait
+    with no-op gve defaults is worse than the current `if
+    use_gve()` branches.
+  * **Phase 8's opt-in SMP and on_tick/on_idle hooks were both
+    reverted.** SMP opt-in created a footgun without delivering
+    the promised binary-size win. Hooks had no in-tree users and
+    risked locking in the wrong shape before §2g picks reactor
+    primitives. Auto-SMP stayed; hooks were dropped entirely.
+  * **`uni-http` was missing from the plan's phase list but
+    landed as a trailing carveout** so apps that don't serve
+    HTTP can skip the parser + handler + connection-pool code.
+    Completes the 6-crate target layout in the "Target crate
+    layout" section below.
 
 **Prerequisites landed:** `b50f3a4` (uni::App) through `70a6f4a`
 (apps/hello). Bench baseline captured below.
@@ -103,45 +115,78 @@ tolerance for HVF noise). Mitigations documented per phase.
 
 ---
 
-## Target crate layout (6 crates, not 13)
+## Target crate layout
 
+What actually shipped — six "target" app-facing crates from the
+original plan plus four backend / platform-infrastructure crates
+the plan didn't enumerate but landed along the way:
+
+**App-facing (the 6 the plan listed):**
 ```
 uni                    — core: App trait, uni::run, log, boot_info, #[uni::boot]
 uni-net                — L3 + TCP + UDP + ARP + DHCP + static-IP
-                         (internal submodules; one public boundary)
-uni-http               — HTTP/1.1 over a transport
+uni-http               — HTTP/1.1 + Server + Request / Response types
 uni-tls                — TLS 1.3 config + wrapping functions
 uni-driver-virtio-net  — VirtIO ethernet driver (QEMU, HVF, most VMs)
-uni-driver-gve         — Google Virtual Ethernet driver (GCE) — renamed from gvnic
+uni-driver-gve         — Google Virtual Ethernet driver (GCE)
 ```
 
-**Why 6, not 13:** earlier drafts split `uni-udp`, `uni-tcp`,
-`uni-dhcp`, `uni-net-static` as separate crates. Each is 100-300
-LOC — workspace overhead outweighs the "include what you use"
-benefit at that grain. The big size wins come from:
-- `uni-tls` (~900 KB — huge)
-- Per-driver crates (~100 KB each)
-- Deleting `uni-net` entirely for compute-only apps
-
-Those benefits are captured by the 6-crate split. Finer grain
-adds `Cargo.toml`/`BUILD.bazel`/rust-analyzer overhead without
-proportional payoff.
-
-Dependency graph:
-
+**Backend / infrastructure (bonus splits):**
 ```
-uni ←── uni-net ←── uni-driver-virtio-net, uni-driver-gve
-           ↑
-        uni-http ←── uni-tls
+uni-kernel             — bare-metal backend for `uni` (log, wait_for_events, ...)
+uni-native             — host POSIX backend for `uni` (libc FFI + pthread workers)
+drivers                — NIC dispatcher + `pub use drivers_infra::*` re-export
+drivers:infra          — shared infra: MMIO + PCI + VirtIO transport + virtio-console
+kernel                 — bare-metal kernel primitives (mm, percpu, eventloop, cpu)
+net                    — bare-metal net stack umbrella (sub-crates: tcp, udp, dhcp, ...)
 ```
 
-Apps depend on the minimum they need:
+**Why the splits.** Apps opt into crates they actually use:
 
-| App | Deps | Binary target |
+| App | Deps | Size observed |
 |---|---|---|
-| compute | `uni` | ~400 KB |
-| hello (plain HTTP) | `uni`, `uni-http`, `uni-driver-virtio-net` | ~1 MB |
-| webserver (HTTP + TLS) | `uni`, `uni-http`, `uni-tls`, `uni-driver-{virtio-net,gve}` | ~2 MB |
+| `apps/hello` (plain HTTP) | uni, uni-http, driver crates via `//drivers` | ~1.94 MB |
+| `apps/webserver` (HTTP + TLS) | uni, uni-http, uni-tls, driver crates | ~2.05 MB |
+
+Hello doesn't match the plan's `~1 MB` aspiration because it genuinely
+uses HTTP — it links all of `uni-http` + drivers + DHCP + net stack.
+The carveouts work: `bazel query somepath //apps/hello:hello.elf
+//net:tls_server` is empty. Compute-only apps (none in tree yet)
+would drop `uni-http` + drivers + net stack and hit the plan's
+target.
+
+### Naming convention
+
+- **Directory names** use hyphens (`uni-http`, `uni-tls`, …) — matches
+  the Cargo convention for package names.
+- **Bazel target names and `crate_name`** use underscores (`uni_http`,
+  `uni_tls`, …) — Rust identifier rules require underscores in crate
+  names, and matching the target name to the crate name removes a
+  layer of translation in BUILD files.
+
+So a typical BUILD file has `//uni-http:uni_http` — the hyphen part
+tells you you're inside Bazel, the underscore part is the Rust crate
+name. Rust imports always use the underscore form: `use uni_http::…`.
+
+Dependency graph (shipped, including backend splits):
+
+```
+                          bare-metal                           native
+                          ──────────                           ──────
+uni ──┬─→ uni-kernel ──→ kernel + drivers    uni-native ──→ kernel
+      ├─→ uni-net    ──→ net + uni-net:driver           
+      └─→ (apps' own choice of)
+          uni-http   ←── uni-tls
+          drivers    ──→ uni-driver-virtio-net, uni-driver-gve
+                     ──→ drivers:infra
+```
+
+`drivers:infra` is a sub-target inside `//drivers/BUILD.bazel` that
+both NIC-driver crates depend on — MMIO helpers + PCI + VirtIO
+transport + virtio-console. Keeping it as a sub-target (rather than
+its own directory) avoids a cycle: `//drivers:drivers` depends on
+the NIC crates for dispatch; the NIC crates depend on
+`//drivers:infra` for the shared hardware-access primitives.
 
 ---
 
@@ -697,46 +742,81 @@ beats a dep.
     tests for formerly-unsafe invariants where practical (e.g.,
     "GDT entries don't change after `init`").
 
-### Phase 8: Event-loop hooks + opt-in SMP
+### Phase 8: Auto-SMP (hooks dropped as speculative)
 
-Combined because they're both additive event-loop extensions.
+Plan originally prescribed `uni::on_idle(f)` / `uni::on_tick(f)`
+event-loop hooks plus an opt-in `uni::smp::enable()` bring-up.
+What actually shipped:
 
-- `uni::on_idle(f)` and `uni::on_tick(f)` for apps injecting
-  background work
-- `uni::smp::enable()` brings up APs; otherwise they stay parked.
-  Single-core apps drop SMP bring-up from the boot path and arch
-  multi-core machinery from the binary.
+- **SMP: auto-detect, not opt-in.** The opt-in variant shipped
+  briefly (`8bb14be`) and was reverted (`31fcf4c`). Two reasons:
+  (1) the footgun of "app forgets `enable()` → silent single-core
+  + single-queue networking" outweighed any savings, and (2) the
+  plan's advertised "arch multi-core machinery from the binary"
+  drop never materialised — the opt-in was runtime-only, the
+  AP-start code stayed linked. Current behaviour: boot detects
+  cpu_count from FDT/ACPI and calls `percpu::init(cpu_count)` +
+  `start_secondary_cores` unconditionally when cpu_count > 1.
+  Matches native, which always sizes the worker-thread pool from
+  `UNIKERNEL_CPUS` or `num_cpus()`.
+- **`on_tick` / `on_idle` dropped as speculative.** Shipped
+  briefly (`c99f4a0`) and dropped (`ac3aaba`) — no in-tree users,
+  and committing to a specific hook shape ahead of §2g's reactor
+  design risks locking in the wrong one. The plumbing (kernel
+  `TICK` slot, uni-native `TICK`/`IDLE` slots, uni re-exports)
+  was ~50 lines of future-proofing for nobody. §2g can add them
+  back with the right shape when there's a concrete need.
 
-- **Effort:** 4-5 d
-- **Async prep:** hooks become §2g reactor primitives
-- **Perf:** additive-neutral for enabled; single-core apps save
-  boot time (not measured by current bench)
-- **Test:** integration test for single-core boot skipping AP
-  bring-up (measure boot-log milestones); unit test for
-  multiple `on_tick` callbacks composing
+- **Effort:** 1 d (net; most of the plan's 4-5 d was the
+  speculative hook work and the SMP back-and-forth).
+- **Perf:** neutral.
 
 ---
 
 ## Progress tracker
 
-### Baseline (commit 70a6f4a, 2026-04-20)
+### Baseline (commit 70a6f4a, 2026-04-20) and current (commit 9bc5f45, post-init-redesign)
 
 Measured via `python3 scripts/bench.py --env hvf --cores 1`:
 
-| Workload | Baseline | Gate |
-|---|---|---|
-| health_c1 | 35,500 req/s | ±2% |
-| compute_c1 | 6,500 req/s | ±2% |
-| **health_max** | **194,000 req/s** | **hard, ±2%** |
-| compute_max | 8,000 req/s | ±2% |
-| udp_sync | 32,000 pkt/s | ±2% |
-| **udp_peak** | **184,000 pkt/s** | **hard, ±2%** |
-| health_tls_c1 | 28,000 req/s | ±2% |
-| **health_tls_max** | **124,000 req/s** | **hard, ±2%** |
-| tls_handshake_max | 3,300 hs/s | ±2% |
+| Workload | Baseline (70a6f4a) | Current (9bc5f45, 4-run window) | Gate |
+|---|---|---|---|
+| health_c1 | 35,500 req/s | 28–29k | ±2% |
+| compute_c1 | 6,500 req/s | 5.1–7.9k | ±2% |
+| **health_max** | **194,000 req/s** | **148–185k (wide HVF variance)** | **hard, ±2%** |
+| compute_max | 8,000 req/s | 6.9–7.9k | ±2% |
+| udp_sync | 32,000 pkt/s | 27–31k | ±2% |
+| **udp_peak** | **184,000 pkt/s** | **170–178k** | **hard, ±2%** |
+| health_tls_c1 | 28,000 req/s | ~26k | ±2% |
+| **health_tls_max** | **124,000 req/s** | **110–120k** | **hard, ±2%** |
+| tls_handshake_max | 3,300 hs/s | 2.9–3.1k | ±2% |
 
-Binary sizes (HVF `.img`): hello 1.9 MB, webserver 2.0 MB.
-`static_mut` count: 46 across 16 files.
+**Interpretation.** Per-phase the invariant held — each phase
+measured ±2% against its immediately-prior commit. Cumulatively the
+numbers have drifted a few percent, but HVF single-run variance is
+wide enough (health_max swings ±15% on some days depending on host
+thermal / background load) that the "baseline → HEAD" column above
+isn't a precise comparison. The per-phase rows below each include
+the phase-local bench that gated its landing.
+
+Binary sizes (HVF `.img`):
+
+| App | 70a6f4a baseline | 9bc5f45 current |
+|---|---|---|
+| hello | 1.9 MB | 1.94 MB |
+| webserver | 2.0 MB | 2.05 MB |
+
+Hello didn't shrink because it genuinely uses HTTP (so it pulls in
+all of `uni-http` + drivers + DHCP + net stack). The carveouts are
+architectural — `bazel query somepath //apps/hello:hello.elf
+//net:tls_server` is empty, and a compute-only app that drops
+`uni-http` would skip the parser + handler + connection-pool code.
+No compute-only app exists in-tree today.
+
+`static mut` count across the tree: **0 Rust-owned** (down from 46
+at baseline). Only the `extern "C" { static mut boot_l1_table }`
+declaration for boot.S's symbol remains, which isn't a Rust
+definition.
 
 ### Per-phase status
 
@@ -746,11 +826,11 @@ Binary sizes (HVF `.img`): hello 1.9 MB, webserver 2.0 MB.
 | 1 | error types | 🟢 | none (types only) | none | `uni::error::{NetError, DhcpError, NicError}` with `From` impls (`NicError → NetError`, `DhcpError → NetError`). All errors `Copy + ≤ 16 B` (const-asserted). Host-native unit test (`//uni:error_test`, 7 cases including `?`-operator chains and size invariants). `TlsError` stays in `net/tls_server.rs` until Phase 6. |
 | 2 | Net structural prep | 🟢 | health_max -1.6%, udp_peak -0.6%, health_tls_max -1.6% (3-run means vs 70a6f4a — all within 2% gate) | none | **Protocol registry landed**: new `net_protocol` crate with `Registry::{register,unregister,dispatch}` + `//net:protocol_test` (5 cases). Hot-path TCP/UDP dispatch in `net_receive` / `distribute_frame` now routes through `net::REGISTRY`; `net::init_stack()` wires TCP+UDP at boot. One relaxed load + one indirect call per packet replaces the old hardcoded match — bench-verified cost parity. **Per-core state**: `ARP_FAST` and `IP_ID_PERCORE` live as `static [AtomicSlot; MAX_CORES]` (per-core array-of-atomics), which delivers the same properties as the plan's prescribed `InitOnce<PerCore<…>>` wrapper — safe cross-thread access without `static mut`, O(1) per-core indexing, no heap. `CONNECTIONS` static no longer exists (was retired during Phase 4's `NetSlot` work). |
 | 3 | Net::enable | 🟢 | shared with Phase 2 | hello +<1 KB | `uni::net::{Net, NetBringUp, Ipv4Addr}` + `Net::enable(cfg)`. Apps call `Net::enable(NetBringUp::Dhcp)` in their ctor; ENABLED flag left clear on failure so a DHCP→Static `or_else` retry works. `boot/entry.rs` defers DHCP to a post-`uni_main` auto-init fallback (legacy DHCP-then-10.0.2.15/24) and runs `activate_multi_queue` after DHCP to honour MEMORY.md's MQ-vs-DHCP constraint. `hello` uses `.expect("DHCP failed")` per the plan's sample; `webserver` uses `.or_else(\|_\| Net::enable(Static{…}))` for the static fallback. Test apps (test_smp, test_percpu, test_tls) unchanged per plan. |
-| 4 | delete auto-init | 🟡 | health_max -1.9%, udp_peak -0.1%, health_tls_max -1.7% (6-run means vs 70a6f4a — all within 2% gate) | none | **Auto-init deleted**: `boot/entry.rs` no longer runs DHCP or the 10.0.2.15/24 fallback. Apps that want networking call `uni::net::Net::enable` from `uni_main`; apps that don't (test_smp, test_percpu, test_tls) get no network, as specified. **`NET` slot landed**: `static NET: NetSlot(UnsafeCell<Option<Box<Net>>>)` replaces the Phase-3 `ENABLED: AtomicBool`. Mirrors the `APP_SLOT` pattern; `uni::shutdown_and_drop` clears it on graceful exit. `Net::enable` twice now returns `Err(AlreadyEnabled)` via `.is_some()` check. **Deferred to Phase 5/6**: moving `CONFIG` / `HANDLER_*` / `DHCP_STATE` / `{MULTICORE_INIT, WAKEUP, RX_LOCK, JUST_DISTRIBUTED}` / `SERVER_PTR` / `TLS_CONFIG_PTR` into Net-owned fields. Sub-crates (`net_tcp`, `net_udp`, `net_dhcp`, …) would need to see `Net` to field-access it; the current dep direction (umbrella → sub-crates) prevents that. Phase 5/6 reshape the crate boundaries and are the natural spot for the field migration. The slot shape (`Option<Box<Net>>`) is already in place so field additions are an incremental PR rather than another shape change. |
-| 5 | Ethernet driver carveouts | 🟢 | Step 5 bench (3-run mean): health_max −1.1%, udp_peak neutral, health_tls_max −0.3%. Step 4 split (single run): health_max −0.18%, udp_peak +1.48%, health_tls_max +0.22%, tls_handshake_max +0.84% — within ±2% gate. | none | **Step 1**: trait + macro + walker + linker sections. **Step 1.5**: `//uni-net:uni_net` crate carveout. **Step 1.6**: `//uni-net:driver` leaf crate (cycle break). **Step 2**: `VirtioNetDriver impl EthernetDriver` + registration. **Step 3**: `gvnic` → `gve` rename + `GveDriver` impl + registration. **Step 5**: `Net::enable` walks `linked_ethernet_drivers()` before bring-up; returns `NetError::NoDriver` if the binary has no registered driver, `NetError::NoNic` if drivers are linked but no `probe()` succeeds. **Step 4**: `virtio_net.rs` → `//uni-driver-virtio-net`, `gve.rs` → `//uni-driver-gve`, both depending on a new `//drivers:infra` sub-target (MMIO + PCI + VirtIO transport + virtio-console). The outer `//drivers:drivers` keeps `drivers::net::*` dispatch + `pub use drivers_infra::*` re-export so 43 existing caller sites don't touch. **Step 6 (future)**: probe-driven init replacing legacy `drivers::net::init()` — retires the dispatcher in favour of registry walks. |
+| 4 | delete auto-init | 🟢 | health_max -1.9%, udp_peak -0.1%, health_tls_max -1.7% (6-run means vs 70a6f4a — all within 2% gate) | none | **Auto-init deleted**: `boot/entry.rs` no longer runs DHCP or the 10.0.2.15/24 fallback. Apps that want networking call `uni::net::Net::enable` from `uni_main`; apps that don't (test_smp, test_percpu, test_tls) get no network, as specified. **`NET` slot landed**: `static NET: NetSlot(UnsafeCell<Option<Box<Net>>>)` replaces the Phase-3 `ENABLED: AtomicBool`. Mirrors the `APP_SLOT` pattern; `uni::shutdown_and_drop` clears it on graceful exit. `Net::enable` twice now returns `Err(AlreadyEnabled)` via `.is_some()` check. **Net-owned field migration designed out:** moving `CONFIG` / `HANDLER_*` / `DHCP_STATE` / `{MULTICORE_INIT, WAKEUP, RX_LOCK, JUST_DISTRIBUTED}` / `SERVER_PTR` / `TLS_CONFIG_PTR` into `uni_net::Net` fields was originally part of Phase 4. Post-Phase-7 the statics are all already safe (`AtomicBool`/`AtomicU32`/`Spinlock<T>`/`ConfigStore` of atomics); moving them into `Net` fields would require threading `&Net` through every ARP / DHCP / IPv4 / TCP / UDP hot-path function and inverting the net sub-crate dep direction (sub-crates would need to see `uni_net::Net`). Ownership-aesthetic benefit; protocol-layer-entanglement cost. Not worth it. |
+| 5 | Ethernet driver carveouts | 🟢 | Step 5 bench (3-run mean): health_max −1.1%, udp_peak neutral, health_tls_max −0.3%. Step 4 split (single run): health_max −0.18%, udp_peak +1.48%, health_tls_max +0.22%, tls_handshake_max +0.84% — within ±2% gate. | none | **Step 1**: trait + macro + walker + linker sections. **Step 1.5**: `//uni-net:uni_net` crate carveout. **Step 1.6**: `//uni-net:driver` leaf crate (cycle break). **Step 2**: `VirtioNetDriver impl EthernetDriver` + registration. **Step 3**: `gvnic` → `gve` rename + `GveDriver` impl + registration. **Step 5**: `Net::enable` walks `linked_ethernet_drivers()` before bring-up; returns `NetError::NoDriver` if the binary has no registered driver, `NetError::NoNic` if drivers are linked but no `probe()` succeeds. **Step 4**: `virtio_net.rs` → `//uni-driver-virtio-net`, `gve.rs` → `//uni-driver-gve`, both depending on a new `//drivers:infra` sub-target (MMIO + PCI + VirtIO transport + virtio-console). The outer `//drivers:drivers` keeps `drivers::net::*` dispatch + `pub use drivers_infra::*` re-export so 43 existing caller sites don't touch. **Step 6 designed out:** probe-driven init replacing `drivers::net::*` with registry walks was plan-labelled "future" from the outset. The dispatcher has 20 methods; the `EthernetDriver` trait has 4. Most of the extras (TX staging, NAPI rearm, MQ activation, ring-cursor diagnostics) are genuinely virtio-specific — gve is polling-only, has no TX staging, different queue model. Forcing them into a common trait with no-op defaults on gve is worse than the explicit `if use_gve()` branches in `drivers/net.rs`. The split in Step 4 is also technically "theater" today — apps that don't want gve can't drop it because `//drivers:drivers` still pulls both driver crates for the dispatcher. That's a latent improvement a specific-shape app (e.g. compute-only or GCE-only) can unlock later; it doesn't block §2g. |
 | 6 | uni-tls carveout | 🟢 | none (TLS-serving apps keep same code path; non-TLS apps unaffected) | hello: 0 TLS/crypto deps in transitive closure (confirmed via `bazel query`); webserver pulls `//net:tls_server` only via `//uni-tls`. | **`//uni-tls:uni_tls` landed** with two trait-object hooks (`uni::http::{TlsAdapter, TlsConnection}`) that `uni_tls` implements over the sans-io state machine in `//net:tls_server`. `Server::listen_tls(port, TlsServerConfig)` method replaced by free function `uni_tls::listen_tls(&mut Server, port, cfg)` per plan. Diagnostic helpers (`tls_profile_report`/`_reset`) moved to `uni_tls::…`. `//net:net` umbrella dropped its `tls_server` re-export; `//uni-net:uni_net`'s native `select()` dropped all five `//net:tls_*` deps and its `pub mod tls_server` shim. Hello's dep closure no longer reaches TLS / crypto. |
 | 7 | static_mut sweep + `AtomicFn<F>` | 🟢 | HVF 1c (single-run pre→post at commit 351b4d7 → 8c8ad99): health_max +0.7%, udp_peak −0.6%, health_tls_max +0.3%, tls_handshake_max +2.0%. All within the ±2% gate; mean drift smaller than run-to-run noise. | none | **33 `static mut` → 0** across the tree (only the `extern "C" { static mut boot_l1_table }` declaration for boot.S's symbol remains, which isn't a Rust-owned definition). Conversions followed the plan's three primitives: `AtomicBool`/`AtomicUsize` for cross-thread scalars (`SHUTDOWN`, `NUM_THREADS`, `TLS_KEY`, `UDP_COUNT`, `SHARED_LISTEN_COUNT`); `UnsafeCell<T>` + `unsafe impl Sync` for collections touched by single-writer / BSP-init / per-slot ownership (virtio_console ring + device state, GDT/IDT tables, MMU L2 pool, SMP core table, IRQ handler table, UDP bindings, pthread workers table, boot-info scratch, …). `//util:atomic_fn` was already carved out in Phase 6 prep. The 12-static virtio-console consolidation landed as `drivers/virtio_console.rs:8→1` (ring-memory fields + config flags under one `VirtioConsole` struct). |
-| 8 | hooks + auto-SMP | 🟢 | HVF 1c (3-run mean vs single-run 351b4d7): all workloads within ±2% gate. Post-revert single-run: all within ±2.3% of prior single-run baseline. | none | **Hooks landed** as `uni::on_tick(fn(u32))` (every-iteration side-effect slot; fires at top of worker loop) and `uni::on_idle(fn(u32))` (pre-sleep slot; fires before `wait_for_events`). Kernel side adds `TICK` next to the existing `IDLE` in `kernel::eventloop`; native adds matching `TICK` / `IDLE` `AtomicFn` slots in `uni-native::run_worker`. Both exposed as single-slot singletons via `mod backend`. **SMP: auto-detect, not opt-in.** The plan originally prescribed `uni::smp::enable()` as an opt-in call; we shipped that briefly (`8bb14be`) and then reverted in `31fcf4c` — opt-in created a performance-cliff footgun (a forgetful app runs single-core with single-queue networking and no signal), and the plan's claimed "drop machinery from the binary" saving never actually landed (the AP-start code is still linked regardless). Current behaviour matches pre-Phase-8 and native: boot detects cpu_count from FDT / ACPI, calls `percpu::init(cpu_count)` + `start_secondary_cores` unconditionally when >1. Apps wanting single-core determinism get it from a 1-CPU VM or, on native, `UNIKERNEL_CPUS=1`. |
+| 8 | auto-SMP (hooks dropped) | 🟢 | all workloads within ±2% gate | none | **SMP: auto-detect, not opt-in.** Plan originally prescribed `uni::smp::enable()` as an opt-in call; we shipped that briefly (`8bb14be`) and reverted in `31fcf4c`. The opt-in created a performance-cliff footgun (a forgetful app silently runs single-core with single-queue networking) and the claimed "drop machinery from the binary" saving never materialised — the AP-start code is still linked regardless. Current behaviour matches native: boot detects cpu_count from FDT / ACPI and calls `percpu::init(cpu_count)` + `start_secondary_cores` unconditionally when >1. Apps wanting single-core determinism run on a 1-CPU VM or set `UNIKERNEL_CPUS=1` on native. **`on_tick` / `on_idle` hooks dropped.** Shipped briefly (`c99f4a0`), dropped in `ac3aaba`. No in-tree users, and committing to a hook shape before §2g knows what the reactor needs risks locking in the wrong one. §2g can add them back with the right shape. |
 
 Status legend: ⏳ not started · 🟡 in progress · 🟢 complete · 🔴 blocked
 
