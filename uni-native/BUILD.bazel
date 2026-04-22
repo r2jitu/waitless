@@ -16,7 +16,7 @@ package(default_visibility = ["//visibility:public"])
 # `uni` re-exports the public surface via `uni::native::*`, so apps
 # keep their existing imports.
 rust_library(
-    name = "uni_native",
+    name = "uni-native",
     srcs = ["src/lib.rs"],
     crate_name = "uni_native",
     target_compatible_with = ["//bazel/platforms:native"],

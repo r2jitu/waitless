@@ -80,17 +80,22 @@ _LINK_FLAGS_ARCH = select({
 })
 
 def _label_crate_name(label):
-    """Derive a crate name from a Bazel label string.
+    """Derive the Rust crate name from a Bazel label string.
 
-    Convention: the label target (part after `:`) is the crate name.
+    Mirrors rules_rust's default `crate_name` derivation: take the
+    label's target name (explicit `:foo` or implicit trailing path
+    component) and replace non-identifier characters with `_`.
+
     Label forms accepted:
-      `//path/to:crate_name`   → `crate_name`
-      `//path/to/crate_name`   → `crate_name`      (implicit target)
-      `:crate_name`            → `crate_name`
+      `//uni-driver-virtio-net`                     → `uni_driver_virtio_net`
+      `//uni-driver-virtio-net:uni-driver-virtio-net` → `uni_driver_virtio_net`
+      `:foo-bar`                                    → `foo_bar`
     """
     if ":" in label:
-        return label.split(":")[-1]
-    return label.rsplit("/", 1)[-1]
+        target = label.split(":")[-1]
+    else:
+        target = label.rsplit("/", 1)[-1]
+    return target.replace("-", "_")
 
 def unikernel_binary(
         name,
@@ -128,12 +133,13 @@ def unikernel_binary(
         name: Base name for all output targets.
         app: A rust_library target with a #[uni::boot] entry point.
         drivers: list of NIC driver crate labels (e.g.
-          `//uni-driver-virtio-net:uni_driver_virtio_net`). Each is
-          pulled into the unikernel link closure via a generated
-          shim library so its `register_ethernet_driver!` entry
-          survives rlib DCE. Not used by the `_native` binary —
-          native networking flows through POSIX sockets. Convention:
-          the label's target name must equal the crate name.
+          `//uni-driver-virtio-net`). Each is `extern crate`d at the
+          unikernel binary's crate root so its
+          `register_ethernet_driver!` entry survives rlib DCE. Not
+          used by the `_native` binary — native networking flows
+          through POSIX sockets. Crate names follow rules_rust's
+          auto-derivation: label target (or trailing path component)
+          with `-` replaced by `_`.
         port_forwards: list of entries built via `port_fwd()`. Each
           entry baked into the variant launchers as a `host_port →
           guest_port` forward, with `UNIKERNEL_*`-style env vars

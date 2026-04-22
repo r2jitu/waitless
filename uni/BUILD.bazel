@@ -25,14 +25,14 @@ rust_library(
     # `uni/lib.rs` itself still calls into them (eventloop hooks,
     # NIC driver diagnostics).
     deps = [
-        "//uni-net:uni_net",
+        "//uni-net",
         "//util/atomic_fn",
     ] + select({
-        "//bazel/platforms:native": ["//uni-native:uni_native"],
+        "//bazel/platforms:native": ["//uni-native"],
         "//conditions:default": [
             "//drivers",
             "//kernel",
-            "//uni-kernel:uni_kernel",
+            "//uni-kernel",
         ],
     }),
 )
@@ -43,7 +43,7 @@ rust_library(
 # in kernel/drivers/net.
 rust_test(
     name = "boot_info_test",
+    size = "small",
     srcs = ["boot_info.rs"],
     crate_root = "boot_info.rs",
-    size = "small",
 )

@@ -20,12 +20,12 @@ package(default_visibility = ["//visibility:public"])
 #   * `uni_tls::{tls_profile_report, tls_profile_reset}` — diagnostic
 #     helpers (moved from `uni_http`).
 rust_library(
-    name = "uni_tls",
+    name = "uni-tls",
     srcs = ["src/lib.rs"],
     crate_name = "uni_tls",
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
     deps = [
         "//net:tls_server",
-        "//uni-http:uni_http",
+        "//uni-http",
     ],
 )

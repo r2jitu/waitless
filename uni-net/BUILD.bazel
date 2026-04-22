@@ -38,7 +38,7 @@ rust_library(
 # `uni::net::*` and `uni::{NetError, …}` — `//uni:uni` re-exports
 # this crate.
 rust_library(
-    name = "uni_net",
+    name = "uni-net",
     srcs = [
         "lib.rs",
     ],
@@ -54,7 +54,7 @@ rust_library(
 # Host-native unit tests for the shared error hierarchy.
 rust_test(
     name = "error_test",
+    size = "small",
     srcs = ["error.rs"],
     crate_root = "error.rs",
-    size = "small",
 )

@@ -20,7 +20,7 @@ package(default_visibility = ["//visibility:public"])
 # no reason to compile there (no kernel / drivers / bare-metal
 # asm on the host).
 rust_library(
-    name = "uni_kernel",
+    name = "uni-kernel",
     srcs = ["src/lib.rs"],
     crate_name = "uni_kernel",
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,

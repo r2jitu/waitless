@@ -9,7 +9,7 @@ package(default_visibility = ["//visibility:public"])
 # use `//drivers:infra`'s VirtIO transport — gve has its own
 # BAR-register ABI that doesn't go through VirtIO.
 rust_library(
-    name = "uni_driver_gve",
+    name = "uni-driver-gve",
     srcs = ["src/lib.rs"],
     crate_name = "uni_driver_gve",
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,

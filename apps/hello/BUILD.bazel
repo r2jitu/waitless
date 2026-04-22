@@ -14,7 +14,7 @@ rust_library(
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
     deps = [
         "//uni",
-        "//uni-http:uni_http",
+        "//uni-http",
     ],
 )
 
@@ -25,8 +25,12 @@ rust_library(
 unikernel_binary(
     name = "hello",
     app = ":app",
-    drivers = ["//uni-driver-virtio-net:uni_driver_virtio_net"],
+    drivers = ["//uni-driver-virtio-net"],
     port_forwards = [
-        port_fwd("tcp", guest = 80, host = 8080),
+        port_fwd(
+            "tcp",
+            guest = 80,
+            host = 8080,
+        ),
     ],
 )

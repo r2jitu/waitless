@@ -7,15 +7,14 @@ package(default_visibility = ["//visibility:public"])
 #
 # Moved out of `//uni` (was `uni::http::*`) so apps that don't serve
 # HTTP drop the ~400 KB of parser + handler dispatch + connection
-# pool + response builder code. Apps that need HTTP add
-# `//uni-http:uni_http` to their deps and `use uni_http::{Server,
-# Request, Response}`.
+# pool + response builder code. Apps that need HTTP add `//uni-http`
+# to their deps and `use uni_http::{Server, Request, Response}`.
 #
 # `TlsAdapter` / `TlsConnection` traits also live here (used to be
 # `uni::http::{TlsAdapter, TlsConnection}`). `//uni-tls` depends on
 # `//uni-http` to implement them; apps that want HTTPS pull in both.
 rust_library(
-    name = "uni_http",
+    name = "uni-http",
     srcs = ["src/lib.rs"],
     crate_name = "uni_http",
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,

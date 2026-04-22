@@ -17,8 +17,8 @@ rust_library(
     rustc_flags = UNIKERNEL_RUSTC_FLAGS,
     deps = [
         "//uni",
-        "//uni-http:uni_http",
-        "//uni-tls:uni_tls",
+        "//uni-http",
+        "//uni-tls",
     ],
 )
 
@@ -29,13 +29,25 @@ unikernel_binary(
     # QEMU / HVF / the default GCE image; gve covers GCE instances
     # launched with --network-interface=nic-type=GVNIC.
     drivers = [
-        "//uni-driver-virtio-net:uni_driver_virtio_net",
-        "//uni-driver-gve:uni_driver_gve",
+        "//uni-driver-virtio-net",
+        "//uni-driver-gve",
     ],
     port_forwards = [
-        port_fwd("tcp", guest = 80, host = 8080),
-        port_fwd("tcp", guest = 443, host = 8443),
-        port_fwd("udp", guest = 7, host = 8007),
+        port_fwd(
+            "tcp",
+            guest = 80,
+            host = 8080,
+        ),
+        port_fwd(
+            "tcp",
+            guest = 443,
+            host = 8443,
+        ),
+        port_fwd(
+            "udp",
+            guest = 7,
+            host = 8007,
+        ),
     ],
 )
 
@@ -45,14 +57,14 @@ unikernel_binary(
 # runner-agnostic. HVF auto-skips on non-macOS hosts.
 unikernel_app_test(
     name = "test",
-    app_base = "webserver",
-    test_rule = py_test,
+    timeout = "short",
     srcs = ["test.py"],
-    deps = ["//scripts:test_helpers"],
+    app_base = "webserver",
     extra_data = ["//apps/webserver/dev_certs:dev_cert.pem"],
     tags = [
         "exclusive",
         "local",
     ],
-    timeout = "short",
+    test_rule = py_test,
+    deps = ["//scripts:test_helpers"],
 )
