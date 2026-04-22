@@ -327,6 +327,7 @@ _hvf_variant = _build_variant_rule(
         "img": attr.label(
             cfg = _hvf_transition,
             mandatory = True,
+            allow_single_file = True,
             doc = "The <name>.img of the underlying unikernel_binary (transitioned).",
         ),
         "hvf_runner": attr.label(
@@ -355,6 +356,7 @@ def _make_iso_variant(variant_transition, qemu_bin, virtio_dev, qemu_machine):
                 "iso": attr.label(
                     cfg = variant_transition,
                     mandatory = True,
+                    allow_single_file = True,
                     doc = "The <name>.iso of the underlying unikernel_binary (transitioned).",
                 ),
                 "qemu_hostfwd": attr.string(
@@ -395,6 +397,7 @@ def _make_qemu_variant(variant_transition):
                 "img": attr.label(
                     cfg = variant_transition,
                     mandatory = True,
+                    allow_single_file = True,
                     doc = "The <name>.img of the underlying unikernel_binary (transitioned).",
                 ),
                 "qemu_hostfwd": attr.string(

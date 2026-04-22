@@ -163,8 +163,12 @@ def unikernel_binary(
     )
 
     # ── Raw binary (ELF → flat image for ARM64 bootloaders) ──────────────
+    # Rule name is `<name>_img_gen` (not `<name>.img`) so Bazel doesn't
+    # warn that the rule name collides with its single output file.
+    # External references use the file label `:<name>.img`, which still
+    # resolves to this rule's output.
     native.genrule(
-        name = name + ".img",
+        name = name + "_img_gen",
         srcs = [":" + name + ".elf"],
         outs = [name + ".img"],
         cmd = """
@@ -207,8 +211,11 @@ def unikernel_binary(
     )
 
     # ── Limine ISO (BIOS + UEFI hybrid) ─────────────────────────────────
+    # Rule name is `<name>_iso_gen` (not `<name>.iso`) so Bazel doesn't
+    # warn that the rule name collides with its single output file.
+    # External references use the file label `:<name>.iso`.
     native.genrule(
-        name = name + ".iso",
+        name = name + "_iso_gen",
         srcs = select({
             "//bazel/platforms:aarch64": [
                 ":" + name + ".elf",
