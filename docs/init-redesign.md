@@ -13,10 +13,11 @@ completes.
 
 ## Status
 
-**Started:** not yet.
+**Complete.** All eight migration phases landed — see the per-phase
+table below and the commit trail ending `6d2f093`.
 **Prerequisites landed:** `b50f3a4` (uni::App) through `70a6f4a`
 (apps/hello). Bench baseline captured below.
-**Blocks:** ROADMAP §2f/§2g/§3c.
+**Unblocks:** ROADMAP §2f/§2g/§3c.
 
 ---
 
