@@ -34,6 +34,40 @@ pub mod x86_64;
 #[cfg(target_arch = "aarch64")]
 pub mod aarch64;
 
+// ── Opt-in SMP ────────────────────────────────────────────────────────────
+//
+// Apps that want multi-core execution call `uni::smp::enable()` inside
+// `uni_main`. That calls `kernel::enable_smp()`, which invokes the
+// AP-start callback boot code registered at init. Synchronous: when
+// the call returns, APs are running and `num_cores()` reflects the
+// enabled total — so `Server::listen` and similar `num_workers()`-
+// sized resources set themselves up correctly during `uni_main`.
+//
+// Single-core apps don't call `enable()`; the callback is never
+// invoked and only the BSP ever runs.
+static AP_START_FN: crate::sync::AtomicFn<fn()> = crate::sync::AtomicFn::null();
+static SMP_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Register the arch/protocol-specific AP bring-up. Boot code calls
+/// this during init; `enable_smp()` invokes the callback when the
+/// app opts in.
+pub fn register_ap_start_fn(f: fn()) {
+    AP_START_FN.store(f);
+}
+
+/// Bring up APs synchronously. Invokes the registered callback
+/// exactly once — subsequent calls are no-ops. Called from
+/// `uni::smp::enable()`; apps that never call it stay single-core.
+pub fn enable_smp() {
+    if SMP_ENABLED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    if let Some(f) = AP_START_FN.load() {
+        f();
+    }
+}
+
 /// Get current CPU ID (arch-independent).
 pub fn cpu_id() -> u32 {
     #[cfg(target_arch = "x86_64")]
