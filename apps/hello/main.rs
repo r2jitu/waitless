@@ -11,14 +11,6 @@
 extern crate alloc;
 extern crate uni;
 extern crate uni_http;
-// Pull the virtio-net driver crate into the link closure for its
-// `register_ethernet_driver!` link-section entry. Without this
-// declaration, rustc drops the rlib (nothing else in the binary
-// references it) and `linked_ethernet_drivers()` is empty at
-// runtime. `os = "none"` gate matches the BUILD `select`: on native
-// the crate isn't in the dep graph (POSIX sockets replace NIC).
-#[cfg(target_os = "none")]
-extern crate uni_driver_virtio_net;
 
 use uni::net::{Net, NetBringUp};
 use uni_http::{Request, Response, Server};

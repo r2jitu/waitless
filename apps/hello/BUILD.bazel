@@ -15,25 +15,17 @@ rust_library(
     deps = [
         "//uni",
         "//uni-http:uni_http",
-    ] + select({
-        # NIC driver is bare-metal-only (`os:none`). On native the
-        # app reaches the network through POSIX sockets via
-        # `//uni-native`, so no driver crate is needed.
-        #
-        # virtio-net covers QEMU / HVF / default GCE. hello doesn't
-        # target gVNIC instances, so it skips the gve crate; a
-        # gVNIC-flavoured variant of this app would add
-        # `//uni-driver-gve` instead.
-        "//bazel/platforms:native": [],
-        "//conditions:default": ["//uni-driver-virtio-net:uni_driver_virtio_net"],
-    }),
+    ],
 )
 
 # hello only serves plain HTTP, so the launcher only needs one
 # forward — HTTPS + UDP echo forwards would just sit idle.
+# hello doesn't target gVNIC instances, so it skips the gve crate;
+# a gVNIC-flavoured variant would add `//uni-driver-gve` too.
 unikernel_binary(
     name = "hello",
     app = ":app",
+    drivers = ["//uni-driver-virtio-net:uni_driver_virtio_net"],
     port_forwards = [
         port_fwd("tcp", guest = 80, host = 8080),
     ],

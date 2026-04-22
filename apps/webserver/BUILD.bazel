@@ -19,25 +19,19 @@ rust_library(
         "//uni",
         "//uni-http:uni_http",
         "//uni-tls:uni_tls",
-    ] + select({
-        # NIC drivers are bare-metal-only (`os:none`). On native the
-        # app reaches the network through POSIX sockets via
-        # `//uni-native`, so no driver crates are needed.
-        #
-        # Runtime picks whichever probes successfully: virtio-net
-        # covers QEMU / HVF / the default GCE image; gve covers GCE
-        # instances launched with --network-interface=nic-type=GVNIC.
-        "//bazel/platforms:native": [],
-        "//conditions:default": [
-            "//uni-driver-virtio-net:uni_driver_virtio_net",
-            "//uni-driver-gve:uni_driver_gve",
-        ],
-    }),
+    ],
 )
 
 unikernel_binary(
     name = "webserver",
     app = ":app",
+    # Runtime picks whichever probes successfully: virtio-net covers
+    # QEMU / HVF / the default GCE image; gve covers GCE instances
+    # launched with --network-interface=nic-type=GVNIC.
+    drivers = [
+        "//uni-driver-virtio-net:uni_driver_virtio_net",
+        "//uni-driver-gve:uni_driver_gve",
+    ],
     port_forwards = [
         port_fwd("tcp", guest = 80, host = 8080),
         port_fwd("tcp", guest = 443, host = 8443),
