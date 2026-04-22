@@ -1,4 +1,12 @@
-// uni/native.rs — Native (POSIX) backend: multi-threaded sockets + stdio.
+// uni-native/src/lib.rs — Host POSIX backend for the `uni` runtime.
+//
+// Self-contained std crate. `uni` itself stays `#![no_std]`; this
+// crate gets `std::env`, `format!`, and friends because a native
+// binary always links libstd anyway (see `bazel/rules/native_main.rs`).
+// Everything platform-specific lives here: libc-FFI sockets, kqueue /
+// epoll event queues, pthread workers, the cross-worker event loop,
+// env-var parsing, RAM / CPU probing. `uni::native::*` re-exports the
+// public surface so apps keep importing via `uni`.
 //
 // Each worker thread has its own:
 //   - Shared listen socket registered in its own kqueue/epoll
@@ -11,16 +19,15 @@
 // and go back to sleep. No dedicated acceptor thread, no pipes — mirrors the
 // unikernel's per-core event loop model where each core polls the accept queue.
 //
-// NOTE: this file is the host POSIX dev backend, not the unikernel itself.
-// It still uses several `static mut` globals for thread/UDP/listener state.
+// NOTE: several `static mut` globals for thread / UDP / listener state.
 // They're sound by current convention (init from a single thread before
-// workers start, then mutated only by their owning worker), but the
-// migration to atomics/locks here is lower priority than the unikernel
-// side and is left as future work. The lint allow is local to this file
-// rather than crate-wide.
+// workers start, then mutated only by their owning worker). The lint
+// allow is crate-local.
 #![allow(static_mut_refs)]
 
-use core::ptr;
+use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use atomic_fn::AtomicFn;
 
 // ============================================================================
 // libc FFI declarations
@@ -160,7 +167,6 @@ unsafe extern "C" {
     fn setsockopt(fd: i32, level: i32, name: i32, val: *const i32, len: u32) -> i32;
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     fn signal(sig: i32, handler: usize) -> usize;
-    fn getenv(name: *const u8) -> *const u8;
     fn write(fd: i32, buf: *const u8, count: usize) -> isize;
     #[cfg(target_os = "macos")]
     fn kqueue() -> i32;
@@ -202,62 +208,12 @@ fn get_errno() -> i32 {
     }
 }
 
-fn parse_u16(s: *const u8) -> u16 {
-    let mut n: u32 = 0;
-    let mut i = 0;
-    unsafe {
-        loop {
-            let c = *s.add(i);
-            if c < b'0' || c > b'9' { break; }
-            n = n * 10 + (c - b'0') as u32;
-            i += 1;
-        }
-    }
-    n as u16
-}
-
-/// Read the `UNIKERNEL_<PROTO>_<GUEST>` env-var override (e.g.
-/// `UNIKERNEL_TCP_80`), returning the parsed port or `None` when
-/// unset / empty. Matches the name derivation baked into the VM
+/// Read `UNIKERNEL_<PROTO>_<GUEST>` (e.g. `UNIKERNEL_TCP_80`) and
+/// parse as a u16. Matches the name derivation baked into the VM
 /// launchers by `variants.bzl`, so `UNIKERNEL_TCP_80=18080
-/// :<app>_native` and `… :<app>_hvf` both bind to the same host
-/// port.
-///
-/// `proto` must be one of the ASCII strings `"TCP"` / `"UDP"`.
-/// Hand-rolled byte buffer (no_std, no `alloc::format!`): builds
-/// `UNIKERNEL_<proto>_<port>\0` on the stack and hands it to
-/// `getenv`. 24 bytes fits `UNIKERNEL_TCP_65535\0` with room to
-/// spare.
-fn read_port_env(proto: &[u8; 3], guest_port: u16) -> Option<u16> {
-    let mut buf = [0u8; 24];
-    let prefix = b"UNIKERNEL_";
-    let mut i = 0;
-    for &c in prefix { buf[i] = c; i += 1; }
-    for &c in proto    { buf[i] = c; i += 1; }
-    buf[i] = b'_'; i += 1;
-
-    // Decimal-encode the port in place, least-significant-first,
-    // then reverse. Single-digit case bypasses the reverse for
-    // brevity. Bytes past the last digit stay zero from the
-    // initialiser, so the buffer is already NUL-terminated.
-    let start = i;
-    let mut n = guest_port;
-    if n == 0 {
-        buf[i] = b'0';
-    } else {
-        while n > 0 {
-            buf[i] = b'0' + (n % 10) as u8;
-            n /= 10;
-            i += 1;
-        }
-        buf[start..i].reverse();
-    }
-
-    unsafe {
-        let p = getenv(buf.as_ptr());
-        if p.is_null() || *p == 0 { return None; }
-        Some(parse_u16(p))
-    }
+/// :<app>_native` and `… :<app>_hvf` both bind to the same host port.
+fn read_port_env(proto: &str, guest_port: u16) -> Option<u16> {
+    std::env::var(format!("UNIKERNEL_{proto}_{guest_port}")).ok()?.parse().ok()
 }
 
 fn set_nonblocking(fd: i32) {
@@ -279,14 +235,14 @@ pub fn num_cpus() -> usize {
 /// Total physical RAM, in bytes, as reported by the host. Zero means
 /// "unknown" (portability fallback). macOS reads `hw.memsize`;
 /// Linux multiplies `_SC_PHYS_PAGES` by `_SC_PAGESIZE`.
-fn host_ram_bytes() -> usize {
+pub fn host_ram_bytes() -> usize {
     #[cfg(target_os = "macos")]
     unsafe {
         let mut val: u64 = 0;
-        let mut len = core::mem::size_of::<u64>();
+        let mut len = std::mem::size_of::<u64>();
         let name = b"hw.memsize\0".as_ptr();
         if sysctlbyname(name, &mut val as *mut u64 as *mut u8, &mut len,
-                        core::ptr::null(), 0) == 0 {
+                        std::ptr::null(), 0) == 0 {
             return val as usize;
         }
         0
@@ -332,7 +288,7 @@ impl NativeConn {
 }
 
 /// One UDP sibling fd owned by a worker thread. Populated at
-/// `native_udp_bind` time, one entry per `-p udp:...` relay. Drained
+/// `udp_bind` time, one entry per `-p udp:...` relay. Drained
 /// inline from `collect_events` when the kqueue/epoll reports the fd
 /// ready — no dedicated RX thread, matches HVF's inline-poll design.
 #[derive(Clone, Copy)]
@@ -458,7 +414,7 @@ impl ThreadState {
         unsafe {
             #[cfg(target_os = "macos")]
             {
-                let mut events = [core::mem::zeroed::<Kevent>(); MAX_EVENTS];
+                let mut events = [std::mem::zeroed::<Kevent>(); MAX_EVENTS];
                 let ts = if timeout_ms > 0 {
                     Timespec { tv_sec: 0, tv_nsec: timeout_ms as i64 * 1_000_000 }
                 } else {
@@ -473,7 +429,7 @@ impl ThreadState {
             }
             #[cfg(target_os = "linux")]
             {
-                let mut events = [core::mem::zeroed::<EpollEvent>(); MAX_EVENTS];
+                let mut events = [std::mem::zeroed::<EpollEvent>(); MAX_EVENTS];
                 let n = epoll_wait(self.eq_fd, events.as_mut_ptr(), MAX_EVENTS as i32, timeout_ms);
                 for i in 0..n.max(0) as usize {
                     let fd = events[i].data as i32;
@@ -517,8 +473,8 @@ fn drain_udp_sibling(fd: i32, binding_idx: usize) {
     };
     let mut buf = [0u8; 65536];
     loop {
-        let mut src_addr: SockAddrIn = unsafe { core::mem::zeroed() };
-        let mut addr_len = core::mem::size_of::<SockAddrIn>() as u32;
+        let mut src_addr: SockAddrIn = unsafe { std::mem::zeroed() };
+        let mut addr_len = std::mem::size_of::<SockAddrIn>() as u32;
         let n = unsafe {
             recvfrom(fd, buf.as_mut_ptr(), buf.len(), 0,
                      &mut src_addr, &mut addr_len)
@@ -535,8 +491,8 @@ fn drain_udp_sibling(fd: i32, binding_idx: usize) {
 // ============================================================================
 
 static mut THREADS: [ThreadState; MAX_THREADS] = [const { ThreadState::new(0) }; MAX_THREADS];
-pub static mut NUM_THREADS: usize = 1;
-pub static mut SHUTDOWN: bool = false;
+static mut NUM_THREADS: usize = 1;
+static mut SHUTDOWN: bool = false;
 
 // ── Shared listen sockets ─────────────────────────────────────────────────────
 // macOS SO_REUSEPORT does not distribute connections across sockets. Instead,
@@ -621,18 +577,16 @@ fn init_native() {
 
         // Per-port overrides (`UNIKERNEL_<PROTO>_<GUEST>`) are read
         // lazily from `config_port` / `config_tls_port` /
-        // `native_udp_bind`, keyed by the caller-supplied default
-        // port — same derivation as `variants.bzl` bakes into the
-        // VM launcher templates. Callers use the same spelling
+        // `udp_bind`, keyed by the caller-supplied default port —
+        // same derivation as `variants.bzl` bakes into the VM
+        // launcher templates. Callers use the same spelling
         // regardless of which runner LAUNCHER points at.
 
-        // Determine thread count from environment or CPU count
-        let t = getenv(b"UNIKERNEL_CPUS\0".as_ptr());
-        if !t.is_null() && *t != 0 {
-            NUM_THREADS = parse_u16(t) as usize;
-        } else {
-            NUM_THREADS = num_cpus().min(MAX_THREADS);
-        }
+        // Determine thread count from environment or CPU count.
+        NUM_THREADS = std::env::var("UNIKERNEL_CPUS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or_else(|| num_cpus().min(MAX_THREADS));
 
         for i in 0..NUM_THREADS {
             THREADS[i].thread_id = i as u32;
@@ -647,26 +601,13 @@ fn init_native() {
         signal(SIGPIPE, SIG_IGN);
     }
 
-    // Register the IO poll callback. This runs on every worker's
-    // event-loop tick and drains the worker's kqueue/epoll: TCP fd
-    // readiness flips `has_pending_data` on matching conns, and UDP
-    // sibling readiness triggers inline `recvfrom`+handler dispatch.
-    // No dedicated RX threads — same inline-poll pattern as the HVF
-    // runner's vCPU loop.
-    crate::register_io_poll(|_worker_id| tcp_poll());
-
-    // Publish the boot-time snapshot. The native backend has no NIC
-    // driver (POSIX sockets go through the host stack), so `nics` is
-    // empty.
-    use crate::boot_info::{BootInfoParams, NicInfo, MAX_NICS};
-    crate::boot_info::init_boot_info(BootInfoParams {
-        ram_bytes: host_ram_bytes(),
-        num_cpus: num_cpus() as u32,
-        boot_args: "",
-        nics: [NicInfo::EMPTY; MAX_NICS],
-        nic_count: 0,
-        rtc_epoch: None,
-    });
+    // Register TCP/UDP polling as the first IO poll callback.
+    // Runs on every worker's event-loop tick and drains the worker's
+    // kqueue/epoll: TCP fd readiness flips `has_pending_data` on
+    // matching conns, and UDP sibling readiness triggers inline
+    // `recvfrom` + handler dispatch. No dedicated RX threads — same
+    // inline-poll pattern as the HVF runner's vCPU loop.
+    register_io_poll(|_worker_id| tcp_poll());
 }
 
 // ============================================================================
@@ -678,7 +619,7 @@ pub fn log(msg: &[u8]) {
 }
 
 pub fn config_port(default_port: u16) -> u16 {
-    read_port_env(b"TCP", default_port).unwrap_or(default_port)
+    read_port_env("TCP", default_port).unwrap_or(default_port)
 }
 
 /// TLS port override. Reads `UNIKERNEL_TCP_<default_port>` — TLS runs
@@ -687,11 +628,15 @@ pub fn config_port(default_port: u16) -> u16 {
 /// on Linux (macOS lets non-root bind anywhere, but we can't rely
 /// on that cross-platform).
 pub fn config_tls_port(default_port: u16) -> u16 {
-    read_port_env(b"TCP", default_port).unwrap_or(default_port)
+    read_port_env("TCP", default_port).unwrap_or(default_port)
 }
 
 pub fn check_shutdown() -> bool {
     unsafe { SHUTDOWN }
+}
+
+pub fn request_shutdown() {
+    unsafe { SHUTDOWN = true; }
 }
 
 pub fn wait_for_events() {
@@ -700,6 +645,13 @@ pub fn wait_for_events() {
 
 pub fn poll_events() -> bool {
     thread_state(current_thread_id()).poll_events()
+}
+
+pub fn num_workers() -> u32 {
+    // NUM_THREADS is set by init_native() from UNIKERNEL_CPUS or
+    // num_cpus() as default. Use it directly — don't override with
+    // num_cpus().
+    unsafe { NUM_THREADS as u32 }
 }
 
 // ---- TCP (per-thread) -------------------------------------------------------
@@ -717,7 +669,7 @@ fn make_listener(port: u16, nonblocking: bool) -> i32 {
 
         let addr = SockAddrIn {
             #[cfg(target_os = "macos")]
-            sin_len: core::mem::size_of::<SockAddrIn>() as u8,
+            sin_len: std::mem::size_of::<SockAddrIn>() as u8,
             #[cfg(target_os = "macos")]
             sin_family: AF_INET as u8,
             #[cfg(target_os = "linux")]
@@ -727,7 +679,7 @@ fn make_listener(port: u16, nonblocking: bool) -> i32 {
             sin_zero: [0; 8],
         };
 
-        if bind(fd, &addr, core::mem::size_of::<SockAddrIn>() as u32) < 0 {
+        if bind(fd, &addr, std::mem::size_of::<SockAddrIn>() as u32) < 0 {
             close(fd); return -1;
         }
         if listen(fd, 128) < 0 {
@@ -739,6 +691,10 @@ fn make_listener(port: u16, nonblocking: bool) -> i32 {
 
 pub fn tcp_listen(port: u16) -> *mut () {
     tcp_listen_for(port, current_thread_id())
+}
+
+pub fn tcp_listen_on(worker_id: u32, port: u16) -> *mut () {
+    tcp_listen_for(port, worker_id)
 }
 
 pub fn tcp_listen_for(port: u16, worker_id: u32) -> *mut () {
@@ -864,7 +820,7 @@ pub fn tcp_poll() -> bool {
 /// the full `SHARED_LISTEN_FDS` table so that workers pick up both the
 /// HTTP listener and (if configured) the HTTPS listener — missing either
 /// one silently drops accept events for that port.
-pub fn tcp_register_shared_listener() {
+fn tcp_register_shared_listener() {
     let tid = current_thread_id();
     unsafe {
         for i in 0..SHARED_LISTEN_COUNT {
@@ -886,10 +842,9 @@ const MAX_UDP_BINDINGS: usize = 8;
 /// bound to the same host port. Incoming datagrams are distributed
 /// across the siblings by the kernel (4-tuple hash) so each UDP worker
 /// thread blocks on its own fd's `recvfrom` and runs the app handler
-/// inline. Replies use the receiving thread's sibling fd (set in the
-/// `CURRENT_UDP_FD` TLS slot before the handler call), which keeps the
-/// reply source port equal to the relay port (NAT-correct) and avoids
-/// cross-thread contention on a single kernel socket lock.
+/// inline. Replies use the receiving thread's sibling fd, which keeps
+/// the reply source port equal to the relay port (NAT-correct) and
+/// avoids cross-thread contention on a single kernel socket lock.
 struct UdpBinding {
     fds: [i32; MAX_THREADS],
     sibling_count: usize,
@@ -915,7 +870,7 @@ fn open_udp_sibling(bind_port: u16) -> i32 {
 
         let addr = SockAddrIn {
             #[cfg(target_os = "macos")]
-            sin_len: core::mem::size_of::<SockAddrIn>() as u8,
+            sin_len: std::mem::size_of::<SockAddrIn>() as u8,
             #[cfg(target_os = "macos")]
             sin_family: AF_INET as u8,
             #[cfg(target_os = "linux")]
@@ -925,7 +880,7 @@ fn open_udp_sibling(bind_port: u16) -> i32 {
             sin_zero: [0; 8],
         };
 
-        if bind(fd, &addr, core::mem::size_of::<SockAddrIn>() as u32) < 0 {
+        if bind(fd, &addr, std::mem::size_of::<SockAddrIn>() as u32) < 0 {
             close(fd);
             return -1;
         }
@@ -935,7 +890,7 @@ fn open_udp_sibling(bind_port: u16) -> i32 {
     }
 }
 
-pub fn native_udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
+pub fn udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
     unsafe {
         if UDP_COUNT >= MAX_UDP_BINDINGS { return; }
 
@@ -943,7 +898,7 @@ pub fn native_udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
         // `UNIKERNEL_UDP_<port>` swaps in a different host-bind
         // port. Each app-requested UDP port has its own knob — no
         // shared base + offset remapping.
-        let bind_port = read_port_env(b"UDP", port).unwrap_or(port);
+        let bind_port = read_port_env("UDP", port).unwrap_or(port);
 
         // Open NUM_THREADS SO_REUSEPORT siblings so the kernel
         // distributes incoming datagrams across the group by 4-tuple
@@ -972,17 +927,16 @@ pub fn native_udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
         UDP_COUNT += 1;
 
         // Register each sibling in its owning worker's event queue.
-        // `native_udp_bind` runs on the main thread before workers
-        // start, but each worker's kqueue/epoll fd is already live
-        // (set up in `init_native`), so we can push registrations
-        // from here.
+        // `udp_bind` runs on the main thread before workers start,
+        // but each worker's kqueue/epoll fd is already live (set up
+        // in `init_native`), so we can push registrations from here.
         for worker_id in 0..got {
             THREADS[worker_id].add_udp_sibling(fds[worker_id], binding_idx);
         }
     }
 }
 
-pub fn native_udp_send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
+pub fn udp_send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
     unsafe {
         // Handler runs inline on a worker thread after its kqueue
         // reported the sibling ready. Reply on that worker's own
@@ -1011,7 +965,7 @@ pub fn native_udp_send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8
 
         let dst_addr = SockAddrIn {
             #[cfg(target_os = "macos")]
-            sin_len: core::mem::size_of::<SockAddrIn>() as u8,
+            sin_len: std::mem::size_of::<SockAddrIn>() as u8,
             #[cfg(target_os = "macos")]
             sin_family: AF_INET as u8,
             #[cfg(target_os = "linux")]
@@ -1022,10 +976,100 @@ pub fn native_udp_send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8
         };
 
         sendto(send_fd, data.as_ptr(), data.len(), 0,
-               &dst_addr, core::mem::size_of::<SockAddrIn>() as u32);
+               &dst_addr, std::mem::size_of::<SockAddrIn>() as u32);
     }
 }
 
+// ============================================================================
+// Callback-driven event loop (mirrors kernel::eventloop)
+// ============================================================================
+//
+// Same pattern as the unikernel: register callbacks, all workers run
+// the same loop. On native, "worker" = OS thread. IO_POLL callbacks
+// are called every tick; SERVICE is the app's per-tick service step.
+
+type PollFn = fn(u32) -> bool;
+
+/// Up to 4 IO poll callbacks (network + future storage). Each slot is
+/// an `AtomicFn<PollFn>` — null = empty, published value = callback.
+/// `IO_POLL_COUNT` tracks how many slots have been claimed. Slots
+/// are filled in order during init by `register_io_poll`, then read
+/// by all worker threads. `AtomicFn`'s Release/Acquire pair gives us
+/// cross-thread happens-before without a volatile *mut ().
+const IO_POLL_MAX: usize = 4;
+static IO_POLL: [AtomicFn<PollFn>; IO_POLL_MAX] = [
+    AtomicFn::null(),
+    AtomicFn::null(),
+    AtomicFn::null(),
+    AtomicFn::null(),
+];
+static IO_POLL_COUNT: AtomicUsize = AtomicUsize::new(0);
+static SERVICE: AtomicFn<PollFn> = AtomicFn::null();
+static READY: AtomicBool = AtomicBool::new(false);
+
+/// Register an IO poll callback (network, storage, etc). Multiple
+/// sources can be registered; all are called each iteration. Designed
+/// to be called from a single init thread; the atomic fetch_add
+/// reserves the slot index race-free even if that contract is ever
+/// violated.
+pub fn register_io_poll(f: PollFn) {
+    let idx = IO_POLL_COUNT.fetch_add(1, Ordering::AcqRel);
+    if idx < IO_POLL_MAX {
+        IO_POLL[idx].store(f);
+    } else {
+        // Roll back to keep IO_POLL_COUNT bounded.
+        IO_POLL_COUNT.store(IO_POLL_MAX, Ordering::Release);
+    }
+}
+
+pub fn set_service(f: PollFn) {
+    SERVICE.store(f);
+}
+
+fn get_service() -> Option<PollFn> {
+    SERVICE.load()
+}
+
+pub fn set_ready() {
+    READY.store(true, Ordering::Release);
+}
+
+fn is_ready() -> bool {
+    READY.load(Ordering::Acquire)
+}
+
+/// Run the worker event loop on this thread. Same structure as the
+/// unikernel's. Called by `native_worker_loop` after thread setup.
+pub fn run_worker(worker_id: u32) {
+    // Wait for ready
+    while !is_ready() && !check_shutdown() {
+        wait_for_events();
+    }
+
+    loop {
+        if check_shutdown() { break; }
+
+        let mut did_work = false;
+
+        // 1. IO poll callbacks (network, future storage, etc)
+        let n = IO_POLL_COUNT.load(Ordering::Acquire).min(IO_POLL_MAX);
+        for i in 0..n {
+            if let Some(f) = IO_POLL[i].load() {
+                if f(worker_id) { did_work = true; }
+            }
+        }
+
+        // 2. App service callback
+        if let Some(f) = get_service() {
+            if f(worker_id) { did_work = true; }
+        }
+
+        // 3. Idle if no work
+        if !did_work {
+            wait_for_events();
+        }
+    }
+}
 
 // ============================================================================
 // Native entry point
@@ -1039,7 +1083,6 @@ extern "C" fn worker_thread(arg: *mut u8) -> *mut u8 {
     let tid = arg as u32;
     set_current_thread_id(tid);
 
-    // Import the Server pointer from http.rs
     // Workers call the same service_core() as the unikernel APs.
     // The Server is set up by the main thread before workers start.
     unsafe extern "C" { fn native_worker_loop(thread_id: u32); }
@@ -1047,26 +1090,52 @@ extern "C" fn worker_thread(arg: *mut u8) -> *mut u8 {
     ptr::null_mut()
 }
 
-/// Native-binary entry point — called from `bazel/rules/native_main.rs`'s
-/// `fn main()`. Returns the process exit code.
-pub fn run() -> i32 {
+/// Config for `run()`. Holds the three uni-side hooks we'd otherwise
+/// need to call across the crate boundary:
+///
+///   * `boot_info_fn` — fills `uni::boot_info` with the native host's
+///     CPU count / RAM bytes right after thread-pool init.
+///   * `add_worker_listener` — called once per non-primary worker
+///     before threads are spawned, so the HTTP server can materialise
+///     per-worker listen handles.
+///   * `shutdown_fn` — called after all workers join, to drop the app
+///     box and clear the net slot (`uni::shutdown_and_drop`).
+///
+/// Keeping these as explicit params (rather than static slots) means
+/// no hot-path indirection and no ordering worries on initialisation.
+pub struct RunConfig {
+    pub boot_info_fn: fn(num_cpus: u32, ram_bytes: usize),
+    pub add_worker_listener: fn(worker_id: u32),
+    pub shutdown_fn: fn(),
+}
+
+/// Native-binary entry point — called from `uni::native::run` (which
+/// in turn is called from `bazel/rules/native_main.rs`'s `fn main()`).
+/// Returns the process exit code.
+pub fn run(config: RunConfig) -> i32 {
     init_native();
+
+    // Publish the boot-time snapshot via the uni-side callback. The
+    // native backend has no NIC driver (POSIX sockets go through the
+    // host stack), so nic info is filled in by the callback as empty.
+    (config.boot_info_fn)(num_cpus() as u32, host_ram_bytes());
+
     unsafe {
         uni_main();
         // uni_main called server.run() → tcp_listen() on thread 0.
-        // In multi-thread mode, tcp_listen() created the shared listen socket
-        // and per-worker handles. add_worker_listener creates the remaining
-        // worker handles before their threads start.
-
-        for i in 1..NUM_THREADS {
+        // In multi-thread mode, tcp_listen() created the shared listen
+        // socket and per-worker handles. add_worker_listener creates
+        // the remaining worker handles before their threads start.
+        let num_threads = NUM_THREADS;
+        for i in 1..num_threads {
             set_current_thread_id(i as u32);
-            crate::http::add_worker_listener(i as u32);
+            (config.add_worker_listener)(i as u32);
         }
         set_current_thread_id(0);
 
         // Start worker threads
         let mut thread_handles = [0usize; MAX_THREADS];
-        for i in 1..NUM_THREADS {
+        for i in 1..num_threads {
             pthread_create(
                 &mut thread_handles[i],
                 ptr::null(),
@@ -1080,17 +1149,16 @@ pub fn run() -> i32 {
         native_worker_loop(0);
 
         // Join workers
-        for i in 1..NUM_THREADS {
+        for i in 1..num_threads {
             if thread_handles[i] != 0 {
                 pthread_join(thread_handles[i], ptr::null_mut());
             }
         }
 
-        // App teardown — drops whatever the user handed to
-        // `uni::run` (firing its `Drop` impl). Idempotent; ordered
-        // after workers have stopped touching app state. See
-        // `uni::lib::shutdown_and_drop`.
-        crate::shutdown_and_drop();
+        // App teardown — drops whatever the user handed to `uni::run`
+        // (firing its `Drop` impl). Idempotent; ordered after workers
+        // have stopped touching app state.
+        (config.shutdown_fn)();
     }
     0
 }
@@ -1102,5 +1170,5 @@ pub extern "C" fn native_worker_loop(thread_id: u32) {
     // Register the shared listen socket with this worker's kqueue/epoll so it
     // wakes up when a new connection arrives.
     tcp_register_shared_listener();
-    crate::backend::run_worker(thread_id);
+    run_worker(thread_id);
 }

@@ -22,11 +22,8 @@ extern crate kernel;
 #[cfg(platform_unikernel)]
 extern crate drivers;
 
-// `atomic_fn::AtomicFn<F>` — typed atomic fn-pointer cell. Only the
-// native backend currently uses it (for `IO_POLL` / `SERVICE`), but
-// we depend unconditionally so `mod backend` stays
-// platform-uniform shape-wise.
-extern crate atomic_fn;
+#[cfg(platform_native)]
+extern crate uni_native;
 
 // The net stack (`Net::enable`, `NetBringUp`, `EthernetDriver`,
 // error types, plus the full umbrella of TCP/UDP/ARP/IPv4/DHCP/TLS
@@ -40,8 +37,33 @@ pub extern crate uni_net as net;
 #[cfg(platform_unikernel)]
 mod unikernel;
 
+/// Back-compat shim: `bazel/rules/native_main.rs` calls
+/// `uni::native::run()` to enter the native event loop. The
+/// platform backend itself lives in the `uni-native` crate (std
+/// rlib); this wrapper plugs uni-side callbacks (`boot_info_fn`,
+/// `add_worker_listener`, `shutdown_fn`) into `uni_native::run`
+/// so `uni_native` never needs to depend back on `uni`.
 #[cfg(platform_native)]
-pub mod native;
+pub mod native {
+    use crate::boot_info::{BootInfoParams, NicInfo, MAX_NICS};
+
+    pub fn run() -> i32 {
+        uni_native::run(uni_native::RunConfig {
+            boot_info_fn: |num_cpus, ram_bytes| {
+                crate::boot_info::init_boot_info(BootInfoParams {
+                    ram_bytes,
+                    num_cpus,
+                    boot_args: "",
+                    nics: [NicInfo::EMPTY; MAX_NICS],
+                    nic_count: 0,
+                    rtc_epoch: None,
+                });
+            },
+            add_worker_listener: crate::http::add_worker_listener,
+            shutdown_fn: crate::shutdown_and_drop,
+        })
+    }
+}
 
 pub mod boot_info;
 pub mod http;
@@ -198,118 +220,19 @@ mod backend {
     pub fn register_io_poll(_f: fn(u32) -> bool) {}
 }
 
+/// Native-platform dispatch — pure re-export from the `uni_native`
+/// crate (host POSIX backend: sockets, pthread workers, kqueue/epoll
+/// event loop). Sits behind the same `mod backend` shape as the
+/// unikernel dispatch above so the cross-platform `pub use
+/// backend::…` block below works uniformly.
 #[cfg(platform_native)]
 mod backend {
-    pub use crate::native::{log, config_port, config_tls_port, check_shutdown, wait_for_events,
-                            tcp_listen, tcp_accept, tcp_has_data,
-                            tcp_recv, tcp_send, tcp_close, tcp_is_closed, tcp_poll};
-
-    // ── Callback-driven event loop (mirrors kernel::eventloop) ──────────
-    // Same pattern as the unikernel: register callbacks, all workers run
-    // the same loop. On native, "worker" = OS thread.
-
-    use core::sync::atomic::{AtomicUsize, Ordering};
-    use atomic_fn::AtomicFn;
-
-    type PollFn = fn(u32) -> bool;
-
-    /// Up to 4 IO poll callbacks (network, storage, ...). Each slot is
-    /// an `AtomicFn<PollFn>` — null = empty, published value = callback.
-    /// `IO_POLL_COUNT` tracks the number of slots that have been
-    /// claimed. Slots are filled in order during init by
-    /// `register_io_poll`, then read by all worker threads.
-    /// `AtomicFn`'s own Release/Acquire pair gives us the cross-thread
-    /// happens-before that a `volatile *mut ()` previously didn't.
-    const IO_POLL_MAX: usize = 4;
-    static IO_POLL: [AtomicFn<PollFn>; IO_POLL_MAX] = [
-        AtomicFn::null(),
-        AtomicFn::null(),
-        AtomicFn::null(),
-        AtomicFn::null(),
-    ];
-    static IO_POLL_COUNT: AtomicUsize = AtomicUsize::new(0);
-    static SERVICE: AtomicFn<PollFn> = AtomicFn::null();
-
-    // NUM_WORKERS removed: num_workers() now reads native::NUM_THREADS directly.
-    static READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-
-    pub fn num_workers() -> u32 {
-        // NUM_THREADS is set by init_native() from the THREADS env var (or
-        // num_cpus() as default). Use it directly — don't override with num_cpus().
-        unsafe { crate::native::NUM_THREADS as u32 }
-    }
-
-    /// Register an IO poll callback (network, storage, etc).
-    /// Multiple sources can be registered; all are called each iteration.
-    /// Designed to be called from a single init thread; the atomic
-    /// fetch_add reserves the slot index race-free even if that contract
-    /// is ever violated.
-    pub fn register_io_poll(f: PollFn) {
-        let idx = IO_POLL_COUNT.fetch_add(1, Ordering::AcqRel);
-        if idx < IO_POLL_MAX {
-            IO_POLL[idx].store(f);
-        } else {
-            // Roll back to keep IO_POLL_COUNT bounded.
-            IO_POLL_COUNT.store(IO_POLL_MAX, Ordering::Release);
-        }
-    }
-
-    pub fn set_service(f: PollFn) {
-        SERVICE.store(f);
-    }
-
-    pub fn get_service() -> Option<PollFn> {
-        SERVICE.load()
-    }
-
-    pub fn set_ready() {
-        READY.store(true, core::sync::atomic::Ordering::Release);
-    }
-
-    pub fn is_ready() -> bool {
-        READY.load(core::sync::atomic::Ordering::Acquire)
-    }
-
-    pub fn request_shutdown() {
-        unsafe { crate::native::SHUTDOWN = true; }
-    }
-
-    pub fn tcp_listen_on(worker_id: u32, port: u16) -> *mut () {
-        crate::native::tcp_listen_for(port, worker_id)
-    }
-
-    /// Run the worker event loop on this thread. Same structure as kernel's.
-    /// Called by native_worker_loop after thread setup.
-    pub fn run_worker(worker_id: u32) {
-        // Wait for ready
-        while !is_ready() && !crate::native::check_shutdown() {
-            crate::native::wait_for_events();
-        }
-
-        loop {
-            if crate::native::check_shutdown() { break; }
-
-            let mut did_work = false;
-
-            // 1. IO poll callbacks (network, future storage, etc)
-            let n = IO_POLL_COUNT.load(Ordering::Acquire).min(IO_POLL_MAX);
-            for i in 0..n {
-                if let Some(f) = IO_POLL[i].load() {
-                    if f(worker_id) { did_work = true; }
-                }
-            }
-
-            // 2. App service callback
-            if let Some(f) = get_service() {
-                if f(worker_id) { did_work = true; }
-            }
-
-            // 3. Idle if no work
-            if !did_work {
-                crate::native::wait_for_events();
-            }
-        }
-    }
+    pub use uni_native::{
+        log, config_port, config_tls_port, check_shutdown, wait_for_events,
+        tcp_listen, tcp_accept, tcp_has_data, tcp_recv, tcp_send, tcp_close,
+        tcp_is_closed, tcp_poll, tcp_listen_on,
+        num_workers, register_io_poll, set_service, set_ready, request_shutdown,
+    };
 }
 
 // ---- Re-exported platform functions ------------------------------------------
@@ -415,12 +338,12 @@ pub fn heap_stats() -> HeapStats {
 
 #[cfg(platform_native)]
 pub fn udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
-    native::native_udp_bind(port, handler);
+    uni_native::udp_bind(port, handler);
 }
 
 #[cfg(platform_native)]
 pub fn udp_send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
-    native::native_udp_send(dst_ip, src_port, dst_port, data);
+    uni_native::udp_send(dst_ip, src_port, dst_port, data);
 }
 
 // ---- TcpListener ------------------------------------------------------------

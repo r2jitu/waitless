@@ -9,7 +9,6 @@ rust_library(
         "boot_info.rs",
         "http.rs",
         "lib.rs",
-        "native.rs",
         "rng.rs",
         "unikernel.rs",
     ],
@@ -27,12 +26,15 @@ rust_library(
     # the hand-rolled TLS 1.3 state machine (POSIX sockets cover
     # everything else). Bare-metal builds additionally pull in
     # //drivers for the stats queries (`net_rx_counts` etc.) that
-    # surface through `uni::*` to apps.
+    # surface through `uni::*` to apps. Native pulls in
+    # //uni-native — the host POSIX backend (libc sockets, pthread
+    # workers, kqueue/epoll event loop) — which lives in its own
+    # std crate so this one stays strictly `#![no_std]`.
     deps = [
         "//uni-net:uni_net",
         "//util/atomic_fn",
     ] + select({
-        "//bazel/platforms:native": [],
+        "//bazel/platforms:native": ["//uni-native:uni_native"],
         "//conditions:default": [
             "//drivers",
             "//kernel",

@@ -1,0 +1,29 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# uni-native — host POSIX backend for `uni` (native / non-unikernel
+# builds). Self-contained std rlib: libc-FFI sockets + kqueue/epoll +
+# pthread workers + the cross-worker event-loop dispatch (IO_POLL /
+# SERVICE atomics, `run_worker`).
+#
+# Lives in its own crate so `uni` itself stays strictly `#![no_std]`
+# and the host-only machinery can use std facilities (`std::env::var`,
+# `format!`, …) without a crate-wide cfg_attr. `target_compatible_with
+# = //bazel/platforms:native` keeps `bazel build //...` on a unikernel
+# target skipping this crate cleanly.
+#
+# `uni` re-exports the public surface via `uni::native::*`, so apps
+# keep their existing imports.
+rust_library(
+    name = "uni_native",
+    srcs = ["src/lib.rs"],
+    crate_name = "uni_native",
+    target_compatible_with = ["//bazel/platforms:native"],
+    # `uni_native` is deliberately a leaf: app-level types (boot_info,
+    # shutdown hook, http listener plumbing) flow IN via callbacks
+    # registered at `run()` time, so we don't need a dep back on
+    # `//uni`. Only `atomic_fn` is shared, for the `IO_POLL` / `SERVICE`
+    # callback slots.
+    deps = ["//util/atomic_fn"],
+)
