@@ -489,12 +489,34 @@ unsafe fn kernel_boot(info: &BootInfo) {
         }
     }
 
-    // ── SMP: per-CPU storage always initialised for the BSP ────────────────
-    // AP bring-up is opt-in: apps that want multi-core call
-    // `uni::smp::enable()` from `uni_main`, which synchronously invokes
-    // the callback we register here. Single-core apps skip the cost.
-    kernel::percpu::init(1);
-    kernel::register_ap_start_fn(ap_start);
+    // ── SMP: detect and bring up all available cores ──────────────────────
+    // Matches the native backend's behaviour of using every available
+    // thread. Apps that want single-core determinism get it by running
+    // on a single-CPU VM (or, on native, via `UNIKERNEL_CPUS=1`).
+    #[cfg(target_arch = "aarch64")]
+    {
+        let cpu_count = kernel::aarch64::fdt::info().cpu_count;
+        kernel::percpu::init(cpu_count);
+        if cpu_count > 1 {
+            kernel::aarch64::smp::start_secondary_cores(cpu_count);
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let cpu_count = kernel::x86_64::acpi::detect_cpus();
+        kernel::percpu::init(cpu_count);
+        if cpu_count > 1 {
+            match info.protocol {
+                Protocol::Limine => {
+                    let total = start_aps_via_limine_mp();
+                    kernel::x86_64::smp::wait_for_cores_online(total);
+                }
+                _ => {
+                    kernel::x86_64::smp::start_secondary_cores(cpu_count);
+                }
+            }
+        }
+    }
 
     // Register callbacks with the kernel event loop.
     if net_ok {
@@ -509,9 +531,6 @@ unsafe fn kernel_boot(info: &BootInfo) {
 
     klog!("\n[BOOT] All subsystems ready. Starting application.\n\n");
     uni_main();
-    // (Opt-in SMP: `uni::smp::enable()` inside `uni_main` brought APs
-    // up synchronously via `kernel::enable_smp()` → our `ap_start`
-    // callback. No post-uni_main SMP work needed here.)
 
     // Post-uni_main: promote virtio-net to multi-queue if the
     // device negotiated MQ. Apps that wanted networking have
@@ -548,42 +567,6 @@ unsafe fn kernel_boot(info: &BootInfo) {
     kernel::aarch64::smp::request_shutdown();
 
     arch_shutdown();
-    }
-}
-
-/// Synchronous AP bring-up, registered with the kernel at boot init
-/// and invoked by `uni::smp::enable()` via `kernel::enable_smp()`.
-/// Runs entirely on the BSP; when it returns APs are sitting in
-/// `kernel::eventloop::run` waiting for READY, and `num_cores()`
-/// reflects the detected CPU count.
-fn ap_start() {
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        let cpu_count = kernel::aarch64::fdt::info().cpu_count;
-        kernel::percpu::init(cpu_count);
-        if cpu_count > 1 {
-            kernel::aarch64::smp::start_secondary_cores(cpu_count);
-        }
-    }
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        let cpu_count = kernel::x86_64::acpi::detect_cpus();
-        kernel::percpu::init(cpu_count);
-        if cpu_count > 1 {
-            // Boot protocol governs the AP-release mechanism — Limine
-            // parks APs in long mode during its own boot, whereas
-            // Multiboot2/PVH use classic INIT-SIPI-SIPI.
-            let protocol = (*G_BOOT_INFO.0.get()).protocol;
-            match protocol {
-                Protocol::Limine => {
-                    let total = start_aps_via_limine_mp();
-                    kernel::x86_64::smp::wait_for_cores_online(total);
-                }
-                _ => {
-                    kernel::x86_64::smp::start_secondary_cores(cpu_count);
-                }
-            }
-        }
     }
 }
 

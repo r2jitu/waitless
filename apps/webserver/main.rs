@@ -43,11 +43,6 @@ impl WebServerApp {
     fn new() -> Self {
         log_boot_info();
 
-        // Opt in to multi-core execution — `Server::listen{,_tls}`
-        // creates a per-worker TCP listener, so `num_workers()` must
-        // reflect the enabled CPU count before `listen` runs.
-        uni::smp::enable();
-
         // Bring up the network stack explicitly (Phase 3 API).
         // Try DHCP first; on timeout (typical under minimal tap
         // networks) fall back to a static 10.0.2.15/24 config so

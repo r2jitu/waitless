@@ -287,41 +287,6 @@ pub use backend::on_tick;
 /// timed-out state. Side-effect only; installed once per program.
 pub use backend::on_idle;
 
-// ---- Opt-in SMP -------------------------------------------------------------
-//
-// Single-core apps get a `num_workers() == 1` runtime for free: the
-// kernel skips AP bring-up unless `uni::smp::enable()` is called from
-// `uni_main`. Apps that want multi-core execution call it before any
-// code that depends on `num_workers()` (typically early in
-// `uni_main`).
-
-/// Multi-core execution controls.
-pub mod smp {
-    /// Ask the runtime to bring up every available AP after
-    /// `uni_main` returns. Call it from `#[uni::boot] fn boot()` if
-    /// the app uses multi-core features (per-worker listeners,
-    /// per-core counters, etc).
-    ///
-    /// Bare-metal: synchronously brings up the APs via the
-    /// arch/protocol-specific bring-up that boot code registered
-    /// with `kernel::register_ap_start_fn`. When this returns,
-    /// `kernel::percpu::init` has been called with the detected
-    /// CPU count, so `num_workers()` reflects the enabled total
-    /// before any subsequent `Server::listen` / per-worker setup
-    /// runs.
-    ///
-    /// Native: no-op. The worker-thread pool is already sized by
-    /// `UNIKERNEL_CPUS` (or `num_cpus()`) at `init_native` time; no
-    /// further runtime opt-in is needed.
-    #[cfg(target_os = "none")]
-    pub fn enable() {
-        kernel::enable_smp();
-    }
-
-    /// Native no-op — see `enable()` docs.
-    #[cfg(not(target_os = "none"))]
-    pub fn enable() {}
-}
 
 /// Current core / worker ID. On unikernel this reads the percpu TLS
 /// register (~2 cycles). On native there's no per-thread state, so

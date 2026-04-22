@@ -11,9 +11,6 @@ extern crate kernel;
 
 #[uni::boot]
 fn boot() {
-    // The test measures multi-core behavior; opt in so APs come up.
-    uni::smp::enable();
-
     uni::log(b"SMP test: cores booted.\n");
 
     // Test IPI: core 0 sends SGI to core 1, check that it was received

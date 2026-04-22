@@ -58,11 +58,6 @@ fn test_service(core_id: u32) -> bool {
 fn boot() {
     uni::log(b"Per-core state test starting.\n");
 
-    // Opt in to multi-core execution — the test requires APs to be
-    // running. `num_cores()` reflects the enabled total after this
-    // returns.
-    uni::smp::enable();
-
     let num_cores = kernel::percpu::num_cores();
     uni::log(b"Cores: ");
     uni::log(&[b'0' + (num_cores as u8 % 10)]);
