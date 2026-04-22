@@ -10,6 +10,12 @@ set -euo pipefail
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
+# Progress logging is off by default so genrule invocations stay
+# silent on success (Bazel mirrors every stdout/stderr byte under
+# "INFO: From Executing genrule ..."). Set `MAKE_LIMINE_ISO_VERBOSE=1`
+# to re-enable when debugging.
+log() { [[ "${MAKE_LIMINE_ISO_VERBOSE:-0}" == "1" ]] && echo "$@" || :; }
+
 KERNEL_ELF=""
 OUTPUT_ISO=""
 ARCH="x86_64"
@@ -68,15 +74,15 @@ trap cleanup EXIT
 while ! mkdir "$LIMINE_LOCK" 2>/dev/null; do sleep 0.2; done
 
 if [[ ! -d "$LIMINE_DIR" ]]; then
-    echo "[ISO] Fetching Limine bootloader..."
+    log "[ISO] Fetching Limine bootloader..."
     git clone --depth=1 --branch=v8.x-binary \
-        https://github.com/limine-bootloader/limine.git "$LIMINE_DIR" 2>/dev/null
+        https://github.com/limine-bootloader/limine.git "$LIMINE_DIR" >/dev/null 2>&1
 fi
 
 # Build the limine CLI tool (needed for BIOS install on ISO)
 if [[ ! -f "$LIMINE_DIR/limine" ]]; then
-    echo "[ISO] Building limine CLI tool..."
-    make -C "$LIMINE_DIR" 2>/dev/null
+    log "[ISO] Building limine CLI tool..."
+    make -C "$LIMINE_DIR" >/dev/null 2>&1
 fi
 
 rmdir "$LIMINE_LOCK" 2>/dev/null || true
@@ -106,7 +112,7 @@ else
 fi
 
 # --- Build ISO ---
-echo "[ISO] Creating Limine ISO..."
+log "[ISO] Creating Limine ISO..."
 
 XORRISO_ARGS=(
     -as mkisofs
@@ -143,5 +149,5 @@ if [[ "$ARCH" == "x86_64" && -x "$LIMINE_DIR/limine" ]]; then
     "$LIMINE_DIR/limine" bios-install "$OUTPUT_ISO" 2>/dev/null || true
 fi
 
-echo "[ISO] Created: $OUTPUT_ISO"
-ls -lh "$OUTPUT_ISO"
+log "[ISO] Created: $OUTPUT_ISO"
+[[ "${MAKE_LIMINE_ISO_VERBOSE:-0}" == "1" ]] && ls -lh "$OUTPUT_ISO" || :
