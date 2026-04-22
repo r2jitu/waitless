@@ -213,8 +213,6 @@ mod backend {
     // name).
     pub use kernel::percpu::num_cores as num_workers;
     pub use kernel::eventloop::{set_service, set_ready, request_shutdown};
-    // Additive app hooks — see `uni::{on_idle, on_tick}` wrappers below.
-    pub use kernel::eventloop::{set_idle as on_idle, set_tick as on_tick};
 
     /// Register an IO poll callback. On unikernel, this is handled by
     /// kernel::eventloop callbacks (net_poll, net_drain, etc). For app-level
@@ -257,8 +255,6 @@ mod backend {
         tcp_is_closed, tcp_poll, tcp_listen_on, udp_bind, udp_send,
         num_workers, register_io_poll, set_service, set_ready, request_shutdown,
     };
-    // Additive app hooks — see `uni::{on_idle, on_tick}` wrappers below.
-    pub use uni_native::{set_idle as on_idle, set_tick as on_tick};
 
     pub fn net_rx_counts() -> [u64; 8] { [0; 8] }
     pub fn net_num_queue_pairs() -> u16 { 1 }
@@ -272,20 +268,6 @@ mod backend {
 pub use backend::{log, config_port, config_tls_port, check_shutdown, wait_for_events, tcp_poll};
 pub use backend::{num_workers, set_service, set_ready, request_shutdown, register_io_poll};
 pub use backend::tcp_listen_on;
-
-/// Register a per-iteration callback. Fires at the top of every
-/// event-loop tick on every worker, regardless of whether other
-/// work happened this iteration. Side-effect only (no return);
-/// use for periodic maintenance such as metrics export, cache
-/// expiry, or GC. Installed once per program — later calls
-/// overwrite earlier ones.
-pub use backend::on_tick;
-
-/// Register a pre-sleep callback. Fires on the worker just before
-/// it calls `wait_for_events` — i.e., when the loop would
-/// otherwise go idle. Good place to flush batched writes or drop
-/// timed-out state. Side-effect only; installed once per program.
-pub use backend::on_idle;
 
 
 /// Current core / worker ID. On unikernel this reads the percpu TLS
