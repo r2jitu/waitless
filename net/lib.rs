@@ -1,23 +1,9 @@
-// net/lib.rs — Network stack umbrella crate.
-//
-// Re-exports per-protocol sub-crates and provides full-stack
-// poll/dispatch that ties them together.
-//
-// Tier 1 (multi-queue): each core polls its own RX queue pair directly.
-// No distributor, no RX_LOCK, no inbox. TX goes through per-core queue
-// pairs with deferred kick. Activated when num_queue_pairs > 1.
-//
-// Tier 2 (single-queue): core 0 polls VirtIO, classifies frames
-// by flow hash, and distributes to per-core RX inboxes. APs drain
-// their inbox and process packets. TX from APs goes through staging
-// buffers that core 0 flushes.
+// Network stack umbrella. See docs/networking.md for the Tier 1 vs
+// Tier 2 dispatch design.
 
 #![no_std]
 
-// See kernel/lib.rs for rationale — `alloc::*` is backed by the
-// kernel's global allocator on bare-metal, libstd's default on native.
 extern crate alloc;
-
 extern crate drivers;
 extern crate kernel;
 pub extern crate net_types as types;
@@ -29,16 +15,12 @@ pub extern crate net_udp as udp;
 pub extern crate net_dhcp as dhcp;
 pub extern crate net_protocol as protocol;
 
-// Process-wide IP protocol dispatch table. Populated by `init_stack`
-// at boot; consulted on the hot path by `net_receive` /
-// `distribute_frame`.
 pub static REGISTRY: protocol::Registry = protocol::Registry::new();
 
-// Thin wrappers converting the u32-IP registry ABI to the
-// Ipv4Addr-typed `tcp_receive` / `udp_receive` entry points. Kept
-// here (rather than inside each protocol crate) so `net_protocol`
-// stays dependency-free and its rust_test avoids the panic-strategy
-// conflict that `:types` would drag in.
+// Adapters converting the u32-IP registry ABI to the Ipv4Addr-typed
+// `*_receive` entry points. Here rather than inside each protocol
+// crate so `net_protocol` stays dep-free (its rust_test would
+// otherwise inherit `:types`' panic-strategy conflict).
 fn tcp_dispatch(src: u32, dst: u32, payload: &[u8]) {
     tcp::tcp_receive(
         types::Ipv4Addr { addr: src },
@@ -54,34 +36,21 @@ fn udp_dispatch(src: u32, dst: u32, payload: &[u8]) {
     );
 }
 
-/// One-shot wiring of TCP/UDP into the protocol registry. Idempotent
-/// — re-registration replaces the previous handler, which is harmless
-/// since the handler pointers are stable link-time addresses.
 pub fn init_stack() {
     REGISTRY.register(protocol::Slot::Tcp, tcp_dispatch);
     REGISTRY.register(protocol::Slot::Udp, udp_dispatch);
 }
 
 // ============================================================================
-// IP-config bring-up primitives
+// IP-config bring-up primitives — `uni::net::Net::enable` dispatches here.
 // ============================================================================
-//
-// `uni::net::Net::enable(NetBringUp)` dispatches here. Kept as plain
-// free functions (rather than a single enum-taking API) because the
-// `NetBringUp` enum lives in `uni::net` and this crate can't depend on
-// `uni`. Each function is idempotent.
 
-/// Run DHCP DISCOVER/REQUEST and store the resulting `NetConfig`.
-/// Returns `true` on success, `false` if the server didn't answer.
-/// On failure the caller is expected to fall back to a static config
-/// (or leave `CONFIG` empty and accept no networking).
+/// Returns `true` on success, `false` on DHCP timeout.
 pub fn bringup_dhcp() -> bool {
     dhcp::discover()
 }
 
-/// Apply a static IP configuration without consulting DHCP.
-/// `netmask` uses CIDR-style dotted-octets; `dns` is left at 0.0.0.0
-/// because the network stack doesn't resolve names.
+/// `dns` is left at 0.0.0.0 — the stack doesn't resolve names.
 pub fn bringup_static(
     ip: types::Ipv4Addr,
     gateway: types::Ipv4Addr,

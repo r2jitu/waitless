@@ -1,18 +1,5 @@
-// uni-net/driver.rs — Ethernet driver contract + link-time registry.
-//
-// `lib.rs` of the leaf `uni_net_driver` crate. Includes `error.rs`
-// as a submodule so the `NetError` / `DhcpError` / `NicError`
-// hierarchy is reachable from driver crates without pulling the
-// full `uni_net` stack.
-//
-// Sits as its own tiny leaf crate so that driver crates like
-// `drivers` can depend on it without the cycle that would appear
-// otherwise:
-//
-//     drivers → uni_net → net (umbrella) → drivers
-//
-// `uni_net` re-exports everything from here so app-facing imports
-// like `use uni_net::EthernetDriver` keep working.
+// `EthernetDriver` trait + link-time registry. Leaf crate so NIC
+// drivers can depend here without inheriting the full net stack.
 
 #![no_std]
 
@@ -21,18 +8,14 @@ pub use error::{DhcpError, NetError, NicError};
 
 // ---- NicHandle -------------------------------------------------------------
 
-/// Opaque handle identifying a successfully-probed NIC. Drivers that
-/// support multiple NIC instances can use it to distinguish them;
-/// single-NIC drivers can treat it as a presence token.
+/// Opaque handle for a probed NIC. Multi-device drivers can use it to
+/// distinguish instances; single-device drivers treat it as a token.
 #[derive(Clone, Copy, Debug)]
 pub struct NicHandle {
     _private: (),
 }
 
 impl NicHandle {
-    /// Construct a handle. Meant for driver `probe()` implementations;
-    /// framework code never constructs one directly. `pub` so driver
-    /// crates (which live outside this one) can return handles.
     pub const fn new() -> Self {
         NicHandle { _private: () }
     }

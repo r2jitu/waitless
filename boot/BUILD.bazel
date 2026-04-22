@@ -4,18 +4,9 @@ package(default_visibility = ["//visibility:public"])
 
 exports_files(["limine.conf"])
 
-# Boot/entry code — rust_static_library targets that provide #[no_mangle]
-# symbols resolved at link time by assembly (kernel_main, limine_entry,
-# memcpy). Separate from the clean kernel library crate.
-#
-# Every target here is unikernel-only (`#![no_std]`, links against boot
-# assembly, has no meaning on a host OS). They carry
-# `target_compatible_with = ["@platforms//os:none"]` so `bazel build
-# //...` on a host platform skips them as incompatible rather than
-# failing to compile no_std code under the host's unwind-friendly
-# defaults. Variant transitions (//bazel/rules:variants.bzl) set the
-# target platform to aarch64/x86_64 _unikernel (both `os:none`), so
-# they compile fine through the variant dep chain.
+# Boot/entry code: rust_static_library targets supplying the
+# `#[no_mangle]` symbols that assembly resolves at link time
+# (kernel_main, limine_entry, memcpy).
 _UNIKERNEL_ONLY = ["@platforms//os:none"]
 
 rust_static_library(
@@ -42,10 +33,9 @@ rust_static_library(
     ],
 )
 
-# x86_64 multiboot/PVH boot stub (boot.S only).
-# Excluded from the Limine higher-half target: boot.S contains 32-bit
-# absolute relocations targeting `.boot_bss` that cannot be linked into
-# a higher-half ELF, and Limine doesn't need the multiboot stub anyway.
+# x86_64 multiboot/PVH stub. Excluded from the Limine higher-half
+# target: boot.S has 32-bit absolute relocations that can't be linked
+# into higher-half, and Limine enters at limine_entry() directly.
 rust_static_library(
     name = "boot_asm",
     srcs = ["boot_asm.rs"],

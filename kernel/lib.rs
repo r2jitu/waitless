@@ -1,15 +1,9 @@
-// kernel/lib.rs — Unified kernel library crate.
-//
-// Platform-independent modules at the top level, arch-specific
-// modules in x86_64/ and aarch64/ subdirectories.
+// Kernel library. Arch-specific modules in `x86_64/` and `aarch64/`.
+// The `#[global_allocator]` for the whole bare-metal build lives at
+// `mm::GLOBAL_ALLOCATOR`.
 
 #![no_std]
 
-// `extern crate alloc` makes `alloc::boxed::Box`, `alloc::vec::Vec`,
-// `alloc::string::String`, etc. available to kernel code. The kernel's
-// `#[global_allocator]` (see `mm::GLOBAL_ALLOCATOR`) backs every
-// allocation — so downstream crates that depend on `//kernel` get a
-// working heap without any extra wiring.
 extern crate alloc;
 
 pub mod types;

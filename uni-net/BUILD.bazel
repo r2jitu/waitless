@@ -3,22 +3,9 @@ load("//bazel/rules:rust.bzl", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 
-# ── Leaf: uni_net_driver (ethernet driver contract) ─────────────────
-#
-# Tiny no-dep crate that hosts the `EthernetDriver` trait plus its
-# support types (`NicHandle`, `NicError`) and the link-time registry
-# machinery (`EthernetDriverReg`, `register_ethernet_driver!`,
-# `linked_ethernet_drivers()`).
-#
-# Sits here rather than inside the main `uni_net` crate so driver
-# crates (`drivers`, and the forthcoming `//uni-driver-virtio-net`
-# / `//uni-driver-gve`) can depend on just this one leaf without
-# pulling in the full net stack. Concretely it breaks the cycle
-#
-#     drivers → uni_net → net (umbrella) → drivers
-#
-# that would otherwise appear the moment `drivers/virtio_net.rs`
-# does `impl EthernetDriver`.
+# Leaf crate: `EthernetDriver` trait + link-time registry. No deps on
+# the net stack — driver crates depend here without forming a
+# `drivers → uni_net → net → drivers` cycle.
 rust_library(
     name = "driver",
     srcs = [
@@ -29,13 +16,7 @@ rust_library(
     crate_root = "driver.rs",
 )
 
-# ── Main uni_net crate ─────────────────────────────────────────────
-#
-# Owns `Net::enable` + `NetBringUp` + `Ipv4Addr`, the `NetError` /
-# `DhcpError` hierarchy, and re-exports the full `driver` surface
-# and the bare-metal net umbrella. Apps keep importing via
-# `uni::net::*` and `uni::{NetError, …}` — `//uni:uni` re-exports
-# this crate.
+# `Net::enable`, error types, and the bare-metal net umbrella.
 rust_library(
     name = "uni-net",
     srcs = [

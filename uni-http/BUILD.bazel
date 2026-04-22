@@ -2,16 +2,8 @@ load("@rules_rust//rust:defs.bzl", "rust_library")
 
 package(default_visibility = ["//visibility:public"])
 
-# uni-http — HTTP/1.1 server + parser + per-core connection pool.
-#
-# Moved out of `//uni` (was `uni::http::*`) so apps that don't serve
-# HTTP drop the ~400 KB of parser + handler dispatch + connection
-# pool + response builder code. Apps that need HTTP add `//uni-http`
-# to their deps and `use uni_http::{Server, Request, Response}`.
-#
-# `TlsAdapter` / `TlsConnection` traits also live here (used to be
-# `uni::http::{TlsAdapter, TlsConnection}`). `//uni-tls` depends on
-# `//uni-http` to implement them; apps that want HTTPS pull in both.
+# HTTP/1.1 server. Also hosts the `TlsAdapter` / `TlsConnection`
+# traits that `//uni-tls` implements — keeps Server TLS-unaware.
 rust_library(
     name = "uni-http",
     srcs = ["src/lib.rs"],

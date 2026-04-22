@@ -1,22 +1,12 @@
-// kernel/mm.rs -- Memory management in Rust
+// Memory management: frame bitmap + talc-backed heap.
 //
-// Two-tier memory management:
+// Frame bitmap: bit per 4 KB page (1 = used). Placed immediately after
+// `_kernel_end`, or in the largest available region for Limine
+// higher-half boot.
 //
-// 1. Physical frame allocator:
-//    A bitmap where each bit represents a 4KB page frame. Bit=1 means used.
-//    The bitmap lives immediately after _kernel_end (or in the largest
-//    available region for Limine higher-half boot).
-//
-// 2. Kernel heap allocator:
-//    Thin wrapper over `talc` (a segregated-free-list allocator) behind
-//    our own `Spinlock`. O(log n) alloc + free, honest arbitrary-alignment
-//    support, and per-heap byte-level counters for `/heap`-style
-//    observability. Replaces the previous hand-rolled first-fit +
-//    O(n) backward-coalescing free list.
-//
-//    The heap starts after the frame bitmap and grows upward. We pre-allocate
-//    a fixed heap region (HEAP_SIZE bytes) from the available physical
-//    memory and `claim` it into talc during `init_heap`.
+// Heap: `talc` (segregated-free-list) behind a `Spinlock`, claimed
+// from a fixed HEAP_SIZE region immediately after the bitmap during
+// `init_heap`.
 
 use core::alloc::Layout;
 use core::ptr::{self, NonNull};

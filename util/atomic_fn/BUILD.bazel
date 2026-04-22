@@ -3,28 +3,13 @@ load("//bazel/rules:rust.bzl", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 
-# util/atomic_fn — typed atomic function-pointer cell.
+# Typed atomic function-pointer cell. Kept as a zero-dep leaf crate
+# so rust_test consumers don't transitively inherit //kernel's
+# RustCrypto / talc / panic=abort chain.
 #
-# Zero-dep leaf crate (only `core::`). Extracted from
-# `kernel::sync::AtomicFn` so downstream callers that can't depend
-# on `//kernel` (because doing so pulls in RustCrypto / talc /
-# panic=abort chains that break rust_test's panic=unwind runtime)
-# can still reach the same primitive.
-#
-# Consumers:
-#   * //kernel: re-exports as `kernel::sync::AtomicFn` for compat.
-#   * //net:protocol: protocol-registry callback slot.
-#   * //uni:uni (native backend): `IO_POLL` / `SERVICE` slots.
-#
-# `crate_features = ["std"]` is toggled on by the
-# `//bazel/rules:tests_need_std` bool_flag (set True by
-# `.bazelrc`'s `test` verb). Under that flag the source's
-# `cfg_attr(all(not(test), not(feature = "std")), no_std)` leaves
-# the crate as std + panic=unwind, so it can link into a
-# `rust_test` binary even when the test uses `crate = ":foo"` and
-# the dep subgraph doesn't get `--test`. Under the default build
-# the flag is False, crate_features is empty, and `#![no_std]`
-# stays on — same production rlib as before.
+# The `std` crate_feature (toggled by `//bazel/rules:tests_need_std`
+# under the `test` verb) flips the crate to std + panic=unwind so it
+# can link into rust_test binaries via `crate = ":foo"`.
 rust_library(
     name = "atomic_fn",
     srcs = ["lib.rs"],

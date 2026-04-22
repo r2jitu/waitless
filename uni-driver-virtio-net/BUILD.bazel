@@ -2,11 +2,8 @@ load("@rules_rust//rust:defs.bzl", "rust_library")
 
 package(default_visibility = ["//visibility:public"])
 
-# uni-driver-virtio-net — VirtIO ethernet driver.
-#
-# Depends only on `//drivers:infra` for MMIO / PCI / VirtIO transport
-# helpers — no dep on `//drivers` itself, so the outer umbrella can
-# dispatch to us without forming a cycle.
+# VirtIO ethernet driver. Depends on `//drivers:infra` (not the outer
+# `//drivers`) so the umbrella can dispatch here without a cycle.
 rust_library(
     name = "uni-driver-virtio-net",
     srcs = ["src/lib.rs"],

@@ -1,30 +1,9 @@
-// uni-http/src/lib.rs — HTTP/1.1 server library.
+// HTTP/1.1 server. Cooperative non-blocking: the kernel event loop
+// accepts, reads, parses, dispatches, and writes back.
 //
-// Moved out of `//uni` so apps that don't serve HTTP skip the
-// parser + handler + connection-pool code. Public surface is
-// `uni_http::{Server, Request, Response, Method, Handler,
-// TlsAdapter, TlsConnection}`.
-//
-// Non-blocking cooperative model: the kernel event loop polls the
-// network stack, accepts connections, reads data, parses HTTP
-// requests, dispatches to handlers, and sends responses.
-//
-// Multi-core: each core creates its own TCP listener and maintains
-// its own active connection set. Core 0 runs the main event loop;
-// APs run HTTP service via the percpu ap_poll hook. Routes are
-// shared (read-only).
-//
-// HTTPS: TLS is injected from `//uni-tls` via the free function
-// `uni_tls::listen_tls(&mut server, port, cfg)`, which hands us a
-// `Box<dyn TlsAdapter>`. The service loop funnels incoming TCP
-// bytes through that trait object, feeds decrypted plaintext into
-// the same HTTP parser, encrypts responses back out. From the
-// request-handler's perspective nothing changes — `Request` and
-// `Response` are the same whether the transport is plain or TLS.
-//
-// The trait-object boundary means `uni_http::Server` itself has
-// no dependency on TLS or crypto code — apps that don't pull
-// `uni-tls` in don't link any of it.
+// Per-core listener + connection set; routes are shared read-only.
+// HTTPS injection happens via the `TlsAdapter` trait object below so
+// this crate has no compile-time dep on TLS or crypto code.
 
 #![no_std]
 
@@ -35,41 +14,18 @@ use alloc::boxed::Box;
 
 use uni::{TcpListener, TcpStream};
 
-// ── TLS injection boundary ─────────────────────────────────────────────
-//
-// `uni-tls` implements these traits over its sans-io TLS 1.3 state
-// machine; nothing else in the tree does. Making the boundary
-// trait-object-based keeps the generated code for `Server` free of
-// any TLS / crypto references when no `TlsAdapter` is installed.
-//
-// Shape mirrors the sans-io primitives exposed by
-// `net_tls_server::TlsServer`:
-//
-//   push_rx         → feed ciphertext bytes off the wire
-//   advance         → drive the handshake + state transitions
-//   pop_tx          → drain ciphertext bytes to send back out
-//   pop_plaintext   → drain decrypted request bytes for HTTP parse
-//   send_app_data   → queue a plaintext response for encryption
-//   close_notify    → queue a TLS shutdown alert before FIN
+// TLS injection boundary. `uni-tls` implements these traits over a
+// sans-io TLS 1.3 state machine.
 
-/// Adapter held by `Server` while TLS is enabled. Creates a per-
-/// connection state machine each time the server accepts on a TLS
-/// listener. `Send + Sync` because it's shared across all worker
-/// cores; `'static` because it lives in a long-lived server.
 pub trait TlsAdapter: Send + Sync + 'static {
-    /// Build a fresh per-connection state machine. `seed` is 32
-    /// bytes of platform entropy the caller has already pulled from
-    /// the RNG.
+    /// `seed` is 32 bytes of platform entropy the caller has already
+    /// pulled from the RNG.
     fn new_connection(&self, seed: [u8; 32]) -> Box<dyn TlsConnection>;
 }
 
-/// Per-connection TLS state. Accessed by one worker at a time (the
-/// one that owns the `ActiveConn`), so `Send` is sufficient — no
-/// `Sync` required.
 pub trait TlsConnection: Send + 'static {
     fn push_rx(&mut self, bytes: &[u8]);
-    /// Drive the handshake / state transitions. `Err(())` means a
-    /// fatal error and the caller should drop the connection.
+    /// `Err(())` is fatal — caller drops the connection.
     fn advance(&mut self) -> Result<(), ()>;
     fn pop_tx(&mut self, out: &mut [u8]) -> usize;
     fn pop_plaintext(&mut self, out: &mut [u8]) -> usize;

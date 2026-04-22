@@ -1,20 +1,11 @@
-// uni/lib.rs — Platform abstraction API
-//
-// Provides safe Rust types: TcpListener, TcpStream, log(), config_port(), etc.
-//
-// Backend is cfg-dispatched on `target_os` via two sibling crates:
-//   - target_os = "none"         → uni_kernel (bare-metal glue)
-//   - !target_os = "none" (unix) → uni_native (POSIX sockets + stdio)
+// Platform abstraction: `TcpListener`, `TcpStream`, `log`, `config_port`,
+// etc. Backend dispatched by `target_os` — `uni_kernel` on bare-metal,
+// `uni_native` on hosted.
 
 #![no_std]
 
-// `extern crate alloc` makes the `alloc` crate's types (`Box`, `Vec`,
-// `String`, …) visible to this crate and to apps built on top of it.
-// On bare-metal the backing allocator is `kernel::mm::GLOBAL_ALLOCATOR`
-// (talc); on native host builds, libstd's own global allocator.
 extern crate alloc;
 
-// Re-export the #[uni::boot] proc macro.
 pub use uni_macros::boot;
 
 #[cfg(target_os = "none")]
@@ -27,21 +18,11 @@ extern crate uni_kernel;
 #[cfg(not(target_os = "none"))]
 extern crate uni_native;
 
-// The net stack (`Net::enable`, `NetBringUp`, `EthernetDriver`,
-// error types, plus the full umbrella of TCP/UDP/ARP/IPv4/DHCP/TLS
-// on bare-metal) lives in the `uni-net` crate. Re-exported at
-// `uni::net::*` for app compat — existing `use uni::net::Net;` and
-// `use uni::{NetError, …};` imports work unchanged.
 pub extern crate uni_net as net;
 
-/// Native-binary entry — called from `bazel/rules/native_main.rs`'s
-/// `fn main()`. Runs the host POSIX event loop (all of which lives in
-/// the `uni_native` crate), plugging in the two uni-side lifecycle
-/// hooks (`boot_info_fn`, `shutdown_fn`) that `uni_native` would
-/// otherwise need a dep back on `uni` to reach. HTTP-specific
-/// per-worker setup registers separately via
-/// `uni::set_add_worker_listener` (called by `uni-http`) so
-/// compute-only apps don't have to know about it.
+/// Native entry from `native_main.rs`. Plugs boot_info and shutdown
+/// callbacks into `uni_native::run` so the native backend doesn't
+/// need a dep back on `uni`.
 #[cfg(not(target_os = "none"))]
 pub fn native_run() -> i32 {
     use crate::boot_info::{BootInfoParams, NicInfo, MAX_NICS};
@@ -61,13 +42,9 @@ pub fn native_run() -> i32 {
     })
 }
 
-/// Register a per-worker pre-spawn hook. On native, `uni_native`'s
-/// `run()` invokes it for workers 1..NUM_THREADS before
-/// `pthread_create`, so HTTP-like crates can materialise per-worker
-/// SO_REUSEPORT listener fds. On unikernel this is a no-op — every
-/// core runs `kernel::eventloop::run` directly and creates its own
-/// listener via the per-core `Server::listen` loop. `uni-http` calls
-/// this at `Server::new_boxed` time.
+/// Per-worker pre-spawn hook for SO_REUSEPORT listener setup on
+/// native (no-op on unikernel, where each core runs its own
+/// `kernel::eventloop::run` + per-core `Server::listen`).
 pub fn set_add_worker_listener(f: fn(u32)) {
     #[cfg(not(target_os = "none"))]
     uni_native::set_add_worker_listener(f);
@@ -80,15 +57,11 @@ pub mod rng;
 
 pub use boot_info::{boot_info, BootInfo, NicInfo};
 
-/// Back-compat re-export: `uni::{NetError, DhcpError, NicError}`
-/// resolve to `uni_net::error::*`. Apps that want the subsystem
-/// split explicit can also `use uni::error::NetError` (via the
-/// `error` module alias below) or `use uni_net::NetError` directly.
 pub use net::{DhcpError, NetError, NicError};
 
-/// `uni::error::*` — alias module. Error types live in `uni_net`
-/// so driver crates can see them; this alias keeps imports like
-/// `use uni::error::NetError` resolving.
+/// Also reachable as `uni::error::NetError`, etc. The types live in
+/// `uni_net` so driver crates can reach them without depending on
+/// `uni`.
 pub mod error {
     pub use crate::net::{DhcpError, NetError, NicError};
 }

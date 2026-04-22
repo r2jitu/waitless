@@ -2,18 +2,8 @@ load("@rules_rust//rust:defs.bzl", "rust_library")
 
 package(default_visibility = ["//visibility:public"])
 
-# ── Shared infrastructure ─────────────────────────────────────────
-#
-# MMIO helpers, PCI bus enumeration, VirtIO transport (legacy +
-# modern PCI + MMIO), virtio-console. Each NIC driver crate
-# (`//uni-driver-virtio-net`, `//uni-driver-gve`) depends on this
-# target; the outer `:drivers` target below layers a dispatcher over
-# both.
-#
-# Kept as a sibling target (not a separate directory) because
-# everything here is tightly coupled — common helpers + PCI/VirtIO
-# probe infra + the virtio-console FFI — and moving them to a
-# separate directory gains nothing.
+# Shared hardware-access infra: MMIO helpers, PCI enumeration, VirtIO
+# transport, virtio-console. NIC driver crates depend here.
 rust_library(
     name = "infra",
     srcs = [
@@ -29,18 +19,10 @@ rust_library(
     ],
 )
 
-# ── Outer driver-umbrella crate (`drivers`) ───────────────────────
-#
-# Owns `drivers::net` (NIC dispatcher) plus a `pub use drivers_infra::*`
-# re-export so existing callers keep seeing `drivers::pci::init`,
-# `drivers::mmio_read32`, etc.
-#
-# No dep on specific NIC crates — the dispatcher trait-dispatches
-# through `uni_net_driver::active_driver()`. Apps add whichever
-# NIC driver crate(s) they want (`//uni-driver-virtio-net`,
-# `//uni-driver-gve`) to their own BUILD deps; those crates
-# register themselves via `register_ethernet_driver!` at link
-# time, and `drivers::net::init()` picks the winner on probe.
+# Outer umbrella: NIC dispatcher (trait-dispatched via
+# `uni_net_driver::active_driver`) + `pub use drivers_infra::*`. Does
+# NOT depend on specific NIC crates — apps pick their drivers via
+# `unikernel_binary(drivers = [...])`.
 rust_library(
     name = "drivers",
     srcs = [

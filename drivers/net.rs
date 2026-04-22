@@ -10,18 +10,12 @@
 
 use uni_net_driver::{active_driver, linked_ethernet_drivers, set_active_driver, NicHandle};
 
-/// Canonical NicHandle passed to every trait call. Each driver today
-/// has a single device, so the handle's payload (empty) is unused.
-/// Using a `static` so we can pass `&'static NicHandle` to every
-/// trait method that takes `&NicHandle` without constructing a fresh
-/// temporary each call.
 static HANDLE: NicHandle = NicHandle::new();
 
 // ---- Init / lifecycle -----------------------------------------------------
 
-/// Walk the linker-section-registered driver table, try each driver's
-/// `probe()`, install the first success as active. Returns `true` if
-/// any driver came up. Called from `boot/entry.rs` before `uni_main`.
+/// Installs the first driver whose `probe()` succeeds. Returns `false`
+/// if no linked driver binds hardware.
 pub fn init() -> bool {
     for reg in linked_ethernet_drivers() {
         if reg.driver.probe().is_some() {

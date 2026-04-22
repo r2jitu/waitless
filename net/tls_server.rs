@@ -1,43 +1,17 @@
-// net/tls_server.rs — TLS 1.3 server handshake state machine.
+// TLS 1.3 server handshake state machine. Sans-io: caller feeds bytes
+// via `push_rx` / `pop_tx`, drives state with `advance`.
 //
-// Pure state machine + byte-buffer I/O — the caller is responsible for
-// feeding it bytes from a `TcpStream` and flushing bytes back out.
-// Never blocks, never allocates on the hot path, never touches a
-// lock. One `TlsServer` is intended to live inline in a per-core
-// connection pool alongside TCP state.
+// Supports exactly:
+//   - TLS 1.3, TLS_CHACHA20_POLY1305_SHA256, X25519
+//   - ECDSA P-256 + SHA-256 server cert
+// No client auth, no resumption, no 0-RTT, no key update, no ALPN.
 //
-// Scope (v1 of hand-rolled TLS):
-//   - TLS 1.3 only (no fallback)
-//   - TLS_CHACHA20_POLY1305_SHA256 only
-//   - X25519 key exchange only
-//   - ECDSA P-256 + SHA-256 server certificate only
-//   - No client authentication
-//   - No session resumption / tickets
-//   - No 0-RTT
-//   - No key update
-//   - No ALPN (for now)
-//
-// This crate root holds the public API (types, construction, the
-// `push_rx` / `pop_tx` / `advance` surface); the actual handshake
-// handlers live in `handlers` and the trace/profile/key helpers in
-// `trace` / `profile` / `keys`. Sub-modules share private fields of
-// `TlsServer` via ordinary Rust submodule visibility.
-//
-// References:
-//   RFC 8446 §2      overall handshake flow
-//   RFC 8446 §4.1.3  ServerHello
-//   RFC 8446 §4.3.1  EncryptedExtensions
-//   RFC 8446 §4.4.2  Certificate
-//   RFC 8446 §4.4.3  CertificateVerify
-//   RFC 8446 §4.4.4  Finished
-//   RFC 8446 §5      Record protocol
-//   RFC 8446 §7.1    Key schedule
+// References: RFC 8446 §2 (flow), §4.1.3 (ServerHello),
+// §4.3.1 (EncryptedExtensions), §4.4.2-4 (Certificate chain),
+// §5 (Record protocol), §7.1 (Key schedule).
 
 #![no_std]
 
-// `alloc` backs any per-connection buffers and future dynamic
-// allocation in this crate. The global allocator is the kernel's
-// talc-backed heap on bare-metal, libstd's default on native.
 extern crate alloc;
 
 extern crate getrandom;

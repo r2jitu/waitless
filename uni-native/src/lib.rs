@@ -1,33 +1,11 @@
-// uni-native/src/lib.rs — Host POSIX backend for the `uni` runtime.
+// Host POSIX backend for `uni`. libc-FFI sockets, kqueue/epoll,
+// pthread workers, cross-worker event loop.
 //
-// Self-contained std crate. `uni` itself stays `#![no_std]`; this
-// crate gets `std::env`, `format!`, and friends because a native
-// binary always links libstd anyway (see `bazel/rules/native_main.rs`).
-// Everything platform-specific lives here: libc-FFI sockets, kqueue /
-// epoll event queues, pthread workers, the cross-worker event loop,
-// env-var parsing, RAM / CPU probing. `uni::native::*` re-exports the
-// public surface so apps keep importing via `uni`.
-//
-// Each worker thread has its own:
-//   - Shared listen socket registered in its own kqueue/epoll
-//   - Connection pool
-//   - poll() loop
-//
-// Multi-thread distribution: a single nonblocking listen socket is registered
-// in every worker's kqueue/epoll. When a connection arrives, the first worker
-// whose kqueue fires calls accept() and owns the connection; others see EAGAIN
-// and go back to sleep. No dedicated acceptor thread, no pipes — mirrors the
-// unikernel's per-core event loop model where each core polls the accept queue.
-//
-// Backend state is split by how each slot is actually used:
-//
-//   * `AtomicBool` / `AtomicUsize` for scalars that are read across
-//     threads (SHUTDOWN, NUM_THREADS, TLS_KEY, UDP_COUNT,
-//     SHARED_LISTEN_COUNT).
-//   * `UnsafeCell<…>` for collections the workers touch through
-//     per-slot ownership (THREADS — each worker only its own slot;
-//     SHARED_LISTEN_PORTS/FDS — filled on the BSP before workers
-//     start; UDP_BINDINGS — same).
+// Listener distribution: one nonblocking listen fd registered in every
+// worker's kqueue/epoll. First worker whose kqueue fires calls
+// accept() and owns the connection; others see EAGAIN and sleep. No
+// dedicated acceptor, no pipes — mirrors the unikernel's per-core
+// model.
 
 use std::cell::UnsafeCell;
 use std::ptr;

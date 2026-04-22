@@ -1,48 +1,18 @@
-// uni-net/lib.rs — net-stack crate.
-//
-// Carved out of `uni::net` (the module) so driver crates can
-// implement `EthernetDriver` without creating a `drivers → uni`
-// dep cycle. Apps still reach the same surface via `uni::net::*`
-// and `uni::{NetError, DhcpError, NicError}` — `uni/lib.rs` re-
-// exports this crate unchanged so no app-side imports move.
-//
-// Layout:
-//   * `uni_net_driver` (leaf crate) — the driver contract
-//     (EthernetDriver trait, NicHandle, error types,
-//     registration macro, section walker). Split out so driver
-//     crates depend on it without inheriting the full net stack.
-//     Re-exported from this crate's root.
-//   * `Net::enable` API — Phases 3/4, lives in this file.
-//   * Umbrella re-export — brings tcp/udp/arp/ipv4/tls_server from
-//     the bare-metal `net` umbrella, or just `tls_server` on native.
+// `Net::enable` API + re-exports. The `EthernetDriver` trait and
+// registry live in the sibling `uni_net_driver` leaf crate so NIC
+// drivers can implement them without forming a `drivers → uni` cycle.
 
 #![no_std]
 
-// `alloc` for Box<Net> in the module-level slot.
 extern crate alloc;
 
-// Re-export the driver API (trait + macro + walker + errors +
-// NicHandle) so `uni_net::EthernetDriver` and friends resolve
-// unchanged. The leaf crate owns the definitions.
 extern crate uni_net_driver;
 pub use uni_net_driver::{
-    linked_ethernet_drivers, DhcpError, EthernetDriver, EthernetDriverReg, NetError,
-    NicError, NicHandle,
+    linked_ethernet_drivers, register_ethernet_driver, DhcpError, EthernetDriver,
+    EthernetDriverReg, NetError, NicError, NicHandle,
 };
 
-// Re-export the registration macro at this crate root too. Apps /
-// driver crates that depend on `uni_net` can write
-// `uni_net::register_ethernet_driver!(…)` instead of reaching for
-// `uni_net_driver`.
-pub use uni_net_driver::register_ethernet_driver;
-
-// ---- Umbrella re-export ---------------------------------------------------
-//
-// Bare-metal pulls the full `net` umbrella (tcp/udp/arp/ipv4/types/…)
-// and re-exports it at `uni::net::*`. Native doesn't pull `//net` at
-// all — TLS lives in `//uni-tls` and the rest of the net stack is
-// unikernel-only.
-
+// Bare-metal pulls the full net umbrella; native uses POSIX sockets.
 #[cfg(target_os = "none")]
 extern crate net as net_umbrella;
 
@@ -53,11 +23,8 @@ pub use net_umbrella::*;
 
 use core::cell::UnsafeCell;
 
-/// IPv4 octets, network-order storage. Defined locally (rather than
-/// re-exported from `net_types`) so the API compiles on both the
-/// bare-metal (`target_os = "none"`) and native backends. The
-/// bare-metal backend converts via the private `to_net_ipv4` helper
-/// below.
+/// IPv4 octets in network order. Defined here rather than re-exported
+/// from `net_types` so the type works on both bare-metal and native.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ipv4Addr(pub [u8; 4]);
 
