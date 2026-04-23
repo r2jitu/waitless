@@ -337,7 +337,7 @@ impl Server {
     /// duration of the program.
     ///
     /// Also registers `add_worker_listener` with the native runtime —
-    /// on native builds, `backend_native::run` invokes that hook for each
+    /// on native builds, `uni_backend::run` invokes that hook for each
     /// worker thread before spawn so SO_REUSEPORT listeners exist on
     /// every worker. Unikernel is a no-op via `uni`'s dispatch.
     pub fn new_boxed() -> Box<Self> {

@@ -1230,3 +1230,17 @@ pub extern "C" fn native_worker_loop(thread_id: u32) {
     tcp_register_shared_listener();
     run_worker(thread_id);
 }
+
+// ---- Driver diagnostics stubs (native has no NIC driver) -------------------
+//
+// Parallel the unikernel side's `drivers::net::{rx_counts, num_queue_pairs,
+// rx_used_cursors}` so cross-platform callers see the same names and return
+// zeros here.
+
+pub fn net_rx_counts() -> [u64; 8] { [0; 8] }
+pub fn net_num_queue_pairs() -> u16 { 1 }
+pub fn net_rx_used_cursors() -> [(u16, u16); 8] { [(0, 0); 8] }
+
+// ---- Heap stats ------------------------------------------------------------
+
+pub fn heap_stats() -> super::HeapStats { super::HeapStats::default() }

@@ -11,30 +11,18 @@ rust_library(
         "rng.rs",
     ],
     proc_macro_deps = ["//uni/macros:uni_macros"],
-    # `//uni-net` owns everything net-stack-related (Net::enable,
-    # NetBringUp, error types, EthernetDriver trait, and the
-    # transitive TCP/UDP/TLS umbrella). `uni` re-exports it as
-    # `uni::net` so apps don't need to learn a new import path.
-    #
-    # Platform backend is picked by target_os via the select below:
-    # `//backend-unikernel` for bare metal (log/wait_for_events/arch
-    # idle on top of `kernel` + `drivers`), `//backend-native` for
-    # host POSIX (libc sockets, pthread workers, kqueue/epoll event
-    # loop).
-    # `//kernel` + `//drivers` stay here as direct deps because
-    # `uni/lib.rs` itself still calls into them (eventloop hooks,
-    # NIC driver diagnostics).
+    # `//uni-net` re-exported as `uni::net`. `//uni-backend` is the
+    # cfg-selected platform adapter (bare-metal or POSIX). `//kernel`
+    # stays as a bare-metal-only direct dep because `uni/lib.rs`
+    # itself calls into it for `cpu_id`, `eventloop::set_on_shutdown`,
+    # and `rng::fill_bytes`.
     deps = [
+        "//uni-backend",
         "//uni-net",
         "//uni-percpu",
-        "//util/atomic_fn",
     ] + select({
-        "//bazel/platforms:native": ["//backend-native"],
-        "//conditions:default": [
-            "//drivers",
-            "//kernel",
-            "//backend-unikernel",
-        ],
+        "//bazel/platforms:native": [],
+        "//conditions:default": ["//kernel"],
     }),
 )
 

@@ -1,4 +1,4 @@
-// backend-native/src/executor.rs — Native (POSIX) backend for the shared runtime.
+// uni-backend/src/native/executor.rs — POSIX side of the runtime backend.
 
 use std::time::Instant;
 
