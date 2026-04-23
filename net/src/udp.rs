@@ -6,6 +6,7 @@
 #![no_std]
 
 extern crate uni_kernel;
+extern crate uni_runtime;
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
 extern crate net_ipv4 as ipv4;
@@ -93,6 +94,10 @@ pub fn send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
 }
 
 /// Called by the network dispatch layer when protocol == UDP.
+/// Tries the async reactor first — if a `uni_runtime::net::UdpSocket`
+/// is bound to the destination port, the datagram goes into its
+/// inbox. Falls back to the callback-style `HANDLER_FNS` registry
+/// for ports like DHCP that still use the sync API.
 pub fn udp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
     let hdr = match UdpHeader::try_ref_from(data) {
         Some(h) => h,
@@ -106,6 +111,10 @@ pub fn udp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
         return;
     }
     let payload = &data[8..udp_len];
+
+    if uni_runtime::net::deliver_udp(dst_port, src_ip.octets(), src_port, payload) {
+        return;
+    }
 
     for i in 0..MAX_HANDLERS {
         let p = HANDLER_PORTS[i].load(Ordering::Acquire);
