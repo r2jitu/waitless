@@ -1,17 +1,21 @@
-// kernel/executor.rs — Bare-metal backend for `uni-executor`.
+// kernel/executor.rs — Bare-metal backend for the shared runtime.
 
-#[inline]
-fn rt_now_ticks() -> u64 {
+fn current_worker() -> u32 {
+    crate::cpu_id()
+}
+
+fn now_ticks() -> u64 {
     crate::time::now_cycles() / crate::time::cycles_per_us()
 }
 
-static RUNTIME: uni_executor::Runtime = uni_executor::Runtime {
-    now_ticks: rt_now_ticks,
+static RUNTIME: uni_percpu::Runtime = uni_percpu::Runtime {
+    current_worker,
+    now_ticks,
 };
 
 /// Register the bare-metal runtime. Call once, before `uni_main`.
 pub fn init() {
-    uni_executor::register(&RUNTIME);
+    uni_percpu::register(&RUNTIME);
 }
 
 // ---- Re-exports for app + event-loop code ---------------------------------

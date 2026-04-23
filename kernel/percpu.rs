@@ -290,13 +290,6 @@ pub fn percore(cc: &CurrentCore) -> &'static PerCore {
     CORES.current(cc)
 }
 
-/// Backend hook consumed by `uni_percpu::CurrentCore::enter()`. Reads
-/// the TLS register via `kernel::cpu_id` so the token matches whatever
-/// the rest of the kernel sees.
-#[unsafe(no_mangle)]
-pub extern "C" fn uni_percpu_current_worker() -> u32 {
-    crate::cpu_id()
-}
 
 /// Register the AP poll function (called by net layer during init).
 /// Release-stores via `AtomicFn` so APs that observe it via acquire-load

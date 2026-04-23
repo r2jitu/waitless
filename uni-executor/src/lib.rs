@@ -8,47 +8,15 @@ use alloc::boxed::Box;
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::pin::Pin;
-use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use uni_percpu::timer::{Timer, TimerWheel};
 use uni_percpu::{CurrentCore, PerCpu, MAX_WORKERS};
 
-// ---- Backend plug-in -------------------------------------------------------
-//
-// Each backend (`//kernel`, `//uni-native`) fills a `static Runtime`
-// with its own hook impls and calls `register` at boot. Grows a field
-// per new reactor primitive (P4 adds `udp_*`, QUIC may add
-// `remote_wake_hint`, …). Published via `AtomicPtr<Runtime>` so the
-// shared path is a thin-pointer load + indirect call, no vtable.
-
-pub struct Runtime {
-    /// Monotonic µs since an arbitrary (backend-defined) start point.
-    /// Must match the deadline scale `schedule_timer` reads from
-    /// `TimerWheel`.
-    pub now_ticks: fn() -> u64,
-}
-
-static RUNTIME: AtomicPtr<Runtime> = AtomicPtr::new(ptr::null_mut());
-
-/// Publish the backend runtime. Call once at boot, before any
-/// `spawn` / `sleep_us` / `tick`.
-pub fn register(rt: &'static Runtime) {
-    RUNTIME.store(rt as *const Runtime as *mut Runtime, Ordering::Release);
-}
-
-#[inline]
-fn runtime() -> &'static Runtime {
-    let p = RUNTIME.load(Ordering::Acquire);
-    // SAFETY: backend is expected to call `register` before any
-    // `runtime()` access.
-    unsafe { &*p }
-}
-
 #[inline]
 fn now_ticks() -> u64 {
-    (runtime().now_ticks)()
+    (uni_percpu::runtime().now_ticks)()
 }
 
 // ---- Per-worker timer storage ---------------------------------------------

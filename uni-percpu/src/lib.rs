@@ -2,20 +2,25 @@
 //
 // `CurrentCore` — zero-sized token whose existence proves the holder
 // is running on a specific worker (core on bare-metal, POSIX thread
-// on native). Obtained via `CurrentCore::enter()`, which reads the
-// backend's `uni_percpu_current_worker` hook (TPIDR_EL1 / GS_BASE /
-// pthread TLS depending on target).
+// on native). Obtained via `CurrentCore::enter()`, which calls the
+// backend's `Runtime::current_worker` hook.
 //
 // `PerCpu<T, N>` — typed array of `N` slots indexed by worker id.
-// Returns a shared `&T`; `T` is responsible for its own interior
-// mutability (`Atomic*`, `UnsafeCell` behind owning-worker discipline,
-// `Mutex`, …). The `&CurrentCore` accessor is safe by construction
-// because the token's existence proves we're on a specific worker.
+// `T` provides its own interior mutability (`Atomic*`, `UnsafeCell`
+// behind owning-worker discipline, `Mutex`, …); the `&CurrentCore`
+// accessor is safe by construction.
+//
+// `Runtime` — the backend plug-in shared between `uni-percpu` and
+// `uni-executor`. Each backend publishes one `static Runtime` and
+// calls `register` at boot; every crate above looks up hooks via
+// `runtime()`. Grows a field per new reactor primitive.
 
 #![no_std]
 
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
+use core::ptr;
+use core::sync::atomic::{AtomicPtr, Ordering};
 
 pub mod once;
 pub mod timer;
@@ -27,14 +32,32 @@ pub use once::InitOnce;
 /// thread-pool size.
 pub const MAX_WORKERS: usize = 8;
 
-// ---- Backend hook ---------------------------------------------------------
-//
-// Provided by the backend crate via `#[unsafe(no_mangle)] pub extern
-// "C" fn uni_percpu_current_worker(...)`. Only one backend links into
-// any binary, so there's no symbol collision.
+// ---- Backend plug-in -------------------------------------------------------
 
-unsafe extern "C" {
-    fn uni_percpu_current_worker() -> u32;
+pub struct Runtime {
+    /// Current worker id. On bare-metal this is one TPIDR_EL1 / GS_BASE
+    /// read; on native it's one pthread TLS read.
+    pub current_worker: fn() -> u32,
+
+    /// Monotonic µs since an arbitrary (backend-defined) start point.
+    /// Must match the deadline scale the shared timer wheel reads.
+    pub now_ticks: fn() -> u64,
+}
+
+static RUNTIME: AtomicPtr<Runtime> = AtomicPtr::new(ptr::null_mut());
+
+/// Publish the backend runtime. Call once at boot, before any
+/// `CurrentCore::enter` / `uni_executor::spawn` / `sleep_us` / `tick`.
+pub fn register(rt: &'static Runtime) {
+    RUNTIME.store(rt as *const Runtime as *mut Runtime, Ordering::Release);
+}
+
+#[inline]
+pub fn runtime() -> &'static Runtime {
+    let p = RUNTIME.load(Ordering::Acquire);
+    // SAFETY: backend is expected to call `register` before any
+    // `runtime()` access.
+    unsafe { &*p }
 }
 
 // ============================================================================
@@ -52,16 +75,12 @@ pub struct CurrentCore {
 }
 
 impl CurrentCore {
-    /// Read the current worker id from the backend and bind it into
-    /// a token. Cheap — on bare-metal this inlines to one MRS /
-    /// `mov gs:[…]`; on native it's a `pthread_getspecific` call.
+    /// Read the current worker id from the backend runtime and bind
+    /// it into a token.
     #[inline(always)]
     pub fn enter() -> Self {
         CurrentCore {
-            // SAFETY: the hook is unconditionally available after the
-            // backend has initialised (which happens before any user
-            // code runs).
-            id: unsafe { uni_percpu_current_worker() },
+            id: (runtime().current_worker)(),
             _not_send: PhantomData,
         }
     }
