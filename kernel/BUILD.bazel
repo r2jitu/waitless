@@ -53,6 +53,7 @@ rust_library(
     deps = [
         "//uni-runtime",
         "//uni-percpu",
+        "//uni-platform",
         "//util/atomic_fn",
         "@crates//:chacha20",
         "@crates//:getrandom",
