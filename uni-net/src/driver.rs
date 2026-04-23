@@ -23,8 +23,8 @@ pub struct NicOps {
 
     // ── Data path ───────────────────────────────────────────────────
     pub send: fn(&[u8]),
-    pub poll_rx: fn(fn(&[u8])) -> i32,
-    pub poll_qp: fn(usize, fn(&[u8])) -> i32,
+    pub poll_rx: fn(fn(&[u8])) -> usize,
+    pub poll_qp: fn(usize, fn(&[u8])) -> usize,
 
     // ── Config / bring-up ───────────────────────────────────────────
     pub get_mac: fn(*mut u8),
@@ -123,7 +123,40 @@ pub fn linked_ethernet_drivers() -> &'static [EthernetDriverReg] {
 
 // ---- Active driver slot ---------------------------------------------------
 
-static ACTIVE_OPS: AtomicPtr<NicOps> = AtomicPtr::new(core::ptr::null_mut());
+// Null-object backstop. `ACTIVE_OPS` points here until the first
+// probe succeeds, so every dispatcher call resolves to a real
+// `&'static NicOps` without a null check. Hot-path cost per call:
+// one Acquire load + one direct fn-pointer call.
+
+fn null_send(_: &[u8]) {}
+fn null_poll(_: fn(&[u8])) -> usize { 0 }
+fn null_poll_qp(_: usize, _: fn(&[u8])) -> usize { 0 }
+fn null_probe() -> bool { false }
+fn null_get_mac(_: *mut u8) {}
+fn null_num_queue_pairs() -> u16 { 1 }
+fn null_void() {}
+fn null_false() -> bool { false }
+
+static NULL_OPS: NicOps = NicOps {
+    name: "none",
+    probe: null_probe,
+    send: null_send,
+    poll_rx: null_poll,
+    poll_qp: null_poll_qp,
+    get_mac: null_get_mac,
+    num_queue_pairs: null_num_queue_pairs,
+    activate_multi_queue: null_void,
+    enable_irq: null_void,
+    enable_deferred_tx_kick: null_void,
+    flush_tx_staging: null_void,
+    flush_tx_kick_if_dirty: null_false,
+    poke_interrupt_status: null_void,
+    idle: None,
+    diag: None,
+};
+
+static ACTIVE_OPS: AtomicPtr<NicOps> =
+    AtomicPtr::new(&NULL_OPS as *const NicOps as *mut NicOps);
 
 /// Install `ops` as the active driver. Called once by `init()` when
 /// the first `probe` succeeds.
@@ -131,17 +164,25 @@ pub fn set_active_ops(ops: &'static NicOps) {
     ACTIVE_OPS.store(ops as *const _ as *mut _, Ordering::Release);
 }
 
-/// Currently-active ops, if any. `None` before first successful probe
-/// and on native (no linker section).
+/// Currently-active ops. Returns `NULL_OPS` (all no-ops) before the
+/// first successful probe and on native — callers never need to
+/// branch on "is a driver installed?". Use `is_installed()` if a
+/// cold-path caller genuinely needs to know.
 #[inline]
-pub fn active_ops() -> Option<&'static NicOps> {
-    let p = ACTIVE_OPS.load(Ordering::Acquire);
-    if p.is_null() {
-        None
-    } else {
-        // SAFETY: `set_active_ops` only stores pointers derived from
-        // `&'static NicOps`; the Release/Acquire pair above
-        // synchronises store with readers. Never reused or freed.
-        unsafe { Some(&*(p as *const NicOps)) }
-    }
+pub fn active_ops() -> &'static NicOps {
+    // SAFETY: `ACTIVE_OPS` is always non-null — it starts pointing
+    // at `NULL_OPS` and `set_active_ops` only stores pointers
+    // derived from `&'static NicOps`. The Release/Acquire pair
+    // synchronises store with readers.
+    unsafe { &*(ACTIVE_OPS.load(Ordering::Acquire) as *const NicOps) }
+}
+
+/// Whether a real driver has been installed. Cold-path — used by
+/// `Net::enable` to distinguish "no driver linked" from "drivers
+/// linked but none probed".
+pub fn is_installed() -> bool {
+    !core::ptr::eq(
+        ACTIVE_OPS.load(Ordering::Acquire) as *const NicOps,
+        &NULL_OPS as *const NicOps,
+    )
 }
