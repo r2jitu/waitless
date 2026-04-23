@@ -15,14 +15,12 @@ fn now_ticks() -> u64 {
     Instant::now().duration_since(start()).as_micros() as u64
 }
 
-static RUNTIME: uni_percpu::Runtime = uni_percpu::Runtime {
-    current_worker,
-    now_ticks,
-};
+static RUNTIME: uni_runtime::Runtime = uni_runtime::Runtime { now_ticks };
 
-/// Register the native runtime. Call once, before `uni_main`.
+/// Register the native runtime hooks. Call once, before `uni_main`.
 pub fn init() {
-    uni_percpu::register(&RUNTIME);
+    uni_percpu::register_current_worker(current_worker);
+    uni_runtime::register(&RUNTIME);
 }
 
 // ---- Re-exports for app + worker-loop code --------------------------------

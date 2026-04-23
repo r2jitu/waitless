@@ -8,14 +8,12 @@ fn now_ticks() -> u64 {
     crate::time::now_cycles() / crate::time::cycles_per_us()
 }
 
-static RUNTIME: uni_percpu::Runtime = uni_percpu::Runtime {
-    current_worker,
-    now_ticks,
-};
+static RUNTIME: uni_runtime::Runtime = uni_runtime::Runtime { now_ticks };
 
-/// Register the bare-metal runtime. Call once, before `uni_main`.
+/// Register the bare-metal runtime hooks. Call once, before `uni_main`.
 pub fn init() {
-    uni_percpu::register(&RUNTIME);
+    uni_percpu::register_current_worker(current_worker);
+    uni_runtime::register(&RUNTIME);
 }
 
 // ---- Re-exports for app + event-loop code ---------------------------------
