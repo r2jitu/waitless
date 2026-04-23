@@ -1,8 +1,8 @@
 // uni-net/error.rs — Shared error hierarchy for the net stack.
 //
-// Lives in the leaf `uni_net_driver` crate so the `EthernetDriver`
-// trait can reference `NicError` in its signature, and so driver
-// crates depend on just this leaf rather than the full `uni_net`.
+// Lives in the leaf `uni_net_driver` crate so `NicOps` fn-pointer
+// signatures can reference `NicError`, and so driver crates depend
+// on just this leaf rather than the full `uni_net`.
 // `uni_net` re-exports the types so apps keep writing `uni_net::
 // NetError` and `uni::NetError` unchanged.
 //

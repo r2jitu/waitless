@@ -965,8 +965,8 @@ fn init() -> bool {
 }
 
 /// Whether `init()` successfully bound a VirtIO-net NIC. Used by
-/// the `EthernetDriver` trait impl (`VirtioNetDriver`) to decide
-/// whether probing should return `Some(NicHandle)`.
+/// the `NicOps::probe` adapter to short-circuit repeat probes
+/// during multi-driver discovery.
 fn probe_ok() -> bool {
     PROBE_OK.load(core::sync::atomic::Ordering::Acquire)
 }
@@ -1525,7 +1525,7 @@ fn flush_tx_kick_if_dirty() -> bool {
 }
 
 // ============================================================================
-// EthernetDriver trait adapter
+// NicOps registration
 // ============================================================================
 //
 // ── Registration ────────────────────────────────────────────────────────────

@@ -1,6 +1,6 @@
-// `Net::enable` API + re-exports. The `EthernetDriver` trait and
+// `Net::enable` API + re-exports. The `NicOps` POD + link-time
 // registry live in the sibling `uni_net_driver` leaf crate so NIC
-// drivers can implement them without forming a `drivers → uni` cycle.
+// drivers can depend there without forming a `drivers → uni` cycle.
 
 #![no_std]
 

@@ -1863,10 +1863,9 @@ const _: () = {
 };
 
 // ============================================================================
-// EthernetDriver trait adapter
+// NicOps registration
 // ============================================================================
 //
-// `GveDriver` adapts the existing module-level functions to the
 // Registered into the `.uni_drivers_ethernet` section as a static
 // `NicOps`. Every dispatcher call does one Acquire load + one direct
 // call through the pointer. gve is polling-only — no NAPI, no MSI-X,

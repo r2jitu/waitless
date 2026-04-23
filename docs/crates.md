@@ -10,7 +10,7 @@ User-facing crates. An app depends on these directly.
 | Target            | Crate name   | What it is                                           |
 |-------------------|--------------|------------------------------------------------------|
 | `//uni`           | `uni`        | Main API: `App`, `TcpListener`, `udp_*`, `#[boot]`   |
-| `//uni-net`       | `uni_net`    | `Net::enable(Dhcp \| Static)`, `EthernetDriver`, err |
+| `//uni-net`       | `uni_net`    | `Net::enable(Dhcp \| Static)`, `NicOps` registry, err |
 | `//uni-http`      | `uni_http`   | Minimal HTTP/1.1 server + routing                    |
 | `//uni-tls`       | `uni_tls`    | TLS termination wrapper                              |
 | `//uni/macros`    | `uni_macros` | Proc macros (`#[uni::boot]`)                         |
@@ -48,10 +48,16 @@ only via `uni-backend`.
 Every crate uses `<crate>/src/` for source files (Cargo convention).
 BUILD.bazel sits at the crate root alongside `src/`.
 
-## Runtime hook model
+## Fn-pointer dispatch model
 
-Tier 2 crates don't `extern "C"` into Tier 3. They declare a
-POD `struct Runtime` of Rust-ABI fn pointers; the active backend
-publishes one via `AtomicPtr` at boot, and callers load+dispatch
-with one `Acquire` load per hook. See
-[executor-plan.md](executor-plan.md) §P3 design note.
+Cross-tier dispatch goes through a POD struct of Rust-ABI fn
+pointers published via `AtomicPtr` at boot. Callers do one
+`Acquire` load + one direct call per hook — no trait objects,
+no vtables, no `extern "C"`. Two instances in the tree:
+
+- `uni_percpu::Runtime` — executor hooks (`now_ticks`,
+  `schedule_timer`, `cancel_timer`). See
+  [executor-plan.md](executor-plan.md) §P3.
+- `uni_net_driver::NicOps` — NIC driver ops (`send`, `poll_rx`,
+  etc.). `ACTIVE_OPS` starts pointing at a `NULL_OPS` backstop
+  so dispatchers never have to null-check.
