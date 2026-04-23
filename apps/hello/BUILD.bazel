@@ -9,7 +9,8 @@ package(default_visibility = ["//visibility:public"])
 # routes, diagnostics).
 rust_library(
     name = "app",
-    srcs = ["main.rs"],
+    srcs = ["src/main.rs"],
+    crate_root = "src/main.rs",
     deps = [
         "//uni",
         "//uni-http",

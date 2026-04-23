@@ -6,10 +6,11 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "uni",
     srcs = [
-        "boot_info.rs",
-        "lib.rs",
-        "rng.rs",
+        "src/boot_info.rs",
+        "src/lib.rs",
+        "src/rng.rs",
     ],
+    crate_root = "src/lib.rs",
     proc_macro_deps = ["//uni/macros:uni_macros"],
     # `//uni-net` re-exported as `uni::net`. `//uni-backend` is the
     # cfg-selected platform adapter (bare-metal or POSIX). `//kernel`
@@ -29,7 +30,7 @@ rust_library(
 rust_test(
     name = "boot_info_test",
     size = "small",
-    srcs = ["boot_info.rs"],
-    crate_root = "boot_info.rs",
+    srcs = ["src/boot_info.rs"],
+    crate_root = "src/boot_info.rs",
     deps = ["//uni-percpu"],
 )

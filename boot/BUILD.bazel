@@ -11,19 +11,19 @@ _UNIKERNEL_ONLY = ["@platforms//os:none"]
 
 rust_static_library(
     name = "entry",
-    srcs = ["entry.rs"],
+    srcs = ["src/entry.rs"],
     compile_data = select({
         "//bazel/platforms:x86_64": [
-            "x86_64/idt_stubs.S",
-            "x86_64/ap_boot.S",
+            "src/x86_64/idt_stubs.S",
+            "src/x86_64/ap_boot.S",
         ],
-        "//bazel/platforms:aarch64": ["aarch64/boot.S"],
+        "//bazel/platforms:aarch64": ["src/aarch64/boot.S"],
         "//conditions:default": [
-            "x86_64/idt_stubs.S",
-            "x86_64/ap_boot.S",
+            "src/x86_64/idt_stubs.S",
+            "src/x86_64/ap_boot.S",
         ],
     }),
-    crate_root = "entry.rs",
+    crate_root = "src/entry.rs",
     target_compatible_with = _UNIKERNEL_ONLY,
     deps = [
         "//drivers",
@@ -38,14 +38,16 @@ rust_static_library(
 # into higher-half, and Limine enters at limine_entry() directly.
 rust_static_library(
     name = "boot_asm",
-    srcs = ["boot_asm.rs"],
-    compile_data = ["x86_64/boot.S"],
+    srcs = ["src/boot_asm.rs"],
+    compile_data = ["src/x86_64/boot.S"],
+    crate_root = "src/boot_asm.rs",
     target_compatible_with = _UNIKERNEL_ONLY,
 )
 
 rust_static_library(
     name = "limine",
-    srcs = ["limine_entry.rs"],
+    srcs = ["src/limine_entry.rs"],
+    crate_root = "src/limine_entry.rs",
     target_compatible_with = _UNIKERNEL_ONLY,
     deps = [
         "//kernel",
@@ -55,6 +57,7 @@ rust_static_library(
 
 rust_static_library(
     name = "libc",
-    srcs = ["libc.rs"],
+    srcs = ["src/libc.rs"],
+    crate_root = "src/libc.rs",
     target_compatible_with = _UNIKERNEL_ONLY,
 )

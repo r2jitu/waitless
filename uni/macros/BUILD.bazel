@@ -4,5 +4,5 @@ package(default_visibility = ["//visibility:public"])
 
 rust_proc_macro(
     name = "uni_macros",
-    srcs = ["lib.rs"],
+    srcs = ["src/lib.rs"],
 )

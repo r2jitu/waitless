@@ -14,7 +14,7 @@ extern crate proc_macro;
 use proc_macro::TokenStream;
 
 /// Marks a function as the unikernel entry point. The platform
-/// runtime (`kernel::entry` on bare metal, `native::main` on
+/// runtime (`uni_kernel::entry` on bare metal, `native::main` on
 /// POSIX) calls the resulting `uni_main` symbol after init.
 ///
 /// The function is a normal Rust function; typical shape is:

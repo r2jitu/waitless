@@ -9,21 +9,21 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "driver",
     srcs = [
-        "driver.rs",
-        "error.rs",
+        "src/driver.rs",
+        "src/error.rs",
     ],
     crate_name = "uni_net_driver",
-    crate_root = "driver.rs",
+    crate_root = "src/driver.rs",
 )
 
 # `Net::enable`, error types, and the bare-metal net umbrella.
 rust_library(
     name = "uni-net",
     srcs = [
-        "lib.rs",
+        "src/lib.rs",
     ],
     crate_name = "uni_net",
-    crate_root = "lib.rs",
+    crate_root = "src/lib.rs",
     deps = [":driver"] + select({
         "//bazel/platforms:native": [],
         "//conditions:default": ["//net"],
@@ -34,6 +34,6 @@ rust_library(
 rust_test(
     name = "error_test",
     size = "small",
-    srcs = ["error.rs"],
-    crate_root = "error.rs",
+    srcs = ["src/error.rs"],
+    crate_root = "src/error.rs",
 )

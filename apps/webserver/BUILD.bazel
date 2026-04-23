@@ -8,7 +8,8 @@ package(default_visibility = ["//visibility:public"])
 # Application library — pure business logic, no platform boilerplate.
 rust_library(
     name = "app",
-    srcs = ["main.rs"],
+    srcs = ["src/main.rs"],
+    crate_root = "src/main.rs",
     compile_data = [
         "//apps/webserver/dev_certs:dev_cert.der",
         "//apps/webserver/dev_certs:dev_key.der",

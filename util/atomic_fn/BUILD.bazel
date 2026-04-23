@@ -12,13 +12,13 @@ package(default_visibility = ["//visibility:public"])
 # can link into rust_test binaries via `crate = ":foo"`.
 rust_library(
     name = "atomic_fn",
-    srcs = ["lib.rs"],
+    srcs = ["src/lib.rs"],
     crate_features = select({
         "//bazel/rules:tests_need_std_on": ["std"],
         "//conditions:default": [],
     }),
     crate_name = "atomic_fn",
-    crate_root = "lib.rs",
+    crate_root = "src/lib.rs",
 )
 
 rust_test(
