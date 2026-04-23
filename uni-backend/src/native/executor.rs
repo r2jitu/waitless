@@ -1,27 +1,13 @@
 // uni-backend/src/native/executor.rs — POSIX side of the runtime backend.
+//
+// Platform primitives (current_worker, now_ticks) live in
+// `uni-platform` and are called directly from uni-percpu / uni-runtime.
+// This file exists only to re-export the executor surface for apps.
 
-use std::time::Instant;
-
-fn start() -> Instant {
-    static S: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-    *S.get_or_init(Instant::now)
-}
-
-fn current_worker() -> u32 {
-    super::current_thread_id()
-}
-
-fn now_ticks() -> u64 {
-    Instant::now().duration_since(start()).as_micros() as u64
-}
-
-static RUNTIME: uni_runtime::Runtime = uni_runtime::Runtime { now_ticks };
-
-/// Register the native runtime hooks. Call once, before `uni_main`.
-pub fn init() {
-    uni_percpu::register_current_worker(current_worker);
-    uni_runtime::register(&RUNTIME);
-}
+/// No backend-side init is required on native — `uni_platform`'s
+/// thread-local worker id is set per-worker in `native::run` when
+/// each worker thread starts.
+pub fn init() {}
 
 // ---- Re-exports for app + worker-loop code --------------------------------
 

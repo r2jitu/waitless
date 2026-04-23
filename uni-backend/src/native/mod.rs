@@ -169,9 +169,6 @@ unsafe extern "C" {
     fn pthread_create(thread: *mut PthreadT, attr: *const u8,
                       start: extern "C" fn(*mut u8) -> *mut u8, arg: *mut u8) -> i32;
     fn pthread_join(thread: PthreadT, retval: *mut *mut u8) -> i32;
-    fn pthread_key_create(key: *mut usize, destructor: usize) -> i32;
-    fn pthread_setspecific(key: usize, value: *const u8) -> i32;
-    fn pthread_getspecific(key: usize) -> *const u8;
     fn sysconf(name: i32) -> i64;
 
     #[cfg(target_os = "macos")]
@@ -570,23 +567,17 @@ fn thread_state(id: u32) -> &'static mut ThreadState {
 // Helpers for the uni API (dispatched by thread_id)
 // ============================================================================
 
-// Thread-local thread ID via pthread TLS.
-// Must be per-thread so concurrent workers don't clobber each other's
-// identity — wrong thread ID means wrong connection pool and wrong
-// kqueue/epoll fd.
-//
-// pthread_key_t: usize on both macOS and Linux (unsigned long / unsigned int).
-/// Populated once by `init_native` via `pthread_key_create`; then
-/// read by every worker thread to look up its own thread ID slot.
-/// `pthread_key_t` fits in a `usize` on both macOS and Linux.
-static TLS_KEY: AtomicUsize = AtomicUsize::new(0);
+// Worker thread id. Backed by `uni_platform`'s std thread-local so
+// every upstream caller (uni-percpu's CurrentCore::enter, uni-runtime's
+// now_ticks-adjacent code) sees the same value without plumbing a
+// registration hook through this file.
 
 fn set_current_thread_id(id: u32) {
-    unsafe { pthread_setspecific(TLS_KEY.load(Ordering::Acquire), id as usize as *const u8); }
+    uni_platform::set_current_worker(id);
 }
 
 fn current_thread_id() -> u32 {
-    unsafe { pthread_getspecific(TLS_KEY.load(Ordering::Acquire)) as u32 }
+    uni_platform::current_worker()
 }
 
 unsafe extern "C" fn sigint_handler(_sig: i32) {
@@ -595,10 +586,6 @@ unsafe extern "C" fn sigint_handler(_sig: i32) {
 
 fn init_native() {
     unsafe {
-        let mut key: usize = 0;
-        pthread_key_create(&mut key, 0);
-        TLS_KEY.store(key, Ordering::Release);
-
         // Per-port overrides (`UNIKERNEL_<PROTO>_<GUEST>`) are read
         // lazily from `config_port` / `config_tls_port` /
         // `udp_bind`, keyed by the caller-supplied default port —
