@@ -147,23 +147,42 @@ fn make_waker_for(slot: *const TaskSlot) -> Waker {
 
 // ---- Per-worker startup hook ----------------------------------------------
 //
-// `spawn_on_each_worker(f)` fires `f` exactly once on each worker,
-// on that worker, on its first `tick`. Inside `f`, `spawn()` lands
-// the task in the running worker's arena. Common pattern for
-// long-lived per-core reactors (UDP/QUIC handlers). Internally used
-// by `net::UdpSocket::run`.
+// `spawn_on_each_worker(f)` registers `f` to fire exactly once on
+// each worker, on that worker, on its first `tick`. Inside `f`,
+// `spawn()` lands the task in the running worker's arena. Common
+// pattern for long-lived per-core reactors (UDP, TCP, QUIC).
+//
+// Multiple registrations accumulate — each call claims the next
+// slot in a fixed-size table. Used internally by `net::UdpSocket::
+// run` and `net::TcpListener::run`; also exposed for apps.
+//
+// Registration after a worker's first `tick` is a no-op for that
+// worker (the `STARTUP_FIRED` flag is already set). Intent is
+// "register all hooks before `set_ready()`"; later registrations
+// still fire on workers that haven't ticked yet.
 
-static PER_WORKER_STARTUP: AtomicFn<fn()> = AtomicFn::null();
+const MAX_STARTUP_HOOKS: usize = 8;
+
+static PER_WORKER_STARTUP: [AtomicFn<fn()>; MAX_STARTUP_HOOKS] =
+    [const { AtomicFn::null() }; MAX_STARTUP_HOOKS];
+static STARTUP_HOOK_COUNT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 static STARTUP_FIRED: [AtomicBool; MAX_WORKERS] =
     [const { AtomicBool::new(false) }; MAX_WORKERS];
 
 /// Register `f` to run exactly once on each worker, on that worker,
-/// on the first event-loop tick. At most one hook may be registered
-/// per process — higher-level APIs (`net::UdpSocket::run`) that
-/// need to accumulate multiple callbacks manage their own launcher
-/// table and register a single fan-out hook here.
+/// on the first event-loop tick after registration. Up to
+/// `MAX_STARTUP_HOOKS` hooks accumulate. Excess registrations past
+/// the cap are silently dropped.
 pub fn spawn_on_each_worker(f: fn()) {
-    PER_WORKER_STARTUP.store(f);
+    let i = STARTUP_HOOK_COUNT
+        .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    if i < MAX_STARTUP_HOOKS {
+        PER_WORKER_STARTUP[i].store(f);
+    }
+    // else: table full, hook discarded. Acceptable under the doc
+    // contract; callers that hit this limit are doing something
+    // unusual.
 }
 
 // ---- Event-loop entry points ----------------------------------------------
@@ -179,12 +198,17 @@ pub fn tick(worker_id: u32) -> bool {
     // SAFETY: caller guarantees `worker_id` is the running worker.
     let cc = unsafe { CurrentCore::from_id_unchecked(worker_id) };
 
-    // First tick on this worker: fire the per-worker startup hook
-    // so tasks registered via `spawn_on_each_worker` land in this
-    // worker's arena.
+    // First tick on this worker: fire every registered per-worker
+    // startup hook so tasks registered via `spawn_on_each_worker`
+    // land in this worker's arena.
     if !STARTUP_FIRED[worker_id as usize].swap(true, Ordering::Relaxed) {
-        if let Some(f) = PER_WORKER_STARTUP.load() {
-            f();
+        let count = STARTUP_HOOK_COUNT
+            .load(Ordering::Acquire)
+            .min(MAX_STARTUP_HOOKS);
+        for slot in PER_WORKER_STARTUP.iter().take(count) {
+            if let Some(f) = slot.load() {
+                f();
+            }
         }
     }
 
