@@ -8,7 +8,10 @@ package(default_visibility = ["//visibility:public"])
 # carry waker state will land here with their own mechanism.
 rust_library(
     name = "uni-runtime",
-    srcs = ["src/lib.rs"],
+    srcs = [
+        "src/lib.rs",
+        "src/net.rs",
+    ],
     crate_name = "uni_runtime",
     deps = [
         "//uni-percpu",

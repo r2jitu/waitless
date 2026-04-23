@@ -4,6 +4,8 @@
 
 extern crate alloc;
 
+pub mod net;
+
 use alloc::boxed::Box;
 use core::cell::UnsafeCell;
 use core::future::Future;
