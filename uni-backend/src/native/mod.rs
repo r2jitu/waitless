@@ -616,6 +616,17 @@ fn init_native() {
     // the NIC RX path unconditionally delivers to the reactor.
     uni_runtime::net::register_backend_bind(udp_backend_bind);
 
+    // TCP reactor hooks. `listen` is a no-op stub (returns `Ok`) so
+    // `TcpListener::bind` succeeds on native; `accept` returns null
+    // so the async accept future stays Pending. Full native wiring —
+    // opening per-worker listen fds and routing kqueue fires to
+    // `deliver_tcp_ready` — is a follow-up; until then apps needing
+    // TCP accept on native should stay on `uni_http::Server`.
+    uni_runtime::net::register_tcp_backend(
+        tcp_backend_listen_stub,
+        tcp_backend_accept_stub,
+    );
+
     // Register TCP/UDP polling as the first IO poll callback.
     // Runs on every worker's event-loop tick and drains the worker's
     // kqueue/epoll: TCP fd readiness flips `has_pending_data` on
@@ -623,6 +634,14 @@ fn init_native() {
     // `recvfrom` + handler dispatch. No dedicated RX threads — same
     // inline-poll pattern as the HVF runner's vCPU loop.
     register_io_poll(|_worker_id| tcp_poll());
+}
+
+fn tcp_backend_listen_stub(_port: u16) -> Result<(), ()> {
+    Ok(())
+}
+
+fn tcp_backend_accept_stub(_port: u16) -> *mut () {
+    core::ptr::null_mut()
 }
 
 // ============================================================================

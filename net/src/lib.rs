@@ -6,6 +6,7 @@
 extern crate alloc;
 extern crate uni_drivers;
 extern crate uni_kernel;
+extern crate uni_runtime;
 pub extern crate net_types as types;
 pub extern crate net_ethernet as ethernet;
 pub extern crate net_arp as arp;
@@ -39,6 +40,30 @@ fn udp_dispatch(src: u32, dst: u32, payload: &[u8]) {
 pub fn init_stack() {
     REGISTRY.register(protocol::Slot::Tcp, tcp_dispatch);
     REGISTRY.register(protocol::Slot::Udp, udp_dispatch);
+    // Wire up the async `uni::runtime::TcpListener` reactor.
+    // Listening requires one slot per core (each core owns its
+    // own per-port accept pool); accept reads the current core's
+    // pool and returns the first Established+!accepted conn.
+    uni_runtime::net::register_tcp_backend(tcp_backend_listen, tcp_backend_accept);
+}
+
+fn tcp_backend_listen(port: u16) -> Result<(), ()> {
+    // `listen_on_core` from the BSP is safe before APs start — it
+    // just CAS-claims a free slot in the target core's pool. Called
+    // during `init_stack` on the BSP before `set_ready` releases
+    // worker cores.
+    let n = percpu::num_cores();
+    for i in 0..n {
+        let h = tcp::listen_on_core(i, port);
+        if h.is_null() {
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
+fn tcp_backend_accept(port: u16) -> *mut () {
+    tcp::accept_on_port(port)
 }
 
 // ============================================================================

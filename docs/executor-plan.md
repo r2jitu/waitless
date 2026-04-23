@@ -24,7 +24,7 @@ implementation itself.
 | P2.5. `InitOnce<T>` shared, `uni/src/boot_info.rs` dedup | 🟢 done | `e52ce2a` |
 | P3. Runtime fn-pointer struct — drop `extern "C"` hooks | 🟢 done | `082b8eb`, `375e99f` |
 | P4. `UdpSocket::recv_from().await` reactor | 🟢 done | `bb0dc1a`..HEAD |
-| P5. *(optional)* `TcpListener::accept().await` reactor | ⏳ | — |
+| P5. `TcpListener::accept().await` reactor (bare-metal; native stub) | 🟡 partial | `fa534ec`..HEAD |
 
 After P4, ROADMAP §3c starts. Everything after that lives in the
 ROADMAP, not here.
@@ -375,7 +375,72 @@ registry mechanics.
 
 ---
 
-## Phase 5 — *(optional)* `TcpListener::accept().await` reactor
+## Phase 5 — `TcpListener::accept().await` reactor
+
+**Bare-metal: shipped.** Native: stubbed (bind succeeds, accept
+stays Pending) pending a full native impl that defers kqueue/epoll
+listen-fd handling to the reactor. See the design note below.
+
+```rust
+uni::runtime::TcpListener::bind(80)?.run(|stream| async move {
+    // Handle one connection. `stream` is a RawTcpStream — wrap in
+    // `uni::TcpStream` for the typed recv/send API.
+    let stream = uni::TcpStream::from_raw(stream);
+    let mut buf = [0u8; 1024];
+    let _n = stream.recv(&mut buf);
+    stream.send(b"HTTP/1.1 200 OK\r\n\r\nhi");
+    stream.close();
+});
+```
+
+`run` consumes the listener, spawns one long-lived accept-loop task
+per worker; each accepted connection becomes its own task. The
+per-worker model preserves NIC flow-hash distribution — conns
+handshaked on core N are accepted on core N.
+
+**Backend model.** Different from UDP because the backend (not the
+reactor) owns the accept queue. `TcpListener::accept` simply polls
+the backend's `tcp_backend_accept(port)` hook; the reactor layer
+only wakes the awaiting task when the backend signals "accept-able
+now" via `deliver_tcp_ready(port)`.
+
+**Bare-metal wiring.** `net::tcp`'s SYN-ACK-ACK completion site
+transitions a conn to `Established`, then calls
+`deliver_tcp_ready(port)` on the core that owns the conn slot.
+`tcp_backend_accept` scans the current core's pool for an
+`Established + !accepted` conn on the matching port. Registration
+happens in `net::init_stack` (triggered by `Net::enable` during app
+boot).
+
+**Launcher table consolidation.** UDP's per-run launcher table
+generalised into a shared `NET_LAUNCHERS` covering both protocols.
+UDP `run_loop`, TCP `run`, and any future reactor all register into
+the same 16-slot table. A single `spawn_on_each_worker` hook (now
+accumulating thanks to `fa534ec`) fires every launcher on each
+worker's first tick.
+
+**Validation.** Bare-metal path is exercised transitively by any app
+that opens a TcpListener; a standalone smoke in `test_async` is
+deferred because it would require pulling a NIC driver + DHCP into
+the test. The proper integration cover arrives when `uni_http::
+Server` migrates to `TcpListener::run(|stream| …)` — that's the
+follow-up that also unlocks async HTTP handlers (per-request
+`.await` for TLS, downstream calls, etc.). Not strictly required
+for QUIC (§3c) since QUIC has its own server.
+
+**Deferred native impl.** Full native TCP async accept requires
+opening SO_REUSEPORT listen fds per worker, tagging them in the
+native backend so the kqueue/epoll dispatcher recognises them,
+calling `deliver_tcp_ready(port)` on fire instead of accepting
+inline, and routing `tcp_backend_accept(port)` through the
+per-worker listen-fd table. The current native hooks are no-op
+stubs so `TcpListener::bind` succeeds (matching bare-metal's
+surface) but accept stays Pending — apps needing TCP accept on
+native should stay on `uni_http::Server`.
+
+---
+
+## Phase 5 — *(historical plan notes below)* `TcpListener::accept().await` reactor
 
 ### Why / whether
 

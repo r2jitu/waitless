@@ -8,6 +8,7 @@
 
 extern crate alloc;
 extern crate uni_kernel;
+extern crate uni_runtime;
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
 extern crate net_ipv4 as ipv4;
@@ -609,6 +610,12 @@ pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
         if c.state == TcpState::SynReceived {
             c.state = TcpState::Established;
             c.snd_una = ack;
+            // Wake any async `TcpListener::accept` awaiting on this
+            // port. Runs on the core that received the 3-way-ACK,
+            // which is the same core that owns this conn slot, so
+            // the reactor's per-worker waker fires the right task.
+            let port = c.listener_port;
+            uni_runtime::net::deliver_tcp_ready(port);
         } else if c.state == TcpState::LastAck {
             free_connection(core, slot);
             return;
@@ -723,6 +730,18 @@ pub fn accept(handle: *mut ()) -> *mut () {
         None => return ptr::null_mut(),
     };
     let port = unsafe { (*conn_ptr(core, listener_slot)).local_port };
+    accept_on_port_core(core, port)
+}
+
+/// Accept a connection on the **current core** by port — the
+/// listener handle isn't threaded through, so this is the entry
+/// point used by `uni_runtime::net::TcpListener`'s backend hook.
+/// Returns null if no connection is ready on this core.
+pub fn accept_on_port(port: u16) -> *mut () {
+    accept_on_port_core(uni_kernel::cpu_id(), port)
+}
+
+fn accept_on_port_core(core: u32, port: u16) -> *mut () {
     for i in 0..CONNECTIONS_PER_CORE {
         // SAFETY: per-core ownership.
         let c = unsafe { &mut *conn_ptr(core, i) };

@@ -27,6 +27,12 @@ fn boot() {
             }
             Err(_) => uni::log(b"test_async: udp bind FAILED\n"),
         }
+        // `uni::runtime::TcpListener` is not smoke-tested here — its
+        // bare-metal backend (`net::tcp` listener-on-each-core) is
+        // only wired up after `Net::enable` calls `init_stack`. This
+        // test intentionally stays off the network stack; the TCP
+        // reactor gets end-to-end cover when an app that uses
+        // `Net::enable` exercises it (the `uni_http` async migration).
 
         let nested = uni::runtime::spawn(async {
             uni::runtime::sleep_us(10_000).await;

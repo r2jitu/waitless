@@ -338,20 +338,11 @@ impl UdpSocket {
         H: Fn(&'static UdpSocket) -> F + Send + Sync + 'static,
         F: Future<Output = ()> + 'static,
     {
-        let idx = self.idx;
         let leaked: &'static UdpSocket = Box::leak(Box::new(self));
-        // Launcher: captures the leaked socket, produces one future
-        // per call, hands it to `spawn` which puts it in the calling
-        // worker's arena.
-        let launcher: BoxedLauncher = Box::new(move || {
+        register_net_launcher(Box::new(move || {
             let fut = body(leaked);
             let _ = crate::spawn(fut);
-        });
-        // Outer box: `AtomicPtr<T>` needs `T: Sized`, so we store a
-        // thin pointer to the heap-alloc'd fat pointer.
-        let outer: Box<BoxedLauncher> = Box::new(launcher);
-        LAUNCHERS[idx].store(Box::into_raw(outer), Ordering::Release);
-        ensure_launcher_hook_registered();
+        }));
     }
 }
 
@@ -419,47 +410,299 @@ pub fn deliver_udp(dst_port: u16, src_ip: [u8; 4], src_port: u16, payload: &[u8]
     false
 }
 
-// ---- Per-worker launcher table ----------------------------------------------
+// ============================================================================
+// TCP accept reactor
+// ============================================================================
 //
-// `UdpSocket::run(body)` stores a type-erased launcher closure in
-// `LAUNCHERS[idx]`. A single `spawn_on_each_worker` hook, registered
-// lazily on the first `run` call, walks the table on each worker's
-// first tick and fires every live launcher — each launcher calls
-// `spawn(body(sock))` on the calling worker.
+// `TcpListener::bind(port)` claims a slot in a parallel registry.
+// The backend (bare-metal `net::tcp` / native `drain_tcp_listener`)
+// calls `deliver_tcp_ready(port)` on the core that observed a new
+// accept-able connection; `accept()` await-loops
+// `tcp_backend_accept` (the backend's non-blocking accept fn) under
+// the familiar "try → register waker → re-check" pattern.
+//
+// Unlike the UDP reactor, the TCP reactor does NOT buffer accepted
+// connections itself — the backend's own accept queue is the source
+// of truth. `TcpAccept::poll` simply calls the backend's accept
+// hook; the reactor layer is purely "notify when there's something
+// to accept".
+//
+// Accepted connections are returned as `RawTcpStream(*mut ())` —
+// the same opaque handle `uni_backend::tcp_accept` returns today.
+// Higher layers wrap it into `uni::TcpStream` for the typed API.
+
+pub const MAX_TCP_LISTENERS: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpBindError {
+    AllSlotsBusy,
+    PortInUse,
+    InvalidPort,
+    /// Backend refused to open the listener (port already in use
+    /// by another process on native, etc.).
+    BackendFailed,
+}
+
+/// Opaque handle to a backend TCP connection. Higher layers
+/// (`uni::TcpStream`) wrap it into a typed API.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct RawTcpStream(pub *mut ());
+
+/// `!Send` — backends return pointers into per-worker state; moving
+/// a stream across workers is wrong. The task system already keeps
+/// futures pinned to their spawning worker.
+impl RawTcpStream {
+    #[inline]
+    pub fn is_null(&self) -> bool {
+        self.0.is_null()
+    }
+}
+
+struct TcpState {
+    port: AtomicU16,
+    /// Per-worker waker slot. Backend `deliver_tcp_ready` fires on
+    /// the core that has the newly-accept-able conn; the waker
+    /// wakes a task on that same core.
+    wakers: PerCpu<SpinLock<Option<Waker>>, MAX_WORKERS>,
+}
+
+const fn fresh_waker_slots() -> [SpinLock<Option<Waker>>; MAX_WORKERS] {
+    [const { SpinLock::new(None) }; MAX_WORKERS]
+}
+
+impl TcpState {
+    const fn new() -> Self {
+        TcpState {
+            port: AtomicU16::new(0),
+            wakers: PerCpu::new(fresh_waker_slots()),
+        }
+    }
+}
+
+static TCP_REGISTRY: [TcpState; MAX_TCP_LISTENERS] =
+    [const { TcpState::new() }; MAX_TCP_LISTENERS];
+
+// Backend hooks. On bare-metal + native both are registered at
+// init; pre-registration calls of `TcpListener::bind` / `accept`
+// return `BackendFailed` / `Pending` respectively.
+
+static TCP_BACKEND_LISTEN: AtomicFn<fn(port: u16) -> Result<(), ()>> =
+    AtomicFn::null();
+static TCP_BACKEND_ACCEPT: AtomicFn<fn(port: u16) -> *mut ()> = AtomicFn::null();
+
+/// Register the TCP backend hooks. Called once at boot by the
+/// backend that owns the actual listen sockets / handshake state.
+pub fn register_tcp_backend(
+    listen: fn(port: u16) -> Result<(), ()>,
+    accept: fn(port: u16) -> *mut (),
+) {
+    TCP_BACKEND_LISTEN.store(listen);
+    TCP_BACKEND_ACCEPT.store(accept);
+}
+
+pub struct TcpListener {
+    port: u16,
+    idx: usize,
+}
+
+impl TcpListener {
+    pub fn bind(port: u16) -> Result<TcpListener, TcpBindError> {
+        if port == 0 {
+            return Err(TcpBindError::InvalidPort);
+        }
+        for state in TCP_REGISTRY.iter() {
+            if state.port.load(Ordering::Acquire) == port {
+                return Err(TcpBindError::PortInUse);
+            }
+        }
+        for (idx, state) in TCP_REGISTRY.iter().enumerate() {
+            if state
+                .port
+                .compare_exchange(0, port, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                for w in 0..MAX_WORKERS as u32 {
+                    *state.wakers.at(w).lock() = None;
+                }
+                let listen = TCP_BACKEND_LISTEN
+                    .load()
+                    .ok_or(TcpBindError::BackendFailed)?;
+                if listen(port).is_err() {
+                    state.port.store(0, Ordering::Release);
+                    return Err(TcpBindError::BackendFailed);
+                }
+                return Ok(TcpListener { port, idx });
+            }
+        }
+        Err(TcpBindError::AllSlotsBusy)
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Await the next accepted connection on the **calling worker**.
+    /// Resolves with a `RawTcpStream`. The stream pointer is
+    /// non-null by construction of the `accept` hook contract — a
+    /// null return from the hook means "not ready yet" and keeps
+    /// the future Pending.
+    pub fn accept<'a>(&'a self) -> TcpAccept<'a> {
+        TcpAccept {
+            listener: self,
+            _not_send: PhantomData,
+        }
+    }
+
+    /// Spawn `body` once per accepted connection. The framework
+    /// owns the accept loop; each `body(stream)` invocation runs
+    /// as its own task on the worker that accepted the connection.
+    /// Consumes the listener — the port stays claimed for the
+    /// process lifetime.
+    pub fn run<H, F>(self, body: H)
+    where
+        H: Fn(RawTcpStream) -> F + Send + Sync + 'static,
+        F: Future<Output = ()> + 'static,
+    {
+        let leaked: &'static TcpListener = Box::leak(Box::new(self));
+        let body: &'static H = Box::leak(Box::new(body));
+        register_net_launcher(Box::new(move || {
+            let _ = crate::spawn(async move {
+                loop {
+                    let stream = leaked.accept().await;
+                    let fut = body(stream);
+                    let _ = crate::spawn(fut);
+                }
+            });
+        }));
+    }
+}
+
+pub struct TcpAccept<'a> {
+    listener: &'a TcpListener,
+    _not_send: PhantomData<*mut ()>,
+}
+
+impl<'a> Future for TcpAccept<'a> {
+    type Output = RawTcpStream;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let port = this.listener.port;
+        let accept = match TCP_BACKEND_ACCEPT.load() {
+            Some(f) => f,
+            None => return Poll::Pending, // backend not wired yet
+        };
+
+        // Fast path
+        let p = accept(port);
+        if !p.is_null() {
+            return Poll::Ready(RawTcpStream(p));
+        }
+
+        // Register waker on this worker's slot, then re-check
+        let cc = CurrentCore::enter();
+        let state = &TCP_REGISTRY[this.listener.idx];
+        *state.wakers.current(&cc).lock() = Some(cx.waker().clone());
+
+        let p = accept(port);
+        if !p.is_null() {
+            *state.wakers.current(&cc).lock() = None;
+            return Poll::Ready(RawTcpStream(p));
+        }
+
+        Poll::Pending
+    }
+}
+
+/// Notify the reactor that the backend has a newly accept-able
+/// connection for `dst_port`. Must be called from the core that
+/// owns the new connection (bare-metal: core whose RX queue
+/// observed the handshake completion; native: worker whose
+/// kqueue/epoll fired for the listen fd). Returns `true` if a
+/// matching listener was found.
+pub fn deliver_tcp_ready(dst_port: u16) -> bool {
+    let cc = CurrentCore::enter();
+    for state in TCP_REGISTRY.iter() {
+        if state.port.load(Ordering::Acquire) == dst_port {
+            let taken = state.wakers.current(&cc).lock().take();
+            if let Some(waker) = taken {
+                waker.wake();
+            }
+            return true;
+        }
+    }
+    false
+}
+
+// ---- Shared launcher table (UDP + TCP + future reactors) --------------------
+//
+// Any reactor's `run`-style method registers a type-erased launcher
+// closure here via `register_net_launcher`. A single
+// `spawn_on_each_worker` hook — registered lazily on the first
+// launcher — walks the table on each worker's first tick and fires
+// every live launcher. Each launcher calls `spawn(body(...))` on
+// the calling worker.
 //
 // Storage is `AtomicPtr<Box<dyn Fn...>>`: the atomic holds a thin
 // pointer to a heap-allocated `Box` (which in turn is the fat
 // pointer to the closure). `AtomicPtr<T>` requires `T: Sized`;
-// `Box<dyn Fn>` is sized (a fat pointer is still `Sized`). Leaking
-// the `Box` keeps the launcher heap-alive for the process lifetime
-// — matches `run`'s consume-the-socket contract.
+// `Box<dyn Fn>` is sized. Leaking the outer box keeps the launcher
+// heap-alive for the process lifetime — matches the consume-the-
+// socket contract of `run`/`run_loop`/`run_each`.
 
 type BoxedLauncher = Box<dyn Fn() + Send + Sync + 'static>;
 
-static LAUNCHERS: [AtomicPtr<BoxedLauncher>; MAX_UDP_SOCKETS] =
-    [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_UDP_SOCKETS];
+/// Bounded cap; UDP and TCP each consume up to `MAX_UDP_SOCKETS`
+/// slots at current sizing. Total also accommodates any future
+/// protocol reactors.
+const MAX_NET_LAUNCHERS: usize = 16;
 
-static LAUNCHER_HOOK_REGISTERED: AtomicBool = AtomicBool::new(false);
+static NET_LAUNCHERS: [AtomicPtr<BoxedLauncher>; MAX_NET_LAUNCHERS] =
+    [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_NET_LAUNCHERS];
+static NET_LAUNCHER_COUNT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static NET_HOOK_REGISTERED: AtomicBool = AtomicBool::new(false);
 
-fn ensure_launcher_hook_registered() {
-    if LAUNCHER_HOOK_REGISTERED
+/// Register a launcher. Each protocol's `run`/`run_each` method
+/// wraps its body-spawn logic in a `BoxedLauncher` and hands it
+/// here. The single per-worker hook fires every registered
+/// launcher on each worker's first tick.
+fn register_net_launcher(launcher: BoxedLauncher) {
+    let i = NET_LAUNCHER_COUNT
+        .fetch_add(1, Ordering::AcqRel);
+    if i >= MAX_NET_LAUNCHERS {
+        // Table full — drop the launcher. Matches `spawn_on_each_worker`'s
+        // documented cap behaviour; 16 slots is beyond any realistic
+        // per-binary reactor count.
+        return;
+    }
+    let outer: Box<BoxedLauncher> = Box::new(launcher);
+    NET_LAUNCHERS[i].store(Box::into_raw(outer), Ordering::Release);
+    ensure_net_hook_registered();
+}
+
+fn ensure_net_hook_registered() {
+    if NET_HOOK_REGISTERED
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
-        crate::spawn_on_each_worker(fire_launchers);
+        crate::spawn_on_each_worker(fire_net_launchers);
     }
 }
 
-fn fire_launchers() {
-    for slot in LAUNCHERS.iter() {
+fn fire_net_launchers() {
+    let count = NET_LAUNCHER_COUNT
+        .load(Ordering::Acquire)
+        .min(MAX_NET_LAUNCHERS);
+    for slot in NET_LAUNCHERS.iter().take(count) {
         let p = slot.load(Ordering::Acquire);
         if p.is_null() {
             continue;
         }
         // SAFETY: `p` was obtained from `Box::into_raw(Box::new(
-        // BoxedLauncher{..}))` in `UdpSocket::run`. The outer box is
-        // leaked (never freed). Release/Acquire pairs the store and
-        // load.
+        // BoxedLauncher{..}))` in `register_net_launcher`. Outer
+        // box is leaked (never freed). Release/Acquire pairs the
+        // store and load.
         let launcher: &BoxedLauncher = unsafe { &*p };
         launcher();
     }

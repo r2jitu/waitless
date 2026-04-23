@@ -122,6 +122,7 @@ rust_library(
         ":ipv4",
         ":types",
         "//kernel",
+        "//uni-runtime",
         "@crates//:bitflags",
     ],
 )
@@ -331,5 +332,6 @@ rust_library(
         ":udp",
         "//drivers",
         "//kernel",
+        "//uni-runtime",
     ],
 )
