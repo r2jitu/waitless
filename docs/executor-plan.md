@@ -5,7 +5,7 @@ shipped"** ([ROADMAP §2f+§2g](../ROADMAP.md) — landed in commit
 `2cd9c9c`) and **"start writing QUIC"** ([ROADMAP §3c](../ROADMAP.md)).
 
 Not a feature delivery — this plan finishes the refactor arc that
-`//uni-executor` + `//uni-percpu` started, then lands the last
+`//uni-runtime` + `//uni-percpu` started, then lands the last
 reactor primitives QUIC needs before §3c can begin. Every phase is
 small enough to land independently; the ROADMAP owns the §3c QUIC
 implementation itself.
@@ -18,11 +18,11 @@ implementation itself.
 
 | Phase | Status | Commit |
 |---|---|---|
-| P0. `//uni-executor` with shared arena / Waker / Sleep | 🟢 done | `509a6af` |
+| P0. `//uni-runtime` with shared arena / Waker / Sleep | 🟢 done | `509a6af` |
 | P1. `//uni-percpu` — `CurrentCore` + `PerCpu<T, N>` shared | 🟢 done | `a506a52` |
 | P2. `TimerWheel` + `PendingTimers` shared | 🟢 done | `9e0095f` |
 | P2.5. `InitOnce<T>` shared, `uni/src/boot_info.rs` dedup | 🟢 done | `e52ce2a` |
-| P3. Runtime fn-pointer struct — drop `extern "C"` hooks | 🟢 done | `62f33b4` |
+| P3. Runtime fn-pointer struct — drop `extern "C"` hooks | 🟢 done | `082b8eb`, `375e99f` |
 | P4. `UdpRecv::recv_from().await` reactor | ⏳ | — |
 | P5. *(optional)* `TcpListener::accept().await` reactor | ⏳ | — |
 
@@ -45,13 +45,13 @@ Rust-ABI fn pointers, published via `AtomicPtr<Runtime>`. No
 fns:
 
 ```rust
-static RUNTIME: uni_executor::Runtime = uni_executor::Runtime {
+static RUNTIME: uni_percpu::Runtime = uni_percpu::Runtime {
     now_ticks: rt_now_ticks,
     schedule_timer: rt_schedule_timer,
     cancel_timer: rt_cancel_timer,
 };
 
-pub fn init() { uni_executor::register(&RUNTIME); }
+pub fn init() { uni_percpu::register(&RUNTIME); }
 ```
 
 One boot-time store of a thin pointer, one Acquire load per hook
@@ -65,10 +65,10 @@ The async runtime has a cross-platform shape that the remaining
 work refines:
 
 ```
-//uni-executor        — TaskSlot arena, RawWakerVTable, Sleep, spawn, tick, has_ready
+//uni-runtime        — TaskSlot arena, RawWakerVTable, Sleep, spawn, tick, has_ready
 //uni-percpu          — CurrentCore (ZST token), PerCpu<T, N>, MAX_WORKERS
 //kernel/src/executor.rs  — bare-metal backend: hooks + tick wrapper + WHEELS
-//uni-native/executor — native backend:    hooks + tick wrapper + per-worker timer Vec
+//uni-backend/src/native/executor.rs — native backend: hooks + tick wrapper + per-worker timers
 //apps/test_async     — smoke test; 4 variants green (HVF, QEMU ×2, native)
 ```
 
@@ -142,7 +142,7 @@ split.
    shared impl.
 
 3. **Native backend swaps storage.** In
-   [uni-native/src/executor.rs](../uni-native/src/executor.rs):
+   [uni-backend/src/native/executor.rs](../uni-backend/src/native/executor.rs):
    ```rust
    // before (today, landed in a506a52):
    struct TimerList(UnsafeCell<Vec<NativeTimer>>);
@@ -210,7 +210,7 @@ Benefits:
 ### Shape
 
 ```rust
-// uni-executor/src/lib.rs (replaces the extern "C" block)
+// uni-runtime/src/lib.rs (replaces the extern "C" block)
 pub trait Runtime: Sync {
     fn now_ticks(&self) -> u64;
     fn schedule_timer(&self, deadline: u64, func: fn(usize), arg: usize) -> bool;
@@ -245,7 +245,7 @@ runtime registration preserves boot-ordering freedom.
 
 Recommend option 2 — the unikernel already has a local
 `kernel::once::Once`, we can either relocate it into `//uni-percpu`
-or copy the pattern into `//uni-executor`.
+or copy the pattern into `//uni-runtime`.
 
 ### Backend shape
 
@@ -263,16 +263,16 @@ impl Runtime for KernelRuntime {
     // ... cancel_timer, advance_timers, has_pending_timers ...
 }
 
-pub fn init() { uni_executor::register(&KERNEL_RT); }
+pub fn init() { uni_percpu::register(&KERNEL_RT); }
 ```
 
 `init()` called from `boot/src/entry.rs` right after `percpu::init`.
-Same pattern for `uni-native` (registered from `uni_native::run`).
+Same pattern for `uni-backend` (registered from `uni_backend::native::run`).
 
 ### Steps
 
 1. **Add `trait Runtime` + `Once` + `register` + `runtime()` to
-   `//uni-executor`.** Keep old `extern "C"` hooks working during
+   `//uni-runtime`.** Keep old `extern "C"` hooks working during
    the transition (call-through from trait methods) so no backend
    breaks mid-refactor.
 2. **Migrate bare-metal backend.** Add `impl Runtime for
@@ -280,8 +280,8 @@ Same pattern for `uni-native` (registered from `uni_native::run`).
    the three `#[unsafe(no_mangle)] pub extern "C" fn uni_exec_*`
    symbols.
 3. **Migrate native backend.** Same shape, registration from
-   `uni_native::run`.
-4. **Delete the `extern "C"` block from `//uni-executor` and both
+   `uni_backend::native::run`.
+4. **Delete the `extern "C"` block from `//uni-runtime` and both
    `#[allow(improper_ctypes)]` annotations.** Replace call sites
    with `runtime().now_ticks()` etc.
 5. **Add `MockRuntime` + host unit tests for arena/Waker
@@ -291,9 +291,9 @@ Same pattern for `uni-native` (registered from `uni_native::run`).
 
 - [ ] All existing test_async variants + test_percpu + webserver
       regressions pass.
-- [ ] No `extern "C"` blocks in `//uni-executor`; no
+- [ ] No `extern "C"` blocks in `//uni-runtime`; no
       `#[allow(improper_ctypes)]` anywhere in the executor stack.
-- [ ] At least one new `#[test]` in `//uni-executor` exercising
+- [ ] At least one new `#[test]` in `//uni-runtime` exercising
       arena + Waker via `MockRuntime`.
 
 ### Estimated effort
@@ -324,7 +324,7 @@ Per-worker UDP "inbox" already exists for the callback path
 (`net::udp::bind`). Add a reactor layer:
 
 ```rust
-// uni-executor/src/net.rs (new module)
+// uni-runtime/src/net.rs (new module)
 pub struct UdpSocket { port: u16, /* waker slot per worker */ }
 
 pub struct UdpRecv<'a> { sock: &'a UdpSocket, /* … */ }
@@ -358,10 +358,10 @@ pattern the Sleep future uses.
 
 1. **Extend `net::udp` delivery path** to allow a "waker sink"
    alongside the existing handler callback. Both can coexist.
-2. **Add `UdpSocket` + `UdpRecv` to `//uni-executor`.** Reactor
+2. **Add `UdpSocket` + `UdpRecv` to `//uni-runtime`.** Reactor
    primitives live here, backed by Runtime trait hooks.
 3. **Native backend** implements the hooks on top of its existing
-   UDP sibling fd (`uni-native::udp_bind`).
+   UDP sibling fd (`uni_backend::udp_bind`).
 4. **Bare-metal backend** implements on top of `net::udp::bind`
    with an inbox queue for pending datagrams.
 5. **`apps/test_async`** grows a UDP echo variant that exercises
@@ -408,12 +408,12 @@ Status legend: ⏳ not started · 🟡 in progress · 🟢 complete · 🔴 bloc
 
 | # | Phase | Status | Primary files | Lines Δ |
 |---|---|---|---|---|
-| P0 | `//uni-executor` — shared arena / Waker / Sleep | 🟢 | `uni-executor/**`, `kernel/src/executor.rs`, `uni-native/src/executor.rs` | +506 / -375 |
+| P0 | `//uni-runtime` — shared arena / Waker / Sleep | 🟢 | `uni-runtime/**`, `kernel/src/executor.rs`, `uni-backend/src/native/executor.rs` | +506 / -375 |
 | P1 | `//uni-percpu` — `CurrentCore` + `PerCpu` | 🟢 | `uni-percpu/**`, `kernel/src/percpu.rs` | +321 / -272 |
-| P2 | Share `TimerWheel` + `PendingTimers` | 🟢 | `uni-percpu/src/timer.rs`, `uni-native/src/executor.rs` | +435 / -451 |
-| P2.5 | Share `InitOnce<T>` | 🟢 | `uni-percpu/src/once.rs`, `uni/boot_info.rs` | +201 / -263 |
-| P3 | `trait Runtime` — drop `extern "C"` | 🔴 blocked | `uni-executor/src/lib.rs`, both backends | — |
-| P4 | `UdpRecv::recv_from().await` | ⏳ | new `uni-executor/src/net.rs`, both backends' UDP paths | ~+200 |
+| P2 | Share `TimerWheel` + `PendingTimers` | 🟢 | `uni-percpu/src/timer.rs`, `uni-backend/src/native/executor.rs` | +435 / -451 |
+| P2.5 | Share `InitOnce<T>` | 🟢 | `uni-percpu/src/once.rs`, `uni/src/boot_info.rs` | +201 / -263 |
+| P3 | `Runtime` fn-pointer struct — drop `extern "C"` | 🟢 | `uni-percpu/src/lib.rs`, both backends | `082b8eb`, `375e99f` |
+| P4 | `UdpRecv::recv_from().await` | ⏳ | new `uni-runtime/src/net.rs`, both backends' UDP paths | ~+200 |
 | P5 | `TcpListener::accept().await` *(optional)* | ⏳ | new, both backends' TCP paths | ~+200 |
 | →§3c | **Hand-off: QUIC starts** | — | see [ROADMAP §3c](../ROADMAP.md) | — |
 
