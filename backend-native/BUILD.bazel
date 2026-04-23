@@ -17,7 +17,7 @@ rust_library(
     crate_name = "backend_native",
     target_compatible_with = ["//bazel/platforms:native"],
     deps = [
-        "//uni-executor",
+        "//executor",
         "//uni-percpu",
         "//util/atomic_fn",
     ],

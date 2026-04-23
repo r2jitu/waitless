@@ -11,7 +11,7 @@
 // accessor is safe by construction.
 //
 // `Runtime` — the backend plug-in shared between `uni-percpu` and
-// `uni-executor`. Each backend publishes one `static Runtime` and
+// `executor`. Each backend publishes one `static Runtime` and
 // calls `register` at boot; every crate above looks up hooks via
 // `runtime()`. Grows a field per new reactor primitive.
 
@@ -47,7 +47,7 @@ pub struct Runtime {
 static RUNTIME: AtomicPtr<Runtime> = AtomicPtr::new(ptr::null_mut());
 
 /// Publish the backend runtime. Call once at boot, before any
-/// `CurrentCore::enter` / `uni_executor::spawn` / `sleep_us` / `tick`.
+/// `CurrentCore::enter` / `executor::spawn` / `sleep_us` / `tick`.
 pub fn register(rt: &'static Runtime) {
     RUNTIME.store(rt as *const Runtime as *mut Runtime, Ordering::Release);
 }

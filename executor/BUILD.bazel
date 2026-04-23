@@ -7,8 +7,8 @@ package(default_visibility = ["//visibility:public"])
 # native (backend hooks in //backend-native). Compiles as no_std + alloc;
 # the host-std binary re-uses the same rlib under the libstd link.
 rust_library(
-    name = "uni-executor",
+    name = "executor",
     srcs = ["src/lib.rs"],
-    crate_name = "uni_executor",
+    crate_name = "executor",
     deps = ["//uni-percpu"],
 )

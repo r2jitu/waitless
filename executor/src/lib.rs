@@ -1,4 +1,4 @@
-// uni-executor/src/lib.rs — Shared async runtime.
+// executor/src/lib.rs — Shared async runtime.
 
 #![no_std]
 

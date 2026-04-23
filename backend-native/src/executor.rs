@@ -27,4 +27,4 @@ pub fn init() {
 
 // ---- Re-exports for app + worker-loop code --------------------------------
 
-pub use uni_executor::{has_pending, sleep_us, spawn, tick, Sleep};
+pub use executor::{has_pending, sleep_us, spawn, tick, Sleep};
