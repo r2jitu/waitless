@@ -12,25 +12,28 @@ use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
+use uni_percpu::timer::{Timer, TimerWheel};
 use uni_percpu::{CurrentCore, PerCpu, MAX_WORKERS};
 
 // ---- Backend plug-in -------------------------------------------------------
 //
-// Each backend (`//kernel`, `//uni-native`) defines a `static
-// Runtime` filled with its own fn pointers and calls `register` at
-// boot. No `dyn Trait`, no `extern "C"` hooks — just a POD struct of
-// Rust-ABI fn pointers, thin-pointer `AtomicPtr` for publication.
+// Each backend (`//kernel`, `//uni-native`) fills a `static Runtime`
+// with its own hook impls and calls `register` at boot. Grows a field
+// per new reactor primitive (P4 adds `udp_*`, QUIC may add
+// `remote_wake_hint`, …). Published via `AtomicPtr<Runtime>` so the
+// shared path is a thin-pointer load + indirect call, no vtable.
 
 pub struct Runtime {
+    /// Monotonic µs since an arbitrary (backend-defined) start point.
+    /// Must match the deadline scale `schedule_timer` reads from
+    /// `TimerWheel`.
     pub now_ticks: fn() -> u64,
-    pub schedule_timer: fn(deadline: u64, func: fn(usize), arg: usize) -> bool,
-    pub cancel_timer: fn(arg: usize) -> bool,
 }
 
 static RUNTIME: AtomicPtr<Runtime> = AtomicPtr::new(ptr::null_mut());
 
 /// Publish the backend runtime. Call once at boot, before any
-/// `spawn` / `sleep_us` / `Sleep::poll`.
+/// `spawn` / `sleep_us` / `tick`.
 pub fn register(rt: &'static Runtime) {
     RUNTIME.store(rt as *const Runtime as *mut Runtime, Ordering::Release);
 }
@@ -41,6 +44,29 @@ fn runtime() -> &'static Runtime {
     // SAFETY: backend is expected to call `register` before any
     // `runtime()` access.
     unsafe { &*p }
+}
+
+#[inline]
+fn now_ticks() -> u64 {
+    (runtime().now_ticks)()
+}
+
+// ---- Per-worker timer storage ---------------------------------------------
+
+struct WheelCell(UnsafeCell<TimerWheel>);
+
+// SAFETY: touched only by its owning worker via
+// `PerCpu::current(&CurrentCore)`.
+unsafe impl Sync for WheelCell {}
+unsafe impl Send for WheelCell {}
+
+static WHEELS: PerCpu<WheelCell, MAX_WORKERS> =
+    PerCpu::new([const { WheelCell(UnsafeCell::new(TimerWheel::new())) }; MAX_WORKERS]);
+
+fn wheel(cc: &CurrentCore) -> &mut TimerWheel {
+    let cell = WHEELS.current(cc);
+    // SAFETY: owning-worker-only; `CurrentCore` proves we're on it.
+    unsafe { &mut *cell.0.get() }
 }
 
 // ---- Task arena ------------------------------------------------------------
@@ -151,14 +177,20 @@ fn make_waker_for(slot: *const TaskSlot) -> Waker {
     unsafe { Waker::from_raw(raw) }
 }
 
-// ---- Poll entry points -----------------------------------------------------
+// ---- Event-loop entry points ----------------------------------------------
 
-/// Poll every ready slot in `worker_id`'s arena. Backends call this
-/// once per event-loop iteration.
+/// Advance this worker's timer wheel (firing expired timers, which
+/// wake their tasks via the `Sleep` → waker chain), then poll every
+/// ready slot in its arena. Backends call this once per event-loop
+/// iteration.
 pub fn tick(worker_id: u32) -> bool {
     if (worker_id as usize) >= MAX_WORKERS {
         return false;
     }
+    // SAFETY: caller guarantees `worker_id` is the running worker.
+    let cc = unsafe { CurrentCore::from_id_unchecked(worker_id) };
+    let _ = wheel(&cc).advance(now_ticks());
+
     let arena = ARENAS.at(worker_id);
     let mut did_work = false;
     for slot in arena.slots.iter() {
@@ -174,10 +206,16 @@ pub fn tick(worker_id: u32) -> bool {
     did_work
 }
 
-/// True iff `worker_id`'s arena has at least one slot flagged ready.
-pub fn has_ready(worker_id: u32) -> bool {
+/// True if the worker has outstanding async work — either a
+/// scheduled timer in its wheel or a task slot flagged ready.
+pub fn has_pending(worker_id: u32) -> bool {
     if (worker_id as usize) >= MAX_WORKERS {
         return false;
+    }
+    // SAFETY: caller guarantees `worker_id` is the running worker.
+    let cc = unsafe { CurrentCore::from_id_unchecked(worker_id) };
+    if wheel(&cc).count() > 0 {
+        return true;
     }
     ARENAS
         .at(worker_id)
@@ -226,7 +264,7 @@ impl Sleep {
 /// Sleep for `us` microseconds from now.
 #[inline]
 pub fn sleep_us(us: u64) -> Sleep {
-    Sleep::until((runtime().now_ticks)().saturating_add(us))
+    Sleep::until(now_ticks().saturating_add(us))
 }
 
 impl Future for Sleep {
@@ -234,15 +272,19 @@ impl Future for Sleep {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = self.get_mut();
-        let rt = runtime();
-        if (rt.now_ticks)() >= this.deadline {
+        if now_ticks() >= this.deadline {
             this.waker = None;
             return Poll::Ready(());
         }
         if !this.timer_scheduled {
             this.waker = Some(cx.waker().clone());
             let self_ptr: *const Sleep = this;
-            if (rt.schedule_timer)(this.deadline, sleep_fire, self_ptr as usize) {
+            let cc = CurrentCore::enter();
+            if wheel(&cc).insert(Timer {
+                deadline: this.deadline,
+                func: sleep_fire,
+                arg: self_ptr as usize,
+            }) {
                 this.timer_scheduled = true;
             }
         }
@@ -254,7 +296,8 @@ impl Drop for Sleep {
     fn drop(&mut self) {
         if self.timer_scheduled {
             let self_ptr: *const Sleep = self;
-            let _ = (runtime().cancel_timer)(self_ptr as usize);
+            let cc = CurrentCore::enter();
+            let _ = wheel(&cc).cancel(self_ptr as usize);
         }
     }
 }

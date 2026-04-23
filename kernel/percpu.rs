@@ -16,7 +16,6 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::deque::{Deque, Task};
 use crate::spsc;
-use crate::timer::{TimerWheel, PendingTimers};
 
 // `CurrentCore` + `PerCpu<T, N>` now live in `//uni-percpu` so native
 // can share them. Kept under the `kernel::percpu` path via re-export
@@ -149,12 +148,6 @@ pub struct PerCore {
     /// Stealable tasks — pure compute, thieves can steal from here.
     pub stealable: Deque,
 
-    /// Timer wheel — only this core fires timers.
-    pub timers: TimerWheel,
-
-    /// Pending timers — any core can push, this core drains into wheel.
-    pub pending_timers: PendingTimers,
-
     /// TX staging buffer — this core writes packets here, core 0 flushes (Tier 2).
     pub tx_staging: TxStaging,
 }
@@ -229,8 +222,6 @@ impl PerCore {
             inbox: spsc::Ring::new(),
             pinned: spsc::Ring::new(),
             stealable: Deque::new(),
-            timers: TimerWheel::new(),
-            pending_timers: PendingTimers::new(),
             tx_staging: TxStaging::new(),
         }
     }

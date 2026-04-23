@@ -7,7 +7,8 @@
 // Cross-worker timer creation goes through the `PendingTimers` MPSC
 // queue. Pool storage is a lock-free intrusive free-list.
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+// No cross-worker submission queue yet — kept simple until a
+// concrete consumer shows up.
 
 /// Number of slots in the wheel. Must be a power of 2.
 const WHEEL_SIZE: usize = 256;
@@ -155,135 +156,10 @@ impl TimerWheel {
     }
 }
 
-/// MPSC queue for cross-core timer submission.
-/// Any core can push; only the owning core pops.
-/// Lock-free via atomic linked-list head.
-pub struct PendingTimers {
-    head: AtomicUsize, // pointer to first TimerNode, or 0
-}
-
-/// Node in the pending timers linked list.
-/// Allocated from a fixed pool (no heap needed).
-struct TimerNode {
-    timer: Timer,
-    next: usize, // pointer to next node, or 0
-}
-
-const PENDING_POOL_SIZE: usize = 64;
-
-// Pool storage. `UnsafeCell`-wrapped: the nodes themselves are
-// mutated exclusively through raw pointers once `init_pool` has
-// built the free list, so the single-owner contract is preserved.
-// Lock-free alloc/free use the atomic head pointer.
-struct PoolSlot(core::cell::UnsafeCell<[TimerNode; PENDING_POOL_SIZE]>);
-// SAFETY: `init_pool` runs once (guarded by `PENDING_POOL_INIT`);
-// after that, node mutation goes through raw pointers + atomics.
-unsafe impl Sync for PoolSlot {}
-
-static PENDING_POOL: PoolSlot = PoolSlot(core::cell::UnsafeCell::new([const {
-    TimerNode {
-        timer: Timer { deadline: 0, func: noop, arg: 0 },
-        next: 0,
-    }
-}; PENDING_POOL_SIZE]));
-
-static PENDING_POOL_HEAD: AtomicUsize = AtomicUsize::new(0);
-static PENDING_POOL_INIT: AtomicUsize = AtomicUsize::new(0);
-
-fn noop(_: usize) {}
-
-fn init_pool() {
-    if PENDING_POOL_INIT.compare_exchange(0, 1, Ordering::SeqCst, Ordering::Relaxed).is_err() {
-        return;
-    }
-    unsafe {
-        let pool = &mut *PENDING_POOL.0.get();
-        // Build free list
-        for i in 0..PENDING_POOL_SIZE - 1 {
-            pool[i].next = &raw const pool[i + 1] as usize;
-        }
-        pool[PENDING_POOL_SIZE - 1].next = 0;
-        PENDING_POOL_HEAD.store(&raw const pool[0] as usize, Ordering::Release);
-    }
-}
-
-fn alloc_node() -> Option<*mut TimerNode> {
-    init_pool();
-    loop {
-        let head = PENDING_POOL_HEAD.load(Ordering::Acquire);
-        if head == 0 {
-            return None;
-        }
-        let node = head as *mut TimerNode;
-        let next = unsafe { (*node).next };
-        if PENDING_POOL_HEAD.compare_exchange(head, next, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-            return Some(node);
-        }
-    }
-}
-
-fn free_node(node: *mut TimerNode) {
-    loop {
-        let head = PENDING_POOL_HEAD.load(Ordering::Acquire);
-        unsafe { (*node).next = head; }
-        if PENDING_POOL_HEAD.compare_exchange(head, node as usize, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-            return;
-        }
-    }
-}
-
-impl PendingTimers {
-    pub const fn new() -> Self {
-        PendingTimers {
-            head: AtomicUsize::new(0),
-        }
-    }
-
-    /// Push a timer (any core can call). Lock-free.
-    ///
-    /// Returns `false` if the global pending pool is exhausted —
-    /// callers must propagate that up rather than assume success.
-    #[must_use = "an ignored `false` silently drops the timer"]
-    pub fn push(&self, timer: Timer) -> bool {
-        let node = match alloc_node() {
-            Some(n) => n,
-            None => return false,
-        };
-        unsafe { (*node).timer = timer; }
-        loop {
-            let head = self.head.load(Ordering::Acquire);
-            unsafe { (*node).next = head; }
-            if self.head.compare_exchange(head, node as usize, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-                return true;
-            }
-        }
-    }
-
-    /// Drain all pending timers into the given wheel (owning core only).
-    /// Returns `(inserted, dropped)` — `dropped` counts timers whose
-    /// target wheel slot was full at drain time.
-    pub fn drain_into(&self, wheel: &mut TimerWheel) -> (usize, usize) {
-        // Atomically take the entire list
-        let head = self.head.swap(0, Ordering::AcqRel);
-        let mut inserted = 0;
-        let mut dropped = 0;
-        let mut node_ptr = head;
-        while node_ptr != 0 {
-            let node = node_ptr as *mut TimerNode;
-            let next = unsafe { (*node).next };
-            let timer = unsafe { (*node).timer };
-            if wheel.insert(timer) { inserted += 1; } else { dropped += 1; }
-            free_node(node);
-            node_ptr = next;
-        }
-        (inserted, dropped)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::sync::atomic::AtomicU32;
+    use core::sync::atomic::{AtomicU32, Ordering};
 
     // Test handlers count fires through a per-test `Counters` struct
     // whose address is passed as the Timer's `arg`. Each test owns its
