@@ -415,7 +415,7 @@ unsafe fn reg_write32(offset: u64, val: u32) {
 /// present and init was attempted successfully. Intended as the
 /// first-choice NIC on GCE; callers fall back to virtio-net on
 /// `false`.
-pub fn init() -> bool {
+fn init() -> bool {
     if GVNIC_OK.load(Ordering::Acquire) {
         return true;
     }
@@ -597,7 +597,7 @@ pub fn init() -> bool {
 }
 
 /// Returns true if `init()` has completed successfully.
-pub fn probe_ok() -> bool {
+fn probe_ok() -> bool {
     GVNIC_OK.load(Ordering::Acquire)
 }
 
@@ -1500,7 +1500,7 @@ fn doorbell_write(bar2_va: u64, offset: u32, value: u32) {
 /// each completion descriptor carries `flags_seq` whose low 3 bits
 /// cycle 1..7. When the next descriptor's sequence matches what
 /// we're expecting, it's a new completion.
-pub fn poll_qp_inner(qp: usize, callback: fn(&[u8])) -> u32 {
+fn poll_qp_inner(qp: usize, callback: fn(&[u8])) -> u32 {
     if qp >= MAX_QUEUE_PAIRS {
         return 0;
     }
@@ -1589,7 +1589,7 @@ fn tx_drain(tx: &TxQueue) {
 /// Submit a single-segment packet on queue pair `qp`. Returns
 /// `true` on success, `false` when the ring has no free slots
 /// (device hasn't caught up) or the frame exceeds `TX_MAX_PKT_LEN`.
-pub fn send_on_qp(qp: usize, data: &[u8]) -> bool {
+fn send_on_qp(qp: usize, data: &[u8]) -> bool {
     if qp >= MAX_QUEUE_PAIRS || data.is_empty() || data.len() > TX_MAX_PKT_LEN {
         return false;
     }
@@ -1666,7 +1666,7 @@ pub fn send_on_qp(qp: usize, data: &[u8]) -> bool {
 /// true if a doorbell write was issued. Called by the event loop
 /// after each service pass to push whatever `send_on_qp` batched
 /// onto the wire before the CPU sits idle.
-pub fn flush_tx_kick_if_dirty_qp(qp: usize) -> bool {
+fn flush_tx_kick_if_dirty_qp(qp: usize) -> bool {
     if qp >= MAX_QUEUE_PAIRS { return false; }
     let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
     if tx_ptr.is_null() { return false; }
@@ -1685,7 +1685,7 @@ pub fn flush_tx_kick_if_dirty_qp(qp: usize) -> bool {
 /// Flush the current core's TX queue if dirty. Mirrors
 /// `uni_drivers::virtio_net::flush_tx_kick_if_dirty` so the shim in
 /// `uni_drivers::net` can dispatch through the same signature.
-pub fn flush_tx_kick_if_dirty() -> bool {
+fn flush_tx_kick_if_dirty() -> bool {
     let num_qp = NUM_QP.load(Ordering::Acquire) as u32;
     if num_qp == 0 { return false; }
     let core = uni_kernel::cpu_id();
@@ -1697,7 +1697,7 @@ pub fn flush_tx_kick_if_dirty() -> bool {
 /// per-core-queue Tier 1 mode (each core's `flush_tx_kick_if_dirty`
 /// covers its own queue), but useful if something batches sends
 /// across cores. Called from the shim's `flush_tx_staging()`.
-pub fn flush_all_tx_kicks() {
+fn flush_all_tx_kicks() {
     let n = NUM_QP.load(Ordering::Acquire) as usize;
     for qp in 0..n.min(MAX_QUEUE_PAIRS) {
         flush_tx_kick_if_dirty_qp(qp);
@@ -1708,7 +1708,7 @@ pub fn flush_all_tx_kicks() {
 /// it has wired `flush_tx_kick_if_dirty` into the event loop —
 /// without that guarantee the device would never see the doorbell
 /// writes and TX would stall once the ring fills.
-pub fn enable_deferred_tx_kick() {
+fn enable_deferred_tx_kick() {
     DEFERRED_KICK.store(true, Ordering::Release);
 }
 
@@ -1716,7 +1716,7 @@ pub fn enable_deferred_tx_kick() {
 /// fits within `num_qp`, else falls back to qp 0. Matches the
 /// virtio-net "send on your own core's queue" semantics so Tier 1
 /// scaling keeps working.
-pub fn send(data: &[u8]) {
+fn send(data: &[u8]) {
     let num_qp = NUM_QP.load(Ordering::Acquire) as u32;
     if num_qp == 0 {
         return;
@@ -1733,7 +1733,7 @@ pub fn send(data: &[u8]) {
 /// shim can call either driver the same way. The caller is
 /// responsible for `mac_out` pointing at 6 writable bytes — same
 /// unwritten contract virtio-net's version has.
-pub fn get_mac(mac_out: *mut u8) {
+fn get_mac(mac_out: *mut u8) {
     let st = STATE.lock();
     let src = st.as_ref().map(|s| s.mac).unwrap_or([0u8; 6]);
     unsafe {
@@ -1744,13 +1744,13 @@ pub fn get_mac(mac_out: *mut u8) {
 /// Active queue pair count. Drives `net::poll_tier1` — when > 1
 /// the kernel switches to per-core queue polling.
 #[inline]
-pub fn num_queue_pairs() -> u16 {
+fn num_queue_pairs() -> u16 {
     NUM_QP.load(Ordering::Acquire)
 }
 
 /// Per-queue RX frame count. Lock-free snapshot — uses the atomic
 /// cons_cnt on each live queue.
-pub fn rx_counts() -> [u64; 8] {
+fn rx_counts() -> [u64; 8] {
     let mut out = [0u64; 8];
     for qp in 0..MAX_QUEUE_PAIRS.min(out.len()) {
         let rx_ptr = RX_QUEUES[qp].load(Ordering::Acquire);
@@ -1767,7 +1767,7 @@ pub fn rx_counts() -> [u64; 8] {
 /// (consumed by driver). Return `(fill_cnt, cons_cnt)` which maps
 /// naturally onto virtio's `(device_idx, driver_cursor)`
 /// interpretation in `/stats`.
-pub fn rx_used_cursors() -> [(u16, u16); 8] {
+fn rx_used_cursors() -> [(u16, u16); 8] {
     let mut out = [(0u16, 0u16); 8];
     for qp in 0..MAX_QUEUE_PAIRS.min(out.len()) {
         let rx_ptr = RX_QUEUES[qp].load(Ordering::Acquire);
@@ -1784,21 +1784,21 @@ pub fn rx_used_cursors() -> [(u16, u16); 8] {
 
 /// Per-queue RX poll. Mirrors `uni_drivers::virtio_net::poll_qp(qp, cb)`
 /// so Tier 1 per-core polling in `net::poll_tier1` works unchanged.
-pub fn poll_qp(qp: usize, callback: fn(&[u8])) -> i32 {
-    poll_qp_inner(qp, callback) as i32
+fn poll_qp(qp: usize, callback: fn(&[u8])) -> usize {
+    poll_qp_inner(qp, callback) as usize
 }
 
 /// Non-per-core poll. Callers (DHCP bring-up, Tier 2 distribute)
 /// don't know which RX queue a given packet landed on, so walk
 /// every live queue. RSS is active by the time `init()` returns,
 /// and DHCP's reply may hash onto any queue — not just qp 0.
-pub fn poll(callback: fn(&[u8])) -> i32 {
+fn poll(callback: fn(&[u8])) -> usize {
     let n = NUM_QP.load(Ordering::Acquire) as usize;
-    let mut total: u32 = 0;
+    let mut total: usize = 0;
     for qp in 0..n.min(MAX_QUEUE_PAIRS) {
-        total = total.saturating_add(poll_qp_inner(qp, callback));
+        total = total.saturating_add(poll_qp_inner(qp, callback) as usize);
     }
-    total as i32
+    total
 }
 
 // ---- Serial logging helpers ------------------------------------------------
@@ -1886,7 +1886,7 @@ static GVE_DIAG_OPS: NicDiagOps = NicDiagOps {
     rx_used_cursors,
 };
 
-pub static GVE_OPS: NicOps = NicOps {
+static GVE_OPS: NicOps = NicOps {
     name: "gve",
     probe,
     send,

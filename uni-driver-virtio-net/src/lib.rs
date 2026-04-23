@@ -198,7 +198,7 @@ fn ndev() -> *mut NetDevice {
 }
 
 /// Get the number of active queue pairs.
-pub fn num_queue_pairs() -> u16 {
+fn num_queue_pairs() -> u16 {
     unsafe { (*ndev()).num_queue_pairs }
 }
 
@@ -403,7 +403,7 @@ fn init_pci_modern() -> bool {
 /// send-side still looks healthy. Leaving the count unset means
 /// vhost-net falls back to its default single-pair behaviour, which
 /// empirically works fine for 1-vCPU guests.
-pub fn activate_multi_queue() {
+fn activate_multi_queue() {
     unsafe {
         let dev = &mut *ndev();
         if !dev.has_mq || dev.negotiated_queue_pairs <= 1 {
@@ -932,14 +932,12 @@ fn irq_handler(_irq: u32) {
 // Public API — VirtIO-net
 // ============================================================================
 
-/// Set when `init()` has returned `true`. Mirrors
-/// `gve::probe_ok()` so the `EthernetDriver` trait impl can
-/// report which driver actually bound hardware at boot. Read
-/// via `probe_ok()` below; do not read directly.
+/// Set when `init()` has returned `true`. Read via `probe_ok()` below;
+/// do not read directly.
 static PROBE_OK: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-pub fn init() -> bool {
+fn init() -> bool {
     log(b"virtio_net: initializing...\n");
 
     #[cfg(target_arch = "aarch64")]
@@ -969,11 +967,11 @@ pub fn init() -> bool {
 /// Whether `init()` successfully bound a VirtIO-net NIC. Used by
 /// the `EthernetDriver` trait impl (`VirtioNetDriver`) to decide
 /// whether probing should return `Some(NicHandle)`.
-pub fn probe_ok() -> bool {
+fn probe_ok() -> bool {
     PROBE_OK.load(core::sync::atomic::Ordering::Acquire)
 }
 
-pub fn get_mac(mac_out: *mut u8) {
+fn get_mac(mac_out: *mut u8) {
     unsafe {
         ptr::copy_nonoverlapping((*ndev()).mac.as_ptr(), mac_out, 6);
     }
@@ -1056,7 +1054,7 @@ static TX_LOCK: uni_kernel::sync::Spinlock<()> = uni_kernel::sync::Spinlock::new
 ///     via `flush_tx_staging()`. The staging path is a throughput
 ///     optimisation — it lets `send()` stay non-blocking on hot paths while
 ///     a single core drains all rings under one lock acquisition.
-pub fn send(data: &[u8]) {
+fn send(data: &[u8]) {
     let cc = uni_kernel::percpu::CurrentCore::enter();
     let id = cc.id();
     let nqp = unsafe { (*ndev()).num_queue_pairs };
@@ -1074,13 +1072,13 @@ pub fn send(data: &[u8]) {
 }
 
 /// True if any AP has staged TX packets waiting for flush.
-pub fn has_pending_tx() -> bool {
+fn has_pending_tx() -> bool {
     TX_PENDING.load(Ordering::Acquire)
 }
 
 /// Flush all per-core TX staging buffers into the VirtIO TX queue.
 /// Any core may call this; concurrent calls are serialised via TX_LOCK.
-pub fn flush_tx_staging() {
+fn flush_tx_staging() {
     if !TX_PENDING.load(Ordering::Acquire) {
         return;
     }
@@ -1109,7 +1107,7 @@ pub fn flush_tx_staging() {
 /// an MMIO exit that lets the host inject pending RX frames. Called from
 /// DHCP's poll-wait loop to ensure DHCP replies are delivered during the
 /// tight polling window where no other MMIO exits occur.
-pub fn poke_interrupt_status() {
+fn poke_interrupt_status() {
     #[cfg(target_arch = "aarch64")]
     unsafe {
         if let Transport::Mmio { base, .. } = (*ndev()).transport {
@@ -1122,9 +1120,7 @@ pub fn poke_interrupt_status() {
     }
 }
 
-pub fn poll(
-    callback: fn(&[u8]),
-) -> i32 {
+fn poll(callback: fn(&[u8])) -> usize {
     poll_qp(0, callback)
 }
 
@@ -1136,7 +1132,7 @@ static RX_COUNTS: [core::sync::atomic::AtomicU64; MAX_QUEUE_PAIRS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; MAX_QUEUE_PAIRS];
 
 /// Snapshot of per-queue RX frame counts.
-pub fn rx_counts() -> [u64; MAX_QUEUE_PAIRS] {
+fn rx_counts() -> [u64; MAX_QUEUE_PAIRS] {
     let mut out = [0u64; MAX_QUEUE_PAIRS];
     for i in 0..MAX_QUEUE_PAIRS {
         out[i] = RX_COUNTS[i].load(core::sync::atomic::Ordering::Relaxed);
@@ -1156,7 +1152,7 @@ pub fn rx_counts() -> [u64; MAX_QUEUE_PAIRS] {
 ///   device_idx >  driver_cursor        → device delivered but we're
 ///                                        not polling fast enough / at all
 ///   device_idx == driver_cursor, both large → healthy: fully drained
-pub fn rx_used_cursors() -> [(u16, u16); MAX_QUEUE_PAIRS] {
+fn rx_used_cursors() -> [(u16, u16); MAX_QUEUE_PAIRS] {
     let mut out = [(0u16, 0u16); MAX_QUEUE_PAIRS];
     // Only negotiated queues are actually initialised — the rest have
     // null `used` pointers and reading `used_idx()` on them would
@@ -1176,7 +1172,7 @@ pub fn rx_used_cursors() -> [(u16, u16); MAX_QUEUE_PAIRS] {
 }
 
 /// Poll a specific queue pair for received frames.
-pub fn poll_qp(qp: usize, callback: fn(&[u8])) -> i32 {
+fn poll_qp(qp: usize, callback: fn(&[u8])) -> usize {
     unsafe {
         if let Transport::None = (*ndev()).transport { return 0; }
     }
@@ -1199,7 +1195,7 @@ pub fn poll_qp(qp: usize, callback: fn(&[u8])) -> i32 {
         // _g released at end of scope.
     }
 
-    let mut count: i32 = 0;
+    let mut count: usize = 0;
     unsafe {
         while let Some((used_id, used_len)) = (*ndev()).rx_queues[qp].get_used() {
             let desc = (*ndev()).rx_queues[qp].desc(used_id);
@@ -1237,7 +1233,7 @@ const BATCH_SIZE: usize = 32;
 
 /// A batch of received frames. Frames are stored contiguously with
 /// a length prefix: [len: u16][frame data][len: u16][frame data]...
-pub struct RxBatch {
+struct RxBatch {
     pub data: [u8; BATCH_SIZE * 1600], // worst case: 32 × 1514-byte frames
     pub len: usize,                     // bytes used in data
     pub count: usize,                   // number of frames
@@ -1254,7 +1250,7 @@ impl RxBatch {
     }
 }
 
-pub struct RxBatchIter<'a> {
+struct RxBatchIter<'a> {
     data: &'a [u8],
     pos: usize,
 }
@@ -1273,12 +1269,12 @@ impl<'a> Iterator for RxBatchIter<'a> {
 }
 
 /// Poll VirtIO RX queue pair 0 and collect frames into a batch buffer.
-pub fn poll_batch(batch: &mut RxBatch) {
+fn poll_batch(batch: &mut RxBatch) {
     poll_batch_qp(0, batch);
 }
 
 /// Poll a specific queue pair's RX queue into a batch buffer.
-pub fn poll_batch_qp(qp: usize, batch: &mut RxBatch) {
+fn poll_batch_qp(qp: usize, batch: &mut RxBatch) {
     batch.len = 0;
     batch.count = 0;
 
@@ -1329,7 +1325,7 @@ pub fn poll_batch_qp(qp: usize, batch: &mut RxBatch) {
     }
 }
 
-pub fn enable_irq() {
+fn enable_irq() {
     unsafe {
         #[cfg(target_arch = "aarch64")]
         {
@@ -1464,15 +1460,15 @@ unsafe extern "C" fn msix_rx_isr_trampoline(
     IRQ_PENDING.store(true, core::sync::atomic::Ordering::Release);
 }
 
-pub fn irq_idle_supported() -> bool {
+fn irq_idle_supported() -> bool {
     unsafe { (*ndev()).irq_idle_available }
 }
 
-pub fn arm_rx_interrupts() {
+fn arm_rx_interrupts() {
     unsafe { (*ndev()).rx_queues[0].enable_interrupts(); }
 }
 
-pub fn has_pending_rx() -> bool {
+fn has_pending_rx() -> bool {
     unsafe { (*ndev()).rx_queues[0].has_used() }
 }
 
@@ -1485,7 +1481,7 @@ pub fn has_pending_rx() -> bool {
 /// Tier 2 / single-queue: every core arms queue 0, and only the core
 /// currently acting as distributor (whichever wins the RX_LOCK in the
 /// net crate) actually reads from it.
-pub fn rearm_rx_napi(core_id: u32) -> bool {
+fn rearm_rx_napi(core_id: u32) -> bool {
     unsafe {
         let nqp = (*ndev()).num_queue_pairs;
         let qp = if nqp > 1 && (core_id as u16) < nqp {
@@ -1502,7 +1498,7 @@ pub fn rearm_rx_napi(core_id: u32) -> bool {
 /// is a no-op; the caller must call flush_tx_kick() to issue the
 /// actual MMIO write. Batches multiple send_segment() calls into
 /// one virtio notification, reducing MMIO exits.
-pub fn enable_deferred_tx_kick() {
+fn enable_deferred_tx_kick() {
     let nqp = unsafe { (*ndev()).num_queue_pairs } as usize;
     for qp in 0..nqp {
         unsafe { (*ndev()).tx_queues[qp].set_deferred_kick(true); }
@@ -1511,13 +1507,13 @@ pub fn enable_deferred_tx_kick() {
 
 /// Flush deferred TX kick — issues one MMIO notify for all batched TX.
 /// Only kicks if new buffers were added since last flush (kick_dirty).
-pub fn flush_tx_kick() {
+fn flush_tx_kick() {
     unsafe { (*ndev()).tx_queues[0].flush_kick(); }
 }
 
 /// Flush only if dirty. Returns true if a kick was issued.
 /// In multi-queue mode, flushes the calling core's TX queue pair.
-pub fn flush_tx_kick_if_dirty() -> bool {
+fn flush_tx_kick_if_dirty() -> bool {
     let nqp = unsafe { (*ndev()).num_queue_pairs };
     if nqp > 1 {
         let core = uni_kernel::cpu_id() as usize;
@@ -1561,7 +1557,7 @@ static VIRTIO_NET_DIAG_OPS: NicDiagOps = NicDiagOps {
     rx_used_cursors,
 };
 
-pub static VIRTIO_NET_OPS: NicOps = NicOps {
+static VIRTIO_NET_OPS: NicOps = NicOps {
     name: "virtio-net",
     probe,
     send,
