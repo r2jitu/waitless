@@ -13,7 +13,7 @@ use alloc::boxed::Box;
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use uni_percpu::timer::{Timer, TimerWheel};
@@ -47,6 +47,16 @@ type BoxedFuture = Pin<Box<dyn Future<Output = ()>>>;
 
 pub struct TaskSlot {
     used: AtomicBool,
+    /// Cancel flag — set by `TaskHandle::abort` (possibly from a
+    /// different worker). Checked by `tick` before polling; if set,
+    /// the future is dropped in place and the slot freed.
+    abort: AtomicBool,
+    /// Bumped every time this slot transitions used → free (on
+    /// completion OR abort). `TaskHandle` captures the epoch at
+    /// spawn time and verifies on every cross-worker op, so a stale
+    /// handle to a reused slot becomes a no-op rather than aborting
+    /// the unrelated task.
+    epoch: AtomicU32,
     future: UnsafeCell<Option<BoxedFuture>>,
 }
 
@@ -54,14 +64,16 @@ impl TaskSlot {
     const fn new() -> Self {
         TaskSlot {
             used: AtomicBool::new(false),
+            abort: AtomicBool::new(false),
+            epoch: AtomicU32::new(0),
             future: UnsafeCell::new(None),
         }
     }
 }
 
-// SAFETY: `used` is atomic; `future` is mutated only by the owning
-// worker (CAS on `used` serialises producers; polling runs on the
-// same worker that spawned).
+// SAFETY: `used` / `abort` / `epoch` are atomic; `future` is
+// mutated only by the owning worker (CAS on `used` serialises
+// producers; polling runs on the same worker that spawned).
 unsafe impl Sync for TaskSlot {}
 unsafe impl Send for TaskSlot {}
 
@@ -88,13 +100,61 @@ static ARENAS: PerCpu<TaskArena, MAX_WORKERS> =
 
 // ---- Spawning --------------------------------------------------------------
 
+/// Handle to a spawned task. Lets the caller query whether the task
+/// is still running and request cancellation. Safe to call from any
+/// worker (cross-worker `abort` defers the drop to the target
+/// worker's next `tick`).
+///
+/// Captured fields: the owning worker, the slot index, and the
+/// epoch stamp at spawn time. A mismatch means the slot has since
+/// been reused; cross-worker ops become no-ops so we never abort an
+/// unrelated task.
+#[derive(Clone, Copy)]
+pub struct TaskHandle {
+    worker_id: u32,
+    slot_idx: u32,
+    epoch: u32,
+}
+
+impl TaskHandle {
+    /// Request that the task stop. The drop runs on the target
+    /// worker's next `tick` — this call itself is just an atomic
+    /// flag write + ready-bit set to force a tick. A no-op if the
+    /// task already finished or the slot was reused.
+    pub fn abort(&self) {
+        let arena = ARENAS.at(self.worker_id);
+        let slot = &arena.slots[self.slot_idx as usize];
+        // Epoch check prevents aborting a stranger that reused the
+        // slot after our task completed.
+        if slot.epoch.load(Ordering::Acquire) != self.epoch {
+            return;
+        }
+        slot.abort.store(true, Ordering::Release);
+        // Force a tick so the abort is honoured promptly, even if
+        // the task isn't otherwise ready.
+        arena
+            .ready_bits
+            .fetch_or(1u64 << self.slot_idx, Ordering::Release);
+    }
+
+    /// True iff the task has completed or been aborted. False
+    /// while still running.
+    pub fn is_finished(&self) -> bool {
+        let arena = ARENAS.at(self.worker_id);
+        let slot = &arena.slots[self.slot_idx as usize];
+        slot.epoch.load(Ordering::Acquire) != self.epoch
+            || !slot.used.load(Ordering::Acquire)
+    }
+}
+
 /// Spawn a future onto the current worker's arena. `Err(())` when
-/// the arena is full.
-pub fn spawn<F>(f: F) -> Result<(), ()>
+/// the arena is full — the future is dropped in that case.
+pub fn spawn<F>(f: F) -> Result<TaskHandle, ()>
 where
     F: Future<Output = ()> + 'static,
 {
     let cc = CurrentCore::enter();
+    let worker_id = cc.id();
     let arena = ARENAS.current(&cc);
     let fut: BoxedFuture = Box::pin(f);
     let mut fut_opt = Some(fut);
@@ -109,8 +169,16 @@ where
             unsafe {
                 *slot.future.get() = fut_opt.take();
             }
+            // Clear any stale abort flag from the prior task that
+            // lived in this slot (swap-not-store to be defensive).
+            slot.abort.store(false, Ordering::Release);
+            let epoch = slot.epoch.load(Ordering::Acquire);
             arena.ready_bits.fetch_or(1u64 << idx, Ordering::Release);
-            return Ok(());
+            return Ok(TaskHandle {
+                worker_id,
+                slot_idx: idx as u32,
+                epoch,
+            });
         }
     }
     Err(())
@@ -254,6 +322,21 @@ pub fn tick(worker_id: u32) -> bool {
         if !slot.used.load(Ordering::Acquire) {
             continue;
         }
+        // Cancellation beats polling: `TaskHandle::abort` set the
+        // flag + flipped the ready bit to force us here. Drop the
+        // future in place (on the owning worker, where it's safe),
+        // bump the epoch so lingering handles observe completion,
+        // then free the slot.
+        if slot.abort.swap(false, Ordering::AcqRel) {
+            // SAFETY: owning-worker-only access.
+            unsafe {
+                *slot.future.get() = None;
+            }
+            slot.epoch.fetch_add(1, Ordering::AcqRel);
+            slot.used.store(false, Ordering::Release);
+            did_work = true;
+            continue;
+        }
         did_work = true;
         poll_slot(slot, worker_id, slot_idx);
     }
@@ -287,6 +370,10 @@ fn poll_slot(slot: &TaskSlot, worker_id: u32, slot_idx: usize) {
         Poll::Pending => {}
         Poll::Ready(()) => {
             *fut_slot = None;
+            // Bump epoch so `TaskHandle::is_finished` sees completion
+            // and any in-flight `abort` call on this handle becomes
+            // a no-op rather than aborting the next task in this slot.
+            slot.epoch.fetch_add(1, Ordering::AcqRel);
             slot.used.store(false, Ordering::Release);
         }
     }

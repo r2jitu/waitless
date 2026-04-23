@@ -178,6 +178,7 @@ pub use uni_backend::{
 /// works on both unikernel and native.
 pub mod runtime {
     pub use uni_backend::runtime::{sleep_us, spawn, spawn_on_each_worker, Sleep};
+    pub use uni_runtime::TaskHandle;
     pub use uni_runtime::net::{
         TcpBindError, TcpRecv, UdpBindError, UdpRecv, UdpSocket,
     };
