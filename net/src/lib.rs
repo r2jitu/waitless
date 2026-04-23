@@ -45,12 +45,12 @@ pub fn init_stack() {
     // own per-port accept pool); accept reads the current core's
     // pool and returns the first Established+!accepted conn.
     uni_runtime::net::register_tcp_backend(tcp_backend_listen, tcp_backend_accept);
-    // And the per-stream recv-ready reactor. Uses `is_readable_or_closed`
-    // (not `has_data`) so the future resolves on peer FIN — the caller
-    // then sees `recv() == 0` and can tear down.
+    // And the per-stream async recv reactor. Uses the generation-
+    // aware variants so stale handles surviving a close+reuse
+    // resolve to closed rather than aliasing the new connection.
     uni_runtime::net::register_tcp_recv_hooks(
         tcp::is_readable_or_closed,
-        tcp::recv,
+        tcp::async_recv,
         tcp::register_recv_waker,
         tcp::clear_recv_waker,
     );
@@ -71,7 +71,7 @@ fn tcp_backend_listen(port: u16) -> Result<(), ()> {
     Ok(())
 }
 
-fn tcp_backend_accept(port: u16) -> *mut () {
+fn tcp_backend_accept(port: u16) -> uni_runtime::net::RawTcpStream {
     tcp::accept_on_port(port)
 }
 

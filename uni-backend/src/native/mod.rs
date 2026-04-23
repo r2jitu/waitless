@@ -267,7 +267,14 @@ struct NativeConn {
     is_shared_listener: bool,
     closed: bool,
     has_pending_data: bool,
-    /// Waker parked by `TcpRecvReady` / `register_tcp_recv_hooks`.
+    /// Incremented every time this slot is released. Async handles
+    /// (RawTcpStream) carry the generation at accept time; hook
+    /// callers pass it on every op so we can detect a stale handle
+    /// whose slot got reused by a newer connection. u16 wraps after
+    /// 65k reuses per slot — collision window one-in-65k, low enough
+    /// for the aliasing bug we're guarding against.
+    generation: u16,
+    /// Waker parked by `TcpRecv` / `register_tcp_recv_hooks`.
     /// Set on Pend, taken by `dispatch_ready_fd` when the fd fires,
     /// cleared explicitly on Ready or on close.
     recv_waker: Option<Waker>,
@@ -281,6 +288,7 @@ impl NativeConn {
             is_shared_listener: false,
             closed: true,
             has_pending_data: false,
+            generation: 0,
             recv_waker: None,
         }
     }
@@ -376,6 +384,8 @@ impl ThreadState {
                 c.closed = false;
                 c.has_pending_data = false;
                 c.recv_waker = None;
+                // Generation is preserved across reuse — `release_conn`
+                // bumps it.
                 return c as *mut NativeConn;
             }
         }
@@ -396,8 +406,11 @@ impl ThreadState {
             (*c).has_pending_data = false;
             (*c).is_listener = false;
             (*c).is_shared_listener = false;
-            // Wake any parked recv_ready so its next poll sees `closed`
-            // and resolves Ready (callers interpret EOF as close).
+            // Bump generation so any still-outstanding async handle
+            // sees a mismatch on its next hook call.
+            (*c).generation = (*c).generation.wrapping_add(1);
+            // Wake any parked recv_waker so its next poll sees
+            // `closed` and resolves with `recv() == 0`.
             if let Some(w) = (*c).recv_waker.take() {
                 w.wake();
             }
@@ -663,7 +676,7 @@ fn init_native() {
     );
     uni_runtime::net::register_tcp_recv_hooks(
         native_tcp_has_data,
-        tcp_recv,
+        native_tcp_do_recv,
         native_tcp_register_recv_waker,
         native_tcp_clear_recv_waker,
     );
@@ -746,7 +759,8 @@ fn async_tcp_listen_hook(app_port: u16) -> Result<(), ()> {
     }
 }
 
-fn async_tcp_accept_hook(app_port: u16) -> *mut () {
+fn async_tcp_accept_hook(app_port: u16) -> uni_runtime::net::RawTcpStream {
+    use uni_runtime::net::RawTcpStream;
     unsafe {
         let tid = uni_platform::current_worker() as usize;
         let count = ASYNC_TCP_COUNT.load(Ordering::Acquire);
@@ -761,11 +775,11 @@ fn async_tcp_accept_hook(app_port: u16) -> *mut () {
             }
             let listen_fd = l.fds[tid];
             if listen_fd < 0 {
-                return ptr::null_mut();
+                return RawTcpStream::NULL;
             }
             let fd = accept(listen_fd, ptr::null_mut(), ptr::null_mut());
             if fd < 0 {
-                return ptr::null_mut();
+                return RawTcpStream::NULL;
             }
             set_nonblocking(fd);
             let opt: i32 = 1;
@@ -774,44 +788,79 @@ fn async_tcp_accept_hook(app_port: u16) -> *mut () {
             let c = ts.alloc_conn();
             if c.is_null() {
                 close(fd);
-                return ptr::null_mut();
+                return RawTcpStream::NULL;
             }
             (*c).fd = fd;
             ts.register_fd(fd);
-            return c as *mut ();
+            return RawTcpStream {
+                handle: c as *mut (),
+                generation: (*c).generation,
+            };
         }
-        ptr::null_mut()
+        RawTcpStream::NULL
     }
 }
 
-// ---- Async TCP recv-ready hooks ------------------------------------------
+// ---- Async TCP recv hooks ------------------------------------------------
 //
-// Called from `uni_runtime::net::TcpRecvReady::poll` via the three
-// function pointers registered in `init_native`. Each operates on a
+// Called from `uni_runtime::net::TcpRecv::poll` via the four function
+// pointers registered in `init_native`. Each operates on a
 // `NativeConn *` obtained from `async_tcp_accept_hook` and lives in
 // the owning worker's `ThreadState.conns`. No locking — the conn's
 // worker thread is the only writer of `recv_waker`; the poll site
-// runs on that same worker (TcpRecvReady is `!Send`).
-fn native_tcp_has_data(handle: *mut ()) -> bool {
+// runs on that same worker (TcpRecv is `!Send`).
+//
+// `generation` is stamped at accept time and checked on every hook
+// call — a mismatch means the slot got reused by a newer connection
+// after a close, so we behave as if the conn is closed for the
+// stale caller (recv returns 0, waker registration wakes
+// immediately so the task observes closure).
+
+/// Returns `true` iff the slot's generation matches and it's still
+/// live. Stale handles return `(c, false)` — the caller should
+/// treat them as closed. Null `handle` also returns `(ptr::null, false)`.
+#[inline]
+unsafe fn check_gen(handle: *mut (), generation: u16) -> (*mut NativeConn, bool) {
     let c = handle as *mut NativeConn;
+    if c.is_null() {
+        return (c, false);
+    }
+    let matches = unsafe { (*c).generation == generation && !(*c).closed };
+    (c, matches)
+}
+
+fn native_tcp_has_data(handle: *mut (), generation: u16) -> bool {
     unsafe {
-        if c.is_null() || (*c).closed {
-            return true; // closed → recv_ready resolves; caller sees recv()==0
+        let (c, live) = check_gen(handle, generation);
+        if !live {
+            // Closed or stale → TcpRecv resolves so the caller sees
+            // `recv() == 0`.
+            return !c.is_null();
         }
         (*c).has_pending_data
     }
 }
 
-fn native_tcp_register_recv_waker(handle: *mut (), waker: &Waker) {
-    let c = handle as *mut NativeConn;
+fn native_tcp_do_recv(handle: *mut (), generation: u16, buf: &mut [u8]) -> usize {
     unsafe {
-        if c.is_null() || (*c).closed {
+        let (_c, live) = check_gen(handle, generation);
+        if !live {
+            return 0;
+        }
+        // Live + matching generation → forward to the sync recv path.
+        tcp_recv(handle, buf)
+    }
+}
+
+fn native_tcp_register_recv_waker(handle: *mut (), generation: u16, waker: &Waker) {
+    unsafe {
+        let (c, live) = check_gen(handle, generation);
+        if !live {
             waker.wake_by_ref();
             return;
         }
-        // Avoid the clone if the stored waker will already fire the
-        // same task. `will_wake` is a best-effort check from the
-        // std Waker vtable.
+        // Dedup — avoid the clone if the stored waker will already
+        // fire the same task.
         match &(*c).recv_waker {
             Some(w) if w.will_wake(waker) => {}
             _ => (*c).recv_waker = Some(waker.clone()),
@@ -819,10 +868,12 @@ fn native_tcp_register_recv_waker(handle: *mut (), waker: &Waker) {
     }
 }
 
-fn native_tcp_clear_recv_waker(handle: *mut ()) {
-    let c = handle as *mut NativeConn;
+fn native_tcp_clear_recv_waker(handle: *mut (), generation: u16) {
     unsafe {
-        if c.is_null() { return; }
+        let (c, live) = check_gen(handle, generation);
+        if !live {
+            return;
+        }
         (*c).recv_waker = None;
     }
 }

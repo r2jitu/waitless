@@ -112,10 +112,15 @@ pub struct TcpConnection {
     rx_tail: usize,
     listener_port: u16,
     accepted: bool,
-    /// Parked `TcpRecvReady` waker. Set by
-    /// `tcp_register_recv_waker` on the owning core; woken when data
-    /// lands in `rx_buf` or the peer closes. Per-core ownership — no
-    /// lock needed.
+    /// Incremented every time `free_connection` resets this slot, so
+    /// a stale async handle that survived a close+reuse sees a
+    /// generation mismatch on its next hook call and short-circuits
+    /// to the "closed" path. Preserved across reset — `new()` does
+    /// NOT reset it; `free_connection` bumps it explicitly.
+    generation: u16,
+    /// Parked `TcpRecv` waker. Set by `register_recv_waker` on the
+    /// owning core; woken when data lands in `rx_buf` or the peer
+    /// closes. Per-core ownership — no lock needed.
     recv_waker: Option<Waker>,
 }
 
@@ -135,6 +140,7 @@ impl TcpConnection {
             rx_tail: 0,
             listener_port: 0,
             accepted: false,
+            generation: 0,
             recv_waker: None,
         }
     }
@@ -416,16 +422,21 @@ fn free_connection(core: u32, slot: usize) {
         let key = tcp_hash_key(c.remote_ip, c.remote_port, c.local_port);
         tcp_hash_remove(core, key);
     }
-    // Fire any parked `TcpRecvReady` waker before the slot is reset
-    // — the app handler needs to observe teardown (is_closed → true)
+    // Fire any parked `TcpRecv` waker before the slot is reset —
+    // the app handler needs to observe teardown (recv returns 0)
     // rather than sleeping on a stale waker that would get dropped.
     if let Some(w) = c.recv_waker.take() {
         w.wake();
     }
+    // Bump generation so any still-outstanding async handle detects
+    // the slot has been reused on its next hook call. Preserved
+    // across the reset below.
+    let next_gen = c.generation.wrapping_add(1);
     // Assigning a fresh TcpConnection drops the old one, which runs
     // the Drop impl on `rx_buf: Option<Box<[u8]>>` — Box::drop returns
     // the bytes to the global allocator. No manual kfree needed.
     *c = TcpConnection::new();
+    c.generation = next_gen;
 }
 
 fn send_segment(
@@ -754,34 +765,40 @@ pub fn listen_on_core(core: u32, port: u16) -> *mut () {
     encode_handle(core, slot)
 }
 
-/// Accept a connection from a specific core's pool.
+/// Sync accept on a specific listener's pool. Returns the bare
+/// handle for the sync `uni_backend::tcp_accept` ABI; the async
+/// path uses `accept_on_port` / `RawTcpStream` instead.
 pub fn accept(handle: *mut ()) -> *mut () {
     let (core, listener_slot) = match decode_handle(handle) {
         Some(v) => v,
         None => return ptr::null_mut(),
     };
     let port = unsafe { (*conn_ptr(core, listener_slot)).local_port };
-    accept_on_port_core(core, port)
+    accept_on_port_core(core, port).handle
 }
 
 /// Accept a connection on the **current core** by port — the
 /// listener handle isn't threaded through, so this is the entry
 /// point used by `uni_runtime::net::TcpListener`'s backend hook.
-/// Returns null if no connection is ready on this core.
-pub fn accept_on_port(port: u16) -> *mut () {
+/// Returns `RawTcpStream::NULL` if no connection is ready on this core.
+pub fn accept_on_port(port: u16) -> uni_runtime::net::RawTcpStream {
     accept_on_port_core(uni_kernel::cpu_id(), port)
 }
 
-fn accept_on_port_core(core: u32, port: u16) -> *mut () {
+fn accept_on_port_core(core: u32, port: u16) -> uni_runtime::net::RawTcpStream {
+    use uni_runtime::net::RawTcpStream;
     for i in 0..CONNECTIONS_PER_CORE {
         // SAFETY: per-core ownership.
         let c = unsafe { &mut *conn_ptr(core, i) };
         if c.state == TcpState::Established && c.listener_port == port && !c.accepted {
             c.accepted = true;
-            return encode_handle(core, i);
+            return RawTcpStream {
+                handle: encode_handle(core, i),
+                generation: c.generation,
+            };
         }
     }
-    ptr::null_mut()
+    RawTcpStream::NULL
 }
 
 pub fn has_data(handle: *mut ()) -> bool {
@@ -795,15 +812,19 @@ pub fn has_data(handle: *mut ()) -> bool {
 /// Async-readiness probe: like `has_data` but also returns `true`
 /// for terminal states (Closed / CloseWait with empty rx) so the
 /// `TcpRecv` future resolves on peer FIN and the caller sees
-/// `recv() == 0`. Registered as the `TCP_HAS_DATA` hook — sync
-/// callers still use `has_data` to avoid spurious recv attempts on
-/// dead conns.
-pub fn is_readable_or_closed(handle: *mut ()) -> bool {
+/// `recv() == 0`. A `generation` mismatch also reports "ready" so
+/// stale handles promptly resolve to closed. Registered as the
+/// `TCP_HAS_DATA` hook — sync callers still use `has_data` to avoid
+/// spurious recv attempts on dead conns.
+pub fn is_readable_or_closed(handle: *mut (), generation: u16) -> bool {
     let (core, slot) = match decode_handle(handle) {
         Some(v) => v,
         None => return true,
     };
     let c = unsafe { &*conn_ptr(core, slot) };
+    if c.generation != generation {
+        return true; // stale → treat as closed
+    }
     if c.rx_used() > 0 {
         return true;
     }
@@ -880,15 +901,35 @@ pub fn close(handle: *mut ()) {
     }
 }
 
+/// Async `TcpRecv` sync read hook. Verifies `generation`; stale
+/// handles return 0 (observed by caller as EOF / close).
+pub fn async_recv(handle: *mut (), generation: u16, buf: &mut [u8]) -> usize {
+    let (core, slot) = match decode_handle(handle) {
+        Some(v) => v,
+        None => return 0,
+    };
+    let c = unsafe { &mut *conn_ptr(core, slot) };
+    if c.generation != generation {
+        return 0;
+    }
+    c.rx_pop(buf)
+}
+
 /// Park the current task's waker on this conn, to be woken when
 /// data arrives or the peer FINs. Called from
-/// `uni_runtime::net::TcpRecvReady::poll` on the owning core.
-pub fn register_recv_waker(handle: *mut (), waker: &Waker) {
+/// `uni_runtime::net::TcpRecv::poll` on the owning core. A
+/// `generation` mismatch fires the waker immediately so the task
+/// observes closure on its next poll.
+pub fn register_recv_waker(handle: *mut (), generation: u16, waker: &Waker) {
     let (core, slot) = match decode_handle(handle) {
         Some(v) => v,
         None => { waker.wake_by_ref(); return; }
     };
     let c = unsafe { &mut *conn_ptr(core, slot) };
+    if c.generation != generation {
+        waker.wake_by_ref();
+        return;
+    }
     match &c.recv_waker {
         Some(w) if w.will_wake(waker) => {}
         _ => c.recv_waker = Some(waker.clone()),
@@ -896,14 +937,18 @@ pub fn register_recv_waker(handle: *mut (), waker: &Waker) {
 }
 
 /// Drop the parked waker without firing it. Called from
-/// `TcpRecvReady::poll` after resolving Ready so a subsequent data
-/// arrival doesn't wake a no-longer-interested task.
-pub fn clear_recv_waker(handle: *mut ()) {
+/// `TcpRecv::poll` after resolving Ready so a subsequent data
+/// arrival doesn't wake a no-longer-interested task. Stale
+/// `generation` is a no-op.
+pub fn clear_recv_waker(handle: *mut (), generation: u16) {
     let (core, slot) = match decode_handle(handle) {
         Some(v) => v,
         None => return,
     };
     let c = unsafe { &mut *conn_ptr(core, slot) };
+    if c.generation != generation {
+        return;
+    }
     c.recv_waker = None;
 }
 

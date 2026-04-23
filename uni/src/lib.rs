@@ -241,7 +241,14 @@ impl TcpListener {
 
     pub fn accept(&self) -> Option<TcpStream> {
         let p = uni_backend::tcp_accept(self.0);
-        if p.is_null() { None } else { Some(TcpStream(p)) }
+        if p.is_null() {
+            None
+        } else {
+            // Sync accept path — uni_http's dispatch loop. No
+            // generation tracking here; sync callers don't use the
+            // async hooks that verify it.
+            Some(TcpStream::from_sync_handle(p))
+        }
     }
 
     pub fn close(&self) {
@@ -251,48 +258,69 @@ impl TcpListener {
 
 // ---- TcpStream ------------------------------------------------------------
 
+/// A TCP connection handle. Carries a `generation` stamp so async
+/// hooks detect slot-reuse after close. Sync-path constructors set
+/// generation to 0 (sync callers don't consult it).
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct TcpStream(*mut ());
+pub struct TcpStream {
+    handle: *mut (),
+    generation: u16,
+}
 
 impl TcpStream {
     /// Wrap a raw handle from `uni::runtime::TcpListener::accept` /
-    /// `run` into the typed `TcpStream` API. The raw `*mut ()` and
-    /// `TcpStream`'s inner pointer use the same backend
-    /// representation; this is a zero-cost reinterpretation.
+    /// `run` into the typed `TcpStream` API, preserving the
+    /// generation the reactor stamped at accept time.
     #[inline]
     pub fn from_raw(raw: uni_runtime::net::RawTcpStream) -> Self {
-        TcpStream(raw.0)
+        TcpStream { handle: raw.handle, generation: raw.generation }
+    }
+
+    /// Construct from a sync-path handle (no generation tracking).
+    /// Used by `uni_http`'s still-sync dispatch loop — sync callers
+    /// don't hit the async hooks, so generation is irrelevant; a
+    /// value of 0 is a placeholder.
+    #[inline]
+    pub fn from_sync_handle(handle: *mut ()) -> Self {
+        TcpStream { handle, generation: 0 }
+    }
+
+    /// Raw handle for sync-ABI callers. Async callers should go
+    /// through `recv` / `send` / `close` instead.
+    #[inline]
+    pub fn raw_handle(&self) -> *mut () {
+        self.handle
     }
 
     pub fn has_data(&self) -> bool {
-        uni_backend::tcp_has_data(self.0)
+        uni_backend::tcp_has_data(self.handle)
     }
 
     /// Async read — the primary recv primitive. Resolves with the
-    /// byte count when data is available (or `0` on peer close).
-    /// Wakes are delivered from the backend event loop; no polling.
-    /// Mirrors the shape of `UdpSocket::recv_from`.
+    /// byte count when data is available (or `0` on peer close /
+    /// stale generation). Wakes are delivered from the backend
+    /// event loop; no polling. Mirrors `UdpSocket::recv_from`.
     #[inline]
     pub fn recv<'a>(&self, buf: &'a mut [u8]) -> uni_runtime::net::TcpRecv<'a> {
-        uni_runtime::net::TcpRecv::new(self.0, buf)
+        uni_runtime::net::TcpRecv::new(self.handle, self.generation, buf)
     }
 
     /// Non-blocking sync read. Returns `0` on EAGAIN or close; use
     /// `recv(..).await` instead in async contexts. Retained for
     /// `uni_http`'s still-sync dispatch loop until that migrates.
     pub fn recv_sync(&self, buf: &mut [u8]) -> usize {
-        uni_backend::tcp_recv(self.0, buf)
+        uni_backend::tcp_recv(self.handle, buf)
     }
 
     pub fn send(&self, data: &[u8]) -> i32 {
-        uni_backend::tcp_send(self.0, data)
+        uni_backend::tcp_send(self.handle, data)
     }
 
     pub fn close(&self) {
-        uni_backend::tcp_close(self.0);
+        uni_backend::tcp_close(self.handle);
     }
 
     pub fn is_closed(&self) -> bool {
-        uni_backend::tcp_is_closed(self.0)
+        uni_backend::tcp_is_closed(self.handle)
     }
 }
