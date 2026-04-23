@@ -40,7 +40,7 @@ fn boot() {
             uni::request_shutdown();
         });
         match nested {
-            Ok(()) => uni::log(b"test_async: nested spawn ok\n"),
+            Ok(_handle) => uni::log(b"test_async: nested spawn ok\n"),
             Err(()) => {
                 uni::log(b"test_async: nested spawn FAILED\n");
                 uni::request_shutdown();
@@ -49,7 +49,7 @@ fn boot() {
     });
 
     match spawn_result {
-        Ok(()) => uni::log(b"test_async: spawn ok\n"),
+        Ok(_handle) => uni::log(b"test_async: spawn ok\n"),
         Err(()) => {
             uni::log(b"test_async: spawn FAILED\n");
             uni::request_shutdown();
