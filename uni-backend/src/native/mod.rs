@@ -797,21 +797,33 @@ fn init_native() {
 
 // ---- Async TCP reactor backend (native side) ------------------------------
 //
-// Parallel to the UDP sibling machinery: open one SO_REUSEPORT
-// listen fd per worker, register each in its worker's kqueue/epoll.
-// When a worker's event queue fires for a listener fd, we call
-// `uni_runtime::net::deliver_tcp_ready(port)` — the awaiting async
-// task on that worker is then woken and its next poll calls
-// `async_tcp_accept_hook`, which does `accept(2)` on the worker's
-// own listener fd. Per-worker isolation (same as UDP) — no cross-
-// core contention for TCP accept.
+// One listen fd per port, shared across every worker. Each worker
+// registers it in its own kqueue/epoll; when a SYN arrives the
+// kernel wakes one waiter (or, on macOS, multiple — thundering
+// herd), whose `async_tcp_accept_hook` calls `accept(2)` and owns
+// the resulting connection. Losers see EAGAIN and re-poll.
+//
+// Why shared-fd and not per-worker SO_REUSEPORT siblings:
+// macOS's TCP SO_REUSEPORT does NOT distribute SYNs across sibling
+// listeners (unlike UDP, and unlike Linux's TCP 4-tuple hash).
+// `sample` under tls_handshake_max showed worker 0 doing all TLS
+// crypto while worker 1 sat 95% idle in kevent — all accepts
+// funnelled to thread 0 via the siblings layout. The shared-fd
+// "first-to-accept-wins" pattern is what `uni_http`'s sync path
+// used to get 5.9 k hs/s on 2 t; siblings-plus-async was capping
+// at 3.7 k.
+//
+// On Linux this shape also works — EPOLLIN on the same fd from N
+// epolls will wake one per event; kernel SO_REUSEPORT-style load
+// balancing is lost but is not needed for correctness.
 
 const MAX_ASYNC_TCP_LISTENERS: usize = 4;
 
 struct AsyncTcpListener {
     app_port: u16,
-    fds: [i32; MAX_THREADS],
-    fd_count: usize,
+    /// Single shared listen fd; same `fd` is registered in every
+    /// worker's kqueue/epoll.
+    fd: i32,
 }
 
 struct AsyncTcpListenersSlot(UnsafeCell<[Option<AsyncTcpListener>; MAX_ASYNC_TCP_LISTENERS]>);
@@ -830,35 +842,22 @@ fn async_tcp_listen_hook(app_port: u16) -> Result<(), ()> {
             return Err(());
         }
         let host_port = read_port_env("TCP", app_port).unwrap_or(app_port);
-        let want = NUM_THREADS.load(Ordering::Acquire).max(1);
-        let mut fds = [-1i32; MAX_THREADS];
-        let mut got = 0usize;
-        for i in 0..want {
-            // `make_listener` opens a SO_REUSEPORT / SO_REUSEADDR listen
-            // fd (nonblocking). Siblings on the same port distribute
-            // incoming SYNs across workers (macOS: same as UDP; Linux
-            // with SO_REUSEPORT: 4-tuple hash).
-            let fd = make_listener(host_port, true);
-            if fd < 0 {
-                if i == 0 {
-                    return Err(());
-                }
-                break;
-            }
-            fds[i] = fd;
-            got += 1;
+        let fd = make_listener(host_port, true);
+        if fd < 0 {
+            return Err(());
         }
         let idx = count;
         (*ASYNC_TCP_LISTENERS.0.get())[idx] = Some(AsyncTcpListener {
             app_port,
-            fds,
-            fd_count: got,
+            fd,
         });
         ASYNC_TCP_COUNT.store(idx + 1, Ordering::Release);
 
+        // Register the shared fd in every worker's event queue.
+        let want = NUM_THREADS.load(Ordering::Acquire).max(1);
         let threads = &mut *THREADS.0.get();
-        for worker_id in 0..got {
-            threads[worker_id].register_fd(fds[worker_id]);
+        for worker_id in 0..want {
+            threads[worker_id].register_fd(fd);
         }
         Ok(())
     }
@@ -867,7 +866,7 @@ fn async_tcp_listen_hook(app_port: u16) -> Result<(), ()> {
 fn async_tcp_accept_hook(app_port: u16) -> uni_runtime::net::RawTcpStream {
     use uni_runtime::net::RawTcpStream;
     unsafe {
-        let tid = uni_platform::current_worker() as usize;
+        let tid = uni_platform::current_worker();
         let count = ASYNC_TCP_COUNT.load(Ordering::Acquire);
         let listeners = &*ASYNC_TCP_LISTENERS.0.get();
         for entry in listeners.iter().take(count) {
@@ -875,21 +874,20 @@ fn async_tcp_accept_hook(app_port: u16) -> uni_runtime::net::RawTcpStream {
                 Some(l) => l,
                 None => continue,
             };
-            if l.app_port != app_port || tid >= l.fd_count {
+            if l.app_port != app_port || l.fd < 0 {
                 continue;
             }
-            let listen_fd = l.fds[tid];
-            if listen_fd < 0 {
-                return RawTcpStream::NULL;
-            }
-            let fd = accept(listen_fd, ptr::null_mut(), ptr::null_mut());
+            // `accept` races across workers on the shared fd. The
+            // kernel hands each SYN to exactly one waiter; losers
+            // see EAGAIN and re-poll on the next kqueue fire.
+            let fd = accept(l.fd, ptr::null_mut(), ptr::null_mut());
             if fd < 0 {
                 return RawTcpStream::NULL;
             }
             set_nonblocking(fd);
             let opt: i32 = 1;
             setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, 4);
-            let ts = thread_state(tid as u32);
+            let ts = thread_state(tid);
             let c = ts.alloc_conn();
             if c.is_null() {
                 close(fd);
@@ -1049,7 +1047,7 @@ fn native_tcp_clear_send_waker(handle: *mut (), generation: u16) {
 
 /// Called from `dispatch_ready_fd`. Returns `true` iff `fd` matched
 /// an async-TCP listener (and the reactor notification was issued).
-fn async_tcp_dispatch(thread_id: u32, fd: i32) -> bool {
+fn async_tcp_dispatch(_thread_id: u32, fd: i32) -> bool {
     unsafe {
         let count = ASYNC_TCP_COUNT.load(Ordering::Acquire);
         let listeners = &*ASYNC_TCP_LISTENERS.0.get();
@@ -1058,8 +1056,7 @@ fn async_tcp_dispatch(thread_id: u32, fd: i32) -> bool {
                 Some(l) => l,
                 None => continue,
             };
-            let tid = thread_id as usize;
-            if tid < l.fd_count && l.fds[tid] == fd {
+            if l.fd == fd {
                 uni_runtime::net::deliver_tcp_ready(l.app_port);
                 return true;
             }
