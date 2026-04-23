@@ -23,8 +23,30 @@
 set -euo pipefail
 
 WS="${BUILD_WORKSPACE_DIRECTORY:-$(cd "$(dirname "$0")/.." && pwd)}"
+OUTPUT_BASE="${HOME}/.cache/bazel-rust-analyzer-$(basename "$WS")"
+LOCKDIR="${OUTPUT_BASE}.discover.lock.d"
 
-exec bazel \
-    "--output_base=${HOME}/.cache/bazel-rust-analyzer-$(basename "$WS")" \
+mkdir -p "$(dirname "$OUTPUT_BASE")"
+
+# Serialize concurrent invocations. rust-analyzer fires this script
+# multiple times in rapid succession (~8 in the same ms on project
+# open); without a mutex they race on bazel's own output-base lock
+# and bazel's "Another command holds the output base lock"
+# contention message lands on stdout, breaking r-a's JSON parser.
+# macOS has no `flock(1)`, so use an atomic `mkdir` spin-wait.
+while ! mkdir "$LOCKDIR" 2>/dev/null; do sleep 0.05; done
+trap 'rmdir "$LOCKDIR" 2>/dev/null || true' EXIT
+
+# Ignore "$@": r-a passes a buildfile path per invocation, and
+# `discover_bazel_rust_project` errors out with "Aquery returned
+# an empty result" for BUILDs that have no rust targets (e.g. the
+# root BUILD.bazel, any C++-only package). Full-project discovery
+# with no arg is the one mode that works reliably.
+#
+# stderr → stdout + filter to JSON lines only: strips bazel's
+# status/warning chatter and any late lock messages so only
+# well-formed {"kind":"progress"|"finished"} payloads reach r-a.
+bazel \
+    "--output_base=${OUTPUT_BASE}" \
     run --ui_event_filters=-info,-stdout,-stderr --noshow_progress \
-    //:discover_rust_project -- "$@"
+    //:discover_rust_project 2>&1 | awk '/^\{/'
