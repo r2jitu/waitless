@@ -49,7 +49,7 @@ rust_library(
     # library.
     target_compatible_with = ["@platforms//os:none"],
     deps = [
-        "//executor",
+        "//uni-runtime",
         "//uni-percpu",
         "//util/atomic_fn",
         "@crates//:chacha20",

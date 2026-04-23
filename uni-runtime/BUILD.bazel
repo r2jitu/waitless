@@ -1,0 +1,14 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# Shared async runtime — task arena + Waker + Sleep built on
+# `//uni-percpu`'s `Runtime` contract. Cfg-select backend (//uni-backend)
+# fills in `now_ticks` / `current_worker`. Compiles as no_std + alloc;
+# same rlib links into unikernel and native binaries.
+rust_library(
+    name = "uni-runtime",
+    srcs = ["src/lib.rs"],
+    crate_name = "uni_runtime",
+    deps = ["//uni-percpu"],
+)

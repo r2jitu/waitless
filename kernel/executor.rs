@@ -20,4 +20,4 @@ pub fn init() {
 
 // ---- Re-exports for app + event-loop code ---------------------------------
 
-pub use executor::{has_pending, sleep_us, spawn, tick, Sleep};
+pub use uni_runtime::{has_pending, sleep_us, spawn, tick, Sleep};

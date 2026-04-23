@@ -11,7 +11,7 @@
 // accessor is safe by construction.
 //
 // `Runtime` — the backend plug-in shared between `uni-percpu` and
-// `executor`. Each backend publishes one `static Runtime` and
+// `uni-runtime`. Each backend publishes one `static Runtime` and
 // calls `register` at boot; every crate above looks up hooks via
 // `runtime()`. Grows a field per new reactor primitive.
 
