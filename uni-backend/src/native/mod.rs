@@ -15,7 +15,9 @@ use atomic_fn::AtomicFn;
 /// Re-export of the shared runtime's executor surface — apps
 /// reach these via `uni::runtime::{spawn,sleep_us,Sleep,…}`.
 pub mod runtime {
-    pub use uni_runtime::{has_pending, sleep_us, spawn, tick, Sleep};
+    pub use uni_runtime::{
+        has_pending, sleep_us, spawn, spawn_on_each_worker, tick, Sleep,
+    };
 }
 
 // ============================================================================

@@ -23,7 +23,7 @@ implementation itself.
 | P2. `TimerWheel` + `PendingTimers` shared | 🟢 done | `9e0095f` |
 | P2.5. `InitOnce<T>` shared, `uni/src/boot_info.rs` dedup | 🟢 done | `e52ce2a` |
 | P3. Runtime fn-pointer struct — drop `extern "C"` hooks | 🟢 done | `082b8eb`, `375e99f` |
-| P4. `UdpRecv::recv_from().await` reactor | ⏳ | — |
+| P4. `UdpSocket::recv_from().await` reactor | 🟢 done | `bb0dc1a`..HEAD |
 | P5. *(optional)* `TcpListener::accept().await` reactor | ⏳ | — |
 
 After P4, ROADMAP §3c starts. Everything after that lives in the
@@ -307,83 +307,71 @@ Same pattern for `uni-backend` (registered from `uni_backend::native::run`).
 
 ---
 
-## Phase 4 — `UdpRecv::recv_from().await` reactor
+## Phase 4 — `UdpSocket::recv_from().await` reactor (shipped)
 
-### Why
-
-QUIC's first `.await` is for a UDP datagram. Currently UDP
-delivery goes through synchronous `udp_bind(port, handler)`
-callbacks. The async pattern we want:
+QUIC's first `.await` is a UDP datagram. Shipped API:
 
 ```rust
-let sock = uni::runtime::UdpSocket::bind(443).await?;
-loop {
-    let (src, payload) = sock.recv_from().await;
-    // QUIC handles packet
-}
-```
-
-### Shape
-
-Per-worker UDP "inbox" already exists for the callback path
-(`net::udp::bind`). Add a reactor layer:
-
-```rust
-// uni-runtime/src/net.rs (new module)
-pub struct UdpSocket { port: u16, /* waker slot per worker */ }
-
-pub struct UdpRecv<'a> { sock: &'a UdpSocket, /* … */ }
-
-impl Future for UdpRecv<'_> {
-    type Output = (Ipv4Addr, u16, Vec<u8>);
-    fn poll(...) -> Poll<Self::Output> {
-        // 1. check this worker's inbox for pending datagram on self.port
-        // 2. if empty: register cx.waker() as "wake-on-inbox"; Pending
-        // 3. if present: pop, return Ready
+UdpSocket::bind(7)?.run(|sock| async move {
+    let mut buf = [0u8; 1500];
+    loop {
+        let (src_ip, src_port, n) = sock.recv_from(&mut buf).await;
+        uni::udp_send(src_ip, 7, src_port, &buf[..n]);
     }
-}
+});
 ```
 
-### Backend hooks (new trait methods)
+`run` consumes the socket and arranges the async body to be spawned
+on every worker. "Bind without spawning per worker" and "spawn on
+the wrong number of workers" are both impossible by construction —
+the per-worker pattern can't be misused by accident. Lower-level
+`bind` + `recv_from` is still available for custom lifecycles.
 
-Added to `Runtime` from P3:
+**Reactor** lives in `uni-runtime/src/net.rs`. Each of the 8 socket
+slots owns a `PerCpu<WorkerInbox, MAX_WORKERS>`: every worker has
+its own 4-slot SPSC ring of 1500-byte datagram slots + a
+`SpinLock<Option<Waker>>`. Inbound datagrams push to the inbox of
+the worker that received them; `recv_from` pulls from the calling
+worker's inbox — no cross-core contention on the hot path. Static
+footprint: ~384 KB.
 
-```rust
-fn udp_bind(&self, port: u16) -> Result<UdpBindToken, ()>;
-fn udp_poll_recv(&self, token: &UdpBindToken, buf: &mut [u8])
-    -> Option<(Ipv4Addr, u16, usize)>;
-fn udp_register_waker(&self, token: &UdpBindToken, waker: Waker);
-```
+**Per-worker dispatch preserves multi-core distribution.** Bare-metal
+Tier 1 MQ distributes RX across cores by flow hash; native
+SO_REUSEPORT does the same across worker threads. The reactor
+preserves that fan-out to the async handler — one long-lived task
+per worker pulling its own stream, which is the pattern QUIC's
+per-connection dispatch needs.
 
-Backend wake path: when the network layer delivers a UDP packet
-to the inbox, it also calls the registered waker (if any). Same
-pattern the Sleep future uses.
+**Cancellation safety:** `UdpRecv::poll` does fast-path pop BEFORE
+waker register, then re-checks AFTER register. Closes the
+delivery-vs-registration race in both directions; dropping
+`UdpRecv` mid-await consumes no datagram. `UdpRecv` is `!Send`
+via `PhantomData<*mut ()>` so the future can't migrate across
+workers mid-await.
 
-### Steps
+**Delivery wiring:**
 
-1. **Extend `net::udp` delivery path** to allow a "waker sink"
-   alongside the existing handler callback. Both can coexist.
-2. **Add `UdpSocket` + `UdpRecv` to `//uni-runtime`.** Reactor
-   primitives live here, backed by Runtime trait hooks.
-3. **Native backend** implements the hooks on top of its existing
-   UDP sibling fd (`uni_backend::udp_bind`).
-4. **Bare-metal backend** implements on top of `net::udp::bind`
-   with an inbox queue for pending datagrams.
-5. **`apps/test_async`** grows a UDP echo variant that exercises
-   `recv_from().await → send()`.
+- Bare-metal: `net::udp::udp_receive` calls
+  `uni_runtime::net::deliver_udp` first; legacy `HANDLER_FNS`
+  callback registry is the fallback (DHCP still uses it).
+- Native: `drain_udp_sibling` calls `deliver_udp` first; legacy
+  `udp_bind(port, handler)` callback is the fallback. The POSIX
+  backend registers a `register_backend_bind` hook that opens
+  SO_REUSEPORT sibling fds when `UdpSocket::bind` runs.
 
-### Acceptance
+**Per-worker spawn mechanism.** `UdpSocket::run` stores a
+type-erased launcher closure in a per-port table. A single
+`spawn_on_each_worker` hook, registered lazily on the first `run`
+call, walks the table on each worker's first `tick()` and fires
+every live launcher — each launcher calls `spawn(body(sock))` on
+the calling worker. `spawn_on_each_worker` is also exposed
+publicly for apps that want the primitive without `UdpSocket`
+semantics.
 
-- [ ] `UdpSocket::bind(port).await?.recv_from().await` works on
-      HVF, QEMU ×2, and native.
-- [ ] Cancellation-safe: dropping the `UdpRecv` future mid-await
-      doesn't lose datagrams.
-
-### Estimated effort
-
-1–2 days. Scope risk: the "waker sink alongside callback"
-extension on the delivery path has to be careful. Budget for
-protocol-layer reading before the design freezes.
+**Validation:** `apps/webserver:test_udp_echo` uses
+`UdpSocket::bind(7).run(...)` end-to-end; passes on HVF, QEMU ×2,
+and native. `apps/test_async` has a bind/drop smoke for the
+registry mechanics.
 
 ---
 

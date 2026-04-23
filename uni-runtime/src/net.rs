@@ -1,63 +1,68 @@
-// uni-runtime/src/net.rs — UDP reactor.
+// uni-runtime/src/net.rs — UDP reactor with per-worker inboxes.
 //
-// `UdpSocket::bind(port)` claims one of `MAX_UDP_SOCKETS` static slots.
-// The socket owns a SPSC ring buffer of fixed-size datagram slots and
-// a single waker cell. The awaiting task's waker is stored there when
-// `UdpRecv` polls Pending; the network backend (bare-metal NIC
-// interrupt path on the unikernel, kqueue/epoll loop on native) calls
-// `deliver_udp(port, src_ip, src_port, payload)` once per inbound
-// datagram, which pushes the payload into the inbox and wakes the
-// task.
+// ## Model
 //
-// Cancellation-safety: `poll` does the fast-path pop BEFORE registering
-// a waker, and re-checks the inbox AFTER register — closes the
-// delivery-vs-registration race in both directions without ever
-// popping a datagram speculatively. Dropping `UdpRecv` mid-await
-// doesn't consume any datagram — they stay in the inbox for the next
-// `recv_from` call.
+// `UdpSocket::bind(port)` claims one of `MAX_UDP_SOCKETS` static
+// slots. Each slot owns `MAX_WORKERS` independent SPSC inboxes —
+// one per worker. Inbound datagrams are pushed into the inbox of
+// the worker that received them (bare-metal Tier 1: the core whose
+// RX queue fired; Tier 2: the distributor; native: the worker whose
+// kqueue/epoll fired for the sibling fd). `recv_from` pulls from
+// the calling worker's inbox.
+//
+// Packets delivered to worker N stay on worker N — no cross-core
+// push, no cross-core pop, no cross-core waker walk. The NIC's flow
+// hash already distributes traffic across workers; the reactor
+// preserves that fan-out all the way to the async handler.
+//
+// ## User API
+//
+// The common pattern — "run a per-worker handler loop" — is the
+// `run` method:
+//
+// ```rust
+// UdpSocket::bind(7)?.run(|sock| async move {
+//     let mut buf = [0u8; 1500];
+//     loop {
+//         let (ip, port, n) = sock.recv_from(&mut buf).await;
+//         uni::udp_send(ip, 7, port, &buf[..n]);
+//     }
+// });
+// ```
+//
+// `run` consumes the socket, leaks it to `&'static`, and arranges
+// the same async body to be spawned on every worker when that
+// worker's event loop starts. Forgetting to spawn-per-worker is
+// impossible — bind+spawn happen together.
+//
+// The lower-level `bind` + `recv_from` is still exposed for cases
+// that want custom lifecycle or multiple concurrent tasks sharing
+// the socket (one per worker, via `spawn_on_each_worker`).
 
-use core::cell::{Cell, UnsafeCell};
+use alloc::boxed::Box;
+use core::cell::UnsafeCell;
 use core::future::Future;
 use core::marker::PhantomData;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU16, AtomicU32, Ordering};
 use core::task::{Context, Poll, Waker};
 
 use atomic_fn::AtomicFn;
+use uni_percpu::{CurrentCore, PerCpu, MAX_WORKERS};
 
 // ---- Sizing -----------------------------------------------------------------
 
-/// Maximum concurrently-bound UDP sockets across the whole binary.
-/// 8 fits today's use (DHCP, QUIC, one or two app-level endpoints) and
-/// keeps the static backing footprint bounded.
 pub const MAX_UDP_SOCKETS: usize = 8;
-
-/// Inbox ring capacity per socket. Must be a power of two for the
-/// wrap-around math.
-const INBOX_CAPACITY: usize = 8;
-
-/// Max payload bytes per datagram. Ethernet MTU minus headers; we
-/// copy into fixed-size slots so the inbox has no heap dependency.
+const INBOX_CAPACITY: usize = 4;
 const MAX_PAYLOAD: usize = 1500;
 
-// ---- SpinLock ---------------------------------------------------------------
-//
-// Self-contained, CAS-based lock for the per-socket waker slot. The
-// waker is the only shared mutable state that can't be represented as
-// a plain atomic (it's a fat pointer + vtable), and the spinlock
-// region is tiny (clone / take). Wrote this here rather than depend
-// on `uni_kernel::sync::Spinlock` because `uni-runtime` must not
-// depend on `//kernel`.
+// ---- SpinLock (waker cell) --------------------------------------------------
 
 struct SpinLock<T> {
     locked: AtomicBool,
     data: UnsafeCell<T>,
 }
 
-// SAFETY: `SpinLock` only hands out guarded access to the contained
-// `T` one caller at a time, so a cross-thread `&SpinLock<T>` is sound
-// as long as `T: Send` (the lock transfers ownership of `&mut T`
-// across threads).
 unsafe impl<T: Send> Sync for SpinLock<T> {}
 
 struct SpinGuard<'a, T> {
@@ -105,7 +110,7 @@ impl<'a, T> Drop for SpinGuard<'a, T> {
     }
 }
 
-// ---- Datagram inbox ---------------------------------------------------------
+// ---- Datagram + worker inbox ------------------------------------------------
 
 #[repr(C)]
 struct Datagram {
@@ -124,28 +129,23 @@ impl Datagram {
     };
 }
 
-struct Inbox {
-    /// Port this inbox is bound to. `0` = slot free.
-    port: AtomicU16,
-    /// Consumer cursor (read by `pop_into`, incremented after a pop).
+/// One worker's view of a socket. Producer and consumer are the
+/// same worker in the common case: the delivery path runs on the
+/// core that received the packet, and the `recv_from` task awaits
+/// on that same worker.
+struct WorkerInbox {
     head: AtomicU32,
-    /// Producer cursor (read by `try_push`, incremented after a push).
     tail: AtomicU32,
-    /// Fixed-size ring of datagram slots. Producer owns `[tail..)`,
-    /// consumer owns `[head..tail)`.
     slots: UnsafeCell<[Datagram; INBOX_CAPACITY]>,
-    /// Waker registered by the awaiting task, fired by `deliver_udp`.
     waker: SpinLock<Option<Waker>>,
 }
 
-// SAFETY: slots is SPSC-disciplined via head/tail cursors (one
-// producer, one consumer); waker is SpinLock-guarded; port is atomic.
-unsafe impl Sync for Inbox {}
+unsafe impl Sync for WorkerInbox {}
+unsafe impl Send for WorkerInbox {}
 
-impl Inbox {
+impl WorkerInbox {
     const fn new() -> Self {
-        Inbox {
-            port: AtomicU16::new(0),
+        WorkerInbox {
             head: AtomicU32::new(0),
             tail: AtomicU32::new(0),
             slots: UnsafeCell::new([const { Datagram::ZERO }; INBOX_CAPACITY]),
@@ -153,9 +153,6 @@ impl Inbox {
         }
     }
 
-    /// Producer-side. Returns `true` iff the datagram was accepted.
-    /// Full inbox drops the datagram — same semantics as OS socket
-    /// buffer overrun.
     fn try_push(&self, src_ip: [u8; 4], src_port: u16, payload: &[u8]) -> bool {
         let tail = self.tail.load(Ordering::Relaxed);
         let head = self.head.load(Ordering::Acquire);
@@ -163,8 +160,7 @@ impl Inbox {
         if next == head {
             return false;
         }
-        // SAFETY: SPSC — the tail slot is owned by the producer until
-        // we Release the updated tail below.
+        // SAFETY: SPSC — producer owns the tail slot until Release store below.
         let slots = unsafe { &mut *self.slots.get() };
         let slot = &mut slots[tail as usize];
         slot.src_ip = src_ip;
@@ -176,16 +172,13 @@ impl Inbox {
         true
     }
 
-    /// Consumer-side. Copies one datagram into `buf`; returns
-    /// `(src_ip, src_port, bytes_written)` or `None` if empty.
     fn pop_into(&self, buf: &mut [u8]) -> Option<([u8; 4], u16, usize)> {
         let head = self.head.load(Ordering::Relaxed);
         let tail = self.tail.load(Ordering::Acquire);
         if head == tail {
             return None;
         }
-        // SAFETY: SPSC — the head slot is owned by the consumer until
-        // we Release the updated head below.
+        // SAFETY: SPSC — consumer owns the head slot until Release store below.
         let slots = unsafe { &*self.slots.get() };
         let slot = &slots[head as usize];
         let n = (slot.len as usize).min(buf.len());
@@ -195,30 +188,45 @@ impl Inbox {
         self.head.store(next, Ordering::Release);
         Some(r)
     }
+
+    fn reset(&self) {
+        self.head.store(0, Ordering::Relaxed);
+        self.tail.store(0, Ordering::Relaxed);
+        *self.waker.lock() = None;
+    }
 }
 
-// ---- Registry ---------------------------------------------------------------
+// ---- Per-port state ---------------------------------------------------------
 
-static REGISTRY: [Inbox; MAX_UDP_SOCKETS] = [const { Inbox::new() }; MAX_UDP_SOCKETS];
+struct SocketState {
+    port: AtomicU16,
+    inboxes: PerCpu<WorkerInbox, MAX_WORKERS>,
+}
+
+const fn fresh_inboxes() -> [WorkerInbox; MAX_WORKERS] {
+    [const { WorkerInbox::new() }; MAX_WORKERS]
+}
+
+impl SocketState {
+    const fn new() -> Self {
+        SocketState {
+            port: AtomicU16::new(0),
+            inboxes: PerCpu::new(fresh_inboxes()),
+        }
+    }
+}
+
+static REGISTRY: [SocketState; MAX_UDP_SOCKETS] =
+    [const { SocketState::new() }; MAX_UDP_SOCKETS];
 
 // ---- Backend plug-in for bind-time setup ------------------------------------
-//
-// On bare-metal this stays unset — the NIC RX path delivers every
-// inbound UDP datagram to `net::udp::udp_receive` which calls
-// `deliver_udp` unconditionally, so a socket just has to exist in
-// the registry.
-//
-// On native, OS sockets don't exist until somebody calls bind. The
-// hook lets the POSIX backend open SO_REUSEPORT sibling fds for the
-// port and plumb them into each worker's kqueue/epoll. A return of
-// `Err(())` means the OS refused (port already bound by another
-// process, etc.) and the `UdpSocket::bind` call propagates the
-// failure as `UdpBindError::BackendFailed`.
 
 static BACKEND_BIND: AtomicFn<fn(port: u16) -> Result<(), ()>> = AtomicFn::null();
 
-/// Register the backend-side bind hook. Called once at boot by the
-/// backend that needs to do work when a `UdpSocket` is created.
+/// Register the backend-side bind hook. On bare-metal this stays
+/// unset — the NIC RX path unconditionally delivers to
+/// `deliver_udp`. On native, the POSIX backend registers a hook
+/// that opens SO_REUSEPORT sibling fds for each `UdpSocket::bind`.
 pub fn register_backend_bind(hook: fn(port: u16) -> Result<(), ()>) {
     BACKEND_BIND.store(hook);
 }
@@ -227,27 +235,24 @@ pub fn register_backend_bind(hook: fn(port: u16) -> Result<(), ()>) {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UdpBindError {
-    /// No free socket slot (all `MAX_UDP_SOCKETS` in use).
     AllSlotsBusy,
-    /// Another `UdpSocket` is already bound to this port.
     PortInUse,
-    /// `port == 0` — not a valid bind target.
     InvalidPort,
     /// Backend-side bind step failed (native OS refused to open the
     /// SO_REUSEPORT sibling sockets for this port).
     BackendFailed,
 }
 
-/// A UDP socket bound to one port. Dropping releases the slot.
-/// Not `Clone` / not `Sync`: the associated inbox has a single
-/// waker cell, so two concurrent `recv_from` callers would clobber
-/// each other's waker. One task per socket. The `PhantomData<Cell<()>>`
-/// carries the `!Sync` auto-trait opt-out without touching the
-/// unstable `negative_impls` feature.
+/// A UDP socket bound to one port. Created with `bind`; the typical
+/// pattern is to call `.run(|sock| async move { ... })` on it
+/// immediately, which consumes the socket and spawns a per-worker
+/// handler task.
+///
+/// For custom lifecycle, use `bind` + manual `spawn_on_each_worker`
+/// with `&'static UdpSocket`, holding onto the socket explicitly.
 pub struct UdpSocket {
     port: u16,
     idx: usize,
-    _not_sync: PhantomData<Cell<()>>,
 }
 
 impl UdpSocket {
@@ -255,43 +260,27 @@ impl UdpSocket {
         if port == 0 {
             return Err(UdpBindError::InvalidPort);
         }
-        // First scan for a duplicate bind.
-        for inbox in REGISTRY.iter() {
-            if inbox.port.load(Ordering::Acquire) == port {
+        for state in REGISTRY.iter() {
+            if state.port.load(Ordering::Acquire) == port {
                 return Err(UdpBindError::PortInUse);
             }
         }
-        // Then claim a free slot via CAS on `port` (0 → port).
-        for (idx, inbox) in REGISTRY.iter().enumerate() {
-            if inbox
+        for (idx, state) in REGISTRY.iter().enumerate() {
+            if state
                 .port
                 .compare_exchange(0, port, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
-                // Reset per-slot state in case this slot was used
-                // before and released. SPSC cursors only need to be
-                // consistent with each other; any stale datagram
-                // bytes are overwritten before the next `pop_into`
-                // reads them (producer writes len + payload first,
-                // consumer reads them after).
-                inbox.head.store(0, Ordering::Relaxed);
-                inbox.tail.store(0, Ordering::Relaxed);
-                *inbox.waker.lock() = None;
-                // Let the backend do any port-specific setup (open
-                // OS sockets on native). Bare-metal's NIC path already
-                // delivers every inbound datagram regardless of who's
-                // bound, so the hook stays unregistered there.
+                for w in 0..MAX_WORKERS as u32 {
+                    state.inboxes.at(w).reset();
+                }
                 if let Some(hook) = BACKEND_BIND.load() {
                     if hook(port).is_err() {
-                        inbox.port.store(0, Ordering::Release);
+                        state.port.store(0, Ordering::Release);
                         return Err(UdpBindError::BackendFailed);
                     }
                 }
-                return Ok(UdpSocket {
-                    port,
-                    idx,
-                    _not_sync: PhantomData,
-                });
+                return Ok(UdpSocket { port, idx });
             }
         }
         Err(UdpBindError::AllSlotsBusy)
@@ -302,30 +291,65 @@ impl UdpSocket {
         self.port
     }
 
-    /// Await one datagram on this socket. The copy into `buf`
-    /// happens on the single poll that returns `Ready`. Returns
-    /// `(src_ip, src_port, bytes_written)`. Truncates oversized
-    /// payloads to `buf.len()`.
+    /// Await one datagram on the **calling worker's** inbox. The
+    /// copy into `buf` happens on the single poll that returns
+    /// `Ready`. Oversized payloads truncate to `buf.len()`.
     pub fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> UdpRecv<'a> {
-        UdpRecv { sock: self, buf }
+        UdpRecv {
+            sock: self,
+            buf,
+            _not_send: PhantomData,
+        }
+    }
+
+    /// Spawn `body` as a long-lived task on each worker. The closure
+    /// is called per worker (on that worker) with the same shared
+    /// `&'static UdpSocket`; since `recv_from` reads from the caller's
+    /// own inbox, each worker ends up consuming only packets that
+    /// landed on its own core — preserving multi-core distribution
+    /// all the way to the handler.
+    ///
+    /// Consumes the socket: the port stays claimed for the process
+    /// lifetime. Apps that need manual lifecycle control should use
+    /// `bind` + `spawn_on_each_worker` directly.
+    pub fn run<H, F>(self, body: H)
+    where
+        H: Fn(&'static UdpSocket) -> F + Send + Sync + 'static,
+        F: Future<Output = ()> + 'static,
+    {
+        let idx = self.idx;
+        let leaked: &'static UdpSocket = Box::leak(Box::new(self));
+        // Launcher: captures the leaked socket, produces one future
+        // per call, hands it to `spawn` which puts it in the calling
+        // worker's arena.
+        let launcher: BoxedLauncher = Box::new(move || {
+            let fut = body(leaked);
+            let _ = crate::spawn(fut);
+        });
+        // Outer box: `AtomicPtr<T>` needs `T: Sized`, so we store a
+        // thin pointer to the heap-alloc'd fat pointer.
+        let outer: Box<BoxedLauncher> = Box::new(launcher);
+        LAUNCHERS[idx].store(Box::into_raw(outer), Ordering::Release);
+        ensure_launcher_hook_registered();
     }
 }
 
-impl Drop for UdpSocket {
-    fn drop(&mut self) {
-        let inbox = &REGISTRY[self.idx];
-        // Clear the waker first so any in-flight `deliver_udp` for
-        // this slot can't wake a stale task after we release the
-        // port. Order: waker → port, mirroring the order a new
-        // `bind` observes them in its pre-claim scan.
-        *inbox.waker.lock() = None;
-        inbox.port.store(0, Ordering::Release);
-    }
-}
+// `UdpSocket` deliberately does NOT implement `Drop`. `bind` +
+// `run` is the intended lifecycle; `run` consumes self. The lower-
+// level `bind` without `run` also leaks — port slots are intended
+// to be permanent allocations. If explicit release becomes needed
+// later, add a dedicated `release()` method rather than repurposing
+// `Drop`.
 
+/// The UdpRecv future holds a mutable borrow of the caller's buffer
+/// plus a shared ref to the socket. `!Send + !Sync` via
+/// `PhantomData<*mut ()>` so the future can't migrate across workers
+/// mid-await — the per-worker inbox semantics depend on staying on
+/// the worker where we first polled.
 pub struct UdpRecv<'a> {
     sock: &'a UdpSocket,
     buf: &'a mut [u8],
+    _not_send: PhantomData<*mut ()>,
 }
 
 impl<'a> Future for UdpRecv<'a> {
@@ -333,48 +357,37 @@ impl<'a> Future for UdpRecv<'a> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let inbox = &REGISTRY[this.sock.idx];
+        let cc = CurrentCore::enter();
+        let inbox = REGISTRY[this.sock.idx].inboxes.current(&cc);
 
-        // Fast path: data already in the inbox. Avoids the waker
-        // clone / spinlock in the common case.
+        // Fast path: data already in this worker's inbox.
         if let Some(r) = inbox.pop_into(this.buf) {
             return Poll::Ready(r);
         }
-
-        // Slow path: register the waker, then re-check. The re-check
-        // closes the race where `deliver_udp` pushed a datagram
-        // between the fast-path pop_into and the waker registration
-        // — without it, the task would sleep despite data sitting in
-        // the inbox.
+        // Slow path: register the waker, then re-check — closes the
+        // race where `deliver_udp` pushed between the fast-path pop
+        // and the waker registration.
         *inbox.waker.lock() = Some(cx.waker().clone());
         if let Some(r) = inbox.pop_into(this.buf) {
-            // Completing now, clear the waker so we don't get an
-            // unnecessary wake later.
             *inbox.waker.lock() = None;
             return Poll::Ready(r);
         }
-
         Poll::Pending
     }
 }
 
 // ---- Backend entry point ----------------------------------------------------
 
-/// Deliver one inbound UDP datagram to whichever `UdpSocket` is
-/// bound to `dst_port`. Called from the network RX path — bare-metal
-/// `net::udp::udp_receive` on the unikernel, `drain_udp_sibling` on
-/// native. Returns `true` if a socket was found (accepting or
-/// dropping the datagram), `false` otherwise.
-///
-/// A full inbox drops the datagram but still fires the waker — any
-/// pending `UdpRecv` gets a chance to drain what's already there.
+/// Deliver one inbound UDP datagram on the **calling worker**'s
+/// view of whichever `UdpSocket` is bound to `dst_port`. Must be
+/// called from the network RX path on the core that received the
+/// packet. Returns `true` if a socket was found.
 pub fn deliver_udp(dst_port: u16, src_ip: [u8; 4], src_port: u16, payload: &[u8]) -> bool {
-    for inbox in REGISTRY.iter() {
-        if inbox.port.load(Ordering::Acquire) == dst_port {
+    let cc = CurrentCore::enter();
+    for state in REGISTRY.iter() {
+        if state.port.load(Ordering::Acquire) == dst_port {
+            let inbox = state.inboxes.current(&cc);
             let _ = inbox.try_push(src_ip, src_port, payload);
-            // Fire the waker (if registered) regardless of push
-            // success — a full inbox means the task needs to drain;
-            // waking it lets it catch up.
             let taken = inbox.waker.lock().take();
             if let Some(waker) = taken {
                 waker.wake();
@@ -383,4 +396,50 @@ pub fn deliver_udp(dst_port: u16, src_ip: [u8; 4], src_port: u16, payload: &[u8]
         }
     }
     false
+}
+
+// ---- Per-worker launcher table ----------------------------------------------
+//
+// `UdpSocket::run(body)` stores a type-erased launcher closure in
+// `LAUNCHERS[idx]`. A single `spawn_on_each_worker` hook, registered
+// lazily on the first `run` call, walks the table on each worker's
+// first tick and fires every live launcher — each launcher calls
+// `spawn(body(sock))` on the calling worker.
+//
+// Storage is `AtomicPtr<Box<dyn Fn...>>`: the atomic holds a thin
+// pointer to a heap-allocated `Box` (which in turn is the fat
+// pointer to the closure). `AtomicPtr<T>` requires `T: Sized`;
+// `Box<dyn Fn>` is sized (a fat pointer is still `Sized`). Leaking
+// the `Box` keeps the launcher heap-alive for the process lifetime
+// — matches `run`'s consume-the-socket contract.
+
+type BoxedLauncher = Box<dyn Fn() + Send + Sync + 'static>;
+
+static LAUNCHERS: [AtomicPtr<BoxedLauncher>; MAX_UDP_SOCKETS] =
+    [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_UDP_SOCKETS];
+
+static LAUNCHER_HOOK_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+fn ensure_launcher_hook_registered() {
+    if LAUNCHER_HOOK_REGISTERED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        crate::spawn_on_each_worker(fire_launchers);
+    }
+}
+
+fn fire_launchers() {
+    for slot in LAUNCHERS.iter() {
+        let p = slot.load(Ordering::Acquire);
+        if p.is_null() {
+            continue;
+        }
+        // SAFETY: `p` was obtained from `Box::into_raw(Box::new(
+        // BoxedLauncher{..}))` in `UdpSocket::run`. The outer box is
+        // leaked (never freed). Release/Acquire pairs the store and
+        // load.
+        let launcher: &BoxedLauncher = unsafe { &*p };
+        launcher();
+    }
 }

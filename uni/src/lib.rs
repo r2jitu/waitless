@@ -177,7 +177,7 @@ pub use uni_backend::{
 /// Re-export of the shared async runtime. `use uni::runtime::spawn;`
 /// works on both unikernel and native.
 pub mod runtime {
-    pub use uni_backend::runtime::{sleep_us, spawn, Sleep};
+    pub use uni_backend::runtime::{sleep_us, spawn, spawn_on_each_worker, Sleep};
     pub use uni_runtime::net::{UdpBindError, UdpRecv, UdpSocket};
 }
 

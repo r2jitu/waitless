@@ -66,19 +66,14 @@ impl WebServerApp {
 
         match uni::runtime::UdpSocket::bind(7) {
             Ok(sock) => {
-                if uni::runtime::spawn(async move {
+                sock.run(|sock| async move {
                     let mut buf = [0u8; 1500];
                     loop {
                         let (src_ip, src_port, n) = sock.recv_from(&mut buf).await;
                         uni::udp_send(src_ip, 7, src_port, &buf[..n]);
                     }
-                })
-                .is_err()
-                {
-                    uni::log(b"UDP echo: spawn FAILED\n");
-                } else {
-                    uni::log(b"UDP echo server on port 7 (async)\n");
-                }
+                });
+                uni::log(b"UDP echo server on port 7 (async, per-worker)\n");
             }
             Err(_) => uni::log(b"UDP echo: bind FAILED\n"),
         }

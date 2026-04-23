@@ -6,6 +6,8 @@ extern crate alloc;
 
 pub mod net;
 
+use atomic_fn::AtomicFn;
+
 use alloc::boxed::Box;
 use core::cell::UnsafeCell;
 use core::future::Future;
@@ -143,6 +145,27 @@ fn make_waker_for(slot: *const TaskSlot) -> Waker {
     unsafe { Waker::from_raw(raw) }
 }
 
+// ---- Per-worker startup hook ----------------------------------------------
+//
+// `spawn_on_each_worker(f)` fires `f` exactly once on each worker,
+// on that worker, on its first `tick`. Inside `f`, `spawn()` lands
+// the task in the running worker's arena. Common pattern for
+// long-lived per-core reactors (UDP/QUIC handlers). Internally used
+// by `net::UdpSocket::run`.
+
+static PER_WORKER_STARTUP: AtomicFn<fn()> = AtomicFn::null();
+static STARTUP_FIRED: [AtomicBool; MAX_WORKERS] =
+    [const { AtomicBool::new(false) }; MAX_WORKERS];
+
+/// Register `f` to run exactly once on each worker, on that worker,
+/// on the first event-loop tick. At most one hook may be registered
+/// per process — higher-level APIs (`net::UdpSocket::run`) that
+/// need to accumulate multiple callbacks manage their own launcher
+/// table and register a single fan-out hook here.
+pub fn spawn_on_each_worker(f: fn()) {
+    PER_WORKER_STARTUP.store(f);
+}
+
 // ---- Event-loop entry points ----------------------------------------------
 
 /// Advance this worker's timer wheel (firing expired timers, which
@@ -155,6 +178,16 @@ pub fn tick(worker_id: u32) -> bool {
     }
     // SAFETY: caller guarantees `worker_id` is the running worker.
     let cc = unsafe { CurrentCore::from_id_unchecked(worker_id) };
+
+    // First tick on this worker: fire the per-worker startup hook
+    // so tasks registered via `spawn_on_each_worker` land in this
+    // worker's arena.
+    if !STARTUP_FIRED[worker_id as usize].swap(true, Ordering::Relaxed) {
+        if let Some(f) = PER_WORKER_STARTUP.load() {
+            f();
+        }
+    }
+
     let _ = wheel(&cc).advance(now_ticks());
 
     let arena = ARENAS.at(worker_id);
