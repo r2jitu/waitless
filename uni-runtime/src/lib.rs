@@ -12,7 +12,7 @@ use alloc::boxed::Box;
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use uni_percpu::timer::{Timer, TimerWheel};
@@ -40,11 +40,11 @@ fn wheel(cc: &CurrentCore) -> &mut TimerWheel {
 // ---- Task arena ------------------------------------------------------------
 
 pub const TASKS_PER_WORKER: usize = 64;
+const _: () = assert!(TASKS_PER_WORKER <= 64, "ready_bits is u64");
 
 type BoxedFuture = Pin<Box<dyn Future<Output = ()>>>;
 
 pub struct TaskSlot {
-    ready: AtomicBool,
     used: AtomicBool,
     future: UnsafeCell<Option<BoxedFuture>>,
 }
@@ -52,28 +52,32 @@ pub struct TaskSlot {
 impl TaskSlot {
     const fn new() -> Self {
         TaskSlot {
-            ready: AtomicBool::new(false),
             used: AtomicBool::new(false),
             future: UnsafeCell::new(None),
         }
     }
 }
 
-// SAFETY: `ready` / `used` are atomic; `future` is mutated only by
-// the owning worker (CAS on `used` serialises producers; polling
-// runs on the same worker that spawned).
+// SAFETY: `used` is atomic; `future` is mutated only by the owning
+// worker (CAS on `used` serialises producers; polling runs on the
+// same worker that spawned).
 unsafe impl Sync for TaskSlot {}
 unsafe impl Send for TaskSlot {}
 
-#[repr(transparent)]
 pub struct TaskArena {
     slots: [TaskSlot; TASKS_PER_WORKER],
+    /// Per-arena ready bitmap — bit `i` set iff slot `i` is scheduled
+    /// to poll. Waker fires the bit; `tick` reads-and-clears the whole
+    /// word then iterates set bits via `trailing_zeros`. O(ready) work
+    /// per tick instead of O(TASKS_PER_WORKER).
+    ready_bits: AtomicU64,
 }
 
 impl TaskArena {
     const fn new() -> Self {
         TaskArena {
             slots: [const { TaskSlot::new() }; TASKS_PER_WORKER],
+            ready_bits: AtomicU64::new(0),
         }
     }
 }
@@ -93,18 +97,18 @@ where
     let arena = ARENAS.current(&cc);
     let fut: BoxedFuture = Box::pin(f);
     let mut fut_opt = Some(fut);
-    for slot in arena.slots.iter() {
+    for (idx, slot) in arena.slots.iter().enumerate() {
         if slot
             .used
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
         {
             // SAFETY: the CAS gives us exclusive access until we
-            // publish via `ready`.
+            // publish via the ready bit below.
             unsafe {
                 *slot.future.get() = fut_opt.take();
             }
-            slot.ready.store(true, Ordering::Release);
+            arena.ready_bits.fetch_or(1u64 << idx, Ordering::Release);
             return Ok(());
         }
     }
@@ -112,6 +116,20 @@ where
 }
 
 // ---- Waker vtable ----------------------------------------------------------
+//
+// `data: *const ()` is repurposed as a packed `(worker_id, slot_idx)`
+// integer (not a real pointer). Bits [0..6]: slot_idx (0..=63). Bits
+// [8..]: worker_id. The vtable is compile-time fixed, so knowing the
+// two indices is enough to locate the arena's ready_bits via
+// `ARENAS.at(worker_id)` and OR-in the bit.
+//
+// Packing as an integer avoids pointer-stability concerns (TaskSlot
+// is in a `static`, fine today, but this is simpler) and keeps
+// wake-site work to a single `fetch_or` — no indirection, no
+// per-slot AtomicBool scan.
+
+const WAKER_SLOT_MASK: usize = 0xFF;
+const WAKER_WORKER_SHIFT: u32 = 8;
 
 static WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     waker_clone,
@@ -129,19 +147,25 @@ fn waker_wake(data: *const ()) {
 }
 
 fn waker_wake_by_ref(data: *const ()) {
-    let slot = data as *const TaskSlot;
-    // SAFETY: `data` points into static ARENAS.
-    unsafe {
-        (*slot).ready.store(true, Ordering::Release);
+    let packed = data as usize;
+    let slot_idx = packed & WAKER_SLOT_MASK;
+    let worker_id = (packed >> WAKER_WORKER_SHIFT) as u32;
+    if (worker_id as usize) >= MAX_WORKERS || slot_idx >= TASKS_PER_WORKER {
+        return;
     }
+    ARENAS
+        .at(worker_id)
+        .ready_bits
+        .fetch_or(1u64 << slot_idx, Ordering::Release);
 }
 
 fn waker_drop(_data: *const ()) {}
 
-fn make_waker_for(slot: *const TaskSlot) -> Waker {
-    let raw = RawWaker::new(slot as *const (), &WAKER_VTABLE);
-    // SAFETY: vtable meets the RawWaker contract; data is a valid,
-    // 'static pointer.
+fn make_waker_for(worker_id: u32, slot_idx: usize) -> Waker {
+    let packed = ((worker_id as usize) << WAKER_WORKER_SHIFT) | (slot_idx & WAKER_SLOT_MASK);
+    let raw = RawWaker::new(packed as *const (), &WAKER_VTABLE);
+    // SAFETY: vtable meets the RawWaker contract; `data` is an
+    // integer bit-pattern, never dereferenced as a pointer.
     unsafe { Waker::from_raw(raw) }
 }
 
@@ -215,16 +239,22 @@ pub fn tick(worker_id: u32) -> bool {
     let _ = wheel(&cc).advance(now_ticks());
 
     let arena = ARENAS.at(worker_id);
+    // Atomically take the current ready bitmap. Wakes that fire
+    // *during* this tick flip fresh bits for the next iteration.
+    let mut ready = arena.ready_bits.swap(0, Ordering::AcqRel);
     let mut did_work = false;
-    for slot in arena.slots.iter() {
+    while ready != 0 {
+        let slot_idx = ready.trailing_zeros() as usize;
+        ready &= ready - 1;
+        let slot = &arena.slots[slot_idx];
+        // Spurious wakes on freed slots are possible if an external
+        // reference fires a stale waker after the task completed.
+        // `used` guards the slot's future storage.
         if !slot.used.load(Ordering::Acquire) {
             continue;
         }
-        if !slot.ready.swap(false, Ordering::AcqRel) {
-            continue;
-        }
         did_work = true;
-        poll_slot(slot);
+        poll_slot(slot, worker_id, slot_idx);
     }
     did_work
 }
@@ -240,15 +270,11 @@ pub fn has_pending(worker_id: u32) -> bool {
     if wheel(&cc).count() > 0 {
         return true;
     }
-    ARENAS
-        .at(worker_id)
-        .slots
-        .iter()
-        .any(|s| s.ready.load(Ordering::Acquire))
+    ARENAS.at(worker_id).ready_bits.load(Ordering::Acquire) != 0
 }
 
-fn poll_slot(slot: &TaskSlot) {
-    let waker = make_waker_for(slot as *const TaskSlot);
+fn poll_slot(slot: &TaskSlot, worker_id: u32, slot_idx: usize) {
+    let waker = make_waker_for(worker_id, slot_idx);
     let mut cx = Context::from_waker(&waker);
 
     // SAFETY: only the owning worker polls its slots.
