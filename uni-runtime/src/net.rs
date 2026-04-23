@@ -302,17 +302,38 @@ impl UdpSocket {
         }
     }
 
-    /// Spawn `body` as a long-lived task on each worker. The closure
-    /// is called per worker (on that worker) with the same shared
-    /// `&'static UdpSocket`; since `recv_from` reads from the caller's
-    /// own inbox, each worker ends up consuming only packets that
-    /// landed on its own core — preserving multi-core distribution
-    /// all the way to the handler.
+    /// Convenience: per-datagram sync handler. The framework owns
+    /// the receive loop; `handler` is called once per inbound
+    /// datagram on the worker that received it. For async
+    /// per-datagram work (e.g. DB lookups), use `run_loop` instead.
     ///
-    /// Consumes the socket: the port stays claimed for the process
-    /// lifetime. Apps that need manual lifecycle control should use
-    /// `bind` + `spawn_on_each_worker` directly.
-    pub fn run<H, F>(self, body: H)
+    /// `handler` is `Fn`, called concurrently across workers. State
+    /// across calls should live in `PerCpu<T, MAX_WORKERS>` or use
+    /// interior mutability.
+    pub fn run_each<H>(self, handler: H)
+    where
+        H: Fn([u8; 4], u16, &[u8]) + Send + Sync + 'static,
+    {
+        // Leak the handler to `&'static` so each worker's spawn
+        // can move a copy of the reference into its async block —
+        // the outer closure we hand to `run_loop` is `Fn`, which
+        // can't yield a borrow to its inner async state.
+        let handler: &'static H = Box::leak(Box::new(handler));
+        self.run_loop(move |sock| async move {
+            let mut buf = [0u8; MAX_PAYLOAD];
+            loop {
+                let (src_ip, src_port, n) = sock.recv_from(&mut buf).await;
+                handler(src_ip, src_port, &buf[..n]);
+            }
+        })
+    }
+
+    /// Escape hatch: custom async body, spawned once per worker.
+    /// The body receives `&'static UdpSocket` and typically loops on
+    /// `recv_from` to drive the per-worker inbox. Use this when the
+    /// sync `run_each` doesn't fit (async per-datagram work, batched
+    /// reads, cross-message state not expressible via `PerCpu`).
+    pub fn run_loop<H, F>(self, body: H)
     where
         H: Fn(&'static UdpSocket) -> F + Send + Sync + 'static,
         F: Future<Output = ()> + 'static,

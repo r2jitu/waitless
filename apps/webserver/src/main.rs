@@ -66,12 +66,8 @@ impl WebServerApp {
 
         match uni::runtime::UdpSocket::bind(7) {
             Ok(sock) => {
-                sock.run(|sock| async move {
-                    let mut buf = [0u8; 1500];
-                    loop {
-                        let (src_ip, src_port, n) = sock.recv_from(&mut buf).await;
-                        uni::udp_send(src_ip, 7, src_port, &buf[..n]);
-                    }
+                sock.run_each(|src_ip, src_port, data| {
+                    uni::udp_send(src_ip, 7, src_port, data);
                 });
                 uni::log(b"UDP echo server on port 7 (async, per-worker)\n");
             }
