@@ -28,6 +28,16 @@
     "rust-analyzer.check.overrideCommand": [],
     "rust-analyzer.cargo.buildScripts.enable": false,
 
+    // Pin rust-analyzer's sysroot probe to stable cargo. Without
+    // this, r-a sets RUSTUP_TOOLCHAIN to the rules_rust-bundled
+    // rustc version (e.g. 1.93.1) when running `cargo metadata`;
+    // if that toolchain isn't installed via rustup, the shim
+    // falls back to nightly, whose cargo may no longer accept
+    // --lockfile-path, breaking project load.
+    "rust-analyzer.cargo.extraEnv": {
+        "CARGO": "/Users/jitudas/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo"
+    },
+
     // Show inlay hints for type information in the editor margin.
     "rust-analyzer.inlayHints.typeHints.enable": true,
     "rust-analyzer.inlayHints.parameterHints.enable": true
