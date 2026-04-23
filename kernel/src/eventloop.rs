@@ -120,10 +120,15 @@ pub fn run(core_id: u32) -> ! {
     // How many no-work iterations to spin through before arming the
     // next RX IRQ and going idle. Each iteration is a full poll +
     // drain + service cycle and costs ~200ns; 64 iterations is
-    // ~13µs, longer than one KVM exit+enter round-trip, so a client
-    // sending keep-alive requests is almost guaranteed to catch the
-    // next packet without an IRQ. Tunable — higher values burn more
-    // CPU on idle, lower values hurt single-flow throughput.
+    // ~13 µs, longer than one KVM exit+enter round-trip, so a
+    // client sending keep-alive requests is almost guaranteed to
+    // catch the next packet without an IRQ. Tunable — higher values
+    // burn more CPU on idle, lower values hurt single-flow
+    // throughput. Profiling 2 c udp_peak on HVF showed that
+    // widening this (1024, u32::MAX) didn't move the needle — the
+    // regression is host-side (macOS SO_REUSEPORT UDP hashing
+    // imbalance and/or Hypervisor.framework vCPU scheduling), not
+    // guest-side yield-poll overhead.
     const IDLE_SPIN_BEFORE_HLT: u32 = 64;
 
     loop {
