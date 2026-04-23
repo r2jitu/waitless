@@ -1115,8 +1115,9 @@ pub fn run_worker(worker_id: u32) {
             if f(worker_id) { did_work = true; }
         }
 
-        // 2a. Async runtime: poll spawned futures. Parallels the
-        // unikernel's `kernel::executor::tick`.
+        // 2a. Async runtime: every worker advances its own timer
+        // list and polls its own arena — same per-core pattern as
+        // the unikernel, driven by `uni_executor` under the hood.
         if executor::tick(worker_id) { did_work = true; }
 
         // 3. Idle if no work

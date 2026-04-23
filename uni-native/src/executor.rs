@@ -1,111 +1,126 @@
-// uni-native/src/executor.rs — Native backend for `uni::executor`.
+// uni-native/src/executor.rs — Native (POSIX) backend for `uni-executor`.
 //
-// Minimal single-threaded async runtime mirroring `kernel::executor`'s
-// shape for the host POSIX build. Polled from worker 0's run loop;
-// other workers skip the tick. Sleep futures resolve by wall-clock
-// deadline and are re-polled at each loop iteration — `run_worker`'s
-// 10 ms `wait_for_events` timeout bounds the wake latency, same role
-// that the CNTV / TSC-spin idle plays on the unikernel.
+// Per-worker timer storage + the four `extern "C"` hooks the shared
+// runtime expects. Each worker thread calls `tick(worker_id)` from
+// `run_worker`; that advances this worker's timer list, fires any
+// expired callbacks (which wake their tasks via `Sleep` → waker),
+// then hands off to `uni_executor::tick` for the poll scan.
+//
+// Timer storage: one `Mutex<Vec<NativeTimer>>` per worker. The mutex
+// is uncontended in the common path (owning worker only) — it's there
+// to give the static the `Send + Sync` it needs to live at global
+// scope.
 
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Wake, Waker};
-use std::time::{Duration, Instant};
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
-type BoxedFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+use uni_executor::MAX_WORKERS;
 
-struct TaskSlot {
-    /// Set by wakers, consulted (but not required) by `tick`. The
-    /// native tick polls every live task regardless, because without
-    /// a central timer wheel we have no better way to drive `Sleep`
-    /// re-polls. See module doc for the trade-off.
-    ready: AtomicBool,
-    future: Mutex<Option<BoxedFuture>>,
+// ---- Monotonic tick source -------------------------------------------------
+
+fn start() -> Instant {
+    static S: OnceLock<Instant> = OnceLock::new();
+    *S.get_or_init(Instant::now)
 }
 
-impl Wake for TaskSlot {
-    fn wake(self: Arc<Self>) {
-        self.ready.store(true, Ordering::Release);
-    }
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.ready.store(true, Ordering::Release);
+fn now_us() -> u64 {
+    Instant::now().duration_since(start()).as_micros() as u64
+}
+
+// ---- Per-worker timer storage ----------------------------------------------
+
+struct NativeTimer {
+    deadline: u64,
+    func: extern "C" fn(usize),
+    arg: usize,
+}
+
+struct TimerList(Mutex<Vec<NativeTimer>>);
+
+impl TimerList {
+    const fn new() -> Self {
+        TimerList(Mutex::new(Vec::new()))
     }
 }
 
-static TASKS: Mutex<Vec<Arc<TaskSlot>>> = Mutex::new(Vec::new());
+static TIMERS: [TimerList; MAX_WORKERS] = [const { TimerList::new() }; MAX_WORKERS];
 
-/// Spawn a future onto the native executor's task list.
-pub fn spawn<F>(f: F) -> Result<(), ()>
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    let slot = Arc::new(TaskSlot {
-        ready: AtomicBool::new(true),
-        future: Mutex::new(Some(Box::pin(f))),
-    });
-    TASKS.lock().unwrap().push(slot);
-    Ok(())
-}
-
-/// Poll every live task, drop any that reported `Ready`. Runs from
-/// worker 0; other workers no-op (native tasks aren't thread-pinned
-/// but there's no reason to have every worker contending on the
-/// task list for the handful of futures a smoke test spawns).
-pub fn tick(worker_id: u32) -> bool {
-    if worker_id != 0 {
-        return false;
-    }
-    let snapshot: Vec<Arc<TaskSlot>> = {
-        let guard = TASKS.lock().unwrap();
-        guard.iter().cloned().collect()
-    };
-    let mut completed = false;
-    for slot in snapshot.iter() {
-        slot.ready.store(false, Ordering::Release);
-        let waker = Waker::from(Arc::clone(slot));
-        let mut cx = Context::from_waker(&waker);
-        let mut guard = slot.future.lock().unwrap();
-        if let Some(fut) = guard.as_mut() {
-            match fut.as_mut().poll(&mut cx) {
-                Poll::Pending => {}
-                Poll::Ready(()) => {
-                    *guard = None;
-                    completed = true;
-                }
+fn advance(worker_id: u32, now: u64) {
+    let list = &TIMERS[worker_id as usize];
+    // Collect expired timers under the lock, fire them after releasing
+    // so a timer callback that re-schedules doesn't deadlock.
+    let fired: Vec<NativeTimer> = {
+        let mut guard = list.0.lock().unwrap();
+        let mut i = 0;
+        let mut out = Vec::new();
+        while i < guard.len() {
+            if guard[i].deadline <= now {
+                out.push(guard.remove(i));
+            } else {
+                i += 1;
             }
         }
-    }
-    if completed {
-        TASKS
-            .lock()
-            .unwrap()
-            .retain(|s| s.future.lock().unwrap().is_some());
-    }
-    completed
-}
-
-/// Future that resolves at a wall-clock deadline. Polled eagerly by
-/// `tick`; resolves lazily when `Instant::now() >= deadline`.
-pub struct Sleep {
-    deadline: Instant,
-}
-
-pub fn sleep_us(us: u64) -> Sleep {
-    Sleep {
-        deadline: Instant::now() + Duration::from_micros(us),
+        out
+    };
+    for t in fired {
+        (t.func)(t.arg);
     }
 }
 
-impl Future for Sleep {
-    type Output = ();
+// ---- Event-loop integration ------------------------------------------------
 
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
-        if Instant::now() >= self.deadline {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
-        }
-    }
+/// Advance this worker's timer list, then poll its arena. Called from
+/// `run_worker` once per iteration.
+pub fn tick(worker_id: u32) -> bool {
+    advance(worker_id, now_us());
+    uni_executor::tick(worker_id)
 }
+
+// ---- Backend hooks ---------------------------------------------------------
+//
+// Linked against the `extern "C"` declarations in
+// `//uni-executor/src/lib.rs`.
+
+#[unsafe(no_mangle)]
+pub extern "C" fn uni_exec_current_worker() -> u32 {
+    super::current_thread_id()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn uni_exec_now_ticks() -> u64 {
+    now_us()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn uni_exec_schedule_timer(
+    deadline: u64,
+    func: extern "C" fn(usize),
+    arg: usize,
+) -> bool {
+    let wid = super::current_thread_id() as usize;
+    if wid >= MAX_WORKERS {
+        return false;
+    }
+    TIMERS[wid].0.lock().unwrap().push(NativeTimer {
+        deadline,
+        func,
+        arg,
+    });
+    true
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn uni_exec_cancel_timer(arg: usize) -> bool {
+    let wid = super::current_thread_id() as usize;
+    if wid >= MAX_WORKERS {
+        return false;
+    }
+    let mut guard = TIMERS[wid].0.lock().unwrap();
+    let before = guard.len();
+    guard.retain(|t| t.arg != arg);
+    guard.len() != before
+}
+
+// ---- Re-exports for app code ----------------------------------------------
+
+pub use uni_executor::{sleep_us, spawn, Sleep};
