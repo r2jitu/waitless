@@ -55,9 +55,11 @@ pointers published via `AtomicPtr` at boot. Callers do one
 `Acquire` load + one direct call per hook — no trait objects,
 no vtables, no `extern "C"`. Two instances in the tree:
 
-- `uni_percpu::Runtime` — executor hooks (`now_ticks`,
-  `schedule_timer`, `cancel_timer`). See
+- `uni_runtime::Runtime` — executor hooks (`now_ticks`, plus
+  reactor hooks as they land in P4/P5). See
   [executor-plan.md](executor-plan.md) §P3.
+- `uni_percpu::register_current_worker` — one-hook slot for the
+  current-worker id (TPIDR_EL1 / pthread TLS).
 - `uni_net_driver::NicOps` — NIC driver ops (`send`, `poll_rx`,
   etc.). `ACTIVE_OPS` starts pointing at a `NULL_OPS` backstop
   so dispatchers never have to null-check.

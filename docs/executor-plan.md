@@ -45,13 +45,14 @@ Rust-ABI fn pointers, published via `AtomicPtr<Runtime>`. No
 fns:
 
 ```rust
-static RUNTIME: uni_percpu::Runtime = uni_percpu::Runtime {
+static RUNTIME: uni_runtime::Runtime = uni_runtime::Runtime {
     now_ticks: rt_now_ticks,
-    schedule_timer: rt_schedule_timer,
-    cancel_timer: rt_cancel_timer,
 };
 
-pub fn init() { uni_percpu::register(&RUNTIME); }
+pub fn init() {
+    uni_percpu::register_current_worker(rt_current_worker);
+    uni_runtime::register(&RUNTIME);
+}
 ```
 
 One boot-time store of a thin pointer, one Acquire load per hook
@@ -85,7 +86,10 @@ unsafe extern "C" {
 …plus one `uni_percpu_current_worker` hook in `//uni-percpu`. Both
 extern blocks need `#[allow(improper_ctypes)]` because `fn(usize)`
 is Rust ABI inside a C-ABI extern block (lint is cosmetic — we own
-both sides). P3 eliminates all three `extern "C"` hooks.
+both sides). P3 eliminates all three `extern "C"` hooks. Hooks are
+split by consuming crate: `register_current_worker` lives in
+`uni-percpu`, `register(&Runtime { now_ticks, … })` lives in
+`uni-runtime`.
 
 Design principles inherited from the landed work:
 
