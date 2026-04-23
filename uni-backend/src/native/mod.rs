@@ -441,6 +441,11 @@ impl ThreadState {
                 return true;
             }
         }
+        // Async TCP listener fd fired → wake the reactor's accept
+        // future on this worker; the task's next poll drains accept.
+        if async_tcp_dispatch(self.thread_id, fd) {
+            return false;
+        }
         for c in self.conns.iter_mut() {
             if c.fd == fd { c.has_pending_data = true; break; }
         }
@@ -623,8 +628,8 @@ fn init_native() {
     // `deliver_tcp_ready` — is a follow-up; until then apps needing
     // TCP accept on native should stay on `uni_http::Server`.
     uni_runtime::net::register_tcp_backend(
-        tcp_backend_listen_stub,
-        tcp_backend_accept_stub,
+        async_tcp_listen_hook,
+        async_tcp_accept_hook,
     );
 
     // Register TCP/UDP polling as the first IO poll callback.
@@ -636,12 +641,132 @@ fn init_native() {
     register_io_poll(|_worker_id| tcp_poll());
 }
 
-fn tcp_backend_listen_stub(_port: u16) -> Result<(), ()> {
-    Ok(())
+// ---- Async TCP reactor backend (native side) ------------------------------
+//
+// Parallel to the UDP sibling machinery: open one SO_REUSEPORT
+// listen fd per worker, register each in its worker's kqueue/epoll.
+// When a worker's event queue fires for a listener fd, we call
+// `uni_runtime::net::deliver_tcp_ready(port)` — the awaiting async
+// task on that worker is then woken and its next poll calls
+// `async_tcp_accept_hook`, which does `accept(2)` on the worker's
+// own listener fd. Per-worker isolation (same as UDP) — no cross-
+// core contention for TCP accept.
+
+const MAX_ASYNC_TCP_LISTENERS: usize = 4;
+
+struct AsyncTcpListener {
+    app_port: u16,
+    fds: [i32; MAX_THREADS],
+    fd_count: usize,
 }
 
-fn tcp_backend_accept_stub(_port: u16) -> *mut () {
-    core::ptr::null_mut()
+struct AsyncTcpListenersSlot(UnsafeCell<[Option<AsyncTcpListener>; MAX_ASYNC_TCP_LISTENERS]>);
+// SAFETY: populated only on the main thread during `uni_main`
+// (via `async_tcp_listen_hook` from `uni::runtime::TcpListener::bind`);
+// read from workers afterwards without further mutation.
+unsafe impl Sync for AsyncTcpListenersSlot {}
+static ASYNC_TCP_LISTENERS: AsyncTcpListenersSlot =
+    AsyncTcpListenersSlot(UnsafeCell::new([const { None }; MAX_ASYNC_TCP_LISTENERS]));
+static ASYNC_TCP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn async_tcp_listen_hook(app_port: u16) -> Result<(), ()> {
+    unsafe {
+        let count = ASYNC_TCP_COUNT.load(Ordering::Acquire);
+        if count >= MAX_ASYNC_TCP_LISTENERS {
+            return Err(());
+        }
+        let host_port = read_port_env("TCP", app_port).unwrap_or(app_port);
+        let want = NUM_THREADS.load(Ordering::Acquire).max(1);
+        let mut fds = [-1i32; MAX_THREADS];
+        let mut got = 0usize;
+        for i in 0..want {
+            // `make_listener` opens a SO_REUSEPORT / SO_REUSEADDR listen
+            // fd (nonblocking). Siblings on the same port distribute
+            // incoming SYNs across workers (macOS: same as UDP; Linux
+            // with SO_REUSEPORT: 4-tuple hash).
+            let fd = make_listener(host_port, true);
+            if fd < 0 {
+                if i == 0 {
+                    return Err(());
+                }
+                break;
+            }
+            fds[i] = fd;
+            got += 1;
+        }
+        let idx = count;
+        (*ASYNC_TCP_LISTENERS.0.get())[idx] = Some(AsyncTcpListener {
+            app_port,
+            fds,
+            fd_count: got,
+        });
+        ASYNC_TCP_COUNT.store(idx + 1, Ordering::Release);
+
+        let threads = &mut *THREADS.0.get();
+        for worker_id in 0..got {
+            threads[worker_id].register_fd(fds[worker_id]);
+        }
+        Ok(())
+    }
+}
+
+fn async_tcp_accept_hook(app_port: u16) -> *mut () {
+    unsafe {
+        let tid = uni_platform::current_worker() as usize;
+        let count = ASYNC_TCP_COUNT.load(Ordering::Acquire);
+        let listeners = &*ASYNC_TCP_LISTENERS.0.get();
+        for entry in listeners.iter().take(count) {
+            let l = match entry {
+                Some(l) => l,
+                None => continue,
+            };
+            if l.app_port != app_port || tid >= l.fd_count {
+                continue;
+            }
+            let listen_fd = l.fds[tid];
+            if listen_fd < 0 {
+                return ptr::null_mut();
+            }
+            let fd = accept(listen_fd, ptr::null_mut(), ptr::null_mut());
+            if fd < 0 {
+                return ptr::null_mut();
+            }
+            set_nonblocking(fd);
+            let opt: i32 = 1;
+            setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, 4);
+            let ts = thread_state(tid as u32);
+            let c = ts.alloc_conn();
+            if c.is_null() {
+                close(fd);
+                return ptr::null_mut();
+            }
+            (*c).fd = fd;
+            ts.register_fd(fd);
+            return c as *mut ();
+        }
+        ptr::null_mut()
+    }
+}
+
+/// Called from `dispatch_ready_fd`. Returns `true` iff `fd` matched
+/// an async-TCP listener (and the reactor notification was issued).
+fn async_tcp_dispatch(thread_id: u32, fd: i32) -> bool {
+    unsafe {
+        let count = ASYNC_TCP_COUNT.load(Ordering::Acquire);
+        let listeners = &*ASYNC_TCP_LISTENERS.0.get();
+        for entry in listeners.iter().take(count) {
+            let l = match entry {
+                Some(l) => l,
+                None => continue,
+            };
+            let tid = thread_id as usize;
+            if tid < l.fd_count && l.fds[tid] == fd {
+                uni_runtime::net::deliver_tcp_ready(l.app_port);
+                return true;
+            }
+        }
+        false
+    }
 }
 
 // ============================================================================

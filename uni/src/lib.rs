@@ -255,6 +255,15 @@ impl TcpListener {
 pub struct TcpStream(*mut ());
 
 impl TcpStream {
+    /// Wrap a raw handle from `uni::runtime::TcpListener::accept` /
+    /// `run` into the typed `TcpStream` API. The raw `*mut ()` and
+    /// `TcpStream`'s inner pointer use the same backend
+    /// representation; this is a zero-cost reinterpretation.
+    #[inline]
+    pub fn from_raw(raw: uni_runtime::net::RawTcpStream) -> Self {
+        TcpStream(raw.0)
+    }
+
     pub fn has_data(&self) -> bool {
         uni_backend::tcp_has_data(self.0)
     }

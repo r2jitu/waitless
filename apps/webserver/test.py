@@ -17,6 +17,7 @@ launcher hides the per-runner specifics.
 from __future__ import annotations
 
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -49,9 +50,10 @@ BOOT_MARKER = b"Entering event loop"
 PORT = int(os.environ.get("TEST_PORT", 18080))
 TLS_PORT = int(os.environ.get("TEST_TLS_PORT", 18443))
 UDP_PORT = int(os.environ.get("TEST_UDP_PORT", 18007))
+TCP_ECHO_PORT = int(os.environ.get("TEST_TCP_ECHO_PORT", 18009))
 
 
-def _launcher_env(port: int, tls_port: int, udp_port: int) -> dict[str, str]:
+def _launcher_env(port: int, tls_port: int, udp_port: int, tcp_echo_port: int) -> dict[str, str]:
     """Env vars spanning every launcher variant.
 
     Name convention is `UNIKERNEL_<PROTO>_<GUEST>` — derived from
@@ -65,6 +67,7 @@ def _launcher_env(port: int, tls_port: int, udp_port: int) -> dict[str, str]:
         "UNIKERNEL_TCP_80": str(port),
         "UNIKERNEL_TCP_443": str(tls_port),
         "UNIKERNEL_UDP_7": str(udp_port),
+        "UNIKERNEL_TCP_9": str(tcp_echo_port),
     }
 
 if not (LAUNCHER.is_file() and os.access(LAUNCHER, os.X_OK)):
@@ -78,7 +81,7 @@ class WebserverServiceTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.launcher = spawn_backgrounded(
             LAUNCHER,
-            env=_launcher_env(PORT, TLS_PORT, UDP_PORT),
+            env=_launcher_env(PORT, TLS_PORT, UDP_PORT, TCP_ECHO_PORT),
             log_prefix="webserver_svc",
         )
         if not wait_http_ready(PORT, timeout=20.0):
@@ -155,6 +158,22 @@ class WebserverServiceTest(unittest.TestCase):
     def test_udp_echo(self) -> None:
         self.assertEqual(udp_echo(port=UDP_PORT), b"hello")
 
+    # ── Async TCP reactor end-to-end (uni::runtime::TcpListener) ──
+    def test_tcp_echo(self) -> None:
+        """Validates `uni::runtime::TcpListener::bind(9)?.run(...)` —
+        bare-metal + native both exercise the full reactor path:
+        accept future wakes on new connection, handler runs on owning
+        worker, recv/send round-trip succeeds."""
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(5.0)
+        try:
+            s.connect(("127.0.0.1", TCP_ECHO_PORT))
+            s.sendall(b"ping")
+            data = s.recv(32)
+            self.assertEqual(data, b"ping")
+        finally:
+            s.close()
+
     # ── Phase 0: boot_info surfaces through the serial log ───────
     def test_boot_info_logged(self) -> None:
         """Webserver's startup log must contain a BOOT_INFO line sourced
@@ -179,10 +198,13 @@ class WebserverShutdownTest(unittest.TestCase):
     """
 
     def test_ctrlc_exits_within_8s(self) -> None:
-        port, tls_port, udp_port = PORT + 100, TLS_PORT + 100, UDP_PORT + 100
+        port = PORT + 100
+        tls_port = TLS_PORT + 100
+        udp_port = UDP_PORT + 100
+        tcp_echo_port = TCP_ECHO_PORT + 100
         pty_launcher = PtyLauncher(
             LAUNCHER,
-            env=_launcher_env(port, tls_port, udp_port),
+            env=_launcher_env(port, tls_port, udp_port, tcp_echo_port),
         )
         stop_hammer = [False]
         try:

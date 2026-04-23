@@ -74,6 +74,37 @@ impl WebServerApp {
             Err(_) => uni::log(b"UDP echo: bind FAILED\n"),
         }
 
+        match uni::runtime::TcpListener::bind(9) {
+            Ok(listener) => {
+                listener.run(|raw| async move {
+                    let stream = uni::TcpStream::from_raw(raw);
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        // Sync recv/send don't yield, so we
+                        // hand-yield between polls by sleeping
+                        // briefly when no data is ready. A proper
+                        // async recv-ready primitive would replace
+                        // this busy-check; for validating the accept
+                        // reactor today it's sufficient.
+                        while !stream.has_data() {
+                            if stream.is_closed() {
+                                return;
+                            }
+                            uni::runtime::sleep_us(200).await;
+                        }
+                        let n = stream.recv(&mut buf);
+                        if n == 0 {
+                            stream.close();
+                            return;
+                        }
+                        let _ = stream.send(&buf[..n]);
+                    }
+                });
+                uni::log(b"TCP echo server on port 9 (async, per-worker)\n");
+            }
+            Err(_) => uni::log(b"TCP echo: bind FAILED\n"),
+        }
+
         let mut server = Server::new_boxed();
         server.default_handler(handle_request);
         server.listen(http_port);

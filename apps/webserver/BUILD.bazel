@@ -47,6 +47,11 @@ unikernel_binary(
             guest = 7,
             host = 8007,
         ),
+        port_fwd(
+            "tcp",
+            guest = 9,
+            host = 8009,
+        ),
     ],
 )
 
