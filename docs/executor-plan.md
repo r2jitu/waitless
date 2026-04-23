@@ -14,19 +14,57 @@ implementation itself.
 
 ## Status
 
-**In progress.** Three of five phases shipped:
+**In progress — P3 blocked.**
 
 | Phase | Status | Commit |
 |---|---|---|
 | P0. `//uni-executor` with shared arena / Waker / Sleep | 🟢 done | `509a6af` |
 | P1. `//uni-percpu` — `CurrentCore` + `PerCpu<T, N>` shared | 🟢 done | `a506a52` |
-| P2. `TimerWheel` + `PendingTimers` shared | ⏳ next | — |
-| P3. Runtime trait — drop remaining `extern "C"` hooks | ⏳ | — |
+| P2. `TimerWheel` + `PendingTimers` shared | 🟢 done | `9e0095f` |
+| P2.5. `InitOnce<T>` shared, `uni/boot_info.rs` dedup | 🟢 done | `e52ce2a` |
+| P3. Runtime trait — drop `extern "C"` executor hooks | 🔴 blocked | — |
 | P4. `UdpRecv::recv_from().await` reactor | ⏳ | — |
 | P5. *(optional)* `TcpListener::accept().await` reactor | ⏳ | — |
 
 After P4, ROADMAP §3c starts. Everything after that lives in the
 ROADMAP, not here.
+
+### P3 blocker
+
+Implemented trait + `InitOnce<&'static dyn Runtime>` + `register`
+hook. Attempted to call `kernel::executor::init()` from
+`boot/entry.rs` just before `uni_main()`. With the call in place:
+
+- `apps/test_async` (4 variants), `apps/test_percpu`,
+  `//uni-percpu:*_test`, `//uni:boot_info_test` — all pass.
+- `apps/webserver:test_hvf` — **hangs**. VM boots, `Net::enable`
+  returns (DHCP fails, static fallback), HTTP/TLS listeners
+  print `listening`, then the event loop spins with
+  `p=0 d=0 s=0 i=N` forever — network poll never sees RX even
+  though the test client is connecting to localhost:18080.
+
+Commenting out the single `kernel::executor::init()` call (while
+keeping the full Runtime trait + impl + `RUNTIME: InitOnce<&dyn
+Runtime>` static) fixes webserver. So the bug is in the `register`
+path, not in the trait / static layout.
+
+Tried: no panic output on serial (panic handler would `serial::puts
+("PANIC in entry")`); InitOnce passes its own unit tests under
+high-contention concurrent-init stress. The `&KERNEL_RT` coercion
+from `&'static KernelRuntime` (ZST) to `&'static dyn Runtime` is
+standard Rust. Two-word fat-pointer write through
+`MaybeUninit<&dyn Runtime>` via `UnsafeCell::get()` should be sound.
+
+Open hypothesis: something about writing the 16-byte fat pointer
+to BSS-resident static storage from the boot path perturbs the
+virtio-net IRQ delivery path (GIC state? MAIR / cache?). No hard
+evidence — pausing for now.
+
+**Reverted** P3 code from `boot/entry.rs`, `kernel/executor.rs`,
+`uni-native/src/executor.rs`, `uni-native/src/lib.rs`, and
+`uni-executor/src/lib.rs`. The three `extern "C"` hooks +
+`#[allow(improper_ctypes)]` stay. `InitOnce` carve-out (P2.5)
+kept because it's independently useful.
 
 ---
 
@@ -381,8 +419,9 @@ Status legend: ⏳ not started · 🟡 in progress · 🟢 complete · 🔴 bloc
 |---|---|---|---|---|
 | P0 | `//uni-executor` — shared arena / Waker / Sleep | 🟢 | `uni-executor/**`, `kernel/executor.rs`, `uni-native/src/executor.rs` | +506 / -375 |
 | P1 | `//uni-percpu` — `CurrentCore` + `PerCpu` | 🟢 | `uni-percpu/**`, `kernel/percpu.rs` | +321 / -272 |
-| P2 | Share `TimerWheel` + `PendingTimers` | ⏳ | `kernel/timer.rs` → `//uni-percpu`, `uni-native/src/executor.rs` | ~0 net |
-| P3 | `trait Runtime` — drop `extern "C"` | ⏳ | `uni-executor/src/lib.rs`, both backends | ~+50 / -60 |
+| P2 | Share `TimerWheel` + `PendingTimers` | 🟢 | `uni-percpu/src/timer.rs`, `uni-native/src/executor.rs` | +435 / -451 |
+| P2.5 | Share `InitOnce<T>` | 🟢 | `uni-percpu/src/once.rs`, `uni/boot_info.rs` | +201 / -263 |
+| P3 | `trait Runtime` — drop `extern "C"` | 🔴 blocked | `uni-executor/src/lib.rs`, both backends | — |
 | P4 | `UdpRecv::recv_from().await` | ⏳ | new `uni-executor/src/net.rs`, both backends' UDP paths | ~+200 |
 | P5 | `TcpListener::accept().await` *(optional)* | ⏳ | new, both backends' TCP paths | ~+200 |
 | →§3c | **Hand-off: QUIC starts** | — | see [ROADMAP §3c](../ROADMAP.md) | — |
