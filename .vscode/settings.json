@@ -28,14 +28,19 @@
     "rust-analyzer.check.overrideCommand": [],
     "rust-analyzer.cargo.buildScripts.enable": false,
 
-    // Pin rust-analyzer's sysroot probe to stable cargo. Without
-    // this, r-a sets RUSTUP_TOOLCHAIN to the rules_rust-bundled
-    // rustc version (e.g. 1.93.1) when running `cargo metadata`;
-    // if that toolchain isn't installed via rustup, the shim
-    // falls back to nightly, whose cargo may no longer accept
-    // --lockfile-path, breaking project load.
-    "rust-analyzer.cargo.extraEnv": {
-        "CARGO": "/Users/jitudas/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo"
+    // Force the rustup shim to stable for every cargo r-a spawns.
+    // When r-a probes the sysroot of the rules_rust-bundled
+    // rust-analyzer toolchain, it sets RUSTUP_TOOLCHAIN to the
+    // bazel sysroot path — a "custom toolchain link" that has no
+    // `cargo` binary. The shim then falls back to whatever cargo
+    // it can find (often nightly), which may no longer accept
+    // flags like `--lockfile-path`, breaking project load.
+    //
+    // `server.extraEnv` (not `cargo.extraEnv`) is required: it
+    // applies to the r-a executable itself, so the override wins
+    // over r-a's per-invocation RUSTUP_TOOLCHAIN setting.
+    "rust-analyzer.server.extraEnv": {
+        "RUSTUP_TOOLCHAIN": "stable"
     },
 
     // Show inlay hints for type information in the editor margin.
