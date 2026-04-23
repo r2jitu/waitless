@@ -401,8 +401,15 @@ fn with_server<R, F: FnOnce(&Server) -> R>(f: F) -> Option<R> {
 /// Plain-HTTP per-conn task. Consumes `stream` and drives one
 /// keep-alive loop: recv → parse (possibly multiple pipelined
 /// requests per recv) → dispatch → send.
+///
+/// The parse buffer is a `Box<[u8]>` allocated via `Vec` so the
+/// zero-fill goes straight to the heap without transiting the
+/// caller's stack — `Box::new([0u8; N])` constructs the array on
+/// the stack before moving to the heap under rustc's current
+/// layout, which measurably hurt HVF-side throughput on the TLS
+/// workloads.
 async fn handle_plain_conn(stream: uni::TcpStream) {
-    let mut buf = alloc::vec![0u8; BUF_SIZE].into_boxed_slice();
+    let mut buf: Box<[u8]> = alloc::vec![0u8; BUF_SIZE].into_boxed_slice();
     let mut buf_len = 0usize;
     loop {
         if buf_len == BUF_SIZE {
@@ -491,10 +498,13 @@ async fn handle_tls_conn(stream: uni::TcpStream) {
         return;
     };
 
-    let mut recv_buf = alloc::vec![0u8; BUF_SIZE].into_boxed_slice();
-    let mut plain_buf = alloc::vec![0u8; BUF_SIZE].into_boxed_slice();
+    // Heap-allocate the two 8 KB direction buffers via `Vec` to
+    // skip the stack hop `Box::new([0u8; N])` currently incurs.
+    // `tx_scratch` is small enough to live on the future's stack.
+    let mut recv_buf: Box<[u8]> = alloc::vec![0u8; BUF_SIZE].into_boxed_slice();
+    let mut plain_buf: Box<[u8]> = alloc::vec![0u8; BUF_SIZE].into_boxed_slice();
     let mut plain_len = 0usize;
-    let mut tx_scratch = alloc::vec![0u8; 2048].into_boxed_slice();
+    let mut tx_scratch = [0u8; 2048];
 
     loop {
         // --- Drain any pending TLS TX (handshake flight, encrypted
