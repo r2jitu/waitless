@@ -53,7 +53,14 @@ use uni_percpu::{CurrentCore, PerCpu, MAX_WORKERS};
 // ---- Sizing -----------------------------------------------------------------
 
 pub const MAX_UDP_SOCKETS: usize = 8;
-const INBOX_CAPACITY: usize = 4;
+/// Per-worker inbox depth. The hot path (same-core producer + same-
+/// core consumer) drains one entry per task poll, so this is purely
+/// burst tolerance for when delivery outpaces task scheduling (NIC
+/// RX interrupt coalescing, slow handler work, cross-core delivery
+/// on Tier 2). 16 absorbs typical interrupt bursts without ballooning
+/// static BSS — total footprint is MAX_UDP_SOCKETS × MAX_WORKERS ×
+/// INBOX_CAPACITY × MAX_PAYLOAD ≈ 1.5 MB.
+const INBOX_CAPACITY: usize = 16;
 const MAX_PAYLOAD: usize = 1500;
 
 // ---- SpinLock (waker cell) --------------------------------------------------
@@ -378,8 +385,19 @@ impl<'a> Future for UdpRecv<'a> {
         }
         // Slow path: register the waker, then re-check — closes the
         // race where `deliver_udp` pushed between the fast-path pop
-        // and the waker registration.
-        *inbox.waker.lock() = Some(cx.waker().clone());
+        // and the waker registration. Dedup via `will_wake` keeps the
+        // loop case (same task polling in a tight recv loop) off the
+        // clone path.
+        {
+            let mut slot = inbox.waker.lock();
+            let need_store = match &*slot {
+                Some(w) => !w.will_wake(cx.waker()),
+                None => true,
+            };
+            if need_store {
+                *slot = Some(cx.waker().clone());
+            }
+        }
         if let Some(r) = inbox.pop_into(this.buf) {
             *inbox.waker.lock() = None;
             return Poll::Ready(r);
