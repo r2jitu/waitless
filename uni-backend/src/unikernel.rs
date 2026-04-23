@@ -1,6 +1,6 @@
 // uni-backend/src/unikernel.rs — Bare-metal dispatch.
 
-use kernel::serial;
+use uni_kernel::serial;
 
 // ---- Lifecycle / config ---------------------------------------------------
 
@@ -25,25 +25,25 @@ pub fn check_shutdown() -> bool {
 
 // ---- Net stack re-exports (TCP/UDP + driver diagnostics) ------------------
 
-pub use drivers::net::{
+pub use uni_drivers::net::{
     num_queue_pairs as net_num_queue_pairs, rx_counts as net_rx_counts,
     rx_used_cursors as net_rx_used_cursors,
 };
-pub use net::poll as tcp_poll;
-pub use net::tcp::{
+pub use uni_net_stack::poll as tcp_poll;
+pub use uni_net_stack::tcp::{
     accept as tcp_accept, close as tcp_close, has_data as tcp_has_data,
     is_closed as tcp_is_closed, listen as tcp_listen, listen_on_core as tcp_listen_on,
     recv as tcp_recv, send as tcp_send,
 };
-pub use net::udp::{bind as udp_bind, send as udp_send};
+pub use uni_net_stack::udp::{bind as udp_bind, send as udp_send};
 
 // ---- Event loop re-exports ------------------------------------------------
 
-pub use kernel::eventloop::{request_shutdown, set_ready, set_service};
-pub use kernel::percpu::num_cores as num_workers;
+pub use uni_kernel::eventloop::{request_shutdown, set_ready, set_service};
+pub use uni_kernel::percpu::num_cores as num_workers;
 
 /// Register an IO poll callback. On unikernel, real registration
-/// goes through `kernel::eventloop::{set_net_poll, set_net_drain}`
+/// goes through `uni_kernel::eventloop::{set_net_poll, set_net_drain}`
 /// directly; this shim exists so cross-platform app code can call it
 /// unconditionally.
 pub fn register_io_poll(_f: fn(u32) -> bool) {}
@@ -51,13 +51,13 @@ pub fn register_io_poll(_f: fn(u32) -> bool) {}
 // ---- Async runtime re-exports ---------------------------------------------
 
 pub mod executor {
-    pub use kernel::executor::{sleep_us, spawn, Sleep};
+    pub use uni_kernel::executor::{sleep_us, spawn, Sleep};
 }
 
 // ---- Heap stats -----------------------------------------------------------
 
 pub fn heap_stats() -> super::HeapStats {
-    let s = kernel::mm::heap_stats();
+    let s = uni_kernel::mm::heap_stats();
     super::HeapStats {
         allocated_bytes: s.allocated_bytes,
         available_bytes: s.available_bytes,
@@ -81,7 +81,7 @@ struct IrqGuard {
 impl IrqGuard {
     #[inline]
     fn new() -> Self {
-        kernel::cpu::mask_irq();
+        uni_kernel::cpu::mask_irq();
         IrqGuard {
             _no_send: core::marker::PhantomData,
         }
@@ -91,21 +91,21 @@ impl IrqGuard {
 impl Drop for IrqGuard {
     #[inline]
     fn drop(&mut self) {
-        kernel::cpu::unmask_irq();
+        uni_kernel::cpu::unmask_irq();
     }
 }
 
 pub fn wait_for_events() {
-    drivers::net::flush_tx_staging();
+    uni_drivers::net::flush_tx_staging();
 
-    if drivers::net::irq_idle_supported() {
+    if uni_drivers::net::irq_idle_supported() {
         let _irq = IrqGuard::new();
-        drivers::net::arm_rx_interrupts();
-        if !drivers::net::has_pending_rx() && !drivers::net::has_pending_tx() {
-            kernel::cpu::idle_bounded();
+        uni_drivers::net::arm_rx_interrupts();
+        if !uni_drivers::net::has_pending_rx() && !uni_drivers::net::has_pending_tx() {
+            uni_kernel::cpu::idle_bounded();
         }
-        drivers::net::flush_tx_staging();
+        uni_drivers::net::flush_tx_staging();
     } else {
-        kernel::cpu::relax();
+        uni_kernel::cpu::relax();
     }
 }

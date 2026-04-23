@@ -1020,7 +1020,7 @@ pub fn udp_send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
 }
 
 // ============================================================================
-// Callback-driven event loop (mirrors kernel::eventloop)
+// Callback-driven event loop (mirrors uni_kernel::eventloop)
 // ============================================================================
 //
 // Same pattern as the unikernel: register callbacks, all workers run
@@ -1233,7 +1233,7 @@ pub extern "C" fn native_worker_loop(thread_id: u32) {
 
 // ---- Driver diagnostics stubs (native has no NIC driver) -------------------
 //
-// Parallel the unikernel side's `drivers::net::{rx_counts, num_queue_pairs,
+// Parallel the unikernel side's `uni_drivers::net::{rx_counts, num_queue_pairs,
 // rx_used_cursors}` so cross-platform callers see the same names and return
 // zeros here.
 

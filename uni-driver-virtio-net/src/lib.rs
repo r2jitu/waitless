@@ -4,7 +4,7 @@
 #![allow(dead_code, unused_imports)]
 
 extern crate drivers_infra;
-extern crate kernel;
+extern crate uni_kernel;
 extern crate uni_net_driver;
 
 use core::arch::asm;
@@ -16,7 +16,7 @@ use drivers_infra::{
     virtio_read32, virtio_write32, virtio_read16, virtio_read8, virtio_write8,
 };
 #[cfg(target_arch = "aarch64")]
-use kernel::aarch64::{exceptions, fdt};
+use uni_kernel::aarch64::{exceptions, fdt};
 use drivers_infra::pci::{pci_device, read_config, find_device, enable_bus_mastering_inner};
 use drivers_infra::virtio::{
     vpci_device, Virtqueue, VirtioPciDevice,
@@ -39,7 +39,7 @@ use drivers_infra::virtio::{
     MMIO_STATUS, MMIO_DEVICE_CONFIG, MMIO_MAGIC,
     MMIO_INTERRUPT_STATUS, MMIO_INTERRUPT_ACK,
 };
-use kernel::mm::{kmalloc, virt_to_phys, phys_to_virt};
+use uni_kernel::mm::{kmalloc, virt_to_phys, phys_to_virt};
 
 // ============================================================================
 // VirtIO-net constants and types
@@ -243,9 +243,9 @@ fn init_pci_modern() -> bool {
     // Use UNIKERNEL_CPUS env var (set in QEMU args) since percpu::init()
     // hasn't run yet. Fall back to 1 if not available.
     #[cfg(target_arch = "x86_64")]
-    let desired_pairs = unsafe { kernel::x86_64::acpi::detect_cpus() as u16 };
+    let desired_pairs = unsafe { uni_kernel::x86_64::acpi::detect_cpus() as u16 };
     #[cfg(target_arch = "aarch64")]
-    let desired_pairs = kernel::aarch64::fdt::info().cpu_count as u16;
+    let desired_pairs = uni_kernel::aarch64::fdt::info().cpu_count as u16;
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let desired_pairs = 1u16;
     let max_pairs = if has_mq {
@@ -770,7 +770,7 @@ fn init_legacy_pci() -> bool {
     // in legacy mode (MSI-X off, always our case): MAC[6] + STATUS[2]
     // + max_virtqueue_pairs[2] starts at VREG_DEVICE_CONFIG + 8.
     #[cfg(target_arch = "x86_64")]
-    let desired_pairs = unsafe { kernel::x86_64::acpi::detect_cpus() as u16 };
+    let desired_pairs = unsafe { uni_kernel::x86_64::acpi::detect_cpus() as u16 };
     #[cfg(not(target_arch = "x86_64"))]
     let desired_pairs = 1u16;
     let max_pairs = if has_mq {
@@ -886,7 +886,7 @@ fn tx_drain() {
 
 // x86_64: extern "C" fn() wrapper for the IDT stub trampoline
 #[cfg(target_arch = "x86_64")]
-unsafe extern "C" fn irq_handler_x86(_frame: *mut kernel::x86_64::idt::InterruptFrame) {
+unsafe extern "C" fn irq_handler_x86(_frame: *mut uni_kernel::x86_64::idt::InterruptFrame) {
     irq_handler(0);
 }
 
@@ -1045,7 +1045,7 @@ static TX_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 /// flush or send. Wraps `()` because the underlying state lives in
 /// `(*ndev()).tx_queues[0]` and is mutable through the existing
 /// raw-pointer accessors; this lock just provides mutual exclusion.
-static TX_LOCK: kernel::sync::Spinlock<()> = kernel::sync::Spinlock::new(());
+static TX_LOCK: uni_kernel::sync::Spinlock<()> = uni_kernel::sync::Spinlock::new(());
 
 /// Send a frame. Two paths:
 ///   * Multi-queue device: each core sends on its own per-core queue pair
@@ -1057,18 +1057,18 @@ static TX_LOCK: kernel::sync::Spinlock<()> = kernel::sync::Spinlock::new(());
 ///     optimisation — it lets `send()` stay non-blocking on hot paths while
 ///     a single core drains all rings under one lock acquisition.
 pub fn send(data: &[u8]) {
-    let cc = kernel::percpu::CurrentCore::enter();
+    let cc = uni_kernel::percpu::CurrentCore::enter();
     let id = cc.id();
     let nqp = unsafe { (*ndev()).num_queue_pairs };
     if nqp > 1 && (id as u16) < nqp {
         // Per-core queue pair: no contention, no locking.
         send_on_qp(id as usize, data);
-    } else if kernel::percpu::num_cores() <= 1 {
+    } else if uni_kernel::percpu::num_cores() <= 1 {
         // Single-core: no contention possible, send directly.
         send_on_qp(0, data);
     } else {
         // Single shared queue, multiple cores: stage to per-core ring.
-        kernel::percpu::percore(&cc).tx_staging.push(data);
+        uni_kernel::percpu::percore(&cc).tx_staging.push(data);
         TX_PENDING.store(true, Ordering::Release);
     }
 }
@@ -1091,11 +1091,11 @@ pub fn flush_tx_staging() {
         None => return,
     };
     TX_PENDING.store(false, Ordering::Release);
-    let n = kernel::percpu::num_cores();
+    let n = uni_kernel::percpu::num_cores();
     let mut buf = [0u8; 1514];
     for i in 0..n {
         unsafe {
-            let core = kernel::percpu::get(i);
+            let core = uni_kernel::percpu::get(i);
             while let Some(len) = core.tx_staging.pop_into(&mut buf) {
                 send_on_qp(0, &buf[..len]);
             }
@@ -1192,7 +1192,7 @@ pub fn poll_qp(qp: usize, callback: fn(&[u8])) -> i32 {
     // lock needed. Tier 2 (single shared queue) — serialise via
     // TX_LOCK so cores don't race the same TX descriptors.
     let nqp = unsafe { (*ndev()).num_queue_pairs };
-    if kernel::percpu::num_cores() <= 1 || (nqp as usize) > 1 {
+    if uni_kernel::percpu::num_cores() <= 1 || (nqp as usize) > 1 {
         tx_drain_qp(qp);
     } else if let Some(_g) = TX_LOCK.try_lock() {
         tx_drain_qp(qp);
@@ -1289,7 +1289,7 @@ pub fn poll_batch_qp(qp: usize, batch: &mut RxBatch) {
     // Drain TX completions. Tier 1 owns qp per core (no lock needed),
     // Tier 2 has the single shared queue and must serialise.
     let nqp = unsafe { (*ndev()).num_queue_pairs };
-    if kernel::percpu::num_cores() <= 1 || (nqp as usize) > 1 {
+    if uni_kernel::percpu::num_cores() <= 1 || (nqp as usize) > 1 {
         tx_drain_qp(qp);
     } else if let Some(_g) = TX_LOCK.try_lock() {
         tx_drain_qp(qp);
@@ -1371,8 +1371,8 @@ pub fn enable_irq() {
                     let irq_line = (irq_reg & 0xFF) as u8;
                     if irq_line < 16 {
                         (*ndev()).rx_queues[0].enable_interrupts();
-                        kernel::x86_64::idt::register_handler(32 + irq_line, irq_handler_x86);
-                        kernel::x86_64::idt::enable_irq(irq_line);
+                        uni_kernel::x86_64::idt::register_handler(32 + irq_line, irq_handler_x86);
+                        uni_kernel::x86_64::idt::enable_irq(irq_line);
                         (*ndev()).irq_idle_available = true;
                     }
                 }
@@ -1420,7 +1420,7 @@ fn init_msix_x86(dev: &VirtioPciDevice, num_pairs: usize) {
     // Config-change interrupt: unused.
     vpci_set_config_msix_vector(dev, NO_VEC);
 
-    let topo = kernel::x86_64::acpi::topology();
+    let topo = uni_kernel::x86_64::acpi::topology();
     let cpu_count = topo.cpu_count as usize;
 
     for qp in 0..num_pairs {
@@ -1437,7 +1437,7 @@ fn init_msix_x86(dev: &VirtioPciDevice, num_pairs: usize) {
         // Install the IDT handler for this vector. All per-queue
         // handlers share one implementation that reads the current
         // core's id and sets the RX_PENDING flag for that core.
-        kernel::x86_64::idt::register_handler(idt_vector, msix_rx_isr_trampoline);
+        uni_kernel::x86_64::idt::register_handler(idt_vector, msix_rx_isr_trampoline);
 
         // Point the RX queue at the vector; TX stays unvectored.
         let rx_qi = (qp * 2) as u16;
@@ -1459,7 +1459,7 @@ fn init_msix_x86(dev: &VirtioPciDevice, num_pairs: usize) {
 /// was programmed with that vCPU's LAPIC id.
 #[cfg(target_arch = "x86_64")]
 unsafe extern "C" fn msix_rx_isr_trampoline(
-    _frame: *mut kernel::x86_64::idt::InterruptFrame,
+    _frame: *mut uni_kernel::x86_64::idt::InterruptFrame,
 ) {
     IRQ_PENDING.store(true, core::sync::atomic::Ordering::Release);
 }
@@ -1520,7 +1520,7 @@ pub fn flush_tx_kick() {
 pub fn flush_tx_kick_if_dirty() -> bool {
     let nqp = unsafe { (*ndev()).num_queue_pairs };
     if nqp > 1 {
-        let core = kernel::cpu_id() as usize;
+        let core = uni_kernel::cpu_id() as usize;
         let qp = if core < nqp as usize { core } else { 0 };
         unsafe { (*ndev()).tx_queues[qp].flush_kick_if_dirty() }
     } else {
@@ -1535,7 +1535,7 @@ pub fn flush_tx_kick_if_dirty() -> bool {
 // `VirtioNetDriver` is a ZST that adapts the existing module-level
 // functions to the `EthernetDriver` trait contract. Registered via
 // `register_ethernet_driver!` so the `.uni_drivers_ethernet` section
-// walker picks it up from `drivers::net::init()`.
+// walker picks it up from `uni_drivers::net::init()`.
 
 use uni_net_driver::{EthernetDriver, NicError, NicHandle};
 
@@ -1578,7 +1578,7 @@ impl EthernetDriver for VirtioNetDriver {
     }
 
     // Overrides for the extended dispatcher surface. These route to
-    // the crate-level free functions that the old `drivers::net::*`
+    // the crate-level free functions that the old `uni_drivers::net::*`
     // dispatcher used to call directly.
 
     fn get_mac(&self, _handle: &NicHandle, out: *mut u8) { get_mac(out) }

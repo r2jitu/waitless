@@ -7,13 +7,13 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "infra",
     srcs = [
-        "infra.rs",
-        "pci.rs",
-        "virtio.rs",
-        "virtio_console.rs",
+        "src/infra.rs",
+        "src/pci.rs",
+        "src/virtio.rs",
+        "src/virtio_console.rs",
     ],
     crate_name = "drivers_infra",
-    crate_root = "infra.rs",
+    crate_root = "src/infra.rs",
     deps = [
         "//kernel",
     ],
@@ -26,10 +26,11 @@ rust_library(
 rust_library(
     name = "drivers",
     srcs = [
-        "lib.rs",
-        "net.rs",
+        "src/lib.rs",
+        "src/net.rs",
     ],
-    crate_root = "lib.rs",
+    crate_name = "uni_drivers",
+    crate_root = "src/lib.rs",
     deps = [
         ":infra",
         "//kernel",

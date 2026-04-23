@@ -259,7 +259,7 @@ struct ActiveConn {
 const IDLE_TIMEOUT_TICKS: u32 = 4_000_000;
 
 // `uni::rng::fill_bytes` handles the platform cfg-switch — see
-// that module for the backend split (kernel::rng on unikernel,
+// that module for the backend split (uni_kernel::rng on unikernel,
 // getentropy(2) on native).
 
 impl ActiveConn {
@@ -477,7 +477,7 @@ impl Server {
                     ac.conn = Some(stream);
                     if let Some(adapter) = self.tls_adapter.as_ref() {
                         // Seed the per-connection ephemeral X25519 keypair
-                        // from platform entropy. `kernel::rng::fill_bytes`
+                        // from platform entropy. `uni_kernel::rng::fill_bytes`
                         // on bare-metal (ChaCha20 PRNG seeded at boot from
                         // the TSC/CNTVCT jitter + RDRAND); libc
                         // `arc4random_buf` on native (host OS entropy).

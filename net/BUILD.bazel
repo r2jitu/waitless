@@ -7,9 +7,9 @@ package(default_visibility = ["//visibility:public"])
 
 rust_library(
     name = "types",
-    srcs = ["types.rs"],
+    srcs = ["src/types.rs"],
     crate_name = "net_types",
-    crate_root = "types.rs",
+    crate_root = "src/types.rs",
 )
 
 rust_test(
@@ -23,9 +23,9 @@ rust_test(
 # byte slice as `&PacketHeader`).
 rust_library(
     name = "from_bytes",
-    srcs = ["from_bytes.rs"],
+    srcs = ["src/from_bytes.rs"],
     crate_name = "net_from_bytes",
-    crate_root = "from_bytes.rs",
+    crate_root = "src/from_bytes.rs",
 )
 
 rust_test(
@@ -41,16 +41,16 @@ rust_test(
 # chains through `:types` or `//kernel` would otherwise trigger.
 rust_library(
     name = "protocol",
-    srcs = ["protocol.rs"],
+    srcs = ["src/protocol.rs"],
     crate_name = "net_protocol",
-    crate_root = "protocol.rs",
+    crate_root = "src/protocol.rs",
     deps = ["//util/atomic_fn"],
 )
 
 # `crate = ":protocol"` would rebuild `protocol` with `--test` but
 # atomic_fn's dep doesn't get `--test`, so its `#![no_std]` stays
 # on and rustc rejects linking a no_std/abort rlib into an unwind
-# test binary. `srcs = ["protocol.rs"]` + a plain `:atomic_fn`
+# test binary. `srcs = ["src/protocol.rs"]` + a plain `:atomic_fn`
 # dep side-steps it: under the `test` verb the
 # `//bazel/rules:tests_need_std` flag flips to True, atomic_fn's
 # `crate_features = select(...)` adds `std`, and the whole chain
@@ -59,8 +59,8 @@ rust_library(
 rust_test(
     name = "protocol_test",
     size = "small",
-    srcs = ["protocol.rs"],
-    crate_root = "protocol.rs",
+    srcs = ["src/protocol.rs"],
+    crate_root = "src/protocol.rs",
     deps = ["//util/atomic_fn"],
 )
 
@@ -69,14 +69,14 @@ rust_test(
 rust_test(
     name = "protocol_tests",
     size = "small",
-    srcs = ["protocol_tests.rs"],
+    srcs = ["src/protocol_tests.rs"],
 )
 
 rust_library(
     name = "ethernet",
-    srcs = ["ethernet.rs"],
+    srcs = ["src/ethernet.rs"],
     crate_name = "net_ethernet",
-    crate_root = "ethernet.rs",
+    crate_root = "src/ethernet.rs",
     deps = [
         ":from_bytes",
         ":types",
@@ -86,9 +86,9 @@ rust_library(
 
 rust_library(
     name = "arp",
-    srcs = ["arp.rs"],
+    srcs = ["src/arp.rs"],
     crate_name = "net_arp",
-    crate_root = "arp.rs",
+    crate_root = "src/arp.rs",
     deps = [
         ":ethernet",
         ":from_bytes",
@@ -100,9 +100,9 @@ rust_library(
 
 rust_library(
     name = "ipv4",
-    srcs = ["ipv4.rs"],
+    srcs = ["src/ipv4.rs"],
     crate_name = "net_ipv4",
-    crate_root = "ipv4.rs",
+    crate_root = "src/ipv4.rs",
     deps = [
         ":arp",
         ":ethernet",
@@ -114,9 +114,9 @@ rust_library(
 
 rust_library(
     name = "tcp",
-    srcs = ["tcp.rs"],
+    srcs = ["src/tcp.rs"],
     crate_name = "net_tcp",
-    crate_root = "tcp.rs",
+    crate_root = "src/tcp.rs",
     deps = [
         ":from_bytes",
         ":ipv4",
@@ -128,9 +128,9 @@ rust_library(
 
 rust_library(
     name = "udp",
-    srcs = ["udp.rs"],
+    srcs = ["src/udp.rs"],
     crate_name = "net_udp",
-    crate_root = "udp.rs",
+    crate_root = "src/udp.rs",
     deps = [
         ":from_bytes",
         ":ipv4",
@@ -155,9 +155,9 @@ rust_library(
 
 rust_library(
     name = "tls_crypto",
-    srcs = ["tls_crypto.rs"],
+    srcs = ["src/tls_crypto.rs"],
     crate_name = "net_tls_crypto",
-    crate_root = "tls_crypto.rs",
+    crate_root = "src/tls_crypto.rs",
     deps = [
         "@crates//:chacha20poly1305",
     ],
@@ -173,9 +173,9 @@ rust_library(
 # unit tests work without the panic-strategy conflict.
 rust_library(
     name = "tls_handshake",
-    srcs = ["tls_handshake.rs"],
+    srcs = ["src/tls_handshake.rs"],
     crate_name = "net_tls_handshake",
-    crate_root = "tls_handshake.rs",
+    crate_root = "src/tls_handshake.rs",
 )
 
 rust_test(
@@ -189,9 +189,9 @@ rust_test(
 # Pure protocol logic — no I/O, no state beyond what the caller owns.
 rust_library(
     name = "tls_record",
-    srcs = ["tls_record.rs"],
+    srcs = ["src/tls_record.rs"],
     crate_name = "net_tls_record",
-    crate_root = "tls_record.rs",
+    crate_root = "src/tls_record.rs",
     deps = [
         ":tls",
         ":tls_crypto",
@@ -224,14 +224,14 @@ rust_library(
 rust_library(
     name = "tls_server",
     srcs = [
-        "tls_server.rs",
-        "tls_server_handlers.rs",
-        "tls_server_keys.rs",
-        "tls_server_profile.rs",
-        "tls_server_trace.rs",
+        "src/tls_server.rs",
+        "src/tls_server_handlers.rs",
+        "src/tls_server_keys.rs",
+        "src/tls_server_profile.rs",
+        "src/tls_server_trace.rs",
     ],
     crate_name = "net_tls_server",
-    crate_root = "tls_server.rs",
+    crate_root = "src/tls_server.rs",
     # `--check-cfg=cfg(tls_debug)` declares the custom cfg to rustc's
     # unexpected-cfg lint so that `#[cfg(tls_debug)]` doesn't warn
     # when the flag is absent (the common case). Project-wide
@@ -276,9 +276,9 @@ rust_library(
 # and (eventually) the QUIC stack.
 rust_library(
     name = "tls",
-    srcs = ["tls.rs"],
+    srcs = ["src/tls.rs"],
     crate_name = "net_tls",
-    crate_root = "tls.rs",
+    crate_root = "src/tls.rs",
     deps = [
         ":tls_crypto",
         "@crates//:hkdf",
@@ -299,9 +299,9 @@ rust_library(
 
 rust_library(
     name = "dhcp",
-    srcs = ["dhcp.rs"],
+    srcs = ["src/dhcp.rs"],
     crate_name = "net_dhcp",
-    crate_root = "dhcp.rs",
+    crate_root = "src/dhcp.rs",
     deps = [
         ":arp",
         ":ethernet",
@@ -317,7 +317,8 @@ rust_library(
 
 rust_library(
     name = "net",
-    srcs = ["lib.rs"],
+    srcs = ["src/lib.rs"],
+    crate_name = "uni_net_stack",
     deps = [
         ":arp",
         ":dhcp",

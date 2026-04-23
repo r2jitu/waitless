@@ -39,7 +39,7 @@
 #![allow(dead_code, unused_imports)]
 
 extern crate drivers_infra;
-extern crate kernel;
+extern crate uni_kernel;
 extern crate uni_net_driver;
 
 use drivers_infra::{log, mmio_read32, mmio_write32};
@@ -47,8 +47,8 @@ use drivers_infra::pci;
 use core::mem::size_of;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
-use kernel::mm::{alloc_pages, phys_to_virt};
-use kernel::sync::Spinlock;
+use uni_kernel::mm::{alloc_pages, phys_to_virt};
+use uni_kernel::sync::Spinlock;
 
 // ---- PCI identity ----------------------------------------------------------
 
@@ -204,7 +204,7 @@ struct State {
     rx: [Option<RxQueue>; MAX_QUEUE_PAIRS],
 }
 
-/// Matches `drivers::virtio_net::MAX_QUEUE_PAIRS`. Upper bound for
+/// Matches `uni_drivers::virtio_net::MAX_QUEUE_PAIRS`. Upper bound for
 /// `net_rx_counts()` / `net_rx_used_cursors()` array sizes so the
 /// two drivers stay signature-compatible.
 const MAX_QUEUE_PAIRS: usize = 8;
@@ -1683,12 +1683,12 @@ pub fn flush_tx_kick_if_dirty_qp(qp: usize) -> bool {
 }
 
 /// Flush the current core's TX queue if dirty. Mirrors
-/// `drivers::virtio_net::flush_tx_kick_if_dirty` so the shim in
-/// `drivers::net` can dispatch through the same signature.
+/// `uni_drivers::virtio_net::flush_tx_kick_if_dirty` so the shim in
+/// `uni_drivers::net` can dispatch through the same signature.
 pub fn flush_tx_kick_if_dirty() -> bool {
     let num_qp = NUM_QP.load(Ordering::Acquire) as u32;
     if num_qp == 0 { return false; }
-    let core = kernel::cpu_id();
+    let core = uni_kernel::cpu_id();
     let qp = if core < num_qp { core as usize } else { 0 };
     flush_tx_kick_if_dirty_qp(qp)
 }
@@ -1721,7 +1721,7 @@ pub fn send(data: &[u8]) -> bool {
     if num_qp == 0 {
         return false;
     }
-    let core = kernel::cpu_id();
+    let core = uni_kernel::cpu_id();
     let qp = if core < num_qp { core as usize } else { 0 };
     send_on_qp(qp, data)
 }
@@ -1729,7 +1729,7 @@ pub fn send(data: &[u8]) -> bool {
 // ---- virtio-net-compatible public surface --------------------------------
 
 /// Copy the device MAC into `mac_out` (6 bytes). Matches the
-/// signature of `drivers::virtio_net::get_mac` so the dispatch
+/// signature of `uni_drivers::virtio_net::get_mac` so the dispatch
 /// shim can call either driver the same way. The caller is
 /// responsible for `mac_out` pointing at 6 writable bytes — same
 /// unwritten contract virtio-net's version has.
@@ -1782,7 +1782,7 @@ pub fn rx_used_cursors() -> [(u16, u16); 8] {
     out
 }
 
-/// Per-queue RX poll. Mirrors `drivers::virtio_net::poll_qp(qp, cb)`
+/// Per-queue RX poll. Mirrors `uni_drivers::virtio_net::poll_qp(qp, cb)`
 /// so Tier 1 per-core polling in `net::poll_tier1` works unchanged.
 pub fn poll_qp(qp: usize, callback: fn(&[u8])) -> i32 {
     poll_qp_inner(qp, callback) as i32
@@ -1869,7 +1869,7 @@ const _: () = {
 // `GveDriver` adapts the existing module-level functions to the
 // `EthernetDriver` trait contract. Registered via
 // `register_ethernet_driver!` so the `.uni_drivers_ethernet` section
-// walker picks it up from `drivers::net::init()`.
+// walker picks it up from `uni_drivers::net::init()`.
 
 use uni_net_driver::{EthernetDriver, NicError, NicHandle};
 

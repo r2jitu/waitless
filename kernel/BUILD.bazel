@@ -5,42 +5,44 @@ package(default_visibility = ["//visibility:public"])
 
 rust_library(
     name = "kernel",
+    crate_name = "uni_kernel",
     srcs = [
-        "bump.rs",
-        "cpu.rs",
-        "deque.rs",
-        "eventloop.rs",
-        "executor.rs",
-        "lib.rs",
-        "mm.rs",
-        "mmio.rs",
-        "once.rs",
-        "percpu.rs",
-        "rng.rs",
-        "serial.rs",
-        "spsc.rs",
-        "sync.rs",
-        "time.rs",
-        "timer.rs",
-        "types.rs",
+        "src/bump.rs",
+        "src/cpu.rs",
+        "src/deque.rs",
+        "src/eventloop.rs",
+        "src/executor.rs",
+        "src/lib.rs",
+        "src/mm.rs",
+        "src/mmio.rs",
+        "src/once.rs",
+        "src/percpu.rs",
+        "src/rng.rs",
+        "src/serial.rs",
+        "src/spsc.rs",
+        "src/sync.rs",
+        "src/time.rs",
+        "src/timer.rs",
+        "src/types.rs",
     ] + select({
         "//bazel/platforms:x86_64": [
-            "x86_64/acpi.rs",
-            "x86_64/apic.rs",
-            "x86_64/gdt.rs",
-            "x86_64/idt.rs",
-            "x86_64/mod.rs",
-            "x86_64/smp.rs",
+            "src/x86_64/acpi.rs",
+            "src/x86_64/apic.rs",
+            "src/x86_64/gdt.rs",
+            "src/x86_64/idt.rs",
+            "src/x86_64/mod.rs",
+            "src/x86_64/smp.rs",
         ],
         "//bazel/platforms:aarch64": [
-            "aarch64/exceptions.rs",
-            "aarch64/fdt.rs",
-            "aarch64/mmu.rs",
-            "aarch64/mod.rs",
-            "aarch64/smp.rs",
+            "src/aarch64/exceptions.rs",
+            "src/aarch64/fdt.rs",
+            "src/aarch64/mmu.rs",
+            "src/aarch64/mod.rs",
+            "src/aarch64/smp.rs",
         ],
         "//conditions:default": [],
     }),
+    crate_root = "src/lib.rs",
     # Unikernel-only: links against MMU / APIC / IDT / boot-section
     # code that only makes sense under a bare-metal target. Host
     # compilation hits mach-o-unfriendly `#[link_section = ".boot_bss"]`
@@ -68,29 +70,29 @@ rust_library(
 rust_test(
     name = "deque_test",
     size = "small",
-    srcs = ["deque.rs"],
-    crate_root = "deque.rs",
+    srcs = ["src/deque.rs"],
+    crate_root = "src/deque.rs",
 )
 
 rust_test(
     name = "bump_test",
     size = "small",
-    srcs = ["bump.rs"],
-    crate_root = "bump.rs",
+    srcs = ["src/bump.rs"],
+    crate_root = "src/bump.rs",
 )
 
 rust_test(
     name = "spsc_test",
     size = "small",
-    srcs = ["spsc.rs"],
-    crate_root = "spsc.rs",
+    srcs = ["src/spsc.rs"],
+    crate_root = "src/spsc.rs",
 )
 
 rust_test(
     name = "sync_test",
     size = "small",
-    srcs = ["sync.rs"],
-    crate_root = "sync.rs",
+    srcs = ["src/sync.rs"],
+    crate_root = "src/sync.rs",
 )
 
 # timer_test moved to //uni-percpu:timer_test — the wheel now lives
