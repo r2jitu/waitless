@@ -4,7 +4,7 @@ package(default_visibility = ["//visibility:public"])
 
 # Cross-platform async runtime. Same arena / waker / Sleep
 # implementation runs on bare-metal (backend hooks in //kernel) and
-# native (backend hooks in //uni-native). Compiles as no_std + alloc;
+# native (backend hooks in //backend-native). Compiles as no_std + alloc;
 # the host-std binary re-uses the same rlib under the libstd link.
 rust_library(
     name = "uni-executor",

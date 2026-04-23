@@ -5,9 +5,9 @@
 // minimal. It exists only to (a) pull in the app crate so its
 // `uni_main` symbol is available at link time, and (b) hand off
 // control to `uni::native_run()` (which drives the host POSIX
-// event loop via the `uni_native` crate).
+// event loop via the `backend_native` crate).
 //
-// `uni` (and every crate under it other than `uni_native`) stays
+// `uni` (and every crate under it other than `backend_native`) stays
 // `#![no_std]` — libraries compile as no_std rlibs and get linked
 // into this std binary just fine. rustc's "unwinding panics are
 // not supported without std" only fires for binary / staticlib

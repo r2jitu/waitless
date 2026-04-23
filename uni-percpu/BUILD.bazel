@@ -11,9 +11,9 @@ package(default_visibility = ["//visibility:public"])
 # `T` provides its own interior mutability (`Atomic*`, `UnsafeCell`
 # behind SPSC / owning-worker discipline). Both are used by
 # `//kernel` for its per-core state, by `//uni-executor` for task
-# arenas, and by `//uni-native` for per-worker timer storage.
+# arenas, and by `//backend-native` for per-worker timer storage.
 #
-# Backends (kernel, uni-native) publish a `static Runtime` with
+# Backends (kernel, backend-native) publish a `static Runtime` with
 # `current_worker` + `now_ticks` fn pointers via `register`; every
 # caller above looks up hooks through `runtime()`.
 rust_library(

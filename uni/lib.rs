@@ -1,6 +1,6 @@
 // Platform abstraction: `TcpListener`, `TcpStream`, `log`, `config_port`,
 // etc. Backend dispatched by `target_os` — `backend_unikernel` on bare-metal,
-// `uni_native` on hosted.
+// `backend_native` on hosted.
 
 #![no_std]
 
@@ -16,18 +16,18 @@ extern crate drivers;
 extern crate backend_unikernel;
 
 #[cfg(not(target_os = "none"))]
-extern crate uni_native;
+extern crate backend_native;
 
 pub extern crate uni_net as net;
 
 /// Native entry from `native_main.rs`. Plugs boot_info and shutdown
-/// callbacks into `uni_native::run` so the native backend doesn't
+/// callbacks into `backend_native::run` so the native backend doesn't
 /// need a dep back on `uni`.
 #[cfg(not(target_os = "none"))]
 pub fn native_run() -> i32 {
     use crate::boot_info::{BootInfoParams, NicInfo, MAX_NICS};
 
-    uni_native::run(uni_native::RunConfig {
+    backend_native::run(backend_native::RunConfig {
         boot_info_fn: |num_cpus, ram_bytes| {
             crate::boot_info::init_boot_info(BootInfoParams {
                 ram_bytes,
@@ -47,7 +47,7 @@ pub fn native_run() -> i32 {
 /// `kernel::eventloop::run` + per-core `Server::listen`).
 pub fn set_add_worker_listener(f: fn(u32)) {
     #[cfg(not(target_os = "none"))]
-    uni_native::set_add_worker_listener(f);
+    backend_native::set_add_worker_listener(f);
     #[cfg(target_os = "none")]
     let _ = f;
 }
@@ -193,7 +193,7 @@ mod backend {
     };
 
     // Event loop — pure re-exports, matching the native backend's
-    // `pub use uni_native::…` style. `num_workers` is aliased from
+    // `pub use backend_native::…` style. `num_workers` is aliased from
     // the kernel's `num_cores` (same signature, cleaner app-facing
     // name).
     pub use kernel::percpu::num_cores as num_workers;
@@ -225,7 +225,7 @@ mod backend {
     }
 }
 
-/// Native-platform dispatch — pure re-export from the `uni_native`
+/// Native-platform dispatch — pure re-export from the `backend_native`
 /// crate (host POSIX backend: sockets, pthread workers, kqueue/epoll
 /// event loop). Sits behind the same `mod backend` shape as the
 /// unikernel dispatch above so the cross-platform `pub use
@@ -237,13 +237,13 @@ mod backend {
 /// doesn't expose the talc-style counters.
 #[cfg(not(target_os = "none"))]
 mod backend {
-    pub use uni_native::{
+    pub use backend_native::{
         log, config_port, config_tls_port, check_shutdown, wait_for_events,
         tcp_listen, tcp_accept, tcp_has_data, tcp_recv, tcp_send, tcp_close,
         tcp_is_closed, tcp_poll, tcp_listen_on, udp_bind, udp_send,
         num_workers, register_io_poll, set_service, set_ready, request_shutdown,
     };
-    pub use uni_native::executor::{spawn as executor_spawn, sleep_us as executor_sleep_us};
+    pub use backend_native::executor::{spawn as executor_spawn, sleep_us as executor_sleep_us};
 
     pub fn net_rx_counts() -> [u64; 8] { [0; 8] }
     pub fn net_num_queue_pairs() -> u16 { 1 }
@@ -261,8 +261,8 @@ pub use backend::{num_workers, set_service, set_ready, request_shutdown, registe
 //
 // Cross-platform wrapper over the backend's executor. On the unikernel
 // this dispatches into `kernel::executor` (polled by `kernel::eventloop`);
-// on native it dispatches into `uni_native::executor` (polled by
-// `uni_native::run_worker`). Same `async fn` app code runs either way.
+// on native it dispatches into `backend_native::executor` (polled by
+// `backend_native::run_worker`). Same `async fn` app code runs either way.
 
 pub mod executor {
     use core::future::Future;

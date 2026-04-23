@@ -29,7 +29,7 @@ rust_library(
         "//uni-percpu",
         "//util/atomic_fn",
     ] + select({
-        "//bazel/platforms:native": ["//uni-native"],
+        "//bazel/platforms:native": ["//backend-native"],
         "//conditions:default": [
             "//drivers",
             "//kernel",
