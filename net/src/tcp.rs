@@ -792,6 +792,25 @@ pub fn has_data(handle: *mut ()) -> bool {
     unsafe { (*conn_ptr(core, slot)).rx_used() > 0 }
 }
 
+/// Async-readiness probe: like `has_data` but also returns `true`
+/// for terminal states (Closed / CloseWait with empty rx) so the
+/// `TcpRecv` future resolves on peer FIN and the caller sees
+/// `recv() == 0`. Registered as the `TCP_HAS_DATA` hook — sync
+/// callers still use `has_data` to avoid spurious recv attempts on
+/// dead conns.
+pub fn is_readable_or_closed(handle: *mut ()) -> bool {
+    let (core, slot) = match decode_handle(handle) {
+        Some(v) => v,
+        None => return true,
+    };
+    let c = unsafe { &*conn_ptr(core, slot) };
+    if c.rx_used() > 0 {
+        return true;
+    }
+    matches!(c.state, TcpState::Closed | TcpState::CloseWait
+                     | TcpState::LastAck | TcpState::TimeWait)
+}
+
 pub fn recv(handle: *mut (), buf: &mut [u8]) -> usize {
     let (core, slot) = match decode_handle(handle) {
         Some(v) => v,
