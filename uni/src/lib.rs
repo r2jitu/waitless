@@ -179,7 +179,7 @@ pub use uni_backend::{
 pub mod runtime {
     pub use uni_backend::runtime::{sleep_us, spawn, spawn_on_each_worker, Sleep};
     pub use uni_runtime::net::{
-        RawTcpStream, TcpAccept, TcpBindError, TcpListener,
+        RawTcpStream, TcpAccept, TcpBindError, TcpListener, TcpRecv,
         UdpBindError, UdpRecv, UdpSocket,
     };
 }
@@ -268,7 +268,19 @@ impl TcpStream {
         uni_backend::tcp_has_data(self.0)
     }
 
-    pub fn recv(&self, buf: &mut [u8]) -> usize {
+    /// Async read — the primary recv primitive. Resolves with the
+    /// byte count when data is available (or `0` on peer close).
+    /// Wakes are delivered from the backend event loop; no polling.
+    /// Mirrors the shape of `UdpSocket::recv_from`.
+    #[inline]
+    pub fn recv<'a>(&self, buf: &'a mut [u8]) -> uni_runtime::net::TcpRecv<'a> {
+        uni_runtime::net::TcpRecv::new(self.0, buf)
+    }
+
+    /// Non-blocking sync read. Returns `0` on EAGAIN or close; use
+    /// `recv(..).await` instead in async contexts. Retained for
+    /// `uni_http`'s still-sync dispatch loop until that migrates.
+    pub fn recv_sync(&self, buf: &mut [u8]) -> usize {
         uni_backend::tcp_recv(self.0, buf)
     }
 

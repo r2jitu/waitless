@@ -533,7 +533,7 @@ impl Server {
                     let buf_len = self.cores[core_id as usize].active[i].buf_len;
                     let avail = BUF_SIZE - buf_len;
                     if avail > 0 {
-                        let got = conn.recv(
+                        let got = conn.recv_sync(
                             &mut self.cores[core_id as usize].active[i].buf
                                 [buf_len..buf_len + avail],
                         );
@@ -614,7 +614,7 @@ impl Server {
         // drain the kernel TCP buffer in one go.
         let mut tmp = [0u8; 2048];
         loop {
-            let got = conn.recv(&mut tmp);
+            let got = conn.recv_sync(&mut tmp);
             if got == 0 {
                 break;
             }
