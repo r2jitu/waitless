@@ -13,10 +13,8 @@ package(default_visibility = ["//visibility:public"])
 # `//kernel` for its per-core state, by `//uni-runtime` for task
 # arenas, and by `//uni-backend` for per-worker timer storage.
 #
-# The cfg-selected backend (bare-metal or POSIX) publishes a
-# `static Runtime` with
-# `current_worker` + `now_ticks` fn pointers via `register`; every
-# caller above looks up hooks through `runtime()`.
+# `CurrentCore::enter` calls `uni_platform::current_worker()` directly;
+# `uni-platform` is the leaf crate that owns the cfg-gated read.
 rust_library(
     name = "uni-percpu",
     srcs = [
@@ -25,6 +23,7 @@ rust_library(
         "src/timer.rs",
     ],
     crate_name = "uni_percpu",
+    deps = ["//uni-platform"],
 )
 
 rust_test(

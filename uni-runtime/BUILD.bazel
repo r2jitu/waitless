@@ -2,14 +2,16 @@ load("@rules_rust//rust:defs.bzl", "rust_library")
 
 package(default_visibility = ["//visibility:public"])
 
-# Shared async runtime — task arena + Waker + Sleep. Owns its own
-# `Runtime` plug-in (just `now_ticks` today; reactor hooks for UDP
-# and TCP land here in P4/P5). Backends register at boot; `//uni-percpu`
-# owns its own `current_worker` hook separately. Compiles as
-# no_std + alloc; same rlib links into unikernel and native binaries.
+# Shared async runtime — task arena + Waker + Sleep. Calls
+# `uni_platform::now_ticks()` directly for time reads; no register/
+# plug-in indirection. Future reactor hooks (P4 UDP, P5 TCP) that
+# carry waker state will land here with their own mechanism.
 rust_library(
     name = "uni-runtime",
     srcs = ["src/lib.rs"],
     crate_name = "uni_runtime",
-    deps = ["//uni-percpu"],
+    deps = [
+        "//uni-percpu",
+        "//uni-platform",
+    ],
 )

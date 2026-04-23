@@ -2,24 +2,19 @@
 //
 // `CurrentCore` — zero-sized token whose existence proves the holder
 // is running on a specific worker (core on bare-metal, POSIX thread
-// on native). Obtained via `CurrentCore::enter()`, which calls the
-// backend's `current_worker` hook registered below.
+// on native). Obtained via `CurrentCore::enter()`, which calls
+// `uni_platform::current_worker()` directly — cfg-gated asm on
+// bare-metal, thread-local on native.
 //
 // `PerCpu<T, N>` — typed array of `N` slots indexed by worker id.
 // `T` provides its own interior mutability (`Atomic*`, `UnsafeCell`
 // behind owning-worker discipline, `Mutex`, …); the `&CurrentCore`
 // accessor is safe by construction.
-//
-// Hook: `register_current_worker(fn() -> u32)` is published once by
-// the backend at boot; `current_worker()` is the Acquire-load entry
-// used by `CurrentCore::enter`. This crate carries only the one hook
-// its own surface needs — executor hooks live in `uni-runtime`.
 
 #![no_std]
 
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicPtr, Ordering};
 
 pub mod once;
 pub mod timer;
@@ -30,31 +25,6 @@ pub use once::InitOnce;
 /// `MAX_CORES` to the same value; native treats this as a ceiling on
 /// thread-pool size.
 pub const MAX_WORKERS: usize = 8;
-
-// ---- current_worker hook ---------------------------------------------------
-//
-// Published via `AtomicPtr<fn()>` (stored as a raw pointer because
-// `AtomicFn<fn()>` would be one more layer of generic machinery than
-// this single hook needs). One Acquire load per call.
-
-static CURRENT_WORKER: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
-
-/// Publish the backend's current-worker hook. Call once at boot,
-/// before any `CurrentCore::enter`. Hook typical costs: one
-/// `TPIDR_EL1` / `GS_BASE` read on bare-metal, one pthread TLS read
-/// on native.
-pub fn register_current_worker(hook: fn() -> u32) {
-    CURRENT_WORKER.store(hook as *mut (), Ordering::Release);
-}
-
-#[inline]
-fn current_worker() -> u32 {
-    let p = CURRENT_WORKER.load(Ordering::Acquire);
-    // SAFETY: backend is expected to call `register_current_worker`
-    // before any `CurrentCore::enter` / `current_worker()` call.
-    let hook: fn() -> u32 = unsafe { core::mem::transmute(p) };
-    hook()
-}
 
 // ============================================================================
 // CurrentCore — ZST proof-of-current-worker token.
@@ -71,24 +41,24 @@ pub struct CurrentCore {
 }
 
 impl CurrentCore {
-    /// Read the current worker id from the backend runtime and bind
-    /// it into a token.
+    /// Read the current worker id from `uni_platform` and bind it
+    /// into a token.
     #[inline(always)]
     pub fn enter() -> Self {
         CurrentCore {
-            id: current_worker(),
+            id: uni_platform::current_worker(),
             _not_send: PhantomData,
         }
     }
 
     /// Construct a token from a worker id the caller already knows
     /// matches the current worker (e.g. threaded through from an
-    /// event-loop callback dispatch). Saves the hook call.
+    /// event-loop callback dispatch). Saves the `uni_platform` read.
     ///
-    /// SAFETY: caller must guarantee that `id == current_worker()` at
-    /// the time of the call AND that the token does not outlive the
-    /// iteration (which can never cross threads because `CurrentCore`
-    /// is `!Send`).
+    /// SAFETY: caller must guarantee that `id == uni_platform::
+    /// current_worker()` at the time of the call AND that the token
+    /// does not outlive the iteration (which can never cross threads
+    /// because `CurrentCore` is `!Send`).
     #[inline(always)]
     pub unsafe fn from_id_unchecked(id: u32) -> Self {
         CurrentCore {
