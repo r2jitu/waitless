@@ -10,6 +10,7 @@
 use std::cell::UnsafeCell;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::task::Waker;
 use atomic_fn::AtomicFn;
 
 /// Re-export of the shared runtime's executor surface — apps
@@ -258,7 +259,6 @@ pub fn host_ram_bytes() -> usize {
 const CONNS_PER_THREAD: usize = 64;
 const MAX_THREADS: usize = 16;
 
-#[derive(Clone, Copy)]
 struct NativeConn {
     fd: i32,
     is_listener: bool,
@@ -267,11 +267,22 @@ struct NativeConn {
     is_shared_listener: bool,
     closed: bool,
     has_pending_data: bool,
+    /// Waker parked by `TcpRecvReady` / `register_tcp_recv_hooks`.
+    /// Set on Pend, taken by `dispatch_ready_fd` when the fd fires,
+    /// cleared explicitly on Ready or on close.
+    recv_waker: Option<Waker>,
 }
 
 impl NativeConn {
     const fn empty() -> Self {
-        NativeConn { fd: -1, is_listener: false, is_shared_listener: false, closed: true, has_pending_data: false }
+        NativeConn {
+            fd: -1,
+            is_listener: false,
+            is_shared_listener: false,
+            closed: true,
+            has_pending_data: false,
+            recv_waker: None,
+        }
     }
 }
 
@@ -296,7 +307,7 @@ struct ThreadState {
 impl ThreadState {
     const fn new(id: u32) -> Self {
         ThreadState {
-            conns: [NativeConn::empty(); CONNS_PER_THREAD],
+            conns: [const { NativeConn::empty() }; CONNS_PER_THREAD],
             eq_fd: -1,
             thread_id: id,
             udp_sibs: [UdpSibling { fd: -1, binding_idx: 0 }; MAX_UDP_BINDINGS],
@@ -359,7 +370,12 @@ impl ThreadState {
     fn alloc_conn(&mut self) -> *mut NativeConn {
         for c in self.conns.iter_mut() {
             if c.closed && c.fd < 0 {
-                *c = NativeConn { fd: -1, is_listener: false, is_shared_listener: false, closed: false, has_pending_data: false };
+                c.fd = -1;
+                c.is_listener = false;
+                c.is_shared_listener = false;
+                c.closed = false;
+                c.has_pending_data = false;
+                c.recv_waker = None;
                 return c as *mut NativeConn;
             }
         }
@@ -380,6 +396,11 @@ impl ThreadState {
             (*c).has_pending_data = false;
             (*c).is_listener = false;
             (*c).is_shared_listener = false;
+            // Wake any parked recv_ready so its next poll sees `closed`
+            // and resolves Ready (callers interpret EOF as close).
+            if let Some(w) = (*c).recv_waker.take() {
+                w.wake();
+            }
         }
     }
 
@@ -447,7 +468,16 @@ impl ThreadState {
             return false;
         }
         for c in self.conns.iter_mut() {
-            if c.fd == fd { c.has_pending_data = true; break; }
+            if c.fd == fd {
+                c.has_pending_data = true;
+                // Wake any task parked on `TcpRecvReady` for this conn.
+                // Take() avoids re-waking if the event queue fires
+                // again before the task re-registers.
+                if let Some(w) = c.recv_waker.take() {
+                    w.wake();
+                }
+                break;
+            }
         }
         false
     }
@@ -631,6 +661,12 @@ fn init_native() {
         async_tcp_listen_hook,
         async_tcp_accept_hook,
     );
+    uni_runtime::net::register_tcp_recv_hooks(
+        native_tcp_has_data,
+        tcp_recv,
+        native_tcp_register_recv_waker,
+        native_tcp_clear_recv_waker,
+    );
 
     // Register TCP/UDP polling as the first IO poll callback.
     // Runs on every worker's event-loop tick and drains the worker's
@@ -745,6 +781,49 @@ fn async_tcp_accept_hook(app_port: u16) -> *mut () {
             return c as *mut ();
         }
         ptr::null_mut()
+    }
+}
+
+// ---- Async TCP recv-ready hooks ------------------------------------------
+//
+// Called from `uni_runtime::net::TcpRecvReady::poll` via the three
+// function pointers registered in `init_native`. Each operates on a
+// `NativeConn *` obtained from `async_tcp_accept_hook` and lives in
+// the owning worker's `ThreadState.conns`. No locking — the conn's
+// worker thread is the only writer of `recv_waker`; the poll site
+// runs on that same worker (TcpRecvReady is `!Send`).
+fn native_tcp_has_data(handle: *mut ()) -> bool {
+    let c = handle as *mut NativeConn;
+    unsafe {
+        if c.is_null() || (*c).closed {
+            return true; // closed → recv_ready resolves; caller sees recv()==0
+        }
+        (*c).has_pending_data
+    }
+}
+
+fn native_tcp_register_recv_waker(handle: *mut (), waker: &Waker) {
+    let c = handle as *mut NativeConn;
+    unsafe {
+        if c.is_null() || (*c).closed {
+            waker.wake_by_ref();
+            return;
+        }
+        // Avoid the clone if the stored waker will already fire the
+        // same task. `will_wake` is a best-effort check from the
+        // std Waker vtable.
+        match &(*c).recv_waker {
+            Some(w) if w.will_wake(waker) => {}
+            _ => (*c).recv_waker = Some(waker.clone()),
+        }
+    }
+}
+
+fn native_tcp_clear_recv_waker(handle: *mut ()) {
+    let c = handle as *mut NativeConn;
+    unsafe {
+        if c.is_null() { return; }
+        (*c).recv_waker = None;
     }
 }
 
