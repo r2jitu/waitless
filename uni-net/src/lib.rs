@@ -8,8 +8,8 @@ extern crate alloc;
 
 extern crate uni_net_driver;
 pub use uni_net_driver::{
-    linked_ethernet_drivers, register_ethernet_driver, DhcpError, EthernetDriver,
-    EthernetDriverReg, NetError, NicError, NicHandle,
+    linked_ethernet_drivers, register_ethernet_driver, DhcpError, EthernetDriverReg,
+    NetError, NicError, NicDiagOps, NicIdleOps, NicOps,
 };
 
 // Bare-metal pulls the full net umbrella; native uses POSIX sockets.
@@ -121,7 +121,7 @@ impl Net {
             }
             let mut any_probed = false;
             for reg in drivers {
-                if reg.driver.probe().is_some() {
+                if (reg.ops.probe)() {
                     any_probed = true;
                     break;
                 }
