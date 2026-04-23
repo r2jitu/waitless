@@ -389,23 +389,6 @@ fn open_udp_sibling(host_port: u16) -> Result<i32, String> {
     }
 }
 
-/// Open `cpu_count` sibling sockets for a UDP relay port. At least one
-/// must succeed; caller reports the error if none do.
-fn open_udp_relay(host_port: u16, cpu_count: usize) -> Result<Vec<i32>, String> {
-    let mut fds = Vec::with_capacity(cpu_count);
-    for i in 0..cpu_count {
-        match open_udp_sibling(host_port) {
-            Ok(fd) => fds.push(fd),
-            Err(e) if i == 0 => return Err(e),
-            Err(e) => {
-                eprintln!("  warning: relay {host_port} sibling {i}: {e}");
-                break;
-            }
-        }
-    }
-    Ok(fds)
-}
-
 pub fn start(mappings: &[PortMapping], cpu_count: usize) -> Result<[u8; 6], String> {
     let mac: [u8; 6] = GUEST_MAC;
     let cpu_count = cpu_count.max(1);
@@ -417,8 +400,18 @@ pub fn start(mappings: &[PortMapping], cpu_count: usize) -> Result<[u8; 6], Stri
     // is thread-safe on a single fd (kernel serializes), so this
     // first-come-first-served pattern needs no extra locking.
     let mut listens: Vec<TcpListen> = Vec::new();
-    // UDP keeps per-vCPU SO_REUSEPORT siblings — that mechanism does
-    // distribute on macOS. Each vCPU drains its own sibling inline.
+    // UDP uses the SAME shared-fd pattern now. We previously opened
+    // one SO_REUSEPORT sibling per vCPU on the theory that macOS
+    // distributes UDP across siblings (it's documented to), but
+    // empirically on darwin 24/M2 all packets hash to a single
+    // sibling — instrumentation under `udp_peak` 2 c showed
+    // vcpu0=0, vcpu1=150 000 after 6 s of load, leaving one vCPU
+    // 100 % idle and the other saturated at ~25 k pkt/s.
+    // A single shared fd polled by every vCPU, with `recvfrom`
+    // racing at the kernel (the socket receive lock serialises),
+    // gives us real load distribution on macOS. Linux still gets
+    // SO_REUSEPORT-style 4-tuple hashing from its own kernel if
+    // siblings ever become worth re-adding for that host.
     let mut per_worker_udps: Vec<Vec<UdpRelay>> =
         (0..cpu_count).map(|_| Vec::new()).collect();
     let mut relay_table: Vec<UdpRelayFds> = Vec::new();
@@ -429,14 +422,19 @@ pub fn start(mappings: &[PortMapping], cpu_count: usize) -> Result<[u8; 6], Stri
                 let fd = bind_listen(m.host)?;
                 listens.push(TcpListen { fd, guest_port: m.guest });
             }
-            Proto::Udp => match open_udp_relay(m.host, cpu_count) {
-                Ok(fds) => {
-                    for (worker_id, &fd) in fds.iter().enumerate() {
+            Proto::Udp => match open_udp_sibling(m.host) {
+                Ok(fd) => {
+                    // One fd shared across every vCPU's pollfds.
+                    for worker_id in 0..cpu_count {
                         per_worker_udps[worker_id].push(UdpRelay {
                             fd,
                             guest_port: m.guest,
                         });
                     }
+                    // `relay_table.fds` is still a vec for the TX
+                    // side's per-vCPU lookup, but every entry is
+                    // the same shared fd.
+                    let fds = vec![fd; cpu_count.max(1)];
                     relay_table.push(UdpRelayFds {
                         guest_port: m.guest,
                         fds,
