@@ -23,6 +23,7 @@ from .envs import (
 from .workloads import (
     _udp_with_retry,
     next_port,
+    run_tcp_echo,
     run_tls_handshake_rate,
     run_wrk,
     run_wrk_https,
@@ -119,6 +120,23 @@ WORKLOADS = [
      "endpoint": "/health",
      "parallelism_per_core": 4,
      "desc": "TLS 1.3 full handshake + GET + close (4 workers × cpus)"},
+
+    # ── Async TCP echo (guest:9 via `uni::runtime::TcpListener`) ─────────
+    #
+    # Validates the async TCP path end-to-end: accept reactor +
+    # `TcpRecv` future + per-conn recv waker. The webserver echoes
+    # each received message verbatim, so this is pure runtime
+    # overhead plus the network stack, no HTTP parsing.
+    #
+    # tcp_echo_c1 is the single-flow latency / small-message rate,
+    # tcp_echo_max is the scaled-conn throughput mirroring
+    # health_max / compute_max.
+    {"name": "tcp_echo_c1", "type": "tcp_echo",
+     "conns": 1,
+     "desc": "Async TCP echo × 1 conn (single-flow ping-pong)"},
+    {"name": "tcp_echo_max", "type": "tcp_echo",
+     "conns_per_core": 16,
+     "desc": "Async TCP echo throughput (16 conn × cpus)"},
 ]
 
 
@@ -287,6 +305,8 @@ def main():
                     wrk_port = env.GUEST_PORT
                     tls_target_port = env.GUEST_TLS_PORT
                     udp_target_port = env.GUEST_UDP_PORT
+                    tcp_echo_target_port = getattr(
+                        env, "GUEST_TCP_ECHO_PORT", None)
                 else:
                     wrk_host = "localhost"
                     wrk_port = bench_port
@@ -294,6 +314,9 @@ def main():
                     tls_target_port = bench_port + tls_off
                     udp_off = getattr(env, 'udp_port_offset', 1)
                     udp_target_port = bench_port + udp_off
+                    tcp_echo_off = getattr(env, 'tcp_echo_offset', None)
+                    tcp_echo_target_port = (
+                        bench_port + tcp_echo_off if tcp_echo_off else None)
 
                 # Workloads that scale with cpu count compute their final
                 # conn / thread / sender counts here. Static workloads keep
@@ -361,6 +384,15 @@ def main():
                     results[(env_name, cpus, wname)] = (pps, p50, p99)
                     print(f"    {wname:<20s} {pps:>10.0f} pkt/s  "
                           f"({best_n}x{cpus} in-flight, {loss_pct:.1f}% loss)")
+                elif w["type"] == "tcp_echo":
+                    if tcp_echo_target_port is None:
+                        print(f"    {wname:<20s} SKIP (env has no tcp_echo port)")
+                        continue
+                    time.sleep(0.5)
+                    rps, p50, p99 = run_tcp_echo(
+                        tcp_echo_target_port, conns, duration, host=wrk_host)
+                    results[(env_name, cpus, wname)] = (rps, p50, p99)
+                    print(f"    {wname:<20s} {rps:>10.0f} msg/s  p50={p50}  p99={p99}")
 
                 env.stop(proc)
                 _current["proc"] = None

@@ -240,6 +240,8 @@ class NativeEnv:
     # outbound sockets, and to be predictable for the bench
     # dispatch loop.
     tls_port_offset = 1000
+    udp_port_offset = 1      # host UDP port = guest HTTP port + 1
+    tcp_echo_offset = 2      # async TCP echo port (guest:9)
 
     # Path to pre-staged native binary; set via --native-bin. If None, bazel build runs.
     bin_override = None
@@ -261,6 +263,9 @@ class NativeEnv:
         env["UNIKERNEL_TCP_80"] = str(port)
         env["UNIKERNEL_TCP_443"] = str(port + self.tls_port_offset)
         env["UNIKERNEL_UDP_7"] = str(port + 1)
+        # Async TCP echo benches target guest port 9 via the
+        # `tcp_echo_offset` offset below.
+        env["UNIKERNEL_TCP_9"] = str(port + NativeEnv.tcp_echo_offset)
         env["UNIKERNEL_CPUS"] = str(cpus)
         return subprocess.Popen(
             [bin_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
@@ -279,6 +284,7 @@ class HvfEnv:
     label = "HVF"
     udp_port_offset = 10000  # host UDP port = guest port + 10000
     tls_port_offset = 1000   # host TLS port = guest HTTP port + 1000
+    tcp_echo_offset = 2000   # host TCP echo port (guest:9)
 
     def build(self):
         # `:webserver_hvf` bundles both the transitioned aarch64
@@ -300,14 +306,16 @@ class HvfEnv:
         log = open(f"/tmp/hvf_{port}.log", "w")
         udp_port = port + self.udp_port_offset
         tls_port = port + self.tls_port_offset
+        tcp_echo_port = port + self.tcp_echo_offset
         # -p tcp:HOST:GUEST forwards HTTP to guest:80; -p tcp:HOST:443
-        # forwards HTTPS to guest:443; -p udp:HOST:GUEST forwards the
-        # UDP echo test to guest:7.
+        # forwards HTTPS to guest:443; -p tcp:HOST:9 forwards the
+        # async TCP echo test; -p udp:HOST:GUEST forwards UDP echo.
         return subprocess.Popen(
             [run_hvf, img,
              "--ram=128", f"--cpus={cpus}",
              "-p", f"tcp:{port}:80",
              "-p", f"tcp:{tls_port}:443",
+             "-p", f"tcp:{tcp_echo_port}:9",
              "-p", f"udp:{udp_port}:7"],
             stdin=subprocess.DEVNULL, stdout=log, stderr=log)
 

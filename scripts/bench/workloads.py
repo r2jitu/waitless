@@ -414,6 +414,105 @@ def _udp_concurrent_probe(port, slots_per_thread, duration, host,
     return recv, loss or 0.0, p50, p99
 
 
+def run_tcp_echo(port, conns, duration, host="127.0.0.1", msg_size=64):
+    """Pump ping-pong messages over `conns` TCP connections for
+    `duration` seconds. Returns (recv_rps, p50, p99, sent_msgs).
+
+    Measures the full async TCP path: accept → recv.await → send.
+    Latency samples are collected only from thread 0 to keep
+    bookkeeping light; throughput aggregates across all threads.
+
+    Python's GIL is a real ceiling here (~200 k msg/s on one thread
+    is typical), so for high-conn counts we fork processes instead
+    of threads — same trick `udp_bench.c` uses.
+    """
+    import multiprocessing as mp
+    import socket
+    import struct
+    import time as _t
+
+    msg = b"p" * msg_size
+    msg_len = len(msg)
+    deadline = _t.monotonic() + duration
+
+    def worker(sample_latency, barrier, result_q):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.settimeout(5.0)
+        try:
+            sock.connect((host, port))
+        except OSError:
+            barrier.wait()
+            result_q.put((0, b""))
+            return
+
+        sock.settimeout(None)
+        buf = bytearray(msg_len)
+        view = memoryview(buf)
+        latencies = []
+        count = 0
+        # Synchronise start so per-worker ramp doesn't skew results.
+        barrier.wait()
+        while _t.monotonic() < deadline:
+            if sample_latency:
+                t0 = _t.monotonic_ns()
+            sock.sendall(msg)
+            got = 0
+            while got < msg_len:
+                n = sock.recv_into(view[got:], msg_len - got)
+                if n == 0:
+                    break
+                got += n
+            if got < msg_len:
+                break
+            if sample_latency:
+                latencies.append(_t.monotonic_ns() - t0)
+            count += 1
+        sock.close()
+        # Compact latency list into bytes to cheaply move across the
+        # multiprocessing boundary.
+        if latencies:
+            lat_bytes = struct.pack(f"<{len(latencies)}Q", *latencies)
+        else:
+            lat_bytes = b""
+        result_q.put((count, lat_bytes))
+
+    procs = []
+    ctx = mp.get_context("fork")
+    barrier = ctx.Barrier(conns + 1)
+    result_q = ctx.Queue()
+    for i in range(conns):
+        p = ctx.Process(target=worker, args=(i == 0, barrier, result_q))
+        p.start()
+        procs.append(p)
+    barrier.wait()  # release workers — clock now starts
+    start = _t.monotonic()
+
+    total = 0
+    lat_bytes = b""
+    for _ in procs:
+        c, lb = result_q.get(timeout=duration + 10)
+        total += c
+        if lb and not lat_bytes:
+            lat_bytes = lb
+    for p in procs:
+        p.join(timeout=2)
+        if p.is_alive():
+            p.terminate()
+
+    elapsed = max(1e-6, _t.monotonic() - start)
+    rps = total / elapsed
+
+    if lat_bytes:
+        count = len(lat_bytes) // 8
+        lats = list(struct.unpack(f"<{count}Q", lat_bytes))
+        lats.sort()
+        p50_us = lats[len(lats) // 2] / 1000.0
+        p99_us = lats[min(len(lats) - 1, len(lats) * 99 // 100)] / 1000.0
+        return rps, f"{p50_us:.1f}us", f"{p99_us:.1f}us"
+    return rps, "", ""
+
+
 def udp_peak_concurrent(port, duration, host, client_cpus=1, timeout_ms=100):
     """Find peak windowed-UDP throughput by sweeping the concurrency
     levels in `_UDP_PEAK_LEVELS` and taking the max.
