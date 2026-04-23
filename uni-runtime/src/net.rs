@@ -614,6 +614,100 @@ impl<'a> Future for TcpAccept<'a> {
     }
 }
 
+// ---- Per-stream async recv -------------------------------------------------
+//
+// `TcpStream::recv(buf).await` resolves with the byte count once the
+// backend has data available on the underlying conn (or zero on peer
+// close). The backend owns the readiness signal (kqueue/epoll on
+// native, rx-ring enqueue on bare-metal) and parks / wakes a single
+// per-stream `Waker` registered via the hooks below. The stream
+// handle is an opaque `*mut ()` — identical to the `RawTcpStream`
+// the accept reactor returns.
+//
+// Hook contract:
+// - `TCP_HAS_DATA(h)` — cheap non-blocking probe. `true` also on
+//   close so the caller's `recv` returns `0`.
+// - `TCP_DO_RECV(h, buf)` — sync read into `buf`; returns bytes
+//   copied (`0` = EOF / close).
+// - `TCP_REGISTER_RECV_WAKER(h, waker)` — store this waker. Called
+//   before the final has-data re-check; the backend de-dupes with
+//   `Waker::will_wake` to avoid churn.
+// - `TCP_CLEAR_RECV_WAKER(h)` — drop the stored waker. Called after
+//   Ready so a later data arrival doesn't wake a stale task.
+
+static TCP_HAS_DATA: AtomicFn<fn(handle: *mut ()) -> bool> = AtomicFn::null();
+static TCP_DO_RECV: AtomicFn<fn(handle: *mut (), buf: &mut [u8]) -> usize> =
+    AtomicFn::null();
+static TCP_REGISTER_RECV_WAKER: AtomicFn<fn(handle: *mut (), waker: &Waker)> =
+    AtomicFn::null();
+static TCP_CLEAR_RECV_WAKER: AtomicFn<fn(handle: *mut ())> = AtomicFn::null();
+
+/// Register backend hooks for the async recv primitive. Called once
+/// at boot alongside `register_tcp_backend`. Both native and bare-
+/// metal wire up all four.
+pub fn register_tcp_recv_hooks(
+    has_data: fn(handle: *mut ()) -> bool,
+    do_recv: fn(handle: *mut (), buf: &mut [u8]) -> usize,
+    register_waker: fn(handle: *mut (), waker: &Waker),
+    clear_waker: fn(handle: *mut ()),
+) {
+    TCP_HAS_DATA.store(has_data);
+    TCP_DO_RECV.store(do_recv);
+    TCP_REGISTER_RECV_WAKER.store(register_waker);
+    TCP_CLEAR_RECV_WAKER.store(clear_waker);
+}
+
+/// Future returned by `TcpStream::recv`. Holds a mutable borrow of
+/// the caller's buffer. `!Send` because the underlying handle points
+/// into per-worker state.
+pub struct TcpRecv<'a> {
+    handle: *mut (),
+    buf: &'a mut [u8],
+    _not_send: PhantomData<*mut ()>,
+}
+
+impl<'a> TcpRecv<'a> {
+    #[inline]
+    pub fn new(handle: *mut (), buf: &'a mut [u8]) -> Self {
+        TcpRecv { handle, buf, _not_send: PhantomData }
+    }
+}
+
+impl<'a> Future for TcpRecv<'a> {
+    type Output = usize;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<usize> {
+        let this = self.get_mut();
+        let has = match TCP_HAS_DATA.load() {
+            Some(f) => f,
+            None => return Poll::Pending,
+        };
+        let do_recv = match TCP_DO_RECV.load() {
+            Some(f) => f,
+            None => return Poll::Pending,
+        };
+        // Fast path — probe, read, clear any stale waker.
+        if has(this.handle) {
+            if let Some(clear) = TCP_CLEAR_RECV_WAKER.load() {
+                clear(this.handle);
+            }
+            return Poll::Ready(do_recv(this.handle, this.buf));
+        }
+        // Register waker, then re-check — closes the wake-before-park
+        // race with the backend's wake site.
+        if let Some(reg) = TCP_REGISTER_RECV_WAKER.load() {
+            reg(this.handle, cx.waker());
+        }
+        if has(this.handle) {
+            if let Some(clear) = TCP_CLEAR_RECV_WAKER.load() {
+                clear(this.handle);
+            }
+            return Poll::Ready(do_recv(this.handle, this.buf));
+        }
+        Poll::Pending
+    }
+}
+
 /// Notify the reactor that the backend has a newly accept-able
 /// connection for `dst_port`. Must be called from the core that
 /// owns the new connection (bare-metal: core whose RX queue
