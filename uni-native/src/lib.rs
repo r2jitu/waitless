@@ -12,6 +12,8 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use atomic_fn::AtomicFn;
 
+pub mod executor;
+
 // ============================================================================
 // libc FFI declarations
 // ============================================================================
@@ -1112,6 +1114,10 @@ pub fn run_worker(worker_id: u32) {
         if let Some(f) = get_service() {
             if f(worker_id) { did_work = true; }
         }
+
+        // 2a. Async runtime: poll spawned futures. Parallels the
+        // unikernel's `kernel::executor::tick`.
+        if executor::tick(worker_id) { did_work = true; }
 
         // 3. Idle if no work
         if !did_work {

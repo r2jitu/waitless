@@ -21,6 +21,10 @@ unikernel_binary(
     name = "test_smp",
     app = ":app",
     cpus = 4,
+    # App depends on `//kernel` (SMP startup + IPI paths), which is
+    # unikernel-only. Skip the `_native` target — it would fail with
+    # a transitive `@platforms//os:none` incompatibility.
+    build_native = False,
 )
 
 # SMP boot + IPI test. Runs on HVF (real aarch64 hardware) + both

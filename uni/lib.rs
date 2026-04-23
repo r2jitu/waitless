@@ -199,6 +199,9 @@ mod backend {
     pub use kernel::percpu::num_cores as num_workers;
     pub use kernel::eventloop::{set_service, set_ready, request_shutdown};
 
+    // Async runtime — backend dispatch for `uni::executor`.
+    pub use uni_kernel::executor::{spawn as executor_spawn, sleep_us as executor_sleep_us};
+
     /// Register an IO poll callback. On unikernel, this is handled by
     /// kernel::eventloop callbacks (net_poll, net_drain, etc). For app-level
     /// IO sources, this is a placeholder — real registration goes through
@@ -240,6 +243,7 @@ mod backend {
         tcp_is_closed, tcp_poll, tcp_listen_on, udp_bind, udp_send,
         num_workers, register_io_poll, set_service, set_ready, request_shutdown,
     };
+    pub use uni_native::executor::{spawn as executor_spawn, sleep_us as executor_sleep_us};
 
     pub fn net_rx_counts() -> [u64; 8] { [0; 8] }
     pub fn net_num_queue_pairs() -> u16 { 1 }
@@ -252,6 +256,34 @@ mod backend {
 
 pub use backend::{log, config_port, config_tls_port, check_shutdown, wait_for_events, tcp_poll};
 pub use backend::{num_workers, set_service, set_ready, request_shutdown, register_io_poll};
+
+// ---- Async runtime ---------------------------------------------------------
+//
+// Cross-platform wrapper over the backend's executor. On the unikernel
+// this dispatches into `kernel::executor` (polled by `kernel::eventloop`);
+// on native it dispatches into `uni_native::executor` (polled by
+// `uni_native::run_worker`). Same `async fn` app code runs either way.
+
+pub mod executor {
+    use core::future::Future;
+
+    /// Spawn a future onto the current worker / core's task list.
+    /// `Err(())` if the arena is full.
+    #[inline]
+    pub fn spawn<F>(f: F) -> Result<(), ()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        super::backend::executor_spawn(f)
+    }
+
+    /// Sleep for `us` microseconds. Returns an opaque `impl Future`
+    /// so the backend-specific Sleep type doesn't leak.
+    #[inline]
+    pub fn sleep_us(us: u64) -> impl Future<Output = ()> {
+        super::backend::executor_sleep_us(us)
+    }
+}
 
 /// Create a TCP listener on `port`, bound to a specific worker.
 /// `uni_http` uses this to set up per-worker SO_REUSEPORT listeners

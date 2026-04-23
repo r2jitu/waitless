@@ -8,14 +8,13 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "app",
     srcs = ["main.rs"],
-    deps = [
-        "//kernel",
-        "//uni",
-    ],
+    deps = ["//uni"],
 )
 
 # Single-core is enough — the executor is per-core and the test only
 # spawns on the BSP. Serial-log-only assertions → no port forwards.
+# Same `async fn` body runs on the unikernel and natively; `uni::
+# executor` dispatches to `kernel::executor` / `uni_native::executor`.
 unikernel_binary(
     name = "test_async",
     app = ":app",
@@ -39,6 +38,7 @@ unikernel_app_test(
         "hvf",
         "qemu_aarch64",
         "qemu_x86_64",
+        "native",
     ],
     deps = ["//scripts:test_helpers"],
 )

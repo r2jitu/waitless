@@ -33,6 +33,15 @@ pub fn check_shutdown() -> bool {
     serial::check_shutdown()
 }
 
+// ---- Async runtime re-exports ----------------------------------------------
+//
+// Lets `uni::executor` dispatch to `kernel::executor` on the unikernel
+// side without every app having to name `//kernel` directly.
+
+pub mod executor {
+    pub use kernel::executor::{sleep_us, spawn, Sleep};
+}
+
 // ---- Wait for events --------------------------------------------------------
 
 /// RAII guard that masks IRQs on construction and unmasks on drop.

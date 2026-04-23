@@ -144,6 +144,7 @@ def unikernel_binary(
         port_forwards = [],
         ram_mb = 128,
         cpus = 1,
+        build_native = True,
         visibility = None):
     """Package a Rust application into bootable unikernel images.
 
@@ -191,6 +192,15 @@ def unikernel_binary(
           via `UNIKERNEL_MEMORY`.
         cpus: default vCPU count, overridable at run time via
           `UNIKERNEL_CPUS`.
+        build_native: when True (the default), also emit a
+          `<name>_native` rust_binary that links the app against
+          libstd and the `uni_native` POSIX backend. Kernel-only
+          smoke tests (test_smp, test_percpu) whose `app` depends on
+          `//kernel` must pass `build_native = False`; otherwise
+          `bazel run :<name>_native` fails with a transitive
+          `@platforms//os:none` incompatibility. Named `build_native`
+          rather than `native` because starlark reserves `native` for
+          the built-in rules module.
         visibility: Bazel visibility specification.
     """
 
@@ -369,26 +379,32 @@ def unikernel_binary(
     # dep-chain rlibs (uni, uni-net, net/*, app) stay `#![no_std]`
     # but compile cleanly under any panic strategy because rlibs
     # don't own a panic handler.
-    rust_binary(
-        name = name + "_native",
-        srcs = ["//bazel/rules:native_main.rs"],
-        deps = [app, "//uni"],
-        rustc_flags = select({
-            "@platforms//os:macos": ["-C", "link-arg=-lSystem"],
-            # Linux musl: static binary, no external sysroot needed.
-            # Rust ships a self-contained musl libc + crt.
-            "//conditions:default": [
-                "-C",
-                "linker-flavor=ld.lld",
-                "-C",
-                "target-feature=+crt-static",
-                "-C",
-                "link-arg=-lc",
-            ],
-        }),
-        target_compatible_with = ["//bazel/platforms:native"],
-        visibility = visibility,
-    )
+    #
+    # Skipped entirely when `build_native = False` so kernel-only apps
+    # (those whose `app` transitively depends on `//kernel`) don't
+    # advertise an unrunnable target that fails with a confusing
+    # transitive-incompatibility error when invoked.
+    if build_native:
+        rust_binary(
+            name = name + "_native",
+            srcs = ["//bazel/rules:native_main.rs"],
+            deps = [app, "//uni"],
+            rustc_flags = select({
+                "@platforms//os:macos": ["-C", "link-arg=-lSystem"],
+                # Linux musl: static binary, no external sysroot needed.
+                # Rust ships a self-contained musl libc + crt.
+                "//conditions:default": [
+                    "-C",
+                    "linker-flavor=ld.lld",
+                    "-C",
+                    "target-feature=+crt-static",
+                    "-C",
+                    "link-arg=-lc",
+                ],
+            }),
+            target_compatible_with = ["//bazel/platforms:native"],
+            visibility = visibility,
+        )
 
     # ── Per-runner variants — `:<name>_hvf` / `_iso` / `_qemu_<arch>` ────
     # Each variant is a runnable target that transitions its sub-graph

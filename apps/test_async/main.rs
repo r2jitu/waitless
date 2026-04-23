@@ -1,34 +1,33 @@
 // apps/test_async — Async-runtime smoke test.
 //
 // Spawns a future that logs, sleeps on a timer, logs again, then
-// requests shutdown. Exercises `kernel::executor::spawn`, the
-// per-core task arena, the RawWakerVTable, the Sleep future, and
-// the timer-wheel integration in `kernel::eventloop`.
+// requests shutdown. Exercises `uni::executor::spawn`, the backend
+// task arena (kernel on unikernel / std on native), the waker wiring
+// and the `Sleep` future end-to-end.
 
 #![no_std]
 
-extern crate kernel;
 extern crate uni;
 
 #[uni::boot]
 fn boot() {
     uni::log(b"test_async: boot\n");
 
-    let spawn_result = kernel::executor::spawn(async {
+    let spawn_result = uni::executor::spawn(async {
         uni::log(b"test_async: task started\n");
-        kernel::executor::sleep_us(50_000).await;
+        uni::executor::sleep_us(50_000).await;
         uni::log(b"test_async: task woke up\n");
 
-        let nested = kernel::executor::spawn(async {
-            kernel::executor::sleep_us(10_000).await;
+        let nested = uni::executor::spawn(async {
+            uni::executor::sleep_us(10_000).await;
             uni::log(b"test_async: nested task done\n");
-            kernel::eventloop::request_shutdown();
+            uni::request_shutdown();
         });
         match nested {
             Ok(()) => uni::log(b"test_async: nested spawn ok\n"),
             Err(()) => {
                 uni::log(b"test_async: nested spawn FAILED\n");
-                kernel::eventloop::request_shutdown();
+                uni::request_shutdown();
             }
         }
     });
@@ -37,10 +36,10 @@ fn boot() {
         Ok(()) => uni::log(b"test_async: spawn ok\n"),
         Err(()) => {
             uni::log(b"test_async: spawn FAILED\n");
-            kernel::eventloop::request_shutdown();
+            uni::request_shutdown();
         }
     }
 
-    // Release the event loop so every core starts polling.
-    kernel::eventloop::set_ready();
+    // Release the event loop / worker pool so tasks start being polled.
+    uni::set_ready();
 }

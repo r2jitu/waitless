@@ -10,7 +10,10 @@ package(default_visibility = ["//visibility:public"])
 # is shared, for the `IO_POLL` / `SERVICE` slots.
 rust_library(
     name = "uni-native",
-    srcs = ["src/lib.rs"],
+    srcs = [
+        "src/executor.rs",
+        "src/lib.rs",
+    ],
     crate_name = "uni_native",
     target_compatible_with = ["//bazel/platforms:native"],
     deps = ["//util/atomic_fn"],

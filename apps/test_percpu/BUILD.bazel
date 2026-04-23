@@ -20,6 +20,9 @@ unikernel_binary(
     name = "test_percpu",
     app = ":app",
     cpus = 4,
+    # App depends on `//kernel` (per-core state primitives), which is
+    # unikernel-only. Skip the `_native` target.
+    build_native = False,
 )
 
 # Per-core state test. Runs on HVF (real aarch64 hardware) + both
