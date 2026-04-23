@@ -17,9 +17,10 @@ rust_library(
     # `uni::net` so apps don't need to learn a new import path.
     #
     # Platform backend is picked by target_os via the select below:
-    # `//uni-kernel` for bare metal (log/wait_for_events/arch idle
-    # on top of `kernel` + `drivers`), `//uni-native` for host POSIX
-    # (libc sockets, pthread workers, kqueue/epoll event loop).
+    # `//backend-unikernel` for bare metal (log/wait_for_events/arch
+    # idle on top of `kernel` + `drivers`), `//backend-native` for
+    # host POSIX (libc sockets, pthread workers, kqueue/epoll event
+    # loop).
     # `//kernel` + `//drivers` stay here as direct deps because
     # `uni/lib.rs` itself still calls into them (eventloop hooks,
     # NIC driver diagnostics).
@@ -32,7 +33,7 @@ rust_library(
         "//conditions:default": [
             "//drivers",
             "//kernel",
-            "//uni-kernel",
+            "//backend-unikernel",
         ],
     }),
 )

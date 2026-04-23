@@ -1,12 +1,9 @@
-// uni-kernel/src/lib.rs — Bare-metal backend for the `uni` runtime.
+// backend-unikernel/src/lib.rs — Bare-metal backend for `uni`.
 //
-// Sibling of `uni-native`: both fit behind `uni`'s `mod backend`
-// dispatch. This crate owns the glue that maps `uni`'s
-// cross-platform API (log, config_port, check_shutdown,
-// wait_for_events) onto `kernel` + `drivers::net`.
-//
-// CPU primitives (idle, relax, mask/unmask IRQ) live in
-// `kernel::cpu` — we just consume them here.
+// Sibling of `//backend-native`; selected by `target_os = "none"`
+// in `//uni`'s deps. Maps `uni`'s cross-platform API
+// (log / config_port / check_shutdown / wait_for_events) onto
+// `//kernel` + `//drivers`.
 
 #![no_std]
 

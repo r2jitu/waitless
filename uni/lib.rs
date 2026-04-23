@@ -1,5 +1,5 @@
 // Platform abstraction: `TcpListener`, `TcpStream`, `log`, `config_port`,
-// etc. Backend dispatched by `target_os` — `uni_kernel` on bare-metal,
+// etc. Backend dispatched by `target_os` — `backend_unikernel` on bare-metal,
 // `uni_native` on hosted.
 
 #![no_std]
@@ -13,7 +13,7 @@ extern crate kernel;
 #[cfg(target_os = "none")]
 extern crate drivers;
 #[cfg(target_os = "none")]
-extern crate uni_kernel;
+extern crate backend_unikernel;
 
 #[cfg(not(target_os = "none"))]
 extern crate uni_native;
@@ -180,7 +180,7 @@ fn install_shutdown_hook() {}
 
 #[cfg(target_os = "none")]
 mod backend {
-    pub use uni_kernel::{log, config_port, config_tls_port, check_shutdown, wait_for_events};
+    pub use backend_unikernel::{log, config_port, config_tls_port, check_shutdown, wait_for_events};
     pub use net::tcp::{listen as tcp_listen, accept as tcp_accept, has_data as tcp_has_data,
                        recv as tcp_recv, send as tcp_send, close as tcp_close,
                        is_closed as tcp_is_closed, listen_on_core as tcp_listen_on};
@@ -200,7 +200,7 @@ mod backend {
     pub use kernel::eventloop::{set_service, set_ready, request_shutdown};
 
     // Async runtime — backend dispatch for `uni::executor`.
-    pub use uni_kernel::executor::{spawn as executor_spawn, sleep_us as executor_sleep_us};
+    pub use backend_unikernel::executor::{spawn as executor_spawn, sleep_us as executor_sleep_us};
 
     /// Register an IO poll callback. On unikernel, this is handled by
     /// kernel::eventloop callbacks (net_poll, net_drain, etc). For app-level
