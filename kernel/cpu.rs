@@ -115,3 +115,36 @@ pub fn idle_unbounded() {
         core::arch::asm!("wfi", options(nomem, nostack));
     }
 }
+
+/// Idle until the virtual timer fires `cycles` from now, or an IRQ
+/// arrives — whichever comes first. Unlike [`idle_bounded`], this
+/// *always* uses the CNTV timer even when an HVF yield register is
+/// advertised, because the yield path only wakes on host-driven IO
+/// and an async task waiting on a `Sleep` future has no such signal.
+///
+/// x86_64: no per-idle timer is wired up yet (no LAPIC oneshot
+/// configured), so this busy-spins until `cycles` TSC ticks elapse.
+/// Correct but not power-efficient — the proper fix is a one-shot
+/// LAPIC timer + handler, tracked in the roadmap.
+#[inline]
+pub fn idle_until_cycles(cycles: u64) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let deadline = crate::time::now_cycles().saturating_add(cycles);
+        while crate::time::now_cycles() < deadline {
+            unsafe {
+                core::arch::asm!("pause", options(nomem, nostack));
+            }
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let tval = cycles.max(1);
+        core::arch::asm!("msr cntv_tval_el0, {}", in(reg) tval);
+        core::arch::asm!("msr cntv_ctl_el0, {}", in(reg) 1u64); // ENABLE
+        core::arch::asm!("isb", options(nomem, nostack));
+        core::arch::asm!("wfi", options(nomem, nostack));
+        core::arch::asm!("msr cntv_ctl_el0, {}", in(reg) 0u64); // DISABLE
+        core::arch::asm!("isb", options(nomem, nostack));
+    }
+}

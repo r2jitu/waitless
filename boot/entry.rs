@@ -463,28 +463,32 @@ unsafe fn kernel_boot(info: &BootInfo) {
         klog!("[INIT] Interrupt-driven idle...\n");
         drivers::net::enable_irq();
 
-        #[cfg(target_arch = "aarch64")]
-        {
-            let fdt = &*fdt::info_ptr();
-            if fdt.gic_dist_base != 0 {
-                exceptions::enable_timer_wakeup();
-                // Enable SGI 0 on core 0 so APs can wake it from WFI via wake_core0().
-                // Without this, SGI 0 is pending in GICR but never forwarded to the
-                // CPU interface (bit 0 of GICR_ISENABLER0 is 0), so WFI never returns.
-                exceptions::register_irq(0, smp::sgi_handler);
-            }
-            // Unmask IRQ only; leave FIQ masked since Apple hypervisors
-            // reserve FIQ for themselves and unmasking it crashes the guest.
-            if fdt.gic_dist_base != 0 {
-                core::arch::asm!("msr daifclr, #0x2", options(nomem, nostack));
-            }
-        }
         #[cfg(target_arch = "x86_64")]
         {
             // Serial RX interrupt (IRQ4 / vector 36) for Ctrl-C wakeup
             kernel::x86_64::idt::register_handler(36, serial_rx_isr_trampoline);
             kernel::x86_64::idt::enable_irq(4);
             serial::enable_rx_irq();
+        }
+    }
+
+    // Idle-path infrastructure (timer IRQ + SGI handler + IRQ unmask) is
+    // orthogonal to the NIC. Apps without networking still need
+    // `kernel::cpu::idle_bounded` to wake from WFI when the 1 ms
+    // generic-timer fires — `kernel::executor`'s `Sleep` future depends
+    // on it.
+    #[cfg(target_arch = "aarch64")]
+    {
+        let fdt = &*fdt::info_ptr();
+        if fdt.gic_dist_base != 0 {
+            exceptions::enable_timer_wakeup();
+            // Enable SGI 0 on core 0 so APs can wake it from WFI via wake_core0().
+            // Without this, SGI 0 is pending in GICR but never forwarded to the
+            // CPU interface (bit 0 of GICR_ISENABLER0 is 0), so WFI never returns.
+            exceptions::register_irq(0, smp::sgi_handler);
+            // Unmask IRQ only; leave FIQ masked since Apple hypervisors
+            // reserve FIQ for themselves and unmasking it crashes the guest.
+            core::arch::asm!("msr daifclr, #0x2", options(nomem, nostack));
         }
     }
 

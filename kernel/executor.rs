@@ -198,6 +198,24 @@ pub fn tick(core_id: u32) -> bool {
     did_work
 }
 
+/// Does this core have async work that might wake on its own — either
+/// a timer pending in the wheel, or a task slot already flagged ready?
+/// The event loop uses this to pick the right idle flavour: when true,
+/// it must bound the sleep on the local timer rather than relying on
+/// the HVF yield register (which only wakes on host IO).
+pub fn has_pending(core_id: u32) -> bool {
+    // SAFETY: caller guarantees `core_id` is the running core.
+    let cc = unsafe { CurrentCore::from_id_unchecked(core_id) };
+    if wheel(&cc).count() > 0 {
+        return true;
+    }
+    let arena = ARENAS.current(&cc);
+    arena
+        .slots
+        .iter()
+        .any(|s| s.ready.load(Ordering::Acquire))
+}
+
 fn poll_slot(slot: &TaskSlot) {
     let waker = make_waker_for(slot as *const TaskSlot);
     let mut cx = Context::from_waker(&waker);

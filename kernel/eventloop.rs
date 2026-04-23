@@ -225,10 +225,18 @@ pub fn run(core_id: u32) -> ! {
             // Sleep until interrupt. WFI/HLT yields the CPU to the
             // host; the hypervisor resumes us when an interrupt fires.
             idle_streak = 0;
-            if let Some(f) = IDLE.load() {
+            if crate::executor::has_pending(core_id) {
+                // The executor has a pending timer or a task ready to
+                // re-poll. Force a local-timer-bounded idle so we wake
+                // promptly — the normal IDLE hook on HVF uses the
+                // cooperative yield register, which only wakes on host
+                // IO and would strand a timer-driven task indefinitely.
+                let cycles_per_ms = crate::time::cycles_per_us().saturating_mul(1000);
+                crate::cpu::idle_until_cycles(cycles_per_ms);
+            } else if let Some(f) = IDLE.load() {
                 f(core_id);
             } else {
-                crate::cpu::idle_unbounded();
+                crate::cpu::idle_bounded();
             }
         }
     }
