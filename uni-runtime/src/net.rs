@@ -790,6 +790,118 @@ impl<'a> Future for TcpRecv<'a> {
     }
 }
 
+// ---- Per-stream async send ------------------------------------------------
+//
+// `TcpStream::send(data).await` resolves when every byte in `data`
+// has been queued to the backend (kernel send buffer on native, NIC
+// TX ring on bare-metal) or the connection is dead. Same waker
+// protocol as recv but parked on a separate slot so reads and
+// writes can pend concurrently on the same conn.
+//
+// Hook contract (all generation-checked; mismatch → treat as closed):
+// - `TCP_TRY_SEND(h, gen, buf)` returns
+//     > 0  : bytes queued (may be partial);
+//     == 0 : would block (caller should register a waker and pend);
+//     < 0  : fatal — conn broken / stale generation.
+// - `TCP_REGISTER_SEND_WAKER(h, gen, waker)` parks `waker` on the
+//   conn's send slot; a subsequent writable event (native:
+//   EVFILT_WRITE / EPOLLOUT; bare-metal: NIC-TX drain + stack
+//   advance) fires it. Stale `gen` fires immediately so the task
+//   observes closure.
+// - `TCP_CLEAR_SEND_WAKER(h, gen)` drops the stored waker.
+
+static TCP_TRY_SEND: AtomicFn<
+    fn(handle: *mut (), generation: u16, buf: &[u8]) -> isize,
+> = AtomicFn::null();
+static TCP_REGISTER_SEND_WAKER: AtomicFn<
+    fn(handle: *mut (), generation: u16, waker: &Waker),
+> = AtomicFn::null();
+static TCP_CLEAR_SEND_WAKER: AtomicFn<fn(handle: *mut (), generation: u16)> =
+    AtomicFn::null();
+
+/// Register backend hooks for the async send primitive. Called once
+/// at boot alongside `register_tcp_backend`.
+pub fn register_tcp_send_hooks(
+    try_send: fn(handle: *mut (), generation: u16, buf: &[u8]) -> isize,
+    register_waker: fn(handle: *mut (), generation: u16, waker: &Waker),
+    clear_waker: fn(handle: *mut (), generation: u16),
+) {
+    TCP_TRY_SEND.store(try_send);
+    TCP_REGISTER_SEND_WAKER.store(register_waker);
+    TCP_CLEAR_SEND_WAKER.store(clear_waker);
+}
+
+/// Future returned by `TcpStream::send`. Resolves `Ok(())` when
+/// every byte in `data` has been queued, or `Err(())` if the
+/// connection breaks. `!Send`.
+pub struct TcpSend<'a> {
+    handle: *mut (),
+    generation: u16,
+    buf: &'a [u8],
+    sent: usize,
+    _not_send: PhantomData<*mut ()>,
+}
+
+impl<'a> TcpSend<'a> {
+    #[inline]
+    pub fn new(handle: *mut (), generation: u16, buf: &'a [u8]) -> Self {
+        TcpSend { handle, generation, buf, sent: 0, _not_send: PhantomData }
+    }
+}
+
+impl<'a> Future for TcpSend<'a> {
+    type Output = Result<(), ()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), ()>> {
+        let this = self.get_mut();
+        let h = this.handle;
+        let g = this.generation;
+        let try_send = match TCP_TRY_SEND.load() {
+            Some(f) => f,
+            None => return Poll::Pending,
+        };
+
+        // Drain as much as the backend will take this tick.
+        loop {
+            if this.sent == this.buf.len() {
+                if let Some(clear) = TCP_CLEAR_SEND_WAKER.load() {
+                    clear(h, g);
+                }
+                return Poll::Ready(Ok(()));
+            }
+            let remaining = &this.buf[this.sent..];
+            let n = try_send(h, g, remaining);
+            if n < 0 {
+                if let Some(clear) = TCP_CLEAR_SEND_WAKER.load() {
+                    clear(h, g);
+                }
+                return Poll::Ready(Err(()));
+            }
+            if n == 0 {
+                // Backend is full. Park waker, then re-probe once —
+                // closes the wake-before-park race with the writable
+                // event site. If the second try also returns 0, pend.
+                if let Some(reg) = TCP_REGISTER_SEND_WAKER.load() {
+                    reg(h, g, cx.waker());
+                }
+                let n2 = try_send(h, g, remaining);
+                if n2 < 0 {
+                    if let Some(clear) = TCP_CLEAR_SEND_WAKER.load() {
+                        clear(h, g);
+                    }
+                    return Poll::Ready(Err(()));
+                }
+                if n2 == 0 {
+                    return Poll::Pending;
+                }
+                this.sent += n2 as usize;
+                continue;
+            }
+            this.sent += n as usize;
+        }
+    }
+}
+
 /// Notify the reactor that the backend has a newly accept-able
 /// connection for `dst_port`. Must be called from the core that
 /// owns the new connection (bare-metal: core whose RX queue

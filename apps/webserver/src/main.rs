@@ -97,7 +97,10 @@ impl WebServerApp {
                             stream.close();
                             return;
                         }
-                        let _ = stream.send(&buf[..n]);
+                        if stream.send(&buf[..n]).await.is_err() {
+                            stream.close();
+                            return;
+                        }
                     }
                 });
                 uni::log(b"TCP echo server on port 9 (async, per-worker)\n");

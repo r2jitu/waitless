@@ -121,9 +121,13 @@ struct Kevent {
 #[cfg(target_os = "macos")]
 const EVFILT_READ: i16 = -1;
 #[cfg(target_os = "macos")]
+const EVFILT_WRITE: i16 = -2;
+#[cfg(target_os = "macos")]
 const EV_ADD: u16 = 0x0001;
 #[cfg(target_os = "macos")]
 const EV_DELETE: u16 = 0x0002;
+#[cfg(target_os = "macos")]
+const EV_CLEAR: u16 = 0x0020;
 
 // epoll (Linux)
 #[cfg(target_os = "linux")]
@@ -137,7 +141,11 @@ struct EpollEvent {
 #[cfg(target_os = "linux")]
 const EPOLLIN: u32 = 0x001;
 #[cfg(target_os = "linux")]
+const EPOLLOUT: u32 = 0x004;
+#[cfg(target_os = "linux")]
 const EPOLL_CTL_ADD: i32 = 1;
+#[cfg(target_os = "linux")]
+const EPOLL_CTL_MOD: i32 = 3;
 #[cfg(target_os = "linux")]
 const EPOLL_CTL_DEL: i32 = 2;
 
@@ -278,6 +286,15 @@ struct NativeConn {
     /// Set on Pend, taken by `dispatch_ready_fd` when the fd fires,
     /// cleared explicitly on Ready or on close.
     recv_waker: Option<Waker>,
+    /// Waker parked by `TcpSend` / `register_tcp_send_hooks`. Uses
+    /// `EVFILT_WRITE` / `EPOLLOUT` on the same fd; taken when the
+    /// event queue fires write-readiness, cleared on Ready or close.
+    send_waker: Option<Waker>,
+    /// `true` while `EVFILT_WRITE` / `EPOLLOUT` is registered on the
+    /// fd. The filter is expensive to add for every pending-send
+    /// poll so we leave it armed across partial-send cycles and
+    /// drop it on clear_send_waker / close.
+    send_registered: bool,
 }
 
 impl NativeConn {
@@ -290,6 +307,8 @@ impl NativeConn {
             has_pending_data: false,
             generation: 0,
             recv_waker: None,
+            send_waker: None,
+            send_registered: false,
         }
     }
 }
@@ -375,6 +394,54 @@ impl ThreadState {
         }
     }
 
+    /// Arm write-readiness notifications on `fd`. On kqueue the
+    /// read and write filters are independent kevents; we add
+    /// `EVFILT_WRITE` alongside the existing `EVFILT_READ`. On
+    /// epoll they're flags on the same event; we MOD the
+    /// subscription to include `EPOLLOUT`. `EV_CLEAR` / default
+    /// epoll level-triggered behaviour — we leave the filter armed
+    /// across partial sends and explicitly `disarm_write_fd` once
+    /// the async send completes.
+    fn arm_write_fd(&self, fd: i32) {
+        unsafe {
+            #[cfg(target_os = "macos")]
+            {
+                let ev = Kevent {
+                    ident: fd as usize, filter: EVFILT_WRITE,
+                    flags: EV_ADD | EV_CLEAR, fflags: 0, data: 0,
+                    udata: fd as *mut u8,
+                };
+                kevent(self.eq_fd, &ev, 1, ptr::null_mut(), 0, ptr::null());
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let mut ev = EpollEvent {
+                    events: EPOLLIN | EPOLLOUT,
+                    data: fd as u64,
+                };
+                epoll_ctl(self.eq_fd, EPOLL_CTL_MOD, fd, &mut ev);
+            }
+        }
+    }
+
+    fn disarm_write_fd(&self, fd: i32) {
+        unsafe {
+            #[cfg(target_os = "macos")]
+            {
+                let ev = Kevent {
+                    ident: fd as usize, filter: EVFILT_WRITE,
+                    flags: EV_DELETE, fflags: 0, data: 0, udata: ptr::null_mut(),
+                };
+                kevent(self.eq_fd, &ev, 1, ptr::null_mut(), 0, ptr::null());
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let mut ev = EpollEvent { events: EPOLLIN, data: fd as u64 };
+                epoll_ctl(self.eq_fd, EPOLL_CTL_MOD, fd, &mut ev);
+            }
+        }
+    }
+
     fn alloc_conn(&mut self) -> *mut NativeConn {
         for c in self.conns.iter_mut() {
             if c.closed && c.fd < 0 {
@@ -384,6 +451,8 @@ impl ThreadState {
                 c.closed = false;
                 c.has_pending_data = false;
                 c.recv_waker = None;
+                c.send_waker = None;
+                c.send_registered = false;
                 // Generation is preserved across reuse — `release_conn`
                 // bumps it.
                 return c as *mut NativeConn;
@@ -395,6 +464,12 @@ impl ThreadState {
     fn release_conn(&mut self, c: *mut NativeConn) {
         unsafe {
             if (*c).fd >= 0 {
+                // Disarm write-readiness if still armed; `unregister_fd`
+                // removes the read filter / the whole epoll entry, so
+                // kqueue needs explicit EV_DELETE on EVFILT_WRITE.
+                if (*c).send_registered {
+                    self.disarm_write_fd((*c).fd);
+                }
                 self.unregister_fd((*c).fd);
                 if !(*c).is_shared_listener {
                     shutdown((*c).fd, SHUT_RDWR);
@@ -406,12 +481,16 @@ impl ThreadState {
             (*c).has_pending_data = false;
             (*c).is_listener = false;
             (*c).is_shared_listener = false;
+            (*c).send_registered = false;
             // Bump generation so any still-outstanding async handle
             // sees a mismatch on its next hook call.
             (*c).generation = (*c).generation.wrapping_add(1);
             // Wake any parked recv_waker so its next poll sees
             // `closed` and resolves with `recv() == 0`.
             if let Some(w) = (*c).recv_waker.take() {
+                w.wake();
+            }
+            if let Some(w) = (*c).send_waker.take() {
                 w.wake();
             }
         }
@@ -446,7 +525,8 @@ impl ThreadState {
                                events.as_mut_ptr(), MAX_EVENTS as i32, &ts);
                 for i in 0..n.max(0) as usize {
                     let fd = events[i].udata as i32;
-                    if self.dispatch_ready_fd(fd) { udp_work = true; }
+                    let is_write = events[i].filter == EVFILT_WRITE;
+                    if self.dispatch_ready_fd(fd, is_write) { udp_work = true; }
                 }
             }
             #[cfg(target_os = "linux")]
@@ -455,20 +535,39 @@ impl ThreadState {
                 let n = epoll_wait(self.eq_fd, events.as_mut_ptr(), MAX_EVENTS as i32, timeout_ms);
                 for i in 0..n.max(0) as usize {
                     let fd = events[i].data as i32;
-                    if self.dispatch_ready_fd(fd) { udp_work = true; }
+                    let flags = events[i].events;
+                    // epoll may signal both read and write in one event;
+                    // dispatch once per direction.
+                    if flags & EPOLLIN != 0 {
+                        if self.dispatch_ready_fd(fd, false) { udp_work = true; }
+                    }
+                    if flags & EPOLLOUT != 0 {
+                        self.dispatch_ready_fd(fd, true);
+                    }
                 }
             }
         }
         udp_work
     }
 
-    /// Handle a single ready fd: UDP siblings get drained and dispatched
-    /// inline (matches HVF's inline-poll design); TCP fds just get
-    /// `has_pending_data = true` so the app's recv path picks them up.
-    /// Returns `true` iff a UDP sibling was drained — TCP flagging
-    /// alone isn't "work" for the event loop because the app's service
-    /// step is what actually consumes it.
-    fn dispatch_ready_fd(&mut self, fd: i32) -> bool {
+    /// Handle a single ready fd. `is_write == true` → write-readiness
+    /// event (EVFILT_WRITE / EPOLLOUT): wake the conn's send_waker.
+    /// Otherwise read-readiness: UDP siblings get drained inline, the
+    /// async-TCP accept reactor is notified, and TCP conn fds flip
+    /// `has_pending_data` + wake any parked recv_waker. Returns `true`
+    /// iff a UDP sibling was drained.
+    fn dispatch_ready_fd(&mut self, fd: i32, is_write: bool) -> bool {
+        if is_write {
+            for c in self.conns.iter_mut() {
+                if c.fd == fd {
+                    if let Some(w) = c.send_waker.take() {
+                        w.wake();
+                    }
+                    break;
+                }
+            }
+            return false;
+        }
         for i in 0..self.udp_sib_count {
             if self.udp_sibs[i].fd == fd {
                 drain_udp_sibling(fd, self.udp_sibs[i].binding_idx);
@@ -483,7 +582,7 @@ impl ThreadState {
         for c in self.conns.iter_mut() {
             if c.fd == fd {
                 c.has_pending_data = true;
-                // Wake any task parked on `TcpRecvReady` for this conn.
+                // Wake any task parked on `TcpRecv` for this conn.
                 // Take() avoids re-waking if the event queue fires
                 // again before the task re-registers.
                 if let Some(w) = c.recv_waker.take() {
@@ -681,6 +780,11 @@ fn init_native() {
         native_tcp_register_recv_waker,
         native_tcp_clear_recv_waker,
     );
+    uni_runtime::net::register_tcp_send_hooks(
+        native_tcp_try_send,
+        native_tcp_register_send_waker,
+        native_tcp_clear_send_waker,
+    );
 
     // Register TCP/UDP polling as the first IO poll callback.
     // Runs on every worker's event-loop tick and drains the worker's
@@ -876,6 +980,70 @@ fn native_tcp_clear_recv_waker(handle: *mut (), generation: u16) {
             return;
         }
         (*c).recv_waker = None;
+    }
+}
+
+// ---- Async TCP send hooks ------------------------------------------------
+
+fn native_tcp_try_send(handle: *mut (), generation: u16, buf: &[u8]) -> isize {
+    unsafe {
+        let (c, live) = check_gen(handle, generation);
+        if !live {
+            return -1;
+        }
+        let fd = (*c).fd;
+        if fd < 0 {
+            return -1;
+        }
+        let n = send(fd, buf.as_ptr(), buf.len(), MSG_NOSIGNAL);
+        if n >= 0 {
+            return n;
+        }
+        // `send` returned -1. EAGAIN means "try again" — report 0 so
+        // the future parks a waker. Any other errno is fatal.
+        if get_errno() == EAGAIN {
+            0
+        } else {
+            -1
+        }
+    }
+}
+
+fn native_tcp_register_send_waker(handle: *mut (), generation: u16, waker: &Waker) {
+    unsafe {
+        let (c, live) = check_gen(handle, generation);
+        if !live {
+            waker.wake_by_ref();
+            return;
+        }
+        // Lazily arm EVFILT_WRITE / EPOLLOUT. Arming/disarming is a
+        // real syscall on every pending-send cycle — defer to
+        // `clear_send_waker` so sends that finish in one try_send
+        // round never touch the event queue.
+        if !(*c).send_registered {
+            let tid = uni_platform::current_worker();
+            thread_state(tid).arm_write_fd((*c).fd);
+            (*c).send_registered = true;
+        }
+        match &(*c).send_waker {
+            Some(w) if w.will_wake(waker) => {}
+            _ => (*c).send_waker = Some(waker.clone()),
+        }
+    }
+}
+
+fn native_tcp_clear_send_waker(handle: *mut (), generation: u16) {
+    unsafe {
+        let (c, live) = check_gen(handle, generation);
+        if !live {
+            return;
+        }
+        (*c).send_waker = None;
+        if (*c).send_registered {
+            let tid = uni_platform::current_worker();
+            thread_state(tid).disarm_write_fd((*c).fd);
+            (*c).send_registered = false;
+        }
     }
 }
 

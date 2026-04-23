@@ -180,7 +180,7 @@ pub mod runtime {
     pub use uni_backend::runtime::{sleep_us, spawn, spawn_on_each_worker, Sleep};
     pub use uni_runtime::TaskHandle;
     pub use uni_runtime::net::{
-        TcpBindError, TcpRecv, UdpBindError, UdpRecv, UdpSocket,
+        TcpBindError, TcpRecv, TcpSend, UdpBindError, UdpRecv, UdpSocket,
     };
     pub use uni_runtime::select::{
         join, join3, select, select3, timeout_us, Either, Three,
@@ -357,7 +357,20 @@ impl TcpStream {
         uni_backend::tcp_recv(self.handle, buf)
     }
 
-    pub fn send(&self, data: &[u8]) -> i32 {
+    /// Async write — resolves when every byte of `data` has been
+    /// queued to the backend (kernel send buffer on native, NIC
+    /// TX ring on bare-metal) or the conn is broken. Wakes are
+    /// delivered from the backend event loop (EVFILT_WRITE /
+    /// EPOLLOUT on native); no polling.
+    #[inline]
+    pub fn send<'a>(&self, data: &'a [u8]) -> uni_runtime::net::TcpSend<'a> {
+        uni_runtime::net::TcpSend::new(self.handle, self.generation, data)
+    }
+
+    /// Non-blocking sync write. Returns bytes sent (possibly 0 on
+    /// EAGAIN) or -1 on error. Retained for `uni_http`'s still-
+    /// sync dispatch loop; async code should use `send(..).await`.
+    pub fn send_sync(&self, data: &[u8]) -> i32 {
         uni_backend::tcp_send(self.handle, data)
     }
 

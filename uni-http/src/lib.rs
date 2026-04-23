@@ -642,7 +642,7 @@ impl Server {
             if n == 0 {
                 break;
             }
-            conn.send(&out[..n]);
+            conn.send_sync(&out[..n]);
         }
 
         // Copy any decrypted plaintext into the HTTP parse buffer.
@@ -696,7 +696,7 @@ impl Server {
                 if n == 0 {
                     break;
                 }
-                conn.send(&out[..n]);
+                conn.send_sync(&out[..n]);
             }
             return;
         }
@@ -922,7 +922,7 @@ impl core::fmt::Write for BufWriter {
 fn send_response(conn: TcpStream, resp: &Response, keep_alive: bool) {
     let mut w = BufWriter::new();
     write_response_into(&mut w, resp, keep_alive);
-    conn.send(w.as_bytes());
+    conn.send_sync(w.as_bytes());
 }
 
 /// Serialise an HTTP/1.1 response into a `BufWriter`. Split out so

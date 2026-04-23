@@ -952,6 +952,59 @@ pub fn clear_recv_waker(handle: *mut (), generation: u16) {
     c.recv_waker = None;
 }
 
+/// Async `TcpSend` try-send hook. Bare-metal's `send_segment`
+/// unconditionally queues into the NIC TX ring (no flow control,
+/// no TX-full backpressure in this stack), so this is effectively
+/// a "try == always succeeds" wrapper over the sync `send` — the
+/// future resolves in one poll. Stale `generation` / dead conn
+/// returns -1 (fatal).
+pub fn async_try_send(handle: *mut (), generation: u16, buf: &[u8]) -> isize {
+    let (core, slot) = match decode_handle(handle) {
+        Some(v) => v,
+        None => return -1,
+    };
+    let c = unsafe { &*conn_ptr(core, slot) };
+    if c.generation != generation {
+        return -1;
+    }
+    match c.state {
+        TcpState::Established => {}
+        _ => return -1,
+    }
+    // Forward to sync `send`. Returns bytes sent (== buf.len for
+    // this stack) or -1 on error.
+    let n = send(handle, buf);
+    if n < 0 { -1 } else { n as isize }
+}
+
+/// Park the send-side waker. On bare-metal `async_try_send`
+/// always accepts the whole buffer, so this path is effectively
+/// unreachable during steady-state sends; kept symmetric with the
+/// recv side so future NIC-TX-backpressure plumbing (or a proper
+/// TCP send-window) can light it up without API churn. Stale
+/// `generation` wakes the waker immediately so the task observes
+/// closure.
+pub fn register_send_waker(handle: *mut (), generation: u16, waker: &Waker) {
+    let (core, slot) = match decode_handle(handle) {
+        Some(v) => v,
+        None => { waker.wake_by_ref(); return; }
+    };
+    let c = unsafe { &mut *conn_ptr(core, slot) };
+    if c.generation != generation {
+        waker.wake_by_ref();
+        return;
+    }
+    // Write-readiness on bare-metal: the NIC TX path is always
+    // "ready" for this stack. Fire immediately so the future
+    // re-probes and resolves.
+    waker.wake_by_ref();
+    let _ = c;  // placate unused-var lint if we ever remove the wake.
+}
+
+pub fn clear_send_waker(_handle: *mut (), _generation: u16) {
+    // No-op on bare-metal — no send-waker state to clear.
+}
+
 pub fn is_closed(handle: *mut ()) -> bool {
     let (core, slot) = match decode_handle(handle) {
         Some(v) => v,
