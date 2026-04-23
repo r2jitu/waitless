@@ -76,8 +76,7 @@ impl WebServerApp {
 
         match uni::runtime::TcpListener::bind(9) {
             Ok(listener) => {
-                listener.run(|raw| async move {
-                    let stream = uni::TcpStream::from_raw(raw);
+                listener.run(|stream| async move {
                     let mut buf = [0u8; 1024];
                     loop {
                         let n = stream.recv(&mut buf).await;

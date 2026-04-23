@@ -179,9 +179,50 @@ pub use uni_backend::{
 pub mod runtime {
     pub use uni_backend::runtime::{sleep_us, spawn, spawn_on_each_worker, Sleep};
     pub use uni_runtime::net::{
-        RawTcpStream, TcpAccept, TcpBindError, TcpListener, TcpRecv,
-        UdpBindError, UdpRecv, UdpSocket,
+        TcpBindError, TcpRecv, UdpBindError, UdpRecv, UdpSocket,
     };
+
+    use alloc::boxed::Box;
+    use core::future::Future;
+
+    /// Async TCP listener. Wraps `uni_runtime::net::TcpListener` so
+    /// the `run` handler receives a `uni::TcpStream` directly — the
+    /// lower-level `RawTcpStream` isn't part of the app-facing API.
+    pub struct TcpListener {
+        inner: uni_runtime::net::TcpListener,
+    }
+
+    impl TcpListener {
+        /// Bind `port` on every worker. `Err` on port conflict,
+        /// invalid port, or backend bind failure.
+        #[inline]
+        pub fn bind(port: u16) -> Result<Self, TcpBindError> {
+            Ok(TcpListener {
+                inner: uni_runtime::net::TcpListener::bind(port)?,
+            })
+        }
+
+        /// Port this listener is bound to.
+        #[inline]
+        pub fn port(&self) -> u16 {
+            self.inner.port()
+        }
+
+        /// Spawn `body` once per accepted connection, on the worker
+        /// that accepted it. Consumes the listener — the port stays
+        /// claimed for the process lifetime. `body` receives a
+        /// `TcpStream` wrapping the backend's accepted handle
+        /// (generation-stamped for aliasing safety).
+        pub fn run<H, F>(self, body: H)
+        where
+            H: Fn(crate::TcpStream) -> F + Send + Sync + 'static,
+            F: Future<Output = ()> + 'static,
+        {
+            let body = Box::new(body);
+            let body = Box::leak(body);
+            self.inner.run(move |raw| body(crate::TcpStream::from_raw(raw)));
+        }
+    }
 }
 
 /// Create a TCP listener on `port`, bound to a specific worker.
