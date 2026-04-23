@@ -1,7 +1,7 @@
 // apps/test_async — Async-runtime smoke test.
 //
 // Spawns a future that logs, sleeps on a timer, logs again, then
-// requests shutdown. Exercises `uni::executor::spawn`, the backend
+// requests shutdown. Exercises `uni::runtime::spawn`, the backend
 // task arena (kernel on unikernel / std on native), the waker wiring
 // and the `Sleep` future end-to-end.
 
@@ -13,13 +13,13 @@ extern crate uni;
 fn boot() {
     uni::log(b"test_async: boot\n");
 
-    let spawn_result = uni::executor::spawn(async {
+    let spawn_result = uni::runtime::spawn(async {
         uni::log(b"test_async: task started\n");
-        uni::executor::sleep_us(50_000).await;
+        uni::runtime::sleep_us(50_000).await;
         uni::log(b"test_async: task woke up\n");
 
-        let nested = uni::executor::spawn(async {
-            uni::executor::sleep_us(10_000).await;
+        let nested = uni::runtime::spawn(async {
+            uni::runtime::sleep_us(10_000).await;
             uni::log(b"test_async: nested task done\n");
             uni::request_shutdown();
         });

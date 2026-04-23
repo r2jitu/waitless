@@ -174,10 +174,10 @@ pub use uni_backend::{
 
 // ---- Async runtime --------------------------------------------------------
 
-/// Re-export of the shared async runtime. `use uni::executor::spawn;`
+/// Re-export of the shared async runtime. `use uni::runtime::spawn;`
 /// works on both unikernel and native.
-pub mod executor {
-    pub use uni_backend::executor::{sleep_us, spawn, Sleep};
+pub mod runtime {
+    pub use uni_backend::runtime::{sleep_us, spawn, Sleep};
 }
 
 /// Create a TCP listener on `port`, bound to a specific worker.

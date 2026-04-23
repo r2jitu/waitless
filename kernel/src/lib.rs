@@ -20,7 +20,7 @@ pub mod spsc;
 pub mod timer;
 pub mod percpu;
 pub mod eventloop;
-pub mod executor;
+pub mod runtime;
 pub mod rng;
 
 #[cfg(target_arch = "x86_64")]

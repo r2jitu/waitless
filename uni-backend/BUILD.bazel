@@ -14,7 +14,6 @@ rust_library(
     name = "uni-backend",
     srcs = [
         "src/lib.rs",
-        "src/native/executor.rs",
         "src/native/mod.rs",
         "src/unikernel.rs",
     ],

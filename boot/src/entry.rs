@@ -475,7 +475,7 @@ unsafe fn kernel_boot(info: &BootInfo) {
     // Idle-path infrastructure (timer IRQ + SGI handler + IRQ unmask) is
     // orthogonal to the NIC. Apps without networking still need
     // `uni_kernel::cpu::idle_bounded` to wake from WFI when the 1 ms
-    // generic-timer fires — `uni_kernel::executor`'s `Sleep` future depends
+    // generic-timer fires — `uni_kernel::runtime`'s `Sleep` future depends
     // on it.
     #[cfg(target_arch = "aarch64")]
     {
@@ -534,7 +534,7 @@ unsafe fn kernel_boot(info: &BootInfo) {
 
     // Register the bare-metal async runtime with `//uni-runtime`.
     // Must happen before `uni_main` so the app can `spawn` / `sleep_us`.
-    uni_kernel::executor::init();
+    uni_kernel::runtime::init();
 
     klog!("\n[BOOT] All subsystems ready. Starting application.\n\n");
     uni_main();

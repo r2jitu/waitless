@@ -50,8 +50,8 @@ pub fn register_io_poll(_f: fn(u32) -> bool) {}
 
 // ---- Async runtime re-exports ---------------------------------------------
 
-pub mod executor {
-    pub use uni_kernel::executor::{sleep_us, spawn, Sleep};
+pub mod runtime {
+    pub use uni_runtime::{sleep_us, spawn, Sleep};
 }
 
 // ---- Heap stats -----------------------------------------------------------

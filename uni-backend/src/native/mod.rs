@@ -12,7 +12,11 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use atomic_fn::AtomicFn;
 
-pub mod executor;
+/// Re-export of the shared runtime's executor surface — apps
+/// reach these via `uni::runtime::{spawn,sleep_us,Sleep,…}`.
+pub mod runtime {
+    pub use uni_runtime::{has_pending, sleep_us, spawn, tick, Sleep};
+}
 
 // ============================================================================
 // libc FFI declarations
@@ -563,23 +567,6 @@ fn thread_state(id: u32) -> &'static mut ThreadState {
     unsafe { &mut (*THREADS.0.get())[id as usize] }
 }
 
-// ============================================================================
-// Helpers for the uni API (dispatched by thread_id)
-// ============================================================================
-
-// Worker thread id. Backed by `uni_platform`'s std thread-local so
-// every upstream caller (uni-percpu's CurrentCore::enter, uni-runtime's
-// now_ticks-adjacent code) sees the same value without plumbing a
-// registration hook through this file.
-
-fn set_current_thread_id(id: u32) {
-    uni_platform::set_current_worker(id);
-}
-
-fn current_thread_id() -> u32 {
-    uni_platform::current_worker()
-}
-
 unsafe extern "C" fn sigint_handler(_sig: i32) {
     SHUTDOWN.store(true, Ordering::Release);
 }
@@ -653,11 +640,11 @@ pub fn request_shutdown() {
 }
 
 pub fn wait_for_events() {
-    thread_state(current_thread_id()).wait_for_events();
+    thread_state(uni_platform::current_worker()).wait_for_events();
 }
 
 pub fn poll_events() -> bool {
-    thread_state(current_thread_id()).poll_events()
+    thread_state(uni_platform::current_worker()).poll_events()
 }
 
 pub fn num_workers() -> u32 {
@@ -703,7 +690,7 @@ fn make_listener(port: u16, nonblocking: bool) -> i32 {
 }
 
 pub fn tcp_listen(port: u16) -> *mut () {
-    tcp_listen_for(port, current_thread_id())
+    tcp_listen_for(port, uni_platform::current_worker())
 }
 
 pub fn tcp_listen_on(worker_id: u32, port: u16) -> *mut () {
@@ -745,7 +732,7 @@ pub fn tcp_listen_for(port: u16, worker_id: u32) -> *mut () {
 
 pub fn tcp_accept(handle: *mut ()) -> *mut () {
     let listener = handle as *mut NativeConn;
-    let tid = current_thread_id();
+    let tid = uni_platform::current_worker();
     let ts = thread_state(tid);
     unsafe {
         if listener.is_null() || (*listener).fd < 0 || (*listener).closed {
@@ -808,7 +795,7 @@ pub fn tcp_close(handle: *mut ()) {
     let c = handle as *mut NativeConn;
     if c.is_null() { return; }
     // Find which thread owns this connection and release it
-    let tid = current_thread_id();
+    let tid = uni_platform::current_worker();
     thread_state(tid).release_conn(c);
 }
 
@@ -823,7 +810,7 @@ pub fn tcp_is_closed(handle: *mut ()) -> bool {
 /// Returns `true` iff a UDP sibling was drained — tells the event
 /// loop to skip its idle sleep and run another iteration.
 pub fn tcp_poll() -> bool {
-    thread_state(current_thread_id()).poll_events()
+    thread_state(uni_platform::current_worker()).poll_events()
 }
 
 /// Register every shared listen socket with this worker's kqueue/epoll.
@@ -834,7 +821,7 @@ pub fn tcp_poll() -> bool {
 /// HTTP listener and (if configured) the HTTPS listener — missing either
 /// one silently drops accept events for that port.
 fn tcp_register_shared_listener() {
-    let tid = current_thread_id();
+    let tid = uni_platform::current_worker();
     unsafe {
         let table = &*SHARED_LISTEN.0.get();
         let count = SHARED_LISTEN_COUNT.load(Ordering::Acquire);
@@ -967,7 +954,7 @@ pub fn udp_send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
         // sibling — same kernel socket lock as the recv, and the
         // source port is already equal to the relay port, which keeps
         // NAT path-correct.
-        let tid = current_thread_id() as usize;
+        let tid = uni_platform::current_worker() as usize;
         let mut send_fd = -1;
         let bindings = &*UDP_BINDINGS.0.get();
         let count = UDP_COUNT.load(Ordering::Acquire);
@@ -1105,7 +1092,7 @@ pub fn run_worker(worker_id: u32) {
         // 2a. Async runtime: every worker advances its own timer
         // list and polls its own arena — same per-core pattern as
         // the unikernel, driven by `//uni-runtime` under the hood.
-        if executor::tick(worker_id) { did_work = true; }
+        if uni_runtime::tick(worker_id) { did_work = true; }
 
         // 3. Idle if no work
         if !did_work {
@@ -1124,7 +1111,7 @@ unsafe extern "C" {
 
 extern "C" fn worker_thread(arg: *mut u8) -> *mut u8 {
     let tid = arg as u32;
-    set_current_thread_id(tid);
+    uni_platform::set_current_worker(tid);
 
     // Workers call the same service_core() as the unikernel APs.
     // The Server is set up by the main thread before workers start.
@@ -1155,7 +1142,6 @@ pub struct RunConfig {
 /// Returns the process exit code.
 pub fn run(config: RunConfig) -> i32 {
     init_native();
-    executor::init();
 
     // Publish the boot-time snapshot via the uni-side callback. The
     // native backend has no NIC driver (POSIX sockets go through the
@@ -1172,11 +1158,11 @@ pub fn run(config: RunConfig) -> i32 {
         let num_threads = NUM_THREADS.load(Ordering::Acquire);
         if let Some(f) = ADD_WORKER_LISTENER.load() {
             for i in 1..num_threads {
-                set_current_thread_id(i as u32);
+                uni_platform::set_current_worker(i as u32);
                 f(i as u32);
             }
         }
-        set_current_thread_id(0);
+        uni_platform::set_current_worker(0);
 
         // Start worker threads
         let mut thread_handles = [0usize; MAX_THREADS];
@@ -1190,7 +1176,7 @@ pub fn run(config: RunConfig) -> i32 {
         }
 
         // Main thread is worker 0
-        set_current_thread_id(0);
+        uni_platform::set_current_worker(0);
         native_worker_loop(0);
 
         // Join workers
@@ -1211,7 +1197,7 @@ pub fn run(config: RunConfig) -> i32 {
 /// Called by each worker thread (including main).
 #[unsafe(no_mangle)]
 pub extern "C" fn native_worker_loop(thread_id: u32) {
-    set_current_thread_id(thread_id);
+    uni_platform::set_current_worker(thread_id);
     // Register the shared listen socket with this worker's kqueue/epoll so it
     // wakes up when a new connection arrives.
     tcp_register_shared_listener();

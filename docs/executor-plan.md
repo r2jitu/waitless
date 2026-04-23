@@ -33,7 +33,7 @@ ROADMAP, not here.
 
 First attempt used `InitOnce<&'static dyn Runtime>` with a
 `trait Runtime`. That broke `apps/webserver:test_hvf` in a
-non-obvious way: `kernel::executor::init()` at boot → webserver's
+non-obvious way: `kernel::runtime::init()` at boot → webserver's
 virtio-net IRQ delivery stopped firing. No panic, just silent
 wedge. Root cause never isolated — suspected fat-pointer write
 ordering vs. GIC / IRQ state, but no hard evidence.
@@ -316,7 +316,7 @@ delivery goes through synchronous `udp_bind(port, handler)`
 callbacks. The async pattern we want:
 
 ```rust
-let sock = uni::executor::UdpSocket::bind(443).await?;
+let sock = uni::runtime::UdpSocket::bind(443).await?;
 loop {
     let (src, payload) = sock.recv_from().await;
     // QUIC handles packet

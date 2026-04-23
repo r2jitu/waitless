@@ -149,8 +149,8 @@ pub fn run(core_id: u32) -> ! {
 
         // 3a. Async runtime: advance timers (drain pending MPSC + fire
         // expired), then poll every ready task slot in the per-core
-        // arena. Spawned futures live here. See uni_kernel::executor.
-        if crate::executor::tick(core_id) {
+        // arena. Spawned futures live here. See uni_kernel::runtime.
+        if uni_runtime::tick(core_id) {
             did_work = true;
         }
 
@@ -225,7 +225,7 @@ pub fn run(core_id: u32) -> ! {
             // Sleep until interrupt. WFI/HLT yields the CPU to the
             // host; the hypervisor resumes us when an interrupt fires.
             idle_streak = 0;
-            if crate::executor::has_pending(core_id) {
+            if uni_runtime::has_pending(core_id) {
                 // The executor has a pending timer or a task ready to
                 // re-poll. Force a local-timer-bounded idle so we wake
                 // promptly — the normal IDLE hook on HVF uses the
