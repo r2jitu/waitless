@@ -54,6 +54,10 @@ pub fn init_stack() {
         tcp::register_recv_waker,
         tcp::clear_recv_waker,
     );
+    // UDP send hook — lets `UdpSocket::send_to` hand off datagrams
+    // without apps having to go through the legacy `uni::udp_send`
+    // free function. Same transport (net_udp::send).
+    uni_runtime::net::register_backend_udp_send(udp::send);
 }
 
 fn tcp_backend_listen(port: u16) -> Result<(), ()> {

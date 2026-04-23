@@ -229,6 +229,9 @@ static REGISTRY: [SocketState; MAX_UDP_SOCKETS] =
 // ---- Backend plug-in for bind-time setup ------------------------------------
 
 static BACKEND_BIND: AtomicFn<fn(port: u16) -> Result<(), ()>> = AtomicFn::null();
+static BACKEND_UDP_SEND: AtomicFn<
+    fn(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]),
+> = AtomicFn::null();
 
 /// Register the backend-side bind hook. On bare-metal this stays
 /// unset — the NIC RX path unconditionally delivers to
@@ -236,6 +239,14 @@ static BACKEND_BIND: AtomicFn<fn(port: u16) -> Result<(), ()>> = AtomicFn::null(
 /// that opens SO_REUSEPORT sibling fds for each `UdpSocket::bind`.
 pub fn register_backend_bind(hook: fn(port: u16) -> Result<(), ()>) {
     BACKEND_BIND.store(hook);
+}
+
+/// Register the backend-side UDP send hook. Both bare-metal and
+/// native wire this; it's the transport for `UdpSocket::send_to`.
+pub fn register_backend_udp_send(
+    hook: fn(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]),
+) {
+    BACKEND_UDP_SEND.store(hook);
 }
 
 // ---- Public API -------------------------------------------------------------
@@ -296,6 +307,18 @@ impl UdpSocket {
     /// Port this socket is bound to.
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// Send a datagram from this socket to `(dst_ip, dst_port)`.
+    /// Returns `Err(())` if the backend isn't wired (should only
+    /// happen pre-init) — backend failures themselves (full TX
+    /// ring on bare-metal, `sendto` EAGAIN on native) are swallowed
+    /// today since they're harmless for UDP; add a proper error
+    /// enum when QUIC needs to observe them.
+    pub fn send_to(&self, dst_ip: [u8; 4], dst_port: u16, data: &[u8]) -> Result<(), ()> {
+        let send = BACKEND_UDP_SEND.load().ok_or(())?;
+        send(dst_ip, self.port, dst_port, data);
+        Ok(())
     }
 
     /// Await one datagram on the **calling worker's** inbox. The

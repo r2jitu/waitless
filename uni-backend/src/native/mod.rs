@@ -663,6 +663,7 @@ fn init_native() {
     // sibling opener. On bare-metal the hook stays unset because
     // the NIC RX path unconditionally delivers to the reactor.
     uni_runtime::net::register_backend_bind(udp_backend_bind);
+    uni_runtime::net::register_backend_udp_send(udp_send);
 
     // TCP reactor hooks. `listen` is a no-op stub (returns `Ok`) so
     // `TcpListener::bind` succeeds on native; `accept` returns null
