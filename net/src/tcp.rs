@@ -17,6 +17,7 @@ extern crate bitflags;
 use alloc::alloc::{alloc_zeroed, Layout};
 use alloc::boxed::Box;
 use core::ptr;
+use core::task::Waker;
 use from_bytes::FromBytes;
 use types::{Ipv4Addr, CONFIG, tcp_checksum, htons, ntohs, htonl, ntohl};
 use ipv4::{ipv4_send, PROTO_TCP};
@@ -111,6 +112,11 @@ pub struct TcpConnection {
     rx_tail: usize,
     listener_port: u16,
     accepted: bool,
+    /// Parked `TcpRecvReady` waker. Set by
+    /// `tcp_register_recv_waker` on the owning core; woken when data
+    /// lands in `rx_buf` or the peer closes. Per-core ownership — no
+    /// lock needed.
+    recv_waker: Option<Waker>,
 }
 
 impl TcpConnection {
@@ -129,6 +135,7 @@ impl TcpConnection {
             rx_tail: 0,
             listener_port: 0,
             accepted: false,
+            recv_waker: None,
         }
     }
 
@@ -409,6 +416,12 @@ fn free_connection(core: u32, slot: usize) {
         let key = tcp_hash_key(c.remote_ip, c.remote_port, c.local_port);
         tcp_hash_remove(core, key);
     }
+    // Fire any parked `TcpRecvReady` waker before the slot is reset
+    // — the app handler needs to observe teardown (is_closed → true)
+    // rather than sleeping on a stale waker that would get dropped.
+    if let Some(w) = c.recv_waker.take() {
+        w.wake();
+    }
     // Assigning a fresh TcpConnection drops the old one, which runs
     // the Drop impl on `rx_buf: Option<Box<[u8]>>` — Box::drop returns
     // the bytes to the global allocator. No manual kfree needed.
@@ -630,6 +643,13 @@ pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
             let pushed = c.rx_push(&payload[..payload_len]);
             c.rcv_nxt = c.rcv_nxt.wrapping_add(pushed as u32);
             c.rcv_wnd = c.rx_free() as u16;
+            // Wake any `TcpRecvReady` parked on this conn. Same core
+            // owns the waker and the rx ring, so no cross-core hop.
+            if pushed > 0 {
+                if let Some(w) = c.recv_waker.take() {
+                    w.wake();
+                }
+            }
             // Send an immediate ACK. The previous version of this code
             // deferred ACKs to piggyback on the next outbound data
             // segment (avoiding a stall on macOS's delayed-ACK
@@ -683,6 +703,17 @@ pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
                 free_connection(core, slot);
             }
             _ => {}
+        }
+        // Peer FIN is also a readable-state transition: any pending
+        // `recv_ready` must resolve so the handler can observe the
+        // close via `is_closed()` / `recv() == 0`. `free_connection`
+        // above already resets the whole conn (including `recv_waker`)
+        // via `TcpConnection::new()`; in the CloseWait branch we still
+        // hold the waker, so fire it here.
+        if c.state == TcpState::CloseWait {
+            if let Some(w) = c.recv_waker.take() {
+                w.wake();
+            }
         }
     }
 }
@@ -828,6 +859,33 @@ pub fn close(handle: *mut ()) {
             free_connection(core, slot);
         }
     }
+}
+
+/// Park the current task's waker on this conn, to be woken when
+/// data arrives or the peer FINs. Called from
+/// `uni_runtime::net::TcpRecvReady::poll` on the owning core.
+pub fn register_recv_waker(handle: *mut (), waker: &Waker) {
+    let (core, slot) = match decode_handle(handle) {
+        Some(v) => v,
+        None => { waker.wake_by_ref(); return; }
+    };
+    let c = unsafe { &mut *conn_ptr(core, slot) };
+    match &c.recv_waker {
+        Some(w) if w.will_wake(waker) => {}
+        _ => c.recv_waker = Some(waker.clone()),
+    }
+}
+
+/// Drop the parked waker without firing it. Called from
+/// `TcpRecvReady::poll` after resolving Ready so a subsequent data
+/// arrival doesn't wake a no-longer-interested task.
+pub fn clear_recv_waker(handle: *mut ()) {
+    let (core, slot) = match decode_handle(handle) {
+        Some(v) => v,
+        None => return,
+    };
+    let c = unsafe { &mut *conn_ptr(core, slot) };
+    c.recv_waker = None;
 }
 
 pub fn is_closed(handle: *mut ()) -> bool {

@@ -45,6 +45,15 @@ pub fn init_stack() {
     // own per-port accept pool); accept reads the current core's
     // pool and returns the first Established+!accepted conn.
     uni_runtime::net::register_tcp_backend(tcp_backend_listen, tcp_backend_accept);
+    // And the per-stream recv-ready reactor: `has_data` probes the
+    // conn's rx ring; `register/clear_recv_waker` store the task's
+    // waker on the conn so TCP RX wakes the right future.
+    uni_runtime::net::register_tcp_recv_hooks(
+        tcp::has_data,
+        tcp::recv,
+        tcp::register_recv_waker,
+        tcp::clear_recv_waker,
+    );
 }
 
 fn tcp_backend_listen(port: u16) -> Result<(), ()> {
