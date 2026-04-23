@@ -11,6 +11,7 @@ rust_library(
     srcs = [
         "src/lib.rs",
         "src/net.rs",
+        "src/select.rs",
     ],
     crate_name = "uni_runtime",
     deps = [

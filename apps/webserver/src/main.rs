@@ -79,7 +79,20 @@ impl WebServerApp {
                 listener.run(|stream| async move {
                     let mut buf = [0u8; 1024];
                     loop {
-                        let n = stream.recv(&mut buf).await;
+                        // 30s idle timeout via `timeout_us` — exercises
+                        // the `select` combinator end-to-end. In a
+                        // steady echo flow the recv wins every time;
+                        // on an abandoned connection the timer fires
+                        // and we tear down rather than leak the slot.
+                        let got = uni::runtime::timeout_us(
+                            30_000_000,
+                            stream.recv(&mut buf),
+                        )
+                        .await;
+                        let Some(n) = got else {
+                            stream.close();
+                            return;
+                        };
                         if n == 0 {
                             stream.close();
                             return;

@@ -181,6 +181,9 @@ pub mod runtime {
     pub use uni_runtime::net::{
         TcpBindError, TcpRecv, UdpBindError, UdpRecv, UdpSocket,
     };
+    pub use uni_runtime::select::{
+        join, join3, select, select3, timeout_us, Either, Three,
+    };
 
     use alloc::boxed::Box;
     use core::future::Future;

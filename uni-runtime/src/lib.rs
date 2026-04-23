@@ -5,6 +5,7 @@
 extern crate alloc;
 
 pub mod net;
+pub mod select;
 
 use atomic_fn::AtomicFn;
 
