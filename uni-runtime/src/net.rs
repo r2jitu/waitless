@@ -23,6 +23,8 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use core::task::{Context, Poll, Waker};
 
+use atomic_fn::AtomicFn;
+
 // ---- Sizing -----------------------------------------------------------------
 
 /// Maximum concurrently-bound UDP sockets across the whole binary.
@@ -199,6 +201,28 @@ impl Inbox {
 
 static REGISTRY: [Inbox; MAX_UDP_SOCKETS] = [const { Inbox::new() }; MAX_UDP_SOCKETS];
 
+// ---- Backend plug-in for bind-time setup ------------------------------------
+//
+// On bare-metal this stays unset — the NIC RX path delivers every
+// inbound UDP datagram to `net::udp::udp_receive` which calls
+// `deliver_udp` unconditionally, so a socket just has to exist in
+// the registry.
+//
+// On native, OS sockets don't exist until somebody calls bind. The
+// hook lets the POSIX backend open SO_REUSEPORT sibling fds for the
+// port and plumb them into each worker's kqueue/epoll. A return of
+// `Err(())` means the OS refused (port already bound by another
+// process, etc.) and the `UdpSocket::bind` call propagates the
+// failure as `UdpBindError::BackendFailed`.
+
+static BACKEND_BIND: AtomicFn<fn(port: u16) -> Result<(), ()>> = AtomicFn::null();
+
+/// Register the backend-side bind hook. Called once at boot by the
+/// backend that needs to do work when a `UdpSocket` is created.
+pub fn register_backend_bind(hook: fn(port: u16) -> Result<(), ()>) {
+    BACKEND_BIND.store(hook);
+}
+
 // ---- Public API -------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,6 +233,9 @@ pub enum UdpBindError {
     PortInUse,
     /// `port == 0` — not a valid bind target.
     InvalidPort,
+    /// Backend-side bind step failed (native OS refused to open the
+    /// SO_REUSEPORT sibling sockets for this port).
+    BackendFailed,
 }
 
 /// A UDP socket bound to one port. Dropping releases the slot.
@@ -250,6 +277,16 @@ impl UdpSocket {
                 inbox.head.store(0, Ordering::Relaxed);
                 inbox.tail.store(0, Ordering::Relaxed);
                 *inbox.waker.lock() = None;
+                // Let the backend do any port-specific setup (open
+                // OS sockets on native). Bare-metal's NIC path already
+                // delivers every inbound datagram regardless of who's
+                // bound, so the hook stays unregistered there.
+                if let Some(hook) = BACKEND_BIND.load() {
+                    if hook(port).is_err() {
+                        inbox.port.store(0, Ordering::Release);
+                        return Err(UdpBindError::BackendFailed);
+                    }
+                }
                 return Ok(UdpSocket {
                     port,
                     idx,

@@ -451,9 +451,9 @@ impl ThreadState {
 /// worker thread's `collect_events` when its kqueue/epoll reports the
 /// sibling ready.
 fn drain_udp_sibling(fd: i32, binding_idx: usize) {
-    let handler = unsafe {
+    let (app_port, handler) = unsafe {
         match (*UDP_BINDINGS.0.get())[binding_idx] {
-            Some(ref b) => b.handler,
+            Some(ref b) => (b.app_port, b.handler),
             None => return,
         }
     };
@@ -468,7 +468,15 @@ fn drain_udp_sibling(fd: i32, binding_idx: usize) {
         if n <= 0 { break; }
         let src_ip = src_addr.sin_addr.to_be_bytes();
         let src_port = u16::from_be(src_addr.sin_port);
-        handler(src_ip, src_port, &buf[..n as usize]);
+        let payload = &buf[..n as usize];
+
+        // Try the async reactor first; fall back to the legacy
+        // callback only if no `UdpSocket` is bound for this port.
+        if !uni_runtime::net::deliver_udp(app_port, src_ip, src_port, payload) {
+            if let Some(h) = handler {
+                h(src_ip, src_port, payload);
+            }
+        }
     }
 }
 
@@ -600,6 +608,11 @@ fn init_native() {
         signal(SIGTERM, h);
         signal(SIGPIPE, SIG_IGN);
     }
+
+    // Wire `UdpSocket::bind` in uni-runtime to our SO_REUSEPORT
+    // sibling opener. On bare-metal the hook stays unset because
+    // the NIC RX path unconditionally delivers to the reactor.
+    uni_runtime::net::register_backend_bind(udp_backend_bind);
 
     // Register TCP/UDP polling as the first IO poll callback.
     // Runs on every worker's event-loop tick and drains the worker's
@@ -851,7 +864,11 @@ struct UdpBinding {
     fds: [i32; MAX_THREADS],
     sibling_count: usize,
     app_port: u16,  // port as requested by app (used for send-side lookup)
-    handler: fn([u8; 4], u16, &[u8]),
+    /// Callback path: `Some` for legacy `udp_bind(port, handler)`.
+    /// `None` when the async reactor (`UdpSocket::bind`) set this
+    /// binding up — drain dispatches to `uni_runtime::net::deliver_udp`
+    /// in that case.
+    handler: Option<fn([u8; 4], u16, &[u8])>,
 }
 
 // UDP relay table. Entries written by `udp_bind` on the main thread
@@ -900,15 +917,35 @@ fn open_udp_sibling(bind_port: u16) -> i32 {
 }
 
 pub fn udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
+    let _ = open_udp_relay(port, Some(handler));
+}
+
+/// Hook registered with `uni_runtime::net::register_backend_bind`.
+/// Invoked when a `UdpSocket` is created; opens the SO_REUSEPORT
+/// siblings with no sync handler so the `drain_udp_sibling` path
+/// routes inbound datagrams through the async reactor.
+fn udp_backend_bind(port: u16) -> Result<(), ()> {
+    open_udp_relay(port, None)
+}
+
+/// Open SO_REUSEPORT siblings for `app_port` and register each in
+/// its worker's kqueue/epoll. Shared by the legacy sync `udp_bind`
+/// and the async `UdpSocket::bind` hook (`handler = None`). Returns
+/// `Err(())` if the OS refused the first sibling bind — higher
+/// layers surface that as `UdpBindError::BackendFailed`.
+fn open_udp_relay(
+    app_port: u16,
+    handler: Option<fn([u8; 4], u16, &[u8])>,
+) -> Result<(), ()> {
     unsafe {
         let count = UDP_COUNT.load(Ordering::Acquire);
-        if count >= MAX_UDP_BINDINGS { return; }
+        if count >= MAX_UDP_BINDINGS { return Err(()); }
 
         // Per-port override keyed on the app's requested port:
         // `UNIKERNEL_UDP_<port>` swaps in a different host-bind
         // port. Each app-requested UDP port has its own knob — no
         // shared base + offset remapping.
-        let bind_port = read_port_env("UDP", port).unwrap_or(port);
+        let bind_port = read_port_env("UDP", app_port).unwrap_or(app_port);
 
         // Open NUM_THREADS SO_REUSEPORT siblings so the kernel
         // distributes incoming datagrams across the group by 4-tuple
@@ -920,7 +957,7 @@ pub fn udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
         for i in 0..want {
             let fd = open_udp_sibling(bind_port);
             if fd < 0 {
-                if i == 0 { return; }
+                if i == 0 { return Err(()); }
                 break;
             }
             fds[i] = fd;
@@ -931,7 +968,7 @@ pub fn udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
         (*UDP_BINDINGS.0.get())[binding_idx] = Some(UdpBinding {
             fds,
             sibling_count: got,
-            app_port: port,
+            app_port,
             handler,
         });
         UDP_COUNT.store(binding_idx + 1, Ordering::Release);
@@ -944,6 +981,7 @@ pub fn udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
         for worker_id in 0..got {
             threads[worker_id].add_udp_sibling(fds[worker_id], binding_idx);
         }
+        Ok(())
     }
 }
 

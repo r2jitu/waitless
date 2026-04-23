@@ -16,5 +16,6 @@ rust_library(
     deps = [
         "//uni-percpu",
         "//uni-platform",
+        "//util/atomic_fn",
     ],
 )
