@@ -21,8 +21,8 @@ implementation itself.
 | P0. `//uni-executor` with shared arena / Waker / Sleep | 🟢 done | `509a6af` |
 | P1. `//uni-percpu` — `CurrentCore` + `PerCpu<T, N>` shared | 🟢 done | `a506a52` |
 | P2. `TimerWheel` + `PendingTimers` shared | 🟢 done | `9e0095f` |
-| P2.5. `InitOnce<T>` shared, `uni/boot_info.rs` dedup | 🟢 done | `e52ce2a` |
-| P3. Runtime fn-pointer struct — drop `extern "C"` hooks | 🟢 done | next |
+| P2.5. `InitOnce<T>` shared, `uni/src/boot_info.rs` dedup | 🟢 done | `e52ce2a` |
+| P3. Runtime fn-pointer struct — drop `extern "C"` hooks | 🟢 done | `62f33b4` |
 | P4. `UdpRecv::recv_from().await` reactor | ⏳ | — |
 | P5. *(optional)* `TcpListener::accept().await` reactor | ⏳ | — |
 
@@ -67,7 +67,7 @@ work refines:
 ```
 //uni-executor        — TaskSlot arena, RawWakerVTable, Sleep, spawn, tick, has_ready
 //uni-percpu          — CurrentCore (ZST token), PerCpu<T, N>, MAX_WORKERS
-//kernel/executor.rs  — bare-metal backend: hooks + tick wrapper + WHEELS
+//kernel/src/executor.rs  — bare-metal backend: hooks + tick wrapper + WHEELS
 //uni-native/executor — native backend:    hooks + tick wrapper + per-worker timer Vec
 //apps/test_async     — smoke test; 4 variants green (HVF, QEMU ×2, native)
 ```
@@ -106,8 +106,8 @@ Design principles inherited from the landed work:
 
 Native currently uses `Vec<NativeTimer>` with O(n) cancel and no
 cross-worker submission path. The kernel's
-[`kernel::timer::TimerWheel`](../kernel/timer.rs) gives O(1) insert
-+ slot-hashed fire; [`PendingTimers`](../kernel/timer.rs) is a
+[`kernel::timer::TimerWheel`](../uni-percpu/src/timer.rs) gives O(1) insert
++ slot-hashed fire; [`PendingTimers`](../uni-percpu/src/timer.rs) is a
 lock-free MPSC for cross-worker scheduling. Moving both into
 `//uni-percpu` (or a new `//uni-timer` crate — bikeshed, see below)
 makes the native backend's `uni_exec_schedule_timer` the same
@@ -129,15 +129,15 @@ split.
 
 ### Steps
 
-1. **Move `kernel/timer.rs` contents to `//uni-percpu` (~290 LOC).**
+1. **Move `uni-percpu/src/timer.rs` contents to `//uni-percpu` (~290 LOC).**
    Keep `kernel::timer` as a re-export for existing callers:
    ```rust
-   // kernel/timer.rs
+   // uni-percpu/src/timer.rs
    pub use uni_percpu::timer::{Timer, TimerWheel, PendingTimers};
    ```
    `Timer::func` is `fn(usize)` (Rust ABI) — unchanged.
 
-2. **`kernel/executor.rs` is unchanged.** It uses
+2. **`kernel/src/executor.rs` is unchanged.** It uses
    `kernel::timer::{Timer, TimerWheel}` which now points at the
    shared impl.
 
@@ -168,7 +168,7 @@ split.
    call, identical to the kernel's idle path.
 
 4. **Unit tests.** `TimerWheel` already has tests at
-   `kernel/timer.rs`; they move with the code. They're host-native
+   `uni-percpu/src/timer.rs`; they move with the code. They're host-native
    tests, so they run on any platform after the move.
 
 ### Acceptance
@@ -250,7 +250,7 @@ or copy the pattern into `//uni-executor`.
 ### Backend shape
 
 ```rust
-// kernel/executor.rs
+// kernel/src/executor.rs
 struct KernelRuntime;
 static KERNEL_RT: KernelRuntime = KernelRuntime;
 
@@ -266,7 +266,7 @@ impl Runtime for KernelRuntime {
 pub fn init() { uni_executor::register(&KERNEL_RT); }
 ```
 
-`init()` called from `boot/entry.rs` right after `percpu::init`.
+`init()` called from `boot/src/entry.rs` right after `percpu::init`.
 Same pattern for `uni-native` (registered from `uni_native::run`).
 
 ### Steps
@@ -276,7 +276,7 @@ Same pattern for `uni-native` (registered from `uni_native::run`).
    the transition (call-through from trait methods) so no backend
    breaks mid-refactor.
 2. **Migrate bare-metal backend.** Add `impl Runtime for
-   KernelRuntime`, add `init()` call from `boot/entry.rs`. Remove
+   KernelRuntime`, add `init()` call from `boot/src/entry.rs`. Remove
    the three `#[unsafe(no_mangle)] pub extern "C" fn uni_exec_*`
    symbols.
 3. **Migrate native backend.** Same shape, registration from
@@ -408,8 +408,8 @@ Status legend: ⏳ not started · 🟡 in progress · 🟢 complete · 🔴 bloc
 
 | # | Phase | Status | Primary files | Lines Δ |
 |---|---|---|---|---|
-| P0 | `//uni-executor` — shared arena / Waker / Sleep | 🟢 | `uni-executor/**`, `kernel/executor.rs`, `uni-native/src/executor.rs` | +506 / -375 |
-| P1 | `//uni-percpu` — `CurrentCore` + `PerCpu` | 🟢 | `uni-percpu/**`, `kernel/percpu.rs` | +321 / -272 |
+| P0 | `//uni-executor` — shared arena / Waker / Sleep | 🟢 | `uni-executor/**`, `kernel/src/executor.rs`, `uni-native/src/executor.rs` | +506 / -375 |
+| P1 | `//uni-percpu` — `CurrentCore` + `PerCpu` | 🟢 | `uni-percpu/**`, `kernel/src/percpu.rs` | +321 / -272 |
 | P2 | Share `TimerWheel` + `PendingTimers` | 🟢 | `uni-percpu/src/timer.rs`, `uni-native/src/executor.rs` | +435 / -451 |
 | P2.5 | Share `InitOnce<T>` | 🟢 | `uni-percpu/src/once.rs`, `uni/boot_info.rs` | +201 / -263 |
 | P3 | `trait Runtime` — drop `extern "C"` | 🔴 blocked | `uni-executor/src/lib.rs`, both backends | — |
