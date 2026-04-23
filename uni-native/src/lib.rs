@@ -1168,6 +1168,7 @@ pub struct RunConfig {
 /// Returns the process exit code.
 pub fn run(config: RunConfig) -> i32 {
     init_native();
+    executor::init();
 
     // Publish the boot-time snapshot via the uni-side callback. The
     // native backend has no NIC driver (POSIX sockets go through the

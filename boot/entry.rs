@@ -532,6 +532,10 @@ unsafe fn kernel_boot(info: &BootInfo) {
     // SMP and NIC init so `num_cpus` and `nics` are final.
     publish_boot_info(net_ok);
 
+    // Register the bare-metal async runtime with `uni-executor`.
+    // Must happen before `uni_main` so the app can `spawn` / `sleep_us`.
+    kernel::executor::init();
+
     klog!("\n[BOOT] All subsystems ready. Starting application.\n\n");
     uni_main();
 

@@ -14,7 +14,7 @@ implementation itself.
 
 ## Status
 
-**In progress — P3 blocked.**
+**In progress.**
 
 | Phase | Status | Commit |
 |---|---|---|
@@ -22,49 +22,40 @@ implementation itself.
 | P1. `//uni-percpu` — `CurrentCore` + `PerCpu<T, N>` shared | 🟢 done | `a506a52` |
 | P2. `TimerWheel` + `PendingTimers` shared | 🟢 done | `9e0095f` |
 | P2.5. `InitOnce<T>` shared, `uni/boot_info.rs` dedup | 🟢 done | `e52ce2a` |
-| P3. Runtime trait — drop `extern "C"` executor hooks | 🔴 blocked | — |
+| P3. Runtime fn-pointer struct — drop `extern "C"` hooks | 🟢 done | next |
 | P4. `UdpRecv::recv_from().await` reactor | ⏳ | — |
 | P5. *(optional)* `TcpListener::accept().await` reactor | ⏳ | — |
 
 After P4, ROADMAP §3c starts. Everything after that lives in the
 ROADMAP, not here.
 
-### P3 blocker
+### P3 design note
 
-Implemented trait + `InitOnce<&'static dyn Runtime>` + `register`
-hook. Attempted to call `kernel::executor::init()` from
-`boot/entry.rs` just before `uni_main()`. With the call in place:
+First attempt used `InitOnce<&'static dyn Runtime>` with a
+`trait Runtime`. That broke `apps/webserver:test_hvf` in a
+non-obvious way: `kernel::executor::init()` at boot → webserver's
+virtio-net IRQ delivery stopped firing. No panic, just silent
+wedge. Root cause never isolated — suspected fat-pointer write
+ordering vs. GIC / IRQ state, but no hard evidence.
 
-- `apps/test_async` (4 variants), `apps/test_percpu`,
-  `//uni-percpu:*_test`, `//uni:boot_info_test` — all pass.
-- `apps/webserver:test_hvf` — **hangs**. VM boots, `Net::enable`
-  returns (DHCP fails, static fallback), HTTP/TLS listeners
-  print `listening`, then the event loop spins with
-  `p=0 d=0 s=0 i=N` forever — network poll never sees RX even
-  though the test client is connecting to localhost:18080.
+Shipped design is simpler and works: a POD `struct Runtime` of
+Rust-ABI fn pointers, published via `AtomicPtr<Runtime>`. No
+`dyn Trait`, no `InitOnce`, no `extern "C"`, no
+`#[allow(improper_ctypes)]`. Backends define a static of named
+fns:
 
-Commenting out the single `kernel::executor::init()` call (while
-keeping the full Runtime trait + impl + `RUNTIME: InitOnce<&dyn
-Runtime>` static) fixes webserver. So the bug is in the `register`
-path, not in the trait / static layout.
+```rust
+static RUNTIME: uni_executor::Runtime = uni_executor::Runtime {
+    now_ticks: rt_now_ticks,
+    schedule_timer: rt_schedule_timer,
+    cancel_timer: rt_cancel_timer,
+};
 
-Tried: no panic output on serial (panic handler would `serial::puts
-("PANIC in entry")`); InitOnce passes its own unit tests under
-high-contention concurrent-init stress. The `&KERNEL_RT` coercion
-from `&'static KernelRuntime` (ZST) to `&'static dyn Runtime` is
-standard Rust. Two-word fat-pointer write through
-`MaybeUninit<&dyn Runtime>` via `UnsafeCell::get()` should be sound.
+pub fn init() { uni_executor::register(&RUNTIME); }
+```
 
-Open hypothesis: something about writing the 16-byte fat pointer
-to BSS-resident static storage from the boot path perturbs the
-virtio-net IRQ delivery path (GIC state? MAIR / cache?). No hard
-evidence — pausing for now.
-
-**Reverted** P3 code from `boot/entry.rs`, `kernel/executor.rs`,
-`uni-native/src/executor.rs`, `uni-native/src/lib.rs`, and
-`uni-executor/src/lib.rs`. The three `extern "C"` hooks +
-`#[allow(improper_ctypes)]` stay. `InitOnce` carve-out (P2.5)
-kept because it's independently useful.
+One boot-time store of a thin pointer, one Acquire load per hook
+call. Extensible by adding fn-pointer fields to the struct.
 
 ---
 
