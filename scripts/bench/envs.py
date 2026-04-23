@@ -34,6 +34,8 @@ class QemuEnv:
     name = "qemu"
     label = "QEMU x86_64 TCG"
     tls_port_offset = 1000   # host TLS port = guest HTTP port + 1000
+    udp_port_offset = 1
+    tcp_echo_offset = 2
 
     def build(self):
         subprocess.run(
@@ -58,10 +60,12 @@ class QemuEnv:
         if cpus > 1:
             dev += f",mq=on,vectors={2*cpus+2}"
         tls_port = port + self.tls_port_offset
+        tcp_echo_port = port + self.tcp_echo_offset
         cmd += ["-device", f"{dev},netdev=net0",
                 "-netdev",
                 (f"user,id=net0,hostfwd=tcp::{port}-:80,"
                  f"hostfwd=tcp::{tls_port}-:443,"
+                 f"hostfwd=tcp::{tcp_echo_port}-:9,"
                  f"hostfwd=udp::{port+1}-:7"),
                 "-kernel", elf]
         return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -87,6 +91,7 @@ class KvmEnv:
     GUEST_PORT = 80
     GUEST_TLS_PORT = 443
     GUEST_UDP_PORT = 7
+    GUEST_TCP_ECHO_PORT = 9
 
     # Path to pre-staged ELF; set via --elf. If None, bazel build runs.
     elf_override = None
@@ -163,6 +168,8 @@ class QemuAarch64Env:
     name = "qemu-arm"
     label = "QEMU aarch64 TCG"
     tls_port_offset = 1000   # host TLS port = guest HTTP port + 1000
+    udp_port_offset = 1
+    tcp_echo_offset = 2
 
     def build(self):
         subprocess.run(
@@ -173,6 +180,7 @@ class QemuAarch64Env:
         img = os.path.join(_project_root(),
                            "bazel-bin/apps/webserver/webserver_qemu_aarch64.img")
         tls_port = port + self.tls_port_offset
+        tcp_echo_port = port + self.tcp_echo_offset
         cmd = ["qemu-system-aarch64", "-machine", "virt", "-cpu", "max",
                "-m", "128", "-smp", str(cpus), "-nographic",
                "-serial", f"file:/tmp/bench_{port}.log", "-no-reboot",
@@ -180,6 +188,7 @@ class QemuAarch64Env:
                "-netdev",
                (f"user,id=net0,hostfwd=tcp::{port}-:80,"
                 f"hostfwd=tcp::{tls_port}-:443,"
+                f"hostfwd=tcp::{tcp_echo_port}-:9,"
                 f"hostfwd=udp::{port+1}-:7"),
                "-kernel", img]
         return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

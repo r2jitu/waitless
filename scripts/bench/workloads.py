@@ -479,29 +479,51 @@ def run_tcp_echo(port, conns, duration, host="127.0.0.1", msg_size=64):
 
     procs = []
     ctx = mp.get_context("fork")
-    barrier = ctx.Barrier(conns + 1)
+    barrier = ctx.Barrier(conns + 1, timeout=10)
     result_q = ctx.Queue()
     for i in range(conns):
         p = ctx.Process(target=worker, args=(i == 0, barrier, result_q))
         p.start()
         procs.append(p)
-    barrier.wait()  # release workers — clock now starts
+    try:
+        barrier.wait()  # release workers — clock now starts
+    except Exception:
+        # Barrier timed out — some worker couldn't connect in 10 s
+        # (slow TCG, unresponsive guest). Tear everything down.
+        for p in procs:
+            if p.is_alive():
+                p.terminate()
+        for p in procs:
+            p.join(timeout=1)
+        return 0.0, "", ""
     start = _t.monotonic()
 
+    # Hard wall clock on result collection so a runaway worker can't
+    # stall the whole benchmark.
+    hard_deadline = _t.monotonic() + duration + 10
     total = 0
     lat_bytes = b""
-    for _ in procs:
-        c, lb = result_q.get(timeout=duration + 10)
-        total += c
-        if lb and not lat_bytes:
-            lat_bytes = lb
+    collected = 0
+    try:
+        for _ in procs:
+            remaining = max(0.1, hard_deadline - _t.monotonic())
+            c, lb = result_q.get(timeout=remaining)
+            total += c
+            collected += 1
+            if lb and not lat_bytes:
+                lat_bytes = lb
+    except Exception:
+        # Timed out waiting for results. Kill survivors and report
+        # whatever we did collect; downstream will show low rps.
+        pass
     for p in procs:
-        p.join(timeout=2)
         if p.is_alive():
             p.terminate()
+    for p in procs:
+        p.join(timeout=1)
 
     elapsed = max(1e-6, _t.monotonic() - start)
-    rps = total / elapsed
+    rps = total / elapsed if collected > 0 else 0.0
 
     if lat_bytes:
         count = len(lat_bytes) // 8
