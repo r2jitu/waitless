@@ -178,6 +178,7 @@ pub use uni_backend::{
 /// works on both unikernel and native.
 pub mod runtime {
     pub use uni_backend::runtime::{sleep_us, spawn, Sleep};
+    pub use uni_runtime::net::{UdpBindError, UdpRecv, UdpSocket};
 }
 
 /// Create a TCP listener on `port`, bound to a specific worker.

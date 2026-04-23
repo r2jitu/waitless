@@ -64,8 +64,24 @@ impl WebServerApp {
         let http_port = uni::config_port(HTTP_PORT);
         let https_port = uni::config_tls_port(HTTPS_PORT);
 
-        uni::udp_bind(7, udp_echo);
-        uni::log(b"UDP echo server on port 7\n");
+        match uni::runtime::UdpSocket::bind(7) {
+            Ok(sock) => {
+                if uni::runtime::spawn(async move {
+                    let mut buf = [0u8; 1500];
+                    loop {
+                        let (src_ip, src_port, n) = sock.recv_from(&mut buf).await;
+                        uni::udp_send(src_ip, 7, src_port, &buf[..n]);
+                    }
+                })
+                .is_err()
+                {
+                    uni::log(b"UDP echo: spawn FAILED\n");
+                } else {
+                    uni::log(b"UDP echo server on port 7 (async)\n");
+                }
+            }
+            Err(_) => uni::log(b"UDP echo: bind FAILED\n"),
+        }
 
         let mut server = Server::new_boxed();
         server.default_handler(handle_request);
@@ -117,10 +133,6 @@ fn handle_request(req: &Request) -> Response {
         }
         _ => Response::not_found(),
     }
-}
-
-fn udp_echo(src_ip: [u8; 4], src_port: u16, data: &[u8]) {
-    uni::udp_send(src_ip, 7, src_port, data);
 }
 
 /// Emit the contents of `uni::boot_info()` at startup. The line tags

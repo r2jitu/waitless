@@ -21,6 +21,7 @@ rust_library(
         "//uni-backend",
         "//uni-net",
         "//uni-percpu",
+        "//uni-runtime",
     ] + select({
         "//bazel/platforms:native": [],
         "//conditions:default": ["//kernel"],

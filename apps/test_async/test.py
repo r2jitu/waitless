@@ -40,6 +40,10 @@ class AsyncRuntimeSmokeTest(unittest.TestCase):
     def test_nested_completes(self) -> None:
         self.assertIn("test_async: nested task done", self.serial)
 
+    def test_udp_bind_drop(self) -> None:
+        self.assertIn("test_async: udp bind ok", self.serial)
+        self.assertIn("test_async: udp drop ok", self.serial)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

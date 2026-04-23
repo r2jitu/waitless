@@ -1,9 +1,10 @@
 // apps/test_async — Async-runtime smoke test.
 //
-// Spawns a future that logs, sleeps on a timer, logs again, then
-// requests shutdown. Exercises `uni::runtime::spawn`, the backend
-// task arena (kernel on unikernel / std on native), the waker wiring
-// and the `Sleep` future end-to-end.
+// Exercises the task arena, Waker wiring, and `Sleep` future. Also
+// does a bind/drop roundtrip on `UdpSocket` to verify the reactor's
+// registry + (on native) the backend bind hook wire up without
+// needing external UDP traffic — `apps/webserver`'s `test_udp_echo`
+// covers the full receive path.
 
 #![no_std]
 
@@ -17,6 +18,15 @@ fn boot() {
         uni::log(b"test_async: task started\n");
         uni::runtime::sleep_us(50_000).await;
         uni::log(b"test_async: task woke up\n");
+
+        match uni::runtime::UdpSocket::bind(17) {
+            Ok(sock) => {
+                uni::log(b"test_async: udp bind ok\n");
+                drop(sock);
+                uni::log(b"test_async: udp drop ok\n");
+            }
+            Err(_) => uni::log(b"test_async: udp bind FAILED\n"),
+        }
 
         let nested = uni::runtime::spawn(async {
             uni::runtime::sleep_us(10_000).await;
