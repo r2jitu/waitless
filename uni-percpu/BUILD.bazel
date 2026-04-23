@@ -1,4 +1,5 @@
 load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//bazel/rules:rust.bzl", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -16,6 +17,18 @@ package(default_visibility = ["//visibility:public"])
 # uni_percpu_current_worker()` hook that `CurrentCore::enter` reads.
 rust_library(
     name = "uni-percpu",
-    srcs = ["src/lib.rs"],
+    srcs = [
+        "src/lib.rs",
+        "src/timer.rs",
+    ],
     crate_name = "uni_percpu",
+)
+
+# Host-native unit tests for the timer wheel. panic=unwind is supplied
+# via `.bazelrc`'s `test --extra_rustc_flag=-Cpanic=unwind`.
+rust_test(
+    name = "timer_test",
+    size = "small",
+    srcs = ["src/timer.rs"],
+    crate_root = "src/timer.rs",
 )

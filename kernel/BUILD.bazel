@@ -100,9 +100,5 @@ rust_test(
     crate_root = "sync.rs",
 )
 
-rust_test(
-    name = "timer_test",
-    size = "small",
-    srcs = ["timer.rs"],
-    crate_root = "timer.rs",
-)
+# timer_test moved to //uni-percpu:timer_test — the wheel now lives
+# there so both backends can share it.

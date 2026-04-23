@@ -17,6 +17,8 @@
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 
+pub mod timer;
+
 /// Maximum workers supported by the shared runtime. Bare-metal sets
 /// `MAX_CORES` to the same value; native treats this as a ceiling on
 /// thread-pool size.
