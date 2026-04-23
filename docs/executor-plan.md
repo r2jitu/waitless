@@ -38,25 +38,26 @@ virtio-net IRQ delivery stopped firing. No panic, just silent
 wedge. Root cause never isolated — suspected fat-pointer write
 ordering vs. GIC / IRQ state, but no hard evidence.
 
-Shipped design is simpler and works: a POD `struct Runtime` of
-Rust-ABI fn pointers, published via `AtomicPtr<Runtime>`. No
-`dyn Trait`, no `InitOnce`, no `extern "C"`, no
-`#[allow(improper_ctypes)]`. Backends define a static of named
-fns:
+Landed in two steps. First shipped a POD `struct Runtime` of
+Rust-ABI fn pointers published via `AtomicPtr<Runtime>`, which
+eliminated `dyn Trait`, `InitOnce`, `extern "C"`, and the
+`#[allow(improper_ctypes)]` dance. Then, for the platform
+primitives that are build-time-selected (`current_worker`,
+`now_ticks`), swapped the `AtomicPtr` indirection for direct
+cfg-gated calls inside a new leaf `//uni-platform` crate:
 
 ```rust
-static RUNTIME: uni_runtime::Runtime = uni_runtime::Runtime {
-    now_ticks: rt_now_ticks,
-};
-
-pub fn init() {
-    uni_percpu::register_current_worker(rt_current_worker);
-    uni_runtime::register(&RUNTIME);
-}
+// bare-metal side: inline asm reads TPIDR_EL1 / rdtsc.
+// native side: std thread-local + Instant.
+let id   = uni_platform::current_worker();
+let now  = uni_platform::now_ticks();
 ```
 
-One boot-time store of a thin pointer, one Acquire load per hook
-call. Extensible by adding fn-pointer fields to the struct.
+Backend init publishes whatever per-worker state `uni-platform`
+depends on (x86 TSC rate after PIT calibration; a thread-local set
+at each native worker's startup). Register-style hooks stay for
+**stateful** dispatch where the upper crate really plugs over
+live-at-runtime backends (e.g., `uni_net_driver::NicOps`).
 
 ---
 
@@ -86,10 +87,10 @@ unsafe extern "C" {
 …plus one `uni_percpu_current_worker` hook in `//uni-percpu`. Both
 extern blocks need `#[allow(improper_ctypes)]` because `fn(usize)`
 is Rust ABI inside a C-ABI extern block (lint is cosmetic — we own
-both sides). P3 eliminates all three `extern "C"` hooks. Hooks are
-split by consuming crate: `register_current_worker` lives in
-`uni-percpu`, `register(&Runtime { now_ticks, … })` lives in
-`uni-runtime`.
+both sides). P3 eliminated all three `extern "C"` hooks and the
+follow-up removed the `AtomicPtr<Runtime>` plug-in entirely for the
+platform primitives — `uni_platform::{current_worker,now_ticks}`
+are direct cfg-gated calls.
 
 Design principles inherited from the landed work:
 

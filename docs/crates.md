@@ -20,13 +20,14 @@ User-facing crates. An app depends on these directly.
 Selected by cfg. `uni` re-exports from here; apps don't touch them
 directly.
 
-| Target                      | Crate name              | What it is                         |
-|-----------------------------|-------------------------|------------------------------------|
-| `//uni-backend`             | `uni_backend`           | Platform adapter (bare / native)   |
-| `//uni-runtime`             | `uni_runtime`           | Async executor (TaskSlot + Sleep)  |
-| `//uni-percpu`              | `uni_percpu`            | `PerCpu<T, N>`, `TimerWheel`       |
-| `//uni-driver-virtio-net`   | `uni_driver_virtio_net` | virtio-net NIC driver              |
-| `//uni-driver-gve`          | `uni_driver_gve`        | GCE gVNIC NIC driver               |
+| Target                      | Crate name              | What it is                                    |
+|-----------------------------|-------------------------|-----------------------------------------------|
+| `//uni-backend`             | `uni_backend`           | Platform adapter (bare / native)              |
+| `//uni-runtime`             | `uni_runtime`           | Async executor (TaskSlot + Sleep)             |
+| `//uni-percpu`              | `uni_percpu`            | `PerCpu<T, N>`, `TimerWheel`                  |
+| `//uni-platform`            | `uni_platform`          | Leaf: `current_worker()`, `now_ticks()`       |
+| `//uni-driver-virtio-net`   | `uni_driver_virtio_net` | virtio-net NIC driver                         |
+| `//uni-driver-gve`          | `uni_driver_gve`        | GCE gVNIC NIC driver                          |
 
 ## Tier 3 — bare-metal internals
 
@@ -50,16 +51,19 @@ BUILD.bazel sits at the crate root alongside `src/`.
 
 ## Fn-pointer dispatch model
 
-Cross-tier dispatch goes through a POD struct of Rust-ABI fn
-pointers published via `AtomicPtr` at boot. Callers do one
+Stateful cross-tier dispatch goes through a POD struct of Rust-ABI
+fn pointers published via `AtomicPtr` at boot. Callers do one
 `Acquire` load + one direct call per hook — no trait objects,
-no vtables, no `extern "C"`. Two instances in the tree:
+no vtables, no `extern "C"`. Used where the upper crate really is
+plugging over multiple live-at-runtime backends:
 
-- `uni_runtime::Runtime` — executor hooks (`now_ticks`, plus
-  reactor hooks as they land in P4/P5). See
-  [executor-plan.md](executor-plan.md) §P3.
-- `uni_percpu::register_current_worker` — one-hook slot for the
-  current-worker id (TPIDR_EL1 / pthread TLS).
 - `uni_net_driver::NicOps` — NIC driver ops (`send`, `poll_rx`,
-  etc.). `ACTIVE_OPS` starts pointing at a `NULL_OPS` backstop
-  so dispatchers never have to null-check.
+  etc.). `ACTIVE_OPS` starts pointing at a `NULL_OPS` backstop so
+  dispatchers never have to null-check.
+
+Platform primitives that are build-time-selected (`current_worker`,
+`now_ticks`) live in `uni-platform` as cfg-gated direct calls, not
+register-style hooks. Backends populate any per-worker state
+`uni-platform` depends on (TPIDR_EL1 / GS_BASE on bare-metal, a
+thread-local on native) during boot. See
+[executor-plan.md](executor-plan.md) §P3 design note.
