@@ -1068,7 +1068,7 @@ pub fn send(data: &[u8]) {
         send_on_qp(0, data);
     } else {
         // Single shared queue, multiple cores: stage to per-core ring.
-        cc.percore().tx_staging.push(data);
+        kernel::percpu::percore(&cc).tx_staging.push(data);
         TX_PENDING.store(true, Ordering::Release);
     }
 }

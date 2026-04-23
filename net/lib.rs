@@ -377,7 +377,7 @@ fn net_drain_cb(core_id: u32) -> bool {
     // current core's id; we threaded that id through, so it matches
     // `cpu_id()` at this exact moment without needing a second TLS read.
     let cc = unsafe { percpu::CurrentCore::from_id_unchecked(core_id) };
-    let core = cc.percore(); // SAFE access via the token
+    let core = percpu::percore(&cc); // SAFE access via the token
     let mut did_work = false;
     let mut buf = [0u8; 1514];
     while let Some(len) = core.rx_inbox.pop_into(&mut buf) {

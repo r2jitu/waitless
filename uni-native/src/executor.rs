@@ -1,25 +1,21 @@
 // uni-native/src/executor.rs — Native (POSIX) backend for `uni-executor`.
 //
-// Per-worker timer storage + the four `extern "C"` hooks the shared
-// runtime expects. Each worker thread calls `tick(worker_id)` from
-// `run_worker`; that advances this worker's timer list, fires any
-// expired callbacks (which wake their tasks via `Sleep` → waker),
-// then hands off to `uni_executor::tick` for the poll scan.
-//
-// Timer storage: one `Mutex<Vec<NativeTimer>>` per worker. The mutex
-// is uncontended in the common path (owning worker only) — it's there
-// to give the static the `Send + Sync` it needs to live at global
-// scope.
+// Same per-worker shape as bare-metal: each worker owns its own
+// timer list, accessed through `uni_percpu::PerCpu` + `CurrentCore`.
+// The `!Send + !Sync` token is all the synchronisation needed — no
+// `Mutex` — because the list is touched only by its owning worker
+// (insert from a running task's `Sleep::poll`, cancel from
+// `Sleep::drop` on the same task, advance from `run_worker`).
 
-use std::sync::{Mutex, OnceLock};
+use std::cell::UnsafeCell;
 use std::time::Instant;
 
-use uni_executor::MAX_WORKERS;
+use uni_percpu::{CurrentCore, PerCpu, MAX_WORKERS};
 
 // ---- Monotonic tick source -------------------------------------------------
 
 fn start() -> Instant {
-    static S: OnceLock<Instant> = OnceLock::new();
+    static S: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     *S.get_or_init(Instant::now)
 }
 
@@ -31,37 +27,51 @@ fn now_us() -> u64 {
 
 struct NativeTimer {
     deadline: u64,
-    func: extern "C" fn(usize),
+    func: fn(usize),
     arg: usize,
 }
 
-struct TimerList(Mutex<Vec<NativeTimer>>);
+/// Owning-worker-only `Vec<NativeTimer>`. The `CurrentCore` token
+/// gates access; the `unsafe impl Sync` is the paperwork that tells
+/// the compiler we've enforced the contract.
+struct TimerList(UnsafeCell<Vec<NativeTimer>>);
+
+// SAFETY: touched only by the worker whose id this slot holds,
+// via `PerCpu::current(&CurrentCore)`.
+unsafe impl Sync for TimerList {}
+unsafe impl Send for TimerList {}
 
 impl TimerList {
     const fn new() -> Self {
-        TimerList(Mutex::new(Vec::new()))
+        TimerList(UnsafeCell::new(Vec::new()))
     }
 }
 
-static TIMERS: [TimerList; MAX_WORKERS] = [const { TimerList::new() }; MAX_WORKERS];
+static TIMERS: PerCpu<TimerList, MAX_WORKERS> =
+    PerCpu::new([const { TimerList::new() }; MAX_WORKERS]);
 
-fn advance(worker_id: u32, now: u64) {
-    let list = &TIMERS[worker_id as usize];
-    // Collect expired timers under the lock, fire them after releasing
-    // so a timer callback that re-schedules doesn't deadlock.
-    let fired: Vec<NativeTimer> = {
-        let mut guard = list.0.lock().unwrap();
-        let mut i = 0;
-        let mut out = Vec::new();
-        while i < guard.len() {
-            if guard[i].deadline <= now {
-                out.push(guard.remove(i));
-            } else {
-                i += 1;
-            }
+fn timers_for(cc: &CurrentCore) -> &mut Vec<NativeTimer> {
+    let cell = TIMERS.current(cc);
+    // SAFETY: owning-worker-only; `CurrentCore` proves we're on it.
+    unsafe { &mut *cell.0.get() }
+}
+
+fn advance(cc: &CurrentCore, now: u64) {
+    let list = timers_for(cc);
+    // Partition in-place: keep pending ahead, collect fired at the
+    // tail. `split_off` at `keep` returns the fired portion.
+    let mut keep = 0;
+    let mut i = 0;
+    while i < list.len() {
+        if list[i].deadline <= now {
+            i += 1;
+        } else {
+            list.swap(keep, i);
+            keep += 1;
+            i += 1;
         }
-        out
-    };
+    }
+    let fired = list.split_off(keep);
     for t in fired {
         (t.func)(t.arg);
     }
@@ -69,20 +79,19 @@ fn advance(worker_id: u32, now: u64) {
 
 // ---- Event-loop integration ------------------------------------------------
 
-/// Advance this worker's timer list, then poll its arena. Called from
-/// `run_worker` once per iteration.
+/// Advance this worker's timer list, then poll its arena. Called
+/// from `run_worker` once per iteration.
 pub fn tick(worker_id: u32) -> bool {
-    advance(worker_id, now_us());
+    // SAFETY: `run_worker` only calls this on the running worker.
+    let cc = unsafe { CurrentCore::from_id_unchecked(worker_id) };
+    advance(&cc, now_us());
     uni_executor::tick(worker_id)
 }
 
 // ---- Backend hooks ---------------------------------------------------------
-//
-// Linked against the `extern "C"` declarations in
-// `//uni-executor/src/lib.rs`.
 
 #[unsafe(no_mangle)]
-pub extern "C" fn uni_exec_current_worker() -> u32 {
+pub extern "C" fn uni_percpu_current_worker() -> u32 {
     super::current_thread_id()
 }
 
@@ -91,17 +100,18 @@ pub extern "C" fn uni_exec_now_ticks() -> u64 {
     now_us()
 }
 
+// `func: fn(usize)` is Rust ABI; on every target we support it
+// lowers to the same register as a C-ABI fn pointer. The lint is
+// about portability we don't need.
+#[allow(improper_ctypes_definitions)]
 #[unsafe(no_mangle)]
 pub extern "C" fn uni_exec_schedule_timer(
     deadline: u64,
-    func: extern "C" fn(usize),
+    func: fn(usize),
     arg: usize,
 ) -> bool {
-    let wid = super::current_thread_id() as usize;
-    if wid >= MAX_WORKERS {
-        return false;
-    }
-    TIMERS[wid].0.lock().unwrap().push(NativeTimer {
+    let cc = CurrentCore::enter();
+    timers_for(&cc).push(NativeTimer {
         deadline,
         func,
         arg,
@@ -111,14 +121,11 @@ pub extern "C" fn uni_exec_schedule_timer(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn uni_exec_cancel_timer(arg: usize) -> bool {
-    let wid = super::current_thread_id() as usize;
-    if wid >= MAX_WORKERS {
-        return false;
-    }
-    let mut guard = TIMERS[wid].0.lock().unwrap();
-    let before = guard.len();
-    guard.retain(|t| t.arg != arg);
-    guard.len() != before
+    let cc = CurrentCore::enter();
+    let list = timers_for(&cc);
+    let before = list.len();
+    list.retain(|t| t.arg != arg);
+    list.len() != before
 }
 
 // ---- Re-exports for app code ----------------------------------------------

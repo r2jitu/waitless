@@ -50,6 +50,7 @@ rust_library(
     target_compatible_with = ["@platforms//os:none"],
     deps = [
         "//uni-executor",
+        "//uni-percpu",
         "//util/atomic_fn",
         "@crates//:chacha20",
         "@crates//:getrandom",

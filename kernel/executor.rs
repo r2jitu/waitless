@@ -1,20 +1,24 @@
 // kernel/executor.rs — Bare-metal backend for `uni-executor`.
 //
 // The shared async runtime (arena, waker, Sleep) lives in
-// `//uni-executor`. This file provides the four `extern "C"` hooks
-// the shared crate expects:
+// `//uni-executor`; `CurrentCore` + `PerCpu` live in `//uni-percpu`.
+// This file provides the three `extern "C"` hooks `uni-executor`
+// expects:
 //
-//   * `uni_exec_current_worker`  → `kernel::cpu_id()`
 //   * `uni_exec_now_ticks`       → cycle counter / µs
 //   * `uni_exec_schedule_timer`  → per-core `kernel::timer::TimerWheel`
 //   * `uni_exec_cancel_timer`    → `TimerWheel::cancel`
+//
+// Worker-id lookups go through `uni_percpu::CurrentCore::enter`,
+// which calls the separate `uni_percpu_current_worker` hook supplied
+// by `kernel::percpu`.
 //
 // `tick()` + `has_pending()` are the event-loop integration points
 // kept here: `tick` drains the per-core `pending_timers` MPSC,
 // advances the wheel (which fires Sleep timers → wakers → slot
 // ready bits), then calls the shared `uni_executor::tick`.
 
-use crate::percpu::{CurrentCore, MAX_CORES, PerCpu};
+use crate::percpu::{percore, CurrentCore, MAX_CORES, PerCpu};
 use crate::timer::{Timer, TimerWheel};
 
 // ---- Per-core wheel storage ------------------------------------------------
@@ -51,7 +55,7 @@ pub fn tick(core_id: u32) -> bool {
     // SAFETY: the event loop only calls `tick` on the running core.
     let cc = unsafe { CurrentCore::from_id_unchecked(core_id) };
 
-    let pc = cc.percore();
+    let pc = percore(&cc);
     let w = wheel(&cc);
     let _ = pc.pending_timers.drain_into(w);
     let _ = w.advance(now_ticks_us());
@@ -75,34 +79,29 @@ pub fn has_pending(core_id: u32) -> bool {
 // ---- Backend hooks ---------------------------------------------------------
 //
 // Linked against the `extern "C"` declarations in
-// `//uni-executor/src/lib.rs`.
-
-#[unsafe(no_mangle)]
-pub extern "C" fn uni_exec_current_worker() -> u32 {
-    crate::cpu_id()
-}
+// `//uni-executor/src/lib.rs`. Function-pointer arg uses plain Rust
+// ABI (`fn(usize)`), so we can store it in `kernel::timer::Timer`
+// directly without a transmute.
 
 #[unsafe(no_mangle)]
 pub extern "C" fn uni_exec_now_ticks() -> u64 {
     now_ticks_us()
 }
 
+// `func: fn(usize)` is Rust ABI; on every target we support it
+// lowers to the same register as a C-ABI fn pointer. The lint is
+// about portability we don't need.
+#[allow(improper_ctypes_definitions)]
 #[unsafe(no_mangle)]
 pub extern "C" fn uni_exec_schedule_timer(
     deadline: u64,
-    func: extern "C" fn(usize),
+    func: fn(usize),
     arg: usize,
 ) -> bool {
     let cc = CurrentCore::enter();
-    let w = wheel(&cc);
-    // `kernel::timer::Timer::func` is `fn(usize)` (Rust ABI). The
-    // `extern "C" fn(usize)` pointer is ABI-compatible for this
-    // single-usize signature on both of our targets (AAPCS64 and
-    // System V x86-64), so a transmute preserves call behaviour.
-    let func_rust: fn(usize) = unsafe { core::mem::transmute(func) };
-    w.insert(Timer {
+    wheel(&cc).insert(Timer {
         deadline,
-        func: func_rust,
+        func,
         arg,
     })
 }

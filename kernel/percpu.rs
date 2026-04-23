@@ -18,8 +18,14 @@ use crate::deque::{Deque, Task};
 use crate::spsc;
 use crate::timer::{TimerWheel, PendingTimers};
 
-/// Maximum number of cores.
-pub const MAX_CORES: usize = 8;
+// `CurrentCore` + `PerCpu<T, N>` now live in `//uni-percpu` so native
+// can share them. Kept under the `kernel::percpu` path via re-export
+// so existing callers don't shift.
+pub use uni_percpu::{CurrentCore, PerCpu, MAX_WORKERS};
+
+/// Maximum number of cores. Alias for `uni_percpu::MAX_WORKERS` kept
+/// for readability inside the kernel.
+pub const MAX_CORES: usize = MAX_WORKERS;
 
 /// Maximum packet size for TX staging.
 const TX_BUF_SIZE: usize = 1514;
@@ -284,76 +290,21 @@ pub fn num_cores() -> u32 {
     NUM_CORES.load(core::sync::atomic::Ordering::Acquire)
 }
 
-// ============================================================================
-// CurrentCore token: zero-cost proof-of-current-core for typed accessors
-// ============================================================================
-//
-// `CurrentCore` is a non-Send, non-Sync, zero-sized token whose existence
-// proves the holder is running on the core whose id is recorded inside it.
-// It's obtained by calling `CurrentCore::enter()`, which reads the TLS
-// register (TPIDR_EL1 / GS_BASE) once. Subsequent uses of the token avoid
-// the syscall-equivalent of re-reading the TLS register on every access.
-//
-// The token's value is in encoding the per-core ownership rule that
-// otherwise lives in comments: "this code path runs on the core whose
-// id == cpu_id() at the time of entry." Methods that take `&CurrentCore`
-// can rely on that invariant for lock-free per-core mutation.
-//
-// Zero cost: `CurrentCore` is a `repr(C)` ZST containing only `id: u32`,
-// so it occupies one register at most. `enter()` inlines to a single TLS
-// register read. The `!Send`/`!Sync` markers are PhantomData<*mut ()> —
-// ZSTs that produce no codegen. The end result is exactly the same
-// machine code as `let id = cpu_id();` followed by manual checks.
-
-/// Token proving that the holder is currently running on `core(id)`.
-/// Cannot be sent to or shared with another thread/core.
-#[derive(Clone, Copy)]
-pub struct CurrentCore {
-    id: u32,
-    _not_send: core::marker::PhantomData<*mut ()>,
+// `CurrentCore` used to expose a `.percore()` convenience that walked
+// the kernel-specific `CORES` array; now that the token is shared with
+// native (which has no `PerCore`) it lives in `uni-percpu`. This free
+// function fills the same role for bare-metal callers.
+#[inline(always)]
+pub fn percore(cc: &CurrentCore) -> &'static PerCore {
+    CORES.current(cc)
 }
 
-impl CurrentCore {
-    /// Read the current core id from the TLS register and bind it into
-    /// a token. Cheap (one MRS or `mov gs:[0], eax`).
-    #[inline(always)]
-    pub fn enter() -> Self {
-        CurrentCore {
-            id: crate::cpu_id(),
-            _not_send: core::marker::PhantomData,
-        }
-    }
-
-    /// Construct a token from a core id the caller already knows is
-    /// the current core (e.g., from the event loop callback dispatch
-    /// which threaded `cpu_id()` through earlier). Saves the second
-    /// TLS read that `enter()` would do.
-    ///
-    /// SAFETY: caller must guarantee that `id == cpu_id()` at the time
-    /// of the call AND that the token does not outlive the iteration
-    /// (which can never happen across threads because `CurrentCore` is
-    /// `!Send`).
-    #[inline(always)]
-    pub unsafe fn from_id_unchecked(id: u32) -> Self {
-        CurrentCore {
-            id,
-            _not_send: core::marker::PhantomData,
-        }
-    }
-
-    /// The id of the core this token represents.
-    #[inline(always)]
-    pub fn id(&self) -> u32 {
-        self.id
-    }
-
-    /// Get a shared reference to this core's `PerCore` state. Safe by
-    /// construction: the token proves we're running on `core(self.id)`,
-    /// and `PerCpu::current` returns the corresponding slot.
-    #[inline(always)]
-    pub fn percore(&self) -> &'static PerCore {
-        CORES.current(self)
-    }
+/// Backend hook consumed by `uni_percpu::CurrentCore::enter()`. Reads
+/// the TLS register via `kernel::cpu_id` so the token matches whatever
+/// the rest of the kernel sees.
+#[unsafe(no_mangle)]
+pub extern "C" fn uni_percpu_current_worker() -> u32 {
+    crate::cpu_id()
 }
 
 /// Register the AP poll function (called by net layer during init).
@@ -366,95 +317,4 @@ pub fn set_ap_poll_fn(f: fn(u32) -> bool) {
 /// Get the AP poll function (called by APs in their event loop).
 pub fn ap_poll_fn() -> Option<fn(u32) -> bool> {
     AP_POLL_FN.load()
-}
-
-// ============================================================================
-// PerCpu<T, const N>: typed per-core array
-// ============================================================================
-//
-// The "array of N per-core slots" pattern was open-coded in five places
-// before this primitive (CORES, RxInbox/TxStaging pool/ready, tcp::POOLS,
-// uni::native::THREADS, net::lib::WAKEUP). Each got the indexing right but
-// the *pattern* repeated, with subtly different access functions and
-// `unsafe { ... }` justifications.
-//
-// `PerCpu<T, N>` consolidates the pattern: N slots stored in `UnsafeCell<T>`,
-// accessed via either:
-//   - `current(&CurrentCore) -> &T` — safe, returns the slot owned by the
-//     calling core (the token proves we're on it)
-//   - `at(id) -> &T` — needs the caller to follow the per-core ownership
-//     discipline (e.g. only the owning core mutates), but is safe at the
-//     reference level since cross-core read of fields with interior
-//     mutability is fine
-//
-// `T` itself must use interior mutability (Atomic*, UnsafeCell) for any
-// mutation — the same convention as `kernel::percpu::PerCore`.
-//
-// Zero cost: `PerCpu<T, N>` is `repr(transparent)` over `[UnsafeCell<T>; N]`.
-// `current()` inlines to a single array index using the token's id (which
-// itself is one register move from the TLS read in `enter()`). The
-// `unsafe impl Sync` is the only unsafe in the type; the safety contract
-// is documented as "T must be Sync OR the caller must use the per-core
-// ownership discipline."
-
-/// Typed per-CPU array of `N` slots of `T`.
-#[repr(transparent)]
-pub struct PerCpu<T, const N: usize> {
-    slots: [core::cell::UnsafeCell<T>; N],
-}
-
-// SAFETY: PerCpu provides shared (`&T`) access only. T is responsible
-// for its own interior mutability (Atomic*, UnsafeCell, lock, etc.).
-// We require T: Sync because cross-core read access is shared, and
-// T: Send because the slot is logically transferable between cores
-// (though in practice each slot is owned by one core).
-unsafe impl<T: Sync + Send, const N: usize> Sync for PerCpu<T, N> {}
-
-impl<T, const N: usize> PerCpu<T, N> {
-    /// Construct from an array of N initial values. Const-callable so
-    /// the array can live in a `static`.
-    #[inline]
-    pub const fn new(values: [T; N]) -> Self {
-        // Convert [T; N] -> [UnsafeCell<T>; N] field-by-field via ptr
-        // copy. This is the only way to do the conversion in const
-        // context as of stable Rust. SAFETY: UnsafeCell<T> is
-        // repr(transparent) over T, so the layouts match exactly.
-        let cells: [core::cell::UnsafeCell<T>; N] = unsafe {
-            let cells = core::mem::ManuallyDrop::new(values);
-            core::ptr::read(&cells as *const _ as *const [core::cell::UnsafeCell<T>; N])
-        };
-        PerCpu { slots: cells }
-    }
-
-    /// Get a shared reference to the slot for the current core.
-    /// Safe by construction: the `&CurrentCore` token proves we hold
-    /// exclusive access to the calling core's identity, and the slot's
-    /// inner `T` uses interior mutability for any actual mutation.
-    #[inline(always)]
-    pub fn current(&self, cc: &CurrentCore) -> &T {
-        // SAFETY: cc.id() is the calling core's id; reading from the
-        // slot returns a `&T` whose mutation discipline is T's job.
-        // PerCpu just guarantees that two different cores get
-        // different slots.
-        unsafe { &*self.slots[cc.id() as usize].get() }
-    }
-
-    /// Get a shared reference to slot `id`. Safe at the reference level
-    /// (T uses interior mutability), but the caller is responsible for
-    /// the per-core ownership convention if they intend to mutate.
-    /// Useful for cross-core read access (e.g. core 0 walking every
-    /// per-core inbox) and for indexing into a slot whose id was
-    /// computed elsewhere.
-    #[inline(always)]
-    pub fn at(&self, id: u32) -> &T {
-        // SAFETY: same as current(); cross-core access is sound at the
-        // reference level because T provides its own synchronisation.
-        unsafe { &*self.slots[id as usize].get() }
-    }
-
-    /// Number of slots.
-    #[inline(always)]
-    pub const fn len(&self) -> usize {
-        N
-    }
 }

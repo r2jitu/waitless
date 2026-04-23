@@ -10,4 +10,5 @@ rust_library(
     name = "uni-executor",
     srcs = ["src/lib.rs"],
     crate_name = "uni_executor",
+    deps = ["//uni-percpu"],
 )

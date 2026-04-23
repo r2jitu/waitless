@@ -1,20 +1,16 @@
 // uni-executor/src/lib.rs — Shared async runtime.
 //
 // Per-worker task arena + slot-pointer `Waker` + `Sleep` future.
-// Backend-agnostic: calls out to `extern "C"` hooks that each
-// backend (`//kernel` on bare-metal, `//uni-native` on host POSIX)
-// implements with no_mangle symbols:
+// Uses `uni_percpu::{CurrentCore, PerCpu}` for the arena storage
+// and worker-id lookup; calls out to three `extern "C"` hooks for
+// the things that vary across backends (time source + timer
+// registration).
 //
-//   * `uni_exec_current_worker()`  — current core / thread id.
-//   * `uni_exec_now_ticks()`       — monotonic µs since boot/start.
-//   * `uni_exec_schedule_timer()`  — register a one-shot callback.
-//   * `uni_exec_cancel_timer()`    — unregister by arg.
-//
-// Every worker polls only its own arena. A waker is a raw
-// `*const TaskSlot` into `ARENAS` (static storage, always-valid
-// pointer), so clone is a bit-copy and drop is free. Cross-worker
-// wake sets `ready` on the target slot; the target worker sees it
-// on its next tick (bounded by the backend's idle timeout).
+// Each worker polls only its own arena. A waker is a raw
+// `*const TaskSlot` into the static `ARENAS` PerCpu array (always-
+// valid pointer), so clone is a bit-copy and drop is free. Cross-
+// worker wake sets `ready` on the target slot; the target worker
+// sees it on its next tick (bounded by the backend's idle timeout).
 
 #![no_std]
 
@@ -27,26 +23,36 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
+use uni_percpu::{CurrentCore, PerCpu, MAX_WORKERS};
+
 // ---- Backend hooks ---------------------------------------------------------
 //
 // Provided by the backend crate via `#[unsafe(no_mangle)]
-// pub extern "C" fn uni_exec_*(…)`. Only one backend links into any
-// given binary (platform selects), so there's no symbol collision.
+// pub extern "C" fn uni_exec_*(…)`. Function-pointer args use plain
+// Rust ABI (`fn(usize)`) — declaring the outer block `extern "C"`
+// only sets the calling convention of the hook itself, not of
+// pointers passed through it. Backends can store the `func` pointer
+// directly without a transmute. (The worker-id lookup goes through
+// `uni_percpu::CurrentCore::enter` rather than a separate hook.)
 
+// `fn(usize)` inside an `extern "C"` block trips the
+// `improper_ctypes` lint — rustc warns that Rust-ABI fn pointers
+// aren't C-calling-convention. In practice a Rust `fn(usize)` and a
+// C `void(*)(size_t)` have the same register lowering on every
+// target we support; the alternative (`extern "C" fn(usize)`) forced
+// a transmute inside the bare-metal backend, which is what this
+// refactor exists to remove. We own both the declaration and the
+// definition, so the lint is a theoretical warning, not a real
+// concern.
+#[allow(improper_ctypes)]
 unsafe extern "C" {
-    fn uni_exec_current_worker() -> u32;
     fn uni_exec_now_ticks() -> u64;
-    fn uni_exec_schedule_timer(
-        deadline: u64,
-        func: extern "C" fn(usize),
-        arg: usize,
-    ) -> bool;
+    fn uni_exec_schedule_timer(deadline: u64, func: fn(usize), arg: usize) -> bool;
     fn uni_exec_cancel_timer(arg: usize) -> bool;
 }
 
 // ---- Task arena ------------------------------------------------------------
 
-pub const MAX_WORKERS: usize = 8;
 pub const TASKS_PER_WORKER: usize = 64;
 
 type BoxedFuture = Pin<Box<dyn Future<Output = ()>>>;
@@ -91,8 +97,8 @@ impl TaskArena {
     }
 }
 
-static ARENAS: [TaskArena; MAX_WORKERS] =
-    [const { TaskArena::new() }; MAX_WORKERS];
+static ARENAS: PerCpu<TaskArena, MAX_WORKERS> =
+    PerCpu::new([const { TaskArena::new() }; MAX_WORKERS]);
 
 // ---- Spawning --------------------------------------------------------------
 
@@ -104,11 +110,8 @@ pub fn spawn<F>(f: F) -> Result<(), ()>
 where
     F: Future<Output = ()> + 'static,
 {
-    let wid = unsafe { uni_exec_current_worker() };
-    if (wid as usize) >= MAX_WORKERS {
-        return Err(());
-    }
-    let arena = &ARENAS[wid as usize];
+    let cc = CurrentCore::enter();
+    let arena = ARENAS.current(&cc);
     let fut: BoxedFuture = Box::pin(f);
     let mut fut_opt = Some(fut);
     for slot in arena.slots.iter() {
@@ -176,7 +179,7 @@ pub fn tick(worker_id: u32) -> bool {
     if (worker_id as usize) >= MAX_WORKERS {
         return false;
     }
-    let arena = &ARENAS[worker_id as usize];
+    let arena = ARENAS.at(worker_id);
     let mut did_work = false;
     for slot in arena.slots.iter() {
         if !slot.used.load(Ordering::Acquire) {
@@ -198,7 +201,8 @@ pub fn has_ready(worker_id: u32) -> bool {
     if (worker_id as usize) >= MAX_WORKERS {
         return false;
     }
-    ARENAS[worker_id as usize]
+    ARENAS
+        .at(worker_id)
         .slots
         .iter()
         .any(|s| s.ready.load(Ordering::Acquire))
@@ -296,7 +300,7 @@ impl Drop for Sleep {
     }
 }
 
-extern "C" fn sleep_fire(arg: usize) {
+fn sleep_fire(arg: usize) {
     let sleep = arg as *const Sleep;
     // SAFETY: `Sleep::drop` cancels the timer before the future is
     // freed, so reaching here implies `sleep` still points at a live

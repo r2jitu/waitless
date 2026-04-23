@@ -1,0 +1,21 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# Cross-platform per-worker primitives.
+#
+# `CurrentCore` is a ZST token whose existence proves the holder is
+# running on a specific worker (core on bare-metal, thread on
+# native). `PerCpu<T, N>` is the matching typed per-worker array;
+# `T` provides its own interior mutability (`Atomic*`, `UnsafeCell`
+# behind SPSC / owning-worker discipline). Both are used by
+# `//kernel` for its per-core state, by `//uni-executor` for task
+# arenas, and by `//uni-native` for per-worker timer storage.
+#
+# Backends (kernel, uni-native) provide the single `extern "C" fn
+# uni_percpu_current_worker()` hook that `CurrentCore::enter` reads.
+rust_library(
+    name = "uni-percpu",
+    srcs = ["src/lib.rs"],
+    crate_name = "uni_percpu",
+)

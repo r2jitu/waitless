@@ -18,6 +18,7 @@ rust_library(
     target_compatible_with = ["//bazel/platforms:native"],
     deps = [
         "//uni-executor",
+        "//uni-percpu",
         "//util/atomic_fn",
     ],
 )
