@@ -1716,14 +1716,14 @@ pub fn enable_deferred_tx_kick() {
 /// fits within `num_qp`, else falls back to qp 0. Matches the
 /// virtio-net "send on your own core's queue" semantics so Tier 1
 /// scaling keeps working.
-pub fn send(data: &[u8]) -> bool {
+pub fn send(data: &[u8]) {
     let num_qp = NUM_QP.load(Ordering::Acquire) as u32;
     if num_qp == 0 {
-        return false;
+        return;
     }
     let core = uni_kernel::cpu_id();
     let qp = if core < num_qp { core as usize } else { 0 };
-    send_on_qp(qp, data)
+    let _ = send_on_qp(qp, data);
 }
 
 // ---- virtio-net-compatible public surface --------------------------------
@@ -1867,64 +1867,43 @@ const _: () = {
 // ============================================================================
 //
 // `GveDriver` adapts the existing module-level functions to the
-// `EthernetDriver` trait contract. Registered via
-// `register_ethernet_driver!` so the `.uni_drivers_ethernet` section
-// walker picks it up from `uni_drivers::net::init()`.
+// Registered into the `.uni_drivers_ethernet` section as a static
+// `NicOps`. Every dispatcher call does one Acquire load + one direct
+// call through the pointer. gve is polling-only — no NAPI, no MSI-X,
+// so `idle` is `None` and the dispatcher's idle path skips it.
 
-use uni_net_driver::{EthernetDriver, NicError, NicHandle};
+use uni_net_driver::{NicDiagOps, NicOps};
 
-pub struct GveDriver;
-
-impl EthernetDriver for GveDriver {
-    fn name(&self) -> &'static str {
-        // Match Linux and Google's upstream driver name; "gVNIC" is
-        // GCE's product branding, but the driver itself is `gve`.
-        "gve"
-    }
-
-    fn probe(&self) -> Option<NicHandle> {
-        // Short-circuit via the cached flag. `init()` internally
-        // already short-circuits on `GVNIC_OK`, but we mirror
-        // virtio-net's shape here so the trait contract — "probe()
-        // is cheap on repeat calls" — holds uniformly.
-        if probe_ok() {
-            return Some(NicHandle::new());
-        }
-        if init() {
-            Some(NicHandle::new())
-        } else {
-            None
-        }
-    }
-
-    fn send(&self, _handle: &NicHandle, frame: &[u8]) -> Result<(), NicError> {
-        // Module-level `send()` drops on error; surface no
-        // back-pressure for now. §2g's async layer can grow
-        // `NicError::TxQueueFull` when it has a retry loop.
-        send(frame);
-        Ok(())
-    }
-
-    fn poll_rx(&self, _handle: &NicHandle, cb: fn(&[u8])) -> usize {
-        let n = poll(cb);
-        if n < 0 { 0 } else { n as usize }
-    }
-
-    // Overrides for extras gve actually implements (polling-only, no
-    // TX staging / MSI-X / NAPI). Most default no-ops from the trait
-    // are already correct for gve — we override only the ones where
-    // gve has a real answer.
-
-    fn get_mac(&self, _handle: &NicHandle, out: *mut u8) { get_mac(out) }
-    fn num_queue_pairs(&self, _handle: &NicHandle) -> u16 { num_queue_pairs() }
-    fn poll_qp(&self, _handle: &NicHandle, qp: usize, cb: fn(&[u8])) -> i32 { poll_qp(qp, cb) }
-    fn flush_tx_staging(&self, _handle: &NicHandle) { flush_all_tx_kicks() }
-    fn flush_tx_kick_if_dirty(&self, _handle: &NicHandle) -> bool { flush_tx_kick_if_dirty() }
-    fn enable_deferred_tx_kick(&self, _handle: &NicHandle) { enable_deferred_tx_kick() }
-    fn rx_counts(&self, _handle: &NicHandle) -> [u64; 8] { rx_counts() }
-    fn rx_used_cursors(&self, _handle: &NicHandle) -> [(u16, u16); 8] { rx_used_cursors() }
+/// `init()` internally short-circuits on `GVNIC_OK`, but we also
+/// check `probe_ok` here so multi-probe driver walks don't re-enter
+/// bring-up. Matches virtio-net's shape.
+fn probe() -> bool {
+    probe_ok() || init()
 }
 
-pub static GVE_DRIVER: GveDriver = GveDriver;
+static GVE_DIAG_OPS: NicDiagOps = NicDiagOps {
+    rx_counts,
+    rx_used_cursors,
+};
 
-uni_net_driver::register_ethernet_driver!(GVE_DRIVER);
+pub static GVE_OPS: NicOps = NicOps {
+    name: "gve",
+    probe,
+    send,
+    poll_rx: poll,
+    poll_qp,
+    get_mac,
+    num_queue_pairs,
+    activate_multi_queue: noop,
+    enable_irq: noop,
+    enable_deferred_tx_kick,
+    flush_tx_staging: flush_all_tx_kicks,
+    flush_tx_kick_if_dirty,
+    poke_interrupt_status: noop,
+    idle: None,
+    diag: Some(&GVE_DIAG_OPS),
+};
+
+fn noop() {}
+
+uni_net_driver::register_ethernet_driver!(GVE_OPS);

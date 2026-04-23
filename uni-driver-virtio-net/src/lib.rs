@@ -1532,73 +1532,51 @@ pub fn flush_tx_kick_if_dirty() -> bool {
 // EthernetDriver trait adapter
 // ============================================================================
 //
-// `VirtioNetDriver` is a ZST that adapts the existing module-level
-// functions to the `EthernetDriver` trait contract. Registered via
-// `register_ethernet_driver!` so the `.uni_drivers_ethernet` section
-// walker picks it up from `uni_drivers::net::init()`.
+// ── Registration ────────────────────────────────────────────────────────────
+//
+// A static `NicOps` struct of fn pointers, registered into the
+// `.uni_drivers_ethernet` section via `register_ethernet_driver!`.
+// The active-driver slot stores `&'static NicOps`; every dispatcher
+// call does one Acquire load + one direct call.
 
-use uni_net_driver::{EthernetDriver, NicError, NicHandle};
+use uni_net_driver::{NicDiagOps, NicIdleOps, NicOps};
 
-pub struct VirtioNetDriver;
-
-impl EthernetDriver for VirtioNetDriver {
-    fn name(&self) -> &'static str {
-        "virtio-net"
-    }
-
-    fn probe(&self) -> Option<NicHandle> {
-        // Short-circuit via the cached flag — `init()` is NOT
-        // idempotent (it re-runs the full PCI/MMIO probe, queue
-        // realloc, MSI-X rebind), and calling it a second time after
-        // the TCP stack is up corrupts in-flight state. Check first,
-        // then do the real bring-up only on the first call.
-        if probe_ok() {
-            return Some(NicHandle::new());
-        }
-        if init() {
-            Some(NicHandle::new())
-        } else {
-            None
-        }
-    }
-
-    fn send(&self, _handle: &NicHandle, frame: &[u8]) -> Result<(), NicError> {
-        // `send()` is fire-and-forget — the driver stages full
-        // queues onto the per-core TX ring rather than surfacing
-        // back-pressure. Return `Ok(())` always; a future async
-        // layer can grow richer semantics when it needs them.
-        send(frame);
-        Ok(())
-    }
-
-    fn poll_rx(&self, _handle: &NicHandle, cb: fn(&[u8])) -> usize {
-        // `poll` returns an `i32` count of frames drained.
-        let n = poll(cb);
-        if n < 0 { 0 } else { n as usize }
-    }
-
-    // Overrides for the extended dispatcher surface. These route to
-    // the crate-level free functions that the old `uni_drivers::net::*`
-    // dispatcher used to call directly.
-
-    fn get_mac(&self, _handle: &NicHandle, out: *mut u8) { get_mac(out) }
-    fn num_queue_pairs(&self, _handle: &NicHandle) -> u16 { num_queue_pairs() }
-    fn activate_multi_queue(&self, _handle: &NicHandle) { activate_multi_queue() }
-    fn enable_irq(&self, _handle: &NicHandle) { enable_irq() }
-    fn poll_qp(&self, _handle: &NicHandle, qp: usize, cb: fn(&[u8])) -> i32 { poll_qp(qp, cb) }
-    fn flush_tx_staging(&self, _handle: &NicHandle) { flush_tx_staging() }
-    fn flush_tx_kick_if_dirty(&self, _handle: &NicHandle) -> bool { flush_tx_kick_if_dirty() }
-    fn irq_idle_supported(&self, _handle: &NicHandle) -> bool { irq_idle_supported() }
-    fn arm_rx_interrupts(&self, _handle: &NicHandle) { arm_rx_interrupts() }
-    fn has_pending_rx(&self, _handle: &NicHandle) -> bool { has_pending_rx() }
-    fn has_pending_tx(&self, _handle: &NicHandle) -> bool { has_pending_tx() }
-    fn rearm_rx_napi(&self, _handle: &NicHandle, core_id: u32) -> bool { rearm_rx_napi(core_id) }
-    fn enable_deferred_tx_kick(&self, _handle: &NicHandle) { enable_deferred_tx_kick() }
-    fn poke_interrupt_status(&self, _handle: &NicHandle) { poke_interrupt_status() }
-    fn rx_counts(&self, _handle: &NicHandle) -> [u64; 8] { rx_counts() }
-    fn rx_used_cursors(&self, _handle: &NicHandle) -> [(u16, u16); 8] { rx_used_cursors() }
+/// `init()` is NOT idempotent — it re-runs PCI/MMIO probe + queue
+/// realloc + MSI-X rebind, corrupting in-flight state if called after
+/// the TCP stack is up. Short-circuit through the cached `probe_ok`
+/// flag; only run the real bring-up on the first call.
+fn probe() -> bool {
+    probe_ok() || init()
 }
 
-pub static VIRTIO_NET_DRIVER: VirtioNetDriver = VirtioNetDriver;
+static VIRTIO_NET_IDLE_OPS: NicIdleOps = NicIdleOps {
+    arm_rx_interrupts,
+    has_pending_rx,
+    has_pending_tx,
+    rearm_rx_napi,
+};
 
-uni_net_driver::register_ethernet_driver!(VIRTIO_NET_DRIVER);
+static VIRTIO_NET_DIAG_OPS: NicDiagOps = NicDiagOps {
+    rx_counts,
+    rx_used_cursors,
+};
+
+pub static VIRTIO_NET_OPS: NicOps = NicOps {
+    name: "virtio-net",
+    probe,
+    send,
+    poll_rx: poll,
+    poll_qp,
+    get_mac,
+    num_queue_pairs,
+    activate_multi_queue,
+    enable_irq,
+    enable_deferred_tx_kick,
+    flush_tx_staging,
+    flush_tx_kick_if_dirty,
+    poke_interrupt_status,
+    idle: Some(&VIRTIO_NET_IDLE_OPS),
+    diag: Some(&VIRTIO_NET_DIAG_OPS),
+};
+
+uni_net_driver::register_ethernet_driver!(VIRTIO_NET_OPS);
