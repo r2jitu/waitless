@@ -12,7 +12,6 @@ extern crate uni;
 
 use alloc::boxed::Box;
 
-use uni::{TcpListener, TcpStream};
 
 // TLS injection boundary. `uni-tls` implements these traits over a
 // sans-io TLS 1.3 state machine.
@@ -215,9 +214,12 @@ pub type Handler = fn(&Request) -> Response;
 // ---- Server -----------------------------------------------------------------
 
 const MAX_ROUTES: usize = 64;
-const MAX_ACTIVE: usize = 64; // per core
 const BUF_SIZE: usize = 8192;
-const MAX_CORES: usize = 8;
+
+/// Idle-connection timeout. After this long without inbound data,
+/// the per-conn task tears down the connection and releases its
+/// backend slot. Mirrors common HTTP/1.1 keep-alive budgets.
+const IDLE_TIMEOUT_US: u64 = 30_000_000;
 
 struct Route {
     path: [u8; 256],
@@ -235,80 +237,23 @@ impl Route {
     }
 }
 
-struct ActiveConn {
-    conn: Option<TcpStream>,
-    /// Heap-allocated receive buffer (BUF_SIZE bytes). Owning the bytes
-    /// off-heap keeps `Server` small enough to live on the stack while
-    /// being constructed in `Server::new()`.
-    buf: Box<[u8]>,
-    buf_len: usize,
-    /// Idle counter: incremented each service_core() call when no data
-    /// arrives. Reset to 0 on activity. Used to close stale connections
-    /// and reclaim slots (prevents pool exhaustion from abandoned clients).
-    idle_ticks: u32,
-    /// Per-connection TLS state (when the server is in HTTPS mode).
-    /// `None` for plain HTTP connections. The trait object comes
-    /// from `TlsAdapter::new_connection` — uni-tls implements it
-    /// over the sans-io state machine in `//net:tls_server`, but
-    /// `Server` itself is TLS-agnostic.
-    tls: Option<Box<dyn TlsConnection>>,
-}
-
-/// Close idle connections after this many service ticks with no data.
-/// At ~800K ticks/sec (single-core event loop), 4M ticks ≈ 5 seconds.
-const IDLE_TIMEOUT_TICKS: u32 = 4_000_000;
-
-// `uni::rng::fill_bytes` handles the platform cfg-switch — see
-// that module for the backend split (uni_kernel::rng on unikernel,
-// getentropy(2) on native).
-
-impl ActiveConn {
-    fn new() -> Self {
-        // Heap-allocated zero-filled receive buffer. `vec!` uses the
-        // global allocator; `panic=abort` on OOM is acceptable here
-        // because this runs once per pool slot during boot, well
-        // before any connection traffic — if the heap can't fit the
-        // pool, the kernel is DOA regardless.
-        let buf: Box<[u8]> = alloc::vec![0u8; BUF_SIZE].into_boxed_slice();
-        ActiveConn {
-            conn: None,
-            buf,
-            buf_len: 0,
-            idle_ticks: 0,
-            tls: None,
-        }
-    }
-}
-
-/// Per-core HTTP state: up to one plain-HTTP listener, up to one
-/// HTTPS listener, and the shared active-connection pool. Both
-/// listeners feed into the same pool; a connection is marked TLS
-/// (via `ActiveConn.tls`) based on which listener accepted it.
-struct CoreHttp {
-    /// Plain HTTP listener (e.g. port 80). `None` if the server
-    /// isn't serving plain HTTP on this core.
-    http_listener: Option<TcpListener>,
-    /// HTTPS listener (e.g. port 443). `None` if the server isn't
-    /// serving TLS on this core.
-    tls_listener: Option<TcpListener>,
-    active: [ActiveConn; MAX_ACTIVE],
-}
-
-impl CoreHttp {
-    fn new() -> Self {
-        CoreHttp {
-            http_listener: None,
-            tls_listener: None,
-            active: core::array::from_fn(|_| ActiveConn::new()),
-        }
-    }
-}
-
+/// The async unikernel HTTP/1.1 server.
+///
+/// Model: one `uni::runtime::TcpListener::run` per registered port;
+/// each accepted connection runs as its own async task on the
+/// worker that accepted it. Per-conn state (receive buffer, parse
+/// buffer, optional TLS state machine) lives on the task's stack,
+/// not in a shared `MAX_ACTIVE` pool — the arena limit in the async
+/// runtime caps concurrency.
+///
+/// `Server` itself holds only boot-time state: the route table,
+/// default handler, and optional TLS adapter. After `listen()` /
+/// `listen_tls()`, `SERVER_PTR` is published Release so each
+/// spawned connection task can Acquire it and walk the routes.
 pub struct Server {
     routes: [Route; MAX_ROUTES],
     route_count: usize,
     default_handler: Option<Handler>,
-    cores: [CoreHttp; MAX_CORES],
     /// TLS adapter, populated by `listen_tls()`. `None` for
     /// plain-HTTP-only servers. Each accepted HTTPS connection
     /// goes through `adapter.new_connection(seed)` to get its own
@@ -331,22 +276,16 @@ static HTTP_LISTEN_PORT: core::sync::atomic::AtomicU16 = core::sync::atomic::Ato
 static TLS_LISTEN_PORT: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
 
 impl Server {
-    /// Allocate a `Server`, including its per-connection receive buffers,
-    /// on the heap. The returned `Box<Server>` is the only handle; callers
-    /// typically `Box::leak` it to get a `&'static mut Server` for the
-    /// duration of the program.
-    ///
-    /// Also registers `add_worker_listener` with the native runtime —
-    /// on native builds, `uni_backend::run` invokes that hook for each
-    /// worker thread before spawn so SO_REUSEPORT listeners exist on
-    /// every worker. Unikernel is a no-op via `uni`'s dispatch.
+    /// Allocate a `Server` on the heap. Callers typically `Box::leak`
+    /// the result to get a `&'static mut Server` that outlives the
+    /// `listen()` / `listen_tls()` calls — per-conn tasks reach back
+    /// into the route table via `SERVER_PTR` after the `Box` is
+    /// permanently stored in the `uni::App` value.
     pub fn new_boxed() -> Box<Self> {
-        uni::set_add_worker_listener(add_worker_listener);
         Box::new(Server {
             routes: [const { Route::new() }; MAX_ROUTES],
             route_count: 0,
             default_handler: None,
-            cores: core::array::from_fn(|_| CoreHttp::new()),
             tls_adapter: None,
         })
     }
@@ -383,30 +322,18 @@ impl Server {
     /// The workers start servicing requests once `uni::run(app)`
     /// signals readiness.
     pub fn listen(&mut self, port: u16) {
-        let nw = uni::num_workers();
-
-        // Create a listener per worker (SO_REUSEPORT on native,
-        // per-core TCP pool on unikernel).
-        let mut ok_any = false;
-        for i in 0..nw {
-            match uni::tcp_listen_on(i, port) {
-                Some(listener) => {
-                    self.cores[i as usize].http_listener = Some(listener);
-                    ok_any = true;
-                }
-                None => {
-                    uni::log(b"http: failed to create HTTP listener\n");
-                    if i == 0 { return; }
-                }
-            }
-        }
-        if !ok_any { return; }
-
-        SERVER_PTR.store(self as *mut Server, core::sync::atomic::Ordering::Release);
+        SERVER_PTR.store(
+            self as *mut Server,
+            core::sync::atomic::Ordering::Release,
+        );
         HTTP_LISTEN_PORT.store(port, core::sync::atomic::Ordering::Release);
-        uni::set_service(http_service_cb);
-
-        uni::log(b"http: listening (plain)\n");
+        match uni::runtime::TcpListener::bind(port) {
+            Ok(listener) => {
+                listener.run(|stream| handle_plain_conn(stream));
+                uni::log(b"http: listening (plain)\n");
+            }
+            Err(_) => uni::log(b"http: failed to bind HTTP listener\n"),
+        }
     }
 
     /// Add an HTTPS (TLS 1.3) listener on `port`, with `adapter`
@@ -423,285 +350,18 @@ impl Server {
     /// going through a private hook.
     pub fn listen_tls(&mut self, port: u16, adapter: Box<dyn TlsAdapter>) {
         self.tls_adapter = Some(adapter);
-
-        let nw = uni::num_workers();
-        let mut ok_any = false;
-        for i in 0..nw {
-            match uni::tcp_listen_on(i, port) {
-                Some(listener) => {
-                    self.cores[i as usize].tls_listener = Some(listener);
-                    ok_any = true;
-                }
-                None => {
-                    uni::log(b"http: failed to create HTTPS listener\n");
-                    if i == 0 { return; }
-                }
-            }
-        }
-        if !ok_any { return; }
-
-        SERVER_PTR.store(self as *mut Server, core::sync::atomic::Ordering::Release);
+        SERVER_PTR.store(
+            self as *mut Server,
+            core::sync::atomic::Ordering::Release,
+        );
         TLS_LISTEN_PORT.store(port, core::sync::atomic::Ordering::Release);
-        uni::set_service(http_service_cb);
-
-        uni::log(b"http: listening (TLS)\n");
-    }
-
-    /// Service connections for a specific core. Returns true if any work was done.
-    fn service_core(&mut self, core_id: u32) -> bool {
-        let mut had_work = false;
-
-        // Accept new connections from both listeners. Connections from
-        // the plain HTTP listener are inserted with `tls=None`;
-        // connections from the TLS listener are wrapped in a freshly
-        // allocated `TlsServer`. Both share the same per-core
-        // `active` pool so one HTTP client and one HTTPS client can
-        // coexist without interfering.
-        if let Some(listener) = self.cores[core_id as usize].http_listener {
-            while let Some(stream) = listener.accept() {
-                had_work = true;
-                if let Some(ac) = alloc_active(&mut self.cores[core_id as usize].active) {
-                    ac.conn = Some(stream);
-                    ac.tls = None;
-                } else {
-                    uni::log(b"http: too many connections, dropping\n");
-                    stream.close();
-                    break;
-                }
+        match uni::runtime::TcpListener::bind(port) {
+            Ok(listener) => {
+                listener.run(|stream| handle_tls_conn(stream));
+                uni::log(b"http: listening (TLS)\n");
             }
+            Err(_) => uni::log(b"http: failed to bind HTTPS listener\n"),
         }
-        if let Some(listener) = self.cores[core_id as usize].tls_listener {
-            while let Some(stream) = listener.accept() {
-                had_work = true;
-                if let Some(ac) = alloc_active(&mut self.cores[core_id as usize].active) {
-                    ac.conn = Some(stream);
-                    if let Some(adapter) = self.tls_adapter.as_ref() {
-                        // Seed the per-connection ephemeral X25519 keypair
-                        // from platform entropy. `uni_kernel::rng::fill_bytes`
-                        // on bare-metal (ChaCha20 PRNG seeded at boot from
-                        // the TSC/CNTVCT jitter + RDRAND); libc
-                        // `arc4random_buf` on native (host OS entropy).
-                        // Both are fine for TLS 1.3 ephemeral keys.
-                        let mut seed = [0u8; 32];
-                        uni::rng::fill_bytes(&mut seed);
-                        ac.tls = Some(adapter.new_connection(seed));
-                    } else {
-                        // Shouldn't happen — `listen_tls()` always sets
-                        // `self.tls_adapter` before creating the listener.
-                        // Defensive: close the conn.
-                        uni::log(b"http: tls listener but no adapter, dropping\n");
-                        stream.close();
-                        ac.conn = None;
-                    }
-                } else {
-                    uni::log(b"http: too many connections, dropping\n");
-                    stream.close();
-                    break;
-                }
-            }
-        }
-
-        // Service active connections.
-        // Use index-based access to avoid borrow conflicts with find_handler.
-        for i in 0..MAX_ACTIVE {
-            let conn = match self.cores[core_id as usize].active[i].conn {
-                Some(c) => c,
-                None => continue,
-            };
-
-            if conn.is_closed() {
-                conn.close(); // Send FIN if in CloseWait.
-                self.cores[core_id as usize].active[i].conn = None;
-                self.cores[core_id as usize].active[i].buf_len = 0;
-                self.cores[core_id as usize].active[i].idle_ticks = 0;
-                self.cores[core_id as usize].active[i].tls = None;
-                had_work = true;
-                continue;
-            }
-
-            // ── Read from TCP. TLS path funnels bytes through the ──
-            // state machine; plain path goes direct to `buf`.
-            if conn.has_data() {
-                had_work = true;
-                self.cores[core_id as usize].active[i].idle_ticks = 0;
-                let is_tls =
-                    self.cores[core_id as usize].active[i].tls.is_some();
-
-                if is_tls {
-                    self.tls_ingest(core_id, i, conn);
-                } else {
-                    let buf_len = self.cores[core_id as usize].active[i].buf_len;
-                    let avail = BUF_SIZE - buf_len;
-                    if avail > 0 {
-                        let got = conn.recv_sync(
-                            &mut self.cores[core_id as usize].active[i].buf
-                                [buf_len..buf_len + avail],
-                        );
-                        self.cores[core_id as usize].active[i].buf_len += got;
-                    }
-                }
-            } else {
-                // No data — bump idle counter and close if stale.
-                self.cores[core_id as usize].active[i].idle_ticks =
-                    self.cores[core_id as usize].active[i].idle_ticks.saturating_add(1);
-                if self.cores[core_id as usize].active[i].idle_ticks >= IDLE_TIMEOUT_TICKS {
-                    conn.close();
-                    self.cores[core_id as usize].active[i].conn = None;
-                    self.cores[core_id as usize].active[i].buf_len = 0;
-                    self.cores[core_id as usize].active[i].idle_ticks = 0;
-                    self.cores[core_id as usize].active[i].tls = None;
-                    continue;
-                }
-            }
-
-            let buf_len = self.cores[core_id as usize].active[i].buf_len;
-            if buf_len > 0 {
-                let mut req = Request::new();
-                let consumed = parse_request(&self.cores[core_id as usize].active[i].buf[..buf_len], &mut req);
-                if consumed > 0 {
-                    let want_close = match req.get_header(b"Connection") {
-                        Some(v) => v.eq_ignore_ascii_case(b"close"),
-                        None => false,
-                    };
-
-                    let handler = self.find_handler(req.path());
-                    let resp = match handler {
-                        Some(h) => h(&req),
-                        None => Response::not_found(),
-                    };
-
-                    self.send_response_via(core_id, i, conn, &resp, !want_close);
-                    self.cores[core_id as usize].active[i].idle_ticks = 0;
-                    had_work = true;
-
-                    if want_close {
-                        conn.close();
-                        self.cores[core_id as usize].active[i].conn = None;
-                        self.cores[core_id as usize].active[i].buf_len = 0;
-                        self.cores[core_id as usize].active[i].idle_ticks = 0;
-                        self.cores[core_id as usize].active[i].tls = None;
-                    } else {
-                        let remaining = buf_len - consumed;
-                        if remaining > 0 {
-                            self.cores[core_id as usize].active[i].buf.copy_within(consumed..buf_len, 0);
-                        }
-                        self.cores[core_id as usize].active[i].buf_len = remaining;
-                    }
-                } else if buf_len >= BUF_SIZE {
-                    conn.close();
-                    self.cores[core_id as usize].active[i].conn = None;
-                    self.cores[core_id as usize].active[i].buf_len = 0;
-                    self.cores[core_id as usize].active[i].tls = None;
-                }
-            }
-        }
-
-        had_work
-    }
-
-    /// Ingest TLS bytes from TCP for a single connection: read raw
-    /// bytes from the socket, push them through the TLS state machine,
-    /// drain any outbound TLS bytes the state machine produced back to
-    /// the socket, and copy any plaintext the state machine decrypted
-    /// into the per-connection `buf` for the HTTP parser to consume.
-    ///
-    /// Only called when the connection is known to be in TLS mode.
-    fn tls_ingest(&mut self, core_id: u32, conn_idx: usize, conn: TcpStream) {
-        let ac = &mut self.cores[core_id as usize].active[conn_idx];
-        let Some(tls) = ac.tls.as_mut() else { return; };
-
-        // Pull raw bytes off TCP into the TLS state machine. Loop to
-        // drain the kernel TCP buffer in one go.
-        let mut tmp = [0u8; 2048];
-        loop {
-            let got = conn.recv_sync(&mut tmp);
-            if got == 0 {
-                break;
-            }
-            tls.push_rx(&tmp[..got]);
-        }
-
-        // Advance the state machine as far as possible. The trait
-        // impl carries its own config reference, so no extra param.
-        if tls.advance().is_err() {
-            // Fatal handshake failure — drop the connection.
-            conn.close();
-            ac.conn = None;
-            ac.buf_len = 0;
-            ac.idle_ticks = 0;
-            ac.tls = None;
-            return;
-        }
-
-        // Drain outgoing TLS bytes the state machine produced (server
-        // flight during handshake, or encrypted responses during
-        // application data phase).
-        let mut out = [0u8; 2048];
-        loop {
-            let n = tls.pop_tx(&mut out);
-            if n == 0 {
-                break;
-            }
-            conn.send_sync(&out[..n]);
-        }
-
-        // Copy any decrypted plaintext into the HTTP parse buffer.
-        // `buf` is shared with the plain-HTTP path and holds HTTP
-        // request bytes regardless of whether they arrived over TLS.
-        let space = BUF_SIZE - ac.buf_len;
-        if space > 0 {
-            let start = ac.buf_len;
-            let n = tls.pop_plaintext(&mut ac.buf[start..start + space]);
-            ac.buf_len += n;
-        }
-    }
-
-    /// Send `resp` on `conn`, routing through TLS if the connection
-    /// has an active `TlsServer`. The plain-HTTP path preserves the
-    /// original `send_response(conn, &resp, keep_alive)` shape.
-    fn send_response_via(
-        &mut self,
-        core_id: u32,
-        conn_idx: usize,
-        conn: TcpStream,
-        resp: &Response,
-        keep_alive: bool,
-    ) {
-        let ac = &mut self.cores[core_id as usize].active[conn_idx];
-        if let Some(tls) = ac.tls.as_mut() {
-            // Build the HTTP response into a temporary stack
-            // buffer, then feed it to TLS as application data.
-            let mut w = BufWriter::new();
-            write_response_into(&mut w, resp, keep_alive);
-            if tls.send_app_data(w.as_bytes()).is_err() {
-                conn.close();
-                ac.conn = None;
-                ac.buf_len = 0;
-                ac.tls = None;
-                return;
-            }
-            // If the response is closing the connection, queue a
-            // TLS close_notify alert before draining tx so the peer
-            // sees a clean TLS shutdown followed by a clean TCP FIN.
-            // This silences OpenSSL's "unexpected eof while reading"
-            // warning and lets well-behaved clients (curl, browsers)
-            // distinguish between a deliberate close and a dropped
-            // connection.
-            if !keep_alive {
-                let _ = tls.close_notify();
-            }
-            let mut out = [0u8; 2048];
-            loop {
-                let n = tls.pop_tx(&mut out);
-                if n == 0 {
-                    break;
-                }
-                conn.send_sync(&out[..n]);
-            }
-            return;
-        }
-        // Fall through to plain-HTTP send when `tls` is None.
-        send_response(conn, resp, keep_alive);
     }
 
     fn find_handler(&self, path: &[u8]) -> Option<Handler> {
@@ -721,51 +381,230 @@ impl Server {
     }
 }
 
-fn alloc_active(active: &mut [ActiveConn; MAX_ACTIVE]) -> Option<&mut ActiveConn> {
-    for ac in active.iter_mut() {
-        if ac.conn.is_none() {
-            ac.buf_len = 0;
-            return Some(ac);
-        }
+/// Access the registered `Server`. Returns `None` before `listen()` /
+/// `listen_tls()` has been called. The pointer is published
+/// Release-ordered and points at a leaked `Box<Server>`, so it
+/// outlives every spawned connection task.
+fn with_server<R, F: FnOnce(&Server) -> R>(f: F) -> Option<R> {
+    let raw = SERVER_PTR.load(core::sync::atomic::Ordering::Acquire);
+    if raw.is_null() {
+        return None;
     }
-    None
+    // SAFETY: SERVER_PTR is published once via Release in `listen*`;
+    // the matching Acquire above synchronises. The pointee is
+    // `Box::leak`-ed by the app (lives for process lifetime).
+    Some(f(unsafe { &*raw }))
 }
 
-/// Event loop service callback: service HTTP connections on this core.
-/// Network poll + inbox drain are handled by the event loop itself.
-/// Add per-worker SO_REUSEPORT listeners on native. Called by native
-/// worker threads after they spawn; re-creates whatever listeners
-/// were configured via `listen()` / `listen_tls()` on core 0.
-pub fn add_worker_listener(worker_id: u32) {
-    let raw = SERVER_PTR.load(core::sync::atomic::Ordering::Acquire);
-    if raw.is_null() { return; }
-    // SAFETY: SERVER_PTR is published once via Release in `Server::listen`;
-    // the matching Acquire load above synchronises with that store. The
-    // pointee outlives the program (it's the app's `static mut SERVER`).
-    let server = unsafe { &mut *raw };
+// ---- Per-connection async handlers ----------------------------------------
 
-    let http_port = HTTP_LISTEN_PORT.load(core::sync::atomic::Ordering::Acquire);
-    if http_port != 0 {
-        if let Some(listener) = uni::tcp_listen_on(worker_id, http_port) {
-            server.cores[worker_id as usize].http_listener = Some(listener);
+/// Plain-HTTP per-conn task. Consumes `stream` and drives one
+/// keep-alive loop: recv → parse (possibly multiple pipelined
+/// requests per recv) → dispatch → send.
+async fn handle_plain_conn(stream: uni::TcpStream) {
+    let mut buf = alloc::vec![0u8; BUF_SIZE].into_boxed_slice();
+    let mut buf_len = 0usize;
+    loop {
+        if buf_len == BUF_SIZE {
+            // Parse buffer full and no progress — client is
+            // sending a request larger than we're prepared to
+            // handle. Drop cleanly.
+            stream.close();
+            return;
         }
-    }
-    let tls_port = TLS_LISTEN_PORT.load(core::sync::atomic::Ordering::Acquire);
-    if tls_port != 0 {
-        if let Some(listener) = uni::tcp_listen_on(worker_id, tls_port) {
-            server.cores[worker_id as usize].tls_listener = Some(listener);
+        let recv_fut = stream.recv(&mut buf[buf_len..]);
+        let got = match uni::runtime::timeout_us(IDLE_TIMEOUT_US, recv_fut).await {
+            Some(n) => n,
+            None => {
+                stream.close();
+                return;
+            }
+        };
+        if got == 0 {
+            stream.close();
+            return;
+        }
+        buf_len += got;
+
+        // Drain every complete request sitting in the buffer.
+        while buf_len > 0 {
+            let mut req = Request::new();
+            let consumed = parse_request(&buf[..buf_len], &mut req);
+            if consumed == 0 {
+                break; // need more bytes
+            }
+            let want_close = match req.get_header(b"Connection") {
+                Some(v) => v.eq_ignore_ascii_case(b"close"),
+                None => false,
+            };
+            let handler = with_server(|s| s.find_handler(req.path())).flatten();
+            let resp = match handler {
+                Some(h) => h(&req),
+                None => Response::not_found(),
+            };
+
+            let mut w = BufWriter::new();
+            write_response_into(&mut w, &resp, !want_close);
+            if stream.send(w.as_bytes()).await.is_err() {
+                stream.close();
+                return;
+            }
+            drop(resp);
+
+            if want_close {
+                stream.close();
+                return;
+            }
+            let remaining = buf_len - consumed;
+            if remaining > 0 {
+                buf.copy_within(consumed..buf_len, 0);
+            }
+            buf_len = remaining;
         }
     }
 }
 
-/// Event loop service callback — services HTTP connections on this worker.
-/// Used by both unikernel (kernel event loop) and native (per-thread loop).
-fn http_service_cb(core_id: u32) -> bool {
-    let raw = SERVER_PTR.load(core::sync::atomic::Ordering::Acquire);
-    if raw.is_null() { return false; }
-    // SAFETY: see add_worker_listener.
-    let server = unsafe { &mut *raw };
-    server.service_core(core_id)
+/// HTTPS per-conn task. Owns a heap-allocated `TlsConnection`
+/// (built via the registered `TlsAdapter`) and pumps TCP↔TLS as
+/// one loop: read raw bytes → push_rx → advance → pop_tx → send.
+/// `pop_plaintext` into the HTTP parse buffer drives the same
+/// request/response machinery as the plain path. The TLS handshake
+/// and app-data phases share this loop — the state machine itself
+/// tracks which records are handshake vs application.
+async fn handle_tls_conn(stream: uni::TcpStream) {
+    // Seed the per-conn ephemeral keypair. `uni::rng::fill_bytes`
+    // abstracts the cfg split (ChaCha20 PRNG seeded at boot on
+    // bare-metal, `arc4random_buf` / `getentropy` on native).
+    let mut seed = [0u8; 32];
+    uni::rng::fill_bytes(&mut seed);
+
+    let tls_box = with_server(|s| {
+        s.tls_adapter
+            .as_ref()
+            .map(|adapter| adapter.new_connection(seed))
+    })
+    .flatten();
+    let Some(mut tls) = tls_box else {
+        // `listen_tls()` was never called but a TLS port fired —
+        // shouldn't happen; bail defensively.
+        stream.close();
+        return;
+    };
+
+    let mut recv_buf = alloc::vec![0u8; BUF_SIZE].into_boxed_slice();
+    let mut plain_buf = alloc::vec![0u8; BUF_SIZE].into_boxed_slice();
+    let mut plain_len = 0usize;
+    let mut tx_scratch = alloc::vec![0u8; 2048].into_boxed_slice();
+
+    loop {
+        // --- Drain any pending TLS TX (handshake flight, encrypted
+        // app-data from a previous iteration's response, alerts).
+        loop {
+            let n = tls.pop_tx(&mut tx_scratch);
+            if n == 0 {
+                break;
+            }
+            if stream.send(&tx_scratch[..n]).await.is_err() {
+                stream.close();
+                return;
+            }
+        }
+
+        // --- Receive more ciphertext.
+        let recv_fut = stream.recv(&mut recv_buf[..]);
+        let got = match uni::runtime::timeout_us(IDLE_TIMEOUT_US, recv_fut).await {
+            Some(n) => n,
+            None => {
+                stream.close();
+                return;
+            }
+        };
+        if got == 0 {
+            stream.close();
+            return;
+        }
+        tls.push_rx(&recv_buf[..got]);
+
+        if tls.advance().is_err() {
+            stream.close();
+            return;
+        }
+
+        // --- Flush any output the advance produced before we
+        // attempt plaintext / HTTP work.
+        loop {
+            let n = tls.pop_tx(&mut tx_scratch);
+            if n == 0 {
+                break;
+            }
+            if stream.send(&tx_scratch[..n]).await.is_err() {
+                stream.close();
+                return;
+            }
+        }
+
+        // --- Pull any newly-decrypted plaintext into the parse
+        // buffer.
+        if plain_len < BUF_SIZE {
+            let n = tls.pop_plaintext(&mut plain_buf[plain_len..]);
+            plain_len += n;
+        }
+
+        // --- Parse + dispatch every complete request.
+        while plain_len > 0 {
+            let mut req = Request::new();
+            let consumed = parse_request(&plain_buf[..plain_len], &mut req);
+            if consumed == 0 {
+                if plain_len >= BUF_SIZE {
+                    stream.close();
+                    return;
+                }
+                break;
+            }
+            let want_close = match req.get_header(b"Connection") {
+                Some(v) => v.eq_ignore_ascii_case(b"close"),
+                None => false,
+            };
+            let handler = with_server(|s| s.find_handler(req.path())).flatten();
+            let resp = match handler {
+                Some(h) => h(&req),
+                None => Response::not_found(),
+            };
+
+            let mut w = BufWriter::new();
+            write_response_into(&mut w, &resp, !want_close);
+            if tls.send_app_data(w.as_bytes()).is_err() {
+                stream.close();
+                return;
+            }
+            if want_close {
+                let _ = tls.close_notify();
+            }
+            drop(resp);
+
+            // Drain the encrypted response out.
+            loop {
+                let n = tls.pop_tx(&mut tx_scratch);
+                if n == 0 {
+                    break;
+                }
+                if stream.send(&tx_scratch[..n]).await.is_err() {
+                    stream.close();
+                    return;
+                }
+            }
+
+            if want_close {
+                stream.close();
+                return;
+            }
+            let remaining = plain_len - consumed;
+            if remaining > 0 {
+                plain_buf.copy_within(consumed..plain_len, 0);
+            }
+            plain_len = remaining;
+        }
+    }
 }
 
 // ---- HTTP request parser ----------------------------------------------------
@@ -919,11 +758,6 @@ impl core::fmt::Write for BufWriter {
     }
 }
 
-fn send_response(conn: TcpStream, resp: &Response, keep_alive: bool) {
-    let mut w = BufWriter::new();
-    write_response_into(&mut w, resp, keep_alive);
-    conn.send_sync(w.as_bytes());
-}
 
 /// Serialise an HTTP/1.1 response into a `BufWriter`. Split out so
 /// the TLS path can reuse it and feed the bytes through `TlsServer`
