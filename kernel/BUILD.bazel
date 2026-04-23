@@ -87,13 +87,6 @@ rust_test(
 )
 
 rust_test(
-    name = "once_test",
-    size = "small",
-    srcs = ["once.rs"],
-    crate_root = "once.rs",
-)
-
-rust_test(
     name = "sync_test",
     size = "small",
     srcs = ["sync.rs"],

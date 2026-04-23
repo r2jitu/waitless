@@ -11,9 +11,7 @@
 // Self-contained (only `core::`) so the file can compile as a
 // standalone rust_test target for host-native unit tests.
 
-use core::cell::UnsafeCell;
-use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicBool, Ordering};
+use uni_percpu::InitOnce;
 
 /// Maximum number of NICs describable in a single `BootInfo`. The
 /// kernel currently activates at most one NIC per boot; four slots
@@ -78,58 +76,6 @@ pub struct BootInfoParams {
 // Two cells: one holds the NIC array so the published `nics` slice has
 // `'static` lifetime; the other holds the `BootInfo` itself. The NIC
 // cell is filled first so `BootInfo.nics` can borrow from it.
-
-struct InitOnce<T> {
-    initialized: AtomicBool,
-    value: UnsafeCell<MaybeUninit<T>>,
-}
-
-// SAFETY: writes are gated by `initialized` (release/acquire), and
-// only one writer ever wins the CAS. Once published the value is
-// read-only and `T: Sync` makes the shared read access sound.
-unsafe impl<T: Sync + Send> Sync for InitOnce<T> {}
-
-impl<T> InitOnce<T> {
-    const fn new() -> Self {
-        InitOnce {
-            initialized: AtomicBool::new(false),
-            value: UnsafeCell::new(MaybeUninit::uninit()),
-        }
-    }
-
-    fn init(&self, v: T) {
-        if self
-            .initialized
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            panic!("boot_info: init called twice");
-        }
-        // SAFETY: the CAS above made us the sole writer. The subsequent
-        // release store republishes the value write so any acquire load
-        // of `initialized` thereafter sees a fully-initialised slot.
-        // Init runs single-threaded during boot, before any reader, so
-        // the narrow window between CAS-release and value write is
-        // harmless in practice — same invariant as `kernel::once`.
-        unsafe {
-            (*self.value.get()).write(v);
-        }
-        self.initialized.store(true, Ordering::Release);
-    }
-
-    fn get(&self) -> &T {
-        if !self.initialized.load(Ordering::Acquire) {
-            panic!("boot_info: queried before init");
-        }
-        // SAFETY: the acquire load pairs with the release store in
-        // `init`, and after init completes the value is read-only.
-        unsafe { (*self.value.get()).assume_init_ref() }
-    }
-
-    fn is_initialized(&self) -> bool {
-        self.initialized.load(Ordering::Acquire)
-    }
-}
 
 static NICS_STORAGE: InitOnce<[NicInfo; MAX_NICS]> = InitOnce::new();
 static BOOT_INFO: InitOnce<BootInfo> = InitOnce::new();
@@ -264,7 +210,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "queried before init")]
+    #[should_panic(expected = "called before init")]
     fn get_before_init_panics() {
         let cell: InitOnce<u32> = InitOnce::new();
         let _ = cell.get();

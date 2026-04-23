@@ -25,6 +25,7 @@ rust_library(
     # NIC driver diagnostics).
     deps = [
         "//uni-net",
+        "//uni-percpu",
         "//util/atomic_fn",
     ] + select({
         "//bazel/platforms:native": ["//uni-native"],
@@ -36,13 +37,10 @@ rust_library(
     }),
 )
 
-# Host-native unit tests for the self-contained boot_info module.
-# boot_info.rs uses only `core::`, so compiling it as a standalone
-# test crate exercises the struct layout + InitOnce without pulling
-# in kernel/drivers/net.
 rust_test(
     name = "boot_info_test",
     size = "small",
     srcs = ["boot_info.rs"],
     crate_root = "boot_info.rs",
+    deps = ["//uni-percpu"],
 )

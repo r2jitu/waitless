@@ -19,13 +19,19 @@ rust_library(
     name = "uni-percpu",
     srcs = [
         "src/lib.rs",
+        "src/once.rs",
         "src/timer.rs",
     ],
     crate_name = "uni_percpu",
 )
 
-# Host-native unit tests for the timer wheel. panic=unwind is supplied
-# via `.bazelrc`'s `test --extra_rustc_flag=-Cpanic=unwind`.
+rust_test(
+    name = "once_test",
+    size = "small",
+    srcs = ["src/once.rs"],
+    crate_root = "src/once.rs",
+)
+
 rust_test(
     name = "timer_test",
     size = "small",
