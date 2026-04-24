@@ -14,8 +14,6 @@ pub use uni_net_driver::{
 
 // Bare-metal pulls the full net umbrella; native uses POSIX sockets.
 #[cfg(target_os = "none")]
-extern crate uni_drivers;
-#[cfg(target_os = "none")]
 pub use uni_net_stack::*;
 
 // ---- Public net-stack API -------------------------------------------------
@@ -126,18 +124,6 @@ impl Net {
             if !any_probed {
                 return Err(NetError::NoNic);
             }
-        }
-
-        #[cfg(target_os = "none")]
-        {
-            // Promote virtio-net to multi-queue BEFORE DHCP runs.
-            // The old ordering (MQ after DHCP) existed to protect
-            // a single-queue DHCP poll from host-side RSS; the
-            // current DHCP is a `UdpSocket::run_each` fan-out that
-            // sees replies on whichever core they land, so MQ is
-            // transparent — and activating it first means DHCP
-            // already exercises the steady-state NIC config.
-            uni_drivers::net::activate_multi_queue();
         }
 
         bringup(cfg).await?;

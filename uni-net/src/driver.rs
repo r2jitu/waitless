@@ -29,7 +29,6 @@ pub struct NicOps {
     // ── Config / bring-up ───────────────────────────────────────────
     pub get_mac: fn(*mut u8),
     pub num_queue_pairs: fn() -> u16,
-    pub activate_multi_queue: fn(),
     pub enable_irq: fn(),
     pub enable_deferred_tx_kick: fn(),
 
@@ -145,7 +144,6 @@ static NULL_OPS: NicOps = NicOps {
     poll_qp: null_poll_qp,
     get_mac: null_get_mac,
     num_queue_pairs: null_num_queue_pairs,
-    activate_multi_queue: null_void,
     enable_irq: null_void,
     enable_deferred_tx_kick: null_void,
     flush_tx_staging: null_void,

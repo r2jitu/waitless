@@ -25,7 +25,6 @@ pub fn init() -> bool {
 pub fn get_mac(mac_out: *mut u8) { (active_ops().get_mac)(mac_out) }
 pub fn num_queue_pairs() -> u16 { (active_ops().num_queue_pairs)() }
 pub fn driver_name() -> &'static str { active_ops().name }
-pub fn activate_multi_queue() { (active_ops().activate_multi_queue)() }
 pub fn enable_irq() { (active_ops().enable_irq)() }
 
 // ---- RX / TX datapath -----------------------------------------------------

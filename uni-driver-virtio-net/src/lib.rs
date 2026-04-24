@@ -144,9 +144,12 @@ struct NetDevice {
     qp_state: [QueuePairState; MAX_QUEUE_PAIRS],
     mac: [u8; 6],
     num_queue_pairs: u16,               // 1 = single-queue, >1 = multi-queue
-    /// Number of queue pairs the device has been initialized for. Stays
-    /// fixed after init; used by `activate_multi_queue()` to know how
-    /// many pairs to activate via VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET.
+    /// Number of queue pairs the device has negotiated capacity for.
+    /// Usually equals `num_queue_pairs` once init completes; the
+    /// split exists because `activate_multi_queue` sends
+    /// `VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET` with this value and the
+    /// `poll` fallback iterates all of them to drain queues host-
+    /// side RSS may have sprayed into before activation landed.
     negotiated_queue_pairs: u16,
     irq_idle_available: bool,
     guest_features: u32,
@@ -377,21 +380,12 @@ fn init_pci_modern() -> bool {
     unsafe {
         (*ndev()).transport = Transport::ModernPci { vpci_idx };
         (*ndev()).guest_features = guest_features;
-        // Multi-queue is NOT activated yet — defer until after DHCP.
-        // DHCP only polls queue 0, so we want the device to keep its
-        // default single-pair behaviour until DHCP completes. Once it
-        // does, boot/entry.rs calls activate_multi_queue() to promote
-        // to N pairs and engage Tier 1 RX polling.
         (*ndev()).num_queue_pairs = 1;
         (*ndev()).negotiated_queue_pairs = num_pairs;
         (*ndev()).has_mq = has_mq && num_pairs > 1;
     }
+    activate_multi_queue();
 
-    if num_pairs > 1 {
-        log(b"virtio_net: multi-queue available: ");
-        log(&[b'0' + (num_pairs as u8 % 10)]);
-        log(b" pairs (deferred until after DHCP)\n");
-    }
     log(b"virtio_net: initialization complete (PCI modern)\n");
     true
 }
@@ -679,17 +673,12 @@ fn init_mmio() -> bool {
     unsafe {
         (*ndev()).transport = Transport::Mmio { base: io_base, is_v2 };
         (*ndev()).guest_features = guest_features;
-        // See init_pci_modern: defer multi-queue activation until after DHCP.
         (*ndev()).num_queue_pairs = 1;
         (*ndev()).negotiated_queue_pairs = num_pairs;
         (*ndev()).has_mq = has_mq && num_pairs > 1;
     }
+    activate_multi_queue();
 
-    if num_pairs > 1 {
-        log(b"virtio_net: multi-queue available: ");
-        log(&[b'0' + (num_pairs as u8 % 10)]);
-        log(b" pairs (MMIO, deferred until after DHCP)\n");
-    }
     log(b"virtio_net: initialization complete (MMIO)\n");
     true
 }
@@ -847,18 +836,12 @@ fn init_legacy_pci() -> bool {
     unsafe {
         (*ndev()).transport = Transport::LegacyPci { base: io_base, pci_idx };
         (*ndev()).guest_features = guest_features;
-        // DHCP needs single-queue (it only polls qp 0); boot/entry
-        // later calls activate_multi_queue() to promote to N pairs.
         (*ndev()).num_queue_pairs = 1;
         (*ndev()).negotiated_queue_pairs = num_pairs;
         (*ndev()).has_mq = has_mq_final && num_pairs > 1;
     }
+    activate_multi_queue();
 
-    if num_pairs > 1 {
-        log(b"virtio_net: multi-queue available: ");
-        log(&[b'0' + (num_pairs as u8 % 10)]);
-        log(b" pairs (legacy PCI, deferred until after DHCP)\n");
-    }
     log(b"virtio_net: initialization complete (legacy PCI)\n");
     true
 }
@@ -1585,7 +1568,6 @@ static VIRTIO_NET_OPS: NicOps = NicOps {
     poll_qp,
     get_mac,
     num_queue_pairs,
-    activate_multi_queue,
     enable_irq,
     enable_deferred_tx_kick,
     flush_tx_staging,

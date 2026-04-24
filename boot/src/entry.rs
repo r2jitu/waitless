@@ -444,8 +444,8 @@ unsafe fn kernel_boot(info: &BootInfo) {
 
         // IP bring-up (DHCP / static) happens inside the app's
         // `#[uni::boot]` task via `uni::net::Net::enable(...).await`.
-        // `Net::enable` also calls `activate_multi_queue()` after
-        // DHCP succeeds — boot/entry.rs doesn't touch either.
+        // Driver-level config like multi-queue activation is
+        // self-contained in the driver's `init()`.
 
         klog!("[INIT] TCP stack...\n");
         net::tcp::init();

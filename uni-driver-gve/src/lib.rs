@@ -1893,7 +1893,6 @@ static GVE_OPS: NicOps = NicOps {
     poll_qp,
     get_mac,
     num_queue_pairs,
-    activate_multi_queue: noop,
     enable_irq: noop,
     enable_deferred_tx_kick,
     flush_tx_staging: flush_all_tx_kicks,
