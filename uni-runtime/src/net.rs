@@ -1202,31 +1202,18 @@ pub fn deliver_tcp_ready(dst_port: u16) -> bool {
 // ---- Shared launcher table (UDP + TCP + future reactors) --------------------
 //
 // Any reactor's `run`-style method registers a type-erased launcher
-// closure here via `register_net_launcher`. `fire_pending_net_launchers`
-// — called from `uni_runtime::tick` on every worker every iteration —
-// walks the table from that worker's cursor to the global count and
+// closure in `NET_LAUNCHERS` (a `LaunchTable`) via
+// `register_net_launcher`. `fire_pending_net_launchers` — called
+// from `uni_runtime::tick` on every worker every iteration — walks
+// the table from that worker's cursor to the global count and
 // invokes each live launcher. Each launcher typically calls
 // `spawn(body(...))` on the calling worker.
 //
-// Slot states (stored in `AtomicPtr<BoxedLauncher>`):
-//   * `null`      — not yet stored (`register_net_launcher` did
-//                   fetch_add but hasn't published; readers stop
-//                   and re-try on the next tick).
-//   * `TOMBSTONE` — previously live, released via
-//                   `release_launcher_slot` (from a `*Handle::Drop`).
-//                   Readers skip it; cursor advances past.
-//   * any other   — `Box::into_raw(Box::new(BoxedLauncher { .. }))`,
-//                   live launcher. The reader dereferences and
-//                   calls it.
-//
-// Slots are NOT reused after release: rewriting a slot whose cursor
-// has already passed on some worker would leak the new launcher on
-// that worker forever. Bumping `NET_LAUNCHER_COUNT` monotonically
-// keeps the cursor invariant simple. `MAX_NET_LAUNCHERS = 256`
-// covers typical apps — bump it if a legitimate long-running app
-// legitimately creates more listeners than that over its lifetime.
-
-type BoxedLauncher = Box<dyn Fn() + Send + Sync + 'static>;
+// See `uni-runtime/src/launcher.rs` for the ownership / tombstone /
+// monotonic-counter invariants that back the table. `MAX_NET_LAUNCHERS
+// = 256` is the lifetime-allocation cap (not live-at-once); bump
+// it if an app creates more than that many listeners over its
+// entire uptime.
 
 /// Bounded cap on launchers ever allocated, not live at once.
 /// Each `UdpSocket::run_each` / `TcpListener::run` / etc. costs
@@ -1234,120 +1221,23 @@ type BoxedLauncher = Box<dyn Fn() + Send + Sync + 'static>;
 /// free it for reuse. 256 covers a realistic long-running app.
 const MAX_NET_LAUNCHERS: usize = 256;
 
-/// Sentinel for a released slot. Must be a non-null, non-Box pointer;
-/// we use `1` which cannot collide with any real `Box::into_raw`
-/// result (all real heap pointers are aligned to at least 8).
-#[inline]
-fn tombstone() -> *mut BoxedLauncher {
-    1 as *mut BoxedLauncher
-}
+static NET_LAUNCHERS: crate::launcher::LaunchTable<MAX_NET_LAUNCHERS> =
+    crate::launcher::LaunchTable::new();
 
 #[inline]
-fn is_tombstone(p: *mut BoxedLauncher) -> bool {
-    p as usize == 1
+fn register_net_launcher(launcher: crate::launcher::Launcher) -> usize {
+    NET_LAUNCHERS.register(launcher)
 }
 
-static NET_LAUNCHERS: [AtomicPtr<BoxedLauncher>; MAX_NET_LAUNCHERS] =
-    [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_NET_LAUNCHERS];
-static NET_LAUNCHER_COUNT: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-/// Per-worker cursor into `NET_LAUNCHERS` — each tick fires only
-/// the launchers added since this worker's last fire. Mirrors
-/// `STARTUP_FIRED_COUNT` in `uni-runtime/src/lib.rs`; needed
-/// because launchers can be registered from inside a task running
-/// on a worker that's already ticked (e.g. `TcpListener::bind(80)`
-/// called from the `#[uni::boot]` async body after DHCP's
-/// `UdpSocket::bind(68)` already ran).
-static NET_LAUNCHER_FIRED: [core::sync::atomic::AtomicUsize; MAX_WORKERS] =
-    [const { core::sync::atomic::AtomicUsize::new(0) }; MAX_WORKERS];
-
-/// Register a launcher. Returns the slot index so the owning
-/// handle can call `release_launcher_slot` on drop, freeing the
-/// captured `Arc`s. `usize::MAX` means "table full; launcher
-/// dropped" — the caller still gets a valid handle, but no task
-/// ever fires. Practically this only happens if an app creates
-/// more than `MAX_NET_LAUNCHERS` listeners over its entire
-/// lifetime.
-fn register_net_launcher(launcher: BoxedLauncher) -> usize {
-    let i = NET_LAUNCHER_COUNT
-        .fetch_add(1, Ordering::AcqRel);
-    if i >= MAX_NET_LAUNCHERS {
-        return usize::MAX;
-    }
-    let outer: Box<BoxedLauncher> = Box::new(launcher);
-    NET_LAUNCHERS[i].store(Box::into_raw(outer), Ordering::Release);
-    i
-}
-
-/// Release a launcher slot on handle drop: swap a tombstone into
-/// the slot and free the `Box`. The tombstone ensures
-/// `fire_pending_net_launchers` skips the slot instead of
-/// stalling on it.
+#[inline]
 fn release_launcher_slot(idx: usize) {
-    if idx >= MAX_NET_LAUNCHERS {
-        return;
-    }
-    let prev = NET_LAUNCHERS[idx].swap(tombstone(), Ordering::AcqRel);
-    if prev.is_null() || is_tombstone(prev) {
-        return;
-    }
-    // SAFETY: every non-null non-tombstone pointer in this table
-    // came from `Box::into_raw(Box::new(BoxedLauncher{..}))` in
-    // `register_net_launcher`. We hold exclusive access to it now
-    // (the swap removed it from the shared table; only this call
-    // site consumes it).
-    unsafe {
-        let _ = Box::from_raw(prev);
-    }
+    NET_LAUNCHERS.release(idx);
 }
 
-/// Spawn every net launcher added since `worker_id` last called
-/// here. Runs once per `uni_runtime::tick()` — a no-op when the
-/// cursor is already caught up, which is the common case.
-///
-/// `register_net_launcher` does `fetch_add(count)` and then
-/// `store(slot)` as two separate ops, so a reader can observe the
-/// incremented count before the matching slot is published. We stop
-/// at the first null slot rather than skipping it, so the next
-/// tick re-tries; skipping + advancing the cursor would drop the
-/// registration permanently.
+/// Fire every net launcher added since `worker_id` last called
+/// here. Thin wrapper over `NET_LAUNCHERS.fire_pending` so
+/// `uni_runtime::tick` has a named entry point.
+#[inline]
 pub fn fire_pending_net_launchers(worker_id: u32) {
-    if (worker_id as usize) >= MAX_WORKERS {
-        return;
-    }
-    let total = NET_LAUNCHER_COUNT
-        .load(Ordering::Acquire)
-        .min(MAX_NET_LAUNCHERS);
-    let fired = NET_LAUNCHER_FIRED[worker_id as usize].load(Ordering::Relaxed);
-    if fired >= total {
-        return;
-    }
-    let mut new_fired = fired;
-    for i in fired..total {
-        let p = NET_LAUNCHERS[i].load(Ordering::Acquire);
-        if p.is_null() {
-            // Registration mid-flight (fetch_add done, store not
-            // yet visible). Stop here; the next tick catches up.
-            break;
-        }
-        if is_tombstone(p) {
-            // Slot was live and has been released. Skip and
-            // advance — never re-touch.
-            new_fired = i + 1;
-            continue;
-        }
-        // SAFETY: `p` was obtained from `Box::into_raw(Box::new(
-        // BoxedLauncher{..}))` in `register_net_launcher`. The
-        // pointer's validity is guaranteed until
-        // `release_launcher_slot` swaps in a tombstone (detected
-        // above), and the swap is AcqRel so we see a consistent
-        // snapshot.
-        let launcher: &BoxedLauncher = unsafe { &*p };
-        launcher();
-        new_fired = i + 1;
-    }
-    if new_fired > fired {
-        NET_LAUNCHER_FIRED[worker_id as usize]
-            .store(new_fired, Ordering::Relaxed);
-    }
+    NET_LAUNCHERS.fire_pending(worker_id);
 }

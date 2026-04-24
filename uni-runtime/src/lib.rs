@@ -5,6 +5,7 @@
 extern crate alloc;
 
 pub mod event;
+pub mod launcher;
 pub mod net;
 pub mod select;
 

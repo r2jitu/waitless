@@ -10,6 +10,7 @@ rust_library(
     name = "uni-runtime",
     srcs = [
         "src/event.rs",
+        "src/launcher.rs",
         "src/lib.rs",
         "src/net.rs",
         "src/select.rs",
