@@ -32,10 +32,12 @@ echo "  ld.lld: $(ld.lld --version | head -1)"
 echo "==> Installing Bazelisk (Bazel version manager)..."
 brew install bazelisk
 
-# Bazelisk is a wrapper that downloads the correct Bazel version automatically.
-# We pin the version via .bazelversion.
-echo "==> Creating .bazelversion..."
-echo "7.3.1" > /Users/jitudas/github.com/r2jitu/unikernel/.bazelversion
+# Bazelisk reads `.bazelversion` in the project root to pick the
+# bazel binary to launch. We don't overwrite it here — the file
+# is checked into the repo and should track whatever version the
+# code actually builds with. If the file is missing, a developer
+# building for the first time will see a clear bazelisk error
+# pointing them at it.
 
 echo "==> Installing QEMU (for local VM testing)..."
 brew install qemu
