@@ -301,7 +301,10 @@ rust_library(
 
 rust_library(
     name = "dhcp",
-    srcs = ["src/dhcp.rs"],
+    srcs = [
+        "src/dhcp.rs",
+        "src/dhcp_parse.rs",
+    ],
     crate_name = "net_dhcp",
     crate_root = "src/dhcp.rs",
     deps = [
@@ -314,6 +317,20 @@ rust_library(
         "//kernel",
         "//uni-runtime",
     ],
+)
+
+# Host-native unit tests for DHCP option TLV parsing + reply-header
+# validation. Pure byte-slice logic, no kernel / driver / runtime
+# deps — the real `dhcp_receive` in `dhcp.rs` calls into this
+# module, so the tests exercise the actual production code. Pins
+# behaviour for truncated options, missing End markers, unknown
+# option codes, wrong XID, and bad magic cookies — all shapes we've
+# seen on the wire (dnsmasq, busybox udhcpd, QEMU SLIRP).
+rust_test(
+    name = "dhcp_parse_test",
+    size = "small",
+    srcs = ["src/dhcp_parse.rs"],
+    crate_root = "src/dhcp_parse.rs",
 )
 
 # ── Umbrella crate: full-stack dispatch + poll ───────────────────────────────

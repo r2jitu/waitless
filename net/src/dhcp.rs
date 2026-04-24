@@ -11,6 +11,8 @@ extern crate net_ethernet as ethernet;
 extern crate net_arp as arp;
 extern crate net_ipv4 as ipv4;
 
+mod dhcp_parse;
+
 use from_bytes::FromBytes;
 use uni_kernel::sync::Spinlock;
 use uni_runtime::{select::timeout_us, sleep_us};
@@ -65,11 +67,11 @@ impl DhcpPacket {
     }
 }
 
+// Outgoing DHCP message types we emit on the wire. Incoming codes
+// (`OFFER` / `ACK` / `NAK`) live in `dhcp_parse::MSG_*` alongside
+// the parser that consumes them.
 const DHCP_DISCOVER: u8 = 1;
-const DHCP_OFFER: u8 = 2;
 const DHCP_REQUEST: u8 = 3;
-const DHCP_ACK: u8 = 5;
-const DHCP_NAK: u8 = 6;
 
 struct DhcpState {
     xid: u32,
@@ -120,6 +122,10 @@ pub fn on_frame(frame: &[u8]) {
 }
 
 /// DHCP receive callback — processes raw ethernet frames during DHCP.
+///
+/// Handles the eth/IP/UDP framing here; option TLV parsing and the
+/// reply-header checks live in `dhcp_parse` (exhaustively unit-tested
+/// standalone).
 fn dhcp_receive(frame: &[u8]) {
     let (ethertype, payload) = match ethernet_parse(frame) {
         Some(v) => v,
@@ -147,65 +153,40 @@ fn dhcp_receive(frame: &[u8]) {
     if ntohs(udp.dst_port) != 68 || ntohs(udp.src_port) != 67 { return; }
 
     let dhcp_offset = ip_hdr_len + 8;
-    if payload.len() < dhcp_offset { return; }
-    let dhcp = match DhcpPacket::try_ref_from(&payload[dhcp_offset..]) {
-        Some(h) => h,
+    let dhcp_bytes = &payload[dhcp_offset..];
+
+    // Header + XID + magic-cookie validation (tested in dhcp_parse).
+    let expected_xid = DHCP_STATE.lock().xid;
+    let expected_xid_be = expected_xid.to_ne_bytes();
+    let yiaddr_bytes = match dhcp_parse::validate_header(dhcp_bytes, expected_xid_be) {
+        Some(a) => a,
         None => return,
     };
-    let xid = dhcp.xid;
-    let cookie = dhcp.magic_cookie;
-    if xid != DHCP_STATE.lock().xid || cookie != htonl(0x63825363) { return; }
+    let yiaddr = Ipv4Addr::from(
+        yiaddr_bytes[0], yiaddr_bytes[1], yiaddr_bytes[2], yiaddr_bytes[3],
+    );
 
-    let opts_start = dhcp_offset + 240;
-    let opts_data = &payload[opts_start..];
+    let parsed = dhcp_parse::parse_options(&dhcp_bytes[240..]);
+    let to_addr = |o: [u8; 4]| Ipv4Addr::from(o[0], o[1], o[2], o[3]);
 
-    let mut msg_type: u8 = 0;
-    let mut subnet = Ipv4Addr::ANY;
-    let mut gateway = Ipv4Addr::ANY;
-    let mut dns = Ipv4Addr::ANY;
-    let mut server_id = Ipv4Addr::ANY;
-
-    let mut i = 0;
-    while i < opts_data.len() {
-        let opt = opts_data[i];
-        if opt == 255 { break; }
-        if opt == 0 { i += 1; continue; }
-        if i + 1 >= opts_data.len() { break; }
-        let opt_len = opts_data[i + 1] as usize;
-        if i + 2 + opt_len > opts_data.len() { break; }
-        let val = &opts_data[i + 2..i + 2 + opt_len];
-
-        match opt {
-            1 if val.len() >= 4 => subnet = Ipv4Addr::from(val[0], val[1], val[2], val[3]),
-            3 if val.len() >= 4 => gateway = Ipv4Addr::from(val[0], val[1], val[2], val[3]),
-            6 if val.len() >= 4 => dns = Ipv4Addr::from(val[0], val[1], val[2], val[3]),
-            53 if val.len() >= 1 => msg_type = val[0],
-            54 if val.len() >= 4 => server_id = Ipv4Addr::from(val[0], val[1], val[2], val[3]),
-            _ => {}
-        }
-
-        i += 2 + opt_len;
-    }
-
-    let yiaddr = dhcp.yiaddr;
     let mut state = DHCP_STATE.lock();
-    match msg_type {
-        DHCP_OFFER => {
+    match parsed.msg_type {
+        dhcp_parse::MSG_OFFER => {
             state.offered_ip = yiaddr;
-            state.offered_subnet = subnet;
-            state.offered_gateway = gateway;
-            state.offered_dns = dns;
-            state.server_ip = server_id;
+            state.offered_subnet = parsed.subnet.map(to_addr).unwrap_or(Ipv4Addr::ANY);
+            state.offered_gateway = parsed.gateway.map(to_addr).unwrap_or(Ipv4Addr::ANY);
+            state.offered_dns = parsed.dns.map(to_addr).unwrap_or(Ipv4Addr::ANY);
+            state.server_ip = parsed.server_id.map(to_addr).unwrap_or(Ipv4Addr::ANY);
             state.got_offer = true;
         }
-        DHCP_ACK => {
+        dhcp_parse::MSG_ACK => {
             state.offered_ip = yiaddr;
-            if subnet != Ipv4Addr::ANY { state.offered_subnet = subnet; }
-            if gateway != Ipv4Addr::ANY { state.offered_gateway = gateway; }
-            if dns != Ipv4Addr::ANY { state.offered_dns = dns; }
+            if let Some(s) = parsed.subnet { state.offered_subnet = to_addr(s); }
+            if let Some(g) = parsed.gateway { state.offered_gateway = to_addr(g); }
+            if let Some(d) = parsed.dns { state.offered_dns = to_addr(d); }
             state.got_ack = true;
         }
-        DHCP_NAK => {
+        dhcp_parse::MSG_NAK => {
             state.got_offer = false;
         }
         _ => {}
