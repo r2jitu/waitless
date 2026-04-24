@@ -92,10 +92,7 @@ fn tcp_backend_accept(port: u16) -> uni_runtime::net::RawTcpStream {
 // IP-config bring-up primitives — `uni::net::Net::enable` dispatches here.
 // ============================================================================
 
-/// Returns `true` on success, `false` on DHCP timeout. Async: yields
-/// between polls so the event-loop TX-flush hook fires between
-/// DISCOVER/REQUEST sends and the next poll (which is what makes the
-/// deferred TX kick correct during bring-up).
+/// Returns `true` on success, `false` on DHCP timeout.
 pub async fn bringup_dhcp() -> bool {
     dhcp::discover().await
 }

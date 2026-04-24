@@ -204,13 +204,12 @@ fn build_payload(tail: &[u8], buf: &mut [u8]) -> usize {
 }
 
 fn build_discover(buf: &mut [u8]) -> usize {
-    let tail: [u8; 10] = [
+    let tail: [u8; 9] = [
         53, 1, DHCP_DISCOVER,
         55, 3, 1, 3, 6,  // param request list: subnet, router, DNS
         255,
-        0,               // pad so `tail.len()` stays constant for arr init
     ];
-    build_payload(&tail[..9], buf)
+    build_payload(&tail, buf)
 }
 
 fn build_request(buf: &mut [u8]) -> usize {
