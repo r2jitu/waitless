@@ -230,7 +230,7 @@ impl WorkerInbox {
 
 // ---- Per-port state ---------------------------------------------------------
 
-struct SocketState {
+struct UdpState {
     port: AtomicU16,
     inboxes: PerCpu<WorkerInbox, MAX_WORKERS>,
 }
@@ -239,17 +239,17 @@ const fn fresh_inboxes() -> [WorkerInbox; MAX_WORKERS] {
     [const { WorkerInbox::new() }; MAX_WORKERS]
 }
 
-impl SocketState {
+impl UdpState {
     const fn new() -> Self {
-        SocketState {
+        UdpState {
             port: AtomicU16::new(0),
             inboxes: PerCpu::new(fresh_inboxes()),
         }
     }
 }
 
-static REGISTRY: [SocketState; MAX_UDP_SOCKETS] =
-    [const { SocketState::new() }; MAX_UDP_SOCKETS];
+static UDP_REGISTRY: [UdpState; MAX_UDP_SOCKETS] =
+    [const { UdpState::new() }; MAX_UDP_SOCKETS];
 
 // ---- Backend plug-in for bind-time setup ------------------------------------
 
@@ -258,7 +258,7 @@ static BACKEND_BIND: AtomicFn<fn(port: u16) -> Result<(), ()>> = AtomicFn::null(
 /// `UdpSocket::Drop` calls it so the backend can release any
 /// per-bind state it holds (native's SO_REUSEPORT sibling fds).
 /// Bare-metal has no need — UDP routing on bare-metal is purely
-/// REGISTRY-driven — so it leaves this null.
+/// UDP_REGISTRY-driven — so it leaves this null.
 static BACKEND_UDP_UNBIND: AtomicFn<fn(port: u16)> = AtomicFn::null();
 static BACKEND_UDP_SEND: AtomicFn<
     fn(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]),
@@ -275,7 +275,7 @@ pub fn register_backend_bind(hook: fn(port: u16) -> Result<(), ()>) {
 /// Register the optional UDP unbind hook. Called from
 /// `UdpSocket::Drop` when set so the backend can release per-bind
 /// state (native SO_REUSEPORT fds). Bare-metal doesn't need to
-/// register one — its UDP routing is pure REGISTRY lookups.
+/// register one — its UDP routing is pure UDP_REGISTRY lookups.
 pub fn register_backend_udp_unbind(hook: fn(port: u16)) {
     BACKEND_UDP_UNBIND.store(hook);
 }
@@ -337,7 +337,7 @@ impl Drop for UdpSocket {
         // thread) and only then notify the backend. Native's
         // unbind hook closes POSIX fds, which is much slower and
         // doesn't need to happen before the slot is reusable.
-        REGISTRY[self.idx].port.store(0, Ordering::Release);
+        UDP_REGISTRY[self.idx].port.store(0, Ordering::Release);
         if let Some(hook) = BACKEND_UDP_UNBIND.load() {
             hook(self.port);
         }
@@ -352,12 +352,12 @@ impl UdpSocket {
         if port == 0 {
             return Err(UdpBindError::InvalidPort);
         }
-        for state in REGISTRY.iter() {
+        for state in UDP_REGISTRY.iter() {
             if state.port.load(Ordering::Acquire) == port {
                 return Err(UdpBindError::PortInUse);
             }
         }
-        for (idx, state) in REGISTRY.iter().enumerate() {
+        for (idx, state) in UDP_REGISTRY.iter().enumerate() {
             if state
                 .port
                 .compare_exchange(0, port, Ordering::AcqRel, Ordering::Relaxed)
@@ -556,7 +556,7 @@ impl Drop for UdpHandle {
         //    last Arc drop and no-op.
         let sock = &*self.ctx.sock;
         if !sock.released.swap(true, Ordering::AcqRel) {
-            REGISTRY[sock.idx].port.store(0, Ordering::Release);
+            UDP_REGISTRY[sock.idx].port.store(0, Ordering::Release);
             if let Some(hook) = BACKEND_UDP_UNBIND.load() {
                 hook(sock.port);
             }
@@ -589,7 +589,7 @@ impl<'a> Future for UdpRecv<'a> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         let cc = CurrentCore::enter();
-        let inbox = REGISTRY[this.sock.idx].inboxes.current(&cc);
+        let inbox = UDP_REGISTRY[this.sock.idx].inboxes.current(&cc);
 
         // Fast path: data already in this worker's inbox.
         if let Some(r) = inbox.pop_into(this.buf) {
@@ -626,7 +626,7 @@ impl<'a> Future for UdpRecv<'a> {
 /// packet. Returns `true` if a socket was found.
 pub fn deliver_udp(dst_port: u16, src_ip: [u8; 4], src_port: u16, payload: &[u8]) -> bool {
     let cc = CurrentCore::enter();
-    for state in REGISTRY.iter() {
+    for state in UDP_REGISTRY.iter() {
         if state.port.load(Ordering::Acquire) == dst_port {
             let inbox = state.inboxes.current(&cc);
             let _ = inbox.try_push(src_ip, src_port, payload);
