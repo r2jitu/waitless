@@ -537,27 +537,14 @@ unsafe fn kernel_boot(info: &BootInfo) {
     uni_kernel::runtime::init();
 
     klog!("\n[BOOT] All subsystems ready. Starting application.\n\n");
+    // `uni_main()` now spawns the app's boot body as a task on core
+    // 0's arena (see the `#[uni::boot]` macro) and returns
+    // immediately. The event loop below polls that task, so DHCP /
+    // async setup / `uni::run(app)` all run while `net_flush_cb`,
+    // `net_poll_cb`, etc. are ticking — no separate pre-eventloop
+    // phase, no deferred-TX-kick race.
+    let _ = net_ok; // kept to quiet `unused` under no-NIC builds
     uni_main();
-
-    // Post-uni_main: promote virtio-net to multi-queue if the
-    // device negotiated MQ. Apps that wanted networking have
-    // already called `uni::net::Net::enable` from `uni_main`,
-    // which ran DHCP (or applied a static config) in single-queue
-    // mode; activating MQ here enables host-side RSS for the
-    // steady-state traffic. MQ activation breaks single-queue
-    // DHCP polling (host-side RSS sprays frames across queues),
-    // so it has to come AFTER the app's Net::enable call.
-    //
-    // Apps that don't call `Net::enable` get no network. Test apps
-    // (test_smp, test_percpu, test_tls) don't use networking and
-    // are unaffected. MQ activation is also skipped on a shutdown
-    // request so those tests exit promptly.
-    if net_ok && !uni_kernel::eventloop::is_shutdown() {
-        uni_drivers::net::activate_multi_queue();
-    }
-
-    // App init complete — signal APs to start their event loops.
-    uni_kernel::eventloop::set_ready();
 
     // If the app's main() returns without calling server.run(),
     // enter the kernel event loop on core 0.

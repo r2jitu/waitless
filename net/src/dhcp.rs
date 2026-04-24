@@ -4,6 +4,7 @@
 
 extern crate uni_kernel;
 extern crate uni_drivers;
+extern crate uni_runtime;
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
 extern crate net_ethernet as ethernet;
@@ -12,7 +13,7 @@ extern crate net_ipv4 as ipv4;
 
 use from_bytes::FromBytes;
 use uni_kernel::sync::Spinlock;
-use uni_kernel::time::udelay;
+use uni_runtime::{select::timeout_us, sleep_us};
 use types::{MacAddr, Ipv4Addr, CONFIG, checksum, htons, ntohs, htonl};
 use ethernet::{EthernetHeader, ethernet_our_mac, ethernet_parse, ETHERTYPE_ARP, ETHERTYPE_IPV4};
 use arp::{arp_receive, arp_announce};
@@ -52,8 +53,6 @@ struct DhcpPacket {
 unsafe impl FromBytes for DhcpPacket {}
 
 impl DhcpPacket {
-    /// View this packet as a `&[u8]` of exactly its 240-byte wire size.
-    /// Safe because `DhcpPacket` is `repr(C, packed)` POD.
     fn as_bytes(&self) -> &[u8] {
         // SAFETY: DhcpPacket is repr(C, packed) with no padding and only
         // POD fields, so any bit pattern is a valid byte slice.
@@ -72,10 +71,6 @@ const DHCP_REQUEST: u8 = 3;
 const DHCP_ACK: u8 = 5;
 const DHCP_NAK: u8 = 6;
 
-/// DHCP negotiation state. The negotiation runs once at boot but
-/// `dhcp_receive` is invoked from the network stack callback (which
-/// could in principle run on any core), so the state lives behind a
-/// spinlock to avoid the cross-core race.
 struct DhcpState {
     xid: u32,
     got_offer: bool,
@@ -104,6 +99,26 @@ impl DhcpState {
 
 static DHCP_STATE: Spinlock<DhcpState> = Spinlock::new(DhcpState::new());
 
+/// True while `discover()` is running. Checked by `net::net_receive`
+/// to decide whether to feed the raw frame into `dhcp_receive`. We
+/// can't bind port 68 via the UDP stack because DHCP runs before
+/// the NetConfig is populated and `ipv4_receive` would accept
+/// broadcast but the UDP port registry isn't wired in yet either.
+/// Opt-in hooking during the bring-up window avoids that chicken-
+/// and-egg problem cleanly.
+static DHCP_ACTIVE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub fn is_active() -> bool {
+    DHCP_ACTIVE.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Invoked by `net::net_receive` while DHCP is active. Parses
+/// DHCP/UDP/IP out of the raw frame and updates `DHCP_STATE`.
+pub fn on_frame(frame: &[u8]) {
+    dhcp_receive(frame);
+}
+
 /// DHCP receive callback — processes raw ethernet frames during DHCP.
 fn dhcp_receive(frame: &[u8]) {
     let (ethertype, payload) = match ethernet_parse(frame) {
@@ -111,7 +126,6 @@ fn dhcp_receive(frame: &[u8]) {
         None => return,
     };
 
-    // Also process ARP during DHCP
     if ethertype == ETHERTYPE_ARP && payload.len() >= 28 {
         arp_receive(payload);
         return;
@@ -142,7 +156,6 @@ fn dhcp_receive(frame: &[u8]) {
     let cookie = dhcp.magic_cookie;
     if xid != DHCP_STATE.lock().xid || cookie != htonl(0x63825363) { return; }
 
-    // Parse options
     let opts_start = dhcp_offset + 240;
     let opts_data = &payload[opts_start..];
 
@@ -155,8 +168,8 @@ fn dhcp_receive(frame: &[u8]) {
     let mut i = 0;
     while i < opts_data.len() {
         let opt = opts_data[i];
-        if opt == 255 { break; } // End
-        if opt == 0 { i += 1; continue; } // Pad
+        if opt == 255 { break; }
+        if opt == 0 { i += 1; continue; }
         if i + 1 >= opts_data.len() { break; }
         let opt_len = opts_data[i + 1] as usize;
         if i + 2 + opt_len > opts_data.len() { break; }
@@ -204,13 +217,13 @@ fn build_dhcp_base() -> DhcpPacket {
     let mut chaddr = [0u8; 16];
     chaddr[..6].copy_from_slice(&mac.bytes);
     DhcpPacket {
-        op: 1,    // BOOTREQUEST
-        htype: 1, // Ethernet
+        op: 1,
+        htype: 1,
         hlen: 6,
         hops: 0,
         xid: DHCP_STATE.lock().xid,
         secs: 0,
-        flags: htons(0x8000), // Broadcast
+        flags: htons(0x8000),
         ciaddr: Ipv4Addr::ANY,
         yiaddr: Ipv4Addr::ANY,
         siaddr: Ipv4Addr::ANY,
@@ -224,8 +237,6 @@ fn build_dhcp_base() -> DhcpPacket {
 
 const DHCP_OFFSET: usize = 14 + 20 + 8;
 
-/// Build the Ethernet/IP/UDP/DHCP-base prologue into `frame` and return the
-/// option-write position (start of DHCP options).
 fn dhcp_frame_prologue(frame: &mut [u8]) -> usize {
     let our_mac = ethernet_our_mac();
 
@@ -240,10 +251,7 @@ fn dhcp_frame_prologue(frame: &mut [u8]) -> usize {
     DHCP_OFFSET + 240
 }
 
-/// Pad to BOOTP minimum, fill in UDP/IP headers + checksum, and return the
-/// total wire length to send.
 fn dhcp_frame_finalize(frame: &mut [u8], mut opt_pos: usize) -> usize {
-    // Pad DHCP payload to minimum 300 bytes (RFC 2131 / BOOTP minimum)
     let min_dhcp_end = DHCP_OFFSET + 300;
     if opt_pos < min_dhcp_end {
         opt_pos = min_dhcp_end;
@@ -273,11 +281,10 @@ fn dhcp_frame_finalize(frame: &mut [u8], mut opt_pos: usize) -> usize {
 }
 
 fn dhcp_send_discover() {
-    let mut frame = [0u8; 590]; // 14 eth + 20 ip + 8 udp + dhcp
+    let mut frame = [0u8; 590];
 
     let mut opt_pos = dhcp_frame_prologue(&mut frame);
     frame[opt_pos] = 53; frame[opt_pos + 1] = 1; frame[opt_pos + 2] = DHCP_DISCOVER; opt_pos += 3;
-    // Parameter request list
     frame[opt_pos] = 55; frame[opt_pos + 1] = 3; frame[opt_pos + 2] = 1; frame[opt_pos + 3] = 3; frame[opt_pos + 4] = 6; opt_pos += 5;
     frame[opt_pos] = 255; opt_pos += 1;
 
@@ -296,17 +303,14 @@ fn dhcp_send_request() {
     };
 
     frame[opt_pos] = 53; frame[opt_pos + 1] = 1; frame[opt_pos + 2] = DHCP_REQUEST; opt_pos += 3;
-    // Requested IP
     let ip_bytes = offered_ip.octets();
     frame[opt_pos] = 50; frame[opt_pos + 1] = 4;
     frame[opt_pos + 2..opt_pos + 6].copy_from_slice(&ip_bytes);
     opt_pos += 6;
-    // Server ID
     let srv_bytes = server_ip.octets();
     frame[opt_pos] = 54; frame[opt_pos + 1] = 4;
     frame[opt_pos + 2..opt_pos + 6].copy_from_slice(&srv_bytes);
     opt_pos += 6;
-    // Parameter request list
     frame[opt_pos] = 55; frame[opt_pos + 1] = 3; frame[opt_pos + 2] = 1; frame[opt_pos + 3] = 3; frame[opt_pos + 4] = 6; opt_pos += 5;
     frame[opt_pos] = 255; opt_pos += 1;
 
@@ -314,32 +318,36 @@ fn dhcp_send_request() {
     uni_drivers::net::send(&frame[..total]);
 }
 
-fn dhcp_poll_wait(timeout_ms: u32, wait_for_ack: bool) -> bool {
-    for _ in 0..timeout_ms {
-        // Poll aggressively within each ms to keep latency low.
-        // The poke_interrupt_status() call reads the virtio MMIO
-        // INTERRUPT_STATUS register, which forces a VM exit on HVF
-        // and lets the host inject any pending RX frames before
-        // we check the used ring. Without this, the tight poll
-        // loop never triggers an MMIO exit and the host can't
-        // deliver DHCP replies during the timeout window.
-        uni_drivers::net::poke_interrupt_status();
-        for _ in 0..100 {
-            uni_drivers::net::poll(dhcp_receive);
-            let s = DHCP_STATE.lock();
-            if wait_for_ack {
-                if s.got_ack { return true; }
-            } else {
-                if s.got_offer { return true; }
-            }
+/// Wait up to `timeout_ms` for a DHCP reply. Yields to the event
+/// loop every 1 ms so `net_flush_cb` kicks pending TX (DISCOVER /
+/// REQUEST) and `net_poll_cb` drains RX — frames flow through
+/// `net_receive → dhcp::on_frame` into `DHCP_STATE`.
+async fn dhcp_await(timeout_ms: u64, wait_for_ack: bool) -> bool {
+    let waiter = async {
+        loop {
+            let done = {
+                let s = DHCP_STATE.lock();
+                if wait_for_ack { s.got_ack } else { s.got_offer }
+            };
+            if done { return; }
+            // Force a VM exit so HVF / KVM's vhost-net actually
+            // injects any pending RX into the virtio ring. Without
+            // this, the busy-poll-and-sleep loop here never exits
+            // the guest (idle_until_cycles is a pure cycle-counter
+            // wait; sleep_us is waker-driven) and the OFFER sits
+            // queued host-side for the full timeout. One MMIO read
+            // per ms is cheap and orders-of-magnitude simpler than
+            // teaching the kernel idle path to WFI while async
+            // tasks are pending.
+            uni_drivers::net::poke_interrupt_status();
+            sleep_us(1000).await;
         }
-        udelay(1000); // 1ms
-    }
-    false
+    };
+    timeout_us(timeout_ms * 1000, waiter).await.is_some()
 }
 
-/// DHCP discover — blocks until IP obtained or timeout.
-pub fn discover() -> bool {
+/// DHCP discover — awaits until IP obtained or timeout.
+pub async fn discover() -> bool {
     {
         let mut s = DHCP_STATE.lock();
         s.got_offer = false;
@@ -347,14 +355,17 @@ pub fn discover() -> bool {
         s.xid = s.xid.wrapping_add(1);
     }
 
+    DHCP_ACTIVE.store(true, core::sync::atomic::Ordering::Release);
+
     // Phase 1: DISCOVER → OFFER
     for _attempt in 0..5 {
         dhcp_send_discover();
-        if dhcp_poll_wait(2000, false) && DHCP_STATE.lock().got_offer {
+        if dhcp_await(2000, false).await && DHCP_STATE.lock().got_offer {
             break;
         }
     }
     if !DHCP_STATE.lock().got_offer {
+        DHCP_ACTIVE.store(false, core::sync::atomic::Ordering::Release);
         return false;
     }
 
@@ -362,15 +373,15 @@ pub fn discover() -> bool {
     DHCP_STATE.lock().got_ack = false;
     for _attempt in 0..5 {
         dhcp_send_request();
-        if dhcp_poll_wait(2000, true) && DHCP_STATE.lock().got_ack {
+        if dhcp_await(2000, true).await && DHCP_STATE.lock().got_ack {
             break;
         }
     }
+    DHCP_ACTIVE.store(false, core::sync::atomic::Ordering::Release);
     if !DHCP_STATE.lock().got_ack {
         return false;
     }
 
-    // Apply configuration
     let net_config = {
         let s = DHCP_STATE.lock();
         types::NetConfig {
@@ -382,8 +393,6 @@ pub fn discover() -> bool {
     };
     CONFIG.store(net_config);
 
-    // Log the configured IP so host-side runners can grep the serial
-    // stream for the guest address before forwarding traffic to it.
     {
         let o = CONFIG.ip().octets();
         let mut msg = *b"dhcp: configured IP xxx.xxx.xxx.xxx\n";
@@ -398,7 +407,6 @@ pub fn discover() -> bool {
         uni_kernel::serial::puts(&msg[..pos]);
     }
 
-    // Gratuitous ARP
     arp_announce();
 
     true

@@ -14,6 +14,8 @@ pub use uni_net_driver::{
 
 // Bare-metal pulls the full net umbrella; native uses POSIX sockets.
 #[cfg(target_os = "none")]
+extern crate uni_drivers;
+#[cfg(target_os = "none")]
 pub use uni_net_stack::*;
 
 // ---- Public net-stack API -------------------------------------------------
@@ -90,29 +92,24 @@ impl Net {
     /// Bring the network stack online. On success stores a
     /// `Box<Net>` in the module-level slot and returns a handle.
     ///
+    /// Async so DHCP (bare-metal) can yield between DISCOVER/REQUEST
+    /// and OFFER/ACK while the event-loop TX-flush hook fires between
+    /// polls. Native's body trivially resolves on first poll (nothing
+    /// to wait on — POSIX sockets don't need DHCP).
+    ///
     /// Failure semantics: the slot is **not** populated on failure,
-    /// so apps can retry with a different config. The typical
-    /// pattern is `enable(Dhcp).or_else(|_| enable(Static{…}))`.
+    /// so apps can retry with a different config. Typical pattern:
+    /// `match Net::enable(Dhcp).await { Ok(n) => n, Err(_) =>
+    /// Net::enable(Static {..}).await.expect(..) }`.
     ///
     /// Calling `enable` twice after a successful bring-up returns
     /// `Err(NetError::AlreadyEnabled)`.
-    pub fn enable(cfg: NetBringUp) -> Result<Net, NetError> {
+    pub async fn enable(cfg: NetBringUp) -> Result<Net, NetError> {
         // SAFETY: BSP-only access; see `unsafe impl Sync for NetSlot`.
         if unsafe { (*NET.0.get()).is_some() } {
             return Err(NetError::AlreadyEnabled);
         }
 
-        // Validate that a driver registered via `register_ethernet_
-        // driver!` is linked AND has probed successfully. Returns
-        // `NoDriver` if the binary has no driver crate linked at all
-        // (empty linker section) and `NoNic` if drivers are linked
-        // but none bound hardware. `probe()` short-circuits on a
-        // cached flag set by `uni_drivers::net::init()` at boot, so this
-        // walk is cheap.
-        //
-        // Native builds skip this check — `linked_ethernet_drivers()`
-        // is stubbed to `&[]` there and networking flows through
-        // POSIX sockets, not ethernet drivers.
         #[cfg(target_os = "none")]
         {
             let drivers = uni_net_driver::linked_ethernet_drivers();
@@ -131,10 +128,16 @@ impl Net {
             }
         }
 
-        bringup(cfg)?;
-        // Park a `Box<Net>` in the slot so `is_enabled()` reflects
-        // "someone successfully called enable". The returned handle
-        // is a separate ZST — both are free to pass around.
+        bringup(cfg).await?;
+
+        #[cfg(target_os = "none")]
+        {
+            // DHCP succeeded (or static was applied) — promote virtio-
+            // net to multi-queue. Host-side RSS then sprays incoming
+            // frames across queue pairs for steady-state traffic.
+            uni_drivers::net::activate_multi_queue();
+        }
+
         // SAFETY: BSP-only access.
         unsafe {
             *NET.0.get() = Some(alloc::boxed::Box::new(Net { _private: () }));
@@ -183,10 +186,10 @@ pub fn clear_on_shutdown() {
 // ----------------------------------------------------------------------------
 
 #[cfg(target_os = "none")]
-fn bringup(cfg: NetBringUp) -> Result<(), NetError> {
+async fn bringup(cfg: NetBringUp) -> Result<(), NetError> {
     match cfg {
         NetBringUp::Dhcp => {
-            if uni_net_stack::bringup_dhcp() {
+            if uni_net_stack::bringup_dhcp().await {
                 Ok(())
             } else {
                 // No implicit static fallback — surfacing the
@@ -207,7 +210,7 @@ fn bringup(cfg: NetBringUp) -> Result<(), NetError> {
 }
 
 #[cfg(not(target_os = "none"))]
-fn bringup(_cfg: NetBringUp) -> Result<(), NetError> {
+async fn bringup(_cfg: NetBringUp) -> Result<(), NetError> {
     // The native backend runs over POSIX sockets; the host
     // manages interface configuration. `Net::enable` is
     // essentially a typed hand-off: the slot lets forward-compat

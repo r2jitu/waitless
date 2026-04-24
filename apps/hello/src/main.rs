@@ -24,12 +24,7 @@ struct HelloApp {
 impl uni::App for HelloApp {}
 
 impl HelloApp {
-    fn new() -> Self {
-        // Bring up networking. `.expect` keeps this example minimal —
-        // webserver/main.rs shows the DHCP→Static fallback pattern.
-        let net = Net::enable(NetBringUp::Dhcp)
-            .expect("Net::enable failed — NIC driver missing?");
-
+    fn new(net: Net) -> Self {
         let mut server = Server::new_boxed();
         server.default_handler(hello);
         server.listen(uni::config_port(80));
@@ -42,6 +37,9 @@ fn hello(_: &Request) -> Response {
 }
 
 #[uni::boot]
-fn boot() {
-    uni::run(HelloApp::new());
+async fn boot() {
+    let net = Net::enable(NetBringUp::Dhcp)
+        .await
+        .expect("Net::enable failed — NIC driver missing?");
+    uni::run(HelloApp::new(net));
 }

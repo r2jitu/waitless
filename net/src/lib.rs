@@ -92,9 +92,12 @@ fn tcp_backend_accept(port: u16) -> uni_runtime::net::RawTcpStream {
 // IP-config bring-up primitives — `uni::net::Net::enable` dispatches here.
 // ============================================================================
 
-/// Returns `true` on success, `false` on DHCP timeout.
-pub fn bringup_dhcp() -> bool {
-    dhcp::discover()
+/// Returns `true` on success, `false` on DHCP timeout. Async: yields
+/// between polls so the event-loop TX-flush hook fires between
+/// DISCOVER/REQUEST sends and the next poll (which is what makes the
+/// deferred TX kick correct during bring-up).
+pub async fn bringup_dhcp() -> bool {
+    dhcp::discover().await
 }
 
 /// `dns` is left at 0.0.0.0 — the stack doesn't resolve names.
@@ -275,6 +278,10 @@ fn poll_tier2(num_cores: u32) -> bool {
 /// Classify a frame and distribute it to the appropriate core.
 /// Called as the VirtIO poll callback on core 0.
 fn distribute_frame(frame: &[u8]) {
+    // See `net_receive` for the DHCP hook rationale.
+    if dhcp::is_active() {
+        dhcp::on_frame(frame);
+    }
     let num_cores = percpu::num_cores();
 
     // Parse enough of the frame to classify by protocol and flow.
@@ -338,6 +345,14 @@ fn distribute_frame(frame: &[u8]) {
 /// Called on core 0 for single-core mode and ARP/TCP frames,
 /// and on any core for distributed frames via ap_poll.
 pub fn net_receive(frame: &[u8]) {
+    // DHCP bring-up: the `discover()` future parks on a condition
+    // variable. It can't bind port 68 through the UDP stack because
+    // `NetConfig` isn't populated and the protocol registry isn't
+    // wired yet. Feed the frame into the DHCP state machine directly
+    // while bring-up is in progress.
+    if dhcp::is_active() {
+        dhcp::on_frame(frame);
+    }
     if let Some((src_mac, ethertype, payload)) = ethernet::ethernet_parse_full(frame) {
         match ethertype {
             ethernet::ETHERTYPE_ARP => arp::arp_receive(payload),
@@ -401,8 +416,11 @@ pub fn init_eventloop() {
     // NAPI re-arm: right before the event loop HLTs, re-enable RX
     // notifications on this core's queue pair and re-check the ring.
     uni_kernel::eventloop::set_net_rearm_rx(uni_drivers::net::rearm_rx_napi);
-    // Batch TX kicks: defer MMIO writes until net_flush_cb, reducing
-    // exits per HTTP response from N segments to 1 notification.
+    // Batch TX kicks: defer MMIO writes until `net_flush_cb` fires at
+    // the end of each event-loop tick. Correct for the whole boot
+    // because DHCP now runs as an async task polled by the event loop
+    // — so the flush hook fires between DISCOVER/REQUEST sends and
+    // the next `dhcp_await` poll.
     uni_drivers::net::enable_deferred_tx_kick();
 }
 

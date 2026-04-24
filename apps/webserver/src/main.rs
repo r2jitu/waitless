@@ -41,25 +41,7 @@ struct WebServerApp {
 impl uni::App for WebServerApp {}
 
 impl WebServerApp {
-    fn new() -> Self {
-        log_boot_info();
-
-        // Try DHCP first; on timeout (typical under minimal tap
-        // networks) fall back to a static 10.0.2.15/24 config so
-        // the app still boots. `Net::enable` leaves the ENABLED
-        // flag clear when bring-up fails, which is what makes the
-        // `.or_else(...)` retry valid.
-        let net = Net::enable(NetBringUp::Dhcp)
-            .or_else(|_| {
-                uni::log(b"Net::enable: DHCP failed, using 10.0.2.15/24 static fallback\n");
-                Net::enable(NetBringUp::Static {
-                    ip: uni::net::Ipv4Addr::new(10, 0, 2, 15),
-                    gateway: uni::net::Ipv4Addr::new(10, 0, 2, 2),
-                    netmask: uni::net::Ipv4Addr::new(255, 255, 255, 0),
-                })
-            })
-            .expect("Net::enable: both DHCP and static fallback failed");
-
+    fn new(net: Net) -> Self {
         uni::log(b"Starting HTTP server...\n");
         let http_port = uni::config_port(HTTP_PORT);
         let https_port = uni::config_tls_port(HTTPS_PORT);
@@ -133,8 +115,27 @@ impl Drop for WebServerApp {
 }
 
 #[uni::boot]
-fn boot() {
-    uni::run(WebServerApp::new());
+async fn boot() {
+    log_boot_info();
+
+    // Try DHCP first; on timeout (typical under minimal tap
+    // networks) fall back to a static 10.0.2.15/24 config so the
+    // app still boots. `Net::enable` leaves the ENABLED flag clear
+    // when bring-up fails, which is what makes the fallback valid.
+    let net = match Net::enable(NetBringUp::Dhcp).await {
+        Ok(n) => n,
+        Err(_) => {
+            uni::log(b"Net::enable: DHCP failed, using 10.0.2.15/24 static fallback\n");
+            Net::enable(NetBringUp::Static {
+                ip: uni::net::Ipv4Addr::new(10, 0, 2, 15),
+                gateway: uni::net::Ipv4Addr::new(10, 0, 2, 2),
+                netmask: uni::net::Ipv4Addr::new(255, 255, 255, 0),
+            })
+            .await
+            .expect("Net::enable: both DHCP and static fallback failed")
+        }
+    };
+    uni::run(WebServerApp::new(net));
 }
 
 // ---- Request dispatch + route handlers --------------------------------------
