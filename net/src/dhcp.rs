@@ -1,9 +1,21 @@
 // net/dhcp.rs — DHCP discover/offer/request/ack.
+//
+// Built on top of the regular UDP stack: binds port 68 via
+// `UdpSocket`, fans the per-worker reply handler out with
+// `run_each`, and sends DISCOVER / REQUEST via `send_to` with the
+// broadcast IP. The IPv4 layer's existing "`CONFIG.ip() == ANY` →
+// MAC broadcast" branch handles the pre-IP corner case, so DHCP
+// doesn't need a custom Ethernet/IP/UDP framer any more.
+//
+// This used to reach deep into the stack: a `DHCP_ACTIVE` atomic
+// plus an `on_frame(&[u8])` hook let `net::net_receive` forward raw
+// frames here during bring-up because we couldn't bind port 68 via
+// the normal UDP path. That code is gone — everything DHCP needs
+// is available to any user of `uni::runtime::UdpSocket`.
 
 #![no_std]
 
 extern crate uni_kernel;
-extern crate uni_drivers;
 extern crate uni_runtime;
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
@@ -15,23 +27,15 @@ mod dhcp_parse;
 
 use from_bytes::FromBytes;
 use uni_kernel::sync::Spinlock;
-use uni_runtime::{select::timeout_us, sleep_us};
-use types::{MacAddr, Ipv4Addr, CONFIG, checksum, htons, ntohs, htonl};
-use ethernet::{EthernetHeader, ethernet_our_mac, ethernet_parse, ETHERTYPE_ARP, ETHERTYPE_IPV4};
-use arp::{arp_receive, arp_announce};
-use ipv4::{Ipv4Header, PROTO_UDP};
+use uni_runtime::event::AsyncEvent;
+use uni_runtime::net::UdpSocket;
+use uni_runtime::select::timeout_us;
+use types::{Ipv4Addr, CONFIG, htons, htonl};
+use ethernet::ethernet_our_mac;
+use arp::arp_announce;
 
-#[repr(C, packed)]
-struct UdpHeader {
-    src_port: u16,
-    dst_port: u16,
-    length: u16,
-    checksum: u16,
-}
-
-// SAFETY: repr(C, packed), all u16 fields.
-unsafe impl FromBytes for UdpHeader {}
-
+/// Fixed DHCP/BOOTP header. 236 bytes + 4-byte magic cookie = 240
+/// bytes. Options follow.
 #[repr(C, packed)]
 struct DhcpPacket {
     op: u8,
@@ -56,8 +60,7 @@ unsafe impl FromBytes for DhcpPacket {}
 
 impl DhcpPacket {
     fn as_bytes(&self) -> &[u8] {
-        // SAFETY: DhcpPacket is repr(C, packed) with no padding and only
-        // POD fields, so any bit pattern is a valid byte slice.
+        // SAFETY: repr(C, packed) POD with no padding.
         unsafe {
             core::slice::from_raw_parts(
                 self as *const _ as *const u8,
@@ -67,16 +70,20 @@ impl DhcpPacket {
     }
 }
 
-// Outgoing DHCP message types we emit on the wire. Incoming codes
-// (`OFFER` / `ACK` / `NAK`) live in `dhcp_parse::MSG_*` alongside
-// the parser that consumes them.
+// Outgoing DHCP message types. Incoming codes (`OFFER` / `ACK` /
+// `NAK`) live in `dhcp_parse::MSG_*`.
 const DHCP_DISCOVER: u8 = 1;
 const DHCP_REQUEST: u8 = 3;
 
+const BROADCAST_IP: [u8; 4] = [255, 255, 255, 255];
+
+/// The parsed lease. `handle_reply` fills this from whichever
+/// worker receives the OFFER / ACK; `discover()` reads it from
+/// core 0 after the matching `AsyncEvent` fires. Completion
+/// signalling lives in the events, not here — these fields are
+/// pure data.
 struct DhcpState {
     xid: u32,
-    got_offer: bool,
-    got_ack: bool,
     offered_ip: Ipv4Addr,
     offered_subnet: Ipv4Addr,
     offered_gateway: Ipv4Addr,
@@ -88,8 +95,6 @@ impl DhcpState {
     const fn new() -> Self {
         DhcpState {
             xid: 0x12345678,
-            got_offer: false,
-            got_ack: false,
             offered_ip: Ipv4Addr::ANY,
             offered_subnet: Ipv4Addr::ANY,
             offered_gateway: Ipv4Addr::ANY,
@@ -101,265 +106,172 @@ impl DhcpState {
 
 static DHCP_STATE: Spinlock<DhcpState> = Spinlock::new(DhcpState::new());
 
-/// True while `discover()` is running. Checked by `net::net_receive`
-/// to decide whether to feed the raw frame into `dhcp_receive`. We
-/// can't bind port 68 via the UDP stack because DHCP runs before
-/// the NetConfig is populated and `ipv4_receive` would accept
-/// broadcast but the UDP port registry isn't wired in yet either.
-/// Opt-in hooking during the bring-up window avoids that chicken-
-/// and-egg problem cleanly.
-static DHCP_ACTIVE: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+/// Signalled by `handle_reply` when an OFFER / ACK lands (on
+/// whichever worker received it); awaited by `discover()` on
+/// core 0. Replaces the old `sleep_us(1 ms)` polling loop — the
+/// waker fires immediately on reply, so discover() continues with
+/// no extra latency and without spending CPU polling a spinlock.
+static OFFER_READY: AsyncEvent = AsyncEvent::new();
+static ACK_READY: AsyncEvent = AsyncEvent::new();
 
-pub fn is_active() -> bool {
-    DHCP_ACTIVE.load(core::sync::atomic::Ordering::Acquire)
-}
-
-/// Invoked by `net::net_receive` while DHCP is active. Parses
-/// DHCP/UDP/IP out of the raw frame and updates `DHCP_STATE`.
-pub fn on_frame(frame: &[u8]) {
-    dhcp_receive(frame);
-}
-
-/// DHCP receive callback — processes raw ethernet frames during DHCP.
-///
-/// Handles the eth/IP/UDP framing here; option TLV parsing and the
-/// reply-header checks live in `dhcp_parse` (exhaustively unit-tested
-/// standalone).
-fn dhcp_receive(frame: &[u8]) {
-    let (ethertype, payload) = match ethernet_parse(frame) {
-        Some(v) => v,
-        None => return,
-    };
-
-    if ethertype == ETHERTYPE_ARP && payload.len() >= 28 {
-        arp_receive(payload);
+/// `UdpSocket::run_each` handler — fires on whichever worker the
+/// OFFER / ACK arrived on. Parses the DHCP payload and updates the
+/// shared `DHCP_STATE`. Validation + option walking lives in
+/// `dhcp_parse`; see its unit tests for the edge-case coverage.
+fn handle_reply(_src_ip: [u8; 4], src_port: u16, payload: &[u8]) {
+    // DHCP servers always source from port 67. Drop anything else.
+    if src_port != 67 {
         return;
     }
 
-    if ethertype != ETHERTYPE_IPV4 { return; }
-    let ip_hdr = match Ipv4Header::try_ref_from(payload) {
-        Some(h) => h,
-        None => return,
-    };
-    if ip_hdr.protocol != PROTO_UDP { return; }
-    let ip_hdr_len = ((ip_hdr.version_ihl & 0x0F) as usize) * 4;
-    if payload.len() < ip_hdr_len { return; }
-
-    let udp = match UdpHeader::try_ref_from(&payload[ip_hdr_len..]) {
-        Some(h) => h,
-        None => return,
-    };
-    if ntohs(udp.dst_port) != 68 || ntohs(udp.src_port) != 67 { return; }
-
-    let dhcp_offset = ip_hdr_len + 8;
-    let dhcp_bytes = &payload[dhcp_offset..];
-
-    // Header + XID + magic-cookie validation (tested in dhcp_parse).
-    let expected_xid = DHCP_STATE.lock().xid;
-    let expected_xid_be = expected_xid.to_ne_bytes();
-    let yiaddr_bytes = match dhcp_parse::validate_header(dhcp_bytes, expected_xid_be) {
+    let expected_xid_be = DHCP_STATE.lock().xid.to_ne_bytes();
+    let yiaddr_bytes = match dhcp_parse::validate_header(payload, expected_xid_be) {
         Some(a) => a,
         None => return,
     };
-    let yiaddr = Ipv4Addr::from(
-        yiaddr_bytes[0], yiaddr_bytes[1], yiaddr_bytes[2], yiaddr_bytes[3],
-    );
+    let to_addr =
+        |o: [u8; 4]| Ipv4Addr::from(o[0], o[1], o[2], o[3]);
+    let yiaddr = to_addr(yiaddr_bytes);
+    let parsed = dhcp_parse::parse_options(&payload[240..]);
 
-    let parsed = dhcp_parse::parse_options(&dhcp_bytes[240..]);
-    let to_addr = |o: [u8; 4]| Ipv4Addr::from(o[0], o[1], o[2], o[3]);
-
-    let mut state = DHCP_STATE.lock();
-    match parsed.msg_type {
-        dhcp_parse::MSG_OFFER => {
-            state.offered_ip = yiaddr;
-            state.offered_subnet = parsed.subnet.map(to_addr).unwrap_or(Ipv4Addr::ANY);
-            state.offered_gateway = parsed.gateway.map(to_addr).unwrap_or(Ipv4Addr::ANY);
-            state.offered_dns = parsed.dns.map(to_addr).unwrap_or(Ipv4Addr::ANY);
-            state.server_ip = parsed.server_id.map(to_addr).unwrap_or(Ipv4Addr::ANY);
-            state.got_offer = true;
+    let msg_type = parsed.msg_type;
+    {
+        let mut state = DHCP_STATE.lock();
+        match msg_type {
+            dhcp_parse::MSG_OFFER => {
+                state.offered_ip = yiaddr;
+                state.offered_subnet = parsed.subnet.map(to_addr).unwrap_or(Ipv4Addr::ANY);
+                state.offered_gateway = parsed.gateway.map(to_addr).unwrap_or(Ipv4Addr::ANY);
+                state.offered_dns = parsed.dns.map(to_addr).unwrap_or(Ipv4Addr::ANY);
+                state.server_ip = parsed.server_id.map(to_addr).unwrap_or(Ipv4Addr::ANY);
+            }
+            dhcp_parse::MSG_ACK => {
+                state.offered_ip = yiaddr;
+                if let Some(s) = parsed.subnet { state.offered_subnet = to_addr(s); }
+                if let Some(g) = parsed.gateway { state.offered_gateway = to_addr(g); }
+                if let Some(d) = parsed.dns { state.offered_dns = to_addr(d); }
+            }
+            // NAK explicitly ignored — no state update, no event
+            // set. Phase 2's timeout fires and `discover()` reports
+            // failure; the app then retries with Static.
+            dhcp_parse::MSG_NAK => {}
+            _ => {}
         }
-        dhcp_parse::MSG_ACK => {
-            state.offered_ip = yiaddr;
-            if let Some(s) = parsed.subnet { state.offered_subnet = to_addr(s); }
-            if let Some(g) = parsed.gateway { state.offered_gateway = to_addr(g); }
-            if let Some(d) = parsed.dns { state.offered_dns = to_addr(d); }
-            state.got_ack = true;
-        }
-        dhcp_parse::MSG_NAK => {
-            state.got_offer = false;
-        }
+    }
+    // Wake `discover()` after releasing the lock — no deadlock on
+    // the set path even if the waiter polls immediately on another
+    // core. NAKs are intentionally silent: if a NAK lands during
+    // Phase 2 we let the retry timeout fire and report failure.
+    match msg_type {
+        dhcp_parse::MSG_OFFER => OFFER_READY.set(),
+        dhcp_parse::MSG_ACK => ACK_READY.set(),
         _ => {}
     }
 }
 
-fn build_dhcp_base() -> DhcpPacket {
-    let mac = ethernet_our_mac();
-    let mut chaddr = [0u8; 16];
-    chaddr[..6].copy_from_slice(&mac.bytes);
-    DhcpPacket {
-        op: 1,
-        htype: 1,
-        hlen: 6,
-        hops: 0,
-        xid: DHCP_STATE.lock().xid,
-        secs: 0,
-        flags: htons(0x8000),
-        ciaddr: Ipv4Addr::ANY,
-        yiaddr: Ipv4Addr::ANY,
-        siaddr: Ipv4Addr::ANY,
-        giaddr: Ipv4Addr::ANY,
-        chaddr,
-        sname: [0; 64],
-        file: [0; 128],
-        magic_cookie: htonl(0x63825363),
-    }
-}
-
-const DHCP_OFFSET: usize = 14 + 20 + 8;
-
-fn dhcp_frame_prologue(frame: &mut [u8]) -> usize {
-    let our_mac = ethernet_our_mac();
-
-    let eth = unsafe { &mut *(frame.as_mut_ptr() as *mut EthernetHeader) };
-    eth.dst = MacAddr::BROADCAST;
-    eth.src = our_mac;
-    eth.ethertype = htons(ETHERTYPE_IPV4);
-
-    let dhcp_base = build_dhcp_base();
-    frame[DHCP_OFFSET..DHCP_OFFSET + 240].copy_from_slice(dhcp_base.as_bytes());
-
-    DHCP_OFFSET + 240
-}
-
-fn dhcp_frame_finalize(frame: &mut [u8], mut opt_pos: usize) -> usize {
-    let min_dhcp_end = DHCP_OFFSET + 300;
-    if opt_pos < min_dhcp_end {
-        opt_pos = min_dhcp_end;
-    }
-
-    let dhcp_len = opt_pos - DHCP_OFFSET;
-    let udp_len = 8 + dhcp_len;
-    let ip_total = 20 + udp_len;
-
-    let udp = unsafe { &mut *(frame.as_mut_ptr().add(14 + 20) as *mut UdpHeader) };
-    udp.src_port = htons(68);
-    udp.dst_port = htons(67);
-    udp.length = htons(udp_len as u16);
-    udp.checksum = 0;
-
-    let ip = unsafe { &mut *(frame.as_mut_ptr().add(14) as *mut Ipv4Header) };
-    ip.version_ihl = 0x45;
-    ip.total_length = htons(ip_total as u16);
-    ip.ttl = 64;
-    ip.protocol = PROTO_UDP;
-    ip.src = Ipv4Addr::ANY;
-    ip.dst = Ipv4Addr::BROADCAST;
-    ip.checksum = 0;
-    ip.checksum = unsafe { checksum(frame.as_ptr().add(14) as *const u8, 20) };
-
-    14 + ip_total
-}
-
-fn dhcp_send_discover() {
-    let mut frame = [0u8; 590];
-
-    let mut opt_pos = dhcp_frame_prologue(&mut frame);
-    frame[opt_pos] = 53; frame[opt_pos + 1] = 1; frame[opt_pos + 2] = DHCP_DISCOVER; opt_pos += 3;
-    frame[opt_pos] = 55; frame[opt_pos + 1] = 3; frame[opt_pos + 2] = 1; frame[opt_pos + 3] = 3; frame[opt_pos + 4] = 6; opt_pos += 5;
-    frame[opt_pos] = 255; opt_pos += 1;
-
-    let total = dhcp_frame_finalize(&mut frame, opt_pos);
-    uni_drivers::net::send(&frame[..total]);
-}
-
-fn dhcp_send_request() {
-    let mut frame = [0u8; 590];
-
-    let mut opt_pos = dhcp_frame_prologue(&mut frame);
-
-    let (offered_ip, server_ip) = {
-        let s = DHCP_STATE.lock();
-        (s.offered_ip, s.server_ip)
-    };
-
-    frame[opt_pos] = 53; frame[opt_pos + 1] = 1; frame[opt_pos + 2] = DHCP_REQUEST; opt_pos += 3;
-    let ip_bytes = offered_ip.octets();
-    frame[opt_pos] = 50; frame[opt_pos + 1] = 4;
-    frame[opt_pos + 2..opt_pos + 6].copy_from_slice(&ip_bytes);
-    opt_pos += 6;
-    let srv_bytes = server_ip.octets();
-    frame[opt_pos] = 54; frame[opt_pos + 1] = 4;
-    frame[opt_pos + 2..opt_pos + 6].copy_from_slice(&srv_bytes);
-    opt_pos += 6;
-    frame[opt_pos] = 55; frame[opt_pos + 1] = 3; frame[opt_pos + 2] = 1; frame[opt_pos + 3] = 3; frame[opt_pos + 4] = 6; opt_pos += 5;
-    frame[opt_pos] = 255; opt_pos += 1;
-
-    let total = dhcp_frame_finalize(&mut frame, opt_pos);
-    uni_drivers::net::send(&frame[..total]);
-}
-
-/// Wait up to `timeout_ms` for a DHCP reply. Yields to the event
-/// loop every 1 ms so `net_flush_cb` kicks pending TX (DISCOVER /
-/// REQUEST) and `net_poll_cb` drains RX — frames flow through
-/// `net_receive → dhcp::on_frame` into `DHCP_STATE`.
-async fn dhcp_await(timeout_ms: u64, wait_for_ack: bool) -> bool {
-    let waiter = async {
-        loop {
-            let done = {
-                let s = DHCP_STATE.lock();
-                if wait_for_ack { s.got_ack } else { s.got_offer }
-            };
-            if done { return; }
-            // Force a VM exit so HVF / KVM's vhost-net actually
-            // injects any pending RX into the virtio ring. Without
-            // this, the busy-poll-and-sleep loop here never exits
-            // the guest (idle_until_cycles is a pure cycle-counter
-            // wait; sleep_us is waker-driven) and the OFFER sits
-            // queued host-side for the full timeout. One MMIO read
-            // per ms is cheap and orders-of-magnitude simpler than
-            // teaching the kernel idle path to WFI while async
-            // tasks are pending.
-            uni_drivers::net::poke_interrupt_status();
-            sleep_us(1000).await;
+/// Fill `buf` with a DHCP fixed header + the tail of the passed
+/// option block, pad to BOOTP's 300-byte minimum payload, return
+/// the total length written. The caller supplies the message-type +
+/// any extra options as `tail`.
+fn build_payload(tail: &[u8], buf: &mut [u8]) -> usize {
+    let base = {
+        let mac = ethernet_our_mac();
+        let mut chaddr = [0u8; 16];
+        chaddr[..6].copy_from_slice(&mac.bytes);
+        DhcpPacket {
+            op: 1,
+            htype: 1,
+            hlen: 6,
+            hops: 0,
+            xid: DHCP_STATE.lock().xid,
+            secs: 0,
+            flags: htons(0x8000), // broadcast flag — reply to FF:FF:FF...
+            ciaddr: Ipv4Addr::ANY,
+            yiaddr: Ipv4Addr::ANY,
+            siaddr: Ipv4Addr::ANY,
+            giaddr: Ipv4Addr::ANY,
+            chaddr,
+            sname: [0; 64],
+            file: [0; 128],
+            magic_cookie: htonl(0x63825363),
         }
     };
-    timeout_us(timeout_ms * 1000, waiter).await.is_some()
+    buf[..240].copy_from_slice(base.as_bytes());
+    buf[240..240 + tail.len()].copy_from_slice(tail);
+    // BOOTP minimum: pad the whole DHCP payload to 300 bytes.
+    let written = 240 + tail.len();
+    written.max(300)
+}
+
+fn build_discover(buf: &mut [u8]) -> usize {
+    let tail: [u8; 10] = [
+        53, 1, DHCP_DISCOVER,
+        55, 3, 1, 3, 6,  // param request list: subnet, router, DNS
+        255,
+        0,               // pad so `tail.len()` stays constant for arr init
+    ];
+    build_payload(&tail[..9], buf)
+}
+
+fn build_request(buf: &mut [u8]) -> usize {
+    let (offered_ip, server_ip) = {
+        let s = DHCP_STATE.lock();
+        (s.offered_ip.octets(), s.server_ip.octets())
+    };
+    let mut tail = [0u8; 21];
+    tail[0] = 53; tail[1] = 1; tail[2] = DHCP_REQUEST;
+    tail[3] = 50; tail[4] = 4;
+    tail[5..9].copy_from_slice(&offered_ip);
+    tail[9] = 54; tail[10] = 4;
+    tail[11..15].copy_from_slice(&server_ip);
+    tail[15] = 55; tail[16] = 3; tail[17] = 1; tail[18] = 3; tail[19] = 6;
+    tail[20] = 255;
+    build_payload(&tail, buf)
 }
 
 /// DHCP discover — awaits until IP obtained or timeout.
 pub async fn discover() -> bool {
+    // Bind port 68 and fan the receive loop out across every
+    // worker — whichever core's RX queue the OFFER / ACK lands on
+    // calls `handle_reply` there, updating `DHCP_STATE` and
+    // signalling `OFFER_READY` / `ACK_READY`. Port + socket stay
+    // allocated for the process lifetime (DHCP only runs once per
+    // boot).
+    let sock = match UdpSocket::bind(68) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let sock: &'static UdpSocket = sock.run_each(handle_reply);
+
     {
         let mut s = DHCP_STATE.lock();
-        s.got_offer = false;
-        s.got_ack = false;
         s.xid = s.xid.wrapping_add(1);
     }
-
-    DHCP_ACTIVE.store(true, core::sync::atomic::Ordering::Release);
+    OFFER_READY.reset();
+    ACK_READY.reset();
 
     // Phase 1: DISCOVER → OFFER
-    for _attempt in 0..5 {
-        dhcp_send_discover();
-        if dhcp_await(2000, false).await && DHCP_STATE.lock().got_offer {
+    let mut buf = [0u8; 300];
+    for _ in 0..5 {
+        let n = build_discover(&mut buf);
+        let _ = sock.send_to(BROADCAST_IP, 67, &buf[..n]);
+        if timeout_us(2_000_000, OFFER_READY.wait()).await.is_some() {
             break;
         }
     }
-    if !DHCP_STATE.lock().got_offer {
-        DHCP_ACTIVE.store(false, core::sync::atomic::Ordering::Release);
+    if !OFFER_READY.is_set() {
         return false;
     }
 
     // Phase 2: REQUEST → ACK
-    DHCP_STATE.lock().got_ack = false;
-    for _attempt in 0..5 {
-        dhcp_send_request();
-        if dhcp_await(2000, true).await && DHCP_STATE.lock().got_ack {
+    for _ in 0..5 {
+        let n = build_request(&mut buf);
+        let _ = sock.send_to(BROADCAST_IP, 67, &buf[..n]);
+        if timeout_us(2_000_000, ACK_READY.wait()).await.is_some() {
             break;
         }
     }
-    DHCP_ACTIVE.store(false, core::sync::atomic::Ordering::Release);
-    if !DHCP_STATE.lock().got_ack {
+    if !ACK_READY.is_set() {
         return false;
     }
 
@@ -393,7 +305,8 @@ pub async fn discover() -> bool {
     true
 }
 
-/// Set fallback network config (called from entry.rs if DHCP fails).
+/// Set fallback network config (called from `bringup_static` when
+/// the app opts out of DHCP, or from a failure-retry path).
 pub fn set_fallback_config(
     ip_a: u8, ip_b: u8, ip_c: u8, ip_d: u8,
     mask_a: u8, mask_b: u8, mask_c: u8, mask_d: u8,

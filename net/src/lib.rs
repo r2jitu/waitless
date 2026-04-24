@@ -278,10 +278,6 @@ fn poll_tier2(num_cores: u32) -> bool {
 /// Classify a frame and distribute it to the appropriate core.
 /// Called as the VirtIO poll callback on core 0.
 fn distribute_frame(frame: &[u8]) {
-    // See `net_receive` for the DHCP hook rationale.
-    if dhcp::is_active() {
-        dhcp::on_frame(frame);
-    }
     let num_cores = percpu::num_cores();
 
     // Parse enough of the frame to classify by protocol and flow.
@@ -345,14 +341,6 @@ fn distribute_frame(frame: &[u8]) {
 /// Called on core 0 for single-core mode and ARP/TCP frames,
 /// and on any core for distributed frames via ap_poll.
 pub fn net_receive(frame: &[u8]) {
-    // DHCP bring-up: the `discover()` future parks on a condition
-    // variable. It can't bind port 68 through the UDP stack because
-    // `NetConfig` isn't populated and the protocol registry isn't
-    // wired yet. Feed the frame into the DHCP state machine directly
-    // while bring-up is in progress.
-    if dhcp::is_active() {
-        dhcp::on_frame(frame);
-    }
     if let Some((src_mac, ethertype, payload)) = ethernet::ethernet_parse_full(frame) {
         match ethertype {
             ethernet::ETHERTYPE_ARP => arp::arp_receive(payload),
