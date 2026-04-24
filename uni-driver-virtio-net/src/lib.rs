@@ -1121,7 +1121,27 @@ fn poke_interrupt_status() {
 }
 
 fn poll(callback: fn(&[u8])) -> usize {
-    poll_qp(0, callback)
+    // Drain every negotiated queue pair, not just queue 0. vhost-net
+    // with `mq=on,queues=N` on QEMU hashes RX packets across all N
+    // queue pairs from the very first DHCP OFFER, well before the
+    // guest's CTRL_MQ_VQ_PAIRS_SET activates multi-queue — so if we
+    // only polled queue 0 here (the pre-activation assumption), DHCP
+    // silently timed out on KVM because the OFFER frame landed on
+    // queue 1 and stayed there.
+    //
+    // Post-activation the net-stack's Tier 1 path switches to
+    // per-core `poll_qp(core_id, …)` and this routine is no longer
+    // on the hot path — so scanning N queues here costs us only
+    // during single-queue (Tier 2, `num_cores <= 1`) polling and
+    // during pre-activation DHCP / ARP.
+    let n = unsafe { (*ndev()).negotiated_queue_pairs as usize }
+        .max(1)
+        .min(MAX_QUEUE_PAIRS);
+    let mut total = 0;
+    for qp in 0..n {
+        total += poll_qp(qp, callback);
+    }
+    total
 }
 
 /// Per-queue RX counters. Incremented once per consumed frame.

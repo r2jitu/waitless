@@ -71,7 +71,7 @@ case ",$env_arg," in *,kvm,*)    need_kvm=1 ;; esac
 case ",$env_arg," in *,native,*) need_native=1 ;; esac
 
 if [ $need_kvm -eq 1 ]; then
-    bench_args+=(--elf "\$HOME/$REMOTE_DIR/webserver.elf")
+    bench_args+=(--elf "\$HOME/$REMOTE_DIR/webserver_qemu_x86_64.elf")
 fi
 if [ $need_native -eq 1 ]; then
     bench_args+=(--native-bin "\$HOME/$REMOTE_DIR/webserver_native")
@@ -96,7 +96,12 @@ fi
 # `os.path.dirname(__file__)` — no bazel runfiles machinery.
 sync_files=("$SCRIPT_DIR/bench.py" "$SCRIPT_DIR/bench")
 if [ $need_kvm -eq 1 ]; then
-    ELF="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver.elf"
+    # `webserver.elf` is the host-default-platform build — on an
+    # Apple-Silicon local that's aarch64 and QEMU on the GCP x86_64
+    # host refuses it ("Error while loading elf kernel"). Ship the
+    # explicit x86_64 variant and alias it to `webserver.elf` on the
+    # remote so KvmEnv's `--elf` path resolves unchanged.
+    ELF="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver_qemu_x86_64.elf"
     [ -f "$ELF" ] || { echo "error: $ELF not found; run without --no-build" >&2; exit 1; }
     sync_files+=("$ELF")
 fi
@@ -133,7 +138,10 @@ fi
 echo "==> Syncing files to $SSH_HOST:~/$REMOTE_DIR/..."
 ssh "$SSH_HOST" "mkdir -p ~/$REMOTE_DIR && chmod -R u+w ~/$REMOTE_DIR"
 # rsync preserves mtimes so subsequent runs skip unchanged files.
-rsync -az --partial "${sync_files[@]}" "$SSH_HOST:$REMOTE_DIR/"
+# `-L` dereferences symlinks on the source side — `bazel-bin/...`
+# entries are symlinks into the bazel cache, so a plain `-a` copy
+# would send a broken link to the remote.
+rsync -azL --partial "${sync_files[@]}" "$SSH_HOST:$REMOTE_DIR/"
 
 # Run bench.py on the remote.
 #
