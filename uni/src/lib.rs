@@ -178,7 +178,6 @@ pub mod runtime {
         join, join3, select, select3, timeout_us, Either, Three,
     };
 
-    use alloc::boxed::Box;
     use core::future::Future;
 
     /// Async TCP listener. Wraps `uni_runtime::net::TcpListener` so
@@ -217,9 +216,17 @@ pub mod runtime {
             H: Fn(crate::TcpStream) -> F + Send + Sync + 'static,
             F: Future<Output = ()> + 'static,
         {
-            let body = Box::new(body);
-            let body = Box::leak(body);
-            self.inner.run(move |raw| body(crate::TcpStream::from_raw(raw)))
+            // Arc-capture the user's body so both this wrapper and
+            // the per-accept closure inside `inner.run` can clone.
+            // The Arc drops when `inner`'s fanout ctx drops (driven
+            // by `TcpHandle::drop` freeing its launcher slot), so
+            // the body is reclaimed alongside the listener — no
+            // leak.
+            let body = alloc::sync::Arc::new(body);
+            self.inner.run(move |raw| {
+                let body = alloc::sync::Arc::clone(&body);
+                async move { body(crate::TcpStream::from_raw(raw)).await }
+            })
         }
     }
 }
