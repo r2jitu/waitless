@@ -516,10 +516,13 @@ unsafe fn kernel_boot(info: &BootInfo) {
         }
     }
 
-    // Register callbacks with the kernel event loop.
+    // Register event-loop callbacks. `check_shutdown` reads the
+    // serial port and is NIC-independent — always wire it. The
+    // NIC-specific hooks (poll/drain/flush/rearm/idle) only make
+    // sense when a NIC probed.
+    uni_kernel::eventloop::set_check_shutdown(|| serial::check_shutdown());
     if net_ok {
         net::init_eventloop();
-        uni_kernel::eventloop::set_check_shutdown(|| serial::check_shutdown());
         uni_kernel::eventloop::set_idle(idle_cb);
     }
 
@@ -538,7 +541,6 @@ unsafe fn kernel_boot(info: &BootInfo) {
     // `uni::run(app)` all run while `net_flush_cb`, `net_poll_cb`,
     // etc. are ticking — no separate pre-eventloop phase, no
     // deferred-TX-kick race.
-    let _ = net_ok; // kept to quiet `unused` under no-NIC builds
     uni_boot();
 
     if !uni_kernel::eventloop::is_shutdown() {
