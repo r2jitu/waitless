@@ -128,15 +128,19 @@ impl Net {
             }
         }
 
-        bringup(cfg).await?;
-
         #[cfg(target_os = "none")]
         {
-            // DHCP succeeded (or static was applied) — promote virtio-
-            // net to multi-queue. Host-side RSS then sprays incoming
-            // frames across queue pairs for steady-state traffic.
+            // Promote virtio-net to multi-queue BEFORE DHCP runs.
+            // The old ordering (MQ after DHCP) existed to protect
+            // a single-queue DHCP poll from host-side RSS; the
+            // current DHCP is a `UdpSocket::run_each` fan-out that
+            // sees replies on whichever core they land, so MQ is
+            // transparent — and activating it first means DHCP
+            // already exercises the steady-state NIC config.
             uni_drivers::net::activate_multi_queue();
         }
+
+        bringup(cfg).await?;
 
         // SAFETY: BSP-only access.
         unsafe {
