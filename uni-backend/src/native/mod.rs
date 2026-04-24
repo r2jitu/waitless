@@ -1532,24 +1532,12 @@ static IO_POLL_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SERVICE: AtomicFn<PollFn> = AtomicFn::null();
 static READY: AtomicBool = AtomicBool::new(false);
 
-/// Optional per-worker pre-spawn hook. HTTP-like crates that need
-/// per-worker TCP listeners (SO_REUSEPORT siblings) register here;
-/// `run()` invokes it for workers 1..NUM_THREADS after `uni_boot`
-/// and before `pthread_create`. Apps without per-worker setup
-/// leave it null.
-static ADD_WORKER_LISTENER: AtomicFn<fn(u32)> = AtomicFn::null();
-
-/// Install a per-worker pre-spawn hook — see `ADD_WORKER_LISTENER`.
-pub fn set_add_worker_listener(f: fn(u32)) {
-    ADD_WORKER_LISTENER.store(f);
-}
-
 /// Register an IO poll callback (network, storage, etc). Multiple
 /// sources can be registered; all are called each iteration. Designed
 /// to be called from a single init thread; the atomic fetch_add
 /// reserves the slot index race-free even if that contract is ever
 /// violated.
-pub fn register_io_poll(f: PollFn) {
+fn register_io_poll(f: PollFn) {
     let idx = IO_POLL_COUNT.fetch_add(1, Ordering::AcqRel);
     if idx < IO_POLL_MAX {
         IO_POLL[idx].store(f);
@@ -1649,10 +1637,6 @@ extern "C" fn worker_thread(arg: *mut u8) -> *mut u8 {
 ///   * `shutdown_fn` — called after all workers join, to drop the app
 ///     box and clear the net slot (`uni::shutdown_and_drop`).
 ///
-/// HTTP-like per-worker pre-spawn hooks (SO_REUSEPORT listeners) are
-/// registered separately via `set_add_worker_listener` — they're
-/// optional and only set by `uni-http`, so carrying them here would
-/// force every native app to know about them.
 pub struct RunConfig {
     pub boot_info_fn: fn(num_cpus: u32, ram_bytes: usize),
     pub shutdown_fn: fn(),
@@ -1671,19 +1655,7 @@ pub fn run(config: RunConfig) -> i32 {
 
     unsafe {
         uni_boot();
-        // uni_boot called server.run() → tcp_listen() on thread 0.
-        // In multi-thread mode, tcp_listen() created the shared listen
-        // socket and per-worker handles. If `uni-http` (or similar)
-        // registered a per-worker hook, call it now to create the
-        // remaining worker handles before their threads start.
         let num_threads = NUM_THREADS.load(Ordering::Acquire);
-        if let Some(f) = ADD_WORKER_LISTENER.load() {
-            for i in 1..num_threads {
-                uni_platform::set_current_worker(i as u32);
-                f(i as u32);
-            }
-        }
-        uni_platform::set_current_worker(0);
 
         // Start worker threads
         let mut thread_handles = [0usize; MAX_THREADS];
