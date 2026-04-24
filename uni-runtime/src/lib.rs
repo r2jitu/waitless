@@ -16,8 +16,8 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
-use uni_percpu::timer::{Timer, TimerWheel};
-use uni_percpu::{CurrentCore, PerCpu, MAX_WORKERS};
+use uni_worker::timer::{Timer, TimerWheel};
+use uni_worker::{CurrentWorker, PerWorker, MAX_WORKERS};
 use uni_platform::now_ticks;
 
 // ---- Per-worker timer storage ---------------------------------------------
@@ -25,16 +25,16 @@ use uni_platform::now_ticks;
 struct WheelCell(UnsafeCell<TimerWheel>);
 
 // SAFETY: touched only by its owning worker via
-// `PerCpu::current(&CurrentCore)`.
+// `PerWorker::current(&CurrentWorker)`.
 unsafe impl Sync for WheelCell {}
 unsafe impl Send for WheelCell {}
 
-static WHEELS: PerCpu<WheelCell, MAX_WORKERS> =
-    PerCpu::new([const { WheelCell(UnsafeCell::new(TimerWheel::new())) }; MAX_WORKERS]);
+static WHEELS: PerWorker<WheelCell, MAX_WORKERS> =
+    PerWorker::new([const { WheelCell(UnsafeCell::new(TimerWheel::new())) }; MAX_WORKERS]);
 
-fn wheel(cc: &CurrentCore) -> &mut TimerWheel {
+fn wheel(cc: &CurrentWorker) -> &mut TimerWheel {
     let cell = WHEELS.current(cc);
-    // SAFETY: owning-worker-only; `CurrentCore` proves we're on it.
+    // SAFETY: owning-worker-only; `CurrentWorker` proves we're on it.
     unsafe { &mut *cell.0.get() }
 }
 
@@ -95,8 +95,8 @@ impl TaskArena {
     }
 }
 
-static ARENAS: PerCpu<TaskArena, MAX_WORKERS> =
-    PerCpu::new([const { TaskArena::new() }; MAX_WORKERS]);
+static ARENAS: PerWorker<TaskArena, MAX_WORKERS> =
+    PerWorker::new([const { TaskArena::new() }; MAX_WORKERS]);
 
 // ---- Spawning --------------------------------------------------------------
 
@@ -153,7 +153,7 @@ pub fn spawn<F>(f: F) -> Result<TaskHandle, ()>
 where
     F: Future<Output = ()> + 'static,
 {
-    let cc = CurrentCore::enter();
+    let cc = CurrentWorker::enter();
     let worker_id = cc.id();
     let arena = ARENAS.current(&cc);
     let fut: BoxedFuture = Box::pin(f);
@@ -249,7 +249,7 @@ pub fn tick(worker_id: u32) -> bool {
         return false;
     }
     // SAFETY: caller guarantees `worker_id` is the running worker.
-    let cc = unsafe { CurrentCore::from_id_unchecked(worker_id) };
+    let cc = unsafe { CurrentWorker::from_id_unchecked(worker_id) };
 
     // Spawn per-worker launchers registered by `UdpSocket::run_each`
     // / `TcpListener::run` since this worker last ticked.
@@ -300,7 +300,7 @@ pub fn has_pending(worker_id: u32) -> bool {
         return false;
     }
     // SAFETY: caller guarantees `worker_id` is the running worker.
-    let cc = unsafe { CurrentCore::from_id_unchecked(worker_id) };
+    let cc = unsafe { CurrentWorker::from_id_unchecked(worker_id) };
     if wheel(&cc).count() > 0 {
         return true;
     }
@@ -366,7 +366,7 @@ impl Future for Sleep {
         if !this.timer_scheduled {
             this.waker = Some(cx.waker().clone());
             let self_ptr: *const Sleep = this;
-            let cc = CurrentCore::enter();
+            let cc = CurrentWorker::enter();
             if wheel(&cc).insert(Timer {
                 deadline: this.deadline,
                 func: sleep_fire,
@@ -383,7 +383,7 @@ impl Drop for Sleep {
     fn drop(&mut self) {
         if self.timer_scheduled {
             let self_ptr: *const Sleep = self;
-            let cc = CurrentCore::enter();
+            let cc = CurrentWorker::enter();
             let _ = wheel(&cc).cancel(self_ptr as usize);
         }
     }

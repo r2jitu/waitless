@@ -1,4 +1,4 @@
-// uni-percpu/src/once.rs — `InitOnce<T>`: write-once cell, multi-reader.
+// uni-worker/src/once.rs — `InitOnce<T>`: write-once cell, multi-reader.
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;

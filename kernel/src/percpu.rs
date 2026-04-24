@@ -17,12 +17,12 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::deque::{Deque, Task};
 use crate::spsc;
 
-// `CurrentCore` + `PerCpu<T, N>` now live in `//uni-percpu` so native
+// `CurrentWorker` + `PerWorker<T, N>` now live in `//uni-worker` so native
 // can share them. Kept under the `uni_kernel::percpu` path via re-export
 // so existing callers don't shift.
-pub use uni_percpu::{CurrentCore, PerCpu, MAX_WORKERS};
+pub use uni_worker::{CurrentWorker, PerWorker, MAX_WORKERS};
 
-/// Maximum number of cores. Alias for `uni_percpu::MAX_WORKERS` kept
+/// Maximum number of cores. Alias for `uni_worker::MAX_WORKERS` kept
 /// for readability inside the kernel.
 pub const MAX_CORES: usize = MAX_WORKERS;
 
@@ -228,11 +228,11 @@ impl PerCore {
 }
 
 /// Global array of per-core state. Initialized by core 0 during boot
-/// (single-threaded), then read-shared from all cores via the `PerCpu`
+/// (single-threaded), then read-shared from all cores via the `PerWorker`
 /// primitive (which encapsulates the `[UnsafeCell<T>; N]` + per-core
 /// indexing pattern that this module used to open-code).
-static CORES: PerCpu<PerCore, MAX_CORES> =
-    PerCpu::new([const { PerCore::new(0) }; MAX_CORES]);
+static CORES: PerWorker<PerCore, MAX_CORES> =
+    PerWorker::new([const { PerCore::new(0) }; MAX_CORES]);
 
 /// Number of online cores. Set once by `init()` on the BSP, then read
 /// by every core. AtomicU32 with Relaxed ordering — there is no other
@@ -281,12 +281,12 @@ pub fn num_cores() -> u32 {
     NUM_CORES.load(core::sync::atomic::Ordering::Acquire)
 }
 
-// `CurrentCore` used to expose a `.percore()` convenience that walked
+// `CurrentWorker` used to expose a `.percore()` convenience that walked
 // the kernel-specific `CORES` array; now that the token is shared with
-// native (which has no `PerCore`) it lives in `uni-percpu`. This free
+// native (which has no `PerCore`) it lives in `uni-worker`. This free
 // function fills the same role for bare-metal callers.
 #[inline(always)]
-pub fn percore(cc: &CurrentCore) -> &'static PerCore {
+pub fn percore(cc: &CurrentWorker) -> &'static PerCore {
     CORES.current(cc)
 }
 

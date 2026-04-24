@@ -19,7 +19,7 @@ rust_library(
     ],
     crate_name = "uni_backend",
     deps = [
-        "//uni-percpu",
+        "//uni-worker",
         "//uni-platform",
         "//uni-runtime",
     ] + select({

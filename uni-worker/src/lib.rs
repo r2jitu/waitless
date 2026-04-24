@@ -1,14 +1,14 @@
-// uni-percpu/src/lib.rs — Cross-platform per-worker primitives.
+// uni-worker/src/lib.rs — Cross-platform per-worker primitives.
 //
-// `CurrentCore` — zero-sized token whose existence proves the holder
+// `CurrentWorker` — zero-sized token whose existence proves the holder
 // is running on a specific worker (core on bare-metal, POSIX thread
-// on native). Obtained via `CurrentCore::enter()`, which calls
+// on native). Obtained via `CurrentWorker::enter()`, which calls
 // `uni_platform::current_worker()` directly — cfg-gated asm on
 // bare-metal, thread-local on native.
 //
-// `PerCpu<T, N>` — typed array of `N` slots indexed by worker id.
+// `PerWorker<T, N>` — typed array of `N` slots indexed by worker id.
 // `T` provides its own interior mutability (`Atomic*`, `UnsafeCell`
-// behind owning-worker discipline, `Mutex`, …); the `&CurrentCore`
+// behind owning-worker discipline, `Mutex`, …); the `&CurrentWorker`
 // accessor is safe by construction.
 
 #![no_std]
@@ -27,7 +27,7 @@ pub use once::InitOnce;
 pub const MAX_WORKERS: usize = 8;
 
 // ============================================================================
-// CurrentCore — ZST proof-of-current-worker token.
+// CurrentWorker — ZST proof-of-current-worker token.
 // ============================================================================
 
 /// Token proving that the holder is currently running on the worker
@@ -35,17 +35,17 @@ pub const MAX_WORKERS: usize = 8;
 /// thread / core (`!Send + !Sync` via `PhantomData<*mut ()>`), so
 /// its existence carries a strict happens-on-this-worker invariant.
 #[derive(Clone, Copy)]
-pub struct CurrentCore {
+pub struct CurrentWorker {
     id: u32,
     _not_send: PhantomData<*mut ()>,
 }
 
-impl CurrentCore {
+impl CurrentWorker {
     /// Read the current worker id from `uni_platform` and bind it
     /// into a token.
     #[inline(always)]
     pub fn enter() -> Self {
-        CurrentCore {
+        CurrentWorker {
             id: uni_platform::current_worker(),
             _not_send: PhantomData,
         }
@@ -58,10 +58,10 @@ impl CurrentCore {
     /// SAFETY: caller must guarantee that `id == uni_platform::
     /// current_worker()` at the time of the call AND that the token
     /// does not outlive the iteration (which can never cross threads
-    /// because `CurrentCore` is `!Send`).
+    /// because `CurrentWorker` is `!Send`).
     #[inline(always)]
     pub unsafe fn from_id_unchecked(id: u32) -> Self {
-        CurrentCore {
+        CurrentWorker {
             id,
             _not_send: PhantomData,
         }
@@ -75,27 +75,27 @@ impl CurrentCore {
 }
 
 // ============================================================================
-// PerCpu<T, N> — typed per-worker array.
+// PerWorker<T, N> — typed per-worker array.
 // ============================================================================
 //
-// N slots of T, each wrapped in `UnsafeCell<T>` so the same `&PerCpu`
+// N slots of T, each wrapped in `UnsafeCell<T>` so the same `&PerWorker`
 // can hand out references to different slots. `T` is responsible for
 // its own interior mutability.
 
 /// Typed per-worker array of `N` slots of `T`.
 #[repr(transparent)]
-pub struct PerCpu<T, const N: usize> {
+pub struct PerWorker<T, const N: usize> {
     slots: [UnsafeCell<T>; N],
 }
 
-// SAFETY: PerCpu provides shared (`&T`) access only. T is responsible
+// SAFETY: PerWorker provides shared (`&T`) access only. T is responsible
 // for its own interior mutability (Atomic*, UnsafeCell, Mutex, …).
 // We require T: Sync because cross-worker read access is shared, and
 // T: Send because the slot is logically transferable between workers
 // (though in practice each slot is owned by one worker).
-unsafe impl<T: Sync + Send, const N: usize> Sync for PerCpu<T, N> {}
+unsafe impl<T: Sync + Send, const N: usize> Sync for PerWorker<T, N> {}
 
-impl<T, const N: usize> PerCpu<T, N> {
+impl<T, const N: usize> PerWorker<T, N> {
     /// Construct from an array of N initial values. Const-callable so
     /// the array can live in a `static`.
     #[inline]
@@ -108,18 +108,18 @@ impl<T, const N: usize> PerCpu<T, N> {
             let cells = core::mem::ManuallyDrop::new(values);
             core::ptr::read(&cells as *const _ as *const [UnsafeCell<T>; N])
         };
-        PerCpu { slots: cells }
+        PerWorker { slots: cells }
     }
 
     /// Get a shared reference to the slot for the current worker.
-    /// Safe by construction: the `&CurrentCore` token proves the
+    /// Safe by construction: the `&CurrentWorker` token proves the
     /// caller's identity, and `T`'s interior mutability provides the
     /// actual mutation synchronisation.
     #[inline(always)]
-    pub fn current(&self, cc: &CurrentCore) -> &T {
+    pub fn current(&self, cc: &CurrentWorker) -> &T {
         // SAFETY: cc.id() is the calling worker's id; reading from
         // the slot returns a `&T` whose mutation discipline is T's
-        // job. PerCpu just guarantees that two different workers get
+        // job. PerWorker just guarantees that two different workers get
         // different slots.
         unsafe { &*self.slots[cc.id() as usize].get() }
     }

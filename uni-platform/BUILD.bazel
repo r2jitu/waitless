@@ -5,7 +5,7 @@ package(default_visibility = ["//visibility:public"])
 # Leaf crate: cfg-gated `current_worker()` and `now_ticks()`. Bare-metal
 # uses inline asm (TPIDR_EL1 / GS_BASE / cntvct / rdtsc); native uses
 # std thread-local + Instant. Replaces the old `Runtime`
-# register/AtomicPtr hook pattern with direct calls — `uni-percpu` and
+# register/AtomicPtr hook pattern with direct calls — `uni-worker` and
 # `uni-runtime` depend here and inline through. Boot-time contract
 # documented in src/lib.rs.
 rust_library(

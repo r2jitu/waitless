@@ -1038,7 +1038,7 @@ static TX_LOCK: uni_kernel::sync::Spinlock<()> = uni_kernel::sync::Spinlock::new
 ///     optimisation — it lets `send()` stay non-blocking on hot paths while
 ///     a single core drains all rings under one lock acquisition.
 fn send(data: &[u8]) {
-    let cc = uni_kernel::percpu::CurrentCore::enter();
+    let cc = uni_kernel::percpu::CurrentWorker::enter();
     let id = cc.id();
     let nqp = unsafe { (*ndev()).num_queue_pairs };
     if nqp > 1 && (id as u16) < nqp {

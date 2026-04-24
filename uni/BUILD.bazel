@@ -20,7 +20,7 @@ rust_library(
     deps = [
         "//uni-backend",
         "//uni-net",
-        "//uni-percpu",
+        "//uni-worker",
         "//uni-runtime",
     ] + select({
         "//bazel/platforms:native": [],
@@ -33,5 +33,5 @@ rust_test(
     size = "small",
     srcs = ["src/boot_info.rs"],
     crate_root = "src/boot_info.rs",
-    deps = ["//uni-percpu"],
+    deps = ["//uni-worker"],
 )

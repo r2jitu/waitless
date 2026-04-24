@@ -208,7 +208,7 @@ impl TcpConnection {
 // Each `TcpConnection` is wrapped in `TcpConnCell` (an `UnsafeCell`
 // newtype) so cores share the `POOLS` static via shared references
 // rather than aliased `&mut`. The outer per-core array is held in
-// `uni_kernel::percpu::PerCpu`, which provides typed `current(&CurrentCore)`
+// `uni_kernel::percpu::PerWorker`, which provides typed `current(&CurrentWorker)`
 // access without manual unsafe at the call site.
 //
 // SAFETY discipline (enforced by flow-hash routing in net/lib.rs and by
@@ -231,8 +231,8 @@ impl TcpConnCell {
 
 type CoreSlots = [TcpConnCell; CONNECTIONS_PER_CORE];
 
-static POOLS: uni_kernel::percpu::PerCpu<CoreSlots, MAX_CORES> =
-    uni_kernel::percpu::PerCpu::new(
+static POOLS: uni_kernel::percpu::PerWorker<CoreSlots, MAX_CORES> =
+    uni_kernel::percpu::PerWorker::new(
         [const { [const { TcpConnCell::new() }; CONNECTIONS_PER_CORE] }; MAX_CORES],
     );
 
@@ -268,8 +268,8 @@ impl TcpHashCore {
     }
 }
 
-static TCP_HASH: uni_kernel::percpu::PerCpu<TcpHashCore, MAX_CORES> =
-    uni_kernel::percpu::PerCpu::new(
+static TCP_HASH: uni_kernel::percpu::PerWorker<TcpHashCore, MAX_CORES> =
+    uni_kernel::percpu::PerWorker::new(
         [const { TcpHashCore::new() }; MAX_CORES],
     );
 

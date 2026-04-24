@@ -1,4 +1,4 @@
-// uni-percpu/src/timer.rs — Per-worker timer wheel.
+// uni-worker/src/timer.rs — Per-worker timer wheel.
 //
 // Simple single-level timer wheel with fixed tick granularity.
 // Each worker has its own wheel — no synchronization needed for

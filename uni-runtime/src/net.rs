@@ -48,7 +48,7 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU16, AtomicU32, Ordering};
 use core::task::{Context, Poll, Waker};
 
-use uni_percpu::{CurrentCore, PerCpu, MAX_WORKERS};
+use uni_worker::{CurrentWorker, PerWorker, MAX_WORKERS};
 
 // ---- Sizing -----------------------------------------------------------------
 
@@ -149,7 +149,7 @@ fn install_worker_task(
     handles: &[SpinLock<Option<crate::TaskHandle>>; MAX_WORKERS],
     h: crate::TaskHandle,
 ) {
-    let cc = CurrentCore::enter();
+    let cc = CurrentWorker::enter();
     let mut slot = handles[cc.id() as usize].lock();
     if stopping.load(Ordering::Acquire) {
         drop(slot);
@@ -249,7 +249,7 @@ impl WorkerInbox {
 
 struct UdpState {
     port: AtomicU16,
-    inboxes: PerCpu<WorkerInbox, MAX_WORKERS>,
+    inboxes: PerWorker<WorkerInbox, MAX_WORKERS>,
 }
 
 const fn fresh_inboxes() -> [WorkerInbox; MAX_WORKERS] {
@@ -260,7 +260,7 @@ impl UdpState {
     const fn new() -> Self {
         UdpState {
             port: AtomicU16::new(0),
-            inboxes: PerCpu::new(fresh_inboxes()),
+            inboxes: PerWorker::new(fresh_inboxes()),
         }
     }
 }
@@ -464,7 +464,7 @@ impl UdpSocket {
     /// typically loops on `recv_from` to drive the per-worker
     /// inbox. Use this when the sync `run_each` doesn't fit
     /// (async per-datagram work, batched reads, cross-message
-    /// state not expressible via `PerCpu`).
+    /// state not expressible via `PerWorker`).
     ///
     /// Returns a [`UdpHandle`] whose `Drop` aborts the per-worker
     /// recv tasks and releases the port.
@@ -611,7 +611,7 @@ impl<'a> Future for UdpRecv<'a> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let cc = CurrentCore::enter();
+        let cc = CurrentWorker::enter();
         let inbox = UDP_REGISTRY[this.sock.idx].inboxes.current(&cc);
 
         // Fast path: data already in this worker's inbox.
@@ -637,7 +637,7 @@ impl<'a> Future for UdpRecv<'a> {
 /// called from the network RX path on the core that received the
 /// packet. Returns `true` if a socket was found.
 pub fn deliver_udp(dst_port: u16, src_ip: [u8; 4], src_port: u16, payload: &[u8]) -> bool {
-    let cc = CurrentCore::enter();
+    let cc = CurrentWorker::enter();
     for state in UDP_REGISTRY.iter() {
         if state.port.load(Ordering::Acquire) == dst_port {
             let inbox = state.inboxes.current(&cc);
@@ -720,7 +720,7 @@ struct TcpState {
     /// Per-worker waker slot. Backend `deliver_tcp_ready` fires on
     /// the core that has the newly-accept-able conn; the waker
     /// wakes a task on that same core.
-    wakers: PerCpu<SpinLock<Option<Waker>>, MAX_WORKERS>,
+    wakers: PerWorker<SpinLock<Option<Waker>>, MAX_WORKERS>,
 }
 
 const fn fresh_waker_slots() -> [SpinLock<Option<Waker>>; MAX_WORKERS] {
@@ -731,7 +731,7 @@ impl TcpState {
     const fn new() -> Self {
         TcpState {
             port: AtomicU16::new(0),
-            wakers: PerCpu::new(fresh_waker_slots()),
+            wakers: PerWorker::new(fresh_waker_slots()),
         }
     }
 }
@@ -1037,7 +1037,7 @@ impl<'a> Future for TcpAccept<'a> {
         }
 
         // Register waker on this worker's slot, then re-check.
-        let cc = CurrentCore::enter();
+        let cc = CurrentWorker::enter();
         let state = &TCP_REGISTRY[this.listener.idx];
         store_waker_if_needed(state.wakers.current(&cc), cx.waker());
 
@@ -1186,7 +1186,7 @@ impl<'a> Future for TcpSend<'a> {
 /// kqueue/epoll fired for the listen fd). Returns `true` if a
 /// matching listener was found.
 pub fn deliver_tcp_ready(dst_port: u16) -> bool {
-    let cc = CurrentCore::enter();
+    let cc = CurrentWorker::enter();
     for state in TCP_REGISTRY.iter() {
         if state.port.load(Ordering::Acquire) == dst_port {
             let taken = state.wakers.current(&cc).lock().take();

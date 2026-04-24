@@ -52,7 +52,7 @@ rust_library(
     target_compatible_with = ["@platforms//os:none"],
     deps = [
         "//uni-runtime",
-        "//uni-percpu",
+        "//uni-worker",
         "//uni-platform",
         "//util/atomic_fn",
         "@crates//:chacha20",
@@ -96,5 +96,5 @@ rust_test(
     crate_root = "src/sync.rs",
 )
 
-# timer_test moved to //uni-percpu:timer_test — the wheel now lives
+# timer_test moved to //uni-worker:timer_test — the wheel now lives
 # there so both backends can share it.

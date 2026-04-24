@@ -8,7 +8,7 @@
 // Both are cfg-gated between bare-metal (inline asm, populated by the
 // kernel's boot code) and native (std thread-local + Instant). The
 // implementation lives here rather than going through a
-// `register(&Runtime)` hook at a higher crate so `uni-percpu` and
+// `register(&Runtime)` hook at a higher crate so `uni-worker` and
 // `uni-runtime` can just call and inline, without the cross-crate
 // plug-in dance.
 //

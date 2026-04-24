@@ -41,7 +41,7 @@
 use alloc::boxed::Box;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
-use uni_percpu::MAX_WORKERS;
+use uni_worker::MAX_WORKERS;
 
 /// Type-erased launcher closure. Captures any state needed for the
 /// per-worker fan-out (typically `Arc`s shared with the owning

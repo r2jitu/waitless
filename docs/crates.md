@@ -24,7 +24,7 @@ directly.
 |-----------------------------|-------------------------|-----------------------------------------------|
 | `//uni-backend`             | `uni_backend`           | Platform adapter (bare / native)              |
 | `//uni-runtime`             | `uni_runtime`           | Async executor (TaskSlot + Sleep)             |
-| `//uni-percpu`              | `uni_percpu`            | `PerCpu<T, N>`, `TimerWheel`                  |
+| `//uni-worker`              | `uni_worker`            | `PerWorker<T, N>`, `CurrentWorker`, `TimerWheel` |
 | `//uni-platform`            | `uni_platform`          | Leaf: `current_worker()`, `now_ticks()`       |
 | `//uni-driver-virtio-net`   | `uni_driver_virtio_net` | virtio-net NIC driver                         |
 | `//uni-driver-gve`          | `uni_driver_gve`        | GCE gVNIC NIC driver                          |

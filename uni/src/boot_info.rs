@@ -11,7 +11,7 @@
 // Self-contained (only `core::`) so the file can compile as a
 // standalone rust_test target for host-native unit tests.
 
-use uni_percpu::InitOnce;
+use uni_worker::InitOnce;
 
 /// Maximum number of NICs describable in a single `BootInfo`. The
 /// kernel currently activates at most one NIC per boot; four slots
