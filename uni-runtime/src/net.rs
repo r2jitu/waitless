@@ -984,6 +984,13 @@ fn register_net_launcher(launcher: BoxedLauncher) {
 /// Spawn every net launcher added since `worker_id` last called
 /// here. Runs once per `uni_runtime::tick()` — a no-op when the
 /// cursor is already caught up, which is the common case.
+///
+/// `register_net_launcher` does `fetch_add(count)` and then
+/// `store(slot)` as two separate ops, so a reader can observe the
+/// incremented count before the matching slot is published. We stop
+/// at the first null slot rather than skipping it, so the next
+/// tick re-tries; skipping + advancing the cursor would drop the
+/// registration permanently.
 pub fn fire_pending_net_launchers(worker_id: u32) {
     if (worker_id as usize) >= MAX_WORKERS {
         return;
@@ -995,10 +1002,13 @@ pub fn fire_pending_net_launchers(worker_id: u32) {
     if fired >= total {
         return;
     }
-    for slot in NET_LAUNCHERS.iter().take(total).skip(fired) {
-        let p = slot.load(Ordering::Acquire);
+    let mut new_fired = fired;
+    for i in fired..total {
+        let p = NET_LAUNCHERS[i].load(Ordering::Acquire);
         if p.is_null() {
-            continue;
+            // Registration mid-flight (fetch_add done, store not
+            // yet visible). Stop here; the next tick catches up.
+            break;
         }
         // SAFETY: `p` was obtained from `Box::into_raw(Box::new(
         // BoxedLauncher{..}))` in `register_net_launcher`. Outer
@@ -1006,6 +1016,10 @@ pub fn fire_pending_net_launchers(worker_id: u32) {
         // store and load.
         let launcher: &BoxedLauncher = unsafe { &*p };
         launcher();
+        new_fired = i + 1;
     }
-    NET_LAUNCHER_FIRED[worker_id as usize].store(total, Ordering::Relaxed);
+    if new_fired > fired {
+        NET_LAUNCHER_FIRED[worker_id as usize]
+            .store(new_fired, Ordering::Relaxed);
+    }
 }

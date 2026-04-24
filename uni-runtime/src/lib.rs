@@ -300,18 +300,31 @@ pub fn tick(worker_id: u32) -> bool {
     // Fire every per-worker startup hook registered since this
     // worker last ticked. See `startup::pending_range` for the
     // cursor rule; unit-tested in `uni-runtime/src/startup.rs`.
+    //
+    // `spawn_on_each_worker` publishes in two steps (fetch_add then
+    // store), so a reader can see the bumped count before the slot
+    // is visible. Stop at the first unpublished slot rather than
+    // skipping it, so the next tick re-tries — skipping + advancing
+    // would drop the registration permanently.
     {
         let total = STARTUP_HOOK_COUNT.load(Ordering::Acquire);
         let fired = STARTUP_FIRED_COUNT[worker_id as usize].load(Ordering::Relaxed);
         let range = pending_range(total, fired);
         if !range.is_empty() {
-            for slot in PER_WORKER_STARTUP.iter().take(range.end).skip(range.start) {
-                if let Some(f) = slot.load() {
-                    f();
+            let mut new_fired = range.start;
+            for i in range.clone() {
+                match PER_WORKER_STARTUP[i].load() {
+                    Some(f) => {
+                        f();
+                        new_fired = i + 1;
+                    }
+                    None => break,
                 }
             }
-            STARTUP_FIRED_COUNT[worker_id as usize]
-                .store(range.end, Ordering::Relaxed);
+            if new_fired > range.start {
+                STARTUP_FIRED_COUNT[worker_id as usize]
+                    .store(new_fired, Ordering::Relaxed);
+            }
         }
     }
     // Spawn per-worker launchers registered by `UdpSocket::run_each`

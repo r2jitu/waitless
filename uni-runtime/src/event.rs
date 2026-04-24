@@ -49,14 +49,14 @@ impl AsyncEvent {
         self.set.load(Ordering::Acquire)
     }
 
-    /// Flip the flag and wake any parked waiter. Cheap on the happy
-    /// path (already set → fetch_or short-circuits, no waker touch).
+    /// Flip the flag and wake any parked waiter. Cheap on the
+    /// already-set path (swap returns true → the earlier setter
+    /// already woke whoever was parked).
     pub fn set(&self) {
         if self.set.swap(true, Ordering::AcqRel) {
-            return; // already set; waiter (if any) was already scheduled
+            return;
         }
-        let w = self.take_waker();
-        if let Some(w) = w {
+        if let Some(w) = self.take_waker() {
             w.wake();
         }
     }
