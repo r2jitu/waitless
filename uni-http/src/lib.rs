@@ -319,45 +319,30 @@ impl Server {
     /// be `&'static` — the accept closure captures it; the ref
     /// outlives every spawned connection task. `.leak()` the
     /// returned `TcpHandle` if the listener is app-lifetime.
-    pub fn listen(&'static self, port: u16) -> uni::runtime::TcpHandle {
-        match uni::runtime::TcpListener::bind(port) {
-            Ok(listener) => {
-                uni::log(b"http: listening (plain)\n");
-                listener.run(move |stream| handle_plain_conn(self, stream))
-            }
-            Err(_) => {
-                uni::log(b"http: failed to bind HTTP listener\n");
-                // Propagate by re-binding port 0 so the caller gets
-                // a Drop-cleanly-at-scope-end TcpHandle rather than
-                // a half-constructed state.
-                uni::runtime::TcpListener::bind(0)
-                    .expect("bind(0)")
-                    .run(|_| async {})
-            }
-        }
+    pub fn listen(
+        &'static self,
+        port: u16,
+    ) -> Result<uni::runtime::TcpHandle, uni::runtime::TcpBindError> {
+        let listener = uni::runtime::TcpListener::bind(port)?;
+        uni::log(b"http: listening (plain)\n");
+        Ok(listener.run(move |stream| handle_plain_conn(self, stream)))
     }
 
     /// Start an HTTPS (TLS 1.3) listener on `port`. Requires a
     /// TLS adapter to have been installed via `install_tls()`;
     /// panics otherwise since the misconfiguration is a boot-time
     /// bug, not a runtime condition apps recover from.
-    pub fn listen_tls(&'static self, port: u16) -> uni::runtime::TcpHandle {
+    pub fn listen_tls(
+        &'static self,
+        port: u16,
+    ) -> Result<uni::runtime::TcpHandle, uni::runtime::TcpBindError> {
         assert!(
             self.tls_adapter.is_some(),
             "Server::listen_tls called without install_tls",
         );
-        match uni::runtime::TcpListener::bind(port) {
-            Ok(listener) => {
-                uni::log(b"http: listening (TLS)\n");
-                listener.run(move |stream| handle_tls_conn(self, stream))
-            }
-            Err(_) => {
-                uni::log(b"http: failed to bind HTTPS listener\n");
-                uni::runtime::TcpListener::bind(0)
-                    .expect("bind(0)")
-                    .run(|_| async {})
-            }
-        }
+        let listener = uni::runtime::TcpListener::bind(port)?;
+        uni::log(b"http: listening (TLS)\n");
+        Ok(listener.run(move |stream| handle_tls_conn(self, stream)))
     }
 
     fn find_handler(&self, path: &[u8]) -> Option<Handler> {

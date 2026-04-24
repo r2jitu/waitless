@@ -29,7 +29,10 @@ impl HelloApp {
         let mut server = Server::new_boxed();
         server.default_handler(hello);
         let server: &'static Server = alloc::boxed::Box::leak(server);
-        server.listen(uni::config_port(80)).leak();
+        server
+            .listen(uni::config_port(80))
+            .expect("HelloApp: TCP listener bind failed")
+            .leak();
         HelloApp { _net: net }
     }
 }

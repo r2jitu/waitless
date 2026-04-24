@@ -114,9 +114,15 @@ impl WebServerApp {
         // directly; no globals. Handles get `.leak()`'d for
         // app-lifetime serving.
         let server: &'static Server = alloc::boxed::Box::leak(server);
-        server.listen(http_port).leak();
+        match server.listen(http_port) {
+            Ok(h) => h.leak(),
+            Err(_) => uni::log(b"http: bind FAILED\n"),
+        }
         if server.has_tls() {
-            server.listen_tls(https_port).leak();
+            match server.listen_tls(https_port) {
+                Ok(h) => h.leak(),
+                Err(_) => uni::log(b"https: bind FAILED\n"),
+            }
         }
 
         uni::log(b"Entering event loop.\n");
