@@ -40,6 +40,7 @@
 // the socket (one per worker, via `spawn_on_each_worker`).
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::marker::PhantomData;
@@ -291,10 +292,22 @@ pub enum UdpBindError {
 pub struct UdpSocket {
     port: u16,
     idx: usize,
+    /// `UdpHandle::Drop` releases the port slot and calls the
+    /// backend's unbind hook eagerly so a subsequent
+    /// `bind(same_port)` works without waiting for aborted tasks
+    /// to actually drop their `Arc<UdpSocket>` clones. This flag
+    /// makes the later `UdpSocket::Drop` (on the last Arc drop) a
+    /// no-op. Plain `bind + drop` paths leave it clear and get
+    /// the release here.
+    released: AtomicBool,
 }
 
 impl Drop for UdpSocket {
     fn drop(&mut self) {
+        if self.released.swap(true, Ordering::AcqRel) {
+            // Already released by `UdpHandle::Drop`.
+            return;
+        }
         // Order matters: clear the registry slot first (so the
         // port is immediately available for a new bind on this
         // thread) and only then notify the backend. Native's
@@ -335,7 +348,11 @@ impl UdpSocket {
                         return Err(UdpBindError::BackendFailed);
                     }
                 }
-                return Ok(UdpSocket { port, idx });
+                return Ok(UdpSocket {
+                    port,
+                    idx,
+                    released: AtomicBool::new(false),
+                });
             }
         }
         Err(UdpBindError::AllSlotsBusy)
@@ -381,78 +398,95 @@ impl UdpSocket {
     where
         H: Fn([u8; 4], u16, &[u8]) + Send + Sync + 'static,
     {
-        // Leak the handler to `&'static` so each worker's spawn
-        // can move a copy of the reference into its async block —
-        // the outer closure we hand to `run_loop` is `Fn`, which
-        // can't yield a borrow to its inner async state.
-        let handler: &'static H = Box::leak(Box::new(handler));
-        self.run_loop(move |sock| async move {
-            let mut buf = [0u8; MAX_PAYLOAD];
-            loop {
-                let (src_ip, src_port, n) = sock.recv_from(&mut buf).await;
-                handler(src_ip, src_port, &buf[..n]);
-            }
-        })
+        let handler = Arc::new(handler);
+        self.run_loop_boxed(Box::new(move |sock: Arc<UdpSocket>| {
+            let handler = Arc::clone(&handler);
+            Box::pin(async move {
+                let mut buf = [0u8; MAX_PAYLOAD];
+                loop {
+                    let (src_ip, src_port, n) = sock.recv_from(&mut buf).await;
+                    handler(src_ip, src_port, &buf[..n]);
+                }
+            })
+        }))
     }
 
     /// Escape hatch: custom async body, spawned once per worker.
-    /// The body receives `&'static UdpSocket` and typically loops on
-    /// `recv_from` to drive the per-worker inbox. Use this when the
-    /// sync `run_each` doesn't fit (async per-datagram work, batched
-    /// reads, cross-message state not expressible via `PerCpu`).
+    /// The body receives `Arc<UdpSocket>` (owned ref — the task's
+    /// future owns its clone, so lifetime is `'static`) and
+    /// typically loops on `recv_from` to drive the per-worker
+    /// inbox. Use this when the sync `run_each` doesn't fit
+    /// (async per-datagram work, batched reads, cross-message
+    /// state not expressible via `PerCpu`).
     ///
     /// Returns a [`UdpHandle`] whose `Drop` aborts the per-worker
     /// recv tasks and releases the port.
     pub fn run_loop<H, F>(self, body: H) -> UdpHandle
     where
-        H: Fn(&'static UdpSocket) -> F + Send + Sync + 'static,
+        H: Fn(Arc<UdpSocket>) -> F + Send + Sync + 'static,
         F: Future<Output = ()> + 'static,
     {
-        // The socket + fanout context stay heap-allocated for the
-        // duration of the spawned recv tasks. We can't safely free
-        // them on UdpHandle drop because the aborted tasks don't
-        // actually drop their futures until each owning worker's
-        // next tick — and those futures hold `&'static UdpSocket`.
-        // Leaking ~100 bytes per `run_each` is the pragmatic
-        // choice; the port slot (the finite resource) is reclaimed
-        // cleanly.
-        let leaked: &'static UdpSocket = Box::leak(Box::new(self));
-        let ctx: &'static UdpFanoutCtx = Box::leak(Box::new(UdpFanoutCtx::new()));
-        register_net_launcher(Box::new(move || {
-            if ctx.stopping.load(Ordering::Acquire) {
+        self.run_loop_boxed(Box::new(move |sock| Box::pin(body(sock))))
+    }
+
+    fn run_loop_boxed(self, body: BoxedBody) -> UdpHandle {
+        let ctx = Arc::new(UdpFanoutCtx {
+            sock: Arc::new(self),
+            body,
+            stopping: AtomicBool::new(false),
+            handles: [const { SpinLock::new(None) }; MAX_WORKERS],
+        });
+        // Launcher captures a strong `Arc<ctx>` clone. When
+        // `UdpHandle::drop` frees the launcher slot, the captured
+        // clone drops; if it was the last one, `Arc<ctx>` drops
+        // (cascading `sock` Arc drop and thus `UdpSocket::Drop`),
+        // so there's no permanent leak.
+        let ctx_for_launcher = Arc::clone(&ctx);
+        let launcher_slot = register_net_launcher(Box::new(move || {
+            if ctx_for_launcher.stopping.load(Ordering::Acquire) {
                 return;
             }
-            let fut = body(leaked);
+            let sock = Arc::clone(&ctx_for_launcher.sock);
+            let fut = (ctx_for_launcher.body)(sock);
             if let Ok(h) = crate::spawn(fut) {
                 let cc = CurrentCore::enter();
-                *ctx.handles[cc.id() as usize].lock() = Some(h);
+                *ctx_for_launcher.handles[cc.id() as usize].lock() = Some(h);
+                // Re-check `stopping` — we might have raced with
+                // `UdpHandle::drop` between our first check and
+                // the task-handle register; if so, abort the task
+                // we just spawned.
+                if ctx_for_launcher.stopping.load(Ordering::Acquire) {
+                    let h = ctx_for_launcher.handles[cc.id() as usize].lock().take();
+                    if let Some(h) = h {
+                        h.abort();
+                    }
+                }
             }
         }));
-        UdpHandle { sock: leaked, ctx }
+        UdpHandle { ctx, launcher_slot }
     }
 }
 
 // ---- UdpHandle: owning reference returned by run_each / run_loop --
 
-/// Per-fanout coordination: a stop flag and one `TaskHandle` slot
-/// per worker. Producer (the launcher) fills a slot on its
-/// worker's tick; consumer (`UdpHandle::drop`) aborts every filled
-/// slot. Leaked alongside the socket — see `run_loop`.
+type BoxedBody = Box<
+    dyn Fn(Arc<UdpSocket>) -> Pin<Box<dyn Future<Output = ()>>>
+        + Send + Sync + 'static,
+>;
+
+/// Per-fanout shared state: the socket, the user's body closure,
+/// a stop flag, and one `TaskHandle` slot per worker. Owned by
+/// `UdpHandle` (strong `Arc`) and by the launcher closure inside
+/// `NET_LAUNCHERS` (strong `Arc`). When `UdpHandle::drop` frees
+/// the launcher slot, the only strong ref left is the handle's
+/// own clone; dropping it drops `UdpFanoutCtx`, which drops
+/// `Arc<UdpSocket>`, which (on the last worker's per-task Arc
+/// release) runs `UdpSocket::Drop`.
 struct UdpFanoutCtx {
-    /// Set by `UdpHandle::drop`. Checked by launchers that haven't
-    /// fired yet so late ticks don't spawn zombie tasks after the
-    /// handle is gone.
+    sock: Arc<UdpSocket>,
+    body: BoxedBody,
     stopping: AtomicBool,
     handles: [SpinLock<Option<crate::TaskHandle>>; MAX_WORKERS],
-}
-
-impl UdpFanoutCtx {
-    fn new() -> Self {
-        UdpFanoutCtx {
-            stopping: AtomicBool::new(false),
-            handles: [const { SpinLock::new(None) }; MAX_WORKERS],
-        }
-    }
 }
 
 /// Owning handle to a running `UdpSocket` fanout. Use via `Deref`
@@ -462,8 +496,8 @@ impl UdpFanoutCtx {
 #[must_use = "UdpHandle stops the recv tasks and releases the port \
               on drop; for a long-lived listener call .leak()"]
 pub struct UdpHandle {
-    sock: &'static UdpSocket,
-    ctx: &'static UdpFanoutCtx,
+    ctx: Arc<UdpFanoutCtx>,
+    launcher_slot: usize,
 }
 
 impl UdpHandle {
@@ -478,14 +512,16 @@ impl UdpHandle {
 impl core::ops::Deref for UdpHandle {
     type Target = UdpSocket;
     fn deref(&self) -> &UdpSocket {
-        self.sock
+        &self.ctx.sock
     }
 }
 
 impl Drop for UdpHandle {
     fn drop(&mut self) {
-        // 1. Block any launcher that hasn't fired yet on a worker
-        //    that has not ticked since run_loop was called.
+        // 1. Block any launcher that hasn't fired yet. Store
+        //    first so any worker that proceeds past the `stopping`
+        //    check after `handles` is iterated still sees `true`
+        //    on its re-check in the launcher closure.
         self.ctx.stopping.store(true, Ordering::Release);
         // 2. Abort tasks already spawned. `TaskHandle::abort` is
         //    cross-worker-safe: sets the abort flag + forces a
@@ -496,15 +532,26 @@ impl Drop for UdpHandle {
                 h.abort();
             }
         }
-        // 3. Release the port slot + notify the backend.
-        //    Bypasses `UdpSocket::Drop` because we only hold a
-        //    `&'static UdpSocket` — the owned `UdpSocket` was moved
-        //    into `Box::leak` up in `run_loop`, so its Drop never
-        //    runs; we have to mirror its cleanup here.
-        REGISTRY[self.sock.idx].port.store(0, Ordering::Release);
-        if let Some(hook) = BACKEND_UDP_UNBIND.load() {
-            hook(self.sock.port);
+        // 3. Eager port release so a subsequent `bind(same_port)`
+        //    succeeds without waiting for aborted tasks to
+        //    actually drop their `Arc<UdpSocket>` clones.
+        //    `UdpSocket::Drop` will see `released = true` on the
+        //    last Arc drop and no-op.
+        let sock = &*self.ctx.sock;
+        if !sock.released.swap(true, Ordering::AcqRel) {
+            REGISTRY[sock.idx].port.store(0, Ordering::Release);
+            if let Some(hook) = BACKEND_UDP_UNBIND.load() {
+                hook(sock.port);
+            }
         }
+        // 4. Free the launcher Box — this drops the launcher's
+        //    strong `Arc<ctx>` clone. Combined with our own Arc
+        //    dropping at end of scope, the ctx refcount falls to
+        //    zero once all per-worker tasks have actually dropped
+        //    (on their next tick after abort). At that point the
+        //    Arc<UdpSocket> inside also drops and the backing
+        //    heap memory is reclaimed.
+        release_launcher_slot(self.launcher_slot);
     }
 }
 
@@ -704,10 +751,18 @@ pub fn register_tcp_backend_unlisten(hook: fn(port: u16)) {
 pub struct TcpListener {
     port: u16,
     idx: usize,
+    /// Same pattern as `UdpSocket::released` — set by
+    /// `TcpHandle::Drop` so the later `TcpListener::Drop` on the
+    /// last `Arc` release no-ops instead of double-invoking the
+    /// backend unlisten hook.
+    released: AtomicBool,
 }
 
 impl Drop for TcpListener {
     fn drop(&mut self) {
+        if self.released.swap(true, Ordering::AcqRel) {
+            return;
+        }
         TCP_REGISTRY[self.idx].port.store(0, Ordering::Release);
         if let Some(hook) = TCP_BACKEND_UNLISTEN.load() {
             hook(self.port);
@@ -741,7 +796,11 @@ impl TcpListener {
                     state.port.store(0, Ordering::Release);
                     return Err(TcpBindError::BackendFailed);
                 }
-                return Ok(TcpListener { port, idx });
+                return Ok(TcpListener {
+                    port,
+                    idx,
+                    released: AtomicBool::new(false),
+                });
             }
         }
         Err(TcpBindError::AllSlotsBusy)
@@ -777,46 +836,64 @@ impl TcpListener {
         H: Fn(RawTcpStream) -> F + Send + Sync + 'static,
         F: Future<Output = ()> + 'static,
     {
-        // Same leak rationale as `UdpSocket::run_loop` — the
-        // spawned task holds `&'static TcpListener`, so we can't
-        // safely free the Box on handle drop.
-        let leaked: &'static TcpListener = Box::leak(Box::new(self));
-        let body: &'static H = Box::leak(Box::new(body));
-        let ctx: &'static TcpFanoutCtx = Box::leak(Box::new(TcpFanoutCtx::new()));
-        register_net_launcher(Box::new(move || {
-            if ctx.stopping.load(Ordering::Acquire) {
+        let body = Arc::new(body);
+        let ctx = Arc::new(TcpFanoutCtx {
+            listener: Arc::new(self),
+            accept_body: Box::new(move |stream| {
+                let body = Arc::clone(&body);
+                Box::pin(async move { body(stream).await })
+            }),
+            stopping: AtomicBool::new(false),
+            handles: [const { SpinLock::new(None) }; MAX_WORKERS],
+        });
+        let ctx_for_launcher = Arc::clone(&ctx);
+        let launcher_slot = register_net_launcher(Box::new(move || {
+            if ctx_for_launcher.stopping.load(Ordering::Acquire) {
                 return;
             }
+            // Clone the listener Arc for the accept task — the
+            // task's future owns it for as long as it runs.
+            let listener = Arc::clone(&ctx_for_launcher.listener);
+            let ctx_inner = Arc::clone(&ctx_for_launcher);
             if let Ok(h) = crate::spawn(async move {
                 loop {
-                    let stream = leaked.accept().await;
-                    let fut = body(stream);
+                    let stream = listener.accept().await;
+                    // `accept_body` wraps the user's body in a
+                    // factory that itself clones its captured
+                    // Arc<body> for the per-conn task.
+                    let fut = (ctx_inner.accept_body)(stream);
                     let _ = crate::spawn(fut);
                 }
             }) {
                 let cc = CurrentCore::enter();
-                *ctx.handles[cc.id() as usize].lock() = Some(h);
+                *ctx_for_launcher.handles[cc.id() as usize].lock() = Some(h);
+                if ctx_for_launcher.stopping.load(Ordering::Acquire) {
+                    let h = ctx_for_launcher.handles[cc.id() as usize].lock().take();
+                    if let Some(h) = h {
+                        h.abort();
+                    }
+                }
             }
         }));
-        TcpHandle { listener: leaked, ctx }
+        TcpHandle { ctx, launcher_slot }
     }
 }
 
-/// Per-fanout coordination for `TcpListener::run`. Shape mirrors
-/// `UdpFanoutCtx`; separated because the two registries have
-/// different element types and there's no shared-generics payoff.
+type BoxedAcceptBody = Box<
+    dyn Fn(RawTcpStream) -> Pin<Box<dyn Future<Output = ()>>>
+        + Send + Sync + 'static,
+>;
+
+/// Per-fanout shared state for `TcpListener::run`. Shape mirrors
+/// `UdpFanoutCtx`; separated because the two reactors register
+/// different body signatures. Owned by `TcpHandle` + the launcher
+/// closure (both strong `Arc`s); the launcher's ref drops when
+/// `TcpHandle::Drop` frees the launcher slot.
 struct TcpFanoutCtx {
+    listener: Arc<TcpListener>,
+    accept_body: BoxedAcceptBody,
     stopping: AtomicBool,
     handles: [SpinLock<Option<crate::TaskHandle>>; MAX_WORKERS],
-}
-
-impl TcpFanoutCtx {
-    fn new() -> Self {
-        TcpFanoutCtx {
-            stopping: AtomicBool::new(false),
-            handles: [const { SpinLock::new(None) }; MAX_WORKERS],
-        }
-    }
 }
 
 /// Owning handle to a running `TcpListener` fanout. Use via
@@ -826,8 +903,8 @@ impl TcpFanoutCtx {
 #[must_use = "TcpHandle stops the accept tasks and releases the \
               port on drop; for a long-lived listener call .leak()"]
 pub struct TcpHandle {
-    listener: &'static TcpListener,
-    ctx: &'static TcpFanoutCtx,
+    ctx: Arc<TcpFanoutCtx>,
+    launcher_slot: usize,
 }
 
 impl TcpHandle {
@@ -839,7 +916,7 @@ impl TcpHandle {
 impl core::ops::Deref for TcpHandle {
     type Target = TcpListener;
     fn deref(&self) -> &TcpListener {
-        self.listener
+        &self.ctx.listener
     }
 }
 
@@ -851,14 +928,17 @@ impl Drop for TcpHandle {
                 h.abort();
             }
         }
-        // Mirror `TcpListener::Drop` — the owned listener was
-        // leaked into `run()`, so its Drop never fires and we
-        // have to clear the slot + invoke the unlisten hook from
-        // here.
-        TCP_REGISTRY[self.listener.idx].port.store(0, Ordering::Release);
-        if let Some(hook) = TCP_BACKEND_UNLISTEN.load() {
-            hook(self.listener.port);
+        // Eager port release — mirror `TcpListener::Drop` so a
+        // rebind works without waiting for aborted accept tasks
+        // to drop their `Arc<TcpListener>` clones.
+        let l = &*self.ctx.listener;
+        if !l.released.swap(true, Ordering::AcqRel) {
+            TCP_REGISTRY[l.idx].port.store(0, Ordering::Release);
+            if let Some(hook) = TCP_BACKEND_UNLISTEN.load() {
+                hook(l.port);
+            }
         }
+        release_launcher_slot(self.launcher_slot);
     }
 }
 
@@ -1156,19 +1236,44 @@ pub fn deliver_tcp_ready(dst_port: u16) -> bool {
 // every live launcher. Each launcher calls `spawn(body(...))` on
 // the calling worker.
 //
-// Storage is `AtomicPtr<Box<dyn Fn...>>`: the atomic holds a thin
-// pointer to a heap-allocated `Box` (which in turn is the fat
-// pointer to the closure). `AtomicPtr<T>` requires `T: Sized`;
-// `Box<dyn Fn>` is sized. Leaking the outer box keeps the launcher
-// heap-alive for the process lifetime — matches the consume-the-
-// socket contract of `run`/`run_loop`/`run_each`.
+// Slot states (stored in `AtomicPtr<BoxedLauncher>`):
+//   * `null`      — not yet stored (`register_net_launcher` did
+//                   fetch_add but hasn't published; readers stop
+//                   and re-try on the next tick).
+//   * `TOMBSTONE` — previously live, released via
+//                   `release_launcher_slot` (from a `*Handle::Drop`).
+//                   Readers skip it; cursor advances past.
+//   * any other   — `Box::into_raw(Box::new(BoxedLauncher { .. }))`,
+//                   live launcher. The reader dereferences and
+//                   calls it.
+//
+// Slots are NOT reused after release: rewriting a slot whose cursor
+// has already passed on some worker would leak the new launcher on
+// that worker forever. Bumping `NET_LAUNCHER_COUNT` monotonically
+// keeps the cursor invariant simple. `MAX_NET_LAUNCHERS = 256`
+// covers typical apps — bump it if a legitimate long-running app
+// legitimately creates more listeners than that over its lifetime.
 
 type BoxedLauncher = Box<dyn Fn() + Send + Sync + 'static>;
 
-/// Bounded cap; UDP and TCP each consume up to `MAX_UDP_SOCKETS`
-/// slots at current sizing. Total also accommodates any future
-/// protocol reactors.
-const MAX_NET_LAUNCHERS: usize = 16;
+/// Bounded cap on launchers ever allocated, not live at once.
+/// Each `UdpSocket::run_each` / `TcpListener::run` / etc. costs
+/// one slot; handle drop marks the slot as a tombstone but doesn't
+/// free it for reuse. 256 covers a realistic long-running app.
+const MAX_NET_LAUNCHERS: usize = 256;
+
+/// Sentinel for a released slot. Must be a non-null, non-Box pointer;
+/// we use `1` which cannot collide with any real `Box::into_raw`
+/// result (all real heap pointers are aligned to at least 8).
+#[inline]
+fn tombstone() -> *mut BoxedLauncher {
+    1 as *mut BoxedLauncher
+}
+
+#[inline]
+fn is_tombstone(p: *mut BoxedLauncher) -> bool {
+    p as usize == 1
+}
 
 static NET_LAUNCHERS: [AtomicPtr<BoxedLauncher>; MAX_NET_LAUNCHERS] =
     [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_NET_LAUNCHERS];
@@ -1184,20 +1289,44 @@ static NET_LAUNCHER_COUNT: core::sync::atomic::AtomicUsize =
 static NET_LAUNCHER_FIRED: [core::sync::atomic::AtomicUsize; MAX_WORKERS] =
     [const { core::sync::atomic::AtomicUsize::new(0) }; MAX_WORKERS];
 
-/// Register a launcher. Each protocol's `run`/`run_each` method
-/// wraps its body-spawn logic in a `BoxedLauncher` and hands it
-/// here. Each worker's `tick()` calls `fire_pending_net_launchers`
-/// to spawn anything newly added since its last tick.
-fn register_net_launcher(launcher: BoxedLauncher) {
+/// Register a launcher. Returns the slot index so the owning
+/// handle can call `release_launcher_slot` on drop, freeing the
+/// captured `Arc`s. `usize::MAX` means "table full; launcher
+/// dropped" — the caller still gets a valid handle, but no task
+/// ever fires. Practically this only happens if an app creates
+/// more than `MAX_NET_LAUNCHERS` listeners over its entire
+/// lifetime.
+fn register_net_launcher(launcher: BoxedLauncher) -> usize {
     let i = NET_LAUNCHER_COUNT
         .fetch_add(1, Ordering::AcqRel);
     if i >= MAX_NET_LAUNCHERS {
-        // Table full — drop. 16 slots is beyond any realistic
-        // per-binary reactor count.
-        return;
+        return usize::MAX;
     }
     let outer: Box<BoxedLauncher> = Box::new(launcher);
     NET_LAUNCHERS[i].store(Box::into_raw(outer), Ordering::Release);
+    i
+}
+
+/// Release a launcher slot on handle drop: swap a tombstone into
+/// the slot and free the `Box`. The tombstone ensures
+/// `fire_pending_net_launchers` skips the slot instead of
+/// stalling on it.
+fn release_launcher_slot(idx: usize) {
+    if idx >= MAX_NET_LAUNCHERS {
+        return;
+    }
+    let prev = NET_LAUNCHERS[idx].swap(tombstone(), Ordering::AcqRel);
+    if prev.is_null() || is_tombstone(prev) {
+        return;
+    }
+    // SAFETY: every non-null non-tombstone pointer in this table
+    // came from `Box::into_raw(Box::new(BoxedLauncher{..}))` in
+    // `register_net_launcher`. We hold exclusive access to it now
+    // (the swap removed it from the shared table; only this call
+    // site consumes it).
+    unsafe {
+        let _ = Box::from_raw(prev);
+    }
 }
 
 /// Spawn every net launcher added since `worker_id` last called
@@ -1229,10 +1358,18 @@ pub fn fire_pending_net_launchers(worker_id: u32) {
             // yet visible). Stop here; the next tick catches up.
             break;
         }
+        if is_tombstone(p) {
+            // Slot was live and has been released. Skip and
+            // advance — never re-touch.
+            new_fired = i + 1;
+            continue;
+        }
         // SAFETY: `p` was obtained from `Box::into_raw(Box::new(
-        // BoxedLauncher{..}))` in `register_net_launcher`. Outer
-        // box is leaked (never freed). Release/Acquire pairs the
-        // store and load.
+        // BoxedLauncher{..}))` in `register_net_launcher`. The
+        // pointer's validity is guaranteed until
+        // `release_launcher_slot` swaps in a tombstone (detected
+        // above), and the swap is AcqRel so we see a consistent
+        // snapshot.
         let launcher: &BoxedLauncher = unsafe { &*p };
         launcher();
         new_fired = i + 1;
