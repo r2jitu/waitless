@@ -6,6 +6,7 @@ extern crate alloc;
 
 pub mod net;
 pub mod select;
+mod startup;
 
 use atomic_fn::AtomicFn;
 
@@ -254,7 +255,7 @@ fn make_waker_for(worker_id: u32, slot_idx: usize) -> Waker {
 // "register all hooks before `set_ready()`"; later registrations
 // still fire on workers that haven't ticked yet.
 
-const MAX_STARTUP_HOOKS: usize = 8;
+use startup::{pending_range, MAX_STARTUP_HOOKS};
 
 static PER_WORKER_STARTUP: [AtomicFn<fn()>; MAX_STARTUP_HOOKS] =
     [const { AtomicFn::null() }; MAX_STARTUP_HOOKS];
@@ -296,23 +297,20 @@ pub fn tick(worker_id: u32) -> bool {
     let cc = unsafe { CurrentCore::from_id_unchecked(worker_id) };
 
     // Fire every per-worker startup hook registered since this
-    // worker last ticked. Hooks registered from *within* a worker's
-    // own boot task (e.g. `TcpListener::run` inside `uni::run(app)`)
-    // land before the count advances here, so they still fire on
-    // the current worker on its next tick.
+    // worker last ticked. See `startup::pending_range` for the
+    // cursor rule; unit-tested in `uni-runtime/src/startup.rs`.
     {
-        let total = STARTUP_HOOK_COUNT
-            .load(Ordering::Acquire)
-            .min(MAX_STARTUP_HOOKS);
+        let total = STARTUP_HOOK_COUNT.load(Ordering::Acquire);
         let fired = STARTUP_FIRED_COUNT[worker_id as usize].load(Ordering::Relaxed);
-        if fired < total {
-            for slot in PER_WORKER_STARTUP.iter().take(total).skip(fired) {
+        let range = pending_range(total, fired);
+        if !range.is_empty() {
+            for slot in PER_WORKER_STARTUP.iter().take(range.end).skip(range.start) {
                 if let Some(f) = slot.load() {
                     f();
                 }
             }
             STARTUP_FIRED_COUNT[worker_id as usize]
-                .store(total, Ordering::Relaxed);
+                .store(range.end, Ordering::Relaxed);
         }
     }
 
