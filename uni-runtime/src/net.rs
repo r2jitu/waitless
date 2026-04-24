@@ -229,6 +229,12 @@ static REGISTRY: [SocketState; MAX_UDP_SOCKETS] =
 // ---- Backend plug-in for bind-time setup ------------------------------------
 
 static BACKEND_BIND: AtomicFn<fn(port: u16) -> Result<(), ()>> = AtomicFn::null();
+/// Optional unbind hook, registered alongside `BACKEND_BIND`.
+/// `UdpSocket::Drop` calls it so the backend can release any
+/// per-bind state it holds (native's SO_REUSEPORT sibling fds).
+/// Bare-metal has no need — UDP routing on bare-metal is purely
+/// REGISTRY-driven — so it leaves this null.
+static BACKEND_UDP_UNBIND: AtomicFn<fn(port: u16)> = AtomicFn::null();
 static BACKEND_UDP_SEND: AtomicFn<
     fn(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]),
 > = AtomicFn::null();
@@ -239,6 +245,14 @@ static BACKEND_UDP_SEND: AtomicFn<
 /// that opens SO_REUSEPORT sibling fds for each `UdpSocket::bind`.
 pub fn register_backend_bind(hook: fn(port: u16) -> Result<(), ()>) {
     BACKEND_BIND.store(hook);
+}
+
+/// Register the optional UDP unbind hook. Called from
+/// `UdpSocket::Drop` when set so the backend can release per-bind
+/// state (native SO_REUSEPORT fds). Bare-metal doesn't need to
+/// register one — its UDP routing is pure REGISTRY lookups.
+pub fn register_backend_udp_unbind(hook: fn(port: u16)) {
+    BACKEND_UDP_UNBIND.store(hook);
 }
 
 /// Register the backend-side UDP send hook. Both bare-metal and
@@ -281,11 +295,18 @@ pub struct UdpSocket {
 
 impl Drop for UdpSocket {
     fn drop(&mut self) {
-        // Release the port slot so a subsequent `bind(port)` can
-        // reclaim it. The inbox's unconsumed entries (if any) are
-        // left in place — the next bind that lands on this slot
-        // calls `reset()` on every worker's inbox before use.
+        // Order matters: clear the registry slot first (so the
+        // port is immediately available for a new bind on this
+        // thread) and only then notify the backend. Native's
+        // unbind hook closes POSIX fds, which is much slower and
+        // doesn't need to happen before the slot is reusable.
         REGISTRY[self.idx].port.store(0, Ordering::Release);
+        if let Some(hook) = BACKEND_UDP_UNBIND.load() {
+            hook(self.port);
+        }
+        // The inbox's unconsumed entries (if any) stay — the next
+        // bind that lands on this slot calls `reset()` on every
+        // worker's inbox before use.
     }
 }
 
@@ -475,11 +496,15 @@ impl Drop for UdpHandle {
                 h.abort();
             }
         }
-        // 3. Release the port slot. Bypasses `UdpSocket::Drop`
-        //    because we only hold a `&'static UdpSocket` — the
-        //    owned `UdpSocket` was moved into `Box::leak` up in
-        //    `run_loop`, so its Drop never runs.
+        // 3. Release the port slot + notify the backend.
+        //    Bypasses `UdpSocket::Drop` because we only hold a
+        //    `&'static UdpSocket` — the owned `UdpSocket` was moved
+        //    into `Box::leak` up in `run_loop`, so its Drop never
+        //    runs; we have to mirror its cleanup here.
         REGISTRY[self.sock.idx].port.store(0, Ordering::Release);
+        if let Some(hook) = BACKEND_UDP_UNBIND.load() {
+            hook(self.sock.port);
+        }
     }
 }
 
@@ -646,6 +671,10 @@ static TCP_BACKEND_LISTEN: AtomicFn<fn(port: u16) -> Result<(), ()>> =
     AtomicFn::null();
 static TCP_BACKEND_ACCEPT: AtomicFn<fn(port: u16) -> RawTcpStream> =
     AtomicFn::null();
+/// Optional. `TcpListener::Drop` calls it to release backend
+/// state (native POSIX listen fd; bare-metal's per-core Listen
+/// TCB slots). Backends that don't need cleanup leave it null.
+static TCP_BACKEND_UNLISTEN: AtomicFn<fn(port: u16)> = AtomicFn::null();
 
 /// Register the TCP backend hooks. Called once at boot by the
 /// backend that owns the actual listen sockets / handshake state.
@@ -658,6 +687,11 @@ pub fn register_tcp_backend(
 ) {
     TCP_BACKEND_LISTEN.store(listen);
     TCP_BACKEND_ACCEPT.store(accept);
+}
+
+/// Register the optional TCP unlisten hook.
+pub fn register_tcp_backend_unlisten(hook: fn(port: u16)) {
+    TCP_BACKEND_UNLISTEN.store(hook);
 }
 
 /// A TCP listener bound to one port.
@@ -675,6 +709,9 @@ pub struct TcpListener {
 impl Drop for TcpListener {
     fn drop(&mut self) {
         TCP_REGISTRY[self.idx].port.store(0, Ordering::Release);
+        if let Some(hook) = TCP_BACKEND_UNLISTEN.load() {
+            hook(self.port);
+        }
     }
 }
 
@@ -814,7 +851,14 @@ impl Drop for TcpHandle {
                 h.abort();
             }
         }
+        // Mirror `TcpListener::Drop` — the owned listener was
+        // leaked into `run()`, so its Drop never fires and we
+        // have to clear the slot + invoke the unlisten hook from
+        // here.
         TCP_REGISTRY[self.listener.idx].port.store(0, Ordering::Release);
+        if let Some(hook) = TCP_BACKEND_UNLISTEN.load() {
+            hook(self.listener.port);
+        }
     }
 }
 

@@ -762,6 +762,7 @@ fn init_native() {
     // sibling opener. On bare-metal the hook stays unset because
     // the NIC RX path unconditionally delivers to the reactor.
     uni_runtime::net::register_backend_bind(udp_backend_bind);
+    uni_runtime::net::register_backend_udp_unbind(udp_backend_unbind);
     uni_runtime::net::register_backend_udp_send(udp_send);
 
     // TCP reactor hooks. `listen` is a no-op stub (returns `Ok`) so
@@ -774,6 +775,7 @@ fn init_native() {
         async_tcp_listen_hook,
         async_tcp_accept_hook,
     );
+    uni_runtime::net::register_tcp_backend_unlisten(async_tcp_unlisten_hook);
     uni_runtime::net::register_tcp_recv_hooks(
         native_tcp_has_data,
         native_tcp_do_recv,
@@ -860,6 +862,29 @@ fn async_tcp_listen_hook(app_port: u16) -> Result<(), ()> {
             threads[worker_id].register_fd(fd);
         }
         Ok(())
+    }
+}
+
+/// Counterpart to `async_tcp_listen_hook`. Called from
+/// `TcpListener::Drop` via `TCP_BACKEND_UNLISTEN`. Closes the
+/// shared listen fd (kqueue/epoll auto-remove the fd from every
+/// worker's event queue) and clears the slot so a subsequent
+/// `bind(app_port)` can allocate fresh. `ASYNC_TCP_COUNT` isn't
+/// decremented — the table is small (cap 4) and we tolerate
+/// `None` holes rather than compacting on teardown.
+fn async_tcp_unlisten_hook(app_port: u16) {
+    unsafe {
+        let count = ASYNC_TCP_COUNT.load(Ordering::Acquire);
+        let listeners = &mut *ASYNC_TCP_LISTENERS.0.get();
+        for entry in listeners.iter_mut().take(count) {
+            if let Some(l) = entry {
+                if l.app_port == app_port {
+                    close(l.fd);
+                    *entry = None;
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -1368,6 +1393,34 @@ pub fn udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
 /// routes inbound datagrams through the async reactor.
 fn udp_backend_bind(port: u16) -> Result<(), ()> {
     open_udp_relay(port, None)
+}
+
+/// Hook registered with `register_backend_udp_unbind`. Mirrors
+/// `udp_backend_bind`: closes every SO_REUSEPORT sibling opened
+/// for `app_port` and frees the binding slot. kqueue/epoll
+/// auto-remove fds on close, so the thread-local `udp_sibs`
+/// entries simply start seeing EBADF from `recvfrom` — which the
+/// drain loop already treats as "no more data". Leaving the
+/// stale entries rather than tracking them down keeps `ThreadState`
+/// free of cross-thread mutation on the unbind path.
+fn udp_backend_unbind(app_port: u16) {
+    unsafe {
+        let count = UDP_COUNT.load(Ordering::Acquire);
+        let bindings = &mut *UDP_BINDINGS.0.get();
+        for entry in bindings.iter_mut().take(count) {
+            if let Some(b) = entry {
+                if b.app_port == app_port {
+                    for i in 0..b.sibling_count {
+                        if b.fds[i] >= 0 {
+                            close(b.fds[i]);
+                        }
+                    }
+                    *entry = None;
+                    return;
+                }
+            }
+        }
+    }
 }
 
 /// Open SO_REUSEPORT siblings for `app_port` and register each in

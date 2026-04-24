@@ -19,21 +19,9 @@ and the `rebind ok` marker never prints.
 
 from __future__ import annotations
 
-import os
 import unittest
 
 from scripts.test_helpers import run_variant_and_capture
-
-
-# Native's TCP backend opens a POSIX fd per listener and doesn't
-# hook `TcpListener::Drop` to close it, so the second `bind(same_
-# port)` fails with EADDRINUSE at the POSIX layer. The uni-runtime
-# port slot IS cleaned up (that's all the Drop impl promises
-# today); the fd leak is a separate native-backend issue tracked
-# as a follow-up. For now, skip the same-port rebind tests on
-# native and rely on the bare-metal variants to exercise the full
-# "slot cleared + rebind works" invariant.
-IS_NATIVE = os.environ.get("LAUNCHER_NAME", "").endswith("_native")
 
 
 class AsyncRuntimeSmokeTest(unittest.TestCase):
@@ -89,13 +77,11 @@ class AsyncRuntimeSmokeTest(unittest.TestCase):
         self.assertMarker("test_async: udp fanout drop ok")
         self.assertMarker("test_async: udp fanout rebind ok")
 
-    @unittest.skipIf(IS_NATIVE, "native TCP backend fd-leak: see module doc")
     def test_tcp_bind_drop_releases_port(self) -> None:
         self.assertMarker("test_async: tcp bind ok")
         self.assertMarker("test_async: tcp drop ok")
         self.assertMarker("test_async: tcp rebind ok")
 
-    @unittest.skipIf(IS_NATIVE, "native TCP backend fd-leak: see module doc")
     def test_tcp_fanout_handle_drop_releases_port(self) -> None:
         self.assertMarker("test_async: tcp fanout drop ok")
         self.assertMarker("test_async: tcp fanout rebind ok")
