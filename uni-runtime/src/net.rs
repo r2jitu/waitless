@@ -118,6 +118,30 @@ impl<'a, T> Drop for SpinGuard<'a, T> {
     }
 }
 
+// ---- Launcher helper --------------------------------------------------------
+
+/// Install a freshly-spawned worker task into its per-worker slot,
+/// handling the drop-race with `*Handle::Drop`: if `stopping` was
+/// set between the launcher's first check and now, abort the task
+/// we just spawned instead of stashing it (its abort flag would
+/// otherwise go unseen until the next drop, leaking the task for
+/// the rest of the process). Taking the lock once keeps the common
+/// case to a single acquire/release.
+fn install_worker_task(
+    stopping: &AtomicBool,
+    handles: &[SpinLock<Option<crate::TaskHandle>>; MAX_WORKERS],
+    h: crate::TaskHandle,
+) {
+    let cc = CurrentCore::enter();
+    let mut slot = handles[cc.id() as usize].lock();
+    if stopping.load(Ordering::Acquire) {
+        drop(slot);
+        h.abort();
+    } else {
+        *slot = Some(h);
+    }
+}
+
 // ---- Datagram + worker inbox ------------------------------------------------
 
 #[repr(C)]
@@ -449,18 +473,11 @@ impl UdpSocket {
             let sock = Arc::clone(&ctx_for_launcher.sock);
             let fut = (ctx_for_launcher.body)(sock);
             if let Ok(h) = crate::spawn(fut) {
-                let cc = CurrentCore::enter();
-                *ctx_for_launcher.handles[cc.id() as usize].lock() = Some(h);
-                // Re-check `stopping` — we might have raced with
-                // `UdpHandle::drop` between our first check and
-                // the task-handle register; if so, abort the task
-                // we just spawned.
-                if ctx_for_launcher.stopping.load(Ordering::Acquire) {
-                    let h = ctx_for_launcher.handles[cc.id() as usize].lock().take();
-                    if let Some(h) = h {
-                        h.abort();
-                    }
-                }
+                install_worker_task(
+                    &ctx_for_launcher.stopping,
+                    &ctx_for_launcher.handles,
+                    h,
+                );
             }
         }));
         UdpHandle { ctx, launcher_slot }
@@ -865,14 +882,11 @@ impl TcpListener {
                     let _ = crate::spawn(fut);
                 }
             }) {
-                let cc = CurrentCore::enter();
-                *ctx_for_launcher.handles[cc.id() as usize].lock() = Some(h);
-                if ctx_for_launcher.stopping.load(Ordering::Acquire) {
-                    let h = ctx_for_launcher.handles[cc.id() as usize].lock().take();
-                    if let Some(h) = h {
-                        h.abort();
-                    }
-                }
+                install_worker_task(
+                    &ctx_for_launcher.stopping,
+                    &ctx_for_launcher.handles,
+                    h,
+                );
             }
         }));
         TcpHandle { ctx, launcher_slot }
