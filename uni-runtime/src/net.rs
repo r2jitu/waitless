@@ -340,7 +340,7 @@ impl UdpSocket {
     /// `handler` is `Fn`, called concurrently across workers. State
     /// across calls should live in `PerCpu<T, MAX_WORKERS>` or use
     /// interior mutability.
-    pub fn run_each<H>(self, handler: H)
+    pub fn run_each<H>(self, handler: H) -> &'static UdpSocket
     where
         H: Fn([u8; 4], u16, &[u8]) + Send + Sync + 'static,
     {
@@ -363,7 +363,12 @@ impl UdpSocket {
     /// `recv_from` to drive the per-worker inbox. Use this when the
     /// sync `run_each` doesn't fit (async per-datagram work, batched
     /// reads, cross-message state not expressible via `PerCpu`).
-    pub fn run_loop<H, F>(self, body: H)
+    ///
+    /// Returns the leaked `&'static UdpSocket` so request/reply
+    /// protocols (DHCP, DNS client, etc.) can keep sending on it
+    /// while receivers fan out across workers. Pure-receiver callers
+    /// can drop the returned reference.
+    pub fn run_loop<H, F>(self, body: H) -> &'static UdpSocket
     where
         H: Fn(&'static UdpSocket) -> F + Send + Sync + 'static,
         F: Future<Output = ()> + 'static,
@@ -373,6 +378,7 @@ impl UdpSocket {
             let fut = body(leaked);
             let _ = crate::spawn(fut);
         }));
+        leaked
     }
 }
 
@@ -949,40 +955,47 @@ static NET_LAUNCHERS: [AtomicPtr<BoxedLauncher>; MAX_NET_LAUNCHERS] =
     [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_NET_LAUNCHERS];
 static NET_LAUNCHER_COUNT: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
-static NET_HOOK_REGISTERED: AtomicBool = AtomicBool::new(false);
+/// Per-worker cursor into `NET_LAUNCHERS` — each tick fires only
+/// the launchers added since this worker's last fire. Mirrors
+/// `STARTUP_FIRED_COUNT` in `uni-runtime/src/lib.rs`; needed
+/// because launchers can be registered from inside a task running
+/// on a worker that's already ticked (e.g. `TcpListener::bind(80)`
+/// called from the `#[uni::boot]` async body after DHCP's
+/// `UdpSocket::bind(68)` already ran).
+static NET_LAUNCHER_FIRED: [core::sync::atomic::AtomicUsize; MAX_WORKERS] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; MAX_WORKERS];
 
 /// Register a launcher. Each protocol's `run`/`run_each` method
 /// wraps its body-spawn logic in a `BoxedLauncher` and hands it
-/// here. The single per-worker hook fires every registered
-/// launcher on each worker's first tick.
+/// here. Each worker's `tick()` calls `fire_pending_net_launchers`
+/// to spawn anything newly added since its last tick.
 fn register_net_launcher(launcher: BoxedLauncher) {
     let i = NET_LAUNCHER_COUNT
         .fetch_add(1, Ordering::AcqRel);
     if i >= MAX_NET_LAUNCHERS {
-        // Table full — drop the launcher. Matches `spawn_on_each_worker`'s
-        // documented cap behaviour; 16 slots is beyond any realistic
+        // Table full — drop. 16 slots is beyond any realistic
         // per-binary reactor count.
         return;
     }
     let outer: Box<BoxedLauncher> = Box::new(launcher);
     NET_LAUNCHERS[i].store(Box::into_raw(outer), Ordering::Release);
-    ensure_net_hook_registered();
 }
 
-fn ensure_net_hook_registered() {
-    if NET_HOOK_REGISTERED
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
-    {
-        crate::spawn_on_each_worker(fire_net_launchers);
+/// Spawn every net launcher added since `worker_id` last called
+/// here. Runs once per `uni_runtime::tick()` — a no-op when the
+/// cursor is already caught up, which is the common case.
+pub fn fire_pending_net_launchers(worker_id: u32) {
+    if (worker_id as usize) >= MAX_WORKERS {
+        return;
     }
-}
-
-fn fire_net_launchers() {
-    let count = NET_LAUNCHER_COUNT
+    let total = NET_LAUNCHER_COUNT
         .load(Ordering::Acquire)
         .min(MAX_NET_LAUNCHERS);
-    for slot in NET_LAUNCHERS.iter().take(count) {
+    let fired = NET_LAUNCHER_FIRED[worker_id as usize].load(Ordering::Relaxed);
+    if fired >= total {
+        return;
+    }
+    for slot in NET_LAUNCHERS.iter().take(total).skip(fired) {
         let p = slot.load(Ordering::Acquire);
         if p.is_null() {
             continue;
@@ -994,4 +1007,5 @@ fn fire_net_launchers() {
         let launcher: &BoxedLauncher = unsafe { &*p };
         launcher();
     }
+    NET_LAUNCHER_FIRED[worker_id as usize].store(total, Ordering::Relaxed);
 }

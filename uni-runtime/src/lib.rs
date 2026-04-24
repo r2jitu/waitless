@@ -4,6 +4,7 @@
 
 extern crate alloc;
 
+pub mod event;
 pub mod net;
 pub mod select;
 mod startup;
@@ -313,6 +314,13 @@ pub fn tick(worker_id: u32) -> bool {
                 .store(range.end, Ordering::Relaxed);
         }
     }
+    // Spawn per-worker launchers registered by `UdpSocket::run_each`
+    // / `TcpListener::run` since this worker last ticked. Same
+    // cursor-based rule, different table — avoids collapsing both
+    // registries into the startup-hook slots (which are sized for
+    // user-visible `spawn_on_each_worker` callers, not internal
+    // reactor machinery).
+    net::fire_pending_net_launchers(worker_id);
 
     let _ = wheel(&cc).advance(now_ticks());
 

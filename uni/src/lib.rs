@@ -169,6 +169,7 @@ pub use uni_backend::{
 pub mod runtime {
     pub use uni_backend::runtime::{sleep_us, spawn, spawn_on_each_worker, Sleep};
     pub use uni_runtime::TaskHandle;
+    pub use uni_runtime::event::{AsyncEvent, WaitEvent};
     pub use uni_runtime::net::{
         TcpBindError, TcpRecv, TcpSend, UdpBindError, UdpRecv, UdpSocket,
     };

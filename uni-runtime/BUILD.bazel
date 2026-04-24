@@ -10,6 +10,7 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "uni-runtime",
     srcs = [
+        "src/event.rs",
         "src/lib.rs",
         "src/net.rs",
         "src/select.rs",
