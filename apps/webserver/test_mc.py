@@ -12,8 +12,8 @@ Companion to `test.py` (single-vCPU), intentionally narrower:
       ephemeral source ports so vhost-net / host-RSS hashes them
       across multiple guest RX queues. Catches the class of
       regressions where the guest accept-task only spawns on some
-      cores (e.g. `spawn_on_each_worker` one-shot semantics) or the
-      Tier-1 `poll_qp(core_id)` routing is broken.
+      cores (e.g. net-launcher one-shot semantics) or the Tier-1
+      `poll_qp(core_id)` routing is broken.
 
     * Asserts the serial log shows multi-queue activation, so we
       never silently fall back to Tier-2 and pass this test for
@@ -134,8 +134,8 @@ class WebserverMultiCoreTest(unittest.TestCase):
         responses exercise every guest core's accept-task spawn
         and the Tier-1 `poll_qp(core_id)` path. Every response must
         succeed — a single 0-byte/timeout/connection-reset means a
-        core's accept task didn't register (see the
-        `spawn_on_each_worker` one-shot regression).
+        core's accept task didn't register (see the net-launcher
+        one-shot regression).
         """
         n = 32
 

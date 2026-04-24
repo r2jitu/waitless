@@ -17,7 +17,7 @@ use atomic_fn::AtomicFn;
 /// reach these via `uni::runtime::{spawn,sleep_us,Sleep,…}`.
 pub mod runtime {
     pub use uni_runtime::{
-        has_pending, sleep_us, spawn, spawn_on_each_worker, tick, Sleep,
+        has_pending, sleep_us, spawn, tick, Sleep,
     };
 }
 

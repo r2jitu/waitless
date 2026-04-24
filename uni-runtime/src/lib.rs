@@ -7,9 +7,6 @@ extern crate alloc;
 pub mod event;
 pub mod net;
 pub mod select;
-mod startup;
-
-use atomic_fn::AtomicFn;
 
 use alloc::boxed::Box;
 use core::cell::UnsafeCell;
@@ -240,50 +237,6 @@ fn make_waker_for(worker_id: u32, slot_idx: usize) -> Waker {
     unsafe { Waker::from_raw(raw) }
 }
 
-// ---- Per-worker startup hook ----------------------------------------------
-//
-// `spawn_on_each_worker(f)` registers `f` to fire exactly once on
-// each worker, on that worker, on its first `tick`. Inside `f`,
-// `spawn()` lands the task in the running worker's arena. Common
-// pattern for long-lived per-core reactors (UDP, TCP, QUIC).
-//
-// Multiple registrations accumulate — each call claims the next
-// slot in a fixed-size table. Used internally by `net::UdpSocket::
-// run` and `net::TcpListener::run`; also exposed for apps.
-//
-// Registration after a worker's first `tick` is a no-op for that
-// worker (the `STARTUP_FIRED` flag is already set). Intent is
-// "register all hooks before `set_ready()`"; later registrations
-// still fire on workers that haven't ticked yet.
-
-use startup::{pending_range, MAX_STARTUP_HOOKS};
-
-static PER_WORKER_STARTUP: [AtomicFn<fn()>; MAX_STARTUP_HOOKS] =
-    [const { AtomicFn::null() }; MAX_STARTUP_HOOKS];
-static STARTUP_HOOK_COUNT: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-/// Per-worker cursor into `PER_WORKER_STARTUP` — incremented each
-/// tick by the number of hooks fired. Replaces the single-shot
-/// `STARTUP_FIRED` flag so hooks registered *after* a worker's
-/// first tick (e.g. from inside the boot task itself) still run
-/// on that worker on its next tick.
-static STARTUP_FIRED_COUNT: [core::sync::atomic::AtomicUsize; MAX_WORKERS] =
-    [const { core::sync::atomic::AtomicUsize::new(0) }; MAX_WORKERS];
-
-/// Register `f` to run on every worker on its next tick after
-/// registration. Up to `MAX_STARTUP_HOOKS` hooks accumulate; excess
-/// registrations are silently dropped.
-pub fn spawn_on_each_worker(f: fn()) {
-    let i = STARTUP_HOOK_COUNT
-        .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
-    if i < MAX_STARTUP_HOOKS {
-        PER_WORKER_STARTUP[i].store(f);
-    }
-    // else: table full, hook discarded. Acceptable under the doc
-    // contract; callers that hit this limit are doing something
-    // unusual.
-}
-
 // ---- Event-loop entry points ----------------------------------------------
 
 /// Advance this worker's timer wheel (firing expired timers, which
@@ -297,42 +250,8 @@ pub fn tick(worker_id: u32) -> bool {
     // SAFETY: caller guarantees `worker_id` is the running worker.
     let cc = unsafe { CurrentCore::from_id_unchecked(worker_id) };
 
-    // Fire every per-worker startup hook registered since this
-    // worker last ticked. See `startup::pending_range` for the
-    // cursor rule; unit-tested in `uni-runtime/src/startup.rs`.
-    //
-    // `spawn_on_each_worker` publishes in two steps (fetch_add then
-    // store), so a reader can see the bumped count before the slot
-    // is visible. Stop at the first unpublished slot rather than
-    // skipping it, so the next tick re-tries — skipping + advancing
-    // would drop the registration permanently.
-    {
-        let total = STARTUP_HOOK_COUNT.load(Ordering::Acquire);
-        let fired = STARTUP_FIRED_COUNT[worker_id as usize].load(Ordering::Relaxed);
-        let range = pending_range(total, fired);
-        if !range.is_empty() {
-            let mut new_fired = range.start;
-            for i in range.clone() {
-                match PER_WORKER_STARTUP[i].load() {
-                    Some(f) => {
-                        f();
-                        new_fired = i + 1;
-                    }
-                    None => break,
-                }
-            }
-            if new_fired > range.start {
-                STARTUP_FIRED_COUNT[worker_id as usize]
-                    .store(new_fired, Ordering::Relaxed);
-            }
-        }
-    }
     // Spawn per-worker launchers registered by `UdpSocket::run_each`
-    // / `TcpListener::run` since this worker last ticked. Same
-    // cursor-based rule, different table — avoids collapsing both
-    // registries into the startup-hook slots (which are sized for
-    // user-visible `spawn_on_each_worker` callers, not internal
-    // reactor machinery).
+    // / `TcpListener::run` since this worker last ticked.
     net::fire_pending_net_launchers(worker_id);
 
     let _ = wheel(&cc).advance(now_ticks());

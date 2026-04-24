@@ -45,7 +45,7 @@ pub use uni_kernel::percpu::num_cores as num_workers;
 // ---- Async runtime re-exports ---------------------------------------------
 
 pub mod runtime {
-    pub use uni_runtime::{sleep_us, spawn, spawn_on_each_worker, Sleep};
+    pub use uni_runtime::{sleep_us, spawn, Sleep};
 }
 
 // ---- Heap stats -----------------------------------------------------------

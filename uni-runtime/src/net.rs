@@ -37,7 +37,7 @@
 //
 // The lower-level `bind` + `recv_from` is still exposed for cases
 // that want custom lifecycle or multiple concurrent tasks sharing
-// the socket (one per worker, via `spawn_on_each_worker`).
+// the socket (one per worker).
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -1202,11 +1202,11 @@ pub fn deliver_tcp_ready(dst_port: u16) -> bool {
 // ---- Shared launcher table (UDP + TCP + future reactors) --------------------
 //
 // Any reactor's `run`-style method registers a type-erased launcher
-// closure here via `register_net_launcher`. A single
-// `spawn_on_each_worker` hook — registered lazily on the first
-// launcher — walks the table on each worker's first tick and fires
-// every live launcher. Each launcher calls `spawn(body(...))` on
-// the calling worker.
+// closure here via `register_net_launcher`. `fire_pending_net_launchers`
+// — called from `uni_runtime::tick` on every worker every iteration —
+// walks the table from that worker's cursor to the global count and
+// invokes each live launcher. Each launcher typically calls
+// `spawn(body(...))` on the calling worker.
 //
 // Slot states (stored in `AtomicPtr<BoxedLauncher>`):
 //   * `null`      — not yet stored (`register_net_launcher` did

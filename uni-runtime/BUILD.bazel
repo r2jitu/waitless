@@ -1,5 +1,4 @@
 load("@rules_rust//rust:defs.bzl", "rust_library")
-load("//bazel/rules:rust.bzl", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -14,25 +13,10 @@ rust_library(
         "src/lib.rs",
         "src/net.rs",
         "src/select.rs",
-        "src/startup.rs",
     ],
     crate_name = "uni_runtime",
     deps = [
         "//uni-percpu",
         "//uni-platform",
-        "//util/atomic_fn",
     ],
-)
-
-# Pure-logic unit tests for the startup-hook cursor. Pins the
-# "late-registered hooks fire on next tick" contract — a regression
-# to one-shot STARTUP_FIRED semantics silently broke accept-task
-# spawn when `TcpListener::run` registered from inside the boot
-# task. Standalone compile avoids pulling uni-percpu / uni-platform
-# into the rust_test's panic=unwind toolchain.
-rust_test(
-    name = "startup_test",
-    size = "small",
-    srcs = ["src/startup.rs"],
-    crate_root = "src/startup.rs",
 )
