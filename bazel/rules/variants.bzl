@@ -676,13 +676,23 @@ def unikernel_app_test(name, app_base, test_rule, extra_data = None, variants = 
         # archs). Lets `--test_tag_filters=hvf` / `=qemu` /
         # `=qemu_aarch64` all work.
         variant_tags = caller_tags + [suffix] + list(spec.extra_test_tags)
+        # `os:none` → `@platforms//:incompatible` so `//...` under a
+        # unikernel target platform silently skips these py_test
+        # targets instead of failing toolchain resolution (there's
+        # no default_test_toolchain registered for bare-metal). The
+        # rust-analyzer discover aspect relies on this when it runs
+        # `bazel build //...` under `--platforms=*_unikernel` to
+        # generate crate specs with `cfg(target_os = "none")` active.
         test_rule(
             name = name + "_" + suffix,
             srcs = [variant_src],
             main = variant_src,
             data = [":" + launcher_name] + (extra_data or []),
             env = {"LAUNCHER_NAME": launcher_name},
-            target_compatible_with = spec.host_compat,
+            target_compatible_with = spec.host_compat + select({
+                "//bazel/platforms:os_none": ["@platforms//:incompatible"],
+                "//conditions:default": [],
+            }),
             tags = variant_tags,
             **kwargs
         )
