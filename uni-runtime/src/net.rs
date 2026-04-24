@@ -117,6 +117,24 @@ impl<'a, T> Drop for SpinGuard<'a, T> {
     }
 }
 
+// ---- Waker helper -----------------------------------------------------------
+
+/// Store `w` into `slot` unless it already holds a waker that
+/// would wake the same task (`Waker::will_wake`). Used on the
+/// slow path of every `poll` that parks on a per-port waker slot
+/// to keep the clone off the hot path when the same task repolls
+/// in a tight loop.
+fn store_waker_if_needed(slot: &SpinLock<Option<Waker>>, w: &Waker) {
+    let mut slot = slot.lock();
+    let need_store = match &*slot {
+        Some(existing) => !existing.will_wake(w),
+        None => true,
+    };
+    if need_store {
+        *slot = Some(w.clone());
+    }
+}
+
 // ---- Launcher helper --------------------------------------------------------
 
 /// Install a freshly-spawned worker task into its per-worker slot,
@@ -602,19 +620,8 @@ impl<'a> Future for UdpRecv<'a> {
         }
         // Slow path: register the waker, then re-check — closes the
         // race where `deliver_udp` pushed between the fast-path pop
-        // and the waker registration. Dedup via `will_wake` keeps the
-        // loop case (same task polling in a tight recv loop) off the
-        // clone path.
-        {
-            let mut slot = inbox.waker.lock();
-            let need_store = match &*slot {
-                Some(w) => !w.will_wake(cx.waker()),
-                None => true,
-            };
-            if need_store {
-                *slot = Some(cx.waker().clone());
-            }
-        }
+        // and the waker registration.
+        store_waker_if_needed(&inbox.waker, cx.waker());
         if let Some(r) = inbox.pop_into(this.buf) {
             *inbox.waker.lock() = None;
             return Poll::Ready(r);
@@ -1030,20 +1037,9 @@ impl<'a> Future for TcpAccept<'a> {
         }
 
         // Register waker on this worker's slot, then re-check.
-        // `will_wake` dedup keeps long-lived accept loops off the
-        // clone path when the same task re-polls.
         let cc = CurrentCore::enter();
         let state = &TCP_REGISTRY[this.listener.idx];
-        {
-            let mut slot = state.wakers.current(&cc).lock();
-            let need_store = match &*slot {
-                Some(w) => !w.will_wake(cx.waker()),
-                None => true,
-            };
-            if need_store {
-                *slot = Some(cx.waker().clone());
-            }
-        }
+        store_waker_if_needed(state.wakers.current(&cc), cx.waker());
 
         let stream = (b.accept)(port);
         if !stream.is_null() {
