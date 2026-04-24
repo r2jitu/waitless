@@ -72,3 +72,23 @@ unikernel_app_test(
     test_rule = py_test,
     deps = ["//scripts:test_helpers"],
 )
+
+# Multi-core integration test. HVF-only: Apple's Hypervisor.framework
+# runs real hardware-virtualised vCPUs, which is what the guest's
+# Tier-1 per-core RX-queue polling and `spawn_on_each_worker` hooks
+# need to actually exercise. QEMU/TCG's 4-vCPU boot is slow enough
+# that adding another 30-second test per `bazel test //...` run
+# isn't worth it for a fallback path.
+unikernel_app_test(
+    name = "test_mc",
+    timeout = "short",
+    srcs = ["test_mc.py"],
+    app_base = "webserver",
+    variants = ["hvf"],
+    tags = [
+        "exclusive",
+        "local",
+    ],
+    test_rule = py_test,
+    deps = ["//scripts:test_helpers"],
+)
