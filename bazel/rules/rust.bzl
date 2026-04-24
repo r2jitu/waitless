@@ -30,8 +30,27 @@ def rust_test(**kwargs):
 # target under the global `-Cpanic=abort`. Pin `-Cpanic=unwind` via
 # the target's own `rustc_flags` — those are appended AFTER
 # `extra_rustc_flags`, so the unwind flag is last-wins.
-def rust_proc_macro(rustc_flags = [], **kwargs):
-    _rust_proc_macro(rustc_flags = rustc_flags + ["-Cpanic=unwind"], **kwargs)
+#
+# `target_compatible_with` gates direct enumeration under a unikernel
+# target platform (`os:none`): the registered rust toolchain there
+# targets `*-unknown-none`, which can't build proc-macros (`warning:
+# dropping unsupported crate type proc-macro` → `can't find crate for
+# std`). Normal consumers reach proc-macros through `proc_macro_deps`,
+# whose cfg="exec" transition switches back to the host platform
+# before toolchain resolution, so THAT path still builds fine. The
+# incompat marker only suppresses wildcard expansion (`bazel build
+# //...`) from trying to compile the proc-macro in the top-level
+# unikernel config — which is what the rust-analyzer discover aspect
+# does under `--platforms=*_unikernel`.
+def rust_proc_macro(rustc_flags = [], target_compatible_with = [], **kwargs):
+    _rust_proc_macro(
+        rustc_flags = rustc_flags + ["-Cpanic=unwind"],
+        target_compatible_with = target_compatible_with + select({
+            "//bazel/platforms:os_none": ["@platforms//:incompatible"],
+            "//conditions:default": [],
+        }),
+        **kwargs
+    )
 
 # Panic strategy is handled in `.bazelrc`:
 #
