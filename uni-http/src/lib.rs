@@ -11,6 +11,8 @@ extern crate alloc;
 extern crate uni;
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 
 // TLS injection boundary. `uni-tls` implements these traits over a
@@ -237,121 +239,25 @@ impl Route {
     }
 }
 
-/// The async unikernel HTTP/1.1 server.
-///
-/// Lifecycle: build while owned (`route`, `default_handler`,
-/// `install_tls`), then `Box::leak` to get a `&'static Server`
-/// and call `.listen(port)` / `.listen_tls(port)` for each port
-/// you want to serve. Each `listen*` captures the `&'static
-/// Server` into its accept closure — no globals, so multiple
-/// independent `Server` instances on different ports/certs work
-/// without stepping on each other.
-///
-/// Per-conn state (receive buffer, parse buffer, optional TLS
-/// state machine) lives on the task's stack; the async-runtime
-/// task arena caps concurrency. `Server` itself holds only
-/// boot-time state: the route table, default handler, and
-/// optional TLS adapter.
-pub struct Server {
+/// Immutable server config, shared (`Arc`) across all accept /
+/// per-conn tasks so they can look up routes + TLS config without
+/// holding exclusive access to `Server`.
+struct Inner {
     routes: [Route; MAX_ROUTES],
     route_count: usize,
     default_handler: Option<Handler>,
-    /// TLS adapter installed via `install_tls()`. `None` for
-    /// plain-HTTP-only servers. Each accepted HTTPS connection
-    /// goes through `adapter.new_connection(seed)` to get its own
-    /// `TlsConnection`.
     tls_adapter: Option<Box<dyn TlsAdapter>>,
+    /// Set by `Server::Drop`. Per-conn tasks check it at their
+    /// loop head and exit cleanly.
+    shutting_down: core::sync::atomic::AtomicBool,
 }
 
-impl Server {
-    /// Allocate a fresh `Server` on the heap. Configure with
-    /// `route` / `default_handler` / `install_tls`, then
-    /// `Box::leak` and call `listen` / `listen_tls` on the
-    /// resulting `&'static Server` reference.
-    pub fn new_boxed() -> Box<Self> {
-        Box::new(Server {
-            routes: [const { Route::new() }; MAX_ROUTES],
-            route_count: 0,
-            default_handler: None,
-            tls_adapter: None,
-        })
-    }
-
-    /// Register an exact-path handler.
-    pub fn route(&mut self, path: &[u8], handler: Handler) {
-        if self.route_count >= MAX_ROUTES {
-            uni::log(b"http: too many routes\n");
-            return;
-        }
-        let r = &mut self.routes[self.route_count];
-        let len = path.len().min(255);
-        r.path[..len].copy_from_slice(&path[..len]);
-        r.path_len = len;
-        r.handler = Some(handler);
-        self.route_count += 1;
-    }
-
-    /// Set the fallback handler (called when no route matches).
-    pub fn default_handler(&mut self, handler: Handler) {
-        self.default_handler = Some(handler);
-    }
-
-    /// Install a TLS adapter. Required before `listen_tls()`. The
-    /// adapter's `new_connection(seed)` is called once per
-    /// accepted HTTPS connection.
-    ///
-    /// App code reaches this via `uni_tls::install(server, cfg)`
-    /// rather than calling directly — that helper wraps
-    /// `TlsServerConfig` in the adapter.
-    pub fn install_tls(&mut self, adapter: Box<dyn TlsAdapter>) {
-        self.tls_adapter = Some(adapter);
-    }
-
-    /// True iff a TLS adapter has been installed. Callers usually
-    /// pair `install_tls` with `listen_tls` unconditionally; this
-    /// is for apps that want to gate HTTPS on cert availability
-    /// at runtime.
-    pub fn has_tls(&self) -> bool {
-        self.tls_adapter.is_some()
-    }
-
-    /// Start a plain-HTTP listener on `port`. Requires `self` to
-    /// be `&'static` — the accept closure captures it; the ref
-    /// outlives every spawned connection task. `.leak()` the
-    /// returned `TcpHandle` if the listener is app-lifetime.
-    pub fn listen(
-        &'static self,
-        port: u16,
-    ) -> Result<uni::runtime::TcpHandle, uni::runtime::TcpBindError> {
-        let listener = uni::runtime::TcpListener::bind(port)?;
-        uni::log(b"http: listening (plain)\n");
-        Ok(listener.run(move |stream| handle_plain_conn(self, stream)))
-    }
-
-    /// Start an HTTPS (TLS 1.3) listener on `port`. Requires a
-    /// TLS adapter to have been installed via `install_tls()`;
-    /// panics otherwise since the misconfiguration is a boot-time
-    /// bug, not a runtime condition apps recover from.
-    pub fn listen_tls(
-        &'static self,
-        port: u16,
-    ) -> Result<uni::runtime::TcpHandle, uni::runtime::TcpBindError> {
-        assert!(
-            self.tls_adapter.is_some(),
-            "Server::listen_tls called without install_tls",
-        );
-        let listener = uni::runtime::TcpListener::bind(port)?;
-        uni::log(b"http: listening (TLS)\n");
-        Ok(listener.run(move |stream| handle_tls_conn(self, stream)))
-    }
-
+impl Inner {
     fn find_handler(&self, path: &[u8]) -> Option<Handler> {
         let routes = &self.routes[..self.route_count];
-        // Exact match first
         if let Some(r) = routes.iter().find(|r| r.path[..r.path_len] == *path) {
             return r.handler;
         }
-        // Prefix match (e.g. "/api" matches "/api/v1/foo")
         if let Some(r) = routes.iter().find(|r| {
             r.path_len > 1 && path.len() >= r.path_len
                 && r.path[..r.path_len] == path[..r.path_len]
@@ -359,6 +265,172 @@ impl Server {
             return r.handler;
         }
         self.default_handler
+    }
+
+    fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(core::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// Builder phase — mutate while owned, then call `build()`.
+pub struct ServerBuilder {
+    inner: Inner,
+}
+
+impl ServerBuilder {
+    pub fn new() -> Self {
+        ServerBuilder {
+            inner: Inner {
+                routes: [const { Route::new() }; MAX_ROUTES],
+                route_count: 0,
+                default_handler: None,
+                tls_adapter: None,
+                shutting_down: core::sync::atomic::AtomicBool::new(false),
+            },
+        }
+    }
+
+    /// Register an exact-path handler. Consumes-and-returns so
+    /// calls chain; `Server::builder().route(...).route(...).build()`.
+    pub fn route(mut self, path: &[u8], handler: Handler) -> Self {
+        if self.inner.route_count >= MAX_ROUTES {
+            uni::log(b"http: too many routes\n");
+            return self;
+        }
+        let r = &mut self.inner.routes[self.inner.route_count];
+        let len = path.len().min(255);
+        r.path[..len].copy_from_slice(&path[..len]);
+        r.path_len = len;
+        r.handler = Some(handler);
+        self.inner.route_count += 1;
+        self
+    }
+
+    /// Set the fallback handler (called when no route matches).
+    pub fn default_handler(mut self, handler: Handler) -> Self {
+        self.inner.default_handler = Some(handler);
+        self
+    }
+
+    /// Install a TLS adapter. Required before `Server::listen_tls()`.
+    /// The adapter's `new_connection(seed)` is called once per
+    /// accepted HTTPS connection.
+    ///
+    /// App code reaches this via `uni_tls::install(builder, cfg)`
+    /// rather than calling directly — that helper wraps
+    /// `TlsServerConfig` in the adapter.
+    pub fn install_tls(mut self, adapter: Box<dyn TlsAdapter>) -> Self {
+        self.inner.tls_adapter = Some(adapter);
+        self
+    }
+
+    /// Finalise the configuration. The returned `Server` owns the
+    /// `Arc<Inner>`; accept tasks get their own clones.
+    pub fn build(self) -> Server {
+        Server {
+            inner: Arc::new(self.inner),
+            handles: Vec::new(),
+        }
+    }
+}
+
+/// The async unikernel HTTP/1.1 server.
+///
+/// Lifecycle:
+///   1. `Server::builder()` → `ServerBuilder` (owned, mutable).
+///      Configure `route` / `default_handler` / `install_tls`.
+///   2. `.build()` → `Server`. The inner config is wrapped in an
+///      `Arc` that accept tasks share; `Server` itself is the
+///      single owner and holds the `TcpHandle`s for each port it's
+///      listening on.
+///   3. `server.listen(port)` / `server.listen_tls(port)` binds a
+///      port and spawns a per-worker accept fan-out. The handle is
+///      stashed inside `self.handles` so `Server::Drop` tears down
+///      the listener on shutdown.
+///
+/// Drop semantics:
+///   * The app drops `Server` (e.g. the field holding it inside
+///     `uni::App`).
+///   * `Drop::drop` flips `shutting_down = true` and lets
+///     `self.handles` drop — each `TcpHandle::Drop` aborts the
+///     corresponding accept task and releases the port.
+///   * Per-conn tasks observe `shutting_down` at the top of their
+///     loop on their next iteration. An idle HTTP keep-alive task
+///     sitting in a long `recv().await` doesn't see it until its
+///     idle timeout fires (~30 s), so full drain is bounded by
+///     `IDLE_TIMEOUT_US` rather than immediate — adding a
+///     broadcast wake-up for force-cancel would want a different
+///     primitive than the current single-waiter `AsyncEvent`.
+///   * `Arc<Inner>` drops when the last per-conn task releases its
+///     clone, freeing the route table and TLS config.
+pub struct Server {
+    inner: Arc<Inner>,
+    handles: alloc::vec::Vec<uni::runtime::TcpHandle>,
+}
+
+impl Server {
+    /// Start building a new server.
+    pub fn builder() -> ServerBuilder {
+        ServerBuilder::new()
+    }
+
+    /// True iff a TLS adapter has been installed. Callers usually
+    /// pair `install_tls` in the builder with `listen_tls` on the
+    /// server; this is for apps that want to gate HTTPS on cert
+    /// availability at runtime.
+    pub fn has_tls(&self) -> bool {
+        self.inner.tls_adapter.is_some()
+    }
+
+    /// Start a plain-HTTP listener on `port`.
+    pub fn listen(
+        &mut self,
+        port: u16,
+    ) -> Result<(), uni::runtime::TcpBindError> {
+        let listener = uni::runtime::TcpListener::bind(port)?;
+        uni::log(b"http: listening (plain)\n");
+        let inner = Arc::clone(&self.inner);
+        let handle = listener.run(move |stream| {
+            let inner = Arc::clone(&inner);
+            async move { handle_plain_conn(inner, stream).await }
+        });
+        self.handles.push(handle);
+        Ok(())
+    }
+
+    /// Start an HTTPS (TLS 1.3) listener on `port`. Requires a TLS
+    /// adapter to have been installed in the builder; panics
+    /// otherwise since the misconfiguration is a boot-time bug.
+    pub fn listen_tls(
+        &mut self,
+        port: u16,
+    ) -> Result<(), uni::runtime::TcpBindError> {
+        assert!(
+            self.inner.tls_adapter.is_some(),
+            "Server::listen_tls called without install_tls in builder",
+        );
+        let listener = uni::runtime::TcpListener::bind(port)?;
+        uni::log(b"http: listening (TLS)\n");
+        let inner = Arc::clone(&self.inner);
+        let handle = listener.run(move |stream| {
+            let inner = Arc::clone(&inner);
+            async move { handle_tls_conn(inner, stream).await }
+        });
+        self.handles.push(handle);
+        Ok(())
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        // Tell per-conn tasks to exit at their next loop iteration.
+        self.inner
+            .shutting_down
+            .store(true, core::sync::atomic::Ordering::Release);
+        // `handles` drops next (in field order), taking the accept
+        // tasks + port slots with it. Per-conn tasks drain on their
+        // own and release their `Arc<Inner>` clones as they exit;
+        // `Inner` itself frees when the last clone drops.
     }
 }
 
@@ -374,10 +446,14 @@ impl Server {
 /// the stack before moving to the heap under rustc's current
 /// layout, which measurably hurt HVF-side throughput on the TLS
 /// workloads.
-async fn handle_plain_conn(server: &'static Server, stream: uni::TcpStream) {
+async fn handle_plain_conn(server: Arc<Inner>, stream: uni::TcpStream) {
     let mut buf: Box<[u8]> = alloc::vec![0u8; BUF_SIZE].into_boxed_slice();
     let mut buf_len = 0usize;
     loop {
+        if server.is_shutting_down() {
+            stream.close();
+            return;
+        }
         if buf_len == BUF_SIZE {
             // Parse buffer full and no progress — client is
             // sending a request larger than we're prepared to
@@ -444,7 +520,7 @@ async fn handle_plain_conn(server: &'static Server, stream: uni::TcpStream) {
 /// request/response machinery as the plain path. The TLS handshake
 /// and app-data phases share this loop — the state machine itself
 /// tracks which records are handshake vs application.
-async fn handle_tls_conn(server: &'static Server, stream: uni::TcpStream) {
+async fn handle_tls_conn(server: Arc<Inner>, stream: uni::TcpStream) {
     // Seed the per-conn ephemeral keypair. `uni::rng::fill_bytes`
     // abstracts the cfg split (ChaCha20 PRNG seeded at boot on
     // bare-metal, `arc4random_buf` / `getentropy` on native).
@@ -467,6 +543,11 @@ async fn handle_tls_conn(server: &'static Server, stream: uni::TcpStream) {
     let mut tx_scratch = [0u8; 2048];
 
     loop {
+        if server.is_shutting_down() {
+            let _ = tls.close_notify();
+            stream.close();
+            return;
+        }
         // --- Drain any pending TLS TX (handshake flight, encrypted
         // app-data from a previous iteration's response, alerts).
         loop {

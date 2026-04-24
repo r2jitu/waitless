@@ -20,13 +20,16 @@ pub use net_tls_server::TlsServerConfig;
 
 // ── Free-function entry point ────────────────────────────────────────────
 
-/// Attach `cfg` to `server` so subsequent `server.listen_tls(port)`
-/// calls can accept HTTPS connections. `cfg` is wrapped in an
-/// adapter and stored on the server via the TLS-agnostic
-/// `install_tls` entry; the actual listener is started by the
-/// caller after `Box::leak`-ing the server.
-pub fn install(server: &mut uni_http::Server, cfg: TlsServerConfig) {
-    server.install_tls(Box::new(TlsAdapterImpl { cfg: Arc::new(cfg) }));
+/// Attach `cfg` to the server builder so subsequent
+/// `Server::listen_tls(port)` calls can accept HTTPS connections.
+/// `cfg` is wrapped in an adapter and stored on the builder via
+/// the TLS-agnostic `install_tls` entry. Consumes and returns the
+/// builder to keep chained construction readable.
+pub fn install(
+    builder: uni_http::ServerBuilder,
+    cfg: TlsServerConfig,
+) -> uni_http::ServerBuilder {
+    builder.install_tls(Box::new(TlsAdapterImpl { cfg: Arc::new(cfg) }))
 }
 
 // ── Diagnostic helpers (moved from `uni::http`) ──────────────────────────

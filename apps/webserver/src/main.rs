@@ -34,12 +34,11 @@ const HTTPS_PORT: u16 = 443;
 
 /// Holds the long-lived state of the webserver program.
 ///
-/// The `Server` itself is `Box::leak`-ed before `listen()` — the
-/// per-conn accept tasks capture `&'static Server` directly, so
-/// the app doesn't need to carry a Box reference here. We just
-/// keep the `Net` handle so the network stack stays up for the
-/// process lifetime.
+/// Dropping `WebServerApp` drops the HTTP `Server` (which aborts
+/// accept tasks and signals per-conn tasks to exit) and the `Net`
+/// handle (which marks the stack disabled).
 struct WebServerApp {
+    _server: uni_http::Server,
     _net: Net,
 }
 
@@ -99,34 +98,26 @@ impl WebServerApp {
             Err(_) => uni::log(b"TCP echo: bind FAILED\n"),
         }
 
-        let mut server = Server::new_boxed();
-        server.default_handler(handle_request);
+        let builder = Server::builder().default_handler(handle_request);
+        let builder =
+            if let Some(cfg) = TlsServerConfig::from_dev_cert(DEV_CERT_DER, DEV_KEY_PKCS8_DER) {
+                uni::log(b"TLS: dev cert loaded. Serving HTTPS.\n");
+                uni_tls::install(builder, cfg)
+            } else {
+                uni::log(b"TLS: failed to parse dev key; HTTPS disabled.\n");
+                builder
+            };
+        let mut server = builder.build();
 
-        if let Some(cfg) = TlsServerConfig::from_dev_cert(DEV_CERT_DER, DEV_KEY_PKCS8_DER) {
-            uni::log(b"TLS: dev cert loaded. Serving HTTPS.\n");
-            uni_tls::install(&mut server, cfg);
-        } else {
-            uni::log(b"TLS: failed to parse dev key; HTTPS disabled.\n");
+        if server.listen(http_port).is_err() {
+            uni::log(b"http: bind FAILED\n");
         }
-
-        // Freeze: leak the fully-configured server and spawn the
-        // listeners. Accept tasks capture this `&'static Server`
-        // directly; no globals. Handles get `.leak()`'d for
-        // app-lifetime serving.
-        let server: &'static Server = alloc::boxed::Box::leak(server);
-        match server.listen(http_port) {
-            Ok(h) => h.leak(),
-            Err(_) => uni::log(b"http: bind FAILED\n"),
-        }
-        if server.has_tls() {
-            match server.listen_tls(https_port) {
-                Ok(h) => h.leak(),
-                Err(_) => uni::log(b"https: bind FAILED\n"),
-            }
+        if server.has_tls() && server.listen_tls(https_port).is_err() {
+            uni::log(b"https: bind FAILED\n");
         }
 
         uni::log(b"Entering event loop.\n");
-        WebServerApp { _net: net }
+        WebServerApp { _server: server, _net: net }
     }
 }
 

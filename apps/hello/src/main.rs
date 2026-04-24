@@ -15,10 +15,12 @@ extern crate uni_http;
 use uni::net::{Net, NetBringUp};
 use uni_http::{Request, Response, Server};
 
-/// The app holds the `Net` so the network stack stays up for the
-/// process lifetime. The HTTP server itself is `Box::leak`-ed
-/// before `listen()` — accept tasks capture `&'static Server`.
+/// Holds the `Server` (for graceful shutdown) and `Net` (keeps
+/// the network stack alive) for the program's lifetime. Dropping
+/// the app drops the Server, which aborts the accept loop and
+/// signals per-conn tasks to exit.
 struct HelloApp {
+    _server: Server,
     _net: Net,
 }
 
@@ -26,14 +28,13 @@ impl uni::App for HelloApp {}
 
 impl HelloApp {
     fn new(net: Net) -> Self {
-        let mut server = Server::new_boxed();
-        server.default_handler(hello);
-        let server: &'static Server = alloc::boxed::Box::leak(server);
+        let mut server = Server::builder()
+            .default_handler(hello)
+            .build();
         server
             .listen(uni::config_port(80))
-            .expect("HelloApp: TCP listener bind failed")
-            .leak();
-        HelloApp { _net: net }
+            .expect("HelloApp: TCP listener bind failed");
+        HelloApp { _server: server, _net: net }
     }
 }
 

@@ -49,4 +49,5 @@ trap 'rmdir "$LOCKDIR" 2>/dev/null || true' EXIT
 bazel \
     "--output_base=${OUTPUT_BASE}" \
     run --ui_event_filters=-info,-stdout,-stderr --noshow_progress \
+    --platforms=//bazel/platforms:aarch64_unikernel \
     //:discover_rust_project 2>&1 | awk '/^\{/'
