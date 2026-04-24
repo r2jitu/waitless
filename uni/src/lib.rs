@@ -234,17 +234,6 @@ pub fn cpu_id() -> u32 {
     { 0 }
 }
 
-// ---- UDP ------------------------------------------------------------------
-
-/// Send a UDP datagram. Thin convenience for apps that want to
-/// reply inside a `UdpSocket::run_each` sync handler without
-/// routing through the `&UdpSocket` (which the `Fn` closure can't
-/// capture across workers). `uni::runtime::UdpSocket::run_loop`
-/// is the preferred pattern when the handler can own the socket.
-pub fn udp_send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
-    uni_backend::udp_send(dst_ip, src_port, dst_port, data);
-}
-
 // ---- NIC driver diagnostics ------------------------------------------------
 
 pub fn net_rx_counts() -> [u64; 8] { uni_backend::net_rx_counts() }

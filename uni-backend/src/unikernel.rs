@@ -35,7 +35,6 @@ pub use uni_drivers::net::{
 // has_data / is_closed / poll) has no callers outside the async
 // reactor's internal hooks and is gone.
 pub use uni_net_stack::tcp::close as tcp_close;
-pub use uni_net_stack::udp::send as udp_send;
 
 // ---- Event loop re-exports ------------------------------------------------
 

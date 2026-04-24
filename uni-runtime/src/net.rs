@@ -21,23 +21,25 @@
 // `run` method:
 //
 // ```rust
-// UdpSocket::bind(7)?.run(|sock| async move {
+// let echo = UdpSocket::bind(7)?.run(|sock| async move {
 //     let mut buf = [0u8; 1500];
 //     loop {
 //         let (ip, port, n) = sock.recv_from(&mut buf).await;
-//         uni::udp_send(ip, 7, port, &buf[..n]);
+//         let _ = sock.send_to(ip, port, &buf[..n]);
 //     }
 // });
+// // store `echo` (a `UdpHandle`) on a long-lived owner so it
+// // tears down cleanly when the owner drops.
 // ```
 //
-// `run` consumes the socket, leaks it to `&'static`, and arranges
-// the same async body to be spawned on every worker when that
-// worker's event loop starts. Forgetting to spawn-per-worker is
+// `run` consumes the socket, wraps it in an `Arc`, and arranges
+// the same async body to be spawned on every worker on that
+// worker's next tick. Forgetting to spawn-per-worker is
 // impossible — bind+spawn happen together.
 //
-// The lower-level `bind` + `recv_from` is still exposed for cases
-// that want custom lifecycle or multiple concurrent tasks sharing
-// the socket (one per worker).
+// The lower-level `bind` + `recv_from` / `send_to` is still
+// exposed for short-lived request/reply patterns (DHCP client,
+// DNS query, fire-and-forget emit) that don't need fan-out.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -330,10 +332,10 @@ pub enum UdpBindError {
 ///     NTP query): `bind(port)?` → `send_to` / `recv_from` → drop.
 ///     `Drop` releases the port slot.
 ///   * **Long-lived listener / fan-out reactor** (UDP echo,
-///     QUIC): `bind(port)?.run_each(handler)` returns a
-///     [`UdpHandle`]. Drop it to stop the per-worker receivers
-///     and release the port; call `.leak()` when the listener
-///     should live for the whole process.
+///     QUIC): `bind(port)?.run(body)` returns a [`UdpHandle`]
+///     that stops the per-worker tasks and releases the port on
+///     drop. Store the handle on a long-lived owner (your `App`
+///     struct) so it tears down cleanly when the owner drops.
 #[must_use = "UdpSocket releases its port on drop; bind without \
               using the socket immediately releases it again"]
 pub struct UdpSocket {
@@ -433,50 +435,23 @@ impl UdpSocket {
         }
     }
 
-    /// Convenience: per-datagram sync handler. The framework owns
-    /// the receive loop; `handler` is called once per inbound
-    /// datagram on the worker that received it. For async
-    /// per-datagram work (e.g. DB lookups), use `run_loop` instead.
+    /// Spawn `body` once per worker. Each invocation gets its own
+    /// `Arc<UdpSocket>` clone and typically loops on `recv_from`
+    /// (and replies via `send_to`) to drive the per-worker inbox.
     ///
     /// Returns a [`UdpHandle`] whose `Drop` aborts the per-worker
-    /// recv tasks and releases the port. Long-lived listeners
-    /// should call `.leak()` on the handle.
-    pub fn run_each<H>(self, handler: H) -> UdpHandle
-    where
-        H: Fn([u8; 4], u16, &[u8]) + Send + Sync + 'static,
-    {
-        let handler = Arc::new(handler);
-        self.run_loop_boxed(Box::new(move |sock: Arc<UdpSocket>| {
-            let handler = Arc::clone(&handler);
-            Box::pin(async move {
-                let mut buf = [0u8; MAX_PAYLOAD];
-                loop {
-                    let (src_ip, src_port, n) = sock.recv_from(&mut buf).await;
-                    handler(src_ip, src_port, &buf[..n]);
-                }
-            })
-        }))
-    }
-
-    /// Escape hatch: custom async body, spawned once per worker.
-    /// The body receives `Arc<UdpSocket>` (owned ref — the task's
-    /// future owns its clone, so lifetime is `'static`) and
-    /// typically loops on `recv_from` to drive the per-worker
-    /// inbox. Use this when the sync `run_each` doesn't fit
-    /// (async per-datagram work, batched reads, cross-message
-    /// state not expressible via `PerWorker`).
-    ///
-    /// Returns a [`UdpHandle`] whose `Drop` aborts the per-worker
-    /// recv tasks and releases the port.
-    pub fn run_loop<H, F>(self, body: H) -> UdpHandle
+    /// tasks and releases the port. Store the handle on a
+    /// long-lived owner (typically your `App` struct) so the
+    /// listener tears down cleanly when the owner drops.
+    pub fn run<H, F>(self, body: H) -> UdpHandle
     where
         H: Fn(Arc<UdpSocket>) -> F + Send + Sync + 'static,
         F: Future<Output = ()> + 'static,
     {
-        self.run_loop_boxed(Box::new(move |sock| Box::pin(body(sock))))
+        self.run_boxed(Box::new(move |sock| Box::pin(body(sock))))
     }
 
-    fn run_loop_boxed(self, body: BoxedBody) -> UdpHandle {
+    fn run_boxed(self, body: BoxedBody) -> UdpHandle {
         let ctx = Arc::new(UdpFanoutCtx {
             sock: Arc::new(self),
             body,
@@ -507,7 +482,7 @@ impl UdpSocket {
     }
 }
 
-// ---- UdpHandle: owning reference returned by run_each / run_loop --
+// ---- UdpHandle: owning reference returned by `run` --------------------------
 
 type BoxedBody = Box<
     dyn Fn(Arc<UdpSocket>) -> Pin<Box<dyn Future<Output = ()>>>
@@ -1216,8 +1191,8 @@ pub fn deliver_tcp_ready(dst_port: u16) -> bool {
 // entire uptime.
 
 /// Bounded cap on launchers ever allocated, not live at once.
-/// Each `UdpSocket::run_each` / `TcpListener::run` / etc. costs
-/// one slot; handle drop marks the slot as a tombstone but doesn't
+/// Each `UdpSocket::run` / `TcpListener::run` / etc. costs one
+/// slot; handle drop marks the slot as a tombstone but doesn't
 /// free it for reuse. 256 covers a realistic long-running app.
 const MAX_NET_LAUNCHERS: usize = 256;
 

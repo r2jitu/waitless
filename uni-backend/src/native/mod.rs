@@ -1468,7 +1468,7 @@ fn open_udp_relay(app_port: u16) -> Result<(), ()> {
     }
 }
 
-pub fn udp_send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
+fn udp_send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
     unsafe {
         // Handler runs inline on a worker thread after its kqueue
         // reported the sibling ready. Reply on that worker's own

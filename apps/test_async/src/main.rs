@@ -2,7 +2,7 @@
 //
 // Exercises the task arena, Waker wiring, and `Sleep` future.
 // Also verifies socket-lifecycle cleanup end-to-end: bind+drop
-// and bind+run_each+drop both re-release their port so the next
+// and bind+run+drop both re-release their port so the next
 // `bind(same_port)` succeeds. That's a real regression catch for
 // the UdpSocket/TcpListener `Drop` impls and for `UdpHandle`/
 // `TcpHandle::drop` task-abort + port-release ordering.
@@ -83,18 +83,22 @@ fn run_udp_bind_drop_cycle() {
     // clean for the next phase if we ever reuse PORT.
 }
 
-/// Phase 2: bind + `run_each` + drop handle + re-bind. Verifies
+/// Phase 2: bind + `run` + drop handle + re-bind. Verifies
 /// `UdpHandle::Drop` aborts per-worker recv tasks AND releases
 /// the port (not one or the other).
 fn run_udp_fanout_drop_cycle() {
     const PORT: u16 = 17019;
     match uni::runtime::UdpSocket::bind(PORT) {
         Ok(sock) => {
-            // Handler never fires in this test (nothing is
-            // sending to port 19) but the per-worker recv tasks
-            // get spawned and parked — exactly what `drop` needs
-            // to tear down.
-            let handle = sock.run_each(|_src_ip, _src_port, _data| {});
+            // Body never receives in this test (nothing is sending
+            // to PORT) but the per-worker recv tasks get spawned
+            // and parked — exactly what `drop` needs to tear down.
+            let handle = sock.run(|sock| async move {
+                let mut buf = [0u8; 1500];
+                loop {
+                    let _ = sock.recv_from(&mut buf).await;
+                }
+            });
             drop(handle);
             uni::log(b"test_async: udp fanout drop ok\n");
         }

@@ -2,7 +2,7 @@
 //
 // Built on top of the regular UDP stack: binds port 68 via
 // `UdpSocket`, fans the per-worker reply handler out with
-// `run_each`, and sends DISCOVER / REQUEST via `send_to` with the
+// `run`, and sends DISCOVER / REQUEST via `send_to` with the
 // broadcast IP. The IPv4 layer's existing "`CONFIG.ip() == ANY` →
 // MAC broadcast" branch handles the pre-IP corner case, so DHCP
 // doesn't need a custom Ethernet/IP/UDP framer any more.
@@ -114,10 +114,11 @@ static DHCP_STATE: Spinlock<DhcpState> = Spinlock::new(DhcpState::new());
 static OFFER_READY: AsyncEvent = AsyncEvent::new();
 static ACK_READY: AsyncEvent = AsyncEvent::new();
 
-/// `UdpSocket::run_each` handler — fires on whichever worker the
-/// OFFER / ACK arrived on. Parses the DHCP payload and updates the
-/// shared `DHCP_STATE`. Validation + option walking lives in
-/// `dhcp_parse`; see its unit tests for the edge-case coverage.
+/// Per-datagram handler invoked from inside the `UdpSocket::run`
+/// body — fires on whichever worker the OFFER / ACK arrived on.
+/// Parses the DHCP payload and updates the shared `DHCP_STATE`.
+/// Validation + option walking lives in `dhcp_parse`; see its
+/// unit tests for the edge-case coverage.
 fn handle_reply(_src_ip: [u8; 4], src_port: u16, payload: &[u8]) {
     // DHCP servers always source from port 67. Drop anything else.
     if src_port != 67 {
@@ -240,13 +241,18 @@ pub async fn discover() -> bool {
         Ok(s) => s,
         Err(_) => return false,
     };
-    // `run_each` returns a `UdpHandle` whose `Drop` aborts the
+    // `run` returns a `UdpHandle` whose `Drop` aborts the
     // per-worker recv tasks and releases port 68 — so when
     // `discover` returns (success, timeout, or failure) the socket
-    // is fully torn down, not leaked like it would be for a
-    // long-lived listener. Retries of `Net::enable(Dhcp)` after a
+    // is fully torn down. Retries of `Net::enable(Dhcp)` after a
     // transient failure can re-bind cleanly.
-    let sock = sock.run_each(handle_reply);
+    let sock = sock.run(|sock| async move {
+        let mut buf = [0u8; 1500];
+        loop {
+            let (src_ip, src_port, n) = sock.recv_from(&mut buf).await;
+            handle_reply(src_ip, src_port, &buf[..n]);
+        }
+    });
 
     {
         let mut s = DHCP_STATE.lock();

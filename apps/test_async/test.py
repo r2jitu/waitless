@@ -7,7 +7,7 @@ Boots the test_async launcher via `run_variant_and_capture` and asserts:
     Waker / Sleep chain works end-to-end.
   * `UdpSocket::bind` + `drop` re-releases the port (second bind
     to the same port succeeds).
-  * `UdpSocket::bind + run_each + drop(handle)` re-releases the
+  * `UdpSocket::bind + run + drop(handle)` re-releases the
     port AND stops the per-worker recv tasks — same rebind proof.
   * Same two checks for `TcpListener` / `TcpHandle`.
 
