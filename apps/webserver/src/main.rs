@@ -48,9 +48,13 @@ impl WebServerApp {
 
         match uni::runtime::UdpSocket::bind(7) {
             Ok(sock) => {
+                // App-lifetime listener — `.leak()` so the
+                // returned `UdpHandle`'s Drop doesn't tear down
+                // the per-worker recv tasks when the match arm
+                // ends.
                 sock.run_each(|src_ip, src_port, data| {
                     uni::udp_send(src_ip, 7, src_port, data);
-                });
+                }).leak();
                 uni::log(b"UDP echo server on port 7 (async, per-worker)\n");
             }
             Err(_) => uni::log(b"UDP echo: bind FAILED\n"),
@@ -84,7 +88,7 @@ impl WebServerApp {
                             return;
                         }
                     }
-                });
+                }).leak();
                 uni::log(b"TCP echo server on port 9 (async, per-worker)\n");
             }
             Err(_) => uni::log(b"TCP echo: bind FAILED\n"),

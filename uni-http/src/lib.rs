@@ -329,7 +329,9 @@ impl Server {
         HTTP_LISTEN_PORT.store(port, core::sync::atomic::Ordering::Release);
         match uni::runtime::TcpListener::bind(port) {
             Ok(listener) => {
-                listener.run(|stream| handle_plain_conn(stream));
+                // App-lifetime listener — leak so the accept tasks
+                // survive the `listen()` return.
+                listener.run(|stream| handle_plain_conn(stream)).leak();
                 uni::log(b"http: listening (plain)\n");
             }
             Err(_) => uni::log(b"http: failed to bind HTTP listener\n"),
@@ -357,7 +359,7 @@ impl Server {
         TLS_LISTEN_PORT.store(port, core::sync::atomic::Ordering::Release);
         match uni::runtime::TcpListener::bind(port) {
             Ok(listener) => {
-                listener.run(|stream| handle_tls_conn(stream));
+                listener.run(|stream| handle_tls_conn(stream)).leak();
                 uni::log(b"http: listening (TLS)\n");
             }
             Err(_) => uni::log(b"http: failed to bind HTTPS listener\n"),

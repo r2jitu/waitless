@@ -261,16 +261,32 @@ pub enum UdpBindError {
     BackendFailed,
 }
 
-/// A UDP socket bound to one port. Created with `bind`; the typical
-/// pattern is to call `.run(|sock| async move { ... })` on it
-/// immediately, which consumes the socket and spawns a per-worker
-/// handler task.
+/// A UDP socket bound to one port.
 ///
-/// For custom lifecycle, use `bind` + manual `spawn_on_each_worker`
-/// with `&'static UdpSocket`, holding onto the socket explicitly.
+/// Two lifecycles:
+///   * **Short-lived request/reply** (DHCP bring-up, DNS client,
+///     NTP query): `bind(port)?` → `send_to` / `recv_from` → drop.
+///     `Drop` releases the port slot.
+///   * **Long-lived listener / fan-out reactor** (UDP echo,
+///     QUIC): `bind(port)?.run_each(handler)` returns a
+///     [`UdpHandle`]. Drop it to stop the per-worker receivers
+///     and release the port; call `.leak()` when the listener
+///     should live for the whole process.
+#[must_use = "UdpSocket releases its port on drop; bind without \
+              using the socket immediately releases it again"]
 pub struct UdpSocket {
     port: u16,
     idx: usize,
+}
+
+impl Drop for UdpSocket {
+    fn drop(&mut self) {
+        // Release the port slot so a subsequent `bind(port)` can
+        // reclaim it. The inbox's unconsumed entries (if any) are
+        // left in place — the next bind that lands on this slot
+        // calls `reset()` on every worker's inbox before use.
+        REGISTRY[self.idx].port.store(0, Ordering::Release);
+    }
 }
 
 impl UdpSocket {
@@ -337,10 +353,10 @@ impl UdpSocket {
     /// datagram on the worker that received it. For async
     /// per-datagram work (e.g. DB lookups), use `run_loop` instead.
     ///
-    /// `handler` is `Fn`, called concurrently across workers. State
-    /// across calls should live in `PerCpu<T, MAX_WORKERS>` or use
-    /// interior mutability.
-    pub fn run_each<H>(self, handler: H) -> &'static UdpSocket
+    /// Returns a [`UdpHandle`] whose `Drop` aborts the per-worker
+    /// recv tasks and releases the port. Long-lived listeners
+    /// should call `.leak()` on the handle.
+    pub fn run_each<H>(self, handler: H) -> UdpHandle
     where
         H: Fn([u8; 4], u16, &[u8]) + Send + Sync + 'static,
     {
@@ -364,30 +380,108 @@ impl UdpSocket {
     /// sync `run_each` doesn't fit (async per-datagram work, batched
     /// reads, cross-message state not expressible via `PerCpu`).
     ///
-    /// Returns the leaked `&'static UdpSocket` so request/reply
-    /// protocols (DHCP, DNS client, etc.) can keep sending on it
-    /// while receivers fan out across workers. Pure-receiver callers
-    /// can drop the returned reference.
-    pub fn run_loop<H, F>(self, body: H) -> &'static UdpSocket
+    /// Returns a [`UdpHandle`] whose `Drop` aborts the per-worker
+    /// recv tasks and releases the port.
+    pub fn run_loop<H, F>(self, body: H) -> UdpHandle
     where
         H: Fn(&'static UdpSocket) -> F + Send + Sync + 'static,
         F: Future<Output = ()> + 'static,
     {
+        // The socket + fanout context stay heap-allocated for the
+        // duration of the spawned recv tasks. We can't safely free
+        // them on UdpHandle drop because the aborted tasks don't
+        // actually drop their futures until each owning worker's
+        // next tick — and those futures hold `&'static UdpSocket`.
+        // Leaking ~100 bytes per `run_each` is the pragmatic
+        // choice; the port slot (the finite resource) is reclaimed
+        // cleanly.
         let leaked: &'static UdpSocket = Box::leak(Box::new(self));
+        let ctx: &'static UdpFanoutCtx = Box::leak(Box::new(UdpFanoutCtx::new()));
         register_net_launcher(Box::new(move || {
+            if ctx.stopping.load(Ordering::Acquire) {
+                return;
+            }
             let fut = body(leaked);
-            let _ = crate::spawn(fut);
+            if let Ok(h) = crate::spawn(fut) {
+                let cc = CurrentCore::enter();
+                *ctx.handles[cc.id() as usize].lock() = Some(h);
+            }
         }));
-        leaked
+        UdpHandle { sock: leaked, ctx }
     }
 }
 
-// `UdpSocket` deliberately does NOT implement `Drop`. `bind` +
-// `run` is the intended lifecycle; `run` consumes self. The lower-
-// level `bind` without `run` also leaks — port slots are intended
-// to be permanent allocations. If explicit release becomes needed
-// later, add a dedicated `release()` method rather than repurposing
-// `Drop`.
+// ---- UdpHandle: owning reference returned by run_each / run_loop --
+
+/// Per-fanout coordination: a stop flag and one `TaskHandle` slot
+/// per worker. Producer (the launcher) fills a slot on its
+/// worker's tick; consumer (`UdpHandle::drop`) aborts every filled
+/// slot. Leaked alongside the socket — see `run_loop`.
+struct UdpFanoutCtx {
+    /// Set by `UdpHandle::drop`. Checked by launchers that haven't
+    /// fired yet so late ticks don't spawn zombie tasks after the
+    /// handle is gone.
+    stopping: AtomicBool,
+    handles: [SpinLock<Option<crate::TaskHandle>>; MAX_WORKERS],
+}
+
+impl UdpFanoutCtx {
+    fn new() -> Self {
+        UdpFanoutCtx {
+            stopping: AtomicBool::new(false),
+            handles: [const { SpinLock::new(None) }; MAX_WORKERS],
+        }
+    }
+}
+
+/// Owning handle to a running `UdpSocket` fanout. Use via `Deref`
+/// for `send_to` / `recv_from` / `port`; `Drop` aborts the
+/// per-worker recv tasks and releases the port slot. Call
+/// `.leak()` for process-lifetime listeners.
+#[must_use = "UdpHandle stops the recv tasks and releases the port \
+              on drop; for a long-lived listener call .leak()"]
+pub struct UdpHandle {
+    sock: &'static UdpSocket,
+    ctx: &'static UdpFanoutCtx,
+}
+
+impl UdpHandle {
+    /// Relinquish ownership — the socket + recv tasks live for
+    /// the rest of the process. Idiomatic for app-lifetime UDP
+    /// listeners (UDP echo, QUIC endpoints).
+    pub fn leak(self) {
+        core::mem::forget(self);
+    }
+}
+
+impl core::ops::Deref for UdpHandle {
+    type Target = UdpSocket;
+    fn deref(&self) -> &UdpSocket {
+        self.sock
+    }
+}
+
+impl Drop for UdpHandle {
+    fn drop(&mut self) {
+        // 1. Block any launcher that hasn't fired yet on a worker
+        //    that has not ticked since run_loop was called.
+        self.ctx.stopping.store(true, Ordering::Release);
+        // 2. Abort tasks already spawned. `TaskHandle::abort` is
+        //    cross-worker-safe: sets the abort flag + forces a
+        //    tick on the owning worker so the future is dropped
+        //    promptly.
+        for slot in self.ctx.handles.iter() {
+            if let Some(h) = slot.lock().take() {
+                h.abort();
+            }
+        }
+        // 3. Release the port slot. Bypasses `UdpSocket::Drop`
+        //    because we only hold a `&'static UdpSocket` — the
+        //    owned `UdpSocket` was moved into `Box::leak` up in
+        //    `run_loop`, so its Drop never runs.
+        REGISTRY[self.sock.idx].port.store(0, Ordering::Release);
+    }
+}
 
 /// The UdpRecv future holds a mutable borrow of the caller's buffer
 /// plus a shared ref to the socket. `!Send + !Sync` via
@@ -566,9 +660,22 @@ pub fn register_tcp_backend(
     TCP_BACKEND_ACCEPT.store(accept);
 }
 
+/// A TCP listener bound to one port.
+///
+/// Two lifecycles, same shape as [`UdpSocket`]: drop directly for
+/// a short-lived bind (releases the port); call
+/// `bound.run(handler)` for the fan-out pattern and drop / leak
+/// the returned [`TcpHandle`].
+#[must_use = "TcpListener releases its port on drop"]
 pub struct TcpListener {
     port: u16,
     idx: usize,
+}
+
+impl Drop for TcpListener {
+    fn drop(&mut self) {
+        TCP_REGISTRY[self.idx].port.store(0, Ordering::Release);
+    }
 }
 
 impl TcpListener {
@@ -622,24 +729,92 @@ impl TcpListener {
     /// Spawn `body` once per accepted connection. The framework
     /// owns the accept loop; each `body(stream)` invocation runs
     /// as its own task on the worker that accepted the connection.
-    /// Consumes the listener — the port stays claimed for the
-    /// process lifetime.
-    pub fn run<H, F>(self, body: H)
+    ///
+    /// Returns a [`TcpHandle`] whose `Drop` aborts the per-worker
+    /// accept tasks and releases the port. In-flight per-connection
+    /// tasks already spawned keep running until they return
+    /// normally (the handle drop doesn't force-close live conns).
+    /// Long-lived listeners should call `.leak()` on the handle.
+    pub fn run<H, F>(self, body: H) -> TcpHandle
     where
         H: Fn(RawTcpStream) -> F + Send + Sync + 'static,
         F: Future<Output = ()> + 'static,
     {
+        // Same leak rationale as `UdpSocket::run_loop` — the
+        // spawned task holds `&'static TcpListener`, so we can't
+        // safely free the Box on handle drop.
         let leaked: &'static TcpListener = Box::leak(Box::new(self));
         let body: &'static H = Box::leak(Box::new(body));
+        let ctx: &'static TcpFanoutCtx = Box::leak(Box::new(TcpFanoutCtx::new()));
         register_net_launcher(Box::new(move || {
-            let _ = crate::spawn(async move {
+            if ctx.stopping.load(Ordering::Acquire) {
+                return;
+            }
+            if let Ok(h) = crate::spawn(async move {
                 loop {
                     let stream = leaked.accept().await;
                     let fut = body(stream);
                     let _ = crate::spawn(fut);
                 }
-            });
+            }) {
+                let cc = CurrentCore::enter();
+                *ctx.handles[cc.id() as usize].lock() = Some(h);
+            }
         }));
+        TcpHandle { listener: leaked, ctx }
+    }
+}
+
+/// Per-fanout coordination for `TcpListener::run`. Shape mirrors
+/// `UdpFanoutCtx`; separated because the two registries have
+/// different element types and there's no shared-generics payoff.
+struct TcpFanoutCtx {
+    stopping: AtomicBool,
+    handles: [SpinLock<Option<crate::TaskHandle>>; MAX_WORKERS],
+}
+
+impl TcpFanoutCtx {
+    fn new() -> Self {
+        TcpFanoutCtx {
+            stopping: AtomicBool::new(false),
+            handles: [const { SpinLock::new(None) }; MAX_WORKERS],
+        }
+    }
+}
+
+/// Owning handle to a running `TcpListener` fanout. Use via
+/// `Deref` for `port` / `accept`; `Drop` aborts the per-worker
+/// accept tasks and releases the port slot. Call `.leak()` for
+/// process-lifetime listeners.
+#[must_use = "TcpHandle stops the accept tasks and releases the \
+              port on drop; for a long-lived listener call .leak()"]
+pub struct TcpHandle {
+    listener: &'static TcpListener,
+    ctx: &'static TcpFanoutCtx,
+}
+
+impl TcpHandle {
+    pub fn leak(self) {
+        core::mem::forget(self);
+    }
+}
+
+impl core::ops::Deref for TcpHandle {
+    type Target = TcpListener;
+    fn deref(&self) -> &TcpListener {
+        self.listener
+    }
+}
+
+impl Drop for TcpHandle {
+    fn drop(&mut self) {
+        self.ctx.stopping.store(true, Ordering::Release);
+        for slot in self.ctx.handles.iter() {
+            if let Some(h) = slot.lock().take() {
+                h.abort();
+            }
+        }
+        TCP_REGISTRY[self.listener.idx].port.store(0, Ordering::Release);
     }
 }
 

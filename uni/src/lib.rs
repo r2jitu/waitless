@@ -171,7 +171,8 @@ pub mod runtime {
     pub use uni_runtime::TaskHandle;
     pub use uni_runtime::event::{AsyncEvent, WaitEvent};
     pub use uni_runtime::net::{
-        TcpBindError, TcpRecv, TcpSend, UdpBindError, UdpRecv, UdpSocket,
+        TcpBindError, TcpHandle, TcpRecv, TcpSend,
+        UdpBindError, UdpHandle, UdpRecv, UdpSocket,
     };
     pub use uni_runtime::select::{
         join, join3, select, select3, timeout_us, Either, Three,
@@ -204,18 +205,21 @@ pub mod runtime {
         }
 
         /// Spawn `body` once per accepted connection, on the worker
-        /// that accepted it. Consumes the listener — the port stays
-        /// claimed for the process lifetime. `body` receives a
-        /// `TcpStream` wrapping the backend's accepted handle
-        /// (generation-stamped for aliasing safety).
-        pub fn run<H, F>(self, body: H)
+        /// that accepted it. `body` receives a `TcpStream` wrapping
+        /// the backend's accepted handle (generation-stamped for
+        /// aliasing safety).
+        ///
+        /// Returns a `TcpHandle` whose `Drop` stops the accept
+        /// tasks and releases the port. Long-lived listeners should
+        /// call `.leak()`.
+        pub fn run<H, F>(self, body: H) -> TcpHandle
         where
             H: Fn(crate::TcpStream) -> F + Send + Sync + 'static,
             F: Future<Output = ()> + 'static,
         {
             let body = Box::new(body);
             let body = Box::leak(body);
-            self.inner.run(move |raw| body(crate::TcpStream::from_raw(raw)));
+            self.inner.run(move |raw| body(crate::TcpStream::from_raw(raw)))
         }
     }
 }

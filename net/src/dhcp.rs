@@ -241,7 +241,13 @@ pub async fn discover() -> bool {
         Ok(s) => s,
         Err(_) => return false,
     };
-    let sock: &'static UdpSocket = sock.run_each(handle_reply);
+    // `run_each` returns a `UdpHandle` whose `Drop` aborts the
+    // per-worker recv tasks and releases port 68 — so when
+    // `discover` returns (success, timeout, or failure) the socket
+    // is fully torn down, not leaked like it would be for a
+    // long-lived listener. Retries of `Net::enable(Dhcp)` after a
+    // transient failure can re-bind cleanly.
+    let sock = sock.run_each(handle_reply);
 
     {
         let mut s = DHCP_STATE.lock();
