@@ -644,7 +644,7 @@ pub fn deliver_udp(dst_port: u16, src_ip: [u8; 4], src_port: u16, payload: &[u8]
 // hook; the reactor layer is purely "notify when there's something
 // to accept".
 //
-// Accepted connections are returned as `RawTcpStream(*mut ())` —
+// Accepted connections are returned as `TcpStream(*mut ())` —
 // the same opaque handle `uni_backend::tcp_accept` returns today.
 // Higher layers wrap it into `uni::TcpStream` for the typed API.
 
@@ -660,33 +660,88 @@ pub enum TcpBindError {
     BackendFailed,
 }
 
-/// Opaque handle to a backend TCP connection. Higher layers
-/// (`uni::TcpStream`) wrap it into a typed API.
+/// Owned handle to an accepted TCP connection.
 ///
 /// `generation` is the backend-assigned generation for this conn
-/// slot; every subsequent async hook call verifies it matches the
-/// conn's current generation, so a stale handle that survived a
-/// connection close + slot reuse is detected and short-circuits to
-/// the "closed" path (recv returns 0, waker registration
-/// immediately wakes to let the task observe closure).
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct RawTcpStream {
-    pub handle: *mut (),
-    pub generation: u16,
+/// slot. Every per-stream hook (`recv`, `send`, `close`) verifies
+/// it matches the conn's current generation; a stale handle that
+/// survived a close + slot reuse is detected and short-circuits
+/// to the "closed" path (recv returns 0, waker registration
+/// immediately wakes, close no-ops).
+///
+/// `!Send + !Copy + !Clone + Drop`:
+/// - `!Send` because backends return pointers into per-worker
+///   state; moving a stream across workers is wrong. The task
+///   system already keeps futures pinned to their spawning worker.
+/// - `!Copy + !Clone` because the stream owns the conn — at most
+///   one `Drop` per accepted conn keeps the close path
+///   single-shot.
+/// - `Drop` sends FIN and releases the backend's per-stream state
+///   via `TcpBackend::close`. Apps don't need an explicit
+///   `close()` call on every exit path; `return` from a `run`
+///   body drops the stream and tears down cleanly.
+pub struct TcpStream {
+    handle: *mut (),
+    generation: u16,
+    _not_send: PhantomData<*mut ()>,
 }
 
-/// `!Send` — backends return pointers into per-worker state; moving
-/// a stream across workers is wrong. The task system already keeps
-/// futures pinned to their spawning worker.
-impl RawTcpStream {
-    pub const NULL: Self = RawTcpStream {
+impl TcpStream {
+    /// Sentinel returned by `TcpBackend::accept` when no
+    /// connection is ready. Carries a null pointer; `is_null` is
+    /// the way for the reactor to detect this without ever
+    /// constructing a real `TcpStream` for "nothing yet".
+    ///
+    /// SAFETY (for Drop): a null pointer never reaches user code —
+    /// the `TcpAccept` future filters it out before the stream is
+    /// moved into a body. `TcpStream::Drop` (and `TcpBackend::close`)
+    /// no-op on a null handle.
+    pub const NULL: Self = TcpStream {
         handle: core::ptr::null_mut(),
         generation: 0,
+        _not_send: PhantomData,
     };
+
+    /// Construct directly from a backend handle + generation.
+    /// Backends call this from their `accept` hook when a fresh
+    /// conn is ready.
+    #[inline]
+    pub const fn from_raw(handle: *mut (), generation: u16) -> Self {
+        TcpStream { handle, generation, _not_send: PhantomData }
+    }
 
     #[inline]
     pub fn is_null(&self) -> bool {
         self.handle.is_null()
+    }
+
+    /// Async read. Resolves with the byte count when data is
+    /// available (or `0` on peer close / stale generation).
+    #[inline]
+    pub fn recv<'a>(&'a self, buf: &'a mut [u8]) -> TcpRecv<'a> {
+        TcpRecv::new(self.handle, self.generation, buf)
+    }
+
+    /// Async write. Resolves `Ok(())` when every byte of `data`
+    /// has been queued to the backend, `Err(())` if the conn is
+    /// broken.
+    #[inline]
+    pub fn send<'a>(&'a self, data: &'a [u8]) -> TcpSend<'a> {
+        TcpSend::new(self.handle, self.generation, data)
+    }
+}
+
+impl Drop for TcpStream {
+    fn drop(&mut self) {
+        if self.handle.is_null() {
+            // The NULL sentinel produced by `accept` when nothing
+            // was ready. Filtered out before reaching user code,
+            // but Drop runs on every value in scope — guard here.
+            return;
+        }
+        if let Some(b) = tcp_backend() {
+            (b.close)(self.handle, self.generation);
+        }
     }
 }
 
@@ -724,7 +779,7 @@ static TCP_REGISTRY: [TcpState; MAX_TCP_LISTENERS] =
 /// atomic load of this pointer instead of one load per hook.
 ///
 /// Generation discipline: every per-stream hook receives the
-/// `generation` stamped into the `RawTcpStream` when it was handed
+/// `generation` stamped into the `TcpStream` when it was handed
 /// out via `TcpAccept`. A mismatch against the conn's current
 /// generation means the slot was reused, and the backend short-
 /// circuits to the "closed" path — recv returns 0, try_send
@@ -734,10 +789,10 @@ pub struct TcpBackend {
     /// Claim the listener for `port`. Bare-metal opens one TCB per
     /// core; native opens a single listen fd shared across workers.
     pub listen: fn(port: u16) -> Result<(), ()>,
-    /// Non-blocking accept. Returns `RawTcpStream::NULL` when
+    /// Non-blocking accept. Returns `TcpStream::NULL` when
     /// nothing is ready; otherwise returns a handle paired with
     /// the accepted conn's current generation.
-    pub accept: fn(port: u16) -> RawTcpStream,
+    pub accept: fn(port: u16) -> TcpStream,
     /// Optional release hook — native closes its listen fd,
     /// bare-metal frees its per-core Listen TCB slots. Backends
     /// without per-listener state can leave this `None`.
@@ -758,6 +813,13 @@ pub struct TcpBackend {
     /// Drop the stored recv waker. Called after Ready. Stale `gen`
     /// is a no-op.
     pub clear_recv_waker: fn(handle: *mut (), generation: u16),
+
+    /// Send FIN on the conn and release the backend's per-stream
+    /// state. Idempotent: a stale `gen` (slot already reused) or
+    /// already-closed conn is a no-op. Called from
+    /// `TcpStream::Drop` so apps don't have to track close
+    /// explicitly.
+    pub close: fn(handle: *mut (), generation: u16),
 
     // Per-stream send hooks (hot path — TcpSend::poll).
     /// Non-blocking write. Returns bytes-queued on success (may be
@@ -861,7 +923,7 @@ impl TcpListener {
     }
 
     /// Await the next accepted connection on the **calling worker**.
-    /// Resolves with a `RawTcpStream`. The stream pointer is
+    /// Resolves with a `TcpStream`. The stream pointer is
     /// non-null by construction of the `accept` hook contract — a
     /// null return from the hook means "not ready yet" and keeps
     /// the future Pending.
@@ -883,7 +945,7 @@ impl TcpListener {
     /// Long-lived listeners should call `.leak()` on the handle.
     pub fn run<H, F>(self, body: H) -> TcpHandle
     where
-        H: Fn(RawTcpStream) -> F + Send + Sync + 'static,
+        H: Fn(TcpStream) -> F + Send + Sync + 'static,
         F: Future<Output = ()> + 'static,
     {
         let body = Arc::new(body);
@@ -927,7 +989,7 @@ impl TcpListener {
 }
 
 type BoxedAcceptBody = Box<
-    dyn Fn(RawTcpStream) -> Pin<Box<dyn Future<Output = ()>>>
+    dyn Fn(TcpStream) -> Pin<Box<dyn Future<Output = ()>>>
         + Send + Sync + 'static,
 >;
 
@@ -995,7 +1057,7 @@ pub struct TcpAccept<'a> {
 }
 
 impl<'a> Future for TcpAccept<'a> {
-    type Output = RawTcpStream;
+    type Output = TcpStream;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
@@ -1034,7 +1096,7 @@ impl<'a> Future for TcpAccept<'a> {
 // native, rx-ring enqueue on bare-metal) and parks / wakes a single
 // per-stream `Waker` via the `register_recv_waker` / `has_data` /
 // `do_recv` / `clear_recv_waker` fields of `TcpBackend`. The stream
-// handle is an opaque `*mut ()` — identical to the `RawTcpStream`
+// handle is an opaque `*mut ()` — identical to the `TcpStream`
 // the accept reactor returns.
 
 /// Future returned by `TcpStream::recv`. Holds a mutable borrow of

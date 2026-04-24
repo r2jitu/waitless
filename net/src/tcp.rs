@@ -764,26 +764,23 @@ pub fn listen_on_core(core: u32, port: u16) -> *mut () {
 
 /// Accept a connection on the **current core** by port — the
 /// entry point used by `uni_runtime::net::TcpListener`'s backend
-/// hook. Returns `RawTcpStream::NULL` if no connection is ready
+/// hook. Returns `TcpStream::NULL` if no connection is ready
 /// on this core.
-pub fn accept_on_port(port: u16) -> uni_runtime::net::RawTcpStream {
+pub fn accept_on_port(port: u16) -> uni_runtime::net::TcpStream {
     accept_on_port_core(uni_kernel::cpu_id(), port)
 }
 
-fn accept_on_port_core(core: u32, port: u16) -> uni_runtime::net::RawTcpStream {
-    use uni_runtime::net::RawTcpStream;
+fn accept_on_port_core(core: u32, port: u16) -> uni_runtime::net::TcpStream {
+    use uni_runtime::net::TcpStream;
     for i in 0..CONNECTIONS_PER_CORE {
         // SAFETY: per-core ownership.
         let c = unsafe { &mut *conn_ptr(core, i) };
         if c.state == TcpState::Established && c.listener_port == port && !c.accepted {
             c.accepted = true;
-            return RawTcpStream {
-                handle: encode_handle(core, i),
-                generation: c.generation,
-            };
+            return TcpStream::from_raw(encode_handle(core, i), c.generation);
         }
     }
-    RawTcpStream::NULL
+    TcpStream::NULL
 }
 
 /// Async-readiness probe — returns `true` when there's inbound
@@ -843,13 +840,18 @@ fn send(handle: *mut (), data: &[u8]) -> i32 {
     sent as i32
 }
 
-pub fn close(handle: *mut ()) {
+pub fn close(handle: *mut (), generation: u16) {
     let (core, slot) = match decode_handle(handle) {
         Some(v) => v,
         None => return,
     };
     // SAFETY: per-core ownership.
     let c = unsafe { &mut *conn_ptr(core, slot) };
+    // Stale handle: slot was already reused. Drop on the floor —
+    // the slot has its own lifecycle now.
+    if c.generation != generation {
+        return;
+    }
     match c.state {
         TcpState::Established => {
             send_segment(

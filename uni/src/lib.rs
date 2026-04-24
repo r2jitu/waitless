@@ -172,54 +172,12 @@ pub mod runtime {
     pub use uni_runtime::event::{AsyncEvent, WaitEvent};
     pub use uni_runtime::launcher::{LaunchTable, Launcher};
     pub use uni_runtime::net::{
-        TcpBindError, TcpHandle, TcpRecv, TcpSend,
+        TcpBindError, TcpHandle, TcpListener, TcpRecv, TcpSend, TcpStream,
         UdpBindError, UdpHandle, UdpRecv, UdpSocket,
     };
     pub use uni_runtime::select::{
         join, join3, select, select3, timeout_us, Either, Three,
     };
-
-    use core::future::Future;
-
-    /// Async TCP listener. Wraps `uni_runtime::net::TcpListener` so
-    /// the `run` handler receives a `uni::TcpStream` directly — the
-    /// lower-level `RawTcpStream` isn't part of the app-facing API.
-    pub struct TcpListener {
-        inner: uni_runtime::net::TcpListener,
-    }
-
-    impl TcpListener {
-        /// Bind `port` on every worker. `Err` on port conflict,
-        /// invalid port, or backend bind failure.
-        #[inline]
-        pub fn bind(port: u16) -> Result<Self, TcpBindError> {
-            Ok(TcpListener {
-                inner: uni_runtime::net::TcpListener::bind(port)?,
-            })
-        }
-
-        /// Port this listener is bound to.
-        #[inline]
-        pub fn port(&self) -> u16 {
-            self.inner.port()
-        }
-
-        /// Spawn `body` once per accepted connection, on the worker
-        /// that accepted it. `body` receives a `TcpStream` wrapping
-        /// the backend's accepted handle (generation-stamped for
-        /// aliasing safety).
-        ///
-        /// Returns a `TcpHandle` whose `Drop` stops the accept
-        /// tasks and releases the port. Long-lived listeners should
-        /// call `.leak()`.
-        pub fn run<H, F>(self, body: H) -> TcpHandle
-        where
-            H: Fn(crate::TcpStream) -> F + Send + Sync + 'static,
-            F: Future<Output = ()> + 'static,
-        {
-            self.inner.run(move |raw| body(crate::TcpStream::from_raw(raw)))
-        }
-    }
 }
 
 /// Current core / worker ID. On unikernel this reads the percpu TLS
@@ -246,52 +204,3 @@ pub fn net_rx_used_cursors() -> [(u16, u16); 8] { uni_backend::net_rx_used_curso
 /// effort zero on native.
 pub fn heap_stats() -> HeapStats { uni_backend::heap_stats() }
 
-// ---- TcpStream ------------------------------------------------------------
-
-/// A TCP connection handle. Carries a `generation` stamp so async
-/// backend hooks detect slot-reuse after close — a stale stream
-/// sees `recv() == 0` / `send().await == Err` rather than aliasing
-/// a newly accepted connection that reused the slot.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct TcpStream {
-    handle: *mut (),
-    generation: u16,
-}
-
-impl TcpStream {
-    /// Wrap a raw handle from `uni::runtime::TcpListener::run` into
-    /// the typed `TcpStream` API, preserving the generation the
-    /// reactor stamped at accept time.
-    #[inline]
-    pub fn from_raw(raw: uni_runtime::net::RawTcpStream) -> Self {
-        TcpStream { handle: raw.handle, generation: raw.generation }
-    }
-
-    /// Async read. Resolves with the byte count when data is
-    /// available (or `0` on peer close / stale generation). Wakes
-    /// are delivered from the backend event loop; no polling.
-    /// Mirrors `UdpSocket::recv_from`.
-    #[inline]
-    pub fn recv<'a>(&self, buf: &'a mut [u8]) -> uni_runtime::net::TcpRecv<'a> {
-        uni_runtime::net::TcpRecv::new(self.handle, self.generation, buf)
-    }
-
-    /// Async write. Resolves `Ok(())` when every byte of `data`
-    /// has been queued to the backend, `Err(())` if the conn is
-    /// broken. Wakes are delivered by `EVFILT_WRITE` / `EPOLLOUT`
-    /// on native and by the NIC-TX path on bare-metal.
-    #[inline]
-    pub fn send<'a>(&self, data: &'a [u8]) -> uni_runtime::net::TcpSend<'a> {
-        uni_runtime::net::TcpSend::new(self.handle, self.generation, data)
-    }
-
-    /// Graceful half-close. Sends FIN; the peer will see EOF on
-    /// its next read. `recv`-side tear-down is triggered when the
-    /// peer FINs (the backend wakes any parked `TcpRecv`), so the
-    /// typical pattern is: read until `recv` returns 0, then
-    /// `close()`. Sync because it's a single TX-queue write, not
-    /// a round-trip wait.
-    pub fn close(&self) {
-        uni_backend::tcp_close(self.handle);
-    }
-}

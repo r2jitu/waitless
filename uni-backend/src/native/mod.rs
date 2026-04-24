@@ -276,7 +276,7 @@ struct NativeConn {
     closed: bool,
     has_pending_data: bool,
     /// Incremented every time this slot is released. Async handles
-    /// (RawTcpStream) carry the generation at accept time; hook
+    /// (TcpStream) carry the generation at accept time; hook
     /// callers pass it on every op so we can detect a stale handle
     /// whose slot got reused by a newer connection. u16 wraps after
     /// 65k reuses per slot — collision window one-in-65k, low enough
@@ -742,6 +742,7 @@ static NATIVE_TCP_BACKEND: uni_runtime::net::TcpBackend =
         do_recv: native_tcp_do_recv,
         register_recv_waker: native_tcp_register_recv_waker,
         clear_recv_waker: native_tcp_clear_recv_waker,
+        close: tcp_close,
         try_send: native_tcp_try_send,
         register_send_waker: native_tcp_register_send_waker,
         clear_send_waker: native_tcp_clear_send_waker,
@@ -890,8 +891,8 @@ fn async_tcp_unlisten_hook(app_port: u16) {
     }
 }
 
-fn async_tcp_accept_hook(app_port: u16) -> uni_runtime::net::RawTcpStream {
-    use uni_runtime::net::RawTcpStream;
+fn async_tcp_accept_hook(app_port: u16) -> uni_runtime::net::TcpStream {
+    use uni_runtime::net::TcpStream;
     unsafe {
         let tid = uni_platform::current_worker();
         let count = ASYNC_TCP_COUNT.load(Ordering::Acquire);
@@ -909,7 +910,7 @@ fn async_tcp_accept_hook(app_port: u16) -> uni_runtime::net::RawTcpStream {
             // see EAGAIN and re-poll on the next kqueue fire.
             let fd = accept(l.fd, ptr::null_mut(), ptr::null_mut());
             if fd < 0 {
-                return RawTcpStream::NULL;
+                return TcpStream::NULL;
             }
             set_nonblocking(fd);
             let opt: i32 = 1;
@@ -918,16 +919,13 @@ fn async_tcp_accept_hook(app_port: u16) -> uni_runtime::net::RawTcpStream {
             let c = ts.alloc_conn();
             if c.is_null() {
                 close(fd);
-                return RawTcpStream::NULL;
+                return TcpStream::NULL;
             }
             (*c).fd = fd;
             ts.register_fd(fd);
-            return RawTcpStream {
-                handle: c as *mut (),
-                generation: (*c).generation,
-            };
+            return TcpStream::from_raw(c as *mut (), (*c).generation);
         }
-        RawTcpStream::NULL
+        TcpStream::NULL
     }
 }
 
@@ -1273,10 +1271,19 @@ pub fn tcp_send(handle: *mut (), data: &[u8]) -> i32 {
     }
 }
 
-pub fn tcp_close(handle: *mut ()) {
+fn tcp_close(handle: *mut (), generation: u16) {
     let c = handle as *mut NativeConn;
     if c.is_null() { return; }
-    // Find which thread owns this connection and release it
+    // SAFETY: stream handles point into per-worker `NativeConn`
+    // pools — the `!Send` marker on `TcpStream` keeps cross-worker
+    // closes out, and the generation check rejects a stale stream
+    // whose slot was already reused by a fresh accept.
+    unsafe {
+        if (*c).generation != generation {
+            return;
+        }
+    }
+    // Find which thread owns this connection and release it.
     let tid = uni_platform::current_worker();
     thread_state(tid).release_conn(c);
 }

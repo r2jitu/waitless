@@ -54,6 +54,7 @@ static BARE_TCP_BACKEND: uni_runtime::net::TcpBackend = uni_runtime::net::TcpBac
     do_recv: tcp::async_recv,
     register_recv_waker: tcp::register_recv_waker,
     clear_recv_waker: tcp::clear_recv_waker,
+    close: tcp::close,
     try_send: tcp::async_try_send,
     register_send_waker: tcp::register_send_waker,
     clear_send_waker: tcp::clear_send_waker,
@@ -98,7 +99,7 @@ fn tcp_backend_listen(port: u16) -> Result<(), ()> {
     Ok(())
 }
 
-fn tcp_backend_accept(port: u16) -> uni_runtime::net::RawTcpStream {
+fn tcp_backend_accept(port: u16) -> uni_runtime::net::TcpStream {
     tcp::accept_on_port(port)
 }
 

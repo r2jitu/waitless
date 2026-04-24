@@ -29,12 +29,6 @@ pub use uni_drivers::net::{
     num_queue_pairs as net_num_queue_pairs, rx_counts as net_rx_counts,
     rx_used_cursors as net_rx_used_cursors,
 };
-// `tcp_close` is the only sync TCP API callers still reach — it's
-// used by `uni::TcpStream::close` on the graceful-shutdown path.
-// Every other sync TCP primitive (accept / recv / send / listen /
-// has_data / is_closed / poll) has no callers outside the async
-// reactor's internal hooks and is gone.
-pub use uni_net_stack::tcp::close as tcp_close;
 
 // ---- Event loop re-exports ------------------------------------------------
 
