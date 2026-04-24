@@ -48,7 +48,6 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU16, AtomicU32, Ordering};
 use core::task::{Context, Poll, Waker};
 
-use atomic_fn::AtomicFn;
 use uni_percpu::{CurrentCore, PerCpu, MAX_WORKERS};
 
 // ---- Sizing -----------------------------------------------------------------
@@ -251,41 +250,47 @@ impl UdpState {
 static UDP_REGISTRY: [UdpState; MAX_UDP_SOCKETS] =
     [const { UdpState::new() }; MAX_UDP_SOCKETS];
 
-// ---- Backend plug-in for bind-time setup ------------------------------------
+// ---- Backend vtable (UDP) ---------------------------------------------------
 
-static BACKEND_BIND: AtomicFn<fn(port: u16) -> Result<(), ()>> = AtomicFn::null();
-/// Optional unbind hook, registered alongside `BACKEND_BIND`.
-/// `UdpSocket::Drop` calls it so the backend can release any
-/// per-bind state it holds (native's SO_REUSEPORT sibling fds).
-/// Bare-metal has no need — UDP routing on bare-metal is purely
-/// UDP_REGISTRY-driven — so it leaves this null.
-static BACKEND_UDP_UNBIND: AtomicFn<fn(port: u16)> = AtomicFn::null();
-static BACKEND_UDP_SEND: AtomicFn<
-    fn(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]),
-> = AtomicFn::null();
-
-/// Register the backend-side bind hook. On bare-metal this stays
-/// unset — the NIC RX path unconditionally delivers to
-/// `deliver_udp`. On native, the POSIX backend registers a hook
-/// that opens SO_REUSEPORT sibling fds for each `UdpSocket::bind`.
-pub fn register_backend_bind(hook: fn(port: u16) -> Result<(), ()>) {
-    BACKEND_BIND.store(hook);
+/// All UDP backend hooks. Installed once at boot by the platform
+/// backend — native (POSIX sockets) or bare-metal (integrated NIC
+/// driver + protocol stack). `UdpSocket::bind` / `send_to` /
+/// `Drop` dispatch through a single atomic load instead of one
+/// per hook.
+pub struct UdpBackend {
+    /// Called after `UdpSocket::bind` claims a UDP_REGISTRY slot.
+    /// `None` on bare-metal (routing is REGISTRY-only); `Some` on
+    /// native (opens SO_REUSEPORT sibling fds).
+    pub bind: Option<fn(port: u16) -> Result<(), ()>>,
+    /// Mirror of `bind` — called on port release to let the
+    /// backend tear down per-bind state. Same optional-on-bare-
+    /// metal rationale.
+    pub unbind: Option<fn(port: u16)>,
+    /// Datagram send transport. Mandatory: `UdpSocket::send_to`
+    /// returns `Err(())` if the backend isn't installed yet.
+    pub send: fn(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]),
 }
 
-/// Register the optional UDP unbind hook. Called from
-/// `UdpSocket::Drop` when set so the backend can release per-bind
-/// state (native SO_REUSEPORT fds). Bare-metal doesn't need to
-/// register one — its UDP routing is pure UDP_REGISTRY lookups.
-pub fn register_backend_udp_unbind(hook: fn(port: u16)) {
-    BACKEND_UDP_UNBIND.store(hook);
+static UDP_BACKEND: AtomicPtr<UdpBackend> =
+    AtomicPtr::new(core::ptr::null_mut());
+
+/// Install the UDP backend. Call once at boot, before any
+/// `UdpSocket::bind` / `send_to`. Safe to call more than once —
+/// last writer wins — but that's not a supported runtime pattern.
+pub fn register_udp_backend(b: &'static UdpBackend) {
+    UDP_BACKEND.store(b as *const _ as *mut _, Ordering::Release);
 }
 
-/// Register the backend-side UDP send hook. Both bare-metal and
-/// native wire this; it's the transport for `UdpSocket::send_to`.
-pub fn register_backend_udp_send(
-    hook: fn(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]),
-) {
-    BACKEND_UDP_SEND.store(hook);
+#[inline]
+fn udp_backend() -> Option<&'static UdpBackend> {
+    let p = UDP_BACKEND.load(Ordering::Acquire);
+    if p.is_null() {
+        None
+    } else {
+        // SAFETY: `register_udp_backend` stores `&'static` references;
+        // the pointer is either null or a valid `&'static UdpBackend`.
+        Some(unsafe { &*p })
+    }
 }
 
 // ---- Public API -------------------------------------------------------------
@@ -338,8 +343,8 @@ impl Drop for UdpSocket {
         // unbind hook closes POSIX fds, which is much slower and
         // doesn't need to happen before the slot is reusable.
         UDP_REGISTRY[self.idx].port.store(0, Ordering::Release);
-        if let Some(hook) = BACKEND_UDP_UNBIND.load() {
-            hook(self.port);
+        if let Some(unbind) = udp_backend().and_then(|b| b.unbind) {
+            unbind(self.port);
         }
         // The inbox's unconsumed entries (if any) stay — the next
         // bind that lands on this slot calls `reset()` on every
@@ -366,8 +371,8 @@ impl UdpSocket {
                 for w in 0..MAX_WORKERS as u32 {
                     state.inboxes.at(w).reset();
                 }
-                if let Some(hook) = BACKEND_BIND.load() {
-                    if hook(port).is_err() {
+                if let Some(bind) = udp_backend().and_then(|b| b.bind) {
+                    if bind(port).is_err() {
                         state.port.store(0, Ordering::Release);
                         return Err(UdpBindError::BackendFailed);
                     }
@@ -394,8 +399,8 @@ impl UdpSocket {
     /// today since they're harmless for UDP; add a proper error
     /// enum when QUIC needs to observe them.
     pub fn send_to(&self, dst_ip: [u8; 4], dst_port: u16, data: &[u8]) -> Result<(), ()> {
-        let send = BACKEND_UDP_SEND.load().ok_or(())?;
-        send(dst_ip, self.port, dst_port, data);
+        let b = udp_backend().ok_or(())?;
+        (b.send)(dst_ip, self.port, dst_port, data);
         Ok(())
     }
 
@@ -557,8 +562,8 @@ impl Drop for UdpHandle {
         let sock = &*self.ctx.sock;
         if !sock.released.swap(true, Ordering::AcqRel) {
             UDP_REGISTRY[sock.idx].port.store(0, Ordering::Release);
-            if let Some(hook) = BACKEND_UDP_UNBIND.load() {
-                hook(sock.port);
+            if let Some(unbind) = udp_backend().and_then(|b| b.unbind) {
+                unbind(sock.port);
             }
         }
         // 4. Free the launcher Box — this drops the launcher's
@@ -727,35 +732,83 @@ impl TcpState {
 static TCP_REGISTRY: [TcpState; MAX_TCP_LISTENERS] =
     [const { TcpState::new() }; MAX_TCP_LISTENERS];
 
-// Backend hooks. On bare-metal + native both are registered at
-// init; pre-registration calls of `TcpListener::bind` / `accept`
-// return `BackendFailed` / `Pending` respectively.
+// ---- Backend vtable (TCP) ---------------------------------------------------
 
-static TCP_BACKEND_LISTEN: AtomicFn<fn(port: u16) -> Result<(), ()>> =
-    AtomicFn::null();
-static TCP_BACKEND_ACCEPT: AtomicFn<fn(port: u16) -> RawTcpStream> =
-    AtomicFn::null();
-/// Optional. `TcpListener::Drop` calls it to release backend
-/// state (native POSIX listen fd; bare-metal's per-core Listen
-/// TCB slots). Backends that don't need cleanup leave it null.
-static TCP_BACKEND_UNLISTEN: AtomicFn<fn(port: u16)> = AtomicFn::null();
+/// All TCP backend hooks. Installed once at boot by the platform
+/// backend — native (kqueue/epoll over POSIX sockets) or bare-
+/// metal (integrated NIC driver + handshake stack). Every TCP
+/// reactor dispatch — listen/accept/unlisten plus per-stream
+/// recv/send readiness and transport — goes through a single
+/// atomic load of this pointer instead of one load per hook.
+///
+/// Generation discipline: every per-stream hook receives the
+/// `generation` stamped into the `RawTcpStream` when it was handed
+/// out via `TcpAccept`. A mismatch against the conn's current
+/// generation means the slot was reused, and the backend short-
+/// circuits to the "closed" path — recv returns 0, try_send
+/// returns -1, waker registration fires immediately so the task
+/// observes closure on its next poll.
+pub struct TcpBackend {
+    /// Claim the listener for `port`. Bare-metal opens one TCB per
+    /// core; native opens a single listen fd shared across workers.
+    pub listen: fn(port: u16) -> Result<(), ()>,
+    /// Non-blocking accept. Returns `RawTcpStream::NULL` when
+    /// nothing is ready; otherwise returns a handle paired with
+    /// the accepted conn's current generation.
+    pub accept: fn(port: u16) -> RawTcpStream,
+    /// Optional release hook — native closes its listen fd,
+    /// bare-metal frees its per-core Listen TCB slots. Backends
+    /// without per-listener state can leave this `None`.
+    pub unlisten: Option<fn(port: u16)>,
 
-/// Register the TCP backend hooks. Called once at boot by the
-/// backend that owns the actual listen sockets / handshake state.
-/// `accept` returns `RawTcpStream::NULL` when nothing is ready;
-/// otherwise it returns the handle paired with the accepted conn's
-/// current generation.
-pub fn register_tcp_backend(
-    listen: fn(port: u16) -> Result<(), ()>,
-    accept: fn(port: u16) -> RawTcpStream,
-) {
-    TCP_BACKEND_LISTEN.store(listen);
-    TCP_BACKEND_ACCEPT.store(accept);
+    // Per-stream recv hooks (hot path — TcpRecv::poll).
+    /// Cheap non-blocking probe. Returns `true` also on close or
+    /// stale `gen` so the caller's `recv` resolves to `0` in those
+    /// cases.
+    pub has_data: fn(handle: *mut (), generation: u16) -> bool,
+    /// Sync read into `buf`; `0` = EOF / close / stale `gen`.
+    pub do_recv: fn(handle: *mut (), generation: u16, buf: &mut [u8]) -> usize,
+    /// Store this waker. Called before the final has-data re-check;
+    /// the backend de-dupes with `Waker::will_wake`. A stale `gen`
+    /// fires `waker` immediately.
+    pub register_recv_waker:
+        fn(handle: *mut (), generation: u16, waker: &Waker),
+    /// Drop the stored recv waker. Called after Ready. Stale `gen`
+    /// is a no-op.
+    pub clear_recv_waker: fn(handle: *mut (), generation: u16),
+
+    // Per-stream send hooks (hot path — TcpSend::poll).
+    /// Non-blocking write. Returns bytes-queued on success (may be
+    /// partial), `0` if the backend is full (caller should park a
+    /// waker and re-poll), or negative on fatal conn error /
+    /// stale `gen`.
+    pub try_send: fn(handle: *mut (), generation: u16, buf: &[u8]) -> isize,
+    /// Park `waker` on the conn's send slot; a subsequent writable
+    /// event fires it. Stale `gen` fires immediately.
+    pub register_send_waker:
+        fn(handle: *mut (), generation: u16, waker: &Waker),
+    /// Drop the stored send waker.
+    pub clear_send_waker: fn(handle: *mut (), generation: u16),
 }
 
-/// Register the optional TCP unlisten hook.
-pub fn register_tcp_backend_unlisten(hook: fn(port: u16)) {
-    TCP_BACKEND_UNLISTEN.store(hook);
+static TCP_BACKEND: AtomicPtr<TcpBackend> =
+    AtomicPtr::new(core::ptr::null_mut());
+
+/// Install the TCP backend. Call once at boot.
+pub fn register_tcp_backend(b: &'static TcpBackend) {
+    TCP_BACKEND.store(b as *const _ as *mut _, Ordering::Release);
+}
+
+#[inline]
+fn tcp_backend() -> Option<&'static TcpBackend> {
+    let p = TCP_BACKEND.load(Ordering::Acquire);
+    if p.is_null() {
+        None
+    } else {
+        // SAFETY: `register_tcp_backend` stores `&'static` references;
+        // the pointer is either null or a valid `&'static TcpBackend`.
+        Some(unsafe { &*p })
+    }
 }
 
 /// A TCP listener bound to one port.
@@ -781,8 +834,8 @@ impl Drop for TcpListener {
             return;
         }
         TCP_REGISTRY[self.idx].port.store(0, Ordering::Release);
-        if let Some(hook) = TCP_BACKEND_UNLISTEN.load() {
-            hook(self.port);
+        if let Some(unlisten) = tcp_backend().and_then(|b| b.unlisten) {
+            unlisten(self.port);
         }
     }
 }
@@ -806,10 +859,8 @@ impl TcpListener {
                 for w in 0..MAX_WORKERS as u32 {
                     *state.wakers.at(w).lock() = None;
                 }
-                let listen = TCP_BACKEND_LISTEN
-                    .load()
-                    .ok_or(TcpBindError::BackendFailed)?;
-                if listen(port).is_err() {
+                let b = tcp_backend().ok_or(TcpBindError::BackendFailed)?;
+                if (b.listen)(port).is_err() {
                     state.port.store(0, Ordering::Release);
                     return Err(TcpBindError::BackendFailed);
                 }
@@ -948,8 +999,8 @@ impl Drop for TcpHandle {
         let l = &*self.ctx.listener;
         if !l.released.swap(true, Ordering::AcqRel) {
             TCP_REGISTRY[l.idx].port.store(0, Ordering::Release);
-            if let Some(hook) = TCP_BACKEND_UNLISTEN.load() {
-                hook(l.port);
+            if let Some(unlisten) = tcp_backend().and_then(|b| b.unlisten) {
+                unlisten(l.port);
             }
         }
         release_launcher_slot(self.launcher_slot);
@@ -967,13 +1018,13 @@ impl<'a> Future for TcpAccept<'a> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         let port = this.listener.port;
-        let accept = match TCP_BACKEND_ACCEPT.load() {
-            Some(f) => f,
+        let b = match tcp_backend() {
+            Some(b) => b,
             None => return Poll::Pending, // backend not wired yet
         };
 
         // Fast path
-        let stream = accept(port);
+        let stream = (b.accept)(port);
         if !stream.is_null() {
             return Poll::Ready(stream);
         }
@@ -994,7 +1045,7 @@ impl<'a> Future for TcpAccept<'a> {
             }
         }
 
-        let stream = accept(port);
+        let stream = (b.accept)(port);
         if !stream.is_null() {
             *state.wakers.current(&cc).lock() = None;
             return Poll::Ready(stream);
@@ -1010,50 +1061,10 @@ impl<'a> Future for TcpAccept<'a> {
 // backend has data available on the underlying conn (or zero on peer
 // close). The backend owns the readiness signal (kqueue/epoll on
 // native, rx-ring enqueue on bare-metal) and parks / wakes a single
-// per-stream `Waker` registered via the hooks below. The stream
+// per-stream `Waker` via the `register_recv_waker` / `has_data` /
+// `do_recv` / `clear_recv_waker` fields of `TcpBackend`. The stream
 // handle is an opaque `*mut ()` — identical to the `RawTcpStream`
 // the accept reactor returns.
-//
-// Hook contract (every hook receives `generation` — the value the
-// backend stamped when the handle was handed out via `TcpAccept`;
-// a mismatch against the conn's current generation means the slot
-// was reused, and the backend short-circuits to the "closed" path):
-// - `TCP_HAS_DATA(h, gen)` — cheap non-blocking probe. `true` also
-//   on close or stale `gen` so the caller's `recv` returns `0`.
-// - `TCP_DO_RECV(h, gen, buf)` — sync read into `buf`; `0` = EOF /
-//   close / stale `gen`.
-// - `TCP_REGISTER_RECV_WAKER(h, gen, waker)` — store this waker.
-//   Called before the final has-data re-check; the backend de-dupes
-//   with `Waker::will_wake`. A stale `gen` fires `waker` immediately
-//   so the task observes closure on its next poll.
-// - `TCP_CLEAR_RECV_WAKER(h, gen)` — drop the stored waker. Called
-//   after Ready. A stale `gen` is a no-op.
-
-static TCP_HAS_DATA: AtomicFn<fn(handle: *mut (), generation: u16) -> bool> =
-    AtomicFn::null();
-static TCP_DO_RECV: AtomicFn<
-    fn(handle: *mut (), generation: u16, buf: &mut [u8]) -> usize,
-> = AtomicFn::null();
-static TCP_REGISTER_RECV_WAKER: AtomicFn<
-    fn(handle: *mut (), generation: u16, waker: &Waker),
-> = AtomicFn::null();
-static TCP_CLEAR_RECV_WAKER: AtomicFn<fn(handle: *mut (), generation: u16)> =
-    AtomicFn::null();
-
-/// Register backend hooks for the async recv primitive. Called once
-/// at boot alongside `register_tcp_backend`. Both native and bare-
-/// metal wire up all four.
-pub fn register_tcp_recv_hooks(
-    has_data: fn(handle: *mut (), generation: u16) -> bool,
-    do_recv: fn(handle: *mut (), generation: u16, buf: &mut [u8]) -> usize,
-    register_waker: fn(handle: *mut (), generation: u16, waker: &Waker),
-    clear_waker: fn(handle: *mut (), generation: u16),
-) {
-    TCP_HAS_DATA.store(has_data);
-    TCP_DO_RECV.store(do_recv);
-    TCP_REGISTER_RECV_WAKER.store(register_waker);
-    TCP_CLEAR_RECV_WAKER.store(clear_waker);
-}
 
 /// Future returned by `TcpStream::recv`. Holds a mutable borrow of
 /// the caller's buffer plus the conn handle + generation. `!Send`
@@ -1079,31 +1090,21 @@ impl<'a> Future for TcpRecv<'a> {
         let this = self.get_mut();
         let h = this.handle;
         let g = this.generation;
-        let has = match TCP_HAS_DATA.load() {
-            Some(f) => f,
-            None => return Poll::Pending,
-        };
-        let do_recv = match TCP_DO_RECV.load() {
-            Some(f) => f,
+        let b = match tcp_backend() {
+            Some(b) => b,
             None => return Poll::Pending,
         };
         // Fast path — probe, read, clear any stale waker.
-        if has(h, g) {
-            if let Some(clear) = TCP_CLEAR_RECV_WAKER.load() {
-                clear(h, g);
-            }
-            return Poll::Ready(do_recv(h, g, this.buf));
+        if (b.has_data)(h, g) {
+            (b.clear_recv_waker)(h, g);
+            return Poll::Ready((b.do_recv)(h, g, this.buf));
         }
         // Register waker, then re-check — closes the wake-before-park
         // race with the backend's wake site.
-        if let Some(reg) = TCP_REGISTER_RECV_WAKER.load() {
-            reg(h, g, cx.waker());
-        }
-        if has(h, g) {
-            if let Some(clear) = TCP_CLEAR_RECV_WAKER.load() {
-                clear(h, g);
-            }
-            return Poll::Ready(do_recv(h, g, this.buf));
+        (b.register_recv_waker)(h, g, cx.waker());
+        if (b.has_data)(h, g) {
+            (b.clear_recv_waker)(h, g);
+            return Poll::Ready((b.do_recv)(h, g, this.buf));
         }
         Poll::Pending
     }
@@ -1115,40 +1116,9 @@ impl<'a> Future for TcpRecv<'a> {
 // has been queued to the backend (kernel send buffer on native, NIC
 // TX ring on bare-metal) or the connection is dead. Same waker
 // protocol as recv but parked on a separate slot so reads and
-// writes can pend concurrently on the same conn.
-//
-// Hook contract (all generation-checked; mismatch → treat as closed):
-// - `TCP_TRY_SEND(h, gen, buf)` returns
-//     > 0  : bytes queued (may be partial);
-//     == 0 : would block (caller should register a waker and pend);
-//     < 0  : fatal — conn broken / stale generation.
-// - `TCP_REGISTER_SEND_WAKER(h, gen, waker)` parks `waker` on the
-//   conn's send slot; a subsequent writable event (native:
-//   EVFILT_WRITE / EPOLLOUT; bare-metal: NIC-TX drain + stack
-//   advance) fires it. Stale `gen` fires immediately so the task
-//   observes closure.
-// - `TCP_CLEAR_SEND_WAKER(h, gen)` drops the stored waker.
-
-static TCP_TRY_SEND: AtomicFn<
-    fn(handle: *mut (), generation: u16, buf: &[u8]) -> isize,
-> = AtomicFn::null();
-static TCP_REGISTER_SEND_WAKER: AtomicFn<
-    fn(handle: *mut (), generation: u16, waker: &Waker),
-> = AtomicFn::null();
-static TCP_CLEAR_SEND_WAKER: AtomicFn<fn(handle: *mut (), generation: u16)> =
-    AtomicFn::null();
-
-/// Register backend hooks for the async send primitive. Called once
-/// at boot alongside `register_tcp_backend`.
-pub fn register_tcp_send_hooks(
-    try_send: fn(handle: *mut (), generation: u16, buf: &[u8]) -> isize,
-    register_waker: fn(handle: *mut (), generation: u16, waker: &Waker),
-    clear_waker: fn(handle: *mut (), generation: u16),
-) {
-    TCP_TRY_SEND.store(try_send);
-    TCP_REGISTER_SEND_WAKER.store(register_waker);
-    TCP_CLEAR_SEND_WAKER.store(clear_waker);
-}
+// writes can pend concurrently on the same conn. Hook semantics
+// live on `TcpBackend::{try_send, register_send_waker,
+// clear_send_waker}`.
 
 /// Future returned by `TcpStream::send`. Resolves `Ok(())` when
 /// every byte in `data` has been queued, or `Err(())` if the
@@ -1175,39 +1145,31 @@ impl<'a> Future for TcpSend<'a> {
         let this = self.get_mut();
         let h = this.handle;
         let g = this.generation;
-        let try_send = match TCP_TRY_SEND.load() {
-            Some(f) => f,
+        let b = match tcp_backend() {
+            Some(b) => b,
             None => return Poll::Pending,
         };
 
         // Drain as much as the backend will take this tick.
         loop {
             if this.sent == this.buf.len() {
-                if let Some(clear) = TCP_CLEAR_SEND_WAKER.load() {
-                    clear(h, g);
-                }
+                (b.clear_send_waker)(h, g);
                 return Poll::Ready(Ok(()));
             }
             let remaining = &this.buf[this.sent..];
-            let n = try_send(h, g, remaining);
+            let n = (b.try_send)(h, g, remaining);
             if n < 0 {
-                if let Some(clear) = TCP_CLEAR_SEND_WAKER.load() {
-                    clear(h, g);
-                }
+                (b.clear_send_waker)(h, g);
                 return Poll::Ready(Err(()));
             }
             if n == 0 {
                 // Backend is full. Park waker, then re-probe once —
                 // closes the wake-before-park race with the writable
                 // event site. If the second try also returns 0, pend.
-                if let Some(reg) = TCP_REGISTER_SEND_WAKER.load() {
-                    reg(h, g, cx.waker());
-                }
-                let n2 = try_send(h, g, remaining);
+                (b.register_send_waker)(h, g, cx.waker());
+                let n2 = (b.try_send)(h, g, remaining);
                 if n2 < 0 {
-                    if let Some(clear) = TCP_CLEAR_SEND_WAKER.load() {
-                        clear(h, g);
-                    }
+                    (b.clear_send_waker)(h, g);
                     return Poll::Ready(Err(()));
                 }
                 if n2 == 0 {

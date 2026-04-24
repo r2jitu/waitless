@@ -37,36 +37,50 @@ fn udp_dispatch(src: u32, dst: u32, payload: &[u8]) {
     );
 }
 
+/// Bare-metal TCP backend vtable. Listener hooks open one TCB per
+/// core; per-stream hooks use the generation-aware variants so a
+/// stale handle surviving a close+reuse resolves to closed rather
+/// than aliasing the new connection. `try_send` currently always
+/// succeeds synchronously (bare-metal NIC TX never blocks under
+/// existing load) so `TcpSend` resolves in one poll; the waker
+/// plumbing is wired through anyway for forward-compatibility
+/// with a future TX-backpressure implementation. `unlisten` is
+/// `None` — there's no per-listener teardown on bare-metal today.
+static BARE_TCP_BACKEND: uni_runtime::net::TcpBackend = uni_runtime::net::TcpBackend {
+    listen: tcp_backend_listen,
+    accept: tcp_backend_accept,
+    unlisten: None,
+    has_data: tcp::is_readable_or_closed,
+    do_recv: tcp::async_recv,
+    register_recv_waker: tcp::register_recv_waker,
+    clear_recv_waker: tcp::clear_recv_waker,
+    try_send: tcp::async_try_send,
+    register_send_waker: tcp::register_send_waker,
+    clear_send_waker: tcp::clear_send_waker,
+};
+
+/// Bare-metal UDP backend vtable. No `bind` / `unbind` — routing
+/// is purely `UDP_REGISTRY` lookups on the NIC RX path.
+static BARE_UDP_BACKEND: uni_runtime::net::UdpBackend = uni_runtime::net::UdpBackend {
+    bind: None,
+    unbind: None,
+    send: udp::send,
+};
+
 pub fn init_stack() {
     REGISTRY.register(protocol::Slot::Tcp, tcp_dispatch);
     REGISTRY.register(protocol::Slot::Udp, udp_dispatch);
-    // Wire up the async `uni::runtime::TcpListener` reactor.
-    // Listening requires one slot per core (each core owns its
-    // own per-port accept pool); accept reads the current core's
-    // pool and returns the first Established+!accepted conn.
-    uni_runtime::net::register_tcp_backend(tcp_backend_listen, tcp_backend_accept);
-    // And the per-stream async recv reactor. Uses the generation-
-    // aware variants so stale handles surviving a close+reuse
-    // resolve to closed rather than aliasing the new connection.
-    uni_runtime::net::register_tcp_recv_hooks(
-        tcp::is_readable_or_closed,
-        tcp::async_recv,
-        tcp::register_recv_waker,
-        tcp::clear_recv_waker,
-    );
-    // Async send hooks. Bare-metal's sync send always succeeds so
-    // `async_try_send` resolves the TcpSend future in one poll; the
-    // waker plumbing is kept symmetric with native for forward
-    // compatibility with a future TX-backpressure implementation.
-    uni_runtime::net::register_tcp_send_hooks(
-        tcp::async_try_send,
-        tcp::register_send_waker,
-        tcp::clear_send_waker,
-    );
-    // UDP send hook — lets `UdpSocket::send_to` hand off datagrams
+    // Wire up the async `uni::runtime::TcpListener` reactor and
+    // the per-stream recv/send reactors — all via a single backend
+    // vtable. Listening requires one slot per core (each core
+    // owns its own per-port accept pool); accept reads the
+    // current core's pool and returns the first Established+
+    // !accepted conn.
+    uni_runtime::net::register_tcp_backend(&BARE_TCP_BACKEND);
+    // UDP backend — lets `UdpSocket::send_to` hand off datagrams
     // without apps having to go through the legacy `uni::udp_send`
-    // free function. Same transport (net_udp::send).
-    uni_runtime::net::register_backend_udp_send(udp::send);
+    // free function.
+    uni_runtime::net::register_udp_backend(&BARE_UDP_BACKEND);
 }
 
 fn tcp_backend_listen(port: u16) -> Result<(), ()> {

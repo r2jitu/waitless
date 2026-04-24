@@ -721,6 +721,32 @@ unsafe extern "C" fn sigint_handler(_sig: i32) {
     SHUTDOWN.store(true, Ordering::Release);
 }
 
+/// Native UDP backend vtable. `bind`/`unbind` open and close the
+/// per-port SO_REUSEPORT sibling fds; `send` is the `sendto` path.
+static NATIVE_UDP_BACKEND: uni_runtime::net::UdpBackend =
+    uni_runtime::net::UdpBackend {
+        bind: Some(udp_backend_bind),
+        unbind: Some(udp_backend_unbind),
+        send: udp_send,
+    };
+
+/// Native TCP backend vtable. Listener hooks are stubs today (see
+/// `init_native` for the follow-up plan); per-stream recv/send
+/// hooks drive the `fd`-based async reactor.
+static NATIVE_TCP_BACKEND: uni_runtime::net::TcpBackend =
+    uni_runtime::net::TcpBackend {
+        listen: async_tcp_listen_hook,
+        accept: async_tcp_accept_hook,
+        unlisten: Some(async_tcp_unlisten_hook),
+        has_data: native_tcp_has_data,
+        do_recv: native_tcp_do_recv,
+        register_recv_waker: native_tcp_register_recv_waker,
+        clear_recv_waker: native_tcp_clear_recv_waker,
+        try_send: native_tcp_try_send,
+        register_send_waker: native_tcp_register_send_waker,
+        clear_send_waker: native_tcp_clear_send_waker,
+    };
+
 fn init_native() {
     unsafe {
         // Per-port overrides (`UNIKERNEL_<PROTO>_<GUEST>`) are read
@@ -751,35 +777,18 @@ fn init_native() {
         signal(SIGPIPE, SIG_IGN);
     }
 
-    // Wire `UdpSocket::bind` in uni-runtime to our SO_REUSEPORT
-    // sibling opener. On bare-metal the hook stays unset because
-    // the NIC RX path unconditionally delivers to the reactor.
-    uni_runtime::net::register_backend_bind(udp_backend_bind);
-    uni_runtime::net::register_backend_udp_unbind(udp_backend_unbind);
-    uni_runtime::net::register_backend_udp_send(udp_send);
-
-    // TCP reactor hooks. `listen` is a no-op stub (returns `Ok`) so
-    // `TcpListener::bind` succeeds on native; `accept` returns null
-    // so the async accept future stays Pending. Full native wiring —
-    // opening per-worker listen fds and routing kqueue fires to
+    // Wire the UDP + TCP reactors through the single-vtable
+    // registration. UDP: `bind`/`unbind` open/close SO_REUSEPORT
+    // sibling fds (bare-metal leaves these None since its NIC RX
+    // path unconditionally delivers to the reactor). TCP: `listen`
+    // is a no-op stub that returns `Ok` so `TcpListener::bind`
+    // succeeds on native; `accept` returns null so the async
+    // accept future stays Pending. Full native wiring — opening
+    // per-worker listen fds and routing kqueue fires to
     // `deliver_tcp_ready` — is a follow-up; until then apps needing
     // TCP accept on native should stay on `uni_http::Server`.
-    uni_runtime::net::register_tcp_backend(
-        async_tcp_listen_hook,
-        async_tcp_accept_hook,
-    );
-    uni_runtime::net::register_tcp_backend_unlisten(async_tcp_unlisten_hook);
-    uni_runtime::net::register_tcp_recv_hooks(
-        native_tcp_has_data,
-        native_tcp_do_recv,
-        native_tcp_register_recv_waker,
-        native_tcp_clear_recv_waker,
-    );
-    uni_runtime::net::register_tcp_send_hooks(
-        native_tcp_try_send,
-        native_tcp_register_send_waker,
-        native_tcp_clear_send_waker,
-    );
+    uni_runtime::net::register_udp_backend(&NATIVE_UDP_BACKEND);
+    uni_runtime::net::register_tcp_backend(&NATIVE_TCP_BACKEND);
 
     // Register TCP/UDP polling as the first IO poll callback.
     // Runs on every worker's event-loop tick and drains the worker's
