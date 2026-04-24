@@ -672,7 +672,7 @@ const MAX_SHARED_LISTENERS: usize = 4;
 /// the process exits on shutdown.
 // Shared-listener table. Filled exclusively on the main thread
 // before any worker starts (HTTP `Server::listen{,_tls}` runs on
-// thread 0 during `uni_main`). After that, workers only read via
+// thread 0 during `uni_boot`). After that, workers only read via
 // `tcp_register_shared_listener`.
 struct SharedListenSlot(UnsafeCell<SharedListenTable>);
 struct SharedListenTable {
@@ -827,7 +827,7 @@ struct AsyncTcpListener {
 }
 
 struct AsyncTcpListenersSlot(UnsafeCell<[Option<AsyncTcpListener>; MAX_ASYNC_TCP_LISTENERS]>);
-// SAFETY: populated only on the main thread during `uni_main`
+// SAFETY: populated only on the main thread during `uni_boot`
 // (via `async_tcp_listen_hook` from `uni::runtime::TcpListener::bind`);
 // read from workers afterwards without further mutation.
 unsafe impl Sync for AsyncTcpListenersSlot {}
@@ -1317,7 +1317,7 @@ struct UdpBinding {
 // (before workers start); workers read their owned sibling fd from
 // the entry.
 struct UdpBindingsSlot(UnsafeCell<[Option<UdpBinding>; MAX_UDP_BINDINGS]>);
-// SAFETY: populated only on the main thread during `uni_main`; read
+// SAFETY: populated only on the main thread during `uni_boot`; read
 // from workers afterwards without further mutation.
 unsafe impl Sync for UdpBindingsSlot {}
 static UDP_BINDINGS: UdpBindingsSlot =
@@ -1502,7 +1502,7 @@ static READY: AtomicBool = AtomicBool::new(false);
 
 /// Optional per-worker pre-spawn hook. HTTP-like crates that need
 /// per-worker TCP listeners (SO_REUSEPORT siblings) register here;
-/// `run()` invokes it for workers 1..NUM_THREADS after `uni_main`
+/// `run()` invokes it for workers 1..NUM_THREADS after `uni_boot`
 /// and before `pthread_create`. Apps without per-worker setup
 /// leave it null.
 static ADD_WORKER_LISTENER: AtomicFn<fn(u32)> = AtomicFn::null();
@@ -1546,7 +1546,7 @@ fn is_ready() -> bool {
 /// Run the worker event loop on this thread. Same structure as the
 /// unikernel's. Called by `native_worker_loop` after thread setup.
 pub fn run_worker(worker_id: u32) {
-    // Worker 0 skips the READY wait: `uni_main` now only spawns the
+    // Worker 0 skips the READY wait: `uni_boot` now only spawns the
     // app's boot body as an async task; worker 0 is what polls it,
     // and the task's `uni::run(app)` is what eventually calls
     // `set_ready` to release the other workers. Blocking here would
@@ -1591,8 +1591,11 @@ pub fn run_worker(worker_id: u32) {
 // Native entry point
 // ============================================================================
 
-unsafe extern "C" {
-    fn uni_main();
+// Rust ABI — both sides are Rust and the function takes no args /
+// returns nothing. `#[no_mangle]` on the emitting `#[uni::boot]`
+// macro gives the symbol a stable link-time name.
+unsafe extern "Rust" {
+    fn uni_boot();
 }
 
 extern "C" fn worker_thread(arg: *mut u8) -> *mut u8 {
@@ -1635,8 +1638,8 @@ pub fn run(config: RunConfig) -> i32 {
     (config.boot_info_fn)(num_cpus() as u32, host_ram_bytes());
 
     unsafe {
-        uni_main();
-        // uni_main called server.run() → tcp_listen() on thread 0.
+        uni_boot();
+        // uni_boot called server.run() → tcp_listen() on thread 0.
         // In multi-thread mode, tcp_listen() created the shared listen
         // socket and per-worker handles. If `uni-http` (or similar)
         // registered a per-worker hook, call it now to create the

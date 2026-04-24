@@ -4,8 +4,9 @@
 // flush TX → idle if no work. All callbacks are registered via function
 // pointers to avoid circular crate dependencies.
 //
-// After the app's main() returns, all cores enter eventloop::run().
-// The loop runs until shutdown.
+// All cores enter eventloop::run() after boot. Core 0 drives the
+// spawned boot task (see `#[uni::boot]`); APs wait for `set_ready`
+// from the app's `uni::run(app)`. The loop runs until shutdown.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -83,7 +84,7 @@ pub fn set_net_rearm_rx(f: ArmFn) {
 }
 
 /// Signal that the app has finished initialization and the event loop
-/// can start processing. Called by boot code after uni_main() returns.
+/// can start processing. Called by boot code after uni_boot() returns.
 pub fn set_ready() {
     READY.store(true, Ordering::Release);
     // Wake all cores so they stop waiting and enter the loop.

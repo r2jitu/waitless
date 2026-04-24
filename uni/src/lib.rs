@@ -74,7 +74,7 @@ pub mod error {
 // Soundness: the runtime stores `Box<dyn App>` in a static slot
 // wrapped in `UnsafeCell`. One `unsafe impl Sync` lets the static
 // hold it; the contract is "boot CPU only", upheld by the two
-// access sites (`run` from `uni_main`, `shutdown_and_drop` from
+// access sites (`run` from `uni_boot`, `shutdown_and_drop` from
 // the BSP branch of the event-loop exit or native's main after
 // `pthread_join`).
 
@@ -90,7 +90,7 @@ pub trait App: 'static {}
 struct AppSlot(core::cell::UnsafeCell<Option<alloc::boxed::Box<dyn App>>>);
 
 // SAFETY: every read/write of `APP_SLOT` is on the boot CPU:
-//   - `run` is called from `uni_main` (BSP on unikernel, main thread
+//   - `run` is called from `uni_boot` (BSP on unikernel, main thread
 //     on native).
 //   - `shutdown_and_drop` is called from `uni_kernel::eventloop`'s
 //     BSP-only shutdown branch (unikernel) or from native's `main`

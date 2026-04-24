@@ -1,15 +1,30 @@
 // uni/macros/lib.rs — Proc macro for `#[uni::boot]`.
 //
-// The platform entry point is a C-ABI symbol named `uni_main`. The
-// macro keeps the user's `fn boot()` / `async fn boot()` intact (so
-// the IDE lints its body correctly), then emits a `uni_main` wrapper
-// that spawns the boot future on the core-0 task arena.
+// The platform entry point is a Rust-ABI symbol named `uni_boot`
+// with `#[no_mangle]` so boot/entry.rs (bare-metal) and
+// uni-backend/src/native/mod.rs can resolve it at link time. Since
+// both sides are Rust and the function takes no args / returns
+// nothing, there's no point pretending this is an FFI boundary —
+// `extern "C"` is unnecessary ceremony.
+//
+// The macro keeps the user's `fn boot()` / `async fn boot()`
+// intact (so the IDE lints its body correctly), then emits a
+// `uni_boot` wrapper that spawns the boot future on the core-0
+// task arena.
 //
 // Running boot as a task means the event loop is already ticking
 // while boot code runs — `Net::enable(Dhcp).await` yields between
 // DISCOVER/REQUEST and OFFER/ACK, the `net_flush_cb` hook kicks the
 // virtio TX ring between polls, and the pre-eventloop DHCP phase
 // (with its deferred-kick workaround) goes away entirely.
+//
+// Why the macro spawns (not the bare-metal / native entry points):
+// there's exactly one `#[uni::boot]` per binary and it's the only
+// place that has the user's async body in Rust scope. Handing a
+// `Pin<Box<dyn Future>>` across the entry-point boundary would
+// need either FFI-over-futures or a link-time registry for a
+// single registrant — both more machinery than value. Entry points
+// stay runtime-agnostic this way.
 
 extern crate proc_macro;
 use proc_macro::TokenStream;
@@ -37,7 +52,7 @@ pub fn boot(_attr: TokenStream, item: TokenStream) -> TokenStream {
 {user_fn}
 
 #[unsafe(no_mangle)]
-pub extern "C" fn uni_main() {{
+pub fn uni_boot() {{
     let _ = {spawn_expr};
 }}
 "#,

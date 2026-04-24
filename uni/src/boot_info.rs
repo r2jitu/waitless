@@ -1,6 +1,6 @@
 // uni/boot_info.rs — Read-only snapshot of boot-time facts.
 //
-// Populated once per boot before `uni_main` runs; immutable thereafter.
+// Populated once per boot before `uni_boot` runs; immutable thereafter.
 // Apps read it via `uni::boot_info()` to size per-core structures,
 // decide which NIC driver is active, log runtime identity, etc.
 //
@@ -82,7 +82,7 @@ static BOOT_INFO: InitOnce<BootInfo> = InitOnce::new();
 
 /// Publish the final boot-time snapshot. Called exactly once per
 /// boot, from the platform backend (bare-metal boot entry on the
-/// unikernel, `init_native` on POSIX) before `uni_main` runs. Not
+/// unikernel, `init_native` on POSIX) before `uni_boot` runs. Not
 /// part of the app-facing API.
 ///
 /// Panics if called twice.
@@ -103,7 +103,7 @@ pub fn init_boot_info(p: BootInfoParams) {
 }
 
 /// Return the boot-time snapshot. Panics if called before
-/// `init_boot_info` (which on both platforms runs before `uni_main`).
+/// `init_boot_info` (which on both platforms runs before `uni_boot`).
 pub fn boot_info() -> &'static BootInfo {
     BOOT_INFO.get()
 }
