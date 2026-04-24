@@ -35,10 +35,14 @@ const HTTPS_PORT: u16 = 443;
 /// Holds the long-lived state of the webserver program.
 ///
 /// Dropping `WebServerApp` drops the HTTP `Server` (which aborts
-/// accept tasks and signals per-conn tasks to exit) and the `Net`
-/// handle (which marks the stack disabled).
+/// accept tasks and signals per-conn tasks to exit), the echo
+/// listener handles (which abort their per-worker tasks and
+/// release ports 7/9), and the `Net` handle (which marks the
+/// stack disabled).
 struct WebServerApp {
     _server: uni_http::Server,
+    _udp_echo: Option<uni::runtime::UdpHandle>,
+    _tcp_echo: Option<uni::runtime::TcpHandle>,
     _net: Net,
 }
 
@@ -50,23 +54,27 @@ impl WebServerApp {
         let http_port = uni::config_port(HTTP_PORT);
         let https_port = uni::config_tls_port(HTTPS_PORT);
 
-        match uni::runtime::UdpSocket::bind(7) {
+        let udp_echo = match uni::runtime::UdpSocket::bind(7) {
             Ok(sock) => {
-                // App-lifetime listener — `.leak()` so the
-                // returned `UdpHandle`'s Drop doesn't tear down
-                // the per-worker recv tasks when the match arm
-                // ends.
-                sock.run_each(|src_ip, src_port, data| {
-                    uni::udp_send(src_ip, 7, src_port, data);
-                }).leak();
+                let h = sock.run(|sock| async move {
+                    let mut buf = [0u8; 1500];
+                    loop {
+                        let (src_ip, src_port, n) = sock.recv_from(&mut buf).await;
+                        let _ = sock.send_to(src_ip, src_port, &buf[..n]);
+                    }
+                });
                 uni::log(b"UDP echo server on port 7 (async, per-worker)\n");
+                Some(h)
             }
-            Err(_) => uni::log(b"UDP echo: bind FAILED\n"),
-        }
+            Err(_) => {
+                uni::log(b"UDP echo: bind FAILED\n");
+                None
+            }
+        };
 
-        match uni::runtime::TcpListener::bind(9) {
+        let tcp_echo = match uni::runtime::TcpListener::bind(9) {
             Ok(listener) => {
-                listener.run(|stream| async move {
+                let h = listener.run(|stream| async move {
                     let mut buf = [0u8; 1024];
                     loop {
                         // 30s idle timeout via `timeout_us` — exercises
@@ -92,11 +100,15 @@ impl WebServerApp {
                             return;
                         }
                     }
-                }).leak();
+                });
                 uni::log(b"TCP echo server on port 9 (async, per-worker)\n");
+                Some(h)
             }
-            Err(_) => uni::log(b"TCP echo: bind FAILED\n"),
-        }
+            Err(_) => {
+                uni::log(b"TCP echo: bind FAILED\n");
+                None
+            }
+        };
 
         let builder = Server::builder().default_handler(handle_request);
         let builder =
@@ -117,7 +129,12 @@ impl WebServerApp {
         }
 
         uni::log(b"Entering event loop.\n");
-        WebServerApp { _server: server, _net: net }
+        WebServerApp {
+            _server: server,
+            _udp_echo: udp_echo,
+            _tcp_echo: tcp_echo,
+            _net: net,
+        }
     }
 }
 
