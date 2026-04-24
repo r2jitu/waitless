@@ -1,19 +1,18 @@
 // net/udp.rs — UDP send/receive.
 //
-// Simple datagram protocol — no state machine, no connection tracking.
-// Port-based dispatch via registered handlers.
+// Simple datagram protocol — no state machine, no connection
+// tracking. The async reactor (`uni_runtime::net::UdpSocket`) is
+// the only binder these days; the pre-async `bind(port, handler)`
+// sync-callback registry is gone.
 
 #![no_std]
 
-extern crate uni_kernel;
 extern crate uni_runtime;
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
 extern crate net_ipv4 as ipv4;
 
-use core::sync::atomic::{AtomicU16, Ordering};
 use from_bytes::FromBytes;
-use uni_kernel::sync::AtomicFn;
 use types::{Ipv4Addr, CONFIG, tcp_checksum, htons, ntohs};
 use ipv4::{ipv4_send, PROTO_UDP};
 
@@ -27,45 +26,6 @@ struct UdpHeader {
 
 // SAFETY: repr(C, packed), all fields u16.
 unsafe impl FromBytes for UdpHeader {}
-
-type UdpHandlerFn = fn([u8; 4], u16, &[u8]);
-
-const MAX_HANDLERS: usize = 8;
-
-/// Port→handler dispatch table. Each slot is `(port, handler_fn)`.
-/// Slots are filled in-order during init via `bind()` (single-threaded
-/// boot phase); reads happen from any core during packet dispatch.
-/// `port = 0` means "empty slot" (UDP port 0 isn't usable for traffic).
-///
-/// Atomic stores publish each slot in two steps: handler first, then
-/// port — so a reader that sees a non-zero port is guaranteed to also
-/// see the matching handler (acquire-pair).
-static HANDLER_PORTS: [AtomicU16; MAX_HANDLERS] = [
-    AtomicU16::new(0), AtomicU16::new(0), AtomicU16::new(0), AtomicU16::new(0),
-    AtomicU16::new(0), AtomicU16::new(0), AtomicU16::new(0), AtomicU16::new(0),
-];
-static HANDLER_FNS: [AtomicFn<UdpHandlerFn>; MAX_HANDLERS] = [
-    AtomicFn::null(), AtomicFn::null(),
-    AtomicFn::null(), AtomicFn::null(),
-    AtomicFn::null(), AtomicFn::null(),
-    AtomicFn::null(), AtomicFn::null(),
-];
-
-/// Register a handler for incoming UDP packets on a specific port.
-/// Uses CAS to claim a slot race-free.
-pub fn bind(port: u16, handler: UdpHandlerFn) {
-    if port == 0 { return; }
-    for i in 0..MAX_HANDLERS {
-        let claimed = HANDLER_PORTS[i]
-            .compare_exchange(0, port, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok();
-
-        if claimed {
-            HANDLER_FNS[i].store(handler);
-            return;
-        }
-    }
-}
 
 /// Send a UDP datagram.
 pub fn send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
@@ -94,10 +54,9 @@ pub fn send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
 }
 
 /// Called by the network dispatch layer when protocol == UDP.
-/// Tries the async reactor first — if a `uni_runtime::net::UdpSocket`
-/// is bound to the destination port, the datagram goes into its
-/// inbox. Falls back to the callback-style `HANDLER_FNS` registry
-/// for ports like DHCP that still use the sync API.
+/// Delivers the datagram to the async reactor if a
+/// `uni_runtime::net::UdpSocket` is bound to the destination port;
+/// otherwise drops it.
 pub fn udp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
     let hdr = match UdpHeader::try_ref_from(data) {
         Some(h) => h,
@@ -112,18 +71,5 @@ pub fn udp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
     }
     let payload = &data[8..udp_len];
 
-    if uni_runtime::net::deliver_udp(dst_port, src_ip.octets(), src_port, payload) {
-        return;
-    }
-
-    for i in 0..MAX_HANDLERS {
-        let p = HANDLER_PORTS[i].load(Ordering::Acquire);
-        if p == 0 { continue; }
-        if p == dst_port {
-            if let Some(h) = HANDLER_FNS[i].load() {
-                h(src_ip.octets(), src_port, payload);
-            }
-            return;
-        }
-    }
+    let _ = uni_runtime::net::deliver_udp(dst_port, src_ip.octets(), src_port, payload);
 }

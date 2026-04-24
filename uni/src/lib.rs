@@ -158,8 +158,8 @@ fn install_shutdown_hook() {}
 // ---- Re-exported platform functions ---------------------------------------
 
 pub use uni_backend::{
-    check_shutdown, config_port, config_tls_port, log, num_workers, register_io_poll,
-    request_shutdown, set_ready, set_service, tcp_poll, wait_for_events, HeapStats,
+    check_shutdown, config_port, config_tls_port, log, num_workers,
+    request_shutdown, set_ready, wait_for_events, HeapStats,
 };
 
 // ---- Async runtime --------------------------------------------------------
@@ -238,12 +238,11 @@ pub fn cpu_id() -> u32 {
 
 // ---- UDP ------------------------------------------------------------------
 
-/// Bind a UDP port handler. Callback receives (src_ip_octets, src_port, payload).
-pub fn udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
-    uni_backend::udp_bind(port, handler);
-}
-
-/// Send a UDP datagram.
+/// Send a UDP datagram. Thin convenience for apps that want to
+/// reply inside a `UdpSocket::run_each` sync handler without
+/// routing through the `&UdpSocket` (which the `Fn` closure can't
+/// capture across workers). `uni::runtime::UdpSocket::run_loop`
+/// is the preferred pattern when the handler can own the socket.
 pub fn udp_send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
     uni_backend::udp_send(dst_ip, src_port, dst_port, data);
 }

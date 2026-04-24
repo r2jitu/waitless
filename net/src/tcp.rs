@@ -746,12 +746,9 @@ pub fn init() {
     }
 }
 
-/// Create a listener on the current core.
-pub fn listen(port: u16) -> *mut () {
-    listen_on_core(uni_kernel::cpu_id(), port)
-}
-
-/// Create a listener on a specific core.
+/// Create a listener on a specific core. Called from
+/// `net::tcp_backend_listen` once per core at `TcpListener::bind`
+/// time.
 pub fn listen_on_core(core: u32, port: u16) -> *mut () {
     let slot = match alloc_connection(core) {
         Some(i) => i,
@@ -765,22 +762,10 @@ pub fn listen_on_core(core: u32, port: u16) -> *mut () {
     encode_handle(core, slot)
 }
 
-/// Sync accept on a specific listener's pool. Returns the bare
-/// handle for the sync `uni_backend::tcp_accept` ABI; the async
-/// path uses `accept_on_port` / `RawTcpStream` instead.
-pub fn accept(handle: *mut ()) -> *mut () {
-    let (core, listener_slot) = match decode_handle(handle) {
-        Some(v) => v,
-        None => return ptr::null_mut(),
-    };
-    let port = unsafe { (*conn_ptr(core, listener_slot)).local_port };
-    accept_on_port_core(core, port).handle
-}
-
 /// Accept a connection on the **current core** by port — the
-/// listener handle isn't threaded through, so this is the entry
-/// point used by `uni_runtime::net::TcpListener`'s backend hook.
-/// Returns `RawTcpStream::NULL` if no connection is ready on this core.
+/// entry point used by `uni_runtime::net::TcpListener`'s backend
+/// hook. Returns `RawTcpStream::NULL` if no connection is ready
+/// on this core.
 pub fn accept_on_port(port: u16) -> uni_runtime::net::RawTcpStream {
     accept_on_port_core(uni_kernel::cpu_id(), port)
 }
@@ -801,21 +786,13 @@ fn accept_on_port_core(core: u32, port: u16) -> uni_runtime::net::RawTcpStream {
     RawTcpStream::NULL
 }
 
-pub fn has_data(handle: *mut ()) -> bool {
-    let (core, slot) = match decode_handle(handle) {
-        Some(v) => v,
-        None => return false,
-    };
-    unsafe { (*conn_ptr(core, slot)).rx_used() > 0 }
-}
-
-/// Async-readiness probe: like `has_data` but also returns `true`
-/// for terminal states (Closed / CloseWait with empty rx) so the
-/// `TcpRecv` future resolves on peer FIN and the caller sees
-/// `recv() == 0`. A `generation` mismatch also reports "ready" so
-/// stale handles promptly resolve to closed. Registered as the
-/// `TCP_HAS_DATA` hook — sync callers still use `has_data` to avoid
-/// spurious recv attempts on dead conns.
+/// Async-readiness probe — returns `true` when there's inbound
+/// data to consume OR the connection is in a terminal state
+/// (Closed / CloseWait / LastAck / TimeWait), so the `TcpRecv`
+/// future resolves on peer FIN and the caller sees `recv() == 0`.
+/// A `generation` mismatch also reports "ready" so stale handles
+/// promptly resolve to closed. Registered as the `TCP_HAS_DATA`
+/// hook.
 pub fn is_readable_or_closed(handle: *mut (), generation: u16) -> bool {
     let (core, slot) = match decode_handle(handle) {
         Some(v) => v,
@@ -832,15 +809,10 @@ pub fn is_readable_or_closed(handle: *mut (), generation: u16) -> bool {
                      | TcpState::LastAck | TcpState::TimeWait)
 }
 
-pub fn recv(handle: *mut (), buf: &mut [u8]) -> usize {
-    let (core, slot) = match decode_handle(handle) {
-        Some(v) => v,
-        None => return 0,
-    };
-    unsafe { (*conn_ptr(core, slot)).rx_pop(buf) }
-}
-
-pub fn send(handle: *mut (), data: &[u8]) -> i32 {
+/// Internal send helper used by `async_try_send`. Splits `data`
+/// into MSS-sized segments and emits one TCP segment per chunk.
+/// Returns bytes sent on success; `-1` on a dead conn.
+fn send(handle: *mut (), data: &[u8]) -> i32 {
     let (core, slot) = match decode_handle(handle) {
         Some(v) => v,
         None => return -1,
@@ -1005,16 +977,3 @@ pub fn clear_send_waker(_handle: *mut (), _generation: u16) {
     // No-op on bare-metal — no send-waker state to clear.
 }
 
-pub fn is_closed(handle: *mut ()) -> bool {
-    let (core, slot) = match decode_handle(handle) {
-        Some(v) => v,
-        None => return true,
-    };
-    let c = unsafe { &*conn_ptr(core, slot) };
-    // Closed: connection fully terminated.
-    // CloseWait with empty RX: client sent FIN, data consumed.
-    // LastAck: we sent FIN, waiting for final ACK. Treat as closed
-    // to prevent pool exhaustion (the ACK may never arrive).
-    c.state == TcpState::Closed
-        || (c.state == TcpState::CloseWait && c.rx_used() == 0)
-}

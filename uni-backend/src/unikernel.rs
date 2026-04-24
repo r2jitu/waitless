@@ -29,24 +29,18 @@ pub use uni_drivers::net::{
     num_queue_pairs as net_num_queue_pairs, rx_counts as net_rx_counts,
     rx_used_cursors as net_rx_used_cursors,
 };
-pub use uni_net_stack::poll as tcp_poll;
-pub use uni_net_stack::tcp::{
-    accept as tcp_accept, close as tcp_close, has_data as tcp_has_data,
-    is_closed as tcp_is_closed, listen as tcp_listen, listen_on_core as tcp_listen_on,
-    recv as tcp_recv, send as tcp_send,
-};
-pub use uni_net_stack::udp::{bind as udp_bind, send as udp_send};
+// `tcp_close` is the only sync TCP API callers still reach — it's
+// used by `uni::TcpStream::close` on the graceful-shutdown path.
+// Every other sync TCP primitive (accept / recv / send / listen /
+// has_data / is_closed / poll) has no callers outside the async
+// reactor's internal hooks and is gone.
+pub use uni_net_stack::tcp::close as tcp_close;
+pub use uni_net_stack::udp::send as udp_send;
 
 // ---- Event loop re-exports ------------------------------------------------
 
-pub use uni_kernel::eventloop::{request_shutdown, set_ready, set_service};
+pub use uni_kernel::eventloop::{request_shutdown, set_ready};
 pub use uni_kernel::percpu::num_cores as num_workers;
-
-/// Register an IO poll callback. On unikernel, real registration
-/// goes through `uni_kernel::eventloop::{set_net_poll, set_net_drain}`
-/// directly; this shim exists so cross-platform app code can call it
-/// unconditionally.
-pub fn register_io_poll(_f: fn(u32) -> bool) {}
 
 // ---- Async runtime re-exports ---------------------------------------------
 

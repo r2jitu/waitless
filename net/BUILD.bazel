@@ -136,7 +136,6 @@ rust_library(
         ":from_bytes",
         ":ipv4",
         ":types",
-        "//kernel",
         "//uni-runtime",
     ],
 )

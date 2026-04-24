@@ -600,9 +600,9 @@ impl ThreadState {
 /// worker thread's `collect_events` when its kqueue/epoll reports the
 /// sibling ready.
 fn drain_udp_sibling(fd: i32, binding_idx: usize) {
-    let (app_port, handler) = unsafe {
+    let app_port = unsafe {
         match (*UDP_BINDINGS.0.get())[binding_idx] {
-            Some(ref b) => (b.app_port, b.handler),
+            Some(ref b) => b.app_port,
             None => return,
         }
     };
@@ -618,14 +618,7 @@ fn drain_udp_sibling(fd: i32, binding_idx: usize) {
         let src_ip = src_addr.sin_addr.to_be_bytes();
         let src_port = u16::from_be(src_addr.sin_port);
         let payload = &buf[..n as usize];
-
-        // Try the async reactor first; fall back to the legacy
-        // callback only if no `UdpSocket` is bound for this port.
-        if !uni_runtime::net::deliver_udp(app_port, src_ip, src_port, payload) {
-            if let Some(h) = handler {
-                h(src_ip, src_port, payload);
-            }
-        }
+        let _ = uni_runtime::net::deliver_udp(app_port, src_ip, src_port, payload);
     }
 }
 
@@ -1331,11 +1324,6 @@ struct UdpBinding {
     fds: [i32; MAX_THREADS],
     sibling_count: usize,
     app_port: u16,  // port as requested by app (used for send-side lookup)
-    /// Callback path: `Some` for legacy `udp_bind(port, handler)`.
-    /// `None` when the async reactor (`UdpSocket::bind`) set this
-    /// binding up — drain dispatches to `uni_runtime::net::deliver_udp`
-    /// in that case.
-    handler: Option<fn([u8; 4], u16, &[u8])>,
 }
 
 // UDP relay table. Entries written by `udp_bind` on the main thread
@@ -1383,16 +1371,12 @@ fn open_udp_sibling(bind_port: u16) -> i32 {
     }
 }
 
-pub fn udp_bind(port: u16, handler: fn([u8; 4], u16, &[u8])) {
-    let _ = open_udp_relay(port, Some(handler));
-}
-
 /// Hook registered with `uni_runtime::net::register_backend_bind`.
 /// Invoked when a `UdpSocket` is created; opens the SO_REUSEPORT
-/// siblings with no sync handler so the `drain_udp_sibling` path
-/// routes inbound datagrams through the async reactor.
+/// siblings and routes inbound datagrams through the async
+/// reactor via `uni_runtime::net::deliver_udp`.
 fn udp_backend_bind(port: u16) -> Result<(), ()> {
-    open_udp_relay(port, None)
+    open_udp_relay(port)
 }
 
 /// Hook registered with `register_backend_udp_unbind`. Mirrors
@@ -1424,14 +1408,10 @@ fn udp_backend_unbind(app_port: u16) {
 }
 
 /// Open SO_REUSEPORT siblings for `app_port` and register each in
-/// its worker's kqueue/epoll. Shared by the legacy sync `udp_bind`
-/// and the async `UdpSocket::bind` hook (`handler = None`). Returns
-/// `Err(())` if the OS refused the first sibling bind — higher
-/// layers surface that as `UdpBindError::BackendFailed`.
-fn open_udp_relay(
-    app_port: u16,
-    handler: Option<fn([u8; 4], u16, &[u8])>,
-) -> Result<(), ()> {
+/// its worker's kqueue/epoll. Returns `Err(())` if the OS refused
+/// the first sibling bind — higher layers surface that as
+/// `UdpBindError::BackendFailed`.
+fn open_udp_relay(app_port: u16) -> Result<(), ()> {
     unsafe {
         let count = UDP_COUNT.load(Ordering::Acquire);
         if count >= MAX_UDP_BINDINGS { return Err(()); }
@@ -1464,7 +1444,6 @@ fn open_udp_relay(
             fds,
             sibling_count: got,
             app_port,
-            handler,
         });
         UDP_COUNT.store(binding_idx + 1, Ordering::Release);
 
