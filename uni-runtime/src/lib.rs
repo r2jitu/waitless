@@ -260,13 +260,17 @@ static PER_WORKER_STARTUP: [AtomicFn<fn()>; MAX_STARTUP_HOOKS] =
     [const { AtomicFn::null() }; MAX_STARTUP_HOOKS];
 static STARTUP_HOOK_COUNT: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
-static STARTUP_FIRED: [AtomicBool; MAX_WORKERS] =
-    [const { AtomicBool::new(false) }; MAX_WORKERS];
+/// Per-worker cursor into `PER_WORKER_STARTUP` — incremented each
+/// tick by the number of hooks fired. Replaces the single-shot
+/// `STARTUP_FIRED` flag so hooks registered *after* a worker's
+/// first tick (e.g. from inside the boot task itself) still run
+/// on that worker on its next tick.
+static STARTUP_FIRED_COUNT: [core::sync::atomic::AtomicUsize; MAX_WORKERS] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; MAX_WORKERS];
 
-/// Register `f` to run exactly once on each worker, on that worker,
-/// on the first event-loop tick after registration. Up to
-/// `MAX_STARTUP_HOOKS` hooks accumulate. Excess registrations past
-/// the cap are silently dropped.
+/// Register `f` to run on every worker on its next tick after
+/// registration. Up to `MAX_STARTUP_HOOKS` hooks accumulate; excess
+/// registrations are silently dropped.
 pub fn spawn_on_each_worker(f: fn()) {
     let i = STARTUP_HOOK_COUNT
         .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
@@ -291,17 +295,24 @@ pub fn tick(worker_id: u32) -> bool {
     // SAFETY: caller guarantees `worker_id` is the running worker.
     let cc = unsafe { CurrentCore::from_id_unchecked(worker_id) };
 
-    // First tick on this worker: fire every registered per-worker
-    // startup hook so tasks registered via `spawn_on_each_worker`
-    // land in this worker's arena.
-    if !STARTUP_FIRED[worker_id as usize].swap(true, Ordering::Relaxed) {
-        let count = STARTUP_HOOK_COUNT
+    // Fire every per-worker startup hook registered since this
+    // worker last ticked. Hooks registered from *within* a worker's
+    // own boot task (e.g. `TcpListener::run` inside `uni::run(app)`)
+    // land before the count advances here, so they still fire on
+    // the current worker on its next tick.
+    {
+        let total = STARTUP_HOOK_COUNT
             .load(Ordering::Acquire)
             .min(MAX_STARTUP_HOOKS);
-        for slot in PER_WORKER_STARTUP.iter().take(count) {
-            if let Some(f) = slot.load() {
-                f();
+        let fired = STARTUP_FIRED_COUNT[worker_id as usize].load(Ordering::Relaxed);
+        if fired < total {
+            for slot in PER_WORKER_STARTUP.iter().take(total).skip(fired) {
+                if let Some(f) = slot.load() {
+                    f();
+                }
             }
+            STARTUP_FIRED_COUNT[worker_id as usize]
+                .store(total, Ordering::Relaxed);
         }
     }
 

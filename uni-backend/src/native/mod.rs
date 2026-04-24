@@ -1546,9 +1546,15 @@ fn is_ready() -> bool {
 /// Run the worker event loop on this thread. Same structure as the
 /// unikernel's. Called by `native_worker_loop` after thread setup.
 pub fn run_worker(worker_id: u32) {
-    // Wait for ready
-    while !is_ready() && !check_shutdown() {
-        wait_for_events();
+    // Worker 0 skips the READY wait: `uni_main` now only spawns the
+    // app's boot body as an async task; worker 0 is what polls it,
+    // and the task's `uni::run(app)` is what eventually calls
+    // `set_ready` to release the other workers. Blocking here would
+    // deadlock because nothing else drives the runtime.
+    if worker_id != 0 {
+        while !is_ready() && !check_shutdown() {
+            wait_for_events();
+        }
     }
 
     loop {

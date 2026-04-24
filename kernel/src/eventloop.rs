@@ -100,9 +100,16 @@ pub fn is_shutdown() -> bool {
 
 /// Run the event loop on the current core. Does not return until shutdown.
 pub fn run(core_id: u32) -> ! {
-    // Wait for the app to finish initialization before processing.
-    while !READY.load(Ordering::Acquire) && !is_shutdown() {
-        crate::cpu::idle_unbounded();
+    // APs wait for the app's `set_ready` so they don't hammer the
+    // NIC / inbox machinery before listeners are registered. Core 0
+    // skips this wait — its event loop drives the spawned boot task
+    // (see `#[uni::boot]`), and that task is what eventually calls
+    // `set_ready`. Blocking here would deadlock because nothing
+    // else polls the runtime.
+    if core_id != 0 {
+        while !READY.load(Ordering::Acquire) && !is_shutdown() {
+            crate::cpu::idle_unbounded();
+        }
     }
 
 
