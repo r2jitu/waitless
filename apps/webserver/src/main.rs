@@ -88,15 +88,12 @@ impl WebServerApp {
                         )
                         .await;
                         let Some(n) = got else {
-                            stream.close();
                             return;
                         };
                         if n == 0 {
-                            stream.close();
                             return;
                         }
                         if stream.send(&buf[..n]).await.is_err() {
-                            stream.close();
                             return;
                         }
                     }

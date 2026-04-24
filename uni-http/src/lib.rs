@@ -446,31 +446,27 @@ impl Drop for Server {
 /// the stack before moving to the heap under rustc's current
 /// layout, which measurably hurt HVF-side throughput on the TLS
 /// workloads.
-async fn handle_plain_conn(server: Arc<Inner>, stream: uni::TcpStream) {
+async fn handle_plain_conn(server: Arc<Inner>, stream: uni::runtime::TcpStream) {
     let mut buf: Box<[u8]> = alloc::vec![0u8; BUF_SIZE].into_boxed_slice();
     let mut buf_len = 0usize;
     loop {
         if server.is_shutting_down() {
-            stream.close();
             return;
         }
         if buf_len == BUF_SIZE {
             // Parse buffer full and no progress — client is
             // sending a request larger than we're prepared to
             // handle. Drop cleanly.
-            stream.close();
             return;
         }
         let recv_fut = stream.recv(&mut buf[buf_len..]);
         let got = match uni::runtime::timeout_us(IDLE_TIMEOUT_US, recv_fut).await {
             Some(n) => n,
             None => {
-                stream.close();
                 return;
             }
         };
         if got == 0 {
-            stream.close();
             return;
         }
         buf_len += got;
@@ -495,13 +491,11 @@ async fn handle_plain_conn(server: Arc<Inner>, stream: uni::TcpStream) {
             let mut w = BufWriter::new();
             write_response_into(&mut w, &resp, !want_close);
             if stream.send(w.as_bytes()).await.is_err() {
-                stream.close();
                 return;
             }
             drop(resp);
 
             if want_close {
-                stream.close();
                 return;
             }
             let remaining = buf_len - consumed;
@@ -520,7 +514,7 @@ async fn handle_plain_conn(server: Arc<Inner>, stream: uni::TcpStream) {
 /// request/response machinery as the plain path. The TLS handshake
 /// and app-data phases share this loop — the state machine itself
 /// tracks which records are handshake vs application.
-async fn handle_tls_conn(server: Arc<Inner>, stream: uni::TcpStream) {
+async fn handle_tls_conn(server: Arc<Inner>, stream: uni::runtime::TcpStream) {
     // Seed the per-conn ephemeral keypair. `uni::rng::fill_bytes`
     // abstracts the cfg split (ChaCha20 PRNG seeded at boot on
     // bare-metal, `arc4random_buf` / `getentropy` on native).
@@ -530,7 +524,6 @@ async fn handle_tls_conn(server: Arc<Inner>, stream: uni::TcpStream) {
     let Some(mut tls) = server.tls_adapter.as_ref().map(|a| a.new_connection(seed)) else {
         // `install_tls()` was never called but a TLS port fired —
         // shouldn't happen; bail defensively.
-        stream.close();
         return;
     };
 
@@ -545,7 +538,6 @@ async fn handle_tls_conn(server: Arc<Inner>, stream: uni::TcpStream) {
     loop {
         if server.is_shutting_down() {
             let _ = tls.close_notify();
-            stream.close();
             return;
         }
         // --- Drain any pending TLS TX (handshake flight, encrypted
@@ -556,7 +548,6 @@ async fn handle_tls_conn(server: Arc<Inner>, stream: uni::TcpStream) {
                 break;
             }
             if stream.send(&tx_scratch[..n]).await.is_err() {
-                stream.close();
                 return;
             }
         }
@@ -566,18 +557,15 @@ async fn handle_tls_conn(server: Arc<Inner>, stream: uni::TcpStream) {
         let got = match uni::runtime::timeout_us(IDLE_TIMEOUT_US, recv_fut).await {
             Some(n) => n,
             None => {
-                stream.close();
                 return;
             }
         };
         if got == 0 {
-            stream.close();
             return;
         }
         tls.push_rx(&recv_buf[..got]);
 
         if tls.advance().is_err() {
-            stream.close();
             return;
         }
 
@@ -589,7 +577,6 @@ async fn handle_tls_conn(server: Arc<Inner>, stream: uni::TcpStream) {
                 break;
             }
             if stream.send(&tx_scratch[..n]).await.is_err() {
-                stream.close();
                 return;
             }
         }
@@ -607,7 +594,6 @@ async fn handle_tls_conn(server: Arc<Inner>, stream: uni::TcpStream) {
             let consumed = parse_request(&plain_buf[..plain_len], &mut req);
             if consumed == 0 {
                 if plain_len >= BUF_SIZE {
-                    stream.close();
                     return;
                 }
                 break;
@@ -625,7 +611,6 @@ async fn handle_tls_conn(server: Arc<Inner>, stream: uni::TcpStream) {
             let mut w = BufWriter::new();
             write_response_into(&mut w, &resp, !want_close);
             if tls.send_app_data(w.as_bytes()).is_err() {
-                stream.close();
                 return;
             }
             if want_close {
@@ -640,13 +625,11 @@ async fn handle_tls_conn(server: Arc<Inner>, stream: uni::TcpStream) {
                     break;
                 }
                 if stream.send(&tx_scratch[..n]).await.is_err() {
-                    stream.close();
                     return;
                 }
             }
 
             if want_close {
-                stream.close();
                 return;
             }
             let remaining = plain_len - consumed;
