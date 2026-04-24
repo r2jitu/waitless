@@ -20,14 +20,13 @@ pub use net_tls_server::TlsServerConfig;
 
 // ── Free-function entry point ────────────────────────────────────────────
 
-/// Make `server` start accepting TLS connections on `port`.
-///
-/// Replaces the old `Server::listen_tls(port, cfg)` method. `cfg` is
-/// wrapped in an adapter and handed to the server via its
-/// `listen_tls` entry, which is TLS-agnostic. Clone-friendly —
-/// multiple ports can share the same config cheaply.
-pub fn listen_tls(server: &mut uni_http::Server, port: u16, cfg: TlsServerConfig) {
-    server.listen_tls(port, Box::new(TlsAdapterImpl { cfg: Arc::new(cfg) }));
+/// Attach `cfg` to `server` so subsequent `server.listen_tls(port)`
+/// calls can accept HTTPS connections. `cfg` is wrapped in an
+/// adapter and stored on the server via the TLS-agnostic
+/// `install_tls` entry; the actual listener is started by the
+/// caller after `Box::leak`-ing the server.
+pub fn install(server: &mut uni_http::Server, cfg: TlsServerConfig) {
+    server.install_tls(Box::new(TlsAdapterImpl { cfg: Arc::new(cfg) }));
 }
 
 // ── Diagnostic helpers (moved from `uni::http`) ──────────────────────────

@@ -33,8 +33,13 @@ const HTTP_PORT: u16 = 80;
 const HTTPS_PORT: u16 = 443;
 
 /// Holds the long-lived state of the webserver program.
+///
+/// The `Server` itself is `Box::leak`-ed before `listen()` — the
+/// per-conn accept tasks capture `&'static Server` directly, so
+/// the app doesn't need to carry a Box reference here. We just
+/// keep the `Net` handle so the network stack stays up for the
+/// process lifetime.
 struct WebServerApp {
-    _server: alloc::boxed::Box<Server>,
     _net: Net,
 }
 
@@ -96,25 +101,32 @@ impl WebServerApp {
 
         let mut server = Server::new_boxed();
         server.default_handler(handle_request);
-        server.listen(http_port);
 
         if let Some(cfg) = TlsServerConfig::from_dev_cert(DEV_CERT_DER, DEV_KEY_PKCS8_DER) {
             uni::log(b"TLS: dev cert loaded. Serving HTTPS.\n");
-            uni_tls::listen_tls(&mut server, https_port, cfg);
+            uni_tls::install(&mut server, cfg);
         } else {
             uni::log(b"TLS: failed to parse dev key; HTTPS disabled.\n");
         }
 
+        // Freeze: leak the fully-configured server and spawn the
+        // listeners. Accept tasks capture this `&'static Server`
+        // directly; no globals. Handles get `.leak()`'d for
+        // app-lifetime serving.
+        let server: &'static Server = alloc::boxed::Box::leak(server);
+        server.listen(http_port).leak();
+        if server.has_tls() {
+            server.listen_tls(https_port).leak();
+        }
+
         uni::log(b"Entering event loop.\n");
-        WebServerApp { _server: server, _net: net }
+        WebServerApp { _net: net }
     }
 }
 
 impl Drop for WebServerApp {
     fn drop(&mut self) {
         uni::log(b"[app] shutting down\n");
-        // Field drops cascade from here: `_server` tears down
-        // listeners, active conns, TLS config, RX buffers.
     }
 }
 

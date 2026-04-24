@@ -15,9 +15,10 @@ extern crate uni_http;
 use uni::net::{Net, NetBringUp};
 use uni_http::{Request, Response, Server};
 
-/// The app: holds the HTTP server for the program's lifetime.
+/// The app holds the `Net` so the network stack stays up for the
+/// process lifetime. The HTTP server itself is `Box::leak`-ed
+/// before `listen()` — accept tasks capture `&'static Server`.
 struct HelloApp {
-    _server: alloc::boxed::Box<Server>,
     _net: Net,
 }
 
@@ -27,8 +28,9 @@ impl HelloApp {
     fn new(net: Net) -> Self {
         let mut server = Server::new_boxed();
         server.default_handler(hello);
-        server.listen(uni::config_port(80));
-        HelloApp { _server: server, _net: net }
+        let server: &'static Server = alloc::boxed::Box::leak(server);
+        server.listen(uni::config_port(80)).leak();
+        HelloApp { _net: net }
     }
 }
 
