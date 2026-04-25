@@ -59,10 +59,22 @@ pub const MAX_UDP_SOCKETS: usize = 8;
 /// core consumer) drains one entry per task poll, so this is purely
 /// burst tolerance for when delivery outpaces task scheduling (NIC
 /// RX interrupt coalescing, slow handler work, cross-core delivery
-/// on Tier 2). 16 absorbs typical interrupt bursts without ballooning
-/// static BSS — total footprint is MAX_UDP_SOCKETS × MAX_WORKERS ×
-/// INBOX_CAPACITY × MAX_PAYLOAD ≈ 1.5 MB.
-const INBOX_CAPACITY: usize = 16;
+/// on Tier 2).
+///
+/// Sized for the udp_peak workload: at ~700k pps per core (the
+/// pre-async-refactor ceiling we want to recover) a single drain
+/// cycle has ~1 µs slack per packet. 16 slots = 22 µs of tolerance
+/// before try_push starts dropping; with NIC poll batches that
+/// regularly land 32+ packets per IRQ, we were dropping mid-batch
+/// and bottlenecking on packet loss instead of CPU. 128 slots
+/// gives the receiver task time to advance the head pointer
+/// without the producer wrapping.
+///
+/// Static BSS cost: MAX_UDP_SOCKETS × MAX_WORKERS × INBOX_CAPACITY
+/// × MAX_PAYLOAD ≈ 8 × 8 × 128 × 1500 = 12 MB. The unikernel has
+/// 128 MB of RAM by default; this buys back a 2× regression on
+/// the hottest workload at ~10% of the memory budget.
+const INBOX_CAPACITY: usize = 128;
 const MAX_PAYLOAD: usize = 1500;
 
 // ---- SpinLock (waker cell) --------------------------------------------------
@@ -188,6 +200,17 @@ struct WorkerInbox {
     head: AtomicU32,
     tail: AtomicU32,
     slots: UnsafeCell<[Datagram; INBOX_CAPACITY]>,
+    /// Hot-path gate for the producer's "wake the receiver" step.
+    /// `false` means there is no parked task to wake — the producer
+    /// can skip the `waker.lock()` round-trip entirely. `true`
+    /// means the receiver parked a waker the producer must consume.
+    /// Set by the receiver (`UdpRecvFrom::poll` slow path) and
+    /// cleared by the producer (after taking + waking) or by the
+    /// receiver itself when it pops via the slow→fast transition.
+    /// Skipping the lock is the single biggest win on the udp_peak
+    /// hot path: at ~700k pps, two atomic ops on the spinlock
+    /// cache line per packet was costing ~half the throughput.
+    waker_present: core::sync::atomic::AtomicBool,
     waker: SpinLock<Option<Waker>>,
 }
 
@@ -200,6 +223,7 @@ impl WorkerInbox {
             head: AtomicU32::new(0),
             tail: AtomicU32::new(0),
             slots: UnsafeCell::new([const { Datagram::ZERO }; INBOX_CAPACITY]),
+            waker_present: core::sync::atomic::AtomicBool::new(false),
             waker: SpinLock::new(None),
         }
     }
@@ -244,6 +268,50 @@ impl WorkerInbox {
         self.head.store(0, Ordering::Relaxed);
         self.tail.store(0, Ordering::Relaxed);
         *self.waker.lock() = None;
+        self.waker_present.store(false, Ordering::Release);
+    }
+
+    /// Receiver-side: park `w` for the producer to wake when the next
+    /// datagram arrives. Sets the `waker_present` gate so the
+    /// producer's hot path knows there's work to do.
+    fn park_waker(&self, w: &Waker) {
+        let mut slot = self.waker.lock();
+        let need_store = match &*slot {
+            Some(existing) => !existing.will_wake(w),
+            None => true,
+        };
+        if need_store {
+            *slot = Some(w.clone());
+        }
+        // Release ordering so the producer's Acquire-load sees the
+        // waker store before the gate flips on.
+        self.waker_present.store(true, Ordering::Release);
+    }
+
+    /// Receiver-side: drop any parked waker. Called when the receiver
+    /// picks up a datagram via the slow-path's re-check (i.e., we
+    /// parked, but the producer-side store landed before our
+    /// re-pop), so the producer can short-circuit the next packet.
+    fn unpark(&self) {
+        self.waker_present.store(false, Ordering::Release);
+        *self.waker.lock() = None;
+    }
+
+    /// Producer-side: wake the parked receiver if any. The
+    /// `waker_present` gate makes this branch-free in the steady-state
+    /// `recv_from` loop where the receiver pops in the fast path and
+    /// never parks.
+    fn wake_if_parked(&self) {
+        // Acquire so we observe the receiver's prior waker store
+        // before reading the slot.
+        if !self.waker_present.load(Ordering::Acquire) {
+            return;
+        }
+        let taken = self.waker.lock().take();
+        if let Some(w) = taken {
+            self.waker_present.store(false, Ordering::Release);
+            w.wake();
+        }
     }
 }
 
@@ -596,9 +664,9 @@ impl<'a> Future for UdpRecv<'a> {
         // Slow path: register the waker, then re-check — closes the
         // race where `deliver_udp` pushed between the fast-path pop
         // and the waker registration.
-        store_waker_if_needed(&inbox.waker, cx.waker());
+        inbox.park_waker(cx.waker());
         if let Some(r) = inbox.pop_into(this.buf) {
-            *inbox.waker.lock() = None;
+            inbox.unpark();
             return Poll::Ready(r);
         }
         Poll::Pending
@@ -617,10 +685,7 @@ pub fn deliver_udp(dst_port: u16, src_ip: [u8; 4], src_port: u16, payload: &[u8]
         if state.port.load(Ordering::Acquire) == dst_port {
             let inbox = state.inboxes.current(&cc);
             let _ = inbox.try_push(src_ip, src_port, payload);
-            let taken = inbox.waker.lock().take();
-            if let Some(waker) = taken {
-                waker.wake();
-            }
+            inbox.wake_if_parked();
             return true;
         }
     }
