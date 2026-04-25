@@ -199,6 +199,22 @@ fn poll_tier1() -> bool {
     }
     let core = uni_kernel::cpu_id();
     let nqp = uni_drivers::net::num_queue_pairs() as u32;
+    // Pre-`set_ready` (boot-task window): only the BSP is polling;
+    // APs are still idling at the top of `eventloop::run`. If a
+    // multi-queue NIC hashes inbound traffic to a queue >0 (e.g.
+    // vhost-net routes a DHCP OFFER to queue 1 by 4-tuple hash),
+    // no AP is draining it and DHCP retries time out. While in
+    // that window the BSP polls every queue. Once `set_ready` has
+    // fired we fall back to the per-core scheme — APs are then
+    // polling their own queues, and double-polling would race on
+    // the per-queue cursor atomics.
+    if core == 0 && !uni_kernel::eventloop::is_ready() {
+        let mut total = 0;
+        for q in 0..nqp as usize {
+            total += uni_drivers::net::poll_qp(q, net_receive);
+        }
+        return total > 0;
+    }
     // Only cores with `core < nqp` poll RX — two cores hammering the
     // same queue race on the cursor atomics and double-deliver /
     // miss packets. Cores beyond nqp still do service work (they

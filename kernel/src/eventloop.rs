@@ -99,6 +99,17 @@ pub fn is_shutdown() -> bool {
     SHUTDOWN.load(Ordering::Relaxed)
 }
 
+/// True after `set_ready()` has been called. Pre-`set_ready` is the
+/// boot-task window: APs are still idling at the top of `run()`,
+/// only the BSP is polling. Used by the net stack to widen the
+/// BSP's RX coverage during this window so packets vhost-net
+/// hashes to a queue whose owning AP hasn't started polling yet
+/// (e.g. DHCP replies on queue 1 of a multi-queue NIC) still get
+/// drained.
+pub fn is_ready() -> bool {
+    READY.load(Ordering::Acquire)
+}
+
 /// Run the event loop on the current core. Does not return until shutdown.
 pub fn run(core_id: u32) -> ! {
     // APs wait for the app's `set_ready` so they don't hammer the
