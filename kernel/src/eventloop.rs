@@ -138,17 +138,33 @@ pub fn run(core_id: u32) -> ! {
 
     // How many no-work iterations to spin through before arming the
     // next RX IRQ and going idle. Each iteration is a full poll +
-    // drain + service cycle and costs ~200ns; 64 iterations is
-    // ~13 µs, longer than one KVM exit+enter round-trip, so a
-    // client sending keep-alive requests is almost guaranteed to
-    // catch the next packet without an IRQ. Tunable — higher values
-    // burn more CPU on idle, lower values hurt single-flow
-    // throughput. Profiling 2 c udp_peak on HVF showed that
-    // widening this (1024, u32::MAX) didn't move the needle — the
-    // regression is host-side (macOS SO_REUSEPORT UDP hashing
-    // imbalance and/or Hypervisor.framework vCPU scheduling), not
-    // guest-side yield-poll overhead.
-    const IDLE_SPIN_BEFORE_HLT: u32 = 64;
+    // drain + service cycle and costs ~200ns.
+    //
+    // 64 (~13 µs) was the original; comments-of-record had it
+    // verified on HVF udp_peak as no-difference vs 1024 / u32::MAX,
+    // and tuned to "longer than one KVM exit+enter round-trip" so
+    // an interactive keep-alive caught the next packet without
+    // arming an IRQ. Empirically that's not the right floor on
+    // either current path:
+    // - On *nested-KVM* dev benches (`scripts/bench.py --env kvm`),
+    //   tcp_echo_max with 16 conns/core ping-ponging hits a ~1.1 ms
+    //   per-conn RTT floor because the guest halts between every
+    //   batch and eats halt→IRQ→wake on the critical path. Widening
+    //   to ~10 k iterations keeps the guest in poll mode through one
+    //   full host-side bounce and lifts tcp_echo from ~44 k to ~169 k
+    //   msg/s on KVM 3c; `*_c1` (single-flow) workloads see 4–10×.
+    // - On *deployed gVNIC* (production target), reverting to 64
+    //   crushes everything roughly the same way: `health_max` 418 k
+    //   → 111 k, `tcp_echo_max` 216 k → 60 k, `health_c1` 15 k → 1 k.
+    //   The async-reactor refactor (commits 4cfa316 / 53841c2 /
+    //   2f91e17) added per-packet inbox+wake overhead; with a 13 µs
+    //   spin window the guest halts between every dispatch boundary.
+    //
+    // 10 000 (~2 ms) keeps both deployed and nested-virt paths in
+    // poll mode through their natural inter-batch gaps. Idle
+    // workloads still halt within 2 ms; the extra busy-spin is
+    // bounded.
+    const IDLE_SPIN_BEFORE_HLT: u32 = 10_000;
 
     loop {
         if loops & 63 == 0 && is_shutdown() { break; }
