@@ -17,7 +17,7 @@ use alloc::string::String;
 use core::fmt::Write as _;
 
 use uni::net::{Net, NetBringUp};
-use uni_http::{Request, Response, Server};
+use uni_http::{HttpBindError, HttpServer, Request, Response};
 use uni_tls::TlsServerConfig;
 
 // ---- Application ------------------------------------------------------------
@@ -40,7 +40,7 @@ const HTTPS_PORT: u16 = 443;
 /// release ports 7/9), and the `Net` handle (which marks the
 /// stack disabled).
 struct WebServerApp {
-    _server: uni_http::Server,
+    _server: HttpServer,
     _udp_echo: Option<uni::runtime::UdpHandle>,
     _tcp_echo: Option<uni::runtime::TcpHandle>,
     _net: Net,
@@ -107,11 +107,11 @@ impl WebServerApp {
             }
         };
 
-        let builder = Server::builder().default_handler(handle_request);
+        let builder = HttpServer::builder().default_handler(handle_request);
         let builder =
             if let Some(cfg) = TlsServerConfig::from_dev_cert(DEV_CERT_DER, DEV_KEY_PKCS8_DER) {
                 uni::log(b"TLS: dev cert loaded. Serving HTTPS.\n");
-                uni_tls::install(builder, cfg)
+                builder.https(uni_tls::server(cfg))
             } else {
                 uni::log(b"TLS: failed to parse dev key; HTTPS disabled.\n");
                 builder
@@ -121,8 +121,11 @@ impl WebServerApp {
         if server.listen(http_port).is_err() {
             uni::log(b"http: bind FAILED\n");
         }
-        if server.has_tls() && server.listen_tls(https_port).is_err() {
-            uni::log(b"https: bind FAILED\n");
+        // `TlsNotConfigured` is a benign outcome (no cert) — only
+        // log real failures.
+        match server.listen_https(https_port) {
+            Ok(()) | Err(HttpBindError::TlsNotConfigured) => {}
+            Err(_) => uni::log(b"https: bind FAILED\n"),
         }
 
         uni::log(b"Entering event loop.\n");

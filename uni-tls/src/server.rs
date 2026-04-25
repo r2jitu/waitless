@@ -10,49 +10,26 @@
 // §4.3.1 (EncryptedExtensions), §4.4.2-4 (Certificate chain),
 // §5 (Record protocol), §7.1 (Key schedule).
 
-#![no_std]
-
-extern crate alloc;
-
-extern crate getrandom;
-extern crate hmac;
-extern crate net_tls as tls;
-extern crate net_tls_crypto as tls_crypto;
-extern crate net_tls_handshake as handshake;
-extern crate net_tls_record as record;
-extern crate p256;
-extern crate sha2;
-
 use alloc::alloc::{alloc_zeroed, Layout};
 use alloc::boxed::Box;
 
-// `//kernel` is only linked in on bare-metal builds (see
-// net/BUILD.bazel's select()). The native host build uses the
-// same tls_server sources but skips the kernel dep entirely,
-// which lets `//uni:uni` use the full hand-rolled TLS stack on
-// both the unikernel and POSIX paths. The only consumer of
-// kernel functionality left in this crate is the optional
-// `#[cfg(tls_debug)]` serial tracer, which falls back to
-// `libc::write(2, ...)` on hosted targets.
-#[cfg(all(tls_debug, target_os = "none"))]
-extern crate uni_kernel;
-
 use p256::ecdsa::SigningKey;
 
-use handshake::ParseError;
-use record::{content_type, seal as record_seal, RecordError};
-use tls::{KeySchedule, TrafficKey, Transcript, X25519ServerKey, HASH_LEN};
+use net_tls_handshake::ParseError;
+use net_tls_record::{content_type, seal as record_seal, RecordError};
+use net_tls::{KeySchedule, TrafficKey, Transcript, X25519ServerKey, HASH_LEN};
 
-// Submodules. Paths are explicit so the flat net/ directory layout
-// keeps `tls_server_*` prefixes instead of colliding with unrelated
-// `profile.rs` / `handlers.rs` files.
-#[path = "tls_server_keys.rs"]
+// Re-export sibling crates under short names so the file-internal
+// references match the original net/tls_server.rs naming. `pub
+// (super)` on `tls` / `record` lets the submodules in `server/`
+// reach them via `super::tls` / `super::record`.
+pub(super) use net_tls as tls;
+pub(super) use net_tls_handshake as handshake;
+pub(super) use net_tls_record as record;
+
 mod keys;
-#[path = "tls_server_trace.rs"]
 mod trace;
-#[path = "tls_server_profile.rs"]
 pub mod profile;
-#[path = "tls_server_handlers.rs"]
 mod handlers;
 
 // ============================================================================
@@ -187,6 +164,13 @@ fn extract_p256_d_from_pkcs8(blob: &[u8]) -> Option<[u8; 32]> {
 // Error type
 // ============================================================================
 
+// `AeadFailed` and the `Failed` state are reachable via `trace.rs`'s
+// debug formatter but no current code path constructs them — the
+// underlying record-layer error is returned wrapped in
+// `RecordError(...)` rather than translated. Keep the variants so
+// the trace remains exhaustive and future error-translation paths
+// have the names they need; silence the dead-code lint locally.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TlsError {
     ParseError(ParseError),
@@ -224,6 +208,7 @@ impl From<RecordError> for TlsError {
 // State
 // ============================================================================
 
+#[allow(dead_code)] // `Failed` reachable via trace formatter only — see TlsError comment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     /// Before any bytes have arrived.
@@ -265,6 +250,11 @@ pub enum State {
 pub struct TlsServer {
     // State
     pub(crate) state: State,
+    /// Set on fatal errors. Not read today (handlers return the
+    /// error directly via `Result`); preserved as scaffolding for
+    /// the eventual `state()`/`error()` accessor pair when a
+    /// caller actually wants to inspect post-mortem.
+    #[allow(dead_code)]
     pub(crate) error: Option<TlsError>,
 
     // Raw TLS bytes received from peer (may contain partial or
@@ -530,21 +520,6 @@ impl TlsServer {
         }
     }
 
-    pub fn state(&self) -> State {
-        self.state
-    }
-
-    pub fn error(&self) -> Option<TlsError> {
-        self.error
-    }
-
-    pub fn has_tx(&self) -> bool {
-        self.tx_len > self.tx_pos
-    }
-
-    pub fn has_plaintext(&self) -> bool {
-        self.pt_len > self.pt_pos
-    }
 }
 
 // ============================================================================

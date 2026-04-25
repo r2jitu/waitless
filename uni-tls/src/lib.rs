@@ -1,13 +1,23 @@
-// uni-tls/src/lib.rs — TLS 1.3 carveout.
+// uni-tls — TLS 1.3 server for HTTPS over `uni_http`.
 //
-// Adapts the sans-io server state machine in `net_tls_server` onto
-// the `uni_http::{TlsAdapter, TlsConnection}` traits so
-// `uni_http::Server` can accept HTTPS connections without any
-// direct dependency on TLS code. Apps that don't import `uni-tls`
-// link zero bytes of TLS / crypto.
+// Owns the entire server-side TLS-over-TCP layer: the handshake
+// state machine (`server::TlsServer` + handlers + keys + profile +
+// trace) plus the `uni_http::Tls` impl that the HTTP server uses
+// to terminate HTTPS connections.
 //
-// Public surface is tiny: the free function `listen_tls`, the
-// re-exported `TlsServerConfig`, and two diagnostic helpers.
+// `//net` provides the lower-level protocol primitives that are
+// shared with the future QUIC stack (`net_tls_crypto`,
+// `net_tls_handshake`, `net_tls_record`, `net_tls`); this crate
+// composes them into the TLS-over-stream server. Apps that don't
+// import `uni_tls` link zero TLS / crypto code — the trait
+// boundary in `uni_http` keeps the dependency graph clean.
+//
+// Public surface:
+//   * `TlsServerConfig` — cert + key loaded from PKCS#8 DER.
+//   * `server(cfg)` — produces a `Box<dyn uni_http::Tls>` ready
+//     for `HttpServerBuilder::https`.
+//   * `tls_profile_report` / `tls_profile_reset` — handshake
+//     timing diagnostics.
 
 #![no_std]
 
@@ -16,64 +26,62 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 
-pub use net_tls_server::TlsServerConfig;
+mod server;
 
-// ── Free-function entry point ────────────────────────────────────────────
+pub use server::TlsServerConfig;
 
-/// Attach `cfg` to the server builder so subsequent
-/// `Server::listen_tls(port)` calls can accept HTTPS connections.
-/// `cfg` is wrapped in an adapter and stored on the builder via
-/// the TLS-agnostic `install_tls` entry. Consumes and returns the
-/// builder to keep chained construction readable.
-pub fn install(
-    builder: uni_http::ServerBuilder,
-    cfg: TlsServerConfig,
-) -> uni_http::ServerBuilder {
-    builder.install_tls(Box::new(TlsAdapterImpl { cfg: Arc::new(cfg) }))
+// ---- Public constructor for the HTTPS path -----------------------------------
+
+/// Build the TLS provider for `uni_http::HttpServerBuilder::https`.
+/// Returns a `Box<dyn uni_http::Tls>` whose `new_connection(seed)`
+/// constructs a fresh handshake state machine per accepted HTTPS
+/// connection, using the same `cfg` (cert + key + ALPN, etc.).
+pub fn server(cfg: TlsServerConfig) -> Box<dyn uni_http::Tls> {
+    Box::new(TlsImpl { cfg: Arc::new(cfg) })
 }
 
-// ── Diagnostic helpers (moved from `uni::http`) ──────────────────────────
+// ---- Diagnostic helpers ------------------------------------------------------
 
-/// Format the TLS handshake profile into `out`. Apps can serve this
-/// as the body of a debug endpoint (`/tls_profile`) to inspect
-/// per-stage handshake timings.
+/// Format the TLS handshake profile into `out`. Apps can serve
+/// this as the body of a debug endpoint (`/tls_profile`) to
+/// inspect per-stage handshake timings.
 pub fn tls_profile_report(out: &mut [u8]) -> usize {
-    net_tls_server::profile::report(out)
+    server::profile::report(out)
 }
 
 /// Reset the TLS handshake profile accumulators. Useful between
 /// benchmark runs.
 pub fn tls_profile_reset() {
-    net_tls_server::profile::reset();
+    server::profile::reset();
 }
 
-// ── TlsAdapter / TlsConnection impls ─────────────────────────────────────
+// ---- uni_http::Tls impl ------------------------------------------------------
 //
-// Thin wrappers over `net_tls_server::{TlsServer, TlsServerConfig}`.
-// The adapter holds an `Arc<TlsServerConfig>` shared by every
-// accepted connection; each `TlsConnection` keeps its own clone of
-// the `Arc` so `advance()` can pass the config to the state machine
-// without needing a back-ref to the adapter.
+// Thin wrappers over `server::{TlsServer, TlsServerConfig}`. The
+// outer `TlsImpl` holds an `Arc<TlsServerConfig>` shared by every
+// accepted connection; each per-conn `TlsConnImpl` keeps its own
+// clone so `advance()` can pass the config to the state machine
+// without needing a back-ref to the outer struct.
 
-struct TlsAdapterImpl {
+struct TlsImpl {
     cfg: Arc<TlsServerConfig>,
 }
 
-impl uni_http::TlsAdapter for TlsAdapterImpl {
-    fn new_connection(&self, seed: [u8; 32]) -> Box<dyn uni_http::TlsConnection> {
+impl uni_http::Tls for TlsImpl {
+    fn new_connection(&self, seed: [u8; 32]) -> Box<dyn uni_http::TlsConn> {
         Box::new(TlsConnImpl {
-            tls: net_tls_server::TlsServer::new(seed),
+            tls: server::TlsServer::new(seed),
             cfg: self.cfg.clone(),
         })
     }
 }
 
 struct TlsConnImpl {
-    tls: net_tls_server::TlsServer,
+    tls: server::TlsServer,
     cfg: Arc<TlsServerConfig>,
 }
 
-impl uni_http::TlsConnection for TlsConnImpl {
+impl uni_http::TlsConn for TlsConnImpl {
     fn push_rx(&mut self, bytes: &[u8]) {
         self.tls.push_rx(bytes);
     }

@@ -13,14 +13,14 @@ extern crate uni;
 extern crate uni_http;
 
 use uni::net::{Net, NetBringUp};
-use uni_http::{Request, Response, Server};
+use uni_http::{HttpServer, Request, Response};
 
 /// Holds the `Server` (for graceful shutdown) and `Net` (keeps
 /// the network stack alive) for the program's lifetime. Dropping
 /// the app drops the Server, which aborts the accept loop and
 /// signals per-conn tasks to exit.
 struct HelloApp {
-    _server: Server,
+    _server: HttpServer,
     _net: Net,
 }
 
@@ -28,7 +28,7 @@ impl uni::App for HelloApp {}
 
 impl HelloApp {
     fn new(net: Net) -> Self {
-        let mut server = Server::builder()
+        let mut server = HttpServer::builder()
             .default_handler(hello)
             .build();
         server

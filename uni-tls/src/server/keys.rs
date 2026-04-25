@@ -10,7 +10,7 @@
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use tls::HASH_LEN;
+use super::tls::{self, HASH_LEN};
 
 /// Derive a TLS 1.3 `finished_key` from a traffic secret via
 /// HKDF-Expand-Label(label="finished", context=""). See RFC 8446

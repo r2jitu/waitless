@@ -588,7 +588,7 @@ pub fn sign_content_server_cert_verify(
 /// ```
 ///
 /// Caller is responsible for actually computing the signature (we don't
-/// want this module to depend on `p256`; that's `//net:tls_server`'s job).
+/// want this module to depend on `p256`; that's `//uni-tls`'s job).
 pub fn build_certificate_verify(
     signature: &[u8],
     out: &mut [u8],

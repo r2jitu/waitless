@@ -203,73 +203,10 @@ rust_library(
 # Coverage will come from the end-to-end //apps/test_tls integration
 # test once the server state machine lands.
 
-# TLS 1.3 server-side handshake state machine. Ties together
-# //net:tls_handshake (message framing), //net:tls_record (AEAD
-# record layer), //net:tls (key schedule) and RustCrypto primitives
-# (sha2 / hmac / p256) to drive a sans-io handshake from ClientHello
-# to Established.
-#
-# Server auth uses ECDSA P-256 + SHA-256 (sig_scheme 0x0403). We
-# previously used ed25519 (0x0807), which was simpler and faster,
-# but Chromium-family browsers (Chrome, Arc, Edge, ...) don't
-# advertise ed25519 in their TLS 1.3 signature_algorithms extension
-# for server auth, so they reject our CertVerify with
-# `illegal_parameter(47)` and show ERR_SSL_PROTOCOL_ERROR. ECDSA
-# P-256 is the first scheme in every modern client's preference
-# list and is also supported by LibreSSL (macOS system /usr/bin
-# tooling), so test_hvf.sh no longer has to reject LibreSSL.
-#
-# To enable diagnostic tracing at runtime add `--cfg=tls_debug` to
-# the rustc_flags of this target. When not set, the trace module
-# in tls_server.rs compiles to no-op stubs with zero runtime cost.
-rust_library(
-    name = "tls_server",
-    srcs = [
-        "src/tls_server.rs",
-        "src/tls_server_handlers.rs",
-        "src/tls_server_keys.rs",
-        "src/tls_server_profile.rs",
-        "src/tls_server_trace.rs",
-    ],
-    crate_name = "net_tls_server",
-    crate_root = "src/tls_server.rs",
-    # `--check-cfg=cfg(tls_debug)` declares the custom cfg to rustc's
-    # unexpected-cfg lint so that `#[cfg(tls_debug)]` doesn't warn
-    # when the flag is absent (the common case). Project-wide
-    # `-Dwarnings` would otherwise turn the warning into a build
-    # failure. To actually enable tracing, add `"--cfg=tls_debug"`
-    # to this list when debugging.
-    #
-    # Passing `--check-cfg` at all switches rustc into strict mode
-    # where any undeclared cfg warns — so we also have to declare
-    # `test` explicitly, since the `#[cfg(test)] mod tests { ... }`
-    # block at the bottom of tls_server.rs is never built as a
-    # rust_test target (no panic=unwind toolchain for it) but still
-    # needs to be syntactically valid.
-    rustc_flags = [
-        "--check-cfg=cfg(tls_debug)",
-        "--check-cfg=cfg(test)",
-    ],
-    # The kernel dep is bare-metal-only: the `#[cfg(tls_debug)]`
-    # trace module uses `kernel::serial::puts` on `target_os="none"`
-    # targets and `libc::write` on hosted targets. The rest of
-    # tls_server has no kernel dependency, so the same source
-    # compiles for native POSIX builds too and lets `//uni:uni`
-    # drive the full TLS stack on both paths.
-    deps = [
-        ":tls",
-        ":tls_crypto",
-        ":tls_handshake",
-        ":tls_record",
-        "@crates//:getrandom",
-        "@crates//:hmac",
-        "@crates//:p256",
-        "@crates//:sha2",
-    ] + select({
-        "//bazel/platforms:native": [],
-        "//conditions:default": ["//kernel"],
-    }),
-)
+# The TLS 1.3 server-side handshake state machine moved out of
+# //net into //uni-tls — it's TLS-over-TCP-specific server logic
+# and never composed cleanly with the lower-level primitives that
+# QUIC will reuse from this package.
 
 # TLS 1.3 sans-io core: key schedule, HKDF-Expand-Label, transcript,
 # X25519 wrapper, AEAD glue. Uses RustCrypto sha2/hmac/hkdf + our own
