@@ -1,4 +1,5 @@
 load("@rules_rust//rust:defs.bzl", "rust_binary")
+load("//bazel/rules:rust.bzl", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -43,6 +44,19 @@ rust_binary(
 # depend on this genrule (e.g. a variant rule running under its
 # aarch64_unikernel transition) would drag the inner rust_binary
 # onto the unikernel platform and fail its os:macos constraint.
+# Host-native unit tests for the aarch64 MMIO instruction decoder.
+# Pure-logic — given a 32-bit instruction word, return the
+# `MmioAccess` shape (load/store, size, register, sign-extension).
+# No HVF / libc deps, so the same source compiles fine under the
+# `rust_test` panic=unwind harness on any host. The wrapper in
+# //bazel/rules:rust.bzl handles host vs unikernel gating.
+rust_test(
+    name = "decoder_test",
+    size = "small",
+    srcs = ["src/decoder.rs"],
+    crate_root = "src/decoder.rs",
+)
+
 genrule(
     name = "run_hvf",
     srcs = ["run-hvf.entitlements"],

@@ -22,7 +22,10 @@
 // - No std, no cert parsing (yet), no SIGALG processing (yet). This
 //   module stops at "we have traffic keys and can seal/open records".
 
-#![no_std]
+// Stays no_std in production. Under `bazel test`, the
+// `tests_need_std` flag flips this crate's `std` feature on so
+// libtest's panic=unwind harness can link.
+#![cfg_attr(all(not(test), not(feature = "std")), no_std)]
 
 extern crate hkdf;
 extern crate hmac;

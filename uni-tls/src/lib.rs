@@ -23,7 +23,11 @@
 //     timing diagnostics.
 //   * `TlsError` — failure to parse cert / key DER.
 
-#![no_std]
+// Stays no_std in production. Under `bazel test`, the
+// `tests_need_std` flag flips this crate's `std` feature on so
+// libtest's panic=unwind harness can link past the RustCrypto
+// deps' no_std requirement.
+#![cfg_attr(all(not(test), not(feature = "std")), no_std)]
 
 extern crate alloc;
 

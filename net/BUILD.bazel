@@ -157,6 +157,10 @@ rust_library(
 rust_library(
     name = "tls_crypto",
     srcs = ["src/tls_crypto.rs"],
+    crate_features = select({
+        "//bazel/rules:tests_need_std_on": ["std"],
+        "//conditions:default": [],
+    }),
     crate_name = "net_tls_crypto",
     crate_root = "src/tls_crypto.rs",
     deps = [
@@ -164,10 +168,15 @@ rust_library(
     ],
 )
 
-# NOTE: no tls_crypto_test — the upstream crate ships its own RFC 8439
-# test vectors, and our wrapper's `rust_test` would hit the same
-# panic-strategy conflict as //net:tls. Coverage lives in
-# //apps/test_tls (bare-metal integration test).
+# Host-native unit tests for the AEAD seal/open round-trip. Pure
+# bytes-in/bytes-out, no kernel deps. Same `std` feature trick as
+# `//util/atomic_fn`: the crate flips to std + panic=unwind under
+# the `test` verb so libtest's harness links.
+rust_test(
+    name = "tls_crypto_test",
+    size = "small",
+    crate = ":tls_crypto",
+)
 
 # TLS 1.3 handshake framing + ClientHello parser + ServerHello builder.
 # Pure byte-slice parsing/encoding with no external deps, so the host
@@ -191,6 +200,10 @@ rust_test(
 rust_library(
     name = "tls_record",
     srcs = ["src/tls_record.rs"],
+    crate_features = select({
+        "//bazel/rules:tests_need_std_on": ["std"],
+        "//conditions:default": [],
+    }),
     crate_name = "net_tls_record",
     crate_root = "src/tls_record.rs",
     deps = [
@@ -199,9 +212,13 @@ rust_library(
     ],
 )
 
-# NOTE: no tls_record_test — same panic-strategy conflict as //net:tls.
-# Coverage will come from the end-to-end //apps/test_tls integration
-# test once the server state machine lands.
+# Host-native unit tests for record-layer framing + AEAD seal/open
+# round-trip. Same `std` feature trick as `:tls_crypto_test`.
+rust_test(
+    name = "tls_record_test",
+    size = "small",
+    crate = ":tls_record",
+)
 
 # The TLS 1.3 server-side handshake state machine moved out of
 # //net into //uni-tls — it's TLS-over-TCP-specific server logic
@@ -215,6 +232,10 @@ rust_library(
 rust_library(
     name = "tls",
     srcs = ["src/tls.rs"],
+    crate_features = select({
+        "//bazel/rules:tests_need_std_on": ["std"],
+        "//conditions:default": [],
+    }),
     crate_name = "net_tls",
     crate_root = "src/tls.rs",
     deps = [
@@ -226,14 +247,16 @@ rust_library(
     ],
 )
 
-# NOTE: no `tls_test` target. The RustCrypto deps (sha2, hmac, hkdf,
-# x25519-dalek, curve25519-dalek, ...) are built with `-Cpanic=abort`
-# via the global .bazelrc flag, which conflicts with the `unwind`
-# strategy `rust_test`'s test harness requires. The same limitation
-# applies to any future test on a crate with external deps (tcp, etc.)
-# and is tracked as a separate follow-up. For now tls's correctness
-# is covered by an in-kernel integration test (//apps/test_tls)
-# that exercises the full key schedule via HTTP + serial.
+# Host-native unit tests for the key schedule, HKDF-Expand-Label,
+# transcript hashing, and X25519 wrapper. Same `std` feature
+# trick as `:tls_crypto_test` — flips this crate to std under the
+# `test` verb so libtest's panic=unwind harness can link past the
+# RustCrypto deps' no_std requirement.
+rust_test(
+    name = "tls_test",
+    size = "small",
+    crate = ":tls",
+)
 
 rust_library(
     name = "dhcp",

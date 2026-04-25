@@ -28,7 +28,10 @@
 // The 5-byte TLSCiphertext header (opaque_type || legacy_record_version
 // || length) serves as AAD for the AEAD, per §5.2.
 
-#![no_std]
+// Stays no_std in production. Under `bazel test`, the
+// `tests_need_std` flag flips this crate's `std` feature on so
+// libtest's panic=unwind harness can link.
+#![cfg_attr(all(not(test), not(feature = "std")), no_std)]
 
 extern crate net_tls as tls;
 extern crate net_tls_crypto as tls_crypto;
