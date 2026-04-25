@@ -617,23 +617,70 @@ impl core::fmt::Write for BufWriter {
 /// Serialise an HTTP/1.1 response into a `BufWriter`. Split out so
 /// the TLS path can reuse it and feed the bytes through `TlsServer`
 /// instead of straight to `conn.send`.
+///
+/// Hot path — called once per HTTP request. `core::fmt`'s machinery
+/// (format-string walker, Display vtable dispatch, padding logic)
+/// adds up at hundreds of thousands of req/s; manual byte-level
+/// pushes for the constant headers and a small itoa for the only
+/// variable integer (`Content-Length`) measurably outperform
+/// `write!(...)` here.
 fn write_response_into(w: &mut BufWriter, resp: &Response, keep_alive: bool) {
-    use core::fmt::Write;
-
     let body = resp.body_bytes();
     let content_type = resp.content_type_bytes();
-    let conn_header = if keep_alive { "keep-alive" } else { "close" };
 
-    let _ = write!(w, "HTTP/1.1 {} {}\r\n", resp.status, status_text(resp.status));
-    let _ = write!(w, "Content-Type: ");
+    w.push(b"HTTP/1.1 ");
+    let mut status_buf = [0u8; 4];
+    let status_len = write_status_code(&mut status_buf, resp.status);
+    w.push(&status_buf[..status_len]);
+    w.push(b" ");
+    w.push(status_text(resp.status).as_bytes());
+    w.push(b"\r\nContent-Type: ");
     w.push(content_type);
-    let _ = write!(
-        w,
-        "\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
-        body.len(),
-        conn_header
-    );
+    w.push(b"\r\nContent-Length: ");
+    let mut len_buf = [0u8; 20];
+    let len_len = write_usize(&mut len_buf, body.len());
+    w.push(&len_buf[..len_len]);
+    w.push(b"\r\nConnection: ");
+    w.push(if keep_alive { b"keep-alive" } else { b"close" });
+    w.push(b"\r\n\r\n");
     w.push(body);
+}
+
+/// Write the decimal digits of a 3-digit HTTP status code into `out`,
+/// returning the number of bytes written. Limited to 100..=999, which
+/// is the entire HTTP status range; anything outside falls back to a
+/// `0` so the response stays well-formed.
+fn write_status_code(out: &mut [u8; 4], status: i32) -> usize {
+    if !(100..=999).contains(&status) {
+        out[0] = b'0';
+        return 1;
+    }
+    let s = status as usize;
+    out[0] = b'0' + (s / 100) as u8;
+    out[1] = b'0' + ((s / 10) % 10) as u8;
+    out[2] = b'0' + (s % 10) as u8;
+    3
+}
+
+/// Minimal usize → ASCII decimal. Writes into `out` from the right,
+/// returns the number of bytes written. Avoids `core::fmt::Display`'s
+/// padding/precision machinery, which dominates the per-request
+/// formatting cost on the static-body path.
+fn write_usize(out: &mut [u8; 20], mut n: usize) -> usize {
+    if n == 0 {
+        out[0] = b'0';
+        return 1;
+    }
+    let mut tmp = [0u8; 20];
+    let mut i = tmp.len();
+    while n > 0 {
+        i -= 1;
+        tmp[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    let len = tmp.len() - i;
+    out[..len].copy_from_slice(&tmp[i..]);
+    len
 }
 
 // ---- Helper functions -------------------------------------------------------
