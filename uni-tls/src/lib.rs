@@ -13,11 +13,15 @@
 // boundary in `uni_http` keeps the dependency graph clean.
 //
 // Public surface:
-//   * `TlsServerConfig` — cert + key loaded from PKCS#8 DER.
-//   * `server(cfg)` — produces a `Box<dyn uni_http::Tls>` ready
-//     for `HttpServerBuilder::https`.
+//   * `acceptor(cert, key)` — parses cert + key, returns the
+//     `Arc<dyn uni_http::Tls>` that `uni_http::listen_https`
+//     consumes.
+//   * `TlsServerConfig` — typed cert + key bundle, exposed for
+//     advanced uses (custom ALPN, future per-connection cert
+//     selection).
 //   * `tls_profile_report` / `tls_profile_reset` — handshake
 //     timing diagnostics.
+//   * `TlsError` — failure to parse cert / key DER.
 
 #![no_std]
 
@@ -30,14 +34,31 @@ mod server;
 
 pub use server::TlsServerConfig;
 
+/// Cert / key parse failure. Apps treat this as "TLS not
+/// available" and fall back to plain HTTP.
+#[derive(Debug)]
+pub enum TlsError {
+    CertOrKey,
+}
+
 // ---- Public constructor for the HTTPS path -----------------------------------
 
-/// Build the TLS provider for `uni_http::HttpServerBuilder::https`.
-/// Returns a `Box<dyn uni_http::Tls>` whose `new_connection(seed)`
-/// constructs a fresh handshake state machine per accepted HTTPS
-/// connection, using the same `cfg` (cert + key + ALPN, etc.).
-pub fn server(cfg: TlsServerConfig) -> Box<dyn uni_http::Tls> {
-    Box::new(TlsImpl { cfg: Arc::new(cfg) })
+/// Build a TLS acceptor from a self-signed dev certificate
+/// (X.509 DER) + PKCS#8 ECDSA P-256 private key (DER). Both
+/// blobs are typically `include_bytes!`'d at compile time; see
+/// `apps/webserver/dev_certs/regen.sh` for the openssl
+/// invocation that generates them.
+///
+/// The returned `Arc<dyn uni_http::Tls>` is what `uni_http::
+/// listen_https` consumes. For multi-port HTTPS reusing one
+/// cert, clone the Arc per port: `tls.clone()`.
+pub fn acceptor(
+    cert_der: &'static [u8],
+    key_pkcs8_der: &[u8],
+) -> Result<Arc<dyn uni_http::Tls>, TlsError> {
+    let cfg = TlsServerConfig::from_dev_cert(cert_der, key_pkcs8_der)
+        .ok_or(TlsError::CertOrKey)?;
+    Ok(Arc::new(TlsImpl { cfg: Arc::new(cfg) }))
 }
 
 // ---- Diagnostic helpers ------------------------------------------------------

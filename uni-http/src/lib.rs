@@ -13,7 +13,6 @@ extern crate uni;
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 
 
 // TLS injection boundary. `uni-tls` is the (currently sole) impl,
@@ -223,7 +222,6 @@ pub type Handler = fn(&Request) -> Response;
 
 // ---- Server -----------------------------------------------------------------
 
-const MAX_ROUTES: usize = 64;
 const BUF_SIZE: usize = 8192;
 
 /// Idle-connection timeout. After this long without inbound data,
@@ -231,258 +229,187 @@ const BUF_SIZE: usize = 8192;
 /// backend slot. Mirrors common HTTP/1.1 keep-alive budgets.
 const IDLE_TIMEOUT_US: u64 = 30_000_000;
 
-struct Route {
-    path: [u8; 256],
-    path_len: usize,
-    handler: Option<Handler>,
+// ---- HttpStream abstraction --------------------------------------------------
+//
+// `HttpStream` is the byte-level interface the conn handler uses
+// to talk to a peer. Plain HTTP impls it directly over
+// `TcpStream`; HTTPS impls it via `TlsStream`, which owns a
+// `TlsConn` and pumps the TLS state machine inside `recv` / `send`
+// so the handler stays protocol-agnostic.
+//
+// Static dispatch: `handle_conn<S: HttpStream>` is monomorphised
+// per impl, so trait method calls inline. Plain path is identical
+// to the pre-trait code; TLS path performs the same TLS pump
+// work, just relocated inside `TlsStream`.
+
+/// `async_fn_in_trait` lints because the lint can't see that
+/// our connection futures are `!Send` by design — `TcpStream` is
+/// per-worker. Allow at the trait level: callers always use this
+/// trait through static dispatch (see `handle_conn<S: HttpStream>`),
+/// and the per-conn task spawns onto the same worker that
+/// accepted the connection, so cross-worker Send is never needed.
+#[allow(async_fn_in_trait)]
+pub trait HttpStream {
+    /// Read up to `buf.len()` bytes from the peer (after
+    /// decryption, for `TlsStream`). Returns `0` on EOF / fatal
+    /// transport error. Implementors decide whether to wake on
+    /// partial reads or drain a full segment first.
+    async fn recv(&mut self, buf: &mut [u8]) -> usize;
+
+    /// Send all of `data` to the peer (encrypted, for `TlsStream`).
+    /// `Err(())` on fatal transport error; the conn handler tears
+    /// down on error.
+    async fn send(&mut self, data: &[u8]) -> Result<(), ()>;
 }
 
-impl Route {
-    const fn new() -> Self {
-        Route {
-            path: [0; 256],
-            path_len: 0,
-            handler: None,
+impl HttpStream for uni::runtime::TcpStream {
+    async fn recv(&mut self, buf: &mut [u8]) -> usize {
+        (*self).recv(buf).await
+    }
+    async fn send(&mut self, data: &[u8]) -> Result<(), ()> {
+        (*self).send(data).await
+    }
+}
+
+/// HTTPS-side `HttpStream`: owns the `TcpStream` + `TlsConn` and
+/// drives the TLS state machine. `recv` blocks until decrypted
+/// plaintext is available (pumping handshake records as needed);
+/// `send` encrypts via `send_app_data` and flushes ciphertext to
+/// TCP.
+pub struct TlsStream {
+    tcp: uni::runtime::TcpStream,
+    tls: Box<dyn TlsConn>,
+    /// Heap-allocated ciphertext scratch reused across recvs.
+    cipher_buf: Box<[u8]>,
+    /// Stack-friendly scratch for draining `pop_tx` output.
+    tx_scratch: [u8; 2048],
+}
+
+impl TlsStream {
+    pub fn new(tcp: uni::runtime::TcpStream, tls: Box<dyn TlsConn>) -> Self {
+        TlsStream {
+            tcp,
+            tls,
+            cipher_buf: alloc::vec![0u8; BUF_SIZE].into_boxed_slice(),
+            tx_scratch: [0u8; 2048],
+        }
+    }
+
+    /// Drain any pending TLS TX (handshake flight, alerts, queued
+    /// app-data) to the underlying TCP stream. `Err(())` is fatal.
+    async fn drain_tx(&mut self) -> Result<(), ()> {
+        loop {
+            let n = self.tls.pop_tx(&mut self.tx_scratch);
+            if n == 0 {
+                return Ok(());
+            }
+            self.tcp.send(&self.tx_scratch[..n]).await?;
         }
     }
 }
 
-/// Bind error returned by `HttpServer::listen` / `listen_https`.
-/// `Tcp` wraps the underlying TCP-bind error (port already in
-/// use, port 0, all slots claimed, backend setup failed).
-/// `TlsNotConfigured` only comes from `listen_https`, when the
-/// builder didn't see an `https(...)` call — apps that
-/// optionally enable HTTPS based on cert availability can match
-/// on this variant and treat it as "skip HTTPS" rather than a
-/// hard error.
-#[derive(Debug)]
-pub enum HttpBindError {
-    Tcp(uni::runtime::TcpBindError),
-    TlsNotConfigured,
-}
-
-impl From<uni::runtime::TcpBindError> for HttpBindError {
-    fn from(e: uni::runtime::TcpBindError) -> Self {
-        HttpBindError::Tcp(e)
-    }
-}
-
-/// Immutable server config, shared (`Arc`) across all accept /
-/// per-conn tasks so they can look up routes + TLS config without
-/// holding exclusive access to `HttpServer`.
-struct Inner {
-    routes: [Route; MAX_ROUTES],
-    route_count: usize,
-    default_handler: Option<Handler>,
-    tls: Option<Box<dyn Tls>>,
-    /// Set by `HttpServer::Drop`. Per-conn tasks check it at their
-    /// loop head and exit cleanly.
-    shutting_down: core::sync::atomic::AtomicBool,
-}
-
-impl Inner {
-    fn find_handler(&self, path: &[u8]) -> Option<Handler> {
-        let routes = &self.routes[..self.route_count];
-        if let Some(r) = routes.iter().find(|r| r.path[..r.path_len] == *path) {
-            return r.handler;
-        }
-        if let Some(r) = routes.iter().find(|r| {
-            r.path_len > 1 && path.len() >= r.path_len
-                && r.path[..r.path_len] == path[..r.path_len]
-        }) {
-            return r.handler;
-        }
-        self.default_handler
-    }
-
-    fn is_shutting_down(&self) -> bool {
-        self.shutting_down.load(core::sync::atomic::Ordering::Acquire)
-    }
-}
-
-/// Builder phase — chain configuration calls, then `build()`.
-pub struct HttpServerBuilder {
-    inner: Inner,
-}
-
-impl HttpServerBuilder {
-    pub fn new() -> Self {
-        HttpServerBuilder {
-            inner: Inner {
-                routes: [const { Route::new() }; MAX_ROUTES],
-                route_count: 0,
-                default_handler: None,
-                tls: None,
-                shutting_down: core::sync::atomic::AtomicBool::new(false),
-            },
+impl HttpStream for TlsStream {
+    async fn recv(&mut self, buf: &mut [u8]) -> usize {
+        loop {
+            // Try to satisfy from already-decrypted plaintext.
+            let n = self.tls.pop_plaintext(buf);
+            if n > 0 {
+                return n;
+            }
+            // Pump TLS: drain pending tx, recv ciphertext, advance,
+            // drain again, then loop to pop_plaintext.
+            if self.drain_tx().await.is_err() {
+                return 0;
+            }
+            let cipher_len = self.cipher_buf.len();
+            let got = self.tcp.recv(&mut self.cipher_buf[..cipher_len]).await;
+            if got == 0 {
+                return 0;
+            }
+            self.tls.push_rx(&self.cipher_buf[..got]);
+            if self.tls.advance().is_err() {
+                return 0;
+            }
+            if self.drain_tx().await.is_err() {
+                return 0;
+            }
         }
     }
 
-    /// Register an exact-path handler. Consumes-and-returns so
-    /// calls chain.
-    pub fn route(mut self, path: &[u8], handler: Handler) -> Self {
-        if self.inner.route_count >= MAX_ROUTES {
-            uni::log(b"http: too many routes\n");
-            return self;
-        }
-        let r = &mut self.inner.routes[self.inner.route_count];
-        let len = path.len().min(255);
-        r.path[..len].copy_from_slice(&path[..len]);
-        r.path_len = len;
-        r.handler = Some(handler);
-        self.inner.route_count += 1;
-        self
-    }
-
-    /// Set the fallback handler (called when no route matches).
-    pub fn default_handler(mut self, handler: Handler) -> Self {
-        self.inner.default_handler = Some(handler);
-        self
-    }
-
-    /// Enable HTTPS using `tls` as the TLS provider. Apps wire
-    /// this from a TLS provider crate, e.g.
-    /// `.https(uni_tls::server(cfg))`. Without this call,
-    /// `HttpServer::listen_https` returns `TlsNotConfigured`.
-    pub fn https(mut self, tls: Box<dyn Tls>) -> Self {
-        self.inner.tls = Some(tls);
-        self
-    }
-
-    /// Finalise the configuration. The returned `HttpServer` owns
-    /// the `Arc<Inner>`; accept tasks get their own clones.
-    pub fn build(self) -> HttpServer {
-        HttpServer {
-            inner: Arc::new(self.inner),
-            handles: Vec::new(),
-        }
+    async fn send(&mut self, data: &[u8]) -> Result<(), ()> {
+        self.tls.send_app_data(data)?;
+        self.drain_tx().await
     }
 }
 
-/// The async HTTP/1.1 (+ optional HTTPS) server.
+// ---- Public entry points -----------------------------------------------------
+
+/// Listen for plain HTTP on `port`. The returned `TcpHandle`
+/// owns the per-worker accept fan-out; drop it to stop accepting
+/// new connections (in-flight conns drain at their idle
+/// timeout).
 ///
-/// Lifecycle:
-///   1. `HttpServer::builder()` → `HttpServerBuilder`. Chain
-///      `route` / `default_handler` / `https`.
-///   2. `.build()` → `HttpServer`. The inner config is wrapped in
-///      an `Arc` that accept tasks share; `HttpServer` itself is
-///      the single owner and holds the `TcpHandle`s for every
-///      port it's listening on.
-///   3. `server.listen(port)` / `server.listen_https(port)`
-///      binds a port and spawns a per-worker accept fan-out.
-///      Each call adds another bind point — the same route
-///      table serves every bound port. Multiple plain ports,
-///      multiple HTTPS ports, and any mix work. Each call
-///      returns its own `Result` so apps can log per-port
-///      failures without bailing on the whole startup.
-///
-/// Drop semantics:
-///   * The app drops `HttpServer` (e.g. the field holding it
-///     inside `uni::App`).
-///   * `Drop::drop` flips `shutting_down = true` and lets
-///     `self.handles` drop — each `TcpHandle::Drop` aborts the
-///     corresponding accept task and releases the port.
-///   * Per-conn tasks observe `shutting_down` at the top of their
-///     loop on their next iteration. An idle HTTP keep-alive task
-///     sitting in a long `recv().await` doesn't see it until its
-///     idle timeout fires (~30 s), so full drain is bounded by
-///     `IDLE_TIMEOUT_US` rather than immediate.
-///   * `Arc<Inner>` drops when the last per-conn task releases its
-///     clone, freeing the route table and TLS config.
-pub struct HttpServer {
-    inner: Arc<Inner>,
-    handles: alloc::vec::Vec<uni::runtime::TcpHandle>,
+/// `handler` is called for every parsed request; apps that want
+/// path routing match `req.path()` inside it. Many ports can be
+/// bound — call this multiple times — and each `TcpHandle` is
+/// independent.
+pub fn listen(
+    port: u16,
+    handler: Handler,
+) -> Result<uni::runtime::TcpHandle, uni::runtime::TcpBindError> {
+    let listener = uni::runtime::TcpListener::bind(port)?;
+    uni::log(b"http: listening (plain)\n");
+    Ok(listener.run(move |stream| async move {
+        handle_conn(handler, stream).await;
+    }))
 }
 
-impl HttpServer {
-    /// Start building a new server.
-    pub fn builder() -> HttpServerBuilder {
-        HttpServerBuilder::new()
-    }
-
-    /// Add a plain HTTP listener on `port`. Multiple listeners
-    /// are supported — call again with another port to serve the
-    /// same routes on additional bind points.
-    pub fn listen(&mut self, port: u16) -> Result<(), HttpBindError> {
-        let listener = uni::runtime::TcpListener::bind(port)?;
-        uni::log(b"http: listening (plain)\n");
-        let inner = Arc::clone(&self.inner);
-        let handle = listener.run(move |stream| {
-            let inner = Arc::clone(&inner);
-            async move { handle_plain_conn(inner, stream).await }
-        });
-        self.handles.push(handle);
-        Ok(())
-    }
-
-    /// Add an HTTPS (TLS 1.3) listener on `port`. Returns
-    /// `TlsNotConfigured` if the builder didn't see `https(...)`
-    /// — apps that gate HTTPS on cert availability can match on
-    /// that variant and skip silently. Multiple HTTPS listeners
-    /// share the same TLS provider and route table.
-    pub fn listen_https(&mut self, port: u16) -> Result<(), HttpBindError> {
-        if self.inner.tls.is_none() {
-            return Err(HttpBindError::TlsNotConfigured);
+/// Listen for HTTPS (TLS 1.3) on `port`. `tls` is a TLS provider
+/// — typically `uni_tls::acceptor(cert, key)?`. The provider is
+/// shared across every accepted connection on this port; for
+/// multi-port HTTPS reusing the same cert, pass `tls.clone()`
+/// (`Arc::clone` is cheap).
+pub fn listen_https(
+    port: u16,
+    handler: Handler,
+    tls: Arc<dyn Tls>,
+) -> Result<uni::runtime::TcpHandle, uni::runtime::TcpBindError> {
+    let listener = uni::runtime::TcpListener::bind(port)?;
+    uni::log(b"http: listening (TLS)\n");
+    Ok(listener.run(move |tcp| {
+        let tls = Arc::clone(&tls);
+        async move {
+            let mut seed = [0u8; 32];
+            uni::rng::fill_bytes(&mut seed);
+            let stream = TlsStream::new(tcp, tls.new_connection(seed));
+            handle_conn(handler, stream).await;
         }
-        let listener = uni::runtime::TcpListener::bind(port)?;
-        uni::log(b"http: listening (TLS)\n");
-        let inner = Arc::clone(&self.inner);
-        let handle = listener.run(move |stream| {
-            let inner = Arc::clone(&inner);
-            async move { handle_tls_conn(inner, stream).await }
-        });
-        self.handles.push(handle);
-        Ok(())
-    }
+    }))
 }
 
-impl Drop for HttpServer {
-    fn drop(&mut self) {
-        // Tell per-conn tasks to exit at their next loop iteration.
-        self.inner
-            .shutting_down
-            .store(true, core::sync::atomic::Ordering::Release);
-        // `handles` drops next (in field order), taking the accept
-        // tasks + port slots with it. Per-conn tasks drain on their
-        // own and release their `Arc<Inner>` clones as they exit;
-        // `Inner` itself frees when the last clone drops.
-    }
-}
+// ---- Unified per-connection handler ------------------------------------------
 
-// ---- Per-connection async handlers ----------------------------------------
-
-/// Plain-HTTP per-conn task. Consumes `stream` and drives one
-/// keep-alive loop: recv → parse (possibly multiple pipelined
-/// requests per recv) → dispatch → send.
-///
-/// The parse buffer is a `Box<[u8]>` allocated via `Vec` so the
-/// zero-fill goes straight to the heap without transiting the
-/// caller's stack — `Box::new([0u8; N])` constructs the array on
-/// the stack before moving to the heap under rustc's current
-/// layout, which measurably hurt HVF-side throughput on the TLS
-/// workloads.
-async fn handle_plain_conn(server: Arc<Inner>, stream: uni::runtime::TcpStream) {
+/// Per-conn keep-alive loop. Reads bytes from `stream` (plain or
+/// TLS — same code path), parses pipelined requests, calls
+/// `handler`, sends responses. Returns when the peer closes,
+/// idle timeout fires, or the buffer overflows on a too-large
+/// request.
+async fn handle_conn<S: HttpStream>(handler: Handler, mut stream: S) {
     let mut buf: Box<[u8]> = alloc::vec![0u8; BUF_SIZE].into_boxed_slice();
     let mut buf_len = 0usize;
     loop {
-        if server.is_shutting_down() {
-            return;
-        }
         if buf_len == BUF_SIZE {
-            // Parse buffer full and no progress — client is
-            // sending a request larger than we're prepared to
-            // handle. Drop cleanly.
+            // Parse buffer full and no complete request in it —
+            // client sent something larger than we handle.
             return;
         }
         let recv_fut = stream.recv(&mut buf[buf_len..]);
         let got = match uni::runtime::timeout_us(IDLE_TIMEOUT_US, recv_fut).await {
             Some(n) => n,
-            None => {
-                return;
-            }
+            None => return, // idle timeout
         };
         if got == 0 {
-            return;
+            return; // EOF / fatal recv
         }
         buf_len += got;
 
@@ -497,11 +424,7 @@ async fn handle_plain_conn(server: Arc<Inner>, stream: uni::runtime::TcpStream) 
                 Some(v) => v.eq_ignore_ascii_case(b"close"),
                 None => false,
             };
-            let handler = server.find_handler(req.path());
-            let resp = match handler {
-                Some(h) => h(&req),
-                None => Response::not_found(),
-            };
+            let resp = handler(&req);
 
             let mut w = BufWriter::new();
             write_response_into(&mut w, &resp, !want_close);
@@ -518,140 +441,6 @@ async fn handle_plain_conn(server: Arc<Inner>, stream: uni::runtime::TcpStream) 
                 buf.copy_within(consumed..buf_len, 0);
             }
             buf_len = remaining;
-        }
-    }
-}
-
-/// HTTPS per-conn task. Owns a heap-allocated `TlsConn`
-/// (built via the registered `Tls` provider) and pumps TCP↔TLS as
-/// one loop: read raw bytes → push_rx → advance → pop_tx → send.
-/// `pop_plaintext` into the HTTP parse buffer drives the same
-/// request/response machinery as the plain path. The TLS handshake
-/// and app-data phases share this loop — the state machine itself
-/// tracks which records are handshake vs application.
-async fn handle_tls_conn(server: Arc<Inner>, stream: uni::runtime::TcpStream) {
-    // Seed the per-conn ephemeral keypair. `uni::rng::fill_bytes`
-    // abstracts the cfg split (ChaCha20 PRNG seeded at boot on
-    // bare-metal, `arc4random_buf` / `getentropy` on native).
-    let mut seed = [0u8; 32];
-    uni::rng::fill_bytes(&mut seed);
-
-    let Some(mut tls) = server.tls.as_ref().map(|a| a.new_connection(seed)) else {
-        // `install_tls()` was never called but a TLS port fired —
-        // shouldn't happen; bail defensively.
-        return;
-    };
-
-    // Heap-allocate the two 8 KB direction buffers via `Vec` to
-    // skip the stack hop `Box::new([0u8; N])` currently incurs.
-    // `tx_scratch` is small enough to live on the future's stack.
-    let mut recv_buf: Box<[u8]> = alloc::vec![0u8; BUF_SIZE].into_boxed_slice();
-    let mut plain_buf: Box<[u8]> = alloc::vec![0u8; BUF_SIZE].into_boxed_slice();
-    let mut plain_len = 0usize;
-    let mut tx_scratch = [0u8; 2048];
-
-    loop {
-        if server.is_shutting_down() {
-            let _ = tls.close_notify();
-            return;
-        }
-        // --- Drain any pending TLS TX (handshake flight, encrypted
-        // app-data from a previous iteration's response, alerts).
-        loop {
-            let n = tls.pop_tx(&mut tx_scratch);
-            if n == 0 {
-                break;
-            }
-            if stream.send(&tx_scratch[..n]).await.is_err() {
-                return;
-            }
-        }
-
-        // --- Receive more ciphertext.
-        let recv_fut = stream.recv(&mut recv_buf[..]);
-        let got = match uni::runtime::timeout_us(IDLE_TIMEOUT_US, recv_fut).await {
-            Some(n) => n,
-            None => {
-                return;
-            }
-        };
-        if got == 0 {
-            return;
-        }
-        tls.push_rx(&recv_buf[..got]);
-
-        if tls.advance().is_err() {
-            return;
-        }
-
-        // --- Flush any output the advance produced before we
-        // attempt plaintext / HTTP work.
-        loop {
-            let n = tls.pop_tx(&mut tx_scratch);
-            if n == 0 {
-                break;
-            }
-            if stream.send(&tx_scratch[..n]).await.is_err() {
-                return;
-            }
-        }
-
-        // --- Pull any newly-decrypted plaintext into the parse
-        // buffer.
-        if plain_len < BUF_SIZE {
-            let n = tls.pop_plaintext(&mut plain_buf[plain_len..]);
-            plain_len += n;
-        }
-
-        // --- Parse + dispatch every complete request.
-        while plain_len > 0 {
-            let mut req = Request::new();
-            let consumed = parse_request(&plain_buf[..plain_len], &mut req);
-            if consumed == 0 {
-                if plain_len >= BUF_SIZE {
-                    return;
-                }
-                break;
-            }
-            let want_close = match req.get_header(b"Connection") {
-                Some(v) => v.eq_ignore_ascii_case(b"close"),
-                None => false,
-            };
-            let handler = server.find_handler(req.path());
-            let resp = match handler {
-                Some(h) => h(&req),
-                None => Response::not_found(),
-            };
-
-            let mut w = BufWriter::new();
-            write_response_into(&mut w, &resp, !want_close);
-            if tls.send_app_data(w.as_bytes()).is_err() {
-                return;
-            }
-            if want_close {
-                let _ = tls.close_notify();
-            }
-            drop(resp);
-
-            // Drain the encrypted response out.
-            loop {
-                let n = tls.pop_tx(&mut tx_scratch);
-                if n == 0 {
-                    break;
-                }
-                if stream.send(&tx_scratch[..n]).await.is_err() {
-                    return;
-                }
-            }
-
-            if want_close {
-                return;
-            }
-            let remaining = plain_len - consumed;
-            if remaining > 0 {
-                plain_buf.copy_within(consumed..plain_len, 0);
-            }
-            plain_len = remaining;
         }
     }
 }
