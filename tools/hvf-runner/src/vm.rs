@@ -97,8 +97,32 @@ const VIRTIO_MMIO_BASE: u64 = 0x0a00_0000;
 const VIRTIO_MMIO_SIZE: u64 = 0x200;
 const VIRTIO_MMIO_SPI: u32 = 3; // INTID = SPI + 32 = 35
 
-/// Where we park the generated DTB in guest RAM (4 MB into RAM).
-const DTB_OFFSET: u64 = 0x0040_0000;
+/// Minimum gap from the end of the loaded kernel image (including BSS)
+/// to the DTB. The DTB lives at `RAM_BASE + image_size + DTB_GAP`,
+/// rounded up to a page boundary.
+///
+/// Why dynamic placement: boot.S zeroes the kernel's BSS by writing
+/// every byte from `__bss_start` to `__bss_end`. If the DTB sits inside
+/// that range, it gets clobbered before fdt::init() can read it, and the
+/// kernel falls back to FdtInfo::ZEROED — which means uart_base=0 (no
+/// serial), gic_dist_base=0, virtio_count=0, etc. Boot completes silently
+/// with no I/O.
+///
+/// The original layout pinned the DTB at a flat 4 MB offset, which was
+/// just past the kernel's BSS for the small-static-array shape the
+/// codebase had at the time. Growing any static (UDP inbox slots, the
+/// hash table, anything in `bss`) past ~3 MB pushed `__bss_end` past
+/// the 4 MB DTB and corrupted boot.
+///
+/// Placing the DTB based on the Image header's `image_size` (which
+/// covers .text + .data + .bss) gets the runner out of the static-
+/// sizing business: as long as the kernel honestly reports its
+/// memory footprint in the header, the DTB is always placed past it.
+const DTB_GAP: u64 = 0x10_0000;            // 1 MB gap past kernel BSS
+const DTB_ALIGN: u64 = 0x10_0000;          // 1 MB align (DTB cells expect this)
+
+/// Offset of `image_size` (u64) in the Linux ARM64 Image header.
+const IMAGE_HEADER_SIZE_OFFSET: usize = 0x10;
 
 
 // PSCI function IDs (SMC64 convention).
@@ -287,18 +311,41 @@ impl Vm {
         // 7. Load kernel image into guest RAM at offset 0 (entry = RAM_BASE).
         let kernel = std::fs::read(kernel_path)
             .map_err(|e| format!("read kernel {kernel_path}: {e}"))?;
-        if kernel.len() > ram_size_fdt - DTB_OFFSET as usize {
+
+        // Read the Image header's image_size to know how much of guest
+        // RAM the kernel will write into (text + data + bss). DTB
+        // goes past that, with a small gap and 1 MB alignment.
+        let image_size = if kernel.len() >= IMAGE_HEADER_SIZE_OFFSET + 8 {
+            u64::from_le_bytes(
+                kernel[IMAGE_HEADER_SIZE_OFFSET..IMAGE_HEADER_SIZE_OFFSET + 8]
+                    .try_into()
+                    .unwrap()
+            )
+        } else {
+            // No header, fall back to file size (unrealistic for our
+            // unikernels but stays correct for hand-rolled test images).
+            kernel.len() as u64
+        };
+        let dtb_offset = ((image_size + DTB_GAP + DTB_ALIGN - 1) / DTB_ALIGN) * DTB_ALIGN;
+        if (kernel.len() as u64) > dtb_offset {
             return Err(format!(
-                "kernel too large: {} bytes (max {})",
-                kernel.len(),
-                ram_size_fdt - DTB_OFFSET as usize
+                "kernel file ({} bytes) extends past computed DTB offset ({}); \
+                 image_size header probably wrong",
+                kernel.len(), dtb_offset,
+            ));
+        }
+        if dtb_offset + 64 * 1024 > ram_size_fdt as u64 {
+            return Err(format!(
+                "kernel too large: image_size={} bytes, DTB would land at {} \
+                 but RAM is only {} bytes",
+                image_size, dtb_offset, ram_size_fdt,
             ));
         }
         unsafe {
             ptr::copy_nonoverlapping(kernel.as_ptr(), ram_host, kernel.len());
         }
 
-        // 8. Generate FDT and write it into guest RAM at DTB_OFFSET.
+        // 8. Generate FDT and write it into guest RAM at the dynamic offset.
         let dtb = fdt::generate(
             RAM_BASE,
             ram_size_fdt as u64,
@@ -312,11 +359,11 @@ impl Vm {
                 spi: VIRTIO_MMIO_SPI,
             }],
         );
-        let dtb_guest_addr = RAM_BASE + DTB_OFFSET;
+        let dtb_guest_addr = RAM_BASE + dtb_offset;
         unsafe {
             ptr::copy_nonoverlapping(
                 dtb.as_ptr(),
-                ram_host.add(DTB_OFFSET as usize),
+                ram_host.add(dtb_offset as usize),
                 dtb.len(),
             );
         }
