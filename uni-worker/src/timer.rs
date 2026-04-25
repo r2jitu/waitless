@@ -86,18 +86,45 @@ impl TimerWheel {
     }
 
     /// Cancel a timer by arg value. Returns true if found and removed.
+    ///
+    /// O(WHEEL_SIZE × MAX_PER_SLOT). Prefer `cancel_at` when the
+    /// caller knows the deadline — at one cancel per `timeout_us`-
+    /// wrapped recv on a busy listener that's millions of slot-
+    /// scans per second.
     pub fn cancel(&mut self, arg: usize) -> bool {
         for slot in self.slots.iter_mut() {
-            for i in 0..slot.count {
-                if let Some(t) = &slot.timers[i] {
-                    if t.arg == arg {
-                        // Swap-remove
-                        slot.count -= 1;
-                        slot.timers[i] = slot.timers[slot.count];
-                        slot.timers[slot.count] = None;
-                        self.total -= 1;
-                        return true;
-                    }
+            if Self::cancel_in_slot(slot, arg) {
+                self.total -= 1;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Cancel a timer whose `(deadline, arg)` pair matches. The
+    /// wheel hashes timers by `deadline & WHEEL_MASK`, so providing
+    /// the deadline turns cancel into an O(MAX_PER_SLOT) lookup
+    /// instead of an O(WHEEL_SIZE × MAX_PER_SLOT) scan. Hot-path
+    /// callers (`Sleep::drop`, the per-recv timeout in keep-alive
+    /// HTTP) all carry the deadline already.
+    pub fn cancel_at(&mut self, deadline: u64, arg: usize) -> bool {
+        let slot_idx = (deadline as usize) & WHEEL_MASK;
+        if Self::cancel_in_slot(&mut self.slots[slot_idx], arg) {
+            self.total -= 1;
+            return true;
+        }
+        false
+    }
+
+    fn cancel_in_slot(slot: &mut Slot, arg: usize) -> bool {
+        for i in 0..slot.count {
+            if let Some(t) = &slot.timers[i] {
+                if t.arg == arg {
+                    // Swap-remove
+                    slot.count -= 1;
+                    slot.timers[i] = slot.timers[slot.count];
+                    slot.timers[slot.count] = None;
+                    return true;
                 }
             }
         }

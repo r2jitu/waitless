@@ -384,7 +384,12 @@ impl Drop for Sleep {
         if self.timer_scheduled {
             let self_ptr: *const Sleep = self;
             let cc = CurrentWorker::enter();
-            let _ = wheel(&cc).cancel(self_ptr as usize);
+            // O(MAX_PER_SLOT) via the deadline-keyed lookup —
+            // significantly faster than the full-wheel scan when
+            // many `timeout_us`-wrapped futures cancel-and-recreate
+            // their inner Sleep on every iteration of a keep-alive
+            // loop.
+            let _ = wheel(&cc).cancel_at(self.deadline, self_ptr as usize);
         }
     }
 }
