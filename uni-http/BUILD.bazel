@@ -2,8 +2,9 @@ load("@rules_rust//rust:defs.bzl", "rust_library")
 
 package(default_visibility = ["//visibility:public"])
 
-# HTTP/1.1 server. Also hosts the `TlsAdapter` / `TlsConnection`
-# traits that `//uni-tls` implements — keeps Server TLS-unaware.
+# HTTP/1.1 server. Also hosts the `Tls` / `TlsConn` traits that
+# `//uni-tls` implements — keeps the HTTP path TLS-unaware so apps
+# without `uni_tls` link zero TLS / crypto code.
 rust_library(
     name = "uni-http",
     srcs = ["src/lib.rs"],

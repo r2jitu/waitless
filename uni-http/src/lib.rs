@@ -18,10 +18,10 @@ use alloc::sync::Arc;
 // TLS injection boundary. `uni-tls` is the (currently sole) impl,
 // adapting its TLS 1.3 state machine onto these methods.
 
-/// TLS provider for `HttpServerBuilder::https`. Implementations
-/// own per-connection-config state (cert + key + per-handshake
-/// scratch); `new_connection` is called once per accepted HTTPS
-/// connection to mint a fresh handshake state machine.
+/// TLS provider for `listen_https`. Implementations own per-
+/// connection-config state (cert + key + per-handshake scratch);
+/// `new_connection` is called once per accepted HTTPS connection
+/// to mint a fresh handshake state machine.
 pub trait Tls: Send + Sync + 'static {
     /// `seed` is 32 bytes of platform entropy the caller has
     /// already pulled from the RNG.

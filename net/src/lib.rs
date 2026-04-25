@@ -78,9 +78,8 @@ pub fn init_stack() {
     // current core's pool and returns the first Established+
     // !accepted conn.
     uni_runtime::net::register_tcp_backend(&BARE_TCP_BACKEND);
-    // UDP backend — lets `UdpSocket::send_to` hand off datagrams
-    // without apps having to go through the legacy `uni::udp_send`
-    // free function.
+    // UDP backend — `UdpSocket::send_to` hands datagrams to the
+    // protocol stack via `udp::send`.
     uni_runtime::net::register_udp_backend(&BARE_UDP_BACKEND);
 }
 
