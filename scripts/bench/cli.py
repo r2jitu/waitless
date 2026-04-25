@@ -10,6 +10,61 @@ import os
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
+
+
+# Number of host CPU cores. Used to threshold when the load generator
+# is saturating — e.g. on a 4-core MacBook running a 3-core HVF guest
+# alongside a bench that spends 3.5 CPU-cores driving traffic, there
+# isn't enough headroom left for the guest and the result is
+# client-bound, not server-bound.
+_HOST_CPUS = os.cpu_count() or 1
+
+
+@contextmanager
+def measure_client_cpu():
+    """Measure how much CPU the load generator consumed while the
+    block runs. Captures parent + all terminated children (wrk
+    subprocesses, multiprocessing pool workers, C udp_bench, ...)
+    via `os.times()`, which includes `children_user` and
+    `children_system` in its tuple.
+
+    Yields a dict that populates on exit with:
+      * `cpu_sec`  — CPU-seconds used
+      * `wall_sec` — wall-clock seconds elapsed
+      * `cores`    — cpu_sec / wall_sec (1.0 = one fully-busy core)
+
+    The caller prints `cores` alongside the throughput number so a
+    run that reports "150k req/s, cli=3.8cpu" on a 4-core host is
+    visibly client-bound (~95% of host capacity was the bench
+    itself). A saturated load generator can't drive the server at
+    its real peak, so that's a signal to either reduce target load,
+    reduce client parallelism, or run the client on a different
+    machine.
+    """
+    t0 = time.monotonic()
+    start = os.times()
+    info = {"cpu_sec": 0.0, "wall_sec": 0.0, "cores": 0.0}
+    try:
+        yield info
+    finally:
+        end = os.times()
+        wall = max(time.monotonic() - t0, 1e-6)
+        cpu = ((end.user - start.user)
+               + (end.system - start.system)
+               + (end.children_user - start.children_user)
+               + (end.children_system - start.children_system))
+        info["cpu_sec"] = cpu
+        info["wall_sec"] = wall
+        info["cores"] = cpu / wall
+
+
+def _cpu_tag(cores):
+    """Format load-gen CPU usage for the per-run output line.
+    Flags with ⚠ when the client used >70% of host capacity, where
+    a result is more likely client-bound than server-bound."""
+    sat = "⚠" if cores >= 0.7 * _HOST_CPUS else ""
+    return f"cli={cores:.1f}cpu{sat}"
 
 from .envs import (
     ENV_MAP,
@@ -222,6 +277,10 @@ def main():
 
     # Collect results: results[(env_name, cpus, workload_name)] = (rps, p50, p99)
     results = {}
+    # Client-side CPU cost of each run (CPU-cores-equivalent the
+    # load generator burned). Parallel dict so result tuple shape
+    # stays backward compatible for any external consumer.
+    client_cpu = {}
     _current = {"env": None, "proc": None}  # for cleanup on Ctrl-C
 
     def _kill_current():
@@ -326,7 +385,15 @@ def main():
                 if "conns_per_core" in w:
                     conns = w["conns_per_core"] * cpus
                 if "threads_per_core" in w:
-                    threads = max(1, w["threads_per_core"] * cpus)
+                    # Scale with target cores but cap at half the host
+                    # count. `wrk` is event-loop (epoll/kqueue), not
+                    # thread-per-conn — one thread can comfortably
+                    # drive 100k req/s, so scaling 1:1 with target cpus
+                    # just burns host cores that the VM / native binary
+                    # needs. Keeping this ≤ host/2 leaves half the host
+                    # for the server.
+                    raw = max(1, w["threads_per_core"] * cpus)
+                    threads = min(raw, max(1, _HOST_CPUS // 2))
                 # UDP workloads use a fixed sender count — tying senders
                 # to vCPUs would conflate client-side concurrency with
                 # the server's core count and make scaling curves
@@ -334,19 +401,25 @@ def main():
                 senders = max(1, min(64, w.get("senders", 0)))
 
                 if w["type"] == "tcp":
-                    rps, p50, p99 = run_wrk(
-                        wrk_port, w["endpoint"], threads, conns, duration,
-                        host=wrk_host)
+                    with measure_client_cpu() as m:
+                        rps, p50, p99 = run_wrk(
+                            wrk_port, w["endpoint"], threads, conns, duration,
+                            host=wrk_host)
                     results[(env_name, cpus, wname)] = (rps, p50, p99)
-                    print(f"    {wname:<20s} {rps:>10.0f} req/s  p50={p50}  p99={p99}")
+                    client_cpu[(env_name, cpus, wname)] = m["cores"]
+                    print(f"    {wname:<20s} {rps:>10.0f} req/s  "
+                          f"p50={p50}  p99={p99}  {_cpu_tag(m['cores'])}")
                 elif w["type"] == "https":
                     # wrk over https://. Self-signed dev cert is fine
                     # because wrk doesn't verify by default.
-                    rps, p50, p99 = run_wrk_https(
-                        tls_target_port, w["endpoint"], threads, conns, duration,
-                        host=wrk_host)
+                    with measure_client_cpu() as m:
+                        rps, p50, p99 = run_wrk_https(
+                            tls_target_port, w["endpoint"], threads, conns, duration,
+                            host=wrk_host)
                     results[(env_name, cpus, wname)] = (rps, p50, p99)
-                    print(f"    {wname:<20s} {rps:>10.0f} req/s  p50={p50}  p99={p99}")
+                    client_cpu[(env_name, cpus, wname)] = m["cores"]
+                    print(f"    {wname:<20s} {rps:>10.0f} req/s  "
+                          f"p50={p50}  p99={p99}  {_cpu_tag(m['cores'])}")
                 elif w["type"] == "tls_handshake":
                     # Connection-per-request: each iteration opens a
                     # fresh TCP socket, completes the full TLS 1.3
@@ -356,21 +429,27 @@ def main():
                     # scales with server cpus to keep all server
                     # cores busy (mirrors the _max HTTP workloads).
                     par = w.get("parallelism_per_core", 4) * cpus
-                    rps, p50, p99 = run_tls_handshake_rate(
-                        tls_target_port, w["endpoint"], duration,
-                        host=wrk_host, parallelism=par)
+                    with measure_client_cpu() as m:
+                        rps, p50, p99 = run_tls_handshake_rate(
+                            tls_target_port, w["endpoint"], duration,
+                            host=wrk_host, parallelism=par)
                     results[(env_name, cpus, wname)] = (rps, p50, p99)
-                    print(f"    {wname:<20s} {rps:>10.0f} hs/s   p50={p50}  p99={p99}")
+                    client_cpu[(env_name, cpus, wname)] = m["cores"]
+                    print(f"    {wname:<20s} {rps:>10.0f} hs/s   "
+                          f"p50={p50}  p99={p99}  {_cpu_tag(m['cores'])}")
                 elif w["type"] == "udp":
                     # Let wait_http's TCP teardown settle before firing a
                     # UDP burst — without this the first sender very
                     # occasionally wins a race against vhost-net's
                     # per-queue worker thread and the test records 0.
                     time.sleep(0.5)
-                    pps, p50, p99 = _udp_with_retry(
-                        udp_target_port, senders, duration, wrk_host)
+                    with measure_client_cpu() as m:
+                        pps, p50, p99 = _udp_with_retry(
+                            udp_target_port, senders, duration, wrk_host)
                     results[(env_name, cpus, wname)] = (pps, p50, p99)
-                    print(f"    {wname:<20s} {pps:>10.0f} pkt/s  p50={p50}  p99={p99}")
+                    client_cpu[(env_name, cpus, wname)] = m["cores"]
+                    print(f"    {wname:<20s} {pps:>10.0f} pkt/s  "
+                          f"p50={p50}  p99={p99}  {_cpu_tag(m['cores'])}")
                 elif w["type"] == "udp_peak":
                     time.sleep(0.5)
                     # Windowed mode with adaptive concurrency ramp:
@@ -378,21 +457,27 @@ def main():
                     # the level where throughput plateaus, so each
                     # platform gets the concurrency that actually
                     # exposes its ceiling without over-pressuring it.
-                    pps, loss_pct, p50, p99, best_n = udp_peak_concurrent(
-                        udp_target_port, duration, wrk_host,
-                        client_cpus=cpus)
+                    with measure_client_cpu() as m:
+                        pps, loss_pct, p50, p99, best_n = udp_peak_concurrent(
+                            udp_target_port, duration, wrk_host,
+                            client_cpus=cpus)
                     results[(env_name, cpus, wname)] = (pps, p50, p99)
+                    client_cpu[(env_name, cpus, wname)] = m["cores"]
                     print(f"    {wname:<20s} {pps:>10.0f} pkt/s  "
-                          f"({best_n}x{cpus} in-flight, {loss_pct:.1f}% loss)")
+                          f"({best_n}x{cpus} in-flight, {loss_pct:.1f}% loss)  "
+                          f"{_cpu_tag(m['cores'])}")
                 elif w["type"] == "tcp_echo":
                     if tcp_echo_target_port is None:
                         print(f"    {wname:<20s} SKIP (env has no tcp_echo port)")
                         continue
                     time.sleep(0.5)
-                    rps, p50, p99 = run_tcp_echo(
-                        tcp_echo_target_port, conns, duration, host=wrk_host)
+                    with measure_client_cpu() as m:
+                        rps, p50, p99 = run_tcp_echo(
+                            tcp_echo_target_port, conns, duration, host=wrk_host)
                     results[(env_name, cpus, wname)] = (rps, p50, p99)
-                    print(f"    {wname:<20s} {rps:>10.0f} msg/s  p50={p50}  p99={p99}")
+                    client_cpu[(env_name, cpus, wname)] = m["cores"]
+                    print(f"    {wname:<20s} {rps:>10.0f} msg/s  "
+                          f"p50={p50}  p99={p99}  {_cpu_tag(m['cores'])}")
 
                 env.stop(proc)
                 _current["proc"] = None
@@ -419,16 +504,23 @@ def main():
                 continue
             columns.append((env_name, cpus))
 
+    # Each cell shows throughput + a compact `(cX.X)` suffix for the
+    # client-CPU cores the load generator consumed, e.g. "201452 (c1.2)".
+    # A trailing `⚠` flags cells where the client likely saturated the
+    # host — the measured rate may be client-bound rather than
+    # server-bound.
+    CELL = 18  # wide enough for "NNNNNNN (cN.N)⚠"
+
     print()
-    print("=" * (24 + 14 * len(columns) + 10))
-    print(f"  Benchmark Results  ({duration}s per test)")
-    print("=" * (24 + 14 * len(columns) + 10))
+    print("=" * (24 + (CELL + 2) * len(columns) + 10))
+    print(f"  Benchmark Results  ({duration}s per test, host has {_HOST_CPUS} CPUs)")
+    print("=" * (24 + (CELL + 2) * len(columns) + 10))
 
     # Header
     hdr = f"  {'Workload':<22s}"
     for env_name, cpus in columns:
         env = envs[env_name]
-        hdr += f" {env.core_label(cpus):>12s}"
+        hdr += f" {env.core_label(cpus):>{CELL}s}"
     # Scaling columns: one per environment that has multiple core counts
     scaling_envs = []
     for env_name in env_names:
@@ -437,7 +529,13 @@ def main():
             scaling_envs.append(env_name)
             hdr += f" {envs[env_name].label[:6]+' ×':>8s}"
     print(hdr)
-    print(f"  {'─'*22}" + f" {'─'*12}" * len(columns) + (f" {'─'*8}" * len(scaling_envs)))
+    print(f"  {'─'*22}" + f" {'─'*CELL}" * len(columns) + (f" {'─'*8}" * len(scaling_envs)))
+
+    def _fmt_cell(val, cores):
+        if val <= 0:
+            return f"{'-':>{CELL}s}"
+        sat = "⚠" if cores >= 0.7 * _HOST_CPUS else " "
+        return f"{val:>7.0f} (c{cores:.1f}){sat}"
 
     # Rows
     for w in workloads:
@@ -445,7 +543,8 @@ def main():
         row = f"  {wname:<22s}"
         for env_name, cpus in columns:
             val = results.get((env_name, cpus, wname), (0, "", ""))
-            row += f" {val[0]:>10.0f}  "
+            cores = client_cpu.get((env_name, cpus, wname), 0.0)
+            row += f" {_fmt_cell(val[0], cores):>{CELL}s}"
 
         # Per-environment scaling columns
         for env_name in scaling_envs:
@@ -458,8 +557,10 @@ def main():
                 row += f" {'N/A':>7s}"
         print(row)
 
-    print("=" * (24 + 14 * len(columns) + 10))
+    print("=" * (24 + (CELL + 2) * len(columns) + 10))
     print(f"  Duration: {duration}s | /compute: 100K hash iters | /health: static JSON")
+    print(f"  Cell format: `rate (cN.N)` — N.N = CPU cores the load gen used. "
+          f"⚠ = client ≥ 70% of {_HOST_CPUS}-core host (result likely client-bound).")
     if any(c > 1 for c in core_counts):
         print(f"  Multi-core: MTTCG (x86_64) or hardware (HVF/KVM)")
-    print("=" * (24 + 14 * len(columns) + 10))
+    print("=" * (24 + (CELL + 2) * len(columns) + 10))
