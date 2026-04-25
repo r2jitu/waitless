@@ -6,25 +6,47 @@
 // `uni_platform::current_worker()` directly — cfg-gated asm on
 // bare-metal, thread-local on native.
 //
-// `PerWorker<T, N>` — typed array of `N` slots indexed by worker id.
+// `PerWorker<T>` — typed array of slots indexed by worker id, sized at
+// runtime via `init(n, |i| …)`. Heap-allocated once at boot after the
+// actual worker count is known, then read-shared from every worker.
 // `T` provides its own interior mutability (`Atomic*`, `UnsafeCell`
 // behind owning-worker discipline, `Mutex`, …); the `&CurrentWorker`
 // accessor is safe by construction.
 
 #![no_std]
 
+extern crate alloc;
+
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
+use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
 pub mod once;
 pub mod timer;
 
 pub use once::InitOnce;
 
-/// Maximum workers supported by the shared runtime. Bare-metal sets
-/// `MAX_CORES` to the same value; native treats this as a ceiling on
-/// thread-pool size.
-pub const MAX_WORKERS: usize = 8;
+/// Number of workers configured for this run. Set once during boot
+/// (BSP, after detecting CPU count) and read shared by every worker
+/// thereafter. Used as the canonical N for any `PerWorker<T>::init(N, …)`
+/// call so all per-worker structures agree on size.
+static NUM_WORKERS: AtomicU32 = AtomicU32::new(0);
+
+/// Set the worker count. Must be called exactly once during boot
+/// before any `PerWorker<T>::init` runs. Subsequent calls are
+/// no-ops to keep the boot sequence robust against double-calls
+/// from quirky bootloaders.
+pub fn set_num_workers(n: u32) {
+    let _ = NUM_WORKERS.compare_exchange(0, n, Ordering::Release, Ordering::Relaxed);
+}
+
+/// Return the configured worker count, or 0 if `set_num_workers`
+/// hasn't run yet (callers gate on this; we don't panic so very-
+/// early boot diagnostics can still log).
+#[inline]
+pub fn num_workers() -> u32 {
+    NUM_WORKERS.load(Ordering::Acquire)
+}
 
 // ============================================================================
 // CurrentWorker — ZST proof-of-current-worker token.
@@ -75,17 +97,20 @@ impl CurrentWorker {
 }
 
 // ============================================================================
-// PerWorker<T, N> — typed per-worker array.
+// PerWorker<T> — typed per-worker array, runtime-sized.
 // ============================================================================
 //
-// N slots of T, each wrapped in `UnsafeCell<T>` so the same `&PerWorker`
-// can hand out references to different slots. `T` is responsible for
-// its own interior mutability.
+// Slot array is heap-allocated once via `init(n, |i| T)` then read-shared
+// from every worker. `T` provides its own interior mutability. The hot
+// path is one Relaxed load of `slots` (an L1-cached AtomicPtr) — the
+// pointer is `Release`-published and never changes after init, so the
+// per-access cost matches a const-sized static within noise.
 
-/// Typed per-worker array of `N` slots of `T`.
-#[repr(transparent)]
-pub struct PerWorker<T, const N: usize> {
-    slots: [UnsafeCell<T>; N],
+pub struct PerWorker<T> {
+    /// Heap-allocated `[UnsafeCell<T>; len]`. Null until `init`.
+    slots: AtomicPtr<UnsafeCell<T>>,
+    /// Number of slots. Read-shared after `init`.
+    len: AtomicU32,
 }
 
 // SAFETY: PerWorker provides shared (`&T`) access only. T is responsible
@@ -93,22 +118,82 @@ pub struct PerWorker<T, const N: usize> {
 // We require T: Sync because cross-worker read access is shared, and
 // T: Send because the slot is logically transferable between workers
 // (though in practice each slot is owned by one worker).
-unsafe impl<T: Sync + Send, const N: usize> Sync for PerWorker<T, N> {}
+unsafe impl<T: Sync + Send> Sync for PerWorker<T> {}
 
-impl<T, const N: usize> PerWorker<T, N> {
-    /// Construct from an array of N initial values. Const-callable so
-    /// the array can live in a `static`.
+impl<T> PerWorker<T> {
+    /// Construct an empty cell. Allocation happens later in `init()`.
+    /// Const-callable so the cell can live in a `static`.
     #[inline]
-    pub const fn new(values: [T; N]) -> Self {
-        // Convert [T; N] → [UnsafeCell<T>; N] field-by-field via ptr
-        // copy. This is the only way to do the conversion in const
-        // context as of stable Rust. SAFETY: UnsafeCell<T> is
-        // #[repr(transparent)] over T, so the layouts match exactly.
-        let cells: [UnsafeCell<T>; N] = unsafe {
-            let cells = core::mem::ManuallyDrop::new(values);
-            core::ptr::read(&cells as *const _ as *const [UnsafeCell<T>; N])
-        };
-        PerWorker { slots: cells }
+    pub const fn new() -> Self {
+        PerWorker {
+            slots: AtomicPtr::new(core::ptr::null_mut()),
+            len: AtomicU32::new(0),
+        }
+    }
+
+    /// Allocate `n` slots and populate each via `f(i)`. Idempotent and
+    /// safe to call concurrently — the first thread to win a CAS on
+    /// the slot pointer publishes; losers free their allocation. The
+    /// race-free flavour is what `LaunchTable::register` and the
+    /// per-port `bind` paths in the UDP/TCP reactors rely on, so the
+    /// CAS is load-bearing, not just defensive.
+    pub fn init<F: FnMut(u32) -> T>(&self, n: u32, mut f: F) {
+        if !self.slots.load(Ordering::Acquire).is_null() {
+            return;
+        }
+        let count = n as usize;
+        let layout = alloc::alloc::Layout::array::<UnsafeCell<T>>(count)
+            .expect("PerWorker::init: layout overflow");
+        // SAFETY: layout is non-zero (count >= 1 by contract), and
+        // we treat the alloc as a raw `[UnsafeCell<T>]` we own
+        // exclusively until the CAS below publishes it.
+        let raw = unsafe { alloc::alloc::alloc(layout) as *mut UnsafeCell<T> };
+        if raw.is_null() {
+            alloc::alloc::handle_alloc_error(layout);
+        }
+        for i in 0..count {
+            // SAFETY: writing into freshly-allocated, owned memory.
+            unsafe { core::ptr::write(raw.add(i), UnsafeCell::new(f(i as u32))); }
+        }
+        // Publish via CAS so concurrent initialisers don't both
+        // succeed and leak one allocation each. Set len BEFORE the
+        // CAS — losers free without touching it, the winner's len
+        // store happens-before any reader's Acquire on slots.
+        self.len.store(n, Ordering::Release);
+        if self
+            .slots
+            .compare_exchange(
+                core::ptr::null_mut(),
+                raw,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            // Lost the race: drop our T's, free the alloc, observe
+            // the winner via the next `at()` Acquire.
+            for i in 0..count {
+                // SAFETY: we wrote each slot above; nobody else has
+                // observed `raw` because the CAS failed.
+                unsafe { core::ptr::drop_in_place(raw.add(i)); }
+            }
+            // SAFETY: `raw` came from `alloc(layout)` and was never
+            // published; we're the unique owner.
+            unsafe { alloc::alloc::dealloc(raw as *mut u8, layout); }
+        }
+    }
+
+    /// `init` if not already initialised — the call-site idiom for
+    /// lazy per-listener `PerWorker`s (UDP/TCP reactors) and for
+    /// the launcher table's per-worker fired cursor. The wrapper
+    /// elides the `is_initialized` check at boot-time call sites
+    /// that already know they're calling exactly once, but for
+    /// lazy paths it makes the intent obvious.
+    #[inline]
+    pub fn ensure_init<F: FnMut(u32) -> T>(&self, n: u32, f: F) {
+        if !self.is_initialized() {
+            self.init(n, f);
+        }
     }
 
     /// Get a shared reference to the slot for the current worker.
@@ -117,11 +202,7 @@ impl<T, const N: usize> PerWorker<T, N> {
     /// actual mutation synchronisation.
     #[inline(always)]
     pub fn current(&self, cc: &CurrentWorker) -> &T {
-        // SAFETY: cc.id() is the calling worker's id; reading from
-        // the slot returns a `&T` whose mutation discipline is T's
-        // job. PerWorker just guarantees that two different workers get
-        // different slots.
-        unsafe { &*self.slots[cc.id() as usize].get() }
+        self.at(cc.id())
     }
 
     /// Get a shared reference to slot `id`. Safe at the reference
@@ -131,15 +212,54 @@ impl<T, const N: usize> PerWorker<T, N> {
     /// walking every per-worker inbox).
     #[inline(always)]
     pub fn at(&self, id: u32) -> &T {
-        // SAFETY: same as current(); cross-worker access is sound at
-        // the reference level because T provides its own
-        // synchronisation.
-        unsafe { &*self.slots[id as usize].get() }
+        let base = self.slots.load(Ordering::Relaxed);
+        debug_assert!(!base.is_null(), "PerWorker::at before init");
+        debug_assert!(id < self.len.load(Ordering::Relaxed),
+                      "PerWorker::at out-of-bounds");
+        // SAFETY: after `init` completes, `base` points at a valid
+        // `[UnsafeCell<T>; len]` for the lifetime of the program.
+        // `id < len` is the caller's invariant (typically guaranteed
+        // by `cc.id() < num_workers()` at the boot site that set up
+        // both this cell and the worker dispatcher).
+        unsafe { &*(*base.add(id as usize)).get() }
     }
 
-    /// Number of slots.
+    /// Number of slots. Returns 0 before `init`.
     #[inline(always)]
-    pub const fn len(&self) -> usize {
-        N
+    pub fn len(&self) -> u32 {
+        self.len.load(Ordering::Relaxed)
+    }
+
+    /// True if `init` has been called.
+    #[inline(always)]
+    pub fn is_initialized(&self) -> bool {
+        !self.slots.load(Ordering::Relaxed).is_null()
+    }
+}
+
+impl<T> Drop for PerWorker<T> {
+    fn drop(&mut self) {
+        // Statics never drop, so this only runs for `PerWorker`s
+        // owned by short-lived state — e.g. the per-listener
+        // `handles` field inside `Arc<UdpFanoutCtx>` /
+        // `Arc<TcpFanoutCtx>`. Without it, every reactor handle
+        // drop leaked `num_workers * size_of::<T>` bytes.
+        let raw = *self.slots.get_mut();
+        if raw.is_null() {
+            return;
+        }
+        let count = *self.len.get_mut() as usize;
+        // SAFETY: we have `&mut self`, so no other thread can be
+        // touching the cell. `raw` was produced by
+        // `alloc::alloc::alloc` with `Layout::array::<UnsafeCell<T>>(count)`
+        // in `init`, and every slot was populated.
+        unsafe {
+            for i in 0..count {
+                core::ptr::drop_in_place(raw.add(i));
+            }
+            let layout = alloc::alloc::Layout::array::<UnsafeCell<T>>(count)
+                .expect("PerWorker::drop: layout overflow");
+            alloc::alloc::dealloc(raw as *mut u8, layout);
+        }
     }
 }

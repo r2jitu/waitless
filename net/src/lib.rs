@@ -69,6 +69,14 @@ static BARE_UDP_BACKEND: uni_runtime::net::UdpBackend = uni_runtime::net::UdpBac
 };
 
 pub fn init_stack() {
+    // Per-core flag tables sized to actual core count. Must run
+    // before any `poll_tier2` call dereferences them.
+    let n = uni_kernel::percpu::num_cores();
+    WAKEUP.init(n, |_| core::sync::atomic::AtomicBool::new(false));
+    JUST_DISTRIBUTED.init(n, |_| core::sync::atomic::AtomicBool::new(false));
+    arp::init();
+    ipv4::init();
+
     REGISTRY.register(protocol::Slot::Tcp, tcp_dispatch);
     REGISTRY.register(protocol::Slot::Udp, udp_dispatch);
     // Wire up the async `uni::runtime::TcpListener` reactor and
@@ -137,8 +145,8 @@ static MULTICORE_INIT: core::sync::atomic::AtomicBool = core::sync::atomic::Atom
 /// distributor is single-threaded (only the lock holder writes), but
 /// every core wakes up afterwards and reads the flags, so atomic load/
 /// store removes the language-level data race.
-static WAKEUP: [core::sync::atomic::AtomicBool; percpu::MAX_CORES] =
-    [const { core::sync::atomic::AtomicBool::new(false) }; percpu::MAX_CORES];
+static WAKEUP: uni_kernel::percpu::PerWorker<core::sync::atomic::AtomicBool> =
+    uni_kernel::percpu::PerWorker::new();
 
 /// RX poll lock: 0 = free, 1 = held. CAS-based; only one core wins
 /// the right to drain the RX queue at a time.
@@ -156,8 +164,8 @@ static RX_LOCK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::n
 /// wins the `try_lock` CAS race consistently (because it's first to
 /// try after each release), so the "rotating distributor" never
 /// actually rotates under asymmetric load.
-static JUST_DISTRIBUTED: [core::sync::atomic::AtomicBool; percpu::MAX_CORES] =
-    [const { core::sync::atomic::AtomicBool::new(false) }; percpu::MAX_CORES];
+static JUST_DISTRIBUTED: uni_kernel::percpu::PerWorker<core::sync::atomic::AtomicBool> =
+    uni_kernel::percpu::PerWorker::new();
 
 
 /// Poll the network device and dispatch received frames through the
@@ -243,7 +251,7 @@ fn poll_tier2(num_cores: u32) -> bool {
     // interrupt and will reclaim the role on the cycle after if no one
     // else takes over.
     if num_cores > 1
-        && JUST_DISTRIBUTED[my_core as usize]
+        && JUST_DISTRIBUTED.at(my_core)
             .swap(false, core::sync::atomic::Ordering::Relaxed)
     {
         return false;
@@ -265,8 +273,8 @@ fn poll_tier2(num_cores: u32) -> bool {
     uni_drivers::net::flush_tx_staging();
 
     // Poll VirtIO RX and distribute directly (no batch buffer copy).
-    for i in 0..num_cores as usize {
-        WAKEUP[i].store(false, core::sync::atomic::Ordering::Relaxed);
+    for i in 0..num_cores {
+        WAKEUP.at(i).store(false, core::sync::atomic::Ordering::Relaxed);
     }
 
     let count = uni_drivers::net::poll(distribute_frame);
@@ -274,7 +282,7 @@ fn poll_tier2(num_cores: u32) -> bool {
     // Mark ourselves as "just distributed" — our next poll attempt will
     // yield, giving other cores first shot at the lock.
     if num_cores > 1 {
-        JUST_DISTRIBUTED[my_core as usize]
+        JUST_DISTRIBUTED.at(my_core)
             .store(true, core::sync::atomic::Ordering::Relaxed);
     }
 
@@ -286,12 +294,12 @@ fn poll_tier2(num_cores: u32) -> bool {
         // Wake only the specific cores that received inbox data.
         // Broadcast wake_cores() is expensive on HVF: each SGI causes
         // a WFI wake (~5µs) on every core, even if it has no work.
-        for i in 1..num_cores as usize {
-            if WAKEUP[i].load(core::sync::atomic::Ordering::Relaxed) {
+        for i in 1..num_cores {
+            if WAKEUP.at(i).load(core::sync::atomic::Ordering::Relaxed) {
                 #[cfg(target_arch = "aarch64")]
-                uni_kernel::aarch64::smp::send_sgi_to(i as u32);
+                uni_kernel::aarch64::smp::send_sgi_to(i);
                 #[cfg(target_arch = "x86_64")]
-                uni_kernel::send_ipi(i as u32);
+                uni_kernel::send_ipi(i);
             }
         }
     }
@@ -351,7 +359,7 @@ fn distribute_frame(frame: &[u8]) {
                         // net_drain_cb).
                         let core = unsafe { percpu::get(target) };
                         if core.rx_inbox.push(frame) {
-                            WAKEUP[target as usize].store(
+                            WAKEUP.at(target).store(
                                 true,
                                 core::sync::atomic::Ordering::Relaxed,
                             );

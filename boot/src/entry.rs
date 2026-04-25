@@ -406,17 +406,31 @@ unsafe fn kernel_boot(info: &BootInfo) {
 
     #[cfg(target_arch = "x86_64")]
     {
-        // Seed the RSDP hint before virtio-net::init() — its MQ
-        // negotiation calls detect_cpus() to pick how many queue
-        // pairs to request. The BIOS-area scan fallback fails under
-        // UEFI (GCE's OVMF), so without this MQ stays at 1 pair.
-        uni_kernel::x86_64::acpi::set_rsdp(info.rsdp_paddr);
-
         klog!("[INIT] Local APIC...\n");
         uni_kernel::x86_64::apic::init();
     }
 
-    // Set per-core TLS register early (before any networking that calls cpu_id).
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Seed the RSDP hint before `detect_cpus()` — under UEFI
+        // (GCE's OVMF) the BIOS-area scan fallback fails, so without
+        // this we'd silently boot 1 CPU.
+        uni_kernel::x86_64::acpi::set_rsdp(info.rsdp_paddr);
+    }
+
+    // Detect actual core count, publish via `set_num_workers`, then
+    // size every `PerWorker<T>`. Strict ordering: `mm::init` first
+    // (heap up), then `acpi::set_rsdp` (x86 detect needs ACPI), then
+    // `percpu::init`, then `init_tls` (which reads `percpu::get(0)`
+    // for GS_BASE / TPIDR_EL1 — running it before `percpu::init`
+    // points the TLS register at a null cell and every later
+    // `cpu_id()` returns garbage).
+    #[cfg(target_arch = "aarch64")]
+    let cpu_count = uni_kernel::aarch64::fdt::info().cpu_count;
+    #[cfg(target_arch = "x86_64")]
+    let cpu_count = uni_kernel::x86_64::acpi::detect_cpus();
+    uni_kernel::percpu::init(cpu_count);
+
     #[cfg(target_arch = "x86_64")]
     uni_kernel::x86_64::smp::init_tls(0);
     #[cfg(target_arch = "aarch64")]
@@ -491,18 +505,17 @@ unsafe fn kernel_boot(info: &BootInfo) {
     // Matches the native backend's behaviour of using every available
     // thread. Apps that want single-core determinism get it by running
     // on a single-CPU VM (or, on native, via `UNIKERNEL_CPUS=1`).
+    // `percpu::init` already ran near the top of boot — that publishes
+    // the worker count and sizes every `PerWorker<T>` to it; the
+    // SMP layer below is only responsible for waking the secondaries.
     #[cfg(target_arch = "aarch64")]
     {
-        let cpu_count = uni_kernel::aarch64::fdt::info().cpu_count;
-        uni_kernel::percpu::init(cpu_count);
         if cpu_count > 1 {
             uni_kernel::aarch64::smp::start_secondary_cores(cpu_count);
         }
     }
     #[cfg(target_arch = "x86_64")]
     {
-        let cpu_count = uni_kernel::x86_64::acpi::detect_cpus();
-        uni_kernel::percpu::init(cpu_count);
         if cpu_count > 1 {
             match info.protocol {
                 Protocol::Limine => {

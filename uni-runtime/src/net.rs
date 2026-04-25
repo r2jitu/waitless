@@ -50,7 +50,7 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU16, AtomicU32, Ordering};
 use core::task::{Context, Poll, Waker};
 
-use uni_worker::{CurrentWorker, PerWorker, MAX_WORKERS};
+use uni_worker::{CurrentWorker, PerWorker, num_workers};
 
 // ---- Sizing -----------------------------------------------------------------
 
@@ -168,11 +168,11 @@ fn store_waker_if_needed(slot: &SpinLock<Option<Waker>>, w: &Waker) {
 /// case to a single acquire/release.
 fn install_worker_task(
     stopping: &AtomicBool,
-    handles: &[SpinLock<Option<crate::TaskHandle>>; MAX_WORKERS],
+    handles: &PerWorker<SpinLock<Option<crate::TaskHandle>>>,
     h: crate::TaskHandle,
 ) {
     let cc = CurrentWorker::enter();
-    let mut slot = handles[cc.id() as usize].lock();
+    let mut slot = handles.current(&cc).lock();
     if stopping.load(Ordering::Acquire) {
         drop(slot);
         h.abort();
@@ -365,18 +365,14 @@ impl WorkerInbox {
 
 struct UdpState {
     port: AtomicU16,
-    inboxes: PerWorker<WorkerInbox, MAX_WORKERS>,
-}
-
-const fn fresh_inboxes() -> [WorkerInbox; MAX_WORKERS] {
-    [const { WorkerInbox::new() }; MAX_WORKERS]
+    inboxes: PerWorker<WorkerInbox>,
 }
 
 impl UdpState {
     const fn new() -> Self {
         UdpState {
             port: AtomicU16::new(0),
-            inboxes: PerWorker::new(fresh_inboxes()),
+            inboxes: PerWorker::new(),
         }
     }
 }
@@ -502,7 +498,8 @@ impl UdpSocket {
                 .compare_exchange(0, port, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
-                for w in 0..MAX_WORKERS as u32 {
+                state.inboxes.ensure_init(num_workers(), |_| WorkerInbox::new());
+                for w in 0..num_workers() {
                     let inbox = state.inboxes.at(w);
                     if !inbox.ensure_alloc() {
                         state.port.store(0, Ordering::Release);
@@ -571,11 +568,13 @@ impl UdpSocket {
     }
 
     fn run_boxed(self, body: BoxedBody) -> UdpHandle {
+        let handles = PerWorker::new();
+        handles.init(num_workers(), |_| SpinLock::new(None));
         let ctx = Arc::new(UdpFanoutCtx {
             sock: Arc::new(self),
             body,
             stopping: AtomicBool::new(false),
-            handles: [const { SpinLock::new(None) }; MAX_WORKERS],
+            handles,
         });
         // Launcher captures a strong `Arc<ctx>` clone. When
         // `UdpHandle::drop` frees the launcher slot, the captured
@@ -620,7 +619,7 @@ struct UdpFanoutCtx {
     sock: Arc<UdpSocket>,
     body: BoxedBody,
     stopping: AtomicBool,
-    handles: [SpinLock<Option<crate::TaskHandle>>; MAX_WORKERS],
+    handles: PerWorker<SpinLock<Option<crate::TaskHandle>>>,
 }
 
 /// Owning handle to a running `UdpSocket` fanout. Use via `Deref`
@@ -661,8 +660,8 @@ impl Drop for UdpHandle {
         //    cross-worker-safe: sets the abort flag + forces a
         //    tick on the owning worker so the future is dropped
         //    promptly.
-        for slot in self.ctx.handles.iter() {
-            if let Some(h) = slot.lock().take() {
+        for w in 0..self.ctx.handles.len() {
+            if let Some(h) = self.ctx.handles.at(w).lock().take() {
                 h.abort();
             }
         }
@@ -866,18 +865,14 @@ struct TcpState {
     /// Per-worker waker slot. Backend `deliver_tcp_ready` fires on
     /// the core that has the newly-accept-able conn; the waker
     /// wakes a task on that same core.
-    wakers: PerWorker<SpinLock<Option<Waker>>, MAX_WORKERS>,
-}
-
-const fn fresh_waker_slots() -> [SpinLock<Option<Waker>>; MAX_WORKERS] {
-    [const { SpinLock::new(None) }; MAX_WORKERS]
+    wakers: PerWorker<SpinLock<Option<Waker>>>,
 }
 
 impl TcpState {
     const fn new() -> Self {
         TcpState {
             port: AtomicU16::new(0),
-            wakers: PerWorker::new(fresh_waker_slots()),
+            wakers: PerWorker::new(),
         }
     }
 }
@@ -1016,7 +1011,8 @@ impl TcpListener {
                 .compare_exchange(0, port, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
-                for w in 0..MAX_WORKERS as u32 {
+                state.wakers.ensure_init(num_workers(), |_| SpinLock::new(None));
+                for w in 0..num_workers() {
                     *state.wakers.at(w).lock() = None;
                 }
                 let b = tcp_backend().ok_or(TcpBindError::BackendFailed)?;
@@ -1065,6 +1061,8 @@ impl TcpListener {
         F: Future<Output = ()> + 'static,
     {
         let body = Arc::new(body);
+        let handles = PerWorker::new();
+        handles.init(num_workers(), |_| SpinLock::new(None));
         let ctx = Arc::new(TcpFanoutCtx {
             listener: Arc::new(self),
             accept_body: Box::new(move |stream| {
@@ -1072,7 +1070,7 @@ impl TcpListener {
                 Box::pin(async move { body(stream).await })
             }),
             stopping: AtomicBool::new(false),
-            handles: [const { SpinLock::new(None) }; MAX_WORKERS],
+            handles,
         });
         let ctx_for_launcher = Arc::clone(&ctx);
         let launcher_slot = register_net_launcher(Box::new(move || {
@@ -1118,7 +1116,7 @@ struct TcpFanoutCtx {
     listener: Arc<TcpListener>,
     accept_body: BoxedAcceptBody,
     stopping: AtomicBool,
-    handles: [SpinLock<Option<crate::TaskHandle>>; MAX_WORKERS],
+    handles: PerWorker<SpinLock<Option<crate::TaskHandle>>>,
 }
 
 /// Owning handle to a running `TcpListener` fanout. Use via
@@ -1148,8 +1146,8 @@ impl core::ops::Deref for TcpHandle {
 impl Drop for TcpHandle {
     fn drop(&mut self) {
         self.ctx.stopping.store(true, Ordering::Release);
-        for slot in self.ctx.handles.iter() {
-            if let Some(h) = slot.lock().take() {
+        for w in 0..self.ctx.handles.len() {
+            if let Some(h) = self.ctx.handles.at(w).lock().take() {
                 h.abort();
             }
         }

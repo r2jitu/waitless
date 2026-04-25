@@ -90,7 +90,6 @@ struct TcpHeader {
 unsafe impl FromBytes for TcpHeader {}
 
 const CONNECTIONS_PER_CORE: usize = 128;
-const MAX_CORES: usize = 8;
 const RX_BUF_SIZE: usize = 8192;
 const MSS: usize = 1460;
 
@@ -231,10 +230,8 @@ impl TcpConnCell {
 
 type CoreSlots = [TcpConnCell; CONNECTIONS_PER_CORE];
 
-static POOLS: uni_kernel::percpu::PerWorker<CoreSlots, MAX_CORES> =
-    uni_kernel::percpu::PerWorker::new(
-        [const { [const { TcpConnCell::new() }; CONNECTIONS_PER_CORE] }; MAX_CORES],
-    );
+static POOLS: uni_kernel::percpu::PerWorker<CoreSlots> =
+    uni_kernel::percpu::PerWorker::new();
 
 // ---- Per-core 4-tuple → slot hash table ------------------------------------
 //
@@ -268,10 +265,8 @@ impl TcpHashCore {
     }
 }
 
-static TCP_HASH: uni_kernel::percpu::PerWorker<TcpHashCore, MAX_CORES> =
-    uni_kernel::percpu::PerWorker::new(
-        [const { TcpHashCore::new() }; MAX_CORES],
-    );
+static TCP_HASH: uni_kernel::percpu::PerWorker<TcpHashCore> =
+    uni_kernel::percpu::PerWorker::new();
 
 #[inline]
 fn tcp_hash_key(src_ip: Ipv4Addr, src_port: u16, dst_port: u16) -> u64 {
@@ -392,7 +387,7 @@ fn decode_handle(handle: *mut ()) -> Option<(u32, usize)> {
     let v = (handle as usize).wrapping_sub(1);
     let core = (v >> 8) as u32;
     let slot = v & 0xFF;
-    if core as usize >= MAX_CORES || slot >= CONNECTIONS_PER_CORE {
+    if core >= POOLS.len() || slot >= CONNECTIONS_PER_CORE {
         None
     } else {
         Some((core, slot))
@@ -771,9 +766,14 @@ fn seq_lt(a: u32, b: u32) -> bool {
 
 /// Initialize TCP connection pools.
 pub fn init() {
-    for core in 0..MAX_CORES {
+    let n = uni_kernel::percpu::num_cores();
+    POOLS.init(n, |_| {
+        [const { TcpConnCell::new() }; CONNECTIONS_PER_CORE]
+    });
+    TCP_HASH.init(n, |_| TcpHashCore::new());
+    for core in 0..n {
         for i in 0..CONNECTIONS_PER_CORE {
-            unsafe { *conn_ptr(core as u32, i) = TcpConnection::new(); }
+            unsafe { *conn_ptr(core, i) = TcpConnection::new(); }
         }
     }
 }

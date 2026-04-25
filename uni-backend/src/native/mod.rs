@@ -764,6 +764,12 @@ fn init_native() {
             .unwrap_or_else(|| num_cpus().min(MAX_THREADS));
         NUM_THREADS.store(num_threads, Ordering::Release);
 
+        // Publish to `uni-worker` so all `PerWorker<T>` users size
+        // themselves correctly, then init the shared runtime's
+        // per-worker tables (timer wheels + task arenas).
+        uni_worker::set_num_workers(num_threads as u32);
+        uni_runtime::init(num_threads as u32);
+
         let threads = &mut *THREADS.0.get();
         for i in 0..num_threads {
             threads[i].thread_id = i as u32;

@@ -17,14 +17,10 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::deque::{Deque, Task};
 use crate::spsc;
 
-// `CurrentWorker` + `PerWorker<T, N>` now live in `//uni-worker` so native
-// can share them. Kept under the `uni_kernel::percpu` path via re-export
-// so existing callers don't shift.
-pub use uni_worker::{CurrentWorker, PerWorker, MAX_WORKERS};
-
-/// Maximum number of cores. Alias for `uni_worker::MAX_WORKERS` kept
-/// for readability inside the kernel.
-pub const MAX_CORES: usize = MAX_WORKERS;
+// `CurrentWorker` + `PerWorker<T>` (runtime-sized) live in `//uni-worker`
+// so native can share them. Kept under the `uni_kernel::percpu` path via
+// re-export so existing callers don't shift.
+pub use uni_worker::{CurrentWorker, PerWorker};
 
 /// Maximum packet size for TX staging.
 const TX_BUF_SIZE: usize = 1514;
@@ -227,19 +223,11 @@ impl PerCore {
     }
 }
 
-/// Global array of per-core state. Initialized by core 0 during boot
-/// (single-threaded), then read-shared from all cores via the `PerWorker`
-/// primitive (which encapsulates the `[UnsafeCell<T>; N]` + per-core
-/// indexing pattern that this module used to open-code).
-static CORES: PerWorker<PerCore, MAX_CORES> =
-    PerWorker::new([const { PerCore::new(0) }; MAX_CORES]);
-
-/// Number of online cores. Set once by `init()` on the BSP, then read
-/// by every core. AtomicU32 with Relaxed ordering — there is no other
-/// shared state synchronised by this counter; cores merely query it
-/// to know how many slots in `CORES` are valid.
-static NUM_CORES: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(1);
+/// Global array of per-core state. Heap-allocated by `init(n)` once
+/// the BSP knows the actual core count, then read-shared from every
+/// core. `PerWorker<T>` handles the indexing + interior mutability;
+/// before `init`, accesses panic in debug.
+static CORES: PerWorker<PerCore> = PerWorker::new();
 
 /// AP poll function: registered by the network layer, called by APs in
 /// their event loop. Returns true if work was done. Stored as a typed
@@ -247,24 +235,14 @@ static NUM_CORES: core::sync::atomic::AtomicU32 =
 /// pair without per-call-site fn-pointer transmutes.
 static AP_POLL_FN: crate::sync::AtomicFn<fn(u32) -> bool> = crate::sync::AtomicFn::null();
 
-/// Initialize per-core state for `count` cores. Must be called exactly
-/// once, single-threaded, before any AP starts and before any call to
-/// `get()`. After init, all access is via shared `&'static PerCore`.
+/// Initialise per-core state for `count` cores. BSP-only, single-
+/// threaded, before any AP starts and before any `get()`. Publishes
+/// `count` via `set_num_workers` so every `PerWorker<T>` (here, in
+/// `uni-runtime`, in `net::*`) sizes itself the same.
 pub unsafe fn init(count: u32) {
-    let n = count.min(MAX_CORES as u32);
-    NUM_CORES.store(n, core::sync::atomic::Ordering::Release);
-    // Stamp each core's id into its slot. We bypass the `current()`
-    // accessor here because at boot time the id field hasn't been
-    // written yet — the convention "PerCore.id == its slot index" is
-    // what we're establishing right now.
-    for i in 0..n {
-        // SAFETY: init runs single-threaded on the BSP before APs
-        // start; no other core has a reference to any slot yet.
-        unsafe {
-            let slot = CORES.at(i) as *const PerCore as *mut PerCore;
-            (*slot).id = i;
-        }
-    }
+    uni_worker::set_num_workers(count);
+    CORES.init(count, |i| PerCore::new(i));
+    uni_runtime::init(count);
 }
 
 /// Get a shared reference to a core's state.
@@ -276,9 +254,10 @@ pub unsafe fn get(id: u32) -> &'static PerCore {
     CORES.at(id)
 }
 
-/// Get the total number of cores.
+/// Total number of cores. Bare-metal-friendly alias for
+/// `uni_worker::num_workers()`.
 pub fn num_cores() -> u32 {
-    NUM_CORES.load(core::sync::atomic::Ordering::Acquire)
+    uni_worker::num_workers()
 }
 
 // `CurrentWorker` used to expose a `.percore()` convenience that walked

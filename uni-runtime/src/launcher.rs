@@ -41,7 +41,7 @@
 use alloc::boxed::Box;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
-use uni_worker::MAX_WORKERS;
+use uni_worker::{PerWorker, num_workers};
 
 /// Type-erased launcher closure. Captures any state needed for the
 /// per-worker fan-out (typically `Arc`s shared with the owning
@@ -58,7 +58,10 @@ pub type Launcher = Box<dyn Fn() + Send + Sync + 'static>;
 pub struct LaunchTable<const N: usize> {
     slots: [AtomicPtr<Launcher>; N],
     count: AtomicUsize,
-    fired: [AtomicUsize; MAX_WORKERS],
+    /// Per-worker fired cursor. Lazy-init on first `fire_pending`
+    /// — the BSP path goes through here too, so we can't rely on
+    /// boot to have called an explicit init.
+    fired: PerWorker<AtomicUsize>,
 }
 
 // SAFETY: all mutable state is behind atomics. `Launcher` carries
@@ -83,7 +86,7 @@ impl<const N: usize> LaunchTable<N> {
         LaunchTable {
             slots: [const { AtomicPtr::new(core::ptr::null_mut()) }; N],
             count: AtomicUsize::new(0),
-            fired: [const { AtomicUsize::new(0) }; MAX_WORKERS],
+            fired: PerWorker::new(),
         }
     }
 
@@ -92,6 +95,11 @@ impl<const N: usize> LaunchTable<N> {
     /// launcher is dropped — the caller's handle is still valid
     /// but the closure never fires on any worker).
     pub fn register(&self, launcher: Launcher) -> usize {
+        // Eagerly size the per-worker cursor table on first
+        // registration — every worker tick reads it via
+        // `fire_pending`, and we want that path branch-free.
+        // `ensure_init` is idempotent + race-safe.
+        self.fired.ensure_init(num_workers(), |_| AtomicUsize::new(0));
         let i = self.count.fetch_add(1, Ordering::AcqRel);
         if i >= N {
             return usize::MAX;
@@ -126,11 +134,17 @@ impl<const N: usize> LaunchTable<N> {
     /// caught up (the common case). Safe to call from any worker
     /// concurrently with `register` / `release`.
     pub fn fire_pending(&self, worker_id: u32) {
-        if (worker_id as usize) >= MAX_WORKERS {
+        if worker_id >= num_workers() {
             return;
         }
+        // No `register()` ever called → no slots to walk and the
+        // cursor table is uninitialised. Hot-path tick exits here.
         let total = self.count.load(Ordering::Acquire).min(N);
-        let fired = self.fired[worker_id as usize].load(Ordering::Relaxed);
+        if total == 0 {
+            return;
+        }
+        let fired_slot = self.fired.at(worker_id);
+        let fired = fired_slot.load(Ordering::Relaxed);
         if fired >= total {
             return;
         }
@@ -156,7 +170,7 @@ impl<const N: usize> LaunchTable<N> {
             new_fired = i + 1;
         }
         if new_fired > fired {
-            self.fired[worker_id as usize].store(new_fired, Ordering::Relaxed);
+            fired_slot.store(new_fired, Ordering::Relaxed);
         }
     }
 }

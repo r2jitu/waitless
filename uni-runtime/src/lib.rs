@@ -17,7 +17,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use uni_worker::timer::{Timer, TimerWheel};
-use uni_worker::{CurrentWorker, PerWorker, MAX_WORKERS};
+use uni_worker::{CurrentWorker, PerWorker};
 use uni_platform::now_ticks;
 
 // ---- Per-worker timer storage ---------------------------------------------
@@ -29,8 +29,7 @@ struct WheelCell(UnsafeCell<TimerWheel>);
 unsafe impl Sync for WheelCell {}
 unsafe impl Send for WheelCell {}
 
-static WHEELS: PerWorker<WheelCell, MAX_WORKERS> =
-    PerWorker::new([const { WheelCell(UnsafeCell::new(TimerWheel::new())) }; MAX_WORKERS]);
+static WHEELS: PerWorker<WheelCell> = PerWorker::new();
 
 fn wheel(cc: &CurrentWorker) -> &mut TimerWheel {
     let cell = WHEELS.current(cc);
@@ -95,8 +94,14 @@ impl TaskArena {
     }
 }
 
-static ARENAS: PerWorker<TaskArena, MAX_WORKERS> =
-    PerWorker::new([const { TaskArena::new() }; MAX_WORKERS]);
+static ARENAS: PerWorker<TaskArena> = PerWorker::new();
+
+/// Size `WHEELS` and `ARENAS` for `num_workers` slots. BSP-only,
+/// after `mm::init()`, before any worker touches the runtime.
+pub fn init(num_workers: u32) {
+    WHEELS.init(num_workers, |_| WheelCell(UnsafeCell::new(TimerWheel::new())));
+    ARENAS.init(num_workers, |_| TaskArena::new());
+}
 
 // ---- Spawning --------------------------------------------------------------
 
@@ -219,7 +224,7 @@ fn waker_wake_by_ref(data: *const ()) {
     let packed = data as usize;
     let slot_idx = packed & WAKER_SLOT_MASK;
     let worker_id = (packed >> WAKER_WORKER_SHIFT) as u32;
-    if (worker_id as usize) >= MAX_WORKERS || slot_idx >= TASKS_PER_WORKER {
+    if worker_id >= uni_worker::num_workers() || slot_idx >= TASKS_PER_WORKER {
         return;
     }
     ARENAS
@@ -245,7 +250,7 @@ fn make_waker_for(worker_id: u32, slot_idx: usize) -> Waker {
 /// ready slot in its arena. Backends call this once per event-loop
 /// iteration.
 pub fn tick(worker_id: u32) -> bool {
-    if (worker_id as usize) >= MAX_WORKERS {
+    if worker_id >= uni_worker::num_workers() {
         return false;
     }
     // SAFETY: caller guarantees `worker_id` is the running worker.
@@ -296,7 +301,7 @@ pub fn tick(worker_id: u32) -> bool {
 /// True if the worker has outstanding async work — either a
 /// scheduled timer in its wheel or a task slot flagged ready.
 pub fn has_pending(worker_id: u32) -> bool {
-    if (worker_id as usize) >= MAX_WORKERS {
+    if worker_id >= uni_worker::num_workers() {
         return false;
     }
     // SAFETY: caller guarantees `worker_id` is the running worker.

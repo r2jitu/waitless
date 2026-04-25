@@ -141,12 +141,19 @@ struct ArpFastSlot {
     mac: AtomicU64,
 }
 
-const ARP_FAST_SLOTS: usize = uni_kernel::percpu::MAX_CORES;
-static ARP_FAST: [ArpFastSlot; ARP_FAST_SLOTS] =
-    [const { ArpFastSlot {
+/// Per-core fast cache slots, sized to actual core count at boot.
+static ARP_FAST: uni_kernel::percpu::PerWorker<ArpFastSlot> =
+    uni_kernel::percpu::PerWorker::new();
+
+/// Allocate the per-core ARP fast cache. Called from the net stack's
+/// init path on the BSP after `uni_kernel::percpu::init` has set
+/// `num_workers`. Idempotent.
+pub fn init() {
+    ARP_FAST.init(uni_kernel::percpu::num_cores(), |_| ArpFastSlot {
         ip: AtomicU32::new(0),
         mac: AtomicU64::new(0),
-    } }; ARP_FAST_SLOTS];
+    });
+}
 
 #[inline]
 fn pack_mac(m: MacAddr) -> u64 {
@@ -178,11 +185,11 @@ fn arp_fast_lookup(ip: Ipv4Addr) -> Option<MacAddr> {
     if ip.addr == 0 {
         return None;
     }
-    let core = uni_kernel::cpu_id() as usize;
-    if core >= ARP_FAST_SLOTS {
+    let core = uni_kernel::cpu_id();
+    if core >= ARP_FAST.len() {
         return None;
     }
-    let slot = &ARP_FAST[core];
+    let slot = ARP_FAST.at(core);
     let ip1 = slot.ip.load(Ordering::Acquire);
     if ip1 != ip.addr {
         return None;
@@ -198,11 +205,11 @@ fn arp_fast_lookup(ip: Ipv4Addr) -> Option<MacAddr> {
 
 #[inline]
 fn arp_fast_store(ip: Ipv4Addr, mac: MacAddr) {
-    let core = uni_kernel::cpu_id() as usize;
-    if core >= ARP_FAST_SLOTS {
+    let core = uni_kernel::cpu_id();
+    if core >= ARP_FAST.len() {
         return;
     }
-    let slot = &ARP_FAST[core];
+    let slot = ARP_FAST.at(core);
     // Invalidate by zeroing IP first, then write the MAC, then publish
     // the new IP. A reader on the same core won't observe a half-written
     // entry, and a cross-core invalidator only zeroes the IP.

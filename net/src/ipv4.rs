@@ -51,9 +51,17 @@ pub struct Ipv4Packet<'a> {
 #[repr(align(64))]
 struct IpIdSlot(core::sync::atomic::AtomicU16);
 
-const IP_ID_SLOTS: usize = uni_kernel::percpu::MAX_CORES;
-static IP_ID_PERCORE: [IpIdSlot; IP_ID_SLOTS] =
-    [const { IpIdSlot(core::sync::atomic::AtomicU16::new(0)) }; IP_ID_SLOTS];
+/// Per-core IP-ID counter slots, sized at boot to actual core count.
+static IP_ID_PERCORE: uni_kernel::percpu::PerWorker<IpIdSlot> =
+    uni_kernel::percpu::PerWorker::new();
+
+/// Allocate the per-core IP-ID counter table. Called from net stack
+/// init on the BSP after `percpu::init`. Idempotent.
+pub fn init() {
+    IP_ID_PERCORE.init(uni_kernel::percpu::num_cores(), |_| {
+        IpIdSlot(core::sync::atomic::AtomicU16::new(0))
+    });
+}
 
 /// True if `ip` is in the same IPv4 subnet as our configured address.
 /// Used by receive-side ARP snooping: only snoop (src_ip, src_mac)
@@ -68,12 +76,13 @@ pub fn same_subnet(ip: Ipv4Addr) -> bool {
 
 #[inline]
 fn next_ip_id() -> u16 {
-    let core = uni_kernel::cpu_id() as usize;
-    let slot = if core < IP_ID_SLOTS { core } else { 0 };
     // Per-core access, but the field is still atomic so the Rust memory
     // model is happy and a borrow check on `&IpIdSlot` works through the
     // shared static. Relaxed is fine — IP IDs have no ordering needs.
-    IP_ID_PERCORE[slot].0.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+    IP_ID_PERCORE
+        .at(uni_kernel::cpu_id())
+        .0
+        .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn ipv4_send(dst: Ipv4Addr, proto: u8, payload: &[u8]) {
