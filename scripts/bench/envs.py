@@ -366,6 +366,7 @@ class RemoteEnv:
     GUEST_PORT = 80
     GUEST_TLS_PORT = 443
     GUEST_UDP_PORT = 7
+    GUEST_TCP_ECHO_PORT = 9
 
     def __init__(self):
         # Non-None sentinel so `_current["proc"]` cleanup logic treats

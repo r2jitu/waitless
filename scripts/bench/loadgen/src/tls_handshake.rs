@@ -19,9 +19,12 @@ use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, RootCertStore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 
 use crate::WorkloadResult;
+
+const PER_OP_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 struct NoCertVerify;
@@ -164,9 +167,16 @@ async fn do_one_handshake(
     request: &[u8],
     buf: &mut [u8],
 ) -> bool {
-    let tcp = match TcpStream::connect((host, port)).await {
-        Ok(s) => s,
-        Err(_) => return false,
+    // Per-op timeouts: at very high concurrent handshake rates the
+    // server can momentarily drop a SYN or stall a handshake mid-
+    // flight. Without a bound the worker would block forever and
+    // its share of the deadline would be wasted, biasing the
+    // aggregate down to zero. A 5s ceiling is well past any healthy
+    // handshake (<50ms typical) but short enough to recover the
+    // remainder of the bench window.
+    let tcp = match timeout(PER_OP_TIMEOUT, TcpStream::connect((host, port))).await {
+        Ok(Ok(s)) => s,
+        _ => return false,
     };
     // The Python version used SO_LINGER=0 to skip TIME_WAIT —
     // tokio deprecated that on TcpStream and the comment is the
@@ -178,23 +188,29 @@ async fn do_one_handshake(
     // setsockopt with the FD pulled via TcpStream::as_raw_fd.
     let _ = tcp.set_nodelay(true);
 
-    let mut tls = match connector.connect(server_name.clone(), tcp).await {
-        Ok(t) => t,
-        Err(_) => return false,
+    let mut tls = match timeout(PER_OP_TIMEOUT, connector.connect(server_name.clone(), tcp)).await {
+        Ok(Ok(t)) => t,
+        _ => return false,
     };
 
-    if tls.write_all(request).await.is_err() {
+    if timeout(PER_OP_TIMEOUT, tls.write_all(request)).await
+        .ok().and_then(|r| r.ok()).is_none()
+    {
         return false;
     }
     // Read until EOF or one full response — server closes after
-    // serving (Connection: close).
-    loop {
-        match tls.read(buf).await {
-            Ok(0) => break,
-            Ok(_) => continue,
-            Err(_) => break,
+    // serving (Connection: close). One outer timeout covers the
+    // whole drain loop.
+    let drain = async {
+        loop {
+            match tls.read(buf).await {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(_) => break,
+            }
         }
-    }
-    let _ = tls.shutdown().await;
+    };
+    let _ = timeout(PER_OP_TIMEOUT, drain).await;
+    let _ = timeout(PER_OP_TIMEOUT, tls.shutdown()).await;
     true
 }

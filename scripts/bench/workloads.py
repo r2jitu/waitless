@@ -328,7 +328,17 @@ def _loadgen_bin():
                 break
         if bin_path is not None:
             return bin_path
-    if shutil.which("cargo") is None:
+    cargo = shutil.which("cargo")
+    if cargo is None:
+        # rustup's `--no-modify-path` install leaves cargo at
+        # `~/.cargo/bin/cargo` without touching shell rc files.
+        # Non-interactive ssh sessions don't pick that up unless
+        # the user manually edits `.bashrc`, so check the well-
+        # known location before giving up.
+        candidate = os.path.expanduser("~/.cargo/bin/cargo")
+        if os.path.isfile(candidate):
+            cargo = candidate
+    if cargo is None:
         if not getattr(_loadgen_bin, "_warned_no_cargo", False):
             print("warning: cargo not found; falling back to Python "
                   "loadgen for tls_handshake / tcp_echo (slower).",
@@ -339,7 +349,7 @@ def _loadgen_bin():
           file=sys.stderr)
     try:
         subprocess.run(
-            ["cargo", "build", "--release"],
+            [cargo, "build", "--release"],
             cwd=crate_dir, check=True, timeout=300)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         print(f"warning: loadgen cargo build failed ({e}); falling "
