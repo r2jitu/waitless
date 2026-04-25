@@ -397,6 +397,17 @@ pub fn listen_https(
 async fn handle_conn<S: HttpStream>(handler: Handler, mut stream: S) {
     let mut buf: Box<[u8]> = alloc::vec![0u8; BUF_SIZE].into_boxed_slice();
     let mut buf_len = 0usize;
+    // Per-connection scratch reused across every request on this
+    // conn — `Request` carries 8 KiB of body buffer and 256 B of
+    // path, `BufWriter` another 2 KiB. Allocating + zero-initing
+    // them per request was costing ~1 GB/s of memory bandwidth per
+    // core at peak request rate. `parse_request` and
+    // `write_response_into` both reset their target's length
+    // fields up front, so a stale tail in the array is invisible
+    // to the read path; only the writes-then-reads-back range is
+    // observed.
+    let mut req = Request::new();
+    let mut w = BufWriter::new();
     loop {
         if buf_len == BUF_SIZE {
             // Parse buffer full and no complete request in it —
@@ -415,7 +426,6 @@ async fn handle_conn<S: HttpStream>(handler: Handler, mut stream: S) {
 
         // Drain every complete request sitting in the buffer.
         while buf_len > 0 {
-            let mut req = Request::new();
             let consumed = parse_request(&buf[..buf_len], &mut req);
             if consumed == 0 {
                 break; // need more bytes
@@ -426,7 +436,7 @@ async fn handle_conn<S: HttpStream>(handler: Handler, mut stream: S) {
             };
             let resp = handler(&req);
 
-            let mut w = BufWriter::new();
+            w.clear();
             write_response_into(&mut w, &resp, !want_close);
             if stream.send(w.as_bytes()).await.is_err() {
                 return;
@@ -576,6 +586,13 @@ struct BufWriter {
 impl BufWriter {
     fn new() -> Self {
         BufWriter { buf: [0u8; 2048], pos: 0 }
+    }
+
+    /// Reset the cursor without touching the backing array. Bytes
+    /// past the new `pos` are stale but unreachable through
+    /// `as_bytes`.
+    fn clear(&mut self) {
+        self.pos = 0;
     }
 
     fn push(&mut self, data: &[u8]) {
