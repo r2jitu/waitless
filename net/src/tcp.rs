@@ -409,6 +409,30 @@ fn alloc_connection(core: u32) -> Option<usize> {
             return Some(i);
         }
     }
+    // No Closed slot — reclaim a half-closed slot whose peer never
+    // completed the FIN exchange. Without a retransmit/RTO timer the
+    // stack can't age these out, so a misbehaving (or just hard-killed)
+    // client that opens many short connections without a clean close
+    // would otherwise wedge the listener after `CONNECTIONS_PER_CORE`
+    // attempts. Walk these states in priority order — FinWait* first
+    // (we already initiated close, peer is the only one we're waiting
+    // on), then LastAck/TimeWait (similar), then CloseWait last (peer
+    // FIN'd but we haven't shipped a response yet — least safe to drop).
+    for state in [
+        TcpState::FinWait1, TcpState::FinWait2,
+        TcpState::LastAck, TcpState::TimeWait, TcpState::CloseWait,
+    ] {
+        for i in 0..CONNECTIONS_PER_CORE {
+            let c = unsafe { &*conn_ptr(core, i) };
+            if c.state == state {
+                // free_connection bumps generation and resets to a
+                // fresh Closed slot; the SYN handler immediately
+                // overwrites the fields it cares about.
+                free_connection(core, i);
+                return Some(i);
+            }
+        }
+    }
     None
 }
 
@@ -643,6 +667,14 @@ pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
         } else if c.state == TcpState::LastAck {
             free_connection(core, slot);
             return;
+        } else if c.state == TcpState::FinWait1 && ack == c.snd_nxt {
+            // Peer ACK'd our FIN. Move to FinWait2 to await the peer's
+            // FIN. Without this transition the slot stays in FinWait1
+            // forever if the peer doesn't piggyback its FIN with the
+            // ACK (Linux clients on a half-closed conn frequently send
+            // the ACK and the FIN as separate segments).
+            c.state = TcpState::FinWait2;
+            c.snd_una = ack;
         } else {
             c.snd_una = ack;
         }
@@ -852,11 +884,18 @@ pub fn close(handle: *mut (), generation: u16) {
     if c.generation != generation {
         return;
     }
+    // Advertise the actual receive-buffer space in the FIN. Sending
+    // FIN with `win=0` is technically legal but Linux clients treat
+    // it as a zero-window event and queue the FIN+ACK behind a persist
+    // timer, leaving the connection orphaned in FIN_WAIT_1 on our side.
+    // Since we've drained the request out of the rx ring before
+    // responding, `rx_free()` is the full buffer here.
+    let win = c.rx_free() as u16;
     match c.state {
         TcpState::Established => {
             send_segment(
                 c.remote_ip, c.local_port, c.remote_port,
-                c.snd_nxt, c.rcv_nxt, TCP_FIN | TCP_ACK, 0, &[],
+                c.snd_nxt, c.rcv_nxt, TCP_FIN | TCP_ACK, win, &[],
             );
             c.snd_nxt = c.snd_nxt.wrapping_add(1);
             c.state = TcpState::FinWait1;
@@ -864,7 +903,7 @@ pub fn close(handle: *mut (), generation: u16) {
         TcpState::CloseWait => {
             send_segment(
                 c.remote_ip, c.local_port, c.remote_port,
-                c.snd_nxt, c.rcv_nxt, TCP_FIN | TCP_ACK, 0, &[],
+                c.snd_nxt, c.rcv_nxt, TCP_FIN | TCP_ACK, win, &[],
             );
             free_connection(core, slot);
             return;
