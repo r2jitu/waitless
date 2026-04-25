@@ -18,10 +18,16 @@
 
 [workspace]
 resolver = "2"
+# `scripts/bench/loadgen` is built via plain cargo (host-native or
+# cross-compiled to x86_64-linux), not Bazel — `ring`'s build script
+# needs `ar` and the bazel cc_toolchain is rust-link-only. Keeping
+# loadgen out of the workspace avoids re-pinning the bazel-side
+# crate_universe lockfile when its tokio/rustls deps shift.
 members = [
     "tools/hvf-runner",
     "bazel/crates-bridge",
 ]
+exclude = ["scripts/bench/loadgen"]
 
 [workspace.dependencies]
 # Used by tools/hvf-runner.

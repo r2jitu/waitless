@@ -2,10 +2,11 @@
 
 Split out of the old flat bench.py: everything here is "given a
 running server at (host, port), measure throughput/latency with wrk /
-udp_bench / a Python TLS client". No bazel / env-lifecycle logic.
+udp_bench / loadgen". No bazel / env-lifecycle logic.
 """
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -292,6 +293,122 @@ def run_tls_handshake_rate(port, endpoint, duration, host="localhost",
     p99_idx = min(len(all_lat) - 1, (len(all_lat) * 99) // 100)
     p99 = all_lat[p99_idx]
     return rps, f"{p50}us", f"{p99}us"
+
+
+def _loadgen_bin():
+    """Return the path to the compiled `loadgen` binary, building it
+    via `cargo build --release` on first call.
+
+    `loadgen` is a Rust async TCP/TLS load generator (sources at
+    `scripts/bench/loadgen/`) that replaces the Python multiprocessing
+    paths for `tls_handshake_max` and `tcp_echo_max` — both were
+    Python-bound at ~6 k hs/s and ~210 k msg/s respectively, so
+    benchmark numbers reflected client cost, not server ceiling.
+
+    First-call build is ~30s (downloads tokio + rustls + ring,
+    compiles); subsequent calls hit the cargo cache and return in
+    milliseconds. If `cargo` isn't on PATH the helper returns None
+    and the harness falls back to the Python implementations with a
+    warning printed once.
+    """
+    here = os.path.dirname(__file__)
+    crate_dir = os.path.join(here, "loadgen")
+    if not os.path.isfile(os.path.join(crate_dir, "Cargo.toml")):
+        return None
+    bin_path = os.path.join(crate_dir, "target", "release", "loadgen")
+    if os.path.isfile(bin_path):
+        # Cheap sanity: rebuild if any source is newer than the binary.
+        bin_mtime = os.path.getmtime(bin_path)
+        for root, _, files in os.walk(os.path.join(crate_dir, "src")):
+            for f in files:
+                if os.path.getmtime(os.path.join(root, f)) > bin_mtime:
+                    bin_path = None
+                    break
+            if bin_path is None:
+                break
+        if bin_path is not None:
+            return bin_path
+    if shutil.which("cargo") is None:
+        if not getattr(_loadgen_bin, "_warned_no_cargo", False):
+            print("warning: cargo not found; falling back to Python "
+                  "loadgen for tls_handshake / tcp_echo (slower).",
+                  file=sys.stderr)
+            _loadgen_bin._warned_no_cargo = True
+        return None
+    print("==> Building scripts/bench/loadgen (first-run, ~30s)...",
+          file=sys.stderr)
+    try:
+        subprocess.run(
+            ["cargo", "build", "--release"],
+            cwd=crate_dir, check=True, timeout=300)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        print(f"warning: loadgen cargo build failed ({e}); falling "
+              "back to Python loadgen.", file=sys.stderr)
+        return None
+    return os.path.join(crate_dir, "target", "release", "loadgen")
+
+
+def _parse_loadgen_output(stdout):
+    """Pull RPS / P50_US / P99_US from loadgen's stdout. Returns
+    (rps_float, p50_str, p99_str). Anything else on stdout is
+    informational; missing values are returned as zero / empty."""
+    rps, p50, p99 = 0.0, "", ""
+    for line in stdout.split("\n"):
+        if line.startswith("RPS "):
+            try:
+                rps = float(line[4:])
+            except ValueError:
+                pass
+        elif line.startswith("P50_US "):
+            p50 = f"{line[7:].strip()}us"
+        elif line.startswith("P99_US "):
+            p99 = f"{line[7:].strip()}us"
+    return rps, p50, p99
+
+
+def run_loadgen_tls_handshake(port, endpoint, duration, host, parallelism, warmup=1):
+    """Run the Rust loadgen TLS-handshake workload. Returns the same
+    `(rps, p50, p99)` shape `run_tls_handshake_rate` does so the
+    dispatcher can swap implementations transparently."""
+    bin_path = _loadgen_bin()
+    if bin_path is None:
+        return run_tls_handshake_rate(port, endpoint, duration, host=host,
+                                      parallelism=parallelism, warmup=warmup)
+    try:
+        r = subprocess.run(
+            [bin_path, "tls-handshake",
+             "--host", host, "--port", str(port),
+             "--endpoint", endpoint,
+             "--duration-secs", str(duration),
+             "--warmup-secs", str(warmup),
+             "--parallelism", str(parallelism)],
+            capture_output=True, text=True, timeout=duration + warmup + 30)
+        if r.returncode != 0:
+            return 0.0, "ERROR", "ERROR"
+        return _parse_loadgen_output(r.stdout)
+    except (subprocess.TimeoutExpired, OSError):
+        return 0.0, "TIMEOUT", "TIMEOUT"
+
+
+def run_loadgen_tcp_echo(port, conns, duration, host="127.0.0.1", msg_size=64):
+    """Run the Rust loadgen TCP-echo workload. Returns the same
+    `(rps, p50, p99)` shape as `run_tcp_echo`."""
+    bin_path = _loadgen_bin()
+    if bin_path is None:
+        return run_tcp_echo(port, conns, duration, host=host, msg_size=msg_size)
+    try:
+        r = subprocess.run(
+            [bin_path, "tcp-echo",
+             "--host", host, "--port", str(port),
+             "--duration-secs", str(duration),
+             "--connections", str(conns),
+             "--msg-size", str(msg_size)],
+            capture_output=True, text=True, timeout=duration + 30)
+        if r.returncode != 0:
+            return 0.0, "ERROR", "ERROR"
+        return _parse_loadgen_output(r.stdout)
+    except (subprocess.TimeoutExpired, OSError):
+        return 0.0, "TIMEOUT", "TIMEOUT"
 
 
 def _udp_bench_bin():

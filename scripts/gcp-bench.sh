@@ -141,7 +141,12 @@ ssh "$SSH_HOST" "mkdir -p ~/$REMOTE_DIR && chmod -R u+w ~/$REMOTE_DIR"
 # `-L` dereferences symlinks on the source side — `bazel-bin/...`
 # entries are symlinks into the bazel cache, so a plain `-a` copy
 # would send a broken link to the remote.
-rsync -azL --partial "${sync_files[@]}" "$SSH_HOST:$REMOTE_DIR/"
+#
+# `--exclude target/` avoids syncing the loadgen crate's locally-
+# built macOS-arm64 binary; cargo on the GCP host rebuilds it for
+# x86_64-linux on first bench run (~30s, then cached).
+rsync -azL --partial --exclude 'target/' \
+    "${sync_files[@]}" "$SSH_HOST:$REMOTE_DIR/"
 
 # Run bench.py on the remote.
 #

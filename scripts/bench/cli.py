@@ -78,8 +78,8 @@ from .envs import (
 from .workloads import (
     _udp_with_retry,
     next_port,
-    run_tcp_echo,
-    run_tls_handshake_rate,
+    run_loadgen_tcp_echo,
+    run_loadgen_tls_handshake,
     run_wrk,
     run_wrk_https,
     udp_peak_concurrent,
@@ -428,9 +428,12 @@ def main():
                     # record-layer throughput. Client parallelism
                     # scales with server cpus to keep all server
                     # cores busy (mirrors the _max HTTP workloads).
+                    # Driven by the Rust `loadgen` binary (rustls +
+                    # tokio); falls back to Python if cargo isn't
+                    # installed.
                     par = w.get("parallelism_per_core", 4) * cpus
                     with measure_client_cpu() as m:
-                        rps, p50, p99 = run_tls_handshake_rate(
+                        rps, p50, p99 = run_loadgen_tls_handshake(
                             tls_target_port, w["endpoint"], duration,
                             host=wrk_host, parallelism=par)
                     results[(env_name, cpus, wname)] = (rps, p50, p99)
@@ -471,8 +474,11 @@ def main():
                         print(f"    {wname:<20s} SKIP (env has no tcp_echo port)")
                         continue
                     time.sleep(0.5)
+                    # Driven by the Rust `loadgen` binary (tokio +
+                    # native sockets); falls back to Python if cargo
+                    # isn't installed.
                     with measure_client_cpu() as m:
-                        rps, p50, p99 = run_tcp_echo(
+                        rps, p50, p99 = run_loadgen_tcp_echo(
                             tcp_echo_target_port, conns, duration, host=wrk_host)
                     results[(env_name, cpus, wname)] = (rps, p50, p99)
                     client_cpu[(env_name, cpus, wname)] = m["cores"]

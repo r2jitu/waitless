@@ -1,5 +1,5 @@
 {
-  "checksum": "aeb61d05fe3a74a3513c36841a041aca9f9c1dbec77eb683a5e80640ef390e9c",
+  "checksum": "f12f34c1dd323f22dc6a183456858339974ca882ceb9412ebdc61ad959840fe4",
   "crates": {
     "aead 0.5.2": {
       "name": "aead",
