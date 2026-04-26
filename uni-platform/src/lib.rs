@@ -162,3 +162,53 @@ pub fn now_ticks() -> u64 {
     let start = START.get_or_init(Instant::now);
     Instant::now().duration_since(*start).as_micros() as u64
 }
+
+// ============================================================================
+// wake_worker — cross-worker wake hook
+// ============================================================================
+//
+// Cross-worker waker firings (set a ready_bit on another worker's
+// arena, or push to its inbox) need a hardware-level kick so the
+// target doesn't sit in HLT/WFI / a blocking kqueue waiting for the
+// next NIC IRQ. Without this, Tier 2 + 3+ cores deadlocks: a UDP
+// reply hashes to the wrong core, that core delivers cross-worker,
+// the owner's task is marked ready but the owner is asleep with no
+// pending IRQ to wake it.
+//
+// Bare-metal: `set_wake_fn` is called from the kernel boot path
+// once `send_ipi` is wired; the runtime calls `wake_worker(id)` to
+// raise an IPI on the target core.
+//
+// Native: idle workers block in kqueue with a 10 ms timeout, so a
+// missed wake delays at most one timeout cycle. Could be tightened
+// with a per-worker wake pipe — left as a follow-up since native
+// already throughputs at 100k req/s without it.
+
+/// Type-erased "wake another worker" hook. Atomic so registration
+/// is thread-safe; loaded with Acquire to pair with the kernel's
+/// Release-store at boot. Null until set; the runtime treats null
+/// as "no cross-worker wake available, target will pick up on its
+/// next idle-spin tick".
+static WAKE_WORKER_FN: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Install the cross-worker wake hook. Called once during boot.
+pub fn set_wake_fn(f: fn(u32)) {
+    WAKE_WORKER_FN.store(f as usize, core::sync::atomic::Ordering::Release);
+}
+
+/// Kick worker `id` so it picks up a freshly-set runtime ready_bit
+/// (or any other cross-core signal) without waiting for its idle
+/// timeout. No-op if no hook is registered yet.
+#[inline]
+pub fn wake_worker(id: u32) {
+    let raw = WAKE_WORKER_FN.load(core::sync::atomic::Ordering::Acquire);
+    if raw == 0 {
+        return;
+    }
+    // SAFETY: `set_wake_fn` is the only writer; it stores a `fn(u32)`
+    // pointer's address. Round-tripping through usize is sound for
+    // function pointers (validated by the boot path that wrote it).
+    let f: fn(u32) = unsafe { core::mem::transmute(raw) };
+    f(id);
+}

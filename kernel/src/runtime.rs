@@ -14,4 +14,11 @@ pub fn init() {
     {
         uni_platform::set_x86_tsc_per_us(crate::time::cycles_per_us());
     }
+    // Cross-worker arena wakes need an IPI to bring the target out
+    // of HLT/WFI when it's idle. Without this, Tier 2 (single NIC
+    // RX queue, multi-core) deadlocks on workloads where one core
+    // delivers a UDP/TCP packet that wakes a task on a different
+    // core — the bit gets set on the target's arena but the target
+    // sleeps until its next NIC IRQ.
+    uni_platform::set_wake_fn(crate::send_ipi);
 }

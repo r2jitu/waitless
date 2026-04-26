@@ -227,10 +227,22 @@ fn waker_wake_by_ref(data: *const ()) {
     if worker_id >= uni_worker::num_workers() || slot_idx >= TASKS_PER_WORKER {
         return;
     }
-    ARENAS
+    let prev = ARENAS
         .at(worker_id)
         .ready_bits
         .fetch_or(1u64 << slot_idx, Ordering::Release);
+    // Cross-worker wake: the target may be in HLT/WFI / blocking
+    // kqueue waiting for its next idle tick; bumping `ready_bits`
+    // alone won't bring it back. Skip when:
+    //   - the target IS the current worker (we'll observe the bit
+    //     on our own next tick, no kernel round-trip needed), or
+    //   - `ready_bits` was already non-zero (the target is either
+    //     mid-tick or about to tick — another bit doesn't change
+    //     the wake semantics, and an extra IPI per packet under
+    //     heavy load just adds overhead).
+    if prev == 0 && worker_id != uni_platform::current_worker() {
+        uni_platform::wake_worker(worker_id);
+    }
 }
 
 fn waker_drop(_data: *const ()) {}
