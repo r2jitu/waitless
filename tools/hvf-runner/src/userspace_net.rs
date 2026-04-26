@@ -304,6 +304,14 @@ struct IoState {
     /// mapping. Each entry holds exactly one fd (the sibling the
     /// kernel hands this vCPU via SO_REUSEPORT distribution).
     udps: Vec<UdpRelay>,
+    /// Outbound UDP NAT — guest_src_port → host-side fd we
+    /// allocated to forward this flow. Populated lazily on first
+    /// `handle_udp_outbound`; the fd lives until vCPU teardown.
+    /// Each fd is registered in `pollfds` so reply datagrams wake
+    /// this vCPU and we synthesise a UDP frame back into the
+    /// guest's RX queue. Single-owner per vCPU — no cross-thread
+    /// mutation, no SO_REUSEPORT.
+    outbound_udp: HashMap<u16, OutboundUdp>,
     /// Read end of the per-vCPU wake pipe. Polled in `pollfds` so a
     /// write from the accept thread breaks the blocking poll. The
     /// payload is a doorbell — drained and discarded.
@@ -324,6 +332,18 @@ struct IoState {
     primed: bool,
     /// Drives the periodic closed-conn cleanup pass.
     cleanup_ctr: u32,
+}
+
+/// One outbound UDP flow allocated by `handle_udp_outbound`. The
+/// guest sends from `guest_src_port` to some external host:port;
+/// we forward via `fd` (an unbound non-blocking socket) and remember
+/// the original destination so reply frames can carry the right
+/// `(src_ip, src_port)` back to the guest.
+#[derive(Clone, Copy)]
+struct OutboundUdp {
+    fd: i32,
+    last_dst_ip: [u8; 4],
+    last_dst_port: u16,
 }
 
 /// Open a non-blocking TCP listen socket bound to
@@ -479,6 +499,7 @@ pub fn start(mappings: &[PortMapping], cpu_count: usize) -> Result<[u8; 6], Stri
         vcpu_ios.push(Mutex::new(IoState {
             id,
             udps,
+            outbound_udp: HashMap::new(),
             wake_pipe_read: wake_reads[id],
             guest_mac: mac,
             read_buf: [0u8; 2048],
@@ -715,6 +736,19 @@ fn poll_worker_iteration(
         io.pollfds.push(libc::pollfd { fd: l.fd, events: libc::POLLIN, revents: 0 });
         io.conn_ports.push(0);
     }
+    // Outbound UDP NAT fds — guest-initiated UDP flows we forwarded
+    // to the host's loopback. Reply datagrams arrive here and we
+    // synthesise a UDP frame back into the guest's RX queue.
+    // `conn_ports` records the GUEST src_port so the reply frame
+    // can carry the right (src=last_dst, dst=guest_src) addressing.
+    let outbound_slot_start = io.pollfds.len();
+    let outbound_drain: Vec<(u16, OutboundUdp)> = io.outbound_udp.iter()
+        .map(|(&port, &o)| (port, o))
+        .collect();
+    for (gport, o) in &outbound_drain {
+        io.pollfds.push(libc::pollfd { fd: o.fd, events: libc::POLLIN, revents: 0 });
+        io.conn_ports.push(*gport);
+    }
     let fixed_slots = io.pollfds.len();
     {
         let conns = shared.conns.lock().unwrap();
@@ -847,6 +881,45 @@ fn poll_worker_iteration(
                 if single_queue {
                     unsafe { hvf::hv_gic_set_spi(35, true); hvf::hv_gic_set_spi(35, false); }
                 }
+            }
+        }
+    }
+
+    // ── Drain outbound-UDP NAT replies ─────────────────────────────
+    // For each outbound flow whose fd fired POLLIN, recvfrom in a
+    // loop until EAGAIN, build a UDP frame back to the guest using
+    // the flow's saved `last_dst_*` (so the guest's stack accepts
+    // the reply as coming from the original destination), and push
+    // it to `tx_replies` for injection on the next iteration.
+    if !outbound_drain.is_empty() {
+        for (i, (gport, o)) in outbound_drain.iter().enumerate() {
+            if io.pollfds[outbound_slot_start + i].revents
+                & (libc::POLLIN | libc::POLLHUP)
+                == 0
+            {
+                continue;
+            }
+            loop {
+                let mut buf = [0u8; 1500];
+                let n = unsafe {
+                    libc::recv(
+                        o.fd,
+                        buf.as_mut_ptr() as *mut _,
+                        buf.len(),
+                        0,
+                    )
+                };
+                if n <= 0 { break; }
+                let payload = &buf[..n as usize];
+                let frame = build_udp_frame_in(
+                    &io.guest_mac,
+                    o.last_dst_ip,
+                    o.last_dst_port,
+                    *gport,
+                    payload,
+                );
+                shared.tx_replies.lock().unwrap().push_back(frame);
+                any_injected = true;
             }
         }
     }
@@ -1228,7 +1301,13 @@ fn handle_arp(arp: &[u8]) {
 fn handle_ipv4(ip: &[u8]) {
     if ip.len() < 20 { return; }
     let ihl = ((ip[0] & 0x0f) as usize) * 4;
-    match ip[9] { 6 => handle_tcp(&ip[ihl..]), 17 => handle_udp(&ip[ihl..]), _ => {} }
+    let src_ip: [u8; 4] = ip[12..16].try_into().unwrap_or([0; 4]);
+    let dst_ip: [u8; 4] = ip[16..20].try_into().unwrap_or([0; 4]);
+    match ip[9] {
+        6 => handle_tcp(&ip[ihl..]),
+        17 => handle_udp(&ip[ihl..], src_ip, dst_ip),
+        _ => {}
+    }
 }
 
 fn handle_tcp(tcp: &[u8]) {
@@ -1329,7 +1408,7 @@ fn handle_tcp(tcp: &[u8]) {
     }
 }
 
-fn handle_udp(udp: &[u8]) {
+fn handle_udp(udp: &[u8], _src_ip: [u8; 4], dst_ip: [u8; 4]) {
     if udp.len() < 8 { return; }
     let src_port = u16::from_be_bytes([udp[0], udp[1]]);
     let dst_port = u16::from_be_bytes([udp[2], udp[3]]);
@@ -1338,46 +1417,118 @@ fn handle_udp(udp: &[u8]) {
         handle_dhcp(&udp[8..]);
         return;
     }
-    // General UDP relay: guest → external client.
-    //
-    // The guest's frame has src_port=<guest-side listener> (matches the
-    // GUEST in one of our `-p udp:HOST:GUEST` mappings) and
-    // dst_port=<client ephemeral>. Pick the TX fd for the current vCPU
-    // from the relay's SO_REUSEPORT pool so multi-core TX doesn't
-    // serialise on a shared kernel socket lock. The TX siblings are all
-    // bound to the same host port, so packet source port == relay port
-    // — NAT-correct.
     let payload = &udp[8..];
     if payload.is_empty() { return; }
+
+    // First try the inbound-relay reply path: the guest is replying
+    // to a client whose datagram came in via one of our `-p udp:H:G`
+    // mappings. Match by `src_port == guest_port` of a relay entry.
     let vcpu_id = CURRENT_VCPU.with(|c| c.get());
-    let fd = match UDP_RELAYS.get() {
-        Some(table) => {
-            let relay = match table.iter().find(|r| r.guest_port == src_port) {
-                Some(r) => r,
-                None => return,
-            };
-            // Per-vCPU sibling fd; fall back to sibling 0 if the
-            // vCPU id is out of range (shouldn't happen).
-            match relay.fds.get(vcpu_id).or_else(|| relay.fds.first()) {
-                Some(&fd) => fd,
-                None => return,
+    let inbound = UDP_RELAYS.get().and_then(|table| {
+        table.iter().find(|r| r.guest_port == src_port)
+    });
+    if let Some(relay) = inbound {
+        // Per-vCPU sibling fd; fall back to sibling 0 if the
+        // vCPU id is out of range (shouldn't happen).
+        let fd = match relay.fds.get(vcpu_id).or_else(|| relay.fds.first()) {
+            Some(&fd) => fd,
+            None => return,
+        };
+        let client_addr = {
+            let guard = my_worker_shared().udp_clients.lock().unwrap();
+            guard.get(&(src_port, dst_port)).copied()
+        };
+        if let Some(addr) = client_addr {
+            unsafe {
+                libc::sendto(fd, payload.as_ptr() as *const _, payload.len(),
+                    0, &addr as *const _ as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as u32);
             }
         }
+        return;
+    }
+
+    // Outbound: guest is initiating a UDP flow (gateway / sidecar
+    // pattern). Forward to (host_loopback, dst_port) — the only
+    // host-side reachable destination in HVF user-mode networking
+    // is loopback; we map any guest-side dst_ip (typically the
+    // virtual gateway 10.0.2.2) to 127.0.0.1. Open a fresh
+    // unbound UDP socket per guest src_port, register it with this
+    // vCPU's poll loop, and remember the original dst for the
+    // synthesised reply frame.
+    handle_udp_outbound(src_port, dst_ip, dst_port, payload);
+}
+
+/// Allocate (or reuse) an outbound NAT fd for the given guest
+/// `src_port` on the current vCPU and forward `payload` to
+/// `(127.0.0.1, dst_port)`. Records the original guest-side dst
+/// (`dst_ip`, `dst_port`) so when the host's reply lands on the fd
+/// we can rebuild a UDP frame that the guest will accept (`src_ip`
+/// = original dst, `src_port` = original dst_port, `dst` = guest).
+fn handle_udp_outbound(
+    guest_src_port: u16,
+    dst_ip: [u8; 4],
+    dst_port: u16,
+    payload: &[u8],
+) {
+    let vcpu_id = CURRENT_VCPU.with(|c| c.get());
+    let vcpu_ios = match VCPU_IOS.get() {
+        Some(v) => v,
         None => return,
     };
-    // The UDP client-addr map is per-worker and our paired worker is
-    // the only producer, so this vCPU's worker-local map is exactly
-    // where the return-path entry was written.
-    let client_addr = {
-        let guard = my_worker_shared().udp_clients.lock().unwrap();
-        guard.get(&(src_port, dst_port)).copied()
+    let mut io = match vcpu_ios.get(vcpu_id) {
+        Some(m) => m.lock().unwrap(),
+        None => return,
     };
-    if let Some(addr) = client_addr {
-        unsafe {
-            libc::sendto(fd, payload.as_ptr() as *const _, payload.len(),
-                0, &addr as *const _ as *const libc::sockaddr,
-                std::mem::size_of::<libc::sockaddr_in>() as u32);
+    let fd = match io.outbound_udp.get_mut(&guest_src_port) {
+        Some(o) => {
+            o.last_dst_ip = dst_ip;
+            o.last_dst_port = dst_port;
+            o.fd
         }
+        None => unsafe {
+            let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+            if fd < 0 { return; }
+            let flags = libc::fcntl(fd, libc::F_GETFL, 0);
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            io.outbound_udp.insert(guest_src_port, OutboundUdp {
+                fd,
+                last_dst_ip: dst_ip,
+                last_dst_port: dst_port,
+            });
+            fd
+        },
+    };
+    // Forward to host loopback. The guest believes it's talking to
+    // `dst_ip` (typically the gateway 10.0.2.2) but the only
+    // host-reachable endpoint under user-mode networking is
+    // 127.0.0.1; the synthesised reply will carry the original
+    // `dst_ip` so the guest's stack accepts it.
+    let host_addr = libc::sockaddr_in {
+        #[cfg(target_os = "macos")]
+        sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
+        #[cfg(target_os = "macos")]
+        sin_family: libc::AF_INET as u8,
+        #[cfg(target_os = "linux")]
+        sin_family: libc::AF_INET as u16,
+        sin_port: dst_port.to_be(),
+        sin_addr: libc::in_addr {
+            // 127.0.0.1 in network-byte-order memory; see the
+            // matching `from_ne_bytes` rationale in
+            // uni-backend/native::udp_send.
+            s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+        },
+        sin_zero: [0; 8],
+    };
+    unsafe {
+        libc::sendto(
+            fd,
+            payload.as_ptr() as *const _,
+            payload.len(),
+            0,
+            &host_addr as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as u32,
+        );
     }
 }
 
@@ -1564,6 +1715,19 @@ fn build_tcp_frame_fixed(dst_mac: &[u8; 6], src_ip: [u8; 4], dst_ip: [u8; 4],
     let mut f = TxFrame { data: [0u8; MAX_REPLY_FRAME], len: 0, };
     f.len = write_tcp_frame(&mut f.data, dst_mac, src_ip, dst_ip,
         src_port, dst_port, seq, ack, flags, payload) as u16;
+    f
+}
+
+/// Build a guest-bound UDP frame using the saved outbound-NAT
+/// destination as the apparent source. Used by the outbound-UDP
+/// reply drain to synthesise replies the guest's IP stack will
+/// accept (matching the original destination 4-tuple).
+fn build_udp_frame_in(dst_mac: &[u8; 6],
+    src_ip: [u8; 4], src_port: u16,
+    guest_dst_port: u16, payload: &[u8]) -> TxFrame {
+    let mut f = TxFrame { data: [0u8; MAX_REPLY_FRAME], len: 0, };
+    f.len = build_udp_frame(&mut f.data, dst_mac,
+        src_ip, VM_IP, src_port, guest_dst_port, payload) as u16;
     f
 }
 
