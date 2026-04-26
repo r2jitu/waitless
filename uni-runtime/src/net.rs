@@ -412,8 +412,19 @@ static EPHEMERAL_PORT_CURSOR: core::sync::atomic::AtomicU32 =
 pub struct UdpBackend {
     /// Called after `UdpSocket::bind` claims a UDP_REGISTRY slot.
     /// `None` on bare-metal (routing is REGISTRY-only); `Some` on
-    /// native (opens SO_REUSEPORT sibling fds).
-    pub bind: Option<fn(port: u16) -> Result<(), ()>>,
+    /// native.
+    ///
+    /// `owner_worker == None` is the fanout case (`UdpSocket::bind`):
+    /// native opens NUM_THREADS SO_REUSEPORT siblings so the kernel
+    /// distributes inbound by 4-tuple hash across the per-worker
+    /// recv loops.
+    ///
+    /// `owner_worker == Some(w)` is the single-owner case
+    /// (`bind_ephemeral`, gateway / sidecar pattern): native opens
+    /// just one socket on worker `w`, no SO_REUSEPORT — every reply
+    /// lands on `w`'s kqueue, and the runtime's owner-aware
+    /// `deliver_udp` keeps the one-bound-socket invariant.
+    pub bind: Option<fn(port: u16, owner_worker: Option<u32>) -> Result<(), ()>>,
     /// Mirror of `bind` — called on port release to let the
     /// backend tear down per-bind state. Same optional-on-bare-
     /// metal rationale.
@@ -512,6 +523,10 @@ impl Drop for UdpSocket {
 
 impl UdpSocket {
     pub fn bind(port: u16) -> Result<UdpSocket, UdpBindError> {
+        Self::bind_with_owner(port, None)
+    }
+
+    fn bind_with_owner(port: u16, owner: Option<u32>) -> Result<UdpSocket, UdpBindError> {
         if port == 0 {
             return Err(UdpBindError::InvalidPort);
         }
@@ -535,9 +550,17 @@ impl UdpSocket {
                     }
                     inbox.reset();
                 }
+                // Pin owner BEFORE the backend bind: the backend may
+                // open its single socket on the owner's worker, and
+                // future replies will deliver into the owner's inbox
+                // before this fn returns.
+                state
+                    .owner_worker
+                    .store(owner.map_or(-1, |w| w as i32), Ordering::Release);
                 if let Some(bind) = udp_backend().and_then(|b| b.bind) {
-                    if bind(port).is_err() {
+                    if bind(port, owner).is_err() {
                         state.port.store(0, Ordering::Release);
+                        state.owner_worker.store(-1, Ordering::Release);
                         return Err(UdpBindError::BackendFailed);
                     }
                 }
@@ -567,20 +590,15 @@ impl UdpSocket {
     /// recv on a non-zero worker would hang.
     pub fn bind_ephemeral() -> Result<UdpSocket, UdpBindError> {
         const EPHEMERAL_BASE: u16 = 49152;
+        let me = CurrentWorker::enter().id();
         let start = EPHEMERAL_PORT_CURSOR
             .fetch_add(1, Ordering::Relaxed)
             % (u16::MAX as u32 - EPHEMERAL_BASE as u32 + 1);
         for offset in 0..(u16::MAX as u32 - EPHEMERAL_BASE as u32 + 1) {
             let port = EPHEMERAL_BASE
                 + ((start + offset) % (u16::MAX as u32 - EPHEMERAL_BASE as u32 + 1)) as u16;
-            match Self::bind(port) {
-                Ok(s) => {
-                    let me = CurrentWorker::enter().id();
-                    UDP_REGISTRY[s.idx]
-                        .owner_worker
-                        .store(me as i32, Ordering::Release);
-                    return Ok(s);
-                }
+            match Self::bind_with_owner(port, Some(me)) {
+                Ok(s) => return Ok(s),
                 Err(UdpBindError::PortInUse) => continue,
                 Err(e) => return Err(e),
             }

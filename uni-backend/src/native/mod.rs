@@ -615,7 +615,10 @@ fn drain_udp_sibling(fd: i32, binding_idx: usize) {
                      &mut src_addr, &mut addr_len)
         };
         if n <= 0 { break; }
-        let src_ip = src_addr.sin_addr.to_be_bytes();
+        // Mirror of `from_ne_bytes` in udp_send. sin_addr is stored
+        // in memory in network byte order; `to_ne_bytes` extracts
+        // those four bytes intact regardless of host endianness.
+        let src_ip = src_addr.sin_addr.to_ne_bytes();
         let src_port = u16::from_be(src_addr.sin_port);
         let payload = &buf[..n as usize];
         let _ = uni_runtime::net::deliver_udp(app_port, src_ip, src_port, payload);
@@ -1359,17 +1362,22 @@ static UDP_BINDINGS: UdpBindingsSlot =
     UdpBindingsSlot(UnsafeCell::new([const { None }; MAX_UDP_BINDINGS]));
 static UDP_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-/// Open one non-blocking SO_REUSEPORT-bound UDP sibling socket on
-/// `bind_port`. All siblings of a relay share the same port — kernel
-/// distributes incoming datagrams across them by 4-tuple hash.
-fn open_udp_sibling(bind_port: u16) -> i32 {
+/// Open one non-blocking UDP socket on `bind_port`. When
+/// `reuseport` is set the socket joins the SO_REUSEPORT group on
+/// that port (used for the fanout model, where N siblings share
+/// the port and the kernel distributes inbound by 4-tuple hash);
+/// otherwise it claims the port exclusively (used for
+/// `bind_ephemeral`, single-owner model).
+fn open_udp_sibling(bind_port: u16, reuseport: bool) -> i32 {
     unsafe {
         let fd = socket(AF_INET, SOCK_DGRAM, 0);
         if fd < 0 { return -1; }
 
         let opt: i32 = 1;
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, 4);
-        setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, 4);
+        if reuseport {
+            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, 4);
+            setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, 4);
+        }
 
         let addr = SockAddrIn {
             #[cfg(target_os = "macos")]
@@ -1397,8 +1405,16 @@ fn open_udp_sibling(bind_port: u16) -> i32 {
 /// Invoked when a `UdpSocket` is created; opens the SO_REUSEPORT
 /// siblings and routes inbound datagrams through the async
 /// reactor via `uni_runtime::net::deliver_udp`.
-fn udp_backend_bind(port: u16) -> Result<(), ()> {
-    open_udp_relay(port)
+///
+/// `owner_worker == None`: open NUM_THREADS SO_REUSEPORT siblings
+/// (the fanout / `UdpSocket::run` model — kernel distributes by
+/// 4-tuple hash across per-worker recv loops).
+///
+/// `owner_worker == Some(w)`: open exactly one socket on worker
+/// `w`'s kqueue, no SO_REUSEPORT (the `bind_ephemeral` /
+/// gateway-conn model — every reply lands on `w`).
+fn udp_backend_bind(port: u16, owner_worker: Option<u32>) -> Result<(), ()> {
+    open_udp_relay(port, owner_worker)
 }
 
 /// Hook registered with `register_backend_udp_unbind`. Mirrors
@@ -1433,10 +1449,19 @@ fn udp_backend_unbind(app_port: u16) {
 /// its worker's kqueue/epoll. Returns `Err(())` if the OS refused
 /// the first sibling bind — higher layers surface that as
 /// `UdpBindError::BackendFailed`.
-fn open_udp_relay(app_port: u16) -> Result<(), ()> {
+fn open_udp_relay(app_port: u16, owner_worker: Option<u32>) -> Result<(), ()> {
     unsafe {
-        let count = UDP_COUNT.load(Ordering::Acquire);
-        if count >= MAX_UDP_BINDINGS { return Err(()); }
+        // CAS-claim the next free slot. fetch_add lets two
+        // concurrent binds claim distinct slots without stepping
+        // on each other; the cap check fires after the bump so
+        // losing the race past MAX returns Err and yields the
+        // claimed-but-unused slot back as wasted (fine — these
+        // are rare lifecycle events).
+        let binding_idx = UDP_COUNT.fetch_add(1, Ordering::AcqRel);
+        if binding_idx >= MAX_UDP_BINDINGS {
+            UDP_COUNT.store(MAX_UDP_BINDINGS, Ordering::Release);
+            return Err(());
+        }
 
         // Per-port override keyed on the app's requested port:
         // `UNIKERNEL_UDP_<port>` swaps in a different host-bind
@@ -1444,38 +1469,70 @@ fn open_udp_relay(app_port: u16) -> Result<(), ()> {
         // shared base + offset remapping.
         let bind_port = read_port_env("UDP", app_port).unwrap_or(app_port);
 
-        // Open NUM_THREADS SO_REUSEPORT siblings so the kernel
-        // distributes incoming datagrams across the group by 4-tuple
-        // hash. Each worker thread owns sibling `i` and polls it
-        // inline via its own kqueue/epoll — no dedicated RX thread.
-        let want = NUM_THREADS.load(Ordering::Acquire).max(1);
         let mut fds = [-1i32; MAX_THREADS];
-        let mut got = 0usize;
-        for i in 0..want {
-            let fd = open_udp_sibling(bind_port);
-            if fd < 0 {
-                if i == 0 { return Err(()); }
-                break;
+        let (got, slot) = match owner_worker {
+            None => {
+                // Fanout model — open NUM_THREADS SO_REUSEPORT
+                // siblings so the kernel distributes inbound by
+                // 4-tuple hash across per-worker recv loops.
+                let want = NUM_THREADS.load(Ordering::Acquire).max(1);
+                let mut got = 0usize;
+                for i in 0..want {
+                    let fd = open_udp_sibling(bind_port, true);
+                    if fd < 0 {
+                        if i == 0 {
+                            // Return the claimed slot — leave the
+                            // entry at None.
+                            return Err(());
+                        }
+                        break;
+                    }
+                    fds[i] = fd;
+                    got += 1;
+                }
+                (got, 0usize)
             }
-            fds[i] = fd;
-            got += 1;
-        }
+            Some(w) => {
+                // Single-owner model — one socket on worker `w`'s
+                // kqueue, no SO_REUSEPORT. Every reply for this
+                // bind lands on the owning worker. The fd lives at
+                // `fds[0]` (not `fds[w]`) because `udp_send` falls
+                // back to `fds[0]` whenever `tid >= sibling_count`
+                // — and `sibling_count == 1` here, so all workers
+                // hit the fallback and need the fd in slot 0.
+                let w = w as usize;
+                if w >= MAX_THREADS { return Err(()); }
+                let fd = open_udp_sibling(bind_port, false);
+                if fd < 0 { return Err(()); }
+                fds[0] = fd;
+                (1usize, w)
+            }
+        };
 
-        let binding_idx = count;
         (*UDP_BINDINGS.0.get())[binding_idx] = Some(UdpBinding {
             fds,
             sibling_count: got,
             app_port,
         });
-        UDP_COUNT.store(binding_idx + 1, Ordering::Release);
 
-        // Register each sibling in its owning worker's event queue.
-        // `udp_bind` runs on the main thread before workers start,
-        // but each worker's kqueue/epoll fd is already live (set up
-        // in `init_native`), so we can push registrations from here.
+        // Register the fd(s) in the owning worker(s)' event queue.
+        // For fanout: each sibling `i` registers in worker `i`'s
+        // kqueue — only safe when binds run before workers start
+        // (boot-time `UdpSocket::bind`/`run` registrations).
+        // For single-owner: register on the owning worker's
+        // kqueue. The bind ran on that worker (it's the calling
+        // worker), so this is local-only mutation — no cross-
+        // thread race on the worker's own ThreadState.
         let threads = &mut *THREADS.0.get();
-        for worker_id in 0..got {
-            threads[worker_id].add_udp_sibling(fds[worker_id], binding_idx);
+        match owner_worker {
+            None => {
+                for worker_id in 0..got {
+                    threads[worker_id].add_udp_sibling(fds[worker_id], binding_idx);
+                }
+            }
+            Some(_) => {
+                threads[slot].add_udp_sibling(fds[0], binding_idx);
+            }
         }
         Ok(())
     }
@@ -1518,7 +1575,14 @@ fn udp_send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
             #[cfg(target_os = "linux")]
             sin_family: AF_INET as u16,
             sin_port: dst_port.to_be(),
-            sin_addr: u32::from_be_bytes(dst_ip),
+            // sin_addr is stored in network byte order in memory.
+            // `from_ne_bytes(dst_ip)` produces a u32 whose memory
+            // representation matches `dst_ip` byte-for-byte on any
+            // host endianness — i.e., bytes 7F 00 00 01 for
+            // 127.0.0.1. Using `from_be_bytes` here would write
+            // 01 00 00 7F on LE hosts and silently send to
+            // 1.0.0.127 instead.
+            sin_addr: u32::from_ne_bytes(dst_ip),
             sin_zero: [0; 8],
         };
 
