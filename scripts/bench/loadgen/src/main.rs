@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 
+mod gateway;
 mod tcp_echo;
 mod tls_handshake;
 
@@ -62,6 +63,41 @@ enum Workload {
         #[arg(long, default_value = "64")]
         msg_size: usize,
     },
+    /// API-gateway / sidecar ping-pong: drives the unikernel's
+    /// `GATEWAY_PORT` listener, which on each request forwards a
+    /// payload to a UDP backend, awaits the reply, and returns it.
+    /// We host the backend in this same loadgen process (a tokio
+    /// UDP echo task on `backend_port`) so a single binary owns
+    /// both the load and the downstream service. The unikernel
+    /// reaches us via `Net::gateway()` (DHCP-discovered host IP),
+    /// or via 127.0.0.1 in the native build. This is the workload
+    /// where async + a syscall-free datapath compound: every
+    /// in-flight request is parked on a UDP recv waker, each conn
+    /// does ~4 packet round-trips through the stack, and a Linux+
+    /// Tokio equivalent (which the native backend approximates)
+    /// pays ~5 syscalls per request just to push bytes.
+    Gateway {
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        port: u16,
+        /// Where the loadgen's UDP echo backend listens. The
+        /// unikernel sends datagrams here and awaits the reply.
+        #[arg(long, default_value = "7777")]
+        backend_port: u16,
+        #[arg(long, default_value = "5")]
+        duration_secs: u64,
+        /// Concurrent TCP keep-alive connections driving the
+        /// unikernel. Each conn does a tight ping-pong loop;
+        /// every request transitions through the unikernel's
+        /// async runtime + UDP backend hop.
+        #[arg(long, default_value = "64")]
+        connections: usize,
+        /// Wire payload size per request. Must match the
+        /// unikernel's `GATEWAY_MSG_SIZE`.
+        #[arg(long, default_value = "32")]
+        msg_size: usize,
+    },
 }
 
 fn main() -> std::io::Result<()> {
@@ -91,6 +127,16 @@ fn main() -> std::io::Result<()> {
         } => runtime.block_on(tcp_echo::run(
             &host,
             port,
+            Duration::from_secs(duration_secs),
+            connections,
+            msg_size,
+        )),
+        Workload::Gateway {
+            host, port, backend_port, duration_secs, connections, msg_size,
+        } => runtime.block_on(gateway::run(
+            &host,
+            port,
+            backend_port,
             Duration::from_secs(duration_secs),
             connections,
             msg_size,

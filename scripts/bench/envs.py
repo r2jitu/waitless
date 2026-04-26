@@ -36,6 +36,7 @@ class QemuEnv:
     tls_port_offset = 1000   # host TLS port = guest HTTP port + 1000
     udp_port_offset = 1
     tcp_echo_offset = 2
+    gateway_offset = 3       # host gateway port (guest:9000)
 
     def build(self):
         subprocess.run(
@@ -61,11 +62,13 @@ class QemuEnv:
             dev += f",mq=on,vectors={2*cpus+2}"
         tls_port = port + self.tls_port_offset
         tcp_echo_port = port + self.tcp_echo_offset
+        gateway_port = port + self.gateway_offset
         cmd += ["-device", f"{dev},netdev=net0",
                 "-netdev",
                 (f"user,id=net0,hostfwd=tcp::{port}-:80,"
                  f"hostfwd=tcp::{tls_port}-:443,"
                  f"hostfwd=tcp::{tcp_echo_port}-:9,"
+                 f"hostfwd=tcp::{gateway_port}-:9000,"
                  f"hostfwd=udp::{port+1}-:7"),
                 "-kernel", elf]
         return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -92,6 +95,7 @@ class KvmEnv:
     GUEST_TLS_PORT = 443
     GUEST_UDP_PORT = 7
     GUEST_TCP_ECHO_PORT = 9
+    GUEST_GATEWAY_PORT = 9000
 
     # Path to pre-staged ELF; set via --elf. If None, bazel build runs.
     elf_override = None
@@ -170,6 +174,7 @@ class QemuAarch64Env:
     tls_port_offset = 1000   # host TLS port = guest HTTP port + 1000
     udp_port_offset = 1
     tcp_echo_offset = 2
+    gateway_offset = 3
 
     def build(self):
         subprocess.run(
@@ -181,6 +186,7 @@ class QemuAarch64Env:
                            "bazel-bin/apps/webserver/webserver_qemu_aarch64.img")
         tls_port = port + self.tls_port_offset
         tcp_echo_port = port + self.tcp_echo_offset
+        gateway_port = port + self.gateway_offset
         cmd = ["qemu-system-aarch64", "-machine", "virt", "-cpu", "max",
                "-m", "128", "-smp", str(cpus), "-nographic",
                "-serial", f"file:/tmp/bench_{port}.log", "-no-reboot",
@@ -189,6 +195,7 @@ class QemuAarch64Env:
                (f"user,id=net0,hostfwd=tcp::{port}-:80,"
                 f"hostfwd=tcp::{tls_port}-:443,"
                 f"hostfwd=tcp::{tcp_echo_port}-:9,"
+                f"hostfwd=tcp::{gateway_port}-:9000,"
                 f"hostfwd=udp::{port+1}-:7"),
                "-kernel", img]
         return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -251,6 +258,7 @@ class NativeEnv:
     tls_port_offset = 1000
     udp_port_offset = 1      # host UDP port = guest HTTP port + 1
     tcp_echo_offset = 2      # async TCP echo port (guest:9)
+    gateway_offset = 3       # async gateway port (guest:9000)
 
     # Path to pre-staged native binary; set via --native-bin. If None, bazel build runs.
     bin_override = None
@@ -275,6 +283,7 @@ class NativeEnv:
         # Async TCP echo benches target guest port 9 via the
         # `tcp_echo_offset` offset below.
         env["UNIKERNEL_TCP_9"] = str(port + NativeEnv.tcp_echo_offset)
+        env["UNIKERNEL_TCP_9000"] = str(port + NativeEnv.gateway_offset)
         env["UNIKERNEL_CPUS"] = str(cpus)
         return subprocess.Popen(
             [bin_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
@@ -294,6 +303,7 @@ class HvfEnv:
     udp_port_offset = 10000  # host UDP port = guest port + 10000
     tls_port_offset = 1000   # host TLS port = guest HTTP port + 1000
     tcp_echo_offset = 2000   # host TCP echo port (guest:9)
+    gateway_offset = 3000    # host gateway port (guest:9000)
 
     def build(self):
         # `:webserver_hvf` bundles both the transitioned aarch64
@@ -316,15 +326,18 @@ class HvfEnv:
         udp_port = port + self.udp_port_offset
         tls_port = port + self.tls_port_offset
         tcp_echo_port = port + self.tcp_echo_offset
+        gateway_port = port + self.gateway_offset
         # -p tcp:HOST:GUEST forwards HTTP to guest:80; -p tcp:HOST:443
         # forwards HTTPS to guest:443; -p tcp:HOST:9 forwards the
-        # async TCP echo test; -p udp:HOST:GUEST forwards UDP echo.
+        # async TCP echo test; -p tcp:HOST:9000 forwards the
+        # gateway listener; -p udp:HOST:GUEST forwards UDP echo.
         return subprocess.Popen(
             [run_hvf, img,
              "--ram=128", f"--cpus={cpus}",
              "-p", f"tcp:{port}:80",
              "-p", f"tcp:{tls_port}:443",
              "-p", f"tcp:{tcp_echo_port}:9",
+             "-p", f"tcp:{gateway_port}:9000",
              "-p", f"udp:{udp_port}:7"],
             stdin=subprocess.DEVNULL, stdout=log, stderr=log)
 
@@ -367,6 +380,7 @@ class RemoteEnv:
     GUEST_TLS_PORT = 443
     GUEST_UDP_PORT = 7
     GUEST_TCP_ECHO_PORT = 9
+    GUEST_GATEWAY_PORT = 9000
 
     def __init__(self):
         # Non-None sentinel so `_current["proc"]` cleanup logic treats

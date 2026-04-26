@@ -421,6 +421,32 @@ def run_loadgen_tcp_echo(port, conns, duration, host="127.0.0.1", msg_size=64):
         return 0.0, "TIMEOUT", "TIMEOUT"
 
 
+def run_loadgen_gateway(port, backend_port, conns, duration, host="127.0.0.1",
+                        msg_size=32):
+    """Run the Rust loadgen `gateway` workload. Hosts a UDP echo
+    backend on `backend_port` (loadgen's own tokio task), then drives
+    the unikernel's gateway listener at `host:port` with `conns`
+    keep-alive TCP connections, each looping ping → forward → pong.
+    Returns `(rps, p50_us, p99_us)`."""
+    bin_path = _loadgen_bin()
+    if bin_path is None:
+        return 0.0, "NO_LOADGEN", "NO_LOADGEN"
+    try:
+        r = subprocess.run(
+            [bin_path, "gateway",
+             "--host", host, "--port", str(port),
+             "--backend-port", str(backend_port),
+             "--duration-secs", str(duration),
+             "--connections", str(conns),
+             "--msg-size", str(msg_size)],
+            capture_output=True, text=True, timeout=duration + 30)
+        if r.returncode != 0:
+            return 0.0, "ERROR", "ERROR"
+        return _parse_loadgen_output(r.stdout)
+    except (subprocess.TimeoutExpired, OSError):
+        return 0.0, "TIMEOUT", "TIMEOUT"
+
+
 def _udp_bench_bin():
     """Return the path to the compiled udp_bench binary, building if needed.
 

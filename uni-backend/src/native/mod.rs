@@ -1333,7 +1333,7 @@ fn tcp_register_shared_listener() {
 // UDP support
 // ============================================================================
 
-const MAX_UDP_BINDINGS: usize = 8;
+const MAX_UDP_BINDINGS: usize = 64;
 
 /// One UDP relay. Holds `NUM_THREADS` SO_REUSEPORT sibling sockets all
 /// bound to the same host port. Incoming datagrams are distributed

@@ -78,6 +78,7 @@ from .envs import (
 from .workloads import (
     _udp_with_retry,
     next_port,
+    run_loadgen_gateway,
     run_loadgen_tcp_echo,
     run_loadgen_tls_handshake,
     run_wrk,
@@ -192,6 +193,26 @@ WORKLOADS = [
     {"name": "tcp_echo_max", "type": "tcp_echo",
      "conns_per_core": 16,
      "desc": "Async TCP echo throughput (16 conn × cpus)"},
+
+    # ── Async gateway / sidecar fan-out (guest:9000) ─────────────────
+    #
+    # The realistic microservice workload: every accepted TCP request
+    # at the unikernel fans out to a UDP backend (tokio-hosted by the
+    # same loadgen process), awaits the reply, returns it. Each
+    # in-flight conn parks its handler future on the backend's UDP
+    # recv waker — this is where async + the syscall-free datapath
+    # compound. Sync runtimes can't service 64+ concurrent in-flight
+    # forwards per worker without OS threads; native (Linux+Tokio
+    # equivalent) pays ~5 syscalls per request just to push bytes.
+    #
+    # `conns_per_core: 16` keeps total in-flight forwards under
+    # `MAX_UDP_SOCKETS = 128` and well inside the kernel heap budget
+    # (each ephemeral UDP socket retains its per-worker inbox across
+    # the run; at ~192 KB / inbox / worker, 16 × N_workers stays
+    # under a few MB total).
+    {"name": "gateway_max", "type": "gateway",
+     "conns_per_core": 4,
+     "desc": "Gateway fan-out (TCP→UDP backend→TCP, 4 conn × cpus)"},
 ]
 
 
@@ -366,6 +387,8 @@ def main():
                     udp_target_port = env.GUEST_UDP_PORT
                     tcp_echo_target_port = getattr(
                         env, "GUEST_TCP_ECHO_PORT", None)
+                    gateway_target_port = getattr(
+                        env, "GUEST_GATEWAY_PORT", None)
                 else:
                     wrk_host = "localhost"
                     wrk_port = bench_port
@@ -376,6 +399,9 @@ def main():
                     tcp_echo_off = getattr(env, 'tcp_echo_offset', None)
                     tcp_echo_target_port = (
                         bench_port + tcp_echo_off if tcp_echo_off else None)
+                    gateway_off = getattr(env, 'gateway_offset', None)
+                    gateway_target_port = (
+                        bench_port + gateway_off if gateway_off else None)
 
                 # Workloads that scale with cpu count compute their final
                 # conn / thread / sender counts here. Static workloads keep
@@ -483,6 +509,27 @@ def main():
                     results[(env_name, cpus, wname)] = (rps, p50, p99)
                     client_cpu[(env_name, cpus, wname)] = m["cores"]
                     print(f"    {wname:<20s} {rps:>10.0f} msg/s  "
+                          f"p50={p50}  p99={p99}  {_cpu_tag(m['cores'])}")
+                elif w["type"] == "gateway":
+                    if gateway_target_port is None:
+                        print(f"    {wname:<20s} SKIP (env has no gateway port)")
+                        continue
+                    time.sleep(0.5)
+                    # Backend port is the unikernel-side hard-coded
+                    # `GATEWAY_BACKEND_PORT`. Loadgen hosts the echo
+                    # task on this port so the unikernel can fan out
+                    # to it directly (under QEMU NAT / HVF user
+                    # networking, the host is reachable via the
+                    # gateway IP DHCP gives us).
+                    backend_port = 7777
+                    msg_size = w.get("msg_size", 32)
+                    with measure_client_cpu() as m:
+                        rps, p50, p99 = run_loadgen_gateway(
+                            gateway_target_port, backend_port, conns,
+                            duration, host=wrk_host, msg_size=msg_size)
+                    results[(env_name, cpus, wname)] = (rps, p50, p99)
+                    client_cpu[(env_name, cpus, wname)] = m["cores"]
+                    print(f"    {wname:<20s} {rps:>10.0f} req/s  "
                           f"p50={p50}  p99={p99}  {_cpu_tag(m['cores'])}")
 
                 env.stop(proc)

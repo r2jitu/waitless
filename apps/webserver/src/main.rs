@@ -31,6 +31,26 @@ const HTTP_PORT: u16 = 80;
 /// 8080 → :80 and 8443 → :443).
 const HTTPS_PORT: u16 = 443;
 
+/// "Gateway" / sidecar pattern listener: accept TCP, on each request
+/// fan out to a UDP backend, await the reply, return it. Demonstrates
+/// the async-runtime + datapath win on the request shape that
+/// dominates real microservice deployments (BFFs, API gateways).
+/// `gateway_max` in the bench harness drives this.
+const GATEWAY_PORT: u16 = 9000;
+
+/// Where the gateway forwards UDP datagrams. Loadgen runs an echo
+/// server on this port on the same host the unikernel virtualises
+/// under (or `127.0.0.1` for native). The address is resolved at
+/// boot from `Net::gateway()` (DHCP-discovered host IP under HVF /
+/// QEMU NAT) and combined with this fixed port.
+const GATEWAY_BACKEND_PORT: u16 = 7777;
+
+/// Wire payload size. Loadgen sends and receives this many bytes per
+/// request; the unikernel forwards the same byte-for-byte. Sized to
+/// match an L1-fitting cache line round-trip while still triggering
+/// real packet send/recv cycles.
+const GATEWAY_MSG_SIZE: usize = 32;
+
 /// Holds the long-lived state of the webserver program.
 ///
 /// Dropping `WebServerApp` drops every listener handle (each
@@ -42,6 +62,7 @@ struct WebServerApp {
     _https: Option<uni::runtime::TcpHandle>,
     _udp_echo: Option<uni::runtime::UdpHandle>,
     _tcp_echo: Option<uni::runtime::TcpHandle>,
+    _gateway: Option<uni::runtime::TcpHandle>,
     _net: Net,
 }
 
@@ -106,6 +127,66 @@ impl WebServerApp {
             }
         };
 
+        // Gateway listener — the `gateway_max` workload's server
+        // side. Each accepted TCP conn binds its own ephemeral
+        // UDP socket once (reused across every request on the
+        // conn) and loops:
+        //   tcp_recv → udp_send_to(backend) → udp_recv → tcp_send.
+        //
+        // Both `udp_recv` and `tcp_recv` park the conn's task on
+        // the runtime's per-worker reactor — under high concurrency
+        // (~64 conns / core) the worker juggles dozens of in-flight
+        // forwards instead of stalling on each. That fan-out is the
+        // exact pattern API gateways / sidecars run in production,
+        // and it's the workload where async + a syscall-free
+        // datapath compound: every Linux equivalent pays >5 syscalls
+        // per request just to get bytes through the kernel TCP +
+        // UDP stacks.
+        let backend_ip = net.gateway().0;
+        let gateway = match uni::runtime::TcpListener::bind(GATEWAY_PORT) {
+            Ok(listener) => {
+                let h = listener.run(move |stream| async move {
+                    let udp = match uni::runtime::UdpSocket::bind_ephemeral() {
+                        Ok(s) => s,
+                        Err(_) => return,
+                    };
+                    let mut buf = [0u8; GATEWAY_MSG_SIZE];
+                    loop {
+                        // Drain exactly one full request from the
+                        // peer. Loadgen sends fixed-size pings, so
+                        // a partial recv only happens at conn close.
+                        let mut got = 0;
+                        while got < GATEWAY_MSG_SIZE {
+                            let n = stream.recv(&mut buf[got..]).await;
+                            if n == 0 {
+                                return;
+                            }
+                            got += n;
+                        }
+                        if udp
+                            .send_to(backend_ip, GATEWAY_BACKEND_PORT, &buf)
+                            .is_err()
+                        {
+                            return;
+                        }
+                        let (_, _, n) = udp.recv_from(&mut buf).await;
+                        if n != GATEWAY_MSG_SIZE {
+                            return;
+                        }
+                        if stream.send(&buf).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+                uni::log(b"Gateway listener on port 9000 (async fan-out to UDP backend)\n");
+                Some(h)
+            }
+            Err(_) => {
+                uni::log(b"Gateway: bind FAILED\n");
+                None
+            }
+        };
+
         let http = match uni_http::listen(http_port, handle_request) {
             Ok(h) => Some(h),
             Err(_) => {
@@ -139,6 +220,7 @@ impl WebServerApp {
             _https: https,
             _udp_echo: udp_echo,
             _tcp_echo: tcp_echo,
+            _gateway: gateway,
             _net: net,
         }
     }

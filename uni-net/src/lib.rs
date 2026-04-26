@@ -153,6 +153,24 @@ impl Net {
             Ipv4Addr::UNSPECIFIED
         }
     }
+
+    /// Default gateway (next hop for off-subnet packets) the stack
+    /// learned at bring-up. Useful for apps that need to reach
+    /// services running on the host the unikernel is virtualised
+    /// under — DHCP / static config both publish this. On native
+    /// we return loopback since the equivalent "host" of a unikernel
+    /// is the same machine running the binary.
+    pub fn gateway(&self) -> Ipv4Addr {
+        #[cfg(target_os = "none")]
+        {
+            let o = crate::types::CONFIG.gateway().octets();
+            Ipv4Addr(o)
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            Ipv4Addr::new(127, 0, 0, 1)
+        }
+    }
 }
 
 /// Whether the stack is currently enabled (the slot holds a `Box<Net>`).

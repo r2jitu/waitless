@@ -54,7 +54,7 @@ use uni_worker::{CurrentWorker, PerWorker, num_workers};
 
 // ---- Sizing -----------------------------------------------------------------
 
-pub const MAX_UDP_SOCKETS: usize = 8;
+pub const MAX_UDP_SOCKETS: usize = 128;
 /// Per-worker inbox depth. The hot path (same-core producer + same-
 /// core consumer) drains one entry per task poll, so this is purely
 /// burst tolerance for when delivery outpaces task scheduling (NIC
@@ -366,6 +366,22 @@ impl WorkerInbox {
 struct UdpState {
     port: AtomicU16,
     inboxes: PerWorker<WorkerInbox>,
+    /// Sticky owner-worker for "single-owner" bind patterns
+    /// (`bind_ephemeral` and friends used by gateway-style fan-out
+    /// where one TCP conn owns one UDP socket).
+    ///
+    /// `-1` means no owner — delivery routes to the receiving
+    /// worker's inbox, which fits the multi-`run` fan-out pattern
+    /// where every worker has its own recv loop on the same port.
+    /// `>=0` pins delivery to that worker's inbox regardless of
+    /// which core observed the packet, which is the correct route
+    /// when only one task on one worker is polling.
+    ///
+    /// Under Tier 2 (single NIC RX queue, multi-core), all
+    /// inbound UDP arrives on core 0; without this, packets for a
+    /// socket bound on worker N would silently land in core 0's
+    /// inbox and the recv on N would wait forever.
+    owner_worker: core::sync::atomic::AtomicI32,
 }
 
 impl UdpState {
@@ -373,12 +389,18 @@ impl UdpState {
         UdpState {
             port: AtomicU16::new(0),
             inboxes: PerWorker::new(),
+            owner_worker: core::sync::atomic::AtomicI32::new(-1),
         }
     }
 }
 
 static UDP_REGISTRY: [UdpState; MAX_UDP_SOCKETS] =
     [const { UdpState::new() }; MAX_UDP_SOCKETS];
+
+/// Rotating cursor for `UdpSocket::bind_ephemeral`. Wraps naturally;
+/// the modulo in the bind path keeps it inside the ephemeral range.
+static EPHEMERAL_PORT_CURSOR: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
 
 // ---- Backend vtable (UDP) ---------------------------------------------------
 
@@ -473,6 +495,12 @@ impl Drop for UdpSocket {
         // unbind hook closes POSIX fds, which is much slower and
         // doesn't need to happen before the slot is reusable.
         UDP_REGISTRY[self.idx].port.store(0, Ordering::Release);
+        // Clear any sticky owner-worker so a future plain `bind`
+        // that lands on this slot doesn't inherit single-owner
+        // routing from the previous occupant.
+        UDP_REGISTRY[self.idx]
+            .owner_worker
+            .store(-1, Ordering::Release);
         if let Some(unbind) = udp_backend().and_then(|b| b.unbind) {
             unbind(self.port);
         }
@@ -518,6 +546,43 @@ impl UdpSocket {
                     idx,
                     released: AtomicBool::new(false),
                 });
+            }
+        }
+        Err(UdpBindError::AllSlotsBusy)
+    }
+
+    /// Bind to any unused port in the IANA ephemeral range
+    /// (49152-65535) and pin delivery to the calling worker.
+    /// Walks sequentially from a per-process rotating cursor so a
+    /// quick bind / drop / bind loop on the same worker doesn't
+    /// always retry the same just-released port (which can stay
+    /// tied up by the backend's recent state for a moment).
+    ///
+    /// Pins the socket's owner-worker so inbound packets are
+    /// routed to *this* worker's inbox no matter which core saw
+    /// them on the wire. That's the correct routing for the
+    /// gateway / sidecar pattern (TCP conn ↔ one UDP socket on
+    /// one worker); without it, Tier 2 (single NIC RX queue,
+    /// multi-core) would deliver every reply to core 0 and the
+    /// recv on a non-zero worker would hang.
+    pub fn bind_ephemeral() -> Result<UdpSocket, UdpBindError> {
+        const EPHEMERAL_BASE: u16 = 49152;
+        let start = EPHEMERAL_PORT_CURSOR
+            .fetch_add(1, Ordering::Relaxed)
+            % (u16::MAX as u32 - EPHEMERAL_BASE as u32 + 1);
+        for offset in 0..(u16::MAX as u32 - EPHEMERAL_BASE as u32 + 1) {
+            let port = EPHEMERAL_BASE
+                + ((start + offset) % (u16::MAX as u32 - EPHEMERAL_BASE as u32 + 1)) as u16;
+            match Self::bind(port) {
+                Ok(s) => {
+                    let me = CurrentWorker::enter().id();
+                    UDP_REGISTRY[s.idx]
+                        .owner_worker
+                        .store(me as i32, Ordering::Release);
+                    return Ok(s);
+                }
+                Err(UdpBindError::PortInUse) => continue,
+                Err(e) => return Err(e),
             }
         }
         Err(UdpBindError::AllSlotsBusy)
@@ -725,15 +790,31 @@ impl<'a> Future for UdpRecv<'a> {
 
 // ---- Backend entry point ----------------------------------------------------
 
-/// Deliver one inbound UDP datagram on the **calling worker**'s
-/// view of whichever `UdpSocket` is bound to `dst_port`. Must be
-/// called from the network RX path on the core that received the
-/// packet. Returns `true` if a socket was found.
+/// Deliver one inbound UDP datagram. Must be called from the
+/// network RX path on the core that observed the packet. Returns
+/// `true` if a socket was found.
+///
+/// Two routing modes:
+///   * `owner_worker == -1` (default `bind`): drop into the
+///     **receiving** worker's inbox. This is the multi-`run`
+///     fan-out shape: each worker has its own recv loop and the
+///     NIC's flow hash already steered the packet here.
+///   * `owner_worker >= 0` (`bind_ephemeral`): drop into the
+///     **owning** worker's inbox regardless of which core received
+///     the packet. This is the gateway / sidecar shape — one TCP
+///     conn owns one UDP socket on one worker, and under Tier 2
+///     (single NIC RX queue, multi-core) every reply lands on
+///     core 0 yet the recv waits on the conn's worker.
 pub fn deliver_udp(dst_port: u16, src_ip: [u8; 4], src_port: u16, payload: &[u8]) -> bool {
     let cc = CurrentWorker::enter();
     for state in UDP_REGISTRY.iter() {
         if state.port.load(Ordering::Acquire) == dst_port {
-            let inbox = state.inboxes.current(&cc);
+            let owner = state.owner_worker.load(Ordering::Acquire);
+            let inbox = if owner >= 0 {
+                state.inboxes.at(owner as u32)
+            } else {
+                state.inboxes.current(&cc)
+            };
             let _ = inbox.try_push(src_ip, src_port, payload);
             inbox.wake_if_parked();
             return true;
