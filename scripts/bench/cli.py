@@ -205,14 +205,16 @@ WORKLOADS = [
     # forwards per worker without OS threads; native (Linux+Tokio
     # equivalent) pays ~5 syscalls per request just to push bytes.
     #
-    # `conns_per_core: 16` keeps total in-flight forwards under
-    # `MAX_UDP_SOCKETS = 128` and well inside the kernel heap budget
-    # (each ephemeral UDP socket retains its per-worker inbox across
-    # the run; at ~192 KB / inbox / worker, 16 × N_workers stays
-    # under a few MB total).
+    # `conns_per_core: 64` is high enough to expose the runner's
+    # throughput ceiling rather than per-conn round-trip latency
+    # (at low conn counts the 8-conn pipeline serialises and HVF
+    # looks much worse than its actual ceiling — see commit
+    # message of the heap+inbox bump for the analysis). Heap
+    # budget at 64 × 3-vcpu × 64-slot inbox × 1508 B ≈ 18 MB,
+    # well inside the kernel's 96 MB heap.
     {"name": "gateway_max", "type": "gateway",
-     "conns_per_core": 4,
-     "desc": "Gateway fan-out (TCP→UDP backend→TCP, 4 conn × cpus)"},
+     "conns_per_core": 64,
+     "desc": "Gateway fan-out (TCP→UDP backend→TCP, 64 conn × cpus)"},
 ]
 
 

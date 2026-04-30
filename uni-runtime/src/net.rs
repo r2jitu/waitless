@@ -54,21 +54,28 @@ use uni_worker::{CurrentWorker, PerWorker, num_workers};
 
 // ---- Sizing -----------------------------------------------------------------
 
-pub const MAX_UDP_SOCKETS: usize = 128;
+pub const MAX_UDP_SOCKETS: usize = 256;
 /// Per-worker inbox depth. The hot path (same-core producer + same-
 /// core consumer) drains one entry per task poll, so this is purely
 /// burst tolerance for when delivery outpaces task scheduling (NIC
 /// RX interrupt coalescing, slow handler work, cross-core delivery
 /// on Tier 2).
 ///
-/// Sized for the udp_peak workload: at ~700k pps per core (the
-/// pre-async-refactor ceiling we want to recover) a single drain
-/// cycle has ~1 µs slack per packet. The original 16 slots = 22 µs
-/// of tolerance before try_push starts dropping; with NIC poll
-/// batches that regularly land 32+ packets per IRQ, we were
-/// dropping mid-batch and bottlenecking on packet loss instead of
-/// CPU. 128 slots gives the receiver task time to advance the head
-/// pointer without the producer wrapping.
+/// History: 16 → 128 → 64. The original 16 was tuned for low-pps
+/// workloads; 128 was bumped for udp_peak's ~700k pps headroom
+/// (NIC poll batches of 32+ packets per IRQ + slow drain → mid-
+/// batch drops at 16 slots, ~22 µs of tolerance). The current 64
+/// gives ~88 µs burst tolerance — empirical udp_peak rates match
+/// the 128-slot peak — while letting `gateway_max` scale to 64
+/// conns/core without overwhelming the kernel heap. With the
+/// 96 MB heap, even higher inbox sizes are affordable; this is
+/// the sweet spot where udp_peak is unaffected and per-conn
+/// memory stays under 100 KB.
+///
+/// At gateway_max's headline shape (64 conns × 3 workers, each
+/// conn binding one ephemeral UDP socket), heap cost is `64 × 3
+/// × 64 × 1508 ≈ 18 MB`. The 96 MB heap (see kernel/src/mm.rs)
+/// covers this with plenty of margin for the rest of the runtime.
 ///
 /// Storage is **heap-allocated** lazily on `bind()` (see the
 /// `slots` field of `WorkerInbox`) rather than living in static BSS.
@@ -78,11 +85,7 @@ pub const MAX_UDP_SOCKETS: usize = 128;
 /// x86 deploy path because the sectional layout is different.
 /// Keeping the buffer off-BSS sidesteps that limit entirely (and
 /// also means apps that never bind a UDP socket pay zero RAM).
-///
-/// At full saturation (8 sockets × 8 workers, all bound) the heap
-/// cost is `8 × 8 × 128 × 1500 ≈ 12 MB`. The webserver app binds
-/// one UDP socket on one worker thread → ~196 KB total.
-const INBOX_CAPACITY: usize = 128;
+const INBOX_CAPACITY: usize = 64;
 const MAX_PAYLOAD: usize = 1500;
 
 // ---- SpinLock (waker cell) --------------------------------------------------
