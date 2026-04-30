@@ -16,39 +16,13 @@
 #[cfg(target_arch = "aarch64")]
 mod aarch64 {
     use core::arch::asm;
-    use core::cell::UnsafeCell;
+
+    use crate::mm;
 
     // L1 page table set up by boot.S — in .boot_bss, not zeroed by BSS clear.
     unsafe extern "C" {
         static mut boot_l1_table: [u64; 512];
     }
-
-    // Pool of L2 tables in .boot_bss (survive BSS zero, pre-MMU-enable).
-    // Each L2 table = 4KB = 512 entries, each covering 2MB.
-    // 4 tables supports 4 separate 1GB regions (ECAM + a few BAR regions).
-    const MAX_L2_TABLES: usize = 4;
-
-    // L2 tables must be in .boot_bss (not .bss) because boot.S zeros .bss
-    // AFTER enabling the MMU using boot_l1_table. If L2 tables were in .bss,
-    // they'd be zeroed while the MMU is live, causing page faults.
-    //
-    // Pool + cursor live in one UnsafeCell-wrapped struct.
-    // Single-owner discipline: `map_device_range` only runs from the BSP
-    // during boot before APs are started.
-    struct L2Pool {
-        tables: [[u64; 512]; MAX_L2_TABLES],
-        next: usize,
-    }
-
-    struct L2PoolSlot(UnsafeCell<L2Pool>);
-    // SAFETY: all mutation is single-threaded on the BSP during boot.
-    unsafe impl Sync for L2PoolSlot {}
-
-    #[unsafe(link_section = ".boot_bss")]
-    static L2_POOL: L2PoolSlot = L2PoolSlot(UnsafeCell::new(L2Pool {
-        tables: [[0; 512]; MAX_L2_TABLES],
-        next: 0,
-    }));
 
     // Descriptor bits (same as boot.S):
     //   L1 table entry:  [addr of L2 table | 0x3] (bits[1:0] = 0b11 = table)
@@ -96,13 +70,18 @@ mod aarch64 {
                 // Already a table descriptor — reuse the L2 table
                 l2 = (l1_entry & !0xFFF_u64) as *mut u64;
             } else {
-                // Need a new L2 table
-                let pool = &mut *L2_POOL.0.get();
-                if pool.next >= MAX_L2_TABLES {
-                    return; // out of L2 tables
+                // Allocate a fresh 4 KB-aligned L2 table from the heap.
+                // `map_device_range` only runs after `mm::init` has set
+                // up the talc heap, so this is safe; on aarch64 phys ==
+                // virt (identity-mapped), so the returned address works
+                // both as the descriptor target and as a writable pointer.
+                let l2_phys = mm::alloc_pages(1);
+                if l2_phys == 0 {
+                    return; // heap exhausted
                 }
-                l2 = pool.tables[pool.next].as_mut_ptr();
-                pool.next += 1;
+                l2 = l2_phys as *mut u64;
+                // alloc_pages does not zero — clear the table before use.
+                core::ptr::write_bytes(l2, 0, 512);
 
                 // If there was a block descriptor, preserve it by filling
                 // the L2 table with equivalent 2MB blocks
