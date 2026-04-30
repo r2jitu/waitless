@@ -13,7 +13,7 @@ use crate::pci::{
 };
 #[cfg(target_arch = "aarch64")]
 use crate::map_device_range;
-use uni_kernel::mm::{alloc_frame, phys_to_virt};
+use uni_kernel::mm::{alloc_pages, phys_to_virt};
 
 // ============================================================================
 // VirtIO PCI transport (modern, VirtIO 1.0+)
@@ -521,11 +521,15 @@ impl Virtqueue {
         let total_size = first_region + second_region;
         let num_frames = (total_size + 4095) / 4096;
 
-        let phys_base = alloc_frame();
+        // Single contiguous allocation. The pre-talc frame
+        // allocator scanned its bitmap and effectively handed out
+        // sequential pages from N back-to-back `alloc_frame` calls,
+        // but the heap-backed `alloc_frame` makes no such promise —
+        // virtio's `used` ring lives at `phys_base + first_region`,
+        // so a non-contiguous second allocation would corrupt
+        // unrelated heap memory on every device DMA.
+        let phys_base = alloc_pages(num_frames as usize);
         if phys_base == 0 { return None; }
-        for _ in 1..num_frames {
-            alloc_frame();
-        }
 
         let base_ptr = phys_to_virt(phys_base);
         unsafe { ptr::write_bytes(base_ptr, 0, total_size as usize); }

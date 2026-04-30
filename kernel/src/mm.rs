@@ -1,16 +1,33 @@
-// Memory management: frame bitmap + talc-backed heap.
+// Memory management: single talc-backed allocator.
 //
-// Frame bitmap: bit per 4 KB page (1 = used). Placed immediately after
-// `_kernel_end`, or in the largest available region for Limine
-// higher-half boot.
+// All dynamic memory comes from one `talc` (segregated-free-list)
+// heap behind a `Spinlock`. At boot, every `MEM_AVAILABLE` region
+// from the boot memory map is claimed into the heap, with the
+// kernel image's range punched out so we don't hand the loader's
+// own pages to allocators.
 //
-// Heap: `talc` (segregated-free-list) behind a `Spinlock`, claimed
-// from whatever's left in the chosen memory region after the bitmap
-// and `FRAME_RESERVE`. Dynamically sized at boot — a 128 MB VM
-// gets a ~108 MB heap, a 4 GB instance gets ~3.97 GB.
+// `alloc_frame` and `alloc_pages` (used by drivers for DMA buffers
+// + virtio rings, and by the SMP layer for AP stacks) are thin
+// page-aligned wrappers over the heap — they request a
+// `Layout::from_size_align(N × PAGE_SIZE, PAGE_SIZE)`, then return
+// the corresponding physical address via `virt_to_phys`. They
+// never free; their consumers are once-at-boot allocations that
+// live for the program's lifetime.
+//
+// Why one allocator instead of a separate page allocator:
+//   * Drivers don't actually need a different allocator — they
+//     need page-aligned, DMA-mappable memory, which is exactly what
+//     `talc` gives us with a page-aligned `Layout`.
+//   * No fixed `FRAME_RESERVE` constant and no risk of running out
+//     of "page pool" while heap has 100 MB free (or vice versa).
+//   * Stats (`heap_stats`) cover everything in one place.
+//
+// Sizes scale with the VM: a 128 MB guest gets a ~125 MB heap, a
+// 4 GB GCE instance gets ~3.99 GB.
 
 use core::alloc::Layout;
 use core::ptr::{self, NonNull};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(target_os = "none")]
 use core::alloc::GlobalAlloc;
@@ -46,132 +63,19 @@ macro_rules! klog {
 // ============================================================================
 
 const PAGE_SIZE: u64 = 4096;
-/// Reserve subtracted from the chosen heap region after the
-/// kernel image and bitmap, to leave room for the frame allocator
-/// (driver DMA buffers, virtio rings, page tables, per-core stacks
-/// not already covered in the kernel image). Whatever's left in
-/// the region after the bitmap + this reserve becomes the talc
-/// heap.
-///
-/// The actual draw on `alloc_frame` is bounded — the NIC driver's
-/// RX buffer pool (`RX_BUFFERS × BUFFER_SIZE × MAX_QP`) dominates
-/// at ~4 MB worst-case; everything else is single-digit MB. 16 MB
-/// is comfortable headroom and keeps the reserve a constant
-/// regardless of total RAM (a percentage-based reserve would waste
-/// >100 MB on a multi-GB instance for no gain).
-const FRAME_RESERVE: u64 = 16 * 1024 * 1024;
-
-/// Minimum heap size we'll boot with. If `available_region -
-/// bitmap - FRAME_RESERVE < HEAP_MIN_SIZE`, init aborts loudly
-/// instead of handing talc a useless tiny heap. Sized to cover the
-/// runtime's per-worker arenas + minimal listener state on a
-/// single-core boot — apps that bind many UDP sockets need
-/// considerably more, but those don't run on a 16 MB VM anyway.
-const HEAP_MIN_SIZE: usize = 8 * 1024 * 1024;
 
 // ============================================================================
-// Bitmap type — bounds-checked access to a raw pointer + bit count
+// Memory-map snapshot
 // ============================================================================
+//
+// Total RAM (sum of MEM_AVAILABLE region lengths) and the highest
+// observed physical address. Captured once at boot, exposed via
+// `get_total_memory` for `BootInfo` publish + boot logs. Free
+// memory is read directly from talc's counters in
+// `get_free_memory`, so we don't need to track allocations here.
 
-struct Bitmap {
-    data: *mut u8,
-    num_bits: u64,
-}
-
-impl Bitmap {
-    const ZEROED: Self = Self {
-        data: ptr::null_mut(),
-        num_bits: 0,
-    };
-
-    /// Returns the number of bytes needed to store `num_bits` bits.
-    fn byte_size(num_bits: u64) -> u64 {
-        (num_bits + 7) / 8
-    }
-
-    fn set(&mut self, bit: u64) {
-        unsafe {
-            if bit < self.num_bits {
-                let byte = &mut *self.data.add((bit / 8) as usize);
-                *byte |= 1 << (bit % 8);
-            }
-        }
-    }
-
-    fn clear(&mut self, bit: u64) {
-        unsafe {
-            if bit < self.num_bits {
-                let byte = &mut *self.data.add((bit / 8) as usize);
-                *byte &= !(1 << (bit % 8));
-            }
-        }
-    }
-
-    fn test(&self, bit: u64) -> bool {
-        unsafe {
-            if bit < self.num_bits {
-                let byte = *self.data.add((bit / 8) as usize);
-                (byte & (1 << (bit % 8))) != 0
-            } else {
-                true // Out-of-range bits are considered "set"
-            }
-        }
-    }
-
-    /// Fill all bytes with `val` (0xFF = all set, 0x00 = all clear).
-    unsafe fn fill(&mut self, val: u8) {
-        unsafe {
-            ptr::write_bytes(self.data, val, Bitmap::byte_size(self.num_bits) as usize);
-        }
-    }
-}
-
-// ============================================================================
-// Frame allocator state
-// ============================================================================
-
-struct FrameAllocator {
-    bitmap: Bitmap,
-    total_frames: u64,
-    used_frames: u64,
-    total_memory: u64,
-}
-
-impl FrameAllocator {
-    const ZEROED: Self = Self {
-        bitmap: Bitmap::ZEROED,
-        total_frames: 0,
-        used_frames: 0,
-        total_memory: 0,
-    };
-
-    /// Mark a range of frames as used (by physical address range).
-    unsafe fn mark_frames_used(&mut self, start_addr: u64, end_addr: u64) {
-        let start_frame = start_addr / PAGE_SIZE;
-        let mut end_frame = (end_addr + PAGE_SIZE - 1) / PAGE_SIZE;
-        if end_frame > self.total_frames {
-            end_frame = self.total_frames;
-        }
-        for i in start_frame..end_frame {
-            if !self.bitmap.test(i) {
-                self.bitmap.set(i);
-                self.used_frames += 1;
-            }
-        }
-    }
-}
-
-// SAFETY: FrameAllocator owns a `*mut u8` (the bitmap data pointer)
-// pointing into kernel-owned memory. The pointer is never aliased; only
-// the lock holder accesses the bitmap. Send is sound because the lock
-// transfers exclusive access between cores.
-unsafe impl Send for FrameAllocator {}
-
-/// Frame allocator behind a spinlock. The previous `static mut
-/// FRAME_ALLOC` was a Tier-1 footgun from the original safety audit:
-/// every alloc/free path was unlocked, so concurrent post-boot
-/// allocation from any AP would race the bitmap.
-static FRAME_ALLOC: Spinlock<FrameAllocator> = Spinlock::new(FrameAllocator::ZEROED);
+static TOTAL_RAM: AtomicU64 = AtomicU64::new(0);
+static MAX_PHYS_ADDR: AtomicU64 = AtomicU64::new(0);
 
 // ============================================================================
 // Address translation state
@@ -247,175 +151,96 @@ fn kernel_end_phys(info: &BootInfo) -> u64 {
     }
 }
 
-/// Choose where to place the frame bitmap and heap, and how big
-/// the heap can be in that region. Identity-mapped boot puts them
-/// right after the kernel image (using whatever's left in the
-/// kernel's region); higher-half boots search the memory map for
-/// the largest available region since the kernel image may live
-/// outside main RAM. Returns `(placement_phys, region_end_phys)`
-/// — caller carves bitmap + heap out of `[placement, region_end)`.
-fn pick_placement_phys(info: &BootInfo, kern_end_phys: u64) -> (u64, u64) {
-    let mut kern_region_end: u64 = 0;
+/// Claim every `MEM_AVAILABLE` region from the boot memory map
+/// into the talc heap, splitting around the kernel image so we
+/// don't hand the loader's pages out as allocations. Tracks total
+/// RAM and the highest physical address for `get_total_memory`
+/// and the boot log.
+fn init_heap(info: &BootInfo, kern_end_phys: u64) {
+    let kern_start = info.kernel_phys_base;
+    let kern_end = kern_end_phys;
+    let mut total_ram: u64 = 0;
+    let mut max_phys: u64 = 0;
+    let mut total_claimed: u64 = 0;
+
+    let mut heap = HEAP.lock();
     for i in 0..info.memory_map_count as usize {
         let r = &info.memory_map[i];
-        if r.region_type == MEM_AVAILABLE
-            && kern_end_phys > r.base
-            && kern_end_phys <= r.base + r.length
-        {
-            kern_region_end = (r.base + r.length) & !(PAGE_SIZE - 1);
-            break;
-        }
-    }
-    let kern_end_in_ram = kern_region_end != 0;
-
-    if info.kernel_virt_base != 0 || !kern_end_in_ram {
-        let mut best_size: u64 = 0;
-        let mut placement: u64 = 0;
-        let mut placement_end: u64 = 0;
-        for i in 0..info.memory_map_count as usize {
-            let region = &info.memory_map[i];
-            if region.region_type != MEM_AVAILABLE {
-                continue;
-            }
-            let rbase = align_up_page(region.base);
-            let rend = (region.base + region.length) & !(PAGE_SIZE - 1);
-            if rend > rbase && (rend - rbase) > best_size {
-                best_size = rend - rbase;
-                placement = rbase;
-                placement_end = rend;
-            }
-        }
-        if placement != 0 {
-            return (placement, placement_end);
-        }
-    }
-
-    // Identity-mapped boot: bitmap+heap go right after the kernel,
-    // ending at the same region boundary the kernel lives in.
-    (align_up_page(kern_end_phys), kern_region_end)
-}
-
-/// Initialise the frame allocator from the boot memory map.
-/// Returns `(heap_phys, heap_size)` — the heap is sized at boot
-/// from whatever's left in the chosen region after the bitmap and
-/// the FRAME_RESERVE driver-buffer reserve. Reserves the kernel
-/// image, bitmap, and the picked heap span in the bitmap before
-/// returning so they don't leak into `alloc_frame`.
-fn init_frame_allocator(info: &BootInfo, kern_end_phys: u64) -> (u64, usize) {
-    let mut fa = FRAME_ALLOC.lock();
-    fa.total_memory = 0;
-    let mut max_physical_addr: u64 = 0;
-
-    for i in 0..info.memory_map_count as usize {
-        let region = &info.memory_map[i];
-        if region.region_type == MEM_AVAILABLE {
-            fa.total_memory += region.length;
-            let end = region.base + region.length;
-            if end > max_physical_addr {
-                max_physical_addr = end;
-            }
-        }
-    }
-
-    klog!(
-        "  Physical memory: {} MB (max addr {:#x})\n",
-        fa.total_memory / (1024 * 1024),
-        max_physical_addr
-    );
-
-    fa.total_frames = max_physical_addr / PAGE_SIZE;
-    let bitmap_byte_size = Bitmap::byte_size(fa.total_frames);
-    fa.bitmap.num_bits = fa.total_frames;
-
-    let (bitmap_phys, region_end) = pick_placement_phys(info, kern_end_phys);
-    fa.bitmap.data = (info.hhdm_offset + bitmap_phys) as *mut u8;
-
-    // Start: all frames used (0xFF = all bits set), then free available regions.
-    unsafe { fa.bitmap.fill(0xFF); }
-    fa.used_frames = fa.total_frames;
-
-    for i in 0..info.memory_map_count as usize {
-        let region = &info.memory_map[i];
-        if region.region_type != MEM_AVAILABLE {
+        if r.region_type != MEM_AVAILABLE {
             continue;
         }
-        let start = align_up_page(region.base);
-        let end = (region.base + region.length) & !(PAGE_SIZE - 1);
-        let mut addr = start;
-        while addr < end {
-            let frame = addr / PAGE_SIZE;
-            if frame < fa.total_frames && fa.bitmap.test(frame) {
-                fa.bitmap.clear(frame);
-                fa.used_frames -= 1;
-            }
-            addr += PAGE_SIZE;
+        total_ram += r.length;
+        let region_end = r.base + r.length;
+        if region_end > max_phys {
+            max_phys = region_end;
         }
-    }
 
-    // Reserve kernel image + bitmap.
-    let bitmap_end_phys = bitmap_phys + align_up_page(bitmap_byte_size);
-    // Heap consumes everything remaining in this region, minus
-    // FRAME_RESERVE for the frame allocator's own page-grain
-    // allocations. Page-aligned downward so talc's claim is
-    // well-formed.
-    let heap_phys = bitmap_end_phys;
-    let heap_end = if region_end > heap_phys.saturating_add(FRAME_RESERVE) {
-        (region_end - FRAME_RESERVE) & !(PAGE_SIZE - 1)
-    } else {
-        // Tiny region — fall back to "everything after the bitmap"
-        // and let the HEAP_MIN_SIZE check below catch the case.
-        region_end & !(PAGE_SIZE - 1)
-    };
-    let heap_size = heap_end.saturating_sub(heap_phys) as usize;
-    unsafe {
-        fa.mark_frames_used(info.kernel_phys_base, kern_end_phys);
-        fa.mark_frames_used(bitmap_phys, bitmap_end_phys);
-        // Reserve heap pages now while we still hold the frame-allocator lock.
-        fa.mark_frames_used(heap_phys, heap_phys + heap_size as u64);
-    }
+        let rstart = align_up_page(r.base);
+        let rend = region_end & !(PAGE_SIZE - 1);
+        if rend <= rstart {
+            continue;
+        }
 
-    klog!(
-        "  Frame allocator: {} total frames, {} free frames\n",
-        fa.total_frames,
-        fa.total_frames - fa.used_frames
-    );
-
-    (heap_phys, heap_size)
-}
-
-/// Hand the pre-reserved heap span to `talc`. Called once during boot
-/// on the BSP before any AP starts, so the lock below is uncontended.
-fn init_heap(hhdm_offset: u64, heap_phys: u64, heap_size: usize) {
-    if heap_size < HEAP_MIN_SIZE {
-        klog!(
-            "  Heap: refusing to claim {} KB (< HEAP_MIN_SIZE = {} KB) — \
-             increase VM RAM\n",
-            heap_size / 1024,
-            HEAP_MIN_SIZE / 1024,
-        );
-        return;
-    }
-    let heap_start = (hhdm_offset + heap_phys) as *mut u8;
-    // SAFETY: `heap_start .. heap_start + heap_size` is a contiguous
-    // range of valid, exclusive, unused memory — `init_frame_allocator`
-    // just reserved those pages in the frame bitmap, and nothing else
-    // has handed them out. `Span::from_base_size` is const + infallible;
-    // `claim` is sound given that precondition.
-    let span = Span::from_base_size(heap_start, heap_size);
-    let mut heap = HEAP.lock();
-    unsafe {
-        if heap.claim(span).is_err() {
-            klog!("  Heap: talc::claim failed ({} bytes)!\n", heap_size);
-            return;
+        // Punch the kernel image's range out of the claim. Three
+        // cases: kernel is entirely outside this region (claim it
+        // whole), kernel splits the region (claim the two halves
+        // separately), or kernel covers the whole region (skip).
+        let kern_overlaps = kern_start < rend && kern_end > rstart;
+        if !kern_overlaps {
+            total_claimed += claim_phys(&mut heap, info.hhdm_offset, rstart, rend - rstart);
+            continue;
+        }
+        if rstart < kern_start {
+            let lo = rstart;
+            let hi = kern_start & !(PAGE_SIZE - 1);
+            if hi > lo {
+                total_claimed += claim_phys(&mut heap, info.hhdm_offset, lo, hi - lo);
+            }
+        }
+        let after_kern = align_up_page(kern_end);
+        if after_kern < rend {
+            total_claimed += claim_phys(
+                &mut heap,
+                info.hhdm_offset,
+                after_kern,
+                rend - after_kern,
+            );
         }
     }
     drop(heap);
 
+    TOTAL_RAM.store(total_ram, Ordering::Release);
+    MAX_PHYS_ADDR.store(max_phys, Ordering::Release);
+
     klog!(
-        "  Heap: {} MB at phys {:#x}\n",
-        heap_size / (1024 * 1024),
-        heap_phys
+        "  Physical memory: {} MB (max addr {:#x})\n",
+        total_ram / (1024 * 1024),
+        max_phys
     );
+    klog!(
+        "  Heap: {} MB (talc, claimed across all available regions)\n",
+        total_claimed / (1024 * 1024)
+    );
+}
+
+/// Hand `[phys, phys+size)` to talc as a heap span. Returns the
+/// number of bytes actually claimed (0 on failure). The span is
+/// HHDM-translated to the virtual address talc expects.
+fn claim_phys(heap: &mut Talc<ErrOnOom>, hhdm: u64, phys: u64, size: u64) -> u64 {
+    let virt = (hhdm + phys) as *mut u8;
+    // SAFETY: `[phys, phys+size)` is in a `MEM_AVAILABLE` region
+    // and disjoint from the kernel image, the only data the
+    // bootloader handed us with active references. The HHDM map
+    // makes `virt..virt+size` a valid, kernel-owned address range.
+    let span = Span::from_base_size(virt, size as usize);
+    unsafe {
+        if heap.claim(span).is_ok() {
+            size
+        } else {
+            klog!("  Heap: talc::claim failed at {:#x} ({} bytes)\n", phys, size);
+            0
+        }
+    }
 }
 
 pub fn init(info: *const BootInfo) {
@@ -431,58 +256,47 @@ pub fn init(info: *const BootInfo) {
     });
 
     let kern_end_phys = kernel_end_phys(info);
-    let (heap_phys, heap_size) = init_frame_allocator(info, kern_end_phys);
-    init_heap(info.hhdm_offset, heap_phys, heap_size);
+    init_heap(info, kern_end_phys);
 }
 
+/// Allocate one page-aligned 4 KB page from the heap. Returns the
+/// physical address; the caller can recover the virtual via
+/// `phys_to_virt` (or just use the returned phys, since the HHDM
+/// + identity-mapped boot paths both make `phys = virt - offset`).
+///
+/// Used by NIC drivers for DMA-mapped virtio queue rings — the
+/// device wants a physical address, talc serves the page-aligned
+/// virtual chunk, `virt_to_phys` does the rest.
+///
+/// Allocations from this path are never freed in the current
+/// codebase (boot-time DMA buffers and AP stacks live for the
+/// program's lifetime), so there's no matching `free_frame`.
 pub fn alloc_frame() -> u64 {
-    let mut fa = FRAME_ALLOC.lock();
-    // Linear scan for the first free frame
-    for i in 0..fa.total_frames {
-        if !fa.bitmap.test(i) {
-            fa.bitmap.set(i);
-            fa.used_frames += 1;
-            return i * PAGE_SIZE;
-        }
-    }
-    klog!("mm::alloc_frame: out of physical memory!\n");
-    0
+    alloc_pages(1)
 }
 
-/// Allocate `count` contiguous physical pages. Returns physical address or 0 on failure.
+/// Allocate `count` contiguous page-aligned 4 KB pages from the
+/// heap. Returns physical address, or 0 on failure.
 pub fn alloc_pages(count: usize) -> u64 {
-    let mut fa = FRAME_ALLOC.lock();
-    let total = fa.total_frames as usize;
-    'outer: for start in 0..total {
-        if start + count > total {
-            break;
-        }
-        for j in 0..count {
-            if fa.bitmap.test((start + j) as u64) {
-                continue 'outer;
-            }
-        }
-        // Found contiguous run
-        for j in 0..count {
-            fa.bitmap.set((start + j) as u64);
-        }
-        fa.used_frames += count as u64;
-        return (start as u64) * PAGE_SIZE;
+    if count == 0 {
+        return 0;
     }
-    klog!("mm::alloc_pages: out of physical memory!\n");
-    0
-}
-
-pub fn free_frame(addr: u64) {
-    let mut fa = FRAME_ALLOC.lock();
-    let frame = addr / PAGE_SIZE;
-    if frame >= fa.total_frames {
-        return;
+    let layout = match Layout::from_size_align(
+        count * PAGE_SIZE as usize,
+        PAGE_SIZE as usize,
+    ) {
+        Ok(l) => l,
+        Err(_) => return 0,
+    };
+    // SAFETY: `layout` has non-zero size and a valid alignment;
+    // the GlobalAlloc contract is satisfied. talc returns a
+    // pointer into the kernel-owned HHDM region.
+    let virt = unsafe { core::alloc::GlobalAlloc::alloc(&GLOBAL_ALLOCATOR, layout) };
+    if virt.is_null() {
+        klog!("mm::alloc_pages: heap exhausted ({} pages)\n", count);
+        return 0;
     }
-    if fa.bitmap.test(frame) {
-        fa.bitmap.clear(frame);
-        fa.used_frames -= 1;
-    }
+    virt_to_phys(virt)
 }
 
 // ============================================================================
@@ -653,12 +467,11 @@ pub fn heap_stats() -> HeapStats {
 }
 
 pub fn get_total_memory() -> usize {
-    FRAME_ALLOC.lock().total_memory as usize
+    TOTAL_RAM.load(Ordering::Acquire) as usize
 }
 
 pub fn get_free_memory() -> usize {
-    let fa = FRAME_ALLOC.lock();
-    ((fa.total_frames - fa.used_frames) * PAGE_SIZE) as usize
+    heap_stats().available_bytes
 }
 
 pub fn phys_to_virt(phys: u64) -> *mut u8 {
