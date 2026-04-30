@@ -5,6 +5,8 @@
 // scanning the legacy BIOS area), walks RSDT/XSDT → MADT, and
 // extracts Local APIC entries to discover CPU count and APIC IDs.
 
+use alloc::vec::Vec;
+
 use crate::once::InitOnce;
 use crate::serial;
 use crate::mm;
@@ -27,9 +29,6 @@ const RSDP_SIG: [u8; 8] = *b"RSD PTR ";
 /// MADT signature: "APIC"
 const MADT_SIG: [u8; 4] = *b"APIC";
 
-/// Maximum number of CPUs we track.
-const MAX_CPUS: usize = 8;
-
 /// Sanity cap on any ACPI table length. Real firmware tables are well
 /// under a page; anything larger means the length field is corrupted
 /// (or, on a hostile hypervisor, crafted). We refuse to walk past this.
@@ -41,10 +40,11 @@ const SDT_HEADER_LEN: usize = 36;
 /// MADT-specific header: SDT + LAPIC address (4) + flags (4).
 const MADT_HEADER_LEN: usize = 44;
 
-/// Discovered CPU info.
+/// Discovered CPU info. `apic_ids` is heap-backed and grows with the
+/// firmware-reported CPU count, so we don't need a compile-time cap.
 pub struct CpuTopology {
     pub cpu_count: u32,
-    pub apic_ids: [u8; MAX_CPUS],
+    pub apic_ids: Vec<u8>,
 }
 
 /// Parsed ACPI topology, populated exactly once on the BSP via
@@ -144,8 +144,8 @@ unsafe fn parse_madt_entries(madt_addr: u64, topo: &mut CpuTopology) -> u32 {
             // apic_id(1) + flags(4). Bit 0 = enabled, bit 1 = online capable.
             let apic_id: u8 = read_phys(madt_addr + offset as u64 + 3);
             let flags: u32 = read_phys(madt_addr + offset as u64 + 4);
-            if (flags & 0x3) != 0 && (count as usize) < MAX_CPUS {
-                topo.apic_ids[count as usize] = apic_id;
+            if (flags & 0x3) != 0 {
+                topo.apic_ids.push(apic_id);
                 count += 1;
             }
         }
@@ -177,7 +177,7 @@ pub unsafe fn detect_cpus() -> u32 {
     }
     let mut topo = CpuTopology {
         cpu_count: 1,
-        apic_ids: [0; MAX_CPUS],
+        apic_ids: Vec::new(),
     };
 
     // Prefer the boot-protocol RSDP hint; only fall back to the BIOS

@@ -17,9 +17,6 @@ const AP_STACK_SIZE: usize = 64 * 1024;
 /// Must be page-aligned and below 1MB. 0x8000 is conventionally safe.
 const AP_TRAMPOLINE_ADDR: u64 = 0x8000;
 
-/// Maximum cores.
-pub const MAX_CORES: usize = 8;
-
 /// Global shutdown flag.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static NUM_CORES_ONLINE: AtomicU32 = AtomicU32::new(1);
@@ -174,7 +171,7 @@ pub unsafe fn start_secondary_cores(cpu_count: u32) {
     if cpu_count <= 1 {
         return;
     }
-    let count = cpu_count.min(MAX_CORES as u32);
+    let count = cpu_count;
     serial::puts(b"[SMP] Starting secondary cores...\n");
 
     // Copy AP trampoline to physical 0x8000. Multiboot2 / PVH leave

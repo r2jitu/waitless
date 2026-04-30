@@ -12,30 +12,8 @@ use super::exceptions;
 /// Per-core stack size: 64KB (16 pages).
 const AP_STACK_SIZE: usize = 64 * 1024;
 
-/// Maximum number of cores supported.
-pub const MAX_CORES: usize = 8;
-
 /// Global shutdown flag — set by core 0, checked by all APs.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
-
-/// Per-core state, allocated by core 0 during boot.
-struct CoreState {
-    stack_top: u64,
-}
-
-// Per-core state is written exclusively on the BSP during boot
-// (`start_secondary_cores`) before the targeted AP starts reading it —
-// `stack_top` is handed to PSCI CPU_ON as the context id, which the AP
-// picks up in x0 on entry. `UnsafeCell` + `unsafe impl Sync` captures
-// the single-writer-during-boot contract without `static_mut`.
-struct CoreArraySlot(core::cell::UnsafeCell<[CoreState; MAX_CORES]>);
-// SAFETY: BSP-only writes during boot; APs consume stack_top via PSCI
-// context_id, not by reading back through this static.
-unsafe impl Sync for CoreArraySlot {}
-
-static CORES: CoreArraySlot = CoreArraySlot(
-    core::cell::UnsafeCell::new([const { CoreState { stack_top: 0 } }; MAX_CORES])
-);
 
 /// Number of cores that have come online (BSP + APs that called `ap_entry`).
 static NUM_CORES_ONLINE: AtomicU32 = AtomicU32::new(1); // BSP is always online
@@ -96,7 +74,7 @@ pub unsafe fn start_secondary_cores(cpu_count: u32) {
         return;
     }
 
-    let count = cpu_count.min(MAX_CORES as u32);
+    let count = cpu_count;
     serial::puts(b"[SMP] Starting secondary cores...\n");
 
     for i in 1..count {
@@ -108,7 +86,6 @@ pub unsafe fn start_secondary_cores(cpu_count: u32) {
             continue;
         }
         let stack_top = stack_base + AP_STACK_SIZE as u64;
-        (*CORES.0.get())[i as usize].stack_top = stack_top;
 
         // Start the AP at the assembly trampoline (handles MMU + VBAR setup).
         // stack_top passed as context_id (x0 when AP starts).
