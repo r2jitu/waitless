@@ -10,6 +10,8 @@
 #![no_std]
 #![allow(unused_imports)]
 
+extern crate alloc;
+
 use core::ptr;
 
 extern crate uni_kernel;
@@ -576,19 +578,18 @@ unsafe fn kernel_boot(info: &BootInfo) {
 /// read the resulting snapshot via `uni::boot_info()` to size
 /// per-core buffers, log runtime identity, etc.
 fn publish_boot_info(net_ok: bool) {
-    use uni::boot_info::{BootInfoParams, NicInfo, MAX_NICS};
+    use uni::boot_info::{BootInfoParams, NicInfo};
+    use alloc::vec::Vec;
 
-    let mut nics = [NicInfo::EMPTY; MAX_NICS];
-    let mut nic_count: u8 = 0;
+    let mut nics: Vec<NicInfo> = Vec::new();
     if net_ok {
         let mut mac = [0u8; 6];
         uni_drivers::net::get_mac(mac.as_mut_ptr());
-        nics[0] = NicInfo {
+        nics.push(NicInfo {
             name: uni_drivers::net::driver_name(),
             mac,
             num_queue_pairs: uni_drivers::net::num_queue_pairs(),
-        };
-        nic_count = 1;
+        });
     }
 
     uni::boot_info::init_boot_info(BootInfoParams {
@@ -598,7 +599,6 @@ fn publish_boot_info(net_ok: bool) {
         // expose an empty string so apps can still rely on the field.
         boot_args: "",
         nics,
-        nic_count,
         // RTC isn't queried at boot yet. Left `None`; a future phase
         // can plumb ACPI FADT CMOS / FDT rtc.
         rtc_epoch: None,

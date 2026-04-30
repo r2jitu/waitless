@@ -7,19 +7,15 @@
 // The bare-metal side populates the struct from `boot/entry.rs` after
 // ACPI/FDT parsing + NIC discovery. The native side populates it from
 // `init_native()` via sysconf/sysctl.
-//
-// Self-contained (only `core::`) so the file can compile as a
-// standalone rust_test target for host-native unit tests.
+
+extern crate alloc;
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 
 use uni_worker::InitOnce;
 
-/// Maximum number of NICs describable in a single `BootInfo`. The
-/// kernel currently activates at most one NIC per boot; four slots
-/// gives headroom for multi-NIC configurations.
-pub const MAX_NICS: usize = 4;
-
 /// Description of one network interface as reported at boot.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NicInfo {
     /// Driver kind: e.g. `"virtio-net"`, `"gve"`, `"posix"`.
     pub name: &'static str,
@@ -27,16 +23,6 @@ pub struct NicInfo {
     pub mac: [u8; 6],
     /// Number of RX/TX queue pairs negotiated at init.
     pub num_queue_pairs: u16,
-}
-
-impl NicInfo {
-    /// All-zero placeholder used to pad the fixed-size storage
-    /// array. Not included in the exposed `nics` slice.
-    pub const EMPTY: NicInfo = NicInfo {
-        name: "",
-        mac: [0; 6],
-        num_queue_pairs: 0,
-    };
 }
 
 /// Read-only snapshot of boot-time facts exposed to app code.
@@ -64,20 +50,12 @@ pub struct BootInfoParams {
     pub ram_bytes: usize,
     pub num_cpus: u32,
     pub boot_args: &'static str,
-    /// Fixed-size NIC array; only the first `nic_count` entries are
-    /// published. Trailing entries are ignored (use `NicInfo::EMPTY`).
-    pub nics: [NicInfo; MAX_NICS],
-    pub nic_count: u8,
+    /// NICs discovered at boot; size is whatever the backend found
+    /// (no compile-time cap).
+    pub nics: Vec<NicInfo>,
     pub rtc_epoch: Option<u64>,
 }
 
-// ---- Storage ---------------------------------------------------------------
-//
-// Two cells: one holds the NIC array so the published `nics` slice has
-// `'static` lifetime; the other holds the `BootInfo` itself. The NIC
-// cell is filled first so `BootInfo.nics` can borrow from it.
-
-static NICS_STORAGE: InitOnce<[NicInfo; MAX_NICS]> = InitOnce::new();
 static BOOT_INFO: InitOnce<BootInfo> = InitOnce::new();
 
 /// Publish the final boot-time snapshot. Called exactly once per
@@ -88,11 +66,11 @@ static BOOT_INFO: InitOnce<BootInfo> = InitOnce::new();
 /// Panics if called twice.
 #[doc(hidden)]
 pub fn init_boot_info(p: BootInfoParams) {
-    let count = (p.nic_count as usize).min(MAX_NICS);
-    NICS_STORAGE.init(p.nics);
-    // `NICS_STORAGE` is a `static`, so the returned reference is
-    // `&'static [NicInfo; MAX_NICS]` and the sub-slice inherits that.
-    let nics_slice: &'static [NicInfo] = &NICS_STORAGE.get()[..count];
+    // Box::leak gives us a `&'static [NicInfo]` from a heap-allocated
+    // backing store. Called exactly once per boot, so the leak is
+    // bounded by the lifetime of the kernel itself.
+    let nics_slice: &'static [NicInfo] =
+        Box::leak(p.nics.into_boxed_slice());
     BOOT_INFO.init(BootInfo {
         ram_bytes: p.ram_bytes,
         num_cpus: p.num_cpus,
@@ -123,24 +101,17 @@ mod tests {
         // Exercises the struct layout without touching the module
         // statics (which can only be initialised once per process,
         // making them unfriendly to `cargo test`'s repeated runs).
-        // The NIC array is a local `static` so it has 'static lifetime
-        // — matching the production path where `NICS_STORAGE` holds
-        // the array.
-        static NICS: [NicInfo; MAX_NICS] = [
-            NicInfo {
-                name: "virtio-net",
-                mac: [0x52, 0x54, 0x00, 0x12, 0x34, 0x56],
-                num_queue_pairs: 3,
-            },
-            NicInfo::EMPTY,
-            NicInfo::EMPTY,
-            NicInfo::EMPTY,
-        ];
+        let nic = NicInfo {
+            name: "virtio-net",
+            mac: [0x52, 0x54, 0x00, 0x12, 0x34, 0x56],
+            num_queue_pairs: 3,
+        };
+        let nics_box: alloc::boxed::Box<[NicInfo]> = alloc::vec![nic].into_boxed_slice();
         let bi = BootInfo {
             ram_bytes: 128 * 1024 * 1024,
             num_cpus: 3,
             boot_args: "console=ttyS0",
-            nics: &NICS[..1],
+            nics: alloc::boxed::Box::leak(nics_box),
             rtc_epoch: Some(1_700_000_000),
         };
         assert_eq!(bi.ram_bytes, 128 * 1024 * 1024);
@@ -165,31 +136,6 @@ mod tests {
         assert!(bi.nics.is_empty());
         assert_eq!(bi.boot_args, "");
         assert!(bi.rtc_epoch.is_none());
-    }
-
-    #[test]
-    fn nic_info_empty_const() {
-        assert_eq!(NicInfo::EMPTY.name, "");
-        assert_eq!(NicInfo::EMPTY.mac, [0; 6]);
-        assert_eq!(NicInfo::EMPTY.num_queue_pairs, 0);
-    }
-
-    #[test]
-    fn params_builds_bootinfo_with_bounded_nic_count() {
-        // `nic_count` > MAX_NICS is clamped to MAX_NICS — the rest of
-        // the array is ignored but still represented by `EMPTY`.
-        let p = BootInfoParams {
-            ram_bytes: 64 * 1024 * 1024,
-            num_cpus: 2,
-            boot_args: "",
-            nics: [NicInfo::EMPTY; MAX_NICS],
-            nic_count: 200,
-            rtc_epoch: None,
-        };
-        // We don't call `init_boot_info` here (see "can only init
-        // once" caveat above) — just assert our clamp math.
-        let count = (p.nic_count as usize).min(MAX_NICS);
-        assert_eq!(count, MAX_NICS);
     }
 
     #[test]

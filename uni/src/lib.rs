@@ -20,7 +20,8 @@ pub extern crate uni_net as net;
 /// dep back on `uni`.
 #[cfg(not(target_os = "none"))]
 pub fn native_run() -> i32 {
-    use crate::boot_info::{BootInfoParams, NicInfo, MAX_NICS};
+    use crate::boot_info::BootInfoParams;
+    use alloc::vec::Vec;
 
     uni_backend::run(uni_backend::RunConfig {
         boot_info_fn: |num_cpus, ram_bytes| {
@@ -28,8 +29,7 @@ pub fn native_run() -> i32 {
                 ram_bytes,
                 num_cpus,
                 boot_args: "",
-                nics: [NicInfo::EMPTY; MAX_NICS],
-                nic_count: 0,
+                nics: Vec::new(),
                 rtc_epoch: None,
             });
         },
