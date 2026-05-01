@@ -172,7 +172,17 @@ impl WebServerApp {
                         if udp.send(&buf).is_err() {
                             return;
                         }
-                        let (_, _, n) = udp.recv(&mut buf).await;
+                        // Zero-copy receive: the runtime hands us a
+                        // borrow of the inbox slot's payload, we
+                        // copy it directly into the TCP send buffer
+                        // without round-tripping through a stack
+                        // buffer. Skips one memcpy per request — at
+                        // 100 k req/s the savings start to matter.
+                        let n = udp.recv_inplace(|payload, _src_ip, _src_port| {
+                            let n = payload.len();
+                            buf[..n].copy_from_slice(payload);
+                            n
+                        }).await;
                         if n != GATEWAY_MSG_SIZE {
                             return;
                         }

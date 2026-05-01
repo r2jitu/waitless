@@ -332,6 +332,39 @@ impl WorkerInbox {
         Some(r)
     }
 
+    /// Zero-copy peek + commit: invoke `f` with a borrow of the head
+    /// slot's payload (and its source) when one is available, then
+    /// advance `head`. Returns `f`'s return value on success, or
+    /// hands the closure back unchanged (`Err(f)`) when the inbox is
+    /// empty so the caller can retry on a later tick.
+    ///
+    /// POSIX equivalent: `recv()` — but `recv()` *must* copy because
+    /// the kernel can't trust user code to release the buffer in
+    /// finite time. We can: the closure has to return.
+    fn pop_with<F, R>(&self, f: F) -> Result<R, F>
+    where
+        F: FnOnce(&[u8], [u8; 4], u16) -> R,
+    {
+        let slots_ptr = self.slots.load(Ordering::Acquire);
+        if slots_ptr.is_null() {
+            return Err(f);
+        }
+        let mask = self.mask.load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Acquire);
+        if head == tail {
+            return Err(f);
+        }
+        // SAFETY: same SPSC ownership argument as `pop_into` — we
+        // own the head slot for the duration of the closure call.
+        let slot = unsafe { &*slots_ptr.add(head as usize) };
+        let n = slot.len as usize;
+        let r = f(&slot.payload[..n], slot.src_ip, slot.src_port);
+        let next = head.wrapping_add(1) & mask;
+        self.head.store(next, Ordering::Release);
+        Ok(r)
+    }
+
     fn reset(&self) {
         self.head.store(0, Ordering::Relaxed);
         self.tail.store(0, Ordering::Relaxed);
@@ -905,6 +938,29 @@ impl UdpSocket {
         }
     }
 
+    /// Zero-copy receive: await one datagram, then invoke `f` with
+    /// a slice borrow of the payload (and its source) sitting in
+    /// the inbox slot — no copy into a user buffer. The closure
+    /// runs synchronously on the single poll that completes the
+    /// future; its return value becomes the future's output.
+    ///
+    /// POSIX `recv()` must copy into a user buffer because the
+    /// kernel can't borrow user code's lifetime. We can — the
+    /// closure has to return before this future resolves, so the
+    /// inbox slot can be safely reused after that. For
+    /// header-only parses (QUIC short headers, DNS labels, statsd
+    /// keys) the saved memcpy is the bulk of the per-packet cost.
+    pub fn recv_inplace<F, R>(&self, f: F) -> UdpRecvInplace<'_, F, R>
+    where
+        F: FnOnce(&[u8], [u8; 4], u16) -> R + Unpin,
+    {
+        UdpRecvInplace {
+            sock: self,
+            f: Some(f),
+            _not_send: PhantomData,
+        }
+    }
+
     /// Spawn `body` once per worker. Each invocation gets its own
     /// `Arc<UdpSocket>` clone and typically loops on `recv_from`
     /// (and replies via `send_to`) to drive the per-worker inbox.
@@ -1003,6 +1059,19 @@ impl UdpFlow {
     #[inline]
     pub fn recv<'a>(&'a self, buf: &'a mut [u8]) -> UdpRecv<'a> {
         self.inner.recv_from(buf)
+    }
+
+    /// Zero-copy receive — see [`UdpSocket::recv_inplace`]. The
+    /// closure runs against a slice borrow of the inbox slot, no
+    /// copy into a user buffer. For QUIC client-side parsing where
+    /// the short-header decode is the bulk of the per-packet cost
+    /// this is the fastest receive path the runtime offers.
+    #[inline]
+    pub fn recv_inplace<F, R>(&self, f: F) -> UdpRecvInplace<'_, F, R>
+    where
+        F: FnOnce(&[u8], [u8; 4], u16) -> R + Unpin,
+    {
+        self.inner.recv_inplace(f)
     }
 
     /// Local source port allocated for this flow.
@@ -1161,6 +1230,64 @@ impl<'a> Future for UdpRecv<'a> {
             return Poll::Ready(r);
         }
         Poll::Pending
+    }
+}
+
+/// Future returned by [`UdpSocket::recv_inplace`]. Holds the closure
+/// until data arrives, then invokes it with a borrow of the inbox
+/// slot's payload — no copy. `!Send` for the same reason as
+/// [`UdpRecv`]: the per-worker inbox semantics require staying on
+/// the worker where we first polled.
+pub struct UdpRecvInplace<'a, F, R>
+where
+    F: FnOnce(&[u8], [u8; 4], u16) -> R + Unpin,
+{
+    sock: &'a UdpSocket,
+    f: Option<F>,
+    _not_send: PhantomData<*mut ()>,
+}
+
+impl<'a, F, R> Future for UdpRecvInplace<'a, F, R>
+where
+    F: FnOnce(&[u8], [u8; 4], u16) -> R + Unpin,
+{
+    type Output = R;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<R> {
+        let this = self.get_mut();
+        let cc = CurrentWorker::enter();
+        let inbox = match this.sock.slot {
+            SlotRef::Server(idx) => {
+                UDP_REGISTRY[idx as usize].inboxes.current(&cc)
+            }
+            SlotRef::Ephemeral { worker, slot_idx } => {
+                let slot = lookup_eph_position(worker, slot_idx)
+                    .expect("ephemeral slot vanished mid-recv");
+                debug_assert_eq!(cc.id(), worker);
+                &slot.inbox
+            }
+        };
+
+        // Fast path: data already in this worker's inbox.
+        let f = this.f.take()
+            .expect("UdpRecvInplace polled after completion");
+        let f = match inbox.pop_with(f) {
+            Ok(r) => return Poll::Ready(r),
+            Err(f) => f,
+        };
+
+        // Slow path: park, re-check.
+        inbox.park_waker(cx.waker());
+        match inbox.pop_with(f) {
+            Ok(r) => {
+                inbox.unpark();
+                Poll::Ready(r)
+            }
+            Err(f) => {
+                this.f = Some(f);
+                Poll::Pending
+            }
+        }
     }
 }
 
