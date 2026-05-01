@@ -961,6 +961,42 @@ impl UdpSocket {
         }
     }
 
+    /// Non-blocking single-shot recv. Returns `Some((src_ip,
+    /// src_port, n))` if a datagram was waiting, `None` otherwise.
+    /// `!Send` enforced via `&UdpRecvNotSend` — the call must
+    /// happen on the worker that owns the inbox.
+    pub fn try_recv_from(&self, buf: &mut [u8]) -> Option<([u8; 4], u16, usize)> {
+        let _: PhantomData<*mut ()> = PhantomData; // !Send marker
+        let cc = CurrentWorker::enter();
+        let inbox = self.current_inbox(&cc);
+        inbox.pop_into(buf)
+    }
+
+    /// Non-blocking zero-copy recv via closure. Returns the
+    /// closure's output if a datagram was waiting, `None`
+    /// otherwise — useful inside drain loops that consume
+    /// everything currently buffered before yielding.
+    pub fn try_recv_inplace<F, R>(&self, f: F) -> Option<R>
+    where
+        F: FnOnce(&[u8], [u8; 4], u16) -> R,
+    {
+        let cc = CurrentWorker::enter();
+        let inbox = self.current_inbox(&cc);
+        inbox.pop_with(f).ok()
+    }
+
+    fn current_inbox<'a>(&'a self, cc: &'a CurrentWorker) -> &'a WorkerInbox {
+        match self.slot {
+            SlotRef::Server(idx) => UDP_REGISTRY[idx as usize].inboxes.current(cc),
+            SlotRef::Ephemeral { worker, slot_idx } => {
+                let slot = lookup_eph_position(worker, slot_idx)
+                    .expect("ephemeral slot vanished mid-recv");
+                debug_assert_eq!(cc.id(), worker);
+                &slot.inbox
+            }
+        }
+    }
+
     /// Spawn `body` once per worker. Each invocation gets its own
     /// `Arc<UdpSocket>` clone and typically loops on `recv_from`
     /// (and replies via `send_to`) to drive the per-worker inbox.
@@ -1072,6 +1108,22 @@ impl UdpFlow {
         F: FnOnce(&[u8], [u8; 4], u16) -> R + Unpin,
     {
         self.inner.recv_inplace(f)
+    }
+
+    /// Non-blocking copy receive. See [`UdpSocket::try_recv_from`].
+    #[inline]
+    pub fn try_recv(&self, buf: &mut [u8]) -> Option<([u8; 4], u16, usize)> {
+        self.inner.try_recv_from(buf)
+    }
+
+    /// Non-blocking zero-copy receive. See
+    /// [`UdpSocket::try_recv_inplace`].
+    #[inline]
+    pub fn try_recv_inplace<F, R>(&self, f: F) -> Option<R>
+    where
+        F: FnOnce(&[u8], [u8; 4], u16) -> R,
+    {
+        self.inner.try_recv_inplace(f)
     }
 
     /// Local source port allocated for this flow.
