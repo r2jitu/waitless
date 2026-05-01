@@ -366,25 +366,14 @@ impl WorkerInbox {
 
 // ---- Per-port state ---------------------------------------------------------
 
+/// Server-style binding: one slot per declared listening port.
+/// Inbound delivery fans out to every worker's inbox so a multi-
+/// `run` listener sees the receiving worker's flow. Owner-pinned
+/// delivery (single-task-on-one-worker) is the ephemeral path's
+/// job and lives in `EphPool` instead.
 struct UdpState {
     port: AtomicU16,
     inboxes: PerWorker<WorkerInbox>,
-    /// Sticky owner-worker for "single-owner" bind patterns
-    /// (`bind_ephemeral` and friends used by gateway-style fan-out
-    /// where one TCP conn owns one UDP socket).
-    ///
-    /// `-1` means no owner — delivery routes to the receiving
-    /// worker's inbox, which fits the multi-`run` fan-out pattern
-    /// where every worker has its own recv loop on the same port.
-    /// `>=0` pins delivery to that worker's inbox regardless of
-    /// which core observed the packet, which is the correct route
-    /// when only one task on one worker is polling.
-    ///
-    /// Under Tier 2 (single NIC RX queue, multi-core), all
-    /// inbound UDP arrives on core 0; without this, packets for a
-    /// socket bound on worker N would silently land in core 0's
-    /// inbox and the recv on N would wait forever.
-    owner_worker: core::sync::atomic::AtomicI32,
 }
 
 impl UdpState {
@@ -392,7 +381,6 @@ impl UdpState {
         UdpState {
             port: AtomicU16::new(0),
             inboxes: PerWorker::new(),
-            owner_worker: core::sync::atomic::AtomicI32::new(-1),
         }
     }
 }
@@ -660,18 +648,13 @@ impl Drop for UdpSocket {
         }
         match self.slot {
             SlotRef::Server(idx) => {
-                // Order matters: clear the registry slot first (so the
-                // port is immediately available for a new bind on this
+                // Clear the registry slot first (so the port is
+                // immediately available for a new bind on this
                 // thread) and only then notify the backend. Native's
-                // unbind hook closes POSIX fds, which is much slower and
-                // doesn't need to happen before the slot is reusable.
+                // unbind hook closes POSIX fds, which is much
+                // slower and doesn't need to happen before the slot
+                // is reusable.
                 UDP_REGISTRY[idx as usize].port.store(0, Ordering::Release);
-                // Clear any sticky owner-worker so a future plain `bind`
-                // that lands on this slot doesn't inherit single-owner
-                // routing from the previous occupant.
-                UDP_REGISTRY[idx as usize]
-                    .owner_worker
-                    .store(-1, Ordering::Release);
             }
             SlotRef::Ephemeral { worker, slot_idx } => {
                 release_eph_slot(worker, slot_idx);
@@ -738,7 +721,6 @@ impl UdpSocket {
                     }
                     inbox.reset();
                 }
-                state.owner_worker.store(-1, Ordering::Release);
                 if let Some(bind) = udp_backend().and_then(|b| b.bind) {
                     if bind(port, None).is_err() {
                         state.port.store(0, Ordering::Release);
@@ -1030,9 +1012,6 @@ impl Drop for UdpHandle {
                     UDP_REGISTRY[idx as usize]
                         .port
                         .store(0, Ordering::Release);
-                    UDP_REGISTRY[idx as usize]
-                        .owner_worker
-                        .store(-1, Ordering::Release);
                 }
                 SlotRef::Ephemeral { worker, slot_idx } => {
                     release_eph_slot(worker, slot_idx);
@@ -1129,38 +1108,29 @@ fn lookup_eph_position(worker: u32, slot_idx: u32) -> Option<&'static EphSlot> {
 /// network RX path on the core that observed the packet. Returns
 /// `true` if a socket was found.
 ///
-/// Two routing modes:
-///   * `owner_worker == -1` (default `bind`): drop into the
-///     **receiving** worker's inbox. This is the multi-`run`
-///     fan-out shape: each worker has its own recv loop and the
-///     NIC's flow hash already steered the packet here.
-///   * `owner_worker >= 0` (`bind_ephemeral`): drop into the
-///     **owning** worker's inbox regardless of which core received
-///     the packet. This is the gateway / sidecar shape — one TCP
-///     conn owns one UDP socket on one worker, and under Tier 2
-///     (single NIC RX queue, multi-core) every reply lands on
-///     core 0 yet the recv waits on the conn's worker.
+/// Routing dispatches by port:
+///   * **Ephemeral range** (port ≥ `EPHEMERAL_BASE`): decode
+///     `(worker, slot)` from the port number and push directly
+///     into the owning worker's inbox. O(1), no registry scan.
+///   * **Server-style** (port < `EPHEMERAL_BASE`): scan
+///     `UDP_REGISTRY` for a matching `bind`. The bound count is
+///     typically a handful (one per declared listening port), so
+///     the scan stays cheap. Delivery routes to the receiving
+///     worker's inbox — server `run` listeners spawn one task per
+///     worker and the NIC's flow hash has already steered here.
 pub fn deliver_udp(dst_port: u16, src_ip: [u8; 4], src_port: u16, payload: &[u8]) -> bool {
-    // Fast path: ephemeral ports route to the owning worker's slot
-    // by decoding the port — O(1) lookup, no scan.
+    // Fast path: ephemeral ports.
     if let Some(slot) = lookup_eph(dst_port) {
         let _ = slot.inbox.try_push(src_ip, src_port, payload);
         slot.inbox.wake_if_parked();
         return true;
     }
 
-    // Server-style ports: small linear scan over `UDP_REGISTRY`.
-    // In practice the bound count is tiny (one slot per declared
-    // listening port), so this stays cheap.
+    // Server-style ports.
     let cc = CurrentWorker::enter();
     for state in UDP_REGISTRY.iter() {
         if state.port.load(Ordering::Acquire) == dst_port {
-            let owner = state.owner_worker.load(Ordering::Acquire);
-            let inbox = if owner >= 0 {
-                state.inboxes.at(owner as u32)
-            } else {
-                state.inboxes.current(&cc)
-            };
+            let inbox = state.inboxes.current(&cc);
             let _ = inbox.try_push(src_ip, src_port, payload);
             inbox.wake_if_parked();
             return true;
