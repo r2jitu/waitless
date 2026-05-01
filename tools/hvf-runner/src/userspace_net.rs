@@ -369,7 +369,13 @@ fn bind_listen(host_port: u16) -> Result<i32, String> {
             libc::close(fd);
             return Err(format!("tcp bind({host_port}): {e}"));
         }
-        libc::listen(fd, 128);
+        // 4096-deep accept queue. macOS silently caps to
+        // `kern.ipc.somaxconn` (default 128), so the OS effective
+        // value is whatever sysctl reports — but raising it past
+        // any plausible cap is harmless and lets benchmarks at
+        // thousand-conn scale work on hosts where the operator has
+        // bumped somaxconn (`sudo sysctl -w kern.ipc.somaxconn=4096`).
+        libc::listen(fd, 4096);
         libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
         Ok(fd)
     }

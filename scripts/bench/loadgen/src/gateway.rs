@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use hdrhistogram::Histogram;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::Barrier;
+use tokio::sync::{Barrier, Semaphore};
 
 use crate::WorkloadResult;
 
@@ -63,12 +63,21 @@ pub async fn run(
     let host: Arc<str> = Arc::from(host.to_string().into_boxed_str());
     let payload: Arc<[u8]> = Arc::from(vec![b'g'; msg_size].into_boxed_slice());
     let barrier = Arc::new(Barrier::new(connections + 1));
+    // macOS' default `kern.ipc.somaxconn` is 128, so 6000 simultaneous
+    // `connect(2)` calls overrun the listener's accept queue and most
+    // SYNs get dropped — which surfaced as "0 req/s, p50=TIMEOUT" at
+    // any conns/core ≥ ~250. Capping concurrent in-flight connects
+    // at 64 (well under 128) lets the server drain its accept queue
+    // between waves. Once each conn is `ESTABLISHED` it goes through
+    // the barrier and the steady-state ping-pong window starts.
+    let connect_limit = Arc::new(Semaphore::new(64));
 
     let mut handles = Vec::with_capacity(connections);
     for i in 0..connections {
         let host = Arc::clone(&host);
         let payload = Arc::clone(&payload);
         let barrier = Arc::clone(&barrier);
+        let connect_limit = Arc::clone(&connect_limit);
         let sample_latency = i == 0;
         handles.push(tokio::spawn(driver(
             host,
@@ -77,6 +86,7 @@ pub async fn run(
             barrier,
             duration,
             sample_latency,
+            connect_limit,
         )));
     }
 
@@ -143,16 +153,31 @@ async fn driver(
     barrier: Arc<Barrier>,
     duration: Duration,
     sample_latency: bool,
+    connect_limit: Arc<Semaphore>,
 ) -> (u64, Histogram<u64>) {
     let hist_zero = || Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap();
 
-    let mut sock = match TcpStream::connect((&*host, port)).await {
-        Ok(s) => s,
+    // Throttle simultaneous connect(2) syscalls so we don't blow
+    // the OS accept queue (see `connect_limit` rationale at the
+    // call site). The permit is released once the connect resolves
+    // — by then the conn is fully ESTABLISHED on both sides and
+    // the next waiter can race in.
+    let permit = match connect_limit.acquire().await {
+        Ok(p) => p,
         Err(_) => {
             barrier.wait().await;
             return (0, hist_zero());
         }
     };
+    let mut sock = match TcpStream::connect((&*host, port)).await {
+        Ok(s) => s,
+        Err(_) => {
+            drop(permit);
+            barrier.wait().await;
+            return (0, hist_zero());
+        }
+    };
+    drop(permit);
     let _ = sock.set_nodelay(true);
 
     let mut buf = vec![0u8; payload.len()];

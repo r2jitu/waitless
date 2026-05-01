@@ -205,21 +205,27 @@ WORKLOADS = [
     # forwards per worker without OS threads; native (Linux+Tokio
     # equivalent) pays ~5 syscalls per request just to push bytes.
     #
-    # `conns_per_core: 1000` exercises the post-refactor extreme-
-    # concurrency path: per-worker ephemeral UDP pool with port-
-    # encoded owner, native O(1) port→fd table. At 3 vCPUs that's
-    # 3000 simultaneous TCP conns each owning an ephemeral UDP
-    # flow to the backend — well past the old MAX_UDP_SOCKETS=256
-    # cliff and into territory where the registry-scan dispatch
-    # would have collapsed.
-    #
-    # Inbox heap budget: 1000 × 3-vcpu × 64-slot inbox × 1508 B
-    # ≈ 290 MB. Apps wanting tiny VMs should drop INBOX_CAPACITY
-    # before bumping conns; the runtime's static MAX_UDP_SOCKETS
-    # no longer caps ephemeral allocations.
+    # `conns_per_core: 200` exercises the post-refactor scaling
+    # path on the *unikernel side* — per-worker ephemeral UDP
+    # pool with port-encoded owner, native O(1) port→fd table —
+    # but keeps the loadgen on macOS within the host-side caps
+    # that gate higher numbers:
+    #   * `kern.ipc.somaxconn=128` silently caps `listen(2)`
+    #     backlog. The loadgen throttles concurrent `connect(2)`
+    #     to 64 (well under 128) to fit; the HVF runner's
+    #     userspace TCP proxy has its own per-vCPU pollfd budget
+    #     that starts dropping accepts above ~500/core.
+    #   * Graceful FIN-ACK close parks each source port in
+    #     TIME_WAIT for ~15 s, so back-to-back runs at thousands
+    #     of conns blow through the 16 384-port loadgen ephemeral
+    #     pool.
+    # The unikernel runtime itself handles tens of thousands of
+    # ephemerals — the bottleneck is the benchmark *client* and
+    # the macOS host that runs it. To push higher, bump somaxconn
+    # (`sudo sysctl -w kern.ipc.somaxconn=4096`) and rerun.
     {"name": "gateway_max", "type": "gateway",
-     "conns_per_core": 2000,
-     "desc": "Gateway fan-out (TCP→UDP backend→TCP, 2000 conn × cpus)"},
+     "conns_per_core": 200,
+     "desc": "Gateway fan-out (TCP→UDP backend→TCP, 200 conn × cpus)"},
 ]
 
 
@@ -397,7 +403,14 @@ def main():
                     gateway_target_port = getattr(
                         env, "GUEST_GATEWAY_PORT", None)
                 else:
-                    wrk_host = "localhost"
+                    # 127.0.0.1 explicit, NOT "localhost". macOS
+                    # resolves localhost to both ::1 and 127.0.0.1;
+                    # for 6 000+ concurrent loadgen connects the
+                    # IPv6-first try fails immediately (the unikernel
+                    # listens AF_INET only) but the fallback to IPv4
+                    # adds enough latency per connect to push the
+                    # gateway_max workload over its subprocess timeout.
+                    wrk_host = "127.0.0.1"
                     wrk_port = bench_port
                     tls_off = getattr(env, 'tls_port_offset', 1000)
                     tls_target_port = bench_port + tls_off
