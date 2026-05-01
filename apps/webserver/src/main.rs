@@ -146,8 +146,14 @@ impl WebServerApp {
         let gateway = match uni::runtime::TcpListener::bind(GATEWAY_PORT) {
             Ok(listener) => {
                 let h = listener.run(move |stream| async move {
-                    let udp = match uni::runtime::UdpSocket::open_ephemeral() {
-                        Ok(s) => s,
+                    // Connected UDP flow: ephemeral source port +
+                    // peer baked in once. Skips the per-send dst
+                    // arguments and matches the QUIC-client shape
+                    // we're building toward.
+                    let udp = match uni::runtime::UdpFlow::connect(
+                        backend_ip, GATEWAY_BACKEND_PORT,
+                    ) {
+                        Ok(f) => f,
                         Err(_) => return,
                     };
                     let mut buf = [0u8; GATEWAY_MSG_SIZE];
@@ -163,13 +169,10 @@ impl WebServerApp {
                             }
                             got += n;
                         }
-                        if udp
-                            .send_to(backend_ip, GATEWAY_BACKEND_PORT, &buf)
-                            .is_err()
-                        {
+                        if udp.send(&buf).is_err() {
                             return;
                         }
-                        let (_, _, n) = udp.recv_from(&mut buf).await;
+                        let (_, _, n) = udp.recv(&mut buf).await;
                         if n != GATEWAY_MSG_SIZE {
                             return;
                         }

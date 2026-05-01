@@ -954,6 +954,70 @@ impl UdpSocket {
     }
 }
 
+// ---- Connected ephemeral flow ----------------------------------------------
+
+/// An ephemeral UDP socket connected to a fixed peer.
+///
+/// Wraps an [`UdpSocket`] from [`UdpSocket::open_ephemeral`] with
+/// the peer address baked in, so `send` / `recv` don't repeat the
+/// destination on every call. This is the shape QUIC client setup
+/// wants — one server, ephemeral source port, owner-pinned to the
+/// calling worker — and it composes with future per-flow
+/// optimisations (peer-filtered inbound, cached route lookup,
+/// compile-time-known QoS) without further API churn.
+///
+/// Inbound datagrams from any peer still arrive on this flow's
+/// inbox today. Filtering replies to `(peer_ip, peer_port)` is a
+/// future hardening step; the wire-level shape is identical.
+///
+/// `!Send + !Sync` follows from `UdpRecv` — the flow stays on the
+/// worker that opened it.
+#[must_use = "UdpFlow releases its port on drop; open without using it \
+              immediately releases it again"]
+pub struct UdpFlow {
+    inner: UdpSocket,
+    peer_ip: [u8; 4],
+    peer_port: u16,
+}
+
+impl UdpFlow {
+    /// Open an ephemeral UDP socket and connect it to `(peer_ip,
+    /// peer_port)`. The local source port is allocated from the
+    /// calling worker's per-worker ephemeral pool; the peer
+    /// address is stored on the flow for `send` / `peer`.
+    pub fn connect(peer_ip: [u8; 4], peer_port: u16) -> Result<UdpFlow, UdpBindError> {
+        let inner = UdpSocket::open_ephemeral()?;
+        Ok(UdpFlow { inner, peer_ip, peer_port })
+    }
+
+    /// Send a datagram to the connected peer.
+    #[inline]
+    pub fn send(&self, data: &[u8]) -> Result<(), ()> {
+        self.inner.send_to(self.peer_ip, self.peer_port, data)
+    }
+
+    /// Await one datagram on this flow's inbox. Returns the source
+    /// `(ip, port, n)`; today inbound is not peer-filtered, so the
+    /// caller still sees datagrams from non-peer senders. Future
+    /// versions will drop those at delivery time.
+    #[inline]
+    pub fn recv<'a>(&'a self, buf: &'a mut [u8]) -> UdpRecv<'a> {
+        self.inner.recv_from(buf)
+    }
+
+    /// Local source port allocated for this flow.
+    #[inline]
+    pub fn local_port(&self) -> u16 {
+        self.inner.port()
+    }
+
+    /// The peer this flow is connected to.
+    #[inline]
+    pub fn peer(&self) -> ([u8; 4], u16) {
+        (self.peer_ip, self.peer_port)
+    }
+}
+
 // ---- UdpHandle: owning reference returned by `run` --------------------------
 
 type BoxedBody = Box<
