@@ -146,7 +146,7 @@ impl WebServerApp {
         let gateway = match uni::runtime::TcpListener::bind(GATEWAY_PORT) {
             Ok(listener) => {
                 let h = listener.run(move |stream| async move {
-                    let udp = match uni::runtime::UdpSocket::bind_ephemeral() {
+                    let udp = match uni::runtime::UdpSocket::open_ephemeral() {
                         Ok(s) => s,
                         Err(_) => return,
                     };

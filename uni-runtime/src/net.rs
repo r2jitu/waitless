@@ -400,10 +400,153 @@ impl UdpState {
 static UDP_REGISTRY: [UdpState; MAX_UDP_SOCKETS] =
     [const { UdpState::new() }; MAX_UDP_SOCKETS];
 
-/// Rotating cursor for `UdpSocket::bind_ephemeral`. Wraps naturally;
-/// the modulo in the bind path keeps it inside the ephemeral range.
-static EPHEMERAL_PORT_CURSOR: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
+// ---- Ephemeral port pool (per-worker) ---------------------------------------
+//
+// Ephemeral binds use a separate registry from server-style `bind(port)`:
+// every owner-pinned socket lives in a per-worker pool, with the slot
+// index encoding the port number. That gives `deliver_udp` an O(1)
+// port→slot mapping for ephemeral traffic, eliminates the linear-scan
+// hot path under heavy ephemeral churn, and removes any compile-time
+// cap (a worker can hold up to `EPH_RANGE / num_workers` concurrent
+// flows, the limit being the protocol-level port number space).
+//
+// Encoding: `port = EPHEMERAL_BASE + slot_idx * num_workers + worker_id`.
+// Inverse: `worker = (port - base) % num_workers`,
+//          `slot   = (port - base) / num_workers`.
+//
+// Storage is chunked: each worker has up to `MAX_CHUNKS_PER_WORKER`
+// pointers to lazily-allocated `EphChunk`s of `EPH_CHUNK_SIZE` slots.
+// New chunks are allocated on the owner worker only; cross-worker
+// readers (`deliver_udp`) acquire-load the chunk pointer and treat
+// null as "not bound."
+//
+// Per-slot bookkeeping is single-writer (the owner worker handles
+// every bind/unbind), so the free-list is a plain `Vec<u32>` behind
+// `UnsafeCell` rather than a lock-free queue.
+
+const EPHEMERAL_BASE: u16 = 49152;
+/// Slot count per chunk. Sized so a chunk fits comfortably in a few
+/// pages and so most workloads only ever allocate the first chunk.
+const EPH_CHUNK_SIZE: usize = 256;
+/// Worst-case (single-worker) ephemeral capacity is the full
+/// 16 384-port range divided into `EPH_CHUNK_SIZE` chunks. Higher
+/// worker counts use fewer chunks per worker; the surplus pointer
+/// slots stay null.
+const MAX_CHUNKS_PER_WORKER: usize = 64;
+
+struct EphSlot {
+    /// 0 ⇒ free; otherwise equals the encoded port for this slot
+    /// position. Cross-worker readers Acquire-load to observe the
+    /// inbox initialisation that the owner published before the
+    /// store of the port.
+    port: AtomicU16,
+    /// Single inbox owned by the worker that allocated this slot.
+    /// Producers (any worker via `deliver_udp`) push; the consumer
+    /// (the owning worker only, since `UdpSocket` is `!Send`) pops
+    /// via `recv_from`.
+    inbox: WorkerInbox,
+}
+
+impl EphSlot {
+    const fn new() -> Self {
+        EphSlot {
+            port: AtomicU16::new(0),
+            inbox: WorkerInbox::new(),
+        }
+    }
+}
+
+#[repr(C)]
+struct EphChunk {
+    slots: [EphSlot; EPH_CHUNK_SIZE],
+}
+
+struct EphPool {
+    chunks: [AtomicPtr<EphChunk>; MAX_CHUNKS_PER_WORKER],
+    /// Owner-worker-only bookkeeping. `UnsafeCell` because no other
+    /// worker reads or writes these fields; the pool is single-writer
+    /// for everything except `chunks` (cross-worker readable) and
+    /// `EphSlot::port` / `EphSlot::inbox` (cross-worker via SPSC).
+    bookkeeping: UnsafeCell<EphBookkeeping>,
+}
+
+struct EphBookkeeping {
+    /// Slots that were allocated and later freed; reused before
+    /// growing into never-allocated territory.
+    free_list: alloc::vec::Vec<u32>,
+    /// First slot index that has never been allocated.
+    next_alloc: u32,
+}
+
+// SAFETY: `chunks` is cross-worker-readable via Acquire/Release on
+// the AtomicPtrs; `bookkeeping` is single-writer (owner worker only).
+// Both invariants are upheld by the bind/unbind paths.
+unsafe impl Sync for EphPool {}
+
+impl EphPool {
+    fn new() -> Self {
+        EphPool {
+            chunks: [const { AtomicPtr::new(core::ptr::null_mut()) };
+                     MAX_CHUNKS_PER_WORKER],
+            bookkeeping: UnsafeCell::new(EphBookkeeping {
+                free_list: alloc::vec::Vec::new(),
+                next_alloc: 0,
+            }),
+        }
+    }
+}
+
+static EPH_POOLS: PerWorker<EphPool> = PerWorker::new();
+
+/// Idempotent boot-time init. Called from the first ephemeral
+/// `open` on each worker; cheap if already done.
+fn ensure_eph_init() {
+    EPH_POOLS.ensure_init(num_workers(), |_| EphPool::new());
+}
+
+/// Decode `(worker, slot_idx)` from a port in the ephemeral range,
+/// or `None` if the port is outside the range.
+#[inline]
+fn decode_eph(port: u16) -> Option<(u32, u32)> {
+    if port < EPHEMERAL_BASE {
+        return None;
+    }
+    let n = num_workers();
+    if n == 0 {
+        return None;
+    }
+    let off = (port - EPHEMERAL_BASE) as u32;
+    Some((off % n, off / n))
+}
+
+/// Look up the live `EphSlot` for `port`, returning `None` if the
+/// port is unbound (chunk null or slot's port field is 0). Acquire-
+/// loads the chunk pointer + slot port so the producer's Release
+/// stores in the bind path are observed.
+fn lookup_eph(port: u16) -> Option<&'static EphSlot> {
+    let (worker, slot_idx) = decode_eph(port)?;
+    if !EPH_POOLS.is_initialized() {
+        return None;
+    }
+    if worker >= EPH_POOLS.len() {
+        return None;
+    }
+    let pool = EPH_POOLS.at(worker);
+    let chunk_idx = (slot_idx as usize) / EPH_CHUNK_SIZE;
+    if chunk_idx >= MAX_CHUNKS_PER_WORKER {
+        return None;
+    }
+    let chunk = pool.chunks[chunk_idx].load(Ordering::Acquire);
+    if chunk.is_null() {
+        return None;
+    }
+    // SAFETY: chunks once published live for the process lifetime.
+    let slot = unsafe { &(*chunk).slots[(slot_idx as usize) % EPH_CHUNK_SIZE] };
+    if slot.port.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    Some(slot)
+}
 
 // ---- Backend vtable (UDP) ---------------------------------------------------
 
@@ -473,20 +616,21 @@ pub enum UdpBindError {
 
 /// A UDP socket bound to one port.
 ///
-/// Two lifecycles:
-///   * **Short-lived request/reply** (DHCP bring-up, DNS client,
-///     NTP query): `bind(port)?` → `send_to` / `recv_from` → drop.
-///     `Drop` releases the port slot.
-///   * **Long-lived listener / fan-out reactor** (UDP echo,
-///     QUIC): `bind(port)?.run(body)` returns a [`UdpHandle`]
-///     that stops the per-worker tasks and releases the port on
-///     drop. Store the handle on a long-lived owner (your `App`
-///     struct) so it tears down cleanly when the owner drops.
+/// Two lifecycles, backed by two different storage paths:
+///   * **Server-style** (`UdpSocket::bind(port)`): claims a slot in
+///     the static `UDP_REGISTRY`. Apps and shared listeners use this.
+///     Inbound delivery fans out to every worker's inbox so a
+///     `run`-style fanout body sees the receiving worker's flow.
+///   * **Ephemeral** (`UdpSocket::open_ephemeral`): allocates a slot
+///     in the calling worker's `EphPool`. The slot's *position* in
+///     the pool encodes the port number, so `deliver_udp` can route
+///     inbound packets in O(1) without scanning a registry. Owner-
+///     pinned: every reply lands in the allocating worker's inbox.
 #[must_use = "UdpSocket releases its port on drop; bind without \
               using the socket immediately releases it again"]
 pub struct UdpSocket {
     port: u16,
-    idx: usize,
+    slot: SlotRef,
     /// `UdpHandle::Drop` releases the port slot and calls the
     /// backend's unbind hook eagerly so a subsequent
     /// `bind(same_port)` works without waiting for aborted tasks
@@ -497,24 +641,42 @@ pub struct UdpSocket {
     released: AtomicBool,
 }
 
+#[derive(Clone, Copy)]
+enum SlotRef {
+    /// Index into the static `UDP_REGISTRY`.
+    Server(u32),
+    /// Position in the per-worker ephemeral pool. The port number
+    /// is fully determined by `(worker, slot_idx)`, which means
+    /// `deliver_udp` can recover the slot from the inbound port
+    /// without consulting a registry.
+    Ephemeral { worker: u32, slot_idx: u32 },
+}
+
 impl Drop for UdpSocket {
     fn drop(&mut self) {
         if self.released.swap(true, Ordering::AcqRel) {
             // Already released by `UdpHandle::Drop`.
             return;
         }
-        // Order matters: clear the registry slot first (so the
-        // port is immediately available for a new bind on this
-        // thread) and only then notify the backend. Native's
-        // unbind hook closes POSIX fds, which is much slower and
-        // doesn't need to happen before the slot is reusable.
-        UDP_REGISTRY[self.idx].port.store(0, Ordering::Release);
-        // Clear any sticky owner-worker so a future plain `bind`
-        // that lands on this slot doesn't inherit single-owner
-        // routing from the previous occupant.
-        UDP_REGISTRY[self.idx]
-            .owner_worker
-            .store(-1, Ordering::Release);
+        match self.slot {
+            SlotRef::Server(idx) => {
+                // Order matters: clear the registry slot first (so the
+                // port is immediately available for a new bind on this
+                // thread) and only then notify the backend. Native's
+                // unbind hook closes POSIX fds, which is much slower and
+                // doesn't need to happen before the slot is reusable.
+                UDP_REGISTRY[idx as usize].port.store(0, Ordering::Release);
+                // Clear any sticky owner-worker so a future plain `bind`
+                // that lands on this slot doesn't inherit single-owner
+                // routing from the previous occupant.
+                UDP_REGISTRY[idx as usize]
+                    .owner_worker
+                    .store(-1, Ordering::Release);
+            }
+            SlotRef::Ephemeral { worker, slot_idx } => {
+                release_eph_slot(worker, slot_idx);
+            }
+        }
         if let Some(unbind) = udp_backend().and_then(|b| b.unbind) {
             unbind(self.port);
         }
@@ -524,12 +686,35 @@ impl Drop for UdpSocket {
     }
 }
 
+/// Free an ephemeral slot. Owner-worker only: the bookkeeping
+/// (free list + next-alloc cursor) is single-writer by design.
+fn release_eph_slot(worker: u32, slot_idx: u32) {
+    if !EPH_POOLS.is_initialized() || worker >= EPH_POOLS.len() {
+        return;
+    }
+    let pool = EPH_POOLS.at(worker);
+    let chunk_idx = (slot_idx as usize) / EPH_CHUNK_SIZE;
+    if chunk_idx >= MAX_CHUNKS_PER_WORKER {
+        return;
+    }
+    let chunk = pool.chunks[chunk_idx].load(Ordering::Acquire);
+    if !chunk.is_null() {
+        // SAFETY: chunks once published live for the process lifetime.
+        let slot = unsafe {
+            &(*chunk).slots[(slot_idx as usize) % EPH_CHUNK_SIZE]
+        };
+        slot.port.store(0, Ordering::Release);
+    }
+    // Push slot index to the free list (owner-only access).
+    // SAFETY: `release_eph_slot` is invoked from `UdpSocket::Drop`,
+    // which runs on the owning worker (sockets are not migrated
+    // across workers; the recv future is `!Send`).
+    let bk = unsafe { &mut *pool.bookkeeping.get() };
+    bk.free_list.push(slot_idx);
+}
+
 impl UdpSocket {
     pub fn bind(port: u16) -> Result<UdpSocket, UdpBindError> {
-        Self::bind_with_owner(port, None)
-    }
-
-    fn bind_with_owner(port: u16, owner: Option<u32>) -> Result<UdpSocket, UdpBindError> {
         if port == 0 {
             return Err(UdpBindError::InvalidPort);
         }
@@ -553,23 +738,16 @@ impl UdpSocket {
                     }
                     inbox.reset();
                 }
-                // Pin owner BEFORE the backend bind: the backend may
-                // open its single socket on the owner's worker, and
-                // future replies will deliver into the owner's inbox
-                // before this fn returns.
-                state
-                    .owner_worker
-                    .store(owner.map_or(-1, |w| w as i32), Ordering::Release);
+                state.owner_worker.store(-1, Ordering::Release);
                 if let Some(bind) = udp_backend().and_then(|b| b.bind) {
-                    if bind(port, owner).is_err() {
+                    if bind(port, None).is_err() {
                         state.port.store(0, Ordering::Release);
-                        state.owner_worker.store(-1, Ordering::Release);
                         return Err(UdpBindError::BackendFailed);
                     }
                 }
                 return Ok(UdpSocket {
                     port,
-                    idx,
+                    slot: SlotRef::Server(idx as u32),
                     released: AtomicBool::new(false),
                 });
             }
@@ -577,36 +755,125 @@ impl UdpSocket {
         Err(UdpBindError::AllSlotsBusy)
     }
 
-    /// Bind to any unused port in the IANA ephemeral range
-    /// (49152-65535) and pin delivery to the calling worker.
-    /// Walks sequentially from a per-process rotating cursor so a
-    /// quick bind / drop / bind loop on the same worker doesn't
-    /// always retry the same just-released port (which can stay
-    /// tied up by the backend's recent state for a moment).
+    /// Open an ephemeral UDP socket pinned to the calling worker.
     ///
-    /// Pins the socket's owner-worker so inbound packets are
-    /// routed to *this* worker's inbox no matter which core saw
-    /// them on the wire. That's the correct routing for the
-    /// gateway / sidecar pattern (TCP conn ↔ one UDP socket on
-    /// one worker); without it, Tier 2 (single NIC RX queue,
-    /// multi-core) would deliver every reply to core 0 and the
-    /// recv on a non-zero worker would hang.
-    pub fn bind_ephemeral() -> Result<UdpSocket, UdpBindError> {
-        const EPHEMERAL_BASE: u16 = 49152;
+    /// Allocates a slot from the worker's `EphPool` (lock-free
+    /// per-worker free-list / bump allocator) and derives the port
+    /// number from the slot position via
+    /// `port = EPHEMERAL_BASE + slot_idx * num_workers + worker_id`.
+    /// That encoding lets `deliver_udp` route inbound packets to
+    /// the right slot in O(1) by decoding the port; no global
+    /// registry scan, no compile-time slot cap, no cross-worker
+    /// contention on bind.
+    ///
+    /// Owner-pinned by construction: every reply for this port
+    /// lands on the allocating worker's inbox regardless of which
+    /// core observed the wire packet (the same correctness
+    /// guarantee `bind_ephemeral` provided before this rewrite).
+    pub fn open_ephemeral() -> Result<UdpSocket, UdpBindError> {
+        ensure_eph_init();
         let me = CurrentWorker::enter().id();
-        let start = EPHEMERAL_PORT_CURSOR
-            .fetch_add(1, Ordering::Relaxed)
-            % (u16::MAX as u32 - EPHEMERAL_BASE as u32 + 1);
-        for offset in 0..(u16::MAX as u32 - EPHEMERAL_BASE as u32 + 1) {
-            let port = EPHEMERAL_BASE
-                + ((start + offset) % (u16::MAX as u32 - EPHEMERAL_BASE as u32 + 1)) as u16;
-            match Self::bind_with_owner(port, Some(me)) {
-                Ok(s) => return Ok(s),
-                Err(UdpBindError::PortInUse) => continue,
-                Err(e) => return Err(e),
+        let pool = EPH_POOLS.at(me);
+        let n = num_workers();
+        if n == 0 {
+            return Err(UdpBindError::AllSlotsBusy);
+        }
+
+        // Owner-only access to bookkeeping: pop a recycled slot or
+        // bump the never-allocated frontier.
+        // SAFETY: only the owning worker reaches this branch
+        // (PerWorker indexed by `me`), so the UnsafeCell is single-
+        // writer.
+        let slot_idx = unsafe {
+            let bk = &mut *pool.bookkeeping.get();
+            if let Some(idx) = bk.free_list.pop() {
+                idx
+            } else {
+                let idx = bk.next_alloc;
+                bk.next_alloc = bk.next_alloc.saturating_add(1);
+                idx
+            }
+        };
+
+        // Bound on the slot index so the encoded port stays inside
+        // the IANA ephemeral range.
+        let max_slots_per_worker = ((u16::MAX as u32) - EPHEMERAL_BASE as u32 + 1) / n;
+        if slot_idx >= max_slots_per_worker {
+            // Out of port space for this worker; push back the
+            // bumped index and bail.
+            // SAFETY: same owner-only bookkeeping invariant.
+            unsafe {
+                let bk = &mut *pool.bookkeeping.get();
+                bk.free_list.push(slot_idx);
+            }
+            return Err(UdpBindError::AllSlotsBusy);
+        }
+
+        // Lazily allocate the chunk for this slot index.
+        let chunk_idx = (slot_idx as usize) / EPH_CHUNK_SIZE;
+        if chunk_idx >= MAX_CHUNKS_PER_WORKER {
+            return Err(UdpBindError::AllSlotsBusy);
+        }
+        let chunk_ptr = pool.chunks[chunk_idx].load(Ordering::Acquire);
+        let chunk = if chunk_ptr.is_null() {
+            let boxed: Box<EphChunk> = Box::new(EphChunk {
+                slots: [const { EphSlot::new() }; EPH_CHUNK_SIZE],
+            });
+            let raw = Box::into_raw(boxed);
+            // Cross-worker readers acquire-load this pointer; we
+            // only ever publish a fully-initialised chunk.
+            match pool.chunks[chunk_idx].compare_exchange(
+                core::ptr::null_mut(),
+                raw,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => raw,
+                Err(existing) => {
+                    // Another path won; drop our box.
+                    // SAFETY: `raw` was never published.
+                    drop(unsafe { Box::from_raw(raw) });
+                    existing
+                }
+            }
+        } else {
+            chunk_ptr
+        };
+
+        // Initialise the slot's inbox + reset queue state.
+        // SAFETY: chunk is now published; slot index is in range.
+        let slot = unsafe { &(*chunk).slots[(slot_idx as usize) % EPH_CHUNK_SIZE] };
+        if !slot.inbox.ensure_alloc() {
+            return Err(UdpBindError::BackendFailed);
+        }
+        slot.inbox.reset();
+
+        let port = EPHEMERAL_BASE + (slot_idx * n + me) as u16;
+
+        // Publish the port AFTER inbox init so cross-worker readers
+        // never see a non-zero port for an uninitialised inbox.
+        slot.port.store(port, Ordering::Release);
+
+        // Notify the backend (native opens an actual fd; bare-metal
+        // is a no-op since routing is registry-only).
+        if let Some(bind) = udp_backend().and_then(|b| b.bind) {
+            if bind(port, Some(me)).is_err() {
+                // Roll back: clear port, mark slot free.
+                slot.port.store(0, Ordering::Release);
+                // SAFETY: owner-only access.
+                unsafe {
+                    let bk = &mut *pool.bookkeeping.get();
+                    bk.free_list.push(slot_idx);
+                }
+                return Err(UdpBindError::BackendFailed);
             }
         }
-        Err(UdpBindError::AllSlotsBusy)
+
+        Ok(UdpSocket {
+            port,
+            slot: SlotRef::Ephemeral { worker: me, slot_idx },
+            released: AtomicBool::new(false),
+        })
     }
 
     /// Port this socket is bound to.
@@ -758,7 +1025,19 @@ impl Drop for UdpHandle {
         //    last Arc drop and no-op.
         let sock = &*self.ctx.sock;
         if !sock.released.swap(true, Ordering::AcqRel) {
-            UDP_REGISTRY[sock.idx].port.store(0, Ordering::Release);
+            match sock.slot {
+                SlotRef::Server(idx) => {
+                    UDP_REGISTRY[idx as usize]
+                        .port
+                        .store(0, Ordering::Release);
+                    UDP_REGISTRY[idx as usize]
+                        .owner_worker
+                        .store(-1, Ordering::Release);
+                }
+                SlotRef::Ephemeral { worker, slot_idx } => {
+                    release_eph_slot(worker, slot_idx);
+                }
+            }
             if let Some(unbind) = udp_backend().and_then(|b| b.unbind) {
                 unbind(sock.port);
             }
@@ -791,7 +1070,21 @@ impl<'a> Future for UdpRecv<'a> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         let cc = CurrentWorker::enter();
-        let inbox = UDP_REGISTRY[this.sock.idx].inboxes.current(&cc);
+        let inbox = match this.sock.slot {
+            SlotRef::Server(idx) => {
+                UDP_REGISTRY[idx as usize].inboxes.current(&cc)
+            }
+            SlotRef::Ephemeral { worker, slot_idx } => {
+                // The recv future is `!Send`, so we're guaranteed
+                // to be on the owning worker (where the slot was
+                // allocated). The slot pointer is stable for the
+                // socket's lifetime because chunks are leaked.
+                let slot = lookup_eph_position(worker, slot_idx)
+                    .expect("ephemeral slot vanished mid-recv");
+                debug_assert_eq!(cc.id(), worker);
+                &slot.inbox
+            }
+        };
 
         // Fast path: data already in this worker's inbox.
         if let Some(r) = inbox.pop_into(this.buf) {
@@ -807,6 +1100,27 @@ impl<'a> Future for UdpRecv<'a> {
         }
         Poll::Pending
     }
+}
+
+/// Position-based ephemeral slot lookup. Unlike `lookup_eph` (which
+/// rejects free / out-of-range slots), this returns the slot
+/// reference even if `port` is 0 — it's used by paths where we
+/// already hold a `UdpSocket` and just need the inbox pointer.
+fn lookup_eph_position(worker: u32, slot_idx: u32) -> Option<&'static EphSlot> {
+    if !EPH_POOLS.is_initialized() || worker >= EPH_POOLS.len() {
+        return None;
+    }
+    let pool = EPH_POOLS.at(worker);
+    let chunk_idx = (slot_idx as usize) / EPH_CHUNK_SIZE;
+    if chunk_idx >= MAX_CHUNKS_PER_WORKER {
+        return None;
+    }
+    let chunk = pool.chunks[chunk_idx].load(Ordering::Acquire);
+    if chunk.is_null() {
+        return None;
+    }
+    // SAFETY: chunks once published live for the process lifetime.
+    Some(unsafe { &(*chunk).slots[(slot_idx as usize) % EPH_CHUNK_SIZE] })
 }
 
 // ---- Backend entry point ----------------------------------------------------
@@ -827,6 +1141,17 @@ impl<'a> Future for UdpRecv<'a> {
 ///     (single NIC RX queue, multi-core) every reply lands on
 ///     core 0 yet the recv waits on the conn's worker.
 pub fn deliver_udp(dst_port: u16, src_ip: [u8; 4], src_port: u16, payload: &[u8]) -> bool {
+    // Fast path: ephemeral ports route to the owning worker's slot
+    // by decoding the port — O(1) lookup, no scan.
+    if let Some(slot) = lookup_eph(dst_port) {
+        let _ = slot.inbox.try_push(src_ip, src_port, payload);
+        slot.inbox.wake_if_parked();
+        return true;
+    }
+
+    // Server-style ports: small linear scan over `UDP_REGISTRY`.
+    // In practice the bound count is tiny (one slot per declared
+    // listening port), so this stays cheap.
     let cc = CurrentWorker::enter();
     for state in UDP_REGISTRY.iter() {
         if state.port.load(Ordering::Acquire) == dst_port {
