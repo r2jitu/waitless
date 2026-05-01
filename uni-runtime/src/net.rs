@@ -85,7 +85,19 @@ pub const MAX_UDP_SOCKETS: usize = 256;
 /// x86 deploy path because the sectional layout is different.
 /// Keeping the buffer off-BSS sidesteps that limit entirely (and
 /// also means apps that never bind a UDP socket pay zero RAM).
-const INBOX_CAPACITY: usize = 64;
+/// Server-style bind inbox depth. Sized for udp_peak's bursty
+/// workload (NIC poll batches of 32+ packets per IRQ + slow drain
+/// → mid-batch drops at 16). 64 slots = 64 × 1508 B ≈ 96 KB per
+/// (worker, port) — affordable for the small set of declared
+/// listening ports.
+const SERVER_INBOX_CAPACITY: usize = 64;
+/// Ephemeral bind inbox depth. Tuned for request-response shapes
+/// (gateway flows, DNS clients, NTP) where there's only ever 1–2
+/// in-flight datagrams per binding. At thousands of concurrent
+/// ephemerals the per-binding inbox memory dominates the heap, so
+/// keep this small. 8 slots = 8 × 1508 B ≈ 12 KB per binding ⇒
+/// 5 000 binds ≈ 60 MB total inbox memory.
+const EPH_INBOX_CAPACITY: usize = 8;
 const MAX_PAYLOAD: usize = 1500;
 
 // ---- SpinLock (waker cell) --------------------------------------------------
@@ -207,26 +219,30 @@ impl Datagram {
 /// same worker in the common case: the delivery path runs on the
 /// core that received the packet, and the `recv_from` task awaits
 /// on that same worker.
+///
+/// Capacity is per-bind, not a global const, so server bindings
+/// can keep deep buffers for burst tolerance (e.g. udp_peak) while
+/// ephemeral bindings — almost always request-response, so 1–2
+/// in-flight at most — stay cheap. At thousands of concurrent
+/// ephemeral binds the per-binding inbox memory is the dominant
+/// heap cost: a 64-slot inbox is ~96 KB; an 8-slot inbox is ~12 KB.
 struct WorkerInbox {
     head: AtomicU32,
     tail: AtomicU32,
-    /// Heap-allocated array of `INBOX_CAPACITY` datagram slots,
-    /// allocated on first `bind()` of the owning socket and
-    /// preserved across rebinds (cheaper than re-allocating). Null
-    /// on a never-bound `UdpState` slot. Acquire-load on read so
-    /// `bind()`'s Release store on the allocating worker is visible
-    /// to other workers' producer/consumer paths.
+    /// Heap-allocated `[Datagram; capacity]`, allocated on first
+    /// bind via `ensure_alloc` (capacity baked in at that point)
+    /// and preserved across rebinds. Null until the first bind.
     slots: AtomicPtr<Datagram>,
+    /// Capacity is a power of two so wrap-around is `(idx+1) & mask`
+    /// instead of a runtime modulo. Stored on the inbox itself so
+    /// different bindings can use different capacities.
+    mask: AtomicU32,
     /// Hot-path gate for the producer's "wake the receiver" step.
     /// `false` means there is no parked task to wake — the producer
-    /// can skip the `waker.lock()` round-trip entirely. `true`
-    /// means the receiver parked a waker the producer must consume.
-    /// Set by the receiver (`UdpRecvFrom::poll` slow path) and
-    /// cleared by the producer (after taking + waking) or by the
-    /// receiver itself when it pops via the slow→fast transition.
-    /// Skipping the lock is the single biggest win on the udp_peak
-    /// hot path: at ~700k pps, two atomic ops on the spinlock
-    /// cache line per packet was costing ~half the throughput.
+    /// can skip the `waker.lock()` round-trip entirely. Skipping
+    /// the lock is the single biggest win on the udp_peak hot path:
+    /// at ~700k pps, two atomic ops on the spinlock cache line per
+    /// packet was costing ~half the throughput.
     waker_present: core::sync::atomic::AtomicBool,
     waker: SpinLock<Option<Waker>>,
 }
@@ -240,29 +256,30 @@ impl WorkerInbox {
             head: AtomicU32::new(0),
             tail: AtomicU32::new(0),
             slots: AtomicPtr::new(core::ptr::null_mut()),
+            mask: AtomicU32::new(0),
             waker_present: core::sync::atomic::AtomicBool::new(false),
             waker: SpinLock::new(None),
         }
     }
 
-    /// Lazily allocate this worker's slot array on heap. Idempotent
-    /// across rebinds — once allocated, the array sticks around for
-    /// the lifetime of the process. Called from `UdpSocket::bind()`
-    /// on every worker's inbox before any producer/consumer can race
-    /// against the slots pointer. Returns `false` if allocation fails.
-    fn ensure_alloc(&self) -> bool {
+    /// Lazily allocate this inbox's slot array. `capacity` must be
+    /// a power of two ≤ 1024. Idempotent across rebinds; once
+    /// allocated, the array (and its capacity) stick for the
+    /// process. Returns `false` on allocation failure.
+    fn ensure_alloc(&self, capacity: usize) -> bool {
         if !self.slots.load(Ordering::Acquire).is_null() {
             return true;
         }
-        let mut boxed: Box<[Datagram; INBOX_CAPACITY]> =
-            Box::new([const { Datagram::ZERO }; INBOX_CAPACITY]);
-        let ptr = boxed.as_mut_ptr();
-        // Leak the Box — the static `UDP_REGISTRY` retains ownership
-        // implicitly via the AtomicPtr. We deliberately never free
-        // (rebinds reuse the slots, and the registry is process-
-        // lifetime), so leaking the smart pointer is the simplest
-        // way to express "static-with-deferred-init".
-        Box::leak(boxed);
+        debug_assert!(capacity.is_power_of_two());
+        debug_assert!(capacity > 0);
+        let mut buf: alloc::vec::Vec<Datagram> =
+            alloc::vec::Vec::with_capacity(capacity);
+        for _ in 0..capacity {
+            buf.push(Datagram::ZERO);
+        }
+        let boxed = buf.into_boxed_slice();
+        let ptr = Box::leak(boxed).as_mut_ptr();
+        self.mask.store((capacity as u32) - 1, Ordering::Release);
         self.slots.store(ptr, Ordering::Release);
         true
     }
@@ -272,9 +289,10 @@ impl WorkerInbox {
         if slots_ptr.is_null() {
             return false;
         }
+        let mask = self.mask.load(Ordering::Relaxed);
         let tail = self.tail.load(Ordering::Relaxed);
         let head = self.head.load(Ordering::Acquire);
-        let next = tail.wrapping_add(1) % INBOX_CAPACITY as u32;
+        let next = tail.wrapping_add(1) & mask;
         if next == head {
             return false;
         }
@@ -297,6 +315,7 @@ impl WorkerInbox {
         if slots_ptr.is_null() {
             return None;
         }
+        let mask = self.mask.load(Ordering::Relaxed);
         let head = self.head.load(Ordering::Relaxed);
         let tail = self.tail.load(Ordering::Acquire);
         if head == tail {
@@ -308,7 +327,7 @@ impl WorkerInbox {
         let n = (slot.len as usize).min(buf.len());
         buf[..n].copy_from_slice(&slot.payload[..n]);
         let r = (slot.src_ip, slot.src_port, n);
-        let next = head.wrapping_add(1) % INBOX_CAPACITY as u32;
+        let next = head.wrapping_add(1) & mask;
         self.head.store(next, Ordering::Release);
         Some(r)
     }
@@ -715,7 +734,7 @@ impl UdpSocket {
                 state.inboxes.ensure_init(num_workers(), |_| WorkerInbox::new());
                 for w in 0..num_workers() {
                     let inbox = state.inboxes.at(w);
-                    if !inbox.ensure_alloc() {
+                    if !inbox.ensure_alloc(SERVER_INBOX_CAPACITY) {
                         state.port.store(0, Ordering::Release);
                         return Err(UdpBindError::BackendFailed);
                     }
@@ -825,7 +844,7 @@ impl UdpSocket {
         // Initialise the slot's inbox + reset queue state.
         // SAFETY: chunk is now published; slot index is in range.
         let slot = unsafe { &(*chunk).slots[(slot_idx as usize) % EPH_CHUNK_SIZE] };
-        if !slot.inbox.ensure_alloc() {
+        if !slot.inbox.ensure_alloc(EPH_INBOX_CAPACITY) {
             return Err(UdpBindError::BackendFailed);
         }
         slot.inbox.reset();

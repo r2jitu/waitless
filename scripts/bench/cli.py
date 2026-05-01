@@ -205,16 +205,21 @@ WORKLOADS = [
     # forwards per worker without OS threads; native (Linux+Tokio
     # equivalent) pays ~5 syscalls per request just to push bytes.
     #
-    # `conns_per_core: 64` is high enough to expose the runner's
-    # throughput ceiling rather than per-conn round-trip latency
-    # (at low conn counts the 8-conn pipeline serialises and HVF
-    # looks much worse than its actual ceiling — see commit
-    # message of the heap+inbox bump for the analysis). Heap
-    # budget at 64 × 3-vcpu × 64-slot inbox × 1508 B ≈ 18 MB,
-    # well inside the kernel's 96 MB heap.
+    # `conns_per_core: 1000` exercises the post-refactor extreme-
+    # concurrency path: per-worker ephemeral UDP pool with port-
+    # encoded owner, native O(1) port→fd table. At 3 vCPUs that's
+    # 3000 simultaneous TCP conns each owning an ephemeral UDP
+    # flow to the backend — well past the old MAX_UDP_SOCKETS=256
+    # cliff and into territory where the registry-scan dispatch
+    # would have collapsed.
+    #
+    # Inbox heap budget: 1000 × 3-vcpu × 64-slot inbox × 1508 B
+    # ≈ 290 MB. Apps wanting tiny VMs should drop INBOX_CAPACITY
+    # before bumping conns; the runtime's static MAX_UDP_SOCKETS
+    # no longer caps ephemeral allocations.
     {"name": "gateway_max", "type": "gateway",
-     "conns_per_core": 64,
-     "desc": "Gateway fan-out (TCP→UDP backend→TCP, 64 conn × cpus)"},
+     "conns_per_core": 2000,
+     "desc": "Gateway fan-out (TCP→UDP backend→TCP, 2000 conn × cpus)"},
 ]
 
 

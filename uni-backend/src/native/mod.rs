@@ -8,8 +8,10 @@
 // model.
 
 use std::cell::UnsafeCell;
+use std::collections::HashMap;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::task::Waker;
 use atomic_fn::AtomicFn;
 
@@ -317,18 +319,24 @@ impl NativeConn {
 /// `udp_bind` time, one entry per `-p udp:...` relay. Drained
 /// inline from `collect_events` when the kqueue/epoll reports the fd
 /// ready — no dedicated RX thread, matches HVF's inline-poll design.
-#[derive(Clone, Copy)]
-struct UdpSibling {
-    fd: i32,
-    binding_idx: usize,
-}
-
 struct ThreadState {
     conns: [NativeConn; CONNS_PER_THREAD],
     eq_fd: i32,  // kqueue (macOS) or epoll (Linux) fd
     thread_id: u32,
-    udp_sibs: [UdpSibling; MAX_UDP_BINDINGS],
-    udp_sib_count: usize,
+    /// Sparse port → fd table for `udp_send`. 65536 `AtomicI32`
+    /// entries (-1 means "no fd for this port on this thread"),
+    /// allocated once at thread setup. Cross-thread bind sets the
+    /// entry via Release; same-thread send loads it via Relaxed.
+    /// Eliminates the linear scan that the old fixed-size
+    /// `UDP_BINDINGS` table required, so `udp_send` stays O(1)
+    /// even at thousands of concurrent ephemeral binds.
+    udp_send_fd: AtomicPtr<AtomicI32>,
+    /// fd → app_port map used by `try_dispatch_fd_event` to learn
+    /// which UDP port a kqueue/epoll-fired fd belongs to. Single-
+    /// writer (only this thread mutates) — server-fanout binds
+    /// run before workers start, ephemeral binds run on the
+    /// owning worker.
+    udp_dispatch: UnsafeCell<Option<HashMap<i32, u16>>>,
 }
 
 impl ThreadState {
@@ -337,16 +345,77 @@ impl ThreadState {
             conns: [const { NativeConn::empty() }; CONNS_PER_THREAD],
             eq_fd: -1,
             thread_id: id,
-            udp_sibs: [UdpSibling { fd: -1, binding_idx: 0 }; MAX_UDP_BINDINGS],
-            udp_sib_count: 0,
+            udp_send_fd: AtomicPtr::new(ptr::null_mut()),
+            udp_dispatch: UnsafeCell::new(None),
         }
     }
 
-    fn add_udp_sibling(&mut self, fd: i32, binding_idx: usize) {
-        if self.udp_sib_count >= MAX_UDP_BINDINGS { return; }
-        self.udp_sibs[self.udp_sib_count] = UdpSibling { fd, binding_idx };
-        self.udp_sib_count += 1;
+    /// Heap-allocate the per-thread UDP fast-path tables. Called
+    /// from thread setup before workers start. Idempotent.
+    fn init_udp_tables(&self) {
+        if !self.udp_send_fd.load(Ordering::Relaxed).is_null() {
+            return;
+        }
+        let mut v: Vec<AtomicI32> = Vec::with_capacity(65536);
+        for _ in 0..65536 {
+            v.push(AtomicI32::new(-1));
+        }
+        let boxed: Box<[AtomicI32]> = v.into_boxed_slice();
+        let raw = Box::leak(boxed).as_mut_ptr();
+        self.udp_send_fd.store(raw, Ordering::Release);
+        // SAFETY: single-writer at boot before workers spawn, then
+        // single-writer on this thread for runtime updates.
+        unsafe { *self.udp_dispatch.get() = Some(HashMap::new()); }
+    }
+
+    /// Register `(fd, app_port)` on this thread's UDP fast-path
+    /// tables and arm the event queue for read-readiness. Used by
+    /// both the server-fanout bind path (cross-thread, boot-only)
+    /// and the ephemeral bind path (same-thread, runtime).
+    fn add_udp_binding(&self, fd: i32, app_port: u16) {
+        // Send-side: O(1) port → fd lookup.
+        let table = self.udp_send_fd.load(Ordering::Acquire);
+        if !table.is_null() {
+            // SAFETY: table points to a leaked 65536-entry slice;
+            // app_port is a u16, so the index is in bounds.
+            unsafe {
+                (*table.add(app_port as usize)).store(fd, Ordering::Release);
+            }
+        }
+        // Drain-side: O(1) fd → port lookup.
+        // SAFETY: server-fanout binds run on the main thread before
+        // workers start; ephemeral binds run on the owning worker.
+        // Either way, no concurrent access.
+        unsafe {
+            if let Some(map) = &mut *self.udp_dispatch.get() {
+                map.insert(fd, app_port);
+            }
+        }
         self.register_fd(fd);
+    }
+
+    /// Tear down the entries `add_udp_binding` published. Called
+    /// from `udp_backend_unbind` for every thread that owned a
+    /// sibling fd for this port.
+    fn remove_udp_binding(&self, fd: i32, app_port: u16) {
+        let table = self.udp_send_fd.load(Ordering::Acquire);
+        if !table.is_null() {
+            unsafe {
+                // Compare-exchange so we only clear if this thread's
+                // entry is still our fd (a concurrent rebind may
+                // have replaced it).
+                let entry = &*table.add(app_port as usize);
+                let _ = entry.compare_exchange(
+                    fd, -1, Ordering::AcqRel, Ordering::Acquire,
+                );
+            }
+        }
+        // SAFETY: same single-writer invariant as `add_udp_binding`.
+        unsafe {
+            if let Some(map) = &mut *self.udp_dispatch.get() {
+                map.remove(&fd);
+            }
+        }
     }
 
     fn init_event_queue(&mut self) {
@@ -568,11 +637,17 @@ impl ThreadState {
             }
             return false;
         }
-        for i in 0..self.udp_sib_count {
-            if self.udp_sibs[i].fd == fd {
-                drain_udp_sibling(fd, self.udp_sibs[i].binding_idx);
-                return true;
-            }
+        // O(1) UDP fd → app_port lookup (was a linear scan over a
+        // 256-entry sibling array). Only this thread mutates the
+        // dispatch map, so the UnsafeCell read is safe.
+        let app_port = unsafe {
+            (*self.udp_dispatch.get())
+                .as_ref()
+                .and_then(|m| m.get(&fd).copied())
+        };
+        if let Some(port) = app_port {
+            drain_udp_sibling(fd, port);
+            return true;
         }
         // Async TCP listener fd fired → wake the reactor's accept
         // future on this worker; the task's next poll drains accept.
@@ -599,13 +674,7 @@ impl ThreadState {
 /// dispatching the app handler for each datagram. Called from the
 /// worker thread's `collect_events` when its kqueue/epoll reports the
 /// sibling ready.
-fn drain_udp_sibling(fd: i32, binding_idx: usize) {
-    let app_port = unsafe {
-        match (*UDP_BINDINGS.0.get())[binding_idx] {
-            Some(ref b) => b.app_port,
-            None => return,
-        }
-    };
+fn drain_udp_sibling(fd: i32, app_port: u16) {
     let mut buf = [0u8; 65536];
     loop {
         let mut src_addr: SockAddrIn = unsafe { std::mem::zeroed() };
@@ -777,6 +846,7 @@ fn init_native() {
         for i in 0..num_threads {
             threads[i].thread_id = i as u32;
             threads[i].init_event_queue();
+            threads[i].init_udp_tables();
         }
 
         // Cast through a function pointer first; rust 1.93+ rejects
@@ -1335,32 +1405,41 @@ fn tcp_register_shared_listener() {
 // ============================================================================
 // UDP support
 // ============================================================================
+//
+// Two routing modes (mirroring the runtime's `UdpSocket::bind` /
+// `UdpSocket::open_ephemeral` split):
+//
+// * **Server fanout** (`owner_worker == None`): open one
+//   SO_REUSEPORT sibling per worker; the kernel distributes
+//   inbound datagrams across siblings by 4-tuple hash. Replies
+//   use the receiving thread's own sibling fd so the source port
+//   stays equal to the bind port (NAT-correct) without
+//   cross-thread socket contention.
+//
+// * **Single-owner ephemeral** (`owner_worker == Some(w)`): open
+//   exactly one socket on worker `w`. Every reply lands on `w`'s
+//   event queue.
+//
+// Hot-path lookups (send + drain dispatch) use per-thread tables
+// allocated in `ThreadState::init_udp_tables`, not this global
+// `UdpBinding` table — this map is consulted only by
+// `udp_backend_unbind` to enumerate which fds to close. So the
+// `Mutex<HashMap>` here is uncontended on the data path even at
+// thousands of concurrent ephemeral binds.
 
-const MAX_UDP_BINDINGS: usize = 256;
-
-/// One UDP relay. Holds `NUM_THREADS` SO_REUSEPORT sibling sockets all
-/// bound to the same host port. Incoming datagrams are distributed
-/// across the siblings by the kernel (4-tuple hash) so each UDP worker
-/// thread blocks on its own fd's `recvfrom` and runs the app handler
-/// inline. Replies use the receiving thread's sibling fd, which keeps
-/// the reply source port equal to the relay port (NAT-correct) and
-/// avoids cross-thread contention on a single kernel socket lock.
+/// One UDP relay's metadata: which workers hold which fds.
 struct UdpBinding {
+    /// `fds[i]` is the fd registered with worker `i`'s event
+    /// queue, or `-1` for workers with no sibling. For the
+    /// single-owner model only `fds[owner]` is non-negative.
     fds: [i32; MAX_THREADS],
-    sibling_count: usize,
-    app_port: u16,  // port as requested by app (used for send-side lookup)
 }
 
-// UDP relay table. Entries written by `udp_bind` on the main thread
-// (before workers start); workers read their owned sibling fd from
-// the entry.
-struct UdpBindingsSlot(UnsafeCell<[Option<UdpBinding>; MAX_UDP_BINDINGS]>);
-// SAFETY: populated only on the main thread during `uni_boot`; read
-// from workers afterwards without further mutation.
-unsafe impl Sync for UdpBindingsSlot {}
-static UDP_BINDINGS: UdpBindingsSlot =
-    UdpBindingsSlot(UnsafeCell::new([const { None }; MAX_UDP_BINDINGS]));
-static UDP_COUNT: AtomicUsize = AtomicUsize::new(0);
+fn udp_bindings() -> &'static Mutex<HashMap<u16, UdpBinding>> {
+    static UDP_BINDINGS: OnceLock<Mutex<HashMap<u16, UdpBinding>>> =
+        OnceLock::new();
+    UDP_BINDINGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 /// Open one non-blocking UDP socket on `bind_port`. When
 /// `reuseport` is set the socket joins the SO_REUSEPORT group on
@@ -1417,125 +1496,71 @@ fn udp_backend_bind(port: u16, owner_worker: Option<u32>) -> Result<(), ()> {
     open_udp_relay(port, owner_worker)
 }
 
-/// Hook registered with `register_backend_udp_unbind`. Mirrors
-/// `udp_backend_bind`: closes every SO_REUSEPORT sibling opened
-/// for `app_port` and frees the binding slot. kqueue/epoll
-/// auto-remove fds on close, so the thread-local `udp_sibs`
-/// entries simply start seeing EBADF from `recvfrom` — which the
-/// drain loop already treats as "no more data". Leaving the
-/// stale entries rather than tracking them down keeps `ThreadState`
-/// free of cross-thread mutation on the unbind path.
+/// Hook registered with `register_backend_udp_unbind`. Closes
+/// every sibling fd opened for `app_port`, clears the per-thread
+/// fast-path tables, and removes the binding from the global map.
 fn udp_backend_unbind(app_port: u16) {
-    unsafe {
-        let count = UDP_COUNT.load(Ordering::Acquire);
-        let bindings = &mut *UDP_BINDINGS.0.get();
-        for entry in bindings.iter_mut().take(count) {
-            if let Some(b) = entry {
-                if b.app_port == app_port {
-                    for i in 0..b.sibling_count {
-                        if b.fds[i] >= 0 {
-                            close(b.fds[i]);
-                        }
-                    }
-                    *entry = None;
-                    return;
-                }
-            }
+    let binding = match udp_bindings().lock().unwrap().remove(&app_port) {
+        Some(b) => b,
+        None => return,
+    };
+    let threads = unsafe { &*THREADS.0.get() };
+    for (worker_id, &fd) in binding.fds.iter().enumerate() {
+        if fd < 0 {
+            continue;
         }
+        threads[worker_id].remove_udp_binding(fd, app_port);
+        unsafe { close(fd); }
     }
 }
 
-/// Open SO_REUSEPORT siblings for `app_port` and register each in
-/// its worker's kqueue/epoll. Returns `Err(())` if the OS refused
-/// the first sibling bind — higher layers surface that as
-/// `UdpBindError::BackendFailed`.
+/// Open SO_REUSEPORT siblings (or one owner-pinned socket) for
+/// `app_port` and publish the fds into the per-thread fast-path
+/// tables. Returns `Err(())` if the OS refused the first bind —
+/// higher layers surface that as `UdpBindError::BackendFailed`.
 fn open_udp_relay(app_port: u16, owner_worker: Option<u32>) -> Result<(), ()> {
-    unsafe {
-        // CAS-claim the next free slot. fetch_add lets two
-        // concurrent binds claim distinct slots without stepping
-        // on each other; the cap check fires after the bump so
-        // losing the race past MAX returns Err and yields the
-        // claimed-but-unused slot back as wasted (fine — these
-        // are rare lifecycle events).
-        let binding_idx = UDP_COUNT.fetch_add(1, Ordering::AcqRel);
-        if binding_idx >= MAX_UDP_BINDINGS {
-            UDP_COUNT.store(MAX_UDP_BINDINGS, Ordering::Release);
-            return Err(());
-        }
+    // Per-port override keyed on the app's requested port:
+    // `UNIKERNEL_UDP_<port>` swaps in a different host-bind port.
+    let bind_port = read_port_env("UDP", app_port).unwrap_or(app_port);
 
-        // Per-port override keyed on the app's requested port:
-        // `UNIKERNEL_UDP_<port>` swaps in a different host-bind
-        // port. Each app-requested UDP port has its own knob — no
-        // shared base + offset remapping.
-        let bind_port = read_port_env("UDP", app_port).unwrap_or(app_port);
-
-        let mut fds = [-1i32; MAX_THREADS];
-        let (got, slot) = match owner_worker {
-            None => {
-                // Fanout model — open NUM_THREADS SO_REUSEPORT
-                // siblings so the kernel distributes inbound by
-                // 4-tuple hash across per-worker recv loops.
-                let want = NUM_THREADS.load(Ordering::Acquire).max(1);
-                let mut got = 0usize;
-                for i in 0..want {
-                    let fd = open_udp_sibling(bind_port, true);
-                    if fd < 0 {
-                        if i == 0 {
-                            // Return the claimed slot — leave the
-                            // entry at None.
-                            return Err(());
-                        }
-                        break;
+    let mut fds = [-1i32; MAX_THREADS];
+    match owner_worker {
+        None => {
+            // Server fanout: NUM_THREADS SO_REUSEPORT siblings.
+            let want = NUM_THREADS.load(Ordering::Acquire).max(1);
+            for i in 0..want {
+                let fd = open_udp_sibling(bind_port, true);
+                if fd < 0 {
+                    if i == 0 {
+                        return Err(());
                     }
-                    fds[i] = fd;
-                    got += 1;
+                    break;
                 }
-                (got, 0usize)
-            }
-            Some(w) => {
-                // Single-owner model — one socket on worker `w`'s
-                // kqueue, no SO_REUSEPORT. Every reply for this
-                // bind lands on the owning worker. The fd lives at
-                // `fds[0]` (not `fds[w]`) because `udp_send` falls
-                // back to `fds[0]` whenever `tid >= sibling_count`
-                // — and `sibling_count == 1` here, so all workers
-                // hit the fallback and need the fd in slot 0.
-                let w = w as usize;
-                if w >= MAX_THREADS { return Err(()); }
-                let fd = open_udp_sibling(bind_port, false);
-                if fd < 0 { return Err(()); }
-                fds[0] = fd;
-                (1usize, w)
-            }
-        };
-
-        (*UDP_BINDINGS.0.get())[binding_idx] = Some(UdpBinding {
-            fds,
-            sibling_count: got,
-            app_port,
-        });
-
-        // Register the fd(s) in the owning worker(s)' event queue.
-        // For fanout: each sibling `i` registers in worker `i`'s
-        // kqueue — only safe when binds run before workers start
-        // (boot-time `UdpSocket::bind`/`run` registrations).
-        // For single-owner: register on the owning worker's
-        // kqueue. The bind ran on that worker (it's the calling
-        // worker), so this is local-only mutation — no cross-
-        // thread race on the worker's own ThreadState.
-        let threads = &mut *THREADS.0.get();
-        match owner_worker {
-            None => {
-                for worker_id in 0..got {
-                    threads[worker_id].add_udp_sibling(fds[worker_id], binding_idx);
-                }
-            }
-            Some(_) => {
-                threads[slot].add_udp_sibling(fds[0], binding_idx);
+                fds[i] = fd;
             }
         }
-        Ok(())
+        Some(w) => {
+            // Single-owner: one socket on the owning worker.
+            let w = w as usize;
+            if w >= MAX_THREADS { return Err(()); }
+            let fd = open_udp_sibling(bind_port, false);
+            if fd < 0 { return Err(()); }
+            fds[w] = fd;
+        }
     }
+
+    // Publish into the global metadata map (used only by unbind to
+    // enumerate which fds to close).
+    udp_bindings().lock().unwrap().insert(app_port, UdpBinding { fds });
+
+    // Wire up per-thread fast-path tables + event queues.
+    let threads = unsafe { &*THREADS.0.get() };
+    for (worker_id, &fd) in fds.iter().enumerate() {
+        if fd >= 0 {
+            threads[worker_id].add_udp_binding(fd, app_port);
+        }
+    }
+    Ok(())
 }
 
 fn udp_send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
@@ -1546,18 +1571,19 @@ fn udp_send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
         // source port is already equal to the relay port, which keeps
         // NAT path-correct.
         let tid = uni_platform::current_worker() as usize;
+        // O(1) port → fd lookup via the per-thread sparse table.
+        // Falls back to opening a fresh ephemeral socket if no
+        // binding exists for `src_port` (e.g. send-without-bind
+        // patterns the tests exercise).
+        let threads = &*THREADS.0.get();
         let mut send_fd = -1;
-        let bindings = &*UDP_BINDINGS.0.get();
-        let count = UDP_COUNT.load(Ordering::Acquire);
-        for i in 0..count {
-            if let Some(ref b) = bindings[i] {
-                if b.app_port == src_port && b.sibling_count > 0 {
-                    send_fd = if tid < b.sibling_count && b.fds[tid] >= 0 {
-                        b.fds[tid]
-                    } else {
-                        b.fds[0]
-                    };
-                    break;
+        if tid < MAX_THREADS {
+            let table = threads[tid].udp_send_fd.load(Ordering::Acquire);
+            if !table.is_null() {
+                let entry = &*table.add(src_port as usize);
+                let v = entry.load(Ordering::Relaxed);
+                if v >= 0 {
+                    send_fd = v;
                 }
             }
         }

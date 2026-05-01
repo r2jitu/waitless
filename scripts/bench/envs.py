@@ -331,9 +331,14 @@ class HvfEnv:
         # forwards HTTPS to guest:443; -p tcp:HOST:9 forwards the
         # async TCP echo test; -p tcp:HOST:9000 forwards the
         # gateway listener; -p udp:HOST:GUEST forwards UDP echo.
+        # 512 MB so the gateway_max workload's thousand-conn shape
+        # — each ephemeral UDP binding allocates an inbox on the
+        # kernel heap — fits with comfortable headroom. Smaller
+        # workloads cost the host nothing extra; the heap grows
+        # dynamically and unused pages stay unfaulted.
         return subprocess.Popen(
             [run_hvf, img,
-             "--ram=128", f"--cpus={cpus}",
+             "--ram=512", f"--cpus={cpus}",
              "-p", f"tcp:{port}:80",
              "-p", f"tcp:{tls_port}:443",
              "-p", f"tcp:{tcp_echo_port}:9",
