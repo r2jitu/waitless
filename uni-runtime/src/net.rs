@@ -1097,17 +1097,33 @@ impl UdpFlow {
         self.inner.recv_from(buf)
     }
 
-    /// Zero-copy receive — see [`UdpSocket::recv_inplace`]. The
-    /// closure runs against a slice borrow of the inbox slot, no
-    /// copy into a user buffer. For QUIC client-side parsing where
-    /// the short-header decode is the bulk of the per-packet cost
-    /// this is the fastest receive path the runtime offers.
+    /// Zero-copy receive — the 3-arg closure form, see
+    /// [`UdpSocket::recv_inplace`]. The `(src_ip, src_port)`
+    /// arguments are usually redundant on a connected flow (every
+    /// datagram is supposed to come from `peer()`); use
+    /// [`recv_payload`](Self::recv_payload) when you don't need
+    /// the source.
     #[inline]
     pub fn recv_inplace<F, R>(&self, f: F) -> UdpRecvInplace<'_, F, R>
     where
         F: FnOnce(&[u8], [u8; 4], u16) -> R + Unpin,
     {
         self.inner.recv_inplace(f)
+    }
+
+    /// Zero-copy receive of just the payload. Tighter ergonomics
+    /// for connected-flow code that doesn't care about the source
+    /// — the peer is fixed at `connect` time and all incoming
+    /// datagrams are assumed to come from it. Internally adapts
+    /// the 1-arg closure to [`UdpSocket::recv_inplace`]'s 3-arg
+    /// form.
+    pub async fn recv_payload<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&[u8]) -> R + Unpin,
+    {
+        self.inner
+            .recv_inplace(move |payload, _src_ip, _src_port| f(payload))
+            .await
     }
 
     /// Non-blocking copy receive. See [`UdpSocket::try_recv_from`].
@@ -1494,6 +1510,26 @@ impl TcpStream {
     #[inline]
     pub fn recv<'a>(&'a self, buf: &'a mut [u8]) -> TcpRecv<'a> {
         TcpRecv::new(self.handle, self.generation, buf)
+    }
+
+    /// Drain exactly `buf.len()` bytes into `buf`. Returns `Ok(())`
+    /// when full, `Err(n_filled)` if the peer closed before all
+    /// bytes arrived (the partial prefix is left in `buf`).
+    ///
+    /// Saves the manual `while got < N { ... }` loop every TCP
+    /// server otherwise writes for fixed-size frames; for streamed
+    /// protocols use `recv` directly.
+    pub async fn recv_exact(&self, buf: &mut [u8]) -> Result<(), usize> {
+        let total = buf.len();
+        let mut got = 0;
+        while got < total {
+            let n = self.recv(&mut buf[got..]).await;
+            if n == 0 {
+                return Err(got);
+            }
+            got += n;
+        }
+        Ok(())
     }
 
     /// Async write. Resolves `Ok(())` when every byte of `data`

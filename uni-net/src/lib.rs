@@ -135,6 +135,30 @@ impl Net {
         Ok(Net { _private: () })
     }
 
+    /// Try DHCP first; on failure (typical under minimal tap
+    /// networks or stripped HVF configs) fall back to the supplied
+    /// static configuration. Logs which path won via `uni_log!`.
+    ///
+    /// Use this when you want graceful boot on diverse network
+    /// environments without writing the match-fallback ladder by
+    /// hand. Equivalent to:
+    /// ```ignore
+    /// match Net::enable(Dhcp).await {
+    ///     Ok(n) => n,
+    ///     Err(_) => Net::enable(Static { ip, gateway, netmask }).await?,
+    /// }
+    /// ```
+    pub async fn dhcp_or_static(
+        ip: Ipv4Addr,
+        gateway: Ipv4Addr,
+        netmask: Ipv4Addr,
+    ) -> Result<Net, NetError> {
+        match Self::enable(NetBringUp::Dhcp).await {
+            Ok(n) => Ok(n),
+            Err(_) => Self::enable(NetBringUp::Static { ip, gateway, netmask }).await,
+        }
+    }
+
     /// Our configured IPv4 address. Returns `UNSPECIFIED` if the
     /// stack came up but neither DHCP nor the static config
     /// actually produced one (shouldn't happen under normal

@@ -16,7 +16,7 @@ use alloc::format;
 use alloc::string::String;
 use core::fmt::Write as _;
 
-use uni::net::{Net, NetBringUp};
+use uni::net::Net;
 use uni_http::{Request, Response};
 
 // ---- Application ------------------------------------------------------------
@@ -51,193 +51,22 @@ const GATEWAY_BACKEND_PORT: u16 = 7777;
 /// real packet send/recv cycles.
 const GATEWAY_MSG_SIZE: usize = 32;
 
-/// Holds the long-lived state of the webserver program.
+/// Long-lived program state.
 ///
-/// Dropping `WebServerApp` drops every listener handle (each
-/// aborts its per-worker accept task and releases its port) and
-/// the `Net` handle (which marks the stack disabled). In-flight
-/// connections drain naturally at their idle timeout.
+/// `handles` carries every value whose `Drop` runs the listener /
+/// network teardown — TCP / UDP listener handles plus the `Net`
+/// guard. Storing them via `uni::Handles` instead of named
+/// `_field: Option<Handle>` slots keeps the "this exists for its
+/// drop side effect" intent explicit; a reader never has to wonder
+/// whether the leading underscore means "unused" or "load-bearing".
 struct WebServerApp {
-    _http: Option<uni::runtime::TcpHandle>,
-    _https: Option<uni::runtime::TcpHandle>,
-    _udp_echo: Option<uni::runtime::UdpHandle>,
-    _tcp_echo: Option<uni::runtime::TcpHandle>,
-    _gateway: Option<uni::runtime::TcpHandle>,
-    _net: Net,
+    // load-bearing: every entry's `Drop` aborts a listener task
+    // or tears down the network stack at shutdown.
+    #[allow(dead_code)]
+    handles: uni::Handles,
 }
 
 impl uni::App for WebServerApp {}
-
-impl WebServerApp {
-    fn new(net: Net) -> Self {
-        uni::log(b"Starting HTTP server...\n");
-        let http_port = uni::config_port(HTTP_PORT);
-        let https_port = uni::config_tls_port(HTTPS_PORT);
-
-        let udp_echo = match uni::runtime::UdpSocket::bind(7) {
-            Ok(sock) => {
-                let h = sock.run(|sock| async move {
-                    let mut buf = [0u8; 1500];
-                    loop {
-                        let (src_ip, src_port, n) = sock.recv_from(&mut buf).await;
-                        let _ = sock.send_to(src_ip, src_port, &buf[..n]);
-                    }
-                });
-                uni::log(b"UDP echo server on port 7 (async, per-worker)\n");
-                Some(h)
-            }
-            Err(_) => {
-                uni::log(b"UDP echo: bind FAILED\n");
-                None
-            }
-        };
-
-        let tcp_echo = match uni::runtime::TcpListener::bind(9) {
-            Ok(listener) => {
-                let h = listener.run(|stream| async move {
-                    let mut buf = [0u8; 1024];
-                    loop {
-                        // 30s idle timeout via `timeout_us` — exercises
-                        // the `select` combinator end-to-end. In a
-                        // steady echo flow the recv wins every time;
-                        // on an abandoned connection the timer fires
-                        // and we tear down rather than leak the slot.
-                        let got = uni::runtime::timeout_us(
-                            30_000_000,
-                            stream.recv(&mut buf),
-                        )
-                        .await;
-                        let Some(n) = got else {
-                            return;
-                        };
-                        if n == 0 {
-                            return;
-                        }
-                        if stream.send(&buf[..n]).await.is_err() {
-                            return;
-                        }
-                    }
-                });
-                uni::log(b"TCP echo server on port 9 (async, per-worker)\n");
-                Some(h)
-            }
-            Err(_) => {
-                uni::log(b"TCP echo: bind FAILED\n");
-                None
-            }
-        };
-
-        // Gateway listener — the `gateway_max` workload's server
-        // side. Each accepted TCP conn binds its own ephemeral
-        // UDP socket once (reused across every request on the
-        // conn) and loops:
-        //   tcp_recv → udp_send_to(backend) → udp_recv → tcp_send.
-        //
-        // Both `udp_recv` and `tcp_recv` park the conn's task on
-        // the runtime's per-worker reactor — under high concurrency
-        // (~64 conns / core) the worker juggles dozens of in-flight
-        // forwards instead of stalling on each. That fan-out is the
-        // exact pattern API gateways / sidecars run in production,
-        // and it's the workload where async + a syscall-free
-        // datapath compound: every Linux equivalent pays >5 syscalls
-        // per request just to get bytes through the kernel TCP +
-        // UDP stacks.
-        let backend_ip = net.gateway().0;
-        let gateway = match uni::runtime::TcpListener::bind(GATEWAY_PORT) {
-            Ok(listener) => {
-                let h = listener.run(move |stream| async move {
-                    // Connected UDP flow: ephemeral source port +
-                    // peer baked in once. Skips the per-send dst
-                    // arguments and matches the QUIC-client shape
-                    // we're building toward.
-                    let udp = match uni::runtime::UdpFlow::connect(
-                        backend_ip, GATEWAY_BACKEND_PORT,
-                    ) {
-                        Ok(f) => f,
-                        Err(_) => return,
-                    };
-                    let mut buf = [0u8; GATEWAY_MSG_SIZE];
-                    loop {
-                        // Drain exactly one full request from the
-                        // peer. Loadgen sends fixed-size pings, so
-                        // a partial recv only happens at conn close.
-                        let mut got = 0;
-                        while got < GATEWAY_MSG_SIZE {
-                            let n = stream.recv(&mut buf[got..]).await;
-                            if n == 0 {
-                                return;
-                            }
-                            got += n;
-                        }
-                        if udp.send(&buf).is_err() {
-                            return;
-                        }
-                        // Zero-copy receive: the runtime hands us a
-                        // borrow of the inbox slot's payload, we
-                        // copy it directly into the TCP send buffer
-                        // without round-tripping through a stack
-                        // buffer. Skips one memcpy per request — at
-                        // 100 k req/s the savings start to matter.
-                        let n = udp.recv_inplace(|payload, _src_ip, _src_port| {
-                            let n = payload.len();
-                            buf[..n].copy_from_slice(payload);
-                            n
-                        }).await;
-                        if n != GATEWAY_MSG_SIZE {
-                            return;
-                        }
-                        if stream.send(&buf).await.is_err() {
-                            return;
-                        }
-                    }
-                });
-                uni::log(b"Gateway listener on port 9000 (async fan-out to UDP backend)\n");
-                Some(h)
-            }
-            Err(_) => {
-                uni::log(b"Gateway: bind FAILED\n");
-                None
-            }
-        };
-
-        let http = match uni_http::listen(http_port, handle_request) {
-            Ok(h) => Some(h),
-            Err(_) => {
-                uni::log(b"http: bind FAILED\n");
-                None
-            }
-        };
-
-        // HTTPS is opt-in: if the bundled dev cert/key parse,
-        // bind the HTTPS port; otherwise log + skip.
-        let https = match uni_tls::acceptor(DEV_CERT_DER, DEV_KEY_PKCS8_DER) {
-            Ok(tls) => {
-                uni::log(b"TLS: dev cert loaded. Serving HTTPS.\n");
-                match uni_http::listen_https(https_port, handle_request, tls) {
-                    Ok(h) => Some(h),
-                    Err(_) => {
-                        uni::log(b"https: bind FAILED\n");
-                        None
-                    }
-                }
-            }
-            Err(_) => {
-                uni::log(b"TLS: failed to parse dev cert/key; HTTPS disabled.\n");
-                None
-            }
-        };
-
-        uni::log(b"Entering event loop.\n");
-        WebServerApp {
-            _http: http,
-            _https: https,
-            _udp_echo: udp_echo,
-            _tcp_echo: tcp_echo,
-            _gateway: gateway,
-            _net: net,
-        }
-    }
-}
 
 impl Drop for WebServerApp {
     fn drop(&mut self) {
@@ -249,24 +78,100 @@ impl Drop for WebServerApp {
 async fn boot() {
     log_boot_info();
 
-    // Try DHCP first; on timeout (typical under minimal tap
-    // networks) fall back to a static 10.0.2.15/24 config so the
-    // app still boots. `Net::enable` leaves the ENABLED flag clear
-    // when bring-up fails, which is what makes the fallback valid.
-    let net = match Net::enable(NetBringUp::Dhcp).await {
-        Ok(n) => n,
-        Err(_) => {
-            uni::log(b"Net::enable: DHCP failed, using 10.0.2.15/24 static fallback\n");
-            Net::enable(NetBringUp::Static {
-                ip: uni::net::Ipv4Addr::new(10, 0, 2, 15),
-                gateway: uni::net::Ipv4Addr::new(10, 0, 2, 2),
-                netmask: uni::net::Ipv4Addr::new(255, 255, 255, 0),
-            })
-            .await
-            .expect("Net::enable: both DHCP and static fallback failed")
+    // One-line DHCP-with-static-fallback. The runtime tries DHCP
+    // first; on bring-up failure (typical under minimal tap
+    // networks) it falls back to the supplied static config.
+    let net = Net::dhcp_or_static(
+        uni::net::Ipv4Addr::new(10, 0, 2, 15),
+        uni::net::Ipv4Addr::new(10, 0, 2, 2),
+        uni::net::Ipv4Addr::new(255, 255, 255, 0),
+    )
+    .await
+    .expect("Net bring-up: both DHCP and static fallback failed");
+
+    uni::log(b"Starting servers...\n");
+    let mut handles = uni::Handles::new();
+
+    let backend_ip = net.gateway().0;
+    handles.keep(net);
+
+    if let Ok(udp_echo) = uni::runtime::UdpSocket::bind(7).map(|s| s.run(|sock| async move {
+        let mut buf = [0u8; 1500];
+        loop {
+            let (src_ip, src_port, n) = sock.recv_from(&mut buf).await;
+            let _ = sock.send_to(src_ip, src_port, &buf[..n]);
         }
-    };
-    uni::run(WebServerApp::new(net));
+    })) {
+        uni::log(b"UDP echo on :7\n");
+        handles.keep(udp_echo);
+    }
+
+    if let Ok(tcp_echo) = uni::runtime::TcpListener::bind(9).map(|l| l.run(|stream| async move {
+        let mut buf = [0u8; 1024];
+        loop {
+            // 30s idle timeout via `timeout_us`. On a steady echo
+            // flow the recv wins every time; on an abandoned
+            // connection the timer fires and we tear down.
+            let Some(n) = uni::runtime::timeout_us(
+                30_000_000,
+                stream.recv(&mut buf),
+            ).await else { return; };
+            if n == 0 { return; }
+            if stream.send(&buf[..n]).await.is_err() { return; }
+        }
+    })) {
+        uni::log(b"TCP echo on :9\n");
+        handles.keep(tcp_echo);
+    }
+
+    // Gateway listener — `gateway_max` workload's server side.
+    // Each accepted TCP conn opens a connected UDP flow to the
+    // backend and ping-pongs:
+    //   tcp_recv_exact → udp_send → udp_recv_payload → tcp_send.
+    if let Ok(gateway) = uni::runtime::TcpListener::bind(GATEWAY_PORT)
+        .map(|l| l.run(move |stream| async move {
+            let Ok(udp) = uni::runtime::UdpFlow::connect(
+                backend_ip, GATEWAY_BACKEND_PORT,
+            ) else { return; };
+            let mut buf = [0u8; GATEWAY_MSG_SIZE];
+            loop {
+                if stream.recv_exact(&mut buf).await.is_err() { return; }
+                if udp.send(&buf).is_err() { return; }
+                // Zero-copy receive: the runtime hands us a borrow
+                // of the inbox slot, we copy directly into the TCP
+                // send buffer without a stack-buffer round-trip.
+                let n = udp.recv_payload(|payload| {
+                    let n = payload.len();
+                    buf[..n].copy_from_slice(payload);
+                    n
+                }).await;
+                if n != GATEWAY_MSG_SIZE { return; }
+                if stream.send(&buf).await.is_err() { return; }
+            }
+        }))
+    {
+        uni::log(b"Gateway on :9000 (TCP <-> UDP fan-out)\n");
+        handles.keep(gateway);
+    }
+
+    let http_port = uni::config_port(HTTP_PORT);
+    if let Ok(http) = uni_http::listen(http_port, handle_request) {
+        handles.keep(http);
+    }
+
+    // HTTPS is opt-in: if the bundled dev cert/key don't parse,
+    // log + skip rather than refuse to boot.
+    let https_port = uni::config_tls_port(HTTPS_PORT);
+    match uni_tls::listen(https_port, handle_request, DEV_CERT_DER, DEV_KEY_PKCS8_DER) {
+        Ok(https) => {
+            uni::log(b"TLS dev cert loaded; serving HTTPS\n");
+            handles.keep(https);
+        }
+        Err(_) => uni::log(b"TLS dev cert/key invalid; HTTPS disabled\n"),
+    }
+
+    uni::log(b"Entering event loop.\n");
+    uni::run(WebServerApp { handles });
 }
 
 // ---- Request dispatch + route handlers --------------------------------------

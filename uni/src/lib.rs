@@ -83,6 +83,62 @@ pub mod error {
 /// identity plus a `Drop` impl (which every type has by default).
 pub trait App: 'static {}
 
+/// A bag for values that exist solely so their `Drop` runs at
+/// shutdown — typically [`runtime::TcpHandle`] / [`runtime::UdpHandle`]
+/// returned from `listen` / `run`, and the [`net::Net`] guard.
+///
+/// **Why this exists.** The naive "store each handle as
+/// `_http: Option<TcpHandle>` field on your App struct" pattern
+/// works but is a footgun: a reader who sees `_http` reasonably
+/// concludes it's unused and deletes it, silently tearing down the
+/// listener at boot. `Handles::keep` says explicitly "this value
+/// is alive because I asked for it to be."
+///
+/// ```rust,ignore
+/// let mut handles = uni::Handles::new();
+/// handles.keep(uni::http::listen(80, handle_request)?);
+/// handles.keep(uni::http::listen_tls(443, handle_request, cert, key)?);
+/// handles.keep(udp_echo);
+/// uni::run(MyApp { handles, /* ... */ });
+/// ```
+///
+/// Items drop in insertion order when the `Handles` itself drops —
+/// store `Net` last (or a separate field) if you need network
+/// teardown to outlive listener tasks.
+pub struct Handles {
+    items: alloc::vec::Vec<alloc::boxed::Box<dyn core::any::Any>>,
+}
+
+impl Handles {
+    /// Empty bag.
+    pub fn new() -> Self {
+        Handles { items: alloc::vec::Vec::new() }
+    }
+
+    /// Take ownership of `value` so it stays alive until the
+    /// `Handles` itself drops. Returns `&mut self` for chaining.
+    pub fn keep<T: 'static>(&mut self, value: T) -> &mut Self {
+        self.items.push(alloc::boxed::Box::new(value));
+        self
+    }
+
+    /// Number of items currently kept.
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// True iff no items are kept.
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
+impl Default for Handles {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // --- Runtime storage --------------------------------------------------------
 
 /// Single-slot storage for the runtime-owned app. Accessed only

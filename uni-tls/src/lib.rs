@@ -65,6 +65,38 @@ pub fn acceptor(
     Ok(Arc::new(TlsImpl { cfg: Arc::new(cfg) }))
 }
 
+/// Error from [`listen`]: either the cert / key pair didn't parse,
+/// or the underlying TCP bind failed.
+#[derive(Debug)]
+pub enum ListenError {
+    /// `acceptor` rejected the cert / key bytes.
+    Cert,
+    /// `TcpListener::bind` failed (port in use, registry full, …).
+    Bind(uni::runtime::TcpBindError),
+}
+
+/// One-call HTTPS listener. Builds a TLS acceptor from `cert_der`
+/// / `key_der` and starts the HTTPS server on `port` with `handler`
+/// dispatching every parsed `Request`.
+///
+/// Equivalent to:
+/// ```ignore
+/// let tls = uni_tls::acceptor(cert_der, key_der)?;
+/// uni_http::listen_https(port, handler, tls)?;
+/// ```
+/// — but without the intermediate `acceptor` variable. Use
+/// [`acceptor`] + [`uni_http::listen_https`] directly if you want
+/// to share one TLS context across multiple ports.
+pub fn listen(
+    port: u16,
+    handler: uni_http::Handler,
+    cert_der: &'static [u8],
+    key_der: &'static [u8],
+) -> Result<uni::runtime::TcpHandle, ListenError> {
+    let tls = acceptor(cert_der, key_der).map_err(|_| ListenError::Cert)?;
+    uni_http::listen_https(port, handler, tls).map_err(ListenError::Bind)
+}
+
 // ---- Diagnostic helpers ------------------------------------------------------
 
 /// Format the TLS handshake profile into `out`. Apps can serve

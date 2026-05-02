@@ -49,6 +49,7 @@ rust_library(
         "//net:tls_crypto",
         "//net:tls_handshake",
         "//net:tls_record",
+        "//uni",
         "//uni-http",
         "@crates//:getrandom",
         "@crates//:hmac",
