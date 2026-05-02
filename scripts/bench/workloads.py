@@ -20,38 +20,6 @@ def next_port():
     return PORT_COUNTER[0]
 
 
-def wait_port_pool(threshold=4000, timeout=60):
-    """Block while the host's TIME_WAIT pool is over `threshold` 127.0.0.1
-    sockets, polling once a second up to `timeout` seconds.
-
-    macOS uses strict TIME_WAIT semantics: once a (src_ip, src_port,
-    dst_ip, dst_port) tuple is in TIME_WAIT (~15 s after a graceful
-    FIN-ACK close), the *source port* can't be reused for any new
-    outgoing connect — even to a different destination. A bench run
-    with 6 000 loadgen TCP conns leaves 6 000 source ports parked
-    for ~15 s; back-to-back runs without this gate exhaust the
-    ephemeral pool (16 384 ports) and the next loadgen sees connect
-    failures, surfacing as `TIMEOUT` in the bench output.
-
-    `threshold=8000` (half the pool) leaves comfortable headroom for
-    the next run's 6 000 outgoing conns. Default `timeout=60` covers
-    a full TIME_WAIT cycle on macOS (default 2*MSL=30 s, with
-    overhead for netstat polling).
-    """
-    if sys.platform != "darwin":
-        time.sleep(1)
-        return
-    for _ in range(timeout):
-        try:
-            r = subprocess.run(["netstat", "-an"], capture_output=True, text=True, timeout=5)
-            tw = sum(1 for l in r.stdout.split("\n") if "TIME_WAIT" in l and "127.0.0.1" in l)
-            if tw <= threshold:
-                return
-        except Exception:
-            pass
-        time.sleep(1)
-
-
 def wait_http(port, timeout=20, host="localhost"):
     """Poll http://host:port/health once a second up to `timeout` seconds.
 

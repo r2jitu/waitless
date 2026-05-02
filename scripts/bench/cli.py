@@ -84,7 +84,6 @@ from .workloads import (
     run_wrk,
     run_wrk_https,
     udp_peak_concurrent,
-    wait_port_pool,
 )
 
 
@@ -379,7 +378,6 @@ def main():
                         except Exception:
                             pass
                     results[(env_name, cpus, wname)] = (0, "", "")
-                    wait_port_pool()
                     consecutive_skips += 1
                     if consecutive_skips >= 3:
                         print(f"    -- 3 consecutive SKIPs on {label}; aborting "
@@ -552,7 +550,6 @@ def main():
 
                 env.stop(proc)
                 _current["proc"] = None
-                wait_port_pool()
     except KeyboardInterrupt:
         print("\nInterrupted — cleaning up...")
         _kill_current()
