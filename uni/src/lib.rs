@@ -107,6 +107,14 @@ pub fn shutdown_and_drop() {
         unsafe { core::mem::take(&mut *LISTENERS.0.get()) };
     drop(drained);
 
+    // Force-drop every live task across all workers' arenas. Listener
+    // drops above flagged per-worker recv/accept tasks for abort, but
+    // abort is normally honoured on the next `tick` — and APs have
+    // already left the eventloop, so no further ticks happen. Walking
+    // the arenas explicitly reclaims the `Box<dyn Future>` storage
+    // before `arch::shutdown()` powers the VM off.
+    uni_runtime::drain_all_arenas();
+
     // RST every still-open TCP connection so peers see an immediate
     // close instead of timing out via TCP keepalive. On the unikernel
     // this matters: `arch::shutdown()` would otherwise just power
@@ -121,14 +129,6 @@ pub fn shutdown_and_drop() {
     // zeros (libstd's allocator exposes no counters), so the line
     // is informational only; on unikernel it's the actual talc
     // counters and a leaked allocation shows up as `LEAK +Nbytes`.
-    //
-    // Known limitation: in-flight conn-handler tasks at shutdown
-    // time get their `abort` flag set when their listener handle
-    // drops above, but APs have already left the eventloop and
-    // won't tick again to honour the abort, so the `Box<dyn Future>`
-    // for each in-flight task stays allocated until the VM powers
-    // off. Idle shutdown is leak-free; active-traffic shutdown
-    // shows a small `LEAK` proportional to in-flight conns.
     let s = uni_backend::heap_stats();
     let bsl_b = HEAP_BASELINE_BYTES.load(core::sync::atomic::Ordering::Acquire);
     let bsl_a = HEAP_BASELINE_ALLOCS.load(core::sync::atomic::Ordering::Acquire);

@@ -242,16 +242,25 @@ class WebserverShutdownTest(unittest.TestCase):
             pty_launcher.kill()
 
     def test_ctrlc_exits_within_8s(self) -> None:
-        """Active-traffic ^C shutdown. Just verifies the VM exits — does
-        NOT assert leak-free, because in-flight conn-handler tasks get
-        their `abort` flag set by `shutdown_and_drop` but never re-poll
-        (APs have left the eventloop by then), so their `Box<dyn Future>`
-        storage stays allocated until the VM powers off. Print the
-        HEAP_LEAK_CHECK line for visibility but tolerate `LEAK`."""
+        """Active-traffic ^C shutdown leaves no allocations behind too.
+        Listener drop sets the abort flag on per-worker conn-handler
+        tasks, then `shutdown_and_drop` calls `drain_all_arenas` which
+        force-drops every live `Box<dyn Future>` across every arena —
+        APs have left the eventloop by then so it's race-free."""
         buf = self._run_shutdown_scenario(port_offset=100, hammer=True)
-        for line in buf.splitlines():
-            if b"HEAP_LEAK_CHECK" in line:
-                print(f"    {line.decode(errors='replace')}", flush=True)
+        leak_line = next(
+            (line for line in buf.splitlines() if b"HEAP_LEAK_CHECK" in line),
+            None,
+        )
+        self.assertIsNotNone(
+            leak_line, "no HEAP_LEAK_CHECK line in serial log",
+        )
+        print(f"    {leak_line.decode(errors='replace')}", flush=True)
+        self.assertNotIn(
+            b"HEAP_LEAK_CHECK LEAK", leak_line,
+            "active-traffic shutdown leaked memory — "
+            "drain_all_arenas didn't reclaim in-flight task storage",
+        )
 
     def test_clean_shutdown_no_leak(self) -> None:
         """Idle ^C shutdown leaves no allocations behind. `shutdown_and_drop`

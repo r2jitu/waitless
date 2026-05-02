@@ -310,6 +310,43 @@ pub fn tick(worker_id: u32) -> bool {
     did_work
 }
 
+/// Force-drop every live task in every worker's arena.
+///
+/// Called once from `uni::shutdown_and_drop` after listener handles
+/// have been dropped (which sets the abort flag on per-worker
+/// recv/accept tasks, but doesn't actually free their `Box<dyn
+/// Future>` storage — that drop normally happens on the next `tick`,
+/// which never runs again post-eventloop-break). This walks every
+/// arena and drops any `used` slot in place, releasing the heap.
+///
+/// Safety: APs have already broken out of `eventloop::run`'s main
+/// loop and are spin-looping past it before issuing PSCI CPU_OFF
+/// (see `kernel/src/eventloop.rs` — they don't tick after break).
+/// They are not concurrently writing to their arenas during this
+/// window, so cross-worker mutable access is race-free.
+pub fn drain_all_arenas() {
+    let n = uni_worker::num_workers();
+    for worker_id in 0..n {
+        let arena = ARENAS.at(worker_id);
+        for slot in arena.slots.iter() {
+            if !slot.used.load(Ordering::Acquire) {
+                continue;
+            }
+            // SAFETY: see fn-level comment — APs are post-eventloop-
+            // break and not polling.
+            unsafe {
+                *slot.future.get() = None;
+            }
+            slot.epoch.fetch_add(1, Ordering::AcqRel);
+            slot.used.store(false, Ordering::Release);
+            slot.abort.store(false, Ordering::Release);
+        }
+        // Clear ready bits so a later spurious wake observes nothing
+        // to do.
+        arena.ready_bits.store(0, Ordering::Release);
+    }
+}
+
 /// True if the worker has outstanding async work — either a
 /// scheduled timer in its wheel or a task slot flagged ready.
 pub fn has_pending(worker_id: u32) -> bool {
