@@ -277,21 +277,18 @@ mod aarch64 {
             d.ctlr.write(0);
             unsafe { asm!("dsb sy", options(nostack)); }
 
-            // Only write fields that differ from reset state. GICv3
-            // reset has ICENABLER=0 (disabled), ICPENDR=0 (no pending),
-            // IROUTER=0 (CPU 0 affinity), so writing those would just
-            // burn vmexits on HVF without changing anything. We DO
-            // need to set IGROUPR=Group 1 NS and IPRIORITYR=0xA0A0A0A0
-            // because their reset values are Group 0 / priority 0.
-            // Saved ~1050 MMIO writes on a 1024-line GICv3 (most of
-            // them in the IROUTER sweep that wrote reset values to
-            // every SPI slot). On HVF this drops `arch+vectors` from
-            // ~26 ms to ~5 ms.
+            // Only write fields that differ from reset state and that
+            // we actually depend on. We must set IGROUPR=Group 1 NS
+            // (reset is Group 0; with ARE_NS the distributor only
+            // forwards Group 1 NS to non-secure EL1). We do NOT need
+            // to set IPRIORITYR — we configure ICC_PMR_EL1=0xFF (mask
+            // nothing) and ICC_BPR1_EL1=0 (no preemption), so the
+            // reset priority of 0 routes through fine, and writing
+            // 0xA0A0A0A0 to 248 words just burns ~5 ms of vmexits on
+            // HVF for no behavioral change. Same logic for ICENABLER /
+            // ICPENDR / IROUTER (reset already matches what we want).
             for i in 1..(num_irqs / 32) as usize {
                 d._igroupr[i].write(0xFFFF_FFFF);   // Group 1 NS
-            }
-            for i in 8..(num_irqs / 4) as usize {
-                d.ipriorityr[i].write(0xA0A0_A0A0);
             }
 
             d.ctlr.write(GICD_CTLR_ARE_NS | GICD_CTLR_ENABLE_GRP1_NS);
