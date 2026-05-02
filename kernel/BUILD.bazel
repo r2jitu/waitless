@@ -7,7 +7,6 @@ rust_library(
     name = "kernel",
     crate_name = "uni_kernel",
     srcs = [
-        "src/bump.rs",
         "src/cpu.rs",
         "src/deque.rs",
         "src/eventloop.rs",
@@ -73,13 +72,6 @@ rust_test(
     size = "small",
     srcs = ["src/deque.rs"],
     crate_root = "src/deque.rs",
-)
-
-rust_test(
-    name = "bump_test",
-    size = "small",
-    srcs = ["src/bump.rs"],
-    crate_root = "src/bump.rs",
 )
 
 rust_test(
