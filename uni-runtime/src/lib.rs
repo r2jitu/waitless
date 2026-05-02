@@ -17,25 +17,12 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use uni_worker::timer::{Timer, TimerWheel};
-use uni_worker::{CurrentWorker, PerWorker};
+use uni_worker::{CurrentWorker, PerWorker, WorkerLocal};
 use uni_platform::now_ticks;
 
 // ---- Per-worker timer storage ---------------------------------------------
 
-struct WheelCell(UnsafeCell<TimerWheel>);
-
-// SAFETY: touched only by its owning worker via
-// `PerWorker::current(&CurrentWorker)`.
-unsafe impl Sync for WheelCell {}
-unsafe impl Send for WheelCell {}
-
-static WHEELS: PerWorker<WheelCell> = PerWorker::new();
-
-fn wheel(cc: &CurrentWorker) -> &mut TimerWheel {
-    let cell = WHEELS.current(cc);
-    // SAFETY: owning-worker-only; `CurrentWorker` proves we're on it.
-    unsafe { &mut *cell.0.get() }
-}
+static WHEELS: WorkerLocal<TimerWheel> = WorkerLocal::new();
 
 // ---- Task arena ------------------------------------------------------------
 
@@ -99,7 +86,7 @@ static ARENAS: PerWorker<TaskArena> = PerWorker::new();
 /// Size `WHEELS` and `ARENAS` for `num_workers` slots. BSP-only,
 /// after `mm::init()`, before any worker touches the runtime.
 pub fn init(num_workers: u32) {
-    WHEELS.init(num_workers, |_| WheelCell(UnsafeCell::new(TimerWheel::new())));
+    WHEELS.init(num_workers, |_| TimerWheel::new());
     ARENAS.init(num_workers, |_| TaskArena::new());
 }
 
@@ -272,7 +259,7 @@ pub fn tick(worker_id: u32) -> bool {
     // `TcpListener::run` since this worker last ticked.
     net::fire_pending_net_launchers(worker_id);
 
-    let _ = wheel(&cc).advance(now_ticks());
+    let _ = WHEELS.with_mut(&cc, |w| w.advance(now_ticks()));
 
     let arena = ARENAS.at(worker_id);
     // Atomically take the current ready bitmap. Wakes that fire
@@ -355,7 +342,7 @@ pub fn has_pending(worker_id: u32) -> bool {
     }
     // SAFETY: caller guarantees `worker_id` is the running worker.
     let cc = unsafe { CurrentWorker::from_id_unchecked(worker_id) };
-    if wheel(&cc).count() > 0 {
+    if WHEELS.with(&cc, |w| w.count()) > 0 {
         return true;
     }
     ARENAS.at(worker_id).ready_bits.load(Ordering::Acquire) != 0
@@ -421,11 +408,11 @@ impl Future for Sleep {
             this.waker = Some(cx.waker().clone());
             let self_ptr: *const Sleep = this;
             let cc = CurrentWorker::enter();
-            if wheel(&cc).insert(Timer {
+            if WHEELS.with_mut(&cc, |w| w.insert(Timer {
                 deadline: this.deadline,
                 func: sleep_fire,
                 arg: self_ptr as usize,
-            }) {
+            })) {
                 this.timer_scheduled = true;
             }
         }
@@ -443,7 +430,7 @@ impl Drop for Sleep {
             // many `timeout_us`-wrapped futures cancel-and-recreate
             // their inner Sleep on every iteration of a keep-alive
             // loop.
-            let _ = wheel(&cc).cancel_at(self.deadline, self_ptr as usize);
+            let _ = WHEELS.with_mut(&cc, |w| w.cancel_at(self.deadline, self_ptr as usize));
         }
     }
 }
