@@ -28,9 +28,20 @@ fn init() {
         let before = uni_kernel::aarch64::smp::ipi_count();
         uni_kernel::aarch64::smp::send_sgi_to(1);
 
-        // Brief delay for IPI delivery
-        for _ in 0..100_000 {
-            unsafe { core::arch::asm!("nop"); }
+        // Wall-clock wait (poll the IPI count up to 1 s). Old code
+        // used `for _ in 0..100_000 { nop }`, which on QEMU TCG with
+        // single-threaded scheduling never yielded to the target AP
+        // — TCG runs one vCPU at a time and only switches at MMIO /
+        // halt boundaries; once the BSP boot path stopped doing
+        // serial-poll MMIO every byte, BSP raced through the whole
+        // test in microseconds and the SGI sat undelivered until
+        // long after `ipi_count()` was checked.
+        let deadline = uni_kernel::time::now_cycles()
+            .wrapping_add(1_000_000 * uni_kernel::time::cycles_per_us());
+        while uni_kernel::aarch64::smp::ipi_count() == before
+            && uni_kernel::time::now_cycles() < deadline
+        {
+            unsafe { core::arch::asm!("yield"); }
         }
 
         let after = uni_kernel::aarch64::smp::ipi_count();

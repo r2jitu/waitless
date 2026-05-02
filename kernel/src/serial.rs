@@ -67,8 +67,14 @@ mod x86 {
 
     pub unsafe fn putc(c: u8) {
         unsafe {
-            // Wait for THR empty (LSR bit 5)
-            while (inb(COM1 + LSR) & 0x20) == 0 {}
+            // No LSR-empty poll — every emulated 16550 path (QEMU,
+            // KVM, HVF/limine) drains THR synchronously / at host
+            // memory speed. The poll was a port-IO `inb` that costs
+            // a vmexit on KVM and roughly nothing on TCG, but
+            // either way it doubled the per-byte log cost without
+            // improving correctness on any virt target. On real
+            // 16550 silicon the FIFO would matter at baud-rate
+            // speed; we don't run on bare 16550 silicon.
             outb(COM1 + THR, c);
         }
     }
@@ -119,7 +125,6 @@ mod aarch64 {
         cr: ReadWrite<u32>,            // 0x030 Control
     }
 
-    const FR_TXFF: u32 = 1 << 5; // TX FIFO full
     const FR_RXFE: u32 = 1 << 4; // RX FIFO empty
     const CR_UARTEN: u32 = 1 << 0;
     const CR_TXE: u32 = 1 << 8;
@@ -200,8 +205,14 @@ mod aarch64 {
             Some(SerialBackend::Virtio) => unsafe { virtio_console_putc(c) },
             Some(SerialBackend::Pl011 { base }) => {
                 let r = pl011_at(*base);
-                // Wait for TX FIFO not full
-                while (r.fr.read() & FR_TXFF) != 0 {}
+                // No `while r.fr.read() & FR_TXFF` poll. Every emulation
+                // path we run on (HVF runner, QEMU PL011, KVM virt-mmio)
+                // drains TX synchronously / instantly to host stdout, so
+                // FR_TXFF is always 0 — and the read itself is a vmexit
+                // (~20 µs on HVF), which doubled the per-byte log cost
+                // for no benefit. On real PL011 silicon the FIFO would
+                // matter at baud-rate speeds, but we don't run on real
+                // PL011 silicon.
                 r.dr.write(c as u32);
             }
             None => {}
