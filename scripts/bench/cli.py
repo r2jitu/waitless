@@ -205,27 +205,24 @@ WORKLOADS = [
     # forwards per worker without OS threads; native (Linux+Tokio
     # equivalent) pays ~5 syscalls per request just to push bytes.
     #
-    # `conns_per_core: 200` exercises the post-refactor scaling
+    # `conns_per_core: 500` exercises the post-refactor scaling
     # path on the *unikernel side* — per-worker ephemeral UDP
-    # pool with port-encoded owner, native O(1) port→fd table —
-    # but keeps the loadgen on macOS within the host-side caps
-    # that gate higher numbers:
-    #   * `kern.ipc.somaxconn=128` silently caps `listen(2)`
-    #     backlog. The loadgen throttles concurrent `connect(2)`
-    #     to 64 (well under 128) to fit; the HVF runner's
-    #     userspace TCP proxy has its own per-vCPU pollfd budget
-    #     that starts dropping accepts above ~500/core.
-    #   * Graceful FIN-ACK close parks each source port in
-    #     TIME_WAIT for ~15 s, so back-to-back runs at thousands
-    #     of conns blow through the 16 384-port loadgen ephemeral
-    #     pool.
-    # The unikernel runtime itself handles tens of thousands of
-    # ephemerals — the bottleneck is the benchmark *client* and
-    # the macOS host that runs it. To push higher, bump somaxconn
-    # (`sudo sysctl -w kern.ipc.somaxconn=4096`) and rerun.
+    # pool with port-encoded owner, native O(1) port→fd table.
+    # Native saturates at ~89 k req/s by 1500 conn (1c), so 500
+    # captures most of the throughput win while keeping HVF safe:
+    # the HVF runner's userspace TCP proxy has a per-vCPU pollfd
+    # budget that drops accepts above ~500/core. The loadgen
+    # also throttles concurrent `connect(2)` to 64 (well under
+    # macOS's `kern.ipc.somaxconn=128` default) so the listener
+    # backlog drains during ramp.
+    #
+    # Loadgen-side TIME_WAIT used to bite at thousands of conns
+    # (16 384-port macOS ephemeral pool, 15 s 2×MSL); the
+    # `set_zero_linger()` fix in scripts/bench/loadgen makes
+    # close() RST instead of FIN, removing that cap entirely.
     {"name": "gateway_max", "type": "gateway",
-     "conns_per_core": 200,
-     "desc": "Gateway fan-out (TCP→UDP backend→TCP, 200 conn × cpus)"},
+     "conns_per_core": 500,
+     "desc": "Gateway fan-out (TCP→UDP backend→TCP, 500 conn × cpus)"},
 ]
 
 
