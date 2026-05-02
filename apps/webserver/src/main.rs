@@ -18,9 +18,10 @@ use uni_http::{Request, Response};
 
 // ---- Configuration ----------------------------------------------------------
 
-/// Plain HTTP / HTTPS / gateway listener ports. `uni::config_port`
-/// reads `UNIKERNEL_TCP_<port>` to let the bench harness remap
-/// privileged defaults onto high host ports.
+/// Plain HTTP / HTTPS / gateway listener ports. The runtime
+/// transparently remaps these to whichever host port the bench
+/// harness wired up (`UNIKERNEL_TCP_<port>=…`), so app code just
+/// uses the natural well-known number and never sees the override.
 const HTTP_PORT: u16 = 80;
 const HTTPS_PORT: u16 = 443;
 const GATEWAY_PORT: u16 = 9000;
@@ -68,18 +69,13 @@ async fn boot() {
     );
     handles.keep_or_log(
         "http",
-        uni_http::listen(uni::config_port(HTTP_PORT), handle_request),
+        uni_http::listen(HTTP_PORT, handle_request),
     );
     // HTTPS is opt-in: if the bundled dev cert/key don't parse,
     // log + skip rather than refuse to boot.
     handles.keep_or_log(
         "https",
-        uni_tls::listen(
-            uni::config_port(HTTPS_PORT),
-            handle_request,
-            DEV_CERT_DER,
-            DEV_KEY_PKCS8_DER,
-        ),
+        uni_tls::listen(HTTPS_PORT, handle_request, DEV_CERT_DER, DEV_KEY_PKCS8_DER),
     );
 
     uni::println!("Entering event loop.");

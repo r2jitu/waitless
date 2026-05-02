@@ -823,9 +823,9 @@ static NATIVE_TCP_BACKEND: uni_runtime::net::TcpBackend =
 fn init_native() {
     unsafe {
         // Per-port overrides (`UNIKERNEL_<PROTO>_<GUEST>`) are read
-        // lazily from `config_port` / `config_tls_port` /
-        // `udp_bind`, keyed by the caller-supplied default port —
-        // same derivation as `variants.bzl` bakes into the VM
+        // lazily inside `async_tcp_listen_hook` / `udp_bind`,
+        // keyed by the caller-supplied app port — same derivation
+        // as `variants.bzl` bakes into the VM
         // launcher templates. Callers use the same spelling
         // regardless of which runner LAUNCHER points at.
 
@@ -1175,19 +1175,6 @@ fn async_tcp_dispatch(_thread_id: u32, fd: i32) -> bool {
 
 pub fn log(msg: &[u8]) {
     unsafe { write(2, msg.as_ptr(), msg.len()); }
-}
-
-pub fn config_port(default_port: u16) -> u16 {
-    read_port_env("TCP", default_port).unwrap_or(default_port)
-}
-
-/// TLS port override. Reads `UNIKERNEL_TCP_<default_port>` — TLS runs
-/// over TCP, so the namespace is shared with plain HTTP. bench.py /
-/// tests set this to a high port to avoid the privileged-port bind
-/// on Linux (macOS lets non-root bind anywhere, but we can't rely
-/// on that cross-platform).
-pub fn config_tls_port(default_port: u16) -> u16 {
-    read_port_env("TCP", default_port).unwrap_or(default_port)
 }
 
 pub fn check_shutdown() -> bool {

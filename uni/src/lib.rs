@@ -1,5 +1,5 @@
-// Platform abstraction: `TcpListener`, `TcpStream`, `log`, `config_port`,
-// etc. Dispatch goes through `//uni-backend` which cfg-selects the
+// Platform abstraction: `TcpListener`, `TcpStream`, `log`, etc.
+// Dispatch goes through `//uni-backend` which cfg-selects the
 // unikernel or POSIX impl internally — `uni/lib.rs` stays uniform.
 
 #![no_std]
@@ -229,18 +229,9 @@ fn install_shutdown_hook() {}
 // ---- Re-exported platform functions ---------------------------------------
 
 pub use uni_backend::{
-    check_shutdown, config_port, log, num_workers, request_shutdown, set_ready,
+    check_shutdown, log, num_workers, request_shutdown, set_ready,
     wait_for_events, HeapStats,
 };
-
-/// Backward-compatible alias for `config_port`. Both HTTP and HTTPS
-/// run over plain TCP, so the env-var namespace is shared
-/// (`UNIKERNEL_TCP_<port>`); calling `config_port(443)` is the same
-/// thing.
-#[deprecated = "use config_port — HTTPS uses the same TCP env namespace"]
-pub fn config_tls_port(default_port: u16) -> u16 {
-    config_port(default_port)
-}
 
 /// Format-and-log helper for `uni::log!("…", args)`. Allocates a
 /// scratch `String` because `core::fmt::write` doesn't have a
