@@ -1544,6 +1544,73 @@ don't want to truncate (current workloads — HTTP/1.1 ~ms-scale —
 don't stress this). QUIC streams will benefit since clean
 CONNECTION_CLOSE is preferred over UDP-level forget.
 
+### Lift `net_tcp` / `net_udp` above `uni_runtime` (app-space L4)
+
+Today TCP and UDP implementations live *below* `uni_runtime` in the
+crate DAG: `net_tcp` / `net_udp` register a `TcpBackend` /
+`UdpBackend` vtable
+([uni-runtime/src/net/tcp.rs](uni-runtime/src/net/tcp.rs),
+[udp.rs](uni-runtime/src/net/udp.rs)) at boot from
+[net/src/lib.rs](net/src/lib.rs)'s `init_stack`. Apps see only
+`uni_runtime::net::TcpListener` / `UdpSocket`. Lifting the
+implementations *above* `uni_runtime` — alongside `uni-tls` /
+`uni-http` — would complete the "everything above the NIC is a
+library" story and let apps swap in alternative L4 stacks
+(smoltcp, custom congestion control, research stacks).
+
+**What's already done:** the vtable seam exists. App code is
+already decoupled from `net_tcp` internals — moving the
+implementation up the DAG is symbolic from the API perspective,
+load-bearing only for *who controls the implementation*.
+
+**What the move would actually require:**
+
+- [ ] Promote `net_tcp` → `uni-tcp` and `net_udp` → `uni-udp`
+      above `uni_runtime`. Both crates are already `#![no_std]`
+      with no `uni_drivers` dep; the `uni_kernel::cpu_id` /
+      `rng::fill_bytes` / `percpu::PerCpu` calls have
+      `uni_worker` equivalents in use across `uni_runtime::net`.
+- [ ] Move the bare-metal `BARE_TCP_BACKEND` /
+      `BARE_UDP_BACKEND` registration out of `net/src/lib.rs`
+      into `uni_tcp::install()` / `uni_udp::install()` (mirrors
+      `uni_tls::install()` style). App calls `install()` from
+      its boot sequence.
+- [ ] Define one new `Ipv4Send` vtable that the platform
+      registers and `uni-tcp` / `uni-udp` call instead of
+      `ipv4_send` directly. Keeps IPv4/ARP/Ethernet below the
+      line as the "platform's wire glue"; only L4 lifts.
+- [ ] Move the `tcp_dispatch` / `udp_dispatch` registry hooks
+      ([net/src/lib.rs:25-38](net/src/lib.rs#L25-L38)) into the
+      lifted crates so they self-register against
+      `protocol::Registry`.
+- [ ] Re-validate the full bench matrix (1c/2c/3c × HVF/KVM/
+      native × `health_max` / `tls_handshake_max` /
+      `gateway_max` / `compute_max` / `udp_peak`). The hot path
+      already crosses the vtable; no new indirection on RX/TX,
+      but the per-core `POOLS` / `TCP_HASH` layout is tuned
+      enough to warrant verification. **Discipline: lift, don't
+      refactor** — moving the crates is the work, redesigning
+      the per-core ownership model is not.
+
+Estimated effort: ~1.5–2 focused days (crates + Bazel + bench
+re-run).
+
+**Trigger**: either of —
+
+- (a) `uni-quic` design wants to share `net_tcp`'s per-core
+  conn pool / generation-handle / waker scaffolding with QUIC.
+  At that point lifting both becomes structural rather than
+  aesthetic, and the right time to do it is as part of QUIC's
+  build-out, not a standalone refactor.
+- (b) A concrete consumer shows up that wants to swap L4 —
+  smoltcp port, BBR/CUBIC A/B, research stack experiment.
+  Then the seam has a real user pulling on it.
+
+Until one of those fires, the existing vtable boundary at
+[uni-runtime/src/net/tcp.rs:205](uni-runtime/src/net/tcp.rs#L205)
+is paying the dividend that matters most (app-side decoupling),
+and the unmet 20 % is speculative.
+
 ### Bare-metal TCP corners (LastAck wait, TIME_WAIT, FIN retransmit)
 
 `net/src/tcp.rs::close()`'s `CloseWait` branch sends FIN+ACK and
