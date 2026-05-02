@@ -211,14 +211,6 @@ impl Response {
         }
     }
 
-    /// Backward-compatible alias for `Response::ok` with an owned
-    /// body. New code should just call `Response::ok(ct, body)` —
-    /// the polymorphic version accepts `Box<[u8]>` / `Vec<u8>` /
-    /// `String` directly.
-    #[deprecated = "use Response::ok with the IntoBody trait instead"]
-    pub fn ok_owned(content_type: &[u8], body: alloc::boxed::Box<[u8]>) -> Self {
-        Self::ok(content_type, body)
-    }
 
     pub fn not_found() -> Self {
         Response {
