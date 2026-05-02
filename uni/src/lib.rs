@@ -89,7 +89,11 @@ pub fn _retain<T: 'static>(handle: T) {
 
 /// Invoked from the event-loop exit path (unikernel BSP after the
 /// loop breaks, native `main` after `pthread_join`) to drop every
-/// retained listener and tear down the network stack.
+/// retained listener and tear down the network stack. Logs a
+/// `HEAP_LEAK_CHECK` line at the end summarising the live-heap
+/// delta versus the snapshot taken at `set_ready` time — a small
+/// negative delta is normal (the boot task itself drains), but
+/// growth is a leak.
 pub fn shutdown_and_drop() {
     #[cfg(target_os = "none")]
     debug_assert_eq!(
@@ -105,6 +109,55 @@ pub fn shutdown_and_drop() {
 
     // Tear down the NET slot symmetrically.
     net::clear_on_shutdown();
+
+    // Heap-leak check. On native the backend's `heap_stats` returns
+    // zeros (libstd's allocator exposes no counters), so the line
+    // is informational only; on unikernel it's the actual talc
+    // counters and a leaked allocation shows up as `LEAK +Nbytes`.
+    //
+    // Known limitation: in-flight conn-handler tasks at shutdown
+    // time get their `abort` flag set when their listener handle
+    // drops above, but APs have already left the eventloop and
+    // won't tick again to honour the abort, so the `Box<dyn Future>`
+    // for each in-flight task stays allocated until the VM powers
+    // off. Idle shutdown is leak-free; active-traffic shutdown
+    // shows a small `LEAK` proportional to in-flight conns.
+    let s = uni_backend::heap_stats();
+    let bsl_b = HEAP_BASELINE_BYTES.load(core::sync::atomic::Ordering::Acquire);
+    let bsl_a = HEAP_BASELINE_ALLOCS.load(core::sync::atomic::Ordering::Acquire);
+    if s.allocated_bytes > bsl_b || s.allocation_count > bsl_a {
+        crate::log!(
+            "HEAP_LEAK_CHECK LEAK bytes={}->{} allocs={}->{} delta=+{}B,+{}allocs\n",
+            bsl_b, s.allocated_bytes, bsl_a, s.allocation_count,
+            s.allocated_bytes.saturating_sub(bsl_b),
+            s.allocation_count.saturating_sub(bsl_a),
+        );
+    } else {
+        crate::log!(
+            "HEAP_LEAK_CHECK ok bytes={}->{} allocs={}->{}\n",
+            bsl_b, s.allocated_bytes, bsl_a, s.allocation_count,
+        );
+    }
+}
+
+/// Snapshot of the heap at `set_ready` time. `shutdown_and_drop`
+/// compares against this to decide whether teardown left memory
+/// behind. Single-writer (BSP at end of boot), single-reader (BSP
+/// during shutdown), so `Acquire` / `Release` is sufficient.
+static HEAP_BASELINE_BYTES: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static HEAP_BASELINE_ALLOCS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Signal that boot is complete and worker cores can leave their
+/// READY-wait spin. Snapshots the heap allocation counters so
+/// `shutdown_and_drop` can detect a leak. Called from the boot
+/// macro after the user's `boot()` body returns.
+pub fn set_ready() {
+    let s = uni_backend::heap_stats();
+    HEAP_BASELINE_BYTES.store(s.allocated_bytes, core::sync::atomic::Ordering::Release);
+    HEAP_BASELINE_ALLOCS.store(s.allocation_count, core::sync::atomic::Ordering::Release);
+    uni_backend::set_ready();
 }
 
 /// Route `shutdown_and_drop` into the platform-specific event-loop
@@ -123,7 +176,7 @@ pub fn _install_shutdown_hook() {}
 // ---- Re-exported platform functions ---------------------------------------
 
 pub use uni_backend::{
-    check_shutdown, log, num_workers, request_shutdown, set_ready,
+    check_shutdown, log, num_workers, request_shutdown,
     wait_for_events, HeapStats,
 };
 

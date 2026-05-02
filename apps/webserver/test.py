@@ -197,11 +197,13 @@ class WebserverShutdownTest(unittest.TestCase):
     funnel into the same 0x03 → PSCI/ACPI shutdown path in the guest.
     """
 
-    def test_ctrlc_exits_within_8s(self) -> None:
-        port = PORT + 100
-        tls_port = TLS_PORT + 100
-        udp_port = UDP_PORT + 100
-        tcp_echo_port = TCP_ECHO_PORT + 100
+    def _run_shutdown_scenario(self, *, port_offset: int, hammer: bool):
+        """Boot, optionally hammer HTTP, send ^C, wait for VM exit. Returns
+        the captured serial buffer for further assertions."""
+        port = PORT + port_offset
+        tls_port = TLS_PORT + port_offset
+        udp_port = UDP_PORT + port_offset
+        tcp_echo_port = TCP_ECHO_PORT + port_offset
         pty_launcher = PtyLauncher(
             LAUNCHER,
             env=_launcher_env(port, tls_port, udp_port, tcp_echo_port),
@@ -214,18 +216,17 @@ class WebserverShutdownTest(unittest.TestCase):
                 f"(got {len(pty_launcher.buffer)} bytes)",
             )
 
-            # Hammer HTTP so the event loop is actively serving when ^C fires.
-            def hammer() -> None:
-                while not stop_hammer[0]:
-                    subprocess.run(
-                        ["curl", "-s", "--max-time", "1",
-                         f"http://127.0.0.1:{port}/health"],
-                        capture_output=True,
-                    )
-
-            workers = [threading.Thread(target=hammer, daemon=True) for _ in range(3)]
-            for w in workers:
-                w.start()
+            if hammer:
+                def _hammer() -> None:
+                    while not stop_hammer[0]:
+                        subprocess.run(
+                            ["curl", "-s", "--max-time", "1",
+                             f"http://127.0.0.1:{port}/health"],
+                            capture_output=True,
+                        )
+                workers = [threading.Thread(target=_hammer, daemon=True) for _ in range(3)]
+                for w in workers:
+                    w.start()
             time.sleep(2)
 
             t0 = time.monotonic()
@@ -235,9 +236,44 @@ class WebserverShutdownTest(unittest.TestCase):
             elapsed = time.monotonic() - t0
             self.assertTrue(exited, f"VM still running {elapsed:.1f}s after ^C — hung")
             print(f"    (exited {elapsed:.2f}s after ^C)", flush=True)
+            return pty_launcher.buffer
         finally:
             stop_hammer[0] = True
             pty_launcher.kill()
+
+    def test_ctrlc_exits_within_8s(self) -> None:
+        """Active-traffic ^C shutdown. Just verifies the VM exits — does
+        NOT assert leak-free, because in-flight conn-handler tasks get
+        their `abort` flag set by `shutdown_and_drop` but never re-poll
+        (APs have left the eventloop by then), so their `Box<dyn Future>`
+        storage stays allocated until the VM powers off. Print the
+        HEAP_LEAK_CHECK line for visibility but tolerate `LEAK`."""
+        buf = self._run_shutdown_scenario(port_offset=100, hammer=True)
+        for line in buf.splitlines():
+            if b"HEAP_LEAK_CHECK" in line:
+                print(f"    {line.decode(errors='replace')}", flush=True)
+
+    def test_clean_shutdown_no_leak(self) -> None:
+        """Idle ^C shutdown leaves no allocations behind. `shutdown_and_drop`
+        snapshots `talc::heap_stats` at `set_ready` and again after dropping
+        every retained listener; absence of in-flight conn tasks means the
+        post-shutdown delta should be zero (or negative — the boot task
+        itself drains). A `LEAK` verdict here means listener teardown
+        regressed."""
+        buf = self._run_shutdown_scenario(port_offset=200, hammer=False)
+        leak_line = next(
+            (line for line in buf.splitlines() if b"HEAP_LEAK_CHECK" in line),
+            None,
+        )
+        self.assertIsNotNone(
+            leak_line,
+            "no HEAP_LEAK_CHECK line in serial log — shutdown_and_drop didn't run?",
+        )
+        print(f"    {leak_line.decode(errors='replace')}", flush=True)
+        self.assertNotIn(
+            b"HEAP_LEAK_CHECK LEAK", leak_line,
+            "idle-shutdown leaked memory — listener teardown regressed",
+        )
 
 
 if __name__ == "__main__":
