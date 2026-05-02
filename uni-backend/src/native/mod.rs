@@ -1236,15 +1236,7 @@ fn make_listener(port: u16, nonblocking: bool) -> i32 {
 }
 
 pub fn tcp_listen(port: u16) -> *mut () {
-    tcp_listen_for(port, uni_platform::current_worker())
-}
-
-pub fn tcp_listen_on(worker_id: u32, port: u16) -> *mut () {
-    tcp_listen_for(port, worker_id)
-}
-
-pub fn tcp_listen_for(port: u16, worker_id: u32) -> *mut () {
-    let tid = worker_id;
+    let tid = uni_platform::current_worker();
     let ts = thread_state(tid);
 
     unsafe {
