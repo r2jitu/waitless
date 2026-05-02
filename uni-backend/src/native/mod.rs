@@ -24,6 +24,7 @@ pub mod runtime {
 }
 
 mod udp;
+mod tcp;
 
 // ============================================================================
 // libc FFI declarations
@@ -273,10 +274,6 @@ const MAX_THREADS: usize = 16;
 
 struct NativeConn {
     fd: i32,
-    is_listener: bool,
-    /// True when this listener's fd is shared across workers (multi-thread mode).
-    /// release_conn must NOT close the fd — other workers are still using it.
-    is_shared_listener: bool,
     closed: bool,
     has_pending_data: bool,
     /// Incremented every time this slot is released. Async handles
@@ -305,8 +302,6 @@ impl NativeConn {
     const fn empty() -> Self {
         NativeConn {
             fd: -1,
-            is_listener: false,
-            is_shared_listener: false,
             closed: true,
             has_pending_data: false,
             generation: 0,
@@ -517,8 +512,6 @@ impl ThreadState {
         for c in self.conns.iter_mut() {
             if c.closed && c.fd < 0 {
                 c.fd = -1;
-                c.is_listener = false;
-                c.is_shared_listener = false;
                 c.closed = false;
                 c.has_pending_data = false;
                 c.recv_waker = None;
@@ -542,16 +535,12 @@ impl ThreadState {
                     self.disarm_write_fd((*c).fd);
                 }
                 self.unregister_fd((*c).fd);
-                if !(*c).is_shared_listener {
-                    shutdown((*c).fd, SHUT_RDWR);
-                    close((*c).fd);
-                }
+                shutdown((*c).fd, SHUT_RDWR);
+                close((*c).fd);
                 (*c).fd = -1;
             }
             (*c).closed = true;
             (*c).has_pending_data = false;
-            (*c).is_listener = false;
-            (*c).is_shared_listener = false;
             (*c).send_registered = false;
             // Bump generation so any still-outstanding async handle
             // sees a mismatch on its next hook call.
@@ -653,7 +642,7 @@ impl ThreadState {
         }
         // Async TCP listener fd fired → wake the reactor's accept
         // future on this worker; the task's next poll drains accept.
-        if async_tcp_dispatch(self.thread_id, fd) {
+        if tcp::async_tcp_dispatch(fd) {
             return false;
         }
         for c in self.conns.iter_mut() {
@@ -720,68 +709,6 @@ static NUM_THREADS: AtomicUsize = AtomicUsize::new(1);
 /// worker. AtomicBool is the natural fit.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-// ── Shared listen sockets ─────────────────────────────────────────────────────
-// macOS SO_REUSEPORT does not distribute connections across sockets. Instead,
-// all workers share a single nonblocking listen socket per port. Each worker
-// registers it with its own kqueue/epoll. The worker whose kqueue fires first
-// calls accept(); others see EAGAIN and go back to sleep. No dedicated thread,
-// no pipes — mirrors the unikernel's per-core polling model.
-//
-// Multiple ports (e.g. HTTP on 8080 + HTTPS on 8443) are supported via a
-// small fixed table: each `tcp_listen(port)` call is deduplicated by port,
-// and all workers register every current fd with their kqueue/epoll so any
-// of them can accept either flavour of connection.
-
-const MAX_SHARED_LISTENERS: usize = 4;
-
-/// `(port, fd)` pairs for every listener currently active. Indexed up to
-/// `SHARED_LISTEN_COUNT`. Entries are never removed during a normal run;
-/// the process exits on shutdown.
-// Shared-listener table. Filled exclusively on the main thread
-// before any worker starts (HTTP `Server::listen{,_tls}` runs on
-// thread 0 during `uni_boot`). After that, workers only read via
-// `tcp_register_shared_listener`.
-struct SharedListenSlot(UnsafeCell<SharedListenTable>);
-struct SharedListenTable {
-    ports: [u16; MAX_SHARED_LISTENERS],
-    fds: [i32; MAX_SHARED_LISTENERS],
-}
-// SAFETY: table is frozen after init (see contract above).
-unsafe impl Sync for SharedListenSlot {}
-
-static SHARED_LISTEN: SharedListenSlot = SharedListenSlot(UnsafeCell::new(SharedListenTable {
-    ports: [0; MAX_SHARED_LISTENERS],
-    fds: [-1; MAX_SHARED_LISTENERS],
-}));
-static SHARED_LISTEN_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-/// Look up (or create) a shared listener for `port`. Returns the fd, or
-/// -1 if bind/listen failed. Must only be called with the shared-listener
-/// table guarded by the init sequence (no concurrent callers at this
-/// point: `Server::listen_tls` runs on the main thread before any worker
-/// has entered its event loop).
-unsafe fn shared_listen_get_or_create(port: u16) -> i32 {
-    unsafe {
-        let table = &mut *SHARED_LISTEN.0.get();
-        let count = SHARED_LISTEN_COUNT.load(Ordering::Acquire);
-        for i in 0..count {
-            if table.ports[i] == port {
-                return table.fds[i];
-            }
-        }
-        if count >= MAX_SHARED_LISTENERS {
-            return -1;
-        }
-        let fd = make_listener(port, true);
-        if fd < 0 { return -1; }
-        let idx = count;
-        table.ports[idx] = port;
-        table.fds[idx] = fd;
-        SHARED_LISTEN_COUNT.store(idx + 1, Ordering::Release);
-        fd
-    }
-}
-
 /// Get the current thread's state. Thread ID is stored in a thread-local-like
 /// fashion by passing it through the worker function argument.
 /// For the main thread (thread 0), we access THREADS[0] directly.
@@ -804,32 +731,14 @@ static NATIVE_UDP_BACKEND: uni_runtime::net::UdpBackend =
         send: udp::udp_send,
     };
 
-/// Native TCP backend vtable. Listener hooks are stubs today (see
-/// `init_native` for the follow-up plan); per-stream recv/send
-/// hooks drive the `fd`-based async reactor.
-static NATIVE_TCP_BACKEND: uni_runtime::net::TcpBackend =
-    uni_runtime::net::TcpBackend {
-        listen: async_tcp_listen_hook,
-        accept: async_tcp_accept_hook,
-        unlisten: Some(async_tcp_unlisten_hook),
-        has_data: native_tcp_has_data,
-        do_recv: native_tcp_do_recv,
-        register_recv_waker: native_tcp_register_recv_waker,
-        clear_recv_waker: native_tcp_clear_recv_waker,
-        close: tcp_close,
-        try_send: native_tcp_try_send,
-        register_send_waker: native_tcp_register_send_waker,
-        clear_send_waker: native_tcp_clear_send_waker,
-    };
-
 fn init_native() {
     unsafe {
         // Per-port overrides (`UNIKERNEL_<PROTO>_<GUEST>`) are read
-        // lazily inside `async_tcp_listen_hook` / `udp_bind`,
+        // lazily inside `tcp::async_tcp_listen_hook` / `udp::udp_backend_bind`,
         // keyed by the caller-supplied app port — same derivation
-        // as `variants.bzl` bakes into the VM
-        // launcher templates. Callers use the same spelling
-        // regardless of which runner LAUNCHER points at.
+        // as `variants.bzl` bakes into the VM launcher templates.
+        // Callers use the same spelling regardless of which runner
+        // LAUNCHER points at.
 
         // Determine thread count from environment or CPU count.
         let num_threads = std::env::var("UNIKERNEL_CPUS")
@@ -859,18 +768,9 @@ fn init_native() {
         signal(SIGPIPE, SIG_IGN);
     }
 
-    // Wire the UDP + TCP reactors through the single-vtable
-    // registration. UDP: `bind`/`unbind` open/close SO_REUSEPORT
-    // sibling fds (bare-metal leaves these None since its NIC RX
-    // path unconditionally delivers to the reactor). TCP: `listen`
-    // is a no-op stub that returns `Ok` so `TcpListener::bind`
-    // succeeds on native; `accept` returns null so the async
-    // accept future stays Pending. Full native wiring — opening
-    // per-worker listen fds and routing kqueue fires to
-    // `deliver_tcp_ready` — is a follow-up; until then apps needing
-    // TCP accept on native should stay on `uni_http::Server`.
+    // Wire the UDP + TCP reactors. Each module owns its vtable.
     uni_runtime::net::register_udp_backend(&NATIVE_UDP_BACKEND);
-    uni_runtime::net::register_tcp_backend(&NATIVE_TCP_BACKEND);
+    uni_runtime::net::register_tcp_backend(&tcp::NATIVE_TCP_BACKEND);
 
     // Register TCP/UDP polling as the first IO poll callback.
     // Runs on every worker's event-loop tick and drains the worker's
@@ -878,297 +778,7 @@ fn init_native() {
     // matching conns, and UDP sibling readiness triggers inline
     // `recvfrom` + handler dispatch. No dedicated RX threads — same
     // inline-poll pattern as the HVF runner's vCPU loop.
-    register_io_poll(|_worker_id| tcp_poll());
-}
-
-// ---- Async TCP reactor backend (native side) ------------------------------
-//
-// One listen fd per port, shared across every worker. Each worker
-// registers it in its own kqueue/epoll; when a SYN arrives the
-// kernel wakes one waiter (or, on macOS, multiple — thundering
-// herd), whose `async_tcp_accept_hook` calls `accept(2)` and owns
-// the resulting connection. Losers see EAGAIN and re-poll.
-//
-// Why shared-fd and not per-worker SO_REUSEPORT siblings:
-// macOS's TCP SO_REUSEPORT does NOT distribute SYNs across sibling
-// listeners (unlike UDP, and unlike Linux's TCP 4-tuple hash).
-// `sample` under tls_handshake_max showed worker 0 doing all TLS
-// crypto while worker 1 sat 95% idle in kevent — all accepts
-// funnelled to thread 0 via the siblings layout. The shared-fd
-// "first-to-accept-wins" pattern is what `uni_http`'s sync path
-// used to get 5.9 k hs/s on 2 t; siblings-plus-async was capping
-// at 3.7 k.
-//
-// On Linux this shape also works — EPOLLIN on the same fd from N
-// epolls will wake one per event; kernel SO_REUSEPORT-style load
-// balancing is lost but is not needed for correctness.
-
-const MAX_ASYNC_TCP_LISTENERS: usize = 4;
-
-struct AsyncTcpListener {
-    app_port: u16,
-    /// Single shared listen fd; same `fd` is registered in every
-    /// worker's kqueue/epoll.
-    fd: i32,
-}
-
-struct AsyncTcpListenersSlot(UnsafeCell<[Option<AsyncTcpListener>; MAX_ASYNC_TCP_LISTENERS]>);
-// SAFETY: populated only on the main thread during `uni_boot`
-// (via `async_tcp_listen_hook` from `uni::runtime::TcpListener::bind`);
-// read from workers afterwards without further mutation.
-unsafe impl Sync for AsyncTcpListenersSlot {}
-static ASYNC_TCP_LISTENERS: AsyncTcpListenersSlot =
-    AsyncTcpListenersSlot(UnsafeCell::new([const { None }; MAX_ASYNC_TCP_LISTENERS]));
-static ASYNC_TCP_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-fn async_tcp_listen_hook(app_port: u16) -> Result<(), ()> {
-    unsafe {
-        let count = ASYNC_TCP_COUNT.load(Ordering::Acquire);
-        if count >= MAX_ASYNC_TCP_LISTENERS {
-            return Err(());
-        }
-        let host_port = read_port_env("TCP", app_port).unwrap_or(app_port);
-        let fd = make_listener(host_port, true);
-        if fd < 0 {
-            return Err(());
-        }
-        let idx = count;
-        (*ASYNC_TCP_LISTENERS.0.get())[idx] = Some(AsyncTcpListener {
-            app_port,
-            fd,
-        });
-        ASYNC_TCP_COUNT.store(idx + 1, Ordering::Release);
-
-        // Register the shared fd in every worker's event queue.
-        let want = NUM_THREADS.load(Ordering::Acquire).max(1);
-        let threads = &mut *THREADS.0.get();
-        for worker_id in 0..want {
-            threads[worker_id].register_fd(fd);
-        }
-        Ok(())
-    }
-}
-
-/// Counterpart to `async_tcp_listen_hook`. Called from
-/// `TcpListener::Drop` via `TCP_BACKEND_UNLISTEN`. Closes the
-/// shared listen fd (kqueue/epoll auto-remove the fd from every
-/// worker's event queue) and clears the slot so a subsequent
-/// `bind(app_port)` can allocate fresh. `ASYNC_TCP_COUNT` isn't
-/// decremented — the table is small (cap 4) and we tolerate
-/// `None` holes rather than compacting on teardown.
-fn async_tcp_unlisten_hook(app_port: u16) {
-    unsafe {
-        let count = ASYNC_TCP_COUNT.load(Ordering::Acquire);
-        let listeners = &mut *ASYNC_TCP_LISTENERS.0.get();
-        for entry in listeners.iter_mut().take(count) {
-            if let Some(l) = entry {
-                if l.app_port == app_port {
-                    close(l.fd);
-                    *entry = None;
-                    return;
-                }
-            }
-        }
-    }
-}
-
-fn async_tcp_accept_hook(app_port: u16) -> uni_runtime::net::TcpStream {
-    use uni_runtime::net::TcpStream;
-    unsafe {
-        let tid = uni_platform::current_worker();
-        let count = ASYNC_TCP_COUNT.load(Ordering::Acquire);
-        let listeners = &*ASYNC_TCP_LISTENERS.0.get();
-        for entry in listeners.iter().take(count) {
-            let l = match entry {
-                Some(l) => l,
-                None => continue,
-            };
-            if l.app_port != app_port || l.fd < 0 {
-                continue;
-            }
-            // `accept` races across workers on the shared fd. The
-            // kernel hands each SYN to exactly one waiter; losers
-            // see EAGAIN and re-poll on the next kqueue fire.
-            let fd = accept(l.fd, ptr::null_mut(), ptr::null_mut());
-            if fd < 0 {
-                return TcpStream::NULL;
-            }
-            set_nonblocking(fd);
-            let opt: i32 = 1;
-            setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, 4);
-            let ts = thread_state(tid);
-            let c = ts.alloc_conn();
-            if c.is_null() {
-                close(fd);
-                return TcpStream::NULL;
-            }
-            (*c).fd = fd;
-            ts.register_fd(fd);
-            return TcpStream::from_raw(c as *mut (), (*c).generation);
-        }
-        TcpStream::NULL
-    }
-}
-
-// ---- Async TCP recv hooks ------------------------------------------------
-//
-// Called from `uni_runtime::net::TcpRecv::poll` via the four function
-// pointers registered in `init_native`. Each operates on a
-// `NativeConn *` obtained from `async_tcp_accept_hook` and lives in
-// the owning worker's `ThreadState.conns`. No locking — the conn's
-// worker thread is the only writer of `recv_waker`; the poll site
-// runs on that same worker (TcpRecv is `!Send`).
-//
-// `generation` is stamped at accept time and checked on every hook
-// call — a mismatch means the slot got reused by a newer connection
-// after a close, so we behave as if the conn is closed for the
-// stale caller (recv returns 0, waker registration wakes
-// immediately so the task observes closure).
-
-/// Returns `true` iff the slot's generation matches and it's still
-/// live. Stale handles return `(c, false)` — the caller should
-/// treat them as closed. Null `handle` also returns `(ptr::null, false)`.
-#[inline]
-unsafe fn check_gen(handle: *mut (), generation: u16) -> (*mut NativeConn, bool) {
-    let c = handle as *mut NativeConn;
-    if c.is_null() {
-        return (c, false);
-    }
-    let matches = unsafe { (*c).generation == generation && !(*c).closed };
-    (c, matches)
-}
-
-fn native_tcp_has_data(handle: *mut (), generation: u16) -> bool {
-    unsafe {
-        let (c, live) = check_gen(handle, generation);
-        if !live {
-            // Closed or stale → TcpRecv resolves so the caller sees
-            // `recv() == 0`.
-            return !c.is_null();
-        }
-        (*c).has_pending_data
-    }
-}
-
-fn native_tcp_do_recv(handle: *mut (), generation: u16, buf: &mut [u8]) -> usize {
-    unsafe {
-        let (_c, live) = check_gen(handle, generation);
-        if !live {
-            return 0;
-        }
-        // Live + matching generation → forward to the sync recv path.
-        tcp_recv(handle, buf)
-    }
-}
-
-fn native_tcp_register_recv_waker(handle: *mut (), generation: u16, waker: &Waker) {
-    unsafe {
-        let (c, live) = check_gen(handle, generation);
-        if !live {
-            waker.wake_by_ref();
-            return;
-        }
-        // Dedup — avoid the clone if the stored waker will already
-        // fire the same task.
-        match &(*c).recv_waker {
-            Some(w) if w.will_wake(waker) => {}
-            _ => (*c).recv_waker = Some(waker.clone()),
-        }
-    }
-}
-
-fn native_tcp_clear_recv_waker(handle: *mut (), generation: u16) {
-    unsafe {
-        let (c, live) = check_gen(handle, generation);
-        if !live {
-            return;
-        }
-        (*c).recv_waker = None;
-    }
-}
-
-// ---- Async TCP send hooks ------------------------------------------------
-
-fn native_tcp_try_send(handle: *mut (), generation: u16, buf: &[u8]) -> isize {
-    unsafe {
-        let (c, live) = check_gen(handle, generation);
-        if !live {
-            return -1;
-        }
-        let fd = (*c).fd;
-        if fd < 0 {
-            return -1;
-        }
-        let n = send(fd, buf.as_ptr(), buf.len(), MSG_NOSIGNAL);
-        if n >= 0 {
-            return n;
-        }
-        // `send` returned -1. EAGAIN means "try again" — report 0 so
-        // the future parks a waker. Any other errno is fatal.
-        if get_errno() == EAGAIN {
-            0
-        } else {
-            -1
-        }
-    }
-}
-
-fn native_tcp_register_send_waker(handle: *mut (), generation: u16, waker: &Waker) {
-    unsafe {
-        let (c, live) = check_gen(handle, generation);
-        if !live {
-            waker.wake_by_ref();
-            return;
-        }
-        // Lazily arm EVFILT_WRITE / EPOLLOUT. Arming/disarming is a
-        // real syscall on every pending-send cycle — defer to
-        // `clear_send_waker` so sends that finish in one try_send
-        // round never touch the event queue.
-        if !(*c).send_registered {
-            let tid = uni_platform::current_worker();
-            thread_state(tid).arm_write_fd((*c).fd);
-            (*c).send_registered = true;
-        }
-        match &(*c).send_waker {
-            Some(w) if w.will_wake(waker) => {}
-            _ => (*c).send_waker = Some(waker.clone()),
-        }
-    }
-}
-
-fn native_tcp_clear_send_waker(handle: *mut (), generation: u16) {
-    unsafe {
-        let (c, live) = check_gen(handle, generation);
-        if !live {
-            return;
-        }
-        (*c).send_waker = None;
-        if (*c).send_registered {
-            let tid = uni_platform::current_worker();
-            thread_state(tid).disarm_write_fd((*c).fd);
-            (*c).send_registered = false;
-        }
-    }
-}
-
-/// Called from `dispatch_ready_fd`. Returns `true` iff `fd` matched
-/// an async-TCP listener (and the reactor notification was issued).
-fn async_tcp_dispatch(_thread_id: u32, fd: i32) -> bool {
-    unsafe {
-        let count = ASYNC_TCP_COUNT.load(Ordering::Acquire);
-        let listeners = &*ASYNC_TCP_LISTENERS.0.get();
-        for entry in listeners.iter().take(count) {
-            let l = match entry {
-                Some(l) => l,
-                None => continue,
-            };
-            if l.fd == fd {
-                uni_runtime::net::deliver_tcp_ready(l.app_port);
-                return true;
-            }
-        }
-        false
-    }
+    register_io_poll(|_worker_id| tcp::tcp_poll());
 }
 
 // ============================================================================
@@ -1201,188 +811,6 @@ pub fn num_workers() -> u32 {
     // num_cpus().
     NUM_THREADS.load(Ordering::Acquire) as u32
 }
-
-// ---- TCP (per-thread) -------------------------------------------------------
-
-fn make_listener(port: u16, nonblocking: bool) -> i32 {
-    unsafe {
-        let fd = socket(AF_INET, SOCK_STREAM, 0);
-        if fd < 0 { return -1; }
-
-        let opt: i32 = 1;
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, 4);
-        // SO_REUSEPORT intentionally omitted: on macOS it doesn't distribute
-        // connections across sockets; the centralized acceptor handles this.
-        if nonblocking { set_nonblocking(fd); }
-
-        let addr = SockAddrIn {
-            #[cfg(target_os = "macos")]
-            sin_len: std::mem::size_of::<SockAddrIn>() as u8,
-            #[cfg(target_os = "macos")]
-            sin_family: AF_INET as u8,
-            #[cfg(target_os = "linux")]
-            sin_family: AF_INET as u16,
-            sin_port: port.to_be(),
-            sin_addr: 0,
-            sin_zero: [0; 8],
-        };
-
-        if bind(fd, &addr, std::mem::size_of::<SockAddrIn>() as u32) < 0 {
-            close(fd); return -1;
-        }
-        if listen(fd, 128) < 0 {
-            close(fd); return -1;
-        }
-        fd
-    }
-}
-
-pub fn tcp_listen(port: u16) -> *mut () {
-    let tid = uni_platform::current_worker();
-    let ts = thread_state(tid);
-
-    unsafe {
-        if NUM_THREADS.load(Ordering::Acquire) > 1 {
-            // Multi-thread: one shared nonblocking listen socket per port
-            // (so HTTP on 8080 and HTTPS on 8443 each get their own fd,
-            // but the fd is shared across all workers). All workers'
-            // kqueue/epoll instances end up watching both fds and any of
-            // them can accept either flavour of connection.
-            let fd = shared_listen_get_or_create(port);
-            if fd < 0 { return ptr::null_mut(); }
-            let c = ts.alloc_conn();
-            if c.is_null() { return ptr::null_mut(); }
-            (*c).fd = fd;
-            (*c).is_listener = true;
-            (*c).is_shared_listener = true;
-            c as *mut ()
-        } else {
-            // Single-thread: direct accept(), nonblocking (polled via kqueue/epoll).
-            let fd = make_listener(port, true);
-            if fd < 0 { return ptr::null_mut(); }
-            let c = ts.alloc_conn();
-            if c.is_null() { close(fd); return ptr::null_mut(); }
-            (*c).fd = fd;
-            (*c).is_listener = true;
-            ts.register_fd(fd);
-            c as *mut ()
-        }
-    }
-}
-
-pub fn tcp_accept(handle: *mut ()) -> *mut () {
-    let listener = handle as *mut NativeConn;
-    let tid = uni_platform::current_worker();
-    let ts = thread_state(tid);
-    unsafe {
-        if listener.is_null() || (*listener).fd < 0 || (*listener).closed {
-            return ptr::null_mut();
-        }
-        let fd = accept((*listener).fd, ptr::null_mut(), ptr::null_mut());
-        if fd < 0 {
-            if get_errno() == EAGAIN { (*listener).has_pending_data = false; }
-            return ptr::null_mut();
-        }
-        set_nonblocking(fd);
-        // Disable Nagle on the accepted client socket. See the
-        // comment on `TCP_NODELAY` above for the full story — short
-        // version: the TLS handshake server flight is 5 small
-        // consecutive `send()` calls, and with Nagle + Linux
-        // delayed-ACK in play the client ends up waiting ~40ms for
-        // each segment's ACK before sending its Finished. That
-        // alone accounted for a ~150x regression in
-        // `tls_handshake_max` on GCP.
-        let opt: i32 = 1;
-        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, 4);
-        let c = ts.alloc_conn();
-        if c.is_null() { close(fd); return ptr::null_mut(); }
-        (*c).fd = fd;
-        ts.register_fd(fd);
-        c as *mut ()
-    }
-}
-
-pub fn tcp_has_data(handle: *mut ()) -> bool {
-    let c = handle as *mut NativeConn;
-    unsafe {
-        if c.is_null() || (*c).closed { return false; }
-        (*c).has_pending_data
-    }
-}
-
-pub fn tcp_recv(handle: *mut (), buf: &mut [u8]) -> usize {
-    let c = handle as *mut NativeConn;
-    unsafe {
-        if c.is_null() || (*c).fd < 0 || (*c).closed { return 0; }
-        let n = recv((*c).fd, buf.as_mut_ptr(), buf.len(), 0);
-        if n < 0 { (*c).has_pending_data = false; return 0; }
-        if n == 0 { (*c).closed = true; (*c).has_pending_data = false; return 0; }
-        (*c).has_pending_data = false;
-        n as usize
-    }
-}
-
-pub fn tcp_send(handle: *mut (), data: &[u8]) -> i32 {
-    let c = handle as *mut NativeConn;
-    unsafe {
-        if c.is_null() || (*c).fd < 0 || (*c).closed { return -1; }
-        let sent = send((*c).fd, data.as_ptr(), data.len(), MSG_NOSIGNAL);
-        if sent < 0 { -1 } else { sent as i32 }
-    }
-}
-
-fn tcp_close(handle: *mut (), generation: u16) {
-    let c = handle as *mut NativeConn;
-    if c.is_null() { return; }
-    // SAFETY: stream handles point into per-worker `NativeConn`
-    // pools — the `!Send` marker on `TcpStream` keeps cross-worker
-    // closes out, and the generation check rejects a stale stream
-    // whose slot was already reused by a fresh accept.
-    unsafe {
-        if (*c).generation != generation {
-            return;
-        }
-    }
-    // Find which thread owns this connection and release it.
-    let tid = uni_platform::current_worker();
-    thread_state(tid).release_conn(c);
-}
-
-pub fn tcp_is_closed(handle: *mut ()) -> bool {
-    let c = handle as *mut NativeConn;
-    unsafe { c.is_null() || (*c).closed }
-}
-
-/// Pump the worker's event queue non-blockingly. Flips
-/// `has_pending_data` on any TCP conn that became readable and drains
-/// any UDP sibling that fired (dispatching the app handler inline).
-/// Returns `true` iff a UDP sibling was drained — tells the event
-/// loop to skip its idle sleep and run another iteration.
-pub fn tcp_poll() -> bool {
-    thread_state(uni_platform::current_worker()).poll_events()
-}
-
-/// Register every shared listen socket with this worker's kqueue/epoll.
-/// Called once per worker thread once it's running. In multi-thread mode
-/// the shared fds are watched by all workers simultaneously; whichever
-/// kqueue fires first calls accept() and the rest see EAGAIN. We iterate
-/// the full `SHARED_LISTEN_FDS` table so that workers pick up both the
-/// HTTP listener and (if configured) the HTTPS listener — missing either
-/// one silently drops accept events for that port.
-fn tcp_register_shared_listener() {
-    let tid = uni_platform::current_worker();
-    unsafe {
-        let table = &*SHARED_LISTEN.0.get();
-        let count = SHARED_LISTEN_COUNT.load(Ordering::Acquire);
-        for i in 0..count {
-            let fd = table.fds[i];
-            if fd >= 0 {
-                thread_state(tid).register_fd(fd);
-            }
-        }
-    }
-}
-
 
 // ============================================================================
 // Callback-driven event loop (mirrors uni_kernel::eventloop)
@@ -1570,9 +998,6 @@ pub fn run(config: RunConfig) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn native_worker_loop(thread_id: u32) {
     uni_platform::set_current_worker(thread_id);
-    // Register the shared listen socket with this worker's kqueue/epoll so it
-    // wakes up when a new connection arrives.
-    tcp_register_shared_listener();
     run_worker(thread_id);
 }
 

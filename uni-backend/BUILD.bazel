@@ -15,6 +15,7 @@ rust_library(
     srcs = [
         "src/lib.rs",
         "src/native/mod.rs",
+        "src/native/tcp.rs",
         "src/native/udp.rs",
         "src/unikernel.rs",
     ],
