@@ -1,7 +1,7 @@
 // net/udp.rs — UDP send/receive.
 //
 // Simple datagram protocol — no state machine, no connection
-// tracking. The async reactor (`uni_runtime::net::UdpServer`) is
+// tracking. The async reactor (`uni_runtime::net::UdpSocket`) is
 // the only binder these days; the pre-async `bind(port, handler)`
 // sync-callback registry is gone.
 
@@ -55,7 +55,7 @@ pub fn send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
 
 /// Called by the network dispatch layer when protocol == UDP.
 /// Delivers the datagram to the async reactor if a
-/// `uni_runtime::net::UdpServer` is bound to the destination port;
+/// `uni_runtime::net::UdpSocket` is bound to the destination port;
 /// otherwise drops it.
 pub fn udp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
     let hdr = match UdpHeader::try_ref_from(data) {

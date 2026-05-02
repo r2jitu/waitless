@@ -172,7 +172,7 @@ pub mod runtime {
     pub use uni_runtime::net::{
         tcp_listen, udp_listen,
         TcpBindError, TcpHandle, TcpListener, TcpRecv, TcpSend, TcpStream,
-        UdpBindError, UdpClient, UdpHandle, UdpRecv, UdpRecvInplace, UdpServer,
+        UdpBindError, UdpClient, UdpHandle, UdpRecv, UdpRecvInplace, UdpSocket,
     };
     pub use uni_runtime::select::{
         join, join3, select, select3, timeout_us, Either, Three,
@@ -211,7 +211,7 @@ pub fn udp_listen<H, F>(
     body: H,
 ) -> Result<(), uni_runtime::net::UdpBindError>
 where
-    H: Fn(alloc::sync::Arc<uni_runtime::net::UdpServer>) -> F + Send + Sync + 'static,
+    H: Fn(alloc::sync::Arc<uni_runtime::net::UdpSocket>) -> F + Send + Sync + 'static,
     F: core::future::Future<Output = ()> + 'static,
 {
     let handle = uni_runtime::net::udp_listen(port, body)?;
