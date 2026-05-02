@@ -226,9 +226,12 @@ def _iso_impl(ctx):
         ctx.attr.iso[0][DefaultInfo].files.to_list()[0],
         ctx.label.name + ".iso",
     )
+    helpers_co = _symlink_into_outdir(
+        ctx, ctx.file.helpers, ctx.label.name + ".helpers.sh",
+    )
     launcher = _expand_launcher(ctx, {
         "%ISO%": iso.basename,
-        "%HELPERS%": _relpath_from_launcher_to(ctx, ctx.file.helpers),
+        "%HELPERS_NAME%": helpers_co.basename,
         "%HOSTFWD%": ctx.attr.qemu_hostfwd,
         "%DEFAULT_RAM%": str(ctx.attr.default_ram_mb),
         "%DEFAULT_CPUS%": str(ctx.attr.default_cpus),
@@ -238,7 +241,7 @@ def _iso_impl(ctx):
     })
     return [DefaultInfo(
         executable = launcher,
-        runfiles = ctx.runfiles(files = [launcher, iso, ctx.file.helpers]),
+        runfiles = ctx.runfiles(files = [launcher, iso, helpers_co]),
     )]
 
 def _qemu_impl(ctx):
@@ -258,17 +261,20 @@ def _qemu_impl(ctx):
         ctx.attr.img[0][DefaultInfo].files.to_list()[0],
         ctx.label.name + ".img",
     )
+    helpers_co = _symlink_into_outdir(
+        ctx, ctx.file.helpers, ctx.label.name + ".helpers.sh",
+    )
     launcher = _expand_launcher(ctx, {
         "%ELF%": elf.basename,
         "%IMG%": img.basename,
-        "%HELPERS%": _relpath_from_launcher_to(ctx, ctx.file.helpers),
+        "%HELPERS_NAME%": helpers_co.basename,
         "%HOSTFWD%": ctx.attr.qemu_hostfwd,
         "%DEFAULT_RAM%": str(ctx.attr.default_ram_mb),
         "%DEFAULT_CPUS%": str(ctx.attr.default_cpus),
     })
     return [DefaultInfo(
         executable = launcher,
-        runfiles = ctx.runfiles(files = [launcher, elf, img, ctx.file.helpers]),
+        runfiles = ctx.runfiles(files = [launcher, elf, img, helpers_co]),
     )]
 
 _ALLOWLIST_ATTR = {

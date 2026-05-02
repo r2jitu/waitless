@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
 # Generated launcher for the `_iso_<arch>` variant of a
 # unikernel_binary target. The variant rule symlinks the Limine
-# ISO next to this script under the filename substituted into
-# %ISO%; `//scripts:helpers.sh` is accessible via the launcher-
-# relative path in %HELPERS%; `%HOSTFWD%` is the hostfwd string
-# built from the app's `port_forwards` attr; `%QEMU_BIN%`,
-# `%VIRTIO_DEV%`, and `%QEMU_MACHINE%` pin the per-arch QEMU
-# binary + machine args at template-expand time (ISO can't
-# auto-detect from an ELF the way run_qemu does).
+# ISO and `//scripts:helpers.sh` next to this script under the
+# filenames substituted into %ISO% / %HELPERS_NAME%, so both are
+# reachable via `$SELF_DIR/<basename>` regardless of whether the
+# launcher is invoked from bazel-bin or the runfiles tree.
+# `%HOSTFWD%` is the hostfwd string built from the app's
+# `port_forwards` attr; `%QEMU_BIN%`, `%VIRTIO_DEV%`, and
+# `%QEMU_MACHINE%` pin the per-arch QEMU binary + machine args at
+# template-expand time (ISO can't auto-detect from an ELF the way
+# run_qemu does).
 set -euo pipefail
 
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 ISO="$SELF_DIR/%ISO%"
-HELPERS="$SELF_DIR/%HELPERS%"
+HELPERS="$SELF_DIR/%HELPERS_NAME%"
 # shellcheck disable=SC1090
 source "$HELPERS"
 

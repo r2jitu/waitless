@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 # Generated launcher for the `_qemu_<arch>` variant of a unikernel_binary
-# target. The variant rule symlinks the guest ELF and the raw .img
-# next to this script under the filenames substituted into %ELF% /
-# %IMG%; `//scripts:helpers.sh` is accessible via the launcher-
-# relative path substituted into %HELPERS%; `%HOSTFWD%` is the
-# hostfwd string built from the app's `port_forwards` attr, with
+# target. The variant rule symlinks the guest ELF, the raw .img, AND
+# `//scripts:helpers.sh` next to this script — under the filenames
+# substituted into %ELF% / %IMG% / %HELPERS_NAME% — so all three are
+# reachable via `$SELF_DIR/<basename>` regardless of whether the
+# launcher is invoked from bazel-bin (the case for `bazel run`) or
+# from the runfiles tree (the case for `bazel test`). `%HOSTFWD%` is
+# the hostfwd string built from the app's `port_forwards` attr, with
 # env-var defaults baked in per forward.
 set -euo pipefail
 
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 ELF="$SELF_DIR/%ELF%"
 IMG="$SELF_DIR/%IMG%"
-HELPERS="$SELF_DIR/%HELPERS%"
+HELPERS="$SELF_DIR/%HELPERS_NAME%"
 # shellcheck disable=SC1090
 source "$HELPERS"
 
