@@ -399,6 +399,7 @@ unsafe fn kernel_boot(info: &BootInfo) {
         exceptions::init();
     }
 
+    uni_kernel::time::log_phase(b"  arch+vectors");
     klog!("[INIT] Memory manager...\n");
     mm::init(info as *const BootInfo);
     klog!(
@@ -406,6 +407,7 @@ unsafe fn kernel_boot(info: &BootInfo) {
         mm::get_total_memory() / (1024 * 1024),
         mm::get_free_memory() / (1024 * 1024)
     );
+    uni_kernel::time::log_phase(b"  memory");
 
     #[cfg(target_arch = "x86_64")]
     {
@@ -439,14 +441,17 @@ unsafe fn kernel_boot(info: &BootInfo) {
     #[cfg(target_arch = "aarch64")]
     uni_kernel::aarch64::smp::init_tls(0);
 
+    uni_kernel::time::log_phase(b"  percpu+apic");
     klog!("[INIT] PCI bus scan...\n");
     uni_drivers::pci::init();
+    uni_kernel::time::log_phase(b"  pci scan");
 
     // NIC bring-up. `uni_drivers::net::init()` tries gVNIC first
     // (preferred on GCE — native RSS multi-queue) then falls back
     // to virtio-net (kvm-vm, HVF, default GCE instances).
     klog!("[INIT] NIC driver...\n");
     let net_ok = uni_drivers::net::init();
+    uni_kernel::time::log_phase(b"  nic driver");
     if !net_ok {
         klog!("       [WARN] No NIC found (neither gVNIC nor virtio-net).\n");
     } else {
@@ -471,6 +476,7 @@ unsafe fn kernel_boot(info: &BootInfo) {
         // `net_receive` routes TCP/UDP packets through
         // `net::REGISTRY` instead of a hardcoded match.
         net::init_stack();
+        uni_kernel::time::log_phase(b"  net stack");
 
         klog!("[INIT] Interrupt-driven idle...\n");
         uni_drivers::net::enable_irq();
