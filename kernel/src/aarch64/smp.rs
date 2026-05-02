@@ -99,12 +99,17 @@ pub unsafe fn start_secondary_cores(cpu_count: u32) {
         }
     }
 
-    // Wait for all APs to come online (timeout after ~100ms)
-    for _ in 0..100_000 {
-        if num_cores_online() >= count {
-            break;
-        }
-        core::arch::asm!("nop");
+    // Wait up to 2 s wall-clock for all APs to come online. On real
+    // hardware / KVM / HVF this resolves in <5 ms (the early break
+    // hits on the first iteration). On QEMU TCG, AP setup is much
+    // slower wall-clock — PSCI CPU_ON + MMU + percpu TLS init can
+    // take 100-500 ms per core, and a previous "100 000 nop" wait
+    // expired before all 4 cores reported, which printed
+    // "3/4 cores online" right before the slow AP came up.
+    let deadline_cycles = crate::time::now_cycles()
+        .wrapping_add(2_000_000 * crate::time::cycles_per_us());
+    while num_cores_online() < count && crate::time::now_cycles() < deadline_cycles {
+        core::arch::asm!("yield");
     }
 
     // Log result
