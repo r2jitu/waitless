@@ -38,6 +38,45 @@ pub fn cpu_id() -> u32 {
     { 0 }
 }
 
+/// Number of secondary cores that have reported online so far.
+/// Arch-independent. Increments monotonically as APs finish their
+/// entry path; the counter starts at 1 (BSP) and tops out at
+/// `percpu::num_cores()` once every AP has come up.
+pub fn num_cores_online() -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    { x86_64::smp::num_cores_online() }
+    #[cfg(target_arch = "aarch64")]
+    { aarch64::smp::num_cores_online() }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    { 1 }
+}
+
+/// Spin until every configured core has come up, with a wall-clock
+/// deadline. Returns `true` if all cores are online before the
+/// deadline, `false` on timeout. Useful for tests / apps that want
+/// to do something explicitly multi-core (send IPIs to APs, observe
+/// per-core counters) before they declare themselves ready —
+/// normal-app boot doesn't need this because `eventloop::run`'s
+/// per-AP `READY` spin already handles join.
+pub fn wait_for_cores_online(timeout_us: u64) -> bool {
+    let count = percpu::num_cores();
+    if num_cores_online() >= count {
+        return true;
+    }
+    let deadline = time::now_cycles()
+        .wrapping_add(timeout_us * time::cycles_per_us());
+    while num_cores_online() < count {
+        if time::now_cycles() >= deadline {
+            return false;
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe { core::arch::asm!("yield", options(nomem, nostack)); }
+        #[cfg(target_arch = "x86_64")]
+        core::hint::spin_loop();
+    }
+    true
+}
+
 /// Send IPI to a specific core (arch-independent).
 /// Used for cold-path operations like shutdown. Hot-path signaling
 /// uses wake_cores() / wake_core0() which are lighter weight.

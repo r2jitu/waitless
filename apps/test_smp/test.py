@@ -31,9 +31,6 @@ class SmpBootTest(unittest.TestCase):
             "test_smp", marker="SMP test complete", timeout=15.0,
         )
 
-    def test_all_cores_online(self) -> None:
-        self.assertIn(f"{EXPECTED_CPUS}/{EXPECTED_CPUS} cores online", self.serial)
-
     def test_each_core_reported(self) -> None:
         # Core 0 is implicit; APs print "[SMP] core N online".
         for core in range(1, EXPECTED_CPUS):

@@ -26,8 +26,15 @@ class PerCoreStateTest(unittest.TestCase):
             "test_percpu", marker="Per-core state test complete", timeout=15.0,
         )
 
-    def test_all_cores_online(self) -> None:
-        self.assertIn(f"{EXPECTED_CPUS}/{EXPECTED_CPUS} cores online", self.serial)
+    def test_each_core_announced(self) -> None:
+        # Each AP prints `[SMP] core N online` from its entry path
+        # before joining the event loop. Core 0 (BSP) doesn't print
+        # this line, so we check 1..EXPECTED_CPUS.
+        for core in range(1, EXPECTED_CPUS):
+            self.assertIn(
+                f"[SMP] core {core} online", self.serial,
+                f"core {core} didn't print its online message",
+            )
 
     def test_each_core_percpu_state(self) -> None:
         # Core 0 runs the service callback inline; APs reach it through

@@ -149,25 +149,6 @@ pub unsafe extern "C" fn ap_entry_via_limine(apic_id: u32) -> ! {
     crate::eventloop::run(id);
 }
 
-/// Wait for `count` cores to reach their online-announcement point
-/// (including the BSP). Used by the Limine-MP path in boot/entry.rs
-/// after releasing APs to `ap_entry_via_limine`.
-pub fn wait_for_cores_online(count: u32) {
-    for _ in 0..100_000_000u64 {
-        if num_cores_online() >= count { break; }
-        core::hint::spin_loop();
-    }
-    let online = num_cores_online();
-    let mut buf = [0u8; 40];
-    let mut pos = 0;
-    for &b in b"[SMP] " { buf[pos] = b; pos += 1; }
-    pos += fmt_u32(&mut buf[pos..], online);
-    for &b in b"/" { buf[pos] = b; pos += 1; }
-    pos += fmt_u32(&mut buf[pos..], count);
-    for &b in b" cores online\n" { buf[pos] = b; pos += 1; }
-    serial::puts(&buf[..pos]);
-}
-
 /// Boot secondary cores via INIT-SIPI-SIPI (Multiboot2 / PVH path).
 pub unsafe fn start_secondary_cores(cpu_count: u32) {
     if cpu_count <= 1 {
@@ -243,23 +224,13 @@ pub unsafe fn start_secondary_cores(cpu_count: u32) {
         }
     }
 
-    // Wait for APs
-    for _ in 0..100_000_000u64 {
-        if num_cores_online() >= count {
-            break;
-        }
-        core::hint::spin_loop();
-    }
-
-    let online = num_cores_online();
-    let mut buf = [0u8; 40];
-    let mut pos = 0;
-    for &b in b"[SMP] " { buf[pos] = b; pos += 1; }
-    pos += fmt_u32(&mut buf[pos..], online);
-    for &b in b"/" { buf[pos] = b; pos += 1; }
-    pos += fmt_u32(&mut buf[pos..], count);
-    for &b in b" cores online\n" { buf[pos] = b; pos += 1; }
-    serial::puts(&buf[..pos]);
+    // No outer wait or count snapshot. Each AP prints its own
+    // `[SMP] core N online` line from `ap_entry_x86`; that's the
+    // source of truth. The per-AP wait above is still required
+    // (the trampoline page at 0x8000 is shared and must be reused
+    // for the next AP). See `aarch64::smp::start_secondary_cores`
+    // for the same removal rationale on the ARM side.
+    let _ = count;
 }
 
 /// IPI wakeup vector (must not conflict with PIC IRQs 32-47 or exceptions 0-31).

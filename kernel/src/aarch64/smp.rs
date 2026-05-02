@@ -68,17 +68,24 @@ fn psci_cpu_on(target_cpu: u64, entry_point: u64, context_id: u64) -> i64 {
 }
 
 /// Boot secondary cores. Called by core 0 after all init is complete.
+///
+/// No BSP-side wait or count print. APs come up asynchronously and
+/// each prints its own `[SMP] core N online` from the AP entry path;
+/// that's the source of truth for "did the core come up." A previous
+/// BSP wait expired before slow APs (TCG: 100-500 ms wall-clock per
+/// core for PSCI CPU_ON + MMU + percpu TLS setup) and printed
+/// "3/4 cores online" right before the slow AP's own line.
+///
+/// Code that needs all cores up before proceeding waits on its own
+/// signal: `eventloop::run` on each AP spins on `READY` until user
+/// init's `set_ready()` fires; tests use `kernel::wait_for_cores_online`.
 pub unsafe fn start_secondary_cores(cpu_count: u32) {
-    unsafe {
     if cpu_count <= 1 {
         return;
     }
-
-    let count = cpu_count;
     serial::puts(b"[SMP] Starting secondary cores...\n");
 
-    for i in 1..count {
-        // Allocate stack for this AP
+    for i in 1..cpu_count {
         let stack_pages = AP_STACK_SIZE / 4096;
         let stack_base = mm::alloc_pages(stack_pages);
         if stack_base == 0 {
@@ -98,31 +105,6 @@ pub unsafe fn start_secondary_cores(cpu_count: u32) {
             serial::puts(b"[SMP] PSCI CPU_ON failed\n");
         }
     }
-
-    // Wait up to 2 s wall-clock for all APs to come online. On real
-    // hardware / KVM / HVF this resolves in <5 ms (the early break
-    // hits on the first iteration). On QEMU TCG, AP setup is much
-    // slower wall-clock — PSCI CPU_ON + MMU + percpu TLS init can
-    // take 100-500 ms per core, and a previous "100 000 nop" wait
-    // expired before all 4 cores reported, which printed
-    // "3/4 cores online" right before the slow AP came up.
-    let deadline_cycles = crate::time::now_cycles()
-        .wrapping_add(2_000_000 * crate::time::cycles_per_us());
-    while num_cores_online() < count && crate::time::now_cycles() < deadline_cycles {
-        core::arch::asm!("yield");
-    }
-
-    // Log result
-    let online = num_cores_online();
-    let mut buf = [0u8; 40];
-    let mut pos = 0;
-    for &b in b"[SMP] " { buf[pos] = b; pos += 1; }
-    pos += fmt_u32(&mut buf[pos..], online);
-    for &b in b"/" { buf[pos] = b; pos += 1; }
-    pos += fmt_u32(&mut buf[pos..], count);
-    for &b in b" cores online\n" { buf[pos] = b; pos += 1; }
-    serial::puts(&buf[..pos]);
-    } // unsafe
 }
 
 /// AP entry point — called from ap_trampoline (boot.S) after MMU + VBAR + stack

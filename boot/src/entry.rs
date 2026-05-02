@@ -521,8 +521,12 @@ unsafe fn kernel_boot(info: &BootInfo) {
         if cpu_count > 1 {
             match info.protocol {
                 Protocol::Limine => {
-                    let total = start_aps_via_limine_mp();
-                    uni_kernel::x86_64::smp::wait_for_cores_online(total);
+                    // Limine MP releases APs into `ap_entry_via_limine`;
+                    // they print their own `[SMP] core N online` lines
+                    // and join the event loop on `READY`. No wait
+                    // needed — see `aarch64::smp::start_secondary_cores`
+                    // for the same rationale.
+                    let _ = start_aps_via_limine_mp();
                 }
                 _ => {
                     uni_kernel::x86_64::smp::start_secondary_cores(cpu_count);

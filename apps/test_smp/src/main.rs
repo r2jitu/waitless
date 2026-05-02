@@ -5,12 +5,21 @@
 #![no_std]
 
 extern crate uni;
-
-#[cfg(target_arch = "aarch64")]
 extern crate uni_kernel;
 
 #[uni::init]
 fn init() {
+    // Wait until every configured core has come up. The kernel's
+    // `start_secondary_cores` no longer waits BSP-side, so we
+    // explicitly synchronise here before the IPI test (which
+    // requires core 1 to be online to receive the SGI) and before
+    // the final marker (so the per-AP `[SMP] core N online` lines
+    // are guaranteed to be in the serial log when the test driver
+    // captures it).
+    if !uni_kernel::wait_for_cores_online(2_000_000) {
+        uni::log(b"SMP test: not all cores came up within 2 s\n");
+    }
+
     uni::log(b"SMP test: cores booted.\n");
 
     // Test IPI: core 0 sends SGI to core 1, check that it was received
