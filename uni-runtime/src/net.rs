@@ -1085,86 +1085,48 @@ impl UdpServer {
               immediately releases it again"]
 pub struct UdpClient {
     inner: UdpServer,
-    /// Connected peer (set by `connect`), or `None` for an
-    /// unconnected client (created via `open`). Connected mode
-    /// makes `send` / `recv_into` peer-implicit; unconnected
-    /// mode requires `send_to` / `recv_from` to specify the peer.
-    peer: Option<([u8; 4], u16)>,
+    peer_ip: [u8; 4],
+    peer_port: u16,
 }
 
 impl UdpClient {
-    /// Open an unconnected ephemeral UDP client. The local source
-    /// port is allocated from the calling worker's per-worker
-    /// ephemeral pool. Use [`send_to`](Self::send_to) /
-    /// [`recv_from`](Self::recv_from) to specify peers per call.
-    pub fn open() -> Result<UdpClient, UdpBindError> {
-        let inner = UdpServer::open_ephemeral()?;
-        Ok(UdpClient { inner, peer: None })
-    }
-
-    /// Open an ephemeral UDP client and connect it to `(peer_ip,
+    /// Open an ephemeral UDP client connected to `(peer_ip,
     /// peer_port)`. The local source port is allocated from the
     /// calling worker's per-worker ephemeral pool; the peer
-    /// address is stored on the client for the peer-implicit
-    /// [`send`](Self::send) / [`recv_into`](Self::recv_into)
-    /// methods.
+    /// address is stored on the client and used implicitly by
+    /// every send / recv method on this type.
+    ///
+    /// `UdpClient` is *always* connected — there is no
+    /// unconnected variant. If you need to talk to multiple
+    /// peers, open one client per peer (cheap — each is a single
+    /// slot in the per-worker pool).
     pub fn connect(peer_ip: [u8; 4], peer_port: u16) -> Result<UdpClient, UdpBindError> {
         let inner = UdpServer::open_ephemeral()?;
-        Ok(UdpClient { inner, peer: Some((peer_ip, peer_port)) })
+        Ok(UdpClient { inner, peer_ip, peer_port })
     }
 
-    /// Send a datagram to the connected peer. Returns `Err(())`
-    /// if this client wasn't built via [`connect`](Self::connect)
-    /// — use [`send_to`](Self::send_to) for unconnected clients.
+    /// Send a datagram to the connected peer.
     #[inline]
     pub fn send(&self, data: &[u8]) -> Result<(), ()> {
-        let (ip, port) = self.peer.ok_or(())?;
-        self.inner.send_to(ip, port, data)
+        self.inner.send_to(self.peer_ip, self.peer_port, data)
     }
 
-    /// Send to an arbitrary peer regardless of `connect`. Always
-    /// succeeds (modulo backend init); the connected peer set by
-    /// [`connect`](Self::connect) is ignored.
-    #[inline]
-    pub fn send_to(&self, dst_ip: [u8; 4], dst_port: u16, data: &[u8]) -> Result<(), ()> {
-        self.inner.send_to(dst_ip, dst_port, data)
+    /// Receive one datagram from the connected peer into `buf`,
+    /// returning the byte count (truncating at `buf.len()`). The
+    /// source address is implicit (it's [`peer`](Self::peer)).
+    pub async fn recv(&self, buf: &mut [u8]) -> usize {
+        self.recv_payload(move |payload| {
+            let n = payload.len().min(buf.len());
+            buf[..n].copy_from_slice(&payload[..n]);
+            n
+        }).await
     }
 
-    /// Await one datagram on this client's inbox. Returns the
-    /// source `(ip, port, n)`; inbound is not peer-filtered today,
-    /// so connected clients still see datagrams from any sender.
-    #[inline]
-    pub fn recv<'a>(&'a self, buf: &'a mut [u8]) -> UdpRecv<'a> {
-        self.inner.recv_from(buf)
-    }
-
-    /// Identical to [`recv`](Self::recv) — kept as the explicit
-    /// "I want the source" name for unconnected clients.
-    #[inline]
-    pub fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> UdpRecv<'a> {
-        self.inner.recv_from(buf)
-    }
-
-    /// Zero-copy receive — the 3-arg closure form, see
-    /// [`UdpServer::recv_inplace`]. The `(src_ip, src_port)`
-    /// arguments are usually redundant on a connected flow (every
-    /// datagram is supposed to come from `peer()`); use
-    /// [`recv_payload`](Self::recv_payload) when you don't need
-    /// the source.
-    #[inline]
-    pub fn recv_inplace<F, R>(&self, f: F) -> UdpRecvInplace<'_, F, R>
-    where
-        F: FnOnce(&[u8], [u8; 4], u16) -> R + Unpin,
-    {
-        self.inner.recv_inplace(f)
-    }
-
-    /// Zero-copy receive of just the payload. Tighter ergonomics
-    /// for connected-flow code that doesn't care about the source
-    /// — the peer is fixed at `connect` time and all incoming
-    /// datagrams are assumed to come from it. Internally adapts
-    /// the 1-arg closure to [`UdpServer::recv_inplace`]'s 3-arg
-    /// form.
+    /// Zero-copy receive: invoke `f` with a slice borrow of the
+    /// payload (no copy into a user buffer, no source-address
+    /// arguments — peer is fixed at `connect` time). For QUIC
+    /// header parsing this is the fastest receive path the
+    /// runtime offers.
     pub async fn recv_payload<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&[u8]) -> R + Unpin,
@@ -1174,31 +1136,24 @@ impl UdpClient {
             .await
     }
 
-    /// Convenience: read one datagram into `buf`, return the byte
-    /// count (truncating at `buf.len()`). The "I just want the
-    /// payload" form for connected flows that don't need a closure.
-    pub async fn recv_into(&self, buf: &mut [u8]) -> usize {
-        self.recv_payload(move |payload| {
+    /// Non-blocking [`recv`](Self::recv). Returns `None` if no
+    /// datagram is currently buffered.
+    #[inline]
+    pub fn try_recv(&self, buf: &mut [u8]) -> Option<usize> {
+        self.inner.try_recv_inplace(move |payload, _, _| {
             let n = payload.len().min(buf.len());
             buf[..n].copy_from_slice(&payload[..n]);
             n
-        }).await
+        })
     }
 
-    /// Non-blocking copy receive. See [`UdpServer::try_recv_from`].
+    /// Non-blocking [`recv_payload`](Self::recv_payload).
     #[inline]
-    pub fn try_recv(&self, buf: &mut [u8]) -> Option<([u8; 4], u16, usize)> {
-        self.inner.try_recv_from(buf)
-    }
-
-    /// Non-blocking zero-copy receive. See
-    /// [`UdpServer::try_recv_inplace`].
-    #[inline]
-    pub fn try_recv_inplace<F, R>(&self, f: F) -> Option<R>
+    pub fn try_recv_payload<F, R>(&self, f: F) -> Option<R>
     where
-        F: FnOnce(&[u8], [u8; 4], u16) -> R,
+        F: FnOnce(&[u8]) -> R,
     {
-        self.inner.try_recv_inplace(f)
+        self.inner.try_recv_inplace(move |payload, _, _| f(payload))
     }
 
     /// Local source port allocated for this client.
@@ -1207,11 +1162,10 @@ impl UdpClient {
         self.inner.port()
     }
 
-    /// The peer this client is connected to, or `None` if this
-    /// client was created via [`open`](Self::open) (unconnected).
+    /// The peer this client is connected to.
     #[inline]
-    pub fn peer(&self) -> Option<([u8; 4], u16)> {
-        self.peer
+    pub fn peer(&self) -> ([u8; 4], u16) {
+        (self.peer_ip, self.peer_port)
     }
 }
 

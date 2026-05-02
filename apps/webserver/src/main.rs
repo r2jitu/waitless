@@ -91,7 +91,7 @@ async fn gateway(stream: TcpStream, backend_ip: [u8; 4]) {
     loop {
         if stream.recv_exact(&mut buf).await.is_err() { return; }
         if udp.send(&buf).is_err() { return; }
-        if udp.recv_into(&mut buf).await != GATEWAY_MSG_SIZE { return; }
+        if udp.recv(&mut buf).await != GATEWAY_MSG_SIZE { return; }
         if stream.send(&buf).await.is_err() { return; }
     }
 }
