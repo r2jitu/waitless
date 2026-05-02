@@ -98,7 +98,7 @@ async fn gateway(stream: TcpStream, backend_ip: [u8; 4]) {
 
 // ---- Request dispatch + route handlers --------------------------------------
 
-fn handle_request(req: &Request) -> Response {
+async fn handle_request(req: &Request) -> Response {
     match req.path() {
         b"/"        => Response::ok(b"text/html", INDEX_HTML),
         b"/health"  => Response::ok(b"application/json", HEALTH_JSON),

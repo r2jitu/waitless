@@ -241,10 +241,6 @@ impl Response {
     }
 }
 
-// ---- Handler type -----------------------------------------------------------
-
-pub type Handler = fn(&Request) -> Response;
-
 // ---- Server -----------------------------------------------------------------
 
 const BUF_SIZE: usize = 8192;
@@ -378,14 +374,24 @@ impl HttpStream for TlsStream {
 /// path routing match `req.path()` inside it. Many ports can be
 /// bound — call this multiple times — and each `TcpHandle` is
 /// independent.
-pub fn listen(
-    port: u16,
-    handler: Handler,
-) -> Result<(), uni::runtime::TcpBindError> {
+/// Listen for plain HTTP on `port`. `handler` is any async closure
+/// or `async fn` taking `&Request` and producing `Response` — e.g.
+/// `async fn handle(req: &Request) -> Response { ... }`. The
+/// closure is shared across every accepted connection (wrapped in
+/// `Arc` once internally) and the per-conn task awaits it inline,
+/// so a slow handler suspends only its own connection.
+pub fn listen<H>(port: u16, handler: H) -> Result<(), uni::runtime::TcpBindError>
+where
+    H: AsyncFn(&Request) -> Response + Send + Sync + 'static,
+{
     let listener = uni::runtime::TcpListener::bind(port)?;
     uni::log(b"http: listening (plain)\n");
-    let h = listener.run(move |stream| async move {
-        handle_conn(handler, stream).await;
+    let handler = Arc::new(handler);
+    let h = listener.run(move |stream| {
+        let handler = Arc::clone(&handler);
+        async move {
+            handle_conn(handler, stream).await;
+        }
     });
     uni::_retain(h);
     Ok(())
@@ -396,14 +402,19 @@ pub fn listen(
 /// shared across every accepted connection on this port; for
 /// multi-port HTTPS reusing the same cert, pass `tls.clone()`
 /// (`Arc::clone` is cheap).
-pub fn listen_https(
+pub fn listen_https<H>(
     port: u16,
-    handler: Handler,
+    handler: H,
     tls: Arc<dyn Tls>,
-) -> Result<(), uni::runtime::TcpBindError> {
+) -> Result<(), uni::runtime::TcpBindError>
+where
+    H: AsyncFn(&Request) -> Response + Send + Sync + 'static,
+{
     let listener = uni::runtime::TcpListener::bind(port)?;
     uni::log(b"http: listening (TLS)\n");
+    let handler = Arc::new(handler);
     let h = listener.run(move |tcp| {
+        let handler = Arc::clone(&handler);
         let tls = Arc::clone(&tls);
         async move {
             let mut seed = [0u8; 32];
@@ -424,7 +435,11 @@ pub fn listen_https(
 /// `handler`, sends responses. Returns when the peer closes,
 /// idle timeout fires, or the buffer overflows on a too-large
 /// request.
-async fn handle_conn<S: HttpStream>(handler: Handler, mut stream: S) {
+async fn handle_conn<S, H>(handler: Arc<H>, mut stream: S)
+where
+    S: HttpStream,
+    H: AsyncFn(&Request) -> Response,
+{
     let mut buf: Box<[u8]> = alloc::vec![0u8; BUF_SIZE].into_boxed_slice();
     let mut buf_len = 0usize;
     // Per-connection scratch reused across every request on this
@@ -464,7 +479,7 @@ async fn handle_conn<S: HttpStream>(handler: Handler, mut stream: S) {
                 Some(v) => v.eq_ignore_ascii_case(b"close"),
                 None => false,
             };
-            let resp = handler(&req);
+            let resp = (&*handler)(&req).await;
 
             w.clear();
             write_response_into(&mut w, &resp, !want_close);

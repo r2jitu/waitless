@@ -12,7 +12,7 @@ extern crate alloc;
 use uni::net::Net;
 use uni_http::{Request, Response};
 
-fn hello(_: &Request) -> Response {
+async fn hello(_: &Request) -> Response {
     Response::ok(b"text/plain", b"Hello from bare metal!\n")
 }
 
