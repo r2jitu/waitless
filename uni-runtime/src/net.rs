@@ -1452,7 +1452,15 @@ pub fn deliver_udp(dst_port: u16, src_ip: [u8; 4], src_port: u16, payload: &[u8]
 // the same opaque handle `uni_backend::tcp_accept` returns today.
 // Higher layers wrap it into `uni::TcpStream` for the typed API.
 
-pub const MAX_TCP_LISTENERS: usize = 8;
+/// Static cap on concurrently bound TCP listening ports. Sized to
+/// match `MAX_UDP_SOCKETS` so the two registries scale together.
+/// In practice apps bind a handful of well-known ports (HTTP /
+/// HTTPS / a couple of services); 256 is generous headroom.
+///
+/// Each slot is ~80 bytes (port + per-worker waker array), so the
+/// table is ~20 KB at the upper bound — affordable for the
+/// process-lifetime allocation.
+pub const MAX_TCP_LISTENERS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TcpBindError {
