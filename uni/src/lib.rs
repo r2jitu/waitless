@@ -55,33 +55,23 @@ pub mod error {
 // App framework — the runtime's handle on the user's program
 // ----------------------------------------------------------------------------
 //
-// `uni::App` is an empty marker trait the user implements on the
-// type that holds their program's long-lived state (HTTP `Server`,
-// TLS config, background-task handles, …). Inside `#[uni::boot]
-// fn boot()` the user constructs an instance and calls `uni::run(it)`
-// to transfer ownership to the runtime.
+// The user constructs any value (typically a struct holding the
+// app's long-lived state — HTTP `Server`, TLS config, background-
+// task handles, …) inside `#[uni::boot] fn boot()` and hands it
+// to `uni::run`. The runtime stores it for the lifetime of the
+// event loop and drops it on graceful shutdown — Drop is the
+// teardown hook.
 //
-// The runtime holds the app for the lifetime of the event loop and
-// drops it on graceful shutdown. Teardown uses Rust's standard
-// `Drop` — apps that need custom shutdown logic implement it
-// themselves.
+// The runtime touches the app only from the boot CPU (core 0 on
+// unikernel, main thread on native), so the `T: 'static` bound is
+// the only constraint — no `Send`/`Sync`, no marker trait.
 //
-// There are no required trait methods and no `Send`/`Sync` bounds.
-// The runtime handles the app on the boot CPU only (core 0 on
-// unikernel, main thread on native), so multi-core aliasing isn't
-// an issue at this layer.
-//
-// Soundness: the runtime stores `Box<dyn App>` in a static slot
+// Soundness: the runtime stores `Box<dyn Any>` in a static slot
 // wrapped in `UnsafeCell`. One `unsafe impl Sync` lets the static
 // hold it; the contract is "boot CPU only", upheld by the two
 // access sites (`run` from `uni_boot`, `shutdown_and_drop` from
 // the BSP branch of the event-loop exit or native's main after
 // `pthread_join`).
-
-/// Marker trait identifying the program's top-level app type.
-/// Implement with an empty body; the runtime only needs the type
-/// identity plus a `Drop` impl (which every type has by default).
-pub trait App: 'static {}
 
 /// A bag for values that exist solely so their `Drop` runs at
 /// shutdown — typically [`runtime::TcpHandle`] / [`runtime::UdpHandle`]
@@ -122,6 +112,31 @@ impl Handles {
         self
     }
 
+    /// Keep `result` if it's `Ok`; log a `[<name>] bind failed` line
+    /// if it's `Err`. The label appears verbatim in the log;
+    /// keeping it short and consistent (`"http"`, `"tcp echo"`,
+    /// `"gateway"`) makes integration-test grep predictable.
+    ///
+    /// Idiomatic for the bind cascade in `#[uni::boot]`: each
+    /// listener that fails to bind logs and is skipped, and
+    /// successful binds collect into the bag with no `match` ladder.
+    pub fn keep_or_log<T: 'static, E>(
+        &mut self,
+        name: &str,
+        result: Result<T, E>,
+    ) -> &mut Self {
+        match result {
+            Ok(v) => {
+                crate::println!("[{}] listening", name);
+                self.items.push(alloc::boxed::Box::new(v));
+            }
+            Err(_) => {
+                crate::println!("[{}] bind failed", name);
+            }
+        }
+        self
+    }
+
     /// Number of items currently kept.
     pub fn len(&self) -> usize {
         self.items.len()
@@ -143,7 +158,7 @@ impl Default for Handles {
 
 /// Single-slot storage for the runtime-owned app. Accessed only
 /// from the boot CPU (see `unsafe impl Sync` below).
-struct AppSlot(core::cell::UnsafeCell<Option<alloc::boxed::Box<dyn App>>>);
+struct AppSlot(core::cell::UnsafeCell<Option<alloc::boxed::Box<dyn core::any::Any>>>);
 
 // SAFETY: every read/write of `APP_SLOT` is on the boot CPU:
 //   - `run` is called from `uni_boot` (BSP on unikernel, main thread
@@ -169,8 +184,8 @@ static APP_SLOT: AppSlot =
 ///
 /// On graceful shutdown, the runtime drops the box — your app's
 /// `Drop` impl runs, then field destructors cascade.
-pub fn run<A: App>(app: A) {
-    let boxed: alloc::boxed::Box<dyn App> = alloc::boxed::Box::new(app);
+pub fn run<A: 'static>(app: A) {
+    let boxed: alloc::boxed::Box<dyn core::any::Any> = alloc::boxed::Box::new(app);
     // SAFETY: boot-CPU-only; see `unsafe impl Sync for AppSlot`.
     unsafe {
         *APP_SLOT.0.get() = Some(boxed);
@@ -218,6 +233,39 @@ pub use uni_backend::{
     request_shutdown, set_ready, wait_for_events, HeapStats,
 };
 
+/// Format-and-log helper for `uni::log!("…", args)`. Allocates a
+/// scratch `String` because `core::fmt::write` doesn't have a
+/// no-alloc collector. For static-message logs prefer `uni::log`
+/// directly to skip the allocation.
+#[doc(hidden)]
+pub fn _log_fmt(args: core::fmt::Arguments<'_>) {
+    use core::fmt::Write as _;
+    let mut s = alloc::string::String::new();
+    let _ = s.write_fmt(args);
+    log(s.as_bytes());
+}
+
+/// Formatted log line, no trailing newline added. `uni::log!("x={}", x)`.
+#[macro_export]
+macro_rules! log {
+    ($($arg:tt)*) => {{
+        $crate::_log_fmt(::core::format_args!($($arg)*));
+    }};
+}
+
+/// Formatted log line + trailing `\n`. The expected serial-output
+/// shape — `uni::println!("hello {}", name)` is the no_std analog
+/// of `println!`.
+#[macro_export]
+macro_rules! println {
+    () => {{
+        $crate::log(b"\n");
+    }};
+    ($($arg:tt)*) => {{
+        $crate::_log_fmt(::core::format_args!("{}\n", ::core::format_args!($($arg)*)));
+    }};
+}
+
 // ---- Async runtime --------------------------------------------------------
 
 /// Re-export of the shared async runtime. `use uni::runtime::spawn;`
@@ -228,6 +276,7 @@ pub mod runtime {
     pub use uni_runtime::event::{AsyncEvent, WaitEvent};
     pub use uni_runtime::launcher::{LaunchTable, Launcher};
     pub use uni_runtime::net::{
+        tcp_listen, udp_listen,
         TcpBindError, TcpHandle, TcpListener, TcpRecv, TcpSend, TcpStream,
         UdpBindError, UdpFlow, UdpHandle, UdpRecv, UdpRecvInplace, UdpSocket,
     };
@@ -248,15 +297,29 @@ pub fn cpu_id() -> u32 {
     { 0 }
 }
 
-// ---- NIC driver diagnostics ------------------------------------------------
+// ---- Diagnostics ----------------------------------------------------------
 
-pub fn net_rx_counts() -> [u64; 8] { uni_backend::net_rx_counts() }
-pub fn net_num_queue_pairs() -> u16 { uni_backend::net_num_queue_pairs() }
-pub fn net_rx_used_cursors() -> [(u16, u16); 8] { uni_backend::net_rx_used_cursors() }
+/// Observability surface — runtime counters and snapshots most
+/// apps don't need but debug endpoints / monitoring agents do.
+/// Kept under its own namespace so the top-level `uni::*` view
+/// stays focused on what apps actually call.
+pub mod diagnostics {
+    /// Per-queue RX frame counts (Tier 1 multi-queue NIC). Index
+    /// is the queue-pair number; `[0..num_queue_pairs()]` are
+    /// meaningful, the rest are zero.
+    pub fn net_rx_counts() -> [u64; 8] { uni_backend::net_rx_counts() }
 
-// ---- Heap stats -----------------------------------------------------------
+    /// Negotiated RX/TX queue-pair count. Tier 2 (single-queue)
+    /// reports 1; Tier 1 reports the per-vCPU count.
+    pub fn net_num_queue_pairs() -> u16 { uni_backend::net_num_queue_pairs() }
 
-/// Snapshot the heap. Cheap on bare-metal (O(1) + spinlock); best-
-/// effort zero on native.
-pub fn heap_stats() -> HeapStats { uni_backend::heap_stats() }
+    /// Per-queue used-ring cursors `(device, driver)`. Useful for
+    /// spotting "device produced but driver didn't consume" gaps
+    /// (cursors apart) vs "host not delivering" (both stuck).
+    pub fn net_rx_used_cursors() -> [(u16, u16); 8] { uni_backend::net_rx_used_cursors() }
+
+    /// Snapshot the heap. Cheap on bare-metal (O(1) + spinlock);
+    /// best-effort zero on native.
+    pub fn heap_stats() -> super::HeapStats { uni_backend::heap_stats() }
+}
 

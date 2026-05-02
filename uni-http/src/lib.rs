@@ -159,32 +159,65 @@ pub struct Response {
 unsafe impl Send for Response {}
 unsafe impl Sync for Response {}
 
+/// Anything a handler can return as a `Response` body.
+/// Implemented for `&'static [u8]` (zero-allocation static
+/// resources), `Box<[u8]>` / `Vec<u8>` / `String` (heap-rendered
+/// JSON, text, etc.). Apps just call `Response::ok(ct, body)`
+/// without picking a method based on the body type.
+pub trait IntoBody {
+    fn into_body(self) -> ResponseBody;
+}
+
+impl IntoBody for &'static [u8] {
+    fn into_body(self) -> ResponseBody {
+        ResponseBody::Static { ptr: self.as_ptr(), len: self.len() }
+    }
+}
+
+impl<const N: usize> IntoBody for &'static [u8; N] {
+    fn into_body(self) -> ResponseBody {
+        ResponseBody::Static { ptr: self.as_ptr(), len: N }
+    }
+}
+
+impl IntoBody for alloc::boxed::Box<[u8]> {
+    fn into_body(self) -> ResponseBody {
+        ResponseBody::Owned(self)
+    }
+}
+
+impl IntoBody for alloc::vec::Vec<u8> {
+    fn into_body(self) -> ResponseBody {
+        ResponseBody::Owned(self.into_boxed_slice())
+    }
+}
+
+impl IntoBody for alloc::string::String {
+    fn into_body(self) -> ResponseBody {
+        ResponseBody::Owned(self.into_bytes().into_boxed_slice())
+    }
+}
+
 impl Response {
-    /// Build a 200 OK with a borrowed body. Zero-allocation common case.
-    pub fn ok(content_type: &[u8], body: &[u8]) -> Self {
+    /// Build a 200 OK. `body` accepts any [`IntoBody`] —
+    /// `&'static [u8]` for zero-allocation static responses,
+    /// `Vec<u8>` / `String` / `Box<[u8]>` for heap-rendered ones.
+    pub fn ok(content_type: &[u8], body: impl IntoBody) -> Self {
         Response {
             status: 200,
             content_type: content_type.as_ptr(),
             content_type_len: content_type.len(),
-            body: ResponseBody::Static {
-                ptr: body.as_ptr(),
-                len: body.len(),
-            },
+            body: body.into_body(),
         }
     }
 
-    /// Build a 200 OK with a heap-owned body. Used by handlers that
-    /// render JSON/text dynamically into a `Box<[u8]>` (e.g. via
-    /// `vec![...].into_boxed_slice()`) rather than pointing into a
-    /// fixed static scratch buffer. The allocation drops when the
-    /// response drops — caller doesn't need to manage its lifetime.
+    /// Backward-compatible alias for `Response::ok` with an owned
+    /// body. New code should just call `Response::ok(ct, body)` —
+    /// the polymorphic version accepts `Box<[u8]>` / `Vec<u8>` /
+    /// `String` directly.
+    #[deprecated = "use Response::ok with the IntoBody trait instead"]
     pub fn ok_owned(content_type: &[u8], body: alloc::boxed::Box<[u8]>) -> Self {
-        Response {
-            status: 200,
-            content_type: content_type.as_ptr(),
-            content_type_len: content_type.len(),
-            body: ResponseBody::Owned(body),
-        }
+        Self::ok(content_type, body)
     }
 
     pub fn not_found() -> Self {

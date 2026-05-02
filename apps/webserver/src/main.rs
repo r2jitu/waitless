@@ -46,9 +46,7 @@ const GATEWAY_PORT: u16 = 9000;
 const GATEWAY_BACKEND_PORT: u16 = 7777;
 
 /// Wire payload size. Loadgen sends and receives this many bytes per
-/// request; the unikernel forwards the same byte-for-byte. Sized to
-/// match an L1-fitting cache line round-trip while still triggering
-/// real packet send/recv cycles.
+/// request; the unikernel forwards the same byte-for-byte.
 const GATEWAY_MSG_SIZE: usize = 32;
 
 /// Long-lived program state.
@@ -57,8 +55,7 @@ const GATEWAY_MSG_SIZE: usize = 32;
 /// network teardown — TCP / UDP listener handles plus the `Net`
 /// guard. Storing them via `uni::Handles` instead of named
 /// `_field: Option<Handle>` slots keeps the "this exists for its
-/// drop side effect" intent explicit; a reader never has to wonder
-/// whether the leading underscore means "unused" or "load-bearing".
+/// drop side effect" intent explicit.
 struct WebServerApp {
     // load-bearing: every entry's `Drop` aborts a listener task
     // or tears down the network stack at shutdown.
@@ -66,11 +63,9 @@ struct WebServerApp {
     handles: uni::Handles,
 }
 
-impl uni::App for WebServerApp {}
-
 impl Drop for WebServerApp {
     fn drop(&mut self) {
-        uni::log(b"[app] shutting down\n");
+        uni::println!("[app] shutting down");
     }
 }
 
@@ -89,47 +84,47 @@ async fn boot() {
     .await
     .expect("Net bring-up: both DHCP and static fallback failed");
 
-    uni::log(b"Starting servers...\n");
-    let mut handles = uni::Handles::new();
-
     let backend_ip = net.gateway().0;
+    let mut handles = uni::Handles::new();
     handles.keep(net);
 
-    if let Ok(udp_echo) = uni::runtime::UdpSocket::bind(7).map(|s| s.run(|sock| async move {
-        let mut buf = [0u8; 1500];
-        loop {
-            let (src_ip, src_port, n) = sock.recv_from(&mut buf).await;
-            let _ = sock.send_to(src_ip, src_port, &buf[..n]);
-        }
-    })) {
-        uni::log(b"UDP echo on :7\n");
-        handles.keep(udp_echo);
-    }
+    handles.keep_or_log(
+        "udp echo :7",
+        uni::runtime::udp_listen(7, |sock| async move {
+            let mut buf = [0u8; 1500];
+            loop {
+                let (src_ip, src_port, n) = sock.recv_from(&mut buf).await;
+                let _ = sock.send_to(src_ip, src_port, &buf[..n]);
+            }
+        }),
+    );
 
-    if let Ok(tcp_echo) = uni::runtime::TcpListener::bind(9).map(|l| l.run(|stream| async move {
-        let mut buf = [0u8; 1024];
-        loop {
-            // 30s idle timeout via `timeout_us`. On a steady echo
-            // flow the recv wins every time; on an abandoned
-            // connection the timer fires and we tear down.
-            let Some(n) = uni::runtime::timeout_us(
-                30_000_000,
-                stream.recv(&mut buf),
-            ).await else { return; };
-            if n == 0 { return; }
-            if stream.send(&buf[..n]).await.is_err() { return; }
-        }
-    })) {
-        uni::log(b"TCP echo on :9\n");
-        handles.keep(tcp_echo);
-    }
+    handles.keep_or_log(
+        "tcp echo :9",
+        uni::runtime::tcp_listen(9, |stream| async move {
+            let mut buf = [0u8; 1024];
+            loop {
+                // 30 s idle timeout via `timeout_us`. On a steady
+                // echo flow the recv wins every time; on an
+                // abandoned connection the timer fires and we tear
+                // down.
+                let Some(n) = uni::runtime::timeout_us(
+                    30_000_000,
+                    stream.recv(&mut buf),
+                ).await else { return; };
+                if n == 0 { return; }
+                if stream.send(&buf[..n]).await.is_err() { return; }
+            }
+        }),
+    );
 
     // Gateway listener — `gateway_max` workload's server side.
     // Each accepted TCP conn opens a connected UDP flow to the
     // backend and ping-pongs:
     //   tcp_recv_exact → udp_send → udp_recv_payload → tcp_send.
-    if let Ok(gateway) = uni::runtime::TcpListener::bind(GATEWAY_PORT)
-        .map(|l| l.run(move |stream| async move {
+    handles.keep_or_log(
+        "gateway :9000",
+        uni::runtime::tcp_listen(GATEWAY_PORT, move |stream| async move {
             let Ok(udp) = uni::runtime::UdpFlow::connect(
                 backend_ip, GATEWAY_BACKEND_PORT,
             ) else { return; };
@@ -148,29 +143,24 @@ async fn boot() {
                 if n != GATEWAY_MSG_SIZE { return; }
                 if stream.send(&buf).await.is_err() { return; }
             }
-        }))
-    {
-        uni::log(b"Gateway on :9000 (TCP <-> UDP fan-out)\n");
-        handles.keep(gateway);
-    }
+        }),
+    );
 
     let http_port = uni::config_port(HTTP_PORT);
-    if let Ok(http) = uni_http::listen(http_port, handle_request) {
-        handles.keep(http);
-    }
+    handles.keep_or_log(
+        "http",
+        uni_http::listen(http_port, handle_request),
+    );
 
     // HTTPS is opt-in: if the bundled dev cert/key don't parse,
     // log + skip rather than refuse to boot.
     let https_port = uni::config_tls_port(HTTPS_PORT);
-    match uni_tls::listen(https_port, handle_request, DEV_CERT_DER, DEV_KEY_PKCS8_DER) {
-        Ok(https) => {
-            uni::log(b"TLS dev cert loaded; serving HTTPS\n");
-            handles.keep(https);
-        }
-        Err(_) => uni::log(b"TLS dev cert/key invalid; HTTPS disabled\n"),
-    }
+    handles.keep_or_log(
+        "https",
+        uni_tls::listen(https_port, handle_request, DEV_CERT_DER, DEV_KEY_PKCS8_DER),
+    );
 
-    uni::log(b"Entering event loop.\n");
+    uni::println!("Entering event loop.");
     uni::run(WebServerApp { handles });
 }
 
@@ -202,27 +192,17 @@ fn handle_request(req: &Request) -> Response {
 /// can grep them out of the serial log.
 fn log_boot_info() {
     let bi = uni::boot_info();
-    let mut line: String = String::new();
-    let _ = write!(
-        line,
-        "BOOT_INFO ram={} cpus={} nics={} boot_args=\"{}\"\n",
-        bi.ram_bytes,
-        bi.num_cpus,
-        bi.nics.len(),
-        bi.boot_args,
+    uni::println!(
+        "BOOT_INFO ram={} cpus={} nics={} boot_args=\"{}\"",
+        bi.ram_bytes, bi.num_cpus, bi.nics.len(), bi.boot_args,
     );
-    uni::log(line.as_bytes());
     for (i, nic) in bi.nics.iter().enumerate() {
-        let mut l: String = String::new();
-        let _ = write!(
-            l,
-            "BOOT_INFO nic[{}] name={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} qps={}\n",
-            i,
-            nic.name,
+        uni::println!(
+            "BOOT_INFO nic[{}] name={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} qps={}",
+            i, nic.name,
             nic.mac[0], nic.mac[1], nic.mac[2], nic.mac[3], nic.mac[4], nic.mac[5],
             nic.num_queue_pairs,
         );
-        uni::log(l.as_bytes());
     }
 }
 
@@ -294,14 +274,11 @@ const DEV_KEY_PKCS8_DER: &[u8] = include_bytes!("../dev_certs/dev_key.der");
 // ---- Diagnostic endpoints ---------------------------------------------------
 
 /// Per-queue RX frame counts + used-ring cursors, so we can see how
-/// the NIC is distributing flows under Tier 1 multi-queue. A
-/// diagnostic, not a production dashboard. If `device_idx` moves
-/// but `counts` stays 0, there's a polling bug; if neither moves,
-/// the host side isn't delivering to that queue.
+/// the NIC is distributing flows under Tier 1 multi-queue.
 fn stats_response() -> Response {
-    let counts = uni::net_rx_counts();
-    let cursors = uni::net_rx_used_cursors();
-    let nqp = uni::net_num_queue_pairs() as usize;
+    let counts = uni::diagnostics::net_rx_counts();
+    let cursors = uni::diagnostics::net_rx_used_cursors();
+    let nqp = uni::diagnostics::net_num_queue_pairs() as usize;
 
     let mut body = String::from("{\"rx_frames\":[");
     for i in 0..nqp.min(counts.len()) {
@@ -320,13 +297,12 @@ fn stats_response() -> Response {
     }
     let _ = write!(body, "],\"num_queue_pairs\":{}}}", nqp);
 
-    Response::ok_owned(b"application/json", body.into_bytes().into_boxed_slice())
+    Response::ok(b"application/json", body)
 }
 
-/// Snapshot of kernel heap utilisation (allocated / available /
-/// claimed / fragmentation).
+/// Snapshot of kernel heap utilisation.
 fn heap_response() -> Response {
-    let s = uni::heap_stats();
+    let s = uni::diagnostics::heap_stats();
     let body = format!(
         "{{\"allocated_bytes\":{},\"available_bytes\":{},\"claimed_bytes\":{},\
          \"allocation_count\":{},\"fragment_count\":{},\"total_allocation_count\":{}}}",
@@ -337,17 +313,15 @@ fn heap_response() -> Response {
         s.fragment_count,
         s.total_allocation_count,
     );
-    Response::ok_owned(b"application/json", body.into_bytes().into_boxed_slice())
+    Response::ok(b"application/json", body)
 }
 
-/// TLS handshake profiler output as plain text. The profiler fills
-/// a caller-provided byte slice (see `net::tls_server::profile`),
-/// so this path stays on the `Vec<u8>` API rather than `format!`.
+/// TLS handshake profiler output as plain text.
 const PROFILE_BUF_LEN: usize = 4096;
 
 fn tls_profile_response() -> Response {
     let mut buf = alloc::vec![0u8; PROFILE_BUF_LEN];
     let n = uni_tls::tls_profile_report(buf.as_mut_slice());
     buf.truncate(n);
-    Response::ok_owned(b"text/plain", buf.into_boxed_slice())
+    Response::ok(b"text/plain", buf)
 }

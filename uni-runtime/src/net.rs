@@ -997,6 +997,23 @@ impl UdpSocket {
         }
     }
 
+}
+
+/// `bind(port).map(|s| s.run(body))` in one call. The 80%-case
+/// shortcut for "open a UDP server on port N and run this loop on
+/// every worker." Use [`UdpSocket::bind`] + [`UdpSocket::run`]
+/// directly when you need to inspect / configure the socket
+/// between bind and run.
+pub fn udp_listen<H, F>(port: u16, body: H) -> Result<UdpHandle, UdpBindError>
+where
+    H: Fn(Arc<UdpSocket>) -> F + Send + Sync + 'static,
+    F: Future<Output = ()> + 'static,
+{
+    UdpSocket::bind(port).map(|s| s.run(body))
+}
+
+impl UdpSocket {
+
     /// Spawn `body` once per worker. Each invocation gets its own
     /// `Arc<UdpSocket>` clone and typically loops on `recv_from`
     /// (and replies via `send_to`) to drive the per-worker inbox.
@@ -1688,6 +1705,19 @@ impl Drop for TcpListener {
             unlisten(self.port);
         }
     }
+}
+
+/// `bind(port).map(|l| l.run(body))` in one call. The 80%-case
+/// shortcut for "open a TCP server on port N and run this loop on
+/// every accepted conn." Use [`TcpListener::bind`] +
+/// [`TcpListener::run`] directly when you need to inspect /
+/// configure the listener between bind and run.
+pub fn tcp_listen<H, F>(port: u16, body: H) -> Result<TcpHandle, TcpBindError>
+where
+    H: Fn(TcpStream) -> F + Send + Sync + 'static,
+    F: Future<Output = ()> + 'static,
+{
+    TcpListener::bind(port).map(|l| l.run(body))
 }
 
 impl TcpListener {
