@@ -4,7 +4,7 @@
 // Also verifies socket-lifecycle cleanup end-to-end: bind+drop
 // and bind+run+drop both re-release their port so the next
 // `bind(same_port)` succeeds. That's a real regression catch for
-// the UdpSocket/TcpListener `Drop` impls and for `UdpHandle`/
+// the UdpServer/TcpListener `Drop` impls and for `UdpHandle`/
 // `TcpHandle::drop` task-abort + port-release ordering.
 
 #![no_std]
@@ -56,15 +56,15 @@ fn boot() {
     uni::set_ready();
 }
 
-/// Phase 1: `UdpSocket::bind` + `drop` + re-bind same port.
-/// Verifies `UdpSocket::Drop` releases the port-registry slot.
+/// Phase 1: `UdpServer::bind` + `drop` + re-bind same port.
+/// Verifies `UdpServer::Drop` releases the port-registry slot.
 fn run_udp_bind_drop_cycle() {
     // All test ports use the 17000 range: unprivileged on POSIX
     // (the `native` variant runs as a plain user binary so
     // anything < 1024 would EACCES) and unused by the webserver
     // tests that may run in parallel.
     const PORT: u16 = 17017;
-    match uni::runtime::UdpSocket::bind(PORT) {
+    match uni::runtime::UdpServer::bind(PORT) {
         Ok(sock) => {
             uni::log(b"test_async: udp bind ok\n");
             drop(sock);
@@ -75,7 +75,7 @@ fn run_udp_bind_drop_cycle() {
             return;
         }
     }
-    match uni::runtime::UdpSocket::bind(PORT) {
+    match uni::runtime::UdpServer::bind(PORT) {
         Ok(_sock) => uni::log(b"test_async: udp rebind ok\n"),
         Err(_) => uni::log(b"test_async: udp rebind FAILED\n"),
     }
@@ -88,7 +88,7 @@ fn run_udp_bind_drop_cycle() {
 /// the port (not one or the other).
 fn run_udp_fanout_drop_cycle() {
     const PORT: u16 = 17019;
-    match uni::runtime::UdpSocket::bind(PORT) {
+    match uni::runtime::UdpServer::bind(PORT) {
         Ok(sock) => {
             // Body never receives in this test (nothing is sending
             // to PORT) but the per-worker recv tasks get spawned
@@ -107,7 +107,7 @@ fn run_udp_fanout_drop_cycle() {
             return;
         }
     }
-    match uni::runtime::UdpSocket::bind(PORT) {
+    match uni::runtime::UdpServer::bind(PORT) {
         Ok(_sock) => uni::log(b"test_async: udp fanout rebind ok\n"),
         Err(_) => uni::log(b"test_async: udp fanout rebind FAILED\n"),
     }

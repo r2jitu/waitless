@@ -1,7 +1,7 @@
 // net/dhcp.rs — DHCP discover/offer/request/ack.
 //
 // Built on top of the regular UDP stack: binds port 68 via
-// `UdpSocket`, fans the per-worker reply handler out with
+// `UdpServer`, fans the per-worker reply handler out with
 // `run`, and sends DISCOVER / REQUEST via `send_to` with the
 // broadcast IP. The IPv4 layer's existing "`CONFIG.ip() == ANY` →
 // MAC broadcast" branch handles the pre-IP corner case, so DHCP
@@ -11,7 +11,7 @@
 // plus an `on_frame(&[u8])` hook let `net::net_receive` forward raw
 // frames here during bring-up because we couldn't bind port 68 via
 // the normal UDP path. That code is gone — everything DHCP needs
-// is available to any user of `uni::runtime::UdpSocket`.
+// is available to any user of `uni::runtime::UdpServer`.
 
 #![no_std]
 
@@ -28,7 +28,7 @@ mod dhcp_parse;
 use from_bytes::FromBytes;
 use uni_kernel::sync::Spinlock;
 use uni_runtime::event::AsyncEvent;
-use uni_runtime::net::UdpSocket;
+use uni_runtime::net::UdpServer;
 use uni_runtime::select::timeout_us;
 use types::{Ipv4Addr, CONFIG, htons, htonl};
 use ethernet::ethernet_our_mac;
@@ -114,7 +114,7 @@ static DHCP_STATE: Spinlock<DhcpState> = Spinlock::new(DhcpState::new());
 static OFFER_READY: AsyncEvent = AsyncEvent::new();
 static ACK_READY: AsyncEvent = AsyncEvent::new();
 
-/// Per-datagram handler invoked from inside the `UdpSocket::run`
+/// Per-datagram handler invoked from inside the `UdpServer::run`
 /// body — fires on whichever worker the OFFER / ACK arrived on.
 /// Parses the DHCP payload and updates the shared `DHCP_STATE`.
 /// Validation + option walking lives in `dhcp_parse`; see its
@@ -237,7 +237,7 @@ pub async fn discover() -> bool {
     // signalling `OFFER_READY` / `ACK_READY`. Port + socket stay
     // allocated for the process lifetime (DHCP only runs once per
     // boot).
-    let sock = match UdpSocket::bind(68) {
+    let sock = match UdpServer::bind(68) {
         Ok(s) => s,
         Err(_) => return false,
     };

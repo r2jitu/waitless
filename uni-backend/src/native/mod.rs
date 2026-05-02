@@ -1393,8 +1393,8 @@ fn tcp_register_shared_listener() {
 // UDP support
 // ============================================================================
 //
-// Two routing modes (mirroring the runtime's `UdpSocket::bind` /
-// `UdpSocket::open_ephemeral` split):
+// Two routing modes (mirroring the runtime's `UdpServer::bind` /
+// `UdpServer::open_ephemeral` split):
 //
 // * **Server fanout** (`owner_worker == None`): open one
 //   SO_REUSEPORT sibling per worker; the kernel distributes
@@ -1468,12 +1468,12 @@ fn open_udp_sibling(bind_port: u16, reuseport: bool) -> i32 {
 }
 
 /// Hook registered with `uni_runtime::net::register_backend_bind`.
-/// Invoked when a `UdpSocket` is created; opens the SO_REUSEPORT
+/// Invoked when a `UdpServer` is created; opens the SO_REUSEPORT
 /// siblings and routes inbound datagrams through the async
 /// reactor via `uni_runtime::net::deliver_udp`.
 ///
 /// `owner_worker == None`: open NUM_THREADS SO_REUSEPORT siblings
-/// (the fanout / `UdpSocket::run` model — kernel distributes by
+/// (the fanout / `UdpServer::run` model — kernel distributes by
 /// 4-tuple hash across per-worker recv loops).
 ///
 /// `owner_worker == Some(w)`: open exactly one socket on worker

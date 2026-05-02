@@ -2,7 +2,7 @@
 //
 // ## Model
 //
-// `UdpSocket::bind(port)` claims one of `MAX_UDP_SOCKETS` static
+// `UdpServer::bind(port)` claims one of `MAX_UDP_SOCKETS` static
 // slots. Each slot owns `MAX_WORKERS` independent SPSC inboxes —
 // one per worker. Inbound datagrams are pushed into the inbox of
 // the worker that received them (bare-metal Tier 1: the core whose
@@ -21,7 +21,7 @@
 // `run` method:
 //
 // ```rust
-// let echo = UdpSocket::bind(7)?.run(|sock| async move {
+// let echo = UdpServer::bind(7)?.run(|sock| async move {
 //     let mut buf = [0u8; 1500];
 //     loop {
 //         let (ip, port, n) = sock.recv_from(&mut buf).await;
@@ -299,7 +299,7 @@ impl WorkerInbox {
         // SAFETY: SPSC — producer owns the tail slot until Release store
         // below; `slots_ptr` was published by `ensure_alloc` with Release
         // ordering before the owning UdpState's port was set non-zero,
-        // and we only get here once a valid `UdpSocket` is in scope.
+        // and we only get here once a valid `UdpServer` is in scope.
         let slot = unsafe { &mut *slots_ptr.add(tail as usize) };
         slot.src_ip = src_ip;
         slot.src_port = src_port;
@@ -482,7 +482,7 @@ struct EphSlot {
     port: AtomicU16,
     /// Single inbox owned by the worker that allocated this slot.
     /// Producers (any worker via `deliver_udp`) push; the consumer
-    /// (the owning worker only, since `UdpSocket` is `!Send`) pops
+    /// (the owning worker only, since `UdpServer` is `!Send`) pops
     /// via `recv_from`.
     inbox: WorkerInbox,
 }
@@ -592,15 +592,15 @@ fn lookup_eph(port: u16) -> Option<&'static EphSlot> {
 
 /// All UDP backend hooks. Installed once at boot by the platform
 /// backend — native (POSIX sockets) or bare-metal (integrated NIC
-/// driver + protocol stack). `UdpSocket::bind` / `send_to` /
+/// driver + protocol stack). `UdpServer::bind` / `send_to` /
 /// `Drop` dispatch through a single atomic load instead of one
 /// per hook.
 pub struct UdpBackend {
-    /// Called after `UdpSocket::bind` claims a UDP_REGISTRY slot.
+    /// Called after `UdpServer::bind` claims a UDP_REGISTRY slot.
     /// `None` on bare-metal (routing is REGISTRY-only); `Some` on
     /// native.
     ///
-    /// `owner_worker == None` is the fanout case (`UdpSocket::bind`):
+    /// `owner_worker == None` is the fanout case (`UdpServer::bind`):
     /// native opens NUM_THREADS SO_REUSEPORT siblings so the kernel
     /// distributes inbound by 4-tuple hash across the per-worker
     /// recv loops.
@@ -615,7 +615,7 @@ pub struct UdpBackend {
     /// backend tear down per-bind state. Same optional-on-bare-
     /// metal rationale.
     pub unbind: Option<fn(port: u16)>,
-    /// Datagram send transport. Mandatory: `UdpSocket::send_to`
+    /// Datagram send transport. Mandatory: `UdpServer::send_to`
     /// returns `Err(())` if the backend isn't installed yet.
     pub send: fn(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]),
 }
@@ -624,7 +624,7 @@ static UDP_BACKEND: AtomicPtr<UdpBackend> =
     AtomicPtr::new(core::ptr::null_mut());
 
 /// Install the UDP backend. Call once at boot, before any
-/// `UdpSocket::bind` / `send_to`. Safe to call more than once —
+/// `UdpServer::bind` / `send_to`. Safe to call more than once —
 /// last writer wins — but that's not a supported runtime pattern.
 pub fn register_udp_backend(b: &'static UdpBackend) {
     UDP_BACKEND.store(b as *const _ as *mut _, Ordering::Release);
@@ -657,25 +657,25 @@ pub enum UdpBindError {
 /// A UDP socket bound to one port.
 ///
 /// Two lifecycles, backed by two different storage paths:
-///   * **Server-style** (`UdpSocket::bind(port)`): claims a slot in
+///   * **Server-style** (`UdpServer::bind(port)`): claims a slot in
 ///     the static `UDP_REGISTRY`. Apps and shared listeners use this.
 ///     Inbound delivery fans out to every worker's inbox so a
 ///     `run`-style fanout body sees the receiving worker's flow.
-///   * **Ephemeral** (`UdpSocket::open_ephemeral`): allocates a slot
+///   * **Ephemeral** (`UdpServer::open_ephemeral`): allocates a slot
 ///     in the calling worker's `EphPool`. The slot's *position* in
 ///     the pool encodes the port number, so `deliver_udp` can route
 ///     inbound packets in O(1) without scanning a registry. Owner-
 ///     pinned: every reply lands in the allocating worker's inbox.
-#[must_use = "UdpSocket releases its port on drop; bind without \
+#[must_use = "UdpServer releases its port on drop; bind without \
               using the socket immediately releases it again"]
-pub struct UdpSocket {
+pub struct UdpServer {
     port: u16,
     slot: SlotRef,
     /// `UdpHandle::Drop` releases the port slot and calls the
     /// backend's unbind hook eagerly so a subsequent
     /// `bind(same_port)` works without waiting for aborted tasks
-    /// to actually drop their `Arc<UdpSocket>` clones. This flag
-    /// makes the later `UdpSocket::Drop` (on the last Arc drop) a
+    /// to actually drop their `Arc<UdpServer>` clones. This flag
+    /// makes the later `UdpServer::Drop` (on the last Arc drop) a
     /// no-op. Plain `bind + drop` paths leave it clear and get
     /// the release here.
     released: AtomicBool,
@@ -692,7 +692,7 @@ enum SlotRef {
     Ephemeral { worker: u32, slot_idx: u32 },
 }
 
-impl Drop for UdpSocket {
+impl Drop for UdpServer {
     fn drop(&mut self) {
         if self.released.swap(true, Ordering::AcqRel) {
             // Already released by `UdpHandle::Drop`.
@@ -741,15 +741,15 @@ fn release_eph_slot(worker: u32, slot_idx: u32) {
         slot.port.store(0, Ordering::Release);
     }
     // Push slot index to the free list (owner-only access).
-    // SAFETY: `release_eph_slot` is invoked from `UdpSocket::Drop`,
+    // SAFETY: `release_eph_slot` is invoked from `UdpServer::Drop`,
     // which runs on the owning worker (sockets are not migrated
     // across workers; the recv future is `!Send`).
     let bk = unsafe { &mut *pool.bookkeeping.get() };
     bk.free_list.push(slot_idx);
 }
 
-impl UdpSocket {
-    pub fn bind(port: u16) -> Result<UdpSocket, UdpBindError> {
+impl UdpServer {
+    pub fn bind(port: u16) -> Result<UdpServer, UdpBindError> {
         if port == 0 {
             return Err(UdpBindError::InvalidPort);
         }
@@ -779,7 +779,7 @@ impl UdpSocket {
                         return Err(UdpBindError::BackendFailed);
                     }
                 }
-                return Ok(UdpSocket {
+                return Ok(UdpServer {
                     port,
                     slot: SlotRef::Server(idx as u32),
                     released: AtomicBool::new(false),
@@ -804,7 +804,7 @@ impl UdpSocket {
     /// lands on the allocating worker's inbox regardless of which
     /// core observed the wire packet (the same correctness
     /// guarantee `bind_ephemeral` provided before this rewrite).
-    pub fn open_ephemeral() -> Result<UdpSocket, UdpBindError> {
+    pub(crate) fn open_ephemeral() -> Result<UdpServer, UdpBindError> {
         ensure_eph_init();
         let me = CurrentWorker::enter().id();
         let pool = EPH_POOLS.at(me);
@@ -903,7 +903,7 @@ impl UdpSocket {
             }
         }
 
-        Ok(UdpSocket {
+        Ok(UdpServer {
             port,
             slot: SlotRef::Ephemeral { worker: me, slot_idx },
             released: AtomicBool::new(false),
@@ -1001,21 +1001,21 @@ impl UdpSocket {
 
 /// `bind(port).map(|s| s.run(body))` in one call. The 80%-case
 /// shortcut for "open a UDP server on port N and run this loop on
-/// every worker." Use [`UdpSocket::bind`] + [`UdpSocket::run`]
+/// every worker." Use [`UdpServer::bind`] + [`UdpServer::run`]
 /// directly when you need to inspect / configure the socket
 /// between bind and run.
 pub fn udp_listen<H, F>(port: u16, body: H) -> Result<UdpHandle, UdpBindError>
 where
-    H: Fn(Arc<UdpSocket>) -> F + Send + Sync + 'static,
+    H: Fn(Arc<UdpServer>) -> F + Send + Sync + 'static,
     F: Future<Output = ()> + 'static,
 {
-    UdpSocket::bind(port).map(|s| s.run(body))
+    UdpServer::bind(port).map(|s| s.run(body))
 }
 
-impl UdpSocket {
+impl UdpServer {
 
     /// Spawn `body` once per worker. Each invocation gets its own
-    /// `Arc<UdpSocket>` clone and typically loops on `recv_from`
+    /// `Arc<UdpServer>` clone and typically loops on `recv_from`
     /// (and replies via `send_to`) to drive the per-worker inbox.
     ///
     /// Returns a [`UdpHandle`] whose `Drop` aborts the per-worker
@@ -1024,7 +1024,7 @@ impl UdpSocket {
     /// listener tears down cleanly when the owner drops.
     pub fn run<H, F>(self, body: H) -> UdpHandle
     where
-        H: Fn(Arc<UdpSocket>) -> F + Send + Sync + 'static,
+        H: Fn(Arc<UdpServer>) -> F + Send + Sync + 'static,
         F: Future<Output = ()> + 'static,
     {
         self.run_boxed(Box::new(move |sock| Box::pin(body(sock))))
@@ -1042,7 +1042,7 @@ impl UdpSocket {
         // Launcher captures a strong `Arc<ctx>` clone. When
         // `UdpHandle::drop` frees the launcher slot, the captured
         // clone drops; if it was the last one, `Arc<ctx>` drops
-        // (cascading `sock` Arc drop and thus `UdpSocket::Drop`),
+        // (cascading `sock` Arc drop and thus `UdpServer::Drop`),
         // so there's no permanent leak.
         let ctx_for_launcher = Arc::clone(&ctx);
         let launcher_slot = register_net_launcher(Box::new(move || {
@@ -1067,7 +1067,7 @@ impl UdpSocket {
 
 /// An ephemeral UDP socket connected to a fixed peer.
 ///
-/// Wraps an [`UdpSocket`] from [`UdpSocket::open_ephemeral`] with
+/// Wraps an [`UdpServer`] from [`UdpServer::open_ephemeral`] with
 /// the peer address baked in, so `send` / `recv` don't repeat the
 /// destination on every call. This is the shape QUIC client setup
 /// wants — one server, ephemeral source port, owner-pinned to the
@@ -1081,41 +1081,72 @@ impl UdpSocket {
 ///
 /// `!Send + !Sync` follows from `UdpRecv` — the flow stays on the
 /// worker that opened it.
-#[must_use = "UdpFlow releases its port on drop; open without using it \
+#[must_use = "UdpClient releases its port on drop; open without using it \
               immediately releases it again"]
-pub struct UdpFlow {
-    inner: UdpSocket,
-    peer_ip: [u8; 4],
-    peer_port: u16,
+pub struct UdpClient {
+    inner: UdpServer,
+    /// Connected peer (set by `connect`), or `None` for an
+    /// unconnected client (created via `open`). Connected mode
+    /// makes `send` / `recv_into` peer-implicit; unconnected
+    /// mode requires `send_to` / `recv_from` to specify the peer.
+    peer: Option<([u8; 4], u16)>,
 }
 
-impl UdpFlow {
-    /// Open an ephemeral UDP socket and connect it to `(peer_ip,
+impl UdpClient {
+    /// Open an unconnected ephemeral UDP client. The local source
+    /// port is allocated from the calling worker's per-worker
+    /// ephemeral pool. Use [`send_to`](Self::send_to) /
+    /// [`recv_from`](Self::recv_from) to specify peers per call.
+    pub fn open() -> Result<UdpClient, UdpBindError> {
+        let inner = UdpServer::open_ephemeral()?;
+        Ok(UdpClient { inner, peer: None })
+    }
+
+    /// Open an ephemeral UDP client and connect it to `(peer_ip,
     /// peer_port)`. The local source port is allocated from the
     /// calling worker's per-worker ephemeral pool; the peer
-    /// address is stored on the flow for `send` / `peer`.
-    pub fn connect(peer_ip: [u8; 4], peer_port: u16) -> Result<UdpFlow, UdpBindError> {
-        let inner = UdpSocket::open_ephemeral()?;
-        Ok(UdpFlow { inner, peer_ip, peer_port })
+    /// address is stored on the client for the peer-implicit
+    /// [`send`](Self::send) / [`recv_into`](Self::recv_into)
+    /// methods.
+    pub fn connect(peer_ip: [u8; 4], peer_port: u16) -> Result<UdpClient, UdpBindError> {
+        let inner = UdpServer::open_ephemeral()?;
+        Ok(UdpClient { inner, peer: Some((peer_ip, peer_port)) })
     }
 
-    /// Send a datagram to the connected peer.
+    /// Send a datagram to the connected peer. Returns `Err(())`
+    /// if this client wasn't built via [`connect`](Self::connect)
+    /// — use [`send_to`](Self::send_to) for unconnected clients.
     #[inline]
     pub fn send(&self, data: &[u8]) -> Result<(), ()> {
-        self.inner.send_to(self.peer_ip, self.peer_port, data)
+        let (ip, port) = self.peer.ok_or(())?;
+        self.inner.send_to(ip, port, data)
     }
 
-    /// Await one datagram on this flow's inbox. Returns the source
-    /// `(ip, port, n)`; today inbound is not peer-filtered, so the
-    /// caller still sees datagrams from non-peer senders. Future
-    /// versions will drop those at delivery time.
+    /// Send to an arbitrary peer regardless of `connect`. Always
+    /// succeeds (modulo backend init); the connected peer set by
+    /// [`connect`](Self::connect) is ignored.
+    #[inline]
+    pub fn send_to(&self, dst_ip: [u8; 4], dst_port: u16, data: &[u8]) -> Result<(), ()> {
+        self.inner.send_to(dst_ip, dst_port, data)
+    }
+
+    /// Await one datagram on this client's inbox. Returns the
+    /// source `(ip, port, n)`; inbound is not peer-filtered today,
+    /// so connected clients still see datagrams from any sender.
     #[inline]
     pub fn recv<'a>(&'a self, buf: &'a mut [u8]) -> UdpRecv<'a> {
         self.inner.recv_from(buf)
     }
 
+    /// Identical to [`recv`](Self::recv) — kept as the explicit
+    /// "I want the source" name for unconnected clients.
+    #[inline]
+    pub fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> UdpRecv<'a> {
+        self.inner.recv_from(buf)
+    }
+
     /// Zero-copy receive — the 3-arg closure form, see
-    /// [`UdpSocket::recv_inplace`]. The `(src_ip, src_port)`
+    /// [`UdpServer::recv_inplace`]. The `(src_ip, src_port)`
     /// arguments are usually redundant on a connected flow (every
     /// datagram is supposed to come from `peer()`); use
     /// [`recv_payload`](Self::recv_payload) when you don't need
@@ -1132,7 +1163,7 @@ impl UdpFlow {
     /// for connected-flow code that doesn't care about the source
     /// — the peer is fixed at `connect` time and all incoming
     /// datagrams are assumed to come from it. Internally adapts
-    /// the 1-arg closure to [`UdpSocket::recv_inplace`]'s 3-arg
+    /// the 1-arg closure to [`UdpServer::recv_inplace`]'s 3-arg
     /// form.
     pub async fn recv_payload<F, R>(&self, f: F) -> R
     where
@@ -1154,14 +1185,14 @@ impl UdpFlow {
         }).await
     }
 
-    /// Non-blocking copy receive. See [`UdpSocket::try_recv_from`].
+    /// Non-blocking copy receive. See [`UdpServer::try_recv_from`].
     #[inline]
     pub fn try_recv(&self, buf: &mut [u8]) -> Option<([u8; 4], u16, usize)> {
         self.inner.try_recv_from(buf)
     }
 
     /// Non-blocking zero-copy receive. See
-    /// [`UdpSocket::try_recv_inplace`].
+    /// [`UdpServer::try_recv_inplace`].
     #[inline]
     pub fn try_recv_inplace<F, R>(&self, f: F) -> Option<R>
     where
@@ -1170,23 +1201,24 @@ impl UdpFlow {
         self.inner.try_recv_inplace(f)
     }
 
-    /// Local source port allocated for this flow.
+    /// Local source port allocated for this client.
     #[inline]
     pub fn local_port(&self) -> u16 {
         self.inner.port()
     }
 
-    /// The peer this flow is connected to.
+    /// The peer this client is connected to, or `None` if this
+    /// client was created via [`open`](Self::open) (unconnected).
     #[inline]
-    pub fn peer(&self) -> ([u8; 4], u16) {
-        (self.peer_ip, self.peer_port)
+    pub fn peer(&self) -> Option<([u8; 4], u16)> {
+        self.peer
     }
 }
 
 // ---- UdpHandle: owning reference returned by `run` --------------------------
 
 type BoxedBody = Box<
-    dyn Fn(Arc<UdpSocket>) -> Pin<Box<dyn Future<Output = ()>>>
+    dyn Fn(Arc<UdpServer>) -> Pin<Box<dyn Future<Output = ()>>>
         + Send + Sync + 'static,
 >;
 
@@ -1196,16 +1228,16 @@ type BoxedBody = Box<
 /// `NET_LAUNCHERS` (strong `Arc`). When `UdpHandle::drop` frees
 /// the launcher slot, the only strong ref left is the handle's
 /// own clone; dropping it drops `UdpFanoutCtx`, which drops
-/// `Arc<UdpSocket>`, which (on the last worker's per-task Arc
-/// release) runs `UdpSocket::Drop`.
+/// `Arc<UdpServer>`, which (on the last worker's per-task Arc
+/// release) runs `UdpServer::Drop`.
 struct UdpFanoutCtx {
-    sock: Arc<UdpSocket>,
+    sock: Arc<UdpServer>,
     body: BoxedBody,
     stopping: AtomicBool,
     handles: PerWorker<SpinLock<Option<crate::TaskHandle>>>,
 }
 
-/// Owning handle to a running `UdpSocket` fanout. Use via `Deref`
+/// Owning handle to a running `UdpServer` fanout. Use via `Deref`
 /// for `send_to` / `recv_from` / `port`; `Drop` aborts the
 /// per-worker recv tasks and releases the port slot. Call
 /// `.leak()` for process-lifetime listeners.
@@ -1226,8 +1258,8 @@ impl UdpHandle {
 }
 
 impl core::ops::Deref for UdpHandle {
-    type Target = UdpSocket;
-    fn deref(&self) -> &UdpSocket {
+    type Target = UdpServer;
+    fn deref(&self) -> &UdpServer {
         &self.ctx.sock
     }
 }
@@ -1250,8 +1282,8 @@ impl Drop for UdpHandle {
         }
         // 3. Eager port release so a subsequent `bind(same_port)`
         //    succeeds without waiting for aborted tasks to
-        //    actually drop their `Arc<UdpSocket>` clones.
-        //    `UdpSocket::Drop` will see `released = true` on the
+        //    actually drop their `Arc<UdpServer>` clones.
+        //    `UdpServer::Drop` will see `released = true` on the
         //    last Arc drop and no-op.
         let sock = &*self.ctx.sock;
         if !sock.released.swap(true, Ordering::AcqRel) {
@@ -1274,7 +1306,7 @@ impl Drop for UdpHandle {
         //    dropping at end of scope, the ctx refcount falls to
         //    zero once all per-worker tasks have actually dropped
         //    (on their next tick after abort). At that point the
-        //    Arc<UdpSocket> inside also drops and the backing
+        //    Arc<UdpServer> inside also drops and the backing
         //    heap memory is reclaimed.
         release_launcher_slot(self.launcher_slot);
     }
@@ -1286,7 +1318,7 @@ impl Drop for UdpHandle {
 /// mid-await — the per-worker inbox semantics depend on staying on
 /// the worker where we first polled.
 pub struct UdpRecv<'a> {
-    sock: &'a UdpSocket,
+    sock: &'a UdpServer,
     buf: &'a mut [u8],
     _not_send: PhantomData<*mut ()>,
 }
@@ -1329,7 +1361,7 @@ impl<'a> Future for UdpRecv<'a> {
     }
 }
 
-/// Future returned by [`UdpSocket::recv_inplace`]. Holds the closure
+/// Future returned by [`UdpServer::recv_inplace`]. Holds the closure
 /// until data arrives, then invokes it with a borrow of the inbox
 /// slot's payload — no copy. `!Send` for the same reason as
 /// [`UdpRecv`]: the per-worker inbox semantics require staying on
@@ -1338,7 +1370,7 @@ pub struct UdpRecvInplace<'a, F, R>
 where
     F: FnOnce(&[u8], [u8; 4], u16) -> R + Unpin,
 {
-    sock: &'a UdpSocket,
+    sock: &'a UdpServer,
     f: Option<F>,
     _not_send: PhantomData<*mut ()>,
 }
@@ -1390,7 +1422,7 @@ where
 /// Position-based ephemeral slot lookup. Unlike `lookup_eph` (which
 /// rejects free / out-of-range slots), this returns the slot
 /// reference even if `port` is 0 — it's used by paths where we
-/// already hold a `UdpSocket` and just need the inbox pointer.
+/// already hold a `UdpServer` and just need the inbox pointer.
 fn lookup_eph_position(worker: u32, slot_idx: u32) -> Option<&'static EphSlot> {
     if !EPH_POOLS.is_initialized() || worker >= EPH_POOLS.len() {
         return None;
@@ -1691,7 +1723,7 @@ fn tcp_backend() -> Option<&'static TcpBackend> {
 
 /// A TCP listener bound to one port.
 ///
-/// Two lifecycles, same shape as [`UdpSocket`]: drop directly for
+/// Two lifecycles, same shape as [`UdpServer`]: drop directly for
 /// a short-lived bind (releases the port); call
 /// `bound.run(handler)` for the fan-out pattern and drop / leak
 /// the returned [`TcpHandle`].
@@ -1699,7 +1731,7 @@ fn tcp_backend() -> Option<&'static TcpBackend> {
 pub struct TcpListener {
     port: u16,
     idx: usize,
-    /// Same pattern as `UdpSocket::released` — set by
+    /// Same pattern as `UdpServer::released` — set by
     /// `TcpHandle::Drop` so the later `TcpListener::Drop` on the
     /// last `Arc` release no-ops instead of double-invoking the
     /// backend unlisten hook.
@@ -2103,7 +2135,7 @@ pub fn deliver_tcp_ready(dst_port: u16) -> bool {
 // entire uptime.
 
 /// Bounded cap on launchers ever allocated, not live at once.
-/// Each `UdpSocket::run` / `TcpListener::run` / etc. costs one
+/// Each `UdpServer::run` / `TcpListener::run` / etc. costs one
 /// slot; handle drop marks the slot as a tombstone but doesn't
 /// free it for reuse. 256 covers a realistic long-running app.
 const MAX_NET_LAUNCHERS: usize = 256;

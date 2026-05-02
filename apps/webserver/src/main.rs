@@ -15,7 +15,7 @@ use alloc::string::String;
 use core::fmt::Write as _;
 
 use uni::net::Net;
-use uni::runtime::{TcpStream, UdpFlow};
+use uni::runtime::{TcpStream, UdpClient};
 use uni_http::{Request, Response};
 
 // ---- Configuration ----------------------------------------------------------
@@ -60,7 +60,7 @@ async fn boot() {
 
 // ---- Listener bodies --------------------------------------------------------
 
-async fn udp_echo(sock: alloc::sync::Arc<uni::runtime::UdpSocket>) {
+async fn udp_echo(sock: alloc::sync::Arc<uni::runtime::UdpServer>) {
     let mut buf = [0u8; 1500];
     loop {
         let (src_ip, src_port, n) = sock.recv_from(&mut buf).await;
@@ -86,7 +86,7 @@ async fn tcp_echo(stream: TcpStream) {
 /// ping-pongs:
 ///   tcp_recv_exact → udp.send → udp.recv_into → tcp_send.
 async fn gateway(stream: TcpStream, backend_ip: [u8; 4]) {
-    let Ok(udp) = UdpFlow::connect(backend_ip, GATEWAY_BACKEND_PORT) else { return; };
+    let Ok(udp) = UdpClient::connect(backend_ip, GATEWAY_BACKEND_PORT) else { return; };
     let mut buf = [0u8; GATEWAY_MSG_SIZE];
     loop {
         if stream.recv_exact(&mut buf).await.is_err() { return; }

@@ -268,7 +268,7 @@ pub fn tick(worker_id: u32) -> bool {
     // SAFETY: caller guarantees `worker_id` is the running worker.
     let cc = unsafe { CurrentWorker::from_id_unchecked(worker_id) };
 
-    // Spawn per-worker launchers registered by `UdpSocket::run` /
+    // Spawn per-worker launchers registered by `UdpServer::run` /
     // `TcpListener::run` since this worker last ticked.
     net::fire_pending_net_launchers(worker_id);
 
