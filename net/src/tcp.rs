@@ -914,6 +914,34 @@ pub fn close(handle: *mut (), generation: u16) {
     }
 }
 
+/// RST every active connection in every core's pool. Called from
+/// `uni::shutdown_and_drop` so the peer sees an immediate close
+/// instead of a silently-vanishing VM (which would only time out
+/// via TCP keepalive — minutes later). Walks every slot once,
+/// emits one RST per non-Closed/Listen conn, frees the slot.
+///
+/// Safety: by the time this fires, BSP has already broken out of
+/// the eventloop and AP cores are spin-looping past their break
+/// before they hit PSCI CPU_OFF. They aren't actively mutating
+/// their pools, so cross-core read access is race-free for the
+/// shutdown window.
+pub fn shutdown_all() {
+    let n = uni_kernel::percpu::num_cores();
+    for core in 0..n {
+        for slot in 0..CONNECTIONS_PER_CORE {
+            // SAFETY: see fn-level comment — APs have left the
+            // eventloop; only BSP runs this and it owns its own
+            // slots, with read-only access to AP slots.
+            let c = unsafe { &mut *conn_ptr(core, slot) };
+            if c.state == TcpState::Closed || c.state == TcpState::Listen {
+                continue;
+            }
+            send_rst(c.remote_ip, c.local_port, c.remote_port, c.snd_nxt, c.rcv_nxt);
+            free_connection(core, slot);
+        }
+    }
+}
+
 /// Async `TcpRecv` sync read hook. Verifies `generation`; stale
 /// handles return 0 (observed by caller as EOF / close).
 pub fn async_recv(handle: *mut (), generation: u16, buf: &mut [u8]) -> usize {

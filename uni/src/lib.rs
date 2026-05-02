@@ -107,6 +107,13 @@ pub fn shutdown_and_drop() {
         unsafe { core::mem::take(&mut *LISTENERS.0.get()) };
     drop(drained);
 
+    // RST every still-open TCP connection so peers see an immediate
+    // close instead of timing out via TCP keepalive. On the unikernel
+    // this matters: `arch::shutdown()` would otherwise just power
+    // the VM off mid-handshake. On native this is a no-op (the
+    // kernel FINs every fd at process exit).
+    uni_runtime::net::shutdown_all_tcp();
+
     // Tear down the NET slot symmetrically.
     net::clear_on_shutdown();
 

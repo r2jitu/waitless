@@ -250,6 +250,13 @@ pub struct TcpBackend {
         fn(handle: *mut (), generation: u16, waker: &Waker),
     /// Drop the stored send waker.
     pub clear_send_waker: fn(handle: *mut (), generation: u16),
+
+    /// Optional. RST every connection currently in the backend's
+    /// pool — called once at shutdown so peers see an immediate
+    /// close instead of timing out via TCP keepalive after the VM
+    /// powers off. Native leaves this `None`: the kernel FINs every
+    /// open fd at process exit.
+    pub shutdown_all: Option<fn()>,
 }
 
 static TCP_BACKEND: AtomicPtr<TcpBackend> =
@@ -258,6 +265,17 @@ static TCP_BACKEND: AtomicPtr<TcpBackend> =
 /// Install the TCP backend. Call once at boot.
 pub fn register_tcp_backend(b: &'static TcpBackend) {
     TCP_BACKEND.store(b as *const _ as *mut _, Ordering::Release);
+}
+
+/// Trigger the backend's `shutdown_all` hook if it has one. No-op
+/// on native (the kernel handles fd cleanup at process exit) and
+/// before any backend has registered.
+pub fn shutdown_all_tcp() {
+    if let Some(b) = tcp_backend() {
+        if let Some(f) = b.shutdown_all {
+            f();
+        }
+    }
 }
 
 #[inline]

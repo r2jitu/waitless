@@ -378,6 +378,7 @@ pub(super) static NATIVE_TCP_BACKEND: uni_runtime::net::TcpBackend =
         try_send: native_tcp_try_send,
         register_send_waker: native_tcp_register_send_waker,
         clear_send_waker: native_tcp_clear_send_waker,
+        shutdown_all: None,
     };
 
 /// Pump the worker's event queue non-blockingly. Flips

@@ -58,6 +58,7 @@ static BARE_TCP_BACKEND: uni_runtime::net::TcpBackend = uni_runtime::net::TcpBac
     try_send: tcp::async_try_send,
     register_send_waker: tcp::register_send_waker,
     clear_send_waker: tcp::clear_send_waker,
+    shutdown_all: Some(tcp::shutdown_all),
 };
 
 /// Bare-metal UDP backend vtable. No `bind` / `unbind` — routing
