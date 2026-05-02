@@ -229,9 +229,18 @@ fn install_shutdown_hook() {}
 // ---- Re-exported platform functions ---------------------------------------
 
 pub use uni_backend::{
-    check_shutdown, config_port, config_tls_port, log, num_workers,
-    request_shutdown, set_ready, wait_for_events, HeapStats,
+    check_shutdown, config_port, log, num_workers, request_shutdown, set_ready,
+    wait_for_events, HeapStats,
 };
+
+/// Backward-compatible alias for `config_port`. Both HTTP and HTTPS
+/// run over plain TCP, so the env-var namespace is shared
+/// (`UNIKERNEL_TCP_<port>`); calling `config_port(443)` is the same
+/// thing.
+#[deprecated = "use config_port — HTTPS uses the same TCP env namespace"]
+pub fn config_tls_port(default_port: u16) -> u16 {
+    config_port(default_port)
+}
 
 /// Format-and-log helper for `uni::log!("…", args)`. Allocates a
 /// scratch `String` because `core::fmt::write` doesn't have a
@@ -284,6 +293,10 @@ pub mod runtime {
         join, join3, select, select3, timeout_us, Either, Three,
     };
 }
+
+// Top-level shortcuts for the most common runtime calls. The full
+// `uni::runtime::*` namespace stays available for everything else.
+pub use uni_runtime::net::{tcp_listen, udp_listen, UdpFlow};
 
 /// Current core / worker ID. On unikernel this reads the percpu TLS
 /// register (~2 cycles). On native there's no per-thread state, so

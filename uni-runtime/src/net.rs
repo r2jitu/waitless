@@ -1143,6 +1143,17 @@ impl UdpFlow {
             .await
     }
 
+    /// Convenience: read one datagram into `buf`, return the byte
+    /// count (truncating at `buf.len()`). The "I just want the
+    /// payload" form for connected flows that don't need a closure.
+    pub async fn recv_into(&self, buf: &mut [u8]) -> usize {
+        self.recv_payload(move |payload| {
+            let n = payload.len().min(buf.len());
+            buf[..n].copy_from_slice(&payload[..n]);
+            n
+        }).await
+    }
+
     /// Non-blocking copy receive. See [`UdpSocket::try_recv_from`].
     #[inline]
     pub fn try_recv(&self, buf: &mut [u8]) -> Option<([u8; 4], u16, usize)> {

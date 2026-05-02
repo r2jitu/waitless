@@ -1,85 +1,57 @@
 // UniKernel Example: HTTP Web Server
 //
-// `#[uni::boot]` marks the entry point; the `WebServerApp` type
-// holds long-lived state (the HTTP server) and gets handed to the
-// runtime via `uni::run`. Request handlers and diagnostic endpoints
-// are defined further down.
+// `#[uni::boot]` marks the entry point. The runtime takes over from
+// the moment `uni::run` is called and tears everything down on
+// shutdown via the `Handles` bag.
 
 #![no_std]
 
 extern crate alloc;
-extern crate uni;
-extern crate uni_http;
-extern crate uni_tls;
 
 use alloc::format;
 use alloc::string::String;
 use core::fmt::Write as _;
 
-use uni::net::Net;
+use uni::net::{Ipv4Addr, Net};
+use uni::runtime::{TcpStream, UdpFlow};
 use uni_http::{Request, Response};
 
-// ---- Application ------------------------------------------------------------
+// ---- Configuration ----------------------------------------------------------
 
-/// Plain HTTP listener port. `uni::config_port` lets the runner
-/// override this via env var; the argument is the default.
+/// Plain HTTP / HTTPS / gateway listener ports. `uni::config_port`
+/// reads `UNIKERNEL_TCP_<port>` to let the bench harness remap
+/// privileged defaults onto high host ports.
 const HTTP_PORT: u16 = 80;
-
-/// HTTPS listener port. Runs alongside HTTP so apps can be reached
-/// over both protocols with the same routes. The HVF runner / QEMU
-/// user-mode networking forward host ports to these (conventionally
-/// 8080 → :80 and 8443 → :443).
 const HTTPS_PORT: u16 = 443;
-
-/// "Gateway" / sidecar pattern listener: accept TCP, on each request
-/// fan out to a UDP backend, await the reply, return it. Demonstrates
-/// the async-runtime + datapath win on the request shape that
-/// dominates real microservice deployments (BFFs, API gateways).
-/// `gateway_max` in the bench harness drives this.
 const GATEWAY_PORT: u16 = 9000;
 
-/// Where the gateway forwards UDP datagrams. Loadgen runs an echo
-/// server on this port on the same host the unikernel virtualises
-/// under (or `127.0.0.1` for native). The address is resolved at
-/// boot from `Net::gateway()` (DHCP-discovered host IP under HVF /
-/// QEMU NAT) and combined with this fixed port.
+/// UDP backend the gateway forwards to (Loadgen runs an echo
+/// server here). Address is the DHCP-discovered host gateway IP.
 const GATEWAY_BACKEND_PORT: u16 = 7777;
 
-/// Wire payload size. Loadgen sends and receives this many bytes per
-/// request; the unikernel forwards the same byte-for-byte.
+/// Wire payload size for the gateway workload. Loadgen sends and
+/// receives this many bytes per request; the unikernel forwards
+/// byte-for-byte through to the UDP backend.
 const GATEWAY_MSG_SIZE: usize = 32;
 
-/// Long-lived program state.
-///
-/// `handles` carries every value whose `Drop` runs the listener /
-/// network teardown — TCP / UDP listener handles plus the `Net`
-/// guard. Storing them via `uni::Handles` instead of named
-/// `_field: Option<Handle>` slots keeps the "this exists for its
-/// drop side effect" intent explicit.
-struct WebServerApp {
-    // load-bearing: every entry's `Drop` aborts a listener task
-    // or tears down the network stack at shutdown.
-    #[allow(dead_code)]
-    handles: uni::Handles,
-}
+// Self-signed dev cert + key (ECDSA P-256 + SHA-256). Regen via
+// `apps/webserver/dev_certs/regen.sh`. NOT FOR PRODUCTION.
+const DEV_CERT_DER: &[u8] = include_bytes!("../dev_certs/dev_cert.der");
+const DEV_KEY_PKCS8_DER: &[u8] = include_bytes!("../dev_certs/dev_key.der");
 
-impl Drop for WebServerApp {
-    fn drop(&mut self) {
-        uni::println!("[app] shutting down");
-    }
-}
+// ---- Boot -------------------------------------------------------------------
 
 #[uni::boot]
 async fn boot() {
     log_boot_info();
 
-    // One-line DHCP-with-static-fallback. The runtime tries DHCP
-    // first; on bring-up failure (typical under minimal tap
-    // networks) it falls back to the supplied static config.
+    // DHCP-with-static-fallback. The runtime tries DHCP first;
+    // on bring-up failure (typical under minimal tap networks) it
+    // falls back to the supplied static config.
     let net = Net::dhcp_or_static(
-        uni::net::Ipv4Addr::new(10, 0, 2, 15),
-        uni::net::Ipv4Addr::new(10, 0, 2, 2),
-        uni::net::Ipv4Addr::new(255, 255, 255, 0),
+        Ipv4Addr::new(10, 0, 2, 15),
+        Ipv4Addr::new(10, 0, 2, 2),
+        Ipv4Addr::new(255, 255, 255, 0),
     )
     .await
     .expect("Net bring-up: both DHCP and static fallback failed");
@@ -88,97 +60,85 @@ async fn boot() {
     let mut handles = uni::Handles::new();
     handles.keep(net);
 
-    handles.keep_or_log(
-        "udp echo :7",
-        uni::runtime::udp_listen(7, |sock| async move {
-            let mut buf = [0u8; 1500];
-            loop {
-                let (src_ip, src_port, n) = sock.recv_from(&mut buf).await;
-                let _ = sock.send_to(src_ip, src_port, &buf[..n]);
-            }
-        }),
-    );
-
-    handles.keep_or_log(
-        "tcp echo :9",
-        uni::runtime::tcp_listen(9, |stream| async move {
-            let mut buf = [0u8; 1024];
-            loop {
-                // 30 s idle timeout via `timeout_us`. On a steady
-                // echo flow the recv wins every time; on an
-                // abandoned connection the timer fires and we tear
-                // down.
-                let Some(n) = uni::runtime::timeout_us(
-                    30_000_000,
-                    stream.recv(&mut buf),
-                ).await else { return; };
-                if n == 0 { return; }
-                if stream.send(&buf[..n]).await.is_err() { return; }
-            }
-        }),
-    );
-
-    // Gateway listener — `gateway_max` workload's server side.
-    // Each accepted TCP conn opens a connected UDP flow to the
-    // backend and ping-pongs:
-    //   tcp_recv_exact → udp_send → udp_recv_payload → tcp_send.
+    handles.keep_or_log("udp echo :7", uni::udp_listen(7, udp_echo));
+    handles.keep_or_log("tcp echo :9", uni::tcp_listen(9, tcp_echo));
     handles.keep_or_log(
         "gateway :9000",
-        uni::runtime::tcp_listen(GATEWAY_PORT, move |stream| async move {
-            let Ok(udp) = uni::runtime::UdpFlow::connect(
-                backend_ip, GATEWAY_BACKEND_PORT,
-            ) else { return; };
-            let mut buf = [0u8; GATEWAY_MSG_SIZE];
-            loop {
-                if stream.recv_exact(&mut buf).await.is_err() { return; }
-                if udp.send(&buf).is_err() { return; }
-                // Zero-copy receive: the runtime hands us a borrow
-                // of the inbox slot, we copy directly into the TCP
-                // send buffer without a stack-buffer round-trip.
-                let n = udp.recv_payload(|payload| {
-                    let n = payload.len();
-                    buf[..n].copy_from_slice(payload);
-                    n
-                }).await;
-                if n != GATEWAY_MSG_SIZE { return; }
-                if stream.send(&buf).await.is_err() { return; }
-            }
-        }),
+        uni::tcp_listen(GATEWAY_PORT, move |stream| gateway(stream, backend_ip)),
     );
-
-    let http_port = uni::config_port(HTTP_PORT);
     handles.keep_or_log(
         "http",
-        uni_http::listen(http_port, handle_request),
+        uni_http::listen(uni::config_port(HTTP_PORT), handle_request),
     );
-
     // HTTPS is opt-in: if the bundled dev cert/key don't parse,
     // log + skip rather than refuse to boot.
-    let https_port = uni::config_tls_port(HTTPS_PORT);
     handles.keep_or_log(
         "https",
-        uni_tls::listen(https_port, handle_request, DEV_CERT_DER, DEV_KEY_PKCS8_DER),
+        uni_tls::listen(
+            uni::config_port(HTTPS_PORT),
+            handle_request,
+            DEV_CERT_DER,
+            DEV_KEY_PKCS8_DER,
+        ),
     );
 
     uni::println!("Entering event loop.");
-    uni::run(WebServerApp { handles });
+    uni::run(handles);
+}
+
+// ---- Listener bodies --------------------------------------------------------
+
+async fn udp_echo(sock: alloc::sync::Arc<uni::runtime::UdpSocket>) {
+    let mut buf = [0u8; 1500];
+    loop {
+        let (src_ip, src_port, n) = sock.recv_from(&mut buf).await;
+        let _ = sock.send_to(src_ip, src_port, &buf[..n]);
+    }
+}
+
+async fn tcp_echo(stream: TcpStream) {
+    let mut buf = [0u8; 1024];
+    loop {
+        // 30 s idle timeout. Steady echo flow always wins the
+        // race; an abandoned connection lets the timer fire and
+        // we tear down rather than leak the slot.
+        let Some(n) = uni::runtime::timeout_us(30_000_000, stream.recv(&mut buf)).await
+        else { return; };
+        if n == 0 { return; }
+        if stream.send(&buf[..n]).await.is_err() { return; }
+    }
+}
+
+/// Gateway handler — `gateway_max` workload's server side. Each
+/// accepted TCP conn opens a connected UDP flow to the backend and
+/// ping-pongs:
+///   tcp_recv_exact → udp.send → udp.recv_into → tcp_send.
+async fn gateway(stream: TcpStream, backend_ip: [u8; 4]) {
+    let Ok(udp) = UdpFlow::connect(backend_ip, GATEWAY_BACKEND_PORT) else { return; };
+    let mut buf = [0u8; GATEWAY_MSG_SIZE];
+    loop {
+        if stream.recv_exact(&mut buf).await.is_err() { return; }
+        if udp.send(&buf).is_err() { return; }
+        if udp.recv_into(&mut buf).await != GATEWAY_MSG_SIZE { return; }
+        if stream.send(&buf).await.is_err() { return; }
+    }
 }
 
 // ---- Request dispatch + route handlers --------------------------------------
 
 fn handle_request(req: &Request) -> Response {
     match req.path() {
-        b"/" => Response::ok(b"text/html", INDEX_HTML),
-        b"/health" => Response::ok(b"application/json", HEALTH_JSON),
-        b"/stats" => stats_response(),
-        b"/heap" => heap_response(),
+        b"/"        => Response::ok(b"text/html", INDEX_HTML),
+        b"/health"  => Response::ok(b"application/json", HEALTH_JSON),
+        b"/stats"   => stats_response(),
+        b"/heap"    => heap_response(),
         b"/compute" => {
-            // black_box prevents the compiler from eliminating compute_work()
+            // black_box prevents the compiler from eliminating compute_work
             // as dead code (the return value would otherwise be unused).
             core::hint::black_box(compute_work());
             Response::ok(b"application/json", b"{\"status\":\"computed\"}")
         }
-        b"/tls_profile" => tls_profile_response(),
+        b"/tls_profile"       => tls_profile_response(),
         b"/tls_profile_reset" => {
             uni_tls::tls_profile_reset();
             Response::ok(b"text/plain", b"tls profile reset\n")
@@ -187,9 +147,9 @@ fn handle_request(req: &Request) -> Response {
     }
 }
 
-/// Emit the contents of `uni::boot_info()` at startup. The line tags
-/// (`BOOT_INFO ram=...`) are stable so the webserver integration test
-/// can grep them out of the serial log.
+/// Emit the contents of `uni::boot_info()` at startup. Line tags
+/// (`BOOT_INFO ram=...`) are stable so the integration test can
+/// grep them out of the serial log.
 fn log_boot_info() {
     let bi = uni::boot_info();
     uni::println!(
@@ -263,13 +223,6 @@ Network backend\n\
 </ul>\
 <p><small>UniKernel v0.1.0</small></p>\
 </body></html>";
-
-// Checked-in self-signed ECDSA P-256 dev cert + private key, baked
-// into the binary via include_bytes!. See apps/webserver/dev_certs/
-// README.md for details and the regen.sh script. DO NOT USE IN
-// PRODUCTION.
-const DEV_CERT_DER: &[u8] = include_bytes!("../dev_certs/dev_cert.der");
-const DEV_KEY_PKCS8_DER: &[u8] = include_bytes!("../dev_certs/dev_key.der");
 
 // ---- Diagnostic endpoints ---------------------------------------------------
 
