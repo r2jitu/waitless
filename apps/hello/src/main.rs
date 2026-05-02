@@ -18,16 +18,6 @@ fn hello(_: &Request) -> Response {
 
 #[uni::boot]
 async fn boot() {
-    let net = Net::dhcp_or_static(
-        uni::net::Ipv4Addr::new(10, 0, 2, 15),
-        uni::net::Ipv4Addr::new(10, 0, 2, 2),
-        uni::net::Ipv4Addr::new(255, 255, 255, 0),
-    )
-    .await
-    .expect("Net bring-up failed");
-
-    let mut handles = uni::Handles::new();
-    handles.keep(net);
-    handles.keep_or_log("http", uni_http::listen(80, hello));
-    uni::run(handles);
+    Net::up().await.expect("Net::up failed");
+    uni_http::listen(80, hello).expect("http bind");
 }

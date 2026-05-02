@@ -92,7 +92,7 @@ pub fn listen(
     handler: uni_http::Handler,
     cert_der: &'static [u8],
     key_der: &'static [u8],
-) -> Result<uni::runtime::TcpHandle, ListenError> {
+) -> Result<(), ListenError> {
     let tls = acceptor(cert_der, key_der).map_err(|_| ListenError::Cert)?;
     uni_http::listen_https(port, handler, tls).map_err(ListenError::Bind)
 }

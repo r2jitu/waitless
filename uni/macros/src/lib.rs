@@ -41,10 +41,15 @@ pub fn boot(_attr: TokenStream, item: TokenStream) -> TokenStream {
         .take_while(|t| *t != "fn")
         .any(|t| t == "async");
 
-    let spawn_expr = if is_async {
-        "::uni::runtime::spawn(boot())"
+    // Wrap the user's body in an async block that installs the
+    // shutdown hook + signals readiness as a final step. Listener
+    // handles registered via `uni::tcp_listen` etc. live in the
+    // runtime's leak slot; nothing else needs to happen on the
+    // user's part once `boot()` returns.
+    let body_call = if is_async {
+        "boot().await"
     } else {
-        "::uni::runtime::spawn(async move { boot() })"
+        "boot()"
     };
 
     let output = format!(
@@ -53,11 +58,16 @@ pub fn boot(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
 #[unsafe(no_mangle)]
 pub fn uni_boot() {{
-    let _ = {spawn_expr};
+    let _ = ::uni::runtime::spawn(async move {{
+        {body_call};
+        ::uni::_install_shutdown_hook();
+        ::uni::set_ready();
+        ::uni::log(b"Entering event loop\n");
+    }});
 }}
 "#,
         user_fn = source,
-        spawn_expr = spawn_expr,
+        body_call = body_call,
     );
 
     output.parse().unwrap()

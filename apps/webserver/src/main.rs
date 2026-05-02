@@ -1,8 +1,10 @@
 // UniKernel Example: HTTP Web Server
 //
-// `#[uni::boot]` marks the entry point. The runtime takes over from
-// the moment `uni::run` is called and tears everything down on
-// shutdown via the `Handles` bag.
+// `#[uni::boot]` is the entry point. The macro spawns the body as
+// a task; once it returns, listeners (registered via the `listen`
+// helpers) keep running for the lifetime of the process. Shutdown
+// (SIGINT / serial Ctrl-C) tears every retained listener down and
+// drops the network stack symmetrically.
 
 #![no_std]
 
@@ -12,27 +14,16 @@ use alloc::format;
 use alloc::string::String;
 use core::fmt::Write as _;
 
-use uni::net::{Ipv4Addr, Net};
+use uni::net::Net;
 use uni::runtime::{TcpStream, UdpFlow};
 use uni_http::{Request, Response};
 
 // ---- Configuration ----------------------------------------------------------
 
-/// Plain HTTP / HTTPS / gateway listener ports. The runtime
-/// transparently remaps these to whichever host port the bench
-/// harness wired up (`UNIKERNEL_TCP_<port>=…`), so app code just
-/// uses the natural well-known number and never sees the override.
 const HTTP_PORT: u16 = 80;
 const HTTPS_PORT: u16 = 443;
 const GATEWAY_PORT: u16 = 9000;
-
-/// UDP backend the gateway forwards to (Loadgen runs an echo
-/// server here). Address is the DHCP-discovered host gateway IP.
 const GATEWAY_BACKEND_PORT: u16 = 7777;
-
-/// Wire payload size for the gateway workload. Loadgen sends and
-/// receives this many bytes per request; the unikernel forwards
-/// byte-for-byte through to the UDP backend.
 const GATEWAY_MSG_SIZE: usize = 32;
 
 // Self-signed dev cert + key (ECDSA P-256 + SHA-256). Regen via
@@ -46,40 +37,25 @@ const DEV_KEY_PKCS8_DER: &[u8] = include_bytes!("../dev_certs/dev_key.der");
 async fn boot() {
     log_boot_info();
 
-    // DHCP-with-static-fallback. The runtime tries DHCP first;
-    // on bring-up failure (typical under minimal tap networks) it
-    // falls back to the supplied static config.
-    let net = Net::dhcp_or_static(
-        Ipv4Addr::new(10, 0, 2, 15),
-        Ipv4Addr::new(10, 0, 2, 2),
-        Ipv4Addr::new(255, 255, 255, 0),
-    )
-    .await
-    .expect("Net bring-up: both DHCP and static fallback failed");
-
+    // VM-friendly bring-up: DHCP first, fall back to NAT-default
+    // static (10.0.2.15/24, gw 10.0.2.2). For dedicated NICs / non-
+    // NAT environments use `Net::dhcp_or_static(...)` with explicit
+    // values.
+    let net = Net::up().await.expect("Net::up failed");
     let backend_ip = net.gateway().0;
-    let mut handles = uni::Handles::new();
-    handles.keep(net);
 
-    handles.keep_or_log("udp echo :7", uni::udp_listen(7, udp_echo));
-    handles.keep_or_log("tcp echo :9", uni::tcp_listen(9, tcp_echo));
-    handles.keep_or_log(
-        "gateway :9000",
-        uni::tcp_listen(GATEWAY_PORT, move |stream| gateway(stream, backend_ip)),
-    );
-    handles.keep_or_log(
-        "http",
-        uni_http::listen(HTTP_PORT, handle_request),
-    );
+    uni::udp_listen(7, udp_echo).expect("udp echo bind");
+    uni::tcp_listen(9, tcp_echo).expect("tcp echo bind");
+    uni::tcp_listen(GATEWAY_PORT, move |s| gateway(s, backend_ip))
+        .expect("gateway bind");
+    uni_http::listen(HTTP_PORT, handle_request).expect("http bind");
+
     // HTTPS is opt-in: if the bundled dev cert/key don't parse,
     // log + skip rather than refuse to boot.
-    handles.keep_or_log(
-        "https",
-        uni_tls::listen(HTTPS_PORT, handle_request, DEV_CERT_DER, DEV_KEY_PKCS8_DER),
-    );
-
-    uni::println!("Entering event loop.");
-    uni::run(handles);
+    match uni_tls::listen(HTTPS_PORT, handle_request, DEV_CERT_DER, DEV_KEY_PKCS8_DER) {
+        Ok(()) => uni::println!("HTTPS enabled"),
+        Err(_) => uni::println!("HTTPS disabled (cert/key invalid)"),
+    }
 }
 
 // ---- Listener bodies --------------------------------------------------------
@@ -95,9 +71,9 @@ async fn udp_echo(sock: alloc::sync::Arc<uni::runtime::UdpSocket>) {
 async fn tcp_echo(stream: TcpStream) {
     let mut buf = [0u8; 1024];
     loop {
-        // 30 s idle timeout. Steady echo flow always wins the
-        // race; an abandoned connection lets the timer fire and
-        // we tear down rather than leak the slot.
+        // 30 s idle timeout. Steady echo flow always wins; an
+        // abandoned connection lets the timer fire and we tear
+        // down rather than leak the slot.
         let Some(n) = uni::runtime::timeout_us(30_000_000, stream.recv(&mut buf)).await
         else { return; };
         if n == 0 { return; }
@@ -197,20 +173,6 @@ background: #1a1a2e; border-radius: 4px; }\
 <span class='stat'>In-process I/O</span>\
 <span class='stat'>Virtio-net driver</span>\
 </div>\
-<h2>Architecture</h2>\
-<pre>\
-Application (this server)\n\
-    |  direct function call\n\
-    v\n\
-HTTP parser\n\
-    |  uni:: interface\n\
-    v\n\
-TCP stack (uni::tcp)\n\
-    |  unikernel: net::tcp + virtio-net\n\
-    |  native:    POSIX sockets\n\
-    v\n\
-Network backend\n\
-</pre>\
 <h2>Endpoints</h2>\
 <ul>\
 <li><a href='/'>/ </a> \xe2\x80\x94 this page</li>\

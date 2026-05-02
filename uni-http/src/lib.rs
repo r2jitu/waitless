@@ -389,12 +389,14 @@ impl HttpStream for TlsStream {
 pub fn listen(
     port: u16,
     handler: Handler,
-) -> Result<uni::runtime::TcpHandle, uni::runtime::TcpBindError> {
+) -> Result<(), uni::runtime::TcpBindError> {
     let listener = uni::runtime::TcpListener::bind(port)?;
     uni::log(b"http: listening (plain)\n");
-    Ok(listener.run(move |stream| async move {
+    let h = listener.run(move |stream| async move {
         handle_conn(handler, stream).await;
-    }))
+    });
+    uni::_retain(h);
+    Ok(())
 }
 
 /// Listen for HTTPS (TLS 1.3) on `port`. `tls` is a TLS provider
@@ -406,10 +408,10 @@ pub fn listen_https(
     port: u16,
     handler: Handler,
     tls: Arc<dyn Tls>,
-) -> Result<uni::runtime::TcpHandle, uni::runtime::TcpBindError> {
+) -> Result<(), uni::runtime::TcpBindError> {
     let listener = uni::runtime::TcpListener::bind(port)?;
     uni::log(b"http: listening (TLS)\n");
-    Ok(listener.run(move |tcp| {
+    let h = listener.run(move |tcp| {
         let tls = Arc::clone(&tls);
         async move {
             let mut seed = [0u8; 32];
@@ -417,7 +419,9 @@ pub fn listen_https(
             let stream = TlsStream::new(tcp, tls.new_connection(seed));
             handle_conn(handler, stream).await;
         }
-    }))
+    });
+    uni::_retain(h);
+    Ok(())
 }
 
 

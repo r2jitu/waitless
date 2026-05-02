@@ -159,6 +159,24 @@ impl Net {
         }
     }
 
+    /// Bring the network up the most-common-case way: try DHCP,
+    /// and if that fails, fall back to a VM-NAT-friendly static
+    /// (10.0.2.15/24, gateway 10.0.2.2) — the convention every
+    /// HVF / QEMU user-mode networking environment uses.
+    ///
+    /// This is the right call for the 95% of unikernels that boot
+    /// inside a VM and want to be reachable on the host network.
+    /// For dedicated NICs / non-NAT environments, use `enable` or
+    /// `dhcp_or_static` with explicit values.
+    pub async fn up() -> Result<Net, NetError> {
+        Self::dhcp_or_static(
+            Ipv4Addr::new(10, 0, 2, 15),
+            Ipv4Addr::new(10, 0, 2, 2),
+            Ipv4Addr::new(255, 255, 255, 0),
+        )
+        .await
+    }
+
     /// Our configured IPv4 address. Returns `UNSPECIFIED` if the
     /// stack came up but neither DHCP nor the static config
     /// actually produced one (shouldn't happen under normal
