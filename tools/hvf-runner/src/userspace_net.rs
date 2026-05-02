@@ -1335,6 +1335,23 @@ fn handle_tcp(tcp: &[u8]) {
         let mut conns = shared.conns.lock().unwrap();
         if flags & 0x04 != 0 {
             if let Some(c) = conns.get_mut(&dst_port) {
+                if c.host_fd >= 0 {
+                    // RST the host-side socket too — set SO_LINGER
+                    // {1,0} so close() emits RST instead of the
+                    // default FIN-ACK dance, mirroring what the guest
+                    // just sent. Without this the host TCP socket
+                    // sits in ESTABLISHED until keepalive (minutes).
+                    let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+                    unsafe {
+                        libc::setsockopt(
+                            c.host_fd, libc::SOL_SOCKET, libc::SO_LINGER,
+                            &linger as *const _ as *const _,
+                            std::mem::size_of::<libc::linger>() as u32,
+                        );
+                        libc::close(c.host_fd);
+                    }
+                    c.host_fd = -1;
+                }
                 c.state = ConnState::Closed;
             }
             return;

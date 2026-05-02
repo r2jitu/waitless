@@ -275,6 +275,101 @@ class WebserverShutdownTest(unittest.TestCase):
             "idle-shutdown leaked memory — listener teardown regressed",
         )
 
+    def test_open_conn_resets_promptly_on_shutdown(self) -> None:
+        """Hold a TCP connection open across shutdown and assert the
+        peer observes the close within a second.
+
+        Pre-fix: `arch::shutdown()` powered off mid-flight without
+        touching open conns, so the host's TCP stack sat on a
+        half-open connection until keepalive eventually killed it
+        (minutes). Post-fix: `shutdown_and_drop` walks every per-core
+        TCP pool and emits one RST per active conn before
+        PSCI SYSTEM_OFF; the host's `recv` returns within a few ms,
+        either with `0` (graceful close — native, where the kernel
+        FINs every fd at process exit) or `ConnectionResetError`
+        (unikernel bare-metal RST sweep).
+        """
+        port = PORT + 300
+        tls_port = TLS_PORT + 300
+        udp_port = UDP_PORT + 300
+        tcp_echo_port = TCP_ECHO_PORT + 300
+        pty_launcher = PtyLauncher(
+            LAUNCHER,
+            env=_launcher_env(port, tls_port, udp_port, tcp_echo_port),
+        )
+        try:
+            self.assertTrue(
+                pty_launcher.wait_for(BOOT_MARKER, timeout=15.0),
+                f"didn't see {BOOT_MARKER!r} within 15s",
+            )
+            # Boot marker fires before the HTTP listener fully accepts
+            # conns; poll /health until it answers.
+            self.assertTrue(
+                wait_http_ready(port, timeout=10.0),
+                f"HTTP not ready on :{port} after 10s",
+            )
+
+            # Open a long-lived TCP connection; verify it works.
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(5.0)
+            s.connect(("127.0.0.1", port))
+            s.sendall(
+                b"GET /health HTTP/1.1\r\n"
+                b"Host: localhost\r\n"
+                b"Connection: keep-alive\r\n\r\n"
+            )
+            resp = s.recv(4096)
+            self.assertIn(b"200", resp[:32], f"sanity GET failed: {resp[:80]!r}")
+
+            # Trigger shutdown. A background thread keeps the pty
+            # drained — the unikernel's eventloop prints its
+            # post-loop diagnostic before invoking
+            # `shutdown_and_drop`, and a full pty buffer would
+            # block those writes (preventing the RST sweep).
+            stop_drain = [False]
+            def _drain_loop() -> None:
+                while not stop_drain[0]:
+                    pty_launcher.drain(0.05)
+            drainer = threading.Thread(target=_drain_loop, daemon=True)
+            drainer.start()
+
+            pty_launcher.write(b"\x03")
+
+            # Block on recv with a 3 s timeout. Keepalive death would
+            # take minutes; a healthy RST/FIN sweep returns within ms.
+            s.settimeout(3.0)
+            t0 = time.monotonic()
+            try:
+                tail = s.recv(4096)
+                # `0` bytes = peer FINed cleanly (native).
+                self.assertEqual(
+                    tail, b"",
+                    f"unexpected post-shutdown payload: {tail[:80]!r}",
+                )
+                close_kind = "FIN"
+            except ConnectionResetError:
+                close_kind = "RST"
+            finally:
+                stop_drain[0] = True
+                drainer.join(timeout=1.0)
+            elapsed = time.monotonic() - t0
+            print(f"    (peer observed {close_kind} in {elapsed*1000:.0f} ms)",
+                  flush=True)
+            self.assertLess(
+                elapsed, 2.0,
+                f"close took {elapsed:.1f}s — keepalive-timeout shape, "
+                "shutdown isn't closing conns",
+            )
+            s.close()
+
+            # And the VM itself should still exit promptly.
+            self.assertTrue(
+                pty_launcher.wait_exit(timeout=8.0),
+                "VM still running 8 s after ^C",
+            )
+        finally:
+            pty_launcher.kill()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

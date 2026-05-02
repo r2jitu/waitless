@@ -940,6 +940,9 @@ pub fn shutdown_all() {
             free_connection(core, slot);
         }
     }
+    // The caller (`net::bare_shutdown_all`) flushes the virtio TX
+    // staging + kick after this returns — `net_tcp` deliberately
+    // doesn't depend on `uni_drivers`.
 }
 
 /// Async `TcpRecv` sync read hook. Verifies `generation`; stale

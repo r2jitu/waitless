@@ -58,8 +58,19 @@ static BARE_TCP_BACKEND: uni_runtime::net::TcpBackend = uni_runtime::net::TcpBac
     try_send: tcp::async_try_send,
     register_send_waker: tcp::register_send_waker,
     clear_send_waker: tcp::clear_send_waker,
-    shutdown_all: Some(tcp::shutdown_all),
+    shutdown_all: Some(bare_shutdown_all),
 };
+
+/// Wrapper around `tcp::shutdown_all` that flushes the virtio-net
+/// TX staging + queue-notify after the RST sweep so the host
+/// observes the RSTs before `arch::shutdown()` returns. Lives here
+/// (not in `net_tcp`) because that crate deliberately doesn't depend
+/// on `uni_drivers`.
+fn bare_shutdown_all() {
+    tcp::shutdown_all();
+    uni_drivers::net::flush_tx_staging();
+    uni_drivers::net::flush_tx_kick_if_dirty();
+}
 
 /// Bare-metal UDP backend vtable. No `bind` / `unbind` — routing
 /// is purely `UDP_REGISTRY` lookups on the NIC RX path.
