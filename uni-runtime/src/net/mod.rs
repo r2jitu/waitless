@@ -160,28 +160,13 @@ pub(crate) fn install_worker_task(
 // invokes each live launcher. Each launcher typically calls
 // `spawn(body(...))` on the calling worker.
 //
-// See `uni-runtime/src/launcher.rs` for the ownership / tombstone /
+// `LaunchTable` uses chunked lazy allocation, so the upfront cost
+// is just the outer pointer array (8 KiB) regardless of how many
+// listeners the app eventually creates. See
+// `uni-runtime/src/launcher.rs` for the ownership / tombstone /
 // monotonic-counter invariants that back the table.
 
-/// Lifetime cap on launchers ever allocated (not live at once).
-/// Each `UdpSocket::run` / `TcpListener::run` / etc. costs one
-/// slot; handle drop marks the slot as a tombstone but doesn't
-/// free it for reuse, so the bound is "how many listeners does
-/// this app create over its entire uptime."
-///
-/// 65 536 covers any realistic pattern — an app creating one
-/// listener per second would take 18 hours to exhaust the table.
-/// Permanent unrecyclable storage at full saturation is 512 KiB
-/// of `AtomicPtr` slots; trivial against a server's heap.
-///
-/// True uncap (chunked allocation) would let the table grow
-/// indefinitely, but the slot-never-recycles invariant ties to
-/// the per-worker monotonic cursor and is harder to make dynamic
-/// than the analogous UDP ephemeral pool. If the 65 K bound ever
-/// matters in practice, that's the next refactor.
-const MAX_NET_LAUNCHERS: usize = 65_536;
-
-static NET_LAUNCHERS: crate::launcher::LaunchTable<MAX_NET_LAUNCHERS> =
+static NET_LAUNCHERS: crate::launcher::LaunchTable =
     crate::launcher::LaunchTable::new();
 
 #[inline]
