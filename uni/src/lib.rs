@@ -158,12 +158,19 @@ static HEAP_BASELINE_ALLOCS: core::sync::atomic::AtomicUsize =
 
 /// Signal that boot is complete and worker cores can leave their
 /// READY-wait spin. Snapshots the heap allocation counters so
-/// `shutdown_and_drop` can detect a leak. Called from the boot
-/// macro after the user's `boot()` body returns.
+/// `shutdown_and_drop` can detect a leak. Called from the `#[uni::init]`
+/// macro after the user's `init()` body returns.
 pub fn set_ready() {
     let s = uni_backend::heap_stats();
     HEAP_BASELINE_BYTES.store(s.allocated_bytes, core::sync::atomic::Ordering::Release);
     HEAP_BASELINE_ALLOCS.store(s.allocation_count, core::sync::atomic::Ordering::Release);
+    // Phase timing — surface "user init complete, ready to serve" as
+    // a single line on the serial log. Pairs with the kernel-side
+    // `[TIME] kernel boot: N ms` printed before `uni_init`. On native
+    // there's no equivalent boot-start timestamp surfaced today, so
+    // this is unikernel-only.
+    #[cfg(target_os = "none")]
+    uni_kernel::time::log_phase(b"init complete");
     uni_backend::set_ready();
 }
 
