@@ -420,12 +420,12 @@ fn init() -> bool {
         return true;
     }
 
+    // gvnic-not-present is the common case on every platform that
+    // isn't GCE — silent miss; the higher-level boot doesn't print
+    // a NIC line and the next driver in the registry gets a turn.
     let idx = match pci::find_device(PCI_VENDOR_GVE, PCI_DEVICE_GVE) {
         Some(i) => i,
-        None => {
-            log(b"[gvnic] device not found on PCI bus\n");
-            return false;
-        }
+        None => return false,
     };
     let dev = pci::pci_device(idx);
     log(b"[gvnic] found device on PCI bus\n");

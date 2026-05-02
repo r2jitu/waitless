@@ -268,8 +268,6 @@ fn init_inner() {
         return;
     }
 
-    log(b"[PCI] Scanning bus 0...\n");
-
     #[cfg(target_arch = "aarch64")]
     {
         let fdt = fdt::info();
@@ -278,7 +276,6 @@ fn init_inner() {
             // This is normal for virtio-mmio-only platforms (Firecracker,
             // custom HVF runner). The virtio-net init will find devices
             // via FDT virtio-mmio nodes instead.
-            log(b"[PCI] No ECAM in FDT, skipping\n");
             return;
         }
         let ecam = fdt.pcie_ecam_base;
@@ -308,7 +305,6 @@ fn init_inner() {
         }
     }
 
-    log(b"[PCI] Scan complete\n");
 }
 
 pub fn find_device(vendor_id: u16, device_id: u16) -> Option<usize> {

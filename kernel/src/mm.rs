@@ -212,15 +212,12 @@ fn init_heap(info: &BootInfo, kern_end_phys: u64) {
     TOTAL_RAM.store(total_ram, Ordering::Release);
     MAX_PHYS_ADDR.store(max_phys, Ordering::Release);
 
-    klog!(
-        "  Physical memory: {} MB (max addr {:#x})\n",
-        total_ram / (1024 * 1024),
-        max_phys
-    );
-    klog!(
-        "  Heap: {} MB (talc, claimed across all available regions)\n",
-        total_claimed / (1024 * 1024)
-    );
+    // No internal log lines — the entry-point banner prints a single
+    // `Heap: free / total MB` line after `mm::init` returns. Each
+    // serial line is ~1 ms on HVF (per-byte vmexit), so the previous
+    // 2-line "Physical memory" + "Heap (talc, claimed across …)"
+    // dump cost ~2 ms per boot for cosmetics.
+    let _ = (total_ram, max_phys, total_claimed);
 }
 
 /// Hand `[phys, phys+size)` to talc as a heap span. Returns the

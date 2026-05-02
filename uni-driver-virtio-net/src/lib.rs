@@ -279,7 +279,6 @@ fn init_pci_modern() -> bool {
         None => return false,
     };
 
-    log(b"virtio_net: found modern virtio-pci net device\n");
 
     let dev_snap = vpci_device(vpci_idx);
     let dev = &dev_snap;
@@ -460,7 +459,6 @@ fn init_pci_modern() -> bool {
     }
     activate_multi_queue();
 
-    log(b"virtio_net: initialization complete (PCI modern)\n");
     true
 }
 
@@ -617,7 +615,6 @@ fn init_mmio() -> bool {
     let is_v2 = ver == 2;
     if ver != 1 && ver != 2 { return false; }
 
-    log(b"virtio_net: virtio-mmio net device found\n");
 
     // Reset
     unsafe { virtio_write32(io_base + MMIO_STATUS, 0); }
@@ -758,7 +755,6 @@ fn init_mmio() -> bool {
     }
     activate_multi_queue();
 
-    log(b"virtio_net: initialization complete (MMIO)\n");
     true
 }
 
@@ -1005,7 +1001,6 @@ static PROBE_OK: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
 fn init() -> bool {
-    log(b"virtio_net: initializing...\n");
 
     #[cfg(target_arch = "aarch64")]
     {

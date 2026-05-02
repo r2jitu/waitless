@@ -110,18 +110,15 @@ impl Net {
 
         #[cfg(target_os = "none")]
         {
-            let drivers = uni_net_driver::linked_ethernet_drivers();
-            if drivers.is_empty() {
+            // Boot already ran every driver's `probe()` and installed
+            // the first match into the active-ops slot
+            // (`drivers::net::init()`); re-probing here just re-fires
+            // the per-driver "device not found" diagnostics for nothing.
+            // Trust the boot-time outcome.
+            if uni_net_driver::linked_ethernet_drivers().is_empty() {
                 return Err(NetError::NoDriver);
             }
-            let mut any_probed = false;
-            for reg in drivers {
-                if (reg.ops.probe)() {
-                    any_probed = true;
-                    break;
-                }
-            }
-            if !any_probed {
+            if !uni_net_driver::is_installed() {
                 return Err(NetError::NoNic);
             }
         }
