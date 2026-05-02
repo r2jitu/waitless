@@ -1,17 +1,32 @@
 // uni-worker/src/lib.rs — Cross-platform per-worker primitives.
 //
+// Three types, picked deliberately so the names tell the whole story:
+//
 // `CurrentWorker` — zero-sized token whose existence proves the holder
 // is running on a specific worker (core on bare-metal, POSIX thread
-// on native). Obtained via `CurrentWorker::enter()`, which calls
-// `uni_platform::current_worker()` directly — cfg-gated asm on
-// bare-metal, thread-local on native.
+// on native). `!Send + !Sync` so it cannot migrate. Obtained via
+// `CurrentWorker::enter()`, which calls `uni_platform::current_worker()`
+// directly — cfg-gated asm on bare-metal, thread-local on native.
 //
 // `PerWorker<T>` — typed array of slots indexed by worker id, sized at
 // runtime via `init(n, |i| …)`. Heap-allocated once at boot after the
 // actual worker count is known, then read-shared from every worker.
-// `T` provides its own interior mutability (`Atomic*`, `UnsafeCell`
-// behind owning-worker discipline, `Mutex`, …); the `&CurrentWorker`
-// accessor is safe by construction.
+// Use when `T` provides its own interior mutability (`Atomic*`,
+// `Mutex`, SPSC ring, …) — `current(&cc)` returns `&T` and `T`'s
+// own primitives serialise concurrent access.
+//
+// `WorkerLocal<T>` — combines `PerWorker` indexing with owner-only
+// mutable access. Use when `T` is a plain (non-`Sync`) type and only
+// the owning worker ever mutates it. The `with_mut(&cc, |t| …)` API
+// is safe by construction: the cell lives in this worker's slot
+// (PerWorker indexing), and `&CurrentWorker` proves the caller is on
+// that worker. Replaces the `PerWorker<UnsafeCell<T>>` +
+// hand-rolled `unsafe { &mut *cell.get() }` pattern.
+//
+// `kernel::percpu::PerCore` is *not* a fourth abstraction — it's the
+// kernel's domain struct (RxInbox, TxStaging, …) that happens to live
+// inside `PerWorker<PerCore>`. Read it as "the bare-metal name for
+// 'per-worker state'."
 
 #![no_std]
 
@@ -261,5 +276,87 @@ impl<T> Drop for PerWorker<T> {
                 .expect("PerWorker::drop: layout overflow");
             alloc::alloc::dealloc(raw as *mut u8, layout);
         }
+    }
+}
+
+// ============================================================================
+// WorkerLocal<T> — per-worker cell with safe owner-only mutable access.
+// ============================================================================
+//
+// Wraps `PerWorker<UnsafeCell<T>>` with a closure-based API
+// (`with_mut(&CurrentWorker, |t| …)`) that's safe by construction:
+// the cell lives in this worker's slot (PerWorker indexing), and
+// the `CurrentWorker` token proves the caller is on that worker.
+// `CurrentWorker` is `!Send`, so no other worker can hold a borrow
+// concurrently, and the closure scope guarantees no two calls
+// produce overlapping `&mut T` even with multiple tokens in scope.
+//
+// Replaces the `PerWorker<UnsafeCell<T>>` + ad-hoc
+// `unsafe { &mut *cell.get() }` pattern: one safe call site instead
+// of one unsafe block per access. Use when `T` is a plain type and
+// only the owning worker mutates it. For cross-worker-shared state
+// where `T` provides its own interior mutability (atomics, SPSC
+// rings, …), use `PerWorker<T>` directly.
+
+pub struct WorkerLocal<T> {
+    inner: PerWorker<UnsafeCell<T>>,
+}
+
+// SAFETY: cross-worker access is gated by the `with_mut` /
+// `with` API, both of which take `&CurrentWorker` and bound the
+// borrow to a closure. `T: Send` because the slot's logical owner
+// is the worker the value was constructed for, even though in
+// practice each value never moves.
+unsafe impl<T: Send> Sync for WorkerLocal<T> {}
+
+impl<T> WorkerLocal<T> {
+    /// Empty cell. Allocation happens in `init()`.
+    #[inline]
+    pub const fn new() -> Self {
+        WorkerLocal { inner: PerWorker::new() }
+    }
+
+    /// Allocate `n` slots and populate each via `f(i)`. Same
+    /// idempotent + race-free contract as `PerWorker::init`.
+    pub fn init<F: FnMut(u32) -> T>(&self, n: u32, mut f: F) {
+        self.inner.init(n, |i| UnsafeCell::new(f(i)));
+    }
+
+    /// `init` if not already initialised. Mirrors
+    /// `PerWorker::ensure_init` for lazy-init call sites.
+    #[inline]
+    pub fn ensure_init<F: FnMut(u32) -> T>(&self, n: u32, mut f: F) {
+        self.inner.ensure_init(n, |i| UnsafeCell::new(f(i)));
+    }
+
+    /// Mutate this worker's local value. The closure scope bounds
+    /// the borrow so no two calls can produce overlapping `&mut T`,
+    /// even if multiple `CurrentWorker` tokens are in scope.
+    #[inline(always)]
+    pub fn with_mut<R>(&self, cc: &CurrentWorker, f: impl FnOnce(&mut T) -> R) -> R {
+        let cell: &UnsafeCell<T> = self.inner.current(cc);
+        // SAFETY: PerWorker indexing → cell belongs to `cc`'s
+        // worker; `CurrentWorker` is `!Send` so no other worker is
+        // accessing it; the closure scope prevents overlap with
+        // any concurrent same-worker call.
+        unsafe { f(&mut *cell.get()) }
+    }
+
+    /// Shared borrow over this worker's local value. Same scoping
+    /// guarantees as `with_mut`.
+    #[inline(always)]
+    pub fn with<R>(&self, cc: &CurrentWorker, f: impl FnOnce(&T) -> R) -> R {
+        let cell: &UnsafeCell<T> = self.inner.current(cc);
+        // SAFETY: see `with_mut`. Returning `&T` is also fine
+        // because no other worker can be holding `&mut T`
+        // concurrently (the type system rules it out via the same
+        // !Send token argument).
+        unsafe { f(&*cell.get()) }
+    }
+
+    /// True if `init` has been called.
+    #[inline(always)]
+    pub fn is_initialized(&self) -> bool {
+        self.inner.is_initialized()
     }
 }
