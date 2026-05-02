@@ -732,10 +732,12 @@ primitives QUIC needs; more reactor primitives land as QUIC demands.
 - [x] Reactor: `Sleep::until(deadline).await` / `sleep_us(us)` —
       parks the task's waker in the per-core timer wheel, cancels
       on `Drop` so a stale fire can't hit a reused slot.
-- [ ] Reactor: `UdpRecv::recv_from(&mut buf).await` — not yet; QUIC
-      will land this.
-- [ ] Reactor: `TcpListener::accept().await` — optional; migrate
-      HTTP only if a concrete win.
+- [x] Reactor: `UdpSocket::recv_from(&mut buf).await`
+      (`UdpSocket::run(|sock| async ...)` is the typical entry
+      point; bind+spawn-per-worker happen together).
+- [x] Reactor: `TcpListener::accept().await` /
+      `TcpStream::{recv,send}.await`. `uni_http::listen` migrated
+      to async handlers (`AsyncFn(&Request) -> Response`).
 - [x] Event loop shim: tick drains the wheel, scans ready slots, calls
       `future.as_mut().poll(&mut cx)`. No change to poll/drain/idle.
 - [x] Smoke test: `apps/test_async` — spawn + timer + nested-spawn +
@@ -1133,10 +1135,11 @@ The trade-off is surface area. Scope discipline is critical:
 
 **Tasks (live):**
 
-- [ ] **Prerequisite: §2f + §2g async runtime foundation.** QUIC
-      connections are `async fn` from day 1 — they `.await` UDP recv,
-      timer fire, and stream readable. Land the minimal runtime first
-      so QUIC drives its own API requirements instead of us guessing.
+- [x] **Prerequisite: §2f + §2g async runtime foundation.** QUIC
+      connections will be `async fn` from day 1 — they `.await`
+      UDP recv, timer fire, and stream readable. Done: runtime
+      foundation + `UdpSocket::run` / `TcpListener::run` /
+      `Sleep::until` reactors green on both backends.
 - [ ] **`//net:tls_server` "QUIC mode"** — extension of the
       existing state machine that emits handshake messages as
       raw bytes (no TLS record framing) for QUIC's CRYPTO
@@ -1509,6 +1512,66 @@ std (`thiserror`, `tracing`, `parking_lot`, `tokio`, …),
 
 **Trigger for revisit**: any of the three above.
 
+### Cooperative-drain shutdown phase
+
+Today's `shutdown_and_drop` (in `uni/src/lib.rs`) is force-abort:
+listeners drop → `drain_all_arenas` force-drops every live future
+→ `shutdown_all_tcp` RSTs every active conn → power off. Clean (the
+`HEAP_LEAK_CHECK ok` test in `apps/webserver:test_hvf` proves
+zero-leak under traffic) but it truncates in-flight work — a
+handler half-way through `stream.send(...)` gets force-dropped and
+the peer sees RST mid-response.
+
+A cleanest design adds a *cooperative drain phase* before the
+forced abort:
+
+- [ ] Per-listener "stop accepting" flag — listener's accept future
+      resolves to a sentinel that callers treat as graceful close.
+- [ ] Bounded drain window (~1-2 s configurable). Cores keep
+      ticking so in-flight handler tasks complete naturally;
+      `shutdown_and_drop` waits for `has_pending(worker_id)` to go
+      false on every worker, with deadline.
+- [ ] Explicit multi-core barrier. Today the BSP trusts that APs
+      are past their eventloop break by the time `on_shutdown`
+      runs (relies on the post-loop `spin_loop()`). A real barrier
+      (atomic counter + per-core "drained" ack) would make the
+      contract explicit.
+- [ ] Idempotent shutdown. `shutdown_and_drop` should tolerate
+      being called twice (e.g., signal racing the boot completion).
+
+**Trigger**: when traffic patterns include long-running RPCs we
+don't want to truncate (current workloads — HTTP/1.1 ~ms-scale —
+don't stress this). QUIC streams will benefit since clean
+CONNECTION_CLOSE is preferred over UDP-level forget.
+
+### Bare-metal TCP corners (LastAck wait, TIME_WAIT, FIN retransmit)
+
+`net/src/tcp.rs::close()`'s `CloseWait` branch sends FIN+ACK and
+frees immediately — no `LastAck` wait. Active close in
+`FinWait1`/`FinWait2` transitions straight to `Closed` on peer FIN
+— no `TIME_WAIT`. There is no FIN retransmit timer.
+
+On a local LAN / VM-NAT (loss-free) this is invisible. On a lossy
+WAN: a single dropped FIN strands the conn until the peer's
+keepalive fires; a delayed segment from a just-closed 4-tuple
+could be misinterpreted by a fresh connection that reuses the
+same ports.
+
+Implementation requires integrating the kernel timer wheel into
+TCP's sync packet handlers (callback fires → state-machine tick
+on the owning core), with generation-aware cancel on slot reuse:
+
+- [ ] `CloseWait → LastAck` transition + retransmit timer.
+- [ ] `FinWait*` peer-FIN → `TimeWait` with 2×MSL drop timer.
+- [ ] Bounded FIN retransmit (e.g., 5 retries with exponential
+      backoff) before forcing close.
+- [ ] Lossy-network test fixture (drop N% of egress packets in
+      the bare-metal driver test seam).
+
+**Trigger**: WAN deployments, OR when QUIC lands and we want
+parity-class TCP behavior so apples-to-apples bench comparisons
+are honest. Probably ~1-2 days plus the test infrastructure.
+
 ### Optional macOS delayed-ACK regression check
 
 `net/tcp.rs` used to defer ACKs to piggyback on the next outbound
@@ -1606,31 +1669,46 @@ sh_test(name = "test", srcs = ["test.sh"], data = [":test_smp.elf"])
 | 2a. SMP boot (AP spin-up) | ✅ done | Medium | Foundation for all multi-core | None |
 | 2b. Tier 1: multi-queue + MSI-X | ✅ done | Large | Per-core queues (QEMU + HVF) | 2a |
 | 2c. Tier 2: software distribution | ✅ done | Medium | Multi-core on single-queue platforms | 2a |
-| 2f. Task arena + event-loop integration | ✅ first cut | Small | Foundation for async | 2a-c |
-| 2g. Async/await (Future + Waker + executor) | ✅ first cut | Medium | The differentiation thesis | 2f |
+| 2f. Task arena + event-loop integration | ✅ done | Small | Foundation for async | 2a-c |
+| 2g. Async/await (Future + Waker + executor + UDP/TCP reactors) | ✅ done | Medium | The differentiation thesis | 2f |
 | 3a. UDP | ✅ done | Small | Enables QUIC | None |
 | 3b. TLS 1.3 (hand-rolled) | ✅ done | Large | Required for QUIC | 1b |
-| 3c. QUIC (as `async fn`) | after 2g | Large | Modern transport + runtime consumer | 3a, 3b, 2g |
+| 3c. QUIC (as `async fn`) | next | Large | Modern transport + runtime consumer | 3a, 3b, 2g |
 | 4. HTTP/3 | not started | Medium | Modern HTTP | 3c |
 | 5. IPv6 + NDP | not started | Medium | Drop IPv4 legacy | None |
 | 2d. Work stealing | parked (post-QUIC) | Medium | CPU-task efficiency | 2a-c |
 | 2e. Timer wheel event-loop wiring | absorbed into 2g | Small | Async timers | 2a |
 | 2h. Perf regression tests | parked (post-QUIC) | Medium | Prevent regressions | 2a-c |
 
-**Where we are now (2026-04-15):** through phase 3b. The
-hand-rolled TLS 1.3 stack runs cleanly on x86_64 KVM, x86_64
-TCG, aarch64 HVF, aarch64 QEMU TCG, and native POSIX
-(macOS / Linux). Bench coverage in place
-(`tls_handshake_max`, `health_tls_c1`, `health_tls_max`),
-including a remote GCP wrapper (`scripts/gcp-bench.sh`).
+**Where we are now (2026-05-02):** all QUIC prerequisites are in.
+Phase 3b (TLS 1.3) shipped, phases 2f+2g (async runtime + UDP/TCP
+reactors) shipped including the `UdpRecv::recv_from` and
+`TcpListener::accept`/`TcpStream` reactors that 3b's plan deferred
+to "alongside QUIC" — they're already done. Highlights since the
+April 2026 status:
 
-**Next on deck:** Phase **3c** (QUIC as `async fn`). §2f + §2g
-first cut shipped: [kernel/executor.rs](kernel/executor.rs) is the
-per-core task arena + `RawWakerVTable` + `Sleep::until` reactor,
-wired into the event loop; [apps/test_async](apps/test_async) is the
-smoke test, green on HVF and both QEMU arches. `UdpRecv::recv_from`
-/ `TcpListener::accept` reactors land alongside QUIC since QUIC is
-the first real consumer that pins their API shape.
+- `//uni-runtime` async executor with chunked launcher table,
+  per-worker arenas, generation-aware handles.
+- `UdpSocket::run` / `TcpListener::run` reactors on bare-metal
+  AND native, both backends sharing a single `TcpBackend` /
+  `UdpBackend` vtable.
+- `uni_http::listen` and `listen_https` now take any
+  `AsyncFn(&Request) -> Response` — handlers can `.await`.
+- Native gateway workload at 89 k req/s 1c, HVF at 73 k 1c
+  (post `gateway_max conns_per_core: 1500` bump).
+- Graceful shutdown: `drain_all_arenas` reclaims in-flight task
+  storage, `shutdown_all_tcp` emits one RST per active conn,
+  `HEAP_LEAK_CHECK ok` asserted under traffic.
+
+**Next on deck:** Phase **3c** (QUIC as `async fn`). Every
+prerequisite — async runtime, UDP socket API, TLS 1.3 server
+state machine — is in place; QUIC starts on a clean foundation.
+
+**Optional pre-QUIC**: TLS session resumption (1 focused day; see
+"Deferred work — Session resumption"). Drops resumed-handshake
+latency ~7×, and resumed handshakes are exactly what QUIC's
+`pre_shared_key` extension reuses, so doing it on the TCP path
+first is free leverage on QUIC later. Skip if eager to start QUIC.
 
 Revised order for what's left:
 `3c (QUIC) → 4 (HTTP/3) → 5 (IPv6/NDP) → 2d/2h (work stealing
