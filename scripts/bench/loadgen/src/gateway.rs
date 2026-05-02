@@ -23,8 +23,16 @@ use hdrhistogram::Histogram;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{Barrier, Semaphore};
+use tokio::time::timeout;
 
 use crate::WorkloadResult;
+
+/// Connect timeout. Without this, a single stuck connect hangs the
+/// entire bench at the start barrier (which waits for ALL workers).
+/// 5 s is well above any healthy connect (<100 ms even for HVF
+/// userspace TCP) but short enough that the bench window survives a
+/// rare straggler — the worker reports zero ops, the bench proceeds.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub async fn run(
     host: &str,
@@ -169,9 +177,9 @@ async fn driver(
             return (0, hist_zero());
         }
     };
-    let mut sock = match TcpStream::connect((&*host, port)).await {
-        Ok(s) => s,
-        Err(_) => {
+    let mut sock = match timeout(CONNECT_TIMEOUT, TcpStream::connect((&*host, port))).await {
+        Ok(Ok(s)) => s,
+        _ => {
             drop(permit);
             barrier.wait().await;
             return (0, hist_zero());

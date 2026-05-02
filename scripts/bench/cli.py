@@ -205,24 +205,25 @@ WORKLOADS = [
     # forwards per worker without OS threads; native (Linux+Tokio
     # equivalent) pays ~5 syscalls per request just to push bytes.
     #
-    # `conns_per_core: 500` exercises the post-refactor scaling
+    # `conns_per_core: 1500` exercises the post-refactor scaling
     # path on the *unikernel side* — per-worker ephemeral UDP
     # pool with port-encoded owner, native O(1) port→fd table.
-    # Native saturates at ~89 k req/s by 1500 conn (1c), so 500
-    # captures most of the throughput win while keeping HVF safe:
-    # the HVF runner's userspace TCP proxy has a per-vCPU pollfd
-    # budget that drops accepts above ~500/core. The loadgen
-    # also throttles concurrent `connect(2)` to 64 (well under
-    # macOS's `kern.ipc.somaxconn=128` default) so the listener
-    # backlog drains during ramp.
+    # Native saturates at ~89 k req/s by 1500 conn (1c), and HVF
+    # holds steady at ~73 k through 1500 conn now that the
+    # loadgen's connect-timeout fix unblocks higher counts (a
+    # missing timeout used to hang the start barrier when one
+    # connect stalled, which masqueraded as a runner-side cap).
+    # The loadgen throttles concurrent `connect(2)` to 64 (well
+    # under macOS's `kern.ipc.somaxconn=128` default) so the
+    # listener backlog drains during ramp.
     #
     # Loadgen-side TIME_WAIT used to bite at thousands of conns
     # (16 384-port macOS ephemeral pool, 15 s 2×MSL); the
     # `set_zero_linger()` fix in scripts/bench/loadgen makes
     # close() RST instead of FIN, removing that cap entirely.
     {"name": "gateway_max", "type": "gateway",
-     "conns_per_core": 500,
-     "desc": "Gateway fan-out (TCP→UDP backend→TCP, 500 conn × cpus)"},
+     "conns_per_core": 1500,
+     "desc": "Gateway fan-out (TCP→UDP backend→TCP, 1500 conn × cpus)"},
 ]
 
 
