@@ -133,7 +133,9 @@ pub unsafe extern "C" fn ap_entry_via_limine(apic_id: u32) -> ! {
     init_tls(logical_id);
     super::idt::load_idt_on_ap();
 
-    NUM_CORES_ONLINE.fetch_add(1, Ordering::SeqCst);
+    // AcqRel pairs with the Acquire in `num_cores_online()`; matches
+    // the aarch64 sibling. SeqCst would add a redundant fence.
+    NUM_CORES_ONLINE.fetch_add(1, Ordering::AcqRel);
 
     let id = cpu_id();
     let mut buf = [0u8; 24];
@@ -288,7 +290,9 @@ extern "C" fn ap_entry_x86(_ctx: u64) -> ! {
     super::idt::load_idt_on_ap();
 
     // Mark online
-    NUM_CORES_ONLINE.fetch_add(1, Ordering::SeqCst);
+    // AcqRel pairs with the Acquire in `num_cores_online()`; matches
+    // the aarch64 sibling. SeqCst would add a redundant fence.
+    NUM_CORES_ONLINE.fetch_add(1, Ordering::AcqRel);
 
     let id = cpu_id();
     let mut buf = [0u8; 24];

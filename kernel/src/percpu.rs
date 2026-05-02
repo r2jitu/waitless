@@ -123,6 +123,11 @@ impl RxInbox {
 /// to this struct. Fields at known offsets can be read directly via
 /// the TLS register without indirection.
 ///
+/// "Core" here is the bare-metal name for what `uni-worker` calls a
+/// "worker"; this struct lives inside `PerWorker<PerCore>` and is the
+/// kernel's concrete per-worker state aggregate, not a separate
+/// abstraction.
+///
 /// IMPORTANT: `id` must be the first field (offset 0) — cpu_id() reads
 /// it directly via `gs:[0]` / TPIDR_EL1 without going through Rust.
 #[repr(C)]
