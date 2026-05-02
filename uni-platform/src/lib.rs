@@ -18,6 +18,15 @@
 // on x86). Native callers must not invoke `current_worker` before
 // their thread has called `set_current_worker`. Failing those
 // ordering constraints returns garbage / zero respectively, not UB.
+//
+// Memory-ordering convention: every register-style hook here uses
+// Release on the boot-time store and Acquire on the runtime load.
+// Workers running real code already happen-after the BSP's
+// `set_num_workers(...) → set_x86_tsc_per_us(...) → set_wake_fn(...)
+// → set_ready()` chain, so Acquire loads are formally redundant
+// (the boot chain already provides happens-before through
+// `NUM_WORKERS`'s Acquire). They're written explicitly anyway so
+// each load reads as obviously sound on its own.
 
 #![cfg_attr(target_os = "none", no_std)]
 
@@ -140,8 +149,11 @@ fn cycles_per_us() -> u64 {
     }
     #[cfg(target_arch = "x86_64")]
     {
+        // Acquire pairs with the Release in `set_x86_tsc_per_us`
+        // so the boot-time TSC publication is self-evidently sound
+        // at this load. Free on x86 (TSO).
         X86_TSC_PER_US
-            .load(core::sync::atomic::Ordering::Relaxed)
+            .load(core::sync::atomic::Ordering::Acquire)
             .max(1)
     }
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
