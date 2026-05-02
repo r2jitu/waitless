@@ -6,7 +6,7 @@
 
 extern crate alloc;
 
-pub use uni_macros::boot;
+pub use uni_macros::init;
 
 extern crate uni_backend;
 

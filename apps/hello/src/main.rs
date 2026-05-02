@@ -16,8 +16,8 @@ async fn hello(_: &Request) -> Response {
     Response::ok(b"text/plain", b"Hello from bare metal!\n")
 }
 
-#[uni::boot]
-async fn boot() {
+#[uni::init]
+async fn init() {
     Net::up().await.expect("Net::up failed");
     uni_http::listen(80, hello).expect("http bind");
 }

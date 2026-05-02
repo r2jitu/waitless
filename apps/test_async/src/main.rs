@@ -11,8 +11,8 @@
 
 extern crate uni;
 
-#[uni::boot]
-fn boot() {
+#[uni::init]
+fn init() {
     uni::log(b"test_async: boot\n");
 
     let spawn_result = uni::runtime::spawn(async {

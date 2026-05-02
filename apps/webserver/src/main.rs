@@ -1,6 +1,6 @@
 // UniKernel Example: HTTP Web Server
 //
-// `#[uni::boot]` is the entry point. The macro spawns the body as
+// `#[uni::init]` is the entry point. The macro spawns the body as
 // a task; once it returns, listeners (registered via the `listen`
 // helpers) keep running for the lifetime of the process. Shutdown
 // (SIGINT / serial Ctrl-C) tears every retained listener down and
@@ -33,8 +33,8 @@ const DEV_KEY_PKCS8_DER: &[u8] = include_bytes!("../dev_certs/dev_key.der");
 
 // ---- Boot -------------------------------------------------------------------
 
-#[uni::boot]
-async fn boot() {
+#[uni::init]
+async fn init() {
     log_boot_info();
 
     // VM-friendly bring-up: DHCP first, fall back to NAT-default

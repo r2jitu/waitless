@@ -13,7 +13,7 @@ Runs on **x86_64** and **ARM64 (aarch64)** via QEMU, Apple Hypervisor.framework 
 ```
 ┌─────────────────────────────────────┐
 │           Application               │  apps/webserver/
-│         #[uni::boot]                │
+│         #[uni::init]                │
 ├─────────────────────────────────────┤
 │    Platform Abstraction (uni)       │  uni/ (HTTP, TCP, TLS 1.3, logging)
 ├─────────────────────────────────────┤
@@ -112,8 +112,8 @@ fn hello(_: &Request) -> Response {
     Response::ok(b"text/plain", b"Hello from bare metal!\n")
 }
 
-#[uni::boot]
-fn boot() {
+#[uni::init]
+fn init() {
     uni::run(HelloApp::new());
 }
 ```
@@ -151,7 +151,7 @@ unikernel/
 │   ├── http.rs             HTTP/1.1 server (+ TLS wrapper)
 │   ├── unikernel.rs        Unikernel backend (serial, idle)
 │   ├── native.rs           Native POSIX backend (sockets)
-│   └── macros/             #[uni::boot] proc macro
+│   └── macros/             #[uni::init] proc macro
 ├── net/                    Network stack crate
 │   ├── ethernet.rs, arp.rs, ipv4.rs, udp.rs, dhcp.rs
 │   ├── tcp.rs              TCP + per-core 4-tuple hash table

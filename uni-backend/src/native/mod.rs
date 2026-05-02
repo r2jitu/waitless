@@ -873,7 +873,7 @@ fn is_ready() -> bool {
 /// Run the worker event loop on this thread. Same structure as the
 /// unikernel's. Called by `native_worker_loop` after thread setup.
 pub fn run_worker(worker_id: u32) {
-    // Worker 0 skips the READY wait: `uni_boot` now only spawns the
+    // Worker 0 skips the READY wait: `uni_init` now only spawns the
     // app's boot body as an async task; worker 0 is what polls it,
     // and the task's `uni::run(app)` is what eventually calls
     // `set_ready` to release the other workers. Blocking here would
@@ -919,10 +919,10 @@ pub fn run_worker(worker_id: u32) {
 // ============================================================================
 
 // Rust ABI — both sides are Rust and the function takes no args /
-// returns nothing. `#[no_mangle]` on the emitting `#[uni::boot]`
+// returns nothing. `#[no_mangle]` on the emitting `#[uni::init]`
 // macro gives the symbol a stable link-time name.
 unsafe extern "Rust" {
-    fn uni_boot();
+    fn uni_init();
 }
 
 extern "C" fn worker_thread(arg: *mut u8) -> *mut u8 {
@@ -961,7 +961,7 @@ pub fn run(config: RunConfig) -> i32 {
     (config.boot_info_fn)(num_cpus() as u32, host_ram_bytes());
 
     unsafe {
-        uni_boot();
+        uni_init();
         let num_threads = NUM_THREADS.load(Ordering::Acquire);
 
         // Start worker threads

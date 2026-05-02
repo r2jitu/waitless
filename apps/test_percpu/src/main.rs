@@ -54,8 +54,8 @@ fn test_service(core_id: u32) -> bool {
     true
 }
 
-#[uni::boot]
-fn boot() {
+#[uni::init]
+fn init() {
     uni::log(b"Per-core state test starting.\n");
 
     let num_cores = uni_kernel::percpu::num_cores();

@@ -9,8 +9,8 @@ extern crate uni;
 #[cfg(target_arch = "aarch64")]
 extern crate uni_kernel;
 
-#[uni::boot]
-fn boot() {
+#[uni::init]
+fn init() {
     uni::log(b"SMP test: cores booted.\n");
 
     // Test IPI: core 0 sends SGI to core 1, check that it was received

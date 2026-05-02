@@ -1206,8 +1206,8 @@ impl H3Server {
 
 App code barely changes:
 ```rust
-#[uni::boot]
-fn boot() {
+#[uni::init]
+fn init() {
     let mut server = H3Server::new();
     server.route(b"/health", handle_health);
     server.run(443);

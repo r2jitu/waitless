@@ -148,7 +148,7 @@ def unikernel_binary(
         visibility = None):
     """Package a Rust application into bootable unikernel images.
 
-    The application is a rust_library with a #[uni::boot] entry point.
+    The application is a rust_library with a #[uni::init] entry point.
 
     Artifact targets produced:
       - <name>.elf        : Bare-metal ELF (QEMU direct boot)
@@ -172,7 +172,7 @@ def unikernel_binary(
 
     Args:
         name: Base name for all output targets.
-        app: A rust_library target with a #[uni::boot] entry point.
+        app: A rust_library target with a #[uni::init] entry point.
         drivers: list of NIC driver crate labels (e.g.
           `//uni-driver-virtio-net`). Each is `extern crate`d at the
           unikernel binary's crate root so its

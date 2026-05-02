@@ -41,7 +41,7 @@ struct AsyncTcpListener {
 }
 
 struct AsyncTcpListenersSlot(UnsafeCell<[Option<AsyncTcpListener>; MAX_ASYNC_TCP_LISTENERS]>);
-// SAFETY: populated only on the main thread during `uni_boot`
+// SAFETY: populated only on the main thread during `uni_init`
 // (via `async_tcp_listen_hook` from `uni::runtime::TcpListener::bind`);
 // read from workers afterwards without further mutation.
 unsafe impl Sync for AsyncTcpListenersSlot {}

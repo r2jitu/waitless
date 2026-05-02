@@ -13,7 +13,7 @@ User-facing crates. An app depends on these directly.
 | `//uni-net`       | `uni_net`    | `Net::enable(Dhcp \| Static)`, `NicOps` registry, err |
 | `//uni-http`      | `uni_http`   | Minimal HTTP/1.1 server + routing                    |
 | `//uni-tls`       | `uni_tls`    | TLS termination wrapper                              |
-| `//uni/macros`    | `uni_macros` | Proc macros (`#[uni::boot]`)                         |
+| `//uni/macros`    | `uni_macros` | Proc macros (`#[uni::init]`)                         |
 
 ## Tier 2 — platform + runtime
 
