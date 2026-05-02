@@ -178,15 +178,11 @@ async fn do_one_handshake(
         Ok(Ok(s)) => s,
         _ => return false,
     };
-    // The Python version used SO_LINGER=0 to skip TIME_WAIT —
-    // tokio deprecated that on TcpStream and the comment is the
-    // explanation: SO_LINGER blocks on drop, which is wrong for
-    // an async runtime. Without it we'll exhaust the ephemeral
-    // port range faster on long runs; for the bench durations we
-    // care about (5-10s), the limit is high enough that it
-    // doesn't bite. If it ever does, switch to a syscall-level
-    // setsockopt with the FD pulled via TcpStream::as_raw_fd.
     let _ = tcp.set_nodelay(true);
+    // SO_LINGER={1,0} → close() sends RST instead of FIN, so the
+    // local side skips TIME_WAIT entirely. macOS's 16K ephemeral
+    // pool exhausts in <10s at 2K hs/s × N workers without this.
+    let _ = tcp.set_zero_linger();
 
     let mut tls = match timeout(PER_OP_TIMEOUT, connector.connect(server_name.clone(), tcp)).await {
         Ok(Ok(t)) => t,

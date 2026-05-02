@@ -45,6 +45,10 @@ pub async fn run(
                 }
             };
             let _ = sock.set_nodelay(true);
+            // SO_LINGER={1,0} → close() RSTs instead of FIN, so we
+            // skip TIME_WAIT on the loadgen's side. Otherwise N conns
+            // × M back-to-back runs exhaust macOS's 16K ephemeral pool.
+            let _ = sock.set_zero_linger();
 
             let mut buf = vec![0u8; msg.len()];
             let mut hist = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap();

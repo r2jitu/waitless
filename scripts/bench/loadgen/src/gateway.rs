@@ -179,6 +179,9 @@ async fn driver(
     };
     drop(permit);
     let _ = sock.set_nodelay(true);
+    // SO_LINGER={1,0} → close() RSTs instead of FIN, sparing the
+    // loadgen's ephemeral pool from TIME_WAIT.
+    let _ = sock.set_zero_linger();
 
     let mut buf = vec![0u8; payload.len()];
     let mut hist = hist_zero();

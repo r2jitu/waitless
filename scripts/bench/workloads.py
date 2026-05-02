@@ -605,9 +605,15 @@ def run_tcp_echo(port, conns, duration, host="127.0.0.1", msg_size=64):
     msg_len = len(msg)
     deadline = _t.monotonic() + duration
 
+    # SO_LINGER={on=1,linger=0} → close() RSTs instead of FIN, so the
+    # loadgen side skips TIME_WAIT. macOS's 16K ephemeral pool would
+    # otherwise fill up across back-to-back runs.
+    linger = struct.pack("ii", 1, 0)
+
     def worker(sample_latency, barrier, result_q):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, linger)
         sock.settimeout(5.0)
         try:
             sock.connect((host, port))
