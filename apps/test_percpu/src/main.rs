@@ -56,16 +56,14 @@ fn test_service(core_id: u32) -> bool {
 
 #[uni::init]
 fn init() {
-    uni::log(b"Per-core state test starting.\n");
+    uni::println!("Per-core state test starting.");
 
     let num_cores = uni_kernel::percpu::num_cores();
-    uni::log(b"Cores: ");
-    uni::log(&[b'0' + (num_cores as u8 % 10)]);
-    uni::log(b"\n");
+    uni::println!("Cores: {}", num_cores);
 
     if num_cores <= 1 {
-        uni::log(b"SKIP: need >1 core for per-core test\n");
-        uni::log(b"Per-core state test complete.\n");
+        uni::println!("SKIP: need >1 core for per-core test");
+        uni::println!("Per-core state test complete.");
         return;
     }
 
@@ -98,16 +96,16 @@ fn init() {
 
     // Print results — include core 0 (its test runs inline, so it's
     // always populated) so the test harness can assert on every core.
+    // Each line is printed via `uni::println!` so the whole line emits
+    // under one serial-lock acquisition; without that, multiple
+    // `uni::log(bytes)` calls let AP eventloop diagnostics slot in
+    // between fragments and break the test's contiguous-string match.
     for i in 0..num_cores {
         let result = RESULTS[i as usize].load(Ordering::Acquire);
-        uni::log(b"Core ");
-        uni::log(&[b'0' + (i as u8 % 10)]);
-        if result == 1 {
-            uni::log(b": inbox OK, tx_staging OK, id OK\n");
-        } else if result == 2 {
-            uni::log(b": FAIL\n");
-        } else {
-            uni::log(b": TIMEOUT (no result)\n");
+        match result {
+            1 => uni::println!("Core {}: inbox OK, tx_staging OK, id OK", i),
+            2 => uni::println!("Core {}: FAIL", i),
+            _ => uni::println!("Core {}: TIMEOUT (no result)", i),
         }
     }
 
@@ -127,11 +125,11 @@ fn init() {
     }
 
     if tx_ok == expected {
-        uni::log(b"Core 0: verified TX staging from all APs\n");
+        uni::println!("Core 0: verified TX staging from all APs");
     } else {
-        uni::log(b"Core 0: FAIL TX staging verification\n");
+        uni::println!("Core 0: FAIL TX staging verification");
     }
 
-    uni::log(b"Per-core state test complete.\n");
+    uni::println!("Per-core state test complete.");
     uni_kernel::eventloop::request_shutdown();
 }

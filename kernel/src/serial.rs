@@ -241,6 +241,74 @@ static SHUTDOWN_REQUESTED: core::sync::atomic::AtomicBool = core::sync::atomic::
 /// implementations. The lock just provides mutual exclusion.
 static SERIAL_TX_LOCK: crate::sync::Spinlock<()> = crate::sync::Spinlock::new(());
 
+/// `true` when the next emitted byte is the first byte of a new
+/// line. Used to drive the "[N.NNN] " timestamp prefix that every
+/// serial line gets — same Linux-`dmesg` shape (`[    0.123456]`),
+/// just ms-precision since sub-millisecond detail isn't useful for
+/// this kernel's boot timeline. Mutated only under SERIAL_TX_LOCK,
+/// so the atomic could be a `bool` behind the lock; AtomicBool is
+/// just convenient.
+static AT_LINE_START: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
+
+#[inline(always)]
+unsafe fn putc_raw(c: u8) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe { x86::putc(c); }
+    #[cfg(target_arch = "aarch64")]
+    unsafe { aarch64::putc(c); }
+}
+
+/// Emit `[N.NNN] ` (seconds.milliseconds since boot) — directly via
+/// `putc_raw` (caller already holds SERIAL_TX_LOCK; do not re-enter).
+unsafe fn emit_timestamp_locked() {
+    let ms = crate::time::since_boot_us() / 1000;
+    let secs = ms / 1000;
+    let ms_part = (ms % 1000) as u32;
+
+    unsafe { putc_raw(b'['); }
+    // Seconds, no leading zeros (variable width — `[0.043]`,
+    // `[12.345]`, `[1234.567]` all naturally fit).
+    if secs == 0 {
+        unsafe { putc_raw(b'0'); }
+    } else {
+        let mut tmp = [0u8; 10];
+        let mut len = 0;
+        let mut s = secs;
+        while s > 0 {
+            tmp[len] = b'0' + (s % 10) as u8;
+            s /= 10;
+            len += 1;
+        }
+        for i in 0..len {
+            unsafe { putc_raw(tmp[len - 1 - i]); }
+        }
+    }
+    unsafe { putc_raw(b'.'); }
+    unsafe { putc_raw(b'0' + (ms_part / 100) as u8); }
+    unsafe { putc_raw(b'0' + ((ms_part / 10) % 10) as u8); }
+    unsafe { putc_raw(b'0' + (ms_part % 10) as u8); }
+    unsafe { putc_raw(b']'); }
+    unsafe { putc_raw(b' '); }
+}
+
+/// Write one byte under the lock, prepending a timestamp prefix at
+/// line starts and translating `\n` to `\r\n`. Caller MUST hold
+/// SERIAL_TX_LOCK.
+unsafe fn write_byte_locked(b: u8) {
+    use core::sync::atomic::Ordering;
+    if AT_LINE_START.load(Ordering::Relaxed) {
+        unsafe { emit_timestamp_locked(); }
+        AT_LINE_START.store(false, Ordering::Relaxed);
+    }
+    if b == b'\n' {
+        unsafe { putc_raw(b'\r'); putc_raw(b'\n'); }
+        AT_LINE_START.store(true, Ordering::Relaxed);
+    } else {
+        unsafe { putc_raw(b); }
+    }
+}
+
 pub fn init() {
     unsafe {
         #[cfg(target_arch = "x86_64")]
@@ -252,13 +320,7 @@ pub fn init() {
 
 pub fn putc(c: u8) {
     let _guard = SERIAL_TX_LOCK.lock();
-    unsafe {
-        #[cfg(target_arch = "x86_64")]
-        x86::putc(c);
-        #[cfg(target_arch = "aarch64")]
-        aarch64::putc(c);
-    }
-    // _guard released at end of scope.
+    unsafe { write_byte_locked(c); }
 }
 
 pub fn puts(s: &[u8]) {
@@ -267,14 +329,7 @@ pub fn puts(s: &[u8]) {
     // scope exit.
     let _guard = SERIAL_TX_LOCK.lock();
     for &c in s {
-        if c == b'\n' { unsafe {
-            #[cfg(target_arch = "x86_64")] x86::putc(b'\r');
-            #[cfg(target_arch = "aarch64")] aarch64::putc(b'\r');
-        }}
-        unsafe {
-            #[cfg(target_arch = "x86_64")] x86::putc(c);
-            #[cfg(target_arch = "aarch64")] aarch64::putc(c);
-        }
+        unsafe { write_byte_locked(c); }
     }
 }
 
@@ -352,14 +407,7 @@ struct LockedWriter;
 impl core::fmt::Write for LockedWriter {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         for b in s.bytes() {
-            unsafe {
-                if b == b'\n' {
-                    #[cfg(target_arch = "x86_64")] x86::putc(b'\r');
-                    #[cfg(target_arch = "aarch64")] aarch64::putc(b'\r');
-                }
-                #[cfg(target_arch = "x86_64")] x86::putc(b);
-                #[cfg(target_arch = "aarch64")] aarch64::putc(b);
-            }
+            unsafe { write_byte_locked(b); }
         }
         Ok(())
     }
