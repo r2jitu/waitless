@@ -387,13 +387,95 @@ impl Drop for LineBuf {
     }
 }
 
-/// Arch-specific batched write. Caller holds SERIAL_TX_LOCK.
+/// Early-boot output buffer. On x86 the 16550 UART is the only
+/// console available before `pci::init` runs, and each `outb` is a
+/// vmexit (~1 µs on KVM, ~50 µs on nested KVM). 8–10 boot lines
+/// emitted byte-at-a-time burns 5–15 ms of wall time before the
+/// virtio-console-pci upgrade gets a chance — money we lose
+/// regardless of whether the host actually has a virtio-serial-pci
+/// device to upgrade to.
+///
+/// This buffer holds those lines in BSS until `flush_early_buf`
+/// gets called from the boot path right after the upgrade attempt.
+/// At that point we know the active backend (virtio-console if the
+/// upgrade succeeded, 16550 otherwise) and can emit the buffered
+/// bytes through it in one batched write — one vmexit on virtio,
+/// or the same per-byte cost we would have paid anyway on 16550.
+///
+/// Cap = 4 KiB. Easily covers the boot-info phase (banner +
+/// cpu/platform/mem/irq/smp/pci ≈ 600 B). If a panic fires before
+/// flush, the panic handler dumps it through the 16550 directly
+/// so we still see what came up.
+const EARLY_BUF_CAP: usize = 4096;
+
+struct EarlyBuf {
+    data: [u8; EARLY_BUF_CAP],
+    len: usize,
+    active: bool,
+}
+
+static EARLY_BUF: crate::sync::Spinlock<EarlyBuf> =
+    crate::sync::Spinlock::new(EarlyBuf {
+        data: [0; EARLY_BUF_CAP],
+        len: 0,
+        active: true,
+    });
+
+/// Direct emit through the arch-specific backend, bypassing the
+/// early-boot buffer. Used by `flush_early_buf` and the panic
+/// path. Caller holds SERIAL_TX_LOCK.
 #[inline]
-unsafe fn arch_puts_raw(bytes: &[u8]) {
+unsafe fn direct_emit(bytes: &[u8]) {
     #[cfg(target_arch = "aarch64")]
     unsafe { aarch64::puts_raw(bytes); }
     #[cfg(target_arch = "x86_64")]
     unsafe { x86::puts_raw(bytes.as_ptr(), bytes.len()); }
+}
+
+/// Arch-specific batched write. Caller holds SERIAL_TX_LOCK.
+#[inline]
+unsafe fn arch_puts_raw(bytes: &[u8]) {
+    {
+        let mut buf = EARLY_BUF.lock();
+        if buf.active {
+            // Append to the early buffer if it fits; if we'd
+            // overflow, fall through and emit directly so the
+            // line still makes it out (slow path, only when the
+            // buffer cap has been exceeded — should not happen on
+            // the documented boot budget, but never silently drop).
+            let avail = EARLY_BUF_CAP - buf.len;
+            if avail >= bytes.len() {
+                let n = bytes.len();
+                let pos = buf.len;
+                buf.data[pos..pos + n].copy_from_slice(bytes);
+                buf.len += n;
+                return;
+            }
+        }
+    }
+    unsafe { direct_emit(bytes); }
+}
+
+/// Drain the early-boot buffer through the now-chosen backend
+/// and flip the buffer off. Idempotent — a second call is a
+/// no-op. Called from the boot path after `upgrade_after_pci`,
+/// regardless of whether the upgrade succeeded: the buffered
+/// bytes go through whichever backend is now live (virtio-
+/// console-pci if upgraded, 16550 otherwise).
+pub fn flush_early_buf() {
+    let _guard = SERIAL_TX_LOCK.lock();
+    let mut buf = EARLY_BUF.lock();
+    if !buf.active { return; }
+    buf.active = false;
+    let len = buf.len;
+    if len == 0 { return; }
+    // Copy out so we can drop the lock before the (potentially
+    // slow) emit — `direct_emit` may take milliseconds on the
+    // 16550 fallback path.
+    let mut local = [0u8; EARLY_BUF_CAP];
+    local[..len].copy_from_slice(&buf.data[..len]);
+    drop(buf);
+    unsafe { direct_emit(&local[..len]); }
 }
 
 pub fn init() {

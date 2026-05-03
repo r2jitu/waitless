@@ -49,6 +49,11 @@ use types::{BootInfo, MemoryRegion, Protocol, MEM_AVAILABLE, MEM_RESERVED, MAX_M
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
+    // Flush whatever early-boot lines are buffered through the
+    // current (16550 / PL011) backend before printing PANIC, so
+    // the operator sees the boot context that led up to the panic
+    // even if the crash beat the post-PCI upgrade.
+    serial::flush_early_buf();
     serial::puts(b"PANIC in entry\n");
     unsafe { arch_shutdown() }
 }
@@ -440,9 +445,16 @@ unsafe fn kernel_boot(info: &BootInfo) {
     // virtio path (1 vmexit per ≤256-byte chunk vs 1 per byte for
     // 16550). No-op on aarch64; that path's `serial::aarch64::init`
     // already picks the best FDT-advertised backend.
-    if serial::upgrade_after_pci() {
+    let upgraded = serial::upgrade_after_pci();
+    if upgraded {
         klog!("console: upgraded to virtio-console-pci (batched, ≤256 B/vmexit)\n");
     }
+    // Drain the early-boot buffer through the now-chosen backend.
+    // If we just upgraded, every pre-PCI line gets flushed via
+    // virtio-console (one batched ≤256 B emit). If we didn't, it
+    // fans out through the 16550 at ~1 ms / line — same cost we
+    // would have paid emitting inline, just deferred.
+    serial::flush_early_buf();
 
     // NIC bring-up. `uni_drivers::net::init()` tries gVNIC first
     // (preferred on GCE — native RSS multi-queue) then falls back
