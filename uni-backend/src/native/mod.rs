@@ -808,10 +808,13 @@ pub fn log(msg: &[u8]) {
     use std::sync::atomic::Ordering;
     for &b in msg {
         if AT_LINE_START.load(Ordering::Relaxed) {
+            // Microsecond resolution to match the kernel-side
+            // `[S.uuuuuu]` format. With HVF boot down to ~1 ms,
+            // ms-only timestamps lump every line into a single tick.
             let elapsed = start.elapsed();
-            let ms = elapsed.as_millis() as u64;
-            let secs = ms / 1000;
-            let ms_part = (ms % 1000) as u32;
+            let us = elapsed.as_micros() as u64;
+            let secs = us / 1_000_000;
+            let us_part = (us % 1_000_000) as u32;
             out.push(b'[');
             if secs == 0 {
                 out.push(b'0');
@@ -823,9 +826,12 @@ pub fn log(msg: &[u8]) {
                 for i in 0..len { out.push(tmp[len - 1 - i]); }
             }
             out.push(b'.');
-            out.push(b'0' + (ms_part / 100) as u8);
-            out.push(b'0' + ((ms_part / 10) % 10) as u8);
-            out.push(b'0' + (ms_part % 10) as u8);
+            out.push(b'0' + (us_part / 100_000) as u8);
+            out.push(b'0' + ((us_part / 10_000) % 10) as u8);
+            out.push(b'0' + ((us_part / 1_000) % 10) as u8);
+            out.push(b'0' + ((us_part / 100) % 10) as u8);
+            out.push(b'0' + ((us_part / 10) % 10) as u8);
+            out.push(b'0' + (us_part % 10) as u8);
             out.push(b']');
             out.push(b' ');
             AT_LINE_START.store(false, Ordering::Relaxed);
