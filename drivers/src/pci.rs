@@ -348,6 +348,21 @@ pub fn pci_device(idx: usize) -> PciDevice {
     PCI_DEVICES.lock().devices[idx]
 }
 
+/// Log one line per discovered device. Boot diagnostic — answers
+/// "what's on the PCI bus on this machine?" without an external
+/// `lspci`. Vendor/device IDs are 4-hex; cross-reference at
+/// pci-ids.ucw.cz or Google's PCI vendor list (0x1ae0).
+pub fn log_devices() {
+    let table = PCI_DEVICES.lock();
+    for i in 0..table.count {
+        let d = &table.devices[i];
+        uni_kernel::serial::write_fmt(format_args!(
+            "[pci] {:02x}:{:02x}.{} vendor={:04x} device={:04x} class={:02x}.{:02x}\n",
+            d.bus, d.slot, d.func, d.vendor_id, d.device_id, d.class_code, d.subclass,
+        ));
+    }
+}
+
 /// Number of PCI devices found on bus 0 by `init`. Boot-log diagnostic
 /// only — most callers should use `find_device(vendor, device)`.
 pub fn device_count() -> usize {

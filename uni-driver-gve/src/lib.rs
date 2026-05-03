@@ -428,7 +428,6 @@ fn init() -> bool {
         None => return false,
     };
     let dev = pci::pci_device(idx);
-    log(b"[gvnic] found device on PCI bus\n");
 
     // Enable bus master + memory space (bits 1 + 2 of Command). The
     // firmware on GCE's kernel-mode VM already programs BAR0, so we
@@ -452,16 +451,12 @@ fn init() -> bool {
     BAR0.store(bar_virt, Ordering::Release);
 
     // ── Read device advertising ──────────────────────────────────────────
-    let dev_status = unsafe { reg_read32(REG_DEVICE_STATUS) };
+    // dev_status / max_tx / max_rx are sanity reads only — values are
+    // identical across every healthy GCE n2 boot and the per-queue
+    // count we actually use lands in the `nic` line at end of init.
+    let _dev_status = unsafe { reg_read32(REG_DEVICE_STATUS) };
     let max_tx = unsafe { reg_read32(REG_MAX_TX_QUEUES) };
     let max_rx = unsafe { reg_read32(REG_MAX_RX_QUEUES) };
-    log(b"[gvnic] device_status=");
-    log_hex32(dev_status);
-    log(b" max_tx=");
-    log_u32(max_tx);
-    log(b" max_rx=");
-    log_u32(max_rx);
-    log(b"\n");
 
     // ── Allocate admin queue (one contiguous 4 KiB page) ─────────────────
     //
@@ -674,46 +669,21 @@ fn parse_device_descriptor(desc_virt: *mut u8) -> bool {
     let header_len = 40;
     let header: &[u8] = unsafe { core::slice::from_raw_parts(desc_virt, header_len) };
 
-    let max_registered_pages = u64::from_be_bytes([
-        header[0], header[1], header[2], header[3],
-        header[4], header[5], header[6], header[7],
-    ]);
     let tx_entries = get_be16(header, 10);
     let rx_entries = get_be16(header, 12);
     let default_num_queues = get_be16(header, 14);
     let mtu = get_be16(header, 16);
     let counters = get_be16(header, 18);
-    let rx_pages_per_qpl = get_be16(header, 22);
     let mut mac = [0u8; 6];
     mac.copy_from_slice(&header[24..30]);
     let num_options = get_be16(header, 30);
     let total_len = get_be16(header, 32) as usize;
 
-    log(b"[gvnic] mtu=");
-    log_u32(mtu as u32);
-    log(b" default_num_queues=");
-    log_u32(default_num_queues as u32);
-    log(b" tx_entries=");
-    log_u32(tx_entries as u32);
-    log(b" rx_entries=");
-    log_u32(rx_entries as u32);
-    log(b" counters=");
-    log_u32(counters as u32);
-    log(b" rx_pages_per_qpl=");
-    log_u32(rx_pages_per_qpl as u32);
-    log(b" max_registered_pages=");
-    log_u32(max_registered_pages as u32);
-    log(b"\n");
-    log(b"[gvnic] mac=");
-    log_mac(&mac);
-    log(b" num_options=");
-    log_u32(num_options as u32);
-    log(b"\n");
-
-    // Walk the option list. For each option, print its id + length
-    // and record the best queue-format we see. Preference order
-    // matches Linux: DQO_RDA > DQO_QPL > GQI_RDA > GQI_QPL. Queue
-    // bring-up reads the commit via `queue_format`.
+    // Walk the option list to negotiate the queue format. Preference
+    // order matches Linux: DQO_RDA > DQO_QPL > GQI_RDA > GQI_QPL.
+    // No per-option logging: GCE currently advertises GQI_QPL plus
+    // a fixed set of decoration options (MODIFY_RING etc.) that
+    // never vary across boots.
     let mut best: Option<QueueFormat> = None;
     let mut offset = header_len;
     let end = if total_len > 0 && total_len <= ADMINQ_SIZE {
@@ -727,15 +697,7 @@ fn parse_device_descriptor(desc_virt: *mut u8) -> bool {
             unsafe { core::slice::from_raw_parts(desc_virt.add(offset), 8) };
         let id = get_be16(opt_hdr, 0);
         let len = get_be16(opt_hdr, 2) as usize;
-        log(b"[gvnic]  option id=");
-        log_u32(id as u32);
-        log(b" len=");
-        log_u32(len as u32);
-        log(b"\n");
 
-        // Promote `best` if this option is higher priority than what
-        // we've seen so far. GCE currently advertises GQI_QPL only;
-        // this loop is structured for future formats.
         let fmt = match id {
             OPT_ID_DQO_RDA => Some(QueueFormat::DqoRda),
             OPT_ID_DQO_QPL => Some(QueueFormat::DqoQpl),
@@ -750,43 +712,30 @@ fn parse_device_descriptor(desc_virt: *mut u8) -> bool {
             });
         }
 
-        // MODIFY_RING (option id 6, len 12): tells us the allowed
-        // min/max ring sizes. The device rejects CREATE_*_QUEUE
-        // with INVALID_ARGUMENT when the ring size is out of this
-        // range, so log it so sizing decisions have numbers behind
-        // them. Payload layout:
-        //   u32 supported_features_mask
-        //   u16 max_rx, u16 max_tx
-        //   u16 min_rx, u16 min_tx
-        if id == 6 && len == 12 && offset + 8 + 12 <= end {
-            let payload: &[u8] =
-                unsafe { core::slice::from_raw_parts(desc_virt.add(offset + 8), 12) };
-            let max_rx = get_be16(payload, 4);
-            let max_tx = get_be16(payload, 6);
-            let min_rx = get_be16(payload, 8);
-            let min_tx = get_be16(payload, 10);
-            log(b"[gvnic]   MODIFY_RING min_rx=");
-            log_u32(min_rx as u32);
-            log(b" max_rx=");
-            log_u32(max_rx as u32);
-            log(b" min_tx=");
-            log_u32(min_tx as u32);
-            log(b" max_tx=");
-            log_u32(max_tx as u32);
-            log(b"\n");
-        }
-
         offset += 8 + len;
     }
 
-    if let Some(fmt) = best {
-        log(b"[gvnic] queue_format=");
-        log(fmt.name());
-        log(b"\n");
-    } else {
-        log(b"[gvnic] no known queue format advertised - incompatible device\n");
-        return false;
-    }
+    let fmt_name = match best {
+        Some(f) => f.name(),
+        None => {
+            log(b"[gvnic] no known queue format advertised - incompatible device\n");
+            return false;
+        }
+    };
+
+    // One summary line covering everything an operator actually
+    // wants to see at boot. Static device caps (counters, max regs,
+    // entry sizes etc.) live in the source — only `mtu`, `qps`,
+    // `mac`, and the negotiated format vary in practice.
+    log(b"[gvnic] device ");
+    log(fmt_name);
+    log(b" mtu=");
+    log_u32(mtu as u32);
+    log(b" qps=");
+    log_u32(default_num_queues as u32);
+    log(b" mac=");
+    log_mac(&mac);
+    log(b"\n");
 
     let mut st = STATE.lock();
     if let Some(s) = st.as_mut() {
@@ -1281,13 +1230,6 @@ fn create_tx_qp(qp: u32) -> bool {
             TX_QUEUES[qp as usize].store(ptr, Ordering::Release);
         }
     }
-    log(b"[gvnic] TX queue ");
-    log_u32(qp);
-    log(b" created, db_offset=");
-    log_u32(db_index * 4);
-    log(b" counter_index=");
-    log_u32(counter_index);
-    log(b"\n");
     true
 }
 
@@ -1403,13 +1345,6 @@ fn create_rx_qp(qp: u32, num_qp: u32) -> bool {
             RX_QUEUES[qp as usize].store(ptr, Ordering::Release);
         }
     }
-    log(b"[gvnic] RX queue ");
-    log_u32(qp);
-    log(b" created, db_offset=");
-    log_u32(db_index * 4);
-    log(b" counter_index=");
-    log_u32(counter_index);
-    log(b"\n");
     true
 }
 
