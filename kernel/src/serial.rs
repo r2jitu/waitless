@@ -97,18 +97,37 @@ mod x86 {
     }
 
     /// Emit `len` bytes to the active backend. One vmexit per
-    /// ≤256-byte chunk on virtio-console-pci; one per byte on
-    /// 16550 (early-boot fallback). Caller holds SERIAL_TX_LOCK.
+    /// ≤256-byte chunk on virtio-console-pci; ~1 vmexit per 16
+    /// bytes on 16550 (early-boot fallback, plus the whole boot
+    /// on hosts that don't expose virtio-serial-pci — notably
+    /// GCE). Caller holds SERIAL_TX_LOCK.
     pub unsafe fn puts_raw(ptr: *const u8, len: usize) {
         if USE_VIRTIO_CONSOLE.load(Ordering::Acquire) {
             unsafe { virtio_console_puts(ptr, len); }
             return;
         }
-        // 16550 fallback: per-byte port I/O. No LSR-empty poll —
-        // every emulated 16550 path drains THR synchronously.
+        // 16550 fallback. We MUST throttle to LSR bit 5 (FIFO
+        // empty) — QEMU TCG / KVM happen to drain the THR
+        // synchronously, but GCE's serial emulation buffers
+        // asynchronously and silently overwrites bytes when the
+        // FIFO can't keep up. Without throttling, sustained output
+        // (e.g. gVNIC queue setup logs at boot) shows up mangled.
+        //
+        // Burst-of-16: with FIFO mode + trigger=14 (set in `init`),
+        // bit 5 means "FIFO empty"; once empty we can write up to
+        // 16 bytes before the next wait. Cuts the LSR-poll vmexit
+        // count to one per 16 bytes vs one per byte.
         let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
-        for &b in bytes {
-            unsafe { outb(COM1 + THR, b); }
+        let mut written = 0;
+        while written < bytes.len() {
+            unsafe {
+                while (inb(COM1 + LSR) & 0x20) == 0 {}
+            }
+            let n = (bytes.len() - written).min(16);
+            for j in 0..n {
+                unsafe { outb(COM1 + THR, bytes[written + j]); }
+            }
+            written += n;
         }
     }
 
