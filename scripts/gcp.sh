@@ -196,11 +196,20 @@ case "$cmd" in
         ssh-keygen -R "$ip" >/dev/null 2>&1 || true
         ssh-keygen -R "$SSH_HOST" >/dev/null 2>&1 || true
         # First-touch trust: accept and pin the new host key on the next
-        # connection, then close. Subsequent ssh invocations don't need
-        # any extra flags.
-        ssh -o StrictHostKeyChecking=accept-new \
-            -o ConnectTimeout=10 \
-            "$SSH_HOST" true >/dev/null 2>&1 || true
+        # connection, then close. Retry: SSH on the freshly-started
+        # instance can still be unavailable after the initial 5 s sleep
+        # (cloud-init / sshd boot lags), and a single failed connect
+        # leaves nothing pinned, so the next user command sees
+        # "Host key verification failed".
+        for _ in $(seq 1 10); do
+            if ssh -o StrictHostKeyChecking=accept-new \
+                   -o ConnectTimeout=5 \
+                   -o BatchMode=yes \
+                   "$SSH_HOST" true >/dev/null 2>&1; then
+                break
+            fi
+            sleep 2
+        done
         echo "    External IP: $ip (SSH config updated)"
         echo "    Connect: ssh $SSH_HOST"
         ;;
