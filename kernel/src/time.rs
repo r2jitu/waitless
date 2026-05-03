@@ -50,9 +50,72 @@ pub fn cycles_per_us() -> u64 {
 
 #[cfg(target_arch = "x86_64")]
 pub fn cycles_per_us() -> u64 {
-    // Force calibration via a zero-length udelay if not yet done.
+    let cached = X86_TSC_PER_US.load(core::sync::atomic::Ordering::Relaxed);
+    if cached != 0 {
+        return cached.max(1);
+    }
+    // Try CPUID-based fast path first — leaves 0x15 (TSC/core-crystal-
+    // clock ratio + nominal frequency) and 0x16 (CPU base/max
+    // frequency) cover modern Intel + AMD without the 10 ms PIT wait.
+    // Falls back to PIT calibration when neither leaf is informative
+    // (older CPUs, some hypervisors). Saves ~10 ms of boot-time
+    // serial output on KVM/TCG x86 (the first timestamp emission
+    // triggered the calibration before this).
+    if let Some(rate) = cpuid_tsc_per_us() {
+        X86_TSC_PER_US.store(rate, core::sync::atomic::Ordering::Relaxed);
+        return rate.max(1);
+    }
     udelay(0);
     X86_TSC_PER_US.load(core::sync::atomic::Ordering::Relaxed).max(1)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn cpuid_tsc_per_us() -> Option<u64> {
+    // Leaf 0x15: EAX = denominator, EBX = numerator, ECX = nominal
+    // core crystal clock frequency in Hz. If EBX != 0 and ECX != 0,
+    // TSC freq Hz = ECX * EBX / EAX (using the ratio). If EBX != 0
+    // but ECX == 0, fall through to leaf 0x16 to derive ECX.
+    let (a, b, c, _) = cpuid_x86(0x15);
+    if b == 0 || a == 0 {
+        return None;
+    }
+    let crystal_hz: u64 = if c != 0 {
+        c as u64
+    } else {
+        // Leaf 0x16: EAX = base CPU frequency in MHz. From that and
+        // the leaf-0x15 ratio we can derive the crystal clock.
+        let (eax_mhz, _, _, _) = cpuid_x86(0x16);
+        if eax_mhz == 0 {
+            return None;
+        }
+        // tsc_hz = eax_mhz * 1_000_000; crystal_hz = tsc_hz * a / b
+        ((eax_mhz as u64) * 1_000_000 * (a as u64)) / (b as u64)
+    };
+    // tsc_hz = crystal_hz * b / a; tsc_per_us = tsc_hz / 1_000_000
+    let tsc_hz = (crystal_hz * (b as u64)) / (a as u64);
+    let per_us = tsc_hz / 1_000_000;
+    if per_us == 0 {
+        return None;
+    }
+    Some(per_us)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn cpuid_x86(leaf: u32) -> (u32, u32, u32, u32) {
+    let (a, b, c, d): (u32, u32, u32, u32);
+    unsafe {
+        core::arch::asm!(
+            "mov {tmp:r}, rbx",
+            "cpuid",
+            "xchg {tmp:r}, rbx",
+            tmp = out(reg) b,
+            inout("eax") leaf => a,
+            inout("ecx") 0u32 => c,
+            out("edx") d,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    (a, b, c, d)
 }
 
 #[cfg(target_arch = "x86_64")]
