@@ -200,24 +200,6 @@ pub fn run(core_id: u32) -> ! {
             if let Some(f) = NET_FLUSH.load() { f(); }
         }
 
-        // Periodic diagnostics (every ~1M loops)
-        let print_interval = if core_id == 0 { 0x3FFFF } else { 0x1FFF };
-        if loops & print_interval == 0 && loops > 0 {
-            crate::serial::puts(b"[ev");
-            crate::serial::puts(&[b'0' + (core_id as u8 % 10)]);
-            crate::serial::puts(b"] L=");
-            print_u64(loops);
-            crate::serial::puts(b" p=");
-            print_u64(poll_work);
-            crate::serial::puts(b" d=");
-            print_u64(drain_work);
-            crate::serial::puts(b" s=");
-            print_u64(service_work);
-            crate::serial::puts(b" i=");
-            print_u64(idle_count);
-            crate::serial::puts(b"\n");
-        }
-
         // 4. Check for shutdown (every 64 iterations to avoid MMIO overhead)
         if loops & 63 == 0 {
             if let Some(f) = CHECK_SHUTDOWN.load() {
