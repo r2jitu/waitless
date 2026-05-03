@@ -52,7 +52,7 @@ class QemuEnv:
         # first time it emits an AVX instruction on a pre-AVX CPU
         # model. `qemu64` is pre-AVX; `max` enables every feature
         # TCG can simulate.
-        cmd = ["qemu-system-x86_64", "-cpu", "max",
+        cmd = ["qemu-system-x86_64", "-machine", "q35", "-cpu", "max",
                "-m", "128", "-smp", str(cpus), "-nographic",
                "-serial", f"file:/tmp/bench_{port}.log", "-no-reboot"]
         if cpus > 1:
@@ -120,7 +120,7 @@ class KvmEnv:
             "bazel-bin/apps/webserver/webserver_qemu_x86_64.elf")
         # tap backend with vhost-net + multi-queue. Multi-queue is only
         # requested when cpus > 1 because QEMU rejects queues=1 on tap.
-        cmd = ["qemu-system-x86_64", "-accel", "kvm", "-cpu", "host",
+        cmd = ["qemu-system-x86_64", "-machine", "q35", "-accel", "kvm", "-cpu", "host",
                "-m", "128", "-smp", str(cpus), "-nographic",
                "-serial", f"file:/tmp/bench_{port}.log", "-no-reboot"]
         # The host tap0 is created with IFF_MULTI_QUEUE; QEMU rejects

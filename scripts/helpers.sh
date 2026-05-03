@@ -37,6 +37,12 @@ detect_qemu() {
         QEMU_BIN="qemu-system-x86_64"
         VIRTIO_DEV="virtio-net-pci"
         KERNEL_ARG="$elf"
+        # Machine type: q35 (PCIe + ACPI MCFG) instead of QEMU's
+        # legacy i440fx default. MCFG is what the kernel walks at
+        # `pci::init` time to discover the ECAM base — without it
+        # x86 falls back to 0xCF8/0xCFC port-I/O config space, which
+        # is 2 vmexits per dword instead of 1 MMIO touch.
+        #
         # CPU model choice:
         #
         #   - Accelerated (KVM/HVF):  -cpu host  pass-through so the
@@ -57,14 +63,14 @@ detect_qemu() {
         # Mac is aarch64).
         if [[ "$(uname -m)" = "x86_64" ]]; then
             if [[ "$(uname -s)" = "Darwin" ]] && sysctl -n kern.hv_support 2>/dev/null | grep -q '^1$'; then
-                QEMU_MACHINE=(-cpu host -accel hvf)
+                QEMU_MACHINE=(-machine q35 -cpu host -accel hvf)
             elif [[ "$(uname -s)" = "Linux" ]] && [[ -r /dev/kvm ]]; then
-                QEMU_MACHINE=(-cpu host -accel kvm)
+                QEMU_MACHINE=(-machine q35 -cpu host -accel kvm)
             else
-                QEMU_MACHINE=(-cpu max)
+                QEMU_MACHINE=(-machine q35 -cpu max)
             fi
         else
-            QEMU_MACHINE=(-cpu max)
+            QEMU_MACHINE=(-machine q35 -cpu max)
         fi
     fi
 }

@@ -272,7 +272,7 @@ DEVICE="virtio-net-pci,netdev=net0,mac=${GUEST_MAC},mq=on,vectors=$((2*NQUEUES+2
 
 sudo rm -f /tmp/webserver.sock /tmp/qemu.out
 nohup sudo qemu-system-x86_64 \
-    -accel kvm \
+    -machine q35 -accel kvm \
     -kernel "$HOME/webserver.elf" \
     -m "$MEMORY" -smp "$CPUS" \
     -cpu host \
@@ -374,7 +374,7 @@ VM_LOG_EARLY="${VM_LOG}.early"
 # platform, mem, irq, smp) land in $VM_LOG_EARLY via 16550. Apps
 # that don't care about per-stage attribution can just `cat` both.
 qemu-system-x86_64 \
-    -accel kvm \
+    -machine q35 -accel kvm \
     -kernel ~/webserver.elf -m 128 \
     -cpu host \
     -device virtio-net-pci,netdev=net0 \
@@ -462,7 +462,7 @@ DEVICE="virtio-net-pci,netdev=net0,mac=${GUEST_MAC},mq=on,vectors=$((2*NQUEUES+2
 
 sudo rm -f /tmp/webserver.log /tmp/qemu.out
 nohup sudo qemu-system-x86_64 \
-    -accel kvm \
+    -machine q35 -accel kvm \
     -kernel "$HOME/webserver.elf" \
     -m "$MEMORY" -smp "$CPUS" \
     -cpu host \
