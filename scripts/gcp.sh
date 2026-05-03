@@ -365,20 +365,22 @@ UDP_PORT=$((PORT + 1))
 FAILURES=0
 
 VM_LOG=$(mktemp)
-# Two-stage console: 16550 emits the few pre-PCI lines via the
-# `-serial file:` chardev, virtio-console-pci emits the post-PCI
-# bulk to a second chardev backed by the same file (append=on, so
-# both fds atomic-append; their writes don't actually interleave
-# in practice because the kernel switches over once and never
-# back). The kernel's `serial::upgrade_after_pci` does the switch.
+VM_LOG_EARLY="${VM_LOG}.early"
+# Two-stage console — QEMU forbids sharing one chardev between
+# `-serial` and `virtconsole`, so we route them to separate files
+# and the test concatenates them for assertions. The bulk of boot
+# (everything emitted after `serial::upgrade_after_pci`) lands in
+# $VM_LOG via virtio-console; the few pre-PCI lines (banner, cpu,
+# platform, mem, irq, smp) land in $VM_LOG_EARLY via 16550. Apps
+# that don't care about per-stage attribution can just `cat` both.
 qemu-system-x86_64 \
     -accel kvm \
     -kernel ~/webserver.elf -m 128 \
     -cpu host \
     -device virtio-net-pci,netdev=net0 \
     -netdev "user,id=net0,hostfwd=tcp::${PORT}-:80,hostfwd=udp::${UDP_PORT}-:7" \
-    -chardev "file,id=ch_log,path=${VM_LOG},append=on" \
-    -serial "file:${VM_LOG}" \
+    -chardev "file,id=ch_log,path=${VM_LOG}" \
+    -serial "file:${VM_LOG_EARLY}" \
     -device virtio-serial-pci,id=virtio-serial0 \
     -device virtconsole,chardev=ch_log \
     -display none -no-reboot &
@@ -392,10 +394,10 @@ for i in $(seq 1 60); do
         echo "  Ready in ${i}s"; break
     fi
     if ! kill -0 "$VM_PID" 2>/dev/null; then
-        echo "ERROR: QEMU exited early"; cat "$VM_LOG" >&2; exit 1
+        echo "ERROR: QEMU exited early"; cat "$VM_LOG_EARLY" "$VM_LOG" >&2; exit 1
     fi
     if [ "$i" -eq 60 ]; then
-        echo "ERROR: not ready after 60s"; cat "$VM_LOG" >&2; exit 1
+        echo "ERROR: not ready after 60s"; cat "$VM_LOG_EARLY" "$VM_LOG" >&2; exit 1
     fi
 done
 
@@ -439,7 +441,7 @@ fi
 
 echo ""
 [[ $FAILURES -eq 0 ]] && echo "ALL TESTS PASSED" && exit 0
-echo "$FAILURES TEST(S) FAILED"; tail -40 "$VM_LOG" >&2; exit 1
+echo "$FAILURES TEST(S) FAILED"; tail -40 "$VM_LOG_EARLY" "$VM_LOG" >&2; exit 1
 REMOTE
         ;;
 

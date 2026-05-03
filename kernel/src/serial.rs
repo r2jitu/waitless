@@ -90,6 +90,12 @@ mod x86 {
         }
     }
 
+    /// True if `upgrade_to_virtio_console` succeeded and subsequent
+    /// output is going through the batched virtio path.
+    pub fn is_virtio_console_active() -> bool {
+        USE_VIRTIO_CONSOLE.load(Ordering::Acquire)
+    }
+
     /// Emit `len` bytes to the active backend. One vmexit per
     /// ≤256-byte chunk on virtio-console-pci; one per byte on
     /// 16550 (early-boot fallback). Caller holds SERIAL_TX_LOCK.
@@ -401,7 +407,9 @@ pub fn init() {
 
 /// Try to upgrade the early-boot console to virtio-console-pci.
 /// Caller must run this AFTER `uni_drivers::pci::init()` has
-/// populated the PCI device table.
+/// populated the PCI device table. Returns `true` if the upgrade
+/// succeeded — caller can use this to log a "console:
+/// virtio-console-pci" diagnostic.
 ///
 /// On x86 the early-boot console is the 16550 UART (port-IO,
 /// 1 vmexit per byte). Once virtio-serial-pci is reachable —
@@ -413,10 +421,15 @@ pub fn init() {
 ///
 /// On aarch64 the existing `aarch64::init` already picks the
 /// best backend from the FDT (PL011 / virtio-mmio /
-/// virtio-pci-console), so this is a no-op.
-pub fn upgrade_after_pci() {
+/// virtio-pci-console), so this is a no-op and returns `false`.
+pub fn upgrade_after_pci() -> bool {
     #[cfg(target_arch = "x86_64")]
-    x86::upgrade_to_virtio_console();
+    {
+        x86::upgrade_to_virtio_console();
+        return x86::is_virtio_console_active();
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    false
 }
 
 pub fn putc(c: u8) {

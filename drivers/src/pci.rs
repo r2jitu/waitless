@@ -323,6 +323,12 @@ pub fn pci_device(idx: usize) -> PciDevice {
     PCI_DEVICES.lock().devices[idx]
 }
 
+/// Number of PCI devices found on bus 0 by `init`. Boot-log diagnostic
+/// only — most callers should use `find_device(vendor, device)`.
+pub fn device_count() -> usize {
+    PCI_DEVICES.lock().count
+}
+
 pub fn enable_bus_mastering_inner(slot: u8) {
     #[cfg(target_arch = "aarch64")]
     {
