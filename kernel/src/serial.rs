@@ -72,9 +72,11 @@ mod x86 {
             // memory speed. The poll was a port-IO `inb` that costs
             // a vmexit on KVM and roughly nothing on TCG, but
             // either way it doubled the per-byte log cost without
-            // improving correctness on any virt target. On real
-            // 16550 silicon the FIFO would matter at baud-rate
-            // speed; we don't run on bare 16550 silicon.
+            // improving correctness on any virt target.
+            //
+            // We also tested `rep outsb` for KVM string-IO batching
+            // on GCE; nested KVM didn't measurably beat the byte
+            // loop (vmexit cost is not the dominant factor there).
             outb(COM1 + THR, c);
         }
     }

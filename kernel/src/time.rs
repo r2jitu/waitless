@@ -54,19 +54,114 @@ pub fn cycles_per_us() -> u64 {
     if cached != 0 {
         return cached.max(1);
     }
-    // Try CPUID-based fast path first — leaves 0x15 (TSC/core-crystal-
-    // clock ratio + nominal frequency) and 0x16 (CPU base/max
-    // frequency) cover modern Intel + AMD without the 10 ms PIT wait.
-    // Falls back to PIT calibration when neither leaf is informative
-    // (older CPUs, some hypervisors). Saves ~10 ms of boot-time
-    // serial output on KVM/TCG x86 (the first timestamp emission
-    // triggered the calibration before this).
+    // Probe order, fastest first:
+    //  1. KVM pvclock (CPUID 0x40000001 bit 3) — derives TSC freq
+    //     from `tsc_to_system_mul` + `tsc_shift` in the
+    //     `pvclock_vcpu_time_info` struct the hypervisor populates
+    //     after we write GPA|1 to MSR_KVM_SYSTEM_TIME_NEW. ~1 µs.
+    //     Standard KVM exposes this; GCE's nested KVM does too.
+    //     Eliminates the otherwise-mandatory PIT wait on `-cpu host`
+    //     where leaves 0x15/0x16 are masked out.
+    //  2. CPUID leaves 0x15/0x16 — works on modern Intel/AMD when
+    //     the hypervisor passes them through (QEMU TCG, real bare
+    //     metal, some KVMs).
+    //  3. PIT calibration — the always-correct fallback. ~1 ms.
+    if let Some(rate) = kvmclock_tsc_per_us() {
+        X86_TSC_PER_US.store(rate, core::sync::atomic::Ordering::Relaxed);
+        return rate.max(1);
+    }
     if let Some(rate) = cpuid_tsc_per_us() {
         X86_TSC_PER_US.store(rate, core::sync::atomic::Ordering::Relaxed);
         return rate.max(1);
     }
     udelay(0);
     X86_TSC_PER_US.load(core::sync::atomic::Ordering::Relaxed).max(1)
+}
+
+/// Try to derive TSC frequency from KVM's pvclock paravirt interface.
+/// The `pvclock_vcpu_time_info` struct (Linux: `arch/x86/include/asm/pvclock-abi.h`)
+/// gives us a TSC→nanosecond mapping; rearrange to get cycles per µs.
+/// Returns None on any non-KVM host or if the feature bit is clear.
+#[cfg(target_arch = "x86_64")]
+fn kvmclock_tsc_per_us() -> Option<u64> {
+    // CPUID 0x40000000: hypervisor signature. KVM identifies as
+    // "KVMKVMKVM\0\0\0" in EBX/ECX/EDX. Treat anything else as
+    // "no KVM pvclock here" — Hyper-V / Xen / VMware advertise
+    // different feature MSRs.
+    let sig = cpuid_x86(0x40000000);
+    if sig.0 < 0x40000001 { return None; }
+    let kvm_sig = (sig.1, sig.2, sig.3);
+    if kvm_sig != (0x4b4d564b, 0x564b4d56, 0x0000004d) {
+        return None;
+    }
+    // CPUID 0x40000001: KVM features. Bit 3 = CLOCKSOURCE2.
+    let feat = cpuid_x86(0x40000001);
+    if feat.0 & (1 << 3) == 0 { return None; }
+
+    // 32-byte aligned BSS-resident struct (matches Linux's pvclock-abi).
+    #[repr(C, align(32))]
+    struct PvClock {
+        version: u32,
+        pad0: u32,
+        tsc_timestamp: u64,
+        system_time: u64,
+        tsc_to_system_mul: u32,
+        tsc_shift: i8,
+        flags: u8,
+        pad: [u8; 2],
+    }
+    static mut PVCLOCK: PvClock = PvClock {
+        version: 0, pad0: 0, tsc_timestamp: 0, system_time: 0,
+        tsc_to_system_mul: 0, tsc_shift: 0, flags: 0, pad: [0; 2],
+    };
+
+    // SAFETY: BSS-resident static; called single-threaded at boot.
+    let pv_ptr = &raw mut PVCLOCK;
+    let gpa = pv_ptr as u64;
+    // Write MSR 0x4b564d01 (MSR_KVM_SYSTEM_TIME_NEW) with GPA | 1
+    // (low bit = enable). The hypervisor starts updating the struct.
+    unsafe {
+        let val = gpa | 1;
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") 0x4b564d01u32,
+            in("eax") val as u32,
+            in("edx") (val >> 32) as u32,
+            options(nomem, nostack),
+        );
+    }
+
+    // Read with the standard "even version → re-read after fields"
+    // protocol so we don't observe an in-flight update. Two iterations
+    // is enough; if we lose twice we fall through to PIT.
+    for _ in 0..2 {
+        let v1 = unsafe { core::ptr::read_volatile(&raw const (*pv_ptr).version) };
+        if v1 & 1 == 0 {
+            let mul = unsafe { core::ptr::read_volatile(&raw const (*pv_ptr).tsc_to_system_mul) };
+            let shift = unsafe { core::ptr::read_volatile(&raw const (*pv_ptr).tsc_shift) };
+            let v2 = unsafe { core::ptr::read_volatile(&raw const (*pv_ptr).version) };
+            if v2 == v1 && mul != 0 {
+                // pvclock conversion: ns_delta = tsc_delta * mul >> (32 - shift)
+                // (shift is signed: positive shifts left, negative shifts right
+                // beyond the implicit 32-bit shift baked into the mul).
+                // Inverting: TSC_HZ = (1 << (32 - shift)) * 1e9 / mul,
+                // so cycles_per_us = TSC_HZ / 1e6.
+                let total_shift = 32i32 - shift as i32;
+                if total_shift < 0 || total_shift > 63 {
+                    return None;
+                }
+                let scale: u64 = 1u64 << total_shift;
+                // tsc_per_us = scale * 1000 / mul (after dividing 1e9 → 1e6).
+                let tsc_per_us = scale.saturating_mul(1000) / mul as u64;
+                if tsc_per_us == 0 {
+                    return None;
+                }
+                return Some(tsc_per_us);
+            }
+        }
+        core::hint::spin_loop();
+    }
+    None
 }
 
 #[cfg(target_arch = "x86_64")]

@@ -304,7 +304,6 @@ fn init_inner() {
             }
         }
     }
-
 }
 
 pub fn find_device(vendor_id: u16, device_id: u16) -> Option<usize> {
