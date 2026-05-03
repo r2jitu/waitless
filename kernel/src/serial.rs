@@ -19,6 +19,7 @@
 #[cfg(target_arch = "x86_64")]
 mod x86 {
     use core::arch::asm;
+    use core::sync::atomic::{AtomicBool, Ordering};
 
     const COM1: u16 = 0x3F8;
     const RBR: u16 = 0; // Receive Buffer Register (read, DLAB=0)
@@ -30,6 +31,19 @@ mod x86 {
     const LCR: u16 = 3; // Line Control Register
     const MCR: u16 = 4; // Modem Control Register
     const LSR: u16 = 5; // Line Status Register
+
+    /// Two-stage console: 16550 (port-IO) is used for early boot
+    /// before `pci::init` runs, then we try to upgrade to
+    /// virtio-console-pci which batches output (one vmexit per
+    /// ≤256-byte chunk vs one per byte for 16550). The early-stage
+    /// 16550 path stays available as a fallback if QEMU's command
+    /// line doesn't expose a virtio-serial-pci device.
+    static USE_VIRTIO_CONSOLE: AtomicBool = AtomicBool::new(false);
+
+    unsafe extern "C" {
+        fn virtio_console_init_pci() -> bool;
+        fn virtio_console_puts(ptr: *const u8, len: usize);
+    }
 
     #[inline(always)]
     unsafe fn outb(port: u16, val: u8) {
@@ -65,23 +79,38 @@ mod x86 {
         }
     }
 
-    pub unsafe fn putc(c: u8) {
-        unsafe {
-            // No LSR-empty poll — every emulated 16550 path (QEMU,
-            // KVM, HVF/limine) drains THR synchronously / at host
-            // memory speed. The poll was a port-IO `inb` that costs
-            // a vmexit on KVM and roughly nothing on TCG, but
-            // either way it doubled the per-byte log cost without
-            // improving correctness on any virt target.
-            //
-            // We also tested `rep outsb` for KVM string-IO batching
-            // on GCE; nested KVM didn't measurably beat the byte
-            // loop (vmexit cost is not the dominant factor there).
-            outb(COM1 + THR, c);
+    /// Probe for virtio-console-pci. Caller must run this AFTER
+    /// `pci::init()` has scanned the PCI bus. On success, all
+    /// subsequent `puts_raw` calls switch to the batched path —
+    /// boot lines emitted before this point stay on the 16550
+    /// stream so `-serial`-driven log capture still sees them.
+    pub fn upgrade_to_virtio_console() {
+        if unsafe { virtio_console_init_pci() } {
+            USE_VIRTIO_CONSOLE.store(true, Ordering::Release);
+        }
+    }
+
+    /// Emit `len` bytes to the active backend. One vmexit per
+    /// ≤256-byte chunk on virtio-console-pci; one per byte on
+    /// 16550 (early-boot fallback). Caller holds SERIAL_TX_LOCK.
+    pub unsafe fn puts_raw(ptr: *const u8, len: usize) {
+        if USE_VIRTIO_CONSOLE.load(Ordering::Acquire) {
+            unsafe { virtio_console_puts(ptr, len); }
+            return;
+        }
+        // 16550 fallback: per-byte port I/O. No LSR-empty poll —
+        // every emulated 16550 path drains THR synchronously.
+        let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+        for &b in bytes {
+            unsafe { outb(COM1 + THR, b); }
         }
     }
 
     pub unsafe fn try_getc() -> i32 {
+        if USE_VIRTIO_CONSOLE.load(Ordering::Acquire) {
+            unsafe extern "C" { fn virtio_console_try_getc() -> i32; }
+            return unsafe { virtio_console_try_getc() };
+        }
         unsafe {
             // LSR bit 0 = Data Ready
             if (inb(COM1 + LSR) & 0x01) != 0 {
@@ -94,7 +123,9 @@ mod x86 {
 
     pub unsafe fn enable_rx_irq() {
         unsafe {
-            // Enable ERBFI (Received Data Available Interrupt)
+            // Enable ERBFI (Received Data Available Interrupt).
+            // Only meaningful when the 16550 backend is in use;
+            // virtio-console RX is polled from `try_getc`.
             outb(COM1 + IER, 0x01);
         }
     }
@@ -356,7 +387,7 @@ unsafe fn arch_puts_raw(bytes: &[u8]) {
     #[cfg(target_arch = "aarch64")]
     unsafe { aarch64::puts_raw(bytes); }
     #[cfg(target_arch = "x86_64")]
-    unsafe { for &b in bytes { x86::putc(b); } }
+    unsafe { x86::puts_raw(bytes.as_ptr(), bytes.len()); }
 }
 
 pub fn init() {
@@ -366,6 +397,26 @@ pub fn init() {
         #[cfg(target_arch = "aarch64")]
         aarch64::init();
     }
+}
+
+/// Try to upgrade the early-boot console to virtio-console-pci.
+/// Caller must run this AFTER `uni_drivers::pci::init()` has
+/// populated the PCI device table.
+///
+/// On x86 the early-boot console is the 16550 UART (port-IO,
+/// 1 vmexit per byte). Once virtio-serial-pci is reachable —
+/// QEMU/KVM with `-device virtio-serial-pci -device virtconsole`
+/// — switching to the virtio-console backend cuts log-line
+/// emission to 1 vmexit per ≤256-byte chunk. Boot is faster
+/// (fewer per-line vmexits during the listener-init phase) and
+/// runtime gets the same benefit for any post-boot output.
+///
+/// On aarch64 the existing `aarch64::init` already picks the
+/// best backend from the FDT (PL011 / virtio-mmio /
+/// virtio-pci-console), so this is a no-op.
+pub fn upgrade_after_pci() {
+    #[cfg(target_arch = "x86_64")]
+    x86::upgrade_to_virtio_console();
 }
 
 pub fn putc(c: u8) {

@@ -423,6 +423,15 @@ unsafe fn kernel_boot(info: &BootInfo) {
 
     uni_drivers::pci::init();
 
+    // Two-stage console: 16550 (x86) gives us early-boot output
+    // before the PCI bus is scanned; once `pci::init` completes we
+    // try to attach virtio-console-pci so subsequent log lines —
+    // most of boot, and all of runtime — emit through the batched
+    // virtio path (1 vmexit per ≤256-byte chunk vs 1 per byte for
+    // 16550). No-op on aarch64; that path's `serial::aarch64::init`
+    // already picks the best FDT-advertised backend.
+    serial::upgrade_after_pci();
+
     // NIC bring-up. `uni_drivers::net::init()` tries gVNIC first
     // (preferred on GCE — native RSS multi-queue) then falls back
     // to virtio-net (kvm-vm, HVF, default GCE instances).

@@ -365,13 +365,23 @@ UDP_PORT=$((PORT + 1))
 FAILURES=0
 
 VM_LOG=$(mktemp)
+# Two-stage console: 16550 emits the few pre-PCI lines via the
+# `-serial file:` chardev, virtio-console-pci emits the post-PCI
+# bulk to a second chardev backed by the same file (append=on, so
+# both fds atomic-append; their writes don't actually interleave
+# in practice because the kernel switches over once and never
+# back). The kernel's `serial::upgrade_after_pci` does the switch.
 qemu-system-x86_64 \
     -accel kvm \
     -kernel ~/webserver.elf -m 128 \
     -cpu host \
     -device virtio-net-pci,netdev=net0 \
     -netdev "user,id=net0,hostfwd=tcp::${PORT}-:80,hostfwd=udp::${UDP_PORT}-:7" \
-    -serial "file:${VM_LOG}" -display none -no-reboot &
+    -chardev "file,id=ch_log,path=${VM_LOG},append=on" \
+    -serial "file:${VM_LOG}" \
+    -device virtio-serial-pci,id=virtio-serial0 \
+    -device virtconsole,chardev=ch_log \
+    -display none -no-reboot &
 VM_PID=$!
 trap "kill $VM_PID 2>/dev/null; wait $VM_PID 2>/dev/null; rm -f $VM_LOG" EXIT
 
@@ -456,7 +466,10 @@ nohup sudo qemu-system-x86_64 \
     -cpu host \
     -device "$DEVICE" \
     -netdev "$NETDEV" \
+    -chardev file,id=ch_log,path=/tmp/webserver.log,append=on \
     -serial file:/tmp/webserver.log \
+    -device virtio-serial-pci,id=virtio-serial0 \
+    -device virtconsole,chardev=ch_log \
     -display none -no-reboot \
     </dev/null >/tmp/qemu.out 2>&1 &
 disown
