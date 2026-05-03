@@ -8,6 +8,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use crate::serial;
 use crate::mm;
+use crate::time;
 use super::apic;
 
 /// Per-core stack size: 64KB.
@@ -190,8 +191,16 @@ pub unsafe fn start_secondary_cores(cpu_count: u32) {
 
     let sipi_vector = (AP_TRAMPOLINE_ADDR / 0x1000) as u8;
 
+    // Broadcast INIT to all APs at once and pay the 10 ms post-INIT
+    // wait (Intel SDM Vol 3 8.4.4.1) only once instead of per AP.
+    // After INIT each AP is in wait-for-SIPI; SIPIs are still sent
+    // sequentially because each AP needs its own stack written into
+    // the shared trampoline page at offset 0xFF8 before it runs.
+    apic::send_init_broadcast();
+    time::udelay(10_000);
+
+    let topo = super::acpi::topology();
     for i in 1..count {
-        // Allocate stack
         let stack_pages = AP_STACK_SIZE / 4096;
         let stack_base = mm::alloc_pages(stack_pages);
         if stack_base == 0 {
@@ -199,27 +208,23 @@ pub unsafe fn start_secondary_cores(cpu_count: u32) {
             continue;
         }
         let stack_top = stack_base + AP_STACK_SIZE as u64;
-
-        // Write stack pointer at offset 0xFF8
         let stack_slot = (AP_TRAMPOLINE_ADDR + 0xFF8) as *mut u64;
         core::ptr::write_volatile(stack_slot, stack_top);
 
-        // INIT-SIPI-SIPI for this specific AP
-        let topo = super::acpi::topology();
         let target_apic_id = topo.apic_ids[i as usize] as u32;
         let expected = num_cores_online() + 1;
 
-        apic::send_init(target_apic_id);
-        for _ in 0..10_000_000u64 { core::hint::spin_loop(); }
         apic::send_sipi(target_apic_id, sipi_vector);
-        for _ in 0..1_000_000u64 { core::hint::spin_loop(); }
+        time::udelay(200); // 200 µs between SIPIs (per SDM)
         apic::send_sipi(target_apic_id, sipi_vector);
 
-        // Wait for this AP to come online before starting the next
-        for _ in 0..10_000_000u64 {
-            if num_cores_online() >= expected {
-                break;
-            }
+        // Wait up to 100 ms for the AP to come online before starting
+        // the next one (the trampoline page at 0x8000 is reused).
+        let deadline = time::now_cycles()
+            .wrapping_add(100_000 * time::cycles_per_us());
+        while num_cores_online() < expected
+            && time::now_cycles() < deadline
+        {
             core::hint::spin_loop();
         }
     }
