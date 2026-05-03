@@ -45,16 +45,23 @@ async fn init() {
     let backend_ip = net.gateway().0;
 
     uni::udp_listen(7, udp_echo).expect("udp echo bind");
+    uni::println!("listen udp://:7 (echo)");
     uni::tcp_listen(9, tcp_echo).expect("tcp echo bind");
+    uni::println!("listen tcp://:9 (echo)");
     uni::tcp_listen(GATEWAY_PORT, move |s| gateway(s, backend_ip))
         .expect("gateway bind");
+    uni::println!("listen tcp://:{} (gateway → udp://{}.{}.{}.{}:{})",
+        GATEWAY_PORT,
+        backend_ip[0], backend_ip[1], backend_ip[2], backend_ip[3],
+        GATEWAY_BACKEND_PORT);
     uni_http::listen(HTTP_PORT, handle_request).expect("http bind");
+    uni::println!("listen tcp://:{} (http)", HTTP_PORT);
 
     // HTTPS is opt-in: if the bundled dev cert/key don't parse,
     // log + skip rather than refuse to boot.
     match uni_tls::listen(HTTPS_PORT, handle_request, DEV_CERT_DER, DEV_KEY_PKCS8_DER) {
-        Ok(()) => uni::println!("HTTPS enabled"),
-        Err(_) => uni::println!("HTTPS disabled (cert/key invalid)"),
+        Ok(()) => uni::println!("listen tcp://:{} (https, TLS_CHACHA20_POLY1305_SHA256)", HTTPS_PORT),
+        Err(_) => uni::println!("[WARN] https disabled (cert/key invalid)"),
     }
 }
 
@@ -119,23 +126,17 @@ async fn handle_request(req: &Request) -> Response {
     }
 }
 
-/// Emit the contents of `uni::boot_info()` at startup. Line tags
-/// (`BOOT_INFO ram=...`) are stable so the integration test can
-/// grep them out of the serial log.
+/// Emit a single tight `app:` line proving `uni::boot_info()` is
+/// wired up at the user-facing API surface (CPU/RAM/NIC details
+/// already appear on the kernel-side boot lines, so we don't
+/// repeat them per-NIC). The `app: ` prefix is stable for the
+/// integration test.
 fn log_boot_info() {
     let bi = uni::boot_info();
     uni::println!(
-        "BOOT_INFO ram={} cpus={} nics={} boot_args=\"{}\"",
-        bi.ram_bytes, bi.num_cpus, bi.nics.len(), bi.boot_args,
+        "app: ram={}MB cpus={} nics={}",
+        bi.ram_bytes / (1024 * 1024), bi.num_cpus, bi.nics.len(),
     );
-    for (i, nic) in bi.nics.iter().enumerate() {
-        uni::println!(
-            "BOOT_INFO nic[{}] name={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} qps={}",
-            i, nic.name,
-            nic.mac[0], nic.mac[1], nic.mac[2], nic.mac[3], nic.mac[4], nic.mac[5],
-            nic.num_queue_pairs,
-        );
-    }
 }
 
 /// CPU-intensive work: iterative FNV-1a over 100K inputs. Dominates

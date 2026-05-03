@@ -385,7 +385,6 @@ where
     H: AsyncFn(&Request) -> Response + Send + Sync + 'static,
 {
     let listener = uni::runtime::TcpListener::bind(port)?;
-    uni::log(b"http: listening (plain)\n");
     let handler = Arc::new(handler);
     let h = listener.run(move |stream| {
         let handler = Arc::clone(&handler);
@@ -411,7 +410,6 @@ where
     H: AsyncFn(&Request) -> Response + Send + Sync + 'static,
 {
     let listener = uni::runtime::TcpListener::bind(port)?;
-    uni::log(b"http: listening (TLS)\n");
     let handler = Arc::new(handler);
     let h = listener.run(move |tcp| {
         let handler = Arc::clone(&handler);

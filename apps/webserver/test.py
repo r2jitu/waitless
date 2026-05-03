@@ -174,16 +174,19 @@ class WebserverServiceTest(unittest.TestCase):
         finally:
             s.close()
 
-    # ── Phase 0: boot_info surfaces through the serial log ───────
+    # ── boot_info surfaces through the serial log ───────────────
     def test_boot_info_logged(self) -> None:
-        """Webserver's startup log must contain a BOOT_INFO line sourced
-        from `uni::boot_info()`. This is the Phase 0 integration check
-        for the init-redesign plan — it confirms `boot_info()` is wired
-        up on whichever runner this test happens to be executing under
-        (hvf / qemu / iso / native)."""
+        """Webserver's startup log must contain an `app: ram=...` line
+        sourced from `uni::boot_info()` — the user-facing API check
+        that the boot snapshot makes it through the runfiles bundle on
+        whichever runner this test happens to be running under
+        (hvf / qemu / iso / native). Kernel-side hardware info appears
+        on separate `cpu:` / `mem:` / `nic:` lines from boot/entry.rs;
+        this assertion specifically guards the *app-visible* surface.
+        """
         log = self.launcher.log_path.read_bytes()
-        self.assertIn(b"BOOT_INFO ram=", log,
-                      f"BOOT_INFO line missing from serial log (length={len(log)})")
+        self.assertIn(b"app: ram=", log,
+                      f"app boot_info line missing from serial log (length={len(log)})")
         self.assertIn(b"cpus=", log)
 
 

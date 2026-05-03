@@ -6,7 +6,6 @@
 
 use crate::mm;
 use crate::mmio::{self, ReadWrite};
-use crate::serial;
 
 // ── Local APIC register layout ───────────────────────────────────────────────
 //
@@ -140,16 +139,11 @@ pub unsafe fn init() {
     // Timer = masked (not used yet)
     l.lvt_timer.write(0x10000);
 
-    let id = l.id.read() >> 24;
-    let ver = l.version.read() & 0xFF;
-    serial::puts(b"       APIC init: ID=");
-    let mut buf = [0u8; 16];
-    let len = fmt_u32(&mut buf, id);
-    serial::puts(&buf[..len]);
-    serial::puts(b" ver=0x");
-    let len = fmt_hex(&mut buf, ver);
-    serial::puts(&buf[..len]);
-    serial::puts(b"\n");
+    // Silent on success — the boot banner's `platform:` and `cpu:`
+    // lines already cover the diagnostic surface. Keep `id` / `ver`
+    // available for future debugging if a hypervisor turns up that
+    // reports surprising values.
+    let _ = (l.id.read() >> 24, l.version.read() & 0xFF);
 }
 
 /// Initialize the Local APIC on a secondary core (AP).
@@ -220,22 +214,3 @@ pub unsafe fn send_sipi_broadcast(vector: u8) {
     for _ in 0..100_000 { core::hint::spin_loop(); }
 }
 
-fn fmt_u32(buf: &mut [u8], mut val: u32) -> usize {
-    if val == 0 { buf[0] = b'0'; return 1; }
-    let mut tmp = [0u8; 10];
-    let mut len = 0;
-    while val > 0 { tmp[len] = b'0' + (val % 10) as u8; val /= 10; len += 1; }
-    for i in 0..len { buf[i] = tmp[len - 1 - i]; }
-    len
-}
-
-fn fmt_hex(buf: &mut [u8], val: u32) -> usize {
-    let hex = b"0123456789abcdef";
-    if val == 0 { buf[0] = b'0'; return 1; }
-    let mut tmp = [0u8; 8];
-    let mut len = 0;
-    let mut v = val;
-    while v > 0 { tmp[len] = hex[(v & 0xF) as usize]; v >>= 4; len += 1; }
-    for i in 0..len { buf[i] = tmp[len - 1 - i]; }
-    len
-}

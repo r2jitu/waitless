@@ -192,7 +192,6 @@ mod boot_shim_x86 {
                 _pad: 0,
             };
             info.memory_map_count = 1;
-            klog!("  Boot protocol: fallback (no boot info)\n");
             return;
         }
 
@@ -223,7 +222,6 @@ mod boot_shim_x86 {
             }
             info.memory_map_count = count as i32;
             info.rsdp_paddr = hvm.rsdp_paddr;
-            klog!("  Boot protocol: PVH ({} memory regions)\n", count);
             return;
         }
 
@@ -283,10 +281,6 @@ mod boot_shim_x86 {
                     ea += entry_size as u64;
                 }
                 info.memory_map_count = count as i32;
-                klog!(
-                    "  Boot protocol: Multiboot2 ({} memory regions)\n",
-                    count
-                );
                 return;
             }
         }
@@ -299,7 +293,6 @@ mod boot_shim_x86 {
             _pad: 0,
         };
         info.memory_map_count = 1;
-        klog!("  Boot protocol: fallback (unrecognized boot info)\n");
         }
     }
 }
@@ -335,11 +328,7 @@ mod boot_shim_fdt {
             _pad: 0,
         };
         info.memory_map_count = 1;
-        klog!(
-            "  Boot protocol: FDT (RAM 0x{:x} + {} MB)\n",
-            ram_base,
-            ram_size / (1024 * 1024)
-        );
+        let _ = (ram_base, ram_size);
         }
     }
 }
@@ -378,9 +367,6 @@ unsafe fn kernel_boot(info: &BootInfo) {
     exceptions::init();
 
     mm::init(info as *const BootInfo);
-    klog!("Heap: {} / {} MB\n",
-          mm::get_free_memory() / (1024 * 1024),
-          mm::get_total_memory() / (1024 * 1024));
 
     #[cfg(target_arch = "x86_64")]
     uni_kernel::x86_64::apic::init();
@@ -411,6 +397,20 @@ unsafe fn kernel_boot(info: &BootInfo) {
     #[cfg(target_arch = "aarch64")]
     uni_kernel::aarch64::smp::init_tls(0);
 
+    // ── Identity / platform / memory diagnostics ────────────────────
+    {
+        let mut buf = [0u8; 128];
+        let n = uni_kernel::cpu_info::summary(&mut buf);
+        // SAFETY: `summary` only writes ASCII chars produced via
+        // `core::fmt::Write` over a `&str`-backed source.
+        let cpu = core::str::from_utf8_unchecked(&buf[..n]);
+        klog!("cpu: {} × {}\n", cpu_count, cpu);
+    }
+    klog!("platform: {}\n", uni_kernel::cpu_info::hypervisor());
+    klog!("mem: {} / {} MB\n",
+          mm::get_free_memory() / (1024 * 1024),
+          mm::get_total_memory() / (1024 * 1024));
+
     uni_drivers::pci::init();
 
     // NIC bring-up. `uni_drivers::net::init()` tries gVNIC first
@@ -418,14 +418,15 @@ unsafe fn kernel_boot(info: &BootInfo) {
     // to virtio-net (kvm-vm, HVF, default GCE instances).
     let net_ok = uni_drivers::net::init();
     if !net_ok {
-        klog!("[WARN] no NIC found (neither gVNIC nor virtio-net)\n");
+        klog!("nic: none (no gVNIC, no virtio-net)\n");
     } else {
         // Cache MAC address for multi-core safe access.
         net::ethernet::init_mac();
         let mut mac = [0u8; 6];
         uni_drivers::net::get_mac(mac.as_mut_ptr());
-        klog!("NIC: {} {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
+        klog!("nic: {} qps={} {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
               uni_drivers::net::driver_name(),
+              uni_drivers::net::num_queue_pairs(),
               mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
         // IP bring-up (DHCP / static) happens inside the app's

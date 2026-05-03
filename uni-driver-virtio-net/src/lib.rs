@@ -1527,9 +1527,10 @@ fn init_msix_x86(dev: &VirtioPciDevice, num_pairs: usize) {
         vpci_set_queue_msix_vector(dev, NO_VEC);
     }
 
-    log(b"virtio_net: MSI-X enabled (");
-    log(&[b'0' + (num_pairs as u8 % 10)]);
-    log(b" RX vectors)\n");
+    // MSI-X enable is silent; the `nic:` line in the boot banner
+    // already shows `qps=N` which encodes whether multi-queue and
+    // therefore MSI-X is active.
+    let _ = num_pairs;
 }
 
 /// ISR trampoline for all virtio-net MSI-X RX vectors.

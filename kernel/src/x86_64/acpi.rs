@@ -219,14 +219,8 @@ pub unsafe fn detect_cpus() -> u32 {
     if count == 0 { count = 1; }
     topo.cpu_count = count;
     TOPOLOGY.init(topo);
-
-    let mut buf = [0u8; 32];
-    let mut pos = 0;
-    for &b in b"       ACPI: " { buf[pos] = b; pos += 1; }
-    pos += fmt_u32(&mut buf[pos..], count);
-    for &b in b" CPUs found\n" { buf[pos] = b; pos += 1; }
-    serial::puts(&buf[..pos]);
-
+    // CPU count is already surfaced in the boot banner's `cpu:` line;
+    // the per-table-source provenance isn't actionable.
     count
 }
 
@@ -235,11 +229,3 @@ pub fn topology() -> &'static CpuTopology {
     TOPOLOGY.get()
 }
 
-fn fmt_u32(buf: &mut [u8], mut val: u32) -> usize {
-    if val == 0 { buf[0] = b'0'; return 1; }
-    let mut tmp = [0u8; 10];
-    let mut len = 0;
-    while val > 0 { tmp[len] = b'0' + (val % 10) as u8; val /= 10; len += 1; }
-    for i in 0..len { buf[i] = tmp[len - 1 - i]; }
-    len
-}

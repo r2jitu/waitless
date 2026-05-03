@@ -21,6 +21,7 @@ pub mod percpu;
 pub mod eventloop;
 pub mod runtime;
 pub mod rng;
+pub mod cpu_info;
 
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;

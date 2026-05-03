@@ -242,7 +242,10 @@ mod aarch64 {
         c.ctlr.write(1);
         unsafe { asm!("dsb sy", "isb", options(nostack)); }
 
-        klog!("       GICv2 init: {} IRQ lines\n", num_irqs);
+        // Silent on success: the boot banner already prints
+        // `platform:` which encodes the GIC version, and the line
+        // count isn't actionable in steady state.
+        let _ = num_irqs;
     }
 
     // ---- GICv3 initialisation ---------------------------------------------
@@ -293,10 +296,8 @@ mod aarch64 {
 
             d.ctlr.write(GICD_CTLR_ARE_NS | GICD_CTLR_ENABLE_GRP1_NS);
             unsafe { asm!("dsb sy", options(nostack)); }
-            klog!("       GICv3 init: {} IRQ lines (full)\n", num_irqs);
-        } else {
-            klog!("       GICv3 init: {} IRQ lines (vGIC pre-configured)\n", num_irqs);
         }
+        let _ = num_irqs;
 
         // CPU interface (system registers) — always needed.
         // SAFETY: writing to ICC_* system registers is privileged but

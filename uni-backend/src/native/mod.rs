@@ -955,10 +955,28 @@ pub struct RunConfig {
 pub fn run(config: RunConfig) -> i32 {
     init_native();
 
+    // Boot banner — same shape as the bare-metal kernel's so users
+    // can `grep '^cpu:'` etc. across runners. POSIX has no equivalent
+    // of `[N.NNN]` timestamps because there's no kernel-controlled
+    // serial line we route everything through; standard write(2) to
+    // stderr is fine, untagged.
+    let host_cpus = num_cpus();
+    let ram_mb = host_ram_bytes() / (1024 * 1024);
+    let arch = if cfg!(target_arch = "aarch64") { "aarch64" }
+               else if cfg!(target_arch = "x86_64") { "x86_64" }
+               else { "unknown" };
+    let os = if cfg!(target_os = "macos") { "darwin" }
+             else if cfg!(target_os = "linux") { "linux" }
+             else { "posix" };
+    log(b"UniKernel v0.1.0 (native)\n");
+    log(format!("platform: {} ({})\n", os, arch).as_bytes());
+    log(format!("cpu: {} \u{00d7} host\n", host_cpus).as_bytes());
+    log(format!("mem: {} MB (host)\n", ram_mb).as_bytes());
+
     // Publish the boot-time snapshot via the uni-side callback. The
     // native backend has no NIC driver (POSIX sockets go through the
     // host stack), so nic info is filled in by the callback as empty.
-    (config.boot_info_fn)(num_cpus() as u32, host_ram_bytes());
+    (config.boot_info_fn)(host_cpus as u32, host_ram_bytes());
 
     unsafe {
         uni_init();
