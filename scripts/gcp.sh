@@ -188,10 +188,19 @@ case "$cmd" in
         echo "    Waiting for SSH..."
         sleep 5
         ip=$(_update_ssh_ip)
-        # Drop any stale known_hosts entry for the new IP — GCE re-rolls
-        # the external IP on every start so the old fingerprint is
-        # almost always wrong for the new host at the same address.
+        # Drop any stale known_hosts entries — GCE re-rolls the external
+        # IP on every start so the old fingerprint is almost always wrong
+        # for the new host. Wipe entries under BOTH the new IP and the
+        # SSH alias (`gcp`); ssh records hostnames as listed in the SSH
+        # config, so depending on prior connections either could be cached.
         ssh-keygen -R "$ip" >/dev/null 2>&1 || true
+        ssh-keygen -R "$SSH_HOST" >/dev/null 2>&1 || true
+        # First-touch trust: accept and pin the new host key on the next
+        # connection, then close. Subsequent ssh invocations don't need
+        # any extra flags.
+        ssh -o StrictHostKeyChecking=accept-new \
+            -o ConnectTimeout=10 \
+            "$SSH_HOST" true >/dev/null 2>&1 || true
         echo "    External IP: $ip (SSH config updated)"
         echo "    Connect: ssh $SSH_HOST"
         ;;
