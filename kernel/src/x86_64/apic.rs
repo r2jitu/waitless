@@ -171,18 +171,29 @@ pub unsafe fn send_ipi(target_apic_id: u32, vector: u8) {
     l.icr_lo.write(vector as u32);
 }
 
+/// Wait for any pending IPI to finish dispatching. ICR_LO bit 12
+/// ("Delivery Status") is set while an IPI is in flight and clears
+/// once the LAPIC has accepted it. Spins on that bit instead of a
+/// fixed 100K iteration loop — the wait is typically <100 cycles on
+/// KVM, vs ~1 ms for the fixed spin.
+#[inline]
+fn wait_ipi_idle(l: &ApicRegs) {
+    while (l.icr_lo.read() & (1 << 12)) != 0 {
+        core::hint::spin_loop();
+    }
+}
+
 /// Send INIT IPI to a target core.
 pub unsafe fn send_init(target_apic_id: u32) {
     let l = lapic();
     l.icr_hi.write(target_apic_id << 24);
     // INIT: delivery mode 101, level assert, edge
     l.icr_lo.write(0x00004500);
-    // Wait for delivery
-    for _ in 0..100_000 { core::hint::spin_loop(); }
+    wait_ipi_idle(l);
     // Deassert
     l.icr_hi.write(target_apic_id << 24);
     l.icr_lo.write(0x00008500);
-    for _ in 0..100_000 { core::hint::spin_loop(); }
+    wait_ipi_idle(l);
 }
 
 /// Send Startup IPI (SIPI) to a target core.
@@ -193,7 +204,7 @@ pub unsafe fn send_sipi(target_apic_id: u32, vector: u8) {
     l.icr_hi.write(target_apic_id << 24);
     // SIPI: delivery mode 110, vector = page number
     l.icr_lo.write(0x00004600 | vector as u32);
-    for _ in 0..100_000 { core::hint::spin_loop(); }
+    wait_ipi_idle(l);
 }
 
 /// Broadcast INIT to all cores except self.
@@ -202,7 +213,7 @@ pub unsafe fn send_init_broadcast() {
     l.icr_hi.write(0);
     // INIT (101), all excluding self (11 in bits 19:18)
     l.icr_lo.write(0x000C4500);
-    for _ in 0..100_000 { core::hint::spin_loop(); }
+    wait_ipi_idle(l);
 }
 
 /// Broadcast SIPI to all cores except self.
@@ -211,6 +222,6 @@ pub unsafe fn send_sipi_broadcast(vector: u8) {
     l.icr_hi.write(0);
     // SIPI (110), all excluding self (11 in bits 19:18)
     l.icr_lo.write(0x000C4600 | vector as u32);
-    for _ in 0..100_000 { core::hint::spin_loop(); }
+    wait_ipi_idle(l);
 }
 
