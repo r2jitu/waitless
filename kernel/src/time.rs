@@ -102,20 +102,8 @@ fn cpuid_tsc_per_us() -> Option<u64> {
 
 #[cfg(target_arch = "x86_64")]
 fn cpuid_x86(leaf: u32) -> (u32, u32, u32, u32) {
-    let (a, b, c, d): (u32, u32, u32, u32);
-    unsafe {
-        core::arch::asm!(
-            "mov {tmp:r}, rbx",
-            "cpuid",
-            "xchg {tmp:r}, rbx",
-            tmp = out(reg) b,
-            inout("eax") leaf => a,
-            inout("ecx") 0u32 => c,
-            out("edx") d,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-    (a, b, c, d)
+    let r = unsafe { core::arch::x86_64::__cpuid_count(leaf, 0) };
+    (r.eax, r.ebx, r.ecx, r.edx)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -205,7 +193,15 @@ pub fn udelay(us: u32) {
     let mut tsc_per_us = X86_TSC_PER_US.load(core::sync::atomic::Ordering::Relaxed);
     if tsc_per_us == 0 {
         unsafe {
-            const PIT_COUNT: u16 = 11932; // ~10ms
+            // PIT runs at 1.193 MHz; 1193 ticks ≈ 1 ms. The original
+            // 10 ms (11932) gave 0.05 % accuracy but blocked boot for
+            // the full window — visible as a 10 ms gap between the
+            // first two log lines on KVM where CPUID leaves 0x15/0x16
+            // are masked. 1 ms is good enough for boot-log timestamps
+            // and `udelay` (the only callers); a 1 % calibration error
+            // turns a 10 ms `udelay(10_000)` into 9.9–10.1 ms, well
+            // inside the SDM's INIT post-delay tolerance.
+            const PIT_COUNT: u16 = 1193;
             let gate = x86_inb(0x61);
             x86_outb(0x61, (gate & 0xFD) | 0x01);
             x86_outb(0x43, 0xB0);
@@ -219,7 +215,7 @@ pub fn udelay(us: u32) {
                 core::arch::asm!("nop");
             }
             let elapsed = x86_rdtsc() - start;
-            tsc_per_us = (elapsed / 10000).max(1);
+            tsc_per_us = (elapsed / 1000).max(1);
         }
         X86_TSC_PER_US.store(tsc_per_us, core::sync::atomic::Ordering::Relaxed);
     }

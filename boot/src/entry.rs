@@ -353,6 +353,16 @@ unsafe fn kernel_boot(info: &BootInfo) {
     // we want every subsequent log line's timestamp to include it.
     uni_kernel::time::mark_boot_start();
     serial::init();
+
+    // Force TSC calibration BEFORE the first log line. On x86 without
+    // CPUID 0x15/0x16 (which `-cpu host` masks out under standard KVM —
+    // max basic leaf reads as 0xd) `cycles_per_us` falls back to a PIT
+    // calibration; if that runs lazily inside the first `klog!`, the
+    // elapsed cycles for that line's timestamp are captured before the
+    // calibration delay, so the line shows `[0.000]` and every subsequent
+    // line is offset by the calibration cost. Eager calibration here
+    // keeps every timestamp truthful and lets us shorten the PIT window.
+    let _ = uni_kernel::time::cycles_per_us();
     #[cfg(target_arch = "aarch64")]
     klog!("UniKernel v0.1.0 (aarch64)\n");
     #[cfg(target_arch = "x86_64")]
