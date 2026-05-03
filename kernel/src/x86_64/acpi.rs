@@ -29,6 +29,9 @@ const RSDP_SIG: [u8; 8] = *b"RSD PTR ";
 /// MADT signature: "APIC"
 const MADT_SIG: [u8; 4] = *b"APIC";
 
+/// MCFG signature: PCIe Memory-Mapped Configuration table.
+const MCFG_SIG: [u8; 4] = *b"MCFG";
+
 /// Sanity cap on any ACPI table length. Real firmware tables are well
 /// under a page; anything larger means the length field is corrupted
 /// (or, on a hostile hypervisor, crafted). We refuse to walk past this.
@@ -88,9 +91,10 @@ unsafe fn find_rsdp_bios_scan() -> u64 {
 }
 
 /// Walk an RSDT (entry_size=4) or XSDT (entry_size=8) at `sdt_phys`
-/// and return the physical address of the first MADT (signature "APIC"),
-/// or 0 if absent or the length field is obviously bogus.
-unsafe fn find_madt(sdt_phys: u64, entry_size: u64) -> u64 {
+/// and return the physical address of the first table whose 4-byte
+/// signature matches `sig`, or 0 if absent or the length field is
+/// obviously bogus.
+unsafe fn find_table(sdt_phys: u64, entry_size: u64, sig: [u8; 4]) -> u64 {
     let sdt_len: u32 = read_phys(sdt_phys + 4);
     let sdt_len = sdt_len as usize;
     if sdt_len < SDT_HEADER_LEN || sdt_len > MAX_TABLE_LEN {
@@ -106,8 +110,8 @@ unsafe fn find_madt(sdt_phys: u64, entry_size: u64) -> u64 {
             read_phys::<u32>(entry_phys_addr) as u64
         };
         if entry_phys == 0 { continue; }
-        let sig: [u8; 4] = read_phys(entry_phys);
-        if sig == MADT_SIG {
+        let entry_sig: [u8; 4] = read_phys(entry_phys);
+        if entry_sig == sig {
             return entry_phys;
         }
     }
@@ -164,6 +168,37 @@ fn finish(topo: CpuTopology, msg: &[u8]) -> u32 {
     count
 }
 
+/// Locate the system root SDT (XSDT preferred on ACPI ≥ 2.0, RSDT on
+/// 1.0). Returns `(sdt_phys, entry_size_bytes)` where `entry_size` is
+/// 8 for XSDT and 4 for RSDT, or 0 / 0 if no RSDP was supplied.
+///
+/// SAFETY: dereferences boot-protocol or scan-derived physical
+/// addresses; caller relies on those being valid ACPI structures.
+unsafe fn locate_root_sdt() -> (u64, u64) {
+    // Prefer the boot-protocol RSDP hint; only fall back to the BIOS
+    // scan when no loader told us where to look. UEFI firmware (GCE's
+    // OVMF path) doesn't put the RSDP in 0xE0000–0xFFFFF, so the scan
+    // fails there.
+    let rsdp_addr = BOOT_RSDP_PADDR.load(core::sync::atomic::Ordering::Relaxed);
+    let rsdp_addr = if rsdp_addr != 0 { rsdp_addr } else { find_rsdp_bios_scan() };
+    if rsdp_addr == 0 {
+        return (0, 0);
+    }
+
+    // ACPI 1.0 RSDP carries a 32-bit RSDT pointer at offset 16.
+    // ACPI 2.0+ (revision >= 2) adds an 8-byte XSDT pointer at offset
+    // 24 with 64-bit entries. Modern firmware — and every UEFI path —
+    // reports rev=2, and may leave the old RSDT pointer 0.
+    let revision: u8 = read_phys(rsdp_addr + 15);
+    if revision >= 2 {
+        let xsdt: u64 = read_phys(rsdp_addr + 24);
+        if xsdt != 0 {
+            return (xsdt, 8);
+        }
+    }
+    (read_phys::<u32>(rsdp_addr + 16) as u64, 4)
+}
+
 /// Scan BIOS memory for RSDP, parse RSDT → MADT → CPU entries.
 /// Returns the number of CPUs found, or 1 if ACPI is unavailable.
 ///
@@ -180,37 +215,12 @@ pub unsafe fn detect_cpus() -> u32 {
         apic_ids: Vec::new(),
     };
 
-    // Prefer the boot-protocol RSDP hint; only fall back to the BIOS
-    // scan when no loader told us where to look. UEFI firmware (GCE's
-    // OVMF path) doesn't put the RSDP in 0xE0000–0xFFFFF, so the scan
-    // fails there — which is exactly how "ACPI: RSDP not found" and
-    // a silent single-core boot showed up on GCE.
-    let rsdp_addr = BOOT_RSDP_PADDR.load(core::sync::atomic::Ordering::Relaxed);
-    let rsdp_addr = if rsdp_addr != 0 { rsdp_addr } else { find_rsdp_bios_scan() };
-    if rsdp_addr == 0 {
+    let (sdt_phys, entry_size) = locate_root_sdt();
+    if sdt_phys == 0 {
         return finish(topo, b"       ACPI: RSDP not found\n");
     }
 
-    // ACPI 1.0 RSDP carries a 32-bit RSDT pointer at offset 16.
-    // ACPI 2.0+ (revision >= 2) adds an 8-byte XSDT pointer at offset
-    // 24 with 64-bit entries. Modern firmware — and every UEFI path —
-    // reports rev=2, and may leave the old RSDT pointer 0.
-    let revision: u8 = read_phys(rsdp_addr + 15);
-    let (sdt_phys, entry_size) = if revision >= 2 {
-        let xsdt: u64 = read_phys(rsdp_addr + 24);
-        if xsdt != 0 {
-            (xsdt, 8u64)
-        } else {
-            (read_phys::<u32>(rsdp_addr + 16) as u64, 4u64)
-        }
-    } else {
-        (read_phys::<u32>(rsdp_addr + 16) as u64, 4u64)
-    };
-    if sdt_phys == 0 {
-        return finish(topo, b"       ACPI: RSDT/XSDT address is 0\n");
-    }
-
-    let madt_addr = find_madt(sdt_phys, entry_size);
+    let madt_addr = find_table(sdt_phys, entry_size, MADT_SIG);
     if madt_addr == 0 {
         return finish(topo, b"       ACPI: MADT not found\n");
     }
@@ -227,5 +237,50 @@ pub unsafe fn detect_cpus() -> u32 {
 /// Get the discovered CPU topology. Panics if `detect_cpus` hasn't run.
 pub fn topology() -> &'static CpuTopology {
     TOPOLOGY.get()
+}
+
+/// Locate the ECAM (PCIe Memory-Mapped Configuration) base address for
+/// PCI segment 0, bus 0 via the ACPI MCFG table. Returns `None` if no
+/// RSDP was supplied, MCFG isn't present (legacy `pc`/`i440fx` machine
+/// types don't expose it), or its layout is invalid — caller falls back
+/// to the legacy 0xCF8/0xCFC port-I/O config mechanism in that case.
+///
+/// MCFG layout (PCI Firmware Spec 3.0 §4.1.2):
+///   +0   ACPI std header (36 bytes)
+///   +36  reserved (8 bytes)
+///   +44  array of "Configuration Space Base Address Allocation"
+///        entries, each 16 bytes:
+///          u64 base_address
+///          u16 pci_segment_group
+///          u8  start_bus_number
+///          u8  end_bus_number
+///          u32 reserved
+///
+/// We pick the first entry covering segment 0, bus 0 — on QEMU q35
+/// and GCE there is exactly one.
+pub unsafe fn mcfg_ecam_base() -> Option<u64> {
+    let (sdt_phys, entry_size) = locate_root_sdt();
+    if sdt_phys == 0 { return None; }
+
+    let mcfg = find_table(sdt_phys, entry_size, MCFG_SIG);
+    if mcfg == 0 { return None; }
+
+    let total_len: u32 = read_phys(mcfg + 4);
+    let total_len = total_len as usize;
+    // Header (36) + reserved (8) + at least one 16-byte allocation.
+    if total_len < 60 || total_len > MAX_TABLE_LEN { return None; }
+
+    let entries_off = (SDT_HEADER_LEN + 8) as u64;
+    let entry_count = (total_len - SDT_HEADER_LEN - 8) / 16;
+    for i in 0..entry_count as u64 {
+        let base = mcfg + entries_off + i * 16;
+        let segment: u16 = read_phys(base + 8);
+        let start_bus: u8 = read_phys(base + 10);
+        if segment == 0 && start_bus == 0 {
+            let phys: u64 = read_phys(base);
+            if phys != 0 { return Some(phys); }
+        }
+    }
+    None
 }
 

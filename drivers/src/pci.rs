@@ -71,14 +71,19 @@ static PCI_INITIALIZED: core::sync::atomic::AtomicBool =
 
 // ---- Config space access (arch-specific unsafe core) ------------------------
 
-/// ECAM base. Set once in `init_inner` from FDT (with a fallback
-/// constant for platforms that don't supply an ECAM node), read by
-/// every config-space access. `InitOnce` gives release/acquire
-/// publication; the volatile MMIO ops on the resulting address
-/// provide the actual hardware ordering.
-#[cfg(target_arch = "aarch64")]
-const ECAM_BASE_DEFAULT: u64 = 0x40_1000_0000;
-#[cfg(target_arch = "aarch64")]
+/// ECAM base. Set once during `init_inner`:
+///
+/// - aarch64: from the FDT `pci` node's `reg` property — always
+///   available on the supported platforms (QEMU virt, HVF runner,
+///   VZ.framework). Required.
+/// - x86_64: from the ACPI MCFG table when present (q35 + UEFI/SeaBIOS
+///   on KVM/TCG, GCE OVMF). Optional — legacy `pc`/`i440fx` machines
+///   don't expose MCFG, in which case config access falls back to the
+///   legacy 0xCF8/0xCFC port-I/O mechanism (slower: 2 vmexits per
+///   dword vs 1 MMIO touch).
+///
+/// `InitOnce` gives release/acquire publication; the volatile MMIO
+/// ops on the resulting address provide the actual hardware ordering.
 pub static G_ECAM_BASE: uni_kernel::once::InitOnce<u64> = uni_kernel::once::InitOnce::new();
 /// MMIO allocation pool cursor. Mutated by `assign_bars` during the
 /// init bus scan; the spinlock around it serialises future cross-core
@@ -91,7 +96,6 @@ const PCI_CONFIG_ADDR: u16 = 0x0CF8;
 #[cfg(target_arch = "x86_64")]
 const PCI_CONFIG_DATA: u16 = 0x0CFC;
 
-#[cfg(target_arch = "aarch64")]
 #[inline]
 fn ecam_addr(bus: u8, slot: u8, func: u8, offset: u8) -> u64 {
     let base = *G_ECAM_BASE.get();
@@ -107,6 +111,9 @@ pub fn read_config(bus: u8, slot: u8, func: u8, offset: u8) -> u32 {
     unsafe {
         #[cfg(target_arch = "x86_64")]
         {
+            if G_ECAM_BASE.try_get().is_some() {
+                return mmio_read32(ecam_addr(bus, slot, func, offset & 0xFC));
+            }
             let addr: u32 = (1 << 31)
                 | ((bus as u32) << 16)
                 | ((slot as u32) << 11)
@@ -127,6 +134,10 @@ pub fn write_config(bus: u8, slot: u8, func: u8, offset: u8, val: u32) {
     unsafe {
         #[cfg(target_arch = "x86_64")]
         {
+            if G_ECAM_BASE.try_get().is_some() {
+                mmio_write32(ecam_addr(bus, slot, func, offset & 0xFC), val);
+                return;
+            }
             let addr: u32 = (1 << 31)
                 | ((bus as u32) << 16)
                 | ((slot as u32) << 11)
@@ -142,7 +153,9 @@ pub fn write_config(bus: u8, slot: u8, func: u8, offset: u8, val: u32) {
     }
 }
 
-/// Read 16-bit PCI config register (aarch64 ECAM supports sub-dword access).
+/// Read 16-bit PCI config register. ECAM supports sub-dword access on
+/// both arches; on x86 without ECAM this is unreachable (callers gate
+/// on aarch64 today).
 #[cfg(target_arch = "aarch64")]
 pub fn read_config16(bus: u8, slot: u8, func: u8, offset: u8) -> u16 {
     unsafe { mmio_read16(ecam_addr(bus, slot, func, offset)) }
@@ -288,6 +301,18 @@ fn init_inner() {
             // virtio-console device, which assigns its BAR directly from
             // pci_mmio32_base before this allocator runs.
             *G_PCI_MEM_NEXT.lock() = fdt.pci_mmio32_base + 0x40_0000;
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Look up ECAM via ACPI MCFG so the bus scan below — and every
+        // future config-space access — uses 1-vmexit MMIO instead of
+        // 2-vmexit port-I/O (outl 0xCF8 + inl 0xCFC). On nested KVM
+        // this halves config-space cost; on legacy `pc`/`i440fx`
+        // machines (no MCFG) we silently fall back to port-I/O.
+        if let Some(base) = unsafe { uni_kernel::x86_64::acpi::mcfg_ecam_base() } {
+            G_ECAM_BASE.init(base);
         }
     }
 
