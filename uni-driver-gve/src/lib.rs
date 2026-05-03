@@ -562,14 +562,9 @@ fn init() -> bool {
     NUM_QP.store(num_qp as u16, Ordering::Release);
 
     post_initial_rx();
-
-    // Attempt to configure RSS so the device distributes incoming
-    // flows across our queue pairs by 4-tuple hash. Not fatal if
-    // rejected — the driver can still run on qp 0 — but we log it
-    // so the /stats output makes sense.
-    if num_qp > 1 {
-        configure_rss(num_qp);
-    }
+    // CONFIGURE_RSS already submitted into Phase B's batch by
+    // `create_all_queues_batched` and verified with the others;
+    // no separate admin-queue round-trip here.
 
     GVNIC_OK.store(true, Ordering::Release);
     log(b"[gvnic] ready (");
@@ -1083,7 +1078,23 @@ fn build_register_page_list_cmd(
 ///
 /// Returns true on success. On failure we log and continue —
 /// the driver still works with queue 0 handling all traffic.
-fn configure_rss(num_qp: u32) -> bool {
+/// Build a CONFIGURE_RSS command + its DMA-coherent backing
+/// allocations (Toeplitz key + 128-entry indirection LUT). The
+/// device processes admin commands in order, so this can be
+/// queued in the same `kick_and_wait` batch as the CREATE_*_QUEUE
+/// commands — the device sees CREATE_RX_QUEUE × N first, then
+/// reads the LUT pointing into queues that now exist. Saves ~3 ms
+/// of separate-batch wait time.
+///
+/// Payload (24 bytes at offset 8):
+///   u16 hash_types    (be)
+///   u8  hash_alg      (1 = Toeplitz)
+///   u8  reserved
+///   u16 hash_key_size (be)
+///   u16 hash_lut_size (be)
+///   u64 hash_key_addr (be, DMA)
+///   u64 hash_lut_addr (be, DMA)
+fn build_configure_rss_cmd(num_qp: u32) -> Option<AdminqCommand> {
     // Use Microsoft's standard Toeplitz RSS key. It's the
     // well-tested 40-byte key every Linux / Windows NIC driver
     // defaults to, and produces well-distributed hashes for
@@ -1110,7 +1121,7 @@ fn configure_rss(num_qp: u32) -> bool {
     let lut_phys = alloc_pages(1);
     if key_phys == 0 || lut_phys == 0 {
         log(b"[gvnic] RSS alloc failed\n");
-        return false;
+        return None;
     }
     unsafe {
         let key_va = phys_to_virt(key_phys);
@@ -1119,14 +1130,6 @@ fn configure_rss(num_qp: u32) -> bool {
         ptr::copy_nonoverlapping(lut_bytes.as_ptr(), lut_va, lut_bytes.len());
     }
 
-    // Payload (24 bytes at offset 8):
-    //   u16 hash_types    (be)
-    //   u8  hash_alg      (1 = Toeplitz)
-    //   u8  reserved
-    //   u16 hash_key_size (be)
-    //   u16 hash_lut_size (be)
-    //   u64 hash_key_addr (be, DMA)
-    //   u64 hash_lut_addr (be, DMA)
     let mut cmd = AdminqCommand::ZERO;
     put_be32(&mut cmd.bytes, 0, OP_CONFIGURE_RSS);
     let hash_types = RSS_HASH_TCPV4 | RSS_HASH_TCPV6 | RSS_HASH_UDPV4 | RSS_HASH_UDPV6;
@@ -1136,15 +1139,7 @@ fn configure_rss(num_qp: u32) -> bool {
     put_be16(&mut cmd.bytes, 14, RSS_LUT_SIZE as u16);
     put_be64(&mut cmd.bytes, 16, key_phys);
     put_be64(&mut cmd.bytes, 24, lut_phys);
-
-    if !execute_cmd(b"CONFIGURE_RSS", &cmd) {
-        log(b"[gvnic] RSS not configured (falling back to single-queue delivery)\n");
-        return false;
-    }
-    log(b"[gvnic] RSS configured across ");
-    log_u32(num_qp);
-    log(b" queue pairs\n");
-    true
+    Some(cmd)
 }
 
 /// Allocate a contiguous physical region of `num_pages` 4 KiB pages.
@@ -1408,9 +1403,11 @@ fn create_all_queues_batched(num_qp: u32) -> bool {
         if !check_slot_status(rx_rpl_slots[qp], b"REGISTER_PAGE_LIST rx") { return false; }
     }
 
-    // Phase B: CREATE_*_QUEUE × 2n (TX then RX), batched. The qres
-    // page contents are device-written, so finalize must run after
-    // the wait completes.
+    // Phase B: CREATE_*_QUEUE × 2n (TX then RX) + CONFIGURE_RSS,
+    // batched. The qres page contents are device-written, so
+    // finalize must run after the wait completes. CONFIGURE_RSS
+    // goes last in the batch so it processes after all the
+    // CREATE_RX_QUEUE commands that its LUT references.
     let mut tx_create_slots = [0usize; MAX_QUEUE_PAIRS];
     let mut rx_create_slots = [0usize; MAX_QUEUE_PAIRS];
     for qp in 0..n {
@@ -1427,6 +1424,18 @@ fn create_all_queues_batched(num_qp: u32) -> bool {
             None => return false,
         }
     }
+    let rss_slot = if num_qp > 1 {
+        let cmd = match build_configure_rss_cmd(num_qp) {
+            Some(c) => c,
+            None => return false,
+        };
+        match submit_no_wait(&cmd) {
+            Some((slot, prod)) => { last_prod = prod; Some(slot) }
+            None => return false,
+        }
+    } else {
+        None
+    };
     if !kick_and_wait_to(last_prod) { return false; }
     for qp in 0..n {
         if !check_slot_status(tx_create_slots[qp], b"CREATE_TX_QUEUE") { return false; }
@@ -1435,6 +1444,13 @@ fn create_all_queues_batched(num_qp: u32) -> bool {
     for qp in 0..n {
         if !check_slot_status(rx_create_slots[qp], b"CREATE_RX_QUEUE") { return false; }
         finalize_rx_queue(qp as u32, rx_allocs[qp].as_ref().unwrap());
+    }
+    if let Some(slot) = rss_slot {
+        // RSS failure is non-fatal — log and fall through to qp 0
+        // single-queue delivery, matching the previous behaviour.
+        if !check_slot_status(slot, b"CONFIGURE_RSS") {
+            log(b"[gvnic] RSS not configured (falling back to single-queue delivery)\n");
+        }
     }
 
     true
