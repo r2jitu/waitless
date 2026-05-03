@@ -52,12 +52,24 @@ pub fn num_cores_online() -> u32 {
 /// PSCI CPU_ON via HVC (QEMU virt uses PSCI 0.2 conduit=hvc).
 /// Returns 0 on success, negative PSCI error otherwise.
 /// PSCI CPU_ON via HVC (QEMU virt default conduit).
+///
+/// The return value is not reliably captured on HVF — the host's
+/// `hv_vcpu_set_reg(X0, PSCI_SUCCESS)` writeback is shadowed on
+/// resume by something in HVF's exception-state plumbing, so the
+/// guest reads back a stack-aliased kernel pointer regardless of
+/// what we set. The same asm captures non-zero sentinels correctly
+/// (we tested with 0xDEAD…BABE), which narrows it to HVF's handling
+/// of zero-valued GPR writebacks. QEMU TCG returns 0 properly.
+///
+/// Callers should treat this function as "side-effect only" and
+/// confirm AP startup by polling `NUM_CORES_ONLINE` rather than
+/// gating on the return value.
 fn psci_cpu_on(target_cpu: u64, entry_point: u64, context_id: u64) -> i64 {
     let ret: i64;
     unsafe {
         core::arch::asm!(
             "hvc #0",
-            inout("x0") 0xC400_0003u64 => ret,  // PSCI CPU_ON (SMC64)
+            inout("x0") 0xC400_0003u64 => ret,
             in("x1") target_cpu,
             in("x2") entry_point,
             in("x3") context_id,
@@ -100,9 +112,43 @@ pub unsafe fn start_secondary_cores(cpu_count: u32) {
         // Cast through a function pointer first; rust 1.93+ rejects
         // casting a function item directly to an integer.
         let entry = ap_trampoline as unsafe extern "C" fn() as u64;
-        let ret = psci_cpu_on(i as u64, entry, stack_top);
-        if ret != 0 {
-            serial::puts(b"[SMP] PSCI CPU_ON failed\n");
+        // PSCI return doesn't survive the HVF X0 writeback (see
+        // `psci_cpu_on` docs), so we don't gate the loop on it. The
+        // AP-incremented online counter is the source of truth, and
+        // we wait briefly for each AP before moving to the next
+        // because:
+        //   1. ap_entry's first runtime tick lazily allocates this
+        //      core's TaskArena (~2 MB). Without serialisation,
+        //      several APs racing into the heap allocator at once
+        //      can OOM each other before the BSP's next stack
+        //      allocation runs.
+        //   2. Per-AP latency on PSCI CPU_ON via HVF is sub-ms, so
+        //      the wait barely costs anything in the success path.
+        // PSCI return doesn't survive HVF's X0 writeback (see
+        // `psci_cpu_on` docs), so we don't trust it. Wait for the
+        // AP to increment the online counter before launching the
+        // next one, with a generous spin budget rather than a
+        // wall-clock deadline (now_cycles can read stale values
+        // when LLVM hoists the mrs instruction). The wait also
+        // serializes per-AP heap allocation: without it, multiple
+        // APs racing into `eventloop::run` → first `tick` →
+        // `TaskArena::new()` exhaust the heap before the BSP's
+        // next stack alloc.
+        // Wait briefly for the AP to come online. PSCI's return code
+        // doesn't survive HVF's X0 writeback (see `psci_cpu_on` docs)
+        // so we use the AP-incremented counter as ground truth, bounded
+        // by `udelay`-paced retries. The wait also serializes per-AP
+        // heap allocation: without it, multiple APs racing into
+        // `eventloop::run` → first `tick` → `TaskArena::new()` exhaust
+        // the heap before the BSP's next stack alloc.
+        let before = NUM_CORES_ONLINE.load(Ordering::Acquire);
+        let _ = psci_cpu_on(i as u64, entry, stack_top);
+        for _ in 0..500 {
+            if NUM_CORES_ONLINE.load(Ordering::Acquire) > before { break; }
+            crate::time::udelay(100); // 100 µs × 500 = 50 ms cap
+        }
+        if NUM_CORES_ONLINE.load(Ordering::Acquire) <= before {
+            serial::puts(b"[SMP] core failed to come online\n");
         }
     }
 }
