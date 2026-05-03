@@ -197,13 +197,28 @@ fn vpci_parse_caps(dev: &mut VirtioPciDevice) -> bool {
 /// Find a modern virtio-pci device by type (1=net, 3=console).
 /// Tries non-transitional ID (0x1040+type) first, then transitional
 /// ID (0x1000-range) which QEMU uses by default.
+///
+/// Modern PCI IDs follow `0x1040 + type`; transitional IDs are
+/// per-device-class and don't follow a clean formula (the v0.9.5
+/// allocations were chosen before virtio types stabilised). Map
+/// the ones we care about explicitly; unrecognised types fall
+/// through to a "no transitional" lookup, returning None for that
+/// path (callers still get the modern probe).
 pub fn vpci_find(virtio_device_type: u16) -> Option<usize> {
     let modern_id = 0x1040 + virtio_device_type;
-    // Transitional IDs: net=0x1000, block=0x1001, console=0x1003
-    let transitional_id = 0x1000 + virtio_device_type - 1;
+    let transitional_id: Option<u16> = match virtio_device_type {
+        1 => Some(0x1000), // network card
+        2 => Some(0x1001), // block device
+        3 => Some(0x1003), // console (skips 0x1002 which is balloon)
+        4 => Some(0x1005), // entropy
+        5 => Some(0x1002), // balloon (yes — out of order in v0.9.5)
+        8 => Some(0x1004), // SCSI host
+        9 => Some(0x1009), // 9P transport
+        _ => None,
+    };
 
     let pci_idx = find_device(0x1AF4, modern_id)
-        .or_else(|| find_device(0x1AF4, transitional_id))?;
+        .or_else(|| transitional_id.and_then(|tid| find_device(0x1AF4, tid)))?;
 
     enable_bus_mastering_inner(pci_device(pci_idx).slot);
 
