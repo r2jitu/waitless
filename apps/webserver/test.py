@@ -42,10 +42,9 @@ ROOT = runfiles_root()
 LAUNCHER_NAME = os.environ["LAUNCHER_NAME"]
 LAUNCHER = ROOT / "apps" / "webserver" / LAUNCHER_NAME
 DEV_CERT = ROOT / "apps" / "webserver" / "dev_certs" / "dev_cert.pem"
-# Matches both unikernel boot (`[BOOT] Entering event loop on core 0.`)
-# and native POSIX (`Entering event loop.` from the app's boot()
-# function before server.run()).
-BOOT_MARKER = b"Entering event loop"
+# Stable end-of-init marker emitted by `#[uni::init]` after the
+# user's body returns. Same line on every runner (HVF / QEMU / native).
+BOOT_MARKER = b"ready"
 
 PORT = int(os.environ.get("TEST_PORT", 18080))
 TLS_PORT = int(os.environ.get("TEST_TLS_PORT", 18443))

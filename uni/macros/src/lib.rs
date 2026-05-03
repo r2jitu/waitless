@@ -69,7 +69,7 @@ pub fn uni_init() {{
         {body_call};
         ::uni::_install_shutdown_hook();
         ::uni::set_ready();
-        ::uni::log(b"Entering event loop\n");
+        ::uni::log(b"ready\n");
     }});
 }}
 "#,
