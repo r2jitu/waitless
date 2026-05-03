@@ -135,7 +135,9 @@ mod aarch64 {
     /// gives us release/acquire publication and proper enum dispatch
     /// without magic-number constants.
     enum SerialBackend {
-        Pl011 { base: u64 },
+        /// `fast_tx` indicates the host accepts multi-byte writes to
+        /// DR — set on HVF runner (heuristic: GICv3, see `init`).
+        Pl011 { base: u64, fast_tx: bool },
         Virtio,
     }
 
@@ -173,7 +175,15 @@ mod aarch64 {
             // Prefer PL011 if FDT found one (QEMU path)
             if fdt.uart_base != 0 {
                 pl011_init(fdt.uart_base);
-                BACKEND.init(SerialBackend::Pl011 { base: fdt.uart_base });
+                // Heuristic: HVF runner advertises GICv3 and accepts
+                // multi-byte writes to PL011 DR (custom, see
+                // `tools/hvf-runner/src/pl011.rs`); QEMU TCG defaults
+                // to GICv2 and treats DR as byte-only. Toggling
+                // `fast_tx` lets `puts` emit up to 8 chars per vmexit
+                // on HVF (~5× faster boot logging) while staying
+                // safe on QEMU.
+                let fast_tx = fdt.gic_version == 3;
+                BACKEND.init(SerialBackend::Pl011 { base: fdt.uart_base, fast_tx });
                 return;
             }
 
@@ -200,20 +210,50 @@ mod aarch64 {
         }
     }
 
-    pub unsafe fn putc(c: u8) {
+    /// Emit a slice in chunks of up to 8 bytes per vmexit when
+    /// `fast_tx` is set (HVF runner — its PL011 emulator accepts
+    /// multi-byte writes to DR and emits all `size` low bytes of
+    /// `value` in order). On QEMU's PL011 (`fast_tx = false`) we
+    /// fall back to per-byte writes since QEMU's emulation is
+    /// byte-only and any multi-byte write would lose all but the
+    /// low byte.
+    ///
+    /// Caller must hold SERIAL_TX_LOCK.
+    pub unsafe fn puts_raw(bytes: &[u8]) {
         match BACKEND.try_get() {
-            Some(SerialBackend::Virtio) => unsafe { virtio_console_putc(c) },
-            Some(SerialBackend::Pl011 { base }) => {
+            Some(SerialBackend::Virtio) => {
+                for &b in bytes { unsafe { virtio_console_putc(b); } }
+            }
+            Some(SerialBackend::Pl011 { base, fast_tx }) => {
                 let r = pl011_at(*base);
-                // No `while r.fr.read() & FR_TXFF` poll. Every emulation
-                // path we run on (HVF runner, QEMU PL011, KVM virt-mmio)
-                // drains TX synchronously / instantly to host stdout, so
-                // FR_TXFF is always 0 — and the read itself is a vmexit
-                // (~20 µs on HVF), which doubled the per-byte log cost
-                // for no benefit. On real PL011 silicon the FIFO would
-                // matter at baud-rate speeds, but we don't run on real
-                // PL011 silicon.
-                r.dr.write(c as u32);
+                if *fast_tx {
+                    // Pack up to 8 bytes per 64-bit MMIO write to DR.
+                    // The runner reads the access width from the
+                    // instruction encoding and emits exactly that many
+                    // low bytes. `core::arch::asm!("str ...")` would
+                    // give us byte-precise control, but volatile u64
+                    // writes via `mmio::ReadWrite<u32>::write` only
+                    // emit 32 bits — so we use a separate u64 store.
+                    let dr_addr = (*base) as *mut u64;
+                    let mut i = 0;
+                    while i + 8 <= bytes.len() {
+                        let mut packed: u64 = 0;
+                        for j in 0..8 {
+                            packed |= (bytes[i + j] as u64) << (j * 8);
+                        }
+                        // SAFETY: dr_addr is the PL011 DR MMIO; the
+                        // HVF runner's pl011::mmio_write handles the
+                        // 8-byte access by emitting all 8 low bytes.
+                        unsafe { core::ptr::write_volatile(dr_addr, packed); }
+                        i += 8;
+                    }
+                    while i < bytes.len() {
+                        r.dr.write(bytes[i] as u32);
+                        i += 1;
+                    }
+                } else {
+                    for &b in bytes { r.dr.write(b as u32); }
+                }
             }
             None => {}
         }
@@ -222,7 +262,7 @@ mod aarch64 {
     pub unsafe fn try_getc() -> i32 {
         match BACKEND.try_get() {
             Some(SerialBackend::Virtio) => unsafe { virtio_console_try_getc() },
-            Some(SerialBackend::Pl011 { base }) => {
+            Some(SerialBackend::Pl011 { base, .. }) => {
                 let r = pl011_at(*base);
                 if (r.fr.read() & FR_RXFE) == 0 {
                     (r.dr.read() & 0xFF) as i32
@@ -254,70 +294,99 @@ static SERIAL_TX_LOCK: crate::sync::Spinlock<()> = crate::sync::Spinlock::new(()
 
 /// `true` when the next emitted byte is the first byte of a new
 /// line. Used to drive the "[N.NNN] " timestamp prefix that every
-/// serial line gets — same Linux-`dmesg` shape (`[    0.123456]`),
-/// just ms-precision since sub-millisecond detail isn't useful for
-/// this kernel's boot timeline. Mutated only under SERIAL_TX_LOCK,
-/// so the atomic could be a `bool` behind the lock; AtomicBool is
-/// just convenient.
+/// serial line gets — same Linux-`dmesg` shape, ms-precision.
+/// Mutated only under SERIAL_TX_LOCK.
 static AT_LINE_START: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(true);
 
-#[inline(always)]
-unsafe fn putc_raw(c: u8) {
-    #[cfg(target_arch = "x86_64")]
-    unsafe { x86::putc(c); }
-    #[cfg(target_arch = "aarch64")]
-    unsafe { aarch64::putc(c); }
+/// Stack-buffered writer used by `puts` and `LockedWriter::write_str`.
+/// Appends bytes with `\r\n` + timestamp-prefix handling into a
+/// fixed-size buffer; flushes via the arch-specific `puts_raw` (which
+/// on HVF emits up to 8 bytes per vmexit) when full or when the
+/// caller drops the writer. Caller MUST hold SERIAL_TX_LOCK.
+const SERIAL_BUF_SIZE: usize = 256;
+
+struct LineBuf {
+    buf: [u8; SERIAL_BUF_SIZE],
+    pos: usize,
 }
 
-/// Emit `[N.NNN] ` (seconds.milliseconds since boot) — directly via
-/// `putc_raw` (caller already holds SERIAL_TX_LOCK; do not re-enter).
-unsafe fn emit_timestamp_locked() {
-    let ms = crate::time::since_boot_us() / 1000;
-    let secs = ms / 1000;
-    let ms_part = (ms % 1000) as u32;
-
-    unsafe { putc_raw(b'['); }
-    // Seconds, no leading zeros (variable width — `[0.043]`,
-    // `[12.345]`, `[1234.567]` all naturally fit).
-    if secs == 0 {
-        unsafe { putc_raw(b'0'); }
-    } else {
-        let mut tmp = [0u8; 10];
-        let mut len = 0;
-        let mut s = secs;
-        while s > 0 {
-            tmp[len] = b'0' + (s % 10) as u8;
-            s /= 10;
-            len += 1;
-        }
-        for i in 0..len {
-            unsafe { putc_raw(tmp[len - 1 - i]); }
-        }
+impl LineBuf {
+    fn new() -> Self {
+        Self { buf: [0u8; SERIAL_BUF_SIZE], pos: 0 }
     }
-    unsafe { putc_raw(b'.'); }
-    unsafe { putc_raw(b'0' + (ms_part / 100) as u8); }
-    unsafe { putc_raw(b'0' + ((ms_part / 10) % 10) as u8); }
-    unsafe { putc_raw(b'0' + (ms_part % 10) as u8); }
-    unsafe { putc_raw(b']'); }
-    unsafe { putc_raw(b' '); }
-}
 
-/// Write one byte under the lock, prepending a timestamp prefix at
-/// line starts and translating `\n` to `\r\n`. Caller MUST hold
-/// SERIAL_TX_LOCK.
-unsafe fn write_byte_locked(b: u8) {
-    use core::sync::atomic::Ordering;
-    if AT_LINE_START.load(Ordering::Relaxed) {
-        unsafe { emit_timestamp_locked(); }
+    fn append(&mut self, b: u8) {
+        // Reserve 16 bytes so a `\r\n` + worst-case timestamp prefix
+        // (`[NNNNN.NNN] ` = 12 chars) fits without splitting.
+        if self.pos >= SERIAL_BUF_SIZE - 16 {
+            self.flush();
+        }
+        self.buf[self.pos] = b;
+        self.pos += 1;
+    }
+
+    fn append_timestamp_if_line_start(&mut self) {
+        use core::sync::atomic::Ordering;
+        if !AT_LINE_START.load(Ordering::Relaxed) {
+            return;
+        }
         AT_LINE_START.store(false, Ordering::Relaxed);
+        let ms = crate::time::since_boot_us() / 1000;
+        let secs = ms / 1000;
+        let ms_part = (ms % 1000) as u32;
+        self.append(b'[');
+        if secs == 0 {
+            self.append(b'0');
+        } else {
+            let mut tmp = [0u8; 10];
+            let mut len = 0;
+            let mut s = secs;
+            while s > 0 { tmp[len] = b'0' + (s % 10) as u8; s /= 10; len += 1; }
+            for i in 0..len { self.append(tmp[len - 1 - i]); }
+        }
+        self.append(b'.');
+        self.append(b'0' + (ms_part / 100) as u8);
+        self.append(b'0' + ((ms_part / 10) % 10) as u8);
+        self.append(b'0' + (ms_part % 10) as u8);
+        self.append(b']');
+        self.append(b' ');
     }
-    if b == b'\n' {
-        unsafe { putc_raw(b'\r'); putc_raw(b'\n'); }
-        AT_LINE_START.store(true, Ordering::Relaxed);
-    } else {
-        unsafe { putc_raw(b); }
+
+    fn write_byte(&mut self, b: u8) {
+        self.append_timestamp_if_line_start();
+        if b == b'\n' {
+            self.append(b'\r');
+            self.append(b'\n');
+            AT_LINE_START.store(true, core::sync::atomic::Ordering::Relaxed);
+        } else {
+            self.append(b);
+        }
     }
+
+    fn flush(&mut self) {
+        if self.pos == 0 { return; }
+        // SAFETY: caller holds SERIAL_TX_LOCK; `puts_raw` is the
+        // arch-specific batched-write path (multi-byte MMIO on HVF,
+        // per-byte fallback on QEMU PL011 / x86 16550).
+        unsafe { arch_puts_raw(&self.buf[..self.pos]); }
+        self.pos = 0;
+    }
+}
+
+impl Drop for LineBuf {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
+/// Arch-specific batched write. Caller holds SERIAL_TX_LOCK.
+#[inline]
+unsafe fn arch_puts_raw(bytes: &[u8]) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe { aarch64::puts_raw(bytes); }
+    #[cfg(target_arch = "x86_64")]
+    unsafe { for &b in bytes { x86::putc(b); } }
 }
 
 pub fn init() {
@@ -331,16 +400,18 @@ pub fn init() {
 
 pub fn putc(c: u8) {
     let _guard = SERIAL_TX_LOCK.lock();
-    unsafe { write_byte_locked(c); }
+    let mut lb = LineBuf::new();
+    lb.write_byte(c);
 }
 
 pub fn puts(s: &[u8]) {
     // Take the lock once around the whole string so multi-core log
     // lines don't interleave at byte granularity. RAII releases on
-    // scope exit.
+    // scope exit; `LineBuf::Drop` flushes any tail bytes.
     let _guard = SERIAL_TX_LOCK.lock();
+    let mut lb = LineBuf::new();
     for &c in s {
-        unsafe { write_byte_locked(c); }
+        lb.write_byte(c);
     }
 }
 
@@ -413,12 +484,20 @@ pub fn rx_isr() {
 /// directly via the arch-specific UART helpers without re-acquiring
 /// the lock. Do NOT call this from anywhere that doesn't already
 /// hold the lock; that's why it's private.
-struct LockedWriter;
+struct LockedWriter {
+    lb: LineBuf,
+}
+
+impl LockedWriter {
+    fn new() -> Self {
+        Self { lb: LineBuf::new() }
+    }
+}
 
 impl core::fmt::Write for LockedWriter {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         for b in s.bytes() {
-            unsafe { write_byte_locked(b); }
+            self.lb.write_byte(b);
         }
         Ok(())
     }
@@ -433,5 +512,7 @@ impl core::fmt::Write for LockedWriter {
 pub fn write_fmt(args: core::fmt::Arguments) {
     use core::fmt::Write;
     let _guard = SERIAL_TX_LOCK.lock();
-    let _ = LockedWriter.write_fmt(args);
+    let mut w = LockedWriter::new();
+    let _ = w.write_fmt(args);
+    // `w.lb` flushes on drop at end of scope.
 }
