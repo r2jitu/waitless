@@ -16,7 +16,12 @@
 /// Decoded MMIO access information.
 #[derive(Debug)]
 pub struct MmioAccess {
-    /// Access width in bytes: 1 or 4.
+    /// Access width in bytes: 1, 4, or 8. Currently no MMIO dispatcher
+    /// reads this — every device handler treats writes as a single 32-
+    /// bit register update — but we keep it on the struct so a future
+    /// width-sensitive emulator (e.g. 64-bit MMIO config blobs) can
+    /// pick it up without re-decoding the instruction.
+    #[allow(dead_code)]
     pub size: u8,
     /// true = store (guest writing to device), false = load (guest reading).
     pub is_write: bool,

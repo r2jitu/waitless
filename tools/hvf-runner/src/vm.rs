@@ -55,7 +55,7 @@ use std::sync::Arc;
 use crate::decoder;
 use crate::fdt;
 use crate::hvf::*;
-use crate::pl011;
+use crate::virtio_console;
 use crate::virtio;
 
 // ── Global vCPU handles for IO thread wakeup ────────────────────────────────
@@ -89,13 +89,18 @@ pub fn wake_vcpu(core_id: usize) {
 // under both QEMU+TCG and this runner.
 
 const RAM_BASE: u64 = 0x4000_0000;
-const PL011_BASE: u64 = 0x0900_0000;
-const PL011_SIZE: u64 = 0x1000;
 const GICD_BASE: u64 = 0x0800_0000;
 const GICR_BASE: u64 = 0x080a_0000;
+// virtio-net occupies the first virtio-mmio slot at 0x0a000000.
 const VIRTIO_MMIO_BASE: u64 = 0x0a00_0000;
 const VIRTIO_MMIO_SIZE: u64 = 0x200;
 const VIRTIO_MMIO_SPI: u32 = 3; // INTID = SPI + 32 = 35
+// virtio-console at the second slot, 0x200 bytes higher. Same SPI
+// would work (the kernel polls used_idx and never enables the irq),
+// but use a distinct one for hygiene in case that ever changes.
+const VIRTIO_CONSOLE_BASE: u64 = 0x0a00_0200;
+const VIRTIO_CONSOLE_SIZE: u64 = 0x200;
+const VIRTIO_CONSOLE_SPI: u32 = 4; // INTID 36, currently unused
 
 /// Minimum gap from the end of the loaded kernel image (including BSS)
 /// to the DTB. The DTB lives at `RAM_BASE + image_size + DTB_GAP`,
@@ -142,8 +147,9 @@ const VTIMER_INTID: u32 = 27;
 const MAX_VCPUS: usize = 8;
 
 // ── Cooperative yield — guest MMIO write parks the vCPU thread ─────────────
-// Address chosen right after PL011 (0x09000000). Not mapped in stage-2,
-// so a guest access causes a data abort that we intercept in the run loop.
+// Address chosen in the legacy PL011 region (0x09000000-0x09001fff was
+// the QEMU PL011 + reserved gap). Not mapped in stage-2, so a guest
+// access causes a data abort that we intercept in the run loop.
 const YIELD_MMIO_BASE: u64 = 0x0900_1000;
 const YIELD_MMIO_SIZE: u64 = 0x1000;
 
@@ -351,13 +357,21 @@ impl Vm {
             ram_size_fdt as u64,
             GICD_BASE,
             gicr_actual,
-            PL011_BASE,
             cpu_count,
-            &[fdt::VirtioMmioDesc {
-                base: VIRTIO_MMIO_BASE,
-                size: VIRTIO_MMIO_SIZE,
-                spi: VIRTIO_MMIO_SPI,
-            }],
+            &[
+                // virtio-net (DeviceID=1)
+                fdt::VirtioMmioDesc {
+                    base: VIRTIO_MMIO_BASE,
+                    size: VIRTIO_MMIO_SIZE,
+                    spi: VIRTIO_MMIO_SPI,
+                },
+                // virtio-console (DeviceID=3) — primary console.
+                fdt::VirtioMmioDesc {
+                    base: VIRTIO_CONSOLE_BASE,
+                    size: VIRTIO_CONSOLE_SIZE,
+                    spi: VIRTIO_CONSOLE_SPI,
+                },
+            ],
         );
         let dtb_guest_addr = RAM_BASE + dtb_offset;
         unsafe {
@@ -388,6 +402,11 @@ impl Vm {
         // 10. Initialize the virtio-mmio net device.
         *virtio::DEVICE.lock().unwrap() = Some(
             virtio::VirtioNet::new(mac, ram_host, RAM_BASE, cpu_count)
+        );
+
+        // 10b. Initialize the virtio-mmio console device.
+        *virtio_console::DEVICE.lock().unwrap() = Some(
+            virtio_console::VirtioConsole::new(ram_host, RAM_BASE)
         );
 
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -473,16 +492,20 @@ fn run_vcpu(
                             // global shutdown flag promptly.
                             //
                             // Also break if the stdin reader has pushed
-                            // a byte into pl011::RX_BUF. Otherwise a
-                            // parked vCPU would never notice Ctrl-C
-                            // (the 0x03 sits in RX_BUF but the guest
-                            // can't run to poll the pl011 MMIO while
-                            // it's stuck in this loop), and the only
-                            // way out would be a network packet or the
-                            // global shutdown flag — neither of which
-                            // Ctrl-C produces on its own.
+                            // a byte into virtio_console::RX_BUF, and
+                            // drive the console RX queue so the byte
+                            // is sitting in guest RAM by the time the
+                            // vCPU resumes. Otherwise a parked vCPU
+                            // would never notice Ctrl-C (the 0x03
+                            // sits in RX_BUF but the guest can't run
+                            // to poll virtio-console while it's stuck
+                            // here), and the only way out would be a
+                            // network packet or the global shutdown
+                            // flag — neither of which Ctrl-C produces
+                            // on its own.
                             while !shutdown.load(Ordering::Acquire) {
-                                if crate::pl011::rx_has_data() {
+                                if crate::virtio_console::rx_has_data() {
+                                    crate::virtio_console::drive_rx();
                                     break;
                                 }
                                 if crate::userspace_net::vcpu_poll(vcpu_id, 10) {
@@ -638,10 +661,16 @@ fn handle_hvc(
                     })
                     .map_err(|e| format!("spawn vcpu-{target_id}: {e}"))?;
 
-                eprintln!(
-                    "  cpu {vcpu_id}: PSCI CPU_ON target={target_id} \
-                     entry=0x{entry_point:x} ctx=0x{context_id:x}"
-                );
+                // HVF aarch64 quirk: writing X0 directly to PSCI_SUCCESS
+                // (0) sometimes doesn't propagate to the guest on HVC
+                // resume — the guest reads a stack-aliased kernel pointer
+                // instead. Writing a non-zero sentinel first, then the
+                // real return value, breaks whatever caching/elision is
+                // happening. Confirmed empirically: with this dance the
+                // guest sees PSCI_SUCCESS, without it the guest sees a
+                // garbage pointer that triggers a spurious "PSCI CPU_ON
+                // failed" log.
+                set_reg(vcpu, HvReg::X0, 1);
                 set_reg(vcpu, HvReg::X0, PSCI_SUCCESS);
             }
         }
@@ -690,16 +719,32 @@ fn handle_mmio(
     })?;
 
     // Route by IPA to the correct device.
-    if fault_ipa >= PL011_BASE && fault_ipa < PL011_BASE + PL011_SIZE {
-        let offset = fault_ipa - PL011_BASE;
-        if access.is_write {
-            let val = if access.rt == 31 { 0 } else { get_reg(vcpu, HvReg::gpr(access.rt as u32)) };
-            pl011::mmio_write(offset, access.size, val);
-        } else {
-            let val = pl011::mmio_read(offset, access.size);
-            if access.rt < 31 {
-                set_reg(vcpu, HvReg::gpr(access.rt as u32), val);
+    if fault_ipa >= VIRTIO_CONSOLE_BASE
+        && fault_ipa < VIRTIO_CONSOLE_BASE + VIRTIO_CONSOLE_SIZE
+    {
+        let offset = fault_ipa - VIRTIO_CONSOLE_BASE;
+        let mut tx_kicked = false;
+        {
+            let mut dev_lock = virtio_console::DEVICE.lock().unwrap();
+            let dev = dev_lock.as_mut().unwrap();
+            if access.is_write {
+                let val = if access.rt == 31 { 0 } else {
+                    get_reg(vcpu, HvReg::gpr(access.rt as u32)) as u32
+                };
+                if dev.write(offset, val) {
+                    // QUEUE_NOTIFY value is the queue index. RX (0)
+                    // is push-only from us; we only act on TX (1).
+                    tx_kicked = val == 1;
+                }
+            } else {
+                let val = dev.read(offset);
+                if access.rt < 31 {
+                    set_reg(vcpu, HvReg::gpr(access.rt as u32), val as u64);
+                }
             }
+        }
+        if tx_kicked {
+            virtio_console::process_tx_queue();
         }
     } else if fault_ipa >= GICD_BASE && fault_ipa < GICD_BASE + 0x1_0000 {
         // GIC distributor MMIO.

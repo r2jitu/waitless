@@ -200,12 +200,44 @@ pub fn run(core_id: u32) -> ! {
             if let Some(f) = NET_FLUSH.load() { f(); }
         }
 
-        // 4. Check for shutdown (every 64 iterations to avoid MMIO overhead)
+        // 4. Check for shutdown (every 64 iterations to avoid MMIO overhead).
         if loops & 63 == 0 {
             if let Some(f) = CHECK_SHUTDOWN.load() {
                 if f() {
                     request_shutdown();
                     break;
+                }
+            }
+
+            // Periodic scheduling window for the host. With PL011 the
+            // FR-register read inside `check_shutdown` was a real MMIO
+            // exit on every backend that emulates serial through traps
+            // (HVF, KVM-virtio-mmio, QEMU). The host hypervisor used
+            // each exit window to drive its inline TCP/UDP polling and
+            // accept new connections.
+            //
+            // virtio-console satisfies `try_getc` from BSS-resident
+            // ring buffers — no exit. Without an explicit yield here
+            // the kernel busy-spins forever when did_work alternates
+            // between true and false (e.g. the async runtime polls a
+            // task that touches a per-tick signal but produces no
+            // user-visible work), so `idle_streak` never reaches
+            // `IDLE_SPIN_BEFORE_HLT` and the runner never sees a
+            // newly-accepted TCP conn.
+            //
+            // A non-existent MMIO write to the cooperative-yield
+            // register synthesises the exit. The runner's yield
+            // handler runs `vcpu_poll`, which now returns true on a
+            // wake-pipe doorbell as well as on injected RX work, so
+            // Ctrl-C and inbound-conn signals both wake the guest
+            // promptly.
+            if !did_work {
+                #[cfg(target_arch = "aarch64")]
+                {
+                    let yield_addr = crate::aarch64::fdt::info().yield_mmio_base;
+                    if yield_addr != 0 {
+                        unsafe { core::ptr::write_volatile(yield_addr as *mut u32, 0); }
+                    }
                 }
             }
         }

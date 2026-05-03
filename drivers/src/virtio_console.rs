@@ -43,6 +43,14 @@ const CON_QS: usize = 16;
 const CON_AVAIL_OFF: usize = CON_QS * 16; // 256
 const CON_USED_OFF: usize = 4096;
 
+/// TX payload buffer size. Sized so a typical kernel log line
+/// (~80 chars) fits in one descriptor, so one MMIO QUEUE_NOTIFY +
+/// one used-ring poll suffices per line. The HVF runner emulates
+/// virtio-mmio entirely in-process; on KVM/QEMU each NOTIFY is one
+/// vmexit. Either way, batching the whole line cuts vmexit count
+/// from O(line length) to O(1).
+const CON_TX_BUF_LEN: usize = 256;
+
 // Queue-ring storage (page-aligned, in BSS).
 #[repr(C, align(4096))]
 struct ConQueueMem([u8; 8192]);
@@ -52,7 +60,7 @@ struct ConQueueMem([u8; 8192]);
 struct VirtioConsole {
     tx_mem: ConQueueMem,
     rx_mem: ConQueueMem,
-    tx_buf: [u8; 1],
+    tx_buf: [u8; CON_TX_BUF_LEN],
     rx_bufs: [u8; CON_QS],
     /// Non-zero = initialized. `1` is used as a sentinel on the PCI
     /// path (the real MMIO base doesn't apply there).
@@ -67,7 +75,7 @@ impl VirtioConsole {
         Self {
             tx_mem: ConQueueMem([0; 8192]),
             rx_mem: ConQueueMem([0; 8192]),
-            tx_buf: [0; 1],
+            tx_buf: [0; CON_TX_BUF_LEN],
             rx_bufs: [0; CON_QS],
             base: 0,
             pci_mode: false,
@@ -328,16 +336,18 @@ fn con_init_pci() -> bool {
 
 // ---- Console I/O ------------------------------------------------------------
 
-fn con_putc(c: u8) {
-    // SAFETY: console access is serialised by uni_kernel::serial.
-    let con = unsafe { &mut *CONSOLE.0.get() };
+/// Submit one TX chunk (≤ `CON_TX_BUF_LEN` bytes) and spin until
+/// the device signals completion. Caller is responsible for chunking
+/// longer payloads.
+///
+/// SAFETY: console access is serialised by uni_kernel::serial.
+unsafe fn con_tx_one_chunk(con: &mut VirtioConsole, bytes: &[u8]) {
+    debug_assert!(bytes.len() <= CON_TX_BUF_LEN);
     unsafe {
-        if con.base == 0 { return; }
-
         let mut tx_avail = CON_TX_AVAIL_IDX.load(Ordering::Relaxed);
         let mut tx_last = CON_TX_LAST_USED.load(Ordering::Relaxed);
 
-        // Spin until previous TX completes
+        // Spin until previous TX completes (descriptor 0 is shared).
         while tx_last < tx_avail {
             let u = ptr::read_volatile(con_used_idx_reg(&raw const con.tx_mem));
             if u != tx_last {
@@ -350,7 +360,12 @@ fn con_putc(c: u8) {
             asm!("pause", options(nostack, preserves_flags));
         }
 
-        con.tx_buf[0] = c;
+        // Copy payload into the static TX buffer and update the
+        // descriptor's length. addr / flags were set at init.
+        for (i, &b) in bytes.iter().enumerate() {
+            con.tx_buf[i] = b;
+        }
+        ptr::write_volatile(con_desc_len(&raw mut con.tx_mem, 0), bytes.len() as u32);
 
         dsb_st();
         let slot = (tx_avail % CON_QS as u16) as usize;
@@ -361,14 +376,12 @@ fn con_putc(c: u8) {
         CON_TX_AVAIL_IDX.store(tx_avail, Ordering::Relaxed);
         dsb_sy();
 
-        // Kick TX queue
         if con.pci_mode {
             ptr::write_volatile(con.tx_notify as *mut u16, 1);
         } else {
             mmio_write32(con.base + MMIO_QUEUE_NOTIFY, 1);
         }
 
-        // Spin until TX completes
         while ptr::read_volatile(con_used_idx_reg(&raw const con.tx_mem)) == tx_last {
             #[cfg(target_arch = "aarch64")]
             asm!("yield", options(nostack, preserves_flags));
@@ -378,6 +391,19 @@ fn con_putc(c: u8) {
         let new_last = ptr::read_volatile(con_used_idx_reg(&raw const con.tx_mem));
         CON_TX_LAST_USED.store(new_last, Ordering::Relaxed);
     }
+}
+
+fn con_puts(bytes: &[u8]) {
+    // SAFETY: console access is serialised by uni_kernel::serial.
+    let con = unsafe { &mut *CONSOLE.0.get() };
+    if con.base == 0 { return; }
+    for chunk in bytes.chunks(CON_TX_BUF_LEN) {
+        unsafe { con_tx_one_chunk(con, chunk); }
+    }
+}
+
+fn con_putc(c: u8) {
+    con_puts(&[c]);
 }
 
 fn con_try_getc() -> i32 {
@@ -448,6 +474,21 @@ pub extern "C" fn virtio_console_init_pci() -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn virtio_console_putc(c: u8) {
     con_putc(c);
+}
+
+/// Write `len` bytes from `ptr` to the console as a single batched
+/// TX submission per `CON_TX_BUF_LEN`-byte chunk — one MMIO notify
+/// + one used-ring poll per chunk. Used by `serial::aarch64::puts_raw`
+/// for the Virtio backend.
+///
+/// SAFETY: `ptr` must point at `len` valid bytes for the duration
+/// of the call. Caller holds SERIAL_TX_LOCK so no other thread is
+/// touching the static console state.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn virtio_console_puts(ptr: *const u8, len: usize) {
+    if ptr.is_null() || len == 0 { return; }
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+    con_puts(bytes);
 }
 
 /// Try to read one byte from the console. Returns -1 if nothing available.

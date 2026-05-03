@@ -15,12 +15,20 @@ pub struct VirtioMmioDesc {
 }
 
 /// Generate a complete FDT blob for the HVF runner VM.
+///
+/// The runner deliberately does NOT advertise a PL011 UART here.
+/// The kernel's `serial::aarch64::init` prefers `uart_base` from
+/// the FDT when present, and only falls through to virtio-mmio
+/// console (DeviceID=3) when no UART is advertised. We want the
+/// virtio-console path on HVF for transport uniformity with KVM
+/// and to retire the runner's bespoke 8-byte-per-write PL011 trick;
+/// QEMU's `-machine virt` still publishes PL011 in *its* FDT, so
+/// the same kernel binary keeps working under QEMU TCG.
 pub fn generate(
     ram_base: u64,
     ram_size: u64,
     gicd_base: u64,
     gicr_base: u64,
-    uart_base: u64,
     cpu_count: usize,
     virtio_devices: &[VirtioMmioDesc],
 ) -> Vec<u8> {
@@ -59,15 +67,6 @@ pub fn generate(
     fdt.property_string("device_type", "memory").unwrap();
     fdt.property_array_u64("reg", &[ram_base, ram_size]).unwrap();
     fdt.end_node(mem).unwrap();
-
-    // /pl011@XXXXXXXX
-    let uart = fdt.begin_node(&format!("pl011@{uart_base:x}")).unwrap();
-    fdt.property_string_list("compatible", vec![
-        "arm,pl011".into(),
-        "arm,primecell".into(),
-    ]).unwrap();
-    fdt.property_array_u64("reg", &[uart_base, 0x1000]).unwrap();
-    fdt.end_node(uart).unwrap();
 
     // /intc@XXXXXXXX — GICv3
     // Redistributor region: N CPUs × 0x20000 bytes per CPU (2 frames).

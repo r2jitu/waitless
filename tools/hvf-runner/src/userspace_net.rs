@@ -773,10 +773,12 @@ fn poll_worker_iteration(
     if ready <= 0 { return any_injected; }
 
     // ── Drain wake pipe doorbell ───────────────────────────────────
-    // The bytes are just signals from the accept thread; the actual
-    // new conn was already inserted into `WORKERS[id].conns` and the
-    // SYN frame into `tx_replies` before the doorbell. We drain the
-    // pipe here so it doesn't keep firing on subsequent polls.
+    // The bytes are signals from another thread (the accept thread, or
+    // the stdin reader after delivering a Ctrl-C byte through virtio-
+    // console). The actual work (new conn, RX queue update) was done
+    // before the doorbell — we drain so it doesn't refire on the next
+    // poll, and flag `any_injected=true` so the yield-handler caller
+    // can break out and let the guest observe whatever just landed.
     if io.pollfds[0].revents & libc::POLLIN != 0 {
         let mut tmp = [0u8; 64];
         loop {
@@ -785,6 +787,7 @@ fn poll_worker_iteration(
             };
             if n <= 0 { break; }
         }
+        any_injected = true;
     }
 
     // ── Drain UDP relay siblings that fired ────────────────────────

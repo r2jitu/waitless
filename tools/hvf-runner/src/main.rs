@@ -21,9 +21,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 mod decoder;
 mod fdt;
 mod hvf;
-mod pl011;
 mod terminal;
 mod virtio;
+mod virtio_console;
 mod vm;
 mod userspace_net;
 
@@ -146,11 +146,11 @@ fn main() {
         orig_hook(info);
     }));
 
-    // Spawn stdin reader thread — pushes bytes into pl011::RX_BUF and
-    // kicks every vCPU so a parked cooperative-yield loop wakes up
-    // promptly. Without the wake, the guest would only notice a Ctrl-C
-    // on the next 10 ms vcpu_poll timeout (or never, if it's deeply
-    // parked) — see vm.rs yield loop comment for the full chain.
+    // Spawn stdin reader thread — pushes bytes into the virtio-console
+    // RX_BUF and kicks every vCPU so a parked cooperative-yield loop
+    // wakes up promptly. Without the wake, the guest would only notice
+    // a Ctrl-C on the next 10 ms vcpu_poll timeout (or never, if it's
+    // deeply parked) — see vm.rs yield loop comment for the full chain.
     std::thread::spawn(|| {
         let stdin = std::io::stdin();
         let mut handle = stdin.lock();
@@ -160,11 +160,20 @@ fn main() {
                 Ok(0) => break,
                 Ok(n) => {
                     {
-                        let mut rx = pl011::RX_BUF.lock().unwrap();
+                        let mut rx = virtio_console::RX_BUF.lock().unwrap();
                         for &b in &buf[..n] {
                             rx.push_back(b);
                         }
                     }
+                    // Drive the RX queue from this thread so the byte
+                    // is in guest RAM by the time the vCPU wakes —
+                    // saves one round trip vs deferring to the vCPU's
+                    // next poll cycle.
+                    virtio_console::drive_rx();
+                    // wake_all_vcpus writes the per-vCPU wake pipe, which
+                    // is in vcpu_poll's poll-fd set; that fires
+                    // `any_injected=true` and breaks the cooperative-yield
+                    // loop so the guest observes the byte promptly.
                     userspace_net::wake_all_vcpus();
                 }
                 Err(_) => break,
