@@ -786,7 +786,56 @@ fn init_native() {
 // ============================================================================
 
 pub fn log(msg: &[u8]) {
-    unsafe { write(2, msg.as_ptr(), msg.len()); }
+    use std::sync::Mutex;
+    use std::time::Instant;
+    // Boot-start timestamp + line-start tracker — same shape as the
+    // kernel-side `[N.NNN]` prefix in `kernel/serial.rs`. Captured
+    // lazily on first call (before any code in this binary's boot
+    // path emits stderr). Mutex coordinates multi-threaded native
+    // workers writing concurrently; per-line atomic for AT_LINE_START
+    // so we only emit a timestamp once at the start of each line.
+    static BOOT_START: Mutex<Option<Instant>> = Mutex::new(None);
+    static AT_LINE_START: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(true);
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    let _g = LOCK.lock().unwrap();
+    let start = {
+        let mut s = BOOT_START.lock().unwrap();
+        *s.get_or_insert_with(Instant::now)
+    };
+    let mut out: Vec<u8> = Vec::with_capacity(msg.len() + 16);
+    use std::sync::atomic::Ordering;
+    for &b in msg {
+        if AT_LINE_START.load(Ordering::Relaxed) {
+            let elapsed = start.elapsed();
+            let ms = elapsed.as_millis() as u64;
+            let secs = ms / 1000;
+            let ms_part = (ms % 1000) as u32;
+            out.push(b'[');
+            if secs == 0 {
+                out.push(b'0');
+            } else {
+                let mut tmp = [0u8; 10];
+                let mut len = 0;
+                let mut s = secs;
+                while s > 0 { tmp[len] = b'0' + (s % 10) as u8; s /= 10; len += 1; }
+                for i in 0..len { out.push(tmp[len - 1 - i]); }
+            }
+            out.push(b'.');
+            out.push(b'0' + (ms_part / 100) as u8);
+            out.push(b'0' + ((ms_part / 10) % 10) as u8);
+            out.push(b'0' + (ms_part % 10) as u8);
+            out.push(b']');
+            out.push(b' ');
+            AT_LINE_START.store(false, Ordering::Relaxed);
+        }
+        out.push(b);
+        if b == b'\n' {
+            AT_LINE_START.store(true, Ordering::Relaxed);
+        }
+    }
+    unsafe { write(2, out.as_ptr(), out.len()); }
 }
 
 pub fn check_shutdown() -> bool {
