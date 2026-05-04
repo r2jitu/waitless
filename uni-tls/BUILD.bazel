@@ -30,6 +30,7 @@ rust_library(
         "src/server/handlers.rs",
         "src/server/keys.rs",
         "src/server/profile.rs",
+        "src/server/ticket.rs",
         "src/server/trace.rs",
     ],
     crate_features = select({
