@@ -244,6 +244,27 @@ rust_test(
     crate = ":quic_crypto",
 )
 
+# QUIC frame codec (RFC 9000 §19): PADDING/PING/ACK/CRYPTO/STREAM/
+# CONNECTION_CLOSE/HANDSHAKE_DONE. Pure protocol layer; consumes
+# decrypted packet payloads from `quic_crypto`. Phase 3c.
+rust_library(
+    name = "quic_frame",
+    srcs = ["src/quic_frame.rs"],
+    crate_features = select({
+        "//bazel/rules:tests_need_std_on": ["std"],
+        "//conditions:default": [],
+    }),
+    crate_name = "net_quic_frame",
+    crate_root = "src/quic_frame.rs",
+    deps = [":quic_wire"],
+)
+
+rust_test(
+    name = "quic_frame_test",
+    size = "small",
+    crate = ":quic_frame",
+)
+
 # TLS 1.3 record layer: wraps plaintext records in TLSCiphertext using
 # //net:tls's TrafficKey (AEAD seal/open with per-sequence nonce).
 # Pure protocol logic — no I/O, no state beyond what the caller owns.
