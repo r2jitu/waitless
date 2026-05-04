@@ -8,6 +8,7 @@ exports_files([
     # `ctx.actions.expand_template` substitutes with runfile filenames.
     "run_hvf.sh.tmpl",
     "run_iso.sh.tmpl",
+    "run_native.sh.tmpl",
     "run_qemu.sh.tmpl",
     "native_main.rs",
     "unikernel_main.rs",

@@ -25,14 +25,12 @@ effect:
     available.
 
 Variants produced (names & platform compat defined in _VARIANT_SPECS):
+  * `:<name>_native`       — host-OS POSIX binary (no VM).
   * `:<name>_hvf`          — aarch64 unikernel + native HVF runner.
   * `:<name>_iso_x86_64`   — x86_64 unikernel + Limine ISO (cloud boot).
   * `:<name>_iso_aarch64`  — aarch64 unikernel + Limine ISO (ARM cloud).
   * `:<name>_qemu_aarch64` — aarch64 unikernel + QEMU TCG.
   * `:<name>_qemu_x86_64`  — x86_64 unikernel + QEMU TCG.
-
-(Native is already covered by `unikernel_binary`'s `:<name>_native`
-rust_binary — a direct host executable, no launcher script required.)
 """
 
 # ── Transitions ────────────────────────────────────────────────────────────
@@ -180,11 +178,32 @@ def _build_qemu_hostfwd(port_forwards):
         ))
     return ",".join(parts)
 
+def _build_native_port_envs(port_forwards):
+    """Build native launcher `export UNIKERNEL_<PROTO>_<GUEST>=…` block.
+
+    Native has no separate runner — `read_port_env` in
+    `uni-backend/src/native/{tcp,udp}.rs` reads the env var per-listen
+    — so the launcher just exports each forward with a `${VAR:-host}`
+    default and execs the underlying rust_binary. Caller-set env wins,
+    matching the HVF / QEMU launchers' shell-expansion semantic.
+    """
+    parts = []
+    for f in port_forwards:
+        env = _port_fwd_env_var(f)
+        parts.append('export {env}="${{{env}:-{host}}}"'.format(
+            env = env,
+            host = f.host,
+        ))
+    return "\n".join(parts)
+
 def _hvf_port_forward_kwargs(port_forwards):
     return {"hvf_port_flags": _build_hvf_port_flags(port_forwards)}
 
 def _qemu_port_forward_kwargs(port_forwards):
     return {"qemu_hostfwd": _build_qemu_hostfwd(port_forwards)}
+
+def _native_port_forward_kwargs(port_forwards):
+    return {"native_port_envs": _build_native_port_envs(port_forwards)}
 
 # Per-variant rule implementations. Each takes exactly the attrs its
 # runner script consumes, symlinks them into co-located files, and
@@ -242,6 +261,30 @@ def _iso_impl(ctx):
     return [DefaultInfo(
         executable = launcher,
         runfiles = ctx.runfiles(files = [launcher, iso, helpers_co]),
+    )]
+
+def _native_impl(ctx):
+    # Underlying rust_binary stays in the host config (no transition);
+    # the launcher just symlinks it next to itself and execs with
+    # `${UNIKERNEL_<PROTO>_<GUEST>:-host}` defaults exported. Same
+    # co-located-runfile pattern as HVF (img + runner sit beside the
+    # launcher in `bazel-bin/<package>/`).
+    #
+    # Symlink suffix uses `.bin` (not `_bin`) so it doesn't collide
+    # with the underlying rust_binary's own `<base>_bin` output in
+    # the same outdir.
+    bin_co = _symlink_into_outdir(
+        ctx,
+        ctx.attr.bin[DefaultInfo].files.to_list()[0],
+        ctx.label.name + ".bin",
+    )
+    launcher = _expand_launcher(ctx, {
+        "%BIN%": bin_co.basename,
+        "%PORT_ENVS%": ctx.attr.native_port_envs,
+    })
+    return [DefaultInfo(
+        executable = launcher,
+        runfiles = ctx.runfiles(files = [launcher, bin_co]),
     )]
 
 def _qemu_impl(ctx):
@@ -351,6 +394,34 @@ _hvf_variant = _build_variant_rule(
         ),
         "hvf_port_flags": attr.string(
             doc = "Pre-formatted `-p` flags; built by `_build_hvf_port_flags`.",
+        ),
+    }),
+)
+
+# Native: no transition (the rust_binary already builds for the host
+# platform), no runner (the rust_binary is itself the executable).
+# Launcher is a thin shell wrapper that exports
+# `UNIKERNEL_<PROTO>_<GUEST>` defaults and execs the binary. Built
+# directly via `rule()` rather than `_build_variant_rule` because
+# the latter wires in the function-transition allowlist, which Bazel
+# rejects on rules that don't actually carry a `cfg=` transition.
+# `_VM_CONFIG_ATTRS` is included only because `_instantiate_variant`
+# passes `default_ram_mb` / `default_cpus` uniformly across specs;
+# the native impl ignores them (no VM, no RAM cap).
+_native_variant = rule(
+    implementation = _native_impl,
+    executable = True,
+    attrs = dict(_VM_CONFIG_ATTRS, **{
+        "_template": attr.label(
+            default = "//bazel/rules:run_native.sh.tmpl",
+            allow_single_file = True,
+        ),
+        "bin": attr.label(
+            mandatory = True,
+            doc = "The <name>_bin rust_binary of the underlying unikernel_binary.",
+        ),
+        "native_port_envs": attr.string(
+            doc = "Pre-formatted `export UNIKERNEL_…=…` block; built by `_build_native_port_envs`.",
         ),
     }),
 )
@@ -506,18 +577,16 @@ _VARIANT_SPECS = [
         in_default_test_set = True,
     ),
     struct(
-        # Native: `:<name>_native` is a plain rust_binary declared
-        # by `unikernel_binary` itself (native_main.rs links libstd,
-        # so no transition or wrapper is required for the `bazel
-        # test` verb's panic=unwind to work). `rule_fn = None`
-        # signals `unikernel_variants` to skip target creation; the
-        # spec entry is still present so `unikernel_app_test` fans
-        # out across native too — fast, no VM boot.
+        # Native: `:<name>_native` is a launcher around the
+        # `:<name>_bin` rust_binary (declared in `unikernel_binary`).
+        # The launcher exports `UNIKERNEL_<PROTO>_<GUEST>=${...:-host}`
+        # defaults so the native variant honors `port_forwards` the
+        # same way HVF / QEMU launchers do via shell expansion.
         suffix = "native",
-        rule_fn = None,
-        src_attrs = {},
+        rule_fn = _native_variant,
+        src_attrs = {"bin": "_bin"},
         host_attrs = {},
-        port_forward_kwargs = None,
+        port_forward_kwargs = _native_port_forward_kwargs,
         host_compat = ["//bazel/platforms:native"],
         extra_test_tags = [],
         in_default_test_set = True,
@@ -533,14 +602,7 @@ _DEFAULT_TEST_VARIANT_SUFFIXES = tuple([
 ])
 
 def _instantiate_variant(spec, name, base, vm_config, visibility):
-    """Invoke `spec.rule_fn` with attrs derived from `spec` + `base`.
-
-    `rule_fn = None` means the target is produced elsewhere — native's
-    `:<base>_native` is declared directly by `unikernel_binary` — so
-    this helper is a no-op for that spec.
-    """
-    if spec.rule_fn == None:
-        return
+    """Invoke `spec.rule_fn` with attrs derived from `spec` + `base`."""
     kwargs = {}
     for attr_name, suffix in spec.src_attrs.items():
         kwargs[attr_name] = ":" + base + suffix
@@ -567,6 +629,7 @@ def unikernel_variants(
         port_forwards,
         ram_mb,
         cpus,
+        build_native = True,
         visibility = None):
     """Generate `:<name>_<variant>` runnable targets for every runner in _VARIANT_SPECS.
 
@@ -586,6 +649,10 @@ def unikernel_variants(
         `port_fwd()` in unikernel.bzl).
       ram_mb: default guest RAM in MB (overridable via UNIKERNEL_MEMORY).
       cpus: default vCPU count (overridable via UNIKERNEL_CPUS).
+      build_native: whether the underlying `:<name>_bin`
+        rust_binary exists. When False (kernel-only apps), the native
+        variant entry is skipped so we don't try to wrap a target
+        that wasn't declared.
       visibility: Bazel visibility for the generated variants.
     """
     vm_config = struct(
@@ -594,6 +661,8 @@ def unikernel_variants(
         cpus = cpus,
     )
     for spec in _VARIANT_SPECS:
+        if spec.suffix == "native" and not build_native:
+            continue
         _instantiate_variant(
             spec,
             name + "_" + spec.suffix,

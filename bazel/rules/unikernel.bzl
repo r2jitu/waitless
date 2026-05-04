@@ -373,12 +373,17 @@ def unikernel_binary(
 
     # ── Native POSIX binary ──────────────────────────────────────────────
     #
-    # Directly runnable as `:<name>_native` — no variant wrapper,
-    # no transition. `native_main.rs` is a std binary (libstd
-    # provides panic handler / allocator / eh_personality); the
-    # dep-chain rlibs (uni, uni-net, net/*, app) stay `#![no_std]`
-    # but compile cleanly under any panic strategy because rlibs
-    # don't own a panic handler.
+    # The actual host-OS binary lives at `:<name>_bin`;
+    # `:<name>_native` is the launcher emitted by the native variant
+    # rule (in variants.bzl) which wraps it with the same
+    # `${UNIKERNEL_TCP_80:-8080}`-style port-default expansion the
+    # HVF / QEMU launchers do. The `_bin` suffix is unqualified
+    # (no `_native_`) because the native variant is the only consumer
+    # — there's no other rust_binary the suffix could collide with.
+    # `native_main.rs` is a std binary (libstd provides panic handler
+    # / allocator / eh_personality); the dep-chain rlibs (uni,
+    # uni-net, net/*, app) stay `#![no_std]` but compile cleanly under
+    # any panic strategy because rlibs don't own a panic handler.
     #
     # Skipped entirely when `build_native = False` so kernel-only apps
     # (those whose `app` transitively depends on `//kernel`) don't
@@ -386,7 +391,7 @@ def unikernel_binary(
     # transitive-incompatibility error when invoked.
     if build_native:
         rust_binary(
-            name = name + "_native",
+            name = name + "_bin",
             srcs = ["//bazel/rules:native_main.rs"],
             deps = [app, "//uni"],
             rustc_flags = select({
@@ -419,5 +424,6 @@ def unikernel_binary(
         port_forwards = port_forwards,
         ram_mb = ram_mb,
         cpus = cpus,
+        build_native = build_native,
         visibility = visibility,
     )
