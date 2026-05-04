@@ -398,12 +398,12 @@ fn put_be64(dst: &mut [u8], offset: usize, v: u64) {
 }
 
 #[inline]
-fn get_be16(src: &[u8], offset: usize) -> u16 {
+fn read_be16(src: &[u8], offset: usize) -> u16 {
     u16::from_be_bytes([src[offset], src[offset + 1]])
 }
 
 #[inline]
-fn get_be32(src: &[u8], offset: usize) -> u32 {
+fn read_be32(src: &[u8], offset: usize) -> u32 {
     u32::from_be_bytes([
         src[offset], src[offset + 1], src[offset + 2], src[offset + 3],
     ])
@@ -671,15 +671,15 @@ fn parse_device_descriptor(desc_virt: *mut u8) -> bool {
     let header_len = 40;
     let header: &[u8] = unsafe { core::slice::from_raw_parts(desc_virt, header_len) };
 
-    let tx_entries = get_be16(header, 10);
-    let rx_entries = get_be16(header, 12);
-    let default_num_queues = get_be16(header, 14);
-    let mtu = get_be16(header, 16);
-    let counters = get_be16(header, 18);
+    let tx_entries = read_be16(header, 10);
+    let rx_entries = read_be16(header, 12);
+    let default_num_queues = read_be16(header, 14);
+    let mtu = read_be16(header, 16);
+    let counters = read_be16(header, 18);
     let mut mac = [0u8; 6];
     mac.copy_from_slice(&header[24..30]);
-    let num_options = get_be16(header, 30);
-    let total_len = get_be16(header, 32) as usize;
+    let num_options = read_be16(header, 30);
+    let total_len = read_be16(header, 32) as usize;
 
     // Walk the option list to negotiate the queue format. Preference
     // order matches Linux: DQO_RDA > DQO_QPL > GQI_RDA > GQI_QPL.
@@ -697,8 +697,8 @@ fn parse_device_descriptor(desc_virt: *mut u8) -> bool {
         if offset + 8 > end { break; }
         let opt_hdr: &[u8] =
             unsafe { core::slice::from_raw_parts(desc_virt.add(offset), 8) };
-        let id = get_be16(opt_hdr, 0);
-        let len = get_be16(opt_hdr, 2) as usize;
+        let id = read_be16(opt_hdr, 0);
+        let len = read_be16(opt_hdr, 2) as usize;
 
         let fmt = match id {
             OPT_ID_DQO_RDA => Some(QueueFormat::DqoRda),
@@ -869,7 +869,7 @@ unsafe fn read_slot_status(slot_idx: usize) -> u32 {
     let s = st.as_ref().expect("state");
     let slot_ptr = (s.adminq_va as *const AdminqCommand).wrapping_add(slot_idx);
     let slot = unsafe { &*slot_ptr };
-    get_be32(&slot.bytes, 4)
+    read_be32(&slot.bytes, 4)
 }
 
 /// Read a field the device wrote into a DMA-coherent buffer the
@@ -1462,8 +1462,8 @@ fn finalize_tx_queue(qp: u32, alloc: &TxAlloc, fmt: QueueFormat) {
     let counter_index;
     unsafe {
         let bytes = slice_at(alloc.qres_va, 8);
-        db_index = get_be32(bytes, 0);
-        counter_index = get_be32(bytes, 4);
+        db_index = read_be32(bytes, 0);
+        counter_index = read_be32(bytes, 4);
     }
     let qpl_size = match fmt {
         QueueFormat::GqiQpl => TX_QPL_PAGES * PAGE_SIZE,
@@ -1513,8 +1513,8 @@ fn finalize_rx_queue(qp: u32, alloc: &RxAlloc, fmt: QueueFormat) {
     let counter_index;
     unsafe {
         let bytes = slice_at(alloc.qres_va, 8);
-        db_index = get_be32(bytes, 0);
-        counter_index = get_be32(bytes, 4);
+        db_index = read_be32(bytes, 0);
+        counter_index = read_be32(bytes, 4);
     }
     let qpl_size = match fmt {
         QueueFormat::GqiQpl => RX_QPL_PAGES * PAGE_SIZE,
@@ -1796,13 +1796,13 @@ fn poll_qp_inner(qp: usize, callback: fn(&[u8])) -> u32 {
         // to see the device's writes.
         let desc: &[u8] = unsafe { core::slice::from_raw_parts(desc_ptr, RX_DESC_SIZE) };
 
-        let flags_seq = get_be16(desc, RX_DESC_FLAGS_SEQ_OFF);
+        let flags_seq = read_be16(desc, RX_DESC_FLAGS_SEQ_OFF);
         let seq = (flags_seq & 0x7) as u8;
         if seq != expected {
             break;
         }
 
-        let len = get_be16(desc, RX_DESC_LEN_OFF) as usize;
+        let len = read_be16(desc, RX_DESC_LEN_OFF) as usize;
         let frame_start = rx.qpl_base_va as usize + idx * (PAGE_SIZE as usize)
             + RX_DATA_OFFSET_IN_PAGE;
         let frame: &[u8] = unsafe {

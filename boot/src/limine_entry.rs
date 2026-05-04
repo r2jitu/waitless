@@ -181,12 +181,12 @@ unsafe extern "C" {
 // Populated once by `limine_entry` during boot, then treated as
 // read-only for the life of the kernel (kernel_boot_from_bootinfo
 // only reads).
-struct LimineBootInfoSlot(core::cell::UnsafeCell<BootInfo>);
+struct LimineBootInfoCell(core::cell::UnsafeCell<BootInfo>);
 // SAFETY: single write on the BSP before `kernel_boot_from_bootinfo`
 // is called; immutable afterwards.
-unsafe impl Sync for LimineBootInfoSlot {}
+unsafe impl Sync for LimineBootInfoCell {}
 
-static LIMINE_BOOT_INFO: LimineBootInfoSlot = LimineBootInfoSlot(core::cell::UnsafeCell::new(BootInfo {
+static LIMINE_BOOT_INFO: LimineBootInfoCell = LimineBootInfoCell(core::cell::UnsafeCell::new(BootInfo {
     protocol: Protocol::Limine,
     memory_map_count: 0,
     memory_map: [MemoryRegion { base: 0, length: 0, region_type: 0, _pad: 0 }; MAX_MEMORY_REGIONS],

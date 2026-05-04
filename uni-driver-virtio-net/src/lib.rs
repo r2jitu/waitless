@@ -512,11 +512,11 @@ struct CtrlMqBuf {
 }
 // CTRL-VQ scratch. Only written from `ctrl_mq_set_pairs`, which the
 // driver init path calls once on the BSP before any AP is running.
-struct CtrlMqBufSlot(core::cell::UnsafeCell<CtrlMqBuf>);
+struct CtrlMqBufCell(core::cell::UnsafeCell<CtrlMqBuf>);
 // SAFETY: BSP-only during driver init; no concurrent access.
-unsafe impl Sync for CtrlMqBufSlot {}
+unsafe impl Sync for CtrlMqBufCell {}
 
-static CTRL_MQ_BUF: CtrlMqBufSlot = CtrlMqBufSlot(core::cell::UnsafeCell::new(CtrlMqBuf {
+static CTRL_MQ_BUF: CtrlMqBufCell = CtrlMqBufCell(core::cell::UnsafeCell::new(CtrlMqBuf {
     hdr_class: 0, hdr_cmd: 0, data: [0; 2], _pad: [0; 4], ack: 0, _tail: [0; 7],
 }));
 
@@ -559,9 +559,9 @@ fn ctrl_mq_set_pairs(num_pairs: u16) {
 
         // Wait for completion.
         for _ in 0..1_000_000u32 {
-            if (*ndev()).ctrl_queue.get_used().is_some() { break; }
+            if (*ndev()).ctrl_queue.used().is_some() { break; }
         }
-        let _ = (*ndev()).ctrl_queue.get_used();
+        let _ = (*ndev()).ctrl_queue.used();
 
         let ack = core::ptr::read_volatile(&(*buf_ptr).ack as *const u8);
         if ack == 0 {
@@ -931,7 +931,7 @@ fn init_legacy_pci() -> bool {
 fn tx_drain_qp(qp: usize) {
     let pool_phys = unsafe { virt_to_phys((*qps(qp)).tx_pool.as_ptr() as *const u8) };
     unsafe {
-        while let Some((used_id, _used_len)) = (*tx_q(qp)).get_used() {
+        while let Some((used_id, _used_len)) = (*tx_q(qp)).used() {
             let d = (*tx_q(qp)).desc(used_id);
             let slot = ((d.addr - pool_phys) / core::mem::size_of::<TxBuf>() as u64) as usize;
             if slot < TX_POOL_SIZE {
@@ -1280,7 +1280,7 @@ fn poll_qp(qp: usize, callback: fn(&[u8])) -> usize {
 
     let mut count: usize = 0;
     unsafe {
-        while let Some((used_id, used_len)) = (*rx_q(qp)).get_used() {
+        while let Some((used_id, used_len)) = (*rx_q(qp)).used() {
             let desc = (*rx_q(qp)).desc(used_id);
             let buf = phys_to_virt(desc.addr);
 
@@ -1376,7 +1376,7 @@ fn poll_batch_qp(qp: usize, batch: &mut RxBatch) {
 
     unsafe {
         while batch.count < BATCH_SIZE {
-            let (used_id, used_len) = match (*rx_q(qp)).get_used() {
+            let (used_id, used_len) = match (*rx_q(qp)).used() {
                 Some(v) => v,
                 None => break,
             };

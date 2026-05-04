@@ -69,11 +69,11 @@ pub struct Net {
 // holding `Option<Box<Net>>`, written only on the boot CPU, cleared
 // only from `uni::shutdown_and_drop` (also BSP).
 
-struct NetSlot(UnsafeCell<Option<alloc::boxed::Box<Net>>>);
+struct NetCell(UnsafeCell<Option<alloc::boxed::Box<Net>>>);
 
-impl NetSlot {
+impl NetCell {
     const fn empty() -> Self {
-        NetSlot(UnsafeCell::new(None))
+        NetCell(UnsafeCell::new(None))
     }
 }
 
@@ -82,9 +82,9 @@ impl NetSlot {
 //     thread on native).
 //   - `clear_on_shutdown` runs from `uni::shutdown_and_drop`, called
 //     only from the BSP shutdown branch of the kernel event loop.
-unsafe impl Sync for NetSlot {}
+unsafe impl Sync for NetCell {}
 
-static NET: NetSlot = NetSlot::empty();
+static NET: NetCell = NetCell::empty();
 
 impl Net {
     /// Bring the network stack online. On success stores a
@@ -103,7 +103,7 @@ impl Net {
     /// Calling `enable` twice after a successful bring-up returns
     /// `Err(NetError::AlreadyEnabled)`.
     pub async fn enable(cfg: NetBringUp) -> Result<Net, NetError> {
-        // SAFETY: BSP-only access; see `unsafe impl Sync for NetSlot`.
+        // SAFETY: BSP-only access; see `unsafe impl Sync for NetCell`.
         if unsafe { (*NET.0.get()).is_some() } {
             return Err(NetError::AlreadyEnabled);
         }
@@ -214,7 +214,7 @@ impl Net {
 
 /// Whether the stack is currently enabled (the slot holds a `Box<Net>`).
 pub fn is_enabled() -> bool {
-    // SAFETY: BSP-only access; see `unsafe impl Sync for NetSlot`.
+    // SAFETY: BSP-only access; see `unsafe impl Sync for NetCell`.
     unsafe { (*NET.0.get()).is_some() }
 }
 

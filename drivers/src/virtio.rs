@@ -779,7 +779,7 @@ impl Virtqueue {
     /// Returns (descriptor_head_id, bytes_written) or None.
     /// Read INTERRUPT_STATUS and extract the device-side used_idx
     /// packed in the upper 16 bits (VIRTIO_F_USED_IDX_MMIO extension).
-    /// Call once per poll cycle; get_used() then uses the cached value.
+    /// Call once per poll cycle; used() then uses the cached value.
     pub fn poll_interrupt_status(&mut self) -> u32 {
         if self.used_idx_mmio {
             let val = unsafe { virtio_read32(self.io_base + MMIO_INTERRUPT_STATUS) };
@@ -791,7 +791,7 @@ impl Virtqueue {
         }
     }
 
-    pub fn get_used(&mut self) -> Option<(u16, u32)> {
+    pub fn used(&mut self) -> Option<(u16, u32)> {
         let cur_used_idx = if self.used_idx_mmio {
             // First check the cached value (no MMIO exit).
             // If stale, do one MMIO read to refresh — this also

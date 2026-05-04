@@ -107,7 +107,7 @@ impl Request {
         &self.path[..self.path_len]
     }
 
-    pub fn get_header(&self, name: &[u8]) -> Option<&[u8]> {
+    pub fn header(&self, name: &[u8]) -> Option<&[u8]> {
         for i in 0..self.header_count {
             if self.headers[i].name().eq_ignore_ascii_case(name) {
                 return Some(self.headers[i].value());
@@ -473,7 +473,7 @@ where
             if consumed == 0 {
                 break; // need more bytes
             }
-            let want_close = match req.get_header(b"Connection") {
+            let want_close = match req.header(b"Connection") {
                 Some(v) => v.eq_ignore_ascii_case(b"close"),
                 None => false,
             };
@@ -604,7 +604,7 @@ fn parse_request(data: &[u8], req: &mut Request) -> usize {
     let mut consumed = body_start;
 
     // Handle Content-Length
-    if let Some(cl_val) = req.get_header(b"Content-Length") {
+    if let Some(cl_val) = req.header(b"Content-Length") {
         let body_len = parse_usize(cl_val);
         let avail = data.len() - body_start;
         if avail < body_len {

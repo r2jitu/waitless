@@ -85,13 +85,13 @@ impl VirtioConsole {
     }
 }
 
-struct ConsoleSlot(UnsafeCell<VirtioConsole>);
+struct ConsoleCell(UnsafeCell<VirtioConsole>);
 // SAFETY: all mutation is serialised by `uni_kernel::serial`'s spinlock
 // (see module-level comment).
-unsafe impl Sync for ConsoleSlot {}
+unsafe impl Sync for ConsoleCell {}
 
-static CONSOLE: ConsoleSlot =
-    ConsoleSlot(UnsafeCell::new(VirtioConsole::new()));
+static CONSOLE: ConsoleCell =
+    ConsoleCell(UnsafeCell::new(VirtioConsole::new()));
 
 // TX/RX ring index state. Atomic so cross-core access is data-race-free at
 // the language level. The actual TX serialisation is done by the caller

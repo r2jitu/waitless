@@ -120,13 +120,13 @@ mod aarch64 {
     // `register_irq_handler`; read from the exception handler on any
     // core. Per-slot writes + reads are single-word and tearing-safe
     // on aarch64. Wrapped in `UnsafeCell` + `unsafe impl Sync`.
-    struct IrqHandlersSlot(core::cell::UnsafeCell<[Option<fn(u32)>; MAX_IRQS]>);
+    struct IrqHandlersCell(core::cell::UnsafeCell<[Option<fn(u32)>; MAX_IRQS]>);
     // SAFETY: single-writer (BSP) with single-word slot stores; readers
     // only observe fully-published handler pointers.
-    unsafe impl Sync for IrqHandlersSlot {}
+    unsafe impl Sync for IrqHandlersCell {}
 
-    static IRQ_HANDLERS: IrqHandlersSlot =
-        IrqHandlersSlot(core::cell::UnsafeCell::new([None; MAX_IRQS]));
+    static IRQ_HANDLERS: IrqHandlersCell =
+        IrqHandlersCell(core::cell::UnsafeCell::new([None; MAX_IRQS]));
 
     // ---- Exception handler (called from vector stubs in boot.S) -----------
 

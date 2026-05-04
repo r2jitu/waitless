@@ -125,11 +125,11 @@ impl IdtState {
     }
 }
 
-struct IdtSlot(UnsafeCell<IdtState>);
+struct IdtCell(UnsafeCell<IdtState>);
 // SAFETY: see module-level contract above.
-unsafe impl Sync for IdtSlot {}
+unsafe impl Sync for IdtCell {}
 
-static IDT: IdtSlot = IdtSlot(UnsafeCell::new(IdtState::new()));
+static IDT: IdtCell = IdtCell(UnsafeCell::new(IdtState::new()));
 
 // ============================================================================
 // ISR stub table — defined in idt_stubs.S

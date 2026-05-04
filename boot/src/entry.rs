@@ -344,12 +344,12 @@ mod boot_shim_fdt {
 
 // Scratch for the legacy entry's BootInfo — populated by the arch-
 // specific shim, then handed to `kernel_boot` as an immutable ref.
-struct BootInfoSlot(core::cell::UnsafeCell<BootInfo>);
+struct BootInfoCell(core::cell::UnsafeCell<BootInfo>);
 // SAFETY: BSP-only during boot; the shim writes it and `kernel_boot`
 // reads it, both on the same thread with no overlap.
-unsafe impl Sync for BootInfoSlot {}
+unsafe impl Sync for BootInfoCell {}
 
-static G_BOOT_INFO: BootInfoSlot = BootInfoSlot(core::cell::UnsafeCell::new(BootInfo::zeroed()));
+static G_BOOT_INFO: BootInfoCell = BootInfoCell(core::cell::UnsafeCell::new(BootInfo::zeroed()));
 
 unsafe fn kernel_boot(info: &BootInfo) {
     unsafe {
@@ -423,8 +423,8 @@ unsafe fn kernel_boot(info: &BootInfo) {
     }
     klog!("platform: {}\n", uni_kernel::cpu_info::hypervisor());
     klog!("mem: {} / {} MB heap\n",
-          mm::get_free_memory() / (1024 * 1024),
-          mm::get_total_memory() / (1024 * 1024));
+          mm::free_memory() / (1024 * 1024),
+          mm::total_memory() / (1024 * 1024));
     #[cfg(target_arch = "x86_64")]
     klog!("irq: xAPIC online\n");
     #[cfg(target_arch = "aarch64")]
@@ -608,7 +608,7 @@ fn publish_boot_info(net_ok: bool) {
     }
 
     uni::boot_info::init_boot_info(BootInfoParams {
-        ram_bytes: uni_kernel::mm::get_total_memory(),
+        ram_bytes: uni_kernel::mm::total_memory(),
         num_cpus: uni_kernel::percpu::num_cores(),
         // No kernel command line plumbed through the boot shim yet —
         // expose an empty string so apps can still rely on the field.

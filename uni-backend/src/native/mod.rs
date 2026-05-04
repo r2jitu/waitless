@@ -201,7 +201,7 @@ unsafe extern "C" {
     fn __errno_location() -> *mut i32;
 }
 
-fn get_errno() -> i32 {
+fn errno() -> i32 {
     unsafe {
         #[cfg(target_os = "macos")]
         { *__error() }
@@ -692,11 +692,11 @@ fn drain_udp_sibling(fd: i32, app_port: u16) {
 // Per-thread state. Written exclusively during init_native (BSP) and
 // then by each worker's own slot afterwards — no cross-thread
 // mutation. UnsafeCell + unsafe impl Sync encodes the contract.
-struct ThreadsSlot(UnsafeCell<[ThreadState; MAX_THREADS]>);
+struct ThreadsCell(UnsafeCell<[ThreadState; MAX_THREADS]>);
 // SAFETY: each worker mutates only its own slot; BSP-only init
 // populates all slots before workers start.
-unsafe impl Sync for ThreadsSlot {}
-static THREADS: ThreadsSlot = ThreadsSlot(
+unsafe impl Sync for ThreadsCell {}
+static THREADS: ThreadsCell = ThreadsCell(
     UnsafeCell::new([const { ThreadState::new(0) }; MAX_THREADS])
 );
 

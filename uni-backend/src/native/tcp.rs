@@ -40,13 +40,13 @@ struct AsyncTcpListener {
     fd: i32,
 }
 
-struct AsyncTcpListenersSlot(UnsafeCell<[Option<AsyncTcpListener>; MAX_ASYNC_TCP_LISTENERS]>);
+struct AsyncTcpListenersCell(UnsafeCell<[Option<AsyncTcpListener>; MAX_ASYNC_TCP_LISTENERS]>);
 // SAFETY: populated only on the main thread during `uni_init`
 // (via `async_tcp_listen_hook` from `uni::runtime::TcpListener::bind`);
 // read from workers afterwards without further mutation.
-unsafe impl Sync for AsyncTcpListenersSlot {}
-static ASYNC_TCP_LISTENERS: AsyncTcpListenersSlot =
-    AsyncTcpListenersSlot(UnsafeCell::new([const { None }; MAX_ASYNC_TCP_LISTENERS]));
+unsafe impl Sync for AsyncTcpListenersCell {}
+static ASYNC_TCP_LISTENERS: AsyncTcpListenersCell =
+    AsyncTcpListenersCell(UnsafeCell::new([const { None }; MAX_ASYNC_TCP_LISTENERS]));
 static ASYNC_TCP_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 fn make_listener(port: u16) -> i32 {
@@ -301,7 +301,7 @@ fn native_tcp_try_send(handle: *mut (), generation: u16, buf: &[u8]) -> isize {
         }
         // `send` returned -1. EAGAIN means "try again" — report 0 so
         // the future parks a waker. Any other errno is fatal.
-        if get_errno() == EAGAIN {
+        if errno() == EAGAIN {
             0
         } else {
             -1

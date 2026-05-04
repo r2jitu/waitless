@@ -64,7 +64,7 @@ struct Tss {
 // ---------------------------------------------------------------------------
 //
 // The GDT state (entries, TSS, GDTR) lives in one `UnsafeCell<GdtState>`
-// behind a `GdtSlot(unsafe impl Sync)` wrapper. Single-owner discipline:
+// behind a `GdtCell(unsafe impl Sync)` wrapper. Single-owner discipline:
 // `init()` writes on the BSP during boot, *before* any AP has been
 // started via `uni_kernel::x86_64::smp::boot_aps` and *before* any
 // interrupt handler runs (the IDT isn't loaded yet either). After that
@@ -120,11 +120,11 @@ impl GdtState {
     }
 }
 
-struct GdtSlot(UnsafeCell<GdtState>);
+struct GdtCell(UnsafeCell<GdtState>);
 // SAFETY: all mutation is single-threaded by contract (see module comment).
-unsafe impl Sync for GdtSlot {}
+unsafe impl Sync for GdtCell {}
 
-static GDT: GdtSlot = GdtSlot(UnsafeCell::new(GdtState::new()));
+static GDT: GdtCell = GdtCell(UnsafeCell::new(GdtState::new()));
 
 // ---------------------------------------------------------------------------
 // Internal helpers

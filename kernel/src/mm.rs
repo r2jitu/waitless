@@ -70,9 +70,9 @@ const PAGE_SIZE: u64 = 4096;
 //
 // Total RAM (sum of MEM_AVAILABLE region lengths) and the highest
 // observed physical address. Captured once at boot, exposed via
-// `get_total_memory` for `BootInfo` publish + boot logs. Free
-// memory is read directly from talc's counters in
-// `get_free_memory`, so we don't need to track allocations here.
+// `total_memory` for `BootInfo` publish + boot logs. Free memory
+// is read directly from talc's counters in `free_memory`, so we
+// don't need to track allocations here.
 
 static TOTAL_RAM: AtomicU64 = AtomicU64::new(0);
 static MAX_PHYS_ADDR: AtomicU64 = AtomicU64::new(0);
@@ -154,7 +154,7 @@ fn kernel_end_phys(info: &BootInfo) -> u64 {
 /// Claim every `MEM_AVAILABLE` region from the boot memory map
 /// into the talc heap, splitting around the kernel image so we
 /// don't hand the loader's pages out as allocations. Tracks total
-/// RAM and the highest physical address for `get_total_memory`
+/// RAM and the highest physical address for `total_memory`
 /// and the boot log.
 fn init_heap(info: &BootInfo, kern_end_phys: u64) {
     let kern_start = info.kernel_phys_base;
@@ -463,11 +463,11 @@ pub fn heap_stats() -> HeapStats {
     }
 }
 
-pub fn get_total_memory() -> usize {
+pub fn total_memory() -> usize {
     TOTAL_RAM.load(Ordering::Acquire) as usize
 }
 
-pub fn get_free_memory() -> usize {
+pub fn free_memory() -> usize {
     heap_stats().available_bytes
 }
 
