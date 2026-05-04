@@ -254,6 +254,64 @@ def https_get(
         conn.close()
 
 
+def https_session_resume_check(
+    *, host: str = "127.0.0.1", port: int, ca_file: Optional[Path] = None,
+    sni: str = "unikernel.local", timeout: float = 5.0,
+) -> tuple[bool, bool]:
+    """Open two TLS connections back-to-back to `host:port`, sharing
+    one `SSLContext`, and report whether the second handshake reused
+    the first connection's session ticket.
+
+    Returns `(first_was_fresh, second_was_resumed)`. Both should be
+    `(True, True)` on a server that correctly issues NewSessionTicket
+    AND accepts the same ticket back via `pre_shared_key` on the
+    next handshake.
+
+    Useful for asserting end-to-end resumption (binder verify + Cert
+    skip) without measuring timing — Python's `ssl.SSLSocket.session_reused`
+    is the OpenSSL flag set after a handshake hits the resumption path.
+    """
+    if ca_file is not None:
+        ctx = ssl.create_default_context(cafile=str(ca_file))
+    else:
+        ctx = ssl._create_unverified_context()
+
+    def one_handshake(prev_session=None):
+        # Plain TLS handshake without HTTPS layering; we just want the
+        # `session_reused` flag and the populated `session` object.
+        sock = socket.create_connection((host, port), timeout=timeout)
+        try:
+            ssock = ctx.wrap_socket(sock, server_hostname=sni,
+                                    session=prev_session)
+            try:
+                # Drive a request so the server emits NewSessionTicket
+                # (which it does after Client Finished verifies). Server
+                # closes after the response per Connection: close, so we
+                # read until EOF.
+                req = (f"GET /health HTTP/1.1\r\nHost: {sni}\r\n"
+                       f"Connection: close\r\n\r\n").encode()
+                ssock.sendall(req)
+                while True:
+                    buf = ssock.recv(4096)
+                    if not buf:
+                        break
+                reused = ssock.session_reused
+                session = ssock.session
+                return reused, session
+            finally:
+                try:
+                    ssock.unwrap()
+                except OSError:
+                    pass
+                ssock.close()
+        finally:
+            sock.close()
+
+    reused1, session = one_handshake(None)
+    reused2, _ = one_handshake(session)
+    return (not reused1), reused2
+
+
 def udp_echo(
     payload: bytes = b"hello", *, host: str = "127.0.0.1",
     port: int, timeout: float = 2.0,

@@ -28,6 +28,7 @@ from scripts.test_helpers import (
     PtyLauncher,
     http_get,
     https_get,
+    https_session_resume_check,
     runfiles_root,
     spawn_backgrounded,
     udp_echo,
@@ -129,6 +130,33 @@ class WebserverServiceTest(unittest.TestCase):
         status, body = https_get("/xyz", port=TLS_PORT, ca_file=DEV_CERT)
         self.assertEqual(status, 404)
         self.assertIn(b"Not Found", body)
+
+    def test_https_session_resumption(self) -> None:
+        """Verify TLS 1.3 session resumption end-to-end.
+
+        Connection 1 is a fresh handshake — the server emits a
+        NewSessionTicket post-handshake. Connection 2 presents that
+        ticket via the `pre_shared_key` extension; the server matches
+        it, verifies the binder, and sends a ServerHello with
+        `selected_identity` while skipping the Certificate +
+        CertificateVerify flight. Python's `ssl.SSLSocket.session_reused`
+        flips to True iff that path completed successfully.
+
+        Regression guard for the resumption sprint: a refactor that
+        breaks ticket sealing, binder verification, or the
+        skip-Cert/CV branch will surface here as
+        `second_was_resumed=False` even when the TCP/TLS handshake
+        otherwise succeeds.
+        """
+        if not DEV_CERT.is_file():
+            self.skipTest("dev_cert.pem missing from runfiles")
+        first_was_fresh, second_was_resumed = https_session_resume_check(
+            port=TLS_PORT, ca_file=DEV_CERT,
+        )
+        self.assertTrue(first_was_fresh,
+                        "first handshake should be fresh (no cached session)")
+        self.assertTrue(second_was_resumed,
+                        "second handshake should reuse the ticket from #1")
 
     def test_https_burst_30(self) -> None:
         """30 back-to-back HTTPS GETs with 0 failures.
