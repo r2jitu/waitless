@@ -16,6 +16,8 @@ rust_library(
         "src/net/tcp.rs",
         "src/net/udp.rs",
         "src/select.rs",
+        "src/sleep.rs",
+        "src/task.rs",
     ],
     crate_name = "uni_runtime",
     deps = [
