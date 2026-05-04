@@ -358,6 +358,22 @@ impl KeySchedule {
         HandshakeSecrets { client_hs, server_hs }
     }
 
+    /// Compute the TLS 1.3 resumption_master_secret without
+    /// consuming `self.secret`. RFC 8446 §7.1:
+    ///
+    ///     resumption_master_secret =
+    ///         Derive-Secret(master_secret, "res master",
+    ///                       Transcript-Hash(ClientHello..ClientFinished))
+    ///
+    /// Caller must invoke this AFTER `enter_application` (which is what
+    /// transitions `self.secret` from handshake_secret → master_secret)
+    /// AND AFTER updating the transcript with the client Finished.
+    /// Returns the 32-byte resumption secret; the caller seals it
+    /// inside a ticket and forgets it.
+    pub fn resumption_secret(&self, transcript: &[u8; HASH_LEN]) -> [u8; HASH_LEN] {
+        derive_secret(&self.secret, b"res master", transcript)
+    }
+
     /// Transition from the Handshake stage to the Application stage.
     /// `transcript` is the hash through ServerFinished.
     pub fn enter_application(
@@ -489,6 +505,34 @@ mod tests {
         let mut sched_c = KeySchedule::new_without_psk();
         let hs_c = sched_c.enter_handshake(&dhe_flipped, &transcript);
         assert_ne!(hs_a.client_hs, hs_c.client_hs);
+    }
+
+    /// `resumption_secret` derives a fresh 32-byte secret from the
+    /// post-application master_secret + transcript-through-Finished.
+    /// Calling it twice with the same transcript yields the same
+    /// output; different transcripts yield different outputs and
+    /// neither matches `client_ap` / `server_ap` / `exporter`.
+    #[test]
+    fn resumption_secret_is_deterministic_and_distinct() {
+        let dhe = [0x66u8; 32];
+        let mid_transcript = [0x44u8; HASH_LEN];
+        let final_transcript = [0x55u8; HASH_LEN];
+        let post_cf_transcript = [0x99u8; HASH_LEN];
+
+        let mut sched = KeySchedule::new_without_psk();
+        let _hs = sched.enter_handshake(&dhe, &mid_transcript);
+        let app = sched.enter_application(&final_transcript);
+
+        let rms_a = sched.resumption_secret(&post_cf_transcript);
+        let rms_b = sched.resumption_secret(&post_cf_transcript);
+        assert_eq!(rms_a, rms_b);
+        // Different transcript → different secret.
+        let rms_c = sched.resumption_secret(&final_transcript);
+        assert_ne!(rms_a, rms_c);
+        // Distinct from every application-stage secret.
+        assert_ne!(rms_a, app.client_ap);
+        assert_ne!(rms_a, app.server_ap);
+        assert_ne!(rms_a, app.exporter);
     }
 
     /// Application-stage secrets differ from handshake-stage secrets

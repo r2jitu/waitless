@@ -22,11 +22,11 @@
 // state==1 spin window covers two `getrandom` calls — microseconds —
 // so contention on the very first handshake is bounded.
 //
-// `#[allow(dead_code)]` on the public surface: the wrappers are
-// wired into the handshake state machine in commits 3+4 of the
-// resumption work; until then the test suite is the only consumer
-// (via the `*_under_key` inner forms). The crate compiles with
-// `#![deny(warnings)]`, so the allow keeps this commit standalone.
+// `open_ticket` and the `*_under_key` inner forms get wired into
+// the resumption-acceptance path in commit 4. Until then they're
+// only exercised by this module's tests; the crate compiles with
+// `#![deny(warnings)]`, so squelch the dead-code complaints for
+// the not-yet-callable items.
 #![allow(dead_code)]
 
 use core::cell::UnsafeCell;
@@ -56,6 +56,12 @@ pub const PLAINTEXT_LEN: usize = 1 + 32 + 4 + 8 + 2;
 /// Total bytes a sealed ticket occupies on the wire.
 /// Layout: `key_name(16) || nonce(12) || ciphertext(47) || tag(16)`.
 pub const SEALED_LEN: usize = KEY_NAME_LEN + NONCE_LEN + PLAINTEXT_LEN + TAG_LEN;
+
+/// `ticket_lifetime` we advertise to clients in NewSessionTicket
+/// (RFC 8446 §4.6.1 — clients SHOULD discard a ticket older than this).
+/// The hard server-side freshness window is enforced separately by
+/// `open_ticket` via `max_age_cycles`. Capped at the spec's 7-day max.
+pub const TICKET_LIFETIME_SECONDS: u32 = 7 * 24 * 3600;
 
 /// Decoded ticket payload — what `seal_ticket` consumes and
 /// `open_ticket` produces. `version` is always `TICKET_VERSION` after

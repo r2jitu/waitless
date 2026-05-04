@@ -17,16 +17,36 @@ use p256::ecdsa::{signature::Signer, Signature as EcdsaSignature};
 
 use super::handshake::{
     build_certificate, build_certificate_verify, build_encrypted_extensions, build_finished,
-    build_server_hello, encode_handshake, msg_type, parse_finished, parse_handshake,
-    sign_content_server_cert_verify, ClientHello, ParseError,
+    build_new_session_ticket, build_server_hello, cipher_suite, encode_handshake, msg_type,
+    parse_finished, parse_handshake, sign_content_server_cert_verify, ClientHello, ParseError,
 };
 use super::record::{self, content_type, open as record_open, seal as record_seal, RecordError, HEADER_LEN};
 use super::tls::{TrafficKey, HASH_LEN};
 
 use super::keys::{ct_eq_32, derive_finished_key, hmac_sha256};
 use super::profile;
+use super::ticket::{
+    seal_ticket, TicketPlaintext, SEALED_LEN, TICKET_LIFETIME_SECONDS, TICKET_VERSION,
+};
 use super::trace;
 use super::{State, HandshakeError, TlsServer, TlsServerConfig, TX_BUF_LEN};
+
+/// Monotonic value the server stamps into freshly-issued tickets and
+/// against which `open_ticket` measures age.
+///
+/// Bare-metal: arch cycle counter (CNTVCT_EL0 / TSC), already
+/// calibrated for use by the existing boot-phase timing.
+/// Native: 0 — the freshness window is effectively disabled until
+/// the runtime grows a unified monotonic clock; tickets still seal
+/// and open correctly, they just can't expire.
+#[cfg(target_os = "none")]
+fn ticket_now_cycles() -> u64 {
+    uni_kernel::time::now_cycles()
+}
+#[cfg(not(target_os = "none"))]
+fn ticket_now_cycles() -> u64 {
+    0
+}
 
 impl TlsServer {
     /// Handle the WaitClientHello state. Looks for one plaintext record
@@ -373,8 +393,98 @@ impl TlsServer {
         // Consume the record.
         self.drain_rx(consumed);
 
+        // Issue exactly one resumption ticket. The handshake state
+        // machine has already advanced `self.schedule.secret` to
+        // master_secret (via `enter_application` in do_client_hello),
+        // and the transcript above has just been updated with
+        // ClientFinished — both preconditions for `resumption_secret`
+        // (RFC 8446 §7.1). Failure here is treated as soft: a logged
+        // trace + drop the ticket. The handshake itself is already
+        // complete; clients that wanted resumption simply won't get it.
+        if let Err(e) = self.emit_session_ticket() {
+            trace::error(self.state, &e);
+        }
+
         self.state = State::Established;
         trace::step(b"[tls] Client Finished verified -> Established\n");
+        Ok(())
+    }
+
+    /// Build, seal, and emit one NewSessionTicket post-handshake
+    /// message. Called from `do_client_finished` immediately before
+    /// the Established transition. The TX buffer must have room for
+    /// the (currently small) sealed record; if it doesn't, we surface
+    /// `TxBufTooSmall` so the caller can decide whether the conn is
+    /// still usable (it is — the handshake completed).
+    fn emit_session_ticket(&mut self) -> Result<(), HandshakeError> {
+        // Derive resumption_master_secret over the transcript that
+        // now ends with ClientFinished.
+        let post_cf_transcript = self.transcript.snapshot();
+        let rms = self.schedule.resumption_secret(&post_cf_transcript);
+
+        // RNG: ticket_age_add is a u32 that obscures absolute ticket
+        // age (RFC 8446 §4.2.11.1). Failure to draw RNG is fatal for
+        // the ticket but not for the handshake.
+        let mut age_bytes = [0u8; 4];
+        if getrandom::getrandom(&mut age_bytes).is_err() {
+            return Err(HandshakeError::Internal);
+        }
+        let age_add = u32::from_be_bytes(age_bytes);
+
+        // Seal the ticket plaintext. Wipe the rms after we've handed
+        // ownership to the (drop-impl-zeroizing) TicketPlaintext.
+        let pt = TicketPlaintext {
+            version: TICKET_VERSION,
+            resumption_master_secret: rms,
+            ticket_age_add: age_add,
+            issued_at_cycles: ticket_now_cycles(),
+            cipher_suite: cipher_suite::TLS_CHACHA20_POLY1305_SHA256,
+        };
+        let mut sealed = [0u8; SEALED_LEN];
+        let n = seal_ticket(&pt, &mut sealed).ok_or(HandshakeError::Internal)?;
+        debug_assert_eq!(n, SEALED_LEN);
+
+        // Wrap the sealed blob in a NewSessionTicket body, then in a
+        // handshake header, then in an encrypted record under
+        // server_ap_tk. The body is small (~100 bytes), so a stack
+        // buffer is fine.
+        let mut nst_body = [0u8; SEALED_LEN + 32];
+        // ticket_nonce = "" — we issue exactly one ticket per
+        // connection, so the nonce-distinguisher RFC 8446 mentions
+        // serves no purpose here.
+        let body_len = build_new_session_ticket(
+            TICKET_LIFETIME_SECONDS,
+            age_add,
+            &[],
+            &sealed[..n],
+            &mut nst_body,
+        )
+        .ok_or(HandshakeError::Internal)?;
+
+        let mut nst_msg = [0u8; SEALED_LEN + 64];
+        let msg_len = encode_handshake(
+            msg_type::NEW_SESSION_TICKET,
+            &nst_body[..body_len],
+            &mut nst_msg,
+        )
+        .ok_or(HandshakeError::Internal)?;
+
+        let tk = self
+            .server_ap_tk
+            .as_mut()
+            .ok_or(HandshakeError::Internal)?;
+        let needed = HEADER_LEN + msg_len + 1 + record::TAG_LEN;
+        if TX_BUF_LEN - self.tx_len < needed {
+            return Err(HandshakeError::TxBufTooSmall);
+        }
+        let written = record_seal(
+            tk,
+            content_type::HANDSHAKE,
+            &nst_msg[..msg_len],
+            &mut self.tx_buf[self.tx_len..],
+        )?;
+        self.tx_len += written;
+        trace::step(b"[tls] NewSessionTicket sealed\n");
         Ok(())
     }
 
