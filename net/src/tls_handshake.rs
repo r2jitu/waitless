@@ -554,15 +554,21 @@ impl<'a> ClientHello<'a> {
 /// Build a ServerHello body for TLS 1.3 with
 /// cipher_suite = TLS_CHACHA20_POLY1305_SHA256 and key_share = X25519.
 ///
+/// `selected_psk_identity` is `Some(idx)` when the server is accepting
+/// a resumption offer — `idx` indexes into the client's PskIdentity
+/// list and goes out as the body of the ServerHello `pre_shared_key`
+/// extension (RFC 8446 §4.2.11). `None` for fresh handshakes.
+///
 /// Writes into `out` and returns the body length. The caller should
 /// wrap the result with `encode_handshake(SERVER_HELLO, body, ...)`.
 pub fn build_server_hello(
     server_random: &[u8; 32],
     legacy_session_id_echo: &[u8],
     server_x25519_pub: &[u8; 32],
+    selected_psk_identity: Option<u16>,
     out: &mut [u8],
 ) -> Option<usize> {
-    // Layout:
+    // Layout (fresh handshake — without `selected_psk_identity`):
     //   u16  legacy_version = 0x0303
     //   32   random
     //   u8   session_id_len  + bytes
@@ -577,6 +583,9 @@ pub fn build_server_hello(
     //     u16  group = x25519
     //     u16  key_exchange_len = 32
     //     32   key_exchange
+    //
+    // Resumption: append a `pre_shared_key` extension carrying the
+    // u16 selected_identity (RFC 8446 §4.2.11). +6 bytes to `ext_total`.
     if legacy_session_id_echo.len() > 32 {
         return None;
     }
@@ -584,7 +593,9 @@ pub fn build_server_hello(
     // Extensions total (written first so we know the length):
     //   supported_versions: 2 + 2 + 2 = 6
     //   key_share:          2 + 2 + 2 + 2 + 32 = 40
-    let ext_total: u16 = 6 + 40;
+    //   pre_shared_key:     2 + 2 + 2 = 6 (resumption only)
+    let psk_ext_len: u16 = if selected_psk_identity.is_some() { 6 } else { 0 };
+    let ext_total: u16 = 6 + 40 + psk_ext_len;
     let sid_len = legacy_session_id_echo.len();
     let total = 2 + 32 + 1 + sid_len + 2 + 1 + 2 + ext_total as usize;
     if out.len() < total {
@@ -633,6 +644,12 @@ pub fn build_server_hello(
     p += 2;
     out[p..p + 32].copy_from_slice(server_x25519_pub);
     p += 32;
+
+    // Optional pre_shared_key extension (resumption).
+    if let Some(idx) = selected_psk_identity {
+        let psk_written = build_server_pre_shared_key_ext(idx, &mut out[p..])?;
+        p += psk_written;
+    }
 
     debug_assert_eq!(p, total);
     Some(p)
@@ -990,7 +1007,7 @@ mod tests {
         let sid_echo = [];
         let server_pub = [0xccu8; 32];
         let mut out = [0u8; 256];
-        let n = build_server_hello(&random, &sid_echo, &server_pub, &mut out).unwrap();
+        let n = build_server_hello(&random, &sid_echo, &server_pub, None, &mut out).unwrap();
 
         // Parse back the first few fields to sanity-check.
         assert_eq!(&out[0..2], &[0x03, 0x03]); // legacy_version
@@ -1016,6 +1033,25 @@ mod tests {
     /// Build a synthetic TLS 1.3 ClientHello with the minimum
     /// extensions we care about: supported_versions + supported_groups
     /// + key_share(x25519). Parse it and verify every field round-trips.
+    #[test]
+    fn server_hello_with_psk_appends_extension() {
+        let random = [0xbbu8; 32];
+        let sid = [];
+        let server_pub = [0xccu8; 32];
+        let mut out = [0u8; 256];
+        let n = build_server_hello(&random, &sid, &server_pub, Some(0x1234), &mut out)
+            .unwrap();
+        // Without PSK: 86 bytes (server_hello_layout test).
+        // With PSK: +6 bytes for the pre_shared_key extension envelope.
+        assert_eq!(n, 92);
+        // extensions_len = 46 (fresh) + 6 (psk) = 52
+        assert_eq!(u16::from_be_bytes([out[38], out[39]]), 52);
+        // The PSK extension sits at the very end: type 0x0029, len 2, body 0x1234.
+        assert_eq!(&out[86..88], &[0x00, 0x29]);
+        assert_eq!(&out[88..90], &[0x00, 0x02]);
+        assert_eq!(&out[90..92], &[0x12, 0x34]);
+    }
+
     #[test]
     fn parse_synthetic_client_hello() {
         let client_pub = [0x77u8; 32];

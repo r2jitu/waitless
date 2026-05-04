@@ -22,11 +22,13 @@
 // state==1 spin window covers two `getrandom` calls — microseconds —
 // so contention on the very first handshake is bounded.
 //
-// `open_ticket` and the `*_under_key` inner forms get wired into
-// the resumption-acceptance path in commit 4. Until then they're
-// only exercised by this module's tests; the crate compiles with
-// `#![deny(warnings)]`, so squelch the dead-code complaints for
-// the not-yet-callable items.
+// `seal_under_key` / `open_under_key` are exercised only by the
+// in-module test suite (the production paths use the global-key
+// wrappers). `current_ticket_key` likewise has no production reader
+// outside this module — the wrappers obtain the key directly via
+// `GLOBAL_TICKET_KEY`. Both are kept `pub(super)` / `pub` so future
+// callers (key-rotation rollover, debug dumps) don't need to add
+// them. `#![deny(warnings)]` would otherwise reject these.
 #![allow(dead_code)]
 
 use core::cell::UnsafeCell;

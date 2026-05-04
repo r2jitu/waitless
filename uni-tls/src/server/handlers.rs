@@ -18,15 +18,22 @@ use p256::ecdsa::{signature::Signer, Signature as EcdsaSignature};
 use super::handshake::{
     build_certificate, build_certificate_verify, build_encrypted_extensions, build_finished,
     build_new_session_ticket, build_server_hello, cipher_suite, encode_handshake, msg_type,
-    parse_finished, parse_handshake, sign_content_server_cert_verify, ClientHello, ParseError,
+    parse_finished, parse_handshake, psk_ke_mode, sign_content_server_cert_verify, ClientHello,
+    ParseError, PskOffer,
 };
 use super::record::{self, content_type, open as record_open, seal as record_seal, RecordError, HEADER_LEN};
-use super::tls::{TrafficKey, HASH_LEN};
+use super::tls::{
+    derive_secret, empty_transcript_hash, hkdf_expand_label, secure_zero, KeySchedule,
+    TrafficKey, HASH_LEN,
+};
+
+use sha2::{Digest as _, Sha256};
 
 use super::keys::{ct_eq_32, derive_finished_key, hmac_sha256};
 use super::profile;
 use super::ticket::{
-    seal_ticket, TicketPlaintext, SEALED_LEN, TICKET_LIFETIME_SECONDS, TICKET_VERSION,
+    open_ticket, seal_ticket, TicketPlaintext, SEALED_LEN, TICKET_LIFETIME_SECONDS,
+    TICKET_VERSION,
 };
 use super::trace;
 use super::{State, HandshakeError, TlsServer, TlsServerConfig, TX_BUF_LEN};
@@ -46,6 +53,122 @@ fn ticket_now_cycles() -> u64 {
 #[cfg(not(target_os = "none"))]
 fn ticket_now_cycles() -> u64 {
     0
+}
+
+/// Hard cap on how old a ticket can be before `open_ticket` rejects
+/// it. Bare-metal: 7 days converted via `cycles_per_us`. Native:
+/// `u64::MAX` (effectively no expiry — see comment on
+/// `ticket_now_cycles`).
+#[cfg(target_os = "none")]
+fn ticket_max_age_cycles() -> u64 {
+    let cyc_per_us = uni_kernel::time::cycles_per_us();
+    // 7 days * 24h * 3600s * 1e6 us/s, then × cyc_per_us. Saturating
+    // multiplication so a wildly fast cycle counter can't wrap.
+    (7u64 * 24 * 3600 * 1_000_000).saturating_mul(cyc_per_us)
+}
+#[cfg(not(target_os = "none"))]
+fn ticket_max_age_cycles() -> u64 {
+    u64::MAX
+}
+
+/// Outcome of attempting to resume a session from a `pre_shared_key`
+/// extension.
+struct ResumeAccept {
+    /// Fresh `KeySchedule` initialised via `new_with_psk` from the
+    /// recovered resumption_master_secret. Replaces the default
+    /// `new_without_psk` schedule on the connection.
+    schedule: KeySchedule,
+    /// Index into the client's PskIdentity list — echoes back as
+    /// `selected_identity` in the ServerHello pre_shared_key extension.
+    selected_identity: u16,
+}
+
+/// Try every PskIdentity in the order the client sent them; first
+/// one whose ticket opens AND whose binder verifies wins.
+///
+/// Per RFC 8446 §4.2.11: a server that finds no acceptable PSK MAY
+/// fall back to a fresh handshake — so this returns `None` for any
+/// rejection (decrypt fail, expired, suite mismatch, binder mismatch)
+/// and lets the caller continue down the fresh path with no observable
+/// difference to the client.
+///
+/// `full_handshake_message` is the bytes of the entire ClientHello
+/// handshake message INCLUDING the 4-byte `(type, uint24 length)`
+/// header. RFC 8446 §4.2.11.2 specifies the binder transcript as
+/// `Truncate(ClientHello)` — everything up to but not including the
+/// binders list — and Truncate is computed over the full handshake
+/// message, so we hash from byte 0 to `4 + binders_offset`.
+fn try_resume(
+    full_handshake_message: &[u8],
+    psk_offer: &PskOffer<'_>,
+    psk_modes: u8,
+) -> Option<ResumeAccept> {
+    // Forward secrecy is non-negotiable — only psk_dhe_ke is accepted.
+    if psk_modes & psk_ke_mode::FLAG_PSK_DHE_KE == 0 {
+        return None;
+    }
+    let truncate_len = 4 + psk_offer.binders_offset;
+    if truncate_len > full_handshake_message.len() {
+        return None;
+    }
+
+    // Pre-compute the partial transcript hash once; the binder check
+    // for each candidate identity HMACs the same digest.
+    let mut hasher = Sha256::new();
+    hasher.update(&full_handshake_message[..truncate_len]);
+    let partial_transcript: [u8; HASH_LEN] = hasher.finalize().into();
+
+    let now = ticket_now_cycles();
+    let max_age = ticket_max_age_cycles();
+
+    let n = psk_offer.identity_count.min(psk_offer.binder_count) as usize;
+    for i in 0..n {
+        let identity_bytes = psk_offer.identities[i].0;
+        let binder = psk_offer.binders[i];
+
+        let opened = match open_ticket(identity_bytes, now, max_age) {
+            Some(t) => t,
+            None => continue,
+        };
+        // We only ever issue tickets for one cipher suite; reject on
+        // any other so a future suite addition can't cause silent
+        // misderivation.
+        if opened.cipher_suite != cipher_suite::TLS_CHACHA20_POLY1305_SHA256 {
+            continue;
+        }
+
+        // PSK = HKDF-Expand-Label(rms, "resumption", ticket_nonce, Hash.length)
+        // We seal tickets with empty ticket_nonce (one ticket per
+        // connection — the distinguisher serves no purpose).
+        let mut psk = [0u8; HASH_LEN];
+        hkdf_expand_label(
+            &opened.resumption_master_secret,
+            b"resumption",
+            &[],
+            &mut psk,
+        );
+
+        let candidate = KeySchedule::new_with_psk(&psk);
+        secure_zero(&mut psk);
+
+        // binder_key = Derive-Secret(early_secret, "res binder", "")
+        // finished_key = HKDF-Expand-Label(binder_key, "finished", "", 32)
+        // expected = HMAC(finished_key, partial_transcript)
+        let binder_key =
+            derive_secret(candidate.secret(), b"res binder", &empty_transcript_hash());
+        let finished_key = derive_finished_key(&binder_key);
+        let expected = hmac_sha256(&finished_key, &partial_transcript);
+
+        if ct_eq_32(binder, &expected) {
+            return Some(ResumeAccept {
+                schedule: candidate,
+                selected_identity: i as u16,
+            });
+        }
+        // Wrong binder: drop this candidate's schedule and keep trying.
+        // (KeySchedule::Drop wipes the secret on the way out.)
+    }
+    None
 }
 
 impl TlsServer {
@@ -89,17 +212,37 @@ impl TlsServer {
         // Parse ClientHello for the fields we need (client random,
         // session_id, X25519 share). We copy the few fields we care
         // about into owned locals immediately so we can drop the
-        // borrow into `self.rx_buf` and continue.
-        let (client_x25519_pub, session_id_echo, sid_len) = {
+        // borrow into `self.rx_buf` and continue. The resumption
+        // attempt is bracketed inside the same scope so PskOffer's
+        // slices into hs_body are still live; the returned
+        // `ResumeAccept` is owned (no borrows) and stays valid past
+        // the subsequent `drain_rx`.
+        let (client_x25519_pub, session_id_echo, sid_len, resume_accept) = {
             let ch = ClientHello::parse(hs_body).map_err(|_| HandshakeError::UnsupportedClient)?;
             trace::client_hello(&ch);
             let mut sid = [0u8; 32];
             let sid_len = ch.legacy_session_id.len();
             sid[..sid_len].copy_from_slice(ch.legacy_session_id);
             let pub_key = ch.x25519_client_pub.ok_or(HandshakeError::UnsupportedClient)?;
-            (pub_key, sid, sid_len)
+
+            let resume_accept = if let Some(psk_offer) = ch.psk.as_ref() {
+                let pre = profile::start();
+                let r = try_resume(body, psk_offer, ch.psk_ke_modes);
+                if r.is_some() {
+                    profile::mark(profile::Stage::PskBinder, pre);
+                }
+                r
+            } else {
+                None
+            };
+
+            (pub_key, sid, sid_len, resume_accept)
         };
-        trace::step(b"[tls] ClientHello parsed\n");
+        if resume_accept.is_some() {
+            trace::step(b"[tls] ClientHello parsed (resumed)\n");
+        } else {
+            trace::step(b"[tls] ClientHello parsed\n");
+        }
 
         // Update transcript with the full handshake message (body is
         // still borrowed into self.rx_buf; that's fine — transcript
@@ -130,11 +273,16 @@ impl TlsServer {
         let server_pub = ephemeral.public_bytes();
 
         // Build ServerHello body + handshake wrapper + plaintext record.
+        // On resumption we additionally emit a `pre_shared_key` extension
+        // carrying the matching identity index, and we'll skip the
+        // Certificate + CertificateVerify flight further down.
+        let selected_psk_identity = resume_accept.as_ref().map(|r| r.selected_identity);
         let mut sh_body = [0u8; 256];
         let sh_len = build_server_hello(
             &server_random,
             &session_id_echo[..sid_len],
             &server_pub,
+            selected_psk_identity,
             &mut sh_body,
         )
         .ok_or(HandshakeError::Internal)?;
@@ -158,6 +306,18 @@ impl TlsServer {
         // ── Compute shared secret + derive handshake traffic keys ──
         let shared = ephemeral.shared_secret(&client_x25519_pub);
         let t = profile::mark(profile::Stage::Ecdhe, t);
+        // If we're resuming, swap in the PSK-seeded schedule before
+        // entering the handshake stage. `enter_handshake` reads
+        // `self.schedule.secret` (the early secret) as one of its
+        // inputs to the HKDF cascade, so this MUST happen before that
+        // call. The dropped default schedule wipes its zeros via
+        // `Drop for KeySchedule`.
+        let resumed = if let Some(ra) = resume_accept {
+            self.schedule = ra.schedule;
+            true
+        } else {
+            false
+        };
         let transcript_h1 = self.transcript.snapshot();
         let hs_secrets = self.schedule.enter_handshake(&shared, &transcript_h1);
         self.client_hs_secret = Some(hs_secrets.client_hs);
@@ -201,56 +361,67 @@ impl TlsServer {
         trace::step(b"[tls] EncryptedExtensions sealed\n");
         let t = profile::mark(profile::Stage::EncExt, t);
 
-        // Certificate
-        // Build into a stack buffer; 2 KB handles our 500-ish-byte dev cert.
-        let mut cert_body = [0u8; 2048];
-        let cert_body_len =
-            build_certificate(config.cert_der, &mut cert_body).ok_or(HandshakeError::Internal)?;
-        let mut cert_msg = [0u8; 2100];
-        let cert_msg_len = encode_handshake(
-            msg_type::CERTIFICATE,
-            &cert_body[..cert_body_len],
-            &mut cert_msg,
-        )
-        .ok_or(HandshakeError::Internal)?;
-        self.transcript.update(&cert_msg[..cert_msg_len]);
-        self.seal_handshake_record(&mut server_hs_tk, &cert_msg[..cert_msg_len])?;
-        trace::step(b"[tls] Certificate sealed\n");
-        let t = profile::mark(profile::Stage::Cert, t);
+        // Certificate + CertificateVerify — fresh handshakes only.
+        // RFC 8446 §2.2: a successfully resumed PSK handshake
+        // authenticates via the binder + the resumed key material;
+        // the server flight skips both the Certificate and
+        // CertificateVerify messages. Saving roughly half the
+        // handshake's wall-time on the resumed path is the whole
+        // point of resumption.
+        let t = if !resumed {
+            // Certificate
+            // Build into a stack buffer; 2 KB handles our 500-ish-byte dev cert.
+            let mut cert_body = [0u8; 2048];
+            let cert_body_len = build_certificate(config.cert_der, &mut cert_body)
+                .ok_or(HandshakeError::Internal)?;
+            let mut cert_msg = [0u8; 2100];
+            let cert_msg_len = encode_handshake(
+                msg_type::CERTIFICATE,
+                &cert_body[..cert_body_len],
+                &mut cert_msg,
+            )
+            .ok_or(HandshakeError::Internal)?;
+            self.transcript.update(&cert_msg[..cert_msg_len]);
+            self.seal_handshake_record(&mut server_hs_tk, &cert_msg[..cert_msg_len])?;
+            trace::step(b"[tls] Certificate sealed\n");
+            let t = profile::mark(profile::Stage::Cert, t);
 
-        // CertificateVerify: sign the transcript hash through Certificate.
-        // ECDSA P-256 + SHA-256 per TLS 1.3 sig_scheme::ECDSA_SECP256R1_SHA256.
-        // `SigningKey::sign` pre-hashes the message with SHA-256 (the
-        // signature::Signer impl for p256::ecdsa::SigningKey) and uses
-        // RFC 6979 deterministic `k` so we don't need an RNG here.
-        // The returned Signature is then DER-encoded into the
-        // `SEQUENCE { INTEGER r, INTEGER s }` shape TLS 1.3 requires
-        // on the wire. The SigningKey itself is pre-constructed in
-        // the shared TlsServerConfig so we don't pay a redundant
-        // `d*G` scalar multiplication per handshake just to populate
-        // the unused `verifying_key` field.
-        let transcript_hash = self.transcript.snapshot();
-        let mut sign_content = [0u8; 130];
-        sign_content_server_cert_verify(&transcript_hash, &mut sign_content);
-        let signature: EcdsaSignature = config.signing_key.sign(&sign_content);
-        let der_sig = signature.to_der();
-        let signature_bytes: &[u8] = der_sig.as_bytes();
-        let t = profile::mark(profile::Stage::CvSign, t);
+            // CertificateVerify: sign the transcript hash through Certificate.
+            // ECDSA P-256 + SHA-256 per TLS 1.3 sig_scheme::ECDSA_SECP256R1_SHA256.
+            // `SigningKey::sign` pre-hashes the message with SHA-256 (the
+            // signature::Signer impl for p256::ecdsa::SigningKey) and uses
+            // RFC 6979 deterministic `k` so we don't need an RNG here.
+            // The returned Signature is then DER-encoded into the
+            // `SEQUENCE { INTEGER r, INTEGER s }` shape TLS 1.3 requires
+            // on the wire. The SigningKey itself is pre-constructed in
+            // the shared TlsServerConfig so we don't pay a redundant
+            // `d*G` scalar multiplication per handshake just to populate
+            // the unused `verifying_key` field.
+            let transcript_hash = self.transcript.snapshot();
+            let mut sign_content = [0u8; 130];
+            sign_content_server_cert_verify(&transcript_hash, &mut sign_content);
+            let signature: EcdsaSignature = config.signing_key.sign(&sign_content);
+            let der_sig = signature.to_der();
+            let signature_bytes: &[u8] = der_sig.as_bytes();
+            let t = profile::mark(profile::Stage::CvSign, t);
 
-        let mut cv_body = [0u8; 128];
-        let cv_body_len =
-            build_certificate_verify(signature_bytes, &mut cv_body).ok_or(HandshakeError::Internal)?;
-        let mut cv_msg = [0u8; 150];
-        let cv_msg_len = encode_handshake(
-            msg_type::CERTIFICATE_VERIFY,
-            &cv_body[..cv_body_len],
-            &mut cv_msg,
-        )
-        .ok_or(HandshakeError::Internal)?;
-        self.transcript.update(&cv_msg[..cv_msg_len]);
-        self.seal_handshake_record(&mut server_hs_tk, &cv_msg[..cv_msg_len])?;
-        trace::step(b"[tls] CertificateVerify sealed\n");
-        let t = profile::mark(profile::Stage::CvSeal, t);
+            let mut cv_body = [0u8; 128];
+            let cv_body_len = build_certificate_verify(signature_bytes, &mut cv_body)
+                .ok_or(HandshakeError::Internal)?;
+            let mut cv_msg = [0u8; 150];
+            let cv_msg_len = encode_handshake(
+                msg_type::CERTIFICATE_VERIFY,
+                &cv_body[..cv_body_len],
+                &mut cv_msg,
+            )
+            .ok_or(HandshakeError::Internal)?;
+            self.transcript.update(&cv_msg[..cv_msg_len]);
+            self.seal_handshake_record(&mut server_hs_tk, &cv_msg[..cv_msg_len])?;
+            trace::step(b"[tls] CertificateVerify sealed\n");
+            profile::mark(profile::Stage::CvSeal, t)
+        } else {
+            t
+        };
 
         // Server Finished
         // verify_data = HMAC(finished_key, Transcript-Hash(CH ... CertVerify))

@@ -112,9 +112,14 @@ pub enum Stage {
     /// HKDF cascade for application traffic secrets
     /// (`KeySchedule::enter_application`).
     HkdfAp = 9,
+    /// Resumption-only: HKDF cascade for the PSK binder + HMAC verify
+    /// + transcript-hash setup. Replaces `cv_sign` time on the
+    /// resumed path; both stages stay separate so the report shows
+    /// where each handshake type spent its cycles.
+    PskBinder = 10,
 }
 
-const N_STAGES: usize = 10;
+const N_STAGES: usize = 11;
 
 const STAGE_NAMES: [&[u8]; N_STAGES] = [
     b"parse     ",
@@ -127,6 +132,7 @@ const STAGE_NAMES: [&[u8]; N_STAGES] = [
     b"cv_seal   ",
     b"finished  ",
     b"hkdf_ap   ",
+    b"psk_bind  ",
 ];
 
 // Per-stage totals. Each handshake adds its elapsed cycles to the
@@ -136,13 +142,13 @@ static TOTAL: [AtomicU64; N_STAGES] = [
     AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
     AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
     AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0),
 ];
 static WORST: [AtomicU64; N_STAGES] = [
     AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
     AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
     AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0),
 ];
 static HANDSHAKES: AtomicU64 = AtomicU64::new(0);
 
