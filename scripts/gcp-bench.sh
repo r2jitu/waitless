@@ -74,7 +74,12 @@ if [ $need_kvm -eq 1 ]; then
     bench_args+=(--elf "\$HOME/$REMOTE_DIR/webserver_qemu_x86_64.elf")
 fi
 if [ $need_native -eq 1 ]; then
-    bench_args+=(--native-bin "\$HOME/$REMOTE_DIR/webserver_native")
+    # `:webserver_bin` is the underlying rust_binary;
+    # `:webserver_native` is a launcher script that bakes BUILD-default
+    # `UNIKERNEL_*` env vars. Bench sets every var explicitly, so the
+    # launcher's defaults are no-ops — staging the raw binary skips
+    # the launcher's runfile bookkeeping.
+    bench_args+=(--native-bin "\$HOME/$REMOTE_DIR/webserver_bin")
 fi
 
 if [ $do_build -eq 1 ]; then
@@ -84,8 +89,8 @@ if [ $do_build -eq 1 ]; then
         bazel build //apps/webserver:webserver_qemu_x86_64
     fi
     if [ $need_native -eq 1 ]; then
-        echo "==> Building :webserver_native (x86_64-linux)..."
-        bazel build --config=x86_64-linux //apps/webserver:webserver_native
+        echo "==> Building :webserver_bin (x86_64-linux)..."
+        bazel build --config=x86_64-linux //apps/webserver:webserver_bin
     fi
 fi
 
@@ -106,7 +111,7 @@ if [ $need_kvm -eq 1 ]; then
     sync_files+=("$ELF")
 fi
 if [ $need_native -eq 1 ]; then
-    NBIN="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver_native"
+    NBIN="$PROJECT_ROOT/bazel-bin/apps/webserver/webserver_bin"
     [ -f "$NBIN" ] || { echo "error: $NBIN not found; run without --no-build" >&2; exit 1; }
     sync_files+=("$NBIN")
 fi

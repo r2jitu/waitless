@@ -216,11 +216,15 @@ class DockerEnv:
 
     def build(self):
         root = _project_root()
+        # `:webserver_bin` is the underlying rust_binary;
+        # `:webserver_native` is the BUILD-defaults launcher script.
+        # Docker only needs the binary — env vars are set via
+        # `docker run -e`, so the launcher's defaults are redundant.
         subprocess.run(
-            ["bazel", "build", "--config=x86_64-linux", "//apps/webserver:webserver_native"],
+            ["bazel", "build", "--config=x86_64-linux", "//apps/webserver:webserver_bin"],
             capture_output=True, cwd=root, timeout=120)
         bench_dir = os.path.join(root, "bench")
-        src = os.path.join(root, "bazel-bin/apps/webserver/webserver_native")
+        src = os.path.join(root, "bazel-bin/apps/webserver/webserver_bin")
         if os.path.exists(src):
             os.makedirs(bench_dir, exist_ok=True)
             shutil.copy2(src, os.path.join(bench_dir, "webserver_native"))
@@ -267,13 +271,17 @@ class NativeEnv:
         if self.bin_override:
             return  # Pre-staged binary; nothing to build.
         config = "aarch64-macos" if platform.machine() in ("arm64", "aarch64") else "x86_64-linux"
+        # Bypass the `:webserver_native` launcher (which sets BUILD
+        # port-fwd defaults) and build the underlying rust_binary
+        # directly — `start()` sets every `UNIKERNEL_*` it needs, so
+        # the launcher's defaults would be no-ops anyway.
         subprocess.run(
-            ["bazel", "build", f"--config={config}", "//apps/webserver:webserver_native"],
+            ["bazel", "build", f"--config={config}", "//apps/webserver:webserver_bin"],
             capture_output=True, cwd=_project_root(), timeout=120)
 
     def start(self, cpus, port):
         bin_path = self.bin_override or os.path.join(
-            _project_root(), "bazel-bin/apps/webserver/webserver_native")
+            _project_root(), "bazel-bin/apps/webserver/webserver_bin")
         if not os.path.exists(bin_path):
             return None
         env = os.environ.copy()

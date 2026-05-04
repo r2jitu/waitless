@@ -282,9 +282,11 @@ def main():
     # Kill stale processes
     subprocess.run(["pkill", "-9", "-f", "qemu-system"], capture_output=True)
     subprocess.run(["pkill", "-9", "-f", "run-hvf"], capture_output=True)
-    # Anchor to argv[0] to avoid matching our own bench.py cmdline when
-    # --native-bin /path/webserver_native is passed.
-    subprocess.run(["pkill", "-9", "-f", r"^\S*/webserver_native( |$)"],
+    # Anchor to argv[0] to avoid matching our own bench.py cmdline
+    # when `--native-bin /path/webserver_bin` is passed. Bench spawns
+    # the underlying `:webserver_bin` rust_binary directly, so that's
+    # the argv[0] we need to reap.
+    subprocess.run(["pkill", "-9", "-f", r"^\S*/webserver_bin( |$)"],
                    capture_output=True)
     time.sleep(2)
 
