@@ -26,14 +26,14 @@ use super::tls::{TrafficKey, HASH_LEN};
 use super::keys::{ct_eq_32, derive_finished_key, hmac_sha256};
 use super::profile;
 use super::trace;
-use super::{State, TlsError, TlsServer, TlsServerConfig, TX_BUF_LEN};
+use super::{State, HandshakeError, TlsServer, TlsServerConfig, TX_BUF_LEN};
 
 impl TlsServer {
     /// Handle the WaitClientHello state. Looks for one plaintext record
     /// of content_type::handshake containing ClientHello. If found,
     /// emits the full server flight into tx_buf and transitions to
     /// WaitClientFinished.
-    pub(super) fn do_client_hello(&mut self, config: &TlsServerConfig) -> Result<(), TlsError> {
+    pub(super) fn do_client_hello(&mut self, config: &TlsServerConfig) -> Result<(), HandshakeError> {
         // Need at least a record header.
         if self.rx_len < record::HEADER_LEN {
             return Ok(());
@@ -51,7 +51,7 @@ impl TlsServer {
             Err(e) => return Err(e.into()),
         };
         if ct != content_type::HANDSHAKE {
-            return Err(TlsError::UnexpectedRecord);
+            return Err(HandshakeError::UnexpectedRecord);
         }
         // Check handshake type. A partial handshake message inside a
         // complete record is theoretically possible (fragmentation) but
@@ -63,7 +63,7 @@ impl TlsServer {
             Err(e) => return Err(e.into()),
         };
         if hs_type != msg_type::CLIENT_HELLO {
-            return Err(TlsError::UnexpectedRecord);
+            return Err(HandshakeError::UnexpectedRecord);
         }
 
         // Parse ClientHello for the fields we need (client random,
@@ -71,12 +71,12 @@ impl TlsServer {
         // about into owned locals immediately so we can drop the
         // borrow into `self.rx_buf` and continue.
         let (client_x25519_pub, session_id_echo, sid_len) = {
-            let ch = ClientHello::parse(hs_body).map_err(|_| TlsError::UnsupportedClient)?;
+            let ch = ClientHello::parse(hs_body).map_err(|_| HandshakeError::UnsupportedClient)?;
             trace::client_hello(&ch);
             let mut sid = [0u8; 32];
             let sid_len = ch.legacy_session_id.len();
             sid[..sid_len].copy_from_slice(ch.legacy_session_id);
-            let pub_key = ch.x25519_client_pub.ok_or(TlsError::UnsupportedClient)?;
+            let pub_key = ch.x25519_client_pub.ok_or(HandshakeError::UnsupportedClient)?;
             (pub_key, sid, sid_len)
         };
         trace::step(b"[tls] ClientHello parsed\n");
@@ -104,9 +104,9 @@ impl TlsServer {
         // fatal Internal error because it means we can't finish the
         // handshake.
         let mut server_random = [0u8; 32];
-        getrandom::getrandom(&mut server_random).map_err(|_| TlsError::Internal)?;
+        getrandom::getrandom(&mut server_random).map_err(|_| HandshakeError::Internal)?;
         // Our ephemeral X25519 public key:
-        let ephemeral = self.ephemeral.take().ok_or(TlsError::Internal)?;
+        let ephemeral = self.ephemeral.take().ok_or(HandshakeError::Internal)?;
         let server_pub = ephemeral.public_bytes();
 
         // Build ServerHello body + handshake wrapper + plaintext record.
@@ -117,10 +117,10 @@ impl TlsServer {
             &server_pub,
             &mut sh_body,
         )
-        .ok_or(TlsError::Internal)?;
+        .ok_or(HandshakeError::Internal)?;
         let mut sh_msg = [0u8; 280];
         let sh_msg_len = encode_handshake(msg_type::SERVER_HELLO, &sh_body[..sh_len], &mut sh_msg)
-            .ok_or(TlsError::Internal)?;
+            .ok_or(HandshakeError::Internal)?;
 
         // Emit as plaintext record.
         let sh_rec_len = record::build_plaintext(
@@ -154,7 +154,7 @@ impl TlsServer {
         // harmless.
         let ccs: [u8; 6] = [0x14, 0x03, 0x03, 0x00, 0x01, 0x01];
         if TX_BUF_LEN - self.tx_len < ccs.len() {
-            return Err(TlsError::TxBufTooSmall);
+            return Err(HandshakeError::TxBufTooSmall);
         }
         self.tx_buf[self.tx_len..self.tx_len + ccs.len()].copy_from_slice(&ccs);
         self.tx_len += ccs.len();
@@ -168,14 +168,14 @@ impl TlsServer {
         // EncryptedExtensions
         let mut ee_body = [0u8; 16];
         let ee_body_len =
-            build_encrypted_extensions(&mut ee_body).ok_or(TlsError::Internal)?;
+            build_encrypted_extensions(&mut ee_body).ok_or(HandshakeError::Internal)?;
         let mut ee_msg = [0u8; 32];
         let ee_msg_len = encode_handshake(
             msg_type::ENCRYPTED_EXTENSIONS,
             &ee_body[..ee_body_len],
             &mut ee_msg,
         )
-        .ok_or(TlsError::Internal)?;
+        .ok_or(HandshakeError::Internal)?;
         self.transcript.update(&ee_msg[..ee_msg_len]);
         self.seal_handshake_record(&mut server_hs_tk, &ee_msg[..ee_msg_len])?;
         trace::step(b"[tls] EncryptedExtensions sealed\n");
@@ -185,14 +185,14 @@ impl TlsServer {
         // Build into a stack buffer; 2 KB handles our 500-ish-byte dev cert.
         let mut cert_body = [0u8; 2048];
         let cert_body_len =
-            build_certificate(config.cert_der, &mut cert_body).ok_or(TlsError::Internal)?;
+            build_certificate(config.cert_der, &mut cert_body).ok_or(HandshakeError::Internal)?;
         let mut cert_msg = [0u8; 2100];
         let cert_msg_len = encode_handshake(
             msg_type::CERTIFICATE,
             &cert_body[..cert_body_len],
             &mut cert_msg,
         )
-        .ok_or(TlsError::Internal)?;
+        .ok_or(HandshakeError::Internal)?;
         self.transcript.update(&cert_msg[..cert_msg_len]);
         self.seal_handshake_record(&mut server_hs_tk, &cert_msg[..cert_msg_len])?;
         trace::step(b"[tls] Certificate sealed\n");
@@ -219,14 +219,14 @@ impl TlsServer {
 
         let mut cv_body = [0u8; 128];
         let cv_body_len =
-            build_certificate_verify(signature_bytes, &mut cv_body).ok_or(TlsError::Internal)?;
+            build_certificate_verify(signature_bytes, &mut cv_body).ok_or(HandshakeError::Internal)?;
         let mut cv_msg = [0u8; 150];
         let cv_msg_len = encode_handshake(
             msg_type::CERTIFICATE_VERIFY,
             &cv_body[..cv_body_len],
             &mut cv_msg,
         )
-        .ok_or(TlsError::Internal)?;
+        .ok_or(HandshakeError::Internal)?;
         self.transcript.update(&cv_msg[..cv_msg_len]);
         self.seal_handshake_record(&mut server_hs_tk, &cv_msg[..cv_msg_len])?;
         trace::step(b"[tls] CertificateVerify sealed\n");
@@ -239,14 +239,14 @@ impl TlsServer {
         let sf_verify = hmac_sha256(&server_finished_key, &transcript_for_sfin);
         let mut sf_body = [0u8; HASH_LEN];
         let sf_body_len =
-            build_finished(&sf_verify, &mut sf_body).ok_or(TlsError::Internal)?;
+            build_finished(&sf_verify, &mut sf_body).ok_or(HandshakeError::Internal)?;
         let mut sf_msg = [0u8; 48];
         let sf_msg_len = encode_handshake(
             msg_type::FINISHED,
             &sf_body[..sf_body_len],
             &mut sf_msg,
         )
-        .ok_or(TlsError::Internal)?;
+        .ok_or(HandshakeError::Internal)?;
         self.transcript.update(&sf_msg[..sf_msg_len]);
         self.seal_handshake_record(&mut server_hs_tk, &sf_msg[..sf_msg_len])?;
         trace::step(b"[tls] ServerFinished sealed, entering WaitClientFinished\n");
@@ -273,10 +273,10 @@ impl TlsServer {
         &mut self,
         tk: &mut TrafficKey,
         body: &[u8],
-    ) -> Result<(), TlsError> {
+    ) -> Result<(), HandshakeError> {
         let needed = HEADER_LEN + body.len() + 1 + record::TAG_LEN;
         if TX_BUF_LEN - self.tx_len < needed {
-            return Err(TlsError::TxBufTooSmall);
+            return Err(HandshakeError::TxBufTooSmall);
         }
         let n = record_seal(tk, content_type::HANDSHAKE, body, &mut self.tx_buf[self.tx_len..])?;
         self.tx_len += n;
@@ -286,7 +286,7 @@ impl TlsServer {
     /// Handle the WaitClientFinished state. Parses one incoming
     /// encrypted record under the client handshake traffic key and
     /// expects it to contain a Finished message.
-    pub(super) fn do_client_finished(&mut self) -> Result<(), TlsError> {
+    pub(super) fn do_client_finished(&mut self) -> Result<(), HandshakeError> {
         trace::do_client_finished_entry(
             self.rx_len,
             if self.rx_len >= 1 { Some(self.rx_buf[0]) } else { None },
@@ -328,20 +328,20 @@ impl TlsServer {
         let tk = self
             .client_hs_tk
             .as_mut()
-            .ok_or(TlsError::Internal)?;
+            .ok_or(HandshakeError::Internal)?;
         let (inner_type, pt, consumed) = record_open(tk, &mut self.rx_buf[..total])?;
         trace::decrypted_record(inner_type, pt.len());
         if inner_type == content_type::ALERT && pt.len() >= 2 {
             trace::alert_received(pt[0], pt[1]);
         }
         if inner_type != content_type::HANDSHAKE {
-            return Err(TlsError::UnexpectedRecord);
+            return Err(HandshakeError::UnexpectedRecord);
         }
         // Parse the handshake message out of the decrypted body.
         // `pt` borrows from self.rx_buf; copy it out so we can drain.
         let mut msg_copy = [0u8; 256];
         if pt.len() > msg_copy.len() {
-            return Err(TlsError::Internal);
+            return Err(HandshakeError::Internal);
         }
         let pt_len = pt.len();
         msg_copy[..pt_len].copy_from_slice(pt);
@@ -349,7 +349,7 @@ impl TlsServer {
         let _ = pt;
         let (hs_type, hs_body) = parse_handshake(&msg_copy[..pt_len])?;
         if hs_type != msg_type::FINISHED {
-            return Err(TlsError::UnexpectedRecord);
+            return Err(HandshakeError::UnexpectedRecord);
         }
         let client_verify = parse_finished(hs_body)?;
 
@@ -359,13 +359,13 @@ impl TlsServer {
         let client_hs_secret = self
             .client_hs_secret
             .as_ref()
-            .ok_or(TlsError::Internal)?;
+            .ok_or(HandshakeError::Internal)?;
         let client_finished_key = derive_finished_key(client_hs_secret);
         let expected_verify = hmac_sha256(&client_finished_key, &self.transcript.snapshot());
 
         if !ct_eq_32(client_verify, &expected_verify) {
             trace::step(b"[tls]   BadClientFinished: verify_data mismatch\n");
-            return Err(TlsError::BadClientFinished);
+            return Err(HandshakeError::BadClientFinished);
         }
 
         // Now we can update the transcript with Client Finished.
@@ -380,7 +380,7 @@ impl TlsServer {
 
     /// Once established, decrypt incoming application-data records
     /// and buffer the plaintext.
-    pub(super) fn do_app_data(&mut self) -> Result<(), TlsError> {
+    pub(super) fn do_app_data(&mut self) -> Result<(), HandshakeError> {
         loop {
             if self.rx_len < record::HEADER_LEN {
                 return Ok(());
@@ -393,7 +393,7 @@ impl TlsServer {
             let tk = self
                 .client_ap_tk
                 .as_mut()
-                .ok_or(TlsError::Internal)?;
+                .ok_or(HandshakeError::Internal)?;
             let (inner_type, pt, consumed) = record_open(tk, &mut self.rx_buf[..total])?;
             match inner_type {
                 content_type::APPLICATION_DATA => {
@@ -419,7 +419,7 @@ impl TlsServer {
                     return Ok(());
                 }
                 _ => {
-                    return Err(TlsError::UnexpectedRecord);
+                    return Err(HandshakeError::UnexpectedRecord);
                 }
             }
         }

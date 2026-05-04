@@ -14,7 +14,7 @@
 
 #![allow(unused_variables, dead_code)]
 
-use super::{handshake, State, TlsError};
+use super::{handshake, State, HandshakeError};
 
 // `serial::puts` sink. Only compiled when `--cfg=tls_debug`
 // is set in `//uni-tls`'s rustc_flags. On the
@@ -203,7 +203,7 @@ pub fn alert_received(level: u8, desc: u8) {
 pub fn alert_received(_level: u8, _desc: u8) {}
 
 #[cfg(tls_debug)]
-pub fn error(state: State, err: &TlsError) {
+pub fn error(state: State, err: &HandshakeError) {
     serial::puts(b"[tls] ERROR in state=");
     serial::puts(state_name(state));
     serial::puts(b" err=");
@@ -211,7 +211,7 @@ pub fn error(state: State, err: &TlsError) {
     serial::puts(b"\n");
 }
 #[cfg(not(tls_debug))]
-pub fn error(_state: State, _err: &TlsError) {}
+pub fn error(_state: State, _err: &HandshakeError) {}
 
 // ── Internal formatting helpers (compiled only with tls_debug) ──────
 #[cfg(tls_debug)]
@@ -299,16 +299,16 @@ fn state_name(s: State) -> &'static [u8] {
 }
 
 #[cfg(tls_debug)]
-fn err_name(e: &TlsError) -> &'static [u8] {
+fn err_name(e: &HandshakeError) -> &'static [u8] {
     match e {
-        TlsError::ParseError(_) => b"ParseError",
-        TlsError::RecordError(_) => b"RecordError",
-        TlsError::UnsupportedClient => b"UnsupportedClient",
-        TlsError::AeadFailed => b"AeadFailed",
-        TlsError::TxBufTooSmall => b"TxBufTooSmall",
-        TlsError::BadClientFinished => b"BadClientFinished",
-        TlsError::UnexpectedRecord => b"UnexpectedRecord",
-        TlsError::Internal => b"Internal",
+        HandshakeError::ParseError(_) => b"ParseError",
+        HandshakeError::RecordError(_) => b"RecordError",
+        HandshakeError::UnsupportedClient => b"UnsupportedClient",
+        HandshakeError::AeadFailed => b"AeadFailed",
+        HandshakeError::TxBufTooSmall => b"TxBufTooSmall",
+        HandshakeError::BadClientFinished => b"BadClientFinished",
+        HandshakeError::UnexpectedRecord => b"UnexpectedRecord",
+        HandshakeError::Internal => b"Internal",
     }
 }
 

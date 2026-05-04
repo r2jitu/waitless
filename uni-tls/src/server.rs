@@ -172,7 +172,7 @@ fn extract_p256_d_from_pkcs8(blob: &[u8]) -> Option<[u8; 32]> {
 // have the names they need; silence the dead-code lint locally.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TlsError {
+pub enum HandshakeError {
     ParseError(ParseError),
     RecordError(RecordError),
     /// Client's ClientHello didn't meet our requirements
@@ -192,15 +192,15 @@ pub enum TlsError {
     Internal,
 }
 
-impl From<ParseError> for TlsError {
+impl From<ParseError> for HandshakeError {
     fn from(e: ParseError) -> Self {
-        TlsError::ParseError(e)
+        HandshakeError::ParseError(e)
     }
 }
 
-impl From<RecordError> for TlsError {
+impl From<RecordError> for HandshakeError {
     fn from(e: RecordError) -> Self {
-        TlsError::RecordError(e)
+        HandshakeError::RecordError(e)
     }
 }
 
@@ -208,7 +208,7 @@ impl From<RecordError> for TlsError {
 // State
 // ============================================================================
 
-#[allow(dead_code)] // `Failed` reachable via trace formatter only — see TlsError comment.
+#[allow(dead_code)] // `Failed` reachable via trace formatter only — see HandshakeError comment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     /// Before any bytes have arrived.
@@ -255,7 +255,7 @@ pub struct TlsServer {
     /// the eventual `state()`/`error()` accessor pair when a
     /// caller actually wants to inspect post-mortem.
     #[allow(dead_code)]
-    pub(crate) error: Option<TlsError>,
+    pub(crate) error: Option<HandshakeError>,
 
     // Raw TLS bytes received from peer (may contain partial or
     // multiple records). Heap-allocated so the 4 KB footprint lands
@@ -417,7 +417,7 @@ impl TlsServer {
     /// don't send alerts during a half-complete handshake because
     /// the traffic keys may not exist yet — closing the TCP without
     /// an alert is the conservative thing in that case).
-    pub fn close_notify(&mut self) -> Result<(), TlsError> {
+    pub fn close_notify(&mut self) -> Result<(), HandshakeError> {
         if self.state != State::Established {
             // No traffic keys, nothing we can cleanly encrypt.
             // Caller should just close TCP.
@@ -427,7 +427,7 @@ impl TlsServer {
         let tk = self
             .server_ap_tk
             .as_mut()
-            .ok_or(TlsError::Internal)?;
+            .ok_or(HandshakeError::Internal)?;
         let alert_body: [u8; 2] = [1, 0]; // warning(1), close_notify(0)
         let needed = record::HEADER_LEN + alert_body.len() + 1 + record::TAG_LEN;
         if TX_BUF_LEN - self.tx_len < needed {
@@ -450,14 +450,14 @@ impl TlsServer {
 
     /// Encrypt `plaintext` into a TLSCiphertext application_data record
     /// and append it to the TX buffer. Only valid in `Established` state.
-    pub fn send_app_data(&mut self, plaintext: &[u8]) -> Result<(), TlsError> {
+    pub fn send_app_data(&mut self, plaintext: &[u8]) -> Result<(), HandshakeError> {
         if self.state != State::Established {
-            return Err(TlsError::UnexpectedRecord);
+            return Err(HandshakeError::UnexpectedRecord);
         }
         let tk = self
             .server_ap_tk
             .as_mut()
-            .ok_or(TlsError::Internal)?;
+            .ok_or(HandshakeError::Internal)?;
 
         // Split plaintext into chunks that fit in one record (max
         // ~16 KB inner plaintext).
@@ -468,7 +468,7 @@ impl TlsServer {
             let space = TX_BUF_LEN - self.tx_len;
             let needed = record::HEADER_LEN + (end - offset) + 1 + record::TAG_LEN;
             if space < needed {
-                return Err(TlsError::TxBufTooSmall);
+                return Err(HandshakeError::TxBufTooSmall);
             }
             let n = record_seal(
                 tk,
@@ -494,13 +494,13 @@ impl TlsServer {
     /// Established would consume Finished and return, leaving the app
     /// data record stranded in `rx_buf` until the next caller push —
     /// which for a short HTTPS request never comes, wedging the conn.
-    pub fn advance(&mut self, config: &TlsServerConfig) -> Result<State, TlsError> {
+    pub fn advance(&mut self, config: &TlsServerConfig) -> Result<State, HandshakeError> {
         loop {
             let before_state = self.state;
             let before_rx = self.rx_len;
             let before_pt = self.pt_len;
             let before_tx = self.tx_len;
-            let step_result: Result<(), TlsError> = match self.state {
+            let step_result: Result<(), HandshakeError> = match self.state {
                 State::WaitClientHello => self.do_client_hello(config),
                 State::WaitClientFinished => self.do_client_finished(),
                 State::Established => self.do_app_data(),
