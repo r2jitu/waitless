@@ -101,6 +101,18 @@ pub fn client_hello(ch: &handshake::ClientHello<'_>) {
     });
     serial::puts(b" offers_x25519=");
     serial::puts(if ch.offers_x25519 { b"true" } else { b"false" });
+    serial::puts(b"\n[tls-debug] psk=");
+    if let Some(psk) = ch.psk.as_ref() {
+        serial::puts(b"Some(identities=");
+        put_u16_dec(psk.identity_count as u16);
+        serial::puts(b" binders=");
+        put_u16_dec(psk.binder_count as u16);
+        serial::puts(b") ke_modes=0x");
+        put_u16_hex(ch.psk_ke_modes as u16);
+    } else {
+        serial::puts(b"None ke_modes=0x");
+        put_u16_hex(ch.psk_ke_modes as u16);
+    }
     serial::puts(b"\n");
 }
 #[cfg(not(tls_debug))]

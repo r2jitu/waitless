@@ -18,6 +18,7 @@ use clap::{Parser, Subcommand};
 mod gateway;
 mod tcp_echo;
 mod tls_handshake;
+mod tls_resume;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -31,6 +32,9 @@ enum Workload {
     /// Full TLS 1.3 handshake rate: open TCP, handshake, send one
     /// HTTP/1.1 GET, read the response, close. Each worker loops
     /// independently; results are aggregated across workers.
+    /// Session resumption is disabled — every handshake is a fresh
+    /// ECDHE + ECDSA P-256 sign. Use `tls-resume` for the resumption
+    /// hot path.
     TlsHandshake {
         #[arg(long)]
         host: String,
@@ -44,6 +48,27 @@ enum Workload {
         warmup_secs: u64,
         /// Number of independent worker tasks driving handshakes
         /// in parallel. The harness scales this with target cpus.
+        #[arg(long, default_value = "4")]
+        parallelism: usize,
+    },
+    /// TLS 1.3 session resumption rate. Each worker keeps its own
+    /// ticket cache; the first handshake per worker is fresh
+    /// (skipped from the histogram), subsequent handshakes resume
+    /// via PSK-DHE. The server's flight skips Certificate +
+    /// CertificateVerify, so this workload's RPS / p50 should sit
+    /// well above `tls-handshake` once the server supports
+    /// resumption.
+    TlsResume {
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        port: u16,
+        #[arg(long, default_value = "/health")]
+        endpoint: String,
+        #[arg(long, default_value = "5")]
+        duration_secs: u64,
+        #[arg(long, default_value = "1")]
+        warmup_secs: u64,
         #[arg(long, default_value = "4")]
         parallelism: usize,
     },
@@ -115,6 +140,16 @@ fn main() -> std::io::Result<()> {
         Workload::TlsHandshake {
             host, port, endpoint, duration_secs, warmup_secs, parallelism,
         } => runtime.block_on(tls_handshake::run(
+            &host,
+            port,
+            &endpoint,
+            Duration::from_secs(duration_secs),
+            Duration::from_secs(warmup_secs),
+            parallelism,
+        )),
+        Workload::TlsResume {
+            host, port, endpoint, duration_secs, warmup_secs, parallelism,
+        } => runtime.block_on(tls_resume::run(
             &host,
             port,
             &endpoint,

@@ -81,6 +81,7 @@ from .workloads import (
     run_loadgen_gateway,
     run_loadgen_tcp_echo,
     run_loadgen_tls_handshake,
+    run_loadgen_tls_resume,
     run_wrk,
     run_wrk_https,
     udp_peak_concurrent,
@@ -175,6 +176,10 @@ WORKLOADS = [
      "endpoint": "/health",
      "parallelism_per_core": 4,
      "desc": "TLS 1.3 full handshake + GET + close (4 workers × cpus)"},
+    {"name": "tls_resume_max", "type": "tls_resume",
+     "endpoint": "/health",
+     "parallelism_per_core": 4,
+     "desc": "TLS 1.3 resumed (PSK-DHE) handshake + GET + close (4 workers × cpus)"},
 
     # ── Async TCP echo (guest:9 via `uni::runtime::TcpListener`) ─────────
     #
@@ -478,6 +483,24 @@ def main():
                     par = w.get("parallelism_per_core", 4) * cpus
                     with measure_client_cpu() as m:
                         rps, p50, p99 = run_loadgen_tls_handshake(
+                            tls_target_port, w["endpoint"], duration,
+                            host=wrk_host, parallelism=par)
+                    results[(env_name, cpus, wname)] = (rps, p50, p99)
+                    client_cpu[(env_name, cpus, wname)] = m["cores"]
+                    print(f"    {wname:<20s} {rps:>10.0f} hs/s   "
+                          f"p50={p50}  p99={p99}  {_cpu_tag(m['cores'])}")
+                elif w["type"] == "tls_resume":
+                    # Resumed-handshake hot path: each worker keeps
+                    # its own ticket cache, the first handshake per
+                    # worker is a fresh seed (excluded from the
+                    # histogram), and every subsequent handshake
+                    # offers the cached ticket via pre_shared_key.
+                    # The unikernel matches it, verifies the binder,
+                    # and skips Cert + CertVerify on the server flight
+                    # — the work that dominates fresh-handshake time.
+                    par = w.get("parallelism_per_core", 4) * cpus
+                    with measure_client_cpu() as m:
+                        rps, p50, p99 = run_loadgen_tls_resume(
                             tls_target_port, w["endpoint"], duration,
                             host=wrk_host, parallelism=par)
                     results[(env_name, cpus, wname)] = (rps, p50, p99)

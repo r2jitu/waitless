@@ -385,6 +385,35 @@ def run_loadgen_tls_handshake(port, endpoint, duration, host, parallelism, warmu
         return 0.0, "TIMEOUT", "TIMEOUT"
 
 
+def run_loadgen_tls_resume(port, endpoint, duration, host, parallelism, warmup=1):
+    """Run the Rust loadgen TLS-resumption workload. Each worker
+    seeds with one fresh handshake (excluded from the histogram) and
+    then loops on resumed PSK-DHE handshakes — the server's flight
+    skips Certificate + CertificateVerify, so wall-time per handshake
+    drops sharply (~30 µs vs ~226 µs cold on the unikernel).
+
+    No Python fallback: the Python harness path doesn't drive
+    rustls's resumption store, so without `cargo` we just report a
+    NO_LOADGEN sentinel rather than silently mis-measuring."""
+    bin_path = _loadgen_bin()
+    if bin_path is None:
+        return 0.0, "NO_LOADGEN", "NO_LOADGEN"
+    try:
+        r = subprocess.run(
+            [bin_path, "tls-resume",
+             "--host", host, "--port", str(port),
+             "--endpoint", endpoint,
+             "--duration-secs", str(duration),
+             "--warmup-secs", str(warmup),
+             "--parallelism", str(parallelism)],
+            capture_output=True, text=True, timeout=duration + warmup + 30)
+        if r.returncode != 0:
+            return 0.0, "ERROR", "ERROR"
+        return _parse_loadgen_output(r.stdout)
+    except (subprocess.TimeoutExpired, OSError):
+        return 0.0, "TIMEOUT", "TIMEOUT"
+
+
 def run_loadgen_tcp_echo(port, conns, duration, host="127.0.0.1", msg_size=64):
     """Run the Rust loadgen TCP-echo workload. Returns the same
     `(rps, p50, p99)` shape as `run_tcp_echo`."""

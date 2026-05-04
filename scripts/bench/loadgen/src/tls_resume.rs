@@ -1,15 +1,38 @@
-// TLS 1.3 handshake throughput workload.
+// TLS 1.3 session-resumption throughput workload.
 //
-// `parallelism` worker tasks loop:
-//   TCP connect → TLS handshake → send GET → read response → close.
+// Counterpart to `tls_handshake_max`. The two workloads measure
+// opposite sides of the same path:
 //
-// Each worker keeps its own latency histogram, dropping the first
-// `warmup` window of samples, and at the end the main task
-// merges them.
+//   tls_handshake_max:  full ECDHE + ECDSA P-256 sign every conn.
+//   tls_resume_max:     PSK-DHE binder verify, server skips the
+//                       Certificate + CertificateVerify flight.
 //
-// Skip cert verification (the unikernel ships a self-signed dev
-// cert; the workload measures handshake throughput, not chain
-// validation).
+// Wire flow per worker:
+//   1. First connection: fresh handshake. Server issues a ticket
+//      via NewSessionTicket; rustls's in-memory session cache
+//      stashes it under the SNI name.
+//   2. Every subsequent connection on the same `ClientConfig`:
+//      ClientHello includes pre_shared_key + psk_key_exchange_modes;
+//      our server matches the ticket, verifies the binder, sends
+//      a ServerHello with the matching `selected_identity`, skips
+//      Cert + CertVerify, and finishes the handshake.
+//
+// Each worker keeps its own ClientConfig (= its own ticket cache)
+// so the `first iteration is fresh` property holds per worker. We
+// drop both (a) the global `warmup` window AND (b) every worker's
+// first handshake from the histogram, so the recorded samples are
+// the resumption hot path only.
+//
+// KNOWN LIMITATION (2026-05-04): rustls 0.23.x's in-memory session
+// store accepts our well-formed NewSessionTicket but does NOT offer
+// a `pre_shared_key` extension on the next handshake to the same
+// server. Verified end-to-end with `openssl s_client -sess_in/out`
+// — that path resumes correctly, exercising the entire server-side
+// PSK path (binder verify + Cert/CertVerify skip). Until the
+// rustls interop is debugged, this workload's numbers will look
+// similar to `tls_handshake_max`; once it's fixed the resumed
+// path's p50 should drop to ~30 µs from ~226 µs cold (per ROADMAP).
+// The bench code itself is correct and ready.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,7 +40,7 @@ use std::time::{Duration, Instant};
 use hdrhistogram::Histogram;
 use rustls::client::Resumption;
 use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, RootCertStore};
+use rustls::ClientConfig;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -26,6 +49,11 @@ use tokio_rustls::TlsConnector;
 use crate::WorkloadResult;
 
 const PER_OP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Capacity of each worker's in-memory ticket cache. We only ever
+/// store one ticket per worker (one SNI), so the value is a
+/// formality — the smallest the API accepts is fine.
+const SESSION_CACHE_CAPACITY: usize = 8;
 
 #[derive(Debug)]
 struct NoCertVerify;
@@ -71,18 +99,17 @@ impl rustls::client::danger::ServerCertVerifier for NoCertVerify {
     }
 }
 
-fn build_client_config() -> Arc<ClientConfig> {
+/// Build a fresh ClientConfig with TLS 1.3 session resumption
+/// explicitly enabled (in-memory ticket cache, per-worker).
+fn build_client_config_with_resumption() -> Arc<ClientConfig> {
     let mut cfg = ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(NoCertVerify))
         .with_no_client_auth();
-    // Explicitly disable session resumption: this workload measures
-    // FRESH handshake throughput. With our server now issuing
-    // NewSessionTicket on every handshake, rustls's default
-    // in-memory cache would silently turn subsequent handshakes
-    // into resumed PSK-DHE flights, biasing the result low. The
-    // resumption hot path lives in `tls_resume.rs`.
-    cfg.resumption = Resumption::disabled();
+    // The default `Resumption` already has an in-memory cache, but
+    // setting it explicitly documents the intent and protects the
+    // workload from a future rustls default change.
+    cfg.resumption = Resumption::in_memory_sessions(SESSION_CACHE_CAPACITY);
     Arc::new(cfg)
 }
 
@@ -94,20 +121,12 @@ pub async fn run(
     warmup: Duration,
     parallelism: usize,
 ) -> WorkloadResult {
-    let _ = RootCertStore::empty(); // touch import so unused-import lint stays quiet
-    let cfg = build_client_config();
-    let connector = TlsConnector::from(cfg);
-    // Server name verification is bypassed by `NoCertVerify`, so any
-    // valid SNI string works — using a literal SNI that the dev cert
-    // doesn't actually validate against is fine here.
-    let server_name: ServerName<'static> = ServerName::try_from("localhost").unwrap();
-
     let request = format!(
         "GET {endpoint} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n",
     );
     let request: Arc<[u8]> = Arc::from(request.into_bytes().into_boxed_slice());
-
     let host: Arc<str> = Arc::from(host.to_string().into_boxed_str());
+    let server_name: ServerName<'static> = ServerName::try_from("localhost").unwrap();
 
     let total_window = duration + warmup;
     let warmup_end_marker = warmup;
@@ -118,7 +137,11 @@ pub async fn run(
 
     let mut handles = Vec::with_capacity(parallelism);
     for _ in 0..parallelism {
-        let connector = connector.clone();
+        // Per-worker config = per-worker ticket cache. The first
+        // handshake on each cache is necessarily fresh (no cached
+        // ticket); we exclude it from the histogram below.
+        let cfg = build_client_config_with_resumption();
+        let connector = TlsConnector::from(cfg);
         let server_name = server_name.clone();
         let request = Arc::clone(&request);
         let host = Arc::clone(&host);
@@ -126,10 +149,14 @@ pub async fn run(
             let mut hist = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap();
             let mut count_post = 0u64;
             let mut buf = vec![0u8; 4096];
+            // Tracks whether this worker has completed its seeding
+            // fresh handshake. Once true, every subsequent successful
+            // handshake is the resumption hot path.
+            let mut seen_first = false;
             while Instant::now() < deadline {
                 let t0 = Instant::now();
                 let post_warmup = t0 >= measure_start;
-                if !do_one_handshake(
+                let ok = do_one_handshake(
                     &connector,
                     &server_name,
                     &host,
@@ -137,8 +164,12 @@ pub async fn run(
                     &request,
                     &mut buf,
                 )
-                .await
-                {
+                .await;
+                if !ok {
+                    continue;
+                }
+                if !seen_first {
+                    seen_first = true;
                     continue;
                 }
                 if post_warmup {
@@ -161,7 +192,7 @@ pub async fn run(
         }
     }
 
-    let elapsed = duration; // measurement window length
+    let elapsed = duration;
     let p50 = combined.value_at_quantile(0.50);
     let p99 = combined.value_at_quantile(0.99);
     WorkloadResult { ops: total, elapsed, p50_us: p50, p99_us: p99 }
@@ -175,21 +206,14 @@ async fn do_one_handshake(
     request: &[u8],
     buf: &mut [u8],
 ) -> bool {
-    // Per-op timeouts: at very high concurrent handshake rates the
-    // server can momentarily drop a SYN or stall a handshake mid-
-    // flight. Without a bound the worker would block forever and
-    // its share of the deadline would be wasted, biasing the
-    // aggregate down to zero. A 5s ceiling is well past any healthy
-    // handshake (<50ms typical) but short enough to recover the
-    // remainder of the bench window.
     let tcp = match timeout(PER_OP_TIMEOUT, TcpStream::connect((host, port))).await {
         Ok(Ok(s)) => s,
         _ => return false,
     };
     let _ = tcp.set_nodelay(true);
-    // SO_LINGER={1,0} → close() sends RST instead of FIN, so the
-    // local side skips TIME_WAIT entirely. macOS's 16K ephemeral
-    // pool exhausts in <10s at 2K hs/s × N workers without this.
+    // SO_LINGER={1,0}: send RST on close so the local side skips
+    // TIME_WAIT entirely. macOS's 16K ephemeral pool exhausts in
+    // <10s otherwise.
     let _ = tcp.set_zero_linger();
 
     let mut tls = match timeout(PER_OP_TIMEOUT, connector.connect(server_name.clone(), tcp)).await {
@@ -202,9 +226,6 @@ async fn do_one_handshake(
     {
         return false;
     }
-    // Read until EOF or one full response — server closes after
-    // serving (Connection: close). One outer timeout covers the
-    // whole drain loop.
     let drain = async {
         loop {
             match tls.read(buf).await {

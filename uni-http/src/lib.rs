@@ -281,6 +281,17 @@ pub trait HttpStream {
     /// `Err(())` on fatal transport error; the conn handler tears
     /// down on error.
     async fn send(&mut self, data: &[u8]) -> Result<(), ()>;
+
+    /// Cleanly signal end-of-stream to the peer before the
+    /// underlying transport closes. Plain TCP is already correct
+    /// with the implicit FIN-on-drop, so the default is a no-op.
+    /// `TlsStream` overrides to emit a `close_notify` alert: rustls
+    /// (and most spec-compliant TLS clients) treat a TCP close
+    /// without close_notify as an unclean shutdown and discard any
+    /// session ticket they were about to cache, blocking resumption.
+    async fn close(&mut self) -> Result<(), ()> {
+        Ok(())
+    }
 }
 
 impl HttpStream for uni::runtime::TcpStream {
@@ -359,6 +370,15 @@ impl HttpStream for TlsStream {
 
     async fn send(&mut self, data: &[u8]) -> Result<(), ()> {
         self.tls.send_app_data(data)?;
+        self.drain_tx().await
+    }
+
+    async fn close(&mut self) -> Result<(), ()> {
+        // Best-effort: the alert is only meaningful when the TLS
+        // state machine is in `Established`. `close_notify` itself
+        // handles other states by no-op'ing and moving to Closed,
+        // so we just drain whatever it produced (if anything).
+        let _ = self.tls.close_notify();
         self.drain_tx().await
     }
 }
@@ -487,6 +507,14 @@ where
             drop(resp);
 
             if want_close {
+                // Send TLS close_notify (no-op for plain TCP) before
+                // the conn drops. Without this, TLS clients tear
+                // down their session-resumption state on the
+                // perceived unclean close — which is why every
+                // post-resumption-PR fresh handshake from rustls or
+                // openssl was unable to follow up with a resumed
+                // one despite tickets flowing correctly on the wire.
+                let _ = stream.close().await;
                 return;
             }
             let remaining = buf_len - consumed;
