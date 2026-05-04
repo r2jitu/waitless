@@ -28,11 +28,20 @@
 // Explicitly out of scope (future work):
 // - signature_algorithms extension parsing / enforcement (we unconditionally
 //   pick ECDSA P-256 + SHA-256 since that's what our dev cert uses)
-// - Pre-shared key / 0-RTT extensions
-// - Session tickets / resumption
+// - 0-RTT / early_data extensions
 // - Alert record format
 // - X.509 DER parsing beyond "treat the cert as an opaque byte blob to
 //   include in Certificate.certificate_list"
+//
+// Session-resumption wire primitives (commit 1 of the resumption work):
+// - `pre_shared_key` (ext 41) and `psk_key_exchange_modes` (ext 45)
+//   parsing in `ClientHello`, including `binders_offset` for the
+//   RFC 8446 §4.2.11.2 partial-transcript hash.
+// - `build_new_session_ticket` (RFC 8446 §4.6.1) — the post-handshake
+//   message a server emits to issue a resumption ticket.
+// - `build_server_pre_shared_key_ext` — the ServerHello extension
+//   echoing the `selected_identity` index. Higher layers do the
+//   actual ticket sealing/opening + binder verification.
 
 // See .bazelrc for why this is `cfg_attr(not(test), no_std)` and not bare `#![no_std]`.
 #![cfg_attr(not(test), no_std)]
@@ -63,7 +72,26 @@ pub mod ext_type {
     pub const APPLICATION_LAYER_PROTOCOL_NEGOTIATION: u16 = 16;
     pub const SUPPORTED_VERSIONS: u16 = 43;
     pub const PRE_SHARED_KEY: u16 = 41;
+    /// PskKeyExchangeModes — RFC 8446 §4.2.9. Required when offering
+    /// `pre_shared_key`; servers MUST abort if it's missing alongside
+    /// a PSK offer.
+    pub const PSK_KEY_EXCHANGE_MODES: u16 = 45;
     pub const KEY_SHARE: u16 = 51;
+}
+
+/// PskKeyExchangeMode wire values (RFC 8446 §4.2.9), plus convenience
+/// bitmask flags used inside `ClientHello::psk_ke_modes`.
+pub mod psk_ke_mode {
+    /// Wire value: PSK-only key establishment.
+    pub const PSK_KE: u8 = 0;
+    /// Wire value: PSK + (EC)DHE — the only mode we support for
+    /// resumption (forward secrecy is non-negotiable).
+    pub const PSK_DHE_KE: u8 = 1;
+
+    /// Set in `ClientHello::psk_ke_modes` when the client advertised `psk_ke`.
+    pub const FLAG_PSK_KE: u8 = 1 << 0;
+    /// Set in `ClientHello::psk_ke_modes` when the client advertised `psk_dhe_ke`.
+    pub const FLAG_PSK_DHE_KE: u8 = 1 << 1;
 }
 
 /// NamedGroup values (we only implement x25519).
@@ -156,6 +184,35 @@ pub fn encode_handshake(msg_type: u8, body: &[u8], out: &mut [u8]) -> Option<usi
 // ClientHello parser (subset: only what TLS 1.3 + X25519 needs)
 // ============================================================================
 
+/// Parsed view of a `pre_shared_key` extension (RFC 8446 §4.2.11).
+/// Lives inside `ClientHello.psk` when the client offered resumption.
+///
+/// `binders_offset` is the load-bearing field: per RFC 8446 §4.2.11.2
+/// the binder is HMAC over `Transcript-Hash(Truncate(ClientHello))`,
+/// where `Truncate` removes the binders list. Concretely, the
+/// transcript-hash input is the 4-byte handshake header followed by
+/// `body[..binders_offset]` — i.e. everything up through the
+/// identities list, ending right before the u16 binders-length prefix.
+/// We capture this offset during parse so commit 4 can reconstruct
+/// the partial transcript without re-parsing.
+#[derive(Clone, Copy)]
+pub struct PskOffer<'a> {
+    /// Up to 4 `(identity_bytes, obfuscated_ticket_age)` pairs in the
+    /// order the client sent them. Most clients send exactly one;
+    /// we cap at 4 for fixed-size storage and the count below tracks
+    /// how many we actually saw on the wire.
+    pub identities: [(&'a [u8], u32); 4],
+    /// Number of identities seen, capped to `identities.len()`.
+    pub identity_count: u8,
+    /// Up to 4 `PskBinderEntry` byte slices, parallel to `identities`.
+    /// Each is 32–255 bytes (`opaque PskBinderEntry<32..255>`).
+    pub binders: [&'a [u8]; 4],
+    pub binder_count: u8,
+    /// Byte offset within the ClientHello body where the binders
+    /// list's u16 length prefix begins. See struct doc.
+    pub binders_offset: usize,
+}
+
 /// Parsed subset of a ClientHello. Byte slices point into the input
 /// buffer — the struct is a view, not owned data.
 #[derive(Clone, Copy)]
@@ -198,6 +255,15 @@ pub struct ClientHello<'a> {
     /// hand-rolled ed25519-signing server.
     pub observed_sig_algs: [u16; 32],
     pub observed_sig_alg_count: u8,
+    /// Parsed `pre_shared_key` extension if the client offered
+    /// resumption; `None` otherwise. See `PskOffer` for binder
+    /// transcript semantics.
+    pub psk: Option<PskOffer<'a>>,
+    /// Bitmask of `psk_key_exchange_modes` (RFC 8446 §4.2.9):
+    /// `psk_ke_mode::FLAG_PSK_KE` and/or `FLAG_PSK_DHE_KE`. Zero
+    /// when the extension is absent. We only accept resumption when
+    /// `FLAG_PSK_DHE_KE` is set (forward secrecy required).
+    pub psk_ke_modes: u8,
 }
 
 impl<'a> ClientHello<'a> {
@@ -250,6 +316,13 @@ impl<'a> ClientHello<'a> {
         let _compression = r.read_vector_u8()?;
 
         // extensions: Extension<0..2^16-1>
+        //
+        // Track the absolute offset (within `body`) where the
+        // extensions vector starts so we can compute `binders_offset`
+        // when we encounter `pre_shared_key`. `r.pos` here points at
+        // the u16 extensions-length prefix; the extensions blob
+        // itself starts 2 bytes later.
+        let ext_bytes_offset_in_body = r.pos + 2;
         let ext_bytes = r.read_vector_u16()?;
         let mut er = Reader::new(ext_bytes);
 
@@ -262,8 +335,14 @@ impl<'a> ClientHello<'a> {
         let mut observed_supported_group_count: u8 = 0;
         let mut observed_sig_algs = [0u16; 32];
         let mut observed_sig_alg_count: u8 = 0;
+        let mut psk: Option<PskOffer<'a>> = None;
+        let mut psk_ke_modes: u8 = 0;
 
         while !er.is_empty() {
+            // Snapshot the position of *this* extension's type byte
+            // within the outer body so we can derive `binders_offset`
+            // for `pre_shared_key`.
+            let this_ext_offset_in_body = ext_bytes_offset_in_body + er.pos;
             let ext_type = er.read_u16()?;
             let ext_data = er.read_vector_u16()?;
             match ext_type {
@@ -347,6 +426,96 @@ impl<'a> ClientHello<'a> {
                         j += 2;
                     }
                 }
+                ext_type::PSK_KEY_EXCHANGE_MODES => {
+                    // PskKeyExchangeModes: u8-prefixed list of u8 modes.
+                    // RFC 8446 §4.2.9 — list MUST be non-empty.
+                    let mut mr = Reader::new(ext_data);
+                    let modes = mr.read_vector_u8()?;
+                    if modes.is_empty() || !mr.is_empty() {
+                        return Err(ParseError::BadExtension);
+                    }
+                    for &m in modes {
+                        match m {
+                            psk_ke_mode::PSK_KE => psk_ke_modes |= psk_ke_mode::FLAG_PSK_KE,
+                            psk_ke_mode::PSK_DHE_KE => {
+                                psk_ke_modes |= psk_ke_mode::FLAG_PSK_DHE_KE
+                            }
+                            // Unknown modes: ignore for forward-compat.
+                            _ => {}
+                        }
+                    }
+                }
+                ext_type::PRE_SHARED_KEY => {
+                    // OfferedPsks layout (RFC 8446 §4.2.11):
+                    //   u16 identities_length
+                    //   PskIdentity identities[..]   { opaque identity<1..2^16-1>; uint32 obfuscated_ticket_age; }
+                    //   u16 binders_length
+                    //   PskBinderEntry binders[..]   { opaque binder<32..255>; }
+                    let mut psk_r = Reader::new(ext_data);
+                    let identities_bytes = psk_r.read_vector_u16()?;
+
+                    // ext_data starts at this_ext_offset_in_body + 4
+                    // (ext_type:2 + ext_len:2). Within ext_data, the
+                    // binders length prefix sits at offset
+                    //   2 (identities len prefix) + identities_bytes.len().
+                    let binders_offset_in_body =
+                        this_ext_offset_in_body + 4 + 2 + identities_bytes.len();
+
+                    let empty: &[u8] = &[];
+                    let mut identities = [(empty, 0u32); 4];
+                    let mut identity_count: u16 = 0;
+                    let mut id_r = Reader::new(identities_bytes);
+                    while !id_r.is_empty() {
+                        let identity = id_r.read_vector_u16()?;
+                        if identity.is_empty() {
+                            return Err(ParseError::BadExtension);
+                        }
+                        let age = id_r.read_u32()?;
+                        if (identity_count as usize) < identities.len() {
+                            identities[identity_count as usize] = (identity, age);
+                        }
+                        identity_count = identity_count.saturating_add(1);
+                    }
+
+                    let binders_bytes = psk_r.read_vector_u16()?;
+                    let mut binders = [empty; 4];
+                    let mut binder_count: u16 = 0;
+                    let mut bind_r = Reader::new(binders_bytes);
+                    while !bind_r.is_empty() {
+                        let binder = bind_r.read_vector_u8()?;
+                        // PskBinderEntry<32..255>
+                        if binder.len() < 32 || binder.len() > 255 {
+                            return Err(ParseError::BadExtension);
+                        }
+                        if (binder_count as usize) < binders.len() {
+                            binders[binder_count as usize] = binder;
+                        }
+                        binder_count = binder_count.saturating_add(1);
+                    }
+
+                    // Identities and binders lists are exactly parallel.
+                    if identity_count != binder_count || identity_count == 0 {
+                        return Err(ParseError::BadExtension);
+                    }
+                    if !psk_r.is_empty() {
+                        return Err(ParseError::BadExtension);
+                    }
+
+                    psk = Some(PskOffer {
+                        identities,
+                        identity_count: (identity_count.min(4)) as u8,
+                        binders,
+                        binder_count: (binder_count.min(4)) as u8,
+                        binders_offset: binders_offset_in_body,
+                    });
+
+                    // RFC 8446 §4.2.11: pre_shared_key MUST be the last
+                    // extension. Servers MUST abort with illegal_parameter
+                    // if it isn't. We surface that as BadExtension.
+                    if !er.is_empty() {
+                        return Err(ParseError::BadExtension);
+                    }
+                }
                 _ => { /* ignore extensions we don't care about */ }
             }
         }
@@ -372,6 +541,8 @@ impl<'a> ClientHello<'a> {
             observed_supported_group_count,
             observed_sig_algs,
             observed_sig_alg_count,
+            psk,
+            psk_ke_modes,
         })
     }
 }
@@ -604,6 +775,98 @@ pub fn build_certificate_verify(
 }
 
 // ============================================================================
+// NewSessionTicket builder (RFC 8446 §4.6.1)
+// ============================================================================
+
+/// Build a `NewSessionTicket` body (the bytes that go AFTER the
+/// `encode_handshake(NEW_SESSION_TICKET, ...)` header).
+///
+/// Wire format:
+/// ```text
+/// struct {
+///     uint32 ticket_lifetime;        /* seconds; max 7 days per spec */
+///     uint32 ticket_age_add;         /* random per-ticket value */
+///     opaque ticket_nonce<0..255>;   /* distinguishes multi-ticket emits */
+///     opaque ticket<1..2^16-1>;      /* the opaque resumption blob */
+///     Extension extensions<0..2^16-2>;  /* empty for our use */
+/// } NewSessionTicket;
+/// ```
+///
+/// The `ticket` argument is the already-sealed ticket bytes (commit 2
+/// produces these via `seal_ticket`); this function only frames them.
+/// We always emit an empty extensions list — `early_data` (the only
+/// realistic ticket-extension) is out of scope for now.
+///
+/// Returns the number of bytes written, or `None` if `out` is too
+/// small or any field exceeds its wire-encoded bound.
+pub fn build_new_session_ticket(
+    lifetime_seconds: u32,
+    age_add: u32,
+    ticket_nonce: &[u8],
+    ticket: &[u8],
+    out: &mut [u8],
+) -> Option<usize> {
+    if ticket_nonce.len() > 255 {
+        return None;
+    }
+    if ticket.is_empty() || ticket.len() > 0xffff {
+        return None;
+    }
+    let total = 4 + 4 + 1 + ticket_nonce.len() + 2 + ticket.len() + 2;
+    if out.len() < total {
+        return None;
+    }
+
+    let mut p = 0usize;
+    out[p..p + 4].copy_from_slice(&lifetime_seconds.to_be_bytes());
+    p += 4;
+    out[p..p + 4].copy_from_slice(&age_add.to_be_bytes());
+    p += 4;
+    out[p] = ticket_nonce.len() as u8;
+    p += 1;
+    out[p..p + ticket_nonce.len()].copy_from_slice(ticket_nonce);
+    p += ticket_nonce.len();
+    out[p..p + 2].copy_from_slice(&(ticket.len() as u16).to_be_bytes());
+    p += 2;
+    out[p..p + ticket.len()].copy_from_slice(ticket);
+    p += ticket.len();
+    // Empty extensions list.
+    out[p] = 0;
+    out[p + 1] = 0;
+    p += 2;
+
+    debug_assert_eq!(p, total);
+    Some(p)
+}
+
+// ============================================================================
+// ServerHello pre_shared_key extension builder (RFC 8446 §4.2.11)
+// ============================================================================
+
+/// Build the `pre_shared_key` extension a server emits inside its
+/// ServerHello when accepting a resumed handshake. The body is just
+/// a u16 `selected_identity` indexing into the client's offered
+/// identities list — the server picks which ticket it accepted.
+///
+/// Output is the full extension envelope: `ext_type(2) || ext_len(2) ||
+/// selected_identity(2)` = 6 bytes.
+///
+/// `out` must have at least 6 bytes; returns `Some(6)` on success,
+/// `None` if the buffer is too small.
+pub fn build_server_pre_shared_key_ext(
+    selected_identity: u16,
+    out: &mut [u8],
+) -> Option<usize> {
+    if out.len() < 6 {
+        return None;
+    }
+    out[0..2].copy_from_slice(&ext_type::PRE_SHARED_KEY.to_be_bytes());
+    out[2..4].copy_from_slice(&2u16.to_be_bytes());
+    out[4..6].copy_from_slice(&selected_identity.to_be_bytes());
+    Some(6)
+}
+
+// ============================================================================
 // Finished builder + parser (RFC 8446 §4.4.4)
 // ============================================================================
 
@@ -669,6 +932,11 @@ impl<'a> Reader<'a> {
     fn read_u16(&mut self) -> Result<u16, ParseError> {
         let b = self.read_bytes(2)?;
         Ok(u16::from_be_bytes([b[0], b[1]]))
+    }
+
+    fn read_u32(&mut self) -> Result<u32, ParseError> {
+        let b = self.read_bytes(4)?;
+        Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
     }
 
     /// Read a length-prefixed vector where the length is a u8.
@@ -912,5 +1180,307 @@ mod tests {
         assert!(parse_finished(&[0u8; 16]).is_err());
         // Long
         assert!(parse_finished(&[0u8; 64]).is_err());
+    }
+
+    // ── PSK / session-resumption parsing & builders ────────────────────────
+
+    /// Helper used by the resumption tests: writes one extension
+    /// (type + u16-length + body) into `buf` at `p`, returning the
+    /// new cursor.
+    fn write_ext(buf: &mut [u8], mut p: usize, ty: u16, body: &[u8]) -> usize {
+        buf[p..p + 2].copy_from_slice(&ty.to_be_bytes());
+        p += 2;
+        buf[p..p + 2].copy_from_slice(&(body.len() as u16).to_be_bytes());
+        p += 2;
+        buf[p..p + body.len()].copy_from_slice(body);
+        p + body.len()
+    }
+
+    /// Build a synthetic ClientHello with arbitrary trailing
+    /// extension bytes after the always-required ones. Returns
+    /// `(ch_body_bytes, trailing_offset)`. `trailing_offset` is the
+    /// offset within the ClientHello body where `trailing_ext_bytes`
+    /// was placed — i.e. directly past the required extensions.
+    fn build_synthetic_ch_with_trailing_ext_bytes(
+        random: [u8; 32],
+        client_pub: [u8; 32],
+        trailing_ext_bytes: &[u8],
+    ) -> (Vec<u8>, usize) {
+        // Required extensions: supported_versions, supported_groups, key_share.
+        let mut ext = [0u8; 256];
+        let mut p = 0usize;
+        let sv_body = [0x02u8, 0x03, 0x04];
+        p = write_ext(&mut ext, p, ext_type::SUPPORTED_VERSIONS, &sv_body);
+        let sg_body = [0x00u8, 0x02, 0x00, 0x1d];
+        p = write_ext(&mut ext, p, ext_type::SUPPORTED_GROUPS, &sg_body);
+        let mut ks_body = [0u8; 38];
+        ks_body[0..2].copy_from_slice(&36u16.to_be_bytes());
+        ks_body[2..4].copy_from_slice(&named_group::X25519.to_be_bytes());
+        ks_body[4..6].copy_from_slice(&32u16.to_be_bytes());
+        ks_body[6..38].copy_from_slice(&client_pub);
+        p = write_ext(&mut ext, p, ext_type::KEY_SHARE, &ks_body);
+
+        let required_ext_len = p;
+        let total_ext_len = required_ext_len + trailing_ext_bytes.len();
+
+        let mut ch = vec![0u8; 0];
+        // legacy_version
+        ch.extend_from_slice(&LEGACY_VERSION_TLS12.to_be_bytes());
+        // random
+        ch.extend_from_slice(&random);
+        // session_id
+        ch.push(0);
+        // cipher_suites (only one)
+        ch.extend_from_slice(&2u16.to_be_bytes());
+        ch.extend_from_slice(&cipher_suite::TLS_CHACHA20_POLY1305_SHA256.to_be_bytes());
+        // legacy compression
+        ch.push(1);
+        ch.push(0);
+        // extensions length
+        ch.extend_from_slice(&(total_ext_len as u16).to_be_bytes());
+        ch.extend_from_slice(&ext[..required_ext_len]);
+        let trailing_offset = ch.len();
+        ch.extend_from_slice(trailing_ext_bytes);
+
+        (ch, trailing_offset)
+    }
+
+    /// Encode an OfferedPsks body (the contents of the
+    /// `pre_shared_key` extension): `(identities..., binders...)`.
+    /// Each identity is `(opaque_bytes, obfuscated_age)`. Each
+    /// binder is its raw HMAC bytes (32–255).
+    fn encode_offered_psks(
+        identities: &[(&[u8], u32)],
+        binders: &[&[u8]],
+    ) -> Vec<u8> {
+        let mut idents_body = vec![];
+        for (identity, age) in identities {
+            idents_body.extend_from_slice(&(identity.len() as u16).to_be_bytes());
+            idents_body.extend_from_slice(identity);
+            idents_body.extend_from_slice(&age.to_be_bytes());
+        }
+        let mut binders_body = vec![];
+        for binder in binders {
+            binders_body.push(binder.len() as u8);
+            binders_body.extend_from_slice(binder);
+        }
+        let mut out = vec![];
+        out.extend_from_slice(&(idents_body.len() as u16).to_be_bytes());
+        out.extend_from_slice(&idents_body);
+        out.extend_from_slice(&(binders_body.len() as u16).to_be_bytes());
+        out.extend_from_slice(&binders_body);
+        out
+    }
+
+    #[test]
+    fn parse_psk_extensions_and_capture_binders_offset() {
+        let identity_bytes = b"ticket-blob-12345";
+        let binder_bytes = [0x55u8; 32];
+        let psk_body = encode_offered_psks(
+            &[(identity_bytes, 0xdead_beef)],
+            &[&binder_bytes[..]],
+        );
+
+        // psk_key_exchange_modes: u8 length=1, modes=[1 (psk_dhe_ke)]
+        let kem_body = [0x01u8, 0x01];
+        let mut trailing = vec![];
+        // Order: psk_key_exchange_modes first, pre_shared_key LAST.
+        let mut tmp = [0u8; 4096];
+        let mut q = 0;
+        q = write_ext(&mut tmp, q, ext_type::PSK_KEY_EXCHANGE_MODES, &kem_body);
+        q = write_ext(&mut tmp, q, ext_type::PRE_SHARED_KEY, &psk_body);
+        trailing.extend_from_slice(&tmp[..q]);
+
+        let (ch, trailing_offset) =
+            build_synthetic_ch_with_trailing_ext_bytes([0xa1; 32], [0x77; 32], &trailing);
+        let parsed = ClientHello::parse(&ch).expect("parse failed");
+
+        // PSK extension fully captured.
+        let psk = parsed.psk.expect("psk should be present");
+        assert_eq!(psk.identity_count, 1);
+        assert_eq!(psk.binder_count, 1);
+        assert_eq!(psk.identities[0].0, identity_bytes);
+        assert_eq!(psk.identities[0].1, 0xdead_beef);
+        assert_eq!(psk.binders[0], &binder_bytes[..]);
+
+        // psk_key_exchange_modes captured (psk_dhe_ke set, psk_ke not).
+        assert_eq!(parsed.psk_ke_modes & psk_ke_mode::FLAG_PSK_DHE_KE,
+                   psk_ke_mode::FLAG_PSK_DHE_KE);
+        assert_eq!(parsed.psk_ke_modes & psk_ke_mode::FLAG_PSK_KE, 0);
+
+        // binders_offset must point at the u16 binders-length prefix.
+        // Layout within `trailing`:
+        //   [0..6]   psk_key_exchange_modes envelope (4 hdr + 2 body)
+        //   [6..10]  pre_shared_key envelope header (type+len)
+        //   [10..]   pre_shared_key body = OfferedPsks
+        //     [10..12]    u16 identities_length
+        //     [12..12+L]  identities (L = 2 + 17 + 4 = 23)
+        //     [12+L..]    u16 binders_length  ← binders_offset points here
+        let kem_envelope_len = 4 + kem_body.len(); // 4 hdr + 2 body = 6
+        let psk_body_offset_in_trailing = kem_envelope_len + 4; // +4 psk hdr
+        let idents_body_len = 2 + identity_bytes.len() + 4; // u16 len + identity + u32 age
+        let expected = trailing_offset
+            + psk_body_offset_in_trailing
+            + 2
+            + idents_body_len;
+        assert_eq!(psk.binders_offset, expected, "binders_offset mismatch");
+
+        // Confirm body[..binders_offset] ends at the byte BEFORE the
+        // u16 binders-length prefix (which is 0x00 0x21 = 33 = 1+32).
+        assert_eq!(ch[psk.binders_offset], 0x00);
+        assert_eq!(ch[psk.binders_offset + 1], 0x21);
+    }
+
+    #[test]
+    fn parse_psk_rejects_non_last() {
+        // pre_shared_key followed by another extension is illegal.
+        let psk_body = encode_offered_psks(
+            &[(b"x", 0)],
+            &[&[0x11u8; 32][..]],
+        );
+        let kem_body = [0x01u8, 0x01];
+        let mut tmp = [0u8; 4096];
+        let mut q = 0;
+        // Wrong order: psk first, then psk_key_exchange_modes.
+        q = write_ext(&mut tmp, q, ext_type::PRE_SHARED_KEY, &psk_body);
+        q = write_ext(&mut tmp, q, ext_type::PSK_KEY_EXCHANGE_MODES, &kem_body);
+
+        let (ch, _) = build_synthetic_ch_with_trailing_ext_bytes(
+            [0xb2; 32], [0x77; 32], &tmp[..q]);
+        assert!(matches!(ClientHello::parse(&ch), Err(ParseError::BadExtension)));
+    }
+
+    #[test]
+    fn parse_psk_rejects_count_mismatch() {
+        // Two identities but only one binder.
+        let psk_body = encode_offered_psks(
+            &[(b"id1", 1), (b"id2", 2)],
+            &[&[0x33u8; 32][..]],
+        );
+        let kem_body = [0x01u8, 0x01];
+        let mut tmp = [0u8; 4096];
+        let mut q = 0;
+        q = write_ext(&mut tmp, q, ext_type::PSK_KEY_EXCHANGE_MODES, &kem_body);
+        q = write_ext(&mut tmp, q, ext_type::PRE_SHARED_KEY, &psk_body);
+
+        let (ch, _) = build_synthetic_ch_with_trailing_ext_bytes(
+            [0xc3; 32], [0x77; 32], &tmp[..q]);
+        assert!(matches!(ClientHello::parse(&ch), Err(ParseError::BadExtension)));
+    }
+
+    #[test]
+    fn parse_psk_rejects_short_binder() {
+        // Binder must be 32–255 bytes; 16 is too short.
+        let psk_body = encode_offered_psks(
+            &[(b"id", 0)],
+            &[&[0x44u8; 16][..]],
+        );
+        let kem_body = [0x01u8, 0x01];
+        let mut tmp = [0u8; 4096];
+        let mut q = 0;
+        q = write_ext(&mut tmp, q, ext_type::PSK_KEY_EXCHANGE_MODES, &kem_body);
+        q = write_ext(&mut tmp, q, ext_type::PRE_SHARED_KEY, &psk_body);
+
+        let (ch, _) = build_synthetic_ch_with_trailing_ext_bytes(
+            [0xd4; 32], [0x77; 32], &tmp[..q]);
+        assert!(matches!(ClientHello::parse(&ch), Err(ParseError::BadExtension)));
+    }
+
+    #[test]
+    fn parse_psk_modes_both_flags() {
+        // psk_key_exchange_modes with both modes; no pre_shared_key.
+        let kem_body = [0x02u8, 0x00, 0x01]; // [psk_ke, psk_dhe_ke]
+        let mut tmp = [0u8; 64];
+        let q = write_ext(&mut tmp, 0, ext_type::PSK_KEY_EXCHANGE_MODES, &kem_body);
+        let (ch, _) = build_synthetic_ch_with_trailing_ext_bytes(
+            [0xe5; 32], [0x77; 32], &tmp[..q]);
+        let parsed = ClientHello::parse(&ch).unwrap();
+        assert_eq!(
+            parsed.psk_ke_modes,
+            psk_ke_mode::FLAG_PSK_KE | psk_ke_mode::FLAG_PSK_DHE_KE
+        );
+        assert!(parsed.psk.is_none());
+    }
+
+    #[test]
+    fn parse_psk_modes_rejects_empty_list() {
+        // ke_modes<1..255> — empty body is illegal.
+        let kem_body = [0x00u8]; // length=0
+        let mut tmp = [0u8; 64];
+        let q = write_ext(&mut tmp, 0, ext_type::PSK_KEY_EXCHANGE_MODES, &kem_body);
+        let (ch, _) = build_synthetic_ch_with_trailing_ext_bytes(
+            [0xe6; 32], [0x77; 32], &tmp[..q]);
+        assert!(matches!(ClientHello::parse(&ch), Err(ParseError::BadExtension)));
+    }
+
+    #[test]
+    fn parse_no_psk_means_psk_none() {
+        // Existing-shape ClientHello (no PSK extensions) still parses
+        // and reports no PSK offer.
+        let (ch, _) = build_synthetic_ch_with_trailing_ext_bytes(
+            [0xf7; 32], [0x77; 32], &[]);
+        let parsed = ClientHello::parse(&ch).unwrap();
+        assert!(parsed.psk.is_none());
+        assert_eq!(parsed.psk_ke_modes, 0);
+    }
+
+    #[test]
+    fn new_session_ticket_layout() {
+        // Spec wire example: lifetime=600, age_add=0xdeadbeef,
+        // nonce=[0x01,0x02], ticket=10 bytes, ext_len=0.
+        let nonce = [0x01u8, 0x02];
+        let ticket = [0x99u8; 10];
+        let mut out = [0u8; 64];
+        let n = build_new_session_ticket(600, 0xdead_beef, &nonce, &ticket, &mut out)
+            .unwrap();
+
+        // Layout: 4 + 4 + 1 + 2 + 2 + 10 + 2 = 25
+        assert_eq!(n, 25);
+        // lifetime
+        assert_eq!(&out[0..4], &600u32.to_be_bytes());
+        // age_add
+        assert_eq!(&out[4..8], &0xdead_beefu32.to_be_bytes());
+        // nonce_len
+        assert_eq!(out[8], 2);
+        assert_eq!(&out[9..11], &nonce[..]);
+        // ticket length (u16)
+        assert_eq!(&out[11..13], &10u16.to_be_bytes());
+        // ticket bytes
+        assert_eq!(&out[13..23], &ticket[..]);
+        // empty extensions
+        assert_eq!(&out[23..25], &[0, 0]);
+    }
+
+    #[test]
+    fn new_session_ticket_rejects_oversize_nonce() {
+        let big_nonce = [0u8; 256];
+        let mut out = [0u8; 1024];
+        assert!(build_new_session_ticket(60, 0, &big_nonce, &[1, 2, 3], &mut out)
+            .is_none());
+    }
+
+    #[test]
+    fn new_session_ticket_rejects_empty_ticket() {
+        let mut out = [0u8; 64];
+        assert!(build_new_session_ticket(60, 0, &[], &[], &mut out).is_none());
+    }
+
+    #[test]
+    fn server_pre_shared_key_ext_layout() {
+        let mut out = [0u8; 16];
+        let n = build_server_pre_shared_key_ext(0x0001, &mut out).unwrap();
+        assert_eq!(n, 6);
+        // ext_type = 0x0029 (41)
+        assert_eq!(&out[0..2], &[0x00, 0x29]);
+        // ext_len = 2
+        assert_eq!(&out[2..4], &[0x00, 0x02]);
+        // selected_identity = 1
+        assert_eq!(&out[4..6], &[0x00, 0x01]);
+    }
+
+    #[test]
+    fn server_pre_shared_key_ext_too_small_buffer() {
+        let mut out = [0u8; 5];
+        assert!(build_server_pre_shared_key_ext(0, &mut out).is_none());
     }
 }
