@@ -35,8 +35,8 @@ pub struct TxPacket {
     pub data: [u8; TX_BUF_SIZE],
 }
 
-impl spsc::Default for Task {
-    const DEFAULT: Self = Task { func: noop, arg: 0 };
+impl spsc::Zero for Task {
+    const ZERO: Self = Task { func: noop, arg: 0 };
 }
 
 fn noop(_: usize) {}

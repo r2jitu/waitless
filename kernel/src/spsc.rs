@@ -25,7 +25,7 @@ const CAPACITY: usize = 256;
 const MASK: usize = CAPACITY - 1;
 
 /// SPSC ring buffer for fixed-size items.
-pub struct Ring<T: Copy + Default> {
+pub struct Ring<T: Copy + Zero> {
     buffer: [UnsafeCell<T>; CAPACITY],
     head: AtomicUsize, // consumer reads from head
     tail: AtomicUsize, // producer writes to tail
@@ -35,12 +35,12 @@ pub struct Ring<T: Copy + Default> {
 // is followed: one producer, one consumer, synchronisation via the atomic
 // head/tail with Acquire/Release ordering. The `T: Send` bound ensures the
 // item can be transferred between cores.
-unsafe impl<T: Copy + Default + Send> Sync for Ring<T> {}
+unsafe impl<T: Copy + Zero + Send> Sync for Ring<T> {}
 
-impl<T: Copy + Default> Ring<T> {
+impl<T: Copy + Zero> Ring<T> {
     pub const fn new() -> Self {
         Ring {
-            buffer: [const { UnsafeCell::new(T::DEFAULT) }; CAPACITY],
+            buffer: [const { UnsafeCell::new(T::ZERO) }; CAPACITY],
             head: AtomicUsize::new(0),
             tail: AtomicUsize::new(0),
         }
@@ -92,21 +92,24 @@ impl<T: Copy + Default> Ring<T> {
     }
 }
 
-/// Trait for types that can be stored in the ring (need a default/zero value).
-pub trait Default: Sized {
-    const DEFAULT: Self;
+/// Const-callable "zero value" trait for ring-buffer slot init. Lives
+/// here rather than reusing `core::default::Default` because we need
+/// a `const`-callable value (slot init runs in `const fn new()` /
+/// `const { … }` array repeat); `Default::default()` isn't const.
+pub trait Zero: Sized {
+    const ZERO: Self;
 }
 
-impl Default for usize {
-    const DEFAULT: Self = 0;
+impl Zero for usize {
+    const ZERO: Self = 0;
 }
 
-impl Default for u64 {
-    const DEFAULT: Self = 0;
+impl Zero for u64 {
+    const ZERO: Self = 0;
 }
 
-impl Default for u32 {
-    const DEFAULT: Self = 0;
+impl Zero for u32 {
+    const ZERO: Self = 0;
 }
 
 #[cfg(test)]
