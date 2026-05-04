@@ -23,16 +23,9 @@
 // first handshake from the histogram, so the recorded samples are
 // the resumption hot path only.
 //
-// KNOWN LIMITATION (2026-05-04): rustls 0.23.x's in-memory session
-// store accepts our well-formed NewSessionTicket but does NOT offer
-// a `pre_shared_key` extension on the next handshake to the same
-// server. Verified end-to-end with `openssl s_client -sess_in/out`
-// — that path resumes correctly, exercising the entire server-side
-// PSK path (binder verify + Cert/CertVerify skip). Until the
-// rustls interop is debugged, this workload's numbers will look
-// similar to `tls_handshake_max`; once it's fixed the resumed
-// path's p50 should drop to ~30 µs from ~226 µs cold (per ROADMAP).
-// The bench code itself is correct and ready.
+// Resumption depends on a non-obvious rustls 0.23.x quirk: see the
+// `SESSION_CACHE_CAPACITY` constant for why it must be ≥ 9. Booby-
+// trap is silent — too small and every handshake stays fresh.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -50,10 +43,18 @@ use crate::WorkloadResult;
 
 const PER_OP_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Capacity of each worker's in-memory ticket cache. We only ever
-/// store one ticket per worker (one SNI), so the value is a
-/// formality — the smallest the API accepts is fine.
-const SESSION_CACHE_CAPACITY: usize = 8;
+/// Capacity of each worker's in-memory ticket cache.
+///
+/// Must be ≥ 9. rustls 0.23.x's `in_memory_sessions(N)` computes
+/// `max_servers = ceil(N / MAX_TLS13_TICKETS_PER_SERVER)` where
+/// MAX_TLS13_TICKETS_PER_SERVER = 8. With N ≤ 8 the result is 1,
+/// and the LimitedCache's preemptive-eviction step
+/// (`oldest.capacity() == oldest.len()` after push) immediately
+/// evicts every just-inserted entry — silently breaking
+/// resumption. Verified empirically: N=8 → kx_hint round-trip
+/// returns None, N=9+ works. We use 64 to leave headroom and
+/// match the rustls default-ish "many sessions" intent.
+const SESSION_CACHE_CAPACITY: usize = 64;
 
 #[derive(Debug)]
 struct NoCertVerify;
