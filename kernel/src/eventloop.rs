@@ -5,7 +5,7 @@
 // pointers to avoid circular crate dependencies.
 //
 // All cores enter eventloop::run() after boot. Core 0 drives the
-// spawned boot task (see `#[uni::boot]`); APs wait for `set_ready`
+// spawned init task (see `#[uni::init]`); APs wait for `set_ready`
 // from the app's `uni::run(app)`. The loop runs until shutdown.
 
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -114,8 +114,8 @@ pub fn is_ready() -> bool {
 pub fn run(core_id: u32) -> ! {
     // APs wait for the app's `set_ready` so they don't hammer the
     // NIC / inbox machinery before listeners are registered. Core 0
-    // skips this wait — its event loop drives the spawned boot task
-    // (see `#[uni::boot]`), and that task is what eventually calls
+    // skips this wait — its event loop drives the spawned init task
+    // (see `#[uni::init]`), and that task is what eventually calls
     // `set_ready`. Blocking here would deadlock because nothing
     // else polls the runtime.
     if core_id != 0 {

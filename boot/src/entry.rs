@@ -1,4 +1,4 @@
-// kernel/entry.rs — Kernel entry point + boot shim (Rust)
+// boot/entry.rs — Kernel entry point + boot shim (Rust)
 //
 // Called from boot.S after the processor is in 64-bit mode with a valid stack.
 // On x86_64: RDI = multiboot2 info physical address.
