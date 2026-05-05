@@ -157,11 +157,13 @@ pub struct QuicTls {
     /// `Option` lets `take()` move it out without `unsafe`.
     ephemeral: Option<X25519ServerKey>,
 
-    /// Inbound handshake bytes per level, in offset order. The
-    /// `advance` loop parses prefixes off the front; remaining
+    /// Inbound handshake bytes per level, contiguous from the
+    /// start of the level's CRYPTO stream. `push_handshake` does
+    /// offset-aware reassembly into these via per-level `RxBuf`s.
+    /// The `advance` loop parses prefixes off the front; remaining
     /// bytes wait for the next push.
-    rx_initial: Vec<u8>,
-    rx_handshake: Vec<u8>,
+    rx_initial: RxBuf,
+    rx_handshake: RxBuf,
 
     /// Outbound handshake bytes per level. The connection layer
     /// drains these into CRYPTO frames and clears the queue.
@@ -197,8 +199,8 @@ impl QuicTls {
             transcript: Transcript::new(),
             schedule: KeySchedule::new_without_psk(),
             ephemeral: Some(X25519ServerKey::from_seed(seed)),
-            rx_initial: Vec::new(),
-            rx_handshake: Vec::new(),
+            rx_initial: RxBuf::default(),
+            rx_handshake: RxBuf::default(),
             tx_initial: Vec::new(),
             tx_handshake: Vec::new(),
             handshake_secrets: None,
@@ -248,18 +250,19 @@ impl QuicTls {
     }
 
     /// Append handshake bytes received from a CRYPTO frame at
-    /// `level`. Caller must deliver bytes in offset order per
-    /// level (no reassembly here). 1-RTT level is accepted but
-    /// ignored — server doesn't expect post-handshake handshake
-    /// messages from the client today.
-    pub fn push_handshake(&mut self, level: CryptoLevel, bytes: &[u8]) {
+    /// `level`, starting at `offset` in the level's CRYPTO stream.
+    /// Reassembles out-of-order frames into a contiguous buffer —
+    /// curl/ngtcp2 deliberately scrambles CRYPTO offsets as an
+    /// anti-fingerprinting measure (RFC 9000 §19.6 explicitly
+    /// permits arbitrary order), so the receiver MUST handle it.
+    /// 1-RTT level is accepted but ignored — server doesn't
+    /// expect post-handshake handshake messages from the client
+    /// today.
+    pub fn push_handshake(&mut self, level: CryptoLevel, offset: u64, bytes: &[u8]) {
         match level {
-            CryptoLevel::Initial => self.rx_initial.extend_from_slice(bytes),
-            CryptoLevel::Handshake => self.rx_handshake.extend_from_slice(bytes),
-            CryptoLevel::OneRtt => {
-                // No client-originated handshake messages in 1-RTT
-                // for our v1 server (no key update, no client cert).
-            }
+            CryptoLevel::Initial => self.rx_initial.ingest(offset, bytes),
+            CryptoLevel::Handshake => self.rx_handshake.ingest(offset, bytes),
+            CryptoLevel::OneRtt => {}
         }
     }
 
@@ -574,6 +577,122 @@ impl QuicTls {
     }
 }
 
+// ============================================================================
+// RxBuf — per-level CRYPTO-stream reassembly
+// ============================================================================
+//
+// Each TLS level has its own monotonically-increasing CRYPTO byte
+// stream. Frames may arrive in any order (RFC 9000 §19.6): the
+// receiver MUST reassemble. This is a small specialisation of the
+// stream-recv pattern in //uni-quic/streams.rs — no FIN tracking,
+// no flow control, just contiguous-prefix accumulation + an
+// offset-keyed gap buffer for late chunks.
+//
+// `Deref<Target=[u8]>` returns the contiguous in-order bytes
+// available for parsing (callers index it like a slice). `drain`
+// consumes a prefix once a complete handshake message has been
+// processed.
+
+#[derive(Default)]
+pub(crate) struct RxBuf {
+    /// Contiguous bytes from offset 0 (after `drain`'d prefixes are
+    /// removed). The TLS parser consumes from the front of this.
+    contiguous: Vec<u8>,
+    /// Cumulative number of bytes ever delivered into `contiguous`
+    /// — i.e. the next stream-offset that would extend it.
+    consumed: u64,
+    /// Out-of-order chunks keyed by their start offset. Folded into
+    /// `contiguous` as the gap fills.
+    pending: alloc::collections::BTreeMap<u64, Vec<u8>>,
+    /// Soft cap on pending bytes — anything past this is dropped to
+    /// prevent a malicious peer flooding us with non-contiguous
+    /// chunks. ClientHello + ServerHello flights are well under
+    /// 4 KiB; cert-only paths might push higher; 64 KiB is a
+    /// generous overhead.
+    pending_budget: usize,
+}
+
+impl RxBuf {
+    /// Total contiguous bytes available right now.
+    pub(crate) fn len(&self) -> usize {
+        self.contiguous.len()
+    }
+
+    /// Stream-offset of the END of `contiguous` (i.e. next byte the
+    /// peer can send to extend our window).
+    pub(crate) fn next_offset(&self) -> u64 {
+        self.consumed
+    }
+
+    /// Discard a prefix of `n` bytes from the contiguous buffer
+    /// (called after a complete handshake message has been parsed).
+    pub(crate) fn drain(&mut self, range: core::ops::RangeTo<usize>) {
+        self.contiguous.drain(range);
+    }
+
+    /// Ingest a CRYPTO frame `(offset, data)` at this level. The
+    /// chunk may be in-order, ahead-of-order, or partially overlap
+    /// data already delivered. RFC 9000 §19.6 requires receivers
+    /// to handle all three cases.
+    pub(crate) fn ingest(&mut self, offset: u64, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        let end = offset + data.len() as u64;
+        // Frame entirely before what we've already delivered →
+        // duplicate retransmit; ignore.
+        if end <= self.consumed {
+            return;
+        }
+        // Trim leading bytes that overlap already-delivered data.
+        let (offset, data) = if offset < self.consumed {
+            let skip = (self.consumed - offset) as usize;
+            (self.consumed, &data[skip..])
+        } else {
+            (offset, data)
+        };
+        if offset == self.consumed {
+            self.contiguous.extend_from_slice(data);
+            self.consumed += data.len() as u64;
+            // See if pending entries can now be folded in.
+            loop {
+                let next_off = match self.pending.iter().next() {
+                    Some((&k, _)) => k,
+                    None => break,
+                };
+                if next_off > self.consumed {
+                    break;
+                }
+                let v = self.pending.remove(&next_off).unwrap();
+                self.pending_budget = self.pending_budget.saturating_add(v.len());
+                let skip = self.consumed.saturating_sub(next_off) as usize;
+                if skip < v.len() {
+                    self.contiguous.extend_from_slice(&v[skip..]);
+                    self.consumed += (v.len() - skip) as u64;
+                }
+            }
+        } else if data.len() <= self.pending_budget.saturating_sub(0) + (64 * 1024) {
+            // Stash for later. We initialise with a 0 budget on
+            // Default and grow it lazily — that quirk lets us cap
+            // the amount we'd buffer for a misbehaving peer with
+            // a single check below.
+            const PENDING_CAP: usize = 64 * 1024;
+            let pending_total: usize =
+                self.pending.values().map(|v| v.len()).sum::<usize>() + data.len();
+            if pending_total <= PENDING_CAP {
+                self.pending.insert(offset, data.to_vec());
+            }
+        }
+    }
+}
+
+impl core::ops::Deref for RxBuf {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.contiguous
+    }
+}
+
 // `Box<QuicTls>` is the conventional shape for the connection
 // state machine to hold one without paying its full size on the
 // per-conn stack frame; the public type stays `QuicTls` so
@@ -658,7 +777,7 @@ mod tests {
         // Push a ClientHello in the Initial space.
         let client_pub = [0x77u8; 32];
         let ch = synthetic_client_hello_message(client_pub);
-        q.push_handshake(CryptoLevel::Initial, &ch);
+        q.push_handshake(CryptoLevel::Initial, 0, &ch);
 
         let s = q.advance(&cfg).expect("advance after CH");
         assert_eq!(s, QuicTlsState::WaitClientFinished);
@@ -690,13 +809,13 @@ mod tests {
         let ch = synthetic_client_hello_message([0x55u8; 32]);
 
         // Push only the first 10 bytes — clearly not a complete CH.
-        q.push_handshake(CryptoLevel::Initial, &ch[..10]);
+        q.push_handshake(CryptoLevel::Initial, 0, &ch[..10]);
         let s = q.advance(&cfg).expect("advance on partial CH");
         assert_eq!(s, QuicTlsState::WaitClientHello,
                    "must remain WaitClientHello on truncated CH");
 
         // Push the rest, advance, transition fires.
-        q.push_handshake(CryptoLevel::Initial, &ch[10..]);
+        q.push_handshake(CryptoLevel::Initial, 10, &ch[10..]);
         let s = q.advance(&cfg).expect("advance after full CH");
         assert_eq!(s, QuicTlsState::WaitClientFinished);
     }
@@ -711,7 +830,7 @@ mod tests {
         bogus.push(msg_type::FINISHED);
         bogus.extend_from_slice(&[0, 0, 32]);
         bogus.extend_from_slice(&[0u8; 32]);
-        q.push_handshake(CryptoLevel::Initial, &bogus);
+        q.push_handshake(CryptoLevel::Initial, 0, &bogus);
         let r = q.advance(&cfg);
         assert!(matches!(r, Err(QuicTlsError::UnexpectedMessage)));
         assert_eq!(q.state(), QuicTlsState::Failed);

@@ -705,11 +705,8 @@ impl Connection {
             let (frame, consumed) = parse_frame(payload).map_err(|_| ConnError::Wire)?;
             match frame {
                 Frame::Padding | Frame::Ping => {}
-                Frame::Crypto { offset: _, data } => {
-                    // We trust offset ordering for the MVP — most
-                    // clients send CRYPTO frames in offset order
-                    // and rustls/quinn always do.
-                    self.tls.push_handshake(level, data);
+                Frame::Crypto { offset, data } => {
+                    self.tls.push_handshake(level, offset, data);
                 }
                 Frame::Ack { .. } => {
                     // We don't track outbound packets in flight
