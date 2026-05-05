@@ -338,7 +338,7 @@ impl QuicTls {
 
         // Parse ClientHello fields we need; copy into owned
         // locals so we can drop the borrow into rx_initial.
-        let (client_x25519_pub, sid_echo, sid_len) = {
+        let (client_x25519_pub, sid_echo, sid_len, selected_alpn) = {
             let ch = ClientHello::parse(body).map_err(|_| QuicTlsError::UnsupportedClient)?;
             let mut sid = [0u8; 32];
             let n = ch.legacy_session_id.len();
@@ -348,7 +348,28 @@ impl QuicTls {
             // before dropping the borrow.
             self.client_transport_params =
                 ch.quic_transport_parameters.map(|s| s.to_vec());
-            (pk, sid, n)
+            // Pick "h3" if the client offered it; otherwise pick
+            // the first listed protocol so non-HTTP-3 clients
+            // (e.g. raw QUIC interop) still complete the handshake.
+            // RFC 7301: "If the server has no application protocol
+            // it supports, it MUST send an alert" — for now we
+            // pick whatever the client offered; refusal can be a
+            // future policy knob.
+            let alpn = ch.alpn_protocol_list.and_then(|list| {
+                let mut h3 = None;
+                let mut first = None;
+                for p in uni_tls::handshake::iter_alpn(list) {
+                    if first.is_none() {
+                        first = Some(p.to_vec());
+                    }
+                    if p == b"h3" {
+                        h3 = Some(p.to_vec());
+                        break;
+                    }
+                }
+                h3.or(first)
+            });
+            (pk, sid, n, alpn)
         };
 
         // Update transcript with the full ClientHello message,
@@ -388,20 +409,36 @@ impl QuicTls {
         self.handshake_secrets = Some(hs_secrets);
 
         // ── EncryptedExtensions (Handshake-level CRYPTO output) ─
-        // Inject the server's quic_transport_parameters as the lone
-        // negotiated extension (RFC 9001 §8.2). Body fits comfortably
-        // in 256 bytes — our defaults plus the two CIDs are <50 bytes.
+        // Inject quic_transport_parameters (RFC 9001 §8.2) and
+        // (if the client offered ALPN) the
+        // application_layer_protocol_negotiation echo (RFC 7301).
+        // Body fits comfortably in 256 bytes — defaults + two CIDs
+        // + ALPN "h3" are <60 bytes.
         let mut ee_body = alloc::vec![0u8; 256];
-        let extra = if !self.server_transport_params.is_empty() {
-            Some((
+        // ALPN echo body: u16 list_len || u8 name_len || name.
+        let alpn_body: Option<alloc::vec::Vec<u8>> = selected_alpn.as_ref().map(|name| {
+            let mut blob = alloc::vec::Vec::with_capacity(3 + name.len());
+            let entry_len = (1 + name.len()) as u16;
+            blob.extend_from_slice(&entry_len.to_be_bytes());
+            blob.push(name.len() as u8);
+            blob.extend_from_slice(name);
+            blob
+        });
+        let mut extras: alloc::vec::Vec<(u16, &[u8])> = alloc::vec::Vec::new();
+        if !self.server_transport_params.is_empty() {
+            extras.push((
                 uni_tls::handshake::ext_type::QUIC_TRANSPORT_PARAMETERS,
                 self.server_transport_params.as_slice(),
-            ))
-        } else {
-            None
-        };
+            ));
+        }
+        if let Some(blob) = &alpn_body {
+            extras.push((
+                uni_tls::handshake::ext_type::APPLICATION_LAYER_PROTOCOL_NEGOTIATION,
+                blob.as_slice(),
+            ));
+        }
         let ee_body_len =
-            build_encrypted_extensions(extra, &mut ee_body).ok_or(QuicTlsError::Internal)?;
+            build_encrypted_extensions(&extras, &mut ee_body).ok_or(QuicTlsError::Internal)?;
         let mut ee_msg = alloc::vec![0u8; 256 + 16];
         let ee_msg_len = encode_handshake(
             msg_type::ENCRYPTED_EXTENSIONS,

@@ -275,6 +275,11 @@ pub struct ClientHello<'a> {
     /// QUIC clients always include this. The server interprets
     /// the bytes via `uni_quic::transport_params::parse_client_params`.
     pub quic_transport_parameters: Option<&'a [u8]>,
+    /// Raw bytes of the `application_layer_protocol_negotiation`
+    /// extension's body if the client offered ALPN. The body is
+    /// `u16 list_len || (u8 name_len || name)+`; the QUIC server
+    /// scans for `"h3"` and rejects otherwise.
+    pub alpn_protocol_list: Option<&'a [u8]>,
 }
 
 impl<'a> ClientHello<'a> {
@@ -349,6 +354,7 @@ impl<'a> ClientHello<'a> {
         let mut psk: Option<PskOffer<'a>> = None;
         let mut psk_ke_modes: u8 = 0;
         let mut quic_transport_parameters: Option<&'a [u8]> = None;
+        let mut alpn_protocol_list: Option<&'a [u8]> = None;
 
         while !er.is_empty() {
             // Snapshot the position of *this* extension's type byte
@@ -533,6 +539,14 @@ impl<'a> ClientHello<'a> {
                     // decodes the TLV stream via `parse_client_params`.
                     quic_transport_parameters = Some(ext_data);
                 }
+                ext_type::APPLICATION_LAYER_PROTOCOL_NEGOTIATION => {
+                    // ALPN body: u16 list_len || (u8 name_len || name)+.
+                    // We pass the inner bytes (after the list_len prefix)
+                    // up to the caller for protocol selection.
+                    let mut ar = Reader::new(ext_data);
+                    let names = ar.read_vector_u16()?;
+                    alpn_protocol_list = Some(names);
+                }
                 _ => { /* ignore extensions we don't care about */ }
             }
         }
@@ -561,7 +575,34 @@ impl<'a> ClientHello<'a> {
             psk,
             psk_ke_modes,
             quic_transport_parameters,
+            alpn_protocol_list,
         })
+    }
+}
+
+/// Iterate the `name_len:u8 || name:bytes` pairs inside an ALPN
+/// extension body. Returns each protocol name as a borrowed slice.
+pub fn iter_alpn(list_bytes: &[u8]) -> AlpnIter<'_> {
+    AlpnIter { bytes: list_bytes }
+}
+
+pub struct AlpnIter<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> Iterator for AlpnIter<'a> {
+    type Item = &'a [u8];
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.bytes.is_empty() {
+            return None;
+        }
+        let len = self.bytes[0] as usize;
+        if 1 + len > self.bytes.len() {
+            return None;
+        }
+        let name = &self.bytes[1..1 + len];
+        self.bytes = &self.bytes[1 + len..];
+        Some(name)
     }
 }
 
@@ -679,34 +720,34 @@ pub fn build_server_hello(
 
 /// Build an EncryptedExtensions message body.
 ///
-/// `extra` lets the caller append a single extension. The TLS-over-TCP
-/// path passes `None` (no negotiated extensions); the QUIC path passes
-/// `Some((QUIC_TRANSPORT_PARAMETERS, params_blob))` to advertise
-/// flow-control limits as required by RFC 9001 §8.2.
+/// `extras` lets the caller append zero-or-more extensions. The
+/// TLS-over-TCP path passes `&[]` (no negotiated extensions); the
+/// QUIC path passes the `quic_transport_parameters` blob (RFC 9001
+/// §8.2) plus, for HTTP/3, the `application_layer_protocol_
+/// negotiation` echo (RFC 7301).
 ///
 /// Wire layout: `u16 extensions_length || (extension_envelope ...)`.
 /// Each extension envelope is `u16 ext_type || u16 ext_len || bytes`.
 ///
-/// Returns the number of bytes written. `out` must have at least 2 bytes
-/// (empty list) or `2 + 4 + extra.len()` (single-extension list).
+/// Returns bytes written, or `None` if `out` is too small or the
+/// total extensions length exceeds `0xffff`.
 pub fn build_encrypted_extensions(
-    extra: Option<(u16, &[u8])>,
+    extras: &[(u16, &[u8])],
     out: &mut [u8],
 ) -> Option<usize> {
-    let body_len = match extra {
-        Some((_, data)) => 4 + data.len(),
-        None => 0,
-    };
+    let body_len: usize = extras.iter().map(|(_, d)| 4 + d.len()).sum();
     if body_len > 0xffff || out.len() < 2 + body_len {
         return None;
     }
     out[0] = ((body_len >> 8) & 0xff) as u8;
     out[1] = (body_len & 0xff) as u8;
-    if let Some((ty, data)) = extra {
-        out[2..4].copy_from_slice(&ty.to_be_bytes());
+    let mut p = 2usize;
+    for (ty, data) in extras {
+        out[p..p + 2].copy_from_slice(&ty.to_be_bytes());
         let len = data.len() as u16;
-        out[4..6].copy_from_slice(&len.to_be_bytes());
-        out[6..6 + data.len()].copy_from_slice(data);
+        out[p + 2..p + 4].copy_from_slice(&len.to_be_bytes());
+        out[p + 4..p + 4 + data.len()].copy_from_slice(data);
+        p += 4 + data.len();
     }
     Some(2 + body_len)
 }
@@ -1170,7 +1211,7 @@ mod tests {
     #[test]
     fn encrypted_extensions_is_empty_extension_list() {
         let mut out = [0u8; 8];
-        let n = build_encrypted_extensions(None, &mut out).unwrap();
+        let n = build_encrypted_extensions(&[], &mut out).unwrap();
         assert_eq!(n, 2);
         assert_eq!(&out[..n], &[0x00, 0x00]);
     }
@@ -1179,20 +1220,32 @@ mod tests {
     fn encrypted_extensions_with_quic_transport_parameters() {
         // Two-byte body, ext_type = 0x0039.
         let blob = [0xab, 0xcd];
+        let extras: &[(u16, &[u8])] =
+            &[(ext_type::QUIC_TRANSPORT_PARAMETERS, &blob)];
         let mut out = [0u8; 16];
-        let n =
-            build_encrypted_extensions(Some((ext_type::QUIC_TRANSPORT_PARAMETERS, &blob)), &mut out)
-                .unwrap();
+        let n = build_encrypted_extensions(extras, &mut out).unwrap();
         // body = ext_type(2) + ext_len(2) + blob(2) = 6 → total = 2 + 6.
         assert_eq!(n, 8);
-        // u16 extensions_length (big-endian) = 6.
         assert_eq!(&out[..2], &[0x00, 0x06]);
-        // ext_type
         assert_eq!(&out[2..4], &[0x00, 0x39]);
-        // ext_len
         assert_eq!(&out[4..6], &[0x00, 0x02]);
-        // blob
         assert_eq!(&out[6..8], &blob);
+    }
+
+    #[test]
+    fn encrypted_extensions_with_two_extensions() {
+        let qtp = [0x10u8, 0x20];
+        // ALPN echo body: u16 list_len || u8 name_len || name.
+        let alpn_body = [0u8, 3, 2, b'h', b'3'];
+        let extras: &[(u16, &[u8])] = &[
+            (ext_type::QUIC_TRANSPORT_PARAMETERS, &qtp),
+            (ext_type::APPLICATION_LAYER_PROTOCOL_NEGOTIATION, &alpn_body),
+        ];
+        let mut out = [0u8; 32];
+        let n = build_encrypted_extensions(extras, &mut out).unwrap();
+        // body = (4 + 2) + (4 + 5) = 15. Total = 17.
+        assert_eq!(n, 17);
+        assert_eq!(&out[..2], &[0x00, 0x0f]);
     }
 
     #[test]

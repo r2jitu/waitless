@@ -110,10 +110,12 @@ impl ConnInbox {
     /// empty (terminal state — conn task should exit).
     pub async fn pop(&self) -> Option<Datagram> {
         loop {
-            if let Some(dgram) = self.queue.borrow_mut().pop_front() {
-                // Reset only when we've actually drained — keeps
-                // the level-triggered semantics intact for the
-                // next push that arrives between pops.
+            // Bind the RefMut to a local so the borrow drops
+            // before we call `borrow()` again to reset the event.
+            // Holding the RefMut through the `if let` body would
+            // panic the second `borrow()` with BorrowError.
+            let popped = self.queue.borrow_mut().pop_front();
+            if let Some(dgram) = popped {
                 if self.queue.borrow().is_empty() {
                     self.event.reset();
                 }
@@ -130,7 +132,11 @@ impl ConnInbox {
     /// conn-task `pop` loop where a single wake services multiple
     /// queued datagrams.
     pub fn try_pop(&self) -> Option<Datagram> {
-        let dgram = self.queue.borrow_mut().pop_front()?;
+        // Same RefMut-temporary discipline as `pop`: bind to a
+        // local first so the mutable borrow drops before the
+        // subsequent immutable borrow.
+        let popped = self.queue.borrow_mut().pop_front();
+        let dgram = popped?;
         if self.queue.borrow().is_empty() {
             self.event.reset();
         }

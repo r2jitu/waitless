@@ -459,6 +459,15 @@ impl Connection {
             return Ok(0);
         }
         let first = bytes[0];
+        // QUIC v1 (RFC 9000 §17.3.1) requires bit 6 (FIXED_BIT) set
+        // on every long- and short-header packet. A zero (or any
+        // byte without FIXED_BIT) at this position is datagram-tail
+        // padding — clients pad UDP datagrams to 1200 bytes after
+        // the Initial packet's coalesced flight. Consume the rest
+        // and stop.
+        if first & FIXED_BIT == 0 {
+            return Ok(bytes.len());
+        }
         if first & HEADER_FORM_LONG != 0 {
             self.process_long_header_packet(bytes)
         } else {
@@ -637,20 +646,20 @@ impl Connection {
         // first byte's top two bits — those are HP-untouched per
         // RFC 9001 §5.4.1 (only low 4/5 bits get masked).
         let is_long = buf[0] & HEADER_FORM_LONG != 0;
-        let pn_slice_len_max = 4.min(buf.len() - pn_offset);
-        // Apply mask to first byte + first 4 bytes after pn_offset.
-        // We unprotect 4 bytes regardless of actual PN length — we'll
-        // truncate after we read the length from the unprotected
-        // first byte.
-        {
-            let (head, rest) = buf.split_at_mut(pn_offset);
-            let pn_window = &mut rest[..pn_slice_len_max];
-            apply_hp_mask(&mut head[0], pn_window, &mask, is_long);
-        }
-
+        // Two-step HP unprotect (RFC 9001 §5.4.1):
+        //   1. XOR mask[0] (low 4 or 5 bits) into the first byte.
+        //   2. Read pn_length from the now-unmasked first byte.
+        //   3. XOR mask[1 .. 1+pn_length] into exactly the PN bytes.
+        // Doing all 4 PN-window bytes up-front would over-XOR the
+        // (4 − pn_length) bytes that aren't PN — those are
+        // ciphertext, and the corruption breaks AEAD verification.
+        buf[0] ^= mask[0] & if is_long { 0x0f } else { 0x1f };
         let pn_length = ((buf[0] & 0x03) as usize) + 1;
         if pn_length > 4 || pn_offset + pn_length + TAG_LEN > buf.len() {
             return Err(ConnError::Wire);
+        }
+        for i in 0..pn_length {
+            buf[pn_offset + i] ^= mask[1 + i];
         }
         // The truncated PN is the first `pn_length` bytes after pn_offset.
         let mut truncated = 0u64;

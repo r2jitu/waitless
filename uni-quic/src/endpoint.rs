@@ -386,12 +386,10 @@ async fn conn_task<H, F>(
     loop {
         let dgram = match inbox.pop().await {
             Some(d) => d,
-            None => break, // inbox closed
+            None => break,
         };
         peer_ip.set(dgram.src_ip);
         peer_port.set(dgram.src_port);
-        // Process the datagram. Borrow is short and dropped before
-        // the outbound drain loop borrows again.
         let result = conn.borrow_mut().process_datagram(&dgram.bytes, &cfg);
         if result.is_err() {
             break;

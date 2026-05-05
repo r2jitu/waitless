@@ -117,31 +117,16 @@ where
             // multiplexes; doing it inline keeps lifetimes simple
             // and matches the shape of //uni-http's handle_conn.
             handle_request(&conn, sid, h.as_ref()).await;
-        } else if sid & 0x3 == 0x2 {
-            // Peer-initiated unidirectional. First varint on the
-            // stream is the stream type. We consume + discard the
-            // body — control-stream SETTINGS we ignore, QPACK
-            // streams stay quiet because we negotiated cap 0.
-            drain_uni_stream(&conn, sid).await;
         }
+        // Peer unidirectional streams (id & 0x3 == 0x2) — control,
+        // QPACK encoder, QPACK decoder. Don't actively drain them
+        // — they'd block the accept loop until they FIN, which
+        // doesn't happen for the lifetime of the connection.
+        // Inbound bytes accumulate in their per-stream recv
+        // buffers harmlessly; we never read them.
         // sid & 0x3 == 0x1 → server-initiated bidi (we don't open
         // any), or sid & 0x3 == 0x3 → server-initiated uni (we
         // opened the control stream above; peers don't echo).
-    }
-}
-
-async fn drain_uni_stream(conn: &QuicConn, sid: u64) {
-    // Read until EOF. We don't care about the contents — the QPACK
-    // encoder/decoder streams stay empty under
-    // SETTINGS_QPACK_MAX_TABLE_CAPACITY=0; the peer's control
-    // stream's SETTINGS is parsed by the H3 layer but not acted on
-    // for our MVP.
-    let mut buf = [0u8; 1024];
-    loop {
-        let (n, eof) = conn.recv(sid, &mut buf).await;
-        if eof || n == 0 {
-            return;
-        }
     }
 }
 
@@ -241,7 +226,6 @@ where
     }
 
     let response = handler(req).await;
-
     // Encode response: HEADERS + DATA + FIN.
     write_response(conn, sid, &response);
 }
@@ -261,24 +245,22 @@ fn write_response(conn: &QuicConn, sid: u64, resp: &Response) {
     let mut qpack_buf: Vec<u8> = Vec::with_capacity(64 + body.len() / 8);
     qpack::encode_field_section(&headers, &mut qpack_buf);
 
-    let mut headers_frame: Vec<u8> = Vec::with_capacity(qpack_buf.len() + 8);
-    let cap = qpack_buf.len() + 8;
-    let mut tmp = vec![0u8; cap];
-    let n = frame::write_frame(h3_ftype::HEADERS, &qpack_buf, &mut tmp)
-        .expect("headers frame fits");
-    headers_frame.extend_from_slice(&tmp[..n]);
-    conn.send(sid, &headers_frame);
-
-    // DATA frame for body.
+    // Bundle HEADERS + DATA into a single byte buffer so the
+    // stream layer ships them in as few QUIC packets as possible.
+    let mut payload: Vec<u8> = Vec::with_capacity(qpack_buf.len() + body.len() + 16);
+    {
+        let mut tmp = vec![0u8; qpack_buf.len() + 8];
+        let n = frame::write_frame(h3_ftype::HEADERS, &qpack_buf, &mut tmp)
+            .expect("headers frame fits");
+        payload.extend_from_slice(&tmp[..n]);
+    }
     if !body.is_empty() {
-        let mut data_frame: Vec<u8> = Vec::with_capacity(body.len() + 8);
-        let cap = body.len() + 8;
-        let mut tmp = vec![0u8; cap];
+        let mut tmp = vec![0u8; body.len() + 8];
         let n = frame::write_frame(h3_ftype::DATA, body, &mut tmp).expect("data frame fits");
-        data_frame.extend_from_slice(&tmp[..n]);
-        conn.send(sid, &data_frame);
+        payload.extend_from_slice(&tmp[..n]);
     }
 
+    conn.send(sid, &payload);
     conn.close_stream(sid);
 }
 
