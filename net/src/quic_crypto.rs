@@ -519,6 +519,115 @@ mod tests {
         assert_eq!(AES_KEY_LEN, 16);
     }
 
+    /// Wire-compat test against quinn-proto's known-answer
+    /// Initial packet (`packet.rs::header_encoding`). Same inputs
+    /// (DCID, empty SCID, PN=0, plaintext = 16 zero bytes) MUST
+    /// produce the SAME 51 bytes after AEAD seal + HP protect —
+    /// otherwise quinn / quiche / s2n-quic / msquic clients
+    /// would reject our packets.
+    ///
+    /// This is the single highest-value wire-compat assertion in
+    /// the QUIC test suite: it exercises the entire encrypt
+    /// pipeline (header layout → AAD shape → AEAD-128-GCM seal →
+    /// HP sample at offset+4 → AES-128-ECB mask → low-4-bit
+    /// first-byte XOR → PN-byte XOR) against bytes we KNOW are
+    /// produced by an RFC 9001 reference implementation.
+    #[test]
+    fn quinn_proto_initial_packet_byte_match() {
+        // DCID + expected-encoded bytes lifted verbatim from
+        // quinn-proto-0.11.14 src/packet.rs::header_encoding test.
+        // Spec reference: RFC 9000 §17.2.2 (Initial packet layout)
+        // + RFC 9001 §5.2/§5.4 (Initial keys + HP).
+        let dcid = hex_var(b"06b858ec6f80452b");
+        let expected_protected: [u8; 51] = {
+            // c8000000010806b858ec6f80452b00004021be3ef508
+            // 07b84191a196f760a6dad1e9d1c430c48952cba0148
+            // 250c21c0a6a70e1
+            let mut out = [0u8; 51];
+            let hex_bytes: &[u8; 102] =
+                b"c8000000010806b858ec6f80452b00004021be3ef50807b84191a196f760a6dad1e9d1c430c48952cba0148250c21c0a6a70e1";
+            let mut i = 0;
+            let mut j = 0;
+            while i < hex_bytes.len() {
+                out[j] = ((nyb_for(hex_bytes[i]) as u8) << 4)
+                    | nyb_for(hex_bytes[i + 1]) as u8;
+                i += 2;
+                j += 1;
+            }
+            out
+        };
+
+        // Build the unprotected packet.
+        let secrets = derive_initial_secrets(&dcid);
+        let client_keys = derive_initial_keys(&secrets.client);
+
+        let mut packet = std::vec::Vec::new();
+        packet.push(0xc0); // long(1) fixed(1) type=Initial(00) reserved=00 pn_len-1=00
+        packet.extend_from_slice(&1u32.to_be_bytes()); // version=1
+        packet.push(dcid.len() as u8); // DCID len = 8
+        packet.extend_from_slice(&dcid);
+        packet.push(0); // SCID len = 0
+        packet.push(0); // Token Length VARINT = 0
+        // Length VARINT (2-byte form) = 33 (PN=1 + payload=16 + tag=16)
+        packet.push(0x40);
+        packet.push(0x21);
+        let pn_offset = packet.len();
+        packet.push(0); // PN = 0 (1 byte)
+        let payload_offset = packet.len();
+        // Plaintext = 16 zero bytes (matches quinn's resize call).
+        packet.extend_from_slice(&[0u8; 16]);
+        packet.extend_from_slice(&[0u8; TAG_LEN]); // tag placeholder
+
+        // AEAD seal.
+        let aad = packet[..payload_offset].to_vec();
+        let nonce = packet_nonce(&client_keys.iv, 0);
+        let mut k16 = [0u8; AES_KEY_LEN];
+        k16.copy_from_slice(&client_keys.key);
+        let payload_slice = &mut packet[payload_offset..payload_offset + 16];
+        let tag = aes128_gcm_seal(&k16, &nonce, &aad, payload_slice);
+        packet[payload_offset + 16..payload_offset + 16 + TAG_LEN]
+            .copy_from_slice(&tag);
+
+        // HP protect.
+        let sample_start = pn_offset + 4;
+        let mut sample = [0u8; HP_SAMPLE_LEN];
+        sample.copy_from_slice(&packet[sample_start..sample_start + HP_SAMPLE_LEN]);
+        let mut hp_k16 = [0u8; AES_KEY_LEN];
+        hp_k16.copy_from_slice(&client_keys.hp);
+        let mask = hp_mask_aes128(&hp_k16, &sample);
+        let (head, rest) = packet.split_at_mut(pn_offset);
+        apply_hp_mask(&mut head[0], &mut rest[..1], &mask, true);
+
+        assert_eq!(
+            packet.len(),
+            expected_protected.len(),
+            "encoded length mismatch"
+        );
+        assert_eq!(
+            &packet[..],
+            &expected_protected[..],
+            "wire bytes diverge from quinn-proto's known-answer Initial"
+        );
+    }
+
+    fn nyb_for(c: u8) -> u8 {
+        match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => 10 + c - b'a',
+            b'A'..=b'F' => 10 + c - b'A',
+            _ => 0,
+        }
+    }
+    fn hex_var(s: &[u8]) -> std::vec::Vec<u8> {
+        let mut out = std::vec::Vec::with_capacity(s.len() / 2);
+        let mut i = 0;
+        while i < s.len() {
+            out.push((nyb_for(s[i]) << 4) | nyb_for(s[i + 1]));
+            i += 2;
+        }
+        out
+    }
+
     /// End-to-end RFC 9001 Appendix A.2 client-Initial decode.
     /// The full encoded packet from the spec, processed through
     /// the primitives this module exports:
