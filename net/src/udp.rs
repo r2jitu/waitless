@@ -11,9 +11,11 @@ extern crate uni_runtime;
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
 extern crate net_ipv4 as ipv4;
+extern crate net_ipv6 as ipv6;
+extern crate net_ipv6_send as ipv6_send;
 
 use from_bytes::FromBytes;
-use types::{Ipv4Addr, CONFIG, tcp_checksum, htons, ntohs};
+use types::{IpAddr, Ipv4Addr, CONFIG, tcp_checksum, tcp_checksum_v6, htons, ntohs};
 use ipv4::{ipv4_send, PROTO_UDP};
 
 #[repr(C, packed)]
@@ -27,29 +29,57 @@ struct UdpHeader {
 // SAFETY: repr(C, packed), all fields u16.
 unsafe impl FromBytes for UdpHeader {}
 
-/// Send a UDP datagram.
+/// Send a UDP datagram. The runtime's UdpBackend vtable currently
+/// passes `dst_ip` as a 4-byte IPv4 address; once the runtime API
+/// switches to `IpAddr`, callers route via `send_to_addr` instead.
 pub fn send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
+    let dst = Ipv4Addr::from(dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]);
+    send_to_addr(IpAddr::V4(dst), src_port, dst_port, data);
+}
+
+/// Family-aware UDP send. Builds the datagram + pseudo-checksum
+/// for the appropriate L3 family, then dispatches to `ipv4_send`
+/// / `ipv6_send`. Used by the dual-stack reactor and by the
+/// receive-path reply paths in TCP / UDP.
+pub fn send_to_addr(dst: IpAddr, src_port: u16, dst_port: u16, data: &[u8]) {
     let udp_len = 8 + data.len();
     if udp_len > 1480 {
         return;
     }
-
-    let dst = Ipv4Addr::from(dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]);
     let mut buf = core::mem::MaybeUninit::<[u8; 1480]>::uninit();
     let p = buf.as_mut_ptr() as *mut u8;
-
     unsafe {
         let hdr = &mut *(p as *mut UdpHeader);
         hdr.src_port = htons(src_port);
         hdr.dst_port = htons(dst_port);
         hdr.length = htons(udp_len as u16);
         hdr.checksum = 0;
-
         core::ptr::copy_nonoverlapping(data.as_ptr(), p.add(8), data.len());
 
-        hdr.checksum = tcp_checksum(CONFIG.ip(), dst, PROTO_UDP, p, udp_len);
-
-        ipv4_send(dst, PROTO_UDP, core::slice::from_raw_parts(p, udp_len));
+        match dst {
+            IpAddr::V4(d) => {
+                hdr.checksum = tcp_checksum(CONFIG.ip(), d, PROTO_UDP, p, udp_len);
+                ipv4_send(d, PROTO_UDP, core::slice::from_raw_parts(p, udp_len));
+            }
+            IpAddr::V6(d) => {
+                // Source IPv6 is filled in by the L3 send path's
+                // checksum computation; we don't have a CONFIG-
+                // tracked global v6 address yet, so use the
+                // unspecified `::` source. Most peers accept this
+                // for short-lived response-path traffic; once the
+                // SLAAC global lands (Phase 5d follow-up), the
+                // reactor's `send_to` will pass the right source.
+                let src = types::Ipv6Addr::ANY;
+                hdr.checksum = tcp_checksum_v6(&src, &d, ipv6::next_header::UDP, p, udp_len);
+                ipv6_send::ipv6_send(
+                    &src,
+                    &d,
+                    ipv6::next_header::UDP,
+                    ipv6::DEFAULT_HOP_LIMIT,
+                    core::slice::from_raw_parts(p, udp_len),
+                );
+            }
+        }
     }
 }
 
@@ -57,7 +87,7 @@ pub fn send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
 /// Delivers the datagram to the async reactor if a
 /// `uni_runtime::net::UdpSocket` is bound to the destination port;
 /// otherwise drops it.
-pub fn udp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
+pub fn udp_receive(src_ip: IpAddr, _dst_ip: IpAddr, data: &[u8]) {
     let hdr = match UdpHeader::try_ref_from(data) {
         Some(h) => h,
         None => return,
@@ -71,5 +101,10 @@ pub fn udp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
     }
     let payload = &data[8..udp_len];
 
-    let _ = uni_runtime::net::deliver_udp(dst_port, src_ip.octets(), src_port, payload);
+    // Until the runtime API gains IpAddr, only IPv4 datagrams
+    // surface to userland sockets. IPv6 UDP packets are ACK'd at
+    // L3 (we sent NA/NS for them) but ignored at L4.
+    if let IpAddr::V4(src) = src_ip {
+        let _ = uni_runtime::net::deliver_udp(dst_port, src.octets(), src_port, payload);
+    }
 }

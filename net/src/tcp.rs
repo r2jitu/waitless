@@ -12,6 +12,8 @@ extern crate uni_runtime;
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
 extern crate net_ipv4 as ipv4;
+extern crate net_ipv6 as ipv6;
+extern crate net_ipv6_send as ipv6_send;
 extern crate bitflags;
 
 use alloc::alloc::{alloc_zeroed, Layout};
@@ -19,7 +21,7 @@ use alloc::boxed::Box;
 use core::ptr;
 use core::task::Waker;
 use from_bytes::FromBytes;
-use types::{Ipv4Addr, CONFIG, tcp_checksum, htons, ntohs, htonl, ntohl};
+use types::{IpAddr, tcp_checksum_any, htons, ntohs, htonl, ntohl};
 use ipv4::{ipv4_send, PROTO_TCP};
 
 /// Heap-allocate a zero-filled `Box<[u8]>` of `len` bytes, returning
@@ -95,7 +97,14 @@ const MSS: usize = 1460;
 
 pub struct TcpConnection {
     pub state: TcpState,
-    remote_ip: Ipv4Addr,
+    /// Peer's IP — IPv4 or IPv6. Used as the destination of every
+    /// outbound segment AND as part of the per-conn lookup key.
+    remote_ip: IpAddr,
+    /// Our IP that the peer addressed when they SYN'd. Recorded so
+    /// outbound segments use the matching pseudo-header (different
+    /// for v4 vs v6) and so we reply from whichever of our
+    /// addresses the peer expects to see.
+    local_ip: IpAddr,
     local_port: u16,
     remote_port: u16,
     snd_nxt: u32,
@@ -127,7 +136,8 @@ impl TcpConnection {
     const fn new() -> Self {
         TcpConnection {
             state: TcpState::Closed,
-            remote_ip: Ipv4Addr::ANY,
+            remote_ip: IpAddr::V4_ANY,
+            local_ip: IpAddr::V4_ANY,
             local_port: 0,
             remote_port: 0,
             snd_nxt: 0,
@@ -269,9 +279,27 @@ static TCP_HASH: uni_kernel::percpu::PerWorker<TcpHashCore> =
     uni_kernel::percpu::PerWorker::new();
 
 #[inline]
-fn tcp_hash_key(src_ip: Ipv4Addr, src_port: u16, dst_port: u16) -> u64 {
-    let ip = u32::from_be_bytes(src_ip.octets()) as u64;
-    (ip << 32) | ((src_port as u64) << 16) | (dst_port as u64) | (1u64 << 63)
+fn tcp_hash_key(src_ip: IpAddr, src_port: u16, dst_port: u16) -> u64 {
+    // Fold the source address to 32 bits so the existing
+    // (ip<<32 | ports) packing keeps working. v6 collisions on
+    // the 32-bit fold are benign — `tcp_hash_find` linear-probes
+    // and the consumer (process_one_packet) re-verifies the full
+    // 4-tuple via `c.remote_ip == src_ip` before dispatching.
+    let ip32 = match src_ip {
+        IpAddr::V4(a) => u32::from_be_bytes(a.octets()),
+        IpAddr::V6(a) => {
+            let o = a.octets;
+            u32::from_be_bytes([o[0], o[1], o[2], o[3]])
+                ^ u32::from_be_bytes([o[4], o[5], o[6], o[7]])
+                ^ u32::from_be_bytes([o[8], o[9], o[10], o[11]])
+                ^ u32::from_be_bytes([o[12], o[13], o[14], o[15]])
+        }
+    };
+    let ip = ip32 as u64;
+    // Salt v6 keys with bit 62 so they can't collide with v4
+    // keys whose 32-bit fold happens to match.
+    let family_bit = if matches!(src_ip, IpAddr::V6(_)) { 1u64 << 62 } else { 0 };
+    (ip << 32) | ((src_port as u64) << 16) | (dst_port as u64) | (1u64 << 63) | family_bit
 }
 
 #[inline]
@@ -459,7 +487,8 @@ fn free_connection(core: u32, slot: usize) {
 }
 
 fn send_segment(
-    dst_ip: Ipv4Addr,
+    local_ip: IpAddr,
+    dst_ip: IpAddr,
     src_port: u16,
     dst_port: u16,
     seq: u32,
@@ -490,13 +519,14 @@ fn send_segment(
             ptr::copy_nonoverlapping(payload.as_ptr(), p.add(20), payload_len);
         }
 
-        hdr.checksum = tcp_checksum(CONFIG.ip(), dst_ip, PROTO_TCP, p, seg_len);
+        hdr.checksum = tcp_checksum_any(local_ip, dst_ip, PROTO_TCP, p, seg_len);
 
-        ipv4_send(dst_ip, PROTO_TCP, core::slice::from_raw_parts(p, seg_len));
+        let bytes = core::slice::from_raw_parts(p, seg_len);
+        send_l3(local_ip, dst_ip, bytes);
     }
 }
 
-fn send_rst(dst_ip: Ipv4Addr, src_port: u16, dst_port: u16, seq: u32, ack: u32) {
+fn send_rst(local_ip: IpAddr, dst_ip: IpAddr, src_port: u16, dst_port: u16, seq: u32, ack: u32) {
     let mut buf = core::mem::MaybeUninit::<[u8; 20]>::uninit();
     let p = buf.as_mut_ptr() as *mut u8;
     unsafe {
@@ -511,14 +541,35 @@ fn send_rst(dst_ip: Ipv4Addr, src_port: u16, dst_port: u16, seq: u32, ack: u32) 
         hdr.checksum = 0;
         hdr.urgent = 0;
 
-        hdr.checksum = tcp_checksum(CONFIG.ip(), dst_ip, PROTO_TCP, p, 20);
+        hdr.checksum = tcp_checksum_any(local_ip, dst_ip, PROTO_TCP, p, 20);
 
-        ipv4_send(dst_ip, PROTO_TCP, core::slice::from_raw_parts(p, 20));
+        let bytes = core::slice::from_raw_parts(p, 20);
+        send_l3(local_ip, dst_ip, bytes);
+    }
+}
+
+/// Family-aware L3 send. Dispatches to `ipv4_send` (which handles
+/// ARP internally) for v4 destinations and to `ipv6_send` (which
+/// handles NDP internally) for v6. The `local_ip` is currently
+/// just used by the checksum calculator; v4 uses CONFIG.ip(), v6
+/// uses our link-local — both selected upstream when the TCB
+/// captured `local_ip` from the SYN.
+fn send_l3(local_ip: IpAddr, dst_ip: IpAddr, segment: &[u8]) {
+    match (local_ip, dst_ip) {
+        (_, IpAddr::V4(d)) => ipv4_send(d, PROTO_TCP, segment),
+        (IpAddr::V6(s), IpAddr::V6(d)) => {
+            ipv6_send::ipv6_send(&s, &d, ipv6::next_header::TCP, 64, segment);
+        }
+        // Mismatched family — should never happen in correct code.
+        // Drop silently rather than crash the kernel.
+        _ => {}
     }
 }
 
 /// Process an incoming TCP packet. Called on the owning core (via flow hash).
-pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
+/// `src_ip` and `dst_ip` are family-tagged so v4 and v6 connections
+/// share the same TCB pool, hash table, and dispatch path.
+pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, data: &[u8]) {
     let hdr = match TcpHeader::try_ref_from(data) {
         Some(h) => h,
         None => return,
@@ -578,7 +629,7 @@ pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
         };
 
         if listener_idx.is_none() {
-            send_rst(src_ip, dst_port, src_port, 0, seq + 1);
+            send_rst(dst_ip, src_ip, dst_port, src_port, 0, seq + 1);
             return;
         }
 
@@ -592,6 +643,7 @@ pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
             let c = unsafe { &mut *conn_ptr(core, slot) };
             c.state = TcpState::SynReceived;
             c.remote_ip = src_ip;
+            c.local_ip = dst_ip;
             c.local_port = dst_port;
             c.remote_port = src_port;
             let isn = next_seq();
@@ -619,7 +671,7 @@ pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
         // Send SYN+ACK
         {
             let c = unsafe { &*conn_ptr(core, slot) };
-            send_segment(src_ip, dst_port, src_port, c.snd_nxt, c.rcv_nxt, TCP_SYN | TCP_ACK, RX_BUF_SIZE as u16, &[]);
+            send_segment(dst_ip, src_ip, dst_port, src_port, c.snd_nxt, c.rcv_nxt, TCP_SYN | TCP_ACK, RX_BUF_SIZE as u16, &[]);
         }
         unsafe {
             let cp = conn_ptr(core, slot);
@@ -710,11 +762,11 @@ pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
             // regression from the old comment shows up again we'll
             // want a real timer-based ACK coalescer rather than
             // pinning this to "next data segment".
-            send_segment(src_ip, dst_port, src_port, c.snd_nxt, c.rcv_nxt, TCP_ACK, c.rx_free() as u16, &[]);
+            send_segment(dst_ip, src_ip, dst_port, src_port, c.snd_nxt, c.rcv_nxt, TCP_ACK, c.rx_free() as u16, &[]);
         } else if seq_lt(seq, c.rcv_nxt) {
             // Duplicate/retransmitted segment — send ACK immediately so the
             // sender knows we already have this data (fast retransmit signal).
-            send_segment(src_ip, dst_port, src_port, c.snd_nxt, c.rcv_nxt, TCP_ACK, c.rx_free() as u16, &[]);
+            send_segment(dst_ip, src_ip, dst_port, src_port, c.snd_nxt, c.rcv_nxt, TCP_ACK, c.rx_free() as u16, &[]);
         }
     }
 
@@ -728,7 +780,7 @@ pub fn tcp_receive(src_ip: Ipv4Addr, _dst_ip: Ipv4Addr, data: &[u8]) {
     // segment close the connection and desync the receive stream.
     if flags & TCP_FIN != 0 && seq.wrapping_add(payload_len as u32) == c.rcv_nxt {
         c.rcv_nxt = c.rcv_nxt.wrapping_add(1);
-        send_segment(src_ip, dst_port, src_port, c.snd_nxt, c.rcv_nxt, TCP_ACK, c.rx_free() as u16, &[]);
+        send_segment(dst_ip, src_ip, dst_port, src_port, c.snd_nxt, c.rcv_nxt, TCP_ACK, c.rx_free() as u16, &[]);
 
         match c.state {
             TcpState::Established | TcpState::SynReceived => {
@@ -857,6 +909,7 @@ fn send(handle: *mut (), data: &[u8]) -> i32 {
     while sent < len {
         let chunk = (len - sent).min(MSS);
         send_segment(
+            c.local_ip,
             c.remote_ip,
             c.local_port,
             c.remote_port,
@@ -894,7 +947,7 @@ pub fn close(handle: *mut (), generation: u16) {
     match c.state {
         TcpState::Established => {
             send_segment(
-                c.remote_ip, c.local_port, c.remote_port,
+                c.local_ip, c.remote_ip, c.local_port, c.remote_port,
                 c.snd_nxt, c.rcv_nxt, TCP_FIN | TCP_ACK, win, &[],
             );
             c.snd_nxt = c.snd_nxt.wrapping_add(1);
@@ -902,7 +955,7 @@ pub fn close(handle: *mut (), generation: u16) {
         }
         TcpState::CloseWait => {
             send_segment(
-                c.remote_ip, c.local_port, c.remote_port,
+                c.local_ip, c.remote_ip, c.local_port, c.remote_port,
                 c.snd_nxt, c.rcv_nxt, TCP_FIN | TCP_ACK, win, &[],
             );
             free_connection(core, slot);
@@ -936,7 +989,7 @@ pub fn shutdown_all() {
             if c.state == TcpState::Closed || c.state == TcpState::Listen {
                 continue;
             }
-            send_rst(c.remote_ip, c.local_port, c.remote_port, c.snd_nxt, c.rcv_nxt);
+            send_rst(c.local_ip, c.remote_ip, c.local_port, c.remote_port, c.snd_nxt, c.rcv_nxt);
             free_connection(core, slot);
         }
     }

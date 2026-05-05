@@ -195,6 +195,8 @@ rust_library(
     deps = [
         ":from_bytes",
         ":ipv4",
+        ":ipv6",
+        ":ipv6_send",
         ":types",
         "//kernel",
         "//uni-runtime",
@@ -210,6 +212,8 @@ rust_library(
     deps = [
         ":from_bytes",
         ":ipv4",
+        ":ipv6",
+        ":ipv6_send",
         ":types",
         "//uni-runtime",
     ],

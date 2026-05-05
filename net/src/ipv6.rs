@@ -42,6 +42,12 @@ pub mod next_header {
     pub const ICMPV6: u8 = 58;
 }
 
+/// Minimum hop limit for outbound traffic when the caller doesn't
+/// have a specific value. RFC 4861 §6.2.4 defaults to 64 for most
+/// host-to-host traffic; ICMPv6 NDP messages use 255 (handled at
+/// the call site).
+pub const DEFAULT_HOP_LIMIT: u8 = 64;
+
 /// IPv6 fixed header (RFC 8200 §3). 40 bytes, no checksum,
 /// `payload_length` does NOT include the header itself (unlike
 /// `total_length` in IPv4).

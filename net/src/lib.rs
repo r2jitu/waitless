@@ -22,21 +22,22 @@ pub extern crate net_protocol as protocol;
 
 pub static REGISTRY: protocol::Registry = protocol::Registry::new();
 
-// Adapters converting the u32-IP registry ABI to the Ipv4Addr-typed
-// `*_receive` entry points. Here rather than inside each protocol
-// crate so `net_protocol` stays dep-free (its rust_test would
-// otherwise inherit `:types`' panic-strategy conflict).
+// Adapters converting the u32-IP registry ABI to the family-typed
+// `*_receive` entry points. The registry itself stays v4-only
+// (the protocol number space is shared with v6 but the dispatch
+// wrappers always wrap incoming u32 IPs in `IpAddr::V4`); IPv6
+// dispatch goes through `dispatch_ipv6_l4_to_registry` directly.
 fn tcp_dispatch(src: u32, dst: u32, payload: &[u8]) {
     tcp::tcp_receive(
-        types::Ipv4Addr { addr: src },
-        types::Ipv4Addr { addr: dst },
+        types::IpAddr::V4(types::Ipv4Addr { addr: src }),
+        types::IpAddr::V4(types::Ipv4Addr { addr: dst }),
         payload,
     );
 }
 fn udp_dispatch(src: u32, dst: u32, payload: &[u8]) {
     udp::udp_receive(
-        types::Ipv4Addr { addr: src },
-        types::Ipv4Addr { addr: dst },
+        types::IpAddr::V4(types::Ipv4Addr { addr: src }),
+        types::IpAddr::V4(types::Ipv4Addr { addr: dst }),
         payload,
     );
 }
@@ -578,8 +579,20 @@ fn ipv6_receive_frame(frame: &[u8], src_mac: types::MacAddr) {
     ndp::ndp_learn(pkt.src, src_mac);
     match pkt.next_header {
         ipv6::next_header::ICMPV6 => handle_icmpv6(&pkt, src_mac),
-        // UDP / TCP over IPv6 — protocol stack still IPv4-keyed for
-        // now; full IPv6 sockets land in a future commit.
+        ipv6::next_header::TCP => {
+            tcp::tcp_receive(
+                types::IpAddr::V6(pkt.src),
+                types::IpAddr::V6(pkt.dst),
+                pkt.payload,
+            );
+        }
+        ipv6::next_header::UDP => {
+            udp::udp_receive(
+                types::IpAddr::V6(pkt.src),
+                types::IpAddr::V6(pkt.dst),
+                pkt.payload,
+            );
+        }
         _ => {}
     }
 }
