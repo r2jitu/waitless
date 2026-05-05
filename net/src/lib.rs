@@ -12,7 +12,9 @@ pub extern crate net_ethernet as ethernet;
 pub extern crate net_arp as arp;
 pub extern crate net_ipv4 as ipv4;
 pub extern crate net_ipv6 as ipv6;
+pub extern crate net_ipv6_send as ipv6_send;
 pub extern crate net_icmpv6 as icmpv6;
+pub extern crate net_ndp as ndp;
 pub extern crate net_tcp as tcp;
 pub extern crate net_udp as udp;
 pub extern crate net_dhcp as dhcp;
@@ -490,13 +492,11 @@ fn send_router_solicitation() {
         Some(n) => n,
         None => return,
     };
-    // Multicast destination → `send_ipv6_from` picks the
-    // 33:33:00:00:00:02 MAC mapping; the fallback unicast MAC
-    // argument is unused but pass `MacAddr::BROADCAST` for clarity.
-    send_ipv6_from(
+    // Multicast destination → ipv6_send picks the
+    // 33:33:00:00:00:02 mapping internally.
+    ipv6_send::ipv6_send(
         &ll,
         &dst,
-        types::MacAddr::BROADCAST,
         ipv6::next_header::ICMPV6,
         255,
         &icmp[..n],
@@ -571,6 +571,11 @@ fn ipv6_receive_frame(frame: &[u8], src_mac: types::MacAddr) {
         Some(p) => p,
         None => return,
     };
+    // Snoop (peer_v6, peer_mac) into the NDP cache so future
+    // server-initiated outbound to this peer doesn't need an
+    // active Neighbor Solicitation. Mirrors the IPv4 ARP-snoop
+    // pattern in `dispatch_frame` above.
+    ndp::ndp_learn(pkt.src, src_mac);
     match pkt.next_header {
         ipv6::next_header::ICMPV6 => handle_icmpv6(&pkt, src_mac),
         // UDP / TCP over IPv6 — protocol stack still IPv4-keyed for
@@ -595,7 +600,14 @@ fn handle_icmpv6(pkt: &ipv6::Ipv6Packet<'_>, src_mac: types::MacAddr) {
                 Some(n) => n,
                 None => return,
             };
-            send_ipv6_from(&ipv6_ll(), &pkt.src, src_mac, ipv6::next_header::ICMPV6, 64, &icmp_out[..n]);
+            ipv6_send::ipv6_send_to_mac(
+                &ipv6_ll(),
+                &pkt.src,
+                src_mac,
+                ipv6::next_header::ICMPV6,
+                64,
+                &icmp_out[..n],
+            );
         }
         icmpv6::msg::ROUTER_ADVERTISEMENT => {
             handle_router_advertisement(pkt.payload);
@@ -631,7 +643,7 @@ fn handle_icmpv6(pkt: &ipv6::Ipv6Packet<'_>, src_mac: types::MacAddr) {
             // SLLA option's MAC if present, falling back to the
             // inbound frame's source MAC.
             let dst_mac = ns.src_lla.unwrap_or(src_mac);
-            send_ipv6_from(
+            ipv6_send::ipv6_send_to_mac(
                 &na_src,
                 &pkt.src,
                 dst_mac,
@@ -644,33 +656,6 @@ fn handle_icmpv6(pkt: &ipv6::Ipv6Packet<'_>, src_mac: types::MacAddr) {
     }
 }
 
-/// Build + ship an IPv6 packet from `src_addr` to `dst_addr`. The
-/// destination MAC is computed deterministically for multicast
-/// destinations (RFC 2464 §7) and falls back to `fallback_dst_mac`
-/// for unicast — the receive-path reply pattern reuses the
-/// inbound frame's source MAC, which sidesteps NDP resolution.
-/// Once we have a real NDP cache, unicast falls through to a
-/// cache lookup instead.
-fn send_ipv6_from(
-    src_addr: &types::Ipv6Addr,
-    dst_addr: &types::Ipv6Addr,
-    fallback_dst_mac: types::MacAddr,
-    next_header: u8,
-    hop_limit: u8,
-    payload: &[u8],
-) {
-    let dst_mac = if dst_addr.is_multicast() {
-        dst_addr.multicast_mac()
-    } else {
-        fallback_dst_mac
-    };
-    let mut buf = [0u8; 1500];
-    let n = match ipv6::ipv6_build(src_addr, dst_addr, next_header, hop_limit, payload, &mut buf) {
-        Some(n) => n,
-        None => return,
-    };
-    ethernet::ethernet_send(dst_mac, ipv6::ETHERTYPE_IPV6, &buf[..n]);
-}
 
 /// Flow hash: map a 4-tuple to a core index for Tier 2 distribution.
 ///

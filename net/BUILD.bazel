@@ -155,6 +155,38 @@ rust_test(
     crate = ":icmpv6",
 )
 
+# NDP MAC cache. Mirrors `:arp`. Kernel-only (Spinlock dep), so
+# no host test target — covered via the integration tests against
+# the running unikernel.
+rust_library(
+    name = "ndp",
+    srcs = ["src/ndp.rs"],
+    crate_name = "net_ndp",
+    crate_root = "src/ndp.rs",
+    deps = [
+        ":types",
+        "//kernel",
+    ],
+)
+
+# Outbound IPv6 helper — combines the wire-format builder with
+# NDP MAC resolution and ethernet_send. Mirrors `ipv4_send`'s
+# place in the dependency graph: TCP / UDP / the umbrella
+# receive-path reply code link against this rather than wiring
+# raw `ethernet_send` themselves.
+rust_library(
+    name = "ipv6_send",
+    srcs = ["src/ipv6_send.rs"],
+    crate_name = "net_ipv6_send",
+    crate_root = "src/ipv6_send.rs",
+    deps = [
+        ":ethernet",
+        ":ipv6",
+        ":ndp",
+        ":types",
+    ],
+)
+
 rust_library(
     name = "tcp",
     srcs = ["src/tcp.rs"],
@@ -237,6 +269,8 @@ rust_library(
         ":icmpv6",
         ":ipv4",
         ":ipv6",
+        ":ipv6_send",
+        ":ndp",
         ":protocol",
         ":tcp",
         ":types",
