@@ -1,0 +1,66 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//bazel/rules:rust.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# QUIC v1 protocol stack (RFC 9000 + RFC 9001).
+#
+# Owns the FULL QUIC implementation: sans-io wire-format primitives
+# (`wire`, `frame`, `crypto`), the TLS 1.3 handshake driver wrapped
+# over CRYPTO frames (`tls`), the per-connection state machine
+# (`conn`), per-connection async inbox (`inbox`), and the UDP
+# endpoint that routes datagrams to conn tasks (`endpoint`). Depends
+# on `//uni-tls` for the sans-io TLS bits (`schedule`, `aead`,
+# `handshake`) plus the cert / signing-key types reused across
+# both protocols.
+rust_library(
+    name = "uni-quic",
+    srcs = [
+        "src/lib.rs",
+        # Sans-io QUIC primitives (formerly //net:quic_{wire,frame,crypto}).
+        "src/crypto.rs",
+        "src/frame.rs",
+        "src/wire.rs",
+        # TLS-handshake-over-CRYPTO-frames driver + connection state
+        # machine + async inbox + UDP endpoint.
+        "src/conn.rs",
+        "src/endpoint.rs",
+        "src/inbox.rs",
+        "src/tls.rs",
+    ],
+    compile_data = [
+        "//apps/webserver/dev_certs:dev_cert.der",
+        "//apps/webserver/dev_certs:dev_key.der",
+    ],
+    crate_features = select({
+        "//bazel/rules:tests_need_std_on": ["std"],
+        "//conditions:default": [],
+    }),
+    crate_name = "uni_quic",
+    rustc_flags = [
+        "--check-cfg=cfg(test)",
+        # `feature = "std"` is toggled by `tests_need_std_on` for the
+        # `rust_test` build (see crate_features above).
+        "--check-cfg=cfg(feature,values(\"std\"))",
+    ],
+    deps = [
+        "//uni",
+        "//uni-tls",
+        "@crates//:aes-gcm",
+        "@crates//:chacha20",
+        "@crates//:getrandom",
+        "@crates//:hmac",
+        "@crates//:p256",
+        "@crates//:sha2",
+    ],
+)
+
+# Host-native unit tests for in-crate `mod tests` blocks (wire-format
+# parsing, frame round-trips, AEAD seal/open, packet-number decode,
+# slot-table allocator, end-to-end self handshake). Same `std`
+# feature trick as the rest of the workspace.
+rust_test(
+    name = "uni_quic_test",
+    size = "small",
+    crate = ":uni-quic",
+)
