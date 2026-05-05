@@ -40,6 +40,7 @@
 
 #![allow(dead_code)]
 
+use alloc::vec;
 use alloc::vec::Vec;
 
 use net_quic_crypto::{
@@ -54,8 +55,8 @@ use net_quic_wire::{
     read_varint, write_varint, FIXED_BIT, HEADER_FORM_LONG, QUIC_VERSION_1,
 };
 
-use super::quic::{CryptoLevel, QuicTls, QuicTlsError, QuicTlsState};
-use super::TlsServerConfig;
+use super::tls::{CryptoLevel, QuicTls, QuicTlsError, QuicTlsState};
+use crate::server::TlsServerConfig;
 
 // ============================================================================
 // Errors
@@ -89,11 +90,10 @@ impl From<QuicTlsError> for ConnError {
 // Connection ID
 // ============================================================================
 
-/// QUIC v1 connection IDs are at most 20 bytes (RFC 9000 §17.2).
-/// Our server picks 8-byte CIDs — same size as OpenSSL / quinn
-/// defaults; large enough to make collisions improbable, small
-/// enough to fit in tight per-core slot tables.
-pub const SERVER_CID_LEN: usize = 8;
+/// Re-export the canonical SERVER_CID_LEN from `inbox`. The two
+/// modules need to agree on this; the source of truth lives next
+/// to the slot-encoding helpers (make_local_cid / parse_local_cid).
+pub use super::inbox::SERVER_CID_LEN;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConnectionId {

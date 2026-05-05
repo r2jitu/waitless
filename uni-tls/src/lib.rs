@@ -35,6 +35,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 
 mod server;
+pub mod quic;
 
 pub use server::TlsServerConfig;
 

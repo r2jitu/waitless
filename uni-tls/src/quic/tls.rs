@@ -29,6 +29,13 @@
 //     X25519 share; HRR is for negotiating a different group)
 //   * Key update (1-RTT key rotation; RFC 9001 §6)
 
+// The connection state machine is the consumer of this module.
+// Until that crate lands, the public API surface here looks
+// dead-code from the workspace's perspective — silence the
+// `#![deny(warnings)]` on the items the connection state machine
+// will wire into.
+#![allow(dead_code)]
+
 use alloc::vec::Vec;
 
 use p256::ecdsa::{signature::Signer, Signature as EcdsaSignature};
@@ -40,8 +47,8 @@ use net_tls_handshake::{
     sign_content_server_cert_verify, ClientHello, ParseError,
 };
 
-use super::keys::{ct_eq_32, derive_finished_key, hmac_sha256};
-use super::TlsServerConfig;
+use crate::server::keys::{ct_eq_32, derive_finished_key, hmac_sha256};
+use crate::server::TlsServerConfig;
 
 // ============================================================================
 // Public types
@@ -50,13 +57,12 @@ use super::TlsServerConfig;
 /// QUIC packet number space for CRYPTO frames. Each level uses a
 /// separate set of packet protection keys derived from a different
 /// stage of the TLS key schedule.
+/// `OneRtt` is part of the public level taxonomy — the connection
+/// state machine routes 1-RTT-protected CRYPTO frames through it
+/// — even though the QuicTls module doesn't itself emit anything
+/// at that level today (no NewSessionTicket / NewToken yet).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-// `OneRtt` is part of the public level taxonomy — the connection
-// state machine routes 1-RTT-protected CRYPTO frames through it
-// — even though the QuicTls module doesn't itself emit anything
-// at that level today (no NewSessionTicket / NewToken yet).
-#[allow(dead_code)]
 pub enum CryptoLevel {
     /// Initial space: ClientHello / ServerHello. Keys from
     /// `quic_crypto::derive_initial_keys`, NOT from the TLS schedule.

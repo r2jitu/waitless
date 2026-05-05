@@ -27,13 +27,11 @@ pub(super) use net_tls as tls;
 pub(super) use net_tls_handshake as handshake;
 pub(super) use net_tls_record as record;
 
-mod keys;
+pub(crate) mod keys;
 mod trace;
 pub mod profile;
 mod handlers;
 pub mod ticket;
-pub mod quic;
-pub mod quic_conn;
 
 // ============================================================================
 // Tunables
