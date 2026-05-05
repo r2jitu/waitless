@@ -52,6 +52,35 @@ openssl pkey  -in dev_key.pem  -outform DER -out dev_key.der
 openssl x509  -in dev_cert.pem -outform DER -out dev_cert.der
 ```
 
+## Browser-trusted local cert via mkcert
+
+The committed self-signed cert works for `curl --cacert` and host-side
+test code, but Chrome/Safari/Edge will refuse it with a hard
+`NET::ERR_CERT_AUTHORITY_INVALID` warning when you visit
+`https://localhost:<port>` directly. To get a browser-trusted local
+cert without giving up the same DER format, use [mkcert][mkcert]:
+
+```bash
+brew install mkcert nss          # nss is for Firefox; skip if you don't use it
+mkcert -install                  # one-time: writes mkcert's local CA into the system keychain
+
+apps/webserver/dev_certs/regen-mkcert.sh
+bazel run //apps/webserver:run
+```
+
+`regen-mkcert.sh` overwrites `dev_cert.{pem,der}` and
+`dev_key.{pem,der}` with an mkcert-issued ECDSA P-256 leaf (same
+algorithm as the committed cert) signed by your local mkcert root.
+Chrome trusts it because mkcert installed the root into the macOS
+keychain. To revert to the committed self-signed cert,
+`git checkout apps/webserver/dev_certs/dev_{cert,key}.{pem,der}`.
+
+The mkcert-signed files are intentionally per-user — don't commit
+them. The committed cert stays the canonical CI / fresh-checkout
+path.
+
+[mkcert]: https://github.com/FiloSottile/mkcert
+
 ## Why we check in the cert instead of generating at boot
 
 We'll eventually want a proper RNG in the kernel (jitter + RDRAND +
