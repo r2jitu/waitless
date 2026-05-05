@@ -107,6 +107,10 @@ impl Request {
         &self.path[..self.path_len]
     }
 
+    pub fn body(&self) -> &[u8] {
+        &self.body[..self.body_len]
+    }
+
     pub fn header(&self, name: &[u8]) -> Option<&[u8]> {
         for i in 0..self.header_count {
             if self.headers[i].name().eq_ignore_ascii_case(name) {
@@ -114,6 +118,42 @@ impl Request {
             }
         }
         None
+    }
+
+    /// Overwrite the request-target path. Truncates if longer than
+    /// the fixed `path` buffer. Used by the HTTP/3 frontend to
+    /// install the `:path` pseudo-header into the same `Request`
+    /// shape the HTTP/1.1 parser fills in.
+    pub fn set_path(&mut self, path: &[u8]) {
+        let n = path.len().min(self.path.len());
+        self.path[..n].copy_from_slice(&path[..n]);
+        self.path_len = n;
+    }
+
+    /// Overwrite the request body. Truncates if longer than the
+    /// fixed `body` buffer. Used by the HTTP/3 frontend after it
+    /// reassembles DATA frames.
+    pub fn set_body(&mut self, body: &[u8]) {
+        let n = body.len().min(self.body.len());
+        self.body[..n].copy_from_slice(&body[..n]);
+        self.body_len = n;
+    }
+
+    /// Append a header line `(name, value)`. Drops silently if the
+    /// per-Request 16-header cap is full (matches the HTTP/1.1
+    /// parser's truncation policy).
+    pub fn push_header(&mut self, name: &[u8], value: &[u8]) {
+        if self.header_count >= self.headers.len() {
+            return;
+        }
+        let h = &mut self.headers[self.header_count];
+        let n = name.len().min(h.name.len());
+        h.name[..n].copy_from_slice(&name[..n]);
+        h.name_len = n;
+        let v = value.len().min(h.value.len());
+        h.value[..v].copy_from_slice(&value[..v]);
+        h.value_len = v;
+        self.header_count += 1;
     }
 
     fn clear(&mut self) {
@@ -224,7 +264,9 @@ impl Response {
         }
     }
 
-    fn body_bytes(&self) -> &[u8] {
+    /// Borrow the response body. Public so non-HTTP/1.1 frontends
+    /// (HTTP/3) can serialise it into their own framing.
+    pub fn body_bytes(&self) -> &[u8] {
         match &self.body {
             // SAFETY: the Static variant is constructed from a
             // caller-provided `&[u8]` whose lifetime covers the
@@ -236,7 +278,9 @@ impl Response {
             ResponseBody::Owned(b) => b,
         }
     }
-    fn content_type_bytes(&self) -> &[u8] {
+    /// Borrow the content-type header value. Public for the HTTP/3
+    /// frontend (mirror of `body_bytes`).
+    pub fn content_type_bytes(&self) -> &[u8] {
         unsafe { core::slice::from_raw_parts(self.content_type, self.content_type_len) }
     }
 }
