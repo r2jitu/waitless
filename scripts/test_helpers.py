@@ -391,10 +391,15 @@ def udp_echo(
     payload: bytes = b"hello", *, host: str = "127.0.0.1",
     port: int, timeout: float = 2.0,
 ) -> Optional[bytes]:
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # `getaddrinfo` picks AF_INET or AF_INET6 based on the literal,
+    # so callers can pass `"::1"` and we open the matching family
+    # without a parallel `udp_echo_v6` helper.
+    info = socket.getaddrinfo(host, port,
+                              type=socket.SOCK_DGRAM)[0]
+    s = socket.socket(info[0], info[1])
     s.settimeout(timeout)
     try:
-        s.sendto(payload, (host, port))
+        s.sendto(payload, info[4])
         data, _ = s.recvfrom(1024)
         return data
     except socket.timeout:

@@ -1338,10 +1338,13 @@ the running unikernel; 16-test suite green; bare-metal builds
       retry once the NA arrives). Mirrors `ipv4_send`'s ARP-miss
       behaviour line for line.
 
-### 5e. HVF runner IPv6 — partial
+### 5e. HVF runner IPv6 — done (modulo SLAAC RA)
 
-The unikernel-side IPv6 stack is complete (Phase 5a–5d). The
-runner-side has the L3 plumbing but not yet the L4 relay:
+Unikernel-side IPv6 (Phase 5a–5d) plus the runner-side AF_INET6
+socket bridge for TCP and UDP. End-to-end verified via
+`apps/webserver/test.py` (`test_http_health_v6`,
+`test_https_health_v6`, `test_udp_echo_v6`) and
+`curl -6 https://[::1]:18443/health`.
 
 - [x] `0x86dd` arm in `handle_guest_tx`. IPv6 frames are no
       longer dropped at the runner.
@@ -1355,12 +1358,14 @@ runner-side has the L3 plumbing but not yet the L4 relay:
 - [x] ICMPv6 Echo bouncer. `ping6 fe80::a8bb:ccff:fedd:eeff`
       from inside the VM gets replies — exercises the kernel's
       Echo Reply path end-to-end without needing a real peer.
-- [ ] **AF_INET6 socket-bridge for TCP / UDP.** Inbound TCP/UDP
-      from the VM over IPv6 to `GW_IPV6` is silently dropped
-      today. The bridge needs `socket(AF_INET6, ...)`,
-      `sockaddr_in6` plumbing, and a `ConnState` family tag —
-      ~400-600 LOC mirroring the existing v4 NAT-relay code
-      paths. No protocol risk; purely mechanical port.
+- [x] **AF_INET6 socket-bridge for TCP / UDP.** `bind_listen_v6`
+      / `open_udp_sibling_v6` open a parallel `[::1]:host_port`
+      socket per `-p tcp:` / `-p udp:` mapping with
+      `IPV6_V6ONLY=1`. The single shared `IpFamily` tag rides
+      through `TcpListen` → `ProxyConn` and `UdpRelay`, so
+      reply frames go through the v6 frame builders
+      (`build_tcp_frame_v6_fixed`, `build_udp_frame_v6`,
+      `write_tcp_frame_v6_around_payload`) automatically.
 - [ ] Optional: emit unsolicited Router Advertisement so the
       VM picks up a SLAAC global. Without this the SLAAC code
       path stays cold in HVF deployments (it works in real LAN

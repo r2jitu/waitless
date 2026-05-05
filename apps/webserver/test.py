@@ -198,6 +198,39 @@ class WebserverServiceTest(unittest.TestCase):
     def test_udp_echo(self) -> None:
         self.assertEqual(udp_echo(port=UDP_PORT), b"hello")
 
+    # ── IPv6 dual-stack reachability ─────────────────────────────
+    # The HVF runner dual-binds every `-p tcp:H:G` / `-p udp:H:G`
+    # mapping on `127.0.0.1` and `[::1]`; the guest sees v4 and v6
+    # frames for the same listening port via separate `IpFamily`
+    # tags. Native and QEMU runners don't have a userspace v6
+    # bridge, so these tests skip cleanly there.
+    def _skip_unless_v6_bridge(self) -> None:
+        if "hvf" not in LAUNCHER_NAME:
+            self.skipTest(
+                "v6 host bridge is HVF-runner only; "
+                f"current launcher={LAUNCHER_NAME}")
+
+    def test_http_health_v6(self) -> None:
+        self._skip_unless_v6_bridge()
+        status, _ = http_get("/health", host="::1", port=PORT)
+        self.assertEqual(status, 200)
+
+    def test_https_health_v6(self) -> None:
+        # Dev cert's SANs only cover 127.0.0.1 / localhost / unikernel.local,
+        # so a verified handshake to `[::1]` would fail Python's IP-SAN
+        # check. Pass `ca_file=None` to exercise just the TLS-over-IPv6
+        # transport — the verified-cert path is already covered by
+        # `test_https_health` over `127.0.0.1`.
+        self._skip_unless_v6_bridge()
+        status, body = https_get("/health", host="::1", port=TLS_PORT,
+                                 ca_file=None)
+        self.assertEqual(status, 200)
+        self.assertIn(b"status", body)
+
+    def test_udp_echo_v6(self) -> None:
+        self._skip_unless_v6_bridge()
+        self.assertEqual(udp_echo(host="::1", port=UDP_PORT), b"hello")
+
     # ── Async TCP reactor end-to-end (uni::runtime::TcpListener) ──
     def test_tcp_echo(self) -> None:
         """Validates `uni::runtime::TcpListener::bind(9)?.run(...)` —

@@ -140,6 +140,11 @@ struct ProxyConn {
     peer_ack: u32,
     state: ConnState,
     pending: Vec<u8>,
+    /// IP family of this connection — determines whether reply frames
+    /// are built via the v4 (`GW_IP`/`VM_IP`) or v6 (`GW_IPV6`/`VM_IPV6`)
+    /// frame builders. Inherited from the `TcpListen` whose `accept(2)`
+    /// produced this conn.
+    family: IpFamily,
 }
 
 // Per-worker shared state. In the N-worker design, each queue pair has
@@ -299,10 +304,18 @@ static UDP_RELAYS_V6: OnceLock<Vec<UdpRelayFds>> = OnceLock::new();
 const GUEST_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 
 /// Per-listen-socket state.
+///
+/// One `TcpListen` per `(host_port, family)` pair: `start()` calls
+/// `bind_listen` for AF_INET and (best-effort) `bind_listen_v6` for
+/// AF_INET6, so a single `-p tcp:H:G` mapping yields up to two
+/// entries here. Inline-accept polls every entry; the family tag
+/// propagates into the `ProxyConn` we synthesise so downstream
+/// reply frames pick the right builder.
 #[derive(Clone, Copy)]
 struct TcpListen {
     fd: i32,
     guest_port: u16,
+    family: IpFamily,
 }
 
 /// One UDP-relay sibling, scoped to a single vCPU's IoState. The
@@ -319,11 +332,14 @@ struct TcpListen {
 struct UdpRelay {
     fd: i32,
     guest_port: u16,
-    family: UdpRelayFamily,
+    family: IpFamily,
 }
 
+/// IP family tag shared by `UdpRelay`, `TcpListen`, and `ProxyConn`.
+/// Used by the per-vCPU poll loop to dispatch the right frame
+/// builder when injecting RX frames back into the guest.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum UdpRelayFamily {
+enum IpFamily {
     V4,
     V6,
 }
@@ -413,6 +429,41 @@ fn bind_listen(host_port: u16) -> Result<i32, String> {
         // any plausible cap is harmless and lets benchmarks at
         // thousand-conn scale work on hosts where the operator has
         // bumped somaxconn (`sudo sysctl -w kern.ipc.somaxconn=4096`).
+        libc::listen(fd, 4096);
+        libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+        Ok(fd)
+    }
+}
+
+/// IPv6 sibling of `bind_listen`. Same shape but AF_INET6 +
+/// `IPV6_V6ONLY=1` bound to `[::1]:host_port`, so v4 and v6
+/// listeners on the same host port stay disjoint (no
+/// `::ffff:1.2.3.4` mapped weirdness on accept). Best-effort: a
+/// failure here just means v6 traffic doesn't reach the guest
+/// over this mapping; the v4 listener stays up.
+fn bind_listen_v6(host_port: u16) -> Result<i32, String> {
+    unsafe {
+        let fd = libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0);
+        if fd < 0 {
+            return Err(format!("tcp v6 socket(): {}", std::io::Error::last_os_error()));
+        }
+        let one: i32 = 1;
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR,
+                         &one as *const _ as *const _, 4);
+        libc::setsockopt(fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY,
+                         &one as *const _ as *const _, 4);
+        let mut addr: libc::sockaddr_in6 = std::mem::zeroed();
+        addr.sin6_family = libc::AF_INET6 as u8;
+        addr.sin6_port = host_port.to_be();
+        // `s6_addr[15] = 1` is `::1`, mirroring the v4 `127.0.0.1`
+        // bind so non-loopback v6 traffic doesn't accidentally hit
+        // the relay.
+        addr.sin6_addr.s6_addr[15] = 1;
+        if libc::bind(fd, &addr as *const _ as *const _, std::mem::size_of_val(&addr) as u32) < 0 {
+            let e = std::io::Error::last_os_error();
+            libc::close(fd);
+            return Err(format!("tcp v6 bind([::1]:{host_port}): {e}"));
+        }
         libc::listen(fd, 4096);
         libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
         Ok(fd)
@@ -525,14 +576,24 @@ pub fn start(mappings: &[PortMapping], cpu_count: usize) -> Result<[u8; 6], Stri
         match m.proto {
             Proto::Tcp => {
                 let fd = bind_listen(m.host)?;
-                listens.push(TcpListen { fd, guest_port: m.guest });
+                listens.push(TcpListen { fd, guest_port: m.guest, family: IpFamily::V4 });
+                // IPv6 sibling on the same host port — failure is
+                // non-fatal (e.g. ::1 not configured): we keep the
+                // v4 listener and the mapping just doesn't carry
+                // v6 traffic into the guest.
+                match bind_listen_v6(m.host) {
+                    Ok(fd6) => listens.push(TcpListen {
+                        fd: fd6, guest_port: m.guest, family: IpFamily::V6,
+                    }),
+                    Err(e) => eprintln!("  warning: {e}"),
+                }
             }
             Proto::Udp => {
                 match open_udp_sibling(m.host) {
                     Ok(fd) => {
                         for worker_id in 0..cpu_count {
                             per_worker_udps[worker_id].push(UdpRelay {
-                                fd, guest_port: m.guest, family: UdpRelayFamily::V4,
+                                fd, guest_port: m.guest, family: IpFamily::V4,
                             });
                         }
                         let fds = vec![fd; cpu_count.max(1)];
@@ -547,7 +608,7 @@ pub fn start(mappings: &[PortMapping], cpu_count: usize) -> Result<[u8; 6], Stri
                     Ok(fd) => {
                         for worker_id in 0..cpu_count {
                             per_worker_udps[worker_id].push(UdpRelay {
-                                fd, guest_port: m.guest, family: UdpRelayFamily::V6,
+                                fd, guest_port: m.guest, family: IpFamily::V6,
                             });
                         }
                         let fds = vec![fd; cpu_count.max(1)];
@@ -882,14 +943,14 @@ fn poll_worker_iteration(
 
     // ── Drain UDP relay siblings that fired ────────────────────────
     {
-        let udp_drain: Vec<(i32, u16, UdpRelayFamily)> = io.udps.iter()
+        let udp_drain: Vec<(i32, u16, IpFamily)> = io.udps.iter()
             .map(|u| (u.fd, u.guest_port, u.family))
             .collect();
         for (i, (fd, gp, family)) in udp_drain.into_iter().enumerate() {
             if io.pollfds[udp_slot_start + i].revents & libc::POLLIN != 0 {
                 match family {
-                    UdpRelayFamily::V4 => handle_udp_rx(io, &qsnap, fd, gp, single_queue),
-                    UdpRelayFamily::V6 => handle_udp_rx_v6(io, &qsnap, fd, gp, single_queue),
+                    IpFamily::V4 => handle_udp_rx(io, &qsnap, fd, gp, single_queue),
+                    IpFamily::V6 => handle_udp_rx_v6(io, &qsnap, fd, gp, single_queue),
                 }
                 any_injected = true;
             }
@@ -939,26 +1000,33 @@ fn poll_worker_iteration(
                         &one as *const _ as *const _, 4,
                     );
                 }
-                // Flow-hash-aware src_port selection: pick a port
-                // whose 4-tuple hashes to the current vCPU's bucket
-                // under the guest's `net/lib.rs::flow_hash`. That
-                // keeps the conn on a single core end-to-end —
+                // Flow-hash-aware src_port selection (v4 only): pick
+                // a port whose 4-tuple hashes to the current vCPU's
+                // bucket under the guest's `net/lib.rs::flow_hash`.
+                // That keeps the conn on a single core end-to-end —
                 // without it, ~(cpu_count-1)/cpu_count of accepted
                 // connections would land on one guest core and
                 // bounce to another via the SPSC `rx_inbox` on
-                // every packet.
-                let src_port = alloc_src_port_for_vcpu(
-                    io.id, cpu_count, listen.guest_port,
-                );
-                let frame = build_tcp_frame_fixed(
-                    &GUEST_MAC, GW_IP, VM_IP,
-                    src_port, listen.guest_port, 1000, 0, 0x02, &[],
+                // every packet. The guest's v6 receive path doesn't
+                // run flow_hash today (single-core dispatch under
+                // Tier 1 is on the v4 fast path only), so v6
+                // accepts skip the loop and grab the next free port.
+                let src_port = match listen.family {
+                    IpFamily::V4 => alloc_src_port_for_vcpu(
+                        io.id, cpu_count, listen.guest_port,
+                    ),
+                    IpFamily::V6 => alloc_src_port(),
+                };
+                let frame = build_tcp_reply(
+                    listen.family, src_port, listen.guest_port,
+                    1000, 0, 0x02, &[],
                 );
                 shared.tx_replies.lock().unwrap().push_back(frame);
                 shared.conns.lock().unwrap().insert(src_port, ProxyConn {
                     host_fd: client_fd, src_port, guest_port: listen.guest_port,
                     my_seq: 1001, peer_ack: 0,
                     state: ConnState::SynSent, pending: Vec::new(),
+                    family: listen.family,
                 });
                 accepted_any = true;
             }
@@ -1027,9 +1095,16 @@ fn poll_worker_iteration(
     }
 
     // ── Zero-copy RX from established TCP conns ────────────────────
-    const HDR_LEN: usize = VIRTIO_NET_HDR_SIZE + 14 + 20 + 20;
-    const MAX_PAYLOAD: usize = 1460;
-    struct ConnSnap { port: u16, guest_port: u16, fd: i32, seq: u32, ack: u32 }
+    // v4 header: virtio(12) + eth(14) + ip(20) + tcp(20) = 66.
+    // v6 header: virtio(12) + eth(14) + ipv6(40) + tcp(20) = 86.
+    // MTU 1500 caps the v4 MSS at 1460 and the v6 MSS at 1440;
+    // we read at most that many bytes into the right offset of
+    // the guest descriptor before stamping headers around it.
+    const HDR_LEN_V4: usize = VIRTIO_NET_HDR_SIZE + 14 + 20 + 20;
+    const HDR_LEN_V6: usize = VIRTIO_NET_HDR_SIZE + 14 + 40 + 20;
+    const MAX_PAYLOAD_V4: usize = 1460;
+    const MAX_PAYLOAD_V6: usize = 1440;
+    struct ConnSnap { port: u16, guest_port: u16, fd: i32, seq: u32, ack: u32, family: IpFamily }
 
     if qsnap.ready {
         let snaps: Vec<ConnSnap> = {
@@ -1042,7 +1117,7 @@ fn poll_worker_iteration(
                         if c.host_fd >= 0 && c.state == ConnState::Established {
                             Some(ConnSnap {
                                 port, guest_port: c.guest_port, fd: c.host_fd,
-                                seq: c.my_seq, ack: c.peer_ack,
+                                seq: c.my_seq, ack: c.peer_ack, family: c.family,
                             })
                         } else { None }
                     })
@@ -1072,8 +1147,12 @@ fn poll_worker_iteration(
             };
             let guest_buf = qsnap.gpa_to_host(buf_addr);
 
-            let payload_ptr = unsafe { guest_buf.add(HDR_LEN) };
-            let n = unsafe { libc::read(cs.fd, payload_ptr as *mut _, MAX_PAYLOAD) };
+            let (hdr_len, max_payload) = match cs.family {
+                IpFamily::V4 => (HDR_LEN_V4, MAX_PAYLOAD_V4),
+                IpFamily::V6 => (HDR_LEN_V6, MAX_PAYLOAD_V6),
+            };
+            let payload_ptr = unsafe { guest_buf.add(hdr_len) };
+            let n = unsafe { libc::read(cs.fd, payload_ptr as *mut _, max_payload) };
             if n <= 0 {
                 if n == 0 {
                     results.push(RxResult { port: cs.port, seq_advance: 0, eof: true });
@@ -1082,9 +1161,14 @@ fn poll_worker_iteration(
             }
             let payload_len = n as usize;
 
-            let total = write_tcp_frame_around_payload(
-                guest_buf, &GUEST_MAC, GW_IP, VM_IP,
-                cs.port, cs.guest_port, cs.seq, cs.ack, 0x18, payload_len);
+            let total = match cs.family {
+                IpFamily::V4 => write_tcp_frame_around_payload(
+                    guest_buf, &GUEST_MAC, GW_IP, VM_IP,
+                    cs.port, cs.guest_port, cs.seq, cs.ack, 0x18, payload_len),
+                IpFamily::V6 => write_tcp_frame_v6_around_payload(
+                    guest_buf, &GUEST_MAC, &GW_IPV6, &VM_IPV6,
+                    cs.port, cs.guest_port, cs.seq, cs.ack, 0x18, payload_len),
+            };
 
             let used_idx = io.rx_last;
             unsafe {
@@ -1104,7 +1188,7 @@ fn poll_worker_iteration(
             for r in &results {
                 if let Some(c) = conns.get_mut(&r.port) {
                     if r.eof {
-                        let frame = build_tcp_frame_fixed(&GUEST_MAC, GW_IP, VM_IP,
+                        let frame = build_tcp_reply(c.family,
                             c.src_port, c.guest_port, c.my_seq, c.peer_ack, 0x11, &[]);
                         c.my_seq = c.my_seq.wrapping_add(1);
                         c.state = ConnState::Closed;
@@ -1352,11 +1436,21 @@ fn inject_frame(frame: &[u8], snap: &virtio::QueueSnapshot, rx_last: &mut u16) -
 fn inject_data_frames(c: &mut ProxyConn, data: &[u8], mac: &[u8; 6],
                       snap: &virtio::QueueSnapshot, rx_last: &mut u16,
                       frame_buf: &mut [u8; 2048]) {
+    let max_chunk = match c.family {
+        IpFamily::V4 => 1460,
+        IpFamily::V6 => 1440,
+    };
     let mut off = 0;
     while off < data.len() {
-        let chunk = (data.len() - off).min(1460);
-        let len = write_tcp_frame(frame_buf, mac, GW_IP, VM_IP, c.src_port, c.guest_port,
-            c.my_seq, c.peer_ack, 0x18, &data[off..off + chunk]);
+        let chunk = (data.len() - off).min(max_chunk);
+        let len = match c.family {
+            IpFamily::V4 => write_tcp_frame(frame_buf, mac, GW_IP, VM_IP,
+                c.src_port, c.guest_port, c.my_seq, c.peer_ack, 0x18,
+                &data[off..off + chunk]),
+            IpFamily::V6 => write_tcp_frame_v6(frame_buf, mac, &GW_IPV6, &VM_IPV6,
+                c.src_port, c.guest_port, c.my_seq, c.peer_ack, 0x18,
+                &data[off..off + chunk]),
+        };
         c.my_seq = c.my_seq.wrapping_add(chunk as u32);
         off += chunk;
         inject_frame(&frame_buf[..len], snap, rx_last);
@@ -1377,14 +1471,14 @@ fn handle_guest_tx(frame: &[u8]) {
     }
 }
 
-// ── IPv6: NDP responder + ICMPv6 echo bounce ────────────────────
+// ── IPv6: NDP responder + ICMPv6 echo bounce + L4 relay ────────
 //
-// MVP-scope: this is NOT a full v6 NAT relay. The runner answers
-// Neighbor Solicitations for `GW_IPV6` so the VM can populate its
-// NDP cache, and bounces Echo Requests back so `ping6 fe80::*` in
-// the VM gets replies. TCP/UDP over v6 is NOT bridged to host
-// sockets — that path is part of the planned "HVF runner IPv6
-// relay" follow-up (see ROADMAP §5e).
+// Mirrors the v4 path: NS → NA, ICMPv6 Echo Request → Reply, and
+// host-side AF_INET6 sockets bridged to the guest for both UDP
+// (`handle_udp_v6`) and TCP (`handle_tcp` with `IpFamily::V6`).
+// `bind_listen_v6` and `open_udp_sibling_v6` set up the listeners
+// in `start()`; reply frames go through the v6 frame builders
+// keyed off the conn's / relay's `family` tag.
 
 fn handle_ipv6(ip: &[u8], guest_mac: [u8; 6]) {
     if ip.len() < 40 { return; }
@@ -1405,7 +1499,7 @@ fn handle_ipv6(ip: &[u8], guest_mac: [u8; 6]) {
             }
         }
         17 => handle_udp_v6(payload, src_ip, dst_ip),
-        // TCP-over-IPv6 not bridged yet (Phase 5e follow-up).
+        6 => handle_tcp(IpFamily::V6, payload),
         _ => {}
     }
 }
@@ -1705,13 +1799,13 @@ fn handle_ipv4(ip: &[u8]) {
     let src_ip: [u8; 4] = ip[12..16].try_into().unwrap_or([0; 4]);
     let dst_ip: [u8; 4] = ip[16..20].try_into().unwrap_or([0; 4]);
     match ip[9] {
-        6 => handle_tcp(&ip[ihl..]),
+        6 => handle_tcp(IpFamily::V4, &ip[ihl..]),
         17 => handle_udp(&ip[ihl..], src_ip, dst_ip),
         _ => {}
     }
 }
 
-fn handle_tcp(tcp: &[u8]) {
+fn handle_tcp(family: IpFamily, tcp: &[u8]) {
     if tcp.len() < 20 { return; }
     let src_port = u16::from_be_bytes([tcp[0], tcp[1]]);
     let dst_port = u16::from_be_bytes([tcp[2], tcp[3]]);
@@ -1803,7 +1897,7 @@ fn handle_tcp(tcp: &[u8]) {
         ConnState::SynSent => {
             if flags & 0x12 == 0x12 {
                 let ack = seq.wrapping_add(1);
-                let f = build_tcp_frame_fixed(&GUEST_MAC, GW_IP, VM_IP,
+                let f = build_tcp_reply(family,
                     snap.port, snap.guest_port, snap.seq, ack, 0x10, &[]);
                 replies.push_back(f);
             }
@@ -1811,13 +1905,13 @@ fn handle_tcp(tcp: &[u8]) {
         ConnState::Established => {
             if !payload.is_empty() {
                 let ack = seq.wrapping_add(payload.len() as u32);
-                let f = build_tcp_frame_fixed(&GUEST_MAC, GW_IP, VM_IP,
+                let f = build_tcp_reply(family,
                     snap.port, src_port, snap.seq, ack, 0x10, &[]);
                 replies.push_back(f);
             }
             if flags & 0x01 != 0 {
                 let ack = snap.ack.wrapping_add(1);
-                let f = build_tcp_frame_fixed(&GUEST_MAC, GW_IP, VM_IP,
+                let f = build_tcp_reply(family,
                     snap.port, src_port, snap.seq, ack, 0x11, &[]);
                 replies.push_back(f);
             }
@@ -2134,6 +2228,118 @@ fn build_tcp_frame_fixed(dst_mac: &[u8; 6], src_ip: [u8; 4], dst_ip: [u8; 4],
     f.len = write_tcp_frame(&mut f.data, dst_mac, src_ip, dst_ip,
         src_port, dst_port, seq, ack, flags, payload) as u16;
     f
+}
+
+/// IPv6 counterpart to `write_tcp_frame`. Layout:
+/// [virtio_net_hdr 12B][Eth 14B][IPv6 40B][TCP 20B][payload]
+fn write_tcp_frame_v6(buf: &mut [u8], dst_mac: &[u8; 6],
+    src_ip: &[u8; 16], dst_ip: &[u8; 16],
+    src_port: u16, dst_port: u16, seq: u32, ack: u32,
+    flags: u8, payload: &[u8]) -> usize {
+    let tcp_len = 20 + payload.len();
+    let total = VIRTIO_NET_HDR_SIZE + 14 + 40 + tcp_len;
+    debug_assert!(total <= buf.len());
+    buf[..VIRTIO_NET_HDR_SIZE].fill(0);
+    let mut o = VIRTIO_NET_HDR_SIZE;
+    buf[o..o+6].copy_from_slice(dst_mac); o += 6;
+    buf[o..o+6].copy_from_slice(&GW_MAC); o += 6;
+    buf[o..o+2].copy_from_slice(&0x86ddu16.to_be_bytes()); o += 2;
+    // IPv6 fixed header.
+    buf[o..o+4].copy_from_slice(&0x6000_0000u32.to_be_bytes()); o += 4;
+    buf[o..o+2].copy_from_slice(&(tcp_len as u16).to_be_bytes()); o += 2;
+    buf[o] = 6; o += 1; // next_header = TCP
+    buf[o] = 64; o += 1; // hop limit
+    buf[o..o+16].copy_from_slice(src_ip); o += 16;
+    buf[o..o+16].copy_from_slice(dst_ip); o += 16;
+    // TCP header + payload, then patch the v6-pseudo-header
+    // checksum over header+payload.
+    let ts = o;
+    buf[o..o+2].copy_from_slice(&src_port.to_be_bytes()); o += 2;
+    buf[o..o+2].copy_from_slice(&dst_port.to_be_bytes()); o += 2;
+    buf[o..o+4].copy_from_slice(&seq.to_be_bytes()); o += 4;
+    buf[o..o+4].copy_from_slice(&ack.to_be_bytes()); o += 4;
+    buf[o] = 0x50; buf[o+1] = flags; o += 2;
+    buf[o..o+2].copy_from_slice(&0xffffu16.to_be_bytes()); o += 2;
+    buf[o..o+4].fill(0); o += 4; // checksum + urgent ptr
+    buf[o..o+payload.len()].copy_from_slice(payload);
+    let cksum = ipv6_pseudo_checksum(src_ip, dst_ip, 6, &buf[ts..ts+tcp_len]);
+    buf[ts+16..ts+18].copy_from_slice(&cksum.to_be_bytes());
+    total
+}
+
+fn build_tcp_frame_v6_fixed(dst_mac: &[u8; 6], src_ip: &[u8; 16], dst_ip: &[u8; 16],
+    src_port: u16, dst_port: u16, seq: u32, ack: u32,
+    flags: u8, payload: &[u8]) -> TxFrame {
+    let mut f = TxFrame { data: [0u8; MAX_REPLY_FRAME], len: 0, };
+    f.len = write_tcp_frame_v6(&mut f.data, dst_mac, src_ip, dst_ip,
+        src_port, dst_port, seq, ack, flags, payload) as u16;
+    f
+}
+
+/// Family-aware reply-frame builder: wraps the v4/v6 fixed
+/// builders behind a single signature so `handle_tcp` doesn't have
+/// to branch on family at every reply site. Both `GW_*`/`VM_*`
+/// constants and `GUEST_MAC` are runner-fixed, so the family alone
+/// fully determines which builder to call.
+fn build_tcp_reply(family: IpFamily,
+    src_port: u16, dst_port: u16, seq: u32, ack: u32,
+    flags: u8, payload: &[u8]) -> TxFrame {
+    match family {
+        IpFamily::V4 => build_tcp_frame_fixed(&GUEST_MAC, GW_IP, VM_IP,
+            src_port, dst_port, seq, ack, flags, payload),
+        IpFamily::V6 => build_tcp_frame_v6_fixed(&GUEST_MAC, &GW_IPV6, &VM_IPV6,
+            src_port, dst_port, seq, ack, flags, payload),
+    }
+}
+
+/// IPv6 counterpart to `write_tcp_frame_around_payload`. Payload
+/// already lives at `buf[HDR_LEN_V6..HDR_LEN_V6+payload_len]` (read(2)
+/// dropped it straight into guest RAM); we only fill the
+/// `[virtio_net_hdr | Eth | IPv6 | TCP]` prefix and patch the
+/// v6-pseudo-header TCP checksum over header+payload.
+fn write_tcp_frame_v6_around_payload(buf: *mut u8, dst_mac: &[u8; 6],
+    src_ip: &[u8; 16], dst_ip: &[u8; 16], src_port: u16, dst_port: u16,
+    seq: u32, ack: u32, flags: u8, payload_len: usize) -> usize {
+    const HDR_LEN_V6: usize = VIRTIO_NET_HDR_SIZE + 14 + 40 + 20;
+    let tcp_len = 20 + payload_len;
+    let total = VIRTIO_NET_HDR_SIZE + 14 + 40 + tcp_len;
+    let b = unsafe { std::slice::from_raw_parts_mut(buf, HDR_LEN_V6) };
+    write_tcp_frame_v6_headers(b, dst_mac, src_ip, dst_ip,
+        src_port, dst_port, seq, ack, flags, tcp_len);
+    let tcp_start = VIRTIO_NET_HDR_SIZE + 14 + 40;
+    let tcp_seg = unsafe { std::slice::from_raw_parts(buf.add(tcp_start), tcp_len) };
+    let tc = ipv6_pseudo_checksum(src_ip, dst_ip, 6, tcp_seg);
+    unsafe {
+        *buf.add(tcp_start + 16) = (tc >> 8) as u8;
+        *buf.add(tcp_start + 17) = (tc & 0xff) as u8;
+    }
+    total
+}
+
+/// Write just the v6 headers (virtio + eth + ipv6 + tcp) into
+/// `buf[..HDR_LEN_V6]`, with TCP checksum left as zero. Caller
+/// patches the checksum once payload is in place.
+fn write_tcp_frame_v6_headers(buf: &mut [u8], dst_mac: &[u8; 6],
+    src_ip: &[u8; 16], dst_ip: &[u8; 16], src_port: u16, dst_port: u16,
+    seq: u32, ack: u32, flags: u8, tcp_len: usize) {
+    buf[..VIRTIO_NET_HDR_SIZE].fill(0);
+    let mut o = VIRTIO_NET_HDR_SIZE;
+    buf[o..o+6].copy_from_slice(dst_mac); o += 6;
+    buf[o..o+6].copy_from_slice(&GW_MAC); o += 6;
+    buf[o..o+2].copy_from_slice(&0x86ddu16.to_be_bytes()); o += 2;
+    buf[o..o+4].copy_from_slice(&0x6000_0000u32.to_be_bytes()); o += 4;
+    buf[o..o+2].copy_from_slice(&(tcp_len as u16).to_be_bytes()); o += 2;
+    buf[o] = 6; o += 1;
+    buf[o] = 64; o += 1;
+    buf[o..o+16].copy_from_slice(src_ip); o += 16;
+    buf[o..o+16].copy_from_slice(dst_ip); o += 16;
+    buf[o..o+2].copy_from_slice(&src_port.to_be_bytes()); o += 2;
+    buf[o..o+2].copy_from_slice(&dst_port.to_be_bytes()); o += 2;
+    buf[o..o+4].copy_from_slice(&seq.to_be_bytes()); o += 4;
+    buf[o..o+4].copy_from_slice(&ack.to_be_bytes()); o += 4;
+    buf[o] = 0x50; buf[o+1] = flags; o += 2;
+    buf[o..o+2].copy_from_slice(&0xffffu16.to_be_bytes()); o += 2;
+    buf[o..o+4].fill(0); // checksum + urgent (filled later)
 }
 
 /// Build a guest-bound UDP frame using the saved outbound-NAT
