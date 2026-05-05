@@ -1169,68 +1169,52 @@ bazel+nightly migration.
 
 ---
 
-## Phase 4: HTTP/3
+## Phase 4: HTTP/3 — shipped
 
-### 4a. QPACK header compression
+### 4a. QPACK header compression — done
 
-Simplified static-table-only QPACK — no dynamic table needed for a
-simple server. ~200 lines.
+Static-only QPACK in `//uni-http3/src/qpack.rs`, with the 99-entry
+static table from RFC 9204 Appendix A in `static_table.rs`. Encoder
+picks the smallest legal representation per field
+(indexed → name-ref → literal-name); decoder handles all three plus
+Huffman-coded values via `huffman.rs` (RFC 7541 Appendix B static
+code).
 
-- [ ] QPACK static table encoder/decoder
-- [ ] Skip dynamic table (unnecessary for simple server)
+- [x] QPACK static-table encoder + decoder
+- [x] Skip dynamic table (`SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0`)
+- [x] Huffman decode (RFC 7541 known-answer tests pass)
 
-**Tests:**
-- [ ] Unit: QPACK encode/decode round-trip
+### 4b. HTTP/3 frame parsing — done
 
-### 4b. HTTP/3 frame parsing
+`//uni-http3/src/frame.rs`. DATA / HEADERS / SETTINGS / GOAWAY
+parsed; reserved frame types parse to `Skipped { ty }` and consume
+their announced length so callers don't choke on grease frames.
 
-H3 frames over QUIC streams. Simpler than HTTP/2 — no TCP head-of-line
-blocking, no flow control at H3 level (QUIC handles it).
+- [x] H3 frame parser (DATA, HEADERS, SETTINGS, GOAWAY)
+- [x] H3 frame builder (`write_frame` + `write_empty_settings`)
+- [x] Unit: H3 frame parse/build round-trip
 
-- [ ] H3 frame parser (HEADERS, DATA, SETTINGS)
-- [ ] H3 frame builder
+### 4c. //uni-http3 module — done
 
-**Tests:**
-- [ ] Unit: H3 frame parse/build round-trip
+Mirrors `//uni-http`'s `listen(port, handler)` shape, not the
+`route + run` shape originally sketched: the app keeps **one**
+`AsyncFn(&Request) -> Response` closure that serves HTTP/1.1,
+HTTPS/1.1 and HTTP/3 simultaneously — see `apps/webserver/src/main.rs`.
 
-### 4c. uni::http3 module
+- [x] `//uni-http3` Bazel target (deps: //uni-http, //uni-quic)
+- [x] H3Server: control stream + per-request stream dispatch
+- [x] Request/response over QUIC bidi streams; QPACK encode + decode
+- [x] `apps/webserver` serves HTTP/3 alongside HTTP/1.1 + HTTPS
+- [x] Alt-Svc auto-emitted from HTTPS responses **only when** H3
+      successfully bound (avoids poisoning browser alt-svc cache)
+- [x] Integration: GET / + /health + /xyz over HTTP/3 verified via
+      aioquic (`scripts/test_helpers.h3_get`) and curl/ngtcp2
 
-Same API pattern as uni::http:
-```rust
-pub struct H3Server { ... }
-impl H3Server {
-    pub fn route(&mut self, path: &[u8], handler: Handler);
-    pub fn run(&mut self, port: u16);
-}
-```
-
-App code barely changes:
-```rust
-#[uni::init]
-fn init() {
-    let mut server = H3Server::new();
-    server.route(b"/health", handle_health);
-    server.run(443);
-}
-```
-
-- [ ] `H3Server` struct with route/run API
-- [ ] Request/response handling over QUIC streams
-- [ ] `//uni:http3` Bazel target (deps: quic)
-- [ ] Example app using `//uni:http3`
-
-**Tests:**
-- [ ] Integration: HTTP/3 request/response with curl --http3
-- [ ] Integration: HTTP smoke tests (GET /, GET /health, GET /404) over HTTP/3
-
-**Try it:**
+**Try it (works today):**
 ```bash
-# HTTP/3 request from host to unikernel
-curl --http3 -k https://localhost:8443/health
-# Response: {"status": "ok"}
-# Serial: "H3: GET /health from [::1]:xxxxx (QUIC stream 0)"
-# Benchmark comparison:
-./scripts/bench.sh   # now includes HTTP/1.1 vs HTTP/3 comparison
+$(brew --prefix curl)/bin/curl --http3-only -k \
+    https://127.0.0.1:8443/health
+# {"status":"ok","runtime":"unikernel","version":"0.1.0"}
 ```
 
 ---

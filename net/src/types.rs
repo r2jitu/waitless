@@ -51,6 +51,97 @@ impl Ipv4Addr {
     }
 }
 
+// ── IPv6 ────────────────────────────────────────────────────────────────────
+
+/// 128-bit IPv6 address. Stored as 16 bytes in network order so
+/// the type can be embedded directly in `repr(C, packed)` headers
+/// without per-field byte-swap. Mirrors `Ipv4Addr`'s plain-data
+/// shape but expanded to v6 width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct Ipv6Addr {
+    pub octets: [u8; 16],
+}
+
+impl Ipv6Addr {
+    /// All zeros — the unspecified address (RFC 4291 §2.5.2).
+    pub const ANY: Self = Ipv6Addr { octets: [0; 16] };
+
+    /// `ff02::1` — the all-nodes link-local multicast group. Every
+    /// IPv6 host MUST receive packets sent here.
+    pub const ALL_NODES_LL: Self = Ipv6Addr {
+        octets: [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01],
+    };
+
+    /// `ff02::2` — all-routers link-local multicast group. Hosts
+    /// send Router Solicitations to this address (RFC 4861 §4.1).
+    pub const ALL_ROUTERS_LL: Self = Ipv6Addr {
+        octets: [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02],
+    };
+
+    pub fn from(o: [u8; 16]) -> Self {
+        Ipv6Addr { octets: o }
+    }
+
+    /// True if `self` is in `fe80::/10` — the link-local prefix.
+    pub fn is_link_local(&self) -> bool {
+        self.octets[0] == 0xfe && (self.octets[1] & 0xc0) == 0x80
+    }
+
+    /// True if `self` is `ff00::/8` — the multicast prefix.
+    pub fn is_multicast(&self) -> bool {
+        self.octets[0] == 0xff
+    }
+
+    /// Construct a solicited-node multicast address for a target
+    /// unicast `addr`: `ff02::1:ffXX:XXXX` where the low 24 bits
+    /// match the low 24 bits of `addr` (RFC 4291 §2.7.1). NDP
+    /// Neighbor Solicitation messages target this group so only
+    /// hosts whose address matches the suffix are interrupted.
+    pub fn solicited_node(addr: &Ipv6Addr) -> Self {
+        let mut o = [0u8; 16];
+        o[0] = 0xff;
+        o[1] = 0x02;
+        o[11] = 0x01;
+        o[12] = 0xff;
+        o[13] = addr.octets[13];
+        o[14] = addr.octets[14];
+        o[15] = addr.octets[15];
+        Ipv6Addr { octets: o }
+    }
+
+    /// Derive the link-local address from a MAC via modified
+    /// EUI-64 (RFC 4291 Appendix A): split MAC at byte 3, insert
+    /// `ff fe`, flip the universal/local bit (bit 1 of byte 0),
+    /// prefix with `fe80::`. Used by SLAAC bring-up before any
+    /// router has been observed.
+    pub fn link_local_from_mac(mac: &MacAddr) -> Self {
+        let mut o = [0u8; 16];
+        o[0] = 0xfe;
+        o[1] = 0x80;
+        // Modified EUI-64: flip bit 1 of byte 0 of the MAC.
+        o[8] = mac.bytes[0] ^ 0x02;
+        o[9] = mac.bytes[1];
+        o[10] = mac.bytes[2];
+        o[11] = 0xff;
+        o[12] = 0xfe;
+        o[13] = mac.bytes[3];
+        o[14] = mac.bytes[4];
+        o[15] = mac.bytes[5];
+        Ipv6Addr { octets: o }
+    }
+
+    /// Solicited-node multicast → Ethernet MAC mapping
+    /// `33:33:XX:XX:XX:XX` where the low 32 bits of the multicast
+    /// address are placed in the low 32 bits of the MAC
+    /// (RFC 2464 §7).
+    pub fn multicast_mac(&self) -> MacAddr {
+        MacAddr {
+            bytes: [0x33, 0x33, self.octets[12], self.octets[13], self.octets[14], self.octets[15]],
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct NetConfig {
     pub ip: Ipv4Addr,
@@ -208,6 +299,54 @@ mod tests {
         let c = Ipv4Addr::from(192, 168, 1, 2);
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn ipv6_link_local_from_mac_eui64() {
+        // RFC 4291 Appendix A example: MAC 02:00:00:00:00:01 →
+        // EUI-64 with universal/local bit flipped (0x02 → 0x00),
+        // resulting interface ID = 0000:00ff:fe00:0001.
+        let mac = MacAddr { bytes: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01] };
+        let ll = Ipv6Addr::link_local_from_mac(&mac);
+        assert!(ll.is_link_local());
+        assert_eq!(
+            ll.octets,
+            [0xfe, 0x80, 0, 0, 0, 0, 0, 0,
+             0x00, 0x00, 0x00, 0xff, 0xfe, 0x00, 0x00, 0x01]
+        );
+    }
+
+    #[test]
+    fn ipv6_solicited_node_low_24_bits() {
+        // Target fe80::5054:ff:fe12:3456 → solicited-node
+        // ff02::1:ff12:3456 (low 24 bits of target).
+        let target = Ipv6Addr {
+            octets: [0xfe, 0x80, 0, 0, 0, 0, 0, 0,
+                     0x52, 0x54, 0x00, 0xff, 0xfe, 0x12, 0x34, 0x56],
+        };
+        let sn = Ipv6Addr::solicited_node(&target);
+        assert!(sn.is_multicast());
+        assert_eq!(
+            sn.octets,
+            [0xff, 0x02, 0, 0, 0, 0, 0, 0,
+             0, 0, 0, 0x01, 0xff, 0x12, 0x34, 0x56]
+        );
+    }
+
+    #[test]
+    fn ipv6_multicast_mac() {
+        // ff02::1 → 33:33:00:00:00:01 (RFC 2464 §7).
+        let mac = Ipv6Addr::ALL_NODES_LL.multicast_mac();
+        assert_eq!(mac.bytes, [0x33, 0x33, 0x00, 0x00, 0x00, 0x01]);
+    }
+
+    #[test]
+    fn ipv6_classification() {
+        assert!(Ipv6Addr::ALL_NODES_LL.is_multicast());
+        assert!(!Ipv6Addr::ALL_NODES_LL.is_link_local());
+        let ll = Ipv6Addr::from([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        assert!(ll.is_link_local());
+        assert!(!ll.is_multicast());
     }
 
     #[test]

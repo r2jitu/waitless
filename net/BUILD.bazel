@@ -112,6 +112,49 @@ rust_library(
     ],
 )
 
+# IPv6 wire-format primitives — pure parse/build/checksum (no
+# Ethernet send wiring, no kernel dep). The umbrella `:net` crate
+# bridges this to `ethernet_send` + the NDP MAC resolver. Keeping
+# this leaf testable host-natively means the os:none-only deps
+# (drivers / kernel) don't pull in via the test target.
+rust_library(
+    name = "ipv6",
+    srcs = ["src/ipv6.rs"],
+    crate_name = "net_ipv6",
+    crate_root = "src/ipv6.rs",
+    deps = [
+        ":from_bytes",
+        ":types",
+    ],
+)
+
+rust_test(
+    name = "ipv6_test",
+    size = "small",
+    crate = ":ipv6",
+)
+
+# ICMPv6 + NDP wire format. Pure parse/build, no kernel dep —
+# host-testable like `:ipv6`. The umbrella `:net` crate dispatches
+# inbound ICMPv6 packets here and ships outbound replies through
+# `ethernet_send`.
+rust_library(
+    name = "icmpv6",
+    srcs = ["src/icmpv6.rs"],
+    crate_name = "net_icmpv6",
+    crate_root = "src/icmpv6.rs",
+    deps = [
+        ":ipv6",
+        ":types",
+    ],
+)
+
+rust_test(
+    name = "icmpv6_test",
+    size = "small",
+    crate = ":icmpv6",
+)
+
 rust_library(
     name = "tcp",
     srcs = ["src/tcp.rs"],
