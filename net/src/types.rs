@@ -142,6 +142,45 @@ impl Ipv6Addr {
     }
 }
 
+// ── Family-agnostic IP address ─────────────────────────────────────────────
+
+/// Either an IPv4 or IPv6 unicast address. Used in dual-stack
+/// signatures (TCP TCB peer, UDP recv source, runtime API). Tag +
+/// 16-byte payload = ~24 bytes incl. alignment, plain Copy data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IpAddr {
+    V4(Ipv4Addr),
+    V6(Ipv6Addr),
+}
+
+impl IpAddr {
+    /// Wildcard / unspecified — any v4 address. Mirrors `Ipv4Addr::ANY`
+    /// for callers that need a typed default.
+    pub const V4_ANY: Self = IpAddr::V4(Ipv4Addr::ANY);
+
+    /// True if the address belongs to the IPv4 family.
+    pub fn is_v4(&self) -> bool {
+        matches!(self, IpAddr::V4(_))
+    }
+
+    /// True if the address belongs to the IPv6 family.
+    pub fn is_v6(&self) -> bool {
+        matches!(self, IpAddr::V6(_))
+    }
+}
+
+impl From<Ipv4Addr> for IpAddr {
+    fn from(v: Ipv4Addr) -> Self {
+        IpAddr::V4(v)
+    }
+}
+
+impl From<Ipv6Addr> for IpAddr {
+    fn from(v: Ipv6Addr) -> Self {
+        IpAddr::V6(v)
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct NetConfig {
     pub ip: Ipv4Addr,
@@ -215,6 +254,72 @@ pub static CONFIG: ConfigStore = ConfigStore::new();
 /// so that the returned u16 can be stored directly in packed struct fields.
 pub fn checksum(data: *const u8, len: usize) -> u16 {
     let mut sum: u32 = 0;
+    let mut i = 0;
+    while i + 1 < len {
+        let word = unsafe { (*data.add(i) as u16) | ((*data.add(i + 1) as u16) << 8) };
+        sum += word as u32;
+        i += 2;
+    }
+    if i < len {
+        sum += unsafe { *data.add(i) as u32 };
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// TCP/UDP pseudo-header checksum, family-dispatched.
+/// `src`/`dst` must agree on family; mismatched families fall back
+/// to `tcp_checksum_v4` on the v4 component (caller bug).
+pub fn tcp_checksum_any(
+    src: IpAddr,
+    dst: IpAddr,
+    proto: u8,
+    data: *const u8,
+    len: usize,
+) -> u16 {
+    match (src, dst) {
+        (IpAddr::V4(s), IpAddr::V4(d)) => tcp_checksum(s, d, proto, data, len),
+        (IpAddr::V6(s), IpAddr::V6(d)) => tcp_checksum_v6(&s, &d, proto, data, len),
+        // Mismatched families — should never happen in correct code.
+        // Use whichever is v4 to keep the response well-formed
+        // rather than crashing.
+        (IpAddr::V4(s), _) => tcp_checksum(s, Ipv4Addr::ANY, proto, data, len),
+        (_, IpAddr::V4(d)) => tcp_checksum(Ipv4Addr::ANY, d, proto, data, len),
+    }
+}
+
+/// TCP/UDP pseudo-header checksum over IPv6 (RFC 8200 §8.1).
+/// Returns the one's-complement folded sum suitable for direct
+/// placement in the upper-layer checksum field — same convention
+/// as the IPv4 `tcp_checksum`.
+pub fn tcp_checksum_v6(
+    src: &Ipv6Addr,
+    dst: &Ipv6Addr,
+    proto: u8,
+    data: *const u8,
+    len: usize,
+) -> u16 {
+    // IPv6 pseudo-header: src(16) || dst(16) || u32 upper-len ||
+    // 3 zeros || u8 next-header. Sum as LE u16 words to match the
+    // existing `tcp_checksum` byte-order convention (the result is
+    // stored directly in a `repr(C, packed)` u16 field).
+    let mut sum: u32 = 0;
+    for chunk in src.octets.chunks(2).chain(dst.octets.chunks(2)) {
+        sum += u16::from_le_bytes([chunk[0], chunk[1]]) as u32;
+    }
+    // u32 upper-layer length, big-endian → split into LE u16 halves.
+    let len32 = len as u32;
+    let len_be = len32.to_be();
+    sum += (len_be & 0xffff) as u32;
+    sum += (len_be >> 16) as u32;
+    // 3 zero bytes + 1 next_header byte. Same trick as v4: treat
+    // as LE u16 (zero | proto<<8) then (zero | zero<<8).
+    sum += (proto as u32) << 8;
+    // (no extra word needed — the high two bytes of the next-
+    // header field area sum to zero.)
+
     let mut i = 0;
     while i + 1 < len {
         let word = unsafe { (*data.add(i) as u16) | ((*data.add(i + 1) as u16) << 8) };
@@ -347,6 +452,37 @@ mod tests {
         let ll = Ipv6Addr::from([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8]);
         assert!(ll.is_link_local());
         assert!(!ll.is_multicast());
+    }
+
+    #[test]
+    fn ip_addr_family_predicates() {
+        let v4: IpAddr = Ipv4Addr::from(10, 0, 0, 1).into();
+        let v6: IpAddr = Ipv6Addr::from([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]).into();
+        assert!(v4.is_v4());
+        assert!(!v4.is_v6());
+        assert!(v6.is_v6());
+        assert!(!v6.is_v4());
+    }
+
+    #[test]
+    fn tcp_checksum_v6_matches_v6_pseudo_header() {
+        // Same input, same output as the spec — verify by placing
+        // the returned cksum and re-checksumming to 0.
+        let src = Ipv6Addr::from([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let dst = Ipv6Addr::from([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        let payload: [u8; 14] = [
+            0x12, 0x34, // src port
+            0x00, 0x50, // dst port
+            0x00, 0x06, // length
+            0x00, 0x00, // checksum placeholder
+            b'h', b'e', b'l', b'l', b'o', 0,
+        ];
+        let cksum = tcp_checksum_v6(&src, &dst, 17, payload.as_ptr(), payload.len());
+        let mut verified = payload;
+        verified[6] = (cksum & 0xff) as u8;
+        verified[7] = (cksum >> 8) as u8;
+        let recheck = tcp_checksum_v6(&src, &dst, 17, verified.as_ptr(), verified.len());
+        assert_eq!(recheck, 0);
     }
 
     #[test]
