@@ -57,24 +57,44 @@ async fn init() {
     uni_http::listen(HTTP_PORT, handle_request).expect("http bind");
     uni::println!("listen tcp://:{} (http)", HTTP_PORT);
 
-    // HTTPS is opt-in: if the bundled dev cert/key don't parse,
-    // log + skip rather than refuse to boot.
-    match uni_tls::listen(HTTPS_PORT, handle_request, DEV_CERT_DER, DEV_KEY_PKCS8_DER) {
-        Ok(()) => uni::println!("listen tcp://:{} (https, TLS_CHACHA20_POLY1305_SHA256)", HTTPS_PORT),
-        Err(_) => uni::println!("[WARN] https disabled (cert/key invalid)"),
-    }
-
-    // HTTP/3 over QUIC on the same port (UDP/443). Uses the same
-    // dev cert + same `handle_request` closure as the HTTPS path.
-    // `uni_http3::listen` returns once the UDP socket is bound;
-    // the listener is retained internally for the lifetime of the
-    // program.
+    // HTTP/3 over QUIC on the same port (UDP/443). Bind H3 FIRST
+    // so we know whether to advertise it via the HTTPS Alt-Svc
+    // header — Alt-Svc on a port that doesn't actually serve H3
+    // poisons the browser's alt-svc cache for the configured
+    // `ma=` window, slowing every subsequent visit.
     let h3_handler = move |req: uni_http::Request| async move {
         handle_request(&req).await
     };
-    match uni_http3::listen(HTTPS_PORT, h3_handler, DEV_CERT_DER, DEV_KEY_PKCS8_DER) {
-        Ok(()) => uni::println!("listen udp://:{} (h3, TLS_CHACHA20_POLY1305_SHA256)", HTTPS_PORT),
-        Err(_) => uni::println!("[WARN] h3 disabled (cert/key invalid or bind failed)"),
+    let h3_up = match uni_http3::listen(
+        HTTPS_PORT, h3_handler, DEV_CERT_DER, DEV_KEY_PKCS8_DER,
+    ) {
+        Ok(()) => {
+            uni::println!("listen udp://:{} (h3, TLS_CHACHA20_POLY1305_SHA256)", HTTPS_PORT);
+            true
+        }
+        Err(_) => {
+            uni::println!("[WARN] h3 disabled (cert/key invalid or bind failed)");
+            false
+        }
+    };
+
+    // HTTPS is opt-in: if the bundled dev cert/key don't parse,
+    // log + skip rather than refuse to boot. When H3 is up,
+    // advertise it on every HTTPS response so HTTP/3-capable
+    // browsers learn to upgrade on the next visit. RFC 7838: the
+    // string is `Alt-Svc: h3=":<port>"; ma=86400\r\n` (one
+    // header line, ending in CRLF).
+    let alt_svc: Option<&'static [u8]> = if h3_up {
+        const ALT_SVC: &[u8] = b"Alt-Svc: h3=\":443\"; ma=86400\r\n";
+        Some(ALT_SVC)
+    } else {
+        None
+    };
+    match uni_tls::listen_with_extra_headers(
+        HTTPS_PORT, handle_request, DEV_CERT_DER, DEV_KEY_PKCS8_DER, alt_svc,
+    ) {
+        Ok(()) => uni::println!("listen tcp://:{} (https, TLS_CHACHA20_POLY1305_SHA256)", HTTPS_PORT),
+        Err(_) => uni::println!("[WARN] https disabled (cert/key invalid)"),
     }
 }
 

@@ -125,8 +125,29 @@ pub fn listen<H>(
 where
     H: AsyncFn(&uni_http::Request) -> uni_http::Response + Send + Sync + 'static,
 {
+    listen_with_extra_headers(port, handler, cert_der, key_der, None)
+}
+
+/// Like [`listen`] but every response carries the static
+/// `extra_response_headers` byte slice (formatted as
+/// `Header: value\r\n` lines, no trailing blank line). The
+/// app uses this to advertise `Alt-Svc: h3=…` ONLY when it has
+/// actually bound a matching HTTP/3 listener — see the comment
+/// on `uni_http::listen_https_with_extra_headers` for why
+/// unconditional Alt-Svc would be a footgun.
+pub fn listen_with_extra_headers<H>(
+    port: u16,
+    handler: H,
+    cert_der: &'static [u8],
+    key_der: &'static [u8],
+    extra_response_headers: Option<&'static [u8]>,
+) -> Result<(), ListenError>
+where
+    H: AsyncFn(&uni_http::Request) -> uni_http::Response + Send + Sync + 'static,
+{
     let tls = acceptor(cert_der, key_der).map_err(|_| ListenError::Cert)?;
-    uni_http::listen_https(port, handler, tls).map_err(ListenError::Bind)
+    uni_http::listen_https_with_extra_headers(port, handler, tls, extra_response_headers)
+        .map_err(ListenError::Bind)
 }
 
 // ---- Diagnostic helpers ------------------------------------------------------

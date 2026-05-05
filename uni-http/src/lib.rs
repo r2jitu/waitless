@@ -473,17 +473,29 @@ pub fn listen_https<H>(
 where
     H: AsyncFn(&Request) -> Response + Send + Sync + 'static,
 {
-    // Pre-format the Alt-Svc header line so HTTP/3-capable browsers
-    // learn (over the HTTPS+TCP first hit) that the same origin
-    // also serves on UDP/<port>. RFC 7838 / RFC 9114 §3.2: clients
-    // remember the mapping for `ma` seconds and try QUIC first on
-    // subsequent visits. `Box::leak` once at startup gives us a
-    // `&'static [u8]` to splice into every response on this port
-    // without per-request allocation.
-    let alt_svc_line = alloc::format!("Alt-Svc: h3=\":{port}\"; ma=86400\r\n")
-        .into_bytes()
-        .into_boxed_slice();
-    let alt_svc: &'static [u8] = Box::leak(alt_svc_line);
+    listen_https_with_extra_headers(port, handler, tls, None)
+}
+
+/// Like [`listen_https`] but every response carries the
+/// caller-supplied static header lines (each formatted as
+/// `Header: value\r\n`, no trailing blank line). Intended for the
+/// `Alt-Svc: h3=…` advertisement when the same app also calls
+/// `uni_http3::listen` — the listener has no way to know whether
+/// an H3 endpoint is running on its behalf, so the app provides
+/// the bytes only when it has actually bound H3 successfully.
+/// Sending Alt-Svc unconditionally would mislead HTTP/3-capable
+/// browsers into trying a port that doesn't exist, slowing the
+/// next page load and possibly poisoning the alt-svc cache for
+/// up to 24 h.
+pub fn listen_https_with_extra_headers<H>(
+    port: u16,
+    handler: H,
+    tls: Arc<dyn Tls>,
+    extra_response_headers: Option<&'static [u8]>,
+) -> Result<(), uni::runtime::TcpBindError>
+where
+    H: AsyncFn(&Request) -> Response + Send + Sync + 'static,
+{
     let listener = uni::runtime::TcpListener::bind(port)?;
     let handler = Arc::new(handler);
     let h = listener.run(move |tcp| {
@@ -493,7 +505,7 @@ where
             let mut seed = [0u8; 32];
             uni::rng::fill_bytes(&mut seed);
             let stream = TlsStream::new(tcp, tls.new_connection(seed));
-            handle_conn(handler, stream, Some(alt_svc)).await;
+            handle_conn(handler, stream, extra_response_headers).await;
         }
     });
     uni::_retain(h);
