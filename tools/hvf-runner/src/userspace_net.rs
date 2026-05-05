@@ -72,6 +72,20 @@ const VM_IP: [u8; 4] = [10, 0, 2, 15];
 const GW_IP: [u8; 4] = [10, 0, 2, 2];
 const BROADCAST_IP: [u8; 4] = [255, 255, 255, 255];
 
+/// Gateway's IPv6 link-local. Derived from `GW_MAC` via modified
+/// EUI-64 (RFC 4291) so the address is deterministic and visible
+/// to anyone reading the runner's NDP behaviour. The runner does
+/// NOT yet bridge L4 IPv6 traffic to host sockets — this is just
+/// enough plumbing to answer the VM's Neighbor Solicitations and
+/// echo ICMPv6 pings, so the kernel-side IPv6 stack can be
+/// exercised without a full v6 NAT bring-up.
+const GW_IPV6: [u8; 16] = [
+    0xfe, 0x80, 0, 0, 0, 0, 0, 0,
+    GW_MAC[0] ^ 0x02, GW_MAC[1], GW_MAC[2],
+    0xff, 0xfe,
+    GW_MAC[3], GW_MAC[4], GW_MAC[5],
+];
+
 /// Protocol for a user-specified port forward.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Proto {
@@ -1275,11 +1289,149 @@ fn inject_data_frames(c: &mut ProxyConn, data: &[u8], mac: &[u8; 6],
 
 fn handle_guest_tx(frame: &[u8]) {
     if frame.len() < 14 { return; }
+    let guest_mac: [u8; 6] = frame[6..12].try_into().unwrap_or([0; 6]);
     match u16::from_be_bytes([frame[12], frame[13]]) {
         0x0806 => handle_arp(&frame[14..]),
         0x0800 => handle_ipv4(&frame[14..]),
+        0x86dd => handle_ipv6(&frame[14..], guest_mac),
         _ => {}
     }
+}
+
+// ── IPv6: NDP responder + ICMPv6 echo bounce ────────────────────
+//
+// MVP-scope: this is NOT a full v6 NAT relay. The runner answers
+// Neighbor Solicitations for `GW_IPV6` so the VM can populate its
+// NDP cache, and bounces Echo Requests back so `ping6 fe80::*` in
+// the VM gets replies. TCP/UDP over v6 is NOT bridged to host
+// sockets — that path is part of the planned "HVF runner IPv6
+// relay" follow-up (see ROADMAP §5e).
+
+fn handle_ipv6(ip: &[u8], guest_mac: [u8; 6]) {
+    if ip.len() < 40 { return; }
+    let payload_len = u16::from_be_bytes([ip[4], ip[5]]) as usize;
+    let next_header = ip[6];
+    if 40 + payload_len > ip.len() { return; }
+    let src_ip: [u8; 16] = ip[8..24].try_into().unwrap_or([0; 16]);
+    let dst_ip: [u8; 16] = ip[24..40].try_into().unwrap_or([0; 16]);
+    let payload = &ip[40..40 + payload_len];
+
+    if next_header == 58 {
+        // ICMPv6 — only the bits we need: NS (135), Echo Request (128).
+        if payload.is_empty() { return; }
+        match payload[0] {
+            128 => bounce_icmpv6_echo(src_ip, dst_ip, payload, guest_mac),
+            135 => reply_neighbor_solicitation(src_ip, payload, guest_mac),
+            _ => {}
+        }
+    }
+    // TCP / UDP over IPv6 not bridged yet — silently dropped.
+}
+
+/// IPv6 pseudo-header checksum (RFC 8200 §8.1) over the upper-
+/// layer payload (already includes any embedded checksum field
+/// set to zero).
+fn ipv6_pseudo_checksum(src: &[u8; 16], dst: &[u8; 16], next_hdr: u8, payload: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    for chunk in src.chunks(2).chain(dst.chunks(2)) {
+        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+    }
+    let len = payload.len() as u32;
+    sum += (len >> 16) & 0xffff;
+    sum += len & 0xffff;
+    sum += next_hdr as u32;
+    let mut i = 0;
+    while i + 2 <= payload.len() {
+        sum += u16::from_be_bytes([payload[i], payload[i + 1]]) as u32;
+        i += 2;
+    }
+    if i < payload.len() {
+        sum += (payload[i] as u32) << 8;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Build an IPv6 packet header into `out` and return the total
+/// frame length written (header + payload). Caller has already
+/// reserved space for the Ethernet header at `out[..14]`.
+fn build_ipv6_frame(
+    dst_mac: &[u8; 6],
+    src_ip: &[u8; 16],
+    dst_ip: &[u8; 16],
+    next_header: u8,
+    hop_limit: u8,
+    payload: &[u8],
+    out: &mut [u8],
+) -> usize {
+    let total = VIRTIO_NET_HDR_SIZE + 14 + 40 + payload.len();
+    if out.len() < total { return 0; }
+    let mut o = VIRTIO_NET_HDR_SIZE;
+    out[o..o+6].copy_from_slice(dst_mac); o += 6;
+    out[o..o+6].copy_from_slice(&GW_MAC); o += 6;
+    out[o..o+2].copy_from_slice(&0x86ddu16.to_be_bytes()); o += 2;
+    // IPv6 fixed header.
+    out[o..o+4].copy_from_slice(&0x6000_0000u32.to_be_bytes()); o += 4;
+    out[o..o+2].copy_from_slice(&(payload.len() as u16).to_be_bytes()); o += 2;
+    out[o] = next_header; o += 1;
+    out[o] = hop_limit; o += 1;
+    out[o..o+16].copy_from_slice(src_ip); o += 16;
+    out[o..o+16].copy_from_slice(dst_ip); o += 16;
+    out[o..o+payload.len()].copy_from_slice(payload);
+    total
+}
+
+/// Reply to an inbound Neighbor Solicitation for our gateway
+/// address. The VM's IPv6 stack drives this on bring-up to learn
+/// the gateway MAC (mirrors how it ARP-resolves `GW_IP` for v4).
+fn reply_neighbor_solicitation(src_ip: [u8; 16], ns: &[u8], guest_mac: [u8; 6]) {
+    if ns.len() < 24 { return; }
+    let target: [u8; 16] = ns[8..24].try_into().unwrap_or([0; 16]);
+    if target != GW_IPV6 { return; }
+    // Build NA: type=136, code=0, cksum=0, flags(S|O), reserved[3], target[16],
+    //           TLLA option (type=2, len=1, GW_MAC[6]).
+    let mut na = [0u8; 32];
+    na[0] = 136; na[1] = 0;
+    na[4] = 0x60; // S=1, O=1 (no Router flag)
+    na[8..24].copy_from_slice(&GW_IPV6);
+    na[24] = 2; na[25] = 1;
+    na[26..32].copy_from_slice(&GW_MAC);
+    let cksum = ipv6_pseudo_checksum(&GW_IPV6, &src_ip, 58, &na);
+    na[2..4].copy_from_slice(&cksum.to_be_bytes());
+
+    let mut frame = [0u8; MAX_REPLY_FRAME];
+    let n = build_ipv6_frame(&guest_mac, &GW_IPV6, &src_ip, 58, 255, &na, &mut frame);
+    if n == 0 { return; }
+    let mut f = TxFrame { data: [0u8; MAX_REPLY_FRAME], len: 0 };
+    f.data[..n].copy_from_slice(&frame[..n]);
+    f.len = n as u16;
+    my_worker_shared().tx_replies.lock().unwrap().push_back(f);
+}
+
+/// Bounce ICMPv6 Echo Request → Echo Reply. Mirrors the standard
+/// host-to-host ping6 behaviour but sourced from the runner's
+/// gateway, so `ping6 fe80::aabb:ccff:fedd:eeff` from inside the
+/// VM gets replies even when no real host is reachable.
+fn bounce_icmpv6_echo(src_ip: [u8; 16], dst_ip: [u8; 16], echo_req: &[u8], guest_mac: [u8; 6]) {
+    if echo_req.len() < 8 { return; }
+    let mut reply = vec![0u8; echo_req.len()];
+    reply.copy_from_slice(echo_req);
+    reply[0] = 129; // Echo Reply
+    reply[1] = 0;
+    reply[2] = 0; reply[3] = 0; // checksum placeholder
+    let _ = dst_ip; // dst was us (or a multicast we joined); reply src = us.
+    let cksum = ipv6_pseudo_checksum(&GW_IPV6, &src_ip, 58, &reply);
+    reply[2..4].copy_from_slice(&cksum.to_be_bytes());
+
+    let mut frame = [0u8; MAX_REPLY_FRAME];
+    let n = build_ipv6_frame(&guest_mac, &GW_IPV6, &src_ip, 58, 64, &reply, &mut frame);
+    if n == 0 { return; }
+    let mut f = TxFrame { data: [0u8; MAX_REPLY_FRAME], len: 0 };
+    f.data[..n].copy_from_slice(&frame[..n]);
+    f.len = n as u16;
+    my_worker_shared().tx_replies.lock().unwrap().push_back(f);
 }
 
 fn handle_arp(arp: &[u8]) {
