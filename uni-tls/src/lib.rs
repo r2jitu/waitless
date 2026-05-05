@@ -1,9 +1,24 @@
-// uni-tls — TLS 1.3 server for HTTPS over `uni_http`.
+// uni-tls — TLS 1.3 for HTTPS-over-TCP and TLS-over-QUIC.
 //
-// Owns the entire server-side TLS-over-TCP layer: the handshake
-// state machine (`server::TlsServer` + handlers + keys + profile +
-// trace) plus the `uni_http::Tls` impl that the HTTP server uses
-// to terminate HTTPS connections.
+// Top-level layout under `src/`:
+//
+//   tcp/   TLS 1.3 server state machine for the HTTPS-over-TCP
+//          path. The `TlsServer` connection state, the handshake
+//          handlers, the per-stage profiler, the session-ticket
+//          envelope, and the diagnostic trace module live here.
+//          A future `tcp/client.rs` would slot in alongside.
+//   quic/  TLS-over-QUIC stack: `QuicTls` handshake driver
+//          (CRYPTO-frame I/O), the `Connection` state machine,
+//          the per-conn `ConnInbox` async queue, and the UDP
+//          listener (`quic_listen` + `QuicListener`). A future
+//          `quic/client.rs` slots in alongside.
+//
+// The two transports share the lower-level protocol primitives
+// from `//net` (`tls`, `tls_handshake`, `tls_record`, `tls_crypto`,
+// `quic_wire`, `quic_crypto`, `quic_frame`); this crate composes
+// them into transport-specific server stacks. Apps that don't
+// import `uni_tls` link zero TLS / crypto code — the trait
+// boundary in `uni_http` keeps the dependency graph clean.
 //
 // `//net` provides the lower-level protocol primitives that are
 // shared with the future QUIC stack (`net_tls_crypto`,
@@ -34,10 +49,10 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 
-mod server;
+mod tcp;
 pub mod quic;
 
-pub use server::TlsServerConfig;
+pub use tcp::TlsServerConfig;
 
 /// Cert / key parse failure. Apps treat this as "TLS not
 /// available" and fall back to plain HTTP.
@@ -107,13 +122,13 @@ where
 /// this as the body of a debug endpoint (`/tls_profile`) to
 /// inspect per-stage handshake timings.
 pub fn tls_profile_report(out: &mut [u8]) -> usize {
-    server::profile::report(out)
+    tcp::profile::report(out)
 }
 
 /// Reset the TLS handshake profile accumulators. Useful between
 /// benchmark runs.
 pub fn tls_profile_reset() {
-    server::profile::reset();
+    tcp::profile::reset();
 }
 
 // ---- uni_http::Tls impl ------------------------------------------------------
@@ -131,14 +146,14 @@ struct TlsImpl {
 impl uni_http::Tls for TlsImpl {
     fn new_connection(&self, seed: [u8; 32]) -> Box<dyn uni_http::TlsConn> {
         Box::new(TlsConnImpl {
-            tls: server::TlsServer::new(seed),
+            tls: tcp::TlsServer::new(seed),
             cfg: self.cfg.clone(),
         })
     }
 }
 
 struct TlsConnImpl {
-    tls: server::TlsServer,
+    tls: tcp::TlsServer,
     cfg: Arc<TlsServerConfig>,
 }
 

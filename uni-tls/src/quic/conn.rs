@@ -56,7 +56,7 @@ use net_quic_wire::{
 };
 
 use super::tls::{CryptoLevel, QuicTls, QuicTlsError, QuicTlsState};
-use crate::server::TlsServerConfig;
+use crate::tcp::TlsServerConfig;
 
 // ============================================================================
 // Errors

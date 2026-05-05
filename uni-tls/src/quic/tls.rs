@@ -47,8 +47,8 @@ use net_tls_handshake::{
     sign_content_server_cert_verify, ClientHello, ParseError,
 };
 
-use crate::server::keys::{ct_eq_32, derive_finished_key, hmac_sha256};
-use crate::server::TlsServerConfig;
+use crate::tcp::keys::{ct_eq_32, derive_finished_key, hmac_sha256};
+use crate::tcp::TlsServerConfig;
 
 // ============================================================================
 // Public types

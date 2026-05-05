@@ -48,7 +48,7 @@ use super::conn::{ConnState, Connection, ConnectionId};
 use super::inbox::{
     make_local_cid, parse_local_cid, ConnInbox, Datagram, SlotTable, SERVER_CID_LEN,
 };
-use crate::server::TlsServerConfig;
+use crate::tcp::TlsServerConfig;
 
 /// Maximum simultaneous QUIC connections per worker. Each slot
 /// is ~16 bytes (gen + Weak), so 1024 slots ≈ 16 KiB per worker
