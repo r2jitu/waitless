@@ -453,7 +453,7 @@ where
     let h = listener.run(move |stream| {
         let handler = Arc::clone(&handler);
         async move {
-            handle_conn(handler, stream, None).await;
+            handle_conn(handler, stream, false).await;
         }
     });
     uni::_retain(h);
@@ -473,25 +473,28 @@ pub fn listen_https<H>(
 where
     H: AsyncFn(&Request) -> Response + Send + Sync + 'static,
 {
-    listen_https_with_extra_headers(port, handler, tls, None)
+    listen_https_advertising_h3(port, handler, tls, false)
 }
 
-/// Like [`listen_https`] but every response carries the
-/// caller-supplied static header lines (each formatted as
-/// `Header: value\r\n`, no trailing blank line). Intended for the
-/// `Alt-Svc: h3=…` advertisement when the same app also calls
-/// `uni_http3::listen` — the listener has no way to know whether
-/// an H3 endpoint is running on its behalf, so the app provides
-/// the bytes only when it has actually bound H3 successfully.
-/// Sending Alt-Svc unconditionally would mislead HTTP/3-capable
-/// browsers into trying a port that doesn't exist, slowing the
-/// next page load and possibly poisoning the alt-svc cache for
-/// up to 24 h.
-pub fn listen_https_with_extra_headers<H>(
+/// Like [`listen_https`] but every response includes
+/// `Alt-Svc: h3=":<port>"; ma=86400` whenever `advertise_h3` is
+/// true. The `<port>` is derived per-response from the request's
+/// `Host` header, so it always matches whatever port the client
+/// actually connected to (e.g. `https://localhost:8443/` →
+/// `h3=":8443"`). This handles the bazel-run default that maps
+/// host `:8443` → guest `:443` — a static `h3=":443"` would point
+/// browsers at a port nothing's listening on and silently disable
+/// HTTP/3 upgrade.
+///
+/// Caller is responsible for only setting `advertise_h3 = true`
+/// when an H3 endpoint actually bound on the corresponding UDP
+/// port; otherwise the browser's alt-svc cache gets poisoned for
+/// up to 24 h with a non-functional advertisement.
+pub fn listen_https_advertising_h3<H>(
     port: u16,
     handler: H,
     tls: Arc<dyn Tls>,
-    extra_response_headers: Option<&'static [u8]>,
+    advertise_h3: bool,
 ) -> Result<(), uni::runtime::TcpBindError>
 where
     H: AsyncFn(&Request) -> Response + Send + Sync + 'static,
@@ -505,7 +508,7 @@ where
             let mut seed = [0u8; 32];
             uni::rng::fill_bytes(&mut seed);
             let stream = TlsStream::new(tcp, tls.new_connection(seed));
-            handle_conn(handler, stream, extra_response_headers).await;
+            handle_conn(handler, stream, advertise_h3).await;
         }
     });
     uni::_retain(h);
@@ -523,7 +526,7 @@ where
 async fn handle_conn<S, H>(
     handler: Arc<H>,
     mut stream: S,
-    extra_response_headers: Option<&'static [u8]>,
+    advertise_h3: bool,
 ) where
     S: HttpStream,
     H: AsyncFn(&Request) -> Response,
@@ -570,7 +573,17 @@ async fn handle_conn<S, H>(
             let resp = (&*handler)(&req).await;
 
             w.clear();
-            write_response_into(&mut w, &resp, !want_close, extra_response_headers);
+            // Per-request Alt-Svc: when H3 is up, advertise it on
+            // whatever port the client actually used to reach us.
+            // Read the Host header here (after parse, before
+            // handler may have mutated `req` — handlers receive
+            // `&Request`, but defensively recompute each loop).
+            let alt_svc_port = if advertise_h3 {
+                req.header(b"Host").and_then(host_header_port).or(Some(443))
+            } else {
+                None
+            };
+            write_response_into(&mut w, &resp, !want_close, alt_svc_port);
             if stream.send(w.as_bytes()).await.is_err() {
                 return;
             }
@@ -766,16 +779,17 @@ impl core::fmt::Write for BufWriter {
 /// variable integer (`Content-Length`) measurably outperform
 /// `write!(...)` here.
 ///
-/// `extra_headers`, if `Some`, is an arena-leaked byte slice already
-/// formatted as one or more `Header: value\r\n` lines (no trailing
-/// blank line). Used by `listen_https` to advertise `Alt-Svc: h3=…`
-/// on every HTTPS response so HTTP/3-capable browsers learn to
-/// upgrade on the next visit.
+/// `alt_svc_port`, if `Some`, emits
+/// `Alt-Svc: h3=":<port>"; ma=86400` so HTTP/3-capable browsers
+/// learn to upgrade on the next visit. Caller resolves the port
+/// from the request's `Host` header so the advertisement matches
+/// whatever port the client actually used (e.g. the bazel-run
+/// default of `:8443`, not the unikernel's internal `:443`).
 fn write_response_into(
     w: &mut BufWriter,
     resp: &Response,
     keep_alive: bool,
-    extra_headers: Option<&'static [u8]>,
+    alt_svc_port: Option<u16>,
 ) {
     let body = resp.body_bytes();
     let content_type = resp.content_type_bytes();
@@ -795,11 +809,86 @@ fn write_response_into(
     w.push(b"\r\nConnection: ");
     w.push(if keep_alive { b"keep-alive" } else { b"close" });
     w.push(b"\r\n");
-    if let Some(extra) = extra_headers {
-        w.push(extra);
+    if let Some(port) = alt_svc_port {
+        w.push(b"Alt-Svc: h3=\":");
+        let mut port_buf = [0u8; 5];
+        let port_len = write_u16(&mut port_buf, port);
+        w.push(&port_buf[..port_len]);
+        w.push(b"\"; ma=86400\r\n");
     }
     w.push(b"\r\n");
     w.push(body);
+}
+
+/// Extract the port from an HTTP `Host` header value. Handles:
+///   `localhost:8443`           → 8443
+///   `localhost`                → None (caller defaults)
+///   `[::1]:8443`               → 8443 (v6-literal form, RFC 7230 §5.4)
+///   `[::1]`                    → None
+/// Anything malformed or out-of-range returns `None`.
+fn host_header_port(host: &[u8]) -> Option<u16> {
+    let after_host = if host.first() == Some(&b'[') {
+        // IPv6 literal: scan past the closing `]` before looking
+        // for the `:` separator, otherwise the address's own colons
+        // would match first.
+        let close = host.iter().position(|&b| b == b']')?;
+        &host[close + 1..]
+    } else {
+        host
+    };
+    let colon = after_host.iter().position(|&b| b == b':')?;
+    let digits = &after_host[colon + 1..];
+    if digits.is_empty() { return None; }
+    let mut acc: u32 = 0;
+    for &b in digits {
+        if !b.is_ascii_digit() { return None; }
+        acc = acc * 10 + (b - b'0') as u32;
+        if acc > 65535 { return None; }
+    }
+    Some(acc as u16)
+}
+
+/// Decimal-encode a `u16` into `out`, returning byte count.
+/// Mirror of `write_usize` but bounded so the buffer can be 5 bytes.
+fn write_u16(out: &mut [u8; 5], mut n: u16) -> usize {
+    if n == 0 {
+        out[0] = b'0';
+        return 1;
+    }
+    let mut tmp = [0u8; 5];
+    let mut len = 0;
+    while n > 0 {
+        tmp[len] = b'0' + (n % 10) as u8;
+        n /= 10;
+        len += 1;
+    }
+    for i in 0..len {
+        out[i] = tmp[len - 1 - i];
+    }
+    len
+}
+
+#[cfg(test)]
+mod host_port_tests {
+    use super::host_header_port;
+    #[test] fn plain_host_with_port() {
+        assert_eq!(host_header_port(b"localhost:8443"), Some(8443));
+    }
+    #[test] fn plain_host_no_port() {
+        assert_eq!(host_header_port(b"localhost"), None);
+    }
+    #[test] fn ipv6_with_port() {
+        assert_eq!(host_header_port(b"[::1]:8443"), Some(8443));
+        assert_eq!(host_header_port(b"[fe80::1%eth0]:443"), Some(443));
+    }
+    #[test] fn ipv6_no_port() {
+        assert_eq!(host_header_port(b"[::1]"), None);
+    }
+    #[test] fn malformed() {
+        assert_eq!(host_header_port(b"localhost:"), None);
+        assert_eq!(host_header_port(b"localhost:abc"), None);
+        assert_eq!(host_header_port(b"localhost:65536"), None);
+    }
 }
 
 /// Write the decimal digits of a 3-digit HTTP status code into `out`,

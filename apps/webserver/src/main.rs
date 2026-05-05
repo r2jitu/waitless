@@ -79,19 +79,15 @@ async fn init() {
     };
 
     // HTTPS is opt-in: if the bundled dev cert/key don't parse,
-    // log + skip rather than refuse to boot. When H3 is up,
-    // advertise it on every HTTPS response so HTTP/3-capable
-    // browsers learn to upgrade on the next visit. RFC 7838: the
-    // string is `Alt-Svc: h3=":<port>"; ma=86400\r\n` (one
-    // header line, ending in CRLF).
-    let alt_svc: Option<&'static [u8]> = if h3_up {
-        const ALT_SVC: &[u8] = b"Alt-Svc: h3=\":443\"; ma=86400\r\n";
-        Some(ALT_SVC)
-    } else {
-        None
-    };
-    match uni_tls::listen_with_extra_headers(
-        HTTPS_PORT, handle_request, DEV_CERT_DER, DEV_KEY_PKCS8_DER, alt_svc,
+    // log + skip rather than refuse to boot. Pass `h3_up` through
+    // — when true, every HTTPS response carries an
+    // `Alt-Svc: h3=":<port>"; ma=86400\r\n` header whose `<port>`
+    // is read from the request's Host header per-response. That
+    // matches whatever port the client actually used (the bazel-run
+    // default of `:8443`, not the guest-side `:443`), so Chrome's
+    // alt-svc cache learns the right H3 endpoint on first visit.
+    match uni_tls::listen_advertising_h3(
+        HTTPS_PORT, handle_request, DEV_CERT_DER, DEV_KEY_PKCS8_DER, h3_up,
     ) {
         Ok(()) => uni::println!("listen tcp://:{} (https, TLS_CHACHA20_POLY1305_SHA256)", HTTPS_PORT),
         Err(_) => uni::println!("[WARN] https disabled (cert/key invalid)"),

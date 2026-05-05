@@ -125,28 +125,30 @@ pub fn listen<H>(
 where
     H: AsyncFn(&uni_http::Request) -> uni_http::Response + Send + Sync + 'static,
 {
-    listen_with_extra_headers(port, handler, cert_der, key_der, None)
+    listen_advertising_h3(port, handler, cert_der, key_der, false)
 }
 
-/// Like [`listen`] but every response carries the static
-/// `extra_response_headers` byte slice (formatted as
-/// `Header: value\r\n` lines, no trailing blank line). The
-/// app uses this to advertise `Alt-Svc: h3=…` ONLY when it has
-/// actually bound a matching HTTP/3 listener — see the comment
-/// on `uni_http::listen_https_with_extra_headers` for why
-/// unconditional Alt-Svc would be a footgun.
-pub fn listen_with_extra_headers<H>(
+/// Like [`listen`] but every HTTPS response includes
+/// `Alt-Svc: h3=":<port>"; ma=86400` when `advertise_h3` is true.
+/// The `<port>` is taken from each request's `Host` header so the
+/// advertisement matches whatever port the client actually used —
+/// the bazel-run default maps host `:8443` → guest `:443`, and a
+/// static `:443` would silently disable HTTP/3 upgrade. The app
+/// passes `true` only after `uni_http3::listen` has reported
+/// success, otherwise the browser's alt-svc cache gets poisoned
+/// with a non-functional advertisement for up to 24 h.
+pub fn listen_advertising_h3<H>(
     port: u16,
     handler: H,
     cert_der: &'static [u8],
     key_der: &'static [u8],
-    extra_response_headers: Option<&'static [u8]>,
+    advertise_h3: bool,
 ) -> Result<(), ListenError>
 where
     H: AsyncFn(&uni_http::Request) -> uni_http::Response + Send + Sync + 'static,
 {
     let tls = acceptor(cert_der, key_der).map_err(|_| ListenError::Cert)?;
-    uni_http::listen_https_with_extra_headers(port, handler, tls, extra_response_headers)
+    uni_http::listen_https_advertising_h3(port, handler, tls, advertise_h3)
         .map_err(ListenError::Bind)
 }
 
