@@ -31,6 +31,7 @@ rust_library(
         "src/server/keys.rs",
         "src/server/profile.rs",
         "src/server/quic.rs",
+        "src/server/quic_conn.rs",
         "src/server/ticket.rs",
         "src/server/trace.rs",
     ],
@@ -51,6 +52,9 @@ rust_library(
         "--check-cfg=cfg(feature,values(\"std\"))",
     ],
     deps = [
+        "//net:quic_crypto",
+        "//net:quic_frame",
+        "//net:quic_wire",
         "//net:tls",
         "//net:tls_crypto",
         "//net:tls_handshake",
