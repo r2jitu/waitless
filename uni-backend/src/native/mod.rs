@@ -678,7 +678,10 @@ fn drain_udp_sibling(fd: i32, app_port: u16) {
         // Mirror of `from_ne_bytes` in udp_send. sin_addr is stored
         // in memory in network byte order; `to_ne_bytes` extracts
         // those four bytes intact regardless of host endianness.
-        let src_ip = src_addr.sin_addr.to_ne_bytes();
+        let src_octets = src_addr.sin_addr.to_ne_bytes();
+        let src_ip = uni_runtime::ip::IpAddr::V4(uni_runtime::ip::Ipv4Addr {
+            addr: u32::from_ne_bytes(src_octets),
+        });
         let src_port = u16::from_be(src_addr.sin_port);
         let payload = &buf[..n as usize];
         let _ = uni_runtime::net::deliver_udp(app_port, src_ip, src_port, payload);

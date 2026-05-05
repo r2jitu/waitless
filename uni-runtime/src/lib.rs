@@ -16,6 +16,7 @@
 #![no_std]
 
 extern crate alloc;
+pub extern crate net_types as ip;
 
 pub mod event;
 pub mod launcher;

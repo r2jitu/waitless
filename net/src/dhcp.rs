@@ -75,7 +75,7 @@ impl DhcpPacket {
 const DHCP_DISCOVER: u8 = 1;
 const DHCP_REQUEST: u8 = 3;
 
-const BROADCAST_IP: [u8; 4] = [255, 255, 255, 255];
+const BROADCAST_IP: types::IpAddr = types::IpAddr::V4(types::Ipv4Addr { addr: 0xFFFF_FFFF });
 
 /// The parsed lease. `handle_reply` fills this from whichever
 /// worker receives the OFFER / ACK; `discover()` reads it from
@@ -119,7 +119,7 @@ static ACK_READY: AsyncEvent = AsyncEvent::new();
 /// Parses the DHCP payload and updates the shared `DHCP_STATE`.
 /// Validation + option walking lives in `dhcp_parse`; see its
 /// unit tests for the edge-case coverage.
-fn handle_reply(_src_ip: [u8; 4], src_port: u16, payload: &[u8]) {
+fn handle_reply(_src_ip: types::IpAddr, src_port: u16, payload: &[u8]) {
     // DHCP servers always source from port 67. Drop anything else.
     if src_port != 67 {
         return;

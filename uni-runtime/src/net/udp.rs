@@ -69,7 +69,7 @@ const MAX_PAYLOAD: usize = 1500;
 
 #[repr(C)]
 struct Datagram {
-    src_ip: [u8; 4],
+    src_ip: IpAddr,
     src_port: u16,
     len: u16,
     payload: [u8; MAX_PAYLOAD],
@@ -77,12 +77,14 @@ struct Datagram {
 
 impl Datagram {
     const ZERO: Self = Datagram {
-        src_ip: [0; 4],
+        src_ip: IpAddr::V4_ANY,
         src_port: 0,
         len: 0,
         payload: [0; MAX_PAYLOAD],
     };
 }
+
+use crate::ip::IpAddr;
 
 /// One worker's view of a socket. Producer and consumer are the
 /// same worker in the common case: the delivery path runs on the
@@ -153,7 +155,7 @@ impl WorkerInbox {
         true
     }
 
-    fn try_push(&self, src_ip: [u8; 4], src_port: u16, payload: &[u8]) -> bool {
+    fn try_push(&self, src_ip: IpAddr, src_port: u16, payload: &[u8]) -> bool {
         let slots_ptr = self.slots.load(Ordering::Acquire);
         if slots_ptr.is_null() {
             return false;
@@ -179,7 +181,7 @@ impl WorkerInbox {
         true
     }
 
-    fn pop_into(&self, buf: &mut [u8]) -> Option<([u8; 4], u16, usize)> {
+    fn pop_into(&self, buf: &mut [u8]) -> Option<(IpAddr, u16, usize)> {
         let slots_ptr = self.slots.load(Ordering::Acquire);
         if slots_ptr.is_null() {
             return None;
@@ -212,7 +214,7 @@ impl WorkerInbox {
     /// finite time. We can: the closure has to return.
     fn pop_with<F, R>(&self, f: F) -> Result<R, F>
     where
-        F: FnOnce(&[u8], [u8; 4], u16) -> R,
+        F: FnOnce(&[u8], IpAddr, u16) -> R,
     {
         let slots_ptr = self.slots.load(Ordering::Acquire);
         if slots_ptr.is_null() {
@@ -486,7 +488,7 @@ pub struct UdpBackend {
     pub unbind: Option<fn(port: u16)>,
     /// Datagram send transport. Mandatory: `UdpSocket::send_to`
     /// returns `Err(())` if the backend isn't installed yet.
-    pub send: fn(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]),
+    pub send: fn(dst_ip: IpAddr, src_port: u16, dst_port: u16, data: &[u8]),
 }
 
 static UDP_BACKEND: AtomicPtr<UdpBackend> =
@@ -790,7 +792,7 @@ impl UdpSocket {
     /// ring on bare-metal, `sendto` EAGAIN on native) are swallowed
     /// today since they're harmless for UDP; add a proper error
     /// enum when QUIC needs to observe them.
-    pub fn send_to(&self, dst_ip: [u8; 4], dst_port: u16, data: &[u8]) -> Result<(), ()> {
+    pub fn send_to(&self, dst_ip: IpAddr, dst_port: u16, data: &[u8]) -> Result<(), ()> {
         let b = udp_backend().ok_or(())?;
         (b.send)(dst_ip, self.port, dst_port, data);
         Ok(())
@@ -821,7 +823,7 @@ impl UdpSocket {
     /// keys) the saved memcpy is the bulk of the per-packet cost.
     pub fn recv_inplace<F, R>(&self, f: F) -> UdpRecvInplace<'_, F, R>
     where
-        F: FnOnce(&[u8], [u8; 4], u16) -> R + Unpin,
+        F: FnOnce(&[u8], IpAddr, u16) -> R + Unpin,
     {
         UdpRecvInplace {
             sock: self,
@@ -834,7 +836,7 @@ impl UdpSocket {
     /// src_port, n))` if a datagram was waiting, `None` otherwise.
     /// `!Send` enforced via `&UdpRecvNotSend` — the call must
     /// happen on the worker that owns the inbox.
-    pub fn try_recv_from(&self, buf: &mut [u8]) -> Option<([u8; 4], u16, usize)> {
+    pub fn try_recv_from(&self, buf: &mut [u8]) -> Option<(IpAddr, u16, usize)> {
         let _: PhantomData<*mut ()> = PhantomData; // !Send marker
         let cc = CurrentWorker::enter();
         let inbox = self.current_inbox(&cc);
@@ -847,7 +849,7 @@ impl UdpSocket {
     /// everything currently buffered before yielding.
     pub fn try_recv_inplace<F, R>(&self, f: F) -> Option<R>
     where
-        F: FnOnce(&[u8], [u8; 4], u16) -> R,
+        F: FnOnce(&[u8], IpAddr, u16) -> R,
     {
         let cc = CurrentWorker::enter();
         let inbox = self.current_inbox(&cc);
@@ -954,7 +956,7 @@ impl UdpSocket {
               immediately releases it again"]
 pub struct UdpClient {
     inner: UdpSocket,
-    peer_ip: [u8; 4],
+    peer_ip: IpAddr,
     peer_port: u16,
 }
 
@@ -969,7 +971,7 @@ impl UdpClient {
     /// unconnected variant. If you need to talk to multiple
     /// peers, open one client per peer (cheap — each is a single
     /// slot in the per-worker pool).
-    pub fn connect(peer_ip: [u8; 4], peer_port: u16) -> Result<UdpClient, UdpBindError> {
+    pub fn connect(peer_ip: IpAddr, peer_port: u16) -> Result<UdpClient, UdpBindError> {
         let inner = UdpSocket::open_ephemeral()?;
         Ok(UdpClient { inner, peer_ip, peer_port })
     }
@@ -1033,7 +1035,7 @@ impl UdpClient {
 
     /// The peer this client is connected to.
     #[inline]
-    pub fn peer(&self) -> ([u8; 4], u16) {
+    pub fn peer(&self) -> (IpAddr, u16) {
         (self.peer_ip, self.peer_port)
     }
 }
@@ -1147,7 +1149,7 @@ pub struct UdpRecv<'a> {
 }
 
 impl<'a> Future for UdpRecv<'a> {
-    type Output = ([u8; 4], u16, usize);
+    type Output = (IpAddr, u16, usize);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
@@ -1191,7 +1193,7 @@ impl<'a> Future for UdpRecv<'a> {
 /// the worker where we first polled.
 pub struct UdpRecvInplace<'a, F, R>
 where
-    F: FnOnce(&[u8], [u8; 4], u16) -> R + Unpin,
+    F: FnOnce(&[u8], IpAddr, u16) -> R + Unpin,
 {
     sock: &'a UdpSocket,
     f: Option<F>,
@@ -1200,7 +1202,7 @@ where
 
 impl<'a, F, R> Future for UdpRecvInplace<'a, F, R>
 where
-    F: FnOnce(&[u8], [u8; 4], u16) -> R + Unpin,
+    F: FnOnce(&[u8], IpAddr, u16) -> R + Unpin,
 {
     type Output = R;
 
@@ -1279,7 +1281,7 @@ fn lookup_eph_position(worker: u32, slot_idx: u32) -> Option<&'static EphSlot> {
 ///     the scan stays cheap. Delivery routes to the receiving
 ///     worker's inbox — server `run` listeners spawn one task per
 ///     worker and the NIC's flow hash has already steered here.
-pub fn deliver_udp(dst_port: u16, src_ip: [u8; 4], src_port: u16, payload: &[u8]) -> bool {
+pub fn deliver_udp(dst_port: u16, src_ip: IpAddr, src_port: u16, payload: &[u8]) -> bool {
     // Fast path: ephemeral ports.
     if let Some(slot) = lookup_eph(dst_port) {
         let _ = slot.inbox.try_push(src_ip, src_port, payload);

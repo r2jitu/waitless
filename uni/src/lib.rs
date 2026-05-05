@@ -237,6 +237,11 @@ pub mod runtime {
     pub use uni_runtime::select::{
         join, join3, select, select3, timeout_us, Either, Three,
     };
+    /// Family-agnostic IP address used in `UdpSocket::recv_from` /
+    /// `send_to` and elsewhere on the runtime API. Re-exported so
+    /// callers don't need to add a `net_types` dep just to pattern-
+    /// match the source of an inbound datagram.
+    pub use uni_runtime::ip::{IpAddr, Ipv4Addr, Ipv6Addr};
 }
 
 // Top-level shortcuts for the most common runtime calls. The full

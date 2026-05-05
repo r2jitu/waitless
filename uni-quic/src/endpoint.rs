@@ -95,7 +95,7 @@ pub struct QuicConn {
     /// Peer 4-tuple. Updated by the conn task on every inbound
     /// datagram so connection migration "just works" — handler
     /// reads the latest values when it sends a reply.
-    peer_ip: Rc<Cell<[u8; 4]>>,
+    peer_ip: Rc<Cell<uni::runtime::IpAddr>>,
     peer_port: Rc<Cell<u16>>,
     /// Wakes the handler when the conn task ingested an inbound
     /// datagram (new stream data may be available, conn state
@@ -398,7 +398,8 @@ async fn conn_task<H, F>(
 {
     let conn = Rc::new(RefCell::new(Connection::new_server(local_cid, seed)));
     let progress = Rc::new(AsyncEvent::new());
-    let peer_ip: Rc<Cell<[u8; 4]>> = Rc::new(Cell::new([0; 4]));
+    let peer_ip: Rc<Cell<uni::runtime::IpAddr>> =
+        Rc::new(Cell::new(uni::runtime::IpAddr::V4_ANY));
     let peer_port: Rc<Cell<u16>> = Rc::new(Cell::new(0));
     let mut handler_spawned = false;
 

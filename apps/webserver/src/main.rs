@@ -126,7 +126,10 @@ async fn tcp_echo(stream: TcpStream) {
 /// ping-pongs:
 ///   tcp_recv_exact → udp.send → udp.recv_into → tcp_send.
 async fn gateway(stream: TcpStream, backend_ip: [u8; 4]) {
-    let Ok(udp) = UdpClient::connect(backend_ip, GATEWAY_BACKEND_PORT) else { return; };
+    let backend = uni::runtime::IpAddr::V4(uni::runtime::Ipv4Addr {
+        addr: u32::from_ne_bytes(backend_ip),
+    });
+    let Ok(udp) = UdpClient::connect(backend, GATEWAY_BACKEND_PORT) else { return; };
     let mut buf = [0u8; GATEWAY_MSG_SIZE];
     loop {
         if stream.recv_exact(&mut buf).await.is_err() { return; }

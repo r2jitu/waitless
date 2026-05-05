@@ -45,7 +45,7 @@ use uni::runtime::AsyncEvent;
 /// copy.
 #[derive(Clone)]
 pub struct Datagram {
-    pub src_ip: [u8; 4],
+    pub src_ip: uni::runtime::IpAddr,
     pub src_port: u16,
     pub bytes: Vec<u8>,
 }
@@ -344,7 +344,9 @@ mod tests {
 
     fn dgram(byte: u8) -> Datagram {
         Datagram {
-            src_ip: [127, 0, 0, 1],
+            src_ip: uni::runtime::IpAddr::V4(uni::runtime::Ipv4Addr {
+                addr: u32::from_ne_bytes([127, 0, 0, 1]),
+            }),
             src_port: 5000,
             bytes: alloc::vec![byte; 8],
         }

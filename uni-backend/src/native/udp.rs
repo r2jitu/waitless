@@ -173,7 +173,14 @@ fn open_udp_relay(app_port: u16, owner_worker: Option<u32>) -> Result<(), ()> {
     Ok(())
 }
 
-pub(super) fn udp_send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
+pub(super) fn udp_send(dst_ip: uni_runtime::ip::IpAddr, src_port: u16, dst_port: u16, data: &[u8]) {
+    // Native backend is IPv4-only — IPv6 destinations require a
+    // separate sockaddr_in6 + AF_INET6 socket; not implemented for
+    // the host-side test runner. Drop silently.
+    let dst_ip = match dst_ip {
+        uni_runtime::ip::IpAddr::V4(a) => a.octets(),
+        uni_runtime::ip::IpAddr::V6(_) => return,
+    };
     unsafe {
         // Handler runs inline on a worker thread after its kqueue
         // reported the sibling ready. Reply on that worker's own

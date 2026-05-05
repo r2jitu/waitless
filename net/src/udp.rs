@@ -15,7 +15,7 @@ extern crate net_ipv6 as ipv6;
 extern crate net_ipv6_send as ipv6_send;
 
 use from_bytes::FromBytes;
-use types::{IpAddr, Ipv4Addr, CONFIG, tcp_checksum, tcp_checksum_v6, htons, ntohs};
+use types::{IpAddr, CONFIG, tcp_checksum, tcp_checksum_v6, htons, ntohs};
 use ipv4::{ipv4_send, PROTO_UDP};
 
 #[repr(C, packed)]
@@ -29,12 +29,12 @@ struct UdpHeader {
 // SAFETY: repr(C, packed), all fields u16.
 unsafe impl FromBytes for UdpHeader {}
 
-/// Send a UDP datagram. The runtime's UdpBackend vtable currently
-/// passes `dst_ip` as a 4-byte IPv4 address; once the runtime API
-/// switches to `IpAddr`, callers route via `send_to_addr` instead.
-pub fn send(dst_ip: [u8; 4], src_port: u16, dst_port: u16, data: &[u8]) {
-    let dst = Ipv4Addr::from(dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]);
-    send_to_addr(IpAddr::V4(dst), src_port, dst_port, data);
+/// Backend send entrypoint registered with the runtime
+/// `UdpBackend` vtable. Forwards to `send_to_addr`. Kept as a
+/// thin wrapper so the runtime sees a stable function pointer
+/// signature even if `send_to_addr` evolves.
+pub fn send(dst_ip: IpAddr, src_port: u16, dst_port: u16, data: &[u8]) {
+    send_to_addr(dst_ip, src_port, dst_port, data);
 }
 
 /// Family-aware UDP send. Builds the datagram + pseudo-checksum
@@ -101,10 +101,5 @@ pub fn udp_receive(src_ip: IpAddr, _dst_ip: IpAddr, data: &[u8]) {
     }
     let payload = &data[8..udp_len];
 
-    // Until the runtime API gains IpAddr, only IPv4 datagrams
-    // surface to userland sockets. IPv6 UDP packets are ACK'd at
-    // L3 (we sent NA/NS for them) but ignored at L4.
-    if let IpAddr::V4(src) = src_ip {
-        let _ = uni_runtime::net::deliver_udp(dst_port, src.octets(), src_port, payload);
-    }
+    let _ = uni_runtime::net::deliver_udp(dst_port, src_ip, src_port, payload);
 }

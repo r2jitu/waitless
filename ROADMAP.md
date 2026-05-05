@@ -1278,42 +1278,66 @@ Prefix Information option + the EUI-64 interface ID. Logs:
 - [x] Unit test: SLAAC happy path via parsed RA + prefix
 - [ ] Multi-prefix tracking (multiple globals) — future expansion
 
-### 5d. Dual-stack TCP / UDP — pending
+### 5d. Dual-stack TCP / UDP — done (sockets layer)
 
-The L3 layer accepts IPv6 frames and replies to ICMPv6, but TCP /
-UDP packets over IPv6 are silently dropped: the connection state
-machine, the runtime API, and the apps all key on `Ipv4Addr`. To
-unlock IPv6 for sockets:
+End-to-end: an inbound TCP/UDP packet — v4 or v6 — flows
+through the same TCB pool, hash table, runtime reactor, and
+user handler. The HVF runner still only relays IPv4, so the v6
+path isn't exercised on macOS today, but a deployment with v6
+L2 connectivity (QEMU bridged net, GCE with v6 enabled) gets
+v6 sockets without any further code changes.
 
 - [x] `IpAddr::{V4, V6}` enum + `tcp_checksum_v6` /
       `tcp_checksum_any` family-dispatched checksums
       (`net/types.rs`).
-- [ ] **Outbound NDP cache** — TCB needs the peer's MAC for
-      unicast IPv6 replies; for response-path traffic the inbound
-      frame's source MAC is enough, but server-initiated outbound
-      (rare today, but listener-side TCP retransmits to a peer
-      whose ARP/NDP entry expired) needs proper resolution.
-- [ ] **`net_ipv6::ipv6_send`** — analogous to `ipv4_send`,
-      requires the NDP cache. Currently `net/lib.rs` has a
-      receive-only `send_ipv6_from` helper that takes the
-      destination MAC explicitly.
-- [ ] **TCP TCB → `IpAddr`** — `remote_ip: Ipv4Addr` becomes
-      `remote_ip: IpAddr`; `local_ip` field added; `tcp_hash_key`
-      hashes the v6 octets; `send_segment` / `send_rst` dispatch
-      between `ipv4_send` and `ipv6_send` by family.
-- [ ] **UDP `udp_receive` → `IpAddr`** — same shape.
-- [ ] **`uni-runtime` API** — `UdpSocket::recv_from / send_to`
-      and `TcpStream` peer addr move to `IpAddr`. Apps update
-      their src-IP unpacking accordingly. Some apps (the UDP
-      echo, the QUIC inbox) treat src as opaque and just need
-      a type rename.
-- [ ] **Integration: HTTP-over-IPv6 + H3-over-IPv6** — once the
-      runtime API serves both families, the existing
-      `apps/webserver` handler would automatically gain v6
-      reach.
+- [x] `//net:ndp` — Spinlock'd MAC cache mirroring `:arp`,
+      populated by receive-path snoops; FIFO eviction.
+- [x] `//net:ipv6_send` — `ipv6_send` (NDP-resolves dst MAC,
+      drops on miss) + `ipv6_send_to_mac` (response-path
+      bypass). Both build the v6 header via `:ipv6` and ship via
+      `ethernet_send`. Replaces the bespoke helpers `net/lib.rs`
+      had.
+- [x] `TcpConnection.remote_ip / local_ip: IpAddr`,
+      `tcp_hash_key` folds v6 octets to 32 bits + sets a
+      family-disjoint bit, `send_segment` / `send_rst`
+      dispatch via `ipv4_send` / `ipv6_send::ipv6_send`.
+      `tcp_receive(src: IpAddr, dst: IpAddr, ...)` is the
+      single entry point.
+- [x] `udp::udp_receive(src: IpAddr, dst: IpAddr, ...)` +
+      `send_to_addr(IpAddr, ...)`. The `UdpBackend` vtable's
+      `send` now takes `IpAddr` so the bare-metal and native
+      backends share one signature.
+- [x] `uni-runtime::ip` re-export of `net_types::{IpAddr,
+      Ipv4Addr, Ipv6Addr}`. `UdpSocket::send_to(IpAddr, ...)`,
+      `recv_from() -> (IpAddr, u16, usize)`,
+      `UdpClient::connect(IpAddr, ...)`,
+      `peer() -> (IpAddr, u16)`, plus the in-place / try-recv
+      flavours. `deliver_udp(port, src: IpAddr, ...)`.
+- [x] `net/lib.rs` `ipv6_receive_frame` dispatches `next_header
+      ∈ {TCP, UDP}` into the L4 entry points with `IpAddr::V6`.
+      ARP-snoop-on-receive's IPv6 counterpart `ndp_learn` runs
+      on every inbound v6 frame.
+- [x] `apps/webserver` (UDP echo, gateway), `uni-quic`
+      (`Datagram.src_ip`, `peer_ip` Cell), DHCP (`BROADCAST_IP`
+      + `handle_reply`), and native backend (`udp_send`,
+      `deliver_udp`) all updated to `IpAddr`. v6 destinations
+      drop in the native backend (host-side test runner is
+      IPv4-only).
 
-Estimated 500-line refactor across `net/{tcp,udp}.rs`,
-`net/lib.rs`, `uni-runtime/net/*`, plus a new NDP cache module.
+End-to-end regression after the refactor: HTTPS GET, curl
+`--http3` GET, and UDP echo all still return 200/OK against
+the running unikernel; 16-test suite green; bare-metal builds
+(arm64 + x86_64) clean.
+
+**Outstanding (small follow-ups):**
+
+- [ ] Active Neighbor Solicitation when the NDP cache misses
+      on outbound unicast — currently we drop. Server reply
+      paths are unaffected (they reuse the inbound src MAC).
+- [ ] HVF runner IPv6 packet relay — the protocol-level path
+      is done end-to-end; lighting up `ping6 ::1%lo0:8443` from
+      a mac host requires `tools/hvf-runner` to forward v6
+      traffic.
 
 **Try it (today, after Phase 5a–5c):**
 ```bash
