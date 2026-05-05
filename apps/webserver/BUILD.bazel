@@ -17,6 +17,7 @@ rust_library(
     deps = [
         "//uni",
         "//uni-http",
+        "//uni-http3",
         "//uni-tls",
     ],
 )
@@ -39,6 +40,11 @@ unikernel_binary(
         ),
         port_fwd(
             "tcp",
+            guest = 443,
+            host = 8443,
+        ),
+        port_fwd(
+            "udp",
             guest = 443,
             host = 8443,
         ),

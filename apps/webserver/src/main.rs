@@ -63,6 +63,19 @@ async fn init() {
         Ok(()) => uni::println!("listen tcp://:{} (https, TLS_CHACHA20_POLY1305_SHA256)", HTTPS_PORT),
         Err(_) => uni::println!("[WARN] https disabled (cert/key invalid)"),
     }
+
+    // HTTP/3 over QUIC on the same port (UDP/443). Uses the same
+    // dev cert + same `handle_request` closure as the HTTPS path.
+    // `uni_http3::listen` returns once the UDP socket is bound;
+    // the listener is retained internally for the lifetime of the
+    // program.
+    let h3_handler = move |req: uni_http::Request| async move {
+        handle_request(&req).await
+    };
+    match uni_http3::listen(HTTPS_PORT, h3_handler, DEV_CERT_DER, DEV_KEY_PKCS8_DER) {
+        Ok(()) => uni::println!("listen udp://:{} (h3, TLS_CHACHA20_POLY1305_SHA256)", HTTPS_PORT),
+        Err(_) => uni::println!("[WARN] h3 disabled (cert/key invalid or bind failed)"),
+    }
 }
 
 // ---- Listener bodies --------------------------------------------------------
