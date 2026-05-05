@@ -14,7 +14,8 @@
 
 #![allow(unused_variables, dead_code)]
 
-use super::{handshake, State, HandshakeError};
+use crate::handshake;
+use crate::server::{HandshakeError, State};
 
 // `serial::puts` sink. Only compiled when `--cfg=tls_debug`
 // is set in `//uni-tls`'s rustc_flags. On the

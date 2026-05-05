@@ -10,19 +10,19 @@
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use super::tls::{self, HASH_LEN};
+use crate::schedule::{self as tls, HASH_LEN};
 
 /// Derive a TLS 1.3 `finished_key` from a traffic secret via
 /// HKDF-Expand-Label(label="finished", context=""). See RFC 8446
 /// §4.4.4.
-pub(crate) fn derive_finished_key(secret: &[u8; HASH_LEN]) -> [u8; HASH_LEN] {
+pub fn derive_finished_key(secret: &[u8; HASH_LEN]) -> [u8; HASH_LEN] {
     let mut out = [0u8; HASH_LEN];
     tls::hkdf_expand_label(secret, b"finished", &[], &mut out);
     out
 }
 
 /// HMAC-SHA256 over `data` with `key`.
-pub(crate) fn hmac_sha256(key: &[u8; HASH_LEN], data: &[u8]) -> [u8; HASH_LEN] {
+pub fn hmac_sha256(key: &[u8; HASH_LEN], data: &[u8]) -> [u8; HASH_LEN] {
     type HmacSha256 = Hmac<Sha256>;
     let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts any slice");
     mac.update(data);
@@ -40,7 +40,7 @@ pub(crate) fn hmac_sha256(key: &[u8; HASH_LEN], data: &[u8]) -> [u8; HASH_LEN] {
 /// through `core::hint::black_box` so rustc can't short-circuit the
 /// loop once `diff` is non-zero. That preserves the constant-time
 /// property without pulling in the `subtle` crate.
-pub(crate) fn ct_eq_32(a: &[u8], b: &[u8; HASH_LEN]) -> bool {
+pub fn ct_eq_32(a: &[u8], b: &[u8; HASH_LEN]) -> bool {
     if a.len() != HASH_LEN {
         return false;
     }

@@ -15,28 +15,28 @@
 
 use p256::ecdsa::{signature::Signer, Signature as EcdsaSignature};
 
-use super::handshake::{
+use crate::handshake::{
     build_certificate, build_certificate_verify, build_encrypted_extensions, build_finished,
     build_new_session_ticket, build_server_hello, cipher_suite, encode_handshake, msg_type,
     parse_finished, parse_handshake, psk_ke_mode, sign_content_server_cert_verify, ClientHello,
     ParseError, PskOffer,
 };
-use super::record::{self, content_type, open as record_open, seal as record_seal, RecordError, HEADER_LEN};
-use super::tls::{
+use crate::record::{self, content_type, open as record_open, seal as record_seal, RecordError, HEADER_LEN};
+use crate::schedule::{
     derive_secret, empty_transcript_hash, hkdf_expand_label, secure_zero, KeySchedule,
     TrafficKey, HASH_LEN,
 };
 
 use sha2::{Digest as _, Sha256};
 
-use super::keys::{ct_eq_32, derive_finished_key, hmac_sha256};
-use super::profile;
-use super::ticket::{
+use crate::keys::{ct_eq_32, derive_finished_key, hmac_sha256};
+use crate::profile;
+use crate::ticket::{
     open_ticket, seal_ticket, TicketPlaintext, SEALED_LEN, TICKET_LIFETIME_SECONDS,
     TICKET_VERSION,
 };
-use super::trace;
-use super::{State, HandshakeError, TlsServer, TlsServerConfig, TX_BUF_LEN};
+use crate::trace;
+use crate::server::{State, HandshakeError, TlsServer, TlsServerConfig, TX_BUF_LEN};
 
 /// Monotonic value the server stamps into freshly-issued tickets and
 /// against which `open_ticket` measures age.

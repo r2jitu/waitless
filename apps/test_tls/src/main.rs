@@ -1,13 +1,13 @@
 // apps/test_tls — TLS 1.3 primitives smoke test.
 //
-// Boots the unikernel, runs the full //net:tls key schedule and the
-// //net:tls_crypto AEAD through a known-answer round-trip, and prints
+// Boots the unikernel, runs the full //uni-tls key schedule and the
+// //uni-tls AEAD through a known-answer round-trip, and prints
 // PASS/FAIL for each stage on the serial console. test_tls.sh parses
 // serial for "TLS TESTS: ALL PASSED" (or any FAIL) and reports test
 // status accordingly.
 //
-// This is the integration test for everything we ship under net/tls*.
-// The host unit tests on //net:tls_crypto cover chacha20/poly1305/aead
+// This is the integration test for everything we ship under uni-tls.
+// The host unit tests on //uni-tls cover chacha20/poly1305/aead
 // against RFC 8439 vectors; this test proves the TLS 1.3 key schedule
 // + X25519 round-trip + record AEAD actually run on bare metal and
 // produce self-consistent results.
@@ -16,8 +16,8 @@
 
 extern crate uni;
 
-extern crate net_tls as tls;
-extern crate net_tls_crypto as tls_crypto;
+use uni_tls::aead as tls_crypto;
+use uni_tls::schedule as tls;
 
 fn logn(msg: &[u8]) {
     uni::log(msg);

@@ -3,14 +3,14 @@ load("//bazel/rules:rust.bzl", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 
-# TLS 1.3 server for HTTPS over uni_http.
+# TLS 1.3 protocol stack for HTTPS-over-TCP.
 #
-# Owns the entire TLS-over-TCP server: the handshake state machine
-# + the `uni_http::Tls` impl. The lower-level protocol primitives
-# (`tls_crypto`, `tls_handshake`, `tls_record`, `tls`) live in
-# //net so a future QUIC stack can share them. Apps that don't
-# import this crate link zero TLS / crypto code — the trait
-# boundary in `uni_http` is what makes the isolation work.
+# After the //net:tls{,_crypto,_handshake,_record} merger, this
+# crate owns the FULL TLS implementation: sans-io primitives
+# (`schedule`, `aead`, `handshake`, `record`) plus the per-conn
+# server state machine. //uni-quic depends on `schedule` / `aead`
+# / `handshake` for its TLS-over-CRYPTO-frames driver; HTTPS apps
+# use the higher-level `acceptor` / `listen` API.
 #
 # To enable diagnostic tracing add `--cfg=tls_debug` to rustc_flags
 # below. When unset, the trace module compiles to no-op stubs with
@@ -18,25 +18,23 @@ package(default_visibility = ["//visibility:public"])
 #
 # The kernel dep is bare-metal-only: the `#[cfg(tls_debug)]` trace
 # module uses `kernel::serial::puts` on `target_os="none"` and
-# `libc::write` on hosted targets. The rest of the crate has no
-# kernel dependency, so the same source compiles for native too
-# and lets `//uni:uni` drive the full TLS stack on both paths.
-#
+# `libc::write` on hosted targets.
 rust_library(
     name = "uni-tls",
     srcs = [
         "src/lib.rs",
-        "src/quic/conn.rs",
-        "src/quic/inbox.rs",
-        "src/quic/mod.rs",
-        "src/quic/server.rs",
-        "src/quic/tls.rs",
-        "src/tcp.rs",
-        "src/tcp/handlers.rs",
-        "src/tcp/keys.rs",
-        "src/tcp/profile.rs",
-        "src/tcp/ticket.rs",
-        "src/tcp/trace.rs",
+        # Sans-io TLS primitives (formerly //net:tls{,_crypto,_handshake,_record})
+        "src/aead.rs",
+        "src/handshake.rs",
+        "src/record.rs",
+        "src/schedule.rs",
+        # TLS-over-TCP server state machine + helpers.
+        "src/handlers.rs",
+        "src/keys.rs",
+        "src/profile.rs",
+        "src/server.rs",
+        "src/ticket.rs",
+        "src/trace.rs",
     ],
     compile_data = [
         "//apps/webserver/dev_certs:dev_cert.der",
@@ -55,30 +53,25 @@ rust_library(
         "--check-cfg=cfg(feature,values(\"std\"))",
     ],
     deps = [
-        "//net:quic_crypto",
-        "//net:quic_frame",
-        "//net:quic_wire",
-        "//net:tls",
-        "//net:tls_crypto",
-        "//net:tls_handshake",
-        "//net:tls_record",
         "//uni",
         "//uni-http",
-        "//uni-runtime",
+        "@crates//:chacha20poly1305",
         "@crates//:getrandom",
+        "@crates//:hkdf",
         "@crates//:hmac",
         "@crates//:p256",
         "@crates//:sha2",
+        "@crates//:x25519-dalek",
     ] + select({
         "//bazel/platforms:native": [],
         "//conditions:default": ["//kernel"],
     }),
 )
 
-# Host-native unit tests for the in-crate `mod tests` blocks
-# (currently `extract_p256_d_matches_known_shape` in `server.rs`
-# and `ct_eq_32_basics` in `server/keys.rs`). Same `std` feature
-# trick as `//net:tls_test`.
+# Host-native unit tests for in-crate `mod tests` blocks (handshake
+# parsing, key schedule, AEAD round-trip, record-layer framing,
+# ticket envelope, finished-key + ct_eq, etc.). Same `std` feature
+# trick as the rest of the workspace.
 rust_test(
     name = "uni_tls_test",
     size = "small",

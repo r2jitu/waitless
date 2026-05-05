@@ -35,10 +35,10 @@ use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU8, Ordering};
 
-use net_tls::secure_zero;
-use net_tls_crypto::{
+use crate::aead::{
     chacha20poly1305_open, chacha20poly1305_seal, KEY_LEN, NONCE_LEN, TAG_LEN,
 };
+use crate::schedule::secure_zero;
 
 /// Plaintext schema version. Bumped whenever the field layout below
 /// changes incompatibly; `open_ticket` rejects any other value so

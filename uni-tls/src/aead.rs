@@ -18,12 +18,8 @@
 // Constant-timeness + correctness are the responsibility of the
 // upstream audited crate.
 
-// Stays no_std in production. Under `bazel test`, the
-// `tests_need_std` flag flips this crate's `std` feature on so
-// libtest's panic=unwind harness can link.
-#![cfg_attr(all(not(test), not(feature = "std")), no_std)]
-
-extern crate chacha20poly1305;
+// (no-std + `extern crate` declarations live in lib.rs after the
+// merger from //net:tls_crypto into //uni-tls.)
 
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag};

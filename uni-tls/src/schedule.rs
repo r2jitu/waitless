@@ -22,17 +22,11 @@
 // - No std, no cert parsing (yet), no SIGALG processing (yet). This
 //   module stops at "we have traffic keys and can seal/open records".
 
-// Stays no_std in production. Under `bazel test`, the
-// `tests_need_std` flag flips this crate's `std` feature on so
-// libtest's panic=unwind harness can link.
-#![cfg_attr(all(not(test), not(feature = "std")), no_std)]
+// (no-std + `extern crate` declarations live in lib.rs after the
+// merger from //net:tls into //uni-tls. `tls_crypto` was a separate
+// crate; it's now this crate's sibling `aead` module.)
 
-extern crate hkdf;
-extern crate hmac;
-extern crate net_tls_crypto as tls_crypto;
-extern crate sha2;
-extern crate x25519_dalek;
-
+use crate::aead as tls_crypto;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};

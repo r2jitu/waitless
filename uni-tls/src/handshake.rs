@@ -43,8 +43,10 @@
 //   echoing the `selected_identity` index. Higher layers do the
 //   actual ticket sealing/opening + binder verification.
 
-// See .bazelrc for why this is `cfg_attr(not(test), no_std)` and not bare `#![no_std]`.
-#![cfg_attr(not(test), no_std)]
+// (no-std declaration lives in lib.rs after the merger from
+// //net:tls_handshake into //uni-tls. This file has no external
+// crate deps — pure byte-slice parsing/encoding — so there's
+// nothing else to migrate.)
 
 // ============================================================================
 // Constants

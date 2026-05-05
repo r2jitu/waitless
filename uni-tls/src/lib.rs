@@ -1,42 +1,43 @@
-// uni-tls — TLS 1.3 for HTTPS-over-TCP and TLS-over-QUIC.
+// uni-tls — TLS 1.3 protocol stack for HTTPS-over-TCP.
 //
-// Top-level layout under `src/`:
+// Owns the full TLS 1.3 implementation: sans-io primitives that
+// were previously split across `//net/tls{,_crypto,_handshake,_record}`,
+// plus the TCP-specific record-layer driver and the per-connection
+// server state machine. After the //net→//uni-tls merger this is
+// one cohesive crate; `//uni-quic` reuses the sans-io modules
+// (`schedule`, `aead`, `handshake`) but skips `record` (which is
+// TCP-specific) and substitutes its own CRYPTO-frame I/O.
 //
-//   tcp/   TLS 1.3 server state machine for the HTTPS-over-TCP
-//          path. The `TlsServer` connection state, the handshake
-//          handlers, the per-stage profiler, the session-ticket
-//          envelope, and the diagnostic trace module live here.
-//          A future `tcp/client.rs` would slot in alongside.
-//   quic/  TLS-over-QUIC stack: `QuicTls` handshake driver
-//          (CRYPTO-frame I/O), the `Connection` state machine,
-//          the per-conn `ConnInbox` async queue, and the UDP
-//          listener (`quic_listen` + `QuicListener`). A future
-//          `quic/client.rs` slots in alongside.
+// Module layout (flat under `src/`):
 //
-// The two transports share the lower-level protocol primitives
-// from `//net` (`tls`, `tls_handshake`, `tls_record`, `tls_crypto`,
-// `quic_wire`, `quic_crypto`, `quic_frame`); this crate composes
-// them into transport-specific server stacks. Apps that don't
-// import `uni_tls` link zero TLS / crypto code — the trait
-// boundary in `uni_http` keeps the dependency graph clean.
+//   lib.rs       public API + acceptor wiring + uni_http::Tls impl
+//   schedule.rs  TLS 1.3 key schedule, transcript, X25519, HKDF math
+//   aead.rs      ChaCha20-Poly1305 wrapper (the only AEAD TLS-over-
+//                  TCP needs; AES-128-GCM lives in //uni-quic for
+//                  Initial-packet protection)
+//   handshake.rs ClientHello parser, server-flight builders,
+//                  signature-content shaper, finished helpers
+//   record.rs    TLS record framing (TCP-specific)
+//   server.rs    TlsServer connection state machine + state enum
+//   handlers.rs  do_client_hello / do_client_finished / do_app_data
+//   keys.rs      finished_key derivation + ct_eq_32 + HMAC helpers
+//                  (small protocol math used by handlers + ticket)
+//   profile.rs   per-stage handshake timing diagnostics
+//   ticket.rs    session-resumption ticket envelope
+//   trace.rs     diagnostic tracing (cfg(tls_debug))
 //
-// `//net` provides the lower-level protocol primitives that are
-// shared with the future QUIC stack (`net_tls_crypto`,
-// `net_tls_handshake`, `net_tls_record`, `net_tls`); this crate
-// composes them into the TLS-over-stream server. Apps that don't
-// import `uni_tls` link zero TLS / crypto code — the trait
-// boundary in `uni_http` keeps the dependency graph clean.
+// Public surface (re-exported through this module's root):
+//   * `acceptor(cert, key)` — TLS acceptor for `uni_http::listen_https`.
+//   * `listen(port, handler, cert, key)` — one-call HTTPS server.
+//   * `TlsServerConfig` — typed cert + key bundle.
+//   * `tls_profile_report` / `tls_profile_reset` — diagnostics.
+//   * `TlsError`, `ListenError` — failure modes.
 //
-// Public surface:
-//   * `acceptor(cert, key)` — parses cert + key, returns the
-//     `Arc<dyn uni_http::Tls>` that `uni_http::listen_https`
-//     consumes.
-//   * `TlsServerConfig` — typed cert + key bundle, exposed for
-//     advanced uses (custom ALPN, future per-connection cert
-//     selection).
-//   * `tls_profile_report` / `tls_profile_reset` — handshake
-//     timing diagnostics.
-//   * `TlsError` — failure to parse cert / key DER.
+// Sans-io modules (`schedule`, `aead`, `handshake`) are also `pub`
+// so `//uni-quic` can reach into them without going through the
+// TCP-server wrappers. Apps consuming `uni-tls` for HTTPS only
+// don't import them directly — the public API hides them behind
+// `acceptor` / `listen`.
 
 // Stays no_std in production. Under `bazel test`, the
 // `tests_need_std` flag flips this crate's `std` feature on so
@@ -49,10 +50,31 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 
-mod tcp;
-pub mod quic;
+// Sans-io TLS primitives (formerly //net:tls{,_crypto,_handshake,_record}).
+// Pub because //uni-quic reaches into `schedule`, `aead`, `handshake`
+// for the TLS-handshake-over-CRYPTO-frames driver. `record` stays
+// pub for symmetry; it's TCP-only but the wider audience doesn't
+// pay any cost — LTO drops it from QUIC binaries.
+pub mod aead;
+pub mod handshake;
+pub mod record;
+pub mod schedule;
 
-pub use tcp::TlsServerConfig;
+// TLS-over-TCP server state machine. (`//uni-quic` lives in its
+// own crate now and depends on this one for the sans-io TLS bits.)
+pub mod server;
+
+// Submodules of the server stack. `pub` so `//uni-quic` can reuse
+// `keys::{ct_eq_32, derive_finished_key, hmac_sha256}` (RFC 8446
+// §4.4.4 finished-key + helpers) and `profile` for the shared
+// per-stage timing accumulator.
+pub mod handlers;
+pub mod keys;
+pub mod profile;
+pub mod ticket;
+pub mod trace;
+
+pub use server::TlsServerConfig;
 
 /// Cert / key parse failure. Apps treat this as "TLS not
 /// available" and fall back to plain HTTP.
@@ -94,15 +116,6 @@ pub enum ListenError {
 /// One-call HTTPS listener. Builds a TLS acceptor from `cert_der`
 /// / `key_der` and starts the HTTPS server on `port` with `handler`
 /// dispatching every parsed `Request`.
-///
-/// Equivalent to:
-/// ```ignore
-/// let tls = uni_tls::acceptor(cert_der, key_der)?;
-/// uni_http::listen_https(port, handler, tls)?;
-/// ```
-/// — but without the intermediate `acceptor` variable. Use
-/// [`acceptor`] + [`uni_http::listen_https`] directly if you want
-/// to share one TLS context across multiple ports.
 pub fn listen<H>(
     port: u16,
     handler: H,
@@ -122,22 +135,16 @@ where
 /// this as the body of a debug endpoint (`/tls_profile`) to
 /// inspect per-stage handshake timings.
 pub fn tls_profile_report(out: &mut [u8]) -> usize {
-    tcp::profile::report(out)
+    profile::report(out)
 }
 
 /// Reset the TLS handshake profile accumulators. Useful between
 /// benchmark runs.
 pub fn tls_profile_reset() {
-    tcp::profile::reset();
+    profile::reset();
 }
 
 // ---- uni_http::Tls impl ------------------------------------------------------
-//
-// Thin wrappers over `server::{TlsServer, TlsServerConfig}`. The
-// outer `TlsImpl` holds an `Arc<TlsServerConfig>` shared by every
-// accepted connection; each per-conn `TlsConnImpl` keeps its own
-// clone so `advance()` can pass the config to the state machine
-// without needing a back-ref to the outer struct.
 
 struct TlsImpl {
     cfg: Arc<TlsServerConfig>,
@@ -146,14 +153,14 @@ struct TlsImpl {
 impl uni_http::Tls for TlsImpl {
     fn new_connection(&self, seed: [u8; 32]) -> Box<dyn uni_http::TlsConn> {
         Box::new(TlsConnImpl {
-            tls: tcp::TlsServer::new(seed),
+            tls: server::TlsServer::new(seed),
             cfg: self.cfg.clone(),
         })
     }
 }
 
 struct TlsConnImpl {
-    tls: tcp::TlsServer,
+    tls: server::TlsServer,
     cfg: Arc<TlsServerConfig>,
 }
 

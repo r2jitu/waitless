@@ -15,23 +15,16 @@ use alloc::boxed::Box;
 
 use p256::ecdsa::SigningKey;
 
-use net_tls_handshake::ParseError;
-use net_tls_record::{content_type, seal as record_seal, RecordError};
-use net_tls::{KeySchedule, TrafficKey, Transcript, X25519ServerKey, HASH_LEN};
+use crate::handshake::ParseError;
+use crate::record::{content_type, seal as record_seal, RecordError};
+use crate::schedule::{KeySchedule, TrafficKey, Transcript, X25519ServerKey, HASH_LEN};
 
-// Re-export sibling crates under short names so the file-internal
-// references match the original net/tls_server.rs naming. `pub
-// (super)` on `tls` / `record` lets the submodules in `server/`
-// reach them via `super::tls` / `super::record`.
-pub(super) use net_tls as tls;
-pub(super) use net_tls_handshake as handshake;
-pub(super) use net_tls_record as record;
-
-pub(crate) mod keys;
-mod trace;
-pub mod profile;
-mod handlers;
-pub mod ticket;
+// File-local aliases. Sibling modules of this crate referenced
+// throughout the file body keep their original short names
+// (`tls`, `record`) so the body matches the prose in RFC 8446
+// without `crate::` clutter.
+use crate::record;
+use crate::schedule as tls;
 
 // ============================================================================
 // Tunables
@@ -508,7 +501,7 @@ impl TlsServer {
                 State::Closed | State::Failed => return Ok(self.state),
             };
             if let Err(e) = step_result {
-                trace::error(before_state, &e);
+                crate::trace::error(before_state, &e);
                 return Err(e);
             }
             let progressed = self.state != before_state
