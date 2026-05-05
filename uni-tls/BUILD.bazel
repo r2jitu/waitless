@@ -30,8 +30,13 @@ rust_library(
         "src/server/handlers.rs",
         "src/server/keys.rs",
         "src/server/profile.rs",
+        "src/server/quic.rs",
         "src/server/ticket.rs",
         "src/server/trace.rs",
+    ],
+    compile_data = [
+        "//apps/webserver/dev_certs:dev_cert.der",
+        "//apps/webserver/dev_certs:dev_key.der",
     ],
     crate_features = select({
         "//bazel/rules:tests_need_std_on": ["std"],

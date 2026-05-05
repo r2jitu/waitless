@@ -32,6 +32,7 @@ mod trace;
 pub mod profile;
 mod handlers;
 pub mod ticket;
+pub mod quic;
 
 // ============================================================================
 // Tunables
