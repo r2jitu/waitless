@@ -348,7 +348,7 @@ impl TlsServer {
         // EncryptedExtensions
         let mut ee_body = [0u8; 16];
         let ee_body_len =
-            build_encrypted_extensions(&mut ee_body).ok_or(HandshakeError::Internal)?;
+            build_encrypted_extensions(None, &mut ee_body).ok_or(HandshakeError::Internal)?;
         let mut ee_msg = [0u8; 32];
         let ee_msg_len = encode_handshake(
             msg_type::ENCRYPTED_EXTENSIONS,

@@ -172,6 +172,19 @@ pub struct QuicTls {
     /// once the relevant transition fires. `None` before then.
     handshake_secrets: Option<HandshakeSecrets>,
     application_secrets: Option<ApplicationSecrets>,
+
+    /// QUIC transport parameters (RFC 9000 §18) the server will
+    /// advertise inside EncryptedExtensions. Set by the connection
+    /// state machine before the first `advance`. Empty until set —
+    /// in that case we still advertise a `quic_transport_parameters`
+    /// extension with an empty body, which is technically invalid
+    /// per RFC 9001 §8.2 but never observed in production because
+    /// the connection layer always populates this.
+    server_transport_params: Vec<u8>,
+
+    /// Client-side transport parameters captured from the
+    /// ClientHello. `None` until ClientHello has been parsed.
+    client_transport_params: Option<Vec<u8>>,
 }
 
 impl QuicTls {
@@ -190,7 +203,24 @@ impl QuicTls {
             tx_handshake: Vec::new(),
             handshake_secrets: None,
             application_secrets: None,
+            server_transport_params: Vec::new(),
+            client_transport_params: None,
         }
+    }
+
+    /// Set the server's transport parameter blob. The connection
+    /// state machine constructs this once it knows its `local_cid`
+    /// (used for `initial_source_connection_id`) and the original
+    /// destination CID from the client's first Initial.
+    pub fn set_server_transport_params(&mut self, params: Vec<u8>) {
+        self.server_transport_params = params;
+    }
+
+    /// Client transport parameters the server learned from the
+    /// `quic_transport_parameters` extension in ClientHello. `None`
+    /// until ClientHello has been processed.
+    pub fn client_transport_params(&self) -> Option<&[u8]> {
+        self.client_transport_params.as_deref()
     }
 
     /// Current state — caller checks for `Established` to know
@@ -314,6 +344,10 @@ impl QuicTls {
             let n = ch.legacy_session_id.len();
             sid[..n].copy_from_slice(ch.legacy_session_id);
             let pk = ch.x25519_client_pub.ok_or(QuicTlsError::UnsupportedClient)?;
+            // Capture quic_transport_parameters into an owned Vec
+            // before dropping the borrow.
+            self.client_transport_params =
+                ch.quic_transport_parameters.map(|s| s.to_vec());
             (pk, sid, n)
         };
 
@@ -354,10 +388,21 @@ impl QuicTls {
         self.handshake_secrets = Some(hs_secrets);
 
         // ── EncryptedExtensions (Handshake-level CRYPTO output) ─
-        let mut ee_body = [0u8; 16];
+        // Inject the server's quic_transport_parameters as the lone
+        // negotiated extension (RFC 9001 §8.2). Body fits comfortably
+        // in 256 bytes — our defaults plus the two CIDs are <50 bytes.
+        let mut ee_body = alloc::vec![0u8; 256];
+        let extra = if !self.server_transport_params.is_empty() {
+            Some((
+                uni_tls::handshake::ext_type::QUIC_TRANSPORT_PARAMETERS,
+                self.server_transport_params.as_slice(),
+            ))
+        } else {
+            None
+        };
         let ee_body_len =
-            build_encrypted_extensions(&mut ee_body).ok_or(QuicTlsError::Internal)?;
-        let mut ee_msg = [0u8; 32];
+            build_encrypted_extensions(extra, &mut ee_body).ok_or(QuicTlsError::Internal)?;
+        let mut ee_msg = alloc::vec![0u8; 256 + 16];
         let ee_msg_len = encode_handshake(
             msg_type::ENCRYPTED_EXTENSIONS,
             &ee_body[..ee_body_len],

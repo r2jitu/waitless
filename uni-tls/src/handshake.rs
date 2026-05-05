@@ -79,6 +79,10 @@ pub mod ext_type {
     /// a PSK offer.
     pub const PSK_KEY_EXCHANGE_MODES: u16 = 45;
     pub const KEY_SHARE: u16 = 51;
+    /// `quic_transport_parameters` (RFC 9001 §8.2). Carries the
+    /// peer's `transport_parameters` TLV blob inside ClientHello /
+    /// EncryptedExtensions when TLS is layered under QUIC.
+    pub const QUIC_TRANSPORT_PARAMETERS: u16 = 0x39;
 }
 
 /// PskKeyExchangeMode wire values (RFC 8446 §4.2.9), plus convenience
@@ -266,6 +270,11 @@ pub struct ClientHello<'a> {
     /// when the extension is absent. We only accept resumption when
     /// `FLAG_PSK_DHE_KE` is set (forward secrecy required).
     pub psk_ke_modes: u8,
+    /// Raw bytes of the `quic_transport_parameters` extension if
+    /// the client sent one. `None` for plain TLS-over-TCP CHs;
+    /// QUIC clients always include this. The server interprets
+    /// the bytes via `uni_quic::transport_params::parse_client_params`.
+    pub quic_transport_parameters: Option<&'a [u8]>,
 }
 
 impl<'a> ClientHello<'a> {
@@ -339,6 +348,7 @@ impl<'a> ClientHello<'a> {
         let mut observed_sig_alg_count: u8 = 0;
         let mut psk: Option<PskOffer<'a>> = None;
         let mut psk_ke_modes: u8 = 0;
+        let mut quic_transport_parameters: Option<&'a [u8]> = None;
 
         while !er.is_empty() {
             // Snapshot the position of *this* extension's type byte
@@ -518,6 +528,11 @@ impl<'a> ClientHello<'a> {
                         return Err(ParseError::BadExtension);
                     }
                 }
+                ext_type::QUIC_TRANSPORT_PARAMETERS => {
+                    // Body is opaque to the TLS parser — the QUIC layer
+                    // decodes the TLV stream via `parse_client_params`.
+                    quic_transport_parameters = Some(ext_data);
+                }
                 _ => { /* ignore extensions we don't care about */ }
             }
         }
@@ -545,6 +560,7 @@ impl<'a> ClientHello<'a> {
             observed_sig_alg_count,
             psk,
             psk_ke_modes,
+            quic_transport_parameters,
         })
     }
 }
@@ -661,20 +677,38 @@ pub fn build_server_hello(
 // EncryptedExtensions builder (RFC 8446 §4.3.1)
 // ============================================================================
 
-/// Build an EncryptedExtensions message body. For our use case the
-/// extensions list is empty — we don't negotiate ALPN, SNI, early data,
-/// supported_groups_in_eerror, or any of the other things that go here.
-/// An empty body is just `[0x00, 0x00]` (u16 extensions_length = 0).
+/// Build an EncryptedExtensions message body.
 ///
-/// Returns the number of bytes written. `out` must have at least 2 bytes.
-pub fn build_encrypted_extensions(out: &mut [u8]) -> Option<usize> {
-    if out.len() < 2 {
+/// `extra` lets the caller append a single extension. The TLS-over-TCP
+/// path passes `None` (no negotiated extensions); the QUIC path passes
+/// `Some((QUIC_TRANSPORT_PARAMETERS, params_blob))` to advertise
+/// flow-control limits as required by RFC 9001 §8.2.
+///
+/// Wire layout: `u16 extensions_length || (extension_envelope ...)`.
+/// Each extension envelope is `u16 ext_type || u16 ext_len || bytes`.
+///
+/// Returns the number of bytes written. `out` must have at least 2 bytes
+/// (empty list) or `2 + 4 + extra.len()` (single-extension list).
+pub fn build_encrypted_extensions(
+    extra: Option<(u16, &[u8])>,
+    out: &mut [u8],
+) -> Option<usize> {
+    let body_len = match extra {
+        Some((_, data)) => 4 + data.len(),
+        None => 0,
+    };
+    if body_len > 0xffff || out.len() < 2 + body_len {
         return None;
     }
-    // Extensions length = 0.
-    out[0] = 0;
-    out[1] = 0;
-    Some(2)
+    out[0] = ((body_len >> 8) & 0xff) as u8;
+    out[1] = (body_len & 0xff) as u8;
+    if let Some((ty, data)) = extra {
+        out[2..4].copy_from_slice(&ty.to_be_bytes());
+        let len = data.len() as u16;
+        out[4..6].copy_from_slice(&len.to_be_bytes());
+        out[6..6 + data.len()].copy_from_slice(data);
+    }
+    Some(2 + body_len)
 }
 
 // ============================================================================
@@ -1136,9 +1170,29 @@ mod tests {
     #[test]
     fn encrypted_extensions_is_empty_extension_list() {
         let mut out = [0u8; 8];
-        let n = build_encrypted_extensions(&mut out).unwrap();
+        let n = build_encrypted_extensions(None, &mut out).unwrap();
         assert_eq!(n, 2);
         assert_eq!(&out[..n], &[0x00, 0x00]);
+    }
+
+    #[test]
+    fn encrypted_extensions_with_quic_transport_parameters() {
+        // Two-byte body, ext_type = 0x0039.
+        let blob = [0xab, 0xcd];
+        let mut out = [0u8; 16];
+        let n =
+            build_encrypted_extensions(Some((ext_type::QUIC_TRANSPORT_PARAMETERS, &blob)), &mut out)
+                .unwrap();
+        // body = ext_type(2) + ext_len(2) + blob(2) = 6 → total = 2 + 6.
+        assert_eq!(n, 8);
+        // u16 extensions_length (big-endian) = 6.
+        assert_eq!(&out[..2], &[0x00, 0x06]);
+        // ext_type
+        assert_eq!(&out[2..4], &[0x00, 0x39]);
+        // ext_len
+        assert_eq!(&out[4..6], &[0x00, 0x02]);
+        // blob
+        assert_eq!(&out[6..8], &blob);
     }
 
     #[test]

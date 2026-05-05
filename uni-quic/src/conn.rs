@@ -413,6 +413,20 @@ impl Connection {
             self.initial_send = Some(DirKeys::from_initial(&server_keys));
             self.initial_recv = Some(DirKeys::from_initial(&client_keys));
             self.state = ConnState::Connecting;
+
+            // Build server transport parameters (RFC 9001 §8.2).
+            // `original_destination_connection_id` = client's first
+            // DCID; `initial_source_connection_id` = our chosen SCID.
+            let server_params = {
+                let p = crate::transport_params::ServerParams::defaults(
+                    self.initial_dcid.as_slice(),
+                    self.local_cid.as_slice(),
+                );
+                let mut blob = Vec::with_capacity(64);
+                p.encode(&mut blob);
+                blob
+            };
+            self.tls.set_server_transport_params(server_params);
         }
 
         let total_packet_len = header.pn_offset + header.length as usize;

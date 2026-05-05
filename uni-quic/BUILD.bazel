@@ -20,6 +20,7 @@ rust_library(
         # Sans-io QUIC primitives (formerly //net:quic_{wire,frame,crypto}).
         "src/crypto.rs",
         "src/frame.rs",
+        "src/transport_params.rs",
         "src/wire.rs",
         # TLS-handshake-over-CRYPTO-frames driver + connection state
         # machine + async inbox + UDP endpoint.

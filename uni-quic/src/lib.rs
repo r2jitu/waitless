@@ -61,6 +61,7 @@ pub mod endpoint;
 pub mod frame;
 pub mod inbox;
 pub mod tls;
+pub mod transport_params;
 pub mod wire;
 
 pub use conn::{ConnError, ConnState, Connection, ConnectionId, SERVER_CID_LEN};
