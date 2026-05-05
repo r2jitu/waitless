@@ -7,8 +7,11 @@
 //   * `ipv6_send(src, dst, next_header, hop_limit, payload)` —
 //     resolves the destination MAC via the NDP cache (or the
 //     33:33:* deterministic mapping for multicast). On unicast
-//     cache miss the packet is dropped — active Neighbor
-//     Solicitation isn't implemented yet.
+//     cache miss, sends a Neighbor Solicitation to the dst's
+//     solicited-node multicast and drops the original packet —
+//     same pattern as `ipv4_send` on ARP miss. The upper layer
+//     (TCP retransmit / UDP best-effort) is responsible for
+//     retrying once the NA arrives and the cache fills.
 //   * `ipv6_send_to_mac(src, dst, dst_mac, ...)` — caller already
 //     knows the destination MAC (e.g. the inbound frame's source
 //     for a receive-path reply). Skips NDP entirely.
@@ -16,6 +19,7 @@
 #![no_std]
 
 extern crate net_ethernet as ethernet;
+extern crate net_icmpv6 as icmpv6;
 extern crate net_ipv6 as ipv6;
 extern crate net_ndp as ndp;
 extern crate net_types as types;
@@ -42,12 +46,44 @@ pub fn ipv6_send(
     } else {
         match ndp::ndp_resolve(dst) {
             Some(m) => m,
-            // Unknown peer — drop. Active NDP Neighbor Solicitation
-            // would queue + retry; that's a Phase 5d follow-up.
-            None => return,
+            None => {
+                // Cache miss → fire a Neighbor Solicitation to
+                // the dst's solicited-node multicast, drop the
+                // original packet. Symmetric with `ipv4_send`'s
+                // ARP-miss behaviour: TCP will retransmit once
+                // the NA fills the cache; UDP's best-effort
+                // semantics handle the loss naturally.
+                solicit(src, dst);
+                return;
+            }
         }
     };
     ipv6_send_to_mac(src, dst, dst_mac, next_header, hop_limit, payload);
+}
+
+/// Send a Neighbor Solicitation for `target`. Source = our `src`
+/// (typically link-local), destination = solicited-node multicast
+/// for `target` (`ff02::1:ffXX:XXXX`). Dst MAC is the deterministic
+/// `33:33:ff:XX:XX:XX` mapping (RFC 2464 §7) — no recursive NDP.
+/// SLLA option carries our MAC so the peer can reply with an NA
+/// directly to us without itself doing a lookup first.
+fn solicit(src: &Ipv6Addr, target: &Ipv6Addr) {
+    let our_mac = ethernet::ethernet_our_mac();
+    if our_mac == MacAddr::ZERO {
+        return; // no NIC initialised → can't solicit
+    }
+    let snm = Ipv6Addr::solicited_node(target);
+    let mut icmp = [0u8; 32];
+    let n = match icmpv6::build_neighbor_solicitation(src, &snm, target, &our_mac, &mut icmp) {
+        Some(n) => n,
+        None => return,
+    };
+    let mut buf = [0u8; 1500];
+    let total = match ipv6::ipv6_build(src, &snm, ipv6::next_header::ICMPV6, 255, &icmp[..n], &mut buf) {
+        Some(t) => t,
+        None => return,
+    };
+    ethernet_send(snm.multicast_mac(), ETHERTYPE_IPV6, &buf[..total]);
 }
 
 /// Send an IPv6 packet to a known MAC. Used by the receive-path

@@ -173,7 +173,9 @@ rust_library(
 # NDP MAC resolution and ethernet_send. Mirrors `ipv4_send`'s
 # place in the dependency graph: TCP / UDP / the umbrella
 # receive-path reply code link against this rather than wiring
-# raw `ethernet_send` themselves.
+# raw `ethernet_send` themselves. On NDP cache miss it issues an
+# active Neighbor Solicitation (deps `:icmpv6` for the NS
+# builder).
 rust_library(
     name = "ipv6_send",
     srcs = ["src/ipv6_send.rs"],
@@ -181,6 +183,7 @@ rust_library(
     crate_root = "src/ipv6_send.rs",
     deps = [
         ":ethernet",
+        ":icmpv6",
         ":ipv6",
         ":ndp",
         ":types",
