@@ -60,6 +60,7 @@ pub mod crypto;
 pub mod endpoint;
 pub mod frame;
 pub mod inbox;
+pub mod streams;
 pub mod tls;
 pub mod transport_params;
 pub mod wire;

@@ -32,17 +32,17 @@
 
 #![allow(dead_code)]
 
-use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use core::cell::{Cell, RefCell};
 use core::future::Future;
 
 use crate::wire::{long_packet_type, parse_long_header_preamble, FIXED_BIT, HEADER_FORM_LONG};
 
-use uni::runtime::{spawn, UdpSocket};
+use uni::runtime::{spawn, AsyncEvent, UdpSocket};
 
 use crate::conn::{ConnState, Connection, ConnectionId};
 use crate::inbox::{
@@ -74,18 +74,35 @@ pub struct QuicListener {
 }
 
 /// Public per-connection handle the user's handler closure
-/// receives. Today it's a thin wrapper around the Connection's
-/// state — once streams land, this is where `accept_stream` and
-/// `recv` / `send` will live.
+/// receives. Wraps an `Rc<RefCell<Connection>>` shared with the
+/// conn task plus the metadata needed to send replies and wait
+/// for new stream activity. Both halves run on the same worker —
+/// no cross-worker locking, just RefCell + an `AsyncEvent` for
+/// waking the handler when new data arrives.
 pub struct QuicConn {
-    /// `Rc` because `ConnInbox` is `!Send + !Sync` (RefCell-backed).
-    /// The handler future runs on the same worker as the conn task,
-    /// so this is sound — the Rc never crosses workers.
-    _inbox: Rc<ConnInbox>,
-    /// `Arc` because `UdpSocket` came across the worker boundary.
-    /// Handler can clone this freely to send replies from any
-    /// async sub-task it spawns inside the connection.
-    _sock: Arc<UdpSocket>,
+    /// Same `Connection` the conn task drives. The handler reads
+    /// stream state via shared borrows + writes outbound via
+    /// short mutable borrows, never holding a borrow across an
+    /// `.await`.
+    conn: Rc<RefCell<Connection>>,
+    /// Cert / key bundle. Needed by `flush()` to drive the TLS
+    /// state machine even when we're emitting only application
+    /// data on an already-Established connection.
+    cfg: Arc<TlsServerConfig>,
+    /// UDP socket used for outbound packets (the same one the
+    /// listener bound).
+    sock: Arc<UdpSocket>,
+    /// Peer 4-tuple. Updated by the conn task on every inbound
+    /// datagram so connection migration "just works" — handler
+    /// reads the latest values when it sends a reply.
+    peer_ip: Rc<Cell<[u8; 4]>>,
+    peer_port: Rc<Cell<u16>>,
+    /// Wakes the handler when the conn task ingested an inbound
+    /// datagram (new stream data may be available, conn state
+    /// may have changed). Manual-reset; consumer drives the
+    /// reset cycle via the await loop in `accept_stream` /
+    /// `recv`.
+    progress: Rc<AsyncEvent>,
     /// The local CID we issued for this connection. App code can
     /// log it as a connection identifier. Stored as bytes since
     /// `ConnectionId` itself is internal.
@@ -93,11 +110,109 @@ pub struct QuicConn {
 }
 
 impl QuicConn {
-    /// True once the QUIC handshake completed and 1-RTT is open.
-    /// (Until streams land, this is the only useful state to
-    /// expose to handler code.)
+    /// Local CID we issued — useful as a connection identifier in
+    /// logs / handler diagnostics.
     pub fn local_cid(&self) -> [u8; SERVER_CID_LEN] {
         self.local_cid
+    }
+
+    /// Await the next stream the peer has opened. Returns `None`
+    /// if the connection failed before any stream arrived.
+    pub async fn accept_stream(&self) -> Option<u64> {
+        loop {
+            {
+                let mut c = self.conn.borrow_mut();
+                if let Some(id) = c.pop_accepted_stream() {
+                    return Some(id);
+                }
+                if matches!(c.state(), ConnState::Failed) {
+                    return None;
+                }
+            }
+            self.progress.reset();
+            // Re-check after reset to close the wake / observe race.
+            {
+                let mut c = self.conn.borrow_mut();
+                if let Some(id) = c.pop_accepted_stream() {
+                    return Some(id);
+                }
+                if matches!(c.state(), ConnState::Failed) {
+                    return None;
+                }
+            }
+            self.progress.wait().await;
+        }
+    }
+
+    /// Read up to `out.len()` bytes from stream `sid`. Returns
+    /// `(bytes_copied, eof)`. `eof = true` once FIN has been
+    /// observed AND every byte has been drained.
+    pub async fn recv(&self, sid: u64, out: &mut [u8]) -> (usize, bool) {
+        loop {
+            {
+                let mut c = self.conn.borrow_mut();
+                let (n, eof) = c.stream_recv(sid, out);
+                if n > 0 || eof {
+                    return (n, eof);
+                }
+                if matches!(c.state(), ConnState::Failed) {
+                    return (0, true);
+                }
+            }
+            self.progress.reset();
+            {
+                let mut c = self.conn.borrow_mut();
+                let (n, eof) = c.stream_recv(sid, out);
+                if n > 0 || eof {
+                    return (n, eof);
+                }
+                if matches!(c.state(), ConnState::Failed) {
+                    return (0, true);
+                }
+            }
+            self.progress.wait().await;
+        }
+    }
+
+    /// Append bytes to stream `sid`'s send queue and immediately
+    /// drain any outbound packets onto the wire. Synchronous: by
+    /// the time `send` returns, the bytes have been sealed into
+    /// 1-RTT packets and `sendto`'d on the UDP socket.
+    pub fn send(&self, sid: u64, data: &[u8]) {
+        {
+            let mut c = self.conn.borrow_mut();
+            c.stream_send(sid, data);
+            let _ = c.flush(&self.cfg);
+        }
+        self.drain_outbound();
+    }
+
+    /// Mark stream `sid` as closed (FIN). The next outbound STREAM
+    /// frame will carry the FIN flag. Drains any packets the
+    /// flush produced.
+    pub fn close_stream(&self, sid: u64) {
+        {
+            let mut c = self.conn.borrow_mut();
+            c.stream_close(sid);
+            let _ = c.flush(&self.cfg);
+        }
+        self.drain_outbound();
+    }
+
+    fn drain_outbound(&self) {
+        let mut out = vec![0u8; 1500];
+        loop {
+            let n = {
+                let mut c = self.conn.borrow_mut();
+                c.pop_packet(&mut out)
+            };
+            if n == 0 {
+                break;
+            }
+            let _ = self
+                .sock
+                .send_to(self.peer_ip.get(), self.peer_port.get(), &out[..n]);
+        }
     }
 }
 
@@ -262,7 +377,10 @@ async fn conn_task<H, F>(
     H: Fn(QuicConn) -> F + Send + Sync + 'static,
     F: Future<Output = ()> + 'static,
 {
-    let mut conn = Box::new(Connection::new_server(local_cid, seed));
+    let conn = Rc::new(RefCell::new(Connection::new_server(local_cid, seed)));
+    let progress = Rc::new(AsyncEvent::new());
+    let peer_ip: Rc<Cell<[u8; 4]>> = Rc::new(Cell::new([0; 4]));
+    let peer_port: Rc<Cell<u16>> = Rc::new(Cell::new(0));
     let mut handler_spawned = false;
 
     loop {
@@ -270,35 +388,45 @@ async fn conn_task<H, F>(
             Some(d) => d,
             None => break, // inbox closed
         };
-        let peer_ip = dgram.src_ip;
-        let peer_port = dgram.src_port;
-        if conn.process_datagram(&dgram.bytes, &cfg).is_err() {
+        peer_ip.set(dgram.src_ip);
+        peer_port.set(dgram.src_port);
+        // Process the datagram. Borrow is short and dropped before
+        // the outbound drain loop borrows again.
+        let result = conn.borrow_mut().process_datagram(&dgram.bytes, &cfg);
+        if result.is_err() {
             break;
         }
 
-        // Drain outbound packets to the peer.
+        // Drain outbound packets to the peer. Each iteration
+        // borrows the cell briefly, drops, then `send_to`'s.
         let mut out = vec![0u8; 1500];
         loop {
-            let n = conn.pop_packet(&mut out);
+            let n = conn.borrow_mut().pop_packet(&mut out);
             if n == 0 {
                 break;
             }
-            let _ = sock.send_to(peer_ip, peer_port, &out[..n]);
+            let _ = sock.send_to(peer_ip.get(), peer_port.get(), &out[..n]);
         }
 
+        // Wake the handler in case new stream data arrived.
+        progress.set();
+
         // Once the handshake completes, spawn the user's handler
-        // as its OWN task on this worker. The conn task continues
-        // pumping the connection's inbox (handshake-stage retransmits,
-        // 1-RTT key updates, future stream-flow frames); the handler
-        // task awaits whatever stream-layer primitives we expose
-        // through `QuicConn`. Splitting the two means a slow
-        // handler can't stall the connection's wire-level service,
-        // and the conn task keeps short, predictable poll cycles.
-        if !handler_spawned && matches!(conn.state(), ConnState::Established) {
+        // as its OWN task on this worker. The conn task keeps
+        // pumping the connection's inbox (retransmits, future
+        // 1-RTT control frames); the handler awaits stream
+        // primitives. Splitting the two means a slow handler
+        // can't stall wire-level service.
+        let est = matches!(conn.borrow().state(), ConnState::Established);
+        if !handler_spawned && est {
             handler_spawned = true;
             let qconn = QuicConn {
-                _inbox: inbox.clone(),
-                _sock: Arc::clone(&sock),
+                conn: Rc::clone(&conn),
+                cfg: cfg.clone(),
+                sock: Arc::clone(&sock),
+                peer_ip: Rc::clone(&peer_ip),
+                peer_port: Rc::clone(&peer_port),
+                progress: Rc::clone(&progress),
                 local_cid: local_cid_bytes,
             };
             let handler_fn = handler.clone();
@@ -307,10 +435,14 @@ async fn conn_task<H, F>(
             });
         }
 
-        if matches!(conn.state(), ConnState::Failed) {
+        if matches!(conn.borrow().state(), ConnState::Failed) {
+            // Wake the handler one last time so its await loops
+            // can observe `Failed` and exit.
+            progress.set();
             break;
         }
     }
+    progress.set();
     // Inbox closed or fatal error — drop everything. The slot
     // table's Weak pointer to `inbox` will fail to upgrade on the
     // next allocator pass, freeing the slot implicitly.

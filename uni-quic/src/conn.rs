@@ -276,6 +276,19 @@ pub struct Connection {
     /// any header-protected, AEAD-sealed packets) ready to ship.
     /// `pop_packet` drains the front entry.
     outbound: Vec<Vec<u8>>,
+
+    /// Per-stream receive state, keyed by stream ID. Lazily
+    /// inserted on the first STREAM frame.
+    recv_streams: alloc::collections::BTreeMap<u64, crate::streams::RecvStream>,
+
+    /// Per-stream send state, keyed by stream ID. Lazily inserted
+    /// the first time the app calls `stream_send` for a stream.
+    send_streams: alloc::collections::BTreeMap<u64, crate::streams::SendStream>,
+
+    /// Stream IDs we've seen at least once, in arrival order. The
+    /// app's `accept_stream` future drains the head; the listener
+    /// is responsible for popping streams it's already accepted.
+    opened_streams: Vec<u64>,
 }
 
 impl Connection {
@@ -311,6 +324,9 @@ impl Connection {
             tls: QuicTls::new(seed),
             handshake_done_sent: false,
             outbound: Vec::new(),
+            recv_streams: alloc::collections::BTreeMap::new(),
+            send_streams: alloc::collections::BTreeMap::new(),
+            opened_streams: Vec::new(),
         }
     }
 
@@ -368,6 +384,68 @@ impl Connection {
     /// for the reactor's wakeup path.
     pub fn has_outbound(&self) -> bool {
         !self.outbound.is_empty()
+    }
+
+    // ── Stream API ─────────────────────────────────────────────
+
+    /// Pop the next stream the peer has opened. Returns `None`
+    /// if no new streams are pending. Caller drives `stream_recv`
+    /// against the returned ID to consume bytes.
+    pub fn pop_accepted_stream(&mut self) -> Option<u64> {
+        if self.opened_streams.is_empty() {
+            None
+        } else {
+            Some(self.opened_streams.remove(0))
+        }
+    }
+
+    /// Read up to `out.len()` bytes from the head of stream `sid`'s
+    /// recv buffer. Returns `(bytes_copied, eof)`. `eof = true` once
+    /// the peer has signaled FIN AND every byte up to it has been
+    /// drained.
+    pub fn stream_recv(&mut self, sid: u64, out: &mut [u8]) -> (usize, bool) {
+        match self.recv_streams.get_mut(&sid) {
+            Some(s) => s.drain(out),
+            None => (0, false),
+        }
+    }
+
+    /// Whether stream `sid` has any buffered bytes ready for the
+    /// app to drain.
+    pub fn stream_has_buffered(&self, sid: u64) -> bool {
+        self.recv_streams
+            .get(&sid)
+            .map(|s| s.has_buffered())
+            .unwrap_or(false)
+    }
+
+    /// Append `data` to stream `sid`'s outbound queue. Bytes go on
+    /// the wire on the next outbound flush. Auto-creates the stream
+    /// state lazily.
+    pub fn stream_send(&mut self, sid: u64, data: &[u8]) {
+        let s = self
+            .send_streams
+            .entry(sid)
+            .or_insert_with(crate::streams::SendStream::default);
+        s.write(data);
+    }
+
+    /// Mark stream `sid` for FIN. The next outbound STREAM frame
+    /// after the buffer drains will carry the FIN flag.
+    pub fn stream_close(&mut self, sid: u64) {
+        let s = self
+            .send_streams
+            .entry(sid)
+            .or_insert_with(crate::streams::SendStream::default);
+        s.close();
+    }
+
+    /// Force a 1-RTT packet emission even if no inbound datagram
+    /// just arrived — caller invokes this after writing data on a
+    /// stream so the connection layer drains the send queue without
+    /// waiting for the next inbound packet.
+    pub fn flush(&mut self, config: &TlsServerConfig) -> Result<(), ConnError> {
+        self.flush_outbound(config)
     }
 
     // ── Inbound packet processing ───────────────────────────────
@@ -494,11 +572,45 @@ impl Connection {
         Ok(total_packet_len)
     }
 
-    fn process_short_header_packet(&mut self, _bytes: &[u8]) -> Result<usize, ConnError> {
-        // 1-RTT packet — DCID length is endpoint-known (= our
-        // SERVER_CID_LEN). We don't need 1-RTT for the handshake
-        // MVP, so accept-and-ignore for now.
-        Ok(_bytes.len())
+    fn process_short_header_packet(&mut self, bytes: &[u8]) -> Result<usize, ConnError> {
+        // Short-header (1-RTT) layout:
+        //   u8 first byte || N-byte DCID || PN bytes || ciphertext || tag.
+        // DCID length is endpoint-known. For our server it's
+        // always SERVER_CID_LEN — the connection pool routed this
+        // datagram to us by matching that prefix.
+        if bytes.len() < 1 + SERVER_CID_LEN + 4 + TAG_LEN {
+            return Err(ConnError::Wire);
+        }
+        let pn_offset = 1 + SERVER_CID_LEN;
+        let recv_keys = self
+            .application_recv
+            .as_ref()
+            .ok_or(ConnError::BadState)?
+            .clone();
+
+        // Short-header packets aren't length-prefixed inside the
+        // datagram — every byte until the end is one packet for us
+        // (no coalescing post-handshake in QUIC v1; receivers MUST
+        // process the whole thing).
+        let total_packet_len = bytes.len();
+        let mut buf = bytes[..total_packet_len].to_vec();
+        let pn = self.unprotect_and_decrypt(&mut buf, pn_offset, &recv_keys)?;
+        let pn_length = ((buf[0] & 0x03) as usize) + 1;
+        let payload_start = pn_offset + pn_length;
+        let payload_end = total_packet_len - TAG_LEN;
+        if payload_end < payload_start {
+            return Err(ConnError::Wire);
+        }
+        let payload = &buf[payload_start..payload_end];
+        self.dispatch_frames(CryptoLevel::OneRtt, payload)?;
+
+        self.application_space.largest_recv_pn = Some(
+            self.application_space
+                .largest_recv_pn
+                .map_or(pn, |x| x.max(pn)),
+        );
+        self.application_space.ack_pending = true;
+        Ok(total_packet_len)
     }
 
     /// Remove header protection AND open the AEAD on a complete
@@ -603,8 +715,26 @@ impl Connection {
                 Frame::HandshakeDone => {
                     // Server only — clients don't send this.
                 }
-                Frame::Stream { .. } => {
-                    // Out of scope for the handshake MVP.
+                Frame::Stream { stream_id, offset, data, fin } => {
+                    if matches!(level, CryptoLevel::OneRtt) {
+                        let s = self
+                            .recv_streams
+                            .entry(stream_id)
+                            .or_insert_with(crate::streams::RecvStream::default);
+                        s.ingest(offset, data, fin);
+                        if !self.opened_streams.contains(&stream_id) {
+                            self.opened_streams.push(stream_id);
+                        }
+                        // Best-effort STREAM-level ack pending so we
+                        // schedule a 1-RTT ACK for it on the next
+                        // outbound flush.
+                        self.application_space.ack_pending = true;
+                    }
+                }
+                Frame::Skipped { .. } => {
+                    // Wire-recognized but no app-level reaction yet
+                    // (MAX_DATA, NEW_CONNECTION_ID, …). Frame layer
+                    // already consumed the right number of bytes.
                 }
             }
             payload = &payload[consumed..];
@@ -678,10 +808,10 @@ impl Connection {
             self.handshake_space.ack_pending = false;
         }
 
-        // 1-RTT packet for HANDSHAKE_DONE.
-        if matches!(self.state, ConnState::Established) && !self.handshake_done_sent {
-            self.encode_one_rtt_handshake_done(&mut datagram)?;
-            self.handshake_done_sent = true;
+        // 1-RTT packet — bundles ACK + HANDSHAKE_DONE + STREAM
+        // frames + STREAM data drained from per-stream send queues.
+        if matches!(self.state, ConnState::Established) {
+            self.encode_one_rtt_packet(&mut datagram)?;
         }
 
         if !datagram.is_empty() {
@@ -802,18 +932,67 @@ impl Connection {
         self.seal_packet(out, header_start, pn_offset, payload_offset, payload_len, total_end, pn, &send_keys, true)
     }
 
-    fn encode_one_rtt_handshake_done(&mut self, out: &mut Vec<u8>) -> Result<(), ConnError> {
-        let send_keys = self
-            .application_send
-            .as_ref()
-            .ok_or(ConnError::BadState)?
-            .clone();
+    /// Build a single 1-RTT packet that bundles the currently-due
+    /// frames: ACK (if pending), HANDSHAKE_DONE (if not yet sent),
+    /// and as many STREAM-frame chunks as fit before the per-packet
+    /// budget. Skips emission entirely if no frames are due.
+    fn encode_one_rtt_packet(&mut self, out: &mut Vec<u8>) -> Result<(), ConnError> {
+        // Per-packet body budget. Leaves headroom for short-header
+        // (1+CID+pn=13) + tag (16) under MTU 1200; STREAM frame
+        // headers add ~4-12 bytes of varint overhead.
+        const PACKET_BODY_BUDGET: usize = 1100;
+
+        let send_keys = match self.application_send.as_ref() {
+            Some(k) => k.clone(),
+            None => return Ok(()),
+        };
+
+        // Collect frames into a scratch buffer.
+        let mut frames: Vec<u8> = Vec::with_capacity(PACKET_BODY_BUDGET);
+
+        if self.application_space.ack_pending {
+            self.append_ack_frame(&mut frames, &self.application_space);
+            self.application_space.ack_pending = false;
+        }
+        if !self.handshake_done_sent {
+            let mut tmp = [0u8; 4];
+            let n = write_handshake_done(&mut tmp).map_err(|_| ConnError::Wire)?;
+            frames.extend_from_slice(&tmp[..n]);
+            self.handshake_done_sent = true;
+        }
+
+        // Drain pending STREAM data. Round-robin across streams
+        // — each stream can contribute one chunk per packet so a
+        // single greedy stream doesn't starve siblings during burst
+        // workloads. (For HTTP/3 there's typically only one active
+        // request stream at a time anyway.)
+        let stream_ids: Vec<u64> = self.send_streams.keys().copied().collect();
+        for sid in stream_ids {
+            if frames.len() >= PACKET_BODY_BUDGET {
+                break;
+            }
+            let max_chunk = PACKET_BODY_BUDGET.saturating_sub(frames.len() + 16); // varint headroom
+            if max_chunk == 0 {
+                break;
+            }
+            let s = match self.send_streams.get_mut(&sid) {
+                Some(s) => s,
+                None => continue,
+            };
+            if let Some((offset, chunk, fin)) = s.pop_chunk(max_chunk) {
+                let mut tmp = vec![0u8; chunk.len() + 32];
+                let n = crate::frame::write_stream(sid, offset, fin, &chunk, &mut tmp)
+                    .map_err(|_| ConnError::Wire)?;
+                frames.extend_from_slice(&tmp[..n]);
+            }
+        }
+
+        if frames.is_empty() {
+            return Ok(());
+        }
+
         let pn = self.application_space.next_send_pn;
         self.application_space.next_send_pn += 1;
-
-        let mut frames = [0u8; 4];
-        let n = write_handshake_done(&mut frames).map_err(|_| ConnError::Wire)?;
-        let frames = &frames[..n];
 
         let pn_length: usize = 4;
         let header_start = out.len();
@@ -825,7 +1004,7 @@ impl Connection {
         let pn_offset = out.len();
         out.extend_from_slice(&(pn as u32).to_be_bytes());
         let payload_offset = out.len();
-        out.extend_from_slice(frames);
+        out.extend_from_slice(&frames);
         // Pad to ensure HP sample (4 bytes after PN start) has 16
         // bytes of ciphertext after AEAD seal.
         while out.len() - pn_offset < 4 + HP_SAMPLE_LEN {
@@ -835,7 +1014,17 @@ impl Connection {
         out.extend_from_slice(&[0u8; TAG_LEN]);
         let total_end = out.len();
 
-        self.seal_packet(out, header_start, pn_offset, payload_offset, payload_len, total_end, pn, &send_keys, false)
+        self.seal_packet(
+            out,
+            header_start,
+            pn_offset,
+            payload_offset,
+            payload_len,
+            total_end,
+            pn,
+            &send_keys,
+            false,
+        )
     }
 
     /// Common AEAD seal + HP protect. `out` is the assembled

@@ -23,10 +23,11 @@ rust_library(
         "src/transport_params.rs",
         "src/wire.rs",
         # TLS-handshake-over-CRYPTO-frames driver + connection state
-        # machine + async inbox + UDP endpoint.
+        # machine + async inbox + UDP endpoint + streams.
         "src/conn.rs",
         "src/endpoint.rs",
         "src/inbox.rs",
+        "src/streams.rs",
         "src/tls.rs",
     ],
     compile_data = [

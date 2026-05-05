@@ -1,25 +1,38 @@
-// net/quic_frame.rs — RFC 9000 §19 frame codec (sans-io).
+// uni-quic/src/frame.rs — RFC 9000 §19 frame codec (sans-io).
 //
-// Parses and encodes the frames that show up in a QUIC v1
-// handshake / 1-RTT stream:
+// Parses and encodes every frame the v1 server needs to interop
+// with curl/quinn/quiche over a 1-RTT HTTP/3 connection:
 //
 //   0x00       PADDING
 //   0x01       PING
 //   0x02..03   ACK (without and with ECN counts)
 //   0x06       CRYPTO
+//   0x07       NEW_TOKEN  (skip)
 //   0x08..0f   STREAM (with OFF/LEN/FIN flag combinations)
+//   0x10       MAX_DATA           (skip)
+//   0x11       MAX_STREAM_DATA    (skip)
+//   0x12..13   MAX_STREAMS        (skip)
+//   0x14       DATA_BLOCKED       (skip)
+//   0x15       STREAM_DATA_BLOCKED (skip)
+//   0x16..17   STREAMS_BLOCKED    (skip)
+//   0x18       NEW_CONNECTION_ID  (skip)
+//   0x19       RETIRE_CONNECTION_ID (skip)
+//   0x1a..1b   PATH_CHALLENGE / PATH_RESPONSE (skip)
 //   0x1c..1d   CONNECTION_CLOSE (transport- and application-layer)
 //   0x1e       HANDSHAKE_DONE
 //
 // Pure protocol layer. The connection state machine drives this
-// over decrypted packet payloads from `quic_crypto::open_*` and
-// builds outbound payloads that go back into `quic_crypto::seal_*`.
+// over decrypted packet payloads from `crate::crypto::open_*` and
+// builds outbound payloads that go back into `crate::crypto::seal_*`.
 //
-// Out of scope for this commit (added when STREAMs land — flow
-// control / connection migration / token issuance):
-//   NEW_TOKEN, MAX_*/_BLOCKED, NEW/RETIRE_CONNECTION_ID,
-//   PATH_CHALLENGE/RESPONSE, RESET_STREAM/STOP_SENDING,
-//   DATAGRAM (RFC 9221).
+// "Skip" frames are parsed enough to advance past their wire
+// length (so coalesced frames after them keep parsing) but the
+// connection layer doesn't act on them — flow control reactivity
+// and CID rotation are out of scope for the MVP server. Adding
+// real handling later only changes the `dispatch_frames` arm.
+//
+// Out of scope (no parser yet — would close the connection on receipt):
+//   RESET_STREAM, STOP_SENDING, DATAGRAM (RFC 9221).
 
 // (no-std declaration is in lib.rs. `wire` is now this crate's
 // sibling module rather than a separate crate.)
@@ -47,6 +60,19 @@ pub mod ftype {
     pub const STREAM_FLAG_OFF: u8 = 0x04;
     pub const STREAM_MAX: u8 = 0x0f;
 
+    pub const NEW_TOKEN: u8 = 0x07;
+    pub const MAX_DATA: u8 = 0x10;
+    pub const MAX_STREAM_DATA: u8 = 0x11;
+    pub const MAX_STREAMS_BIDI: u8 = 0x12;
+    pub const MAX_STREAMS_UNI: u8 = 0x13;
+    pub const DATA_BLOCKED: u8 = 0x14;
+    pub const STREAM_DATA_BLOCKED: u8 = 0x15;
+    pub const STREAMS_BLOCKED_BIDI: u8 = 0x16;
+    pub const STREAMS_BLOCKED_UNI: u8 = 0x17;
+    pub const NEW_CONNECTION_ID: u8 = 0x18;
+    pub const RETIRE_CONNECTION_ID: u8 = 0x19;
+    pub const PATH_CHALLENGE: u8 = 0x1a;
+    pub const PATH_RESPONSE: u8 = 0x1b;
     pub const CONNECTION_CLOSE_TRANSPORT: u8 = 0x1c;
     pub const CONNECTION_CLOSE_APPLICATION: u8 = 0x1d;
     pub const HANDSHAKE_DONE: u8 = 0x1e;
@@ -128,6 +154,12 @@ pub enum Frame<'a> {
         reason: &'a [u8],
     },
     HandshakeDone,
+    /// Wire-recognized frame whose semantics the connection layer
+    /// doesn't act on yet. Carries the type byte for diagnostics —
+    /// upgrading to a typed variant is a one-arm change in dispatch.
+    Skipped {
+        kind: u8,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,8 +221,87 @@ pub fn parse_frame(data: &[u8]) -> Result<(Frame<'_>, usize), FrameError> {
             parse_close_application(rest, frame_total_offset)
         }
         ftype::HANDSHAKE_DONE => Ok((Frame::HandshakeDone, 1)),
+        ftype::NEW_TOKEN => skip_var_len_field(rest, t, frame_total_offset),
+        ftype::MAX_DATA
+        | ftype::MAX_STREAMS_BIDI
+        | ftype::MAX_STREAMS_UNI
+        | ftype::DATA_BLOCKED
+        | ftype::STREAMS_BLOCKED_BIDI
+        | ftype::STREAMS_BLOCKED_UNI
+        | ftype::RETIRE_CONNECTION_ID => skip_one_varint(rest, t, frame_total_offset),
+        ftype::MAX_STREAM_DATA | ftype::STREAM_DATA_BLOCKED => {
+            skip_two_varints(rest, t, frame_total_offset)
+        }
+        ftype::NEW_CONNECTION_ID => skip_new_connection_id(rest, t, frame_total_offset),
+        ftype::PATH_CHALLENGE | ftype::PATH_RESPONSE => {
+            skip_fixed(rest, t, 8, frame_total_offset)
+        }
         other => Err(FrameError::UnknownFrameType(other)),
     }
+}
+
+// ── Skip helpers ─────────────────────────────────────────────────
+
+fn skip_one_varint(body: &[u8], kind: u8, header: usize) -> Result<(Frame<'_>, usize), FrameError> {
+    let (_v, n) = read_varint(body)?;
+    Ok((Frame::Skipped { kind }, header + n))
+}
+
+fn skip_two_varints(
+    body: &[u8],
+    kind: u8,
+    header: usize,
+) -> Result<(Frame<'_>, usize), FrameError> {
+    let (_a, n) = read_varint(body)?;
+    let (_b, m) = read_varint(&body[n..])?;
+    Ok((Frame::Skipped { kind }, header + n + m))
+}
+
+fn skip_var_len_field(
+    body: &[u8],
+    kind: u8,
+    header: usize,
+) -> Result<(Frame<'_>, usize), FrameError> {
+    // NEW_TOKEN: u8 0x07 || varint token_len || token bytes
+    let (token_len, n) = read_varint(body)?;
+    let token_len = token_len as usize;
+    if token_len > body.len() - n {
+        return Err(FrameError::BadLength);
+    }
+    Ok((Frame::Skipped { kind }, header + n + token_len))
+}
+
+fn skip_new_connection_id(
+    body: &[u8],
+    kind: u8,
+    header: usize,
+) -> Result<(Frame<'_>, usize), FrameError> {
+    // NEW_CONNECTION_ID: varint sequence_number || varint retire_prior_to
+    //   || u8 cid_len || cid_len bytes || 16 bytes stateless_reset_token.
+    let (_seq, n) = read_varint(body)?;
+    let (_retire, m) = read_varint(&body[n..])?;
+    let after_varints = n + m;
+    if after_varints + 1 > body.len() {
+        return Err(FrameError::BadLength);
+    }
+    let cid_len = body[after_varints] as usize;
+    let total_after_header = after_varints + 1 + cid_len + 16;
+    if total_after_header > body.len() {
+        return Err(FrameError::BadLength);
+    }
+    Ok((Frame::Skipped { kind }, header + total_after_header))
+}
+
+fn skip_fixed(
+    body: &[u8],
+    kind: u8,
+    n: usize,
+    header: usize,
+) -> Result<(Frame<'_>, usize), FrameError> {
+    if body.len() < n {
+        return Err(FrameError::Truncated);
+    }
+    Ok((Frame::Skipped { kind }, header + n))
 }
 
 fn parse_ack<'a>(
@@ -378,6 +489,38 @@ pub fn write_crypto(offset: u64, data: &[u8], out: &mut [u8]) -> Result<usize, F
     Ok(p)
 }
 
+/// Write a STREAM frame `(stream_id, offset, fin, data)` with the
+/// OFF + LEN flags both set. Returns bytes written. The connection
+/// layer always sends with explicit length so multiple frames can
+/// coalesce in one packet; LEN-omitted "extends-to-end-of-payload"
+/// is reserved for the case where it's the only or last frame.
+pub fn write_stream(
+    stream_id: u64,
+    offset: u64,
+    fin: bool,
+    data: &[u8],
+    out: &mut [u8],
+) -> Result<usize, FrameError> {
+    if out.is_empty() {
+        return Err(FrameError::OutputTooSmall);
+    }
+    let mut t = ftype::STREAM_BASE | ftype::STREAM_FLAG_OFF | ftype::STREAM_FLAG_LEN;
+    if fin {
+        t |= ftype::STREAM_FLAG_FIN;
+    }
+    out[0] = t;
+    let mut p = 1usize;
+    p += write_varint(stream_id, &mut out[p..])?;
+    p += write_varint(offset, &mut out[p..])?;
+    p += write_varint(data.len() as u64, &mut out[p..])?;
+    if out.len() - p < data.len() {
+        return Err(FrameError::OutputTooSmall);
+    }
+    out[p..p + data.len()].copy_from_slice(data);
+    p += data.len();
+    Ok(p)
+}
+
 /// Write an ACK frame. `additional_ranges` is `(gap, ack_range_length)`
 /// varint pairs in network order (oldest gap first); pass an empty
 /// slice for a single-range ACK.
@@ -480,10 +623,55 @@ mod tests {
 
     #[test]
     fn parse_unknown_frame_type() {
-        // Pick a value in the reserved range that isn't yet wired
-        // up here (e.g. 0x10 = MAX_DATA).
-        let r = parse_frame(&[0x10u8]);
-        assert!(matches!(r, Err(FrameError::UnknownFrameType(0x10))));
+        // 0x20 sits past every defined v1 frame type — still
+        // unknown territory. Future expansion would wire up arms
+        // for these as needed.
+        let r = parse_frame(&[0x20u8]);
+        assert!(matches!(r, Err(FrameError::UnknownFrameType(0x20))));
+    }
+
+    #[test]
+    fn skip_max_data_consumes_one_varint() {
+        // type=0x10 || varint(7) = 1 + 1 bytes (7 fits in 6-bit form).
+        let buf = [0x10u8, 0x07];
+        let (f, n) = parse_frame(&buf).unwrap();
+        assert!(matches!(f, Frame::Skipped { kind: 0x10 }));
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn skip_new_connection_id_full_layout() {
+        // type=0x18 || seq=1 || retire=0 || cid_len=4 || cid=0xa1a2a3a4 || token[16]
+        let mut buf = vec![0x18u8, 0x01, 0x00, 0x04, 0xa1, 0xa2, 0xa3, 0xa4];
+        buf.extend_from_slice(&[0xff; 16]);
+        let (f, n) = parse_frame(&buf).unwrap();
+        assert!(matches!(f, Frame::Skipped { kind: 0x18 }));
+        assert_eq!(n, buf.len());
+    }
+
+    #[test]
+    fn skip_path_challenge_consumes_8_bytes() {
+        let buf = [0x1au8, 1, 2, 3, 4, 5, 6, 7, 8];
+        let (f, n) = parse_frame(&buf).unwrap();
+        assert!(matches!(f, Frame::Skipped { kind: 0x1a }));
+        assert_eq!(n, 9);
+    }
+
+    #[test]
+    fn write_stream_round_trip() {
+        let mut buf = [0u8; 32];
+        let n = write_stream(7, 4, true, b"hello", &mut buf).unwrap();
+        let (f, parsed_n) = parse_frame(&buf[..n]).unwrap();
+        match f {
+            Frame::Stream { stream_id, offset, data, fin } => {
+                assert_eq!(stream_id, 7);
+                assert_eq!(offset, 4);
+                assert!(fin);
+                assert_eq!(data, b"hello");
+            }
+            _ => panic!("expected Stream"),
+        }
+        assert_eq!(parsed_n, n);
     }
 
     #[test]
