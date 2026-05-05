@@ -1219,55 +1219,111 @@ $(brew --prefix curl)/bin/curl --http3-only -k \
 
 ---
 
-## Phase 5: IPv6 + NDP (drop IPv4/ARP)
+## Phase 5: IPv6 + NDP
 
-### 5a. IPv6 (net/ipv6.rs)
+The "drop IPv4/ARP" framing in the original roadmap is an
+end-state aspiration; in practice the unikernel runs in
+environments where the HVF runner / GCE / Docker still default
+to IPv4 NAT, so the working build is dual-stack with a path to
+v6-only when deployment substrates support it.
 
-Simpler header than IPv4 (no checksum, no fragmentation at network layer).
-~150 lines.
+### 5a. IPv6 (net/ipv6.rs) — done
 
-- [ ] IPv6 header parse/build
-- [ ] `//net:ipv6` Bazel target (deps: ethernet)
+Pure wire-format crate `//net:ipv6` (host-testable as a leaf — no
+ethernet/driver dep). 40-byte fixed header, no checksum, no IHL.
+`ipv6_build` / `ipv6_receive` + `pseudo_checksum` for the L4
+upper layers.
 
-**Tests:**
-- [ ] Unit: IPv6 header parse/build
-- [ ] Integration: ping6 from host to VM
+- [x] IPv6 header parse + build
+- [x] `Ipv6Addr` type with EUI-64, solicited-node, multicast-MAC
+      helpers (RFC 4291 + RFC 2464)
+- [x] Pseudo-header checksum (RFC 8200 §8.1)
+- [x] Unit tests: build/parse round-trip, version + truncation
+      rejection, checksum verification
+- [ ] End-to-end ping6 — needs HVF runner IPv6 packet relay
+      (tooling work in `tools/hvf-runner`); QEMU bridged net
+      already exercises this path on Linux
 
-### 5b. NDP — Neighbor Discovery Protocol (net/ndp.rs)
+### 5b. NDP — Neighbor Discovery Protocol — done (parsers + service)
 
-Replaces ARP. Uses ICMPv6:
-- Neighbor Solicitation/Advertisement (like ARP request/reply)
-- Router Solicitation/Advertisement (for gateway discovery)
-- ~200 lines
+`//net:icmpv6` covers ICMPv6 + NDP wire format; `//net:net`
+handles inbound NS/RA/Echo on the BSP. `//net:ndp` was renamed
+`//net:icmpv6` to reflect that the same module covers Echo
+Request/Reply alongside the NDP messages — they all share the
+ICMPv6 framing + pseudo-checksum.
 
-- [ ] Neighbor Solicitation/Advertisement
-- [ ] Router Solicitation/Advertisement
-- [ ] `//net:ndp` Bazel target (deps: ipv6)
+- [x] Neighbor Solicitation/Advertisement (build + parse + reply)
+- [x] Router Solicitation (sent at bring-up to ff02::2)
+- [x] Router Advertisement parsing (drives SLAAC)
+- [x] Echo Request/Reply (replies to ping6)
+- [x] `//net:icmpv6` Bazel target (deps: ipv6, types)
+- [x] Unit tests: NA layout + flags, NS round-trip, RA prefix
+      extraction, Echo Reply checksum verification
+- [ ] Outbound NDP cache for server-initiated unicast IPv6 —
+      not needed for receive-path replies (we reuse the inbound
+      Ethernet src MAC); becomes necessary once dual-stack TCP /
+      UDP land
 
-**Tests:**
-- [ ] Unit: NDP message encode/decode
-- [ ] Integration: neighbor discovery completes in QEMU
+### 5c. Stateless autoconfiguration (SLAAC) — done
 
-### 5c. Stateless autoconfiguration (SLAAC)
+Builds a global IPv6 address from a Router Advertisement's
+Prefix Information option + the EUI-64 interface ID. Logs:
 
-Replaces DHCP for IPv6. Generate address from MAC + router prefix.
-~50 lines. Much simpler than DHCP.
+    [net] ipv6 link-local fe80::5054:ff:fe12:3456
+    [net] ipv6 SLAAC: configured 2001:0db8:0000:0000::5054:ff:fe12:3456
 
-- [ ] SLAAC address generation from MAC + router prefix
-- [ ] Router advertisement processing
+- [x] SLAAC address generation from MAC + router prefix
+- [x] Router Advertisement processing (single-prefix MVP — first
+      RA with `A=1` and `prefix_length == 64` wins)
+- [x] Unit test: SLAAC happy path via parsed RA + prefix
+- [ ] Multi-prefix tracking (multiple globals) — future expansion
 
-**Tests:**
-- [ ] Unit: SLAAC address generation
-- [ ] Integration: HTTP over IPv6 end-to-end
+### 5d. Dual-stack TCP / UDP — pending
 
-**Try it:**
+The L3 layer accepts IPv6 frames and replies to ICMPv6, but TCP /
+UDP packets over IPv6 are silently dropped: the connection state
+machine, the runtime API, and the apps all key on `Ipv4Addr`. To
+unlock IPv6 for sockets:
+
+- [x] `IpAddr::{V4, V6}` enum + `tcp_checksum_v6` /
+      `tcp_checksum_any` family-dispatched checksums
+      (`net/types.rs`).
+- [ ] **Outbound NDP cache** — TCB needs the peer's MAC for
+      unicast IPv6 replies; for response-path traffic the inbound
+      frame's source MAC is enough, but server-initiated outbound
+      (rare today, but listener-side TCP retransmits to a peer
+      whose ARP/NDP entry expired) needs proper resolution.
+- [ ] **`net_ipv6::ipv6_send`** — analogous to `ipv4_send`,
+      requires the NDP cache. Currently `net/lib.rs` has a
+      receive-only `send_ipv6_from` helper that takes the
+      destination MAC explicitly.
+- [ ] **TCP TCB → `IpAddr`** — `remote_ip: Ipv4Addr` becomes
+      `remote_ip: IpAddr`; `local_ip` field added; `tcp_hash_key`
+      hashes the v6 octets; `send_segment` / `send_rst` dispatch
+      between `ipv4_send` and `ipv6_send` by family.
+- [ ] **UDP `udp_receive` → `IpAddr`** — same shape.
+- [ ] **`uni-runtime` API** — `UdpSocket::recv_from / send_to`
+      and `TcpStream` peer addr move to `IpAddr`. Apps update
+      their src-IP unpacking accordingly. Some apps (the UDP
+      echo, the QUIC inbox) treat src as opaque and just need
+      a type rename.
+- [ ] **Integration: HTTP-over-IPv6 + H3-over-IPv6** — once the
+      runtime API serves both families, the existing
+      `apps/webserver` handler would automatically gain v6
+      reach.
+
+Estimated 500-line refactor across `net/{tcp,udp}.rs`,
+`net/lib.rs`, `uni-runtime/net/*`, plus a new NDP cache module.
+
+**Try it (today, after Phase 5a–5c):**
 ```bash
-# IPv6 ping from host to unikernel
-ping6 fe80::...%tap0
-# HTTP over IPv6
-curl -6 http://[fe80::...%tap0]:80/health
-# Serial: "SLAAC: configured fe80::5054:ff:fe12:3456"
-# Serial: "NDP: neighbor solicitation from fe80::1"
+# Boot logs:
+[net] ipv6 link-local fe80::5054:ff:fe12:3456
+# After RA arrival on a network with `radvd`:
+[net] ipv6 SLAAC: configured <prefix>::5054:ff:fe12:3456
+
+# `ping6 <unikernel-ll>` works once the HVF runner relays IPv6
+# (or against a QEMU bridged-net deployment today).
 ```
 
 ---

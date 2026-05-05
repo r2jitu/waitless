@@ -325,90 +325,82 @@ fn poll_tier2(num_cores: u32) -> bool {
     had_frames
 }
 
-/// Classify a frame and distribute it to the appropriate core.
-/// Called as the VirtIO poll callback on core 0.
-fn distribute_frame(frame: &[u8]) {
-    let num_cores = percpu::num_cores();
-
-    // Parse enough of the frame to classify by protocol and flow.
-    if let Some((src_mac, ethertype, payload)) = ethernet::ethernet_parse_full(frame) {
-        match ethertype {
-            ethernet::ETHERTYPE_ARP => {
-                // ARP: always core 0 (modifies shared ARP cache).
-                arp::arp_receive(payload);
-            }
-            ethernet::ETHERTYPE_IPV4 => {
-                if let Some(pkt) = ipv4::ipv4_receive(payload) {
-                    // Snoop (src_ip, src_mac) into the ARP fast cache if
-                    // the peer is on our subnet.
-                    if ipv4::same_subnet(pkt.src) {
-                        arp::arp_learn(pkt.src, src_mac);
-                    }
-                    // Extract ports for flow hash (TCP and UDP both have ports at offset 0-3).
-                    let (src_port, dst_port) = if pkt.payload.len() >= 4 {
-                        (u16::from_be_bytes([pkt.payload[0], pkt.payload[1]]),
-                         u16::from_be_bytes([pkt.payload[2], pkt.payload[3]]))
-                    } else {
-                        (0, 0)
-                    };
-                    let target = flow_hash(
-                        pkt.src.addr, pkt.dst.addr, src_port, dst_port, num_cores,
-                    );
-
-                    let my_core = uni_kernel::cpu_id();
-                    if target == my_core || num_cores <= 1 {
-                        // Target is this core (or we're running
-                        // single-core) — dispatch inline via the
-                        // protocol registry. Unknown protocols fall
-                        // through silently, same as the previous
-                        // hardcoded match.
-                        REGISTRY.dispatch(
-                            pkt.protocol, pkt.src.addr, pkt.dst.addr, pkt.payload,
-                        );
-                    } else {
-                        // Distribute to target core's RX inbox.
-                        // SAFETY: percpu::init() runs before any AP starts;
-                        // target is bounded by num_cores. The inbox uses
-                        // SPSC discipline (single producer = the distributor
-                        // here, single consumer = the target core's
-                        // net_drain_cb).
-                        let core = unsafe { percpu::get(target) };
-                        if core.rx_inbox.push(frame) {
-                            WAKEUP.at(target).store(
-                                true,
-                                core::sync::atomic::Ordering::Relaxed,
-                            );
-                        }
-                    }
+/// Common ethertype-dispatch helper. `inline_ipv4` handles a parsed
+/// IPv4 packet — `net_receive` always passes the inline-dispatch
+/// closure that calls the protocol REGISTRY directly; the Tier 2
+/// distributor passes a closure that flow-hashes and may push the
+/// raw frame to another core's inbox first. ARP and IPv6 don't
+/// participate in cross-core distribution today, so both entry
+/// points handle them identically and inline.
+#[inline(always)]
+fn dispatch_frame<F>(frame: &[u8], mut inline_ipv4: F)
+where
+    F: FnMut(&[u8], ipv4::Ipv4Packet<'_>, types::MacAddr),
+{
+    let (src_mac, ethertype, payload) = match ethernet::ethernet_parse_full(frame) {
+        Some(t) => t,
+        None => return,
+    };
+    match ethertype {
+        ethernet::ETHERTYPE_ARP => arp::arp_receive(payload),
+        ethernet::ETHERTYPE_IPV4 => {
+            if let Some(pkt) = ipv4::ipv4_receive(payload) {
+                // Snoop (src_ip, src_mac) into the ARP fast cache if
+                // the peer is on our subnet — both paths want this.
+                if ipv4::same_subnet(pkt.src) {
+                    arp::arp_learn(pkt.src, src_mac);
                 }
+                inline_ipv4(frame, pkt, src_mac);
             }
-            _ => {}
         }
+        ipv6::ETHERTYPE_IPV6 => ipv6_receive_frame(payload, src_mac),
+        _ => {}
     }
 }
 
-/// Process a single received frame through the full stack.
-/// Called on core 0 for single-core mode and ARP/TCP frames,
-/// and on any core for distributed frames via ap_poll.
+/// Process a single received frame through the full stack inline
+/// (no cross-core distribution). Called from the Tier 1 multi-queue
+/// path, the single-core path, and `net_drain_cb` (after the
+/// distributor pushed a frame to this core's inbox).
 pub fn net_receive(frame: &[u8]) {
-    if let Some((src_mac, ethertype, payload)) = ethernet::ethernet_parse_full(frame) {
-        match ethertype {
-            ethernet::ETHERTYPE_ARP => arp::arp_receive(payload),
-            ethernet::ETHERTYPE_IPV4 => {
-                if let Some(pkt) = ipv4::ipv4_receive(payload) {
-                    // See matching comment in distribute_frame.
-                    if ipv4::same_subnet(pkt.src) {
-                        arp::arp_learn(pkt.src, src_mac);
-                    }
-                    REGISTRY.dispatch(
-                        pkt.protocol, pkt.src.addr, pkt.dst.addr, pkt.payload,
-                    );
-                }
+    dispatch_frame(frame, |_frame, pkt, _src_mac| {
+        REGISTRY.dispatch(
+            pkt.protocol, pkt.src.addr, pkt.dst.addr, pkt.payload,
+        );
+    });
+}
+
+/// Tier 2 distributor: classify, then either dispatch inline (when
+/// the flow hashes to our own core or single-core mode) or push the
+/// raw frame to the target core's RX inbox.
+fn distribute_frame(frame: &[u8]) {
+    let num_cores = percpu::num_cores();
+    let my_core = uni_kernel::cpu_id();
+    dispatch_frame(frame, |frame, pkt, _src_mac| {
+        // Extract ports for the 4-tuple flow hash (TCP and UDP both
+        // have src_port/dst_port at offset 0-3 of their headers).
+        let (src_port, dst_port) = if pkt.payload.len() >= 4 {
+            (u16::from_be_bytes([pkt.payload[0], pkt.payload[1]]),
+             u16::from_be_bytes([pkt.payload[2], pkt.payload[3]]))
+        } else {
+            (0, 0)
+        };
+        let target = flow_hash(
+            pkt.src.addr, pkt.dst.addr, src_port, dst_port, num_cores,
+        );
+        if target == my_core || num_cores <= 1 {
+            REGISTRY.dispatch(pkt.protocol, pkt.src.addr, pkt.dst.addr, pkt.payload);
+        } else {
+            // SAFETY: percpu::init() runs before any AP starts;
+            // target is bounded by num_cores. SPSC: only the
+            // distributor pushes to a given core's inbox, only the
+            // target core (in net_drain_cb) consumes.
+            let core = unsafe { percpu::get(target) };
+            if core.rx_inbox.push(frame) {
+                WAKEUP.at(target).store(true, core::sync::atomic::Ordering::Relaxed);
             }
-            ipv6::ETHERTYPE_IPV6 => ipv6_receive_frame(payload, src_mac),
-            _ => {}
         }
-    }
+    });
 }
 
 // ============================================================================
@@ -498,12 +490,17 @@ fn send_router_solicitation() {
         Some(n) => n,
         None => return,
     };
-    let mut buf = [0u8; 1500];
-    let total = match ipv6::ipv6_build(&ll, &dst, ipv6::next_header::ICMPV6, 255, &icmp[..n], &mut buf) {
-        Some(t) => t,
-        None => return,
-    };
-    ethernet::ethernet_send(dst.multicast_mac(), ipv6::ETHERTYPE_IPV6, &buf[..total]);
+    // Multicast destination → `send_ipv6_from` picks the
+    // 33:33:00:00:00:02 MAC mapping; the fallback unicast MAC
+    // argument is unused but pass `MacAddr::BROADCAST` for clarity.
+    send_ipv6_from(
+        &ll,
+        &dst,
+        types::MacAddr::BROADCAST,
+        ipv6::next_header::ICMPV6,
+        255,
+        &icmp[..n],
+    );
 }
 
 /// Process an inbound Router Advertisement. If it carries a
@@ -598,7 +595,7 @@ fn handle_icmpv6(pkt: &ipv6::Ipv6Packet<'_>, src_mac: types::MacAddr) {
                 Some(n) => n,
                 None => return,
             };
-            send_ipv6(&pkt.src, src_mac, ipv6::next_header::ICMPV6, 64, &icmp_out[..n]);
+            send_ipv6_from(&ipv6_ll(), &pkt.src, src_mac, ipv6::next_header::ICMPV6, 64, &icmp_out[..n]);
         }
         icmpv6::msg::ROUTER_ADVERTISEMENT => {
             handle_router_advertisement(pkt.payload);
@@ -630,58 +627,49 @@ fn handle_icmpv6(pkt: &ipv6::Ipv6Packet<'_>, src_mac: types::MacAddr) {
                 Some(n) => n,
                 None => return,
             };
-            // Send the NA back to the soliciting host. The peer's
-            // MAC is the inbound frame's src, OR the SLLA option
-            // if we want to be cleaner. Either works.
+            // Send the NA back to the soliciting host. Prefer the
+            // SLLA option's MAC if present, falling back to the
+            // inbound frame's source MAC.
             let dst_mac = ns.src_lla.unwrap_or(src_mac);
-            let mut buf = [0u8; 1500];
-            let total = match ipv6::ipv6_build(&na_src, &pkt.src, ipv6::next_header::ICMPV6, 255, &icmp_out[..n], &mut buf) {
-                Some(t) => t,
-                None => return,
-            };
-            ethernet::ethernet_send(dst_mac, ipv6::ETHERTYPE_IPV6, &buf[..total]);
+            send_ipv6_from(
+                &na_src,
+                &pkt.src,
+                dst_mac,
+                ipv6::next_header::ICMPV6,
+                255,
+                &icmp_out[..n],
+            );
         }
         _ => {}
     }
 }
 
-/// Build + ship an IPv6 packet for which we already know the
-/// destination MAC (e.g. inbound frame's source). Bypasses NDP
-/// resolution.
-fn send_ipv6_with_dst_mac(
-    dst: &types::Ipv6Addr,
-    dst_mac: types::MacAddr,
-    next_header: u8,
-    hop_limit: u8,
-    payload: &[u8],
-) {
-    let mut buf = [0u8; 1500];
-    let n = match ipv6::ipv6_build(&ipv6_ll(), dst, next_header, hop_limit, payload, &mut buf) {
-        Some(n) => n,
-        None => return,
-    };
-    ethernet::ethernet_send(dst_mac, ipv6::ETHERTYPE_IPV6, &buf[..n]);
-}
-
-/// Build + ship an IPv6 packet, using the inbound `src_mac` as
-/// destination (for replies on the receive path; eliminates NDP
-/// resolution for symmetric flows).
-fn send_ipv6(
-    dst: &types::Ipv6Addr,
+/// Build + ship an IPv6 packet from `src_addr` to `dst_addr`. The
+/// destination MAC is computed deterministically for multicast
+/// destinations (RFC 2464 §7) and falls back to `fallback_dst_mac`
+/// for unicast — the receive-path reply pattern reuses the
+/// inbound frame's source MAC, which sidesteps NDP resolution.
+/// Once we have a real NDP cache, unicast falls through to a
+/// cache lookup instead.
+fn send_ipv6_from(
+    src_addr: &types::Ipv6Addr,
+    dst_addr: &types::Ipv6Addr,
     fallback_dst_mac: types::MacAddr,
     next_header: u8,
     hop_limit: u8,
     payload: &[u8],
 ) {
-    // Multicast destinations get the deterministic 33:33:XX:XX:XX:XX
-    // mapping; unicast falls back to the inbound src MAC (works for
-    // direct replies; full NDP cache is a future commit).
-    let dst_mac = if dst.is_multicast() {
-        dst.multicast_mac()
+    let dst_mac = if dst_addr.is_multicast() {
+        dst_addr.multicast_mac()
     } else {
         fallback_dst_mac
     };
-    send_ipv6_with_dst_mac(dst, dst_mac, next_header, hop_limit, payload);
+    let mut buf = [0u8; 1500];
+    let n = match ipv6::ipv6_build(src_addr, dst_addr, next_header, hop_limit, payload, &mut buf) {
+        Some(n) => n,
+        None => return,
+    };
+    ethernet::ethernet_send(dst_mac, ipv6::ETHERTYPE_IPV6, &buf[..n]);
 }
 
 /// Flow hash: map a 4-tuple to a core index for Tier 2 distribution.
