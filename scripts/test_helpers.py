@@ -236,6 +236,81 @@ def http_get(
         conn.close()
 
 
+def h3_get(
+    path: str, *, host: str = "127.0.0.1", port: int,
+    timeout: float = 6.0,
+) -> tuple[int, bytes]:
+    """HTTP/3 GET via `aioquic`. Returns `(status, body)` like `http_get`.
+
+    Probes the unikernel's HTTP/3 endpoint over QUIC v1. Uses
+    `aioquic`'s `QuicConnectionProtocol` subclass shape so events
+    flow through `quic_event_received` (not `_quic.next_event()`,
+    which bypasses the protocol's own dispatch and silently drops
+    DataReceived).
+
+    Raises `unittest.SkipTest` if `aioquic` isn't importable —
+    the H3 stack is otherwise covered by host unit tests, so a
+    missing `aioquic` install shouldn't break the test suite.
+    """
+    try:
+        import asyncio
+        import aioquic.asyncio.client as aclient
+        from aioquic.asyncio.protocol import QuicConnectionProtocol
+        from aioquic.h3.connection import H3_ALPN, H3Connection
+        from aioquic.h3.events import HeadersReceived, DataReceived
+        from aioquic.quic.configuration import QuicConfiguration
+        from aioquic.quic.events import QuicEvent
+    except ImportError as exc:
+        import unittest
+        raise unittest.SkipTest(f"aioquic not installed: {exc}")
+
+    class H3Probe(QuicConnectionProtocol):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.h3 = H3Connection(self._quic)
+            self.done = asyncio.get_event_loop().create_future()
+            self.body = bytearray()
+            self.status: Optional[bytes] = None
+
+        def quic_event_received(self, event):
+            for h3_event in self.h3.handle_event(event):
+                if isinstance(h3_event, HeadersReceived):
+                    for k, v in h3_event.headers:
+                        if k == b":status":
+                            self.status = v
+                    if h3_event.stream_ended and not self.done.done():
+                        self.done.set_result((self.status, bytes(self.body)))
+                elif isinstance(h3_event, DataReceived):
+                    self.body.extend(h3_event.data)
+                    if h3_event.stream_ended and not self.done.done():
+                        self.done.set_result((self.status, bytes(self.body)))
+
+    async def _fetch():
+        cfg = QuicConfiguration(is_client=True, alpn_protocols=H3_ALPN)
+        cfg.verify_mode = False  # accept self-signed dev cert
+        cfg.idle_timeout = timeout
+        async with aclient.connect(
+            host, port,
+            configuration=cfg,
+            create_protocol=H3Probe,
+            wait_connected=True,
+        ) as client:
+            sid = client._quic.get_next_available_stream_id()
+            client.h3.send_headers(
+                stream_id=sid,
+                headers=[(b":method", b"GET"),
+                         (b":scheme", b"https"),
+                         (b":authority", f"{host}:{port}".encode()),
+                         (b":path", path.encode())],
+                end_stream=True,
+            )
+            client.transmit()
+            status, body = await asyncio.wait_for(client.done, timeout=timeout)
+            return int(status), body
+
+    return asyncio.run(_fetch())
+
+
 def https_get(
     path: str, *, host: str = "127.0.0.1", port: int,
     ca_file: Optional[Path] = None, sni: str = "unikernel.local",

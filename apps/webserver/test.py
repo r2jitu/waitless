@@ -26,6 +26,7 @@ import unittest
 
 from scripts.test_helpers import (
     PtyLauncher,
+    h3_get,
     http_get,
     https_get,
     https_session_resume_check,
@@ -157,6 +158,18 @@ class WebserverServiceTest(unittest.TestCase):
                         "first handshake should be fresh (no cached session)")
         self.assertTrue(second_was_resumed,
                         "second handshake should reuse the ticket from #1")
+
+    # ── HTTP/3 over QUIC ─────────────────────────────────────────
+    def test_h3_health(self) -> None:
+        """End-to-end HTTP/3 GET against the same handler that
+        serves HTTPS/1.1 — exercises the full stack
+        `uni-quic` (QUIC v1 transport) → `uni-http3` (H3 frames +
+        QPACK static-only) → `uni-http` Request/Response.
+        Skips if `aioquic` isn't available locally.
+        """
+        status, body = h3_get("/health", port=TLS_PORT)
+        self.assertEqual(status, 200)
+        self.assertIn(b"status", body)
 
     def test_https_burst_30(self) -> None:
         """30 back-to-back HTTPS GETs with 0 failures.

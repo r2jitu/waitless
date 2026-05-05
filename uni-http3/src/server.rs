@@ -260,8 +260,12 @@ fn write_response(conn: &QuicConn, sid: u64, resp: &Response) {
         payload.extend_from_slice(&tmp[..n]);
     }
 
-    conn.send(sid, &payload);
-    conn.close_stream(sid);
+    // One-shot send+FIN: bundles HEADERS+DATA bytes and the FIN
+    // marker into a single STREAM frame (and ideally a single
+    // 1-RTT packet). Avoids the FIN-without-data corner case
+    // where some H3 clients may discard the request stream
+    // before observing the data half.
+    conn.send_fin(sid, &payload);
 }
 
 fn status_to_bytes(status: i32) -> [u8; 3] {
