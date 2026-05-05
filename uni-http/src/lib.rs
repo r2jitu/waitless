@@ -453,7 +453,7 @@ where
     let h = listener.run(move |stream| {
         let handler = Arc::clone(&handler);
         async move {
-            handle_conn(handler, stream).await;
+            handle_conn(handler, stream, None).await;
         }
     });
     uni::_retain(h);
@@ -473,6 +473,17 @@ pub fn listen_https<H>(
 where
     H: AsyncFn(&Request) -> Response + Send + Sync + 'static,
 {
+    // Pre-format the Alt-Svc header line so HTTP/3-capable browsers
+    // learn (over the HTTPS+TCP first hit) that the same origin
+    // also serves on UDP/<port>. RFC 7838 / RFC 9114 §3.2: clients
+    // remember the mapping for `ma` seconds and try QUIC first on
+    // subsequent visits. `Box::leak` once at startup gives us a
+    // `&'static [u8]` to splice into every response on this port
+    // without per-request allocation.
+    let alt_svc_line = alloc::format!("Alt-Svc: h3=\":{port}\"; ma=86400\r\n")
+        .into_bytes()
+        .into_boxed_slice();
+    let alt_svc: &'static [u8] = Box::leak(alt_svc_line);
     let listener = uni::runtime::TcpListener::bind(port)?;
     let handler = Arc::new(handler);
     let h = listener.run(move |tcp| {
@@ -482,7 +493,7 @@ where
             let mut seed = [0u8; 32];
             uni::rng::fill_bytes(&mut seed);
             let stream = TlsStream::new(tcp, tls.new_connection(seed));
-            handle_conn(handler, stream).await;
+            handle_conn(handler, stream, Some(alt_svc)).await;
         }
     });
     uni::_retain(h);
@@ -497,8 +508,11 @@ where
 /// `handler`, sends responses. Returns when the peer closes,
 /// idle timeout fires, or the buffer overflows on a too-large
 /// request.
-async fn handle_conn<S, H>(handler: Arc<H>, mut stream: S)
-where
+async fn handle_conn<S, H>(
+    handler: Arc<H>,
+    mut stream: S,
+    extra_response_headers: Option<&'static [u8]>,
+) where
     S: HttpStream,
     H: AsyncFn(&Request) -> Response,
 {
@@ -544,7 +558,7 @@ where
             let resp = (&*handler)(&req).await;
 
             w.clear();
-            write_response_into(&mut w, &resp, !want_close);
+            write_response_into(&mut w, &resp, !want_close, extra_response_headers);
             if stream.send(w.as_bytes()).await.is_err() {
                 return;
             }
@@ -739,7 +753,18 @@ impl core::fmt::Write for BufWriter {
 /// pushes for the constant headers and a small itoa for the only
 /// variable integer (`Content-Length`) measurably outperform
 /// `write!(...)` here.
-fn write_response_into(w: &mut BufWriter, resp: &Response, keep_alive: bool) {
+///
+/// `extra_headers`, if `Some`, is an arena-leaked byte slice already
+/// formatted as one or more `Header: value\r\n` lines (no trailing
+/// blank line). Used by `listen_https` to advertise `Alt-Svc: h3=…`
+/// on every HTTPS response so HTTP/3-capable browsers learn to
+/// upgrade on the next visit.
+fn write_response_into(
+    w: &mut BufWriter,
+    resp: &Response,
+    keep_alive: bool,
+    extra_headers: Option<&'static [u8]>,
+) {
     let body = resp.body_bytes();
     let content_type = resp.content_type_bytes();
 
@@ -757,7 +782,11 @@ fn write_response_into(w: &mut BufWriter, resp: &Response, keep_alive: bool) {
     w.push(&len_buf[..len_len]);
     w.push(b"\r\nConnection: ");
     w.push(if keep_alive { b"keep-alive" } else { b"close" });
-    w.push(b"\r\n\r\n");
+    w.push(b"\r\n");
+    if let Some(extra) = extra_headers {
+        w.push(extra);
+    }
+    w.push(b"\r\n");
     w.push(body);
 }
 
