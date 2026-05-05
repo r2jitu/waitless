@@ -164,6 +164,11 @@ struct WorkerShared {
     /// external sockaddr. Populated by the worker on incoming UDP, read
     /// by the vCPU in `handle_udp` when the guest sends a reply.
     udp_clients: Mutex<HashMap<(u16, u16), libc::sockaddr_in>>,
+    /// IPv6 counterpart to `udp_clients`. Same `(guest_port,
+    /// client_ephemeral_port)` key, value is `sockaddr_in6` so the
+    /// TX-side reply in `handle_udp_v6` can `sendto` the original
+    /// peer over IPv6.
+    udp_clients_v6: Mutex<HashMap<(u16, u16), libc::sockaddr_in6>>,
 }
 
 impl WorkerShared {
@@ -171,6 +176,7 @@ impl WorkerShared {
         Self {
             conns: Mutex::new(HashMap::new()),
             tx_replies: Mutex::new(VecDeque::new()),
+            udp_clients_v6: Mutex::new(HashMap::new()),
             udp_clients: Mutex::new(HashMap::new()),
         }
     }
@@ -284,6 +290,12 @@ struct UdpRelayFds {
 }
 static UDP_RELAYS: OnceLock<Vec<UdpRelayFds>> = OnceLock::new();
 
+/// IPv6 counterpart to `UDP_RELAYS`. Same shape — keyed by
+/// `guest_port`, holds `cpu_count` v6 sibling fds (one per vCPU
+/// for the TX-side lookup). Set at `start()` time alongside the
+/// v4 table.
+static UDP_RELAYS_V6: OnceLock<Vec<UdpRelayFds>> = OnceLock::new();
+
 const GUEST_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 
 /// Per-listen-socket state.
@@ -298,10 +310,22 @@ struct TcpListen {
 /// `start()` time; vCPU `N` owns sibling `N`, and `UDP_RELAYS` below
 /// keeps a flat `Vec<i32>` so the TX-side `handle_udp` can still look
 /// up "this vCPU's sibling" when the guest sends a reply.
+///
+/// `family` distinguishes the v4 sibling (binds 127.0.0.1) from the
+/// v6 sibling (binds ::1). Both fds for a given guest_port are
+/// added to every vCPU's pollfds; on read we dispatch to
+/// `handle_udp_rx` (v4) or `handle_udp_rx_v6` (v6) accordingly.
 #[derive(Clone, Copy)]
 struct UdpRelay {
     fd: i32,
     guest_port: u16,
+    family: UdpRelayFamily,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UdpRelayFamily {
+    V4,
+    V6,
 }
 
 /// Per-vCPU IoState. One per vCPU; lives in `VCPU_IOS` and is locked
@@ -429,6 +453,46 @@ fn open_udp_sibling(host_port: u16) -> Result<i32, String> {
     }
 }
 
+/// IPv6 sibling of `open_udp_sibling`. Binds to `[::1]:host_port`
+/// with `IPV6_V6ONLY=1` so v4 traffic still goes to the AF_INET
+/// sibling — keeps the receive-path code paths cleanly separated
+/// (v4 sees `sockaddr_in`, v6 sees `sockaddr_in6`, no
+/// `::ffff:1.2.3.4` mapped weirdness).
+fn open_udp_sibling_v6(host_port: u16) -> Result<i32, String> {
+    unsafe {
+        let fd = libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0);
+        if fd < 0 {
+            return Err(format!("udp v6 socket(): {}", std::io::Error::last_os_error()));
+        }
+        let one: i32 = 1;
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR,
+                         &one as *const _ as *const _, 4);
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT,
+                         &one as *const _ as *const _, 4);
+        libc::setsockopt(fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY,
+                         &one as *const _ as *const _, 4);
+        let bufsz: i32 = 16 * 1024 * 1024;
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF,
+                         &bufsz as *const _ as *const _, 4);
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF,
+                         &bufsz as *const _ as *const _, 4);
+        let mut addr: libc::sockaddr_in6 = std::mem::zeroed();
+        addr.sin6_family = libc::AF_INET6 as u8;
+        addr.sin6_port = host_port.to_be();
+        // Bind to ::1 (loopback) so non-loopback traffic doesn't
+        // accidentally hit the relay; mirrors the v4 `127.0.0.1`
+        // bind. `s6_addr[15] = 1` is `::1`.
+        addr.sin6_addr.s6_addr[15] = 1;
+        if libc::bind(fd, &addr as *const _ as *const _, std::mem::size_of_val(&addr) as u32) < 0 {
+            let e = std::io::Error::last_os_error();
+            libc::close(fd);
+            return Err(format!("udp v6 bind([::1]:{host_port}): {e}"));
+        }
+        libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+        Ok(fd)
+    }
+}
+
 pub fn start(mappings: &[PortMapping], cpu_count: usize) -> Result<[u8; 6], String> {
     let mac: [u8; 6] = GUEST_MAC;
     let cpu_count = cpu_count.max(1);
@@ -455,6 +519,7 @@ pub fn start(mappings: &[PortMapping], cpu_count: usize) -> Result<[u8; 6], Stri
     let mut per_worker_udps: Vec<Vec<UdpRelay>> =
         (0..cpu_count).map(|_| Vec::new()).collect();
     let mut relay_table: Vec<UdpRelayFds> = Vec::new();
+    let mut relay_table_v6: Vec<UdpRelayFds> = Vec::new();
 
     for m in mappings {
         match m.proto {
@@ -462,32 +527,43 @@ pub fn start(mappings: &[PortMapping], cpu_count: usize) -> Result<[u8; 6], Stri
                 let fd = bind_listen(m.host)?;
                 listens.push(TcpListen { fd, guest_port: m.guest });
             }
-            Proto::Udp => match open_udp_sibling(m.host) {
-                Ok(fd) => {
-                    // One fd shared across every vCPU's pollfds.
-                    for worker_id in 0..cpu_count {
-                        per_worker_udps[worker_id].push(UdpRelay {
-                            fd,
-                            guest_port: m.guest,
-                        });
+            Proto::Udp => {
+                match open_udp_sibling(m.host) {
+                    Ok(fd) => {
+                        for worker_id in 0..cpu_count {
+                            per_worker_udps[worker_id].push(UdpRelay {
+                                fd, guest_port: m.guest, family: UdpRelayFamily::V4,
+                            });
+                        }
+                        let fds = vec![fd; cpu_count.max(1)];
+                        relay_table.push(UdpRelayFds { guest_port: m.guest, fds });
                     }
-                    // `relay_table.fds` is still a vec for the TX
-                    // side's per-vCPU lookup, but every entry is
-                    // the same shared fd.
-                    let fds = vec![fd; cpu_count.max(1)];
-                    relay_table.push(UdpRelayFds {
-                        guest_port: m.guest,
-                        fds,
-                    });
+                    Err(e) => eprintln!("  warning: {e}"),
                 }
-                // UDP bind is non-fatal — keep TCP working even if UDP port is taken.
-                Err(e) => eprintln!("  warning: {e}"),
-            },
+                // IPv6 sibling on the same host port — bind failure
+                // here is also non-fatal (e.g. ::1 not configured),
+                // we just log and continue with v4-only relay.
+                match open_udp_sibling_v6(m.host) {
+                    Ok(fd) => {
+                        for worker_id in 0..cpu_count {
+                            per_worker_udps[worker_id].push(UdpRelay {
+                                fd, guest_port: m.guest, family: UdpRelayFamily::V6,
+                            });
+                        }
+                        let fds = vec![fd; cpu_count.max(1)];
+                        relay_table_v6.push(UdpRelayFds { guest_port: m.guest, fds });
+                    }
+                    Err(e) => eprintln!("  warning: {e}"),
+                }
+            }
         }
     }
 
     if !relay_table.is_empty() {
         UDP_RELAYS.set(relay_table).ok();
+    }
+    if !relay_table_v6.is_empty() {
+        UDP_RELAYS_V6.set(relay_table_v6).ok();
     }
 
     // One WorkerShared entry per vCPU, populated before any vCPU runs.
@@ -806,12 +882,15 @@ fn poll_worker_iteration(
 
     // ── Drain UDP relay siblings that fired ────────────────────────
     {
-        let udp_drain: Vec<(i32, u16)> = io.udps.iter()
-            .map(|u| (u.fd, u.guest_port))
+        let udp_drain: Vec<(i32, u16, UdpRelayFamily)> = io.udps.iter()
+            .map(|u| (u.fd, u.guest_port, u.family))
             .collect();
-        for (i, (fd, gp)) in udp_drain.into_iter().enumerate() {
+        for (i, (fd, gp, family)) in udp_drain.into_iter().enumerate() {
             if io.pollfds[udp_slot_start + i].revents & libc::POLLIN != 0 {
-                handle_udp_rx(io, &qsnap, fd, gp, single_queue);
+                match family {
+                    UdpRelayFamily::V4 => handle_udp_rx(io, &qsnap, fd, gp, single_queue),
+                    UdpRelayFamily::V6 => handle_udp_rx_v6(io, &qsnap, fd, gp, single_queue),
+                }
                 any_injected = true;
             }
         }
@@ -1316,16 +1395,177 @@ fn handle_ipv6(ip: &[u8], guest_mac: [u8; 6]) {
     let dst_ip: [u8; 16] = ip[24..40].try_into().unwrap_or([0; 16]);
     let payload = &ip[40..40 + payload_len];
 
-    if next_header == 58 {
-        // ICMPv6 — only the bits we need: NS (135), Echo Request (128).
-        if payload.is_empty() { return; }
-        match payload[0] {
-            128 => bounce_icmpv6_echo(src_ip, dst_ip, payload, guest_mac),
-            135 => reply_neighbor_solicitation(src_ip, payload, guest_mac),
-            _ => {}
+    match next_header {
+        58 => {
+            if payload.is_empty() { return; }
+            match payload[0] {
+                128 => bounce_icmpv6_echo(src_ip, dst_ip, payload, guest_mac),
+                135 => reply_neighbor_solicitation(src_ip, payload, guest_mac),
+                _ => {}
+            }
+        }
+        17 => handle_udp_v6(payload, src_ip, dst_ip),
+        // TCP-over-IPv6 not bridged yet (Phase 5e follow-up).
+        _ => {}
+    }
+}
+
+// ── IPv6 UDP relay ─────────────────────────────────────────────
+//
+// Mirrors the v4 UDP path (`handle_udp_rx` worker-side, `handle_udp`
+// vCPU-side) for inbound + reply traffic over IPv6. The runner
+// holds an AF_INET6 socket bound to `::1:host_port` per
+// `-p udp:H:G` mapping; datagrams arriving there get translated
+// into IPv6 UDP frames addressed to the VM's link-local; the VM's
+// reply hits `handle_udp_v6`, which `sendto`s back to the
+// remembered `sockaddr_in6`.
+
+/// Build a UDP-over-IPv6 frame: virtio_net_hdr | Eth | IPv6 | UDP
+/// | payload. Returns total bytes written into `buf`.
+fn build_udp_frame_v6(
+    buf: &mut [u8],
+    dst_mac: &[u8; 6],
+    src_ip: &[u8; 16],
+    dst_ip: &[u8; 16],
+    src_port: u16,
+    dst_port: u16,
+    payload: &[u8],
+) -> usize {
+    let udp_len = 8 + payload.len();
+    let total = VIRTIO_NET_HDR_SIZE + 14 + 40 + udp_len;
+    debug_assert!(total <= buf.len());
+    buf[..VIRTIO_NET_HDR_SIZE].fill(0);
+    let mut o = VIRTIO_NET_HDR_SIZE;
+    buf[o..o+6].copy_from_slice(dst_mac); o += 6;
+    buf[o..o+6].copy_from_slice(&GW_MAC); o += 6;
+    buf[o..o+2].copy_from_slice(&0x86ddu16.to_be_bytes()); o += 2;
+    // IPv6 header.
+    buf[o..o+4].copy_from_slice(&0x6000_0000u32.to_be_bytes()); o += 4;
+    buf[o..o+2].copy_from_slice(&(udp_len as u16).to_be_bytes()); o += 2;
+    buf[o] = 17; o += 1; // next_header = UDP
+    buf[o] = 64; o += 1; // hop limit
+    buf[o..o+16].copy_from_slice(src_ip); o += 16;
+    buf[o..o+16].copy_from_slice(dst_ip); o += 16;
+    // UDP header + payload first (with checksum=0), then patch in
+    // the pseudo-header checksum over header+payload.
+    let us = o;
+    buf[o..o+2].copy_from_slice(&src_port.to_be_bytes()); o += 2;
+    buf[o..o+2].copy_from_slice(&dst_port.to_be_bytes()); o += 2;
+    buf[o..o+2].copy_from_slice(&(udp_len as u16).to_be_bytes()); o += 2;
+    buf[o..o+2].fill(0); o += 2; // checksum placeholder
+    buf[o..o+payload.len()].copy_from_slice(payload);
+    let cksum = ipv6_pseudo_checksum(src_ip, dst_ip, 17, &buf[us..us+udp_len]);
+    buf[us+6..us+8].copy_from_slice(&cksum.to_be_bytes());
+    total
+}
+
+/// VM IPv6 link-local — derived from `GUEST_MAC` via modified
+/// EUI-64 (mirrors what the unikernel computes at boot).
+const VM_IPV6: [u8; 16] = [
+    0xfe, 0x80, 0, 0, 0, 0, 0, 0,
+    GUEST_MAC[0] ^ 0x02, GUEST_MAC[1], GUEST_MAC[2],
+    0xff, 0xfe,
+    GUEST_MAC[3], GUEST_MAC[4], GUEST_MAC[5],
+];
+
+/// Worker-side IPv6 UDP RX. Reads from the AF_INET6 sibling fd,
+/// records the `(guest_port, client_port) → sockaddr_in6` mapping
+/// in `udp_clients_v6`, and injects a UDP-over-IPv6 frame into
+/// the guest. Mirrors `handle_udp_rx` for v4.
+fn handle_udp_rx_v6(
+    io: &mut IoState,
+    qsnap: &virtio::QueueSnapshot,
+    fd: i32,
+    guest_port: u16,
+    single_queue: bool,
+) {
+    let shared = worker_shared(io.id);
+    let mut any_injected = false;
+    let mut ring_full = false;
+    loop {
+        let mut client_addr: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+        let mut addr_len: libc::socklen_t = std::mem::size_of::<libc::sockaddr_in6>() as u32;
+        let n = unsafe {
+            libc::recvfrom(fd, io.read_buf.as_mut_ptr() as *mut _,
+                io.read_buf.len(), 0,
+                &mut client_addr as *mut _ as *mut libc::sockaddr,
+                &mut addr_len)
+        };
+        if n <= 0 { break; }
+        let payload_len = n as usize;
+        let client_port = u16::from_be(client_addr.sin6_port);
+
+        {
+            let mut m = shared.udp_clients_v6.lock().unwrap();
+            m.insert((guest_port, client_port), client_addr);
+        }
+
+        if !qsnap.ready { ring_full = true; continue; }
+
+        // Source address from the host's perspective: GW_IPV6
+        // (the runner's gateway). Destination = VM_IPV6.
+        let frame_len = build_udp_frame_v6(
+            &mut io.frame_buf,
+            &io.guest_mac,
+            &GW_IPV6, &VM_IPV6,
+            client_port, guest_port,
+            &io.read_buf[..payload_len],
+        );
+        if !inject_frame(&io.frame_buf[..frame_len], qsnap, &mut io.rx_last) {
+            ring_full = true; continue;
+        }
+        any_injected = true;
+    }
+    if !any_injected && !ring_full { return; }
+    unsafe { core::arch::asm!("dsb sy", options(nostack)); }
+    if single_queue {
+        unsafe {
+            hvf::hv_gic_set_spi(35, true);
+            hvf::hv_gic_set_spi(35, false);
         }
     }
-    // TCP / UDP over IPv6 not bridged yet — silently dropped.
+    let _ = io.id;
+}
+
+/// vCPU-side handler for guest-TX UDP-over-IPv6 packets.
+/// Distinguishes:
+///   * Reply path: `src_port` matches a `UDP_RELAYS_V6` entry's
+///     `guest_port` → look up the original `sockaddr_in6` in
+///     `udp_clients_v6` and `sendto` back to the host.
+///   * Outbound (guest-initiated): not supported yet — DHCP
+///     equivalent for v6 is SLAAC, which doesn't go through the
+///     runner; other outbound v6 patterns aren't a real use case
+///     for us right now.
+fn handle_udp_v6(udp: &[u8], _src_ip: [u8; 16], _dst_ip: [u8; 16]) {
+    if udp.len() < 8 { return; }
+    let src_port = u16::from_be_bytes([udp[0], udp[1]]);
+    let dst_port = u16::from_be_bytes([udp[2], udp[3]]);
+    let payload = &udp[8..];
+    if payload.is_empty() { return; }
+
+    let vcpu_id = CURRENT_VCPU.with(|c| c.get());
+    let inbound = UDP_RELAYS_V6.get().and_then(|table| {
+        table.iter().find(|r| r.guest_port == src_port)
+    });
+    let relay = match inbound {
+        Some(r) => r,
+        None => return,
+    };
+    let fd = match relay.fds.get(vcpu_id).or_else(|| relay.fds.first()) {
+        Some(&fd) => fd,
+        None => return,
+    };
+    let client_addr = {
+        let guard = my_worker_shared().udp_clients_v6.lock().unwrap();
+        guard.get(&(src_port, dst_port)).copied()
+    };
+    if let Some(addr) = client_addr {
+        unsafe {
+            libc::sendto(fd, payload.as_ptr() as *const _, payload.len(),
+                0, &addr as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in6>() as u32);
+        }
+    }
 }
 
 /// IPv6 pseudo-header checksum (RFC 8200 §8.1) over the upper-
