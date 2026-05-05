@@ -11,6 +11,8 @@ pub extern crate net_types as types;
 pub extern crate net_ethernet as ethernet;
 pub extern crate net_arp as arp;
 pub extern crate net_ipv4 as ipv4;
+pub extern crate net_ipv6 as ipv6;
+pub extern crate net_icmpv6 as icmpv6;
 pub extern crate net_tcp as tcp;
 pub extern crate net_udp as udp;
 pub extern crate net_dhcp as dhcp;
@@ -88,6 +90,7 @@ pub fn init_stack() {
     JUST_DISTRIBUTED.init(n, |_| core::sync::atomic::AtomicBool::new(false));
     arp::init();
     ipv4::init();
+    init_ipv6();
 
     REGISTRY.register(protocol::Slot::Tcp, tcp_dispatch);
     REGISTRY.register(protocol::Slot::Udp, udp_dispatch);
@@ -402,9 +405,173 @@ pub fn net_receive(frame: &[u8]) {
                     );
                 }
             }
+            ipv6::ETHERTYPE_IPV6 => ipv6_receive_frame(payload, src_mac),
             _ => {}
         }
     }
+}
+
+// ============================================================================
+// IPv6 receive + ICMPv6 / NDP service
+// ============================================================================
+
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
+/// Our link-local IPv6 address, derived from the NIC MAC at
+/// `init_ipv6` time via modified EUI-64 (RFC 4291). Stored as 16
+/// `AtomicU8`s so a multi-core read-during-init never races.
+/// Single writer (BSP at boot); many readers (per-core RX paths).
+static IPV6_LL_OCTETS: [AtomicU8; 16] = [
+    AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0),
+    AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0),
+    AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0),
+    AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0),
+];
+static IPV6_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+fn ipv6_ll() -> types::Ipv6Addr {
+    let mut o = [0u8; 16];
+    for (i, slot) in IPV6_LL_OCTETS.iter().enumerate() {
+        o[i] = slot.load(Ordering::Acquire);
+    }
+    types::Ipv6Addr { octets: o }
+}
+
+/// Initialise our IPv6 link-local address from the cached MAC. Idempotent;
+/// the BSP calls this once after `ethernet::init_mac`.
+pub fn init_ipv6() {
+    if IPV6_INITIALIZED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let mac = ethernet::ethernet_our_mac();
+    let ll = types::Ipv6Addr::link_local_from_mac(&mac);
+    for (i, slot) in IPV6_LL_OCTETS.iter().enumerate() {
+        slot.store(ll.octets[i], Ordering::Release);
+    }
+    uni_kernel::serial::write_fmt(format_args!(
+        "[net] ipv6 link-local fe80::{:x}:{:x}:{:x}:{:x}\n",
+        u16::from_be_bytes([ll.octets[8], ll.octets[9]]),
+        u16::from_be_bytes([ll.octets[10], ll.octets[11]]),
+        u16::from_be_bytes([ll.octets[12], ll.octets[13]]),
+        u16::from_be_bytes([ll.octets[14], ll.octets[15]]),
+    ));
+}
+
+/// Addresses we accept inbound IPv6 packets to: link-local, the
+/// solicited-node multicast for that LL address, and all-nodes
+/// link-local (ff02::1).
+fn our_v6_addrs() -> [types::Ipv6Addr; 3] {
+    let ll = ipv6_ll();
+    [
+        ll,
+        types::Ipv6Addr::solicited_node(&ll),
+        types::Ipv6Addr::ALL_NODES_LL,
+    ]
+}
+
+fn ipv6_receive_frame(frame: &[u8], src_mac: types::MacAddr) {
+    let addrs = our_v6_addrs();
+    let pkt = match ipv6::ipv6_receive(frame, &addrs) {
+        Some(p) => p,
+        None => return,
+    };
+    match pkt.next_header {
+        ipv6::next_header::ICMPV6 => handle_icmpv6(&pkt, src_mac),
+        // UDP / TCP over IPv6 — protocol stack still IPv4-keyed for
+        // now; full IPv6 sockets land in a future commit.
+        _ => {}
+    }
+}
+
+fn handle_icmpv6(pkt: &ipv6::Ipv6Packet<'_>, src_mac: types::MacAddr) {
+    if pkt.payload.is_empty() {
+        return;
+    }
+    if icmpv6::verify_checksum(&pkt.src, &pkt.dst, pkt.payload).is_err() {
+        return;
+    }
+    match pkt.payload[0] {
+        icmpv6::msg::ECHO_REQUEST => {
+            // Reply: src = our LL, dst = original src. RFC 4443 §4.2:
+            // hop limit 64 (default).
+            let mut icmp_out = [0u8; 1500 - ipv6::HEADER_LEN];
+            let n = match icmpv6::build_echo_reply(&ipv6_ll(), &pkt.src, pkt.payload, &mut icmp_out) {
+                Some(n) => n,
+                None => return,
+            };
+            send_ipv6(&pkt.src, src_mac, ipv6::next_header::ICMPV6, 64, &icmp_out[..n]);
+        }
+        icmpv6::msg::NEIGHBOR_SOLICITATION => {
+            let ns = match icmpv6::parse_neighbor_solicitation(pkt.payload) {
+                Ok(ns) => ns,
+                Err(_) => return,
+            };
+            // Only respond if the target is one of our addresses.
+            if ns.target != ipv6_ll() {
+                return;
+            }
+            let mac = ethernet::ethernet_our_mac();
+            let mut icmp_out = [0u8; 64];
+            let n = match icmpv6::build_neighbor_advertisement(
+                &ipv6_ll(),
+                &pkt.src,
+                &ns.target,
+                &mac,
+                &mut icmp_out,
+            ) {
+                Some(n) => n,
+                None => return,
+            };
+            // Send the NA back to the soliciting host. The peer's
+            // MAC is the inbound frame's src, OR the SLLA option
+            // if we want to be cleaner. Either works.
+            let dst_mac = ns.src_lla.unwrap_or(src_mac);
+            send_ipv6_with_dst_mac(&pkt.src, dst_mac, ipv6::next_header::ICMPV6, 255, &icmp_out[..n]);
+        }
+        _ => {}
+    }
+}
+
+/// Build + ship an IPv6 packet for which we already know the
+/// destination MAC (e.g. inbound frame's source). Bypasses NDP
+/// resolution.
+fn send_ipv6_with_dst_mac(
+    dst: &types::Ipv6Addr,
+    dst_mac: types::MacAddr,
+    next_header: u8,
+    hop_limit: u8,
+    payload: &[u8],
+) {
+    let mut buf = [0u8; 1500];
+    let n = match ipv6::ipv6_build(&ipv6_ll(), dst, next_header, hop_limit, payload, &mut buf) {
+        Some(n) => n,
+        None => return,
+    };
+    ethernet::ethernet_send(dst_mac, ipv6::ETHERTYPE_IPV6, &buf[..n]);
+}
+
+/// Build + ship an IPv6 packet, using the inbound `src_mac` as
+/// destination (for replies on the receive path; eliminates NDP
+/// resolution for symmetric flows).
+fn send_ipv6(
+    dst: &types::Ipv6Addr,
+    fallback_dst_mac: types::MacAddr,
+    next_header: u8,
+    hop_limit: u8,
+    payload: &[u8],
+) {
+    // Multicast destinations get the deterministic 33:33:XX:XX:XX:XX
+    // mapping; unicast falls back to the inbound src MAC (works for
+    // direct replies; full NDP cache is a future commit).
+    let dst_mac = if dst.is_multicast() {
+        dst.multicast_mac()
+    } else {
+        fallback_dst_mac
+    };
+    send_ipv6_with_dst_mac(dst, dst_mac, next_header, hop_limit, payload);
 }
 
 /// Flow hash: map a 4-tuple to a core index for Tier 2 distribution.
