@@ -484,6 +484,13 @@ pub struct Connection {
     /// `pop_packet` drains the front entry.
     outbound: Vec<Vec<u8>>,
 
+    /// Per-conn scratch for the per-packet `frames` buffer.
+    /// `encode_*_packet` clear()s it on entry — capacity stays,
+    /// no realloc — instead of allocating a fresh Vec per packet.
+    /// On the hot path of a multi-packet response that's one
+    /// fewer alloc per packet (×6+ for a typical 6 KiB page).
+    scratch_frames: Vec<u8>,
+
     /// Per-stream receive state, keyed by stream ID. Lazily
     /// inserted on the first STREAM frame.
     recv_streams: alloc::collections::BTreeMap<u64, crate::streams::RecvStream>,
@@ -553,6 +560,7 @@ impl Connection {
             close_pending: None,
             one_rtt_crypto_offset: 0,
             outbound: Vec::new(),
+            scratch_frames: Vec::with_capacity(1500),
             recv_streams: alloc::collections::BTreeMap::new(),
             send_streams: alloc::collections::BTreeMap::new(),
             opened_streams: Vec::new(),
@@ -1904,8 +1912,13 @@ impl Connection {
             None => return Ok(()),
         };
 
-        // Collect frames into a scratch buffer.
-        let mut frames: Vec<u8> = Vec::with_capacity(PACKET_BODY_BUDGET);
+        // Collect frames into the per-conn scratch buffer (taken
+        // out and put back via core::mem::take so methods on
+        // `self` remain callable while we mutate frames). After
+        // the first packet on this conn, the Vec's capacity is
+        // already sized — no realloc per packet.
+        let mut frames = core::mem::take(&mut self.scratch_frames);
+        frames.clear();
         // Tracks whether the packet contains any non-ACK frame.
         // RFC 9002 §3: a packet is ack-eliciting iff it carries a
         // frame other than ACK / PADDING / CONNECTION_CLOSE.
@@ -2025,6 +2038,8 @@ impl Connection {
         }
 
         if frames.is_empty() {
+            // No frames produced; restore the scratch and return.
+            self.scratch_frames = frames;
             return Ok(());
         }
 
@@ -2064,6 +2079,9 @@ impl Connection {
             false,
         )?;
         self.record_sent_packet(CryptoLevel::OneRtt, pn, ack_eliciting, byte_count);
+        // Return the (possibly grown) scratch Vec to the conn
+        // so the next encode_one_rtt_packet reuses its capacity.
+        self.scratch_frames = frames;
         Ok(())
     }
 
