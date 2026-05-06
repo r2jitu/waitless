@@ -164,6 +164,22 @@ pub struct Counters {
     /// is just slow / the peer is briefly unresponsive; a bumped
     /// counter with matching loss growth means real loss.
     pub pto_probes_sent: AtomicU64,
+    /// Total RecvStream entries ever created (one per peer-initiated
+    /// stream that arrived). Pair with `streams_reaped` to spot a
+    /// leak: if `recv_streams_created - streams_reaped` keeps
+    /// climbing, some sid is stuck with one side done and the other
+    /// dangling — usually a request stream where the handler bailed
+    /// without sending a response.
+    pub recv_streams_created: AtomicU64,
+    /// Total SendStream entries ever created (one per stream the app
+    /// or H3 layer wrote to). For HTTP/3 servers each request creates
+    /// one of these.
+    pub send_streams_created: AtomicU64,
+    /// Streams pruned by `reap_finished_streams` after both sides
+    /// FIN'd and buffers drained. Should track 1:1 with completed
+    /// requests; lag means streams aren't reaching the reapable
+    /// state.
+    pub streams_reaped: AtomicU64,
 }
 
 impl Counters {
@@ -197,6 +213,9 @@ impl Counters {
             packets_lost_threshold: AtomicU64::new(0),
             packets_lost_time: AtomicU64::new(0),
             pto_probes_sent: AtomicU64::new(0),
+            recv_streams_created: AtomicU64::new(0),
+            send_streams_created: AtomicU64::new(0),
+            streams_reaped: AtomicU64::new(0),
         }
     }
 }
@@ -316,7 +335,7 @@ pub fn should_log_event() -> bool {
 
 /// Snapshot of every counter, for `/debug/quic_stats`-style dumps.
 /// Returns `(name, value)` pairs in declaration order.
-pub fn snapshot() -> [(&'static str, u64); 28] {
+pub fn snapshot() -> [(&'static str, u64); 31] {
     let c = &COUNTERS;
     [
         ("no_dcid", c.no_dcid.load(Ordering::Relaxed)),
@@ -347,6 +366,9 @@ pub fn snapshot() -> [(&'static str, u64); 28] {
         ("packets_lost_threshold", c.packets_lost_threshold.load(Ordering::Relaxed)),
         ("packets_lost_time", c.packets_lost_time.load(Ordering::Relaxed)),
         ("pto_probes_sent", c.pto_probes_sent.load(Ordering::Relaxed)),
+        ("recv_streams_created", c.recv_streams_created.load(Ordering::Relaxed)),
+        ("send_streams_created", c.send_streams_created.load(Ordering::Relaxed)),
+        ("streams_reaped", c.streams_reaped.load(Ordering::Relaxed)),
     ]
 }
 

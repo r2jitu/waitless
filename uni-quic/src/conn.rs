@@ -782,6 +782,7 @@ impl Connection {
         for sid in candidates {
             self.send_streams.remove(&sid);
             self.recv_streams.remove(&sid);
+            crate::diag::bump(&crate::diag::COUNTERS.streams_reaped);
         }
     }
 
@@ -840,21 +841,29 @@ impl Connection {
     /// the wire on the next outbound flush. Auto-creates the stream
     /// state lazily.
     pub fn stream_send(&mut self, sid: u64, data: &[u8]) {
+        let was_new = !self.send_streams.contains_key(&sid);
         let s = self
             .send_streams
             .entry(sid)
             .or_insert_with(crate::streams::SendStream::default);
         s.write(data);
+        if was_new {
+            crate::diag::bump(&crate::diag::COUNTERS.send_streams_created);
+        }
     }
 
     /// Mark stream `sid` for FIN. The next outbound STREAM frame
     /// after the buffer drains will carry the FIN flag.
     pub fn stream_close(&mut self, sid: u64) {
+        let was_new = !self.send_streams.contains_key(&sid);
         let s = self
             .send_streams
             .entry(sid)
             .or_insert_with(crate::streams::SendStream::default);
         s.close();
+        if was_new {
+            crate::diag::bump(&crate::diag::COUNTERS.send_streams_created);
+        }
     }
 
     /// Force a 1-RTT packet emission even if no inbound datagram
@@ -1401,11 +1410,15 @@ impl Connection {
                 }
                 Frame::Stream { stream_id, offset, data, fin } => {
                     if matches!(level, CryptoLevel::OneRtt) {
+                        let was_new = !self.recv_streams.contains_key(&stream_id);
                         let s = self
                             .recv_streams
                             .entry(stream_id)
                             .or_insert_with(crate::streams::RecvStream::default);
                         s.ingest(offset, data, fin);
+                        if was_new {
+                            crate::diag::bump(&crate::diag::COUNTERS.recv_streams_created);
+                        }
                         if !self.opened_streams.contains(&stream_id) {
                             self.opened_streams.push(stream_id);
                         }

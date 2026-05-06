@@ -152,7 +152,8 @@ where
         let (n, end) = conn.recv(sid, &mut chunk).await;
         if n > 0 {
             if buf.len() + n > RECV_CAP {
-                return; // request too large; drop conn
+                conn.close_stream(sid);
+                return;
             }
             buf.extend_from_slice(&chunk[..n]);
         }
@@ -165,7 +166,10 @@ where
             let (f, used) = match frame::parse_frame(&buf) {
                 Ok(x) => x,
                 Err(frame::FrameError::Truncated) => break,
-                Err(_) => return, // malformed; bail
+                Err(_) => {
+                    conn.close_stream(sid);
+                    return;
+                }
             };
             match f {
                 frame::Frame::Headers(body) => {
@@ -187,13 +191,17 @@ where
         }
     }
     if !headers_seen {
+        conn.close_stream(sid);
         return;
     }
 
     // Decode QPACK headers.
     let fields = match qpack::decode_field_section(&headers_value) {
         Ok(f) => f,
-        Err(_) => return,
+        Err(_) => {
+            conn.close_stream(sid);
+            return;
+        }
     };
 
     // Translate to uni_http::Request.
