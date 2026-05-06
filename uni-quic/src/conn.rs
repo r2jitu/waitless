@@ -724,7 +724,7 @@ impl Connection {
     /// happens — so calling it per packet is cheap.
     pub fn process_datagram(
         &mut self,
-        datagram: &[u8],
+        datagram: &mut [u8],
         config: &TlsServerConfig,
     ) -> Result<(), ConnError> {
         if matches!(self.state, ConnState::Failed) {
@@ -751,7 +751,12 @@ impl Connection {
             // short-header (1-RTT) packets there's no length —
             // the packet IS the rest of the datagram — so on
             // decrypt failure we drop the whole remainder.
-            match self.process_one_packet(&datagram[p..], config) {
+            //
+            // The slice we pass is `&mut datagram[p..]` so each
+            // packet processor can do HP-unprotect / AEAD-decrypt
+            // in place rather than copying the bytes into a fresh
+            // Vec. -1 alloc per inbound packet on the hot path.
+            match self.process_one_packet(&mut datagram[p..], config) {
                 Ok(0) => break, // forward-progress guard
                 Ok(consumed) => {
                     p += consumed;
@@ -949,7 +954,7 @@ impl Connection {
 
     fn process_one_packet(
         &mut self,
-        bytes: &[u8],
+        bytes: &mut [u8],
         _config: &TlsServerConfig,
     ) -> Result<usize, ConnError> {
         if bytes.is_empty() {
@@ -972,7 +977,7 @@ impl Connection {
         }
     }
 
-    fn process_long_header_packet(&mut self, bytes: &[u8]) -> Result<usize, ConnError> {
+    fn process_long_header_packet(&mut self, bytes: &mut [u8]) -> Result<usize, ConnError> {
         let preamble = parse_long_header_preamble(bytes).map_err(|_| {
             crate::quic_drop!(long_header_parse,
                 "size={} first={:#x}", bytes.len(), bytes.first().copied().unwrap_or(0));
@@ -1003,7 +1008,7 @@ impl Connection {
     /// resumption negotiated), matching the spec's "0-RTT MAY be
     /// rejected; client treats it as transparent retransmission
     /// over 1-RTT" behaviour.
-    fn process_zero_rtt(&mut self, bytes: &[u8]) -> Result<usize, ConnError> {
+    fn process_zero_rtt(&mut self, bytes: &mut [u8]) -> Result<usize, ConnError> {
         let preamble = parse_long_header_preamble(bytes).map_err(|_| {
             crate::quic_drop!(long_header_parse, "0-RTT preamble: size={}", bytes.len());
             ConnError::Wire
@@ -1045,8 +1050,8 @@ impl Connection {
             }
         };
 
-        let mut buf = bytes[..total_packet_len].to_vec();
-        let pn = self.unprotect_and_decrypt(&mut buf, pn_offset, &recv_keys)?;
+        let buf = &mut bytes[..total_packet_len];
+        let pn = self.unprotect_and_decrypt(buf, pn_offset, &recv_keys)?;
         let pn_length = ((buf[0] & 0x03) as usize) + 1;
         let payload_start = pn_offset + pn_length;
         let payload_end = total_packet_len - TAG_LEN;
@@ -1074,38 +1079,38 @@ impl Connection {
         Ok(total_packet_len)
     }
 
-    fn process_initial(&mut self, bytes: &[u8]) -> Result<usize, ConnError> {
-        let header = parse_initial_header(bytes).map_err(|_| ConnError::Wire)?;
-        // First-Initial path: derive Initial keys from the
-        // client's chosen DCID and learn our peer_cid.
-        if self.initial_recv.is_none() {
-            let dcid = ConnectionId::new(header.preamble.dcid);
-            let scid = ConnectionId::new(header.preamble.scid);
-            self.initial_dcid = dcid;
-            self.peer_cid = scid;
-            let secrets = derive_initial_secrets(self.initial_dcid.as_slice());
-            let server_keys = derive_initial_keys(&secrets.server);
-            let client_keys = derive_initial_keys(&secrets.client);
-            self.initial_send = Some(DirKeys::from_initial(&server_keys));
-            self.initial_recv = Some(DirKeys::from_initial(&client_keys));
-            self.state = ConnState::Connecting;
-
-            // Build server transport parameters (RFC 9001 §8.2).
-            // `original_destination_connection_id` = client's first
-            // DCID; `initial_source_connection_id` = our chosen SCID.
-            let server_params = {
-                let p = crate::transport_params::ServerParams::defaults(
-                    self.initial_dcid.as_slice(),
-                    self.local_cid.as_slice(),
-                );
-                let mut blob = Vec::with_capacity(64);
-                p.encode(&mut blob);
-                blob
-            };
-            self.tls.set_server_transport_params(server_params);
-        }
-
-        let total_packet_len = header.pn_offset + header.length as usize;
+    fn process_initial(&mut self, bytes: &mut [u8]) -> Result<usize, ConnError> {
+        // Parse the header up-front, copying out everything we'll
+        // need afterwards (pn_offset + total_packet_len), so the
+        // immutable borrow on `bytes` ends before we reborrow it
+        // mutably for in-place HP/AEAD work.
+        let (header_pn_offset, total_packet_len) = {
+            let header =
+                parse_initial_header(bytes).map_err(|_| ConnError::Wire)?;
+            if self.initial_recv.is_none() {
+                let dcid = ConnectionId::new(header.preamble.dcid);
+                let scid = ConnectionId::new(header.preamble.scid);
+                self.initial_dcid = dcid;
+                self.peer_cid = scid;
+                let secrets = derive_initial_secrets(self.initial_dcid.as_slice());
+                let server_keys = derive_initial_keys(&secrets.server);
+                let client_keys = derive_initial_keys(&secrets.client);
+                self.initial_send = Some(DirKeys::from_initial(&server_keys));
+                self.initial_recv = Some(DirKeys::from_initial(&client_keys));
+                self.state = ConnState::Connecting;
+                let server_params = {
+                    let p = crate::transport_params::ServerParams::defaults(
+                        self.initial_dcid.as_slice(),
+                        self.local_cid.as_slice(),
+                    );
+                    let mut blob = Vec::with_capacity(64);
+                    p.encode(&mut blob);
+                    blob
+                };
+                self.tls.set_server_transport_params(server_params);
+            }
+            (header.pn_offset, header.pn_offset + header.length as usize)
+        };
         if total_packet_len > bytes.len() {
             return Err(ConnError::Wire);
         }
@@ -1115,14 +1120,14 @@ impl Connection {
             .ok_or(ConnError::BadState)?
             .clone();
 
-        let mut buf = bytes[..total_packet_len].to_vec();
-        let pn = self.unprotect_and_decrypt(&mut buf, header.pn_offset, &recv_keys)?;
+        let buf = &mut bytes[..total_packet_len];
+        let pn = self.unprotect_and_decrypt(buf, header_pn_offset, &recv_keys)?;
 
         // Frame parsing: payload = buf[pn_offset + pn_length .. end - TAG_LEN].
         // unprotect_and_decrypt set buf[pn_offset..pn_offset+pn_length]
         // to the unprotected PN. We need pn_length to find payload start.
         let pn_length = ((buf[0] & 0x03) as usize) + 1;
-        let payload_start = header.pn_offset + pn_length;
+        let payload_start = header_pn_offset + pn_length;
         let payload_end = total_packet_len - TAG_LEN;
         let payload = &buf[payload_start..payload_end];
         self.dispatch_frames(CryptoLevel::Initial, payload)?;
@@ -1134,7 +1139,7 @@ impl Connection {
         Ok(total_packet_len)
     }
 
-    fn process_handshake_pkt(&mut self, bytes: &[u8]) -> Result<usize, ConnError> {
+    fn process_handshake_pkt(&mut self, bytes: &mut [u8]) -> Result<usize, ConnError> {
         // Handshake packet shares the long-header preamble shape
         // with Initial but has no Token field — just Length.
         let preamble = parse_long_header_preamble(bytes).map_err(|_| ConnError::Wire)?;
@@ -1153,8 +1158,8 @@ impl Connection {
             .ok_or(ConnError::BadState)?
             .clone();
 
-        let mut buf = bytes[..total_packet_len].to_vec();
-        let pn = self.unprotect_and_decrypt(&mut buf, pn_offset, &recv_keys)?;
+        let buf = &mut bytes[..total_packet_len];
+        let pn = self.unprotect_and_decrypt(buf, pn_offset, &recv_keys)?;
         let pn_length = ((buf[0] & 0x03) as usize) + 1;
         let payload_start = pn_offset + pn_length;
         let payload_end = total_packet_len - TAG_LEN;
@@ -1170,7 +1175,7 @@ impl Connection {
         Ok(total_packet_len)
     }
 
-    fn process_short_header_packet(&mut self, bytes: &[u8]) -> Result<usize, ConnError> {
+    fn process_short_header_packet(&mut self, bytes: &mut [u8]) -> Result<usize, ConnError> {
         // Short-header (1-RTT) layout:
         //   u8 first byte || N-byte DCID || PN bytes || ciphertext || tag.
         // DCID length is endpoint-known. For our server it's
@@ -1216,8 +1221,8 @@ impl Connection {
             .as_ref()
             .ok_or(ConnError::BadState)?
             .clone();
-        let mut buf = bytes[..total_packet_len].to_vec();
-        let pn = self.unprotect_header(&mut buf, pn_offset, &recv_keys_cur)?;
+        let buf = &mut bytes[..total_packet_len];
+        let pn = self.unprotect_header(buf, pn_offset, &recv_keys_cur)?;
         let pn_length = ((buf[0] & 0x03) as usize) + 1;
         let payload_start = pn_offset + pn_length;
         let payload_end = total_packet_len - TAG_LEN;
@@ -1556,8 +1561,8 @@ impl Connection {
                 // packet so we share decryption + frame-dispatch
                 // logic with the steady-state path.
                 let pending = core::mem::take(&mut self.pending_zero_rtt);
-                for pkt in pending {
-                    if let Err(e) = self.process_zero_rtt(&pkt) {
+                for mut pkt in pending {
+                    if let Err(e) = self.process_zero_rtt(&mut pkt) {
                         // Don't propagate — replay failures are
                         // best-effort and shouldn't kill the conn.
                         crate::quic_drop!(other_wire,
@@ -2730,7 +2735,7 @@ mod tests {
         let local_cid = ConnectionId::new(&[0xab; 8]);
         let mut conn = Connection::new_server(local_cid, [0x42u8; 32]);
         let cfg = dev_config();
-        conn.process_datagram(&packet, &cfg).expect("process inbound Initial");
+        conn.process_datagram(&mut packet, &cfg).expect("process inbound Initial");
 
         // The server should have moved into Connecting and queued
         // an outbound datagram with the server flight.

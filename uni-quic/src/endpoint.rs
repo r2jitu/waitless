@@ -590,11 +590,18 @@ async fn conn_task<H, F>(
         while let Some(d) = current.take() {
             peer_ip.set(d.src_ip);
             peer_port.set(d.src_port);
-            let result = conn.borrow_mut().process_datagram(&d.bytes, &cfg);
+            // Pass the datagram as `&mut [u8]` so the per-packet
+            // processors can do HP-unprotect + AEAD-decrypt in
+            // place rather than allocating a fresh buffer per
+            // packet. The Datagram owns its bytes Vec, so taking
+            // mutable access is straightforward.
+            let dgram_size = d.bytes.len();
+            let mut bytes = d.bytes;
+            let result = conn.borrow_mut().process_datagram(&mut bytes, &cfg);
             if let Err(e) = result {
                 crate::quic_drop!(other_wire,
                     "process_datagram failed: {:?} dgram_size={} local_cid={}",
-                    e, d.bytes.len(), hex8(&local_cid_bytes));
+                    e, dgram_size, hex8(&local_cid_bytes));
                 let (code, reason): (u64, &[u8]) = match e {
                     ConnError::Wire => (0x0a, b"protocol_violation"),
                     ConnError::Decrypt => (0x0a, b"crypto_error"),
