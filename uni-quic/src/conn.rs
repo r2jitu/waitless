@@ -2652,28 +2652,44 @@ impl Connection {
         let time_threshold_us = ((max_rtt * 9) / 8).max(K_GRANULARITY_US);
         let now = uni_tls::ticket::now_us();
 
-        // Two-pass to keep the borrow checker happy: collect lost
-        // PNs, then remove them. BTreeMap iteration is in PN
-        // order, so the threshold check is monotonic.
-        let mut lost_threshold: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
-        let mut lost_time: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+        // Stack-array scratch for the lost-PN list — typical case
+        // is 0 lost; even under heavy loss, more than ~32 packets
+        // declared lost in a single ACK is unusual. Avoiding the
+        // Vec::new() allocations on the common (no loss) path
+        // saves two allocs per ACK processed, and ACKs fire
+        // multiple times per HTTP/3 response.
+        const SCRATCH_CAP: usize = 64;
+        let mut lost_buf: [u64; SCRATCH_CAP] = [0; SCRATCH_CAP];
+        let mut lost_threshold_n: usize = 0;
+        let mut lost_time_n: usize = 0;
+        // Walk in PN order. Threshold-lost PNs come first
+        // (lowest PNs). Time-lost can appear after them. We pack
+        // both into the same buffer with threshold first;
+        // counters track how many of each.
         for (&pn, pkt) in space.sent_packets.iter() {
             if pn >= largest_acked {
                 break; // PN >= largest_acked are still in-flight
             }
             if pn + K_PACKET_THRESHOLD <= largest_acked {
-                lost_threshold.push(pn);
+                if lost_threshold_n + lost_time_n < SCRATCH_CAP {
+                    lost_buf[lost_threshold_n + lost_time_n] = pn;
+                    lost_threshold_n += 1;
+                }
                 continue;
             }
             if max_rtt > 0 && now.saturating_sub(pkt.time_sent_us) > time_threshold_us {
-                lost_time.push(pn);
+                if lost_threshold_n + lost_time_n < SCRATCH_CAP {
+                    lost_buf[lost_threshold_n + lost_time_n] = pn;
+                    lost_time_n += 1;
+                }
             }
         }
-        let lost_threshold_n = lost_threshold.len() as u64;
-        let lost_time_n = lost_time.len() as u64;
-        for pn in lost_threshold.into_iter().chain(lost_time.into_iter()) {
+        let total_lost = lost_threshold_n + lost_time_n;
+        for &pn in &lost_buf[..total_lost] {
             space.sent_packets.remove(&pn);
         }
+        let lost_threshold_n = lost_threshold_n as u64;
+        let lost_time_n = lost_time_n as u64;
         if lost_threshold_n > 0 {
             crate::diag::COUNTERS
                 .packets_lost_threshold
