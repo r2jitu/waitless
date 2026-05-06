@@ -267,54 +267,75 @@ where
     crate::diag::bump(&crate::diag::COUNTERS.user_handler_invoked);
     let response = handler(req).await;
     crate::diag::bump(&crate::diag::COUNTERS.user_handler_returned);
+    let status = response.status;
     // Encode response: HEADERS + DATA + FIN.
-    write_response(conn, sid, &response);
+    write_response(conn, sid, response);
     crate::diag::bump(&crate::diag::COUNTERS.write_response_completed);
-    crate::h3_event!(requests_handled, "sid={} status={}", sid, response.status);
+    crate::h3_event!(requests_handled, "sid={} status={}", sid, status);
     crate::diag::bump(&crate::diag::COUNTERS.responses_sent);
 }
 
-fn write_response(conn: &QuicConn, sid: u64, resp: &Response) {
-    // Build response payload — HEADERS frame + optional DATA
-    // frame — into a single Vec. The DATA frame goes in via
-    // `append_frame_header` + `extend_from_slice`, no tmp
-    // buffer. The HEADERS frame still uses one scratch Vec
-    // because we need the QPACK-encoded length before we can
-    // emit the type+length header.
+fn write_response(conn: &QuicConn, sid: u64, resp: Response) {
+    // Build the response in two pieces:
+    //   1. A "framing" Vec containing [H3 HEADERS frame complete]
+    //      [H3 DATA frame header without body]. Small (~64 B for
+    //      a typical response), allocated and moved into the
+    //      stream chain.
+    //   2. The body itself — sent as a separate chunk. If the
+    //      Response was built from a `&'static` slice the chunk
+    //      is borrowed (`stream_send_static`) — zero alloc, zero
+    //      copy. If owned (e.g. JSON rendered into a Vec at
+    //      handler time), the underlying Box is reinterpreted as
+    //      a Vec and moved by `stream_send_owned` — also zero
+    //      alloc, zero copy at this boundary. Either way, the
+    //      body bytes touch this codepath without a memcpy.
+    //
+    // Result: one extra small alloc (the framing Vec) — instead
+    // of allocating a payload Vec sized for body + framing and
+    // memcpying the body in.
     let status_str = status_to_bytes(resp.status);
-    let content_type = resp.content_type_bytes();
-    let body = resp.body_bytes();
-    let len_str = format_usize(body.len());
-
+    // Build qpack_buf while still borrowing resp; the encoder
+    // copies field bytes into qpack_buf, so the borrow ends as
+    // soon as encode_field_section returns. Then we consume
+    // resp to extract the body Cow.
+    let body_len: usize;
     let mut qpack_buf: Vec<u8> = Vec::with_capacity(128);
-    qpack::encode_field_section(
-        &[
-            (&b":status"[..], status_str.as_slice()),
-            (&b"content-type"[..], content_type),
-            (&b"content-length"[..], len_str.as_slice()),
-        ],
-        &mut qpack_buf,
-    );
+    {
+        let body_bytes = resp.body_bytes();
+        body_len = body_bytes.len();
+        let len_str = format_usize(body_len);
+        qpack::encode_field_section(
+            &[
+                (&b":status"[..], status_str.as_slice()),
+                (&b"content-type"[..], resp.content_type_bytes()),
+                (&b"content-length"[..], len_str.as_slice()),
+            ],
+            &mut qpack_buf,
+        );
+    }
+    let body_cow: alloc::borrow::Cow<'static, [u8]> = resp.into_body_cow();
 
-    let mut payload: Vec<u8> = Vec::with_capacity(qpack_buf.len() + body.len() + 16);
-    frame::append_frame_header(h3_ftype::HEADERS, qpack_buf.len(), &mut payload)
+    let mut framing: Vec<u8> = Vec::with_capacity(qpack_buf.len() + 16);
+    frame::append_frame_header(h3_ftype::HEADERS, qpack_buf.len(), &mut framing)
         .expect("headers frame header fits");
-    payload.extend_from_slice(&qpack_buf);
-    if !body.is_empty() {
-        frame::append_frame_header(h3_ftype::DATA, body.len(), &mut payload)
+    framing.extend_from_slice(&qpack_buf);
+    if body_len > 0 {
+        frame::append_frame_header(h3_ftype::DATA, body_len, &mut framing)
             .expect("data frame header fits");
-        payload.extend_from_slice(body);
     }
 
-    // One-shot send+FIN: bundles HEADERS+DATA bytes and the FIN
-    // marker into a single STREAM frame (and ideally a single
-    // 1-RTT packet). Avoids the FIN-without-data corner case
-    // where some H3 clients may discard the request stream
-    // before observing the data half.
-    // Hand off the payload Vec by move. `send_fin_owned` pushes
-    // it straight into the SendStream's chunk chain — no
-    // extend_from_slice copy at the QUIC API boundary.
-    conn.send_fin_owned(sid, payload);
+    // Framing chunk → stream by move.
+    conn.send_owned(sid, framing);
+    // Body chunk: borrowed if static, moved if owned.
+    if body_len > 0 {
+        match body_cow {
+            alloc::borrow::Cow::Borrowed(s) => conn.send_static(sid, s),
+            alloc::borrow::Cow::Owned(v) => conn.send_owned(sid, v),
+        }
+    }
+    // FIN is set by close_stream; the next pop_chunk_into emits
+    // it on the last chunk.
+    conn.close_stream(sid);
 }
 
 fn status_to_bytes(status: i32) -> [u8; 3] {

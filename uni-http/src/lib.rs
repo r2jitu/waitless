@@ -264,6 +264,32 @@ impl Response {
         }
     }
 
+    /// Consume the response and return its body as a
+    /// `Cow<'static, [u8]>`. Static-backed bodies (built from
+    /// `&'static [u8]`) come back as `Cow::Borrowed` with the
+    /// original static lifetime preserved — the caller can pass
+    /// them to zero-copy sinks like
+    /// `QuicConn::send_static(&'static [u8])` without
+    /// allocating. Owned bodies move out as `Cow::Owned(Vec<u8>)`
+    /// (Box's heap allocation is reinterpreted as a Vec without
+    /// copying).
+    pub fn into_body_cow(self) -> alloc::borrow::Cow<'static, [u8]> {
+        match self.body {
+            ResponseBody::Static { ptr, len } => {
+                // SAFETY: Static was constructed from a `&'static [u8]`
+                // (see ResponseBody::Static construction sites:
+                // `Response::ok(_, &'static_literal)` /
+                // `not_found()` / etc.). The lifetime is genuinely
+                // static; round-tripping it through the raw pointer
+                // is sound.
+                alloc::borrow::Cow::Borrowed(unsafe {
+                    core::slice::from_raw_parts(ptr, len)
+                })
+            }
+            ResponseBody::Owned(b) => alloc::borrow::Cow::Owned(b.into_vec()),
+        }
+    }
+
     /// Borrow the response body. Public so non-HTTP/1.1 frontends
     /// (HTTP/3) can serialise it into their own framing.
     pub fn body_bytes(&self) -> &[u8] {

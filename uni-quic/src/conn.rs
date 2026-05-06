@@ -1063,6 +1063,23 @@ impl Connection {
         }
     }
 
+    /// Append a `&'static` slice to stream `sid`'s outbound
+    /// chunk chain — zero allocation, zero copy. The slice is
+    /// held by reference; pop_chunk_into will copy the
+    /// requested bytes into the datagram payload region for
+    /// AEAD-in-place sealing.
+    pub fn stream_send_static(&mut self, sid: u64, data: &'static [u8]) {
+        let was_new = !self.send_streams.contains_key(&sid);
+        let s = self
+            .send_streams
+            .entry(sid)
+            .or_insert_with(crate::streams::SendStream::default);
+        s.write_static(data);
+        if was_new {
+            crate::diag::bump(&crate::diag::COUNTERS.send_streams_created);
+        }
+    }
+
     /// Mark stream `sid` for FIN. The next outbound STREAM frame
     /// after the buffer drains will carry the FIN flag.
     pub fn stream_close(&mut self, sid: u64) {
