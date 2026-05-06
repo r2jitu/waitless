@@ -283,6 +283,16 @@ pub struct Connection {
     /// CH has been parsed. The server never sends 0-RTT, so there's
     /// no `early_send` counterpart.
     early_recv: Option<DirKeys>,
+    /// 0-RTT packets that arrived before we'd derived `early_recv`
+    /// — typically because they were coalesced with (or arrived
+    /// before) the LAST fragment of a multi-packet ClientHello.
+    /// Drained and replayed by `advance_tls` the moment
+    /// `early_recv` becomes available; cleared (without replay)
+    /// once the handshake reaches Established without resumption,
+    /// since at that point we'll never be able to decrypt them.
+    /// Capped to avoid an unbounded memory footprint from a
+    /// flood-attempting peer.
+    pending_zero_rtt: Vec<Vec<u8>>,
 
     // ── 1-RTT key update state (RFC 9001 §6) ──────────────────────
     //
@@ -368,6 +378,7 @@ impl Connection {
             initial_send: None,
             initial_recv: None,
             early_recv: None,
+            pending_zero_rtt: Vec::new(),
             application_recv_prev: None,
             application_recv_next: None,
             client_app_secret: None,
@@ -618,10 +629,28 @@ impl Connection {
         let recv_keys = match self.early_recv.as_ref() {
             Some(k) => k.clone(),
             None => {
-                crate::quic_drop!(bad_state, "0-RTT packet but no early_recv keys");
-                // Consume the packet — caller's coalesced-packet
-                // walker shouldn't try to reparse the bytes as
-                // something else. Same shape as Initial / HS rejects.
+                // Keys aren't ready yet. Buffer the FULL packet
+                // (header included) so we can replay it once
+                // `advance_tls` derives `early_recv`. This handles:
+                //   * 0-RTT coalesced with a multi-packet CH whose
+                //     last fragment hasn't arrived yet
+                //   * 0-RTT in its own datagram that arrived before
+                //     the CH-completing Initial
+                // Cap the buffer so a malicious peer can't OOM us
+                // by sending undecryptable 0-RTT in a loop. 16
+                // packets × ~1500 bytes ≈ 24 KiB/conn worst case.
+                const PENDING_ZERO_RTT_CAP: usize = 16;
+                if self.pending_zero_rtt.len() < PENDING_ZERO_RTT_CAP {
+                    self.pending_zero_rtt.push(bytes[..total_packet_len].to_vec());
+                    crate::quic_event!(zero_rtt_buffered,
+                        "size={} pending={} local_cid={}",
+                        total_packet_len, self.pending_zero_rtt.len(),
+                        crate::endpoint::hex8(self.local_cid.as_slice()));
+                } else {
+                    crate::quic_drop!(bad_state,
+                        "0-RTT buffer full ({} packets), dropping new",
+                        PENDING_ZERO_RTT_CAP);
+                }
                 return Ok(total_packet_len);
             }
         };
@@ -1092,6 +1121,20 @@ impl Connection {
                 crate::quic_event!(early_keys_derived,
                     "local_cid={}",
                     crate::endpoint::hex8(self.local_cid.as_slice()));
+                // Replay any 0-RTT packets that arrived before
+                // the keys were ready. process_zero_rtt is the
+                // canonical handler — call it on each buffered
+                // packet so we share decryption + frame-dispatch
+                // logic with the steady-state path.
+                let pending = core::mem::take(&mut self.pending_zero_rtt);
+                for pkt in pending {
+                    if let Err(e) = self.process_zero_rtt(&pkt) {
+                        // Don't propagate — replay failures are
+                        // best-effort and shouldn't kill the conn.
+                        crate::quic_drop!(other_wire,
+                            "0-RTT replay error: {:?}", e);
+                    }
+                }
             }
         }
         // Once handshake-stage secrets exist on the TLS side and
@@ -1135,6 +1178,18 @@ impl Connection {
                 crate::quic_event!(handshakes_completed,
                     "local_cid={}",
                     crate::endpoint::hex8(self.local_cid.as_slice()));
+                // If the handshake completed WITHOUT resumption
+                // (no early_recv ever derived), we'll never be
+                // able to decrypt buffered 0-RTT packets — drop
+                // them now so they don't sit in memory until conn
+                // teardown. Common when a peer optimistically sent
+                // 0-RTT with a stale ticket from a previous boot.
+                if !self.pending_zero_rtt.is_empty() && self.early_recv.is_none() {
+                    crate::quic_event!(zero_rtt_unresumable,
+                        "dropped={} reason=resumption_rejected",
+                        self.pending_zero_rtt.len());
+                    self.pending_zero_rtt.clear();
+                }
             }
             self.state = ConnState::Established;
         } else if matches!(new_state, QuicTlsState::Failed) {

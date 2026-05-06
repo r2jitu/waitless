@@ -114,6 +114,20 @@ pub struct Counters {
     /// a malfunctioning peer or an attacker probing for stale-keys
     /// behavior.
     pub key_updates_accepted: AtomicU64,
+    /// 0-RTT packet arrived before we'd derived the early-data recv
+    /// keys (multi-packet CH still in flight, OR 0-RTT in its own
+    /// datagram that arrived before the CH-completing Initial). The
+    /// packet is buffered and replayed when keys land. Common at
+    /// connection start; persistent growth indicates the peer keeps
+    /// sending undecryptable 0-RTT or our key-derivation is stuck.
+    pub zero_rtt_buffered: AtomicU64,
+    /// Buffered 0-RTT packets dropped because the handshake
+    /// completed without resumption (e.g. peer presented a stale
+    /// ticket). Counter equals packets dropped, not connections —
+    /// a single peer-rejection can drop several pending packets at
+    /// once. Expected to fire briefly after a server reboot when
+    /// clients optimistically replay with the previous key's tickets.
+    pub zero_rtt_unresumable: AtomicU64,
 }
 
 impl Counters {
@@ -140,6 +154,8 @@ impl Counters {
             early_keys_derived: AtomicU64::new(0),
             zero_rtt_accepted: AtomicU64::new(0),
             key_updates_accepted: AtomicU64::new(0),
+            zero_rtt_buffered: AtomicU64::new(0),
+            zero_rtt_unresumable: AtomicU64::new(0),
         }
     }
 }
@@ -259,7 +275,7 @@ pub fn should_log_event() -> bool {
 
 /// Snapshot of every counter, for `/debug/quic_stats`-style dumps.
 /// Returns `(name, value)` pairs in declaration order.
-pub fn snapshot() -> [(&'static str, u64); 21] {
+pub fn snapshot() -> [(&'static str, u64); 23] {
     let c = &COUNTERS;
     [
         ("no_dcid", c.no_dcid.load(Ordering::Relaxed)),
@@ -283,6 +299,8 @@ pub fn snapshot() -> [(&'static str, u64); 21] {
         ("early_keys_derived", c.early_keys_derived.load(Ordering::Relaxed)),
         ("zero_rtt_accepted", c.zero_rtt_accepted.load(Ordering::Relaxed)),
         ("key_updates_accepted", c.key_updates_accepted.load(Ordering::Relaxed)),
+        ("zero_rtt_buffered", c.zero_rtt_buffered.load(Ordering::Relaxed)),
+        ("zero_rtt_unresumable", c.zero_rtt_unresumable.load(Ordering::Relaxed)),
     ]
 }
 
