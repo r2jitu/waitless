@@ -338,6 +338,15 @@ pub struct Connection {
     /// "creation time + idle".
     last_recv_us: u64,
 
+    /// Set by `close_with_error` to schedule a CONNECTION_CLOSE
+    /// frame on the next `flush_outbound`. `None` means the
+    /// connection is in normal operation. RFC 9000 §10.2.1: a close
+    /// is emitted at the highest packet number space we have keys
+    /// for; subsequent packets in lower spaces are NOT generated
+    /// after close. We emit one packet then transition to
+    /// `Failed` so the conn task tears down on its next iteration.
+    close_pending: Option<(u64, alloc::vec::Vec<u8>)>,
+
     /// Next-byte offset into the OneRtt CRYPTO stream for outbound
     /// post-handshake messages. Bumped on every CRYPTO frame
     /// emitted at 1-RTT level (currently NewSessionTicket; future
@@ -404,6 +413,7 @@ impl Connection {
             tls: QuicTls::new(seed),
             handshake_done_sent: false,
             last_recv_us: 0,
+            close_pending: None,
             one_rtt_crypto_offset: 0,
             outbound: Vec::new(),
             recv_streams: alloc::collections::BTreeMap::new(),
@@ -434,6 +444,41 @@ impl Connection {
     /// `idle_timeout_us` to compute the close deadline.
     pub fn last_recv_us(&self) -> u64 {
         self.last_recv_us
+    }
+
+    /// Schedule a CONNECTION_CLOSE on the next outbound flush.
+    /// Per RFC 9000 §10.2 the close is emitted as a single packet
+    /// at the highest level we have keys for; we mark the conn as
+    /// `Failed` so the task tears down right after.
+    ///
+    /// Standard error codes (RFC 9000 §20.1): `0x00 NO_ERROR`,
+    /// `0x01 INTERNAL_ERROR`, `0x0a PROTOCOL_VIOLATION`, etc.
+    /// `reason` is a UTF-8 byte slice; pass `b""` to omit.
+    pub fn close_with_error(&mut self, error_code: u64, reason: &[u8]) {
+        if self.close_pending.is_none() && !matches!(self.state, ConnState::Failed) {
+            self.close_pending = Some((error_code, reason.to_vec()));
+        }
+    }
+
+    /// Build the CONNECTION_CLOSE packet (if `close_pending` is set)
+    /// without going through `flush_outbound`. The conn task uses
+    /// this from its error-handling arm where it doesn't have a
+    /// `TlsServerConfig` reference handy and where `process_datagram`
+    /// has already returned, so the normal flush path won't run.
+    /// No-op when no close is pending.
+    pub fn flush_close(&mut self) {
+        if let Some((error_code, reason)) = self.close_pending.take() {
+            let mut datagram = alloc::vec::Vec::with_capacity(256);
+            if self
+                .encode_close_packet(&mut datagram, error_code, &reason)
+                .is_ok()
+                && !datagram.is_empty()
+            {
+                self.outbound.push(datagram);
+                crate::diag::bump(&crate::diag::COUNTERS.connection_closes_emitted);
+            }
+            self.state = ConnState::Failed;
+        }
     }
 
     /// Effective idle-timeout window for this connection, in
@@ -1258,6 +1303,24 @@ impl Connection {
     }
 
     fn flush_outbound(&mut self, _config: &TlsServerConfig) -> Result<(), ConnError> {
+        // CONNECTION_CLOSE short-circuits the normal flush flow.
+        // RFC 9000 §10.2.1: once we decide to close, we send one
+        // packet with the close frame and stop generating packets
+        // in any space. Emit at the highest level we have send
+        // keys for so the peer can decrypt it; clients that have
+        // 1-RTT or Handshake keys will also have the keys for
+        // every lower level.
+        if let Some((error_code, reason)) = self.close_pending.take() {
+            let mut datagram = Vec::with_capacity(256);
+            self.encode_close_packet(&mut datagram, error_code, &reason)?;
+            if !datagram.is_empty() {
+                self.outbound.push(datagram);
+                crate::diag::bump(&crate::diag::COUNTERS.connection_closes_emitted);
+            }
+            self.state = ConnState::Failed;
+            return Ok(());
+        }
+
         // Build outbound packets in a single coalesced datagram.
         // Order matters: Initial first, then Handshake, then 1-RTT
         // (RFC 9000 §12.2). Each packet's tx-side CRYPTO bytes
@@ -1535,6 +1598,127 @@ impl Connection {
             &send_keys,
             false,
         )
+    }
+
+    /// Build and seal a single packet carrying just a
+    /// CONNECTION_CLOSE (transport) frame. Picks the highest level
+    /// for which we have send keys: 1-RTT > Handshake > Initial.
+    /// RFC 9000 §10.2.3 says a closing endpoint can emit the close
+    /// in multiple packet number spaces if the peer might lack
+    /// keys for the highest one — for now we keep it to one packet
+    /// at the highest space, which works fine when the peer reaches
+    /// at least the same level we have keys for (the common case).
+    fn encode_close_packet(
+        &mut self,
+        out: &mut Vec<u8>,
+        error_code: u64,
+        reason: &[u8],
+    ) -> Result<(), ConnError> {
+        // Build the CONNECTION_CLOSE frame body. frame_type=0 means
+        // "no specific frame triggered the close" — appropriate for
+        // both internal errors and protocol violations not tied to
+        // a single frame.
+        let mut frame_buf = vec![0u8; reason.len() + 32];
+        let frame_n = crate::frame::write_close_transport(
+            error_code,
+            /* frame_type */ 0,
+            reason,
+            &mut frame_buf,
+        )
+        .map_err(|_| ConnError::Wire)?;
+        let frames = &frame_buf[..frame_n];
+
+        if let Some(send_keys) = self.application_send.as_ref().cloned() {
+            // 1-RTT short-header packet.
+            let pn = self.application_space.next_send_pn;
+            self.application_space.next_send_pn += 1;
+            let pn_length: usize = 4;
+            let header_start = out.len();
+            let first_byte: u8 = FIXED_BIT | ((pn_length as u8) - 1);
+            out.push(first_byte);
+            out.extend_from_slice(self.peer_cid.as_slice());
+            let pn_offset = out.len();
+            out.extend_from_slice(&(pn as u32).to_be_bytes());
+            let payload_offset = out.len();
+            out.extend_from_slice(frames);
+            // Pad so the HP sample (4 bytes after PN start) has 16
+            // bytes of ciphertext after AEAD seal.
+            while out.len() - pn_offset < 4 + HP_SAMPLE_LEN {
+                out.push(0); // PADDING
+            }
+            let payload_len = out.len() - payload_offset;
+            out.extend_from_slice(&[0u8; TAG_LEN]);
+            let total_end = out.len();
+            return self.seal_packet(
+                out, header_start, pn_offset, payload_offset, payload_len, total_end, pn,
+                &send_keys, false,
+            );
+        }
+
+        if let Some(send_keys) = self.handshake_send.as_ref().cloned() {
+            // Handshake long-header packet.
+            let pn = self.handshake_space.next_send_pn;
+            self.handshake_space.next_send_pn += 1;
+            let pn_length: usize = 4;
+            let payload_len = frames.len();
+            let length_field = (pn_length + payload_len + TAG_LEN) as u64;
+            let first_byte: u8 = 0xe0 | ((pn_length as u8) - 1);
+            let header_start = out.len();
+            out.push(first_byte);
+            out.extend_from_slice(&QUIC_VERSION_1.to_be_bytes());
+            out.push(self.peer_cid.len() as u8);
+            out.extend_from_slice(self.peer_cid.as_slice());
+            out.push(self.local_cid.len() as u8);
+            out.extend_from_slice(self.local_cid.as_slice());
+            let mut lf_buf = [0u8; 4];
+            let n = write_varint(length_field, &mut lf_buf).map_err(|_| ConnError::Wire)?;
+            out.extend_from_slice(&lf_buf[..n]);
+            let pn_offset = out.len();
+            out.extend_from_slice(&(pn as u32).to_be_bytes());
+            let payload_offset = out.len();
+            out.extend_from_slice(frames);
+            out.extend_from_slice(&[0u8; TAG_LEN]);
+            let total_end = out.len();
+            return self.seal_packet(
+                out, header_start, pn_offset, payload_offset, payload_len, total_end, pn,
+                &send_keys, true,
+            );
+        }
+
+        if let Some(send_keys) = self.initial_send.as_ref().cloned() {
+            // Initial long-header packet.
+            let pn = self.initial_space.next_send_pn;
+            self.initial_space.next_send_pn += 1;
+            let pn_length: usize = 4;
+            let payload_len = frames.len();
+            let length_field = (pn_length + payload_len + TAG_LEN) as u64;
+            let first_byte: u8 = 0xc0 | ((pn_length as u8) - 1);
+            let header_start = out.len();
+            out.push(first_byte);
+            out.extend_from_slice(&QUIC_VERSION_1.to_be_bytes());
+            out.push(self.peer_cid.len() as u8);
+            out.extend_from_slice(self.peer_cid.as_slice());
+            out.push(self.local_cid.len() as u8);
+            out.extend_from_slice(self.local_cid.as_slice());
+            out.push(0); // Token Length VARINT = 0
+            let mut lf_buf = [0u8; 4];
+            let n = write_varint(length_field, &mut lf_buf).map_err(|_| ConnError::Wire)?;
+            out.extend_from_slice(&lf_buf[..n]);
+            let pn_offset = out.len();
+            out.extend_from_slice(&(pn as u32).to_be_bytes());
+            let payload_offset = out.len();
+            out.extend_from_slice(frames);
+            out.extend_from_slice(&[0u8; TAG_LEN]);
+            let total_end = out.len();
+            return self.seal_packet(
+                out, header_start, pn_offset, payload_offset, payload_len, total_end, pn,
+                &send_keys, true,
+            );
+        }
+
+        // No send keys at any level — peer has no way to decrypt
+        // a close packet. Caller falls through to silent close.
+        Ok(())
     }
 
     /// Common AEAD seal + HP protect. `out` is the assembled

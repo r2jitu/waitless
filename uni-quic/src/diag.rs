@@ -136,6 +136,13 @@ pub struct Counters {
     /// `last_recv_us` isn't refreshing — investigate via
     /// `[quic-event idle_timeouts]` log lines.
     pub idle_timeouts: AtomicU64,
+    /// One CONNECTION_CLOSE frame was emitted to the peer because
+    /// `process_datagram` returned `Err` or the application asked
+    /// the conn to close (RFC 9000 §10.2). Lets the peer tear its
+    /// state down immediately instead of waiting for its own idle
+    /// timer. Each fire = one packet on the wire, then the conn
+    /// task exits.
+    pub connection_closes_emitted: AtomicU64,
 }
 
 impl Counters {
@@ -165,6 +172,7 @@ impl Counters {
             zero_rtt_buffered: AtomicU64::new(0),
             zero_rtt_unresumable: AtomicU64::new(0),
             idle_timeouts: AtomicU64::new(0),
+            connection_closes_emitted: AtomicU64::new(0),
         }
     }
 }
@@ -284,7 +292,7 @@ pub fn should_log_event() -> bool {
 
 /// Snapshot of every counter, for `/debug/quic_stats`-style dumps.
 /// Returns `(name, value)` pairs in declaration order.
-pub fn snapshot() -> [(&'static str, u64); 24] {
+pub fn snapshot() -> [(&'static str, u64); 25] {
     let c = &COUNTERS;
     [
         ("no_dcid", c.no_dcid.load(Ordering::Relaxed)),
@@ -311,6 +319,7 @@ pub fn snapshot() -> [(&'static str, u64); 24] {
         ("zero_rtt_buffered", c.zero_rtt_buffered.load(Ordering::Relaxed)),
         ("zero_rtt_unresumable", c.zero_rtt_unresumable.load(Ordering::Relaxed)),
         ("idle_timeouts", c.idle_timeouts.load(Ordering::Relaxed)),
+        ("connection_closes_emitted", c.connection_closes_emitted.load(Ordering::Relaxed)),
     ]
 }
 
