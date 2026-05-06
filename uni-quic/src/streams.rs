@@ -283,52 +283,33 @@ pub enum SendState {
     FinSent,
 }
 
-/// One entry in a SendStream's outbound chunk chain. Holds
-/// either an owned `Vec<u8>` (Cow::Owned) or a borrowed
-/// `&'static [u8]` (Cow::Borrowed). The static variant lets
-/// `&'static` response bodies (e.g. `b"healthy"`) thread all
-/// the way to the wire without allocating — the SendStream
-/// just keeps the slice reference, and `pop_chunk_into` copies
-/// the relevant bytes into the datagram payload region.
-///
-/// `consumed` tracks how many bytes have been emitted from the
-/// front in prior pop_chunk_into calls. Once `consumed == bytes.len()`
-/// the chunk is fully drained and pop_front'd.
-pub struct SendChunk {
-    bytes: alloc::borrow::Cow<'static, [u8]>,
-    consumed: usize,
-}
-
-impl SendChunk {
-    pub fn from_owned(v: Vec<u8>) -> Self {
-        SendChunk { bytes: alloc::borrow::Cow::Owned(v), consumed: 0 }
-    }
-    pub fn from_static(s: &'static [u8]) -> Self {
-        SendChunk { bytes: alloc::borrow::Cow::Borrowed(s), consumed: 0 }
-    }
-    fn remaining(&self) -> &[u8] {
-        &self.bytes[self.consumed..]
-    }
-}
+/// Same primitive as `uni_http::Bytes` — a borrowed-static or
+/// owned byte chunk. Re-aliased here so this crate's API
+/// doesn't have to mention `Cow<'static, [u8]>` longhand and
+/// to keep the cross-stack abstraction explicit. uni-quic
+/// can't depend on uni-http (transport ↛ application), but
+/// the underlying type is the same so values cross the
+/// boundary without conversion.
+pub type Bytes = alloc::borrow::Cow<'static, [u8]>;
 
 /// Per-stream send state. The connection layer drives
 /// `pop_chunk` on each outbound 1-RTT packet build.
 ///
-/// Outbound bytes are held as a chain of `SendChunk`s — each is
-/// either owned or borrowed-static — rather than a single
-/// contiguous buffer. This lets `write_owned`/`write_static`
-/// accept their inputs without copying, and the legacy
-/// `write(&[u8])` path pushes one fresh-Vec chunk per call
-/// without the extend_from_slice merge that would otherwise
-/// impose a memcpy of the entire buffer on every additional
-/// write.
-///
-/// `pop_chunk_into` walks the head chunk, slicing as much as the
-/// per-packet budget permits; once the head is fully consumed
-/// `pop_front` advances to the next chunk.
+/// Outbound bytes are held as a chain of [Bytes] chunks — each
+/// either owned (Cow::Owned) or borrowed-static (Cow::Borrowed).
+/// `head_consumed` tracks how many bytes of the FRONT chunk
+/// have already been emitted in prior pop_chunk_into calls;
+/// only the head needs a cursor (later chunks are untouched
+/// until they reach the front). Once the head is fully
+/// consumed it's pop_front'd and the cursor resets to 0.
 pub struct SendStream {
     /// Outbound chunks, FIFO. Empty payloads are not pushed.
-    pub outbound: alloc::collections::VecDeque<SendChunk>,
+    pub outbound: alloc::collections::VecDeque<Bytes>,
+    /// Bytes already emitted from the head chunk's front.
+    /// `0..head_consumed` of `outbound[0]` is "drained";
+    /// `head_consumed..` is the remaining bytes. Reset to 0
+    /// each time we pop_front.
+    pub head_consumed: usize,
     /// Offset of the next byte to send. Increments by chunk size
     /// per `pop_chunk` call.
     pub send_offset: u64,
@@ -340,6 +321,7 @@ impl Default for SendStream {
     fn default() -> Self {
         SendStream {
             outbound: alloc::collections::VecDeque::new(),
+            head_consumed: 0,
             send_offset: 0,
             state: SendState::Open,
         }
@@ -354,35 +336,35 @@ impl SendStream {
         matches!(self.state, SendState::FinSent)
     }
 
+    /// Generic append: takes any `Bytes` (Cow::Borrowed or
+    /// Cow::Owned) and queues it in the chunk chain. The
+    /// type-specific shortcuts below all funnel into this.
+    pub fn write_bytes(&mut self, data: Bytes) {
+        if matches!(self.state, SendState::FinSent) || data.is_empty() {
+            return;
+        }
+        self.outbound.push_back(data);
+    }
+
     /// Append a borrowed slice. Allocates one Vec to hold the
     /// copy. For zero-copy paths use `write_owned` (Vec by
     /// move) or `write_static` (`&'static [u8]` by reference).
     pub fn write(&mut self, data: &[u8]) {
-        if matches!(self.state, SendState::FinSent) || data.is_empty() {
+        if data.is_empty() {
             return;
         }
-        self.outbound.push_back(SendChunk::from_owned(data.to_vec()));
+        self.write_bytes(alloc::borrow::Cow::Owned(data.to_vec()));
     }
 
-    /// Append an owned `Vec<u8>` by move — no copy. Use this
-    /// for buffers the caller has already built (e.g. an H3
-    /// response framing block).
+    /// Append an owned `Vec<u8>` by move — no copy.
     pub fn write_owned(&mut self, data: Vec<u8>) {
-        if matches!(self.state, SendState::FinSent) || data.is_empty() {
-            return;
-        }
-        self.outbound.push_back(SendChunk::from_owned(data));
+        self.write_bytes(alloc::borrow::Cow::Owned(data));
     }
 
     /// Append a `&'static` slice by reference — zero copy AND
-    /// zero alloc. Use for static response bodies
-    /// (`b"healthy"`-style) that already live in the program's
-    /// read-only data segment.
+    /// zero alloc.
     pub fn write_static(&mut self, data: &'static [u8]) {
-        if matches!(self.state, SendState::FinSent) || data.is_empty() {
-            return;
-        }
-        self.outbound.push_back(SendChunk::from_static(data));
+        self.write_bytes(alloc::borrow::Cow::Borrowed(data));
     }
 
     pub fn close(&mut self) {
@@ -399,11 +381,31 @@ impl SendStream {
         self.outbound.is_empty()
     }
 
-    /// Pop up to `max_bytes` from the front of the chunk chain.
-    /// Returns `(offset, data, fin)`. The hot path uses
-    /// `pop_chunk_into`; this exists for callers that still
-    /// want an owned chunk (and accept a memcpy from
-    /// borrowed-static chunks).
+    /// How many bytes of the head chunk are still un-emitted.
+    /// 0 if no chunks remain.
+    fn head_remaining_len(&self) -> usize {
+        self.outbound
+            .front()
+            .map(|b| b.len() - self.head_consumed)
+            .unwrap_or(0)
+    }
+
+    /// Advance the head cursor by `n` bytes. Pops the head and
+    /// resets the cursor when fully drained.
+    fn advance_head(&mut self, n: usize) {
+        self.head_consumed += n;
+        if let Some(head) = self.outbound.front() {
+            if self.head_consumed == head.len() {
+                self.outbound.pop_front();
+                self.head_consumed = 0;
+            }
+        }
+    }
+
+    /// Pop up to `max_bytes` from the front of the chunk chain
+    /// as an owned Vec. Hot path is `pop_chunk_into` (writes
+    /// straight into the datagram); this exists for callers
+    /// that want an owned chunk back.
     pub fn pop_chunk(&mut self, max_bytes: usize) -> Option<(u64, Vec<u8>, bool)> {
         match self.state {
             SendState::FinSent => return None,
@@ -411,23 +413,18 @@ impl SendStream {
             _ => {}
         }
         let offset = self.send_offset;
-        // Closing with empty outbound → emit zero-byte FIN.
         if self.outbound.is_empty() {
+            // Closing with empty outbound → zero-byte FIN.
             self.state = SendState::FinSent;
             return Some((offset, Vec::new(), true));
         }
-        let head_remaining = self.outbound.front().unwrap().remaining().len();
+        let head_remaining = self.head_remaining_len();
         let n = head_remaining.min(max_bytes);
         let chunk: Vec<u8> = {
-            let head = self.outbound.front_mut().unwrap();
-            head.remaining()[..n].to_vec()
+            let head = self.outbound.front().unwrap();
+            head[self.head_consumed..self.head_consumed + n].to_vec()
         };
-        // Advance head consumed; pop_front when fully drained.
-        let head = self.outbound.front_mut().unwrap();
-        head.consumed += n;
-        if head.consumed == head.bytes.len() {
-            self.outbound.pop_front();
-        }
+        self.advance_head(n);
         self.send_offset += n as u64;
         let fin = matches!(self.state, SendState::Closing) && self.outbound.is_empty();
         if fin {
@@ -438,8 +435,7 @@ impl SendStream {
 
     /// Allocation-free variant of `pop_chunk`: appends the
     /// STREAM frame (header + body + FIN bit) directly into
-    /// `frames_out`. Walks the head chunk, may split it.
-    /// Returns true if anything was emitted.
+    /// `frames_out`.
     pub fn pop_chunk_into(
         &mut self,
         stream_id: u64,
@@ -453,29 +449,27 @@ impl SendStream {
         }
         let offset = self.send_offset;
 
-        // Closing with no queued data → emit zero-byte FIN.
         if self.outbound.is_empty() {
+            // Closing with no queued data → zero-byte FIN.
             crate::frame::append_stream_header(stream_id, offset, true, 0, frames_out)?;
             self.state = SendState::FinSent;
             return Ok(true);
         }
 
-        let head_remaining = self.outbound.front().unwrap().remaining().len();
+        let head_remaining = self.head_remaining_len();
         let n = head_remaining.min(max_bytes);
-        // FIN-on-this-frame iff: closing AND this drain empties
-        // the entire chain (current chunk fully consumed AND no
-        // chunks behind it).
+        // FIN iff: closing AND this drain empties the entire
+        // chain (head fully consumed AND no chunks behind it).
         let fin = matches!(self.state, SendState::Closing)
             && n == head_remaining
             && self.outbound.len() == 1;
 
         crate::frame::append_stream_header(stream_id, offset, fin, n, frames_out)?;
-        let head = self.outbound.front_mut().unwrap();
-        frames_out.extend_from_slice(&head.remaining()[..n]);
-        head.consumed += n;
-        if head.consumed == head.bytes.len() {
-            self.outbound.pop_front();
+        {
+            let head = self.outbound.front().unwrap();
+            frames_out.extend_from_slice(&head[self.head_consumed..self.head_consumed + n]);
         }
+        self.advance_head(n);
         self.send_offset += n as u64;
         if fin {
             self.state = SendState::FinSent;
