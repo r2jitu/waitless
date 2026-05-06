@@ -17,13 +17,13 @@
 # real browser profile.
 #
 # Usage:
-#   ./scripts/open-browser-h3.sh                      # defaults: Arc, port 8443
-#   ./scripts/open-browser-h3.sh --browser=chrome     # Google Chrome
+#   ./scripts/open-browser-h3.sh                      # defaults: Chrome, port 8443
+#   ./scripts/open-browser-h3.sh --browser=arc        # Arc
 #   ./scripts/open-browser-h3.sh --port=18443         # custom port
 
 set -euo pipefail
 
-BROWSER="arc"
+BROWSER="chrome"
 PORT="8443"
 URL=""
 
