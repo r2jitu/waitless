@@ -285,10 +285,23 @@ pub enum SendState {
 
 /// Per-stream send state. The connection layer drives
 /// `pop_chunk` on each outbound 1-RTT packet build.
+///
+/// Outbound bytes are held as a chain of owned chunks
+/// (`VecDeque<Vec<u8>>`) rather than a single contiguous buffer.
+/// This lets `write_owned` accept a `Vec<u8>` by move — zero-copy
+/// from the H3 layer's payload buffer into the stream — and lets
+/// the legacy `write(&[u8])` path push one chunk per call without
+/// the `extend_from_slice` merge that would otherwise impose a
+/// memcpy of the entire buffer on every additional write.
+///
+/// `pop_chunk_into` walks the head chunk, slicing as much as the
+/// per-packet budget permits; once the head is drained empty
+/// `pop_front` advances to the next chunk.
 pub struct SendStream {
-    /// Byte buffer waiting to ship. `pop_chunk` slices off the
-    /// front into a STREAM frame body.
-    pub outbound: Vec<u8>,
+    /// Owned chunks waiting to ship, FIFO. Each chunk is a
+    /// contiguous `Vec<u8>`; chunks are NOT merged across writes.
+    /// Empty Vecs are not pushed (writers skip the no-op).
+    pub outbound: alloc::collections::VecDeque<Vec<u8>>,
     /// Offset of the next byte to send. Increments by chunk size
     /// per `pop_chunk` call.
     pub send_offset: u64,
@@ -299,7 +312,7 @@ pub struct SendStream {
 impl Default for SendStream {
     fn default() -> Self {
         SendStream {
-            outbound: Vec::new(),
+            outbound: alloc::collections::VecDeque::new(),
             send_offset: 0,
             state: SendState::Open,
         }
@@ -314,14 +327,27 @@ impl SendStream {
         matches!(self.state, SendState::FinSent)
     }
 
+    /// Append a borrowed slice. Allocates one Vec to hold the
+    /// copy; subsequent `write` calls do NOT merge with prior
+    /// chunks (a deliberate choice — merging would impose a
+    /// large memcpy on every additional write).
     pub fn write(&mut self, data: &[u8]) {
-        // Writes after FIN are a no-op rather than a panic so
-        // a racing `stream_send` after `stream_close` doesn't
-        // crash the conn task.
-        if matches!(self.state, SendState::FinSent) {
+        if matches!(self.state, SendState::FinSent) || data.is_empty() {
             return;
         }
-        self.outbound.extend_from_slice(data);
+        self.outbound.push_back(data.to_vec());
+    }
+
+    /// Append an owned `Vec<u8>` by move — no copy. Use this
+    /// for buffers the caller has already built (e.g. an H3
+    /// response payload). Subsequent `pop_chunk_into` calls
+    /// drain bytes straight from this Vec into the datagram
+    /// without an intermediate copy.
+    pub fn write_owned(&mut self, data: Vec<u8>) {
+        if matches!(self.state, SendState::FinSent) || data.is_empty() {
+            return;
+        }
+        self.outbound.push_back(data);
     }
 
     pub fn close(&mut self) {
@@ -332,19 +358,40 @@ impl SendStream {
         }
     }
 
-    /// Pop up to `max_bytes` from the front. Returns
-    /// `(offset, data, fin)`. `fin` is `true` only if `close()`
-    /// was called and we just popped the final byte.
+    /// `true` if no bytes are queued AND no close is pending.
+    /// Used by `has_pending_one_rtt_data` and the reaper.
+    pub fn outbound_is_empty(&self) -> bool {
+        self.outbound.is_empty()
+    }
+
+    /// Pop up to `max_bytes` from the front of the chunk chain.
+    /// Returns `(offset, data, fin)`. The returned `data` Vec is
+    /// the front chunk if it fits entirely, else a fresh Vec
+    /// holding the prefix. Kept for back-compat with callers
+    /// that still want an owned chunk; the hot path uses
+    /// `pop_chunk_into` to write directly into the datagram.
     pub fn pop_chunk(&mut self, max_bytes: usize) -> Option<(u64, Vec<u8>, bool)> {
         match self.state {
             SendState::FinSent => return None,
             SendState::Open if self.outbound.is_empty() => return None,
-            // Open with data, OR Closing (with or without data).
             _ => {}
         }
-        let n = self.outbound.len().min(max_bytes);
-        let chunk: Vec<u8> = self.outbound.drain(..n).collect();
         let offset = self.send_offset;
+        // Closing with empty outbound → emit zero-byte FIN.
+        if self.outbound.is_empty() {
+            self.state = SendState::FinSent;
+            return Some((offset, Vec::new(), true));
+        }
+        let head = self.outbound.front_mut().unwrap();
+        let chunk: Vec<u8> = if head.len() <= max_bytes {
+            // Take the whole head Vec by move — no alloc.
+            self.outbound.pop_front().unwrap()
+        } else {
+            // Slice off the prefix; leaves remainder in head.
+            let prefix: Vec<u8> = head.drain(..max_bytes).collect();
+            prefix
+        };
+        let n = chunk.len();
         self.send_offset += n as u64;
         let fin = matches!(self.state, SendState::Closing) && self.outbound.is_empty();
         if fin {
@@ -355,10 +402,8 @@ impl SendStream {
 
     /// Allocation-free variant of `pop_chunk`: appends the
     /// STREAM frame (header + body + FIN bit) directly into
-    /// `frames_out`. Saves the per-emit `chunk: Vec<u8>` (from
-    /// `drain(..n).collect()`) AND the per-emit `tmp: Vec<u8>`
-    /// the caller previously used. Returns true if anything
-    /// was emitted.
+    /// `frames_out`. Walks the head chunk, may split it.
+    /// Returns true if anything was emitted.
     pub fn pop_chunk_into(
         &mut self,
         stream_id: u64,
@@ -370,17 +415,35 @@ impl SendStream {
             SendState::Open if self.outbound.is_empty() => return Ok(false),
             _ => {}
         }
-        let n = self.outbound.len().min(max_bytes);
         let offset = self.send_offset;
-        let fin =
-            matches!(self.state, SendState::Closing) && self.outbound.len() == n;
-        // Append [type][stream_id-varint][offset-varint]
-        // [length-varint] header to frames_out.
+
+        // Closing with no queued data → emit zero-byte FIN.
+        if self.outbound.is_empty() {
+            crate::frame::append_stream_header(stream_id, offset, true, 0, frames_out)?;
+            self.state = SendState::FinSent;
+            return Ok(true);
+        }
+
+        // Slice the head chunk to fit the budget.
+        let head_len = self.outbound.front().map(|h| h.len()).unwrap_or(0);
+        let n = head_len.min(max_bytes);
+        // FIN-on-this-frame iff: closing AND this drain empties
+        // the entire chain (current chunk fully consumed AND no
+        // chunks behind it).
+        let fin = matches!(self.state, SendState::Closing)
+            && n == head_len
+            && self.outbound.len() == 1;
+
         crate::frame::append_stream_header(stream_id, offset, fin, n, frames_out)?;
-        // Append body bytes directly from outbound — no
+        // Body: copy from head chunk into frames_out. No
         // intermediate Vec.
-        frames_out.extend_from_slice(&self.outbound[..n]);
-        self.outbound.drain(..n);
+        let head = self.outbound.front_mut().unwrap();
+        frames_out.extend_from_slice(&head[..n]);
+        if n == head_len {
+            self.outbound.pop_front();
+        } else {
+            head.drain(..n);
+        }
         self.send_offset += n as u64;
         if fin {
             self.state = SendState::FinSent;

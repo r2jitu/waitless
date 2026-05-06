@@ -1045,6 +1045,24 @@ impl Connection {
         }
     }
 
+    /// Append an owned `Vec<u8>` to stream `sid`'s outbound
+    /// chunk chain by move. Use this when the caller already
+    /// holds a built buffer (e.g. an H3 response payload) so
+    /// we don't memcpy the whole thing into the SendStream.
+    /// Subsequent `pop_chunk_into` calls drain from this Vec
+    /// directly into the datagram payload region.
+    pub fn stream_send_owned(&mut self, sid: u64, data: Vec<u8>) {
+        let was_new = !self.send_streams.contains_key(&sid);
+        let s = self
+            .send_streams
+            .entry(sid)
+            .or_insert_with(crate::streams::SendStream::default);
+        s.write_owned(data);
+        if was_new {
+            crate::diag::bump(&crate::diag::COUNTERS.send_streams_created);
+        }
+    }
+
     /// Mark stream `sid` for FIN. The next outbound STREAM frame
     /// after the buffer drains will carry the FIN flag.
     pub fn stream_close(&mut self, sid: u64) {
