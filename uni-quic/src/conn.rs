@@ -46,8 +46,8 @@ use alloc::vec::Vec;
 use crate::crypto::{
     aes128_gcm_open, aes128_gcm_seal, apply_hp_mask, chacha20_poly1305_open,
     chacha20_poly1305_seal, derive_chacha_keys, derive_initial_keys, derive_initial_secrets,
-    hp_mask_aes128, hp_mask_chacha20, packet_nonce, AES_KEY_LEN, CHACHA_KEY_LEN, HP_MASK_LEN,
-    HP_SAMPLE_LEN, NONCE_LEN, TAG_LEN,
+    hp_mask_aes128, hp_mask_chacha20, next_traffic_secret, packet_nonce, AES_KEY_LEN,
+    CHACHA_KEY_LEN, HP_MASK_LEN, HP_SAMPLE_LEN, NONCE_LEN, TAG_LEN,
 };
 use crate::frame::{parse_frame, write_ack, write_crypto, write_handshake_done, Frame};
 use crate::wire::{
@@ -167,6 +167,21 @@ impl DirKeys {
         }
     }
 
+    /// Build per-key-phase keys: AEAD `key`/`iv` from the freshly-
+    /// derived `next_traffic_secret`, but reuse the existing HP key
+    /// from `prev`. RFC 9001 §6.1: "the same header protection key
+    /// is used" across key phases — only the AEAD half rotates.
+    fn from_chacha_reuse_hp(k: &crate::crypto::ChaChaKeys, prev: &DirKeys) -> Self {
+        DirKeys {
+            aead: k.key,
+            iv: k.iv,
+            hp: prev.hp,
+            aead_len: CHACHA_KEY_LEN as u8,
+            hp_len: prev.hp_len,
+            is_chacha: true,
+        }
+    }
+
     fn aead_seal(&self, nonce: &[u8; NONCE_LEN], aad: &[u8], data: &mut [u8]) -> [u8; TAG_LEN] {
         if self.is_chacha {
             chacha20_poly1305_seal(&self.aead, nonce, aad, data)
@@ -269,6 +284,30 @@ pub struct Connection {
     /// no `early_send` counterpart.
     early_recv: Option<DirKeys>,
 
+    // ── 1-RTT key update state (RFC 9001 §6) ──────────────────────
+    //
+    // `application_recv` above holds the keys for the CURRENT recv
+    // key phase (the bit value the peer used on packets we've
+    // successfully opened). The next-phase recv keys are
+    // pre-derived eagerly so that when the peer toggles its
+    // KEY_PHASE bit we can trial-decrypt without HKDF on the hot
+    // path — Chrome/Firefox routinely do a key update after some
+    // traffic volume. The previous-phase keys are retained for one
+    // rotation to absorb reordered packets that arrived after the
+    // peer's KU but were sent before it.
+    application_recv_prev: Option<DirKeys>,
+    application_recv_next: Option<DirKeys>,
+    /// Latest CLIENT application-traffic secret. Updated on each
+    /// successful key update — `next_traffic_secret(client_ap)` is
+    /// then ready to feed `derive_chacha_keys` for the
+    /// post-rotation `application_recv_next`.
+    client_app_secret: Option<[u8; 32]>,
+    /// Peer's current KEY_PHASE bit value (0 or 1). Toggled when
+    /// we successfully open a packet with `application_recv_next`.
+    /// We never initiate KU ourselves on the send side; our own
+    /// send packets stay at KP=0 for now.
+    recv_key_phase: u8,
+
     initial_space: SpaceState,
     handshake_space: SpaceState,
     application_space: SpaceState,
@@ -329,6 +368,10 @@ impl Connection {
             initial_send: None,
             initial_recv: None,
             early_recv: None,
+            application_recv_prev: None,
+            application_recv_next: None,
+            client_app_secret: None,
+            recv_key_phase: 0,
             handshake_send: None,
             handshake_recv: None,
             application_send: None,
@@ -718,25 +761,99 @@ impl Connection {
             return Err(ConnError::Wire);
         }
         let pn_offset = 1 + SERVER_CID_LEN;
-        let recv_keys = self
-            .application_recv
-            .as_ref()
-            .ok_or(ConnError::BadState)?
-            .clone();
 
         // Short-header packets aren't length-prefixed inside the
         // datagram — every byte until the end is one packet for us
         // (no coalescing post-handshake in QUIC v1; receivers MUST
         // process the whole thing).
         let total_packet_len = bytes.len();
+
+        // Key-update aware decryption (RFC 9001 §6).
+        //
+        // 1. HP unprotect with whichever set of keys; HP keys
+        //    persist across phases so any of {prev, current, next}
+        //    works — we use `application_recv` since it's always
+        //    present once the handshake completes.
+        // 2. After HP unprotect, the first byte's bit 2 (KEY_PHASE)
+        //    tells us which AEAD keys protect this packet.
+        // 3. If KP matches `recv_key_phase` → AEAD-open with
+        //    `application_recv`. The common path.
+        // 4. If KP differs → trial-decrypt with
+        //    `application_recv_next`. On success, peer initiated
+        //    a key update: rotate (prev <- current; current <- next;
+        //    derive new next from updated client_app_secret) and
+        //    flip `recv_key_phase`. This is the path that today
+        //    fails silently — without it, every post-update
+        //    packet AEAD-fails forever.
+        // 5. If trial-decrypt with _next ALSO fails, the packet
+        //    might be a reordered straggler from BEFORE the last
+        //    update we already processed — try `application_recv_prev`
+        //    (which holds the previous-phase keys for one rotation).
+        //
+        // The header-protection step only happens once; the AEAD
+        // attempts share the unprotected first byte / PN bytes.
+        let recv_keys_cur = self
+            .application_recv
+            .as_ref()
+            .ok_or(ConnError::BadState)?
+            .clone();
         let mut buf = bytes[..total_packet_len].to_vec();
-        let pn = self.unprotect_and_decrypt(&mut buf, pn_offset, &recv_keys)?;
+        let pn = self.unprotect_header(&mut buf, pn_offset, &recv_keys_cur)?;
         let pn_length = ((buf[0] & 0x03) as usize) + 1;
         let payload_start = pn_offset + pn_length;
         let payload_end = total_packet_len - TAG_LEN;
         if payload_end < payload_start {
             return Err(ConnError::Wire);
         }
+        let pkt_kp = (buf[0] & 0x04) >> 2;
+
+        // Try the keys appropriate for this packet's KP.
+        let aad: Vec<u8> = buf[..payload_start].to_vec();
+        let nonce = packet_nonce(&recv_keys_cur.iv, pn);
+        let tag: [u8; TAG_LEN] = buf[payload_end..]
+            .try_into()
+            .map_err(|_| ConnError::Wire)?;
+
+        let aead_result = if pkt_kp == self.recv_key_phase {
+            recv_keys_cur.aead_open(&nonce, &aad, &mut buf[payload_start..payload_end], &tag)
+        } else if let Some(next) = self.application_recv_next.as_ref().cloned() {
+            // Peer's KP differs from ours: try the next-phase keys.
+            let next_nonce = packet_nonce(&next.iv, pn);
+            match next.aead_open(&next_nonce, &aad, &mut buf[payload_start..payload_end], &tag) {
+                Ok(()) => {
+                    // Successful key update — rotate and re-derive.
+                    self.rotate_recv_keys();
+                    crate::quic_event!(key_updates_accepted,
+                        "new_phase={} pn={}", self.recv_key_phase, pn);
+                    Ok(())
+                }
+                Err(()) => {
+                    // Try previous-phase keys for reorder absorption.
+                    if let Some(prev) = self.application_recv_prev.as_ref() {
+                        let prev_nonce = packet_nonce(&prev.iv, pn);
+                        prev.aead_open(&prev_nonce, &aad, &mut buf[payload_start..payload_end], &tag)
+                    } else {
+                        Err(())
+                    }
+                }
+            }
+        } else {
+            // No next-phase keys yet (shouldn't happen post-handshake)
+            // — try previous-phase as a last resort.
+            if let Some(prev) = self.application_recv_prev.as_ref() {
+                let prev_nonce = packet_nonce(&prev.iv, pn);
+                prev.aead_open(&prev_nonce, &aad, &mut buf[payload_start..payload_end], &tag)
+            } else {
+                Err(())
+            }
+        };
+        aead_result.map_err(|_| {
+            crate::quic_drop!(aead_decrypt_failed,
+                "1-RTT pn={} kp={} our_kp={} payload_len={}",
+                pn, pkt_kp, self.recv_key_phase, payload_end - payload_start);
+            ConnError::Decrypt
+        })?;
+
         let payload = &buf[payload_start..payload_end];
         self.dispatch_frames(CryptoLevel::OneRtt, payload)?;
 
@@ -747,6 +864,80 @@ impl Connection {
         );
         self.application_space.ack_pending = true;
         Ok(total_packet_len)
+    }
+
+    /// Promote the next-phase recv keys to current (RFC 9001 §6.1).
+    /// Called when a packet's KEY_PHASE bit doesn't match
+    /// `recv_key_phase` AND the next-phase keys successfully open
+    /// the packet. After rotation the previously-current keys live
+    /// in `application_recv_prev` for one more key-phase window so
+    /// reordered older packets can still be opened.
+    fn rotate_recv_keys(&mut self) {
+        // current → prev
+        self.application_recv_prev = self.application_recv.take();
+        // next → current
+        self.application_recv = self.application_recv_next.take();
+        self.recv_key_phase ^= 1;
+        // Derive a fresh next-phase pair from the updated secret.
+        if let Some(secret) = self.client_app_secret.as_ref() {
+            let next_secret = next_traffic_secret(secret);
+            // Save the new "current" secret so the NEXT KU can
+            // derive from it.
+            self.client_app_secret = Some(next_secret);
+            let next_chacha = derive_chacha_keys(&next_secret);
+            // Reuse HP from the new-current keys (HP is invariant
+            // across KU per §6.1).
+            if let Some(cur) = self.application_recv.as_ref() {
+                self.application_recv_next =
+                    Some(DirKeys::from_chacha_reuse_hp(&next_chacha, cur));
+            }
+        }
+    }
+
+    /// Remove header protection in place (no AEAD). Returns the
+    /// reconstructed full PN. Used by the 1-RTT path which then
+    /// trial-decrypts with one of three key-phase key sets;
+    /// Initial/Handshake stick with `unprotect_and_decrypt` since
+    /// they have no key-phase ambiguity.
+    fn unprotect_header(
+        &self,
+        buf: &mut [u8],
+        pn_offset: usize,
+        keys: &DirKeys,
+    ) -> Result<u64, ConnError> {
+        let sample_start = pn_offset + 4;
+        if sample_start + HP_SAMPLE_LEN > buf.len() {
+            return Err(ConnError::Wire);
+        }
+        let mut sample = [0u8; HP_SAMPLE_LEN];
+        sample.copy_from_slice(&buf[sample_start..sample_start + HP_SAMPLE_LEN]);
+        let mask = keys.hp_mask(&sample);
+
+        let is_long = buf[0] & HEADER_FORM_LONG != 0;
+        buf[0] ^= mask[0] & if is_long { 0x0f } else { 0x1f };
+        let pn_length = ((buf[0] & 0x03) as usize) + 1;
+        if pn_length > 4 || pn_offset + pn_length + TAG_LEN > buf.len() {
+            return Err(ConnError::Wire);
+        }
+        for i in 0..pn_length {
+            buf[pn_offset + i] ^= mask[1 + i];
+        }
+        let mut truncated = 0u64;
+        for i in 0..pn_length {
+            truncated = (truncated << 8) | buf[pn_offset + i] as u64;
+        }
+        let space = if is_long {
+            let lt = (buf[0] >> 4) & 0x3;
+            match lt {
+                long_packet_type::INITIAL => &self.initial_space,
+                long_packet_type::HANDSHAKE => &self.handshake_space,
+                _ => &self.application_space,
+            }
+        } else {
+            &self.application_space
+        };
+        let largest = space.largest_recv_pn.unwrap_or(0u64.wrapping_sub(1));
+        Ok(decode_packet_number(largest, truncated, pn_length))
     }
 
     /// Remove header protection AND open the AEAD on a complete
@@ -920,6 +1111,21 @@ impl Connection {
                 let recv = derive_chacha_keys(&ap.client_ap);
                 self.application_send = Some(DirKeys::from_chacha(&send));
                 self.application_recv = Some(DirKeys::from_chacha(&recv));
+                // Pre-derive next-phase recv keys so a peer-initiated
+                // key update (RFC 9001 §6) doesn't require HKDF on
+                // the hot decrypt path — we just trial-decrypt with
+                // `application_recv_next` whenever the KEY_PHASE bit
+                // disagrees with `recv_key_phase`. HP key persists
+                // across phases (§6.1: "the same header protection
+                // key is used") so we copy it from the current keys.
+                self.client_app_secret = Some(ap.client_ap);
+                let next_secret = next_traffic_secret(&ap.client_ap);
+                let next_chacha = derive_chacha_keys(&next_secret);
+                let cur_recv = self.application_recv.as_ref().unwrap();
+                self.application_recv_next = Some(DirKeys::from_chacha_reuse_hp(
+                    &next_chacha,
+                    cur_recv,
+                ));
             }
         }
         if matches!(new_state, QuicTlsState::Established) {

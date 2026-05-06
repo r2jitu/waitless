@@ -105,6 +105,15 @@ pub struct Counters {
     /// dispatched. Counter rate = peer's effective 0-RTT request
     /// volume after our acceptance policy.
     pub zero_rtt_accepted: AtomicU64,
+    /// Peer-initiated 1-RTT key update (KEY_PHASE bit flipped) that
+    /// we successfully decrypted with the next-phase keys, then
+    /// rotated. Per RFC 9001 §6 each KU is a once-per-flight event;
+    /// browsers / mobile clients rotate every ~thousands of packets,
+    /// so under sustained load this counter ticks slowly. A sudden
+    /// spike paired with a spike in `aead_decrypt_failed` indicates
+    /// a malfunctioning peer or an attacker probing for stale-keys
+    /// behavior.
+    pub key_updates_accepted: AtomicU64,
 }
 
 impl Counters {
@@ -130,6 +139,7 @@ impl Counters {
             tickets_accepted: AtomicU64::new(0),
             early_keys_derived: AtomicU64::new(0),
             zero_rtt_accepted: AtomicU64::new(0),
+            key_updates_accepted: AtomicU64::new(0),
         }
     }
 }
@@ -249,7 +259,7 @@ pub fn should_log_event() -> bool {
 
 /// Snapshot of every counter, for `/debug/quic_stats`-style dumps.
 /// Returns `(name, value)` pairs in declaration order.
-pub fn snapshot() -> [(&'static str, u64); 20] {
+pub fn snapshot() -> [(&'static str, u64); 21] {
     let c = &COUNTERS;
     [
         ("no_dcid", c.no_dcid.load(Ordering::Relaxed)),
@@ -272,6 +282,7 @@ pub fn snapshot() -> [(&'static str, u64); 20] {
         ("tickets_accepted", c.tickets_accepted.load(Ordering::Relaxed)),
         ("early_keys_derived", c.early_keys_derived.load(Ordering::Relaxed)),
         ("zero_rtt_accepted", c.zero_rtt_accepted.load(Ordering::Relaxed)),
+        ("key_updates_accepted", c.key_updates_accepted.load(Ordering::Relaxed)),
     ]
 }
 

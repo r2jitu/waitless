@@ -152,6 +152,22 @@ pub fn derive_chacha_keys(secret: &[u8; HASH_LEN]) -> ChaChaKeys {
     ChaChaKeys { key, iv, hp }
 }
 
+/// Update a 1-RTT traffic secret to its next key-phase value per
+/// RFC 9001 §6.1:
+///
+///     next_secret = HKDF-Expand-Label(current_secret, "quic ku", "", 32)
+///
+/// Caller then runs `derive_chacha_keys` on the result to get the
+/// AEAD `key` + `iv` for the new key phase. The HP key is **not**
+/// updated — RFC 9001 §6.1 explicitly carries it across phases —
+/// so the caller reuses the existing HP from `current_secret`'s
+/// derived keys.
+pub fn next_traffic_secret(current_secret: &[u8; HASH_LEN]) -> [u8; HASH_LEN] {
+    let mut next = [0u8; HASH_LEN];
+    hkdf_expand_label(current_secret, b"quic ku", &[], &mut next);
+    next
+}
+
 // ============================================================================
 // §5.3 — Packet protection nonce
 // ============================================================================
