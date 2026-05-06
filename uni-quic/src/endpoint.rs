@@ -348,23 +348,27 @@ async fn listener_loop<H, F>(
     H: Fn(QuicConn) -> F + Send + Sync + 'static,
     F: Future<Output = ()> + 'static,
 {
-    let mut buf = vec![0u8; 1500];
     loop {
+        // Allocate the recv buffer per iteration so we can move it
+        // straight into the Datagram on push, eliminating the
+        // `dgram_bytes.to_vec()` memcpy. Same-size allocations are
+        // friendly to the talc allocator's free-list. For
+        // recoverable bursts the conn task drops these Vecs after
+        // process_datagram (which mutates them in place); reuse
+        // would require cross-task plumbing not worth the
+        // complexity here.
+        let mut buf = vec![0u8; 1500];
         let (src_ip, src_port, n) = sock.recv_from(&mut buf).await;
         if n == 0 {
             continue;
         }
-        let dgram_bytes = &buf[..n];
-        // Extract DCID. Long-header packets carry it explicitly
-        // (parse_long_header_preamble); short-header packets put
-        // it at a fixed offset (caller-known length = SERVER_CID_LEN
-        // for our server-issued CIDs).
-        let dcid = match extract_dcid(dgram_bytes) {
+        buf.truncate(n);
+        let dcid = match extract_dcid(&buf) {
             Some(d) => d,
             None => {
                 crate::quic_drop!(no_dcid, "datagram_size={} first={:#x}",
-                    dgram_bytes.len(),
-                    dgram_bytes.first().copied().unwrap_or(0));
+                    buf.len(),
+                    buf.first().copied().unwrap_or(0));
                 continue;
             }
         };
@@ -376,15 +380,16 @@ async fn listener_loop<H, F>(
         // server-chosen SCID as its DCID.
         if let Some((slot_idx, generation)) = parse_local_cid(&dcid) {
             if let Some(inbox) = slots.lookup(slot_idx, generation) {
+                let dgram_size = buf.len();
                 let pushed = inbox.push(Datagram {
                     src_ip,
                     src_port,
-                    bytes: dgram_bytes.to_vec(),
+                    bytes: buf,
                 });
                 if !pushed {
                     crate::quic_drop!(inbox_full_drops,
                         "size={} slot={} gen={}",
-                        dgram_bytes.len(), slot_idx, generation);
+                        dgram_size, slot_idx, generation);
                 }
                 continue;
             }
@@ -407,34 +412,35 @@ async fn listener_loop<H, F>(
         //      packet for a known initial-DCID MUST route to the
         //      same conn — otherwise we drop the 0-RTT data.
         if let Some(inbox) = slots.lookup_initial_dcid(&dcid) {
+            let dgram_size = buf.len();
             crate::quic_event!(initial_dcid_hit,
-                "size={} dcid={}", dgram_bytes.len(), hex8(&dcid));
+                "size={} dcid={}", dgram_size, hex8(&dcid));
             let pushed = inbox.push(Datagram {
                 src_ip,
                 src_port,
-                bytes: dgram_bytes.to_vec(),
+                bytes: buf,
             });
             if !pushed {
                 crate::quic_drop!(inbox_full_drops,
-                    "size={} initial-dcid", dgram_bytes.len());
+                    "size={} initial-dcid", dgram_size);
             }
             continue;
         }
 
         // No prior conn for this DCID. If it's a long-header
         // Initial we'll allocate one; otherwise drop.
-        if !is_long_header_initial(dgram_bytes) {
+        if !is_long_header_initial(&buf) {
             // Wrong-length DCID, short-header for unknown conn,
             // or Handshake/0-RTT/Retry without a matching slot
             // — drop. (Stateless reset is out of scope.)
-            let first = dgram_bytes.first().copied().unwrap_or(0);
+            let first = buf.first().copied().unwrap_or(0);
             if first & 0x80 == 0 {
                 crate::quic_drop!(unknown_short_header,
-                    "size={} dcid={}", dgram_bytes.len(), hex8(&dcid));
+                    "size={} dcid={}", buf.len(), hex8(&dcid));
             } else {
                 crate::quic_drop!(unknown_long_header,
                     "size={} dcid={} first={:#x}",
-                    dgram_bytes.len(), hex8(&dcid), first);
+                    buf.len(), hex8(&dcid), first);
             }
             continue;
         }
@@ -472,7 +478,7 @@ async fn listener_loop<H, F>(
         inbox.push(Datagram {
             src_ip,
             src_port,
-            bytes: dgram_bytes.to_vec(),
+            bytes: buf,
         });
 
         let mut seed = [0u8; 32];
