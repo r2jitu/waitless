@@ -51,6 +51,23 @@ pub struct Counters {
     /// request (id & 0x3 != 0). Shouldn't happen — clients
     /// never initiate server-style bidi.
     pub unexpected_bidi: AtomicU64,
+    /// `handle_request` finished its read loop (received FIN +
+    /// HEADERS frame). Pair with `requests_received` — the gap
+    /// between is "stuck inside the read loop".
+    pub read_loop_completed: AtomicU64,
+    /// QPACK decode succeeded and we're about to call the user
+    /// handler. Pair with `read_loop_completed` — the gap is
+    /// "stuck during request building / QPACK decode" (rare;
+    /// QPACK is sync).
+    pub user_handler_invoked: AtomicU64,
+    /// User handler returned a Response. Pair with
+    /// `user_handler_invoked` — the gap is "stuck inside the
+    /// user handler future".
+    pub user_handler_returned: AtomicU64,
+    /// `write_response` returned. The gap from
+    /// `user_handler_returned` is "stuck inside the QUIC send
+    /// path" (flush_outbound, sock.send_to, etc.).
+    pub write_response_completed: AtomicU64,
 }
 
 impl Counters {
@@ -65,6 +82,10 @@ impl Counters {
             responses_sent: AtomicU64::new(0),
             peer_uni_streams_seen: AtomicU64::new(0),
             unexpected_bidi: AtomicU64::new(0),
+            read_loop_completed: AtomicU64::new(0),
+            user_handler_invoked: AtomicU64::new(0),
+            user_handler_returned: AtomicU64::new(0),
+            write_response_completed: AtomicU64::new(0),
         }
     }
 }
@@ -140,7 +161,7 @@ pub fn should_log_event() -> bool {
     LEVEL.load(Ordering::Relaxed) >= LogLevel::Events as u8
 }
 
-pub fn snapshot() -> [(&'static str, u64); 9] {
+pub fn snapshot() -> [(&'static str, u64); 13] {
     let c = &COUNTERS;
     [
         ("requests_received", c.requests_received.load(Ordering::Relaxed)),
@@ -152,6 +173,10 @@ pub fn snapshot() -> [(&'static str, u64); 9] {
         ("responses_sent", c.responses_sent.load(Ordering::Relaxed)),
         ("peer_uni_streams_seen", c.peer_uni_streams_seen.load(Ordering::Relaxed)),
         ("unexpected_bidi", c.unexpected_bidi.load(Ordering::Relaxed)),
+        ("read_loop_completed", c.read_loop_completed.load(Ordering::Relaxed)),
+        ("user_handler_invoked", c.user_handler_invoked.load(Ordering::Relaxed)),
+        ("user_handler_returned", c.user_handler_returned.load(Ordering::Relaxed)),
+        ("write_response_completed", c.write_response_completed.load(Ordering::Relaxed)),
     ]
 }
 

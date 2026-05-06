@@ -217,6 +217,7 @@ where
             break;
         }
     }
+    crate::diag::bump(&crate::diag::COUNTERS.read_loop_completed);
     if !headers_seen {
         crate::h3_drop!(no_headers_seen, "sid={}", sid);
         conn.close_stream(sid);
@@ -264,9 +265,12 @@ where
         }
     }
 
+    crate::diag::bump(&crate::diag::COUNTERS.user_handler_invoked);
     let response = handler(req).await;
+    crate::diag::bump(&crate::diag::COUNTERS.user_handler_returned);
     // Encode response: HEADERS + DATA + FIN.
     write_response(conn, sid, &response);
+    crate::diag::bump(&crate::diag::COUNTERS.write_response_completed);
     crate::h3_event!(requests_handled, "sid={} status={}", sid, response.status);
     crate::diag::bump(&crate::diag::COUNTERS.responses_sent);
 }
