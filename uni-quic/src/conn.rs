@@ -862,7 +862,9 @@ impl Connection {
     /// stream so the connection layer drains the send queue without
     /// waiting for the next inbound packet.
     pub fn flush(&mut self, config: &TlsServerConfig) -> Result<(), ConnError> {
-        self.flush_outbound(config)
+        self.flush_outbound(config)?;
+        self.reap_finished_streams();
+        Ok(())
     }
 
     // ── Inbound packet processing ───────────────────────────────
@@ -1573,14 +1575,60 @@ impl Connection {
 
         // 1-RTT packet — bundles ACK + HANDSHAKE_DONE + STREAM
         // frames + STREAM data drained from per-stream send queues.
+        // Encode the FIRST 1-RTT packet inline with any
+        // Initial/Handshake packets above to maximise coalescing.
         if matches!(self.state, ConnState::Established) {
             self.encode_one_rtt_packet(&mut datagram)?;
         }
-
         if !datagram.is_empty() {
             self.outbound.push(datagram);
         }
+
+        // Drain remaining stream/CRYPTO data into ADDITIONAL 1-RTT
+        // datagrams. Without this, a 6 KiB response would dribble
+        // out at one ~1100-byte packet per inbound trigger event,
+        // and on rapid-refresh load partial response bytes pile
+        // up in `send_streams.outbound` faster than they can ship
+        // — `fin_sent` never becomes true, the reaper can never
+        // free the stream, and the heap grows.
+        //
+        // RFC 9000 §12.2 forbids coalescing two 1-RTT packets
+        // into one UDP datagram (short-header has no length
+        // field), so each extra packet becomes its own datagram.
+        // Cap the loop at MAX_FLUSH_PACKETS so a wedged peer
+        // can't make us spin emitting endlessly.
+        if matches!(self.state, ConnState::Established) {
+            const MAX_FLUSH_PACKETS: usize = 32;
+            for _ in 0..MAX_FLUSH_PACKETS {
+                if !self.has_pending_one_rtt_data() {
+                    break;
+                }
+                let mut more = Vec::with_capacity(1500);
+                self.encode_one_rtt_packet(&mut more)?;
+                if more.is_empty() {
+                    break;
+                }
+                self.outbound.push(more);
+            }
+        }
         Ok(())
+    }
+
+    /// Whether any 1-RTT-level frame source has data ready to
+    /// emit (besides the always-coalescable ACK / HANDSHAKE_DONE,
+    /// which we already drain in the first pass). Used by
+    /// `flush_outbound` to decide whether to emit another packet.
+    fn has_pending_one_rtt_data(&self) -> bool {
+        // Any send stream with bytes queued OR a close pending.
+        for s in self.send_streams.values() {
+            if s.fin_sent {
+                continue;
+            }
+            if !s.outbound.is_empty() || s.close_after_drain {
+                return true;
+            }
+        }
+        false
     }
 
     // ── Outbound encoding ───────────────────────────────────────
