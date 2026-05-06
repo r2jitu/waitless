@@ -476,12 +476,23 @@ impl Connection {
     }
 
     fn process_long_header_packet(&mut self, bytes: &[u8]) -> Result<usize, ConnError> {
-        let preamble = parse_long_header_preamble(bytes).map_err(|_| ConnError::Wire)?;
+        let preamble = parse_long_header_preamble(bytes).map_err(|_| {
+            crate::quic_drop!(long_header_parse,
+                "size={} first={:#x}", bytes.len(), bytes.first().copied().unwrap_or(0));
+            ConnError::Wire
+        })?;
         match preamble.long_type {
             long_packet_type::INITIAL => self.process_initial(bytes),
             long_packet_type::HANDSHAKE => self.process_handshake_pkt(bytes),
-            long_packet_type::ZERO_RTT | long_packet_type::RETRY => Err(ConnError::Wire),
-            _ => Err(ConnError::Wire),
+            long_packet_type::ZERO_RTT | long_packet_type::RETRY => {
+                crate::quic_drop!(other_wire,
+                    "unsupported long_type={} (0RTT/RETRY)", preamble.long_type);
+                Err(ConnError::Wire)
+            }
+            _ => {
+                crate::quic_drop!(other_wire, "bogus long_type={}", preamble.long_type);
+                Err(ConnError::Wire)
+            }
         }
     }
 
@@ -692,7 +703,11 @@ impl Connection {
             .map_err(|_| ConnError::Wire)?;
         let nonce = packet_nonce(&keys.iv, full_pn);
         keys.aead_open(&nonce, &aad, &mut buf[aad_end..payload_end], &tag)
-            .map_err(|_| ConnError::Decrypt)?;
+            .map_err(|_| {
+                crate::quic_drop!(aead_decrypt_failed,
+                    "pn={} payload_len={}", full_pn, payload_end - aad_end);
+                ConnError::Decrypt
+            })?;
         Ok(full_pn)
     }
 
@@ -702,7 +717,12 @@ impl Connection {
         mut payload: &[u8],
     ) -> Result<(), ConnError> {
         while !payload.is_empty() {
-            let (frame, consumed) = parse_frame(payload).map_err(|_| ConnError::Wire)?;
+            let (frame, consumed) = parse_frame(payload).map_err(|e| {
+                crate::quic_drop!(unknown_frame,
+                    "level={:?} err={:?} first={:#x} rem={}",
+                    level, e, payload[0], payload.len());
+                ConnError::Wire
+            })?;
             match frame {
                 Frame::Padding | Frame::Ping => {}
                 Frame::Crypto { offset, data } => {
@@ -772,6 +792,13 @@ impl Connection {
             }
         }
         if matches!(new_state, QuicTlsState::Established) {
+            // Edge-trigger the event so a flapping flush_outbound
+            // doesn't double-count.
+            if !matches!(self.state, ConnState::Established) {
+                crate::quic_event!(handshakes_completed,
+                    "local_cid={}",
+                    crate::endpoint::hex8(self.local_cid.as_slice()));
+            }
             self.state = ConnState::Established;
         } else if matches!(new_state, QuicTlsState::Failed) {
             self.state = ConnState::Failed;

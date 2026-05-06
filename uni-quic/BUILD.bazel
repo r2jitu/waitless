@@ -26,6 +26,10 @@ rust_library(
     name = "uni-quic",
     srcs = [
         "src/lib.rs",
+        # Observability: per-reason atomic counters + the
+        # `quic_drop!` / `quic_event!` macros that wrap every
+        # silent-drop site so failures are visible to the operator.
+        "src/diag.rs",
         # Sans-io QUIC primitives (formerly //net:quic_{wire,frame,crypto}).
         "src/crypto.rs",
         "src/frame.rs",

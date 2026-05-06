@@ -311,7 +311,12 @@ async fn listener_loop<H, F>(
         // for our server-issued CIDs).
         let dcid = match extract_dcid(dgram_bytes) {
             Some(d) => d,
-            None => continue, // junk
+            None => {
+                crate::quic_drop!(no_dcid, "datagram_size={} first={:#x}",
+                    dgram_bytes.len(),
+                    dgram_bytes.first().copied().unwrap_or(0));
+                continue;
+            }
         };
 
         // Try the slot table first: if this DCID's first 4 bytes
@@ -336,6 +341,18 @@ async fn listener_loop<H, F>(
             // Wrong-length DCID, short-header for unknown conn,
             // or Handshake/0-RTT/Retry without a matching slot
             // — drop. (Stateless reset is out of scope.)
+            let first = dgram_bytes.first().copied().unwrap_or(0);
+            // Distinguish short-header (FIXED_BIT set, long-header
+            // bit clear) from random long-header levels for finer
+            // diagnostic grouping.
+            if first & 0x80 == 0 {
+                crate::quic_drop!(unknown_short_header,
+                    "size={} dcid={}", dgram_bytes.len(), hex8(&dcid));
+            } else {
+                crate::quic_drop!(unknown_long_header,
+                    "size={} dcid={} first={:#x}",
+                    dgram_bytes.len(), hex8(&dcid), first);
+            }
             continue;
         }
 
@@ -350,6 +367,8 @@ async fn listener_loop<H, F>(
         // existing conn whenever we've seen this Initial DCID
         // already.
         if let Some(inbox) = slots.lookup_initial_dcid(&dcid) {
+            crate::quic_event!(initial_dcid_hit,
+                "size={} dcid={}", dgram_bytes.len(), hex8(&dcid));
             inbox.push(Datagram {
                 src_ip,
                 src_port,
@@ -360,15 +379,22 @@ async fn listener_loop<H, F>(
 
         let (slot_idx, generation) = match slots.allocate() {
             Some(x) => x,
-            None => continue, // slot table full, drop
+            None => {
+                crate::quic_drop!(slot_table_full, "dcid={}", hex8(&dcid));
+                continue;
+            }
         };
         slots.register_initial_dcid(&dcid, slot_idx, generation);
         let mut nonce = [0u8; 4];
         if getrandom::getrandom(&mut nonce).is_err() {
+            crate::quic_drop!(rng_failed, "minting CID nonce");
             continue;
         }
         let local_cid_bytes = make_local_cid(slot_idx, generation, nonce);
         let local_cid = ConnectionId::new(&local_cid_bytes);
+        crate::quic_event!(conns_allocated,
+            "slot={} gen={} dcid={} local_cid={}",
+            slot_idx, generation, hex8(&dcid), hex8(&local_cid_bytes));
 
         let inbox = ConnInbox::new();
         slots.install(slot_idx, generation, &inbox);
@@ -384,6 +410,7 @@ async fn listener_loop<H, F>(
 
         let mut seed = [0u8; 32];
         if getrandom::getrandom(&mut seed).is_err() {
+            crate::quic_drop!(rng_failed, "minting per-conn TLS seed");
             continue;
         }
         let task_inbox = inbox.clone();
@@ -433,7 +460,15 @@ async fn conn_task<H, F>(
         peer_ip.set(dgram.src_ip);
         peer_port.set(dgram.src_port);
         let result = conn.borrow_mut().process_datagram(&dgram.bytes, &cfg);
-        if result.is_err() {
+        if let Err(e) = result {
+            // Conn-level fatal error — closes the conn task and
+            // implicitly frees its slot. Surfacing the variant
+            // tells the operator which layer rejected the packet
+            // (wire / decrypt / state / TLS), instead of leaving
+            // the peer waiting 30 s for an idle timeout.
+            crate::quic_drop!(other_wire,
+                "process_datagram failed: {:?} dgram_size={} local_cid={}",
+                e, dgram.bytes.len(), hex8(&local_cid_bytes));
             break;
         }
 
@@ -496,6 +531,22 @@ async fn conn_task<H, F>(
 /// expose it in the standard place; short-header packets
 /// (1-RTT) have an endpoint-known DCID length, which for us is
 /// always `SERVER_CID_LEN`. Returns `None` for malformed inputs.
+/// Compact hex of up to the first 8 bytes of a slice, for log lines.
+/// Connection IDs are 8 bytes max in our scheme, so this hits the
+/// whole CID; arbitrary slices get truncated with `..`.
+pub(crate) fn hex8(b: &[u8]) -> alloc::string::String {
+    use core::fmt::Write;
+    let mut s = alloc::string::String::with_capacity(20);
+    let n = b.len().min(8);
+    for &byte in &b[..n] {
+        let _ = write!(s, "{:02x}", byte);
+    }
+    if b.len() > 8 {
+        s.push_str("..");
+    }
+    s
+}
+
 fn extract_dcid(bytes: &[u8]) -> Option<Vec<u8>> {
     if bytes.is_empty() {
         return None;

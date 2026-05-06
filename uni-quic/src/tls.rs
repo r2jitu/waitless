@@ -342,11 +342,25 @@ impl QuicTls {
         // Parse ClientHello fields we need; copy into owned
         // locals so we can drop the borrow into rx_initial.
         let (client_x25519_pub, sid_echo, sid_len, selected_alpn) = {
-            let ch = ClientHello::parse(body).map_err(|_| QuicTlsError::UnsupportedClient)?;
+            let ch = ClientHello::parse(body).map_err(|e| {
+                crate::quic_drop!(unsupported_client,
+                    "ClientHello::parse failed: {:?} body_len={}", e, body.len());
+                QuicTlsError::UnsupportedClient
+            })?;
             let mut sid = [0u8; 32];
             let n = ch.legacy_session_id.len();
             sid[..n].copy_from_slice(ch.legacy_session_id);
-            let pk = ch.x25519_client_pub.ok_or(QuicTlsError::UnsupportedClient)?;
+            let pk = ch.x25519_client_pub.ok_or_else(|| {
+                // Single-most-common reason a real browser CH gets
+                // rejected: only PQ key_share offered, no plain
+                // x25519 to fall back on. Surface enough to tell
+                // operators to either implement HRR or switch
+                // groups.
+                crate::quic_drop!(unsupported_client,
+                    "no x25519 in ClientHello key_share (groups offered: {} key_shares: {})",
+                    ch.observed_supported_group_count, ch.observed_key_share_count);
+                QuicTlsError::UnsupportedClient
+            })?;
             // Capture quic_transport_parameters into an owned Vec
             // before dropping the borrow.
             self.client_transport_params =

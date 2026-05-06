@@ -57,6 +57,7 @@ extern crate alloc;
 
 pub mod conn;
 pub mod crypto;
+pub mod diag;
 pub mod endpoint;
 pub mod frame;
 pub mod inbox;
