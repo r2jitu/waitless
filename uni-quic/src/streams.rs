@@ -57,8 +57,6 @@ pub fn is_bidirectional(id: u64) -> bool {
     id & 0b10 == 0
 }
 
-/// Per-stream receive state. Keeps a contiguous in-order byte
-/// buffer + an offset map for any out-of-order tail.
 /// Snapshot of `RecvStream` interior state for the stuck-handler
 /// watchdog. Serialisable to a log line so a stalled `conn.recv`
 /// can report exactly what the stream looks like.
@@ -69,6 +67,24 @@ pub struct RecvStreamState {
     pub closed: bool,
     pub buffer_len: usize,
     pub gap_entries: usize,
+}
+
+/// Receive-side stream lifecycle. Replaces the previous bool-pile
+/// (`closed: bool` + `fin_offset: Option<u64>`) with three
+/// mutually-exclusive variants — invalid combinations like
+/// "closed without fin_offset" are now unrepresentable, and the
+/// FIN-arrives-on-stale-frame bug from earlier in the session
+/// becomes a missing match arm at compile time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecvState {
+    /// No FIN seen yet; data may still arrive.
+    Open,
+    /// FIN seen at `fin_offset` but `self.offset < fin_offset`
+    /// (we still need data to fill the gap before EOF).
+    FinSeen { fin_offset: u64 },
+    /// FIN seen AND `self.offset >= fin_offset`. No more data
+    /// will arrive; once `buffer` drains, drain returns eof.
+    Closed { fin_offset: u64 },
 }
 
 pub struct RecvStream {
@@ -83,12 +99,8 @@ pub struct RecvStream {
     /// Out-of-order frames staged by their starting offset. Cleared
     /// as `offset` advances and adjacent ranges fold in.
     pub gap_buffer: BTreeMap<u64, Vec<u8>>,
-    /// Set when a STREAM frame with FIN has been seen. Combined
-    /// with `offset >= fin_offset` to determine "all data has been
-    /// delivered."
-    pub fin_offset: Option<u64>,
-    /// `true` once the app has consumed everything up to fin_offset.
-    pub closed: bool,
+    /// Lifecycle state — replaces `closed: bool` + `fin_offset`.
+    pub state: RecvState,
     /// Cumulative cap on out-of-order bytes — anything past this
     /// is dropped (treated as packet loss).
     pub gap_budget: usize,
@@ -100,8 +112,7 @@ impl Default for RecvStream {
             buffer: Vec::new(),
             offset: 0,
             gap_buffer: BTreeMap::new(),
-            fin_offset: None,
-            closed: false,
+            state: RecvState::Open,
             gap_budget: 16 * 1024,
         }
     }
@@ -115,10 +126,61 @@ impl RecvStream {
     pub fn debug_state(&self) -> RecvStreamState {
         RecvStreamState {
             offset: self.offset,
-            fin_offset: self.fin_offset,
-            closed: self.closed,
+            fin_offset: self.fin_offset(),
+            closed: self.is_closed(),
             buffer_len: self.buffer.len(),
             gap_entries: self.gap_buffer.len(),
+        }
+    }
+
+    /// `Some(fin_offset)` once we've seen a FIN-bearing frame.
+    /// Derived from `state` so the bool-pile invariant
+    /// (`closed && fin_offset.is_some()`) is enforced by the
+    /// type system.
+    pub fn fin_offset(&self) -> Option<u64> {
+        match self.state {
+            RecvState::Open => None,
+            RecvState::FinSeen { fin_offset } | RecvState::Closed { fin_offset } => {
+                Some(fin_offset)
+            }
+        }
+    }
+
+    /// `true` once FIN has been seen AND `offset >= fin_offset`.
+    /// Equivalent to `matches!(state, RecvState::Closed { .. })`.
+    pub fn is_closed(&self) -> bool {
+        matches!(self.state, RecvState::Closed { .. })
+    }
+
+    /// Record a FIN at `end` and re-evaluate whether the stream
+    /// is now `Closed`. Called from both the contiguous and
+    /// stale-frame branches in `ingest`. Centralising the state
+    /// transition is the whole point of this refactor — the
+    /// FIN-only-stale bug existed because two branches each had
+    /// half the logic.
+    fn record_fin(&mut self, end: u64) {
+        let fin_offset = match self.state {
+            RecvState::Open => end,
+            RecvState::FinSeen { fin_offset } | RecvState::Closed { fin_offset } => {
+                fin_offset.max(end)
+            }
+        };
+        self.state = if self.offset >= fin_offset {
+            RecvState::Closed { fin_offset }
+        } else {
+            RecvState::FinSeen { fin_offset }
+        };
+    }
+
+    /// Re-check whether the offset has caught up to an
+    /// already-recorded FIN. Called after `offset` advances
+    /// (contiguous append + gap fold-in). No-op when not in
+    /// `FinSeen`.
+    fn maybe_close(&mut self) {
+        if let RecvState::FinSeen { fin_offset } = self.state {
+            if self.offset >= fin_offset {
+                self.state = RecvState::Closed { fin_offset };
+            }
         }
     }
 
@@ -130,22 +192,13 @@ impl RecvStream {
         // Frame entirely below current offset → already-seen
         // retransmit, OR a FIN-only frame at the current offset
         // with length 0 (Chrome routinely sends HEADERS without
-        // FIN and then a separate FIN-only frame; the inequality
-        // is non-strict so a 0-length FIN at offset==self.offset
-        // hits this branch). We still need to record the FIN and
-        // — critically — set `closed` if it's now reached, since
-        // the early-return below would otherwise skip the
-        // closed-update at the bottom and `drain()` would never
-        // report eof, hanging any reader awaiting the FIN.
+        // FIN and then a separate FIN-only frame at offset ==
+        // self.offset, len = 0). Either way we still must record
+        // the FIN if present — `record_fin` handles the
+        // FinSeen → Closed promotion.
         if frame_offset + data.len() as u64 <= self.offset {
             if fin {
-                let end = frame_offset + data.len() as u64;
-                self.fin_offset = Some(self.fin_offset.map_or(end, |x| x.max(end)));
-                if let Some(f) = self.fin_offset {
-                    if self.offset >= f {
-                        self.closed = true;
-                    }
-                }
+                self.record_fin(frame_offset + data.len() as u64);
             }
             return false;
         }
@@ -184,13 +237,11 @@ impl RecvStream {
             self.gap_budget -= data.len();
         }
         if fin {
-            let end = frame_offset + data.len() as u64;
-            self.fin_offset = Some(self.fin_offset.map_or(end, |x| x.max(end)));
-        }
-        if let Some(f) = self.fin_offset {
-            if self.offset >= f {
-                self.closed = true;
-            }
+            self.record_fin(frame_offset + data.len() as u64);
+        } else {
+            // Even without a new FIN this frame, our `offset`
+            // may have caught up to a previously-seen one.
+            self.maybe_close();
         }
         produced
     }
@@ -203,14 +254,33 @@ impl RecvStream {
         let n = out.len().min(self.buffer.len());
         out[..n].copy_from_slice(&self.buffer[..n]);
         self.buffer.drain(..n);
-        let eof =
-            self.fin_offset.is_some() && self.buffer.is_empty() && self.closed;
+        let eof = self.is_closed() && self.buffer.is_empty();
         (n, eof)
     }
 
     pub fn has_buffered(&self) -> bool {
         !self.buffer.is_empty()
     }
+}
+
+/// Send-side stream lifecycle. Replaces the
+/// (`close_after_drain`, `fin_sent`) bool pair with three
+/// mutually-exclusive variants. The two valid states under the
+/// old encoding were Open (FF), Closing (TF), FinSent (TT) —
+/// the (FT) combination ("fin sent without ever calling close")
+/// was unreachable but representable. Now it's not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendState {
+    /// Accepting writes. `close()` transitions to `Closing`.
+    Open,
+    /// `close()` was called; we'll emit FIN on the next pop_chunk
+    /// after `outbound` drains.
+    Closing,
+    /// FIN frame has been emitted. No further STREAM frames; no
+    /// further writes accepted (write becomes a no-op rather than
+    /// panicking — the caller may have a pending write that
+    /// raced the close).
+    FinSent,
 }
 
 /// Per-stream send state. The connection layer drives
@@ -222,12 +292,8 @@ pub struct SendStream {
     /// Offset of the next byte to send. Increments by chunk size
     /// per `pop_chunk` call.
     pub send_offset: u64,
-    /// Set by `close()` — once the buffer is empty we'll emit
-    /// FIN on the final STREAM frame.
-    pub close_after_drain: bool,
-    /// `true` once a STREAM frame with FIN has been emitted; no
-    /// further STREAM frames go out for this stream.
-    pub fin_sent: bool,
+    /// Lifecycle — replaces (`close_after_drain`, `fin_sent`).
+    pub state: SendState,
 }
 
 impl Default for SendStream {
@@ -235,36 +301,54 @@ impl Default for SendStream {
         SendStream {
             outbound: Vec::new(),
             send_offset: 0,
-            close_after_drain: false,
-            fin_sent: false,
+            state: SendState::Open,
         }
     }
 }
 
 impl SendStream {
+    /// Convenience predicate (FIN was emitted) — kept for the
+    /// reaper, which uses it as half of the "both sides done"
+    /// gate.
+    pub fn fin_sent(&self) -> bool {
+        matches!(self.state, SendState::FinSent)
+    }
+
     pub fn write(&mut self, data: &[u8]) {
+        // Writes after FIN are a no-op rather than a panic so
+        // a racing `stream_send` after `stream_close` doesn't
+        // crash the conn task.
+        if matches!(self.state, SendState::FinSent) {
+            return;
+        }
         self.outbound.extend_from_slice(data);
     }
+
     pub fn close(&mut self) {
-        self.close_after_drain = true;
+        match self.state {
+            SendState::Open => self.state = SendState::Closing,
+            // Already closing or FIN'd — close is idempotent.
+            SendState::Closing | SendState::FinSent => {}
+        }
     }
+
     /// Pop up to `max_bytes` from the front. Returns
     /// `(offset, data, fin)`. `fin` is `true` only if `close()`
     /// was called and we just popped the final byte.
     pub fn pop_chunk(&mut self, max_bytes: usize) -> Option<(u64, Vec<u8>, bool)> {
-        if self.fin_sent {
-            return None;
-        }
-        if self.outbound.is_empty() && !self.close_after_drain {
-            return None;
+        match self.state {
+            SendState::FinSent => return None,
+            SendState::Open if self.outbound.is_empty() => return None,
+            // Open with data, OR Closing (with or without data).
+            _ => {}
         }
         let n = self.outbound.len().min(max_bytes);
         let chunk: Vec<u8> = self.outbound.drain(..n).collect();
         let offset = self.send_offset;
         self.send_offset += n as u64;
-        let fin = self.close_after_drain && self.outbound.is_empty();
+        let fin = matches!(self.state, SendState::Closing) && self.outbound.is_empty();
         if fin {
-            self.fin_sent = true;
+            self.state = SendState::FinSent;
         }
         Some((offset, chunk, fin))
     }

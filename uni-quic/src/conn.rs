@@ -802,13 +802,13 @@ impl Connection {
             .send_streams
             .iter()
             .filter_map(|(sid, s)| {
-                if !(s.fin_sent && s.outbound.is_empty()) {
+                if !(s.fin_sent() && s.outbound.is_empty()) {
                     return None;
                 }
                 let recv_done = self
                     .recv_streams
                     .get(sid)
-                    .map_or(false, |r| r.closed && r.buffer.is_empty());
+                    .map_or(false, |r| r.is_closed() && r.buffer.is_empty());
                 if recv_done {
                     Some(*sid)
                 } else {
@@ -1746,11 +1746,14 @@ impl Connection {
     fn has_pending_one_rtt_data(&self) -> bool {
         // Any send stream with bytes queued OR a close pending.
         for s in self.send_streams.values() {
-            if s.fin_sent {
-                continue;
-            }
-            if !s.outbound.is_empty() || s.close_after_drain {
-                return true;
+            match s.state {
+                crate::streams::SendState::FinSent => continue,
+                crate::streams::SendState::Closing => return true,
+                crate::streams::SendState::Open => {
+                    if !s.outbound.is_empty() {
+                        return true;
+                    }
+                }
             }
         }
         false
