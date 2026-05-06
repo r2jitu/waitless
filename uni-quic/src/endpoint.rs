@@ -147,7 +147,18 @@ impl QuicConn {
     /// Read up to `out.len()` bytes from stream `sid`. Returns
     /// `(bytes_copied, eof)`. `eof = true` once FIN has been
     /// observed AND every byte has been drained.
+    ///
+    /// Includes a stuck-handler watchdog: if the await loop runs
+    /// for more than `STUCK_THRESHOLD_US` without making progress,
+    /// log the recv stream's interior state once. The threshold
+    /// is past the typical idle-page render delay (a few hundred
+    /// ms) but well before the user notices a stall, so a real
+    /// wedge surfaces in the log with the exact state needed to
+    /// diagnose it.
     pub async fn recv(&self, sid: u64, out: &mut [u8]) -> (usize, bool) {
+        const STUCK_THRESHOLD_US: u64 = 5_000_000; // 5 s
+        let entered_us = uni_tls::ticket::now_us();
+        let mut warned = false;
         loop {
             {
                 let mut c = self.conn.borrow_mut();
@@ -157,6 +168,17 @@ impl QuicConn {
                 }
                 if matches!(c.state(), ConnState::Failed) {
                     return (0, true);
+                }
+            }
+            if !warned {
+                let elapsed = uni_tls::ticket::now_us().saturating_sub(entered_us);
+                if elapsed > STUCK_THRESHOLD_US {
+                    let state = self.conn.borrow().recv_stream_state(sid);
+                    crate::quic_drop!(other_wire,
+                        "stuck recv await sid={} elapsed_ms={} state={:?} local_cid={}",
+                        sid, elapsed / 1_000, state,
+                        crate::endpoint::hex8(&self.local_cid));
+                    warned = true;
                 }
             }
             self.progress.reset();

@@ -851,6 +851,16 @@ impl Connection {
         }
     }
 
+    /// Snapshot a recv stream's interior state for diagnostics.
+    /// Returns `None` if the stream doesn't exist (already reaped
+    /// or never created). Used by the stuck-handler watchdog.
+    pub fn recv_stream_state(
+        &self,
+        sid: u64,
+    ) -> Option<crate::streams::RecvStreamState> {
+        self.recv_streams.get(&sid).map(|s| s.debug_state())
+    }
+
     /// Whether stream `sid` has any buffered bytes ready for the
     /// app to drain.
     pub fn stream_has_buffered(&self, sid: u64) -> bool {

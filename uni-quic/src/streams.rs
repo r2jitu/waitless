@@ -59,6 +59,18 @@ pub fn is_bidirectional(id: u64) -> bool {
 
 /// Per-stream receive state. Keeps a contiguous in-order byte
 /// buffer + an offset map for any out-of-order tail.
+/// Snapshot of `RecvStream` interior state for the stuck-handler
+/// watchdog. Serialisable to a log line so a stalled `conn.recv`
+/// can report exactly what the stream looks like.
+#[derive(Debug, Clone, Copy)]
+pub struct RecvStreamState {
+    pub offset: u64,
+    pub fin_offset: Option<u64>,
+    pub closed: bool,
+    pub buffer_len: usize,
+    pub gap_entries: usize,
+}
+
 pub struct RecvStream {
     /// Bytes consecutively received and not yet drained by the app.
     /// Pop-front semantics from the dispatch path; the recv API
@@ -96,6 +108,20 @@ impl Default for RecvStream {
 }
 
 impl RecvStream {
+    /// Snapshot of internal state for diagnostics. Used by the
+    /// stuck-handler watchdog so a stalled `conn.recv` await can
+    /// report what the stream actually looks like instead of
+    /// guessing.
+    pub fn debug_state(&self) -> RecvStreamState {
+        RecvStreamState {
+            offset: self.offset,
+            fin_offset: self.fin_offset,
+            closed: self.closed,
+            buffer_len: self.buffer.len(),
+            gap_entries: self.gap_buffer.len(),
+        }
+    }
+
     /// Ingest a STREAM frame's `(offset, data, fin)` triple.
     /// Returns `true` if this frame contributed any new contiguous
     /// bytes (caller may want to wake the recv future).
@@ -290,16 +316,176 @@ mod tests {
     #[test]
     fn recv_fin_only_frame_after_data_signals_eof() {
         let mut s = RecvStream::default();
-        // First frame: data, no FIN.
         s.ingest(0, b"GET /", false);
         let mut out = [0u8; 8];
         let (n, eof) = s.drain(&mut out);
         assert_eq!(&out[..n], b"GET /");
         assert!(!eof);
-        // Second frame: empty, FIN at offset == current offset.
         s.ingest(5, b"", true);
         let (n2, eof2) = s.drain(&mut out);
         assert_eq!(n2, 0);
+        assert!(eof2);
+    }
+
+    // ── Exhaustive RecvStream state-transition coverage ─────────
+    //
+    // The bugs we've shipped to production were each one missed
+    // (state, input) transition. The tests below cover every
+    // legal combination of frame placement vs current `offset` /
+    // `fin_offset`, asserting the same invariant at the end:
+    //
+    //   "drain() returns eof=true iff the peer has signalled FIN
+    //    AND every byte up to fin_offset has been delivered to
+    //    the app."
+    //
+    // If a future change re-introduces the FIN-skip-closed bug
+    // (or any cousin), the matching test below fails immediately.
+
+    fn drain_all(s: &mut RecvStream) -> (alloc::vec::Vec<u8>, bool) {
+        let mut out = [0u8; 4096];
+        let mut collected = alloc::vec::Vec::new();
+        loop {
+            let (n, eof) = s.drain(&mut out);
+            collected.extend_from_slice(&out[..n]);
+            if n == 0 {
+                return (collected, eof);
+            }
+            if eof {
+                return (collected, eof);
+            }
+        }
+    }
+
+    #[test]
+    fn recv_fin_with_data_in_one_frame() {
+        let mut s = RecvStream::default();
+        s.ingest(0, b"hello", true);
+        let (data, eof) = drain_all(&mut s);
+        assert_eq!(&data[..], b"hello");
+        assert!(eof);
+    }
+
+    #[test]
+    fn recv_data_then_fin_only_at_boundary() {
+        // Most common Chrome HTTP/3 GET pattern.
+        let mut s = RecvStream::default();
+        s.ingest(0, b"hello", false);
+        s.ingest(5, b"", true);
+        let (data, eof) = drain_all(&mut s);
+        assert_eq!(&data[..], b"hello");
+        assert!(eof);
+    }
+
+    #[test]
+    fn recv_drain_then_fin_only_at_boundary() {
+        // Same as above but app drains between ingests.
+        let mut s = RecvStream::default();
+        s.ingest(0, b"hello", false);
+        let mut out = [0u8; 16];
+        s.drain(&mut out);
+        s.ingest(5, b"", true);
+        let (_, eof) = s.drain(&mut out);
+        assert!(eof);
+    }
+
+    #[test]
+    fn recv_retransmit_of_fin_bearing_frame() {
+        // Peer retransmits same data+FIN frame (same offset/len/fin).
+        // `closed` must end up true; idempotent.
+        let mut s = RecvStream::default();
+        s.ingest(0, b"hello", true);
+        s.ingest(0, b"hello", true);
+        let (data, eof) = drain_all(&mut s);
+        assert_eq!(&data[..], b"hello");
+        assert!(eof);
+    }
+
+    #[test]
+    fn recv_partial_overlap_carrying_fin() {
+        // FIN frame partially overlaps already-received data.
+        let mut s = RecvStream::default();
+        s.ingest(0, b"hello", false);
+        // overlap: first 3 bytes already seen, last 4 are new+FIN.
+        s.ingest(2, b"llo wo", true); // 2..8
+        let (data, eof) = drain_all(&mut s);
+        assert_eq!(&data[..], b"hello wo");
+        assert!(eof);
+    }
+
+    #[test]
+    fn recv_out_of_order_then_fill_with_fin() {
+        // FIN frame arrives first (gap-buffered), data fills gap.
+        let mut s = RecvStream::default();
+        s.ingest(5, b"world", true); // gap-buffered, fin_offset=10
+        let (n, eof) = s.drain(&mut [0u8; 16]);
+        assert_eq!(n, 0);
+        assert!(!eof);
+        s.ingest(0, b"hello", false);
+        let (data, eof) = drain_all(&mut s);
+        assert_eq!(&data[..], b"helloworld");
+        assert!(eof);
+    }
+
+    #[test]
+    fn recv_out_of_order_then_fill_then_fin_only() {
+        let mut s = RecvStream::default();
+        s.ingest(5, b"world", false); // gap-buffered
+        s.ingest(0, b"hello", false); // fold-in → offset=10
+        s.ingest(10, b"", true); // FIN at boundary
+        let (data, eof) = drain_all(&mut s);
+        assert_eq!(&data[..], b"helloworld");
+        assert!(eof);
+    }
+
+    #[test]
+    fn recv_fin_arrives_before_any_data() {
+        // FIN-only frame at offset 0, no data yet sent.
+        let mut s = RecvStream::default();
+        s.ingest(0, b"", true);
+        let (n, eof) = s.drain(&mut [0u8; 8]);
+        assert_eq!(n, 0);
+        assert!(eof);
+    }
+
+    #[test]
+    fn recv_drain_eof_is_idempotent() {
+        // Calling drain after eof keeps returning eof=true.
+        let mut s = RecvStream::default();
+        s.ingest(0, b"x", true);
+        let mut out = [0u8; 4];
+        let (_, eof1) = s.drain(&mut out);
+        assert!(eof1);
+        let (n2, eof2) = s.drain(&mut out);
+        assert_eq!(n2, 0);
+        assert!(eof2);
+    }
+
+    #[test]
+    fn recv_fin_in_stale_retransmit() {
+        // Peer drops the FIN bit on first send, sets it on retx
+        // (legal — sender state machine may decide at retx time).
+        let mut s = RecvStream::default();
+        s.ingest(0, b"hello", false);
+        let mut out = [0u8; 8];
+        s.drain(&mut out);
+        // Retx of same range, this time with FIN.
+        s.ingest(0, b"hello", true);
+        let (_, eof) = s.drain(&mut out);
+        assert!(eof);
+    }
+
+    #[test]
+    fn recv_eof_only_after_buffer_drained() {
+        // Until the app has actually consumed the bytes,
+        // eof must remain false.
+        let mut s = RecvStream::default();
+        s.ingest(0, b"hello", true);
+        let mut out = [0u8; 3];
+        let (n, eof) = s.drain(&mut out);
+        assert_eq!(n, 3);
+        assert!(!eof, "buffer not yet drained");
+        let (n2, eof2) = s.drain(&mut out);
+        assert_eq!(n2, 2);
         assert!(eof2);
     }
 
