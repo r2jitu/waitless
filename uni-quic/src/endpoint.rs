@@ -462,26 +462,30 @@ async fn conn_task<H, F>(
     let mut handler_spawned = false;
 
     loop {
-        // Idle-timeout-aware wait. Each iteration recomputes the
-        // deadline from the current `last_recv_us` (the field is
-        // refreshed inside `process_datagram` for every accepted
-        // datagram). `select` polls inbox first, then the timer —
-        // if both fire same poll, inbound wins, which is the
-        // correct bias.
-        let (idle_us, last_recv_us) = {
+        // Race the inbox against a single combined timer that
+        // fires at the earliest of: idle-timeout deadline,
+        // PTO deadline (if any in-flight ack-eliciting packets).
+        // After wake we figure out which one fired, since `select`
+        // is binary: we know the timer fired, then check now()
+        // against each deadline independently.
+        let (idle_us, last_recv_us, pto_deadline) = {
             let c = conn.borrow();
-            (c.idle_timeout_us(), c.last_recv_us())
+            (c.idle_timeout_us(), c.last_recv_us(), c.pto_deadline_us())
         };
         let now = uni_tls::ticket::now_us();
         let elapsed = now.saturating_sub(last_recv_us);
         if elapsed >= idle_us {
-            // Already past the deadline — bail without sleeping.
             crate::quic_event!(idle_timeouts,
                 "elapsed_us={} idle_us={} local_cid={}",
                 elapsed, idle_us, hex8(&local_cid_bytes));
             break;
         }
-        let remaining = idle_us - elapsed;
+        let idle_deadline = last_recv_us + idle_us;
+        let timer_deadline = match pto_deadline {
+            Some(p) => p.min(idle_deadline),
+            None => idle_deadline,
+        };
+        let remaining = timer_deadline.saturating_sub(now).max(1);
 
         let dgram = match uni::runtime::select(
             inbox.pop(),
@@ -490,14 +494,39 @@ async fn conn_task<H, F>(
             uni::runtime::Either::Left(Some(d)) => d,
             uni::runtime::Either::Left(None) => break, // inbox closed
             uni::runtime::Either::Right(()) => {
-                // Idle timer fired without an inbound datagram in
-                // the window. RFC 9000 §10.1: "If the idle timeout
-                // is enabled, a connection is silently closed and
-                // its state is discarded when it remains idle for
-                // longer than the advertised idle_timeout."
+                // Timer fired. Distinguish PTO vs idle by which
+                // deadline was earlier and is now in the past.
+                let after = uni_tls::ticket::now_us();
+                if let Some(p) = pto_deadline {
+                    if after >= p && p < idle_deadline {
+                        // PTO fired first — emit a probe and loop
+                        // back. Don't break; PTO is recovery, not
+                        // teardown.
+                        let probed = conn.borrow_mut().send_pto_probe();
+                        if probed {
+                            crate::diag::COUNTERS
+                                .pto_probes_sent
+                                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                            // Drain the probe to the wire
+                            // immediately; no need to wait for
+                            // the next loop iteration.
+                            let mut out = vec![0u8; 1500];
+                            loop {
+                                let n = conn.borrow_mut().pop_packet(&mut out);
+                                if n == 0 {
+                                    break;
+                                }
+                                let _ = sock.send_to(peer_ip.get(), peer_port.get(), &out[..n]);
+                            }
+                        }
+                        continue;
+                    }
+                }
+                // Idle path.
                 crate::quic_event!(idle_timeouts,
                     "elapsed_us={} idle_us={} local_cid={}",
-                    remaining, idle_us, hex8(&local_cid_bytes));
+                    after.saturating_sub(last_recv_us),
+                    idle_us, hex8(&local_cid_bytes));
                 break;
             }
         };

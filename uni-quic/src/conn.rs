@@ -609,6 +609,69 @@ impl Connection {
         effective_ms.saturating_mul(1_000)
     }
 
+    /// PTO (Probe Timeout) period in microseconds, RFC 9002 §6.2.1:
+    ///   `PTO = SRTT + max(4 * RTTvar, kGranularity) + max_ack_delay`
+    /// Until we have an SRTT sample, falls back to kInitialRtt =
+    /// 333 ms. We don't yet implement exponential backoff
+    /// (`PTO * 2^pto_count`); a single missed probe is acceptable
+    /// for first-pass behaviour.
+    pub fn pto_period_us(&self) -> u64 {
+        const K_INITIAL_RTT_US: u64 = 333_000;
+        const K_GRANULARITY_US: u64 = 1_000;
+        // Default peer max_ack_delay is 25 ms (RFC 9000 §18.2).
+        let max_ack_delay_us: u64 = 25_000;
+        match self.smoothed_rtt_us {
+            None => K_INITIAL_RTT_US + K_GRANULARITY_US,
+            Some(srtt) => srtt + (4 * self.rttvar_us).max(K_GRANULARITY_US) + max_ack_delay_us,
+        }
+    }
+
+    /// Microseconds-since-boot timestamp at which the PTO timer
+    /// fires. `None` when we have no in-flight ack-eliciting packet
+    /// (no probe needed). Picks the *earliest* deadline across all
+    /// three spaces — a probe in any of them would advance the
+    /// state machine.
+    pub fn pto_deadline_us(&self) -> Option<u64> {
+        let pto = self.pto_period_us();
+        self.time_of_last_ack_eliciting_us
+            .iter()
+            .filter_map(|t| t.map(|x| x + pto))
+            .min()
+    }
+
+    /// Send a PING-only probe at the level that has the oldest
+    /// in-flight ack-eliciting packet. RFC 9002 §6.2.4 prefers
+    /// retransmitting unacked CRYPTO/STREAM data here, but until
+    /// frame retx is wired up, a PING is the next-best forcer of
+    /// an ACK from the peer (which then either confirms previously
+    /// sent packets via cumulative ACK, or signals their loss via
+    /// silence). Returns `true` if a probe was actually emitted.
+    pub fn send_pto_probe(&mut self) -> bool {
+        // Find the level with the oldest unacked ack-eliciting send.
+        // Initial / Handshake / Application = 0 / 1 / 2.
+        let oldest = self
+            .time_of_last_ack_eliciting_us
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| t.map(|x| (i, x)))
+            .min_by_key(|(_, t)| *t);
+        let level_idx = match oldest {
+            Some((i, _)) => i,
+            None => return false,
+        };
+        let level = match level_idx {
+            0 => CryptoLevel::Initial,
+            1 => CryptoLevel::Handshake,
+            _ => CryptoLevel::OneRtt,
+        };
+        let mut datagram = Vec::with_capacity(64);
+        if self.encode_ping_probe(&mut datagram, level).is_ok() && !datagram.is_empty() {
+            self.outbound.push(datagram);
+            return true;
+        }
+        false
+    }
+
     /// Process one inbound UDP datagram. Coalesced packets
     /// (Initial+Handshake or Initial+0-RTT in one datagram, both
     /// common with browsers) are walked left-to-right; each packet's
@@ -1848,6 +1911,123 @@ impl Connection {
 
         // No send keys at any level — peer has no way to decrypt
         // a close packet. Caller falls through to silent close.
+        Ok(())
+    }
+
+    /// Build and seal a single-byte PING probe at the requested
+    /// level. Used by the PTO timer to force the peer to ACK so
+    /// we can either (a) confirm the connection's still alive,
+    /// or (b) advance loss detection by raising `largest_acked`
+    /// past stale unacked PNs. The encoded packet is also recorded
+    /// in `sent_packets` so it itself participates in the loss /
+    /// RTT machinery.
+    fn encode_ping_probe(
+        &mut self,
+        out: &mut Vec<u8>,
+        level: CryptoLevel,
+    ) -> Result<(), ConnError> {
+        let frames = [crate::frame::ftype::PING];
+
+        match level {
+            CryptoLevel::OneRtt => {
+                let send_keys = match self.application_send.as_ref() {
+                    Some(k) => k.clone(),
+                    None => return Ok(()),
+                };
+                let pn = self.application_space.next_send_pn;
+                self.application_space.next_send_pn += 1;
+                let pn_length: usize = 4;
+                let header_start = out.len();
+                let first_byte: u8 = FIXED_BIT | ((pn_length as u8) - 1);
+                out.push(first_byte);
+                out.extend_from_slice(self.peer_cid.as_slice());
+                let pn_offset = out.len();
+                out.extend_from_slice(&(pn as u32).to_be_bytes());
+                let payload_offset = out.len();
+                out.extend_from_slice(&frames);
+                while out.len() - pn_offset < 4 + HP_SAMPLE_LEN {
+                    out.push(0);
+                }
+                let payload_len = out.len() - payload_offset;
+                out.extend_from_slice(&[0u8; TAG_LEN]);
+                let total_end = out.len();
+                let byte_count = (total_end - header_start) as u32;
+                self.seal_packet(
+                    out, header_start, pn_offset, payload_offset, payload_len, total_end, pn,
+                    &send_keys, false,
+                )?;
+                self.record_sent_packet(CryptoLevel::OneRtt, pn, true, byte_count);
+            }
+            CryptoLevel::Handshake => {
+                let send_keys = match self.handshake_send.as_ref() {
+                    Some(k) => k.clone(),
+                    None => return Ok(()),
+                };
+                let pn = self.handshake_space.next_send_pn;
+                self.handshake_space.next_send_pn += 1;
+                let pn_length: usize = 4;
+                let payload_len = frames.len();
+                let length_field = (pn_length + payload_len + TAG_LEN) as u64;
+                let first_byte: u8 = 0xe0 | ((pn_length as u8) - 1);
+                let header_start = out.len();
+                out.push(first_byte);
+                out.extend_from_slice(&QUIC_VERSION_1.to_be_bytes());
+                out.push(self.peer_cid.len() as u8);
+                out.extend_from_slice(self.peer_cid.as_slice());
+                out.push(self.local_cid.len() as u8);
+                out.extend_from_slice(self.local_cid.as_slice());
+                let mut lf_buf = [0u8; 4];
+                let n = write_varint(length_field, &mut lf_buf).map_err(|_| ConnError::Wire)?;
+                out.extend_from_slice(&lf_buf[..n]);
+                let pn_offset = out.len();
+                out.extend_from_slice(&(pn as u32).to_be_bytes());
+                let payload_offset = out.len();
+                out.extend_from_slice(&frames);
+                out.extend_from_slice(&[0u8; TAG_LEN]);
+                let total_end = out.len();
+                let byte_count = (total_end - header_start) as u32;
+                self.seal_packet(
+                    out, header_start, pn_offset, payload_offset, payload_len, total_end, pn,
+                    &send_keys, true,
+                )?;
+                self.record_sent_packet(CryptoLevel::Handshake, pn, true, byte_count);
+            }
+            CryptoLevel::Initial => {
+                let send_keys = match self.initial_send.as_ref() {
+                    Some(k) => k.clone(),
+                    None => return Ok(()),
+                };
+                let pn = self.initial_space.next_send_pn;
+                self.initial_space.next_send_pn += 1;
+                let pn_length: usize = 4;
+                let payload_len = frames.len();
+                let length_field = (pn_length + payload_len + TAG_LEN) as u64;
+                let first_byte: u8 = 0xc0 | ((pn_length as u8) - 1);
+                let header_start = out.len();
+                out.push(first_byte);
+                out.extend_from_slice(&QUIC_VERSION_1.to_be_bytes());
+                out.push(self.peer_cid.len() as u8);
+                out.extend_from_slice(self.peer_cid.as_slice());
+                out.push(self.local_cid.len() as u8);
+                out.extend_from_slice(self.local_cid.as_slice());
+                out.push(0); // Token Length VARINT = 0
+                let mut lf_buf = [0u8; 4];
+                let n = write_varint(length_field, &mut lf_buf).map_err(|_| ConnError::Wire)?;
+                out.extend_from_slice(&lf_buf[..n]);
+                let pn_offset = out.len();
+                out.extend_from_slice(&(pn as u32).to_be_bytes());
+                let payload_offset = out.len();
+                out.extend_from_slice(&frames);
+                out.extend_from_slice(&[0u8; TAG_LEN]);
+                let total_end = out.len();
+                let byte_count = (total_end - header_start) as u32;
+                self.seal_packet(
+                    out, header_start, pn_offset, payload_offset, payload_len, total_end, pn,
+                    &send_keys, true,
+                )?;
+                self.record_sent_packet(CryptoLevel::Initial, pn, true, byte_count);
+            }
+        }
         Ok(())
     }
 

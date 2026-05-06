@@ -156,6 +156,14 @@ pub struct Counters {
     /// past `max(9/8 * max(SRTT, latest_rtt), kGranularity)`.
     /// Same caveat as `packets_lost_threshold` w.r.t. retx.
     pub packets_lost_time: AtomicU64,
+    /// One PTO probe packet was emitted because the PTO timer
+    /// fired before any ACK confirmed our most-recent ack-eliciting
+    /// send (RFC 9002 §6.2). The probe is a PING-only packet at
+    /// the level with the oldest unacked send. A bumped counter
+    /// without matching `packets_lost_*` growth means the network
+    /// is just slow / the peer is briefly unresponsive; a bumped
+    /// counter with matching loss growth means real loss.
+    pub pto_probes_sent: AtomicU64,
 }
 
 impl Counters {
@@ -188,6 +196,7 @@ impl Counters {
             connection_closes_emitted: AtomicU64::new(0),
             packets_lost_threshold: AtomicU64::new(0),
             packets_lost_time: AtomicU64::new(0),
+            pto_probes_sent: AtomicU64::new(0),
         }
     }
 }
@@ -307,7 +316,7 @@ pub fn should_log_event() -> bool {
 
 /// Snapshot of every counter, for `/debug/quic_stats`-style dumps.
 /// Returns `(name, value)` pairs in declaration order.
-pub fn snapshot() -> [(&'static str, u64); 27] {
+pub fn snapshot() -> [(&'static str, u64); 28] {
     let c = &COUNTERS;
     [
         ("no_dcid", c.no_dcid.load(Ordering::Relaxed)),
@@ -337,6 +346,7 @@ pub fn snapshot() -> [(&'static str, u64); 27] {
         ("connection_closes_emitted", c.connection_closes_emitted.load(Ordering::Relaxed)),
         ("packets_lost_threshold", c.packets_lost_threshold.load(Ordering::Relaxed)),
         ("packets_lost_time", c.packets_lost_time.load(Ordering::Relaxed)),
+        ("pto_probes_sent", c.pto_probes_sent.load(Ordering::Relaxed)),
     ]
 }
 
