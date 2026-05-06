@@ -102,12 +102,24 @@ impl RecvStream {
     pub fn ingest(&mut self, frame_offset: u64, data: &[u8], fin: bool) -> bool {
         let mut produced = false;
         // Frame entirely below current offset → already-seen
-        // retransmit; ignore.
+        // retransmit, OR a FIN-only frame at the current offset
+        // with length 0 (Chrome routinely sends HEADERS without
+        // FIN and then a separate FIN-only frame; the inequality
+        // is non-strict so a 0-length FIN at offset==self.offset
+        // hits this branch). We still need to record the FIN and
+        // — critically — set `closed` if it's now reached, since
+        // the early-return below would otherwise skip the
+        // closed-update at the bottom and `drain()` would never
+        // report eof, hanging any reader awaiting the FIN.
         if frame_offset + data.len() as u64 <= self.offset {
-            // Just record FIN if it arrives on a stale frame —
-            // unusual but legal.
             if fin {
-                self.fin_offset = Some(frame_offset + data.len() as u64);
+                let end = frame_offset + data.len() as u64;
+                self.fin_offset = Some(self.fin_offset.map_or(end, |x| x.max(end)));
+                if let Some(f) = self.fin_offset {
+                    if self.offset >= f {
+                        self.closed = true;
+                    }
+                }
             }
             return false;
         }
@@ -267,6 +279,28 @@ mod tests {
         let (n, eof) = s.drain(&mut out);
         assert_eq!(&out[..n], b"hi");
         assert!(eof);
+    }
+
+    /// Regression: Chrome (and other HTTP/3 clients) routinely
+    /// send HEADERS without FIN, then a separate FIN-only STREAM
+    /// frame at offset == current offset, length 0. Previously
+    /// the stale-frame early return set `fin_offset` but skipped
+    /// the `closed` update, and `drain()` would never report eof
+    /// — wedging any handler awaiting the request body.
+    #[test]
+    fn recv_fin_only_frame_after_data_signals_eof() {
+        let mut s = RecvStream::default();
+        // First frame: data, no FIN.
+        s.ingest(0, b"GET /", false);
+        let mut out = [0u8; 8];
+        let (n, eof) = s.drain(&mut out);
+        assert_eq!(&out[..n], b"GET /");
+        assert!(!eof);
+        // Second frame: empty, FIN at offset == current offset.
+        s.ingest(5, b"", true);
+        let (n2, eof2) = s.drain(&mut out);
+        assert_eq!(n2, 0);
+        assert!(eof2);
     }
 
     #[test]
