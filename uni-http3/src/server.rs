@@ -293,14 +293,15 @@ fn write_response(conn: &QuicConn, sid: u64, resp: Response) {
     // contiguous bytes inside the QUIC STREAM frame.
     let status_str = status_to_bytes(resp.status);
     let body_len = resp.body_len();
-    let len_str = format_usize(body_len);
+    let mut len_buf = [0u8; 20];
+    let len_off = format_usize_into(body_len, &mut len_buf);
 
     let mut qpack_buf: Vec<u8> = Vec::with_capacity(128);
     qpack::encode_field_section(
         &[
             (&b":status"[..], status_str.as_slice()),
             (&b"content-type"[..], resp.content_type_bytes()),
-            (&b"content-length"[..], len_str.as_slice()),
+            (&b"content-length"[..], &len_buf[len_off..]),
         ],
         &mut qpack_buf,
     );
@@ -346,11 +347,16 @@ fn status_to_bytes(status: i32) -> [u8; 3] {
     ]
 }
 
-fn format_usize(n: usize) -> Vec<u8> {
+/// Format `n` as ASCII decimal into the caller's stack buffer.
+/// Returns the offset where the digits start; the slice
+/// `&buf[off..]` is the formatted number. Callers use this
+/// instead of returning a Vec so the per-response Content-Length
+/// rendering doesn't allocate.
+fn format_usize_into(n: usize, buf: &mut [u8; 20]) -> usize {
     if n == 0 {
-        return alloc::vec![b'0'];
+        buf[19] = b'0';
+        return 19;
     }
-    let mut buf = [0u8; 20];
     let mut i = buf.len();
     let mut v = n;
     while v > 0 {
@@ -358,6 +364,6 @@ fn format_usize(n: usize) -> Vec<u8> {
         buf[i] = b'0' + (v % 10) as u8;
         v /= 10;
     }
-    buf[i..].to_vec()
+    i
 }
 
