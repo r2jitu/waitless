@@ -327,6 +327,17 @@ pub struct Connection {
     /// Whether we've already emitted HANDSHAKE_DONE in 1-RTT.
     handshake_done_sent: bool,
 
+    /// Microseconds since boot when this conn last accepted ANY
+    /// inbound datagram. Bumped at the end of `process_datagram`
+    /// for any datagram that didn't error all the way out. The
+    /// conn task races a sleep against this deadline; when the
+    /// sleep wins, we've been idle long enough to honor RFC 9000
+    /// §10.1 and tear down. `0` = never received (fresh conn);
+    /// the listener seeds it via `set_last_recv_now()` immediately
+    /// after spawning so the first iteration's deadline is
+    /// "creation time + idle".
+    last_recv_us: u64,
+
     /// Next-byte offset into the OneRtt CRYPTO stream for outbound
     /// post-handshake messages. Bumped on every CRYPTO frame
     /// emitted at 1-RTT level (currently NewSessionTicket; future
@@ -392,6 +403,7 @@ impl Connection {
             application_space: SpaceState::default(),
             tls: QuicTls::new(seed),
             handshake_done_sent: false,
+            last_recv_us: 0,
             one_rtt_crypto_offset: 0,
             outbound: Vec::new(),
             recv_streams: alloc::collections::BTreeMap::new(),
@@ -406,6 +418,48 @@ impl Connection {
 
     pub fn local_cid(&self) -> &ConnectionId {
         &self.local_cid
+    }
+
+    /// Mark this conn as having received "now", without actually
+    /// processing a datagram. Used by the listener to seed the
+    /// idle-timeout deadline at conn creation time so a peer that
+    /// allocates a slot and then disappears entirely (no further
+    /// datagrams) still gets reaped after the idle window.
+    pub fn set_last_recv_now(&mut self) {
+        self.last_recv_us = uni_tls::ticket::now_us();
+    }
+
+    /// Microseconds-since-boot timestamp of the most recent inbound
+    /// datagram (or `set_last_recv_now` seed). Pair with
+    /// `idle_timeout_us` to compute the close deadline.
+    pub fn last_recv_us(&self) -> u64 {
+        self.last_recv_us
+    }
+
+    /// Effective idle-timeout window for this connection, in
+    /// microseconds. RFC 9000 §10.1.2: each endpoint advertises a
+    /// `max_idle_timeout` in transport_parameters; the effective
+    /// window is `min(local, peer)` — both endpoints close after
+    /// that many microseconds without an inbound packet. We
+    /// always advertise 30 s; if the peer's value (parsed below)
+    /// is smaller and non-zero, use that.
+    pub fn idle_timeout_us(&self) -> u64 {
+        const OUR_IDLE_MS: u64 = 30_000;
+        let peer_ms = self
+            .tls
+            .client_transport_params()
+            .and_then(|bytes| {
+                crate::transport_params::parse_client_params(bytes).ok()
+            })
+            .map(|p| p.max_idle_timeout_ms)
+            .unwrap_or(0);
+        // RFC 9000 §18.2: a value of 0 means no timeout — treat
+        // that as "use the other side's value". Otherwise take min.
+        let effective_ms = match (peer_ms, OUR_IDLE_MS) {
+            (0, ours) => ours,
+            (peer, ours) => peer.min(ours),
+        };
+        effective_ms.saturating_mul(1_000)
     }
 
     /// Process one inbound UDP datagram. Coalesced packets
@@ -431,6 +485,11 @@ impl Connection {
         if matches!(self.state, ConnState::Failed) {
             return Ok(());
         }
+        // Refresh the idle-timeout deadline. Any received datagram
+        // counts — even one we'll fail to decrypt below — because
+        // the peer is clearly still trying. RFC 9000 §10.1 only
+        // requires receipt, not successful processing.
+        self.last_recv_us = uni_tls::ticket::now_us();
         let mut p = 0usize;
         while p < datagram.len() {
             // Per-packet drop on AEAD failure (RFC 9000 §9.7:

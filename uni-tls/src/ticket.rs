@@ -84,6 +84,23 @@ pub fn now_cycles() -> u64 {
     0
 }
 
+/// Microseconds since boot. Companion to `now_cycles` for callers
+/// that want a wall-clock-ish duration rather than raw cycles —
+/// idle-timeout deadlines, rate-limit windows, RTT estimates. On
+/// bare-metal this is `kernel::time::since_boot_us`. Native builds
+/// return 0 for the same reason `now_cycles` does (no unified
+/// monotonic clock yet); callers that depend on actual elapsed
+/// microseconds will see "no timeout ever" on native, which is
+/// fine for the integration tests we run there today.
+#[cfg(target_os = "none")]
+pub fn now_us() -> u64 {
+    uni_kernel::time::since_boot_us()
+}
+#[cfg(not(target_os = "none"))]
+pub fn now_us() -> u64 {
+    0
+}
+
 /// Decoded ticket payload — what `seal_ticket` consumes and
 /// `open_ticket` produces. `version` is always `TICKET_VERSION` after
 /// a successful open; we surface it for symmetry with the wire layout.

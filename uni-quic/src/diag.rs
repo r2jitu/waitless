@@ -128,6 +128,14 @@ pub struct Counters {
     /// once. Expected to fire briefly after a server reboot when
     /// clients optimistically replay with the previous key's tickets.
     pub zero_rtt_unresumable: AtomicU64,
+    /// Connection torn down because no inbound datagram arrived
+    /// inside the negotiated `max_idle_timeout` window (RFC 9000
+    /// §10.1). Each fire = one slot freed. Sustained growth at idle
+    /// is normal hygiene; growth correlated with active traffic
+    /// would mean datagrams are getting stuck in the inbox or
+    /// `last_recv_us` isn't refreshing — investigate via
+    /// `[quic-event idle_timeouts]` log lines.
+    pub idle_timeouts: AtomicU64,
 }
 
 impl Counters {
@@ -156,6 +164,7 @@ impl Counters {
             key_updates_accepted: AtomicU64::new(0),
             zero_rtt_buffered: AtomicU64::new(0),
             zero_rtt_unresumable: AtomicU64::new(0),
+            idle_timeouts: AtomicU64::new(0),
         }
     }
 }
@@ -275,7 +284,7 @@ pub fn should_log_event() -> bool {
 
 /// Snapshot of every counter, for `/debug/quic_stats`-style dumps.
 /// Returns `(name, value)` pairs in declaration order.
-pub fn snapshot() -> [(&'static str, u64); 23] {
+pub fn snapshot() -> [(&'static str, u64); 24] {
     let c = &COUNTERS;
     [
         ("no_dcid", c.no_dcid.load(Ordering::Relaxed)),
@@ -301,6 +310,7 @@ pub fn snapshot() -> [(&'static str, u64); 23] {
         ("key_updates_accepted", c.key_updates_accepted.load(Ordering::Relaxed)),
         ("zero_rtt_buffered", c.zero_rtt_buffered.load(Ordering::Relaxed)),
         ("zero_rtt_unresumable", c.zero_rtt_unresumable.load(Ordering::Relaxed)),
+        ("idle_timeouts", c.idle_timeouts.load(Ordering::Relaxed)),
     ]
 }
 

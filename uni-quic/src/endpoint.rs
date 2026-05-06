@@ -449,6 +449,12 @@ async fn conn_task<H, F>(
     F: Future<Output = ()> + 'static,
 {
     let conn = Rc::new(RefCell::new(Connection::new_server(local_cid, seed)));
+    // Seed last_recv at conn creation so a peer that allocates a
+    // slot via Initial and then disappears gets reaped after the
+    // idle window (the listener has already pushed the first
+    // datagram into the inbox; we'll process it on the first loop
+    // iteration and refresh last_recv there).
+    conn.borrow_mut().set_last_recv_now();
     let progress = Rc::new(AsyncEvent::new());
     let peer_ip: Rc<Cell<uni::runtime::IpAddr>> =
         Rc::new(Cell::new(uni::runtime::IpAddr::V4_ANY));
@@ -456,9 +462,44 @@ async fn conn_task<H, F>(
     let mut handler_spawned = false;
 
     loop {
-        let dgram = match inbox.pop().await {
-            Some(d) => d,
-            None => break,
+        // Idle-timeout-aware wait. Each iteration recomputes the
+        // deadline from the current `last_recv_us` (the field is
+        // refreshed inside `process_datagram` for every accepted
+        // datagram). `select` polls inbox first, then the timer —
+        // if both fire same poll, inbound wins, which is the
+        // correct bias.
+        let (idle_us, last_recv_us) = {
+            let c = conn.borrow();
+            (c.idle_timeout_us(), c.last_recv_us())
+        };
+        let now = uni_tls::ticket::now_us();
+        let elapsed = now.saturating_sub(last_recv_us);
+        if elapsed >= idle_us {
+            // Already past the deadline — bail without sleeping.
+            crate::quic_event!(idle_timeouts,
+                "elapsed_us={} idle_us={} local_cid={}",
+                elapsed, idle_us, hex8(&local_cid_bytes));
+            break;
+        }
+        let remaining = idle_us - elapsed;
+
+        let dgram = match uni::runtime::select(
+            inbox.pop(),
+            uni::runtime::sleep_us(remaining),
+        ).await {
+            uni::runtime::Either::Left(Some(d)) => d,
+            uni::runtime::Either::Left(None) => break, // inbox closed
+            uni::runtime::Either::Right(()) => {
+                // Idle timer fired without an inbound datagram in
+                // the window. RFC 9000 §10.1: "If the idle timeout
+                // is enabled, a connection is silently closed and
+                // its state is discarded when it remains idle for
+                // longer than the advertised idle_timeout."
+                crate::quic_event!(idle_timeouts,
+                    "elapsed_us={} idle_us={} local_cid={}",
+                    remaining, idle_us, hex8(&local_cid_bytes));
+                break;
+            }
         };
         peer_ip.set(dgram.src_ip);
         peer_port.set(dgram.src_port);
