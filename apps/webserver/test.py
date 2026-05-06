@@ -67,6 +67,15 @@ def _launcher_env(port: int, tls_port: int, udp_port: int, tcp_echo_port: int) -
     return {
         "UNIKERNEL_TCP_80": str(port),
         "UNIKERNEL_TCP_443": str(tls_port),
+        # H3 listens on UDP/443 inside the guest; the launcher maps it
+        # to the same host port as HTTPS so a single port number
+        # addresses both. Omitting this would leave H3 at its
+        # BUILD-default host port (8443) while HTTPS moves to
+        # `tls_port` — the resulting Alt-Svc advertisement would still
+        # be `h3=":<host_header_port>"` (correct per request), but
+        # `test_h3_health` connects directly to `tls_port` over UDP and
+        # would silently fail.
+        "UNIKERNEL_UDP_443": str(tls_port),
         "UNIKERNEL_UDP_7": str(udp_port),
         "UNIKERNEL_TCP_9": str(tcp_echo_port),
     }

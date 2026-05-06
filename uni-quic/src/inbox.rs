@@ -220,8 +220,25 @@ impl Default for Slot {
 }
 
 /// Per-worker slot table. Single-worker access; no locks.
+///
+/// Two parallel maps:
+///   * `slots`: indexed by `(slot_idx, generation)` derived from
+///     OUR server-chosen SCID. This is what every packet *after*
+///     the first server reply uses — clients echo our SCID as
+///     their DCID, so we can decode the slot trivially.
+///   * `initial_dcids`: keyed by the CLIENT's chosen DCID. When a
+///     client splits its ClientHello across multiple Initial
+///     packets (Chrome's PQ-key_share CHs are routinely 2.2 KiB),
+///     every one of those packets carries the same client-chosen
+///     DCID — but our SCID isn't picked yet, so the `slots`
+///     lookup misses. Without the second map, each Initial would
+///     create a fresh conn with a fresh server SCID, fragmenting
+///     the ClientHello reassembly across multiple ghost
+///     connections and stalling the handshake. Entries are evicted
+///     when the slot dies (conn task ends).
 pub struct SlotTable {
     slots: RefCell<Vec<Slot>>,
+    initial_dcids: RefCell<alloc::collections::BTreeMap<Vec<u8>, (u16, u16)>>,
 }
 
 impl SlotTable {
@@ -230,7 +247,40 @@ impl SlotTable {
         for _ in 0..capacity {
             v.push(Slot::default());
         }
-        SlotTable { slots: RefCell::new(v) }
+        SlotTable {
+            slots: RefCell::new(v),
+            initial_dcids: RefCell::new(alloc::collections::BTreeMap::new()),
+        }
+    }
+
+    /// Look up the inbox for a client-chosen Initial DCID. Returns
+    /// `None` if no Initial has been seen yet for this DCID, or
+    /// if the conn whose Initial it was has since terminated. The
+    /// caller (listener loop) only consults this map for long-
+    /// header Initial packets that miss the primary slot lookup.
+    pub fn lookup_initial_dcid(&self, dcid: &[u8]) -> Option<Rc<ConnInbox>> {
+        let map = self.initial_dcids.borrow();
+        let (idx, generation) = *map.get(dcid)?;
+        drop(map);
+        let inbox = self.lookup(idx, generation);
+        if inbox.is_none() {
+            // Conn died — drop the stale mapping so it doesn't
+            // pile up. We do this lazily here rather than scanning
+            // on every conn drop.
+            self.initial_dcids.borrow_mut().remove(dcid);
+        }
+        inbox
+    }
+
+    /// Register a client-chosen Initial DCID → slot mapping.
+    /// Called immediately after `allocate` for a new conn whose
+    /// first Initial packet carried this DCID. Subsequent Initial
+    /// packets sharing the DCID get routed to the same slot via
+    /// `lookup_initial_dcid`.
+    pub fn register_initial_dcid(&self, dcid: &[u8], idx: u16, generation: u16) {
+        self.initial_dcids
+            .borrow_mut()
+            .insert(dcid.to_vec(), (idx, generation));
     }
 
     /// Allocate a free slot. Returns `(slot_index, generation)`

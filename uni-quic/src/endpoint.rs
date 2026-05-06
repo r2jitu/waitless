@@ -316,7 +316,9 @@ async fn listener_loop<H, F>(
 
         // Try the slot table first: if this DCID's first 4 bytes
         // decode as a (slot, gen) pair we recognise, route to
-        // that conn.
+        // that conn. This is the steady-state path — every
+        // post-first-reply packet from the client echoes our
+        // server-chosen SCID as its DCID.
         if let Some((slot_idx, generation)) = parse_local_cid(&dcid) {
             if let Some(inbox) = slots.lookup(slot_idx, generation) {
                 inbox.push(Datagram {
@@ -337,10 +339,30 @@ async fn listener_loop<H, F>(
             continue;
         }
 
+        // Client splits a 2+ KiB ClientHello (Chrome with PQ
+        // key_share routinely does this) across N Initial
+        // packets, all carrying the same client-chosen DCID. The
+        // primary `slots.lookup` above never matches — that DCID
+        // isn't ours — so without this second map we'd allocate a
+        // fresh conn for every such packet, each with a different
+        // server SCID, fragmenting CRYPTO reassembly across N
+        // ghost conns and stalling the handshake. Route to the
+        // existing conn whenever we've seen this Initial DCID
+        // already.
+        if let Some(inbox) = slots.lookup_initial_dcid(&dcid) {
+            inbox.push(Datagram {
+                src_ip,
+                src_port,
+                bytes: dgram_bytes.to_vec(),
+            });
+            continue;
+        }
+
         let (slot_idx, generation) = match slots.allocate() {
             Some(x) => x,
             None => continue, // slot table full, drop
         };
+        slots.register_initial_dcid(&dcid, slot_idx, generation);
         let mut nonce = [0u8; 4];
         if getrandom::getrandom(&mut nonce).is_err() {
             continue;
