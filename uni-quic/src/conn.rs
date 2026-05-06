@@ -740,8 +740,10 @@ impl Connection {
         // Drive the TLS state machine + queue outbound after
         // consuming all packets in the datagram.
         self.advance_tls(config)?;
+        crate::diag::bump(&crate::diag::COUNTERS.flush_calls);
         self.flush_outbound(config)?;
         self.reap_finished_streams();
+        crate::diag::bump(&crate::diag::COUNTERS.datagrams_processed);
         Ok(())
     }
 
@@ -871,6 +873,7 @@ impl Connection {
     /// stream so the connection layer drains the send queue without
     /// waiting for the next inbound packet.
     pub fn flush(&mut self, config: &TlsServerConfig) -> Result<(), ConnError> {
+        crate::diag::bump(&crate::diag::COUNTERS.flush_calls);
         self.flush_outbound(config)?;
         self.reap_finished_streams();
         Ok(())

@@ -375,8 +375,8 @@ IP, Ethernet, virtio-net (or gve), into a transmit ring the device \
 DMAs from. No socket layer, no skbuff allocation, no kernel.</p>\
 <h2>Layer by layer</h2>\
 <ul class=\"proto-list\">\
-<li><strong>L2 — virtio-net</strong> · multi-queue receive, lock-free per-core RX rings. \
-Apple's gVNIC variant supported on GCE; legacy-virtio fallback on older paths.</li>\
+<li><strong>L2 — virtio-net / gve</strong> · multi-queue receive, lock-free per-core RX rings. \
+Google's gVNIC supported on GCE; virtio-net on HVF and QEMU.</li>\
 <li><strong>L3 — IPv4 + IPv6</strong> · ARP cache for v4, NDP cache for v6. \
 SLAAC for v6 link-local from the MAC via modified EUI-64; RA-driven global \
 prefix when on a router-equipped LAN.</li>\
@@ -563,6 +563,16 @@ auto-refreshes every 5 seconds; raw JSON endpoints below.</p>\
     body.push_str("<h2>QUIC events &amp; drops</h2>");
     body.push_str("<table><tr><th>Counter</th><th>Value</th></tr>");
     for (name, value) in uni_quic::diag::snapshot() {
+        let _ = write!(body,
+            "<tr><td><code>{}</code></td><td class=\"num\">{}</td></tr>",
+            name, value);
+    }
+    body.push_str("</table>");
+
+    // ── HTTP/3 counters ───────────────────────────────────────────
+    body.push_str("<h2>HTTP/3 events &amp; drops</h2>");
+    body.push_str("<table><tr><th>Counter</th><th>Value</th></tr>");
+    for (name, value) in uni_http3::diag::snapshot() {
         let _ = write!(body,
             "<tr><td><code>{}</code></td><td class=\"num\">{}</td></tr>",
             name, value);

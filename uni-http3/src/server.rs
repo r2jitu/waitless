@@ -117,16 +117,20 @@ where
             // multiplexes; doing it inline keeps lifetimes simple
             // and matches the shape of //uni-http's handle_conn.
             handle_request(&conn, sid, h.as_ref()).await;
+        } else if sid & 0x3 == 0x2 {
+            // Peer unidirectional streams — control, QPACK
+            // encoder, QPACK decoder. Don't actively drain them
+            // — they'd block the accept loop until they FIN,
+            // which doesn't happen for the lifetime of the
+            // connection. Inbound bytes accumulate in their
+            // per-stream recv buffers harmlessly; we never
+            // read them.
+            crate::h3_event!(peer_uni_streams_seen, "sid={}", sid);
+        } else {
+            // sid & 0x3 == 0x1 → server-initiated bidi (we
+            // don't open any), or 0x3 → server-initiated uni.
+            crate::h3_drop!(unexpected_bidi, "sid={}", sid);
         }
-        // Peer unidirectional streams (id & 0x3 == 0x2) — control,
-        // QPACK encoder, QPACK decoder. Don't actively drain them
-        // — they'd block the accept loop until they FIN, which
-        // doesn't happen for the lifetime of the connection.
-        // Inbound bytes accumulate in their per-stream recv
-        // buffers harmlessly; we never read them.
-        // sid & 0x3 == 0x1 → server-initiated bidi (we don't open
-        // any), or sid & 0x3 == 0x3 → server-initiated uni (we
-        // opened the control stream above; peers don't echo).
     }
 }
 
@@ -148,10 +152,13 @@ where
     let mut data: Vec<u8> = Vec::new();
     let mut eof = false;
 
+    crate::h3_event!(requests_received, "sid={}", sid);
     while !eof {
         let (n, end) = conn.recv(sid, &mut chunk).await;
         if n > 0 {
             if buf.len() + n > RECV_CAP {
+                crate::h3_drop!(recv_buffer_overflow,
+                    "sid={} buf_len={} cap={}", sid, buf.len(), RECV_CAP);
                 conn.close_stream(sid);
                 return;
             }
@@ -166,7 +173,9 @@ where
             let (f, used) = match frame::parse_frame(&buf) {
                 Ok(x) => x,
                 Err(frame::FrameError::Truncated) => break,
-                Err(_) => {
+                Err(e) => {
+                    crate::h3_drop!(frame_parse_error,
+                        "sid={} err={:?} buf_len={}", sid, e, buf.len());
                     conn.close_stream(sid);
                     return;
                 }
@@ -191,6 +200,7 @@ where
         }
     }
     if !headers_seen {
+        crate::h3_drop!(no_headers_seen, "sid={}", sid);
         conn.close_stream(sid);
         return;
     }
@@ -198,7 +208,10 @@ where
     // Decode QPACK headers.
     let fields = match qpack::decode_field_section(&headers_value) {
         Ok(f) => f,
-        Err(_) => {
+        Err(e) => {
+            crate::h3_drop!(qpack_decode_error,
+                "sid={} err={:?} header_len={}",
+                sid, e, headers_value.len());
             conn.close_stream(sid);
             return;
         }
@@ -236,6 +249,8 @@ where
     let response = handler(req).await;
     // Encode response: HEADERS + DATA + FIN.
     write_response(conn, sid, &response);
+    crate::h3_event!(requests_handled, "sid={} status={}", sid, response.status);
+    crate::diag::bump(&crate::diag::COUNTERS.responses_sent);
 }
 
 fn write_response(conn: &QuicConn, sid: u64, resp: &Response) {

@@ -36,6 +36,7 @@
 
 extern crate alloc;
 
+pub mod diag;
 pub mod frame;
 pub mod huffman;
 pub mod qpack;

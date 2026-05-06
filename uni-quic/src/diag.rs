@@ -188,6 +188,25 @@ pub struct Counters {
     /// stall followed by `aead_decrypt_failed` lines for late-
     /// arriving stragglers.
     pub inbox_full_drops: AtomicU64,
+    /// One pass through the per-conn task loop: dequeue (or
+    /// timer-fire), process_datagram, flush, drain. A flat
+    /// counter that should be ticking continuously while a conn
+    /// is alive — if `/quic_stats` shows it frozen for several
+    /// seconds, the conn task is wedged (deadlock, runaway
+    /// loop, or stuck in send_to). If it's ticking but
+    /// throughput is zero, the bottleneck is downstream.
+    pub conn_task_iterations: AtomicU64,
+    /// One call to `flush_outbound`. Bumps from both
+    /// `process_datagram` (once per inbound datagram) and
+    /// `QuicConn::send`/`send_fin` (once per app write).
+    pub flush_calls: AtomicU64,
+    /// One UDP datagram successfully drained from
+    /// `conn.outbound` and handed to `sock.send_to`. Pair with
+    /// `flush_calls` to see fan-out (packets-per-flush).
+    pub datagrams_sent: AtomicU64,
+    /// One inbound datagram processed (parse + dispatch). Pair
+    /// with `inbox_full_drops` to see drop ratio under load.
+    pub datagrams_processed: AtomicU64,
 }
 
 impl Counters {
@@ -225,6 +244,10 @@ impl Counters {
             send_streams_created: AtomicU64::new(0),
             streams_reaped: AtomicU64::new(0),
             inbox_full_drops: AtomicU64::new(0),
+            conn_task_iterations: AtomicU64::new(0),
+            flush_calls: AtomicU64::new(0),
+            datagrams_sent: AtomicU64::new(0),
+            datagrams_processed: AtomicU64::new(0),
         }
     }
 }
@@ -344,7 +367,7 @@ pub fn should_log_event() -> bool {
 
 /// Snapshot of every counter, for `/debug/quic_stats`-style dumps.
 /// Returns `(name, value)` pairs in declaration order.
-pub fn snapshot() -> [(&'static str, u64); 32] {
+pub fn snapshot() -> [(&'static str, u64); 36] {
     let c = &COUNTERS;
     [
         ("no_dcid", c.no_dcid.load(Ordering::Relaxed)),
@@ -379,6 +402,10 @@ pub fn snapshot() -> [(&'static str, u64); 32] {
         ("send_streams_created", c.send_streams_created.load(Ordering::Relaxed)),
         ("streams_reaped", c.streams_reaped.load(Ordering::Relaxed)),
         ("inbox_full_drops", c.inbox_full_drops.load(Ordering::Relaxed)),
+        ("conn_task_iterations", c.conn_task_iterations.load(Ordering::Relaxed)),
+        ("flush_calls", c.flush_calls.load(Ordering::Relaxed)),
+        ("datagrams_sent", c.datagrams_sent.load(Ordering::Relaxed)),
+        ("datagrams_processed", c.datagrams_processed.load(Ordering::Relaxed)),
     ]
 }
 

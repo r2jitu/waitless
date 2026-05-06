@@ -231,6 +231,7 @@ impl QuicConn {
             let _ = self
                 .sock
                 .send_to(self.peer_ip.get(), self.peer_port.get(), &out[..n]);
+            crate::diag::bump(&crate::diag::COUNTERS.datagrams_sent);
         }
     }
 }
@@ -471,6 +472,7 @@ async fn conn_task<H, F>(
     let mut handler_spawned = false;
 
     loop {
+        crate::diag::bump(&crate::diag::COUNTERS.conn_task_iterations);
         // Race the inbox against a single combined timer that
         // fires at the earliest of: idle-timeout deadline,
         // PTO deadline (if any in-flight ack-eliciting packets).
@@ -526,6 +528,7 @@ async fn conn_task<H, F>(
                                     break;
                                 }
                                 let _ = sock.send_to(peer_ip.get(), peer_port.get(), &out[..n]);
+                                crate::diag::bump(&crate::diag::COUNTERS.datagrams_sent);
                             }
                         }
                         continue;
@@ -592,6 +595,7 @@ async fn conn_task<H, F>(
                 break;
             }
             let _ = sock.send_to(peer_ip.get(), peer_port.get(), &out[..n]);
+            crate::diag::bump(&crate::diag::COUNTERS.datagrams_sent);
         }
         if tearing_down {
             break;

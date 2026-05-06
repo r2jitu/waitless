@@ -13,6 +13,7 @@ rust_library(
     name = "uni-http3",
     srcs = [
         "src/lib.rs",
+        "src/diag.rs",
         "src/frame.rs",
         "src/huffman.rs",
         "src/qpack.rs",
