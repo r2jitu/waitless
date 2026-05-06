@@ -593,6 +593,29 @@ pub fn write_handshake_done(out: &mut [u8]) -> Result<usize, FrameError> {
     Ok(1)
 }
 
+/// MAX_STREAMS_BIDI (RFC 9000 §19.11). Tells the peer they're
+/// allowed to open up to `max_streams` bidirectional streams. The
+/// limit is cumulative — a value lower than what we've previously
+/// announced is silently ignored by the peer.
+pub fn write_max_streams_bidi(max_streams: u64, out: &mut [u8]) -> Result<usize, FrameError> {
+    if out.is_empty() {
+        return Err(FrameError::OutputTooSmall);
+    }
+    out[0] = ftype::MAX_STREAMS_BIDI;
+    let n = write_varint(max_streams, &mut out[1..])?;
+    Ok(1 + n)
+}
+
+/// MAX_STREAMS_UNI counterpart. Same shape, different type byte.
+pub fn write_max_streams_uni(max_streams: u64, out: &mut [u8]) -> Result<usize, FrameError> {
+    if out.is_empty() {
+        return Err(FrameError::OutputTooSmall);
+    }
+    out[0] = ftype::MAX_STREAMS_UNI;
+    let n = write_varint(max_streams, &mut out[1..])?;
+    Ok(1 + n)
+}
+
 // ============================================================================
 // Tests
 // ============================================================================

@@ -397,6 +397,33 @@ pub struct Connection {
     /// Whether we've already emitted HANDSHAKE_DONE in 1-RTT.
     handshake_done_sent: bool,
 
+    // ── Stream-credit (MAX_STREAMS) replenishment ─────────────────
+    //
+    // RFC 9000 §4.6 + §19.11: the peer can only open up to
+    // `peer_max_streams_*_advertised` cumulative streams of the
+    // matching type. Once they've used the credit, they MUST wait
+    // for a MAX_STREAMS frame from us bumping the limit. Without
+    // replenishment a long-lived browser conn that keeps refreshing
+    // will eventually wedge — exactly the symptom the user
+    // reproduced after ~99 refreshes against the old 100-stream
+    // initial limit.
+    //
+    // We track:
+    //   * the highest sid the peer has actually opened (per type),
+    //   * the max-streams limit we've already advertised (per
+    //     type, initially the transport-parameter value).
+    // When the peer's count gets within `STREAM_CREDIT_REFILL_AT`
+    // of the advertised cap, `flush_outbound` emits MAX_STREAMS
+    // raising the cap by `STREAM_CREDIT_WINDOW`.
+    //
+    // Stream IDs encode (type, count): bidi-client sids are
+    // 0,4,8,..., so `(sid >> 2) + 1` is the count of bidi streams
+    // the peer has opened so far.
+    peer_bidi_streams_opened: u64,
+    peer_uni_streams_opened: u64,
+    peer_max_streams_bidi_advertised: u64,
+    peer_max_streams_uni_advertised: u64,
+
     // ── RTT estimator (RFC 9002 §5) ───────────────────────────────
     //
     // All in microseconds. Updated each time an ACK arrives that
@@ -509,6 +536,14 @@ impl Connection {
             application_space: SpaceState::default(),
             tls: QuicTls::new(seed),
             handshake_done_sent: false,
+            peer_bidi_streams_opened: 0,
+            peer_uni_streams_opened: 0,
+            // Must match `transport_params::ServerParams::defaults`'s
+            // initial_max_streams_*. Updating one without the other
+            // would let the peer either open beyond what we
+            // advertised or fail to use credit we already gave.
+            peer_max_streams_bidi_advertised: 1024,
+            peer_max_streams_uni_advertised: 1024,
             latest_rtt_us: None,
             min_rtt_us: None,
             smoothed_rtt_us: None,
@@ -1452,6 +1487,26 @@ impl Connection {
                         s.ingest(offset, data, fin);
                         if was_new {
                             crate::diag::bump(&crate::diag::COUNTERS.recv_streams_created);
+                            // Update the peer-stream-count high
+                            // watermark per type. Stream IDs encode
+                            // (initiator, type) in the low 2 bits:
+                            //   00 = client bidi, 01 = server bidi,
+                            //   02 = client uni,  03 = server uni.
+                            // We only see client-initiated here.
+                            let count = (stream_id >> 2) + 1;
+                            match stream_id & 0x3 {
+                                0x0 => {
+                                    if count > self.peer_bidi_streams_opened {
+                                        self.peer_bidi_streams_opened = count;
+                                    }
+                                }
+                                0x2 => {
+                                    if count > self.peer_uni_streams_opened {
+                                        self.peer_uni_streams_opened = count;
+                                    }
+                                }
+                                _ => {}
+                            }
                         }
                         if !self.opened_streams.contains(&stream_id) {
                             self.opened_streams.push(stream_id);
@@ -1852,6 +1907,47 @@ impl Connection {
             let n = write_handshake_done(&mut tmp).map_err(|_| ConnError::Wire)?;
             frames.extend_from_slice(&tmp[..n]);
             self.handshake_done_sent = true;
+            ack_eliciting = true;
+        }
+
+        // MAX_STREAMS replenishment (RFC 9000 §4.6 / §19.11).
+        // When the peer's used-stream count gets within
+        // STREAM_CREDIT_REFILL_AT of the cap we previously
+        // advertised, raise the cap by STREAM_CREDIT_WINDOW and
+        // tell the peer about it via MAX_STREAMS_BIDI / _UNI.
+        // Without this, a long-lived browser conn that keeps
+        // refreshing eventually exhausts its initial credit, and
+        // Chrome's QUIC stack silently refuses to open new
+        // streams — the request never reaches our server and
+        // the user sees a permanent stall.
+        const STREAM_CREDIT_REFILL_AT: u64 = 256;
+        const STREAM_CREDIT_WINDOW: u64 = 1024;
+        if self.peer_max_streams_bidi_advertised
+            <= self.peer_bidi_streams_opened + STREAM_CREDIT_REFILL_AT
+        {
+            self.peer_max_streams_bidi_advertised =
+                self.peer_bidi_streams_opened + STREAM_CREDIT_WINDOW;
+            let mut tmp = [0u8; 16];
+            let n = crate::frame::write_max_streams_bidi(
+                self.peer_max_streams_bidi_advertised,
+                &mut tmp,
+            )
+            .map_err(|_| ConnError::Wire)?;
+            frames.extend_from_slice(&tmp[..n]);
+            ack_eliciting = true;
+        }
+        if self.peer_max_streams_uni_advertised
+            <= self.peer_uni_streams_opened + STREAM_CREDIT_REFILL_AT
+        {
+            self.peer_max_streams_uni_advertised =
+                self.peer_uni_streams_opened + STREAM_CREDIT_WINDOW;
+            let mut tmp = [0u8; 16];
+            let n = crate::frame::write_max_streams_uni(
+                self.peer_max_streams_uni_advertised,
+                &mut tmp,
+            )
+            .map_err(|_| ConnError::Wire)?;
+            frames.extend_from_slice(&tmp[..n]);
             ack_eliciting = true;
         }
 

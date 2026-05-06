@@ -87,8 +87,17 @@ impl<'a> ServerParams<'a> {
             initial_max_stream_data_bidi_local: 256 << 10,  // 256 KiB
             initial_max_stream_data_bidi_remote: 256 << 10, // 256 KiB
             initial_max_stream_data_uni: 256 << 10,         // 256 KiB
-            initial_max_streams_bidi: 100,
-            initial_max_streams_uni: 100,
+            // Initial bidi-stream credit. The peer can open this
+            // many bidirectional streams before they MUST stop and
+            // wait for a MAX_STREAMS frame from us. We replenish
+            // continuously as streams complete (see
+            // `Connection::flush_outbound`'s MAX_STREAMS emission),
+            // so the only visible effect of this initial value is
+            // the headroom available before the first replenishment
+            // round-trip. 1024 is comfortably more than any
+            // single-page web app's burst.
+            initial_max_streams_bidi: 1024,
+            initial_max_streams_uni: 1024,
             max_idle_timeout_ms: 30_000,
         }
     }
@@ -269,7 +278,7 @@ mod tests {
         );
         assert_eq!(parsed.initial_max_data, 1 << 20);
         assert_eq!(parsed.initial_max_stream_data_bidi_remote, 256 << 10);
-        assert_eq!(parsed.initial_max_streams_bidi, 100);
+        assert_eq!(parsed.initial_max_streams_bidi, 1024);
         assert_eq!(parsed.max_idle_timeout_ms, 30_000);
     }
 
