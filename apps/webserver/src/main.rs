@@ -23,7 +23,7 @@ use core::fmt::Write as _;
 
 use uni::net::Net;
 use uni::runtime::{TcpStream, UdpClient};
-use uni_http::{Body, BodyPart, Request, Response};
+use uni_http::{Body, Request, Response};
 
 // ---- Configuration ----------------------------------------------------------
 
@@ -289,13 +289,11 @@ fn shell_body(active: &str, title: &str, body: Body) -> Body {
     b = b.push_static(SHELL_AFTER_STYLES);
     b = b.push_owned(nav_buf.into_bytes());
     b = b.push_static(SHELL_NAV_MAIN);
-    // Splice in the page body's parts in order — each is
-    // already either static or owned.
+    // Splice in the page body's parts in order. Each Bytes
+    // is already either Borrowed-static or Owned; push handles
+    // both via Into<Bytes>.
     for part in body.parts {
-        match part {
-            BodyPart::Static(s) => b = b.push_static(s),
-            BodyPart::Owned(v) => b = b.push_owned(v),
-        }
+        b = b.push(part);
     }
     b = b.push_static(SHELL_FOOTER);
     b

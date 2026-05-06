@@ -330,18 +330,14 @@ fn write_response(conn: &QuicConn, sid: u64, resp: Response) {
 
     conn.send_owned(sid, framing);
 
-    // Walk the body parts and queue each as a SendChunk —
-    // borrowed-static for Static parts, moved Vec for Owned.
+    // Queue each body chunk on the QUIC stream. Cow::Borrowed
+    // → send_static (zero alloc); Cow::Owned → send_owned (move).
     if body_len > 0 {
-        match resp.into_body_parts() {
-            uni_http::BodyParts::Static(s) => conn.send_static(sid, s),
-            uni_http::BodyParts::Owned(v) => conn.send_owned(sid, v),
-            uni_http::BodyParts::Chain { parts, .. } => {
+        match resp.into_body() {
+            uni_http::ResponseBody::Single(b) => queue_chunk(conn, sid, b),
+            uni_http::ResponseBody::Chain { parts, .. } => {
                 for part in parts {
-                    match part {
-                        uni_http::BodyPart::Static(s) => conn.send_static(sid, s),
-                        uni_http::BodyPart::Owned(v) => conn.send_owned(sid, v),
-                    }
+                    queue_chunk(conn, sid, part);
                 }
             }
         }
@@ -349,6 +345,16 @@ fn write_response(conn: &QuicConn, sid: u64, resp: Response) {
     // FIN is set by close_stream; the next pop_chunk_into emits
     // it on the last queued chunk.
     conn.close_stream(sid);
+}
+
+/// Push one Bytes chunk onto stream `sid`. Pattern-matches on
+/// the Cow variant to pick the zero-alloc borrowed-static path
+/// or the by-move owned path.
+fn queue_chunk(conn: &QuicConn, sid: u64, b: uni_http::Bytes) {
+    match b {
+        alloc::borrow::Cow::Borrowed(s) => conn.send_static(sid, s),
+        alloc::borrow::Cow::Owned(v) => conn.send_owned(sid, v),
+    }
 }
 
 fn status_to_bytes(status: i32) -> [u8; 3] {
