@@ -206,6 +206,16 @@ impl QuicConn {
         self.drain_outbound();
     }
 
+    /// Discard any bytes buffered for `sid`'s recv side without
+    /// awaiting. Use for streams the app never intends to read
+    /// (e.g. HTTP/3 peer-initiated uni streams: control, QPACK
+    /// encoder, QPACK decoder). Without this, a long-lived
+    /// connection accumulates QPACK encoder bytes per request
+    /// in `recv_streams[sid].buffer` forever.
+    pub fn discard_recv(&self, sid: u64) {
+        self.conn.borrow_mut().discard_recv(sid);
+    }
+
     /// Mark stream `sid` as closed (FIN). The next outbound STREAM
     /// frame will carry the FIN flag. Drains any packets the
     /// flush produced.

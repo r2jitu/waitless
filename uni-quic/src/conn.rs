@@ -830,6 +830,27 @@ impl Connection {
         }
     }
 
+    /// Discard any bytes the QUIC layer has buffered for stream
+    /// `sid`'s recv side. Used by the HTTP/3 layer for peer
+    /// unidirectional streams (QPACK encoder/decoder + control)
+    /// where the bytes are uninteresting but the peer keeps
+    /// pushing — without this drain the buffer grows for the
+    /// lifetime of the connection. Cheap: reuses the existing
+    /// `RecvStream::drain` to truncate the buffer head; the Vec
+    /// keeps its capacity so subsequent appends don't reallocate.
+    pub fn discard_recv(&mut self, sid: u64) {
+        if let Some(s) = self.recv_streams.get_mut(&sid) {
+            // Drain in 2 KiB chunks until empty.
+            let mut sink = [0u8; 2048];
+            loop {
+                let (n, _eof) = s.drain(&mut sink);
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+    }
+
     /// Whether stream `sid` has any buffered bytes ready for the
     /// app to drain.
     pub fn stream_has_buffered(&self, sid: u64) -> bool {

@@ -104,6 +104,18 @@ where
     }
 
     // 2. Loop accepting streams.
+    //
+    // Peer uni streams (control + QPACK encoder + QPACK decoder)
+    // are accepted ONCE per (conn, sid). After that, their
+    // RecvStream stays alive and `dispatch_frames` re-pushes the
+    // sid into `opened_streams` whenever new bytes arrive — so
+    // accept_stream would re-yield the same sid forever, and
+    // each refresh's QPACK encoder bytes would pile up in the
+    // recv buffer. To avoid that, track which uni sids we've
+    // already accepted and drop their buffers on each re-yield
+    // so the recv buffer can't grow without bound.
+    use alloc::collections::BTreeSet;
+    let mut uni_seen: BTreeSet<u64> = BTreeSet::new();
     loop {
         let sid = match conn.accept_stream().await {
             Some(s) => s,
@@ -119,13 +131,19 @@ where
             handle_request(&conn, sid, h.as_ref()).await;
         } else if sid & 0x3 == 0x2 {
             // Peer unidirectional streams — control, QPACK
-            // encoder, QPACK decoder. Don't actively drain them
-            // — they'd block the accept loop until they FIN,
-            // which doesn't happen for the lifetime of the
-            // connection. Inbound bytes accumulate in their
-            // per-stream recv buffers harmlessly; we never
-            // read them.
-            crate::h3_event!(peer_uni_streams_seen, "sid={}", sid);
+            // encoder, QPACK decoder. We can't actively drain
+            // them via `recv` (that would block the accept loop
+            // until FIN, which never arrives), so instead we
+            // discard any bytes the QUIC layer has buffered for
+            // them whenever the accept loop re-yields the sid.
+            // We only count NEW peer uni streams in the event
+            // counter, so it stays at ~3 per conn rather than
+            // climbing per refresh.
+            let new_uni = uni_seen.insert(sid);
+            if new_uni {
+                crate::h3_event!(peer_uni_streams_seen, "sid={}", sid);
+            }
+            conn.discard_recv(sid);
         } else {
             // sid & 0x3 == 0x1 → server-initiated bidi (we
             // don't open any), or 0x3 → server-initiated uni.
