@@ -191,8 +191,11 @@ pub enum ResponseBody {
     /// so a static template prefix gets a borrowed-static chunk
     /// (zero alloc) sitting alongside the dynamic middle's
     /// owned chunk — no `Vec::extend_from_slice`-style merge.
+    /// VecDeque so frontends (or the next layer down) can
+    /// O(1)-prepend if they want to wrap framing around a
+    /// pre-sized body.
     Chain {
-        parts: alloc::vec::Vec<Bytes>,
+        parts: alloc::collections::VecDeque<Bytes>,
         total_len: usize,
     },
 }
@@ -209,22 +212,24 @@ pub enum ResponseBody {
 /// Response::ok(b"text/html; charset=utf-8", body)
 /// ```
 ///
-/// Each part is queued as a separate SendChunk on the QUIC
-/// stream and reaches the wire with at most one memcpy per
+/// Backing storage is `VecDeque<Bytes>` so both `push` (back)
+/// and `prepend` (front) are O(1) — the latter is useful when
+/// a frontend wants to add a header after the body is sized.
+/// Each part reaches the wire with at most one memcpy per
 /// packet (into the AEAD-target datagram region).
 pub struct Body {
-    pub parts: alloc::vec::Vec<Bytes>,
+    pub parts: alloc::collections::VecDeque<Bytes>,
     pub total_len: usize,
 }
 
 impl Body {
     pub fn new() -> Self {
-        Body { parts: alloc::vec::Vec::new(), total_len: 0 }
+        Body { parts: alloc::collections::VecDeque::new(), total_len: 0 }
     }
 
     pub fn with_capacity(n: usize) -> Self {
         Body {
-            parts: alloc::vec::Vec::with_capacity(n),
+            parts: alloc::collections::VecDeque::with_capacity(n),
             total_len: 0,
         }
     }
@@ -237,7 +242,22 @@ impl Body {
         let b: Bytes = chunk.into();
         if !b.is_empty() {
             self.total_len += b.len();
-            self.parts.push(b);
+            self.parts.push_back(b);
+        }
+        self
+    }
+
+    /// Prepend a chunk to the front of the chain — O(1) thanks
+    /// to VecDeque's ring-buffer layout. Useful for frontends
+    /// that build a body from the inside out and add the
+    /// outermost framing last (e.g. HTTP/1.1 chunked-transfer
+    /// length prefixes, TLS record headers added after the
+    /// payload is sealed).
+    pub fn prepend(mut self, chunk: impl Into<Bytes>) -> Self {
+        let b: Bytes = chunk.into();
+        if !b.is_empty() {
+            self.total_len += b.len();
+            self.parts.push_front(b);
         }
         self
     }
@@ -351,7 +371,7 @@ impl IntoBody for Body {
             0 => ResponseBody::Single(alloc::borrow::Cow::Borrowed(b"")),
             1 => {
                 let mut parts = self.parts;
-                ResponseBody::Single(parts.pop().unwrap())
+                ResponseBody::Single(parts.pop_front().unwrap())
             }
             _ => ResponseBody::Chain {
                 parts: self.parts,
