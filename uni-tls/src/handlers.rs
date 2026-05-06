@@ -46,14 +46,10 @@ use crate::server::{State, HandshakeError, TlsServer, TlsServerConfig, TX_BUF_LE
 /// Native: 0 — the freshness window is effectively disabled until
 /// the runtime grows a unified monotonic clock; tickets still seal
 /// and open correctly, they just can't expire.
-#[cfg(target_os = "none")]
-fn ticket_now_cycles() -> u64 {
-    uni_kernel::time::now_cycles()
-}
-#[cfg(not(target_os = "none"))]
-fn ticket_now_cycles() -> u64 {
-    0
-}
+/// Re-export so the rest of `handlers.rs` keeps working without
+/// the cfg-dance — the canonical definition lives in `ticket.rs`
+/// so the QUIC handshake driver shares one helper.
+use crate::ticket::now_cycles as ticket_now_cycles;
 
 /// Hard cap on how old a ticket can be before `open_ticket` rejects
 /// it. Bare-metal: 7 days converted via `cycles_per_us`. Native:

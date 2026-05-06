@@ -65,6 +65,25 @@ pub const SEALED_LEN: usize = KEY_NAME_LEN + NONCE_LEN + PLAINTEXT_LEN + TAG_LEN
 /// `open_ticket` via `max_age_cycles`. Capped at the spec's 7-day max.
 pub const TICKET_LIFETIME_SECONDS: u32 = 7 * 24 * 3600;
 
+/// Wall-style monotonic counter used by `seal_ticket` for the
+/// `issued_at_cycles` field, and by `open_ticket` for the freshness
+/// check. Cycles, not seconds — `cycles_per_us` calibration is the
+/// kernel's responsibility. On bare-metal this is `CNTVCT_EL0` (or
+/// the x86 equivalent); native builds don't have a unified clock
+/// yet so they return 0, which effectively disables the freshness
+/// window — tickets still seal/open correctly, just don't expire.
+///
+/// Public so the QUIC handshake driver can call it without
+/// duplicating the cfg dance.
+#[cfg(target_os = "none")]
+pub fn now_cycles() -> u64 {
+    uni_kernel::time::now_cycles()
+}
+#[cfg(not(target_os = "none"))]
+pub fn now_cycles() -> u64 {
+    0
+}
+
 /// Decoded ticket payload — what `seal_ticket` consumes and
 /// `open_ticket` produces. `version` is always `TICKET_VERSION` after
 /// a successful open; we surface it for symmetry with the wire layout.

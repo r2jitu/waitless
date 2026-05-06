@@ -85,6 +85,13 @@ pub struct Counters {
     pub initial_dcid_hit: AtomicU64,
     /// Handshake completed (Established).
     pub handshakes_completed: AtomicU64,
+    /// NewSessionTicket emitted to a client after a fresh
+    /// handshake. The client may present this ticket on a later
+    /// connection to skip Cert/CV (Phase B) or to send 0-RTT data
+    /// (Phase C). Counter rate ≈ rate of fresh handshakes once
+    /// resumption support lands; `0` means clients have no path to
+    /// resume.
+    pub tickets_emitted: AtomicU64,
 }
 
 impl Counters {
@@ -106,6 +113,7 @@ impl Counters {
             conns_allocated: AtomicU64::new(0),
             initial_dcid_hit: AtomicU64::new(0),
             handshakes_completed: AtomicU64::new(0),
+            tickets_emitted: AtomicU64::new(0),
         }
     }
 }
@@ -225,7 +233,7 @@ pub fn should_log_event() -> bool {
 
 /// Snapshot of every counter, for `/debug/quic_stats`-style dumps.
 /// Returns `(name, value)` pairs in declaration order.
-pub fn snapshot() -> [(&'static str, u64); 16] {
+pub fn snapshot() -> [(&'static str, u64); 17] {
     let c = &COUNTERS;
     [
         ("no_dcid", c.no_dcid.load(Ordering::Relaxed)),
@@ -244,6 +252,7 @@ pub fn snapshot() -> [(&'static str, u64); 16] {
         ("conns_allocated", c.conns_allocated.load(Ordering::Relaxed)),
         ("initial_dcid_hit", c.initial_dcid_hit.load(Ordering::Relaxed)),
         ("handshakes_completed", c.handshakes_completed.load(Ordering::Relaxed)),
+        ("tickets_emitted", c.tickets_emitted.load(Ordering::Relaxed)),
     ]
 }
 

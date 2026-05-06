@@ -166,9 +166,14 @@ pub struct QuicTls {
     rx_handshake: RxBuf,
 
     /// Outbound handshake bytes per level. The connection layer
-    /// drains these into CRYPTO frames and clears the queue.
+    /// drains these into CRYPTO frames and clears the queue. The
+    /// 1-RTT level carries post-handshake messages — currently
+    /// `NewSessionTicket` (RFC 8446 §4.6.1) for QUIC resumption,
+    /// emitted right after the WaitClientFinished → Established
+    /// transition.
     tx_initial: Vec<u8>,
     tx_handshake: Vec<u8>,
+    tx_one_rtt: Vec<u8>,
 
     /// Stage-3 traffic secrets, exposed read-only to the caller
     /// once the relevant transition fires. `None` before then.
@@ -203,6 +208,7 @@ impl QuicTls {
             rx_handshake: RxBuf::default(),
             tx_initial: Vec::new(),
             tx_handshake: Vec::new(),
+            tx_one_rtt: Vec::new(),
             handshake_secrets: None,
             application_secrets: None,
             server_transport_params: Vec::new(),
@@ -273,7 +279,7 @@ impl QuicTls {
         let buf = match level {
             CryptoLevel::Initial => &mut self.tx_initial,
             CryptoLevel::Handshake => &mut self.tx_handshake,
-            CryptoLevel::OneRtt => return 0,
+            CryptoLevel::OneRtt => &mut self.tx_one_rtt,
         };
         let n = out.len().min(buf.len());
         out[..n].copy_from_slice(&buf[..n]);
@@ -586,7 +592,69 @@ impl QuicTls {
         self.transcript.update(&self.rx_handshake[..total_len]);
         self.rx_handshake.drain(..total_len);
 
+        // Emit a NewSessionTicket so the client can resume in a
+        // future connection. The body is small (~150 bytes) and
+        // queued in `tx_one_rtt` so the conn layer wraps it in a
+        // 1-RTT-level CRYPTO frame on the next outbound flush. This
+        // is the foundation for QUIC 0-RTT (subsequent connections
+        // present this ticket via the `pre_shared_key` extension).
+        // Failure here is non-fatal — the handshake completed; the
+        // client just won't be able to resume on the next visit.
+        let _ = self.emit_new_session_ticket();
+
         self.state = QuicTlsState::Established;
+        Ok(())
+    }
+
+    /// Build, seal, and queue a NewSessionTicket for emission via
+    /// `tx_one_rtt`. Mirrors `uni-tls::handlers::emit_session_ticket`
+    /// but writes raw handshake-message bytes (the QUIC connection
+    /// layer wraps them in CRYPTO frames; there's no TLS record
+    /// envelope at QUIC's 1-RTT level).
+    fn emit_new_session_ticket(&mut self) -> Result<(), QuicTlsError> {
+        // Resumption master secret over the post-ClientFinished
+        // transcript. Same as the TCP-TLS path.
+        let post_cf_transcript = self.transcript.snapshot();
+        let rms = self.schedule.resumption_secret(&post_cf_transcript);
+
+        let mut age_bytes = [0u8; 4];
+        getrandom::getrandom(&mut age_bytes).map_err(|_| QuicTlsError::Internal)?;
+        let age_add = u32::from_be_bytes(age_bytes);
+
+        let pt = uni_tls::ticket::TicketPlaintext {
+            version: uni_tls::ticket::TICKET_VERSION,
+            resumption_master_secret: rms,
+            ticket_age_add: age_add,
+            issued_at_cycles: uni_tls::ticket::now_cycles(),
+            cipher_suite: uni_tls::handshake::cipher_suite::TLS_CHACHA20_POLY1305_SHA256,
+        };
+        let mut sealed = [0u8; uni_tls::ticket::SEALED_LEN];
+        let n = uni_tls::ticket::seal_ticket(&pt, &mut sealed)
+            .ok_or(QuicTlsError::Internal)?;
+
+        // RFC 8446 §4.6.1 NewSessionTicket layout.
+        let mut nst_body = alloc::vec![0u8; n + 32];
+        let body_len = uni_tls::handshake::build_new_session_ticket(
+            uni_tls::ticket::TICKET_LIFETIME_SECONDS,
+            age_add,
+            &[], // empty ticket_nonce — one ticket per connection
+            &sealed[..n],
+            &mut nst_body,
+        )
+        .ok_or(QuicTlsError::Internal)?;
+
+        let mut nst_msg = alloc::vec![0u8; body_len + 4];
+        let msg_len = uni_tls::handshake::encode_handshake(
+            uni_tls::handshake::msg_type::NEW_SESSION_TICKET,
+            &nst_body[..body_len],
+            &mut nst_msg,
+        )
+        .ok_or(QuicTlsError::Internal)?;
+
+        // Queue the raw TLS handshake bytes; the QUIC conn layer
+        // pop_handshake's them at the OneRtt level on its next
+        // flush_outbound and emits a CRYPTO frame in a 1-RTT packet.
+        self.tx_one_rtt.extend_from_slice(&nst_msg[..msg_len]);
         Ok(())
     }
 }

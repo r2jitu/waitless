@@ -272,6 +272,14 @@ pub struct Connection {
     /// Whether we've already emitted HANDSHAKE_DONE in 1-RTT.
     handshake_done_sent: bool,
 
+    /// Next-byte offset into the OneRtt CRYPTO stream for outbound
+    /// post-handshake messages. Bumped on every CRYPTO frame
+    /// emitted at 1-RTT level (currently NewSessionTicket; future
+    /// KeyUpdate / NEW_TOKEN). Per RFC 8446 §4.6 each post-
+    /// handshake message follows the previous in the same stream,
+    /// so the offset accumulates rather than resetting per-frame.
+    one_rtt_crypto_offset: u64,
+
     /// Outbound packet queue: complete UDP datagrams (including
     /// any header-protected, AEAD-sealed packets) ready to ship.
     /// `pop_packet` drains the front entry.
@@ -323,6 +331,7 @@ impl Connection {
             application_space: SpaceState::default(),
             tls: QuicTls::new(seed),
             handshake_done_sent: false,
+            one_rtt_crypto_offset: 0,
             outbound: Vec::new(),
             recv_streams: alloc::collections::BTreeMap::new(),
             send_streams: alloc::collections::BTreeMap::new(),
@@ -992,6 +1001,32 @@ impl Connection {
             let n = write_handshake_done(&mut tmp).map_err(|_| ConnError::Wire)?;
             frames.extend_from_slice(&tmp[..n]);
             self.handshake_done_sent = true;
+        }
+
+        // Drain any 1-RTT-level handshake bytes (NewSessionTicket
+        // emitted right after ClientFinished verifies; future
+        // KeyUpdate / NewToken). Wrap as a CRYPTO frame at offset 0
+        // — this is the OneRtt CRYPTO stream, distinct from
+        // Initial/Handshake. Each ticket adds ~150 bytes; the
+        // budget check after pop_handshake guards against an
+        // unbounded queue.
+        let mut one_rtt_crypto = [0u8; 1024];
+        let crypto_n = self
+            .tls
+            .pop_handshake(CryptoLevel::OneRtt, &mut one_rtt_crypto);
+        if crypto_n > 0 {
+            // Track our own offset for the OneRtt CRYPTO stream so
+            // multiple post-handshake messages (e.g. a sequence of
+            // tickets, KeyUpdate, NEW_TOKEN) chain correctly.
+            let offset = self.one_rtt_crypto_offset;
+            let mut tmp = vec![0u8; crypto_n + 16];
+            let n = write_crypto(offset, &one_rtt_crypto[..crypto_n], &mut tmp)
+                .map_err(|_| ConnError::Wire)?;
+            frames.extend_from_slice(&tmp[..n]);
+            self.one_rtt_crypto_offset += crypto_n as u64;
+            crate::quic_event!(tickets_emitted,
+                "size={} local_cid={}", crypto_n,
+                crate::endpoint::hex8(self.local_cid.as_slice()));
         }
 
         // Drain pending STREAM data. Round-robin across streams
