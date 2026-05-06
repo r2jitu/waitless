@@ -166,12 +166,39 @@ impl Request {
 
 // ---- Response ---------------------------------------------------------------
 
-/// Body storage for a `Response`. Either a borrowed byte slice (the
-/// common case: `&'static [u8]` for compile-time strings like
-/// INDEX_HTML / HEALTH_JSON), or a heap-owned `Box<[u8]>` for
-/// dynamically rendered bodies (e.g. `/stats` / `/heap` /
-/// `/tls_profile`). The enum is `#[repr(C)]` so `body_bytes` compiles
-/// to a single conditional branch per access, not a vtable jump.
+/// One segment of a multi-part response body. Static parts are
+/// borrowed `&'static` slices (zero alloc, zero copy); Owned
+/// parts are heap-allocated and moved.
+pub enum BodyPart {
+    Static(&'static [u8]),
+    Owned(alloc::vec::Vec<u8>),
+}
+
+impl BodyPart {
+    pub fn len(&self) -> usize {
+        match self {
+            BodyPart::Static(s) => s.len(),
+            BodyPart::Owned(v) => v.len(),
+        }
+    }
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            BodyPart::Static(s) => s,
+            BodyPart::Owned(v) => v,
+        }
+    }
+}
+
+/// Body storage for a `Response`. Three shapes:
+///   - `Static`: a borrowed `&'static` slice — zero alloc, zero
+///     copy until the wire.
+///   - `Owned`: a heap-allocated single buffer — one alloc, no
+///     copy at API boundaries.
+///   - `Chain`: a sequence of [BodyPart]s, each independently
+///     static or owned. Apps build this via the [Body] builder
+///     to compose a response from a static template prefix +
+///     dynamic middle + static suffix without memcpying
+///     everything into one buffer first.
 pub enum ResponseBody {
     /// A borrowed byte slice with lifetime that outlives `Response`.
     /// Stored as a raw pointer pair so the struct keeps its current
@@ -184,6 +211,126 @@ pub enum ResponseBody {
     /// happens after `send_response` has copied the bytes into the
     /// outbound TCP/TLS buffer.
     Owned(alloc::boxed::Box<[u8]>),
+    /// A chain of body parts assembled at handler time. Each part
+    /// is queued as its own SendChunk on the QUIC stream, so a
+    /// static template prefix gets a borrowed-static chunk (zero
+    /// alloc) sitting alongside the dynamic middle's owned chunk.
+    Chain {
+        parts: alloc::vec::Vec<BodyPart>,
+        total_len: usize,
+    },
+}
+
+/// Builder for a chained / composable response body. Apps that
+/// want to wrap a dynamic middle in a static template can do so
+/// without memcpying the whole thing into one buffer:
+///
+/// ```ignore
+/// let body = Body::new()
+///     .push_static(STATIC_HTML_PREFIX)
+///     .push_owned(rendered_middle.into_bytes())
+///     .push_static(STATIC_HTML_SUFFIX);
+/// Response::ok(b"text/html; charset=utf-8", body)
+/// ```
+///
+/// Each part is queued as a separate SendChunk on the QUIC stream
+/// and reaches the wire with at most one memcpy per packet
+/// (into the AEAD-target datagram region).
+pub struct Body {
+    pub parts: alloc::vec::Vec<BodyPart>,
+    pub total_len: usize,
+}
+
+impl Body {
+    pub fn new() -> Self {
+        Body { parts: alloc::vec::Vec::new(), total_len: 0 }
+    }
+
+    pub fn with_capacity(n: usize) -> Self {
+        Body {
+            parts: alloc::vec::Vec::with_capacity(n),
+            total_len: 0,
+        }
+    }
+
+    pub fn push_static(mut self, s: &'static [u8]) -> Self {
+        if !s.is_empty() {
+            self.total_len += s.len();
+            self.parts.push(BodyPart::Static(s));
+        }
+        self
+    }
+
+    pub fn push_owned(mut self, v: alloc::vec::Vec<u8>) -> Self {
+        if !v.is_empty() {
+            self.total_len += v.len();
+            self.parts.push(BodyPart::Owned(v));
+        }
+        self
+    }
+
+    pub fn push_string(self, s: alloc::string::String) -> Self {
+        self.push_owned(s.into_bytes())
+    }
+
+    pub fn len(&self) -> usize { self.total_len }
+    pub fn is_empty(&self) -> bool { self.total_len == 0 }
+}
+
+impl Default for Body {
+    fn default() -> Self { Body::new() }
+}
+
+impl From<&'static [u8]> for Body {
+    fn from(s: &'static [u8]) -> Self {
+        Body::new().push_static(s)
+    }
+}
+
+impl From<&'static str> for Body {
+    fn from(s: &'static str) -> Self {
+        Body::new().push_static(s.as_bytes())
+    }
+}
+
+impl From<alloc::vec::Vec<u8>> for Body {
+    fn from(v: alloc::vec::Vec<u8>) -> Self {
+        Body::new().push_owned(v)
+    }
+}
+
+impl From<alloc::string::String> for Body {
+    fn from(s: alloc::string::String) -> Self {
+        Body::new().push_string(s)
+    }
+}
+
+/// Output of [`Response::into_body_parts`]. Flattens trivial
+/// single-part bodies so frontends don't pay Chain overhead in
+/// the common case.
+pub enum BodyParts {
+    /// Single static slice — zero alloc, zero copy at the
+    /// frontend boundary.
+    Static(&'static [u8]),
+    /// Single owned Vec — one alloc when the response was
+    /// built, no copy at the frontend boundary.
+    Owned(alloc::vec::Vec<u8>),
+    /// Multi-part chain — frontend walks parts, queueing each
+    /// as a SendChunk.
+    Chain {
+        parts: alloc::vec::Vec<BodyPart>,
+        total_len: usize,
+    },
+}
+
+impl BodyParts {
+    pub fn total_len(&self) -> usize {
+        match self {
+            BodyParts::Static(s) => s.len(),
+            BodyParts::Owned(v) => v.len(),
+            BodyParts::Chain { total_len, .. } => *total_len,
+        }
+    }
 }
 
 pub struct Response {
@@ -238,6 +385,37 @@ impl IntoBody for alloc::string::String {
     }
 }
 
+impl IntoBody for Body {
+    fn into_body(self) -> ResponseBody {
+        // Collapse trivial cases so single-part Body builders
+        // don't pay the Chain enum's Vec overhead — a builder
+        // that pushed exactly one Static slice flattens to
+        // ResponseBody::Static (zero alloc).
+        match self.parts.len() {
+            0 => ResponseBody::Static {
+                ptr: b"".as_ptr(),
+                len: 0,
+            },
+            1 => {
+                let mut parts = self.parts;
+                let only = parts.pop().unwrap();
+                // `parts` Vec drops here.
+                match only {
+                    BodyPart::Static(s) => ResponseBody::Static {
+                        ptr: s.as_ptr(),
+                        len: s.len(),
+                    },
+                    BodyPart::Owned(v) => ResponseBody::Owned(v.into_boxed_slice()),
+                }
+            }
+            _ => ResponseBody::Chain {
+                parts: self.parts,
+                total_len: self.total_len,
+            },
+        }
+    }
+}
+
 impl Response {
     /// Build a 200 OK. `body` accepts any [`IntoBody`] —
     /// `&'static [u8]` for zero-allocation static responses,
@@ -264,44 +442,82 @@ impl Response {
         }
     }
 
-    /// Consume the response and return its body as a
-    /// `Cow<'static, [u8]>`. Static-backed bodies (built from
-    /// `&'static [u8]`) come back as `Cow::Borrowed` with the
-    /// original static lifetime preserved — the caller can pass
-    /// them to zero-copy sinks like
-    /// `QuicConn::send_static(&'static [u8])` without
-    /// allocating. Owned bodies move out as `Cow::Owned(Vec<u8>)`
-    /// (Box's heap allocation is reinterpreted as a Vec without
-    /// copying).
-    pub fn into_body_cow(self) -> alloc::borrow::Cow<'static, [u8]> {
+    /// Consume the response and return its body as a list of
+    /// parts. Frontends (HTTP/1.1 or HTTP/3) walk the list and
+    /// emit each part on the wire — for Static parts via
+    /// borrowed-slice APIs (zero alloc, zero copy until the
+    /// final wire memcpy), for Owned parts by move.
+    ///
+    /// The returned [BodyParts] flattens the single-part case
+    /// to its underlying variant so callers don't pay the
+    /// `Vec<BodyPart>` overhead when the body is one buffer.
+    pub fn into_body_parts(self) -> BodyParts {
         match self.body {
             ResponseBody::Static { ptr, len } => {
-                // SAFETY: Static was constructed from a `&'static [u8]`
-                // (see ResponseBody::Static construction sites:
-                // `Response::ok(_, &'static_literal)` /
-                // `not_found()` / etc.). The lifetime is genuinely
-                // static; round-tripping it through the raw pointer
-                // is sound.
-                alloc::borrow::Cow::Borrowed(unsafe {
-                    core::slice::from_raw_parts(ptr, len)
-                })
+                // SAFETY: Static was constructed from a `&'static [u8]`.
+                let s = unsafe { core::slice::from_raw_parts(ptr, len) };
+                BodyParts::Static(s)
             }
-            ResponseBody::Owned(b) => alloc::borrow::Cow::Owned(b.into_vec()),
+            ResponseBody::Owned(b) => BodyParts::Owned(b.into_vec()),
+            ResponseBody::Chain { parts, total_len } => {
+                BodyParts::Chain { parts, total_len }
+            }
         }
     }
 
-    /// Borrow the response body. Public so non-HTTP/1.1 frontends
-    /// (HTTP/3) can serialise it into their own framing.
+    /// Total body length in bytes — sums all parts of a Chain.
+    /// Used by frontends to write the Content-Length header
+    /// (HTTP/1.1) or DATA-frame length prefix (HTTP/3) without
+    /// having to walk the parts twice.
+    pub fn body_len(&self) -> usize {
+        match &self.body {
+            ResponseBody::Static { len, .. } => *len,
+            ResponseBody::Owned(b) => b.len(),
+            ResponseBody::Chain { total_len, .. } => *total_len,
+        }
+    }
+
+    /// Borrow the response body as a contiguous slice. For
+    /// `Chain` bodies this would require flattening, which the
+    /// HTTP/1.1 and HTTP/3 frontends explicitly avoid — they
+    /// use `into_body_parts` instead. Callers that genuinely
+    /// need a single contiguous slice (e.g. passing to a
+    /// hash function) can use `body_flatten()` to allocate.
+    /// `body_bytes()` returns an empty slice for Chain bodies
+    /// to surface the API mismatch loudly rather than silently
+    /// flattening behind the caller's back.
     pub fn body_bytes(&self) -> &[u8] {
         match &self.body {
-            // SAFETY: the Static variant is constructed from a
-            // caller-provided `&[u8]` whose lifetime covers the
-            // handler return + send_response copy. See the comment
-            // on ResponseBody::Static.
             ResponseBody::Static { ptr, len } => unsafe {
                 core::slice::from_raw_parts(*ptr, *len)
             },
             ResponseBody::Owned(b) => b,
+            ResponseBody::Chain { .. } => &[],
+        }
+    }
+
+    /// Walk a Chain body's parts (or yield the single-part
+    /// equivalent) into the caller's closure. Useful for
+    /// frontends that want to inspect parts without consuming
+    /// the response.
+    pub fn for_each_body_part<F: FnMut(&BodyPart)>(&self, mut f: F) {
+        match &self.body {
+            ResponseBody::Static { ptr, len } => {
+                let s = unsafe { core::slice::from_raw_parts(*ptr, *len) };
+                f(&BodyPart::Static(unsafe {
+                    core::slice::from_raw_parts(s.as_ptr(), s.len())
+                }))
+            }
+            ResponseBody::Owned(_) => {
+                // Skipping this case in the walker — callers that
+                // need the bytes can use body_bytes() since Owned
+                // is contiguous.
+            }
+            ResponseBody::Chain { parts, .. } => {
+                for p in parts {
+                    f(p);
+                }
+            }
         }
     }
     /// Borrow the content-type header value. Public for the HTTP/3
@@ -641,11 +857,32 @@ async fn handle_conn<S, H>(
             if stream.send(w.as_bytes()).await.is_err() {
                 return;
             }
-            let body = resp.body_bytes();
-            if !body.is_empty() && stream.send(body).await.is_err() {
-                return;
+            // Walk body parts. For Static/Owned (single buffer)
+            // we send once. For Chain (multi-part), we send each
+            // part separately — TCP coalesces the segments at
+            // its layer, so the wire receives the same byte
+            // sequence as if we'd concatenated, but we don't
+            // pay the concat memcpy.
+            let body_parts = resp.into_body_parts();
+            match body_parts {
+                BodyParts::Static(s) => {
+                    if !s.is_empty() && stream.send(s).await.is_err() {
+                        return;
+                    }
+                }
+                BodyParts::Owned(v) => {
+                    if !v.is_empty() && stream.send(&v).await.is_err() {
+                        return;
+                    }
+                }
+                BodyParts::Chain { parts, .. } => {
+                    for part in &parts {
+                        if stream.send(part.as_slice()).await.is_err() {
+                            return;
+                        }
+                    }
+                }
             }
-            drop(resp);
 
             if want_close {
                 // Send TLS close_notify (no-op for plain TCP) before
@@ -864,7 +1101,7 @@ fn write_response_into(
     keep_alive: bool,
     alt_svc_port: Option<u16>,
 ) {
-    let body = resp.body_bytes();
+    let body_len = resp.body_len();
     let content_type = resp.content_type_bytes();
 
     w.push(b"HTTP/1.1 ");
@@ -877,7 +1114,7 @@ fn write_response_into(
     w.push(content_type);
     w.push(b"\r\nContent-Length: ");
     let mut len_buf = [0u8; 20];
-    let len_len = write_usize(&mut len_buf, body.len());
+    let len_len = write_usize(&mut len_buf, body_len);
     w.push(&len_buf[..len_len]);
     w.push(b"\r\nConnection: ");
     w.push(if keep_alive { b"keep-alive" } else { b"close" });
@@ -890,13 +1127,10 @@ fn write_response_into(
         w.push(b"\"; ma=86400\r\n");
     }
     w.push(b"\r\n");
-    // NOTE: body is NOT pushed here — `handle_conn` sends it via a
-    // separate `stream.send` so arbitrarily-large response bodies
-    // don't overflow the 2 KiB header buffer. The unused `body`
-    // borrow here is just to ensure callers consider whether body
-    // is part of the response (and to keep the signature stable
-    // against future "include trailer" extensions).
-    let _ = body;
+    // body is NOT pushed here; `handle_conn` ships it via
+    // separate stream.send calls — one per body part for
+    // multi-part Chain bodies — so arbitrarily-large bodies
+    // don't overflow the 2 KiB header buffer.
 }
 
 /// Extract the port from an HTTP `Host` header value. Handles:

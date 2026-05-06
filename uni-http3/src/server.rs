@@ -276,44 +276,31 @@ where
 }
 
 fn write_response(conn: &QuicConn, sid: u64, resp: Response) {
-    // Build the response in two pieces:
-    //   1. A "framing" Vec containing [H3 HEADERS frame complete]
-    //      [H3 DATA frame header without body]. Small (~64 B for
-    //      a typical response), allocated and moved into the
-    //      stream chain.
-    //   2. The body itself — sent as a separate chunk. If the
-    //      Response was built from a `&'static` slice the chunk
-    //      is borrowed (`stream_send_static`) — zero alloc, zero
-    //      copy. If owned (e.g. JSON rendered into a Vec at
-    //      handler time), the underlying Box is reinterpreted as
-    //      a Vec and moved by `stream_send_owned` — also zero
-    //      alloc, zero copy at this boundary. Either way, the
-    //      body bytes touch this codepath without a memcpy.
+    // Build the response wire stream as a sequence of chunks.
+    //   1. A small "framing" Vec containing [H3 HEADERS frame
+    //      complete + qpack-encoded fields][H3 DATA frame
+    //      header — type+length, no body].
+    //   2. Each body part — Static (borrowed slice, zero alloc),
+    //      Owned (Vec by move), or several of each in a Chain.
     //
-    // Result: one extra small alloc (the framing Vec) — instead
-    // of allocating a payload Vec sized for body + framing and
-    // memcpying the body in.
+    // The framing knows the total body length up front, so a
+    // multi-part body still ships as one DATA frame with the
+    // sum of part lengths in its length-prefix; parts get
+    // queued as separate SendChunks but reach the wire as
+    // contiguous bytes inside the QUIC STREAM frame.
     let status_str = status_to_bytes(resp.status);
-    // Build qpack_buf while still borrowing resp; the encoder
-    // copies field bytes into qpack_buf, so the borrow ends as
-    // soon as encode_field_section returns. Then we consume
-    // resp to extract the body Cow.
-    let body_len: usize;
+    let body_len = resp.body_len();
+    let len_str = format_usize(body_len);
+
     let mut qpack_buf: Vec<u8> = Vec::with_capacity(128);
-    {
-        let body_bytes = resp.body_bytes();
-        body_len = body_bytes.len();
-        let len_str = format_usize(body_len);
-        qpack::encode_field_section(
-            &[
-                (&b":status"[..], status_str.as_slice()),
-                (&b"content-type"[..], resp.content_type_bytes()),
-                (&b"content-length"[..], len_str.as_slice()),
-            ],
-            &mut qpack_buf,
-        );
-    }
-    let body_cow: alloc::borrow::Cow<'static, [u8]> = resp.into_body_cow();
+    qpack::encode_field_section(
+        &[
+            (&b":status"[..], status_str.as_slice()),
+            (&b"content-type"[..], resp.content_type_bytes()),
+            (&b"content-length"[..], len_str.as_slice()),
+        ],
+        &mut qpack_buf,
+    );
 
     let mut framing: Vec<u8> = Vec::with_capacity(qpack_buf.len() + 16);
     frame::append_frame_header(h3_ftype::HEADERS, qpack_buf.len(), &mut framing)
@@ -324,17 +311,26 @@ fn write_response(conn: &QuicConn, sid: u64, resp: Response) {
             .expect("data frame header fits");
     }
 
-    // Framing chunk → stream by move.
     conn.send_owned(sid, framing);
-    // Body chunk: borrowed if static, moved if owned.
+
+    // Walk the body parts and queue each as a SendChunk —
+    // borrowed-static for Static parts, moved Vec for Owned.
     if body_len > 0 {
-        match body_cow {
-            alloc::borrow::Cow::Borrowed(s) => conn.send_static(sid, s),
-            alloc::borrow::Cow::Owned(v) => conn.send_owned(sid, v),
+        match resp.into_body_parts() {
+            uni_http::BodyParts::Static(s) => conn.send_static(sid, s),
+            uni_http::BodyParts::Owned(v) => conn.send_owned(sid, v),
+            uni_http::BodyParts::Chain { parts, .. } => {
+                for part in parts {
+                    match part {
+                        uni_http::BodyPart::Static(s) => conn.send_static(sid, s),
+                        uni_http::BodyPart::Owned(v) => conn.send_owned(sid, v),
+                    }
+                }
+            }
         }
     }
     // FIN is set by close_stream; the next pop_chunk_into emits
-    // it on the last chunk.
+    // it on the last queued chunk.
     conn.close_stream(sid);
 }
 

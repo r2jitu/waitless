@@ -23,7 +23,7 @@ use core::fmt::Write as _;
 
 use uni::net::Net;
 use uni::runtime::{TcpStream, UdpClient};
-use uni_http::{Request, Response};
+use uni_http::{Body, BodyPart, Request, Response};
 
 // ---- Configuration ----------------------------------------------------------
 
@@ -247,30 +247,62 @@ margin-left:8px;letter-spacing:0.02em;}\
 hr{border:0;border-top:1px solid var(--border);margin:28px 0;}\
 </style>";
 
-fn page_shell(active: &str, title: &str, body: &str) -> String {
-    let mut s = String::with_capacity(8192);
-    s.push_str("<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">");
-    s.push_str("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
-    s.push_str("<title>");
-    s.push_str(title);
-    s.push_str(" — UniKernel</title>");
-    s.push_str(STYLES);
-    s.push_str("</head><body><nav>");
-    s.push_str("<a class=\"brand\" href=\"/\">⬢ UniKernel</a>");
+/// Static prefix that ends right before `<title>`. Same on
+/// every page (charset, viewport meta).
+const SHELL_HEAD_BEFORE_TITLE: &[u8] =
+    b"<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>";
+/// Between the page title and STYLES.
+const SHELL_HEAD_AFTER_TITLE: &[u8] = b" \xE2\x80\x94 UniKernel</title>";
+/// Between STYLES and the nav block (which the active-link
+/// loop builds dynamically because of the `class="active"`
+/// flip).
+const SHELL_AFTER_STYLES: &[u8] = b"</head><body><nav><a class=\"brand\" href=\"/\">\xE2\xAC\xA2 UniKernel</a>";
+/// Static between nav and main.
+const SHELL_NAV_MAIN: &[u8] = b"</nav><main>";
+/// Static suffix from the close of `<main>` through `</html>`.
+const SHELL_FOOTER: &[u8] =
+    b"</main><footer><span>UniKernel v0.1.0 \xC2\xB7 bare-metal Rust \xC2\xB7 no OS, no syscalls</span><span><a href=\"/diagnostics\">Live stats \xE2\x86\x92</a></span></footer></body></html>";
+
+/// Build a Body for the page shell, taking the page title and
+/// the body Body builder. The shell's static chrome is queued
+/// by reference (zero alloc, zero copy) — only the bits that
+/// vary per page (title, nav-link active-class flip) get
+/// allocated.
+fn shell_body(active: &str, title: &str, body: Body) -> Body {
+    // The nav block has one bit of dynamism — the active class.
+    // Render it into a small Vec; everything else is static.
+    let mut nav_buf = String::with_capacity(512);
     for (path, label) in NAV {
         let class = if *path == active { " class=\"active\"" } else { "" };
-        let _ = write!(s, "<a href=\"{}\"{}>{}</a>", path, class, label);
+        let _ = write!(nav_buf, "<a href=\"{}\"{}>{}</a>", path, class, label);
     }
-    s.push_str("</nav><main>");
-    s.push_str(body);
-    s.push_str("</main><footer><span>UniKernel v0.1.0 · bare-metal Rust · no OS, no syscalls</span>");
-    s.push_str("<span><a href=\"/diagnostics\">Live stats →</a></span>");
-    s.push_str("</footer></body></html>");
-    s
+
+    // The title segment. Tiny — just the title text wrapped in
+    // the shell's title-tag context.
+    let title_buf = title.as_bytes().to_vec();
+
+    let mut b = Body::with_capacity(8 + body.parts.len());
+    b = b.push_static(SHELL_HEAD_BEFORE_TITLE);
+    b = b.push_owned(title_buf);
+    b = b.push_static(SHELL_HEAD_AFTER_TITLE);
+    b = b.push_static(STYLES.as_bytes());
+    b = b.push_static(SHELL_AFTER_STYLES);
+    b = b.push_owned(nav_buf.into_bytes());
+    b = b.push_static(SHELL_NAV_MAIN);
+    // Splice in the page body's parts in order — each is
+    // already either static or owned.
+    for part in body.parts {
+        match part {
+            BodyPart::Static(s) => b = b.push_static(s),
+            BodyPart::Owned(v) => b = b.push_owned(v),
+        }
+    }
+    b = b.push_static(SHELL_FOOTER);
+    b
 }
 
-fn html_response(active: &str, title: &str, body: &str) -> Response {
-    Response::ok(b"text/html; charset=utf-8", page_shell(active, title, body))
+fn html_response(active: &str, title: &str, body: impl Into<Body>) -> Response {
+    Response::ok(b"text/html; charset=utf-8", shell_body(active, title, body.into()))
 }
 
 // ---- Page bodies ------------------------------------------------------------
@@ -588,7 +620,7 @@ auto-refreshes every 5 seconds; raw JSON endpoints below.</p>\
     body.push_str("<p><a href=\"/quic_stats\"><code>/quic_stats</code></a> · raw JSON · ");
     body.push_str("<a href=\"/tls_profile\"><code>/tls_profile</code></a> · TLS handshake timing</p>");
 
-    html_response("/diagnostics", "Diagnostics", &body)
+    html_response("/diagnostics", "Diagnostics", body)
 }
 
 // ---- JSON / text data endpoints --------------------------------------------
