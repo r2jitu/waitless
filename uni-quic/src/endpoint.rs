@@ -251,19 +251,20 @@ impl QuicConn {
     }
 
     fn drain_outbound(&self) {
-        let mut out = vec![0u8; 1500];
         loop {
-            let n = {
+            let pkt = {
                 let mut c = self.conn.borrow_mut();
-                c.pop_packet(&mut out)
+                c.pop_packet_owned()
             };
-            if n == 0 {
-                break;
-            }
+            let pkt = match pkt {
+                Some(p) => p,
+                None => break,
+            };
             let _ = self
                 .sock
-                .send_to(self.peer_ip.get(), self.peer_port.get(), &out[..n]);
+                .send_to(self.peer_ip.get(), self.peer_port.get(), &pkt);
             crate::diag::bump(&crate::diag::COUNTERS.datagrams_sent);
+            self.conn.borrow_mut().recycle_packet(pkt);
         }
     }
 }
@@ -556,16 +557,16 @@ async fn conn_task<H, F>(
                                 .pto_probes_sent
                                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                             // Drain the probe to the wire
-                            // immediately; no need to wait for
-                            // the next loop iteration.
-                            let mut out = vec![0u8; 1500];
+                            // immediately via the ownership-
+                            // transfer pop + recycle pattern.
                             loop {
-                                let n = conn.borrow_mut().pop_packet(&mut out);
-                                if n == 0 {
-                                    break;
-                                }
-                                let _ = sock.send_to(peer_ip.get(), peer_port.get(), &out[..n]);
+                                let pkt = match conn.borrow_mut().pop_packet_owned() {
+                                    Some(p) => p,
+                                    None => break,
+                                };
+                                let _ = sock.send_to(peer_ip.get(), peer_port.get(), &pkt);
                                 crate::diag::bump(&crate::diag::COUNTERS.datagrams_sent);
+                                conn.borrow_mut().recycle_packet(pkt);
                             }
                         }
                         continue;
@@ -631,15 +632,20 @@ async fn conn_task<H, F>(
         }
 
         // Drain outbound packets to the peer. Each iteration
-        // borrows the cell briefly, drops, then `send_to`'s.
-        let mut out = vec![0u8; 1500];
+        // takes the front Vec by ownership (`pop_packet_owned`),
+        // sends without copying it into a local scratch buffer,
+        // then returns the Vec to the conn's recycle pool. The
+        // memcpy that the slice-based `pop_packet` would have
+        // performed disappears, and the Vec gets reused on the
+        // next encode rather than dropped.
         loop {
-            let n = conn.borrow_mut().pop_packet(&mut out);
-            if n == 0 {
-                break;
-            }
-            let _ = sock.send_to(peer_ip.get(), peer_port.get(), &out[..n]);
+            let pkt = match conn.borrow_mut().pop_packet_owned() {
+                Some(p) => p,
+                None => break,
+            };
+            let _ = sock.send_to(peer_ip.get(), peer_port.get(), &pkt);
             crate::diag::bump(&crate::diag::COUNTERS.datagrams_sent);
+            conn.borrow_mut().recycle_packet(pkt);
         }
         if tearing_down {
             break;

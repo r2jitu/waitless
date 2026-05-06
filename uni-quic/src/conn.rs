@@ -503,7 +503,22 @@ pub struct Connection {
     /// Outbound packet queue: complete UDP datagrams (including
     /// any header-protected, AEAD-sealed packets) ready to ship.
     /// `pop_packet` drains the front entry.
-    outbound: Vec<Vec<u8>>,
+    ///
+    /// VecDeque (not Vec) so the front-pop is O(1). Multi-packet
+    /// responses queue up to MAX_FLUSH_PACKETS (~32) at a time;
+    /// `Vec::remove(0)` would have shifted all of them on each
+    /// pop.
+    outbound: alloc::collections::VecDeque<Vec<u8>>,
+
+    /// Recycled datagram Vecs from `pop_packet_owned` /
+    /// `recycle_packet`. Each is `clear()`-ed (capacity ≈ 1500
+    /// preserved) before going back. The encode paths pull from
+    /// here first via `take_datagram_buf`, falling back to a
+    /// fresh `Vec::with_capacity(1500)` only when the pool is
+    /// empty. On a steady-state response stream the pool stays
+    /// at saturation (a handful of bufs cycling) and zero
+    /// datagram-Vec allocs hit the hot path.
+    outbound_pool: Vec<Vec<u8>>,
 
     /// Per-conn scratch for the per-packet `frames` buffer.
     /// `encode_*_packet` clear()s it on entry — capacity stays,
@@ -583,7 +598,8 @@ impl Connection {
             last_recv_us: 0,
             close_pending: None,
             one_rtt_crypto_offset: 0,
-            outbound: Vec::new(),
+            outbound: alloc::collections::VecDeque::new(),
+            outbound_pool: Vec::new(),
             scratch_frames: Vec::with_capacity(1500),
             recv_streams: alloc::collections::BTreeMap::new(),
             send_streams: alloc::collections::BTreeMap::new(),
@@ -643,7 +659,7 @@ impl Connection {
                 .is_ok()
                 && !datagram.is_empty()
             {
-                self.outbound.push(datagram);
+                self.outbound.push_back(datagram);
                 crate::diag::bump(&crate::diag::COUNTERS.connection_closes_emitted);
             }
             self.state = ConnState::Failed;
@@ -756,7 +772,7 @@ impl Connection {
         };
         let mut datagram = Vec::with_capacity(64);
         if self.encode_ping_probe(&mut datagram, level).is_ok() && !datagram.is_empty() {
-            self.outbound.push(datagram);
+            self.outbound.push_back(datagram);
             return true;
         }
         false
@@ -893,13 +909,62 @@ impl Connection {
     /// Drain one ready-to-send UDP datagram into `out`. Returns
     /// number of bytes written (0 if nothing pending).
     pub fn pop_packet(&mut self, out: &mut [u8]) -> usize {
-        if self.outbound.is_empty() {
-            return 0;
-        }
-        let pkt = self.outbound.remove(0);
+        let pkt = match self.outbound.pop_front() {
+            Some(p) => p,
+            None => return 0,
+        };
         let n = out.len().min(pkt.len());
         out[..n].copy_from_slice(&pkt[..n]);
+        // Recycle the buffer so the next encode reuses its
+        // capacity instead of allocating a fresh Vec. Cap the
+        // pool size so a wedged peer (queue can't drain) doesn't
+        // grow the pool unboundedly.
+        const POOL_MAX: usize = 16;
+        if self.outbound_pool.len() < POOL_MAX {
+            let mut recycled = pkt;
+            recycled.clear();
+            self.outbound_pool.push(recycled);
+        }
         n
+    }
+
+    /// Pop the next outbound datagram by ownership, no copy.
+    /// Caller can pass the Vec straight to `sock.send_to(&vec)`,
+    /// then return it via `recycle_packet` for buffer reuse.
+    /// Saves the per-packet memcpy that the slice-based
+    /// `pop_packet` performs, plus enables the pool to reach
+    /// steady state (`pop_packet` recycles internally; this
+    /// hands off and trusts the caller).
+    pub fn pop_packet_owned(&mut self) -> Option<Vec<u8>> {
+        self.outbound.pop_front()
+    }
+
+    /// Return a previously-popped datagram Vec to the conn's
+    /// recycle pool. The Vec is cleared (length=0, capacity
+    /// preserved). Pool is bounded; over the cap the Vec is
+    /// dropped normally.
+    pub fn recycle_packet(&mut self, mut v: Vec<u8>) {
+        const POOL_MAX: usize = 16;
+        if self.outbound_pool.len() < POOL_MAX {
+            v.clear();
+            self.outbound_pool.push(v);
+        }
+    }
+
+    /// Take a datagram-sized buffer from the pool, or allocate
+    /// a fresh `Vec::with_capacity(1500)`. Encode paths use this
+    /// to avoid the per-packet datagram alloc on the hot path.
+    fn take_datagram_buf(&mut self, fallback_capacity: usize) -> Vec<u8> {
+        match self.outbound_pool.pop() {
+            Some(mut v) => {
+                v.clear();
+                if v.capacity() < fallback_capacity {
+                    v.reserve(fallback_capacity - v.capacity());
+                }
+                v
+            }
+            None => Vec::with_capacity(fallback_capacity),
+        }
     }
 
     /// Whether there's an outbound datagram queued. Cheap check
@@ -1734,7 +1799,7 @@ impl Connection {
             let mut datagram = Vec::with_capacity(256);
             self.encode_close_packet(&mut datagram, error_code, &reason)?;
             if !datagram.is_empty() {
-                self.outbound.push(datagram);
+                self.outbound.push_back(datagram);
                 crate::diag::bump(&crate::diag::COUNTERS.connection_closes_emitted);
             }
             self.state = ConnState::Failed;
@@ -1745,7 +1810,7 @@ impl Connection {
         // Order matters: Initial first, then Handshake, then 1-RTT
         // (RFC 9000 §12.2). Each packet's tx-side CRYPTO bytes
         // come from QuicTls.pop_handshake at the matching level.
-        let mut datagram = Vec::with_capacity(1500);
+        let mut datagram = self.take_datagram_buf(1500);
 
         // Initial packet (if there are bytes to send or an ACK pending).
         let mut initial_crypto = [0u8; 1024];
@@ -1792,7 +1857,7 @@ impl Connection {
             let n = datagram.len() as u64;
             if n <= self.anti_amp_remaining() {
                 self.record_bytes_sent(n);
-                self.outbound.push(datagram);
+                self.outbound.push_back(datagram);
             } else {
                 crate::diag::bump(&crate::diag::COUNTERS.anti_amp_throttled);
             }
@@ -1825,7 +1890,7 @@ impl Connection {
                 if self.anti_amp_remaining() == 0 {
                     break;
                 }
-                let mut more = Vec::with_capacity(1500);
+                let mut more = self.take_datagram_buf(1500);
                 self.encode_one_rtt_packet(&mut more)?;
                 if more.is_empty() {
                     break;
@@ -1836,7 +1901,7 @@ impl Connection {
                     break;
                 }
                 self.record_bytes_sent(n);
-                self.outbound.push(more);
+                self.outbound.push_back(more);
             }
         }
         Ok(())
