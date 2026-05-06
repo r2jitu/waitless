@@ -207,6 +207,14 @@ pub struct Counters {
     /// One inbound datagram processed (parse + dispatch). Pair
     /// with `inbox_full_drops` to see drop ratio under load.
     pub datagrams_processed: AtomicU64,
+    /// Outbound datagram suppressed by the anti-amplification
+    /// limit (RFC 9000 §8.1.2). Bumps when the path isn't yet
+    /// validated and emitting the packet would exceed 3× the
+    /// bytes received from the peer. The packet is dropped (not
+    /// truncated); the peer treats it as loss and we'll retry
+    /// once enough peer bytes accumulate, or once a Handshake
+    /// packet arrives and the limit is lifted entirely.
+    pub anti_amp_throttled: AtomicU64,
 }
 
 impl Counters {
@@ -248,6 +256,7 @@ impl Counters {
             flush_calls: AtomicU64::new(0),
             datagrams_sent: AtomicU64::new(0),
             datagrams_processed: AtomicU64::new(0),
+            anti_amp_throttled: AtomicU64::new(0),
         }
     }
 }
@@ -367,7 +376,7 @@ pub fn should_log_event() -> bool {
 
 /// Snapshot of every counter, for `/debug/quic_stats`-style dumps.
 /// Returns `(name, value)` pairs in declaration order.
-pub fn snapshot() -> [(&'static str, u64); 36] {
+pub fn snapshot() -> [(&'static str, u64); 37] {
     let c = &COUNTERS;
     [
         ("no_dcid", c.no_dcid.load(Ordering::Relaxed)),
@@ -406,6 +415,7 @@ pub fn snapshot() -> [(&'static str, u64); 36] {
         ("flush_calls", c.flush_calls.load(Ordering::Relaxed)),
         ("datagrams_sent", c.datagrams_sent.load(Ordering::Relaxed)),
         ("datagrams_processed", c.datagrams_processed.load(Ordering::Relaxed)),
+        ("anti_amp_throttled", c.anti_amp_throttled.load(Ordering::Relaxed)),
     ]
 }
 

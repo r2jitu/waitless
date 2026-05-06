@@ -424,6 +424,27 @@ pub struct Connection {
     peer_max_streams_bidi_advertised: u64,
     peer_max_streams_uni_advertised: u64,
 
+    // ── Anti-amplification (RFC 9000 §8.1) ────────────────────────
+    //
+    // Until the peer's address is validated, we MUST NOT send more
+    // than 3 × the bytes we've received from them. Without this an
+    // attacker could spoof a victim's source IP, send a small Initial,
+    // and we'd reply with a several-KB server flight (cert + EE +
+    // CV + Finished) — amplification in the worst case ~30×.
+    //
+    // Validation is triggered by receipt of a Handshake-encrypted
+    // packet (the peer must have decoded our ServerHello to derive
+    // Handshake keys, proving they own the source address).
+    /// Cumulative bytes received from peer before path was validated.
+    /// Frozen once `path_validated` flips to true.
+    bytes_received_pre_validation: u64,
+    /// Cumulative bytes we've sent before path was validated.
+    /// Frozen once `path_validated` flips to true.
+    bytes_sent_pre_validation: u64,
+    /// `true` once the peer has proven they hold the source
+    /// address (received a Handshake packet from them).
+    path_validated: bool,
+
     // ── RTT estimator (RFC 9002 §5) ───────────────────────────────
     //
     // All in microseconds. Updated each time an ACK arrives that
@@ -551,6 +572,9 @@ impl Connection {
             // advertised or fail to use credit we already gave.
             peer_max_streams_bidi_advertised: 1024,
             peer_max_streams_uni_advertised: 1024,
+            bytes_received_pre_validation: 0,
+            bytes_sent_pre_validation: 0,
+            path_validated: false,
             latest_rtt_us: None,
             min_rtt_us: None,
             smoothed_rtt_us: None,
@@ -652,6 +676,29 @@ impl Connection {
         effective_ms.saturating_mul(1_000)
     }
 
+    /// Anti-amplification credit remaining (RFC 9000 §8.1.2). Pre-
+    /// validation we may send at most 3× the bytes we've received.
+    /// Returns u64::MAX once the path is validated. Used by
+    /// `flush_outbound` and the per-encoder paths to suppress
+    /// further emission when the credit would be exceeded.
+    fn anti_amp_remaining(&self) -> u64 {
+        if self.path_validated {
+            return u64::MAX;
+        }
+        let limit = self.bytes_received_pre_validation.saturating_mul(3);
+        limit.saturating_sub(self.bytes_sent_pre_validation)
+    }
+
+    /// Account for `n` bytes leaving the conn. No-op once the path
+    /// is validated. Called after each packet is appended to the
+    /// outbound queue.
+    fn record_bytes_sent(&mut self, n: u64) {
+        if !self.path_validated {
+            self.bytes_sent_pre_validation =
+                self.bytes_sent_pre_validation.saturating_add(n);
+        }
+    }
+
     /// PTO (Probe Timeout) period in microseconds, RFC 9002 §6.2.1:
     ///   `PTO = SRTT + max(4 * RTTvar, kGranularity) + max_ack_delay`
     /// Until we have an SRTT sample, falls back to kInitialRtt =
@@ -743,6 +790,13 @@ impl Connection {
         // the peer is clearly still trying. RFC 9000 §10.1 only
         // requires receipt, not successful processing.
         self.last_recv_us = uni_tls::ticket::now_us();
+        // Anti-amplification accounting (RFC 9000 §8.1.2): all
+        // bytes received from the peer's address count toward our
+        // 3× send credit, including ones that fail to decrypt.
+        if !self.path_validated {
+            self.bytes_received_pre_validation =
+                self.bytes_received_pre_validation.saturating_add(datagram.len() as u64);
+        }
         let mut p = 0usize;
         while p < datagram.len() {
             // Per-packet drop on AEAD failure (RFC 9000 §9.7:
@@ -1180,6 +1234,11 @@ impl Connection {
                 .map_or(pn, |x| x.max(pn)),
         );
         self.handshake_space.ack_pending = true;
+        // RFC 9000 §8.1: a successful Handshake-encrypted packet
+        // proves the peer holds the source address (they had to
+        // decrypt our ServerHello to derive Handshake keys). The
+        // 3× anti-amplification limit is lifted from now on.
+        self.path_validated = true;
         Ok(total_packet_len)
     }
 
@@ -1724,7 +1783,19 @@ impl Connection {
             self.encode_one_rtt_packet(&mut datagram)?;
         }
         if !datagram.is_empty() {
-            self.outbound.push(datagram);
+            // Anti-amplification gate (RFC 9000 §8.1.2). Pre-
+            // validation we drop packets whose cumulative bytes
+            // would exceed 3× what we've received from the peer.
+            // Dropping rather than truncating is correct here:
+            // the peer treats it as packet loss and retries, by
+            // which time their address may be validated.
+            let n = datagram.len() as u64;
+            if n <= self.anti_amp_remaining() {
+                self.record_bytes_sent(n);
+                self.outbound.push(datagram);
+            } else {
+                crate::diag::bump(&crate::diag::COUNTERS.anti_amp_throttled);
+            }
         }
 
         // Drain remaining stream/CRYPTO data into ADDITIONAL 1-RTT
@@ -1746,11 +1817,25 @@ impl Connection {
                 if !self.has_pending_one_rtt_data() {
                     break;
                 }
+                // Same anti-amp gate for the multi-packet flush
+                // tail. Dropping additional packets pre-validation
+                // is fine — the peer will get the first packet
+                // (which moves them to Handshake) and we'll send
+                // the rest after validation.
+                if self.anti_amp_remaining() == 0 {
+                    break;
+                }
                 let mut more = Vec::with_capacity(1500);
                 self.encode_one_rtt_packet(&mut more)?;
                 if more.is_empty() {
                     break;
                 }
+                let n = more.len() as u64;
+                if n > self.anti_amp_remaining() {
+                    crate::diag::bump(&crate::diag::COUNTERS.anti_amp_throttled);
+                    break;
+                }
+                self.record_bytes_sent(n);
                 self.outbound.push(more);
             }
         }
@@ -2695,10 +2780,22 @@ mod tests {
         ch_msg.push((len & 0xff) as u8);
         ch_msg.extend_from_slice(&ch_body);
 
-        // 2. Wrap ChMsg in a CRYPTO frame.
+        // 2. Wrap ChMsg in a CRYPTO frame, then pad so the entire
+        //    UDP datagram is ≥ 1200 bytes — RFC 9000 §14.1 requires
+        //    client Initials to be padded to that size, and the
+        //    server's anti-amplification check (§8.1.2) limits its
+        //    reply to 3× received bytes. Without padding here the
+        //    server's full flight would be throttled.
         let mut crypto_frame = vec![0u8; ch_msg.len() + 16];
         let cn = write_crypto(0, &ch_msg, &mut crypto_frame).unwrap();
-        let payload = &crypto_frame[..cn];
+        // Approximate header overhead so the post-AEAD UDP
+        // datagram lands at ≥ 1200 bytes; over-estimate is fine.
+        let header_overhead = 1 + 4 + 1 + 8 + 1 + 8 + 1 + 4 + 4 + 16;
+        let need_payload = 1200_usize.saturating_sub(header_overhead).max(cn);
+        let mut padded = alloc::vec::Vec::with_capacity(need_payload);
+        padded.extend_from_slice(&crypto_frame[..cn]);
+        padded.resize(need_payload, 0u8); // PADDING frame = 0x00
+        let payload = padded.as_slice();
 
         // 3. Build a sealed Initial packet using client-direction
         //    Initial keys derived from a synthetic DCID.
