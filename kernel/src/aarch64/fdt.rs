@@ -40,7 +40,20 @@ pub struct FdtInfo {
     /// runner to park the vCPU thread at zero CPU cost. Discovered from
     /// an `hvf-yield` FDT node (only present in HVF runner FDTs).
     pub yield_mmio_base: u64,
+    /// Kernel command line — `chosen.bootargs` from the FDT, copied
+    /// into an inline buffer at parse time. Capped at
+    /// `BOOT_ARGS_MAX` bytes; longer strings are truncated. We use a
+    /// fixed buffer (rather than `Box::leak`) because FDT parsing
+    /// runs before heap init in the boot sequence. Access via
+    /// `boot_args()` for a `&'static str` view.
+    boot_args_buf: [u8; BOOT_ARGS_MAX],
+    boot_args_len: usize,
 }
+
+/// Cap on the bytes we keep from `chosen.bootargs`. 256 bytes is
+/// more than any real kernel command line we care about and keeps
+/// `FdtInfo` cheap to copy/initialise.
+pub const BOOT_ARGS_MAX: usize = 256;
 
 impl FdtInfo {
     const ZEROED: FdtInfo = FdtInfo {
@@ -61,7 +74,17 @@ impl FdtInfo {
         pci_irqs: [0; 8],
         cpu_count: 0,
         yield_mmio_base: 0,
+        boot_args_buf: [0; BOOT_ARGS_MAX],
+        boot_args_len: 0,
     };
+
+    /// `&'static str` view into the inlined boot-args buffer. Lifetime
+    /// is `&'static` because `FdtInfo` lives in `G_INFO: InitOnce<…>`
+    /// for the kernel's lifetime, so the reborrowed slice does too.
+    pub fn boot_args(&'static self) -> &'static str {
+        let bytes = &self.boot_args_buf[..self.boot_args_len];
+        core::str::from_utf8(bytes).unwrap_or("")
+    }
 }
 
 /// Parsed FDT, populated exactly once by `init()` before any AP starts.
@@ -243,6 +266,28 @@ fn extract_info(fdt: &fdt::Fdt) -> FdtInfo {
     if let Some(node) = fdt.find_compatible(&["hvf,yield"]) {
         if let Some(reg) = node.reg().and_then(|mut r| r.next()) {
             info.yield_mmio_base = reg.starting_address as u64;
+        }
+    }
+
+    // /chosen/bootargs — kernel command line. Some firmwares
+    // (HVF runner with `--bootargs`, recent QEMU `-append`) emit
+    // this; older builds skip the node entirely. Strip a single
+    // trailing NUL because the FDT property value usually
+    // includes one (it's a length-prefixed C string in the spec).
+    // Copy into the inline buffer; truncate (don't fail) if the
+    // string overflows BOOT_ARGS_MAX so a too-long arg degrades
+    // gracefully.
+    if let Some(chosen) = fdt.find_node("/chosen") {
+        if let Some(prop) = chosen.property("bootargs") {
+            let mut bytes = prop.value;
+            if let Some((&last, head)) = bytes.split_last() {
+                if last == 0 {
+                    bytes = head;
+                }
+            }
+            let n = bytes.len().min(BOOT_ARGS_MAX);
+            info.boot_args_buf[..n].copy_from_slice(&bytes[..n]);
+            info.boot_args_len = n;
         }
     }
 

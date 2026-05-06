@@ -14,14 +14,16 @@
 // `match _ => {}` patterns that turned every QUIC interop bug into
 // "client times out 30 seconds later, no idea why".
 //
-// Cost: each call site is one atomic increment + one `uni::println!`.
-// In release builds the println goes to the serial console; in
-// no-output environments (`UNI_QUIC_QUIET=1` someday — left as a
-// follow-up) it can be silenced. The counters are always live so
-// `/debug/quic_stats` (also a follow-up) can dump them on demand
-// without code changes.
+// Cost: each call site is one atomic increment + (gated) one
+// `uni::println!`. The println is gated by the runtime log level
+// (`LogLevel` below) so benchmark builds pay only the increment.
+// Default is `Drops` — failure events log, normal events don't.
+// Override via the `quic.log=silent|drops|events` token in
+// `uni::boot_info().boot_args`, parsed on first macro invocation.
+// The counters are always live so a future `/debug/quic_stats`
+// endpoint can dump them on demand without code changes.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 /// One atomic counter per drop / event reason. Cheap to read in bulk
 /// for a stats dump, cheap to increment on the hot path.
@@ -119,6 +121,108 @@ pub fn bump(field: &AtomicU64) {
     field.fetch_add(1, Ordering::Relaxed);
 }
 
+// ── Log-level gating ────────────────────────────────────────────────
+//
+// The macros below check this u8 before printing. Counter increments
+// are unaffected — they're cheap and always run, so `/debug/quic_stats`
+// stays accurate even in `Silent` mode.
+//
+//   0 = Silent  (counters only; for benchmarks)
+//   1 = Drops   (failures only; default — drops are rare on a
+//                healthy server, so this is cheap in production)
+//   2 = Events  (drops + positive events: conn alloc, handshake
+//                done, ticket emit/accept, etc. — for debug)
+//
+// Stored as AtomicU8 with relaxed ordering. Hot-path access is one
+// load + one branch.
+
+/// Public representation of the log level. Apps call
+/// `set_log_level(LogLevel::Events)` to enable verbose logging at
+/// runtime; the default is `Drops`.
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LogLevel {
+    Silent = 0,
+    Drops = 1,
+    Events = 2,
+}
+
+const LEVEL_DEFAULT: u8 = LogLevel::Drops as u8;
+static LEVEL: AtomicU8 = AtomicU8::new(LEVEL_DEFAULT);
+/// Whether we've parsed `boot_info().boot_args` yet. First macro
+/// invocation triggers the parse; subsequent calls hit the cached
+/// `LEVEL` directly.
+static LEVEL_INIT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Override the log level explicitly. Useful for tests, benchmarks,
+/// or when an app wants to force-enable verbose logging without
+/// rebooting (e.g. on receipt of a debug command). Stable across
+/// concurrent calls; last writer wins.
+pub fn set_log_level(level: LogLevel) {
+    LEVEL.store(level as u8, Ordering::Relaxed);
+    // Mark "init done" so we don't overwrite the explicit choice
+    // with a boot_args parse on the next macro call.
+    LEVEL_INIT.store(true, Ordering::Relaxed);
+}
+
+/// Current log level. Exposed for tests / a future stats endpoint.
+pub fn log_level() -> LogLevel {
+    match LEVEL.load(Ordering::Relaxed) {
+        0 => LogLevel::Silent,
+        2 => LogLevel::Events,
+        _ => LogLevel::Drops,
+    }
+}
+
+/// Internal: parse `boot_info().boot_args` once and cache the
+/// resulting level. Looks for the `quic.log=<level>` token (any
+/// position in the args string). Unknown tokens are ignored;
+/// missing token leaves the default in place.
+fn init_from_boot_args() {
+    // Boot info is published before app `init()` runs on every
+    // backend, so the call here is safe — but we still guard to
+    // avoid a panic if some test-only code path runs us before init.
+    if !uni::boot_info::is_initialized() {
+        LEVEL_INIT.store(true, Ordering::Relaxed);
+        return;
+    }
+    let args = uni::boot_info().boot_args;
+    for tok in args.split_whitespace() {
+        if let Some(v) = tok.strip_prefix("quic.log=") {
+            let lvl = match v {
+                "silent" | "off" | "0" => LogLevel::Silent as u8,
+                "drops" | "1" => LogLevel::Drops as u8,
+                "events" | "verbose" | "2" => LogLevel::Events as u8,
+                _ => continue,
+            };
+            LEVEL.store(lvl, Ordering::Relaxed);
+        }
+    }
+    LEVEL_INIT.store(true, Ordering::Relaxed);
+}
+
+/// Should `quic_drop!` print? Internal helper used by the macro
+/// expansion. Inline so the cold init path stays out of the hot
+/// path's I-cache footprint.
+#[inline]
+pub fn should_log_drop() -> bool {
+    if !LEVEL_INIT.load(Ordering::Relaxed) {
+        init_from_boot_args();
+    }
+    LEVEL.load(Ordering::Relaxed) >= LogLevel::Drops as u8
+}
+
+/// Should `quic_event!` print? Same shape as `should_log_drop` but
+/// requires `Events` level — drops fire below this threshold.
+#[inline]
+pub fn should_log_event() -> bool {
+    if !LEVEL_INIT.load(Ordering::Relaxed) {
+        init_from_boot_args();
+    }
+    LEVEL.load(Ordering::Relaxed) >= LogLevel::Events as u8
+}
+
 /// Snapshot of every counter, for `/debug/quic_stats`-style dumps.
 /// Returns `(name, value)` pairs in declaration order.
 pub fn snapshot() -> [(&'static str, u64); 16] {
@@ -143,13 +247,16 @@ pub fn snapshot() -> [(&'static str, u64); 16] {
     ]
 }
 
-/// Drop-site macro: increments the named counter and logs a single
-/// line to the serial console with the reason + a caller-supplied
-/// detail string. Use for "we couldn't continue here, packet/conn
-/// is being dropped" — never for normal completion.
+/// Drop-site macro: increments the named counter and (if the log
+/// level allows) logs a single line. Use for "we couldn't continue
+/// here, packet/conn is being dropped" — never for normal completion.
 ///
 /// The first arg is the bare counter field name from `Counters`;
 /// the rest is `format_args!`-shape detail.
+///
+/// Counter increments unconditionally; the println is gated by
+/// `LogLevel >= Drops` (the default). Benchmark builds set
+/// `quic.log=silent` in `boot_args` and pay only the increment.
 ///
 /// Example:
 ///   `quic_drop!(unsupported_client, "no x25519 in CH key_share");`
@@ -157,33 +264,42 @@ pub fn snapshot() -> [(&'static str, u64); 16] {
 macro_rules! quic_drop {
     ($reason:ident, $($detail:tt)*) => {{
         $crate::diag::bump(&$crate::diag::COUNTERS.$reason);
-        ::uni::println!(
-            "[quic-drop {}] {}",
-            stringify!($reason),
-            ::core::format_args!($($detail)*),
-        );
+        if $crate::diag::should_log_drop() {
+            ::uni::println!(
+                "[quic-drop {}] {}",
+                stringify!($reason),
+                ::core::format_args!($($detail)*),
+            );
+        }
     }};
     ($reason:ident) => {{
         $crate::diag::bump(&$crate::diag::COUNTERS.$reason);
-        ::uni::println!("[quic-drop {}]", stringify!($reason));
+        if $crate::diag::should_log_drop() {
+            ::uni::println!("[quic-drop {}]", stringify!($reason));
+        }
     }};
 }
 
 /// Event-site macro: same shape as `quic_drop!` but for positive /
-/// progress events. Same logging cost; conceptually distinct so
-/// operators can grep `quic-event` vs `quic-drop` separately.
+/// progress events. Gated by `LogLevel >= Events` so the default
+/// `Drops` level keeps these silent — they're useful for
+/// per-handshake debugging but noise during steady-state load.
 #[macro_export]
 macro_rules! quic_event {
     ($reason:ident, $($detail:tt)*) => {{
         $crate::diag::bump(&$crate::diag::COUNTERS.$reason);
-        ::uni::println!(
-            "[quic-event {}] {}",
-            stringify!($reason),
-            ::core::format_args!($($detail)*),
-        );
+        if $crate::diag::should_log_event() {
+            ::uni::println!(
+                "[quic-event {}] {}",
+                stringify!($reason),
+                ::core::format_args!($($detail)*),
+            );
+        }
     }};
     ($reason:ident) => {{
         $crate::diag::bump(&$crate::diag::COUNTERS.$reason);
-        ::uni::println!("[quic-event {}]", stringify!($reason));
+        if $crate::diag::should_log_event() {
+            ::uni::println!("[quic-event {}]", stringify!($reason));
+        }
     }};
 }

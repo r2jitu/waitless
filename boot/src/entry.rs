@@ -610,9 +610,12 @@ fn publish_boot_info(net_ok: bool) {
     uni::boot_info::init_boot_info(BootInfoParams {
         ram_bytes: uni_kernel::mm::total_memory(),
         num_cpus: uni_kernel::percpu::num_cores(),
-        // No kernel command line plumbed through the boot shim yet —
-        // expose an empty string so apps can still rely on the field.
-        boot_args: "",
+        // Surface the `chosen.bootargs` from the FDT (HVF runner's
+        // `--bootargs=` flag, QEMU `-append`, …). Empty string when
+        // no firmware supplied one. Apps key configuration off it
+        // (e.g. `quic.log=events` to flip the QUIC stack into
+        // verbose-event mode).
+        boot_args: uni_kernel::aarch64::fdt::info().boot_args(),
         nics,
         // RTC isn't queried at boot yet. Left `None`; a future phase
         // can plumb ACPI FADT CMOS / FDT rtc.

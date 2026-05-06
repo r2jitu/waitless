@@ -31,6 +31,7 @@ pub fn generate(
     gicr_base: u64,
     cpu_count: usize,
     virtio_devices: &[VirtioMmioDesc],
+    bootargs: &str,
 ) -> Vec<u8> {
     let mut fdt = FdtWriter::new().unwrap();
 
@@ -90,6 +91,16 @@ pub fn generate(
         fdt.property_array_u32("interrupts", &[0, dev.spi, 1]).unwrap();
         fdt.end_node(node).unwrap();
     }
+
+    // /chosen — kernel command line. Kernel reads `bootargs` and
+    // exposes it as `uni::boot_info().boot_args`. Apps key
+    // configuration (e.g. `quic.log=events`) off this string. Empty
+    // bootargs are still emitted as an empty `bootargs = "";`
+    // property — the kernel's parser tolerates either form, but
+    // emitting unconditionally keeps the FDT shape stable.
+    let chosen = fdt.begin_node("chosen").unwrap();
+    fdt.property_string("bootargs", bootargs).unwrap();
+    fdt.end_node(chosen).unwrap();
 
     // /hvf-yield@9001000 — cooperative yield register.
     // The guest writes to this MMIO address instead of executing WFI.

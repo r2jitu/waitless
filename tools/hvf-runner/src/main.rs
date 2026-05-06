@@ -38,6 +38,9 @@ fn usage(prog: &str) {
     eprintln!("Options:");
     eprintln!("  --ram=MB              Guest RAM in MiB (default: 128)");
     eprintln!("  --cpus=N              vCPU count (default: 1)");
+    eprintln!("  --bootargs=STR        Kernel command line passed via FDT chosen.bootargs.");
+    eprintln!("                        Read by the guest as `uni::boot_info().boot_args`.");
+    eprintln!("                        Example: --bootargs=\"quic.log=events\"");
     eprintln!("  -p PROTO:HOST:GUEST   Port forward (repeatable).");
     eprintln!("                        PROTO = tcp | udp.");
     eprintln!("                        Default: -p tcp:8080:80 -p udp:18080:7");
@@ -66,6 +69,11 @@ struct Args {
     ram_mib: usize,
     cpu_count: usize,
     mappings: Vec<PortMapping>,
+    /// Kernel command line forwarded into the FDT `chosen.bootargs`
+    /// property. Apps consume it via `uni::boot_info().boot_args`.
+    /// Whitespace-separated `key=value` tokens by convention; the
+    /// QUIC stack's verbosity knob is `quic.log=silent|drops|events`.
+    bootargs: String,
 }
 
 fn parse_args(argv: &[String]) -> Result<Args, String> {
@@ -78,6 +86,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     let mut ram_mib: usize = 128;
     let mut cpu_count: usize = 1;
     let mut mappings: Vec<PortMapping> = Vec::new();
+    let mut bootargs: String = String::new();
 
     let mut i = 1;
     while i < argv.len() {
@@ -89,6 +98,8 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
             ram_mib = v.parse().map_err(|_| format!("bad --ram value '{v}'"))?;
         } else if let Some(v) = a.strip_prefix("--cpus=") {
             cpu_count = v.parse().map_err(|_| format!("bad --cpus value '{v}'"))?;
+        } else if let Some(v) = a.strip_prefix("--bootargs=") {
+            bootargs = v.to_string();
         } else if a == "-p" {
             i += 1;
             let v = argv.get(i).ok_or_else(|| "-p expects a value".to_string())?;
@@ -113,7 +124,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
         mappings.push(PortMapping { proto: Proto::Udp, host: 18080, guest: 7 });
     }
 
-    Ok(Args { kernel_path, ram_mib, cpu_count, mappings })
+    Ok(Args { kernel_path, ram_mib, cpu_count, mappings, bootargs })
 }
 
 fn main() {
@@ -193,7 +204,7 @@ fn main() {
     };
 
     // Create and run the VM.
-    let mut vm = match vm::Vm::new_with_config(&parsed.kernel_path, parsed.ram_mib, parsed.cpu_count, vmnet_mac) {
+    let mut vm = match vm::Vm::new_with_config(&parsed.kernel_path, parsed.ram_mib, parsed.cpu_count, vmnet_mac, &parsed.bootargs) {
         Ok(vm) => vm,
         Err(e) => {
             terminal::restore();

@@ -202,6 +202,7 @@ impl Vm {
         ram_mib: usize,
         cpu_count: usize,
         mac: [u8; 6],
+        bootargs: &str,
     ) -> Result<Self, String> {
         let ram_size_fdt = ram_mib * 1024 * 1024;
         // Map a full 1 GB (the L1 page-table block size) regardless of
@@ -372,6 +373,7 @@ impl Vm {
                     spi: VIRTIO_CONSOLE_SPI,
                 },
             ],
+            bootargs,
         );
         let dtb_guest_addr = RAM_BASE + dtb_offset;
         unsafe {
