@@ -124,6 +124,25 @@ pub fn write_frame(ty: u64, payload: &[u8], out: &mut [u8]) -> Result<usize, Fra
     Ok(p + payload.len())
 }
 
+/// Append an H3 frame HEADER ([type-varint][length-varint]) to
+/// `out` without copying the body. Caller appends the body
+/// separately (typically `extend_from_slice`). This pairs with
+/// the `append_stream_header` pattern in uni-quic and lets the
+/// HTTP/3 server write its response directly into one buffer
+/// rather than through tmp Vecs.
+pub fn append_frame_header(
+    ty: u64,
+    body_len: usize,
+    out: &mut alloc::vec::Vec<u8>,
+) -> Result<(), FrameError> {
+    let mut tmp = [0u8; 8];
+    let n = write_varint(ty, &mut tmp)?;
+    out.extend_from_slice(&tmp[..n]);
+    let n = write_varint(body_len as u64, &mut tmp)?;
+    out.extend_from_slice(&tmp[..n]);
+    Ok(())
+}
+
 /// Convenience: write a SETTINGS frame with empty body. Used by the
 /// server's control stream — we declare nothing beyond defaults
 /// (no QPACK dynamic table, no extra capacity).

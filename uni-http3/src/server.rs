@@ -20,7 +20,6 @@
 #![allow(dead_code)]
 
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
 
 use uni_quic::{quic_listen, QuicConn, QuicListenError};
@@ -276,33 +275,35 @@ where
 }
 
 fn write_response(conn: &QuicConn, sid: u64, resp: &Response) {
-    // Build HEADERS payload via QPACK.
+    // Build response payload — HEADERS frame + optional DATA
+    // frame — into a single Vec. The DATA frame goes in via
+    // `append_frame_header` + `extend_from_slice`, no tmp
+    // buffer. The HEADERS frame still uses one scratch Vec
+    // because we need the QPACK-encoded length before we can
+    // emit the type+length header.
     let status_str = status_to_bytes(resp.status);
     let content_type = resp.content_type_bytes();
     let body = resp.body_bytes();
     let len_str = format_usize(body.len());
 
-    let headers: alloc::vec::Vec<(&[u8], &[u8])> = alloc::vec![
-        (&b":status"[..], status_str.as_slice()),
-        (&b"content-type"[..], content_type),
-        (&b"content-length"[..], len_str.as_slice()),
-    ];
-    let mut qpack_buf: Vec<u8> = Vec::with_capacity(64 + body.len() / 8);
-    qpack::encode_field_section(&headers, &mut qpack_buf);
+    let mut qpack_buf: Vec<u8> = Vec::with_capacity(128);
+    qpack::encode_field_section(
+        &[
+            (&b":status"[..], status_str.as_slice()),
+            (&b"content-type"[..], content_type),
+            (&b"content-length"[..], len_str.as_slice()),
+        ],
+        &mut qpack_buf,
+    );
 
-    // Bundle HEADERS + DATA into a single byte buffer so the
-    // stream layer ships them in as few QUIC packets as possible.
     let mut payload: Vec<u8> = Vec::with_capacity(qpack_buf.len() + body.len() + 16);
-    {
-        let mut tmp = vec![0u8; qpack_buf.len() + 8];
-        let n = frame::write_frame(h3_ftype::HEADERS, &qpack_buf, &mut tmp)
-            .expect("headers frame fits");
-        payload.extend_from_slice(&tmp[..n]);
-    }
+    frame::append_frame_header(h3_ftype::HEADERS, qpack_buf.len(), &mut payload)
+        .expect("headers frame header fits");
+    payload.extend_from_slice(&qpack_buf);
     if !body.is_empty() {
-        let mut tmp = vec![0u8; body.len() + 8];
-        let n = frame::write_frame(h3_ftype::DATA, body, &mut tmp).expect("data frame fits");
-        payload.extend_from_slice(&tmp[..n]);
+        frame::append_frame_header(h3_ftype::DATA, body.len(), &mut payload)
+            .expect("data frame header fits");
+        payload.extend_from_slice(body);
     }
 
     // One-shot send+FIN: bundles HEADERS+DATA bytes and the FIN
