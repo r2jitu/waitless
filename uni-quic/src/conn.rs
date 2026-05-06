@@ -741,7 +741,48 @@ impl Connection {
         // consuming all packets in the datagram.
         self.advance_tls(config)?;
         self.flush_outbound(config)?;
+        self.reap_finished_streams();
         Ok(())
+    }
+
+    /// Drop send/recv stream state for any stream where BOTH ends
+    /// have FIN'd and all buffers are empty. Without this, every
+    /// HTTP/3 request on a long-lived QUIC connection leaks its
+    /// stream's `Vec<u8>` buffers forever — a Chrome session that
+    /// refreshes a page repeatedly accumulates one leaked stream
+    /// per refresh, eventually exhausting the heap.
+    ///
+    /// "Both done" is locally observable: server-side `fin_sent`
+    /// AND `recv.closed` (peer's FIN was seen and the contiguous
+    /// data has been consumed). After that, RFC 9000 §3.2 / §3.3
+    /// puts the stream in Data Recvd / Data Sent and no further
+    /// activity is expected on either side. We don't keep a
+    /// "graveyard" set: a late STREAM frame for a reaped sid
+    /// would simply re-create an entry. On a healthy connection
+    /// that's not expected.
+    fn reap_finished_streams(&mut self) {
+        let candidates: Vec<u64> = self
+            .send_streams
+            .iter()
+            .filter_map(|(sid, s)| {
+                if !(s.fin_sent && s.outbound.is_empty()) {
+                    return None;
+                }
+                let recv_done = self
+                    .recv_streams
+                    .get(sid)
+                    .map_or(false, |r| r.closed && r.buffer.is_empty());
+                if recv_done {
+                    Some(*sid)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for sid in candidates {
+            self.send_streams.remove(&sid);
+            self.recv_streams.remove(&sid);
+        }
     }
 
     /// Drain one ready-to-send UDP datagram into `out`. Returns
