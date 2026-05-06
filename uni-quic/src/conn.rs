@@ -1970,8 +1970,82 @@ impl Connection {
                 self.update_rtt(latest, ack_delay);
             }
         }
+        // Loss detection — runs after each ACK in the same space.
+        // RFC 9002 §6.1: declare lost any sent packet that's both
+        //   (a) lower than `largest_acked - kPacketThreshold` (3),
+        //   AND
+        //   (b) older than the time threshold
+        //       `max(9/8 * max(SRTT, latest_rtt), kGranularity)`.
+        // Either condition alone is sufficient on its own per the
+        // RFC; we apply them as separate counters.
+        self.detect_loss(level);
         if space_now_empty {
             self.time_of_last_ack_eliciting_us[space_idx] = None;
+        }
+    }
+
+    /// Walk one space's `sent_packets` after an ACK arrives and
+    /// drop any that meet the RFC 9002 §6.1 packet- or time-threshold
+    /// loss conditions. We don't yet retransmit the frames that
+    /// were in those packets — handshake- and stream-level retx
+    /// is a follow-up that requires offset tracking through
+    /// `pop_handshake` / `SendStream::pop_chunk`. For now, drop +
+    /// counter is the contract: it gives accurate "in flight"
+    /// numbers and visibility into loss without faking recovery.
+    fn detect_loss(&mut self, level: CryptoLevel) {
+        const K_PACKET_THRESHOLD: u64 = 3;
+        const K_GRANULARITY_US: u64 = 1_000;
+        let space = match level {
+            CryptoLevel::Initial => &mut self.initial_space,
+            CryptoLevel::Handshake => &mut self.handshake_space,
+            CryptoLevel::OneRtt => &mut self.application_space,
+        };
+        let largest_acked = match space.largest_acked {
+            Some(x) => x,
+            None => return,
+        };
+        // Time threshold uses the latest_rtt and srtt we just (or
+        // previously) updated. Both `latest_rtt_us` and
+        // `smoothed_rtt_us` live on Connection, so cache before
+        // borrowing through SpaceState.
+        let max_rtt = self
+            .smoothed_rtt_us
+            .map(|s| s.max(self.latest_rtt_us.unwrap_or(0)))
+            .unwrap_or(self.latest_rtt_us.unwrap_or(0));
+        let time_threshold_us = ((max_rtt * 9) / 8).max(K_GRANULARITY_US);
+        let now = uni_tls::ticket::now_us();
+
+        // Two-pass to keep the borrow checker happy: collect lost
+        // PNs, then remove them. BTreeMap iteration is in PN
+        // order, so the threshold check is monotonic.
+        let mut lost_threshold: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+        let mut lost_time: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+        for (&pn, pkt) in space.sent_packets.iter() {
+            if pn >= largest_acked {
+                break; // PN >= largest_acked are still in-flight
+            }
+            if pn + K_PACKET_THRESHOLD <= largest_acked {
+                lost_threshold.push(pn);
+                continue;
+            }
+            if max_rtt > 0 && now.saturating_sub(pkt.time_sent_us) > time_threshold_us {
+                lost_time.push(pn);
+            }
+        }
+        let lost_threshold_n = lost_threshold.len() as u64;
+        let lost_time_n = lost_time.len() as u64;
+        for pn in lost_threshold.into_iter().chain(lost_time.into_iter()) {
+            space.sent_packets.remove(&pn);
+        }
+        if lost_threshold_n > 0 {
+            crate::diag::COUNTERS
+                .packets_lost_threshold
+                .fetch_add(lost_threshold_n, core::sync::atomic::Ordering::Relaxed);
+        }
+        if lost_time_n > 0 {
+            crate::diag::COUNTERS
+                .packets_lost_time
+                .fetch_add(lost_time_n, core::sync::atomic::Ordering::Relaxed);
         }
     }
 

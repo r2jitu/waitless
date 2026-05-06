@@ -143,6 +143,19 @@ pub struct Counters {
     /// timer. Each fire = one packet on the wire, then the conn
     /// task exits.
     pub connection_closes_emitted: AtomicU64,
+    /// One packet declared lost by the packet-threshold rule
+    /// (RFC 9002 §6.1.1: `pn < largest_acked - kPacketThreshold`).
+    /// Counter only — we don't yet retransmit the frames that
+    /// were in those packets, so on a lossy network handshakes
+    /// can stall. Sustained growth on a healthy localhost link
+    /// would point at a misordered ACK or an off-by-one in the
+    /// detection logic, not real loss.
+    pub packets_lost_threshold: AtomicU64,
+    /// One packet declared lost by the time-threshold rule
+    /// (RFC 9002 §6.1.2): older than the largest acked AND aged
+    /// past `max(9/8 * max(SRTT, latest_rtt), kGranularity)`.
+    /// Same caveat as `packets_lost_threshold` w.r.t. retx.
+    pub packets_lost_time: AtomicU64,
 }
 
 impl Counters {
@@ -173,6 +186,8 @@ impl Counters {
             zero_rtt_unresumable: AtomicU64::new(0),
             idle_timeouts: AtomicU64::new(0),
             connection_closes_emitted: AtomicU64::new(0),
+            packets_lost_threshold: AtomicU64::new(0),
+            packets_lost_time: AtomicU64::new(0),
         }
     }
 }
@@ -292,7 +307,7 @@ pub fn should_log_event() -> bool {
 
 /// Snapshot of every counter, for `/debug/quic_stats`-style dumps.
 /// Returns `(name, value)` pairs in declaration order.
-pub fn snapshot() -> [(&'static str, u64); 25] {
+pub fn snapshot() -> [(&'static str, u64); 27] {
     let c = &COUNTERS;
     [
         ("no_dcid", c.no_dcid.load(Ordering::Relaxed)),
@@ -320,6 +335,8 @@ pub fn snapshot() -> [(&'static str, u64); 25] {
         ("zero_rtt_unresumable", c.zero_rtt_unresumable.load(Ordering::Relaxed)),
         ("idle_timeouts", c.idle_timeouts.load(Ordering::Relaxed)),
         ("connection_closes_emitted", c.connection_closes_emitted.load(Ordering::Relaxed)),
+        ("packets_lost_threshold", c.packets_lost_threshold.load(Ordering::Relaxed)),
+        ("packets_lost_time", c.packets_lost_time.load(Ordering::Relaxed)),
     ]
 }
 
