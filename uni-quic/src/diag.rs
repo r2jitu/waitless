@@ -92,6 +92,11 @@ pub struct Counters {
     /// resumption support lands; `0` means clients have no path to
     /// resume.
     pub tickets_emitted: AtomicU64,
+    /// PSK in ClientHello validated successfully and resumption
+    /// went through (server skipped Cert+CV in the response). Ratio
+    /// `tickets_accepted / handshakes_completed` ≈ resumption hit
+    /// rate.
+    pub tickets_accepted: AtomicU64,
 }
 
 impl Counters {
@@ -114,6 +119,7 @@ impl Counters {
             initial_dcid_hit: AtomicU64::new(0),
             handshakes_completed: AtomicU64::new(0),
             tickets_emitted: AtomicU64::new(0),
+            tickets_accepted: AtomicU64::new(0),
         }
     }
 }
@@ -233,7 +239,7 @@ pub fn should_log_event() -> bool {
 
 /// Snapshot of every counter, for `/debug/quic_stats`-style dumps.
 /// Returns `(name, value)` pairs in declaration order.
-pub fn snapshot() -> [(&'static str, u64); 17] {
+pub fn snapshot() -> [(&'static str, u64); 18] {
     let c = &COUNTERS;
     [
         ("no_dcid", c.no_dcid.load(Ordering::Relaxed)),
@@ -253,6 +259,7 @@ pub fn snapshot() -> [(&'static str, u64); 17] {
         ("initial_dcid_hit", c.initial_dcid_hit.load(Ordering::Relaxed)),
         ("handshakes_completed", c.handshakes_completed.load(Ordering::Relaxed)),
         ("tickets_emitted", c.tickets_emitted.load(Ordering::Relaxed)),
+        ("tickets_accepted", c.tickets_accepted.load(Ordering::Relaxed)),
     ]
 }
 

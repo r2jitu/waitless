@@ -68,15 +68,17 @@ fn ticket_max_age_cycles() -> u64 {
 }
 
 /// Outcome of attempting to resume a session from a `pre_shared_key`
-/// extension.
-struct ResumeAccept {
+/// extension. Public so the QUIC handshake driver can drive the same
+/// path — both transports share `try_resume` and the resulting
+/// `KeySchedule` initialised from the recovered RMS.
+pub struct ResumeAccept {
     /// Fresh `KeySchedule` initialised via `new_with_psk` from the
     /// recovered resumption_master_secret. Replaces the default
     /// `new_without_psk` schedule on the connection.
-    schedule: KeySchedule,
+    pub schedule: KeySchedule,
     /// Index into the client's PskIdentity list — echoes back as
     /// `selected_identity` in the ServerHello pre_shared_key extension.
-    selected_identity: u16,
+    pub selected_identity: u16,
 }
 
 /// Try every PskIdentity in the order the client sent them; first
@@ -94,7 +96,7 @@ struct ResumeAccept {
 /// `Truncate(ClientHello)` — everything up to but not including the
 /// binders list — and Truncate is computed over the full handshake
 /// message, so we hash from byte 0 to `4 + binders_offset`.
-fn try_resume(
+pub fn try_resume(
     full_handshake_message: &[u8],
     psk_offer: &PskOffer<'_>,
     psk_modes: u8,

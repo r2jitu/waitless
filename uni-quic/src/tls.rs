@@ -346,8 +346,12 @@ impl QuicTls {
         let total_len = 4 + body.len();
 
         // Parse ClientHello fields we need; copy into owned
-        // locals so we can drop the borrow into rx_initial.
-        let (client_x25519_pub, sid_echo, sid_len, selected_alpn) = {
+        // locals so we can drop the borrow into rx_initial. Same
+        // scope holds the resumption attempt — `PskOffer` borrows
+        // from `body`, so the `try_resume` call must happen before
+        // the borrow expires; the returned `ResumeAccept` is
+        // owned, so it remains valid past the scope.
+        let (client_x25519_pub, sid_echo, sid_len, selected_alpn, resume_accept) = {
             let ch = ClientHello::parse(body).map_err(|e| {
                 crate::quic_drop!(unsupported_client,
                     "ClientHello::parse failed: {:?} body_len={}", e, body.len());
@@ -357,27 +361,13 @@ impl QuicTls {
             let n = ch.legacy_session_id.len();
             sid[..n].copy_from_slice(ch.legacy_session_id);
             let pk = ch.x25519_client_pub.ok_or_else(|| {
-                // Single-most-common reason a real browser CH gets
-                // rejected: only PQ key_share offered, no plain
-                // x25519 to fall back on. Surface enough to tell
-                // operators to either implement HRR or switch
-                // groups.
                 crate::quic_drop!(unsupported_client,
                     "no x25519 in ClientHello key_share (groups offered: {} key_shares: {})",
                     ch.observed_supported_group_count, ch.observed_key_share_count);
                 QuicTlsError::UnsupportedClient
             })?;
-            // Capture quic_transport_parameters into an owned Vec
-            // before dropping the borrow.
             self.client_transport_params =
                 ch.quic_transport_parameters.map(|s| s.to_vec());
-            // Pick "h3" if the client offered it; otherwise pick
-            // the first listed protocol so non-HTTP-3 clients
-            // (e.g. raw QUIC interop) still complete the handshake.
-            // RFC 7301: "If the server has no application protocol
-            // it supports, it MUST send an alert" — for now we
-            // pick whatever the client offered; refusal can be a
-            // future policy knob.
             let alpn = ch.alpn_protocol_list.and_then(|list| {
                 let mut h3 = None;
                 let mut first = None;
@@ -392,8 +382,36 @@ impl QuicTls {
                 }
                 h3.or(first)
             });
-            (pk, sid, n, alpn)
+
+            // Resumption attempt. RFC 9001 §4.5: QUIC requires
+            // psk_dhe_ke (forward-secret resumption); pure-PSK is
+            // forbidden. `try_resume` enforces that and validates
+            // the binder against `Truncate(ClientHello)`. On any
+            // failure we fall through to a fresh handshake with
+            // no observable difference to the client.
+            let resume = if let Some(psk_offer) = ch.psk.as_ref() {
+                // `try_resume` expects the FULL handshake message
+                // (4-byte header + body), which is `rx_initial[..total_len]`.
+                let full_hs = &self.rx_initial[..total_len];
+                uni_tls::handlers::try_resume(full_hs, psk_offer, ch.psk_ke_modes)
+            } else {
+                None
+            };
+            (pk, sid, n, alpn, resume)
         };
+
+        // Adopt the resumed schedule (if any) so handshake_traffic_secret
+        // derivation downstream uses the PSK-derived early secret.
+        let selected_psk_identity: Option<u16> = resume_accept.as_ref()
+            .map(|r| r.selected_identity);
+        let resumed = resume_accept.is_some();
+        if let Some(ra) = resume_accept {
+            // `ra` is moved here — capture selected_identity into a
+            // local first since we still want to log it.
+            let id = ra.selected_identity;
+            self.schedule = ra.schedule;
+            crate::quic_event!(tickets_accepted, "selected_identity={}", id);
+        }
 
         // Update transcript with the full ClientHello message,
         // then drain consumed bytes.
@@ -411,7 +429,7 @@ impl QuicTls {
             &server_random,
             &sid_echo[..sid_len],
             &server_pub,
-            None, // no PSK resumption in QUIC v1 server
+            selected_psk_identity, // Some(idx) on resumption, None on fresh
             &mut sh_body,
         )
         .ok_or(QuicTlsError::Internal)?;
@@ -472,42 +490,47 @@ impl QuicTls {
         self.transcript.update(&ee_msg[..ee_msg_len]);
         self.tx_handshake.extend_from_slice(&ee_msg[..ee_msg_len]);
 
-        // ── Certificate (Handshake-level) ───────────────────────
-        // Heap-allocate scratch buffers since cert can be ~2KB.
-        let mut cert_body = alloc::vec![0u8; 2048];
-        let cert_body_len =
-            build_certificate(config.cert_der, &mut cert_body).ok_or(QuicTlsError::Internal)?;
-        let mut cert_msg = alloc::vec![0u8; 2100];
-        let cert_msg_len = encode_handshake(
-            msg_type::CERTIFICATE,
-            &cert_body[..cert_body_len],
-            &mut cert_msg,
-        )
-        .ok_or(QuicTlsError::Internal)?;
-        self.transcript.update(&cert_msg[..cert_msg_len]);
-        self.tx_handshake
-            .extend_from_slice(&cert_msg[..cert_msg_len]);
-
-        // ── CertificateVerify ───────────────────────────────────
-        let transcript_hash = self.transcript.snapshot();
-        let mut sign_content = [0u8; 130];
-        sign_content_server_cert_verify(&transcript_hash, &mut sign_content);
-        let signature: EcdsaSignature = config.signing_key.sign(&sign_content);
-        let der_sig = signature.to_der();
-        let signature_bytes: &[u8] = der_sig.as_bytes();
-
-        let mut cv_body = [0u8; 128];
-        let cv_body_len = build_certificate_verify(signature_bytes, &mut cv_body)
+        // ── Certificate + CertificateVerify (skipped on resume) ──
+        // RFC 8446 §4.4.1: when the handshake is resumed via PSK,
+        // the server omits Certificate and CertificateVerify — the
+        // client already authenticated the server in the original
+        // connection that issued the ticket. Skipping these saves
+        // ~1 KB of handshake bytes and the ECDSA signing cost
+        // (the slowest server-side step in our profile).
+        if !resumed {
+            let mut cert_body = alloc::vec![0u8; 2048];
+            let cert_body_len = build_certificate(config.cert_der, &mut cert_body)
+                .ok_or(QuicTlsError::Internal)?;
+            let mut cert_msg = alloc::vec![0u8; 2100];
+            let cert_msg_len = encode_handshake(
+                msg_type::CERTIFICATE,
+                &cert_body[..cert_body_len],
+                &mut cert_msg,
+            )
             .ok_or(QuicTlsError::Internal)?;
-        let mut cv_msg = [0u8; 150];
-        let cv_msg_len = encode_handshake(
-            msg_type::CERTIFICATE_VERIFY,
-            &cv_body[..cv_body_len],
-            &mut cv_msg,
-        )
-        .ok_or(QuicTlsError::Internal)?;
-        self.transcript.update(&cv_msg[..cv_msg_len]);
-        self.tx_handshake.extend_from_slice(&cv_msg[..cv_msg_len]);
+            self.transcript.update(&cert_msg[..cert_msg_len]);
+            self.tx_handshake.extend_from_slice(&cert_msg[..cert_msg_len]);
+
+            let transcript_hash = self.transcript.snapshot();
+            let mut sign_content = [0u8; 130];
+            sign_content_server_cert_verify(&transcript_hash, &mut sign_content);
+            let signature: EcdsaSignature = config.signing_key.sign(&sign_content);
+            let der_sig = signature.to_der();
+            let signature_bytes: &[u8] = der_sig.as_bytes();
+
+            let mut cv_body = [0u8; 128];
+            let cv_body_len = build_certificate_verify(signature_bytes, &mut cv_body)
+                .ok_or(QuicTlsError::Internal)?;
+            let mut cv_msg = [0u8; 150];
+            let cv_msg_len = encode_handshake(
+                msg_type::CERTIFICATE_VERIFY,
+                &cv_body[..cv_body_len],
+                &mut cv_msg,
+            )
+            .ok_or(QuicTlsError::Internal)?;
+            self.transcript.update(&cv_msg[..cv_msg_len]);
+            self.tx_handshake.extend_from_slice(&cv_msg[..cv_msg_len]);
+        }
 
         // ── Server Finished ─────────────────────────────────────
         let server_hs = &self
