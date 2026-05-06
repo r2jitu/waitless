@@ -49,7 +49,7 @@ use crate::crypto::{
     hp_mask_aes128, hp_mask_chacha20, next_traffic_secret, packet_nonce, AES_KEY_LEN,
     CHACHA_KEY_LEN, HP_MASK_LEN, HP_SAMPLE_LEN, NONCE_LEN, TAG_LEN,
 };
-use crate::frame::{parse_frame, write_ack, write_crypto, write_handshake_done, Frame};
+use crate::frame::{parse_frame, write_ack, write_crypto, Frame};
 use crate::wire::{
     decode_packet_number, long_packet_type, parse_initial_header, parse_long_header_preamble,
     read_varint, write_varint, FIXED_BIT, HEADER_FORM_LONG, QUIC_VERSION_1,
@@ -520,12 +520,6 @@ pub struct Connection {
     /// datagram-Vec allocs hit the hot path.
     outbound_pool: Vec<Vec<u8>>,
 
-    /// Per-conn scratch for the per-packet `frames` buffer.
-    /// `encode_*_packet` clear()s it on entry — capacity stays,
-    /// no realloc — instead of allocating a fresh Vec per packet.
-    /// On the hot path of a multi-packet response that's one
-    /// fewer alloc per packet (×6+ for a typical 6 KiB page).
-    scratch_frames: Vec<u8>,
 
     /// Per-stream receive state, keyed by stream ID. Lazily
     /// inserted on the first STREAM frame.
@@ -600,7 +594,6 @@ impl Connection {
             one_rtt_crypto_offset: 0,
             outbound: alloc::collections::VecDeque::new(),
             outbound_pool: Vec::new(),
-            scratch_frames: Vec::with_capacity(1500),
             recv_streams: alloc::collections::BTreeMap::new(),
             send_streams: alloc::collections::BTreeMap::new(),
             opened_streams: Vec::new(),
@@ -2049,8 +2042,16 @@ impl Connection {
 
     /// Build a single 1-RTT packet that bundles the currently-due
     /// frames: ACK (if pending), HANDSHAKE_DONE (if not yet sent),
+    /// MAX_STREAMS replenishment, post-handshake CRYPTO frames,
     /// and as many STREAM-frame chunks as fit before the per-packet
-    /// budget. Skips emission entirely if no frames are due.
+    /// budget.
+    ///
+    /// Writes every frame directly into `out` (the datagram Vec),
+    /// no intermediate scratch Vec. The header is laid down first
+    /// (short-header is fixed-size for our 8-byte DCID), frames
+    /// follow, AEAD seals in place. Saves one full memcpy of the
+    /// packet body per emitted packet vs. the old "build frames in
+    /// scratch, then extend_from_slice into datagram" path.
     fn encode_one_rtt_packet(&mut self, out: &mut Vec<u8>) -> Result<(), ConnError> {
         // Per-packet body budget. Leaves headroom for short-header
         // (1+CID+pn=13) + tag (16) under MTU 1200; STREAM frame
@@ -2062,40 +2063,37 @@ impl Connection {
             None => return Ok(()),
         };
 
-        // Collect frames into the per-conn scratch buffer (taken
-        // out and put back via core::mem::take so methods on
-        // `self` remain callable while we mutate frames). After
-        // the first packet on this conn, the Vec's capacity is
-        // already sized — no realloc per packet.
-        let mut frames = core::mem::take(&mut self.scratch_frames);
-        frames.clear();
+        // ── Header ───────────────────────────────────────────────
+        // Lay down the short-header bytes first so frames write
+        // directly into the datagram payload region. We rollback
+        // via `out.truncate(header_start)` if no frames are due.
+        let pn_length: usize = 4;
+        let header_start = out.len();
+        let first_byte: u8 = FIXED_BIT | ((pn_length as u8) - 1);
+        out.push(first_byte);
+        out.extend_from_slice(self.peer_cid.as_slice());
+        let pn_offset = out.len();
+        // PN bytes — placeholder; we patch in the real pn after
+        // we've decided to emit (so we don't burn a PN on rollback).
+        out.extend_from_slice(&[0u8; 4]);
+        let payload_offset = out.len();
+
         // Tracks whether the packet contains any non-ACK frame.
-        // RFC 9002 §3: a packet is ack-eliciting iff it carries a
-        // frame other than ACK / PADDING / CONNECTION_CLOSE.
+        // RFC 9002 §3: ack-eliciting iff carries a frame other than
+        // ACK / PADDING / CONNECTION_CLOSE.
         let mut ack_eliciting = false;
 
         if self.application_space.ack_pending {
-            self.append_ack_frame(&mut frames, &self.application_space);
+            self.append_ack_frame(out, &self.application_space);
             self.application_space.ack_pending = false;
         }
         if !self.handshake_done_sent {
-            let mut tmp = [0u8; 4];
-            let n = write_handshake_done(&mut tmp).map_err(|_| ConnError::Wire)?;
-            frames.extend_from_slice(&tmp[..n]);
+            out.push(crate::frame::ftype::HANDSHAKE_DONE);
             self.handshake_done_sent = true;
             ack_eliciting = true;
         }
 
         // MAX_STREAMS replenishment (RFC 9000 §4.6 / §19.11).
-        // When the peer's used-stream count gets within
-        // STREAM_CREDIT_REFILL_AT of the cap we previously
-        // advertised, raise the cap by STREAM_CREDIT_WINDOW and
-        // tell the peer about it via MAX_STREAMS_BIDI / _UNI.
-        // Without this, a long-lived browser conn that keeps
-        // refreshing eventually exhausts its initial credit, and
-        // Chrome's QUIC stack silently refuses to open new
-        // streams — the request never reaches our server and
-        // the user sees a permanent stall.
         const STREAM_CREDIT_REFILL_AT: u64 = 256;
         const STREAM_CREDIT_WINDOW: u64 = 1024;
         if self.peer_max_streams_bidi_advertised
@@ -2103,13 +2101,12 @@ impl Connection {
         {
             self.peer_max_streams_bidi_advertised =
                 self.peer_bidi_streams_opened + STREAM_CREDIT_WINDOW;
-            let mut tmp = [0u8; 16];
-            let n = crate::frame::write_max_streams_bidi(
+            append_max_streams_into(
+                out,
                 self.peer_max_streams_bidi_advertised,
-                &mut tmp,
+                /* uni= */ false,
             )
             .map_err(|_| ConnError::Wire)?;
-            frames.extend_from_slice(&tmp[..n]);
             ack_eliciting = true;
         }
         if self.peer_max_streams_uni_advertised
@@ -2117,38 +2114,30 @@ impl Connection {
         {
             self.peer_max_streams_uni_advertised =
                 self.peer_uni_streams_opened + STREAM_CREDIT_WINDOW;
-            let mut tmp = [0u8; 16];
-            let n = crate::frame::write_max_streams_uni(
+            append_max_streams_into(
+                out,
                 self.peer_max_streams_uni_advertised,
-                &mut tmp,
+                /* uni= */ true,
             )
             .map_err(|_| ConnError::Wire)?;
-            frames.extend_from_slice(&tmp[..n]);
             ack_eliciting = true;
         }
 
         // Drain any 1-RTT-level handshake bytes (NewSessionTicket
         // emitted right after ClientFinished verifies; future
-        // KeyUpdate / NewToken). Wrap as a CRYPTO frame at offset 0
-        // — this is the OneRtt CRYPTO stream, distinct from
-        // Initial/Handshake. Each ticket adds ~150 bytes; the
-        // budget check after pop_handshake guards against an
-        // unbounded queue.
+        // KeyUpdate / NewToken).
         let mut one_rtt_crypto = [0u8; 1024];
         let crypto_n = self
             .tls
             .pop_handshake(CryptoLevel::OneRtt, &mut one_rtt_crypto);
         if crypto_n > 0 {
-            // Write the CRYPTO frame directly into `frames`
-            // instead of into a tmp Vec + extend_from_slice. Saves
-            // one alloc per emitted ticket.
             let offset = self.one_rtt_crypto_offset;
             let max_size = crypto_n + 16;
-            let start = frames.len();
-            frames.resize(start + max_size, 0);
-            let n = write_crypto(offset, &one_rtt_crypto[..crypto_n], &mut frames[start..])
+            let start = out.len();
+            out.resize(start + max_size, 0);
+            let n = write_crypto(offset, &one_rtt_crypto[..crypto_n], &mut out[start..])
                 .map_err(|_| ConnError::Wire)?;
-            frames.truncate(start + n);
+            out.truncate(start + n);
             self.one_rtt_crypto_offset += crypto_n as u64;
             ack_eliciting = true;
             crate::quic_event!(tickets_emitted,
@@ -2156,17 +2145,14 @@ impl Connection {
                 crate::endpoint::hex8(self.local_cid.as_slice()));
         }
 
-        // Drain pending STREAM data. Round-robin across streams
-        // — each stream can contribute one chunk per packet so a
-        // single greedy stream doesn't starve siblings during burst
-        // workloads. (For HTTP/3 there's typically only one active
-        // request stream at a time anyway.)
+        // Drain pending STREAM data, directly into `out`.
         let stream_ids: Vec<u64> = self.send_streams.keys().copied().collect();
         for sid in stream_ids {
-            if frames.len() >= PACKET_BODY_BUDGET {
+            let body_so_far = out.len() - payload_offset;
+            if body_so_far >= PACKET_BODY_BUDGET {
                 break;
             }
-            let max_chunk = PACKET_BODY_BUDGET.saturating_sub(frames.len() + 16); // varint headroom
+            let max_chunk = PACKET_BODY_BUDGET.saturating_sub(body_so_far + 16);
             if max_chunk == 0 {
                 break;
             }
@@ -2174,41 +2160,28 @@ impl Connection {
                 Some(s) => s,
                 None => continue,
             };
-            // pop_chunk_into writes the STREAM frame (header +
-            // body + FIN bit) directly into `frames`, eliminating
-            // both the intermediate `chunk: Vec<u8>` from the
-            // old pop_chunk return AND the per-frame `tmp`
-            // allocation. One fewer alloc per stream chunk per
-            // 1-RTT packet.
-            if s.pop_chunk_into(sid, max_chunk, &mut frames)
+            if s.pop_chunk_into(sid, max_chunk, out)
                 .map_err(|_| ConnError::Wire)?
             {
                 ack_eliciting = true;
             }
         }
 
-        if frames.is_empty() {
-            // No frames produced; restore the scratch and return.
-            self.scratch_frames = frames;
+        let body_len = out.len() - payload_offset;
+        if body_len == 0 {
+            // No frames produced; rollback the header so the
+            // caller's `out.is_empty()` check sees nothing.
+            out.truncate(header_start);
             return Ok(());
         }
 
+        // Commit the PN now that we know we're emitting.
         let pn = self.application_space.next_send_pn;
         self.application_space.next_send_pn += 1;
+        out[pn_offset..pn_offset + 4].copy_from_slice(&(pn as u32).to_be_bytes());
 
-        let pn_length: usize = 4;
-        let header_start = out.len();
-        // Short-header first byte: form=0 fixed=1 spin=0 reserved=00
-        // key-phase=0 pn_length-1 in low 2 bits.
-        let first_byte: u8 = FIXED_BIT | ((pn_length as u8) - 1);
-        out.push(first_byte);
-        out.extend_from_slice(self.peer_cid.as_slice());
-        let pn_offset = out.len();
-        out.extend_from_slice(&(pn as u32).to_be_bytes());
-        let payload_offset = out.len();
-        out.extend_from_slice(&frames);
-        // Pad to ensure HP sample (4 bytes after PN start) has 16
-        // bytes of ciphertext after AEAD seal.
+        // Pad to ensure HP sample (4 bytes after PN start) has
+        // 16 bytes of ciphertext after AEAD seal.
         while out.len() - pn_offset < 4 + HP_SAMPLE_LEN {
             out.push(0); // PADDING frame
         }
@@ -2229,9 +2202,6 @@ impl Connection {
             false,
         )?;
         self.record_sent_packet(CryptoLevel::OneRtt, pn, ack_eliciting, byte_count);
-        // Return the (possibly grown) scratch Vec to the conn
-        // so the next encode_one_rtt_packet reuses its capacity.
-        self.scratch_frames = frames;
         Ok(())
     }
 
@@ -2754,6 +2724,24 @@ impl Connection {
             frames.extend_from_slice(&tmp[..n]);
         }
     }
+}
+
+/// Append a MAX_STREAMS frame to `out` directly. Wraps the
+/// stack-buffer-then-extend pattern so the caller doesn't have
+/// to thread a tmp buffer in.
+fn append_max_streams_into(
+    out: &mut Vec<u8>,
+    max: u64,
+    uni: bool,
+) -> Result<(), crate::frame::FrameError> {
+    let mut tmp = [0u8; 16];
+    let n = if uni {
+        crate::frame::write_max_streams_uni(max, &mut tmp)?
+    } else {
+        crate::frame::write_max_streams_bidi(max, &mut tmp)?
+    };
+    out.extend_from_slice(&tmp[..n]);
+    Ok(())
 }
 
 // ============================================================================
