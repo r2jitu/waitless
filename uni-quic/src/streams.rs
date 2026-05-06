@@ -283,25 +283,52 @@ pub enum SendState {
     FinSent,
 }
 
+/// One entry in a SendStream's outbound chunk chain. Holds
+/// either an owned `Vec<u8>` (Cow::Owned) or a borrowed
+/// `&'static [u8]` (Cow::Borrowed). The static variant lets
+/// `&'static` response bodies (e.g. `b"healthy"`) thread all
+/// the way to the wire without allocating — the SendStream
+/// just keeps the slice reference, and `pop_chunk_into` copies
+/// the relevant bytes into the datagram payload region.
+///
+/// `consumed` tracks how many bytes have been emitted from the
+/// front in prior pop_chunk_into calls. Once `consumed == bytes.len()`
+/// the chunk is fully drained and pop_front'd.
+pub struct SendChunk {
+    bytes: alloc::borrow::Cow<'static, [u8]>,
+    consumed: usize,
+}
+
+impl SendChunk {
+    pub fn from_owned(v: Vec<u8>) -> Self {
+        SendChunk { bytes: alloc::borrow::Cow::Owned(v), consumed: 0 }
+    }
+    pub fn from_static(s: &'static [u8]) -> Self {
+        SendChunk { bytes: alloc::borrow::Cow::Borrowed(s), consumed: 0 }
+    }
+    fn remaining(&self) -> &[u8] {
+        &self.bytes[self.consumed..]
+    }
+}
+
 /// Per-stream send state. The connection layer drives
 /// `pop_chunk` on each outbound 1-RTT packet build.
 ///
-/// Outbound bytes are held as a chain of owned chunks
-/// (`VecDeque<Vec<u8>>`) rather than a single contiguous buffer.
-/// This lets `write_owned` accept a `Vec<u8>` by move — zero-copy
-/// from the H3 layer's payload buffer into the stream — and lets
-/// the legacy `write(&[u8])` path push one chunk per call without
-/// the `extend_from_slice` merge that would otherwise impose a
-/// memcpy of the entire buffer on every additional write.
+/// Outbound bytes are held as a chain of `SendChunk`s — each is
+/// either owned or borrowed-static — rather than a single
+/// contiguous buffer. This lets `write_owned`/`write_static`
+/// accept their inputs without copying, and the legacy
+/// `write(&[u8])` path pushes one fresh-Vec chunk per call
+/// without the extend_from_slice merge that would otherwise
+/// impose a memcpy of the entire buffer on every additional
+/// write.
 ///
 /// `pop_chunk_into` walks the head chunk, slicing as much as the
-/// per-packet budget permits; once the head is drained empty
+/// per-packet budget permits; once the head is fully consumed
 /// `pop_front` advances to the next chunk.
 pub struct SendStream {
-    /// Owned chunks waiting to ship, FIFO. Each chunk is a
-    /// contiguous `Vec<u8>`; chunks are NOT merged across writes.
-    /// Empty Vecs are not pushed (writers skip the no-op).
-    pub outbound: alloc::collections::VecDeque<Vec<u8>>,
+    /// Outbound chunks, FIFO. Empty payloads are not pushed.
+    pub outbound: alloc::collections::VecDeque<SendChunk>,
     /// Offset of the next byte to send. Increments by chunk size
     /// per `pop_chunk` call.
     pub send_offset: u64,
@@ -328,26 +355,34 @@ impl SendStream {
     }
 
     /// Append a borrowed slice. Allocates one Vec to hold the
-    /// copy; subsequent `write` calls do NOT merge with prior
-    /// chunks (a deliberate choice — merging would impose a
-    /// large memcpy on every additional write).
+    /// copy. For zero-copy paths use `write_owned` (Vec by
+    /// move) or `write_static` (`&'static [u8]` by reference).
     pub fn write(&mut self, data: &[u8]) {
         if matches!(self.state, SendState::FinSent) || data.is_empty() {
             return;
         }
-        self.outbound.push_back(data.to_vec());
+        self.outbound.push_back(SendChunk::from_owned(data.to_vec()));
     }
 
     /// Append an owned `Vec<u8>` by move — no copy. Use this
     /// for buffers the caller has already built (e.g. an H3
-    /// response payload). Subsequent `pop_chunk_into` calls
-    /// drain bytes straight from this Vec into the datagram
-    /// without an intermediate copy.
+    /// response framing block).
     pub fn write_owned(&mut self, data: Vec<u8>) {
         if matches!(self.state, SendState::FinSent) || data.is_empty() {
             return;
         }
-        self.outbound.push_back(data);
+        self.outbound.push_back(SendChunk::from_owned(data));
+    }
+
+    /// Append a `&'static` slice by reference — zero copy AND
+    /// zero alloc. Use for static response bodies
+    /// (`b"healthy"`-style) that already live in the program's
+    /// read-only data segment.
+    pub fn write_static(&mut self, data: &'static [u8]) {
+        if matches!(self.state, SendState::FinSent) || data.is_empty() {
+            return;
+        }
+        self.outbound.push_back(SendChunk::from_static(data));
     }
 
     pub fn close(&mut self) {
@@ -365,11 +400,10 @@ impl SendStream {
     }
 
     /// Pop up to `max_bytes` from the front of the chunk chain.
-    /// Returns `(offset, data, fin)`. The returned `data` Vec is
-    /// the front chunk if it fits entirely, else a fresh Vec
-    /// holding the prefix. Kept for back-compat with callers
-    /// that still want an owned chunk; the hot path uses
-    /// `pop_chunk_into` to write directly into the datagram.
+    /// Returns `(offset, data, fin)`. The hot path uses
+    /// `pop_chunk_into`; this exists for callers that still
+    /// want an owned chunk (and accept a memcpy from
+    /// borrowed-static chunks).
     pub fn pop_chunk(&mut self, max_bytes: usize) -> Option<(u64, Vec<u8>, bool)> {
         match self.state {
             SendState::FinSent => return None,
@@ -382,16 +416,18 @@ impl SendStream {
             self.state = SendState::FinSent;
             return Some((offset, Vec::new(), true));
         }
-        let head = self.outbound.front_mut().unwrap();
-        let chunk: Vec<u8> = if head.len() <= max_bytes {
-            // Take the whole head Vec by move — no alloc.
-            self.outbound.pop_front().unwrap()
-        } else {
-            // Slice off the prefix; leaves remainder in head.
-            let prefix: Vec<u8> = head.drain(..max_bytes).collect();
-            prefix
+        let head_remaining = self.outbound.front().unwrap().remaining().len();
+        let n = head_remaining.min(max_bytes);
+        let chunk: Vec<u8> = {
+            let head = self.outbound.front_mut().unwrap();
+            head.remaining()[..n].to_vec()
         };
-        let n = chunk.len();
+        // Advance head consumed; pop_front when fully drained.
+        let head = self.outbound.front_mut().unwrap();
+        head.consumed += n;
+        if head.consumed == head.bytes.len() {
+            self.outbound.pop_front();
+        }
         self.send_offset += n as u64;
         let fin = matches!(self.state, SendState::Closing) && self.outbound.is_empty();
         if fin {
@@ -424,25 +460,21 @@ impl SendStream {
             return Ok(true);
         }
 
-        // Slice the head chunk to fit the budget.
-        let head_len = self.outbound.front().map(|h| h.len()).unwrap_or(0);
-        let n = head_len.min(max_bytes);
+        let head_remaining = self.outbound.front().unwrap().remaining().len();
+        let n = head_remaining.min(max_bytes);
         // FIN-on-this-frame iff: closing AND this drain empties
         // the entire chain (current chunk fully consumed AND no
         // chunks behind it).
         let fin = matches!(self.state, SendState::Closing)
-            && n == head_len
+            && n == head_remaining
             && self.outbound.len() == 1;
 
         crate::frame::append_stream_header(stream_id, offset, fin, n, frames_out)?;
-        // Body: copy from head chunk into frames_out. No
-        // intermediate Vec.
         let head = self.outbound.front_mut().unwrap();
-        frames_out.extend_from_slice(&head[..n]);
-        if n == head_len {
+        frames_out.extend_from_slice(&head.remaining()[..n]);
+        head.consumed += n;
+        if head.consumed == head.bytes.len() {
             self.outbound.pop_front();
-        } else {
-            head.drain(..n);
         }
         self.send_offset += n as u64;
         if fin {
