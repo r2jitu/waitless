@@ -233,6 +233,76 @@ struct SpaceState {
     /// Whether we owe the peer an ACK that hasn't been bundled
     /// into an outbound packet yet.
     ack_pending: bool,
+    /// Largest packet number the peer has acknowledged in this
+    /// space. `None` until the first ACK arrives. Used by RFC 9002
+    /// loss detection to compute the packet-threshold cutoff.
+    largest_acked: Option<u64>,
+    /// Per-packet send records, keyed by packet number, for every
+    /// outbound packet that hasn't been ACKed or declared lost yet.
+    /// RFC 9002 §A.1 names this `sent_packets`. Removed on ACK;
+    /// walked by loss detection to find packets that fell behind
+    /// `largest_acked - kPacketThreshold`.
+    sent_packets: alloc::collections::BTreeMap<u64, SentPacket>,
+}
+
+/// One in-flight send. Stored per-PN per-space until the peer
+/// acknowledges or loss detection declares it lost. RFC 9002 §A.1
+/// calls this `SentPacketInfo`. We track only the metadata that
+/// matters to current loss detection / RTT estimation; frame
+/// retransmission state lives on the streams + handshake queues.
+#[derive(Clone, Debug)]
+struct SentPacket {
+    /// Microseconds-since-boot when we sealed and queued this packet.
+    /// `now() - time_sent_us` on ACK = RTT sample (RFC 9002 §5.1).
+    time_sent_us: u64,
+    /// `true` if the packet contains any frame other than ACK / PADDING /
+    /// CONNECTION_CLOSE — i.e. one the peer must acknowledge. Non-
+    /// eliciting packets are not subject to PTO and are not RTT
+    /// samples even when later "acknowledged" implicitly.
+    ack_eliciting: bool,
+    /// `true` if the packet counts against congestion-control bytes-
+    /// in-flight. RFC 9002 §2: a packet is in flight iff it's ack-
+    /// eliciting, or contains PADDING. We piggyback on `ack_eliciting`
+    /// for the simple cases — both flags currently coincide for our
+    /// stack (we don't pad-only) but keep them split for clarity and
+    /// to ease future congestion-control work.
+    in_flight: bool,
+    /// On-the-wire byte count of the sealed packet. Drives bytes-
+    /// in-flight; not used yet but recorded for the eventual
+    /// congestion controller.
+    byte_count: u32,
+}
+
+/// Pop every PN in `[low, high]` (inclusive) from `sent_packets`,
+/// stashing the entry whose PN equals `target_pn` (the ACK's
+/// `largest_acknowledged`) into `largest_out` so the caller can use
+/// it for an RTT sample. Inclusive both ends; safe when the range
+/// is sparse (most PNs have already been removed by previous ACKs).
+fn ack_remove_range(
+    space: &mut SpaceState,
+    low: u64,
+    high: u64,
+    target_pn: u64,
+    largest_out: &mut Option<SentPacket>,
+) {
+    if low > high {
+        return;
+    }
+    // Drain via BTreeMap::remove since the range is typically
+    // tight (a few packets at a time); for large ranges the
+    // explicit loop is still O((high-low) * log n) which is fine.
+    let mut pn = high;
+    loop {
+        if let Some(pkt) = space.sent_packets.remove(&pn) {
+            if pn == target_pn {
+                *largest_out = Some(pkt);
+            }
+        }
+        if pn == low {
+            break;
+        }
+        pn = pn.wrapping_sub(1);
+    }
 }
 
 // ============================================================================
@@ -327,6 +397,33 @@ pub struct Connection {
     /// Whether we've already emitted HANDSHAKE_DONE in 1-RTT.
     handshake_done_sent: bool,
 
+    // ── RTT estimator (RFC 9002 §5) ───────────────────────────────
+    //
+    // All in microseconds. Updated each time an ACK arrives that
+    // names a previously-sent ack-eliciting packet from any space.
+    // We use `latest_rtt - peer_ack_delay` (clamped to non-negative)
+    // as the per-sample input to the SRTT/RTTvar EWMA. A `None`
+    // `smoothed_rtt_us` means we haven't received the first sample
+    // yet; PTO falls back to `kInitialRtt = 333_000` until then
+    // (RFC 9002 §6.2.2).
+    /// Most recent RTT sample (`now - time_sent`).
+    latest_rtt_us: Option<u64>,
+    /// Smallest RTT sample observed so far. Used to clamp
+    /// `peer_ack_delay` when we apply it (RFC 9002 §5.2).
+    min_rtt_us: Option<u64>,
+    /// Smoothed RTT estimate. EWMA: `7/8 * SRTT + 1/8 * latest`.
+    smoothed_rtt_us: Option<u64>,
+    /// RTT variation. EWMA: `3/4 * RTTvar + 1/4 * |SRTT - latest|`.
+    rttvar_us: u64,
+    /// Per-space `time_of_last_ack_eliciting_packet_sent`. Indexed
+    /// 0=Initial 1=Handshake 2=Application; `None` until we've sent
+    /// an ack-eliciting packet in that space. Anchor for the PTO
+    /// timer once it's wired up — the PTO deadline is
+    /// `last_sent + pto_period`. Tracked here (rather than in
+    /// SpaceState) so `pto_deadline_us` can fold across all three
+    /// spaces with a single borrow.
+    time_of_last_ack_eliciting_us: [Option<u64>; 3],
+
     /// Microseconds since boot when this conn last accepted ANY
     /// inbound datagram. Bumped at the end of `process_datagram`
     /// for any datagram that didn't error all the way out. The
@@ -412,6 +509,11 @@ impl Connection {
             application_space: SpaceState::default(),
             tls: QuicTls::new(seed),
             handshake_done_sent: false,
+            latest_rtt_us: None,
+            min_rtt_us: None,
+            smoothed_rtt_us: None,
+            rttvar_us: 0,
+            time_of_last_ack_eliciting_us: [None; 3],
             last_recv_us: 0,
             close_pending: None,
             one_rtt_crypto_offset: 0,
@@ -1168,10 +1270,20 @@ impl Connection {
                 Frame::Crypto { offset, data } => {
                     self.tls.push_handshake(level, offset, data);
                 }
-                Frame::Ack { .. } => {
-                    // We don't track outbound packets in flight
-                    // yet; ACKs are ignored on the receive side
-                    // (no retransmission triggered by us).
+                Frame::Ack {
+                    largest_acknowledged,
+                    ack_delay,
+                    first_ack_range,
+                    ack_ranges,
+                    ..
+                } => {
+                    self.process_ack(
+                        level,
+                        largest_acknowledged,
+                        ack_delay,
+                        first_ack_range,
+                        ack_ranges,
+                    );
                 }
                 Frame::ConnectionCloseTransport { .. }
                 | Frame::ConnectionCloseApplication { .. } => {
@@ -1427,7 +1539,11 @@ impl Connection {
         out.extend_from_slice(&[0u8; TAG_LEN]); // tag placeholder
         let total_end = out.len();
 
-        self.seal_packet(out, header_start, pn_offset, payload_offset, payload_len, total_end, pn, &send_keys, true)
+        let ack_eliciting = !crypto_bytes.is_empty();
+        let byte_count = (total_end - header_start) as u32;
+        self.seal_packet(out, header_start, pn_offset, payload_offset, payload_len, total_end, pn, &send_keys, true)?;
+        self.record_sent_packet(CryptoLevel::Initial, pn, ack_eliciting, byte_count);
+        Ok(())
     }
 
     fn encode_handshake_packet(
@@ -1476,7 +1592,11 @@ impl Connection {
         out.extend_from_slice(&[0u8; TAG_LEN]);
         let total_end = out.len();
 
-        self.seal_packet(out, header_start, pn_offset, payload_offset, payload_len, total_end, pn, &send_keys, true)
+        let ack_eliciting = !crypto_bytes.is_empty();
+        let byte_count = (total_end - header_start) as u32;
+        self.seal_packet(out, header_start, pn_offset, payload_offset, payload_len, total_end, pn, &send_keys, true)?;
+        self.record_sent_packet(CryptoLevel::Handshake, pn, ack_eliciting, byte_count);
+        Ok(())
     }
 
     /// Build a single 1-RTT packet that bundles the currently-due
@@ -1496,6 +1616,10 @@ impl Connection {
 
         // Collect frames into a scratch buffer.
         let mut frames: Vec<u8> = Vec::with_capacity(PACKET_BODY_BUDGET);
+        // Tracks whether the packet contains any non-ACK frame.
+        // RFC 9002 §3: a packet is ack-eliciting iff it carries a
+        // frame other than ACK / PADDING / CONNECTION_CLOSE.
+        let mut ack_eliciting = false;
 
         if self.application_space.ack_pending {
             self.append_ack_frame(&mut frames, &self.application_space);
@@ -1506,6 +1630,7 @@ impl Connection {
             let n = write_handshake_done(&mut tmp).map_err(|_| ConnError::Wire)?;
             frames.extend_from_slice(&tmp[..n]);
             self.handshake_done_sent = true;
+            ack_eliciting = true;
         }
 
         // Drain any 1-RTT-level handshake bytes (NewSessionTicket
@@ -1529,6 +1654,7 @@ impl Connection {
                 .map_err(|_| ConnError::Wire)?;
             frames.extend_from_slice(&tmp[..n]);
             self.one_rtt_crypto_offset += crypto_n as u64;
+            ack_eliciting = true;
             crate::quic_event!(tickets_emitted,
                 "size={} local_cid={}", crypto_n,
                 crate::endpoint::hex8(self.local_cid.as_slice()));
@@ -1557,6 +1683,7 @@ impl Connection {
                 let n = crate::frame::write_stream(sid, offset, fin, &chunk, &mut tmp)
                     .map_err(|_| ConnError::Wire)?;
                 frames.extend_from_slice(&tmp[..n]);
+                ack_eliciting = true;
             }
         }
 
@@ -1587,6 +1714,7 @@ impl Connection {
         out.extend_from_slice(&[0u8; TAG_LEN]);
         let total_end = out.len();
 
+        let byte_count = (total_end - header_start) as u32;
         self.seal_packet(
             out,
             header_start,
@@ -1597,7 +1725,9 @@ impl Connection {
             pn,
             &send_keys,
             false,
-        )
+        )?;
+        self.record_sent_packet(CryptoLevel::OneRtt, pn, ack_eliciting, byte_count);
+        Ok(())
     }
 
     /// Build and seal a single packet carrying just a
@@ -1757,6 +1887,158 @@ impl Connection {
         let (head, rest) = out.split_at_mut(pn_offset);
         apply_hp_mask(&mut head[header_start], &mut rest[..pn_length], &mask, is_long);
         Ok(())
+    }
+
+    /// Walk the ACK ranges from an inbound ACK frame and:
+    ///   1. drop matching entries from the matching space's
+    ///      `sent_packets` map,
+    ///   2. update `largest_acked`,
+    ///   3. take an RTT sample from the largest newly-acked
+    ///      ack-eliciting packet (RFC 9002 §5.1).
+    /// `ack_delay` is the peer's reported delay before generating
+    /// the ACK, in microseconds (already scaled by their
+    /// ack_delay_exponent on the wire — we treat the value as μs
+    /// for the simple case where both ends use the default
+    /// exponent of 3 → 8 μs units; close enough for now).
+    fn process_ack(
+        &mut self,
+        level: CryptoLevel,
+        largest_acknowledged: u64,
+        ack_delay: u64,
+        first_ack_range: u64,
+        ack_ranges: crate::frame::AckRanges<'_>,
+    ) {
+        let space_idx = match level {
+            CryptoLevel::Initial => 0usize,
+            CryptoLevel::Handshake => 1,
+            CryptoLevel::OneRtt => 2,
+        };
+
+        // Walk all ranges removing newly-acked PNs from sent_packets.
+        // RFC 9000 §19.3.1: the first range covers
+        // `[largest - first_ack_range, largest]`. Each subsequent
+        // `(gap, length)` pair encodes one more range, with
+        // `next_largest = prev_smallest - gap - 2` and
+        // `next_smallest = next_largest - length`.
+        //
+        // We capture the SentPacket for `largest_acknowledged`
+        // specifically, since RFC 9002 §5.1 requires the RTT
+        // sample to come from THAT packet (only).
+        let mut largest_pkt: Option<SentPacket> = None;
+        let space_now_empty: bool;
+        {
+            let space = match level {
+                CryptoLevel::Initial => &mut self.initial_space,
+                CryptoLevel::Handshake => &mut self.handshake_space,
+                CryptoLevel::OneRtt => &mut self.application_space,
+            };
+            space.largest_acked = Some(match space.largest_acked {
+                Some(x) => x.max(largest_acknowledged),
+                None => largest_acknowledged,
+            });
+            let first_smallest = largest_acknowledged.saturating_sub(first_ack_range);
+            ack_remove_range(
+                space,
+                first_smallest,
+                largest_acknowledged,
+                largest_acknowledged,
+                &mut largest_pkt,
+            );
+            let mut largest_smallest = first_smallest;
+            for (gap, length) in ack_ranges {
+                // gap=N means N PNs between prev_smallest and this
+                // range's largest are NOT acked. So the next PN
+                // covered is prev_smallest - gap - 2 down to that
+                // minus length.
+                let high = match largest_smallest.checked_sub(gap + 2) {
+                    Some(v) => v,
+                    None => break,
+                };
+                let low = high.saturating_sub(length);
+                ack_remove_range(space, low, high, largest_acknowledged, &mut largest_pkt);
+                largest_smallest = low;
+            }
+            space_now_empty = space.sent_packets.is_empty();
+        }
+
+        // RTT sample (RFC 9002 §5.1). Only when the largest_acked
+        // PN is newly acked AND its packet was ack-eliciting.
+        if let Some(pkt) = largest_pkt {
+            if pkt.ack_eliciting {
+                let now = uni_tls::ticket::now_us();
+                let latest = now.saturating_sub(pkt.time_sent_us);
+                self.update_rtt(latest, ack_delay);
+            }
+        }
+        if space_now_empty {
+            self.time_of_last_ack_eliciting_us[space_idx] = None;
+        }
+    }
+
+    /// RFC 9002 §5.3: SRTT/RTTvar EWMA update. Called once per
+    /// inbound ACK that produced an RTT sample.
+    fn update_rtt(&mut self, latest_rtt_us: u64, peer_ack_delay_us: u64) {
+        self.latest_rtt_us = Some(latest_rtt_us);
+        self.min_rtt_us = Some(match self.min_rtt_us {
+            Some(x) => x.min(latest_rtt_us),
+            None => latest_rtt_us,
+        });
+        // Adjusted RTT: subtract ack_delay if doing so doesn't
+        // drop us below min_rtt. This compensates for processing
+        // delay on the peer.
+        let adjusted = if let Some(min) = self.min_rtt_us {
+            if latest_rtt_us > min + peer_ack_delay_us {
+                latest_rtt_us - peer_ack_delay_us
+            } else {
+                latest_rtt_us
+            }
+        } else {
+            latest_rtt_us
+        };
+
+        match self.smoothed_rtt_us {
+            None => {
+                self.smoothed_rtt_us = Some(adjusted);
+                self.rttvar_us = adjusted / 2;
+            }
+            Some(srtt) => {
+                let rttvar_sample = srtt.abs_diff(adjusted);
+                // RTTvar = 3/4 * RTTvar + 1/4 * sample
+                self.rttvar_us = (3 * self.rttvar_us + rttvar_sample) / 4;
+                // SRTT = 7/8 * SRTT + 1/8 * adjusted
+                self.smoothed_rtt_us = Some((7 * srtt + adjusted) / 8);
+            }
+        }
+    }
+
+    /// Record a freshly-sealed packet in its space's `sent_packets`
+    /// map and bump `time_of_last_ack_eliciting_us` if appropriate.
+    /// Called from each `encode_*_packet` after `seal_packet`
+    /// returns. RFC 9002 §A.4: this is `OnPacketSent`. The byte
+    /// count is `total_end - header_start` (sealed wire bytes).
+    fn record_sent_packet(
+        &mut self,
+        level: CryptoLevel,
+        pn: u64,
+        ack_eliciting: bool,
+        byte_count: u32,
+    ) {
+        let now = uni_tls::ticket::now_us();
+        let pkt = SentPacket {
+            time_sent_us: now,
+            ack_eliciting,
+            in_flight: ack_eliciting,
+            byte_count,
+        };
+        let (space, idx) = match level {
+            CryptoLevel::Initial => (&mut self.initial_space, 0usize),
+            CryptoLevel::Handshake => (&mut self.handshake_space, 1usize),
+            CryptoLevel::OneRtt => (&mut self.application_space, 2usize),
+        };
+        space.sent_packets.insert(pn, pkt);
+        if ack_eliciting {
+            self.time_of_last_ack_eliciting_us[idx] = Some(now);
+        }
     }
 
     fn append_ack_frame(&self, frames: &mut Vec<u8>, space: &SpaceState) {
