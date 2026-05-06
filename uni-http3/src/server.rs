@@ -235,14 +235,16 @@ where
         }
     };
 
-    // Translate to uni_http::Request.
+    // Translate to uni_http::Request. Field name/value are
+    // Cow<'static, [u8]> — deref to &[u8] for the comparisons.
     let mut req = Request::new();
     let mut method_bytes: &[u8] = b"";
     let mut path_bytes: &[u8] = b"";
     for f in &fields {
-        if f.name == b":method" {
+        let name: &[u8] = &f.name;
+        if name == b":method" {
             method_bytes = &f.value;
-        } else if f.name == b":path" {
+        } else if name == b":path" {
             path_bytes = &f.value;
         }
     }
@@ -259,8 +261,9 @@ where
     // Pass through user headers (excluding pseudo-headers, which
     // start with ':').
     for f in &fields {
-        if !f.name.starts_with(b":") {
-            req.push_header(&f.name, &f.value);
+        let name: &[u8] = &f.name;
+        if !name.starts_with(b":") {
+            req.push_header(name, &f.value);
         }
     }
 

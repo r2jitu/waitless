@@ -36,11 +36,17 @@ pub enum QpackError {
     Utf8(usize), // (where) - kept for diagnostics
 }
 
-/// One decoded field line.
+/// One decoded field line. Both fields use `Cow<'static, [u8]>`
+/// so indexed-static-table references stay borrowed against the
+/// program's static table instead of being copied to a fresh
+/// `Vec<u8>` per request — for Chrome's typical 8-10-header
+/// HTTP/3 GET that's 16-20 fewer allocations per request hot
+/// path. Literal names/values still allocate (Cow::Owned), as
+/// they must.
 #[derive(Debug, Clone)]
 pub struct Field {
-    pub name: Vec<u8>,
-    pub value: Vec<u8>,
+    pub name: alloc::borrow::Cow<'static, [u8]>,
+    pub value: alloc::borrow::Cow<'static, [u8]>,
 }
 
 /// Decode a QPACK-encoded field section into `(req_insert_count,
@@ -80,9 +86,11 @@ pub fn decode_field_section(input: &[u8]) -> Result<Vec<Field>, QpackError> {
             bytes = &bytes[n..];
             let entry = static_table::lookup(idx as usize)
                 .ok_or(QpackError::StaticIndexOutOfRange)?;
+            // Both name and value live in the program's static
+            // QPACK table — borrow them, no alloc.
             out.push(Field {
-                name: entry.name.to_vec(),
-                value: entry.value.to_vec(),
+                name: alloc::borrow::Cow::Borrowed(entry.name),
+                value: alloc::borrow::Cow::Borrowed(entry.value),
             });
         } else if first & 0x40 != 0 {
             // Literal Field Line With Name Reference.
@@ -98,9 +106,11 @@ pub fn decode_field_section(input: &[u8]) -> Result<Vec<Field>, QpackError> {
                 .ok_or(QpackError::StaticIndexOutOfRange)?;
             let (value, n) = read_string(bytes, 7)?;
             bytes = &bytes[n..];
+            // Name borrows from static table; value is literal,
+            // must be owned.
             out.push(Field {
-                name: entry.name.to_vec(),
-                value,
+                name: alloc::borrow::Cow::Borrowed(entry.name),
+                value: alloc::borrow::Cow::Owned(value),
             });
         } else if first & 0x20 != 0 {
             // Literal Field Line With Literal Name.
@@ -110,7 +120,10 @@ pub fn decode_field_section(input: &[u8]) -> Result<Vec<Field>, QpackError> {
             bytes = &bytes[n..];
             let (value, n) = read_string(bytes, 7)?;
             bytes = &bytes[n..];
-            out.push(Field { name, value });
+            out.push(Field {
+                name: alloc::borrow::Cow::Owned(name),
+                value: alloc::borrow::Cow::Owned(value),
+            });
         } else {
             // 0 0 0 1 ...  → Indexed Field Line With Post-Base Index
             // 0 0 0 0 ...  → Literal Field Line With Post-Base Name Reference
@@ -242,8 +255,8 @@ mod tests {
         encode_field_section(headers, &mut buf);
         let decoded = decode_field_section(&buf).unwrap();
         assert_eq!(decoded.len(), 1);
-        assert_eq!(decoded[0].name, b":status");
-        assert_eq!(decoded[0].value, b"200");
+        assert_eq!(&*decoded[0].name, b":status".as_slice());
+        assert_eq!(&*decoded[0].value, b"200".as_slice());
     }
 
     #[test]
@@ -252,8 +265,8 @@ mod tests {
         let mut buf = Vec::new();
         encode_field_section(headers, &mut buf);
         let decoded = decode_field_section(&buf).unwrap();
-        assert_eq!(decoded[0].name, b":status");
-        assert_eq!(decoded[0].value, b"199");
+        assert_eq!(&*decoded[0].name, b":status".as_slice());
+        assert_eq!(&*decoded[0].value, b"199".as_slice());
     }
 
     #[test]
@@ -262,8 +275,8 @@ mod tests {
         let mut buf = Vec::new();
         encode_field_section(headers, &mut buf);
         let decoded = decode_field_section(&buf).unwrap();
-        assert_eq!(decoded[0].name, b"x-custom");
-        assert_eq!(decoded[0].value, b"hello");
+        assert_eq!(&*decoded[0].name, b"x-custom".as_slice());
+        assert_eq!(&*decoded[0].value, b"hello".as_slice());
     }
 
     #[test]
@@ -281,8 +294,8 @@ mod tests {
         buf.push(0b1000_0110); // H=1 len=6
         buf.extend_from_slice(&[0xa8, 0xeb, 0x10, 0x64, 0x9c, 0xbf]);
         let decoded = decode_field_section(&buf).unwrap();
-        assert_eq!(decoded[0].name, b"x");
-        assert_eq!(decoded[0].value, b"no-cache");
+        assert_eq!(&*decoded[0].name, b"x".as_slice());
+        assert_eq!(&*decoded[0].value, b"no-cache".as_slice());
     }
 
     #[test]
@@ -297,11 +310,11 @@ mod tests {
         encode_field_section(headers, &mut buf);
         let decoded = decode_field_section(&buf).unwrap();
         assert_eq!(decoded.len(), 3);
-        assert_eq!(decoded[0].name, b":method");
-        assert_eq!(decoded[0].value, b"GET");
-        assert_eq!(decoded[1].name, b":path");
-        assert_eq!(decoded[1].value, b"/");
-        assert_eq!(decoded[2].name, b":scheme");
-        assert_eq!(decoded[2].value, b"https");
+        assert_eq!(&*decoded[0].name, b":method".as_slice());
+        assert_eq!(&*decoded[0].value, b"GET".as_slice());
+        assert_eq!(&*decoded[1].name, b":path".as_slice());
+        assert_eq!(&*decoded[1].value, b"/".as_slice());
+        assert_eq!(&*decoded[2].name, b":scheme".as_slice());
+        assert_eq!(&*decoded[2].value, b"https".as_slice());
     }
 }
