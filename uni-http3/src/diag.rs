@@ -68,6 +68,14 @@ pub struct Counters {
     /// `user_handler_returned` is "stuck inside the QUIC send
     /// path" (flush_outbound, sock.send_to, etc.).
     pub write_response_completed: AtomicU64,
+    /// First poll of the user handler future entered the closure
+    /// body (bumped synchronously inside the future before any
+    /// await). A gap from `user_handler_invoked` means the
+    /// handler future was constructed but never actually polled
+    /// — i.e. the handle_conn task is suspended somewhere
+    /// between `handler(req)` and the first `.await` poll of
+    /// the resulting future.
+    pub user_handler_polled: AtomicU64,
 }
 
 impl Counters {
@@ -86,6 +94,7 @@ impl Counters {
             user_handler_invoked: AtomicU64::new(0),
             user_handler_returned: AtomicU64::new(0),
             write_response_completed: AtomicU64::new(0),
+            user_handler_polled: AtomicU64::new(0),
         }
     }
 }
@@ -161,7 +170,7 @@ pub fn should_log_event() -> bool {
     LEVEL.load(Ordering::Relaxed) >= LogLevel::Events as u8
 }
 
-pub fn snapshot() -> [(&'static str, u64); 13] {
+pub fn snapshot() -> [(&'static str, u64); 14] {
     let c = &COUNTERS;
     [
         ("requests_received", c.requests_received.load(Ordering::Relaxed)),
@@ -177,6 +186,7 @@ pub fn snapshot() -> [(&'static str, u64); 13] {
         ("user_handler_invoked", c.user_handler_invoked.load(Ordering::Relaxed)),
         ("user_handler_returned", c.user_handler_returned.load(Ordering::Relaxed)),
         ("write_response_completed", c.write_response_completed.load(Ordering::Relaxed)),
+        ("user_handler_polled", c.user_handler_polled.load(Ordering::Relaxed)),
     ]
 }
 

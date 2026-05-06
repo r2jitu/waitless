@@ -61,6 +61,13 @@ async fn init() {
     uni::println!("listen tcp://:{} (http)", HTTP_PORT);
 
     let h3_handler = move |req: uni_http::Request| async move {
+        // Bump the poll-entered counter the moment the future
+        // body starts executing. A gap between `user_handler_invoked`
+        // (set BEFORE handler(req).await in the H3 server) and
+        // `user_handler_polled` would mean the future was built
+        // but never polled — strong signal of a runtime/scheduler
+        // bug rather than handler-internal work.
+        uni_http3::diag::bump(&uni_http3::diag::COUNTERS.user_handler_polled);
         handle_request(&req).await
     };
     let h3_up = match uni_http3::listen(
