@@ -1551,6 +1551,29 @@ impl Connection {
                 }
             }
             self.state = ConnState::Established;
+            // RFC 9001 §4.9.1 / §4.9.2 + RFC 9002 §A.5: when the
+            // handshake is confirmed, discard Initial AND
+            // Handshake loss-detection state. Without this:
+            //   * `time_of_last_ack_eliciting_us[Initial]` is set
+            //     when we send our ServerHello and never resets
+            //     (Chrome stops sending Initial ACKs as soon as
+            //     it derives Handshake keys),
+            //   * `pto_deadline_us` picks the smallest deadline
+            //     across all spaces, so it stays anchored at
+            //     `serverhello_time + pto_period`,
+            //   * past that point, PTO fires every loop iteration
+            //     until it backs off, throwing PING probes at
+            //     idle time. `pto_probes_sent` climbs without
+            //     matching loss / recovery activity.
+            // Clearing the bookkeeping (we keep the keys for now)
+            // lets the PTO timer key off only the application
+            // space, which has live ACKs flowing.
+            self.initial_space.sent_packets.clear();
+            self.initial_space.largest_acked = None;
+            self.handshake_space.sent_packets.clear();
+            self.handshake_space.largest_acked = None;
+            self.time_of_last_ack_eliciting_us[0] = None;
+            self.time_of_last_ack_eliciting_us[1] = None;
         } else if matches!(new_state, QuicTlsState::Failed) {
             self.state = ConnState::Failed;
         }
