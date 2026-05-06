@@ -18,6 +18,7 @@ rust_library(
         "//uni",
         "//uni-http",
         "//uni-http3",
+        "//uni-quic",
         "//uni-tls",
     ],
 )

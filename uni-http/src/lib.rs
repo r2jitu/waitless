@@ -413,8 +413,29 @@ impl HttpStream for TlsStream {
     }
 
     async fn send(&mut self, data: &[u8]) -> Result<(), ()> {
-        self.tls.send_app_data(data)?;
-        self.drain_tx().await
+        // The TLS server's TX buffer is finite (~4 KiB today), and
+        // `send_app_data` seals into it without any awareness of the
+        // ciphertext drain. If we hand it a body larger than that
+        // buffer it fails outright with `TxBufTooSmall`. Chunk
+        // plaintext into pieces small enough that headers + ciphertext
+        // overhead per record (≤ ~80 B) still fit, draining between
+        // chunks so steady streaming of multi-KiB bodies (e.g. our
+        // multi-page HTML) just works.
+        const PLAINTEXT_CHUNK: usize = 3 * 1024;
+        let mut offset = 0;
+        while offset < data.len() {
+            let end = (offset + PLAINTEXT_CHUNK).min(data.len());
+            self.tls.send_app_data(&data[offset..end])?;
+            self.drain_tx().await?;
+            offset = end;
+        }
+        // Empty body still gets a no-op drain so any pre-queued TLS
+        // bytes (e.g. a NewSessionTicket sealed during handshake but
+        // not yet drained) reach the wire promptly.
+        if data.is_empty() {
+            self.drain_tx().await?;
+        }
+        Ok(())
     }
 
     async fn close(&mut self) -> Result<(), ()> {
@@ -584,7 +605,18 @@ async fn handle_conn<S, H>(
                 None
             };
             write_response_into(&mut w, &resp, !want_close, alt_svc_port);
+            // Two writes: headers (always small, in `w`'s 2 KiB
+            // buffer) then the body (potentially large — multi-KiB
+            // HTML pages, JSON dumps, etc.). Streaming body
+            // separately lets a single response carry as much data
+            // as the underlying stream can take, with no
+            // intermediate copy and no header-buffer cap on body
+            // length.
             if stream.send(w.as_bytes()).await.is_err() {
+                return;
+            }
+            let body = resp.body_bytes();
+            if !body.is_empty() && stream.send(body).await.is_err() {
                 return;
             }
             drop(resp);
@@ -750,6 +782,21 @@ impl BufWriter {
     }
 
     fn push(&mut self, data: &[u8]) {
+        // Headers only — bodies are sent separately by `handle_conn`
+        // via a second `stream.send`. The 2 KiB cap is plenty for any
+        // realistic header set (HTTP/1.1 + Content-Type + Content-Length
+        // + Connection + optional Alt-Svc ≈ 200 bytes), but if a future
+        // change pushes header bytes past it the response would
+        // truncate silently and the peer would hang waiting for body.
+        // `debug_assert` makes that show up in tests rather than as a
+        // mystery timeout in production.
+        debug_assert!(
+            self.pos + data.len() <= 2048,
+            "BufWriter overflow: header bytes exceed 2 KiB cap (pos={}, push={}). \
+             Bodies are streamed separately, so this means your headers got too \
+             big — bump the buffer or trim them.",
+            self.pos, data.len()
+        );
         let n = data.len().min(2048 - self.pos);
         self.buf[self.pos..self.pos + n].copy_from_slice(&data[..n]);
         self.pos += n;
@@ -817,7 +864,13 @@ fn write_response_into(
         w.push(b"\"; ma=86400\r\n");
     }
     w.push(b"\r\n");
-    w.push(body);
+    // NOTE: body is NOT pushed here — `handle_conn` sends it via a
+    // separate `stream.send` so arbitrarily-large response bodies
+    // don't overflow the 2 KiB header buffer. The unused `body`
+    // borrow here is just to ensure callers consider whether body
+    // is part of the response (and to keep the signature stable
+    // against future "include trailer" extensions).
+    let _ = body;
 }
 
 /// Extract the port from an HTTP `Host` header value. Handles:
