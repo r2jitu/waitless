@@ -335,37 +335,22 @@ async fn listener_loop<H, F>(
             }
         }
 
-        // Not an existing conn. If it's a long-header Initial
-        // packet, allocate a slot and spawn a new conn task.
-        if !is_long_header_initial(dgram_bytes) {
-            // Wrong-length DCID, short-header for unknown conn,
-            // or Handshake/0-RTT/Retry without a matching slot
-            // — drop. (Stateless reset is out of scope.)
-            let first = dgram_bytes.first().copied().unwrap_or(0);
-            // Distinguish short-header (FIXED_BIT set, long-header
-            // bit clear) from random long-header levels for finer
-            // diagnostic grouping.
-            if first & 0x80 == 0 {
-                crate::quic_drop!(unknown_short_header,
-                    "size={} dcid={}", dgram_bytes.len(), hex8(&dcid));
-            } else {
-                crate::quic_drop!(unknown_long_header,
-                    "size={} dcid={} first={:#x}",
-                    dgram_bytes.len(), hex8(&dcid), first);
-            }
-            continue;
-        }
-
-        // Client splits a 2+ KiB ClientHello (Chrome with PQ
-        // key_share routinely does this) across N Initial
-        // packets, all carrying the same client-chosen DCID. The
-        // primary `slots.lookup` above never matches — that DCID
-        // isn't ours — so without this second map we'd allocate a
-        // fresh conn for every such packet, each with a different
-        // server SCID, fragmenting CRYPTO reassembly across N
-        // ghost conns and stalling the handshake. Route to the
-        // existing conn whenever we've seen this Initial DCID
-        // already.
+        // Try the client-chosen-DCID map BEFORE the Initial-only
+        // gate. The map serves two related cases:
+        //
+        //   1. Multi-packet ClientHello: every Initial fragment
+        //      shares one client-chosen DCID; without this lookup
+        //      every fragment would allocate a fresh ghost conn.
+        //   2. Coalesced/standalone 0-RTT (or Handshake) packets
+        //      addressed to that same client-chosen DCID — the
+        //      client uses it for ALL packets until it's seen our
+        //      first Initial reply (and learned our SCID). 0-RTT
+        //      packets in particular often arrive in their own
+        //      datagram (Chrome routinely sends Initial+0-RTT in
+        //      the SAME datagram, but on retransmit they may
+        //      arrive separately), so a long-header non-Initial
+        //      packet for a known initial-DCID MUST route to the
+        //      same conn — otherwise we drop the 0-RTT data.
         if let Some(inbox) = slots.lookup_initial_dcid(&dcid) {
             crate::quic_event!(initial_dcid_hit,
                 "size={} dcid={}", dgram_bytes.len(), hex8(&dcid));
@@ -374,6 +359,24 @@ async fn listener_loop<H, F>(
                 src_port,
                 bytes: dgram_bytes.to_vec(),
             });
+            continue;
+        }
+
+        // No prior conn for this DCID. If it's a long-header
+        // Initial we'll allocate one; otherwise drop.
+        if !is_long_header_initial(dgram_bytes) {
+            // Wrong-length DCID, short-header for unknown conn,
+            // or Handshake/0-RTT/Retry without a matching slot
+            // — drop. (Stateless reset is out of scope.)
+            let first = dgram_bytes.first().copied().unwrap_or(0);
+            if first & 0x80 == 0 {
+                crate::quic_drop!(unknown_short_header,
+                    "size={} dcid={}", dgram_bytes.len(), hex8(&dcid));
+            } else {
+                crate::quic_drop!(unknown_long_header,
+                    "size={} dcid={} first={:#x}",
+                    dgram_bytes.len(), hex8(&dcid), first);
+            }
             continue;
         }
 
