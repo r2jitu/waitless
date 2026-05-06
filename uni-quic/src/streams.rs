@@ -352,6 +352,41 @@ impl SendStream {
         }
         Some((offset, chunk, fin))
     }
+
+    /// Allocation-free variant of `pop_chunk`: appends the
+    /// STREAM frame (header + body + FIN bit) directly into
+    /// `frames_out`. Saves the per-emit `chunk: Vec<u8>` (from
+    /// `drain(..n).collect()`) AND the per-emit `tmp: Vec<u8>`
+    /// the caller previously used. Returns true if anything
+    /// was emitted.
+    pub fn pop_chunk_into(
+        &mut self,
+        stream_id: u64,
+        max_bytes: usize,
+        frames_out: &mut Vec<u8>,
+    ) -> Result<bool, crate::frame::FrameError> {
+        match self.state {
+            SendState::FinSent => return Ok(false),
+            SendState::Open if self.outbound.is_empty() => return Ok(false),
+            _ => {}
+        }
+        let n = self.outbound.len().min(max_bytes);
+        let offset = self.send_offset;
+        let fin =
+            matches!(self.state, SendState::Closing) && self.outbound.len() == n;
+        // Append [type][stream_id-varint][offset-varint]
+        // [length-varint] header to frames_out.
+        crate::frame::append_stream_header(stream_id, offset, fin, n, frames_out)?;
+        // Append body bytes directly from outbound — no
+        // intermediate Vec.
+        frames_out.extend_from_slice(&self.outbound[..n]);
+        self.outbound.drain(..n);
+        self.send_offset += n as u64;
+        if fin {
+            self.state = SendState::FinSent;
+        }
+        Ok(true)
+    }
 }
 
 #[cfg(test)]

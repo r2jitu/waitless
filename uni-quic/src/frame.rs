@@ -521,6 +521,34 @@ pub fn write_stream(
     Ok(p)
 }
 
+/// Append a STREAM frame HEADER (everything up to but not
+/// including the body) to `out`. The body is written separately
+/// by the caller (typically via `extend_from_slice`).
+/// `body_len` controls only the length-varint inside the header.
+/// This split avoids having to copy the body into a scratch
+/// buffer just so it can be passed to `write_stream`.
+pub fn append_stream_header(
+    stream_id: u64,
+    offset: u64,
+    fin: bool,
+    body_len: usize,
+    out: &mut alloc::vec::Vec<u8>,
+) -> Result<(), FrameError> {
+    let mut t = ftype::STREAM_BASE | ftype::STREAM_FLAG_OFF | ftype::STREAM_FLAG_LEN;
+    if fin {
+        t |= ftype::STREAM_FLAG_FIN;
+    }
+    out.push(t);
+    let mut tmp = [0u8; 8];
+    let n = write_varint(stream_id, &mut tmp)?;
+    out.extend_from_slice(&tmp[..n]);
+    let n = write_varint(offset, &mut tmp)?;
+    out.extend_from_slice(&tmp[..n]);
+    let n = write_varint(body_len as u64, &mut tmp)?;
+    out.extend_from_slice(&tmp[..n]);
+    Ok(())
+}
+
 /// Write an ACK frame. `additional_ranges` is `(gap, ack_range_length)`
 /// varint pairs in network order (oldest gap first); pass an empty
 /// slice for a single-range ACK.

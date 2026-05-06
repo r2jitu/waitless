@@ -1420,15 +1420,20 @@ impl Connection {
         let full_pn = decode_packet_number(largest, truncated, pn_length);
 
         // AEAD AAD = unprotected header bytes (everything before
-        // ciphertext): buf[..pn_offset + pn_length].
+        // ciphertext): buf[..pn_offset + pn_length]. Avoid the
+        // alloc by splitting `buf` into disjoint mutable slices
+        // — the AAD prefix becomes a borrow of one half, the
+        // payload+tag a borrow of the other.
         let aad_end = pn_offset + pn_length;
         let payload_end = buf.len() - TAG_LEN;
-        let aad: Vec<u8> = buf[..aad_end].to_vec();
         let tag: [u8; TAG_LEN] = buf[payload_end..]
             .try_into()
             .map_err(|_| ConnError::Wire)?;
         let nonce = packet_nonce(&keys.iv, full_pn);
-        keys.aead_open(&nonce, &aad, &mut buf[aad_end..payload_end], &tag)
+        let (aad_part, rest_part) = buf.split_at_mut(aad_end);
+        let aad: &[u8] = aad_part;
+        let payload_slice = &mut rest_part[..payload_end - aad_end];
+        keys.aead_open(&nonce, aad, payload_slice, &tag)
             .map_err(|_| {
                 crate::quic_drop!(aead_decrypt_failed,
                     "pn={} payload_len={}", full_pn, payload_end - aad_end);
@@ -1966,14 +1971,16 @@ impl Connection {
             .tls
             .pop_handshake(CryptoLevel::OneRtt, &mut one_rtt_crypto);
         if crypto_n > 0 {
-            // Track our own offset for the OneRtt CRYPTO stream so
-            // multiple post-handshake messages (e.g. a sequence of
-            // tickets, KeyUpdate, NEW_TOKEN) chain correctly.
+            // Write the CRYPTO frame directly into `frames`
+            // instead of into a tmp Vec + extend_from_slice. Saves
+            // one alloc per emitted ticket.
             let offset = self.one_rtt_crypto_offset;
-            let mut tmp = vec![0u8; crypto_n + 16];
-            let n = write_crypto(offset, &one_rtt_crypto[..crypto_n], &mut tmp)
+            let max_size = crypto_n + 16;
+            let start = frames.len();
+            frames.resize(start + max_size, 0);
+            let n = write_crypto(offset, &one_rtt_crypto[..crypto_n], &mut frames[start..])
                 .map_err(|_| ConnError::Wire)?;
-            frames.extend_from_slice(&tmp[..n]);
+            frames.truncate(start + n);
             self.one_rtt_crypto_offset += crypto_n as u64;
             ack_eliciting = true;
             crate::quic_event!(tickets_emitted,
@@ -1999,11 +2006,15 @@ impl Connection {
                 Some(s) => s,
                 None => continue,
             };
-            if let Some((offset, chunk, fin)) = s.pop_chunk(max_chunk) {
-                let mut tmp = vec![0u8; chunk.len() + 32];
-                let n = crate::frame::write_stream(sid, offset, fin, &chunk, &mut tmp)
-                    .map_err(|_| ConnError::Wire)?;
-                frames.extend_from_slice(&tmp[..n]);
+            // pop_chunk_into writes the STREAM frame (header +
+            // body + FIN bit) directly into `frames`, eliminating
+            // both the intermediate `chunk: Vec<u8>` from the
+            // old pop_chunk return AND the per-frame `tmp`
+            // allocation. One fewer alloc per stream chunk per
+            // 1-RTT packet.
+            if s.pop_chunk_into(sid, max_chunk, &mut frames)
+                .map_err(|_| ConnError::Wire)?
+            {
                 ack_eliciting = true;
             }
         }
@@ -2305,10 +2316,17 @@ impl Connection {
         keys: &DirKeys,
         is_long: bool,
     ) -> Result<(), ConnError> {
-        let aad: Vec<u8> = out[header_start..payload_offset].to_vec();
+        // Split `out` into the AAD prefix and the payload tail
+        // without allocating. Previously this copied the AAD via
+        // `to_vec()` because Rust won't let us hold both
+        // `&out[..payload_offset]` and `&mut out[payload_offset..]`
+        // from the same `&mut out`. `split_at_mut` carves the two
+        // disjoint slices the borrow checker accepts.
         let nonce = packet_nonce(&keys.iv, pn);
-        let payload_slice = &mut out[payload_offset..payload_offset + payload_len];
-        let tag = keys.aead_seal(&nonce, &aad, payload_slice);
+        let (header_part, payload_part) = out.split_at_mut(payload_offset);
+        let aad: &[u8] = &header_part[header_start..payload_offset];
+        let payload_slice = &mut payload_part[..payload_len];
+        let tag = keys.aead_seal(&nonce, aad, payload_slice);
         out[payload_offset + payload_len..payload_offset + payload_len + TAG_LEN]
             .copy_from_slice(&tag);
 
