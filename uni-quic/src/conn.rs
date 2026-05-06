@@ -379,14 +379,34 @@ impl Connection {
         }
         let mut p = 0usize;
         while p < datagram.len() {
-            let consumed = self.process_one_packet(&datagram[p..], config)?;
-            if consumed == 0 {
-                // Defensive — never observed in practice with
-                // well-formed datagrams, but guarantees forward
-                // progress so a parsing bug can't loop.
-                break;
+            // Per-packet drop on AEAD failure (RFC 9000 §9.7:
+            // endpoints MUST NOT abandon the connection on
+            // packets they cannot decrypt). Most common causes:
+            //   * client did a key update (KEY_PHASE bit flipped)
+            //     and we don't track key phase yet — pending
+            //     follow-up.
+            //   * stale-keys retransmit straggler.
+            //   * unrelated traffic addressed to our DCID.
+            // For long-header packets we know the packet length
+            // from the header so we can skip exactly that and
+            // continue with the next coalesced packet. For
+            // short-header (1-RTT) packets there's no length —
+            // the packet IS the rest of the datagram — so on
+            // decrypt failure we drop the whole remainder.
+            match self.process_one_packet(&datagram[p..], config) {
+                Ok(0) => break, // forward-progress guard
+                Ok(consumed) => {
+                    p += consumed;
+                }
+                Err(ConnError::Decrypt) => {
+                    // Stop walking this datagram; conn stays
+                    // alive for future packets. Counter was
+                    // already bumped via `aead_decrypt_failed`
+                    // inside `unprotect_and_decrypt`.
+                    break;
+                }
+                Err(e) => return Err(e),
             }
-            p += consumed;
             // Drive the TLS state machine to derive any new keys
             // before we attempt to decrypt the next coalesced
             // packet. Especially important for Initial → 0-RTT
