@@ -326,11 +326,16 @@ async fn listener_loop<H, F>(
         // server-chosen SCID as its DCID.
         if let Some((slot_idx, generation)) = parse_local_cid(&dcid) {
             if let Some(inbox) = slots.lookup(slot_idx, generation) {
-                inbox.push(Datagram {
+                let pushed = inbox.push(Datagram {
                     src_ip,
                     src_port,
                     bytes: dgram_bytes.to_vec(),
                 });
+                if !pushed {
+                    crate::quic_drop!(inbox_full_drops,
+                        "size={} slot={} gen={}",
+                        dgram_bytes.len(), slot_idx, generation);
+                }
                 continue;
             }
         }
@@ -354,11 +359,15 @@ async fn listener_loop<H, F>(
         if let Some(inbox) = slots.lookup_initial_dcid(&dcid) {
             crate::quic_event!(initial_dcid_hit,
                 "size={} dcid={}", dgram_bytes.len(), hex8(&dcid));
-            inbox.push(Datagram {
+            let pushed = inbox.push(Datagram {
                 src_ip,
                 src_port,
                 bytes: dgram_bytes.to_vec(),
             });
+            if !pushed {
+                crate::quic_drop!(inbox_full_drops,
+                    "size={} initial-dcid", dgram_bytes.len());
+            }
             continue;
         }
 
@@ -530,42 +539,48 @@ async fn conn_task<H, F>(
                 break;
             }
         };
-        peer_ip.set(dgram.src_ip);
-        peer_port.set(dgram.src_port);
-        let result = conn.borrow_mut().process_datagram(&dgram.bytes, &cfg);
+        // Process the awaited datagram, then opportunistically
+        // drain anything else already queued. Each
+        // `process_datagram` call also runs `flush_outbound`,
+        // which can emit up to 33 packets — without batching, a
+        // burst of 32 inbound datagrams from a refresh-spamming
+        // browser fills the 256-slot inbox faster than the
+        // listener-→drain pipeline can shift, and the listener
+        // starts dropping. Batching here lets one wake service
+        // many queued datagrams.
+        const BATCH_LIMIT: usize = 32;
         let mut tearing_down = false;
-        if let Err(e) = result {
-            // Conn-level fatal error — closes the conn task and
-            // implicitly frees its slot. Surfacing the variant
-            // tells the operator which layer rejected the packet
-            // (wire / decrypt / state / TLS), instead of leaving
-            // the peer waiting 30 s for an idle timeout.
-            crate::quic_drop!(other_wire,
-                "process_datagram failed: {:?} dgram_size={} local_cid={}",
-                e, dgram.bytes.len(), hex8(&local_cid_bytes));
-            // Schedule a CONNECTION_CLOSE so the peer learns of
-            // the failure right away (RFC 9000 §10.2). Map the
-            // ConnError to a transport error code; details land
-            // in the reason for diagnostics. The drain loop below
-            // will pick up the close packet on this same tick;
-            // we then break out.
-            let (code, reason): (u64, &[u8]) = match e {
-                ConnError::Wire => (0x0a, b"protocol_violation"),
-                ConnError::Decrypt => (0x0a, b"crypto_error"),
-                ConnError::Tls => (0x0a, b"tls_alert"),
-                ConnError::BadState => (0x01, b"internal_error"),
-                ConnError::OutputTooSmall => (0x01, b"internal_error"),
-                ConnError::UnsupportedVersion => (0x0a, b"unsupported_version"),
-            };
-            // `process_datagram` returned Err before any flush
-            // ran, so the close packet is built here directly via
-            // `flush_close`. The drain loop below picks it up.
-            {
-                let mut c = conn.borrow_mut();
-                c.close_with_error(code, reason);
-                c.flush_close();
+        let mut current = Some(dgram);
+        let mut processed = 0usize;
+        while let Some(d) = current.take() {
+            peer_ip.set(d.src_ip);
+            peer_port.set(d.src_port);
+            let result = conn.borrow_mut().process_datagram(&d.bytes, &cfg);
+            if let Err(e) = result {
+                crate::quic_drop!(other_wire,
+                    "process_datagram failed: {:?} dgram_size={} local_cid={}",
+                    e, d.bytes.len(), hex8(&local_cid_bytes));
+                let (code, reason): (u64, &[u8]) = match e {
+                    ConnError::Wire => (0x0a, b"protocol_violation"),
+                    ConnError::Decrypt => (0x0a, b"crypto_error"),
+                    ConnError::Tls => (0x0a, b"tls_alert"),
+                    ConnError::BadState => (0x01, b"internal_error"),
+                    ConnError::OutputTooSmall => (0x01, b"internal_error"),
+                    ConnError::UnsupportedVersion => (0x0a, b"unsupported_version"),
+                };
+                {
+                    let mut c = conn.borrow_mut();
+                    c.close_with_error(code, reason);
+                    c.flush_close();
+                }
+                tearing_down = true;
+                break;
             }
-            tearing_down = true;
+            processed += 1;
+            if processed >= BATCH_LIMIT {
+                break;
+            }
+            current = inbox.try_pop();
         }
 
         // Drain outbound packets to the peer. Each iteration

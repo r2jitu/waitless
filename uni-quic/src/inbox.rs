@@ -62,9 +62,17 @@ pub struct ConnInbox {
     event: AsyncEvent,
     closed: Cell<bool>,
     /// Maximum queued datagrams. Anything past this is dropped.
-    /// Sized for the worst-case handshake burst (4-5 packets)
-    /// plus a few in-flight 1-RTT packets. Real flow control
-    /// arrives via the QUIC connection-level limits, not here.
+    /// Sized for sustained pipelined traffic — a Chrome session
+    /// rapidly refreshing a page bursts dozens of request +
+    /// ACK datagrams faster than the conn task can drain them
+    /// (each task iteration does parse + dispatch + flush of up
+    /// to 33 packets + sendto the lot). At capacity 16 the
+    /// listener silently drops new datagrams, Chrome takes
+    /// several seconds to discover the loss via its own PTO,
+    /// and retransmitted stragglers later show up as
+    /// `aead_decrypt_failed` once our state has moved on.
+    /// Real flow control arrives via the QUIC connection-level
+    /// limits, not here.
     capacity: usize,
 }
 
@@ -75,7 +83,7 @@ pub struct ConnInbox {
 // trivially satisfied.
 
 impl ConnInbox {
-    pub const DEFAULT_CAPACITY: usize = 16;
+    pub const DEFAULT_CAPACITY: usize = 256;
 
     pub fn new() -> Rc<Self> {
         Self::with_capacity(Self::DEFAULT_CAPACITY)

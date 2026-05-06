@@ -180,6 +180,14 @@ pub struct Counters {
     /// requests; lag means streams aren't reaching the reapable
     /// state.
     pub streams_reaped: AtomicU64,
+    /// Listener tried to push a datagram into a full
+    /// `ConnInbox` (DEFAULT_CAPACITY=256) — usually because the
+    /// peer is bursting faster than the conn task can drain.
+    /// The datagram is dropped on the floor; QUIC retransmit on
+    /// the peer's side eventually recovers, manifesting as a
+    /// stall followed by `aead_decrypt_failed` lines for late-
+    /// arriving stragglers.
+    pub inbox_full_drops: AtomicU64,
 }
 
 impl Counters {
@@ -216,6 +224,7 @@ impl Counters {
             recv_streams_created: AtomicU64::new(0),
             send_streams_created: AtomicU64::new(0),
             streams_reaped: AtomicU64::new(0),
+            inbox_full_drops: AtomicU64::new(0),
         }
     }
 }
@@ -335,7 +344,7 @@ pub fn should_log_event() -> bool {
 
 /// Snapshot of every counter, for `/debug/quic_stats`-style dumps.
 /// Returns `(name, value)` pairs in declaration order.
-pub fn snapshot() -> [(&'static str, u64); 31] {
+pub fn snapshot() -> [(&'static str, u64); 32] {
     let c = &COUNTERS;
     [
         ("no_dcid", c.no_dcid.load(Ordering::Relaxed)),
@@ -369,6 +378,7 @@ pub fn snapshot() -> [(&'static str, u64); 31] {
         ("recv_streams_created", c.recv_streams_created.load(Ordering::Relaxed)),
         ("send_streams_created", c.send_streams_created.load(Ordering::Relaxed)),
         ("streams_reaped", c.streams_reaped.load(Ordering::Relaxed)),
+        ("inbox_full_drops", c.inbox_full_drops.load(Ordering::Relaxed)),
     ]
 }
 
