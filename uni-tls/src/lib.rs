@@ -71,6 +71,7 @@ pub mod server;
 pub mod handlers;
 pub mod keys;
 pub mod profile;
+pub mod replay;
 pub mod ticket;
 pub mod trace;
 

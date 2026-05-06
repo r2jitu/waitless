@@ -79,6 +79,12 @@ pub struct ResumeAccept {
     /// Index into the client's PskIdentity list — echoes back as
     /// `selected_identity` in the ServerHello pre_shared_key extension.
     pub selected_identity: u16,
+    /// `false` when the ticket nonce was already seen by the
+    /// 0-RTT replay cache (RFC 9001 §5.5). The 1-RTT resumption
+    /// proceeds normally; the QUIC layer skips deriving the
+    /// early-data secret and any 0-RTT packets are dropped at
+    /// AEAD open. `true` for first-use tickets.
+    pub early_data_allowed: bool,
 }
 
 /// Try every PskIdentity in the order the client sent them; first
@@ -158,9 +164,28 @@ pub fn try_resume(
         let expected = hmac_sha256(&finished_key, &partial_transcript);
 
         if ct_eq_32(binder, &expected) {
+            // RFC 9001 §5.5: check the 0-RTT replay cache before
+            // letting the caller derive the early-data secret.
+            // Sealed-ticket layout (see ticket.rs::seal_under_key):
+            //   [name(16) | nonce(12) | ciphertext | tag]
+            // We use the per-ticket AEAD nonce as the replay
+            // identifier — it's already a fresh 96-bit random
+            // generated at seal time, so each ticket has a unique
+            // value even when the underlying RMS is shared.
+            let early_data_allowed = if identity_bytes.len() >= 28 {
+                let mut nonce = [0u8; 12];
+                nonce.copy_from_slice(&identity_bytes[16..28]);
+                crate::replay::check_and_record(&nonce)
+            } else {
+                // Truncated ticket — paranoid: refuse 0-RTT
+                // rather than fail-open. The 1-RTT resumption
+                // proceeds.
+                false
+            };
             return Some(ResumeAccept {
                 schedule: candidate,
                 selected_identity: i as u16,
+                early_data_allowed,
             });
         }
         // Wrong binder: drop this candidate's schedule and keep trying.

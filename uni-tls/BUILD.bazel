@@ -32,6 +32,7 @@ rust_library(
         "src/handlers.rs",
         "src/keys.rs",
         "src/profile.rs",
+        "src/replay.rs",
         "src/server.rs",
         "src/ticket.rs",
         "src/trace.rs",

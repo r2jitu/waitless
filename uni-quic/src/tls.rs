@@ -425,17 +425,28 @@ impl QuicTls {
         if let Some(ra) = resume_accept {
             let id = ra.selected_identity;
             self.schedule = ra.schedule;
-            // Derive client_early_traffic_secret from
-            // Transcript-Hash(ClientHello). At this point
-            // `self.transcript` already includes the full CH
-            // (updated above) and nothing else, so its snapshot
-            // IS that hash. The connection layer pops it via
-            // `client_early_traffic_secret()` and turns it into
-            // 0-RTT AEAD keys; without those keys we'd silently
-            // drop every 0-RTT packet the client sends.
-            let transcript_h0 = self.transcript.snapshot();
-            self.client_early_traffic_secret =
-                Some(self.schedule.early_traffic(&transcript_h0));
+            if ra.early_data_allowed {
+                // Derive client_early_traffic_secret from
+                // Transcript-Hash(ClientHello). At this point
+                // `self.transcript` already includes the full
+                // CH (updated above) and nothing else, so its
+                // snapshot IS that hash. The connection layer
+                // pops it via `client_early_traffic_secret()`
+                // and turns it into 0-RTT AEAD keys.
+                let transcript_h0 = self.transcript.snapshot();
+                self.client_early_traffic_secret =
+                    Some(self.schedule.early_traffic(&transcript_h0));
+            } else {
+                // Replay-cache hit (RFC 9001 §5.5). 1-RTT
+                // resumption proceeds; 0-RTT is rejected by
+                // virtue of leaving `client_early_traffic_secret`
+                // None, which makes the QUIC layer drop any
+                // incoming 0-RTT packets at AEAD open. Surface
+                // the event so an operator can spot replay
+                // attempts vs. the normal accept path.
+                crate::quic_event!(zero_rtt_unresumable,
+                    "reason=replay_cache_hit selected_identity={}", id);
+            }
             crate::quic_event!(tickets_accepted, "selected_identity={}", id);
         }
 
