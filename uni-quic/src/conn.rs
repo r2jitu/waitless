@@ -355,9 +355,20 @@ impl Connection {
     }
 
     /// Process one inbound UDP datagram. Coalesced packets
-    /// (Initial+Handshake in one datagram, common with rustls /
-    /// quinn) are walked left-to-right; each packet's protection
-    /// is removed independently.
+    /// (Initial+Handshake or Initial+0-RTT in one datagram, both
+    /// common with browsers) are walked left-to-right; each packet's
+    /// protection is removed independently.
+    ///
+    /// `advance_tls` runs BETWEEN packets in the loop so that keys
+    /// derived from earlier packets (e.g. 0-RTT recv keys derived
+    /// when the Initial's ClientHello validates a PSK) are
+    /// available to LATER packets in the same datagram. Without
+    /// this, the 0-RTT packet that Chrome coalesces with its
+    /// Initial would hit `process_zero_rtt` before the CH-driven
+    /// `client_early_traffic_secret` is computed, and we'd drop
+    /// it with `bad_state: no early_recv keys`. `advance_tls` is
+    /// idempotent — `tls.advance` returns once no state change
+    /// happens — so calling it per packet is cheap.
     pub fn process_datagram(
         &mut self,
         datagram: &[u8],
@@ -376,6 +387,12 @@ impl Connection {
                 break;
             }
             p += consumed;
+            // Drive the TLS state machine to derive any new keys
+            // before we attempt to decrypt the next coalesced
+            // packet. Especially important for Initial → 0-RTT
+            // ordering, where 0-RTT decrypt depends on the
+            // early-data secret derived from the CH.
+            self.advance_tls(config)?;
         }
         // Drive the TLS state machine + queue outbound after
         // consuming all packets in the datagram.
