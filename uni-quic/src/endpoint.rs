@@ -228,6 +228,22 @@ impl QuicConn {
         self.drain_outbound();
     }
 
+    /// Zero-copy variant of `send_fin`: takes ownership of the
+    /// payload Vec and passes it straight into the SendStream's
+    /// chunk chain, skipping the extend_from_slice memcpy that
+    /// `send_fin(&[u8])` performs. Use this whenever the caller
+    /// already holds a built Vec (the H3 server's write_response
+    /// is the canonical example).
+    pub fn send_fin_owned(&self, sid: u64, data: Vec<u8>) {
+        {
+            let mut c = self.conn.borrow_mut();
+            c.stream_send_owned(sid, data);
+            c.stream_close(sid);
+            let _ = c.flush(&self.cfg);
+        }
+        self.drain_outbound();
+    }
+
     /// Discard any bytes buffered for `sid`'s recv side without
     /// awaiting. Use for streams the app never intends to read
     /// (e.g. HTTP/3 peer-initiated uni streams: control, QPACK

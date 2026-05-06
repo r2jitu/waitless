@@ -311,7 +311,10 @@ fn write_response(conn: &QuicConn, sid: u64, resp: &Response) {
     // 1-RTT packet). Avoids the FIN-without-data corner case
     // where some H3 clients may discard the request stream
     // before observing the data half.
-    conn.send_fin(sid, &payload);
+    // Hand off the payload Vec by move. `send_fin_owned` pushes
+    // it straight into the SendStream's chunk chain — no
+    // extend_from_slice copy at the QUIC API boundary.
+    conn.send_fin_owned(sid, payload);
 }
 
 fn status_to_bytes(status: i32) -> [u8; 3] {
