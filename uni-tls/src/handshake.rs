@@ -83,6 +83,12 @@ pub mod ext_type {
     /// peer's `transport_parameters` TLV blob inside ClientHello /
     /// EncryptedExtensions when TLS is layered under QUIC.
     pub const QUIC_TRANSPORT_PARAMETERS: u16 = 0x39;
+    /// `early_data` extension (RFC 8446 §4.2.10). Empty body in
+    /// EncryptedExtensions ("server accepts 0-RTT for this conn");
+    /// 4-byte `max_early_data_size` body in NewSessionTicket
+    /// (which RFC 9001 §4.6.1 mandates equal `0xffffffff` for
+    /// QUIC, signaling future-self will accept 0-RTT).
+    pub const EARLY_DATA: u16 = 42;
 }
 
 /// PskKeyExchangeMode wire values (RFC 8446 §4.2.9), plus convenience
@@ -888,8 +894,10 @@ pub fn build_certificate_verify(
 ///
 /// The `ticket` argument is the already-sealed ticket bytes (commit 2
 /// produces these via `seal_ticket`); this function only frames them.
-/// We always emit an empty extensions list — `early_data` (the only
-/// realistic ticket-extension) is out of scope for now.
+/// `extensions` is a pre-encoded extensions blob (each entry being
+/// `ext_type:u16 || ext_len:u16 || ext_data`). Pass `&[]` for the
+/// 1-RTT-only case (TCP TLS resumption); QUIC 0-RTT callers pass the
+/// `early_data` extension envelope (RFC 9001 §4.6.1) here.
 ///
 /// Returns the number of bytes written, or `None` if `out` is too
 /// small or any field exceeds its wire-encoded bound.
@@ -898,6 +906,7 @@ pub fn build_new_session_ticket(
     age_add: u32,
     ticket_nonce: &[u8],
     ticket: &[u8],
+    extensions: &[u8],
     out: &mut [u8],
 ) -> Option<usize> {
     if ticket_nonce.len() > 255 {
@@ -906,7 +915,10 @@ pub fn build_new_session_ticket(
     if ticket.is_empty() || ticket.len() > 0xffff {
         return None;
     }
-    let total = 4 + 4 + 1 + ticket_nonce.len() + 2 + ticket.len() + 2;
+    if extensions.len() > 0xfffe {
+        return None;
+    }
+    let total = 4 + 4 + 1 + ticket_nonce.len() + 2 + ticket.len() + 2 + extensions.len();
     if out.len() < total {
         return None;
     }
@@ -924,10 +936,11 @@ pub fn build_new_session_ticket(
     p += 2;
     out[p..p + ticket.len()].copy_from_slice(ticket);
     p += ticket.len();
-    // Empty extensions list.
-    out[p] = 0;
-    out[p + 1] = 0;
+    // Extensions list: u16 length prefix + bytes.
+    out[p..p + 2].copy_from_slice(&(extensions.len() as u16).to_be_bytes());
     p += 2;
+    out[p..p + extensions.len()].copy_from_slice(extensions);
+    p += extensions.len();
 
     debug_assert_eq!(p, total);
     Some(p)
@@ -1576,7 +1589,7 @@ mod tests {
         let nonce = [0x01u8, 0x02];
         let ticket = [0x99u8; 10];
         let mut out = [0u8; 64];
-        let n = build_new_session_ticket(600, 0xdead_beef, &nonce, &ticket, &mut out)
+        let n = build_new_session_ticket(600, 0xdead_beef, &nonce, &ticket, &[], &mut out)
             .unwrap();
 
         // Layout: 4 + 4 + 1 + 2 + 2 + 10 + 2 = 25
@@ -1600,14 +1613,14 @@ mod tests {
     fn new_session_ticket_rejects_oversize_nonce() {
         let big_nonce = [0u8; 256];
         let mut out = [0u8; 1024];
-        assert!(build_new_session_ticket(60, 0, &big_nonce, &[1, 2, 3], &mut out)
+        assert!(build_new_session_ticket(60, 0, &big_nonce, &[1, 2, 3], &[], &mut out)
             .is_none());
     }
 
     #[test]
     fn new_session_ticket_rejects_empty_ticket() {
         let mut out = [0u8; 64];
-        assert!(build_new_session_ticket(60, 0, &[], &[], &mut out).is_none());
+        assert!(build_new_session_ticket(60, 0, &[], &[], &[], &mut out).is_none());
     }
 
     #[test]

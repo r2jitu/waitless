@@ -97,6 +97,14 @@ pub struct Counters {
     /// `tickets_accepted / handshakes_completed` ≈ resumption hit
     /// rate.
     pub tickets_accepted: AtomicU64,
+    /// 0-RTT (early-data) packet-protection keys derived. Fires
+    /// once per resumed handshake before the first 0-RTT packet
+    /// can be unprotected.
+    pub early_keys_derived: AtomicU64,
+    /// Inbound 0-RTT packet successfully unprotected and frames
+    /// dispatched. Counter rate = peer's effective 0-RTT request
+    /// volume after our acceptance policy.
+    pub zero_rtt_accepted: AtomicU64,
 }
 
 impl Counters {
@@ -120,6 +128,8 @@ impl Counters {
             handshakes_completed: AtomicU64::new(0),
             tickets_emitted: AtomicU64::new(0),
             tickets_accepted: AtomicU64::new(0),
+            early_keys_derived: AtomicU64::new(0),
+            zero_rtt_accepted: AtomicU64::new(0),
         }
     }
 }
@@ -239,7 +249,7 @@ pub fn should_log_event() -> bool {
 
 /// Snapshot of every counter, for `/debug/quic_stats`-style dumps.
 /// Returns `(name, value)` pairs in declaration order.
-pub fn snapshot() -> [(&'static str, u64); 18] {
+pub fn snapshot() -> [(&'static str, u64); 20] {
     let c = &COUNTERS;
     [
         ("no_dcid", c.no_dcid.load(Ordering::Relaxed)),
@@ -260,6 +270,8 @@ pub fn snapshot() -> [(&'static str, u64); 18] {
         ("handshakes_completed", c.handshakes_completed.load(Ordering::Relaxed)),
         ("tickets_emitted", c.tickets_emitted.load(Ordering::Relaxed)),
         ("tickets_accepted", c.tickets_accepted.load(Ordering::Relaxed)),
+        ("early_keys_derived", c.early_keys_derived.load(Ordering::Relaxed)),
+        ("zero_rtt_accepted", c.zero_rtt_accepted.load(Ordering::Relaxed)),
     ]
 }
 

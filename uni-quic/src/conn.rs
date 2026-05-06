@@ -262,6 +262,12 @@ pub struct Connection {
     handshake_recv: Option<DirKeys>,
     application_send: Option<DirKeys>,
     application_recv: Option<DirKeys>,
+    /// 0-RTT (early-data) packet-protection keys for *receiving*.
+    /// `Some` only on a resumed handshake whose PSK validated;
+    /// derived from `QuicTls::client_early_traffic_secret` once the
+    /// CH has been parsed. The server never sends 0-RTT, so there's
+    /// no `early_send` counterpart.
+    early_recv: Option<DirKeys>,
 
     initial_space: SpaceState,
     handshake_space: SpaceState,
@@ -322,6 +328,7 @@ impl Connection {
             initial_dcid: ConnectionId::new(&[]),
             initial_send: None,
             initial_recv: None,
+            early_recv: None,
             handshake_send: None,
             handshake_recv: None,
             application_send: None,
@@ -493,9 +500,9 @@ impl Connection {
         match preamble.long_type {
             long_packet_type::INITIAL => self.process_initial(bytes),
             long_packet_type::HANDSHAKE => self.process_handshake_pkt(bytes),
-            long_packet_type::ZERO_RTT | long_packet_type::RETRY => {
-                crate::quic_drop!(other_wire,
-                    "unsupported long_type={} (0RTT/RETRY)", preamble.long_type);
+            long_packet_type::ZERO_RTT => self.process_zero_rtt(bytes),
+            long_packet_type::RETRY => {
+                crate::quic_drop!(other_wire, "RETRY received as server (peer bug)");
                 Err(ConnError::Wire)
             }
             _ => {
@@ -503,6 +510,69 @@ impl Connection {
                 Err(ConnError::Wire)
             }
         }
+    }
+
+    /// 0-RTT (early-data) packet: long-header type=0x01, layout
+    /// matches Handshake (no Token field), but encrypted under the
+    /// `client_early_traffic_secret`-derived AEAD keys instead of
+    /// the handshake-stage ones. Frames inside share the OneRtt
+    /// stream namespace per RFC 9001 §5.5 — STREAM frames at
+    /// 0-RTT and 1-RTT level are the same logical streams. We
+    /// silently drop the packet if `early_recv` is None (no
+    /// resumption negotiated), matching the spec's "0-RTT MAY be
+    /// rejected; client treats it as transparent retransmission
+    /// over 1-RTT" behaviour.
+    fn process_zero_rtt(&mut self, bytes: &[u8]) -> Result<usize, ConnError> {
+        let preamble = parse_long_header_preamble(bytes).map_err(|_| {
+            crate::quic_drop!(long_header_parse, "0-RTT preamble: size={}", bytes.len());
+            ConnError::Wire
+        })?;
+        let mut p = preamble.tail_offset;
+        let (length, n) = read_varint(&bytes[p..]).map_err(|_| ConnError::Wire)?;
+        p += n;
+        let pn_offset = p;
+        let total_packet_len = pn_offset + length as usize;
+        if total_packet_len > bytes.len() {
+            return Err(ConnError::Wire);
+        }
+        let recv_keys = match self.early_recv.as_ref() {
+            Some(k) => k.clone(),
+            None => {
+                crate::quic_drop!(bad_state, "0-RTT packet but no early_recv keys");
+                // Consume the packet — caller's coalesced-packet
+                // walker shouldn't try to reparse the bytes as
+                // something else. Same shape as Initial / HS rejects.
+                return Ok(total_packet_len);
+            }
+        };
+
+        let mut buf = bytes[..total_packet_len].to_vec();
+        let pn = self.unprotect_and_decrypt(&mut buf, pn_offset, &recv_keys)?;
+        let pn_length = ((buf[0] & 0x03) as usize) + 1;
+        let payload_start = pn_offset + pn_length;
+        let payload_end = total_packet_len - TAG_LEN;
+        let payload = &buf[payload_start..payload_end];
+
+        // RFC 9001 §5.5: 0-RTT and 1-RTT carry the SAME application
+        // data namespace — STREAM frames at 0-RTT belong to the
+        // OneRtt stream space. Dispatch under OneRtt so a STREAM
+        // frame at 0-RTT followed by a STREAM frame at 1-RTT for
+        // the same stream id flows naturally into one RecvStream.
+        self.dispatch_frames(CryptoLevel::OneRtt, payload)?;
+
+        // ACKs for 0-RTT live in the application_space PN ring
+        // alongside 1-RTT ACKs (RFC 9000 §17.2.3).
+        self.application_space.largest_recv_pn = Some(
+            self.application_space
+                .largest_recv_pn
+                .map_or(pn, |x| x.max(pn)),
+        );
+        self.application_space.ack_pending = true;
+        crate::quic_event!(zero_rtt_accepted,
+            "pn={} payload_len={} local_cid={}",
+            pn, payload_end - payload_start,
+            crate::endpoint::hex8(self.local_cid.as_slice()));
+        Ok(total_packet_len)
     }
 
     fn process_initial(&mut self, bytes: &[u8]) -> Result<usize, ConnError> {
@@ -781,6 +851,21 @@ impl Connection {
 
     fn advance_tls(&mut self, config: &TlsServerConfig) -> Result<(), ConnError> {
         let new_state = self.tls.advance(config)?;
+        // 0-RTT (early-data) recv keys. Only set on resumption,
+        // and only after CH has been parsed — `client_early_traffic_secret()`
+        // returns Some at that point. Derived eagerly so we can
+        // unprotect 0-RTT packets that arrive in the same datagram
+        // as the Initial / right after; without these the packets
+        // get silently dropped by `aead_decrypt_failed`.
+        if let Some(et) = self.tls.client_early_traffic_secret() {
+            if self.early_recv.is_none() {
+                let recv = derive_chacha_keys(et);
+                self.early_recv = Some(DirKeys::from_chacha(&recv));
+                crate::quic_event!(early_keys_derived,
+                    "local_cid={}",
+                    crate::endpoint::hex8(self.local_cid.as_slice()));
+            }
+        }
         // Once handshake-stage secrets exist on the TLS side and
         // we haven't yet derived our packet-protection keys for
         // the Handshake space, derive them now.

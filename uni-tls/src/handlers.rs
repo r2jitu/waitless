@@ -621,11 +621,14 @@ impl TlsServer {
         // ticket_nonce = "" — we issue exactly one ticket per
         // connection, so the nonce-distinguisher RFC 8446 mentions
         // serves no purpose here.
+        // TCP TLS resumption path doesn't yet advertise 0-RTT
+        // (Phase E in the QUIC roadmap). Empty extensions list.
         let body_len = build_new_session_ticket(
             TICKET_LIFETIME_SECONDS,
             age_add,
             &[],
             &sealed[..n],
+            &[], // no extensions (no early_data)
             &mut nst_body,
         )
         .ok_or(HandshakeError::Internal)?;

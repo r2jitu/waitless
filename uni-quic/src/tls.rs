@@ -180,6 +180,15 @@ pub struct QuicTls {
     handshake_secrets: Option<HandshakeSecrets>,
     application_secrets: Option<ApplicationSecrets>,
 
+    /// Client early-data (0-RTT) traffic secret. `Some` only on a
+    /// resumed handshake whose PSK validated — derived from the
+    /// early_secret + Transcript-Hash(ClientHello). The connection
+    /// layer turns this into AEAD keys for decrypting 0-RTT
+    /// packets. `None` for fresh handshakes (no early-data) and
+    /// always `None` for the SERVER side of early data (server
+    /// never sends 0-RTT).
+    client_early_traffic_secret: Option<[u8; 32]>,
+
     /// QUIC transport parameters (RFC 9000 §18) the server will
     /// advertise inside EncryptedExtensions. Set by the connection
     /// state machine before the first `advance`. Empty until set —
@@ -211,6 +220,7 @@ impl QuicTls {
             tx_one_rtt: Vec::new(),
             handshake_secrets: None,
             application_secrets: None,
+            client_early_traffic_secret: None,
             server_transport_params: Vec::new(),
             client_transport_params: None,
         }
@@ -253,6 +263,13 @@ impl QuicTls {
     /// even before client Finished arrives.
     pub fn application_secrets(&self) -> Option<&ApplicationSecrets> {
         self.application_secrets.as_ref()
+    }
+
+    /// Client early-data (0-RTT) traffic secret. `Some` only on
+    /// resumed handshakes — the connection layer derives AEAD keys
+    /// from this and unprotects incoming 0-RTT packets with them.
+    pub fn client_early_traffic_secret(&self) -> Option<&[u8; 32]> {
+        self.client_early_traffic_secret.as_ref()
     }
 
     /// Append handshake bytes received from a CRYPTO frame at
@@ -406,10 +423,19 @@ impl QuicTls {
             .map(|r| r.selected_identity);
         let resumed = resume_accept.is_some();
         if let Some(ra) = resume_accept {
-            // `ra` is moved here — capture selected_identity into a
-            // local first since we still want to log it.
             let id = ra.selected_identity;
             self.schedule = ra.schedule;
+            // Derive client_early_traffic_secret from
+            // Transcript-Hash(ClientHello). At this point
+            // `self.transcript` already includes the full CH
+            // (updated above) and nothing else, so its snapshot
+            // IS that hash. The connection layer pops it via
+            // `client_early_traffic_secret()` and turns it into
+            // 0-RTT AEAD keys; without those keys we'd silently
+            // drop every 0-RTT packet the client sends.
+            let transcript_h0 = self.transcript.snapshot();
+            self.client_early_traffic_secret =
+                Some(self.schedule.early_traffic(&transcript_h0));
             crate::quic_event!(tickets_accepted, "selected_identity={}", id);
         }
 
@@ -476,6 +502,26 @@ impl QuicTls {
             extras.push((
                 uni_tls::handshake::ext_type::APPLICATION_LAYER_PROTOCOL_NEGOTIATION,
                 blob.as_slice(),
+            ));
+        }
+        // RFC 8446 §4.2.10 / RFC 9001 §4.6: empty `early_data`
+        // extension in EE = "I accept 0-RTT for this conn". Without
+        // this, an RFC-compliant client treats 0-RTT as REJECTED
+        // even when its CH offered it AND we accepted the PSK —
+        // the client retransmits the early data over 1-RTT instead
+        // of relying on it. We only emit when both:
+        //   * the client offered early-data (we'd add the extension
+        //     parsing to ClientHello to detect this — for now we
+        //     just gate on `resumed`, which is the necessary
+        //     precondition; for non-early-data resumptions the
+        //     client ignores the EE extension)
+        //   * we have early_recv keys ready
+        // In practice today the gate is just `resumed && PSK_offered`
+        // — early_data acceptance follows automatically on resumption.
+        if resumed {
+            extras.push((
+                uni_tls::handshake::ext_type::EARLY_DATA,
+                &[], // empty body in EE
             ));
         }
         let ee_body_len =
@@ -655,13 +701,26 @@ impl QuicTls {
         let n = uni_tls::ticket::seal_ticket(&pt, &mut sealed)
             .ok_or(QuicTlsError::Internal)?;
 
-        // RFC 8446 §4.6.1 NewSessionTicket layout.
-        let mut nst_body = alloc::vec![0u8; n + 32];
+        // RFC 8446 §4.6.1 NewSessionTicket layout, plus the
+        // RFC 9001 §4.6.1 `early_data` extension carrying the
+        // sentinel `max_early_data_size = 0xffffffff`. Without
+        // this extension the client won't even attempt 0-RTT on
+        // the next connection — it's the sole signal "future-self
+        // accepts 0-RTT". RFC 9001 mandates exactly this value
+        // for QUIC; any other is a connection error.
+        let mut early_data_ext = [0u8; 8];
+        early_data_ext[0..2]
+            .copy_from_slice(&uni_tls::handshake::ext_type::EARLY_DATA.to_be_bytes());
+        early_data_ext[2..4].copy_from_slice(&4u16.to_be_bytes());
+        early_data_ext[4..8].copy_from_slice(&0xffff_ffffu32.to_be_bytes());
+
+        let mut nst_body = alloc::vec![0u8; n + 64];
         let body_len = uni_tls::handshake::build_new_session_ticket(
             uni_tls::ticket::TICKET_LIFETIME_SECONDS,
             age_add,
             &[], // empty ticket_nonce — one ticket per connection
             &sealed[..n],
+            &early_data_ext,
             &mut nst_body,
         )
         .ok_or(QuicTlsError::Internal)?;

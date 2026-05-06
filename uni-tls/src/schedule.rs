@@ -332,6 +332,29 @@ impl KeySchedule {
         &self.secret
     }
 
+    /// Derive the client early-data traffic secret (RFC 8446 §7.1):
+    ///
+    ///     client_early_traffic = Derive-Secret(early_secret,
+    ///                                          "c e traffic",
+    ///                                          ClientHello)
+    ///
+    /// Returned independently from a state transition because in
+    /// QUIC 0-RTT the server needs early-data keys *immediately*
+    /// after parsing CH (so it can decrypt 0-RTT packets that
+    /// arrive in the same datagram), without yet committing to
+    /// the handshake-stage state. `transcript` is the hash of
+    /// just the ClientHello (`Transcript-Hash(ClientHello)`).
+    /// Returns the 32-byte traffic secret; caller derives AEAD
+    /// keys via `derive_chacha_keys` (or equivalent).
+    ///
+    /// Only meaningful on a `KeySchedule::new_with_psk(...)` —
+    /// `new_without_psk` produces an early_secret tied to the
+    /// zero-PSK and the resulting traffic secret can't decrypt
+    /// any client traffic.
+    pub fn early_traffic(&self, transcript: &[u8; HASH_LEN]) -> [u8; HASH_LEN] {
+        derive_secret(&self.secret, b"c e traffic", transcript)
+    }
+
     /// Transition from the Early stage to the Handshake stage by
     /// extracting the handshake secret from the (EC)DHE shared secret.
     /// `transcript` is the hash of all handshake messages so far
