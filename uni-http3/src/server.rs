@@ -115,6 +115,13 @@ where
     // so the recv buffer can't grow without bound.
     use alloc::collections::BTreeSet;
     let mut uni_seen: BTreeSet<u64> = BTreeSet::new();
+    // Per-connection scratch for the request-recv buffer. Each
+    // handle_request `clear()`s it on entry — capacity stays —
+    // instead of allocating a fresh 16 KiB Vec per request. For
+    // a refresh-spamming session this saves one 16 KiB alloc
+    // per refresh (the largest single alloc on the request hot
+    // path).
+    let mut recv_scratch: Vec<u8> = Vec::with_capacity(16 * 1024);
     loop {
         let sid = match conn.accept_stream().await {
             Some(s) => s,
@@ -127,7 +134,7 @@ where
             // task per request, but the conn task already
             // multiplexes; doing it inline keeps lifetimes simple
             // and matches the shape of //uni-http's handle_conn.
-            handle_request(&conn, sid, h.as_ref()).await;
+            handle_request(&conn, sid, h.as_ref(), &mut recv_scratch).await;
         } else if sid & 0x3 == 0x2 {
             // Peer unidirectional streams — control, QPACK
             // encoder, QPACK decoder. We can't actively drain
@@ -151,8 +158,12 @@ where
     }
 }
 
-async fn handle_request<H, F>(conn: &QuicConn, sid: u64, handler: &H)
-where
+async fn handle_request<H, F>(
+    conn: &QuicConn,
+    sid: u64,
+    handler: &H,
+    buf: &mut Vec<u8>,
+) where
     H: Fn(Request) -> F,
     F: core::future::Future<Output = Response>,
 {
@@ -161,8 +172,10 @@ where
     //
     // Buffer cap: enough for our worst-case single request (path +
     // headers + small body). Match `uni_http::Request`'s 8 KiB body.
+    // The buf is per-conn scratch; we clear() and reuse capacity
+    // across requests on the same connection.
     const RECV_CAP: usize = 16 * 1024;
-    let mut buf: Vec<u8> = Vec::with_capacity(RECV_CAP);
+    buf.clear();
     let mut chunk = [0u8; 4096];
     let mut headers_seen = false;
     let mut headers_value: Vec<u8> = Vec::new();
