@@ -219,11 +219,21 @@ struct Slot {
     /// `Some(Weak)` after install. The Weak's upgrade fails when
     /// the conn task ends — that's the implicit free.
     inbox: Option<Weak<ConnInbox>>,
+    /// Source IP that allocated this slot. Used by `allocate` to
+    /// enforce a per-source-IP cap: a single peer (or attacker
+    /// spoofing a single source) cannot consume more than
+    /// `PER_IP_SLOT_LIMIT` slots, leaving room for legitimate
+    /// new connections from other peers.
+    src_ip: uni::runtime::IpAddr,
 }
 
 impl Default for Slot {
     fn default() -> Self {
-        Slot { generation: 0, inbox: None }
+        Slot {
+            generation: 0,
+            inbox: None,
+            src_ip: uni::runtime::IpAddr::V4_ANY,
+        }
     }
 }
 
@@ -291,23 +301,44 @@ impl SlotTable {
             .insert(dcid.to_vec(), (idx, generation));
     }
 
-    /// Allocate a free slot. Returns `(slot_index, generation)`
-    /// to embed in the local CID. `None` if the table is full.
-    pub fn allocate(&self) -> Option<(u16, u16)> {
+    /// Allocate a free slot for a new conn from `src_ip`. Returns
+    /// `(slot_index, generation)` to embed in the local CID.
+    /// `None` if the table is full **or** `src_ip` already holds
+    /// the per-IP cap (see `PER_IP_SLOT_LIMIT`). The per-IP cap
+    /// stops a single peer (or an attacker spoofing one) from
+    /// monopolising the slot table — a flood of Initial packets
+    /// from one source can fill at most that many slots,
+    /// leaving the rest for legitimate peers.
+    ///
+    /// The walk is O(slots), counting per-IP usage in the same
+    /// pass that finds a free slot — no extra map. With a
+    /// 1024-slot table that's a couple of microseconds, well
+    /// under the cost of allocating + sealing the Initial reply
+    /// we'd otherwise be doing.
+    pub fn allocate(&self, src_ip: uni::runtime::IpAddr) -> Option<(u16, u16)> {
+        const PER_IP_SLOT_LIMIT: usize = 64;
         let mut slots = self.slots.borrow_mut();
+        let mut per_ip_count = 0usize;
+        let mut free_idx: Option<usize> = None;
         for (i, s) in slots.iter_mut().enumerate() {
-            // Slot is "free" iff its Weak upgrade returns None
-            // (or the slot has never been used). We keep stale
-            // Weak references in the slot until the next allocate
-            // hits them — saves a sweep loop.
             let live = s.inbox.as_ref().and_then(Weak::upgrade).is_some();
-            if !live {
-                s.generation = s.generation.wrapping_add(1);
-                s.inbox = None; // clear stale Weak
-                return Some((i as u16, s.generation));
+            if live {
+                if s.src_ip == src_ip {
+                    per_ip_count += 1;
+                }
+            } else if free_idx.is_none() {
+                free_idx = Some(i);
             }
         }
-        None
+        if per_ip_count >= PER_IP_SLOT_LIMIT {
+            return None;
+        }
+        let i = free_idx?;
+        let s = &mut slots[i];
+        s.generation = s.generation.wrapping_add(1);
+        s.inbox = None; // clear stale Weak
+        s.src_ip = src_ip;
+        Some((i as u16, s.generation))
     }
 
     /// Install an inbox at `(idx, gen)`. The caller has just
@@ -439,11 +470,17 @@ mod tests {
         assert!(!inbox.push(dgram(0x02)));
     }
 
+    fn ip(b: u8) -> uni::runtime::IpAddr {
+        uni::runtime::IpAddr::V4(uni::runtime::Ipv4Addr {
+            addr: u32::from_be_bytes([10, 0, 0, b]),
+        })
+    }
+
     #[test]
     fn slot_table_allocate_lookup_recycle() {
         let table = SlotTable::new(4);
         let inbox1 = ConnInbox::new();
-        let (idx, gen1) = table.allocate().expect("first allocate");
+        let (idx, gen1) = table.allocate(ip(1)).expect("first allocate");
         table.install(idx, gen1, &inbox1);
 
         // Lookup with right gen returns a strong Rc.
@@ -463,7 +500,7 @@ mod tests {
 
         // Allocate again: same slot can be re-used; gen bumps.
         let inbox2 = ConnInbox::new();
-        let (idx2, gen2) = table.allocate().expect("re-allocate");
+        let (idx2, gen2) = table.allocate(ip(1)).expect("re-allocate");
         assert_eq!(idx2, idx);
         assert_ne!(gen2, gen1);
         table.install(idx2, gen2, &inbox2);
@@ -477,14 +514,39 @@ mod tests {
         let table = SlotTable::new(2);
         let i1 = ConnInbox::new();
         let i2 = ConnInbox::new();
-        let (a, ga) = table.allocate().unwrap();
+        let (a, ga) = table.allocate(ip(1)).unwrap();
         table.install(a, ga, &i1);
-        let (b, gb) = table.allocate().unwrap();
+        let (b, gb) = table.allocate(ip(2)).unwrap();
         table.install(b, gb, &i2);
-        assert!(table.allocate().is_none());
+        assert!(table.allocate(ip(3)).is_none());
         // Free one — allocate succeeds again.
         drop(i1);
-        assert!(table.allocate().is_some());
+        assert!(table.allocate(ip(3)).is_some());
+    }
+
+    /// Per-IP cap (PER_IP_SLOT_LIMIT = 64 in the impl). One IP
+    /// can fill at most that many slots; further allocations from
+    /// it are rejected even if there's global headroom.
+    #[test]
+    fn slot_table_per_ip_cap() {
+        // Use a table larger than PER_IP_SLOT_LIMIT so it's the
+        // per-IP cap, not the global cap, that bites first.
+        let table = SlotTable::new(128);
+        let attacker = ip(7);
+        let mut held: alloc::vec::Vec<Rc<ConnInbox>> = alloc::vec::Vec::new();
+        for _ in 0..64 {
+            let inbox = ConnInbox::new();
+            let (i, g) = table
+                .allocate(attacker)
+                .expect("under cap should still succeed");
+            table.install(i, g, &inbox);
+            held.push(inbox);
+        }
+        // 65th from same IP — rejected.
+        assert!(table.allocate(attacker).is_none());
+        // But a different IP can still allocate (table is far
+        // from full globally — 128 slots, 64 used).
+        assert!(table.allocate(ip(8)).is_some());
     }
 
     #[test]

@@ -422,10 +422,15 @@ async fn listener_loop<H, F>(
             continue;
         }
 
-        let (slot_idx, generation) = match slots.allocate() {
+        let (slot_idx, generation) = match slots.allocate(src_ip) {
             Some(x) => x,
             None => {
-                crate::quic_drop!(slot_table_full, "dcid={}", hex8(&dcid));
+                // Either the global table is full or this src_ip
+                // is already at its per-IP cap. Both surface as
+                // `slot_table_full` for now; the inbox unit tests
+                // distinguish them.
+                crate::quic_drop!(slot_table_full,
+                    "dcid={} src_ip={:?}", hex8(&dcid), src_ip);
                 continue;
             }
         };
