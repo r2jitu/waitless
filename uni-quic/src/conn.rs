@@ -1855,7 +1855,11 @@ impl Connection {
         }
 
         // Handshake packet (after Initial has at least an ACK).
-        let mut hs_crypto = vec![0u8; 8192];
+        // Stack-allocate the drain buffer — the server flight is
+        // bounded (cert + EE + CV + Finished, well under 8 KiB),
+        // and the previous Vec::with_capacity(8192) was hitting
+        // the heap on every flush.
+        let mut hs_crypto = [0u8; 8192];
         let hs_n = self
             .tls
             .pop_handshake(CryptoLevel::Handshake, &mut hs_crypto);
@@ -2180,9 +2184,12 @@ impl Connection {
                 crate::endpoint::hex8(self.local_cid.as_slice()));
         }
 
-        // Drain pending STREAM data, directly into `out`.
-        let stream_ids: Vec<u64> = self.send_streams.keys().copied().collect();
-        for sid in stream_ids {
+        // Drain pending STREAM data, directly into `out`. Use
+        // iter_mut so we don't have to collect the stream IDs
+        // into a temporary Vec just to satisfy the borrow
+        // checker — the per-flush stream-ids alloc the old
+        // shape required is gone.
+        for (sid, s) in self.send_streams.iter_mut() {
             let body_so_far = out.len() - payload_offset;
             if body_so_far >= PACKET_BODY_BUDGET {
                 break;
@@ -2191,11 +2198,7 @@ impl Connection {
             if max_chunk == 0 {
                 break;
             }
-            let s = match self.send_streams.get_mut(&sid) {
-                Some(s) => s,
-                None => continue,
-            };
-            if s.pop_chunk_into(sid, max_chunk, out)
+            if s.pop_chunk_into(*sid, max_chunk, out)
                 .map_err(|_| ConnError::Wire)?
             {
                 ack_eliciting = true;
