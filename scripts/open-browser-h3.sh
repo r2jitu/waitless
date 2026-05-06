@@ -60,5 +60,7 @@ echo >&2
 
 exec "$APP" \
     --user-data-dir="$DATA_DIR" \
+    --no-first-run \
+    --no-default-browser-check \
     --origin-to-force-quic-on="localhost:$PORT" \
     "$URL"
