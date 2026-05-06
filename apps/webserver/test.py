@@ -180,6 +180,36 @@ class WebserverServiceTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"status", body)
 
+    def test_h3_burst_20_conns(self) -> None:
+        """20 sequential HTTP/3 GETs over fresh connections.
+
+        Each `h3_get` opens a new QUIC connection. Below the
+        per-IP slot cap (64) but enough to exercise repeated
+        handshake + slot-table churn. Catches regressions in
+        the QUIC connection lifecycle that wouldn't surface in
+        a single-conn smoke test (slot recycling, generation
+        bump, key derivation freshness, etc.).
+
+        We don't go higher because aioquic's `async with` exit
+        doesn't always send a CONNECTION_CLOSE before tearing
+        the socket down — lingering server-side conns then hold
+        slots until idle timeout, and a 200-burst test would
+        exceed the cap in a way unrelated to the QUIC stack
+        itself.
+        """
+        n = 20
+        failures = []
+        for i in range(n):
+            try:
+                status, body = h3_get("/health", port=TLS_PORT)
+                if status != 200 or b"status" not in body:
+                    failures.append(f"#{i}: status={status} body={body!r}")
+            except Exception as e:
+                failures.append(f"#{i}: {e!r}")
+                if len(failures) >= 5:
+                    break
+        self.assertFalse(failures, f"{len(failures)}/{n} failed: {failures[:5]}")
+
     def test_https_burst_30(self) -> None:
         """30 back-to-back HTTPS GETs with 0 failures.
 
