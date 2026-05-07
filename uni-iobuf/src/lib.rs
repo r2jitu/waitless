@@ -87,6 +87,63 @@ enum Inner {
     /// headroom / tailroom semantics. Common for HTML literal
     /// chunks, the QPACK static table, etc.
     Static { data: &'static [u8] },
+    /// Externally-managed buffer — the IOBuf borrows a region but
+    /// is responsible for invoking a release callback when it
+    /// drops. The canonical use case is NIC zero-copy RX: a
+    /// virtio-net descriptor's buffer flows up the stack as an
+    /// IOBuf; on drop the callback returns the descriptor to the
+    /// receive ring. Same offset/len semantics as `Heap` (so
+    /// AEAD-in-place, prepend, append all work the same way),
+    /// but the storage isn't dropped — instead the callback runs.
+    ///
+    /// SAFETY: the caller MUST guarantee `base + capacity` is a
+    /// valid, exclusively-owned region for the IOBuf's lifetime,
+    /// and that the callback is safe to invoke on Drop. The
+    /// callback typically captures a back-channel (Rc, raw
+    /// queue index) to return the buffer to its origin.
+    External(External),
+}
+
+/// Backing for [`Inner::External`]. Held in a wrapping struct so
+/// the manual `Drop` impl can run the release callback exactly
+/// once. Trait-object Drop callback so different consumers (NIC
+/// drivers, mmap'd regions, refcounted shared buffers) all
+/// flow through the same IOBuf shape.
+struct External {
+    /// Start of the underlying region.
+    base: core::ptr::NonNull<u8>,
+    /// Total bytes of the region (`base + capacity` is one past
+    /// the end). The visible payload is at `[offset..offset+len]`
+    /// within these bytes.
+    capacity: u32,
+    /// Visible-payload start, relative to `base`. `prepend`
+    /// shrinks toward 0; `consume` grows toward
+    /// `offset + len`.
+    offset: u32,
+    /// Visible-payload byte length.
+    len: u32,
+    /// Release callback — runs in `Drop`. `Some` until consumed;
+    /// `None` after one of the destructure paths (`split_off`,
+    /// future refcount-share) has taken ownership of the
+    /// callback. Boxed because we need a heterogeneous Drop
+    /// closure; the alloc happens once at IOBuf construction
+    /// time, not per-use.
+    on_drop: Option<alloc::boxed::Box<dyn FnOnce() + Send>>,
+}
+
+// SAFETY: `External` is Send because the underlying memory is
+// exclusively owned (the constructor takes that as a precondition)
+// and the on_drop callback is Send. We don't expose interior
+// mutability across threads — IOBuf itself is moved across thread
+// boundaries, not shared.
+unsafe impl Send for External {}
+
+impl Drop for External {
+    fn drop(&mut self) {
+        if let Some(cb) = self.on_drop.take() {
+            cb();
+        }
+    }
 }
 
 impl IOBuf {
@@ -137,6 +194,44 @@ impl IOBuf {
         }
     }
 
+    /// Wrap an externally-managed buffer region. The IOBuf treats
+    /// `[base..base+capacity]` as its full backing, with the
+    /// visible payload starting at `offset` of length `len` (so
+    /// `headroom = offset`, `tailroom = capacity - offset - len`).
+    /// `on_drop` runs when the IOBuf is dropped — typically the
+    /// caller closes a back-channel that returns the descriptor
+    /// to its origin (a NIC RX ring, an mmap'd page pool, etc.).
+    ///
+    /// SAFETY: the caller MUST guarantee:
+    ///   * `base..base+capacity` is a valid, exclusively-owned
+    ///     byte region for the IOBuf's lifetime — no aliasing
+    ///     with anything outside the IOBuf's visibility.
+    ///   * `offset + len <= capacity`.
+    ///   * The `on_drop` callback is sound to invoke (won't UAF
+    ///     anything, won't double-free, can run from any thread
+    ///     since IOBuf is `Send`).
+    pub unsafe fn from_external<F>(
+        base: core::ptr::NonNull<u8>,
+        capacity: u32,
+        offset: u32,
+        len: u32,
+        on_drop: F,
+    ) -> Self
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        debug_assert!(offset.saturating_add(len) <= capacity);
+        IOBuf {
+            inner: Inner::External(External {
+                base,
+                capacity,
+                offset,
+                len,
+                on_drop: Some(alloc::boxed::Box::new(on_drop)),
+            }),
+        }
+    }
+
     /// Visible payload bytes.
     pub fn data(&self) -> &[u8] {
         match &self.inner {
@@ -150,6 +245,18 @@ impl IOBuf {
                 &storage[o..o + l]
             }
             Inner::Static { data } => data,
+            Inner::External(e) => {
+                // SAFETY: External::base + offset is in-bounds
+                // by construction precondition (offset + len <=
+                // capacity); the underlying memory is exclusively
+                // owned by this IOBuf for its lifetime.
+                unsafe {
+                    core::slice::from_raw_parts(
+                        e.base.as_ptr().add(e.offset as usize),
+                        e.len as usize,
+                    )
+                }
+            }
         }
     }
 
@@ -157,6 +264,7 @@ impl IOBuf {
         match &self.inner {
             Inner::Heap { len, .. } => *len as usize,
             Inner::Static { data } => data.len(),
+            Inner::External(e) => e.len as usize,
         }
     }
 
@@ -171,6 +279,7 @@ impl IOBuf {
         match &self.inner {
             Inner::Heap { offset, .. } => *offset as usize,
             Inner::Static { .. } => 0,
+            Inner::External(e) => e.offset as usize,
         }
     }
 
@@ -187,6 +296,10 @@ impl IOBuf {
                 storage.len().saturating_sub(used)
             }
             Inner::Static { .. } => 0,
+            Inner::External(e) => {
+                let used = e.offset as usize + e.len as usize;
+                (e.capacity as usize).saturating_sub(used)
+            }
         }
     }
 
@@ -205,6 +318,17 @@ impl IOBuf {
                 Some(&mut storage[o..o + l])
             }
             Inner::Static { .. } => None,
+            Inner::External(e) => {
+                // SAFETY: same as `data()`; we additionally hold
+                // `&mut self` so no aliasing with other readers
+                // during this call.
+                Some(unsafe {
+                    core::slice::from_raw_parts_mut(
+                        e.base.as_ptr().add(e.offset as usize),
+                        e.len as usize,
+                    )
+                })
+            }
         }
     }
 
@@ -236,6 +360,25 @@ impl IOBuf {
                 Ok(())
             }
             Inner::Static { .. } => Err(IOBufError::Immutable),
+            Inner::External(e) => {
+                let n = data.len();
+                if n > e.offset as usize {
+                    return Err(IOBufError::NoHeadroom);
+                }
+                let new_offset = e.offset - n as u32;
+                // SAFETY: bounds checked above; exclusive access
+                // via `&mut self`.
+                unsafe {
+                    let dst = core::slice::from_raw_parts_mut(
+                        e.base.as_ptr().add(new_offset as usize),
+                        n,
+                    );
+                    dst.copy_from_slice(data);
+                }
+                e.offset = new_offset;
+                e.len += n as u32;
+                Ok(())
+            }
         }
     }
 
@@ -258,6 +401,23 @@ impl IOBuf {
                 Ok(())
             }
             Inner::Static { .. } => Err(IOBufError::Immutable),
+            Inner::External(e) => {
+                let end = e.offset as usize + e.len as usize;
+                let n = data.len();
+                if end + n > e.capacity as usize {
+                    return Err(IOBufError::NoTailroom);
+                }
+                // SAFETY: bounds checked above.
+                unsafe {
+                    let dst = core::slice::from_raw_parts_mut(
+                        e.base.as_ptr().add(end),
+                        n,
+                    );
+                    dst.copy_from_slice(data);
+                }
+                e.len += n as u32;
+                Ok(())
+            }
         }
     }
 
@@ -281,6 +441,17 @@ impl IOBuf {
                 Ok(&mut storage[end..end + n])
             }
             Inner::Static { .. } => Err(IOBufError::Immutable),
+            Inner::External(e) => {
+                let end = e.offset as usize + e.len as usize;
+                if end + n > e.capacity as usize {
+                    return Err(IOBufError::NoTailroom);
+                }
+                e.len += n as u32;
+                // SAFETY: bounds checked above; exclusive access.
+                Ok(unsafe {
+                    core::slice::from_raw_parts_mut(e.base.as_ptr().add(end), n)
+                })
+            }
         }
     }
 
@@ -306,6 +477,14 @@ impl IOBuf {
                 *data = &data[n..];
                 Ok(())
             }
+            Inner::External(e) => {
+                if n > e.len as usize {
+                    return Err(IOBufError::OutOfBounds);
+                }
+                e.offset += n as u32;
+                e.len -= n as u32;
+                Ok(())
+            }
         }
     }
 
@@ -319,6 +498,12 @@ impl IOBuf {
     /// `Vec<u8>` (uni-quic's `SendStream::write_owned`). When that
     /// API itself moves to IOBuf the bridge goes away.
     pub fn into_owned_vec(self) -> alloc::vec::Vec<u8> {
+        // For Heap with an exactly-fitting payload, migrate the
+        // Box<[u8]> into a Vec<u8> with no copy. Other variants
+        // (Static, External) require copying since we don't own
+        // the storage in a Vec-compatible shape. External notably
+        // ALSO has to release its descriptor on drop — copying
+        // out lets the on_drop callback fire promptly.
         match self.inner {
             Inner::Heap {
                 storage,
@@ -335,6 +520,20 @@ impl IOBuf {
                 }
             }
             Inner::Static { data } => data.to_vec(),
+            Inner::External(e) => {
+                // SAFETY: same access semantics as `data()`.
+                let slice = unsafe {
+                    core::slice::from_raw_parts(
+                        e.base.as_ptr().add(e.offset as usize),
+                        e.len as usize,
+                    )
+                };
+                let v = slice.to_vec();
+                // `e` (and its on_drop) is dropped at end of arm,
+                // returning the descriptor to its origin.
+                drop(e);
+                v
+            }
         }
     }
 
@@ -347,13 +546,14 @@ impl IOBuf {
     }
 
     /// If this IOBuf is a static borrow, return the underlying
-    /// `&'static [u8]`. Returns `None` for heap-owned variants.
-    /// Lets the H3 / TLS / TCP send paths take a borrowed-static
-    /// fast path that holds onto the slice without copying.
+    /// `&'static [u8]`. Returns `None` for heap-owned and
+    /// external variants. Lets the H3 / TLS / TCP send paths
+    /// take a borrowed-static fast path that holds onto the
+    /// slice without copying.
     pub fn as_static(&self) -> Option<&'static [u8]> {
         match &self.inner {
             Inner::Static { data } => Some(data),
-            Inner::Heap { .. } => None,
+            Inner::Heap { .. } | Inner::External(_) => None,
         }
     }
 
@@ -386,6 +586,13 @@ impl IOBuf {
                     return Err(IOBufError::OutOfBounds);
                 }
                 *data = &data[..data.len() - n];
+                Ok(())
+            }
+            Inner::External(e) => {
+                if n > e.len as usize {
+                    return Err(IOBufError::OutOfBounds);
+                }
+                e.len -= n as u32;
                 Ok(())
             }
         }
@@ -1034,6 +1241,53 @@ mod tests {
         let r = write!(w, "cdefgh");
         assert!(r.is_err());
         assert!(w.overflowed());
+    }
+
+    #[test]
+    fn external_buf_drop_runs_callback() {
+        use core::ptr::NonNull;
+        use core::sync::atomic::{AtomicBool, Ordering};
+        extern crate std;
+        use std::sync::Arc;
+
+        let released = Arc::new(AtomicBool::new(false));
+        let released_for_cb = released.clone();
+
+        // Owns a small backing region; we'll wrap it as External
+        // and ensure on_drop fires when the IOBuf drops.
+        let mut storage: alloc::vec::Vec<u8> = alloc::vec![0u8; 32];
+        storage[5..13].copy_from_slice(b"abcdefgh");
+        let ptr = NonNull::new(storage.as_mut_ptr()).unwrap();
+        {
+            // SAFETY: storage outlives the IOBuf in this block;
+            // the on_drop closure doesn't free anything (the
+            // Vec frees its allocation on its own scope-end).
+            let mut buf = unsafe {
+                IOBuf::from_external(ptr, 32, 5, 8, move || {
+                    released_for_cb.store(true, Ordering::SeqCst);
+                })
+            };
+            assert_eq!(buf.data(), b"abcdefgh");
+            assert_eq!(buf.headroom(), 5);
+            assert_eq!(buf.tailroom(), 19);
+            // Prepend uses headroom (writes into storage[2..5]).
+            buf.prepend(b"PRE").unwrap();
+            assert_eq!(buf.data(), b"PREabcdefgh");
+            // Append uses tailroom.
+            buf.append_slice(b"END").unwrap();
+            assert_eq!(buf.data(), b"PREabcdefghEND");
+            // Mutate in place.
+            for byte in buf.data_mut().unwrap() {
+                if (b'a'..=b'z').contains(byte) {
+                    *byte ^= 0x20;
+                }
+            }
+            assert_eq!(buf.data(), b"PREABCDEFGHEND");
+            // Callback hasn't run yet.
+            assert!(!released.load(Ordering::SeqCst));
+        }
+        // IOBuf dropped at scope end → on_drop fires.
+        assert!(released.load(Ordering::SeqCst));
     }
 
     #[test]
