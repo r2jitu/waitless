@@ -113,8 +113,12 @@ where
     // recv buffer. To avoid that, track which uni sids we've
     // already accepted and drop their buffers on each re-yield
     // so the recv buffer can't grow without bound.
-    use alloc::collections::BTreeSet;
-    let mut uni_seen: BTreeSet<u64> = BTreeSet::new();
+    // Browsers open exactly 3 peer uni streams per H3 conn
+    // (control + QPACK encoder + QPACK decoder); 6 covers any
+    // future client that opens duplicates and saves the 3 tree-
+    // node allocs a `BTreeSet<u64>` would do per fresh conn.
+    // Linear scan is cheaper than a tree at this cardinality.
+    let mut uni_seen: [Option<u64>; 6] = [None; 6];
     // Per-connection scratch buffers. Each `handle_request` /
     // `write_response` `clear()`s them on entry and reuses the
     // existing capacity — instead of allocating a fresh Vec per
@@ -148,9 +152,34 @@ where
             // We only count NEW peer uni streams in the event
             // counter, so it stays at ~3 per conn rather than
             // climbing per refresh.
-            let new_uni = uni_seen.insert(sid);
-            if new_uni {
-                crate::h3_event!(peer_uni_streams_seen, "sid={}", sid);
+            // Inline contains+insert: scan the array for `sid`,
+            // and remember the first empty slot. If `sid` is
+            // not found, fill the empty slot. Past the cap, we
+            // silently treat the sid as already-seen (no
+            // event); the alternative — abort the conn — would
+            // be hostile to non-conformant clients without a
+            // real benefit.
+            let mut found = false;
+            let mut empty: Option<usize> = None;
+            for (idx, slot) in uni_seen.iter().enumerate() {
+                match slot {
+                    Some(v) if *v == sid => {
+                        found = true;
+                        break;
+                    }
+                    Some(_) => {}
+                    None => {
+                        if empty.is_none() {
+                            empty = Some(idx);
+                        }
+                    }
+                }
+            }
+            if !found {
+                if let Some(idx) = empty {
+                    uni_seen[idx] = Some(sid);
+                    crate::h3_event!(peer_uni_streams_seen, "sid={}", sid);
+                }
             }
             conn.discard_recv(sid);
         } else {
