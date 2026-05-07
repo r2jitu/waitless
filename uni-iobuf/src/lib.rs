@@ -814,49 +814,72 @@ pub enum IOBufError {
 /// each layer can append/prepend nodes (or prepend INTO the
 /// front node's headroom) without disturbing the rest.
 ///
-/// Layout: a small-vec-style `head: Option<IOBuf>` plus a lazy
-/// `tail: VecDeque<IOBuf>`. Single-element chains (the common
-/// case for static-body responses — `Response::ok(b"text/plain",
-/// HEALTH_JSON)`) live entirely in `head` and never allocate the
-/// deque. The deque allocates only when a second part is pushed,
-/// inspired by folly's intrusive-`next`/`prev` chain (which has
+/// Layout: an inline `[Option<IOBuf>; INLINE_PARTS]` array for
+/// the first parts, plus a lazy `VecDeque<IOBuf>` overflow for
+/// chains that grow past the inline capacity. Chains with up to
+/// [`INLINE_PARTS`] (8) parts cost **zero** heap allocations for
+/// the chain machinery — covers the common multi-layer shape
+/// (eth + ip + tcp + http + body, plus a couple of layered
+/// framing headers) without forcing the producer to materialise
+/// a `VecDeque` per chain.
+///
+/// Inspired by folly's intrusive `next`/`prev` chain, which has
 /// zero chain-machinery allocs because the IOBuf IS the chain
-/// element). We approximate that property for the common
-/// 1-element case without growing the IOBuf size or paying the
-/// per-push `Box` allocation an intrusive linked list would
-/// incur for owned-storage IOBufs.
+/// element. We approximate that property here without:
+///
+///   * growing the IOBuf size by two pointers,
+///   * paying a `Box<IOBuf>` per element (an owned linked list
+///     would),
+///   * making chain operations unsafe.
+///
+/// The only chain alloc occurs when `part_count > INLINE_PARTS`
+/// — a deeply chunked HTML page or chunked-transfer body. For
+/// those the `overflow` `VecDeque` allocates on the first push
+/// past the inline cap.
 pub struct IOBufChain {
-    /// First part. `None` for empty chains. Inline so a
-    /// 1-element chain (the typical static-body response) costs
-    /// zero heap allocations.
-    head: Option<IOBuf>,
-    /// Subsequent parts. Lazily allocated on the second
-    /// `push_back` / `push_front` — `VecDeque::new()` itself is
-    /// alloc-free; the buffer materialises on first push.
-    tail: VecDeque<IOBuf>,
+    /// Inline slots — first `INLINE_PARTS` parts live here,
+    /// packed at indices `[0, inline_count)`. No allocation.
+    inline: [Option<IOBuf>; INLINE_PARTS],
+    /// Number of parts in `inline` (always packed front-flush).
+    inline_count: u8,
+    /// Parts past the inline cap. Lazily allocated; logically
+    /// concatenated AFTER the inline parts. `VecDeque::new()`
+    /// itself is alloc-free — the buffer materialises only on
+    /// the first push that exceeds `INLINE_PARTS`.
+    overflow: VecDeque<IOBuf>,
     total_len: usize,
 }
 
+/// Inline-array capacity for [`IOBufChain`]. Sized to cover the
+/// common multi-layer shape — header IOBuf prepended onto a
+/// body chain of a few parts, plus 1-2 framing IOBufs for
+/// layered protocols (TLS, H3). Chains past 8 parts spill to
+/// the `overflow` `VecDeque` and pay one allocation.
+pub const INLINE_PARTS: usize = 8;
+
 impl IOBufChain {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         IOBufChain {
-            head: None,
-            tail: VecDeque::new(),
+            inline: [const { None }; INLINE_PARTS],
+            inline_count: 0,
+            overflow: VecDeque::new(),
             total_len: 0,
         }
     }
 
+    /// Hint that the chain will hold at least `part_capacity`
+    /// parts. If the hint exceeds the inline cap, pre-allocates
+    /// the overflow deque so subsequent pushes don't reallocate.
+    /// A hint within the inline cap is a no-op (no alloc).
     pub fn with_capacity(part_capacity: usize) -> Self {
-        // Reserve `part_capacity - 1` slots in the tail (one
-        // slot is `head` itself). Hint of zero / one keeps the
-        // tail unallocated.
-        let tail_cap = part_capacity.saturating_sub(1);
+        let overflow_cap = part_capacity.saturating_sub(INLINE_PARTS);
         IOBufChain {
-            head: None,
-            tail: if tail_cap == 0 {
+            inline: [const { None }; INLINE_PARTS],
+            inline_count: 0,
+            overflow: if overflow_cap == 0 {
                 VecDeque::new()
             } else {
-                VecDeque::with_capacity(tail_cap)
+                VecDeque::with_capacity(overflow_cap)
             },
             total_len: 0,
         }
@@ -867,42 +890,63 @@ impl IOBufChain {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.head.is_none()
+        self.inline_count == 0
     }
 
     pub fn part_count(&self) -> usize {
-        if self.head.is_some() { 1 + self.tail.len() } else { 0 }
+        self.inline_count as usize + self.overflow.len()
     }
 
-    /// Append a buf to the back of the chain. First push lands
-    /// in `head` (no allocation); subsequent pushes go to `tail`
-    /// (one VecDeque allocation on the very first tail push).
+    /// Append a buf to the back of the chain. Goes into the
+    /// inline array if there's space, else into the overflow
+    /// deque (which allocates lazily on the first overflow push).
     pub fn push_back(&mut self, buf: IOBuf) {
         if buf.is_empty() {
             return;
         }
         self.total_len += buf.len();
-        if self.head.is_none() {
-            self.head = Some(buf);
+        let n = self.inline_count as usize;
+        if n < INLINE_PARTS {
+            self.inline[n] = Some(buf);
+            self.inline_count += 1;
         } else {
-            self.tail.push_back(buf);
+            self.overflow.push_back(buf);
         }
     }
 
-    /// Prepend a buf to the front of the chain. The new buf
-    /// becomes `head`; the previous head (if any) shifts to the
-    /// front of `tail`.
+    /// Prepend a buf to the front of the chain. New buf becomes
+    /// the front; existing inline parts shift right by one. If
+    /// the inline array was already full, the last inline part
+    /// rotates to the front of overflow before the shift.
+    ///
+    /// O(`INLINE_PARTS`) shift cost — for the typical layered-
+    /// header use case (one `push_front` per response) this is a
+    /// handful of `Option<IOBuf>` moves and dominated by the
+    /// surrounding work.
     pub fn push_front(&mut self, buf: IOBuf) {
         if buf.is_empty() {
             return;
         }
         self.total_len += buf.len();
-        if let Some(old_head) = self.head.take() {
-            // First multi-element insert: tail allocates on this
-            // push_front. Subsequent push_fronts re-use the deque.
-            self.tail.push_front(old_head);
+        let n = self.inline_count as usize;
+        if n < INLINE_PARTS {
+            // Shift inline[..n] right by 1 to make room at index 0.
+            for i in (0..n).rev() {
+                self.inline[i + 1] = self.inline[i].take();
+            }
+            self.inline[0] = Some(buf);
+            self.inline_count += 1;
+        } else {
+            // Inline is full. Rotate the last inline part out to
+            // the front of overflow, shift inline right, then
+            // insert at 0. Inline count stays at INLINE_PARTS.
+            let last = self.inline[INLINE_PARTS - 1].take().unwrap();
+            self.overflow.push_front(last);
+            for i in (0..INLINE_PARTS - 1).rev() {
+                self.inline[i + 1] = self.inline[i].take();
+            }
+            self.inline[0] = Some(buf);
         }
-        self.head = Some(buf);
     }
 
     /// Prepend `data` directly into the FRONT node's headroom,
@@ -911,27 +955,49 @@ impl IOBufChain {
     /// prepend a small fixed header (TLS record header, H3 frame
     /// header) without growing the chain.
     pub fn prepend_in_place(&mut self, data: &[u8]) -> Result<(), IOBufError> {
-        let front = self.head.as_mut().ok_or(IOBufError::NoHeadroom)?;
+        let front = self.inline[0].as_mut().ok_or(IOBufError::NoHeadroom)?;
         front.prepend(data)?;
         self.total_len += data.len();
         Ok(())
     }
 
     /// Iterate the chain front-to-back.
+    #[inline]
     pub fn iter(&self) -> impl Iterator<Item = &IOBuf> {
-        self.head.iter().chain(self.tail.iter())
+        // SAFETY: invariant of `inline_count` is that
+        // `inline[0..inline_count]` is always `Some`. `push_*`
+        // only writes `Some`; `pop_front` shifts and ends with
+        // a `None` in the freed slot which is past the new
+        // `inline_count`.
+        self.inline[..self.inline_count as usize]
+            .iter()
+            .map(|s| unsafe { s.as_ref().unwrap_unchecked() })
+            .chain(self.overflow.iter())
     }
 
     /// Pop the front part. Returns `None` when the chain is
-    /// empty. Adjusts `total_len` to account for the popped
-    /// part's payload. After a pop, the next tail part (if any)
-    /// promotes into `head` so a subsequent `pop_front` continues
-    /// to drain in chain order.
+    /// empty. Shifts inline left by one and (when overflow is
+    /// non-empty) promotes the first overflow element into the
+    /// freshly-vacated inline slot, so subsequent `pop_front`
+    /// calls continue to drain in chain order without ever
+    /// straddling inline/overflow.
     pub fn pop_front(&mut self) -> Option<IOBuf> {
-        let buf = self.head.take()?;
+        if self.inline_count == 0 {
+            return None;
+        }
+        let buf = self.inline[0].take().unwrap();
         self.total_len = self.total_len.saturating_sub(buf.len());
-        if let Some(next) = self.tail.pop_front() {
-            self.head = Some(next);
+        let n = self.inline_count as usize;
+        for i in 0..(n - 1) {
+            self.inline[i] = self.inline[i + 1].take();
+        }
+        self.inline_count -= 1;
+        // Promote the next overflow part into the freed inline
+        // slot so the inline array stays packed at the front of
+        // the chain — keeps `iter`/`pop_front` straightforward.
+        if let Some(next) = self.overflow.pop_front() {
+            self.inline[self.inline_count as usize] = Some(next);
+            self.inline_count += 1;
         }
         Some(buf)
     }
@@ -943,7 +1009,7 @@ impl IOBufChain {
     /// responsible for keeping `total_len` in sync via
     /// [`shrink_total_len`].
     pub fn front_mut(&mut self) -> Option<&mut IOBuf> {
-        self.head.as_mut()
+        self.inline[0].as_mut()
     }
 
     /// Decrease the cached `total_len` by `n`. Pair with a
@@ -955,24 +1021,38 @@ impl IOBufChain {
     }
 
     /// Drop every part still in the chain, leaving an empty
-    /// chain with its `VecDeque` allocation preserved. The
-    /// drops run in front-to-back order — same ordering as a
+    /// chain with its `overflow` allocation preserved (if any).
+    /// The drops run in front-to-back order — same ordering as a
     /// `pop_front` loop, which matters for `External` IOBufs
     /// whose drop callbacks return descriptors to driver pools.
     pub fn clear(&mut self) {
-        // Drop head first so the order is front-to-back; then
-        // drain tail.
-        self.head = None;
-        self.tail.clear();
+        for i in 0..self.inline_count as usize {
+            self.inline[i] = None;
+        }
+        self.inline_count = 0;
+        self.overflow.clear();
         self.total_len = 0;
     }
 
     /// Move all parts out, consuming the chain. Returns an
-    /// iterator yielding parts front-to-back. Zero allocation
-    /// for 1-element chains (the head moves out directly without
-    /// materialising a deque).
+    /// iterator yielding parts front-to-back. Zero new
+    /// allocation: the inline parts move out via `Option::take`
+    /// in iteration order; the overflow's existing `VecDeque`
+    /// allocation is consumed but no fresh deque is built.
     pub fn into_parts(self) -> impl Iterator<Item = IOBuf> {
-        self.head.into_iter().chain(self.tail.into_iter())
+        let count = self.inline_count as usize;
+        let mut inline = self.inline;
+        let mut idx = 0;
+        let inline_iter = core::iter::from_fn(move || {
+            if idx < count {
+                let buf = inline[idx].take();
+                idx += 1;
+                buf
+            } else {
+                None
+            }
+        });
+        inline_iter.chain(self.overflow.into_iter())
     }
 
     /// Convenience: append a `&'static [u8]` part. Borrowed,
@@ -1112,15 +1192,19 @@ impl<'a> Cursor<'a> {
         self.consumed
     }
 
-    /// Resolve `node_idx` to a borrowed `IOBuf`. Logical index
-    /// `0` is `head` (if Some); `1..=tail.len()` indexes into
-    /// `tail[idx-1]`. Returns `None` past the chain's end.
+    /// Resolve `node_idx` to a borrowed `IOBuf`. Indices in
+    /// `[0, inline_count)` come from the inline array;
+    /// `[inline_count, inline_count + overflow.len())` come from
+    /// the overflow deque. Returns `None` past the chain's end.
     #[inline]
     fn node_at(&self, idx: usize) -> Option<&'a IOBuf> {
-        if idx == 0 {
-            self.chain.head.as_ref()
+        let inline_n = self.chain.inline_count as usize;
+        if idx < inline_n {
+            // SAFETY: `inline[0..inline_count]` is always `Some`
+            // (invariant maintained by `push_*` / `pop_*`).
+            Some(unsafe { self.chain.inline[idx].as_ref().unwrap_unchecked() })
         } else {
-            self.chain.tail.get(idx - 1)
+            self.chain.overflow.get(idx - inline_n)
         }
     }
 
