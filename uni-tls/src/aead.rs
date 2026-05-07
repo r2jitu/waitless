@@ -24,6 +24,15 @@
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag};
 
+// Lower-level primitives for the scatter-gather seal path.
+// `chacha20poly1305_seal_split` drives them by hand instead of
+// going through the single-buffer `AeadInPlace` interface so the
+// caller can pass the body and trailer as two separate slices.
+use chacha20::cipher::{KeyIvInit, StreamCipher};
+use chacha20::ChaCha20;
+use poly1305::universal_hash::{generic_array::GenericArray, UniversalHash};
+use poly1305::Poly1305;
+
 /// Size of the Poly1305 authentication tag in bytes.
 pub const TAG_LEN: usize = 16;
 
@@ -52,6 +61,122 @@ pub fn chacha20poly1305_seal(
     let mut out = [0u8; TAG_LEN];
     out.copy_from_slice(tag.as_slice());
     out
+}
+
+/// Scatter-gather AEAD encrypt. Encrypts `body` and `trailer` in
+/// place as if they were a single concatenated plaintext, computes
+/// one Poly1305 tag over `aad || body_ciphertext || trailer_ciphertext`
+/// (with the standard padding + length-block), and returns the tag.
+///
+/// Lets the caller assemble a TLS 1.3 record across two separate
+/// IOBufs — body in its own buffer (no tailroom needed for the
+/// inner-content-type byte / AEAD tag), trailer in a small dedicated
+/// buffer — without any plaintext-side coalesce. The wire layout is
+/// the same as `chacha20poly1305_seal` over the contiguous concat:
+///
+///   tag = chacha20poly1305_seal(key, nonce, aad, body || trailer)
+///
+/// (verified by the `seal_split_matches_single_buffer` test below).
+///
+/// Drives `chacha20::ChaCha20` and `poly1305::Poly1305` directly
+/// instead of going through `chacha20poly1305::AeadInPlace`'s
+/// single-buffer entry point. Same audited primitives, same
+/// security guarantees — just a different driver loop.
+pub fn chacha20poly1305_seal_split(
+    key: &[u8; KEY_LEN],
+    nonce: &[u8; NONCE_LEN],
+    aad: &[u8],
+    body: &mut [u8],
+    trailer: &mut [u8],
+) -> [u8; TAG_LEN] {
+    // Step 1: derive the Poly1305 key from the first ChaCha20 block
+    // (counter 0). Per RFC 8439 §2.6 we take the first 32 bytes of
+    // the keystream and discard the next 32 (so the cipher's counter
+    // lands at 1 for the plaintext encryption).
+    let mut cipher = ChaCha20::new(
+        chacha20::Key::from_slice(key),
+        chacha20::Nonce::from_slice(nonce),
+    );
+    let mut poly_key = [0u8; 32];
+    cipher.apply_keystream(&mut poly_key);
+    let mut discard = [0u8; 32];
+    cipher.apply_keystream(&mut discard);
+
+    // Step 2: encrypt body + trailer in place. ChaCha20 is a stream
+    // cipher — the keystream is one continuous sequence applied
+    // byte-by-byte across both buffers. The counter advances
+    // automatically as bytes are consumed.
+    cipher.apply_keystream(body);
+    cipher.apply_keystream(trailer);
+
+    // Step 3: Poly1305 over `aad || pad(aad,16) || ct || pad(ct,16)
+    // || aad_len_le8 || ct_len_le8`. The "ct" is body+trailer treated
+    // as one logical stream — we feed full 16-byte blocks of body
+    // straight through, then handle the body-tail-plus-trailer
+    // partial-block straddle, then a single zero-pad to the next
+    // 16-byte boundary.
+    let mut mac = Poly1305::new(GenericArray::from_slice(&poly_key));
+
+    // AAD with its own padding (this is fine — `update_padded` pads
+    // at the end of THIS call, which is exactly the boundary the
+    // spec wants between AAD and ciphertext).
+    mac.update_padded(aad);
+
+    // Body's full 16-byte blocks.
+    let body_full_bytes = body.len() & !15;
+    if body_full_bytes > 0 {
+        // SAFETY: `body[..body_full_bytes]` is `body_full_bytes / 16`
+        // contiguous 16-byte blocks. Reinterpreting `&[u8]` as
+        // `&[GenericArray<u8, U16>]` is sound — both have the same
+        // representation (plain byte arrays with no padding /
+        // alignment requirements past 1).
+        let blocks: &[GenericArray<u8, _>] = unsafe {
+            core::slice::from_raw_parts(
+                body.as_ptr() as *const GenericArray<u8, _>,
+                body_full_bytes / 16,
+            )
+        };
+        mac.update(blocks);
+    }
+
+    // Body-tail + trailer + zero-pad-to-16, processed via a
+    // 16-byte buffer that we fill and submit as full blocks.
+    let body_tail = &body[body_full_bytes..];
+    let mut block_buf = [0u8; 16];
+    block_buf[..body_tail.len()].copy_from_slice(body_tail);
+    let mut block_pos = body_tail.len();
+    let mut t_off = 0usize;
+    while t_off < trailer.len() {
+        let take = (16 - block_pos).min(trailer.len() - t_off);
+        block_buf[block_pos..block_pos + take]
+            .copy_from_slice(&trailer[t_off..t_off + take]);
+        block_pos += take;
+        t_off += take;
+        if block_pos == 16 {
+            mac.update(&[*GenericArray::from_slice(&block_buf)]);
+            block_buf = [0u8; 16];
+            block_pos = 0;
+        }
+    }
+    // Final partial block (zero-padded). Skip when the straddle
+    // happened to land on a clean 16-byte boundary.
+    if block_pos > 0 {
+        // `block_buf[block_pos..]` is already zero (we either
+        // started zero-initialised or reset to zero on submit).
+        mac.update(&[*GenericArray::from_slice(&block_buf)]);
+    }
+
+    // Step 4: length block — aad_len_le8 || ct_len_le8.
+    let ct_len = body.len() + trailer.len();
+    let mut len_block = [0u8; 16];
+    len_block[..8].copy_from_slice(&(aad.len() as u64).to_le_bytes());
+    len_block[8..].copy_from_slice(&(ct_len as u64).to_le_bytes());
+    mac.update(&[*GenericArray::from_slice(&len_block)]);
+
+    let tag_arr = mac.finalize();
+    let mut tag = [0u8; TAG_LEN];
+    tag.copy_from_slice(tag_arr.as_slice());
+    tag
 }
 
 /// One-shot AEAD decrypt + verify. Returns `Ok(())` on tag match and
@@ -142,5 +267,77 @@ mod tests {
         tag[0] ^= 0x01;
         let opened = chacha20poly1305_open(&key, &nonce, &aad, &mut data, &tag);
         assert!(opened.is_err());
+    }
+
+    /// `chacha20poly1305_seal_split(key, nonce, aad, body, trailer)`
+    /// must produce the same ciphertext+tag as
+    /// `chacha20poly1305_seal(key, nonce, aad, body || trailer)`.
+    /// Sweeps body lengths around the 16-byte block boundary
+    /// (where the partial-block straddle in the split impl is most
+    /// likely to go wrong) and trailer lengths from empty up
+    /// through the full tail.
+    #[test]
+    fn seal_split_matches_single_buffer() {
+        let key = [0x42u8; 32];
+        let nonce = [0x07u8; 12];
+        let aad: &[u8] = b"some-aad-bytes";
+        let plaintext: alloc::vec::Vec<u8> = (0..200u8).collect();
+
+        // Body lengths that exercise:
+        //   * 0 (entire ciphertext is in trailer)
+        //   * < 16 (body is one partial block)
+        //   * exactly 16, 32, 48 (body ends on a clean block boundary)
+        //   * 17, 33, 49 (body's last block straddles into trailer)
+        //   * > total/2 (long body, short trailer)
+        for body_len in [0, 1, 7, 15, 16, 17, 31, 32, 33, 48, 49, 100, 199, 200] {
+            if body_len > plaintext.len() {
+                continue;
+            }
+            let trailer_len = plaintext.len() - body_len;
+
+            // Reference: single-buffer seal over the contiguous
+            // (body || trailer) plaintext.
+            let mut ref_buf = plaintext.clone();
+            let ref_tag = chacha20poly1305_seal(&key, &nonce, aad, &mut ref_buf);
+
+            // Split: feed the same plaintext through `seal_split`
+            // partitioned at `body_len`.
+            let mut body_buf = plaintext[..body_len].to_vec();
+            let mut trailer_buf = plaintext[body_len..].to_vec();
+            let split_tag = chacha20poly1305_seal_split(
+                &key,
+                &nonce,
+                aad,
+                &mut body_buf,
+                &mut trailer_buf,
+            );
+
+            assert_eq!(
+                ref_tag, split_tag,
+                "tag mismatch for body_len={}, trailer_len={}",
+                body_len, trailer_len
+            );
+            assert_eq!(
+                &ref_buf[..body_len],
+                &body_buf[..],
+                "body ciphertext mismatch for body_len={}",
+                body_len
+            );
+            assert_eq!(
+                &ref_buf[body_len..],
+                &trailer_buf[..],
+                "trailer ciphertext mismatch for trailer_len={}",
+                trailer_len
+            );
+
+            // Round-trip: `chacha20poly1305_open` over the
+            // re-concatenated split output reproduces the
+            // original plaintext.
+            let mut roundtrip = body_buf.clone();
+            roundtrip.extend_from_slice(&trailer_buf);
+            let opened = chacha20poly1305_open(&key, &nonce, aad, &mut roundtrip, &split_tag);
+            assert!(opened.is_ok(), "open failed for body_len={}", body_len);
+            assert_eq!(roundtrip, plaintext);
+        }
     }
 }

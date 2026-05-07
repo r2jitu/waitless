@@ -1,5 +1,5 @@
 {
-  "checksum": "f12f34c1dd323f22dc6a183456858339974ca882ceb9412ebdc61ad959840fe4",
+  "checksum": "f16b34b6b1a730bc6d5b6174be785779a07d009bf175d0c7a4d8e8adb9ed9ce6",
   "crates": {
     "aead 0.5.2": {
       "name": "aead",
@@ -773,6 +773,10 @@
             {
               "id": "p256 0.13.2",
               "target": "p256"
+            },
+            {
+              "id": "poly1305 0.8.0",
+              "target": "poly1305"
             },
             {
               "id": "rand_core 0.6.4",
@@ -3662,6 +3666,7 @@
     "libc 0.2.185",
     "limine 0.5.0",
     "p256 0.13.2",
+    "poly1305 0.8.0",
     "rand_core 0.6.4",
     "sha2 0.10.9",
     "talc 4.4.3",
