@@ -1159,46 +1159,6 @@ pub fn is_readable_or_closed(handle: *mut (), generation: u16) -> bool {
                      | TcpState::LastAck | TcpState::TimeWait)
 }
 
-/// Internal send helper used by `async_try_send`. Splits `data`
-/// into MSS-sized segments and emits one TCP segment per chunk.
-/// Returns bytes sent on success; `-1` on a dead conn.
-fn send(handle: *mut (), data: &[u8]) -> i32 {
-    let (core, slot) = match decode_handle(handle) {
-        Some(v) => v,
-        None => return -1,
-    };
-    // SAFETY: per-core ownership.
-    let c = unsafe { &mut *conn_ptr(core, slot) };
-    if c.state != TcpState::Established {
-        return -1;
-    }
-
-    let len = data.len();
-    let mut sent = 0;
-    // Family-aware MSS: IPv4 fits 1460 of TCP payload, IPv6 only
-    // 1440 (40-byte v6 header vs 20-byte v4). Sending v4-sized
-    // segments on a v6 conn produces 1534-byte Ethernet frames
-    // that the userspace bridge truncates — see MSS_V6 comment.
-    let mss = mss_for(c.local_ip);
-    while sent < len {
-        let chunk = (len - sent).min(mss);
-        send_segment(
-            c.local_ip,
-            c.remote_ip,
-            c.local_port,
-            c.remote_port,
-            c.snd_nxt,
-            c.rcv_nxt,
-            TCP_ACK | TCP_PSH,
-            c.rx_free() as u16,
-            &data[sent..sent + chunk],
-        );
-        c.snd_nxt = c.snd_nxt.wrapping_add(chunk as u32);
-        sent += chunk;
-    }
-    sent as i32
-}
-
 pub fn close(handle: *mut (), generation: u16) {
     let (core, slot) = match decode_handle(handle) {
         Some(v) => v,
@@ -1324,31 +1284,6 @@ pub fn clear_recv_waker(handle: *mut (), generation: u16) {
     c.recv_waker = None;
 }
 
-/// Async `TcpSend` try-send hook. Bare-metal's `send_segment`
-/// unconditionally queues into the NIC TX ring (no flow control,
-/// no TX-full backpressure in this stack), so this is effectively
-/// a "try == always succeeds" wrapper over the sync `send` — the
-/// future resolves in one poll. Stale `generation` / dead conn
-/// returns -1 (fatal).
-pub fn async_try_send(handle: *mut (), generation: u16, buf: &[u8]) -> isize {
-    let (core, slot) = match decode_handle(handle) {
-        Some(v) => v,
-        None => return -1,
-    };
-    let c = unsafe { &*conn_ptr(core, slot) };
-    if c.generation != generation {
-        return -1;
-    }
-    match c.state {
-        TcpState::Established => {}
-        _ => return -1,
-    }
-    // Forward to sync `send`. Returns bytes sent (== buf.len for
-    // this stack) or -1 on error.
-    let n = send(handle, buf);
-    if n < 0 { -1 } else { n as isize }
-}
-
 /// Async `TcpSendChain` try-send hook. Walks `chain` via cursor
 /// and emits MSS-sized TCP segments, copying directly from chain
 /// nodes into each segment's payload area — no user-space
@@ -1359,29 +1294,26 @@ pub fn async_try_send(handle: *mut (), generation: u16, buf: &[u8]) -> isize {
 ///
 /// Bare-metal's NIC TX never blocks under this stack's load
 /// model, so this always sends every byte in the chain (or
-/// returns `-1` on a dead conn / stale `gen`).
+/// returns `Err(())` on a dead conn / stale `gen`).
 pub fn async_try_send_chain(
     handle: *mut (),
     generation: u16,
     chain: &mut uni_iobuf::IOBufChain,
-) -> isize {
-    let (core, slot) = match decode_handle(handle) {
-        Some(v) => v,
-        None => return -1,
-    };
+) -> Result<usize, ()> {
+    let (core, slot) = decode_handle(handle).ok_or(())?;
     // SAFETY: per-core ownership; the worker that registered this
     // backend is the one polling its `TcpSendChain`.
     let c = unsafe { &mut *conn_ptr(core, slot) };
     if c.generation != generation {
-        return -1;
+        return Err(());
     }
     if c.state != TcpState::Established {
-        return -1;
+        return Err(());
     }
 
     let total = chain.total_len();
     if total == 0 {
-        return 0;
+        return Ok(0);
     }
 
     let mss = mss_for(c.local_ip);
@@ -1410,7 +1342,7 @@ pub fn async_try_send_chain(
     // callbacks recycle NIC descriptors back to driver pools).
     drop(cursor);
     chain.clear();
-    sent as isize
+    Ok(sent)
 }
 
 /// Like `send_segment` but reads `payload_len` bytes from a chain
@@ -1466,7 +1398,7 @@ fn send_segment_from_cursor(
     }
 }
 
-/// Park the send-side waker. On bare-metal `async_try_send`
+/// Park the send-side waker. On bare-metal `async_try_send_chain`
 /// always accepts the whole buffer, so this path is effectively
 /// unreachable during steady-state sends; kept symmetric with the
 /// recv side so future NIC-TX-backpressure plumbing (or a proper

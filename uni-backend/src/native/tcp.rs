@@ -285,30 +285,6 @@ fn native_tcp_clear_recv_waker(handle: *mut (), generation: u16) {
     }
 }
 
-fn native_tcp_try_send(handle: *mut (), generation: u16, buf: &[u8]) -> isize {
-    unsafe {
-        let (c, live) = check_gen(handle, generation);
-        if !live {
-            return -1;
-        }
-        let fd = (*c).fd;
-        if fd < 0 {
-            return -1;
-        }
-        let n = send(fd, buf.as_ptr(), buf.len(), MSG_NOSIGNAL);
-        if n >= 0 {
-            return n;
-        }
-        // `send` returned -1. EAGAIN means "try again" — report 0 so
-        // the future parks a waker. Any other errno is fatal.
-        if errno() == EAGAIN {
-            0
-        } else {
-            -1
-        }
-    }
-}
-
 /// Gather-write `chain` to the socket via `writev(2)`. One
 /// syscall for the whole `[header, body0, body1, ...]` shape;
 /// the kernel TCP stack handles segmentation. Drains the chain
@@ -316,25 +292,26 @@ fn native_tcp_try_send(handle: *mut (), generation: u16, buf: &[u8]) -> isize {
 /// `writev`) advances the front part's visible payload past the
 /// committed bytes, so the next call sees only the remainder.
 ///
-/// Returns bytes-pushed-this-call, `0` on EAGAIN, `-1` on fatal
-/// error / stale `gen`.
+/// Returns `Ok(n)` for bytes-pushed-this-call, `Ok(0)` on
+/// EAGAIN (caller parks waker), `Err(())` on fatal error / stale
+/// `gen` (caller drops the conn).
 fn native_tcp_try_send_chain(
     handle: *mut (),
     generation: u16,
     chain: &mut uni_iobuf::IOBufChain,
-) -> isize {
+) -> Result<usize, ()> {
     unsafe {
         let (c, live) = check_gen(handle, generation);
         if !live {
-            return -1;
+            return Err(());
         }
         let fd = (*c).fd;
         if fd < 0 {
-            return -1;
+            return Err(());
         }
         let total = chain.total_len();
         if total == 0 {
-            return 0;
+            return Ok(0);
         }
 
         // Build an `iovec` array on the stack — one slot per
@@ -352,12 +329,12 @@ fn native_tcp_try_send_chain(
             let n = writev(fd, iov.as_ptr(), part_count as i32);
             if n < 0 {
                 if errno() == EAGAIN {
-                    return 0;
+                    return Ok(0);
                 }
-                return -1;
+                return Err(());
             }
             drain_chain_prefix(chain, n as usize);
-            return n;
+            return Ok(n as usize);
         }
 
         // Long chain (>IOV_INLINE parts): walk parts manually,
@@ -366,7 +343,7 @@ fn native_tcp_try_send_chain(
         // sees tidy segments. Long chains are rare (chunked HTML),
         // so the optimisation that matters is the iovec inline
         // path above.
-        let mut sent_total = 0isize;
+        let mut sent_total = 0usize;
         while let Some(part) = chain.front_mut() {
             let data = part.data();
             if data.is_empty() {
@@ -376,9 +353,11 @@ fn native_tcp_try_send_chain(
             let n = send(fd, data.as_ptr(), data.len(), MSG_NOSIGNAL);
             if n < 0 {
                 if errno() == EAGAIN {
-                    return if sent_total == 0 { 0 } else { sent_total };
+                    // EAGAIN with no progress so far → tell caller
+                    // to park; with partial progress → report it.
+                    return Ok(sent_total);
                 }
-                return -1;
+                return Err(());
             }
             let n = n as usize;
             if n == data.len() {
@@ -388,12 +367,12 @@ fn native_tcp_try_send_chain(
                 chain.shrink_total_len(n);
                 // Partial part-send: kernel won't take more right
                 // now, return what we got.
-                sent_total += n as isize;
-                return sent_total;
+                sent_total += n;
+                return Ok(sent_total);
             }
-            sent_total += n as isize;
+            sent_total += n;
         }
-        sent_total
+        Ok(sent_total)
     }
 }
 
@@ -487,7 +466,6 @@ pub(super) static NATIVE_TCP_BACKEND: uni_runtime::net::TcpBackend =
         register_recv_waker: native_tcp_register_recv_waker,
         clear_recv_waker: native_tcp_clear_recv_waker,
         close: tcp_close,
-        try_send_bytes: native_tcp_try_send,
         try_send: native_tcp_try_send_chain,
         register_send_waker: native_tcp_register_send_waker,
         clear_send_waker: native_tcp_clear_send_waker,
