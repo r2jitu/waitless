@@ -34,36 +34,6 @@ rust_test(
     crate = ":from_bytes",
 )
 
-# IP protocol dispatch registry — replaces hardcoded TCP/UDP match in
-# `net::net_receive`. One acquire load + one indirect call per packet.
-# Depends only on `//util:atomic_fn` (itself a zero-dep leaf crate),
-# so `rust_test` still avoids the panic-strategy conflict that dep
-# chains through `:types` or `//kernel` would otherwise trigger.
-rust_library(
-    name = "protocol",
-    srcs = ["src/protocol.rs"],
-    crate_name = "net_protocol",
-    crate_root = "src/protocol.rs",
-    deps = ["//util/atomic_fn"],
-)
-
-# `crate = ":protocol"` would rebuild `protocol` with `--test` but
-# atomic_fn's dep doesn't get `--test`, so its `#![no_std]` stays
-# on and rustc rejects linking a no_std/abort rlib into an unwind
-# test binary. `srcs = ["src/protocol.rs"]` + a plain `:atomic_fn`
-# dep side-steps it: under the `test` verb the
-# `//bazel/rules:tests_need_std` flag flips to True, atomic_fn's
-# `crate_features = select(...)` adds `std`, and the whole chain
-# compiles as std + unwind. Production builds have the flag False
-# and are still no_std + abort. No sibling target, no inline shim.
-rust_test(
-    name = "protocol_test",
-    size = "small",
-    srcs = ["src/protocol.rs"],
-    crate_root = "src/protocol.rs",
-    deps = ["//util/atomic_fn"],
-)
-
 # Protocol parsing tests — host-native, tests raw byte parsing for all protocols.
 # No deps on bare-metal crates (panic=abort incompatible with test harness).
 rust_test(
@@ -281,7 +251,6 @@ rust_library(
         ":ipv6",
         ":ipv6_send",
         ":ndp",
-        ":protocol",
         ":tcp",
         ":types",
         ":udp",

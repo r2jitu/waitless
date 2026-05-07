@@ -479,9 +479,9 @@ unsafe fn kernel_boot(info: &BootInfo) {
         // self-contained in the driver's `init()`.
 
         net::tcp::init();
-        // Populate the IP protocol-dispatch registry. After this
-        // `net_receive` routes TCP/UDP packets through
-        // `net::REGISTRY` instead of a hardcoded match.
+        // Initialise IPv4/IPv6 stack state (ARP cache, our local
+        // addrs, NDP, etc.). `net_receive` matches on the IP
+        // protocol byte directly.
         net::init_stack();
         uni_drivers::net::enable_irq();
         klog!("net: stack ready (Ethernet/ARP/IPv4/TCP/UDP)\n");

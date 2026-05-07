@@ -18,9 +18,6 @@ pub extern crate net_ndp as ndp;
 pub extern crate net_tcp as tcp;
 pub extern crate net_udp as udp;
 pub extern crate net_dhcp as dhcp;
-pub extern crate net_protocol as protocol;
-
-pub static REGISTRY: protocol::Registry = protocol::Registry::new();
 
 /// Bare-metal TCP backend vtable. Listener hooks open one TCB per
 /// core; per-stream hooks use the generation-aware variants so a
