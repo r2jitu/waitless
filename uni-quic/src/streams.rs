@@ -119,6 +119,22 @@ impl Default for RecvStream {
 }
 
 impl RecvStream {
+    /// Reset to a clean state for reuse. Clears all per-stream
+    /// data but preserves the `buffer` and `gap_buffer`
+    /// allocations — the next stream that recycles this
+    /// `RecvStream` from the per-conn pool gets an empty Vec
+    /// with non-zero capacity, so its first
+    /// `buffer.extend_from_slice` doesn't trigger a fresh
+    /// allocation. Saves one heap alloc per request stream on
+    /// the H3 hot path.
+    pub fn reset_for_reuse(&mut self) {
+        self.buffer.clear();
+        self.offset = 0;
+        self.gap_buffer.clear();
+        self.state = RecvState::Open;
+        self.gap_budget = 16 * 1024;
+    }
+
     /// Snapshot of internal state for diagnostics. Used by the
     /// stuck-handler watchdog so a stalled `conn.recv` await can
     /// report what the stream actually looks like instead of
@@ -328,6 +344,20 @@ impl Default for SendStream {
 }
 
 impl SendStream {
+    /// Reset to a clean state for reuse. Drains any pending
+    /// `outbound` IOBufs (drops them) but preserves the
+    /// `VecDeque`'s allocation — the next stream that recycles
+    /// this `SendStream` from the per-conn pool gets an empty
+    /// chain with non-zero capacity, so its first `push_back`
+    /// doesn't trigger a fresh allocation. Saves one heap alloc
+    /// per request stream on the H3 hot path.
+    pub fn reset_for_reuse(&mut self) {
+        self.outbound.clear();
+        self.head_consumed = 0;
+        self.send_offset = 0;
+        self.state = SendState::Open;
+    }
+
     /// Convenience predicate (FIN was emitted) — kept for the
     /// reaper, which uses it as half of the "both sides done"
     /// gate.

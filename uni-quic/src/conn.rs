@@ -529,11 +529,29 @@ pub struct Connection {
     /// the first time the app calls `stream_send` for a stream.
     send_streams: alloc::collections::BTreeMap<u64, crate::streams::SendStream>,
 
+    /// Recycle pool for `RecvStream`s. The reaper pushes finished
+    /// streams here (after `reset_for_reuse` clears state but
+    /// preserves capacity); `get_or_create_recv` pops first
+    /// before falling back to a fresh allocation. Capped at
+    /// `STREAM_POOL_CAP` so a long-lived conn that processes many
+    /// requests doesn't accumulate unbounded reserve.
+    recv_pool: Vec<crate::streams::RecvStream>,
+
+    /// Recycle pool for `SendStream`s — same shape as `recv_pool`.
+    send_pool: Vec<crate::streams::SendStream>,
+
     /// Stream IDs we've seen at least once, in arrival order. The
     /// app's `accept_stream` future drains the head; the listener
     /// is responsible for popping streams it's already accepted.
     opened_streams: Vec<u64>,
 }
+
+/// Cap on the size of each per-conn stream recycle pool. A
+/// kept-alive HTTP/3 conn cycles through dozens of streams over
+/// its lifetime; 8 reserves enough for a typical pipelined
+/// burst (the user's "20-conn refresh" scenario) without
+/// stockpiling memory on a long-idle conn.
+const STREAM_POOL_CAP: usize = 8;
 
 impl Connection {
     /// Create a fresh connection from the client's first Initial
@@ -596,8 +614,26 @@ impl Connection {
             outbound_pool: Vec::new(),
             recv_streams: alloc::collections::BTreeMap::new(),
             send_streams: alloc::collections::BTreeMap::new(),
+            recv_pool: Vec::new(),
+            send_pool: Vec::new(),
             opened_streams: Vec::new(),
         }
+    }
+
+    /// Get-or-create a SendStream entry for `sid`, drawing from
+    /// the recycle pool first so the buffer / VecDeque allocations
+    /// inside survive across stream lifecycles. Returns a `&mut`
+    /// handle so the caller can immediately write into it.
+    fn ensure_send_stream(&mut self, sid: u64) -> &mut crate::streams::SendStream {
+        if !self.send_streams.contains_key(&sid) {
+            let new_stream = self
+                .send_pool
+                .pop()
+                .unwrap_or_else(crate::streams::SendStream::default);
+            self.send_streams.insert(sid, new_stream);
+            crate::diag::bump(&crate::diag::COUNTERS.send_streams_created);
+        }
+        self.send_streams.get_mut(&sid).unwrap()
     }
 
     pub fn state(&self) -> ConnState {
@@ -893,8 +929,24 @@ impl Connection {
             })
             .collect();
         for sid in candidates {
-            self.send_streams.remove(&sid);
-            self.recv_streams.remove(&sid);
+            // Recycle the SendStream / RecvStream into per-conn
+            // pools (capped at STREAM_POOL_CAP) so the next
+            // stream on this conn reuses their `outbound` /
+            // `buffer` allocations instead of growing fresh
+            // ones. `reset_for_reuse` clears state but
+            // preserves capacity.
+            if let Some(mut s) = self.send_streams.remove(&sid) {
+                if self.send_pool.len() < STREAM_POOL_CAP {
+                    s.reset_for_reuse();
+                    self.send_pool.push(s);
+                }
+            }
+            if let Some(mut r) = self.recv_streams.remove(&sid) {
+                if self.recv_pool.len() < STREAM_POOL_CAP {
+                    r.reset_for_reuse();
+                    self.recv_pool.push(r);
+                }
+            }
             crate::diag::bump(&crate::diag::COUNTERS.streams_reaped);
         }
     }
@@ -1034,15 +1086,7 @@ impl Connection {
     /// the wire on the next outbound flush. Auto-creates the stream
     /// state lazily.
     pub fn stream_send(&mut self, sid: u64, data: &[u8]) {
-        let was_new = !self.send_streams.contains_key(&sid);
-        let s = self
-            .send_streams
-            .entry(sid)
-            .or_insert_with(crate::streams::SendStream::default);
-        s.write(data);
-        if was_new {
-            crate::diag::bump(&crate::diag::COUNTERS.send_streams_created);
-        }
+        self.ensure_send_stream(sid).write(data);
     }
 
     /// Append an owned `Vec<u8>` to stream `sid`'s outbound
@@ -1052,15 +1096,7 @@ impl Connection {
     /// Subsequent `pop_chunk_into` calls drain from this Vec
     /// directly into the datagram payload region.
     pub fn stream_send_owned(&mut self, sid: u64, data: Vec<u8>) {
-        let was_new = !self.send_streams.contains_key(&sid);
-        let s = self
-            .send_streams
-            .entry(sid)
-            .or_insert_with(crate::streams::SendStream::default);
-        s.write_owned(data);
-        if was_new {
-            crate::diag::bump(&crate::diag::COUNTERS.send_streams_created);
-        }
+        self.ensure_send_stream(sid).write_owned(data);
     }
 
     /// Append a `&'static` slice to stream `sid`'s outbound
@@ -1069,15 +1105,7 @@ impl Connection {
     /// requested bytes into the datagram payload region for
     /// AEAD-in-place sealing.
     pub fn stream_send_static(&mut self, sid: u64, data: &'static [u8]) {
-        let was_new = !self.send_streams.contains_key(&sid);
-        let s = self
-            .send_streams
-            .entry(sid)
-            .or_insert_with(crate::streams::SendStream::default);
-        s.write_static(data);
-        if was_new {
-            crate::diag::bump(&crate::diag::COUNTERS.send_streams_created);
-        }
+        self.ensure_send_stream(sid).write_static(data);
     }
 
     /// Append a pre-built [`uni_iobuf::IOBuf`] chunk to stream
@@ -1089,29 +1117,13 @@ impl Connection {
     /// VecDeque; subsequent `pop_chunk_into` calls drain its
     /// `data()` slice straight into the packet's frames buffer.
     pub fn stream_send_iobuf(&mut self, sid: u64, data: uni_iobuf::IOBuf) {
-        let was_new = !self.send_streams.contains_key(&sid);
-        let s = self
-            .send_streams
-            .entry(sid)
-            .or_insert_with(crate::streams::SendStream::default);
-        s.write_iobuf(data);
-        if was_new {
-            crate::diag::bump(&crate::diag::COUNTERS.send_streams_created);
-        }
+        self.ensure_send_stream(sid).write_iobuf(data);
     }
 
     /// Mark stream `sid` for FIN. The next outbound STREAM frame
     /// after the buffer drains will carry the FIN flag.
     pub fn stream_close(&mut self, sid: u64) {
-        let was_new = !self.send_streams.contains_key(&sid);
-        let s = self
-            .send_streams
-            .entry(sid)
-            .or_insert_with(crate::streams::SendStream::default);
-        s.close();
-        if was_new {
-            crate::diag::bump(&crate::diag::COUNTERS.send_streams_created);
-        }
+        self.ensure_send_stream(sid).close();
     }
 
     /// Force a 1-RTT packet emission even if no inbound datagram
@@ -1678,10 +1690,20 @@ impl Connection {
                 Frame::Stream { stream_id, offset, data, fin } => {
                     if matches!(level, CryptoLevel::OneRtt) {
                         let was_new = !self.recv_streams.contains_key(&stream_id);
-                        let s = self
-                            .recv_streams
-                            .entry(stream_id)
-                            .or_insert_with(crate::streams::RecvStream::default);
+                        if was_new {
+                            // Pull from the per-conn recycle pool so
+                            // a recycled stream's `buffer` Vec keeps
+                            // its capacity across stream lifecycles
+                            // (saves the first-`extend_from_slice`
+                            // allocation per request stream on the
+                            // H3 hot path).
+                            let new_stream = self
+                                .recv_pool
+                                .pop()
+                                .unwrap_or_else(crate::streams::RecvStream::default);
+                            self.recv_streams.insert(stream_id, new_stream);
+                        }
+                        let s = self.recv_streams.get_mut(&stream_id).unwrap();
                         s.ingest(offset, data, fin);
                         if was_new {
                             crate::diag::bump(&crate::diag::COUNTERS.recv_streams_created);
