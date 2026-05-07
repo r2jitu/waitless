@@ -193,6 +193,10 @@ impl uni_http::TlsConn for TlsConnImpl {
         self.tls.send_app_data(data).map_err(|_| ())
     }
 
+    fn send_app_data_iobuf(&mut self, buf: &mut uni_iobuf::IOBuf) -> Result<(), ()> {
+        self.tls.send_app_data_iobuf(buf).map_err(|_| ())
+    }
+
     fn close_notify(&mut self) -> Result<(), ()> {
         self.tls.close_notify().map_err(|_| ())
     }

@@ -442,6 +442,37 @@ impl TlsServer {
         Ok(())
     }
 
+    /// Encrypt-in-place sibling of `send_app_data`. The caller hands
+    /// us an [`uni_iobuf::IOBuf`] containing plaintext (visible as
+    /// `buf.data()`) plus reserved headroom (≥ `HEADER_LEN`) and
+    /// tailroom (≥ `1 + TAG_LEN`); on success the IOBuf's visible
+    /// payload becomes the full TLSCiphertext record (header ||
+    /// ciphertext || type || tag).
+    ///
+    /// Compared to `send_app_data(&plaintext)` which copies the
+    /// plaintext into our `tx_buf` and seals there, this seals
+    /// directly into the caller's IOBuf. The caller drains the
+    /// sealed record straight to TCP — bypassing `tx_buf` entirely.
+    /// One fewer plaintext memcpy per body chunk on HTTPS sends.
+    ///
+    /// Single-record only — caller chunks oversized payloads (the
+    /// `TlsStream::send_iobuf` path uses the same 3 KiB chunk
+    /// boundary `send_app_data`'s callers already used).
+    pub fn send_app_data_iobuf(
+        &mut self,
+        buf: &mut uni_iobuf::IOBuf,
+    ) -> Result<(), HandshakeError> {
+        if self.state != State::Established {
+            return Err(HandshakeError::UnexpectedRecord);
+        }
+        let tk = self
+            .server_ap_tk
+            .as_mut()
+            .ok_or(HandshakeError::Internal)?;
+        record::seal_in_place(tk, content_type::APPLICATION_DATA, buf)
+            .map_err(|e| e.into())
+    }
+
     /// Encrypt `plaintext` into a TLSCiphertext application_data record
     /// and append it to the TX buffer. Only valid in `Established` state.
     pub fn send_app_data(&mut self, plaintext: &[u8]) -> Result<(), HandshakeError> {

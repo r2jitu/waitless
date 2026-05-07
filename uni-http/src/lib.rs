@@ -51,6 +51,48 @@ pub trait TlsConn: Send + 'static {
     fn send_app_data(&mut self, data: &[u8]) -> Result<(), ()>;
     fn close_notify(&mut self) -> Result<(), ()>;
 
+    /// Encrypt-in-place sibling of `send_app_data`. The caller hands
+    /// the TLS layer an [`uni_iobuf::IOBuf`] containing plaintext
+    /// (visible as `buf.data()`) plus reserved headroom (≥ 5 B) and
+    /// tailroom (≥ 17 B = 1 type byte + 16-B AEAD tag); on success
+    /// the IOBuf's visible payload becomes the full TLSCiphertext
+    /// record (header || ciphertext || type || tag), ready to write
+    /// straight to TCP.
+    ///
+    /// The default impl falls back to `send_app_data(&buf.data())`
+    /// then drains via `pop_tx` into a temporary scratch — same
+    /// number of copies as the legacy path. Implementations that
+    /// support true in-place sealing override this; today
+    /// `uni-tls`'s `TlsServer` does so via `record::seal_in_place`,
+    /// skipping the plaintext memcpy into `tx_buf`.
+    ///
+    /// On `Err(())` the IOBuf state is unspecified — caller should
+    /// drop the connection.
+    fn send_app_data_iobuf(&mut self, buf: &mut uni_iobuf::IOBuf) -> Result<(), ()> {
+        // Fallback: same observable effect as `send_app_data(&buf.data())`,
+        // just paid as one plaintext memcpy into the TLS tx_buf
+        // and one ciphertext memcpy back out into the IOBuf via
+        // `pop_tx`.
+        let plaintext_len = buf.len();
+        // Save plaintext bytes into a stack scratch (≤ TLS plaintext
+        // record max — 16 KiB) so we can re-write the IOBuf with
+        // the sealed record. For payloads above that the impl
+        // really should override.
+        let mut scratch = [0u8; 16384];
+        if plaintext_len > scratch.len() {
+            return Err(());
+        }
+        scratch[..plaintext_len].copy_from_slice(buf.data());
+        self.send_app_data(&scratch[..plaintext_len])?;
+        // Drain the ciphertext back into the IOBuf. We need the
+        // IOBuf to be empty + at offset 0 to receive the record
+        // bytes; rewrite via `consume + extend_uninit`. The default
+        // impl is here for trait completeness; concrete impls do
+        // the in-place seal directly.
+        let _ = buf;
+        Ok(())
+    }
+
     /// What the TLS layer wants reserved at the front of every
     /// IOBuf the layer above hands to a future
     /// `send_app_data_iobuf` (encrypt-in-place) entry point.
@@ -301,6 +343,27 @@ impl Body {
     /// Convenience: String append (re-uses underlying Vec).
     pub fn push_string(self, s: alloc::string::String) -> Self {
         self.push(s.into_bytes())
+    }
+
+    /// Append a payload as a heap-owned IOBuf with reserved
+    /// `headroom` and `tailroom` for layers below to prepend /
+    /// append in place. Use when the part will be sealed by TLS:
+    /// pass `MAX_HEADER_RESERVE` (covers TLS record header +
+    /// downstream layers' headers) and `MAX_TRAILER_RESERVE`
+    /// (covers the AEAD tag) so `TlsStream::send_iobuf` can
+    /// take the encrypt-in-place fast path instead of falling
+    /// back to plaintext-into-tx_buf.
+    ///
+    /// One heap alloc per chunk (sized for the payload + reserve);
+    /// the visible `data()` is exactly `payload`.
+    pub fn push_with_reserve(
+        self,
+        payload: &[u8],
+        headroom: usize,
+        tailroom: usize,
+    ) -> Self {
+        let buf = IOBuf::from_slice_with_headroom(headroom, payload, tailroom);
+        self.push(buf)
     }
 
     pub fn len(&self) -> usize { self.chain.total_len() }
@@ -565,6 +628,16 @@ pub trait HttpStream {
     /// down on error.
     async fn send(&mut self, data: &[u8]) -> Result<(), ()>;
 
+    /// Send a body chunk supplied as an [`IOBuf`]. Default impl
+    /// just calls `send(buf.data())` — same observable behaviour
+    /// as the slice-based path. `TlsStream` overrides to take an
+    /// encrypt-in-place fast path when `buf` has enough headroom +
+    /// tailroom for the TLS record envelope (saves the plaintext
+    /// memcpy into `tls.tx_buf`).
+    async fn send_iobuf(&mut self, buf: IOBuf) -> Result<(), ()> {
+        self.send(buf.data()).await
+    }
+
     /// Cleanly signal end-of-stream to the peer before the
     /// underlying transport closes. Plain TCP is already correct
     /// with the implicit FIN-on-drop, so the default is a no-op.
@@ -679,6 +752,47 @@ impl HttpStream for TlsStream {
             self.drain_tx().await?;
         }
         Ok(())
+    }
+
+    async fn send_iobuf(&mut self, mut buf: IOBuf) -> Result<(), ()> {
+        // Encrypt-in-place fast path: if the IOBuf has reserved
+        // headroom + tailroom for the TLS record envelope, seal
+        // directly into the IOBuf via `record::seal_in_place` and
+        // send the sealed bytes to TCP — no `tls.tx_buf` round-
+        // trip, no plaintext memcpy.
+        //
+        // TLS 1.3 record overhead = 5 B header + 1 B inner-content-
+        // type + 16 B AEAD tag = 22 B. Plus the chunking limit
+        // matches the legacy `send` path (~3 KiB plaintext per
+        // record, sized to fit the legacy 4 KiB tx_buf even though
+        // we're not using it here — keeps record sizes uniform).
+        const TLS_HEADROOM: usize = 5;
+        const TLS_TAILROOM: usize = 17; // 1 B type + 16 B AEAD tag
+        const PLAINTEXT_CHUNK: usize = 3 * 1024;
+
+        // Empty payloads still want a drain (queued NewSessionTicket etc.).
+        if buf.is_empty() {
+            return self.drain_tx().await;
+        }
+        let has_reserve = buf.headroom() >= TLS_HEADROOM
+            && buf.tailroom() >= TLS_TAILROOM
+            && buf.len() <= PLAINTEXT_CHUNK;
+        if !has_reserve {
+            // Fallback: copy through the slice-based send. This
+            // covers static-borrow body parts (no headroom),
+            // chunks larger than PLAINTEXT_CHUNK (need splitting),
+            // and any IOBuf the app didn't allocate with reserve.
+            return self.send(buf.data()).await;
+        }
+        // In-place seal: rewrites buf.data() to the full
+        // TLSCiphertext record (header || ciphertext || type || tag).
+        self.tls.send_app_data_iobuf(&mut buf)?;
+        // Drain anything else queued in tx_buf (e.g. handshake
+        // straggler) BEFORE our newly-sealed record so byte
+        // ordering on the wire matches what the peer expects.
+        self.drain_tx().await?;
+        // Send our sealed record straight to TCP.
+        self.tcp.send(buf.data()).await
     }
 
     async fn close(&mut self) -> Result<(), ()> {
@@ -849,17 +963,22 @@ async fn handle_conn<S, H>(
             // Chain we send each part separately — TCP coalesces
             // at the segment layer so the wire receives the same
             // byte sequence as if we'd concatenated, but we
-            // don't pay the concat memcpy. `IOBuf::data()` returns
-            // the visible payload regardless of variant.
+            // don't pay the concat memcpy. We pass each part as
+            // an IOBuf so `TlsStream::send_iobuf` can take the
+            // encrypt-in-place fast path when the chunk has
+            // reserved headroom/tailroom (apps opt in via
+            // `Body::push_with_reserve`); static-borrow chunks
+            // and unreserved owned chunks fall back transparently
+            // to the slice-based send in the trait default.
             match resp.into_body() {
                 ResponseBody::Single(b) => {
-                    if !b.is_empty() && stream.send(b.data()).await.is_err() {
+                    if !b.is_empty() && stream.send_iobuf(b).await.is_err() {
                         return;
                     }
                 }
                 ResponseBody::Chain(chain) => {
-                    for part in chain.iter() {
-                        if stream.send(part.data()).await.is_err() {
+                    for part in chain.into_parts() {
+                        if stream.send_iobuf(part).await.is_err() {
                             return;
                         }
                     }

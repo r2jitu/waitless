@@ -330,7 +330,17 @@ const SHELL_FOOTER: &[u8] =
 /// by reference (zero alloc, zero copy) — only the bits that
 /// vary per page (title, nav-link active-class flip) get
 /// allocated.
+///
+/// Heap-owned chunks go through `push_with_reserve` so each one
+/// carries TLS record headroom (5 B) + tailroom (17 B = 1 type
+/// byte + 16 B AEAD tag). `TlsStream::send_iobuf` then takes
+/// the encrypt-in-place path on those parts: no plaintext
+/// memcpy into `tls.tx_buf`, AEAD seals straight into the
+/// IOBuf the app handed up. Static parts can't be sealed in
+/// place (immutable storage); they fall back to the
+/// slice-based path transparently.
 fn shell_body(active: &str, title: &str, body: Body) -> Body {
+    use uni_http::{MAX_HEADER_RESERVE as HDR, MAX_TRAILER_RESERVE as TRL};
     // The nav block has one bit of dynamism — the active class.
     // Render it into a small Vec; everything else is static.
     let mut nav_buf = String::with_capacity(512);
@@ -339,17 +349,13 @@ fn shell_body(active: &str, title: &str, body: Body) -> Body {
         let _ = write!(nav_buf, "<a href=\"{}\"{}>{}</a>", path, class, label);
     }
 
-    // The title segment. Tiny — just the title text wrapped in
-    // the shell's title-tag context.
-    let title_buf = title.as_bytes().to_vec();
-
     let mut b = Body::with_capacity(8 + body.parts_len());
     b = b.push_static(SHELL_HEAD_BEFORE_TITLE);
-    b = b.push_owned(title_buf);
+    b = b.push_with_reserve(title.as_bytes(), HDR, TRL);
     b = b.push_static(SHELL_HEAD_AFTER_TITLE);
     b = b.push_static(STYLES.as_bytes());
     b = b.push_static(SHELL_AFTER_STYLES);
-    b = b.push_owned(nav_buf.into_bytes());
+    b = b.push_with_reserve(nav_buf.as_bytes(), HDR, TRL);
     b = b.push_static(SHELL_NAV_MAIN);
     // Splice the page body's parts in order. Each is an IOBuf
     // (static-borrow or heap-owned); `push` accepts any
