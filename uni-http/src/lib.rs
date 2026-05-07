@@ -566,8 +566,12 @@ impl HttpStream for uni::runtime::TcpStream {
 pub struct TlsStream {
     tcp: uni::runtime::TcpStream,
     tls: Box<dyn TlsConn>,
-    /// Heap-allocated ciphertext scratch reused across recvs.
-    cipher_buf: Box<[u8]>,
+    /// Inline ciphertext scratch reused across recvs. Used to be
+    /// `Box<[u8]>` allocated separately in `new()`; folded into
+    /// the struct so the future state machine that holds the
+    /// `TlsStream` carries the buffer inline — one fewer alloc
+    /// per HTTPS conn accept.
+    cipher_buf: [u8; BUF_SIZE],
     /// Stack-friendly scratch for draining `pop_tx` output.
     tx_scratch: [u8; 2048],
 }
@@ -577,7 +581,7 @@ impl TlsStream {
         TlsStream {
             tcp,
             tls,
-            cipher_buf: alloc::vec![0u8; BUF_SIZE].into_boxed_slice(),
+            cipher_buf: [0u8; BUF_SIZE],
             tx_scratch: [0u8; 2048],
         }
     }
@@ -745,7 +749,15 @@ async fn handle_conn<S, H>(
     S: HttpStream,
     H: AsyncFn(&Request) -> Response,
 {
-    let mut buf: Box<[u8]> = alloc::vec![0u8; BUF_SIZE].into_boxed_slice();
+    // Inline 8 KiB request-parse buffer in the future state. The
+    // async runtime allocates the future once (as a
+    // `Pin<Box<dyn Future>>` per accepted conn); folding `buf` in
+    // turns the previous "future alloc + Box<[u8]> alloc" pair
+    // into a single alloc per conn-accept. The future struct
+    // already carries an inline `Request` (8 KiB body + 256 B
+    // path) and `BufWriter` (2 KiB), so the extra 8 KiB stays
+    // proportional.
+    let mut buf = [0u8; BUF_SIZE];
     let mut buf_len = 0usize;
     // Per-connection scratch reused across every request on this
     // conn — `Request` carries 8 KiB of body buffer and 256 B of
