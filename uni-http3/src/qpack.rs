@@ -297,47 +297,132 @@ fn read_string_into(
 // Encoder
 // ============================================================================
 
-/// Encode a list of `(name, value)` headers into `out`. Always
-/// emits `req_insert_count=0`, `base=0` (no dynamic table).
+/// Encode a list of `(name, value)` headers into a caller-owned
+/// slice. Returns bytes written, or `QpackError::Truncated` if
+/// `out` is too small. Always emits `req_insert_count=0`,
+/// `base=0` (no dynamic table) per our SETTINGS advertisement.
+///
+/// Slice-target variant — what the H3 framing builder calls so
+/// the QPACK body lands directly in an `IOBuf`'s payload region
+/// (with reserved headroom for the H3 HEADERS frame header to
+/// be prepended in place afterward). No intermediate `Vec<u8>`,
+/// no per-conn scratch, no qpack→framing memcpy.
+pub fn encode_field_section_into(
+    headers: &[(&[u8], &[u8])],
+    out: &mut [u8],
+) -> Result<usize, QpackError> {
+    let mut w = SliceWriter::new(out);
+    encode_impl(headers, &mut w);
+    if w.overflow {
+        Err(QpackError::Truncated)
+    } else {
+        Ok(w.pos)
+    }
+}
+
+/// Vec-target variant. Convenience wrapper for tests and any
+/// caller that wants the bytes in an owned buffer; the H3 hot
+/// path uses `encode_field_section_into` directly.
 pub fn encode_field_section(headers: &[(&[u8], &[u8])], out: &mut Vec<u8>) {
+    let mut w = VecWriter { out };
+    encode_impl(headers, &mut w);
+}
+
+/// Internal byte-writer abstraction so the encoder body can
+/// emit into either a fixed-size slice (`SliceWriter`) or a
+/// growable Vec (`VecWriter`) without code duplication. The
+/// trait stays private — public callers pick a target via the
+/// two `encode_field_section{,_into}` entry points.
+trait QpackWriter {
+    fn write(&mut self, byte: u8);
+    fn write_slice(&mut self, slice: &[u8]);
+}
+
+struct VecWriter<'a> {
+    out: &'a mut Vec<u8>,
+}
+impl QpackWriter for VecWriter<'_> {
+    fn write(&mut self, byte: u8) {
+        self.out.push(byte);
+    }
+    fn write_slice(&mut self, slice: &[u8]) {
+        self.out.extend_from_slice(slice);
+    }
+}
+
+struct SliceWriter<'a> {
+    out: &'a mut [u8],
+    pos: usize,
+    overflow: bool,
+}
+impl<'a> SliceWriter<'a> {
+    fn new(out: &'a mut [u8]) -> Self {
+        SliceWriter {
+            out,
+            pos: 0,
+            overflow: false,
+        }
+    }
+}
+impl QpackWriter for SliceWriter<'_> {
+    fn write(&mut self, byte: u8) {
+        if self.pos < self.out.len() {
+            self.out[self.pos] = byte;
+        } else {
+            self.overflow = true;
+        }
+        self.pos += 1;
+    }
+    fn write_slice(&mut self, slice: &[u8]) {
+        let n = slice.len();
+        if self.pos + n <= self.out.len() {
+            self.out[self.pos..self.pos + n].copy_from_slice(slice);
+        } else {
+            self.overflow = true;
+        }
+        self.pos += n;
+    }
+}
+
+fn encode_impl<W: QpackWriter>(headers: &[(&[u8], &[u8])], w: &mut W) {
     // Prefix: Required Insert Count (1 byte 0x00) || S=0,Base=0 (0x00).
-    out.push(0);
-    out.push(0);
+    w.write(0);
+    w.write(0);
 
     for (name, value) in headers {
         if let Some(idx) = static_table::find_exact(name, value) {
             // Indexed Field Line: 1 1 idx[6].
-            write_prefixed_int(idx as u64, 6, 0b1100_0000, out);
+            write_prefixed_int(idx as u64, 6, 0b1100_0000, w);
         } else if let Some(name_idx) = static_table::find_name(name) {
             // Literal Field Line With Name Reference: 0 1 N=0 T=1 idx[4].
-            write_prefixed_int(name_idx as u64, 4, 0b0101_0000, out);
+            write_prefixed_int(name_idx as u64, 4, 0b0101_0000, w);
             // Value: H=0 len[7] bytes.
-            write_prefixed_int(value.len() as u64, 7, 0, out);
-            out.extend_from_slice(value);
+            write_prefixed_int(value.len() as u64, 7, 0, w);
+            w.write_slice(value);
         } else {
             // Literal Field Line With Literal Name:
             //   0 0 1 N=0 H=0 len[3] (name bytes) H=0 len[7] (value bytes).
-            write_prefixed_int(name.len() as u64, 3, 0b0010_0000, out);
-            out.extend_from_slice(name);
-            write_prefixed_int(value.len() as u64, 7, 0, out);
-            out.extend_from_slice(value);
+            write_prefixed_int(name.len() as u64, 3, 0b0010_0000, w);
+            w.write_slice(name);
+            write_prefixed_int(value.len() as u64, 7, 0, w);
+            w.write_slice(value);
         }
     }
 }
 
-fn write_prefixed_int(value: u64, prefix_bits: u8, prefix_byte: u8, out: &mut Vec<u8>) {
+fn write_prefixed_int<W: QpackWriter>(value: u64, prefix_bits: u8, prefix_byte: u8, w: &mut W) {
     let mask: u64 = (1u64 << prefix_bits) - 1;
     if value < mask {
-        out.push(prefix_byte | (value as u8));
+        w.write(prefix_byte | (value as u8));
         return;
     }
-    out.push(prefix_byte | (mask as u8));
+    w.write(prefix_byte | (mask as u8));
     let mut v = value - mask;
     while v >= 128 {
-        out.push((v as u8 & 0x7f) | 0x80);
+        w.write((v as u8 & 0x7f) | 0x80);
         v >>= 7;
     }
-    out.push(v as u8);
+    w.write(v as u8);
 }
 
 #[cfg(test)]

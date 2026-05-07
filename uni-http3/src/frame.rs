@@ -143,6 +143,24 @@ pub fn append_frame_header(
     Ok(())
 }
 
+/// Slice-target variant of [`append_frame_header`]. Writes
+/// `[type-varint][length-varint]` into `out`, returning the
+/// total number of bytes written. Used by the H3 framing
+/// builder to write straight into a stack scratch (then
+/// `IOBuf::prepend` / `append_slice` into the framing IOBuf's
+/// reserved headroom/tailroom) — avoiding the per-request
+/// `Vec<u8>` allocation that the Vec-target variant requires.
+pub fn write_frame_header(
+    ty: u64,
+    body_len: usize,
+    out: &mut [u8],
+) -> Result<usize, FrameError> {
+    let mut p = 0usize;
+    p += write_varint(ty, &mut out[p..])?;
+    p += write_varint(body_len as u64, &mut out[p..])?;
+    Ok(p)
+}
+
 /// Convenience: write a SETTINGS frame with empty body. Used by the
 /// server's control stream — we declare nothing beyond defaults
 /// (no QPACK dynamic table, no extra capacity).

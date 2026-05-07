@@ -37,6 +37,14 @@ pub struct Counters {
     /// (we negotiated capacity 0 so this should never fire),
     /// or malformed Huffman.
     pub qpack_decode_error: AtomicU64,
+    /// QPACK encode of the response header section overflowed
+    /// the per-request reserve (`QPACK_BODY_RESERVE`). Should
+    /// not fire for our 3-header response shape; if it does,
+    /// either a content-type is unusually long or
+    /// `with_header` added enough custom headers to exceed
+    /// the reserve. Bump `QPACK_BODY_RESERVE` if this counter
+    /// stays nonzero in production.
+    pub qpack_encode_overflow: AtomicU64,
     /// One server-initiated stream-level write. Most apps emit
     /// 1–2 of these per request (HEADERS + DATA combined into
     /// a single send_fin call); deviations from that ratio
@@ -87,6 +95,7 @@ impl Counters {
             frame_parse_error: AtomicU64::new(0),
             no_headers_seen: AtomicU64::new(0),
             qpack_decode_error: AtomicU64::new(0),
+            qpack_encode_overflow: AtomicU64::new(0),
             responses_sent: AtomicU64::new(0),
             peer_uni_streams_seen: AtomicU64::new(0),
             unexpected_bidi: AtomicU64::new(0),
@@ -170,7 +179,7 @@ pub fn should_log_event() -> bool {
     LEVEL.load(Ordering::Relaxed) >= LogLevel::Events as u8
 }
 
-pub fn snapshot() -> [(&'static str, u64); 14] {
+pub fn snapshot() -> [(&'static str, u64); 15] {
     let c = &COUNTERS;
     [
         ("requests_received", c.requests_received.load(Ordering::Relaxed)),
@@ -179,6 +188,7 @@ pub fn snapshot() -> [(&'static str, u64); 14] {
         ("frame_parse_error", c.frame_parse_error.load(Ordering::Relaxed)),
         ("no_headers_seen", c.no_headers_seen.load(Ordering::Relaxed)),
         ("qpack_decode_error", c.qpack_decode_error.load(Ordering::Relaxed)),
+        ("qpack_encode_overflow", c.qpack_encode_overflow.load(Ordering::Relaxed)),
         ("responses_sent", c.responses_sent.load(Ordering::Relaxed)),
         ("peer_uni_streams_seen", c.peer_uni_streams_seen.load(Ordering::Relaxed)),
         ("unexpected_bidi", c.unexpected_bidi.load(Ordering::Relaxed)),

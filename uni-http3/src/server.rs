@@ -164,11 +164,11 @@ where
 /// Per-connection scratch buffers, retained across requests on
 /// the same QUIC conn. Each request `clear()`s the buffers it
 /// uses and refills via `extend_from_slice` — capacity stays put,
-/// so the steady-state per-request alloc count drops by 5 (vs
-/// the original `Vec::new()`-per-request style). Sized for a
-/// typical Chrome refresh; oversize requests grow the buffer in
-/// place (rare, but capped via `RECV_CAP` enforcement in
-/// `handle_request`).
+/// so the steady-state per-request alloc count for the request-
+/// parsing path drops to zero (no fresh `Vec::new()` per request).
+/// Response framing is now built directly inside an IOBuf with
+/// reserved headroom/tailroom (see `write_response`) — the old
+/// `qpack_buf` + `framing` Vec scratches are gone.
 pub(crate) struct Scratch {
     /// H3 stream-bytes accumulator — successive `recv` chunks
     /// concatenate here until enough bytes form a complete frame.
@@ -180,11 +180,6 @@ pub(crate) struct Scratch {
     /// Empty path for GET. Kept as scratch so an occasional POST
     /// on the same conn doesn't allocate.
     pub(crate) data: Vec<u8>,
-    /// QPACK-encoded response field section.
-    pub(crate) qpack_buf: Vec<u8>,
-    /// H3 framing prefix (HEADERS frame header + qpack body +
-    /// optional DATA frame header).
-    pub(crate) framing: Vec<u8>,
 }
 
 impl Scratch {
@@ -200,11 +195,6 @@ impl Scratch {
             // Empty by default; will allocate if a request body
             // arrives.
             data: Vec::new(),
-            // 256 B covers our typical 3-header response (status,
-            // content-type, content-length).
-            qpack_buf: Vec::with_capacity(256),
-            // 64 B covers the H3 framing prefix.
-            framing: Vec::with_capacity(64),
         }
     }
 }
@@ -368,62 +358,122 @@ async fn handle_request<H, F>(
     crate::diag::bump(&crate::diag::COUNTERS.user_handler_returned);
     let status = response.status;
     // Encode response: HEADERS + DATA + FIN.
-    write_response(conn, sid, response, &mut scratch.qpack_buf);
+    write_response(conn, sid, response);
     crate::diag::bump(&crate::diag::COUNTERS.write_response_completed);
     crate::h3_event!(requests_handled, "sid={} status={}", sid, status);
     crate::diag::bump(&crate::diag::COUNTERS.responses_sent);
 }
 
-fn write_response(conn: &QuicConn, sid: u64, resp: Response, qpack_buf: &mut Vec<u8>) {
-    // Build the response wire stream as a sequence of chunks.
-    //   1. A small "framing" Vec containing [H3 HEADERS frame
-    //      complete + qpack-encoded fields][H3 DATA frame
-    //      header — type+length, no body].
-    //   2. Each body part — Static (borrowed slice, zero alloc),
-    //      Owned (Vec by move), or several of each in a Chain.
+/// Maximum bytes an H3 frame header (type varint + length
+/// varint) can take. Both varints are at most 8 bytes (RFC 9000
+/// §16) but in practice our types are 1-byte and our lengths
+/// fit in 4-byte varints. Round to 16 to give the IOBuf payload
+/// alignment-friendly bookends.
+const H3_FRAME_HEADER_MAX: usize = 16;
+
+/// Conservative cap on the QPACK body for a typical 3-header
+/// response (`:status`, `content-type`, `content-length`).
+/// Any one literal value past this would overflow; the
+/// `encode_field_section_into` call below returns
+/// `QpackError::Truncated` and we fall back to closing the
+/// stream cleanly. 1 KiB covers our biggest content-type
+/// (`text/html; charset=utf-8`) plus indexed/literal-name
+/// references for `content-length` and `:status` with room to
+/// spare.
+const QPACK_BODY_RESERVE: usize = 1024;
+
+fn write_response(conn: &QuicConn, sid: u64, resp: Response) {
+    // Build the response framing as a single IOBuf with
+    // reserved headroom for the H3 HEADERS frame header and
+    // tailroom for the optional H3 DATA frame header. QPACK
+    // encodes directly into the IOBuf's payload region, so:
     //
-    // The framing knows the total body length up front, so a
-    // multi-part body still ships as one DATA frame with the
-    // sum of part lengths in its length-prefix; parts get
-    // queued as separate SendChunks but reach the wire as
-    // contiguous bytes inside the QUIC STREAM frame.
+    //   * No separate `qpack_buf: Vec` scratch (was per-conn).
+    //   * No `qpack_buf → framing` memcpy (was ~150-300 B/request).
+    //   * The H3 frame headers prepend / append IN PLACE.
+    //
+    // One heap alloc per response (the IOBuf), same alloc
+    // count as the previous `framing: Vec<u8>` approach, but
+    // the response is built end-to-end with no intermediate
+    // buffers and no copies between them.
     let status_str = status_to_bytes(resp.status);
     let body_len = resp.body_len();
     let mut len_buf = [0u8; 20];
     let len_off = format_usize_into(body_len, &mut len_buf);
 
-    // Reuse the per-conn `qpack_buf` scratch — encode_field_section
-    // writes into it after `clear()`, so capacity persists across
-    // requests on this conn (1 alloc per CONN, not per request).
-    qpack_buf.clear();
-    qpack::encode_field_section(
-        &[
-            (&b":status"[..], status_str.as_slice()),
-            (&b"content-type"[..], resp.content_type_bytes()),
-            (&b"content-length"[..], &len_buf[len_off..]),
-        ],
-        qpack_buf,
+    // Allocate the framing IOBuf: `[headroom][qpack body
+    // capacity][tailroom]`. The headroom holds the HEADERS
+    // frame header after we know the QPACK length; the
+    // tailroom holds the DATA frame header (when there's a
+    // body).
+    let mut framing = uni_http::IOBuf::new_with_reserved(
+        H3_FRAME_HEADER_MAX,
+        QPACK_BODY_RESERVE,
+        H3_FRAME_HEADER_MAX,
     );
 
-    // `framing` is moved into the SendStream by `send_owned`, so we
-    // can't pool it across requests (the owned chunk is held in
-    // the QUIC layer until the bytes hit the wire). Allocate fresh,
-    // sized to fit both the HEADERS prefix and the QPACK body in
-    // one shot — `with_capacity` so `extend_from_slice` doesn't
-    // double-grow.
-    let mut framing: Vec<u8> = Vec::with_capacity(qpack_buf.len() + 16);
-    frame::append_frame_header(h3_ftype::HEADERS, qpack_buf.len(), &mut framing)
+    // Encode the QPACK field section directly into the IOBuf's
+    // tailroom region (the space we just reserved as
+    // payload-capacity). `extend_uninit` returns a `&mut [u8]`
+    // pointing at that region; we then trim it back to the
+    // exact encoded length.
+    let qpack_len = {
+        let region = framing
+            .extend_uninit(QPACK_BODY_RESERVE)
+            .expect("qpack reserve fits in fresh IOBuf");
+        match qpack::encode_field_section_into(
+            &[
+                (&b":status"[..], status_str.as_slice()),
+                (&b"content-type"[..], resp.content_type_bytes()),
+                (&b"content-length"[..], &len_buf[len_off..]),
+            ],
+            region,
+        ) {
+            Ok(n) => n,
+            Err(_) => {
+                crate::h3_drop!(qpack_encode_overflow,
+                    "sid={} status={} qpack_reserve={}",
+                    sid, resp.status, QPACK_BODY_RESERVE);
+                conn.close_stream(sid);
+                return;
+            }
+        }
+    };
+    // Shrink the visible payload to just the encoded QPACK
+    // bytes; the unused remainder stays as tailroom for the
+    // DATA frame header below.
+    framing
+        .trim_end(QPACK_BODY_RESERVE - qpack_len)
+        .expect("qpack_len <= reserve");
+
+    // Prepend the H3 HEADERS frame header into the IOBuf's
+    // reserved headroom — no allocation, no copy of the QPACK
+    // body. Slice-target frame writer keeps this stack-only.
+    let mut hdr_buf = [0u8; H3_FRAME_HEADER_MAX];
+    let hdr_len = frame::write_frame_header(h3_ftype::HEADERS, qpack_len, &mut hdr_buf)
         .expect("headers frame header fits");
-    framing.extend_from_slice(qpack_buf);
+    framing
+        .prepend(&hdr_buf[..hdr_len])
+        .expect("HEADERS hdr fits in reserved headroom");
+
+    // Append the H3 DATA frame header into the tailroom (if
+    // there's a body to follow).
     if body_len > 0 {
-        frame::append_frame_header(h3_ftype::DATA, body_len, &mut framing)
+        let dlen = frame::write_frame_header(h3_ftype::DATA, body_len, &mut hdr_buf)
             .expect("data frame header fits");
+        framing
+            .append_slice(&hdr_buf[..dlen])
+            .expect("DATA hdr fits in reserved tailroom");
     }
 
-    conn.send_owned(sid, framing);
+    // Move the framing IOBuf into the SendStream as a single
+    // chunk. SendStream now natively holds IOBufs (no Vec
+    // conversion), so reserved headroom/tailroom on body parts
+    // also passes through cleanly for downstream layers.
+    conn.send_iobuf(sid, framing);
 
-    // Queue each body chunk on the QUIC stream. Cow::Borrowed
-    // → send_static (zero alloc); Cow::Owned → send_owned (move).
+    // Queue each body chunk on the QUIC stream. Static borrows
+    // stay borrowed; heap-owned chunks move via send_iobuf.
     if body_len > 0 {
         match resp.into_body() {
             uni_http::ResponseBody::Single(b) => queue_chunk(conn, sid, b),
