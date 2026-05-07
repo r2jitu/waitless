@@ -135,10 +135,14 @@ pub fn body_iobuf(cap: usize) -> IOBuf {
     if let Some(borrowed) = try_carve_scratch(cap) {
         return borrowed;
     }
-    // Fallback: fresh heap allocation. Same reserves as the
-    // borrowed-scratch path so the encrypt-in-place fast path
-    // in `TlsStream::send` applies either way.
-    IOBuf::new_with_reserved(MAX_HEADER_RESERVE, cap, MAX_TRAILER_RESERVE)
+    // Fallback: fresh heap allocation with headroom for layered
+    // framing prepends (HTTP / TLS record / etc.) but no
+    // tailroom — TLS handles its trailer through the slice path
+    // today, so reserving 17 B per IOBuf was hidden bytes that
+    // never got used. If a future small-record fast path
+    // re-enables encrypt-in-place we can either bump this back
+    // or have the TLS layer append a separate trailer IOBuf.
+    IOBuf::new_with_reserved(MAX_HEADER_RESERVE, cap, 0)
 }
 
 /// Internal: try to carve an IOBuf out of the per-worker
@@ -164,9 +168,17 @@ fn try_carve_scratch(cap: usize) -> Option<IOBuf> {
         return None;
     }
     let remaining = total - cursor;
+    // Headroom only — no trailer reservation. The TLS encrypt-
+    // in-place path wanted 17 B of tailroom (1 B inner-content-
+    // type + 16 B AEAD tag), but its size cap (≤ 3 KiB
+    // plaintext per record) rules out the diagnostics-class
+    // bodies that actually matter, and small bodies take the
+    // already-coalesce-into-scratch path which doesn't need
+    // body tailroom either. Until a faster small-record fast
+    // path needs encrypt-in-place to fire, the trailer reserve
+    // was just hidden bytes that did nothing.
     let headroom = MAX_HEADER_RESERVE.min(remaining / 4);
-    let tailroom = MAX_TRAILER_RESERVE;
-    let needed = headroom + cap + tailroom;
+    let needed = headroom + cap;
     if needed > remaining {
         return None;
     }
