@@ -106,19 +106,13 @@ pub fn udp_receive(src_ip: IpAddr, _dst_ip: IpAddr, mut iobuf: uni_iobuf::IOBuf)
     if udp_len < 8 || udp_len > data.len() {
         return;
     }
-    // Drop the header borrow before mutating iobuf.
     let body_len = udp_len - 8;
-    if iobuf.consume(8).is_err() {
+    // Narrow visible payload to just the UDP body — `narrow` runs
+    // `consume(8)` then trims any trailing IP padding past the
+    // body length. NLL ends the `data` / `hdr` borrow chain after
+    // the integer extractions above so the mutable borrow is OK.
+    if iobuf.narrow(8, body_len).is_err() {
         return;
-    }
-    // The IOBuf may carry trailing pad bytes (Ethernet minimum
-    // frame size, IP options, etc.) past the UDP body; cap the
-    // visible payload to `body_len` by trimming from the back.
-    let visible = iobuf.data().len();
-    if visible > body_len {
-        if iobuf.trim_end(visible - body_len).is_err() {
-            return;
-        }
     }
     let _ = uni_runtime::net::deliver_udp(dst_port, src_ip, src_port, iobuf);
 }

@@ -324,70 +324,40 @@ pub fn net_receive(mut iobuf: uni_iobuf::IOBuf) {
             // iobuf drops at fn exit
         }
         ethernet::ETHERTYPE_IPV4 => {
-            // Re-borrow `frame` after `payload` to avoid a stale
-            // borrow when we mutate iobuf below.
             let Some(pkt) = ipv4::ipv4_receive(payload) else { return };
             if ipv4::same_subnet(pkt.src) {
                 arp::arp_learn(pkt.src, src_mac);
             }
             let proto = pkt.protocol;
-            let src = pkt.src.addr;
-            let dst = pkt.dst.addr;
-            // Compute UDP/TCP segment offset relative to frame start.
+            let src = types::IpAddr::V4(types::Ipv4Addr { addr: pkt.src.addr });
+            let dst = types::IpAddr::V4(types::Ipv4Addr { addr: pkt.dst.addr });
+            // Offset of the L4 segment within the original frame.
+            // NLL ends `frame` / `payload` / `pkt` borrows after
+            // this line, so `iobuf.narrow(...)` below is OK.
             let seg_offset = unsafe {
                 pkt.payload.as_ptr().offset_from(frame.as_ptr()) as usize
             };
             let seg_len = pkt.payload.len();
-            // Drop the `pkt` borrow (and the `payload` borrow,
-            // and the `frame` borrow) before mutating iobuf.
-            drop(pkt);
+            // Narrow the IOBuf so `data()` is just the L4 segment
+            // (header + payload), trimming pad-to-min-frame bytes
+            // that hang off the back of the Ethernet frame past
+            // the IP `total_length`. Then hand ownership to the
+            // L4 receive entry.
             match proto {
                 ipv4::PROTO_UDP => {
-                    // Advance iobuf so data() == UDP datagram, then
-                    // hand ownership down. Trim trailing pad bytes
-                    // (the Ethernet frame can be larger than the
-                    // IP `total_length` it carries — pad-to-min-frame
-                    // bytes hang off the back).
-                    if iobuf.consume(seg_offset).is_err() {
-                        return;
+                    if iobuf.narrow(seg_offset, seg_len).is_ok() {
+                        udp::udp_receive(src, dst, iobuf);
                     }
-                    let visible = iobuf.data().len();
-                    if visible > seg_len
-                        && iobuf.trim_end(visible - seg_len).is_err()
-                    {
-                        return;
-                    }
-                    udp::udp_receive(
-                        types::IpAddr::V4(types::Ipv4Addr { addr: src }),
-                        types::IpAddr::V4(types::Ipv4Addr { addr: dst }),
-                        iobuf,
-                    );
-                    // iobuf moved
                     return;
                 }
                 ipv4::PROTO_TCP => {
-                    // Symmetric to the UDP arm: consume past the
-                    // IP header so `iobuf.data()` is the TCP segment,
-                    // trim trailing IP padding, then move into TCP.
-                    if iobuf.consume(seg_offset).is_err() {
-                        return;
+                    if iobuf.narrow(seg_offset, seg_len).is_ok() {
+                        tcp::tcp_receive(src, dst, iobuf);
                     }
-                    let visible = iobuf.data().len();
-                    if visible > seg_len
-                        && iobuf.trim_end(visible - seg_len).is_err()
-                    {
-                        return;
-                    }
-                    tcp::tcp_receive(
-                        types::IpAddr::V4(types::Ipv4Addr { addr: src }),
-                        types::IpAddr::V4(types::Ipv4Addr { addr: dst }),
-                        iobuf,
-                    );
-                    // iobuf moved
                     return;
                 }
                 _ => {
-                    // Unknown IP protocol — drop iobuf at end of fn.
+                    // Unknown IP protocol — iobuf drops at fn exit.
                 }
             }
         }

@@ -496,6 +496,25 @@ impl IOBuf {
         }
     }
 
+    /// Narrow the visible payload to `[offset..offset+len]` relative
+    /// to the current visible region. Equivalent to
+    /// `self.consume(offset)?` followed by trimming any tail past
+    /// `len` via `trim_end`. The common case in protocol dispatch:
+    /// "advance past my header (offset = header_size), and cut
+    /// trailing IP padding if my payload is shorter than the
+    /// frame I came in on (len = next-layer total)."
+    ///
+    /// Returns `Err` if `offset + len` exceeds the current visible
+    /// payload length.
+    pub fn narrow(&mut self, offset: usize, len: usize) -> Result<(), IOBufError> {
+        self.consume(offset)?;
+        let visible = self.data().len();
+        if visible > len {
+            self.trim_end(visible - len)?;
+        }
+        Ok(())
+    }
+
     /// Trim `n` bytes from the FRONT of the visible payload.
     /// Used by the consumer side after a layer has stripped its
     /// header (e.g. TLS unprotect leaves the record header
