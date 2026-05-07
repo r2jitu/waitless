@@ -1080,6 +1080,26 @@ impl Connection {
         }
     }
 
+    /// Append a pre-built [`uni_iobuf::IOBuf`] chunk to stream
+    /// `sid`'s outbound chain. Use this when the caller has
+    /// already built an IOBuf — typically a heap-allocated
+    /// buffer with reserved headroom (so a layer below can
+    /// prepend its header in place) plus the payload bytes
+    /// already written. The IOBuf moves into the SendStream's
+    /// VecDeque; subsequent `pop_chunk_into` calls drain its
+    /// `data()` slice straight into the packet's frames buffer.
+    pub fn stream_send_iobuf(&mut self, sid: u64, data: uni_iobuf::IOBuf) {
+        let was_new = !self.send_streams.contains_key(&sid);
+        let s = self
+            .send_streams
+            .entry(sid)
+            .or_insert_with(crate::streams::SendStream::default);
+        s.write_iobuf(data);
+        if was_new {
+            crate::diag::bump(&crate::diag::COUNTERS.send_streams_created);
+        }
+    }
+
     /// Mark stream `sid` for FIN. The next outbound STREAM frame
     /// after the buffer drains will carry the FIN flag.
     pub fn stream_close(&mut self, sid: u64) {

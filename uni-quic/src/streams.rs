@@ -283,35 +283,34 @@ pub enum SendState {
     FinSent,
 }
 
-/// Same primitive as `uni_http::Bytes` — a borrowed-static or
-/// owned byte chunk. Re-aliased here so this crate's API
-/// doesn't have to mention `Cow<'static, [u8]>` longhand and
-/// to keep the cross-stack abstraction explicit. uni-quic
-/// can't depend on uni-http (transport ↛ application), but
-/// the underlying type is the same so values cross the
-/// boundary without conversion.
-pub type Bytes = alloc::borrow::Cow<'static, [u8]>;
-
 /// Per-stream send state. The connection layer drives
-/// `pop_chunk` on each outbound 1-RTT packet build.
+/// `pop_chunk_into` on each outbound 1-RTT packet build.
 ///
-/// Outbound bytes are held as a chain of [Bytes] chunks — each
-/// either owned (Cow::Owned) or borrowed-static (Cow::Borrowed).
-/// `head_consumed` tracks how many bytes of the FRONT chunk
-/// have already been emitted in prior pop_chunk_into calls;
-/// only the head needs a cursor (later chunks are untouched
-/// until they reach the front). Once the head is fully
-/// consumed it's pop_front'd and the cursor resets to 0.
+/// Outbound bytes are held as a chain of [`uni_iobuf::IOBuf`]
+/// chunks — static-borrowed, heap-owned, or (in future) shared
+/// with refcount. `head_consumed` tracks how many bytes of the
+/// FRONT chunk have already been emitted in prior pop_chunk_into
+/// calls; only the head needs a cursor (later chunks are
+/// untouched until they reach the front). Once the head is
+/// fully consumed it's `pop_front`'d and the cursor resets to 0.
+///
+/// Migrating off `Cow<'static, [u8]>`: the previous `Bytes`
+/// alias mapped 1:1 to Cow's two variants. IOBuf is a strict
+/// superset — same two cases (Static / Heap), plus per-chunk
+/// headroom/tailroom that lower layers (TLS record header /
+/// AEAD tag, future per-packet QUIC header prepend) can write
+/// into without re-allocating. SendStream itself doesn't read
+/// the headroom; it just passes the IOBuf along.
 pub struct SendStream {
     /// Outbound chunks, FIFO. Empty payloads are not pushed.
-    pub outbound: alloc::collections::VecDeque<Bytes>,
+    pub outbound: alloc::collections::VecDeque<uni_iobuf::IOBuf>,
     /// Bytes already emitted from the head chunk's front.
     /// `0..head_consumed` of `outbound[0]` is "drained";
     /// `head_consumed..` is the remaining bytes. Reset to 0
     /// each time we pop_front.
     pub head_consumed: usize,
     /// Offset of the next byte to send. Increments by chunk size
-    /// per `pop_chunk` call.
+    /// per `pop_chunk_into` call.
     pub send_offset: u64,
     /// Lifecycle — replaces (`close_after_drain`, `fin_sent`).
     pub state: SendState,
@@ -336,35 +335,40 @@ impl SendStream {
         matches!(self.state, SendState::FinSent)
     }
 
-    /// Generic append: takes any `Bytes` (Cow::Borrowed or
-    /// Cow::Owned) and queues it in the chunk chain. The
-    /// type-specific shortcuts below all funnel into this.
-    pub fn write_bytes(&mut self, data: Bytes) {
+    /// Canonical append. Takes any pre-built [`IOBuf`] (static
+    /// borrow, heap-owned, with or without reserved
+    /// headroom/tailroom) and queues it. The type-specific
+    /// shortcuts below all funnel into this.
+    pub fn write_iobuf(&mut self, data: uni_iobuf::IOBuf) {
         if matches!(self.state, SendState::FinSent) || data.is_empty() {
             return;
         }
         self.outbound.push_back(data);
     }
 
-    /// Append a borrowed slice. Allocates one Vec to hold the
-    /// copy. For zero-copy paths use `write_owned` (Vec by
-    /// move) or `write_static` (`&'static [u8]` by reference).
+    /// Append a borrowed slice. Allocates one heap buffer to
+    /// hold the copy. For zero-copy paths use `write_owned`
+    /// (Vec by move) or `write_static` (`&'static [u8]` by
+    /// reference).
     pub fn write(&mut self, data: &[u8]) {
         if data.is_empty() {
             return;
         }
-        self.write_bytes(alloc::borrow::Cow::Owned(data.to_vec()));
+        self.write_iobuf(uni_iobuf::IOBuf::from(data.to_vec()));
     }
 
-    /// Append an owned `Vec<u8>` by move — no copy.
+    /// Append an owned `Vec<u8>` by move. `Vec → Box<[u8]>`
+    /// transfers the allocation without a copy when len ==
+    /// capacity (typical for `Vec::with_capacity` + extend
+    /// flows); otherwise `into_boxed_slice` may shrink-realloc.
     pub fn write_owned(&mut self, data: Vec<u8>) {
-        self.write_bytes(alloc::borrow::Cow::Owned(data));
+        self.write_iobuf(uni_iobuf::IOBuf::from(data));
     }
 
     /// Append a `&'static` slice by reference — zero copy AND
     /// zero alloc.
     pub fn write_static(&mut self, data: &'static [u8]) {
-        self.write_bytes(alloc::borrow::Cow::Borrowed(data));
+        self.write_iobuf(uni_iobuf::IOBuf::from_static(data));
     }
 
     pub fn close(&mut self) {
@@ -403,9 +407,9 @@ impl SendStream {
     }
 
     /// Pop up to `max_bytes` from the front of the chunk chain
-    /// as an owned Vec. Hot path is `pop_chunk_into` (writes
-    /// straight into the datagram); this exists for callers
-    /// that want an owned chunk back.
+    /// as an owned Vec. Used by callers that want an owned
+    /// chunk back; the hot path is `pop_chunk_into` which
+    /// avoids the intermediate allocation.
     pub fn pop_chunk(&mut self, max_bytes: usize) -> Option<(u64, Vec<u8>, bool)> {
         match self.state {
             SendState::FinSent => return None,
@@ -422,7 +426,7 @@ impl SendStream {
         let n = head_remaining.min(max_bytes);
         let chunk: Vec<u8> = {
             let head = self.outbound.front().unwrap();
-            head[self.head_consumed..self.head_consumed + n].to_vec()
+            head.data()[self.head_consumed..self.head_consumed + n].to_vec()
         };
         self.advance_head(n);
         self.send_offset += n as u64;
@@ -435,7 +439,8 @@ impl SendStream {
 
     /// Allocation-free variant of `pop_chunk`: appends the
     /// STREAM frame (header + body + FIN bit) directly into
-    /// `frames_out`.
+    /// `frames_out` by reading bytes from the head IOBuf via
+    /// its `data()` slice.
     pub fn pop_chunk_into(
         &mut self,
         stream_id: u64,
@@ -467,7 +472,8 @@ impl SendStream {
         crate::frame::append_stream_header(stream_id, offset, fin, n, frames_out)?;
         {
             let head = self.outbound.front().unwrap();
-            frames_out.extend_from_slice(&head[self.head_consumed..self.head_consumed + n]);
+            frames_out
+                .extend_from_slice(&head.data()[self.head_consumed..self.head_consumed + n]);
         }
         self.advance_head(n);
         self.send_offset += n as u64;

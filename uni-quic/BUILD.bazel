@@ -63,6 +63,7 @@ rust_library(
     }),
     deps = [
         "//uni",
+        "//uni-iobuf",
         "//uni-tls",
         "@crates//:aes-gcm",
         "@crates//:chacha20",

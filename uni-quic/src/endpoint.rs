@@ -271,6 +271,25 @@ impl QuicConn {
         self.drain_outbound();
     }
 
+    /// Append a pre-built [`uni_iobuf::IOBuf`] chunk to stream
+    /// `sid`. The IOBuf may be a static borrow, a heap-owned
+    /// buffer, or a heap buffer with reserved headroom that a
+    /// downstream layer (the H3 framing prefix builder, for
+    /// example) has already prepended into. The IOBuf moves into
+    /// the SendStream's chunk chain; lower layers still don't
+    /// touch the headroom — pop_chunk_into reads only the
+    /// visible payload via `IOBuf::data()`. Callers that want
+    /// a per-request IOBuf scratch / pool plumb the `Drop`-on-
+    /// chunk-completion pathway (future work).
+    pub fn send_iobuf(&self, sid: u64, data: uni_iobuf::IOBuf) {
+        {
+            let mut c = self.conn.borrow_mut();
+            c.stream_send_iobuf(sid, data);
+            let _ = c.flush(&self.cfg);
+        }
+        self.drain_outbound();
+    }
+
     /// Discard any bytes buffered for `sid`'s recv side without
     /// awaiting. Use for streams the app never intends to read
     /// (e.g. HTTP/3 peer-initiated uni streams: control, QPACK
