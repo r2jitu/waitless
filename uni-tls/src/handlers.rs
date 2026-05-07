@@ -17,9 +17,9 @@ use p256::ecdsa::{signature::Signer, Signature as EcdsaSignature};
 
 use crate::handshake::{
     build_certificate, build_certificate_verify, build_encrypted_extensions, build_finished,
-    build_new_session_ticket, build_server_hello, cipher_suite, encode_handshake, msg_type,
-    parse_finished, parse_handshake, psk_ke_mode, sign_content_server_cert_verify, ClientHello,
-    ParseError, PskOffer,
+    build_new_session_ticket, build_server_hello, cipher_suite, encode_handshake, ext_type,
+    iter_alpn, msg_type, parse_finished, parse_handshake, psk_ke_mode,
+    sign_content_server_cert_verify, ClientHello, ParseError, PskOffer,
 };
 use crate::record::{self, content_type, open as record_open, seal as record_seal, RecordError, HEADER_LEN};
 use crate::schedule::{
@@ -240,6 +240,16 @@ impl TlsServer {
         // slices into hs_body are still live; the returned
         // `ResumeAccept` is owned (no borrows) and stays valid past
         // the subsequent `drain_rx`.
+        // Buffer for the selected ALPN protocol name. We pull it out
+        // of `ch.alpn_protocol_list` while ch is still in scope (the
+        // list borrows into `hs_body` which dies with `body`), then
+        // copy the chosen name into a small stack array so we can
+        // use it later in EncryptedExtensions. `selected_alpn_len`
+        // == 0 means "client didn't offer ALPN" — we skip the
+        // extension entirely in that case.
+        let mut selected_alpn = [0u8; 8]; // longest currently-supported is "http/1.1" (8)
+        let mut selected_alpn_len: usize = 0;
+
         let (client_x25519_pub, session_id_echo, sid_len, resume_accept) = {
             let ch = ClientHello::parse(hs_body).map_err(|_| HandshakeError::UnsupportedClient)?;
             trace::client_hello(&ch);
@@ -247,6 +257,25 @@ impl TlsServer {
             let sid_len = ch.legacy_session_id.len();
             sid[..sid_len].copy_from_slice(ch.legacy_session_id);
             let pub_key = ch.x25519_client_pub.ok_or(HandshakeError::UnsupportedClient)?;
+
+            // RFC 7301 §3.2: if the client offered ALPN and we
+            // support a name in their list, we MUST echo the
+            // selected name in EncryptedExtensions. Modern Chrome
+            // refuses to fall back on a missing-ALPN ServerHello
+            // when it offered `h2,http/1.1` — surfaces as
+            // ERR_SSL_PROTOCOL_ERROR. We don't speak HTTP/2, so
+            // `http/1.1` is the only protocol we select on the
+            // TCP/TLS path. (HTTP/3 is selected separately by
+            // `uni-quic`'s own EncryptedExtensions builder.)
+            if let Some(alpn_list) = ch.alpn_protocol_list {
+                for name in iter_alpn(alpn_list) {
+                    if name == b"http/1.1" {
+                        selected_alpn[..name.len()].copy_from_slice(name);
+                        selected_alpn_len = name.len();
+                        break;
+                    }
+                }
+            }
 
             let resume_accept = if let Some(psk_offer) = ch.psk.as_ref() {
                 let pre = profile::start();
@@ -368,10 +397,36 @@ impl TlsServer {
         // message inside a TLSCiphertext record, though in principle
         // they could share records — separate records is simpler.
 
-        // EncryptedExtensions
-        let mut ee_body = [0u8; 16];
+        // EncryptedExtensions. If the client offered ALPN and we
+        // selected a protocol above, echo it back per RFC 7301 §3.2.
+        // Wire body for ALPN: u16 list_len || u8 name_len || name.
+        // For our 8-byte max name ("http/1.1"), the body fits in 12
+        // bytes — fully stack-allocated.
+        let mut alpn_body_buf = [0u8; 12];
+        let alpn_body_len = if selected_alpn_len > 0 {
+            let list_len = (1 + selected_alpn_len) as u16;
+            alpn_body_buf[0..2].copy_from_slice(&list_len.to_be_bytes());
+            alpn_body_buf[2] = selected_alpn_len as u8;
+            alpn_body_buf[3..3 + selected_alpn_len]
+                .copy_from_slice(&selected_alpn[..selected_alpn_len]);
+            3 + selected_alpn_len
+        } else {
+            0
+        };
+        let extras_storage: [(u16, &[u8]); 1] = [(
+            ext_type::APPLICATION_LAYER_PROTOCOL_NEGOTIATION,
+            &alpn_body_buf[..alpn_body_len],
+        )];
+        let extras: &[(u16, &[u8])] = if alpn_body_len > 0 {
+            &extras_storage[..]
+        } else {
+            &[]
+        };
+        // 32 bytes covers: 2 (body_len) + 4 (ext envelope) + 12
+        // (ALPN body) = 18; rounded up.
+        let mut ee_body = [0u8; 32];
         let ee_body_len =
-            build_encrypted_extensions(&[], &mut ee_body).ok_or(HandshakeError::Internal)?;
+            build_encrypted_extensions(extras, &mut ee_body).ok_or(HandshakeError::Internal)?;
         let mut ee_msg = [0u8; 32];
         let ee_msg_len = encode_handshake(
             msg_type::ENCRYPTED_EXTENSIONS,
