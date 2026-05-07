@@ -91,6 +91,17 @@ const EAGAIN: i32 = 35;
 const EAGAIN: i32 = 11;
 
 #[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct IoVec {
+    /// `*const u8` rather than `*mut u8` because we only use
+    /// `IoVec` for `writev` (gather-write), which takes
+    /// `const struct iovec*` semantically. Casting to `*mut`
+    /// at the boundary is fine — the kernel only reads.
+    pub iov_base: *const u8,
+    pub iov_len: usize,
+}
+
+#[repr(C)]
 struct SockAddrIn {
     #[cfg(target_os = "macos")]
     sin_len: u8,
@@ -163,6 +174,7 @@ unsafe extern "C" {
     fn accept(fd: i32, addr: *mut u8, len: *mut u32) -> i32;
     fn recv(fd: i32, buf: *mut u8, len: usize, flags: i32) -> isize;
     fn send(fd: i32, buf: *const u8, len: usize, flags: i32) -> isize;
+    fn writev(fd: i32, iov: *const IoVec, iovcnt: i32) -> isize;
     fn recvfrom(fd: i32, buf: *mut u8, len: usize, flags: i32,
                 addr: *mut SockAddrIn, addrlen: *mut u32) -> isize;
     fn sendto(fd: i32, buf: *const u8, len: usize, flags: i32,

@@ -1349,6 +1349,120 @@ pub fn async_try_send(handle: *mut (), generation: u16, buf: &[u8]) -> isize {
     if n < 0 { -1 } else { n as isize }
 }
 
+/// Async `TcpSendChain` try-send hook. Walks `chain`'s bytes via
+/// its cursor and emits MSS-sized TCP segments by copying directly
+/// from chain nodes into each segment's payload area — no
+/// user-space scratch coalesce. Drains `chain` on success (every
+/// part popped + dropped, so `External` IOBufs return their
+/// backing storage to the driver pool in chain order).
+pub fn async_try_send_chain(
+    handle: *mut (),
+    generation: u16,
+    chain: &mut uni_iobuf::IOBufChain,
+) -> isize {
+    let (core, slot) = match decode_handle(handle) {
+        Some(v) => v,
+        None => return -1,
+    };
+    // SAFETY: per-core ownership; the worker that registered this
+    // backend is the one polling its `TcpSendChain`.
+    let c = unsafe { &mut *conn_ptr(core, slot) };
+    if c.generation != generation {
+        return -1;
+    }
+    if c.state != TcpState::Established {
+        return -1;
+    }
+
+    let total = chain.total_len();
+    if total == 0 {
+        return 0;
+    }
+
+    let mss = mss_for(c.local_ip);
+    let mut cursor = chain.cursor();
+    let mut sent = 0usize;
+    while sent < total {
+        let chunk = (total - sent).min(mss);
+        send_segment_from_cursor(
+            c.local_ip,
+            c.remote_ip,
+            c.local_port,
+            c.remote_port,
+            c.snd_nxt,
+            c.rcv_nxt,
+            TCP_ACK | TCP_PSH,
+            c.rx_free() as u16,
+            &mut cursor,
+            chunk,
+        );
+        c.snd_nxt = c.snd_nxt.wrapping_add(chunk as u32);
+        sent += chunk;
+    }
+
+    // Bytes are on the wire; release every part's backing storage.
+    // Dropping in chain order matches the legacy single-buffer
+    // `send` path (which dropped the caller-supplied slice's
+    // backing) and matters for `External` IOBufs whose drop
+    // callbacks recycle NIC RX descriptors back to the driver
+    // pool.
+    chain.clear();
+    sent as isize
+}
+
+/// Like `send_segment` but reads `payload_len` bytes from a chain
+/// cursor (advancing it) instead of borrowing from a contiguous
+/// slice. Caller must have ensured the cursor has at least
+/// `payload_len` bytes remaining.
+fn send_segment_from_cursor(
+    local_ip: IpAddr,
+    dst_ip: IpAddr,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    cursor: &mut uni_iobuf::Cursor<'_>,
+    payload_len: usize,
+) {
+    let payload_len = payload_len.min(MSS_MAX);
+    let seg_len = 20 + payload_len;
+
+    let mut buf = core::mem::MaybeUninit::<[u8; 20 + MSS_MAX]>::uninit();
+    let p = buf.as_mut_ptr() as *mut u8;
+
+    unsafe {
+        let hdr = &mut *(p as *mut TcpHeader);
+        hdr.src_port = htons(src_port);
+        hdr.dst_port = htons(dst_port);
+        hdr.seq = htonl(seq);
+        hdr.ack = htonl(ack);
+        hdr.data_offset = 0x50;
+        hdr.flags = flags;
+        hdr.window = htons(window);
+        hdr.checksum = 0;
+        hdr.urgent = 0;
+
+        if payload_len > 0 {
+            // Copy chain bytes straight into the segment's
+            // payload area; cursor walks node boundaries
+            // transparently. This is the "one memcpy, no
+            // intermediate buffer" property the IOBuf chain
+            // design exists for.
+            let dst = core::slice::from_raw_parts_mut(p.add(20), payload_len);
+            let n = cursor.read(dst);
+            debug_assert_eq!(n, payload_len);
+            let _ = n;
+        }
+
+        hdr.checksum = tcp_checksum_any(local_ip, dst_ip, PROTO_TCP, p, seg_len);
+
+        let bytes = core::slice::from_raw_parts(p, seg_len);
+        send_l3(local_ip, dst_ip, bytes);
+    }
+}
+
 /// Park the send-side waker. On bare-metal `async_try_send`
 /// always accepts the whole buffer, so this path is effectively
 /// unreachable during steady-state sends; kept symmetric with the

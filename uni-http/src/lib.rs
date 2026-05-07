@@ -632,19 +632,36 @@ pub trait HttpStream {
     /// partial reads or drain a full segment first.
     async fn recv(&mut self, buf: &mut [u8]) -> usize;
 
-    /// Send all of `data` to the peer (encrypted, for `TlsStream`).
+    /// Send a chain of IOBuf parts. The transport decides how to
+    /// chunk the bytes onto the wire — TCP coalesces parts into
+    /// MSS-bounded segments, TLS encrypts each part as a record
+    /// (in-place when the part has reserved headroom + tailroom).
+    /// Producers (the HTTP framing layer + apps) build the chain
+    /// out of the layered pieces — header IOBuf prepended to the
+    /// app's body chain — and let the transport own the layout
+    /// decision.
+    ///
+    /// Takes `&mut IOBufChain` rather than consuming it so the
+    /// caller can amortise the `VecDeque` allocation across many
+    /// requests on the same connection. The implementation drains
+    /// the chain (each part `pop_front`'d, then dropped after its
+    /// bytes are committed); on return the chain is empty but the
+    /// underlying `VecDeque` capacity is preserved.
+    ///
     /// `Err(())` on fatal transport error; the conn handler tears
     /// down on error.
-    async fn send(&mut self, data: &[u8]) -> Result<(), ()>;
+    async fn send_chain(&mut self, chain: &mut IOBufChain) -> Result<(), ()>;
 
-    /// Send a body chunk supplied as an [`IOBuf`]. Default impl
-    /// just calls `send(buf.data())` — same observable behaviour
-    /// as the slice-based path. `TlsStream` overrides to take an
-    /// encrypt-in-place fast path when `buf` has enough headroom +
-    /// tailroom for the TLS record envelope (saves the plaintext
-    /// memcpy into `tls.tx_buf`).
-    async fn send_iobuf(&mut self, buf: IOBuf) -> Result<(), ()> {
-        self.send(buf.data()).await
+    /// What this stream's transport stack reserves at the front
+    /// and back of every IOBuf the producer ships through
+    /// `send_chain`. Lets the producer size headers/body buffers
+    /// so each part has enough headroom for the transport's
+    /// framing (TLS prepends 5 B record header) and tailroom for
+    /// trailers (TLS appends 17 B AEAD tag + inner-content-type)
+    /// — without this, the transport falls back to a slice copy
+    /// instead of encrypt-in-place.
+    fn layer_reserve(&self) -> uni_iobuf::LayerReserve {
+        uni_iobuf::LayerReserve::PASSTHROUGH
     }
 
     /// Cleanly signal end-of-stream to the peer before the
@@ -663,8 +680,15 @@ impl HttpStream for uni::runtime::TcpStream {
     async fn recv(&mut self, buf: &mut [u8]) -> usize {
         (*self).recv(buf).await
     }
-    async fn send(&mut self, data: &[u8]) -> Result<(), ()> {
-        (*self).send(data).await
+
+    async fn send_chain(&mut self, chain: &mut IOBufChain) -> Result<(), ()> {
+        // The runtime's `TcpStream::send_chain` hands the chain to
+        // the backend, which decides chunking. Bare-metal walks
+        // the chain via its cursor and copies bytes directly into
+        // MSS-sized TCP segments (no user-space scratch coalesce);
+        // native uses `writev(2)` so a multi-part shape ships in
+        // one syscall. This layer is a thin trait wire-up.
+        (*self).send_chain(chain).await
     }
 }
 
@@ -737,71 +761,93 @@ impl HttpStream for TlsStream {
         }
     }
 
-    async fn send(&mut self, data: &[u8]) -> Result<(), ()> {
-        // The TLS server's TX buffer is finite (~4 KiB today), and
-        // `send_app_data` seals into it without any awareness of the
-        // ciphertext drain. If we hand it a body larger than that
-        // buffer it fails outright with `TxBufTooSmall`. Chunk
-        // plaintext into pieces small enough that headers + ciphertext
-        // overhead per record (≤ ~80 B) still fit, draining between
-        // chunks so steady streaming of multi-KiB bodies (e.g. our
-        // multi-page HTML) just works.
+    async fn send_chain(&mut self, chain: &mut IOBufChain) -> Result<(), ()> {
+        // TLS 1.3 record envelope: 5-B header + 1-B inner content
+        // type + 16-B AEAD tag = 22 B fixed overhead. Plaintext
+        // chunks ≤ 3 KiB so headers + ciphertext fit in the legacy
+        // 4-KiB `tls.tx_buf` even when the producer didn't
+        // pre-reserve in the IOBuf.
+        const TLS_HEADROOM: usize = 5;
+        const TLS_TAILROOM: usize = 17;
         const PLAINTEXT_CHUNK: usize = 3 * 1024;
-        let mut offset = 0;
-        while offset < data.len() {
-            let end = (offset + PLAINTEXT_CHUNK).min(data.len());
-            self.tls.send_app_data(&data[offset..end])?;
-            self.drain_tx().await?;
-            offset = end;
+
+        if chain.is_empty() {
+            // Drain any pre-queued TLS bytes (NewSessionTicket etc.)
+            // — same effect as the old `send_iobuf` empty-buf path.
+            return self.drain_tx().await;
         }
-        // Empty body still gets a no-op drain so any pre-queued TLS
-        // bytes (e.g. a NewSessionTicket sealed during handshake but
-        // not yet drained) reach the wire promptly.
-        if data.is_empty() {
+
+        // Small-response fast path: total chain payload fits in a
+        // single TLS record. Coalesce every part into a stack
+        // scratch buffer and seal once, so the wire sees one
+        // record + one TCP segment for typical
+        // `[response-header, body]` shapes (e.g. /health, JSON
+        // endpoints). The encrypt-in-place per-part path below
+        // would emit one record PER part — fine for multi-KiB
+        // bodies where the in-place memcpy savings dominate, but
+        // a 2× regression on tiny replies that fit in one record.
+        if chain.total_len() <= PLAINTEXT_CHUNK {
+            let mut scratch = [0u8; PLAINTEXT_CHUNK];
+            let mut filled = 0usize;
+            for part in chain.iter() {
+                let data = part.data();
+                scratch[filled..filled + data.len()].copy_from_slice(data);
+                filled += data.len();
+            }
+            self.tls.send_app_data(&scratch[..filled])?;
             self.drain_tx().await?;
+            chain.clear();
+            return Ok(());
+        }
+
+        // Streamed-response path: total chain payload spans
+        // multiple TLS records. Encrypt each part in-place when
+        // reserves match (saves the plaintext memcpy through
+        // `tls.tx_buf` for big bodies), fall back to the slice
+        // path for static-borrow chunks and oversize parts that
+        // need splitting.
+        while let Some(mut part) = chain.pop_front() {
+            if part.is_empty() {
+                continue;
+            }
+            let has_reserve = part.headroom() >= TLS_HEADROOM
+                && part.tailroom() >= TLS_TAILROOM
+                && part.len() <= PLAINTEXT_CHUNK;
+            if has_reserve {
+                self.tls.send_app_data_iobuf(&mut part)?;
+                // Drain anything queued before this record (a
+                // handshake straggler, e.g. NewSessionTicket) so
+                // the byte order on the wire matches what the
+                // peer expects.
+                self.drain_tx().await?;
+                self.tcp.send(part.data()).await?;
+                continue;
+            }
+            // Fallback: copy through the legacy slice path. This
+            // covers static-borrow parts (zero headroom), parts
+            // bigger than `PLAINTEXT_CHUNK` (need splitting into
+            // multiple records), and any part the producer
+            // allocated without reserves.
+            let data = part.data();
+            let mut offset = 0;
+            while offset < data.len() {
+                let end = (offset + PLAINTEXT_CHUNK).min(data.len());
+                self.tls.send_app_data(&data[offset..end])?;
+                self.drain_tx().await?;
+                offset = end;
+            }
         }
         Ok(())
     }
 
-    async fn send_iobuf(&mut self, mut buf: IOBuf) -> Result<(), ()> {
-        // Encrypt-in-place fast path: if the IOBuf has reserved
-        // headroom + tailroom for the TLS record envelope, seal
-        // directly into the IOBuf via `record::seal_in_place` and
-        // send the sealed bytes to TCP — no `tls.tx_buf` round-
-        // trip, no plaintext memcpy.
-        //
-        // TLS 1.3 record overhead = 5 B header + 1 B inner-content-
-        // type + 16 B AEAD tag = 22 B. Plus the chunking limit
-        // matches the legacy `send` path (~3 KiB plaintext per
-        // record, sized to fit the legacy 4 KiB tx_buf even though
-        // we're not using it here — keeps record sizes uniform).
-        const TLS_HEADROOM: usize = 5;
-        const TLS_TAILROOM: usize = 17; // 1 B type + 16 B AEAD tag
-        const PLAINTEXT_CHUNK: usize = 3 * 1024;
-
-        // Empty payloads still want a drain (queued NewSessionTicket etc.).
-        if buf.is_empty() {
-            return self.drain_tx().await;
-        }
-        let has_reserve = buf.headroom() >= TLS_HEADROOM
-            && buf.tailroom() >= TLS_TAILROOM
-            && buf.len() <= PLAINTEXT_CHUNK;
-        if !has_reserve {
-            // Fallback: copy through the slice-based send. This
-            // covers static-borrow body parts (no headroom),
-            // chunks larger than PLAINTEXT_CHUNK (need splitting),
-            // and any IOBuf the app didn't allocate with reserve.
-            return self.send(buf.data()).await;
-        }
-        // In-place seal: rewrites buf.data() to the full
-        // TLSCiphertext record (header || ciphertext || type || tag).
-        self.tls.send_app_data_iobuf(&mut buf)?;
-        // Drain anything else queued in tx_buf (e.g. handshake
-        // straggler) BEFORE our newly-sealed record so byte
-        // ordering on the wire matches what the peer expects.
-        self.drain_tx().await?;
-        // Send our sealed record straight to TCP.
-        self.tcp.send(buf.data()).await
+    fn layer_reserve(&self) -> uni_iobuf::LayerReserve {
+        // Mirror the TlsConn-level reserve so the framing layer
+        // sizes the header IOBuf (and any body chunks the app
+        // allocates with `IOBuf::new_with_reserved`) for the
+        // encrypt-in-place fast path. 5-B record header headroom
+        // + 17-B trailer (1-B type + 16-B AEAD tag) = the TLS 1.3
+        // record envelope.
+        self.tls.layer_reserve()
     }
 
     async fn close(&mut self) -> Result<(), ()> {
@@ -906,21 +952,41 @@ async fn handle_conn<S, H>(
     // turns the previous "future alloc + Box<[u8]> alloc" pair
     // into a single alloc per conn-accept. The future struct
     // already carries an inline `Request` (8 KiB body + 256 B
-    // path) and `BufWriter` (2 KiB), so the extra 8 KiB stays
-    // proportional.
+    // path) and the per-conn header storage + outbound chain;
+    // the extra 8 KiB here stays proportional.
     let mut buf = [0u8; BUF_SIZE];
     let mut buf_len = 0usize;
     // Per-connection scratch reused across every request on this
     // conn — `Request` carries 8 KiB of body buffer and 256 B of
-    // path, `BufWriter` another 2 KiB. Allocating + zero-initing
-    // them per request was costing ~1 GB/s of memory bandwidth per
-    // core at peak request rate. `parse_request` and
-    // `write_response_into` both reset their target's length
-    // fields up front, so a stale tail in the array is invisible
-    // to the read path; only the writes-then-reads-back range is
-    // observed.
+    // path. Allocating + zero-initing it per request was costing
+    // ~1 GB/s of memory bandwidth per core at peak request rate.
+    // `parse_request` resets length fields up front, so a stale
+    // tail is invisible to the read path; only the
+    // writes-then-reads-back range is observed.
     let mut req = Request::new();
-    let mut w = BufWriter::new();
+    // The stream's transport stack publishes the headroom +
+    // tailroom every IOBuf it ships should reserve (TLS prepends
+    // 5 B record header + appends 17 B AEAD tag for the encrypt-
+    // in-place path; plain TCP needs neither). Cache it once at
+    // conn-accept so we don't re-query per response.
+    let layer = stream.layer_reserve();
+    // Outbound chain is amortised across every response on this
+    // connection — `send_chain` drains it via `pop_front`, leaving
+    // the chain empty but with its `VecDeque` allocation
+    // preserved. Capacity 4 covers the common shapes (header +
+    // 1 body part, header + 2-3 chunked body parts) without
+    // forcing the deque to grow.
+    let mut out_chain = IOBufChain::with_capacity(4);
+    // Inline storage for the response-header IOBuf, sized for the
+    // typical header set plus the worst-case transport reserve.
+    // Folded into the future state so each iteration wraps it as
+    // an `IOBuf::External` rather than allocating a fresh
+    // `Box<[u8]>` per response. 1 KiB covers HTTP/1.1 status line
+    // + Content-Type + Content-Length + Connection + a handful
+    // of `with_header`-set extras (Alt-Svc, Cache-Control,
+    // Set-Cookie) with room to spare.
+    const HEADER_BUF_SIZE: usize = 1024;
+    let mut header_storage = [0u8; HEADER_BUF_SIZE];
     // Carries the parser's progress (`scan_pos`) across calls
     // when a request arrives in multiple recv'd segments — the
     // `find_header_end` scan resumes from the last position
@@ -957,68 +1023,65 @@ async fn handle_conn<S, H>(
             };
             let resp = (&*handler)(&req).await;
 
-            w.clear();
-            // Extra response headers (Alt-Svc / Cache-Control / etc.)
-            // are now app-side: the handler can call
-            // `Response::with_header(...)` and `write_response_into`
-            // emits them inline. Apps that want to advertise h3
-            // read `req.host_port()` themselves — keeps the
-            // per-response branch and Host-reparse out of the
-            // framework when no extra headers are set.
-            write_response_into(&mut w, &resp, !want_close);
-            // Inline-when-fits: most responses are tiny (JSON
-            // health/stats, plain-text errors) and the headers
-            // alone use a couple hundred bytes of `w`'s 2 KiB
-            // buffer, so we can append the body and ship the whole
-            // response in one `stream.send`. On plain TCP that's
-            // one segment instead of two; on the bare-metal path
-            // it's also one `try_send` and one ACK round-trip
-            // saved per request. Splitting the multi-page rewrite
-            // (commit 80a5504) regressed `health_max` ~30 % — this
-            // recovers it while still streaming larger pages.
+            // Wrap the per-conn `header_storage` array as an
+            // `IOBuf::External` so the framing layer can build
+            // headers in stack-resident memory without a heap
+            // allocation per response. SAFETY contract:
+            //   * `header_storage` outlives every IOBuf wrapping
+            //     it (it's a future-state field, the future is
+            //     pinned, and we drop the IOBuf inside this
+            //     iteration before constructing the next one).
+            //   * No two IOBufs ever alias the same bytes — the
+            //     IOBuf is `push_back`'d into `out_chain`,
+            //     drained by `send_chain` (which drops it after
+            //     committing the bytes to the wire), and only
+            //     then does the next iteration construct a fresh
+            //     IOBuf wrapping the same storage.
+            //   * No drop callback (`drop_fn = None`) — the
+            //     storage is borrowed, not owned, so the IOBuf's
+            //     drop should be a no-op for the array.
+            let header = unsafe {
+                IOBuf::from_external(
+                    core::ptr::NonNull::new_unchecked(header_storage.as_mut_ptr()),
+                    HEADER_BUF_SIZE as u32,
+                    layer.headroom as u32,
+                    0,
+                    None,
+                    core::ptr::null_mut(),
+                )
+            };
+            // SAFETY: the only IOBuf currently aliasing
+            // `header_storage` is `header` itself (we just
+            // constructed it). `write_response_into_iobuf` writes
+            // through `header` exclusively.
+            let mut header = header;
+            write_response_into_iobuf(&mut header, &resp, !want_close);
+
+            // Stage the response into the per-conn outbound chain.
+            // Order: header IOBuf first, then body parts. The
+            // transport (TCP / TLS) drains the chain via
+            // `pop_front` and decides the wire chunking — TCP
+            // coalesces parts into MSS-bounded segments so this
+            // header-plus-body shape ships in one TCP segment for
+            // tiny replies; TLS encrypts each part as its own
+            // record (in-place when reserves match).
             //
-            // Falls through to the streaming path when the body
-            // is a `Chain`, when the single chunk is too big to
-            // fit, or when the body is empty (skip the no-op
-            // send_iobuf).
-            let mut body_inlined = false;
-            if let ResponseBody::Single(b) = resp.body_ref() {
-                let bd = b.data();
-                if !bd.is_empty() && w.try_push(bd) {
-                    body_inlined = true;
+            // `out_chain` is empty here (`send_chain` drains it
+            // each iteration) — push_back the header, then walk
+            // the body's parts in.
+            debug_assert!(out_chain.is_empty());
+            out_chain.push_back(header);
+            match resp.into_body() {
+                ResponseBody::Single(b) => out_chain.push_back(b),
+                ResponseBody::Chain(c) => {
+                    for part in c.into_parts() {
+                        out_chain.push_back(part);
+                    }
                 }
             }
-            if stream.send(w.as_bytes()).await.is_err() {
+
+            if stream.send_chain(&mut out_chain).await.is_err() {
                 return;
-            }
-            if !body_inlined {
-                // Walk body. For a Single chunk we send once; for
-                // a Chain we send each part separately — TCP
-                // coalesces at the segment layer so the wire
-                // receives the same byte sequence as if we'd
-                // concatenated, but we don't pay the concat
-                // memcpy. We pass each part as an IOBuf so
-                // `TlsStream::send_iobuf` can take the encrypt-
-                // in-place fast path when the chunk has reserved
-                // headroom/tailroom (apps opt in via
-                // `Body::push_with_reserve`); static-borrow
-                // chunks and unreserved owned chunks fall back
-                // transparently to the slice-based send in the
-                // trait default.
-                match resp.into_body() {
-                    ResponseBody::Single(b) => {
-                        if !b.is_empty() && stream.send_iobuf(b).await.is_err() {
-                            return;
-                        }
-                    }
-                    ResponseBody::Chain(chain) => {
-                        for part in chain.into_parts() {
-                            if stream.send_iobuf(part).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                }
             }
 
             if want_close {
@@ -1191,118 +1254,60 @@ fn parse_request_with_state(data: &[u8], req: &mut Request, state: &mut ParserSt
 
 // ---- Response sender --------------------------------------------------------
 
-struct BufWriter {
-    buf: [u8; 2048],
-    pos: usize,
-}
-
-impl BufWriter {
-    fn new() -> Self {
-        BufWriter { buf: [0u8; 2048], pos: 0 }
-    }
-
-    /// Reset the cursor without touching the backing array. Bytes
-    /// past the new `pos` are stale but unreachable through
-    /// `as_bytes`.
-    fn clear(&mut self) {
-        self.pos = 0;
-    }
-
-    fn push(&mut self, data: &[u8]) {
-        // Header writers always fit — the realistic header set
-        // (HTTP/1.1 + Content-Type + Content-Length + Connection +
-        // optional Alt-Svc) lands well under 1 KiB. Body bytes use
-        // `try_push` so an oversized body falls back to a separate
-        // `stream.send` instead of silently truncating.
-        debug_assert!(
-            self.pos + data.len() <= 2048,
-            "BufWriter overflow: header bytes exceed 2 KiB cap (pos={}, push={}). \
-             Bodies use `try_push` and stream separately when too big — this \
-             panic means your *headers* got too large. Bump the buffer or trim.",
-            self.pos, data.len()
-        );
-        let n = data.len().min(2048 - self.pos);
-        self.buf[self.pos..self.pos + n].copy_from_slice(&data[..n]);
-        self.pos += n;
-    }
-
-    /// Like `push`, but returns `false` (without writing) when
-    /// `data` wouldn't fit in the remaining space. Used to inline
-    /// small response bodies behind the headers — coalesces the
-    /// whole HTTP/1.1 response into one `stream.send`, which on
-    /// plain TCP means one segment instead of two.
-    fn try_push(&mut self, data: &[u8]) -> bool {
-        if self.pos + data.len() > 2048 {
-            return false;
-        }
-        self.buf[self.pos..self.pos + data.len()].copy_from_slice(data);
-        self.pos += data.len();
-        true
-    }
-
-    fn as_bytes(&self) -> &[u8] {
-        &self.buf[..self.pos]
-    }
-}
-
-impl core::fmt::Write for BufWriter {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        self.push(s.as_bytes());
-        Ok(())
-    }
-}
-
-
-/// Serialise an HTTP/1.1 response into a `BufWriter`. Split out so
-/// the TLS path can reuse it and feed the bytes through `TlsServer`
-/// instead of straight to `conn.send`.
+/// Serialise an HTTP/1.1 response head (status line + headers,
+/// terminated by `\r\n\r\n`) into a heap-backed `IOBuf` whose
+/// reserves were sized for the transport stack. The body is NOT
+/// appended here — the caller `push_front`s this IOBuf onto the
+/// response body chain and lets the transport stitch the parts.
 ///
-/// Hot path — called once per HTTP request. `core::fmt`'s machinery
-/// (format-string walker, Display vtable dispatch, padding logic)
-/// adds up at hundreds of thousands of req/s; manual byte-level
-/// pushes for the constant headers and a small itoa for the only
-/// variable integer (`Content-Length`) measurably outperform
-/// `write!(...)` here.
+/// Hot path — called once per HTTP request. `core::fmt`'s
+/// machinery (format-string walker, Display vtable dispatch,
+/// padding logic) adds up at hundreds of thousands of req/s; the
+/// manual byte-level `append_slice` calls here plus a small itoa
+/// for the only variable integer (`Content-Length`) measurably
+/// outperform `write!(...)`.
 ///
 /// Extra headers (`Alt-Svc`, `Cache-Control`, `Set-Cookie`, etc.)
 /// are pulled from `resp.extra_headers()` — apps add them via
-/// `Response::with_header`. The framework no longer hardcodes
-/// any optional header itself; per-response branches and Host-
-/// header reparses live in app code now if at all.
-fn write_response_into(
-    w: &mut BufWriter,
-    resp: &Response,
-    keep_alive: bool,
-) {
-    let body_len = resp.body_len();
-    let content_type = resp.content_type_bytes();
+/// `Response::with_header`. The framework no longer hardcodes any
+/// optional header itself; per-response branches live in app code.
+fn write_response_into_iobuf(buf: &mut IOBuf, resp: &Response, keep_alive: bool) {
+    // `append_slice` returns `Err(NoTailroom)` if we exceed the
+    // IOBuf's reserved capacity. The caller picks `HEADER_BUF_SIZE`
+    // bytes well above the realistic header total (~ a few hundred
+    // bytes), so an `Err` here means the producer truncated the
+    // response head. `debug_assert` panics in tests; release builds
+    // silently truncate.
+    macro_rules! push {
+        ($data:expr) => {{
+            let r = buf.append_slice($data);
+            debug_assert!(r.is_ok(), "response header overflow (raise HEADER_CAP)");
+            let _ = r;
+        }};
+    }
 
-    w.push(b"HTTP/1.1 ");
+    push!(b"HTTP/1.1 ");
     let mut status_buf = [0u8; 4];
     let status_len = write_status_code(&mut status_buf, resp.status);
-    w.push(&status_buf[..status_len]);
-    w.push(b" ");
-    w.push(status_text(resp.status).as_bytes());
-    w.push(b"\r\nContent-Type: ");
-    w.push(content_type);
-    w.push(b"\r\nContent-Length: ");
+    push!(&status_buf[..status_len]);
+    push!(b" ");
+    push!(status_text(resp.status).as_bytes());
+    push!(b"\r\nContent-Type: ");
+    push!(resp.content_type_bytes());
+    push!(b"\r\nContent-Length: ");
     let mut len_buf = [0u8; 20];
-    let len_len = write_usize(&mut len_buf, body_len);
-    w.push(&len_buf[..len_len]);
-    w.push(b"\r\nConnection: ");
-    w.push(if keep_alive { b"keep-alive" } else { b"close" });
-    w.push(b"\r\n");
+    let len_len = write_usize(&mut len_buf, resp.body_len());
+    push!(&len_buf[..len_len]);
+    push!(b"\r\nConnection: ");
+    push!(if keep_alive { b"keep-alive" } else { b"close" });
+    push!(b"\r\n");
     for (name, value) in resp.extra_headers() {
-        w.push(name);
-        w.push(b": ");
-        w.push(value);
-        w.push(b"\r\n");
+        push!(name);
+        push!(b": ");
+        push!(value);
+        push!(b"\r\n");
     }
-    w.push(b"\r\n");
-    // body is NOT pushed here; `handle_conn` ships it via
-    // separate stream.send calls — one per body part for
-    // multi-part Chain bodies — so arbitrarily-large bodies
-    // don't overflow the 2 KiB header buffer.
+    push!(b"\r\n");
 }
 
 /// Extract the port from an HTTP `Host` header value. Handles:

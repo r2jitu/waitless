@@ -309,6 +309,107 @@ fn native_tcp_try_send(handle: *mut (), generation: u16, buf: &[u8]) -> isize {
     }
 }
 
+/// Gather-write the chain to the socket via `writev(2)`. One
+/// syscall for the whole `[header, body0, body1, ...]` shape;
+/// the kernel TCP stack handles segmentation. Drains `chain` on
+/// success.
+fn native_tcp_try_send_chain(
+    handle: *mut (),
+    generation: u16,
+    chain: &mut uni_iobuf::IOBufChain,
+) -> isize {
+    unsafe {
+        let (c, live) = check_gen(handle, generation);
+        if !live {
+            return -1;
+        }
+        let fd = (*c).fd;
+        if fd < 0 {
+            return -1;
+        }
+        let total = chain.total_len();
+        if total == 0 {
+            return 0;
+        }
+
+        // Build an `iovec` array on the stack — one slot per
+        // chain part. 8 covers the typical multi-part response
+        // shape (header + a few body chunks); chains longer than
+        // that fall back to the slice-per-part path.
+        const IOV_INLINE: usize = 8;
+        let part_count = chain.part_count();
+        if part_count <= IOV_INLINE {
+            let mut iov = [IoVec { iov_base: ptr::null(), iov_len: 0 }; IOV_INLINE];
+            for (i, part) in chain.iter().enumerate() {
+                let data = part.data();
+                iov[i] = IoVec { iov_base: data.as_ptr(), iov_len: data.len() };
+            }
+            let n = writev(fd, iov.as_ptr(), part_count as i32);
+            if n >= 0 {
+                let n = n as usize;
+                if n == total {
+                    chain.clear();
+                    return total as isize;
+                }
+                // Partial write: drop fully-sent parts and shrink
+                // the front of the surviving part. The runtime
+                // re-polls; the next iteration's iovec rebuild
+                // sees only the remainder.
+                let mut remaining = n;
+                while remaining > 0 {
+                    let head_len = match chain.iter().next() {
+                        Some(h) => h.len(),
+                        None => break,
+                    };
+                    if remaining >= head_len {
+                        let _ = chain.pop_front();
+                        remaining -= head_len;
+                    } else {
+                        // Front part partially consumed — advance
+                        // its visible payload via `consume`.
+                        if let Some(front) = chain.front_mut() {
+                            let _ = front.consume(remaining);
+                        }
+                        chain.shrink_total_len(remaining);
+                        remaining = 0;
+                    }
+                }
+                return n as isize;
+            }
+            // `writev` returned -1.
+            if errno() == EAGAIN {
+                return 0;
+            }
+            return -1;
+        }
+
+        // Long chain (>IOV_INLINE parts): fall back to per-part
+        // `send`. Each is a syscall, but the kernel TCP stack
+        // coalesces into segments based on Nagle / cork — so the
+        // wire still sees a tidy stream, just at higher syscall
+        // cost. Long chains are rare (chunked HTML) so the
+        // optimisation that matters most (single syscall for the
+        // common header+body shape) is the inline path above.
+        let mut sent_total = 0usize;
+        while let Some(part) = chain.pop_front() {
+            let data = part.data();
+            let mut off = 0;
+            while off < data.len() {
+                let n = send(fd, data.as_ptr().add(off), data.len() - off, MSG_NOSIGNAL);
+                if n < 0 {
+                    if errno() == EAGAIN {
+                        return if sent_total == 0 { 0 } else { sent_total as isize };
+                    }
+                    return -1;
+                }
+                off += n as usize;
+                sent_total += n as usize;
+            }
+        }
+        sent_total as isize
+    }
+}
+
 fn native_tcp_register_send_waker(handle: *mut (), generation: u16, waker: &Waker) {
     unsafe {
         let (c, live) = check_gen(handle, generation);
@@ -376,6 +477,7 @@ pub(super) static NATIVE_TCP_BACKEND: uni_runtime::net::TcpBackend =
         clear_recv_waker: native_tcp_clear_recv_waker,
         close: tcp_close,
         try_send: native_tcp_try_send,
+        try_send_chain: native_tcp_try_send_chain,
         register_send_waker: native_tcp_register_send_waker,
         clear_send_waker: native_tcp_clear_send_waker,
         shutdown_all: None,

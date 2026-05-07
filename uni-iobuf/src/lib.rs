@@ -886,6 +886,46 @@ impl IOBufChain {
         self.parts.iter()
     }
 
+    /// Pop the front part. Returns `None` when the chain is
+    /// empty. Adjusts `total_len` to account for the popped
+    /// part's payload. Used by transports that drain the chain
+    /// part-by-part (writing each to the wire) without consuming
+    /// the chain wrapper itself, so the caller can re-use the
+    /// underlying `VecDeque` allocation across many sends.
+    pub fn pop_front(&mut self) -> Option<IOBuf> {
+        let buf = self.parts.pop_front()?;
+        self.total_len = self.total_len.saturating_sub(buf.len());
+        Some(buf)
+    }
+
+    /// Mutable access to the front part. Used by partial-send
+    /// recovery paths that need to advance the head buf's visible
+    /// payload (`IOBuf::consume(n)`) when the underlying transport
+    /// committed only `n < head.len()` bytes. The caller is
+    /// responsible for keeping `total_len` in sync via
+    /// [`shrink_total_len`].
+    pub fn front_mut(&mut self) -> Option<&mut IOBuf> {
+        self.parts.front_mut()
+    }
+
+    /// Decrease the cached `total_len` by `n`. Pair with a
+    /// `front_mut().consume(n)` (or equivalent) when the caller
+    /// shrunk a buf's visible payload without going through
+    /// `pop_front`.
+    pub fn shrink_total_len(&mut self, n: usize) {
+        self.total_len = self.total_len.saturating_sub(n);
+    }
+
+    /// Drop every part still in the chain, leaving an empty
+    /// chain with its `VecDeque` allocation preserved. The
+    /// drops run in front-to-back order — same ordering as a
+    /// `pop_front` loop, which matters for `External` IOBufs
+    /// whose drop callbacks return descriptors to driver pools.
+    pub fn clear(&mut self) {
+        self.parts.clear();
+        self.total_len = 0;
+    }
+
     /// Move all parts out, consuming the chain.
     pub fn into_parts(self) -> VecDeque<IOBuf> {
         self.parts

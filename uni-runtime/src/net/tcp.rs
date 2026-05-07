@@ -150,6 +150,22 @@ impl TcpStream {
     pub fn send<'a>(&'a self, data: &'a [u8]) -> TcpSend<'a> {
         TcpSend::new(self.handle, self.generation, data)
     }
+
+    /// Async gather-write. Hands `chain` to the backend so the
+    /// transport decides chunking — bare-metal packs the chain's
+    /// bytes directly into MSS-sized TCP segments via `IOBufChain`'s
+    /// cursor (no intermediate user-space coalesce buffer); native
+    /// drains the chain through `writev(2)` so a multi-part
+    /// response shape ships in a single syscall + kernel-side
+    /// coalesce. Resolves `Ok(())` when every byte is queued (and
+    /// the chain is empty), `Err(())` on fatal transport error.
+    #[inline]
+    pub fn send_chain<'a>(
+        &'a self,
+        chain: &'a mut uni_iobuf::IOBufChain,
+    ) -> TcpSendChain<'a> {
+        TcpSendChain::new(self.handle, self.generation, chain)
+    }
 }
 
 impl Drop for TcpStream {
@@ -244,6 +260,23 @@ pub struct TcpBackend {
     /// waker and re-poll), or negative on fatal conn error /
     /// stale `gen`.
     pub try_send: fn(handle: *mut (), generation: u16, buf: &[u8]) -> isize,
+    /// Non-blocking gather-write. Drains `chain` (front to back)
+    /// and pushes its bytes to the wire — the backend decides the
+    /// actual chunking. Bare-metal walks the chain via cursor and
+    /// packs bytes directly into MSS-sized TCP segments without an
+    /// intermediate scratch buffer. Native uses `writev(2)` so a
+    /// multi-part response shape (`[headers, body0, body1, ...]`)
+    /// becomes one syscall + the kernel-side coalesce. Same return
+    /// shape as `try_send`: bytes drained on success, `0` if the
+    /// backend pushed back, negative on fatal error.
+    ///
+    /// On non-fatal partial completion the backend leaves the
+    /// remaining bytes in `chain`; the caller re-polls (after
+    /// parking the send waker) and the next call resumes from
+    /// where the last one stopped. On `Err`/Ready completion the
+    /// chain is left empty regardless of error class.
+    pub try_send_chain:
+        fn(handle: *mut (), generation: u16, chain: &mut uni_iobuf::IOBufChain) -> isize,
     /// Park `waker` on the conn's send slot; a subsequent writable
     /// event fires it. Stale `gen` fires immediately.
     pub register_send_waker:
@@ -666,6 +699,71 @@ impl<'a> Future for TcpSend<'a> {
                 continue;
             }
             this.sent += n as usize;
+        }
+    }
+}
+
+/// Future returned by [`TcpStream::send_chain`]. Drives the backend's
+/// `try_send_chain` hook: the backend drains `chain` by walking it
+/// directly (cursor on bare-metal, `writev` on native), so a
+/// multi-part response shape ships as one MSS-bounded segment per
+/// segment-worth-of-bytes (bare-metal) or one syscall (native) —
+/// no user-space scratch coalesce required.
+pub struct TcpSendChain<'a> {
+    handle: *mut (),
+    generation: u16,
+    chain: &'a mut uni_iobuf::IOBufChain,
+    _not_send: PhantomData<*mut ()>,
+}
+
+impl<'a> TcpSendChain<'a> {
+    #[inline]
+    pub fn new(
+        handle: *mut (),
+        generation: u16,
+        chain: &'a mut uni_iobuf::IOBufChain,
+    ) -> Self {
+        TcpSendChain { handle, generation, chain, _not_send: PhantomData }
+    }
+}
+
+impl<'a> Future for TcpSendChain<'a> {
+    type Output = Result<(), ()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), ()>> {
+        let this = self.get_mut();
+        let h = this.handle;
+        let g = this.generation;
+        let b = match tcp_backend() {
+            Some(b) => b,
+            None => return Poll::Pending,
+        };
+
+        loop {
+            if this.chain.is_empty() {
+                return Poll::Ready(Ok(()));
+            }
+            let n = (b.try_send_chain)(h, g, this.chain);
+            if n < 0 {
+                return Poll::Ready(Err(()));
+            }
+            if n == 0 {
+                // Backend pushed back. Park waker, then re-probe
+                // once — same wake-before-park race close as
+                // `TcpSend::poll`.
+                (b.register_send_waker)(h, g, cx.waker());
+                let n2 = (b.try_send_chain)(h, g, this.chain);
+                if n2 < 0 {
+                    return Poll::Ready(Err(()));
+                }
+                if n2 == 0 {
+                    return Poll::Pending;
+                }
+                continue;
+            }
+            // `n > 0`: backend drained that many bytes. If the
+            // chain is now empty we're done; otherwise loop and
+            // try the next batch.
         }
     }
 }
