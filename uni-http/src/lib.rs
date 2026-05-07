@@ -50,6 +50,29 @@ pub trait TlsConn: Send + 'static {
     fn pop_plaintext(&mut self, out: &mut [u8]) -> usize;
     fn send_app_data(&mut self, data: &[u8]) -> Result<(), ()>;
     fn close_notify(&mut self) -> Result<(), ()>;
+
+    /// What the TLS layer wants reserved at the front of every
+    /// IOBuf the layer above hands to a future
+    /// `send_app_data_iobuf` (encrypt-in-place) entry point.
+    /// 5 bytes for the TLS 1.3 record header. Default impl
+    /// returns the LayerReserve that today's `send_app_data`
+    /// would need if it were called with an IOBuf instead of
+    /// a `&[u8]` — useful for apps that want to size body
+    /// chunks for in-place encryption without adopting the
+    /// full IOBuf path yet.
+    fn layer_reserve(&self) -> uni_iobuf::LayerReserve {
+        uni_iobuf::LayerReserve {
+            // 5 B TLS 1.3 record header.
+            headroom: 5,
+            // 16 B AEAD tag + 1 B inner-content-type trailer.
+            tailroom: 17,
+            // Max plaintext bytes per TLS 1.3 record (MAX_INNER_PLAINTEXT
+            // in uni-tls/src/record.rs, but we don't depend on that
+            // crate here). Less 1 for the type trailer, less 16 for
+            // the tag. ~16 KiB.
+            max_payload: 16384,
+        }
+    }
 }
 
 // ---- HTTP types -------------------------------------------------------------
