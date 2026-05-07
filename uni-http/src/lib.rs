@@ -184,37 +184,34 @@ impl Request {
 // ---- Response ---------------------------------------------------------------
 
 /// One byte chunk — either borrowed against the program's
-/// static data segment or heap-owned. The whole HTTP/QUIC stack
-/// uses this type as its byte-buffer primitive: `Response`
-/// bodies, `Body` builder parts, QUIC SendStream chunks, etc.
-/// Cow<'static, [u8]> already gives us:
-///   - Send + Sync (Borrowed has 'static lifetime, Owned is Vec)
-///   - Deref to &[u8] for transparent slice access
-///   - Cheap pattern-matching on Borrowed vs Owned
-/// so we use it directly with a type alias for readability
-/// rather than wrapping in another enum. A future Shared(Arc<[u8]>)
-/// variant — useful for cached responses — would mean swapping
-/// the alias for our own enum, but isn't worth the complexity now.
-pub type Bytes = alloc::borrow::Cow<'static, [u8]>;
+/// static data segment or heap-owned with optional headroom /
+/// tailroom for layer-prepend. Re-export of [`IOBuf`] under the
+/// historical `Bytes` name so existing call sites (and the
+/// `impl Into<Bytes>` type bounds throughout this crate) keep
+/// compiling. Future cleanup may rename callsites to `IOBuf`
+/// directly; for now the alias keeps the diff small while the
+/// underlying primitive switches to the chain-aware type.
+pub type Bytes = IOBuf;
 
-/// Body storage for a `Response`. Either a single `Bytes`
+/// Body storage for a `Response`. Either a single `IOBuf`
 /// chunk (the common case — zero-alloc when constructed from
 /// `&'static [u8]`, one-alloc when from `Vec<u8>`) or a
-/// `Chain` for multi-part composition built via [`Body`].
+/// multi-part [`IOBufChain`].
 pub enum ResponseBody {
-    Single(Bytes),
-    /// A chain of byte chunks assembled at handler time. Each
-    /// chunk is queued as its own SendChunk on the QUIC stream,
-    /// so a static template prefix gets a borrowed-static chunk
-    /// (zero alloc) sitting alongside the dynamic middle's
-    /// owned chunk — no `Vec::extend_from_slice`-style merge.
-    /// VecDeque so frontends (or the next layer down) can
-    /// O(1)-prepend if they want to wrap framing around a
-    /// pre-sized body.
-    Chain {
-        parts: alloc::collections::VecDeque<Bytes>,
-        total_len: usize,
-    },
+    Single(IOBuf),
+    Chain(IOBufChain),
+}
+
+impl ResponseBody {
+    pub fn len(&self) -> usize {
+        match self {
+            ResponseBody::Single(b) => b.len(),
+            ResponseBody::Chain(c) => c.total_len(),
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// Builder for a multi-part response body. Apps that want to
@@ -229,85 +226,79 @@ pub enum ResponseBody {
 /// Response::ok(b"text/html; charset=utf-8", body)
 /// ```
 ///
-/// Backing storage is `VecDeque<Bytes>` so both `push` (back)
-/// and `prepend` (front) are O(1) — the latter is useful when
-/// a frontend wants to add a header after the body is sized.
-/// Each part reaches the wire with at most one memcpy per
-/// packet (into the AEAD-target datagram region).
+/// Backed by [`IOBufChain`] — `push` and `prepend` are both
+/// O(1), each part keeps its origin (static borrow vs heap-
+/// owned), and downstream layers (HTTP/1.1 framing, TLS record
+/// header, QUIC packet header) can prepend INTO heap parts'
+/// reserved headroom without reallocating.
 pub struct Body {
-    pub parts: alloc::collections::VecDeque<Bytes>,
-    pub total_len: usize,
+    pub chain: IOBufChain,
 }
 
 impl Body {
     pub fn new() -> Self {
-        Body { parts: alloc::collections::VecDeque::new(), total_len: 0 }
+        Body { chain: IOBufChain::new() }
     }
 
     pub fn with_capacity(n: usize) -> Self {
-        Body {
-            parts: alloc::collections::VecDeque::with_capacity(n),
-            total_len: 0,
-        }
+        Body { chain: IOBufChain::with_capacity(n) }
     }
 
-    /// Append any byte chunk (Borrowed-static or Owned). The
-    /// generic bound lets callers pass `&'static [u8]`,
-    /// `&'static str`, `Vec<u8>`, `String`, or any pre-built
-    /// `Bytes` directly.
-    pub fn push(mut self, chunk: impl Into<Bytes>) -> Self {
-        let b: Bytes = chunk.into();
-        if !b.is_empty() {
-            self.total_len += b.len();
-            self.parts.push_back(b);
-        }
+    /// Append any byte chunk. Generic bound lets callers pass
+    /// `&'static [u8]`, `&'static str`, `Vec<u8>`, `String`, or
+    /// a pre-built [`IOBuf`].
+    pub fn push(mut self, chunk: impl Into<IOBuf>) -> Self {
+        self.chain.push_back(chunk.into());
         self
     }
 
-    /// Prepend a chunk to the front of the chain — O(1) thanks
-    /// to VecDeque's ring-buffer layout. Useful for frontends
-    /// that build a body from the inside out and add the
-    /// outermost framing last (e.g. HTTP/1.1 chunked-transfer
-    /// length prefixes, TLS record headers added after the
-    /// payload is sealed).
-    pub fn prepend(mut self, chunk: impl Into<Bytes>) -> Self {
-        let b: Bytes = chunk.into();
-        if !b.is_empty() {
-            self.total_len += b.len();
-            self.parts.push_front(b);
-        }
+    /// Prepend a chunk to the front of the chain — O(1).
+    pub fn prepend(mut self, chunk: impl Into<IOBuf>) -> Self {
+        self.chain.push_front(chunk.into());
         self
     }
 
     /// Convenience: borrowed-static append.
     pub fn push_static(self, s: &'static [u8]) -> Self {
-        self.push(s)
+        self.push(IOBuf::from_static(s))
     }
 
-    /// Convenience: owned-Vec append (move).
+    /// Convenience: owned-Vec append (move). Uses the
+    /// `Vec → IOBuf` conversion which migrates the allocation
+    /// without copy when len == capacity.
     pub fn push_owned(self, v: alloc::vec::Vec<u8>) -> Self {
         self.push(v)
     }
 
-    /// Convenience: String append (re-uses the underlying Vec
-    /// via String::into_bytes — no copy).
+    /// Convenience: String append (re-uses underlying Vec).
     pub fn push_string(self, s: alloc::string::String) -> Self {
         self.push(s.into_bytes())
     }
 
-    pub fn len(&self) -> usize { self.total_len }
-    pub fn is_empty(&self) -> bool { self.total_len == 0 }
+    pub fn len(&self) -> usize { self.chain.total_len() }
+    pub fn is_empty(&self) -> bool { self.chain.is_empty() }
+
+    /// Iterate the underlying parts (for frontends that walk
+    /// chunks one at a time, e.g. the HTTP/1.1 send loop).
+    pub fn parts(&self) -> impl Iterator<Item = &IOBuf> {
+        self.chain.iter()
+    }
+
+    /// Number of parts in the chain.
+    pub fn parts_len(&self) -> usize {
+        self.chain.part_count()
+    }
 }
 
 impl Default for Body {
     fn default() -> Self { Body::new() }
 }
 
-impl From<&'static [u8]> for Body { fn from(s: &'static [u8]) -> Self { Body::new().push(s) } }
-impl From<&'static str>  for Body { fn from(s: &'static str)  -> Self { Body::new().push(s.as_bytes()) } }
+impl From<&'static [u8]> for Body { fn from(s: &'static [u8]) -> Self { Body::new().push(IOBuf::from_static(s)) } }
+impl From<&'static str>  for Body { fn from(s: &'static str)  -> Self { Body::new().push(IOBuf::from_static(s.as_bytes())) } }
 impl From<alloc::vec::Vec<u8>>    for Body { fn from(v: alloc::vec::Vec<u8>)    -> Self { Body::new().push(v) } }
 impl From<alloc::string::String>  for Body { fn from(s: alloc::string::String)  -> Self { Body::new().push(s.into_bytes()) } }
-impl From<Bytes> for Body { fn from(b: Bytes) -> Self { Body::new().push(b) } }
+impl From<IOBuf> for Body { fn from(b: IOBuf) -> Self { Body::new().push(b) } }
 
 /// Maximum number of additional headers (beyond the framework's
 /// always-emitted Content-Type / Content-Length / Connection) that
@@ -332,15 +323,15 @@ pub struct Response {
     extra_headers: [Option<(Bytes, Bytes)>; MAX_EXTRA_HEADERS],
 }
 
-// Note: no `unsafe impl Send/Sync for Response` needed — Bytes
-// (Cow<'static, [u8]>) and ResponseBody are themselves
-// Send + Sync because the borrowed branch has 'static lifetime
-// and the owned branch holds Vec<u8>.
+// Note: no `unsafe impl Send/Sync for Response` needed —
+// `IOBuf` and `ResponseBody` are themselves Send + Sync (the
+// static-borrow branch has 'static lifetime, the heap branch
+// holds Box<[u8]>; no thread-local interior mutability).
 
 /// Anything a handler can return as a `Response` body.
 /// Implemented for `&'static [u8]` / `&'static str` (zero-alloc
 /// static resources), `Box<[u8]>` / `Vec<u8>` / `String`
-/// (heap-rendered), [`Bytes`] (pre-built chunk), and [`Body`]
+/// (heap-rendered), [`IOBuf`] (pre-built chunk), and [`Body`]
 /// (multi-part composition). Apps call `Response::ok(ct, body)`
 /// without picking a method based on the body type.
 pub trait IntoBody {
@@ -349,43 +340,42 @@ pub trait IntoBody {
 
 impl IntoBody for &'static [u8] {
     fn into_body(self) -> ResponseBody {
-        ResponseBody::Single(alloc::borrow::Cow::Borrowed(self))
+        ResponseBody::Single(IOBuf::from_static(self))
     }
 }
 
 impl<const N: usize> IntoBody for &'static [u8; N] {
     fn into_body(self) -> ResponseBody {
-        ResponseBody::Single(alloc::borrow::Cow::Borrowed(self))
+        ResponseBody::Single(IOBuf::from_static(self))
     }
 }
 
 impl IntoBody for &'static str {
     fn into_body(self) -> ResponseBody {
-        ResponseBody::Single(alloc::borrow::Cow::Borrowed(self.as_bytes()))
+        ResponseBody::Single(IOBuf::from_static(self.as_bytes()))
     }
 }
 
 impl IntoBody for alloc::boxed::Box<[u8]> {
     fn into_body(self) -> ResponseBody {
-        // Box<[u8]> -> Vec<u8> reinterprets the heap allocation
-        // (same memory, no copy).
-        ResponseBody::Single(alloc::borrow::Cow::Owned(self.into_vec()))
+        // Box<[u8]> -> Vec<u8> -> IOBuf — all zero-copy moves.
+        ResponseBody::Single(IOBuf::from(self.into_vec()))
     }
 }
 
 impl IntoBody for alloc::vec::Vec<u8> {
     fn into_body(self) -> ResponseBody {
-        ResponseBody::Single(alloc::borrow::Cow::Owned(self))
+        ResponseBody::Single(IOBuf::from(self))
     }
 }
 
 impl IntoBody for alloc::string::String {
     fn into_body(self) -> ResponseBody {
-        ResponseBody::Single(alloc::borrow::Cow::Owned(self.into_bytes()))
+        ResponseBody::Single(IOBuf::from(self.into_bytes()))
     }
 }
 
-impl IntoBody for Bytes {
+impl IntoBody for IOBuf {
     fn into_body(self) -> ResponseBody {
         ResponseBody::Single(self)
     }
@@ -394,19 +384,16 @@ impl IntoBody for Bytes {
 impl IntoBody for Body {
     fn into_body(self) -> ResponseBody {
         // Collapse trivial cases so single-part Body builders
-        // don't pay the Chain enum's Vec overhead — a builder
+        // don't pay the Chain wrapper's overhead — a builder
         // that pushed exactly one chunk flattens to
-        // ResponseBody::Single (zero alloc).
-        match self.parts.len() {
-            0 => ResponseBody::Single(alloc::borrow::Cow::Borrowed(b"")),
+        // ResponseBody::Single.
+        match self.chain.part_count() {
+            0 => ResponseBody::Single(IOBuf::from_static(b"")),
             1 => {
-                let mut parts = self.parts;
+                let mut parts = self.chain.into_parts();
                 ResponseBody::Single(parts.pop_front().unwrap())
             }
-            _ => ResponseBody::Chain {
-                parts: self.parts,
-                total_len: self.total_len,
-            },
+            _ => ResponseBody::Chain(self.chain),
         }
     }
 }
@@ -433,8 +420,8 @@ impl Response {
     pub fn not_found() -> Self {
         Response {
             status: 404,
-            content_type: alloc::borrow::Cow::Borrowed(b"text/plain"),
-            body: ResponseBody::Single(alloc::borrow::Cow::Borrowed(b"Not Found")),
+            content_type: IOBuf::from_static(b"text/plain"),
+            body: ResponseBody::Single(IOBuf::from_static(b"Not Found")),
             extra_headers: [const { None }; MAX_EXTRA_HEADERS],
         }
     }
@@ -461,7 +448,7 @@ impl Response {
     pub fn extra_headers(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
         self.extra_headers
             .iter()
-            .filter_map(|slot| slot.as_ref().map(|(n, v)| (&**n, &**v)))
+            .filter_map(|slot| slot.as_ref().map(|(n, v)| (n.data(), v.data())))
     }
 
     /// Consume the response and yield its body. Frontends match
@@ -478,10 +465,7 @@ impl Response {
     /// the Content-Length header (HTTP/1.1) or DATA-frame
     /// length prefix (HTTP/3) without walking the parts twice.
     pub fn body_len(&self) -> usize {
-        match &self.body {
-            ResponseBody::Single(b) => b.len(),
-            ResponseBody::Chain { total_len, .. } => *total_len,
-        }
+        self.body.len()
     }
 
     /// Borrow the body as a contiguous slice if it's a single
@@ -490,27 +474,26 @@ impl Response {
     /// pattern-match.
     pub fn body_bytes(&self) -> &[u8] {
         match &self.body {
-            ResponseBody::Single(b) => b,
-            ResponseBody::Chain { .. } => &[],
+            ResponseBody::Single(b) => b.data(),
+            ResponseBody::Chain(_) => &[],
         }
     }
 
     pub fn content_type_bytes(&self) -> &[u8] {
-        &self.content_type
+        self.content_type.data()
     }
 }
 
 /// Convenience: bytes_static(b"...") produces a borrowed-static
-/// `Bytes`, the no_std equivalent of `Bytes::from_static` in
-/// the `bytes` crate. Useful when a callsite has many static
-/// chunks to pass.
-pub fn bytes_static(s: &'static [u8]) -> Bytes {
-    alloc::borrow::Cow::Borrowed(s)
+/// `IOBuf`. Equivalent to `IOBuf::from_static(s)`; kept for
+/// symmetry with the historical `Bytes` API.
+pub fn bytes_static(s: &'static [u8]) -> IOBuf {
+    IOBuf::from_static(s)
 }
 
-/// Convenience: bytes_owned(v) wraps a Vec as `Bytes`.
-pub fn bytes_owned(v: alloc::vec::Vec<u8>) -> Bytes {
-    alloc::borrow::Cow::Owned(v)
+/// Convenience: bytes_owned(v) wraps a Vec as `IOBuf`.
+pub fn bytes_owned(v: alloc::vec::Vec<u8>) -> IOBuf {
+    IOBuf::from(v)
 }
 
 // ---- Server -----------------------------------------------------------------
@@ -826,17 +809,17 @@ async fn handle_conn<S, H>(
             // Chain we send each part separately — TCP coalesces
             // at the segment layer so the wire receives the same
             // byte sequence as if we'd concatenated, but we
-            // don't pay the concat memcpy. Cow auto-derefs to
-            // &[u8] for both Borrowed and Owned variants.
+            // don't pay the concat memcpy. `IOBuf::data()` returns
+            // the visible payload regardless of variant.
             match resp.into_body() {
                 ResponseBody::Single(b) => {
-                    if !b.is_empty() && stream.send(&b).await.is_err() {
+                    if !b.is_empty() && stream.send(b.data()).await.is_err() {
                         return;
                     }
                 }
-                ResponseBody::Chain { parts, .. } => {
-                    for part in &parts {
-                        if stream.send(part).await.is_err() {
+                ResponseBody::Chain(chain) => {
+                    for part in chain.iter() {
+                        if stream.send(part.data()).await.is_err() {
                             return;
                         }
                     }

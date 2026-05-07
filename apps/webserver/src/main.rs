@@ -343,7 +343,7 @@ fn shell_body(active: &str, title: &str, body: Body) -> Body {
     // the shell's title-tag context.
     let title_buf = title.as_bytes().to_vec();
 
-    let mut b = Body::with_capacity(8 + body.parts.len());
+    let mut b = Body::with_capacity(8 + body.parts_len());
     b = b.push_static(SHELL_HEAD_BEFORE_TITLE);
     b = b.push_owned(title_buf);
     b = b.push_static(SHELL_HEAD_AFTER_TITLE);
@@ -351,10 +351,10 @@ fn shell_body(active: &str, title: &str, body: Body) -> Body {
     b = b.push_static(SHELL_AFTER_STYLES);
     b = b.push_owned(nav_buf.into_bytes());
     b = b.push_static(SHELL_NAV_MAIN);
-    // Splice in the page body's parts in order. Each Bytes
-    // is already either Borrowed-static or Owned; push handles
-    // both via Into<Bytes>.
-    for part in body.parts {
+    // Splice the page body's parts in order. Each is an IOBuf
+    // (static-borrow or heap-owned); `push` accepts any
+    // `Into<IOBuf>`.
+    for part in body.chain.into_parts() {
         b = b.push(part);
     }
     b = b.push_static(SHELL_FOOTER);

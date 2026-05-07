@@ -427,8 +427,8 @@ fn write_response(conn: &QuicConn, sid: u64, resp: Response, qpack_buf: &mut Vec
     if body_len > 0 {
         match resp.into_body() {
             uni_http::ResponseBody::Single(b) => queue_chunk(conn, sid, b),
-            uni_http::ResponseBody::Chain { parts, .. } => {
-                for part in parts {
+            uni_http::ResponseBody::Chain(chain) => {
+                for part in chain.into_parts() {
                     queue_chunk(conn, sid, part);
                 }
             }
@@ -439,13 +439,18 @@ fn write_response(conn: &QuicConn, sid: u64, resp: Response, qpack_buf: &mut Vec
     conn.close_stream(sid);
 }
 
-/// Push one Bytes chunk onto stream `sid`. Pattern-matches on
-/// the Cow variant to pick the zero-alloc borrowed-static path
-/// or the by-move owned path.
-fn queue_chunk(conn: &QuicConn, sid: u64, b: uni_http::Bytes) {
-    match b {
-        alloc::borrow::Cow::Borrowed(s) => conn.send_static(sid, s),
-        alloc::borrow::Cow::Owned(v) => conn.send_owned(sid, v),
+/// Push one IOBuf chunk onto stream `sid`. Static-borrow chunks
+/// take the zero-alloc `send_static` path; heap-owned chunks
+/// move via `send_owned` (Box → Vec is zero-copy when the visible
+/// payload spans the entire backing storage, which is the typical
+/// app-side body chunk shape today). When SendStream learns to
+/// hold IOBuf directly (future commit) this conversion goes
+/// away.
+fn queue_chunk(conn: &QuicConn, sid: u64, b: uni_http::IOBuf) {
+    if let Some(s) = b.as_static() {
+        conn.send_static(sid, s);
+    } else {
+        conn.send_owned(sid, b.into_owned_vec());
     }
 }
 

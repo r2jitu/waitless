@@ -308,6 +308,54 @@ impl IOBuf {
         }
     }
 
+    /// Consume the IOBuf, producing an owned `Vec<u8>` of just
+    /// the visible payload bytes. Zero-copy when this is a Heap
+    /// variant whose visible payload spans the entire backing
+    /// storage (offset=0 and len=cap); otherwise copies into a
+    /// fresh Vec. For Static variants, always copies.
+    ///
+    /// Used as a bridge to APIs that take ownership of bytes via
+    /// `Vec<u8>` (uni-quic's `SendStream::write_owned`). When that
+    /// API itself moves to IOBuf the bridge goes away.
+    pub fn into_owned_vec(self) -> alloc::vec::Vec<u8> {
+        match self.inner {
+            Inner::Heap {
+                storage,
+                offset,
+                len,
+            } => {
+                let o = offset as usize;
+                let l = len as usize;
+                if o == 0 && l == storage.len() {
+                    // Whole-buffer ownership migrates without copy.
+                    storage.into_vec()
+                } else {
+                    storage[o..o + l].to_vec()
+                }
+            }
+            Inner::Static { data } => data.to_vec(),
+        }
+    }
+
+    /// True if this IOBuf wraps a `&'static [u8]`. Used by
+    /// downstream layers to dispatch zero-alloc static-borrow vs
+    /// owned-move paths (e.g. `SendStream::send_static` vs
+    /// `send_owned`).
+    pub fn is_static(&self) -> bool {
+        matches!(self.inner, Inner::Static { .. })
+    }
+
+    /// If this IOBuf is a static borrow, return the underlying
+    /// `&'static [u8]`. Returns `None` for heap-owned variants.
+    /// Lets the H3 / TLS / TCP send paths take a borrowed-static
+    /// fast path that holds onto the slice without copying.
+    pub fn as_static(&self) -> Option<&'static [u8]> {
+        match &self.inner {
+            Inner::Static { data } => Some(data),
+            Inner::Heap { .. } => None,
+        }
+    }
+
     /// Trim `n` bytes from the BACK of the visible payload.
     pub fn trim_end(&mut self, n: usize) -> Result<(), IOBufError> {
         match &mut self.inner {
@@ -593,6 +641,12 @@ impl<'a> Cursor<'a> {
 
 impl From<&'static [u8]> for IOBuf {
     fn from(s: &'static [u8]) -> Self {
+        IOBuf::from_static(s)
+    }
+}
+
+impl<const N: usize> From<&'static [u8; N]> for IOBuf {
+    fn from(s: &'static [u8; N]) -> Self {
         IOBuf::from_static(s)
     }
 }
