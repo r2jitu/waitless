@@ -18,8 +18,8 @@ extern crate uni_iobuf;
 // depend on `uni-http`) can use the same type without crossing
 // the transport↛app dependency boundary.
 pub use uni_iobuf::{
-    Cursor as IOBufCursor, IOBuf, IOBufChain, IOBufError, MAX_HEADER_RESERVE,
-    MAX_TRAILER_RESERVE,
+    Cursor as IOBufCursor, IOBuf, IOBufChain, IOBufError, IOBufWriter,
+    MAX_HEADER_RESERVE, MAX_TRAILER_RESERVE,
 };
 
 use alloc::boxed::Box;

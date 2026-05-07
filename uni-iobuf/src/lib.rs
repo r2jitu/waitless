@@ -357,6 +357,20 @@ impl IOBuf {
         }
     }
 
+    /// `core::fmt::Write` adapter that appends formatted bytes
+    /// into the IOBuf's tailroom. Lets callers `write!(buf.writer(),
+    /// "{}", value)` to render straight into the IOBuf instead of
+    /// going through an intermediate `String` + memcpy.
+    ///
+    /// The writer drops `Ok` even if the tailroom fills mid-render
+    /// — `core::fmt::Write` doesn't surface `Err` for buffer
+    /// exhaustion, so the caller checks `data().len()` afterward
+    /// to detect truncation. Sized correctly the truncation path
+    /// is cold.
+    pub fn writer(&mut self) -> IOBufWriter<'_> {
+        IOBufWriter { buf: self, overflowed: false }
+    }
+
     /// Trim `n` bytes from the BACK of the visible payload.
     pub fn trim_end(&mut self, n: usize) -> Result<(), IOBufError> {
         match &mut self.inner {
@@ -400,6 +414,47 @@ pub const MAX_HEADER_RESERVE: usize = 128;
 /// tags). 16 B handles a single AEAD tag; if a future layer adds
 /// its own trailer we'll bump.
 pub const MAX_TRAILER_RESERVE: usize = 16;
+
+/// `core::fmt::Write` adapter for [`IOBuf`]. Appends formatted
+/// bytes into the buffer's tailroom; if tailroom runs out
+/// mid-render the writer silently truncates (see `overflowed`).
+/// Used by app-side response builders to render dynamic content
+/// directly into a TLS-ready IOBuf without an intermediate
+/// `String` allocation + memcpy.
+pub struct IOBufWriter<'a> {
+    buf: &'a mut IOBuf,
+    /// Set when an `extend_uninit` call inside `write_str` failed
+    /// (tailroom exhausted). The caller queries this after the
+    /// `write!`/`writeln!` chain completes — `core::fmt::Write`'s
+    /// `Result` doesn't propagate buffer-out-of-space errors.
+    overflowed: bool,
+}
+
+impl IOBufWriter<'_> {
+    /// True if any append during this writer's lifetime hit a
+    /// tailroom exhaustion. Caller should treat the IOBuf as
+    /// truncated and either grow it or surface an error.
+    pub fn overflowed(&self) -> bool {
+        self.overflowed
+    }
+}
+
+impl core::fmt::Write for IOBufWriter<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        match self.buf.append_slice(s.as_bytes()) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                self.overflowed = true;
+                // `core::fmt::Write::write_str` returns
+                // `core::fmt::Error` on failure. Returning Err
+                // here halts the `write!` macro chain. The
+                // caller still checks `overflowed()` for the
+                // narrower "tailroom exhausted" signal.
+                Err(core::fmt::Error)
+            }
+        }
+    }
+}
 
 // ============================================================================
 // Per-layer MTU / headroom negotiation
@@ -952,6 +1007,33 @@ mod tests {
         assert_eq!(p.headroom, 0);
         assert_eq!(p.tailroom, 0);
         assert_eq!(p.max_payload, usize::MAX);
+    }
+
+    #[test]
+    fn iobuf_writer_renders_into_tailroom() {
+        use core::fmt::Write as _;
+        let mut buf = IOBuf::new_with_reserved(8, 0, 64);
+        // Visible payload starts empty.
+        assert_eq!(buf.len(), 0);
+        write!(buf.writer(), "hello {}", 42).unwrap();
+        assert_eq!(buf.data(), b"hello 42");
+        // Subsequent prepend uses headroom (still has 8 reserved).
+        buf.prepend(b"REC1").unwrap();
+        assert_eq!(buf.data(), b"REC1hello 42");
+    }
+
+    #[test]
+    fn iobuf_writer_signals_overflow() {
+        use core::fmt::Write as _;
+        let mut buf = IOBuf::new_with_reserved(0, 0, 4);
+        let mut w = buf.writer();
+        // First write fits.
+        let _ = write!(w, "ab");
+        // Second exceeds tailroom — the second write_str call
+        // sets overflowed and returns Err.
+        let r = write!(w, "cdefgh");
+        assert!(r.is_err());
+        assert!(w.overflowed());
     }
 
     #[test]
