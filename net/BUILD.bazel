@@ -284,6 +284,7 @@ rust_library(
         ":udp",
         "//drivers",
         "//kernel",
+        "//uni-iobuf",
         "//uni-runtime",
     ],
 )

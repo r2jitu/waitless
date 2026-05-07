@@ -234,10 +234,15 @@ fn poll_tier1() -> bool {
     // fired we fall back to the per-core scheme — APs are then
     // polling their own queues, and double-polling would race on
     // the per-queue cursor atomics.
+    let iobuf_path = uni_drivers::net::iobuf_rx_supported();
     if core == 0 && !uni_kernel::eventloop::is_ready() {
         let mut total = 0;
         for q in 0..nqp as usize {
-            total += uni_drivers::net::poll_qp(q, net_receive);
+            total += if iobuf_path {
+                uni_drivers::net::poll_qp_iobuf(q, net_receive_iobuf)
+            } else {
+                uni_drivers::net::poll_qp(q, net_receive)
+            };
         }
         return total > 0;
     }
@@ -249,7 +254,11 @@ fn poll_tier1() -> bool {
     if core >= nqp {
         return false;
     }
-    let count = uni_drivers::net::poll_qp(core as usize, net_receive);
+    let count = if iobuf_path {
+        uni_drivers::net::poll_qp_iobuf(core as usize, net_receive_iobuf)
+    } else {
+        uni_drivers::net::poll_qp(core as usize, net_receive)
+    };
     count > 0
 }
 
@@ -295,7 +304,11 @@ fn poll_tier2(num_cores: u32) -> bool {
         WAKEUP.at(i).store(false, core::sync::atomic::Ordering::Relaxed);
     }
 
-    let count = uni_drivers::net::poll(distribute_frame);
+    let count = if uni_drivers::net::iobuf_rx_supported() {
+        uni_drivers::net::poll_iobuf(distribute_frame_iobuf)
+    } else {
+        uni_drivers::net::poll(distribute_frame)
+    };
 
     // Mark ourselves as "just distributed" — our next poll attempt will
     // yield, giving other cores first shot at the lock.
@@ -373,6 +386,22 @@ pub fn net_receive(frame: &[u8]) {
     });
 }
 
+/// Zero-copy variant of `net_receive`. Same dispatch path; the
+/// IOBuf is borrowed via `iobuf.data()` for the parse/dispatch and
+/// dropped at end-of-scope (returning the descriptor's buffer to
+/// the driver's spare pool). Used as the callback for
+/// `uni_drivers::net::poll_qp_iobuf` on Tier 1 and as the inbox-
+/// drain step on Tier 2.
+pub fn net_receive_iobuf(iobuf: uni_iobuf::IOBuf) {
+    dispatch_frame(iobuf.data(), |_frame, pkt, _src_mac| {
+        REGISTRY.dispatch(
+            pkt.protocol, pkt.src.addr, pkt.dst.addr, pkt.payload,
+        );
+    });
+    // `iobuf` drops here. For `IOBuf::External` from virtio-net's
+    // iobuf_rx path, drop runs the descriptor-buffer pool callback.
+}
+
 /// Tier 2 distributor: classify, then either dispatch inline (when
 /// the flow hashes to our own core or single-core mode) or push the
 /// raw frame to the target core's RX inbox.
@@ -404,6 +433,84 @@ fn distribute_frame(frame: &[u8]) {
             }
         }
     });
+}
+
+/// Tier 2 distributor decision — classify a frame for the IOBuf
+/// path. Pulled out into its own function so it can run BEFORE we
+/// commit to moving the IOBuf (the closure-passed-to-`dispatch_frame`
+/// shape conflicts with moving the borrowed-from value out of the
+/// closure body). Side effect: ARP-learns from on-subnet IPv4
+/// senders, exactly like `dispatch_frame` does on the copy path.
+fn classify_for_distribution(
+    frame: &[u8],
+    num_cores: u32,
+    my_core: u32,
+) -> ClassifyResult {
+    let Some((src_mac, ethertype, payload)) = ethernet::ethernet_parse_full(frame) else {
+        return ClassifyResult::Drop;
+    };
+    match ethertype {
+        ethernet::ETHERTYPE_ARP | ipv6::ETHERTYPE_IPV6 => ClassifyResult::Inline,
+        ethernet::ETHERTYPE_IPV4 => {
+            let Some(pkt) = ipv4::ipv4_receive(payload) else {
+                return ClassifyResult::Drop;
+            };
+            if ipv4::same_subnet(pkt.src) {
+                arp::arp_learn(pkt.src, src_mac);
+            }
+            let (src_port, dst_port) = if pkt.payload.len() >= 4 {
+                (u16::from_be_bytes([pkt.payload[0], pkt.payload[1]]),
+                 u16::from_be_bytes([pkt.payload[2], pkt.payload[3]]))
+            } else {
+                (0, 0)
+            };
+            let target = flow_hash(
+                pkt.src.addr, pkt.dst.addr, src_port, dst_port, num_cores,
+            );
+            if target == my_core || num_cores <= 1 {
+                ClassifyResult::Inline
+            } else {
+                ClassifyResult::Distribute(target)
+            }
+        }
+        _ => ClassifyResult::Drop,
+    }
+}
+
+enum ClassifyResult {
+    /// Hand off to `net_receive_iobuf` on this core (ARP, IPv6,
+    /// or IPv4 destined for `my_core`).
+    Inline,
+    /// Push to target core's `rx_iobuf_inbox`; target wakes up and
+    /// consumes via `net_drain_cb`.
+    Distribute(u32),
+    /// Frame is unparseable / wrong ethertype — IOBuf drops here.
+    Drop,
+}
+
+/// Zero-copy Tier 2 distributor. Identifies the target core, then
+/// either runs the full receive path inline (for ARP, IPv6, or
+/// my-core IPv4) or hands the IOBuf to the target core's
+/// `rx_iobuf_inbox` — no memcpy at the cross-core boundary.
+fn distribute_frame_iobuf(iobuf: uni_iobuf::IOBuf) {
+    let num_cores = percpu::num_cores();
+    let my_core = uni_kernel::cpu_id();
+    match classify_for_distribution(iobuf.data(), num_cores, my_core) {
+        ClassifyResult::Inline => net_receive_iobuf(iobuf),
+        ClassifyResult::Distribute(target) => {
+            // SAFETY: same as the copy path — `percpu::init()` runs
+            // before any AP starts, target is bounded by num_cores.
+            let core = unsafe { percpu::get(target) };
+            // `push` consumes the IOBuf either way: on success it
+            // moves it into the slot; on failure (ring full) it
+            // drops the IOBuf internally, which returns the
+            // backing buffer to the driver pool.
+            if core.rx_iobuf_inbox.push(iobuf) {
+                WAKEUP.at(target).store(true, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        ClassifyResult::Drop => {} // iobuf drops here
+    }
 }
 
 // ============================================================================
@@ -742,6 +849,15 @@ fn net_drain_cb(core_id: u32) -> bool {
     let cc = unsafe { percpu::CurrentWorker::from_id_unchecked(core_id) };
     let core = percpu::percore(&cc); // SAFE access via the token
     let mut did_work = false;
+    // Zero-copy inbox first: when the active driver supports it,
+    // `distribute_frame_iobuf` pushes IOBufs here instead of memcpy
+    // ing into `rx_inbox`. Drains both regardless — a driver upgrade
+    // (or a brief boot-window mismatch) shouldn't strand frames in
+    // the wrong inbox.
+    while let Some(iobuf) = core.rx_iobuf_inbox.pop() {
+        net_receive_iobuf(iobuf);
+        did_work = true;
+    }
     let mut buf = [0u8; 1514];
     while let Some(len) = core.rx_inbox.pop_into(&mut buf) {
         net_receive(&buf[..len]);
