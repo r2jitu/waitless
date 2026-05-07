@@ -361,25 +361,21 @@ const SHELL_FOOTER: &[u8] =
 /// (immutable storage); they fall back to the slice-based
 /// path transparently.
 fn shell_body(active: &str, title: &str, body: IOBufChain) -> IOBufChain {
-    use uni_http::{IOBuf, MAX_HEADER_RESERVE as HDR, MAX_TRAILER_RESERVE as TRL};
     use core::fmt::Write as _;
 
-    // Title and nav chunks borrow from the same per-conn body
-    // scratch as the page body, partitioned in order. Three
-    // `body_iobuf` calls = three sub-ranges of one buffer = zero
-    // heap allocations for any of them. Falls back to fresh
-    // `IOBuf::new_with_reserved` if the scratch is exhausted or
-    // we're outside a handler invocation.
+    // Title and nav chunks share the per-conn body scratch with
+    // the page body — three `body_iobuf` calls = three sub-
+    // ranges of one buffer = zero heap allocations for any of
+    // them. Transport-framing reserves (TLS record header, AEAD
+    // tag) live inside the IOBuf out of the app's view.
     let title_cap = title.len().max(1);
-    let mut title_buf = uni_http::body_iobuf(title_cap)
-        .unwrap_or_else(|| IOBuf::new_with_reserved(HDR, title_cap, TRL));
+    let mut title_buf = uni_http::body_iobuf(title_cap);
     let _ = title_buf.append_slice(title.as_bytes());
 
     // 512 B covers the current 6-link nav with active-class flip;
     // the writer truncates above that.
     const NAV_CAP: usize = 512;
-    let mut nav_buf = uni_http::body_iobuf(NAV_CAP)
-        .unwrap_or_else(|| IOBuf::new_with_reserved(HDR, NAV_CAP, TRL));
+    let mut nav_buf = uni_http::body_iobuf(NAV_CAP);
     {
         let mut w = nav_buf.writer();
         for (path, label) in NAV {
@@ -656,22 +652,15 @@ fn page_diagnostics() -> Response {
     // payload region; `TlsStream::send_iobuf` then takes the
     // encrypt-in-place path on the chunk (saves the plaintext-into-
     // tx_buf memcpy too).
-    use uni_http::{IOBuf, MAX_HEADER_RESERVE as HDR, MAX_TRAILER_RESERVE as TRL};
     use core::fmt::Write as _;
 
     // Payload capacity: 12 KiB covers the worst-case rendered
     // diagnostics page (~9 KiB observed); past that the writer
-    // truncates.
-    //
-    // Borrows the per-conn body scratch parked by `handle_conn`
-    // in the per-worker slot — zero allocation per response.
-    // Falls back to `IOBuf::new_with_reserved` when there's no
-    // active handler-side scratch (test contexts) or when
-    // another part of this same handler invocation has already
-    // taken it.
+    // truncates. `body_iobuf` borrows from the per-conn scratch
+    // when called inside a handler (zero alloc) and falls back
+    // to a fresh allocation otherwise — apps don't pick.
     const PAYLOAD_CAP: usize = 12 * 1024;
-    let mut body = uni_http::body_iobuf(PAYLOAD_CAP)
-        .unwrap_or_else(|| IOBuf::new_with_reserved(HDR, PAYLOAD_CAP, TRL));
+    let mut body = uni_http::body_iobuf(PAYLOAD_CAP);
     {
         let mut w = body.writer();
 
@@ -758,15 +747,13 @@ const HEALTH_JSON: &[u8] =
 /// Per-queue RX frame counts + used-ring cursors, so we can see how
 /// the NIC is distributing flows under Tier 1 multi-queue.
 fn stats_response() -> Response {
-    use uni_http::{IOBuf, MAX_HEADER_RESERVE as HDR, MAX_TRAILER_RESERVE as TRL};
     let counts = uni::diagnostics::net_rx_counts();
     let cursors = uni::diagnostics::net_rx_used_cursors();
     let nqp = uni::diagnostics::net_num_queue_pairs() as usize;
 
     // 1 KiB body region — even with 32 queue pairs and 20-digit
     // u64 counters this stays well under cap.
-    let mut body = uni_http::body_iobuf(1024)
-        .unwrap_or_else(|| IOBuf::new_with_reserved(HDR, 1024, TRL));
+    let mut body = uni_http::body_iobuf(1024);
     {
         let mut w = body.writer();
         let _ = w.write_str("{\"rx_frames\":[");
@@ -790,13 +777,12 @@ fn stats_response() -> Response {
 }
 
 fn heap_response() -> Response {
-    use uni_http::{IOBuf, MAX_HEADER_RESERVE as HDR, MAX_TRAILER_RESERVE as TRL};
-    // Render directly into an IOBuf with TLS reserve so
-    // `TlsStream::send_iobuf` takes the encrypt-in-place path
-    // on this body chunk. ~200 B JSON + reserve.
+    // ~200 B JSON renders directly into the per-conn body
+    // scratch via `body_iobuf`; transport-framing reserves are
+    // handled inside the IOBuf out of view, so the encrypt-in-
+    // place path in `TlsStream::send` applies for HTTPS.
     let s = uni::diagnostics::heap_stats();
-    let mut body = uni_http::body_iobuf(256)
-        .unwrap_or_else(|| IOBuf::new_with_reserved(HDR, 256, TRL));
+    let mut body = uni_http::body_iobuf(256);
     let _ = write!(body.writer(),
         "{{\"allocated_bytes\":{},\"available_bytes\":{},\"claimed_bytes\":{},\
          \"allocation_count\":{},\"fragment_count\":{},\"total_allocation_count\":{}}}",
@@ -810,12 +796,10 @@ fn heap_response() -> Response {
 /// Same numbers the Diagnostics page renders, exposed as JSON for
 /// programmatic monitoring.
 fn quic_stats_response() -> Response {
-    use uni_http::{IOBuf, MAX_HEADER_RESERVE as HDR, MAX_TRAILER_RESERVE as TRL};
     // 1 KiB body region covers ~37 named u64 counters (the
     // current snapshot size); render in place to skip the
     // String → IOBuf copy.
-    let mut body = uni_http::body_iobuf(1024)
-        .unwrap_or_else(|| IOBuf::new_with_reserved(HDR, 1024, TRL));
+    let mut body = uni_http::body_iobuf(1024);
     {
         let mut w = body.writer();
         let _ = w.write_str("{");

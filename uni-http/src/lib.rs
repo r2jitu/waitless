@@ -93,37 +93,37 @@ fn body_scratch_init() {
     });
 }
 
-/// Get an IOBuf carved out of the current handler's per-conn
-/// body scratch buffer. The returned IOBuf has at least `cap`
-/// bytes of usable payload capacity plus headroom + tailroom
-/// reserved for the transport stack's framing (TLS record
-/// header, AEAD tag). Visible payload starts empty (`len = 0`);
-/// callers write via [`IOBuf::append_slice`] /
+/// Allocate an IOBuf for a response body part with `cap` bytes
+/// of usable payload capacity. The framework reserves transport-
+/// framing headroom and tailroom internally — apps don't see
+/// or care about TLS record headers / AEAD tag space; the
+/// returned IOBuf's visible payload (`buf.data()`) starts empty
+/// and grows up to `cap` bytes via [`IOBuf::append_slice`] /
 /// [`IOBuf::writer`] / [`IOBuf::extend_uninit`].
 ///
-/// Returns `Some(IOBuf)` while a handler is in flight on this
-/// worker and the requested `cap` (plus reserves) fits in the
-/// remaining scratch; `None` otherwise. Multiple calls within
-/// one handler invocation are supported — the scratch is
-/// partitioned in the order requested, so a handler can
-/// allocate a small title IOBuf, a nav IOBuf, and a body
-/// IOBuf all backed by the same per-conn buffer with zero
-/// heap allocations. Caller falls back to a fresh
-/// `IOBuf::new_with_reserved` allocation when this returns
-/// `None`.
+/// Always returns an IOBuf. Two backing strategies, transparent
+/// to the caller:
 ///
-/// The IOBuf borrows storage owned by `handle_conn`'s pinned
-/// future state. The buffer is reused across every request on
-/// the connection — no per-response allocation for the
-/// underlying bytes. Drop is a no-op (the storage stays alive
-/// until the conn closes).
+///   1. **Borrowed scratch** (zero alloc): when invoked inside
+///      a request handler, the IOBuf borrows a sub-range of
+///      `handle_conn`'s per-conn 16 KiB scratch buffer. Multiple
+///      `body_iobuf` calls within one handler partition the
+///      scratch in order, so a handler that builds a title
+///      IOBuf + nav IOBuf + body IOBuf gets all three from the
+///      same buffer — zero heap allocations for any of them.
 ///
-/// Apps that want zero-alloc body construction:
+///   2. **Fresh heap allocation**: when called outside a handler
+///      (test contexts) or when the requested capacity exceeds
+///      the remaining scratch, falls back to a fresh
+///      `IOBuf::new_with_reserved` with the same reserves baked
+///      in. Same observable IOBuf shape, just a `Box<[u8]>`
+///      under the hood.
+///
+/// Apps:
 ///
 /// ```ignore
 /// async fn page(_req: &Request) -> Response {
-///     let mut body = uni_http::body_iobuf(12 * 1024)
-///         .unwrap_or_else(|| IOBuf::new_with_reserved(HDR, 12 * 1024, TRL));
+///     let mut body = uni_http::body_iobuf(12 * 1024);
 ///     {
 ///         let mut w = body.writer();
 ///         // render content
@@ -131,7 +131,20 @@ fn body_scratch_init() {
 ///     Response::ok(b"text/html", body)
 /// }
 /// ```
-pub fn body_iobuf(cap: usize) -> Option<IOBuf> {
+pub fn body_iobuf(cap: usize) -> IOBuf {
+    if let Some(borrowed) = try_carve_scratch(cap) {
+        return borrowed;
+    }
+    // Fallback: fresh heap allocation. Same reserves as the
+    // borrowed-scratch path so the encrypt-in-place fast path
+    // in `TlsStream::send` applies either way.
+    IOBuf::new_with_reserved(MAX_HEADER_RESERVE, cap, MAX_TRAILER_RESERVE)
+}
+
+/// Internal: try to carve an IOBuf out of the per-worker
+/// scratch slot. Returns `None` outside handlers or when the
+/// requested capacity wouldn't fit in the remaining scratch.
+fn try_carve_scratch(cap: usize) -> Option<IOBuf> {
     let cc = CurrentWorker::enter();
     body_scratch_init();
     let slot = BODY_SCRATCH.with(&cc, |c| c.get());
@@ -151,12 +164,6 @@ pub fn body_iobuf(cap: usize) -> Option<IOBuf> {
         return None;
     }
     let remaining = total - cursor;
-
-    // Headroom + tailroom for the transport framing layer
-    // (TLS record header + AEAD tag); plus `cap` of usable
-    // payload. Headroom is clamped so a small carve-out still
-    // fits — TLS reserves are tiny (5 B / 17 B), so this
-    // matters only at the tail of a near-full scratch.
     let headroom = MAX_HEADER_RESERVE.min(remaining / 4);
     let tailroom = MAX_TRAILER_RESERVE;
     let needed = headroom + cap + tailroom;
@@ -170,7 +177,6 @@ pub fn body_iobuf(cap: usize) -> Option<IOBuf> {
             cursor: cursor + needed,
         })
     });
-
     Some(unsafe {
         IOBuf::from_external(
             NonNull::new_unchecked(slice.as_ptr().add(chunk_start) as *mut u8),
