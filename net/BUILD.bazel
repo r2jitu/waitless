@@ -203,6 +203,7 @@ rust_library(
         ":ipv6_send",
         ":types",
         "//kernel",
+        "//uni-iobuf",
         "//uni-runtime",
         "@crates//:bitflags",
     ],

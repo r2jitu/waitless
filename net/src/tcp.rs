@@ -16,34 +16,12 @@ extern crate net_ipv6 as ipv6;
 extern crate net_ipv6_send as ipv6_send;
 extern crate bitflags;
 
-use alloc::alloc::{alloc_zeroed, Layout};
 use alloc::boxed::Box;
 use core::ptr;
 use core::task::Waker;
 use from_bytes::FromBytes;
 use types::{IpAddr, tcp_checksum_any, htons, ntohs, htonl, ntohl};
 use ipv4::{ipv4_send, PROTO_TCP};
-
-/// Heap-allocate a zero-filled `Box<[u8]>` of `len` bytes, returning
-/// `None` on OOM instead of aborting. `vec![0u8; len].into_boxed_slice()`
-/// would panic on failure; we refuse the connection instead.
-fn try_zeroed_boxed_slice(len: usize) -> Option<Box<[u8]>> {
-    if len == 0 {
-        return None;
-    }
-    let layout = Layout::from_size_align(len, 1).ok()?;
-    // SAFETY: non-zero size, u8 has no invalid bit patterns so
-    // zero-initialised memory is a valid `[u8]`; Box::from_raw
-    // takes ownership of the freshly-allocated slice pointer.
-    unsafe {
-        let raw = alloc_zeroed(layout);
-        if raw.is_null() {
-            return None;
-        }
-        let slice = core::slice::from_raw_parts_mut(raw, len);
-        Some(Box::from_raw(slice))
-    }
-}
 
 bitflags::bitflags! {
     struct TcpFlags: u8 {
@@ -148,13 +126,24 @@ pub struct TcpConnection {
     snd_una: u32,
     rcv_nxt: u32,
     rcv_wnd: u16,
-    /// Owned RX ring buffer. `None` until the connection is accepted
-    /// (allocated in `tcp_receive` SYN handling), then a `Box<[u8]>`
-    /// of length `RX_BUF_SIZE`. Drop returns the bytes to the global
-    /// allocator automatically when the connection is reset.
-    rx_buf: Option<Box<[u8]>>,
-    rx_head: usize,
-    rx_tail: usize,
+    /// In-order RX chunk list. `None` until the connection is
+    /// accepted (allocated in `tcp_receive` SYN handling), then a
+    /// `VecDeque<IOBuf>` whose total visible-payload length is at
+    /// most `RX_BUF_SIZE` bytes. Each `rx_push` appends one chunk;
+    /// `rx_pop` walks chunks left-to-right copying into the user
+    /// buffer, dropping each chunk when fully drained or trimming
+    /// it via `IOBuf::consume(n)` on partial drain. Drop runs the
+    /// IOBuf chain's drop on connection reset, which returns each
+    /// chunk's backing buffer to its driver pool.
+    ///
+    /// The `Option` is the SYN-time admission gate — if the
+    /// `VecDeque::with_capacity` allocation fails on a fresh
+    /// connection we refuse the connection rather than panic.
+    rx_chunks: Option<alloc::collections::VecDeque<uni_iobuf::IOBuf>>,
+    /// Cached total length of `rx_chunks` payloads. Avoids walking
+    /// the deque on every `rx_used` / `rx_free` call (TCP segment
+    /// processing reads them per-segment for the window field).
+    rx_used: usize,
     listener_port: u16,
     accepted: bool,
     /// Incremented every time `free_connection` resets this slot, so
@@ -164,8 +153,8 @@ pub struct TcpConnection {
     /// NOT reset it; `free_connection` bumps it explicitly.
     generation: u16,
     /// Parked `TcpRecv` waker. Set by `register_recv_waker` on the
-    /// owning core; woken when data lands in `rx_buf` or the peer
-    /// closes. Per-core ownership — no lock needed.
+    /// owning core; woken when data lands in `rx_chunks` or the
+    /// peer closes. Per-core ownership — no lock needed.
     recv_waker: Option<Waker>,
     /// Free-list link. When this slot is on the free list (state ==
     /// Closed AND the slot has been returned to the pool), this
@@ -187,9 +176,8 @@ impl TcpConnection {
             snd_una: 0,
             rcv_nxt: 0,
             rcv_wnd: RX_BUF_SIZE as u16,
-            rx_buf: None,
-            rx_head: 0,
-            rx_tail: 0,
+            rx_chunks: None,
+            rx_used: 0,
             listener_port: 0,
             accepted: false,
             generation: 0,
@@ -199,60 +187,84 @@ impl TcpConnection {
     }
 
     #[inline]
-    fn rx_buf_size(&self) -> usize {
-        self.rx_buf.as_ref().map(|b| b.len()).unwrap_or(0)
-    }
-
     fn rx_used(&self) -> usize {
-        let size = self.rx_buf_size();
-        if size == 0 { return 0; }
-        if self.rx_head >= self.rx_tail {
-            self.rx_head - self.rx_tail
-        } else {
-            size - self.rx_tail + self.rx_head
-        }
+        self.rx_used
     }
 
+    #[inline]
     fn rx_free(&self) -> usize {
-        let size = self.rx_buf_size();
-        if size == 0 { return 0; }
-        size - 1 - self.rx_used()
+        if self.rx_chunks.is_none() {
+            return 0;
+        }
+        // -1 to leave room for the FIN-with-data edge case the
+        // ring-buffer version reserved; behavioural parity.
+        RX_BUF_SIZE.saturating_sub(self.rx_used).saturating_sub(1)
     }
 
-    fn rx_push(&mut self, data: &[u8]) -> usize {
-        let size = self.rx_buf_size();
-        if size == 0 { return 0; }
-        let free = self.rx_free();
-        let n = data.len().min(free);
+    /// Append an IOBuf chunk to the rx queue. `iobuf.data()` should
+    /// already be just the TCP segment payload (caller has consumed
+    /// past the TCP header). Returns the number of bytes accepted —
+    /// may be less than `iobuf.data().len()` if the receive window
+    /// is partially full, in which case the IOBuf is trimmed via
+    /// `IOBuf::trim_end(...)` before being pushed (the dropped
+    /// suffix isn't kept; the sender will retransmit when our
+    /// advertised window opens up).
+    fn rx_push(&mut self, mut iobuf: uni_iobuf::IOBuf) -> usize {
+        let chunks = match &mut self.rx_chunks {
+            Some(c) => c,
+            None => return 0,
+        };
+        let free = RX_BUF_SIZE.saturating_sub(self.rx_used).saturating_sub(1);
+        if free == 0 { return 0; }
+        let len = iobuf.data().len();
+        let n = len.min(free);
         if n == 0 { return 0; }
-        let contig = size - self.rx_head;
-        let buf = self.rx_buf.as_mut().unwrap();
-        if n <= contig {
-            buf[self.rx_head..self.rx_head + n].copy_from_slice(&data[..n]);
-        } else {
-            buf[self.rx_head..self.rx_head + contig].copy_from_slice(&data[..contig]);
-            buf[..n - contig].copy_from_slice(&data[contig..n]);
+        if n < len {
+            // Window can't take the whole segment; trim the trailing
+            // bytes so the chunk fits exactly. The sender will
+            // re-send those bytes on retransmit once `rcv_wnd` opens.
+            if iobuf.trim_end(len - n).is_err() {
+                return 0;
+            }
         }
-        self.rx_head = (self.rx_head + n) % size;
+        chunks.push_back(iobuf);
+        self.rx_used += n;
         n
     }
 
     fn rx_pop(&mut self, out: &mut [u8]) -> usize {
-        let size = self.rx_buf_size();
-        if size == 0 { return 0; }
-        let used = self.rx_used();
-        let n = out.len().min(used);
-        if n == 0 { return 0; }
-        let contig = size - self.rx_tail;
-        let buf = self.rx_buf.as_ref().unwrap();
-        if n <= contig {
-            out[..n].copy_from_slice(&buf[self.rx_tail..self.rx_tail + n]);
-        } else {
-            out[..contig].copy_from_slice(&buf[self.rx_tail..self.rx_tail + contig]);
-            out[contig..n].copy_from_slice(&buf[..n - contig]);
+        let chunks = match &mut self.rx_chunks {
+            Some(c) => c,
+            None => return 0,
+        };
+        let mut written = 0;
+        while written < out.len() {
+            let head = match chunks.front_mut() {
+                Some(h) => h,
+                None => break,
+            };
+            let head_data = head.data();
+            let want = out.len() - written;
+            let take = want.min(head_data.len());
+            if take == 0 {
+                // Defensive: empty chunk shouldn't happen post-push,
+                // but if it does, pop and continue.
+                chunks.pop_front();
+                continue;
+            }
+            out[written..written + take].copy_from_slice(&head_data[..take]);
+            written += take;
+            if take == head_data.len() {
+                // Fully drained — drop the IOBuf, which releases its
+                // backing buffer to the driver pool.
+                chunks.pop_front();
+            } else {
+                // Partial drain — advance the visible payload.
+                let _ = head.consume(take);
+            }
         }
-        self.rx_tail = (self.rx_tail + n) % size;
-        n
+        self.rx_used -= written;
+        written
     }
 }
 
@@ -685,9 +697,11 @@ fn free_connection(core: u32, slot: usize) {
     // the slot has been reused on its next hook call. Preserved
     // across the reset below.
     let next_gen = c.generation.wrapping_add(1);
-    // Assigning a fresh TcpConnection drops the old one, which runs
-    // the Drop impl on `rx_buf: Option<Box<[u8]>>` — Box::drop returns
-    // the bytes to the global allocator. No manual kfree needed.
+    // Assigning a fresh TcpConnection drops the old one, which
+    // drops `rx_chunks: Option<VecDeque<IOBuf>>` — the deque's
+    // drop walks each remaining IOBuf, running its drop callback
+    // (returns each chunk's backing buffer to the driver pool, or
+    // frees the heap allocation on the legacy IPv6 wrap path).
     *c = TcpConnection::new();
     c.generation = next_gen;
     // Return the slot to the pool's free list. O(1) push; the next
@@ -867,13 +881,26 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, data: &[u8]) {
             c.listener_port = dst_port;
             c.accepted = false;
 
-            // Allocate RX buffer. Box drops back to the global
-            // allocator automatically when the connection is reset;
-            // `try_zeroed_boxed_slice` returns None on OOM so we
-            // refuse the connection instead of aborting.
-            c.rx_buf = try_zeroed_boxed_slice(RX_BUF_SIZE);
-            c.rx_head = 0;
-            c.rx_tail = 0;
+            // Allocate the RX chunk list — a fresh empty `VecDeque`
+            // for the connection's lifetime. Capacity is reserved
+            // up-front so admission control can fail loudly here
+            // rather than later (out-of-memory under load is harder
+            // to recover from gracefully than at SYN-receive time).
+            // Drop runs the IOBuf chain's drop on connection reset,
+            // returning each chunk's backing buffer to its driver
+            // pool.
+            //
+            // 16 chunks ≈ 16 × MSS (1460 typical) ≈ 23 KiB of
+            // payload at most — comfortably more than `RX_BUF_SIZE`
+            // (8 KiB), so admission for a typical request
+            // (single segment) and bursty body uploads (a handful
+            // of segments) covers without growing the deque.
+            // Beyond 16 the deque grows; that's a heap alloc on
+            // hot path but only under sustained large bodies.
+            let mut chunks = alloc::collections::VecDeque::new();
+            chunks.reserve_exact(16);
+            c.rx_chunks = Some(chunks);
+            c.rx_used = 0;
         }
 
         // Publish this 4-tuple to the per-core hash index so the
@@ -944,7 +971,16 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, data: &[u8]) {
     // Process data
     if payload_len > 0 && (c.state == TcpState::Established || c.state == TcpState::FinWait1 || c.state == TcpState::FinWait2) {
         if seq == c.rcv_nxt {
-            let pushed = c.rx_push(&payload[..payload_len]);
+            // Commit 1: wrap the borrowed segment payload in a Heap
+            // IOBuf so the chunk-list shape lands in isolation. The
+            // memcpy from `payload` into the Heap IOBuf's storage
+            // matches what the old ring-buffer `rx_push(&[u8])` did.
+            // Commit 2 routes the original NIC `IOBuf::External`
+            // through here directly, dropping this wrap+memcpy.
+            let chunk = uni_iobuf::IOBuf::from_slice_with_headroom(
+                0, &payload[..payload_len], 0,
+            );
+            let pushed = c.rx_push(chunk);
             c.rcv_nxt = c.rcv_nxt.wrapping_add(pushed as u32);
             c.rcv_wnd = c.rx_free() as u16;
             // Wake any `TcpRecvReady` parked on this conn. Same core
