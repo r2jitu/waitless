@@ -795,7 +795,16 @@ fn send_l3(local_ip: IpAddr, dst_ip: IpAddr, segment: &[u8]) {
 /// Process an incoming TCP packet. Called on the owning core (via flow hash).
 /// `src_ip` and `dst_ip` are family-tagged so v4 and v6 connections
 /// share the same TCB pool, hash table, and dispatch path.
-pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, data: &[u8]) {
+///
+/// Takes ownership of the segment as an `IOBuf` whose `data()` is
+/// the full TCP segment (header + payload). After header parse,
+/// `iobuf.consume(data_offset)` advances the visible payload past
+/// the header so the IOBuf can be moved into `rx_push` directly
+/// (no memcpy at the protocol-recv boundary). Control-only
+/// segments (SYN, RST, FIN-only, ACK-only) drop the IOBuf at
+/// end-of-scope, returning its backing buffer to the driver pool.
+pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut iobuf: uni_iobuf::IOBuf) {
+    let data = iobuf.data();
     let hdr = match TcpHeader::try_ref_from(data) {
         Some(h) => h,
         None => return,
@@ -807,7 +816,6 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, data: &[u8]) {
     let flags = hdr.flags;
     let data_offset = ((hdr.data_offset >> 4) as usize) * 4;
     let payload_len = if data.len() > data_offset { data.len() - data_offset } else { 0 };
-    let payload = &data[data_offset..];
 
     // Determine which core owns this packet.
     let core = uni_kernel::cpu_id();
@@ -971,16 +979,22 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, data: &[u8]) {
     // Process data
     if payload_len > 0 && (c.state == TcpState::Established || c.state == TcpState::FinWait1 || c.state == TcpState::FinWait2) {
         if seq == c.rcv_nxt {
-            // Commit 1: wrap the borrowed segment payload in a Heap
-            // IOBuf so the chunk-list shape lands in isolation. The
-            // memcpy from `payload` into the Heap IOBuf's storage
-            // matches what the old ring-buffer `rx_push(&[u8])` did.
-            // Commit 2 routes the original NIC `IOBuf::External`
-            // through here directly, dropping this wrap+memcpy.
-            let chunk = uni_iobuf::IOBuf::from_slice_with_headroom(
-                0, &payload[..payload_len], 0,
-            );
-            let pushed = c.rx_push(chunk);
+            // Advance the IOBuf's visible payload past the TCP
+            // header so `data()` is just the segment body, then
+            // hand ownership to `rx_push`. Trim trailing pad
+            // bytes (the IPv4 caller already trimmed at the IP
+            // layer, so `visible == payload_len` typically; the
+            // belt-and-braces check costs nothing).
+            if iobuf.consume(data_offset).is_err() {
+                return;
+            }
+            let visible = iobuf.data().len();
+            if visible > payload_len
+                && iobuf.trim_end(visible - payload_len).is_err()
+            {
+                return;
+            }
+            let pushed = c.rx_push(iobuf);
             c.rcv_nxt = c.rcv_nxt.wrapping_add(pushed as u32);
             c.rcv_wnd = c.rx_free() as u16;
             // Wake any `TcpRecvReady` parked on this conn. Same core

@@ -22,19 +22,6 @@ pub extern crate net_protocol as protocol;
 
 pub static REGISTRY: protocol::Registry = protocol::Registry::new();
 
-// REGISTRY adapter for IPv4 TCP. Wraps the u32-IP ABI into the
-// family-typed `tcp_receive` entry. IPv4 UDP no longer goes through
-// REGISTRY — it routes directly through `udp_receive` from
-// `net_receive`. IPv6 dispatch (both TCP and UDP) calls the
-// `*_receive` entries directly from `ipv6_receive_frame`.
-fn tcp_dispatch(src: u32, dst: u32, payload: &[u8]) {
-    tcp::tcp_receive(
-        types::IpAddr::V4(types::Ipv4Addr { addr: src }),
-        types::IpAddr::V4(types::Ipv4Addr { addr: dst }),
-        payload,
-    );
-}
-
 /// Bare-metal TCP backend vtable. Listener hooks open one TCB per
 /// core; per-stream hooks use the generation-aware variants so a
 /// stale handle surviving a close+reuse resolves to closed rather
@@ -88,7 +75,6 @@ pub fn init_stack() {
     ipv4::init();
     init_ipv6();
 
-    REGISTRY.register(protocol::Slot::Tcp, tcp_dispatch);
     // Wire up the async `uni::runtime::TcpListener` reactor and
     // the per-stream recv/send reactors — all via a single backend
     // vtable. Listening requires one slot per core (each core
@@ -382,9 +368,29 @@ pub fn net_receive(mut iobuf: uni_iobuf::IOBuf) {
                     // iobuf moved
                     return;
                 }
+                ipv4::PROTO_TCP => {
+                    // Symmetric to the UDP arm: consume past the
+                    // IP header so `iobuf.data()` is the TCP segment,
+                    // trim trailing IP padding, then move into TCP.
+                    if iobuf.consume(seg_offset).is_err() {
+                        return;
+                    }
+                    let visible = iobuf.data().len();
+                    if visible > seg_len
+                        && iobuf.trim_end(visible - seg_len).is_err()
+                    {
+                        return;
+                    }
+                    tcp::tcp_receive(
+                        types::IpAddr::V4(types::Ipv4Addr { addr: src }),
+                        types::IpAddr::V4(types::Ipv4Addr { addr: dst }),
+                        iobuf,
+                    );
+                    // iobuf moved
+                    return;
+                }
                 _ => {
-                    // TCP / other: legacy &[u8] dispatch, then drop.
-                    REGISTRY.dispatch(proto, src, dst, &iobuf.data()[seg_offset..seg_offset + seg_len]);
+                    // Unknown IP protocol — drop iobuf at end of fn.
                 }
             }
         }
@@ -645,10 +651,19 @@ fn ipv6_receive_frame(frame: &[u8], src_mac: types::MacAddr) {
     match pkt.next_header {
         ipv6::next_header::ICMPV6 => handle_icmpv6(&pkt, src_mac),
         ipv6::next_header::TCP => {
+            // IPv6 still threads `&[u8]` through `dispatch_ipv6_l4`,
+            // so wrap the borrowed segment in a Heap IOBuf before
+            // forwarding. Per-packet alloc on the IPv6 path; the
+            // IPv4 fast path goes straight from the NIC driver's
+            // owned IOBuf to `tcp_receive` without copying. (Same
+            // shape as the IPv6 UDP arm just below.)
+            let iobuf = uni_iobuf::IOBuf::from_slice_with_headroom(
+                0, pkt.payload, 0,
+            );
             tcp::tcp_receive(
                 types::IpAddr::V6(pkt.src),
                 types::IpAddr::V6(pkt.dst),
-                pkt.payload,
+                iobuf,
             );
         }
         ipv6::next_header::UDP => {
