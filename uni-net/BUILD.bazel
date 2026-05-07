@@ -14,6 +14,7 @@ rust_library(
     ],
     crate_name = "uni_net_driver",
     crate_root = "src/driver.rs",
+    deps = ["//uni-iobuf"],
 )
 
 # `Net::enable`, error types, and the bare-metal net umbrella.

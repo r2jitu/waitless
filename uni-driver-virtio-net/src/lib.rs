@@ -1656,6 +1656,10 @@ static VIRTIO_NET_OPS: NicOps = NicOps {
     poke_interrupt_status,
     idle: Some(&VIRTIO_NET_IDLE_OPS),
     diag: Some(&VIRTIO_NET_DIAG_OPS),
+    // Zero-copy RX not yet wired — drops to the copy path via
+    // `poll_rx`. Step 3 of the IOBuf-RX series flips this on
+    // (see uni_net_driver::NicIobufRxOps).
+    iobuf_rx: None,
 };
 
 uni_net_driver::register_ethernet_driver!(VIRTIO_NET_OPS);

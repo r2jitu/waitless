@@ -2370,6 +2370,10 @@ static GVE_OPS: NicOps = NicOps {
     poke_interrupt_status: noop,
     idle: None,
     diag: Some(&GVE_DIAG_OPS),
+    // Zero-copy RX not yet wired (gve's QPL has the right shape
+    // for it — buffers stay mapped across descriptor reposts —
+    // but virtio-net is the simpler first port).
+    iobuf_rx: None,
 };
 
 fn noop() {}
