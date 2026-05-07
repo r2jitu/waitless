@@ -247,6 +247,27 @@ impl TrafficKey {
         tls_crypto::chacha20poly1305_seal(&self.key, &nonce, aad, data)
     }
 
+    /// Scatter-gather variant of [`Self::seal`]. Encrypts `body` and
+    /// `trailer` in place as if they were a single concatenated
+    /// plaintext, computes one Poly1305 tag over the AAD + combined
+    /// ciphertext, and returns it. Auto-increments `seq`.
+    ///
+    /// Lets the TLS record layer assemble a record across two
+    /// IOBufs (body without tailroom for the inner-content-type
+    /// byte + AEAD tag, plus a small dedicated trailer IOBuf) so
+    /// app-side body IOBufs don't need to leave space for
+    /// transport framing.
+    pub fn seal_split(
+        &mut self,
+        aad: &[u8],
+        body: &mut [u8],
+        trailer: &mut [u8],
+    ) -> [u8; 16] {
+        let nonce = self.nonce_for_seq(self.seq);
+        self.seq = self.seq.wrapping_add(1);
+        tls_crypto::chacha20poly1305_seal_split(&self.key, &nonce, aad, body, trailer)
+    }
+
     /// Open `data` in place; returns Err on tag mismatch. Auto-increments
     /// `seq` on success.
     pub fn open(&mut self, aad: &[u8], data: &mut [u8], tag: &[u8; 16]) -> Result<(), ()> {

@@ -473,6 +473,37 @@ impl TlsServer {
             .map_err(|e| e.into())
     }
 
+    /// Scatter-gather sibling of [`Self::send_app_data_iobuf`].
+    /// Seals across two IOBufs:
+    ///
+    ///   * `body` holds the plaintext on input. Needs `headroom >=
+    ///     HEADER_LEN` (5) so the TLS record header gets prepended in
+    ///     place. **No tailroom required** — the inner-content-type
+    ///     byte and the AEAD tag go in `trailer`.
+    ///   * `trailer` is the caller's small dedicated trailer IOBuf
+    ///     with `tailroom >= 1 + TAG_LEN` (17). Starts empty.
+    ///
+    /// On `Ok`:
+    ///   * `body.data()` is `[record_header || ciphertext]`.
+    ///   * `trailer.data()` is `[encrypted_type || aead_tag]`.
+    ///
+    /// Single-record only — the caller chunks oversized payloads.
+    pub fn send_app_data_iobuf_split(
+        &mut self,
+        body: &mut uni_iobuf::IOBuf,
+        trailer: &mut uni_iobuf::IOBuf,
+    ) -> Result<(), HandshakeError> {
+        if self.state != State::Established {
+            return Err(HandshakeError::UnexpectedRecord);
+        }
+        let tk = self
+            .server_ap_tk
+            .as_mut()
+            .ok_or(HandshakeError::Internal)?;
+        record::seal_in_place_split(tk, content_type::APPLICATION_DATA, body, trailer)
+            .map_err(|e| e.into())
+    }
+
     /// Encrypt `plaintext` into a TLSCiphertext application_data record
     /// and append it to the TX buffer. Only valid in `Established` state.
     pub fn send_app_data(&mut self, plaintext: &[u8]) -> Result<(), HandshakeError> {

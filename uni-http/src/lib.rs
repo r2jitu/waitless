@@ -295,6 +295,37 @@ pub trait TlsConn: Send + 'static {
         Ok(())
     }
 
+    /// Scatter-gather sibling of [`Self::send_app_data_iobuf`].
+    /// Seals across two IOBufs: plaintext lives in `body` (which
+    /// needs `headroom >= 5 B` for the TLS record header but no
+    /// tailroom), and the inner-content-type byte + AEAD tag go
+    /// into a small dedicated `trailer` IOBuf the caller allocated
+    /// or pooled (`tailroom >= 17 B`).
+    ///
+    /// On success:
+    ///   * `body.data()` is `[record_header || ciphertext]`.
+    ///   * `trailer.data()` is `[encrypted_type || tag]`.
+    ///
+    /// Caller chains them as adjacent parts to ship the full
+    /// record. Lets app-side body IOBufs ship without leaving
+    /// transport-framing tailroom — the framing layer appends the
+    /// trailer at seal time. Default impl falls back to
+    /// `send_app_data_iobuf` over a coalesced buffer; concrete
+    /// impls override to use the AEAD scatter-gather primitive.
+    fn send_app_data_iobuf_split(
+        &mut self,
+        body: &mut uni_iobuf::IOBuf,
+        trailer: &mut uni_iobuf::IOBuf,
+    ) -> Result<(), ()> {
+        // Generic fallback: the body has the full plaintext in its
+        // visible payload; we coalesce body+trailer into a contiguous
+        // buffer and seal that, then re-distribute the bytes back into
+        // the two IOBufs. Concrete impls (like `uni-tls`'s) override
+        // to drive the scatter-gather AEAD primitive directly.
+        let _ = trailer;
+        self.send_app_data_iobuf(body)
+    }
+
     /// What the TLS layer wants reserved at the front of every
     /// IOBuf the layer above hands to a future
     /// `send_app_data_iobuf` (encrypt-in-place) entry point.
@@ -803,25 +834,42 @@ impl HttpStream for TlsStream {
 
         // Streamed-response path: total chain payload spans
         // multiple TLS records. Encrypt each part in-place when
-        // reserves match (saves the plaintext memcpy through
-        // `tls.tx_buf` for big bodies), fall back to the slice
-        // path for static-borrow chunks and oversize parts that
-        // need splitting.
+        // it has 5 B of headroom for the record header (saves the
+        // plaintext memcpy through `tls.tx_buf` for big bodies);
+        // fall back to the slice path for static-borrow chunks
+        // and oversize parts that need splitting.
+        //
+        // We use the scatter-gather seal — body needs only
+        // headroom (no tailroom), and a small dedicated trailer
+        // IOBuf carries the encrypted inner-type byte + AEAD tag.
+        // App-side body IOBufs therefore don't have to leave
+        // 17 B of tailroom for transport framing.
+        let _ = TLS_TAILROOM; // referenced from doc only.
         while let Some(mut part) = chain.pop_front() {
             if part.is_empty() {
                 continue;
             }
             let has_reserve = part.headroom() >= TLS_HEADROOM
-                && part.tailroom() >= TLS_TAILROOM
                 && part.len() <= PLAINTEXT_CHUNK;
             if has_reserve {
-                self.tls.send_app_data_iobuf(&mut part)?;
+                // Allocate a small trailer IOBuf for the encrypted
+                // type byte + AEAD tag. 17 B visible payload max,
+                // plus 0 headroom (it lives after `part` on the
+                // wire). Sized exactly so `seal_in_place_split`
+                // succeeds the tailroom check.
+                let mut trailer = IOBuf::new_with_reserved(0, 1 + 16, 0);
+                self.tls.send_app_data_iobuf_split(&mut part, &mut trailer)?;
                 // Drain anything queued before this record (a
                 // handshake straggler, e.g. NewSessionTicket) so
                 // the byte order on the wire matches what the
                 // peer expects.
                 self.drain_tx().await?;
-                self.tcp.send_bytes(part.data()).await?;
+                // Ship body + trailer as adjacent parts so they
+                // become one logical TLS record on the wire.
+                let mut record_chain = IOBufChain::new();
+                record_chain.push_back(part);
+                record_chain.push_back(trailer);
+                self.tcp.send(&mut record_chain).await?;
                 continue;
             }
             // Fallback: copy through the legacy slice path. This

@@ -242,6 +242,92 @@ pub fn seal_in_place(
     Ok(())
 }
 
+/// Scatter-gather sibling of [`seal_in_place`]. Seals across two
+/// IOBufs: the body holds the plaintext (no tailroom needed for
+/// the inner-content-type byte + AEAD tag, but it does need
+/// `headroom >= HEADER_LEN` so we can prepend the record header
+/// in place), and the trailer is a small empty IOBuf the caller
+/// allocates / pools with `tailroom >= 1 + TAG_LEN`.
+///
+/// On success:
+///
+///   * `body.data()` becomes the full TLSCiphertext-prefixed
+///     ciphertext: `[record_header || ciphertext]`.
+///   * `trailer.data()` becomes `[encrypted_inner_type || tag]`.
+///
+/// Caller chains them as adjacent parts to ship the full record.
+///
+/// Lets app-side body IOBufs ship without transport-framing
+/// tailroom — the framing layer appends the trailer IOBuf at
+/// seal time, instead of carving it out of the body's reserved
+/// tail. Encrypts everything in place via the scatter-gather
+/// AEAD; no plaintext-side coalesce.
+pub fn seal_in_place_split(
+    traffic_key: &mut tls::TrafficKey,
+    inner_type: u8,
+    body: &mut uni_iobuf::IOBuf,
+    trailer: &mut uni_iobuf::IOBuf,
+) -> Result<(), RecordError> {
+    let plaintext_len = body.len();
+    if plaintext_len >= MAX_INNER_PLAINTEXT {
+        return Err(RecordError::InputTooLarge);
+    }
+    if body.headroom() < HEADER_LEN {
+        return Err(RecordError::OutputTooSmall);
+    }
+    if trailer.tailroom() < 1 + TAG_LEN {
+        return Err(RecordError::OutputTooSmall);
+    }
+    let inner_len = plaintext_len + 1; // +1 for the type byte (in trailer)
+    let record_len = inner_len + TAG_LEN;
+    if record_len > u16::MAX as usize {
+        return Err(RecordError::RecordTooLarge);
+    }
+
+    // Step 1: write the inner-content-type byte into the trailer
+    // (will be encrypted by the scatter-gather seal below).
+    trailer
+        .append_slice(&[inner_type])
+        .map_err(|_| RecordError::OutputTooSmall)?;
+
+    // Step 2: encrypt body (plaintext) + trailer (just the type
+    // byte, for now) in place with one ChaCha20 keystream. AAD is
+    // the (yet-to-be-prepended) record header.
+    let aad = make_aad(record_len as u16);
+    let body_data = body
+        .data_mut()
+        .ok_or(RecordError::OutputTooSmall)?;
+    // Take exclusive borrow of trailer's bytes for the seal call.
+    // After step 1 the trailer's visible payload is exactly the
+    // 1-byte type marker.
+    let trailer_data = trailer
+        .data_mut()
+        .ok_or(RecordError::OutputTooSmall)?;
+    // `seal_split` encrypts in place over (body || trailer) as a
+    // single logical stream and returns the AEAD tag.
+    let tag = traffic_key.seal_split(&aad, body_data, trailer_data);
+
+    // Step 3: append the AEAD tag into the trailer's tailroom.
+    // After this the trailer's visible payload is
+    // (encrypted_type_byte || tag) — `1 + TAG_LEN` bytes total.
+    trailer
+        .append_slice(&tag)
+        .map_err(|_| RecordError::OutputTooSmall)?;
+
+    // Step 4: prepend the TLSCiphertext record header into the
+    // body's headroom. The `length` field covers (ciphertext ||
+    // type || tag), exactly `record_len`. After this the body's
+    // visible payload is `[record_header || ciphertext]` and the
+    // chain layout (body, trailer) is the full record.
+    let mut hdr = [0u8; HEADER_LEN];
+    hdr[0] = OPAQUE_TYPE;
+    hdr[1..3].copy_from_slice(&LEGACY_RECORD_VERSION.to_be_bytes());
+    hdr[3..5].copy_from_slice(&(record_len as u16).to_be_bytes());
+    body.prepend(&hdr).map_err(|_| RecordError::OutputTooSmall)?;
+
+    Ok(())
+}
+
 /// Decrypt the TLSCiphertext record at the start of `input` with
 /// `traffic_key`. On success returns `(inner_type, plaintext_slice,
 /// bytes_consumed)`.
