@@ -609,83 +609,99 @@ event on the serial console.</p>";
 }
 
 fn page_diagnostics() -> Response {
-    // Build the body dynamically — every visit reflects current
-    // counters / heap / NIC state at the moment of request.
-    let mut body = String::with_capacity(8192);
-    // Auto-refresh every 5 s. Refresh stays paused if the user
-    // navigates away and comes back.
-    body.push_str("\
+    // Build the dynamic body straight into an IOBuf with reserved
+    // headroom + tailroom for the TLS record envelope. The previous
+    // version allocated a `String::with_capacity(8192)`, grew it as
+    // content exceeded that, then `Body::from` copied the bytes
+    // into a fresh IOBuf — two allocs + one large memcpy. With
+    // `IOBufWriter`, `write!` renders directly into the buffer's
+    // payload region; `TlsStream::send_iobuf` then takes the
+    // encrypt-in-place path on the chunk (saves the plaintext-into-
+    // tx_buf memcpy too).
+    use uni_http::{IOBuf, MAX_HEADER_RESERVE as HDR, MAX_TRAILER_RESERVE as TRL};
+    use core::fmt::Write as _;
+
+    // 12 KiB payload capacity covers the worst-case rendered
+    // diagnostics page (~9 KiB observed); past that the writer
+    // truncates and we fall back to a clean response. Total IOBuf
+    // storage: 5 + 12288 + 17 = 12310 B.
+    const PAYLOAD_CAP: usize = 12 * 1024;
+    let mut body = IOBuf::new_with_reserved(HDR, PAYLOAD_CAP, TRL);
+    {
+        let mut w = body.writer();
+
+        let _ = w.write_str("\
 <h1>Diagnostics</h1>\
 <p class=\"lead\">Live counters from the unikernel. This page \
 auto-refreshes every 5 seconds; raw JSON endpoints below.</p>\
 <meta http-equiv=\"refresh\" content=\"5\">");
 
-    // ── Heap ──────────────────────────────────────────────────────
-    let heap = uni::diagnostics::heap_stats();
-    body.push_str("<h2>Heap</h2><table>");
-    body.push_str("<tr><th>Field</th><th>Value</th></tr>");
-    let _ = write!(body,
-        "<tr><td>allocated</td><td class=\"num\">{} B ({} KiB)</td></tr>",
-        heap.allocated_bytes, heap.allocated_bytes / 1024);
-    let _ = write!(body,
-        "<tr><td>available</td><td class=\"num\">{} B ({} KiB)</td></tr>",
-        heap.available_bytes, heap.available_bytes / 1024);
-    let _ = write!(body,
-        "<tr><td>claimed (heap size)</td><td class=\"num\">{} B ({} KiB)</td></tr>",
-        heap.claimed_bytes, heap.claimed_bytes / 1024);
-    let _ = write!(body,
-        "<tr><td>live allocations</td><td class=\"num\">{}</td></tr>",
-        heap.allocation_count);
-    let _ = write!(body,
-        "<tr><td>fragments</td><td class=\"num\">{}</td></tr>",
-        heap.fragment_count);
-    let _ = write!(body,
-        "<tr><td>total allocations (lifetime)</td><td class=\"num\">{}</td></tr>",
-        heap.total_allocation_count);
-    body.push_str("</table>");
-    body.push_str("<p><a href=\"/heap\"><code>/heap</code></a> · raw JSON</p>");
+        // ── Heap ──────────────────────────────────────────────────────
+        let heap = uni::diagnostics::heap_stats();
+        let _ = w.write_str("<h2>Heap</h2><table>");
+        let _ = w.write_str("<tr><th>Field</th><th>Value</th></tr>");
+        let _ = write!(w,
+            "<tr><td>allocated</td><td class=\"num\">{} B ({} KiB)</td></tr>",
+            heap.allocated_bytes, heap.allocated_bytes / 1024);
+        let _ = write!(w,
+            "<tr><td>available</td><td class=\"num\">{} B ({} KiB)</td></tr>",
+            heap.available_bytes, heap.available_bytes / 1024);
+        let _ = write!(w,
+            "<tr><td>claimed (heap size)</td><td class=\"num\">{} B ({} KiB)</td></tr>",
+            heap.claimed_bytes, heap.claimed_bytes / 1024);
+        let _ = write!(w,
+            "<tr><td>live allocations</td><td class=\"num\">{}</td></tr>",
+            heap.allocation_count);
+        let _ = write!(w,
+            "<tr><td>fragments</td><td class=\"num\">{}</td></tr>",
+            heap.fragment_count);
+        let _ = write!(w,
+            "<tr><td>total allocations (lifetime)</td><td class=\"num\">{}</td></tr>",
+            heap.total_allocation_count);
+        let _ = w.write_str("</table>");
+        let _ = w.write_str("<p><a href=\"/heap\"><code>/heap</code></a> · raw JSON</p>");
 
-    // ── NIC RX queues ─────────────────────────────────────────────
-    let counts = uni::diagnostics::net_rx_counts();
-    let cursors = uni::diagnostics::net_rx_used_cursors();
-    let nqp = uni::diagnostics::net_num_queue_pairs() as usize;
-    let nqp_clamped = nqp.min(counts.len()).min(cursors.len());
-    body.push_str("<h2>NIC RX queues</h2>");
-    let _ = write!(body, "<p>{} queue pair{} negotiated.</p>",
-        nqp, if nqp == 1 { "" } else { "s" });
-    body.push_str("<table><tr><th>Queue</th><th>Frames RX'd</th>\
+        // ── NIC RX queues ─────────────────────────────────────────────
+        let counts = uni::diagnostics::net_rx_counts();
+        let cursors = uni::diagnostics::net_rx_used_cursors();
+        let nqp = uni::diagnostics::net_num_queue_pairs() as usize;
+        let nqp_clamped = nqp.min(counts.len()).min(cursors.len());
+        let _ = w.write_str("<h2>NIC RX queues</h2>");
+        let _ = write!(w, "<p>{} queue pair{} negotiated.</p>",
+            nqp, if nqp == 1 { "" } else { "s" });
+        let _ = w.write_str("<table><tr><th>Queue</th><th>Frames RX'd</th>\
 <th>Used (device)</th><th>Used (driver)</th></tr>");
-    for i in 0..nqp_clamped {
-        let _ = write!(body,
-            "<tr><td>{}</td><td class=\"num\">{}</td>\
+        for i in 0..nqp_clamped {
+            let _ = write!(w,
+                "<tr><td>{}</td><td class=\"num\">{}</td>\
 <td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
-            i, counts[i], cursors[i].0, cursors[i].1);
-    }
-    body.push_str("</table>");
-    body.push_str("<p><a href=\"/stats\"><code>/stats</code></a> · raw JSON</p>");
+                i, counts[i], cursors[i].0, cursors[i].1);
+        }
+        let _ = w.write_str("</table>");
+        let _ = w.write_str("<p><a href=\"/stats\"><code>/stats</code></a> · raw JSON</p>");
 
-    // ── QUIC counters ─────────────────────────────────────────────
-    body.push_str("<h2>QUIC events &amp; drops</h2>");
-    body.push_str("<table><tr><th>Counter</th><th>Value</th></tr>");
-    for (name, value) in uni_quic::diag::snapshot() {
-        let _ = write!(body,
-            "<tr><td><code>{}</code></td><td class=\"num\">{}</td></tr>",
-            name, value);
-    }
-    body.push_str("</table>");
+        // ── QUIC counters ─────────────────────────────────────────────
+        let _ = w.write_str("<h2>QUIC events &amp; drops</h2>");
+        let _ = w.write_str("<table><tr><th>Counter</th><th>Value</th></tr>");
+        for (name, value) in uni_quic::diag::snapshot() {
+            let _ = write!(w,
+                "<tr><td><code>{}</code></td><td class=\"num\">{}</td></tr>",
+                name, value);
+        }
+        let _ = w.write_str("</table>");
 
-    // ── HTTP/3 counters ───────────────────────────────────────────
-    body.push_str("<h2>HTTP/3 events &amp; drops</h2>");
-    body.push_str("<table><tr><th>Counter</th><th>Value</th></tr>");
-    for (name, value) in uni_http3::diag::snapshot() {
-        let _ = write!(body,
-            "<tr><td><code>{}</code></td><td class=\"num\">{}</td></tr>",
-            name, value);
+        // ── HTTP/3 counters ───────────────────────────────────────────
+        let _ = w.write_str("<h2>HTTP/3 events &amp; drops</h2>");
+        let _ = w.write_str("<table><tr><th>Counter</th><th>Value</th></tr>");
+        for (name, value) in uni_http3::diag::snapshot() {
+            let _ = write!(w,
+                "<tr><td><code>{}</code></td><td class=\"num\">{}</td></tr>",
+                name, value);
+        }
+        let _ = w.write_str("</table>");
+        let _ = w.write_str("<p><a href=\"/quic_stats\"><code>/quic_stats</code></a> · raw JSON · ");
+        let _ = w.write_str("<a href=\"/tls_profile\"><code>/tls_profile</code></a> · TLS handshake timing</p>");
     }
-    body.push_str("</table>");
-    body.push_str("<p><a href=\"/quic_stats\"><code>/quic_stats</code></a> · raw JSON · ");
-    body.push_str("<a href=\"/tls_profile\"><code>/tls_profile</code></a> · TLS handshake timing</p>");
-
     html_response("/diagnostics", "Diagnostics", body)
 }
 
