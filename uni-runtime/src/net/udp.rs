@@ -206,6 +206,36 @@ impl WorkerInbox {
         true
     }
 
+    /// Take the head slot's `IOBuf` out and hand ownership to the
+    /// caller. Caller can then `data()` the bytes, move the IOBuf
+    /// into its own state, or pass it through to a layer (TLS,
+    /// QUIC) that wants to decrypt-in-place. Releases the slot
+    /// for the next push as soon as the caller drops the IOBuf.
+    fn pop_iobuf(&self) -> Option<(IpAddr, u16, uni_iobuf::IOBuf)> {
+        let slots_ptr = self.slots.load(Ordering::Acquire);
+        if slots_ptr.is_null() {
+            return None;
+        }
+        let mask = self.mask.load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Acquire);
+        if head == tail {
+            return None;
+        }
+        // SAFETY: SPSC — consumer owns the head slot until the
+        // Release store below. We have exclusive access for the
+        // duration of `take()` and the field reads. The producer
+        // can't observe the head advance until our Release store,
+        // and won't overwrite this slot before then.
+        let slot = unsafe { &mut *slots_ptr.add(head as usize) };
+        let iobuf = slot.iobuf.take()?;
+        let src_ip = slot.src_ip;
+        let src_port = slot.src_port;
+        let next = head.wrapping_add(1) & mask;
+        self.head.store(next, Ordering::Release);
+        Some((src_ip, src_port, iobuf))
+    }
+
     fn pop_into(&self, buf: &mut [u8]) -> Option<(IpAddr, u16, usize)> {
         let slots_ptr = self.slots.load(Ordering::Acquire);
         if slots_ptr.is_null() {
@@ -857,6 +887,28 @@ impl UdpSocket {
         }
     }
 
+    /// Await one datagram and hand the caller the underlying
+    /// [`uni_iobuf::IOBuf`] — no copy. The IOBuf's `data()` is the
+    /// UDP body. Caller can `consume(n)` to strip protocol headers
+    /// in place (QUIC long/short headers, DNS prefix, etc.) and
+    /// keep the IOBuf as long as needed; on drop the buffer
+    /// returns to the driver pool (or the heap allocator on the
+    /// native-backend path).
+    ///
+    /// The `&mut [u8]` shape of `recv_from` requires a memcpy at
+    /// the user-API boundary even though everything below it is
+    /// zero-copy. This variant skips that copy: the IOBuf is moved
+    /// straight from the inbox slot into the caller's hands. Use
+    /// it when you'd otherwise feed the recv'd bytes to a layer
+    /// that wants in-place mutation (TLS unprotect, QUIC AEAD
+    /// open).
+    pub fn recv_iobuf(&self) -> UdpRecvIobuf<'_> {
+        UdpRecvIobuf {
+            sock: self,
+            _not_send: PhantomData,
+        }
+    }
+
     /// Zero-copy receive: await one datagram, then invoke `f` with
     /// a slice borrow of the payload (and its source) sitting in
     /// the inbox slot — no copy into a user buffer. The closure
@@ -889,6 +941,17 @@ impl UdpSocket {
         let cc = CurrentWorker::enter();
         let inbox = self.current_inbox(&cc);
         inbox.pop_into(buf)
+    }
+
+    /// Non-blocking IOBuf-returning recv. Returns
+    /// `Some((src_ip, src_port, iobuf))` if a datagram was waiting,
+    /// `None` otherwise. Useful inside drain loops that pull every
+    /// queued datagram into a local Vec for batch processing.
+    pub fn try_recv_iobuf(&self) -> Option<(IpAddr, u16, uni_iobuf::IOBuf)> {
+        let _: PhantomData<*mut ()> = PhantomData;
+        let cc = CurrentWorker::enter();
+        let inbox = self.current_inbox(&cc);
+        inbox.pop_iobuf()
     }
 
     /// Non-blocking zero-copy recv via closure. Returns the
@@ -1229,6 +1292,46 @@ impl<'a> Future for UdpRecv<'a> {
         // and the waker registration.
         inbox.park_waker(cx.waker());
         if let Some(r) = inbox.pop_into(this.buf) {
+            inbox.unpark();
+            return Poll::Ready(r);
+        }
+        Poll::Pending
+    }
+}
+
+/// Future returned by [`UdpSocket::recv_iobuf`]. Resolves with the
+/// owned `IOBuf` lifted out of the inbox slot — no memcpy at the
+/// user-API boundary. `!Send` for the same reason as [`UdpRecv`]:
+/// the per-worker inbox semantics require staying on the worker
+/// where we first polled.
+pub struct UdpRecvIobuf<'a> {
+    sock: &'a UdpSocket,
+    _not_send: PhantomData<*mut ()>,
+}
+
+impl<'a> Future for UdpRecvIobuf<'a> {
+    type Output = (IpAddr, u16, uni_iobuf::IOBuf);
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let cc = CurrentWorker::enter();
+        let inbox = match this.sock.slot {
+            SlotRef::Server(idx) => {
+                UDP_REGISTRY[idx as usize].inboxes.current(&cc)
+            }
+            SlotRef::Ephemeral { worker, slot_idx } => {
+                let slot = lookup_eph_position(worker, slot_idx)
+                    .expect("ephemeral slot vanished mid-recv");
+                debug_assert_eq!(cc.id(), worker);
+                &slot.inbox
+            }
+        };
+
+        if let Some(r) = inbox.pop_iobuf() {
+            return Poll::Ready(r);
+        }
+        inbox.park_waker(cx.waker());
+        if let Some(r) = inbox.pop_iobuf() {
             inbox.unpark();
             return Poll::Ready(r);
         }
