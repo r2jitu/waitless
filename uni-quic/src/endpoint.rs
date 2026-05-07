@@ -570,6 +570,7 @@ async fn listener_loop<H, F>(
         let task_cfg = cfg.clone();
         let task_handler = handler.clone();
         let task_recycle = recycle_pool.clone();
+        let task_slots = slots.clone();
         let _ = spawn(conn_task::<H, F>(
             task_inbox,
             task_sock,
@@ -579,6 +580,9 @@ async fn listener_loop<H, F>(
             local_cid_bytes,
             seed,
             task_recycle,
+            task_slots,
+            slot_idx,
+            generation,
         ));
     }
 }
@@ -596,6 +600,9 @@ async fn conn_task<H, F>(
     local_cid_bytes: [u8; SERVER_CID_LEN],
     seed: [u8; 32],
     recycle_pool: RecyclePool,
+    slots: Rc<SlotTable>,
+    slot_idx: u16,
+    generation: u16,
 ) where
     H: Fn(QuicConn) -> F + Send + Sync + 'static,
     F: Future<Output = ()> + 'static,
@@ -796,9 +803,13 @@ async fn conn_task<H, F>(
         }
     }
     progress.set();
-    // Inbox closed or fatal error — drop everything. The slot
-    // table's Weak pointer to `inbox` will fail to upgrade on the
-    // next allocator pass, freeing the slot implicitly.
+    // Conn task exiting — explicitly return the slot to the pool's
+    // free list and decrement its per-IP counter. The slot table's
+    // `Weak<ConnInbox>` will also fail to upgrade after we drop our
+    // strong Rc above, but that's a lookup-time signal (lookups
+    // return None) — the explicit `free_slot` is what makes the
+    // slot reusable for the next incoming Initial in O(1).
+    slots.free_slot(slot_idx, generation);
 }
 
 // ============================================================================
