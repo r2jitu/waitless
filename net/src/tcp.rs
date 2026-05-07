@@ -1349,16 +1349,25 @@ pub fn async_try_send(handle: *mut (), generation: u16, buf: &[u8]) -> isize {
     if n < 0 { -1 } else { n as isize }
 }
 
-/// Async `TcpSendChain` try-send hook. Walks `chain`'s bytes via
+/// Async `TcpSendChain` try-send hook. Walks `chain[skip..]` via
 /// its cursor and emits MSS-sized TCP segments by copying directly
 /// from chain nodes into each segment's payload area — no
-/// user-space scratch coalesce. Drains `chain` on success (every
-/// part popped + dropped, so `External` IOBufs return their
-/// backing storage to the driver pool in chain order).
+/// user-space scratch coalesce. Read-only on `chain` (matches
+/// POSIX `writev`'s "buffer is yours, I'll just read it"
+/// semantics); the wrapping `TcpSendChain` future is what
+/// eventually drops the chain's parts.
+///
+/// Bare-metal's NIC TX never blocks under this stack's load model,
+/// so this always sends `chain.total_len() - skip` bytes (or `-1`
+/// on a dead conn / stale `gen`). The `skip` parameter is here
+/// for symmetry with the trait — backends that *can* return
+/// partial sends (native's `writev`) need it; this one threads
+/// it through unchanged.
 pub fn async_try_send_chain(
     handle: *mut (),
     generation: u16,
-    chain: &mut uni_iobuf::IOBufChain,
+    chain: &uni_iobuf::IOBufChain,
+    skip: usize,
 ) -> isize {
     let (core, slot) = match decode_handle(handle) {
         Some(v) => v,
@@ -1375,15 +1384,20 @@ pub fn async_try_send_chain(
     }
 
     let total = chain.total_len();
-    if total == 0 {
+    if skip >= total {
         return 0;
     }
+    let to_send = total - skip;
 
     let mss = mss_for(c.local_ip);
     let mut cursor = chain.cursor();
+    if skip > 0 {
+        let advanced = cursor.advance(skip);
+        debug_assert_eq!(advanced, skip);
+    }
     let mut sent = 0usize;
-    while sent < total {
-        let chunk = (total - sent).min(mss);
+    while sent < to_send {
+        let chunk = (to_send - sent).min(mss);
         send_segment_from_cursor(
             c.local_ip,
             c.remote_ip,
@@ -1399,14 +1413,6 @@ pub fn async_try_send_chain(
         c.snd_nxt = c.snd_nxt.wrapping_add(chunk as u32);
         sent += chunk;
     }
-
-    // Bytes are on the wire; release every part's backing storage.
-    // Dropping in chain order matches the legacy single-buffer
-    // `send` path (which dropped the caller-supplied slice's
-    // backing) and matters for `External` IOBufs whose drop
-    // callbacks recycle NIC RX descriptors back to the driver
-    // pool.
-    chain.clear();
     sent as isize
 }
 

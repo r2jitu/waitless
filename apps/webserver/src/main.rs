@@ -21,7 +21,7 @@ use core::fmt::Write as _;
 
 use uni::net::Net;
 use uni::runtime::{TcpStream, UdpClient};
-use uni_http::{Body, Request, Response};
+use uni_http::{IOBufChain, Request, Response};
 
 // ---- Configuration ----------------------------------------------------------
 
@@ -346,21 +346,21 @@ const SHELL_NAV_MAIN: &[u8] = b"</nav><main>";
 const SHELL_FOOTER: &[u8] =
     b"</main><footer><span>UniKernel v0.1.0 \xC2\xB7 bare-metal Rust \xC2\xB7 no OS, no syscalls</span><span><a href=\"/diagnostics\">Live stats \xE2\x86\x92</a></span></footer></body></html>";
 
-/// Build a Body for the page shell, taking the page title and
-/// the body Body builder. The shell's static chrome is queued
-/// by reference (zero alloc, zero copy) — only the bits that
-/// vary per page (title, nav-link active-class flip) get
+/// Build an `IOBufChain` for the page shell, taking the page
+/// title and the inner-page body. The shell's static chrome is
+/// queued by reference (zero alloc, zero copy) — only the bits
+/// that vary per page (title, nav-link active-class flip) get
 /// allocated.
 ///
 /// Heap-owned chunks are rendered directly into IOBufs with
 /// TLS record headroom (5 B) + tailroom (17 B = 1 type byte +
-/// 16 B AEAD tag). `TlsStream::send_iobuf` then takes the
+/// 16 B AEAD tag). `TlsStream::send_chain` then takes the
 /// encrypt-in-place path on those parts: no plaintext memcpy
 /// into `tls.tx_buf`, AEAD seals straight into the IOBuf the
 /// app handed up. Static parts can't be sealed in place
 /// (immutable storage); they fall back to the slice-based
 /// path transparently.
-fn shell_body(active: &str, title: &str, body: Body) -> Body {
+fn shell_body(active: &str, title: &str, body: IOBufChain) -> IOBufChain {
     use uni_http::{IOBuf, MAX_HEADER_RESERVE as HDR, MAX_TRAILER_RESERVE as TRL};
     use core::fmt::Write as _;
 
@@ -382,25 +382,24 @@ fn shell_body(active: &str, title: &str, body: Body) -> Body {
         }
     }
 
-    let mut b = Body::with_capacity(8 + body.parts_len());
-    b = b.push_static(SHELL_HEAD_BEFORE_TITLE);
-    b = b.push(title_buf);
-    b = b.push_static(SHELL_HEAD_AFTER_TITLE);
-    b = b.push_static(STYLES.as_bytes());
-    b = b.push_static(SHELL_AFTER_STYLES);
-    b = b.push(nav_buf);
-    b = b.push_static(SHELL_NAV_MAIN);
+    let mut chain = uni_http::IOBufChain::with_capacity(8 + body.part_count());
+    chain.push_static(SHELL_HEAD_BEFORE_TITLE);
+    chain.push_back(title_buf);
+    chain.push_static(SHELL_HEAD_AFTER_TITLE);
+    chain.push_static(STYLES.as_bytes());
+    chain.push_static(SHELL_AFTER_STYLES);
+    chain.push_back(nav_buf);
+    chain.push_static(SHELL_NAV_MAIN);
     // Splice the page body's parts in order. Each is an IOBuf
-    // (static-borrow or heap-owned); `push` accepts any
-    // `Into<IOBuf>`.
-    for part in body.chain.into_parts() {
-        b = b.push(part);
+    // (static-borrow or heap-owned).
+    for part in body.into_parts() {
+        chain.push_back(part);
     }
-    b = b.push_static(SHELL_FOOTER);
-    b
+    chain.push_static(SHELL_FOOTER);
+    chain
 }
 
-fn html_response(active: &str, title: &str, body: impl Into<Body>) -> Response {
+fn html_response(active: &str, title: &str, body: impl Into<uni_http::IOBufChain>) -> Response {
     Response::ok(b"text/html; charset=utf-8", shell_body(active, title, body.into()))
 }
 

@@ -639,13 +639,8 @@ fn write_response(
     // Queue each body chunk on the QUIC stream. Static borrows
     // stay borrowed; heap-owned chunks move via send_iobuf.
     if body_len > 0 {
-        match resp.into_body() {
-            uni_http::ResponseBody::Single(b) => queue_chunk(conn, sid, b),
-            uni_http::ResponseBody::Chain(chain) => {
-                for part in chain.into_parts() {
-                    queue_chunk(conn, sid, part);
-                }
-            }
+        for part in resp.into_body().into_parts() {
+            queue_chunk(conn, sid, part);
         }
     }
     // FIN is set by close_stream; the next pop_chunk_into emits

@@ -931,6 +931,41 @@ impl IOBufChain {
         self.parts
     }
 
+    /// Convenience: append a `&'static [u8]` part. Borrowed,
+    /// zero-alloc (the chain still allocates its `VecDeque`
+    /// backing on first push).
+    pub fn push_static(&mut self, s: &'static [u8]) {
+        self.push_back(IOBuf::from_static(s));
+    }
+
+    /// Convenience: append a `Vec<u8>` part. Move-no-copy when
+    /// `len == capacity`; reallocates to fit otherwise.
+    pub fn push_owned(&mut self, v: alloc::vec::Vec<u8>) {
+        self.push_back(IOBuf::from(v));
+    }
+
+    /// Convenience: append a `String`'s underlying bytes.
+    pub fn push_string(&mut self, s: alloc::string::String) {
+        self.push_back(IOBuf::from(s.into_bytes()));
+    }
+
+    /// Append a payload as a heap-owned IOBuf with reserved
+    /// `headroom` and `tailroom` for layers below to prepend or
+    /// append in place. Use when the part will be sealed by TLS:
+    /// pass `MAX_HEADER_RESERVE` (covers TLS record header +
+    /// downstream layers) and `MAX_TRAILER_RESERVE` (covers the
+    /// AEAD tag) so `TlsStream::send_chain`'s encrypt-in-place
+    /// path applies. One heap alloc per chunk (sized for payload
+    /// + reserve); the visible `data()` is exactly `payload`.
+    pub fn push_with_reserve(
+        &mut self,
+        payload: &[u8],
+        headroom: usize,
+        tailroom: usize,
+    ) {
+        self.push_back(IOBuf::from_slice_with_headroom(headroom, payload, tailroom));
+    }
+
     /// Construct a `Cursor` for reading.
     pub fn cursor(&self) -> Cursor<'_> {
         Cursor {
@@ -945,6 +980,61 @@ impl IOBufChain {
 impl Default for IOBufChain {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ---- IOBufChain From<X> conversions ---------------------------------
+//
+// Every shape an HTTP body / response can land in flattens to a
+// 1-part chain via these. Apps build chains directly:
+//
+//   Response::ok(b"text/plain", b"hello")          // &'static [u8]
+//   Response::ok(b"text/plain", rendered)          // String / Vec<u8>
+//   Response::ok(b"text/html", chain)              // multi-part
+//
+// without picking a method based on body shape.
+
+impl From<IOBuf> for IOBufChain {
+    fn from(b: IOBuf) -> Self {
+        let mut c = IOBufChain::with_capacity(1);
+        c.push_back(b);
+        c
+    }
+}
+
+impl From<&'static [u8]> for IOBufChain {
+    fn from(s: &'static [u8]) -> Self {
+        IOBuf::from_static(s).into()
+    }
+}
+
+impl<const N: usize> From<&'static [u8; N]> for IOBufChain {
+    fn from(s: &'static [u8; N]) -> Self {
+        IOBuf::from_static(s).into()
+    }
+}
+
+impl From<&'static str> for IOBufChain {
+    fn from(s: &'static str) -> Self {
+        IOBuf::from_static(s.as_bytes()).into()
+    }
+}
+
+impl From<alloc::vec::Vec<u8>> for IOBufChain {
+    fn from(v: alloc::vec::Vec<u8>) -> Self {
+        IOBuf::from(v).into()
+    }
+}
+
+impl From<alloc::boxed::Box<[u8]>> for IOBufChain {
+    fn from(b: alloc::boxed::Box<[u8]>) -> Self {
+        IOBuf::from(b.into_vec()).into()
+    }
+}
+
+impl From<alloc::string::String> for IOBufChain {
+    fn from(s: alloc::string::String) -> Self {
+        IOBuf::from(s.into_bytes()).into()
     }
 }
 
@@ -1112,14 +1202,6 @@ impl From<alloc::vec::Vec<u8>> for IOBuf {
 impl From<alloc::string::String> for IOBuf {
     fn from(s: alloc::string::String) -> Self {
         IOBuf::from(s.into_bytes())
-    }
-}
-
-impl From<IOBuf> for IOBufChain {
-    fn from(buf: IOBuf) -> Self {
-        let mut c = IOBufChain::new();
-        c.push_back(buf);
-        c
     }
 }
 
