@@ -371,16 +371,20 @@ async fn handle_request<H, F>(
 /// alignment-friendly bookends.
 const H3_FRAME_HEADER_MAX: usize = 16;
 
-/// Conservative cap on the QPACK body for a typical 3-header
-/// response (`:status`, `content-type`, `content-length`).
-/// Any one literal value past this would overflow; the
-/// `encode_field_section_into` call below returns
-/// `QpackError::Truncated` and we fall back to closing the
-/// stream cleanly. 1 KiB covers our biggest content-type
-/// (`text/html; charset=utf-8`) plus indexed/literal-name
-/// references for `content-length` and `:status` with room to
-/// spare.
-const QPACK_BODY_RESERVE: usize = 1024;
+/// Cap on the QPACK body for a typical response. The default
+/// 3-header response (`:status`, `content-type`, `content-
+/// length`) encodes to ~25-30 bytes; each app-side
+/// `Response::with_header` adds a literal-name + value (≈
+/// `2 + name.len() + value.len()` bytes). 256 covers the
+/// default + ~6 typical extra headers (Alt-Svc, Cache-Control,
+/// ETag, etc.) before overflow; oversize headers surface as
+/// `qpack_encode_overflow` and the stream closes cleanly.
+///
+/// Sized small intentionally — this is the per-request IOBuf's
+/// payload region, allocated fresh per response. Smaller bucket
+/// → smaller fragmentation footprint → cheaper allocator
+/// path. Trim further if profiling shows headroom.
+const QPACK_BODY_RESERVE: usize = 256;
 
 fn write_response(conn: &QuicConn, sid: u64, resp: Response) {
     // Build the response framing as a single IOBuf with

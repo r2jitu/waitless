@@ -401,6 +401,68 @@ pub const MAX_HEADER_RESERVE: usize = 128;
 /// its own trailer we'll bump.
 pub const MAX_TRAILER_RESERVE: usize = 16;
 
+// ============================================================================
+// Per-layer MTU / headroom negotiation
+// ============================================================================
+
+/// What each layer of the network stack publishes to the layer
+/// above. The layer above (the producer) consults these fields
+/// when allocating an `IOBuf` so every lower layer's `prepend`
+/// in headroom and `append` in tailroom fits without
+/// reallocating.
+///
+/// Concrete numbers come out of each layer's protocol header
+/// shape: TCP wants 20 B headroom + 0 tailroom, IPv6 wants
+/// 40 B headroom + 0, TLS 1.3 wants 5 B headroom + 16 B
+/// tailroom for the AEAD tag, etc. The `compose` helper sums a
+/// stack of LayerReserve values into the cumulative reserve a
+/// producer should request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayerReserve {
+    /// Bytes the layer wants reserved at the front of every
+    /// payload it ships. The layer's `send` method prepends
+    /// its header into these bytes.
+    pub headroom: usize,
+    /// Bytes the layer wants reserved at the back. AEAD tags
+    /// + trailers go here.
+    pub tailroom: usize,
+    /// Maximum payload bytes the layer can accept from the layer
+    /// above for a single send call (i.e. before fragmentation
+    /// kicks in). For TLS this is the record body size limit;
+    /// for TCP it's the MSS.
+    pub max_payload: usize,
+}
+
+impl LayerReserve {
+    /// Identity / no-op layer — zero overhead, unbounded payload.
+    /// Useful as a default for layers that don't add framing.
+    pub const PASSTHROUGH: Self = LayerReserve {
+        headroom: 0,
+        tailroom: 0,
+        max_payload: usize::MAX,
+    };
+}
+
+// (Composition of multiple layers' reserves — "app over TLS over
+// TCP — what's the cumulative headroom?" — is intentionally
+// omitted from this commit. The arithmetic depends on whether
+// we want "max per send call" semantics or "fit entirely in one
+// lower-layer packet" semantics, and the right answer differs by
+// layer pair. We'll add a concrete `compose_for_*` helper when
+// the first consumer needs it.)
+
+/// Trait every layer that wraps a payload implements so its
+/// own consumers (the layer above) can ask "how much space
+/// should I reserve in the IOBuf I hand to your `send`?". The
+/// network stack walks this top-down at conn-establish time;
+/// the producer caches the resulting `LayerReserve` and uses
+/// its `headroom` / `tailroom` to size body buffers.
+pub trait LayerInfo {
+    /// What this layer plus all layers below it reserve. The
+    /// layer above queries this to size its outgoing IOBufs.
+    fn layer_reserve(&self) -> LayerReserve;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IOBufError {
     NoHeadroom,
@@ -882,6 +944,14 @@ mod tests {
         // Treat as a smoke test of the conversion direction.
         assert_eq!(buf.data(), &[1u8, 2, 3, 4, 5]);
         let _ = ptr_before;
+    }
+
+    #[test]
+    fn layer_reserve_passthrough_constants() {
+        let p = LayerReserve::PASSTHROUGH;
+        assert_eq!(p.headroom, 0);
+        assert_eq!(p.tailroom, 0);
+        assert_eq!(p.max_payload, usize::MAX);
     }
 
     #[test]
