@@ -190,7 +190,7 @@ async fn tcp_echo(stream: TcpStream) {
         let Some(n) = uni::runtime::timeout_us(30_000_000, stream.recv(&mut buf)).await
         else { return; };
         if n == 0 { return; }
-        if stream.send(&buf[..n]).await.is_err() { return; }
+        if stream.send_bytes(&buf[..n]).await.is_err() { return; }
     }
 }
 
@@ -204,7 +204,7 @@ async fn gateway(stream: TcpStream, backend_ip: [u8; 4]) {
         if stream.recv_exact(&mut buf).await.is_err() { return; }
         if udp.send(&buf).is_err() { return; }
         if udp.recv(&mut buf).await != GATEWAY_MSG_SIZE { return; }
-        if stream.send(&buf).await.is_err() { return; }
+        if stream.send_bytes(&buf).await.is_err() { return; }
     }
 }
 

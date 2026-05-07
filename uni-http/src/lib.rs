@@ -283,7 +283,7 @@ pub struct Response {
     /// chain; multi-part templates push static + dynamic parts
     /// without ever materialising a single contiguous buffer.
     /// `IOBufChain` is the standard transport-side buffer type
-    /// (`HttpStream::send_chain`, `TcpStream::send_chain`) so
+    /// (`HttpStream::send`, `TcpStream::send`) so
     /// the body flows through to the wire with no enum dispatch
     /// or shape-flattening on the way down.
     body: IOBufChain,
@@ -355,7 +355,7 @@ impl Response {
 
     /// Consume the response and yield its body chain. Frontends
     /// drain it via `pop_front`, `iter`, or by appending it to
-    /// an outbound chain (`stream.send_chain(&mut out_chain)`).
+    /// an outbound chain (`stream.send(&mut out_chain)`).
     pub fn into_body(self) -> IOBufChain {
         self.body
     }
@@ -436,20 +436,21 @@ pub trait HttpStream {
     /// app's body chain — and let the transport own the layout
     /// decision.
     ///
-    /// Takes `&mut IOBufChain` rather than consuming it so the
-    /// caller can amortise the `VecDeque` allocation across many
-    /// requests on the same connection. The implementation drains
-    /// the chain (each part `pop_front`'d, then dropped after its
-    /// bytes are committed); on return the chain is empty but the
-    /// underlying `VecDeque` capacity is preserved.
+    /// `IOBufChain` is the standard send surface; takes `&mut`
+    /// so the caller can amortise the `VecDeque` allocation
+    /// across many requests on the same connection. The
+    /// implementation drains the chain (each part `pop_front`'d,
+    /// then dropped after its bytes are committed); on return
+    /// the chain is empty but the underlying `VecDeque` capacity
+    /// is preserved.
     ///
     /// `Err(())` on fatal transport error; the conn handler tears
     /// down on error.
-    async fn send_chain(&mut self, chain: &mut IOBufChain) -> Result<(), ()>;
+    async fn send(&mut self, chain: &mut IOBufChain) -> Result<(), ()>;
 
     /// What this stream's transport stack reserves at the front
     /// and back of every IOBuf the producer ships through
-    /// `send_chain`. Lets the producer size headers/body buffers
+    /// `send`. Lets the producer size headers/body buffers
     /// so each part has enough headroom for the transport's
     /// framing (TLS prepends 5 B record header) and tailroom for
     /// trailers (TLS appends 17 B AEAD tag + inner-content-type)
@@ -476,14 +477,17 @@ impl HttpStream for uni::runtime::TcpStream {
         (*self).recv(buf).await
     }
 
-    async fn send_chain(&mut self, chain: &mut IOBufChain) -> Result<(), ()> {
-        // The runtime's `TcpStream::send_chain` hands the chain to
-        // the backend, which decides chunking. Bare-metal walks
-        // the chain via its cursor and copies bytes directly into
-        // MSS-sized TCP segments (no user-space scratch coalesce);
-        // native uses `writev(2)` so a multi-part shape ships in
-        // one syscall. This layer is a thin trait wire-up.
-        (*self).send_chain(chain).await
+    async fn send(&mut self, chain: &mut IOBufChain) -> Result<(), ()> {
+        // Hand the chain to the runtime's chain-shaped send,
+        // which calls into the backend. Bare-metal walks the
+        // chain via its cursor and copies bytes directly into
+        // MSS-sized TCP segments (no user-space scratch
+        // coalesce); native uses `writev(2)` so a multi-part
+        // shape ships in one syscall. This layer is a thin
+        // trait wire-up — the transport-side decisions live
+        // in `tcp::async_try_send_chain` (bare-metal) and
+        // `native_tcp_try_send_chain` (POSIX).
+        (*self).send(chain).await
     }
 }
 
@@ -523,7 +527,7 @@ impl TlsStream {
             if n == 0 {
                 return Ok(());
             }
-            self.tcp.send(&self.tx_scratch[..n]).await?;
+            self.tcp.send_bytes(&self.tx_scratch[..n]).await?;
         }
     }
 }
@@ -556,7 +560,7 @@ impl HttpStream for TlsStream {
         }
     }
 
-    async fn send_chain(&mut self, chain: &mut IOBufChain) -> Result<(), ()> {
+    async fn send(&mut self, chain: &mut IOBufChain) -> Result<(), ()> {
         // TLS 1.3 record envelope: 5-B header + 1-B inner content
         // type + 16-B AEAD tag = 22 B fixed overhead. Plaintext
         // chunks ≤ 3 KiB so headers + ciphertext fit in the legacy
@@ -615,7 +619,7 @@ impl HttpStream for TlsStream {
                 // the byte order on the wire matches what the
                 // peer expects.
                 self.drain_tx().await?;
-                self.tcp.send(part.data()).await?;
+                self.tcp.send_bytes(part.data()).await?;
                 continue;
             }
             // Fallback: copy through the legacy slice path. This
@@ -766,7 +770,7 @@ async fn handle_conn<S, H>(
     // conn-accept so we don't re-query per response.
     let layer = stream.layer_reserve();
     // Outbound chain is amortised across every response on this
-    // connection — `send_chain` drains it via `pop_front`, leaving
+    // connection — `send` drains it via `pop_front`, leaving
     // the chain empty but with its `VecDeque` allocation
     // preserved. Capacity 4 covers the common shapes (header +
     // 1 body part, header + 2-3 chunked body parts) without
@@ -828,7 +832,7 @@ async fn handle_conn<S, H>(
             //     iteration before constructing the next one).
             //   * No two IOBufs ever alias the same bytes — the
             //     IOBuf is `push_back`'d into `out_chain`,
-            //     drained by `send_chain` (which drops it after
+            //     drained by `send` (which drops it after
             //     committing the bytes to the wire), and only
             //     then does the next iteration construct a fresh
             //     IOBuf wrapping the same storage.
@@ -861,7 +865,7 @@ async fn handle_conn<S, H>(
             // encrypts each part as its own record (in-place when
             // reserves match).
             //
-            // `out_chain` is empty here (`send_chain` drains it
+            // `out_chain` is empty here (`send` drains it
             // each iteration). Move the body's parts in via
             // `into_parts()`, then `push_front` the header so the
             // wire order is [header, body0, body1, ...].
@@ -871,7 +875,7 @@ async fn handle_conn<S, H>(
             }
             out_chain.push_front(header);
 
-            if stream.send_chain(&mut out_chain).await.is_err() {
+            if stream.send(&mut out_chain).await.is_err() {
                 return;
             }
 

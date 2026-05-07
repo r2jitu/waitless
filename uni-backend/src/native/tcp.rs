@@ -309,20 +309,19 @@ fn native_tcp_try_send(handle: *mut (), generation: u16, buf: &[u8]) -> isize {
     }
 }
 
-/// Gather-write `chain[skip..]` to the socket via `writev(2)`.
-/// One syscall for the whole `[header, body0, body1, ...]`
-/// shape; the kernel TCP stack handles segmentation. Read-only
-/// on `chain` — the caller (`TcpSendChain` future) tracks how
-/// many bytes have been pushed and re-polls with an updated
-/// `skip` if `writev` returned partial.
+/// Gather-write `chain` to the socket via `writev(2)`. One
+/// syscall for the whole `[header, body0, body1, ...]` shape;
+/// the kernel TCP stack handles segmentation. Drains the chain
+/// in place: pops fully-sent parts off the front, and (on partial
+/// `writev`) advances the front part's visible payload past the
+/// committed bytes, so the next call sees only the remainder.
 ///
 /// Returns bytes-pushed-this-call, `0` on EAGAIN, `-1` on fatal
 /// error / stale `gen`.
 fn native_tcp_try_send_chain(
     handle: *mut (),
     generation: u16,
-    chain: &uni_iobuf::IOBufChain,
-    skip: usize,
+    chain: &mut uni_iobuf::IOBufChain,
 ) -> isize {
     unsafe {
         let (c, live) = check_gen(handle, generation);
@@ -334,75 +333,91 @@ fn native_tcp_try_send_chain(
             return -1;
         }
         let total = chain.total_len();
-        if skip >= total {
+        if total == 0 {
             return 0;
         }
 
-        // Build an `iovec` array on the stack from `chain[skip..]`.
-        // 8 slots covers the typical multi-part response shape
-        // (header + a few body chunks); longer chains fall back to
-        // a per-part `send` loop below.
+        // Build an `iovec` array on the stack — one slot per
+        // chain part. 8 slots covers the typical multi-part
+        // response shape (header + a few body chunks); longer
+        // chains fall back to a per-part `send` loop below.
         const IOV_INLINE: usize = 8;
         let part_count = chain.part_count();
         if part_count <= IOV_INLINE {
             let mut iov = [IoVec { iov_base: ptr::null(), iov_len: 0 }; IOV_INLINE];
-            let mut iov_n = 0usize;
-            let mut left_to_skip = skip;
-            for part in chain.iter() {
+            for (i, part) in chain.iter().enumerate() {
                 let data = part.data();
-                if left_to_skip >= data.len() {
-                    left_to_skip -= data.len();
-                    continue;
+                iov[i] = IoVec { iov_base: data.as_ptr(), iov_len: data.len() };
+            }
+            let n = writev(fd, iov.as_ptr(), part_count as i32);
+            if n < 0 {
+                if errno() == EAGAIN {
+                    return 0;
                 }
-                iov[iov_n] = IoVec {
-                    iov_base: data.as_ptr().add(left_to_skip),
-                    iov_len: data.len() - left_to_skip,
-                };
-                iov_n += 1;
-                left_to_skip = 0;
+                return -1;
             }
-            let n = writev(fd, iov.as_ptr(), iov_n as i32);
-            if n >= 0 {
-                return n;
-            }
-            if errno() == EAGAIN {
-                return 0;
-            }
-            return -1;
+            drain_chain_prefix(chain, n as usize);
+            return n;
         }
 
         // Long chain (>IOV_INLINE parts): walk parts manually,
-        // skipping `skip` bytes from the front, calling `send`
-        // for each remaining part. Each is a syscall but the
+        // calling `send` for each. Each is a syscall but the
         // kernel TCP stack coalesces via Nagle so the wire still
         // sees tidy segments. Long chains are rare (chunked HTML),
         // so the optimisation that matters is the iovec inline
         // path above.
-        let mut left_to_skip = skip;
         let mut sent_total = 0isize;
-        for part in chain.iter() {
+        while let Some(part) = chain.front_mut() {
             let data = part.data();
-            let mut off = if left_to_skip >= data.len() {
-                left_to_skip -= data.len();
+            if data.is_empty() {
+                let _ = chain.pop_front();
                 continue;
-            } else {
-                let o = left_to_skip;
-                left_to_skip = 0;
-                o
-            };
-            while off < data.len() {
-                let n = send(fd, data.as_ptr().add(off), data.len() - off, MSG_NOSIGNAL);
-                if n < 0 {
-                    if errno() == EAGAIN {
-                        return if sent_total == 0 { 0 } else { sent_total };
-                    }
-                    return -1;
-                }
-                off += n as usize;
-                sent_total += n;
             }
+            let n = send(fd, data.as_ptr(), data.len(), MSG_NOSIGNAL);
+            if n < 0 {
+                if errno() == EAGAIN {
+                    return if sent_total == 0 { 0 } else { sent_total };
+                }
+                return -1;
+            }
+            let n = n as usize;
+            if n == data.len() {
+                let _ = chain.pop_front();
+            } else {
+                let _ = part.consume(n);
+                chain.shrink_total_len(n);
+                // Partial part-send: kernel won't take more right
+                // now, return what we got.
+                sent_total += n as isize;
+                return sent_total;
+            }
+            sent_total += n as isize;
         }
         sent_total
+    }
+}
+
+/// Drop `n` bytes from the front of `chain`: pop fully-sent
+/// parts, advance the front part's visible payload past the
+/// committed bytes for any partial-send remainder. Used by the
+/// iovec path on partial `writev` to advance the chain in place.
+fn drain_chain_prefix(chain: &mut uni_iobuf::IOBufChain, n: usize) {
+    let mut remaining = n;
+    while remaining > 0 {
+        let head_len = match chain.front_mut() {
+            Some(h) => h.len(),
+            None => break,
+        };
+        if remaining >= head_len {
+            let _ = chain.pop_front();
+            remaining -= head_len;
+        } else {
+            if let Some(front) = chain.front_mut() {
+                let _ = front.consume(remaining);
+            }
+            chain.shrink_total_len(remaining);
+            remaining = 0;
+        }
     }
 }
 
@@ -472,8 +487,8 @@ pub(super) static NATIVE_TCP_BACKEND: uni_runtime::net::TcpBackend =
         register_recv_waker: native_tcp_register_recv_waker,
         clear_recv_waker: native_tcp_clear_recv_waker,
         close: tcp_close,
-        try_send: native_tcp_try_send,
-        try_send_chain: native_tcp_try_send_chain,
+        try_send_bytes: native_tcp_try_send,
+        try_send: native_tcp_try_send_chain,
         register_send_waker: native_tcp_register_send_waker,
         clear_send_waker: native_tcp_clear_send_waker,
         shutdown_all: None,

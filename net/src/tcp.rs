@@ -1349,25 +1349,21 @@ pub fn async_try_send(handle: *mut (), generation: u16, buf: &[u8]) -> isize {
     if n < 0 { -1 } else { n as isize }
 }
 
-/// Async `TcpSendChain` try-send hook. Walks `chain[skip..]` via
-/// its cursor and emits MSS-sized TCP segments by copying directly
-/// from chain nodes into each segment's payload area — no
-/// user-space scratch coalesce. Read-only on `chain` (matches
-/// POSIX `writev`'s "buffer is yours, I'll just read it"
-/// semantics); the wrapping `TcpSendChain` future is what
-/// eventually drops the chain's parts.
+/// Async `TcpSendChain` try-send hook. Walks `chain` via cursor
+/// and emits MSS-sized TCP segments, copying directly from chain
+/// nodes into each segment's payload area — no user-space
+/// scratch coalesce. Drains the chain as bytes hit the wire so
+/// `External` IOBufs (NIC RX descriptors etc.) return to the
+/// driver pool as the response leaves the box, not all at the
+/// end.
 ///
-/// Bare-metal's NIC TX never blocks under this stack's load model,
-/// so this always sends `chain.total_len() - skip` bytes (or `-1`
-/// on a dead conn / stale `gen`). The `skip` parameter is here
-/// for symmetry with the trait — backends that *can* return
-/// partial sends (native's `writev`) need it; this one threads
-/// it through unchanged.
+/// Bare-metal's NIC TX never blocks under this stack's load
+/// model, so this always sends every byte in the chain (or
+/// returns `-1` on a dead conn / stale `gen`).
 pub fn async_try_send_chain(
     handle: *mut (),
     generation: u16,
-    chain: &uni_iobuf::IOBufChain,
-    skip: usize,
+    chain: &mut uni_iobuf::IOBufChain,
 ) -> isize {
     let (core, slot) = match decode_handle(handle) {
         Some(v) => v,
@@ -1384,20 +1380,15 @@ pub fn async_try_send_chain(
     }
 
     let total = chain.total_len();
-    if skip >= total {
+    if total == 0 {
         return 0;
     }
-    let to_send = total - skip;
 
     let mss = mss_for(c.local_ip);
     let mut cursor = chain.cursor();
-    if skip > 0 {
-        let advanced = cursor.advance(skip);
-        debug_assert_eq!(advanced, skip);
-    }
     let mut sent = 0usize;
-    while sent < to_send {
-        let chunk = (to_send - sent).min(mss);
+    while sent < total {
+        let chunk = (total - sent).min(mss);
         send_segment_from_cursor(
             c.local_ip,
             c.remote_ip,
@@ -1413,6 +1404,12 @@ pub fn async_try_send_chain(
         c.snd_nxt = c.snd_nxt.wrapping_add(chunk as u32);
         sent += chunk;
     }
+
+    // Bytes are on the wire — release the cursor's borrow on the
+    // chain and drain it. Drops fire in chain order (External
+    // callbacks recycle NIC descriptors back to driver pools).
+    drop(cursor);
+    chain.clear();
     sent as isize
 }
 
