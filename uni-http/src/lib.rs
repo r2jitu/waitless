@@ -120,6 +120,17 @@ impl Request {
         None
     }
 
+    /// Parse the port number out of the request's `Host` header.
+    /// Returns `None` if the header is missing or has no `:port`
+    /// suffix. Handles both `host:port` and `[v6-literal]:port`
+    /// shapes (RFC 7230 §5.4). Useful for apps that want to emit
+    /// `Alt-Svc: h3=":<port>"` advertising the same port the
+    /// client used to reach us — typical in dev where the host-
+    /// to-guest mapping puts HTTPS on a non-default port.
+    pub fn host_port(&self) -> Option<u16> {
+        host_header_port(self.header(b"Host")?)
+    }
+
     /// Overwrite the request-target path. Truncates if longer than
     /// the fixed `path` buffer. Used by the HTTP/3 frontend to
     /// install the `:path` pseudo-header into the same `Request`
@@ -292,6 +303,14 @@ impl From<alloc::vec::Vec<u8>>    for Body { fn from(v: alloc::vec::Vec<u8>)    
 impl From<alloc::string::String>  for Body { fn from(s: alloc::string::String)  -> Self { Body::new().push(s.into_bytes()) } }
 impl From<Bytes> for Body { fn from(b: Bytes) -> Self { Body::new().push(b) } }
 
+/// Maximum number of additional headers (beyond the framework's
+/// always-emitted Content-Type / Content-Length / Connection) that
+/// a Response can carry. 4 covers the common cases (Alt-Svc, Cache-
+/// Control, ETag, Set-Cookie) without bloating the struct. Past
+/// this the builder silently drops further `with_header` calls,
+/// matching the Request-side header-cap behaviour.
+pub const MAX_EXTRA_HEADERS: usize = 4;
+
 pub struct Response {
     pub status: i32,
     /// Content-Type header value. `Bytes` (Cow<'static, [u8]>) so
@@ -300,6 +319,11 @@ pub struct Response {
     /// strings can flow through Cow::Owned.
     content_type: Bytes,
     body: ResponseBody,
+    /// Optional extra response headers (Alt-Svc, Cache-Control,
+    /// etc.) that the app sets via `with_header`. Inline storage
+    /// — no Vec allocation per response. Both name and value are
+    /// `Bytes` so static literals stay zero-alloc.
+    extra_headers: [Option<(Bytes, Bytes)>; MAX_EXTRA_HEADERS],
 }
 
 // Note: no `unsafe impl Send/Sync for Response` needed — Bytes
@@ -396,6 +420,7 @@ impl Response {
             status: 200,
             content_type: content_type.into(),
             body: body.into_body(),
+            extra_headers: [const { None }; MAX_EXTRA_HEADERS],
         }
     }
 
@@ -404,7 +429,33 @@ impl Response {
             status: 404,
             content_type: alloc::borrow::Cow::Borrowed(b"text/plain"),
             body: ResponseBody::Single(alloc::borrow::Cow::Borrowed(b"Not Found")),
+            extra_headers: [const { None }; MAX_EXTRA_HEADERS],
         }
+    }
+
+    /// Add an extra response header. Use for `Alt-Svc`,
+    /// `Cache-Control`, `Set-Cookie`, etc. Both `name` and
+    /// `value` are `Bytes` (Cow<'static, [u8]>) so static
+    /// literals stay zero-alloc; dynamically-built values
+    /// flow through `Cow::Owned`. Builder-style — chains.
+    /// Silently drops past `MAX_EXTRA_HEADERS` (4 today).
+    pub fn with_header(mut self, name: impl Into<Bytes>, value: impl Into<Bytes>) -> Self {
+        for slot in self.extra_headers.iter_mut() {
+            if slot.is_none() {
+                *slot = Some((name.into(), value.into()));
+                return self;
+            }
+        }
+        self
+    }
+
+    /// Iterate the extra headers set via `with_header`. Used by
+    /// the HTTP/1.1 response writer and the H3 frontend's QPACK
+    /// encoder to emit them on the wire.
+    pub fn extra_headers(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
+        self.extra_headers
+            .iter()
+            .filter_map(|slot| slot.as_ref().map(|(n, v)| (&**n, &**v)))
     }
 
     /// Consume the response and yield its body. Frontends match
@@ -645,7 +696,7 @@ where
     let h = listener.run(move |stream| {
         let handler = Arc::clone(&handler);
         async move {
-            handle_conn(handler, stream, false).await;
+            handle_conn(handler, stream).await;
         }
     });
     uni::_retain(h);
@@ -657,36 +708,19 @@ where
 /// shared across every accepted connection on this port; for
 /// multi-port HTTPS reusing the same cert, pass `tls.clone()`
 /// (`Arc::clone` is cheap).
+///
+/// To advertise an HTTP/3 endpoint via `Alt-Svc` on responses,
+/// the app's handler should emit it itself per-response — read
+/// `req.host_port()` and add a `with_header(b"Alt-Svc", ...)`
+/// to the `Response`. The framework no longer hardcodes this
+/// (the previous `listen_https_advertising_h3` plumbing); apps
+/// that don't use HTTP/3 don't pay the per-response Host-header
+/// re-parse, and apps that do retain full control over the
+/// advertised port and TTL.
 pub fn listen_https<H>(
     port: u16,
     handler: H,
     tls: Arc<dyn Tls>,
-) -> Result<(), uni::runtime::TcpBindError>
-where
-    H: AsyncFn(&Request) -> Response + Send + Sync + 'static,
-{
-    listen_https_advertising_h3(port, handler, tls, false)
-}
-
-/// Like [`listen_https`] but every response includes
-/// `Alt-Svc: h3=":<port>"; ma=86400` whenever `advertise_h3` is
-/// true. The `<port>` is derived per-response from the request's
-/// `Host` header, so it always matches whatever port the client
-/// actually connected to (e.g. `https://localhost:8443/` →
-/// `h3=":8443"`). This handles the bazel-run default that maps
-/// host `:8443` → guest `:443` — a static `h3=":443"` would point
-/// browsers at a port nothing's listening on and silently disable
-/// HTTP/3 upgrade.
-///
-/// Caller is responsible for only setting `advertise_h3 = true`
-/// when an H3 endpoint actually bound on the corresponding UDP
-/// port; otherwise the browser's alt-svc cache gets poisoned for
-/// up to 24 h with a non-functional advertisement.
-pub fn listen_https_advertising_h3<H>(
-    port: u16,
-    handler: H,
-    tls: Arc<dyn Tls>,
-    advertise_h3: bool,
 ) -> Result<(), uni::runtime::TcpBindError>
 where
     H: AsyncFn(&Request) -> Response + Send + Sync + 'static,
@@ -700,7 +734,7 @@ where
             let mut seed = [0u8; 32];
             uni::rng::fill_bytes(&mut seed);
             let stream = TlsStream::new(tcp, tls.new_connection(seed));
-            handle_conn(handler, stream, advertise_h3).await;
+            handle_conn(handler, stream).await;
         }
     });
     uni::_retain(h);
@@ -718,7 +752,6 @@ where
 async fn handle_conn<S, H>(
     handler: Arc<H>,
     mut stream: S,
-    advertise_h3: bool,
 ) where
     S: HttpStream,
     H: AsyncFn(&Request) -> Response,
@@ -765,17 +798,14 @@ async fn handle_conn<S, H>(
             let resp = (&*handler)(&req).await;
 
             w.clear();
-            // Per-request Alt-Svc: when H3 is up, advertise it on
-            // whatever port the client actually used to reach us.
-            // Read the Host header here (after parse, before
-            // handler may have mutated `req` — handlers receive
-            // `&Request`, but defensively recompute each loop).
-            let alt_svc_port = if advertise_h3 {
-                req.header(b"Host").and_then(host_header_port).or(Some(443))
-            } else {
-                None
-            };
-            write_response_into(&mut w, &resp, !want_close, alt_svc_port);
+            // Extra response headers (Alt-Svc / Cache-Control / etc.)
+            // are now app-side: the handler can call
+            // `Response::with_header(...)` and `write_response_into`
+            // emits them inline. Apps that want to advertise h3
+            // read `req.host_port()` themselves — keeps the
+            // per-response branch and Host-reparse out of the
+            // framework when no extra headers are set.
+            write_response_into(&mut w, &resp, !want_close);
             // Two writes: headers (always small, in `w`'s 2 KiB
             // buffer) then the body (potentially large — multi-KiB
             // HTML pages, JSON dumps, etc.). Streaming body
@@ -1012,17 +1042,15 @@ impl core::fmt::Write for BufWriter {
 /// variable integer (`Content-Length`) measurably outperform
 /// `write!(...)` here.
 ///
-/// `alt_svc_port`, if `Some`, emits
-/// `Alt-Svc: h3=":<port>"; ma=86400` so HTTP/3-capable browsers
-/// learn to upgrade on the next visit. Caller resolves the port
-/// from the request's `Host` header so the advertisement matches
-/// whatever port the client actually used (e.g. the bazel-run
-/// default of `:8443`, not the unikernel's internal `:443`).
+/// Extra headers (`Alt-Svc`, `Cache-Control`, `Set-Cookie`, etc.)
+/// are pulled from `resp.extra_headers()` — apps add them via
+/// `Response::with_header`. The framework no longer hardcodes
+/// any optional header itself; per-response branches and Host-
+/// header reparses live in app code now if at all.
 fn write_response_into(
     w: &mut BufWriter,
     resp: &Response,
     keep_alive: bool,
-    alt_svc_port: Option<u16>,
 ) {
     let body_len = resp.body_len();
     let content_type = resp.content_type_bytes();
@@ -1042,12 +1070,11 @@ fn write_response_into(
     w.push(b"\r\nConnection: ");
     w.push(if keep_alive { b"keep-alive" } else { b"close" });
     w.push(b"\r\n");
-    if let Some(port) = alt_svc_port {
-        w.push(b"Alt-Svc: h3=\":");
-        let mut port_buf = [0u8; 5];
-        let port_len = write_u16(&mut port_buf, port);
-        w.push(&port_buf[..port_len]);
-        w.push(b"\"; ma=86400\r\n");
+    for (name, value) in resp.extra_headers() {
+        w.push(name);
+        w.push(b": ");
+        w.push(value);
+        w.push(b"\r\n");
     }
     w.push(b"\r\n");
     // body is NOT pushed here; `handle_conn` ships it via
@@ -1082,26 +1109,6 @@ fn host_header_port(host: &[u8]) -> Option<u16> {
         if acc > 65535 { return None; }
     }
     Some(acc as u16)
-}
-
-/// Decimal-encode a `u16` into `out`, returning byte count.
-/// Mirror of `write_usize` but bounded so the buffer can be 5 bytes.
-fn write_u16(out: &mut [u8; 5], mut n: u16) -> usize {
-    if n == 0 {
-        out[0] = b'0';
-        return 1;
-    }
-    let mut tmp = [0u8; 5];
-    let mut len = 0;
-    while n > 0 {
-        tmp[len] = b'0' + (n % 10) as u8;
-        n /= 10;
-        len += 1;
-    }
-    for i in 0..len {
-        out[i] = tmp[len - 1 - i];
-    }
-    len
 }
 
 #[cfg(test)]

@@ -83,12 +83,74 @@ async fn init() {
         }
     };
 
-    match uni_tls::listen_advertising_h3(
-        HTTPS_PORT, handle_request, DEV_CERT_DER, DEV_KEY_PKCS8_DER, h3_up,
+    // Alt-Svc advertisement is now app-side: when h3 is up we
+    // attach `Alt-Svc: h3=":<port>"; ma=86400` to every HTTPS
+    // response inside `handle_request_https`. The framework no
+    // longer hardcodes this — see uni-http's `Response::with_header`
+    // and `Request::host_port`. Apps that don't run h3 don't pay
+    // the per-response Host-header reparse. `H3_UP` is a static
+    // bool because closure lifetimes don't compose cleanly with
+    // the framework's HRTB-bound `AsyncFn(&Request)` handler
+    // signature; a static is the simplest way to thread the flag
+    // into the dispatch path.
+    H3_UP.store(h3_up, core::sync::atomic::Ordering::Relaxed);
+    match uni_tls::listen(
+        HTTPS_PORT, handle_request_https, DEV_CERT_DER, DEV_KEY_PKCS8_DER,
     ) {
         Ok(()) => uni::println!("listen tcp://:{} (https, TLS_CHACHA20_POLY1305_SHA256)", HTTPS_PORT),
         Err(_) => uni::println!("[WARN] https disabled (cert/key invalid)"),
     }
+}
+
+/// Process `false`/`true` after `init` decides whether the H3
+/// listener is up. Read by `handle_request_https` to attach the
+/// Alt-Svc header opportunistically.
+static H3_UP: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// HTTPS-specific dispatch. Calls into the shared
+/// `handle_request` (used by both HTTPS and H3 paths) and, when
+/// the H3 listener is up, layers an `Alt-Svc` header onto the
+/// response advertising the same port the client connected to.
+async fn handle_request_https(req: &Request) -> Response {
+    let resp = handle_request(req).await;
+    if !H3_UP.load(core::sync::atomic::Ordering::Relaxed) {
+        return resp;
+    }
+    // Default to :443 if the client omitted the Host header port
+    // (RFC 7230 says we MAY default — and Chrome won't visit a
+    // URL without one, so this branch is mostly defensive).
+    let port = req.host_port().unwrap_or(443);
+    resp.with_header(&b"Alt-Svc"[..], format_alt_svc_value(port))
+}
+
+/// Render `h3=":<port>"; ma=86400` for the Alt-Svc header,
+/// avoiding the format! machinery for the common case. Returns
+/// an owned Vec; callers can pass it directly to
+/// `Response::with_header`.
+fn format_alt_svc_value(port: u16) -> alloc::vec::Vec<u8> {
+    let mut out = alloc::vec::Vec::with_capacity(32);
+    out.extend_from_slice(b"h3=\":");
+    let mut digit_buf = [0u8; 5];
+    let mut n = port;
+    let mut len = 0usize;
+    if n == 0 {
+        digit_buf[0] = b'0';
+        len = 1;
+    } else {
+        let mut tmp = [0u8; 5];
+        while n > 0 {
+            tmp[len] = b'0' + (n % 10) as u8;
+            n /= 10;
+            len += 1;
+        }
+        for i in 0..len {
+            digit_buf[i] = tmp[len - 1 - i];
+        }
+    }
+    out.extend_from_slice(&digit_buf[..len]);
+    out.extend_from_slice(b"\"; ma=86400");
+    out
 }
 
 // ---- Listener bodies --------------------------------------------------------

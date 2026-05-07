@@ -117,6 +117,13 @@ pub enum ListenError {
 /// One-call HTTPS listener. Builds a TLS acceptor from `cert_der`
 /// / `key_der` and starts the HTTPS server on `port` with `handler`
 /// dispatching every parsed `Request`.
+///
+/// Apps that want to advertise an HTTP/3 endpoint via `Alt-Svc`
+/// emit it themselves per-response — read `req.host_port()` and
+/// add the header via `Response::with_header(b"Alt-Svc", ...)`.
+/// The framework no longer hardcodes this (it used to take an
+/// `advertise_h3` flag and the host-header reparse fired on
+/// every response); apps that don't care don't pay.
 pub fn listen<H>(
     port: u16,
     handler: H,
@@ -126,31 +133,8 @@ pub fn listen<H>(
 where
     H: AsyncFn(&uni_http::Request) -> uni_http::Response + Send + Sync + 'static,
 {
-    listen_advertising_h3(port, handler, cert_der, key_der, false)
-}
-
-/// Like [`listen`] but every HTTPS response includes
-/// `Alt-Svc: h3=":<port>"; ma=86400` when `advertise_h3` is true.
-/// The `<port>` is taken from each request's `Host` header so the
-/// advertisement matches whatever port the client actually used —
-/// the bazel-run default maps host `:8443` → guest `:443`, and a
-/// static `:443` would silently disable HTTP/3 upgrade. The app
-/// passes `true` only after `uni_http3::listen` has reported
-/// success, otherwise the browser's alt-svc cache gets poisoned
-/// with a non-functional advertisement for up to 24 h.
-pub fn listen_advertising_h3<H>(
-    port: u16,
-    handler: H,
-    cert_der: &'static [u8],
-    key_der: &'static [u8],
-    advertise_h3: bool,
-) -> Result<(), ListenError>
-where
-    H: AsyncFn(&uni_http::Request) -> uni_http::Response + Send + Sync + 'static,
-{
     let tls = acceptor(cert_der, key_der).map_err(|_| ListenError::Cert)?;
-    uni_http::listen_https_advertising_h3(port, handler, tls, advertise_h3)
-        .map_err(ListenError::Bind)
+    uni_http::listen_https(port, handler, tls).map_err(ListenError::Bind)
 }
 
 // ---- Diagnostic helpers ------------------------------------------------------
