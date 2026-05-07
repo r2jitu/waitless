@@ -64,7 +64,7 @@ const RX_POOL_SIZE: usize = 16;
 /// returns it. The producer can only wrap back to a slot once the
 /// consumer has drained it (by ring-capacity invariant), so the
 /// `Some → take → Some` sequence on the same slot is well-ordered.
-pub struct RxIobufInbox {
+pub struct RxInbox {
     pool: [UnsafeCell<Option<uni_iobuf::IOBuf>>; RX_POOL_SIZE],
     ready: spsc::Ring<u32>,
     next_slot: AtomicUsize,
@@ -77,11 +77,11 @@ pub struct RxIobufInbox {
 // the slot's `Some(iobuf)` write with `ready.push`'s release-tail
 // store; consumer's `ready.pop` acquire-load makes that write
 // visible before it `take()`s.
-unsafe impl Sync for RxIobufInbox {}
+unsafe impl Sync for RxInbox {}
 
-impl RxIobufInbox {
+impl RxInbox {
     pub const fn new() -> Self {
-        RxIobufInbox {
+        RxInbox {
             pool: [const { UnsafeCell::new(None) }; RX_POOL_SIZE],
             ready: spsc::Ring::new(),
             next_slot: AtomicUsize::new(0),
@@ -155,7 +155,7 @@ pub struct PerCore {
     /// RX inbox for Tier 2 cross-core delivery — distributor on
     /// the polling core pushes IOBufs here; owning core pops and
     /// processes via `net_drain_cb` → `net_receive_iobuf`.
-    pub rx_iobuf_inbox: RxIobufInbox,
+    pub rx_inbox: RxInbox,
 
     /// Inbox for Tier 2 RX delivery (SPSC: core 0 writes, this core reads).
     pub inbox: spsc::Ring<Task>,
@@ -236,7 +236,7 @@ impl PerCore {
         PerCore {
             id,
             _pad: 0,
-            rx_iobuf_inbox: RxIobufInbox::new(),
+            rx_inbox: RxInbox::new(),
             inbox: spsc::Ring::new(),
             pinned: spsc::Ring::new(),
             stealable: Deque::new(),

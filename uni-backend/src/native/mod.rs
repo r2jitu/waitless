@@ -667,7 +667,7 @@ impl ThreadState {
 /// sibling ready.
 ///
 /// Allocates a Heap `IOBuf` per datagram, recvs into it directly, and
-/// hands ownership to `deliver_udp_iobuf`. This is the same one-copy
+/// hands ownership to `deliver_udp`. This is the same one-copy
 /// shape the legacy `recvfrom` + memcpy path had — but it routes
 /// through the unified IOBuf delivery surface, so the runtime's UDP
 /// inbox doesn't need a parallel `&[u8]` push path. Native is dev-
@@ -716,7 +716,7 @@ fn drain_udp_sibling(fd: i32, app_port: u16) {
             addr: u32::from_ne_bytes(src_octets),
         });
         let src_port = u16::from_be(src_addr.sin_port);
-        let _ = uni_runtime::net::deliver_udp_iobuf(app_port, src_ip, src_port, iobuf);
+        let _ = uni_runtime::net::deliver_udp(app_port, src_ip, src_port, iobuf);
     }
 }
 

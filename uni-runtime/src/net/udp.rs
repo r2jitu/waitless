@@ -73,7 +73,7 @@ struct Datagram {
     len: u16,
     /// Owned IOBuf whose `data()` is the UDP payload — Eth/IP/UDP
     /// headers were consumed via `IOBuf::consume` upstream. The
-    /// IOBuf stays in the slot until the next `try_push_iobuf`
+    /// IOBuf stays in the slot until the next `try_push`
     /// overwrites it; on overwrite, `Option`'s assignment runs
     /// the prior IOBuf's drop (returning its backing buffer to
     /// the driver pool, or freeing the heap allocation on the
@@ -166,7 +166,7 @@ impl WorkerInbox {
     /// (Eth/IP/UDP headers consumed via `IOBuf::consume` upstream).
     /// Returns `false` (and drops the IOBuf, releasing its backing
     /// buffer back to the driver pool) when the inbox ring is full.
-    fn try_push_iobuf(
+    fn try_push(
         &self,
         src_ip: IpAddr,
         src_port: u16,
@@ -248,7 +248,7 @@ impl WorkerInbox {
             return None;
         }
         // SAFETY: SPSC — consumer owns the head slot until Release
-        // store below; same publication argument as `try_push_iobuf`.
+        // store below; same publication argument as `try_push`.
         let slot = unsafe { &*slots_ptr.add(head as usize) };
         let src_bytes: &[u8] = match &slot.iobuf {
             Some(b) => {
@@ -256,7 +256,7 @@ impl WorkerInbox {
                 let n = (slot.len as usize).min(d.len());
                 &d[..n]
             }
-            // `try_push_iobuf` is the only push path, so iobuf is
+            // `try_push` is the only push path, so iobuf is
             // always Some on a filled slot. This None arm is
             // defensive — if it ever fires, we report 0 bytes
             // rather than alias whatever was in the slot before.
@@ -1443,18 +1443,18 @@ fn lookup_eph_position(worker: u32, slot_idx: u32) -> Option<&'static EphSlot> {
 ///
 /// Returns `true` if a registered binding was found (whether or not
 /// the inbox push itself succeeded). The IOBuf is consumed either
-/// way: `try_push_iobuf` moves it into the slot on success; on
+/// way: `try_push` moves it into the slot on success; on
 /// full-ring failure the IOBuf drops here, releasing its buffer
 /// to the driver pool (or freeing the heap allocation on the
 /// native-backend path).
-pub fn deliver_udp_iobuf(
+pub fn deliver_udp(
     dst_port: u16,
     src_ip: IpAddr,
     src_port: u16,
     iobuf: uni_iobuf::IOBuf,
 ) -> bool {
     if let Some(slot) = lookup_eph(dst_port) {
-        let _ = slot.inbox.try_push_iobuf(src_ip, src_port, iobuf);
+        let _ = slot.inbox.try_push(src_ip, src_port, iobuf);
         slot.inbox.wake_if_parked();
         return true;
     }
@@ -1462,7 +1462,7 @@ pub fn deliver_udp_iobuf(
     for state in UDP_REGISTRY.iter() {
         if state.port.load(Ordering::Acquire) == dst_port {
             let inbox = state.inboxes.current(&cc);
-            let _ = inbox.try_push_iobuf(src_ip, src_port, iobuf);
+            let _ = inbox.try_push(src_ip, src_port, iobuf);
             inbox.wake_if_parked();
             return true;
         }

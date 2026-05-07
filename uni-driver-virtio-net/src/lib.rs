@@ -1551,7 +1551,7 @@ fn flush_tx_kick_if_dirty() -> bool {
 // Zero-copy RX
 // ============================================================================
 //
-// `poll_qp_iobuf` wraps each used descriptor's buffer as an
+// `poll_qp` wraps each used descriptor's buffer as an
 // `IOBuf::External` and hands ownership to the consumer. Re-arming
 // the descriptor is deferred until the consumer drops the IOBuf —
 // `rx_drop_callback` calls `add_buf` on the qp directly, re-posting
@@ -1581,7 +1581,7 @@ fn flush_tx_kick_if_dirty() -> bool {
 // drop-burst size.
 
 /// Drop callback for `IOBuf::External` instances handed out by
-/// `poll_qp_iobuf`. Re-posts the buffer to its qp's avail ring so
+/// `poll_qp`. Re-posts the buffer to its qp's avail ring so
 /// the device can fill it with the next inbound frame; sets
 /// `rx_dirty` so the next poll's kick notifies the device.
 ///
@@ -1617,7 +1617,7 @@ unsafe fn rx_drop_callback(
 /// each descriptor's buffer as an `IOBuf::External`. Re-arming
 /// is deferred to `rx_drop_callback`, which fires when the
 /// consumer drops the IOBuf.
-fn poll_qp_iobuf(qp: usize, callback: fn(uni_net_driver::IOBuf)) -> usize {
+fn poll_qp(qp: usize, callback: fn(uni_net_driver::IOBuf)) -> usize {
     unsafe {
         if let Transport::None = (*ndev()).transport { return 0; }
     }
@@ -1689,11 +1689,11 @@ fn poll_qp_iobuf(qp: usize, callback: fn(uni_net_driver::IOBuf)) -> usize {
 }
 
 /// All-queues fan-out wrapper.
-fn poll_iobuf(callback: fn(uni_net_driver::IOBuf)) -> usize {
+fn poll(callback: fn(uni_net_driver::IOBuf)) -> usize {
     let n = unsafe { (*ndev()).negotiated_queue_pairs as usize }.max(1);
     let mut total = 0;
     for qp in 0..n {
-        total += poll_qp_iobuf(qp, callback);
+        total += poll_qp(qp, callback);
     }
     total
 }
@@ -1735,8 +1735,8 @@ static VIRTIO_NET_OPS: NicOps = NicOps {
     name: "virtio-net",
     probe,
     send,
-    poll_rx: poll_iobuf,
-    poll_qp: poll_qp_iobuf,
+    poll_rx: poll,
+    poll_qp,
     get_mac,
     num_queue_pairs,
     enable_irq,
