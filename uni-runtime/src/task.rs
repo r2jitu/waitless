@@ -25,7 +25,10 @@ use uni_worker::{CurrentWorker, PerWorker};
 pub const TASKS_PER_WORKER: usize = 64;
 const _: () = assert!(TASKS_PER_WORKER <= 64, "ready_bits is u64");
 
-type BoxedFuture = Pin<Box<dyn Future<Output = ()>>>;
+/// Pre-boxed future shape accepted by [`spawn_boxed`]. Listeners
+/// that already type-erase per-conn futures into `Pin<Box<dyn …>>`
+/// hand the box straight to the spawner without a second allocation.
+pub type BoxedFuture = Pin<Box<dyn Future<Output = ()>>>;
 
 pub struct TaskSlot {
     used: AtomicBool,
@@ -135,14 +138,29 @@ impl TaskHandle {
 
 /// Spawn a future onto the current worker's arena. `Err(())` when
 /// the arena is full — the future is dropped in that case.
+///
+/// One heap alloc per spawn (the `Box::pin`). Callers that
+/// already have a `Pin<Box<dyn Future>>` should use
+/// [`spawn_boxed`] instead to skip the redundant re-box.
 pub fn spawn<F>(f: F) -> Result<TaskHandle, ()>
 where
     F: Future<Output = ()> + 'static,
 {
+    spawn_boxed(Box::pin(f))
+}
+
+/// Spawn a pre-boxed future onto the current worker's arena.
+/// Saves one heap allocation vs `spawn(f)` when the caller has
+/// already produced a `Pin<Box<dyn Future>>` (typical pattern:
+/// listener accept-loops that route through a type-erased
+/// factory closure returning `BoxFuture`).
+///
+/// `Err(())` when the arena is full — the future is dropped
+/// in that case.
+pub fn spawn_boxed(fut: BoxedFuture) -> Result<TaskHandle, ()> {
     let cc = CurrentWorker::enter();
     let worker_id = cc.id();
     let arena = ARENAS.current(&cc);
-    let fut: BoxedFuture = Box::pin(f);
     let mut fut_opt = Some(fut);
     for (idx, slot) in arena.slots.iter().enumerate() {
         if slot

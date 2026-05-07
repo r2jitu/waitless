@@ -423,9 +423,12 @@ impl TcpListener {
                     let stream = listener.accept().await;
                     // `accept_body` wraps the user's body in a
                     // factory that itself clones its captured
-                    // Arc<body> for the per-conn task.
+                    // Arc<body> for the per-conn task. It returns
+                    // a `BoxedFuture`, so route through
+                    // `spawn_boxed` to skip a redundant `Box::pin`
+                    // per accepted conn.
                     let fut = (ctx_inner.accept_body)(stream);
-                    let _ = crate::spawn(fut);
+                    let _ = crate::spawn_boxed(fut);
                 }
             }) {
                 install_worker_task(

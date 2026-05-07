@@ -921,8 +921,10 @@ impl UdpSocket {
                 return;
             }
             let sock = Arc::clone(&ctx_for_launcher.sock);
+            // `body` already returns a `BoxedFuture`, so route
+            // through `spawn_boxed` to skip a redundant `Box::pin`.
             let fut = (ctx_for_launcher.body)(sock);
-            if let Ok(h) = crate::spawn(fut) {
+            if let Ok(h) = crate::spawn_boxed(fut) {
                 install_worker_task(
                     &ctx_for_launcher.stopping,
                     &ctx_for_launcher.handles,
