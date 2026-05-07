@@ -72,6 +72,15 @@ struct Datagram {
     src_ip: IpAddr,
     src_port: u16,
     len: u16,
+    /// Zero-copy payload — `Some` when the slot was filled via the
+    /// IOBuf path (driver supports `iobuf_rx`). `iobuf.data()` is
+    /// the UDP payload (Eth/IP/UDP headers already consumed). When
+    /// `Some`, `payload` is unused; when `None`, the legacy memcpy
+    /// path filled `payload[..len]`.
+    iobuf: Option<uni_iobuf::IOBuf>,
+    /// Inline-storage fallback for legacy drivers without IOBuf-RX.
+    /// Unused (but allocated) when the active driver delivers via
+    /// the IOBuf path.
     payload: [u8; MAX_PAYLOAD],
 }
 
@@ -80,6 +89,7 @@ impl Datagram {
         src_ip: IpAddr::V4_ANY,
         src_port: 0,
         len: 0,
+        iobuf: None,
         payload: [0; MAX_PAYLOAD],
     };
 }
@@ -174,9 +184,51 @@ impl WorkerInbox {
         let slot = unsafe { &mut *slots_ptr.add(tail as usize) };
         slot.src_ip = src_ip;
         slot.src_port = src_port;
+        // Clear any stale IOBuf left in this slot from a prior
+        // IOBuf-path push — assignment runs Drop, which releases
+        // the buffer back to the driver pool.
+        slot.iobuf = None;
         let n = payload.len().min(MAX_PAYLOAD);
         slot.len = n as u16;
         slot.payload[..n].copy_from_slice(&payload[..n]);
+        self.tail.store(next, Ordering::Release);
+        true
+    }
+
+    /// Zero-copy push: move an `IOBuf` into the slot. The IOBuf's
+    /// `data()` should already point at just the UDP payload bytes
+    /// (Eth/IP/UDP headers consumed via `IOBuf::consume` upstream).
+    /// Returns `false` (and drops the IOBuf, releasing its backing
+    /// buffer back to the driver pool) when the inbox ring is full.
+    fn try_push_iobuf(
+        &self,
+        src_ip: IpAddr,
+        src_port: u16,
+        iobuf: uni_iobuf::IOBuf,
+    ) -> bool {
+        let slots_ptr = self.slots.load(Ordering::Acquire);
+        if slots_ptr.is_null() {
+            return false;
+        }
+        let mask = self.mask.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Acquire);
+        let next = tail.wrapping_add(1) & mask;
+        if next == head {
+            return false;
+        }
+        // SAFETY: same SPSC ownership argument as `try_push`.
+        let slot = unsafe { &mut *slots_ptr.add(tail as usize) };
+        slot.src_ip = src_ip;
+        slot.src_port = src_port;
+        // Truncate to MAX_PAYLOAD for parity with the byte path,
+        // even though the IOBuf can carry larger payloads — keeps
+        // recv_from's `&mut [u8]` semantics matching across paths.
+        let payload_len = iobuf.data().len().min(MAX_PAYLOAD);
+        slot.len = payload_len as u16;
+        // Assignment drops any stale IOBuf left in this slot from
+        // a prior push, releasing its buffer to the driver pool.
+        slot.iobuf = Some(iobuf);
         self.tail.store(next, Ordering::Release);
         true
     }
@@ -195,11 +247,26 @@ impl WorkerInbox {
         // SAFETY: SPSC — consumer owns the head slot until Release store
         // below; same publication argument as `try_push`.
         let slot = unsafe { &*slots_ptr.add(head as usize) };
-        let n = (slot.len as usize).min(buf.len());
-        buf[..n].copy_from_slice(&slot.payload[..n]);
+        // Pick the source slice based on which push path filled
+        // this slot. The `iobuf` branch is the zero-copy path; the
+        // inline-`payload` branch is the legacy memcpy path.
+        let src_bytes: &[u8] = match &slot.iobuf {
+            Some(b) => {
+                let d = b.data();
+                let n = (slot.len as usize).min(d.len());
+                &d[..n]
+            }
+            None => &slot.payload[..slot.len as usize],
+        };
+        let n = src_bytes.len().min(buf.len());
+        buf[..n].copy_from_slice(&src_bytes[..n]);
         let r = (slot.src_ip, slot.src_port, n);
         let next = head.wrapping_add(1) & mask;
         self.head.store(next, Ordering::Release);
+        // The IOBuf (if any) stays in the slot until the next push
+        // overwrites it. Bounded by inbox capacity (≤64 slots), so
+        // at most that many descriptor buffers stay "in flight"
+        // past consumer drain.
         Some(r)
     }
 
@@ -230,7 +297,14 @@ impl WorkerInbox {
         // own the head slot for the duration of the closure call.
         let slot = unsafe { &*slots_ptr.add(head as usize) };
         let n = slot.len as usize;
-        let r = f(&slot.payload[..n], slot.src_ip, slot.src_port);
+        let src_bytes: &[u8] = match &slot.iobuf {
+            Some(b) => {
+                let d = b.data();
+                &d[..n.min(d.len())]
+            }
+            None => &slot.payload[..n],
+        };
+        let r = f(src_bytes, slot.src_ip, slot.src_port);
         let next = head.wrapping_add(1) & mask;
         self.head.store(next, Ordering::Release);
         Ok(r)
@@ -1297,6 +1371,41 @@ pub fn deliver_udp(dst_port: u16, src_ip: IpAddr, src_port: u16, payload: &[u8])
         if state.port.load(Ordering::Acquire) == dst_port {
             let inbox = state.inboxes.current(&cc);
             let _ = inbox.try_push(src_ip, src_port, payload);
+            inbox.wake_if_parked();
+            return true;
+        }
+    }
+    false
+}
+
+/// Zero-copy variant of [`deliver_udp`]. The caller threads an owned
+/// `IOBuf` (typically `IOBuf::External` wrapping the NIC RX
+/// descriptor's storage) whose visible payload is the UDP datagram
+/// body — Eth/IP/UDP headers consumed via `IOBuf::consume` upstream.
+/// On dispatch, the IOBuf moves into the inbox slot; no memcpy.
+///
+/// Returns `true` if a registered binding was found (whether or not
+/// the inbox push itself succeeded — the existing port-found
+/// semantics match `deliver_udp`). The IOBuf is consumed either way:
+/// `try_push_iobuf` moves it into the slot on success; on full-ring
+/// failure the IOBuf drops here, releasing its buffer to the
+/// driver pool.
+pub fn deliver_udp_iobuf(
+    dst_port: u16,
+    src_ip: IpAddr,
+    src_port: u16,
+    iobuf: uni_iobuf::IOBuf,
+) -> bool {
+    if let Some(slot) = lookup_eph(dst_port) {
+        let _ = slot.inbox.try_push_iobuf(src_ip, src_port, iobuf);
+        slot.inbox.wake_if_parked();
+        return true;
+    }
+    let cc = CurrentWorker::enter();
+    for state in UDP_REGISTRY.iter() {
+        if state.port.load(Ordering::Acquire) == dst_port {
+            let inbox = state.inboxes.current(&cc);
+            let _ = inbox.try_push_iobuf(src_ip, src_port, iobuf);
             inbox.wake_if_parked();
             return true;
         }

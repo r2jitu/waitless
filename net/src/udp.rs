@@ -103,3 +103,36 @@ pub fn udp_receive(src_ip: IpAddr, _dst_ip: IpAddr, data: &[u8]) {
 
     let _ = uni_runtime::net::deliver_udp(dst_port, src_ip, src_port, payload);
 }
+
+/// Zero-copy variant of [`udp_receive`]. The caller hands an owned
+/// `IOBuf` whose `data()` slice is the UDP datagram (header at the
+/// front, then payload). After parsing the header, this function
+/// `consume()`s 8 bytes off the front of the IOBuf so its visible
+/// payload becomes just the body, and forwards via
+/// `deliver_udp_iobuf`. The IOBuf moves into the inbox slot — no
+/// memcpy at the protocol-recv boundary.
+pub fn udp_receive_iobuf(src_ip: IpAddr, _dst_ip: IpAddr, mut iobuf: uni_iobuf::IOBuf) {
+    let data = iobuf.data();
+    let Some(hdr) = UdpHeader::try_ref_from(data) else { return };
+    let dst_port = ntohs(hdr.dst_port);
+    let src_port = ntohs(hdr.src_port);
+    let udp_len = ntohs(hdr.length) as usize;
+    if udp_len < 8 || udp_len > data.len() {
+        return;
+    }
+    // Drop the header borrow before mutating iobuf.
+    let body_len = udp_len - 8;
+    if iobuf.consume(8).is_err() {
+        return;
+    }
+    // The IOBuf may carry trailing pad bytes (Ethernet minimum
+    // frame size, IP options, etc.) past the UDP body; cap the
+    // visible payload to `body_len` by trimming from the back.
+    let visible = iobuf.data().len();
+    if visible > body_len {
+        if iobuf.trim_end(visible - body_len).is_err() {
+            return;
+        }
+    }
+    let _ = uni_runtime::net::deliver_udp_iobuf(dst_port, src_ip, src_port, iobuf);
+}

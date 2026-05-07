@@ -218,6 +218,7 @@ rust_library(
         ":ipv6",
         ":ipv6_send",
         ":types",
+        "//uni-iobuf",
         "//uni-runtime",
     ],
 )

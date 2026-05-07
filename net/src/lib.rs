@@ -386,20 +386,81 @@ pub fn net_receive(frame: &[u8]) {
     });
 }
 
-/// Zero-copy variant of `net_receive`. Same dispatch path; the
-/// IOBuf is borrowed via `iobuf.data()` for the parse/dispatch and
-/// dropped at end-of-scope (returning the descriptor's buffer to
-/// the driver's spare pool). Used as the callback for
-/// `uni_drivers::net::poll_qp_iobuf` on Tier 1 and as the inbox-
-/// drain step on Tier 2.
-pub fn net_receive_iobuf(iobuf: uni_iobuf::IOBuf) {
-    dispatch_frame(iobuf.data(), |_frame, pkt, _src_mac| {
-        REGISTRY.dispatch(
-            pkt.protocol, pkt.src.addr, pkt.dst.addr, pkt.payload,
-        );
-    });
-    // `iobuf` drops here. For `IOBuf::External` from virtio-net's
-    // iobuf_rx path, drop runs the descriptor-buffer pool callback.
+/// Zero-copy variant of `net_receive`. Mirrors `dispatch_frame`'s
+/// Eth/IPv4 walk but threads the owned `IOBuf` through to UDP via
+/// `udp::udp_receive_iobuf`, so the UDP inbox can take ownership
+/// without memcpy'ing the payload. TCP / IPv6 / ARP paths fall
+/// through to the legacy `&[u8]` REGISTRY dispatch — the IOBuf
+/// then drops at end-of-scope, returning the descriptor's buffer
+/// to the driver's spare pool.
+///
+/// Step 5 covers UDP first because a UDP datagram is independent
+/// (no in-order reassembly) — moving the IOBuf to the inbox slot
+/// is a clean ownership transfer. TCP needs its segment-reassembly
+/// rx_buf to also become IOBuf-shaped before the same trick works
+/// there; that's a follow-up.
+pub fn net_receive_iobuf(mut iobuf: uni_iobuf::IOBuf) {
+    let frame = iobuf.data();
+    let Some((src_mac, ethertype, payload)) = ethernet::ethernet_parse_full(frame) else {
+        return;
+    };
+    match ethertype {
+        ethernet::ETHERTYPE_ARP => {
+            arp::arp_receive(payload);
+            // iobuf drops at fn exit
+        }
+        ethernet::ETHERTYPE_IPV4 => {
+            // Re-borrow `frame` after `payload` to avoid a stale
+            // borrow when we mutate iobuf below.
+            let Some(pkt) = ipv4::ipv4_receive(payload) else { return };
+            if ipv4::same_subnet(pkt.src) {
+                arp::arp_learn(pkt.src, src_mac);
+            }
+            let proto = pkt.protocol;
+            let src = pkt.src.addr;
+            let dst = pkt.dst.addr;
+            // Compute UDP/TCP segment offset relative to frame start.
+            let seg_offset = unsafe {
+                pkt.payload.as_ptr().offset_from(frame.as_ptr()) as usize
+            };
+            let seg_len = pkt.payload.len();
+            // Drop the `pkt` borrow (and the `payload` borrow,
+            // and the `frame` borrow) before mutating iobuf.
+            drop(pkt);
+            match proto {
+                ipv4::PROTO_UDP => {
+                    // Advance iobuf so data() == UDP datagram, then
+                    // hand ownership down. Trim trailing pad bytes
+                    // (the Ethernet frame can be larger than the
+                    // IP `total_length` it carries — pad-to-min-frame
+                    // bytes hang off the back).
+                    if iobuf.consume(seg_offset).is_err() {
+                        return;
+                    }
+                    let visible = iobuf.data().len();
+                    if visible > seg_len
+                        && iobuf.trim_end(visible - seg_len).is_err()
+                    {
+                        return;
+                    }
+                    udp::udp_receive_iobuf(
+                        types::IpAddr::V4(types::Ipv4Addr { addr: src }),
+                        types::IpAddr::V4(types::Ipv4Addr { addr: dst }),
+                        iobuf,
+                    );
+                    // iobuf moved
+                    return;
+                }
+                _ => {
+                    // TCP / other: legacy &[u8] dispatch, then drop.
+                    REGISTRY.dispatch(proto, src, dst, &iobuf.data()[seg_offset..seg_offset + seg_len]);
+                }
+            }
+        }
+        ipv6::ETHERTYPE_IPV6 => ipv6_receive_frame(payload, src_mac),
+        _ => {}
+    }
+    // `iobuf` drops here for non-UDP-success paths.
 }
 
 /// Tier 2 distributor: classify, then either dispatch inline (when

@@ -22,6 +22,7 @@ rust_library(
     crate_name = "uni_runtime",
     deps = [
         "//net:types",
+        "//uni-iobuf",
         "//uni-worker",
         "//uni-platform",
     ],
