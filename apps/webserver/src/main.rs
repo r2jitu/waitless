@@ -364,16 +364,22 @@ fn shell_body(active: &str, title: &str, body: IOBufChain) -> IOBufChain {
     use uni_http::{IOBuf, MAX_HEADER_RESERVE as HDR, MAX_TRAILER_RESERVE as TRL};
     use core::fmt::Write as _;
 
-    // Title chunk: small IOBuf with TLS reserve, populated
-    // directly via append_slice.
-    let mut title_buf = IOBuf::new_with_reserved(HDR, title.len().max(1), TRL);
+    // Title and nav chunks borrow from the same per-conn body
+    // scratch as the page body, partitioned in order. Three
+    // `body_iobuf` calls = three sub-ranges of one buffer = zero
+    // heap allocations for any of them. Falls back to fresh
+    // `IOBuf::new_with_reserved` if the scratch is exhausted or
+    // we're outside a handler invocation.
+    let title_cap = title.len().max(1);
+    let mut title_buf = uni_http::body_iobuf(title_cap)
+        .unwrap_or_else(|| IOBuf::new_with_reserved(HDR, title_cap, TRL));
     let _ = title_buf.append_slice(title.as_bytes());
 
-    // Nav chunk: render the active-class flip directly into the
-    // IOBuf via IOBufWriter — no intermediate `String` alloc,
-    // no String → IOBuf copy. 512 B covers the current 6-link
-    // nav with class flip; the writer truncates above that.
-    let mut nav_buf = IOBuf::new_with_reserved(HDR, 512, TRL);
+    // 512 B covers the current 6-link nav with active-class flip;
+    // the writer truncates above that.
+    const NAV_CAP: usize = 512;
+    let mut nav_buf = uni_http::body_iobuf(NAV_CAP)
+        .unwrap_or_else(|| IOBuf::new_with_reserved(HDR, NAV_CAP, TRL));
     {
         let mut w = nav_buf.writer();
         for (path, label) in NAV {
@@ -653,12 +659,19 @@ fn page_diagnostics() -> Response {
     use uni_http::{IOBuf, MAX_HEADER_RESERVE as HDR, MAX_TRAILER_RESERVE as TRL};
     use core::fmt::Write as _;
 
-    // 12 KiB payload capacity covers the worst-case rendered
+    // Payload capacity: 12 KiB covers the worst-case rendered
     // diagnostics page (~9 KiB observed); past that the writer
-    // truncates and we fall back to a clean response. Total IOBuf
-    // storage: 5 + 12288 + 17 = 12310 B.
+    // truncates.
+    //
+    // Borrows the per-conn body scratch parked by `handle_conn`
+    // in the per-worker slot — zero allocation per response.
+    // Falls back to `IOBuf::new_with_reserved` when there's no
+    // active handler-side scratch (test contexts) or when
+    // another part of this same handler invocation has already
+    // taken it.
     const PAYLOAD_CAP: usize = 12 * 1024;
-    let mut body = IOBuf::new_with_reserved(HDR, PAYLOAD_CAP, TRL);
+    let mut body = uni_http::body_iobuf(PAYLOAD_CAP)
+        .unwrap_or_else(|| IOBuf::new_with_reserved(HDR, PAYLOAD_CAP, TRL));
     {
         let mut w = body.writer();
 
@@ -752,7 +765,8 @@ fn stats_response() -> Response {
 
     // 1 KiB body region — even with 32 queue pairs and 20-digit
     // u64 counters this stays well under cap.
-    let mut body = IOBuf::new_with_reserved(HDR, 1024, TRL);
+    let mut body = uni_http::body_iobuf(1024)
+        .unwrap_or_else(|| IOBuf::new_with_reserved(HDR, 1024, TRL));
     {
         let mut w = body.writer();
         let _ = w.write_str("{\"rx_frames\":[");
@@ -781,7 +795,8 @@ fn heap_response() -> Response {
     // `TlsStream::send_iobuf` takes the encrypt-in-place path
     // on this body chunk. ~200 B JSON + reserve.
     let s = uni::diagnostics::heap_stats();
-    let mut body = IOBuf::new_with_reserved(HDR, 256, TRL);
+    let mut body = uni_http::body_iobuf(256)
+        .unwrap_or_else(|| IOBuf::new_with_reserved(HDR, 256, TRL));
     let _ = write!(body.writer(),
         "{{\"allocated_bytes\":{},\"available_bytes\":{},\"claimed_bytes\":{},\
          \"allocation_count\":{},\"fragment_count\":{},\"total_allocation_count\":{}}}",
@@ -799,7 +814,8 @@ fn quic_stats_response() -> Response {
     // 1 KiB body region covers ~37 named u64 counters (the
     // current snapshot size); render in place to skip the
     // String → IOBuf copy.
-    let mut body = IOBuf::new_with_reserved(HDR, 1024, TRL);
+    let mut body = uni_http::body_iobuf(1024)
+        .unwrap_or_else(|| IOBuf::new_with_reserved(HDR, 1024, TRL));
     {
         let mut w = body.writer();
         let _ = w.write_str("{");
