@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import socket
+import ssl
 import subprocess
 import sys
 import threading
@@ -121,11 +122,65 @@ class WebserverServiceTest(unittest.TestCase):
         self.assertIn(b"Not Found", body)
 
     # ── HTTPS ────────────────────────────────────────────────────
+    # The HTML pages all flow through `shell_body` in main.rs, which
+    # builds a 9-part `Body` chain (mostly borrowed-static slices,
+    # plus a couple of owned per-request chunks). That hits a code
+    # path the small static endpoints (/health, JSON dumps) don't:
+    # `ResponseBody::Chain` → one `stream.send(part)` per chunk →
+    # multiple TLS records per response. Asserting on the body
+    # boundaries (`<!DOCTYPE html>` head, `</html>` tail, byte size,
+    # nav-bar active-class flip) lights up corruption that a
+    # status-only check would miss — a chunk dropped, a record
+    # mis-encrypted, or a content-length disagreement would all
+    # surface here as a body-size or boundary mismatch.
+    SHELL_PAGES: tuple[tuple[str, str, str], ...] = (
+        ("/",             "Home",          "/\" class=\"active\""),
+        ("/architecture", "Architecture",  "/architecture\" class=\"active\""),
+        ("/network",      "Network",       "/network\" class=\"active\""),
+        ("/tls",          "TLS",           "/tls\" class=\"active\""),
+        ("/quic",         "QUIC",          "/quic\" class=\"active\""),
+        ("/diagnostics",  "Diagnostics",   "/diagnostics\" class=\"active\""),
+    )
+
+    def _assert_full_html(self, body: bytes, title: str, active_marker: str) -> None:
+        self.assertTrue(body.startswith(b"<!DOCTYPE html>"),
+                        f"body doesn't start with doctype: {body[:40]!r}")
+        self.assertTrue(body.rstrip().endswith(b"</html>"),
+                        f"body doesn't end with </html>: ...{body[-60:]!r}")
+        self.assertIn(f"<title>{title} — UniKernel</title>".encode(), body,
+                      f"title missing for {title!r}")
+        self.assertIn(active_marker.encode(), body,
+                      f"active nav marker missing for {active_marker!r}")
+        # Sanity floor: shell + nav + STYLES + page body is always
+        # ≥ 5 KiB. A truncated multi-part body (chunk dropped mid-
+        # response) typically lands well below this.
+        self.assertGreater(len(body), 5000, f"body suspiciously small ({len(body)} B)")
+
     def test_https_root(self) -> None:
+        """Full-body verification of /. Exercises the 9-part shell
+        Body → ResponseBody::Chain → multi-record TLS path. Pre-
+        coverage was status-only and would have missed mid-stream
+        truncation."""
         if not DEV_CERT.is_file():
             self.skipTest("dev_cert.pem missing from runfiles")
-        status, _ = https_get("/", port=TLS_PORT, ca_file=DEV_CERT)
+        status, body = https_get("/", port=TLS_PORT, ca_file=DEV_CERT)
         self.assertEqual(status, 200)
+        self._assert_full_html(body, "Home", "/\" class=\"active\"")
+
+    def test_https_all_shell_pages(self) -> None:
+        """Walk every page that goes through `shell_body`. Each
+        renders 5 KiB-9 KiB across 9+ Body parts, sending a
+        different chunk-size mix through `TlsStream::send` →
+        PLAINTEXT_CHUNK splitting. A regression that broke any one
+        page's framing (off-by-one Content-Length, wrong chunk
+        order, dropped trailing static) shows up here."""
+        if not DEV_CERT.is_file():
+            self.skipTest("dev_cert.pem missing from runfiles")
+        for path, title, active in self.SHELL_PAGES:
+            with self.subTest(path=path):
+                status, body = https_get(path, port=TLS_PORT, ca_file=DEV_CERT)
+                self.assertEqual(status, 200)
+                self._assert_full_html(body, title, active)
 
     def test_https_health(self) -> None:
         if not DEV_CERT.is_file():
@@ -140,6 +195,30 @@ class WebserverServiceTest(unittest.TestCase):
         status, body = https_get("/xyz", port=TLS_PORT, ca_file=DEV_CERT)
         self.assertEqual(status, 404)
         self.assertIn(b"Not Found", body)
+
+    def test_https_alpn_http11(self) -> None:
+        """ClientHello with ALPN `h2,http/1.1` must get
+        EncryptedExtensions echoing `http/1.1`. Without the echo,
+        modern Chrome refuses to fall back to a no-ALPN ServerHello
+        and surfaces ERR_SSL_PROTOCOL_ERROR — even though Python's
+        `ssl` module and openssl tolerate the omission and proceed
+        on HTTP/1.1 anyway. Hardcoded `b"http/1.1"` here is the
+        only protocol our HTTPS path supports; the H3/QUIC stack
+        echoes `h3` independently in `uni-quic`."""
+        if not DEV_CERT.is_file():
+            self.skipTest("dev_cert.pem missing from runfiles")
+        ctx = ssl.create_default_context(cafile=str(DEV_CERT))
+        ctx.set_alpn_protocols(["h2", "http/1.1"])
+        sock = socket.create_connection(("127.0.0.1", TLS_PORT), timeout=5.0)
+        try:
+            with ctx.wrap_socket(sock, server_hostname="unikernel.local") as ssock:
+                self.assertEqual(
+                    ssock.selected_alpn_protocol(), "http/1.1",
+                    "server didn't echo http/1.1 ALPN — "
+                    "Chrome will reject this with ERR_SSL_PROTOCOL_ERROR",
+                )
+        finally:
+            sock.close()
 
     def test_https_session_resumption(self) -> None:
         """Verify TLS 1.3 session resumption end-to-end.
@@ -179,6 +258,21 @@ class WebserverServiceTest(unittest.TestCase):
         status, body = h3_get("/health", port=TLS_PORT)
         self.assertEqual(status, 200)
         self.assertIn(b"status", body)
+
+    def test_h3_all_shell_pages(self) -> None:
+        """Same body-integrity check as `test_https_all_shell_pages`
+        but over HTTP/3. The H3 server's `write_response` walks the
+        same `ResponseBody::Chain`, queuing each chunk as a separate
+        SendStream Bytes — a multi-KiB page therefore spans multiple
+        QUIC packets and exercises the SendStream `head_consumed`
+        cursor (chunk too big for one packet → split). Anything that
+        breaks chunk ordering, FIN-on-last-chunk, or QPACK content-
+        length encoding shows up as a size/boundary mismatch here."""
+        for path, title, active in self.SHELL_PAGES:
+            with self.subTest(path=path):
+                status, body = h3_get(path, port=TLS_PORT)
+                self.assertEqual(status, 200)
+                self._assert_full_html(body, title, active)
 
     def test_h3_burst_20_conns(self) -> None:
         """20 sequential HTTP/3 GETs over fresh connections.
@@ -233,6 +327,38 @@ class WebserverServiceTest(unittest.TestCase):
                 failures.append(f"#{i}: {e!r}")
         self.assertFalse(failures, f"{len(failures)}/{n} failed: {failures[:5]}")
 
+    def test_https_burst_multi_part_body(self) -> None:
+        """20 back-to-back HTTPS GETs against `/diagnostics` — the
+        biggest multi-part body the server emits (~9 KiB across 9+
+        chunks, several rendered dynamically per request).
+
+        `test_https_burst_30` only hits `/health` (single 60 B body,
+        one TLS record), so a regression that corrupts a chunk
+        midstream — under-sized record header, off-by-one in the TLS
+        TX buffer accounting, half-flushed `drain_tx` between chunks
+        — slips past it. This burst hammers the chunked path 20×
+        with full-body assertions; pre-fix any flake here would hit
+        every iteration deterministically because `/diagnostics` is
+        the same shape every refresh."""
+        if not DEV_CERT.is_file():
+            self.skipTest("dev_cert.pem missing from runfiles")
+        n = 20
+        failures = []
+        for i in range(n):
+            try:
+                status, body = https_get("/diagnostics", port=TLS_PORT, ca_file=DEV_CERT)
+                if status != 200:
+                    failures.append(f"#{i}: status={status}")
+                elif not body.startswith(b"<!DOCTYPE html>"):
+                    failures.append(f"#{i}: head={body[:40]!r}")
+                elif not body.rstrip().endswith(b"</html>"):
+                    failures.append(f"#{i}: tail={body[-40:]!r}")
+                elif len(body) < 5000:
+                    failures.append(f"#{i}: short body ({len(body)} B)")
+            except Exception as e:
+                failures.append(f"#{i}: {e!r}")
+        self.assertFalse(failures, f"{len(failures)}/{n} failed: {failures[:5]}")
+
     # ── UDP ──────────────────────────────────────────────────────
     def test_udp_echo(self) -> None:
         self.assertEqual(udp_echo(port=UDP_PORT), b"hello")
@@ -265,6 +391,23 @@ class WebserverServiceTest(unittest.TestCase):
                                  ca_file=None)
         self.assertEqual(status, 200)
         self.assertIn(b"status", body)
+
+    def test_https_root_v6(self) -> None:
+        """Multi-part body over IPv6 — regression guard for the
+        family-unaware MSS bug. Pre-fix the guest TCP stack used
+        `MSS=1460` for both v4 and v6, but v6 has a 40-byte
+        header (vs v4's 20), so a 1460-byte v6 payload built a
+        1534-byte Ethernet frame — over the 1500 MTU. /health
+        fit in one short segment so it worked; the home page
+        (~6 KiB across multiple full-size segments) lost data
+        starting at the first 1460-byte payload, surfacing as
+        Chrome's `ERR_SSL_PROTOCOL_ERROR` on
+        `https://localhost/`. Resolves localhost via IPv6 first
+        is exactly the path Chrome takes."""
+        self._skip_unless_v6_bridge()
+        status, body = https_get("/", host="::1", port=TLS_PORT, ca_file=None)
+        self.assertEqual(status, 200)
+        self._assert_full_html(body, "Home", "/\" class=\"active\"")
 
     def test_udp_echo_v6(self) -> None:
         self._skip_unless_v6_bridge()
