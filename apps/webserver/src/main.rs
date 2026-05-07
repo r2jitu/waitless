@@ -17,7 +17,6 @@
 
 extern crate alloc;
 
-use alloc::format;
 use alloc::string::String;
 use core::fmt::Write as _;
 
@@ -713,58 +712,73 @@ const HEALTH_JSON: &[u8] =
 /// Per-queue RX frame counts + used-ring cursors, so we can see how
 /// the NIC is distributing flows under Tier 1 multi-queue.
 fn stats_response() -> Response {
+    use uni_http::{IOBuf, MAX_HEADER_RESERVE as HDR, MAX_TRAILER_RESERVE as TRL};
     let counts = uni::diagnostics::net_rx_counts();
     let cursors = uni::diagnostics::net_rx_used_cursors();
     let nqp = uni::diagnostics::net_num_queue_pairs() as usize;
 
-    let mut body = String::from("{\"rx_frames\":[");
-    for i in 0..nqp.min(counts.len()) {
-        if i > 0 { body.push(','); }
-        let _ = write!(body, "{}", counts[i]);
+    // 1 KiB body region — even with 32 queue pairs and 20-digit
+    // u64 counters this stays well under cap.
+    let mut body = IOBuf::new_with_reserved(HDR, 1024, TRL);
+    {
+        let mut w = body.writer();
+        let _ = w.write_str("{\"rx_frames\":[");
+        for i in 0..nqp.min(counts.len()) {
+            if i > 0 { let _ = w.write_str(","); }
+            let _ = write!(w, "{}", counts[i]);
+        }
+        let _ = w.write_str("],\"rx_used_dev\":[");
+        for i in 0..nqp.min(cursors.len()) {
+            if i > 0 { let _ = w.write_str(","); }
+            let _ = write!(w, "{}", cursors[i].0);
+        }
+        let _ = w.write_str("],\"rx_used_drv\":[");
+        for i in 0..nqp.min(cursors.len()) {
+            if i > 0 { let _ = w.write_str(","); }
+            let _ = write!(w, "{}", cursors[i].1);
+        }
+        let _ = write!(w, "],\"num_queue_pairs\":{}}}", nqp);
     }
-    body.push_str("],\"rx_used_dev\":[");
-    for i in 0..nqp.min(cursors.len()) {
-        if i > 0 { body.push(','); }
-        let _ = write!(body, "{}", cursors[i].0);
-    }
-    body.push_str("],\"rx_used_drv\":[");
-    for i in 0..nqp.min(cursors.len()) {
-        if i > 0 { body.push(','); }
-        let _ = write!(body, "{}", cursors[i].1);
-    }
-    let _ = write!(body, "],\"num_queue_pairs\":{}}}", nqp);
-
-    Response::ok(b"application/json", body)
+    Response::ok(&b"application/json"[..], body)
 }
 
 fn heap_response() -> Response {
+    use uni_http::{IOBuf, MAX_HEADER_RESERVE as HDR, MAX_TRAILER_RESERVE as TRL};
+    // Render directly into an IOBuf with TLS reserve so
+    // `TlsStream::send_iobuf` takes the encrypt-in-place path
+    // on this body chunk. ~200 B JSON + reserve.
     let s = uni::diagnostics::heap_stats();
-    let body = format!(
+    let mut body = IOBuf::new_with_reserved(HDR, 256, TRL);
+    let _ = write!(body.writer(),
         "{{\"allocated_bytes\":{},\"available_bytes\":{},\"claimed_bytes\":{},\
          \"allocation_count\":{},\"fragment_count\":{},\"total_allocation_count\":{}}}",
-        s.allocated_bytes,
-        s.available_bytes,
-        s.claimed_bytes,
-        s.allocation_count,
-        s.fragment_count,
-        s.total_allocation_count,
+        s.allocated_bytes, s.available_bytes, s.claimed_bytes,
+        s.allocation_count, s.fragment_count, s.total_allocation_count,
     );
-    Response::ok(b"application/json", body)
+    Response::ok(&b"application/json"[..], body)
 }
 
 /// Snapshot of the QUIC-stack counters (`uni_quic::diag::snapshot`).
 /// Same numbers the Diagnostics page renders, exposed as JSON for
 /// programmatic monitoring.
 fn quic_stats_response() -> Response {
-    let mut body = String::from("{");
-    let mut first = true;
-    for (name, value) in uni_quic::diag::snapshot() {
-        if !first { body.push(','); }
-        first = false;
-        let _ = write!(body, "\"{}\":{}", name, value);
+    use uni_http::{IOBuf, MAX_HEADER_RESERVE as HDR, MAX_TRAILER_RESERVE as TRL};
+    // 1 KiB body region covers ~37 named u64 counters (the
+    // current snapshot size); render in place to skip the
+    // String → IOBuf copy.
+    let mut body = IOBuf::new_with_reserved(HDR, 1024, TRL);
+    {
+        let mut w = body.writer();
+        let _ = w.write_str("{");
+        let mut first = true;
+        for (name, value) in uni_quic::diag::snapshot() {
+            if !first { let _ = w.write_str(","); }
+            first = false;
+            let _ = write!(w, "\"{}\":{}", name, value);
+        }
+        let _ = w.write_str("}");
     }
-    body.push('}');
-    Response::ok(b"application/json", body)
+    Response::ok(&b"application/json"[..], body)
 }
 
 const PROFILE_BUF_LEN: usize = 4096;
