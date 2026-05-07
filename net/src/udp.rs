@@ -83,34 +83,30 @@ pub fn send_to_addr(dst: IpAddr, src_port: u16, dst_port: u16, data: &[u8]) {
     }
 }
 
+/// Borrowed-bytes UDP entry. Used by the IPv6 receive path
+/// (which still threads `&[u8]` through `dispatch_frame`) and as
+/// a thin shim over `udp_receive_iobuf` — wraps the slice in a
+/// Heap IOBuf and forwards. Per-packet alloc, but only the IPv6
+/// path hits this; the IPv4 fast path goes straight through
+/// `udp_receive_iobuf` from `net_receive_iobuf` without
+/// allocating.
+pub fn udp_receive(src_ip: IpAddr, dst_ip: IpAddr, data: &[u8]) {
+    let iobuf = uni_iobuf::IOBuf::from_slice_with_headroom(0, data, 0);
+    udp_receive_iobuf(src_ip, dst_ip, iobuf);
+}
+
 /// Called by the network dispatch layer when protocol == UDP.
 /// Delivers the datagram to the async reactor if a
 /// `uni_runtime::net::UdpSocket` is bound to the destination port;
 /// otherwise drops it.
-pub fn udp_receive(src_ip: IpAddr, _dst_ip: IpAddr, data: &[u8]) {
-    let hdr = match UdpHeader::try_ref_from(data) {
-        Some(h) => h,
-        None => return,
-    };
-    let dst_port = ntohs(hdr.dst_port);
-    let src_port = ntohs(hdr.src_port);
-    let udp_len = ntohs(hdr.length) as usize;
-
-    if udp_len < 8 || udp_len > data.len() {
-        return;
-    }
-    let payload = &data[8..udp_len];
-
-    let _ = uni_runtime::net::deliver_udp(dst_port, src_ip, src_port, payload);
-}
-
-/// Zero-copy variant of [`udp_receive`]. The caller hands an owned
-/// `IOBuf` whose `data()` slice is the UDP datagram (header at the
-/// front, then payload). After parsing the header, this function
-/// `consume()`s 8 bytes off the front of the IOBuf so its visible
-/// payload becomes just the body, and forwards via
-/// `deliver_udp_iobuf`. The IOBuf moves into the inbox slot — no
-/// memcpy at the protocol-recv boundary.
+///
+/// The caller hands an owned `IOBuf` whose `data()` slice is the
+/// UDP datagram (header at the front, then payload). After parsing
+/// the header, this function `consume()`s 8 bytes off the front of
+/// the IOBuf so its visible payload becomes just the body, and
+/// forwards via `deliver_udp_iobuf`. The IOBuf moves into the
+/// inbox slot — no memcpy at the protocol-recv boundary on the
+/// IPv4 fast path.
 pub fn udp_receive_iobuf(src_ip: IpAddr, _dst_ip: IpAddr, mut iobuf: uni_iobuf::IOBuf) {
     let data = iobuf.data();
     let Some(hdr) = UdpHeader::try_ref_from(data) else { return };

@@ -22,20 +22,13 @@ pub extern crate net_protocol as protocol;
 
 pub static REGISTRY: protocol::Registry = protocol::Registry::new();
 
-// Adapters converting the u32-IP registry ABI to the family-typed
-// `*_receive` entry points. The registry itself stays v4-only
-// (the protocol number space is shared with v6 but the dispatch
-// wrappers always wrap incoming u32 IPs in `IpAddr::V4`); IPv6
-// dispatch goes through `dispatch_ipv6_l4_to_registry` directly.
+// REGISTRY adapter for IPv4 TCP. Wraps the u32-IP ABI into the
+// family-typed `tcp_receive` entry. IPv4 UDP no longer goes through
+// REGISTRY — it routes directly through `udp_receive_iobuf` from
+// `net_receive_iobuf`. IPv6 dispatch (both TCP and UDP) calls the
+// `*_receive` entries directly from `ipv6_receive_frame`.
 fn tcp_dispatch(src: u32, dst: u32, payload: &[u8]) {
     tcp::tcp_receive(
-        types::IpAddr::V4(types::Ipv4Addr { addr: src }),
-        types::IpAddr::V4(types::Ipv4Addr { addr: dst }),
-        payload,
-    );
-}
-fn udp_dispatch(src: u32, dst: u32, payload: &[u8]) {
-    udp::udp_receive(
         types::IpAddr::V4(types::Ipv4Addr { addr: src }),
         types::IpAddr::V4(types::Ipv4Addr { addr: dst }),
         payload,
@@ -96,7 +89,6 @@ pub fn init_stack() {
     init_ipv6();
 
     REGISTRY.register(protocol::Slot::Tcp, tcp_dispatch);
-    REGISTRY.register(protocol::Slot::Udp, udp_dispatch);
     // Wire up the async `uni::runtime::TcpListener` reactor and
     // the per-stream recv/send reactors — all via a single backend
     // vtable. Listening requires one slot per core (each core
@@ -199,7 +191,7 @@ pub fn poll() -> bool {
     let num_cores = percpu::num_cores();
 
     if num_cores <= 1 {
-        return uni_drivers::net::poll(net_receive) > 0;
+        return uni_drivers::net::poll(net_receive_iobuf) > 0;
     }
 
     // Tier 1: multi-queue — each core polls its own RX queue pair.
@@ -234,15 +226,10 @@ fn poll_tier1() -> bool {
     // fired we fall back to the per-core scheme — APs are then
     // polling their own queues, and double-polling would race on
     // the per-queue cursor atomics.
-    let iobuf_path = uni_drivers::net::iobuf_rx_supported();
     if core == 0 && !uni_kernel::eventloop::is_ready() {
         let mut total = 0;
         for q in 0..nqp as usize {
-            total += if iobuf_path {
-                uni_drivers::net::poll_qp_iobuf(q, net_receive_iobuf)
-            } else {
-                uni_drivers::net::poll_qp(q, net_receive)
-            };
+            total += uni_drivers::net::poll_qp(q, net_receive_iobuf);
         }
         return total > 0;
     }
@@ -254,11 +241,7 @@ fn poll_tier1() -> bool {
     if core >= nqp {
         return false;
     }
-    let count = if iobuf_path {
-        uni_drivers::net::poll_qp_iobuf(core as usize, net_receive_iobuf)
-    } else {
-        uni_drivers::net::poll_qp(core as usize, net_receive)
-    };
+    let count = uni_drivers::net::poll_qp(core as usize, net_receive_iobuf);
     count > 0
 }
 
@@ -304,11 +287,7 @@ fn poll_tier2(num_cores: u32) -> bool {
         WAKEUP.at(i).store(false, core::sync::atomic::Ordering::Relaxed);
     }
 
-    let count = if uni_drivers::net::iobuf_rx_supported() {
-        uni_drivers::net::poll_iobuf(distribute_frame_iobuf)
-    } else {
-        uni_drivers::net::poll(distribute_frame)
-    };
+    let count = uni_drivers::net::poll(distribute_frame_iobuf);
 
     // Mark ourselves as "just distributed" — our next poll attempt will
     // yield, giving other cores first shot at the lock.
@@ -341,64 +320,16 @@ fn poll_tier2(num_cores: u32) -> bool {
     had_frames
 }
 
-/// Common ethertype-dispatch helper. `inline_ipv4` handles a parsed
-/// IPv4 packet — `net_receive` always passes the inline-dispatch
-/// closure that calls the protocol REGISTRY directly; the Tier 2
-/// distributor passes a closure that flow-hashes and may push the
-/// raw frame to another core's inbox first. ARP and IPv6 don't
-/// participate in cross-core distribution today, so both entry
-/// points handle them identically and inline.
-#[inline(always)]
-fn dispatch_frame<F>(frame: &[u8], mut inline_ipv4: F)
-where
-    F: FnMut(&[u8], ipv4::Ipv4Packet<'_>, types::MacAddr),
-{
-    let (src_mac, ethertype, payload) = match ethernet::ethernet_parse_full(frame) {
-        Some(t) => t,
-        None => return,
-    };
-    match ethertype {
-        ethernet::ETHERTYPE_ARP => arp::arp_receive(payload),
-        ethernet::ETHERTYPE_IPV4 => {
-            if let Some(pkt) = ipv4::ipv4_receive(payload) {
-                // Snoop (src_ip, src_mac) into the ARP fast cache if
-                // the peer is on our subnet — both paths want this.
-                if ipv4::same_subnet(pkt.src) {
-                    arp::arp_learn(pkt.src, src_mac);
-                }
-                inline_ipv4(frame, pkt, src_mac);
-            }
-        }
-        ipv6::ETHERTYPE_IPV6 => ipv6_receive_frame(payload, src_mac),
-        _ => {}
-    }
-}
 
 /// Process a single received frame through the full stack inline
-/// (no cross-core distribution). Called from the Tier 1 multi-queue
-/// path, the single-core path, and `net_drain_cb` (after the
-/// distributor pushed a frame to this core's inbox).
-pub fn net_receive(frame: &[u8]) {
-    dispatch_frame(frame, |_frame, pkt, _src_mac| {
-        REGISTRY.dispatch(
-            pkt.protocol, pkt.src.addr, pkt.dst.addr, pkt.payload,
-        );
-    });
-}
-
-/// Zero-copy variant of `net_receive`. Mirrors `dispatch_frame`'s
-/// Eth/IPv4 walk but threads the owned `IOBuf` through to UDP via
-/// `udp::udp_receive_iobuf`, so the UDP inbox can take ownership
-/// without memcpy'ing the payload. TCP / IPv6 / ARP paths fall
-/// through to the legacy `&[u8]` REGISTRY dispatch — the IOBuf
-/// then drops at end-of-scope, returning the descriptor's buffer
-/// to the driver's spare pool.
+/// (no cross-core distribution). Called from the Tier 1 per-core
+/// poll, the single-core fallback, and `net_drain_cb` (after the
+/// Tier 2 distributor pushed an IOBuf to this core's inbox).
 ///
-/// Step 5 covers UDP first because a UDP datagram is independent
-/// (no in-order reassembly) — moving the IOBuf to the inbox slot
-/// is a clean ownership transfer. TCP needs its segment-reassembly
-/// rx_buf to also become IOBuf-shaped before the same trick works
-/// there; that's a follow-up.
+/// The IOBuf is consumed: for UDP the ownership flows to the UDP
+/// inbox slot (zero-copy); for ARP / TCP / IPv6 the dispatch reads
+/// `iobuf.data()` synchronously and the IOBuf drops at end-of-
+/// scope (returning its backing buffer to the driver's pool).
 pub fn net_receive_iobuf(mut iobuf: uni_iobuf::IOBuf) {
     let frame = iobuf.data();
     let Some((src_mac, ethertype, payload)) = ethernet::ethernet_parse_full(frame) else {
@@ -463,45 +394,11 @@ pub fn net_receive_iobuf(mut iobuf: uni_iobuf::IOBuf) {
     // `iobuf` drops here for non-UDP-success paths.
 }
 
-/// Tier 2 distributor: classify, then either dispatch inline (when
-/// the flow hashes to our own core or single-core mode) or push the
-/// raw frame to the target core's RX inbox.
-fn distribute_frame(frame: &[u8]) {
-    let num_cores = percpu::num_cores();
-    let my_core = uni_kernel::cpu_id();
-    dispatch_frame(frame, |frame, pkt, _src_mac| {
-        // Extract ports for the 4-tuple flow hash (TCP and UDP both
-        // have src_port/dst_port at offset 0-3 of their headers).
-        let (src_port, dst_port) = if pkt.payload.len() >= 4 {
-            (u16::from_be_bytes([pkt.payload[0], pkt.payload[1]]),
-             u16::from_be_bytes([pkt.payload[2], pkt.payload[3]]))
-        } else {
-            (0, 0)
-        };
-        let target = flow_hash(
-            pkt.src.addr, pkt.dst.addr, src_port, dst_port, num_cores,
-        );
-        if target == my_core || num_cores <= 1 {
-            REGISTRY.dispatch(pkt.protocol, pkt.src.addr, pkt.dst.addr, pkt.payload);
-        } else {
-            // SAFETY: percpu::init() runs before any AP starts;
-            // target is bounded by num_cores. SPSC: only the
-            // distributor pushes to a given core's inbox, only the
-            // target core (in net_drain_cb) consumes.
-            let core = unsafe { percpu::get(target) };
-            if core.rx_inbox.push(frame) {
-                WAKEUP.at(target).store(true, core::sync::atomic::Ordering::Relaxed);
-            }
-        }
-    });
-}
-
-/// Tier 2 distributor decision — classify a frame for the IOBuf
-/// path. Pulled out into its own function so it can run BEFORE we
-/// commit to moving the IOBuf (the closure-passed-to-`dispatch_frame`
-/// shape conflicts with moving the borrowed-from value out of the
-/// closure body). Side effect: ARP-learns from on-subnet IPv4
-/// senders, exactly like `dispatch_frame` does on the copy path.
+/// Tier 2 distributor decision — classify an IOBuf for distribution.
+/// Returns where the frame should go: inline on the polling core,
+/// distributed to a peer core, or dropped. Side effect: ARP-learns
+/// from on-subnet IPv4 senders so the polling core's ARP cache
+/// stays warm regardless of where the packet ends up handled.
 fn classify_for_distribution(
     frame: &[u8],
     num_cores: u32,
@@ -910,18 +807,10 @@ fn net_drain_cb(core_id: u32) -> bool {
     let cc = unsafe { percpu::CurrentWorker::from_id_unchecked(core_id) };
     let core = percpu::percore(&cc); // SAFE access via the token
     let mut did_work = false;
-    // Zero-copy inbox first: when the active driver supports it,
-    // `distribute_frame_iobuf` pushes IOBufs here instead of memcpy
-    // ing into `rx_inbox`. Drains both regardless — a driver upgrade
-    // (or a brief boot-window mismatch) shouldn't strand frames in
-    // the wrong inbox.
+    // Tier 2 cross-core delivery: distributor pushes owned IOBufs;
+    // owning core takes ownership here and dispatches inline.
     while let Some(iobuf) = core.rx_iobuf_inbox.pop() {
         net_receive_iobuf(iobuf);
-        did_work = true;
-    }
-    let mut buf = [0u8; 1514];
-    while let Some(len) = core.rx_inbox.pop_into(&mut buf) {
-        net_receive(&buf[..len]);
         did_work = true;
     }
     did_work

@@ -1182,27 +1182,6 @@ fn poke_interrupt_status() {
     }
 }
 
-fn poll(callback: fn(&[u8])) -> usize {
-    // Drain every negotiated queue pair, not just queue 0. vhost-net
-    // with `mq=on,queues=N` on QEMU hashes RX packets across all N
-    // queue pairs from the very first DHCP OFFER, well before the
-    // guest's CTRL_MQ_VQ_PAIRS_SET activates multi-queue — so if we
-    // only polled queue 0 here (the pre-activation assumption), DHCP
-    // silently timed out on KVM because the OFFER frame landed on
-    // queue 1 and stayed there.
-    //
-    // Post-activation the net-stack's Tier 1 path switches to
-    // per-core `poll_qp(core_id, …)` and this routine is no longer
-    // on the hot path — so scanning N queues here costs us only
-    // during single-queue (Tier 2, `num_cores <= 1`) polling and
-    // during pre-activation DHCP / ARP.
-    let n = unsafe { (*ndev()).negotiated_queue_pairs as usize }.max(1);
-    let mut total = 0;
-    for qp in 0..n {
-        total += poll_qp(qp, callback);
-    }
-    total
-}
 
 /// Per-queue RX counters. Incremented once per consumed frame.
 /// Read via `rx_counts()` from app code (e.g. the /stats handler)
@@ -1254,62 +1233,6 @@ fn rx_used_cursors() -> [(u16, u16); DIAG_QP_CAP] {
     out
 }
 
-/// Poll a specific queue pair for received frames.
-fn poll_qp(qp: usize, callback: fn(&[u8])) -> usize {
-    unsafe {
-        if let Transport::None = (*ndev()).transport { return 0; }
-    }
-
-    // For VIRTIO_F_USED_IDX_MMIO devices: the IRQ handler already
-    // cached the used_idx when it read INTERRUPT_STATUS. Just consume
-    // the flag — no extra MMIO exit needed.
-    if IRQ_PENDING.swap(false, core::sync::atomic::Ordering::Acquire) {
-        // used_idx was cached by irq_handler; get_used() will find it.
-    }
-
-    // Tier 1 (per-core RX queue) — qp is owned by this core, no
-    // lock needed. Tier 2 (single shared queue) — serialise via
-    // TX_LOCK so cores don't race the same TX descriptors.
-    let nqp = unsafe { (*ndev()).num_queue_pairs };
-    if uni_kernel::percpu::num_cores() <= 1 || (nqp as usize) > 1 {
-        tx_drain_qp(qp);
-    } else if let Some(_g) = TX_LOCK.try_lock() {
-        tx_drain_qp(qp);
-        // _g released at end of scope.
-    }
-
-    let mut count: usize = 0;
-    unsafe {
-        while let Some((used_id, used_len)) = (*rx_q(qp)).used() {
-            let desc = (*rx_q(qp)).desc(used_id);
-            let buf = phys_to_virt(desc.addr);
-
-            if used_len > VIRTIO_NET_HDR_SIZE as u32 {
-                let frame_len = (used_len - VIRTIO_NET_HDR_SIZE as u32) as usize;
-                let frame_data = buf.add(VIRTIO_NET_HDR_SIZE);
-                let slice = core::slice::from_raw_parts(frame_data, frame_len);
-                callback(slice);
-            }
-
-            // Re-arm RX buffer
-            let buf_phys = virt_to_phys(buf);
-            (*rx_q(qp)).add_buf(buf_phys, BUFFER_SIZE, 0, 1);
-            count += 1;
-        }
-
-        if count > 0 {
-            (*rx_q(qp)).kick();
-            if qp < DIAG_QP_CAP {
-                RX_COUNTS[qp].fetch_add(
-                    count as u64,
-                    core::sync::atomic::Ordering::Relaxed,
-                );
-            }
-        }
-    }
-
-    count
-}
 
 /// Maximum frames per batch poll.
 const BATCH_SIZE: usize = 32;
@@ -1831,7 +1754,7 @@ fn poll_iobuf(callback: fn(uni_net_driver::IOBuf)) -> usize {
 // The active-driver slot stores `&'static NicOps`; every dispatcher
 // call does one Acquire load + one direct call.
 
-use uni_net_driver::{NicDiagOps, NicIdleOps, NicIobufRxOps, NicOps};
+use uni_net_driver::{NicDiagOps, NicIdleOps, NicOps};
 
 /// `init()` is NOT idempotent — it re-runs PCI/MMIO probe + queue
 /// realloc + MSI-X rebind, corrupting in-flight state if called after
@@ -1853,17 +1776,12 @@ static VIRTIO_NET_DIAG_OPS: NicDiagOps = NicDiagOps {
     rx_used_cursors,
 };
 
-static VIRTIO_NET_IOBUF_RX_OPS: NicIobufRxOps = NicIobufRxOps {
-    poll_rx: poll_iobuf,
-    poll_qp: poll_qp_iobuf,
-};
-
 static VIRTIO_NET_OPS: NicOps = NicOps {
     name: "virtio-net",
     probe,
     send,
-    poll_rx: poll,
-    poll_qp,
+    poll_rx: poll_iobuf,
+    poll_qp: poll_qp_iobuf,
     get_mac,
     num_queue_pairs,
     enable_irq,
@@ -1873,7 +1791,6 @@ static VIRTIO_NET_OPS: NicOps = NicOps {
     poke_interrupt_status,
     idle: Some(&VIRTIO_NET_IDLE_OPS),
     diag: Some(&VIRTIO_NET_DIAG_OPS),
-    iobuf_rx: Some(&VIRTIO_NET_IOBUF_RX_OPS),
 };
 
 uni_net_driver::register_ethernet_driver!(VIRTIO_NET_OPS);

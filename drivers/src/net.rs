@@ -29,38 +29,20 @@ pub fn enable_irq() { (active_ops().enable_irq)() }
 
 // ---- RX / TX datapath -----------------------------------------------------
 
-pub fn poll(callback: fn(&[u8])) -> usize { (active_ops().poll_rx)(callback) }
-pub fn poll_qp(qp: usize, callback: fn(&[u8])) -> usize {
+/// Drain every queue pair into `callback`, one owned [`IOBuf`] per
+/// frame. Used by Tier 2 (single-queue distribute) and the pre-
+/// `set_ready` boot window where APs aren't polling yet.
+pub fn poll(callback: fn(uni_net_driver::IOBuf)) -> usize {
+    (active_ops().poll_rx)(callback)
+}
+
+/// Per-queue variant for Tier 1 multi-queue, where each core only
+/// polls its own RX queue pair.
+pub fn poll_qp(qp: usize, callback: fn(uni_net_driver::IOBuf)) -> usize {
     (active_ops().poll_qp)(qp, callback)
 }
+
 pub fn send(data: &[u8]) { (active_ops().send)(data) }
-
-// ---- Zero-copy RX (opt-in via NicOps::iobuf_rx) ---------------------------
-
-/// `true` iff the active driver implements the IOBuf-RX path.
-/// Callers branch on this to pick `poll_iobuf` over `poll`
-/// (and the IOBuf-shaped Tier 2 inbox over the memcpy one).
-pub fn iobuf_rx_supported() -> bool { active_ops().iobuf_rx.is_some() }
-
-/// Zero-copy variant of `poll`. Each frame arrives at `callback`
-/// as an owned [`uni_iobuf::IOBuf`] (typically `IOBuf::External`
-/// pointing at the descriptor's storage). Returns 0 when the
-/// active driver doesn't implement the path — callers should
-/// gate on `iobuf_rx_supported()` first to avoid spinning.
-pub fn poll_iobuf(callback: fn(uni_net_driver::IOBuf)) -> usize {
-    match active_ops().iobuf_rx {
-        Some(ops) => (ops.poll_rx)(callback),
-        None => 0,
-    }
-}
-
-/// Zero-copy per-queue variant of `poll_qp`.
-pub fn poll_qp_iobuf(qp: usize, callback: fn(uni_net_driver::IOBuf)) -> usize {
-    match active_ops().iobuf_rx {
-        Some(ops) => (ops.poll_qp)(qp, callback),
-        None => 0,
-    }
-}
 
 // ---- Idle / TX-flush knobs -----------------------------------------------
 

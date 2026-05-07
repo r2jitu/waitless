@@ -25,8 +25,17 @@ pub struct NicOps {
 
     // ── Data path ───────────────────────────────────────────────────
     pub send: fn(&[u8]),
-    pub poll_rx: fn(fn(&[u8])) -> usize,
-    pub poll_qp: fn(usize, fn(&[u8])) -> usize,
+    /// Zero-copy RX. The callback receives an owned [`IOBuf`]
+    /// (typically `IOBuf::External` wrapping the descriptor's
+    /// storage) per frame; the IOBuf's drop callback returns the
+    /// buffer to the driver's pool. There used to be a parallel
+    /// `poll_rx: fn(fn(&[u8]))` / `poll_qp: fn(usize, fn(&[u8]))`
+    /// pair for backends that hadn't been ported to IOBuf yet, but
+    /// every backend now implements this surface — so the legacy
+    /// `&[u8]` path is gone and the net stack only has one RX
+    /// shape to reason about.
+    pub poll_rx: fn(fn(IOBuf)) -> usize,
+    pub poll_qp: fn(usize, fn(IOBuf)) -> usize,
 
     // ── Config / bring-up ───────────────────────────────────────────
     pub get_mac: fn(*mut u8),
@@ -49,18 +58,6 @@ pub struct NicOps {
     /// Per-queue diagnostics. `None` = driver doesn't expose them;
     /// dispatcher returns zero arrays.
     pub diag: Option<&'static NicDiagOps>,
-
-    /// Zero-copy RX path. `Some` = driver hands an [`IOBuf::External`]
-    /// pointing directly at the RX descriptor's buffer; the IOBuf's
-    /// drop callback returns the buffer to the driver's pool (so the
-    /// descriptor can be re-posted). `None` = driver only supports
-    /// the copy path through `poll_rx` / `poll_qp`.
-    ///
-    /// Callers that prefer the zero-copy path probe this field and
-    /// fall back to `poll_rx` when it's `None`. Wiring a new driver
-    /// up to zero-copy is purely additive — the copy path keeps
-    /// working until every driver has flipped over.
-    pub iobuf_rx: Option<&'static NicIobufRxOps>,
 }
 
 /// NAPI-style idle hooks. A driver that implements interrupt-driven
@@ -80,27 +77,6 @@ pub struct NicDiagOps {
     pub rx_used_cursors: fn() -> [(u16, u16); 8],
 }
 
-/// Zero-copy RX hooks. A driver that implements these hands each
-/// received frame to the consumer as an [`IOBuf::External`]
-/// pointing at the descriptor's underlying storage; when the IOBuf
-/// drops, its callback returns the buffer to the driver's pool so
-/// the descriptor can be re-posted to the NIC.
-///
-/// Mirrors the shape of `poll_rx` / `poll_qp` — same callback-per-
-/// frame loop — except the callback receives an owned `IOBuf`
-/// instead of a borrowed `&[u8]`. The consumer can then forward the
-/// IOBuf across cores (Tier 2) or up the stack (TCP/UDP recv) with
-/// zero memcpy.
-///
-/// To stay zero-copy past one poll cycle the driver needs a buffer
-/// pool slightly larger than its descriptor count, so a descriptor
-/// can be re-posted with a fresh buffer while the consumer still
-/// holds the previous one. Without that headroom the IOBuf's drop
-/// callback would fire too late and the queue would stall.
-pub struct NicIobufRxOps {
-    pub poll_rx: fn(fn(IOBuf)) -> usize,
-    pub poll_qp: fn(usize, fn(IOBuf)) -> usize,
-}
 
 // ---- Link-time registry ---------------------------------------------------
 
@@ -164,8 +140,8 @@ pub fn linked_ethernet_drivers() -> &'static [EthernetDriverReg] {
 // one Acquire load + one direct fn-pointer call.
 
 fn null_send(_: &[u8]) {}
-fn null_poll(_: fn(&[u8])) -> usize { 0 }
-fn null_poll_qp(_: usize, _: fn(&[u8])) -> usize { 0 }
+fn null_poll(_: fn(IOBuf)) -> usize { 0 }
+fn null_poll_qp(_: usize, _: fn(IOBuf)) -> usize { 0 }
 fn null_probe() -> bool { false }
 fn null_get_mac(_: *mut u8) {}
 fn null_num_queue_pairs() -> u16 { 1 }
@@ -187,7 +163,6 @@ static NULL_OPS: NicOps = NicOps {
     poke_interrupt_status: null_void,
     idle: None,
     diag: None,
-    iobuf_rx: None,
 };
 
 static ACTIVE_OPS: AtomicPtr<NicOps> =

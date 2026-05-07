@@ -1755,7 +1755,7 @@ fn doorbell_write(bar2_va: u64, offset: u32, value: u32) {
 /// each completion descriptor carries `flags_seq` whose low 3 bits
 /// cycle 1..7. When the next descriptor's sequence matches what
 /// we're expecting, it's a new completion.
-fn poll_qp_inner(qp: usize, callback: fn(&[u8])) -> u32 {
+fn poll_qp_inner<F: FnMut(&[u8])>(qp: usize, mut callback: F) -> u32 {
     if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
         return poll_qp_inner_dqo(qp, callback);
     }
@@ -2104,7 +2104,7 @@ fn post_initial_rx_for_qp_dqo(rx: &RxQueue) {
     doorbell_write_le(bar2_va, rx.db_offset, DQO_RX_POOL_BUFS);
 }
 
-fn poll_qp_inner_dqo(qp: usize, callback: fn(&[u8])) -> u32 {
+fn poll_qp_inner_dqo<F: FnMut(&[u8])>(qp: usize, mut callback: F) -> u32 {
     if qp >= MAX_QUEUE_PAIRS { return 0; }
     let rx_ptr = RX_QUEUES[qp].load(Ordering::Acquire);
     if rx_ptr.is_null() { return 0; }
@@ -2252,21 +2252,40 @@ fn rx_used_cursors() -> [(u16, u16); 8] {
     out
 }
 
-/// Per-queue RX poll. Mirrors `uni_drivers::virtio_net::poll_qp(qp, cb)`
-/// so Tier 1 per-core polling in `net::poll_tier1` works unchanged.
-fn poll_qp(qp: usize, callback: fn(&[u8])) -> usize {
-    poll_qp_inner(qp, callback) as usize
+// ---- RX (NicOps::poll_rx / poll_qp) --------------------------------------
+//
+// gve's QPL design pins a fixed set of pages between guest and
+// device, so the device may overwrite a frame's QPL page once we
+// re-fill its descriptor. A real zero-copy IOBuf path for gve
+// would track which descriptors are out at consumers and gate
+// `fill_cnt` advance on in-flight drops — that's substantial
+// enough to be its own follow-up.
+//
+// For now this is a memcpy-wrap stub: per frame we kmalloc a fresh
+// Heap IOBuf and copy the QPL bytes into it, then re-fill the
+// descriptor immediately. Same memcpy count as a `&[u8]` callback
+// would have done; the win is API uniformity — the net stack only
+// has one RX surface to call into.
+
+fn poll_qp(qp: usize, callback: fn(uni_net_driver::IOBuf)) -> usize {
+    poll_qp_inner(qp, |frame| {
+        let iobuf = uni_net_driver::IOBuf::from_slice_with_headroom(0, frame, 0);
+        callback(iobuf);
+    }) as usize
 }
 
 /// Non-per-core poll. Callers (DHCP bring-up, Tier 2 distribute)
 /// don't know which RX queue a given packet landed on, so walk
 /// every live queue. RSS is active by the time `init()` returns,
 /// and DHCP's reply may hash onto any queue — not just qp 0.
-fn poll(callback: fn(&[u8])) -> usize {
+fn poll(callback: fn(uni_net_driver::IOBuf)) -> usize {
     let n = NUM_QP.load(Ordering::Acquire) as usize;
     let mut total: usize = 0;
     for qp in 0..n.min(MAX_QUEUE_PAIRS) {
-        total = total.saturating_add(poll_qp_inner(qp, callback) as usize);
+        total = total.saturating_add(poll_qp_inner(qp, |frame| {
+            let iobuf = uni_net_driver::IOBuf::from_slice_with_headroom(0, frame, 0);
+            callback(iobuf);
+        }) as usize);
     }
     total
 }
@@ -2370,10 +2389,6 @@ static GVE_OPS: NicOps = NicOps {
     poke_interrupt_status: noop,
     idle: None,
     diag: Some(&GVE_DIAG_OPS),
-    // Zero-copy RX not yet wired (gve's QPL has the right shape
-    // for it — buffers stay mapped across descriptor reposts —
-    // but virtio-net is the simpler first port).
-    iobuf_rx: None,
 };
 
 fn noop() {}

@@ -95,6 +95,7 @@ rust_library(
         ":types",
         "//drivers",
         "//kernel",
+        "//uni-iobuf",
     ],
 )
 

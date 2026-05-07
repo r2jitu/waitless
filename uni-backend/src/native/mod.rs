@@ -665,16 +665,49 @@ impl ThreadState {
 /// dispatching the app handler for each datagram. Called from the
 /// worker thread's `collect_events` when its kqueue/epoll reports the
 /// sibling ready.
+///
+/// Allocates a Heap `IOBuf` per datagram, recvs into it directly, and
+/// hands ownership to `deliver_udp_iobuf`. This is the same one-copy
+/// shape the legacy `recvfrom` + memcpy path had — but it routes
+/// through the unified IOBuf delivery surface, so the runtime's UDP
+/// inbox doesn't need a parallel `&[u8]` push path. Native is dev-
+/// only, so the per-packet alloc is acceptable; production goes
+/// through the bare-metal NIC drivers' `iobuf_rx` instead.
 fn drain_udp_sibling(fd: i32, app_port: u16) {
-    let mut buf = [0u8; 65536];
+    // 64 KiB matches the maximum UDP datagram size; the previous
+    // stack buffer was the same size, just dropped on EAGAIN.
+    const RECV_CAP: usize = 65536;
     loop {
+        // `new_with_reserved(0, RECV_CAP, 0)` allocates RECV_CAP
+        // bytes of storage but leaves the visible payload empty —
+        // the `payload_capacity` arg is reserve, not initial len.
+        // `extend_uninit(RECV_CAP)` claims the whole region as
+        // visible payload so `recvfrom` can write into it; we trim
+        // back to the actual recv size below.
+        let mut iobuf = uni_iobuf::IOBuf::new_with_reserved(0, RECV_CAP, 0);
+        let buf_ptr = match iobuf.extend_uninit(RECV_CAP) {
+            Ok(s) => s.as_mut_ptr(),
+            Err(_) => break, // alloc failed / shape mismatch; bail
+        };
         let mut src_addr: SockAddrIn = unsafe { std::mem::zeroed() };
         let mut addr_len = std::mem::size_of::<SockAddrIn>() as u32;
         let n = unsafe {
-            recvfrom(fd, buf.as_mut_ptr(), buf.len(), 0,
+            recvfrom(fd, buf_ptr, RECV_CAP, 0,
                      &mut src_addr, &mut addr_len)
         };
-        if n <= 0 { break; }
+        if n <= 0 {
+            // No more datagrams — `iobuf` drops here, freeing its
+            // backing buffer. One wasted alloc per drain pass on
+            // EAGAIN. Acceptable for the native-dev path.
+            break;
+        }
+        let n = n as usize;
+        // Trim the IOBuf's visible payload to the actual recv'd
+        // size. The remaining `RECV_CAP - n` bytes hang as
+        // tailroom, freed when the IOBuf drops.
+        if n < RECV_CAP {
+            let _ = iobuf.trim_end(RECV_CAP - n);
+        }
         // Mirror of `from_ne_bytes` in udp_send. sin_addr is stored
         // in memory in network byte order; `to_ne_bytes` extracts
         // those four bytes intact regardless of host endianness.
@@ -683,8 +716,7 @@ fn drain_udp_sibling(fd: i32, app_port: u16) {
             addr: u32::from_ne_bytes(src_octets),
         });
         let src_port = u16::from_be(src_addr.sin_port);
-        let payload = &buf[..n as usize];
-        let _ = uni_runtime::net::deliver_udp(app_port, src_ip, src_port, payload);
+        let _ = uni_runtime::net::deliver_udp_iobuf(app_port, src_ip, src_port, iobuf);
     }
 }
 

@@ -41,95 +41,21 @@ impl spsc::Zero for Task {
 
 fn noop(_: usize) {}
 
-/// Maximum packet size for RX inbox.
-const RX_BUF_SIZE: usize = 1514;
-
-/// Number of RX inbox slots per core.
+/// Per-core RX inbox slot count for Tier 2 cross-core delivery.
 const RX_POOL_SIZE: usize = 16;
 
-/// A received packet in the inbox: length + data.
-#[derive(Clone, Copy)]
-pub struct RxPacket {
-    pub len: usize,
-    pub data: [u8; RX_BUF_SIZE],
-}
-
-/// RX inbox: core 0 pushes received frames here, owning core pops and processes.
-///
-/// SPSC discipline: a single producer (core 0, the distributor) calls `push`,
-/// and a single consumer (the owning core) calls `pop_into`. Both take `&self`
-/// because they may run concurrently on different cores.
-pub struct RxInbox {
-    pool: [UnsafeCell<RxPacket>; RX_POOL_SIZE],
-    /// Indices of filled packets, ready for the owning core to process.
-    ready: spsc::Ring<u32>,
-    /// Producer-only cursor into `pool`. AtomicUsize for interior mutability;
-    /// only the producer ever stores, so Relaxed is sufficient.
-    next_slot: AtomicUsize,
-}
-
-// SAFETY: producer/consumer discipline above. The pool slot at `next_slot`
-// is written exclusively by the producer before its release-store on the
-// `ready` ring's tail, and read exclusively by the consumer after its
-// matching acquire-load — same release/acquire chain as `spsc::Ring`.
-unsafe impl Sync for RxInbox {}
-
-impl RxInbox {
-    pub const fn new() -> Self {
-        RxInbox {
-            pool: [const { UnsafeCell::new(RxPacket { len: 0, data: [0; RX_BUF_SIZE] }) }; RX_POOL_SIZE],
-            ready: spsc::Ring::new(),
-            next_slot: AtomicUsize::new(0),
-        }
-    }
-
-    /// Push a frame into the inbox (called by core 0 during distribution).
-    pub fn push(&self, data: &[u8]) -> bool {
-        if data.len() > RX_BUF_SIZE {
-            return false;
-        }
-        let slot = self.next_slot.load(Ordering::Relaxed);
-        // SAFETY: producer-only write to its current slot. The consumer can
-        // only observe this write after the release-store inside `ready.push`.
-        unsafe {
-            let pkt = &mut *self.pool[slot].get();
-            pkt.data[..data.len()].copy_from_slice(data);
-            pkt.len = data.len();
-        }
-        if !self.ready.push(slot as u32) {
-            return false;
-        }
-        self.next_slot.store((slot + 1) % RX_POOL_SIZE, Ordering::Relaxed);
-        true
-    }
-
-    /// Pop a ready frame into a caller-provided buffer (called by owning core).
-    /// Returns the number of bytes copied, or None if the inbox is empty.
-    pub fn pop_into(&self, out: &mut [u8]) -> Option<usize> {
-        let idx = self.ready.pop()?;
-        // SAFETY: the matching acquire-load inside `ready.pop` synchronises
-        // with the producer's release on `ready.tail`, so the slot data is
-        // visible and stable until the producer's pool wraps RX_POOL_SIZE
-        // slots later. Single consumer ⇒ no concurrent reader.
-        let pkt = unsafe { &*self.pool[idx as usize].get() };
-        let n = pkt.len.min(out.len());
-        out[..n].copy_from_slice(&pkt.data[..n]);
-        Some(n)
-    }
-}
-
-/// Zero-copy variant of [`RxInbox`] — the producer hands an owned
+/// Zero-copy cross-core RX inbox — the distributor hands an owned
 /// [`uni_iobuf::IOBuf`] (typically `IOBuf::External` wrapping a NIC
-/// descriptor's storage) and the consumer takes ownership of it.
+/// descriptor's storage) and the owning core takes ownership of it.
 /// No memcpy on either side: the cross-core hand-off is just an
 /// SPSC ring exchange of a pointer-sized index, and the IOBuf
 /// itself moves by-value through the slot.
 ///
-/// SPSC discipline mirrors `RxInbox`: a single producer (the
-/// distributor on the receiving core) calls `push`, a single
-/// consumer (the owning core) calls `pop`. Both take `&self` and
-/// rely on producer-only `next_slot` advance + the `ready` ring's
-/// release/acquire pair for visibility.
+/// SPSC discipline: a single producer (the distributor on the
+/// receiving core) calls `push`, a single consumer (the owning
+/// core) calls `pop`. Both take `&self` and rely on producer-only
+/// `next_slot` advance + the `ready` ring's release/acquire pair
+/// for visibility.
 ///
 /// Slot lifecycle: each `Option<IOBuf>` cell starts as `None`.
 /// `push` writes `Some(iobuf)` into `pool[next_slot]` and then
@@ -226,15 +152,9 @@ pub struct PerCore {
 
     _pad: u32, // align next field to 8 bytes
 
-    /// RX inbox for Tier 2 delivery (core 0 writes, this core reads).
-    pub rx_inbox: RxInbox,
-
-    /// Zero-copy variant of `rx_inbox` — used by drivers that
-    /// implement `NicOps::iobuf_rx`. Same SPSC shape but each slot
-    /// holds an owned `IOBuf` (typically `IOBuf::External`
-    /// pointing at the descriptor's storage) instead of a
-    /// memcpy'd `RxPacket`. Stays empty when the active driver
-    /// only supports the copy path through `RxInbox`.
+    /// RX inbox for Tier 2 cross-core delivery — distributor on
+    /// the polling core pushes IOBufs here; owning core pops and
+    /// processes via `net_drain_cb` → `net_receive_iobuf`.
     pub rx_iobuf_inbox: RxIobufInbox,
 
     /// Inbox for Tier 2 RX delivery (SPSC: core 0 writes, this core reads).
@@ -316,7 +236,6 @@ impl PerCore {
         PerCore {
             id,
             _pad: 0,
-            rx_inbox: RxInbox::new(),
             rx_iobuf_inbox: RxIobufInbox::new(),
             inbox: spsc::Ring::new(),
             pinned: spsc::Ring::new(),
