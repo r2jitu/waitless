@@ -167,8 +167,9 @@ where
 /// so the steady-state per-request alloc count for the request-
 /// parsing path drops to zero (no fresh `Vec::new()` per request).
 /// Response framing is now built directly inside an IOBuf with
-/// reserved headroom/tailroom (see `write_response`) — the old
-/// `qpack_buf` + `framing` Vec scratches are gone.
+/// reserved headroom/tailroom (see `write_response`); the
+/// framing IOBuf's underlying storage is recycled via the
+/// `FramingPool` below — also zero-alloc on the steady state.
 pub(crate) struct Scratch {
     /// H3 stream-bytes accumulator — successive `recv` chunks
     /// concatenate here until enough bytes form a complete frame.
@@ -180,6 +181,15 @@ pub(crate) struct Scratch {
     /// Empty path for GET. Kept as scratch so an occasional POST
     /// on the same conn doesn't allocate.
     pub(crate) data: Vec<u8>,
+    /// Pool of `Box<[u8]>` storage for response-framing IOBufs.
+    /// Each `write_response` takes one from the pool, builds the
+    /// HEADERS+QPACK+DATA framing IOBuf in it, and hands the
+    /// IOBuf to QUIC's SendStream. When SendStream finishes
+    /// draining the IOBuf's bytes onto the wire and drops it,
+    /// the storage returns to this pool — capacity preserved.
+    /// Steady-state alloc count: 0 framing buffers per H3
+    /// request after the pool is primed.
+    pub(crate) framing_pool: alloc::sync::Arc<FramingPool>,
 }
 
 impl Scratch {
@@ -195,8 +205,119 @@ impl Scratch {
             // Empty by default; will allocate if a request body
             // arrives.
             data: Vec::new(),
+            framing_pool: FramingPool::new(),
         }
     }
+}
+
+/// Per-conn pool of `Box<[u8]>` storage backing response framing
+/// IOBufs. The pool is wrapped in an `Arc` and the IOBuf's drop
+/// callback decrements that refcount via `Arc::from_raw` —
+/// `Arc` because `IOBuf::External` is `Send` (an IOBuf could
+/// in principle move workers before drop) and `Rc` isn't, even
+/// though in practice every IOBuf this pool issues stays on
+/// the worker that created it.
+///
+/// Per-request: pop a `Box<[u8]>` from `bufs` (or alloc fresh
+/// if empty), wrap as `IOBuf::External` with a drop callback
+/// that returns the storage to `bufs`. The Arc strong count
+/// is bumped per outstanding IOBuf so the pool stays alive
+/// until every framing IOBuf has dropped, even past `Scratch`'s
+/// own lifetime.
+pub(crate) struct FramingPool {
+    bufs: core::cell::RefCell<Vec<alloc::boxed::Box<[u8]>>>,
+}
+
+/// Each framing buffer holds the H3 HEADERS frame header (≤16 B)
+/// + QPACK body (typical 30-200 B, capped at 256) + optional
+/// DATA frame header (≤16 B). 288 B (256 + 16 + 16) covers
+/// every shape comfortably; pick a power-of-two-ish size for
+/// allocator-friendliness.
+const FRAMING_BUF_SIZE: usize = 288;
+
+/// Cap on per-conn pool retention. A burst of pipelined H3
+/// requests can briefly hold many framing IOBufs in flight
+/// (one per outstanding response on the wire, plus any in
+/// SendStream's outbound chain not yet drained); past this
+/// cap the drop callback drops the storage instead of pooling.
+const FRAMING_POOL_MAX: usize = 16;
+
+impl FramingPool {
+    fn new() -> alloc::sync::Arc<Self> {
+        alloc::sync::Arc::new(Self {
+            bufs: core::cell::RefCell::new(Vec::with_capacity(FRAMING_POOL_MAX)),
+        })
+    }
+
+    /// Take a framing IOBuf from the pool. The visible payload
+    /// starts empty; caller writes via `extend_uninit` /
+    /// `append_slice` / `prepend` and the IOBuf releases its
+    /// storage back to this pool when it drops.
+    fn take(self: &alloc::sync::Arc<Self>) -> uni_http::IOBuf {
+        // Pop existing storage, or allocate fresh if pool is empty.
+        let storage = self
+            .bufs
+            .borrow_mut()
+            .pop()
+            .unwrap_or_else(|| alloc::vec![0u8; FRAMING_BUF_SIZE].into_boxed_slice());
+        debug_assert_eq!(storage.len(), FRAMING_BUF_SIZE);
+        // Leak the Box; the drop callback reconstructs it via
+        // `Box::from_raw` and either pushes back to the pool or
+        // lets it drop (when the pool is full).
+        let raw: *mut [u8] = alloc::boxed::Box::into_raw(storage);
+        // SAFETY: `raw` is non-null (came from a valid Box) and
+        // points to FRAMING_BUF_SIZE bytes.
+        let base = unsafe { core::ptr::NonNull::new_unchecked((*raw).as_mut_ptr()) };
+        // Bump the Arc strong count so the pool stays alive
+        // until this IOBuf's drop callback fires; the callback
+        // `Arc::from_raw`'s the ctx back to drop one strong ref.
+        let ctx = alloc::sync::Arc::into_raw(alloc::sync::Arc::clone(self)) as *mut ();
+        // SAFETY: storage was just popped from this Arc<FramingPool>'s
+        // private Vec — we hold it exclusively. `base..base+
+        // FRAMING_BUF_SIZE` is a valid Box<[u8]> region. The drop
+        // callback `Box::from_raw`'s the same range and either
+        // pushes back to the pool or drops it.
+        unsafe {
+            uni_http::IOBuf::from_external(
+                base,
+                FRAMING_BUF_SIZE as u32,
+                0,
+                0,
+                Some(framing_pool_drop),
+                ctx,
+            )
+        }
+    }
+}
+
+/// Drop callback fired when a framing IOBuf drops. Reconstructs
+/// the underlying Box<[u8]> and the Arc<FramingPool> from the
+/// raw pointers, pushes the Box back to the pool (or drops if
+/// the pool is full), and lets the Arc strong count decrement.
+unsafe fn framing_pool_drop(
+    base: core::ptr::NonNull<u8>,
+    capacity: u32,
+    ctx: *mut (),
+) {
+    // SAFETY: ctx came from `Arc::into_raw` in `FramingPool::take`;
+    // we balance that with `Arc::from_raw` here.
+    let pool: alloc::sync::Arc<FramingPool> =
+        unsafe { alloc::sync::Arc::from_raw(ctx as *const FramingPool) };
+    // SAFETY: base + capacity is the same range we leaked via
+    // `Box::into_raw` in `FramingPool::take`; reconstruct the
+    // Box so it owns the storage again.
+    let storage: alloc::boxed::Box<[u8]> = unsafe {
+        alloc::boxed::Box::from_raw(core::slice::from_raw_parts_mut(
+            base.as_ptr(),
+            capacity as usize,
+        ))
+    };
+    let mut bufs = pool.bufs.borrow_mut();
+    if bufs.len() < FRAMING_POOL_MAX {
+        bufs.push(storage);
+    }
+    // else: storage drops at scope-end, returning bytes to allocator.
+    // pool's Arc drops at scope-end too, decrementing the strong count.
 }
 
 async fn handle_request<H, F>(
@@ -358,7 +479,7 @@ async fn handle_request<H, F>(
     crate::diag::bump(&crate::diag::COUNTERS.user_handler_returned);
     let status = response.status;
     // Encode response: HEADERS + DATA + FIN.
-    write_response(conn, sid, response);
+    write_response(conn, sid, response, &scratch.framing_pool);
     crate::diag::bump(&crate::diag::COUNTERS.write_response_completed);
     crate::h3_event!(requests_handled, "sid={} status={}", sid, status);
     crate::diag::bump(&crate::diag::COUNTERS.responses_sent);
@@ -380,13 +501,17 @@ const H3_FRAME_HEADER_MAX: usize = 16;
 /// ETag, etc.) before overflow; oversize headers surface as
 /// `qpack_encode_overflow` and the stream closes cleanly.
 ///
-/// Sized small intentionally — this is the per-request IOBuf's
-/// payload region, allocated fresh per response. Smaller bucket
-/// → smaller fragmentation footprint → cheaper allocator
-/// path. Trim further if profiling shows headroom.
-const QPACK_BODY_RESERVE: usize = 256;
+/// Must equal `FRAMING_BUF_SIZE - 2 * H3_FRAME_HEADER_MAX` so
+/// the pool's pre-allocated buffer matches the headroom +
+/// payload + tailroom layout `write_response` expects.
+const QPACK_BODY_RESERVE: usize = FRAMING_BUF_SIZE - 2 * H3_FRAME_HEADER_MAX;
 
-fn write_response(conn: &QuicConn, sid: u64, resp: Response) {
+fn write_response(
+    conn: &QuicConn,
+    sid: u64,
+    resp: Response,
+    framing_pool: &alloc::sync::Arc<FramingPool>,
+) {
     // Build the response framing as a single IOBuf with
     // reserved headroom for the H3 HEADERS frame header and
     // tailroom for the optional H3 DATA frame header. QPACK
@@ -396,31 +521,37 @@ fn write_response(conn: &QuicConn, sid: u64, resp: Response) {
     //   * No `qpack_buf → framing` memcpy (was ~150-300 B/request).
     //   * The H3 frame headers prepend / append IN PLACE.
     //
-    // One heap alloc per response (the IOBuf), same alloc
-    // count as the previous `framing: Vec<u8>` approach, but
-    // the response is built end-to-end with no intermediate
-    // buffers and no copies between them.
+    // The framing IOBuf's underlying storage comes from a per-
+    // conn pool — pop a `Box<[u8]>`, wrap as `IOBuf::External`
+    // with a drop callback that returns the storage to the
+    // pool when SendStream finishes draining. Steady-state per-
+    // request alloc count: 0 framing buffers (was 1).
     let status_str = status_to_bytes(resp.status);
     let body_len = resp.body_len();
     let mut len_buf = [0u8; 20];
     let len_off = format_usize_into(body_len, &mut len_buf);
 
-    // Allocate the framing IOBuf: `[headroom][qpack body
-    // capacity][tailroom]`. The headroom holds the HEADERS
-    // frame header after we know the QPACK length; the
-    // tailroom holds the DATA frame header (when there's a
-    // body).
-    let mut framing = uni_http::IOBuf::new_with_reserved(
-        H3_FRAME_HEADER_MAX,
-        QPACK_BODY_RESERVE,
-        H3_FRAME_HEADER_MAX,
-    );
+    // Take a framing IOBuf from the pool. Layout:
+    //   `[headroom: H3_FRAME_HEADER_MAX][qpack body region:
+    //    QPACK_BODY_RESERVE][tailroom: H3_FRAME_HEADER_MAX]`.
+    // Pool's IOBufs start at offset=0, len=0, with the full
+    // FRAMING_BUF_SIZE as tailroom; we shift the visible
+    // window to leave headroom for the HEADERS frame header
+    // before encoding QPACK.
+    let mut framing = framing_pool.take();
+    // Reserve the headroom by extending past it via
+    // `extend_uninit` then `consume(headroom_len)` — that
+    // shifts offset forward without writing anything.
+    let _ = framing
+        .extend_uninit(H3_FRAME_HEADER_MAX)
+        .expect("headroom fits in fresh framing IOBuf");
+    framing
+        .consume(H3_FRAME_HEADER_MAX)
+        .expect("just-extended bytes are consumable");
 
     // Encode the QPACK field section directly into the IOBuf's
-    // tailroom region (the space we just reserved as
-    // payload-capacity). `extend_uninit` returns a `&mut [u8]`
-    // pointing at that region; we then trim it back to the
-    // exact encoded length.
+    // tailroom region (the QPACK_BODY_RESERVE-sized space
+    // immediately after the headroom).
     let qpack_len = {
         let region = framing
             .extend_uninit(QPACK_BODY_RESERVE)
