@@ -17,7 +17,6 @@
 
 extern crate alloc;
 
-use alloc::string::String;
 use core::fmt::Write as _;
 
 use uni::net::Net;
@@ -330,31 +329,43 @@ const SHELL_FOOTER: &[u8] =
 /// vary per page (title, nav-link active-class flip) get
 /// allocated.
 ///
-/// Heap-owned chunks go through `push_with_reserve` so each one
-/// carries TLS record headroom (5 B) + tailroom (17 B = 1 type
-/// byte + 16 B AEAD tag). `TlsStream::send_iobuf` then takes
-/// the encrypt-in-place path on those parts: no plaintext
-/// memcpy into `tls.tx_buf`, AEAD seals straight into the
-/// IOBuf the app handed up. Static parts can't be sealed in
-/// place (immutable storage); they fall back to the
-/// slice-based path transparently.
+/// Heap-owned chunks are rendered directly into IOBufs with
+/// TLS record headroom (5 B) + tailroom (17 B = 1 type byte +
+/// 16 B AEAD tag). `TlsStream::send_iobuf` then takes the
+/// encrypt-in-place path on those parts: no plaintext memcpy
+/// into `tls.tx_buf`, AEAD seals straight into the IOBuf the
+/// app handed up. Static parts can't be sealed in place
+/// (immutable storage); they fall back to the slice-based
+/// path transparently.
 fn shell_body(active: &str, title: &str, body: Body) -> Body {
-    use uni_http::{MAX_HEADER_RESERVE as HDR, MAX_TRAILER_RESERVE as TRL};
-    // The nav block has one bit of dynamism — the active class.
-    // Render it into a small Vec; everything else is static.
-    let mut nav_buf = String::with_capacity(512);
-    for (path, label) in NAV {
-        let class = if *path == active { " class=\"active\"" } else { "" };
-        let _ = write!(nav_buf, "<a href=\"{}\"{}>{}</a>", path, class, label);
+    use uni_http::{IOBuf, MAX_HEADER_RESERVE as HDR, MAX_TRAILER_RESERVE as TRL};
+    use core::fmt::Write as _;
+
+    // Title chunk: small IOBuf with TLS reserve, populated
+    // directly via append_slice.
+    let mut title_buf = IOBuf::new_with_reserved(HDR, title.len().max(1), TRL);
+    let _ = title_buf.append_slice(title.as_bytes());
+
+    // Nav chunk: render the active-class flip directly into the
+    // IOBuf via IOBufWriter — no intermediate `String` alloc,
+    // no String → IOBuf copy. 512 B covers the current 6-link
+    // nav with class flip; the writer truncates above that.
+    let mut nav_buf = IOBuf::new_with_reserved(HDR, 512, TRL);
+    {
+        let mut w = nav_buf.writer();
+        for (path, label) in NAV {
+            let class = if *path == active { " class=\"active\"" } else { "" };
+            let _ = write!(w, "<a href=\"{}\"{}>{}</a>", path, class, label);
+        }
     }
 
     let mut b = Body::with_capacity(8 + body.parts_len());
     b = b.push_static(SHELL_HEAD_BEFORE_TITLE);
-    b = b.push_with_reserve(title.as_bytes(), HDR, TRL);
+    b = b.push(title_buf);
     b = b.push_static(SHELL_HEAD_AFTER_TITLE);
     b = b.push_static(STYLES.as_bytes());
     b = b.push_static(SHELL_AFTER_STYLES);
-    b = b.push_with_reserve(nav_buf.as_bytes(), HDR, TRL);
+    b = b.push(nav_buf);
     b = b.push_static(SHELL_NAV_MAIN);
     // Splice the page body's parts in order. Each is an IOBuf
     // (static-borrow or heap-owned); `push` accepts any
