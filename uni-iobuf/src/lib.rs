@@ -813,22 +813,51 @@ pub enum IOBufError {
 /// The chain is the natural shape for a multi-layer stack:
 /// each layer can append/prepend nodes (or prepend INTO the
 /// front node's headroom) without disturbing the rest.
+///
+/// Layout: a small-vec-style `head: Option<IOBuf>` plus a lazy
+/// `tail: VecDeque<IOBuf>`. Single-element chains (the common
+/// case for static-body responses — `Response::ok(b"text/plain",
+/// HEALTH_JSON)`) live entirely in `head` and never allocate the
+/// deque. The deque allocates only when a second part is pushed,
+/// inspired by folly's intrusive-`next`/`prev` chain (which has
+/// zero chain-machinery allocs because the IOBuf IS the chain
+/// element). We approximate that property for the common
+/// 1-element case without growing the IOBuf size or paying the
+/// per-push `Box` allocation an intrusive linked list would
+/// incur for owned-storage IOBufs.
 pub struct IOBufChain {
-    parts: VecDeque<IOBuf>,
+    /// First part. `None` for empty chains. Inline so a
+    /// 1-element chain (the typical static-body response) costs
+    /// zero heap allocations.
+    head: Option<IOBuf>,
+    /// Subsequent parts. Lazily allocated on the second
+    /// `push_back` / `push_front` — `VecDeque::new()` itself is
+    /// alloc-free; the buffer materialises on first push.
+    tail: VecDeque<IOBuf>,
     total_len: usize,
 }
 
 impl IOBufChain {
     pub fn new() -> Self {
         IOBufChain {
-            parts: VecDeque::new(),
+            head: None,
+            tail: VecDeque::new(),
             total_len: 0,
         }
     }
 
     pub fn with_capacity(part_capacity: usize) -> Self {
+        // Reserve `part_capacity - 1` slots in the tail (one
+        // slot is `head` itself). Hint of zero / one keeps the
+        // tail unallocated.
+        let tail_cap = part_capacity.saturating_sub(1);
         IOBufChain {
-            parts: VecDeque::with_capacity(part_capacity),
+            head: None,
+            tail: if tail_cap == 0 {
+                VecDeque::new()
+            } else {
+                VecDeque::with_capacity(tail_cap)
+            },
             total_len: 0,
         }
     }
@@ -838,31 +867,42 @@ impl IOBufChain {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.total_len == 0
+        self.head.is_none()
     }
 
     pub fn part_count(&self) -> usize {
-        self.parts.len()
+        if self.head.is_some() { 1 + self.tail.len() } else { 0 }
     }
 
-    /// Append a buf to the back of the chain.
+    /// Append a buf to the back of the chain. First push lands
+    /// in `head` (no allocation); subsequent pushes go to `tail`
+    /// (one VecDeque allocation on the very first tail push).
     pub fn push_back(&mut self, buf: IOBuf) {
         if buf.is_empty() {
             return;
         }
         self.total_len += buf.len();
-        self.parts.push_back(buf);
+        if self.head.is_none() {
+            self.head = Some(buf);
+        } else {
+            self.tail.push_back(buf);
+        }
     }
 
-    /// Prepend a buf to the front of the chain. O(1) thanks to
-    /// `VecDeque`'s ring-buffer layout — the canonical use case
-    /// is a layer wrapping framing bytes around a pre-built body.
+    /// Prepend a buf to the front of the chain. The new buf
+    /// becomes `head`; the previous head (if any) shifts to the
+    /// front of `tail`.
     pub fn push_front(&mut self, buf: IOBuf) {
         if buf.is_empty() {
             return;
         }
         self.total_len += buf.len();
-        self.parts.push_front(buf);
+        if let Some(old_head) = self.head.take() {
+            // First multi-element insert: tail allocates on this
+            // push_front. Subsequent push_fronts re-use the deque.
+            self.tail.push_front(old_head);
+        }
+        self.head = Some(buf);
     }
 
     /// Prepend `data` directly into the FRONT node's headroom,
@@ -870,12 +910,8 @@ impl IOBufChain {
     /// node is missing or static (no headroom). Lets a layer
     /// prepend a small fixed header (TLS record header, H3 frame
     /// header) without growing the chain.
-    ///
-    /// Falls back to `push_front` of a heap-allocated single-byte
-    /// node if the caller prefers a uniform "always works" API —
-    /// see `prepend_or_push`.
     pub fn prepend_in_place(&mut self, data: &[u8]) -> Result<(), IOBufError> {
-        let front = self.parts.front_mut().ok_or(IOBufError::NoHeadroom)?;
+        let front = self.head.as_mut().ok_or(IOBufError::NoHeadroom)?;
         front.prepend(data)?;
         self.total_len += data.len();
         Ok(())
@@ -883,18 +919,20 @@ impl IOBufChain {
 
     /// Iterate the chain front-to-back.
     pub fn iter(&self) -> impl Iterator<Item = &IOBuf> {
-        self.parts.iter()
+        self.head.iter().chain(self.tail.iter())
     }
 
     /// Pop the front part. Returns `None` when the chain is
     /// empty. Adjusts `total_len` to account for the popped
-    /// part's payload. Used by transports that drain the chain
-    /// part-by-part (writing each to the wire) without consuming
-    /// the chain wrapper itself, so the caller can re-use the
-    /// underlying `VecDeque` allocation across many sends.
+    /// part's payload. After a pop, the next tail part (if any)
+    /// promotes into `head` so a subsequent `pop_front` continues
+    /// to drain in chain order.
     pub fn pop_front(&mut self) -> Option<IOBuf> {
-        let buf = self.parts.pop_front()?;
+        let buf = self.head.take()?;
         self.total_len = self.total_len.saturating_sub(buf.len());
+        if let Some(next) = self.tail.pop_front() {
+            self.head = Some(next);
+        }
         Some(buf)
     }
 
@@ -905,7 +943,7 @@ impl IOBufChain {
     /// responsible for keeping `total_len` in sync via
     /// [`shrink_total_len`].
     pub fn front_mut(&mut self) -> Option<&mut IOBuf> {
-        self.parts.front_mut()
+        self.head.as_mut()
     }
 
     /// Decrease the cached `total_len` by `n`. Pair with a
@@ -922,18 +960,24 @@ impl IOBufChain {
     /// `pop_front` loop, which matters for `External` IOBufs
     /// whose drop callbacks return descriptors to driver pools.
     pub fn clear(&mut self) {
-        self.parts.clear();
+        // Drop head first so the order is front-to-back; then
+        // drain tail.
+        self.head = None;
+        self.tail.clear();
         self.total_len = 0;
     }
 
-    /// Move all parts out, consuming the chain.
-    pub fn into_parts(self) -> VecDeque<IOBuf> {
-        self.parts
+    /// Move all parts out, consuming the chain. Returns an
+    /// iterator yielding parts front-to-back. Zero allocation
+    /// for 1-element chains (the head moves out directly without
+    /// materialising a deque).
+    pub fn into_parts(self) -> impl Iterator<Item = IOBuf> {
+        self.head.into_iter().chain(self.tail.into_iter())
     }
 
     /// Convenience: append a `&'static [u8]` part. Borrowed,
-    /// zero-alloc (the chain still allocates its `VecDeque`
-    /// backing on first push).
+    /// zero-alloc end-to-end for the first part (head); the
+    /// VecDeque tail materialises only on a second push.
     pub fn push_static(&mut self, s: &'static [u8]) {
         self.push_back(IOBuf::from_static(s));
     }
@@ -1068,6 +1112,18 @@ impl<'a> Cursor<'a> {
         self.consumed
     }
 
+    /// Resolve `node_idx` to a borrowed `IOBuf`. Logical index
+    /// `0` is `head` (if Some); `1..=tail.len()` indexes into
+    /// `tail[idx-1]`. Returns `None` past the chain's end.
+    #[inline]
+    fn node_at(&self, idx: usize) -> Option<&'a IOBuf> {
+        if idx == 0 {
+            self.chain.head.as_ref()
+        } else {
+            self.chain.tail.get(idx - 1)
+        }
+    }
+
     /// Advance the cursor by `n` bytes without reading. Caps at
     /// `remaining()`; returns the number of bytes actually
     /// advanced.
@@ -1075,7 +1131,7 @@ impl<'a> Cursor<'a> {
         let mut to_skip = n.min(self.remaining());
         let advanced = to_skip;
         while to_skip > 0 {
-            let node = match self.chain.parts.get(self.node_idx) {
+            let node = match self.node_at(self.node_idx) {
                 Some(n) => n,
                 None => break,
             };
@@ -1101,7 +1157,7 @@ impl<'a> Cursor<'a> {
     pub fn read(&mut self, dst: &mut [u8]) -> usize {
         let mut written = 0;
         while written < dst.len() {
-            let node = match self.chain.parts.get(self.node_idx) {
+            let node = match self.node_at(self.node_idx) {
                 Some(n) => n,
                 None => break,
             };
@@ -1138,7 +1194,7 @@ impl<'a> Cursor<'a> {
     /// `read`.
     pub fn next_chunk(&mut self, max_len: usize) -> Option<&'a [u8]> {
         loop {
-            let node = self.chain.parts.get(self.node_idx)?;
+            let node = self.node_at(self.node_idx)?;
             let node_data = node.data();
             let avail = node_data.len() - self.in_node_off;
             if avail == 0 {
