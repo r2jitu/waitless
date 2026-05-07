@@ -552,6 +552,15 @@ impl Response {
         self.body
     }
 
+    /// Borrow the body without consuming the response. Used by
+    /// frontends that want to peek at the shape (Single vs Chain,
+    /// length, contiguous slice) before deciding whether to inline
+    /// the body into a header buffer or stream it separately. Pair
+    /// with `into_body()` once the layout choice is made.
+    pub fn body_ref(&self) -> &ResponseBody {
+        &self.body
+    }
+
     /// Total body length in bytes. Used by frontends to write
     /// the Content-Length header (HTTP/1.1) or DATA-frame
     /// length prefix (HTTP/3) without walking the parts twice.
@@ -957,37 +966,56 @@ async fn handle_conn<S, H>(
             // per-response branch and Host-reparse out of the
             // framework when no extra headers are set.
             write_response_into(&mut w, &resp, !want_close);
-            // Two writes: headers (always small, in `w`'s 2 KiB
-            // buffer) then the body (potentially large — multi-KiB
-            // HTML pages, JSON dumps, etc.). Streaming body
-            // separately lets a single response carry as much data
-            // as the underlying stream can take, with no
-            // intermediate copy and no header-buffer cap on body
-            // length.
+            // Inline-when-fits: most responses are tiny (JSON
+            // health/stats, plain-text errors) and the headers
+            // alone use a couple hundred bytes of `w`'s 2 KiB
+            // buffer, so we can append the body and ship the whole
+            // response in one `stream.send`. On plain TCP that's
+            // one segment instead of two; on the bare-metal path
+            // it's also one `try_send` and one ACK round-trip
+            // saved per request. Splitting the multi-page rewrite
+            // (commit 80a5504) regressed `health_max` ~30 % — this
+            // recovers it while still streaming larger pages.
+            //
+            // Falls through to the streaming path when the body
+            // is a `Chain`, when the single chunk is too big to
+            // fit, or when the body is empty (skip the no-op
+            // send_iobuf).
+            let mut body_inlined = false;
+            if let ResponseBody::Single(b) = resp.body_ref() {
+                let bd = b.data();
+                if !bd.is_empty() && w.try_push(bd) {
+                    body_inlined = true;
+                }
+            }
             if stream.send(w.as_bytes()).await.is_err() {
                 return;
             }
-            // Walk body. For a Single chunk we send once; for a
-            // Chain we send each part separately — TCP coalesces
-            // at the segment layer so the wire receives the same
-            // byte sequence as if we'd concatenated, but we
-            // don't pay the concat memcpy. We pass each part as
-            // an IOBuf so `TlsStream::send_iobuf` can take the
-            // encrypt-in-place fast path when the chunk has
-            // reserved headroom/tailroom (apps opt in via
-            // `Body::push_with_reserve`); static-borrow chunks
-            // and unreserved owned chunks fall back transparently
-            // to the slice-based send in the trait default.
-            match resp.into_body() {
-                ResponseBody::Single(b) => {
-                    if !b.is_empty() && stream.send_iobuf(b).await.is_err() {
-                        return;
-                    }
-                }
-                ResponseBody::Chain(chain) => {
-                    for part in chain.into_parts() {
-                        if stream.send_iobuf(part).await.is_err() {
+            if !body_inlined {
+                // Walk body. For a Single chunk we send once; for
+                // a Chain we send each part separately — TCP
+                // coalesces at the segment layer so the wire
+                // receives the same byte sequence as if we'd
+                // concatenated, but we don't pay the concat
+                // memcpy. We pass each part as an IOBuf so
+                // `TlsStream::send_iobuf` can take the encrypt-
+                // in-place fast path when the chunk has reserved
+                // headroom/tailroom (apps opt in via
+                // `Body::push_with_reserve`); static-borrow
+                // chunks and unreserved owned chunks fall back
+                // transparently to the slice-based send in the
+                // trait default.
+                match resp.into_body() {
+                    ResponseBody::Single(b) => {
+                        if !b.is_empty() && stream.send_iobuf(b).await.is_err() {
                             return;
+                        }
+                    }
+                    ResponseBody::Chain(chain) => {
+                        for part in chain.into_parts() {
+                            if stream.send_iobuf(part).await.is_err() {
+                                return;
+                            }
                         }
                     }
                 }
@@ -1181,24 +1209,35 @@ impl BufWriter {
     }
 
     fn push(&mut self, data: &[u8]) {
-        // Headers only — bodies are sent separately by `handle_conn`
-        // via a second `stream.send`. The 2 KiB cap is plenty for any
-        // realistic header set (HTTP/1.1 + Content-Type + Content-Length
-        // + Connection + optional Alt-Svc ≈ 200 bytes), but if a future
-        // change pushes header bytes past it the response would
-        // truncate silently and the peer would hang waiting for body.
-        // `debug_assert` makes that show up in tests rather than as a
-        // mystery timeout in production.
+        // Header writers always fit — the realistic header set
+        // (HTTP/1.1 + Content-Type + Content-Length + Connection +
+        // optional Alt-Svc) lands well under 1 KiB. Body bytes use
+        // `try_push` so an oversized body falls back to a separate
+        // `stream.send` instead of silently truncating.
         debug_assert!(
             self.pos + data.len() <= 2048,
             "BufWriter overflow: header bytes exceed 2 KiB cap (pos={}, push={}). \
-             Bodies are streamed separately, so this means your headers got too \
-             big — bump the buffer or trim them.",
+             Bodies use `try_push` and stream separately when too big — this \
+             panic means your *headers* got too large. Bump the buffer or trim.",
             self.pos, data.len()
         );
         let n = data.len().min(2048 - self.pos);
         self.buf[self.pos..self.pos + n].copy_from_slice(&data[..n]);
         self.pos += n;
+    }
+
+    /// Like `push`, but returns `false` (without writing) when
+    /// `data` wouldn't fit in the remaining space. Used to inline
+    /// small response bodies behind the headers — coalesces the
+    /// whole HTTP/1.1 response into one `stream.send`, which on
+    /// plain TCP means one segment instead of two.
+    fn try_push(&mut self, data: &[u8]) -> bool {
+        if self.pos + data.len() > 2048 {
+            return false;
+        }
+        self.buf[self.pos..self.pos + data.len()].copy_from_slice(data);
+        self.pos += data.len();
+        true
     }
 
     fn as_bytes(&self) -> &[u8] {
