@@ -104,11 +104,23 @@ enum Inner {
     External(External),
 }
 
+/// Drop callback signature for [`Inner::External`]. Receives
+/// the original `(base, capacity, ctx)` from `from_external`,
+/// regardless of how the IOBuf's offset/len shifted during its
+/// lifetime — the consumer that gave us the buffer wants the
+/// whole region back (e.g. a NIC descriptor index), not the
+/// shifted view. `unsafe` because the impl reconstructs
+/// concrete types (Box<[u8]>, descriptor index) from the raw
+/// pointers and must respect the contract the caller of
+/// `from_external` established.
+pub type IOBufDropFn = unsafe fn(base: core::ptr::NonNull<u8>, capacity: u32, ctx: *mut ());
+
 /// Backing for [`Inner::External`]. Held in a wrapping struct so
 /// the manual `Drop` impl can run the release callback exactly
-/// once. Trait-object Drop callback so different consumers (NIC
-/// drivers, mmap'd regions, refcounted shared buffers) all
-/// flow through the same IOBuf shape.
+/// once. Function-pointer + opaque-context drop instead of a
+/// `Box<dyn FnOnce>` — saves the per-IOBuf closure-box
+/// allocation, important for the framing-IOBuf-per-request
+/// recycling path where every saved alloc shows up.
 struct External {
     /// Start of the underlying region.
     base: core::ptr::NonNull<u8>,
@@ -122,26 +134,38 @@ struct External {
     offset: u32,
     /// Visible-payload byte length.
     len: u32,
-    /// Release callback — runs in `Drop`. `Some` until consumed;
-    /// `None` after one of the destructure paths (`split_off`,
-    /// future refcount-share) has taken ownership of the
-    /// callback. Boxed because we need a heterogeneous Drop
-    /// closure; the alloc happens once at IOBuf construction
-    /// time, not per-use.
-    on_drop: Option<alloc::boxed::Box<dyn FnOnce() + Send>>,
+    /// Release callback — `None` if the IOBuf was constructed
+    /// without one (e.g. a borrowed view that the caller manages
+    /// out-of-band). `Some` for the typical NIC-ring / pool case.
+    drop_fn: Option<IOBufDropFn>,
+    /// Opaque context passed to `drop_fn`. Typically a raw
+    /// `*mut` pointer the caller cast from an `Rc`/`Arc` or
+    /// integer (e.g. a NIC ring index). Untyped so we don't
+    /// bake any one shape into the IOBuf.
+    drop_ctx: *mut (),
 }
 
 // SAFETY: `External` is Send because the underlying memory is
 // exclusively owned (the constructor takes that as a precondition)
-// and the on_drop callback is Send. We don't expose interior
-// mutability across threads — IOBuf itself is moved across thread
-// boundaries, not shared.
+// and the function-pointer drop callback together with the raw
+// context pointer is Send-by-construction (function pointers are
+// Send; the caller is responsible for ensuring the context's
+// pointee is safe to drop on the worker that owns the IOBuf,
+// matching the existing Send bound on the prior `Box<dyn FnOnce
+// + Send>` design).
 unsafe impl Send for External {}
 
 impl Drop for External {
     fn drop(&mut self) {
-        if let Some(cb) = self.on_drop.take() {
-            cb();
+        if let Some(f) = self.drop_fn.take() {
+            // SAFETY: function-pointer's contract was set by the
+            // `from_external` caller — they're responsible for
+            // ensuring the pair (drop_fn, drop_ctx) is sound to
+            // invoke now. We invoke at most once because of the
+            // `take()`.
+            unsafe {
+                f(self.base, self.capacity, self.drop_ctx);
+            }
         }
     }
 }
@@ -194,32 +218,48 @@ impl IOBuf {
         }
     }
 
-    /// Wrap an externally-managed buffer region. The IOBuf treats
-    /// `[base..base+capacity]` as its full backing, with the
-    /// visible payload starting at `offset` of length `len` (so
-    /// `headroom = offset`, `tailroom = capacity - offset - len`).
-    /// `on_drop` runs when the IOBuf is dropped — typically the
-    /// caller closes a back-channel that returns the descriptor
-    /// to its origin (a NIC RX ring, an mmap'd page pool, etc.).
+    /// Wrap an externally-managed buffer region. The IOBuf
+    /// treats `[base..base+capacity]` as its full backing, with
+    /// the visible payload starting at `offset` of length `len`
+    /// (so `headroom = offset`, `tailroom = capacity - offset -
+    /// len`).
+    ///
+    /// `drop_fn` runs once when the IOBuf is dropped, receiving
+    /// the original `(base, capacity, ctx)` regardless of how
+    /// the IOBuf's offset/len shifted during its lifetime. The
+    /// canonical use case is NIC RX or a heap pool: the consumer
+    /// dropping the IOBuf wants the whole underlying region
+    /// returned to its origin, not the shifted view. Pass
+    /// `None` to skip the callback (caller manages lifetime
+    /// out-of-band).
+    ///
+    /// `drop_ctx` is opaque — typically a raw `*mut` pointer
+    /// the caller cast from an `Rc`/`Arc::into_raw` (the
+    /// callback `Rc::from_raw` it back) or a packed integer
+    /// (e.g. a ring slot index). Untyped so any consumer shape
+    /// fits without baking the IOBuf to one pattern.
     ///
     /// SAFETY: the caller MUST guarantee:
     ///   * `base..base+capacity` is a valid, exclusively-owned
-    ///     byte region for the IOBuf's lifetime — no aliasing
-    ///     with anything outside the IOBuf's visibility.
+    ///     byte region for the IOBuf's lifetime.
     ///   * `offset + len <= capacity`.
-    ///   * The `on_drop` callback is sound to invoke (won't UAF
-    ///     anything, won't double-free, can run from any thread
-    ///     since IOBuf is `Send`).
-    pub unsafe fn from_external<F>(
+    ///   * `drop_fn` (when `Some`) is sound to invoke with
+    ///     `(base, capacity, drop_ctx)` once at IOBuf-drop
+    ///     time. Implementations typically reconstruct an
+    ///     owned type from `drop_ctx` (e.g. `Box::from_raw`,
+    ///     `Rc::from_raw`) and let it drop, returning storage
+    ///     to its pool.
+    ///   * The pair is Send-safe: the IOBuf may move across
+    ///     workers, and the eventual drop runs on whichever
+    ///     worker owns the IOBuf at drop-time.
+    pub unsafe fn from_external(
         base: core::ptr::NonNull<u8>,
         capacity: u32,
         offset: u32,
         len: u32,
-        on_drop: F,
-    ) -> Self
-    where
-        F: FnOnce() + Send + 'static,
-    {
+        drop_fn: Option<IOBufDropFn>,
+        drop_ctx: *mut (),
+    ) -> Self {
         debug_assert!(offset.saturating_add(len) <= capacity);
         IOBuf {
             inner: Inner::External(External {
@@ -227,7 +267,8 @@ impl IOBuf {
                 capacity,
                 offset,
                 len,
-                on_drop: Some(alloc::boxed::Box::new(on_drop)),
+                drop_fn,
+                drop_ctx,
             }),
         }
     }
@@ -1251,21 +1292,29 @@ mod tests {
         use std::sync::Arc;
 
         let released = Arc::new(AtomicBool::new(false));
-        let released_for_cb = released.clone();
+
+        // Drop callback: reconstructs the Arc from the raw ctx
+        // pointer (canceling the `into_raw` increment), flips
+        // the flag, then drops the Arc.
+        unsafe fn cb(_base: NonNull<u8>, _cap: u32, ctx: *mut ()) {
+            let arc: Arc<AtomicBool> =
+                unsafe { Arc::from_raw(ctx as *const AtomicBool) };
+            arc.store(true, Ordering::SeqCst);
+        }
 
         // Owns a small backing region; we'll wrap it as External
-        // and ensure on_drop fires when the IOBuf drops.
+        // and ensure the drop callback fires when the IOBuf drops.
         let mut storage: alloc::vec::Vec<u8> = alloc::vec![0u8; 32];
         storage[5..13].copy_from_slice(b"abcdefgh");
         let ptr = NonNull::new(storage.as_mut_ptr()).unwrap();
+        let ctx = Arc::into_raw(released.clone()) as *mut ();
         {
             // SAFETY: storage outlives the IOBuf in this block;
-            // the on_drop closure doesn't free anything (the
-            // Vec frees its allocation on its own scope-end).
+            // the drop callback reconstructs the Arc from ctx
+            // (via `Arc::from_raw`, canceling the `into_raw`
+            // refcount bump above) and lets it drop normally.
             let mut buf = unsafe {
-                IOBuf::from_external(ptr, 32, 5, 8, move || {
-                    released_for_cb.store(true, Ordering::SeqCst);
-                })
+                IOBuf::from_external(ptr, 32, 5, 8, Some(cb), ctx)
             };
             assert_eq!(buf.data(), b"abcdefgh");
             assert_eq!(buf.headroom(), 5);
@@ -1286,7 +1335,7 @@ mod tests {
             // Callback hasn't run yet.
             assert!(!released.load(Ordering::SeqCst));
         }
-        // IOBuf dropped at scope end → on_drop fires.
+        // IOBuf dropped at scope end → drop callback fires.
         assert!(released.load(Ordering::SeqCst));
     }
 
