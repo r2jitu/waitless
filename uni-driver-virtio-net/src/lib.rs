@@ -1690,31 +1690,47 @@ fn poll_qp(qp: usize, callback: fn(uni_net_driver::IOBuf)) -> usize {
             count += 1;
         }
 
-        if count > 0 {
-            // Diagnostic counter only — no kick from poll. Drops
-            // own kick responsibility now (see `rx_repost`); poll
-            // didn't add anything to the avail ring on the IOBuf
-            // path, so a kick here would be a no-op.
-            //
-            // Clearing `rx_dirty` here re-arms the "first re-post
-            // since clean kicks" mechanism in `rx_repost`. We hold
-            // `rx_lock` briefly so this serialises with concurrent
-            // drops on consumer cores: a drop that completes
-            // before this clear has already kicked (was-clean
-            // path) or didn't need to (was-dirty path); a drop
-            // that completes after this clear sees was-clean and
-            // kicks. Either way every add_buf is paired with
-            // exactly one kick.
+        // Dirty-flag bookkeeping at end of every poll cycle —
+        // unconditional, regardless of `count`. Two reasons:
+        //
+        // (a) If `count == 0` we still need to clear `rx_dirty`,
+        //     otherwise a stale `true` from a prior drop burst
+        //     would persist across quiet poll cycles and the next
+        //     drop's `swap(true)` would return `true → skip kick`,
+        //     leaving fresh add_bufs unkicked indefinitely.
+        //
+        // (b) Even with the clear, the rx_repost protocol has a
+        //     window: drop A kicks (was-clean), drops B/C/D
+        //     piggyback (was-dirty, no kick), and if the device
+        //     finishes processing A's avail entry and sleeps
+        //     before noticing B/C/D's adds, those adds stay
+        //     invisible until something else kicks. With
+        //     `VIRTIO_F_EVENT_IDX` the device only re-scans on
+        //     kick, so we can't rely on it polling. Poll's
+        //     end-of-cycle kick-if-dirty bounds the worst-case
+        //     stall to one event-loop tick.
+        //
+        // The lock serialises this swap with concurrent
+        // `rx_repost` calls on other cores: a repost that
+        // completes before our lock has either already kicked
+        // (was-clean path) or piggybacked on a same-period kick
+        // (was-dirty path); a repost that completes after sees
+        // was-clean and kicks. Every add_buf is therefore paired
+        // with at least one kick.
+        {
             let _g = (*qps(qp)).rx_lock.lock();
-            (*qps(qp))
+            let was_dirty = (*qps(qp))
                 .rx_dirty
-                .store(false, core::sync::atomic::Ordering::Release);
-            if qp < DIAG_QP_CAP {
-                RX_COUNTS[qp].fetch_add(
-                    count as u64,
-                    core::sync::atomic::Ordering::Relaxed,
-                );
+                .swap(false, core::sync::atomic::Ordering::AcqRel);
+            if was_dirty {
+                (*rx_q(qp)).kick();
             }
+        }
+        if count > 0 && qp < DIAG_QP_CAP {
+            RX_COUNTS[qp].fetch_add(
+                count as u64,
+                core::sync::atomic::Ordering::Relaxed,
+            );
         }
     }
     count
