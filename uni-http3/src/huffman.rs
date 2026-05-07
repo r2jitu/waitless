@@ -34,13 +34,39 @@ pub enum HuffmanError {
     TrailingTooLong,
 }
 
-/// Decode `input` into `out`. Caller pre-allocates `out` capacity;
-/// worst-case ~4× expansion (5-bit codes for 'a'..'z').
+/// Decode `input` into `out` (Vec). Caller pre-allocates `out`
+/// capacity; worst-case ~4× expansion (5-bit codes for 'a'..'z').
+/// Convenience wrapper around `decode_into_slice` for the test
+/// path and any caller that wants an owned buffer; the H3 hot
+/// path uses `decode_into_slice` directly to avoid the heap.
 pub fn decode(input: &[u8], out: &mut Vec<u8>) -> Result<(), HuffmanError> {
+    // Decode into a small stack scratch, then memcpy into `out`.
+    // Worst-case 4× expansion bounds the per-call buffer at 4×
+    // the input length; for any practical HTTP header (< 4 KiB)
+    // this fits well within the 16 KiB scratch.
+    let mut scratch = [0u8; 16 * 1024];
+    let n = decode_into_slice(input, &mut scratch)?;
+    out.extend_from_slice(&scratch[..n]);
+    Ok(())
+}
+
+/// Decode `input` into the caller-provided slice `out`. Returns
+/// the number of bytes written. `Err(BadPadding)` if `out` runs
+/// out of room mid-symbol — caller is responsible for sizing the
+/// scratch to cover the worst-case 4× expansion of the encoded
+/// length.
+///
+/// Allocation-free — used on the H3 request hot path where the
+/// caller (`qpack::decode_field_section_into`) owns a stack
+/// buffer it slices into for each header literal. Replacing the
+/// old `decode(&mut Vec)` here drops one heap alloc per QPACK
+/// literal value (≈ 8-12 per Chrome request).
+pub fn decode_into_slice(input: &[u8], out: &mut [u8]) -> Result<usize, HuffmanError> {
     let tree = ensure_tree();
     let mut node = 0u16; // root
     let mut bits_since_root = 0u8;
     let mut last_was_one = true; // tracks "we've only seen 1-bits since root"
+    let mut written = 0usize;
 
     for &byte in input {
         for shift in (0..8).rev() {
@@ -56,7 +82,15 @@ pub fn decode(input: &[u8], out: &mut Vec<u8>) -> Result<(), HuffmanError> {
             let child = tree.children[node as usize][bit as usize];
             match child {
                 Child::Leaf(sym) => {
-                    out.push(sym);
+                    if written >= out.len() {
+                        // Scratch overflow — caller's buffer was
+                        // sized below the worst-case expansion.
+                        // Surface as BadPadding so the QPACK
+                        // decoder turns it into a stream error.
+                        return Err(HuffmanError::BadPadding);
+                    }
+                    out[written] = sym;
+                    written += 1;
                     node = 0;
                     bits_since_root = 0;
                     last_was_one = true;
@@ -69,7 +103,7 @@ pub fn decode(input: &[u8], out: &mut Vec<u8>) -> Result<(), HuffmanError> {
         }
     }
     if node == 0 {
-        return Ok(());
+        return Ok(written);
     }
     // Mid-symbol at end: must be ≤ 7 bits and all 1s.
     if bits_since_root > 7 {
@@ -78,7 +112,7 @@ pub fn decode(input: &[u8], out: &mut Vec<u8>) -> Result<(), HuffmanError> {
     if !last_was_one {
         return Err(HuffmanError::BadPadding);
     }
-    Ok(())
+    Ok(written)
 }
 
 #[derive(Clone, Copy)]

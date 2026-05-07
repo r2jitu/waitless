@@ -49,11 +49,52 @@ pub struct Field {
     pub value: alloc::borrow::Cow<'static, [u8]>,
 }
 
-/// Decode a QPACK-encoded field section into `(req_insert_count,
-/// base, fields)`. We require `req_insert_count == 0 && base == 0`
-/// (no dynamic table) — anything else means the peer ignored our
-/// SETTINGS_QPACK_MAX_TABLE_CAPACITY=0 advertisement.
-pub fn decode_field_section(input: &[u8]) -> Result<Vec<Field>, QpackError> {
+/// Push-style sink for the streaming decoder. Each decoded field
+/// invokes `on_field(name, value)` with byte slices that are
+/// valid only for the duration of the call — the sink must copy
+/// what it wants to keep before returning. Names/values may be
+/// borrowed from the program's static QPACK table (when the
+/// peer used an indexed reference) OR from a caller-provided
+/// scratch buffer (when the peer sent a literal). Either way
+/// the sink sees the decoded plaintext bytes; H=Huffman is
+/// already unrolled.
+///
+/// Using this API instead of `decode_field_section` (which
+/// returns `Vec<Field>` with each literal value boxed in a
+/// `Cow::Owned(Vec<u8>)`) is the difference between
+/// "1 alloc per literal field" and "0 allocs per field" on the
+/// H3 request hot path. The H3 server's `RequestSink` (in
+/// `server.rs`) implements this trait by memcpy'ing names and
+/// values straight into the fixed-size `uni_http::Request`
+/// header arrays — no intermediate `Field` materialization.
+///
+/// Pattern matches what nghttp3 / lsqpack / quiche all do; the
+/// trait is just the Rust expression of the C "decoder fires a
+/// header_block_data_cb per header" pattern.
+pub trait FieldSink {
+    fn on_field(&mut self, name: &[u8], value: &[u8]);
+}
+
+/// Streaming decode — calls `sink.on_field(name, value)` for
+/// each decoded field line and never allocates. `name_scratch`
+/// and `value_scratch` are caller-owned (typically stack
+/// arrays) used for Huffman decode and raw literal collection;
+/// they get overwritten on every literal. Size them for the
+/// worst-case Huffman expansion (4× the encoded length) of the
+/// largest header in your traffic — Chrome's `user-agent` at
+/// ~200 bytes encoded is the upper bound for typical browser
+/// traffic, well under 4 KiB after expansion.
+///
+/// Same wire-format coverage as `decode_field_section`:
+/// rejects all dynamic-table references (we advertise
+/// `SETTINGS_QPACK_MAX_TABLE_CAPACITY=0`) and `req_insert_count
+/// != 0` / `base != 0` prefix values.
+pub fn decode_field_section_into<S: FieldSink>(
+    input: &[u8],
+    name_scratch: &mut [u8],
+    value_scratch: &mut [u8],
+    sink: &mut S,
+) -> Result<(), QpackError> {
     // Required Insert Count: prefixed integer with N=8.
     let (ric, n) = read_prefixed_int(input, 8)?;
     let mut bytes = &input[n..];
@@ -71,15 +112,11 @@ pub fn decode_field_section(input: &[u8]) -> Result<Vec<Field>, QpackError> {
         return Err(QpackError::BadPrefix);
     }
 
-    let mut out = Vec::new();
     while !bytes.is_empty() {
         let first = bytes[0];
         if first & 0x80 != 0 {
             // Indexed Field Line. Bit 6 is T (1=static).
-            // Index is N=6.
             if first & 0x40 == 0 {
-                // Dynamic table reference — we said capacity=0,
-                // so this is a protocol error.
                 return Err(QpackError::BadInstruction);
             }
             let (idx, n) = read_prefixed_int(bytes, 6)?;
@@ -87,15 +124,11 @@ pub fn decode_field_section(input: &[u8]) -> Result<Vec<Field>, QpackError> {
             let entry = static_table::lookup(idx as usize)
                 .ok_or(QpackError::StaticIndexOutOfRange)?;
             // Both name and value live in the program's static
-            // QPACK table — borrow them, no alloc.
-            out.push(Field {
-                name: alloc::borrow::Cow::Borrowed(entry.name),
-                value: alloc::borrow::Cow::Borrowed(entry.value),
-            });
+            // QPACK table — pass borrowed slices straight to the
+            // sink without touching the scratch.
+            sink.on_field(entry.name, entry.value);
         } else if first & 0x40 != 0 {
             // Literal Field Line With Name Reference.
-            // 0 1 N T x x x x  → bit 4 T (1=static), N=4 idx in 4 bits.
-            // (Bit 5 is N=never-index, ignored on receive.)
             let t_static = first & 0x10 != 0;
             if !t_static {
                 return Err(QpackError::BadInstruction);
@@ -104,34 +137,86 @@ pub fn decode_field_section(input: &[u8]) -> Result<Vec<Field>, QpackError> {
             bytes = &bytes[n..];
             let entry = static_table::lookup(idx as usize)
                 .ok_or(QpackError::StaticIndexOutOfRange)?;
-            let (value, n) = read_string(bytes, 7)?;
+            let (value_len, n) = read_string_into(bytes, 7, value_scratch)?;
             bytes = &bytes[n..];
-            // Name borrows from static table; value is literal,
-            // must be owned.
-            out.push(Field {
-                name: alloc::borrow::Cow::Borrowed(entry.name),
-                value: alloc::borrow::Cow::Owned(value),
-            });
+            sink.on_field(entry.name, &value_scratch[..value_len]);
         } else if first & 0x20 != 0 {
             // Literal Field Line With Literal Name.
-            // 0 0 1 N H x x x  → name follows as a string with N=3
-            // length prefix (after the H bit).
-            let (name, n) = read_string(bytes, 3)?;
+            let (name_len, n) = read_string_into(bytes, 3, name_scratch)?;
             bytes = &bytes[n..];
-            let (value, n) = read_string(bytes, 7)?;
+            let (value_len, n) = read_string_into(bytes, 7, value_scratch)?;
             bytes = &bytes[n..];
-            out.push(Field {
-                name: alloc::borrow::Cow::Owned(name),
-                value: alloc::borrow::Cow::Owned(value),
-            });
+            // Need to split borrows: name in name_scratch, value
+            // in value_scratch, both referenced in one call.
+            sink.on_field(&name_scratch[..name_len], &value_scratch[..value_len]);
         } else {
-            // 0 0 0 1 ...  → Indexed Field Line With Post-Base Index
-            // 0 0 0 0 ...  → Literal Field Line With Post-Base Name Reference
-            // Both reference the dynamic table; with capacity=0 it's a violation.
             return Err(QpackError::BadInstruction);
         }
     }
-    Ok(out)
+    Ok(())
+}
+
+/// Decode a QPACK-encoded field section into a `Vec<Field>`.
+/// Convenience wrapper for tests and any caller that wants the
+/// fields owned. The H3 server uses
+/// `decode_field_section_into` instead so it can stream the
+/// decoded headers straight into the `Request` without ever
+/// materialising the intermediate `Field` collection.
+pub fn decode_field_section(input: &[u8]) -> Result<Vec<Field>, QpackError> {
+    struct Collect {
+        out: Vec<Field>,
+    }
+    impl FieldSink for Collect {
+        fn on_field(&mut self, name: &[u8], value: &[u8]) {
+            // Try to recover the static-table borrow: if the
+            // bytes match an entry in the static table (cheap
+            // comparison via lookup_by_name_value), we can keep
+            // the name/value as `Cow::Borrowed`. For the literal
+            // paths we copy into Owned. The streaming API has
+            // already lost the "is this a static-table ref"
+            // signal, so we re-derive via lookup. Rare path — only
+            // called from tests and the legacy API; the hot path
+            // doesn't go through this.
+            let (n, v) = if let Some(idx) =
+                static_table::find_exact(name, value)
+            {
+                if let Some(entry) = static_table::lookup(idx as usize) {
+                    (
+                        alloc::borrow::Cow::Borrowed(entry.name),
+                        alloc::borrow::Cow::Borrowed(entry.value),
+                    )
+                } else {
+                    (
+                        alloc::borrow::Cow::Owned(name.to_vec()),
+                        alloc::borrow::Cow::Owned(value.to_vec()),
+                    )
+                }
+            } else if let Some(name_idx) = static_table::find_name(name) {
+                if let Some(entry) = static_table::lookup(name_idx as usize) {
+                    (
+                        alloc::borrow::Cow::Borrowed(entry.name),
+                        alloc::borrow::Cow::Owned(value.to_vec()),
+                    )
+                } else {
+                    (
+                        alloc::borrow::Cow::Owned(name.to_vec()),
+                        alloc::borrow::Cow::Owned(value.to_vec()),
+                    )
+                }
+            } else {
+                (
+                    alloc::borrow::Cow::Owned(name.to_vec()),
+                    alloc::borrow::Cow::Owned(value.to_vec()),
+                )
+            };
+            self.out.push(Field { name: n, value: v });
+        }
+    }
+    let mut name_scratch = [0u8; 256];
+    let mut value_scratch = [0u8; 4096];
+    let mut sink = Collect { out: Vec::new() };
+    decode_field_section_into(input, &mut name_scratch, &mut value_scratch, &mut sink)?;
+    Ok(sink.out)
 }
 
 /// Read a prefixed-integer per RFC 7541 §5.1 with `prefix_bits` of
@@ -171,11 +256,18 @@ fn read_prefixed_int(buf: &[u8], prefix_bits: u8) -> Result<(u64, usize), QpackE
     }
 }
 
-/// Read a string field-line argument: `H || prefixed_int_len ||
-/// bytes`. `prefix_bits_for_len` is the number of bits the length
-/// integer uses inside the H-marker byte (e.g. 7 for value strings,
-/// 3 for literal-name strings).
-fn read_string(buf: &[u8], prefix_bits_for_len: u8) -> Result<(Vec<u8>, usize), QpackError> {
+/// Read a string field-line argument into a caller-provided
+/// scratch slice. Returns `(decoded_len, bytes_consumed_from_buf)`.
+/// Allocation-free — Huffman expands directly into `out`, raw
+/// bytes get memcpy'd. Errors on `Truncated` if the wire bytes
+/// run out, `HuffmanFailed` if the input is malformed Huffman,
+/// or `HuffmanFailed` (via the underlying decoder) if `out` is
+/// smaller than the worst-case 4× expansion.
+fn read_string_into(
+    buf: &[u8],
+    prefix_bits_for_len: u8,
+    out: &mut [u8],
+) -> Result<(usize, usize), QpackError> {
     if buf.is_empty() {
         return Err(QpackError::Truncated);
     }
@@ -189,11 +281,15 @@ fn read_string(buf: &[u8], prefix_bits_for_len: u8) -> Result<(Vec<u8>, usize), 
     let raw = &buf[n..n + len];
     let bytes_total = n + len;
     if h {
-        let mut decoded = Vec::with_capacity(len * 2);
-        huffman::decode(raw, &mut decoded).map_err(|_| QpackError::HuffmanFailed)?;
-        Ok((decoded, bytes_total))
+        let decoded_len = huffman::decode_into_slice(raw, out)
+            .map_err(|_| QpackError::HuffmanFailed)?;
+        Ok((decoded_len, bytes_total))
     } else {
-        Ok((raw.to_vec(), bytes_total))
+        if raw.len() > out.len() {
+            return Err(QpackError::HuffmanFailed); // scratch overflow
+        }
+        out[..raw.len()].copy_from_slice(raw);
+        Ok((raw.len(), bytes_total))
     }
 }
 

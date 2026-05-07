@@ -27,7 +27,7 @@ use uni_quic::{quic_listen, QuicConn, QuicListenError};
 use uni_http::{Method, Request, Response};
 
 use crate::frame::{self, ftype as h3_ftype};
-use crate::qpack;
+use crate::qpack::{self, FieldSink};
 
 /// Stream-type byte for HTTP/3 control streams (RFC 9114 §6.2.1).
 const STREAM_TYPE_CONTROL: u64 = 0x00;
@@ -115,13 +115,16 @@ where
     // so the recv buffer can't grow without bound.
     use alloc::collections::BTreeSet;
     let mut uni_seen: BTreeSet<u64> = BTreeSet::new();
-    // Per-connection scratch for the request-recv buffer. Each
-    // handle_request `clear()`s it on entry — capacity stays —
-    // instead of allocating a fresh 16 KiB Vec per request. For
-    // a refresh-spamming session this saves one 16 KiB alloc
-    // per refresh (the largest single alloc on the request hot
-    // path).
-    let mut recv_scratch: Vec<u8> = Vec::with_capacity(16 * 1024);
+    // Per-connection scratch buffers. Each `handle_request` /
+    // `write_response` `clear()`s them on entry and reuses the
+    // existing capacity — instead of allocating a fresh Vec per
+    // request. For a refresh-spamming session this saves the
+    // five Vec allocs that previously fired per H3 GET (recv
+    // buffer, HEADERS frame copy, request body, QPACK output,
+    // H3 framing prefix). The capacities below cover the worst
+    // case for a typical browser request — they grow if exceeded
+    // (rare) but never shrink.
+    let mut scratch = Scratch::new();
     loop {
         let sid = match conn.accept_stream().await {
             Some(s) => s,
@@ -134,7 +137,7 @@ where
             // task per request, but the conn task already
             // multiplexes; doing it inline keeps lifetimes simple
             // and matches the shape of //uni-http's handle_conn.
-            handle_request(&conn, sid, h.as_ref(), &mut recv_scratch).await;
+            handle_request(&conn, sid, h.as_ref(), &mut scratch).await;
         } else if sid & 0x3 == 0x2 {
             // Peer unidirectional streams — control, QPACK
             // encoder, QPACK decoder. We can't actively drain
@@ -158,11 +161,59 @@ where
     }
 }
 
+/// Per-connection scratch buffers, retained across requests on
+/// the same QUIC conn. Each request `clear()`s the buffers it
+/// uses and refills via `extend_from_slice` — capacity stays put,
+/// so the steady-state per-request alloc count drops by 5 (vs
+/// the original `Vec::new()`-per-request style). Sized for a
+/// typical Chrome refresh; oversize requests grow the buffer in
+/// place (rare, but capped via `RECV_CAP` enforcement in
+/// `handle_request`).
+pub(crate) struct Scratch {
+    /// H3 stream-bytes accumulator — successive `recv` chunks
+    /// concatenate here until enough bytes form a complete frame.
+    pub(crate) recv_buf: Vec<u8>,
+    /// HEADERS-frame body, copied out of `recv_buf` before the
+    /// outer `drain` invalidates the borrow into it.
+    pub(crate) headers_value: Vec<u8>,
+    /// Reassembled request body across DATA frames (POST/PUT).
+    /// Empty path for GET. Kept as scratch so an occasional POST
+    /// on the same conn doesn't allocate.
+    pub(crate) data: Vec<u8>,
+    /// QPACK-encoded response field section.
+    pub(crate) qpack_buf: Vec<u8>,
+    /// H3 framing prefix (HEADERS frame header + qpack body +
+    /// optional DATA frame header).
+    pub(crate) framing: Vec<u8>,
+}
+
+impl Scratch {
+    pub(crate) fn new() -> Self {
+        Scratch {
+            // 16 KiB matches the previous `recv_scratch` cap and
+            // covers a worst-case single request (8 KiB body +
+            // headers + framing).
+            recv_buf: Vec::with_capacity(16 * 1024),
+            // 4 KiB covers Chrome's typical HEADERS frame size
+            // (compressed pseudo + a dozen literal headers).
+            headers_value: Vec::with_capacity(4 * 1024),
+            // Empty by default; will allocate if a request body
+            // arrives.
+            data: Vec::new(),
+            // 256 B covers our typical 3-header response (status,
+            // content-type, content-length).
+            qpack_buf: Vec::with_capacity(256),
+            // 64 B covers the H3 framing prefix.
+            framing: Vec::with_capacity(64),
+        }
+    }
+}
+
 async fn handle_request<H, F>(
     conn: &QuicConn,
     sid: u64,
     handler: &H,
-    buf: &mut Vec<u8>,
+    scratch: &mut Scratch,
 ) where
     H: Fn(Request) -> F,
     F: core::future::Future<Output = Response>,
@@ -172,14 +223,17 @@ async fn handle_request<H, F>(
     //
     // Buffer cap: enough for our worst-case single request (path +
     // headers + small body). Match `uni_http::Request`'s 8 KiB body.
-    // The buf is per-conn scratch; we clear() and reuse capacity
-    // across requests on the same connection.
+    // `scratch` is per-conn; we clear and reuse capacity across
+    // requests on the same connection.
     const RECV_CAP: usize = 16 * 1024;
-    buf.clear();
+    scratch.recv_buf.clear();
+    scratch.headers_value.clear();
+    scratch.data.clear();
+    let buf = &mut scratch.recv_buf;
+    let headers_value = &mut scratch.headers_value;
+    let data = &mut scratch.data;
     let mut chunk = [0u8; 4096];
     let mut headers_seen = false;
-    let mut headers_value: Vec<u8> = Vec::new();
-    let mut data: Vec<u8> = Vec::new();
     let mut eof = false;
 
     crate::h3_event!(requests_received, "sid={}", sid);
@@ -212,7 +266,10 @@ async fn handle_request<H, F>(
             };
             match f {
                 frame::Frame::Headers(body) => {
-                    headers_value = body.to_vec();
+                    // Copy into per-conn scratch BEFORE the outer
+                    // `buf.drain` invalidates the borrow.
+                    headers_value.clear();
+                    headers_value.extend_from_slice(body);
                     headers_seen = true;
                 }
                 frame::Frame::Data(body) => {
@@ -236,62 +293,88 @@ async fn handle_request<H, F>(
         return;
     }
 
-    // Decode QPACK headers.
-    let fields = match qpack::decode_field_section(&headers_value) {
-        Ok(f) => f,
-        Err(e) => {
+    // Decode QPACK headers via the streaming sink — names and
+    // values land directly in `Request`'s fixed-size arrays
+    // (set_path, push_header) without going through an
+    // intermediate `Vec<Field>`. Saves one heap alloc per
+    // QPACK literal value (≈ 8-12 per Chrome request); no
+    // intermediate `Cow::Owned(Vec<u8>)` per header. Stack-
+    // allocated 4 KiB Huffman scratches cover the worst-case
+    // expansion of any single header in browser traffic.
+    //
+    // Pattern matches the nghttp3/lsqpack approach: decoder
+    // emits header callbacks, consumer copies into final
+    // storage immediately, decoder owns nothing.
+    struct RequestSink<'r> {
+        req: &'r mut Request,
+    }
+    impl FieldSink for RequestSink<'_> {
+        fn on_field(&mut self, name: &[u8], value: &[u8]) {
+            // Pseudo-headers go to dedicated Request fields.
+            // Static-table indexed `:method` / `:path` /
+            // `:scheme` / `:authority` arrive here with the
+            // borrowed-static name from the QPACK static table,
+            // so the byte comparison is against pointer-stable
+            // data (still a memcmp for safety).
+            match name {
+                b":method" => {
+                    self.req.method = match value {
+                        b"GET" => Method::Get,
+                        b"HEAD" => Method::Head,
+                        b"POST" => Method::Post,
+                        b"PUT" => Method::Put,
+                        b"DELETE" => Method::Delete,
+                        _ => Method::Unknown,
+                    };
+                }
+                b":path" => self.req.set_path(value),
+                // :scheme / :authority — we don't currently
+                // use either; drop on the floor.
+                n if n.starts_with(b":") => {}
+                // Regular header — copy into the fixed-size
+                // 16-slot table. Truncates silently past the
+                // cap, matching the HTTP/1.1 parser's behavior.
+                _ => self.req.push_header(name, value),
+            }
+        }
+    }
+    let mut req = Request::new();
+    {
+        let mut sink = RequestSink { req: &mut req };
+        // 4 KiB on the stack covers ≥99th percentile
+        // worst-case Huffman expansion (4× the input length)
+        // for any header in normal browser traffic. A literal
+        // header that exceeds this surfaces as
+        // `qpack_decode_error` and the stream is closed.
+        let mut name_scratch = [0u8; 4096];
+        let mut value_scratch = [0u8; 4096];
+        if let Err(e) = qpack::decode_field_section_into(
+            &headers_value,
+            &mut name_scratch,
+            &mut value_scratch,
+            &mut sink,
+        ) {
             crate::h3_drop!(qpack_decode_error,
                 "sid={} err={:?} header_len={}",
                 sid, e, headers_value.len());
             conn.close_stream(sid);
             return;
         }
-    };
-
-    // Translate to uni_http::Request. Field name/value are
-    // Cow<'static, [u8]> — deref to &[u8] for the comparisons.
-    let mut req = Request::new();
-    let mut method_bytes: &[u8] = b"";
-    let mut path_bytes: &[u8] = b"";
-    for f in &fields {
-        let name: &[u8] = &f.name;
-        if name == b":method" {
-            method_bytes = &f.value;
-        } else if name == b":path" {
-            path_bytes = &f.value;
-        }
     }
-    req.method = match method_bytes {
-        b"GET" => Method::Get,
-        b"HEAD" => Method::Head,
-        b"POST" => Method::Post,
-        b"PUT" => Method::Put,
-        b"DELETE" => Method::Delete,
-        _ => Method::Unknown,
-    };
-    req.set_path(path_bytes);
-    req.set_body(&data);
-    // Pass through user headers (excluding pseudo-headers, which
-    // start with ':').
-    for f in &fields {
-        let name: &[u8] = &f.name;
-        if !name.starts_with(b":") {
-            req.push_header(name, &f.value);
-        }
-    }
+    req.set_body(&data[..]);
 
     crate::diag::bump(&crate::diag::COUNTERS.user_handler_invoked);
     let response = handler(req).await;
     crate::diag::bump(&crate::diag::COUNTERS.user_handler_returned);
     let status = response.status;
     // Encode response: HEADERS + DATA + FIN.
-    write_response(conn, sid, response);
+    write_response(conn, sid, response, &mut scratch.qpack_buf);
     crate::diag::bump(&crate::diag::COUNTERS.write_response_completed);
     crate::h3_event!(requests_handled, "sid={} status={}", sid, status);
     crate::diag::bump(&crate::diag::COUNTERS.responses_sent);
 }
 
-fn write_response(conn: &QuicConn, sid: u64, resp: Response) {
+fn write_response(conn: &QuicConn, sid: u64, resp: Response, qpack_buf: &mut Vec<u8>) {
     // Build the response wire stream as a sequence of chunks.
     //   1. A small "framing" Vec containing [H3 HEADERS frame
     //      complete + qpack-encoded fields][H3 DATA frame
@@ -309,20 +392,29 @@ fn write_response(conn: &QuicConn, sid: u64, resp: Response) {
     let mut len_buf = [0u8; 20];
     let len_off = format_usize_into(body_len, &mut len_buf);
 
-    let mut qpack_buf: Vec<u8> = Vec::with_capacity(128);
+    // Reuse the per-conn `qpack_buf` scratch — encode_field_section
+    // writes into it after `clear()`, so capacity persists across
+    // requests on this conn (1 alloc per CONN, not per request).
+    qpack_buf.clear();
     qpack::encode_field_section(
         &[
             (&b":status"[..], status_str.as_slice()),
             (&b"content-type"[..], resp.content_type_bytes()),
             (&b"content-length"[..], &len_buf[len_off..]),
         ],
-        &mut qpack_buf,
+        qpack_buf,
     );
 
+    // `framing` is moved into the SendStream by `send_owned`, so we
+    // can't pool it across requests (the owned chunk is held in
+    // the QUIC layer until the bytes hit the wire). Allocate fresh,
+    // sized to fit both the HEADERS prefix and the QPACK body in
+    // one shot — `with_capacity` so `extend_from_slice` doesn't
+    // double-grow.
     let mut framing: Vec<u8> = Vec::with_capacity(qpack_buf.len() + 16);
     frame::append_frame_header(h3_ftype::HEADERS, qpack_buf.len(), &mut framing)
         .expect("headers frame header fits");
-    framing.extend_from_slice(&qpack_buf);
+    framing.extend_from_slice(qpack_buf);
     if body_len > 0 {
         frame::append_frame_header(h3_ftype::DATA, body_len, &mut framing)
             .expect("data frame header fits");

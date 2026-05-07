@@ -1391,19 +1391,27 @@ impl Connection {
         }
         let pkt_kp = (buf[0] & 0x04) >> 2;
 
-        // Try the keys appropriate for this packet's KP.
-        let aad: Vec<u8> = buf[..payload_start].to_vec();
+        // Try the keys appropriate for this packet's KP. Split `buf`
+        // into two disjoint mutable slices: AAD is the unprotected
+        // header bytes, payload+tag the rest. Avoids the per-packet
+        // `to_vec()` of the header — for `/diagnostics` over a kept-
+        // alive QUIC conn that meant 3-6 fewer allocs per refresh.
+        // Same approach the Initial/Handshake path already uses
+        // (see `decrypt_long_header`).
         let nonce = packet_nonce(&recv_keys_cur.iv, pn);
         let tag: [u8; TAG_LEN] = buf[payload_end..]
             .try_into()
             .map_err(|_| ConnError::Wire)?;
+        let (aad_part, rest_part) = buf.split_at_mut(payload_start);
+        let aad: &[u8] = aad_part;
+        let payload_slice = &mut rest_part[..payload_end - payload_start];
 
         let aead_result = if pkt_kp == self.recv_key_phase {
-            recv_keys_cur.aead_open(&nonce, &aad, &mut buf[payload_start..payload_end], &tag)
+            recv_keys_cur.aead_open(&nonce, aad, payload_slice, &tag)
         } else if let Some(next) = self.application_recv_next.as_ref().cloned() {
             // Peer's KP differs from ours: try the next-phase keys.
             let next_nonce = packet_nonce(&next.iv, pn);
-            match next.aead_open(&next_nonce, &aad, &mut buf[payload_start..payload_end], &tag) {
+            match next.aead_open(&next_nonce, aad, payload_slice, &tag) {
                 Ok(()) => {
                     // Successful key update — rotate and re-derive.
                     self.rotate_recv_keys();
@@ -1415,7 +1423,7 @@ impl Connection {
                     // Try previous-phase keys for reorder absorption.
                     if let Some(prev) = self.application_recv_prev.as_ref() {
                         let prev_nonce = packet_nonce(&prev.iv, pn);
-                        prev.aead_open(&prev_nonce, &aad, &mut buf[payload_start..payload_end], &tag)
+                        prev.aead_open(&prev_nonce, aad, payload_slice, &tag)
                     } else {
                         Err(())
                     }
@@ -1426,7 +1434,7 @@ impl Connection {
             // — try previous-phase as a last resort.
             if let Some(prev) = self.application_recv_prev.as_ref() {
                 let prev_nonce = packet_nonce(&prev.iv, pn);
-                prev.aead_open(&prev_nonce, &aad, &mut buf[payload_start..payload_end], &tag)
+                prev.aead_open(&prev_nonce, aad, payload_slice, &tag)
             } else {
                 Err(())
             }

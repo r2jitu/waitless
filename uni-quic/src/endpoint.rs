@@ -34,7 +34,6 @@
 
 use alloc::rc::Rc;
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
 
 use core::cell::{Cell, RefCell};
@@ -367,6 +366,52 @@ where
 // Listener loop (per worker)
 // ============================================================================
 
+/// Per-listener pool of 1500-byte recv buffers. Shared between
+/// the listener loop (allocator) and conn_task (returner) via
+/// `Rc<RefCell<…>>` — both halves run on the same worker, so
+/// single-threaded interior mutability is sufficient. Cap of
+/// `RECYCLE_POOL_CAP` keeps the pool from holding indefinite
+/// memory if a burst pushes many Vecs back at once.
+type RecyclePool = Rc<core::cell::RefCell<alloc::vec::Vec<alloc::vec::Vec<u8>>>>;
+
+/// Maximum number of buffers we hold in the recycle pool. Picked
+/// to comfortably cover one Chrome refresh's burst (~5-8 inbound
+/// datagrams) without stockpiling.
+const RECYCLE_POOL_CAP: usize = 16;
+
+/// Hand a drained recv buffer back to the pool. Called by the
+/// conn task after it's done with `process_datagram` — the Vec
+/// has been mutated in place but its capacity is intact, so we
+/// `clear()` and refill on the next listener iteration. Drops
+/// the buffer if the pool is at capacity (steady-state behaviour
+/// — the listener+conn alternate fast enough that the pool
+/// rarely accumulates beyond one or two slots).
+fn recycle_buf(pool: &RecyclePool, mut buf: alloc::vec::Vec<u8>) {
+    if buf.capacity() < 1500 {
+        return;
+    }
+    let mut p = pool.borrow_mut();
+    if p.len() < RECYCLE_POOL_CAP {
+        // Restore length to 1500 so the next `recv_from` sees a
+        // full buffer. `resize` only writes the gap from current
+        // len up to 1500; the bytes already in `0..len` get
+        // overwritten by recv_from anyway, so leaving them as-is
+        // is fine and saves a bzero of the head.
+        buf.resize(1500, 0);
+        p.push(buf);
+    }
+}
+
+/// Pull a 1500-byte buffer from the pool or freshly allocate one.
+/// The returned buffer is `len() == 1500` and ready for
+/// `recv_from`.
+fn take_buf(pool: &RecyclePool) -> alloc::vec::Vec<u8> {
+    if let Some(v) = pool.borrow_mut().pop() {
+        return v;
+    }
+    alloc::vec![0u8; 1500]
+}
+
 async fn listener_loop<H, F>(
     sock: Arc<UdpSocket>,
     slots: Rc<SlotTable>,
@@ -376,16 +421,18 @@ async fn listener_loop<H, F>(
     H: Fn(QuicConn) -> F + Send + Sync + 'static,
     F: Future<Output = ()> + 'static,
 {
+    let recycle_pool: RecyclePool = Rc::new(core::cell::RefCell::new(
+        alloc::vec::Vec::with_capacity(RECYCLE_POOL_CAP),
+    ));
     loop {
-        // Allocate the recv buffer per iteration so we can move it
-        // straight into the Datagram on push, eliminating the
-        // `dgram_bytes.to_vec()` memcpy. Same-size allocations are
-        // friendly to the talc allocator's free-list. For
-        // recoverable bursts the conn task drops these Vecs after
-        // process_datagram (which mutates them in place); reuse
-        // would require cross-task plumbing not worth the
-        // complexity here.
-        let mut buf = vec![0u8; 1500];
+        // Pull a 1500-byte recv buffer from the per-listener
+        // recycle pool, falling back to a fresh allocation. The
+        // conn task returns drained buffers via `recycle_buf`
+        // after `process_datagram` finishes — for a kept-alive
+        // QUIC conn (browser refresh-spam pattern) this turns
+        // the previous "1 alloc per inbound datagram" into "0
+        // alloc per inbound datagram on the steady-state path."
+        let mut buf = take_buf(&recycle_pool);
         let (src_ip, src_port, n) = sock.recv_from(&mut buf).await;
         if n == 0 {
             continue;
@@ -397,6 +444,7 @@ async fn listener_loop<H, F>(
                 crate::quic_drop!(no_dcid, "datagram_size={} first={:#x}",
                     buf.len(),
                     buf.first().copied().unwrap_or(0));
+                recycle_buf(&recycle_pool, buf);
                 continue;
             }
         };
@@ -470,6 +518,7 @@ async fn listener_loop<H, F>(
                     "size={} dcid={} first={:#x}",
                     buf.len(), hex8(&dcid), first);
             }
+            recycle_buf(&recycle_pool, buf);
             continue;
         }
 
@@ -482,6 +531,7 @@ async fn listener_loop<H, F>(
                 // distinguish them.
                 crate::quic_drop!(slot_table_full,
                     "dcid={} src_ip={:?}", hex8(&dcid), src_ip);
+                recycle_buf(&recycle_pool, buf);
                 continue;
             }
         };
@@ -489,6 +539,7 @@ async fn listener_loop<H, F>(
         let mut nonce = [0u8; 4];
         if getrandom::getrandom(&mut nonce).is_err() {
             crate::quic_drop!(rng_failed, "minting CID nonce");
+            recycle_buf(&recycle_pool, buf);
             continue;
         }
         let local_cid_bytes = make_local_cid(slot_idx, generation, nonce);
@@ -518,6 +569,7 @@ async fn listener_loop<H, F>(
         let task_sock = sock.clone();
         let task_cfg = cfg.clone();
         let task_handler = handler.clone();
+        let task_recycle = recycle_pool.clone();
         let _ = spawn(conn_task::<H, F>(
             task_inbox,
             task_sock,
@@ -526,6 +578,7 @@ async fn listener_loop<H, F>(
             local_cid,
             local_cid_bytes,
             seed,
+            task_recycle,
         ));
     }
 }
@@ -542,6 +595,7 @@ async fn conn_task<H, F>(
     local_cid: ConnectionId,
     local_cid_bytes: [u8; SERVER_CID_LEN],
     seed: [u8; 32],
+    recycle_pool: RecyclePool,
 ) where
     H: Fn(QuicConn) -> F + Send + Sync + 'static,
     F: Future<Output = ()> + 'static,
@@ -654,6 +708,12 @@ async fn conn_task<H, F>(
             let dgram_size = d.bytes.len();
             let mut bytes = d.bytes;
             let result = conn.borrow_mut().process_datagram(&mut bytes, &cfg);
+            // Hand the buffer back to the listener's recycle pool
+            // — kept-alive QUIC conns under refresh-spam pattern see
+            // 5-8 inbound datagrams per fetch, each 1500 B; without
+            // recycling those were 5-8 fresh `vec![0u8; 1500]`
+            // allocs per request.
+            recycle_buf(&recycle_pool, bytes);
             if let Err(e) = result {
                 crate::quic_drop!(other_wire,
                     "process_datagram failed: {:?} dgram_size={} local_cid={}",
