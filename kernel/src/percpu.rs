@@ -118,6 +118,95 @@ impl RxInbox {
     }
 }
 
+/// Zero-copy variant of [`RxInbox`] — the producer hands an owned
+/// [`uni_iobuf::IOBuf`] (typically `IOBuf::External` wrapping a NIC
+/// descriptor's storage) and the consumer takes ownership of it.
+/// No memcpy on either side: the cross-core hand-off is just an
+/// SPSC ring exchange of a pointer-sized index, and the IOBuf
+/// itself moves by-value through the slot.
+///
+/// SPSC discipline mirrors `RxInbox`: a single producer (the
+/// distributor on the receiving core) calls `push`, a single
+/// consumer (the owning core) calls `pop`. Both take `&self` and
+/// rely on producer-only `next_slot` advance + the `ready` ring's
+/// release/acquire pair for visibility.
+///
+/// Slot lifecycle: each `Option<IOBuf>` cell starts as `None`.
+/// `push` writes `Some(iobuf)` into `pool[next_slot]` and then
+/// publishes the index via `ready.push`. `pop` reads the index,
+/// `take()`s the IOBuf out of the slot (leaving `None`), and
+/// returns it. The producer can only wrap back to a slot once the
+/// consumer has drained it (by ring-capacity invariant), so the
+/// `Some → take → Some` sequence on the same slot is well-ordered.
+pub struct RxIobufInbox {
+    pool: [UnsafeCell<Option<uni_iobuf::IOBuf>>; RX_POOL_SIZE],
+    ready: spsc::Ring<u32>,
+    next_slot: AtomicUsize,
+}
+
+// SAFETY: same producer/consumer discipline as `RxInbox`. The
+// `IOBuf` payload is `Send` (heap variant: `Box<[u8]>`; static:
+// `&'static [u8]`; external: explicit `unsafe impl Send`) so
+// moving it across cores via the slot is sound. Producer publishes
+// the slot's `Some(iobuf)` write with `ready.push`'s release-tail
+// store; consumer's `ready.pop` acquire-load makes that write
+// visible before it `take()`s.
+unsafe impl Sync for RxIobufInbox {}
+
+impl RxIobufInbox {
+    pub const fn new() -> Self {
+        RxIobufInbox {
+            pool: [const { UnsafeCell::new(None) }; RX_POOL_SIZE],
+            ready: spsc::Ring::new(),
+            next_slot: AtomicUsize::new(0),
+        }
+    }
+
+    /// Push an `IOBuf` into the inbox. Returns `false` (and drops
+    /// `iobuf` — the IOBuf's own Drop runs, releasing any backing
+    /// storage / NIC descriptor) when the ring is full. The slot at
+    /// `next_slot` is guaranteed `None` by the ring-capacity
+    /// invariant: consumer must have drained the previous content
+    /// before producer wraps to it.
+    pub fn push(&self, iobuf: uni_iobuf::IOBuf) -> bool {
+        let slot = self.next_slot.load(Ordering::Relaxed);
+        // SAFETY: producer-only write to its current slot. The
+        // consumer can only observe this Some after the release-
+        // store inside `ready.push`. The slot is guaranteed to be
+        // `None` here because the ring's capacity equals the pool
+        // size — wrapping back to slot N requires the consumer to
+        // have already `pop`'d it.
+        unsafe {
+            let cell = &mut *self.pool[slot].get();
+            *cell = Some(iobuf);
+        }
+        if !self.ready.push(slot as u32) {
+            // Ring is full despite the wrap-invariant — should not
+            // happen, but undo the slot write so we don't leak.
+            // SAFETY: we just wrote `Some(iobuf)` above; nobody
+            // else has touched this slot.
+            unsafe {
+                let cell = &mut *self.pool[slot].get();
+                *cell = None;
+            }
+            return false;
+        }
+        self.next_slot.store((slot + 1) % RX_POOL_SIZE, Ordering::Relaxed);
+        true
+    }
+
+    /// Pop a ready `IOBuf` from the inbox.
+    pub fn pop(&self) -> Option<uni_iobuf::IOBuf> {
+        let idx = self.ready.pop()?;
+        // SAFETY: the matching acquire-load inside `ready.pop`
+        // synchronises with the producer's release on
+        // `ready.tail`, so the `Some(iobuf)` write is visible.
+        // Single consumer ⇒ no concurrent reader.
+        let cell = unsafe { &mut *self.pool[idx as usize].get() };
+        cell.take()
+    }
+}
+
 /// Per-core state. Each core has exactly one of these.
 /// The TLS register (GS_BASE on x86_64, TPIDR_EL1 on aarch64) points
 /// to this struct. Fields at known offsets can be read directly via
@@ -139,6 +228,14 @@ pub struct PerCore {
 
     /// RX inbox for Tier 2 delivery (core 0 writes, this core reads).
     pub rx_inbox: RxInbox,
+
+    /// Zero-copy variant of `rx_inbox` — used by drivers that
+    /// implement `NicOps::iobuf_rx`. Same SPSC shape but each slot
+    /// holds an owned `IOBuf` (typically `IOBuf::External`
+    /// pointing at the descriptor's storage) instead of a
+    /// memcpy'd `RxPacket`. Stays empty when the active driver
+    /// only supports the copy path through `RxInbox`.
+    pub rx_iobuf_inbox: RxIobufInbox,
 
     /// Inbox for Tier 2 RX delivery (SPSC: core 0 writes, this core reads).
     pub inbox: spsc::Ring<Task>,
@@ -220,6 +317,7 @@ impl PerCore {
             id,
             _pad: 0,
             rx_inbox: RxInbox::new(),
+            rx_iobuf_inbox: RxIobufInbox::new(),
             inbox: spsc::Ring::new(),
             pinned: spsc::Ring::new(),
             stealable: Deque::new(),
