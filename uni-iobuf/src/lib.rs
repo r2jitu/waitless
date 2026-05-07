@@ -274,6 +274,7 @@ impl IOBuf {
     }
 
     /// Visible payload bytes.
+    #[inline]
     pub fn data(&self) -> &[u8] {
         match &self.inner {
             Inner::Heap {
@@ -301,6 +302,7 @@ impl IOBuf {
         }
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
         match &self.inner {
             Inner::Heap { len, .. } => *len as usize,
@@ -309,6 +311,7 @@ impl IOBuf {
         }
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -316,6 +319,7 @@ impl IOBuf {
     /// Bytes available before the payload. Lower layers (TLS,
     /// TCP, IP, Eth) prepend their headers into this space.
     /// Always `0` for static borrows.
+    #[inline]
     pub fn headroom(&self) -> usize {
         match &self.inner {
             Inner::Heap { offset, .. } => *offset as usize,
@@ -326,6 +330,7 @@ impl IOBuf {
 
     /// Bytes available after the payload. Used for AEAD tags,
     /// trailers, etc. Always `0` for static borrows.
+    #[inline]
     pub fn tailroom(&self) -> usize {
         match &self.inner {
             Inner::Heap {
@@ -347,6 +352,7 @@ impl IOBuf {
     /// Mutable access to the visible payload. Returns `None` for
     /// static borrows. Used by in-place crypto (ChaCha20-Poly1305
     /// seals into the source bytes).
+    #[inline]
     pub fn data_mut(&mut self) -> Option<&mut [u8]> {
         match &mut self.inner {
             Inner::Heap {
@@ -506,6 +512,7 @@ impl IOBuf {
     ///
     /// Returns `Err` if `offset + len` exceeds the current visible
     /// payload length.
+    #[inline]
     pub fn narrow(&mut self, offset: usize, len: usize) -> Result<(), IOBufError> {
         self.consume(offset)?;
         let visible = self.data().len();
@@ -520,6 +527,7 @@ impl IOBuf {
     /// header (e.g. TLS unprotect leaves the record header
     /// untouched in headroom; the next layer up just wants the
     /// plaintext).
+    #[inline]
     pub fn consume(&mut self, n: usize) -> Result<(), IOBufError> {
         match &mut self.inner {
             Inner::Heap { offset, len, .. } => {
@@ -632,6 +640,7 @@ impl IOBuf {
     }
 
     /// Trim `n` bytes from the BACK of the visible payload.
+    #[inline]
     pub fn trim_end(&mut self, n: usize) -> Result<(), IOBufError> {
         match &mut self.inner {
             Inner::Heap { len, .. } => {
