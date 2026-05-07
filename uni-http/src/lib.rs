@@ -912,6 +912,13 @@ async fn handle_conn<S, H>(
     // observed.
     let mut req = Request::new();
     let mut w = BufWriter::new();
+    // Carries the parser's progress (`scan_pos`) across calls
+    // when a request arrives in multiple recv'd segments — the
+    // `find_header_end` scan resumes from the last position
+    // instead of restarting at byte 0. Reset to default after
+    // each successfully-consumed request so the next pipelined
+    // request starts a fresh scan.
+    let mut parser_state = ParserState::default();
     loop {
         if buf_len == BUF_SIZE {
             // Parse buffer full and no complete request in it —
@@ -930,7 +937,8 @@ async fn handle_conn<S, H>(
 
         // Drain every complete request sitting in the buffer.
         while buf_len > 0 {
-            let consumed = parse_request(&buf[..buf_len], &mut req);
+            let consumed =
+                parse_request_with_state(&buf[..buf_len], &mut req, &mut parser_state);
             if consumed == 0 {
                 break; // need more bytes
             }
@@ -1001,20 +1009,47 @@ async fn handle_conn<S, H>(
                 buf.copy_within(consumed..buf_len, 0);
             }
             buf_len = remaining;
+            // The next pipelined request starts at byte 0 of the
+            // shifted buffer, so the parser state has to forget
+            // its "already scanned" cursor.
+            parser_state = ParserState::default();
         }
     }
 }
 
 // ---- HTTP request parser ----------------------------------------------------
 
-/// Parse an HTTP request from `data`. Returns bytes consumed (>0) on success,
-/// 0 if the request is incomplete.
-fn parse_request(data: &[u8], req: &mut Request) -> usize {
+/// Parser state retained across `parse_request` calls on the same
+/// pipelined request. Lets `find_header_end` skip bytes it's
+/// already scanned — the previous implementation re-walked the
+/// whole accumulated buffer on every recv, costing O(N²) on
+/// requests that arrive in many small segments. With this state
+/// the scan is amortised O(N) regardless of segment shape.
+///
+/// `handle_conn` keeps one of these per connection and resets it
+/// to `Default::default()` after each successfully-consumed
+/// request so the next pipelined request starts a fresh scan.
+#[derive(Default)]
+pub struct ParserState {
+    /// Bytes 0..scan_pos already scanned without finding the
+    /// `\r\n\r\n` terminator. New recv data extends past
+    /// `scan_pos`; the scan resumes from `scan_pos.saturating_sub(3)`
+    /// so a terminator straddling the recv boundary still matches.
+    scan_pos: usize,
+}
+
+fn parse_request_with_state(data: &[u8], req: &mut Request, state: &mut ParserState) -> usize {
     req.clear();
 
-    // Find end of headers ("\r\n\r\n")
-    let header_end = find_header_end(data);
+    // Find end of headers ("\r\n\r\n"). Resume from the last
+    // scanned position (minus 3 so a terminator straddling the
+    // previous-call buffer boundary is caught).
+    let resume = state.scan_pos.saturating_sub(3);
+    let header_end = find_header_end_from(data, resume);
     if header_end.is_none() {
+        // Mark how far we've scanned so the next call doesn't
+        // redo this work.
+        state.scan_pos = data.len();
         return 0;
     }
     let header_end_pos = header_end.unwrap();
@@ -1321,9 +1356,14 @@ fn write_usize(out: &mut [u8; 20], mut n: usize) -> usize {
 
 // ---- Helper functions -------------------------------------------------------
 
-fn find_header_end(data: &[u8]) -> Option<usize> {
-    data.windows(4)
-        .position(|w| w == b"\r\n\r\n")
+/// Locate `\r\n\r\n` (the headers/body terminator) starting from
+/// byte `start`. The caller has already scanned `data[..start]`
+/// without finding it; this restarts there to avoid the O(N²)
+/// re-scan when a request arrives in many small recv segments.
+/// Returns the absolute index of the terminator within `data`.
+fn find_header_end_from(data: &[u8], start: usize) -> Option<usize> {
+    let suffix = data.get(start..)?;
+    suffix.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + start)
 }
 
 
