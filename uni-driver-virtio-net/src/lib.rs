@@ -40,7 +40,7 @@ use drivers_infra::virtio::{
     MMIO_STATUS, MMIO_DEVICE_CONFIG, MMIO_MAGIC,
     MMIO_INTERRUPT_STATUS, MMIO_INTERRUPT_ACK,
 };
-use uni_kernel::mm::{kmalloc, virt_to_phys, phys_to_virt};
+use uni_kernel::mm::{kfree, kmalloc, virt_to_phys, phys_to_virt};
 
 // ============================================================================
 // VirtIO-net constants and types
@@ -1609,6 +1609,218 @@ fn flush_tx_kick_if_dirty() -> bool {
 }
 
 // ============================================================================
+// Zero-copy RX (NicOps::iobuf_rx implementation)
+// ============================================================================
+//
+// `poll_qp_iobuf` mirrors `poll_qp` but instead of memcpy'ing the
+// frame into a transient `&[u8]` slice borrowed by the callback, it
+// wraps the descriptor's buffer as an `IOBuf::External` and hands
+// ownership to the consumer. The IOBuf's drop callback returns the
+// buffer to a global spare pool (`RX_SPARE_POOL`) so a future poll
+// can re-arm a descriptor with it.
+//
+// Each used descriptor consumed in this path has its buffer handed
+// out — the descriptor must be re-armed with a fresh buffer before
+// the device pulls from the avail ring again. We pop a fresh one
+// from the spare pool; if the pool is empty (every spare buffer is
+// out at a consumer) we kmalloc a one-off, which eventually returns
+// to the pool when the consumer drops its IOBuf.
+//
+// Steady-state behaviour: the pool fills up to `RX_SPARE_POOL_SIZE`
+// after the first burst, kmalloc stops firing, and every RX packet
+// is a pop+push pair on the spinlocked pool — no allocator hits, no
+// per-packet memcpy. Pool overflow on push falls back to `kfree`,
+// keeping the pool size bounded under sustained pressure.
+
+const RX_SPARE_POOL_SIZE: usize = 256;
+
+/// Cross-core spare-buffer pool. Producer is the IOBuf drop
+/// callback (any core under Tier 2); consumer is the polling core
+/// (each core under Tier 1, core 0 only under Tier 2). Spinlocked
+/// because Tier 2 cross-core hand-off can drop on any core, and a
+/// lock-free ring would cost more under the typical low-contention
+/// access pattern than an uncontended spinlock acquire.
+struct RxSparePool {
+    inner: uni_kernel::sync::Spinlock<RxSparePoolInner>,
+}
+
+struct RxSparePoolInner {
+    /// Buffer payload pointers (i.e. `kmalloc-payload + RX_IP_ALIGN`),
+    /// stored as `usize` so the spinlock's data type is trivially
+    /// `Send + Sync` without manual unsafe impls.
+    slots: [usize; RX_SPARE_POOL_SIZE],
+    count: usize,
+}
+
+impl RxSparePool {
+    const fn new() -> Self {
+        RxSparePool {
+            inner: uni_kernel::sync::Spinlock::new(RxSparePoolInner {
+                slots: [0; RX_SPARE_POOL_SIZE],
+                count: 0,
+            }),
+        }
+    }
+
+    fn pop(&self) -> Option<*mut u8> {
+        let mut g = self.inner.lock();
+        if g.count == 0 {
+            return None;
+        }
+        let idx = g.count - 1;
+        let slot = g.slots[idx];
+        g.slots[idx] = 0;
+        g.count = idx;
+        Some(slot as *mut u8)
+    }
+
+    fn push(&self, ptr: *mut u8) -> bool {
+        let mut g = self.inner.lock();
+        if g.count >= RX_SPARE_POOL_SIZE {
+            return false;
+        }
+        let idx = g.count;
+        g.slots[idx] = ptr as usize;
+        g.count = idx + 1;
+        true
+    }
+}
+
+static RX_SPARE_POOL: RxSparePool = RxSparePool::new();
+
+/// Allocate a fresh RX buffer for re-arming a descriptor. Tries
+/// the spare pool first; falls back to `kmalloc` when the pool is
+/// drained (all spare buffers are out at consumers). Returns the
+/// buffer payload pointer (kmalloc-addr + `RX_IP_ALIGN`); the
+/// virtio-net header region at the start has been zero'd.
+unsafe fn rx_buffer_alloc() -> Option<*mut u8> {
+    if let Some(buf) = RX_SPARE_POOL.pop() {
+        // Re-zero the virtio header region — the consumer overwrote
+        // it on the previous use. The rest of the buffer is don't-
+        // care (the device fills it before we look again).
+        unsafe { ptr::write_bytes(buf, 0, VIRTIO_NET_HDR_SIZE); }
+        return Some(buf);
+    }
+    let alloc = kmalloc(BUFFER_SIZE as usize + RX_IP_ALIGN);
+    if alloc.is_null() {
+        return None;
+    }
+    let buf = unsafe { alloc.add(RX_IP_ALIGN) };
+    unsafe { ptr::write_bytes(buf, 0, VIRTIO_NET_HDR_SIZE); }
+    Some(buf)
+}
+
+/// Drop callback for `IOBuf::External` instances handed out by
+/// `poll_qp_iobuf`. Returns the buffer to `RX_SPARE_POOL`; on pool
+/// overflow, frees it (the pool's bounded size keeps memory in
+/// check even under sustained mismatch between RX rate and
+/// consumer drain rate).
+///
+/// SAFETY contract from `IOBuf::from_external`: `base` is the same
+/// pointer we passed in (`buf` — kmalloc-addr + `RX_IP_ALIGN`),
+/// `capacity` is `BUFFER_SIZE`, and the underlying allocation is
+/// exclusively owned (the descriptor was repointed at a different
+/// buffer before the IOBuf was created, so no other code is
+/// reading this region).
+unsafe fn rx_drop_callback(
+    base: core::ptr::NonNull<u8>,
+    _capacity: u32,
+    _ctx: *mut (),
+) {
+    let buf = base.as_ptr();
+    if !RX_SPARE_POOL.push(buf) {
+        // Pool full — free the buffer (recovering the kmalloc-
+        // payload addr by undoing the `RX_IP_ALIGN` shift).
+        unsafe { kfree(buf.sub(RX_IP_ALIGN)); }
+    }
+}
+
+/// Per-queue zero-copy RX poll. Mirrors `poll_qp` but the callback
+/// receives an owned `IOBuf::External` per frame instead of a
+/// borrowed `&[u8]`.
+fn poll_qp_iobuf(qp: usize, callback: fn(uni_net_driver::IOBuf)) -> usize {
+    unsafe {
+        if let Transport::None = (*ndev()).transport { return 0; }
+    }
+
+    if IRQ_PENDING.swap(false, core::sync::atomic::Ordering::Acquire) {
+        // used_idx was cached by irq_handler.
+    }
+
+    let nqp = unsafe { (*ndev()).num_queue_pairs };
+    if uni_kernel::percpu::num_cores() <= 1 || (nqp as usize) > 1 {
+        tx_drain_qp(qp);
+    } else if let Some(_g) = TX_LOCK.try_lock() {
+        tx_drain_qp(qp);
+    }
+
+    let mut count: usize = 0;
+    unsafe {
+        while let Some((used_id, used_len)) = (*rx_q(qp)).used() {
+            let desc = (*rx_q(qp)).desc(used_id);
+            let buf = phys_to_virt(desc.addr);
+
+            if used_len > VIRTIO_NET_HDR_SIZE as u32 {
+                let frame_len = (used_len - VIRTIO_NET_HDR_SIZE as u32) as usize;
+                // Wrap the descriptor's buffer as an `IOBuf::External`.
+                // The IOBuf takes ownership; its drop callback returns
+                // the buffer to `RX_SPARE_POOL`. Visible payload starts
+                // past the virtio-net header (offset = HDR_SIZE).
+                let iobuf = uni_net_driver::IOBuf::from_external(
+                    core::ptr::NonNull::new_unchecked(buf),
+                    BUFFER_SIZE,
+                    VIRTIO_NET_HDR_SIZE as u32,
+                    frame_len as u32,
+                    Some(rx_drop_callback),
+                    core::ptr::null_mut(),
+                );
+                callback(iobuf);
+            } else {
+                // Truncated / header-only frame — return to pool
+                // directly without minting an IOBuf.
+                if !RX_SPARE_POOL.push(buf) {
+                    kfree(buf.sub(RX_IP_ALIGN));
+                }
+            }
+
+            // Re-arm with a fresh buffer (pool first, kmalloc fallback).
+            if let Some(new_buf) = rx_buffer_alloc() {
+                let new_buf_phys = virt_to_phys(new_buf);
+                (*rx_q(qp)).add_buf(new_buf_phys, BUFFER_SIZE, 0, 1);
+            } else {
+                // OOM — bail out of the drain loop. The descriptor
+                // we just consumed is now not-armed; subsequent
+                // polls will pick up where we left off once the
+                // allocator recovers.
+                break;
+            }
+            count += 1;
+        }
+
+        if count > 0 {
+            (*rx_q(qp)).kick();
+            if qp < DIAG_QP_CAP {
+                RX_COUNTS[qp].fetch_add(
+                    count as u64,
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+            }
+        }
+    }
+    count
+}
+
+/// All-queues fan-out wrapper, parallel to `poll`.
+fn poll_iobuf(callback: fn(uni_net_driver::IOBuf)) -> usize {
+    let n = unsafe { (*ndev()).negotiated_queue_pairs as usize }.max(1);
+    let mut total = 0;
+    for qp in 0..n {
+        total += poll_qp_iobuf(qp, callback);
+    }
+    total
+}
+
+// ============================================================================
 // NicOps registration
 // ============================================================================
 //
@@ -1619,7 +1831,7 @@ fn flush_tx_kick_if_dirty() -> bool {
 // The active-driver slot stores `&'static NicOps`; every dispatcher
 // call does one Acquire load + one direct call.
 
-use uni_net_driver::{NicDiagOps, NicIdleOps, NicOps};
+use uni_net_driver::{NicDiagOps, NicIdleOps, NicIobufRxOps, NicOps};
 
 /// `init()` is NOT idempotent — it re-runs PCI/MMIO probe + queue
 /// realloc + MSI-X rebind, corrupting in-flight state if called after
@@ -1641,6 +1853,11 @@ static VIRTIO_NET_DIAG_OPS: NicDiagOps = NicDiagOps {
     rx_used_cursors,
 };
 
+static VIRTIO_NET_IOBUF_RX_OPS: NicIobufRxOps = NicIobufRxOps {
+    poll_rx: poll_iobuf,
+    poll_qp: poll_qp_iobuf,
+};
+
 static VIRTIO_NET_OPS: NicOps = NicOps {
     name: "virtio-net",
     probe,
@@ -1656,10 +1873,7 @@ static VIRTIO_NET_OPS: NicOps = NicOps {
     poke_interrupt_status,
     idle: Some(&VIRTIO_NET_IDLE_OPS),
     diag: Some(&VIRTIO_NET_DIAG_OPS),
-    // Zero-copy RX not yet wired — drops to the copy path via
-    // `poll_rx`. Step 3 of the IOBuf-RX series flips this on
-    // (see uni_net_driver::NicIobufRxOps).
-    iobuf_rx: None,
+    iobuf_rx: Some(&VIRTIO_NET_IOBUF_RX_OPS),
 };
 
 uni_net_driver::register_ethernet_driver!(VIRTIO_NET_OPS);
