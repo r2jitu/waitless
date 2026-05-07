@@ -522,12 +522,17 @@ pub struct Connection {
 
 
     /// Per-stream receive state, keyed by stream ID. Lazily
-    /// inserted on the first STREAM frame.
-    recv_streams: alloc::collections::BTreeMap<u64, crate::streams::RecvStream>,
+    /// inserted on the first STREAM frame. Vec-backed (see
+    /// `SmallStreamMap`) so insert/remove don't allocate per-
+    /// entry nodes — the typical live-stream count per QUIC
+    /// conn is 1-4 (current request bidi + QPACK uni streams),
+    /// well within the linear-scan-wins regime.
+    recv_streams: crate::streams::SmallStreamMap<crate::streams::RecvStream>,
 
-    /// Per-stream send state, keyed by stream ID. Lazily inserted
-    /// the first time the app calls `stream_send` for a stream.
-    send_streams: alloc::collections::BTreeMap<u64, crate::streams::SendStream>,
+    /// Per-stream send state, keyed by stream ID. Lazily
+    /// inserted the first time the app calls `stream_send` for
+    /// a stream. Same `SmallStreamMap` shape as `recv_streams`.
+    send_streams: crate::streams::SmallStreamMap<crate::streams::SendStream>,
 
     /// Recycle pool for `RecvStream`s. The reaper pushes finished
     /// streams here (after `reset_for_reuse` clears state but
@@ -612,8 +617,12 @@ impl Connection {
             one_rtt_crypto_offset: 0,
             outbound: alloc::collections::VecDeque::new(),
             outbound_pool: Vec::new(),
-            recv_streams: alloc::collections::BTreeMap::new(),
-            send_streams: alloc::collections::BTreeMap::new(),
+            // Pre-allocate space for the typical live-stream
+            // count (1 bidi + 3 peer-uni for QPACK control /
+            // encoder / decoder = 4) so neither map needs to
+            // grow during normal request processing.
+            recv_streams: crate::streams::SmallStreamMap::with_capacity(4),
+            send_streams: crate::streams::SmallStreamMap::with_capacity(4),
             recv_pool: Vec::new(),
             send_pool: Vec::new(),
             opened_streams: Vec::new(),
@@ -625,7 +634,7 @@ impl Connection {
     /// inside survive across stream lifecycles. Returns a `&mut`
     /// handle so the caller can immediately write into it.
     fn ensure_send_stream(&mut self, sid: u64) -> &mut crate::streams::SendStream {
-        if !self.send_streams.contains_key(&sid) {
+        if !self.send_streams.contains_key(sid) {
             let new_stream = self
                 .send_pool
                 .pop()
@@ -633,7 +642,7 @@ impl Connection {
             self.send_streams.insert(sid, new_stream);
             crate::diag::bump(&crate::diag::COUNTERS.send_streams_created);
         }
-        self.send_streams.get_mut(&sid).unwrap()
+        self.send_streams.get_mut(sid).unwrap()
     }
 
     pub fn state(&self) -> ConnState {
@@ -922,7 +931,7 @@ impl Connection {
                     .get(sid)
                     .map_or(false, |r| r.is_closed() && r.buffer.is_empty());
                 if recv_done {
-                    Some(*sid)
+                    Some(sid)
                 } else {
                     None
                 }
@@ -935,13 +944,13 @@ impl Connection {
             // `buffer` allocations instead of growing fresh
             // ones. `reset_for_reuse` clears state but
             // preserves capacity.
-            if let Some(mut s) = self.send_streams.remove(&sid) {
+            if let Some(mut s) = self.send_streams.remove(sid) {
                 if self.send_pool.len() < STREAM_POOL_CAP {
                     s.reset_for_reuse();
                     self.send_pool.push(s);
                 }
             }
-            if let Some(mut r) = self.recv_streams.remove(&sid) {
+            if let Some(mut r) = self.recv_streams.remove(sid) {
                 if self.recv_pool.len() < STREAM_POOL_CAP {
                     r.reset_for_reuse();
                     self.recv_pool.push(r);
@@ -1036,7 +1045,7 @@ impl Connection {
     /// the peer has signaled FIN AND every byte up to it has been
     /// drained.
     pub fn stream_recv(&mut self, sid: u64, out: &mut [u8]) -> (usize, bool) {
-        match self.recv_streams.get_mut(&sid) {
+        match self.recv_streams.get_mut(sid) {
             Some(s) => s.drain(out),
             None => (0, false),
         }
@@ -1051,7 +1060,7 @@ impl Connection {
     /// `RecvStream::drain` to truncate the buffer head; the Vec
     /// keeps its capacity so subsequent appends don't reallocate.
     pub fn discard_recv(&mut self, sid: u64) {
-        if let Some(s) = self.recv_streams.get_mut(&sid) {
+        if let Some(s) = self.recv_streams.get_mut(sid) {
             // Drain in 2 KiB chunks until empty.
             let mut sink = [0u8; 2048];
             loop {
@@ -1070,14 +1079,14 @@ impl Connection {
         &self,
         sid: u64,
     ) -> Option<crate::streams::RecvStreamState> {
-        self.recv_streams.get(&sid).map(|s| s.debug_state())
+        self.recv_streams.get(sid).map(|s| s.debug_state())
     }
 
     /// Whether stream `sid` has any buffered bytes ready for the
     /// app to drain.
     pub fn stream_has_buffered(&self, sid: u64) -> bool {
         self.recv_streams
-            .get(&sid)
+            .get(sid)
             .map(|s| s.has_buffered())
             .unwrap_or(false)
     }
@@ -1689,7 +1698,7 @@ impl Connection {
                 }
                 Frame::Stream { stream_id, offset, data, fin } => {
                     if matches!(level, CryptoLevel::OneRtt) {
-                        let was_new = !self.recv_streams.contains_key(&stream_id);
+                        let was_new = !self.recv_streams.contains_key(stream_id);
                         if was_new {
                             // Pull from the per-conn recycle pool so
                             // a recycled stream's `buffer` Vec keeps
@@ -1703,7 +1712,7 @@ impl Connection {
                                 .unwrap_or_else(crate::streams::RecvStream::default);
                             self.recv_streams.insert(stream_id, new_stream);
                         }
-                        let s = self.recv_streams.get_mut(&stream_id).unwrap();
+                        let s = self.recv_streams.get_mut(stream_id).unwrap();
                         s.ingest(offset, data, fin);
                         if was_new {
                             crate::diag::bump(&crate::diag::COUNTERS.recv_streams_created);
@@ -2248,7 +2257,7 @@ impl Connection {
             if max_chunk == 0 {
                 break;
             }
-            if s.pop_chunk_into(*sid, max_chunk, out)
+            if s.pop_chunk_into(sid, max_chunk, out)
                 .map_err(|_| ConnError::Wire)?
             {
                 ack_eliciting = true;
