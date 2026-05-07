@@ -11,6 +11,12 @@
 extern crate alloc;
 extern crate uni;
 
+mod iobuf;
+pub use iobuf::{
+    Cursor as IOBufCursor, IOBuf, IOBufChain, IOBufError, MAX_HEADER_RESERVE,
+    MAX_TRAILER_RESERVE,
+};
+
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 

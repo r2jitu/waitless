@@ -1,4 +1,4 @@
-load("@rules_rust//rust:defs.bzl", "rust_library")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -7,7 +7,17 @@ package(default_visibility = ["//visibility:public"])
 # without `uni_tls` link zero TLS / crypto code.
 rust_library(
     name = "uni-http",
-    srcs = ["src/lib.rs"],
+    srcs = [
+        "src/iobuf.rs",
+        "src/lib.rs",
+    ],
     crate_name = "uni_http",
     deps = ["//uni"],
+)
+
+# IOBuf unit tests. Run via `bazel test //uni-http:iobuf_test`;
+# tests live inline at the bottom of `src/iobuf.rs`.
+rust_test(
+    name = "iobuf_test",
+    crate = ":uni-http",
 )
