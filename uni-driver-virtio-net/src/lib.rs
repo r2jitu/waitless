@@ -1580,10 +1580,42 @@ fn flush_tx_kick_if_dirty() -> bool {
 // any frames. This caps kicks at one per poll regardless of
 // drop-burst size.
 
+/// Re-post `buf_phys` to qp `qp`'s avail ring and notify the
+/// device IF this is the first re-post since the last poll
+/// cleared the dirty flag.
+///
+/// Kick batching: the dirty flag is set true atomically with
+/// add_buf (under `rx_lock`); the swap returns the prior value.
+/// `prior == false` means we're the first re-post in a quiet
+/// period, so we kick. Subsequent re-posts before the next
+/// poll's clear see `prior == true` and skip the kick — their
+/// add_bufs piggyback on the kick the first one already did,
+/// because the device's avail-ring scan walks every entry up
+/// to `avail->idx` once it's woken.
+///
+/// Without this, drops that fire after a polling core has gone
+/// idle would set the dirty flag with no kick to follow:
+/// `VIRTIO_F_EVENT_IDX` means the device only re-scans on kick,
+/// so the avail-ring updates would stay invisible until the
+/// next poll cycle (which may never come if RX traffic is what
+/// would have woken the polling core).
+#[inline]
+unsafe fn rx_repost(qp: usize, buf_phys: u64) {
+    let _g = unsafe { (*qps(qp)).rx_lock.lock() };
+    let _ = unsafe { (*rx_q(qp)).add_buf(buf_phys, BUFFER_SIZE, 0, 1) };
+    let was_dirty = unsafe {
+        (*qps(qp))
+            .rx_dirty
+            .swap(true, core::sync::atomic::Ordering::AcqRel)
+    };
+    if !was_dirty {
+        unsafe { (*rx_q(qp)).kick(); }
+    }
+}
+
 /// Drop callback for `IOBuf::External` instances handed out by
-/// `poll_qp`. Re-posts the buffer to its qp's avail ring so
-/// the device can fill it with the next inbound frame; sets
-/// `rx_dirty` so the next poll's kick notifies the device.
+/// `poll_qp`. Re-posts the buffer to its qp's avail ring and
+/// kicks the device if needed (see `rx_repost`).
 ///
 /// `ctx` carries the qp index (cast as `*mut ()`); `base` is the
 /// buffer payload pointer originally posted via `add_buf` at init.
@@ -1593,7 +1625,7 @@ fn flush_tx_kick_if_dirty() -> bool {
 /// because the IOBuf was the sole reference between drain and
 /// drop (the descriptor's `addr` field still points at this
 /// buffer but the device only writes after we re-arm via
-/// `add_buf` below).
+/// `add_buf` inside `rx_repost`).
 unsafe fn rx_drop_callback(
     base: core::ptr::NonNull<u8>,
     _capacity: u32,
@@ -1601,22 +1633,17 @@ unsafe fn rx_drop_callback(
 ) {
     let qp = ctx as usize;
     let buf = base.as_ptr();
-    let buf_phys = virt_to_phys(buf);
     // Zero the virtio header region — the consumer mutated the
     // payload past it; defensively reset the header bytes so the
     // device sees a clean slate when it next writes here.
     unsafe { ptr::write_bytes(buf, 0, VIRTIO_NET_HDR_SIZE); }
-    let _g = unsafe { (*qps(qp)).rx_lock.lock() };
-    let _ = unsafe { (*rx_q(qp)).add_buf(buf_phys, BUFFER_SIZE, 0, 1) };
-    unsafe {
-        (*qps(qp)).rx_dirty.store(true, core::sync::atomic::Ordering::Release);
-    }
+    unsafe { rx_repost(qp, virt_to_phys(buf)); }
 }
 
 /// Per-queue zero-copy RX poll. Drains the used ring, wrapping
 /// each descriptor's buffer as an `IOBuf::External`. Re-arming
-/// is deferred to `rx_drop_callback`, which fires when the
-/// consumer drops the IOBuf.
+/// + kicking is deferred to `rx_drop_callback`, which fires when
+/// the consumer drops the IOBuf.
 fn poll_qp(qp: usize, callback: fn(uni_net_driver::IOBuf)) -> usize {
     unsafe {
         if let Transport::None = (*ndev()).transport { return 0; }
@@ -1654,29 +1681,34 @@ fn poll_qp(qp: usize, callback: fn(uni_net_driver::IOBuf)) -> usize {
                 );
                 callback(iobuf);
                 // Drop happens later — when the consumer is done
-                // with the IOBuf. Re-arm runs there.
+                // with the IOBuf. Re-arm + kick run there.
             } else {
                 // Truncated / header-only frame — re-post the
                 // buffer directly without minting an IOBuf.
-                let _g = (*qps(qp)).rx_lock.lock();
-                let _ = (*rx_q(qp)).add_buf(virt_to_phys(buf), BUFFER_SIZE, 0, 1);
-                (*qps(qp)).rx_dirty.store(
-                    true,
-                    core::sync::atomic::Ordering::Release,
-                );
+                rx_repost(qp, virt_to_phys(buf));
             }
             count += 1;
         }
 
-        // Kick if either we drained frames this cycle OR drops
-        // since the last poll re-armed any descriptors. Drops
-        // set `rx_dirty` instead of kicking themselves so we
-        // don't pay an MMIO per drop.
-        let dirty = (*qps(qp))
-            .rx_dirty
-            .swap(false, core::sync::atomic::Ordering::Acquire);
-        if count > 0 || dirty {
-            (*rx_q(qp)).kick();
+        if count > 0 {
+            // Diagnostic counter only — no kick from poll. Drops
+            // own kick responsibility now (see `rx_repost`); poll
+            // didn't add anything to the avail ring on the IOBuf
+            // path, so a kick here would be a no-op.
+            //
+            // Clearing `rx_dirty` here re-arms the "first re-post
+            // since clean kicks" mechanism in `rx_repost`. We hold
+            // `rx_lock` briefly so this serialises with concurrent
+            // drops on consumer cores: a drop that completes
+            // before this clear has already kicked (was-clean
+            // path) or didn't need to (was-dirty path); a drop
+            // that completes after this clear sees was-clean and
+            // kicks. Either way every add_buf is paired with
+            // exactly one kick.
+            let _g = (*qps(qp)).rx_lock.lock();
+            (*qps(qp))
+                .rx_dirty
+                .store(false, core::sync::atomic::Ordering::Release);
             if qp < DIAG_QP_CAP {
                 RX_COUNTS[qp].fetch_add(
                     count as u64,
