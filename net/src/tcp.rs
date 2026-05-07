@@ -86,6 +86,13 @@ const SEGMENT_SIZE: u16 = 64;
 const MAX_SEGMENTS: usize = 1023;
 const NULL_SLOT: u16 = 0xFFFF;
 const RX_BUF_SIZE: usize = 8192;
+/// Inline RX-chunk slots per `TcpConnection`. 8 slots × ~1024 B per
+/// chunk covers `RX_BUF_SIZE` (8 KiB) comfortably for the common
+/// MSS-1460 case (≤ 6 chunks fill the window). Inline avoids the
+/// per-conn `VecDeque` heap allocation that the previous design
+/// paid on every SYN-receive AND the `Option<VecDeque>` branch on
+/// every per-segment `rx_push` / `rx_pop` call.
+const RX_SLOTS: usize = 8;
 /// IPv4 max TCP segment payload: MTU(1500) - IP(20) - TCP(20) = 1460.
 const MSS_V4: usize = 1460;
 /// IPv6 max TCP segment payload: MTU(1500) - IPv6(40) - TCP(20) = 1440.
@@ -139,9 +146,11 @@ pub struct TcpConnection {
     /// The `Option` is the SYN-time admission gate — if the
     /// `VecDeque::with_capacity` allocation fails on a fresh
     /// connection we refuse the connection rather than panic.
-    rx_chunks: Option<alloc::collections::VecDeque<uni_iobuf::IOBuf>>,
-    /// Cached total length of `rx_chunks` payloads. Avoids walking
-    /// the deque on every `rx_used` / `rx_free` call (TCP segment
+    rx_slots: [Option<uni_iobuf::IOBuf>; RX_SLOTS],
+    rx_head: u8,
+    rx_tail: u8,
+    /// Cached total length of `rx_slots` payloads. Avoids walking
+    /// the slots on every `rx_used` / `rx_free` call (TCP segment
     /// processing reads them per-segment for the window field).
     rx_used: usize,
     listener_port: u16,
@@ -153,7 +162,7 @@ pub struct TcpConnection {
     /// NOT reset it; `free_connection` bumps it explicitly.
     generation: u16,
     /// Parked `TcpRecv` waker. Set by `register_recv_waker` on the
-    /// owning core; woken when data lands in `rx_chunks` or the
+    /// owning core; woken when data lands in `rx_slots` or the
     /// peer closes. Per-core ownership — no lock needed.
     recv_waker: Option<Waker>,
     /// Free-list link. When this slot is on the free list (state ==
@@ -176,7 +185,9 @@ impl TcpConnection {
             snd_una: 0,
             rcv_nxt: 0,
             rcv_wnd: RX_BUF_SIZE as u16,
-            rx_chunks: None,
+            rx_slots: [const { None }; RX_SLOTS],
+            rx_head: 0,
+            rx_tail: 0,
             rx_used: 0,
             listener_port: 0,
             accepted: false,
@@ -193,12 +204,18 @@ impl TcpConnection {
 
     #[inline]
     fn rx_free(&self) -> usize {
-        if self.rx_chunks.is_none() {
-            return 0;
-        }
         // -1 to leave room for the FIN-with-data edge case the
         // ring-buffer version reserved; behavioural parity.
         RX_BUF_SIZE.saturating_sub(self.rx_used).saturating_sub(1)
+    }
+
+    /// True when the slot ring has no IOBuf available to push into.
+    /// Caller treats this the same as window-full: drop the
+    /// segment and let the sender retransmit when our advertised
+    /// `rcv_wnd` opens.
+    #[inline]
+    fn rx_slots_full(&self) -> bool {
+        ((self.rx_tail as usize + 1) % RX_SLOTS) == self.rx_head as usize
     }
 
     /// Append an IOBuf chunk to the rx queue. `iobuf.data()` should
@@ -210,10 +227,7 @@ impl TcpConnection {
     /// suffix isn't kept; the sender will retransmit when our
     /// advertised window opens up).
     fn rx_push(&mut self, mut iobuf: uni_iobuf::IOBuf) -> usize {
-        let chunks = match &mut self.rx_chunks {
-            Some(c) => c,
-            None => return 0,
-        };
+        if self.rx_slots_full() { return 0; }
         let free = RX_BUF_SIZE.saturating_sub(self.rx_used).saturating_sub(1);
         if free == 0 { return 0; }
         let len = iobuf.data().len();
@@ -227,19 +241,22 @@ impl TcpConnection {
                 return 0;
             }
         }
-        chunks.push_back(iobuf);
+        // SAFETY: `rx_tail < RX_SLOTS` always (kept in range by the
+        // mod below) and the slot at `rx_tail` is `None` because
+        // either it was just produced fresh by `new()` or `rx_pop`
+        // cleared it via `Option::take`. The full-check above
+        // guarantees we're not overwriting an in-flight chunk.
+        self.rx_slots[self.rx_tail as usize] = Some(iobuf);
+        self.rx_tail = ((self.rx_tail as usize + 1) % RX_SLOTS) as u8;
         self.rx_used += n;
         n
     }
 
     fn rx_pop(&mut self, out: &mut [u8]) -> usize {
-        let chunks = match &mut self.rx_chunks {
-            Some(c) => c,
-            None => return 0,
-        };
         let mut written = 0;
         while written < out.len() {
-            let head = match chunks.front_mut() {
+            let head_idx = self.rx_head as usize;
+            let head = match &mut self.rx_slots[head_idx] {
                 Some(h) => h,
                 None => break,
             };
@@ -248,16 +265,18 @@ impl TcpConnection {
             let take = want.min(head_data.len());
             if take == 0 {
                 // Defensive: empty chunk shouldn't happen post-push,
-                // but if it does, pop and continue.
-                chunks.pop_front();
+                // but if it does, drop and advance.
+                self.rx_slots[head_idx] = None;
+                self.rx_head = ((head_idx + 1) % RX_SLOTS) as u8;
                 continue;
             }
             out[written..written + take].copy_from_slice(&head_data[..take]);
             written += take;
             if take == head_data.len() {
-                // Fully drained — drop the IOBuf, which releases its
-                // backing buffer to the driver pool.
-                chunks.pop_front();
+                // Fully drained — drop the IOBuf (releases its
+                // backing buffer to the driver pool) and advance.
+                self.rx_slots[head_idx] = None;
+                self.rx_head = ((head_idx + 1) % RX_SLOTS) as u8;
             } else {
                 // Partial drain — advance the visible payload.
                 let _ = head.consume(take);
@@ -698,10 +717,10 @@ fn free_connection(core: u32, slot: usize) {
     // across the reset below.
     let next_gen = c.generation.wrapping_add(1);
     // Assigning a fresh TcpConnection drops the old one, which
-    // drops `rx_chunks: Option<VecDeque<IOBuf>>` — the deque's
-    // drop walks each remaining IOBuf, running its drop callback
-    // (returns each chunk's backing buffer to the driver pool, or
-    // frees the heap allocation on the legacy IPv6 wrap path).
+    // walks `rx_slots: [Option<IOBuf>; RX_SLOTS]` and drops each
+    // remaining IOBuf — running its drop callback returns each
+    // chunk's backing buffer to the driver pool (or frees the
+    // heap allocation on the legacy IPv6 wrap path).
     *c = TcpConnection::new();
     c.generation = next_gen;
     // Return the slot to the pool's free list. O(1) push; the next
@@ -889,25 +908,13 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut iobuf: uni_iobuf::IOBuf) 
             c.listener_port = dst_port;
             c.accepted = false;
 
-            // Allocate the RX chunk list — a fresh empty `VecDeque`
-            // for the connection's lifetime. Capacity is reserved
-            // up-front so admission control can fail loudly here
-            // rather than later (out-of-memory under load is harder
-            // to recover from gracefully than at SYN-receive time).
-            // Drop runs the IOBuf chain's drop on connection reset,
-            // returning each chunk's backing buffer to its driver
-            // pool.
-            //
-            // 16 chunks ≈ 16 × MSS (1460 typical) ≈ 23 KiB of
-            // payload at most — comfortably more than `RX_BUF_SIZE`
-            // (8 KiB), so admission for a typical request
-            // (single segment) and bursty body uploads (a handful
-            // of segments) covers without growing the deque.
-            // Beyond 16 the deque grows; that's a heap alloc on
-            // hot path but only under sustained large bodies.
-            let mut chunks = alloc::collections::VecDeque::new();
-            chunks.reserve_exact(16);
-            c.rx_chunks = Some(chunks);
+            // RX chunk slots are inline (`rx_slots: [Option<IOBuf>;
+            // RX_SLOTS]`) and pre-zeroed by `TcpConnection::new()` —
+            // no per-conn heap allocation here. Reset cursors so the
+            // connection starts with an empty ring whether the slot
+            // was freshly allocated or reused from the free list.
+            c.rx_head = 0;
+            c.rx_tail = 0;
             c.rx_used = 0;
         }
 
