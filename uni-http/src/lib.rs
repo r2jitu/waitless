@@ -10,9 +10,14 @@
 
 extern crate alloc;
 extern crate uni;
+extern crate uni_iobuf;
 
-mod iobuf;
-pub use iobuf::{
+// Re-export the shared IOBuf primitive so `uni_http::IOBuf` /
+// `uni_http::IOBufChain` keep working at every existing call
+// site. The crate moved out so `uni-quic` (transport, can't
+// depend on `uni-http`) can use the same type without crossing
+// the transport↛app dependency boundary.
+pub use uni_iobuf::{
     Cursor as IOBufCursor, IOBuf, IOBufChain, IOBufError, MAX_HEADER_RESERVE,
     MAX_TRAILER_RESERVE,
 };

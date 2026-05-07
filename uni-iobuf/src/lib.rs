@@ -56,6 +56,7 @@
 //     gets recycled when the IOBuf drops).
 //   * `try_coalesce` for crypto APIs that need contiguous input.
 
+#![no_std]
 #![allow(dead_code)]
 
 extern crate alloc;
