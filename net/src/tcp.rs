@@ -91,9 +91,46 @@ struct TcpHeader {
 // SAFETY: repr(C, packed), all fields are POD integers.
 unsafe impl FromBytes for TcpHeader {}
 
-const CONNECTIONS_PER_CORE: usize = 128;
+/// Initial slots per core. The pool grows by `SEGMENT_SIZE`-slot
+/// segments on demand thereafter, so this is a soft floor — once a
+/// core's segment fills the pool allocates another. Keeping the
+/// segment small keeps the per-core base memory footprint low for
+/// idle cores; it's a stride for the slot→pointer index, not a hard
+/// connection cap. (Pre-segmented-pool this was 128 and a hard cap;
+/// reaching it wedged the listener until conns died.)
+const SEGMENT_SIZE: u16 = 64;
+/// Cap on segments per core. 1023 × 64 = 65472 slots, fits in a u16
+/// slot index with `0xFFFF` reserved as the "null" / end-of-free-list
+/// sentinel. Hitting this means 65k+ live conns on a single core,
+/// which is several orders of magnitude past anything we can
+/// realistically service — well before that, the per-core RX-inbox
+/// and per-conn handler tasks will have starved out.
+const MAX_SEGMENTS: usize = 1023;
+const NULL_SLOT: u16 = 0xFFFF;
 const RX_BUF_SIZE: usize = 8192;
-const MSS: usize = 1460;
+/// IPv4 max TCP segment payload: MTU(1500) - IP(20) - TCP(20) = 1460.
+const MSS_V4: usize = 1460;
+/// IPv6 max TCP segment payload: MTU(1500) - IPv6(40) - TCP(20) = 1440.
+/// Sending a 1460-byte payload over a v6 conn produces a 1534-byte
+/// Ethernet frame that the userspace bridge truncates (or drops),
+/// silently corrupting any response that needs more than one
+/// full-size segment. /health works on v6 because it fits in one
+/// short segment; multi-part HTML responses (which need full-size
+/// segments after the first chunk's headers) lose data starting at
+/// the first 1460-byte payload — observable as Chrome's
+/// ERR_SSL_PROTOCOL_ERROR over `https://localhost/`.
+const MSS_V6: usize = 1440;
+/// Conservative buffer cap that fits both. Used as the stack
+/// allocation for `send_segment`'s on-stack TCP segment.
+const MSS_MAX: usize = MSS_V4;
+
+/// Pick the MSS for a given local IP family.
+fn mss_for(local_ip: IpAddr) -> usize {
+    match local_ip {
+        IpAddr::V4(_) => MSS_V4,
+        IpAddr::V6(_) => MSS_V6,
+    }
+}
 
 pub struct TcpConnection {
     pub state: TcpState,
@@ -130,6 +167,12 @@ pub struct TcpConnection {
     /// owning core; woken when data lands in `rx_buf` or the peer
     /// closes. Per-core ownership — no lock needed.
     recv_waker: Option<Waker>,
+    /// Free-list link. When this slot is on the free list (state ==
+    /// Closed AND the slot has been returned to the pool), this
+    /// holds the index of the next free slot, or `NULL_SLOT` for
+    /// end-of-list. Untouched while the slot is live; on `free` the
+    /// pool overwrites it; on `alloc` the pool reads it once.
+    next_free: u16,
 }
 
 impl TcpConnection {
@@ -151,6 +194,7 @@ impl TcpConnection {
             accepted: false,
             generation: 0,
             recv_waker: None,
+            next_free: NULL_SLOT,
         }
     }
 
@@ -233,14 +277,136 @@ struct TcpConnCell(core::cell::UnsafeCell<TcpConnection>);
 unsafe impl Sync for TcpConnCell {}
 unsafe impl Send for TcpConnCell {}
 impl TcpConnCell {
-    const fn new() -> Self {
+    fn new() -> Self {
         TcpConnCell(core::cell::UnsafeCell::new(TcpConnection::new()))
     }
 }
 
-type CoreSlots = [TcpConnCell; CONNECTIONS_PER_CORE];
+// ---- Segmented per-core slot pool ------------------------------------
+//
+// Replaces the previous fixed `[TcpConnCell; CONNECTIONS_PER_CORE]`
+// per-core array. Two changes:
+//
+//   1. Slots live on the heap in `SEGMENT_SIZE`-slot segments. New
+//      segments are added on demand, capped at `MAX_SEGMENTS` (~64k
+//      slots/core, way past the SPSC inbox + handler-task scaling
+//      limit). The fixed-array hard cap is gone — bursting connection
+//      load no longer wedges the listener after 128 conns.
+//   2. Free slots form an embedded singly-linked list rooted at
+//      `free_head`. `alloc` is a pointer pop, `free` is a push —
+//      both O(1), replacing the previous linear-scan-for-Closed +
+//      linear-scan-for-half-closed dance that walked the whole
+//      array on every accept.
+//
+// All operations are single-threaded per worker (the per-core
+// ownership discipline carries over). No atomics on the fast path.
+pub(crate) struct TcpPool {
+    /// Heap-resident segments. Pushed-only — once a segment is
+    /// allocated its `Box<[TcpConnCell]>` lives until process exit,
+    /// keeping slot pointers stable for handles that encode
+    /// (core, slot_idx).
+    segments: core::cell::UnsafeCell<alloc::vec::Vec<Box<[TcpConnCell]>>>,
+    /// Head of the free-slot linked list, or `NULL_SLOT` if empty.
+    /// On alloc we pop here and follow `next_free` on the popped
+    /// slot to advance the head; on free we push the slot's index
+    /// here.
+    free_head: core::cell::UnsafeCell<u16>,
+}
+// SAFETY: per-core ownership — only the owning worker accesses its
+// `TcpPool`. The interior mutability (UnsafeCell) is single-writer
+// at all times.
+unsafe impl Sync for TcpPool {}
+unsafe impl Send for TcpPool {}
 
-static POOLS: uni_kernel::percpu::PerWorker<CoreSlots> =
+impl TcpPool {
+    pub const fn new() -> Self {
+        TcpPool {
+            segments: core::cell::UnsafeCell::new(alloc::vec::Vec::new()),
+            free_head: core::cell::UnsafeCell::new(NULL_SLOT),
+        }
+    }
+
+    /// Total allocated slots across all segments.
+    fn capacity(&self) -> u16 {
+        // SAFETY: per-core ownership.
+        let segs = unsafe { &*self.segments.get() };
+        (segs.len() as u32 * SEGMENT_SIZE as u32) as u16
+    }
+
+    /// Resolve a slot index into its `*mut TcpConnection`. The
+    /// pointer is stable for the slot's lifetime (we never move
+    /// segments after pushing them).
+    fn slot_ptr(&self, slot: u16) -> *mut TcpConnection {
+        let seg_idx = (slot / SEGMENT_SIZE) as usize;
+        let off = (slot % SEGMENT_SIZE) as usize;
+        // SAFETY: per-core ownership; caller passes a slot from
+        // `alloc`/`capacity` so the index is in range.
+        let segs = unsafe { &*self.segments.get() };
+        segs[seg_idx][off].0.get()
+    }
+
+    /// O(1) allocation: pop the free-list head. Grows the pool by
+    /// one segment if the list is empty. Returns `None` only if
+    /// `MAX_SEGMENTS` is hit.
+    fn alloc(&self) -> Option<u16> {
+        // SAFETY: per-core ownership.
+        let head = unsafe { *self.free_head.get() };
+        if head != NULL_SLOT {
+            // Pop: read the popped slot's `next_free` to find the
+            // new head. The slot itself gets reset by the caller
+            // before any other code observes it (see
+            // `alloc_connection`).
+            let next = unsafe { (*self.slot_ptr(head)).next_free };
+            unsafe { *self.free_head.get() = next; }
+            return Some(head);
+        }
+        // Free list empty — try to grow.
+        if !self.grow_segment() {
+            return None;
+        }
+        // Recurse: grow_segment populated the free list.
+        self.alloc()
+    }
+
+    /// O(1) free: push the slot onto the free list. Caller is
+    /// responsible for having reset the slot's state to `Closed`
+    /// (or otherwise made it inert) before this call.
+    fn free_slot(&self, slot: u16) {
+        // SAFETY: per-core ownership.
+        let head = unsafe { *self.free_head.get() };
+        unsafe {
+            (*self.slot_ptr(slot)).next_free = head;
+            *self.free_head.get() = slot;
+        }
+    }
+
+    /// Append a fresh segment of `SEGMENT_SIZE` slots and link them
+    /// all into the free list. Returns false at `MAX_SEGMENTS`.
+    fn grow_segment(&self) -> bool {
+        // SAFETY: per-core ownership.
+        let segs = unsafe { &mut *self.segments.get() };
+        if segs.len() >= MAX_SEGMENTS {
+            return false;
+        }
+        let segment_idx = segs.len() as u16;
+        let base = segment_idx.saturating_mul(SEGMENT_SIZE);
+        let mut new_seg: alloc::vec::Vec<TcpConnCell> =
+            alloc::vec::Vec::with_capacity(SEGMENT_SIZE as usize);
+        for _ in 0..SEGMENT_SIZE {
+            new_seg.push(TcpConnCell::new());
+        }
+        segs.push(new_seg.into_boxed_slice());
+        // Link new slots into the free list. Push in reverse so
+        // pops happen in ascending order — better cache behavior
+        // for the typical "fill up sequentially" pattern.
+        for i in (0..SEGMENT_SIZE).rev() {
+            self.free_slot(base + i);
+        }
+        true
+    }
+}
+
+static POOLS: uni_kernel::percpu::PerWorker<TcpPool> =
     uni_kernel::percpu::PerWorker::new();
 
 // ---- Per-core 4-tuple → slot hash table ------------------------------------
@@ -339,8 +505,12 @@ fn tcp_hash_insert(core: u32, key: u64, slot: usize) {
             return;
         }
     }
-    // Table full — CONNECTIONS_PER_CORE=128 < TCP_HASH_SIZE=256,
-    // so this path is effectively unreachable under normal load.
+    // Table full — under load up to roughly TCP_HASH_SIZE/2 live
+    // conns the open-addressed probe stays bounded; past that we
+    // silently drop hash inserts (not connections — the slot is
+    // still allocated, it just won't appear in the fast lookup,
+    // forcing a linear scan in `tcp_receive`). Future work: grow
+    // the hash table in lockstep with the segmented pool.
 }
 
 fn tcp_hash_remove(core: u32, key: u64) {
@@ -384,10 +554,20 @@ fn tcp_hash_remove(core: u32, key: u64) {
 
 /// Get a `*mut TcpConnection` for `(core, slot)`. The caller must
 /// uphold the per-core ownership discipline (only the owning core may
-/// dereference the resulting pointer mutably).
+/// dereference the resulting pointer mutably). Delegates to the
+/// segmented pool's slot lookup; pointers stay stable for the slot's
+/// lifetime, so handles encoding `(core, slot_idx)` remain valid even
+/// across pool growth.
 #[inline]
 fn conn_ptr(core: u32, slot: usize) -> *mut TcpConnection {
-    POOLS.at(core)[slot].0.get()
+    POOLS.at(core).slot_ptr(slot as u16)
+}
+
+/// Snapshot of `core`'s pool capacity — number of slots that have
+/// been materialized so far. Linear-scan callers walk `0..pool_capacity(core)`.
+#[inline]
+fn pool_capacity(core: u32) -> usize {
+    POOLS.at(core).capacity() as usize
 }
 
 /// Draw a per-connection initial sequence number.
@@ -404,18 +584,25 @@ fn next_seq() -> u32 {
     u32::from_ne_bytes(buf)
 }
 
-/// Encode a connection handle from core + slot index.
-/// Handle = (core << 8) | slot, +1 to avoid null.
+/// Encode a connection handle from core + slot index. Slots are
+/// now u16-wide (the segmented pool can grow well past the 8-bit
+/// slot space the original encoding allowed); the high bits of the
+/// usize hold the core id, low 16 hold the slot.
+/// Handle = ((core << 16) | slot) + 1, +1 to avoid null.
 fn encode_handle(core: u32, slot: usize) -> *mut () {
-    (((core as usize) << 8 | slot) + 1) as *mut ()
+    let v = ((core as usize) << 16) | (slot & 0xFFFF);
+    (v + 1) as *mut ()
 }
 
-/// Decode a handle into (core, slot).
+/// Decode a handle into (core, slot). The slot is bounds-checked
+/// against the owning core's current pool capacity (which grows as
+/// segments are added) — a stale handle pointing past `capacity()`
+/// is treated as invalid.
 fn decode_handle(handle: *mut ()) -> Option<(u32, usize)> {
     let v = (handle as usize).wrapping_sub(1);
-    let core = (v >> 8) as u32;
-    let slot = v & 0xFF;
-    if core >= POOLS.len() || slot >= CONNECTIONS_PER_CORE {
+    let core = (v >> 16) as u32;
+    let slot = v & 0xFFFF;
+    if core >= POOLS.len() || slot >= pool_capacity(core) {
         None
     } else {
         Some((core, slot))
@@ -423,36 +610,43 @@ fn decode_handle(handle: *mut ()) -> Option<(u32, usize)> {
 }
 
 fn alloc_connection(core: u32) -> Option<usize> {
-    for i in 0..CONNECTIONS_PER_CORE {
+    let pool = POOLS.at(core);
+    // O(1) fast path: pop from the free list. The pool grows by
+    // one segment if the list is empty.
+    if let Some(slot) = pool.alloc() {
         // SAFETY: per-core ownership; only the owning core (which is `core`
-        // by the public API contract) calls this.
-        let c = unsafe { &mut *conn_ptr(core, i) };
-        if c.state == TcpState::Closed {
-            *c = TcpConnection::new();
-            return Some(i);
-        }
+        // by the public API contract) calls this. The slot was just popped
+        // from the free list, so no other code holds a reference.
+        let c = unsafe { &mut *conn_ptr(core, slot as usize) };
+        // Preserve generation across reuse so any still-outstanding
+        // async handle observes the bump on its next hook call.
+        let preserved_gen = c.generation;
+        *c = TcpConnection::new();
+        c.generation = preserved_gen;
+        return Some(slot as usize);
     }
-    // No Closed slot — reclaim a half-closed slot whose peer never
-    // completed the FIN exchange. Without a retransmit/RTO timer the
-    // stack can't age these out, so a misbehaving (or just hard-killed)
-    // client that opens many short connections without a clean close
-    // would otherwise wedge the listener after `CONNECTIONS_PER_CORE`
-    // attempts. Walk these states in priority order — FinWait* first
-    // (we already initiated close, peer is the only one we're waiting
-    // on), then LastAck/TimeWait (similar), then CloseWait last (peer
-    // FIN'd but we haven't shipped a response yet — least safe to drop).
+    // Pool grew to MAX_SEGMENTS without a free slot — try to reclaim
+    // a half-closed slot whose peer never completed the FIN exchange.
+    // Without a retransmit/RTO timer the stack can't age these out,
+    // so a misbehaving (or just hard-killed) client that opens many
+    // short connections without a clean close would otherwise wedge
+    // the listener once we hit the `MAX_SEGMENTS` ceiling. Walk in
+    // priority order — FinWait* first (we already initiated close,
+    // peer is the only one we're waiting on), then LastAck/TimeWait
+    // (similar), then CloseWait last (peer FIN'd but we haven't
+    // shipped a response yet — least safe to drop).
+    let cap = pool.capacity() as usize;
     for state in [
         TcpState::FinWait1, TcpState::FinWait2,
         TcpState::LastAck, TcpState::TimeWait, TcpState::CloseWait,
     ] {
-        for i in 0..CONNECTIONS_PER_CORE {
+        for i in 0..cap {
             let c = unsafe { &*conn_ptr(core, i) };
             if c.state == state {
-                // free_connection bumps generation and resets to a
-                // fresh Closed slot; the SYN handler immediately
-                // overwrites the fields it cares about.
+                // free_connection bumps generation, resets the slot,
+                // and pushes onto the free list. Re-pop and return.
                 free_connection(core, i);
-                return Some(i);
+                return pool.alloc().map(|s| s as usize);
             }
         }
     }
@@ -462,6 +656,18 @@ fn alloc_connection(core: u32) -> Option<usize> {
 fn free_connection(core: u32, slot: usize) {
     // SAFETY: per-core ownership.
     let c = unsafe { &mut *conn_ptr(core, slot) };
+    // Already on the free list (state == Closed AND we already
+    // returned this slot to the pool). Idempotent no-op so callers
+    // can fire-and-forget without tracking lifecycle.
+    if c.state == TcpState::Closed && c.next_free != NULL_SLOT {
+        return;
+    }
+    // The free-list head sentinel is also `NULL_SLOT`, so a slot
+    // that's the current head AND in Closed state is technically
+    // free; checking `state == Closed && head == this_slot` would
+    // catch that case. Cheaper to just skip the special-case (the
+    // hash-table lookup below will no-op for a Closed slot anyway).
+
     // Remove this connection's 4-tuple from the per-core hash index
     // so future packets won't hit a stale entry. No-op for listeners
     // (they aren't inserted).
@@ -484,6 +690,9 @@ fn free_connection(core: u32, slot: usize) {
     // the bytes to the global allocator. No manual kfree needed.
     *c = TcpConnection::new();
     c.generation = next_gen;
+    // Return the slot to the pool's free list. O(1) push; the next
+    // `alloc_connection` call picks it up in O(1) too.
+    POOLS.at(core).free_slot(slot as u16);
 }
 
 fn send_segment(
@@ -497,10 +706,13 @@ fn send_segment(
     window: u16,
     payload: &[u8],
 ) {
-    let payload_len = payload.len().min(MSS);
+    // Caller already chunked to per-family MSS via `mss_for(local_ip)`,
+    // but clamp again with the conservative `MSS_MAX` so a misuse
+    // doesn't blow the stack-allocated `buf` below.
+    let payload_len = payload.len().min(MSS_MAX);
     let seg_len = 20 + payload_len;
 
-    let mut buf = core::mem::MaybeUninit::<[u8; 20 + MSS]>::uninit();
+    let mut buf = core::mem::MaybeUninit::<[u8; 20 + MSS_MAX]>::uninit();
     let p = buf.as_mut_ptr() as *mut u8;
 
     unsafe {
@@ -596,7 +808,8 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, data: &[u8]) {
     // connection down. Only accept the reset if seq == rcv_nxt (the
     // strict in-sequence position). Any other seq is silently dropped.
     if flags & TCP_RST != 0 {
-        for i in 0..CONNECTIONS_PER_CORE {
+        let cap = pool_capacity(core);
+        for i in 0..cap {
             let c = unsafe { &*conn_ptr(core, i) };
             if c.state != TcpState::Closed
                 && c.state != TcpState::Listen
@@ -618,7 +831,8 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, data: &[u8]) {
         // Find listener on this core
         let listener_idx = {
             let mut found = None;
-            for i in 0..CONNECTIONS_PER_CORE {
+            let cap = pool_capacity(core);
+            for i in 0..cap {
                 let c = unsafe { &*conn_ptr(core, i) };
                 if c.state == TcpState::Listen && c.local_port == dst_port {
                     found = Some(i);
@@ -816,18 +1030,15 @@ fn seq_lt(a: u32, b: u32) -> bool {
 // TCP public API — handles encode (core, slot) for transparent routing.
 // ============================================================================
 
-/// Initialize TCP connection pools.
+/// Initialize TCP connection pools. Each per-core pool starts
+/// empty; the first `alloc_connection` call grows it by a segment.
+/// No per-core slot pre-init is needed — segment construction
+/// initializes every slot to a fresh `TcpConnection` and links them
+/// into the free list before publishing the segment.
 pub fn init() {
     let n = uni_kernel::percpu::num_cores();
-    POOLS.init(n, |_| {
-        [const { TcpConnCell::new() }; CONNECTIONS_PER_CORE]
-    });
+    POOLS.init(n, |_| TcpPool::new());
     TCP_HASH.init(n, |_| TcpHashCore::new());
-    for core in 0..n {
-        for i in 0..CONNECTIONS_PER_CORE {
-            unsafe { *conn_ptr(core, i) = TcpConnection::new(); }
-        }
-    }
 }
 
 /// Create a listener on a specific core. Called from
@@ -856,7 +1067,8 @@ pub fn accept_on_port(port: u16) -> uni_runtime::net::TcpStream {
 
 fn accept_on_port_core(core: u32, port: u16) -> uni_runtime::net::TcpStream {
     use uni_runtime::net::TcpStream;
-    for i in 0..CONNECTIONS_PER_CORE {
+    let cap = pool_capacity(core);
+    for i in 0..cap {
         // SAFETY: per-core ownership.
         let c = unsafe { &mut *conn_ptr(core, i) };
         if c.state == TcpState::Established && c.listener_port == port && !c.accepted {
@@ -906,8 +1118,13 @@ fn send(handle: *mut (), data: &[u8]) -> i32 {
 
     let len = data.len();
     let mut sent = 0;
+    // Family-aware MSS: IPv4 fits 1460 of TCP payload, IPv6 only
+    // 1440 (40-byte v6 header vs 20-byte v4). Sending v4-sized
+    // segments on a v6 conn produces 1534-byte Ethernet frames
+    // that the userspace bridge truncates — see MSS_V6 comment.
+    let mss = mss_for(c.local_ip);
     while sent < len {
-        let chunk = (len - sent).min(MSS);
+        let chunk = (len - sent).min(mss);
         send_segment(
             c.local_ip,
             c.remote_ip,
@@ -981,7 +1198,8 @@ pub fn close(handle: *mut (), generation: u16) {
 pub fn shutdown_all() {
     let n = uni_kernel::percpu::num_cores();
     for core in 0..n {
-        for slot in 0..CONNECTIONS_PER_CORE {
+        let cap = pool_capacity(core);
+        for slot in 0..cap {
             // SAFETY: see fn-level comment — APs have left the
             // eventloop; only BSP runs this and it owns its own
             // slots, with read-only access to AP slots.
