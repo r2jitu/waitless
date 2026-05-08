@@ -610,17 +610,36 @@ fn publish_boot_info(net_ok: bool) {
     uni::boot_info::init_boot_info(BootInfoParams {
         ram_bytes: uni_kernel::mm::total_memory(),
         num_cpus: uni_kernel::percpu::num_cores(),
-        // Surface the `chosen.bootargs` from the FDT (HVF runner's
-        // `--bootargs=` flag, QEMU `-append`, …). Empty string when
-        // no firmware supplied one. Apps key configuration off it
-        // (e.g. `quic.log=events` to flip the QUIC stack into
-        // verbose-event mode).
-        boot_args: uni_kernel::aarch64::fdt::info().boot_args(),
+        // Surface the kernel command line. On aarch64 this is
+        // `chosen.bootargs` from the FDT (HVF runner's
+        // `--bootargs=` flag, QEMU `-append`, …); on x86_64
+        // (Limine boot) we don't yet plumb the Limine
+        // KernelFile cmdline through, so it's an empty string.
+        // Apps key configuration off it (e.g. `quic.log=events`
+        // to flip the QUIC stack into verbose-event mode).
+        boot_args: boot_args(),
         nics,
         // RTC isn't queried at boot yet. Left `None`; a future phase
         // can plumb ACPI FADT CMOS / FDT rtc.
         rtc_epoch: None,
     });
+}
+
+/// Per-arch boot-args resolver. Aarch64 reads from the FDT;
+/// x86_64 (Limine) returns `""` until we plumb the cmdline
+/// through. Apps tolerate the empty string fine — the QUIC
+/// log toggle, etc. just stay at their defaults.
+#[cfg(target_arch = "aarch64")]
+fn boot_args() -> &'static str {
+    uni_kernel::aarch64::fdt::info().boot_args()
+}
+
+#[cfg(target_arch = "x86_64")]
+fn boot_args() -> &'static str {
+    // TODO: wire `limine::request::ExecutableCmdlineRequest`
+    // (or whatever the Limine 0.5 crate exposes) through to
+    // here so QEMU `-append` reaches the app.
+    ""
 }
 
 /// Event loop idle callback. Core-aware:
