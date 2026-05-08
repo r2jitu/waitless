@@ -9,19 +9,23 @@
 extern crate alloc;
 extern crate uni_kernel;
 extern crate uni_runtime;
+extern crate uni_drivers;
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
+extern crate net_arp as arp;
+extern crate net_ethernet as ethernet;
 extern crate net_ipv4 as ipv4;
 extern crate net_ipv6 as ipv6;
 extern crate net_ipv6_send as ipv6_send;
+extern crate net_ndp as ndp;
 extern crate bitflags;
 
 use alloc::boxed::Box;
 use core::ptr;
 use core::task::Waker;
 use from_bytes::FromBytes;
-use types::{IpAddr, tcp_checksum_any, htons, ntohs, htonl, ntohl};
-use ipv4::{ipv4_send, PROTO_TCP};
+use types::{IpAddr, Ipv4Addr, MacAddr, tcp_checksum_any, htons, ntohs, htonl, ntohl, CONFIG};
+use ipv4::PROTO_TCP;
 
 bitflags::bitflags! {
     struct TcpFlags: u8 {
@@ -728,6 +732,145 @@ fn free_connection(core: u32, slot: usize) {
     POOLS.at(core).free_slot(slot as u16);
 }
 
+// ─── Unified TCP-frame builder ───────────────────────────────────────────────
+//
+// Build the full Ethernet+IP+TCP+payload frame in one stack buffer
+// and hand it directly to the driver. Replaces the legacy chain of
+// `send_l3 → ipv4_send → ethernet_send`, which built a fresh stack
+// buffer at each layer and `memcpy`'d the inner bytes forward —
+// three memcpys per byte just to attach 54 B of headers.
+//
+// The two payload-source variants (slice / chain cursor) share
+// `fill_tcp_frame_headers` for header-fill and family dispatch;
+// only the payload-write step differs.
+//
+// Frame layout:
+//   v4: [ETH 14][IPv4 20][TCP 20][payload ≤ MSS_V4 = 1460]  → ≤ 1514 B
+//   v6: [ETH 14][IPv6 40][TCP 20][payload ≤ MSS_V6 = 1440]  → ≤ 1514 B
+//
+// Same total bound for both families, so one stack buffer fits all.
+
+const ETH_HDR_LEN: usize = 14;
+const IPV4_HDR_LEN: usize = ipv4::HEADER_LEN;       // 20
+const IPV6_HDR_LEN: usize = ipv6::HEADER_LEN;       // 40
+const TCP_HDR_LEN: usize = 20;
+const FRAME_BUF_LEN: usize = ETH_HDR_LEN + IPV6_HDR_LEN + TCP_HDR_LEN + MSS_V4;
+
+/// Compute the TCP-payload offset within a frame buffer for `local_ip`'s family.
+#[inline]
+fn payload_offset(local_ip: IpAddr) -> usize {
+    match local_ip {
+        IpAddr::V4(_) => ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_LEN,   // 54
+        IpAddr::V6(_) => ETH_HDR_LEN + IPV6_HDR_LEN + TCP_HDR_LEN,   // 74
+    }
+}
+
+/// Resolve the destination MAC for `dst_ip`. Returns `None` (drop)
+/// on ARP/NDP cache miss; the surrounding TCP retransmit timer
+/// retries.
+#[inline]
+fn resolve_dst_mac(dst_ip: IpAddr) -> Option<MacAddr> {
+    match dst_ip {
+        IpAddr::V4(d) => {
+            if CONFIG.ip() == Ipv4Addr::ANY {
+                Some(MacAddr::BROADCAST)
+            } else {
+                arp::arp_resolve(d)
+            }
+        }
+        IpAddr::V6(d) => {
+            if d.is_multicast() {
+                Some(d.multicast_mac())
+            } else {
+                ndp::ndp_resolve(&d)
+            }
+        }
+    }
+}
+
+/// Fill the ETH + IP + TCP headers of `frame` in place. `frame` must
+/// already contain the TCP payload at `frame[payload_offset(local_ip)..]`.
+/// `payload_len` is the bytes past the TCP header (TCP segment payload
+/// length); 0 for control-only segments. Computes both IP and TCP
+/// checksums in place.
+unsafe fn fill_tcp_frame_headers(
+    frame: &mut [u8],
+    local_ip: IpAddr,
+    dst_ip: IpAddr,
+    dst_mac: MacAddr,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    payload_len: usize,
+) {
+    let tcp_off = match local_ip {
+        IpAddr::V4(_) => ETH_HDR_LEN + IPV4_HDR_LEN,
+        IpAddr::V6(_) => ETH_HDR_LEN + IPV6_HDR_LEN,
+    };
+    let tcp_seg_len = TCP_HDR_LEN + payload_len;
+
+    // ── TCP header ───────────────────────────────────────────────────
+    // SAFETY: frame[tcp_off..tcp_off+TCP_HDR_LEN] is in-bounds (caller
+    // sized the buffer). `TcpHeader` is `repr(C)` POD bytes.
+    let tcp_hdr = unsafe {
+        &mut *(frame.as_mut_ptr().add(tcp_off) as *mut TcpHeader)
+    };
+    tcp_hdr.src_port = htons(src_port);
+    tcp_hdr.dst_port = htons(dst_port);
+    tcp_hdr.seq = htonl(seq);
+    tcp_hdr.ack = htonl(ack);
+    tcp_hdr.data_offset = 0x50;
+    tcp_hdr.flags = flags;
+    tcp_hdr.window = htons(window);
+    tcp_hdr.checksum = 0;
+    tcp_hdr.urgent = 0;
+    tcp_hdr.checksum = unsafe {
+        tcp_checksum_any(
+            local_ip,
+            dst_ip,
+            PROTO_TCP,
+            frame.as_ptr().add(tcp_off),
+            tcp_seg_len,
+        )
+    };
+
+    // ── IP header (family-dispatched) ────────────────────────────────
+    let ip_total = (tcp_off - ETH_HDR_LEN + tcp_seg_len) as u16;
+    match (local_ip, dst_ip) {
+        (IpAddr::V4(s), IpAddr::V4(d)) => {
+            ipv4::fill_header(
+                &mut frame[ETH_HDR_LEN..ETH_HDR_LEN + IPV4_HDR_LEN],
+                s, d, PROTO_TCP, ip_total,
+            );
+        }
+        (IpAddr::V6(s), IpAddr::V6(d)) => {
+            ipv6::fill_header(
+                &mut frame[ETH_HDR_LEN..ETH_HDR_LEN + IPV6_HDR_LEN],
+                &s, &d, ipv6::next_header::TCP, 64, tcp_seg_len as u16,
+            );
+        }
+        _ => unreachable!("mismatched family"),
+    }
+
+    // ── Ethernet header ──────────────────────────────────────────────
+    let ethertype = match dst_ip {
+        IpAddr::V4(_) => ethernet::ETHERTYPE_IPV4,
+        IpAddr::V6(_) => ipv6::ETHERTYPE_IPV6,
+    };
+    ethernet::fill_header(
+        &mut frame[..ETH_HDR_LEN],
+        dst_mac,
+        ethernet::ethernet_our_mac(),
+        ethertype,
+    );
+}
+
+/// Build and ship a TCP segment whose payload comes from `payload`
+/// (a contiguous byte slice). Used by control-path callers (SYN,
+/// SYN-ACK, ACK-only, FIN, RST) and by tests.
 fn send_segment(
     local_ip: IpAddr,
     dst_ip: IpAddr,
@@ -739,76 +882,86 @@ fn send_segment(
     window: u16,
     payload: &[u8],
 ) {
-    // Caller already chunked to per-family MSS via `mss_for(local_ip)`,
-    // but clamp again with the conservative `MSS_MAX` so a misuse
-    // doesn't blow the stack-allocated `buf` below.
-    let payload_len = payload.len().min(MSS_MAX);
-    let seg_len = 20 + payload_len;
+    let dst_mac = match resolve_dst_mac(dst_ip) {
+        Some(m) => m,
+        None => return, // ARP/NDP miss; TCP retransmit will retry
+    };
 
-    let mut buf = core::mem::MaybeUninit::<[u8; 20 + MSS_MAX]>::uninit();
+    let payload_off = payload_offset(local_ip);
+    let payload_len = payload.len().min(MSS_MAX);
+    let frame_len = payload_off + payload_len;
+
+    let mut buf = core::mem::MaybeUninit::<[u8; FRAME_BUF_LEN]>::uninit();
     let p = buf.as_mut_ptr() as *mut u8;
 
     unsafe {
-        let hdr = &mut *(p as *mut TcpHeader);
-        hdr.src_port = htons(src_port);
-        hdr.dst_port = htons(dst_port);
-        hdr.seq = htonl(seq);
-        hdr.ack = htonl(ack);
-        hdr.data_offset = 0x50;
-        hdr.flags = flags;
-        hdr.window = htons(window);
-        hdr.checksum = 0;
-        hdr.urgent = 0;
-
-        if !payload.is_empty() {
-            ptr::copy_nonoverlapping(payload.as_ptr(), p.add(20), payload_len);
+        // Copy payload into the frame's payload slot (one copy total —
+        // the legacy path made three).
+        if payload_len > 0 {
+            ptr::copy_nonoverlapping(payload.as_ptr(), p.add(payload_off), payload_len);
         }
+        let frame = core::slice::from_raw_parts_mut(p, frame_len);
+        fill_tcp_frame_headers(
+            frame, local_ip, dst_ip, dst_mac,
+            src_port, dst_port, seq, ack, flags, window,
+            payload_len,
+        );
+        uni_drivers::net::send(frame);
+    }
+}
 
-        hdr.checksum = tcp_checksum_any(local_ip, dst_ip, PROTO_TCP, p, seg_len);
+/// Build and ship a TCP segment whose payload is read from a chain
+/// cursor. Used by the data-send hot path (`async_try_send_chain`).
+fn send_segment_from_cursor(
+    local_ip: IpAddr,
+    dst_ip: IpAddr,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    cursor: &mut uni_iobuf::Cursor<'_>,
+    payload_len: usize,
+) {
+    let dst_mac = match resolve_dst_mac(dst_ip) {
+        Some(m) => m,
+        None => return, // ARP/NDP miss; TCP retransmit will retry
+    };
 
-        let bytes = core::slice::from_raw_parts(p, seg_len);
-        send_l3(local_ip, dst_ip, bytes);
+    let payload_off = payload_offset(local_ip);
+    let payload_len = payload_len.min(MSS_MAX);
+    let frame_len = payload_off + payload_len;
+
+    let mut buf = core::mem::MaybeUninit::<[u8; FRAME_BUF_LEN]>::uninit();
+    let p = buf.as_mut_ptr() as *mut u8;
+
+    unsafe {
+        // Walk chain bytes straight into the payload slot. This is
+        // the "one memcpy, no intermediate buffer" property the IOBuf
+        // chain design exists for — and now there are no IP/Eth-wrap
+        // memcpys downstream either.
+        if payload_len > 0 {
+            let dst = core::slice::from_raw_parts_mut(p.add(payload_off), payload_len);
+            let n = cursor.read(dst);
+            debug_assert_eq!(n, payload_len);
+            let _ = n;
+        }
+        let frame = core::slice::from_raw_parts_mut(p, frame_len);
+        fill_tcp_frame_headers(
+            frame, local_ip, dst_ip, dst_mac,
+            src_port, dst_port, seq, ack, flags, window,
+            payload_len,
+        );
+        uni_drivers::net::send(frame);
     }
 }
 
 fn send_rst(local_ip: IpAddr, dst_ip: IpAddr, src_port: u16, dst_port: u16, seq: u32, ack: u32) {
-    let mut buf = core::mem::MaybeUninit::<[u8; 20]>::uninit();
-    let p = buf.as_mut_ptr() as *mut u8;
-    unsafe {
-        let hdr = &mut *(p as *mut TcpHeader);
-        hdr.src_port = htons(src_port);
-        hdr.dst_port = htons(dst_port);
-        hdr.seq = htonl(seq);
-        hdr.ack = htonl(ack);
-        hdr.data_offset = 0x50;
-        hdr.flags = TCP_RST | TCP_ACK;
-        hdr.window = 0;
-        hdr.checksum = 0;
-        hdr.urgent = 0;
-
-        hdr.checksum = tcp_checksum_any(local_ip, dst_ip, PROTO_TCP, p, 20);
-
-        let bytes = core::slice::from_raw_parts(p, 20);
-        send_l3(local_ip, dst_ip, bytes);
-    }
-}
-
-/// Family-aware L3 send. Dispatches to `ipv4_send` (which handles
-/// ARP internally) for v4 destinations and to `ipv6_send` (which
-/// handles NDP internally) for v6. The `local_ip` is currently
-/// just used by the checksum calculator; v4 uses CONFIG.ip(), v6
-/// uses our link-local — both selected upstream when the TCB
-/// captured `local_ip` from the SYN.
-fn send_l3(local_ip: IpAddr, dst_ip: IpAddr, segment: &[u8]) {
-    match (local_ip, dst_ip) {
-        (_, IpAddr::V4(d)) => ipv4_send(d, PROTO_TCP, segment),
-        (IpAddr::V6(s), IpAddr::V6(d)) => {
-            ipv6_send::ipv6_send(&s, &d, ipv6::next_header::TCP, 64, segment);
-        }
-        // Mismatched family — should never happen in correct code.
-        // Drop silently rather than crash the kernel.
-        _ => {}
-    }
+    send_segment(
+        local_ip, dst_ip, src_port, dst_port,
+        seq, ack, TCP_RST | TCP_ACK, 0, &[],
+    );
 }
 
 /// Process an incoming TCP packet. Called on the owning core (via flow hash).
@@ -1343,59 +1496,6 @@ pub fn async_try_send_chain(
     drop(cursor);
     chain.clear();
     Ok(sent)
-}
-
-/// Like `send_segment` but reads `payload_len` bytes from a chain
-/// cursor (advancing it) instead of borrowing from a contiguous
-/// slice. Caller must have ensured the cursor has at least
-/// `payload_len` bytes remaining.
-fn send_segment_from_cursor(
-    local_ip: IpAddr,
-    dst_ip: IpAddr,
-    src_port: u16,
-    dst_port: u16,
-    seq: u32,
-    ack: u32,
-    flags: u8,
-    window: u16,
-    cursor: &mut uni_iobuf::Cursor<'_>,
-    payload_len: usize,
-) {
-    let payload_len = payload_len.min(MSS_MAX);
-    let seg_len = 20 + payload_len;
-
-    let mut buf = core::mem::MaybeUninit::<[u8; 20 + MSS_MAX]>::uninit();
-    let p = buf.as_mut_ptr() as *mut u8;
-
-    unsafe {
-        let hdr = &mut *(p as *mut TcpHeader);
-        hdr.src_port = htons(src_port);
-        hdr.dst_port = htons(dst_port);
-        hdr.seq = htonl(seq);
-        hdr.ack = htonl(ack);
-        hdr.data_offset = 0x50;
-        hdr.flags = flags;
-        hdr.window = htons(window);
-        hdr.checksum = 0;
-        hdr.urgent = 0;
-
-        if payload_len > 0 {
-            // Copy chain bytes straight into the segment's
-            // payload area; cursor walks node boundaries
-            // transparently. This is the "one memcpy, no
-            // intermediate buffer" property the IOBuf chain
-            // design exists for.
-            let dst = core::slice::from_raw_parts_mut(p.add(20), payload_len);
-            let n = cursor.read(dst);
-            debug_assert_eq!(n, payload_len);
-            let _ = n;
-        }
-
-        hdr.checksum = tcp_checksum_any(local_ip, dst_ip, PROTO_TCP, p, seg_len);
-
-        let bytes = core::slice::from_raw_parts(p, seg_len);
-        send_l3(local_ip, dst_ip, bytes);
-    }
 }
 
 /// Park the send-side waker. On bare-metal `async_try_send_chain`
