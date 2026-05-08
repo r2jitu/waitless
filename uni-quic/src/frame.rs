@@ -48,6 +48,8 @@ pub mod ftype {
     pub const PING: u8 = 0x01;
     pub const ACK: u8 = 0x02;
     pub const ACK_ECN: u8 = 0x03;
+    pub const RESET_STREAM: u8 = 0x04;
+    pub const STOP_SENDING: u8 = 0x05;
     pub const CRYPTO: u8 = 0x06;
 
     /// Base byte for STREAM frames (§19.8). Low 3 bits are flags:
@@ -222,6 +224,20 @@ pub fn parse_frame(data: &[u8]) -> Result<(Frame<'_>, usize), FrameError> {
         }
         ftype::HANDSHAKE_DONE => Ok((Frame::HandshakeDone, 1)),
         ftype::NEW_TOKEN => skip_var_len_field(rest, t, frame_total_offset),
+        // RESET_STREAM (RFC 9000 §19.4): three varints — stream id,
+        // application error code, final size. Skip-only today: the
+        // server treats the stream as closed via its own FIN
+        // accounting; the client's intent to abort is implicit in
+        // the response stream being dropped.
+        ftype::RESET_STREAM => skip_three_varints(rest, t, frame_total_offset),
+        // STOP_SENDING (RFC 9000 §19.5): two varints — stream id,
+        // application error code. Skip-only today: quinn's H3 client
+        // sends this routinely after consuming the response, telling
+        // us "don't send any more on this stream." We're already
+        // FIN-closed on the response side by the time it arrives, so
+        // ignoring it is safe; treating it as an unknown frame
+        // tripped CONNECTION_CLOSE(PROTOCOL_VIOLATION) instead.
+        ftype::STOP_SENDING => skip_two_varints(rest, t, frame_total_offset),
         ftype::MAX_DATA
         | ftype::MAX_STREAMS_BIDI
         | ftype::MAX_STREAMS_UNI
@@ -255,6 +271,17 @@ fn skip_two_varints(
     let (_a, n) = read_varint(body)?;
     let (_b, m) = read_varint(&body[n..])?;
     Ok((Frame::Skipped { kind }, header + n + m))
+}
+
+fn skip_three_varints(
+    body: &[u8],
+    kind: u8,
+    header: usize,
+) -> Result<(Frame<'_>, usize), FrameError> {
+    let (_a, n) = read_varint(body)?;
+    let (_b, m) = read_varint(&body[n..])?;
+    let (_c, p) = read_varint(&body[n + m..])?;
+    Ok((Frame::Skipped { kind }, header + n + m + p))
 }
 
 fn skip_var_len_field(
