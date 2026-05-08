@@ -307,6 +307,133 @@ where
     tag
 }
 
+/// Fused copy-and-encrypt AEAD seal. Reads plaintext from each
+/// part of `src_parts` (an iterator of `&[u8]`), XORs with the
+/// ChaCha20 keystream while writing the ciphertext to consecutive
+/// regions of `dst`, and accumulates one Poly1305 tag over the
+/// resulting ciphertext. Returns the tag.
+///
+/// Differs from [`chacha20poly1305_seal_chain`] in the source-vs-
+/// destination shape: `seal_chain` operates in place on mutable
+/// parts (caller has already coalesced plaintext into the parts
+/// themselves), while `seal_chain_to` reads from immutable source
+/// parts and writes ciphertext to a separate destination buffer.
+/// The fused form lets the TLS record layer skip the copy-then-
+/// encrypt-in-place pattern: instead of memcpy'ing chain bytes
+/// into a scratch and then encrypting in place, encrypt-while-
+/// copying in a single pass through the destination.
+///
+/// Uses `cipher::StreamCipher::apply_keystream_b2b` so the inner
+/// XOR loop benefits from the chacha20 crate's SIMD backends.
+///
+/// `dst` must be at least as long as the sum of `src_parts`'
+/// lengths. Bytes past the written prefix are left untouched.
+pub fn chacha20poly1305_seal_chain_to<'a, I>(
+    key: &[u8; KEY_LEN],
+    nonce: &[u8; NONCE_LEN],
+    aad: &[u8],
+    src_parts: I,
+    dst: &mut [u8],
+) -> [u8; TAG_LEN]
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
+    use chacha20::cipher::StreamCipher;
+
+    // Step 1: derive Poly1305 key from ChaCha20 counter 0 and skip
+    // the rest of the first block (counter lands at 1 for plaintext).
+    let mut cipher = ChaCha20::new(
+        chacha20::Key::from_slice(key),
+        chacha20::Nonce::from_slice(nonce),
+    );
+    let mut poly_key = [0u8; 32];
+    cipher.apply_keystream(&mut poly_key);
+    let mut discard = [0u8; 32];
+    cipher.apply_keystream(&mut discard);
+
+    let mut mac = Poly1305::new(GenericArray::from_slice(&poly_key));
+    mac.update_padded(aad);
+
+    // Step 2: walk src parts; for each one, encrypt-while-copying
+    // from src_part into dst[cursor..cursor+len], then feed the
+    // ciphertext bytes to Poly1305. Same 16-byte block straddle
+    // logic as `seal_chain`.
+    let mut cursor = 0usize;
+    let mut block_buf = [0u8; 16];
+    let mut block_pos = 0usize;
+
+    for src_part in src_parts {
+        let len = src_part.len();
+        if len == 0 {
+            continue;
+        }
+        let end = cursor + len;
+        cipher
+            .apply_keystream_b2b(src_part, &mut dst[cursor..end])
+            .expect("src and dst slices have equal length");
+        // Re-borrow as `&[u8]` for the Poly1305 read pass — the
+        // mut borrow from `apply_keystream_b2b` ended on return.
+        let mut data: &[u8] = &dst[cursor..end];
+        cursor = end;
+
+        // Drain any partial block carried over from a previous
+        // part. `block_pos` is the number of bytes already in
+        // `block_buf` from the previous iteration's tail.
+        if block_pos > 0 {
+            let take = (16 - block_pos).min(data.len());
+            block_buf[block_pos..block_pos + take]
+                .copy_from_slice(&data[..take]);
+            block_pos += take;
+            data = &data[take..];
+            if block_pos == 16 {
+                mac.update(&[*GenericArray::from_slice(&block_buf)]);
+                block_buf = [0u8; 16];
+                block_pos = 0;
+            }
+        }
+
+        // Submit any whole 16-byte blocks then carry the tail.
+        if !data.is_empty() {
+            debug_assert_eq!(block_pos, 0);
+            let full_bytes = data.len() & !15;
+            if full_bytes > 0 {
+                // SAFETY: contiguous `u8` bytes can be reinterpreted
+                // as `&[GenericArray<u8, U16>]` (alignment 1, no
+                // padding past element size).
+                let blocks: &[GenericArray<u8, _>] = unsafe {
+                    core::slice::from_raw_parts(
+                        data.as_ptr() as *const GenericArray<u8, _>,
+                        full_bytes / 16,
+                    )
+                };
+                mac.update(blocks);
+            }
+            let tail = &data[full_bytes..];
+            if !tail.is_empty() {
+                block_buf[..tail.len()].copy_from_slice(tail);
+                block_pos = tail.len();
+            }
+        }
+    }
+
+    // Final partial block (zero-padded). Skipped if total ended on
+    // a 16-byte boundary.
+    if block_pos > 0 {
+        mac.update(&[*GenericArray::from_slice(&block_buf)]);
+    }
+
+    // Length block: aad_len_le8 || ct_len_le8.
+    let mut len_block = [0u8; 16];
+    len_block[..8].copy_from_slice(&(aad.len() as u64).to_le_bytes());
+    len_block[8..].copy_from_slice(&(cursor as u64).to_le_bytes());
+    mac.update(&[*GenericArray::from_slice(&len_block)]);
+
+    let tag_arr = mac.finalize();
+    let mut tag = [0u8; TAG_LEN];
+    tag.copy_from_slice(tag_arr.as_slice());
+    tag
+}
+
 /// One-shot AEAD decrypt + verify. Returns `Ok(())` on tag match and
 /// decrypts `data` in place; returns `Err(())` on tag mismatch (in
 /// which case `data` is left in an undefined state — the upstream
@@ -551,6 +678,90 @@ mod tests {
             let opened = chacha20poly1305_open(&key, &nonce, aad, &mut chain_ct, &chain_tag);
             assert!(opened.is_ok(), "open failed for layout {:?}", layout);
             assert_eq!(&chain_ct[..], &plaintext[..total]);
+        }
+    }
+
+    /// `chacha20poly1305_seal_chain_to(key, nonce, aad, src_parts,
+    /// dst)` must produce the same tag and the same ciphertext
+    /// bytes as `chacha20poly1305_seal_chain` over an in-place
+    /// copy of the same plaintext. Sweeps the same part-layout
+    /// matrix to exercise straddles, empty middle parts, and
+    /// many-small-parts edge cases.
+    #[test]
+    fn seal_chain_to_matches_seal_chain() {
+        let key = [0x77u8; 32];
+        let nonce = [0x42u8; 12];
+        let aad: &[u8] = b"chain-to-aad";
+        let plaintext: alloc::vec::Vec<u8> = (0..256u32).map(|i| (i as u8).wrapping_mul(7)).collect();
+
+        let layouts: &[&[usize]] = &[
+            &[256],
+            &[16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16],
+            &[1, 255],
+            &[15, 241],
+            &[16, 240],
+            &[17, 239],
+            &[31, 225],
+            &[32, 224],
+            &[33, 223],
+            &[7, 13, 23, 213],
+            &[100, 0, 156],
+            &[1; 256],
+        ];
+
+        for layout in layouts {
+            let total: usize = layout.iter().sum();
+
+            // Reference: in-place seal_chain over a copy of the
+            // partitioned plaintext.
+            let mut ref_bufs: alloc::vec::Vec<alloc::vec::Vec<u8>> =
+                alloc::vec::Vec::new();
+            let mut off = 0;
+            for &len in layout.iter() {
+                ref_bufs.push(plaintext[off..off + len].to_vec());
+                off += len;
+            }
+            let ref_tag = chacha20poly1305_seal_chain(
+                &key,
+                &nonce,
+                aad,
+                ref_bufs.iter_mut().map(|v| v.as_mut_slice()),
+            );
+            let mut ref_ct = alloc::vec::Vec::with_capacity(total);
+            for v in ref_bufs.iter() {
+                ref_ct.extend_from_slice(v);
+            }
+
+            // seal_chain_to: read from immutable plaintext parts,
+            // write ciphertext to a separate dst buffer.
+            let src_bufs: alloc::vec::Vec<alloc::vec::Vec<u8>> = {
+                let mut v = alloc::vec::Vec::new();
+                let mut off = 0;
+                for &len in layout.iter() {
+                    v.push(plaintext[off..off + len].to_vec());
+                    off += len;
+                }
+                v
+            };
+            let mut dst = alloc::vec![0u8; total];
+            let to_tag = chacha20poly1305_seal_chain_to(
+                &key,
+                &nonce,
+                aad,
+                src_bufs.iter().map(|v| v.as_slice()),
+                &mut dst,
+            );
+
+            assert_eq!(
+                ref_tag, to_tag,
+                "tag mismatch for layout {:?}",
+                layout
+            );
+            assert_eq!(
+                dst, ref_ct,
+                "ciphertext mismatch for layout {:?}",
+                layout
+            );
         }
     }
 }
