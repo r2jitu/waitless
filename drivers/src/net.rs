@@ -44,6 +44,39 @@ pub fn poll_qp(qp: usize, callback: fn(uni_net_driver::IOBuf)) -> usize {
 
 pub fn send(data: &[u8]) { (active_ops().send)(data) }
 
+/// Acquire a writable TX buffer from the driver's pool. Caller fills
+/// the returned region in place, then [`submit_tx`]s it for
+/// transmission. Returns `None` when the driver doesn't support
+/// the direct-fill path (Tier 2 shared queue, GVE, native), or
+/// when the pool is full — caller falls back to [`send`] (which
+/// memcpys through the legacy slice path).
+///
+/// On `Some(handle)`:
+///   * Caller writes the L2 frame into `handle.data_mut()[..len]`.
+///   * Caller hands the handle to [`submit_tx`].
+///   * Dropping the handle without submission returns the slot
+///     to the pool (the caller's error path doesn't need to do
+///     bookkeeping).
+pub fn acquire_tx_buf() -> Option<uni_net_driver::TxBufHandle> {
+    let f = active_ops().acquire_tx_buf?;
+    f()
+}
+
+/// Submit a previously-acquired TX buffer with `frame_len` bytes of
+/// frame data at the head of `handle.data_mut()`. Consumes the
+/// handle.
+pub fn submit_tx(handle: uni_net_driver::TxBufHandle, frame_len: usize) {
+    if let Some(f) = active_ops().submit_tx {
+        f(handle, frame_len);
+    } else {
+        // Only reachable via API misuse — `acquire_tx_buf` returns
+        // `None` when the driver lacks the surface, so a caller that
+        // does proper acquire+submit can never end up here. Drop the
+        // handle (its `Drop` returns the slot to the pool).
+        drop(handle);
+    }
+}
+
 // ---- Idle / TX-flush knobs -----------------------------------------------
 
 pub fn flush_tx_staging() { (active_ops().flush_tx_staging)() }

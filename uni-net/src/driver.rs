@@ -12,6 +12,73 @@ use core::sync::atomic::{AtomicPtr, Ordering};
 
 // ---- Core ops --------------------------------------------------------------
 
+/// Handle returned by [`NicOps::acquire_tx_buf`]. Wraps a writable
+/// region of driver-owned TX-pool storage so the caller can fill
+/// frame bytes in place — no memcpy through an intermediate
+/// stack buffer when handing the frame to the driver.
+///
+/// Lifecycle:
+///   * Acquire → driver marks the slot busy, returns this handle.
+///   * Caller fills `data_mut()[..frame_len]` with the L2 frame.
+///   * Caller passes the handle to [`NicOps::submit_tx`], which
+///     mem-forgets it (skipping `Drop`) and enqueues a virtio
+///     descriptor pointing at the slot. The slot stays busy
+///     until the device signals descriptor completion (via the
+///     driver's `tx_drain`).
+///   * If the caller drops the handle without submitting (e.g.
+///     a frame-build error path), `Drop` calls `release_fn` to
+///     return the slot to the pool unused.
+///
+/// `release_fn` is the driver's "release this slot back to the
+/// pool" entry point; it takes the opaque `driver_token` we
+/// gave the caller. Usually a small bookkeeping write (clearing
+/// a `tx_pool_used[slot]` bit).
+pub struct TxBufHandle {
+    /// Pointer to the writable data region (the frame body — the
+    /// virtio_net header lives in driver-private bytes adjacent
+    /// to this region and is filled by `submit_tx`).
+    pub data_ptr: *mut u8,
+    /// Bytes available at `data_ptr` (≥ 1514 for an Ethernet
+    /// MTU 1500 frame; drivers may expose more if they support
+    /// jumbo frames in the future).
+    pub data_cap: u32,
+    /// Driver-private opaque token — the driver decodes this in
+    /// `submit_tx` / `release_fn` to find the slot. Caller treats
+    /// it as opaque.
+    pub driver_token: u64,
+    /// Released on `Drop` if the handle isn't submitted. Driver
+    /// uses this to put the slot back in the free pool.
+    pub release_fn: fn(driver_token: u64),
+}
+
+// SAFETY: `data_ptr` is a writable region of driver-owned static
+// storage with a stable address; `release_fn` is a `fn` pointer
+// (always Sync). `TxBufHandle` is logically per-acquirer — it
+// can be moved between threads as long as the caller doesn't
+// share it (which would defeat the "exclusive write" property).
+unsafe impl Send for TxBufHandle {}
+
+impl TxBufHandle {
+    /// Mutable view of the writable frame region. Caller fills
+    /// `data_mut()[..frame_len]` with the L2 frame bytes.
+    #[inline]
+    pub fn data_mut(&mut self) -> &mut [u8] {
+        // SAFETY: the driver guarantees `data_ptr` is valid and
+        // `data_cap` accurate for the handle's lifetime, with
+        // exclusive write access (no other holder of the same
+        // slot exists between acquire and submit/drop).
+        unsafe {
+            core::slice::from_raw_parts_mut(self.data_ptr, self.data_cap as usize)
+        }
+    }
+}
+
+impl Drop for TxBufHandle {
+    fn drop(&mut self) {
+        (self.release_fn)(self.driver_token);
+    }
+}
+
 /// All fn pointers a NIC driver exposes. A single `&'static NicOps`
 /// is published via `AtomicPtr` at boot; every dispatcher call does
 /// one Acquire load + one direct call.
@@ -25,6 +92,33 @@ pub struct NicOps {
 
     // ── Data path ───────────────────────────────────────────────────
     pub send: fn(&[u8]),
+    /// Optional zero-copy TX: caller acquires a slot from the
+    /// driver's TX pool, fills frame bytes in place, submits.
+    /// `None` means the driver doesn't support this surface (or
+    /// the runtime context — e.g. Tier-2 shared queue under
+    /// multi-core — can't supply a slot without lock contention);
+    /// caller falls back to `send(&[u8])`.
+    ///
+    /// On `Some(handle)` return:
+    ///   * Caller fills `handle.data_mut()[..frame_len]` with the
+    ///     full Ethernet frame (no virtio_net header — that's
+    ///     filled by `submit_tx` from driver-private bytes
+    ///     adjacent to the data region).
+    ///   * Caller hands the handle to `submit_tx(handle, frame_len)`.
+    ///   * If the caller drops the handle without submitting (e.g.
+    ///     on an error path), the slot returns to the pool via
+    ///     `TxBufHandle::Drop`.
+    ///
+    /// Returns `None` on pool exhaustion — caller may retry, fall
+    /// back to `send`, or drop the packet (UDP / QUIC retransmit).
+    pub acquire_tx_buf: Option<fn() -> Option<TxBufHandle>>,
+    /// Submit a previously-acquired TX buffer for transmission.
+    /// `frame_len` is the bytes the caller wrote at the start of
+    /// `handle.data_mut()`. Consumes the handle (slot returns to
+    /// pool when the device signals descriptor completion via
+    /// `tx_drain`, NOT when this fn returns). `None` mirrors
+    /// `acquire_tx_buf`'s `None`.
+    pub submit_tx: Option<fn(TxBufHandle, usize)>,
     /// Zero-copy RX. The callback receives an owned [`IOBuf`]
     /// (typically `IOBuf::External` wrapping the descriptor's
     /// storage) per frame; the IOBuf's drop callback returns the
@@ -152,6 +246,8 @@ static NULL_OPS: NicOps = NicOps {
     name: "none",
     probe: null_probe,
     send: null_send,
+    acquire_tx_buf: None,
+    submit_tx: None,
     poll_rx: null_poll,
     poll_qp: null_poll_qp,
     get_mac: null_get_mac,

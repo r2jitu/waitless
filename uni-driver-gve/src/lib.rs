@@ -2378,6 +2378,11 @@ static GVE_OPS: NicOps = NicOps {
     name: "gve",
     probe,
     send,
+    // GVE doesn't yet implement the direct-fill TX surface; callers
+    // fall back to the slice-based `send` path. See virtio-net for
+    // the reference implementation.
+    acquire_tx_buf: None,
+    submit_tx: None,
     poll_rx: poll,
     poll_qp,
     get_mac,

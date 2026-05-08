@@ -1149,6 +1149,134 @@ fn send(data: &[u8]) {
     }
 }
 
+// ─── Direct-fill (zero-copy) TX path ────────────────────────────────────────
+//
+// `acquire_tx_buf` hands the caller an `IOBuf::TxBufHandle` whose
+// data ptr points straight at a free slot in the per-qp `tx_pool`.
+// The caller fills the frame in place (no memcpy through an
+// intermediate stack buffer); `submit_tx` enqueues a virtio
+// descriptor pointing at the same storage. The slot stays "in
+// use" until the device signals descriptor completion via
+// `tx_drain_qp`.
+//
+// Tier 1 (per-core queue pairs) is the supported case: the qp is
+// owned by the caller's core, so no lock contention on
+// `tx_pool_used` scanning. Tier 2 (shared qp + multi-core) returns
+// `None` from `acquire_tx_buf` — the caller falls back to the
+// legacy `send(&[u8])` + per-core staging path.
+
+/// Encode `(qp, slot)` into a single u64 token. Layout:
+/// `qp << 32 | slot`. Decoded via `decode_token`.
+#[inline]
+fn encode_token(qp: usize, slot: usize) -> u64 {
+    ((qp as u64) << 32) | (slot as u64)
+}
+
+#[inline]
+fn decode_token(token: u64) -> (usize, usize) {
+    ((token >> 32) as usize, (token & 0xFFFFFFFF) as usize)
+}
+
+/// Drop callback for an unsubmitted `TxBufHandle`: returns the
+/// slot to the pool. Called by `TxBufHandle::drop` when a caller
+/// acquires a slot but doesn't go through `submit_tx` (e.g. error
+/// path before frame-build completion).
+fn release_tx_slot(token: u64) {
+    let (qp, slot) = decode_token(token);
+    if qp < unsafe { (*ndev()).num_queue_pairs as usize } && slot < TX_POOL_SIZE {
+        unsafe { (*qps(qp)).tx_pool_used[slot] = false; }
+    }
+}
+
+fn acquire_tx_buf() -> Option<uni_net_driver::TxBufHandle> {
+    // Driver not yet bound — caller falls back to send().
+    if unsafe { matches!((*ndev()).transport, Transport::None) } {
+        return None;
+    }
+
+    let cc = uni_kernel::percpu::CurrentWorker::enter();
+    let id = cc.id();
+    let nqp = unsafe { (*ndev()).num_queue_pairs };
+    let qp = if nqp > 1 && (id as u16) < nqp {
+        // Per-core qp: no contention.
+        id as usize
+    } else if uni_kernel::percpu::num_cores() <= 1 {
+        // Single-core: no contention possible.
+        0
+    } else {
+        // Shared qp under multi-core: scanning `tx_pool_used`
+        // would race with other cores. Caller falls back to the
+        // staging path.
+        return None;
+    };
+
+    // Drain completed descriptors so freshly-finished slots are
+    // visible to the search below.
+    tx_drain_qp(qp);
+
+    // Find a free slot. No spin — return None on full so the
+    // caller can decide whether to retry, fall back to memcpy
+    // send, or drop the packet.
+    for slot in 0..TX_POOL_SIZE {
+        unsafe {
+            if !(*qps(qp)).tx_pool_used[slot] {
+                (*qps(qp)).tx_pool_used[slot] = true;
+                let buf = &mut (*qps(qp)).tx_pool[slot];
+                return Some(uni_net_driver::TxBufHandle {
+                    data_ptr: buf.data.as_mut_ptr(),
+                    data_cap: MAX_ETH_FRAME as u32,
+                    driver_token: encode_token(qp, slot),
+                    release_fn: release_tx_slot,
+                });
+            }
+        }
+    }
+    None
+}
+
+fn submit_tx(handle: uni_net_driver::TxBufHandle, frame_len: usize) {
+    let (qp, slot) = decode_token(handle.driver_token);
+    // mem::forget skips `Drop`'s `release_fn` — the slot is
+    // about to be in-flight, not unused. `tx_drain_qp` returns
+    // it to the pool when the device signals completion.
+    core::mem::forget(handle);
+
+    if frame_len == 0 || frame_len > MAX_ETH_FRAME {
+        // Invalid input — release the slot so we don't leak it.
+        unsafe { (*qps(qp)).tx_pool_used[slot] = false; }
+        return;
+    }
+
+    unsafe {
+        let buf = &mut (*qps(qp)).tx_pool[slot];
+        // Fill virtio_net header (zeros except num_buffers = 1 for
+        // single-buffer frames). The header sits at offset 0 of
+        // `TxBuf`; the caller-filled frame data starts at offset
+        // `VIRTIO_NET_HDR_SIZE` (the `data` field).
+        buf.hdr = VirtioNetHeader {
+            flags: 0,
+            gso_type: 0,
+            hdr_len: 0,
+            gso_size: 0,
+            csum_start: 0,
+            csum_offset: 0,
+            num_buffers: 1,
+        };
+
+        let total_len = VIRTIO_NET_HDR_SIZE as u32 + frame_len as u32;
+        let buf_phys = virt_to_phys(buf as *const TxBuf as *const u8);
+        let head = (*tx_q(qp)).add_buf(buf_phys, total_len, 1, 0);
+        if head < 0 {
+            // Virtq full — release the slot. The caller's frame is
+            // dropped on the floor; UDP / QUIC retransmits handle
+            // loss, TCP retransmits later.
+            (*qps(qp)).tx_pool_used[slot] = false;
+            return;
+        }
+        (*tx_q(qp)).kick();
+    }
+}
+
 /// True if any AP has staged TX packets waiting for flush.
 fn has_pending_tx() -> bool {
     TX_PENDING.load(Ordering::Acquire)
@@ -1783,6 +1911,8 @@ static VIRTIO_NET_OPS: NicOps = NicOps {
     name: "virtio-net",
     probe,
     send,
+    acquire_tx_buf: Some(acquire_tx_buf),
+    submit_tx: Some(submit_tx),
     poll_rx: poll,
     poll_qp,
     get_mac,
