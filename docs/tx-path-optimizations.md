@@ -141,28 +141,30 @@ be removed without offloading AEAD to the NIC.
 - **Risk**: low.
 
 ### D. Fuse copy + encrypt in scratch
-- **Status**: [ ] **deferred** — re-evaluate after profiling
-- **Why deferred**: The chacha20 0.9 crate only exposes
-  `apply_keystream(&mut [u8])` (in-place). A fused src→dst
-  variant would require either (a) hand-rolling the XOR loop
-  against `apply_keystream` over a stack-local 64-B keystream
-  block, losing the crate's SIMD optimisations, or (b) moving
-  to a newer cipher trait (`InOutBuf`) and revalidating
-  KATs. Meanwhile the existing copy-then-encrypt path keeps
-  the scratch L1-resident between passes — DRAM traffic is
-  already ~1 R (chain) + 1 W (scratch) per byte; the second
-  encrypt pass over scratch + Poly1305 read are
-  cache-resident. The cycle savings are likely single-digit %
-  rather than the wall-clock win the doc originally implied.
-- **Re-trigger**: pick this back up if (1) profiling shows
-  scratch churn is a hot spot under multi-core load (e.g.
-  multiple TlsStreams' 16 KiB scratches contending L2), or
-  (2) we move to a newer chacha20/cipher crate version that
-  exposes `apply_keystream_inout`.
-- **Where (when revived)**: `uni-tls/src/aead.rs` — new
-  `chacha20poly1305_seal_chain_copy(...)` primitive.
-- **Effort (when revived)**: medium. Test with same KAT
-  vectors used by `seal_chain`.
+- **Status**: [x] **landed 2026-05-08** (commits `39c034e`,
+  `fef3c63`, `25858e3`)
+- **Result**: -1 R/W pass per byte through dst on the TLS
+  single-record fast path. Earlier deferral reasoning was
+  wrong — `chacha20` 0.9 (via `cipher` 0.4.4) does expose
+  `StreamCipher::apply_keystream_b2b(input, output)`, which
+  drives the same SIMD backends as in-place `apply_keystream`.
+  Implementation:
+  * New `chacha20poly1305_seal_chain_to` primitive in
+    `uni-tls/aead.rs` — reads plaintext from an iterator,
+    XORs while writing ciphertext to dst, accumulates Poly1305
+    over the resulting ciphertext bytes.
+  * `TrafficKey::seal_chain_to` + `record::seal_chain_to_in_place`
+    + `TlsServer::send_app_data_chain_to` plumb it through the
+    TLS layers.
+  * `TlsConn::send_app_data_chain_to` trait method + override.
+  * `TlsStream::send` uses the fused path on single-record
+    chains (the common case); oversize chains keep the legacy
+    copy-into-scratch + `seal_in_place` path until chain-
+    splitting at byte offsets becomes worth implementing.
+- **Bench impact**: within noise on /health (250 B body). The
+  savings are per-byte and need a multi-KiB body to surface
+  on the bench. Verified correctness via record-layer KAT
+  comparing wire bytes to the existing in-place seal.
 
 ### E. Skip `drain_tx()` no-op at top of the hot path
 - **Status**: [ ] not started
@@ -435,26 +437,25 @@ items until they unlock something concrete.
 1. ✓ **A + C** — TCP TX wrap memcpys + TLS seal envelope. Done.
 2. ✓ **P** — UDP TX wrap fold (mirror of A). Done.
 3. ✓ **Q** — QUIC packets into framing buffer. Done.
-4. **B** (virtio SG TX descriptors) — drops the last guest-side
+4. ✓ **D** — fused copy + encrypt for TLS single-record path. Done.
+5. **B** (virtio SG TX descriptors) — drops the last guest-side
    memcpy on **both** paths (2 → 1 for TCP and QUIC) and
    replaces the `send_on_qp` busy-spin with parking-async. Lays
    the foundation for G.
-5. **G** (TSO) — biggest single Tier 1 win once we benchmark on
+6. **G** (TSO) — biggest single Tier 1 win once we benchmark on
    KVM/GCE. Depends on B.
-6. **M** (conn-state pool) — the alloc-side equivalent of A+C;
+7. **M** (conn-state pool) — the alloc-side equivalent of A+C;
    biggest *alloc-count* win whenever conn churn matters. Land
    any time after we have a conn-churn workload to bench against
    — local keep-alive bench won't show it.
-7. **N + O** — close out the alloc tail once M is in. (O is
+8. **N + O** — close out the alloc tail once M is in. (O is
    partly mitigated by Q's headroom-prefix approach but the
    per-frame staging Vecs in `encode_initial_packet` /
    `encode_handshake_packet` remain — re-evaluate scope.)
-8. **J** (compression) + **K** (0-RTT) + **L** (Early Hints) when
+9. **J** (compression) + **K** (0-RTT) + **L** (Early Hints) when
    we shift focus from local benchmarks to Internet-facing serving.
 
-D (fused copy + encrypt) is **deferred** — see its entry above.
-
-End state after step 6: **1 memcpy per byte** on the guest side
+End state after step 5: **1 memcpy per byte** on the guest side
 for both TCP TLS and QUIC — just the one fundamental encrypt R/W
 pass for AEAD (or zero of the encrypt itself moves to NIC offload
 via TLS-offload, but that's its own rabbit hole).
@@ -523,3 +524,21 @@ E and F are low-effort cleanups that can land any time.
   headers in the headroom in place. QUIC TX memcpys now at 2
   per byte (encode + driver-TX-pool), matching TCP. End state
   after item B is 1 memcpy per byte for both paths.
+- **2026-05-08** — Cleanup pass after Q (`2beb525`, `47a0590`):
+  * Factored `resolve_dst_mac` (duplicated in `tcp.rs` and
+    `udp.rs`) into a new `:dst_mac` leaf module.
+  * Collapsed `udp::send_to_addr` to delegate to
+    `send_with_l2_headroom` (one site for header-fill logic;
+    -120 LOC of duplicated code).
+  * Updated stale comments in `uni-quic` referencing the
+    pre-Q `sock.send_to(&vec)` flow.
+- **2026-05-08** — Item **D landed** (`39c034e`, `fef3c63`,
+  `25858e3`): fused copy+encrypt for TLS single-record path.
+  Earlier deferral was wrong — `cipher 0.4.4` exposes
+  `apply_keystream_b2b` which uses the same SIMD backends as
+  in-place. New `chacha20poly1305_seal_chain_to` primitive
+  (with KAT against `seal_chain`), wired through TrafficKey
+  → record::seal_chain_to_in_place → TlsServer →
+  TlsConn::send_app_data_chain_to → TlsStream::send fused fast
+  path on chains ≤ 16 KiB. Bench within noise on /health (need
+  larger body to surface the per-byte savings).
