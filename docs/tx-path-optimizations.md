@@ -146,23 +146,28 @@ recycling for what's left) closes the rest.
 - **Risk**: low.
 
 ### D. Fuse copy + encrypt in scratch
-- **Status**: [ ] not started
-- **Where**: `uni-tls/src/aead.rs::chacha20poly1305_seal_chain`
-  (or a new `_seal_copy` variant), `uni-http/src/lib.rs::send`
-  loop.
-- **What**: Today is two passes through the scratch — pass 1
-  (`copy_from_slice` chain → scratch), pass 2 (ChaCha20 in
-  place). Fuse to a single pass that reads from the chain part,
-  XORs against the keystream, writes ciphertext to scratch. The
-  RustCrypto trait doesn't expose this directly but it's
-  straightforward to implement against `chacha20::ChaCha20`'s
-  block-mode API.
-- **Win**: -1 R/W pass per byte through L1/L2. Latency win,
-  cache-pressure win.
-- **Effort**: medium. New AEAD primitive plus tests against the
-  existing single-buffer KAT.
-- **Risk**: low (cryptographic correctness is testable with the
-  same KAT vectors we already use).
+- **Status**: [ ] **deferred** — re-evaluate after profiling
+- **Why deferred**: The chacha20 0.9 crate only exposes
+  `apply_keystream(&mut [u8])` (in-place). A fused src→dst
+  variant would require either (a) hand-rolling the XOR loop
+  against `apply_keystream` over a stack-local 64-B keystream
+  block, losing the crate's SIMD optimisations, or (b) moving
+  to a newer cipher trait (`InOutBuf`) and revalidating
+  KATs. Meanwhile the existing copy-then-encrypt path keeps
+  the scratch L1-resident between passes — DRAM traffic is
+  already ~1 R (chain) + 1 W (scratch) per byte; the second
+  encrypt pass over scratch + Poly1305 read are
+  cache-resident. The cycle savings are likely single-digit %
+  rather than the wall-clock win the doc originally implied.
+- **Re-trigger**: pick this back up if (1) profiling shows
+  scratch churn is a hot spot under multi-core load (e.g.
+  multiple TlsStreams' 16 KiB scratches contending L2), or
+  (2) we move to a newer chacha20/cipher crate version that
+  exposes `apply_keystream_inout`.
+- **Where (when revived)**: `uni-tls/src/aead.rs` — new
+  `chacha20poly1305_seal_chain_copy(...)` primitive.
+- **Effort (when revived)**: medium. Test with same KAT
+  vectors used by `seal_chain`.
 
 ### E. Skip `drain_tx()` no-op at top of the hot path
 - **Status**: [ ] not started
@@ -417,33 +422,29 @@ chasing the structural QUIC payoff, (c) defer foundational/risky
 items until they unlock something concrete.
 
 1. ✓ **A + C** — TCP TX wrap memcpys + TLS seal envelope. Done.
-2. **P** (UDP wrap fold, mirror of A) — mechanical, low risk,
-   ~50 LOC. Drops QUIC guest-side memcpys **5 → 3**, bringing it
-   to TCP parity. Touches no new abstractions; reuses the
-   `fill_header` helpers A added.
-3. **D** (fused copy + encrypt) — separable, lives in
-   `uni-tls/aead`. Latency + cache-pressure win on the TLS path.
-   Independent of P; can run in parallel mentally.
-4. **Q** (QUIC packets into framing buffer) — structural QUIC
+2. ✓ **P** — UDP TX wrap fold (mirror of A). Done.
+3. **Q** (QUIC packets into framing buffer) — structural QUIC
    payoff. Removes the QUIC-encode-into-Vec hop and several
    per-packet `Vec::with_capacity` allocs. Drops QUIC guest-side
    memcpys **3 → 2** (one fundamental pass remains). Can land
    with a stack-local framing buffer first; B upgrades it later.
-5. **B** (virtio SG TX descriptors) — drops the last guest-side
+4. **B** (virtio SG TX descriptors) — drops the last guest-side
    memcpy on **both** paths (3 → 2 for TCP, 2 → 1 for QUIC) and
    replaces the `send_on_qp` busy-spin with parking-async. Lays
    the foundation for G.
-6. **G** (TSO) — biggest single Tier 1 win once we benchmark on
+5. **G** (TSO) — biggest single Tier 1 win once we benchmark on
    KVM/GCE. Depends on B.
-7. **M** (conn-state pool) — the alloc-side equivalent of A+C;
+6. **M** (conn-state pool) — the alloc-side equivalent of A+C;
    biggest *alloc-count* win whenever conn churn matters. Land
    any time after we have a conn-churn workload to bench against
    — local keep-alive bench won't show it.
-8. **N + O** — close out the alloc tail once M is in. (O may be
+7. **N + O** — close out the alloc tail once M is in. (O may be
    subsumed by Q if Q removes the per-frame Vecs entirely;
    re-evaluate after Q.)
-9. **J** (compression) + **K** (0-RTT) + **L** (Early Hints) when
+8. **J** (compression) + **K** (0-RTT) + **L** (Early Hints) when
    we shift focus from local benchmarks to Internet-facing serving.
+
+D (fused copy + encrypt) is **deferred** — see its entry above.
 
 End state after step 6: **1 memcpy per byte** on the guest side
 for both TCP TLS and QUIC — just the one fundamental encrypt R/W
@@ -472,6 +473,20 @@ E and F are low-effort cleanups that can land any time.
   (small response). Wins scale with payload size — show up on
   larger-body workloads (bench coverage gap; consider adding a
   shell-page bench).
+- **2026-05-08** — Item **P landed** (`1494f06`): UDP TX wrap
+  fold. -2 memcpys per byte for any UDP traffic (incl. QUIC).
+  Drops QUIC guest-side memcpys 5 → 3, matching post-A TCP. UDP
+  bench numbers within noise on small packets — wins scale with
+  payload size; need a QUIC-throughput workload to surface
+  (bench coverage gap, same as A).
+- **2026-05-08** — Item **D deferred**. chacha20 0.9 only
+  exposes in-place `apply_keystream`; a fused src→dst variant
+  needs a hand-rolled XOR loop (loses crate SIMD) or a newer
+  cipher trait. Today's copy-then-encrypt keeps scratch
+  L1-resident between passes, so the actual DRAM cost is
+  already ~1R+1W per byte. Likely single-digit % cycle win —
+  not worth the complexity now. Re-trigger on profiling
+  evidence or crate upgrade.
 - **2026-05-08** — TX driver model + QUIC/UDP path traced:
   * TX is fully async — driver writes a virtio descriptor and
     kicks; completion is silent (no IRQ), drained lazily on the
