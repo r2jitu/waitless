@@ -242,6 +242,104 @@ pub fn seal_in_place(
     Ok(())
 }
 
+/// Whole-chain in-place seal. Takes an `IOBufChain` of plaintext
+/// parts that must all be mutable (Heap or External), prepends a
+/// fresh TLS record header IOBuf, appends a fresh trailer IOBuf
+/// holding the encrypted inner-content-type byte + AEAD tag, and
+/// runs the scatter-gather AEAD across every part in place. Zero
+/// plaintext-side coalesce: each part's bytes are encrypted where
+/// the producer left them.
+///
+/// On `Ok`, the chain layout becomes:
+///
+///   `[tls_record_header, encrypted_part_0, ..., encrypted_part_n, tls_trailer]`
+///
+/// Caller ships the chain straight to TCP — the bytes on the
+/// wire form one well-formed TLS 1.3 record.
+///
+/// Errors (chain is left untouched in every error path):
+///   * `Err(InputTooLarge)` if `chain.total_len() >= MAX_INNER_PLAINTEXT`.
+///     Caller chunks oversized chains.
+///   * `Err(OutputTooSmall)` if any chain part is a `Static`
+///     IOBuf. Caller falls back to coalesce-then-seal.
+///   * `Err(RecordTooLarge)` if the on-wire record exceeds the
+///     16-bit length field.
+pub fn seal_chain_in_place(
+    traffic_key: &mut tls::TrafficKey,
+    inner_type: u8,
+    chain: &mut uni_iobuf::IOBufChain,
+) -> Result<(), RecordError> {
+    let plaintext_len = chain.total_len();
+    if plaintext_len >= MAX_INNER_PLAINTEXT {
+        return Err(RecordError::InputTooLarge);
+    }
+    let inner_len = plaintext_len + 1; // +1 for inner-content-type byte
+    let record_len = inner_len + TAG_LEN;
+    if record_len > u16::MAX as usize {
+        return Err(RecordError::RecordTooLarge);
+    }
+
+    // Pre-flight: every chain part must be mutable so we can
+    // encrypt in place. Done before any mutation so the chain
+    // is left untouched on error and the caller can fall back
+    // to coalesce-then-seal cleanly.
+    if chain.iter().any(|p| !p.is_mutable()) {
+        return Err(RecordError::OutputTooSmall);
+    }
+
+    // Append a fresh trailer IOBuf for the encrypted type byte +
+    // AEAD tag (17 B). Heap-backed so `data_mut` returns Some
+    // for the seal pass over the inner-type byte. Tag is appended
+    // separately after the seal — it's plaintext on the wire.
+    let mut trailer = uni_iobuf::IOBuf::new_with_reserved(0, 1 + TAG_LEN, 0);
+    trailer
+        .append_slice(&[inner_type])
+        .map_err(|_| RecordError::OutputTooSmall)?;
+    chain.push_back(trailer);
+
+    // Scatter-gather seal across every chain part (incl. the
+    // single-byte trailer we just pushed). One ChaCha20 keystream
+    // pass + one Poly1305 MAC.
+    //
+    // SAFETY: pre-flight verified every part is mutable, so
+    // `data_mut()` returns `Some` for every iterator step.
+    let aad = make_aad(record_len as u16);
+    let tag = traffic_key.seal_chain(
+        &aad,
+        chain
+            .iter_mut()
+            .map(|iobuf| unsafe { iobuf.data_mut().unwrap_unchecked() }),
+    );
+
+    // Append the AEAD tag to the trailer. `append_slice` mutates
+    // the back IOBuf's visible payload but doesn't touch
+    // `total_len`; bump it manually.
+    {
+        let back = chain
+            .back_mut()
+            .expect("trailer was just pushed");
+        back.append_slice(&tag)
+            .map_err(|_| RecordError::OutputTooSmall)?;
+    }
+    chain.bump_total_len(TAG_LEN);
+
+    // Prepend the 5-byte TLS record header: opaque type
+    // (APPLICATION_DATA = 0x17 for TLS 1.3 ciphertext), legacy
+    // version 0x0303, and the 16-bit length covering
+    // `ciphertext || type || tag` = `record_len`.
+    let mut header_iobuf = uni_iobuf::IOBuf::new_with_reserved(0, HEADER_LEN, 0);
+    let mut hdr = [0u8; HEADER_LEN];
+    hdr[0] = OPAQUE_TYPE;
+    hdr[1..3].copy_from_slice(&LEGACY_RECORD_VERSION.to_be_bytes());
+    hdr[3..5].copy_from_slice(&(record_len as u16).to_be_bytes());
+    header_iobuf
+        .append_slice(&hdr)
+        .map_err(|_| RecordError::OutputTooSmall)?;
+    chain.push_front(header_iobuf);
+
+    Ok(())
+}
+
 /// Scatter-gather sibling of [`seal_in_place`]. Seals across two
 /// IOBufs: the body holds the plaintext (no tailroom needed for
 /// the inner-content-type byte + AEAD tag, but it does need
@@ -564,6 +662,88 @@ mod tests {
         assert_eq!(ty, content_type::HANDSHAKE);
         assert_eq!(parsed, body);
         assert_eq!(consumed, n);
+    }
+
+    /// `seal_chain_in_place` over a multi-part chain must produce
+    /// the same on-wire bytes as `seal` over the concatenated
+    /// plaintext. Verifies via round-trip through `open`.
+    #[test]
+    fn seal_chain_in_place_roundtrip() {
+        let secret = [0x42u8; 32];
+        let mut sender = tls::TrafficKey::from_secret(&secret);
+        let mut receiver = tls::TrafficKey::from_secret(&secret);
+
+        // Build a multi-part chain: 3 mutable Heap parts. Lengths
+        // chosen so the second part's tail straddles a 16-byte
+        // Poly1305 block boundary, exercising the per-part block
+        // carry path.
+        let mut chain = uni_iobuf::IOBufChain::new();
+        for chunk in &[&b"HTTP/1.1 200 OK\r\n"[..], &b"Content-Length: 5\r\n\r\n"[..], &b"Hello"[..]] {
+            let mut buf = uni_iobuf::IOBuf::new_with_reserved(0, chunk.len(), 0);
+            buf.append_slice(chunk).unwrap();
+            chain.push_back(buf);
+        }
+        let plaintext_total: alloc::vec::Vec<u8> = chain
+            .iter()
+            .flat_map(|p| p.data().iter().copied())
+            .collect();
+
+        seal_chain_in_place(
+            &mut sender,
+            content_type::APPLICATION_DATA,
+            &mut chain,
+        )
+        .unwrap();
+
+        // Chain layout: header IOBuf + 3 ciphertext parts + trailer.
+        // Wire bytes form one TLS record.
+        let mut wire: alloc::vec::Vec<u8> = chain
+            .iter()
+            .flat_map(|p| p.data().iter().copied())
+            .collect();
+        assert_eq!(
+            wire.len(),
+            HEADER_LEN + plaintext_total.len() + 1 + TAG_LEN,
+        );
+        // chain.total_len() must agree with the materialised wire.
+        assert_eq!(chain.total_len(), wire.len());
+
+        // Round-trip via the existing `open` over the contiguous wire.
+        let (inner_type, decrypted, consumed) =
+            open(&mut receiver, &mut wire).unwrap();
+        assert_eq!(inner_type, content_type::APPLICATION_DATA);
+        assert_eq!(decrypted, &plaintext_total[..]);
+        assert_eq!(consumed, HEADER_LEN + plaintext_total.len() + 1 + TAG_LEN);
+
+        assert_eq!(sender.seq, 1);
+        assert_eq!(receiver.seq, 1);
+    }
+
+    /// A chain containing a `Static` IOBuf must be rejected with
+    /// `OutputTooSmall` and left unmutated, so the caller can fall
+    /// back to coalesce-then-seal.
+    #[test]
+    fn seal_chain_in_place_rejects_static_part() {
+        let secret = [0u8; 32];
+        let mut sender = tls::TrafficKey::from_secret(&secret);
+
+        let mut chain = uni_iobuf::IOBufChain::new();
+        let mut head = uni_iobuf::IOBuf::new_with_reserved(0, 16, 0);
+        head.append_slice(b"head-bytes").unwrap();
+        chain.push_back(head);
+        chain.push_back(uni_iobuf::IOBuf::from(&b"static-tail"[..]));
+
+        let total_before = chain.total_len();
+        let result = seal_chain_in_place(
+            &mut sender,
+            content_type::APPLICATION_DATA,
+            &mut chain,
+        );
+        assert_eq!(result, Err(RecordError::OutputTooSmall));
+        // Chain shape preserved: same number of parts, same total
+        // length, sequence number unchanged.
+        assert_eq!(chain.total_len(), total_before);
+        assert_eq!(sender.seq, 0);
     }
 
     #[test]
