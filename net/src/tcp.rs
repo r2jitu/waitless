@@ -844,6 +844,52 @@ unsafe fn fill_tcp_frame_headers(
     );
 }
 
+/// Acquire a TX-pool slot from the driver and run `fill` over its
+/// frame region; on success submit it for transmission. Falls back
+/// to a stack-local buffer + slice-shaped `send` when the driver's
+/// direct-fill path is unavailable (Tier 2 shared queue, GVE,
+/// native, pool full).
+///
+/// `fill` writes `frame_len` bytes starting at the head of the
+/// passed `&mut [u8]` (which is at least `FRAME_BUF_LEN` bytes
+/// wide on either path). Caller is responsible for ensuring
+/// `frame_len <= FRAME_BUF_LEN`.
+#[inline]
+fn build_and_send_frame<F>(frame_len: usize, fill: F)
+where
+    F: FnOnce(&mut [u8]),
+{
+    debug_assert!(frame_len <= FRAME_BUF_LEN);
+    if let Some(mut handle) = uni_drivers::net::acquire_tx_buf() {
+        // Direct-fill path: caller writes straight into the
+        // driver's TX pool slot — no memcpy at submit time.
+        let cap = handle.data_cap as usize;
+        debug_assert!(frame_len <= cap);
+        // SAFETY: the handle's `data_mut()` returns a slice of
+        // `data_cap` writable bytes; we narrow to `frame_len`
+        // for the closure but the underlying buffer covers the
+        // full slot. The closure is responsible for initialising
+        // every byte in `frame[..frame_len]` before submit.
+        fill(&mut handle.data_mut()[..frame_len]);
+        uni_drivers::net::submit_tx(handle, frame_len);
+        return;
+    }
+    // Slow path: stack-local frame buffer + slice-shaped send
+    // (the driver memcpys into its TX pool inside `send`).
+    let mut buf = core::mem::MaybeUninit::<[u8; FRAME_BUF_LEN]>::uninit();
+    let p = buf.as_mut_ptr() as *mut u8;
+    // SAFETY: `from_raw_parts_mut` over uninit memory is fine as
+    // long as the resulting slice is fully written before any
+    // read. `fill` writes every byte in `[..frame_len]`; `send`
+    // then reads them.
+    unsafe {
+        let frame = core::slice::from_raw_parts_mut(p, frame_len);
+        fill(frame);
+        let frame_const = core::slice::from_raw_parts(p, frame_len);
+        uni_drivers::net::send(frame_const);
+    }
+}
+
 /// Build and ship a TCP segment whose payload comes from `payload`
 /// (a contiguous byte slice). Used by control-path callers (SYN,
 /// SYN-ACK, ACK-only, FIN, RST) and by tests.
@@ -867,23 +913,21 @@ fn send_segment(
     let payload_len = payload.len().min(MSS_MAX);
     let frame_len = payload_off + payload_len;
 
-    let mut buf = core::mem::MaybeUninit::<[u8; FRAME_BUF_LEN]>::uninit();
-    let p = buf.as_mut_ptr() as *mut u8;
-
-    unsafe {
-        // Copy payload into the frame's payload slot (one copy total —
-        // the legacy path made three).
+    build_and_send_frame(frame_len, |frame| unsafe {
+        // Copy payload into the frame's payload slot.
         if payload_len > 0 {
-            ptr::copy_nonoverlapping(payload.as_ptr(), p.add(payload_off), payload_len);
+            ptr::copy_nonoverlapping(
+                payload.as_ptr(),
+                frame.as_mut_ptr().add(payload_off),
+                payload_len,
+            );
         }
-        let frame = core::slice::from_raw_parts_mut(p, frame_len);
         fill_tcp_frame_headers(
             frame, local_ip, dst_ip, dst_mac,
             src_port, dst_port, seq, ack, flags, window,
             payload_len,
         );
-        uni_drivers::net::send(frame);
-    }
+    });
 }
 
 /// Build and ship a TCP segment whose payload is read from a chain
@@ -909,28 +953,27 @@ fn send_segment_from_cursor(
     let payload_len = payload_len.min(MSS_MAX);
     let frame_len = payload_off + payload_len;
 
-    let mut buf = core::mem::MaybeUninit::<[u8; FRAME_BUF_LEN]>::uninit();
-    let p = buf.as_mut_ptr() as *mut u8;
-
-    unsafe {
+    build_and_send_frame(frame_len, |frame| unsafe {
         // Walk chain bytes straight into the payload slot. This is
-        // the "one memcpy, no intermediate buffer" property the IOBuf
-        // chain design exists for — and now there are no IP/Eth-wrap
-        // memcpys downstream either.
+        // the "one memcpy, no intermediate buffer" property the
+        // IOBuf chain design exists for — and on the direct-fill
+        // path the cursor reads into the driver's TX pool slot
+        // without further memcpy.
         if payload_len > 0 {
-            let dst = core::slice::from_raw_parts_mut(p.add(payload_off), payload_len);
+            let dst = core::slice::from_raw_parts_mut(
+                frame.as_mut_ptr().add(payload_off),
+                payload_len,
+            );
             let n = cursor.read(dst);
             debug_assert_eq!(n, payload_len);
             let _ = n;
         }
-        let frame = core::slice::from_raw_parts_mut(p, frame_len);
         fill_tcp_frame_headers(
             frame, local_ip, dst_ip, dst_mac,
             src_port, dst_port, seq, ack, flags, window,
             payload_len,
         );
-        uni_drivers::net::send(frame);
-    }
+    });
 }
 
 fn send_rst(local_ip: IpAddr, dst_ip: IpAddr, src_port: u16, dst_port: u16, seq: u32, ack: u32) {
