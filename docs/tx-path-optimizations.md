@@ -24,24 +24,31 @@ browser RX* — and tracks progress as we land them.
 |---|------|------|---|---|---|
 | 1 | Handler renders body | `body_iobuf` writer | 1× memcpy (dynamic content only) | — | Static literals are zero-copy |
 | 2 | Header build | `write_response_into_iobuf` | — | ~150 B memcpy | Into per-conn `header_storage` |
-| 3 | **TLS coalesce** | `TlsStream::send` loop | **1× memcpy** | — | Chain → 16 KiB stack scratch |
-| 4 | **TLS encrypt** | `seal_chain_in_place` | 1× R/W (ChaCha20) + 1× R (Poly1305) | 5 B header alloc + 17 B trailer alloc | In-place on scratch; tag computed alongside |
-| 5 | **TCP segment build** | `send_segment_from_cursor` | **1× memcpy** | 20 B TCP header + checksum scan | Cursor → 1480 B stack buffer per MSS |
-| 6 | **IPv4 wrap** | `ipv4_send` | **1× memcpy** | 20 B IP header + checksum | Stack → 1500 B stack buf |
-| 7 | **Ethernet wrap** | `ethernet_send` | **1× memcpy** | 14 B Eth header | Stack → 1514 B stack buf |
+| 3 | **TLS coalesce** | `TlsStream::send` loop | **1× memcpy** | — | Chain → scratch (5 B head + 16 KiB plaintext + 17 B tail) |
+| 4 | TLS encrypt + envelope | `seal_in_place` | 1× R/W (ChaCha20) + 1× R (Poly1305) | — | In place; header / type / tag written into scratch's reserved head/tail (item C ✓) |
+| 5 | **TCP frame build** | `send_segment` / `send_segment_from_cursor` | **1× memcpy** | 14 + 20 + 20 B headers + 2 checksums | Cursor → one stack buffer with full [ETH][IP][TCP][PAYLOAD] (item A ✓) |
+| 6 | ~~IPv4 wrap~~ | — | — | — | Folded into step 5 (item A ✓) |
+| 7 | ~~Ethernet wrap~~ | — | — | — | Folded into step 5 (item A ✓) |
 | 8 | **virtio-net submit** | `virtio_net::send` | **1× memcpy** | descriptor add + kick | → TX pool slot, then DMA |
 | 9 | virtio host pickup | (HVF userspace_net or KVM) | depends on host | — | HVF: another memcpy to host TCP socket |
 | 10 | Host TCP/IP/Eth | host kernel | host-side | — | TSO can fold this on real NICs |
 | 11 | Wire | network stack | — | — | MTU, cwnd, RTT |
 | 12 | Browser RX | TLS decrypt + HTTP parse | symmetric to ours | — | Out of our control |
 
-Steps 3, 5, 6, 7, 8 are the **5 guest-side memcpys per byte**. Items
-A, B below collapse that to 1.
+Active per-byte memcpys on the guest side: **3** (steps 3, 5, 8) —
+down from 5 before items A and C. Item B (virtio SG) targets
+step 8 next.
 
 ## Segment 1 — Inside the unikernel (TLS encrypt → NIC TX)
 
-### A. Fold TCP/IP/Eth wrap memcpys into one IOBuf prepend
-- **Status**: [ ] not started
+### A. Fold TCP/IP/Eth wrap memcpys into one buffer
+- **Status**: [x] **landed 2026-05-08** (commits `bcf2e8d`, `e3c7e08`)
+- **Result**: -2 memcpys per byte on the TCP TX hot path.
+  Implementation built [ETH][IP][TCP][PAYLOAD] in one stack
+  buffer in `tcp.rs` using new `fill_header` helpers in
+  `ethernet.rs` / `ipv4.rs` / `ipv6.rs`, replacing the legacy
+  `send_l3 → ipv4_send → ethernet_send` chain. Slow paths (UDP,
+  ARP, ICMP) keep the layered functions.
 - **Where**: `net/src/tcp.rs::send_segment_from_cursor`,
   `net/src/ipv4.rs::ipv4_send`, `net/src/ethernet.rs::ethernet_send`,
   `drivers/src/net.rs::send`.
@@ -77,7 +84,12 @@ A, B below collapse that to 1.
 - **Lays groundwork for**: G (TSO).
 
 ### C. Bake the record envelope into the scratch (no header/trailer allocs)
-- **Status**: [ ] not started
+- **Status**: [x] **landed 2026-05-08** (commit `e6d9a28`)
+- **Result**: -2 small Heap allocs per TLS record. `flush_record`
+  now sizes the scratch as `[u8; 5 + 16384 + 17]` and routes
+  through `send_app_data_iobuf` (which calls `seal_in_place`).
+  Record header / type byte / tag all written into the scratch's
+  reserved headroom + tailroom — no Heap IOBufs allocated.
 - **Where**: `uni-tls/src/record.rs::seal_chain_in_place`,
   `uni-http/src/lib.rs::flush_record`.
 - **What**: `seal_chain_in_place` allocates 2 small Heap IOBufs
@@ -321,3 +333,13 @@ E and F are low-effort cleanups that can land any time.
   conn-accept setup (item M), 1 is chain VecDeque overflow
   (untracked — page-specific tuning), 2 are TLS seal IOBufs
   (covered by item C), H3 extras are QUIC encode Vecs (item O).
+- **2026-05-08** — Item **C landed** (`e6d9a28`): -2 allocs per
+  TLS record. Scratch now sized 16406 B and routed through
+  `send_app_data_iobuf` → `seal_in_place`. Bench unchanged
+  (alloc-side opt, doesn't move keep-alive throughput).
+- **2026-05-08** — Item **A landed** (`bcf2e8d`, `e3c7e08`):
+  -2 memcpys per byte on the TCP TX hot path. Path table updated:
+  active per-byte memcpys 5 → 3. Bench unchanged on /health
+  (small response). Wins scale with payload size — show up on
+  larger-body workloads (bench coverage gap; consider adding a
+  shell-page bench).
