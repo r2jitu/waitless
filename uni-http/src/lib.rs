@@ -803,18 +803,16 @@ impl TlsStream {
     }
 }
 
-/// Wrap `scratch[..filled]` as an External IOBuf, push it as the
-/// only data part of `chain`, run the chain-shaped seal (which
-/// adds a header + trailer IOBuf around it), and ship to TCP.
-/// Caller resets `filled = 0` after.
+/// Encrypt the plaintext sitting in `scratch[TLS_HEADROOM..
+/// TLS_HEADROOM+filled]` and ship the resulting wire-ready TLS
+/// record to TCP. `scratch` is sized to hold the full record envelope
+/// (5 B record header at the front, plaintext, 1 B inner-content-type
+/// byte + 16 B AEAD tag at the tail), so the seal runs entirely
+/// in place — no Heap IOBuf allocations for the header/trailer.
 ///
-/// Free function rather than `&mut self` method so the caller can
-/// borrow `tls` mutably and `tcp` immutably alongside the
-/// stack-local `scratch` without aliasing through `self` — Rust's
-/// borrow checker rejects the equivalent
-/// `self.flush_record(chain, &mut scratch, ...)` shape because
-/// `scratch` is conceptually-local-to-`send` but the method
-/// signature would re-borrow all of `self`.
+/// Free function (not `&mut self`) so the caller can hold `&mut
+/// scratch` (a stack-local borrow distinct from `self`) alongside
+/// `&mut tls` without re-borrowing all of `self`.
 ///
 /// SAFETY: `scratch`'s address is stable across `tcp.send.await`
 /// because the surrounding `send` future is `Pin`'d. The External
@@ -825,25 +823,49 @@ impl TlsStream {
 async fn flush_record(
     tls: &mut Box<dyn TlsConn>,
     tcp: &uni::runtime::TcpStream,
-    chain: &mut IOBufChain,
     scratch: &mut [u8],
     filled: usize,
 ) -> Result<(), ()> {
-    debug_assert!(chain.is_empty());
-    let ext = unsafe {
+    // Wrap scratch as an External IOBuf whose visible payload is the
+    // plaintext we just packed in. Headroom = TLS_HEADROOM (5 B)
+    // gives `seal_in_place` room to prepend the record header;
+    // tailroom (`scratch.len() - TLS_HEADROOM - filled`) covers the
+    // 1 B type byte + 16 B AEAD tag the seal appends.
+    let mut buf = unsafe {
         IOBuf::from_external(
             NonNull::new_unchecked(scratch.as_mut_ptr()),
             scratch.len() as u32,
-            0,
+            TLS_HEADROOM as u32,
             filled as u32,
             None,
             core::ptr::null_mut(),
         )
     };
-    chain.push_back(ext);
-    tls.send_app_data_chain(chain).map_err(|_| ())?;
-    tcp.send(chain).await
+    // Seal in place: ChaCha20-Poly1305 across the visible payload,
+    // prepend record header into headroom, append type byte + tag
+    // into tailroom. Zero allocs.
+    tls.send_app_data_iobuf(&mut buf).map_err(|_| ())?;
+    // Ship the wire-ready record. Local chain is alloc-free
+    // (IOBufChain uses 8-slot inline storage; one part fits inline).
+    let mut chain = IOBufChain::new();
+    chain.push_back(buf);
+    tcp.send(&mut chain).await
 }
+
+/// Headroom reserved in the TLS scratch for the 5 B TLS 1.3 record
+/// header that `seal_in_place` prepends.
+const TLS_HEADROOM: usize = 5;
+
+/// Tailroom reserved in the TLS scratch for the 1 B inner-content-
+/// type byte + 16 B AEAD tag that `seal_in_place` appends.
+const TLS_TAILROOM: usize = 1 + 16;
+
+/// Plaintext capacity of one TLS 1.3 record (RFC 8446 §5.1: 2^14 B).
+const PLAINTEXT_CHUNK: usize = 16384;
+
+/// Total bytes in the TLS scratch — enough to hold one full record
+/// (envelope + max plaintext).
+const TLS_SCRATCH_LEN: usize = TLS_HEADROOM + PLAINTEXT_CHUNK + TLS_TAILROOM;
 
 impl HttpStream for TlsStream {
     async fn recv(&mut self, buf: &mut [u8]) -> usize {
@@ -883,21 +905,16 @@ impl HttpStream for TlsStream {
             return Ok(());
         }
 
-        // Walk every part of the input chain and pack bytes into a
-        // stack-local TLS-record-sized scratch. As each chunk fills,
-        // run the chain-shaped seal over the scratch (encrypt in
-        // place + add header / trailer IOBufs) and ship the wire-
-        // ready record to TCP. Last chunk flushes whatever's
-        // partial.
+        // Walk every part of the input chain and pack plaintext
+        // into a stack-local TLS-record-sized scratch. As each
+        // record fills, `flush_record` seals it in place (no allocs
+        // — the scratch holds the 5 B record header in headroom and
+        // the 17 B type+tag trailer in tailroom) and ships to TCP.
         //
         // One uniform path for every chain shape and size:
-        //   * Small mutable-only chains (e.g. /stats body): pay one
-        //     plaintext memcpy into scratch — the all-mutable
-        //     encrypt-in-place fast path is gone in favour of a
-        //     single, simpler design.
-        //   * Static-bearing chains (e.g. shell pages): the same
-        //     memcpy moves Static bytes into mutable storage; chain
-        //     seal then encrypts in place inside scratch.
+        //   * Small chains: one record, one flush.
+        //   * Static-bearing chains: the memcpy moves Static bytes
+        //     into mutable scratch; seal encrypts in place after.
         //   * Oversized chains (>16 KiB): scratch fills, flushes as
         //     one record, resets, continues with the rest.
         //
@@ -906,27 +923,28 @@ impl HttpStream for TlsStream {
         // on multi-core; the address is stable across awaits
         // because the surrounding `handle_conn` future is `Pin`'d.
         //
-        // Future work: size the chunk dynamically based on
-        // transport feedback (congestion, loss) once the QUIC path
-        // needs it.
-        const PLAINTEXT_CHUNK: usize = 16384;
-        let mut scratch = [0u8; PLAINTEXT_CHUNK];
+        // Plaintext lives at `scratch[TLS_HEADROOM..]`; the leading
+        // bytes are reserved for the seal's prepended record header.
+        // Future work: size the chunk dynamically based on transport
+        // feedback (congestion, loss) once the QUIC path needs it.
+        let mut scratch = [0u8; TLS_SCRATCH_LEN];
         let mut filled = 0usize;
         while let Some(part) = chain.pop_front() {
             let mut data: &[u8] = part.data();
             while !data.is_empty() {
                 let take = (PLAINTEXT_CHUNK - filled).min(data.len());
-                scratch[filled..filled + take].copy_from_slice(&data[..take]);
+                let off = TLS_HEADROOM + filled;
+                scratch[off..off + take].copy_from_slice(&data[..take]);
                 filled += take;
                 data = &data[take..];
                 if filled == PLAINTEXT_CHUNK {
-                    flush_record(&mut self.tls, &self.tcp, chain, &mut scratch, filled).await?;
+                    flush_record(&mut self.tls, &self.tcp, &mut scratch, filled).await?;
                     filled = 0;
                 }
             }
         }
         if filled > 0 {
-            flush_record(&mut self.tls, &self.tcp, chain, &mut scratch, filled).await?;
+            flush_record(&mut self.tls, &self.tcp, &mut scratch, filled).await?;
         }
         Ok(())
     }
