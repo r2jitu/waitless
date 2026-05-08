@@ -6,11 +6,14 @@
 // packet number state, ACK tracking, the TLS handshake driver
 // (`QuicTls`), and outbound packet assembly buffers.
 //
-// Sans-io: caller (the UDP reactor in `uni-quic-server`) feeds
+// Sans-io: caller (the UDP reactor in `endpoint.rs`) feeds
 // inbound datagrams via `process_datagram`, drains outbound
-// packets via `pop_packet`. No allocation on the steady-state
-// hot path; the only `Vec` growth is the per-level CRYPTO byte
-// queue inside `QuicTls`.
+// packets via `pop_packet_owned` (returns a `DatagramBuf` —
+// either a heap Vec or a wrapper around a driver TX-pool slot
+// the encoder wrote into directly). No allocation on the
+// steady-state hot path when the driver TX pool has slots;
+// the only `Vec` growth is the per-level CRYPTO byte queue
+// inside `QuicTls`.
 //
 // Per the architectural decisions (per-core conn pool, no
 // cross-core access, one async task per conn): no Arc, no
@@ -73,7 +76,7 @@ pub enum ConnError {
     Tls,
     /// Caller-supplied output buffer too small.
     OutputTooSmall,
-    /// State doesn't permit this operation (e.g. pop_packet
+    /// State doesn't permit this operation (e.g. drain outbound
     /// before any inbound).
     BadState,
     /// Unsupported QUIC version (server should respond with
@@ -626,7 +629,8 @@ pub struct Connection {
 
     /// Outbound packet queue: complete UDP datagrams (including
     /// any header-protected, AEAD-sealed packets) ready to ship.
-    /// `pop_packet` drains the front entry.
+    /// `pop_packet_owned` drains the front entry; the reactor's
+    /// `ship_datagram` dispatches on the variant.
     ///
     /// VecDeque (not Vec) so the front-pop is O(1). Multi-packet
     /// responses queue up to MAX_FLUSH_PACKETS (~32) at a time;
@@ -634,14 +638,16 @@ pub struct Connection {
     /// pop.
     outbound: alloc::collections::VecDeque<DatagramBuf>,
 
-    /// Recycled datagram Vecs from `pop_packet_owned` /
-    /// `recycle_packet`. Each is `clear()`-ed (capacity ≈ 1500
-    /// preserved) before going back. The encode paths pull from
-    /// here first via `take_datagram_buf`, falling back to a
-    /// fresh `Vec::with_capacity(1500)` only when the pool is
-    /// empty. On a steady-state response stream the pool stays
-    /// at saturation (a handful of bufs cycling) and zero
-    /// datagram-Vec allocs hit the hot path.
+    /// Recycle pool for the **`Heap` fallback path** of
+    /// [`DatagramBuf`]. Every `Heap` Vec popped via
+    /// `pop_packet_owned` and returned via `recycle_packet` lands
+    /// here cleared (capacity ≈ 1500 preserved), and
+    /// `take_datagram_buf` pulls from it before falling back to a
+    /// fresh allocation. Bare-metal builds with a working driver
+    /// TX pool rarely touch this — `take_datagram_buf` returns
+    /// `TxSlot` first and only falls through to Heap when
+    /// `acquire_tx_buf` returns `None` (pool exhaustion, GVE,
+    /// native). On native this pool IS the hot path.
     outbound_pool: Vec<Vec<u8>>,
 
 
@@ -1077,26 +1083,6 @@ impl Connection {
             }
             crate::diag::bump(&crate::diag::COUNTERS.streams_reaped);
         }
-    }
-
-    /// Drain one ready-to-send UDP datagram into `out`. Returns
-    /// number of bytes written (0 if nothing pending).
-    pub fn pop_packet(&mut self, out: &mut [u8]) -> usize {
-        use uni_runtime::net::MAX_L2_HEADROOM;
-        let pkt = match self.outbound.pop_front() {
-            Some(p) => p,
-            None => return 0,
-        };
-        // Skip the L2/L3/L4 headroom prefix `take_datagram_buf`
-        // pre-fills — only the QUIC packet bytes go to the caller.
-        let payload_len = pkt.len().saturating_sub(MAX_L2_HEADROOM);
-        let n = out.len().min(payload_len);
-        out[..n].copy_from_slice(&pkt.vec()[MAX_L2_HEADROOM..MAX_L2_HEADROOM + n]);
-        // Recycle (Heap variants only — TxSlot's Drop releases
-        // the slot back to the driver pool automatically).
-        const POOL_MAX: usize = 16;
-        pkt.recycle_into(&mut self.outbound_pool, POOL_MAX);
-        n
     }
 
     /// Pop the next outbound datagram by ownership, no copy. The
@@ -3213,10 +3199,11 @@ mod tests {
         // 5. Drain the outbound datagram and verify both packets
         //    parse + decrypt with the *server* Initial / Handshake
         //    keys (which our connection derived).
-        let mut reply = vec![0u8; 4096];
-        let n = conn.pop_packet(&mut reply);
-        assert!(n > 0, "non-empty reply datagram");
-        let reply = &reply[..n];
+        let pkt = conn
+            .pop_packet_owned()
+            .expect("server reply datagram queued");
+        let reply = &pkt.vec()[uni_runtime::net::MAX_L2_HEADROOM..];
+        assert!(!reply.is_empty(), "non-empty reply datagram");
 
         // First packet should be Initial. Re-derive server-side
         // keys from the same client_dcid and unprotect.
