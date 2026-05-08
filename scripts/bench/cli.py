@@ -79,6 +79,7 @@ from .workloads import (
     _udp_with_retry,
     next_port,
     run_loadgen_gateway,
+    run_loadgen_h3_health,
     run_loadgen_tcp_echo,
     run_loadgen_tls_handshake,
     run_loadgen_tls_resume,
@@ -180,6 +181,22 @@ WORKLOADS = [
      "endpoint": "/health",
      "parallelism_per_core": 4,
      "desc": "TLS 1.3 resumed (PSK-DHE) handshake + GET + close (4 workers × cpus)"},
+
+    # ── HTTP/3 over QUIC ──────────────────────────────────────────────
+    #
+    # The QUIC analogue of `health_tls_max`: each worker opens its
+    # own QUIC connection (one full handshake, skipped from the
+    # histogram), then loops sequential GETs on the keep-alive
+    # connection. Hits the post-handshake hot path that item B2
+    # (encoder writes directly into the driver TX-pool slot)
+    # targets. Compare against `health_tls_max` to see the QUIC vs
+    # TLS-over-TCP per-request cost on the same /health body.
+    #
+    # 4 workers × cpus mirrors the other `_max` workloads' shape.
+    {"name": "h3_health_max", "type": "h3_health",
+     "endpoint": "/health",
+     "parallelism_per_core": 4,
+     "desc": "/health throughput over HTTP/3 (4 workers × cpus, QUIC keep-alive)"},
 
     # ── Async TCP echo (guest:9 via `uni::runtime::TcpListener`) ─────────
     #
@@ -401,6 +418,8 @@ def main():
                     wrk_port = env.GUEST_PORT
                     tls_target_port = env.GUEST_TLS_PORT
                     udp_target_port = env.GUEST_UDP_PORT
+                    h3_target_port = getattr(
+                        env, "GUEST_H3_PORT", env.GUEST_TLS_PORT)
                     tcp_echo_target_port = getattr(
                         env, "GUEST_TCP_ECHO_PORT", None)
                     gateway_target_port = getattr(
@@ -419,6 +438,9 @@ def main():
                     tls_target_port = bench_port + tls_off
                     udp_off = getattr(env, 'udp_port_offset', 1)
                     udp_target_port = bench_port + udp_off
+                    h3_off = getattr(env, 'h3_port_offset', None)
+                    h3_target_port = (
+                        bench_port + h3_off if h3_off else None)
                     tcp_echo_off = getattr(env, 'tcp_echo_offset', None)
                     tcp_echo_target_port = (
                         bench_port + tcp_echo_off if tcp_echo_off else None)
@@ -506,6 +528,32 @@ def main():
                     results[(env_name, cpus, wname)] = (rps, p50, p99)
                     client_cpu[(env_name, cpus, wname)] = m["cores"]
                     print(f"    {wname:<20s} {rps:>10.0f} hs/s   "
+                          f"p50={p50}  p99={p99}  {_cpu_tag(m['cores'])}")
+                elif w["type"] == "h3_health":
+                    # HTTP/3 keep-alive throughput. Each worker
+                    # opens its own QUIC connection (one full
+                    # handshake, skipped from the histogram), then
+                    # fires sequential GETs on the keep-alive
+                    # connection. `h3_target_port` is a UDP forward
+                    # to the unikernel's QUIC/H3 listener (guest
+                    # UDP:443) — distinct from `udp_target_port`
+                    # (which forwards UDP echo on guest UDP:7).
+                    if h3_target_port is None:
+                        # Env doesn't expose an H3 port (older env
+                        # without h3_port_offset). Skip rather than
+                        # silently mis-targeting.
+                        results[(env_name, cpus, wname)] = (0.0, "NO_H3_PORT", "NO_H3_PORT")
+                        client_cpu[(env_name, cpus, wname)] = 0.0
+                        print(f"    {wname:<20s} (env has no H3 port — skipped)")
+                        continue
+                    par = w.get("parallelism_per_core", 4) * cpus
+                    with measure_client_cpu() as m:
+                        rps, p50, p99 = run_loadgen_h3_health(
+                            h3_target_port, w["endpoint"], duration,
+                            host=wrk_host, parallelism=par)
+                    results[(env_name, cpus, wname)] = (rps, p50, p99)
+                    client_cpu[(env_name, cpus, wname)] = m["cores"]
+                    print(f"    {wname:<20s} {rps:>10.0f} req/s  "
                           f"p50={p50}  p99={p99}  {_cpu_tag(m['cores'])}")
                 elif w["type"] == "udp":
                     # Let wait_http's TCP teardown settle before firing a

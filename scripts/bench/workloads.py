@@ -414,6 +414,35 @@ def run_loadgen_tls_resume(port, endpoint, duration, host, parallelism, warmup=1
         return 0.0, "TIMEOUT", "TIMEOUT"
 
 
+def run_loadgen_h3_health(port, endpoint, duration, host, parallelism, warmup=1):
+    """Run the Rust loadgen HTTP/3 keep-alive workload. Each worker
+    opens its own QUIC connection, completes the handshake (skipped
+    from the histogram), then fires sequential GETs on the keep-
+    alive connection. Mirrors `health_tls_max`'s shape; isolates the
+    QUIC TX hot path that item B2 optimised.
+
+    No Python fallback: the standard library has no HTTP/3 client,
+    and brew's curl on macOS isn't built with quiche/ngtcp2 — without
+    `cargo` we report NO_LOADGEN rather than silently skipping."""
+    bin_path = _loadgen_bin()
+    if bin_path is None:
+        return 0.0, "NO_LOADGEN", "NO_LOADGEN"
+    try:
+        r = subprocess.run(
+            [bin_path, "h3-health",
+             "--host", host, "--port", str(port),
+             "--endpoint", endpoint,
+             "--duration-secs", str(duration),
+             "--warmup-secs", str(warmup),
+             "--parallelism", str(parallelism)],
+            capture_output=True, text=True, timeout=duration + warmup + 30)
+        if r.returncode != 0:
+            return 0.0, "ERROR", "ERROR"
+        return _parse_loadgen_output(r.stdout)
+    except (subprocess.TimeoutExpired, OSError):
+        return 0.0, "TIMEOUT", "TIMEOUT"
+
+
 def run_loadgen_tcp_echo(port, conns, duration, host="127.0.0.1", msg_size=64):
     """Run the Rust loadgen TCP-echo workload. Returns the same
     `(rps, p50, p99)` shape as `run_tcp_echo`."""

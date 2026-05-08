@@ -94,6 +94,8 @@ class KvmEnv:
     GUEST_PORT = 80
     GUEST_TLS_PORT = 443
     GUEST_UDP_PORT = 7
+    GUEST_H3_PORT = 443     # H3/QUIC over UDP (same port number as
+                            # TLS-over-TCP; the unikernel binds both).
     GUEST_TCP_ECHO_PORT = 9
     GUEST_GATEWAY_PORT = 9000
 
@@ -263,6 +265,11 @@ class NativeEnv:
     udp_port_offset = 1      # host UDP port = guest HTTP port + 1
     tcp_echo_offset = 2      # async TCP echo port (guest:9)
     gateway_offset = 3       # async gateway port (guest:9000)
+    h3_port_offset = 1500    # host UDP port for the H3/QUIC listener
+                             # (guest UDP:443). Picked above
+                             # `tls_port_offset` so the human-readable
+                             # mapping (`bench_port + 1500` ↔ H3) is
+                             # easy to spot when reading log output.
 
     # Path to pre-staged native binary; set via --native-bin. If None, bazel build runs.
     bin_override = None
@@ -288,6 +295,8 @@ class NativeEnv:
         env["UNIKERNEL_TCP_80"] = str(port)
         env["UNIKERNEL_TCP_443"] = str(port + self.tls_port_offset)
         env["UNIKERNEL_UDP_7"] = str(port + 1)
+        # H3/QUIC listener (guest UDP:443).
+        env["UNIKERNEL_UDP_443"] = str(port + NativeEnv.h3_port_offset)
         # Async TCP echo benches target guest port 9 via the
         # `tcp_echo_offset` offset below.
         env["UNIKERNEL_TCP_9"] = str(port + NativeEnv.tcp_echo_offset)
@@ -312,6 +321,10 @@ class HvfEnv:
     tls_port_offset = 1000   # host TLS port = guest HTTP port + 1000
     tcp_echo_offset = 2000   # host TCP echo port (guest:9)
     gateway_offset = 3000    # host gateway port (guest:9000)
+    h3_port_offset = 11000   # host UDP port for the H3/QUIC listener
+                             # (guest UDP:443). Disjoint from
+                             # `udp_port_offset` (which forwards the
+                             # echo listener at guest UDP:7).
 
     def build(self):
         # `:webserver_hvf` bundles both the transitioned aarch64
@@ -335,10 +348,12 @@ class HvfEnv:
         tls_port = port + self.tls_port_offset
         tcp_echo_port = port + self.tcp_echo_offset
         gateway_port = port + self.gateway_offset
+        h3_port = port + self.h3_port_offset
         # -p tcp:HOST:GUEST forwards HTTP to guest:80; -p tcp:HOST:443
         # forwards HTTPS to guest:443; -p tcp:HOST:9 forwards the
         # async TCP echo test; -p tcp:HOST:9000 forwards the
-        # gateway listener; -p udp:HOST:GUEST forwards UDP echo.
+        # gateway listener; -p udp:HOST:7 forwards UDP echo;
+        # -p udp:HOST:443 forwards the H3/QUIC listener.
         # 512 MB so the gateway_max workload's thousand-conn shape
         # — each ephemeral UDP binding allocates an inbox on the
         # kernel heap — fits with comfortable headroom. Smaller
@@ -351,7 +366,8 @@ class HvfEnv:
              "-p", f"tcp:{tls_port}:443",
              "-p", f"tcp:{tcp_echo_port}:9",
              "-p", f"tcp:{gateway_port}:9000",
-             "-p", f"udp:{udp_port}:7"],
+             "-p", f"udp:{udp_port}:7",
+             "-p", f"udp:{h3_port}:443"],
             stdin=subprocess.DEVNULL, stdout=log, stderr=log)
 
     def wait_proxy_ready(self, port, proc, timeout=30):
@@ -392,6 +408,7 @@ class RemoteEnv:
     GUEST_PORT = 80
     GUEST_TLS_PORT = 443
     GUEST_UDP_PORT = 7
+    GUEST_H3_PORT = 443
     GUEST_TCP_ECHO_PORT = 9
     GUEST_GATEWAY_PORT = 9000
 

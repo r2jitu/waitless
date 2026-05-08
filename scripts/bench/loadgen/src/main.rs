@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use clap::{Parser, Subcommand};
 
 mod gateway;
+mod h3_health;
 mod tcp_echo;
 mod tls_handshake;
 mod tls_resume;
@@ -88,6 +89,28 @@ enum Workload {
         #[arg(long, default_value = "64")]
         msg_size: usize,
     },
+    /// HTTP/3 keep-alive throughput. Each worker opens its own
+    /// QUIC connection to the unikernel's H3 server, completes
+    /// the handshake (skipped from the histogram), then fires
+    /// sequential GET requests on the keep-alive connection.
+    /// QUIC analogue of `health_tls_max` — measures the post-
+    /// handshake AEAD + packet-encode + UDP-emit hot path that
+    /// item B2 (encoder writes directly into the driver TX-pool
+    /// slot) targets.
+    H3Health {
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        port: u16,
+        #[arg(long, default_value = "/health")]
+        endpoint: String,
+        #[arg(long, default_value = "5")]
+        duration_secs: u64,
+        #[arg(long, default_value = "1")]
+        warmup_secs: u64,
+        #[arg(long, default_value = "4")]
+        parallelism: usize,
+    },
     /// API-gateway / sidecar ping-pong: drives the unikernel's
     /// `GATEWAY_PORT` listener, which on each request forwards a
     /// payload to a UDP backend, awaits the reply, and returns it.
@@ -150,6 +173,16 @@ fn main() -> std::io::Result<()> {
         Workload::TlsResume {
             host, port, endpoint, duration_secs, warmup_secs, parallelism,
         } => runtime.block_on(tls_resume::run(
+            &host,
+            port,
+            &endpoint,
+            Duration::from_secs(duration_secs),
+            Duration::from_secs(warmup_secs),
+            parallelism,
+        )),
+        Workload::H3Health {
+            host, port, endpoint, duration_secs, warmup_secs, parallelism,
+        } => runtime.block_on(h3_health::run(
             &host,
             port,
             &endpoint,

@@ -17,6 +17,12 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "tls1
 rustls-pki-types = "1"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 hdrhistogram = "7"
+# HTTP/3 client deps for the `h3-health` workload (benches the QUIC
+# TX hot path the unikernel optimises in item B2).
+quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "runtime-tokio", "log"] }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+http = "1"
 
 # Single-purpose tool: small + fast, abort on panic.
 [profile.release]
