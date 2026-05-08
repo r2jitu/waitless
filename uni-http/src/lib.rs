@@ -326,6 +326,44 @@ pub trait TlsConn: Send + 'static {
         self.send_app_data_iobuf(body)
     }
 
+    /// Whole-chain in-place seal. Takes an `IOBufChain` of plaintext
+    /// parts (every part must be mutable — Heap or External, not
+    /// Static), prepends a fresh TLS record header IOBuf, appends a
+    /// fresh trailer IOBuf for the encrypted inner-content-type byte
+    /// + AEAD tag, runs the scatter-gather AEAD across every part in
+    /// place, and leaves the chain as a ready-to-ship TLS record:
+    ///
+    ///   `[record_header, ct_part_0, ..., ct_part_n, trailer]`
+    ///
+    /// Single-record only — caller chunks oversized chains. Returns
+    /// `Err(())` if any chain part is a Static borrow (caller should
+    /// fall back to coalesce-then-seal) or if the cipher state isn't
+    /// `Established`.
+    ///
+    /// Default impl falls back to `send_app_data_iobuf` over a
+    /// coalesced buffer; concrete impls override to drive the
+    /// chain-shaped seal primitive directly.
+    fn send_app_data_chain(
+        &mut self,
+        chain: &mut uni_iobuf::IOBufChain,
+    ) -> Result<(), ()> {
+        // Generic fallback for trait-completeness: coalesce every
+        // part into a stack scratch and call `send_app_data`. The
+        // concrete `uni-tls` impl overrides this and never falls
+        // through.
+        let total = chain.total_len();
+        let mut scratch = [0u8; 16384];
+        if total > scratch.len() {
+            return Err(());
+        }
+        let mut off = 0;
+        for part in chain.iter() {
+            scratch[off..off + part.len()].copy_from_slice(part.data());
+            off += part.len();
+        }
+        self.send_app_data(&scratch[..total])
+    }
+
     /// What the TLS layer wants reserved at the front of every
     /// IOBuf the layer above hands to a future
     /// `send_app_data_iobuf` (encrypt-in-place) entry point.
@@ -794,89 +832,59 @@ impl HttpStream for TlsStream {
     }
 
     async fn send(&mut self, chain: &mut IOBufChain) -> Result<(), ()> {
-        // TLS 1.3 record envelope: 5-B header + 1-B inner content
-        // type + 16-B AEAD tag = 22 B fixed overhead. Plaintext
-        // chunks ≤ 3 KiB so headers + ciphertext fit in the legacy
-        // 4-KiB `tls.tx_buf` even when the producer didn't
-        // pre-reserve in the IOBuf.
-        const TLS_HEADROOM: usize = 5;
-        const TLS_TAILROOM: usize = 17;
-        const PLAINTEXT_CHUNK: usize = 3 * 1024;
+        // Drain any TLS bytes queued before this send (handshake
+        // straggler, NewSessionTicket, prior alert) so the wire
+        // byte order is what the peer expects.
+        self.drain_tx().await?;
 
         if chain.is_empty() {
-            // Drain any pre-queued TLS bytes (NewSessionTicket etc.)
-            // — same effect as the old `send_iobuf` empty-buf path.
-            return self.drain_tx().await;
+            return Ok(());
         }
 
-        // Small-response fast path: total chain payload fits in a
-        // single TLS record. Coalesce every part into a stack
-        // scratch buffer and seal once, so the wire sees one
-        // record + one TCP segment for typical
-        // `[response-header, body]` shapes (e.g. /health, JSON
-        // endpoints). The encrypt-in-place per-part path below
-        // would emit one record PER part — fine for multi-KiB
-        // bodies where the in-place memcpy savings dominate, but
-        // a 2× regression on tiny replies that fit in one record.
+        // TLS 1.3 RFC 8446 §5.1 caps inner plaintext at 2^14 B
+        // per record. Above that we have to split into multiple
+        // records.
+        const PLAINTEXT_CHUNK: usize = 16384;
+
         if chain.total_len() <= PLAINTEXT_CHUNK {
+            // Single-record path. Try the chain-shaped seal first:
+            // every mutable (Heap / External) part gets encrypted
+            // in place where the producer left it — zero
+            // plaintext-side memcpy. The TLS layer prepends a
+            // header IOBuf + appends a trailer IOBuf to the chain,
+            // and the whole thing is wire-ready.
+            if self.tls.send_app_data_chain(chain).is_ok() {
+                self.tcp.send(chain).await?;
+                return Ok(());
+            }
+            // Fallback for Static-bearing chains: coalesce every
+            // part into a stack scratch and seal via the legacy
+            // `send_app_data` path. The TLS layer drains its
+            // tx_buf into TCP after.
+            let total = chain.total_len();
             let mut scratch = [0u8; PLAINTEXT_CHUNK];
             let mut filled = 0usize;
             for part in chain.iter() {
-                let data = part.data();
-                scratch[filled..filled + data.len()].copy_from_slice(data);
-                filled += data.len();
+                scratch[filled..filled + part.len()].copy_from_slice(part.data());
+                filled += part.len();
             }
+            debug_assert_eq!(filled, total);
             self.tls.send_app_data(&scratch[..filled])?;
             self.drain_tx().await?;
             chain.clear();
             return Ok(());
         }
 
-        // Streamed-response path: total chain payload spans
-        // multiple TLS records. Encrypt each part in-place when
-        // it has 5 B of headroom for the record header (saves the
-        // plaintext memcpy through `tls.tx_buf` for big bodies);
-        // fall back to the slice path for static-borrow chunks
-        // and oversize parts that need splitting.
-        //
-        // We use the scatter-gather seal — body needs only
-        // headroom (no tailroom), and a small dedicated trailer
-        // IOBuf carries the encrypted inner-type byte + AEAD tag.
-        // App-side body IOBufs therefore don't have to leave
-        // 17 B of tailroom for transport framing.
-        let _ = TLS_TAILROOM; // referenced from doc only.
-        while let Some(mut part) = chain.pop_front() {
+        // Oversize chain: spans more than one TLS record. Walk
+        // each part, chunking by part if needed, copy through
+        // send_app_data + drain. (Chain-shaped seal across
+        // multiple records — splitting a chain at a byte offset
+        // — is future work; this path is the rare case for HTTPS
+        // responses > 16 KiB.)
+        while let Some(part) = chain.pop_front() {
             if part.is_empty() {
                 continue;
             }
-            let has_reserve = part.headroom() >= TLS_HEADROOM
-                && part.len() <= PLAINTEXT_CHUNK;
-            if has_reserve {
-                // Allocate a small trailer IOBuf for the encrypted
-                // type byte + AEAD tag. 17 B visible payload max,
-                // plus 0 headroom (it lives after `part` on the
-                // wire). Sized exactly so `seal_in_place_split`
-                // succeeds the tailroom check.
-                let mut trailer = IOBuf::new_with_reserved(0, 1 + 16, 0);
-                self.tls.send_app_data_iobuf_split(&mut part, &mut trailer)?;
-                // Drain anything queued before this record (a
-                // handshake straggler, e.g. NewSessionTicket) so
-                // the byte order on the wire matches what the
-                // peer expects.
-                self.drain_tx().await?;
-                // Ship body + trailer as adjacent parts so they
-                // become one logical TLS record on the wire.
-                let mut record_chain = IOBufChain::new();
-                record_chain.push_back(part);
-                record_chain.push_back(trailer);
-                self.tcp.send(&mut record_chain).await?;
-                continue;
-            }
-            // Fallback: copy through the legacy slice path. This
-            // covers static-borrow parts (zero headroom), parts
-            // bigger than `PLAINTEXT_CHUNK` (need splitting into
-            // multiple records), and any part the producer
-            // allocated without reserves.
             let data = part.data();
             let mut offset = 0;
             while offset < data.len() {
