@@ -873,6 +873,17 @@ async fn conn_task<H, F>(
             break;
         }
     }
+    // Mark the conn terminated BEFORE the final wake. The user
+    // handler observes `state() == Failed` to break out of its
+    // `accept_stream` / `recv` loops and let its captured
+    // `Rc<RefCell<Connection>>` drop. Without this, an idle-timeout
+    // or batch-limit teardown leaves the handler stranded on
+    // `progress.wait()` forever — the Rc count never reaches 0, the
+    // Connection (with its recv/send pools, outbound recycle Vec,
+    // stream BTreeMaps, and the reaped-streams ring) leaks until
+    // process exit, and the `HEAP_LEAK_CHECK` line at shutdown
+    // reports per-stranded-conn growth.
+    conn.borrow_mut().mark_terminated();
     progress.set();
     // Conn task exiting — explicitly return the slot to the pool's
     // free list and decrement its per-IP counter. The slot table's

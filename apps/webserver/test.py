@@ -455,9 +455,10 @@ class WebserverShutdownTest(unittest.TestCase):
     funnel into the same 0x03 → PSCI/ACPI shutdown path in the guest.
     """
 
-    def _run_shutdown_scenario(self, *, port_offset: int, hammer: bool):
-        """Boot, optionally hammer HTTP, send ^C, wait for VM exit. Returns
-        the captured serial buffer for further assertions."""
+    def _run_shutdown_scenario(self, *, port_offset: int, hammer: bool,
+                                h3_hammer: bool = False):
+        """Boot, optionally hammer HTTP and/or HTTP/3, send ^C, wait for VM
+        exit. Returns the captured serial buffer for further assertions."""
         port = PORT + port_offset
         tls_port = TLS_PORT + port_offset
         udp_port = UDP_PORT + port_offset
@@ -485,7 +486,31 @@ class WebserverShutdownTest(unittest.TestCase):
                 workers = [threading.Thread(target=_hammer, daemon=True) for _ in range(3)]
                 for w in workers:
                     w.start()
-            time.sleep(2)
+            if h3_hammer:
+                # H3 hammer: each iteration opens a fresh QUIC conn,
+                # sends one GET, awaits the response, closes. Exercises
+                # the handshake → request → reap path (which item B2
+                # and the recent stream-retransmit fix touch). 8 parallel
+                # workers and a 5-second window run hundreds of conns
+                # through the reaper, so any per-conn alloc that
+                # doesn't drop on conn teardown shows up as a clear
+                # multi-alloc leak in the post-shutdown delta.
+                def _h3_hammer() -> None:
+                    while not stop_hammer[0]:
+                        try:
+                            h3_get("/health", port=tls_port, timeout=2.0)
+                        except Exception:
+                            pass
+                workers_h3 = [
+                    threading.Thread(target=_h3_hammer, daemon=True)
+                    for _ in range(8)
+                ]
+                for w in workers_h3:
+                    w.start()
+            # Longer dwell when h3-hammering so the test exercises
+            # enough conns to surface a per-conn leak signal above
+            # noise. Plain HTTP hammer keeps the original 2 s.
+            time.sleep(5 if h3_hammer else 2)
 
             t0 = time.monotonic()
             pty_launcher.write(b"\x03")
@@ -518,6 +543,68 @@ class WebserverShutdownTest(unittest.TestCase):
             b"HEAP_LEAK_CHECK LEAK", leak_line,
             "active-traffic shutdown leaked memory — "
             "drain_all_arenas didn't reclaim in-flight task storage",
+        )
+
+    def test_ctrlc_h3_hammer_no_per_conn_leak(self) -> None:
+        """Active-traffic ^C with HTTP/3 hammer doesn't leak per-conn
+        state. The QUIC reactor's per-conn `Connection` (with its
+        recv/send pools, outbound-Vec recycle pool, stream BTreeMaps,
+        and reaped-streams ring) must drop cleanly when
+        `drain_all_arenas` reclaims both the conn task and the user
+        handler.
+
+        Originally caught by the user as `delta=+12251B,+10allocs`
+        after a real H3 bench. Root cause: conn-task `break` paths
+        (idle timeout, batch-limit reached, …) didn't transition the
+        Connection to `Failed`, so the user handler's `accept_stream`
+        kept waiting on `progress.wait()` forever and its
+        `Rc<Connection>` never dropped. Fixed by `mark_terminated`
+        before the final `progress.set()` in `conn_task`.
+
+        The threshold below allows a small amount of background
+        Vec-capacity growth (existing pre-set_ready Vecs reallocing
+        during traffic — sub-kilobyte total, no new allocs) but
+        catches per-conn leaks (kilobytes per conn, multiple
+        allocations).
+
+        Skips if `aioquic` isn't importable."""
+        try:
+            import aioquic  # noqa: F401
+        except ImportError:
+            self.skipTest("aioquic not installed")
+        import re
+        buf = self._run_shutdown_scenario(
+            port_offset=300, hammer=False, h3_hammer=True,
+        )
+        leak_line = next(
+            (line for line in buf.splitlines() if b"HEAP_LEAK_CHECK" in line),
+            None,
+        )
+        self.assertIsNotNone(
+            leak_line, "no HEAP_LEAK_CHECK line in serial log",
+        )
+        print(f"    {leak_line.decode(errors='replace')}", flush=True)
+        # `ok` lines have no `delta=…` — no leak, pass.
+        m = re.search(rb"delta=\+(\d+)B,\+(\d+)allocs", leak_line)
+        if m is None:
+            return
+        bytes_leaked = int(m.group(1))
+        allocs_leaked = int(m.group(2))
+        # Per-conn leak fingerprint: multiple allocations totalling
+        # kilobytes (the user's report was +10 allocs / +12251 bytes).
+        # The +0 / +sub-1KB shape is a separate Vec-growth issue
+        # tracked as a follow-up; allow it through here.
+        self.assertLessEqual(
+            allocs_leaked, 4,
+            f"H3-hammer leaked {allocs_leaked} new allocations "
+            f"({bytes_leaked} bytes) — per-conn cleanup regression "
+            f"({leak_line.decode(errors='replace')})",
+        )
+        self.assertLessEqual(
+            bytes_leaked, 1024,
+            f"H3-hammer leaked {bytes_leaked} bytes — beyond the "
+            f"~hundreds-of-bytes Vec-growth tolerance "
+            f"({leak_line.decode(errors='replace')})",
         )
 
     def test_clean_shutdown_no_leak(self) -> None:

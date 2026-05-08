@@ -834,6 +834,20 @@ impl Connection {
         self.state
     }
 
+    /// Mark the connection terminated. Called from the conn-task
+    /// teardown path after a non-error exit (idle timeout, batch
+    /// limit reached, …) so that the user handler — which observes
+    /// `state() == Failed` to know it can stop awaiting stream
+    /// primitives — exits its accept/recv loops and drops its
+    /// `Rc<RefCell<Connection>>`. Without this, the handler stays
+    /// pinned on `progress.wait()` forever, the Rc never reaches 0,
+    /// and the entire `Connection` (with its recv/send pools,
+    /// outbound recycle pool, stream BTreeMaps, and reaped-streams
+    /// ring) leaks for the rest of process lifetime.
+    pub fn mark_terminated(&mut self) {
+        self.state = ConnState::Failed;
+    }
+
     pub fn local_cid(&self) -> &ConnectionId {
         &self.local_cid
     }
