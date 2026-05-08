@@ -613,6 +613,18 @@ impl IOBuf {
         matches!(self.inner, Inner::Static { .. })
     }
 
+    /// True if `data_mut()` would return `Some` — i.e. this is a
+    /// `Heap` or `External` variant. Used by encrypt-in-place
+    /// paths (e.g. TLS scatter-gather seal) to pre-flight a
+    /// chain before mutating any part: if any IOBuf isn't
+    /// mutable the caller falls back to coalesce-then-seal.
+    pub fn is_mutable(&self) -> bool {
+        match self.inner {
+            Inner::Heap { .. } | Inner::External(_) => true,
+            Inner::Static { .. } => false,
+        }
+    }
+
     /// If this IOBuf is a static borrow, return the underlying
     /// `&'static [u8]`. Returns `None` for heap-owned and
     /// external variants. Lets the H3 / TLS / TCP send paths
@@ -975,6 +987,20 @@ impl IOBufChain {
             .chain(self.overflow.iter())
     }
 
+    /// Mutable iterate front-to-back. Lets the caller mutate
+    /// individual parts (e.g. encrypt-in-place via
+    /// `IOBuf::data_mut()` per part) without consuming the
+    /// chain.
+    #[inline]
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut IOBuf> {
+        // SAFETY: same invariant as `iter` — `inline[0..inline_count]`
+        // is always `Some`.
+        self.inline[..self.inline_count as usize]
+            .iter_mut()
+            .map(|s| unsafe { s.as_mut().unwrap_unchecked() })
+            .chain(self.overflow.iter_mut())
+    }
+
     /// Pop the front part. Returns `None` when the chain is
     /// empty. Shifts inline left by one and (when overflow is
     /// non-empty) promotes the first overflow element into the
@@ -1012,12 +1038,60 @@ impl IOBufChain {
         self.inline[0].as_mut()
     }
 
+    /// Mutable access to the back part. Used by sealing paths
+    /// that append (e.g. an AEAD tag) onto the last IOBuf after
+    /// the encryption pass. Caller must `total_len += n` after
+    /// growing the back part's visible payload.
+    pub fn back_mut(&mut self) -> Option<&mut IOBuf> {
+        if let Some(last) = self.overflow.back_mut() {
+            return Some(last);
+        }
+        if self.inline_count == 0 {
+            return None;
+        }
+        // SAFETY: `inline_count > 0` and `inline[..inline_count]` is
+        // always `Some`.
+        Some(unsafe {
+            self.inline[self.inline_count as usize - 1]
+                .as_mut()
+                .unwrap_unchecked()
+        })
+    }
+
+    /// Pop the back part. Mirror of `pop_front`. Used by paths
+    /// that speculatively appended a part and need to rewind the
+    /// chain on a subsequent error.
+    pub fn pop_back(&mut self) -> Option<IOBuf> {
+        if let Some(buf) = self.overflow.pop_back() {
+            self.total_len = self.total_len.saturating_sub(buf.len());
+            return Some(buf);
+        }
+        if self.inline_count == 0 {
+            return None;
+        }
+        let idx = self.inline_count as usize - 1;
+        let buf = self.inline[idx].take().unwrap();
+        self.inline_count -= 1;
+        self.total_len = self.total_len.saturating_sub(buf.len());
+        Some(buf)
+    }
+
     /// Decrease the cached `total_len` by `n`. Pair with a
     /// `front_mut().consume(n)` (or equivalent) when the caller
     /// shrunk a buf's visible payload without going through
     /// `pop_front`.
     pub fn shrink_total_len(&mut self, n: usize) {
         self.total_len = self.total_len.saturating_sub(n);
+    }
+
+    /// Increase the cached `total_len` by `n`. Pair with a
+    /// `back_mut().append_slice(...)` (or equivalent) that grew
+    /// a buf's visible payload without going through
+    /// `push_back` / `push_front`. Used by the TLS seal-chain
+    /// path to record the AEAD tag bytes appended to the
+    /// trailer IOBuf after the encryption pass.
+    pub fn bump_total_len(&mut self, n: usize) {
+        self.total_len += n;
     }
 
     /// Drop every part still in the chain, leaving an empty
