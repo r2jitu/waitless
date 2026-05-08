@@ -46,25 +46,20 @@ step 8 next.
 |---|------|------|---|---|---|
 | 1 | Handler renders body | `body_iobuf` writer | 1× memcpy (dynamic content only) | — | Same as TCP path |
 | 2 | H3 frame encode | `uni-http3/src/*` | — | small `Vec::with_capacity` per frame | HEADERS / DATA / etc. |
-| 3 | **QUIC packet encode** | `encode_one_rtt_packet` etc. (`uni-quic/src/conn.rs:2018+`) | **1× memcpy** | `Vec::with_capacity(1024)` for frames + `take_datagram_buf` (1500 B, pooled) | Frame staging Vec, then write into outer datagram Vec |
+| 3 | **QUIC packet encode** | `encode_one_rtt_packet` etc. (`uni-quic/src/conn.rs:2018+`) | **1× memcpy** | `Vec::with_capacity(1024)` for frames + `take_datagram_buf` (~1500 B, pooled with 62 B L2/L3/L4 headroom prefix after item Q) | Frame headers + STREAM data written into the datagram Vec; for 1-RTT packets writes directly (no temp staging Vec); Initial/Handshake still stage via temp `frames` Vec |
 | 4 | QUIC AEAD seal | within `seal_packet` | 1× R/W (ChaCha20) + 1× R (Poly1305) | — | In place over the assembled packet bytes |
-| 5 | `pop_packet_owned` | `uni-quic/src/endpoint.rs` | — (move) | — | Already optimized — Vec ownership transferred, no slice memcpy |
-| 6 | **UDP wrap** | `net/src/udp.rs::send_to_addr` | **1× memcpy** | 8 B UDP header + checksum | Stack buf [UDP][PAYLOAD] |
-| 7 | **IPv4 wrap** | `ipv4_send` | **1× memcpy** | 20 B IP header + checksum | Stack buf [IP][UDP][PAYLOAD] |
-| 8 | **Ethernet wrap** | `ethernet_send` | **1× memcpy** | 14 B Eth header | Stack buf [ETH][IP][UDP][PAYLOAD] |
+| 5 | `pop_packet_owned` | `uni-quic/src/endpoint.rs` | — (move) | — | Vec ownership transferred to the reactor |
+| 6 | ~~UDP wrap~~ | — (item Q ✓) | — | — | Folded into step 3 — encoder writes packet bytes directly into the framing buffer's UDP-payload region; bare-metal `send_with_l2_headroom` fills UDP/IP/Eth headers in the pre-reserved headroom |
+| 7 | ~~IPv4 wrap~~ | — | — | — | Folded into step 6 (item P ✓ and Q ✓) |
+| 8 | ~~Ethernet wrap~~ | — | — | — | Folded into step 6 (item P ✓ and Q ✓) |
 | 9 | **virtio-net submit** | `virtio_net::send` | **1× memcpy** | descriptor + kick | → TX pool slot |
 | 10+ | Host pickup, host kernel, wire, browser | — | — | — | Same as TCP from this point on |
 
-Active per-byte memcpys on the guest side: **5** (steps 3, 6, 7, 8, 9).
-Items P (mirror of A, but for UDP), Q (encode QUIC packets directly
-into the L2/L3/L4 framing buffer), and B (virtio SG) collapse this
-to **1**.
-
-The QUIC path is also where the **8 H3-extra allocs** measured in
-the alloc inventory live (per-frame `Vec::with_capacity`, per-packet
-datagram buffer, stream-state BTreeMap entries). Item Q removes
-most of those by composing in place; item O (`outbound_pool`-style
-recycling for what's left) closes the rest.
+Active per-byte memcpys on the guest side: **2** (steps 3, 9) —
+down from 5 before items A, P, and Q. Same as TCP after A. Item B
+(virtio SG TX descriptors) targets step 9, dropping both paths to
+**1 memcpy per byte** — the fundamental encoder write that can't
+be removed without offloading AEAD to the NIC.
 
 ## Segment 1 — Inside the unikernel (TLS encrypt → NIC TX)
 
@@ -195,7 +190,13 @@ recycling for what's left) closes the rest.
 - **Risk**: low.
 
 ### P. Apply A's `fill_header` pattern to UDP TX
-- **Status**: [ ] not started
+- **Status**: [x] **landed 2026-05-08** (commit `1494f06`)
+- **Result**: -2 memcpys per byte for any UDP traffic (incl.
+  QUIC). `udp::send_to_addr` now builds [ETH][IP][UDP][payload]
+  in one stack buffer using the `fill_header` helpers (added by
+  A) and ships straight to the driver — no per-layer wrap
+  memcpys. UDP bench numbers unchanged on small packets;
+  per-byte savings scale with payload size.
 - **Where**: `net/src/udp.rs::send_to_addr`. The current
   implementation builds [UDP][PAYLOAD] in a 1480 B stack buf,
   calls `ipv4_send` (which builds [IP][UDP][PAYLOAD] in a 1500 B
@@ -219,7 +220,17 @@ recycling for what's left) closes the rest.
   short replies, DHCP, etc.) keep the layered API.
 
 ### Q. Encode QUIC packets directly into the TX framing buffer
-- **Status**: [ ] not started
+- **Status**: [x] **landed 2026-05-08** (commits `2224cd7`, `46ab22e`)
+- **Result**: -1 memcpy per byte on the QUIC TX hot path. The
+  QUIC conn's `take_datagram_buf` now pre-reserves 62 B at the
+  front of every outbound Vec; the encoder writes packet bytes
+  starting at offset 62. The reactor calls a new
+  `UdpSocket::send_to_with_l2_headroom`, which on bare-metal
+  fills L2/L3/L4 headers in the pre-reserved space and ships
+  straight to the driver — bypassing
+  `udp::send_to_addr → ipv4_send → ethernet_send`.
+  QUIC TX guest-side memcpys now match TCP at 2 per byte
+  (encode + driver-pool); item B drops both to 1.
 - **Where**: `uni-quic/src/conn.rs::encode_*_packet` family,
   the boundary between `pop_packet_owned` and
   `UdpSocket::send_to`, and the QUIC reactor's send loop in
@@ -423,13 +434,9 @@ items until they unlock something concrete.
 
 1. ✓ **A + C** — TCP TX wrap memcpys + TLS seal envelope. Done.
 2. ✓ **P** — UDP TX wrap fold (mirror of A). Done.
-3. **Q** (QUIC packets into framing buffer) — structural QUIC
-   payoff. Removes the QUIC-encode-into-Vec hop and several
-   per-packet `Vec::with_capacity` allocs. Drops QUIC guest-side
-   memcpys **3 → 2** (one fundamental pass remains). Can land
-   with a stack-local framing buffer first; B upgrades it later.
+3. ✓ **Q** — QUIC packets into framing buffer. Done.
 4. **B** (virtio SG TX descriptors) — drops the last guest-side
-   memcpy on **both** paths (3 → 2 for TCP, 2 → 1 for QUIC) and
+   memcpy on **both** paths (2 → 1 for TCP and QUIC) and
    replaces the `send_on_qp` busy-spin with parking-async. Lays
    the foundation for G.
 5. **G** (TSO) — biggest single Tier 1 win once we benchmark on
@@ -438,9 +445,10 @@ items until they unlock something concrete.
    biggest *alloc-count* win whenever conn churn matters. Land
    any time after we have a conn-churn workload to bench against
    — local keep-alive bench won't show it.
-7. **N + O** — close out the alloc tail once M is in. (O may be
-   subsumed by Q if Q removes the per-frame Vecs entirely;
-   re-evaluate after Q.)
+7. **N + O** — close out the alloc tail once M is in. (O is
+   partly mitigated by Q's headroom-prefix approach but the
+   per-frame staging Vecs in `encode_initial_packet` /
+   `encode_handshake_packet` remain — re-evaluate scope.)
 8. **J** (compression) + **K** (0-RTT) + **L** (Early Hints) when
    we shift focus from local benchmarks to Internet-facing serving.
 
@@ -507,3 +515,11 @@ E and F are low-effort cleanups that can land any time.
   * Recommended sequence updated: P → D → Q → B → G → M → N+O →
     J/K/L. End state after step 6 is 1 memcpy per byte on both
     TCP and QUIC TX paths.
+- **2026-05-08** — Item **Q landed** (`2224cd7`, `46ab22e`):
+  -1 memcpy per byte on the QUIC TX hot path. `take_datagram_buf`
+  now pre-reserves 62 B at the front of each outbound Vec;
+  encoder writes packet bytes at offset 62; the reactor calls a
+  new `UdpSocket::send_to_with_l2_headroom` that fills L2/L3/L4
+  headers in the headroom in place. QUIC TX memcpys now at 2
+  per byte (encode + driver-TX-pool), matching TCP. End state
+  after item B is 1 memcpy per byte for both paths.
