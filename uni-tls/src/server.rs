@@ -42,24 +42,17 @@ use crate::schedule as tls;
 /// bigger than this will close the connection.
 pub const RX_BUF_LEN: usize = 4 * 1024;
 
-/// Max raw TLS bytes we emit before the caller drains. Two callers
-/// push here:
-///   * the server handshake flight (ServerHello + CCS + encrypted
-///     {EncExt, Certificate, CertVerify, Finished}) — typically
-///     ~1.5 KB for a self-signed ECDSA P-256 dev cert.
-///   * `send_app_data` for the legacy slice-shaped path — it seals
-///     into tx_buf, the caller drains via `pop_tx`. The chain-shaped
-///     `send_app_data_chain` writes wire bytes into the caller's
-///     IOBufChain directly and bypasses tx_buf, so it doesn't pay
-///     this limit.
+/// Max raw TLS bytes we emit during the server flight
+/// (ServerHello + CCS + encrypted {EncExt, Certificate, CertVerify,
+/// Finished}). A typical self-signed ECDSA P-256 dev cert is ~550 bytes
+/// so the flight fits in ~1.5 KB; 4 KB is generous room.
 ///
-/// Sized to hold one full TLS 1.3 record (16 KiB inner plaintext +
-/// 22 B envelope) + handshake straggler room. A 4 KB tx_buf would
-/// have forced the legacy slice path to chunk plaintext below
-/// MAX_INNER_PLAINTEXT and emit multiple records per HTTP response;
-/// instead we pay 24 KB of fixed scratch per conn for the same
-/// wire shape every other TLS stack uses.
-pub const TX_BUF_LEN: usize = 24 * 1024;
+/// Application-data sends bypass `tx_buf` entirely — they go through
+/// `send_app_data_chain`, which writes the wire-ready record into the
+/// caller's IOBufChain. Only `send_app_data` (the legacy slice-shaped
+/// API) seals into `tx_buf`, and it chunks plaintext to fit, so this
+/// constant doesn't have to scale to MAX_INNER_PLAINTEXT.
+pub const TX_BUF_LEN: usize = 4 * 1024;
 
 /// Max decrypted plaintext we buffer for the app (one HTTP request).
 pub const PT_BUF_LEN: usize = 4 * 1024;
@@ -555,9 +548,12 @@ impl TlsServer {
             .as_mut()
             .ok_or(HandshakeError::Internal)?;
 
-        // Split plaintext into chunks that fit in one record (max
-        // ~16 KB inner plaintext).
-        const CHUNK: usize = 15 * 1024;
+        // Split plaintext into chunks that fit in `tx_buf` after
+        // record envelope overhead. Modern callers go through
+        // `send_app_data_chain` (no tx_buf round-trip) so this
+        // path is mostly for legacy callers that pass a contiguous
+        // plaintext slice — sized to one drain cycle.
+        const CHUNK: usize = TX_BUF_LEN - record::HEADER_LEN - 1 - record::TAG_LEN;
         let mut offset = 0;
         while offset < plaintext.len() {
             let end = core::cmp::min(offset + CHUNK, plaintext.len());
