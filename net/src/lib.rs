@@ -60,6 +60,8 @@ static BARE_UDP_BACKEND: uni_runtime::net::UdpBackend = uni_runtime::net::UdpBac
     bind: None,
     unbind: None,
     send: udp::send,
+    acquire_tx_buf: Some(uni_drivers::net::acquire_tx_buf),
+    send_via_tx_handle: Some(udp::send_via_tx_handle),
     send_with_l2_headroom: Some(udp::send_with_l2_headroom),
 };
 

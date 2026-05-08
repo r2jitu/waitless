@@ -23,6 +23,7 @@ rust_library(
     deps = [
         "//net:types",
         "//uni-iobuf",
+        "//uni-net:driver",
         "//uni-worker",
         "//uni-platform",
     ],

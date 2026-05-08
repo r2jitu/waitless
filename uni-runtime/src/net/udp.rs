@@ -567,6 +567,34 @@ pub struct UdpBackend {
     /// Datagram send transport. Mandatory: `UdpSocket::send_to`
     /// returns `Err(())` if the backend isn't installed yet.
     pub send: fn(dst_ip: IpAddr, src_port: u16, dst_port: u16, data: &[u8]),
+    /// Optional acquire-from-TX-pool entry. Returns a writable
+    /// frame buffer drawn from the driver's TX pool; the caller
+    /// fills `[..MAX_L2_HEADROOM]` later via the matching
+    /// `send_via_tx_handle` and writes the UDP payload at
+    /// `[MAX_L2_HEADROOM..]`. `None` (returned by the backend or
+    /// the function itself) means the caller falls back to `send`
+    /// (which memcpys through a stack buffer).
+    ///
+    /// Used by the QUIC encoder's `take_datagram_buf` to write
+    /// packet bytes straight into a TX-pool slot — saves the
+    /// driver-side memcpy that the slice-based `send` path pays.
+    pub acquire_tx_buf:
+        Option<fn() -> Option<uni_net_driver::TxBufHandle>>,
+    /// Optional submit-via-TX-handle entry. Caller has filled
+    /// `handle.data_mut()[MAX_L2_HEADROOM..MAX_L2_HEADROOM+payload_len]`
+    /// with the UDP payload; the backend fills the L2/L3/L4
+    /// headers in the headroom in place and submits the slot to
+    /// the driver via `submit_tx`. `frame_len` is `MAX_L2_HEADROOM
+    /// + payload_len`.
+    pub send_via_tx_handle: Option<
+        fn(
+            dst_ip: IpAddr,
+            src_port: u16,
+            dst_port: u16,
+            handle: uni_net_driver::TxBufHandle,
+            frame_len: usize,
+        ),
+    >,
     /// Optional zero-copy send: caller hands a frame buffer where
     /// the first [`MAX_L2_HEADROOM`] bytes are reserved for the
     /// L2/L3/L4 headers and the UDP payload starts at
@@ -597,6 +625,31 @@ pub struct UdpBackend {
 /// Ethernet + IP + UDP headers. Sized for v6 (14 + 40 + 8); v4
 /// uses 42 of these, the leading 20 are unused.
 pub const MAX_L2_HEADROOM: usize = 14 + 40 + 8;
+
+/// Acquire a writable frame buffer drawn from the driver's TX
+/// pool. Free function (no `UdpSocket` needed) — used by the
+/// QUIC encoder's `take_datagram_buf`, which doesn't have a
+/// socket reference but still wants to land packet bytes
+/// directly in a slot.
+///
+/// Caller writes the UDP payload at
+/// `handle.data_mut()[MAX_L2_HEADROOM..MAX_L2_HEADROOM+payload_len]`
+/// and submits via [`UdpSocket::send_via_tx_handle`]. The
+/// L2/L3/L4 headers are filled in the headroom by the backend
+/// at submit time (for v4 destinations the backend does a
+/// 20-byte in-place memmove of payload bytes to align with the
+/// 42-byte v4 header — same memcpy count as the slice-shaped
+/// path; for v6 it's a clean win).
+///
+/// `None` means the backend doesn't support direct-fill TX
+/// (native), the driver doesn't either (GVE today), or the
+/// pool is full. Caller falls back to a heap-allocated
+/// `Vec<u8>` + slice-shaped send.
+pub fn acquire_tx_buf() -> Option<uni_net_driver::TxBufHandle> {
+    let b = udp_backend()?;
+    let f = b.acquire_tx_buf?;
+    f()
+}
 
 static UDP_BACKEND: AtomicPtr<UdpBackend> =
     AtomicPtr::new(core::ptr::null_mut());
@@ -903,6 +956,35 @@ impl UdpSocket {
         let b = udp_backend().ok_or(())?;
         (b.send)(dst_ip, self.port, dst_port, data);
         Ok(())
+    }
+
+    /// Submit a previously-[acquired](acquire_tx_buf) TX
+    /// handle. `frame_len` is `MAX_L2_HEADROOM + payload_len` (the
+    /// total bytes the bare-metal backend ships, after filling
+    /// the L2/L3/L4 headers in the headroom). Consumes the
+    /// handle.
+    ///
+    /// `Err(())` if the backend doesn't support handle-based send;
+    /// the handle is dropped (slot returns to the pool unused).
+    pub fn send_via_tx_handle(
+        &self,
+        dst_ip: IpAddr,
+        dst_port: u16,
+        handle: uni_net_driver::TxBufHandle,
+        frame_len: usize,
+    ) -> Result<(), ()> {
+        let b = udp_backend().ok_or(())?;
+        if let Some(f) = b.send_via_tx_handle {
+            f(dst_ip, self.port, dst_port, handle, frame_len);
+            Ok(())
+        } else {
+            // No bare-metal-style hook (e.g. native): drop the
+            // handle (returns slot to pool) and let the caller
+            // retry via the slice-shaped path. Should not happen
+            // when paired with `acquire_tx_buf`'s `None` gating.
+            drop(handle);
+            Err(())
+        }
     }
 
     /// Zero-copy send: caller pre-reserves `MAX_L2_HEADROOM` bytes

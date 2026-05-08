@@ -214,6 +214,7 @@ rust_library(
         ":types",
         "//drivers",
         "//uni-iobuf",
+        "//uni-net:driver",
         "//uni-runtime",
     ],
 )

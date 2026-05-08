@@ -776,9 +776,11 @@ static NATIVE_UDP_BACKEND: uni_runtime::net::UdpBackend =
         bind: Some(udp::udp_backend_bind),
         unbind: Some(udp::udp_backend_unbind),
         send: udp::udp_send,
-        // Native uses the OS sendto(); no L2/L3/L4 headers to fill.
-        // Caller's `send_to_with_l2_headroom` falls back to send()
-        // over `frame[headroom..]` automatically.
+        // Native uses the OS sendto(); no driver TX pool, no
+        // L2/L3/L4 headers to fill. Callers' `acquire_tx_buf` and
+        // `send_to_with_l2_headroom` fall back to plain `send`.
+        acquire_tx_buf: None,
+        send_via_tx_handle: None,
         send_with_l2_headroom: None,
     };
 

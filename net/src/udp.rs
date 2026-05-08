@@ -9,6 +9,7 @@
 
 extern crate uni_runtime;
 extern crate uni_drivers;
+extern crate uni_net_driver;
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
 extern crate net_dst_mac as dst_mac;
@@ -176,6 +177,127 @@ pub fn send_with_l2_headroom(
         );
         uni_drivers::net::send(frame_slice);
     }
+}
+
+/// Submit a `TxBufHandle` (acquired via
+/// [`uni_runtime::net::acquire_tx_buf`]) for transmission. Caller
+/// has written the UDP payload at
+/// `handle.data_mut()[MAX_L2_HEADROOM..frame_len]`; we fill the
+/// L2/L3/L4 headers in the headroom in place and submit the slot
+/// to the driver.
+///
+/// For v6 destinations the wire frame uses all 62 bytes of
+/// headroom (14 ETH + 40 IPv6 + 8 UDP), so the layout is
+/// already correct — fill headers, submit, ship.
+///
+/// For v4 destinations the wire frame needs only 42 bytes of
+/// header (14 + 20 + 8). To put the L2 frame at the start of
+/// the slot's data field (where the driver's submit_tx assumes
+/// it lives), we'd need either a 2-descriptor SG submit or an
+/// in-place memmove that shifts the payload back by 20 bytes.
+/// We do the memmove — same memcpy cost as the legacy
+/// slice-shaped path (which also memcpy'd the payload into a
+/// pool slot at submit time), so v4 doesn't regress; only v6
+/// gets the full B2 win.
+///
+/// Bypasses the `udp::send_to_addr → drivers::net::send` chain
+/// for v6 callers that build their UDP payload (e.g. the QUIC
+/// encoder) directly into a TX pool slot.
+pub fn send_via_tx_handle(
+    dst: IpAddr,
+    src_port: u16,
+    dst_port: u16,
+    mut handle: uni_net_driver::TxBufHandle,
+    frame_len: usize,
+) {
+    use uni_runtime::net::MAX_L2_HEADROOM;
+    debug_assert!(frame_len >= MAX_L2_HEADROOM);
+    debug_assert!(frame_len <= handle.data_cap as usize);
+
+    let payload_len = frame_len - MAX_L2_HEADROOM;
+    if payload_len == 0 || payload_len > 1500 - IPV4_HDR_LEN - UDP_HDR_LEN {
+        // Invalid input — drop. Handle's `Drop` returns the slot
+        // to the pool unused.
+        return;
+    }
+    let udp_len = UDP_HDR_LEN + payload_len;
+
+    let dst_mac = match dst_mac::resolve(dst) {
+        Some(m) => m,
+        None => return, // ARP/NDP miss; fire-and-forget UDP drop.
+    };
+
+    let (ip_hdr_len, ethertype) = match dst {
+        IpAddr::V4(_) => (IPV4_HDR_LEN, ethernet::ETHERTYPE_IPV4),
+        IpAddr::V6(_) => (IPV6_HDR_LEN, ipv6::ETHERTYPE_IPV6),
+    };
+    // Total bytes on wire (after any in-place memmove for v4).
+    let on_wire_actual = ETH_HDR_LEN + ip_hdr_len + UDP_HDR_LEN + payload_len;
+    let actual_headroom = ETH_HDR_LEN + ip_hdr_len + UDP_HDR_LEN;
+
+    {
+        let frame = handle.data_mut();
+        // SAFETY: `frame` is `&mut [u8]` of `data_cap` bytes
+        // (>= MAX_L2_HEADROOM + payload_len per the bounds checks
+        // above). All offset arithmetic stays in-bounds.
+        unsafe {
+            let p = frame.as_mut_ptr();
+
+            // For v4: shift payload back by 20 B so the L2 frame
+            // starts at slot.data[0] (where the driver's submit_tx
+            // expects it). Overlapping move — use ptr::copy.
+            if matches!(dst, IpAddr::V4(_)) {
+                core::ptr::copy(
+                    p.add(MAX_L2_HEADROOM),
+                    p.add(actual_headroom),
+                    payload_len,
+                );
+            }
+
+            // UDP header at (eth + ip) offset.
+            let udp_off = ETH_HDR_LEN + ip_hdr_len;
+            let udp_hdr = &mut *(p.add(udp_off) as *mut UdpHeader);
+            udp_hdr.src_port = htons(src_port);
+            udp_hdr.dst_port = htons(dst_port);
+            udp_hdr.length = htons(udp_len as u16);
+            udp_hdr.checksum = 0;
+
+            let ip_total = (ip_hdr_len + udp_len) as u16;
+            let ip_slot = core::slice::from_raw_parts_mut(p.add(ETH_HDR_LEN), ip_hdr_len);
+            match dst {
+                IpAddr::V4(d) => {
+                    udp_hdr.checksum = tcp_checksum(
+                        CONFIG.ip(), d, PROTO_UDP, p.add(udp_off), udp_len,
+                    );
+                    ipv4::fill_header(ip_slot, CONFIG.ip(), d, PROTO_UDP, ip_total);
+                }
+                IpAddr::V6(d) => {
+                    let src = types::Ipv6Addr::ANY;
+                    udp_hdr.checksum = tcp_checksum_v6(
+                        &src, &d, ipv6::next_header::UDP, p.add(udp_off), udp_len,
+                    );
+                    ipv6::fill_header(
+                        ip_slot,
+                        &src, &d, ipv6::next_header::UDP,
+                        ipv6::DEFAULT_HOP_LIMIT,
+                        udp_len as u16,
+                    );
+                }
+            }
+
+            ethernet::fill_header(
+                core::slice::from_raw_parts_mut(p, ETH_HDR_LEN),
+                dst_mac,
+                ethernet::ethernet_our_mac(),
+                ethertype,
+            );
+        }
+    }
+
+    // The L2 frame now starts at slot.data[0] for both families;
+    // submit_tx with the actual on-wire length.
+    let _ = &mut handle;
+    uni_drivers::net::submit_tx(handle, on_wire_actual);
 }
 
 /// Slice-shaped UDP send. Copies `data` into a stack-local
