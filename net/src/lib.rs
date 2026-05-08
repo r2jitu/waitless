@@ -60,6 +60,7 @@ static BARE_UDP_BACKEND: uni_runtime::net::UdpBackend = uni_runtime::net::UdpBac
     bind: None,
     unbind: None,
     send: udp::send,
+    send_with_l2_headroom: Some(udp::send_with_l2_headroom),
 };
 
 pub fn init_stack() {

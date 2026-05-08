@@ -567,7 +567,36 @@ pub struct UdpBackend {
     /// Datagram send transport. Mandatory: `UdpSocket::send_to`
     /// returns `Err(())` if the backend isn't installed yet.
     pub send: fn(dst_ip: IpAddr, src_port: u16, dst_port: u16, data: &[u8]),
+    /// Optional zero-copy send: caller hands a frame buffer where
+    /// the first [`MAX_L2_HEADROOM`] bytes are reserved for the
+    /// L2/L3/L4 headers and the UDP payload starts at
+    /// `frame[MAX_L2_HEADROOM..]`. The backend fills the headers
+    /// in place and ships the contiguous frame to the driver — no
+    /// payload memcpy. `None` means the caller falls back to
+    /// `send` over `frame[MAX_L2_HEADROOM..]`.
+    ///
+    /// `MAX_L2_HEADROOM = 62` accommodates v6 (14 + 40 + 8). For
+    /// v4 destinations the backend uses only the trailing 42 bytes
+    /// of that reserve and ships from the family-correct offset
+    /// (the leading 20 bytes go on the wire as part of the frame
+    /// the driver receives — the backend writes the actual ETH
+    /// header at `frame[MAX_L2_HEADROOM - 42] = frame[20]` and
+    /// passes `&frame[20..]` to the driver).
+    ///
+    /// Used by the QUIC reactor to skip the per-packet
+    /// `udp::send_to_addr → ipv4_send → ethernet_send → driver`
+    /// memcpy chain. Bare-metal sets this; native leaves it `None`
+    /// (the OS does the wrap on `sendto`).
+    pub send_with_l2_headroom: Option<
+        fn(dst_ip: IpAddr, src_port: u16, dst_port: u16, frame: &mut [u8]),
+    >,
 }
+
+/// Max bytes a caller of `UdpSocket::send_to_with_l2_headroom`
+/// must reserve at the front of its frame buffer for the
+/// Ethernet + IP + UDP headers. Sized for v6 (14 + 40 + 8); v4
+/// uses 42 of these, the leading 20 are unused.
+pub const MAX_L2_HEADROOM: usize = 14 + 40 + 8;
 
 static UDP_BACKEND: AtomicPtr<UdpBackend> =
     AtomicPtr::new(core::ptr::null_mut());
@@ -873,6 +902,32 @@ impl UdpSocket {
     pub fn send_to(&self, dst_ip: IpAddr, dst_port: u16, data: &[u8]) -> Result<(), ()> {
         let b = udp_backend().ok_or(())?;
         (b.send)(dst_ip, self.port, dst_port, data);
+        Ok(())
+    }
+
+    /// Zero-copy send: caller pre-reserves `MAX_L2_HEADROOM` bytes
+    /// at the front of `frame`; the UDP payload lives at
+    /// `frame[MAX_L2_HEADROOM..]`. On bare-metal the backend fills
+    /// the L2/L3/L4 headers in place and ships the contiguous
+    /// frame to the driver — no payload memcpy. On native (no
+    /// headroom-aware backend) falls back to a slice-based `send`
+    /// over `frame[MAX_L2_HEADROOM..]`, which incurs the kernel's
+    /// own buffer copy on `sendto`.
+    ///
+    /// Used by the QUIC reactor to skip the per-packet UDP-wrap
+    /// memcpy that `send_to` would otherwise pay.
+    pub fn send_to_with_l2_headroom(
+        &self,
+        dst_ip: IpAddr,
+        dst_port: u16,
+        frame: &mut [u8],
+    ) -> Result<(), ()> {
+        let b = udp_backend().ok_or(())?;
+        if let Some(fast) = b.send_with_l2_headroom {
+            fast(dst_ip, self.port, dst_port, frame);
+        } else {
+            (b.send)(dst_ip, self.port, dst_port, &frame[MAX_L2_HEADROOM..]);
+        }
         Ok(())
     }
 

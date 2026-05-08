@@ -93,6 +93,105 @@ fn resolve_dst_mac(dst_ip: IpAddr) -> Option<MacAddr> {
     }
 }
 
+/// Zero-copy UDP send: caller pre-supplies a frame buffer where
+/// the first `MAX_L2_HEADROOM = 62` bytes are reserved for the
+/// L2/L3/L4 headers and the UDP payload starts at
+/// `frame[MAX_L2_HEADROOM..]`. Fills the headers in place and
+/// ships the contiguous frame to the driver — no payload memcpy.
+///
+/// 62 covers v6 (14 + 40 + 8). For v4 destinations the actual
+/// headers are 42 bytes; we write them into the trailing 42 bytes
+/// of the reserve and ship from `frame[20..]` (skipping the 20
+/// unused leading bytes). Caller doesn't need to know the family.
+///
+/// Used by the QUIC reactor (via `UdpSocket::send_to_with_l2_
+/// headroom`) to skip the per-packet UDP-wrap memcpy. ARP/NDP
+/// miss drops the packet — UDP is fire-and-forget.
+pub fn send_with_l2_headroom(
+    dst: IpAddr,
+    src_port: u16,
+    dst_port: u16,
+    frame: &mut [u8],
+) {
+    use uni_runtime::net::MAX_L2_HEADROOM;
+    debug_assert!(frame.len() > MAX_L2_HEADROOM);
+
+    let payload_len = frame.len() - MAX_L2_HEADROOM;
+    if payload_len == 0 || payload_len > 1500 - IPV4_HDR_LEN - UDP_HDR_LEN {
+        return;
+    }
+    let udp_len = UDP_HDR_LEN + payload_len;
+
+    let dst_mac = match resolve_dst_mac(dst) {
+        Some(m) => m,
+        None => return,
+    };
+
+    let actual_headroom = payload_offset(dst);
+    let prefix_skip = MAX_L2_HEADROOM - actual_headroom;
+    let eth_off = prefix_skip;
+    let ip_off = eth_off + ETH_HDR_LEN;
+    let udp_off = MAX_L2_HEADROOM - UDP_HDR_LEN;
+
+    unsafe {
+        let p = frame.as_mut_ptr();
+
+        // UDP header at fixed offset (last 8 B of headroom).
+        let udp_hdr = &mut *(p.add(udp_off) as *mut UdpHeader);
+        udp_hdr.src_port = htons(src_port);
+        udp_hdr.dst_port = htons(dst_port);
+        udp_hdr.length = htons(udp_len as u16);
+        udp_hdr.checksum = 0;
+
+        // IP header + UDP checksum (family-specific pseudo-header).
+        let ip_hdr_len = actual_headroom - ETH_HDR_LEN - UDP_HDR_LEN;
+        match dst {
+            IpAddr::V4(d) => {
+                let ip_total = (ip_hdr_len + udp_len) as u16;
+                udp_hdr.checksum = tcp_checksum(
+                    CONFIG.ip(), d, PROTO_UDP, p.add(udp_off), udp_len,
+                );
+                ipv4::fill_header(
+                    core::slice::from_raw_parts_mut(p.add(ip_off), IPV4_HDR_LEN),
+                    CONFIG.ip(), d, PROTO_UDP, ip_total,
+                );
+            }
+            IpAddr::V6(d) => {
+                let src = types::Ipv6Addr::ANY;
+                udp_hdr.checksum = tcp_checksum_v6(
+                    &src, &d, ipv6::next_header::UDP, p.add(udp_off), udp_len,
+                );
+                ipv6::fill_header(
+                    core::slice::from_raw_parts_mut(p.add(ip_off), IPV6_HDR_LEN),
+                    &src, &d, ipv6::next_header::UDP,
+                    ipv6::DEFAULT_HOP_LIMIT,
+                    udp_len as u16,
+                );
+            }
+        }
+
+        // Ethernet header at the family-correct offset (skipping
+        // any unused leading bytes for v4).
+        let ethertype = match dst {
+            IpAddr::V4(_) => ethernet::ETHERTYPE_IPV4,
+            IpAddr::V6(_) => ipv6::ETHERTYPE_IPV6,
+        };
+        ethernet::fill_header(
+            core::slice::from_raw_parts_mut(p.add(eth_off), ETH_HDR_LEN),
+            dst_mac,
+            ethernet::ethernet_our_mac(),
+            ethertype,
+        );
+
+        // Ship the contiguous frame from the family-correct offset.
+        let frame_slice = core::slice::from_raw_parts(
+            p.add(prefix_skip),
+            frame.len() - prefix_skip,
+        );
+        uni_drivers::net::send(frame_slice);
+    }
+}
+
 /// Family-aware UDP send. Builds [ETH][IP][UDP][payload] in one
 /// stack buffer and hands it straight to the driver — no
 /// per-layer wrap memcpys. Used by the async reactor's

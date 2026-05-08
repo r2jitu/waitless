@@ -776,6 +776,10 @@ static NATIVE_UDP_BACKEND: uni_runtime::net::UdpBackend =
         bind: Some(udp::udp_backend_bind),
         unbind: Some(udp::udp_backend_unbind),
         send: udp::udp_send,
+        // Native uses the OS sendto(); no L2/L3/L4 headers to fill.
+        // Caller's `send_to_with_l2_headroom` falls back to send()
+        // over `frame[headroom..]` automatically.
+        send_with_l2_headroom: None,
     };
 
 fn init_native() {
