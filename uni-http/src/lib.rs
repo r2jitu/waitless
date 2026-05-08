@@ -778,6 +778,15 @@ pub struct TlsStream {
     cipher_buf: [u8; BUF_SIZE],
     /// Stack-friendly scratch for draining `pop_tx` output.
     tx_scratch: [u8; 2048],
+    /// Per-conn scratch for migrating Static IOBuf parts into
+    /// mutable storage so the chain-shaped seal can encrypt in
+    /// place. Heap-allocated once at conn-open, reused on every
+    /// send. Sized to one TLS 1.3 record's max inner plaintext
+    /// (16 KiB) — anything larger is split into multiple records
+    /// at the send-loop level. Box (not inline) to keep the
+    /// future state machine small enough to stay in cache (same
+    /// reasoning as `body_scratch` in `handle_conn`).
+    coalesce_buf: alloc::boxed::Box<[u8]>,
 }
 
 impl TlsStream {
@@ -787,6 +796,7 @@ impl TlsStream {
             tls,
             cipher_buf: [0u8; BUF_SIZE],
             tx_scratch: [0u8; 2048],
+            coalesce_buf: alloc::vec![0u8; 16 * 1024].into_boxed_slice(),
         }
     }
 
@@ -800,6 +810,116 @@ impl TlsStream {
             }
             self.tcp.send_bytes(&self.tx_scratch[..n]).await?;
         }
+    }
+
+    /// Walk `chain` once and rewrite every Static part into an
+    /// `External` IOBuf whose storage points into `coalesce_buf`
+    /// — leaving mutable (Heap / External) parts untouched. After
+    /// this the chain has the same wire bytes and the same
+    /// part-by-part shape, but every part returns `Some` from
+    /// `data_mut()`, so the chain-shaped seal can encrypt in
+    /// place.
+    ///
+    /// For a typical shell-page response (~6 KiB of Static
+    /// chrome interleaved with ~3 KiB across External body
+    /// buffers) this pays N memcpys for N Static parts and zero
+    /// memcpys for the dynamic content — vs the previous
+    /// "coalesce everything" approach that copied every part.
+    ///
+    /// Pre-condition: `chain.total_len() <= coalesce_buf.len()`
+    /// (caller's responsibility — only called from the single-
+    /// record path where this is gated by `PLAINTEXT_CHUNK`).
+    /// SAFETY: each rewritten `External` borrows a disjoint
+    /// sub-range of `coalesce_buf`. `coalesce_buf` lives in
+    /// `self`, which is borrowed mutably for the duration of the
+    /// send (so no other code can touch `coalesce_buf` while
+    /// the IOBufs are live), and the borrowed-storage IOBufs
+    /// drop with `drop_fn = None` (no-op) when the chain
+    /// drains.
+    fn migrate_static_parts(&mut self, chain: &mut IOBufChain) {
+        let n = chain.iter().count();
+        let mut cursor = 0usize;
+        let buf_ptr = self.coalesce_buf.as_mut_ptr();
+        let buf_cap = self.coalesce_buf.len();
+        for _ in 0..n {
+            let part = chain
+                .pop_front()
+                .expect("counted parts above");
+            if part.is_mutable() {
+                chain.push_back(part);
+                continue;
+            }
+            let bytes = part.data();
+            let len = bytes.len();
+            debug_assert!(cursor + len <= buf_cap);
+            // SAFETY: `buf_ptr.add(cursor)` is in-bounds (asserted
+            // above) and the destination range is disjoint from
+            // `bytes` (which lives in static memory or another
+            // IOBuf's backing).
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    buf_ptr.add(cursor),
+                    len,
+                );
+            }
+            // SAFETY (External wrap): see the function-level
+            // SAFETY note. The IOBuf borrows `coalesce_buf[cursor..
+            // cursor+len]` exclusively (every other rewritten
+            // External targets a disjoint range, by `cursor`'s
+            // monotonic advance).
+            let ext = unsafe {
+                IOBuf::from_external(
+                    NonNull::new_unchecked(buf_ptr.add(cursor)),
+                    len as u32,
+                    0,
+                    len as u32,
+                    None,
+                    core::ptr::null_mut(),
+                )
+            };
+            chain.push_back(ext);
+            cursor += len;
+        }
+    }
+
+    /// Wrap the first `filled` bytes of `coalesce_buf` as an
+    /// External IOBuf, run the chain-shaped seal over it, and
+    /// ship the resulting record to TCP. Used by the oversized-
+    /// chain path to flush each `PLAINTEXT_CHUNK`-sized chunk as
+    /// its own TLS record. Caller resets `filled = 0` after.
+    ///
+    /// `chain` is passed in as the destination for the wrapped
+    /// External (and the header / trailer IOBufs the seal layer
+    /// prepends / appends). It must be empty on entry — the
+    /// oversize-path loop drains the caller's chain via
+    /// `pop_front` before reaching us, so the chain we re-use
+    /// here is the same one with all original parts already
+    /// consumed.
+    async fn flush_coalesced(
+        &mut self,
+        chain: &mut IOBufChain,
+        filled: usize,
+    ) -> Result<(), ()> {
+        debug_assert!(chain.is_empty());
+        // SAFETY: `coalesce_buf` lives in `self`, borrowed
+        // mutably for the duration of this send. The External
+        // IOBuf is dropped when TCP consumes it (no-op drop —
+        // `drop_fn = None`), after which `coalesce_buf` is
+        // reusable.
+        let ext = unsafe {
+            IOBuf::from_external(
+                NonNull::new_unchecked(self.coalesce_buf.as_mut_ptr()),
+                self.coalesce_buf.len() as u32,
+                0,
+                filled as u32,
+                None,
+                core::ptr::null_mut(),
+            )
+        };
+        chain.push_back(ext);
+        self.tls.send_app_data_chain(chain).map_err(|_| ())?;
+        self.tcp.send(chain).await
     }
 }
 
@@ -842,57 +962,46 @@ impl HttpStream for TlsStream {
         }
 
         // TLS 1.3 RFC 8446 §5.1 caps inner plaintext at 2^14 B
-        // per record. Above that we have to split into multiple
-        // records.
+        // per record. The chain-shaped seal can carry up to that
+        // in one record; oversized chains split below.
         const PLAINTEXT_CHUNK: usize = 16384;
 
+        // Single-record path: every part fits in one TLS record.
+        // Hot path for typical HTTPS responses (≤ 16 KiB body).
         if chain.total_len() <= PLAINTEXT_CHUNK {
-            // Single-record path. Try the chain-shaped seal first:
-            // every mutable (Heap / External) part gets encrypted
-            // in place where the producer left it — zero
-            // plaintext-side memcpy. The TLS layer prepends a
-            // header IOBuf + appends a trailer IOBuf to the chain,
-            // and the whole thing is wire-ready.
-            if self.tls.send_app_data_chain(chain).is_ok() {
-                self.tcp.send(chain).await?;
-                return Ok(());
-            }
-            // Fallback for Static-bearing chains: coalesce every
-            // part into a stack scratch and seal via the legacy
-            // `send_app_data` path. The TLS layer drains its
-            // tx_buf into TCP after.
-            let total = chain.total_len();
-            let mut scratch = [0u8; PLAINTEXT_CHUNK];
-            let mut filled = 0usize;
-            for part in chain.iter() {
-                scratch[filled..filled + part.len()].copy_from_slice(part.data());
-                filled += part.len();
-            }
-            debug_assert_eq!(filled, total);
-            self.tls.send_app_data(&scratch[..filled])?;
-            self.drain_tx().await?;
-            chain.clear();
-            return Ok(());
+            // Migrate any Static parts into the per-conn coalesce
+            // scratch — leave mutable parts where they are. After
+            // this every part is mutable so the chain-shaped seal
+            // can encrypt in place.
+            self.migrate_static_parts(chain);
+            self.tls.send_app_data_chain(chain).map_err(|_| ())?;
+            return self.tcp.send(chain).await;
         }
 
-        // Oversize chain: spans more than one TLS record. Walk
-        // each part, chunking by part if needed, copy through
-        // send_app_data + drain. (Chain-shaped seal across
-        // multiple records — splitting a chain at a byte offset
-        // — is future work; this path is the rare case for HTTPS
-        // responses > 16 KiB.)
+        // Oversize chain: spans more than one TLS record. Drain
+        // parts into the coalesce buffer in chunks of
+        // PLAINTEXT_CHUNK bytes; flush each chunk as one record.
+        // Mutable parts pay one memcpy here that the small-record
+        // path skips — chain-splitting at byte offsets to preserve
+        // in-place sealing across records is future work.
+        let mut filled = 0usize;
+        let cap = self.coalesce_buf.len();
         while let Some(part) = chain.pop_front() {
-            if part.is_empty() {
-                continue;
+            let mut data: &[u8] = part.data();
+            while !data.is_empty() {
+                let take = (cap - filled).min(data.len());
+                self.coalesce_buf[filled..filled + take]
+                    .copy_from_slice(&data[..take]);
+                filled += take;
+                data = &data[take..];
+                if filled == cap {
+                    self.flush_coalesced(chain, filled).await?;
+                    filled = 0;
+                }
             }
-            let data = part.data();
-            let mut offset = 0;
-            while offset < data.len() {
-                let end = (offset + PLAINTEXT_CHUNK).min(data.len());
-                self.tls.send_app_data(&data[offset..end])?;
-                self.drain_tx().await?;
-                offset = end;
-            }
+        }
+        if filled > 0 {
+            self.flush_coalesced(chain, filled).await?;
         }
         Ok(())
     }
