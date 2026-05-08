@@ -682,11 +682,12 @@ impl Connection {
     /// No-op when no close is pending.
     pub fn flush_close(&mut self) {
         if let Some((error_code, reason)) = self.close_pending.take() {
-            let mut datagram = alloc::vec::Vec::with_capacity(256);
+            use uni_runtime::net::MAX_L2_HEADROOM;
+            let mut datagram = self.take_datagram_buf(256);
             if self
                 .encode_close_packet(&mut datagram, error_code, &reason)
                 .is_ok()
-                && !datagram.is_empty()
+                && datagram.len() > MAX_L2_HEADROOM
             {
                 self.outbound.push_back(datagram);
                 crate::diag::bump(&crate::diag::COUNTERS.connection_closes_emitted);
@@ -799,8 +800,11 @@ impl Connection {
             1 => CryptoLevel::Handshake,
             _ => CryptoLevel::OneRtt,
         };
-        let mut datagram = Vec::with_capacity(64);
-        if self.encode_ping_probe(&mut datagram, level).is_ok() && !datagram.is_empty() {
+        use uni_runtime::net::MAX_L2_HEADROOM;
+        let mut datagram = self.take_datagram_buf(64);
+        if self.encode_ping_probe(&mut datagram, level).is_ok()
+            && datagram.len() > MAX_L2_HEADROOM
+        {
             self.outbound.push_back(datagram);
             return true;
         }
@@ -954,12 +958,16 @@ impl Connection {
     /// Drain one ready-to-send UDP datagram into `out`. Returns
     /// number of bytes written (0 if nothing pending).
     pub fn pop_packet(&mut self, out: &mut [u8]) -> usize {
+        use uni_runtime::net::MAX_L2_HEADROOM;
         let pkt = match self.outbound.pop_front() {
             Some(p) => p,
             None => return 0,
         };
-        let n = out.len().min(pkt.len());
-        out[..n].copy_from_slice(&pkt[..n]);
+        // Skip the L2/L3/L4 headroom prefix `take_datagram_buf`
+        // pre-fills — only the QUIC packet bytes go to the caller.
+        let payload_len = pkt.len().saturating_sub(MAX_L2_HEADROOM);
+        let n = out.len().min(payload_len);
+        out[..n].copy_from_slice(&pkt[MAX_L2_HEADROOM..MAX_L2_HEADROOM + n]);
         // Recycle the buffer so the next encode reuses its
         // capacity instead of allocating a fresh Vec. Cap the
         // pool size so a wedged peer (queue can't drain) doesn't
@@ -999,17 +1007,35 @@ impl Connection {
     /// Take a datagram-sized buffer from the pool, or allocate
     /// a fresh `Vec::with_capacity(1500)`. Encode paths use this
     /// to avoid the per-packet datagram alloc on the hot path.
+    ///
+    /// The returned Vec has its length set to `MAX_L2_HEADROOM`
+    /// (62 bytes) of leading zeroed reserve, so subsequent
+    /// `out.push(...)` / `out.extend_from_slice(...)` writes from
+    /// the encoder land in the UDP-payload region. The reactor
+    /// ships the packet via `UdpSocket::send_to_with_l2_headroom`,
+    /// which fills the L2/L3/L4 headers in place inside that
+    /// reserve — no payload memcpy through `udp::send_to_addr`.
     fn take_datagram_buf(&mut self, fallback_capacity: usize) -> Vec<u8> {
-        match self.outbound_pool.pop() {
+        use uni_runtime::net::MAX_L2_HEADROOM;
+        let total_capacity = MAX_L2_HEADROOM + fallback_capacity;
+        let mut v = match self.outbound_pool.pop() {
             Some(mut v) => {
                 v.clear();
-                if v.capacity() < fallback_capacity {
-                    v.reserve(fallback_capacity - v.capacity());
+                if v.capacity() < total_capacity {
+                    v.reserve(total_capacity - v.capacity());
                 }
                 v
             }
-            None => Vec::with_capacity(fallback_capacity),
-        }
+            None => Vec::with_capacity(total_capacity),
+        };
+        // Pre-fill the L2/L3/L4 headroom with zeros. The encoder's
+        // `out.len()` initially returns MAX_L2_HEADROOM; subsequent
+        // pushes write packet bytes into the UDP-payload region.
+        // `seal_packet`'s offsets are absolute Vec offsets — they
+        // stay consistent with the headroom prefix because the
+        // encoder captures them after the resize.
+        v.resize(MAX_L2_HEADROOM, 0);
+        v
     }
 
     /// Whether there's an outbound datagram queued. Cheap check
@@ -1866,6 +1892,8 @@ impl Connection {
     }
 
     fn flush_outbound(&mut self, _config: &TlsServerConfig) -> Result<(), ConnError> {
+        use uni_runtime::net::MAX_L2_HEADROOM;
+
         // CONNECTION_CLOSE short-circuits the normal flush flow.
         // RFC 9000 §10.2.1: once we decide to close, we send one
         // packet with the close frame and stop generating packets
@@ -1874,9 +1902,9 @@ impl Connection {
         // 1-RTT or Handshake keys will also have the keys for
         // every lower level.
         if let Some((error_code, reason)) = self.close_pending.take() {
-            let mut datagram = Vec::with_capacity(256);
+            let mut datagram = self.take_datagram_buf(256);
             self.encode_close_packet(&mut datagram, error_code, &reason)?;
-            if !datagram.is_empty() {
+            if datagram.len() > MAX_L2_HEADROOM {
                 self.outbound.push_back(datagram);
                 crate::diag::bump(&crate::diag::COUNTERS.connection_closes_emitted);
             }
@@ -1929,14 +1957,16 @@ impl Connection {
         if matches!(self.state, ConnState::Established) {
             self.encode_one_rtt_packet(&mut datagram)?;
         }
-        if !datagram.is_empty() {
+        if datagram.len() > MAX_L2_HEADROOM {
             // Anti-amplification gate (RFC 9000 §8.1.2). Pre-
             // validation we drop packets whose cumulative bytes
             // would exceed 3× what we've received from the peer.
             // Dropping rather than truncating is correct here:
             // the peer treats it as packet loss and retries, by
             // which time their address may be validated.
-            let n = datagram.len() as u64;
+            // `n` is the *wire* size (excluding the L2/L3/L4
+            // headroom prefix the reactor will consume).
+            let n = (datagram.len() - MAX_L2_HEADROOM) as u64;
             if n <= self.anti_amp_remaining() {
                 self.record_bytes_sent(n);
                 self.outbound.push_back(datagram);
@@ -1974,10 +2004,10 @@ impl Connection {
                 }
                 let mut more = self.take_datagram_buf(1500);
                 self.encode_one_rtt_packet(&mut more)?;
-                if more.is_empty() {
+                if more.len() <= MAX_L2_HEADROOM {
                     break;
                 }
-                let n = more.len() as u64;
+                let n = (more.len() - MAX_L2_HEADROOM) as u64;
                 if n > self.anti_amp_remaining() {
                     crate::diag::bump(&crate::diag::COUNTERS.anti_amp_throttled);
                     break;

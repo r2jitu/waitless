@@ -318,13 +318,15 @@ impl QuicConn {
                 let mut c = self.conn.borrow_mut();
                 c.pop_packet_owned()
             };
-            let pkt = match pkt {
+            let mut pkt = match pkt {
                 Some(p) => p,
                 None => break,
             };
-            let _ = self
-                .sock
-                .send_to(self.peer_ip.get(), self.peer_port.get(), &pkt);
+            let _ = self.sock.send_to_with_l2_headroom(
+                self.peer_ip.get(),
+                self.peer_port.get(),
+                &mut pkt,
+            );
             crate::diag::bump(&crate::diag::COUNTERS.datagrams_sent);
             self.conn.borrow_mut().recycle_packet(pkt);
         }
@@ -690,11 +692,13 @@ async fn conn_task<H, F>(
                             // immediately via the ownership-
                             // transfer pop + recycle pattern.
                             loop {
-                                let pkt = match conn.borrow_mut().pop_packet_owned() {
+                                let mut pkt = match conn.borrow_mut().pop_packet_owned() {
                                     Some(p) => p,
                                     None => break,
                                 };
-                                let _ = sock.send_to(peer_ip.get(), peer_port.get(), &pkt);
+                                let _ = sock.send_to_with_l2_headroom(
+                                    peer_ip.get(), peer_port.get(), &mut pkt,
+                                );
                                 crate::diag::bump(&crate::diag::COUNTERS.datagrams_sent);
                                 conn.borrow_mut().recycle_packet(pkt);
                             }
@@ -775,11 +779,13 @@ async fn conn_task<H, F>(
         // performed disappears, and the Vec gets reused on the
         // next encode rather than dropped.
         loop {
-            let pkt = match conn.borrow_mut().pop_packet_owned() {
+            let mut pkt = match conn.borrow_mut().pop_packet_owned() {
                 Some(p) => p,
                 None => break,
             };
-            let _ = sock.send_to(peer_ip.get(), peer_port.get(), &pkt);
+            let _ = sock.send_to_with_l2_headroom(
+                peer_ip.get(), peer_port.get(), &mut pkt,
+            );
             crate::diag::bump(&crate::diag::COUNTERS.datagrams_sent);
             conn.borrow_mut().recycle_packet(pkt);
         }
