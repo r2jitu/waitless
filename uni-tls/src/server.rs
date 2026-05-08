@@ -537,6 +537,36 @@ impl TlsServer {
             .map_err(|e| e.into())
     }
 
+    /// Fused copy-and-encrypt sibling of [`Self::send_app_data_iobuf`].
+    /// Reads plaintext from `src_chain` and encrypts-while-copying
+    /// into `dst`'s reserved space. `dst` must have headroom (5 B
+    /// for the record header) and tailroom (1 B type + 16 B tag +
+    /// the plaintext bytes from `src_chain`).
+    ///
+    /// On success, `dst.data()` is the wire-ready TLS record. The
+    /// TLS layer's TlsStream uses this to skip the
+    /// copy-into-scratch + seal-in-place double pass.
+    pub fn send_app_data_chain_to(
+        &mut self,
+        src_chain: &uni_iobuf::IOBufChain,
+        dst: &mut uni_iobuf::IOBuf,
+    ) -> Result<(), HandshakeError> {
+        if self.state != State::Established {
+            return Err(HandshakeError::UnexpectedRecord);
+        }
+        let tk = self
+            .server_ap_tk
+            .as_mut()
+            .ok_or(HandshakeError::Internal)?;
+        record::seal_chain_to_in_place(
+            tk,
+            content_type::APPLICATION_DATA,
+            src_chain,
+            dst,
+        )
+        .map_err(|e| e.into())
+    }
+
     /// Encrypt `plaintext` into a TLSCiphertext application_data record
     /// and append it to the TX buffer. Only valid in `Established` state.
     pub fn send_app_data(&mut self, plaintext: &[u8]) -> Result<(), HandshakeError> {

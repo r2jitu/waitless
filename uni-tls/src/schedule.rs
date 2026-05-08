@@ -287,6 +287,31 @@ impl TrafficKey {
         tls_crypto::chacha20poly1305_seal_chain(&self.key, &nonce, aad, parts)
     }
 
+    /// Fused copy-and-encrypt sibling of [`Self::seal_chain`].
+    /// Reads plaintext from `src_parts` (immutable byte slices),
+    /// writes ciphertext to consecutive regions of `dst`,
+    /// computes one Poly1305 tag, and returns it. Auto-
+    /// increments `seq`.
+    ///
+    /// Lets the TLS record layer skip the copy-then-encrypt-in-
+    /// place pattern: instead of memcpy'ing chain bytes into a
+    /// scratch and then encrypting in place, encrypt-while-
+    /// copying in a single pass through `dst`. `dst` must be at
+    /// least as long as the sum of `src_parts`' lengths.
+    pub fn seal_chain_to<'a, I>(
+        &mut self,
+        aad: &[u8],
+        src_parts: I,
+        dst: &mut [u8],
+    ) -> [u8; 16]
+    where
+        I: IntoIterator<Item = &'a [u8]>,
+    {
+        let nonce = self.nonce_for_seq(self.seq);
+        self.seq = self.seq.wrapping_add(1);
+        tls_crypto::chacha20poly1305_seal_chain_to(&self.key, &nonce, aad, src_parts, dst)
+    }
+
     /// Open `data` in place; returns Err on tag mismatch. Auto-increments
     /// `seq` on success.
     pub fn open(&mut self, aad: &[u8], data: &mut [u8], tag: &[u8; 16]) -> Result<(), ()> {
