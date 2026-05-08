@@ -1979,22 +1979,36 @@ impl Connection {
                                 _ => {}
                             }
                         }
-                        // Push to `opened_streams` only when the
-                        // stream is genuinely new — i.e. this is
-                        // the first STREAM frame for this sid.
-                        // Subsequent frames (more data, FIN-only)
-                        // arrive while the H3 handler is already
-                        // reading from the existing recv_stream;
-                        // `progress.set()` after each datagram
-                        // wakes the handler, so a re-push would
-                        // only cause `accept_stream` to re-yield a
-                        // sid the handler has already finished —
-                        // the same wedge the `is_reaped` early-out
-                        // above defends against, but for streams
-                        // that haven't been reaped yet (handler
-                        // still executing, or response still
-                        // draining out the send queue).
-                        if was_new {
+                        // Push to `opened_streams` semantics depend
+                        // on the stream type (RFC 9000 §2.1, low 2
+                        // bits of sid):
+                        //
+                        //   0x0 client bidi → request stream. Push
+                        //        ONLY on `was_new`; the H3 handler
+                        //        consumes data via `recv()` on the
+                        //        existing recv_stream and a re-push
+                        //        would let `accept_stream` re-yield
+                        //        a sid the handler has already
+                        //        finished, stranding it in `recv()`.
+                        //   0x2 client uni → control / QPACK
+                        //        encoder / QPACK decoder. The H3
+                        //        server uses re-yield as a periodic
+                        //        signal to call `discard_recv` and
+                        //        reset the recv buffer; without
+                        //        re-push, QPACK update bytes
+                        //        accumulate forever on a long-
+                        //        lived conn (real leak for
+                        //        Chrome's refresh pattern).
+                        //   0x1 / 0x3 server-initiated → we don't
+                        //        open these; if the peer somehow
+                        //        sends one, conservatively use the
+                        //        bidi rule.
+                        let push = if stream_id & 0x3 == 0x2 {
+                            !self.opened_streams.contains(&stream_id)
+                        } else {
+                            was_new
+                        };
+                        if push {
                             self.opened_streams.push(stream_id);
                         }
                         // Best-effort STREAM-level ack pending so we
