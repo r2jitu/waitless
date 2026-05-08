@@ -674,7 +674,39 @@ pub struct Connection {
     /// app's `accept_stream` future drains the head; the listener
     /// is responsible for popping streams it's already accepted.
     opened_streams: Vec<u64>,
+
+    /// Ring of recently-reaped client-bidi stream IDs. A late
+    /// STREAM-frame retransmit for a sid we've already finished
+    /// (response sent + FIN'd, both ends drained) used to:
+    ///   1. resurrect a `recv_stream` from the pool,
+    ///   2. push the sid back onto `opened_streams`,
+    /// then `reap_finished_streams` would kill the resurrected
+    /// recv_stream on the very next flush (because the matching
+    /// `send_stream` was still satisfying the reap conditions),
+    /// leaving the H3 server blocked forever on `recv(sid)` —
+    /// surfaces as `[quic-drop other_wire] stuck recv await
+    /// state=None`. Linux quinn drives this case routinely via
+    /// loss-recovery retransmits; macOS quinn rarely hits it.
+    /// Tracking a small ring of "already-handled" sids and
+    /// dropping STREAM frames that match (no recv_stream
+    /// creation, no opened_streams push, just the byte-ack
+    /// bookkeeping) breaks the cycle.
+    ///
+    /// Cap of 256: a refresh-spamming Chrome session at 20
+    /// req/s for 10 s = 200 streams; 256 covers a comfortable
+    /// burst without per-conn memory bloat (256 × 8 B = 2 KiB).
+    /// Replacement is FIFO via `reaped_idx`.
+    reaped_streams: [u64; REAPED_STREAMS_CAP],
+    reaped_idx: usize,
 }
+
+/// Cap on the per-conn reaped-streams ring (see
+/// `reaped_streams` docstring).
+const REAPED_STREAMS_CAP: usize = 256;
+/// Sentinel for an unused ring slot. Stream IDs are bounded by
+/// `2^62 - 1` per RFC 9000 §16, so `u64::MAX` is safely never a
+/// real sid.
+const REAPED_STREAM_EMPTY: u64 = u64::MAX;
 
 /// Cap on the size of each per-conn stream recycle pool. A
 /// kept-alive HTTP/3 conn cycles through dozens of streams over
@@ -747,7 +779,23 @@ impl Connection {
             recv_pool: Vec::new(),
             send_pool: Vec::new(),
             opened_streams: Vec::new(),
+            reaped_streams: [REAPED_STREAM_EMPTY; REAPED_STREAMS_CAP],
+            reaped_idx: 0,
         }
+    }
+
+    /// Record `sid` in the reaped-streams ring. Called when
+    /// `reap_finished_streams` removes a fully-completed stream;
+    /// subsequent late STREAM frames for this sid are dropped
+    /// instead of resurrecting the stream (see ring docstring).
+    fn mark_reaped(&mut self, sid: u64) {
+        self.reaped_streams[self.reaped_idx] = sid;
+        self.reaped_idx = (self.reaped_idx + 1) % REAPED_STREAMS_CAP;
+    }
+
+    /// Whether `sid` is in the reaped-streams ring.
+    fn is_reaped(&self, sid: u64) -> bool {
+        self.reaped_streams.contains(&sid)
     }
 
     /// Get-or-create a SendStream entry for `sid`, drawing from
@@ -1081,6 +1129,10 @@ impl Connection {
                     self.recv_pool.push(r);
                 }
             }
+            // Tombstone the sid so a late retransmit's STREAM
+            // frame can't resurrect the stream and strand the H3
+            // handler in `recv()` (see `reaped_streams` docstring).
+            self.mark_reaped(sid);
             crate::diag::bump(&crate::diag::COUNTERS.streams_reaped);
         }
     }
@@ -1867,6 +1919,27 @@ impl Connection {
                 }
                 Frame::Stream { stream_id, offset, data, fin } => {
                     if matches!(level, CryptoLevel::OneRtt) {
+                        // Late STREAM-frame retransmit for a stream
+                        // we've already finished and reaped: drop
+                        // the bytes on the floor. Resurrecting
+                        // recv_stream + re-pushing to opened_streams
+                        // would only let `reap_finished_streams`
+                        // immediately re-kill the entry (the
+                        // matching send_stream still satisfies the
+                        // reap conditions on its way out), and the
+                        // H3 server would block forever on the
+                        // resurrected sid. The peer's own ACK + FIN
+                        // bookkeeping is already complete, so
+                        // discarding here is safe.
+                        if self.is_reaped(stream_id) {
+                            // Note: the application_space.ack_pending
+                            // bump below also fires for already-
+                            // reaped streams so the peer sees an
+                            // ACK and stops retransmitting.
+                            self.application_space.ack_pending = true;
+                            payload = &payload[consumed..];
+                            continue;
+                        }
                         let was_new = !self.recv_streams.contains_key(&stream_id);
                         if was_new {
                             // Pull from the per-conn recycle pool so
@@ -1906,7 +1979,22 @@ impl Connection {
                                 _ => {}
                             }
                         }
-                        if !self.opened_streams.contains(&stream_id) {
+                        // Push to `opened_streams` only when the
+                        // stream is genuinely new — i.e. this is
+                        // the first STREAM frame for this sid.
+                        // Subsequent frames (more data, FIN-only)
+                        // arrive while the H3 handler is already
+                        // reading from the existing recv_stream;
+                        // `progress.set()` after each datagram
+                        // wakes the handler, so a re-push would
+                        // only cause `accept_stream` to re-yield a
+                        // sid the handler has already finished —
+                        // the same wedge the `is_reaped` early-out
+                        // above defends against, but for streams
+                        // that haven't been reaped yet (handler
+                        // still executing, or response still
+                        // draining out the send queue).
+                        if was_new {
                             self.opened_streams.push(stream_id);
                         }
                         // Best-effort STREAM-level ack pending so we
