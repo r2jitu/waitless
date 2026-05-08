@@ -56,6 +56,7 @@ use crate::wire::{
 };
 
 use crate::tls::{CryptoLevel, QuicTls, QuicTlsError, QuicTlsState};
+use core::mem::ManuallyDrop;
 use uni_tls::TlsServerConfig;
 
 // ============================================================================
@@ -324,6 +325,129 @@ pub enum ConnState {
     Failed,
 }
 
+/// Outbound datagram buffer. Either heap-allocated (the
+/// `Heap` variant — fallback for backends that don't expose
+/// the SG TX surface, or when the driver pool is full) or
+/// backed by a driver TX-pool slot (the `TxSlot` variant —
+/// the zero-copy hot path: encoder writes packet bytes
+/// directly into the slot's `data` region, the bare-metal UDP
+/// backend fills the L2/L3/L4 headers in the headroom in place
+/// and submits the slot's descriptor without memcpy'ing the
+/// payload).
+///
+/// The encoder reads/writes via [`vec_mut`](Self::vec_mut),
+/// which returns a `&mut Vec<u8>` regardless of variant. For
+/// `TxSlot`, that Vec is a `ManuallyDrop<Vec<u8>>` whose
+/// allocation is the driver-owned slot's `data` field — `push`
+/// / `extend_from_slice` write straight into the slot. The
+/// encoder's max write (≤ ~1300 B for handshake-coalesced
+/// datagrams, ≤ ~1100 B for 1-RTT under PACKET_BODY_BUDGET)
+/// stays under the slot's 1514 B capacity, so Vec never
+/// reallocates and the ManuallyDrop wrapping never lets it
+/// dealloc the driver-owned memory.
+///
+/// SAFETY contract for `TxSlot::vec`:
+///   * `vec.as_mut_ptr()` == `handle.data_ptr` (set at
+///     construction in `take_datagram_buf`).
+///   * `vec.capacity()` == `handle.data_cap` (1514 today).
+///   * No code path on the Vec calls `reserve`, `with_capacity`,
+///     `set_len(>cap)`, or any other realloc-triggering method.
+///     Audited per-encoder-fn at the time of writing
+///     (`out.push`, `out.extend_from_slice`, `out.truncate`,
+///     `out.split_at_mut`, slice indexing — never `reserve`).
+pub enum DatagramBuf {
+    /// Heap-allocated Vec. Used as fallback when
+    /// [`uni_runtime::net::acquire_tx_buf`] returns `None`.
+    Heap(Vec<u8>),
+    /// Vec wrapping a driver TX-pool slot. The handle's `Drop`
+    /// returns the slot to the pool if the buf is dropped
+    /// without going through [`Self::into_tx_handle`]; once
+    /// `into_tx_handle` extracts the handle for submission, the
+    /// slot stays in-flight until the device signals descriptor
+    /// completion via the driver's `tx_drain`.
+    TxSlot {
+        handle: uni_net_driver::TxBufHandle,
+        vec: ManuallyDrop<Vec<u8>>,
+    },
+}
+
+impl DatagramBuf {
+    /// Mutable access to the inner Vec — the encoder's write
+    /// surface. For TxSlot, dereferences through ManuallyDrop;
+    /// the resulting `&mut Vec<u8>` IS a real Vec from the
+    /// encoder's perspective.
+    pub fn vec_mut(&mut self) -> &mut Vec<u8> {
+        match self {
+            DatagramBuf::Heap(v) => v,
+            DatagramBuf::TxSlot { vec, .. } => &mut **vec,
+        }
+    }
+
+    /// Read-only access to the inner Vec.
+    pub fn vec(&self) -> &Vec<u8> {
+        match self {
+            DatagramBuf::Heap(v) => v,
+            DatagramBuf::TxSlot { vec, .. } => &**vec,
+        }
+    }
+
+    /// Bytes currently written (= `vec().len()`). Includes the
+    /// L2/L3/L4 headroom prefix the encoder pre-fills via
+    /// [`Connection::take_datagram_buf`].
+    pub fn len(&self) -> usize {
+        self.vec().len()
+    }
+
+    /// Whether this buf is backed by a driver TX-pool slot.
+    /// `true` iff [`Self::into_tx_handle`] would succeed.
+    pub fn is_tx_slot(&self) -> bool {
+        matches!(self, DatagramBuf::TxSlot { .. })
+    }
+
+    /// Consume the buf and return its TxBufHandle + frame_len
+    /// for submission. Only succeeds for the `TxSlot` variant;
+    /// `Heap`-variant returns the buf back via `Err(self)` so
+    /// the caller can fall back to a slice-shaped send.
+    pub fn into_tx_handle(
+        self,
+    ) -> Result<(uni_net_driver::TxBufHandle, usize), Self> {
+        match self {
+            DatagramBuf::TxSlot { handle, vec } => {
+                let len = vec.len();
+                // `vec` is `ManuallyDrop<Vec<u8>>` wrapping the
+                // driver-owned slot. Dropping the wrapper is a
+                // no-op (it doesn't dealloc the slot), so the
+                // pattern just falls out of scope here. The
+                // handle moves out for submission; the driver
+                // releases the slot via the handle's `Drop` after
+                // the device signals descriptor completion.
+                let _ = vec;
+                Ok((handle, len))
+            }
+            other => Err(other),
+        }
+    }
+
+    /// Recycle this buf back to the conn's outbound_pool. For
+    /// `TxSlot`, the slot is implicitly returned by handle's
+    /// `Drop` — nothing to recycle on the pool side. For `Heap`,
+    /// `clear()` and return the Vec to the pool.
+    pub(crate) fn recycle_into(self, pool: &mut Vec<Vec<u8>>, pool_max: usize) {
+        match self {
+            DatagramBuf::Heap(mut v) => {
+                if pool.len() < pool_max {
+                    v.clear();
+                    pool.push(v);
+                }
+            }
+            DatagramBuf::TxSlot { .. } => {
+                // Drop fires `handle.Drop` → `release_fn` → slot
+                // back to pool.
+            }
+        }
+    }
+}
+
 pub struct Connection {
     state: ConnState,
 
@@ -508,7 +632,7 @@ pub struct Connection {
     /// responses queue up to MAX_FLUSH_PACKETS (~32) at a time;
     /// `Vec::remove(0)` would have shifted all of them on each
     /// pop.
-    outbound: alloc::collections::VecDeque<Vec<u8>>,
+    outbound: alloc::collections::VecDeque<DatagramBuf>,
 
     /// Recycled datagram Vecs from `pop_packet_owned` /
     /// `recycle_packet`. Each is `clear()`-ed (capacity ≈ 1500
@@ -685,7 +809,7 @@ impl Connection {
             use uni_runtime::net::MAX_L2_HEADROOM;
             let mut datagram = self.take_datagram_buf(256);
             if self
-                .encode_close_packet(&mut datagram, error_code, &reason)
+                .encode_close_packet(datagram.vec_mut(), error_code, &reason)
                 .is_ok()
                 && datagram.len() > MAX_L2_HEADROOM
             {
@@ -802,7 +926,7 @@ impl Connection {
         };
         use uni_runtime::net::MAX_L2_HEADROOM;
         let mut datagram = self.take_datagram_buf(64);
-        if self.encode_ping_probe(&mut datagram, level).is_ok()
+        if self.encode_ping_probe(datagram.vec_mut(), level).is_ok()
             && datagram.len() > MAX_L2_HEADROOM
         {
             self.outbound.push_back(datagram);
@@ -967,57 +1091,104 @@ impl Connection {
         // pre-fills — only the QUIC packet bytes go to the caller.
         let payload_len = pkt.len().saturating_sub(MAX_L2_HEADROOM);
         let n = out.len().min(payload_len);
-        out[..n].copy_from_slice(&pkt[MAX_L2_HEADROOM..MAX_L2_HEADROOM + n]);
-        // Recycle the buffer so the next encode reuses its
-        // capacity instead of allocating a fresh Vec. Cap the
-        // pool size so a wedged peer (queue can't drain) doesn't
-        // grow the pool unboundedly.
+        out[..n].copy_from_slice(&pkt.vec()[MAX_L2_HEADROOM..MAX_L2_HEADROOM + n]);
+        // Recycle (Heap variants only — TxSlot's Drop releases
+        // the slot back to the driver pool automatically).
         const POOL_MAX: usize = 16;
-        if self.outbound_pool.len() < POOL_MAX {
-            let mut recycled = pkt;
-            recycled.clear();
-            self.outbound_pool.push(recycled);
-        }
+        pkt.recycle_into(&mut self.outbound_pool, POOL_MAX);
         n
     }
 
     /// Pop the next outbound datagram by ownership, no copy. The
-    /// Vec includes the L2/L3/L4 headroom prefix that
-    /// `take_datagram_buf` pre-reserved (see `MAX_L2_HEADROOM`);
-    /// the QUIC packet bytes start at `vec[MAX_L2_HEADROOM..]`.
-    /// Caller hands the whole Vec to
-    /// `sock.send_to_with_l2_headroom`, which fills the headers
-    /// in place, and returns it via [`recycle_packet`] for buffer
-    /// reuse.
-    pub fn pop_packet_owned(&mut self) -> Option<Vec<u8>> {
+    /// returned `DatagramBuf` is either:
+    ///   * `Heap` — a heap-allocated Vec with an `MAX_L2_HEADROOM`-
+    ///     byte prefix; caller ships via
+    ///     `sock.send_to_with_l2_headroom(&mut vec)`.
+    ///   * `TxSlot` — a TxBufHandle wrapping a driver TX-pool
+    ///     slot; caller extracts via `into_tx_handle` and ships
+    ///     via `sock.send_via_tx_handle(handle, frame_len)` — no
+    ///     payload memcpy.
+    pub fn pop_packet_owned(&mut self) -> Option<DatagramBuf> {
         self.outbound.pop_front()
     }
 
-    /// Return a previously-popped datagram Vec to the conn's
-    /// recycle pool. The Vec is cleared (length=0, capacity
-    /// preserved). Pool is bounded; over the cap the Vec is
-    /// dropped normally.
-    pub fn recycle_packet(&mut self, mut v: Vec<u8>) {
+    /// Return a previously-popped datagram to the recycle pool.
+    /// `Heap` variant: Vec is cleared and pushed back. `TxSlot`
+    /// variant: handle's `Drop` returns the slot to the pool —
+    /// nothing to do here.
+    pub fn recycle_packet(&mut self, buf: DatagramBuf) {
         const POOL_MAX: usize = 16;
-        if self.outbound_pool.len() < POOL_MAX {
-            v.clear();
-            self.outbound_pool.push(v);
-        }
+        buf.recycle_into(&mut self.outbound_pool, POOL_MAX);
     }
 
-    /// Take a datagram-sized buffer from the pool, or allocate
-    /// a fresh `Vec::with_capacity(1500)`. Encode paths use this
-    /// to avoid the per-packet datagram alloc on the hot path.
+    /// Take a datagram-sized buffer for the encoder. Tries the
+    /// driver's TX pool first (zero-copy hot path: encoder
+    /// writes packet bytes directly into a slot's `data` region,
+    /// and the bare-metal UDP backend fills the L2/L3/L4 headers
+    /// in the headroom in place at submit time). Falls back to a
+    /// heap-allocated `Vec` when the pool is full, the backend
+    /// doesn't expose the SG TX surface (native), or the driver
+    /// doesn't (GVE today).
     ///
-    /// The returned Vec has its length set to `MAX_L2_HEADROOM`
-    /// (62 bytes) of leading zeroed reserve, so subsequent
-    /// `out.push(...)` / `out.extend_from_slice(...)` writes from
-    /// the encoder land in the UDP-payload region. The reactor
-    /// ships the packet via `UdpSocket::send_to_with_l2_headroom`,
-    /// which fills the L2/L3/L4 headers in place inside that
-    /// reserve — no payload memcpy through `udp::send_to_addr`.
-    fn take_datagram_buf(&mut self, fallback_capacity: usize) -> Vec<u8> {
+    /// The returned buf has its length pre-set to
+    /// `MAX_L2_HEADROOM` (62 bytes) so subsequent encoder writes
+    /// (`out.push`, `out.extend_from_slice`) land in the
+    /// UDP-payload region. `seal_packet`'s absolute-offset
+    /// arithmetic is consistent with the headroom prefix because
+    /// the encoder captures `header_start = out.len()` after the
+    /// resize.
+    fn take_datagram_buf(&mut self, fallback_capacity: usize) -> DatagramBuf {
         use uni_runtime::net::MAX_L2_HEADROOM;
+
+        // Hot path: acquire a slot from the driver's TX pool.
+        if let Some(handle) = uni_runtime::net::acquire_tx_buf() {
+            // Wrap the slot's data region as a Vec via raw
+            // construction. Capacity == handle.data_cap (1514 B);
+            // the encoder won't push beyond that for any single
+            // QUIC datagram (PACKET_BODY_BUDGET keeps 1-RTT
+            // packets ~1100 B; handshake-coalesced datagrams stay
+            // well under 1300 B).
+            //
+            // SAFETY:
+            //   * `handle.data_ptr` is a valid `*mut u8` to a
+            //     writable region of `data_cap` bytes for the
+            //     handle's lifetime (driver's TX-pool slot).
+            //   * len = MAX_L2_HEADROOM ≤ data_cap; the trailing
+            //     bytes are zero-padded (slot was zeroed at boot
+            //     and never written past `len` by anyone before).
+            //     Wait — the slot's `data` field is reused across
+            //     conn lifetimes, so the trailing bytes may hold
+            //     stale ciphertext from a previous TX. We
+            //     explicitly zero the headroom prefix below so
+            //     bytes [..MAX_L2_HEADROOM] are clean before the
+            //     encoder writes; the bytes past `len` are not
+            //     read until the encoder writes them via push /
+            //     extend_from_slice (which initialises before
+            //     read).
+            //   * The Vec's allocation (`handle.data_ptr`) is NOT
+            //     allocator-managed; ManuallyDrop suppresses
+            //     Vec::Drop's dealloc.
+            let mut vec: Vec<u8> = unsafe {
+                Vec::from_raw_parts(
+                    handle.data_ptr,
+                    0,
+                    handle.data_cap as usize,
+                )
+            };
+            // Zero-fill the headroom; the encoder doesn't read it
+            // (writes start at vec.len()), but the backend fills
+            // headers there at submit time and may read for
+            // checksumming. Use resize to grow `len`.
+            vec.resize(MAX_L2_HEADROOM, 0);
+            let _ = fallback_capacity; // matched signature; unused on this path
+            return DatagramBuf::TxSlot {
+                handle,
+                vec: ManuallyDrop::new(vec),
+            };
+        }
+
+        // Fallback: heap-allocated Vec, recycled through
+        // `outbound_pool`.
         let total_capacity = MAX_L2_HEADROOM + fallback_capacity;
         let mut v = match self.outbound_pool.pop() {
             Some(mut v) => {
@@ -1029,14 +1200,8 @@ impl Connection {
             }
             None => Vec::with_capacity(total_capacity),
         };
-        // Pre-fill the L2/L3/L4 headroom with zeros. The encoder's
-        // `out.len()` initially returns MAX_L2_HEADROOM; subsequent
-        // pushes write packet bytes into the UDP-payload region.
-        // `seal_packet`'s offsets are absolute Vec offsets — they
-        // stay consistent with the headroom prefix because the
-        // encoder captures them after the resize.
         v.resize(MAX_L2_HEADROOM, 0);
-        v
+        DatagramBuf::Heap(v)
     }
 
     /// Whether there's an outbound datagram queued. Cheap check
@@ -1904,7 +2069,7 @@ impl Connection {
         // every lower level.
         if let Some((error_code, reason)) = self.close_pending.take() {
             let mut datagram = self.take_datagram_buf(256);
-            self.encode_close_packet(&mut datagram, error_code, &reason)?;
+            self.encode_close_packet(datagram.vec_mut(), error_code, &reason)?;
             if datagram.len() > MAX_L2_HEADROOM {
                 self.outbound.push_back(datagram);
                 crate::diag::bump(&crate::diag::COUNTERS.connection_closes_emitted);
@@ -1926,7 +2091,7 @@ impl Connection {
             .pop_handshake(CryptoLevel::Initial, &mut initial_crypto);
         if initial_n > 0 || self.initial_space.ack_pending {
             self.encode_initial_packet(
-                &mut datagram,
+                datagram.vec_mut(),
                 &initial_crypto[..initial_n],
                 self.initial_space.ack_pending,
             )?;
@@ -1944,7 +2109,7 @@ impl Connection {
             .pop_handshake(CryptoLevel::Handshake, &mut hs_crypto);
         if hs_n > 0 || self.handshake_space.ack_pending {
             self.encode_handshake_packet(
-                &mut datagram,
+                datagram.vec_mut(),
                 &hs_crypto[..hs_n],
                 self.handshake_space.ack_pending,
             )?;
@@ -1956,7 +2121,7 @@ impl Connection {
         // Encode the FIRST 1-RTT packet inline with any
         // Initial/Handshake packets above to maximise coalescing.
         if matches!(self.state, ConnState::Established) {
-            self.encode_one_rtt_packet(&mut datagram)?;
+            self.encode_one_rtt_packet(datagram.vec_mut())?;
         }
         if datagram.len() > MAX_L2_HEADROOM {
             // Anti-amplification gate (RFC 9000 §8.1.2). Pre-
@@ -2004,7 +2169,7 @@ impl Connection {
                     break;
                 }
                 let mut more = self.take_datagram_buf(1500);
-                self.encode_one_rtt_packet(&mut more)?;
+                self.encode_one_rtt_packet(more.vec_mut())?;
                 if more.len() <= MAX_L2_HEADROOM {
                     break;
                 }

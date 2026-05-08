@@ -64,6 +64,7 @@ rust_library(
     deps = [
         "//uni",
         "//uni-iobuf",
+        "//uni-net:driver",
         "//uni-runtime",
         "//uni-tls",
         "@crates//:aes-gcm",

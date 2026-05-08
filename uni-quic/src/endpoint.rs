@@ -18,11 +18,15 @@
 // state machine and an `Rc<UdpSocket>` for sending replies. It
 // `.await`s its `ConnInbox` for new datagrams; on each, it runs
 // `Connection::process_datagram` and drains outbound packets via
-// `pop_packet_owned` + `sock.send_to_with_l2_headroom`. The
-// outbound Vecs carry an L2/L3/L4 headroom prefix the encoder
-// pre-reserves in `take_datagram_buf`, so the bare-metal UDP
-// backend fills the Ethernet/IP/UDP headers in place without
-// memcpy'ing the QUIC packet bytes. When the connection ends
+// `pop_packet_owned` + `ship_datagram`. Outbound packets are
+// `DatagramBuf`s — either a heap-allocated `Vec<u8>` or a
+// `TxBufHandle` wrapping a driver TX-pool slot. For TxSlot the
+// encoder writes directly into the slot's data region (preceded
+// by L2/L3/L4 headroom), and the bare-metal UDP backend fills
+// headers in place at submit time — no payload memcpy at all.
+// For Heap, the bare-metal backend still fills headers in the
+// headroom in place but the driver memcpy from heap to slot is
+// unavoidable. When the connection ends
 // (Established + a future state-change to Closing/Closed, or
 // fatal error), the task exits and its `Rc<ConnInbox>` drops —
 // the slot's `Weak` upgrade fails on the next allocator pass and
@@ -47,11 +51,48 @@ use crate::wire::{long_packet_type, parse_long_header_preamble, FIXED_BIT, HEADE
 
 use uni::runtime::{spawn, AsyncEvent, UdpSocket};
 
-use crate::conn::{ConnError, ConnState, Connection, ConnectionId};
+use crate::conn::{ConnError, ConnState, Connection, ConnectionId, DatagramBuf};
 use crate::inbox::{
     make_local_cid, parse_local_cid, ConnInbox, Datagram, SlotTable, SERVER_CID_LEN,
 };
 use uni_tls::TlsServerConfig;
+
+/// Ship one popped [`DatagramBuf`] to the wire. Dispatches on the
+/// variant:
+///   * `TxSlot` — extracts the [`uni_net_driver::TxBufHandle`] and
+///     calls [`UdpSocket::send_via_tx_handle`]. The bare-metal UDP
+///     backend fills the L2/L3/L4 headers in the slot's headroom
+///     in place and submits the contiguous frame to the driver,
+///     skipping the per-packet driver memcpy. The handle's `Drop`
+///     returns the slot to the driver's TX pool when the device
+///     signals descriptor completion.
+///   * `Heap` — calls [`UdpSocket::send_to_with_l2_headroom`] with
+///     the heap Vec; the bare-metal backend still fills headers in
+///     place but the driver memcpy still happens (heap memory
+///     isn't a TX-pool slot). The Vec is then recycled back into
+///     the conn's `outbound_pool`.
+///
+/// Always bumps `COUNTERS.datagrams_sent`.
+fn ship_datagram(
+    sock: &UdpSocket,
+    conn: &RefCell<Connection>,
+    peer_ip: uni::runtime::IpAddr,
+    peer_port: u16,
+    pkt: DatagramBuf,
+) {
+    if pkt.is_tx_slot() {
+        // is_tx_slot() guarantees this branch.
+        let (handle, frame_len) = pkt
+            .into_tx_handle()
+            .unwrap_or_else(|_| unreachable!("is_tx_slot() guarded"));
+        let _ = sock.send_via_tx_handle(peer_ip, peer_port, handle, frame_len);
+    } else {
+        let mut pkt = pkt;
+        let _ = sock.send_to_with_l2_headroom(peer_ip, peer_port, pkt.vec_mut());
+        conn.borrow_mut().recycle_packet(pkt);
+    }
+    crate::diag::bump(&crate::diag::COUNTERS.datagrams_sent);
+}
 
 /// Maximum simultaneous QUIC connections per worker. Each slot
 /// is ~16 bytes (gen + Weak), so 1024 slots ≈ 16 KiB per worker
@@ -322,17 +363,17 @@ impl QuicConn {
                 let mut c = self.conn.borrow_mut();
                 c.pop_packet_owned()
             };
-            let mut pkt = match pkt {
+            let pkt = match pkt {
                 Some(p) => p,
                 None => break,
             };
-            let _ = self.sock.send_to_with_l2_headroom(
+            ship_datagram(
+                &self.sock,
+                &self.conn,
                 self.peer_ip.get(),
                 self.peer_port.get(),
-                &mut pkt,
+                pkt,
             );
-            crate::diag::bump(&crate::diag::COUNTERS.datagrams_sent);
-            self.conn.borrow_mut().recycle_packet(pkt);
         }
     }
 }
@@ -696,15 +737,15 @@ async fn conn_task<H, F>(
                             // immediately via the ownership-
                             // transfer pop + recycle pattern.
                             loop {
-                                let mut pkt = match conn.borrow_mut().pop_packet_owned() {
+                                let pkt = match conn.borrow_mut().pop_packet_owned() {
                                     Some(p) => p,
                                     None => break,
                                 };
-                                let _ = sock.send_to_with_l2_headroom(
-                                    peer_ip.get(), peer_port.get(), &mut pkt,
+                                ship_datagram(
+                                    &sock, &conn,
+                                    peer_ip.get(), peer_port.get(),
+                                    pkt,
                                 );
-                                crate::diag::bump(&crate::diag::COUNTERS.datagrams_sent);
-                                conn.borrow_mut().recycle_packet(pkt);
                             }
                         }
                         continue;
@@ -776,22 +817,23 @@ async fn conn_task<H, F>(
         }
 
         // Drain outbound packets to the peer. Each iteration
-        // takes the front Vec by ownership (`pop_packet_owned`),
-        // sends without copying it into a local scratch buffer,
-        // then returns the Vec to the conn's recycle pool. The
-        // memcpy that the slice-based `pop_packet` would have
-        // performed disappears, and the Vec gets reused on the
-        // next encode rather than dropped.
+        // takes the front DatagramBuf by ownership
+        // (`pop_packet_owned`); `ship_datagram` dispatches on the
+        // variant: `TxSlot` ships zero-copy via
+        // `send_via_tx_handle` (driver fills the L2/L3/L4 headers
+        // in the slot's headroom in place), `Heap` falls back to
+        // `send_to_with_l2_headroom` and recycles the Vec into
+        // the conn's pool.
         loop {
-            let mut pkt = match conn.borrow_mut().pop_packet_owned() {
+            let pkt = match conn.borrow_mut().pop_packet_owned() {
                 Some(p) => p,
                 None => break,
             };
-            let _ = sock.send_to_with_l2_headroom(
-                peer_ip.get(), peer_port.get(), &mut pkt,
+            ship_datagram(
+                &sock, &conn,
+                peer_ip.get(), peer_port.get(),
+                pkt,
             );
-            crate::diag::bump(&crate::diag::COUNTERS.datagrams_sent);
-            conn.borrow_mut().recycle_packet(pkt);
         }
         if tearing_down {
             break;
