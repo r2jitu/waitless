@@ -30,15 +30,18 @@ RX* — and tracks progress as we land them.
 | 5 | **TCP frame build** | `send_segment` / `send_segment_from_cursor` | **1× memcpy** | 14 + 20 + 20 B headers + 2 checksums | Cursor → one stack buffer with full [ETH][IP][TCP][PAYLOAD] (item A ✓) |
 | 6 | ~~IPv4 wrap~~ | — | — | — | Folded into step 5 (item A ✓) |
 | 7 | ~~Ethernet wrap~~ | — | — | — | Folded into step 5 (item A ✓) |
-| 8 | **virtio-net submit** | `virtio_net::send` | **1× memcpy** | descriptor add + kick | → TX pool slot, then DMA |
+| 8 | ~~virtio-net submit memcpy~~ | — (item B ✓ for TCP) | — | descriptor add + kick | TCP writes directly into the TX pool slot via `acquire_tx_buf` + `submit_tx` |
 | 9 | virtio host pickup | (HVF userspace_net or KVM) | depends on host | — | HVF: another memcpy to host TCP socket |
 | 10 | Host TCP/IP/Eth | host kernel | host-side | — | TSO can fold this on real NICs |
 | 11 | Wire | network stack | — | — | MTU, cwnd, RTT |
 | 12 | Browser RX | TLS decrypt + HTTP parse | symmetric to ours | — | Out of our control |
 
-Active per-byte memcpys on the guest side: **3** (steps 3, 5, 8) —
-down from 5 before items A and C. Item B (virtio SG) targets
-step 8 next.
+Active per-byte memcpys on the **TCP TX** guest side: **2**
+(steps 3 — TLS coalesce, and 5 — TCP frame build into either the
+TX pool slot directly or a stack buffer). Down from 5 before
+items A, C, B. The TLS coalesce + TCP frame build are
+fundamental: the chain → contiguous-buffer copy is required to
+seal a TLS record over the chain bytes.
 
 ## Current path — QUIC (HTTPS over H3)
 
@@ -86,37 +89,44 @@ be removed without offloading AEAD to the NIC.
 - **Risk**: low. The IOBuf primitive already supports prepend; we
   just need the right amount of headroom plumbed from the top.
 
-### B. Use virtio-net SG TX descriptors (TX pool as IOBuf source)
-- **Status**: [ ] not started
-- **Where**: `uni-driver-virtio-net/src/lib.rs::send`
-  (the `ptr::copy_nonoverlapping` into `tx_pool` slot at line 1103).
-- **What**: virtio-net supports multi-buffer (scatter-gather) TX
-  descriptors. Re-shape the existing 64-slot `tx_pool` as a
-  buffer pool that callers acquire from instead of `memcpy`'ing
-  into. Each acquire returns an `IOBuf::External` wrapping a
-  pool slot's `data` field, with reserved headroom for the
-  virtio_net_header + the L2/L3/L4 stack. Caller fills in place;
-  driver enqueues a descriptor pointing at the same storage
-  (zero memcpy). Drop callback fires from `tx_drain_qp` when the
-  device returns the descriptor — slot goes back to the pool.
-- **Win**: -1 memcpy per byte on top of A and P. On Tier 1 (KVM,
-  real NIC) this is the difference between "we copy data" and
-  "the NIC DMAs from our buffers".
-- **Side win**: today `send_on_qp` **busy-spins** when all 64
-  slots are in flight (line 1070 — `loop { ... if found { break };
-  flush_kick(); tx_drain_qp(); }`). Re-shaping acquire as
-  IOBuf-borrowing makes it natural to return a future that
-  parks until `tx_drain` frees a slot, instead of spinning.
-  Lower priority but worth doing alongside.
-- **Effort**: medium-high. Needs a TX completion path that drops
-  the right IOBuf in `tx_drain_qp`, and the IOBuf has to survive
-  across the descriptor's lifetime.
-- **Risk**: medium. Subtle; needs careful audit of when the host
-  is allowed to read the descriptor's referenced memory, and
-  what happens if the IOBuf is dropped before the device
-  returns the descriptor (must not happen — drop_fn is the
-  pool-return).
-- **Lays groundwork for**: G (TSO), Q (QUIC into framing buffer).
+### B. SG TX API (direct-fill from caller into the TX pool)
+- **Status**: [x] **landed 2026-05-08** for **TCP** (commits
+  `936f03f`, `84777e2`). UDP/QUIC integration deferred — see
+  follow-up note.
+- **Result**: -1 memcpy per byte on the TCP TX hot path. Driver
+  exposes `acquire_tx_buf() -> Option<TxBufHandle>` + `submit_tx`;
+  caller (TCP) writes straight into a slot of the existing 64-slot
+  `tx_pool`, no intermediate stack buffer + memcpy.
+  * Implementation: new `TxBufHandle` struct in `uni-net::driver`
+    with `Drop` returning the slot to the pool unused; `submit_tx`
+    `mem::forget`s the handle to skip release.
+  * virtio-net: per-qp scan, Tier-1 only (Tier-2 shared qp returns
+    `None` to avoid cross-core lock contention on `tx_pool_used`).
+  * GVE: stubbed `None`/`None`; callers fall back to `send(&[u8])`.
+  * TCP: `send_segment` and `send_segment_from_cursor` route
+    through a shared `build_and_send_frame(frame_len, fill)`
+    helper that does the acquire-or-stack dance.
+- **Bench (HVF, /health)**:
+  * 1c: ~108 → ~114k req/s (+5%)
+  * 2c: ~150 → ~170k       (+13%)
+  * 3c: ~150 → ~171k       (+14%)
+- **Follow-up: UDP/QUIC** (separate item, call it B2). The
+  current `udp::send_with_l2_headroom` takes a caller-supplied
+  `&mut [u8]` (typically the QUIC encoder's outbound Vec). Using
+  the SG TX API there would still pay the Vec → pool-slot
+  memcpy in the backend — same cost as today. The actual win
+  for QUIC requires the encoder to write directly into a TX
+  pool slot (replace `outbound: VecDeque<Vec<u8>>` with
+  `VecDeque<TxBufHandle>`), which is the deeper QUIC-side
+  refactor that Q's headroom-prefix approach didn't take.
+  Tracked as a follow-up; QUIC TX stays at 2 memcpys/byte for
+  now (encode + driver-pool).
+- **Note (`send_on_qp` busy-spin)**: still there in the slow path
+  used by ARP/DHCP/ICMP/UDP and the TCP fallback when the pool
+  is full. With the new acquire path returning `None` on full,
+  the TCP hot path no longer busy-spins — it falls back to the
+  `send(&[u8])` slow path which still spins. Worth replacing
+  with parking-async in a future cleanup.
 
 ### C. Bake the record envelope into the scratch (no header/trailer allocs)
 - **Status**: [x] **landed 2026-05-08** (commit `e6d9a28`)
@@ -438,24 +448,27 @@ items until they unlock something concrete.
 2. ✓ **P** — UDP TX wrap fold (mirror of A). Done.
 3. ✓ **Q** — QUIC packets into framing buffer. Done.
 4. ✓ **D** — fused copy + encrypt for TLS single-record path. Done.
-5. **B** (virtio SG TX descriptors) — drops the last guest-side
-   memcpy on **both** paths (2 → 1 for TCP and QUIC) and
-   replaces the `send_on_qp` busy-spin with parking-async. Lays
-   the foundation for G.
-6. **G** (TSO) — biggest single Tier 1 win once we benchmark on
+5. ✓ **B** (TCP) — direct-fill TX pool. Done.
+6. **B2** (UDP/QUIC) — extend B to QUIC by replacing
+   `outbound: VecDeque<Vec<u8>>` with `VecDeque<TxBufHandle>`
+   so the QUIC encoder writes directly into a TX pool slot.
+   Doesn't help the slow-path UDP callers (DNS, ICMP).
+   QUIC-only win.
+7. **G** (TSO) — biggest single Tier 1 win once we benchmark on
    KVM/GCE. Depends on B.
-7. **M** (conn-state pool) — the alloc-side equivalent of A+C;
+8. **M** (conn-state pool) — the alloc-side equivalent of A+C;
    biggest *alloc-count* win whenever conn churn matters. Land
    any time after we have a conn-churn workload to bench against
    — local keep-alive bench won't show it.
-8. **N + O** — close out the alloc tail once M is in. (O is
+9. **N + O** — close out the alloc tail once M is in. (O is
    partly mitigated by Q's headroom-prefix approach but the
    per-frame staging Vecs in `encode_initial_packet` /
    `encode_handshake_packet` remain — re-evaluate scope.)
-9. **J** (compression) + **K** (0-RTT) + **L** (Early Hints) when
-   we shift focus from local benchmarks to Internet-facing serving.
+10. **J** (compression) + **K** (0-RTT) + **L** (Early Hints)
+    when we shift focus from local benchmarks to Internet-facing
+    serving.
 
-End state after step 5: **1 memcpy per byte** on the guest side
+End state after step 6: **1 memcpy per byte** on the guest side
 for both TCP TLS and QUIC — just the one fundamental encrypt R/W
 pass for AEAD (or zero of the encrypt itself moves to NIC offload
 via TLS-offload, but that's its own rabbit hole).
@@ -532,6 +545,15 @@ E and F are low-effort cleanups that can land any time.
     -120 LOC of duplicated code).
   * Updated stale comments in `uni-quic` referencing the
     pre-Q `sock.send_to(&vec)` flow.
+- **2026-05-08** — Item **B landed for TCP** (`936f03f`,
+  `84777e2`): SG TX API + TCP wiring. Driver exposes
+  `acquire_tx_buf` / `submit_tx`; TCP `send_segment` /
+  `send_segment_from_cursor` write directly into the TX pool
+  slot, no intermediate memcpy through a stack buffer. Bench
+  HVF /health: 1c +5%, 2c +13%, 3c +14%. UDP/QUIC integration
+  is **B2** (separate item) — needs the QUIC encoder to write
+  into a TX pool slot directly (replace `outbound: VecDeque<
+  Vec<u8>>` with `VecDeque<TxBufHandle>`).
 - **2026-05-08** — Item **D landed** (`39c034e`, `fef3c63`,
   `25858e3`): fused copy+encrypt for TLS single-record path.
   Earlier deferral was wrong — `cipher 0.4.4` exposes
