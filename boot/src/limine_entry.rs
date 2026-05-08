@@ -43,7 +43,7 @@ use limine::request::{
 #[cfg(target_arch = "aarch64")]
 use limine::request::DeviceTreeBlobRequest;
 #[cfg(target_arch = "x86_64")]
-use limine::request::{RsdpRequest, MpRequest};
+use limine::request::{ExecutableCmdlineRequest, RsdpRequest, MpRequest};
 
 // x86_64 SSE + AVX enable stub — Limine drops us in 64-bit mode
 // with MMU + paging but does NOT enable the OS-level bits the
@@ -147,6 +147,15 @@ static DTB_REQUEST: DeviceTreeBlobRequest = DeviceTreeBlobRequest::new();
 #[used]
 #[unsafe(link_section = ".limine_requests")]
 static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
+
+// Limine kernel cmdline. Equivalent of `chosen.bootargs` on the
+// FDT path: lets the QEMU `-append` / OVMF NVRAM boot-arg reach
+// the unikernel. Apps key boot-time configuration off the result
+// (e.g. `quic.log=events`).
+#[cfg(target_arch = "x86_64")]
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+static CMDLINE_REQUEST: ExecutableCmdlineRequest = ExecutableCmdlineRequest::new();
 
 // Limine MP request. The presence of this static tells Limine to
 // start every AP during its own pre-boot phase via INIT-SIPI-SIPI
@@ -267,6 +276,19 @@ pub unsafe extern "C" fn limine_entry() {
         let virt = resp.address() as u64;
         if virt != 0 && virt >= info.hhdm_offset {
             info.rsdp_paddr = virt - info.hhdm_offset;
+        }
+    }
+
+    // x86_64: kernel cmdline (Limine equivalent of FDT
+    // `chosen.bootargs`). Copy out into the kernel's static buffer
+    // so we don't keep a pointer into Limine's bootloader-
+    // reclaimable region. Missing response or empty cmdline → no
+    // install (`boot_args()` returns `""`).
+    #[cfg(target_arch = "x86_64")]
+    if let Some(resp) = CMDLINE_REQUEST.get_response() {
+        let bytes = resp.cmdline().to_bytes();
+        if !bytes.is_empty() {
+            uni_kernel::x86_64::boot_args::install(bytes);
         }
     }
 

@@ -625,10 +625,14 @@ fn publish_boot_info(net_ok: bool) {
     });
 }
 
-/// Per-arch boot-args resolver. Aarch64 reads from the FDT;
-/// x86_64 (Limine) returns `""` until we plumb the cmdline
-/// through. Apps tolerate the empty string fine — the QUIC
-/// log toggle, etc. just stay at their defaults.
+/// Per-arch boot-args resolver. Aarch64 reads from the FDT
+/// (`chosen.bootargs`, written by HVF runner's `--bootargs=` /
+/// QEMU `-append`); x86_64 reads from the static buffer that
+/// `limine_entry` populates from Limine's
+/// `ExecutableCmdlineRequest`. Both arches return `""` when no
+/// cmdline was supplied — apps tolerate the empty string fine
+/// (boot-arg toggles like `quic.log=events` just stay at their
+/// defaults).
 #[cfg(target_arch = "aarch64")]
 fn boot_args() -> &'static str {
     uni_kernel::aarch64::fdt::info().boot_args()
@@ -636,10 +640,7 @@ fn boot_args() -> &'static str {
 
 #[cfg(target_arch = "x86_64")]
 fn boot_args() -> &'static str {
-    // TODO: wire `limine::request::ExecutableCmdlineRequest`
-    // (or whatever the Limine 0.5 crate exposes) through to
-    // here so QEMU `-append` reaches the app.
-    ""
+    uni_kernel::x86_64::boot_args::boot_args()
 }
 
 /// Event loop idle callback. Core-aware:

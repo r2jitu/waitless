@@ -28,6 +28,7 @@ rust_library(
         "//bazel/platforms:x86_64": [
             "src/x86_64/acpi.rs",
             "src/x86_64/apic.rs",
+            "src/x86_64/boot_args.rs",
             "src/x86_64/gdt.rs",
             "src/x86_64/idt.rs",
             "src/x86_64/mod.rs",
