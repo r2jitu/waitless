@@ -981,13 +981,14 @@ impl Connection {
         n
     }
 
-    /// Pop the next outbound datagram by ownership, no copy.
-    /// Caller can pass the Vec straight to `sock.send_to(&vec)`,
-    /// then return it via `recycle_packet` for buffer reuse.
-    /// Saves the per-packet memcpy that the slice-based
-    /// `pop_packet` performs, plus enables the pool to reach
-    /// steady state (`pop_packet` recycles internally; this
-    /// hands off and trusts the caller).
+    /// Pop the next outbound datagram by ownership, no copy. The
+    /// Vec includes the L2/L3/L4 headroom prefix that
+    /// `take_datagram_buf` pre-reserved (see `MAX_L2_HEADROOM`);
+    /// the QUIC packet bytes start at `vec[MAX_L2_HEADROOM..]`.
+    /// Caller hands the whole Vec to
+    /// `sock.send_to_with_l2_headroom`, which fills the headers
+    /// in place, and returns it via [`recycle_packet`] for buffer
+    /// reuse.
     pub fn pop_packet_owned(&mut self) -> Option<Vec<u8>> {
         self.outbound.pop_front()
     }

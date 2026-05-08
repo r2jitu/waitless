@@ -18,7 +18,11 @@
 // state machine and an `Rc<UdpSocket>` for sending replies. It
 // `.await`s its `ConnInbox` for new datagrams; on each, it runs
 // `Connection::process_datagram` and drains outbound packets via
-// `pop_packet` + `sock.send_to`. When the connection ends
+// `pop_packet_owned` + `sock.send_to_with_l2_headroom`. The
+// outbound Vecs carry an L2/L3/L4 headroom prefix the encoder
+// pre-reserves in `take_datagram_buf`, so the bare-metal UDP
+// backend fills the Ethernet/IP/UDP headers in place without
+// memcpy'ing the QUIC packet bytes. When the connection ends
 // (Established + a future state-change to Closing/Closed, or
 // fatal error), the task exits and its `Rc<ConnInbox>` drops —
 // the slot's `Weak` upgrade fails on the next allocator pass and
