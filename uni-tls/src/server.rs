@@ -42,11 +42,24 @@ use crate::schedule as tls;
 /// bigger than this will close the connection.
 pub const RX_BUF_LEN: usize = 4 * 1024;
 
-/// Max raw TLS bytes we emit during the server flight
-/// (ServerHello + CCS + encrypted {EncExt, Certificate, CertVerify,
-/// Finished}). A typical self-signed ECDSA P-256 dev cert is ~550 bytes
-/// so the flight fits in ~1.5 KB; 4 KB is generous room.
-pub const TX_BUF_LEN: usize = 4 * 1024;
+/// Max raw TLS bytes we emit before the caller drains. Two callers
+/// push here:
+///   * the server handshake flight (ServerHello + CCS + encrypted
+///     {EncExt, Certificate, CertVerify, Finished}) — typically
+///     ~1.5 KB for a self-signed ECDSA P-256 dev cert.
+///   * `send_app_data` for the legacy slice-shaped path — it seals
+///     into tx_buf, the caller drains via `pop_tx`. The chain-shaped
+///     `send_app_data_chain` writes wire bytes into the caller's
+///     IOBufChain directly and bypasses tx_buf, so it doesn't pay
+///     this limit.
+///
+/// Sized to hold one full TLS 1.3 record (16 KiB inner plaintext +
+/// 22 B envelope) + handshake straggler room. A 4 KB tx_buf would
+/// have forced the legacy slice path to chunk plaintext below
+/// MAX_INNER_PLAINTEXT and emit multiple records per HTTP response;
+/// instead we pay 24 KB of fixed scratch per conn for the same
+/// wire shape every other TLS stack uses.
+pub const TX_BUF_LEN: usize = 24 * 1024;
 
 /// Max decrypted plaintext we buffer for the app (one HTTP request).
 pub const PT_BUF_LEN: usize = 4 * 1024;
@@ -501,6 +514,33 @@ impl TlsServer {
             .as_mut()
             .ok_or(HandshakeError::Internal)?;
         record::seal_in_place_split(tk, content_type::APPLICATION_DATA, body, trailer)
+            .map_err(|e| e.into())
+    }
+
+    /// Whole-chain in-place seal. Takes an `IOBufChain` of plaintext
+    /// parts (every part must be mutable — i.e. Heap or External),
+    /// prepends a fresh TLS record header IOBuf, appends a fresh
+    /// trailer IOBuf for the encrypted inner-content-type byte +
+    /// AEAD tag, and runs the scatter-gather AEAD across every part
+    /// in place. Zero plaintext-side coalesce: each part's bytes are
+    /// encrypted where the producer left them.
+    ///
+    /// Single-record only — caller chunks oversized chains. Returns
+    /// `Err(...)` derived from `seal_chain_in_place`'s errors:
+    ///   * `RecordTooLarge` / `OutputTooSmall` (Static-bearing chain
+    ///     — caller falls back to coalesce-then-seal).
+    pub fn send_app_data_chain(
+        &mut self,
+        chain: &mut uni_iobuf::IOBufChain,
+    ) -> Result<(), HandshakeError> {
+        if self.state != State::Established {
+            return Err(HandshakeError::UnexpectedRecord);
+        }
+        let tk = self
+            .server_ap_tk
+            .as_mut()
+            .ok_or(HandshakeError::Internal)?;
+        record::seal_chain_in_place(tk, content_type::APPLICATION_DATA, chain)
             .map_err(|e| e.into())
     }
 
