@@ -474,6 +474,20 @@ pub struct Connection {
     handshake_recv: Option<DirKeys>,
     application_send: Option<DirKeys>,
     application_recv: Option<DirKeys>,
+    /// Sticky flag set once we've discarded our Initial keys per
+    /// RFC 9001 §4.9.1 (first received Handshake packet). Without
+    /// this flag, `process_initial`'s `initial_recv.is_none()`
+    /// branch would helpfully re-derive Initial keys from a stale
+    /// retransmit's DCID — letting it decrypt + dispatch frames
+    /// from a peer that has long moved past Initial. The flag
+    /// gates the derive arm so straggler Initials fall through to
+    /// the late-drop counter instead.
+    initial_keys_discarded: bool,
+    /// Mirror of `initial_keys_discarded` for Handshake keys —
+    /// set when the TLS handshake reaches Established (RFC 9001
+    /// §4.9.2). Gates `process_handshake_pkt` against late
+    /// retransmits.
+    handshake_keys_discarded: bool,
     /// 0-RTT (early-data) packet-protection keys for *receiving*.
     /// `Some` only on a resumed handshake whose PSK validated;
     /// derived from `QuicTls::client_early_traffic_secret` once the
@@ -748,6 +762,8 @@ impl Connection {
             handshake_recv: None,
             application_send: None,
             application_recv: None,
+            initial_keys_discarded: false,
+            handshake_keys_discarded: false,
             initial_space: SpaceState::default(),
             handshake_space: SpaceState::default(),
             application_space: SpaceState::default(),
@@ -1504,6 +1520,20 @@ impl Connection {
         let (header_pn_offset, total_packet_len) = {
             let header =
                 parse_initial_header(bytes).map_err(|_| ConnError::Wire)?;
+            // Late retransmit Initial after we've already discarded
+            // Initial keys (RFC 9001 §4.9.1). Skip past it; both
+            // sides have moved on, the peer's PN ACK accounting
+            // doesn't need this one re-acked.
+            if self.initial_keys_discarded {
+                let total = header.pn_offset + header.length as usize;
+                if total > bytes.len() {
+                    return Err(ConnError::Wire);
+                }
+                crate::quic_event!(late_initial_dropped,
+                    "size={} dcid={}",
+                    total, crate::endpoint::hex8(header.preamble.dcid));
+                return Ok(total);
+            }
             if self.initial_recv.is_none() {
                 let dcid = ConnectionId::new(header.preamble.dcid);
                 let scid = ConnectionId::new(header.preamble.scid);
@@ -1568,6 +1598,16 @@ impl Connection {
         if total_packet_len > bytes.len() {
             return Err(ConnError::Wire);
         }
+        // Late retransmit Handshake after we've discarded our
+        // Handshake keys (RFC 9001 §4.9.2 — TLS handshake
+        // confirmed). Skip past it; counterpart of the late-Initial
+        // path in `process_initial`.
+        if self.handshake_keys_discarded {
+            crate::quic_event!(late_handshake_dropped,
+                "size={} dcid={}",
+                total_packet_len, crate::endpoint::hex8(preamble.dcid));
+            return Ok(total_packet_len);
+        }
 
         let recv_keys = self
             .handshake_recv
@@ -1582,6 +1622,27 @@ impl Connection {
         let payload_end = total_packet_len - TAG_LEN;
         let payload = &buf[payload_start..payload_end];
         self.dispatch_frames(CryptoLevel::Handshake, payload)?;
+
+        // RFC 9001 §4.9.1: a successfully-decrypted Handshake packet
+        // from the peer means both sides have moved past Initial.
+        // Discard Initial keys so straggler Initial retransmits fall
+        // through to `late_initial_dropped` instead of attempting
+        // AEAD against stale state. Edge-trigger via the
+        // `initial_keys_discarded` flag so the inner `is_none()`
+        // check in `process_initial` doesn't re-derive keys for a
+        // late Initial.
+        if !self.initial_keys_discarded {
+            self.initial_keys_discarded = true;
+            self.initial_send = None;
+            self.initial_recv = None;
+            // Bookkeeping for the now-defunct PN space — these are
+            // also cleared by the TLS-Established hook later, but
+            // doing them eagerly here is cheap and keeps state
+            // consistent with the "Initial is gone" invariant.
+            self.initial_space.sent_packets.clear();
+            self.initial_space.largest_acked = None;
+            self.time_of_last_ack_eliciting_us[0] = None;
+        }
 
         self.handshake_space.largest_recv_pn = Some(
             self.handshake_space
@@ -1710,6 +1771,25 @@ impl Connection {
 
         let payload = &buf[payload_start..payload_end];
         self.dispatch_frames(CryptoLevel::OneRtt, payload)?;
+
+        // RFC 9001 §4.9.2: a successfully-decrypted 1-RTT packet
+        // confirms the TLS handshake from the receiver's side
+        // (peer used 1-RTT keys we wouldn't have if Finished
+        // hadn't completed). Discard Handshake keys so straggler
+        // Handshake retransmits fall through to
+        // `late_handshake_dropped`. Edge-trigger via the flag —
+        // covers the case where the existing TLS-Established hook
+        // hasn't fired yet (it only fires when our TLS state
+        // advances; but the peer can send a 1-RTT packet
+        // earlier — coalesced with their Finished).
+        if !self.handshake_keys_discarded {
+            self.handshake_keys_discarded = true;
+            self.handshake_send = None;
+            self.handshake_recv = None;
+            self.handshake_space.sent_packets.clear();
+            self.handshake_space.largest_acked = None;
+            self.time_of_last_ack_eliciting_us[1] = None;
+        }
 
         self.application_space.largest_recv_pn = Some(
             self.application_space
@@ -2116,9 +2196,21 @@ impl Connection {
                 }
             }
             self.state = ConnState::Established;
-            // RFC 9001 §4.9.1 / §4.9.2 + RFC 9002 §A.5: when the
-            // handshake is confirmed, discard Initial AND
-            // Handshake loss-detection state. Without this:
+            // RFC 9001 §4.9.1 + RFC 9002 §A.5: discard Initial keys
+            // belt-and-braces here (the wire path also discards
+            // them on first received Handshake packet — see
+            // `process_handshake_pkt`). We do NOT discard Handshake
+            // keys here even though TLS is Established — the next
+            // `flush_outbound` still needs `handshake_send` to emit
+            // the ACK for the client's Finished. Handshake keys
+            // are discarded later in `process_short_header_packet`
+            // on the first successful 1-RTT decrypt: at that point
+            // the peer has provably moved on, no more Handshake
+            // packets are in flight in either direction, and the
+            // RFC 9001 §4.9.2 condition ("handshake is confirmed")
+            // is satisfied.
+            //
+            // The bookkeeping clears here matter independently:
             //   * `time_of_last_ack_eliciting_us[Initial]` is set
             //     when we send our ServerHello and never resets
             //     (Chrome stops sending Initial ACKs as soon as
@@ -2128,11 +2220,12 @@ impl Connection {
             //     `serverhello_time + pto_period`,
             //   * past that point, PTO fires every loop iteration
             //     until it backs off, throwing PING probes at
-            //     idle time. `pto_probes_sent` climbs without
-            //     matching loss / recovery activity.
-            // Clearing the bookkeeping (we keep the keys for now)
-            // lets the PTO timer key off only the application
-            // space, which has live ACKs flowing.
+            //     idle time.
+            if !self.initial_keys_discarded {
+                self.initial_keys_discarded = true;
+                self.initial_send = None;
+                self.initial_recv = None;
+            }
             self.initial_space.sent_packets.clear();
             self.initial_space.largest_acked = None;
             self.handshake_space.sent_packets.clear();
@@ -2173,11 +2266,16 @@ impl Connection {
         let mut datagram = self.take_datagram_buf(1500);
 
         // Initial packet (if there are bytes to send or an ACK pending).
+        // Skip if we've discarded our Initial keys per RFC 9001 §4.9.1
+        // — `initial_send` is None and the matching `ack_pending`
+        // state is conservatively cleared so it doesn't pile up.
         let mut initial_crypto = [0u8; 1024];
         let initial_n = self
             .tls
             .pop_handshake(CryptoLevel::Initial, &mut initial_crypto);
-        if initial_n > 0 || self.initial_space.ack_pending {
+        if self.initial_keys_discarded {
+            self.initial_space.ack_pending = false;
+        } else if initial_n > 0 || self.initial_space.ack_pending {
             self.encode_initial_packet(
                 datagram.vec_mut(),
                 &initial_crypto[..initial_n],
@@ -2191,11 +2289,18 @@ impl Connection {
         // bounded (cert + EE + CV + Finished, well under 8 KiB),
         // and the previous Vec::with_capacity(8192) was hitting
         // the heap on every flush.
+        // Skip if we've discarded our Handshake keys per RFC 9001
+        // §4.9.2 (peer sent a 1-RTT packet → both sides have moved
+        // on); same shape as the Initial guard above. The pending
+        // ACK state is dropped on the floor — peer doesn't expect
+        // a Handshake-level ACK once they've started 1-RTT.
         let mut hs_crypto = [0u8; 8192];
         let hs_n = self
             .tls
             .pop_handshake(CryptoLevel::Handshake, &mut hs_crypto);
-        if hs_n > 0 || self.handshake_space.ack_pending {
+        if self.handshake_keys_discarded {
+            self.handshake_space.ack_pending = false;
+        } else if hs_n > 0 || self.handshake_space.ack_pending {
             self.encode_handshake_packet(
                 datagram.vec_mut(),
                 &hs_crypto[..hs_n],

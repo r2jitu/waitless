@@ -64,6 +64,17 @@ pub struct Counters {
     /// We received a packet at a level we have no keys for (e.g.
     /// 1-RTT before handshake confirms).
     pub bad_state: AtomicU64,
+    /// Late Initial-level packet arrived after we discarded our
+    /// Initial keys per RFC 9001 §4.9.1 (first received Handshake
+    /// packet from the peer means both sides have moved past
+    /// Initial). Counts the harmless straggler retransmits that
+    /// previously surfaced as `aead_decrypt_failed` against stale
+    /// keys.
+    pub late_initial_dropped: AtomicU64,
+    /// Mirror of `late_initial_dropped` for Handshake-level
+    /// stragglers after we've discarded Handshake keys per RFC
+    /// 9001 §4.9.2 (TLS handshake confirmed).
+    pub late_handshake_dropped: AtomicU64,
     /// Unspecified wire-format error not covered by a more specific
     /// counter above. Aggregates the long tail so they're at least
     /// visible.
@@ -230,6 +241,8 @@ impl Counters {
             aead_decrypt_failed: AtomicU64::new(0),
             unknown_frame: AtomicU64::new(0),
             bad_state: AtomicU64::new(0),
+            late_initial_dropped: AtomicU64::new(0),
+            late_handshake_dropped: AtomicU64::new(0),
             other_wire: AtomicU64::new(0),
             unsupported_client: AtomicU64::new(0),
             tls_internal: AtomicU64::new(0),
@@ -376,7 +389,7 @@ pub fn should_log_event() -> bool {
 
 /// Snapshot of every counter, for `/debug/quic_stats`-style dumps.
 /// Returns `(name, value)` pairs in declaration order.
-pub fn snapshot() -> [(&'static str, u64); 37] {
+pub fn snapshot() -> [(&'static str, u64); 39] {
     let c = &COUNTERS;
     [
         ("no_dcid", c.no_dcid.load(Ordering::Relaxed)),
@@ -389,6 +402,8 @@ pub fn snapshot() -> [(&'static str, u64); 37] {
         ("aead_decrypt_failed", c.aead_decrypt_failed.load(Ordering::Relaxed)),
         ("unknown_frame", c.unknown_frame.load(Ordering::Relaxed)),
         ("bad_state", c.bad_state.load(Ordering::Relaxed)),
+        ("late_initial_dropped", c.late_initial_dropped.load(Ordering::Relaxed)),
+        ("late_handshake_dropped", c.late_handshake_dropped.load(Ordering::Relaxed)),
         ("other_wire", c.other_wire.load(Ordering::Relaxed)),
         ("unsupported_client", c.unsupported_client.load(Ordering::Relaxed)),
         ("tls_internal", c.tls_internal.load(Ordering::Relaxed)),
