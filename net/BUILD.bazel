@@ -140,6 +140,23 @@ rust_library(
     ],
 )
 
+# Destination-MAC resolution dispatcher. Thin layer over `arp` +
+# `ndp` that picks the right resolver based on the destination
+# IP family. Used by `tcp` and `udp`'s unified L2/L3/L4 frame
+# builders so they don't carry duplicate copies of the same
+# 10-line dispatch.
+rust_library(
+    name = "dst_mac",
+    srcs = ["src/dst_mac.rs"],
+    crate_name = "net_dst_mac",
+    crate_root = "src/dst_mac.rs",
+    deps = [
+        ":arp",
+        ":ndp",
+        ":types",
+    ],
+)
+
 # Outbound IPv6 helper — combines the wire-format builder with
 # NDP MAC resolution and ethernet_send. Mirrors `ipv4_send`'s
 # place in the dependency graph: TCP / UDP / the umbrella
@@ -167,13 +184,12 @@ rust_library(
     crate_name = "net_tcp",
     crate_root = "src/tcp.rs",
     deps = [
-        ":arp",
+        ":dst_mac",
         ":ethernet",
         ":from_bytes",
         ":ipv4",
         ":ipv6",
         ":ipv6_send",
-        ":ndp",
         ":types",
         "//drivers",
         "//kernel",
@@ -189,13 +205,12 @@ rust_library(
     crate_name = "net_udp",
     crate_root = "src/udp.rs",
     deps = [
-        ":arp",
+        ":dst_mac",
         ":ethernet",
         ":from_bytes",
         ":ipv4",
         ":ipv6",
         ":ipv6_send",
-        ":ndp",
         ":types",
         "//drivers",
         "//uni-iobuf",

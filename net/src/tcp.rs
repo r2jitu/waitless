@@ -12,19 +12,18 @@ extern crate uni_runtime;
 extern crate uni_drivers;
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
-extern crate net_arp as arp;
+extern crate net_dst_mac as dst_mac;
 extern crate net_ethernet as ethernet;
 extern crate net_ipv4 as ipv4;
 extern crate net_ipv6 as ipv6;
 extern crate net_ipv6_send as ipv6_send;
-extern crate net_ndp as ndp;
 extern crate bitflags;
 
 use alloc::boxed::Box;
 use core::ptr;
 use core::task::Waker;
 use from_bytes::FromBytes;
-use types::{IpAddr, Ipv4Addr, MacAddr, tcp_checksum_any, htons, ntohs, htonl, ntohl, CONFIG};
+use types::{IpAddr, MacAddr, tcp_checksum_any, htons, ntohs, htonl, ntohl};
 use ipv4::PROTO_TCP;
 
 bitflags::bitflags! {
@@ -765,29 +764,6 @@ fn payload_offset(local_ip: IpAddr) -> usize {
     }
 }
 
-/// Resolve the destination MAC for `dst_ip`. Returns `None` (drop)
-/// on ARP/NDP cache miss; the surrounding TCP retransmit timer
-/// retries.
-#[inline]
-fn resolve_dst_mac(dst_ip: IpAddr) -> Option<MacAddr> {
-    match dst_ip {
-        IpAddr::V4(d) => {
-            if CONFIG.ip() == Ipv4Addr::ANY {
-                Some(MacAddr::BROADCAST)
-            } else {
-                arp::arp_resolve(d)
-            }
-        }
-        IpAddr::V6(d) => {
-            if d.is_multicast() {
-                Some(d.multicast_mac())
-            } else {
-                ndp::ndp_resolve(&d)
-            }
-        }
-    }
-}
-
 /// Fill the ETH + IP + TCP headers of `frame` in place. `frame` must
 /// already contain the TCP payload at `frame[payload_offset(local_ip)..]`.
 /// `payload_len` is the bytes past the TCP header (TCP segment payload
@@ -882,7 +858,7 @@ fn send_segment(
     window: u16,
     payload: &[u8],
 ) {
-    let dst_mac = match resolve_dst_mac(dst_ip) {
+    let dst_mac = match dst_mac::resolve(dst_ip) {
         Some(m) => m,
         None => return, // ARP/NDP miss; TCP retransmit will retry
     };
@@ -924,7 +900,7 @@ fn send_segment_from_cursor(
     cursor: &mut uni_iobuf::Cursor<'_>,
     payload_len: usize,
 ) {
-    let dst_mac = match resolve_dst_mac(dst_ip) {
+    let dst_mac = match dst_mac::resolve(dst_ip) {
         Some(m) => m,
         None => return, // ARP/NDP miss; TCP retransmit will retry
     };

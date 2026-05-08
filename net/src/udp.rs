@@ -11,15 +11,14 @@ extern crate uni_runtime;
 extern crate uni_drivers;
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
-extern crate net_arp as arp;
+extern crate net_dst_mac as dst_mac;
 extern crate net_ethernet as ethernet;
 extern crate net_ipv4 as ipv4;
 extern crate net_ipv6 as ipv6;
 extern crate net_ipv6_send as ipv6_send;
-extern crate net_ndp as ndp;
 
 use from_bytes::FromBytes;
-use types::{IpAddr, Ipv4Addr, MacAddr, CONFIG, tcp_checksum, tcp_checksum_v6, htons, ntohs};
+use types::{IpAddr, CONFIG, tcp_checksum, tcp_checksum_v6, htons, ntohs};
 use ipv4::PROTO_UDP;
 
 #[repr(C, packed)]
@@ -70,29 +69,6 @@ fn payload_offset(dst_ip: IpAddr) -> usize {
     }
 }
 
-/// Resolve the destination MAC for `dst_ip`. Returns `None` (drop)
-/// on ARP/NDP cache miss; UDP is fire-and-forget so retries fall to
-/// the application layer (e.g. QUIC retransmits, DNS retries).
-#[inline]
-fn resolve_dst_mac(dst_ip: IpAddr) -> Option<MacAddr> {
-    match dst_ip {
-        IpAddr::V4(d) => {
-            if CONFIG.ip() == Ipv4Addr::ANY {
-                Some(MacAddr::BROADCAST)
-            } else {
-                arp::arp_resolve(d)
-            }
-        }
-        IpAddr::V6(d) => {
-            if d.is_multicast() {
-                Some(d.multicast_mac())
-            } else {
-                ndp::ndp_resolve(&d)
-            }
-        }
-    }
-}
-
 /// Zero-copy UDP send: caller pre-supplies a frame buffer where
 /// the first `MAX_L2_HEADROOM = 62` bytes are reserved for the
 /// L2/L3/L4 headers and the UDP payload starts at
@@ -122,7 +98,7 @@ pub fn send_with_l2_headroom(
     }
     let udp_len = UDP_HDR_LEN + payload_len;
 
-    let dst_mac = match resolve_dst_mac(dst) {
+    let dst_mac = match dst_mac::resolve(dst) {
         Some(m) => m,
         None => return,
     };
@@ -213,7 +189,7 @@ pub fn send_to_addr(dst: IpAddr, src_port: u16, dst_port: u16, data: &[u8]) {
         return;
     }
 
-    let dst_mac = match resolve_dst_mac(dst) {
+    let dst_mac = match dst_mac::resolve(dst) {
         Some(m) => m,
         None => return, // ARP/NDP miss; drop, app-layer retries
     };
