@@ -803,6 +803,48 @@ impl TlsStream {
     }
 }
 
+/// Wrap `scratch[..filled]` as an External IOBuf, push it as the
+/// only data part of `chain`, run the chain-shaped seal (which
+/// adds a header + trailer IOBuf around it), and ship to TCP.
+/// Caller resets `filled = 0` after.
+///
+/// Free function rather than `&mut self` method so the caller can
+/// borrow `tls` mutably and `tcp` immutably alongside the
+/// stack-local `scratch` without aliasing through `self` — Rust's
+/// borrow checker rejects the equivalent
+/// `self.flush_record(chain, &mut scratch, ...)` shape because
+/// `scratch` is conceptually-local-to-`send` but the method
+/// signature would re-borrow all of `self`.
+///
+/// SAFETY: `scratch`'s address is stable across `tcp.send.await`
+/// because the surrounding `send` future is `Pin`'d. The External
+/// IOBuf is dropped when `tcp.send` drains the chain — its
+/// `drop_fn = None` means no-op for the borrowed storage. After
+/// `flush_record` returns, no IOBuf aliases `scratch` and the
+/// caller can overwrite it.
+async fn flush_record(
+    tls: &mut Box<dyn TlsConn>,
+    tcp: &uni::runtime::TcpStream,
+    chain: &mut IOBufChain,
+    scratch: &mut [u8],
+    filled: usize,
+) -> Result<(), ()> {
+    debug_assert!(chain.is_empty());
+    let ext = unsafe {
+        IOBuf::from_external(
+            NonNull::new_unchecked(scratch.as_mut_ptr()),
+            scratch.len() as u32,
+            0,
+            filled as u32,
+            None,
+            core::ptr::null_mut(),
+        )
+    };
+    chain.push_back(ext);
+    tls.send_app_data_chain(chain).map_err(|_| ())?;
+    tcp.send(chain).await
+}
+
 impl HttpStream for TlsStream {
     async fn recv(&mut self, buf: &mut [u8]) -> usize {
         loop {
@@ -841,58 +883,53 @@ impl HttpStream for TlsStream {
             return Ok(());
         }
 
-        // TLS 1.3 RFC 8446 §5.1 caps inner plaintext at 2^14 B
-        // per record. Above that we have to split into multiple
-        // records.
+        // TLS 1.3 RFC 8446 §5.1 caps inner plaintext at 2^14 B per
+        // record. Hot path is a single record (≤16 KiB).
         const PLAINTEXT_CHUNK: usize = 16384;
 
-        if chain.total_len() <= PLAINTEXT_CHUNK {
-            // Single-record path. Try the chain-shaped seal first:
-            // every mutable (Heap / External) part gets encrypted
-            // in place where the producer left it — zero
-            // plaintext-side memcpy. The TLS layer prepends a
-            // header IOBuf + appends a trailer IOBuf to the chain,
-            // and the whole thing is wire-ready.
-            if self.tls.send_app_data_chain(chain).is_ok() {
-                self.tcp.send(chain).await?;
-                return Ok(());
-            }
-            // Fallback for Static-bearing chains: coalesce every
-            // part into a stack scratch and seal via the legacy
-            // `send_app_data` path. The TLS layer drains its
-            // tx_buf into TCP after.
-            let total = chain.total_len();
-            let mut scratch = [0u8; PLAINTEXT_CHUNK];
-            let mut filled = 0usize;
-            for part in chain.iter() {
-                scratch[filled..filled + part.len()].copy_from_slice(part.data());
-                filled += part.len();
-            }
-            debug_assert_eq!(filled, total);
-            self.tls.send_app_data(&scratch[..filled])?;
-            self.drain_tx().await?;
-            chain.clear();
-            return Ok(());
+        // Mutable-only fast path: chain-shaped AEAD encrypts every
+        // part in place, prepends a header IOBuf, appends a
+        // trailer IOBuf — zero plaintext-side memcpy. Single-
+        // record only (total ≤ 16 KiB); size mismatch or any
+        // Static-borrow part flips to the coalesce path below.
+        if chain.total_len() <= PLAINTEXT_CHUNK
+            && self.tls.send_app_data_chain(chain).is_ok()
+        {
+            return self.tcp.send(chain).await;
         }
 
-        // Oversize chain: spans more than one TLS record. Walk
-        // each part, chunking by part if needed, copy through
-        // send_app_data + drain. (Chain-shaped seal across
-        // multiple records — splitting a chain at a byte offset
-        // — is future work; this path is the rare case for HTTPS
-        // responses > 16 KiB.)
+        // Slow path: walk chain, copy bytes into a stack-local
+        // TLS-record-sized scratch in 16 KiB chunks, run the
+        // chain-shaped seal over the scratch, ship to TCP, repeat.
+        // Handles two cases under one path:
+        //   * Static-bearing chains that the in-place fast path
+        //     above can't seal (Static IOBufs aren't mutable).
+        //   * Oversized chains that span more than one record;
+        //     each chunk becomes its own TLS record.
+        //
+        // Stack scratch (not a per-conn Box) keeps the alloc
+        // pattern matched to the legacy code that worked on multi-
+        // core; the address is stable across awaits because the
+        // surrounding handle_conn future is `Pin`'d. Future work:
+        // size the chunk dynamically based on transport feedback
+        // (congestion, loss) once the QUIC path needs it.
+        let mut scratch = [0u8; PLAINTEXT_CHUNK];
+        let mut filled = 0usize;
         while let Some(part) = chain.pop_front() {
-            if part.is_empty() {
-                continue;
+            let mut data: &[u8] = part.data();
+            while !data.is_empty() {
+                let take = (PLAINTEXT_CHUNK - filled).min(data.len());
+                scratch[filled..filled + take].copy_from_slice(&data[..take]);
+                filled += take;
+                data = &data[take..];
+                if filled == PLAINTEXT_CHUNK {
+                    flush_record(&mut self.tls, &self.tcp, chain, &mut scratch, filled).await?;
+                    filled = 0;
+                }
             }
-            let data = part.data();
-            let mut offset = 0;
-            while offset < data.len() {
-                let end = (offset + PLAINTEXT_CHUNK).min(data.len());
-                self.tls.send_app_data(&data[offset..end])?;
-                self.drain_tx().await?;
-                offset = end;
-            }
+        }
+        if filled > 0 {
+            flush_record(&mut self.tls, &self.tcp, chain, &mut scratch, filled).await?;
         }
         Ok(())
     }
