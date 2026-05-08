@@ -883,36 +883,33 @@ impl HttpStream for TlsStream {
             return Ok(());
         }
 
-        // TLS 1.3 RFC 8446 §5.1 caps inner plaintext at 2^14 B per
-        // record. Hot path is a single record (≤16 KiB).
-        const PLAINTEXT_CHUNK: usize = 16384;
-
-        // Mutable-only fast path: chain-shaped AEAD encrypts every
-        // part in place, prepends a header IOBuf, appends a
-        // trailer IOBuf — zero plaintext-side memcpy. Single-
-        // record only (total ≤ 16 KiB); size mismatch or any
-        // Static-borrow part flips to the coalesce path below.
-        if chain.total_len() <= PLAINTEXT_CHUNK
-            && self.tls.send_app_data_chain(chain).is_ok()
-        {
-            return self.tcp.send(chain).await;
-        }
-
-        // Slow path: walk chain, copy bytes into a stack-local
-        // TLS-record-sized scratch in 16 KiB chunks, run the
-        // chain-shaped seal over the scratch, ship to TCP, repeat.
-        // Handles two cases under one path:
-        //   * Static-bearing chains that the in-place fast path
-        //     above can't seal (Static IOBufs aren't mutable).
-        //   * Oversized chains that span more than one record;
-        //     each chunk becomes its own TLS record.
+        // Walk every part of the input chain and pack bytes into a
+        // stack-local TLS-record-sized scratch. As each chunk fills,
+        // run the chain-shaped seal over the scratch (encrypt in
+        // place + add header / trailer IOBufs) and ship the wire-
+        // ready record to TCP. Last chunk flushes whatever's
+        // partial.
         //
-        // Stack scratch (not a per-conn Box) keeps the alloc
-        // pattern matched to the legacy code that worked on multi-
-        // core; the address is stable across awaits because the
-        // surrounding handle_conn future is `Pin`'d. Future work:
-        // size the chunk dynamically based on transport feedback
-        // (congestion, loss) once the QUIC path needs it.
+        // One uniform path for every chain shape and size:
+        //   * Small mutable-only chains (e.g. /stats body): pay one
+        //     plaintext memcpy into scratch — the all-mutable
+        //     encrypt-in-place fast path is gone in favour of a
+        //     single, simpler design.
+        //   * Static-bearing chains (e.g. shell pages): the same
+        //     memcpy moves Static bytes into mutable storage; chain
+        //     seal then encrypts in place inside scratch.
+        //   * Oversized chains (>16 KiB): scratch fills, flushes as
+        //     one record, resets, continues with the rest.
+        //
+        // Stack scratch (not a per-conn allocation) keeps the
+        // memory pattern aligned with the legacy code that worked
+        // on multi-core; the address is stable across awaits
+        // because the surrounding `handle_conn` future is `Pin`'d.
+        //
+        // Future work: size the chunk dynamically based on
+        // transport feedback (congestion, loss) once the QUIC path
+        // needs it.
+        const PLAINTEXT_CHUNK: usize = 16384;
         let mut scratch = [0u8; PLAINTEXT_CHUNK];
         let mut filled = 0usize;
         while let Some(part) = chain.pop_front() {
