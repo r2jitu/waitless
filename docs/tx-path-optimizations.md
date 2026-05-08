@@ -30,7 +30,7 @@ RX* — and tracks progress as we land them.
 | 5 | **TCP frame build** | `send_segment` / `send_segment_from_cursor` | **1× memcpy** | 14 + 20 + 20 B headers + 2 checksums | Cursor → one stack buffer with full [ETH][IP][TCP][PAYLOAD] (item A ✓) |
 | 6 | ~~IPv4 wrap~~ | — | — | — | Folded into step 5 (item A ✓) |
 | 7 | ~~Ethernet wrap~~ | — | — | — | Folded into step 5 (item A ✓) |
-| 8 | ~~virtio-net submit memcpy~~ | — (item B ✓ for TCP) | — | descriptor add + kick | TCP writes directly into the TX pool slot via `acquire_tx_buf` + `submit_tx` |
+| 8 | ~~virtio-net submit memcpy~~ | — (item B ✓ for TCP, B2 ✓ for QUIC) | — | descriptor add + kick | Both TCP and QUIC write directly into the TX pool slot via `acquire_tx_buf` + `submit_tx` |
 | 9 | virtio host pickup | (HVF userspace_net or KVM) | depends on host | — | HVF: another memcpy to host TCP socket |
 | 10 | Host TCP/IP/Eth | host kernel | host-side | — | TSO can fold this on real NICs |
 | 11 | Wire | network stack | — | — | MTU, cwnd, RTT |
@@ -51,18 +51,17 @@ seal a TLS record over the chain bytes.
 | 2 | H3 frame encode | `uni-http3/src/*` | — | small `Vec::with_capacity` per frame | HEADERS / DATA / etc. |
 | 3 | **QUIC packet encode** | `encode_one_rtt_packet` etc. (`uni-quic/src/conn.rs:2018+`) | **1× memcpy** | `Vec::with_capacity(1024)` for frames + `take_datagram_buf` (~1500 B, pooled with 62 B L2/L3/L4 headroom prefix after item Q) | Frame headers + STREAM data written into the datagram Vec; for 1-RTT packets writes directly (no temp staging Vec); Initial/Handshake still stage via temp `frames` Vec |
 | 4 | QUIC AEAD seal | within `seal_packet` | 1× R/W (ChaCha20) + 1× R (Poly1305) | — | In place over the assembled packet bytes |
-| 5 | `pop_packet_owned` | `uni-quic/src/endpoint.rs` | — (move) | — | Vec ownership transferred to the reactor |
+| 5 | `pop_packet_owned` | `uni-quic/src/endpoint.rs` | — (move) | — | `DatagramBuf` ownership transferred to the reactor; `TxSlot` variant carries a `TxBufHandle` (zero-copy ship), `Heap` variant carries a `Vec<u8>` (recycled via the conn's pool) |
 | 6 | ~~UDP wrap~~ | — (item Q ✓) | — | — | Folded into step 3 — encoder writes packet bytes directly into the framing buffer's UDP-payload region; bare-metal `send_with_l2_headroom` fills UDP/IP/Eth headers in the pre-reserved headroom |
 | 7 | ~~IPv4 wrap~~ | — | — | — | Folded into step 6 (item P ✓ and Q ✓) |
 | 8 | ~~Ethernet wrap~~ | — | — | — | Folded into step 6 (item P ✓ and Q ✓) |
-| 9 | **virtio-net submit** | `virtio_net::send` | **1× memcpy** | descriptor + kick | → TX pool slot |
+| 9 | ~~virtio-net submit memcpy~~ | — (item B2 ✓) | — | descriptor + kick | QUIC encoder writes directly into a TX-pool slot via `take_datagram_buf` → `acquire_tx_buf`; reactor's `ship_datagram` extracts the handle and submits via `send_via_tx_handle`. IPv4 destinations do an in-place 20-byte payload memmove (driver expects L2 frame at slot offset 0); IPv6 is pure zero-copy. Heap fallback when the pool is empty. |
 | 10+ | Host pickup, host kernel, wire, browser | — | — | — | Same as TCP from this point on |
 
-Active per-byte memcpys on the guest side: **2** (steps 3, 9) —
-down from 5 before items A, P, and Q. Same as TCP after A. Item B
-(virtio SG TX descriptors) targets step 9, dropping both paths to
-**1 memcpy per byte** — the fundamental encoder write that can't
-be removed without offloading AEAD to the NIC.
+Active per-byte memcpys on the guest side: **1** (step 3) — down
+from 5 before items A, P, Q, B2. Same as TCP after B. The
+fundamental encoder write that can't be removed without offloading
+AEAD to the NIC.
 
 ## Segment 1 — Inside the unikernel (TLS encrypt → NIC TX)
 
@@ -91,12 +90,13 @@ be removed without offloading AEAD to the NIC.
 
 ### B. SG TX API (direct-fill from caller into the TX pool)
 - **Status**: [x] **landed 2026-05-08** for **TCP** (commits
-  `936f03f`, `84777e2`). UDP/QUIC integration deferred — see
-  follow-up note.
-- **Result**: -1 memcpy per byte on the TCP TX hot path. Driver
-  exposes `acquire_tx_buf() -> Option<TxBufHandle>` + `submit_tx`;
-  caller (TCP) writes straight into a slot of the existing 64-slot
-  `tx_pool`, no intermediate stack buffer + memcpy.
+  `936f03f`, `84777e2`) and for **QUIC** (B2; commits `68f985f`
+  + this commit).
+- **Result**: -1 memcpy per byte on the TCP TX and QUIC TX hot
+  paths. Driver exposes `acquire_tx_buf() -> Option<TxBufHandle>`
+  + `submit_tx`; caller (TCP and QUIC) writes straight into a
+  slot of the existing 64-slot `tx_pool`, no intermediate stack
+  buffer + memcpy.
   * Implementation: new `TxBufHandle` struct in `uni-net::driver`
     with `Drop` returning the slot to the pool unused; `submit_tx`
     `mem::forget`s the handle to skip release.
@@ -110,17 +110,25 @@ be removed without offloading AEAD to the NIC.
   * 1c: ~108 → ~114k req/s (+5%)
   * 2c: ~150 → ~170k       (+13%)
   * 3c: ~150 → ~171k       (+14%)
-- **Follow-up: UDP/QUIC** (separate item, call it B2). The
-  current `udp::send_with_l2_headroom` takes a caller-supplied
-  `&mut [u8]` (typically the QUIC encoder's outbound Vec). Using
-  the SG TX API there would still pay the Vec → pool-slot
-  memcpy in the backend — same cost as today. The actual win
-  for QUIC requires the encoder to write directly into a TX
-  pool slot (replace `outbound: VecDeque<Vec<u8>>` with
-  `VecDeque<TxBufHandle>`), which is the deeper QUIC-side
-  refactor that Q's headroom-prefix approach didn't take.
-  Tracked as a follow-up; QUIC TX stays at 2 memcpys/byte for
-  now (encode + driver-pool).
+- **B2 (QUIC integration)**: `Connection::outbound:
+  VecDeque<Vec<u8>>` is now `VecDeque<DatagramBuf>`. `DatagramBuf`
+  is an enum with two variants: `Heap(Vec<u8>)` (heap fallback)
+  and `TxSlot { handle: TxBufHandle, vec: ManuallyDrop<Vec<u8>> }`
+  (the encoder's writes land in the slot's data region directly,
+  with the Vec wrapper suppressing dealloc on drop).
+  `take_datagram_buf` tries `acquire_tx_buf` first; the encoder's
+  audited `&mut Vec<u8>` write surface (push / extend_from_slice
+  / truncate / split_at_mut — never `reserve`) is safe with
+  capacity 1514. The reactor's drain path collapses three
+  duplicated loops (the `drain_outbound` method + the PTO probe
+  drain + the main loop drain) into a shared `ship_datagram`
+  helper that dispatches on the variant: TxSlot extracts the
+  handle and ships via `send_via_tx_handle` (zero-copy on IPv6;
+  20 B in-place memmove on IPv4 because the driver expects the
+  L2 frame at slot offset 0); Heap falls back to
+  `send_to_with_l2_headroom` and recycles the Vec into the
+  conn's pool. End state: QUIC TX hot path is **1 memcpy per
+  byte** — the fundamental encrypt R/W pass.
 - **Note (`send_on_qp` busy-spin)**: still there in the slow path
   used by ARP/DHCP/ICMP/UDP and the TCP fallback when the pool
   is full. With the new acquire path returning `None` on full,
@@ -449,11 +457,10 @@ items until they unlock something concrete.
 3. ✓ **Q** — QUIC packets into framing buffer. Done.
 4. ✓ **D** — fused copy + encrypt for TLS single-record path. Done.
 5. ✓ **B** (TCP) — direct-fill TX pool. Done.
-6. **B2** (UDP/QUIC) — extend B to QUIC by replacing
-   `outbound: VecDeque<Vec<u8>>` with `VecDeque<TxBufHandle>`
-   so the QUIC encoder writes directly into a TX pool slot.
-   Doesn't help the slow-path UDP callers (DNS, ICMP).
-   QUIC-only win.
+6. ✓ **B2** (UDP/QUIC) — extend B to QUIC. Done. QUIC encoder
+   writes directly into a TX pool slot via the `DatagramBuf::TxSlot`
+   variant; reactor ships zero-copy via `send_via_tx_handle`. Heap
+   fallback retained for pool exhaustion.
 7. **G** (TSO) — biggest single Tier 1 win once we benchmark on
    KVM/GCE. Depends on B.
 8. **M** (conn-state pool) — the alloc-side equivalent of A+C;
@@ -564,3 +571,26 @@ E and F are low-effort cleanups that can land any time.
   TlsConn::send_app_data_chain_to → TlsStream::send fused fast
   path on chains ≤ 16 KiB. Bench within noise on /health (need
   larger body to surface the per-byte savings).
+- **2026-05-08** — Item **B2 landed** (`68f985f` + this commit):
+  QUIC encoder writes directly into a driver TX-pool slot. New
+  `DatagramBuf` enum with `Heap(Vec<u8>)` and
+  `TxSlot { handle: TxBufHandle, vec: ManuallyDrop<Vec<u8>> }`
+  variants. `Connection::take_datagram_buf` tries
+  `uni_runtime::net::acquire_tx_buf` first and wraps the slot's
+  data region as a `Vec` via `from_raw_parts` (capacity = 1514,
+  len pre-set to 62 B headroom for L2/L3/L4). Encoder writes
+  packet bytes via the existing `&mut Vec<u8>` surface (audited:
+  push / extend_from_slice / truncate / split_at_mut only — no
+  realloc-triggering calls). Reactor's three drain sites (the
+  `drain_outbound` method + the PTO probe drain + the main loop
+  drain) collapse into a shared `ship_datagram` helper that
+  dispatches on the variant: TxSlot ships zero-copy via
+  `send_via_tx_handle` (the bare-metal backend fills the
+  L2/L3/L4 headers in the slot's headroom in place — IPv6 is
+  pure zero-copy; IPv4 does an in-place `ptr::copy` to slide the
+  payload back 20 bytes); Heap falls back to
+  `send_to_with_l2_headroom` and recycles the Vec. End state:
+  **1 memcpy per byte** on the QUIC TX hot path (just the
+  encrypt R/W pass), matching post-B TCP. Bench HVF
+  health_tls_max 1c steady at ~108 k req/s; QUIC integration
+  test green (`test_hvf`, `test_mc_hvf`).
