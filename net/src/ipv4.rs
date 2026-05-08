@@ -85,6 +85,36 @@ fn next_ip_id() -> u16 {
         .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Length in bytes of the IPv4 header (no options).
+pub const HEADER_LEN: usize = 20;
+
+/// Write an IPv4 header in place into `slot` (which must be at
+/// least [`HEADER_LEN`] bytes). `total_len` is the IP `total_length`
+/// field (header + L4 payload). Used by upper layers that want to
+/// compose `[ETH][IP][L4][payload]` in a single buffer without
+/// memcpy'ing through the legacy `ipv4_send` slow path.
+#[inline]
+pub fn fill_header(slot: &mut [u8], src: Ipv4Addr, dst: Ipv4Addr, proto: u8, total_len: u16) {
+    debug_assert!(slot.len() >= HEADER_LEN);
+    // SAFETY: caller ensures `slot.len() >= HEADER_LEN`. `Ipv4Header` is
+    // `repr(C)` plain bytes (`FromBytes`), so writing through the cast
+    // is well-defined for all field bytes.
+    unsafe {
+        let hdr = &mut *(slot.as_mut_ptr() as *mut Ipv4Header);
+        hdr.version_ihl = 0x45;
+        hdr.tos = 0;
+        hdr.total_length = htons(total_len);
+        hdr.identification = htons(next_ip_id());
+        hdr.flags_fragment = htons(0x4000);
+        hdr.ttl = 64;
+        hdr.protocol = proto;
+        hdr.checksum = 0;
+        hdr.src = src;
+        hdr.dst = dst;
+        hdr.checksum = checksum(slot.as_ptr(), HEADER_LEN);
+    }
+}
+
 pub fn ipv4_send(dst: Ipv4Addr, proto: u8, payload: &[u8]) {
     let payload_len = payload.len().min(1480);
     let total_len = 20 + payload_len;

@@ -64,6 +64,23 @@ pub fn ethernet_our_mac() -> MacAddr {
     }
 }
 
+/// Write an Ethernet II header in place into `slot` (which must be
+/// at least [`HEADER_LEN`] bytes). Used by upper layers composing
+/// `[ETH][IP][L4][payload]` in one buffer instead of memcpy'ing
+/// through the legacy `ethernet_send` slow path.
+#[inline]
+pub fn fill_header(slot: &mut [u8], dst: MacAddr, src: MacAddr, ethertype: u16) {
+    debug_assert!(slot.len() >= HEADER_LEN);
+    // SAFETY: caller ensures `slot.len() >= HEADER_LEN`.
+    // `EthernetHeader` is `repr(C, packed)` plain bytes (`FromBytes`).
+    unsafe {
+        let hdr = &mut *(slot.as_mut_ptr() as *mut EthernetHeader);
+        hdr.dst = dst;
+        hdr.src = src;
+        hdr.ethertype = htons(ethertype);
+    }
+}
+
 pub fn ethernet_send(dst: MacAddr, ethertype: u16, payload: &[u8]) {
     // Stack-allocated buffer: safe for multi-core (each core has its own stack).
     // Use MaybeUninit to avoid zeroing 1514 bytes — we fill the header and

@@ -81,6 +81,30 @@ pub struct Ipv6Packet<'a> {
 /// the standard 1500-byte Ethernet MTU.
 pub const MAX_PAYLOAD: usize = 1500 - HEADER_LEN;
 
+/// Write an IPv6 header in place into `slot` (which must be at
+/// least [`HEADER_LEN`] bytes). `payload_len` is the bytes that
+/// follow the header (the IPv6 `payload_length` field). Used by
+/// upper layers composing `[ETH][IP6][L4][payload]` in one buffer.
+#[inline]
+pub fn fill_header(
+    slot: &mut [u8],
+    src: &Ipv6Addr,
+    dst: &Ipv6Addr,
+    next_header: u8,
+    hop_limit: u8,
+    payload_len: u16,
+) {
+    debug_assert!(slot.len() >= HEADER_LEN);
+    // First u32: version(4) | traffic_class(8) | flow_label(20).
+    // Always emit version=6, class=0, flow=0 → 0x60000000.
+    slot[0..4].copy_from_slice(&0x6000_0000u32.to_be_bytes());
+    slot[4..6].copy_from_slice(&htons(payload_len).to_ne_bytes());
+    slot[6] = next_header;
+    slot[7] = hop_limit;
+    slot[8..24].copy_from_slice(&src.octets);
+    slot[24..40].copy_from_slice(&dst.octets);
+}
+
 /// Build a complete IPv6 packet (header + payload) into `out`.
 /// Returns the total bytes written, or `None` if `out` is too
 /// small or `payload` exceeds `MAX_PAYLOAD`.
