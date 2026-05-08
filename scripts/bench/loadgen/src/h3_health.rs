@@ -26,6 +26,14 @@ use crate::WorkloadResult;
 
 const PER_OP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Run `f` only the first time the gate is `false`. Lets each
+/// per-worker error path log once instead of once-per-iteration.
+fn log_first<F: FnOnce(&mut bool)>(gate: &mut bool, f: F) {
+    if !*gate {
+        f(gate);
+    }
+}
+
 #[derive(Debug)]
 struct NoCertVerify;
 
@@ -150,6 +158,13 @@ pub async fn run(
         let h = tokio::spawn(async move {
             let mut hist = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap();
             let mut count_post = 0u64;
+            // First-occurrence log gates: a single stuck connection
+            // would otherwise spam stderr with the same line every
+            // few microseconds.
+            let mut logged_send_err = false;
+            let mut logged_send_timeout = false;
+            let mut logged_recv_err = false;
+            let mut logged_recv_timeout = false;
 
             // One QUIC endpoint (UDP socket) per worker so each
             // worker drives its own 4-tuple (the unikernel hashes
@@ -214,6 +229,12 @@ pub async fn run(
                     .body(())
                     .unwrap();
 
+                // Per-op error handling: log once per failure mode
+                // (not once per iteration) — a stuck connection
+                // would otherwise spam stderr with thousands of
+                // identical lines. The loadgen's stdout RPS / P50_US
+                // / P99_US line is what the harness consumes; stderr
+                // is for diagnostics only.
                 let mut stream = match timeout(
                     PER_OP_TIMEOUT,
                     send_request.send_request(req),
@@ -221,17 +242,53 @@ pub async fn run(
                 .await
                 {
                     Ok(Ok(s)) => s,
-                    _ => continue,
+                    Ok(Err(e)) => {
+                        log_first(&mut logged_send_err, |once| {
+                            eprintln!(
+                                "h3_health[{worker_idx}]: send_request err (logged once): {e}"
+                            );
+                            *once = true;
+                        });
+                        continue;
+                    }
+                    Err(_) => {
+                        log_first(&mut logged_send_timeout, |once| {
+                            eprintln!(
+                                "h3_health[{worker_idx}]: send_request timed out (logged once)"
+                            );
+                            *once = true;
+                        });
+                        continue;
+                    }
                 };
                 if timeout(PER_OP_TIMEOUT, stream.finish()).await.is_err() {
                     continue;
                 }
-                // Drain headers + body. We don't care about the
-                // contents; just want the round-trip cost.
-                let _ = timeout(PER_OP_TIMEOUT, stream.recv_response()).await;
+                match timeout(PER_OP_TIMEOUT, stream.recv_response()).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => {
+                        log_first(&mut logged_recv_err, |once| {
+                            eprintln!(
+                                "h3_health[{worker_idx}]: recv_response err (logged once): {e}"
+                            );
+                            *once = true;
+                        });
+                        continue;
+                    }
+                    Err(_) => {
+                        log_first(&mut logged_recv_timeout, |once| {
+                            eprintln!(
+                                "h3_health[{worker_idx}]: recv_response timed out (logged once)"
+                            );
+                            *once = true;
+                        });
+                        continue;
+                    }
+                }
                 loop {
                     match timeout(PER_OP_TIMEOUT, stream.recv_data()).await {
                         Ok(Ok(Some(_chunk))) => continue,
+                        Ok(Ok(None)) => break,
                         _ => break,
                     }
                 }
