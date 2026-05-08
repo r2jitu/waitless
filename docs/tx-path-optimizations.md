@@ -200,6 +200,97 @@ A, B below collapse that to 1.
 - **Effort**: low-medium if the H3 stack already supports it.
 - **Risk**: low.
 
+## Allocations (separate dimension from memcpy)
+
+Measured: **/diagnostics over HTTPS/1.1 = 11 allocs**, **over H3 =
+19 allocs** for a cold-conn first request. Decomposition:
+
+| # | Alloc | Site | Per-… |
+|---|-------|------|------|
+| 1 | `Box::pin(async move {...})` (conn future) | `uni-runtime/src/net/tcp.rs:475` | conn-accept |
+| 2 | spawn task struct | `crate::spawn_boxed` | conn-accept |
+| 3 | `Box<TlsConnImpl>` | `uni-tls/src/lib.rs:163` | conn-accept |
+| 4 | `rx_buf` `Box<[u8; 4096]>` | `TlsServer::new` | conn-accept |
+| 5 | `tx_buf` `Box<[u8; 4096]>` | `TlsServer::new` | conn-accept |
+| 6 | `pt_buf` `Box<[u8; 4096]>` | `TlsServer::new` | conn-accept |
+| 7 | `body_scratch` `Box<[u8; 16384]>` | `handle_conn` | conn-accept |
+| 8 | VecDeque overflow | first chain `push_back` past INLINE_PARTS | first request per conn |
+| 9 | seal trailer Heap IOBuf (17 B) | `seal_chain_in_place` | per-record (also in TX memcpy table item C) |
+| 10 | seal header Heap IOBuf (5 B) | `seal_chain_in_place` | per-record (also in TX memcpy table item C) |
+| H3 +1..+8 | per-packet/frame `Vec::with_capacity` | `uni-quic/src/conn.rs` (frame & datagram encode) | per H3 packet |
+
+Item **C** in the memcpy plan removes #9 and #10 by baking the
+record envelope into the TLS scratch.
+
+Item **#8** (VecDeque overflow) is one alloc per conn, amortized
+on subsequent requests via retained capacity. Not tracked as a
+separate task — tuning `INLINE_PARTS` to a specific page is
+fragile and the cost is bounded.
+
+The remaining per-conn-accept allocs (#1–#7) are the lever for
+the work below.
+
+### M. Conn-state pool
+- **Status**: [ ] not started
+- **Where**: `uni-runtime/src/net/tcp.rs` (accept site),
+  `uni-tls/src/lib.rs::new_connection`,
+  `uni-tls/src/server.rs::TlsServer::new`,
+  `uni-http/src/lib.rs::handle_conn` (`body_scratch`).
+- **What**: Recycle the chunky per-conn allocations across
+  accept/close cycles instead of allocating fresh per accept.
+  Pool the things that have stable shape and size:
+  * `Box<TlsConnImpl>` and the 3 `Box<[u8; 4096]>` it holds inside
+    (`rx_buf`, `tx_buf`, `pt_buf`). Reset on return: zero the seq
+    counters + key state, leave the buffers untouched.
+  * The 16 KiB `body_scratch` from `handle_conn`.
+  * Optionally, the conn-accept `Box::pin` future and spawn task
+    struct (smaller wins; folder N below).
+- **Win**: -5..7 allocs **per conn-accept**. Heap-traffic + talc
+  spinlock contention drops in proportion to conn churn.
+  * Keep-alive bench (current local benches): noise.
+  * Curl-style / Internet-facing serving: can drop the per-request
+    alloc count from ~11 to ~4 on cold conns.
+  * Also avoids the per-conn-Box-alloc bug class we hit earlier
+    on 2c (HEAD~2 of this branch) where adding any `Box<[u8]>`
+    field to `TlsStream` wedged half of accepted conns under
+    multi-core load.
+- **Effort**: medium. Per-worker SPSC free list keyed by the
+  pool's struct shape; reset hooks on return; pool-watermark
+  cap to avoid unbounded growth.
+- **Risk**: medium. Reset semantics need care — leftover state
+  (seq numbers, partial RX buffer contents) must not survive
+  into the next conn.
+
+### N. Conn future + spawn-task pool (follow-up to M)
+- **Status**: [ ] not started, after M
+- **Where**: `uni-runtime/src/net/tcp.rs:475` Box::pin site,
+  `crate::spawn_boxed` task allocation.
+- **What**: Once M lands the conn-state pool, the remaining two
+  per-accept allocs are the boxed accept-body future and the
+  task struct itself. Both are small and have stable layout.
+  Pool either (a) the boxed future (a `Pin<Box<dyn Future>>`
+  wrapping the same conn handler shape), or (b) the task slot
+  the spawner places it in. Smaller individual win than M but
+  closes out the conn-accept alloc count.
+- **Effort**: medium-high (touches the spawner internals).
+- **Risk**: medium.
+
+### O. QUIC encode-side `Vec` recycling (H3 path)
+- **Status**: [ ] not started, after M
+- **Where**: per-frame and per-datagram encode sites in
+  `uni-quic/src/conn.rs` (already an `outbound_pool` for the
+  datagram-sized buffer at line 1011; per-frame Vecs are not
+  yet pooled).
+- **What**: H3 has 8 more allocs than H/1.1 per cold-conn
+  /diagnostics request, almost all from `Vec::with_capacity` in
+  the QUIC encode path. Same pooling pattern as M but at a
+  different layer: each `Vec` recycled through a per-conn (or
+  per-worker) free list. The existing `outbound_pool` provides
+  the template.
+- **Win**: -5..8 allocs per H3 request under load.
+- **Effort**: medium.
+- **Risk**: low.
+
 ## Recommended sequence
 
 1. **A + C** together — mechanical, very testable, removes 3
@@ -210,7 +301,12 @@ A, B below collapse that to 1.
    the prerequisite for G.
 4. **G (TSO)** — biggest single Tier 1 win once we benchmark on
    KVM/GCE.
-5. **J (compression)** + **K (0-RTT)** + **L (Early Hints)** when
+5. **M (conn-state pool)** — the alloc-side equivalent of A+C;
+   biggest *alloc-count* win whenever conn churn matters. Land
+   any time after we have a conn-churn workload to bench against
+   — local keep-alive bench won't show it.
+6. **N + O** — close out the alloc tail once M is in.
+7. **J (compression)** + **K (0-RTT)** + **L (Early Hints)** when
    we shift focus from local benchmarks to Internet-facing serving.
 
 E and F are low-effort cleanups that can land any time.
@@ -220,3 +316,8 @@ E and F are low-effort cleanups that can land any time.
 - **2026-05-08** — Doc created. Per-byte guest-side memcpy count
   measured at 5 (steps 3, 5, 6, 7, 8). Bench baseline:
   `health_tls_max` ≈ 108 k req/s 1c HVF, ≈ 150 k 2c, ≈ 150 k 3c.
+- **2026-05-08** — Allocations dimension added. /diagnostics
+  cold-conn alloc count traced: 11 (H/1.1) / 19 (H3). 7 are
+  conn-accept setup (item M), 1 is chain VecDeque overflow
+  (untracked — page-specific tuning), 2 are TLS seal IOBufs
+  (covered by item C), H3 extras are QUIC encode Vecs (item O).
