@@ -469,6 +469,10 @@ pub(super) static NATIVE_TCP_BACKEND: uni_runtime::net::TcpBackend =
         try_send: native_tcp_try_send_chain,
         register_send_waker: native_tcp_register_send_waker,
         clear_send_waker: native_tcp_clear_send_waker,
+        // Native (POSIX SOCK_STREAM) doesn't expose a TX-pool
+        // slot to write into — the kernel owns that region.
+        // Callers fall back to the regular `try_send` chain path.
+        try_send_tso: None,
         shutdown_all: None,
     };
 

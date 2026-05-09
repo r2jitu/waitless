@@ -1025,6 +1025,106 @@ fn send_super_segment_from_cursor(
     );
 }
 
+/// Try to send a single TCP TSO super-segment whose payload is
+/// produced by `fill`. The closure is called with a mutable byte
+/// slice into the driver's TX-pool big-slot's payload region
+/// (i.e. the bytes after [ETH][IP][TCP] headers); it writes
+/// payload bytes there and returns the byte count written.
+/// This function fills the L2/L3/L4 headers around the closure's
+/// output, calls `submit_tx_tso`, and advances `snd_nxt`.
+///
+/// The TLS layer uses this to encrypt directly into the TX-pool
+/// slot — eliminating the stack-scratch → TX-slot memcpy that
+/// the regular `async_try_send_chain` path does. The closure
+/// receives access to bytes already in the driver's exclusive-
+/// write buffer; the TLS encrypter's chain-to primitive walks
+/// the plaintext chain and produces ciphertext directly into
+/// those bytes.
+///
+/// Returns:
+///   * `Some(payload_len)` on success — the bytes are in flight.
+///   * `None` when no TSO slot is available (TSO not negotiated,
+///     big pool full, conn not Established, dst MAC unresolved,
+///     stale `gen`). Caller falls back to the regular send path.
+pub fn try_send_tso(
+    handle: *mut (),
+    generation: u16,
+    fill: &mut dyn FnMut(&mut [u8]) -> usize,
+) -> Option<usize> {
+    let (core, slot) = decode_handle(handle)?;
+    // SAFETY: per-core ownership; the worker that registered
+    // this backend is the one calling here.
+    let c = unsafe { &mut *conn_ptr(core, slot) };
+    if c.generation != generation {
+        return None;
+    }
+    if c.state != TcpState::Established {
+        return None;
+    }
+    let dst_mac = dst_mac::resolve(c.remote_ip)?;
+    let mut handle = uni_drivers::net::acquire_tx_tso_buf()?;
+
+    let payload_off = payload_offset(c.local_ip);
+    let cap = handle.data_cap() as usize;
+    let max_payload = cap.saturating_sub(payload_off);
+
+    // Hand the post-header region of the slot to the closure.
+    // The closure (typically the TLS encrypt-chain-to path)
+    // writes ciphertext bytes here and returns the count.
+    let payload_len = {
+        let region = &mut handle.data_mut()[payload_off..payload_off + max_payload];
+        fill(region)
+    };
+    if payload_len == 0 {
+        // Nothing to send — slot returns to the pool via the
+        // handle's Drop without a virtio descriptor enqueue.
+        return Some(0);
+    }
+    if payload_len > max_payload {
+        // Closure overran (shouldn't happen given the slice we
+        // handed in had capacity = max_payload). Defensive.
+        return None;
+    }
+
+    let frame_len = payload_off + payload_len;
+    let frame = &mut handle.data_mut()[..frame_len];
+
+    // Fill ETH + IP + TCP headers in the prefix region.
+    // SAFETY: caller verified `c` is exclusively-owned by this
+    // worker; the frame slice is a fresh mutable reborrow that
+    // doesn't alias with anything else (the closure's earlier
+    // payload-region borrow ended above).
+    unsafe {
+        fill_tcp_frame_headers(
+            frame, c.local_ip, c.remote_ip, dst_mac,
+            c.local_port, c.remote_port,
+            c.snd_nxt, c.rcv_nxt,
+            TCP_ACK | TCP_PSH,
+            c.rx_free() as u16,
+            payload_len,
+        );
+    }
+    // Zero the TCP checksum: NEEDS_CSUM tells the device to
+    // compute it per emitted segment. Same convention as
+    // `send_super_segment_from_cursor`.
+    let tcp_off = match c.local_ip {
+        IpAddr::V4(_) => ETH_HDR_LEN + IPV4_HDR_LEN,
+        IpAddr::V6(_) => ETH_HDR_LEN + IPV6_HDR_LEN,
+    };
+    frame[tcp_off + 16] = 0;
+    frame[tcp_off + 17] = 0;
+
+    let mss = mss_for(c.local_ip);
+    let hdr_len = payload_off as u16;
+    let csum_start = tcp_off as u16;
+    uni_drivers::net::submit_tx_tso(
+        handle, frame_len, hdr_len, csum_start, mss as u16,
+    );
+
+    c.snd_nxt = c.snd_nxt.wrapping_add(payload_len as u32);
+    Some(payload_len)
+}
+
 /// Per-MSS fallback path — used when [`send_super_segment_from_cursor`]
 /// can't acquire a TX-pool slot. Loops `send_segment_from_cursor`
 /// over the cursor as the original (pre-TSO) path did.

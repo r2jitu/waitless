@@ -164,6 +164,34 @@ impl TcpStream {
         TcpSendChain::new(self.handle, self.generation, chain)
     }
 
+    /// Try to send a single TSO super-segment whose payload is
+    /// produced by `fill`. The closure receives a mutable byte
+    /// slice into the driver's TX-pool big-slot's payload region
+    /// (after L2/L3/L4 headers); it writes payload bytes and
+    /// returns the count. The TCP layer fills the headers around
+    /// it and submits.
+    ///
+    /// Returns `Some(n)` when the super-segment was submitted
+    /// (n = bytes written), or `None` if no TSO slot was
+    /// available — caller falls back to the regular `send()`
+    /// path. Bare-metal only; native always returns `None`.
+    ///
+    /// Used by `TlsStream::send` to encrypt ciphertext directly
+    /// into the driver's TX-pool slot (eliminating the
+    /// stack-scratch → TX-slot memcpy on the TLS-over-TCP fast
+    /// path).
+    pub fn try_send_tso<F>(&self, mut fill: F) -> Option<usize>
+    where
+        F: FnMut(&mut [u8]) -> usize,
+    {
+        if self.handle.is_null() {
+            return None;
+        }
+        let backend = tcp_backend()?;
+        let f = backend.try_send_tso?;
+        f(self.handle, self.generation, &mut fill)
+    }
+
     /// Async byte-slice write — convenience wrapper that builds
     /// a 1-element `IOBufChain` borrowing `data` and hands it to
     /// [`Self::send`]. Resolves `Ok(())` when every byte is on
@@ -318,6 +346,29 @@ pub struct TcpBackend {
         fn(handle: *mut (), generation: u16, waker: &Waker),
     /// Drop the stored send waker.
     pub clear_send_waker: fn(handle: *mut (), generation: u16),
+
+    /// Optional fast path: try to send a single TSO super-segment
+    /// (TCP-level payload up to ~16 KiB) whose payload bytes are
+    /// produced by the `fill` closure into a driver TX-pool
+    /// big-slot. The closure is called with a mutable byte slice
+    /// into the slot's payload region (after L2/L3/L4 headers);
+    /// it writes payload bytes and returns the count.
+    ///
+    /// Returns:
+    ///   * `Some(n)` on successful submission (n = bytes written).
+    ///   * `None` when TSO isn't supported, no slot is available,
+    ///     conn isn't Established, dst MAC isn't resolved, or the
+    ///     backend doesn't expose this surface (`None` outer).
+    ///
+    /// Used by the TLS-over-TCP fast path to encrypt ciphertext
+    /// directly into the driver's TX-pool slot — eliminating the
+    /// stack-scratch → TX-slot memcpy that `try_send` would do
+    /// after a separate encrypt-into-scratch pass.
+    pub try_send_tso: Option<fn(
+        handle: *mut (),
+        generation: u16,
+        fill: &mut dyn FnMut(&mut [u8]) -> usize,
+    ) -> Option<usize>>,
 
     /// Optional. RST every connection currently in the backend's
     /// pool — called once at shutdown so peers see an immediate

@@ -40,6 +40,7 @@ static BARE_TCP_BACKEND: uni_runtime::net::TcpBackend = uni_runtime::net::TcpBac
     try_send: tcp::async_try_send_chain,
     register_send_waker: tcp::register_send_waker,
     clear_send_waker: tcp::clear_send_waker,
+    try_send_tso: Some(tcp::try_send_tso),
     shutdown_all: Some(bare_shutdown_all),
 };
 

@@ -938,28 +938,70 @@ impl HttpStream for TlsStream {
             return Ok(());
         }
 
-        // Stack-local TLS scratch. Reused across the fast (single-
-        // record) and slow (oversize) paths below. The address is
-        // stable across awaits because the surrounding `handle_conn`
-        // future is `Pin`'d.
+        // Fast-fast path: encrypt directly into a TX-pool big-slot
+        // when TSO is available. The TLS chain-to primitive walks
+        // the plaintext chain and writes ciphertext bytes straight
+        // into the driver's TX-pool slot's payload region — no
+        // stack-scratch buffer in between, no scratch → TX-slot
+        // memcpy. Saves one full pass through 16 KiB of bytes
+        // per record vs the regular fast path below.
+        //
+        // `try_send_tso` returns None when the big pool is full,
+        // TSO isn't negotiated, the conn isn't Established, or
+        // we're on native (no driver TX pool to write into) — in
+        // any of those cases we fall through to the stack-scratch
+        // fast path.
+        if chain.total_len() <= PLAINTEXT_CHUNK {
+            let mut tls_err = false;
+            let submitted = self.tcp.try_send_tso(|payload_region| {
+                // The TSO TX-pool big-slot's payload region is
+                // sized to fit one full TLS record (5 + 16384 +
+                // 17 = 16406 bytes max). Wrap as a transient
+                // IOBuf with TLS_HEADROOM reserved for the
+                // record-header prepend, then run the fused
+                // encrypt-chain-to primitive — same primitive
+                // the stack-scratch path uses, just pointed at
+                // the driver's slot instead.
+                let mut dst = unsafe { scratch_iobuf(payload_region, 0) };
+                if self.tls
+                    .send_app_data_chain_to(chain, &mut dst)
+                    .is_err()
+                {
+                    tls_err = true;
+                    return 0;
+                }
+                dst.len()
+            });
+            if tls_err {
+                return Err(());
+            }
+            if submitted.is_some() {
+                chain.clear();
+                return Ok(());
+            }
+            // TSO unavailable — fall through to stack-scratch.
+        }
+
+        // Stack-local TLS scratch. Used by the regular fast path
+        // (chain ≤ one record) when the TSO direct-encrypt path
+        // wasn't taken, and by the slow path (oversize chain)
+        // below. The address is stable across awaits because
+        // the surrounding `handle_conn` future is `Pin`'d.
         let mut scratch = [0u8; TLS_SCRATCH_LEN];
 
-        // Fast path: chain fits in one record. Use the fused
-        // copy-and-encrypt primitive — `tls.send_app_data_chain_to`
-        // walks `chain` and `cipher.apply_keystream_b2b`'s each
-        // part directly into `scratch`'s payload region. Single
-        // pass through the destination (vs the slow path's
-        // copy-then-encrypt-in-place double pass).
+        // Fast path: chain fits in one record but the TSO direct-
+        // encrypt path wasn't available (big pool full, TSO not
+        // negotiated, native backend, etc.). Encrypt into the
+        // stack scratch, then hand the wire-ready record to the
+        // regular `tcp.send` (which itself uses TSO when
+        // available — the difference vs the fast-fast path above
+        // is one extra 16 KiB memcpy from scratch into the slot).
         if chain.total_len() <= PLAINTEXT_CHUNK {
             let mut dst = unsafe { scratch_iobuf(&mut scratch, 0) };
             self.tls
                 .send_app_data_chain_to(chain, &mut dst)
                 .map_err(|_| ())?;
-            // The seal primitive reads `chain` non-destructively;
-            // drain it now so the caller's invariant
-            // (`out_chain.is_empty()` after send) holds.
             chain.clear();
-            // Ship the wire-ready record.
             let mut record_chain = IOBufChain::new();
             record_chain.push_back(dst);
             return self.tcp.send(&mut record_chain).await;
