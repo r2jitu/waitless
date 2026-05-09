@@ -70,3 +70,17 @@ pub use conn::{ConnError, ConnState, Connection, ConnectionId, SERVER_CID_LEN};
 pub use endpoint::{quic_listen, QuicConn, QuicListenError, QuicListener};
 pub use inbox::ConnInbox;
 pub use tls::{CryptoLevel, QuicTls, QuicTlsError, QuicTlsState};
+
+/// Force-exercise every QUIC + TLS primitive that lazily allocates
+/// inside its RustCrypto crate so the heap allocations land in
+/// `HEAP_BASELINE` at boot rather than being charged to the first
+/// connection as a per-conn delta. Idempotent.
+///
+/// Today this delegates entirely to [`uni_tls::preinit`] — every
+/// QUIC primitive that allocates lazily (ECDSA, ChaCha20-Poly1305,
+/// X25519) lives inside the TLS sans-io modules. If a future QUIC-
+/// only primitive (e.g. AES-128-GCM for Initial-packet protection)
+/// ever grows its own lazy state, the exercise for it goes here.
+pub fn preinit() {
+    uni_tls::preinit();
+}

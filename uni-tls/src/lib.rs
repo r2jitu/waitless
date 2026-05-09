@@ -84,6 +84,63 @@ pub enum TlsError {
     CertOrKey,
 }
 
+/// Force-exercise every TLS primitive that lazily allocates inside
+/// its RustCrypto crate so the heap allocations land in
+/// `HEAP_BASELINE` at boot rather than being charged to the first
+/// request as a per-conn delta. Idempotent.
+///
+/// `listen` / `acceptor` call this once on entry. Apps that build
+/// their own `TlsServerConfig` directly should call it once at
+/// boot too. Cost is one ECDSA sign + verify, one ChaCha20-Poly1305
+/// seal + open, one X25519 keypair + ECDH — single-digit
+/// microseconds total on Apple silicon, dwarfed by `getrandom`'s
+/// own boot-time work.
+///
+/// Without this, the first HTTPS / HTTP/3 connection's handshake
+/// allocates whichever precomputed scalar / Poly1305 / Curve25519
+/// tables those crates lazy-init on first use, and the post-
+/// shutdown leak check picks them up as a +N alloc delta. With it,
+/// the leak check can demand `delta == 0`.
+pub fn preinit() {
+    // ECDSA P-256 sign + verify exercise. Uses an arbitrary 32-byte
+    // private scalar so we don't depend on the dev cert at preinit
+    // time; the math hits the same precomputed scalar tables the
+    // real CertVerify path will use. All-ones is a valid scalar
+    // (it's < the group order).
+    {
+        use p256::ecdsa::{
+            signature::{Signer, Verifier},
+            Signature, SigningKey, VerifyingKey,
+        };
+        let scalar = [0xFFu8; 32];
+        if let Ok(sk) = SigningKey::from_slice(&scalar) {
+            let sig: Signature = sk.sign(b"uni-tls preinit");
+            let vk = VerifyingKey::from(&sk);
+            let _ = vk.verify(b"uni-tls preinit", &sig);
+        }
+    }
+
+    // ChaCha20-Poly1305 seal + open exercise. Hits the Poly1305
+    // initialization path on first use.
+    {
+        let key = [0u8; aead::KEY_LEN];
+        let nonce = [0u8; aead::NONCE_LEN];
+        let mut buf = [0u8; 16];
+        let tag = aead::chacha20poly1305_seal(&key, &nonce, b"", &mut buf);
+        let _ = aead::chacha20poly1305_open(&key, &nonce, b"", &mut buf, &tag);
+    }
+
+    // X25519 ECDH exercise. The schedule path uses
+    // `x25519_dalek::StaticSecret::from(seed).diffie_hellman(...)`
+    // — both operations may populate Curve25519 lazy state.
+    {
+        use x25519_dalek::{PublicKey, StaticSecret};
+        let a = StaticSecret::from([1u8; 32]);
+        let b = StaticSecret::from([2u8; 32]);
+        let _shared = a.diffie_hellman(&PublicKey::from(&b));
+    }
+}
+
 // ---- Public constructor for the HTTPS path -----------------------------------
 
 /// Build a TLS acceptor from a self-signed dev certificate

@@ -70,6 +70,25 @@ where
     H: Fn(Request) -> F + Send + Sync + Clone + 'static,
     F: core::future::Future<Output = Response> + 'static,
 {
+    // Pay one-time lazy-init costs upfront so they land in the
+    // HEAP_BASELINE snapshot rather than the first request's
+    // alloc delta. Two contributors:
+    //
+    //   * `huffman::warmup` builds the QPACK static Huffman
+    //     decoder tree (~4 KiB Vec) that's otherwise allocated
+    //     on the first decoded request header.
+    //   * `uni_quic::preinit` (which delegates to uni_tls)
+    //     exercises the RustCrypto primitives (p256 sign +
+    //     verify, ChaCha20-Poly1305 seal + open, X25519 ECDH)
+    //     so any internal precomputed-table allocations on
+    //     first use happen now.
+    //
+    // Without these the post-shutdown leak check has to tolerate
+    // a fixed cushion (~12 KiB / ~10 allocs in measurements
+    // before this lands); with them it can demand `delta == 0`.
+    crate::huffman::warmup();
+    uni_quic::preinit();
+
     let handler = Arc::new(handler);
     let listener = quic_listen(port, cert_der, key_pkcs8_der, move |conn: QuicConn| {
         let handler = Arc::clone(&handler);
