@@ -49,6 +49,11 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::cell::RefCell;
+use core::mem::ManuallyDrop;
+
+use uni_worker::{CurrentWorker, WorkerLocal};
 
 // Sans-io TLS primitives (formerly //net:tls{,_crypto,_handshake,_record}).
 // Pub because //uni-quic reaches into `schedule`, `aead`, `handshake`
@@ -158,7 +163,10 @@ pub fn acceptor(
 ) -> Result<Arc<dyn uni_http::Tls>, TlsError> {
     let cfg = TlsServerConfig::from_dev_cert(cert_der, key_pkcs8_der)
         .ok_or(TlsError::CertOrKey)?;
-    Ok(Arc::new(TlsImpl { cfg: Arc::new(cfg) }))
+    Ok(Arc::new(TlsImpl {
+        cfg: Arc::new(cfg),
+        pool: TlsConnPool::new(),
+    }))
 }
 
 /// Error from [`listen`]: either the cert / key pair didn't parse,
@@ -209,49 +217,163 @@ pub fn tls_profile_reset() {
     profile::reset();
 }
 
+// ---- Conn-state pool (item M) -----------------------------------------------
+//
+// Recycles `Box<TlsConnImpl>` instances across accept/close cycles
+// instead of paying ~7 chunky heap allocs per accept (TlsConnImpl
+// + 3 × 4 KiB rx/tx/pt buffers + handshake state). On accept we
+// pop a freed instance, `TlsServer::reset` it with a fresh ephemeral
+// seed, and reuse its buffers; on close, the wrapper's `Drop` pushes
+// the inner box back to the pool. Pre-M baseline `tls_handshake_max`
+// bench: 7.25 allocs/iter; post-M target: ~0 once steady-state pool
+// usage stabilises.
+//
+// Per-worker storage. Tier 1 multi-queue assigns each conn task to
+// exactly one worker, and that worker owns the conn for its lifetime
+// (no migration), so `WorkerLocal<RefCell<Vec<...>>>` gives us
+// lock-free pool ops on the steady-state path. The `Arc<TlsConnPool>`
+// is shared across `TlsImpl` (one per HTTPS listener) and every
+// `PooledTlsConn` it issues; when LISTENERS drains and the listener
+// + every live conn drop, the Arc count hits zero, the pool drops,
+// and all retained `Box<TlsConnImpl>` go with it — no separate
+// shutdown-drain hook needed.
+
+const POOL_CAP: usize = 16;
+
+pub(crate) struct TlsConnPool {
+    slots: WorkerLocal<RefCell<Vec<Box<TlsConnImpl>>>>,
+}
+
+// SAFETY: `WorkerLocal<T>` is `Sync` for `T: Send`; `RefCell` is
+// `Send`; `Box<TlsConnImpl>` is `Send` (TlsServer is `Send` —
+// inner `Box<[u8]>` plus `Send`-friendly key state). The
+// `WorkerLocal` access path bounds borrowing to the current
+// worker via `CurrentWorker`, so the `RefCell::borrow_mut` inside
+// `with` can never race across workers.
+
+impl TlsConnPool {
+    fn new() -> Arc<Self> {
+        let pool = TlsConnPool { slots: WorkerLocal::new() };
+        pool.slots.ensure_init(uni::num_workers(), |_| {
+            RefCell::new(Vec::with_capacity(POOL_CAP))
+        });
+        Arc::new(pool)
+    }
+
+    /// Pop an idle `Box<TlsConnImpl>` for this worker, or `None`
+    /// if the worker's slot is empty (caller falls back to fresh
+    /// alloc).
+    fn pop(&self) -> Option<Box<TlsConnImpl>> {
+        if !self.slots.is_initialized() {
+            return None;
+        }
+        let cc = CurrentWorker::enter();
+        self.slots.with(&cc, |c| c.borrow_mut().pop())
+    }
+
+    /// Push an idle `Box<TlsConnImpl>` back to this worker's slot,
+    /// or drop it if the slot is full / pool not initialised.
+    fn push(&self, boxed: Box<TlsConnImpl>) {
+        if !self.slots.is_initialized() {
+            return; // Box drops at scope-end
+        }
+        let cc = CurrentWorker::enter();
+        self.slots.with(&cc, |c| {
+            let mut v = c.borrow_mut();
+            if v.len() < POOL_CAP {
+                v.push(boxed);
+            }
+            // else: pool full — Box drops at scope-end
+        });
+    }
+}
+
 // ---- uni_http::Tls impl ------------------------------------------------------
 
 struct TlsImpl {
     cfg: Arc<TlsServerConfig>,
+    pool: Arc<TlsConnPool>,
 }
 
 impl uni_http::Tls for TlsImpl {
     fn new_connection(&self, seed: [u8; 32]) -> Box<dyn uni_http::TlsConn> {
-        Box::new(TlsConnImpl {
-            tls: server::TlsServer::new(seed),
-            cfg: self.cfg.clone(),
+        // Pop a recycled inner if this worker has one cached;
+        // otherwise allocate fresh. Either way, the seed seeds a
+        // fresh X25519 keypair + key schedule for this connection.
+        let inner = match self.pool.pop() {
+            Some(mut boxed) => {
+                boxed.tls.reset(seed);
+                boxed
+            }
+            None => Box::new(TlsConnImpl {
+                tls: server::TlsServer::new(seed),
+                cfg: self.cfg.clone(),
+            }),
+        };
+        Box::new(PooledTlsConn {
+            inner: ManuallyDrop::new(inner),
+            pool: Arc::clone(&self.pool),
         })
     }
 }
 
-struct TlsConnImpl {
+/// Inner per-conn TLS state. Pooled by `TlsConnPool`; the
+/// `cfg` Arc is invariant across the pool's lifetime (every
+/// pooled instance came from the same `TlsImpl`), so `reset`
+/// only has to touch the `tls` field.
+pub(crate) struct TlsConnImpl {
     tls: server::TlsServer,
     cfg: Arc<TlsServerConfig>,
 }
 
-impl uni_http::TlsConn for TlsConnImpl {
+/// Pool-aware `TlsConn` wrapper returned from
+/// `TlsImpl::new_connection`. On drop, takes the inner
+/// `Box<TlsConnImpl>` out and pushes it back to the pool —
+/// the next accept on this worker will pop + reset it instead
+/// of paying a fresh allocation.
+struct PooledTlsConn {
+    inner: ManuallyDrop<Box<TlsConnImpl>>,
+    pool: Arc<TlsConnPool>,
+}
+
+impl Drop for PooledTlsConn {
+    fn drop(&mut self) {
+        // SAFETY: ManuallyDrop::take moves the inner Box out
+        // exactly once — this is the only access, and `self`
+        // drops immediately after, so the `inner` field is
+        // never read again.
+        let inner = unsafe { ManuallyDrop::take(&mut self.inner) };
+        self.pool.push(inner);
+    }
+}
+
+impl uni_http::TlsConn for PooledTlsConn {
     fn push_rx(&mut self, bytes: &[u8]) {
-        self.tls.push_rx(bytes);
+        self.inner.tls.push_rx(bytes);
     }
 
     fn advance(&mut self) -> Result<(), ()> {
-        self.tls.advance(&self.cfg).map(|_| ()).map_err(|_| ())
+        // Reborrow split: take an immutable Arc clone of cfg first
+        // so the subsequent `&mut self.inner.tls` borrow doesn't
+        // conflict with reading `self.inner.cfg`.
+        let inner = &mut **self.inner;
+        inner.tls.advance(&inner.cfg).map(|_| ()).map_err(|_| ())
     }
 
     fn pop_tx(&mut self, out: &mut [u8]) -> usize {
-        self.tls.pop_tx(out)
+        self.inner.tls.pop_tx(out)
     }
 
     fn pop_plaintext(&mut self, out: &mut [u8]) -> usize {
-        self.tls.pop_plaintext(out)
+        self.inner.tls.pop_plaintext(out)
     }
 
     fn send_app_data(&mut self, data: &[u8]) -> Result<(), ()> {
-        self.tls.send_app_data(data).map_err(|_| ())
+        self.inner.tls.send_app_data(data).map_err(|_| ())
     }
 
     fn send_app_data_iobuf(&mut self, buf: &mut uni_iobuf::IOBuf) -> Result<(), ()> {
-        self.tls.send_app_data_iobuf(buf).map_err(|_| ())
+        self.inner.tls.send_app_data_iobuf(buf).map_err(|_| ())
     }
 
     fn send_app_data_chain_to(
@@ -259,10 +381,10 @@ impl uni_http::TlsConn for TlsConnImpl {
         src_chain: &uni_iobuf::IOBufChain,
         dst: &mut uni_iobuf::IOBuf,
     ) -> Result<(), ()> {
-        self.tls.send_app_data_chain_to(src_chain, dst).map_err(|_| ())
+        self.inner.tls.send_app_data_chain_to(src_chain, dst).map_err(|_| ())
     }
 
     fn close_notify(&mut self) -> Result<(), ()> {
-        self.tls.close_notify().map_err(|_| ())
+        self.inner.tls.close_notify().map_err(|_| ())
     }
 }

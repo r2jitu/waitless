@@ -364,6 +364,55 @@ impl TlsServer {
         }
     }
 
+    /// Reset this TlsServer for reuse on a fresh connection while
+    /// preserving the `rx_buf` / `tx_buf` / `pt_buf` heap allocations.
+    /// Observable state matches `TlsServer::new(seed)` after the
+    /// call — buffers are logically empty (length cursors at 0),
+    /// fresh X25519 keypair, all traffic keys cleared, transcript /
+    /// key schedule reinitialised — but the three 4 KiB buffers
+    /// don't re-allocate.
+    ///
+    /// Used by the per-worker conn-state pool (item M in
+    /// docs/tx-path-optimizations.md): a freed `Box<TlsConnImpl>`
+    /// is reset and pushed back to the pool; the next accept pops
+    /// it instead of allocating a new TlsServer + 3 buffers.
+    ///
+    /// Buffer contents are not zeroed — the buffer slots
+    /// (`..rx_len`, `..tx_len`, `..pt_len`) are inaccessible via
+    /// the API once their length cursors reset to 0, and
+    /// application plaintext that lived in `pt_buf` during the
+    /// previous conn isn't secret cryptographic material in our
+    /// model (the application already saw it). `rx_buf` / `tx_buf`
+    /// only ever held ciphertext.
+    pub fn reset(&mut self, x25519_seed: [u8; 32]) {
+        // Wipe handshake-secret arrays before clearing — same
+        // discipline as our Drop impl. TrafficKey and KeySchedule
+        // wipe their own key/iv/secret in their Drop impls when we
+        // overwrite them below.
+        if let Some(mut s) = self.server_hs_secret.take() {
+            tls::secure_zero(&mut s);
+        }
+        if let Some(mut s) = self.client_hs_secret.take() {
+            tls::secure_zero(&mut s);
+        }
+
+        self.state = State::WaitClientHello;
+        self.error = None;
+        self.rx_len = 0;
+        self.tx_len = 0;
+        self.tx_pos = 0;
+        self.pt_len = 0;
+        self.pt_pos = 0;
+        self.transcript = Transcript::new();
+        self.schedule = KeySchedule::new_without_psk();
+        self.ephemeral = Some(X25519ServerKey::from_seed(x25519_seed));
+        self.client_hs_tk = None;
+        self.server_hs_tk = None;
+        self.client_ap_tk = None;
+        self.server_ap_tk = None;
+        // server_hs_secret / client_hs_secret already cleared above.
+    }
+
     // ── Outward API (caller-driven) ─────────────────────────────────
 
     /// Push raw TLS bytes from the peer into the RX buffer. Returns
