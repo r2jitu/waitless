@@ -2189,7 +2189,21 @@ impl Connection {
                 ));
             }
         }
-        if matches!(new_state, QuicTlsState::Established) {
+        // `Failed` is terminal — never resurrect it. Without this
+        // guard, a peer-initiated CONNECTION_CLOSE (handled in
+        // `dispatch_frames` by setting `state = Failed`) is
+        // immediately negated by the next `advance_tls` call: TLS
+        // is still `Established` (CONNECTION_CLOSE is a transport-
+        // level frame, not a TLS-level event), so the block below
+        // would set `state = Established` again, bump
+        // `handshakes_completed`, and the conn-task's `state ==
+        // Failed` break check at the loop tail never fires. Each
+        // subsequent inbound datagram (retransmit CLOSE, late ACK,
+        // …) repeats the cycle, inflating
+        // `handshakes_completed` by hundreds per conn lifecycle.
+        if matches!(new_state, QuicTlsState::Established)
+            && !matches!(self.state, ConnState::Failed)
+        {
             // Edge-trigger the event so a flapping flush_outbound
             // doesn't double-count.
             if !matches!(self.state, ConnState::Established) {
