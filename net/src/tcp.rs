@@ -1714,11 +1714,16 @@ pub fn async_try_send_chain(
 
     let mss = mss_for(c.local_ip);
     let mut cursor = chain.cursor();
-    // TSO fast path: when the driver advertises TSOv4 (and the
-    // payload exceeds one MSS, so we'd otherwise loop), hand the
+    // TSO fast path: when the driver advertises TSOv4, hand the
     // whole chain to the driver in a single super-segment. The
-    // device does the per-MSS split host-side.
-    if total > mss && uni_drivers::net::tso_available()
+    // device does the per-MSS split host-side AND computes per-
+    // segment TCP/IP checksums (NEEDS_CSUM), so we save a
+    // checksum-compute pass per segment regardless of payload
+    // size — even single-MSS sends benefit. The size cap matches
+    // the big-pool slot capacity; payloads larger than that fall
+    // back to the per-MSS loop (rare for HTTPS — the TLS layer
+    // pre-chunks at PLAINTEXT_CHUNK = 16 KiB).
+    if uni_drivers::net::tso_available()
         && payload_offset(c.local_ip) + total <= TSO_FRAME_BUF_LEN
     {
         send_super_segment_from_cursor(
