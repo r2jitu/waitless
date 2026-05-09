@@ -716,9 +716,15 @@ pub struct Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        crate::diag::COUNTERS
-            .conns_dropped
-            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        // Bump the counter unconditionally, log only at events
+        // verbosity (matches the existing `conns_allocated` event).
+        // Pairing those two log lines line-for-line in the serial
+        // output is the cheapest way to spot a leaked conn:
+        // every `conns_allocated` should have a matching
+        // `conns_dropped`.
+        crate::quic_event!(conns_dropped,
+            "local_cid={}",
+            crate::endpoint::hex8(self.local_cid.as_slice()));
     }
 }
 
