@@ -89,6 +89,7 @@ where
     crate::huffman::preinit();
     uni_quic::preinit();
     uni_http::body_scratch_preinit();
+    uni_http::tls_scratch_preinit();
 
     let handler = Arc::new(handler);
     let listener = quic_listen(port, cert_der, key_pkcs8_der, move |conn: QuicConn| {
