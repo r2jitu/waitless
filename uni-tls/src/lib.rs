@@ -52,6 +52,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::mem::ManuallyDrop;
+use core::ptr::addr_of_mut;
 
 use uni_worker::{CurrentWorker, WorkerLocal};
 
@@ -305,10 +306,7 @@ impl uni_http::Tls for TlsImpl {
                 boxed.tls.reset(seed);
                 boxed
             }
-            None => Box::new(TlsConnImpl {
-                tls: server::TlsServer::new(seed),
-                cfg: self.cfg.clone(),
-            }),
+            None => TlsConnImpl::new_box(seed, self.cfg.clone()),
         };
         Box::new(PooledTlsConn {
             inner: ManuallyDrop::new(inner),
@@ -321,9 +319,36 @@ impl uni_http::Tls for TlsImpl {
 /// `cfg` Arc is invariant across the pool's lifetime (every
 /// pooled instance came from the same `TlsImpl`), so `reset`
 /// only has to touch the `tls` field.
+///
+/// `TlsServer` carries its rx/tx/pt buffers inline (see
+/// `server.rs` tunables), so `Box<TlsConnImpl>` is **one**
+/// contiguous heap allocation covering the metadata + 12 KB of
+/// buffers + the cfg pointer. Fresh-conn allocation count is
+/// `1` total — the pre-inline design did 4 (struct + three
+/// `Box<[u8]>`).
 pub(crate) struct TlsConnImpl {
     tls: server::TlsServer,
     cfg: Arc<TlsServerConfig>,
+}
+
+impl TlsConnImpl {
+    /// Allocate + initialise in place. Wraps
+    /// `Box::<MaybeUninit<Self>>::new_uninit()` so the 12 KB
+    /// `TlsServer` field never round-trips through a stack
+    /// temporary — same constraint as `TlsServer::new_box` (and
+    /// the same fix).
+    fn new_box(seed: [u8; 32], cfg: Arc<TlsServerConfig>) -> Box<Self> {
+        let mut b = Box::<Self>::new_uninit();
+        // SAFETY: `b.as_mut_ptr()` points at uninitialised storage
+        // sized for `Self`. We initialise both fields below; on
+        // return `assume_init` is sound.
+        unsafe {
+            let p = b.as_mut_ptr();
+            server::TlsServer::init_in_place(addr_of_mut!((*p).tls), seed);
+            addr_of_mut!((*p).cfg).write(cfg);
+            b.assume_init()
+        }
+    }
 }
 
 /// Pool-aware `TlsConn` wrapper returned from

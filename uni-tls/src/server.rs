@@ -10,8 +10,8 @@
 // §4.3.1 (EncryptedExtensions), §4.4.2-4 (Certificate chain),
 // §5 (Record protocol), §7.1 (Key schedule).
 
-use alloc::alloc::{alloc_zeroed, Layout};
 use alloc::boxed::Box;
+use core::ptr::{self, addr_of_mut};
 
 use p256::ecdsa::SigningKey;
 
@@ -30,10 +30,21 @@ use crate::schedule as tls;
 // Tunables
 // ============================================================================
 //
-// rx/tx/pt buffers are heap-allocated via `zeroed_boxed_slice` in
-// `TlsServer::new` (see below), so these sizes don't impact the
-// boot stack. Sized to fit a typical ClientHello / server flight /
-// HTTP/1.1 request respectively; 4 KB is generous for all three.
+// rx/tx/pt buffers are now inline `[u8; N]` arrays inside `TlsServer`
+// (was: three separate `Box<[u8]>` allocations). Inline brings the
+// fresh-conn allocation count from 4 → 1: a single
+// `Box<TlsConnImpl>` covers the metadata, all three buffers, and the
+// shared cfg pointer in one contiguous heap block.
+//
+// Stack-overflow on the boot path is avoided by `init_in_place`
+// below — it writes every field via `addr_of_mut!` without ever
+// constructing the 12 KB struct on the stack. `TlsServer::new_box`
+// is the only public constructor; struct-literal construction
+// (`TlsServer { ... }`) would create the stack temp the comment
+// previously warned about, so it's intentionally not exposed.
+//
+// Sized to fit a typical ClientHello / server flight / HTTP/1.1
+// request respectively; 4 KB is generous for all three.
 
 /// Max raw TLS bytes we buffer from the peer before advancing the
 /// state machine. Sized to hold a typical ClientHello (~500 bytes)
@@ -258,19 +269,20 @@ pub struct TlsServer {
     pub(crate) error: Option<HandshakeError>,
 
     // Raw TLS bytes received from peer (may contain partial or
-    // multiple records). Heap-allocated so the 4 KB footprint lands
-    // on the heap at connection-accept time instead of reserving
-    // the bytes inline for every pre-allocated `TlsServer` slot.
-    pub(crate) rx_buf: Box<[u8]>,
+    // multiple records). Inline `[u8; N]` arrays now live with the
+    // metadata in a single Box<TlsConnImpl> — the boxed allocation
+    // is one heap block per conn, no per-buffer secondary allocs.
+    // See `init_in_place` for the stack-temp-avoidance scheme.
+    pub(crate) rx_buf: [u8; RX_BUF_LEN],
     pub(crate) rx_len: usize,
 
     // Raw TLS bytes waiting to be sent to peer.
-    pub(crate) tx_buf: Box<[u8]>,
+    pub(crate) tx_buf: [u8; TX_BUF_LEN],
     pub(crate) tx_len: usize,
     pub(crate) tx_pos: usize, // how many bytes we've handed out via pop_tx()
 
     // Decrypted application data waiting to be consumed by the app.
-    pub(crate) pt_buf: Box<[u8]>,
+    pub(crate) pt_buf: [u8; PT_BUF_LEN],
     pub(crate) pt_len: usize,
     pub(crate) pt_pos: usize,
 
@@ -297,9 +309,9 @@ impl Drop for TlsServer {
         // wipe `key` / `iv` / `secret`. The raw handshake-secret
         // arrays in this struct are separately held, so scrub them
         // here before the backing memory is released back to the
-        // global allocator. (rx/tx/pt Box<[u8]> drops are safe to
-        // leave as-is — they hold ciphertext and decrypted request
-        // plaintext, which isn't secret key material.)
+        // global allocator. (rx/tx/pt buffers are inline arrays;
+        // they hold ciphertext and decrypted request plaintext,
+        // not secret key material — no scrub needed before free.)
         if let Some(mut s) = self.server_hs_secret.take() {
             tls::secure_zero(&mut s);
         }
@@ -309,68 +321,90 @@ impl Drop for TlsServer {
     }
 }
 
-/// Allocate a zero-filled `Box<[u8]>` directly on the heap via
-/// `alloc_zeroed`, bypassing any `[0u8; N]` stack temporary.
-/// Critical for this module because a stack-constructed then
-/// moved-to-heap `[0u8; 4096]` array could blow the boot stack
-/// before optimisation — `alloc_zeroed` writes straight to the
-/// new allocation.
-///
-/// OOM aborts (`handle_alloc_error`); TlsServer::new is called
-/// from connection-accept, and refusing an HTTPS conn at the
-/// kernel-OOM level would cascade into aborting the connection
-/// anyway, so we let the global allocator's OOM handler run.
-fn zeroed_boxed_slice(len: usize) -> Box<[u8]> {
-    let layout = Layout::from_size_align(len, 1).expect("valid layout");
-    // SAFETY: non-zero size (RX/TX/PT_BUF_LEN are all 4 KB > 0);
-    // u8 has no invalid bit patterns so zero-initialised memory is
-    // a valid `[u8]`; Box::from_raw takes ownership of the
-    // freshly-allocated slice pointer.
-    unsafe {
-        let raw = alloc_zeroed(layout);
-        if raw.is_null() {
-            alloc::alloc::handle_alloc_error(layout);
-        }
-        let slice = core::slice::from_raw_parts_mut(raw, len);
-        Box::from_raw(slice)
-    }
-}
-
 impl TlsServer {
-    /// Create a fresh TlsServer with a random X25519 keypair.
-    /// `seed` is 32 bytes of entropy for the ephemeral key — caller
-    /// supplies from `uni_kernel::rng::fill_bytes()`.
-    pub fn new(x25519_seed: [u8; 32]) -> Self {
-        TlsServer {
-            state: State::WaitClientHello,
-            error: None,
-            rx_buf: zeroed_boxed_slice(RX_BUF_LEN),
-            rx_len: 0,
-            tx_buf: zeroed_boxed_slice(TX_BUF_LEN),
-            tx_len: 0,
-            tx_pos: 0,
-            pt_buf: zeroed_boxed_slice(PT_BUF_LEN),
-            pt_len: 0,
-            pt_pos: 0,
-            transcript: Transcript::new(),
-            schedule: KeySchedule::new_without_psk(),
-            ephemeral: Some(X25519ServerKey::from_seed(x25519_seed)),
-            client_hs_tk: None,
-            server_hs_tk: None,
-            client_ap_tk: None,
-            server_ap_tk: None,
-            server_hs_secret: None,
-            client_hs_secret: None,
+    /// Allocate a fresh boxed `TlsServer` and initialise it in
+    /// place — single 12 KB heap allocation, no per-buffer
+    /// secondary allocs. `seed` is 32 bytes of entropy for the
+    /// ephemeral X25519 keypair (caller supplies from
+    /// `uni_kernel::rng::fill_bytes()`).
+    ///
+    /// The struct is too large to round-trip through a stack
+    /// temporary (3 × 4 KB inline buffers), so we go through
+    /// `Box::<MaybeUninit<Self>>::new_uninit()` and write each
+    /// field via raw pointer in `init_in_place`. RVO/NRVO is not
+    /// guaranteed across all build configurations and the
+    /// pre-inline boot stack was tight enough that the original
+    /// design boxed the buffers separately to dodge this exact
+    /// problem; the in-place writer makes inlining safe again.
+    pub fn new_box(x25519_seed: [u8; 32]) -> Box<Self> {
+        let mut b = Box::<Self>::new_uninit();
+        // SAFETY: `b.as_mut_ptr()` returns a valid `*mut TlsServer`
+        // pointing at uninitialised storage of `size_of::<Self>()`;
+        // `init_in_place` writes every field, after which
+        // `assume_init` is sound.
+        unsafe {
+            Self::init_in_place(b.as_mut_ptr(), x25519_seed);
+            b.assume_init()
         }
     }
 
-    /// Reset this TlsServer for reuse on a fresh connection while
-    /// preserving the `rx_buf` / `tx_buf` / `pt_buf` heap allocations.
-    /// Observable state matches `TlsServer::new(seed)` after the
-    /// call — buffers are logically empty (length cursors at 0),
-    /// fresh X25519 keypair, all traffic keys cleared, transcript /
-    /// key schedule reinitialised — but the three 4 KiB buffers
-    /// don't re-allocate.
+    /// Write a fully-initialised `TlsServer` into the given
+    /// uninitialised pointer.
+    ///
+    /// SAFETY: `this` must point at writable, properly-aligned,
+    /// uninitialised memory of exactly `size_of::<TlsServer>()`.
+    /// On return, every field is initialised — the pointer is
+    /// safe to convert via `assume_init` / dereference.
+    ///
+    /// Each field is written via `addr_of_mut!` so the compiler
+    /// never materialises a struct-shaped stack temporary; in
+    /// particular the three 4 KB buffers are zero-filled directly
+    /// via `write_bytes` on the heap pointer rather than
+    /// `[0u8; N]` literals.
+    pub unsafe fn init_in_place(this: *mut Self, x25519_seed: [u8; 32]) {
+        // Plain Copy / small fields first.
+        unsafe {
+            addr_of_mut!((*this).state).write(State::WaitClientHello);
+            addr_of_mut!((*this).error).write(None);
+            addr_of_mut!((*this).rx_len).write(0);
+            addr_of_mut!((*this).tx_len).write(0);
+            addr_of_mut!((*this).tx_pos).write(0);
+            addr_of_mut!((*this).pt_len).write(0);
+            addr_of_mut!((*this).pt_pos).write(0);
+
+            // Buffers: zero-fill in place. Writing `[0u8; N]` would
+            // construct the array on the stack first; `write_bytes`
+            // on the field pointer does it directly on the heap.
+            ptr::write_bytes(addr_of_mut!((*this).rx_buf) as *mut u8, 0, RX_BUF_LEN);
+            ptr::write_bytes(addr_of_mut!((*this).tx_buf) as *mut u8, 0, TX_BUF_LEN);
+            ptr::write_bytes(addr_of_mut!((*this).pt_buf) as *mut u8, 0, PT_BUF_LEN);
+
+            // Sub-objects with their own constructors. These return
+            // by value but are small (Transcript ≈ SHA-256 state ~
+            // 100 B; KeySchedule a similar shape; X25519ServerKey
+            // ~ 32 B scalar), so they round-trip a stack temp
+            // safely.
+            addr_of_mut!((*this).transcript).write(Transcript::new());
+            addr_of_mut!((*this).schedule).write(KeySchedule::new_without_psk());
+            addr_of_mut!((*this).ephemeral)
+                .write(Some(X25519ServerKey::from_seed(x25519_seed)));
+            addr_of_mut!((*this).client_hs_tk).write(None);
+            addr_of_mut!((*this).server_hs_tk).write(None);
+            addr_of_mut!((*this).client_ap_tk).write(None);
+            addr_of_mut!((*this).server_ap_tk).write(None);
+            addr_of_mut!((*this).server_hs_secret).write(None);
+            addr_of_mut!((*this).client_hs_secret).write(None);
+        }
+    }
+
+    /// Reset this TlsServer for reuse on a fresh connection. The
+    /// whole struct (incl. the 12 KB of inline rx/tx/pt buffers)
+    /// stays in its existing heap slot — no allocations happen
+    /// here. Observable state matches `TlsServer::new_box(seed)`
+    /// after the call: buffers are logically empty (length cursors
+    /// at 0), fresh X25519 keypair, all traffic keys cleared,
+    /// transcript / key schedule reinitialised. The buffer storage
+    /// itself isn't touched (see the buffer-secrecy note below).
     ///
     /// Used by the per-worker conn-state pool (item M in
     /// docs/tx-path-optimizations.md): a freed `Box<TlsConnImpl>`
