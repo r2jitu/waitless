@@ -46,7 +46,9 @@ use drivers_infra::{log, mmio_read32, mmio_write32};
 use drivers_infra::pci;
 use core::mem::size_of;
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{
+    compiler_fence, AtomicBool, AtomicPtr, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering,
+};
 use uni_kernel::mm::{alloc_pages, phys_to_virt};
 use uni_kernel::sync::Spinlock;
 
@@ -282,6 +284,28 @@ struct TxQueue {
     /// Expected generation bit value for the next completion entry.
     /// Flips each time `tx_compl_head` wraps. 0 in GQI mode.
     tx_compl_gen: AtomicU8,
+
+    // ---- Direct-fill (zero-copy) TX path (GQI_QPL only today) ----
+    //
+    // The QPL is indexed by `slot * PAGE_SIZE`; each slot is one
+    // 4 KiB page. `slot_used[i]` tracks whether slot `i`'s page is
+    // currently filled-and-in-flight. acquire scans for the first
+    // `false`, sets `true`, hands the caller a handle pointing at
+    // QPL[slot]. submit writes a descriptor at the next ring
+    // position whose `seg_addr` references QPL[slot] (decoupled
+    // from ring index — the descriptor carries the seg_addr
+    // explicitly, so any slot can be referenced from any ring
+    // position). On completion the drain path reads `seg_addr`
+    // out of the descriptor to recover the slot index and clear
+    // `_used`.
+    //
+    // AtomicBool because the drain runs on the qp's owning core
+    // (Tier 1) but slot-allocation is also on that core — single-
+    // writer per worker. AtomicBool is a clean primitive here even
+    // though a plain `bool` would suffice on Tier 1; matches
+    // virtio-net's pattern and keeps cross-core drain (Tier 2 if
+    // we ever add it) sound for free.
+    slot_used: [core::sync::atomic::AtomicBool; TX_RING_ENTRIES as usize],
 }
 
 /// Per-queue RX metadata. Also QPL-backed: incoming frames are
@@ -1497,6 +1521,8 @@ fn finalize_tx_queue(qp: u32, alloc: &TxAlloc, fmt: QueueFormat) {
             // each ring wrap. Ring is initially zeroed (gen=0), so we
             // expect the first entry to read with gen=1.
             tx_compl_gen: AtomicU8::new(1),
+            slot_used: [const { core::sync::atomic::AtomicBool::new(false) };
+                TX_RING_ENTRIES as usize],
         });
         // Publish a raw pointer to the TxQueue living inside State
         // so the hot path (`send_on_qp`) can reach it without
@@ -1830,7 +1856,11 @@ fn poll_qp_inner<F: FnMut(&[u8])>(qp: usize, mut callback: F) -> u32 {
 
 /// Reclaim TX slots on `qp` from the device's completion counter.
 /// Lock-free fast path — reads TxQueue via the pre-published
-/// pointer + device counter via an atomic.
+/// pointer + device counter via an atomic. For each completed
+/// descriptor in the range `[done_cnt, nic_done)`, reads the
+/// descriptor's `seg_addr` to recover which slot's QPL page it
+/// referenced and marks that slot free. Cheap: each completion
+/// is a 16-byte descriptor read + an atomic store.
 #[inline]
 fn tx_drain(tx: &TxQueue) {
     let counter_va = COUNTER_ARRAY_VA.load(Ordering::Acquire);
@@ -1839,9 +1869,28 @@ fn tx_drain(tx: &TxQueue) {
     let raw = unsafe { ptr::read_volatile(counter_ptr.add(tx.counter_index as usize)) };
     let nic_done = u32::from_be(raw);
     let prev = tx.done_cnt.load(Ordering::Relaxed);
-    if nic_done.wrapping_sub(prev) != 0 {
-        tx.done_cnt.store(nic_done, Ordering::Relaxed);
+    if nic_done == prev { return; }
+
+    // Walk completed descriptors and free their slots.
+    let mask = (tx.ring_entries - 1) as u32;
+    let mut k = prev;
+    while k != nic_done {
+        let ring_idx = (k & mask) as usize;
+        let desc_ptr = (tx.ring_va as *const u8).wrapping_add(ring_idx * TX_DESC_SIZE);
+        // gve_tx_pkt_desc: seg_addr is at offset 8, big-endian u64.
+        // SAFETY: ring_va is a registered DMA-mapped page; idx is in
+        // bounds via `& mask`; descriptor is 16 bytes wide.
+        let seg_addr_be = unsafe {
+            ptr::read_unaligned(desc_ptr.add(8) as *const u64)
+        };
+        let seg_addr = u64::from_be(seg_addr_be);
+        let slot = (seg_addr / PAGE_SIZE as u64) as usize;
+        if slot < TX_RING_ENTRIES as usize {
+            tx.slot_used[slot].store(false, Ordering::Release);
+        }
+        k = k.wrapping_add(1);
     }
+    tx.done_cnt.store(nic_done, Ordering::Relaxed);
 }
 
 /// Submit a single-segment packet on queue pair `qp`. Returns
@@ -1853,76 +1902,186 @@ fn send_on_qp(qp: usize, data: &[u8]) -> bool {
     if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
         return send_on_qp_dqo(qp, data);
     }
-    if qp >= MAX_QUEUE_PAIRS || data.is_empty() || data.len() > TX_MAX_PKT_LEN {
+    if data.is_empty() || data.len() > TX_MAX_PKT_LEN {
         return false;
     }
+    // Slice-shaped wrapper over the direct-fill path: acquire a
+    // slot from the QP's pool, memcpy data into it, submit. The
+    // caller's stack-staged buffer + this memcpy is exactly the
+    // cost the direct-fill path saves for callers willing to fill
+    // in place.
+    let mut handle = match acquire_tx_buf_for_qp(qp) {
+        Some(h) => h,
+        None => return false,
+    };
+    let n = data.len();
+    handle.data_mut()[..n].copy_from_slice(data);
+    submit_tx_inner(handle, n);
+    true
+}
+
+/// Acquire a TX slot for a specific qp. Used by `send_on_qp` (which
+/// has already picked the qp by core or fallback) and by the
+/// public `acquire_tx_buf` (which picks the worker's qp). Spin-
+/// drains on full pool — the caller is the qp's owning worker
+/// (Tier 1) so this is cooperative scheduling, not deadlock-prone.
+fn acquire_tx_buf_for_qp(qp: usize) -> Option<uni_net_driver::TxBufHandle> {
+    if qp >= MAX_QUEUE_PAIRS { return None; }
     let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
-    if tx_ptr.is_null() { return false; }
+    if tx_ptr.is_null() { return None; }
+    let tx = unsafe { &*tx_ptr };
+
+    loop {
+        // Need both: a free slot in the pool AND ring-fill capacity
+        // (fill_cnt - done_cnt < ring_entries). With slot_count ==
+        // ring_entries, "free slot" implies "ring capacity" once
+        // drain runs; check both for clarity.
+        tx_drain(tx);
+        let fill = tx.fill_cnt.load(Ordering::Relaxed);
+        let done = tx.done_cnt.load(Ordering::Relaxed);
+        if fill.wrapping_sub(done) < tx.ring_entries as u32 {
+            for slot in 0..(tx.ring_entries as usize) {
+                if !tx.slot_used[slot].load(Ordering::Acquire) {
+                    tx.slot_used[slot].store(true, Ordering::Relaxed);
+                    let qpl_offset = (slot as u32) * PAGE_SIZE;
+                    let data_ptr = (tx.qpl_base_va + qpl_offset as u64) as *mut u8;
+                    return Some(uni_net_driver::TxBufHandle {
+                        data_ptr,
+                        data_cap: TX_MAX_PKT_LEN as u32,
+                        driver_token: encode_token(qp, slot),
+                        release_fn: release_tx_slot,
+                    });
+                }
+            }
+        }
+        // No capacity. Force any deferred kick so the host sees
+        // pending descriptors and can produce completions.
+        let bar2_va = BAR2_VA.load(Ordering::Acquire);
+        if bar2_va != 0 {
+            let last = tx.last_kicked.load(Ordering::Relaxed);
+            if fill != last {
+                doorbell_write(bar2_va, tx.db_offset, fill);
+                tx.last_kicked.store(fill, Ordering::Relaxed);
+            }
+        }
+        compiler_fence(Ordering::SeqCst);
+    }
+}
+
+/// Encode `(qp, slot)` into the opaque `driver_token` of a
+/// [`uni_net_driver::TxBufHandle`]. Layout:
+///   * bits 32..62: qp index
+///   * bits  0..32: slot index
+#[inline]
+fn encode_token(qp: usize, slot: usize) -> u64 {
+    (((qp as u64) & 0x7FFF_FFFF) << 32) | (slot as u64 & 0xFFFF_FFFF)
+}
+
+#[inline]
+fn decode_token(token: u64) -> (usize, usize) {
+    let qp = ((token >> 32) & 0x7FFF_FFFF) as usize;
+    let slot = (token & 0xFFFF_FFFF) as usize;
+    (qp, slot)
+}
+
+/// Drop callback for an unsubmitted handle: returns the slot to
+/// the pool. `submit_tx_inner` mem-forgets the handle to skip this
+/// path on the success leg.
+fn release_tx_slot(token: u64) {
+    let (qp, slot) = decode_token(token);
+    if qp >= MAX_QUEUE_PAIRS { return; }
+    let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
+    if tx_ptr.is_null() { return; }
+    let tx = unsafe { &*tx_ptr };
+    if slot < TX_RING_ENTRIES as usize {
+        tx.slot_used[slot].store(false, Ordering::Release);
+    }
+}
+
+/// Build the gve_tx_pkt_desc at the next ring position, advance
+/// `fill_cnt`, and (unless deferred) write the doorbell. Caller
+/// has already filled `handle.data_mut()[..frame_len]` with the
+/// frame bytes; the descriptor's `seg_addr` references the slot's
+/// QPL page so the device DMAs from there.
+///
+/// gve_tx_pkt_desc layout (16 bytes):
+///   u8  type_flags     (GVE_TXD_STD = 0)
+///   u8  l4_csum_offset (0 — no checksum offload)
+///   u8  l4_hdr_offset  (0)
+///   u8  desc_cnt       (1 — single-segment packet)
+///   u16 len            (be, total packet length)
+///   u16 seg_len        (be, this segment length)
+///   u64 seg_addr       (be, QPL byte offset in QPL mode)
+fn submit_tx_inner(handle: uni_net_driver::TxBufHandle, frame_len: usize) {
+    let (qp, slot) = decode_token(handle.driver_token);
+    // mem::forget skips Drop's `release_fn` — the slot is about
+    // to be in-flight, not unused. `tx_drain` returns it to the
+    // pool when the device signals descriptor completion.
+    core::mem::forget(handle);
+
+    if qp >= MAX_QUEUE_PAIRS || slot >= TX_RING_ENTRIES as usize {
+        return;
+    }
+    if frame_len == 0 || frame_len > TX_MAX_PKT_LEN {
+        let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
+        if !tx_ptr.is_null() {
+            unsafe { (*tx_ptr).slot_used[slot].store(false, Ordering::Release); }
+        }
+        return;
+    }
+    let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
+    if tx_ptr.is_null() { return; }
     let tx = unsafe { &*tx_ptr };
     let bar2_va = BAR2_VA.load(Ordering::Acquire);
 
-    tx_drain(tx);
-
     let fill_cnt = tx.fill_cnt.load(Ordering::Relaxed);
-    let done_cnt = tx.done_cnt.load(Ordering::Relaxed);
-
-    // Gate on ring capacity. Without this check, a flood of sends
-    // wraps past `done_cnt` and rewrites descriptors the device is
-    // still processing — the root cause of the ~50 % drop rate
-    // observed on GCE before this fix.
-    let in_flight = fill_cnt.wrapping_sub(done_cnt);
-    if in_flight >= tx.ring_entries as u32 {
-        return false;
-    }
-
     let mask = (tx.ring_entries - 1) as u32;
-    let slot = (fill_cnt & mask) as usize;
+    let ring_idx = (fill_cnt & mask) as usize;
 
-    // Each slot owns a single 4 KiB QPL page; its byte offset is
-    // `slot * PAGE_SIZE`. Since the slot is only reused after the
-    // device signals completion (the in_flight gate above), the
-    // device can't be reading this page while we memcpy a new
-    // packet into it.
     let qpl_offset = (slot as u32) * PAGE_SIZE;
-    let dst = (tx.qpl_base_va + qpl_offset as u64) as *mut u8;
-    unsafe {
-        ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
-    }
-
-    // Build the TX descriptor. gve_tx_pkt_desc layout:
-    //   u8  type_flags       (GVE_TXD_STD = 0)
-    //   u8  l4_csum_offset   (0 — no checksum offload)
-    //   u8  l4_hdr_offset    (0)
-    //   u8  desc_cnt         (1 — single-segment packet)
-    //   u16 len              (be, total packet length)
-    //   u16 seg_len          (be, this segment length)
-    //   u64 seg_addr         (be, QPL byte offset in QPL mode)
-    let desc_ptr = (tx.ring_va as *mut u8).wrapping_add(slot * TX_DESC_SIZE);
+    let desc_ptr = (tx.ring_va as *mut u8).wrapping_add(ring_idx * TX_DESC_SIZE);
     let mut desc = [0u8; TX_DESC_SIZE];
-    desc[3] = 1;
-    put_be16(&mut desc, 4, data.len() as u16);
-    put_be16(&mut desc, 6, data.len() as u16);
+    desc[3] = 1; // desc_cnt
+    put_be16(&mut desc, 4, frame_len as u16);
+    put_be16(&mut desc, 6, frame_len as u16);
     put_be64(&mut desc, 8, qpl_offset as u64);
     unsafe {
-        core::ptr::copy_nonoverlapping(desc.as_ptr(), desc_ptr, TX_DESC_SIZE);
+        ptr::copy_nonoverlapping(desc.as_ptr(), desc_ptr, TX_DESC_SIZE);
     }
 
     let new_fill = fill_cnt.wrapping_add(1);
     tx.fill_cnt.store(new_fill, Ordering::Release);
 
-    // Deferred-kick path: the doorbell write costs a VM-exit on
-    // GCE's gVNIC backend. If the event-loop integration promises
-    // to call `flush_tx_kick_if_dirty()` before idling, we can
-    // batch many sends into one doorbell. Force a kick anyway when
-    // the ring is near full — otherwise a sustained burst with no
-    // flush would stall waiting for completions the device hasn't
-    // been told about.
-    let near_full = new_fill.wrapping_sub(done_cnt) >= (tx.ring_entries as u32) - 16;
+    let near_full = new_fill.wrapping_sub(tx.done_cnt.load(Ordering::Relaxed))
+        >= (tx.ring_entries as u32) - 16;
     if !DEFERRED_KICK.load(Ordering::Relaxed) || near_full {
         doorbell_write(bar2_va, tx.db_offset, new_fill);
         tx.last_kicked.store(new_fill, Ordering::Relaxed);
     }
-    true
+}
+
+/// Public direct-fill TX entry — picks the calling worker's qp,
+/// scans for a free slot, returns a handle into the QPL page.
+/// Always succeeds (spin-drains on full pool) on GQI_QPL devices;
+/// returns `None` on DQO_RDA (not yet implemented for direct-fill)
+/// so callers fall back to the slice-shaped `send` path.
+fn acquire_tx_buf() -> Option<uni_net_driver::TxBufHandle> {
+    if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
+        // DQO direct-fill not yet implemented — caller falls
+        // back to slice-shaped `send`.
+        return None;
+    }
+    let num_qp = NUM_QP.load(Ordering::Acquire) as u32;
+    if num_qp == 0 { return None; }
+    let core = uni_kernel::cpu_id();
+    let qp = if core < num_qp { core as usize } else { 0 };
+    acquire_tx_buf_for_qp(qp)
+}
+
+/// Public submit — paired with [`acquire_tx_buf`]. Consumes the
+/// handle (slot returns to pool on device completion).
+fn submit_tx(handle: uni_net_driver::TxBufHandle, frame_len: usize) {
+    submit_tx_inner(handle, frame_len);
 }
 
 /// Flush the deferred TX kick for the given queue pair. Returns
@@ -2378,11 +2537,11 @@ static GVE_OPS: NicOps = NicOps {
     name: "gve",
     probe,
     send,
-    // GVE doesn't yet implement the direct-fill TX surface; callers
-    // fall back to the slice-based `send` path. See virtio-net for
-    // the reference implementation.
-    acquire_tx_buf: None,
-    submit_tx: None,
+    // Direct-fill TX: GQI_QPL implemented; DQO_RDA returns None
+    // and callers fall back to the slice-shaped `send` (one extra
+    // memcpy per frame). Wiring DQO direct-fill is a follow-up.
+    acquire_tx_buf: Some(acquire_tx_buf),
+    submit_tx: Some(submit_tx),
     // GVE on GCE supports TSOv4 natively but we haven't wired the
     // descriptor-side support yet; report unavailable so callers
     // do per-MSS segmentation as today.
