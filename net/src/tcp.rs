@@ -748,12 +748,25 @@ fn free_connection(core: u32, slot: usize) {
 //   v6: [ETH 14][IPv6 40][TCP 20][payload ≤ MSS_V6 = 1440]  → ≤ 1514 B
 //
 // Same total bound for both families, so one stack buffer fits all.
+// TSO super-segments (up to ~16 KiB payload) bypass the stack
+// buffer — they always use the driver's direct-fill TX-pool slot
+// via `acquire_tx_buf` (which has the larger `data_cap` for the
+// super-segment shape). When acquire fails on the TSO path, we
+// fall back to the per-MSS loop rather than expanding this stack
+// buffer to ~16 KiB.
 
 const ETH_HDR_LEN: usize = 14;
 const IPV4_HDR_LEN: usize = ipv4::HEADER_LEN;       // 20
 const IPV6_HDR_LEN: usize = ipv6::HEADER_LEN;       // 40
 const TCP_HDR_LEN: usize = 20;
 const FRAME_BUF_LEN: usize = ETH_HDR_LEN + IPV6_HDR_LEN + TCP_HDR_LEN + MSS_V4;
+/// Per-conn-state cap on TSO super-segments: the maximum bytes we
+/// hand to `submit_tx_tso` in one frame. Sized to cover one TLS
+/// 1.3 record (16384 plaintext + 22-byte envelope) plus the
+/// L2/L3/L4 headers. The driver's TX-pool slots are sized to
+/// match (`MAX_ETH_FRAME` in uni-driver-virtio-net).
+const TSO_FRAME_BUF_LEN: usize =
+    ETH_HDR_LEN + IPV6_HDR_LEN + TCP_HDR_LEN + 16384 + 24;
 
 /// Compute the TCP-payload offset within a frame buffer for `local_ip`'s family.
 #[inline]
@@ -928,6 +941,120 @@ fn send_segment(
             payload_len,
         );
     });
+}
+
+/// Build and ship a TCP TSO super-segment whose payload (up to
+/// ~16 KiB — one TLS record's worth) is read from a chain
+/// cursor. The driver's NIC segments the payload into MSS-sized
+/// chunks host-side, fixing up TCP/IP headers per segment.
+///
+/// Caller must have verified `uni_drivers::net::tso_available()`
+/// before reaching this. Falls back to the per-MSS loop in
+/// `async_try_send_chain` when not available.
+fn send_super_segment_from_cursor(
+    local_ip: IpAddr,
+    dst_ip: IpAddr,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    cursor: &mut uni_iobuf::Cursor<'_>,
+    payload_len: usize,
+) {
+    let dst_mac = match dst_mac::resolve(dst_ip) {
+        Some(m) => m,
+        None => return,
+    };
+
+    let payload_off = payload_offset(local_ip);
+    let frame_len = payload_off + payload_len;
+    debug_assert!(frame_len <= TSO_FRAME_BUF_LEN);
+
+    // We need the direct-fill path here — TSO super-segments
+    // exceed the slow-path stack buffer's MSS-sized assumption.
+    // Caller falls back to the per-MSS loop if acquire fails.
+    let Some(mut handle) = uni_drivers::net::acquire_tx_buf() else {
+        // Slow path: caller does per-MSS segmentation as a
+        // fallback. We can't TSO without a writable slot.
+        // (The caller checks for this and reverts.)
+        send_per_mss_fallback(
+            local_ip, dst_ip, src_port, dst_port,
+            seq, ack, flags, window, cursor, payload_len,
+        );
+        return;
+    };
+    let cap = handle.data_cap as usize;
+    debug_assert!(frame_len <= cap);
+
+    let frame = &mut handle.data_mut()[..frame_len];
+    // Read the entire super-segment payload directly into the
+    // TX-pool slot via the chain cursor — single memcpy across
+    // chain → driver TX pool.
+    if payload_len > 0 {
+        let n = cursor.read(&mut frame[payload_off..payload_off + payload_len]);
+        debug_assert_eq!(n, payload_len);
+        let _ = n;
+    }
+    // SAFETY: `frame` is initialised through `frame[payload_off..
+    // payload_off + payload_len]` above; the header-fill below
+    // writes the rest.
+    unsafe {
+        fill_tcp_frame_headers(
+            frame, local_ip, dst_ip, dst_mac,
+            src_port, dst_port, seq, ack, flags, window,
+            payload_len,
+        );
+    }
+    // Zero the TCP checksum: with VIRTIO_NET_F_NEEDS_CSUM set,
+    // the device computes the per-segment TCP checksum (the
+    // partial-checksum convention isn't strictly required —
+    // HVF's userspace TCP proxy ignores the field and forwards
+    // bytes; vhost-net + real NICs honour the gso fields and
+    // synthesise full checksums per segment).
+    let tcp_off = match local_ip {
+        IpAddr::V4(_) => ETH_HDR_LEN + IPV4_HDR_LEN,
+        IpAddr::V6(_) => ETH_HDR_LEN + IPV6_HDR_LEN,
+    };
+    frame[tcp_off + 16] = 0; // TCP checksum field, big-endian high byte
+    frame[tcp_off + 17] = 0; //                              low byte
+
+    let mss = mss_for(local_ip);
+    let hdr_len = (payload_off) as u16;
+    let csum_start = (tcp_off) as u16;
+    uni_drivers::net::submit_tx_tso(
+        handle, frame_len, hdr_len, csum_start, mss as u16,
+    );
+}
+
+/// Per-MSS fallback path — used when [`send_super_segment_from_cursor`]
+/// can't acquire a TX-pool slot. Loops `send_segment_from_cursor`
+/// over the cursor as the original (pre-TSO) path did.
+fn send_per_mss_fallback(
+    local_ip: IpAddr,
+    dst_ip: IpAddr,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    cursor: &mut uni_iobuf::Cursor<'_>,
+    payload_len: usize,
+) {
+    let mss = mss_for(local_ip);
+    let mut sent = 0usize;
+    let mut cur_seq = seq;
+    while sent < payload_len {
+        let chunk = (payload_len - sent).min(mss);
+        send_segment_from_cursor(
+            local_ip, dst_ip, src_port, dst_port,
+            cur_seq, ack, flags, window, cursor, chunk,
+        );
+        cur_seq = cur_seq.wrapping_add(chunk as u32);
+        sent += chunk;
+    }
 }
 
 /// Build and ship a TCP segment whose payload is read from a chain
@@ -1490,10 +1617,14 @@ pub fn async_try_send_chain(
 
     let mss = mss_for(c.local_ip);
     let mut cursor = chain.cursor();
-    let mut sent = 0usize;
-    while sent < total {
-        let chunk = (total - sent).min(mss);
-        send_segment_from_cursor(
+    // TSO fast path: when the driver advertises TSOv4 (and the
+    // payload exceeds one MSS, so we'd otherwise loop), hand the
+    // whole chain to the driver in a single super-segment. The
+    // device does the per-MSS split host-side.
+    if total > mss && uni_drivers::net::tso_available()
+        && payload_offset(c.local_ip) + total <= TSO_FRAME_BUF_LEN
+    {
+        send_super_segment_from_cursor(
             c.local_ip,
             c.remote_ip,
             c.local_port,
@@ -1503,10 +1634,28 @@ pub fn async_try_send_chain(
             TCP_ACK | TCP_PSH,
             c.rx_free() as u16,
             &mut cursor,
-            chunk,
+            total,
         );
-        c.snd_nxt = c.snd_nxt.wrapping_add(chunk as u32);
-        sent += chunk;
+        c.snd_nxt = c.snd_nxt.wrapping_add(total as u32);
+    } else {
+        let mut sent = 0usize;
+        while sent < total {
+            let chunk = (total - sent).min(mss);
+            send_segment_from_cursor(
+                c.local_ip,
+                c.remote_ip,
+                c.local_port,
+                c.remote_port,
+                c.snd_nxt,
+                c.rcv_nxt,
+                TCP_ACK | TCP_PSH,
+                c.rx_free() as u16,
+                &mut cursor,
+                chunk,
+            );
+            c.snd_nxt = c.snd_nxt.wrapping_add(chunk as u32);
+            sent += chunk;
+        }
     }
 
     // Bytes are on the wire — release the cursor's borrow on the
@@ -1514,7 +1663,10 @@ pub fn async_try_send_chain(
     // callbacks recycle NIC descriptors back to driver pools).
     drop(cursor);
     chain.clear();
-    Ok(sent)
+    // Both paths (TSO super-segment + per-MSS loop) consume the
+    // entire chain — bare-metal NIC TX never blocks under our
+    // load model.
+    Ok(total)
 }
 
 /// Park the send-side waker. On bare-metal `async_try_send_chain`

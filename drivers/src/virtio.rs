@@ -424,7 +424,14 @@ pub const VIRTQ_AVAIL_F_NO_INTERRUPT: u16 = 1;
 pub const VIRTQ_USED_F_NO_NOTIFY: u16 = 1;
 
 // Feature bits
+/// Driver handles packets with partial checksum (host computes for us).
+/// Required as a prerequisite for `VIRTIO_NET_F_HOST_TSO4`.
+pub const VIRTIO_NET_F_CSUM: u32 = 1 << 0;
 pub const VIRTIO_NET_F_MAC: u32 = 1 << 5;
+/// Device can handle TCPv4 GSO from the driver — we hand it a single
+/// super-segment with `gso_type=TCPV4` + `gso_size=MSS`, the device
+/// segments it host-side. Saves the per-MSS frame-build loop on TX.
+pub const VIRTIO_NET_F_HOST_TSO4: u32 = 1 << 11;
 pub const VIRTIO_NET_F_MRG_RXBUF: u32 = 1 << 15;
 pub const VIRTIO_NET_F_STATUS: u32 = 1 << 16;
 pub const VIRTIO_NET_F_MQ: u32 = 1 << 22;

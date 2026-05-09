@@ -77,6 +77,38 @@ pub fn submit_tx(handle: uni_net_driver::TxBufHandle, frame_len: usize) {
     }
 }
 
+/// True iff the driver negotiated TSOv4 (`VIRTIO_NET_F_HOST_TSO4`
+/// + `VIRTIO_NET_F_CSUM`, or equivalent). When true, the TCP
+/// send path can hand a single super-segment to [`submit_tx_tso`]
+/// instead of looping per-MSS through `submit_tx`.
+pub fn tso_available() -> bool {
+    (active_ops().tso_available)()
+}
+
+/// Submit a TSO super-segment for TCPv4. Same shape as
+/// [`submit_tx`] plus the gso fields: `hdr_len` is the offset
+/// of the TCP payload (Eth + IP + TCP), `csum_start` is the
+/// offset of the TCP header (Eth + IP), `gso_size` is the MSS.
+/// The device segments the payload into `gso_size`-byte chunks
+/// host-side and computes per-segment TCP checksums.
+///
+/// Caller must have verified [`tso_available`] before reaching
+/// this; if the surface is unavailable, the slot is returned
+/// to the pool and no traffic emitted.
+pub fn submit_tx_tso(
+    handle: uni_net_driver::TxBufHandle,
+    frame_len: usize,
+    hdr_len: u16,
+    csum_start: u16,
+    gso_size: u16,
+) {
+    if let Some(f) = active_ops().submit_tx_tso {
+        f(handle, frame_len, hdr_len, csum_start, gso_size);
+    } else {
+        drop(handle);
+    }
+}
+
 // ---- Idle / TX-flush knobs -----------------------------------------------
 
 pub fn flush_tx_staging() { (active_ops().flush_tx_staging)() }

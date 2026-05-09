@@ -119,6 +119,40 @@ pub struct NicOps {
     /// `tx_drain`, NOT when this fn returns). `None` mirrors
     /// `acquire_tx_buf`'s `None`.
     pub submit_tx: Option<fn(TxBufHandle, usize)>,
+    /// TSOv4 capability: `true` when the device negotiated
+    /// `VIRTIO_NET_F_HOST_TSO4` + `VIRTIO_NET_F_CSUM` (or the
+    /// equivalent on non-virtio drivers). When true, the TCP
+    /// layer can hand the driver a single super-segment (up to
+    /// `data_cap` bytes per slot, currently ~16 KiB) with one
+    /// `submit_tx_tso` call instead of looping per-MSS through
+    /// `submit_tx`. When false, callers must split into
+    /// MSS-sized segments themselves before calling `submit_tx`.
+    pub tso_available: fn() -> bool,
+    /// Submit a TSO super-segment. Same shape as `submit_tx` plus
+    /// the gso fields the device needs to segment host-side:
+    ///
+    ///   * `hdr_len`: bytes from the start of the frame up to
+    ///     (but not including) the TCP payload — i.e.
+    ///     `Eth(14) + IP(20|40) + TCP(20)`. The device copies
+    ///     these headers to every emitted segment, fixing up
+    ///     length and seq fields per segment.
+    ///   * `csum_start`: offset of the TCP header within the
+    ///     frame — `Eth(14) + IP(20|40)`. The device computes
+    ///     the per-segment TCP checksum (placed at
+    ///     `csum_start + 16`, the TCP `checksum` field).
+    ///   * `gso_size`: MSS — bytes of TCP payload per emitted
+    ///     segment.
+    ///
+    /// `None` when the driver doesn't support TSO (mirror of
+    /// `tso_available()`); caller falls back to per-MSS
+    /// `submit_tx` calls.
+    pub submit_tx_tso: Option<fn(
+        handle: TxBufHandle,
+        frame_len: usize,
+        hdr_len: u16,
+        csum_start: u16,
+        gso_size: u16,
+    )>,
     /// Zero-copy RX. The callback receives an owned [`IOBuf`]
     /// (typically `IOBuf::External` wrapping the descriptor's
     /// storage) per frame; the IOBuf's drop callback returns the
@@ -248,6 +282,8 @@ static NULL_OPS: NicOps = NicOps {
     send: null_send,
     acquire_tx_buf: None,
     submit_tx: None,
+    tso_available: null_false,
+    submit_tx_tso: None,
     poll_rx: null_poll,
     poll_qp: null_poll_qp,
     get_mac: null_get_mac,

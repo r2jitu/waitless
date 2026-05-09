@@ -294,21 +294,45 @@ AEAD to the NIC.
 ## Segment 2 — Wire & receive (NIC TX → browser RX)
 
 ### G. TSO (TCP Segmentation Offload)
-- **Status**: [ ] not started
-- **Where**: virtio feature negotiation
-  (`VIRTIO_NET_F_HOST_TSO4`/`HOST_TSO6`), `net/src/tcp.rs` send
-  loop.
-- **What**: Hand the device a single super-segment (e.g. 16 KiB
-  plaintext + envelope = one TLS record + one TCP/IP header)
-  and let the NIC split into MSS-sized segments. The 12 calls to
-  `send_segment_from_cursor` per record collapse to 1.
-- **Win**: huge on Tier 1 / KVM with a real NIC. Limited on HVF
-  because the userspace relay still has to split.
-- **Effort**: medium-high. Needs B as a prerequisite (the
-  super-segment can't fit in a single 1514 B TX pool slot, so we
-  need SG descriptors).
-- **Risk**: medium. Real interaction with host NIC offload
-  capabilities.
+- **Status**: [x] **landed for HVF + virtio-net (2026-05-08)**.
+- **Approach**: bumped `MAX_ETH_FRAME` 1514 → 16512 in the
+  virtio-net driver so a single TX-pool slot fits one TLS record's
+  worth of TCP super-segment (Eth + IP + TCP + 16 KiB payload).
+  Two new APIs at the driver layer: `tso_available()` and
+  `submit_tx_tso(handle, frame_len, hdr_len, csum_start, gso_size)`.
+  TCP layer's `async_try_send_chain` checks `tso_available()` and
+  collapses the per-MSS frame-build loop into a single
+  `send_super_segment_from_cursor` when the chain exceeds one MSS.
+  The HVF userspace TCP proxy was already shape-compatible (it
+  reads the virtio descriptor by `len` with no upper bound, parses
+  the TCP header, forwards bytes to a host SOCK_STREAM where the
+  host kernel handles segmentation — the gso fields are advisory
+  on this path); just adding `VIRTIO_NET_F_CSUM` +
+  `VIRTIO_NET_F_HOST_TSO4` to the runner's offered feature bits
+  was sufficient.
+- **Bench (HVF, /diagnostics ~9 KiB body, post-G)**:
+  * 1c: 14163 → 17642 req/s (+25%)
+  * 3c: 35815 req/s (2.03x scaling vs 1c)
+  * `health_tls_max` (single-MSS body, doesn't trigger TSO):
+    unchanged at ~105k 1c, 162k 2c.
+  * `tls_handshake_max` (handshake also fits one MSS): unchanged
+    at ~2.9k hs/s.
+- **Tier 1 / KVM / GCE**: feature negotiation is generic; same
+  driver code path will exercise host-side TSO when running on
+  vhost-net or a real NIC. Not yet bench-verified on those targets
+  — when GCE bench cycle returns we expect the same TX win plus
+  whatever NIC-hardware offload latency reduction the underlying
+  device adds. GVE driver (in uni-driver-gve) reports
+  `tso_available: || false` so it falls back to per-MSS sends
+  until we wire the descriptor-side support there too.
+- **Risk**: low for HVF (the userspace proxy just forwards bytes,
+  ignoring gso fields). Medium for KVM/real-NIC (descriptor
+  format compliance + checksum convention) — pending bench
+  validation on those.
+- **Memory cost**: +1 MB heap per worker for the larger TX pool
+  (TX_POOL_SIZE=64 × MAX_ETH_FRAME=16512). Acceptable on the
+  128 MB+ VMs we target. Could shrink TX_POOL_SIZE under TSO
+  since one super-segment carries 12× the bytes — deferred.
 
 ### H. Push more traffic through HTTP/3
 - **Status**: [ ] in progress (we already serve H3)
@@ -483,9 +507,12 @@ items until they unlock something concrete.
    — local keep-alive bench won't show it.
 9. **N** — conn-future + spawn-task pool. After M, since N's
    wins compose on top of M's pooled conn-state lifetime.
-10. **G** (TSO) — biggest single Tier 1 win once we benchmark on
-    KVM/GCE. Depends on B; deferred until we're back on a Tier 1
-    bench cycle so we can validate end-to-end.
+10. ✓ **G** (TSO) — landed for HVF + virtio-net (2026-05-08).
+    Single-super-segment TX path delivers +25% on
+    `diagnostics_tls_max` 1c (multi-segment shape). KVM / GCE
+    validation deferred until we're back on a Tier 1 bench
+    cycle, but the descriptor-side support is generic so the
+    next bench should exercise it without further code changes.
 11. **J** (compression) + **K** (0-RTT) + **L** (Early Hints)
     when we shift focus from local benchmarks to Internet-facing
     serving.

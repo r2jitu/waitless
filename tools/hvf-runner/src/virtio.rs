@@ -65,7 +65,9 @@ const VIRTIO_DEVICE_NET: u32 = 1;
 const VIRTIO_VENDOR: u32 = 0x554d_4551; // "QEMU" — convention
 
 // Feature bits we offer (word 0 only; word 1 = VIRTIO_F_VERSION_1 implied by v2)
+const VIRTIO_NET_F_CSUM: u32 = 1 << 0;
 const VIRTIO_NET_F_MAC: u32 = 1 << 5;
+const VIRTIO_NET_F_HOST_TSO4: u32 = 1 << 11;
 const VIRTIO_NET_F_CTRL_VQ: u32 = 1 << 17;
 const VIRTIO_NET_F_MQ: u32 = 1 << 22;
 
@@ -211,7 +213,19 @@ impl VirtioNet {
             VENDOR_ID => VIRTIO_VENDOR,
             DEVICE_FEATURES => {
                 match self.device_features_sel {
-                    0 => VIRTIO_NET_F_MAC | VIRTIO_NET_F_MQ | VIRTIO_NET_F_CTRL_VQ,
+                    // VIRTIO_NET_F_CSUM + VIRTIO_NET_F_HOST_TSO4 enable
+                    // guest-side TSO: the guest hands us one super-segment
+                    // (up to 64 KiB) with `gso_type=TCPV4` + `gso_size=MSS`
+                    // and we forward the bytes to the host SOCK_STREAM.
+                    // The host TCP stack handles segmentation transparently
+                    // (we're a userspace TCP proxy, not a NIC), so the
+                    // gso fields are advisory — but advertising them lets
+                    // the guest collapse its per-MSS frame-build loop.
+                    0 => VIRTIO_NET_F_CSUM
+                        | VIRTIO_NET_F_MAC
+                        | VIRTIO_NET_F_HOST_TSO4
+                        | VIRTIO_NET_F_MQ
+                        | VIRTIO_NET_F_CTRL_VQ,
                     1 => 1, // VIRTIO_F_VERSION_1 (bit 0 of word 1 = feature bit 32)
                     _ => 0,
                 }

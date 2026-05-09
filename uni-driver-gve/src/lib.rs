@@ -2383,6 +2383,11 @@ static GVE_OPS: NicOps = NicOps {
     // the reference implementation.
     acquire_tx_buf: None,
     submit_tx: None,
+    // GVE on GCE supports TSOv4 natively but we haven't wired the
+    // descriptor-side support yet; report unavailable so callers
+    // do per-MSS segmentation as today.
+    tso_available: || false,
+    submit_tx_tso: None,
     poll_rx: poll,
     poll_qp,
     get_mac,

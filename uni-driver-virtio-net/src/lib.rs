@@ -29,6 +29,7 @@ use drivers_infra::virtio::{
     vpci_set_queue_msix_vector, vpci_set_config_msix_vector,
     vpci_msix_enable, vpci_msix_write_entry,
     STATUS_ACKNOWLEDGE, STATUS_DRIVER, STATUS_DRIVER_OK, STATUS_FEATURES_OK, STATUS_FAILED,
+    VIRTIO_NET_F_CSUM, VIRTIO_NET_F_HOST_TSO4,
     VIRTIO_NET_F_MAC, VIRTIO_NET_F_MRG_RXBUF, VIRTIO_NET_F_STATUS,
     VIRTIO_NET_F_MQ, VIRTIO_NET_F_CTRL_VQ,
     VIRTIO_RING_F_EVENT_IDX, VIRTIO_F_USED_IDX_MMIO,
@@ -54,7 +55,22 @@ const RX_BUFFERS: usize = 256;
 const BUFFER_SIZE: u32 = 2048;
 const TX_POOL_SIZE: usize = 64;
 const VIRTIO_NET_HDR_SIZE: usize = 12; // VirtioNetHeader (with num_buffers)
-const MAX_ETH_FRAME: usize = 1514;
+/// Maximum bytes per TX-pool slot. Sized to fit a single TSO
+/// super-segment when `VIRTIO_NET_F_HOST_TSO4` is negotiated:
+/// 14 (Ethernet) + 40 (max IPv6) + 20 (TCP) + 16384 (TLS plaintext)
+/// + 22 (TLS envelope = 5 hdr + 1 type + 16 tag) = 16480 bytes.
+/// Round up to the next 64-byte boundary for cache-line friendliness.
+/// Without TSO this only carries up to 1514 bytes (one MSS-sized
+/// segment); the headroom is reserved unconditionally so the same
+/// pool serves both paths.
+const MAX_ETH_FRAME: usize = 16512;
+
+/// Virtio gso_type values (RFC: virtio spec §5.1.6).
+const VIRTIO_NET_HDR_GSO_NONE: u8 = 0;
+const VIRTIO_NET_HDR_GSO_TCPV4: u8 = 1;
+
+/// Virtio flags values.
+const VIRTIO_NET_HDR_F_NEEDS_CSUM: u8 = 1;
 
 /// Public diagnostic API (`net_rx_counts` / `net_rx_used_cursors`)
 /// returns fixed-size arrays of this length. The actual queue-pair
@@ -180,6 +196,13 @@ struct NetDevice {
     irq_idle_available: bool,
     guest_features: u32,
     has_mq: bool,                       // VIRTIO_NET_F_MQ negotiated
+    /// VIRTIO_NET_F_HOST_TSO4 + VIRTIO_NET_F_CSUM negotiated. When
+    /// true, the TCP layer can hand us a single super-segment up
+    /// to MAX_ETH_FRAME bytes with `gso_type=TCPV4` + `gso_size=MSS`
+    /// in the per-slot virtio_net_hdr; the device segments it
+    /// host-side. Saves the per-MSS frame-build loop in
+    /// `async_try_send_chain`.
+    has_tso4: bool,
     irq_edge: bool,                     // SPI is edge-triggered (from FDT)
 }
 
@@ -196,6 +219,7 @@ impl NetDevice {
         irq_idle_available: false,
         guest_features: 0,
         has_mq: false,
+        has_tso4: false,
         irq_edge: false,
     };
 }
@@ -312,6 +336,14 @@ fn init_pci_modern() -> bool {
     // Check for multi-queue support
     let has_mq = (dev_features & VIRTIO_NET_F_MQ) != 0
               && (dev_features & VIRTIO_NET_F_CTRL_VQ) != 0;
+    // Check for TSOv4 support. Requires both VIRTIO_NET_F_CSUM (so the
+    // device computes the per-segment TCP/IP checksum we don't bother
+    // with on TSO sends) AND VIRTIO_NET_F_HOST_TSO4 (so the device can
+    // segment a super-segment we hand it). When both are negotiated the
+    // TCP layer can collapse its per-MSS frame-build loop into a single
+    // submit_tx_tso call.
+    let has_tso4 = (dev_features & VIRTIO_NET_F_CSUM) != 0
+                && (dev_features & VIRTIO_NET_F_HOST_TSO4) != 0;
 
     vpci_write_features(dev, 0, guest_features);
     vpci_write_features(dev, 1, 1); // VIRTIO_F_VERSION_1
@@ -472,6 +504,7 @@ fn init_pci_modern() -> bool {
         (*ndev()).num_queue_pairs = 1;
         (*ndev()).negotiated_queue_pairs = num_pairs;
         (*ndev()).has_mq = has_mq && num_pairs > 1;
+        (*ndev()).has_tso4 = has_tso4;
     }
     activate_multi_queue();
 
@@ -646,11 +679,14 @@ fn init_mmio() -> bool {
     let mut guest_features: u32 = 0;
     let mut has_used_idx_mmio = false;
     let mut has_mq = false;
+    let mut has_tso4 = false;
     unsafe {
         if is_v2 {
             virtio_write32(io_base + MMIO_DEVICE_FEATURES_SEL, 0);
             let dev_features = virtio_read32(io_base + MMIO_HOST_FEATURES);
+            if (dev_features & VIRTIO_NET_F_CSUM) != 0 { guest_features |= VIRTIO_NET_F_CSUM; }
             if (dev_features & VIRTIO_NET_F_MAC) != 0 { guest_features |= VIRTIO_NET_F_MAC; }
+            if (dev_features & VIRTIO_NET_F_HOST_TSO4) != 0 { guest_features |= VIRTIO_NET_F_HOST_TSO4; }
             if (dev_features & VIRTIO_NET_F_STATUS) != 0 { guest_features |= VIRTIO_NET_F_STATUS; }
             if (dev_features & VIRTIO_NET_F_MRG_RXBUF) != 0 { guest_features |= VIRTIO_NET_F_MRG_RXBUF; }
             if (dev_features & VIRTIO_F_USED_IDX_MMIO) != 0 {
@@ -661,6 +697,11 @@ fn init_mmio() -> bool {
             if (dev_features & VIRTIO_NET_F_CTRL_VQ) != 0 { guest_features |= VIRTIO_NET_F_CTRL_VQ; }
             has_mq = (guest_features & VIRTIO_NET_F_MQ) != 0
                   && (guest_features & VIRTIO_NET_F_CTRL_VQ) != 0;
+            // TSOv4 needs both CSUM (host computes per-segment cksums)
+            // and HOST_TSO4 (device segments super-segments); both
+            // negotiated → TCP layer can collapse its per-MSS loop.
+            has_tso4 = (guest_features & VIRTIO_NET_F_CSUM) != 0
+                    && (guest_features & VIRTIO_NET_F_HOST_TSO4) != 0;
             virtio_write32(io_base + MMIO_DRIVER_FEATURES_SEL, 0);
             virtio_write32(io_base + MMIO_GUEST_FEATURES, guest_features);
             virtio_write32(io_base + MMIO_DRIVER_FEATURES_SEL, 1);
@@ -768,6 +809,7 @@ fn init_mmio() -> bool {
         (*ndev()).num_queue_pairs = 1;
         (*ndev()).negotiated_queue_pairs = num_pairs;
         (*ndev()).has_mq = has_mq && num_pairs > 1;
+        (*ndev()).has_tso4 = has_tso4;
     }
     activate_multi_queue();
 
@@ -1270,6 +1312,62 @@ fn submit_tx(handle: uni_net_driver::TxBufHandle, frame_len: usize) {
             // Virtq full — release the slot. The caller's frame is
             // dropped on the floor; UDP / QUIC retransmits handle
             // loss, TCP retransmits later.
+            (*qps(qp)).tx_pool_used[slot] = false;
+            return;
+        }
+        (*tx_q(qp)).kick();
+    }
+}
+
+fn tso_available() -> bool {
+    unsafe { (*ndev()).has_tso4 }
+}
+
+fn submit_tx_tso(
+    handle: uni_net_driver::TxBufHandle,
+    frame_len: usize,
+    hdr_len: u16,
+    csum_start: u16,
+    gso_size: u16,
+) {
+    let (qp, slot) = decode_token(handle.driver_token);
+    core::mem::forget(handle); // see `submit_tx` for rationale
+
+    if frame_len == 0 || frame_len > MAX_ETH_FRAME {
+        unsafe { (*qps(qp)).tx_pool_used[slot] = false; }
+        return;
+    }
+
+    unsafe {
+        let buf = &mut (*qps(qp)).tx_pool[slot];
+        // TSO virtio_net_hdr — see virtio spec §5.1.6:
+        //   * `flags = NEEDS_CSUM`: device computes the per-segment
+        //     TCP checksum at byte offset `csum_start + csum_offset`
+        //     of each emitted segment.
+        //   * `gso_type = TCPV4`: device segments the payload into
+        //     `gso_size`-byte chunks with TCP/IP headers fixed up
+        //     per segment.
+        //   * `hdr_len`: total L2+L3+L4 header length the device
+        //     copies to every segment.
+        //   * `csum_start`: offset of the TCP header (start of the
+        //     range Poly1305 covers, but here we use it as the
+        //     start of the IP checksum scope per the v1 spec).
+        //   * `csum_offset = 16`: offset within the TCP header to
+        //     the `checksum` field.
+        buf.hdr = VirtioNetHeader {
+            flags: VIRTIO_NET_HDR_F_NEEDS_CSUM,
+            gso_type: VIRTIO_NET_HDR_GSO_TCPV4,
+            hdr_len,
+            gso_size,
+            csum_start,
+            csum_offset: 16,
+            num_buffers: 1,
+        };
+
+        let total_len = VIRTIO_NET_HDR_SIZE as u32 + frame_len as u32;
+        let buf_phys = virt_to_phys(buf as *const TxBuf as *const u8);
+        let head = (*tx_q(qp)).add_buf(buf_phys, total_len, 1, 0);
+        if head < 0 {
             (*qps(qp)).tx_pool_used[slot] = false;
             return;
         }
@@ -1913,6 +2011,8 @@ static VIRTIO_NET_OPS: NicOps = NicOps {
     send,
     acquire_tx_buf: Some(acquire_tx_buf),
     submit_tx: Some(submit_tx),
+    tso_available,
+    submit_tx_tso: Some(submit_tx_tso),
     poll_rx: poll,
     poll_qp,
     get_mac,
