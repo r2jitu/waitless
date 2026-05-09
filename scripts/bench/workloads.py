@@ -41,6 +41,41 @@ def wait_http(port, timeout=20, host="localhost"):
     return False
 
 
+def fetch_total_allocs(port, host="localhost", https=False):
+    """GET `/heap` and return `total_allocation_count` (cumulative
+    talc allocations since boot). Returns `None` on any failure
+    (server not exposing /heap, network blip, parse error) so
+    callers can fall back to "no alloc-stats" reporting without
+    aborting the bench.
+
+    On a unikernel target this number is the kernel heap's monotonic
+    `Talc::counters().total_allocation_count`; on native/POSIX it's
+    `0` (libstd's allocator exposes no counters), so callers should
+    treat a constant `0` across before/after as "alloc-stats not
+    available on this env" and skip the per-handshake derivation.
+    """
+    import json
+    scheme = "https" if https else "http"
+    url = f"{scheme}://{host}:{port}/heap"
+    try:
+        # `-k` for HTTPS so the self-signed dev cert doesn't trip
+        # curl's verifier; the alternative is `subprocess.run` with
+        # ssl.SSLContext, which adds Python imports for marginal
+        # benefit on a tool we already shell out to elsewhere.
+        flags = ["-sf", "--max-time", "3"]
+        if https:
+            flags.append("-k")
+        r = subprocess.run(
+            ["curl", *flags, url],
+            capture_output=True, timeout=5)
+        if r.returncode != 0:
+            return None
+        data = json.loads(r.stdout)
+        return int(data.get("total_allocation_count", 0))
+    except Exception:
+        return None
+
+
 def run_wrk(port, endpoint, threads, conns, duration, host="localhost"):
     # Hard-cap wrk's per-request timeout at 5 s so a stuck server can't
     # peg latency at the wrk default of 2 s and still appear "running"

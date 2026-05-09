@@ -66,6 +66,30 @@ def _cpu_tag(cores):
     sat = "⚠" if cores >= 0.7 * _HOST_CPUS else ""
     return f"cli={cores:.1f}cpu{sat}"
 
+
+def _alloc_tag(allocs_before, allocs_after, iterations):
+    """Format the allocs-per-iteration delta for the per-run output
+    line. Returns an empty string (no extra tag) when sampling
+    failed (`/heap` not exposed on this env, or HTTPS fetch failed)
+    or when iterations is too small to give a stable ratio (<10).
+
+    Used by tls_handshake / tls_resume / diagnostics workloads to
+    surface the M-validation metric: pre-M today's path costs ~7
+    allocs per accept (TlsConnImpl + 3 buffers + body_scratch + the
+    boxed accept future + spawn slot), post-M target ~0 once those
+    are pooled across accept/close cycles.
+    """
+    if allocs_before is None or allocs_after is None:
+        return ""
+    if iterations < 10:
+        return ""
+    delta = allocs_after - allocs_before
+    if delta < 0:
+        # Counter wraparound or server restart mid-bench — discard.
+        return ""
+    per_iter = delta / iterations
+    return f"  allocs/iter={per_iter:.2f}"
+
 from .envs import (
     ENV_MAP,
     HvfEnv,
@@ -77,6 +101,7 @@ from .envs import (
 )
 from .workloads import (
     _udp_with_retry,
+    fetch_total_allocs,
     next_port,
     run_loadgen_gateway,
     run_loadgen_h3_health,
@@ -173,6 +198,17 @@ WORKLOADS = [
     {"name": "health_tls_max", "type": "https", "endpoint": "/health",
      "threads_per_core": 1, "conns_per_core": 32,
      "desc": "/health throughput over TLS (32 conn × cpus, keep-alive)"},
+    # `diagnostics_tls_max` is `health_tls_max` against a multi-segment
+    # body (~9 KiB rendered HTML) instead of /health's 80 B JSON. The
+    # post-Q TX path emits the same 16 KB TLS record either way, but
+    # only the multi-segment shape exercises the TCP segmentation work
+    # — `health_tls_max` always fits in one MSS so it doesn't surface
+    # TSO wins. Compare the two before/after item G to see how much of
+    # /diagnostics' guest CPU was per-segment header building +
+    # checksum vs the encryption itself.
+    {"name": "diagnostics_tls_max", "type": "https", "endpoint": "/diagnostics",
+     "threads_per_core": 1, "conns_per_core": 32,
+     "desc": "/diagnostics throughput over TLS (~9 KB body, multi-segment)"},
     {"name": "tls_handshake_max", "type": "tls_handshake",
      "endpoint": "/health",
      "parallelism_per_core": 4,
@@ -483,14 +519,21 @@ def main():
                 elif w["type"] == "https":
                     # wrk over https://. Self-signed dev cert is fine
                     # because wrk doesn't verify by default.
+                    allocs_before = fetch_total_allocs(
+                        tls_target_port, host=wrk_host, https=True)
                     with measure_client_cpu() as m:
                         rps, p50, p99 = run_wrk_https(
                             tls_target_port, w["endpoint"], threads, conns, duration,
                             host=wrk_host)
+                    allocs_after = fetch_total_allocs(
+                        tls_target_port, host=wrk_host, https=True)
                     results[(env_name, cpus, wname)] = (rps, p50, p99)
                     client_cpu[(env_name, cpus, wname)] = m["cores"]
+                    alloc_tag = _alloc_tag(allocs_before, allocs_after,
+                                           rps * duration)
                     print(f"    {wname:<20s} {rps:>10.0f} req/s  "
-                          f"p50={p50}  p99={p99}  {_cpu_tag(m['cores'])}")
+                          f"p50={p50}  p99={p99}  "
+                          f"{_cpu_tag(m['cores'])}{alloc_tag}")
                 elif w["type"] == "tls_handshake":
                     # Connection-per-request: each iteration opens a
                     # fresh TCP socket, completes the full TLS 1.3
@@ -503,14 +546,30 @@ def main():
                     # tokio); falls back to Python if cargo isn't
                     # installed.
                     par = w.get("parallelism_per_core", 4) * cpus
+                    # Alloc-count sampling: snapshot total cumulative
+                    # talc allocations before + after the bench. The
+                    # post-bench delta divided by handshakes_completed
+                    # is allocs-per-handshake — the metric that item M
+                    # (conn-state pool) targets. `total_allocation_count`
+                    # is monotonic across the bench window so this is
+                    # only meaningful when nothing else is allocating
+                    # on the server, which is true for the duration of
+                    # a single workload run.
+                    allocs_before = fetch_total_allocs(
+                        tls_target_port, host=wrk_host, https=True)
                     with measure_client_cpu() as m:
                         rps, p50, p99 = run_loadgen_tls_handshake(
                             tls_target_port, w["endpoint"], duration,
                             host=wrk_host, parallelism=par)
+                    allocs_after = fetch_total_allocs(
+                        tls_target_port, host=wrk_host, https=True)
                     results[(env_name, cpus, wname)] = (rps, p50, p99)
                     client_cpu[(env_name, cpus, wname)] = m["cores"]
+                    alloc_tag = _alloc_tag(allocs_before, allocs_after,
+                                           rps * duration)
                     print(f"    {wname:<20s} {rps:>10.0f} hs/s   "
-                          f"p50={p50}  p99={p99}  {_cpu_tag(m['cores'])}")
+                          f"p50={p50}  p99={p99}  "
+                          f"{_cpu_tag(m['cores'])}{alloc_tag}")
                 elif w["type"] == "tls_resume":
                     # Resumed-handshake hot path: each worker keeps
                     # its own ticket cache, the first handshake per
@@ -521,14 +580,21 @@ def main():
                     # and skips Cert + CertVerify on the server flight
                     # — the work that dominates fresh-handshake time.
                     par = w.get("parallelism_per_core", 4) * cpus
+                    allocs_before = fetch_total_allocs(
+                        tls_target_port, host=wrk_host, https=True)
                     with measure_client_cpu() as m:
                         rps, p50, p99 = run_loadgen_tls_resume(
                             tls_target_port, w["endpoint"], duration,
                             host=wrk_host, parallelism=par)
+                    allocs_after = fetch_total_allocs(
+                        tls_target_port, host=wrk_host, https=True)
                     results[(env_name, cpus, wname)] = (rps, p50, p99)
                     client_cpu[(env_name, cpus, wname)] = m["cores"]
+                    alloc_tag = _alloc_tag(allocs_before, allocs_after,
+                                           rps * duration)
                     print(f"    {wname:<20s} {rps:>10.0f} hs/s   "
-                          f"p50={p50}  p99={p99}  {_cpu_tag(m['cores'])}")
+                          f"p50={p50}  p99={p99}  "
+                          f"{_cpu_tag(m['cores'])}{alloc_tag}")
                 elif w["type"] == "h3_health":
                     # HTTP/3 keep-alive throughput. Each worker
                     # opens its own QUIC connection (one full
