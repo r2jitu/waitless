@@ -221,7 +221,7 @@ pub fn aes128_gcm_open(
         .map_err(|_| ())
 }
 
-/// Re-export of `chacha20poly1305_seal` from `tls_crypto` for symmetry
+/// Re-export of `seal` from `tls_crypto` for symmetry
 /// — QUIC packet protection uses the same primitive.
 pub fn chacha20_poly1305_seal(
     key: &[u8; CHACHA_KEY_LEN],
@@ -229,10 +229,10 @@ pub fn chacha20_poly1305_seal(
     aad: &[u8],
     data: &mut [u8],
 ) -> [u8; TAG_LEN] {
-    tls_crypto::chacha20poly1305_seal(key, nonce, aad, data)
+    tls_crypto::seal(key, nonce, aad, data)
 }
 
-/// Re-export of `chacha20poly1305_open` for symmetry with seal.
+/// Re-export of `open` for symmetry with seal.
 pub fn chacha20_poly1305_open(
     key: &[u8; CHACHA_KEY_LEN],
     nonce: &[u8; NONCE_LEN],
@@ -240,7 +240,7 @@ pub fn chacha20_poly1305_open(
     data: &mut [u8],
     tag: &[u8; TAG_LEN],
 ) -> Result<(), ()> {
-    tls_crypto::chacha20poly1305_open(key, nonce, aad, data, tag)
+    tls_crypto::open(key, nonce, aad, data, tag)
 }
 
 // ============================================================================

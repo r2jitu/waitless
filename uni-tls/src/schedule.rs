@@ -244,7 +244,7 @@ impl TrafficKey {
     pub fn seal(&mut self, aad: &[u8], data: &mut [u8]) -> [u8; 16] {
         let nonce = self.nonce_for_seq(self.seq);
         self.seq = self.seq.wrapping_add(1);
-        tls_crypto::chacha20poly1305_seal(&self.key, &nonce, aad, data)
+        tls_crypto::seal(&self.key, &nonce, aad, data)
     }
 
     /// Fused copy-and-encrypt N-way variant of [`Self::seal`].
@@ -269,14 +269,14 @@ impl TrafficKey {
     {
         let nonce = self.nonce_for_seq(self.seq);
         self.seq = self.seq.wrapping_add(1);
-        tls_crypto::chacha20poly1305_seal_chain_to(&self.key, &nonce, aad, src_parts, dst)
+        tls_crypto::seal_chain_to(&self.key, &nonce, aad, src_parts, dst)
     }
 
     /// Open `data` in place; returns Err on tag mismatch. Auto-increments
     /// `seq` on success.
     pub fn open(&mut self, aad: &[u8], data: &mut [u8], tag: &[u8; 16]) -> Result<(), ()> {
         let nonce = self.nonce_for_seq(self.seq);
-        tls_crypto::chacha20poly1305_open(&self.key, &nonce, aad, data, tag)?;
+        tls_crypto::open(&self.key, &nonce, aad, data, tag)?;
         self.seq = self.seq.wrapping_add(1);
         Ok(())
     }

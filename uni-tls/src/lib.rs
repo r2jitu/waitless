@@ -126,8 +126,8 @@ pub fn preinit() {
         let key = [0u8; aead::KEY_LEN];
         let nonce = [0u8; aead::NONCE_LEN];
         let mut buf = [0u8; 16];
-        let tag = aead::chacha20poly1305_seal(&key, &nonce, b"", &mut buf);
-        let _ = aead::chacha20poly1305_open(&key, &nonce, b"", &mut buf, &tag);
+        let tag = aead::seal(&key, &nonce, b"", &mut buf);
+        let _ = aead::open(&key, &nonce, b"", &mut buf, &tag);
     }
 
     // X25519 ECDH exercise. The schedule path uses

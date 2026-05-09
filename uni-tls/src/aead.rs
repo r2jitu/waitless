@@ -25,7 +25,7 @@ use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag};
 
 // Lower-level primitives for the fused copy-and-encrypt path.
-// `chacha20poly1305_seal_chain_to` drives them by hand instead of
+// `seal_chain_to` drives them by hand instead of
 // going through the single-buffer `AeadInPlace` interface so the
 // caller can read from immutable source parts and write to a
 // separate destination in a single pass.
@@ -49,7 +49,7 @@ pub const NONCE_LEN: usize = 12;
 ///
 /// `aad` is additional authenticated data — authenticated but not
 /// encrypted (e.g. TLS record header).
-pub fn chacha20poly1305_seal(
+pub fn seal(
     key: &[u8; KEY_LEN],
     nonce: &[u8; NONCE_LEN],
     aad: &[u8],
@@ -71,7 +71,7 @@ pub fn chacha20poly1305_seal(
 /// regions of `dst`, and accumulates one Poly1305 tag over the
 /// resulting ciphertext. Returns the tag.
 ///
-/// Differs from [`chacha20poly1305_seal_chain`] in the source-vs-
+/// Differs from [`seal_chain`] in the source-vs-
 /// destination shape: `seal_chain` operates in place on mutable
 /// parts (caller has already coalesced plaintext into the parts
 /// themselves), while `seal_chain_to` reads from immutable source
@@ -86,7 +86,7 @@ pub fn chacha20poly1305_seal(
 ///
 /// `dst` must be at least as long as the sum of `src_parts`'
 /// lengths. Bytes past the written prefix are left untouched.
-pub fn chacha20poly1305_seal_chain_to<'a, I>(
+pub fn seal_chain_to<'a, I>(
     key: &[u8; KEY_LEN],
     nonce: &[u8; NONCE_LEN],
     aad: &[u8],
@@ -196,7 +196,7 @@ where
 /// decrypts `data` in place; returns `Err(())` on tag mismatch (in
 /// which case `data` is left in an undefined state — the upstream
 /// crate zeroises or leaves it, we don't rely on either).
-pub fn chacha20poly1305_open(
+pub fn open(
     key: &[u8; KEY_LEN],
     nonce: &[u8; NONCE_LEN],
     aad: &[u8],
@@ -261,11 +261,11 @@ mod tests {
 
         let mut data = [0u8; 114];
         data.copy_from_slice(plaintext);
-        let tag = chacha20poly1305_seal(&key, &nonce, &aad, &mut data);
+        let tag = seal(&key, &nonce, &aad, &mut data);
         assert_eq!(&data[..], &expected_ct[..]);
         assert_eq!(tag, expected_tag);
 
-        let opened = chacha20poly1305_open(&key, &nonce, &aad, &mut data, &tag);
+        let opened = open(&key, &nonce, &aad, &mut data, &tag);
         assert!(opened.is_ok());
         assert_eq!(&data[..], plaintext);
     }
@@ -276,16 +276,16 @@ mod tests {
         let nonce = [0u8; 12];
         let aad = [];
         let mut data = [0u8; 32];
-        let mut tag = chacha20poly1305_seal(&key, &nonce, &aad, &mut data);
+        let mut tag = seal(&key, &nonce, &aad, &mut data);
         tag[0] ^= 0x01;
-        let opened = chacha20poly1305_open(&key, &nonce, &aad, &mut data, &tag);
+        let opened = open(&key, &nonce, &aad, &mut data, &tag);
         assert!(opened.is_err());
     }
 
 
-    /// `chacha20poly1305_seal_chain_to(key, nonce, aad, src_parts,
+    /// `seal_chain_to(key, nonce, aad, src_parts,
     /// dst)` must produce the same tag and the same ciphertext
-    /// bytes as `chacha20poly1305_seal(key, nonce, aad,
+    /// bytes as `seal(key, nonce, aad,
     /// concat(src_parts))` — i.e. the scatter-gather encrypt-while-
     /// copying form is byte-identical to a single-buffer in-place
     /// seal of the coalesced plaintext. Sweeps part layouts that
@@ -322,7 +322,7 @@ mod tests {
             // scatter-gather seal_chain_to must produce the same
             // bytes.
             let mut ref_buf = plaintext[..total].to_vec();
-            let ref_tag = chacha20poly1305_seal(&key, &nonce, aad, &mut ref_buf);
+            let ref_tag = seal(&key, &nonce, aad, &mut ref_buf);
 
             // seal_chain_to: read from immutable plaintext parts,
             // write ciphertext to a separate dst buffer.
@@ -336,7 +336,7 @@ mod tests {
                 v
             };
             let mut dst = alloc::vec![0u8; total];
-            let to_tag = chacha20poly1305_seal_chain_to(
+            let to_tag = seal_chain_to(
                 &key,
                 &nonce,
                 aad,

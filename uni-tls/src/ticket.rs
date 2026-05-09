@@ -36,7 +36,7 @@ use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::aead::{
-    chacha20poly1305_open, chacha20poly1305_seal, KEY_LEN, NONCE_LEN, TAG_LEN,
+    open, seal, KEY_LEN, NONCE_LEN, TAG_LEN,
 };
 use crate::schedule::secure_zero;
 
@@ -281,7 +281,7 @@ pub(super) fn seal_under_key(
     // AAD = key name. Guards against a tag from another key being
     // pasted onto a name belonging to this one (defence in depth —
     // the key would also have to match for AEAD to succeed).
-    let tag = chacha20poly1305_seal(
+    let tag = seal(
         &tk.key,
         &nonce,
         &tk.name,
@@ -317,7 +317,7 @@ pub(super) fn open_under_key(
             .try_into()
             .ok()?;
 
-    if chacha20poly1305_open(&tk.key, &nonce, &tk.name, &mut buf, &tag).is_err() {
+    if open(&tk.key, &nonce, &tk.name, &mut buf, &tag).is_err() {
         return None;
     }
 
