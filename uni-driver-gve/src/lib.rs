@@ -771,6 +771,15 @@ fn parse_device_descriptor(desc_virt: *mut u8) -> bool {
     log_u32(mtu as u32);
     log(b" qps=");
     log_u32(default_num_queues as u32);
+    // Device's advertised TX/RX ring sizes. Currently we use static
+    // `TX_RING_ENTRIES = 256` / `RX_RING_ENTRIES = 512` regardless;
+    // if these advertised numbers diverge (especially on a future
+    // GCE SKU), the gap is visible here for a follow-up that
+    // heap-allocates `TxQueue.slot_used` from the runtime value.
+    log(b" tx_entries=");
+    log_u32(tx_entries as u32);
+    log(b" rx_entries=");
+    log_u32(rx_entries as u32);
     log(b" tx_pages_per_qpl=");
     log_u32(tx_pages_per_qpl as u32);
     log(b" mac=");
