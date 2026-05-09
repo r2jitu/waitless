@@ -744,16 +744,26 @@ auto-refreshes every 5 seconds; raw JSON endpoints below.</p>\
 const HEALTH_JSON: &[u8] =
     b"{\"status\":\"ok\",\"runtime\":\"unikernel\",\"version\":\"0.1.0\"}";
 
-/// Per-queue RX frame counts + used-ring cursors, so we can see how
-/// the NIC is distributing flows under Tier 1 multi-queue.
+/// Per-queue RX frame counts + used-ring cursors + TX-side
+/// saturation/scan-depth/per-qp counters. Lets a monitoring agent
+/// or `/diagnostics` page see whether:
+///   * RSS / per-core dispatch is spreading load evenly
+///     (rx_frames / tx_packets even across qps)
+///   * The TX pool is undersized for the offered load
+///     (tx_small_full_spins climbing)
+///   * The linear-scan acquire path is wasting cycles
+///     (tx_small_avg_scan_depth high relative to pool size)
+///   * TSO super-segments are saturating their pool
+///     (tx_big_full_returns climbing)
 fn stats_response() -> Response {
     let counts = uni::diagnostics::net_rx_counts();
     let cursors = uni::diagnostics::net_rx_used_cursors();
     let nqp = uni::diagnostics::net_num_queue_pairs() as usize;
+    let tx = uni::diagnostics::net_tx_diag();
 
-    // 1 KiB body region — even with 32 queue pairs and 20-digit
-    // u64 counters this stays well under cap.
-    let mut body = uni_http::body_iobuf(1024);
+    // 2 KiB body region — covers nqp ≤ 32 with TX/RX arrays + the
+    // small set of saturation scalars and stays well under cap.
+    let mut body = uni_http::body_iobuf(2048);
     {
         let mut w = body.writer();
         let _ = w.write_str("{\"rx_frames\":[");
@@ -771,7 +781,44 @@ fn stats_response() -> Response {
             if i > 0 { let _ = w.write_str(","); }
             let _ = write!(w, "{}", cursors[i].1);
         }
-        let _ = write!(w, "],\"num_queue_pairs\":{}}}", nqp);
+        let _ = write!(w, "],\"num_queue_pairs\":{}", nqp);
+
+        if let Some(t) = tx {
+            // Average scan depth: high values vs `small_pool_size`
+            // motivate replacing the linear scan with a freelist.
+            // Compute on the read side; emit as a fixed-point
+            // ratio (×100) since we don't pull in float formatting.
+            let avg_scan_x100 = if t.small_pool_acquires > 0 {
+                (t.small_pool_scan_iters * 100) / t.small_pool_acquires
+            } else {
+                0
+            };
+            let _ = w.write_str(",\"tx_packets\":[");
+            for i in 0..nqp.min(t.packets_per_qp.len()) {
+                if i > 0 { let _ = w.write_str(","); }
+                let _ = write!(w, "{}", t.packets_per_qp[i]);
+            }
+            let _ = write!(
+                w,
+                "],\"tx_small_pool_size\":{},\
+                  \"tx_big_pool_size\":{},\
+                  \"tx_small_acquires\":{},\
+                  \"tx_small_scan_iters\":{},\
+                  \"tx_small_avg_scan_x100\":{},\
+                  \"tx_small_full_spins\":{},\
+                  \"tx_big_acquires\":{},\
+                  \"tx_big_full_returns\":{}",
+                t.small_pool_size,
+                t.big_pool_size,
+                t.small_pool_acquires,
+                t.small_pool_scan_iters,
+                avg_scan_x100,
+                t.small_pool_full_spins,
+                t.big_pool_acquires,
+                t.big_pool_full_returns,
+            );
+        }
+        let _ = w.write_str("}");
     }
     Response::ok(&b"application/json"[..], body)
 }

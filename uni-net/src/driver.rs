@@ -325,10 +325,65 @@ pub struct NicIdleOps {
 }
 
 /// Per-queue diagnostic snapshots. Wired into the stats endpoint but
-/// never on the hot path.
+/// never on the hot path. The `tx_diag` accessor is `Option`-shaped
+/// so legacy backends without TX-side instrumentation can return
+/// `None` without filling a zero struct.
 pub struct NicDiagOps {
     pub rx_counts: fn() -> [u64; 8],
     pub rx_used_cursors: fn() -> [(u16, u16); 8],
+    /// Snapshot of TX-pool saturation + per-qp TX packet counts.
+    /// `None` when the driver hasn't been instrumented (kept as
+    /// an Option to avoid forcing every backend to fill the
+    /// struct on every release). Returns a single `TxDiag`
+    /// covering all qps — per-qp arrays are indexed up to
+    /// `DIAG_QP_CAP`.
+    pub tx_diag: Option<fn() -> TxDiag>,
+}
+
+/// Cap on per-qp diagnostic arrays. Mirrors `rx_counts: [u64; 8]`
+/// so a single `TxDiag` snapshot fits the common case without
+/// heap allocation. Drivers with more queue-pairs sum the tail
+/// into `[7]` so the total still reflects the device.
+pub const DIAG_QP_CAP: usize = 8;
+
+/// TX-side counters surfaced via [`NicDiagOps::tx_diag`]. All
+/// fields are zeroed at boot and only ever incremented (relaxed
+/// atomic on the hot path), so a snapshot's value differences
+/// across a sampling window give per-second rates.
+///
+/// The two pools (`small` for single-segment frames, `big` for
+/// TSO super-segments) report their max sizes alongside their
+/// in-flight + saturation counts so the reader can compute
+/// utilisation without knowing driver constants.
+#[derive(Clone, Copy, Default)]
+pub struct TxDiag {
+    /// Per-qp count of TX packets submitted to the device.
+    /// Reflects load distribution across qps — uneven values
+    /// mean RSS / per-core dispatch isn't spreading evenly.
+    pub packets_per_qp: [u64; DIAG_QP_CAP],
+    /// Cumulative number of times `acquire_tx_buf` had to spin
+    /// because the small pool was fully in-flight. High counts
+    /// = pool is undersized for the load.
+    pub small_pool_full_spins: u64,
+    /// Cumulative scan-iterations across all small-pool
+    /// acquires. `small_pool_scan_iters / acquire_count` gives
+    /// the average linear-scan depth — high values motivate a
+    /// real freelist.
+    pub small_pool_scan_iters: u64,
+    /// Number of small-pool acquires that succeeded. Pair with
+    /// `small_pool_scan_iters` to compute mean.
+    pub small_pool_acquires: u64,
+    /// Cumulative number of times `acquire_tx_tso_buf` returned
+    /// `None` because the big pool was full. Each event means
+    /// the caller fell back to per-MSS segmentation (TSO win
+    /// lost on that send).
+    pub big_pool_full_returns: u64,
+    /// Number of TSO super-segments successfully submitted.
+    pub big_pool_acquires: u64,
+    /// Static pool sizes, snapshot at boot. Reader divides
+    /// `acquires - releases` if it needs in-flight count.
+    pub small_pool_size: u32,
+    pub big_pool_size: u32,
 }
 
 

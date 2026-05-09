@@ -1137,6 +1137,13 @@ pub fn net_rx_counts() -> [u64; 8] { [0; 8] }
 pub fn net_num_queue_pairs() -> u16 { 1 }
 pub fn net_rx_used_cursors() -> [(u16, u16); 8] { [(0, 0); 8] }
 
+// `tx_diag` mirrors the unikernel side's `Option`-returning accessor.
+// Re-export the same `TxDiag` shape from `uni_net_driver` so callers
+// don't see a different type on native.
+pub use uni_net_driver::TxDiag as NetTxDiag;
+pub const NET_DIAG_QP_CAP: usize = uni_net_driver::DIAG_QP_CAP;
+pub fn net_tx_diag() -> Option<NetTxDiag> { None }
+
 // ---- Heap stats ------------------------------------------------------------
 
 pub fn heap_stats() -> super::HeapStats { super::HeapStats::default() }

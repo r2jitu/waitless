@@ -181,6 +181,20 @@ pub fn rx_used_cursors() -> [(u16, u16); 8] {
     active_ops().diag.map(|d| (d.rx_used_cursors)()).unwrap_or([(0, 0); 8])
 }
 
+/// TX-side diagnostics — per-qp packet counts + small/big pool
+/// saturation counters. Returns `None` when either no driver is
+/// active or the active driver hasn't wired up the `tx_diag`
+/// accessor (it's `Option`-shaped on `NicDiagOps` so legacy
+/// drivers compile without filling the struct).
+pub fn tx_diag() -> Option<uni_net_driver::TxDiag> {
+    active_ops()
+        .diag
+        .and_then(|d| d.tx_diag)
+        .map(|f| f())
+}
+
+pub use uni_net_driver::{TxDiag, DIAG_QP_CAP};
+
 /// Cold-path: used by `uni::Net::enable` to tell "no driver linked"
 /// from "drivers linked but none bound hardware".
 pub fn installed() -> bool { is_installed() }

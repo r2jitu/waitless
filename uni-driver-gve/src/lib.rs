@@ -1992,6 +1992,7 @@ fn acquire_tx_buf_for_qp(qp: usize) -> Option<uni_net_driver::TxBufHandle> {
     if tx_ptr.is_null() { return None; }
     let tx = unsafe { &*tx_ptr };
 
+    let mut local_iters: u64 = 0;
     loop {
         // Need both: a free slot in the pool AND ring-fill capacity
         // (fill_cnt - done_cnt < ring_entries). With slot_count ==
@@ -2002,8 +2003,15 @@ fn acquire_tx_buf_for_qp(qp: usize) -> Option<uni_net_driver::TxBufHandle> {
         let done = tx.done_cnt.load(Ordering::Relaxed);
         if fill.wrapping_sub(done) < tx.ring_entries as u32 {
             for slot in 0..(tx.ring_entries as usize) {
+                local_iters += 1;
                 if !tx.slot_used[slot].load(Ordering::Acquire) {
                     tx.slot_used[slot].store(true, Ordering::Relaxed);
+                    // Diag: record cumulative scan-iters + acquire
+                    // count so the reader can compute the average
+                    // scan depth. Single relaxed atomic each — off
+                    // the per-packet hot path's critical chain.
+                    TX_SMALL_SCAN_ITERS.fetch_add(local_iters, Ordering::Relaxed);
+                    TX_SMALL_ACQUIRES.fetch_add(1, Ordering::Relaxed);
                     let qpl_offset = (slot as u32) * PAGE_SIZE;
                     let data_ptr = (tx.qpl_base_va + qpl_offset as u64) as *mut u8;
                     return Some(uni_net_driver::TxBufHandle {
@@ -2016,7 +2024,9 @@ fn acquire_tx_buf_for_qp(qp: usize) -> Option<uni_net_driver::TxBufHandle> {
             }
         }
         // No capacity. Force any deferred kick so the host sees
-        // pending descriptors and can produce completions.
+        // pending descriptors and can produce completions. Each
+        // wrap-around counts as one saturation event.
+        TX_SMALL_FULL_SPINS.fetch_add(1, Ordering::Relaxed);
         let bar2_va = BAR2_VA.load(Ordering::Acquire);
         if bar2_va != 0 {
             let last = tx.last_kicked.load(Ordering::Relaxed);
@@ -2143,6 +2153,11 @@ fn submit_tx_inner(
     if !DEFERRED_KICK.load(Ordering::Relaxed) || near_full {
         doorbell_write(bar2_va, tx.db_offset, new_fill);
         tx.last_kicked.store(new_fill, Ordering::Relaxed);
+    }
+
+    // Per-qp TX packet count for load-distribution diagnostics.
+    if qp < TX_PACKETS_PER_QP.len() {
+        TX_PACKETS_PER_QP[qp].fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -2526,6 +2541,11 @@ fn submit_tx_inner_dqo(
         doorbell_write_le(bar2_va, tx.db_offset, new_fill);
         tx.last_kicked.store(new_fill, Ordering::Relaxed);
     }
+
+    // Per-qp TX packet count, same field as the GQI path.
+    if qp < TX_PACKETS_PER_QP.len() {
+        TX_PACKETS_PER_QP[qp].fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Post all DQO_RX_POOL_BUFS buffers on this queue's buffer ring and
@@ -2662,6 +2682,44 @@ fn get_mac(mac_out: *mut u8) {
 #[inline]
 fn num_queue_pairs() -> u16 {
     NUM_QP.load(Ordering::Acquire)
+}
+
+// ---- TX-side hot-path counters ----
+//
+// Bumped from `acquire_tx_buf_for_qp`, `acquire_tx_tso_buf_for_qp`,
+// and the GQI / DQO submit functions. Surfaced via `tx_diag()` →
+// `NicDiagOps::tx_diag` so the /stats endpoint can render them.
+//
+// Layout mirrors virtio-net's: per-qp packet counts (8-deep) plus
+// scalar saturation + scan-depth counters that don't depend on qp
+// (the small/big pools are per-qp here, but the scans run inside
+// the owning worker so a single set of counters captures the
+// driver's aggregate behaviour without needing a per-qp split).
+static TX_PACKETS_PER_QP: [AtomicU64; 8] =
+    [const { AtomicU64::new(0) }; 8];
+static TX_SMALL_FULL_SPINS: AtomicU64 = AtomicU64::new(0);
+static TX_SMALL_SCAN_ITERS: AtomicU64 = AtomicU64::new(0);
+static TX_SMALL_ACQUIRES: AtomicU64 = AtomicU64::new(0);
+static TX_BIG_FULL_RETURNS: AtomicU64 = AtomicU64::new(0);
+static TX_BIG_ACQUIRES: AtomicU64 = AtomicU64::new(0);
+
+fn tx_diag() -> uni_net_driver::TxDiag {
+    let mut packets = [0u64; uni_net_driver::DIAG_QP_CAP];
+    for i in 0..uni_net_driver::DIAG_QP_CAP {
+        packets[i] = TX_PACKETS_PER_QP[i].load(Ordering::Relaxed);
+    }
+    uni_net_driver::TxDiag {
+        packets_per_qp: packets,
+        small_pool_full_spins: TX_SMALL_FULL_SPINS.load(Ordering::Relaxed),
+        small_pool_scan_iters: TX_SMALL_SCAN_ITERS.load(Ordering::Relaxed),
+        small_pool_acquires: TX_SMALL_ACQUIRES.load(Ordering::Relaxed),
+        big_pool_full_returns: TX_BIG_FULL_RETURNS.load(Ordering::Relaxed),
+        big_pool_acquires: TX_BIG_ACQUIRES.load(Ordering::Relaxed),
+        small_pool_size: TX_RING_ENTRIES as u32,
+        // Big pool isn't wired in production (TSO parked); report 0
+        // until acquire_tx_tso_buf comes back online.
+        big_pool_size: 0,
+    }
 }
 
 /// Per-queue RX frame count. Lock-free snapshot — uses the atomic
@@ -2818,6 +2876,7 @@ fn probe() -> bool {
 static GVE_DIAG_OPS: NicDiagOps = NicDiagOps {
     rx_counts,
     rx_used_cursors,
+    tx_diag: Some(tx_diag),
 };
 
 static GVE_OPS: NicOps = NicOps {

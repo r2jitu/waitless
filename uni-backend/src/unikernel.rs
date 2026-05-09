@@ -16,7 +16,8 @@ pub fn check_shutdown() -> bool {
 
 pub use uni_drivers::net::{
     num_queue_pairs as net_num_queue_pairs, rx_counts as net_rx_counts,
-    rx_used_cursors as net_rx_used_cursors,
+    rx_used_cursors as net_rx_used_cursors, tx_diag as net_tx_diag,
+    TxDiag as NetTxDiag, DIAG_QP_CAP as NET_DIAG_QP_CAP,
 };
 
 // ---- Event loop re-exports ------------------------------------------------

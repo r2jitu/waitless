@@ -1426,11 +1426,20 @@ fn acquire_tx_buf() -> Option<uni_net_driver::TxBufHandle> {
     // Spin-drain on full. Per-worker pool means slot allocation
     // is lock-free regardless of nqp; only the qp drain takes
     // TX_LOCK on Tier 2 (single shared qp).
+    let mut local_iters: u64 = 0;
     loop {
         for slot in 0..TX_POOL_SMALL_SIZE {
+            local_iters += 1;
             unsafe {
                 if !(*wpool(worker)).small_used[slot].load(Ordering::Acquire) {
                     (*wpool(worker)).small_used[slot].store(true, Ordering::Relaxed);
+                    // Diagnostics: bump aggregate scan-depth + acquire
+                    // counts. One write each per successful acquire
+                    // — `local_iters / acquires` (read-side) is the
+                    // average scan depth. Relaxed ordering: counters
+                    // never gate any other read.
+                    TX_SMALL_SCAN_ITERS.fetch_add(local_iters, Ordering::Relaxed);
+                    TX_SMALL_ACQUIRES.fetch_add(1, Ordering::Relaxed);
                     let buf = &mut (*wpool(worker)).small[slot];
                     return Some(uni_net_driver::TxBufHandle {
                         data_ptr: buf.data.as_mut_ptr(),
@@ -1443,7 +1452,9 @@ fn acquire_tx_buf() -> Option<uni_net_driver::TxBufHandle> {
         }
         // All slots busy — flush deferred kicks so the host can
         // process the pending TX batch and produce completions,
-        // then drain and re-scan.
+        // then drain and re-scan. Each full sweep counts as one
+        // saturation event for `tx_diag`.
+        TX_SMALL_FULL_SPINS.fetch_add(1, Ordering::Relaxed);
         unsafe { (*tx_q(qp)).flush_kick(); }
         tx_drain_qp_locked(qp);
         compiler_fence(Ordering::SeqCst);
@@ -1467,6 +1478,7 @@ fn acquire_tx_tso_buf() -> Option<uni_net_driver::TxTsoBufHandle> {
         unsafe {
             if !(*wpool(worker)).big_used[slot].load(Ordering::Acquire) {
                 (*wpool(worker)).big_used[slot].store(true, Ordering::Relaxed);
+                TX_BIG_ACQUIRES.fetch_add(1, Ordering::Relaxed);
                 let buf = &mut *big_ptr.add(slot);
                 return Some(uni_net_driver::TxTsoBufHandle(
                     uni_net_driver::TxBufHandle {
@@ -1479,6 +1491,11 @@ fn acquire_tx_tso_buf() -> Option<uni_net_driver::TxTsoBufHandle> {
             }
         }
     }
+    // Big pool full → caller falls back to per-MSS small-pool sends.
+    // High counts here mean TSO is being undersized (or the TCP
+    // layer is shipping super-segments faster than the device
+    // drains them).
+    TX_BIG_FULL_RETURNS.fetch_add(1, Ordering::Relaxed);
     None
 }
 
@@ -1547,11 +1564,17 @@ fn submit_tx(
             (*tx_q(qp)).kick();
             true
         };
-        if qp_needs_lock() {
+        let ok = if qp_needs_lock() {
             let _g = TX_LOCK.lock();
-            submit(&|| (*tx_q(qp)).add_buf(buf_phys, total_len, 1, 0));
+            submit(&|| (*tx_q(qp)).add_buf(buf_phys, total_len, 1, 0))
         } else {
-            submit(&|| (*tx_q(qp)).add_buf(buf_phys, total_len, 1, 0));
+            submit(&|| (*tx_q(qp)).add_buf(buf_phys, total_len, 1, 0))
+        };
+        if ok && qp < DIAG_QP_CAP {
+            // Per-qp TX packet count — surfaces load distribution
+            // across qps. Even-ish counts under multi-core load
+            // means worker→qp mapping + RSS are balanced.
+            TX_PACKETS_PER_QP[qp].fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -1630,19 +1653,23 @@ fn submit_tx_tso(
 
         let total_len = VIRTIO_NET_HDR_SIZE as u32 + frame_len as u32;
         let buf_phys = virt_to_phys(buf as *const TxBufBig as *const u8);
-        let submit = || {
+        let submit = || -> bool {
             let head = (*tx_q(qp)).add_buf(buf_phys, total_len, 1, 0);
             if head < 0 {
                 (*wpool(worker)).big_used[slot].store(false, Ordering::Release);
-                return;
+                return false;
             }
             (*tx_q(qp)).kick();
+            true
         };
-        if qp_needs_lock() {
+        let ok = if qp_needs_lock() {
             let _g = TX_LOCK.lock();
-            submit();
+            submit()
         } else {
-            submit();
+            submit()
+        };
+        if ok && qp < DIAG_QP_CAP {
+            TX_PACKETS_PER_QP[qp].fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -1704,6 +1731,47 @@ fn poke_interrupt_status() {
 /// fixed-size array; queues beyond that are not tracked here.
 static RX_COUNTS: [core::sync::atomic::AtomicU64; DIAG_QP_CAP] =
     [const { core::sync::atomic::AtomicU64::new(0) }; DIAG_QP_CAP];
+
+/// TX-side hot-path counters surfaced via [`NicDiagOps::tx_diag`].
+/// Each is a single relaxed atomic — bumped once per acquire /
+/// once per scan-iteration / once per submit. `packets_per_qp[i]`
+/// is bumped from `submit_tx*` for the qp the worker maps to.
+///
+/// The pair `(SCAN_ITERS_SMALL, ACQUIRES_SMALL)` lets the reader
+/// compute average linear-scan depth: high values flag that a
+/// real freelist would help. `FULL_SPINS_SMALL` counts the times
+/// we wrapped the scan and had to flush+drain — direct saturation
+/// indicator.
+static TX_PACKETS_PER_QP: [core::sync::atomic::AtomicU64; DIAG_QP_CAP] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; DIAG_QP_CAP];
+static TX_SMALL_FULL_SPINS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+static TX_SMALL_SCAN_ITERS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+static TX_SMALL_ACQUIRES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+static TX_BIG_FULL_RETURNS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+static TX_BIG_ACQUIRES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+fn tx_diag() -> uni_net_driver::TxDiag {
+    use core::sync::atomic::Ordering::Relaxed;
+    let mut packets = [0u64; DIAG_QP_CAP];
+    for i in 0..DIAG_QP_CAP {
+        packets[i] = TX_PACKETS_PER_QP[i].load(Relaxed);
+    }
+    uni_net_driver::TxDiag {
+        packets_per_qp: packets,
+        small_pool_full_spins: TX_SMALL_FULL_SPINS.load(Relaxed),
+        small_pool_scan_iters: TX_SMALL_SCAN_ITERS.load(Relaxed),
+        small_pool_acquires: TX_SMALL_ACQUIRES.load(Relaxed),
+        big_pool_full_returns: TX_BIG_FULL_RETURNS.load(Relaxed),
+        big_pool_acquires: TX_BIG_ACQUIRES.load(Relaxed),
+        small_pool_size: TX_POOL_SMALL_SIZE as u32,
+        big_pool_size: TX_POOL_BIG_SIZE as u32,
+    }
+}
 
 /// Snapshot of per-queue RX frame counts.
 fn rx_counts() -> [u64; DIAG_QP_CAP] {
@@ -2274,6 +2342,7 @@ static VIRTIO_NET_IDLE_OPS: NicIdleOps = NicIdleOps {
 static VIRTIO_NET_DIAG_OPS: NicDiagOps = NicDiagOps {
     rx_counts,
     rx_used_cursors,
+    tx_diag: Some(tx_diag),
 };
 
 static VIRTIO_NET_OPS: NicOps = NicOps {

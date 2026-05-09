@@ -25,6 +25,12 @@ rust_library(
         "//uni-worker",
         "//uni-platform",
         "//uni-runtime",
+        # `uni_net_driver::TxDiag` is re-exported from both backends
+        # so `uni::diagnostics::NetTxDiag` is the same type on both
+        # native (stub) and bare-metal (driver-filled). The driver
+        # leaf crate is dependency-light (just `//uni-iobuf`), so it
+        # adds no real native footprint.
+        "//uni-net:driver",
     ] + select({
         "//bazel/platforms:native": ["//util/atomic_fn"],
         "//conditions:default": [

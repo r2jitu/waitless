@@ -317,6 +317,29 @@ pub mod diagnostics {
     /// (cursors apart) vs "host not delivering" (both stuck).
     pub fn net_rx_used_cursors() -> [(u16, u16); 8] { uni_backend::net_rx_used_cursors() }
 
+    /// TX-side hot-path counters: per-qp packet counts + small/big
+    /// pool saturation + scan-depth aggregates. `None` when no
+    /// driver is bound or the active driver hasn't wired the
+    /// accessor.
+    ///
+    /// Read-side division gives the average linear-scan depth on
+    /// small-pool acquires:
+    /// `small_pool_scan_iters / small_pool_acquires`. High values
+    /// (e.g. > pool_size/2) suggest replacing the
+    /// `[AtomicBool; N]` scan with a real freelist; low values
+    /// mean the linear scan is fine and a freelist would just add
+    /// code.
+    ///
+    /// `small_pool_full_spins` and `big_pool_full_returns` flag
+    /// pool sizing — a steady non-zero rate means the pool is
+    /// undersized for the load.
+    pub fn net_tx_diag() -> Option<uni_backend::NetTxDiag> {
+        uni_backend::net_tx_diag()
+    }
+
+    pub use uni_backend::NET_DIAG_QP_CAP;
+    pub use uni_backend::NetTxDiag;
+
     /// Snapshot the heap. Cheap on bare-metal (O(1) + spinlock);
     /// best-effort zero on native.
     pub fn heap_stats() -> super::HeapStats { uni_backend::heap_stats() }
