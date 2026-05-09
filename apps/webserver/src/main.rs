@@ -774,6 +774,12 @@ where
 ///   * `chi² > 100·χ²_{0.999, df}` → highly skewed.
 ///     For df=3: χ²_{0.999, 3} = 16.27, so chi² > 1627.
 ///
+/// Caveat: χ² scales linearly with total N, so at bench-scale
+/// (10⁷+ packets) every detectable imbalance — even a 1.3× max/min
+/// ratio — produces "highly skewed" by this threshold. Pair with
+/// [`max_min_ratio_x100`] for a magnitude that doesn't grow with
+/// the sample size.
+///
 /// Returns 0 when there's no traffic (or only one bucket) — readers
 /// should treat 0 as "no data", not "perfectly balanced".
 fn rss_chi_squared_x100(observed: &[u64]) -> u64 {
@@ -799,6 +805,31 @@ fn rss_chi_squared_x100(observed: &[u64]) -> u64 {
         acc = acc.saturating_add(term);
     }
     acc.saturating_mul(100)
+}
+
+/// Peak-to-trough ratio of `observed` × 100. Returns
+/// `max(observed) * 100 / max(min(observed), 1)`. A perfectly
+/// uniform distribution returns 100; 200 means the hottest bucket
+/// has 2× the load of the coldest. Independent of total volume,
+/// so this stays meaningful at any traffic scale (unlike raw
+/// chi-squared, which grows linearly with N).
+///
+/// Returns 0 when `observed` is empty or `max == 0`.
+fn max_min_ratio_x100(observed: &[u64]) -> u64 {
+    let mut min = u64::MAX;
+    let mut max = 0u64;
+    for &v in observed {
+        if v < min {
+            min = v;
+        }
+        if v > max {
+            max = v;
+        }
+    }
+    if max == 0 || min == u64::MAX {
+        return 0;
+    }
+    max.saturating_mul(100) / min.max(1)
 }
 
 /// Per-queue RX frame counts + used-ring cursors + TX-side
@@ -830,13 +861,17 @@ fn stats_response() -> Response {
         used_drv[i] = cursors[i].1;
     }
 
-    // RSS imbalance metric — chi-squared against a uniform expected
-    // distribution. `rx_chi_squared_x100` reflects how RSS spreads
-    // incoming flows (NIC-side hashing); `tx_chi_squared_x100`
-    // reflects how the worker→qp dispatch spreads outgoing packets.
-    // Both should be small under healthy load; rising values flag
-    // a hash-bias problem (RX) or a scheduler imbalance (TX).
-    let rx_chi = rss_chi_squared_x100(&counts[..nqp.min(counts.len())]);
+    // RSS imbalance metrics. `chi_squared` is the Pearson statistic
+    // for "is this consistent with uniform" (good for stat-sig
+    // tests), but at bench-scale traffic volumes even a small
+    // imbalance produces a huge chi² because the metric grows
+    // linearly with N. `max_min_ratio` is the human-readable
+    // companion: 100 = perfectly balanced, 200 = hottest qp gets
+    // 2× the coldest qp's load, etc. Independent of N. RX side
+    // reflects RSS hashing; TX reflects per-core dispatch.
+    let rx_slice = &counts[..nqp.min(counts.len())];
+    let rx_chi = rss_chi_squared_x100(rx_slice);
+    let rx_ratio = max_min_ratio_x100(rx_slice);
 
     // 2 KiB body region — covers nqp ≤ 32 with TX/RX arrays + the
     // small set of saturation scalars and stays well under cap.
@@ -849,8 +884,13 @@ fn stats_response() -> Response {
         emit_json_array(&mut w, "rx_used_dev", &used_dev[..n]);
         let _ = w.write_str(",");
         emit_json_array(&mut w, "rx_used_drv", &used_drv[..n]);
-        let _ = write!(w, ",\"num_queue_pairs\":{},\"rx_chi_squared_x100\":{}",
-                       nqp, rx_chi);
+        let _ = write!(
+            w,
+            ",\"num_queue_pairs\":{},\
+              \"rx_chi_squared_x100\":{},\
+              \"rx_max_min_ratio_x100\":{}",
+            nqp, rx_chi, rx_ratio,
+        );
 
         if let Some(t) = tx {
             // Average scan depth: high values vs `small_pool_size`
@@ -865,6 +905,7 @@ fn stats_response() -> Response {
             let tx_slice = &t.packets_per_qp[..nqp.min(t.packets_per_qp.len())];
             let inflight_slice = &t.inflight_per_qp[..nqp.min(t.inflight_per_qp.len())];
             let tx_chi = rss_chi_squared_x100(tx_slice);
+            let tx_ratio = max_min_ratio_x100(tx_slice);
             let _ = w.write_str(",");
             emit_json_array(&mut w, "tx_packets", tx_slice);
             let _ = w.write_str(",");
@@ -872,6 +913,7 @@ fn stats_response() -> Response {
             let _ = write!(
                 w,
                 ",\"tx_chi_squared_x100\":{},\
+                  \"tx_max_min_ratio_x100\":{},\
                   \"tx_small_pool_size\":{},\
                   \"tx_big_pool_size\":{},\
                   \"tx_small_acquires\":{},\
@@ -881,6 +923,7 @@ fn stats_response() -> Response {
                   \"tx_big_acquires\":{},\
                   \"tx_big_full_returns\":{}",
                 tx_chi,
+                tx_ratio,
                 t.small_pool_size,
                 t.big_pool_size,
                 t.small_pool_acquires,
