@@ -118,7 +118,10 @@ where
         let mut settings = [0u8; 8];
         let n = frame::write_empty_settings(&mut settings).expect("write settings");
         buf.extend_from_slice(&settings[..n]);
-        conn.send(control_id, &buf);
+        // Hand the Vec to the SendStream by move (zero-copy). The
+        // alternative `conn.send(control_id, &buf)` would `to_vec()`
+        // a duplicate inside the slice variant of `SendStream::write`.
+        conn.send_owned(control_id, buf);
     }
 
     // 2. Loop accepting streams.

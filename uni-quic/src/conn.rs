@@ -1356,13 +1356,6 @@ impl Connection {
             .unwrap_or(false)
     }
 
-    /// Append `data` to stream `sid`'s outbound queue. Bytes go on
-    /// the wire on the next outbound flush. Auto-creates the stream
-    /// state lazily.
-    pub fn stream_send(&mut self, sid: u64, data: &[u8]) {
-        self.ensure_send_stream(sid).write(data);
-    }
-
     /// Append an owned `Vec<u8>` to stream `sid`'s outbound
     /// chunk chain by move. Use this when the caller already
     /// holds a built buffer (e.g. an H3 response payload) so
@@ -1371,15 +1364,6 @@ impl Connection {
     /// directly into the datagram payload region.
     pub fn stream_send_owned(&mut self, sid: u64, data: Vec<u8>) {
         self.ensure_send_stream(sid).write_owned(data);
-    }
-
-    /// Append a `&'static` slice to stream `sid`'s outbound
-    /// chunk chain — zero allocation, zero copy. The slice is
-    /// held by reference; pop_chunk_into will copy the
-    /// requested bytes into the datagram payload region for
-    /// AEAD-in-place sealing.
-    pub fn stream_send_static(&mut self, sid: u64, data: &'static [u8]) {
-        self.ensure_send_stream(sid).write_static(data);
     }
 
     /// Append a pre-built [`uni_iobuf::IOBuf`] chunk to stream

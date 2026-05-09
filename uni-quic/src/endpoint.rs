@@ -240,54 +240,6 @@ impl QuicConn {
         }
     }
 
-    /// Append bytes to stream `sid`'s send queue and immediately
-    /// drain any outbound packets onto the wire. Synchronous: by
-    /// the time `send` returns, the bytes have been sealed into
-    /// 1-RTT packets and `sendto`'d on the UDP socket.
-    pub fn send(&self, sid: u64, data: &[u8]) {
-        {
-            let mut c = self.conn.borrow_mut();
-            c.stream_send(sid, data);
-            let _ = c.flush(&self.cfg);
-        }
-        self.drain_outbound();
-    }
-
-    /// Append bytes to stream `sid` AND mark it for FIN, then
-    /// flush — bundles data + FIN into a single STREAM frame
-    /// (and a single 1-RTT packet, when the data fits the
-    /// per-packet body budget). The two-call pattern
-    /// (`send` then `close_stream`) emits FIN in a separate
-    /// STREAM frame at offset = N, len = 0, fin = true; some
-    /// peers treat that as a stream-finalize signal that arrives
-    /// out of order with the data, so prefer this single-call
-    /// path for normal request/response.
-    pub fn send_fin(&self, sid: u64, data: &[u8]) {
-        {
-            let mut c = self.conn.borrow_mut();
-            c.stream_send(sid, data);
-            c.stream_close(sid);
-            let _ = c.flush(&self.cfg);
-        }
-        self.drain_outbound();
-    }
-
-    /// Zero-copy variant of `send_fin`: takes ownership of the
-    /// payload Vec and passes it straight into the SendStream's
-    /// chunk chain, skipping the extend_from_slice memcpy that
-    /// `send_fin(&[u8])` performs. Use this whenever the caller
-    /// already holds a built Vec (the H3 server's write_response
-    /// is the canonical example).
-    pub fn send_fin_owned(&self, sid: u64, data: Vec<u8>) {
-        {
-            let mut c = self.conn.borrow_mut();
-            c.stream_send_owned(sid, data);
-            c.stream_close(sid);
-            let _ = c.flush(&self.cfg);
-        }
-        self.drain_outbound();
-    }
-
     /// Append an owned `Vec<u8>` to stream `sid`'s send queue
     /// (no FIN). Stream stays open for further writes — caller
     /// closes via `close_stream` when ready. Used by H3 to
@@ -296,21 +248,6 @@ impl QuicConn {
         {
             let mut c = self.conn.borrow_mut();
             c.stream_send_owned(sid, data);
-            let _ = c.flush(&self.cfg);
-        }
-        self.drain_outbound();
-    }
-
-    /// Append a `&'static` slice to stream `sid`'s send queue
-    /// by reference — zero alloc, zero copy at the API
-    /// boundary. The slice's bytes get into the wire packet via
-    /// one final memcpy in `pop_chunk_into` (where AEAD-in-place
-    /// requires contiguous bytes inside the datagram), but the
-    /// SendStream itself never owns or copies the data.
-    pub fn send_static(&self, sid: u64, data: &'static [u8]) {
-        {
-            let mut c = self.conn.borrow_mut();
-            c.stream_send_static(sid, data);
             let _ = c.flush(&self.cfg);
         }
         self.drain_outbound();

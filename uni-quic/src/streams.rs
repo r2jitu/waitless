@@ -367,24 +367,12 @@ impl SendStream {
 
     /// Canonical append. Takes any pre-built [`IOBuf`] (static
     /// borrow, heap-owned, with or without reserved
-    /// headroom/tailroom) and queues it. The type-specific
-    /// shortcuts below all funnel into this.
+    /// headroom/tailroom) and queues it.
     pub fn write_iobuf(&mut self, data: uni_iobuf::IOBuf) {
         if matches!(self.state, SendState::FinSent) || data.is_empty() {
             return;
         }
         self.outbound.push_back(data);
-    }
-
-    /// Append a borrowed slice. Allocates one heap buffer to
-    /// hold the copy. For zero-copy paths use `write_owned`
-    /// (Vec by move) or `write_static` (`&'static [u8]` by
-    /// reference).
-    pub fn write(&mut self, data: &[u8]) {
-        if data.is_empty() {
-            return;
-        }
-        self.write_iobuf(uni_iobuf::IOBuf::from(data.to_vec()));
     }
 
     /// Append an owned `Vec<u8>` by move. `Vec → Box<[u8]>`
@@ -393,12 +381,6 @@ impl SendStream {
     /// flows); otherwise `into_boxed_slice` may shrink-realloc.
     pub fn write_owned(&mut self, data: Vec<u8>) {
         self.write_iobuf(uni_iobuf::IOBuf::from(data));
-    }
-
-    /// Append a `&'static` slice by reference — zero copy AND
-    /// zero alloc.
-    pub fn write_static(&mut self, data: &'static [u8]) {
-        self.write_iobuf(uni_iobuf::IOBuf::from_static(data));
     }
 
     pub fn close(&mut self) {
@@ -736,7 +718,7 @@ mod tests {
     #[test]
     fn send_chunks_and_fin_on_close() {
         let mut s = SendStream::default();
-        s.write(b"hello");
+        s.write_owned(b"hello".to_vec());
         s.close();
         let (off, c, fin) = s.pop_chunk(1024).unwrap();
         assert_eq!(off, 0);
@@ -749,7 +731,7 @@ mod tests {
     #[test]
     fn send_pops_in_chunks() {
         let mut s = SendStream::default();
-        s.write(b"abcdefghij");
+        s.write_owned(b"abcdefghij".to_vec());
         let (off1, c1, fin1) = s.pop_chunk(4).unwrap();
         assert_eq!(off1, 0);
         assert_eq!(c1, b"abcd");
