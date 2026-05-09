@@ -785,12 +785,19 @@ fn parse_device_descriptor(desc_virt: *mut u8) -> bool {
 }
 
 fn higher_priority(a: QueueFormat, b: QueueFormat) -> QueueFormat {
+    // Linux ranks DQO_RDA highest (it's the modern format, better
+    // perf on supporting hardware). Our DQO TX path stalls under
+    // sustained parallel load on c3-standard-4, while GQI_QPL is
+    // validated working on n2. Until DQO is debugged on host,
+    // prefer GQI_QPL so c3 deployments fall back to a known-good
+    // format. C3 advertises both per Google's gVNIC docs; older
+    // n2/n2d/e2 advertise only GQI_QPL.
     fn rank(f: QueueFormat) -> u8 {
         match f {
-            QueueFormat::DqoRda => 4,
-            QueueFormat::DqoQpl => 3,
-            QueueFormat::GqiRda => 2,
-            QueueFormat::GqiQpl => 1,
+            QueueFormat::GqiQpl => 4,
+            QueueFormat::GqiRda => 3,
+            QueueFormat::DqoQpl => 2,
+            QueueFormat::DqoRda => 1,
         }
     }
     if rank(a) >= rank(b) { a } else { b }
@@ -2809,25 +2816,15 @@ static GVE_OPS: NicOps = NicOps {
     // descriptor-side support yet; report unavailable so callers
     // do per-MSS segmentation as today.
     tso_available: || false,
-    // CSUM offload disabled. The descriptor bits are wired up
-    // (GQI's `GVE_TXF_L4CSUM` + `l4_csum_offset` / `l4_hdr_offset`
-    // in 16-bit-word units, per Linux's `gve_tx_fill_pkt_desc`),
-    // and we tried both stamp conventions on n2:
-    //   * `PseudoHeaderPartial` (virtio convention) → -19% / -28%
-    //   * `Zero` (assumed gve convention)            → -32% / -36%
-    // Both regressions are consistent with "device doesn't honour
-    // the CSUM bits in this configuration" — the packet ships
-    // with the (wrong) stamped value and the receiver rejects
-    // most. The full L4 checksum the caller computes today works
-    // correctly, so we stick with that until we can debug the
-    // descriptor-bit handshake on a real n2 (perhaps a missing
-    // adminq feature negotiation, or a different bit encoding
-    // in the type_flags byte than Linux's docs suggest).
-    csum_tx_offload: || false,
-    // Convention is irrelevant while csum_tx_offload returns
-    // false; declared so the field exists and the API shape is
-    // ready for re-enablement.
-    csum_stamp_convention: || uni_net_driver::CsumStampConvention::Zero,
+    // CSUM offload via GQI's `GVE_TXF_L4CSUM` + `l4_csum_offset` /
+    // `l4_hdr_offset` (per Linux's `gve_tx_fill_pkt_desc`). Stamp
+    // convention is `PseudoHeaderPartial` to match Linux's
+    // `CHECKSUM_PARTIAL` skb path (caller pre-stamps the
+    // pseudo-header sum at the L4 checksum field; device adds
+    // data and folds).
+    csum_tx_offload: || true,
+    csum_stamp_convention:
+        || uni_net_driver::CsumStampConvention::PseudoHeaderPartial,
     acquire_tx_tso_buf: None,
     submit_tx_tso: None,
     poll_rx: poll,
