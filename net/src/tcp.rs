@@ -858,16 +858,11 @@ unsafe fn fill_tcp_frame_headers(
 }
 
 /// Acquire a TX-pool slot from the driver and run `fill` over its
-/// frame region; submit it for transmission.
-///
-/// The driver's TX pool is per-worker (regardless of nqp) and
-/// `acquire_tx_buf` spin-drains on full, so the only path where
-/// `None` returns is "no driver installed". The Tier 1 vs Tier 2
-/// distinction lives below the slot acquisition: Tier 1 has a
-/// per-core qp (uncontended virtq submit); Tier 2 funnels every
-/// worker's frames through qp 0 under TX_LOCK. Caller writes
-/// straight into the slot — no memcpy through an intermediate
-/// stack buffer.
+/// frame region; submit it for transmission. Falls back to a
+/// stack-staged frame + slice-shaped `send` when the driver
+/// doesn't expose direct-fill (`acquire_tx_buf == None`) — the
+/// gve driver's DQO_RDA path may surface this until its
+/// direct-fill plumbing lands.
 ///
 /// `fill` writes `frame_len` bytes starting at the head of the
 /// passed `&mut [u8]` (≥ `FRAME_BUF_LEN` bytes). Caller is
@@ -878,18 +873,32 @@ where
     F: FnOnce(&mut [u8]),
 {
     debug_assert!(frame_len <= FRAME_BUF_LEN);
-    let Some(mut handle) = uni_drivers::net::acquire_tx_buf() else {
-        return; // no driver installed
-    };
-    let cap = handle.data_cap as usize;
-    debug_assert!(frame_len <= cap);
-    // SAFETY: the handle's `data_mut()` returns a slice of
-    // `data_cap` writable bytes; we narrow to `frame_len` for
-    // the closure but the underlying buffer covers the full
-    // slot. The closure is responsible for initialising every
-    // byte in `frame[..frame_len]` before submit.
-    fill(&mut handle.data_mut()[..frame_len]);
-    uni_drivers::net::submit_tx(handle, frame_len);
+    if let Some(mut handle) = uni_drivers::net::acquire_tx_buf() {
+        let cap = handle.data_cap as usize;
+        debug_assert!(frame_len <= cap);
+        // SAFETY: the handle's `data_mut()` returns a slice of
+        // `data_cap` writable bytes; we narrow to `frame_len`
+        // for the closure but the underlying buffer covers the
+        // full slot.
+        fill(&mut handle.data_mut()[..frame_len]);
+        uni_drivers::net::submit_tx(handle, frame_len);
+        return;
+    }
+    // Slice-shaped fallback: stage on the stack, hand to the
+    // driver's slice-shaped `send`. Driver-specific memcpy
+    // happens inside.
+    let mut buf = core::mem::MaybeUninit::<[u8; FRAME_BUF_LEN]>::uninit();
+    let p = buf.as_mut_ptr() as *mut u8;
+    // SAFETY: `from_raw_parts_mut` over uninit memory is fine
+    // as long as the resulting slice is fully written before
+    // any read. `fill` writes every byte in `[..frame_len]`;
+    // `send` then reads them.
+    unsafe {
+        let frame = core::slice::from_raw_parts_mut(p, frame_len);
+        fill(frame);
+        let frame_const = core::slice::from_raw_parts(p, frame_len);
+        uni_drivers::net::send(frame_const);
+    }
 }
 
 /// Build and ship a TCP segment whose payload comes from `payload`
