@@ -269,6 +269,52 @@ pub fn checksum(data: *const u8, len: usize) -> u16 {
     !(sum as u16)
 }
 
+/// 16-bit one's-complement pseudo-header partial sum (no
+/// invert), suitable for placement in the L4 checksum field
+/// before handing the frame to a NIC that supports
+/// `VIRTIO_NET_HDR_F_NEEDS_CSUM` (or equivalent CSUM-offload).
+/// The device adds the data checksum to this value and writes
+/// the final 16-bit checksum at the same offset.
+///
+/// Cheaper than `tcp_checksum_any` because it skips the data
+/// pass — that's the whole point of CSUM-offload.
+#[inline]
+pub fn tcp_pseudo_partial(
+    src: IpAddr,
+    dst: IpAddr,
+    proto: u8,
+    l4_len: usize,
+) -> u16 {
+    let mut sum: u32 = match (src, dst) {
+        (IpAddr::V4(s), IpAddr::V4(d)) => {
+            let mut s32: u32 = 0;
+            s32 += (s.addr & 0xFFFF) as u32;
+            s32 += (s.addr >> 16) as u32;
+            s32 += (d.addr & 0xFFFF) as u32;
+            s32 += (d.addr >> 16) as u32;
+            s32 += (proto as u32) << 8; // proto byte in LE high
+            s32 += htons(l4_len as u16) as u32;
+            s32
+        }
+        (IpAddr::V6(s), IpAddr::V6(d)) => {
+            let mut s32: u32 = 0;
+            for chunk in s.octets.chunks(2).chain(d.octets.chunks(2)) {
+                s32 += u16::from_le_bytes([chunk[0], chunk[1]]) as u32;
+            }
+            let len_be = (l4_len as u32).to_be();
+            s32 += (len_be & 0xffff) as u32;
+            s32 += (len_be >> 16) as u32;
+            s32 += (proto as u32) << 8;
+            s32
+        }
+        _ => 0, // mismatched families — caller bug; safe fallback
+    };
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    sum as u16
+}
+
 /// TCP/UDP pseudo-header checksum, family-dispatched.
 /// `src`/`dst` must agree on family; mismatched families fall back
 /// to `tcp_checksum_v4` on the v4 component (caller bug).

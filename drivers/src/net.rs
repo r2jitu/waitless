@@ -9,6 +9,8 @@
 
 use uni_net_driver::{active_ops, is_installed, linked_ethernet_drivers, set_active_ops};
 
+pub use uni_net_driver::CsumOffload;
+
 // ---- Init / lifecycle -----------------------------------------------------
 
 /// Installs the first driver whose `probe` succeeds.
@@ -64,10 +66,16 @@ pub fn acquire_tx_buf() -> Option<uni_net_driver::TxBufHandle> {
 
 /// Submit a previously-acquired TX buffer with `frame_len` bytes of
 /// frame data at the head of `handle.data_mut()`. Consumes the
-/// handle.
-pub fn submit_tx(handle: uni_net_driver::TxBufHandle, frame_len: usize) {
+/// handle. `csum` is the optional L4-checksum-offload hint — pass
+/// [`uni_net_driver::CsumOffload::NONE`] when the caller already
+/// computed and stamped the L4 checksum.
+pub fn submit_tx(
+    handle: uni_net_driver::TxBufHandle,
+    frame_len: usize,
+    csum: uni_net_driver::CsumOffload,
+) {
     if let Some(f) = active_ops().submit_tx {
-        f(handle, frame_len);
+        f(handle, frame_len, csum);
     } else {
         // Only reachable via API misuse — `acquire_tx_buf` returns
         // `None` when the driver lacks the surface, so a caller that
@@ -84,6 +92,15 @@ pub fn submit_tx(handle: uni_net_driver::TxBufHandle, frame_len: usize) {
 /// via [`submit_tx_tso`].
 pub fn tso_available() -> bool {
     (active_ops().tso_available)()
+}
+
+/// True iff the driver supports L4 checksum-offload-on-TX
+/// (`VIRTIO_NET_F_CSUM` or equivalent). Callers branch:
+/// stamp pseudo-header partial sum + pass non-NONE
+/// `CsumOffload` when true; stamp full checksum + pass
+/// `CsumOffload::NONE` when false.
+pub fn csum_tx_offload() -> bool {
+    (active_ops().csum_tx_offload)()
 }
 
 /// Acquire a big-slot TX buffer (16 KiB capacity) for a TCP TSO

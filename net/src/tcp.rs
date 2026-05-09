@@ -23,7 +23,7 @@ use alloc::boxed::Box;
 use core::ptr;
 use core::task::Waker;
 use from_bytes::FromBytes;
-use types::{IpAddr, MacAddr, tcp_checksum_any, htons, ntohs, htonl, ntohl};
+use types::{IpAddr, MacAddr, tcp_checksum_any, tcp_pseudo_partial, htons, ntohs, htonl, ntohl};
 use ipv4::PROTO_TCP;
 
 bitflags::bitflags! {
@@ -816,14 +816,22 @@ unsafe fn fill_tcp_frame_headers(
     tcp_hdr.window = htons(window);
     tcp_hdr.checksum = 0;
     tcp_hdr.urgent = 0;
-    tcp_hdr.checksum = unsafe {
-        tcp_checksum_any(
-            local_ip,
-            dst_ip,
-            PROTO_TCP,
-            frame.as_ptr().add(tcp_off),
-            tcp_seg_len,
-        )
+    // Stamp either the pseudo-header partial sum (driver supports
+    // CSUM offload — device finishes the data part) or the full
+    // checksum. Partial is dramatically cheaper for big segments
+    // because we skip the per-byte data sum entirely; for tiny
+    // control segments the cost is the same, but the partial
+    // path's branch is a one-time `csum_tx_offload()` query
+    // outside the critical loop, so it's free either way.
+    tcp_hdr.checksum = if uni_drivers::net::csum_tx_offload() {
+        tcp_pseudo_partial(local_ip, dst_ip, PROTO_TCP, tcp_seg_len)
+    } else {
+        unsafe {
+            tcp_checksum_any(
+                local_ip, dst_ip, PROTO_TCP,
+                frame.as_ptr().add(tcp_off), tcp_seg_len,
+            )
+        }
     };
 
     // ── IP header (family-dispatched) ────────────────────────────────
@@ -858,21 +866,31 @@ unsafe fn fill_tcp_frame_headers(
 }
 
 /// Acquire a TX-pool slot from the driver and run `fill` over its
-/// frame region; submit it for transmission. Falls back to a
-/// stack-staged frame + slice-shaped `send` when the driver
-/// doesn't expose direct-fill (`acquire_tx_buf == None`) — the
-/// gve driver's DQO_RDA path may surface this until its
-/// direct-fill plumbing lands.
+/// frame region; submit it for transmission. `csum_tcp_off` is
+/// the byte offset of the TCP header within the frame (= `0` if
+/// the caller doesn't want CSUM offload) — `submit_tx` reads
+/// this to populate the offload-hint field.
+///
+/// Falls back to a stack-staged frame + slice-shaped `send` when
+/// the driver doesn't expose direct-fill (`acquire_tx_buf == None`)
+/// — the gve driver's DQO_RDA path surfaces this today.
 ///
 /// `fill` writes `frame_len` bytes starting at the head of the
 /// passed `&mut [u8]` (≥ `FRAME_BUF_LEN` bytes). Caller is
 /// responsible for ensuring `frame_len <= FRAME_BUF_LEN`.
 #[inline]
-fn build_and_send_frame<F>(frame_len: usize, fill: F)
+fn build_and_send_frame<F>(frame_len: usize, csum_tcp_off: u16, fill: F)
 where
     F: FnOnce(&mut [u8]),
 {
     debug_assert!(frame_len <= FRAME_BUF_LEN);
+    let csum = if csum_tcp_off != 0 && uni_drivers::net::csum_tx_offload() {
+        // 16 = byte offset of the TCP `checksum` field within
+        // the TCP header.
+        uni_drivers::net::CsumOffload { start: csum_tcp_off, offset: 16 }
+    } else {
+        uni_drivers::net::CsumOffload::NONE
+    };
     if let Some(mut handle) = uni_drivers::net::acquire_tx_buf() {
         let cap = handle.data_cap as usize;
         debug_assert!(frame_len <= cap);
@@ -881,12 +899,27 @@ where
         // for the closure but the underlying buffer covers the
         // full slot.
         fill(&mut handle.data_mut()[..frame_len]);
-        uni_drivers::net::submit_tx(handle, frame_len);
+        uni_drivers::net::submit_tx(handle, frame_len, csum);
         return;
     }
     // Slice-shaped fallback: stage on the stack, hand to the
     // driver's slice-shaped `send`. Driver-specific memcpy
-    // happens inside.
+    // happens inside; csum-offload hint is lost here (the slice
+    // path doesn't carry it), so callers requesting offload
+    // would see a broken checksum on a fallback driver. The
+    // caller's `fill` already stamped the correct shape (full
+    // checksum if `csum_tx_offload()` returned false at
+    // header-fill time, partial otherwise) — but partial only
+    // works when paired with a NEEDS_CSUM submit. So when we
+    // fall back, the partial-stamped frame would be incorrect.
+    //
+    // In practice this can't bite today: the only fallback driver
+    // is gve-DQO, which reports `csum_tx_offload() == false`, so
+    // `fill` stamped the full checksum and the slice path ships
+    // a correct frame. If a future driver returns true for offload
+    // but None from acquire, we'll need to redo the checksum at
+    // fallback time. Marked here so we catch it.
+    let _ = csum;
     let mut buf = core::mem::MaybeUninit::<[u8; FRAME_BUF_LEN]>::uninit();
     let p = buf.as_mut_ptr() as *mut u8;
     // SAFETY: `from_raw_parts_mut` over uninit memory is fine
@@ -923,8 +956,14 @@ fn send_segment(
     let payload_off = payload_offset(local_ip);
     let payload_len = payload.len().min(MSS_MAX);
     let frame_len = payload_off + payload_len;
+    // TCP header offset within the frame = ETH + IP. Used by the
+    // CSUM-offload hint passed to `submit_tx`.
+    let tcp_off = match local_ip {
+        IpAddr::V4(_) => ETH_HDR_LEN + IPV4_HDR_LEN,
+        IpAddr::V6(_) => ETH_HDR_LEN + IPV6_HDR_LEN,
+    } as u16;
 
-    build_and_send_frame(frame_len, |frame| unsafe {
+    build_and_send_frame(frame_len, tcp_off, |frame| unsafe {
         // Copy payload into the frame's payload slot.
         if payload_len > 0 {
             ptr::copy_nonoverlapping(
@@ -1174,8 +1213,12 @@ fn send_segment_from_cursor(
     let payload_off = payload_offset(local_ip);
     let payload_len = payload_len.min(MSS_MAX);
     let frame_len = payload_off + payload_len;
+    let tcp_off = match local_ip {
+        IpAddr::V4(_) => ETH_HDR_LEN + IPV4_HDR_LEN,
+        IpAddr::V6(_) => ETH_HDR_LEN + IPV6_HDR_LEN,
+    } as u16;
 
-    build_and_send_frame(frame_len, |frame| unsafe {
+    build_and_send_frame(frame_len, tcp_off, |frame| unsafe {
         // Walk chain bytes straight into the payload slot. This is
         // the "one memcpy, no intermediate buffer" property the
         // IOBuf chain design exists for — and on the direct-fill

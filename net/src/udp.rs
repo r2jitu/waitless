@@ -19,7 +19,7 @@ extern crate net_ipv6 as ipv6;
 extern crate net_ipv6_send as ipv6_send;
 
 use from_bytes::FromBytes;
-use types::{IpAddr, CONFIG, tcp_checksum, tcp_checksum_v6, htons, ntohs};
+use types::{IpAddr, CONFIG, tcp_checksum, tcp_checksum_v6, tcp_pseudo_partial, htons, ntohs};
 use ipv4::PROTO_UDP;
 
 #[repr(C, packed)]
@@ -264,18 +264,31 @@ pub fn send_via_tx_handle(
 
             let ip_total = (ip_hdr_len + udp_len) as u16;
             let ip_slot = core::slice::from_raw_parts_mut(p.add(ETH_HDR_LEN), ip_hdr_len);
+            // Stamp pseudo-header partial sum (driver-side CSUM
+            // offload finishes the data part) when supported;
+            // else compute the full checksum guest-side.
+            let offload = uni_drivers::net::csum_tx_offload();
             match dst {
                 IpAddr::V4(d) => {
-                    udp_hdr.checksum = tcp_checksum(
-                        CONFIG.ip(), d, PROTO_UDP, p.add(udp_off), udp_len,
-                    );
+                    udp_hdr.checksum = if offload {
+                        tcp_pseudo_partial(
+                            IpAddr::V4(CONFIG.ip()), IpAddr::V4(d), PROTO_UDP, udp_len,
+                        )
+                    } else {
+                        tcp_checksum(CONFIG.ip(), d, PROTO_UDP, p.add(udp_off), udp_len)
+                    };
                     ipv4::fill_header(ip_slot, CONFIG.ip(), d, PROTO_UDP, ip_total);
                 }
                 IpAddr::V6(d) => {
                     let src = types::Ipv6Addr::ANY;
-                    udp_hdr.checksum = tcp_checksum_v6(
-                        &src, &d, ipv6::next_header::UDP, p.add(udp_off), udp_len,
-                    );
+                    udp_hdr.checksum = if offload {
+                        tcp_pseudo_partial(
+                            IpAddr::V6(src), IpAddr::V6(d),
+                            ipv6::next_header::UDP, udp_len,
+                        )
+                    } else {
+                        tcp_checksum_v6(&src, &d, ipv6::next_header::UDP, p.add(udp_off), udp_len)
+                    };
                     ipv6::fill_header(
                         ip_slot,
                         &src, &d, ipv6::next_header::UDP,
@@ -295,9 +308,19 @@ pub fn send_via_tx_handle(
     }
 
     // The L2 frame now starts at slot.data[0] for both families;
-    // submit_tx with the actual on-wire length.
+    // submit_tx with the actual on-wire length. Pass CsumOffload
+    // when the driver supports it — UDP checksum field is at
+    // byte offset 6 within the UDP header.
     let _ = &mut handle;
-    uni_drivers::net::submit_tx(handle, on_wire_actual);
+    let csum = if uni_drivers::net::csum_tx_offload() {
+        uni_drivers::net::CsumOffload {
+            start: (ETH_HDR_LEN + ip_hdr_len) as u16,
+            offset: 6,
+        }
+    } else {
+        uni_drivers::net::CsumOffload::NONE
+    };
+    uni_drivers::net::submit_tx(handle, on_wire_actual, csum);
 }
 
 /// Slice-shaped UDP send. Copies `data` into a stack-local

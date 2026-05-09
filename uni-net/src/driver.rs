@@ -58,6 +58,44 @@ pub struct TxBufHandle {
 // share it (which would defeat the "exclusive write" property).
 unsafe impl Send for TxBufHandle {}
 
+/// L4 checksum-offload hint passed to [`NicOps::submit_tx`]. When
+/// `start != 0`, the driver tells the device to compute the
+/// per-segment L4 checksum host-side (`VIRTIO_NET_HDR_F_NEEDS_CSUM`
+/// on virtio; the equivalent in gve / future drivers). Saves the
+/// guest CPU one full pass over the packet payload.
+///
+/// Driver contract (virtio convention — gve mirrors): the caller
+/// MUST place the 16-bit pseudo-header partial sum (no invert,
+/// no data) at the L4 checksum field within the frame before
+/// submitting. The device adds the data checksum and writes the
+/// final 16-bit checksum back at the same offset.
+///
+/// Use [`Self::NONE`] when the caller already computed the full
+/// checksum and stamped it (control segments built at boot, etc.).
+#[derive(Clone, Copy, Debug)]
+pub struct CsumOffload {
+    /// Byte offset within the frame where checksum coverage
+    /// starts (= start of the L4 header). For TCP/UDP over IPv4:
+    /// `ETH(14) + IPv4(20) = 34`. Over IPv6:
+    /// `ETH(14) + IPv6(40) = 54`. `0` disables offload.
+    pub start: u16,
+    /// Byte offset of the L4 checksum field, RELATIVE to `start`.
+    /// TCP: 16. UDP: 6.
+    pub offset: u16,
+}
+
+impl CsumOffload {
+    /// No offload — caller computed the full checksum and stamped
+    /// it before submit. Drivers ship the frame verbatim.
+    pub const NONE: Self = Self { start: 0, offset: 0 };
+
+    /// True when the caller wants offload (any non-zero `start`).
+    #[inline]
+    pub fn is_some(&self) -> bool {
+        self.start != 0
+    }
+}
+
 impl TxBufHandle {
     /// Mutable view of the writable frame region. Caller fills
     /// `data_mut()[..frame_len]` with the L2 frame bytes.
@@ -145,11 +183,14 @@ pub struct NicOps {
     pub acquire_tx_buf: Option<fn() -> Option<TxBufHandle>>,
     /// Submit a previously-acquired TX buffer for transmission.
     /// `frame_len` is the bytes the caller wrote at the start of
-    /// `handle.data_mut()`. Consumes the handle (slot returns to
-    /// pool when the device signals descriptor completion via
-    /// `tx_drain`, NOT when this fn returns). `None` mirrors
-    /// `acquire_tx_buf`'s `None`.
-    pub submit_tx: Option<fn(TxBufHandle, usize)>,
+    /// `handle.data_mut()`. `csum` carries the optional checksum-
+    /// offload hint — non-zero `csum.start` activates device-side
+    /// L4 checksum compute (caller stamped the pseudo-header
+    /// partial sum at `csum.start + csum.offset`). Consumes the
+    /// handle (slot returns to pool when the device signals
+    /// descriptor completion via `tx_drain`, NOT when this fn
+    /// returns). `None` mirrors `acquire_tx_buf`'s `None`.
+    pub submit_tx: Option<fn(TxBufHandle, usize, CsumOffload)>,
     /// TSOv4 capability: `true` when the device negotiated
     /// `VIRTIO_NET_F_HOST_TSO4` + `VIRTIO_NET_F_CSUM` (or the
     /// equivalent on non-virtio drivers). When true,
@@ -159,6 +200,15 @@ pub struct NicOps {
     /// into MSS-sized segments themselves and use the small-pool
     /// `acquire_tx_buf` + `submit_tx` path.
     pub tso_available: fn() -> bool,
+    /// L4 checksum-offload-on-TX capability: `true` when the
+    /// device negotiated `VIRTIO_NET_F_CSUM` (or the equivalent
+    /// on non-virtio drivers). When true, callers should stamp
+    /// the 16-bit pseudo-header partial sum at the L4 checksum
+    /// field and pass [`CsumOffload`] with non-zero `start`;
+    /// the device finishes the checksum host-side. When false,
+    /// callers must compute and stamp the full checksum
+    /// themselves and pass [`CsumOffload::NONE`].
+    pub csum_tx_offload: fn() -> bool,
     /// Acquire a big-slot TX buffer (16 KiB capacity) for a TCP
     /// TSO super-segment. Returns `None` when:
     ///   * TSO isn't negotiated (no big pool allocated), OR
@@ -333,6 +383,7 @@ static NULL_OPS: NicOps = NicOps {
     acquire_tx_buf: None,
     submit_tx: None,
     tso_available: null_false,
+    csum_tx_offload: null_false,
     acquire_tx_tso_buf: None,
     submit_tx_tso: None,
     poll_rx: null_poll,

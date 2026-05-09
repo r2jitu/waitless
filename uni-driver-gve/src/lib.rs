@@ -1916,7 +1916,7 @@ fn send_on_qp(qp: usize, data: &[u8]) -> bool {
     };
     let n = data.len();
     handle.data_mut()[..n].copy_from_slice(data);
-    submit_tx_inner(handle, n);
+    submit_tx_inner(handle, n, uni_net_driver::CsumOffload::NONE);
     true
 }
 
@@ -2012,7 +2012,15 @@ fn release_tx_slot(token: u64) {
 ///   u16 len            (be, total packet length)
 ///   u16 seg_len        (be, this segment length)
 ///   u64 seg_addr       (be, QPL byte offset in QPL mode)
-fn submit_tx_inner(handle: uni_net_driver::TxBufHandle, frame_len: usize) {
+fn submit_tx_inner(
+    handle: uni_net_driver::TxBufHandle,
+    frame_len: usize,
+    _csum: uni_net_driver::CsumOffload,
+) {
+    // TODO: wire `_csum` to GQI's `l4_csum_offset` / `l4_hdr_offset`
+    // (gve_tx_pkt_desc bytes 1 and 2) + the GVE_TXF_L4CSUM type-flag
+    // bit when we have the spec confirmed. Today the caller
+    // computes the full checksum and stamps it; gve ships verbatim.
     let (qp, slot) = decode_token(handle.driver_token);
     // mem::forget skips Drop's `release_fn` — the slot is about
     // to be in-flight, not unused. `tx_drain` returns it to the
@@ -2079,9 +2087,15 @@ fn acquire_tx_buf() -> Option<uni_net_driver::TxBufHandle> {
 }
 
 /// Public submit — paired with [`acquire_tx_buf`]. Consumes the
-/// handle (slot returns to pool on device completion).
-fn submit_tx(handle: uni_net_driver::TxBufHandle, frame_len: usize) {
-    submit_tx_inner(handle, frame_len);
+/// handle (slot returns to pool on device completion). `csum`
+/// is not yet wired through gve's descriptor — caller's stamped
+/// checksum is shipped verbatim today.
+fn submit_tx(
+    handle: uni_net_driver::TxBufHandle,
+    frame_len: usize,
+    csum: uni_net_driver::CsumOffload,
+) {
+    submit_tx_inner(handle, frame_len, csum);
 }
 
 /// Flush the deferred TX kick for the given queue pair. Returns
@@ -2546,6 +2560,11 @@ static GVE_OPS: NicOps = NicOps {
     // descriptor-side support yet; report unavailable so callers
     // do per-MSS segmentation as today.
     tso_available: || false,
+    // CSUM offload not yet wired through gve's descriptor (TODO:
+    // populate `l4_csum_offset` / `l4_hdr_offset` + the type-flag
+    // bit when GVE_TXF_L4CSUM is confirmed); caller computes the
+    // full checksum and stamps it.
+    csum_tx_offload: || false,
     acquire_tx_tso_buf: None,
     submit_tx_tso: None,
     poll_rx: poll,

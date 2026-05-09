@@ -1309,7 +1309,9 @@ fn send_slice(data: &[u8]) {
         None => return, // no driver
     };
     handle.data_mut()[..frame_len].copy_from_slice(&data[..frame_len]);
-    submit_tx(handle, frame_len);
+    // Caller's frame already carries a fully-computed checksum
+    // (or doesn't need one — ARP, etc.); no offload.
+    submit_tx(handle, frame_len, uni_net_driver::CsumOffload::NONE);
 }
 
 /// Flag: set by APs when they stage TX.
@@ -1480,7 +1482,11 @@ fn acquire_tx_tso_buf() -> Option<uni_net_driver::TxTsoBufHandle> {
     None
 }
 
-fn submit_tx(handle: uni_net_driver::TxBufHandle, frame_len: usize) {
+fn submit_tx(
+    handle: uni_net_driver::TxBufHandle,
+    frame_len: usize,
+    csum: uni_net_driver::CsumOffload,
+) {
     use core::sync::atomic::Ordering;
     let (worker, slot, _pool) = decode_token(handle.driver_token);
     // mem::forget skips `Drop`'s `release_fn` — the slot is
@@ -1504,19 +1510,28 @@ fn submit_tx(handle: uni_net_driver::TxBufHandle, frame_len: usize) {
 
     let qp = worker_qp(worker);
 
+    // CsumOffload → virtio_net_hdr fields. NEEDS_CSUM tells the
+    // device to compute the L4 checksum at `csum_start +
+    // csum_offset`; the caller has already stamped the pseudo-
+    // header partial sum at the L4 checksum field.
+    let (flags, csum_start, csum_off) = if csum.is_some() {
+        (VIRTIO_NET_HDR_F_NEEDS_CSUM, csum.start, csum.offset)
+    } else {
+        (0, 0, 0)
+    };
+
     unsafe {
         let buf = &mut (*wpool(worker)).small[slot];
-        // Fill virtio_net header (zeros except num_buffers = 1 for
-        // single-buffer frames). The header sits at offset 0 of
-        // `TxBufSmall`; the caller-filled frame data starts at
-        // offset `VIRTIO_NET_HDR_SIZE` (the `data` field).
+        // Fill virtio_net header. Single-buffer frame
+        // (num_buffers = 1); GSO disabled; checksum offload
+        // controlled by `csum` (caller's choice).
         buf.hdr = VirtioNetHeader {
-            flags: 0,
+            flags,
             gso_type: 0,
             hdr_len: 0,
             gso_size: 0,
-            csum_start: 0,
-            csum_offset: 0,
+            csum_start,
+            csum_offset: csum_off,
             num_buffers: 1,
         };
 
@@ -1542,6 +1557,14 @@ fn submit_tx(handle: uni_net_driver::TxBufHandle, frame_len: usize) {
 }
 
 fn tso_available() -> bool {
+    unsafe { (*ndev()).has_tso4 }
+}
+
+/// L4 checksum offload — `VIRTIO_NET_F_CSUM`. Today it's
+/// negotiated together with TSO4 (the device init enables both
+/// or neither), so we report the same flag. If the negotiation
+/// gets split in the future, track CSUM separately on `ndev`.
+fn csum_tx_offload() -> bool {
     unsafe { (*ndev()).has_tso4 }
 }
 
@@ -2260,6 +2283,7 @@ static VIRTIO_NET_OPS: NicOps = NicOps {
     acquire_tx_buf: Some(acquire_tx_buf),
     submit_tx: Some(submit_tx),
     tso_available,
+    csum_tx_offload,
     acquire_tx_tso_buf: Some(acquire_tx_tso_buf),
     submit_tx_tso: Some(submit_tx_tso),
     poll_rx: poll,
