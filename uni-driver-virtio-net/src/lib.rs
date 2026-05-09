@@ -1413,7 +1413,7 @@ fn acquire_tx_buf() -> Option<uni_net_driver::TxBufHandle> {
 /// super-segment. Returns `None` when TSO isn't negotiated (no
 /// big pool allocated) or the pool is full. Caller falls back to
 /// `acquire_tx_buf` + per-MSS segmentation when None.
-fn acquire_tx_tso_buf() -> Option<uni_net_driver::TxBufHandle> {
+fn acquire_tx_tso_buf() -> Option<uni_net_driver::TxTsoBufHandle> {
     let qp = acquire_qp_or_none()?;
     let big_ptr = unsafe { (*qps(qp)).tx_pool_big };
     if big_ptr.is_null() {
@@ -1424,12 +1424,14 @@ fn acquire_tx_tso_buf() -> Option<uni_net_driver::TxBufHandle> {
             if !(*qps(qp)).tx_pool_big_used[slot] {
                 (*qps(qp)).tx_pool_big_used[slot] = true;
                 let buf = &mut *big_ptr.add(slot);
-                return Some(uni_net_driver::TxBufHandle {
-                    data_ptr: buf.data.as_mut_ptr(),
-                    data_cap: MAX_ETH_FRAME_BIG as u32,
-                    driver_token: encode_token(qp, slot, POOL_ID_BIG),
-                    release_fn: release_tx_slot,
-                });
+                return Some(uni_net_driver::TxTsoBufHandle(
+                    uni_net_driver::TxBufHandle {
+                        data_ptr: buf.data.as_mut_ptr(),
+                        data_cap: MAX_ETH_FRAME_BIG as u32,
+                        driver_token: encode_token(qp, slot, POOL_ID_BIG),
+                        release_fn: release_tx_slot,
+                    },
+                ));
             }
         }
     }
@@ -1437,17 +1439,17 @@ fn acquire_tx_tso_buf() -> Option<uni_net_driver::TxBufHandle> {
 }
 
 fn submit_tx(handle: uni_net_driver::TxBufHandle, frame_len: usize) {
-    let (qp, slot, pool) = decode_token(handle.driver_token);
+    let (qp, slot, _pool) = decode_token(handle.driver_token);
     // mem::forget skips `Drop`'s `release_fn` — the slot is
     // about to be in-flight, not unused. `tx_drain_qp` returns
     // it to the pool when the device signals completion.
     core::mem::forget(handle);
 
-    // submit_tx is the small-pool path (per-MSS frames). A
-    // caller mismatch (acquired big but called submit_tx) would
-    // be an API misuse; release the slot defensively.
-    if pool != POOL_ID_SMALL || slot >= TX_POOL_SMALL_SIZE {
-        release_tx_slot(encode_token(qp, slot, pool));
+    // Type-distinct handles guarantee a `TxBufHandle` here came
+    // from the small pool (big-pool slots flow through
+    // `TxTsoBufHandle` + `submit_tx_tso`). Defensive bound check
+    // for slot index only.
+    if slot >= TX_POOL_SMALL_SIZE {
         return;
     }
     if frame_len == 0 || frame_len > MAX_ETH_FRAME_SMALL {
@@ -1490,19 +1492,22 @@ fn tso_available() -> bool {
 }
 
 fn submit_tx_tso(
-    handle: uni_net_driver::TxBufHandle,
+    handle: uni_net_driver::TxTsoBufHandle,
     frame_len: usize,
     hdr_len: u16,
     csum_start: u16,
     gso_size: u16,
 ) {
-    let (qp, slot, pool) = decode_token(handle.driver_token);
+    // Type-distinct wrapper guarantees this token came from
+    // `acquire_tx_tso_buf` (i.e. POOL_ID_BIG). We still decode
+    // it for the qp/slot fields; the pool ID is implied.
+    let (qp, slot, _pool) = decode_token(handle.0.driver_token);
     core::mem::forget(handle); // see `submit_tx` for rationale
 
-    // submit_tx_tso is the big-pool path. Caller mismatch =
-    // misuse; release defensively.
-    if pool != POOL_ID_BIG || slot >= TX_POOL_BIG_SIZE {
-        release_tx_slot(encode_token(qp, slot, pool));
+    if slot >= TX_POOL_BIG_SIZE {
+        // Defensive — should be impossible given the type-system
+        // enforcement, but if a future driver fork mis-encodes
+        // the token we'd rather no-op than UB.
         return;
     }
     if frame_len == 0 || frame_len > MAX_ETH_FRAME_BIG {

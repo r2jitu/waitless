@@ -91,7 +91,11 @@ pub fn tso_available() -> bool {
 /// big pool is full, or the driver doesn't support this surface;
 /// caller falls back to per-MSS segmentation via
 /// [`acquire_tx_buf`].
-pub fn acquire_tx_tso_buf() -> Option<uni_net_driver::TxBufHandle> {
+///
+/// Returns a [`TxTsoBufHandle`] — type-distinct from
+/// [`TxBufHandle`] so it can only be submitted via
+/// [`submit_tx_tso`], not via [`submit_tx`].
+pub fn acquire_tx_tso_buf() -> Option<uni_net_driver::TxTsoBufHandle> {
     let f = active_ops().acquire_tx_tso_buf?;
     f()
 }
@@ -107,7 +111,7 @@ pub fn acquire_tx_tso_buf() -> Option<uni_net_driver::TxBufHandle> {
 /// this; if the surface is unavailable, the slot is returned
 /// to the pool and no traffic emitted.
 pub fn submit_tx_tso(
-    handle: uni_net_driver::TxBufHandle,
+    handle: uni_net_driver::TxTsoBufHandle,
     frame_len: usize,
     hdr_len: u16,
     csum_start: u16,

@@ -79,6 +79,37 @@ impl Drop for TxBufHandle {
     }
 }
 
+/// Handle returned by [`NicOps::acquire_tx_tso_buf`] for a TCP
+/// TSO super-segment. Type-distinct from `TxBufHandle` so
+/// [`NicOps::submit_tx`] can't accept it (and vice versa) — the
+/// big-pool / small-pool distinction is enforced at compile
+/// time, not just by a runtime pool-ID check on the token.
+///
+/// Lifecycle and field layout match `TxBufHandle` (this is a
+/// newtype wrapper). Drop fires the wrapped handle's
+/// `release_fn` automatically.
+#[repr(transparent)]
+pub struct TxTsoBufHandle(pub TxBufHandle);
+
+// SAFETY: same rationale as `TxBufHandle::Send`.
+unsafe impl Send for TxTsoBufHandle {}
+
+impl TxTsoBufHandle {
+    /// Mutable view of the writable frame region. The big-pool
+    /// slot's capacity is sized to fit one TSO super-segment
+    /// (~16 KiB).
+    #[inline]
+    pub fn data_mut(&mut self) -> &mut [u8] {
+        self.0.data_mut()
+    }
+
+    /// Capacity of the writable region, in bytes.
+    #[inline]
+    pub fn data_cap(&self) -> u32 {
+        self.0.data_cap
+    }
+}
+
 /// All fn pointers a NIC driver exposes. A single `&'static NicOps`
 /// is published via `AtomicPtr` at boot; every dispatcher call does
 /// one Acquire load + one direct call.
@@ -136,7 +167,12 @@ pub struct NicOps {
     ///     variant of the option).
     /// Caller falls back to per-MSS segmentation via
     /// [`acquire_tx_buf`] when None.
-    pub acquire_tx_tso_buf: Option<fn() -> Option<TxBufHandle>>,
+    ///
+    /// Returns the type-distinct [`TxTsoBufHandle`] so the
+    /// caller can't accidentally hand it to [`submit_tx`] (the
+    /// type system enforces big-pool slots → `submit_tx_tso`,
+    /// small-pool slots → `submit_tx`).
+    pub acquire_tx_tso_buf: Option<fn() -> Option<TxTsoBufHandle>>,
     /// Submit a TSO super-segment. Same shape as `submit_tx` plus
     /// the gso fields the device needs to segment host-side:
     ///
@@ -155,8 +191,13 @@ pub struct NicOps {
     /// `None` when the driver doesn't support TSO (mirror of
     /// `tso_available()`); caller falls back to per-MSS
     /// `submit_tx` calls.
+    ///
+    /// Takes a [`TxTsoBufHandle`] (the type-distinct wrapper
+    /// from `acquire_tx_tso_buf`) — a small-pool `TxBufHandle`
+    /// won't compile here, eliminating the previous runtime
+    /// pool-ID check.
     pub submit_tx_tso: Option<fn(
-        handle: TxBufHandle,
+        handle: TxTsoBufHandle,
         frame_len: usize,
         hdr_len: u16,
         csum_start: u16,

@@ -982,7 +982,7 @@ fn send_super_segment_from_cursor(
         );
         return;
     };
-    let cap = handle.data_cap as usize;
+    let cap = handle.data_cap() as usize;
     debug_assert!(frame_len <= cap);
 
     let frame = &mut handle.data_mut()[..frame_len];
