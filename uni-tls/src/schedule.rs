@@ -247,47 +247,7 @@ impl TrafficKey {
         tls_crypto::chacha20poly1305_seal(&self.key, &nonce, aad, data)
     }
 
-    /// Scatter-gather variant of [`Self::seal`]. Encrypts `body` and
-    /// `trailer` in place as if they were a single concatenated
-    /// plaintext, computes one Poly1305 tag over the AAD + combined
-    /// ciphertext, and returns it. Auto-increments `seq`.
-    ///
-    /// Lets the TLS record layer assemble a record across two
-    /// IOBufs (body without tailroom for the inner-content-type
-    /// byte + AEAD tag, plus a small dedicated trailer IOBuf) so
-    /// app-side body IOBufs don't need to leave space for
-    /// transport framing.
-    pub fn seal_split(
-        &mut self,
-        aad: &[u8],
-        body: &mut [u8],
-        trailer: &mut [u8],
-    ) -> [u8; 16] {
-        let nonce = self.nonce_for_seq(self.seq);
-        self.seq = self.seq.wrapping_add(1);
-        tls_crypto::chacha20poly1305_seal_split(&self.key, &nonce, aad, body, trailer)
-    }
-
-    /// N-way generalisation of [`Self::seal_split`]. Encrypts every
-    /// slice in `parts` in place as if they were a single
-    /// concatenated plaintext, computes one Poly1305 tag, and
-    /// returns it. Auto-increments `seq`.
-    ///
-    /// Lets the record layer seal a TLS record across an arbitrary-
-    /// length IOBufChain — `[http_header, body_part_0, body_part_1,
-    /// ..., trailer]` — with one ChaCha20 keystream pass and one
-    /// Poly1305 MAC. Zero plaintext-side coalesce: each part is
-    /// encrypted in place where the producer left it.
-    pub fn seal_chain<'a, I>(&mut self, aad: &[u8], parts: I) -> [u8; 16]
-    where
-        I: IntoIterator<Item = &'a mut [u8]>,
-    {
-        let nonce = self.nonce_for_seq(self.seq);
-        self.seq = self.seq.wrapping_add(1);
-        tls_crypto::chacha20poly1305_seal_chain(&self.key, &nonce, aad, parts)
-    }
-
-    /// Fused copy-and-encrypt sibling of [`Self::seal_chain`].
+    /// Fused copy-and-encrypt N-way variant of [`Self::seal`].
     /// Reads plaintext from `src_parts` (immutable byte slices),
     /// writes ciphertext to consecutive regions of `dst`,
     /// computes one Poly1305 tag, and returns it. Auto-

@@ -527,64 +527,6 @@ impl TlsServer {
             .map_err(|e| e.into())
     }
 
-    /// Scatter-gather sibling of [`Self::send_app_data_iobuf`].
-    /// Seals across two IOBufs:
-    ///
-    ///   * `body` holds the plaintext on input. Needs `headroom >=
-    ///     HEADER_LEN` (5) so the TLS record header gets prepended in
-    ///     place. **No tailroom required** — the inner-content-type
-    ///     byte and the AEAD tag go in `trailer`.
-    ///   * `trailer` is the caller's small dedicated trailer IOBuf
-    ///     with `tailroom >= 1 + TAG_LEN` (17). Starts empty.
-    ///
-    /// On `Ok`:
-    ///   * `body.data()` is `[record_header || ciphertext]`.
-    ///   * `trailer.data()` is `[encrypted_type || aead_tag]`.
-    ///
-    /// Single-record only — the caller chunks oversized payloads.
-    pub fn send_app_data_iobuf_split(
-        &mut self,
-        body: &mut uni_iobuf::IOBuf,
-        trailer: &mut uni_iobuf::IOBuf,
-    ) -> Result<(), HandshakeError> {
-        if self.state != State::Established {
-            return Err(HandshakeError::UnexpectedRecord);
-        }
-        let tk = self
-            .server_ap_tk
-            .as_mut()
-            .ok_or(HandshakeError::Internal)?;
-        record::seal_in_place_split(tk, content_type::APPLICATION_DATA, body, trailer)
-            .map_err(|e| e.into())
-    }
-
-    /// Whole-chain in-place seal. Takes an `IOBufChain` of plaintext
-    /// parts (every part must be mutable — i.e. Heap or External),
-    /// prepends a fresh TLS record header IOBuf, appends a fresh
-    /// trailer IOBuf for the encrypted inner-content-type byte +
-    /// AEAD tag, and runs the scatter-gather AEAD across every part
-    /// in place. Zero plaintext-side coalesce: each part's bytes are
-    /// encrypted where the producer left them.
-    ///
-    /// Single-record only — caller chunks oversized chains. Returns
-    /// `Err(...)` derived from `seal_chain_in_place`'s errors:
-    ///   * `RecordTooLarge` / `OutputTooSmall` (Static-bearing chain
-    ///     — caller falls back to coalesce-then-seal).
-    pub fn send_app_data_chain(
-        &mut self,
-        chain: &mut uni_iobuf::IOBufChain,
-    ) -> Result<(), HandshakeError> {
-        if self.state != State::Established {
-            return Err(HandshakeError::UnexpectedRecord);
-        }
-        let tk = self
-            .server_ap_tk
-            .as_mut()
-            .ok_or(HandshakeError::Internal)?;
-        record::seal_chain_in_place(tk, content_type::APPLICATION_DATA, chain)
-            .map_err(|e| e.into())
-    }
-
     /// Fused copy-and-encrypt sibling of [`Self::send_app_data_iobuf`].
     /// Reads plaintext from `src_chain` and encrypts-while-copying
     /// into `dst`'s reserved space. `dst` must have headroom (5 B
