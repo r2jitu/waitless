@@ -982,6 +982,11 @@ const RX_QPL_PAGES: u32 = RX_RING_ENTRIES as u32;
 ///   14..16 buf_size_and_resv              bits[13:0]=buf_size (max 16383)
 const DQO_TX_DESC_SIZE: usize = 16;
 const DQO_TX_DTYPE_PKT: u8 = 0xC;
+/// General context descriptor type, per `gve_desc_dqo.h`'s
+/// `GVE_TX_GENERAL_CTX_DESC_DTYPE_DQO`. Linux emits one of
+/// these IMMEDIATELY before each data descriptor; without it,
+/// our packets miss the metadata preamble the device expects.
+const DQO_TX_DTYPE_GENERAL_CTX: u8 = 0x4;
 const DQO_TX_FLAG_EOP: u8 = 1 << 5;
 /// `checksum_offload_enable` (byte 8 bit 6) — instructs the device
 /// to compute the L4 checksum host-side. Equivalent of virtio's
@@ -2331,6 +2336,15 @@ fn send_on_qp_dqo(qp: usize, data: &[u8]) -> bool {
 
     // gve_tx_pkt_desc_dqo, 16 bytes, all LE. RE only every 32nd
     // descriptor per the device's spec (`GVE_TX_MIN_RE_INTERVAL`).
+    //
+    // NOTE: Linux's `gve_tx_add_skb_dqo` ALWAYS emits a general
+    // context descriptor (DTYPE 0x4) before each data desc.
+    // I tried that — c3-standard-4 throughput got worse, not
+    // better, suggesting either my context-desc layout is wrong
+    // or there's an interaction with the RE/completion path I
+    // can't see from outside the bench loop. Reverted to the
+    // single-data-desc shape; needs on-host instrumentation to
+    // root-cause why the device wedges under sustained load.
     let last_re = tx.last_re_at_fill.load(Ordering::Relaxed);
     let want_re = fill_cnt.wrapping_sub(last_re) >= DQO_TX_RE_INTERVAL;
     let mut flags = DQO_TX_DTYPE_PKT | DQO_TX_FLAG_EOP;
