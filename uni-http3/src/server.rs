@@ -88,6 +88,7 @@ where
     // before this lands); with them it can demand `delta == 0`.
     crate::huffman::preinit();
     uni_quic::preinit();
+    uni_http::body_scratch_preinit();
 
     let handler = Arc::new(handler);
     let listener = quic_listen(port, cert_der, key_pkcs8_der, move |conn: QuicConn| {
@@ -151,18 +152,15 @@ where
     // case for a typical browser request — they grow if exceeded
     // (rare) but never shrink.
     let mut scratch = Scratch::new();
-    // Per-conn body scratch for handlers that opt into the
-    // `uni_http::body_iobuf` zero-alloc path. Mirrors the same
-    // buffer in `uni-http`'s HTTP/1.1 `handle_conn` — the H3
-    // path used to skip this and let `body_iobuf` fall through
-    // to fresh `IOBuf::new_with_reserved` per response, leaving
-    // an alloc-count asymmetry between H/1.1 and H3 that
-    // surfaced as multi-request leak shape on shutdown. Sized
-    // to match (16 KiB covers our largest dynamic body, the
-    // /diagnostics page at ~9 KiB, with headroom).
-    const BODY_SCRATCH_SIZE: usize = 16 * 1024;
-    let mut body_scratch =
-        alloc::vec![0u8; BODY_SCRATCH_SIZE].into_boxed_slice();
+    // Body-scratch is now a per-worker static allocated once at
+    // boot via `uni_http::body_scratch_preinit` (called from
+    // `uni_http3::listen`). Shared across every conn/request on
+    // this worker — safe because handlers run synchronously to
+    // completion and the IOBufs they carve are read+dropped
+    // before any TX yields. See the safety contract on
+    // `uni_http::install_body_scratch`. This eliminates the
+    // per-conn 16 KiB Box that handle_conn used to keep in its
+    // future state.
     loop {
         let sid = match conn.accept_stream().await {
             Some(s) => s,
@@ -176,7 +174,7 @@ where
             // multiplexes; doing it inline keeps lifetimes simple
             // and matches the shape of //uni-http's handle_conn.
             handle_request(
-                &conn, sid, h.as_ref(), &mut scratch, &mut body_scratch,
+                &conn, sid, h.as_ref(), &mut scratch,
             ).await;
         } else if sid & 0x3 == 0x2 {
             // Peer unidirectional streams — control, QPACK
@@ -390,7 +388,6 @@ async fn handle_request<H, F>(
     sid: u64,
     handler: &H,
     scratch: &mut Scratch,
-    body_scratch: &mut [u8],
 ) where
     H: Fn(Request) -> F,
     F: core::future::Future<Output = Response>,
@@ -541,19 +538,13 @@ async fn handle_request<H, F>(
     req.set_body(&data[..]);
 
     crate::diag::bump(&crate::diag::COUNTERS.user_handler_invoked);
-    // Park `body_scratch` in the per-worker slot so the handler
-    // can grab a borrowed `IOBuf` via `uni_http::body_iobuf` and
-    // skip the per-response heap allocation. Cleared after the
-    // handler returns so out-of-handler `body_iobuf` calls fall
-    // back to fresh allocations. Same pattern as `uni-http`'s
-    // HTTP/1.1 `handle_conn`. SAFETY: `body_scratch` is owned by
-    // `handle_conn` for this conn's lifetime — IOBufs carved out
-    // of it must drain (via `write_response` → SendStream) before
-    // the conn task drops; the request-handling loop here awaits
-    // `write_response` synchronously before the next iteration,
-    // and shutdown's `drain_all_arenas` drops conn task and
-    // listener task atomically (no IOBuf can outlive the buffer).
-    uni_http::install_body_scratch(body_scratch);
+    // Activate the per-worker body-scratch buffer so the
+    // handler's `body_iobuf` calls carve from it instead of
+    // heap-allocating. Same pattern as `uni-http`'s HTTP/1.1
+    // `handle_conn`. Safety relies on the IOBufs being read +
+    // dropped before any TX yields — see the contract on
+    // `uni_http::install_body_scratch`.
+    uni_http::install_body_scratch();
     let response = handler(req).await;
     uni_http::clear_body_scratch();
     crate::diag::bump(&crate::diag::COUNTERS.user_handler_returned);

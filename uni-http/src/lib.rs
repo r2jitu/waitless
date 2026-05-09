@@ -58,39 +58,69 @@ use uni_worker::{CurrentWorker, WorkerLocal};
 //   * The `taken` flag prevents one handler from constructing
 //     two IOBufs that alias the same buffer.
 
-/// Per-handler scratch slot. `handle_conn` parks the
-/// connection's body buffer here before invoking the handler;
-/// `body_iobuf` carves out a sub-range, advances `cursor`, and
-/// returns an `IOBuf::External` wrapping that range. Multiple
-/// `body_iobuf` calls within a single handler invocation are
-/// supported as long as their combined size fits the buffer —
-/// useful for handlers that compose several heap-IOBufs (a
-/// title buf + nav buf + main body), each backed by a slice
-/// of the same per-conn scratch.
-#[derive(Clone, Copy)]
-struct BodyScratchSlot {
-    /// Address of the current `handle_conn`'s body buffer.
-    /// `None` outside any handler invocation.
-    ptr: Option<NonNull<[u8]>>,
-    /// Bytes already handed out from `ptr`. Subsequent
-    /// `body_iobuf` calls carve from `[cursor..]`. Reset to 0
-    /// by `handle_conn` between requests.
-    cursor: usize,
+/// Per-worker body-scratch buffer. ONE 16 KiB allocation per worker,
+/// shared across every request that runs on that worker. This is
+/// safe because:
+///
+/// 1. Handlers run synchronously to completion on a single worker
+///    (the conn task awaits on TX, never inside the handler — our
+///    pages are sync `match` dispatches with no `.await`).
+/// 2. By the time `TlsStream::send` first awaits, the handler's
+///    IOBufs from `body_scratch` have already been read and
+///    encrypted into the TLS scratch (`send_app_data_chain_to`
+///    consumes the bytes; `chain.clear()` drops the IOBufs).
+///    So no IOBuf still references `body_scratch` when the worker
+///    yields to another conn.
+/// 3. Workers are single-threaded async — no two handlers can be
+///    mid-carve concurrently.
+///
+/// The previous design kept a per-conn `Box<[u8; 16 KiB]>` in
+/// `handle_conn`'s future state — one alloc per accepted HTTPS
+/// connection. With this per-worker layout we pay the alloc
+/// once at boot (folded into HEAP_BASELINE via the eager
+/// `body_scratch_init` call from `listen_https`) and every
+/// subsequent accept costs zero body_scratch allocs.
+struct BodyScratch {
+    /// Permanent storage. Allocated once per worker at first init;
+    /// the same Box lives for the duration of the worker.
+    storage: Box<[u8]>,
+    /// Toggled by `install_body_scratch` / `clear_body_scratch`
+    /// around the handler call. `false` outside handlers means
+    /// `body_iobuf` falls through to a fresh heap alloc — preserves
+    /// the old "out-of-handler caller still works" contract for
+    /// test code.
+    active: Cell<bool>,
+    /// Bytes already handed out since the last `install`. Carves
+    /// advance from `cursor`; reset to 0 on `install_body_scratch`.
+    cursor: Cell<usize>,
 }
 
-// SAFETY: `BodyScratchSlot` is logically `!Send` (the `NonNull`
-// borrows `handle_conn`'s frame on a specific worker) but
-// `WorkerLocal` requires `Send` to be `Sync`. The slot is only
-// ever touched from its owning worker (via `CurrentWorker`), so
-// the bound is satisfied by construction.
-unsafe impl Send for BodyScratchSlot {}
+// SAFETY: `Box<[u8]>` and `Cell<{bool,usize}>` are individually
+// `Send`. We access `storage` only through raw-pointer arithmetic
+// (`as_ptr().add(cursor)` cast to `*mut u8`), bounded by the
+// `WorkerLocal` access path's `CurrentWorker` token — so no two
+// workers ever construct overlapping pointers into the same Box.
+unsafe impl Send for BodyScratch {}
 
-static BODY_SCRATCH: WorkerLocal<Cell<BodyScratchSlot>> = WorkerLocal::new();
+const BODY_SCRATCH_SIZE: usize = 16 * 1024;
+
+static BODY_SCRATCH: WorkerLocal<BodyScratch> = WorkerLocal::new();
 
 fn body_scratch_init() {
-    BODY_SCRATCH.ensure_init(uni::num_workers(), |_| {
-        Cell::new(BodyScratchSlot { ptr: None, cursor: 0 })
+    BODY_SCRATCH.ensure_init(uni::num_workers(), |_| BodyScratch {
+        storage: alloc::vec![0u8; BODY_SCRATCH_SIZE].into_boxed_slice(),
+        active: Cell::new(false),
+        cursor: Cell::new(0),
     });
+}
+
+/// Pre-init the per-worker body-scratch buffers so the 16 KiB ×
+/// `num_workers()` allocations land in `HEAP_BASELINE` rather
+/// than being charged to the first request as a leak-check
+/// delta. Called from `listen` / `listen_https` / `listen_h3`
+/// before any traffic arrives.
+pub fn body_scratch_preinit() {
+    body_scratch_init();
 }
 
 /// Allocate an IOBuf for a response body part with `cap` bytes
@@ -146,105 +176,113 @@ pub fn body_iobuf(cap: usize) -> IOBuf {
 }
 
 /// Internal: try to carve an IOBuf out of the per-worker
-/// scratch slot. Returns `None` outside handlers or when the
-/// requested capacity wouldn't fit in the remaining scratch.
+/// scratch buffer. Returns `None` outside handlers (no `install`
+/// in scope) or when the requested capacity wouldn't fit in
+/// the remaining scratch.
 fn try_carve_scratch(cap: usize) -> Option<IOBuf> {
     let cc = CurrentWorker::enter();
     body_scratch_init();
-    let slot = BODY_SCRATCH.with(&cc, |c| c.get());
-    let ptr = slot.ptr?;
-    let cursor = slot.cursor;
-
-    // SAFETY: the slice is `handle_conn`'s body buffer for the
-    // current connection — Pin'd and exclusively owned for the
-    // duration of this handler invocation. We carve a sub-range
-    // `[cursor..cursor + needed]` and update `cursor` (the
-    // worker is single-threaded cooperative, so this is
-    // race-free), so subsequent `body_iobuf` calls within the
-    // same invocation see disjoint ranges.
-    let slice = unsafe { ptr.as_ref() };
-    let total = slice.len();
-    if cursor >= total {
-        return None;
-    }
-    let remaining = total - cursor;
-    // Headroom only — no trailer reservation. The TLS encrypt-
-    // in-place path wanted 17 B of tailroom (1 B inner-content-
-    // type + 16 B AEAD tag), but its size cap (≤ 3 KiB
-    // plaintext per record) rules out the diagnostics-class
-    // bodies that actually matter, and small bodies take the
-    // already-coalesce-into-scratch path which doesn't need
-    // body tailroom either. Until a faster small-record fast
-    // path needs encrypt-in-place to fire, the trailer reserve
-    // was just hidden bytes that did nothing.
-    let headroom = MAX_HEADER_RESERVE.min(remaining / 4);
-    let needed = headroom + cap;
-    if needed > remaining {
-        return None;
-    }
-    let chunk_start = cursor;
-    BODY_SCRATCH.with(&cc, |c| {
-        c.set(BodyScratchSlot {
-            ptr: Some(ptr),
-            cursor: cursor + needed,
-        })
-    });
-    Some(unsafe {
-        IOBuf::from_external(
-            NonNull::new_unchecked(slice.as_ptr().add(chunk_start) as *mut u8),
-            needed as u32,
-            headroom as u32,
-            0,
-            None,
-            core::ptr::null_mut(),
-        )
+    BODY_SCRATCH.with(&cc, |s| {
+        if !s.active.get() {
+            return None;
+        }
+        let cursor = s.cursor.get();
+        let total = s.storage.len();
+        if cursor >= total {
+            return None;
+        }
+        let remaining = total - cursor;
+        // Headroom only — no trailer reservation. The TLS encrypt-
+        // in-place path wanted 17 B of tailroom (1 B inner-content-
+        // type + 16 B AEAD tag), but its size cap (≤ 3 KiB
+        // plaintext per record) rules out the diagnostics-class
+        // bodies that actually matter, and small bodies take the
+        // already-coalesce-into-scratch path which doesn't need
+        // body tailroom either. Until a faster small-record fast
+        // path needs encrypt-in-place to fire, the trailer reserve
+        // was just hidden bytes that did nothing.
+        let headroom = MAX_HEADER_RESERVE.min(remaining / 4);
+        let needed = headroom + cap;
+        if needed > remaining {
+            return None;
+        }
+        s.cursor.set(cursor + needed);
+        // SAFETY: `storage` is per-worker, accessed only through
+        // the `CurrentWorker` token (which is `!Send` — so no
+        // other worker can construct a pointer into this Box).
+        // The active handler runs synchronously on this worker
+        // until it returns; subsequent carves return disjoint
+        // sub-ranges (`cursor` monotonically increases until
+        // `install` resets it). The IOBuf's bytes are read+
+        // dropped by the time `TlsStream::send` first awaits
+        // (verified via the
+        // `send_app_data_chain_to` → `chain.clear()` → `tcp.send().await`
+        // sequence in `TlsStream::send`), so the buffer is
+        // free for the next handler that runs on this worker.
+        unsafe {
+            Some(IOBuf::from_external(
+                NonNull::new_unchecked(
+                    s.storage.as_ptr().add(cursor) as *mut u8,
+                ),
+                needed as u32,
+                headroom as u32,
+                0,
+                None,
+                core::ptr::null_mut(),
+            ))
+        }
     })
 }
 
-/// Install `buf` as the current handler's body-scratch slot.
-/// Subsequent [`body_iobuf`] calls from inside the handler will
-/// carve sub-ranges out of `buf` instead of heap-allocating —
-/// turning the typical "render response body" path into zero
-/// allocations.
+/// Activate the per-worker body-scratch buffer for the current
+/// handler invocation. While active, `body_iobuf` calls carve
+/// sub-ranges out of the worker-local 16 KiB buffer instead of
+/// heap-allocating — turning the typical "render response body"
+/// path into zero allocations on the conn-handling fast path.
 ///
 /// # Safety contract
 ///
-/// `buf` must outlive every IOBuf carved from it. The IOBufs
-/// returned by `body_iobuf` are `IOBuf::External` references
-/// into `buf`'s storage; if `buf` is dropped while any of those
-/// IOBufs is still being read (e.g. queued in a transport
-/// SendStream), the IOBufs will dereference freed memory.
+/// Single-buffer-per-worker is sound because:
 ///
-/// In practice the contract is upheld by the listener crates
-/// (`uni-http`, `uni-http3`) holding `buf` as a local in
-/// `handle_conn` so it lives for the conn's lifetime, calling
-/// `install_body_scratch` immediately before the handler future
-/// runs and `clear_body_scratch` immediately after the response
-/// has been fully queued onto the transport. The transport then
-/// drains the IOBufs onto the wire while `buf` is still alive.
+/// 1. Async handlers run synchronously to completion on a single
+///    worker — the conn task awaits on TX, never inside the
+///    handler body. The carve cursor advances monotonically until
+///    the handler returns and we `clear`.
+/// 2. By the time `TlsStream::send` first awaits (or any other
+///    transport TX path yields), the handler's IOBufs have
+///    already been read into the TLS scratch and dropped (via
+///    `send_app_data_chain_to` + `chain.clear()`). No IOBuf
+///    backed by `body_scratch` lives across an `.await`.
+/// 3. While the worker is yielded, no other handler runs on the
+///    same worker (single-threaded async). When a new handler
+///    starts, its `install_body_scratch` resets the cursor — by
+///    then the previous conn's IOBufs are gone, so overwriting
+///    the buffer is safe.
 ///
-/// Apps don't call this directly. The framework crate that
-/// dispatches request handlers does.
-pub fn install_body_scratch(buf: &mut [u8]) {
+/// `clear_body_scratch` must be called after the handler returns,
+/// before the worker yields to another conn — the framework
+/// crates (`uni-http`, `uni-http3`) wrap the handler call in
+/// install/clear pairs to enforce this. Out-of-handler `body_iobuf`
+/// calls (during init, tests) fall through to fresh heap allocs
+/// — see `try_carve_scratch`.
+pub fn install_body_scratch() {
     let cc = CurrentWorker::enter();
     body_scratch_init();
-    BODY_SCRATCH.with(&cc, |c| {
-        c.set(BodyScratchSlot {
-            ptr: Some(NonNull::from(&mut *buf)),
-            cursor: 0,
-        });
+    BODY_SCRATCH.with(&cc, |s| {
+        s.cursor.set(0);
+        s.active.set(true);
     });
 }
 
-/// Clear the body-scratch slot after the handler returns.
-/// Subsequent [`body_iobuf`] calls (e.g. from out-of-handler
-/// code) return a fresh heap allocation rather than borrowing
-/// from a now-orphaned buffer. Idempotent.
+/// Deactivate the per-worker body-scratch buffer after the
+/// handler returns. Subsequent `body_iobuf` calls return fresh
+/// heap allocations until the next `install_body_scratch`.
+/// Idempotent.
 pub fn clear_body_scratch() {
     let cc = CurrentWorker::enter();
     body_scratch_init();
-    BODY_SCRATCH.with(&cc, |c| {
-        c.set(BodyScratchSlot { ptr: None, cursor: 0 });
+    BODY_SCRATCH.with(&cc, |s| {
+        s.active.set(false);
     });
 }
 
@@ -995,6 +1033,10 @@ pub fn listen<H>(port: u16, handler: H) -> Result<(), uni::runtime::TcpBindError
 where
     H: AsyncFn(&Request) -> Response + Send + Sync + 'static,
 {
+    // Pay the per-worker body-scratch allocations into HEAP_BASELINE
+    // before any traffic arrives. Idempotent across multiple
+    // listen()/listen_https() calls.
+    body_scratch_preinit();
     let listener = uni::runtime::TcpListener::bind(port)?;
     let handler = Arc::new(handler);
     let h = listener.run(move |stream| {
@@ -1029,6 +1071,10 @@ pub fn listen_https<H>(
 where
     H: AsyncFn(&Request) -> Response + Send + Sync + 'static,
 {
+    // Pay the per-worker body-scratch allocations into HEAP_BASELINE
+    // before any traffic arrives. Idempotent across multiple
+    // listen()/listen_https() calls.
+    body_scratch_preinit();
     let listener = uni::runtime::TcpListener::bind(port)?;
     let handler = Arc::new(handler);
     let h = listener.run(move |tcp| {
@@ -1101,18 +1147,16 @@ async fn handle_conn<S, H>(
     // Set-Cookie) with room to spare.
     const HEADER_BUF_SIZE: usize = 1024;
     let mut header_storage = [0u8; HEADER_BUF_SIZE];
-    // Per-conn body scratch for handlers that opt into the
-    // `body_iobuf` zero-alloc path. Heap-allocated once at
-    // conn-open (one alloc per accept, amortised across every
-    // request on this conn) rather than inline in the future
-    // state — keeps the handle_conn future small enough to
-    // stay in cache. Sized to cover the largest dynamic body
-    // we render today (the diagnostics page is ~9 KiB; 16 KiB
-    // gives headroom). Apps that need bigger bodies fall back
-    // to fresh `IOBuf::new_with_reserved` allocs (one per
-    // response) automatically.
-    const BODY_SCRATCH_SIZE: usize = 16 * 1024;
-    let mut body_scratch = alloc::vec![0u8; BODY_SCRATCH_SIZE].into_boxed_slice();
+    // Body scratch for the `body_iobuf` zero-alloc path is now a
+    // per-worker static (one 16 KiB Box per worker, paid into
+    // HEAP_BASELINE via `body_scratch_preinit` from `listen_*`),
+    // shared across every conn that runs on this worker. Safe
+    // because handlers are synchronous and the IOBufs they carve
+    // are consumed (read into the TLS scratch + dropped) before
+    // `TlsStream::send` ever yields — see the safety comment on
+    // `install_body_scratch`. Eliminates the per-accept 16 KiB
+    // allocation that handle_conn used to keep in its future
+    // state.
     // Carries the parser's progress (`scan_pos`) across calls
     // when a request arrives in multiple recv'd segments — the
     // `find_header_end` scan resumes from the last position
@@ -1147,13 +1191,12 @@ async fn handle_conn<S, H>(
                 Some(v) => v.eq_ignore_ascii_case(b"close"),
                 None => false,
             };
-            // Park `body_scratch` in the per-worker slot so the
-            // handler can grab a borrowed `IOBuf` via
-            // `uni_http::body_iobuf` and skip the per-response
-            // heap allocation. Cleared after the chain is sent —
-            // out-of-handler `body_iobuf` calls return `None` and
-            // fall back to fresh allocations.
-            install_body_scratch(&mut body_scratch);
+            // Activate the per-worker body-scratch buffer so the
+            // handler's `body_iobuf` calls carve from it instead
+            // of heap-allocating. Cleared after the handler
+            // returns — out-of-handler `body_iobuf` calls fall
+            // back to fresh allocations.
+            install_body_scratch();
             let resp = (&*handler)(&req).await;
             clear_body_scratch();
 
