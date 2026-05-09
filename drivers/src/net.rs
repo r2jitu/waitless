@@ -9,7 +9,7 @@
 
 use uni_net_driver::{active_ops, is_installed, linked_ethernet_drivers, set_active_ops};
 
-pub use uni_net_driver::CsumOffload;
+pub use uni_net_driver::{CsumOffload, CsumStampConvention};
 
 // ---- Init / lifecycle -----------------------------------------------------
 
@@ -95,12 +95,19 @@ pub fn tso_available() -> bool {
 }
 
 /// True iff the driver supports L4 checksum-offload-on-TX
-/// (`VIRTIO_NET_F_CSUM` or equivalent). Callers branch:
-/// stamp pseudo-header partial sum + pass non-NONE
-/// `CsumOffload` when true; stamp full checksum + pass
-/// `CsumOffload::NONE` when false.
+/// (`VIRTIO_NET_F_CSUM` or equivalent). Callers branch on
+/// this AND on [`csum_stamp_convention`] to decide what
+/// (if anything) to stamp at the L4 checksum field.
 pub fn csum_tx_offload() -> bool {
     (active_ops().csum_tx_offload)()
+}
+
+/// What value the active driver expects at the L4 checksum
+/// field when CSUM offload is requested. Returns
+/// `PseudoHeaderPartial` for virtio-class NICs, `Zero` for gve.
+/// Only meaningful when [`csum_tx_offload`] returns `true`.
+pub fn csum_stamp_convention() -> CsumStampConvention {
+    (active_ops().csum_stamp_convention)()
 }
 
 /// Acquire a big-slot TX buffer (16 KiB capacity) for a TCP TSO

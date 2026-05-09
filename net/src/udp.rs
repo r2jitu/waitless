@@ -264,16 +264,25 @@ pub fn send_via_tx_handle(
 
             let ip_total = (ip_hdr_len + udp_len) as u16;
             let ip_slot = core::slice::from_raw_parts_mut(p.add(ETH_HDR_LEN), ip_hdr_len);
-            // Stamp pseudo-header partial sum (driver-side CSUM
-            // offload finishes the data part) when supported;
-            // else compute the full checksum guest-side.
+            // Stamp value driven by the active NIC's CSUM-offload
+            // convention: virtio wants pseudo-header partial sum;
+            // gve wants zero (device builds the pseudo-header
+            // itself); no offload means we compute the full
+            // checksum guest-side.
             let offload = uni_drivers::net::csum_tx_offload();
+            let convention = uni_drivers::net::csum_stamp_convention();
             match dst {
                 IpAddr::V4(d) => {
                     udp_hdr.checksum = if offload {
-                        tcp_pseudo_partial(
-                            IpAddr::V4(CONFIG.ip()), IpAddr::V4(d), PROTO_UDP, udp_len,
-                        )
+                        match convention {
+                            uni_drivers::net::CsumStampConvention::PseudoHeaderPartial => {
+                                tcp_pseudo_partial(
+                                    IpAddr::V4(CONFIG.ip()), IpAddr::V4(d),
+                                    PROTO_UDP, udp_len,
+                                )
+                            }
+                            uni_drivers::net::CsumStampConvention::Zero => 0,
+                        }
                     } else {
                         tcp_checksum(CONFIG.ip(), d, PROTO_UDP, p.add(udp_off), udp_len)
                     };
@@ -282,10 +291,15 @@ pub fn send_via_tx_handle(
                 IpAddr::V6(d) => {
                     let src = types::Ipv6Addr::ANY;
                     udp_hdr.checksum = if offload {
-                        tcp_pseudo_partial(
-                            IpAddr::V6(src), IpAddr::V6(d),
-                            ipv6::next_header::UDP, udp_len,
-                        )
+                        match convention {
+                            uni_drivers::net::CsumStampConvention::PseudoHeaderPartial => {
+                                tcp_pseudo_partial(
+                                    IpAddr::V6(src), IpAddr::V6(d),
+                                    ipv6::next_header::UDP, udp_len,
+                                )
+                            }
+                            uni_drivers::net::CsumStampConvention::Zero => 0,
+                        }
                     } else {
                         tcp_checksum_v6(&src, &d, ipv6::next_header::UDP, p.add(udp_off), udp_len)
                     };

@@ -816,15 +816,18 @@ unsafe fn fill_tcp_frame_headers(
     tcp_hdr.window = htons(window);
     tcp_hdr.checksum = 0;
     tcp_hdr.urgent = 0;
-    // Stamp either the pseudo-header partial sum (driver supports
-    // CSUM offload — device finishes the data part) or the full
-    // checksum. Partial is dramatically cheaper for big segments
-    // because we skip the per-byte data sum entirely; for tiny
-    // control segments the cost is the same, but the partial
-    // path's branch is a one-time `csum_tx_offload()` query
-    // outside the critical loop, so it's free either way.
+    // What we stamp depends on the active NIC's CSUM-offload
+    // convention. virtio expects pseudo-header partial sum;
+    // gve expects zero (device builds the pseudo-header from
+    // the IP header). Without offload, we compute the full
+    // checksum on the guest.
     tcp_hdr.checksum = if uni_drivers::net::csum_tx_offload() {
-        tcp_pseudo_partial(local_ip, dst_ip, PROTO_TCP, tcp_seg_len)
+        match uni_drivers::net::csum_stamp_convention() {
+            uni_drivers::net::CsumStampConvention::PseudoHeaderPartial => {
+                tcp_pseudo_partial(local_ip, dst_ip, PROTO_TCP, tcp_seg_len)
+            }
+            uni_drivers::net::CsumStampConvention::Zero => 0,
+        }
     } else {
         unsafe {
             tcp_checksum_any(

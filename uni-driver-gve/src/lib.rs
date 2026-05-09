@@ -2795,19 +2795,25 @@ static GVE_OPS: NicOps = NicOps {
     // descriptor-side support yet; report unavailable so callers
     // do per-MSS segmentation as today.
     tso_available: || false,
-    // CSUM offload disabled: the descriptor bits are wired
+    // CSUM offload disabled. The descriptor bits are wired up
     // (GQI's `GVE_TXF_L4CSUM` + `l4_csum_offset` / `l4_hdr_offset`
-    // in 16-bit-word units; DQO's `checksum_offload_enable`
-    // byte-8 bit 6) per Linux's gve, but enabling it on n2
-    // (GQI_QPL) regresses health_max -19% / health_tls_max -28%
-    // — the device appears to interpret the partial-sum stamp
-    // differently from virtio-net. Suspect the gve hardware
-    // builds the pseudo-header itself from the IP header rather
-    // than reading the pre-stamped partial sum at csum_offset,
-    // so our partial-sum stamp produces a corrupted result.
-    // Needs investigation against a real GCE test bed; for now
-    // the caller computes the full checksum and gve ships it.
+    // in 16-bit-word units, per Linux's `gve_tx_fill_pkt_desc`),
+    // and we tried both stamp conventions on n2:
+    //   * `PseudoHeaderPartial` (virtio convention) → -19% / -28%
+    //   * `Zero` (assumed gve convention)            → -32% / -36%
+    // Both regressions are consistent with "device doesn't honour
+    // the CSUM bits in this configuration" — the packet ships
+    // with the (wrong) stamped value and the receiver rejects
+    // most. The full L4 checksum the caller computes today works
+    // correctly, so we stick with that until we can debug the
+    // descriptor-bit handshake on a real n2 (perhaps a missing
+    // adminq feature negotiation, or a different bit encoding
+    // in the type_flags byte than Linux's docs suggest).
     csum_tx_offload: || false,
+    // Convention is irrelevant while csum_tx_offload returns
+    // false; declared so the field exists and the API shape is
+    // ready for re-enablement.
+    csum_stamp_convention: || uni_net_driver::CsumStampConvention::Zero,
     acquire_tx_tso_buf: None,
     submit_tx_tso: None,
     poll_rx: poll,
