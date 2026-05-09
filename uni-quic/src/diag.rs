@@ -90,6 +90,15 @@ pub struct Counters {
     // ── Events (positive signal) ─────────────────────────────────
     /// New conn allocated for an Initial packet.
     pub conns_allocated: AtomicU64,
+    /// `Connection`'s `Drop` impl fired. Compare against
+    /// `conns_allocated` at shutdown — a non-zero gap means N
+    /// connections didn't drop, and their per-stream BTreeMaps,
+    /// recv/send pools, and outbound recycle Vecs leak. If
+    /// `(conns_allocated - conns_dropped) > 0` after
+    /// `drain_all_arenas`, an `Rc<RefCell<Connection>>` is held
+    /// somewhere outside the conn-task / user-handler future
+    /// pair we expect to cover.
+    pub conns_dropped: AtomicU64,
     /// Initial-DCID lookup hit — the multi-packet ClientHello path
     /// did its job. If this stays at 0 under browser traffic the
     /// fix isn't reaching the right callers.
@@ -247,6 +256,7 @@ impl Counters {
             unsupported_client: AtomicU64::new(0),
             tls_internal: AtomicU64::new(0),
             conns_allocated: AtomicU64::new(0),
+            conns_dropped: AtomicU64::new(0),
             initial_dcid_hit: AtomicU64::new(0),
             handshakes_completed: AtomicU64::new(0),
             tickets_emitted: AtomicU64::new(0),
@@ -389,7 +399,7 @@ pub fn should_log_event() -> bool {
 
 /// Snapshot of every counter, for `/debug/quic_stats`-style dumps.
 /// Returns `(name, value)` pairs in declaration order.
-pub fn snapshot() -> [(&'static str, u64); 39] {
+pub fn snapshot() -> [(&'static str, u64); 40] {
     let c = &COUNTERS;
     [
         ("no_dcid", c.no_dcid.load(Ordering::Relaxed)),
@@ -408,6 +418,7 @@ pub fn snapshot() -> [(&'static str, u64); 39] {
         ("unsupported_client", c.unsupported_client.load(Ordering::Relaxed)),
         ("tls_internal", c.tls_internal.load(Ordering::Relaxed)),
         ("conns_allocated", c.conns_allocated.load(Ordering::Relaxed)),
+        ("conns_dropped", c.conns_dropped.load(Ordering::Relaxed)),
         ("initial_dcid_hit", c.initial_dcid_hit.load(Ordering::Relaxed)),
         ("handshakes_completed", c.handshakes_completed.load(Ordering::Relaxed)),
         ("tickets_emitted", c.tickets_emitted.load(Ordering::Relaxed)),

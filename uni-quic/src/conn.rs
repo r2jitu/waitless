@@ -714,6 +714,14 @@ pub struct Connection {
     reaped_idx: usize,
 }
 
+impl Drop for Connection {
+    fn drop(&mut self) {
+        crate::diag::COUNTERS
+            .conns_dropped
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Cap on the per-conn reaped-streams ring (see
 /// `reaped_streams` docstring).
 const REAPED_STREAMS_CAP: usize = 256;
