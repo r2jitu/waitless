@@ -699,3 +699,69 @@ E and F are low-effort cleanups that can land any time.
   diagnostic counters); gve CSUM-offload negotiation; gve TSO
   (multi-descriptor with separate big QPL — substantial chunk
   of work, not started).
+
+- **2026-05-09** — gve GQI fallback + CSUM offload re-enable
+  (`2d7ecaa`, `d807ab1`):
+
+  * **Queue-format priority flip**: `higher_priority` ranks
+    `GQI_QPL > GQI_RDA > DQO_QPL > DQO_RDA` (Linux ranks DQO_RDA
+    highest). C3 advertises both formats; our DQO TX still stalls
+    under sustained parallel load even with all the spec-correct
+    fixes from Linux's `gve_tx_dqo`. Falling back to GQI_QPL on
+    c3 is a no-op on n2/n2d/e2 (GQI_QPL only) and unblocks c3.
+    Bench on c3-standard-4 (4 vCPU, GQI_QPL direct-fill):
+        health_max:        466 238 req/s
+        health_tls_max:    298 431
+        h3_health_max:      73 187
+        udp_peak:          826 198
+
+  * **CSUM TX offload re-enabled** with
+    `CsumStampConvention::PseudoHeaderPartial` (matching Linux's
+    `CHECKSUM_PARTIAL` skb path): caller pre-stamps the
+    pseudo-header sum at the L4 cksum field; device adds data
+    and folds. Earlier disabling was based on n2 numbers that
+    didn't reproduce on c3 GQI direct-fill — now neutral perf
+    with offload on.
+
+  * **`tx_pages_per_qpl` parsing**: the offset-20 slot in
+    `gve_device_descriptor` was previously read as `reserved2`;
+    Linux's `gve_adminq.h` shows it's `tx_pages_per_qpl` (the
+    device's advertised cap on TX QPL pages). Now parsed and
+    logged. The cap is advisory: Linux uses `tx_desc_cnt /
+    GVE_QPL_DIVISOR = 4` pages and FIFO-packs many packets per
+    page; our 1-page-per-slot model uses 256 pages and the
+    device permits the overflow on every gVNIC variant tested.
+
+- **2026-05-09** — gve TSO attempt (parked).
+  TSO scaffolding implemented end-to-end (big-pool of 16×20 KiB
+  slots carved from the same QPL, pool_id flag in driver_token,
+  `acquire_tx_tso_buf` / `submit_tx_tso` writing the GQI TSO
+  pkt_desc + SEG desc pair per Linux's `gve_tx_fill_pkt_desc` /
+  `_seg_desc`, `tx_drain` branched on the descriptor type byte).
+  Local `test_qemu_x86_64` and HVF tests pass — code is
+  structurally correct.
+
+  GCE c3-standard-4 deploy with `tso_available: || true` boot-
+  hangs: HTTP /health probe never returns, regardless of the
+  exact slot/page sizing. With `tso_available: || false` the
+  pool-split itself runs but TLS-over-TCP returns 0 req/s, while
+  HTTP/3 over UDP/QUIC works (TSO is bypassed there). The TCP
+  path emits a TSO+SEG descriptor pair on every send (the layer
+  unconditionally uses TSO when the driver advertises it),
+  including the small HTTP /health response — so any descriptor
+  bug in `submit_tx_tso` shows up as a complete TX-path
+  failure on the first packet.
+
+  Without serial-port-output access on the GCE VM (sandbox
+  permission is gated), narrowing further from "first TSO
+  send fails" requires either:
+    1. a dev path that surfaces the gve-side panic over an
+       HTTP `/diagnostic` endpoint (driver counters + last
+       descriptor bytes), or
+    2. tcpdump on the receive side (kvm-vm) to see what the
+       device emits, or
+    3. comparing wire bytes of a Linux gve TSO send against ours.
+
+  Implementation reverted to keep the validated GQI-fallback
+  + CSUM-offload state shippable. Resume TSO when one of the
+  above debug paths is in place.
