@@ -25,9 +25,9 @@ RX* — and tracks progress as we land them.
 |---|------|------|---|---|---|
 | 1 | Handler renders body | `body_iobuf` writer | 1× memcpy (dynamic content only) | — | Static literals are zero-copy |
 | 2 | Header build | `write_response_into_iobuf` | — | ~150 B memcpy | Into per-conn `header_storage` |
-| 3 | **TLS coalesce** | `TlsStream::send` loop | **1× memcpy** | — | Chain → scratch (5 B head + 16 KiB plaintext + 17 B tail) |
-| 4 | TLS encrypt + envelope | `seal_in_place` | 1× R/W (ChaCha20) + 1× R (Poly1305) | — | In place; header / type / tag written into scratch's reserved head/tail (item C ✓) |
-| 5 | **TCP frame build** | `send_segment` / `send_segment_from_cursor` | **1× memcpy** | 14 + 20 + 20 B headers + 2 checksums | Cursor → one stack buffer with full [ETH][IP][TCP][PAYLOAD] (item A ✓) |
+| 3 | ~~TLS coalesce~~ | — | — | — | Folded into step 4 — `TlsStream::send` fast-fast path encrypts directly into the driver's TX-pool big-slot (item TLS-direct ✓) |
+| 4 | TLS encrypt + envelope | `seal_chain_to_in_place` | 1× R/W (ChaCha20) + 1× R (Poly1305) | — | In place; chain → TX-slot fused encrypt (item C + D + TLS-direct ✓) |
+| 5 | **TCP frame build** | `try_send_tso` / `send_segment` | **0× extra memcpy** | 14 + 20 + 20 B headers + 1 cksum | Headers written into TX-slot prefix in place; payload already in slot from step 4 (TLS-direct ✓ + items A, B, G) |
 | 6 | ~~IPv4 wrap~~ | — | — | — | Folded into step 5 (item A ✓) |
 | 7 | ~~Ethernet wrap~~ | — | — | — | Folded into step 5 (item A ✓) |
 | 8 | ~~virtio-net submit memcpy~~ | — (item B ✓ for TCP, B2 ✓ for QUIC) | — | descriptor add + kick | Both TCP and QUIC write directly into the TX pool slot via `acquire_tx_buf` + `submit_tx` |
@@ -36,12 +36,13 @@ RX* — and tracks progress as we land them.
 | 11 | Wire | network stack | — | — | MTU, cwnd, RTT |
 | 12 | Browser RX | TLS decrypt + HTTP parse | symmetric to ours | — | Out of our control |
 
-Active per-byte memcpys on the **TCP TX** guest side: **2**
-(steps 3 — TLS coalesce, and 5 — TCP frame build into either the
-TX pool slot directly or a stack buffer). Down from 5 before
-items A, C, B. The TLS coalesce + TCP frame build are
-fundamental: the chain → contiguous-buffer copy is required to
-seal a TLS record over the chain bytes.
+Active per-byte memcpys on the **TCP TX** guest side: **1**
+(the fundamental encrypt R/W + Poly1305 read-only pass — the
+chain bytes flow plaintext-from-body_scratch → ciphertext-in-
+TX-slot in a single fused pass, with no intermediate
+stack buffer or scratch → slot copy). Down from 5 before items
+A, C, B, G, and the TLS-direct-encrypt commit. Same as the
+QUIC TX path's per-byte cost.
 
 ## Current path — QUIC (HTTPS over H3)
 
