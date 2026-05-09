@@ -7,31 +7,18 @@
 # built from the app's `port_forwards` attr, with env-var defaults
 # baked in per forward.
 #
-# Pass-through extras: any positional args the launcher receives are
-# forwarded to the runner verbatim, after the BUILD-baked port
-# flags. The canonical use case is `bazel run //app:foo_hvf --
-# --bootargs="quic.log=events"` to flip the in-guest log level
-# without rebuilding. `UNIKERNEL_BOOTARGS=…` is a friendlier
-# environment-variable alternative; specifying both means the env
-# var is appended first, then the explicit args.
+# Trailing `"$@"` forwards any positional args reaching the launcher
+# straight through to the runner, so e.g.
+#   bazel run //app:foo_hvf -- --bootargs="quic.log=events"
+# flips the in-guest log level without rebuilding.
 set -euo pipefail
 
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 IMG="$SELF_DIR/%IMG%"
 RUNNER="$SELF_DIR/%RUNNER%"
 
-EXTRA_ARGS=()
-if [ -n "${UNIKERNEL_BOOTARGS:-}" ]; then
-    EXTRA_ARGS+=("--bootargs=${UNIKERNEL_BOOTARGS}")
-fi
-
-## `"${EXTRA_ARGS[@]}"` is a "set -u"-safe expansion of a possibly-
-## empty array (bash 3.2 ships with macOS — `set -u` plus a bare
-## `"${EMPTY[@]}"` aborts with "unbound variable", `${EMPTY[@]+...}`
-## suppresses that). Same shape used in scripts/helpers.sh.
 exec "$RUNNER" "$IMG" \
     "--ram=${UNIKERNEL_MEMORY:-%DEFAULT_RAM%}" \
     "--cpus=${UNIKERNEL_CPUS:-%DEFAULT_CPUS%}" \
     %PORT_FLAGS% \
-    ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} \
     "$@"
