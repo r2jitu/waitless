@@ -732,6 +732,56 @@ E and F are low-effort cleanups that can land any time.
     page; our 1-page-per-slot model uses 256 pages and the
     device permits the overflow on every gVNIC variant tested.
 
+- **2026-05-09** — TX-path saturation + load-distribution
+  diagnostics (`52430d8`). Adds `NicDiagOps::tx_diag` ↦ JSON in
+  `/stats` so we can answer four questions live without
+  redeploying:
+
+  * **Are pool sizes saturating?**
+    `tx_small_full_spins` and `tx_big_full_returns` count every
+    pool-exhaustion event on the hot path. Stays at 0 for both
+    drivers under c3 4-vCPU bench (14 M small-pool acquires,
+    zero saturation events) — current sizing has plenty of
+    headroom.
+
+  * **Are linear scans expensive?**
+    `tx_small_acquires` × `tx_small_scan_iters` lets the reader
+    compute average scan depth on `[AtomicBool; N]` freelists.
+    HVF: 1.24. c3 GCE: 3.37 (out of 256 = 1.3% of pool). Linear
+    scan is effectively O(1) under measured loads — a real
+    freelist refactor isn't motivated yet; revisit if future
+    loads push avg depth into double digits.
+
+  * **Are pools dynamically sized?**
+    Not yet. virtio-net pool is per-worker fixed (64 small +
+    16 big). gve TX QPL is `TX_RING_ENTRIES = 256` slots. The
+    device advertises `tx_queue_entries` (and now
+    `tx_pages_per_qpl`) which we log but don't yet use to
+    drive runtime sizing. Future work: heap-allocate the per-qp
+    `slot_used` arrays from the device-advertised count rather
+    than the static `[AtomicBool; TX_RING_ENTRIES]` so a
+    different gVNIC variant doesn't quietly waste or under-provision
+    memory.
+
+  * **Is load spreading evenly?**
+    `tx_packets_per_qp[]` reveals the answer per run. c3 4-vCPU
+    bench:
+        qp 0: 25.3 %     qp 1: 21.6 %
+        qp 2: 17.3 %     qp 3: 36.4 %    (← 2.1× of qp 2)
+    Aggregate scaling still 4× (Remote 4c health_tls_max
+    189 188 req/s) so total throughput isn't lost — but the
+    hottest queue is 2× the load of the coldest. The bench
+    client (`kvm-vm`, single source IP, many parallel src
+    ports) hashes through the Microsoft Toeplitz key into our
+    `i % num_qp` indirection table; under that traffic shape
+    the key biases. Follow-up: try alternate keys + log a
+    chi-squared p-value alongside the per-qp counts.
+
+  Counter cost: one relaxed atomic per acquire / submit /
+  saturation event. Bench rerun after wiring counters
+  (health_tls_max 4c = 189 K) is within noise of the prior
+  pre-counter run (190 K) — instrumentation is free.
+
 - **2026-05-09** — gve TSO attempt (parked).
   TSO scaffolding implemented end-to-end (big-pool of 16×20 KiB
   slots carved from the same QPL, pool_id flag in driver_token,
