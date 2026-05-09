@@ -285,6 +285,14 @@ struct TxQueue {
     /// Flips each time `tx_compl_head` wraps. 0 in GQI mode.
     tx_compl_gen: AtomicU8,
 
+    /// Cumulative `fill_cnt` value at which we last set
+    /// `report_event` on a DQO descriptor. Used to gate the
+    /// 32-descriptor minimum spacing between RE flags
+    /// (`DQO_TX_RE_INTERVAL`) — required by the device per
+    /// `gve_desc_dqo.h`. GQI doesn't have RE; field is unused
+    /// in that mode.
+    last_re_at_fill: AtomicU32,
+
     // ---- Direct-fill (zero-copy) TX path (GQI_QPL only today) ----
     //
     // The QPL is indexed by `slot * PAGE_SIZE`; each slot is one
@@ -975,7 +983,20 @@ const RX_QPL_PAGES: u32 = RX_RING_ENTRIES as u32;
 const DQO_TX_DESC_SIZE: usize = 16;
 const DQO_TX_DTYPE_PKT: u8 = 0xC;
 const DQO_TX_FLAG_EOP: u8 = 1 << 5;
+/// `checksum_offload_enable` (byte 8 bit 6) — instructs the device
+/// to compute the L4 checksum host-side. Equivalent of virtio's
+/// NEEDS_CSUM. Per gve_desc_dqo.h.
+const DQO_TX_FLAG_CSUM: u8 = 1 << 6;
 const DQO_TX_FLAG_REPORT_EVENT: u8 = 1 << 7;
+/// `report_event` flags MUST be spaced at least this many TX
+/// descriptors apart per `gve_desc_dqo.h`'s GVE_TX_MIN_RE_INTERVAL
+/// (= 32). Linux's gve_tx_dqo bumps `last_re_idx` after setting RE
+/// and only sets it again once `interval >= 32`. Setting RE on
+/// every descriptor (which an earlier version of this driver did)
+/// stalls the device under sustained load: completions stop
+/// arriving and the per-qp ring saturates at fill_cnt - done_cnt
+/// = ring_entries.
+const DQO_TX_RE_INTERVAL: u32 = 32;
 
 /// DQO TX completion descriptor — 8 bytes (device-written).
 ///   0..2   header                         bits[10:0]=id, [13:11]=type,
@@ -984,6 +1005,11 @@ const DQO_TX_FLAG_REPORT_EVENT: u8 = 1 << 7;
 ///   4..8   reserved                       (LE32)
 const DQO_TX_COMPL_SIZE: usize = 8;
 const DQO_TX_COMPL_TYPE_PACKET: u8 = 0x2;
+/// Descriptor completion. Carries `tx_head` (= last desc fetched
+/// by HW + 1) at compl bytes 2-3 — the authoritative driver
+/// `done_cnt` value. Emitted in response to a `report_event` bit
+/// in the TX descriptor.
+const DQO_TX_COMPL_TYPE_DESC: u8 = 0x4;
 
 /// DQO RX buffer descriptor — 32 bytes (driver-written, points to a
 /// device-readable packet buffer).
@@ -1521,6 +1547,12 @@ fn finalize_tx_queue(qp: u32, alloc: &TxAlloc, fmt: QueueFormat) {
             // each ring wrap. Ring is initially zeroed (gen=0), so we
             // expect the first entry to read with gen=1.
             tx_compl_gen: AtomicU8::new(1),
+            // Initialise last_re_at_fill = -DQO_TX_RE_INTERVAL
+            // (wrapping). With fill_cnt starting at 0, the first
+            // submit's `interval = 0 - (-32) = 32` fires the
+            // `>= 32` check and sets RE — so the device's
+            // completion stream bootstraps on the first packet.
+            last_re_at_fill: AtomicU32::new(0u32.wrapping_sub(DQO_TX_RE_INTERVAL)),
             slot_used: [const { core::sync::atomic::AtomicBool::new(false) };
                 TX_RING_ENTRIES as usize],
         });
@@ -2004,23 +2036,27 @@ fn release_tx_slot(token: u64) {
 /// frame bytes; the descriptor's `seg_addr` references the slot's
 /// QPL page so the device DMAs from there.
 ///
-/// gve_tx_pkt_desc layout (16 bytes):
-///   u8  type_flags     (GVE_TXD_STD = 0)
-///   u8  l4_csum_offset (0 — no checksum offload)
-///   u8  l4_hdr_offset  (0)
+/// gve_tx_pkt_desc layout (16 bytes), per Linux gve_desc.h:
+///   u8  type_flags     (low 4 bits = type, upper 4 bits = flags;
+///                       type = GVE_TXD_STD (0x00); flags include
+///                       GVE_TXF_L4CSUM (bit 0))
+///   u8  l4_csum_offset (16-bit-WORD offset within L4 header to
+///                       the checksum field — TCP=8, UDP=3)
+///   u8  l4_hdr_offset  (16-bit-WORD offset of L4 header in
+///                       packet — Eth+IPv4 = 34/2 = 17)
 ///   u8  desc_cnt       (1 — single-segment packet)
 ///   u16 len            (be, total packet length)
 ///   u16 seg_len        (be, this segment length)
 ///   u64 seg_addr       (be, QPL byte offset in QPL mode)
+///
+/// `csum.is_some()` activates L4-CSUM offload: the device
+/// computes the L4 checksum at byte
+/// `l4_hdr_offset*2 + l4_csum_offset*2` of the frame.
 fn submit_tx_inner(
     handle: uni_net_driver::TxBufHandle,
     frame_len: usize,
-    _csum: uni_net_driver::CsumOffload,
+    csum: uni_net_driver::CsumOffload,
 ) {
-    // TODO: wire `_csum` to GQI's `l4_csum_offset` / `l4_hdr_offset`
-    // (gve_tx_pkt_desc bytes 1 and 2) + the GVE_TXF_L4CSUM type-flag
-    // bit when we have the spec confirmed. Today the caller
-    // computes the full checksum and stamps it; gve ships verbatim.
     let (qp, slot) = decode_token(handle.driver_token);
     // mem::forget skips Drop's `release_fn` — the slot is about
     // to be in-flight, not unused. `tx_drain` returns it to the
@@ -2049,6 +2085,19 @@ fn submit_tx_inner(
     let qpl_offset = (slot as u32) * PAGE_SIZE;
     let desc_ptr = (tx.ring_va as *mut u8).wrapping_add(ring_idx * TX_DESC_SIZE);
     let mut desc = [0u8; TX_DESC_SIZE];
+    // type_flags: GVE_TXD_STD (= 0x00) | GVE_TXF_L4CSUM (= 0x01)
+    // when offload is on. Linux uses the upper-4-bit type encoding
+    // (`(0x0 << 4) = GVE_TXD_STD`) plus low-bit flags.
+    desc[0] = if csum.is_some() { 0x01 /* GVE_TXF_L4CSUM */ } else { 0x00 };
+    if csum.is_some() {
+        // Both fields are in 16-bit-word units per the spec
+        // (`csum_offset >> 1`, `l4_hdr_offset >> 1` in Linux).
+        // The caller's `csum.start` is the byte offset of the L4
+        // header in the frame; `csum.offset` is the byte offset
+        // of the checksum field within the L4 header.
+        desc[1] = (csum.offset >> 1) as u8;
+        desc[2] = (csum.start >> 1) as u8;
+    }
     desc[3] = 1; // desc_cnt
     put_be16(&mut desc, 4, frame_len as u16);
     put_be16(&mut desc, 6, frame_len as u16);
@@ -2070,18 +2119,20 @@ fn submit_tx_inner(
 
 /// Public direct-fill TX entry — picks the calling worker's qp,
 /// scans for a free slot, returns a handle into the per-slot
-/// buffer (QPL page on GQI_QPL).
+/// QPL page (GQI_QPL).
 ///
 /// On DQO_RDA returns `None` so callers fall through to the
-/// slice-shaped `send` path. The DQO direct-fill code is in
-/// place (`acquire_tx_buf_dqo_for_qp` / `submit_tx_inner_dqo`)
-/// but observed to stall under sustained parallel load on c3
-/// — the same stall affects the legacy `send_on_qp_dqo` slice
-/// path, so it's a pre-existing DQO issue (suspected:
-/// completion-ring field-decode + deferred-kick interaction)
-/// rather than a regression in the direct-fill refactor.
-/// Tracked as a follow-up; needs GCE-c3-instance debugging
-/// with diagnostic counters.
+/// slice-shaped `send_on_qp_dqo` path. The DQO direct-fill
+/// implementation (`acquire_tx_buf_dqo_for_qp` /
+/// `submit_tx_inner_dqo`) is in place and applies all the
+/// spec-correct fixes derived from Linux's `gve_tx_dqo` (RE
+/// spaced ≥ 32 descriptors, DESC completion's `tx_head` drives
+/// `done_cnt`, `checksum_offload_enable` bit), but real-device
+/// validation on c3 still shows a stall under sustained
+/// parallel load even with these fixes — there's at least one
+/// more issue that needs on-host debugging (likely doorbell or
+/// completion-ring related) before we can ship DQO direct-fill.
+/// Tracked as a follow-up.
 fn acquire_tx_buf() -> Option<uni_net_driver::TxBufHandle> {
     if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
         return None;
@@ -2103,8 +2154,7 @@ fn submit_tx(
     csum: uni_net_driver::CsumOffload,
 ) {
     if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
-        let _ = csum; // TODO: wire DQO descriptor's csum offload bits
-        submit_tx_inner_dqo(handle, frame_len);
+        submit_tx_inner_dqo(handle, frame_len, csum);
     } else {
         submit_tx_inner(handle, frame_len, csum);
     }
@@ -2176,49 +2226,78 @@ fn doorbell_write_le(bar2_va: u64, offset: u32, value: u32) {
 }
 
 /// Drain the DQO TX completion ring up to the first entry whose
-/// generation bit doesn't match what we expect.
+/// generation bit doesn't match what we expect, then advance
+/// `done_cnt` to the device-reported `tx_head` from the last
+/// observed DESC completion.
 ///
 /// DQO TX-completion descriptor layout (8 bytes), per Linux's
-/// `gve_tx_compl_desc`:
-///   byte 0:   bit 7 = generation, bits 0..3 = type
-///   byte 1:   reserved
-///   bytes 2-3: compl_tag (LE u16) — informational
+/// `gve_tx_compl_desc` (gve_desc_dqo.h):
+///
+///   bytes 0-1: LE-bitfield u16
+///     bits  0..10 = id (compl_tag, for PKT/MISS/REINJECT compls;
+///                   queue ID for DESC compls — informational)
+///     bits 11..13 = type (DQO_TX_COMPL_TYPE_*)
+///     bit 14      = reserved
+///     bit 15      = generation
+///   bytes 2-3: union — `tx_head` (DESC compl) or
+///              `completion_tag` (PKT compl), LE u16
 ///   bytes 4-7: reserved
 ///
-/// (The pre-existing inline comment in this file claimed the
-/// generation bit was at hdr_word bit 15 and type at bits 11..13
-/// — i.e. inside the *reserved* byte 1. That misread caused
-/// `done_cnt` to never advance under sustained load, which froze
-/// the qp once `fill_cnt - done_cnt` reached `ring_entries`.
-/// Below-ring-entries traffic happened to work — DHCP didn't
-/// notice — but parallel HTTP load saturates the ring and
-/// stalls. Fixed here by reading byte 0 directly.)
+/// `tx_head` from a DESC completion is "the last descriptor
+/// fetched by HW plus one" (the authoritative driver `done_cnt`
+/// value). PKT/MISS/REINJECT completions only convey per-packet
+/// status — we don't need them for slot reuse since this driver
+/// uses the slot==ring_idx convention; ring positions cycle
+/// implicitly as `done_cnt` advances.
 fn tx_drain_dqo(tx: &TxQueue) {
     if tx.tx_compl_va == 0 || tx.tx_compl_entries == 0 { return; }
-    let mask = (tx.tx_compl_entries - 1) as u32;
+    let cmask = (tx.tx_compl_entries - 1) as u32;
+    let rmask = (tx.ring_entries - 1) as u32;
     let mut head = tx.tx_compl_head.load(Ordering::Relaxed);
     let mut cur_gen = tx.tx_compl_gen.load(Ordering::Relaxed);
-    let mut packets_done: u32 = 0;
+    let mut latest_tx_head: Option<u16> = None;
     loop {
-        let idx = (head & mask) as usize;
+        let idx = (head & cmask) as usize;
         let desc_ptr = (tx.tx_compl_va as *const u8).wrapping_add(idx * DQO_TX_COMPL_SIZE);
-        let type_status = unsafe { ptr::read_volatile(desc_ptr) };
-        let desc_gen = (type_status >> 7) & 1;
+        let hdr_word = u16::from_le_bytes([
+            unsafe { ptr::read_volatile(desc_ptr) },
+            unsafe { ptr::read_volatile(desc_ptr.add(1)) },
+        ]);
+        let desc_gen = ((hdr_word >> 15) & 1) as u8;
         if desc_gen != cur_gen { break; }
-        let cmpl_type = type_status & 0x0F;
-        if cmpl_type == DQO_TX_COMPL_TYPE_PACKET {
-            packets_done += 1;
+        let cmpl_type = ((hdr_word >> 11) & 0x7) as u8;
+        if cmpl_type == DQO_TX_COMPL_TYPE_DESC {
+            let tx_head = u16::from_le_bytes([
+                unsafe { ptr::read_volatile(desc_ptr.add(2)) },
+                unsafe { ptr::read_volatile(desc_ptr.add(3)) },
+            ]);
+            latest_tx_head = Some(tx_head);
         }
+        // PKT / MISS / REINJECTION completions: consume but
+        // don't act on them — slot reuse is keyed off DESC
+        // completions' tx_head.
         head = head.wrapping_add(1);
-        if (head & mask) == 0 {
+        if (head & cmask) == 0 {
             cur_gen ^= 1;
         }
     }
     tx.tx_compl_head.store(head, Ordering::Relaxed);
     tx.tx_compl_gen.store(cur_gen, Ordering::Relaxed);
-    if packets_done > 0 {
+    if let Some(tx_head) = latest_tx_head {
+        // Translate the device's u16 ring-position `tx_head` into
+        // an advance for our cumulative `done_cnt` (u32). Both
+        // `done_cnt`'s low ring-mask bits and `tx_head` index into
+        // the same ring; the delta between them (mod ring_entries)
+        // is the number of descriptors the device has fetched
+        // since our last drain.
+        let mask16 = rmask as u16;
         let prev = tx.done_cnt.load(Ordering::Relaxed);
-        tx.done_cnt.store(prev.wrapping_add(packets_done), Ordering::Relaxed);
+        let prev_low = (prev as u16) & mask16;
+        let tx_head_low = tx_head & mask16;
+        let delta = (tx_head_low.wrapping_sub(prev_low)) & mask16;
+        if delta > 0 {
+            tx.done_cnt.store(prev.wrapping_add(delta as u32), Ordering::Relaxed);
+        }
     }
 }
 
@@ -2250,11 +2329,19 @@ fn send_on_qp_dqo(qp: usize, data: &[u8]) -> bool {
     let buf_phys = tx.qpl_base_phys + buf_offset as u64;
     unsafe { ptr::copy_nonoverlapping(data.as_ptr(), buf_va, data.len()); }
 
-    // gve_tx_pkt_desc_dqo, 16 bytes, all LE.
+    // gve_tx_pkt_desc_dqo, 16 bytes, all LE. RE only every 32nd
+    // descriptor per the device's spec (`GVE_TX_MIN_RE_INTERVAL`).
+    let last_re = tx.last_re_at_fill.load(Ordering::Relaxed);
+    let want_re = fill_cnt.wrapping_sub(last_re) >= DQO_TX_RE_INTERVAL;
+    let mut flags = DQO_TX_DTYPE_PKT | DQO_TX_FLAG_EOP;
+    if want_re {
+        flags |= DQO_TX_FLAG_REPORT_EVENT;
+        tx.last_re_at_fill.store(fill_cnt, Ordering::Relaxed);
+    }
     let desc_ptr = (tx.ring_va as *mut u8).wrapping_add(slot * DQO_TX_DESC_SIZE);
     let mut desc = [0u8; DQO_TX_DESC_SIZE];
     desc[0..8].copy_from_slice(&buf_phys.to_le_bytes());
-    desc[8] = DQO_TX_DTYPE_PKT | DQO_TX_FLAG_EOP | DQO_TX_FLAG_REPORT_EVENT;
+    desc[8] = flags;
     desc[12..14].copy_from_slice(&(slot as u16).to_le_bytes());
     let size_word = (data.len() as u16) & 0x3FFF;
     desc[14..16].copy_from_slice(&size_word.to_le_bytes());
@@ -2336,12 +2423,22 @@ fn release_tx_slot_noop(_token: u64) {}
 ///
 /// gve_tx_pkt_desc_dqo (16 bytes, all LE):
 ///   0..8   buf_addr (DMA address)
-///   8      dtype (low 5 bits = 0xC) | EOP (bit5) | report_event (bit7)
-///   12..14 compl_tag (we use the slot index — informational; the
-///          driver no longer relies on it for slot reuse since
-///          slot==ring_idx is implicit via fill_cnt/done_cnt)
+///   8      dtype:5 | end_of_packet:1 | checksum_offload_enable:1 | report_event:1
+///   9      reserved
+///   10..12 reserved
+///   12..14 compl_tag (we use the slot index — informational)
 ///   14..16 buf_size (low 14 bits)
-fn submit_tx_inner_dqo(handle: uni_net_driver::TxBufHandle, frame_len: usize) {
+///
+/// `report_event` is gated to fire at most every
+/// `DQO_TX_RE_INTERVAL` (= 32) descriptors per the device's spec.
+/// `checksum_offload_enable` is set when the caller passed a
+/// non-NONE `CsumOffload` (caller stamped the pseudo-header
+/// partial sum at the L4 checksum field).
+fn submit_tx_inner_dqo(
+    handle: uni_net_driver::TxBufHandle,
+    frame_len: usize,
+    csum: uni_net_driver::CsumOffload,
+) {
     let (qp, slot) = decode_token(handle.driver_token);
     core::mem::forget(handle);
     if qp >= MAX_QUEUE_PAIRS || slot >= TX_RING_ENTRIES as usize {
@@ -2361,16 +2458,27 @@ fn submit_tx_inner_dqo(handle: uni_net_driver::TxBufHandle, frame_len: usize) {
     let buf_offset = (slot as u32) * (RX_BUFFER_SIZE as u32);
     let buf_phys = tx.qpl_base_phys + buf_offset as u64;
 
+    let fill_cnt = tx.fill_cnt.load(Ordering::Relaxed);
+    let last_re = tx.last_re_at_fill.load(Ordering::Relaxed);
+    let want_re = fill_cnt.wrapping_sub(last_re) >= DQO_TX_RE_INTERVAL;
+    let mut flags = DQO_TX_DTYPE_PKT | DQO_TX_FLAG_EOP;
+    if want_re {
+        flags |= DQO_TX_FLAG_REPORT_EVENT;
+        tx.last_re_at_fill.store(fill_cnt, Ordering::Relaxed);
+    }
+    if csum.is_some() {
+        flags |= DQO_TX_FLAG_CSUM;
+    }
+
     let desc_ptr = (tx.ring_va as *mut u8).wrapping_add(slot * DQO_TX_DESC_SIZE);
     let mut desc = [0u8; DQO_TX_DESC_SIZE];
     desc[0..8].copy_from_slice(&buf_phys.to_le_bytes());
-    desc[8] = DQO_TX_DTYPE_PKT | DQO_TX_FLAG_EOP | DQO_TX_FLAG_REPORT_EVENT;
+    desc[8] = flags;
     desc[12..14].copy_from_slice(&(slot as u16).to_le_bytes());
     let size_word = (frame_len as u16) & 0x3FFF;
     desc[14..16].copy_from_slice(&size_word.to_le_bytes());
     unsafe { ptr::copy_nonoverlapping(desc.as_ptr(), desc_ptr, DQO_TX_DESC_SIZE); }
 
-    let fill_cnt = tx.fill_cnt.load(Ordering::Relaxed);
     let new_fill = fill_cnt.wrapping_add(1);
     tx.fill_cnt.store(new_fill, Ordering::Release);
 
@@ -2687,10 +2795,18 @@ static GVE_OPS: NicOps = NicOps {
     // descriptor-side support yet; report unavailable so callers
     // do per-MSS segmentation as today.
     tso_available: || false,
-    // CSUM offload not yet wired through gve's descriptor (TODO:
-    // populate `l4_csum_offset` / `l4_hdr_offset` + the type-flag
-    // bit when GVE_TXF_L4CSUM is confirmed); caller computes the
-    // full checksum and stamps it.
+    // CSUM offload disabled: the descriptor bits are wired
+    // (GQI's `GVE_TXF_L4CSUM` + `l4_csum_offset` / `l4_hdr_offset`
+    // in 16-bit-word units; DQO's `checksum_offload_enable`
+    // byte-8 bit 6) per Linux's gve, but enabling it on n2
+    // (GQI_QPL) regresses health_max -19% / health_tls_max -28%
+    // — the device appears to interpret the partial-sum stamp
+    // differently from virtio-net. Suspect the gve hardware
+    // builds the pseudo-header itself from the IP header rather
+    // than reading the pre-stamped partial sum at csum_offset,
+    // so our partial-sum stamp produces a corrupted result.
+    // Needs investigation against a real GCE test bed; for now
+    // the caller computes the full checksum and gve ships it.
     csum_tx_offload: || false,
     acquire_tx_tso_buf: None,
     submit_tx_tso: None,
