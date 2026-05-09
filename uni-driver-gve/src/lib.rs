@@ -1254,12 +1254,32 @@ fn build_register_page_list_cmd(
 ///   u64 hash_key_addr (be, DMA)
 ///   u64 hash_lut_addr (be, DMA)
 fn build_configure_rss_cmd(num_qp: u32) -> Option<AdminqCommand> {
-    // Use Microsoft's standard Toeplitz RSS key. It's the
-    // well-tested 40-byte key every Linux / Windows NIC driver
-    // defaults to, and produces well-distributed hashes for
-    // realistic 4-tuples. Our first attempt used a synthetic key
+    // 40-byte Toeplitz RSS key. The default is Microsoft's
+    // standard key (every Linux / Windows NIC driver uses it),
+    // well-tested for realistic 4-tuples. Override at compile
+    // time with `--cfg=rss_key=symmetric` to use the symmetric
+    // form (`0x6d5a` repeated 20 times) — useful when the
+    // bench-client traffic shape is single-source-IP +
+    // many-ephemeral-ports, where the asymmetric MS key has
+    // surfaced 2× imbalance between hottest and coldest qp on
+    // c3 (see /stats `rx_chi_squared_x100`). The symmetric key
+    // gives identical hashes for both directions of a 4-tuple,
+    // which decorrelates the bias when one peer's port range
+    // is fixed.
+    //
+    // Our first attempt used a synthetic key
     // (`i * 0x9E3779B1 >> 24`) which happened to hash ~99 % of
-    // wrk's flows onto qp 0 on n2-highcpu-4.
+    // wrk's flows onto qp 0 on n2-highcpu-4 — kept as a
+    // cautionary tale in this comment.
+    #[cfg(rss_key = "symmetric")]
+    let key: [u8; RSS_KEY_SIZE] = [
+        0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a,
+        0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a,
+        0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a,
+        0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a,
+        0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a,
+    ];
+    #[cfg(not(rss_key = "symmetric"))]
     let key: [u8; RSS_KEY_SIZE] = [
         0x6d, 0x5a, 0x56, 0xda, 0x25, 0x5b, 0x0e, 0xc2,
         0x41, 0x67, 0x25, 0x3d, 0x43, 0xa3, 0x8f, 0xb0,

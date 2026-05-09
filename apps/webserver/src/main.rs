@@ -763,6 +763,44 @@ where
     let _ = w.write_str("]");
 }
 
+/// Pearson chi-squared statistic comparing `observed` to a uniform
+/// expected distribution: `Σ (O_i − E)² / E` where
+/// `E = total / observed.len()`. Returns the statistic ×100 so the
+/// consumer can treat it as a fixed-point value (no float pull).
+///
+/// Interpretation, with `df = observed.len() - 1`:
+///   * `chi² < 100·χ²_{0.95, df}`  → consistent with uniform.
+///     For df=3 (4 qps): χ²_{0.95, 3} = 7.815, so chi² < 781.
+///   * `chi² > 100·χ²_{0.999, df}` → highly skewed.
+///     For df=3: χ²_{0.999, 3} = 16.27, so chi² > 1627.
+///
+/// Returns 0 when there's no traffic (or only one bucket) — readers
+/// should treat 0 as "no data", not "perfectly balanced".
+fn rss_chi_squared_x100(observed: &[u64]) -> u64 {
+    let n = observed.len() as u64;
+    if n < 2 {
+        return 0;
+    }
+    let total: u64 = observed.iter().sum();
+    if total == 0 {
+        return 0;
+    }
+    let expected = total / n;
+    if expected == 0 {
+        // Every bucket is fractional; statistic isn't meaningful.
+        return 0;
+    }
+    let mut acc: u64 = 0;
+    for &o in observed {
+        let diff = if o > expected { o - expected } else { expected - o };
+        // (diff² / expected) — at bench scale (≤ 10⁷ packets/q),
+        // diff² fits in u64 with margin (10¹⁴ vs u64 max 1.8×10¹⁹).
+        let term = diff.saturating_mul(diff) / expected;
+        acc = acc.saturating_add(term);
+    }
+    acc.saturating_mul(100)
+}
+
 /// Per-queue RX frame counts + used-ring cursors + TX-side
 /// saturation/scan-depth/per-qp counters. Lets a monitoring agent
 /// or `/diagnostics` page see whether:
@@ -792,6 +830,14 @@ fn stats_response() -> Response {
         used_drv[i] = cursors[i].1;
     }
 
+    // RSS imbalance metric — chi-squared against a uniform expected
+    // distribution. `rx_chi_squared_x100` reflects how RSS spreads
+    // incoming flows (NIC-side hashing); `tx_chi_squared_x100`
+    // reflects how the worker→qp dispatch spreads outgoing packets.
+    // Both should be small under healthy load; rising values flag
+    // a hash-bias problem (RX) or a scheduler imbalance (TX).
+    let rx_chi = rss_chi_squared_x100(&counts[..nqp.min(counts.len())]);
+
     // 2 KiB body region — covers nqp ≤ 32 with TX/RX arrays + the
     // small set of saturation scalars and stays well under cap.
     let mut body = uni_http::body_iobuf(2048);
@@ -803,7 +849,8 @@ fn stats_response() -> Response {
         emit_json_array(&mut w, "rx_used_dev", &used_dev[..n]);
         let _ = w.write_str(",");
         emit_json_array(&mut w, "rx_used_drv", &used_drv[..n]);
-        let _ = write!(w, ",\"num_queue_pairs\":{}", nqp);
+        let _ = write!(w, ",\"num_queue_pairs\":{},\"rx_chi_squared_x100\":{}",
+                       nqp, rx_chi);
 
         if let Some(t) = tx {
             // Average scan depth: high values vs `small_pool_size`
@@ -815,15 +862,14 @@ fn stats_response() -> Response {
             } else {
                 0
             };
+            let tx_slice = &t.packets_per_qp[..nqp.min(t.packets_per_qp.len())];
+            let tx_chi = rss_chi_squared_x100(tx_slice);
             let _ = w.write_str(",");
-            emit_json_array(
-                &mut w,
-                "tx_packets",
-                &t.packets_per_qp[..nqp.min(t.packets_per_qp.len())],
-            );
+            emit_json_array(&mut w, "tx_packets", tx_slice);
             let _ = write!(
                 w,
-                ",\"tx_small_pool_size\":{},\
+                ",\"tx_chi_squared_x100\":{},\
+                  \"tx_small_pool_size\":{},\
                   \"tx_big_pool_size\":{},\
                   \"tx_small_acquires\":{},\
                   \"tx_small_scan_iters\":{},\
@@ -831,6 +877,7 @@ fn stats_response() -> Response {
                   \"tx_small_full_spins\":{},\
                   \"tx_big_acquires\":{},\
                   \"tx_big_full_returns\":{}",
+                tx_chi,
                 t.small_pool_size,
                 t.big_pool_size,
                 t.small_pool_acquires,
