@@ -616,18 +616,18 @@ class WebserverShutdownTest(unittest.TestCase):
         `Rc<Connection>` never dropped. Fixed by `mark_terminated`
         before the final `progress.set()` in `conn_task`.
 
-        The threshold below allows a small amount of background
-        Vec-capacity growth (existing pre-set_ready Vecs reallocing
-        during traffic — sub-kilobyte total, no new allocs) but
-        catches per-conn leaks (kilobytes per conn, multiple
-        allocations).
+        Aioquic-driven hammer: serial GETs only, no Chrome-specific
+        frame patterns (PRIORITY_UPDATE, QPACK encoder probes, etc.)
+        — see the Chrome residue bullet under item O in
+        `docs/tx-path-optimizations.md`. Currently lands at
+        delta=-55 allocs / -3680 bytes post-preinit, so this test
+        asserts strict `ok` (no `LEAK` line at all).
 
         Skips if `aioquic` isn't importable."""
         try:
             import aioquic  # noqa: F401
         except ImportError:
             self.skipTest("aioquic not installed")
-        import re
         buf = self._run_shutdown_scenario(
             port_offset=300, hammer=False, h3_hammer=True,
         )
@@ -639,26 +639,9 @@ class WebserverShutdownTest(unittest.TestCase):
             leak_line, "no HEAP_LEAK_CHECK line in serial log",
         )
         print(f"    {leak_line.decode(errors='replace')}", flush=True)
-        # `ok` lines have no `delta=…` — no leak, pass.
-        m = re.search(rb"delta=\+(\d+)B,\+(\d+)allocs", leak_line)
-        if m is None:
-            return
-        bytes_leaked = int(m.group(1))
-        allocs_leaked = int(m.group(2))
-        # Per-conn leak fingerprint: multiple allocations totalling
-        # kilobytes (the user's report was +10 allocs / +12251 bytes).
-        # The +0 / +sub-1KB shape is a separate Vec-growth issue
-        # tracked as a follow-up; allow it through here.
-        self.assertLessEqual(
-            allocs_leaked, 4,
-            f"H3-hammer leaked {allocs_leaked} new allocations "
-            f"({bytes_leaked} bytes) — per-conn cleanup regression "
-            f"({leak_line.decode(errors='replace')})",
-        )
-        self.assertLessEqual(
-            bytes_leaked, 1024,
-            f"H3-hammer leaked {bytes_leaked} bytes — beyond the "
-            f"~hundreds-of-bytes Vec-growth tolerance "
+        self.assertNotIn(
+            b"HEAP_LEAK_CHECK LEAK", leak_line,
+            "H3-hammer leaked memory — per-conn cleanup regression "
             f"({leak_line.decode(errors='replace')})",
         )
 
@@ -679,15 +662,22 @@ class WebserverShutdownTest(unittest.TestCase):
 
         User-reported leak in this exact shape was
         `delta=+12412B,+10allocs` after Chrome auto-refreshed
-        /diagnostics on a kept-open tab. Threshold below tracks the
-        per-conn-leak fingerprint.
+        /diagnostics on a kept-open tab. The cold-conn lazy-init
+        portion (~12 KB) was killed by `uni_tls::preinit` +
+        `huffman::warmup`; the small Chrome-specific residue that
+        survives is tracked under item O in
+        `docs/tx-path-optimizations.md` and only reproduces on
+        Chrome (not aioquic — see commit message for the smoking-
+        gun PRIORITY_UPDATE / QPACK-encoder-probe analysis).
+        Aioquic-driven persistent session lands at delta=-55
+        allocs / -3680 bytes post-preinit, so this test asserts
+        strict `ok` (no `LEAK` line at all).
 
         Skips if `aioquic` isn't importable."""
         try:
             import aioquic  # noqa: F401
         except ImportError:
             self.skipTest("aioquic not installed")
-        import re
         buf = self._run_shutdown_scenario(
             port_offset=400, hammer=False, h3_persistent=True,
         )
@@ -699,26 +689,10 @@ class WebserverShutdownTest(unittest.TestCase):
             leak_line, "no HEAP_LEAK_CHECK line in serial log",
         )
         print(f"    {leak_line.decode(errors='replace')}", flush=True)
-        m = re.search(rb"delta=\+(\d+)B,\+(\d+)allocs", leak_line)
-        if m is None:
-            return
-        bytes_leaked = int(m.group(1))
-        allocs_leaked = int(m.group(2))
-        # Same threshold as `test_ctrlc_h3_hammer_no_per_conn_leak`:
-        # tolerate the small unidentified Vec-growth leak (sub-1 KB,
-        # 0 net allocs); flag any per-conn shape (multi-alloc,
-        # kilobyte total).
-        self.assertLessEqual(
-            allocs_leaked, 4,
-            f"H3-persistent leaked {allocs_leaked} new allocations "
-            f"({bytes_leaked} bytes) — Connection didn't drop on "
-            f"force-shutdown ({leak_line.decode(errors='replace')})",
-        )
-        self.assertLessEqual(
-            bytes_leaked, 1024,
-            f"H3-persistent leaked {bytes_leaked} bytes — beyond the "
-            f"~hundreds-of-bytes Vec-growth tolerance "
-            f"({leak_line.decode(errors='replace')})",
+        self.assertNotIn(
+            b"HEAP_LEAK_CHECK LEAK", leak_line,
+            "H3-persistent leaked memory — Connection didn't drop "
+            f"on force-shutdown ({leak_line.decode(errors='replace')})",
         )
 
     def test_clean_shutdown_no_leak(self) -> None:

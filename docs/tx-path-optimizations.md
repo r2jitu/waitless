@@ -430,39 +430,32 @@ the work below.
 - **Risk**: medium.
 
 ### O. QUIC encode-side `Vec` recycling (H3 path)
-- **Status**: [ ] not started, after M
-- **Where**: per-frame and per-datagram encode sites in
-  `uni-quic/src/conn.rs` (already an `outbound_pool` for the
-  datagram-sized buffer at line 1011; per-frame Vecs are not
-  yet pooled).
-- **What**: H3 has 8 more allocs than H/1.1 per cold-conn
-  /diagnostics request, almost all from `Vec::with_capacity` in
-  the QUIC encode path. Same pooling pattern as M but at a
-  different layer: each `Vec` recycled through a per-conn (or
-  per-worker) free list. The existing `outbound_pool` provides
-  the template.
-- **Win**: -5..8 allocs per H3 request under load.
-- **Effort**: medium.
-- **Risk**: low.
-- **Connected leak signal** (2026-05-08): a Chrome
+- **Status**: [x] **effectively landed by Q (2026-05-08)** — the
+  per-packet staging Vecs that this item originally targeted
+  were removed when `encode_one_rtt_packet` was reshaped to
+  write directly into the datagram `out` buffer. The
+  remaining `Vec::with_capacity` sites in `encode_initial_packet`
+  / `encode_handshake_packet` fire only during conn handshake
+  (~4-8 allocs over a conn's lifetime, not per request).
+- **Verification**: `test_ctrlc_h3_persistent_session_no_leak`
+  (aioquic, ~10 serial GETs over a single H3 conn, ^C) lands
+  at delta=-55 allocs / -3680 bytes. `test_ctrlc_h3_hammer_no_per_conn_leak`
+  (8-worker H3 hammer, ~hundreds of conns, ^C) lands the same.
+  Both tests now assert strict `HEAP_LEAK_CHECK ok` (no LEAK
+  line at all) instead of the earlier ≤4 alloc cushion.
+- **Chrome residue (open, separate bug)**: a real Chrome
   refresh-spam session against `/diagnostics` over H3 leaks
-  +9 allocs / ~8 KiB at shutdown after a single conn (with
-  `huffman::warmup` + `uni_tls::preinit` already paying the
-  cold-conn lazy-init costs into baseline). Profile:
-  * First 3 requests on the conn: 0 alloc residue.
-  * Each subsequent request adds residue, plateauing at ~9
-    allocs / ~8 KiB regardless of total request count.
-  * `aioquic` doing serial GETs (the
-    `test_ctrlc_h3_persistent_session_no_leak` test rig)
-    doesn't reproduce — only Chrome's pipelining pattern hits it.
-  * `Connection::Drop` fires (the `conns_dropped` quic-event
-    confirms it), so whatever's leaking is owned by the
-    encode-side Vec pool family this item targets, not by
-    Connection itself. The shape "8 allocs of ~924 B average"
-    matches "per-frame staging Vecs in `encode_*_packet`"
-    almost exactly.
-  Doing O should make this leak go to zero deterministically.
-  Tracking here so a regression test slots in alongside the fix.
+  +9 allocs / ~8 KiB at shutdown — but only with Chrome, not
+  aioquic. The leak shape is "first 3 requests clean, plateau
+  at ~9 allocs after that," which doesn't match the encode-Vec
+  hypothesis. Smoking-gun candidates are Chrome-specific frame
+  patterns that aioquic doesn't send: PRIORITY_UPDATE on the
+  H3 control stream (RFC 9218), QPACK encoder-stream probes
+  (we negotiate capacity 0, but Chrome may still send insert
+  instructions we discard), or Chrome's PING/keepalive cadence.
+  Filed as a follow-up — small, bounded, won't gate the
+  remaining items in this plan. See the smoking-gun analysis
+  in commit message of the body_iobuf-scratch alignment.
 
 ## Recommended sequence
 
@@ -480,17 +473,20 @@ items until they unlock something concrete.
    writes directly into a TX pool slot via the `DatagramBuf::TxSlot`
    variant; reactor ships zero-copy via `send_via_tx_handle`. Heap
    fallback retained for pool exhaustion.
-7. **G** (TSO) — biggest single Tier 1 win once we benchmark on
-   KVM/GCE. Depends on B.
+7. ✓ **O** — effectively landed by Q (per-frame staging Vecs gone
+   on the steady-state path). Aioquic-driven H3 leak tests
+   tightened to strict `HEAP_LEAK_CHECK ok`. Chrome-specific
+   residue filed as a separate follow-up under the item bullet.
 8. **M** (conn-state pool) — the alloc-side equivalent of A+C;
    biggest *alloc-count* win whenever conn churn matters. Land
    any time after we have a conn-churn workload to bench against
    — local keep-alive bench won't show it.
-9. **N + O** — close out the alloc tail once M is in. (O is
-   partly mitigated by Q's headroom-prefix approach but the
-   per-frame staging Vecs in `encode_initial_packet` /
-   `encode_handshake_packet` remain — re-evaluate scope.)
-10. **J** (compression) + **K** (0-RTT) + **L** (Early Hints)
+9. **N** — conn-future + spawn-task pool. After M, since N's
+   wins compose on top of M's pooled conn-state lifetime.
+10. **G** (TSO) — biggest single Tier 1 win once we benchmark on
+    KVM/GCE. Depends on B; deferred until we're back on a Tier 1
+    bench cycle so we can validate end-to-end.
+11. **J** (compression) + **K** (0-RTT) + **L** (Early Hints)
     when we shift focus from local benchmarks to Internet-facing
     serving.
 
