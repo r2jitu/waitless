@@ -201,11 +201,31 @@ fn try_carve_scratch(cap: usize) -> Option<IOBuf> {
     })
 }
 
-/// Internal: install `body_storage` as the current handler's
-/// scratch slot. `handle_conn` calls this just before polling
-/// the handler and `clear_body_scratch` after the response is
-/// drained.
-fn install_body_scratch(buf: &mut [u8]) {
+/// Install `buf` as the current handler's body-scratch slot.
+/// Subsequent [`body_iobuf`] calls from inside the handler will
+/// carve sub-ranges out of `buf` instead of heap-allocating —
+/// turning the typical "render response body" path into zero
+/// allocations.
+///
+/// # Safety contract
+///
+/// `buf` must outlive every IOBuf carved from it. The IOBufs
+/// returned by `body_iobuf` are `IOBuf::External` references
+/// into `buf`'s storage; if `buf` is dropped while any of those
+/// IOBufs is still being read (e.g. queued in a transport
+/// SendStream), the IOBufs will dereference freed memory.
+///
+/// In practice the contract is upheld by the listener crates
+/// (`uni-http`, `uni-http3`) holding `buf` as a local in
+/// `handle_conn` so it lives for the conn's lifetime, calling
+/// `install_body_scratch` immediately before the handler future
+/// runs and `clear_body_scratch` immediately after the response
+/// has been fully queued onto the transport. The transport then
+/// drains the IOBufs onto the wire while `buf` is still alive.
+///
+/// Apps don't call this directly. The framework crate that
+/// dispatches request handlers does.
+pub fn install_body_scratch(buf: &mut [u8]) {
     let cc = CurrentWorker::enter();
     body_scratch_init();
     BODY_SCRATCH.with(&cc, |c| {
@@ -216,11 +236,11 @@ fn install_body_scratch(buf: &mut [u8]) {
     });
 }
 
-/// Internal: clear the body-scratch slot after the response
-/// is fully sent. Subsequent `body_iobuf` calls (e.g. from
-/// out-of-handler code) return `None` and fall back to fresh
-/// allocations.
-fn clear_body_scratch() {
+/// Clear the body-scratch slot after the handler returns.
+/// Subsequent [`body_iobuf`] calls (e.g. from out-of-handler
+/// code) return a fresh heap allocation rather than borrowing
+/// from a now-orphaned buffer. Idempotent.
+pub fn clear_body_scratch() {
     let cc = CurrentWorker::enter();
     body_scratch_init();
     BODY_SCRATCH.with(&cc, |c| {
