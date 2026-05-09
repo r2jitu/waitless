@@ -390,9 +390,14 @@ impl SlotTable {
         drop(map);
         let inbox = self.lookup(idx, generation);
         if inbox.is_none() {
-            // Conn died — drop the stale mapping so it doesn't
-            // pile up. We do this lazily here rather than scanning
-            // on every conn drop.
+            // Defense-in-depth eviction: `free_slot` already evicts
+            // entries pointing at slots it frees, so this branch
+            // shouldn't fire under the normal conn-drop path.
+            // Kept for the corner case where the slot's `Weak<ConnInbox>`
+            // failed to upgrade *before* `free_slot` ran (e.g. the
+            // conn task dropped its strong Rc but hasn't yet hit
+            // the `slots.free_slot(...)` line at the bottom of
+            // `conn_task`).
             self.initial_dcids.borrow_mut().remove(dcid);
         }
         inbox
@@ -522,6 +527,20 @@ impl SlotTable {
                 }
             }
         }
+        // Evict any initial_dcids entries pointing at this slot.
+        // The map's docstring promises "entries are evicted when
+        // the slot dies"; the previous lazy-on-miss-lookup path
+        // left orphan entries (Vec<u8> key + BTreeMap node) live
+        // forever for any DCID that wasn't queried again post-
+        // conn-drop. A linear walk is fine here: free_slot fires
+        // once per conn (rare relative to packet arrivals), and
+        // the map's working set is tiny — a Chrome PQ-CH session
+        // has ≤1 dcid registered per conn.
+        self.initial_dcids
+            .borrow_mut()
+            .retain(|_, (slot_idx, slot_gen)| {
+                !(*slot_idx == idx && *slot_gen == generation)
+            });
         // Push onto the free list. Don't bump generation here —
         // that happens on the next `allocate`, so reads racing
         // against a free-then-realloc cycle still see a coherent
