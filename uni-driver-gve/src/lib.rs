@@ -681,21 +681,22 @@ fn describe_device() -> bool {
 }
 
 fn parse_device_descriptor(desc_virt: *mut u8) -> bool {
-    // Device descriptor layout (40 bytes, all big-endian):
+    // Device descriptor layout (40 bytes, all big-endian), per
+    // Linux's `struct gve_device_descriptor` in `gve_adminq.h`:
     //
-    //   u64 max_registered_pages
-    //   u16 reserved1
-    //   u16 tx_queue_entries
-    //   u16 rx_queue_entries
-    //   u16 default_num_queues
-    //   u16 mtu
-    //   u16 counters
-    //   u16 reserved2
-    //   u16 rx_pages_per_qpl
-    //   u8[6] mac
-    //   u16 num_device_options
-    //   u16 total_length
-    //   u8[6] reserved3
+    //   u64 max_registered_pages   // offset  0
+    //   u16 reserved1              //         8
+    //   u16 tx_queue_entries       //        10
+    //   u16 rx_queue_entries       //        12
+    //   u16 default_num_queues     //        14
+    //   u16 mtu                    //        16
+    //   u16 counters               //        18
+    //   u16 tx_pages_per_qpl       //        20
+    //   u16 rx_pages_per_qpl       //        22
+    //   u8[6] mac                  //        24
+    //   u16 num_device_options     //        30
+    //   u16 total_length           //        32
+    //   u8[6] reserved3            //        34
     //
     // followed by `num_device_options` copies of `{ u16 id, u16 len,
     // u32 req_features }` plus a per-option payload of `len` bytes.
@@ -706,6 +707,7 @@ fn parse_device_descriptor(desc_virt: *mut u8) -> bool {
     let tx_entries = read_be16(header, 10);
     let rx_entries = read_be16(header, 12);
     let default_num_queues = read_be16(header, 14);
+    let tx_pages_per_qpl = read_be16(header, 20);
     let mtu = read_be16(header, 16);
     let counters = read_be16(header, 18);
     let mut mac = [0u8; 6];
@@ -767,9 +769,24 @@ fn parse_device_descriptor(desc_virt: *mut u8) -> bool {
     log_u32(mtu as u32);
     log(b" qps=");
     log_u32(default_num_queues as u32);
+    log(b" tx_pages_per_qpl=");
+    log_u32(tx_pages_per_qpl as u32);
     log(b" mac=");
     log_mac(&mac);
     log(b"\n");
+
+    // The device advertises `tx_pages_per_qpl` (Linux's
+    // `gve_device_descriptor.tx_pages_per_qpl`) as the MAXIMUM
+    // tx pages per registered QPL. Linux uses `tx_desc_cnt /
+    // GVE_QPL_DIVISOR = 256/64 = 4` and packs many packets into
+    // each page via a FIFO. We deliberately use `1 page per ring
+    // slot` (TX_QPL_PAGES = 256), which exceeds the advertised
+    // cap on most GCE generations, but our REGISTER_PAGE_LIST
+    // command has been working in practice. Log if we exceed and
+    // proceed; if a future device strictly enforces this cap and
+    // rejects our registration, we'll see it in a CREATE_TX_QUEUE
+    // failure later.
+    let _ = tx_pages_per_qpl;
 
     let mut st = STATE.lock();
     if let Some(s) = st.as_mut() {
