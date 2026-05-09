@@ -444,6 +444,25 @@ the work below.
 - **Win**: -5..8 allocs per H3 request under load.
 - **Effort**: medium.
 - **Risk**: low.
+- **Connected leak signal** (2026-05-08): a Chrome
+  refresh-spam session against `/diagnostics` over H3 leaks
+  +9 allocs / ~8 KiB at shutdown after a single conn (with
+  `huffman::warmup` + `uni_tls::preinit` already paying the
+  cold-conn lazy-init costs into baseline). Profile:
+  * First 3 requests on the conn: 0 alloc residue.
+  * Each subsequent request adds residue, plateauing at ~9
+    allocs / ~8 KiB regardless of total request count.
+  * `aioquic` doing serial GETs (the
+    `test_ctrlc_h3_persistent_session_no_leak` test rig)
+    doesn't reproduce — only Chrome's pipelining pattern hits it.
+  * `Connection::Drop` fires (the `conns_dropped` quic-event
+    confirms it), so whatever's leaking is owned by the
+    encode-side Vec pool family this item targets, not by
+    Connection itself. The shape "8 allocs of ~924 B average"
+    matches "per-frame staging Vecs in `encode_*_packet`"
+    almost exactly.
+  Doing O should make this leak go to zero deterministically.
+  Tracking here so a regression test slots in alongside the fix.
 
 ## Recommended sequence
 
