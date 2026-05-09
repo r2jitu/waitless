@@ -637,3 +637,65 @@ E and F are low-effort cleanups that can land any time.
   encrypt R/W pass), matching post-B TCP. Bench HVF
   health_tls_max 1c steady at ~108 k req/s; QUIC integration
   test green (`test_hvf`, `test_mc_hvf`).
+
+- **2026-05-09** — Multi-driver TX-path overhaul
+  (`78bfc60`...`a301ef0`):
+
+  * **`uni-http`**: per-worker TLS record scratch (cfg-gated
+    bare-metal) — caps the 16 KiB per-conn future state at one
+    worker-static buffer regardless of conn count. Removes the
+    broken `TlsConn` trait defaults that made
+    `send_app_data_chain_to` look like it ignored its `dst`.
+    `body_iobuf` headroom cleanup (chain prepend supersedes it).
+
+  * **`net::tcp`**: `async_try_send_chain` uses TSO
+    unconditionally when the driver advertises it (was gated
+    `total > mss`, missed the per-segment CSUM offload win on
+    sub-MSS sends). `build_and_send_frame` simplified down to
+    one direct-fill path; slice-shaped fallback retained for
+    drivers that don't expose direct-fill.
+
+  * **`uni-driver-virtio-net`**: TX pool is now per-worker
+    (`WorkerTxPool` indexed by worker id) regardless of
+    `num_queue_pairs`. On Tier 2 (single shared qp + multi-core)
+    slot allocation stays lock-free; only the virtq submit step
+    takes `TX_LOCK`. `acquire_tx_buf` spin-drains on full pool.
+    The legacy SPSC staging-ring path is retired.
+
+  * **`net+drivers`**: `NicOps` gains `csum_tx_offload` +
+    `csum_stamp_convention` query. `CsumOffload { start, offset }`
+    rides on `submit_tx`. New `tcp_pseudo_partial` helper for
+    pre-stamping. virtio-net wires `NEEDS_CSUM` for TCP control
+    + per-MSS data fallback + UDP / QUIC datagrams (HVF
+    `diagnostics_tls_max` +10%). Two stamp conventions
+    encoded:
+    `PseudoHeaderPartial` (virtio) and `Zero` (gve).
+
+  * **`uni-driver-gve`**: direct-fill TX path for GQI_QPL
+    (validated on n2-highcpu-4 / GVNIC). DQO_RDA implementation
+    exists with the spec-correct fixes from Linux's
+    `gve_tx_dqo` (RE spaced ≥ 32 descs per
+    `GVE_TX_MIN_RE_INTERVAL`; DESC completion's `tx_head`
+    drives `done_cnt` instead of per-PKT counts), but is gated
+    off (`acquire_tx_buf` returns `None` on DQO) — c3-standard-4
+    still stalls under sustained parallel load even with the
+    fixes. CSUM-offload bits are wired into both modes
+    (`GVE_TXF_L4CSUM` for GQI; `checksum_offload_enable` byte-8
+    bit 6 for DQO) but `csum_tx_offload` returns `false`:
+    enabling regresses health_max -19/-32% across both stamp
+    conventions, suggesting either an unnegotiated adminq
+    feature or a different `type_flags` bit encoding than Linux's
+    docs imply. Both gates flip on with one-line changes once
+    debugged.
+
+  GCE deploy/bench validation via `deploy-gcloud.sh`
+  (`unikernel-webserver-image` on n2 + c3) and
+  `gcp-deploy-bench.sh`. n2 `health_max` 469K req/s the first
+  bench session, ~322K subsequently — variance attributed to
+  GCE network. Both VMs stopped between iterations to keep
+  spend trivial.
+
+  Open follow-ups: gve DQO direct-fill stall (needs on-host
+  diagnostic counters); gve CSUM-offload negotiation; gve TSO
+  (multi-descriptor with separate big QPL — substantial chunk
+  of work, not started).
