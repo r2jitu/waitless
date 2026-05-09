@@ -74,7 +74,7 @@ where
     // HEAP_BASELINE snapshot rather than the first request's
     // alloc delta. Two contributors:
     //
-    //   * `huffman::warmup` builds the QPACK static Huffman
+    //   * `huffman::preinit` builds the QPACK static Huffman
     //     decoder tree (~4 KiB Vec) that's otherwise allocated
     //     on the first decoded request header.
     //   * `uni_quic::preinit` (which delegates to uni_tls)
@@ -86,7 +86,7 @@ where
     // Without these the post-shutdown leak check has to tolerate
     // a fixed cushion (~12 KiB / ~10 allocs in measurements
     // before this lands); with them it can demand `delta == 0`.
-    crate::huffman::warmup();
+    crate::huffman::preinit();
     uni_quic::preinit();
 
     let handler = Arc::new(handler);

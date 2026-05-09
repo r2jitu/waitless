@@ -209,7 +209,7 @@ pub fn seal(
 /// On `Ok`, `dst.data()` is the wire-ready record:
 /// `[5 record header || N ciphertext || encrypted type byte || 16 tag]`.
 /// `traffic_key.seq` advances.
-pub fn seal_chain_to_in_place(
+pub fn seal_chain_to(
     traffic_key: &mut tls::TrafficKey,
     inner_type: u8,
     src_chain: &uni_iobuf::IOBufChain,
@@ -554,11 +554,11 @@ mod tests {
         assert_eq!(consumed, n);
     }
 
-    /// `seal_chain_to_in_place` produces wire bytes that round-trip
+    /// `seal_chain_to` produces wire bytes that round-trip
     /// cleanly through `open`, including the multi-part Poly1305
     /// block-straddle carry path.
     #[test]
-    fn seal_chain_to_in_place_roundtrip() {
+    fn seal_chain_to_roundtrip() {
         let secret = [0xa5u8; 32];
         let mut sender = tls::TrafficKey::from_secret(&secret);
         let mut receiver = tls::TrafficKey::from_secret(&secret);
@@ -588,7 +588,7 @@ mod tests {
             0,
         );
 
-        seal_chain_to_in_place(
+        seal_chain_to(
             &mut sender,
             content_type::APPLICATION_DATA,
             &src_chain,

@@ -141,7 +141,10 @@ static mut TREE: Option<Tree> = None;
 /// — without this, the first H3 request charges the alloc to
 /// the leak-check delta as a one-time first-use cost and trips
 /// `HEAP_LEAK_CHECK LEAK` for tests that run a single conn.
-pub fn warmup() {
+///
+/// Paired with [`uni_tls::preinit`] / [`uni_quic::preinit`] —
+/// same deterministic-startup contract.
+pub fn preinit() {
     let _ = ensure_tree();
 }
 

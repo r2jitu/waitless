@@ -500,7 +500,7 @@ impl TlsServer {
             .server_ap_tk
             .as_mut()
             .ok_or(HandshakeError::Internal)?;
-        record::seal_chain_to_in_place(
+        record::seal_chain_to(
             tk,
             content_type::APPLICATION_DATA,
             src_chain,
