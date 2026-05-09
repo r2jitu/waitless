@@ -344,6 +344,80 @@ enum IpFamily {
     V6,
 }
 
+/// Source/destination IP-address pair, family-tagged. Pairs the
+/// addresses with their family so `write_tcp_frame*` can branch
+/// internally on a single argument instead of every call site
+/// having a `match family { V4 => ..., V6 => ... }` block.
+#[derive(Clone, Copy)]
+enum IpAddrPair {
+    V4 { src: [u8; 4], dst: [u8; 4] },
+    V6 { src: [u8; 16], dst: [u8; 16] },
+}
+
+impl IpAddrPair {
+    /// Length of the IP header on the wire — 20 (v4) or 40 (v6).
+    #[inline]
+    fn ip_hdr_len(&self) -> usize {
+        match self {
+            IpAddrPair::V4 { .. } => 20,
+            IpAddrPair::V6 { .. } => 40,
+        }
+    }
+
+    /// Ethertype field (host order) for the L2 header.
+    #[inline]
+    fn ethertype(&self) -> u16 {
+        match self {
+            IpAddrPair::V4 { .. } => 0x0800,
+            IpAddrPair::V6 { .. } => 0x86dd,
+        }
+    }
+
+    /// Write the IP header into `buf[..ip_hdr_len()]`. `tcp_len` is
+    /// `TCP header + payload` bytes — the v4 header's `total_length`
+    /// includes itself + tcp_len, while v6's `payload_length` is
+    /// just tcp_len. Caller must zero/initialise the rest of `buf`
+    /// (TCP header, payload) separately.
+    fn write_ip_header(&self, buf: &mut [u8], tcp_len: usize) {
+        match *self {
+            IpAddrPair::V4 { src, dst } => {
+                buf[0] = 0x45;
+                buf[1] = 0;
+                let ip_total = (20 + tcp_len) as u16;
+                buf[2..4].copy_from_slice(&ip_total.to_be_bytes());
+                buf[4..8].copy_from_slice(&[0, 0, 0x40, 0]);
+                buf[8] = 64; // TTL
+                buf[9] = 6;  // protocol = TCP
+                buf[10..12].fill(0); // checksum placeholder
+                buf[12..16].copy_from_slice(&src);
+                buf[16..20].copy_from_slice(&dst);
+                let cs = ipv4_checksum(&buf[..20]);
+                buf[10] = (cs >> 8) as u8;
+                buf[11] = (cs & 0xff) as u8;
+            }
+            IpAddrPair::V6 { src, dst } => {
+                buf[..4].copy_from_slice(&0x6000_0000u32.to_be_bytes());
+                buf[4..6].copy_from_slice(&(tcp_len as u16).to_be_bytes());
+                buf[6] = 6;  // next_header = TCP
+                buf[7] = 64; // hop limit
+                buf[8..24].copy_from_slice(&src);
+                buf[24..40].copy_from_slice(&dst);
+            }
+        }
+    }
+
+    /// Compute the TCP checksum over `tcp_seg` (TCP header + payload)
+    /// using the family-correct pseudo-header form. v4 uses
+    /// `tcp_checksum`'s pseudo-header; v6 uses the
+    /// `next_header = TCP` form.
+    fn tcp_checksum(&self, tcp_seg: &[u8]) -> u16 {
+        match self {
+            IpAddrPair::V4 { src, dst } => tcp_checksum(src, dst, tcp_seg),
+            IpAddrPair::V6 { src, dst } => ipv6_pseudo_checksum(src, dst, 6, tcp_seg),
+        }
+    }
+}
+
 /// Per-vCPU IoState. One per vCPU; lives in `VCPU_IOS` and is locked
 /// only by the vCPU thread that owns it. TCP listen fds live in the
 /// shared `LISTENS` slice and every vCPU adds them to its own
@@ -1161,14 +1235,13 @@ fn poll_worker_iteration(
             }
             let payload_len = n as usize;
 
-            let total = match cs.family {
-                IpFamily::V4 => write_tcp_frame_around_payload(
-                    guest_buf, &GUEST_MAC, GW_IP, VM_IP,
-                    cs.port, cs.guest_port, cs.seq, cs.ack, 0x18, payload_len),
-                IpFamily::V6 => write_tcp_frame_v6_around_payload(
-                    guest_buf, &GUEST_MAC, &GW_IPV6, &VM_IPV6,
-                    cs.port, cs.guest_port, cs.seq, cs.ack, 0x18, payload_len),
+            let addrs = match cs.family {
+                IpFamily::V4 => IpAddrPair::V4 { src: GW_IP, dst: VM_IP },
+                IpFamily::V6 => IpAddrPair::V6 { src: GW_IPV6, dst: VM_IPV6 },
             };
+            let total = write_tcp_frame_around_payload(
+                guest_buf, &GUEST_MAC, &addrs,
+                cs.port, cs.guest_port, cs.seq, cs.ack, 0x18, payload_len);
 
             let used_idx = io.rx_last;
             unsafe {
@@ -1440,17 +1513,16 @@ fn inject_data_frames(c: &mut ProxyConn, data: &[u8], mac: &[u8; 6],
         IpFamily::V4 => 1460,
         IpFamily::V6 => 1440,
     };
+    let addrs = match c.family {
+        IpFamily::V4 => IpAddrPair::V4 { src: GW_IP, dst: VM_IP },
+        IpFamily::V6 => IpAddrPair::V6 { src: GW_IPV6, dst: VM_IPV6 },
+    };
     let mut off = 0;
     while off < data.len() {
         let chunk = (data.len() - off).min(max_chunk);
-        let len = match c.family {
-            IpFamily::V4 => write_tcp_frame(frame_buf, mac, GW_IP, VM_IP,
-                c.src_port, c.guest_port, c.my_seq, c.peer_ack, 0x18,
-                &data[off..off + chunk]),
-            IpFamily::V6 => write_tcp_frame_v6(frame_buf, mac, &GW_IPV6, &VM_IPV6,
-                c.src_port, c.guest_port, c.my_seq, c.peer_ack, 0x18,
-                &data[off..off + chunk]),
-        };
+        let len = write_tcp_frame(frame_buf, mac, &addrs,
+            c.src_port, c.guest_port, c.my_seq, c.peer_ack, 0x18,
+            &data[off..off + chunk]);
         c.my_seq = c.my_seq.wrapping_add(chunk as u32);
         off += chunk;
         inject_frame(&frame_buf[..len], snap, rx_last);
@@ -2122,68 +2194,74 @@ fn build_grat_arp_frame(mac: &[u8; 6]) -> TxFrame {
 
 /// Write a TCP frame into `buf`. Returns the total frame length.
 /// Header layout: [virtio_net_hdr 12B][Eth 14B][IP 20B][TCP 20B][payload]
-fn write_tcp_frame(buf: &mut [u8], dst_mac: &[u8; 6], src_ip: [u8; 4], dst_ip: [u8; 4],
+// ---- Family-aware TCP reply builders ----------------------------------------
+//
+// These three functions previously existed as v4/v6 pairs (eight
+// functions total). The IP-header section is the only genuinely
+// family-specific part — the virtio-net-hdr, Ethernet header, and
+// TCP header layouts are identical between families. So we
+// factored the family branch into `IpAddrPair` (above) and have
+// one function each for: write-full-frame, write-headers-around-
+// pre-populated-payload, and the TxFrame wrapper.
+
+/// Write a complete TCP reply frame:
+///   `[virtio_net_hdr 12 B][Eth 14 B][IP 20|40 B][TCP 20 B][payload]`
+/// into `buf` starting at offset 0 and return the byte count
+/// written. `addrs` selects v4 vs v6 layout + checksum form;
+/// `dst_mac` is the guest MAC (we always use `GW_MAC` as source).
+fn write_tcp_frame(buf: &mut [u8], dst_mac: &[u8; 6], addrs: &IpAddrPair,
     src_port: u16, dst_port: u16, seq: u32, ack: u32,
     flags: u8, payload: &[u8]) -> usize {
     let tcp_len = 20 + payload.len();
-    let ip_total = 20 + tcp_len;
-    let total = VIRTIO_NET_HDR_SIZE + 14 + ip_total;
+    let total = VIRTIO_NET_HDR_SIZE + 14 + addrs.ip_hdr_len() + tcp_len;
     debug_assert!(total <= buf.len());
 
-    // Virtio-net header (12 zero bytes).
+    // virtio-net header (12 zero bytes) + Ethernet header.
     buf[..VIRTIO_NET_HDR_SIZE].fill(0);
     let mut o = VIRTIO_NET_HDR_SIZE;
+    buf[o..o + 6].copy_from_slice(dst_mac); o += 6;
+    buf[o..o + 6].copy_from_slice(&GW_MAC); o += 6;
+    buf[o..o + 2].copy_from_slice(&addrs.ethertype().to_be_bytes()); o += 2;
 
-    // Ethernet header.
-    buf[o..o+6].copy_from_slice(dst_mac); o += 6;
-    buf[o..o+6].copy_from_slice(&GW_MAC); o += 6;
-    buf[o..o+2].copy_from_slice(&0x0800u16.to_be_bytes()); o += 2;
+    // IP header (family-specific layout + v4 csum).
+    let ip_len = addrs.ip_hdr_len();
+    addrs.write_ip_header(&mut buf[o..o + ip_len], tcp_len);
+    o += ip_len;
 
-    // IPv4 header.
-    let is = o;
-    buf[o] = 0x45; buf[o+1] = 0; o += 2;
-    buf[o..o+2].copy_from_slice(&(ip_total as u16).to_be_bytes()); o += 2;
-    buf[o..o+4].copy_from_slice(&[0,0,0x40,0]); o += 4;
-    buf[o] = 64; buf[o+1] = 6; o += 2;
-    buf[o..o+2].fill(0); o += 2; // checksum placeholder
-    buf[o..o+4].copy_from_slice(&src_ip); o += 4;
-    buf[o..o+4].copy_from_slice(&dst_ip); o += 4;
-    let cs = ipv4_checksum(&buf[is..is+20]);
-    buf[is+10] = (cs >> 8) as u8; buf[is+11] = (cs & 0xff) as u8;
-
-    // TCP header.
+    // TCP header + payload (identical layout across families).
     let ts = o;
-    buf[o..o+2].copy_from_slice(&src_port.to_be_bytes()); o += 2;
-    buf[o..o+2].copy_from_slice(&dst_port.to_be_bytes()); o += 2;
-    buf[o..o+4].copy_from_slice(&seq.to_be_bytes()); o += 4;
-    buf[o..o+4].copy_from_slice(&ack.to_be_bytes()); o += 4;
-    buf[o] = 0x50; buf[o+1] = flags; o += 2;
-    buf[o..o+2].copy_from_slice(&0xffffu16.to_be_bytes()); o += 2;
-    buf[o..o+4].fill(0); o += 4; // checksum + urgent ptr
-    buf[o..o+payload.len()].copy_from_slice(payload);
-    let tc = tcp_checksum(&src_ip, &dst_ip, &buf[ts..ts+tcp_len]);
-    buf[ts+16] = (tc >> 8) as u8; buf[ts+17] = (tc & 0xff) as u8;
+    write_tcp_header(&mut buf[o..o + 20], src_port, dst_port, seq, ack, flags);
+    o += 20;
+    buf[o..o + payload.len()].copy_from_slice(payload);
 
+    // Family-correct pseudo-header checksum over [TCP-hdr || payload].
+    let cksum = addrs.tcp_checksum(&buf[ts..ts + tcp_len]);
+    buf[ts + 16..ts + 18].copy_from_slice(&cksum.to_be_bytes());
     total
 }
 
-/// Write TCP frame headers around payload already at buf[66..66+payload_len].
-/// The payload was read() directly into guest RAM; we just write headers before it.
+/// Like `write_tcp_frame` but the payload is already at
+/// `buf[hdr_total..hdr_total+payload_len]` (read(2) dropped it
+/// straight into guest RAM). Only the prefix headers are written
+/// here, then the TCP checksum is patched over header + payload.
 /// Returns total frame length.
 fn write_tcp_frame_around_payload(buf: *mut u8, dst_mac: &[u8; 6],
-    src_ip: [u8; 4], dst_ip: [u8; 4], src_port: u16, dst_port: u16,
+    addrs: &IpAddrPair, src_port: u16, dst_port: u16,
     seq: u32, ack: u32, flags: u8, payload_len: usize) -> usize {
     let tcp_len = 20 + payload_len;
-    let ip_total = 20 + tcp_len;
-    let total = VIRTIO_NET_HDR_SIZE + 14 + ip_total;
-    // Write into guest RAM via raw pointer (payload is already there).
-    let b = unsafe { std::slice::from_raw_parts_mut(buf, VIRTIO_NET_HDR_SIZE + 14 + 20 + 20) };
-    write_tcp_frame_headers(b, dst_mac, src_ip, dst_ip, src_port, dst_port,
-        seq, ack, flags, ip_total);
-    // Compute TCP checksum over header + payload.
-    let tcp_start = VIRTIO_NET_HDR_SIZE + 14 + 20;
+    let hdr_total = VIRTIO_NET_HDR_SIZE + 14 + addrs.ip_hdr_len() + 20;
+    let total = hdr_total + payload_len;
+    // Write headers via a scoped slice over the prefix region only;
+    // payload bytes live past it and were placed there by the
+    // caller's read(2). SAFETY: caller guarantees `buf[..hdr_total
+    // + payload_len]` is a valid mutable region in guest RAM.
+    let prefix = unsafe { std::slice::from_raw_parts_mut(buf, hdr_total) };
+    write_tcp_headers_only(prefix, dst_mac, addrs, src_port, dst_port,
+                           seq, ack, flags, tcp_len);
+    // Patch the TCP checksum over [TCP-hdr || payload].
+    let tcp_start = VIRTIO_NET_HDR_SIZE + 14 + addrs.ip_hdr_len();
     let tcp_seg = unsafe { std::slice::from_raw_parts(buf.add(tcp_start), tcp_len) };
-    let tc = tcp_checksum(&src_ip, &dst_ip, tcp_seg);
+    let tc = addrs.tcp_checksum(tcp_seg);
     unsafe {
         *buf.add(tcp_start + 16) = (tc >> 8) as u8;
         *buf.add(tcp_start + 17) = (tc & 0xff) as u8;
@@ -2191,155 +2269,63 @@ fn write_tcp_frame_around_payload(buf: *mut u8, dst_mac: &[u8; 6],
     total
 }
 
-/// Write just the headers (virtio + eth + ip + tcp) into buf[..66].
-/// Does NOT write payload (caller handles that). Sets checksum placeholders.
-fn write_tcp_frame_headers(buf: &mut [u8], dst_mac: &[u8; 6],
-    src_ip: [u8; 4], dst_ip: [u8; 4], src_port: u16, dst_port: u16,
-    seq: u32, ack: u32, flags: u8, ip_total: usize) {
-    buf[..VIRTIO_NET_HDR_SIZE].fill(0);
-    let mut o = VIRTIO_NET_HDR_SIZE;
-    buf[o..o+6].copy_from_slice(dst_mac); o += 6;
-    buf[o..o+6].copy_from_slice(&GW_MAC); o += 6;
-    buf[o..o+2].copy_from_slice(&0x0800u16.to_be_bytes()); o += 2;
-    let is = o;
-    buf[o] = 0x45; buf[o+1] = 0; o += 2;
-    buf[o..o+2].copy_from_slice(&(ip_total as u16).to_be_bytes()); o += 2;
-    buf[o..o+4].copy_from_slice(&[0,0,0x40,0]); o += 4;
-    buf[o] = 64; buf[o+1] = 6; o += 2;
-    buf[o..o+2].fill(0); o += 2;
-    buf[o..o+4].copy_from_slice(&src_ip); o += 4;
-    buf[o..o+4].copy_from_slice(&dst_ip); o += 4;
-    let cs = ipv4_checksum(&buf[is..is+20]);
-    buf[is+10] = (cs >> 8) as u8; buf[is+11] = (cs & 0xff) as u8;
-    buf[o..o+2].copy_from_slice(&src_port.to_be_bytes()); o += 2;
-    buf[o..o+2].copy_from_slice(&dst_port.to_be_bytes()); o += 2;
-    buf[o..o+4].copy_from_slice(&seq.to_be_bytes()); o += 4;
-    buf[o..o+4].copy_from_slice(&ack.to_be_bytes()); o += 4;
-    buf[o] = 0x50; buf[o+1] = flags; o += 2;
-    buf[o..o+2].copy_from_slice(&0xffffu16.to_be_bytes()); o += 2;
-    buf[o..o+4].fill(0); // checksum + urgent (filled later)
+/// Write the TCP-only header (20 B) at `buf[..20]`, leaving the
+/// checksum field zeroed for the caller to patch once payload is
+/// in place.
+#[inline]
+fn write_tcp_header(buf: &mut [u8], src_port: u16, dst_port: u16,
+                    seq: u32, ack: u32, flags: u8) {
+    buf[0..2].copy_from_slice(&src_port.to_be_bytes());
+    buf[2..4].copy_from_slice(&dst_port.to_be_bytes());
+    buf[4..8].copy_from_slice(&seq.to_be_bytes());
+    buf[8..12].copy_from_slice(&ack.to_be_bytes());
+    buf[12] = 0x50;
+    buf[13] = flags;
+    buf[14..16].copy_from_slice(&0xffffu16.to_be_bytes());
+    buf[16..20].fill(0); // checksum + urgent ptr (csum patched by caller)
 }
 
-/// Fixed-size frame wrapper — no heap allocation.
-fn build_tcp_frame_fixed(dst_mac: &[u8; 6], src_ip: [u8; 4], dst_ip: [u8; 4],
+/// Write `[virtio_net_hdr | Eth | IP | TCP]` into `buf[..hdr_total]`,
+/// with the TCP checksum left as zero. Caller patches the
+/// checksum once the payload is in place.
+fn write_tcp_headers_only(buf: &mut [u8], dst_mac: &[u8; 6],
+                          addrs: &IpAddrPair, src_port: u16, dst_port: u16,
+                          seq: u32, ack: u32, flags: u8, tcp_len: usize) {
+    buf[..VIRTIO_NET_HDR_SIZE].fill(0);
+    let mut o = VIRTIO_NET_HDR_SIZE;
+    buf[o..o + 6].copy_from_slice(dst_mac); o += 6;
+    buf[o..o + 6].copy_from_slice(&GW_MAC); o += 6;
+    buf[o..o + 2].copy_from_slice(&addrs.ethertype().to_be_bytes()); o += 2;
+    let ip_len = addrs.ip_hdr_len();
+    addrs.write_ip_header(&mut buf[o..o + ip_len], tcp_len);
+    o += ip_len;
+    write_tcp_header(&mut buf[o..o + 20], src_port, dst_port, seq, ack, flags);
+}
+
+/// `TxFrame` wrapper: stack-only allocation, fills with
+/// `write_tcp_frame` and returns the populated frame. Used by
+/// `build_tcp_reply` to avoid heap churn on every reply.
+fn build_tcp_frame_fixed(dst_mac: &[u8; 6], addrs: &IpAddrPair,
     src_port: u16, dst_port: u16, seq: u32, ack: u32,
     flags: u8, payload: &[u8]) -> TxFrame {
-    let mut f = TxFrame { data: [0u8; MAX_REPLY_FRAME], len: 0, };
-    f.len = write_tcp_frame(&mut f.data, dst_mac, src_ip, dst_ip,
+    let mut f = TxFrame { data: [0u8; MAX_REPLY_FRAME], len: 0 };
+    f.len = write_tcp_frame(&mut f.data, dst_mac, addrs,
         src_port, dst_port, seq, ack, flags, payload) as u16;
     f
 }
 
-/// IPv6 counterpart to `write_tcp_frame`. Layout:
-/// [virtio_net_hdr 12B][Eth 14B][IPv6 40B][TCP 20B][payload]
-fn write_tcp_frame_v6(buf: &mut [u8], dst_mac: &[u8; 6],
-    src_ip: &[u8; 16], dst_ip: &[u8; 16],
-    src_port: u16, dst_port: u16, seq: u32, ack: u32,
-    flags: u8, payload: &[u8]) -> usize {
-    let tcp_len = 20 + payload.len();
-    let total = VIRTIO_NET_HDR_SIZE + 14 + 40 + tcp_len;
-    debug_assert!(total <= buf.len());
-    buf[..VIRTIO_NET_HDR_SIZE].fill(0);
-    let mut o = VIRTIO_NET_HDR_SIZE;
-    buf[o..o+6].copy_from_slice(dst_mac); o += 6;
-    buf[o..o+6].copy_from_slice(&GW_MAC); o += 6;
-    buf[o..o+2].copy_from_slice(&0x86ddu16.to_be_bytes()); o += 2;
-    // IPv6 fixed header.
-    buf[o..o+4].copy_from_slice(&0x6000_0000u32.to_be_bytes()); o += 4;
-    buf[o..o+2].copy_from_slice(&(tcp_len as u16).to_be_bytes()); o += 2;
-    buf[o] = 6; o += 1; // next_header = TCP
-    buf[o] = 64; o += 1; // hop limit
-    buf[o..o+16].copy_from_slice(src_ip); o += 16;
-    buf[o..o+16].copy_from_slice(dst_ip); o += 16;
-    // TCP header + payload, then patch the v6-pseudo-header
-    // checksum over header+payload.
-    let ts = o;
-    buf[o..o+2].copy_from_slice(&src_port.to_be_bytes()); o += 2;
-    buf[o..o+2].copy_from_slice(&dst_port.to_be_bytes()); o += 2;
-    buf[o..o+4].copy_from_slice(&seq.to_be_bytes()); o += 4;
-    buf[o..o+4].copy_from_slice(&ack.to_be_bytes()); o += 4;
-    buf[o] = 0x50; buf[o+1] = flags; o += 2;
-    buf[o..o+2].copy_from_slice(&0xffffu16.to_be_bytes()); o += 2;
-    buf[o..o+4].fill(0); o += 4; // checksum + urgent ptr
-    buf[o..o+payload.len()].copy_from_slice(payload);
-    let cksum = ipv6_pseudo_checksum(src_ip, dst_ip, 6, &buf[ts..ts+tcp_len]);
-    buf[ts+16..ts+18].copy_from_slice(&cksum.to_be_bytes());
-    total
-}
-
-fn build_tcp_frame_v6_fixed(dst_mac: &[u8; 6], src_ip: &[u8; 16], dst_ip: &[u8; 16],
-    src_port: u16, dst_port: u16, seq: u32, ack: u32,
-    flags: u8, payload: &[u8]) -> TxFrame {
-    let mut f = TxFrame { data: [0u8; MAX_REPLY_FRAME], len: 0, };
-    f.len = write_tcp_frame_v6(&mut f.data, dst_mac, src_ip, dst_ip,
-        src_port, dst_port, seq, ack, flags, payload) as u16;
-    f
-}
-
-/// Family-aware reply-frame builder: wraps the v4/v6 fixed
-/// builders behind a single signature so `handle_tcp` doesn't have
-/// to branch on family at every reply site. Both `GW_*`/`VM_*`
-/// constants and `GUEST_MAC` are runner-fixed, so the family alone
-/// fully determines which builder to call.
+/// Family-aware reply-frame builder. Both `GW_*`/`VM_*` constants
+/// and `GUEST_MAC` are runner-fixed, so the family alone fully
+/// determines which addressing pair to use.
 fn build_tcp_reply(family: IpFamily,
     src_port: u16, dst_port: u16, seq: u32, ack: u32,
     flags: u8, payload: &[u8]) -> TxFrame {
-    match family {
-        IpFamily::V4 => build_tcp_frame_fixed(&GUEST_MAC, GW_IP, VM_IP,
-            src_port, dst_port, seq, ack, flags, payload),
-        IpFamily::V6 => build_tcp_frame_v6_fixed(&GUEST_MAC, &GW_IPV6, &VM_IPV6,
-            src_port, dst_port, seq, ack, flags, payload),
-    }
-}
-
-/// IPv6 counterpart to `write_tcp_frame_around_payload`. Payload
-/// already lives at `buf[HDR_LEN_V6..HDR_LEN_V6+payload_len]` (read(2)
-/// dropped it straight into guest RAM); we only fill the
-/// `[virtio_net_hdr | Eth | IPv6 | TCP]` prefix and patch the
-/// v6-pseudo-header TCP checksum over header+payload.
-fn write_tcp_frame_v6_around_payload(buf: *mut u8, dst_mac: &[u8; 6],
-    src_ip: &[u8; 16], dst_ip: &[u8; 16], src_port: u16, dst_port: u16,
-    seq: u32, ack: u32, flags: u8, payload_len: usize) -> usize {
-    const HDR_LEN_V6: usize = VIRTIO_NET_HDR_SIZE + 14 + 40 + 20;
-    let tcp_len = 20 + payload_len;
-    let total = VIRTIO_NET_HDR_SIZE + 14 + 40 + tcp_len;
-    let b = unsafe { std::slice::from_raw_parts_mut(buf, HDR_LEN_V6) };
-    write_tcp_frame_v6_headers(b, dst_mac, src_ip, dst_ip,
-        src_port, dst_port, seq, ack, flags, tcp_len);
-    let tcp_start = VIRTIO_NET_HDR_SIZE + 14 + 40;
-    let tcp_seg = unsafe { std::slice::from_raw_parts(buf.add(tcp_start), tcp_len) };
-    let tc = ipv6_pseudo_checksum(src_ip, dst_ip, 6, tcp_seg);
-    unsafe {
-        *buf.add(tcp_start + 16) = (tc >> 8) as u8;
-        *buf.add(tcp_start + 17) = (tc & 0xff) as u8;
-    }
-    total
-}
-
-/// Write just the v6 headers (virtio + eth + ipv6 + tcp) into
-/// `buf[..HDR_LEN_V6]`, with TCP checksum left as zero. Caller
-/// patches the checksum once payload is in place.
-fn write_tcp_frame_v6_headers(buf: &mut [u8], dst_mac: &[u8; 6],
-    src_ip: &[u8; 16], dst_ip: &[u8; 16], src_port: u16, dst_port: u16,
-    seq: u32, ack: u32, flags: u8, tcp_len: usize) {
-    buf[..VIRTIO_NET_HDR_SIZE].fill(0);
-    let mut o = VIRTIO_NET_HDR_SIZE;
-    buf[o..o+6].copy_from_slice(dst_mac); o += 6;
-    buf[o..o+6].copy_from_slice(&GW_MAC); o += 6;
-    buf[o..o+2].copy_from_slice(&0x86ddu16.to_be_bytes()); o += 2;
-    buf[o..o+4].copy_from_slice(&0x6000_0000u32.to_be_bytes()); o += 4;
-    buf[o..o+2].copy_from_slice(&(tcp_len as u16).to_be_bytes()); o += 2;
-    buf[o] = 6; o += 1;
-    buf[o] = 64; o += 1;
-    buf[o..o+16].copy_from_slice(src_ip); o += 16;
-    buf[o..o+16].copy_from_slice(dst_ip); o += 16;
-    buf[o..o+2].copy_from_slice(&src_port.to_be_bytes()); o += 2;
-    buf[o..o+2].copy_from_slice(&dst_port.to_be_bytes()); o += 2;
-    buf[o..o+4].copy_from_slice(&seq.to_be_bytes()); o += 4;
-    buf[o..o+4].copy_from_slice(&ack.to_be_bytes()); o += 4;
-    buf[o] = 0x50; buf[o+1] = flags; o += 2;
-    buf[o..o+2].copy_from_slice(&0xffffu16.to_be_bytes()); o += 2;
-    buf[o..o+4].fill(0); // checksum + urgent (filled later)
+    let addrs = match family {
+        IpFamily::V4 => IpAddrPair::V4 { src: GW_IP, dst: VM_IP },
+        IpFamily::V6 => IpAddrPair::V6 { src: GW_IPV6, dst: VM_IPV6 },
+    };
+    build_tcp_frame_fixed(&GUEST_MAC, &addrs, src_port, dst_port,
+                          seq, ack, flags, payload)
 }
 
 /// Build a guest-bound UDP frame using the saved outbound-NAT
