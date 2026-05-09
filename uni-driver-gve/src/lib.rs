@@ -2387,6 +2387,7 @@ static GVE_OPS: NicOps = NicOps {
     // descriptor-side support yet; report unavailable so callers
     // do per-MSS segmentation as today.
     tso_available: || false,
+    acquire_tx_tso_buf: None,
     submit_tx_tso: None,
     poll_rx: poll,
     poll_qp,

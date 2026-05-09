@@ -972,13 +972,10 @@ fn send_super_segment_from_cursor(
     let frame_len = payload_off + payload_len;
     debug_assert!(frame_len <= TSO_FRAME_BUF_LEN);
 
-    // We need the direct-fill path here — TSO super-segments
-    // exceed the slow-path stack buffer's MSS-sized assumption.
-    // Caller falls back to the per-MSS loop if acquire fails.
-    let Some(mut handle) = uni_drivers::net::acquire_tx_buf() else {
-        // Slow path: caller does per-MSS segmentation as a
-        // fallback. We can't TSO without a writable slot.
-        // (The caller checks for this and reverts.)
+    // TSO super-segments need a big-pool slot (16 KiB capacity).
+    // Falls back to per-MSS when the big pool is full or TSO
+    // isn't supported on this driver.
+    let Some(mut handle) = uni_drivers::net::acquire_tx_tso_buf() else {
         send_per_mss_fallback(
             local_ip, dst_ip, src_port, dst_port,
             seq, ack, flags, window, cursor, payload_len,

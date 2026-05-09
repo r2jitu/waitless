@@ -53,17 +53,33 @@ static IRQ_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicB
 
 const RX_BUFFERS: usize = 256;
 const BUFFER_SIZE: u32 = 2048;
-const TX_POOL_SIZE: usize = 64;
 const VIRTIO_NET_HDR_SIZE: usize = 12; // VirtioNetHeader (with num_buffers)
-/// Maximum bytes per TX-pool slot. Sized to fit a single TSO
-/// super-segment when `VIRTIO_NET_F_HOST_TSO4` is negotiated:
-/// 14 (Ethernet) + 40 (max IPv6) + 20 (TCP) + 16384 (TLS plaintext)
-/// + 22 (TLS envelope = 5 hdr + 1 type + 16 tag) = 16480 bytes.
-/// Round up to the next 64-byte boundary for cache-line friendliness.
-/// Without TSO this only carries up to 1514 bytes (one MSS-sized
-/// segment); the headroom is reserved unconditionally so the same
-/// pool serves both paths.
-const MAX_ETH_FRAME: usize = 16512;
+
+// ── TX pool sizing (two-tier post-G) ────────────────────────────
+//
+// Small pool: 64 × 1514-byte slots. Used by every TX path that
+// fits in one MTU — UDP, ARP, TCP per-MSS segments, TCP control
+// (ACK/FIN/RST), QUIC packets. ~97 KiB per worker. Always
+// allocated.
+//
+// Big pool: 16 × 16512-byte slots. Used ONLY by the TCP TSO
+// super-segment path when `VIRTIO_NET_F_HOST_TSO4` is negotiated;
+// each slot fits one full TLS 1.3 record (16384 plaintext + 22
+// envelope) plus L2/L3/L4 headers. ~264 KiB per worker.
+// Heap-allocated lazily inside `init_qp_storage` only when TSO
+// is on; null pointer when off so a TSO-disabled device pays
+// zero memory for unused slots.
+//
+// Total per-worker TX memory: 97 KiB (TSO off) or 361 KiB (TSO on).
+// Compares to ~1 MiB if we'd kept a single 64-slot pool sized for
+// the TSO worst case.
+const TX_POOL_SMALL_SIZE: usize = 64;
+const TX_POOL_BIG_SIZE: usize = 16;
+const MAX_ETH_FRAME_SMALL: usize = 1514;
+/// Big-slot capacity. 14 (Eth) + 40 (max IPv6) + 20 (TCP) + 16384
+/// (TLS plaintext) + 22 (TLS envelope = 5 hdr + 1 type + 16 tag)
+/// = 16480 bytes. Round to the next 64-B cache-line boundary.
+const MAX_ETH_FRAME_BIG: usize = 16512;
 
 /// Virtio gso_type values (RFC: virtio spec §5.1.6).
 const VIRTIO_NET_HDR_GSO_NONE: u8 = 0;
@@ -103,13 +119,19 @@ struct VirtioNetHeader {
 }
 
 #[repr(C)]
-struct TxBuf {
+struct TxBufSmall {
     hdr: VirtioNetHeader,
-    data: [u8; MAX_ETH_FRAME],
+    data: [u8; MAX_ETH_FRAME_SMALL],
 }
 
-impl TxBuf {
-    const ZERO: Self = TxBuf {
+#[repr(C)]
+struct TxBufBig {
+    hdr: VirtioNetHeader,
+    data: [u8; MAX_ETH_FRAME_BIG],
+}
+
+impl TxBufSmall {
+    const ZERO: Self = TxBufSmall {
         hdr: VirtioNetHeader {
             flags: 0,
             gso_type: 0,
@@ -119,7 +141,22 @@ impl TxBuf {
             csum_offset: 0,
             num_buffers: 0,
         },
-        data: [0; MAX_ETH_FRAME],
+        data: [0; MAX_ETH_FRAME_SMALL],
+    };
+}
+
+impl TxBufBig {
+    const ZERO: Self = TxBufBig {
+        hdr: VirtioNetHeader {
+            flags: 0,
+            gso_type: 0,
+            hdr_len: 0,
+            gso_size: 0,
+            csum_start: 0,
+            csum_offset: 0,
+            num_buffers: 0,
+        },
+        data: [0; MAX_ETH_FRAME_BIG],
     };
 }
 
@@ -139,8 +176,15 @@ pub(crate) enum Transport {
 // ============================================================================
 
 struct QueuePairState {
-    tx_pool: [TxBuf; TX_POOL_SIZE],
-    tx_pool_used: [bool; TX_POOL_SIZE],
+    /// Small TX-pool slots — always allocated. 64 × 1514 B.
+    tx_pool_small: [TxBufSmall; TX_POOL_SMALL_SIZE],
+    tx_pool_small_used: [bool; TX_POOL_SMALL_SIZE],
+    /// Big TX-pool slots — heap-alloc'd in `init_qp_storage` only
+    /// when `VIRTIO_NET_F_HOST_TSO4` is negotiated. Pointer is
+    /// null when TSO is off so a TSO-disabled device pays no
+    /// memory for the unused slots.
+    tx_pool_big: *mut TxBufBig,
+    tx_pool_big_used: [bool; TX_POOL_BIG_SIZE],
     rx_buffers: [*mut u8; RX_BUFFERS],
     /// Serialises `(*rx_q(qp)).add_buf(...)` calls. With the
     /// IOBuf-RX path, both `poll_qp` (running on the polling
@@ -160,8 +204,10 @@ struct QueuePairState {
 
 impl QueuePairState {
     const ZEROED: Self = QueuePairState {
-        tx_pool: [const { TxBuf::ZERO }; TX_POOL_SIZE],
-        tx_pool_used: [false; TX_POOL_SIZE],
+        tx_pool_small: [const { TxBufSmall::ZERO }; TX_POOL_SMALL_SIZE],
+        tx_pool_small_used: [false; TX_POOL_SMALL_SIZE],
+        tx_pool_big: ptr::null_mut(),
+        tx_pool_big_used: [false; TX_POOL_BIG_SIZE],
         rx_buffers: [ptr::null_mut(); RX_BUFFERS],
         rx_lock: uni_kernel::sync::Spinlock::new(()),
         rx_dirty: core::sync::atomic::AtomicBool::new(false),
@@ -229,7 +275,7 @@ impl NetDevice {
 /// transport re-init keeps the existing storage rather than
 /// re-allocating (ownership during driver re-init is not well-
 /// defined). Returns `false` on OOM.
-unsafe fn init_qp_storage(num_pairs: usize) -> bool {
+unsafe fn init_qp_storage(num_pairs: usize, has_tso: bool) -> bool {
     use alloc::alloc::{alloc, Layout};
     if num_pairs == 0 {
         return false;
@@ -260,6 +306,30 @@ unsafe fn init_qp_storage(num_pairs: usize) -> bool {
         (*ndev()).rx_queues = rx;
         (*ndev()).tx_queues = tx;
         (*ndev()).qp_state = qs;
+
+        // Allocate big TX pool per-qp only when TSO is negotiated.
+        // ~264 KiB extra per worker; skipped entirely on TSO-disabled
+        // devices so they pay nothing for unused slots.
+        if has_tso {
+            let big_layout = match Layout::array::<TxBufBig>(TX_POOL_BIG_SIZE) {
+                Ok(l) => l,
+                Err(_) => return false,
+            };
+            for i in 0..num_pairs {
+                let big = alloc(big_layout) as *mut TxBufBig;
+                if big.is_null() {
+                    // Best-effort: leave the previously-allocated qps'
+                    // big pools in place (they'll drop with the device
+                    // singleton at process exit). TSO requests on the
+                    // qp without a big pool fall back to per-MSS.
+                    return false;
+                }
+                for slot in 0..TX_POOL_BIG_SIZE {
+                    ptr::write(big.add(slot), TxBufBig::ZERO);
+                }
+                (*qs.add(i)).tx_pool_big = big;
+            }
+        }
     }
     true
 }
@@ -373,7 +443,7 @@ fn init_pci_modern() -> bool {
 
     // Heap-allocate per-qp storage for the negotiated count, then
     // init each queue.
-    if !unsafe { init_qp_storage(num_pairs as usize) } {
+    if !unsafe { init_qp_storage(num_pairs as usize, has_tso4) } {
         log(b"virtio_net: failed to allocate per-qp storage\n");
         vpci_set_status(dev, STATUS_FAILED);
         return false;
@@ -734,7 +804,7 @@ fn init_mmio() -> bool {
     };
     let num_pairs = desired_pairs.min(max_pairs);
 
-    if !unsafe { init_qp_storage(num_pairs as usize) } {
+    if !unsafe { init_qp_storage(num_pairs as usize, has_tso4) } {
         log(b"virtio_net: failed to allocate per-qp storage\n");
         return false;
     }
@@ -902,7 +972,10 @@ fn init_legacy_pci() -> bool {
     };
     let num_pairs = desired_pairs.min(max_pairs);
 
-    if !unsafe { init_qp_storage(num_pairs as usize) } {
+    // Legacy virtio-pci path (x86 + GCE): no TSO negotiation today.
+    // Callers fall through to the per-MSS slow path; the big pool
+    // stays unallocated.
+    if !unsafe { init_qp_storage(num_pairs as usize, false) } {
         log(b"virtio_net: failed to allocate per-qp storage\n");
         return false;
     }
@@ -987,14 +1060,46 @@ fn init_legacy_pci() -> bool {
 // ---- TX drain ---------------------------------------------------------------
 
 fn tx_drain_qp(qp: usize) {
-    let pool_phys = unsafe { virt_to_phys((*qps(qp)).tx_pool.as_ptr() as *const u8) };
+    let small_phys = unsafe {
+        virt_to_phys((*qps(qp)).tx_pool_small.as_ptr() as *const u8)
+    };
+    let small_size = core::mem::size_of::<TxBufSmall>() as u64;
+    let small_count = TX_POOL_SMALL_SIZE as u64;
+    let big_ptr = unsafe { (*qps(qp)).tx_pool_big };
+    let (big_phys, big_size, big_count) = if big_ptr.is_null() {
+        (0u64, 0u64, 0u64)
+    } else {
+        (
+            virt_to_phys(big_ptr as *const u8),
+            core::mem::size_of::<TxBufBig>() as u64,
+            TX_POOL_BIG_SIZE as u64,
+        )
+    };
+
     unsafe {
         while let Some((used_id, _used_len)) = (*tx_q(qp)).used() {
             let d = (*tx_q(qp)).desc(used_id);
-            let slot = ((d.addr - pool_phys) / core::mem::size_of::<TxBuf>() as u64) as usize;
-            if slot < TX_POOL_SIZE {
-                (*qps(qp)).tx_pool_used[slot] = false;
+            let addr = d.addr;
+            // Address-arithmetic tag: which pool does this descriptor's
+            // buffer fall inside? Both pools are contiguous arrays so
+            // the offset / element-size division gives the slot index
+            // unambiguously.
+            if addr >= small_phys && addr < small_phys + small_count * small_size {
+                let slot = ((addr - small_phys) / small_size) as usize;
+                if slot < TX_POOL_SMALL_SIZE {
+                    (*qps(qp)).tx_pool_small_used[slot] = false;
+                }
+            } else if big_size > 0
+                && addr >= big_phys
+                && addr < big_phys + big_count * big_size
+            {
+                let slot = ((addr - big_phys) / big_size) as usize;
+                if slot < TX_POOL_BIG_SIZE {
+                    (*qps(qp)).tx_pool_big_used[slot] = false;
+                }
             }
+            // else: address from neither pool — should never happen,
+            // ignore (don't double-free a stale descriptor).
         }
     }
 }
@@ -1104,15 +1209,21 @@ fn send_on_qp(qp: usize, data: &[u8]) {
         if let Transport::None = (*ndev()).transport { return; }
     }
     let len = data.len() as u32;
-    let frame_len = if len > MAX_ETH_FRAME as u32 { MAX_ETH_FRAME as u32 } else { len };
+    let frame_len = if len > MAX_ETH_FRAME_SMALL as u32 {
+        MAX_ETH_FRAME_SMALL as u32
+    } else {
+        len
+    };
 
     tx_drain_qp(qp);
 
-    // Find a free pool slot; spin-drain if all busy
+    // Find a free small-pool slot; spin-drain if all busy. (The
+    // legacy `send` slow path doesn't TSO — it copies a single
+    // frame into the small pool and ships.)
     let slot = loop {
         let mut found = None;
-        for i in 0..TX_POOL_SIZE {
-            if unsafe { !(*qps(qp)).tx_pool_used[i] } {
+        for i in 0..TX_POOL_SMALL_SIZE {
+            if unsafe { !(*qps(qp)).tx_pool_small_used[i] } {
                 found = Some(i);
                 break;
             }
@@ -1129,8 +1240,8 @@ fn send_on_qp(qp: usize, data: &[u8]) {
     };
 
     unsafe {
-        (*qps(qp)).tx_pool_used[slot] = true;
-        let buf = &mut (*qps(qp)).tx_pool[slot];
+        (*qps(qp)).tx_pool_small_used[slot] = true;
+        let buf = &mut (*qps(qp)).tx_pool_small[slot];
         // VirtIO net header: all zero except num_buffers = 1.
         buf.hdr = VirtioNetHeader {
             flags: 0,
@@ -1145,10 +1256,10 @@ fn send_on_qp(qp: usize, data: &[u8]) {
         ptr::copy_nonoverlapping(data.as_ptr(), buf.data.as_mut_ptr(), frame_len as usize);
 
         let total_len = VIRTIO_NET_HDR_SIZE as u32 + frame_len;
-        let buf_phys = virt_to_phys(buf as *const TxBuf as *const u8);
+        let buf_phys = virt_to_phys(buf as *const TxBufSmall as *const u8);
         let head = (*tx_q(qp)).add_buf(buf_phys, total_len, 1, 0);
         if head < 0 {
-            (*qps(qp)).tx_pool_used[slot] = false;
+            (*qps(qp)).tx_pool_small_used[slot] = false;
             return;
         }
 
@@ -1207,16 +1318,29 @@ fn send(data: &[u8]) {
 // `None` from `acquire_tx_buf` — the caller falls back to the
 // legacy `send(&[u8])` + per-core staging path.
 
-/// Encode `(qp, slot)` into a single u64 token. Layout:
-/// `qp << 32 | slot`. Decoded via `decode_token`.
+/// Pool ID embedded in `TxBufHandle::driver_token` so `release_fn`
+/// + `submit_tx*` know which pool's `_used` array to update and
+/// which slot array to index. Only two pools today (small + big),
+/// one bit of the token is sufficient.
+const POOL_ID_SMALL: u8 = 0;
+const POOL_ID_BIG: u8 = 1;
+
+/// Encode `(qp, slot, pool_id)` into a single u64 token. Layout:
+///   * bit 63    — pool ID (0 = small, 1 = big)
+///   * bits 32-62 — qp index
+///   * bits 0-31 — slot index within pool
 #[inline]
-fn encode_token(qp: usize, slot: usize) -> u64 {
-    ((qp as u64) << 32) | (slot as u64)
+fn encode_token(qp: usize, slot: usize, pool: u8) -> u64 {
+    let pool_bit = ((pool & 1) as u64) << 63;
+    pool_bit | (((qp as u64) & 0x7FFF_FFFF) << 32) | (slot as u64 & 0xFFFF_FFFF)
 }
 
 #[inline]
-fn decode_token(token: u64) -> (usize, usize) {
-    ((token >> 32) as usize, (token & 0xFFFFFFFF) as usize)
+fn decode_token(token: u64) -> (usize, usize, u8) {
+    let pool = ((token >> 63) & 1) as u8;
+    let qp = ((token >> 32) & 0x7FFF_FFFF) as usize;
+    let slot = (token & 0xFFFF_FFFF) as usize;
+    (qp, slot, pool)
 }
 
 /// Drop callback for an unsubmitted `TxBufHandle`: returns the
@@ -1224,50 +1348,86 @@ fn decode_token(token: u64) -> (usize, usize) {
 /// acquires a slot but doesn't go through `submit_tx` (e.g. error
 /// path before frame-build completion).
 fn release_tx_slot(token: u64) {
-    let (qp, slot) = decode_token(token);
-    if qp < unsafe { (*ndev()).num_queue_pairs as usize } && slot < TX_POOL_SIZE {
-        unsafe { (*qps(qp)).tx_pool_used[slot] = false; }
+    let (qp, slot, pool) = decode_token(token);
+    if qp >= unsafe { (*ndev()).num_queue_pairs as usize } {
+        return;
+    }
+    match pool {
+        POOL_ID_SMALL if slot < TX_POOL_SMALL_SIZE => {
+            unsafe { (*qps(qp)).tx_pool_small_used[slot] = false; }
+        }
+        POOL_ID_BIG if slot < TX_POOL_BIG_SIZE => {
+            unsafe { (*qps(qp)).tx_pool_big_used[slot] = false; }
+        }
+        _ => {}
     }
 }
 
-fn acquire_tx_buf() -> Option<uni_net_driver::TxBufHandle> {
-    // Driver not yet bound — caller falls back to send().
+/// Per-worker preflight common to both `acquire_tx_buf` and
+/// `acquire_tx_tso_buf` — picks the qp index this worker owns
+/// (Tier 1 multi-queue: per-core; single-core: 0; Tier 2 shared:
+/// returns None so the caller falls back to the staging path)
+/// and drains completed descriptors before the slot search.
+fn acquire_qp_or_none() -> Option<usize> {
     if unsafe { matches!((*ndev()).transport, Transport::None) } {
         return None;
     }
-
     let cc = uni_kernel::percpu::CurrentWorker::enter();
     let id = cc.id();
     let nqp = unsafe { (*ndev()).num_queue_pairs };
     let qp = if nqp > 1 && (id as u16) < nqp {
-        // Per-core qp: no contention.
         id as usize
     } else if uni_kernel::percpu::num_cores() <= 1 {
-        // Single-core: no contention possible.
         0
     } else {
-        // Shared qp under multi-core: scanning `tx_pool_used`
-        // would race with other cores. Caller falls back to the
-        // staging path.
         return None;
     };
-
-    // Drain completed descriptors so freshly-finished slots are
-    // visible to the search below.
     tx_drain_qp(qp);
+    Some(qp)
+}
 
-    // Find a free slot. No spin — return None on full so the
-    // caller can decide whether to retry, fall back to memcpy
-    // send, or drop the packet.
-    for slot in 0..TX_POOL_SIZE {
+fn acquire_tx_buf() -> Option<uni_net_driver::TxBufHandle> {
+    let qp = acquire_qp_or_none()?;
+
+    // Find a free small-pool slot. No spin — return None on full
+    // so the caller can decide whether to retry, fall back to
+    // memcpy send, or drop the packet.
+    for slot in 0..TX_POOL_SMALL_SIZE {
         unsafe {
-            if !(*qps(qp)).tx_pool_used[slot] {
-                (*qps(qp)).tx_pool_used[slot] = true;
-                let buf = &mut (*qps(qp)).tx_pool[slot];
+            if !(*qps(qp)).tx_pool_small_used[slot] {
+                (*qps(qp)).tx_pool_small_used[slot] = true;
+                let buf = &mut (*qps(qp)).tx_pool_small[slot];
                 return Some(uni_net_driver::TxBufHandle {
                     data_ptr: buf.data.as_mut_ptr(),
-                    data_cap: MAX_ETH_FRAME as u32,
-                    driver_token: encode_token(qp, slot),
+                    data_cap: MAX_ETH_FRAME_SMALL as u32,
+                    driver_token: encode_token(qp, slot, POOL_ID_SMALL),
+                    release_fn: release_tx_slot,
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Acquire a big-slot TX buffer (16 KiB capacity) for a TCP TSO
+/// super-segment. Returns `None` when TSO isn't negotiated (no
+/// big pool allocated) or the pool is full. Caller falls back to
+/// `acquire_tx_buf` + per-MSS segmentation when None.
+fn acquire_tx_tso_buf() -> Option<uni_net_driver::TxBufHandle> {
+    let qp = acquire_qp_or_none()?;
+    let big_ptr = unsafe { (*qps(qp)).tx_pool_big };
+    if big_ptr.is_null() {
+        return None; // TSO not negotiated for this device
+    }
+    for slot in 0..TX_POOL_BIG_SIZE {
+        unsafe {
+            if !(*qps(qp)).tx_pool_big_used[slot] {
+                (*qps(qp)).tx_pool_big_used[slot] = true;
+                let buf = &mut *big_ptr.add(slot);
+                return Some(uni_net_driver::TxBufHandle {
+                    data_ptr: buf.data.as_mut_ptr(),
+                    data_cap: MAX_ETH_FRAME_BIG as u32,
+                    driver_token: encode_token(qp, slot, POOL_ID_BIG),
                     release_fn: release_tx_slot,
                 });
             }
@@ -1277,24 +1437,30 @@ fn acquire_tx_buf() -> Option<uni_net_driver::TxBufHandle> {
 }
 
 fn submit_tx(handle: uni_net_driver::TxBufHandle, frame_len: usize) {
-    let (qp, slot) = decode_token(handle.driver_token);
+    let (qp, slot, pool) = decode_token(handle.driver_token);
     // mem::forget skips `Drop`'s `release_fn` — the slot is
     // about to be in-flight, not unused. `tx_drain_qp` returns
     // it to the pool when the device signals completion.
     core::mem::forget(handle);
 
-    if frame_len == 0 || frame_len > MAX_ETH_FRAME {
-        // Invalid input — release the slot so we don't leak it.
-        unsafe { (*qps(qp)).tx_pool_used[slot] = false; }
+    // submit_tx is the small-pool path (per-MSS frames). A
+    // caller mismatch (acquired big but called submit_tx) would
+    // be an API misuse; release the slot defensively.
+    if pool != POOL_ID_SMALL || slot >= TX_POOL_SMALL_SIZE {
+        release_tx_slot(encode_token(qp, slot, pool));
+        return;
+    }
+    if frame_len == 0 || frame_len > MAX_ETH_FRAME_SMALL {
+        unsafe { (*qps(qp)).tx_pool_small_used[slot] = false; }
         return;
     }
 
     unsafe {
-        let buf = &mut (*qps(qp)).tx_pool[slot];
+        let buf = &mut (*qps(qp)).tx_pool_small[slot];
         // Fill virtio_net header (zeros except num_buffers = 1 for
         // single-buffer frames). The header sits at offset 0 of
-        // `TxBuf`; the caller-filled frame data starts at offset
-        // `VIRTIO_NET_HDR_SIZE` (the `data` field).
+        // `TxBufSmall`; the caller-filled frame data starts at
+        // offset `VIRTIO_NET_HDR_SIZE` (the `data` field).
         buf.hdr = VirtioNetHeader {
             flags: 0,
             gso_type: 0,
@@ -1306,13 +1472,13 @@ fn submit_tx(handle: uni_net_driver::TxBufHandle, frame_len: usize) {
         };
 
         let total_len = VIRTIO_NET_HDR_SIZE as u32 + frame_len as u32;
-        let buf_phys = virt_to_phys(buf as *const TxBuf as *const u8);
+        let buf_phys = virt_to_phys(buf as *const TxBufSmall as *const u8);
         let head = (*tx_q(qp)).add_buf(buf_phys, total_len, 1, 0);
         if head < 0 {
             // Virtq full — release the slot. The caller's frame is
             // dropped on the floor; UDP / QUIC retransmits handle
             // loss, TCP retransmits later.
-            (*qps(qp)).tx_pool_used[slot] = false;
+            (*qps(qp)).tx_pool_small_used[slot] = false;
             return;
         }
         (*tx_q(qp)).kick();
@@ -1330,16 +1496,30 @@ fn submit_tx_tso(
     csum_start: u16,
     gso_size: u16,
 ) {
-    let (qp, slot) = decode_token(handle.driver_token);
+    let (qp, slot, pool) = decode_token(handle.driver_token);
     core::mem::forget(handle); // see `submit_tx` for rationale
 
-    if frame_len == 0 || frame_len > MAX_ETH_FRAME {
-        unsafe { (*qps(qp)).tx_pool_used[slot] = false; }
+    // submit_tx_tso is the big-pool path. Caller mismatch =
+    // misuse; release defensively.
+    if pool != POOL_ID_BIG || slot >= TX_POOL_BIG_SIZE {
+        release_tx_slot(encode_token(qp, slot, pool));
+        return;
+    }
+    if frame_len == 0 || frame_len > MAX_ETH_FRAME_BIG {
+        unsafe { (*qps(qp)).tx_pool_big_used[slot] = false; }
+        return;
+    }
+
+    let big_ptr = unsafe { (*qps(qp)).tx_pool_big };
+    if big_ptr.is_null() {
+        // Pool was deallocated mid-flight (shouldn't happen on
+        // a live device). Release the slot bit anyway.
+        unsafe { (*qps(qp)).tx_pool_big_used[slot] = false; }
         return;
     }
 
     unsafe {
-        let buf = &mut (*qps(qp)).tx_pool[slot];
+        let buf = &mut *big_ptr.add(slot);
         // TSO virtio_net_hdr — see virtio spec §5.1.6:
         //   * `flags = NEEDS_CSUM`: device computes the per-segment
         //     TCP checksum at byte offset `csum_start + csum_offset`
@@ -1365,10 +1545,10 @@ fn submit_tx_tso(
         };
 
         let total_len = VIRTIO_NET_HDR_SIZE as u32 + frame_len as u32;
-        let buf_phys = virt_to_phys(buf as *const TxBuf as *const u8);
+        let buf_phys = virt_to_phys(buf as *const TxBufBig as *const u8);
         let head = (*tx_q(qp)).add_buf(buf_phys, total_len, 1, 0);
         if head < 0 {
-            (*qps(qp)).tx_pool_used[slot] = false;
+            (*qps(qp)).tx_pool_big_used[slot] = false;
             return;
         }
         (*tx_q(qp)).kick();
@@ -2012,6 +2192,7 @@ static VIRTIO_NET_OPS: NicOps = NicOps {
     acquire_tx_buf: Some(acquire_tx_buf),
     submit_tx: Some(submit_tx),
     tso_available,
+    acquire_tx_tso_buf: Some(acquire_tx_tso_buf),
     submit_tx_tso: Some(submit_tx_tso),
     poll_rx: poll,
     poll_qp,

@@ -121,13 +121,22 @@ pub struct NicOps {
     pub submit_tx: Option<fn(TxBufHandle, usize)>,
     /// TSOv4 capability: `true` when the device negotiated
     /// `VIRTIO_NET_F_HOST_TSO4` + `VIRTIO_NET_F_CSUM` (or the
-    /// equivalent on non-virtio drivers). When true, the TCP
-    /// layer can hand the driver a single super-segment (up to
-    /// `data_cap` bytes per slot, currently ~16 KiB) with one
-    /// `submit_tx_tso` call instead of looping per-MSS through
-    /// `submit_tx`. When false, callers must split into
-    /// MSS-sized segments themselves before calling `submit_tx`.
+    /// equivalent on non-virtio drivers). When true,
+    /// [`acquire_tx_tso_buf`] returns 16-KiB-capacity slots that
+    /// the TCP layer fills with a single super-segment and ships
+    /// via [`submit_tx_tso`]. When false, callers must split
+    /// into MSS-sized segments themselves and use the small-pool
+    /// `acquire_tx_buf` + `submit_tx` path.
     pub tso_available: fn() -> bool,
+    /// Acquire a big-slot TX buffer (16 KiB capacity) for a TCP
+    /// TSO super-segment. Returns `None` when:
+    ///   * TSO isn't negotiated (no big pool allocated), OR
+    ///   * the big pool is full, OR
+    ///   * the driver doesn't expose this surface (`None`
+    ///     variant of the option).
+    /// Caller falls back to per-MSS segmentation via
+    /// [`acquire_tx_buf`] when None.
+    pub acquire_tx_tso_buf: Option<fn() -> Option<TxBufHandle>>,
     /// Submit a TSO super-segment. Same shape as `submit_tx` plus
     /// the gso fields the device needs to segment host-side:
     ///
@@ -283,6 +292,7 @@ static NULL_OPS: NicOps = NicOps {
     acquire_tx_buf: None,
     submit_tx: None,
     tso_available: null_false,
+    acquire_tx_tso_buf: None,
     submit_tx_tso: None,
     poll_rx: null_poll,
     poll_qp: null_poll_qp,

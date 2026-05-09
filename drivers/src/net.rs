@@ -78,11 +78,22 @@ pub fn submit_tx(handle: uni_net_driver::TxBufHandle, frame_len: usize) {
 }
 
 /// True iff the driver negotiated TSOv4 (`VIRTIO_NET_F_HOST_TSO4`
-/// + `VIRTIO_NET_F_CSUM`, or equivalent). When true, the TCP
-/// send path can hand a single super-segment to [`submit_tx_tso`]
-/// instead of looping per-MSS through `submit_tx`.
+/// + `VIRTIO_NET_F_CSUM`, or equivalent). When true,
+/// [`acquire_tx_tso_buf`] returns 16-KiB-capacity slots that
+/// the TCP layer fills with a single super-segment and ships
+/// via [`submit_tx_tso`].
 pub fn tso_available() -> bool {
     (active_ops().tso_available)()
+}
+
+/// Acquire a big-slot TX buffer (16 KiB capacity) for a TCP TSO
+/// super-segment. Returns `None` when TSO isn't negotiated, the
+/// big pool is full, or the driver doesn't support this surface;
+/// caller falls back to per-MSS segmentation via
+/// [`acquire_tx_buf`].
+pub fn acquire_tx_tso_buf() -> Option<uni_net_driver::TxBufHandle> {
+    let f = active_ops().acquire_tx_tso_buf?;
+    f()
 }
 
 /// Submit a TSO super-segment for TCPv4. Same shape as
