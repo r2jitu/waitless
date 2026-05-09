@@ -166,8 +166,6 @@ pub(crate) enum Transport {
     None,
     #[cfg(target_arch = "aarch64")]
     Mmio { base: u64, is_v2: bool },
-    #[cfg(target_arch = "x86_64")]
-    LegacyPci { base: u64, pci_idx: usize },
     ModernPci { vpci_idx: usize },
 }
 
@@ -962,176 +960,16 @@ fn init_mmio() -> bool {
     true
 }
 
-// ---- Legacy PCI init (x86_64) -----------------------------------------------
-
-#[cfg(target_arch = "x86_64")]
-fn init_legacy_pci() -> bool {
-    // Find legacy virtio-net (0x1AF4/0x1000) or modern (0x1AF4/0x1041)
-    let pci_idx = find_device(0x1AF4, 0x1000)
-        .or_else(|| find_device(0x1AF4, 0x1041));
-    let pci_idx = match pci_idx {
-        Some(i) => i,
-        None => return false,
-    };
-
-    let dev_snap = pci_device(pci_idx);
-    let dev = &dev_snap;
-    log(b"virtio_net: found legacy PCI device\n");
-
-    // Verify subsystem device ID = 1 (network)
-    let subsys = read_config(dev.bus, dev.slot, dev.func, 0x2C);
-    let subsys_device_id = ((subsys >> 16) & 0xFFFF) as u16;
-    if subsys_device_id != 1 {
-        log(b"virtio_net: not a network device\n");
-        return false;
-    }
-
-    enable_bus_mastering_inner(dev.slot);
-
-    // Get I/O base from BAR0
-    let bar0 = dev.bar[0];
-    if (bar0 & 0x01) == 0 {
-        log(b"virtio_net: BAR0 is not I/O space\n");
-        return false;
-    }
-    let io_base = (bar0 & !0x03u32) as u64;
-    if io_base == 0 { return false; }
-
-    // Reset
-    unsafe { virtio_write8(io_base + VREG_DEVICE_STATUS, 0); }
-
-    // ACKNOWLEDGE + DRIVER
-    unsafe {
-        virtio_write8(io_base + VREG_DEVICE_STATUS, STATUS_ACKNOWLEDGE);
-        virtio_write8(io_base + VREG_DEVICE_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
-    }
-
-    // Feature negotiation. Legacy virtio-pci only exposes word 0
-    // (32 bits), so VIRTIO_F_VERSION_1 (bit 32) is out of reach —
-    // which matches GCE: its virtio-net backend is hard-locked to
-    // legacy v0.95 and rejects modern feature negotiation outright.
-    // MQ (bit 22) and CTRL_VQ (bit 17) live in word 0 and are safe.
-    let dev_features = unsafe { virtio_read32(io_base + VREG_DEVICE_FEATURES) };
-    let mut guest_features: u32 = 0;
-    if (dev_features & VIRTIO_NET_F_MAC) != 0 { guest_features |= VIRTIO_NET_F_MAC; }
-    if (dev_features & VIRTIO_NET_F_STATUS) != 0 { guest_features |= VIRTIO_NET_F_STATUS; }
-    if (dev_features & VIRTIO_NET_F_MRG_RXBUF) != 0 { guest_features |= VIRTIO_NET_F_MRG_RXBUF; }
-    if (dev_features & VIRTIO_NET_F_MQ) != 0 { guest_features |= VIRTIO_NET_F_MQ; }
-    if (dev_features & VIRTIO_NET_F_CTRL_VQ) != 0 { guest_features |= VIRTIO_NET_F_CTRL_VQ; }
-    let has_mq = (guest_features & VIRTIO_NET_F_MQ) != 0
-              && (guest_features & VIRTIO_NET_F_CTRL_VQ) != 0;
-    unsafe { virtio_write32(io_base + VREG_GUEST_FEATURES, guest_features); }
-
-    // FEATURES_OK
-    unsafe {
-        virtio_write8(io_base + VREG_DEVICE_STATUS,
-                      STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK);
-        let status = virtio_read8(io_base + VREG_DEVICE_STATUS);
-        if (status & STATUS_FEATURES_OK) == 0 {
-            log(b"virtio_net: device did not accept features\n");
-            virtio_write8(io_base + VREG_DEVICE_STATUS, STATUS_FAILED);
-            return false;
-        }
-    }
-
-    // Determine how many queue pairs to set up. Device config layout
-    // in legacy mode (MSI-X off, always our case): MAC[6] + STATUS[2]
-    // + max_virtqueue_pairs[2] starts at VREG_DEVICE_CONFIG + 8.
-    #[cfg(target_arch = "x86_64")]
-    let desired_pairs = unsafe { uni_kernel::x86_64::acpi::detect_cpus() as u16 };
-    #[cfg(not(target_arch = "x86_64"))]
-    let desired_pairs = 1u16;
-    let max_pairs = if has_mq {
-        unsafe { virtio_read16(io_base + VREG_DEVICE_CONFIG + 8).max(1) }
-    } else {
-        1
-    };
-    let num_pairs = desired_pairs.min(max_pairs);
-
-    // Legacy virtio-pci path (x86 + GCE): no TSO negotiation today.
-    // Callers fall through to the per-MSS slow path; the big pool
-    // stays unallocated.
-    if !unsafe { init_qp_storage(num_pairs as usize, false) } {
-        log(b"virtio_net: failed to allocate per-qp storage\n");
-        return false;
-    }
-
-    // Queue init order: ALL RX and TX pairs fully allocated and
-    // their PFNs published via VREG_QUEUE_ADDRESS *before* we send
-    // the MQ control command. GCE's backend drops RX delivery if it
-    // sees VQ_PAIRS_SET before every pair's ring is programmed.
-    for pair in 0..num_pairs as usize {
-        let rx_qi = (pair * 2) as u16;
-        let tx_qi = (pair * 2 + 1) as u16;
-        unsafe {
-            if !(*rx_q(pair)).init_legacy(io_base, rx_qi, false, false) {
-                log(b"virtio_net: failed to init RX queue\n");
-                return false;
-            }
-            if !(*tx_q(pair)).init_legacy(io_base, tx_qi, false, false) {
-                log(b"virtio_net: failed to init TX queue\n");
-                return false;
-            }
-        }
-    }
-
-    // Control VQ at index 2*max_pairs. Only initialised when we
-    // intend to activate multi-queue — see the vhost-net wedge in
-    // init_pci_modern's comment.
-    let mut has_mq_final = has_mq;
-    if has_mq && num_pairs > 1 {
-        let ctrl_qi = (2 * max_pairs) as u16;
-        unsafe {
-            if !(*ndev()).ctrl_queue.init_legacy(io_base, ctrl_qi, false, false) {
-                log(b"virtio_net: failed to init ctrl queue, falling back to 1 pair\n");
-                has_mq_final = false;
-            }
-        }
-    }
-
-    // Read MAC
-    for i in 0..6u64 {
-        unsafe { (*ndev()).mac[i as usize] = virtio_read8(io_base + VREG_DEVICE_CONFIG + i); }
-    }
-
-    // Populate RX buffers for every queue pair (kick happens after
-    // DRIVER_OK; the virtio spec says pre-DRIVER_OK kicks are
-    // undefined and some backends drop them).
-    for pair in 0..num_pairs as usize {
-        for i in 0..RX_BUFFERS {
-            let buf = kmalloc(BUFFER_SIZE as usize);
-            if buf.is_null() { return false; }
-            unsafe {
-                ptr::write_bytes(buf, 0, VIRTIO_NET_HDR_SIZE);
-                (*qps(pair)).rx_buffers[i] = buf;
-                let buf_phys = virt_to_phys(buf);
-                (*rx_q(pair)).add_buf(buf_phys, BUFFER_SIZE, 0, 1);
-            }
-        }
-    }
-
-    // DRIVER_OK — queues must be fully set up by this point.
-    unsafe {
-        virtio_write8(io_base + VREG_DEVICE_STATUS,
-                      STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
-    }
-
-    for pair in 0..num_pairs as usize {
-        unsafe { (*rx_q(pair)).kick(); }
-    }
-
-    unsafe {
-        (*ndev()).transport = Transport::LegacyPci { base: io_base, pci_idx };
-        (*ndev()).guest_features = guest_features;
-        (*ndev()).num_queue_pairs = 1;
-        (*ndev()).negotiated_queue_pairs = num_pairs;
-        (*ndev()).has_mq = has_mq_final && num_pairs > 1;
-    }
-    activate_multi_queue();
-
-    log(b"virtio_net: initialization complete (legacy PCI)\n");
-    true
-}
+// Legacy virtio-pci init (`init_legacy_pci`, x86_64-only) was
+// removed at commit-time-of-this-comment. It was originally
+// written for GCE's legacy virtio-net backend (no modern PCI
+// caps, hard-locked to v0.95 features), but GCE deployments
+// now use the gve driver as the preferred NIC. In every other
+// x86_64 environment we test (QEMU 9.x, KVM-on-host) the
+// `init_pci_modern` path succeeds. Resurrect from git history
+// (`uni-driver-virtio-net: remove unreachable legacy PCI init`)
+// if a future hypervisor surfaces one that only exposes the
+// legacy I/O-port surface.
 
 // ---- TX drain ---------------------------------------------------------------
 
@@ -1237,10 +1075,6 @@ fn irq_handler(_irq: u32) {
                 IRQ_PENDING.store(true, core::sync::atomic::Ordering::Release);
                 virtio_write32(base + MMIO_INTERRUPT_ACK, isr & 0xFFFF);
             }
-            #[cfg(target_arch = "x86_64")]
-            Transport::LegacyPci { base, .. } => {
-                virtio_read8(base + VREG_ISR_STATUS);
-            }
             Transport::None => {}
         }
     }
@@ -1256,7 +1090,6 @@ static PROBE_OK: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
 fn init() -> bool {
-
     #[cfg(target_arch = "aarch64")]
     {
         if init_mmio() {
@@ -1264,20 +1097,10 @@ fn init() -> bool {
             return true;
         }
     }
-    // Try modern PCI first (supports multi-queue), fall back to legacy.
     if init_pci_modern() {
         PROBE_OK.store(true, core::sync::atomic::Ordering::Release);
         return true;
     }
-    #[cfg(target_arch = "x86_64")]
-    {
-        if init_legacy_pci() {
-            PROBE_OK.store(true, core::sync::atomic::Ordering::Release);
-            return true;
-        }
-        return false;
-    }
-    #[cfg(not(target_arch = "x86_64"))]
     false
 }
 
@@ -1799,8 +1622,8 @@ fn rx_used_cursors() -> [(u16, u16); DIAG_QP_CAP] {
     // Only negotiated queues are actually initialised — the rest have
     // null `used` pointers and reading `used_idx()` on them would
     // page-fault in the kernel. `negotiated_queue_pairs` caps the
-    // loop at what `init_pci_*` / `init_legacy_pci` wired up; the
-    // diag-array bound is what fits in the public API tuple.
+    // loop at what the `init_pci_modern` / `init_mmio` paths wired
+    // up; the diag-array bound is what fits in the public API tuple.
     let n = unsafe { (*ndev()).negotiated_queue_pairs as usize }
         .min(DIAG_QP_CAP);
     unsafe {
@@ -1948,17 +1771,6 @@ fn enable_irq() {
         #[cfg(target_arch = "x86_64")]
         {
             match (*ndev()).transport {
-                Transport::LegacyPci { pci_idx, .. } => {
-                    let dev = pci_device(pci_idx);
-                    let irq_reg = read_config(dev.bus, dev.slot, dev.func, 0x3C);
-                    let irq_line = (irq_reg & 0xFF) as u8;
-                    if irq_line < 16 {
-                        (*rx_q(0)).enable_interrupts();
-                        uni_kernel::x86_64::idt::register_handler(32 + irq_line, irq_handler_x86);
-                        uni_kernel::x86_64::idt::enable_irq(irq_line);
-                        (*ndev()).irq_idle_available = true;
-                    }
-                }
                 Transport::ModernPci { vpci_idx } => {
                     let dev = vpci_device(vpci_idx);
                     if dev.msix_cap_off != 0 && dev.msix_table != 0 {
