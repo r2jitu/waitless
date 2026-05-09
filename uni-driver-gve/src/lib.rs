@@ -113,11 +113,12 @@ const RSS_LUT_SIZE: usize = 128;
 /// we got from REGISTER_PAGE_LIST.
 const GVE_RAW_ADDRESSING_QPL_ID: u32 = 0xFFFFFFFF;
 
-/// Values for `CONFIGURE_DEVICE_RESOURCES.queue_format`.
-const QF_GQI_RDA: u8 = 0x1;
+/// Values for `CONFIGURE_DEVICE_RESOURCES.queue_format`. Only the
+/// two we actually negotiate are listed; see the comment on
+/// `QueueFormat` for why `QF_GQI_RDA` (0x1) and `QF_DQO_QPL` (0x4)
+/// were removed.
 const QF_GQI_QPL: u8 = 0x2;
 const QF_DQO_RDA: u8 = 0x3;
-const QF_DQO_QPL: u8 = 0x4;
 
 // Adminq completion statuses.
 const STATUS_UNSET: u32 = 0x0;
@@ -131,11 +132,14 @@ const DEVICE_DESCRIPTOR_VERSION: u32 = 1;
 // device to service DESCRIBE_DEVICE in a freshly-booted VM.
 const ADMINQ_WAIT_SPINS: u32 = 10_000_000;
 
-// Device-option ids (only the ones we care to log).
-const OPT_ID_GQI_RDA: u16 = 0x2;
+// Device-option ids — only the queue formats this driver knows
+// how to bring up. `OPT_ID_GQI_RDA` (0x2) and `OPT_ID_DQO_QPL`
+// (0x7) are also defined in the spec but are never advertised
+// by GCE in any generation we've tested + we have no driver
+// support for them, so they're not parsed here. Unknown ids in
+// the device descriptor are skipped silently.
 const OPT_ID_GQI_QPL: u16 = 0x3;
 const OPT_ID_DQO_RDA: u16 = 0x4;
-const OPT_ID_DQO_QPL: u16 = 0x7;
 
 // ---- Wire structures -------------------------------------------------------
 //
@@ -352,21 +356,24 @@ struct RxQueue {
     expected_seq: AtomicU8,
 }
 
+/// The two queue formats we actually support. GCE today advertises
+/// `GqiQpl` on n2/n2d/e2 and both `GqiQpl` + `DqoRda` on c3/c4. The
+/// driver historically also enumerated `GqiRda` and `DqoQpl` for
+/// completeness, but neither is ever advertised by GCE in any
+/// generation we've tested, and neither has driver-side support
+/// (CREATE_*_QUEUE shape, descriptor format, completion handling),
+/// so the variants were pure dead code — removed.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum QueueFormat {
-    GqiRda,
     GqiQpl,
     DqoRda,
-    DqoQpl,
 }
 
 impl QueueFormat {
     fn name(self) -> &'static [u8] {
         match self {
-            QueueFormat::GqiRda => b"GQI_RDA",
             QueueFormat::GqiQpl => b"GQI_QPL",
             QueueFormat::DqoRda => b"DQO_RDA",
-            QueueFormat::DqoQpl => b"DQO_QPL",
         }
     }
 }
@@ -560,16 +567,13 @@ fn init() -> bool {
     // ── Queue bring-up ──────────────────────────────────────────────────
     //
     // Negotiated queue format. n2 / n2d / e2 advertise GQI_QPL;
-    // c3 / c4 / future generations advertise DQO_RDA only. We
-    // support both and dispatch on `fmt` from here on out.
+    // c3 / c4 / future generations advertise both GQI_QPL and
+    // DQO_RDA — `higher_priority` picks GQI_QPL today (DQO direct-
+    // fill debug is parked on the c3 stall). The match is now
+    // exhaustive: `QueueFormat` only enumerates the two formats
+    // the driver actually supports.
     let fmt = match STATE.lock().as_ref().and_then(|s| s.queue_format) {
-        Some(f @ QueueFormat::GqiQpl) | Some(f @ QueueFormat::DqoRda) => f,
-        Some(other) => {
-            log(b"[gvnic] queue format ");
-            log(other.name());
-            log(b" not supported - aborting\n");
-            return false;
-        }
+        Some(f) => f,
         None => return false,
     };
     QUEUE_FORMAT_DQO.store(matches!(fmt, QueueFormat::DqoRda), Ordering::Release);
@@ -736,8 +740,6 @@ fn parse_device_descriptor(desc_virt: *mut u8) -> bool {
 
         let fmt = match id {
             OPT_ID_DQO_RDA => Some(QueueFormat::DqoRda),
-            OPT_ID_DQO_QPL => Some(QueueFormat::DqoQpl),
-            OPT_ID_GQI_RDA => Some(QueueFormat::GqiRda),
             OPT_ID_GQI_QPL => Some(QueueFormat::GqiQpl),
             _ => None,
         };
@@ -809,15 +811,11 @@ fn higher_priority(a: QueueFormat, b: QueueFormat) -> QueueFormat {
     // prefer GQI_QPL so c3 deployments fall back to a known-good
     // format. C3 advertises both per Google's gVNIC docs; older
     // n2/n2d/e2 advertise only GQI_QPL.
-    fn rank(f: QueueFormat) -> u8 {
-        match f {
-            QueueFormat::GqiQpl => 4,
-            QueueFormat::GqiRda => 3,
-            QueueFormat::DqoQpl => 2,
-            QueueFormat::DqoRda => 1,
-        }
+    use QueueFormat::{DqoRda, GqiQpl};
+    match (a, b) {
+        (GqiQpl, _) | (_, GqiQpl) => GqiQpl,
+        (DqoRda, DqoRda) => DqoRda,
     }
-    if rank(a) >= rank(b) { a } else { b }
 }
 
 // ---- Admin-queue plumbing -------------------------------------------------
@@ -1147,10 +1145,8 @@ fn configure_device_resources(bar2_va: u64, num_qp: u32, fmt: QueueFormat) -> bo
     put_be32(&mut cmd.bytes, 32, IRQ_DB_STRIDE);
     put_be32(&mut cmd.bytes, 36, 0);
     cmd.bytes[40] = match fmt {
-        QueueFormat::GqiRda => QF_GQI_RDA,
         QueueFormat::GqiQpl => QF_GQI_QPL,
         QueueFormat::DqoRda => QF_DQO_RDA,
-        QueueFormat::DqoQpl => QF_DQO_QPL,
     };
 
     if !execute_cmd(b"CONFIGURE_DEVICE_RESOURCES", &cmd) {
@@ -1379,7 +1375,6 @@ fn alloc_tx_resources(fmt: QueueFormat) -> Option<TxAlloc> {
             let pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
             alloc_contig(pages as usize)
         }
-        _ => return None,
     };
     if qpl_phys == 0 { log(b"[gvnic] failed to alloc TX backing pages\n"); return None; }
 
@@ -1404,7 +1399,6 @@ fn alloc_rx_resources(fmt: QueueFormat) -> Option<RxAlloc> {
     let compl_desc_size: u32 = match fmt {
         QueueFormat::GqiQpl => 64,
         QueueFormat::DqoRda => DQO_RX_COMPL_SIZE as u32,
-        _ => return None,
     };
     let compl_pages = ((RX_RING_ENTRIES as u32) * compl_desc_size + PAGE_SIZE - 1) / PAGE_SIZE;
     let (compl_phys, compl_va) = alloc_contig(compl_pages as usize);
@@ -1416,7 +1410,6 @@ fn alloc_rx_resources(fmt: QueueFormat) -> Option<RxAlloc> {
     let data_desc_size: u32 = match fmt {
         QueueFormat::GqiQpl => 8,
         QueueFormat::DqoRda => DQO_RX_DESC_SIZE as u32,
-        _ => return None,
     };
     let data_pages = ((RX_RING_ENTRIES as u32) * data_desc_size + PAGE_SIZE - 1) / PAGE_SIZE;
     let (data_phys, data_va) = alloc_contig(data_pages as usize);
@@ -1435,7 +1428,6 @@ fn alloc_rx_resources(fmt: QueueFormat) -> Option<RxAlloc> {
             let pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
             alloc_contig(pages as usize)
         }
-        _ => return None,
     };
     if qpl_phys == 0 { log(b"[gvnic] failed to alloc RX backing pages\n"); return None; }
 
@@ -1547,11 +1539,10 @@ fn finalize_tx_queue(qp: u32, alloc: &TxAlloc, fmt: QueueFormat) {
     let qpl_size = match fmt {
         QueueFormat::GqiQpl => TX_QPL_PAGES * PAGE_SIZE,
         QueueFormat::DqoRda => DQO_TX_POOL_BUFS * RX_BUFFER_SIZE as u32,
-        _ => 0,
     };
     let qpl_id = match fmt {
         QueueFormat::GqiQpl => tx_qpl_id(qp),
-        _ => 0,
+        QueueFormat::DqoRda => 0, // RDA → no QPL; CREATE_TX_QUEUE uses GVE_RAW_ADDRESSING_QPL_ID
     };
     let mut st = STATE.lock();
     if let Some(s) = st.as_mut() {
@@ -1606,11 +1597,10 @@ fn finalize_rx_queue(qp: u32, alloc: &RxAlloc, fmt: QueueFormat) {
     let qpl_size = match fmt {
         QueueFormat::GqiQpl => RX_QPL_PAGES * PAGE_SIZE,
         QueueFormat::DqoRda => DQO_RX_POOL_BUFS * RX_BUFFER_SIZE as u32,
-        _ => 0,
     };
     let qpl_id = match fmt {
         QueueFormat::GqiQpl => rx_qpl_id(qp),
-        _ => 0,
+        QueueFormat::DqoRda => 0, // RDA → CREATE_RX_QUEUE uses GVE_RAW_ADDRESSING_QPL_ID
     };
     // GQI uses flags_seq starting at 1; DQO uses generation bit
     // starting at 1 (ring is zeroed, device fills with current gen,
