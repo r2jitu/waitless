@@ -1581,11 +1581,24 @@ static TX_BIG_ACQUIRES: core::sync::atomic::AtomicU64 =
 fn tx_diag() -> uni_net_driver::TxDiag {
     use core::sync::atomic::Ordering::Relaxed;
     let mut packets = [0u64; DIAG_QP_CAP];
+    let mut inflight = [0u32; DIAG_QP_CAP];
     for i in 0..DIAG_QP_CAP {
         packets[i] = TX_PACKETS_PER_QP[i].load(Relaxed);
     }
+    // Per-qp in-flight count: virtio's avail-used delta on each TX
+    // queue. Pool slot count instead would conflate small and big
+    // pools — the descriptor-side count is the device's view.
+    let nqp = unsafe { (*ndev()).negotiated_queue_pairs as usize };
+    for i in 0..nqp.min(DIAG_QP_CAP) {
+        unsafe {
+            let q = &*tx_q(i);
+            // Outstanding descriptors = avail.idx - used.idx.
+            inflight[i] = (q.avail_idx().wrapping_sub(q.used_idx())) as u32;
+        }
+    }
     uni_net_driver::TxDiag {
         packets_per_qp: packets,
+        inflight_per_qp: inflight,
         small_pool_full_spins: TX_SMALL_FULL_SPINS.load(Relaxed),
         small_pool_scan_iters: TX_SMALL_SCAN_ITERS.load(Relaxed),
         small_pool_acquires: TX_SMALL_ACQUIRES.load(Relaxed),

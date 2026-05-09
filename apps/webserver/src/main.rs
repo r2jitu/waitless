@@ -863,9 +863,12 @@ fn stats_response() -> Response {
                 0
             };
             let tx_slice = &t.packets_per_qp[..nqp.min(t.packets_per_qp.len())];
+            let inflight_slice = &t.inflight_per_qp[..nqp.min(t.inflight_per_qp.len())];
             let tx_chi = rss_chi_squared_x100(tx_slice);
             let _ = w.write_str(",");
             emit_json_array(&mut w, "tx_packets", tx_slice);
+            let _ = w.write_str(",");
+            emit_json_array(&mut w, "tx_inflight", inflight_slice);
             let _ = write!(
                 w,
                 ",\"tx_chi_squared_x100\":{},\

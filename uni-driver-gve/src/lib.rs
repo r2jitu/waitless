@@ -2724,11 +2724,27 @@ static TX_BIG_ACQUIRES: AtomicU64 = AtomicU64::new(0);
 
 fn tx_diag() -> uni_net_driver::TxDiag {
     let mut packets = [0u64; uni_net_driver::DIAG_QP_CAP];
+    let mut inflight = [0u32; uni_net_driver::DIAG_QP_CAP];
     for i in 0..uni_net_driver::DIAG_QP_CAP {
         packets[i] = TX_PACKETS_PER_QP[i].load(Ordering::Relaxed);
+        // In-flight = fill_cnt - done_cnt for each live qp. Pinned
+        // at `ring_entries` across multiple snapshots flags a
+        // stall — the driver's queueing more, but the device
+        // hasn't issued completions. Direct smoking gun for the
+        // gve DQO-direct-fill stall on c3 (whichever qp shows
+        // a saturated in-flight + zero advance over time is the
+        // one to look at).
+        let tx_ptr = TX_QUEUES[i].load(Ordering::Acquire);
+        if !tx_ptr.is_null() {
+            let tx = unsafe { &*tx_ptr };
+            let fill = tx.fill_cnt.load(Ordering::Relaxed);
+            let done = tx.done_cnt.load(Ordering::Relaxed);
+            inflight[i] = fill.wrapping_sub(done);
+        }
     }
     uni_net_driver::TxDiag {
         packets_per_qp: packets,
+        inflight_per_qp: inflight,
         small_pool_full_spins: TX_SMALL_FULL_SPINS.load(Ordering::Relaxed),
         small_pool_scan_iters: TX_SMALL_SCAN_ITERS.load(Ordering::Relaxed),
         small_pool_acquires: TX_SMALL_ACQUIRES.load(Ordering::Relaxed),

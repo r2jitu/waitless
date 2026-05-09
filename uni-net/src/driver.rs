@@ -361,6 +361,14 @@ pub struct TxDiag {
     /// Reflects load distribution across qps — uneven values
     /// mean RSS / per-core dispatch isn't spreading evenly.
     pub packets_per_qp: [u64; DIAG_QP_CAP],
+    /// Per-qp count of descriptors currently in flight to the
+    /// device (`fill_cnt - done_cnt`). Should hover well below
+    /// `small_pool_size` under healthy load. Pinned at
+    /// `small_pool_size` across multiple snapshots = stall:
+    /// the driver has slots queued but the device isn't
+    /// emitting completions. Direct smoking gun for the gve
+    /// DQO-direct-fill stall on c3.
+    pub inflight_per_qp: [u32; DIAG_QP_CAP],
     /// Cumulative number of times `acquire_tx_buf` had to spin
     /// because the small pool was fully in-flight. High counts
     /// = pool is undersized for the load.

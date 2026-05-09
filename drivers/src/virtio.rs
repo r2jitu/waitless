@@ -953,7 +953,11 @@ impl Virtqueue {
     }
 
     /// Read avail->idx (volatile, device may read concurrently).
-    fn avail_idx(&self) -> u16 {
+    /// Public so callers can compute in-flight descriptor counts
+    /// (`avail_idx().wrapping_sub(used_idx())`) without taking
+    /// the queue lock — the diff is intrinsically a sample, not
+    /// a transaction.
+    pub fn avail_idx(&self) -> u16 {
         // SAFETY: avail points to a valid VirtqAvail header.
         unsafe { ptr::read_volatile(&(*self.avail).idx) }
     }
