@@ -172,19 +172,10 @@ pub(crate) enum Transport {
 }
 
 // ============================================================================
-// Per-queue-pair state (one per core in Tier 1)
+// Per-queue-pair state (one per NIC virtqueue pair)
 // ============================================================================
 
 struct QueuePairState {
-    /// Small TX-pool slots — always allocated. 64 × 1514 B.
-    tx_pool_small: [TxBufSmall; TX_POOL_SMALL_SIZE],
-    tx_pool_small_used: [bool; TX_POOL_SMALL_SIZE],
-    /// Big TX-pool slots — heap-alloc'd in `init_qp_storage` only
-    /// when `VIRTIO_NET_F_HOST_TSO4` is negotiated. Pointer is
-    /// null when TSO is off so a TSO-disabled device pays no
-    /// memory for the unused slots.
-    tx_pool_big: *mut TxBufBig,
-    tx_pool_big_used: [bool; TX_POOL_BIG_SIZE],
     rx_buffers: [*mut u8; RX_BUFFERS],
     /// Serialises `(*rx_q(qp)).add_buf(...)` calls. With the
     /// IOBuf-RX path, both `poll_qp` (running on the polling
@@ -204,13 +195,52 @@ struct QueuePairState {
 
 impl QueuePairState {
     const ZEROED: Self = QueuePairState {
-        tx_pool_small: [const { TxBufSmall::ZERO }; TX_POOL_SMALL_SIZE],
-        tx_pool_small_used: [false; TX_POOL_SMALL_SIZE],
-        tx_pool_big: ptr::null_mut(),
-        tx_pool_big_used: [false; TX_POOL_BIG_SIZE],
         rx_buffers: [ptr::null_mut(); RX_BUFFERS],
         rx_lock: uni_kernel::sync::Spinlock::new(()),
         rx_dirty: core::sync::atomic::AtomicBool::new(false),
+    };
+}
+
+// ============================================================================
+// Per-worker TX pools (one per worker, regardless of nqp)
+// ============================================================================
+//
+// The TX pool — the storage slots a frame builder fills before
+// `submit_tx` — is per-worker, NOT per-qp. On Tier 1 (per-core
+// queue pair) num_workers == num_qps and the indexing coincides;
+// on Tier 2 (shared qp 0) we still want pool slot allocation to
+// be lock-free per worker, with only the virtq submission going
+// through TX_LOCK.
+//
+// `*_used` flags are AtomicBool so the qp-drain path (which on
+// Tier 2 may run on any worker, freeing slots that belong to
+// other workers' pools) can mark slots free without racing the
+// owning worker's allocation scan. Allocation is still single-
+// writer per worker (only the owning worker calls
+// `acquire_tx_buf`), so it's a load + a store (no CAS needed —
+// the only cross-worker write is the drain's `store(false)` of
+// a slot the owning worker already saw as `true`).
+
+struct WorkerTxPool {
+    /// Small TX-pool slots — always allocated. 64 × 1514 B.
+    small: [TxBufSmall; TX_POOL_SMALL_SIZE],
+    small_used: [core::sync::atomic::AtomicBool; TX_POOL_SMALL_SIZE],
+    /// Big TX-pool slots — heap-alloc'd in `init_qp_storage` only
+    /// when `VIRTIO_NET_F_HOST_TSO4` is negotiated. Pointer is
+    /// null when TSO is off so a TSO-disabled device pays no
+    /// memory for the unused slots.
+    big: *mut TxBufBig,
+    big_used: [core::sync::atomic::AtomicBool; TX_POOL_BIG_SIZE],
+}
+
+impl WorkerTxPool {
+    const ZEROED: Self = WorkerTxPool {
+        small: [const { TxBufSmall::ZERO }; TX_POOL_SMALL_SIZE],
+        small_used: [const { core::sync::atomic::AtomicBool::new(false) };
+            TX_POOL_SMALL_SIZE],
+        big: ptr::null_mut(),
+        big_used: [const { core::sync::atomic::AtomicBool::new(false) };
+            TX_POOL_BIG_SIZE],
     };
 }
 
@@ -229,6 +259,16 @@ struct NetDevice {
     rx_queues: *mut Virtqueue,
     tx_queues: *mut Virtqueue,
     qp_state: *mut QueuePairState,
+    /// Per-worker TX pools — one per worker, regardless of
+    /// `num_queue_pairs`. `acquire_tx_buf` indexes by
+    /// `CurrentWorker::id()` so slot allocation is lock-free per
+    /// worker on both Tier 1 (per-core qp) and Tier 2 (shared qp
+    /// 0); only the virtq-submit step takes TX_LOCK on Tier 2.
+    worker_pools: *mut WorkerTxPool,
+    /// Number of workers — the size of the `worker_pools` array.
+    /// Captured at `init_qp_storage` time from
+    /// `uni_kernel::percpu::num_cores()`.
+    num_workers: usize,
     ctrl_queue: Virtqueue,              // Control VQ for multi-queue commands
     mac: [u8; 6],
     num_queue_pairs: u16,               // 1 = single-queue, >1 = multi-queue
@@ -258,6 +298,8 @@ impl NetDevice {
         rx_queues: ptr::null_mut(),
         tx_queues: ptr::null_mut(),
         qp_state: ptr::null_mut(),
+        worker_pools: ptr::null_mut(),
+        num_workers: 1,
         ctrl_queue: Virtqueue::ZERO,
         mac: [0; 6],
         num_queue_pairs: 1,
@@ -280,6 +322,7 @@ unsafe fn init_qp_storage(num_pairs: usize, has_tso: bool) -> bool {
     if num_pairs == 0 {
         return false;
     }
+    let num_workers = uni_kernel::percpu::num_cores().max(1) as usize;
     unsafe {
         if !(*ndev()).rx_queues.is_null() {
             return true;
@@ -292,10 +335,15 @@ unsafe fn init_qp_storage(num_pairs: usize, has_tso: bool) -> bool {
             Ok(l) => l,
             Err(_) => return false,
         };
+        let p_layout = match Layout::array::<WorkerTxPool>(num_workers) {
+            Ok(l) => l,
+            Err(_) => return false,
+        };
         let rx = alloc(q_layout) as *mut Virtqueue;
         let tx = alloc(q_layout) as *mut Virtqueue;
         let qs = alloc(s_layout) as *mut QueuePairState;
-        if rx.is_null() || tx.is_null() || qs.is_null() {
+        let wp = alloc(p_layout) as *mut WorkerTxPool;
+        if rx.is_null() || tx.is_null() || qs.is_null() || wp.is_null() {
             return false;
         }
         for i in 0..num_pairs {
@@ -303,31 +351,36 @@ unsafe fn init_qp_storage(num_pairs: usize, has_tso: bool) -> bool {
             ptr::write(tx.add(i), Virtqueue::ZERO);
             ptr::write(qs.add(i), QueuePairState::ZEROED);
         }
+        for i in 0..num_workers {
+            ptr::write(wp.add(i), WorkerTxPool::ZEROED);
+        }
         (*ndev()).rx_queues = rx;
         (*ndev()).tx_queues = tx;
         (*ndev()).qp_state = qs;
+        (*ndev()).worker_pools = wp;
+        (*ndev()).num_workers = num_workers;
 
-        // Allocate big TX pool per-qp only when TSO is negotiated.
-        // ~264 KiB extra per worker; skipped entirely on TSO-disabled
-        // devices so they pay nothing for unused slots.
+        // Allocate big TX pool per-worker only when TSO is
+        // negotiated. ~264 KiB extra per worker; skipped entirely
+        // on TSO-disabled devices so they pay nothing for unused
+        // slots.
         if has_tso {
             let big_layout = match Layout::array::<TxBufBig>(TX_POOL_BIG_SIZE) {
                 Ok(l) => l,
                 Err(_) => return false,
             };
-            for i in 0..num_pairs {
+            for i in 0..num_workers {
                 let big = alloc(big_layout) as *mut TxBufBig;
                 if big.is_null() {
-                    // Best-effort: leave the previously-allocated qps'
-                    // big pools in place (they'll drop with the device
-                    // singleton at process exit). TSO requests on the
-                    // qp without a big pool fall back to per-MSS.
+                    // Best-effort: leave the previously-allocated
+                    // workers' big pools in place. TSO requests on
+                    // workers without a big pool fall back to per-MSS.
                     return false;
                 }
                 for slot in 0..TX_POOL_BIG_SIZE {
                     ptr::write(big.add(slot), TxBufBig::ZERO);
                 }
-                (*qs.add(i)).tx_pool_big = big;
+                (*wp.add(i)).big = big;
             }
         }
     }
@@ -348,6 +401,29 @@ unsafe fn tx_q(qp: usize) -> *mut Virtqueue {
 #[inline]
 unsafe fn qps(qp: usize) -> *mut QueuePairState {
     unsafe { (*ndev()).qp_state.add(qp) }
+}
+#[inline]
+unsafe fn wpool(worker: usize) -> *mut WorkerTxPool {
+    unsafe { (*ndev()).worker_pools.add(worker) }
+}
+
+/// Pick the qp this worker submits its TX through. On Tier 1
+/// (per-core qp) `qp == worker`. On Tier 2 / single-queue,
+/// every worker submits via qp 0.
+#[inline]
+fn worker_qp(worker: usize) -> usize {
+    let nqp = unsafe { (*ndev()).num_queue_pairs as usize };
+    if nqp > 1 && worker < nqp { worker } else { 0 }
+}
+
+/// True when multiple workers feed the same qp — `submit_tx` must
+/// take TX_LOCK around the virtq enqueue, and `tx_drain_qp` must
+/// take it around the used-ring drain.
+#[inline]
+fn qp_needs_lock() -> bool {
+    let nqp = unsafe { (*ndev()).num_queue_pairs as usize };
+    let nw = unsafe { (*ndev()).num_workers };
+    nqp == 1 && nw > 1
 }
 
 /// Driver state singleton.
@@ -1059,47 +1135,63 @@ fn init_legacy_pci() -> bool {
 
 // ---- TX drain ---------------------------------------------------------------
 
+/// Drain completed TX descriptors from `qp`'s used ring and mark
+/// the corresponding pool slots free. The descriptor's `addr` is
+/// the slot's physical address; we identify (worker, pool, slot)
+/// via address-range lookup across worker pools.
+///
+/// On Tier 1 (per-core qp) `qp == worker`, and the descriptors
+/// in qp X's used ring all came from worker X's pool — only one
+/// worker's pool needs scanning. On Tier 2 (shared qp 0)
+/// completions can belong to any worker's pool, so we scan all
+/// of them. Cross-worker `_used` writes are safe because
+/// `small_used` / `big_used` are `AtomicBool`.
 fn tx_drain_qp(qp: usize) {
-    let small_phys = unsafe {
-        virt_to_phys((*qps(qp)).tx_pool_small.as_ptr() as *const u8)
-    };
+    use core::sync::atomic::Ordering;
+    let nw = unsafe { (*ndev()).num_workers };
+    // Cache (phys range, ptr) per worker pool for fast lookup.
+    // 8 workers max in current configurations; if it grows past
+    // that, consider sorting by phys address for binary search.
     let small_size = core::mem::size_of::<TxBufSmall>() as u64;
-    let small_count = TX_POOL_SMALL_SIZE as u64;
-    let big_ptr = unsafe { (*qps(qp)).tx_pool_big };
-    let (big_phys, big_size, big_count) = if big_ptr.is_null() {
-        (0u64, 0u64, 0u64)
-    } else {
-        (
-            virt_to_phys(big_ptr as *const u8),
-            core::mem::size_of::<TxBufBig>() as u64,
-            TX_POOL_BIG_SIZE as u64,
-        )
-    };
+    let big_size = core::mem::size_of::<TxBufBig>() as u64;
 
     unsafe {
         while let Some((used_id, _used_len)) = (*tx_q(qp)).used() {
             let d = (*tx_q(qp)).desc(used_id);
             let addr = d.addr;
-            // Address-arithmetic tag: which pool does this descriptor's
-            // buffer fall inside? Both pools are contiguous arrays so
-            // the offset / element-size division gives the slot index
-            // unambiguously.
-            if addr >= small_phys && addr < small_phys + small_count * small_size {
-                let slot = ((addr - small_phys) / small_size) as usize;
-                if slot < TX_POOL_SMALL_SIZE {
-                    (*qps(qp)).tx_pool_small_used[slot] = false;
+            // Find which worker pool this address falls into. On
+            // Tier 1 only worker `qp` will match; on Tier 2 we
+            // walk all of them.
+            let mut hit = false;
+            for w in 0..nw {
+                let pool = wpool(w);
+                let small_phys = virt_to_phys((*pool).small.as_ptr() as *const u8);
+                let small_end = small_phys + (TX_POOL_SMALL_SIZE as u64) * small_size;
+                if addr >= small_phys && addr < small_end {
+                    let slot = ((addr - small_phys) / small_size) as usize;
+                    if slot < TX_POOL_SMALL_SIZE {
+                        (*pool).small_used[slot].store(false, Ordering::Release);
+                    }
+                    hit = true;
+                    break;
                 }
-            } else if big_size > 0
-                && addr >= big_phys
-                && addr < big_phys + big_count * big_size
-            {
-                let slot = ((addr - big_phys) / big_size) as usize;
-                if slot < TX_POOL_BIG_SIZE {
-                    (*qps(qp)).tx_pool_big_used[slot] = false;
+                let big_ptr = (*pool).big;
+                if !big_ptr.is_null() {
+                    let big_phys = virt_to_phys(big_ptr as *const u8);
+                    let big_end = big_phys + (TX_POOL_BIG_SIZE as u64) * big_size;
+                    if addr >= big_phys && addr < big_end {
+                        let slot = ((addr - big_phys) / big_size) as usize;
+                        if slot < TX_POOL_BIG_SIZE {
+                            (*pool).big_used[slot].store(false, Ordering::Release);
+                        }
+                        hit = true;
+                        break;
+                    }
                 }
             }
-            // else: address from neither pool — should never happen,
-            // ignore (don't double-free a stale descriptor).
+            // No match: address didn't come from any pool. Stale
+            // / duplicate completion — ignore.
+            let _ = hit;
         }
     }
 }
@@ -1202,69 +1294,22 @@ fn get_mac(mac_out: *mut u8) {
     }
 }
 
-/// Send a frame on a specific queue pair.
-fn send_on_qp(qp: usize, data: &[u8]) {
+/// Slice-shaped send convenience wrapper. Acquires a TX-pool slot
+/// from the caller's worker pool, copies `data` into it, and
+/// submits via the unified `submit_tx` path. Used by ARP/NDP/etc.
+/// callers that don't fill in place.
+fn send_slice(data: &[u8]) {
     if data.is_empty() { return; }
     unsafe {
         if let Transport::None = (*ndev()).transport { return; }
     }
-    let len = data.len() as u32;
-    let frame_len = if len > MAX_ETH_FRAME_SMALL as u32 {
-        MAX_ETH_FRAME_SMALL as u32
-    } else {
-        len
+    let frame_len = data.len().min(MAX_ETH_FRAME_SMALL);
+    let mut handle = match acquire_tx_buf() {
+        Some(h) => h,
+        None => return, // no driver
     };
-
-    tx_drain_qp(qp);
-
-    // Find a free small-pool slot; spin-drain if all busy. (The
-    // legacy `send` slow path doesn't TSO — it copies a single
-    // frame into the small pool and ships.)
-    let slot = loop {
-        let mut found = None;
-        for i in 0..TX_POOL_SMALL_SIZE {
-            if unsafe { !(*qps(qp)).tx_pool_small_used[i] } {
-                found = Some(i);
-                break;
-            }
-        }
-        if let Some(s) = found { break s; }
-        // Force any deferred kick to fire so the host can process
-        // the pending TX batch and produce completions. With deferred
-        // kicks + a host that delivers RX in big batches (HVF), we'd
-        // otherwise deadlock here: the kick we're waiting on is
-        // sitting in kick_dirty, not in the MMIO register.
-        unsafe { (*tx_q(qp)).flush_kick(); }
-        tx_drain_qp(qp);
-        compiler_fence(Ordering::SeqCst);
-    };
-
-    unsafe {
-        (*qps(qp)).tx_pool_small_used[slot] = true;
-        let buf = &mut (*qps(qp)).tx_pool_small[slot];
-        // VirtIO net header: all zero except num_buffers = 1.
-        buf.hdr = VirtioNetHeader {
-            flags: 0,
-            gso_type: 0,
-            hdr_len: 0,
-            gso_size: 0,
-            csum_start: 0,
-            csum_offset: 0,
-            num_buffers: 1,
-        };
-
-        ptr::copy_nonoverlapping(data.as_ptr(), buf.data.as_mut_ptr(), frame_len as usize);
-
-        let total_len = VIRTIO_NET_HDR_SIZE as u32 + frame_len;
-        let buf_phys = virt_to_phys(buf as *const TxBufSmall as *const u8);
-        let head = (*tx_q(qp)).add_buf(buf_phys, total_len, 1, 0);
-        if head < 0 {
-            (*qps(qp)).tx_pool_small_used[slot] = false;
-            return;
-        }
-
-        (*tx_q(qp)).kick();
-    }
+    handle.data_mut()[..frame_len].copy_from_slice(&data[..frame_len]);
+    submit_tx(handle, frame_len);
 }
 
 /// Flag: set by APs when they stage TX.
@@ -1276,30 +1321,12 @@ static TX_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 /// raw-pointer accessors; this lock just provides mutual exclusion.
 static TX_LOCK: uni_kernel::sync::Spinlock<()> = uni_kernel::sync::Spinlock::new(());
 
-/// Send a frame. Two paths:
-///   * Multi-queue device: each core sends on its own per-core queue pair
-///     with no locking.
-///   * Single-queue (or extra cores beyond `num_queue_pairs`): push to a
-///     per-core SPSC staging ring and flag `TX_PENDING`. Any core can later
-///     batch-flush all staged frames into the shared queue under `TX_LOCK`
-///     via `flush_tx_staging()`. The staging path is a throughput
-///     optimisation — it lets `send()` stay non-blocking on hot paths while
-///     a single core drains all rings under one lock acquisition.
+/// Send a slice-shaped frame. Goes through the unified
+/// acquire+submit path: pool is per-worker (lock-free slot
+/// allocation on both Tier 1 and Tier 2); virtq submission is
+/// per-core on Tier 1 and TX_LOCK-serialised on Tier 2.
 fn send(data: &[u8]) {
-    let cc = uni_kernel::percpu::CurrentWorker::enter();
-    let id = cc.id();
-    let nqp = unsafe { (*ndev()).num_queue_pairs };
-    if nqp > 1 && (id as u16) < nqp {
-        // Per-core queue pair: no contention, no locking.
-        send_on_qp(id as usize, data);
-    } else if uni_kernel::percpu::num_cores() <= 1 {
-        // Single-core: no contention possible, send directly.
-        send_on_qp(0, data);
-    } else {
-        // Single shared queue, multiple cores: stage to per-core ring.
-        uni_kernel::percpu::percore(&cc).tx_staging.push(data);
-        TX_PENDING.store(true, Ordering::Release);
-    }
+    send_slice(data);
 }
 
 // ─── Direct-fill (zero-copy) TX path ────────────────────────────────────────
@@ -1348,87 +1375,102 @@ fn decode_token(token: u64) -> (usize, usize, u8) {
 /// acquires a slot but doesn't go through `submit_tx` (e.g. error
 /// path before frame-build completion).
 fn release_tx_slot(token: u64) {
-    let (qp, slot, pool) = decode_token(token);
-    if qp >= unsafe { (*ndev()).num_queue_pairs as usize } {
+    use core::sync::atomic::Ordering;
+    let (worker, slot, pool) = decode_token(token);
+    if worker >= unsafe { (*ndev()).num_workers } {
         return;
     }
     match pool {
         POOL_ID_SMALL if slot < TX_POOL_SMALL_SIZE => {
-            unsafe { (*qps(qp)).tx_pool_small_used[slot] = false; }
+            unsafe { (*wpool(worker)).small_used[slot].store(false, Ordering::Release); }
         }
         POOL_ID_BIG if slot < TX_POOL_BIG_SIZE => {
-            unsafe { (*qps(qp)).tx_pool_big_used[slot] = false; }
+            unsafe { (*wpool(worker)).big_used[slot].store(false, Ordering::Release); }
         }
         _ => {}
     }
 }
 
-/// Per-worker preflight common to both `acquire_tx_buf` and
-/// `acquire_tx_tso_buf` — picks the qp index this worker owns
-/// (Tier 1 multi-queue: per-core; single-core: 0; Tier 2 shared:
-/// returns None so the caller falls back to the staging path)
-/// and drains completed descriptors before the slot search.
-fn acquire_qp_or_none() -> Option<usize> {
+/// Pick the calling worker's pool index and pre-drain the qp
+/// it submits through. Returns `(worker_id, qp)` — `qp` is what
+/// the caller drains while spin-waiting for a slot to free.
+fn current_worker_and_qp() -> Option<(usize, usize)> {
     if unsafe { matches!((*ndev()).transport, Transport::None) } {
         return None;
     }
     let cc = uni_kernel::percpu::CurrentWorker::enter();
-    let id = cc.id();
-    let nqp = unsafe { (*ndev()).num_queue_pairs };
-    let qp = if nqp > 1 && (id as u16) < nqp {
-        id as usize
-    } else if uni_kernel::percpu::num_cores() <= 1 {
-        0
+    let worker = cc.id() as usize;
+    let qp = worker_qp(worker);
+    tx_drain_qp_locked(qp);
+    Some((worker, qp))
+}
+
+/// `tx_drain_qp` wrapped in TX_LOCK on Tier 2 so concurrent
+/// workers don't race the used-ring read. On Tier 1 each worker
+/// drains its own qp, no lock needed.
+fn tx_drain_qp_locked(qp: usize) {
+    if qp_needs_lock() {
+        let _g = TX_LOCK.lock();
+        tx_drain_qp(qp);
     } else {
-        return None;
-    };
-    tx_drain_qp(qp);
-    Some(qp)
+        tx_drain_qp(qp);
+    }
 }
 
 fn acquire_tx_buf() -> Option<uni_net_driver::TxBufHandle> {
-    let qp = acquire_qp_or_none()?;
+    use core::sync::atomic::Ordering;
+    let (worker, qp) = current_worker_and_qp()?;
 
-    // Find a free small-pool slot. No spin — return None on full
-    // so the caller can decide whether to retry, fall back to
-    // memcpy send, or drop the packet.
-    for slot in 0..TX_POOL_SMALL_SIZE {
-        unsafe {
-            if !(*qps(qp)).tx_pool_small_used[slot] {
-                (*qps(qp)).tx_pool_small_used[slot] = true;
-                let buf = &mut (*qps(qp)).tx_pool_small[slot];
-                return Some(uni_net_driver::TxBufHandle {
-                    data_ptr: buf.data.as_mut_ptr(),
-                    data_cap: MAX_ETH_FRAME_SMALL as u32,
-                    driver_token: encode_token(qp, slot, POOL_ID_SMALL),
-                    release_fn: release_tx_slot,
-                });
+    // Spin-drain on full. Per-worker pool means slot allocation
+    // is lock-free regardless of nqp; only the qp drain takes
+    // TX_LOCK on Tier 2 (single shared qp).
+    loop {
+        for slot in 0..TX_POOL_SMALL_SIZE {
+            unsafe {
+                if !(*wpool(worker)).small_used[slot].load(Ordering::Acquire) {
+                    (*wpool(worker)).small_used[slot].store(true, Ordering::Relaxed);
+                    let buf = &mut (*wpool(worker)).small[slot];
+                    return Some(uni_net_driver::TxBufHandle {
+                        data_ptr: buf.data.as_mut_ptr(),
+                        data_cap: MAX_ETH_FRAME_SMALL as u32,
+                        driver_token: encode_token(worker, slot, POOL_ID_SMALL),
+                        release_fn: release_tx_slot,
+                    });
+                }
             }
         }
+        // All slots busy — flush deferred kicks so the host can
+        // process the pending TX batch and produce completions,
+        // then drain and re-scan.
+        unsafe { (*tx_q(qp)).flush_kick(); }
+        tx_drain_qp_locked(qp);
+        compiler_fence(Ordering::SeqCst);
     }
-    None
 }
 
 /// Acquire a big-slot TX buffer (16 KiB capacity) for a TCP TSO
 /// super-segment. Returns `None` when TSO isn't negotiated (no
 /// big pool allocated) or the pool is full. Caller falls back to
-/// `acquire_tx_buf` + per-MSS segmentation when None.
+/// `acquire_tx_buf` + per-MSS segmentation when None — TSO pool
+/// is small (16 slots) so we don't spin-drain it; per-MSS keeps
+/// throughput up under transient TSO-pool saturation.
 fn acquire_tx_tso_buf() -> Option<uni_net_driver::TxTsoBufHandle> {
-    let qp = acquire_qp_or_none()?;
-    let big_ptr = unsafe { (*qps(qp)).tx_pool_big };
+    use core::sync::atomic::Ordering;
+    let (worker, _qp) = current_worker_and_qp()?;
+    let big_ptr = unsafe { (*wpool(worker)).big };
     if big_ptr.is_null() {
         return None; // TSO not negotiated for this device
     }
     for slot in 0..TX_POOL_BIG_SIZE {
         unsafe {
-            if !(*qps(qp)).tx_pool_big_used[slot] {
-                (*qps(qp)).tx_pool_big_used[slot] = true;
+            if !(*wpool(worker)).big_used[slot].load(Ordering::Acquire) {
+                (*wpool(worker)).big_used[slot].store(true, Ordering::Relaxed);
                 let buf = &mut *big_ptr.add(slot);
                 return Some(uni_net_driver::TxTsoBufHandle(
                     uni_net_driver::TxBufHandle {
                         data_ptr: buf.data.as_mut_ptr(),
                         data_cap: MAX_ETH_FRAME_BIG as u32,
-                        driver_token: encode_token(qp, slot, POOL_ID_BIG),
+                        driver_token: encode_token(worker, slot, POOL_ID_BIG),
                         release_fn: release_tx_slot,
                     },
                 ));
@@ -1439,7 +1481,8 @@ fn acquire_tx_tso_buf() -> Option<uni_net_driver::TxTsoBufHandle> {
 }
 
 fn submit_tx(handle: uni_net_driver::TxBufHandle, frame_len: usize) {
-    let (qp, slot, _pool) = decode_token(handle.driver_token);
+    use core::sync::atomic::Ordering;
+    let (worker, slot, _pool) = decode_token(handle.driver_token);
     // mem::forget skips `Drop`'s `release_fn` — the slot is
     // about to be in-flight, not unused. `tx_drain_qp` returns
     // it to the pool when the device signals completion.
@@ -1447,18 +1490,22 @@ fn submit_tx(handle: uni_net_driver::TxBufHandle, frame_len: usize) {
 
     // Type-distinct handles guarantee a `TxBufHandle` here came
     // from the small pool (big-pool slots flow through
-    // `TxTsoBufHandle` + `submit_tx_tso`). Defensive bound check
-    // for slot index only.
-    if slot >= TX_POOL_SMALL_SIZE {
+    // `TxTsoBufHandle` + `submit_tx_tso`). Defensive bound checks
+    // for slot/worker index only.
+    if slot >= TX_POOL_SMALL_SIZE
+        || worker >= unsafe { (*ndev()).num_workers }
+    {
         return;
     }
     if frame_len == 0 || frame_len > MAX_ETH_FRAME_SMALL {
-        unsafe { (*qps(qp)).tx_pool_small_used[slot] = false; }
+        unsafe { (*wpool(worker)).small_used[slot].store(false, Ordering::Release); }
         return;
     }
 
+    let qp = worker_qp(worker);
+
     unsafe {
-        let buf = &mut (*qps(qp)).tx_pool_small[slot];
+        let buf = &mut (*wpool(worker)).small[slot];
         // Fill virtio_net header (zeros except num_buffers = 1 for
         // single-buffer frames). The header sits at offset 0 of
         // `TxBufSmall`; the caller-filled frame data starts at
@@ -1475,15 +1522,22 @@ fn submit_tx(handle: uni_net_driver::TxBufHandle, frame_len: usize) {
 
         let total_len = VIRTIO_NET_HDR_SIZE as u32 + frame_len as u32;
         let buf_phys = virt_to_phys(buf as *const TxBufSmall as *const u8);
-        let head = (*tx_q(qp)).add_buf(buf_phys, total_len, 1, 0);
-        if head < 0 {
-            // Virtq full — release the slot. The caller's frame is
-            // dropped on the floor; UDP / QUIC retransmits handle
-            // loss, TCP retransmits later.
-            (*qps(qp)).tx_pool_small_used[slot] = false;
-            return;
+
+        let submit = |head_check: &dyn Fn() -> i32| -> bool {
+            let head = head_check();
+            if head < 0 {
+                (*wpool(worker)).small_used[slot].store(false, Ordering::Release);
+                return false;
+            }
+            (*tx_q(qp)).kick();
+            true
+        };
+        if qp_needs_lock() {
+            let _g = TX_LOCK.lock();
+            submit(&|| (*tx_q(qp)).add_buf(buf_phys, total_len, 1, 0));
+        } else {
+            submit(&|| (*tx_q(qp)).add_buf(buf_phys, total_len, 1, 0));
         }
-        (*tx_q(qp)).kick();
     }
 }
 
@@ -1498,30 +1552,32 @@ fn submit_tx_tso(
     csum_start: u16,
     gso_size: u16,
 ) {
+    use core::sync::atomic::Ordering;
     // Type-distinct wrapper guarantees this token came from
     // `acquire_tx_tso_buf` (i.e. POOL_ID_BIG). We still decode
-    // it for the qp/slot fields; the pool ID is implied.
-    let (qp, slot, _pool) = decode_token(handle.0.driver_token);
+    // it for the worker/slot fields; the pool ID is implied.
+    let (worker, slot, _pool) = decode_token(handle.0.driver_token);
     core::mem::forget(handle); // see `submit_tx` for rationale
 
-    if slot >= TX_POOL_BIG_SIZE {
-        // Defensive — should be impossible given the type-system
-        // enforcement, but if a future driver fork mis-encodes
-        // the token we'd rather no-op than UB.
+    if slot >= TX_POOL_BIG_SIZE
+        || worker >= unsafe { (*ndev()).num_workers }
+    {
         return;
     }
     if frame_len == 0 || frame_len > MAX_ETH_FRAME_BIG {
-        unsafe { (*qps(qp)).tx_pool_big_used[slot] = false; }
+        unsafe { (*wpool(worker)).big_used[slot].store(false, Ordering::Release); }
         return;
     }
 
-    let big_ptr = unsafe { (*qps(qp)).tx_pool_big };
+    let big_ptr = unsafe { (*wpool(worker)).big };
     if big_ptr.is_null() {
         // Pool was deallocated mid-flight (shouldn't happen on
         // a live device). Release the slot bit anyway.
-        unsafe { (*qps(qp)).tx_pool_big_used[slot] = false; }
+        unsafe { (*wpool(worker)).big_used[slot].store(false, Ordering::Release); }
         return;
     }
+
+    let qp = worker_qp(worker);
 
     unsafe {
         let buf = &mut *big_ptr.add(slot);
@@ -1551,44 +1607,51 @@ fn submit_tx_tso(
 
         let total_len = VIRTIO_NET_HDR_SIZE as u32 + frame_len as u32;
         let buf_phys = virt_to_phys(buf as *const TxBufBig as *const u8);
-        let head = (*tx_q(qp)).add_buf(buf_phys, total_len, 1, 0);
-        if head < 0 {
-            (*qps(qp)).tx_pool_big_used[slot] = false;
-            return;
-        }
-        (*tx_q(qp)).kick();
-    }
-}
-
-/// True if any AP has staged TX packets waiting for flush.
-fn has_pending_tx() -> bool {
-    TX_PENDING.load(Ordering::Acquire)
-}
-
-/// Flush all per-core TX staging buffers into the VirtIO TX queue.
-/// Any core may call this; concurrent calls are serialised via TX_LOCK.
-fn flush_tx_staging() {
-    if !TX_PENDING.load(Ordering::Acquire) {
-        return;
-    }
-    // Only one core should flush at a time. The returned guard
-    // releases the lock automatically on scope exit.
-    let _guard = match TX_LOCK.try_lock() {
-        Some(g) => g,
-        None => return,
-    };
-    TX_PENDING.store(false, Ordering::Release);
-    let n = uni_kernel::percpu::num_cores();
-    let mut buf = [0u8; 1514];
-    for i in 0..n {
-        unsafe {
-            let core = uni_kernel::percpu::get(i);
-            while let Some(len) = core.tx_staging.pop_into(&mut buf) {
-                send_on_qp(0, &buf[..len]);
+        let submit = || {
+            let head = (*tx_q(qp)).add_buf(buf_phys, total_len, 1, 0);
+            if head < 0 {
+                (*wpool(worker)).big_used[slot].store(false, Ordering::Release);
+                return;
             }
+            (*tx_q(qp)).kick();
+        };
+        if qp_needs_lock() {
+            let _g = TX_LOCK.lock();
+            submit();
+        } else {
+            submit();
         }
     }
-    // _guard released at end of scope.
+}
+
+/// True if any worker has TX work pending. Always `false` — TX
+/// goes straight through `acquire_tx_buf`/`submit_tx` now (per-
+/// worker pool + virtq submit, with TX_LOCK on Tier 2). The
+/// per-core SPSC staging-ring path has been retired; this hook
+/// stays in the NicOps vtable so callers compile, but never
+/// reports work pending.
+fn has_pending_tx() -> bool {
+    false
+}
+
+/// Flush deferred TX kicks across all qps. Used by callers that
+/// just submitted via `acquire_tx_buf`/`submit_tx` and want to
+/// ensure the host sees the descriptors before they sleep — e.g.
+/// before WFI/HLT, or to break a deferred-kick deadlock during
+/// ARP resolution. The legacy "drain per-core staging ring"
+/// behaviour is gone with the staging-ring path itself.
+fn flush_tx_staging() {
+    let nqp = unsafe { (*ndev()).num_queue_pairs as usize };
+    if qp_needs_lock() {
+        let _g = TX_LOCK.lock();
+        for qp in 0..nqp {
+            unsafe { (*tx_q(qp)).flush_kick(); }
+        }
+    } else {
+        for qp in 0..nqp {
+            unsafe { (*tx_q(qp)).flush_kick(); }
+        }
+    }
 }
 
 /// Read the virtio INTERRUPT_STATUS register. This is a no-op from the
