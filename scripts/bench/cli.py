@@ -233,6 +233,19 @@ WORKLOADS = [
      "endpoint": "/health",
      "parallelism_per_core": 4,
      "desc": "/health throughput over HTTP/3 (4 workers × cpus, QUIC keep-alive)"},
+    # Same shape as h3_health_max but pointed at /diagnostics
+    # (~9 KiB HTML body) so the QUIC TX path's multi-packet
+    # encrypt + send loop is the bottleneck, not the per-request
+    # parsing overhead. Pairs with `diagnostics_tls_max` to give
+    # a side-by-side QUIC-vs-TLS-over-TCP read on larger bodies
+    # — the gap is where the QUIC encoder's encode-into-TX-slot
+    # zero-copy (item B2) actually surfaces; on /health the
+    # body is too small for any of the per-byte wins to register
+    # above run-to-run noise.
+    {"name": "h3_diagnostics_max", "type": "h3_health",
+     "endpoint": "/diagnostics",
+     "parallelism_per_core": 4,
+     "desc": "/diagnostics throughput over HTTP/3 (~9 KB body, multi-packet)"},
 
     # ── Async TCP echo (guest:9 via `uni::runtime::TcpListener`) ─────────
     #

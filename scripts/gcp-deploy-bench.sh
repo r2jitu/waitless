@@ -46,10 +46,27 @@ UNI_ZONE="${UNIKERNEL_GCE_ZONE:-us-west1-a}"
 KVM_NAME="${GCP_KVM_VM_NAME:-kvm-vm}"
 KVM_ZONE="${GCP_KVM_VM_ZONE:-$UNI_ZONE}"
 
-# Default workloads. h3_health_max is the QUIC TX-path bench
-# (the path item B2 optimised); health_tls_max is the parallel
-# TLS-over-TCP keep-alive bench for cross-protocol comparison.
-DEFAULT_WORKLOADS="h3_health_max,health_tls_max"
+# Default workload set, picked to give signal across both protocol
+# stacks AND both small/large body shapes:
+#
+#   * `health_max`           — /health over plain HTTP. Pure
+#                              throughput baseline (we hit 466K
+#                              req/s on c3 here in 2026-05-09).
+#   * `health_tls_max`       — /health over TLS-over-TCP. Same
+#                              80 B body, exercises TLS record
+#                              hot path (1 record per request).
+#   * `h3_health_max`        — /health over QUIC. QUIC TX path
+#                              equivalent of the above.
+#   * `diagnostics_tls_max`  — /diagnostics (~9 KB HTML) over
+#                              TLS-over-TCP. Required to make
+#                              per-byte memcpy + CSUM-offload +
+#                              TSO wins visible — the small-body
+#                              workloads can't surface them
+#                              above run-to-run noise.
+#   * `h3_diagnostics_max`   — same multi-packet body but over
+#                              QUIC, so cross-protocol perf on
+#                              larger bodies is comparable.
+DEFAULT_WORKLOADS="health_max,health_tls_max,h3_health_max,diagnostics_tls_max,h3_diagnostics_max"
 DEFAULT_CORES="1,2,4"
 DEFAULT_DURATION="10"
 
