@@ -456,7 +456,8 @@ class WebserverShutdownTest(unittest.TestCase):
     """
 
     def _run_shutdown_scenario(self, *, port_offset: int, hammer: bool,
-                                h3_hammer: bool = False):
+                                h3_hammer: bool = False,
+                                h3_persistent: bool = False):
         """Boot, optionally hammer HTTP and/or HTTP/3, send ^C, wait for VM
         exit. Returns the captured serial buffer for further assertions."""
         port = PORT + port_offset
@@ -507,10 +508,64 @@ class WebserverShutdownTest(unittest.TestCase):
                 ]
                 for w in workers_h3:
                     w.start()
+            persistent_thread = None
+            if h3_persistent:
+                # Single LONG-LIVED H3 conn that stays alive across ^C.
+                # Mirrors a real browser keeping a tab open: conn stays
+                # in mid-await state when shutdown_and_drop fires, and
+                # `mark_terminated` doesn't get a chance to run (the
+                # future is force-dropped by `drain_all_arenas`).
+                # Connection's Rc count must still hit 0 via captured-
+                # field drops — if it doesn't, we leak the conn-state
+                # heap (BTreeMaps + per-stream Vecs).
+                #
+                # We start the session in a daemon thread so the
+                # main test thread can ^C the launcher while the
+                # session is still actively pumping packets.
+                def _persistent() -> None:
+                    try:
+                        import asyncio
+                        import aioquic.asyncio.client as aclient
+                        from aioquic.asyncio.protocol import QuicConnectionProtocol
+                        from aioquic.h3.connection import H3_ALPN, H3Connection
+                        from aioquic.quic.configuration import QuicConfiguration
+
+                        class P(QuicConnectionProtocol):
+                            def __init__(self, *a, **kw):
+                                super().__init__(*a, **kw)
+                                self.h3 = H3Connection(self._quic)
+                            def quic_event_received(self, event):
+                                for _ in self.h3.handle_event(event): pass
+
+                        async def go() -> None:
+                            cfg = QuicConfiguration(is_client=True, alpn_protocols=H3_ALPN)
+                            cfg.verify_mode = False
+                            cfg.idle_timeout = 60
+                            async with aclient.connect(
+                                "127.0.0.1", tls_port,
+                                configuration=cfg,
+                                create_protocol=P,
+                                wait_connected=True,
+                            ) as c:
+                                while not stop_hammer[0]:
+                                    sid = c._quic.get_next_available_stream_id()
+                                    c.h3.send_headers(stream_id=sid, headers=[
+                                        (b":method", b"GET"),
+                                        (b":scheme", b"https"),
+                                        (b":authority", f"127.0.0.1:{tls_port}".encode()),
+                                        (b":path", b"/diagnostics")],
+                                        end_stream=True)
+                                    c.transmit()
+                                    await asyncio.sleep(0.5)
+                        asyncio.run(go())
+                    except Exception:
+                        pass
+                persistent_thread = threading.Thread(target=_persistent, daemon=True)
+                persistent_thread.start()
             # Longer dwell when h3-hammering so the test exercises
             # enough conns to surface a per-conn leak signal above
             # noise. Plain HTTP hammer keeps the original 2 s.
-            time.sleep(5 if h3_hammer else 2)
+            time.sleep(5 if (h3_hammer or h3_persistent) else 2)
 
             t0 = time.monotonic()
             pty_launcher.write(b"\x03")
@@ -603,6 +658,65 @@ class WebserverShutdownTest(unittest.TestCase):
         self.assertLessEqual(
             bytes_leaked, 1024,
             f"H3-hammer leaked {bytes_leaked} bytes — beyond the "
+            f"~hundreds-of-bytes Vec-growth tolerance "
+            f"({leak_line.decode(errors='replace')})",
+        )
+
+    def test_ctrlc_h3_persistent_session_no_leak(self) -> None:
+        """Active QUIC conn at ^C — matches a browser tab kept open.
+
+        Mirrors what Chrome does: open ONE QUIC conn, hold it across
+        many requests, never CONNECTION_CLOSE the conn. When the user
+        ^Cs the unikernel mid-session, `drain_all_arenas` force-drops
+        the conn_task and user-handler futures while they're both
+        suspended on awaits. `mark_terminated` (commit `1e73a40`)
+        doesn't run on this path — it's after the conn_task loop, and
+        the future is destroyed before the loop returns. Connection
+        cleanup must therefore happen via the future's struct-field
+        drop chain (Rc<RefCell<Connection>> → strong count 0 →
+        Connection drops → recv/send_streams BTreeMaps drop → all
+        per-stream allocations release).
+
+        User-reported leak in this exact shape was
+        `delta=+12412B,+10allocs` after Chrome auto-refreshed
+        /diagnostics on a kept-open tab. Threshold below tracks the
+        per-conn-leak fingerprint.
+
+        Skips if `aioquic` isn't importable."""
+        try:
+            import aioquic  # noqa: F401
+        except ImportError:
+            self.skipTest("aioquic not installed")
+        import re
+        buf = self._run_shutdown_scenario(
+            port_offset=400, hammer=False, h3_persistent=True,
+        )
+        leak_line = next(
+            (line for line in buf.splitlines() if b"HEAP_LEAK_CHECK" in line),
+            None,
+        )
+        self.assertIsNotNone(
+            leak_line, "no HEAP_LEAK_CHECK line in serial log",
+        )
+        print(f"    {leak_line.decode(errors='replace')}", flush=True)
+        m = re.search(rb"delta=\+(\d+)B,\+(\d+)allocs", leak_line)
+        if m is None:
+            return
+        bytes_leaked = int(m.group(1))
+        allocs_leaked = int(m.group(2))
+        # Same threshold as `test_ctrlc_h3_hammer_no_per_conn_leak`:
+        # tolerate the small unidentified Vec-growth leak (sub-1 KB,
+        # 0 net allocs); flag any per-conn shape (multi-alloc,
+        # kilobyte total).
+        self.assertLessEqual(
+            allocs_leaked, 4,
+            f"H3-persistent leaked {allocs_leaked} new allocations "
+            f"({bytes_leaked} bytes) — Connection didn't drop on "
+            f"force-shutdown ({leak_line.decode(errors='replace')})",
+        )
+        self.assertLessEqual(
+            bytes_leaked, 1024,
+            f"H3-persistent leaked {bytes_leaked} bytes — beyond the "
             f"~hundreds-of-bytes Vec-growth tolerance "
             f"({leak_line.decode(errors='replace')})",
         )
