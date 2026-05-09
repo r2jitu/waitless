@@ -744,6 +744,25 @@ auto-refreshes every 5 seconds; raw JSON endpoints below.</p>\
 const HEALTH_JSON: &[u8] =
     b"{\"status\":\"ok\",\"runtime\":\"unikernel\",\"version\":\"0.1.0\"}";
 
+/// Emit `"name":[v0,v1,...]` into `w` without a leading comma.
+/// Caller manages comma separators between fields. `T: Display`
+/// covers every numeric width the diagnostics endpoints use
+/// (`u64`, `u16`, `u32`, ...) without per-type duplication.
+fn emit_json_array<W, T>(w: &mut W, name: &str, slice: &[T])
+where
+    W: core::fmt::Write,
+    T: core::fmt::Display,
+{
+    let _ = write!(w, "\"{}\":[", name);
+    for (i, v) in slice.iter().enumerate() {
+        if i > 0 {
+            let _ = w.write_str(",");
+        }
+        let _ = write!(w, "{}", v);
+    }
+    let _ = w.write_str("]");
+}
+
 /// Per-queue RX frame counts + used-ring cursors + TX-side
 /// saturation/scan-depth/per-qp counters. Lets a monitoring agent
 /// or `/diagnostics` page see whether:
@@ -761,27 +780,30 @@ fn stats_response() -> Response {
     let nqp = uni::diagnostics::net_num_queue_pairs() as usize;
     let tx = uni::diagnostics::net_tx_diag();
 
+    // Project the (device_idx, driver_cursor) tuple into separate
+    // u16 slices so `emit_json_array` can render them — needed
+    // because the helper emits `T: Display` and there's no
+    // sensible Display impl for `(u16, u16)`.
+    let n = nqp.min(cursors.len());
+    let mut used_dev = [0u16; 8];
+    let mut used_drv = [0u16; 8];
+    for i in 0..n {
+        used_dev[i] = cursors[i].0;
+        used_drv[i] = cursors[i].1;
+    }
+
     // 2 KiB body region — covers nqp ≤ 32 with TX/RX arrays + the
     // small set of saturation scalars and stays well under cap.
     let mut body = uni_http::body_iobuf(2048);
     {
         let mut w = body.writer();
-        let _ = w.write_str("{\"rx_frames\":[");
-        for i in 0..nqp.min(counts.len()) {
-            if i > 0 { let _ = w.write_str(","); }
-            let _ = write!(w, "{}", counts[i]);
-        }
-        let _ = w.write_str("],\"rx_used_dev\":[");
-        for i in 0..nqp.min(cursors.len()) {
-            if i > 0 { let _ = w.write_str(","); }
-            let _ = write!(w, "{}", cursors[i].0);
-        }
-        let _ = w.write_str("],\"rx_used_drv\":[");
-        for i in 0..nqp.min(cursors.len()) {
-            if i > 0 { let _ = w.write_str(","); }
-            let _ = write!(w, "{}", cursors[i].1);
-        }
-        let _ = write!(w, "],\"num_queue_pairs\":{}", nqp);
+        let _ = w.write_str("{");
+        emit_json_array(&mut w, "rx_frames", &counts[..nqp.min(counts.len())]);
+        let _ = w.write_str(",");
+        emit_json_array(&mut w, "rx_used_dev", &used_dev[..n]);
+        let _ = w.write_str(",");
+        emit_json_array(&mut w, "rx_used_drv", &used_drv[..n]);
+        let _ = write!(w, ",\"num_queue_pairs\":{}", nqp);
 
         if let Some(t) = tx {
             // Average scan depth: high values vs `small_pool_size`
@@ -793,14 +815,15 @@ fn stats_response() -> Response {
             } else {
                 0
             };
-            let _ = w.write_str(",\"tx_packets\":[");
-            for i in 0..nqp.min(t.packets_per_qp.len()) {
-                if i > 0 { let _ = w.write_str(","); }
-                let _ = write!(w, "{}", t.packets_per_qp[i]);
-            }
+            let _ = w.write_str(",");
+            emit_json_array(
+                &mut w,
+                "tx_packets",
+                &t.packets_per_qp[..nqp.min(t.packets_per_qp.len())],
+            );
             let _ = write!(
                 w,
-                "],\"tx_small_pool_size\":{},\
+                ",\"tx_small_pool_size\":{},\
                   \"tx_big_pool_size\":{},\
                   \"tx_small_acquires\":{},\
                   \"tx_small_scan_iters\":{},\
