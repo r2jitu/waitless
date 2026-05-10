@@ -176,24 +176,37 @@ _X86_TRIPLES = [
     )
 ]
 
-# chacha20 and poly1305 get an extra `--cfg=..._force_soft` — something
-# in their x86 SIMD backends (not AVX2; SSE2 is also affected) produces
-# incorrect ciphertext on x86_64-unknown-none targets. The RFC 8439
-# known-answer test in apps/test_tls fails both ct_ok and tag_ok on
-# x86_64 with the SIMD path enabled, and bypassing SIMD at the crate
-# level makes it pass again. Both crates explicitly document
-# `chacha20_force_soft` / `poly1305_force_soft` as the way to pick the
-# portable constant-time software backend. Applied on all triples
-# (non-x86 builds don't hit the SIMD path anyway; belt-and-suspenders).
+# Note (2026-05-09): the "force_soft" workaround was added because
+# enabling SIMD ChaCha20+Poly1305 broke TLS. We've now identified
+# TWO separate problems behind that single symptom and only fixed
+# one of them, so we're keeping the workaround:
 #
-# Re-verified with Rust 1.93.1 (2026-05-09): removing the cfg gates
-# makes `test_qemu_x86_64` produce `EXCESSIVE_MESSAGE_SIZE` on every
-# TLS handshake, confirming the SIMD path still emits incorrect
-# ciphertext. So we stay on software ChaCha20+Poly1305 here; for
-# perf the long-term fix is to add AES-128-GCM as a TLS cipher
-# suite (the AES-NI path is verified-correct via the same
-# annotation_select target-feature flags above) and let modern
-# clients negotiate it.
+#   1. **TCG `-cpu max` SSE/AVX emulation gap** (not a Rust bug).
+#      `test_qemu_x86_64` produces wrong ciphertext under TCG when
+#      the SIMD path is on. Real KVM passthrough on n2-highcpu-8
+#      (Cascade Lake) handles the same code correctly. Wontfix
+#      from our side; that test would need to run under KVM, not
+#      TCG, to validate SIMD.
+#
+#   2. **YMM-state corruption in IDT stubs — FIXED**. Our ISR
+#      stubs (`boot/src/x86_64/idt_stubs.S`) used to save only
+#      general-purpose registers, leaving YMM exposed to clobber
+#      by LLVM-vectorised IRQ-handler code. Now we save/restore
+#      YMM0..15 around every handler call. That fix is correct
+#      and lands separately from this comment.
+#
+#   3. **Sapphire Rapids (c3 GCE) still loses TLS records** even
+#      with #2 fixed: plain HTTP scales fine (~490 K req/s @ 4c)
+#      but every TLS workload returns 0 req/s, while the same
+#      binary works on KVM/Cascade Lake. The c3 root cause is
+#      not yet identified — the symptoms are consistent with a
+#      crypto-output bug somewhere on the SPR-specific code path,
+#      but `gcloud compute instances get-serial-port-output` is
+#      sandboxed-blocked from this environment, so we can't read
+#      the panic message. Until we have a way to debug it
+#      (in-band /diag endpoint, alternate serial collection, or
+#      AES-128-GCM cipher suite), the production deploy stays on
+#      software ChaCha20+Poly1305.
 crate.annotation(
     crate = "chacha20",
     rustc_flags = ["--cfg=chacha20_force_soft"],

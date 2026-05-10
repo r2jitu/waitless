@@ -37,7 +37,7 @@
 
 .global isr_common
 isr_common:
-    // Save all general-purpose registers
+    // ---- Save general-purpose registers (15 × 8 = 120 B) -----------
     pushq %rax
     pushq %rbx
     pushq %rcx
@@ -54,18 +54,93 @@ isr_common:
     pushq %r14
     pushq %r15
 
-    // First argument (RDI) = pointer to InterruptFrame on stack
+    // First argument (RDI) = pointer to InterruptFrame on stack.
+    // Capture before we adjust RSP for SIMD save + ABI alignment.
     movq %rsp, %rdi
 
-    // Align stack to 16 bytes for the C ABI call.
-    // We've pushed 15 GP regs + vector + error_code + 5 CPU values = 22 qwords
-    // (176 bytes). The stack may not be 16-byte aligned, so save and align.
+    // ---- Save YMM0..YMM15 (16 × 32 = 512 B) ------------------------
+    //
+    // The interrupted code may be mid-way through SIMD work (chacha20
+    // record encrypt, p256 scalar mult, etc.) with live state in YMM
+    // registers. The Rust handler bodies (`isr_common_handler` →
+    // registered `InterruptHandler`s) are compiled with `+avx2` and
+    // LLVM may emit `vmov*`-style YMM clobbers anywhere — memcpy
+    // intrinsics, slice fills, atomics on aligned buffers, etc. —
+    // so we cannot assume the handler leaves YMM untouched.
+    //
+    // Without this save/restore the interrupted code resumes with
+    // garbage YMM values and produces wrong output. On c3 GCE
+    // (Sapphire Rapids + 4 gve MSI-X queues) this manifested as
+    // unrecoverable TLS corruption under load — the bug that the
+    // `--cfg=chacha20_force_soft` workaround in MODULE.bazel was
+    // hiding by keeping ChaCha20 strictly in GP registers.
+    //
+    // We use `vmovdqu` (unaligned move) so we don't need the stack
+    // to be 32-byte aligned at this point — the prior `pushq`s
+    // leave us at an arbitrary 8-byte boundary. A subsequent
+    // alignment of RSP for the C-ABI call comes after.
+    //
+    // We don't need to save YMM16..YMM31 / opmasks: AVX-512 isn't
+    // enabled in `XCR0` (we set bits [2:0] only) so LLVM won't emit
+    // those instructions; YMM0..15 is the full live SIMD state.
+    //
+    // We don't save x87 / MMX state: no Rust code in the kernel or
+    // its dependencies uses x87, and MMX has been deprecated for
+    // years. Adding it would just bloat the IRQ prolog.
+    subq $512, %rsp
+    vmovdqu %ymm0,  0(%rsp)
+    vmovdqu %ymm1,  32(%rsp)
+    vmovdqu %ymm2,  64(%rsp)
+    vmovdqu %ymm3,  96(%rsp)
+    vmovdqu %ymm4,  128(%rsp)
+    vmovdqu %ymm5,  160(%rsp)
+    vmovdqu %ymm6,  192(%rsp)
+    vmovdqu %ymm7,  224(%rsp)
+    vmovdqu %ymm8,  256(%rsp)
+    vmovdqu %ymm9,  288(%rsp)
+    vmovdqu %ymm10, 320(%rsp)
+    vmovdqu %ymm11, 352(%rsp)
+    vmovdqu %ymm12, 384(%rsp)
+    vmovdqu %ymm13, 416(%rsp)
+    vmovdqu %ymm14, 448(%rsp)
+    vmovdqu %ymm15, 480(%rsp)
+
+    // Align stack to 16 bytes for the C ABI call. Save the pre-align
+    // RSP in RBP so we can recover it after the call — that lands us
+    // back exactly at the YMM-save base.
     movq %rsp, %rbp
     andq $-16, %rsp
     call isr_common_handler
     movq %rbp, %rsp
 
-    // Restore all general-purpose registers
+    // ---- Restore YMM0..YMM15 ---------------------------------------
+    vmovdqu 0(%rsp),   %ymm0
+    vmovdqu 32(%rsp),  %ymm1
+    vmovdqu 64(%rsp),  %ymm2
+    vmovdqu 96(%rsp),  %ymm3
+    vmovdqu 128(%rsp), %ymm4
+    vmovdqu 160(%rsp), %ymm5
+    vmovdqu 192(%rsp), %ymm6
+    vmovdqu 224(%rsp), %ymm7
+    vmovdqu 256(%rsp), %ymm8
+    vmovdqu 288(%rsp), %ymm9
+    vmovdqu 320(%rsp), %ymm10
+    vmovdqu 352(%rsp), %ymm11
+    vmovdqu 384(%rsp), %ymm12
+    vmovdqu 416(%rsp), %ymm13
+    vmovdqu 448(%rsp), %ymm14
+    vmovdqu 480(%rsp), %ymm15
+    addq $512, %rsp
+
+    // No `vzeroupper` here: the entire kernel is compiled with
+    // `+avx2`, so all subsequent code (including the interrupted
+    // ChaCha20/Poly1305 SIMD path we're returning to) is
+    // VEX-encoded — there's no SSE-encoded code to transition
+    // back to. Worse, `vzeroupper` would CLOBBER the upper 128
+    // bits of YMM0..15 immediately after we restored them,
+    // corrupting the interrupted code's SIMD state.
+
+    // ---- Restore general-purpose registers ------------------------
     popq %r15
     popq %r14
     popq %r13
