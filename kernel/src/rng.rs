@@ -1,8 +1,8 @@
 // kernel/rng.rs — Kernel random number generator.
 //
 // Provides a `getrandom` custom backend so that crates pulling in
-// `rand_core::OsRng` (RustCrypto AEADs, x25519-dalek, p256,
-// rustls-rustcrypto, ...) can fill buffers without an OS syscall.
+// `rand_core::OsRng` (RustCrypto AEADs, x25519-dalek, p256, ...) can
+// fill buffers without an OS syscall.
 //
 // Construction:
 //
@@ -20,10 +20,21 @@
 //    AMD CPU since Zen (2017), which matches our `x86_64-v3`
 //    target baseline.
 //
-// 2. **Expansion** — the seed keys a ChaCha20 stream cipher whose
-//    keystream we hand back to callers. This is the same pattern
-//    Linux's `getrandom(2)` uses. ChaCha20 is in our build already
-//    via the `chacha20` crate (transitive of `chacha20poly1305`).
+// 2. **Expansion** — SHA-256 hash chain in counter mode. Each output
+//    block is `SHA256("unikernel rng expand v1\0" || seed || ctr_le)`,
+//    `ctr` advancing one per 32-byte block. This is the bulk
+//    construction underlying NIST SP 800-90A's Hash_DRBG (without
+//    the reseed counter logic, which we don't run long enough to
+//    need). SHA-NI on x86_64-v3+ Intel CPUs and FEAT_SHA256 on
+//    Apple Silicon / Graviton make this ~2-3 cycles/byte without
+//    pulling in a separate stream cipher crate.
+//
+//    The previous ChaCha20-keystream construction was equivalent in
+//    security but came from an outside crate (`chacha20` v0.9.x with
+//    a known SIMD-correctness bug on `x86_64-unknown-none`, requiring
+//    `--cfg=chacha20_force_soft` to dodge). Using `sha2` — already
+//    a direct dep for jitter mixing + TLS / QUIC HKDF — drops a crate
+//    from the kernel link line.
 //
 // **NOT a CSPRNG yet for production use.** The jitter source has not
 // been formally analysed for our targets, RDRAND alone shouldn't be
@@ -33,12 +44,9 @@
 
 #![allow(unsafe_op_in_unsafe_fn)] // SAFETY documented per call site
 
-extern crate chacha20;
 extern crate getrandom;
 extern crate sha2;
 
-use chacha20::cipher::{KeyIvInit, StreamCipher};
-use chacha20::ChaCha20;
 use core::cell::UnsafeCell;
 use sha2::{Digest, Sha256};
 
@@ -152,39 +160,57 @@ fn collect_seed() -> [u8; 32] {
 }
 
 // ============================================================================
-// ChaCha20 keystream RNG
+// SHA-256 hash-chain expander
 // ============================================================================
 
 /// The kernel's RNG state. Lazily seeded on first `fill_bytes` call.
 ///
-/// `Spinlock` because callers can come from any core and getrandom is
-/// fundamentally a global resource. The lock is held briefly: one
-/// `apply_keystream` call into a small buffer.
-struct RngCell(UnsafeCell<Option<ChaCha20>>);
+/// State is just `(seed, counter)` — each 32-byte output block is
+/// `SHA256(TAG || seed || counter_le)`, counter advancing one per
+/// block. `Spinlock` because callers can come from any core and
+/// getrandom is fundamentally a global resource; the lock is held
+/// briefly (one SHA-256 update + finalize per 32 bytes requested).
+struct ExpandState {
+    seed: [u8; 32],
+    counter: u64,
+}
+
+struct RngCell(UnsafeCell<Option<ExpandState>>);
 unsafe impl Sync for RngCell {}
 
 static RNG: RngCell = RngCell(UnsafeCell::new(None));
 static RNG_LOCK: Spinlock<()> = Spinlock::new(());
+
+/// Domain separation tag for the expand step. Distinct from the seed-
+/// collection tag in `collect_seed()` so a SHA-256 collision in one
+/// would not produce a collision in the other.
+const EXPAND_TAG: &[u8] = b"unikernel kernel rng expand v1\0";
 
 /// Fill `dest` with random bytes. Lazily seeds the RNG on first call.
 pub fn fill_bytes(dest: &mut [u8]) {
     let _g = RNG_LOCK.lock();
     // SAFETY: RNG_LOCK serialises all accesses to RNG.
     let slot = unsafe { &mut *RNG.0.get() };
-    if slot.is_none() {
-        let seed = collect_seed();
-        let key = chacha20::Key::from(seed);
-        // Fixed all-zero IV — the cipher key itself carries the
-        // freshness, and we never re-key.
-        let iv = chacha20::Nonce::from([0u8; 12]);
-        *slot = Some(ChaCha20::new(&key, &iv));
+    let state = slot.get_or_insert_with(|| ExpandState {
+        seed: collect_seed(),
+        counter: 0,
+    });
+
+    let mut offset = 0;
+    while offset < dest.len() {
+        let mut h = Sha256::new();
+        h.update(EXPAND_TAG);
+        h.update(state.seed);
+        h.update(state.counter.to_le_bytes());
+        let block = h.finalize();
+        // Counter advances even on the partial-tail block so the
+        // next call doesn't re-derive the same prefix.
+        state.counter = state.counter.wrapping_add(1);
+
+        let take = (dest.len() - offset).min(32);
+        dest[offset..offset + take].copy_from_slice(&block[..take]);
+        offset += take;
     }
-    let cipher = slot.as_mut().expect("seeded above");
-    // Generate keystream by encrypting a zero buffer of `dest.len()`.
-    for b in dest.iter_mut() {
-        *b = 0;
-    }
-    cipher.apply_keystream(dest);
 }
 
 // ============================================================================

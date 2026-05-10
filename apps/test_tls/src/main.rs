@@ -7,10 +7,10 @@
 // status accordingly.
 //
 // This is the integration test for everything we ship under uni-tls.
-// The host unit tests on //uni-tls cover chacha20/poly1305/aead
-// against RFC 8439 vectors; this test proves the TLS 1.3 key schedule
-// + X25519 round-trip + record AEAD actually run on bare metal and
-// produce self-consistent results.
+// The host unit tests on //uni-tls cover the AES-128-GCM AEAD
+// against NIST SP 800-38D vectors; this test proves the TLS 1.3 key
+// schedule + X25519 round-trip + record AEAD actually run on bare
+// metal and produce self-consistent results.
 
 #![no_std]
 
@@ -41,22 +41,22 @@ fn init() {
 
     let mut failures = 0u32;
 
-    // ---- 1. ChaCha20-Poly1305 AEAD round-trip --------------------------
+    // ---- 1. AES-128-GCM AEAD round-trip --------------------------------
     {
-        let key = [0x42u8; 32];
-        let nonce = [0x01u8; 12];
+        let key = [0x42u8; tls_crypto::KEY_LEN];
+        let nonce = [0x01u8; tls_crypto::NONCE_LEN];
         let aad = b"header";
         let plaintext: [u8; 32] = *b"unikernel says hi from handshake";
         let mut buf = [0u8; 32];
         buf.copy_from_slice(&plaintext);
 
-        let tag = tls_crypto::chacha20poly1305_seal(&key, &nonce, aad, &mut buf);
+        let tag = tls_crypto::seal(&key, &nonce, aad, &mut buf);
 
         // Ciphertext differs from plaintext (overwhelmingly probable).
         let ct_differs = buf != plaintext;
 
         // Round-trip via open().
-        let opened = tls_crypto::chacha20poly1305_open(&key, &nonce, aad, &mut buf, &tag);
+        let opened = tls_crypto::open(&key, &nonce, aad, &mut buf, &tag);
         let pt_recovered = opened.is_ok() && buf == plaintext;
 
         if ct_differs && pt_recovered {
@@ -68,10 +68,10 @@ fn init() {
 
         // Tamper detection: flip a tag bit, confirm open() rejects.
         let mut buf2 = plaintext;
-        let tag2 = tls_crypto::chacha20poly1305_seal(&key, &nonce, aad, &mut buf2);
+        let tag2 = tls_crypto::seal(&key, &nonce, aad, &mut buf2);
         let mut bad_tag = tag2;
         bad_tag[0] ^= 1;
-        let tampered = tls_crypto::chacha20poly1305_open(&key, &nonce, aad, &mut buf2, &bad_tag);
+        let tampered = tls_crypto::open(&key, &nonce, aad, &mut buf2, &bad_tag);
         if tampered.is_err() {
             pass(b"aead_tamper_detect");
         } else {
@@ -83,16 +83,14 @@ fn init() {
     // ---- 1b. Large-plaintext AEAD round-trip ---------------------------
     // Live handshake Certificate records are ~580 bytes of plaintext,
     // way past the 32-byte smoke test above. Any data-length-dependent
-    // bug in the SIMD path (e.g. wrong block-count handling at a
-    // specific size threshold) wouldn't show up in the small test but
-    // would cripple the real handshake — which is exactly what we saw
-    // on x86_64-unknown-none TCG after enabling `+avx,+avx2`. This
-    // test seals a 600-byte buffer and verifies the round-trip is
-    // byte-exact, catching any corruption from AVX emulation /
-    // length-gating bugs at its source.
+    // bug in the AES-NI / GHASH SIMD path (wrong block-count handling
+    // at a specific size threshold) wouldn't show up in the small test
+    // but would cripple the real handshake. This test seals a 600-byte
+    // buffer and verifies the round-trip is byte-exact, catching any
+    // corruption from CPU emulation / length-gating bugs at its source.
     {
-        let key = [0x77u8; 32];
-        let nonce = [0x33u8; 12];
+        let key = [0x77u8; tls_crypto::KEY_LEN];
+        let nonce = [0x33u8; tls_crypto::NONCE_LEN];
         let aad = b"5-byte";
         let mut original = [0u8; 600];
         // Fill with a non-trivial pattern so any XOR-then-XOR-back bug
@@ -104,7 +102,7 @@ fn init() {
         let mut buf = [0u8; 600];
         buf.copy_from_slice(&original);
 
-        let tag = tls_crypto::chacha20poly1305_seal(&key, &nonce, aad, &mut buf);
+        let tag = tls_crypto::seal(&key, &nonce, aad, &mut buf);
 
         // Ciphertext must differ from plaintext at >90% of positions
         // (probabilistically certain for any real stream cipher).
@@ -115,7 +113,7 @@ fn init() {
         let ct_looks_encrypted = differ > 540;
 
         // Round-trip.
-        let opened = tls_crypto::chacha20poly1305_open(&key, &nonce, aad, &mut buf, &tag);
+        let opened = tls_crypto::open(&key, &nonce, aad, &mut buf, &tag);
         let pt_recovered = opened.is_ok() && buf == original;
 
         if ct_looks_encrypted && pt_recovered {
@@ -126,58 +124,65 @@ fn init() {
         }
     }
 
-    // ---- 1c. AEAD known-answer vector (RFC 8439 §2.8.2) ---------------
+    // ---- 1c. AEAD known-answer vector (NIST SP 800-38D §B Test 4) -----
     // The round-trip tests above only prove seal(open(x)) == x — a bug
     // that produces consistent-but-wrong ciphertext (e.g. XOR with the
     // wrong stream) would still pass. This test pins seal() output
-    // against the RFC 8439 known-answer vector so we catch that case.
-    // If this fails but the round-trip passes, something in the chacha20
-    // or poly1305 SIMD path is producing a self-consistent but
-    // incorrect keystream.
+    // against the NIST SP 800-38D Test Case 4 known-answer vector so we
+    // catch that case. If this fails but the round-trip passes, the
+    // AES-NI / PCLMULQDQ / GHASH paths are producing self-consistent
+    // but incorrect output. Same vector that uni-tls's boot-time KAT
+    // pins against, just exercised here as a unikernel-side test too.
     {
-        let key: [u8; 32] = [
-            0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,
-            0x88, 0x89, 0x8a, 0x8b, 0x8c, 0x8d, 0x8e, 0x8f,
-            0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97,
-            0x98, 0x99, 0x9a, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f,
+        let key: [u8; 16] = [
+            0xfe, 0xff, 0xe9, 0x92, 0x86, 0x65, 0x73, 0x1c,
+            0x6d, 0x6a, 0x8f, 0x94, 0x67, 0x30, 0x83, 0x08,
         ];
         let nonce: [u8; 12] = [
-            0x07, 0x00, 0x00, 0x00,
-            0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47,
+            0xca, 0xfe, 0xba, 0xbe, 0xfa, 0xce, 0xdb, 0xad,
+            0xde, 0xca, 0xf8, 0x88,
         ];
-        let aad: [u8; 12] = [
-            0x50, 0x51, 0x52, 0x53, 0xc0, 0xc1, 0xc2, 0xc3,
-            0xc4, 0xc5, 0xc6, 0xc7,
+        let aad: [u8; 20] = [
+            0xfe, 0xed, 0xfa, 0xce, 0xde, 0xad, 0xbe, 0xef,
+            0xfe, 0xed, 0xfa, 0xce, 0xde, 0xad, 0xbe, 0xef,
+            0xab, 0xad, 0xda, 0xd2,
         ];
-        let plaintext: &[u8] = b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
-        let expected_ct: [u8; 114] = [
-            0xd3, 0x1a, 0x8d, 0x34, 0x64, 0x8e, 0x60, 0xdb, 0x7b, 0x86, 0xaf, 0xbc,
-            0x53, 0xef, 0x7e, 0xc2, 0xa4, 0xad, 0xed, 0x51, 0x29, 0x6e, 0x08, 0xfe,
-            0xa9, 0xe2, 0xb5, 0xa7, 0x36, 0xee, 0x62, 0xd6, 0x3d, 0xbe, 0xa4, 0x5e,
-            0x8c, 0xa9, 0x67, 0x12, 0x82, 0xfa, 0xfb, 0x69, 0xda, 0x92, 0x72, 0x8b,
-            0x1a, 0x71, 0xde, 0x0a, 0x9e, 0x06, 0x0b, 0x29, 0x05, 0xd6, 0xa5, 0xb6,
-            0x7e, 0xcd, 0x3b, 0x36, 0x92, 0xdd, 0xbd, 0x7f, 0x2d, 0x77, 0x8b, 0x8c,
-            0x98, 0x03, 0xae, 0xe3, 0x28, 0x09, 0x1b, 0x58, 0xfa, 0xb3, 0x24, 0xe4,
-            0xfa, 0xd6, 0x75, 0x94, 0x55, 0x85, 0x80, 0x8b, 0x48, 0x31, 0xd7, 0xbc,
-            0x3f, 0xf4, 0xde, 0xf0, 0x8e, 0x4b, 0x7a, 0x9d, 0xe5, 0x76, 0xd2, 0x65,
-            0x86, 0xce, 0xc6, 0x4b, 0x61, 0x16,
+        let plaintext: [u8; 60] = [
+            0xd9, 0x31, 0x32, 0x25, 0xf8, 0x84, 0x06, 0xe5,
+            0xa5, 0x59, 0x09, 0xc5, 0xaf, 0xf5, 0x26, 0x9a,
+            0x86, 0xa7, 0xa9, 0x53, 0x15, 0x34, 0xf7, 0xda,
+            0x2e, 0x4c, 0x30, 0x3d, 0x8a, 0x31, 0x8a, 0x72,
+            0x1c, 0x3c, 0x0c, 0x95, 0x95, 0x68, 0x09, 0x53,
+            0x2f, 0xcf, 0x0e, 0x24, 0x49, 0xa6, 0xb5, 0x25,
+            0xb1, 0x6a, 0xed, 0xf5, 0xaa, 0x0d, 0xe6, 0x57,
+            0xba, 0x63, 0x7b, 0x39,
+        ];
+        let expected_ct: [u8; 60] = [
+            0x42, 0x83, 0x1e, 0xc2, 0x21, 0x77, 0x74, 0x24,
+            0x4b, 0x72, 0x21, 0xb7, 0x84, 0xd0, 0xd4, 0x9c,
+            0xe3, 0xaa, 0x21, 0x2f, 0x2c, 0x02, 0xa4, 0xe0,
+            0x35, 0xc1, 0x7e, 0x23, 0x29, 0xac, 0xa1, 0x2e,
+            0x21, 0xd5, 0x14, 0xb2, 0x54, 0x66, 0x93, 0x1c,
+            0x7d, 0x8f, 0x6a, 0x5a, 0xac, 0x84, 0xaa, 0x05,
+            0x1b, 0xa3, 0x0b, 0x39, 0x6a, 0x0a, 0xac, 0x97,
+            0x3d, 0x58, 0xe0, 0x91,
         ];
         let expected_tag: [u8; 16] = [
-            0x1a, 0xe1, 0x0b, 0x59, 0x4f, 0x09, 0xe2, 0x6a,
-            0x7e, 0x90, 0x2e, 0xcb, 0xd0, 0x60, 0x06, 0x91,
+            0x5b, 0xc9, 0x4f, 0xbc, 0x32, 0x21, 0xa5, 0xdb,
+            0x94, 0xfa, 0xe9, 0x5a, 0xe7, 0x12, 0x1a, 0x47,
         ];
 
-        let mut buf = [0u8; 114];
-        buf.copy_from_slice(plaintext);
-        let tag = tls_crypto::chacha20poly1305_seal(&key, &nonce, &aad, &mut buf);
+        let mut buf = [0u8; 60];
+        buf.copy_from_slice(&plaintext);
+        let tag = tls_crypto::seal(&key, &nonce, &aad, &mut buf);
 
         let ct_ok = buf == expected_ct;
         let tag_ok = tag == expected_tag;
 
         if ct_ok && tag_ok {
-            pass(b"aead_rfc8439_known_answer");
+            pass(b"aead_nist_sp800_38d_known_answer");
         } else {
-            fail(b"aead_rfc8439_known_answer");
+            fail(b"aead_nist_sp800_38d_known_answer");
             logn(b"      ct_ok=");
             logn(if ct_ok { b"true " } else { b"false " });
             logn(b"tag_ok=");
@@ -307,8 +312,8 @@ fn init() {
 
     // ---- 6. uni::rng — fill_bytes produces non-trivial output ------
     // Smoke-tests the platform-appropriate entropy source: on
-    // unikernel that's the kernel's ChaCha20 PRNG seeded from
-    // TSC/CNTVCT + RDRAND; on native it's getentropy(2). We can't
+    // unikernel that's the kernel's SHA-256 hash-chain PRNG seeded
+    // from TSC/CNTVCT + RDRAND; on native it's getentropy(2). We can't
     // check randomness quality in a unit test, but we CAN check
     // (a) a 32-byte fill is non-zero, (b) two consecutive fills
     // differ, and (c) calling it never panics or hangs.

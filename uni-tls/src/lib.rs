@@ -12,9 +12,9 @@
 //
 //   lib.rs       public API + acceptor wiring + uni_http::Tls impl
 //   schedule.rs  TLS 1.3 key schedule, transcript, X25519, HKDF math
-//   aead.rs      ChaCha20-Poly1305 wrapper (the only AEAD TLS-over-
-//                  TCP needs; AES-128-GCM lives in //uni-quic for
-//                  Initial-packet protection)
+//   aead.rs      AES-128-GCM wrapper — the single AEAD shared by
+//                  TLS-over-TCP record protection here AND //uni-quic
+//                  packet protection (see RFC 9001 §5.3)
 //   handshake.rs ClientHello parser, server-flight builders,
 //                  signature-content shaper, finished helpers
 //   record.rs    TLS record framing (TCP-specific)
@@ -97,13 +97,13 @@ pub enum TlsError {
 ///
 /// `listen` / `acceptor` call this once on entry. Apps that build
 /// their own `TlsServerConfig` directly should call it once at
-/// boot too. Cost is one ECDSA sign + verify, one ChaCha20-Poly1305
+/// boot too. Cost is one ECDSA sign + verify, one AES-128-GCM
 /// seal + open, one X25519 keypair + ECDH — single-digit
 /// microseconds total on Apple silicon, dwarfed by `getrandom`'s
 /// own boot-time work.
 ///
 /// Without this, the first HTTPS / HTTP/3 connection's handshake
-/// allocates whichever precomputed scalar / Poly1305 / Curve25519
+/// allocates whichever precomputed scalar / GHASH / Curve25519
 /// tables those crates lazy-init on first use, and the post-
 /// shutdown leak check picks them up as a +N alloc delta. With it,
 /// the leak check can demand `delta == 0`.
@@ -126,8 +126,9 @@ pub fn preinit() {
         }
     }
 
-    // ChaCha20-Poly1305 seal + open exercise. Hits the Poly1305
-    // initialization path on first use.
+    // AES-128-GCM seal + open exercise. Hits the AES round-key
+    // expansion + GHASH H-table init the crate lazily allocates
+    // on the first cipher constructor.
     {
         let key = [0u8; aead::KEY_LEN];
         let nonce = [0u8; aead::NONCE_LEN];

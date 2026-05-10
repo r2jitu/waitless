@@ -10,11 +10,13 @@
 //   RFC 8446 §7.1  TLS 1.3 key schedule
 //   RFC 8446 §4.4  Key calculation (hash-input snapshots)
 //   RFC 5869        HKDF
-//   RFC 8439        ChaCha20-Poly1305 (used via //net:tls_crypto)
+//   NIST SP 800-38D AES-GCM (the AEAD this schedule feeds)
 //
 // Design notes:
 // - Hash: SHA-256 only (TLS_AES_128_GCM_SHA256, the suite we ship).
-// - AEAD: ChaCha20-Poly1305 only (via //net:tls_crypto).
+// - AEAD: AES-128-GCM only — RFC 8446 §9.1 mandatory-to-implement
+//   suite, hardware-accelerated via AES-NI / FEAT_AES on every
+//   target this project runs on.
 // - KX: X25519 only (the TLS 1.3 default group, smallest code, and the
 //   only MTI group shared with QUIC).
 // - No allocator usage on the hot path: the schedule carries fixed
@@ -35,9 +37,7 @@ use sha2::{Digest, Sha256};
 pub const HASH_LEN: usize = 32;
 
 /// TLS 1.3 AEAD key length for `TLS_AES_128_GCM_SHA256`, our sole
-/// negotiated cipher suite (post-migration from
-/// `TLS_CHACHA20_POLY1305_SHA256` which used 32). 16 bytes —
-/// AES-128 key.
+/// negotiated cipher suite. 16 bytes — AES-128 key.
 pub const KEY_LEN: usize = 16;
 
 /// TLS 1.3 AEAD nonce length (all currently-defined suites use 12 bytes).
@@ -252,8 +252,8 @@ impl TrafficKey {
     /// Fused copy-and-encrypt N-way variant of [`Self::seal`].
     /// Reads plaintext from `src_parts` (immutable byte slices),
     /// writes ciphertext to consecutive regions of `dst`,
-    /// computes one Poly1305 tag, and returns it. Auto-
-    /// increments `seq`.
+    /// computes one AES-GCM authentication tag, and returns it.
+    /// Auto-increments `seq`.
     ///
     /// Lets the TLS record layer skip the copy-then-encrypt-in-
     /// place pattern: instead of memcpy'ing chain bytes into a

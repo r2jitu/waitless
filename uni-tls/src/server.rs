@@ -187,7 +187,7 @@ pub enum HandshakeError {
     ParseError(ParseError),
     RecordError(RecordError),
     /// Client's ClientHello didn't meet our requirements
-    /// (missing TLS 1.3 / X25519 / ChaCha20-Poly1305).
+    /// (missing TLS 1.3 / X25519 / TLS_AES_128_GCM_SHA256).
     UnsupportedClient,
     /// AEAD tag mismatch on an incoming record.
     AeadFailed,

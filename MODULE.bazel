@@ -169,35 +169,16 @@ _X86_TRIPLES = [
         "primeorder",
         "elliptic-curve",
         "crypto-bigint",
-        # `chacha20` is RNG-only after the AES-128-GCM TLS migration
-        # (`kernel::rng` uses it as a CSPRNG expander). Keep the
-        # SIMD-enabling target-feature flag so the cpufeatures
-        # dispatch + soft path both compile cleanly even though
-        # `chacha20_force_soft` below pins us to the soft path at
-        # runtime.
-        "chacha20",
         "curve25519-dalek",
     )
 ]
 
-# `chacha20_force_soft` survives the AES-128-GCM TLS migration —
-# `kernel::rng` is the only remaining caller of the `chacha20`
-# crate, using `ChaCha20::new(...)` as a CSPRNG expander for its
-# seed-derived keystream. The SIMD backend on
-# `x86_64-unknown-none` produced wrong keystream in our boot-time
-# KAT (committed in `8109360`); the AEAD migration to AES-128-GCM
-# avoided the issue for TLS / QUIC, but RNG output runs through
-# the same SIMD dispatch and would emit a non-uniform stream
-# without this gate. Bad for X25519 ephemerals + any other
-# security-sensitive randomness — pin to the soft path.
-#
-# `poly1305_force_soft` removed: `poly1305` is no longer in our
-# dep tree (it was a `chacha20poly1305` transitive). bazel's
-# crate_universe rejects annotations on missing crates.
-crate.annotation(
-    crate = "chacha20",
-    rustc_flags = ["--cfg=chacha20_force_soft"],
-)
+# `chacha20` annotations dropped along with the crate itself —
+# `kernel::rng` was the last consumer (CSPRNG expander) and now
+# uses an in-crate SHA-256 hash chain, so the chacha20 dep is
+# gone from `Cargo.toml` + `crates-bridge`. Keeping the
+# annotations would make crate_universe error out with
+# "annotation on missing crate".
 
 # curve25519-dalek also needs a build-script override to force the
 # portable "serial" backend instead of the "simd" one that assumes

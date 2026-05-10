@@ -1,5 +1,5 @@
 {
-  "checksum": "ae91f57cf0e4a152cb74f8cacc7b5453fd4bdbe97fd3794e21f028c0d679fdc0",
+  "checksum": "a2e31cff43e2687d10de06eb6f0b2bd8b1915fe2d00b7e64cc577e1d9de88744",
   "crates": {
     "aead 0.5.2": {
       "name": "aead",
@@ -380,84 +380,6 @@
       ],
       "license_file": "LICENSE-APACHE"
     },
-    "chacha20 0.9.1": {
-      "name": "chacha20",
-      "version": "0.9.1",
-      "package_url": "https://github.com/RustCrypto/stream-ciphers",
-      "repository": {
-        "Http": {
-          "url": "https://static.crates.io/crates/chacha20/0.9.1/download",
-          "sha256": "c3613f74bd2eac03dad61bd53dbe620703d4371614fe0bc3b9f04dd36fe4e818"
-        }
-      },
-      "targets": [
-        {
-          "Library": {
-            "crate_name": "chacha20",
-            "crate_root": "src/lib.rs",
-            "srcs": {
-              "allow_empty": true,
-              "include": [
-                "**/*.rs"
-              ]
-            }
-          }
-        }
-      ],
-      "library_target_name": "chacha20",
-      "common_attrs": {
-        "compile_data_glob": [
-          "**"
-        ],
-        "crate_features": {
-          "common": [
-            "zeroize"
-          ],
-          "selects": {}
-        },
-        "deps": {
-          "common": [
-            {
-              "id": "cfg-if 1.0.4",
-              "target": "cfg_if"
-            },
-            {
-              "id": "cipher 0.4.4",
-              "target": "cipher"
-            }
-          ],
-          "selects": {
-            "cfg(any(target_arch = \"x86_64\", target_arch = \"x86\"))": [
-              {
-                "id": "cpufeatures 0.2.17",
-                "target": "cpufeatures"
-              }
-            ]
-          }
-        },
-        "edition": "2021",
-        "rustc_flags": {
-          "common": [
-            "--cfg=chacha20_force_soft"
-          ],
-          "selects": {
-            "x86_64-unknown-linux-gnu": [
-              "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmul,+fma,+bmi1,+bmi2"
-            ],
-            "x86_64-unknown-none": [
-              "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmul,+fma,+bmi1,+bmi2"
-            ]
-          }
-        },
-        "version": "0.9.1"
-      },
-      "license": "Apache-2.0 OR MIT",
-      "license_ids": [
-        "Apache-2.0",
-        "MIT"
-      ],
-      "license_file": "LICENSE-APACHE"
-    },
     "cipher 0.4.4": {
       "name": "cipher",
       "version": "0.4.4",
@@ -487,12 +409,6 @@
         "compile_data_glob": [
           "**"
         ],
-        "crate_features": {
-          "common": [
-            "zeroize"
-          ],
-          "selects": {}
-        },
         "deps": {
           "common": [
             {
@@ -502,10 +418,6 @@
             {
               "id": "inout 0.1.4",
               "target": "inout"
-            },
-            {
-              "id": "zeroize 1.8.2",
-              "target": "zeroize"
             }
           ],
           "selects": {}
@@ -660,10 +572,6 @@
             {
               "id": "bitflags 2.11.0",
               "target": "bitflags"
-            },
-            {
-              "id": "chacha20 0.9.1",
-              "target": "chacha20"
             },
             {
               "id": "fdt 0.1.5",
@@ -3472,10 +3380,6 @@
       "x86_64-unknown-linux-gnu",
       "x86_64-unknown-none"
     ],
-    "cfg(any(target_arch = \"x86_64\", target_arch = \"x86\"))": [
-      "x86_64-unknown-linux-gnu",
-      "x86_64-unknown-none"
-    ],
     "cfg(curve25519_dalek_backend = \"fiat\")": [],
     "cfg(target_arch = \"x86_64\")": [
       "x86_64-unknown-linux-gnu",
@@ -3496,7 +3400,6 @@
   "direct_deps": [
     "aes-gcm 0.10.3",
     "bitflags 2.11.0",
-    "chacha20 0.9.1",
     "fdt 0.1.5",
     "getrandom 0.2.17",
     "hkdf 0.12.4",

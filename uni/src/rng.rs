@@ -3,7 +3,8 @@
 // Thin cfg-switch over the two backends:
 //
 //   * `target_os = "none"` → `uni_kernel::rng::fill_bytes` (the kernel-
-//     side PRNG, seeded at boot from `getrandom` via `chacha20`).
+//     side PRNG: jitter-entropy + RDRAND seed, expanded via SHA-256
+//     hash chain).
 //   * else (unix host)     → `getentropy(2)` (POSIX; available on
 //     macOS + Linux glibc/musl).
 //

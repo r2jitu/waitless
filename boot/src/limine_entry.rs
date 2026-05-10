@@ -87,8 +87,8 @@ use limine::request::{ExecutableCmdlineRequest, RsdpRequest, MpRequest};
 //   - XCR0 is masked with CPUID.0Dh:EAX so we only enable bits
 //     (x87|SSE|AVX) that the CPU actually supports.
 //
-// Without this, p256 / chacha20poly1305 / etc. compiled with
-// the MODULE.bazel `+avx,+avx2` annotation crash with `#UD` on
+// Without this, p256 / aes-gcm / etc. compiled with the
+// MODULE.bazel `+avx,+avx2` annotation crash with `#UD` on
 // the first YMM instruction — manifests as a silent guest hang
 // during TLS config init.
 //

@@ -80,25 +80,20 @@ hkdf = { version = "0.12", default-features = false }
 # vs AES-NI. See git log around the migration commit for the
 # full forensic chain.
 #
-# AES-GCM auto-compiles both a SIMD intrinsic path AND a software
-# path, dispatched at runtime via `cpufeatures`, so BOTH must
-# compile. The stock `x86_64-unknown-none` target has
-# `+soft-float,-sse` baked in and LLVM bails with "Do not know
-# how to split the result of this operator!" (rust-lang/rust
-# #87642, #92760). Fixed per-crate in MODULE.bazel via
-# `crate.annotation` with `-Ctarget-feature=-soft-float,+sse,
-# +sse2,...,+aes,+pclmul`. The kernel already enables SSE at boot
+# Hardware acceleration: with `+aes,+pclmul,+sse2,+avx,+avx2`
+# baked in via `_X86_CRYPTO_FLAG` in MODULE.bazel, the
+# `cpufeatures::new!()` macros in `aes` + `polyval` evaluate to
+# compile-time `true`, so the AES-NI + PCLMULQDQ backends are
+# selected unconditionally — no runtime CPUID dispatch and no
+# soft-path fallback in the binary. The stock
+# `x86_64-unknown-none` target has `+soft-float,-sse` baked in
+# and LLVM bails with "Do not know how to split the result of
+# this operator!" (rust-lang/rust #87642, #92760) without those
+# overrides. The kernel already enables SSE at boot
 # (CR4.OSFXSR) and our cooperative scheduler never preempts, so
 # kernel-side SIMD is safe (see `boot/src/x86_64/idt_stubs.S`
 # for the YMM save/restore path that protects mid-IRQ SIMD).
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
-# `chacha20` stays — `kernel::rng` uses it as a CSPRNG expander
-# for its seed-derived keystream (NOT for TLS / QUIC AEAD; that
-# path is gone). Software path only on bare-metal; the SIMD
-# correctness regression that motivated the AES-GCM migration
-# only affects the AEAD-via-cpufeatures dispatch, not the
-# direct `ChaCha20::new(...)` constructor we use for RNG.
-chacha20 = { version = "0.9", default-features = false, features = ["zeroize"] }
 # Key exchange: X25519 is the only MTI group for TLS 1.3 and QUIC.
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
 # ECDSA P-256 + SHA-256 — the signature algorithm our TLS 1.3 server

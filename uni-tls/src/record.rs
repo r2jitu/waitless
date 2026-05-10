@@ -58,7 +58,7 @@ pub const OPAQUE_TYPE: u8 = content_type::APPLICATION_DATA;
 /// compatibility with middleboxes that inspect this field.
 pub const LEGACY_RECORD_VERSION: u16 = 0x0303;
 
-/// AEAD tag length (16 bytes for ChaCha20-Poly1305 and AES-GCM).
+/// AEAD tag length (16 bytes for AES-128-GCM).
 pub const TAG_LEN: usize = tls_crypto::TAG_LEN;
 
 /// Maximum TLSCiphertext record length, per RFC 8446 §5.2:
@@ -555,8 +555,8 @@ mod tests {
     }
 
     /// `seal_chain_to` produces wire bytes that round-trip
-    /// cleanly through `open`, including the multi-part Poly1305
-    /// block-straddle carry path.
+    /// cleanly through `open`, including the multi-part AES-GCM
+    /// 16-byte block-straddle path through GHASH.
     #[test]
     fn seal_chain_to_roundtrip() {
         let secret = [0xa5u8; 32];
@@ -564,7 +564,7 @@ mod tests {
         let mut receiver = tls::TrafficKey::from_secret(&secret);
 
         // Multi-part src chain, chosen lengths to exercise the
-        // 16-byte Poly1305 block-straddle path.
+        // 16-byte AES-GCM block-straddle path through GHASH.
         let mut src_chain = uni_iobuf::IOBufChain::new();
         for chunk in &[
             &b"HTTP/1.1 200 OK\r\n"[..],

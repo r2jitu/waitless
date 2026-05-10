@@ -474,8 +474,8 @@ runtime that ties it all together.</p></a>\
 <p>L2 to L7 written from scratch — virtio-net, ARP, IPv4/IPv6, TCP, \
 UDP, DHCP, NDP/SLAAC.</p></a>\
 <a class=\"card\" href=\"/tls\"><h3>TLS 1.3 →</h3>\
-<p>Hand-rolled TLS 1.3, ChaCha20-Poly1305, ECDSA P-256, session \
-resumption tickets.</p></a>\
+<p>Hand-rolled TLS 1.3, AES-128-GCM via AES-NI / FEAT_AES, ECDSA \
+P-256, session resumption tickets.</p></a>\
 <a class=\"card\" href=\"/quic\"><h3>QUIC + HTTP/3 →</h3>\
 <p>RFC 9000 v1, RFC 9001 TLS-over-QUIC, RFC 9114 H3, including 0-RTT \
 and key update.</p></a>\
@@ -597,9 +597,9 @@ rustls. Just the parts needed to terminate HTTPS for a server.</p>\
 <h2>Suite</h2>\
 <ul class=\"proto-list\">\
 <li><strong>Cipher</strong> · <code>TLS_AES_128_GCM_SHA256</code> \
-exclusively. AES paths exist for QUIC's Initial-level packet \
-protection (RFC 9001 mandates AES-128-GCM there) but post-handshake \
-we're ChaCha20 only.</li>\
+exclusively (RFC 8446 §9.1's mandatory-to-implement suite). The same \
+AES-128-GCM AEAD also protects QUIC packets per RFC 9001, so the \
+hardware path is shared between the TLS-over-TCP and HTTP/3 paths.</li>\
 <li><strong>(EC)DHE group</strong> · X25519. The server's ephemeral \
 keypair is fresh per connection.</li>\
 <li><strong>Certificate</strong> · ECDSA P-256 + SHA-256 \

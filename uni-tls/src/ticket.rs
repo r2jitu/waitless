@@ -1,6 +1,6 @@
 // TLS 1.3 session-ticket envelope.
 //
-// Seals an opaque resumption blob under a process-wide ChaCha20-Poly1305
+// Seals an opaque resumption blob under a process-wide AES-128-GCM
 // key, using a 16-byte key name as both routing tag (for future key
 // rotation) and AEAD AAD. The plaintext schema is fixed: version byte,
 // resumption_master_secret, ticket_age_add, issued_at_cycles,

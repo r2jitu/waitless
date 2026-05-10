@@ -609,8 +609,8 @@ fn pool_capacity(core: u32) -> usize {
 /// Previously this was a global counter that stepped by 64 000, which
 /// made the ISN trivially guessable and invited off-path sequence
 /// injection. Each new connection now gets a fresh 32-bit sample from
-/// the kernel RNG (ChaCha20 keystream, seeded from jitter + RDRAND on
-/// x86). One ChaCha block / connection is well below SYN cost.
+/// the kernel RNG (SHA-256 hash chain, seeded from jitter + RDRAND on
+/// x86). One SHA-256 block / connection is well below SYN cost.
 #[inline]
 fn next_seq() -> u32 {
     let mut buf = [0u8; 4];

@@ -58,7 +58,6 @@ rust_library(
         "//uni-worker",
         "//uni-platform",
         "//util/atomic_fn",
-        "@crates//:chacha20",
         "@crates//:getrandom",
         "@crates//:sha2",
         "@crates//:talc",
