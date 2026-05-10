@@ -185,6 +185,15 @@ _X86_TRIPLES = [
 # `chacha20_force_soft` / `poly1305_force_soft` as the way to pick the
 # portable constant-time software backend. Applied on all triples
 # (non-x86 builds don't hit the SIMD path anyway; belt-and-suspenders).
+#
+# Re-verified with Rust 1.93.1 (2026-05-09): removing the cfg gates
+# makes `test_qemu_x86_64` produce `EXCESSIVE_MESSAGE_SIZE` on every
+# TLS handshake, confirming the SIMD path still emits incorrect
+# ciphertext. So we stay on software ChaCha20+Poly1305 here; for
+# perf the long-term fix is to add AES-128-GCM as a TLS cipher
+# suite (the AES-NI path is verified-correct via the same
+# annotation_select target-feature flags above) and let modern
+# clients negotiate it.
 crate.annotation(
     crate = "chacha20",
     rustc_flags = ["--cfg=chacha20_force_soft"],
