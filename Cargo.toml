@@ -69,35 +69,36 @@ limine = { version = "0.5.0", default-features = false }
 sha2 = { version = "0.10", default-features = false }
 hmac = { version = "0.12", default-features = false }
 hkdf = { version = "0.12", default-features = false }
-# Audited AEAD for TLS 1.3 record encryption.
-#   - aes-gcm + polyval for TLS_AES_128_GCM_SHA256 / _256_ (future)
-#   - chacha20poly1305 + poly1305 + chacha20 for our MTI suite,
-#     TLS_CHACHA20_POLY1305_SHA256.
+# Audited AEAD for TLS 1.3 record encryption + QUIC packet
+# protection. We ship `TLS_AES_128_GCM_SHA256` exclusively (TLS
+# 1.3 RFC 8446 §9.1's mandatory-to-implement suite, and the
+# universal preference of every modern client when the receiver
+# advertises AES-NI / FEAT_AES). Pre-2026-05-09 the deploy used
+# `TLS_CHACHA20_POLY1305_SHA256`; the rustcrypto `chacha20`
+# v0.9.1 SIMD path produced wrong keystream on
+# `x86_64-unknown-none` and the soft path was costing real perf
+# vs AES-NI. See git log around the migration commit for the
+# full forensic chain.
 #
-# Every RustCrypto AEAD auto-compiles both a SIMD intrinsic path AND
-# a software path, dispatched at runtime via `cpufeatures`, so BOTH
-# must compile. The stock `x86_64-unknown-none` target has
-# `+soft-float,-sse` baked in and LLVM bails with "Do not know how
-# to split the result of this operator!" (rust-lang/rust#87642,
-# #92760). Fixed per-crate in MODULE.bazel via `crate.annotation`
-# with `-Ctarget-feature=-soft-float,+sse,+sse2,...`. The kernel
-# already enables SSE at boot (CR4.OSFXSR) and our cooperative
-# scheduler never preempts, so kernel-side SIMD is safe.
+# AES-GCM auto-compiles both a SIMD intrinsic path AND a software
+# path, dispatched at runtime via `cpufeatures`, so BOTH must
+# compile. The stock `x86_64-unknown-none` target has
+# `+soft-float,-sse` baked in and LLVM bails with "Do not know
+# how to split the result of this operator!" (rust-lang/rust
+# #87642, #92760). Fixed per-crate in MODULE.bazel via
+# `crate.annotation` with `-Ctarget-feature=-soft-float,+sse,
+# +sse2,...,+aes,+pclmul`. The kernel already enables SSE at boot
+# (CR4.OSFXSR) and our cooperative scheduler never preempts, so
+# kernel-side SIMD is safe (see `boot/src/x86_64/idt_stubs.S`
+# for the YMM save/restore path that protects mid-IRQ SIMD).
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
-chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
-# Direct dep on the chacha20 stream cipher so `kernel::rng` can use
-# it as the expander for its seed-derived keystream RNG. Pulled in
-# transitively by chacha20poly1305 anyway, but listing it explicitly
-# gives us a top-level `@crates//:chacha20` Bazel label. Also used
-# by `uni-tls`'s `aead.rs` for the scatter-gather seal path —
-# encrypts split body+trailer buffers in place with one ChaCha20
-# keystream pass.
+# `chacha20` stays — `kernel::rng` uses it as a CSPRNG expander
+# for its seed-derived keystream (NOT for TLS / QUIC AEAD; that
+# path is gone). Software path only on bare-metal; the SIMD
+# correctness regression that motivated the AES-GCM migration
+# only affects the AEAD-via-cpufeatures dispatch, not the
+# direct `ChaCha20::new(...)` constructor we use for RNG.
 chacha20 = { version = "0.9", default-features = false, features = ["zeroize"] }
-# Audited Poly1305 MAC. Pulled in transitively by chacha20poly1305
-# (which uses it to compute the AEAD tag); listed explicitly so
-# `uni-tls`'s scatter-gather seal path can drive it directly
-# (block-by-block update over body+trailer + manual padding).
-poly1305 = { version = "0.8", default-features = false }
 # Key exchange: X25519 is the only MTI group for TLS 1.3 and QUIC.
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
 # ECDSA P-256 + SHA-256 — the signature algorithm our TLS 1.3 server

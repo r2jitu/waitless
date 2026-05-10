@@ -1,11 +1,13 @@
-// net/quic_crypto.rs — RFC 9001 packet protection.
+// uni-quic/crypto.rs — RFC 9001 packet protection.
 //
 // Initial-keys derivation (§5.2), AEAD packet protection (§5.3),
-// and header protection (§5.4). Reuses `//net:tls`'s
-// HKDF-Expand-Label and `//net:tls_crypto`'s ChaCha20-Poly1305;
-// adds AES-128-GCM + AES-128-ECB for the Initial packet path
-// (AES is mandatory for Initial per §5.2, regardless of which
-// 1-RTT cipher suite the TLS handshake selects).
+// and header protection (§5.4). Reuses `//uni-tls`'s
+// HKDF-Expand-Label. After the AES-128-GCM TLS migration,
+// EVERY QUIC packet stage uses the same AEAD primitive
+// (AES-128-GCM + AES-128-ECB-based HP mask) — Initial,
+// Handshake, and 1-RTT all derive 16-byte keys via "quic key" /
+// "quic iv" / "quic hp" HKDF labels and feed the same seal/open
+// helpers below. No more ChaCha20-Poly1305 path in QUIC at all.
 //
 // Pure crypto layer — no I/O, no QUIC state. The connection state
 // machine and `quic_wire` together drive `seal` / `open` per
@@ -18,8 +20,8 @@
 
 // (no-std declaration is in lib.rs. The TLS sans-io modules
 // (`schedule`, `aead`) live in the //uni-tls crate; this module
-// pulls in `hkdf_expand_label` and `chacha20poly1305_*` from
-// there to share the audited TLS 1.3 primitives.)
+// pulls in `hkdf_expand_label` from there to share the audited
+// TLS 1.3 primitives.)
 
 // `aes-gcm 0.10` re-exports the underlying `aes` crate (`pub use aes;`),
 // so we get `Aes128` for free without adding a top-level dep.
@@ -28,10 +30,7 @@ use aes_gcm::aes::cipher::generic_array::GenericArray;
 use aes_gcm::aes::cipher::BlockEncrypt;
 use aes_gcm::aes::Aes128;
 use aes_gcm::Aes128Gcm;
-use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
-use chacha20::ChaCha20;
 
-use uni_tls::aead as tls_crypto;
 use uni_tls::schedule::hkdf_expand_label;
 
 /// SHA-256 output / key-schedule hash length.
@@ -40,14 +39,11 @@ pub const HASH_LEN: usize = 32;
 /// QUIC v1 nonce length is 12 bytes regardless of AEAD (§5.3).
 pub const NONCE_LEN: usize = 12;
 
-/// AES-128-GCM key length (Initial packets, §5.2).
+/// AES-128-GCM key length. Used for every QUIC stage now that
+/// TLS_AES_128_GCM_SHA256 is the (sole) negotiated cipher suite.
 pub const AES_KEY_LEN: usize = 16;
 
-/// ChaCha20-Poly1305 key length (Handshake + 1-RTT once
-/// CHACHA20_POLY1305_SHA256 is negotiated).
-pub const CHACHA_KEY_LEN: usize = 32;
-
-/// AEAD tag length (16 bytes for both AES-GCM and ChaCha20-Poly1305).
+/// AEAD tag length (16 bytes for AES-128-GCM).
 pub const TAG_LEN: usize = 16;
 
 /// Header-protection sample size (§5.4.2): 16 bytes regardless of
@@ -126,30 +122,23 @@ pub fn derive_initial_keys(secret: &[u8; HASH_LEN]) -> InitialKeys {
     InitialKeys { key, iv, hp }
 }
 
-/// 1-RTT / Handshake-stage keys for ChaCha20-Poly1305 packet
-/// protection. Used after the TLS handshake hands us the
-/// application-traffic secret (or the handshake traffic secret
-/// for Handshake packets). Same structure as `InitialKeys` but
-/// 32-byte AEAD + HP keys.
-pub struct ChaChaKeys {
-    pub key: [u8; CHACHA_KEY_LEN],
-    pub iv: [u8; NONCE_LEN],
-    /// Header-protection key for ChaCha20 — used as a stream
-    /// cipher with the sample bytes split into counter + nonce
-    /// (RFC 9001 §5.4.4).
-    pub hp: [u8; CHACHA_KEY_LEN],
-}
-
-/// Derive `(key, iv, hp)` for ChaCha20-Poly1305 packet protection
-/// from a TLS traffic secret per RFC 9001 §5.1.
-pub fn derive_chacha_keys(secret: &[u8; HASH_LEN]) -> ChaChaKeys {
-    let mut key = [0u8; CHACHA_KEY_LEN];
+/// Derive `(key, iv, hp)` for AES-128-GCM packet protection from
+/// a TLS traffic secret per RFC 9001 §5.1. Used for Handshake +
+/// 1-RTT stages now that all QUIC AEAD is AES-128-GCM.
+/// Initial-stage uses `derive_initial_keys` instead, with the
+/// same `InitialKeys` shape but a different HKDF label set.
+///
+/// Identical key/iv/hp shape to `InitialKeys` (which used to be
+/// the only AES-128 keys struct); reuses that type to keep
+/// downstream code small.
+pub fn derive_aes128_keys(secret: &[u8; HASH_LEN]) -> InitialKeys {
+    let mut key = [0u8; AES_KEY_LEN];
     let mut iv = [0u8; NONCE_LEN];
-    let mut hp = [0u8; CHACHA_KEY_LEN];
+    let mut hp = [0u8; AES_KEY_LEN];
     hkdf_expand_label(secret, b"quic key", &[], &mut key);
     hkdf_expand_label(secret, b"quic iv", &[], &mut iv);
     hkdf_expand_label(secret, b"quic hp", &[], &mut hp);
-    ChaChaKeys { key, iv, hp }
+    InitialKeys { key, iv, hp }
 }
 
 /// Update a 1-RTT traffic secret to its next key-phase value per
@@ -157,7 +146,7 @@ pub fn derive_chacha_keys(secret: &[u8; HASH_LEN]) -> ChaChaKeys {
 ///
 ///     next_secret = HKDF-Expand-Label(current_secret, "quic ku", "", 32)
 ///
-/// Caller then runs `derive_chacha_keys` on the result to get the
+/// Caller then runs `derive_aes128_keys` on the result to get the
 /// AEAD `key` + `iv` for the new key phase. The HP key is **not**
 /// updated — RFC 9001 §6.1 explicitly carries it across phases —
 /// so the caller reuses the existing HP from `current_secret`'s
@@ -221,27 +210,11 @@ pub fn aes128_gcm_open(
         .map_err(|_| ())
 }
 
-/// Re-export of `seal` from `tls_crypto` for symmetry
-/// — QUIC packet protection uses the same primitive.
-pub fn chacha20_poly1305_seal(
-    key: &[u8; CHACHA_KEY_LEN],
-    nonce: &[u8; NONCE_LEN],
-    aad: &[u8],
-    data: &mut [u8],
-) -> [u8; TAG_LEN] {
-    tls_crypto::seal(key, nonce, aad, data)
-}
-
-/// Re-export of `open` for symmetry with seal.
-pub fn chacha20_poly1305_open(
-    key: &[u8; CHACHA_KEY_LEN],
-    nonce: &[u8; NONCE_LEN],
-    aad: &[u8],
-    data: &mut [u8],
-    tag: &[u8; TAG_LEN],
-) -> Result<(), ()> {
-    tls_crypto::open(key, nonce, aad, data, tag)
-}
+// `chacha20_poly1305_seal/open` removed in the AES-128-GCM TLS
+// migration — QUIC now uses `aes128_gcm_seal/open` for every stage
+// (Initial / Handshake / 1-RTT). Resurrect from git history if a
+// future deploy ever needs ChaCha20-Poly1305 negotiation back
+// (no client we test cares).
 
 // ============================================================================
 // §5.4 — Header Protection
@@ -260,24 +233,10 @@ pub fn hp_mask_aes128(hp_key: &[u8; AES_KEY_LEN], sample: &[u8; HP_SAMPLE_LEN]) 
     mask
 }
 
-/// Compute the 5-byte header-protection mask for ChaCha20 per
-/// RFC 9001 §5.4.4. Sample splits into a 32-bit LE block-counter
-/// and a 12-byte nonce; ChaCha20 with that counter produces a
-/// keystream and we take the first 5 bytes.
-pub fn hp_mask_chacha20(
-    hp_key: &[u8; CHACHA_KEY_LEN],
-    sample: &[u8; HP_SAMPLE_LEN],
-) -> [u8; HP_MASK_LEN] {
-    let counter = u32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]);
-    let nonce_bytes: [u8; 12] = sample[4..16].try_into().unwrap();
-    let key = chacha20::Key::from_slice(hp_key);
-    let nonce = chacha20::Nonce::from_slice(&nonce_bytes);
-    let mut cipher = ChaCha20::new(key, nonce);
-    cipher.seek((counter as u64) * 64);
-    let mut buf = [0u8; HP_MASK_LEN];
-    cipher.apply_keystream(&mut buf);
-    buf
-}
+// `hp_mask_chacha20` removed in the AES-128-GCM TLS migration.
+// Every QUIC stage (Initial / Handshake / 1-RTT) now uses
+// `hp_mask_aes128`. Resurrect from git history if a future deploy
+// ever needs ChaCha20 HP back.
 
 /// Apply (or reverse — XOR is its own inverse) header protection
 /// to a packet's first byte and packet-number bytes, given a
@@ -466,20 +425,10 @@ mod tests {
         assert!(aes128_gcm_open(&key, &nonce, aad, &mut buf2, &bad_tag).is_err());
     }
 
-    #[test]
-    fn hp_mask_chacha20_known_answer() {
-        // RFC 9001 §A.5 supplies a ChaCha20 HP test vector:
-        //   hp = 25a282b9e82f06f21f488917a4fc8f1b73573685608597d0efcb076b0ab7a7a4
-        //   sample = 5e5cd55c41f69080575d7999c25a5bfb
-        //   mask = aefefe7d03
-        let hp: [u8; 32] = hex32(
-            "25a282b9e82f06f21f488917a4fc8f1b\
-             73573685608597d0efcb076b0ab7a7a4",
-        );
-        let sample: [u8; 16] = hex16("5e5cd55c41f69080575d7999c25a5bfb");
-        let mask = hp_mask_chacha20(&hp, &sample);
-        assert_eq!(&mask[..], &hex16("aefefe7d030000000000000000000000")[..5]);
-    }
+    // `hp_mask_chacha20_known_answer` removed with the
+    // ChaCha20-Poly1305 → AES-128-GCM migration. RFC 9001 §A.5's
+    // ChaCha20 vector lives in git history if a future reverse
+    // migration ever needs it.
 
     #[test]
     fn hp_mask_aes128_known_answer() {
@@ -524,15 +473,12 @@ mod tests {
         assert_eq!(pn, [0x11 ^ 0xaa, 0x22 ^ 0xbb, 0x33 ^ 0xcc, 0x44 ^ 0xdd]);
     }
 
-    #[test]
-    fn chacha_keys_distinct_from_initial() {
-        // Sanity: `derive_chacha_keys` and `derive_initial_keys`
-        // operate on the same secret API but produce different
-        // shapes (32-byte vs 16-byte keys), so they aren't
-        // accidentally aliased.
-        assert_eq!(CHACHA_KEY_LEN, 32);
-        assert_eq!(AES_KEY_LEN, 16);
-    }
+    // `chacha_keys_distinct_from_initial` removed: post-migration
+    // `derive_aes128_keys` and `derive_initial_keys` produce the
+    // same shape (16-byte keys); only the HKDF-Expand-Label salt
+    // differs. They're not aliased — different functions, different
+    // labels — but the size-distinction sanity check is no longer
+    // meaningful.
 
     /// Wire-compat test against quinn-proto's known-answer
     /// Initial packet (`packet.rs::header_encoding`). Same inputs

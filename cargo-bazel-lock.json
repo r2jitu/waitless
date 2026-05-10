@@ -1,5 +1,5 @@
 {
-  "checksum": "f16b34b6b1a730bc6d5b6174be785779a07d009bf175d0c7a4d8e8adb9ed9ce6",
+  "checksum": "ae91f57cf0e4a152cb74f8cacc7b5453fd4bdbe97fd3794e21f028c0d679fdc0",
   "crates": {
     "aead 0.5.2": {
       "name": "aead",
@@ -458,87 +458,6 @@
       ],
       "license_file": "LICENSE-APACHE"
     },
-    "chacha20poly1305 0.10.1": {
-      "name": "chacha20poly1305",
-      "version": "0.10.1",
-      "package_url": "https://github.com/RustCrypto/AEADs/tree/master/chacha20poly1305",
-      "repository": {
-        "Http": {
-          "url": "https://static.crates.io/crates/chacha20poly1305/0.10.1/download",
-          "sha256": "10cd79432192d1c0f4e1a0fef9527696cc039165d729fb41b3f4f4f354c2dc35"
-        }
-      },
-      "targets": [
-        {
-          "Library": {
-            "crate_name": "chacha20poly1305",
-            "crate_root": "src/lib.rs",
-            "srcs": {
-              "allow_empty": true,
-              "include": [
-                "**/*.rs"
-              ]
-            }
-          }
-        }
-      ],
-      "library_target_name": "chacha20poly1305",
-      "common_attrs": {
-        "compile_data_glob": [
-          "**"
-        ],
-        "crate_features": {
-          "common": [
-            "alloc"
-          ],
-          "selects": {}
-        },
-        "deps": {
-          "common": [
-            {
-              "id": "aead 0.5.2",
-              "target": "aead"
-            },
-            {
-              "id": "chacha20 0.9.1",
-              "target": "chacha20"
-            },
-            {
-              "id": "cipher 0.4.4",
-              "target": "cipher"
-            },
-            {
-              "id": "poly1305 0.8.0",
-              "target": "poly1305"
-            },
-            {
-              "id": "zeroize 1.8.2",
-              "target": "zeroize"
-            }
-          ],
-          "selects": {}
-        },
-        "edition": "2021",
-        "rustc_flags": {
-          "common": [],
-          "selects": {
-            "x86_64-unknown-linux-gnu": [
-              "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmul,+fma,+bmi1,+bmi2"
-            ],
-            "x86_64-unknown-none": [
-              "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmul,+fma,+bmi1,+bmi2"
-            ]
-          }
-        },
-        "version": "0.10.1"
-      },
-      "license": "Apache-2.0 OR MIT",
-      "license_ids": [
-        "Apache-2.0",
-        "MIT"
-      ],
-      "license_file": "LICENSE-APACHE"
-    },
     "cipher 0.4.4": {
       "name": "cipher",
       "version": "0.4.4",
@@ -747,10 +666,6 @@
               "target": "chacha20"
             },
             {
-              "id": "chacha20poly1305 0.10.1",
-              "target": "chacha20poly1305"
-            },
-            {
               "id": "fdt 0.1.5",
               "target": "fdt"
             },
@@ -773,10 +688,6 @@
             {
               "id": "p256 0.13.2",
               "target": "p256"
-            },
-            {
-              "id": "poly1305 0.8.0",
-              "target": "poly1305"
             },
             {
               "id": "rand_core 0.6.4",
@@ -2319,78 +2230,6 @@
       ],
       "license_file": "LICENSE-APACHE"
     },
-    "poly1305 0.8.0": {
-      "name": "poly1305",
-      "version": "0.8.0",
-      "package_url": "https://github.com/RustCrypto/universal-hashes",
-      "repository": {
-        "Http": {
-          "url": "https://static.crates.io/crates/poly1305/0.8.0/download",
-          "sha256": "8159bd90725d2df49889a078b54f4f79e87f1f8a8444194cdca81d38f5393abf"
-        }
-      },
-      "targets": [
-        {
-          "Library": {
-            "crate_name": "poly1305",
-            "crate_root": "src/lib.rs",
-            "srcs": {
-              "allow_empty": true,
-              "include": [
-                "**/*.rs"
-              ]
-            }
-          }
-        }
-      ],
-      "library_target_name": "poly1305",
-      "common_attrs": {
-        "compile_data_glob": [
-          "**"
-        ],
-        "deps": {
-          "common": [
-            {
-              "id": "opaque-debug 0.3.1",
-              "target": "opaque_debug"
-            },
-            {
-              "id": "universal-hash 0.5.1",
-              "target": "universal_hash"
-            }
-          ],
-          "selects": {
-            "cfg(any(target_arch = \"x86_64\", target_arch = \"x86\"))": [
-              {
-                "id": "cpufeatures 0.2.17",
-                "target": "cpufeatures"
-              }
-            ]
-          }
-        },
-        "edition": "2021",
-        "rustc_flags": {
-          "common": [
-            "--cfg=poly1305_force_soft"
-          ],
-          "selects": {
-            "x86_64-unknown-linux-gnu": [
-              "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmul,+fma,+bmi1,+bmi2"
-            ],
-            "x86_64-unknown-none": [
-              "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmul,+fma,+bmi1,+bmi2"
-            ]
-          }
-        },
-        "version": "0.8.0"
-      },
-      "license": "Apache-2.0 OR MIT",
-      "license_ids": [
-        "Apache-2.0",
-        "MIT"
-      ],
-      "license_file": "LICENSE-APACHE"
-    },
     "polyval 0.6.2": {
       "name": "polyval",
       "version": "0.6.2",
@@ -3658,7 +3497,6 @@
     "aes-gcm 0.10.3",
     "bitflags 2.11.0",
     "chacha20 0.9.1",
-    "chacha20poly1305 0.10.1",
     "fdt 0.1.5",
     "getrandom 0.2.17",
     "hkdf 0.12.4",
@@ -3666,7 +3504,6 @@
     "libc 0.2.185",
     "limine 0.5.0",
     "p256 0.13.2",
-    "poly1305 0.8.0",
     "rand_core 0.6.4",
     "sha2 0.10.9",
     "talc 4.4.3",

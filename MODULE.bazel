@@ -169,51 +169,34 @@ _X86_TRIPLES = [
         "primeorder",
         "elliptic-curve",
         "crypto-bigint",
+        # `chacha20` is RNG-only after the AES-128-GCM TLS migration
+        # (`kernel::rng` uses it as a CSPRNG expander). Keep the
+        # SIMD-enabling target-feature flag so the cpufeatures
+        # dispatch + soft path both compile cleanly even though
+        # `chacha20_force_soft` below pins us to the soft path at
+        # runtime.
         "chacha20",
-        "chacha20poly1305",
-        "poly1305",
         "curve25519-dalek",
     )
 ]
 
-# Note (2026-05-09): the "force_soft" workaround was added because
-# enabling SIMD ChaCha20+Poly1305 broke TLS. We've now identified
-# TWO separate problems behind that single symptom and only fixed
-# one of them, so we're keeping the workaround:
+# `chacha20_force_soft` survives the AES-128-GCM TLS migration —
+# `kernel::rng` is the only remaining caller of the `chacha20`
+# crate, using `ChaCha20::new(...)` as a CSPRNG expander for its
+# seed-derived keystream. The SIMD backend on
+# `x86_64-unknown-none` produced wrong keystream in our boot-time
+# KAT (committed in `8109360`); the AEAD migration to AES-128-GCM
+# avoided the issue for TLS / QUIC, but RNG output runs through
+# the same SIMD dispatch and would emit a non-uniform stream
+# without this gate. Bad for X25519 ephemerals + any other
+# security-sensitive randomness — pin to the soft path.
 #
-#   1. **TCG `-cpu max` SSE/AVX emulation gap** (not a Rust bug).
-#      `test_qemu_x86_64` produces wrong ciphertext under TCG when
-#      the SIMD path is on. Real KVM passthrough on n2-highcpu-8
-#      (Cascade Lake) handles the same code correctly. Wontfix
-#      from our side; that test would need to run under KVM, not
-#      TCG, to validate SIMD.
-#
-#   2. **YMM-state corruption in IDT stubs — FIXED**. Our ISR
-#      stubs (`boot/src/x86_64/idt_stubs.S`) used to save only
-#      general-purpose registers, leaving YMM exposed to clobber
-#      by LLVM-vectorised IRQ-handler code. Now we save/restore
-#      YMM0..15 around every handler call. That fix is correct
-#      and lands separately from this comment.
-#
-#   3. **Sapphire Rapids (c3 GCE) still loses TLS records** even
-#      with #2 fixed: plain HTTP scales fine (~490 K req/s @ 4c)
-#      but every TLS workload returns 0 req/s, while the same
-#      binary works on KVM/Cascade Lake. The c3 root cause is
-#      not yet identified — the symptoms are consistent with a
-#      crypto-output bug somewhere on the SPR-specific code path,
-#      but `gcloud compute instances get-serial-port-output` is
-#      sandboxed-blocked from this environment, so we can't read
-#      the panic message. Until we have a way to debug it
-#      (in-band /diag endpoint, alternate serial collection, or
-#      AES-128-GCM cipher suite), the production deploy stays on
-#      software ChaCha20+Poly1305.
+# `poly1305_force_soft` removed: `poly1305` is no longer in our
+# dep tree (it was a `chacha20poly1305` transitive). bazel's
+# crate_universe rejects annotations on missing crates.
 crate.annotation(
     crate = "chacha20",
     rustc_flags = ["--cfg=chacha20_force_soft"],
-)
-crate.annotation(
-    crate = "poly1305",
-    rustc_flags = ["--cfg=poly1305_force_soft"],
 )
 
 # curve25519-dalek also needs a build-script override to force the

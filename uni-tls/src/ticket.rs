@@ -372,7 +372,7 @@ mod tests {
             resumption_master_secret: [0xCC; 32],
             ticket_age_add: 0xdead_beef,
             issued_at_cycles: 1_000_000,
-            cipher_suite: 0x1303, // TLS_CHACHA20_POLY1305_SHA256
+            cipher_suite: 0x1303, // TLS_AES_128_GCM_SHA256
         }
     }
 

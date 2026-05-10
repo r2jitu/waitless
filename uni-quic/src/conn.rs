@@ -47,10 +47,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::crypto::{
-    aes128_gcm_open, aes128_gcm_seal, apply_hp_mask, chacha20_poly1305_open,
-    chacha20_poly1305_seal, derive_chacha_keys, derive_initial_keys, derive_initial_secrets,
-    hp_mask_aes128, hp_mask_chacha20, next_traffic_secret, packet_nonce, AES_KEY_LEN,
-    CHACHA_KEY_LEN, HP_MASK_LEN, HP_SAMPLE_LEN, NONCE_LEN, TAG_LEN,
+    aes128_gcm_open, aes128_gcm_seal, apply_hp_mask, derive_aes128_keys, derive_initial_keys,
+    derive_initial_secrets, hp_mask_aes128, next_traffic_secret, packet_nonce, AES_KEY_LEN,
+    HP_MASK_LEN, HP_SAMPLE_LEN, NONCE_LEN, TAG_LEN,
 };
 use crate::frame::{parse_frame, write_ack, write_crypto, Frame};
 use crate::wire::{
@@ -126,74 +125,44 @@ impl ConnectionId {
 // Per-direction packet protection keys
 // ============================================================================
 
-/// Variable-key-length AEAD/HP key material. AES-128-GCM uses
-/// 16-byte AEAD + 16-byte HP keys; ChaCha20-Poly1305 uses 32-byte
-/// for both. Stored as fixed 32-byte arrays with a length byte
-/// so the connection can hold either without an enum-per-stage.
+/// AEAD/HP key material for one direction (client→server or
+/// server←client) at one packet-protection stage (Initial,
+/// Handshake, or 1-RTT). Always AES-128-GCM (16-byte AEAD key,
+/// 12-byte IV, 16-byte HP key) since `TLS_AES_128_GCM_SHA256` is
+/// our sole negotiated cipher suite. Pre-migration the struct
+/// carried a `is_chacha` discriminant + 32-byte buffers to also
+/// hold ChaCha20-Poly1305 keys; the migration to AES-128-GCM
+/// dropped the discriminant + halved the buffer sizes.
 #[derive(Clone)]
 struct DirKeys {
-    aead: [u8; CHACHA_KEY_LEN],
+    aead: [u8; AES_KEY_LEN],
     iv: [u8; NONCE_LEN],
-    hp: [u8; CHACHA_KEY_LEN],
-    aead_len: u8, // 16 or 32
-    hp_len: u8,   // 16 or 32
-    /// `true` for ChaCha20-Poly1305 + ChaCha20 HP, `false` for
-    /// AES-128-GCM + AES-128-ECB HP (Initial uses AES, post-handshake
-    /// uses whichever the TLS suite negotiated — we only support
-    /// CHACHA20_POLY1305_SHA256, so post-Initial is always ChaCha20).
-    is_chacha: bool,
+    hp: [u8; AES_KEY_LEN],
 }
 
 impl DirKeys {
     fn from_initial(k: &crate::crypto::InitialKeys) -> Self {
-        let mut aead = [0u8; CHACHA_KEY_LEN];
-        let mut hp = [0u8; CHACHA_KEY_LEN];
-        aead[..AES_KEY_LEN].copy_from_slice(&k.key);
-        hp[..AES_KEY_LEN].copy_from_slice(&k.hp);
-        DirKeys {
-            aead,
-            iv: k.iv,
-            hp,
-            aead_len: AES_KEY_LEN as u8,
-            hp_len: AES_KEY_LEN as u8,
-            is_chacha: false,
-        }
+        DirKeys { aead: k.key, iv: k.iv, hp: k.hp }
     }
 
-    fn from_chacha(k: &crate::crypto::ChaChaKeys) -> Self {
-        DirKeys {
-            aead: k.key,
-            iv: k.iv,
-            hp: k.hp,
-            aead_len: CHACHA_KEY_LEN as u8,
-            hp_len: CHACHA_KEY_LEN as u8,
-            is_chacha: true,
-        }
+    fn from_aes128(k: &crate::crypto::InitialKeys) -> Self {
+        // Same shape as `from_initial` — `derive_aes128_keys` and
+        // `derive_initial_keys` both return `InitialKeys` post-
+        // migration. Kept as a separate method so call sites read
+        // cleanly ("post-handshake keys" vs "Initial-stage keys").
+        DirKeys { aead: k.key, iv: k.iv, hp: k.hp }
     }
 
     /// Build per-key-phase keys: AEAD `key`/`iv` from the freshly-
     /// derived `next_traffic_secret`, but reuse the existing HP key
     /// from `prev`. RFC 9001 §6.1: "the same header protection key
     /// is used" across key phases — only the AEAD half rotates.
-    fn from_chacha_reuse_hp(k: &crate::crypto::ChaChaKeys, prev: &DirKeys) -> Self {
-        DirKeys {
-            aead: k.key,
-            iv: k.iv,
-            hp: prev.hp,
-            aead_len: CHACHA_KEY_LEN as u8,
-            hp_len: prev.hp_len,
-            is_chacha: true,
-        }
+    fn from_aes128_reuse_hp(k: &crate::crypto::InitialKeys, prev: &DirKeys) -> Self {
+        DirKeys { aead: k.key, iv: k.iv, hp: prev.hp }
     }
 
     fn aead_seal(&self, nonce: &[u8; NONCE_LEN], aad: &[u8], data: &mut [u8]) -> [u8; TAG_LEN] {
-        if self.is_chacha {
-            chacha20_poly1305_seal(&self.aead, nonce, aad, data)
-        } else {
-            let mut k16 = [0u8; AES_KEY_LEN];
-            k16.copy_from_slice(&self.aead[..AES_KEY_LEN]);
-            aes128_gcm_seal(&k16, nonce, aad, data)
-        }
+        aes128_gcm_seal(&self.aead, nonce, aad, data)
     }
 
     fn aead_open(
@@ -203,23 +172,11 @@ impl DirKeys {
         data: &mut [u8],
         tag: &[u8; TAG_LEN],
     ) -> Result<(), ()> {
-        if self.is_chacha {
-            chacha20_poly1305_open(&self.aead, nonce, aad, data, tag)
-        } else {
-            let mut k16 = [0u8; AES_KEY_LEN];
-            k16.copy_from_slice(&self.aead[..AES_KEY_LEN]);
-            aes128_gcm_open(&k16, nonce, aad, data, tag)
-        }
+        aes128_gcm_open(&self.aead, nonce, aad, data, tag)
     }
 
     fn hp_mask(&self, sample: &[u8; HP_SAMPLE_LEN]) -> [u8; HP_MASK_LEN] {
-        if self.is_chacha {
-            hp_mask_chacha20(&self.hp, sample)
-        } else {
-            let mut k16 = [0u8; AES_KEY_LEN];
-            k16.copy_from_slice(&self.hp[..AES_KEY_LEN]);
-            hp_mask_aes128(&k16, sample)
-        }
+        hp_mask_aes128(&self.hp, sample)
     }
 }
 
@@ -520,7 +477,7 @@ pub struct Connection {
     application_recv_next: Option<DirKeys>,
     /// Latest CLIENT application-traffic secret. Updated on each
     /// successful key update — `next_traffic_secret(client_ap)` is
-    /// then ready to feed `derive_chacha_keys` for the
+    /// then ready to feed `derive_aes128_keys` for the
     /// post-rotation `application_recv_next`.
     client_app_secret: Option<[u8; 32]>,
     /// Peer's current KEY_PHASE bit value (0 or 1). Toggled when
@@ -1830,12 +1787,12 @@ impl Connection {
             // Save the new "current" secret so the NEXT KU can
             // derive from it.
             self.client_app_secret = Some(next_secret);
-            let next_chacha = derive_chacha_keys(&next_secret);
+            let next_aes128 = derive_aes128_keys(&next_secret);
             // Reuse HP from the new-current keys (HP is invariant
             // across KU per §6.1).
             if let Some(cur) = self.application_recv.as_ref() {
                 self.application_recv_next =
-                    Some(DirKeys::from_chacha_reuse_hp(&next_chacha, cur));
+                    Some(DirKeys::from_aes128_reuse_hp(&next_aes128, cur));
             }
         }
     }
@@ -2132,8 +2089,8 @@ impl Connection {
         // get silently dropped by `aead_decrypt_failed`.
         if let Some(et) = self.tls.client_early_traffic_secret() {
             if self.early_recv.is_none() {
-                let recv = derive_chacha_keys(et);
-                self.early_recv = Some(DirKeys::from_chacha(&recv));
+                let recv = derive_aes128_keys(et);
+                self.early_recv = Some(DirKeys::from_aes128(&recv));
                 crate::quic_event!(early_keys_derived,
                     "local_cid={}",
                     crate::endpoint::hex8(self.local_cid.as_slice()));
@@ -2158,18 +2115,18 @@ impl Connection {
         // the Handshake space, derive them now.
         if let Some(hs) = self.tls.handshake_secrets() {
             if self.handshake_send.is_none() {
-                let send = derive_chacha_keys(&hs.server_hs);
-                let recv = derive_chacha_keys(&hs.client_hs);
-                self.handshake_send = Some(DirKeys::from_chacha(&send));
-                self.handshake_recv = Some(DirKeys::from_chacha(&recv));
+                let send = derive_aes128_keys(&hs.server_hs);
+                let recv = derive_aes128_keys(&hs.client_hs);
+                self.handshake_send = Some(DirKeys::from_aes128(&send));
+                self.handshake_recv = Some(DirKeys::from_aes128(&recv));
             }
         }
         if let Some(ap) = self.tls.application_secrets() {
             if self.application_send.is_none() {
-                let send = derive_chacha_keys(&ap.server_ap);
-                let recv = derive_chacha_keys(&ap.client_ap);
-                self.application_send = Some(DirKeys::from_chacha(&send));
-                self.application_recv = Some(DirKeys::from_chacha(&recv));
+                let send = derive_aes128_keys(&ap.server_ap);
+                let recv = derive_aes128_keys(&ap.client_ap);
+                self.application_send = Some(DirKeys::from_aes128(&send));
+                self.application_recv = Some(DirKeys::from_aes128(&recv));
                 // Pre-derive next-phase recv keys so a peer-initiated
                 // key update (RFC 9001 §6) doesn't require HKDF on
                 // the hot decrypt path — we just trial-decrypt with
@@ -2179,10 +2136,10 @@ impl Connection {
                 // key is used") so we copy it from the current keys.
                 self.client_app_secret = Some(ap.client_ap);
                 let next_secret = next_traffic_secret(&ap.client_ap);
-                let next_chacha = derive_chacha_keys(&next_secret);
+                let next_aes128 = derive_aes128_keys(&next_secret);
                 let cur_recv = self.application_recv.as_ref().unwrap();
-                self.application_recv_next = Some(DirKeys::from_chacha_reuse_hp(
-                    &next_chacha,
+                self.application_recv_next = Some(DirKeys::from_aes128_reuse_hp(
+                    &next_aes128,
                     cur_recv,
                 ));
             }
@@ -3338,7 +3295,7 @@ mod tests {
         ch_body.push(0);
         ch_body.extend_from_slice(&2u16.to_be_bytes());
         ch_body
-            .extend_from_slice(&cipher_suite::TLS_CHACHA20_POLY1305_SHA256.to_be_bytes());
+            .extend_from_slice(&cipher_suite::TLS_AES_128_GCM_SHA256.to_be_bytes());
         ch_body.push(1);
         ch_body.push(0);
         ch_body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
@@ -3498,8 +3455,8 @@ mod tests {
         let secrets = derive_initial_secrets(&dcid);
         let server_keys = derive_initial_keys(&secrets.server);
         let dk = DirKeys::from_initial(&server_keys);
-        assert_eq!(dk.aead_len, AES_KEY_LEN as u8);
-        assert!(!dk.is_chacha);
+        // AES-128-GCM only post-migration; no `aead_len` /
+        // `is_chacha` discriminants remain on `DirKeys`.
         // Round-trip seal/open with these keys.
         let nonce = packet_nonce(&dk.iv, 0);
         let mut data = *b"plaintext-ish-block";

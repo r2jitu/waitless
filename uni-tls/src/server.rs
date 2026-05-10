@@ -2,7 +2,7 @@
 // via `push_rx` / `pop_tx`, drives state with `advance`.
 //
 // Supports exactly:
-//   - TLS 1.3, TLS_CHACHA20_POLY1305_SHA256, X25519
+//   - TLS 1.3, TLS_AES_128_GCM_SHA256, X25519
 //   - ECDSA P-256 + SHA-256 server cert
 // No client auth, no resumption, no 0-RTT, no key update, no ALPN.
 //

@@ -25,9 +25,10 @@ sha2 = { workspace = true }
 hmac = { workspace = true }
 hkdf = { workspace = true }
 aes-gcm = { workspace = true }
-chacha20poly1305 = { workspace = true }
+# `chacha20` retained for `kernel::rng` (CSPRNG expander). TLS / QUIC
+# AEAD paths are AES-128-GCM only post-migration; `chacha20poly1305`
+# and `poly1305` are no longer pulled in from this bridge.
 chacha20 = { workspace = true }
-poly1305 = { workspace = true }
 x25519-dalek = { workspace = true }
 p256 = { workspace = true }
 rand_core = { workspace = true }

@@ -20,7 +20,7 @@
 // - Handshake message header encode/decode
 // - `ClientHello` parser: legacy fields + the TLS 1.3 extensions we need
 //   (supported_versions, key_share, supported_groups).
-// - `ServerHello` builder for TLS_CHACHA20_POLY1305_SHA256 + X25519.
+// - `ServerHello` builder for TLS_AES_128_GCM_SHA256 + X25519.
 // - `EncryptedExtensions`, `Certificate`, `CertificateVerify`, `Finished`
 //   builders covering the server side of the TLS 1.3 handshake.
 // - `Finished` parser for client's response.
@@ -111,9 +111,19 @@ pub mod named_group {
     pub const X25519: u16 = 0x001d;
 }
 
-/// CipherSuite values (we only implement one).
+/// CipherSuite values (we only implement one). TLS 1.3 lists three
+/// MTI suites in RFC 8446 §9.1; we ship `TLS_AES_128_GCM_SHA256`
+/// because it's the **mandatory-to-implement** one (the other two
+/// are SHOULD-implement) and because AES-NI / FEAT_AES is on every
+/// CPU we deploy to, giving us hardware-accelerated record
+/// encryption on both x86_64 (Intel + AMD) and aarch64 (Apple
+/// Silicon, modern ARM servers). Migrated from
+/// `TLS_CHACHA20_POLY1305_SHA256` (0x1303) — see commit log for
+/// the rationale (broken chacha20 SIMD path on
+/// `x86_64-unknown-none` + universal browser preference for
+/// AES-128-GCM when the client sees AES-NI).
 pub mod cipher_suite {
-    pub const TLS_CHACHA20_POLY1305_SHA256: u16 = 0x1303;
+    pub const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
 }
 
 /// SignatureScheme values from RFC 8446 §4.2.3. We only implement one.
@@ -136,7 +146,7 @@ pub const LEGACY_VERSION_TLS12: u16 = 0x0303;
 pub const VERSION_TLS13: u16 = 0x0304;
 
 /// TLS 1.3 uses SHA-256 as its transcript hash for every cipher suite
-/// we support (`TLS_CHACHA20_POLY1305_SHA256`). All code that needs a
+/// we support (`TLS_AES_128_GCM_SHA256`). All code that needs a
 /// transcript digest should assume 32-byte outputs.
 pub const HASH_LEN: usize = 32;
 
@@ -325,7 +335,7 @@ impl<'a> ClientHello<'a> {
         let mut i = 0;
         while i < suites.len() {
             let s = u16::from_be_bytes([suites[i], suites[i + 1]]);
-            if s == cipher_suite::TLS_CHACHA20_POLY1305_SHA256 {
+            if s == cipher_suite::TLS_AES_128_GCM_SHA256 {
                 offers_chacha = true;
             }
             i += 2;
@@ -617,7 +627,7 @@ impl<'a> Iterator for AlpnIter<'a> {
 // ============================================================================
 
 /// Build a ServerHello body for TLS 1.3 with
-/// cipher_suite = TLS_CHACHA20_POLY1305_SHA256 and key_share = X25519.
+/// cipher_suite = TLS_AES_128_GCM_SHA256 and key_share = X25519.
 ///
 /// `selected_psk_identity` is `Some(idx)` when the server is accepting
 /// a resumption offer — `idx` indexes into the client's PskIdentity
@@ -680,7 +690,7 @@ pub fn build_server_hello(
     out[p..p + sid_len].copy_from_slice(legacy_session_id_echo);
     p += sid_len;
     // cipher_suite
-    out[p..p + 2].copy_from_slice(&cipher_suite::TLS_CHACHA20_POLY1305_SHA256.to_be_bytes());
+    out[p..p + 2].copy_from_slice(&cipher_suite::TLS_AES_128_GCM_SHA256.to_be_bytes());
     p += 2;
     // legacy_compression_method = null
     out[p] = 0;
@@ -981,7 +991,7 @@ pub fn build_server_pre_shared_key_ext(
 /// no extra framing inside a Finished message.
 ///
 /// Caller computes `verify_data = HMAC(finished_key, transcript_hash)`
-/// and passes it here. For `TLS_CHACHA20_POLY1305_SHA256` (our only suite)
+/// and passes it here. For `TLS_AES_128_GCM_SHA256` (our only suite)
 /// the output is 32 bytes (SHA-256 HMAC).
 pub fn build_finished(verify_data: &[u8], out: &mut [u8]) -> Option<usize> {
     let n = verify_data.len();
@@ -1103,7 +1113,7 @@ mod tests {
         assert_eq!(&out[0..2], &[0x03, 0x03]); // legacy_version
         assert_eq!(&out[2..34], &random[..]);
         assert_eq!(out[34], 0); // session_id length
-        assert_eq!(&out[35..37], &[0x13, 0x03]); // cipher_suite
+        assert_eq!(&out[35..37], &[0x13, 0x01]); // cipher_suite (TLS_AES_128_GCM_SHA256)
         assert_eq!(out[37], 0); // legacy_compression
         // extensions_len = 46
         assert_eq!(u16::from_be_bytes([out[38], out[39]]), 46);
@@ -1181,7 +1191,7 @@ mod tests {
 
         // Now build the full ClientHello body:
         //   u16 legacy_version | 32 random | u8 session_id_len=0 |
-        //   u16 cipher_suites_len=2 | u16 TLS_CHACHA20_POLY1305_SHA256 |
+        //   u16 cipher_suites_len=2 | u16 TLS_AES_128_GCM_SHA256 |
         //   u8 legacy_compression_len=1 | u8 null |
         //   u16 extensions_len | ext_bytes
         let mut ch = [0u8; 512];
@@ -1195,7 +1205,7 @@ mod tests {
         q += 1;
         ch[q..q + 2].copy_from_slice(&2u16.to_be_bytes()); // cipher_suites_len
         q += 2;
-        ch[q..q + 2].copy_from_slice(&cipher_suite::TLS_CHACHA20_POLY1305_SHA256.to_be_bytes());
+        ch[q..q + 2].copy_from_slice(&cipher_suite::TLS_AES_128_GCM_SHA256.to_be_bytes());
         q += 2;
         ch[q] = 1; // compression_methods_len
         q += 1;
@@ -1390,7 +1400,7 @@ mod tests {
         ch.push(0);
         // cipher_suites (only one)
         ch.extend_from_slice(&2u16.to_be_bytes());
-        ch.extend_from_slice(&cipher_suite::TLS_CHACHA20_POLY1305_SHA256.to_be_bytes());
+        ch.extend_from_slice(&cipher_suite::TLS_AES_128_GCM_SHA256.to_be_bytes());
         // legacy compression
         ch.push(1);
         ch.push(0);

@@ -96,7 +96,7 @@ pub enum QuicTlsState {
 pub enum QuicTlsError {
     ParseError(ParseError),
     /// ClientHello didn't meet our requirements (no TLS 1.3, no
-    /// X25519 share, no ChaCha20-Poly1305 cipher offered).
+    /// X25519 share, no AES-128-GCM cipher offered).
     UnsupportedClient,
     /// Client Finished verify_data didn't match expected HMAC.
     BadClientFinished,
@@ -250,8 +250,8 @@ impl QuicTls {
     /// Handshake-stage traffic secrets (`client_hs`, `server_hs`).
     /// `Some` after the WaitClientHello → WaitClientFinished
     /// transition; the caller derives Handshake-space packet
-    /// protection keys from these via `quic_crypto::derive_chacha_keys`
-    /// or equivalent.
+    /// protection keys from these via
+    /// `quic_crypto::derive_aes128_keys`.
     pub fn handshake_secrets(&self) -> Option<&HandshakeSecrets> {
         self.handshake_secrets.as_ref()
     }
@@ -706,7 +706,7 @@ impl QuicTls {
             resumption_master_secret: rms,
             ticket_age_add: age_add,
             issued_at_cycles: uni_tls::ticket::now_cycles(),
-            cipher_suite: uni_tls::handshake::cipher_suite::TLS_CHACHA20_POLY1305_SHA256,
+            cipher_suite: uni_tls::handshake::cipher_suite::TLS_AES_128_GCM_SHA256,
         };
         let mut sealed = [0u8; uni_tls::ticket::SEALED_LEN];
         let n = uni_tls::ticket::seal_ticket(&pt, &mut sealed)
@@ -916,7 +916,7 @@ mod tests {
         body.extend_from_slice(&[0x11u8; 32]); // random
         body.push(0); // session_id length = 0
         body.extend_from_slice(&2u16.to_be_bytes());
-        body.extend_from_slice(&cipher_suite::TLS_CHACHA20_POLY1305_SHA256.to_be_bytes());
+        body.extend_from_slice(&cipher_suite::TLS_AES_128_GCM_SHA256.to_be_bytes());
         body.push(1); // compression_methods length
         body.push(0); // null compression
         body.extend_from_slice(&(ext.len() as u16).to_be_bytes());

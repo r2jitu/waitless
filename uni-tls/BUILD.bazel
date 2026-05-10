@@ -52,16 +52,28 @@ rust_library(
         # `feature = "std"` is toggled by `tests_need_std_on` for
         # the `rust_test` build (see crate_features above).
         "--check-cfg=cfg(feature,values(\"std\"))",
-    ],
+    ] + select({
+        # The aes-gcm AEAD path inlines `__m128i` intrinsics from
+        # the `aes` + `polyval` crates into our own `aead.rs`
+        # call sites. With `x86_64-unknown-none`'s default
+        # `+soft-float`, LLVM has no register class for those
+        # vector types and bails with "Do not know how to split
+        # the result of this operator!". Apply the same
+        # target-feature override the crypto crates already use
+        # (cf. `_X86_CRYPTO_FLAG` in MODULE.bazel) to our crate
+        # so the inlined SIMD compiles cleanly.
+        "//bazel/platforms:x86_64": [
+            "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmul,+fma,+bmi1,+bmi2",
+        ],
+        "//conditions:default": [],
+    }),
     deps = [
         "//uni",
         "//uni-http",
         "//uni-iobuf",
         "//uni-worker",
-        "@crates//:chacha20",
-        "@crates//:chacha20poly1305",
+        "@crates//:aes-gcm",
         "@crates//:getrandom",
-        "@crates//:poly1305",
         "@crates//:hkdf",
         "@crates//:hmac",
         "@crates//:p256",

@@ -42,12 +42,13 @@ const DEV_KEY_PKCS8_DER: &[u8] = include_bytes!("../dev_certs/dev_key.der");
 async fn init() {
     log_boot_info();
 
-    // Boot-time AEAD KAT — runs RFC 8439 §2.8.2 vector through the
-    // live ChaCha20-Poly1305 implementation (whichever backend the
-    // build selected: software / SSE2 / AVX2). On a known-good
-    // build this prints `aead-kat: ok`. On a CPU/compiler that
-    // produces wrong ciphertext (which is what bit us when we
-    // initially tried to enable SIMD on Sapphire Rapids) we get
+    // Boot-time AEAD KAT — runs NIST SP 800-38D Test Case 4
+    // through the live AES-128-GCM implementation (AES-NI on
+    // x86_64 with `+aes,+pclmul`; aarch64 NEON / FEAT_AES on
+    // Apple Silicon). On a known-good build this prints
+    // `aead-kat: ok`. On a CPU/compiler that produces wrong
+    // ciphertext (the original chacha20-SIMD failure mode that
+    // motivated this whole infrastructure) we get
     // `aead-kat: FAIL byte[i] expected=ee got=ff`, captured into
     // the diag buffer for `/diag-panic` to surface and on serial
     // for operators with serial access. Cheap (~few µs); safe to
@@ -111,7 +112,7 @@ async fn init() {
         HTTPS_PORT, h3_handler, DEV_CERT_DER, DEV_KEY_PKCS8_DER,
     ) {
         Ok(()) => {
-            uni::println!("listen udp://:{} (h3, TLS_CHACHA20_POLY1305_SHA256)", HTTPS_PORT);
+            uni::println!("listen udp://:{} (h3, TLS_AES_128_GCM_SHA256)", HTTPS_PORT);
             true
         }
         Err(_) => {
@@ -132,7 +133,7 @@ async fn init() {
     match uni_tls::listen(
         HTTPS_PORT, handle_request_https, DEV_CERT_DER, DEV_KEY_PKCS8_DER,
     ) {
-        Ok(()) => uni::println!("listen tcp://:{} (https, TLS_CHACHA20_POLY1305_SHA256)", HTTPS_PORT),
+        Ok(()) => uni::println!("listen tcp://:{} (https, TLS_AES_128_GCM_SHA256)", HTTPS_PORT),
         Err(_) => uni::println!("[WARN] https disabled (cert/key invalid)"),
     }
 }
@@ -595,7 +596,7 @@ fn page_tls() -> Response {
 rustls. Just the parts needed to terminate HTTPS for a server.</p>\
 <h2>Suite</h2>\
 <ul class=\"proto-list\">\
-<li><strong>Cipher</strong> · <code>TLS_CHACHA20_POLY1305_SHA256</code> \
+<li><strong>Cipher</strong> · <code>TLS_AES_128_GCM_SHA256</code> \
 exclusively. AES paths exist for QUIC's Initial-level packet \
 protection (RFC 9001 mandates AES-128-GCM there) but post-handshake \
 we're ChaCha20 only.</li>\

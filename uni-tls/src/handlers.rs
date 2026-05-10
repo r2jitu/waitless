@@ -137,7 +137,7 @@ pub fn try_resume(
         // We only ever issue tickets for one cipher suite; reject on
         // any other so a future suite addition can't cause silent
         // misderivation.
-        if opened.cipher_suite != cipher_suite::TLS_CHACHA20_POLY1305_SHA256 {
+        if opened.cipher_suite != cipher_suite::TLS_AES_128_GCM_SHA256 {
             continue;
         }
 
@@ -687,7 +687,7 @@ impl TlsServer {
             resumption_master_secret: rms,
             ticket_age_add: age_add,
             issued_at_cycles: ticket_now_cycles(),
-            cipher_suite: cipher_suite::TLS_CHACHA20_POLY1305_SHA256,
+            cipher_suite: cipher_suite::TLS_AES_128_GCM_SHA256,
         };
         let mut sealed = [0u8; SEALED_LEN];
         let n = seal_ticket(&pt, &mut sealed).ok_or(HandshakeError::Internal)?;

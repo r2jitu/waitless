@@ -13,7 +13,7 @@
 //   RFC 8439        ChaCha20-Poly1305 (used via //net:tls_crypto)
 //
 // Design notes:
-// - Hash: SHA-256 only (TLS_CHACHA20_POLY1305_SHA256, the suite we ship).
+// - Hash: SHA-256 only (TLS_AES_128_GCM_SHA256, the suite we ship).
 // - AEAD: ChaCha20-Poly1305 only (via //net:tls_crypto).
 // - KX: X25519 only (the TLS 1.3 default group, smallest code, and the
 //   only MTI group shared with QUIC).
@@ -34,9 +34,11 @@ use sha2::{Digest, Sha256};
 /// SHA-256 output length in bytes.
 pub const HASH_LEN: usize = 32;
 
-/// TLS 1.3 AEAD key length for ChaCha20-Poly1305 (and AES-256-GCM, for
-/// forward compatibility). Our code path only uses ChaCha20.
-pub const KEY_LEN: usize = 32;
+/// TLS 1.3 AEAD key length for `TLS_AES_128_GCM_SHA256`, our sole
+/// negotiated cipher suite (post-migration from
+/// `TLS_CHACHA20_POLY1305_SHA256` which used 32). 16 bytes —
+/// AES-128 key.
+pub const KEY_LEN: usize = 16;
 
 /// TLS 1.3 AEAD nonce length (all currently-defined suites use 12 bytes).
 pub const IV_LEN: usize = 12;
