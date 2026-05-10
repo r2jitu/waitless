@@ -295,7 +295,10 @@ AEAD to the NIC.
 ## Segment 2 — Wire & receive (NIC TX → browser RX)
 
 ### G. TSO (TCP Segmentation Offload)
-- **Status**: [x] **landed for HVF + virtio-net (2026-05-08)**.
+- **Status**: [x] **landed for HVF + virtio-net (2026-05-08)** and
+  **gve / GCE GQI_QPL (2026-05-10)**. See the 2026-05-10 entry in
+  the progress log below for the gve unparking notes + the
+  `try_send_tso` MSS-gate bug that the second deploy uncovered.
 - **Approach**: bumped `MAX_ETH_FRAME` 1514 → 16512 in the
   virtio-net driver so a single TX-pool slot fits one TLS record's
   worth of TCP super-segment (Eth + IP + TCP + 16 KiB payload).
@@ -815,3 +818,66 @@ E and F are low-effort cleanups that can land any time.
   Implementation reverted to keep the validated GQI-fallback
   + CSUM-offload state shippable. Resume TSO when one of the
   above debug paths is in place.
+
+- **2026-05-10** — **gve TSO unparked, end-to-end working on GCE
+  GQI_QPL** (`e4f8235`, `ad68340`).
+
+  Reapplied the parked TSO scaffold (`ae692d3` content) on top of
+  the multi-segment TSO gate (`2cdbbff`) and the /diag-gve
+  descriptor capture (`955c9ed`). The new debug path made the
+  remaining bug visible from the host side without serial-port
+  access:
+
+  * `tso_available: || true` + the `total > mss` gate in
+    `async_try_send_chain` kept /health on the proven STD path,
+    so the boot HTTP probe came up clean.
+  * `/diag-gve` returned the 16-byte TSO + SEG pair as written.
+    Bytes matched Linux's `gve_tx_fill_pkt_desc` /
+    `gve_tx_fill_seg_desc`: TSO has
+    `type=0x11 (TSO|L4CSUM), l4_csum_off=0x08, l4_hdr_off=0x11
+    (=34/2), desc_cnt=2, len=total, seg_len=hdr_len,
+    seg_addr=big_pool_qpl_off`; SEG has `type=0x20, l3_off=0x07,
+    mss=0x05B4 (=1460), seg_len=payload, seg_addr=+hdr_len`.
+  * Wire trace (tcpdump on kvm-vm receive side) confirmed the
+    server's /diagnostics response landed intact — the receiver's
+    GRO reassembles into one 9745 B PSH frame.
+
+  Bug exposed by the path that *didn't* work: HTTPS /health
+  (post-handshake response under MSS) timed out, while HTTPS
+  /diagnostics (record over MSS) succeeded. Root cause: the
+  TLS-direct `try_send_tso` path (uni-http `TlsStream::send`)
+  gated only on `src.total_len() <= PLAINTEXT_CHUNK` — i.e. it
+  used TSO for ANY chain fitting one record, including
+  single-segment responses. **gve hardware silently drops
+  sub-MSS TSO frames** (the descriptor pair lands on the ring,
+  the device fetches them, but no packet emerges). The
+  `async_try_send_chain` path had this gate (`total > mss`)
+  but TLS-direct bypassed it.
+
+  Fix: thread a `min_payload` lower bound through
+  `TcpStream::try_send_tso` and the backend trait; TLS passes
+  `src.total_len() + 22` (record-overhead constant); bare-metal
+  `tcp::try_send_tso` short-circuits to `None` when
+  `min_payload <= mss`, so TLS falls through to its worker-scratch
+  + small-pool path.
+
+  GCE n2-highcpu-4 (gVNIC, GQI_QPL) numbers, post-fix:
+
+  | Workload                | req/s   | Note                  |
+  |-------------------------|---------|-----------------------|
+  | health_max              | 517 242 | STD small-pool        |
+  | health_tls_max          | 335 549 | STD small-pool + TLS  |
+  | h3_health_max           |  87 118 | UDP/QUIC (TSO bypassed) |
+  | diagnostics_tls_max     |  33 606 | **TSO path**          |
+
+  All counters healthy: `tx_big_acquires` increments per
+  TSO send, `tx_big_full_returns = 0`, `tx_small_full_spins = 0`.
+  100 % success on a 100× mixed-load mix of /health + /diagnostics
+  over HTTPS.
+
+  Open items unaffected:
+  * **DQO direct-fill stall** (c3-standard-4 only). GQI_QPL is
+    the priority format; c3 falls back to GQI_QPL until the DQO
+    stall is debugged.
+  * **HVF TSO bench** (G's prior +25% on diagnostics_tls_max 1c)
+    still applies — virtio-net path unchanged.
