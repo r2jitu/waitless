@@ -1146,6 +1146,9 @@ pub fn net_tx_diag() -> Option<NetTxDiag> { None }
 
 // ---- Diag-capture stubs (native has no kernel panic to capture) ----
 
+pub fn diag_append(_bytes: &[u8]) {}
+pub fn diag_append_hex(_value: u64) {}
+pub fn diag_append_hex_u8(_value: u8) {}
 pub fn diag_snapshot(_out: &mut [u8]) -> usize { 0 }
 pub fn diag_captured_len() -> usize { 0 }
 pub fn diag_reset() {}

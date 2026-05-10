@@ -69,6 +69,20 @@ pub fn append_hex(value: u64) {
     append(&buf);
 }
 
+/// Append a 2-char hex byte (without the `0x` prefix). Used by
+/// boot-time KAT dumps that need readable byte-windows in the
+/// `/diag-panic` output, where `append_hex(b as u64)` would render
+/// as 16 leading zeros + 2 useful chars.
+pub fn append_hex_u8(value: u8) {
+    let hi = value >> 4;
+    let lo = value & 0xF;
+    let buf = [
+        if hi < 10 { b'0' + hi } else { b'a' + (hi - 10) },
+        if lo < 10 { b'0' + lo } else { b'a' + (lo - 10) },
+    ];
+    append(&buf);
+}
+
 /// Append a decimal u32 — used for cpu IDs and small counters.
 pub fn append_u32(value: u32) {
     if value == 0 {

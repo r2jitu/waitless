@@ -42,6 +42,45 @@ const DEV_KEY_PKCS8_DER: &[u8] = include_bytes!("../dev_certs/dev_key.der");
 async fn init() {
     log_boot_info();
 
+    // Boot-time AEAD KAT — runs RFC 8439 §2.8.2 vector through the
+    // live ChaCha20-Poly1305 implementation (whichever backend the
+    // build selected: software / SSE2 / AVX2). On a known-good
+    // build this prints `aead-kat: ok`. On a CPU/compiler that
+    // produces wrong ciphertext (which is what bit us when we
+    // initially tried to enable SIMD on Sapphire Rapids) we get
+    // `aead-kat: FAIL byte[i] expected=ee got=ff`, captured into
+    // the diag buffer for `/diag-panic` to surface and on serial
+    // for operators with serial access. Cheap (~few µs); safe to
+    // run once per boot.
+    {
+        use uni::diagnostics as diag;
+        match uni_tls::aead::rfc8439_kat() {
+            Ok(()) => {
+                uni::println!("aead-kat: ok");
+                diag::diag_append(b"aead-kat: ok\n");
+            }
+            Err(f) => {
+                uni::println!(
+                    "aead-kat: FAIL at byte {}: expected=0x{:02x} got=0x{:02x}",
+                    f.first_diverge_at, f.expected, f.actual,
+                );
+                diag::diag_append(b"aead-kat: FAIL at byte ");
+                diag::diag_append_hex(f.first_diverge_at as u64);
+                diag::diag_append(b"\n  expected: ");
+                for &b in &f.expected_window {
+                    diag::diag_append_hex_u8(b);
+                    diag::diag_append(b" ");
+                }
+                diag::diag_append(b"\n  actual:   ");
+                for &b in &f.actual_window {
+                    diag::diag_append_hex_u8(b);
+                    diag::diag_append(b" ");
+                }
+                diag::diag_append(b"\n");
+            }
+        }
+    }
+
     let net = Net::up().await.expect("Net::up failed");
     let backend_ip = net.gateway().0;
 

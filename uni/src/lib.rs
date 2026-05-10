@@ -344,10 +344,26 @@ pub mod diagnostics {
     /// best-effort zero on native.
     pub fn heap_stats() -> super::HeapStats { uni_backend::heap_stats() }
 
+    /// Append a byte slice to the in-band diag buffer. For boot-time
+    /// KATs and one-shot probes that want their results to land in
+    /// `/diag-panic` alongside any later panic traces.
+    pub fn diag_append(bytes: &[u8]) { uni_backend::diag_append(bytes) }
+
+    /// Append a 16-char hex-encoded u64 (no `0x` prefix). Pairs with
+    /// `diag_append` for format-free logging from boot-critical code
+    /// paths.
+    pub fn diag_append_hex(value: u64) { uni_backend::diag_append_hex(value) }
+
+    /// Append a 2-char hex-encoded u8. For dumps of byte windows
+    /// where the u64 form would print 14 leading zeros per byte.
+    pub fn diag_append_hex_u8(value: u8) {
+        uni_backend::diag_append_hex_u8(value)
+    }
+
     /// Snapshot the in-band diag-capture buffer (kernel panics +
-    /// unhandled CPU exceptions). Returns the byte count written
-    /// to `out`. Native build returns 0 (no kernel panics to
-    /// capture).
+    /// unhandled CPU exceptions + `diag_append` records). Returns
+    /// the byte count written to `out`. Native build returns 0 (no
+    /// kernel panics to capture).
     ///
     /// The buffer is FIFO-bounded; up to ~4 KiB of records survive
     /// the panicking core's halt and are readable by any other core

@@ -47,6 +47,26 @@ pub fn heap_stats() -> super::HeapStats {
 
 // ---- Diag-capture re-exports --------------------------------------------
 
+/// Append a byte slice to the in-band diag-capture buffer. Used by
+/// boot-time KATs / one-shot probes to log results that should
+/// survive in `/diag-panic` even if the rest of the kernel later
+/// halts.
+pub fn diag_append(bytes: &[u8]) {
+    uni_kernel::diag::append(bytes)
+}
+
+/// Append a hex-encoded u64 (no `0x` prefix) — pairs with
+/// `diag_append` for boot-time format-free logging.
+pub fn diag_append_hex(value: u64) {
+    uni_kernel::diag::append_hex(value)
+}
+
+/// Append a 2-char hex-encoded u8 — for byte-window dumps where
+/// `diag_append_hex` would render 14 leading zeros.
+pub fn diag_append_hex_u8(value: u8) {
+    uni_kernel::diag::append_hex_u8(value)
+}
+
 /// Snapshot the in-band diag-capture buffer (panics + unhandled
 /// exceptions, cf. `kernel::diag`). Returns the byte count written.
 pub fn diag_snapshot(out: &mut [u8]) -> usize {
