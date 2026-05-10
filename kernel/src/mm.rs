@@ -27,7 +27,7 @@
 
 use core::alloc::Layout;
 use core::ptr::{self, NonNull};
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(target_os = "none")]
 use core::alloc::GlobalAlloc;
@@ -113,54 +113,6 @@ static ADDR_SPACE: InitOnce<AddressSpace> = InitOnce::new();
 /// (GlobalAlloc path + legacy `kmalloc`/`kfree`) funnels through
 /// this single static.
 static HEAP: Spinlock<Talc<ErrOnOom>> = Spinlock::new(Talc::new(ErrOnOom));
-
-// ============================================================================
-// Lock-free heap counter shadow
-// ============================================================================
-//
-// `heap_stats()` is called once per `/diagnostics` HTTP request; under
-// load that's tens of thousands of acquisitions/sec on `HEAP.lock()`
-// — short-window each, but enough cache-line ping-pong on the lock
-// cacheline to flatten cross-core scaling on /diagnostics-style
-// workloads (33 K req/s × 4 cores × ~150 ns = ~20 ms/sec/core just
-// in cache-coherence stalls on a single line).
-//
-// Mirror talc's six counters into separate atomics, populated under
-// the lock at the end of every successful alloc/dealloc and read
-// lock-free in `heap_stats()`. The mirrored snapshot is allowed to
-// be slightly inconsistent across the six fields (a reader between
-// `available_bytes.store` and `allocated_bytes.store` can see two
-// neighboring states) — fine for display-only counters, and equally
-// true of any racy multi-counter snapshot.
-//
-// Cost on the alloc/dealloc hot path: six relaxed stores per op,
-// ~30-60 ns vs talc's ~300-500 ns malloc/free body — under 15%.
-//
-// Updates use `Relaxed` ordering: the values are independent of
-// other state we synchronize on, and `heap_stats()`'s consumers
-// never read program state inferred from a counter value (e.g.
-// "if allocated_bytes > X, then field Y is initialised").
-
-static HEAP_ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
-static HEAP_AVAILABLE_BYTES: AtomicUsize = AtomicUsize::new(0);
-static HEAP_CLAIMED_BYTES: AtomicUsize = AtomicUsize::new(0);
-static HEAP_ALLOCATION_COUNT: AtomicUsize = AtomicUsize::new(0);
-static HEAP_FRAGMENT_COUNT: AtomicUsize = AtomicUsize::new(0);
-static HEAP_TOTAL_ALLOCATION_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// Sync the lock-free counter shadow from talc's internal counters.
-/// Call inside the `HEAP.lock()` window after a successful malloc /
-/// free / claim — the lock guarantees a single writer at a time.
-#[inline]
-fn refresh_heap_counters(heap: &Talc<ErrOnOom>) {
-    let c = heap.get_counters();
-    HEAP_ALLOCATED_BYTES.store(c.allocated_bytes, Ordering::Relaxed);
-    HEAP_AVAILABLE_BYTES.store(c.available_bytes, Ordering::Relaxed);
-    HEAP_CLAIMED_BYTES.store(c.claimed_bytes, Ordering::Relaxed);
-    HEAP_ALLOCATION_COUNT.store(c.allocation_count, Ordering::Relaxed);
-    HEAP_FRAGMENT_COUNT.store(c.fragment_count, Ordering::Relaxed);
-    HEAP_TOTAL_ALLOCATION_COUNT.store(c.total_allocation_count, Ordering::Relaxed);
-}
 
 /// Prefix size for legacy `kmalloc`/`kfree`. The C-style API
 /// doesn't carry the original allocation size at free time, so we
@@ -280,10 +232,6 @@ fn claim_phys(heap: &mut Talc<ErrOnOom>, hhdm: u64, phys: u64, size: u64) -> u64
     let span = Span::from_base_size(virt, size as usize);
     unsafe {
         if heap.claim(span).is_ok() {
-            // Each claim grows `available_bytes` and `claimed_bytes`;
-            // refresh the lock-free shadow now so very-early callers
-            // (boot logs) see non-zero values from `heap_stats()`.
-            refresh_heap_counters(heap);
             size
         } else {
             klog!("  Heap: talc::claim failed at {:#x} ({} bytes)\n", phys, size);
@@ -380,10 +328,7 @@ unsafe impl GlobalAlloc for KernelAllocator {
         // SAFETY: size is non-zero (checked above); the spinlock grants
         // exclusive access to the allocator state.
         match unsafe { heap.malloc(layout) } {
-            Ok(nn) => {
-                refresh_heap_counters(&heap);
-                nn.as_ptr()
-            }
+            Ok(nn) => nn.as_ptr(),
             Err(()) => {
                 drop(heap);
                 klog!(
@@ -405,7 +350,6 @@ unsafe impl GlobalAlloc for KernelAllocator {
         // SAFETY: caller guarantees `ptr` came from a previous `alloc`
         // with a matching `layout`; the spinlock grants exclusive access.
         unsafe { heap.free(nn, layout) };
-        refresh_heap_counters(&heap);
     }
 }
 
@@ -447,7 +391,6 @@ pub fn kmalloc(size: usize) -> *mut u8 {
             return ptr::null_mut();
         }
     };
-    refresh_heap_counters(&heap);
     drop(heap);
 
     // Stash the size in the prefix and hand the caller the payload.
@@ -477,7 +420,6 @@ pub fn kfree(ptr: *mut u8) {
         let Some(nn) = NonNull::new(raw) else { return };
         let mut heap = HEAP.lock();
         heap.free(nn, layout);
-        refresh_heap_counters(&heap);
     }
 }
 
@@ -506,27 +448,18 @@ pub struct HeapStats {
     pub total_allocation_count: u64,
 }
 
-/// Snapshot the kernel heap. Lock-free: reads the atomic shadow
-/// maintained by `refresh_heap_counters` after every successful
-/// alloc/dealloc/claim. The six fields can be slightly out of sync
-/// across one in-flight alloc on another core (the writer stores
-/// them serially under the heap lock; a concurrent reader can
-/// observe an intermediate state) — fine for /diagnostics display.
-///
-/// Previously took `HEAP.lock()` for an O(1) read of talc's
-/// counters; under sustained `/diagnostics` load that produced
-/// cross-core cache-line ping-pong on the lock cacheline that
-/// flattened multi-core scaling. Lock-free reads eliminate that
-/// without changing the alloc-path serialisation talc already
-/// imposes.
+/// Snapshot the kernel heap. Cheap: `talc` maintains the counters
+/// inline, so this is O(1) plus the spinlock.
 pub fn heap_stats() -> HeapStats {
+    let heap = HEAP.lock();
+    let c = heap.get_counters();
     HeapStats {
-        allocated_bytes: HEAP_ALLOCATED_BYTES.load(Ordering::Relaxed),
-        available_bytes: HEAP_AVAILABLE_BYTES.load(Ordering::Relaxed),
-        claimed_bytes: HEAP_CLAIMED_BYTES.load(Ordering::Relaxed),
-        allocation_count: HEAP_ALLOCATION_COUNT.load(Ordering::Relaxed),
-        fragment_count: HEAP_FRAGMENT_COUNT.load(Ordering::Relaxed),
-        total_allocation_count: HEAP_TOTAL_ALLOCATION_COUNT.load(Ordering::Relaxed),
+        allocated_bytes: c.allocated_bytes,
+        available_bytes: c.available_bytes,
+        claimed_bytes: c.claimed_bytes,
+        allocation_count: c.allocation_count,
+        fragment_count: c.fragment_count,
+        total_allocation_count: c.total_allocation_count,
     }
 }
 
