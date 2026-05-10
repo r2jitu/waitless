@@ -339,19 +339,9 @@ struct TcpListen {
 /// `start()` time; vCPU `N` owns sibling `N`, and `UDP_RELAYS` below
 /// keeps a flat `Vec<i32>` so the TX-side `handle_udp` can still look
 /// up "this vCPU's sibling" when the guest sends a reply.
-///
-/// `family` distinguishes the v4 sibling (binds 127.0.0.1) from the
-/// v6 sibling (binds ::1). Both fds for a given guest_port are
-/// added to every vCPU's pollfds; on read we dispatch to
-/// `handle_udp_rx` (v4) or `handle_udp_rx_v6` (v6) accordingly.
-#[derive(Clone, Copy)]
-struct UdpRelay {
-    fd: i32,
-    guest_port: u16,
-    family: IpFamily,
-}
 
-/// IP family tag shared by `UdpRelay`, `TcpListen`, and `ProxyConn`.
+/// IP family tag shared by `TcpListen`, `ProxyConn`, and the UDP
+/// listener thread's per-fd table.
 /// Used by the per-vCPU poll loop to dispatch the right frame
 /// builder when injecting RX frames back into the guest.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -444,10 +434,6 @@ impl IpAddrPair {
 struct IoState {
     /// The vCPU's id (== its queue pair).
     id: usize,
-    /// UDP relay sockets owned by this vCPU — one per `-p udp:H:G`
-    /// mapping. Each entry holds exactly one fd (the sibling the
-    /// kernel hands this vCPU via SO_REUSEPORT distribution).
-    udps: Vec<UdpRelay>,
     /// Outbound UDP NAT — guest_src_port → host-side fd we
     /// allocated to forward this flow. Populated lazily on first
     /// `handle_udp_outbound`; the fd lives until vCPU teardown.
@@ -657,8 +643,6 @@ pub fn start(mappings: &[PortMapping], cpu_count: usize) -> Result<[u8; 6], Stri
     // gives us real load distribution on macOS. Linux still gets
     // SO_REUSEPORT-style 4-tuple hashing from its own kernel if
     // siblings ever become worth re-adding for that host.
-    let mut per_worker_udps: Vec<Vec<UdpRelay>> =
-        (0..cpu_count).map(|_| Vec::new()).collect();
     let mut relay_table: Vec<UdpRelayFds> = Vec::new();
     let mut relay_table_v6: Vec<UdpRelayFds> = Vec::new();
 
@@ -679,13 +663,19 @@ pub fn start(mappings: &[PortMapping], cpu_count: usize) -> Result<[u8; 6], Stri
                 }
             }
             Proto::Udp => {
+                // Open one UDP fd per `udp:H:G` mapping. The dedicated
+                // listener thread (`udp_listener_loop`) owns recvfrom
+                // on every entry in `relay_table` / `relay_table_v6`
+                // and 4-tuple-hashes inbound flows to vCPUs.
+                //
+                // The `UdpRelayFds.fds` Vec still carries `cpu_count`
+                // copies of the same fd — that's a legacy shape the
+                // TX-side `handle_udp` reply path indexes by vCPU id
+                // to pick a sibling, which used to matter under
+                // SO_REUSEPORT. With one fd per relay it's the same
+                // value `cpu_count` times, but kept for API symmetry.
                 match open_udp_sibling(m.host) {
                     Ok(fd) => {
-                        for worker_id in 0..cpu_count {
-                            per_worker_udps[worker_id].push(UdpRelay {
-                                fd, guest_port: m.guest, family: IpFamily::V4,
-                            });
-                        }
                         let fds = vec![fd; cpu_count.max(1)];
                         relay_table.push(UdpRelayFds { guest_port: m.guest, fds });
                     }
@@ -696,11 +686,6 @@ pub fn start(mappings: &[PortMapping], cpu_count: usize) -> Result<[u8; 6], Stri
                 // we just log and continue with v4-only relay.
                 match open_udp_sibling_v6(m.host) {
                     Ok(fd) => {
-                        for worker_id in 0..cpu_count {
-                            per_worker_udps[worker_id].push(UdpRelay {
-                                fd, guest_port: m.guest, family: IpFamily::V6,
-                            });
-                        }
                         let fds = vec![fd; cpu_count.max(1)];
                         relay_table_v6.push(UdpRelayFds { guest_port: m.guest, fds });
                     }
@@ -742,10 +727,8 @@ pub fn start(mappings: &[PortMapping], cpu_count: usize) -> Result<[u8; 6], Stri
     // gets the read end of its wake pipe.
     let mut vcpu_ios: Vec<Mutex<IoState>> = Vec::with_capacity(cpu_count);
     for id in 0..cpu_count {
-        let udps = std::mem::take(&mut per_worker_udps[id]);
         vcpu_ios.push(Mutex::new(IoState {
             id,
-            udps,
             outbound_udp: HashMap::new(),
             wake_pipe_read: wake_reads[id],
             guest_mac: mac,
@@ -779,6 +762,13 @@ pub fn start(mappings: &[PortMapping], cpu_count: usize) -> Result<[u8; 6], Stri
         eprintln!("  Benchmark:  wrk -t1 -c1 -d10s http://localhost:{}/health", first_tcp.host);
     }
     eprintln!();
+
+    // Spawn the dedicated UDP listener thread. It owns recvfrom on
+    // every host UDP fd and 4-tuple-hashes inbound flows to vCPUs.
+    // Spawned LAST so every static it reads — UDP_RELAYS{,_V6},
+    // WORKERS, VCPU_WAKE_PIPES, CPU_COUNT — is fully published.
+    spawn_udp_listener();
+
     Ok(mac)
 }
 
@@ -997,11 +987,10 @@ fn poll_worker_iteration(
         fd: io.wake_pipe_read, events: libc::POLLIN, revents: 0,
     });
     io.conn_ports.push(0);
-    let udp_slot_start = io.pollfds.len();
-    for u in &io.udps {
-        io.pollfds.push(libc::pollfd { fd: u.fd, events: libc::POLLIN, revents: 0 });
-        io.conn_ports.push(0);
-    }
+    // UDP fds are no longer polled per-vCPU; the dedicated UDP
+    // listener thread owns recvfrom and forwards inbound frames to
+    // each vCPU's `forwarded_rx` mailbox (drained at the top of
+    // this poll loop).
     let listen_slot_start = io.pollfds.len();
     let listens: &[TcpListen] = LISTENS.get().map(|v| v.as_slice()).unwrap_or(&[]);
     for l in listens {
@@ -1054,22 +1043,6 @@ fn poll_worker_iteration(
             if n <= 0 { break; }
         }
         any_injected = true;
-    }
-
-    // ── Drain UDP relay siblings that fired ────────────────────────
-    {
-        let udp_drain: Vec<(i32, u16, IpFamily)> = io.udps.iter()
-            .map(|u| (u.fd, u.guest_port, u.family))
-            .collect();
-        for (i, (fd, gp, family)) in udp_drain.into_iter().enumerate() {
-            if io.pollfds[udp_slot_start + i].revents & libc::POLLIN != 0 {
-                match family {
-                    IpFamily::V4 => handle_udp_rx(io, &qsnap, fd, gp, single_queue),
-                    IpFamily::V6 => handle_udp_rx_v6(io, &qsnap, fd, gp, single_queue),
-                }
-                any_injected = true;
-            }
-        }
     }
 
     // ── Inline accept on shared TCP listen fds ─────────────────────
@@ -1447,6 +1420,252 @@ fn alloc_src_port_for_vcpu(
 /// sibling fd (distributed by SO_REUSEPORT hashing at bind time), there's
 /// no cross-worker software RSS needed — the kernel already routed the
 /// datagram to us.
+// ============================================================================
+// UDP listener thread
+// ============================================================================
+//
+// One dedicated thread does `recvfrom` on every host UDP fd
+// (registered v4 + v6 relays), 4-tuple-hashes the inbound flow
+// to a vCPU, builds the `[virtio_hdr | Eth | IP | UDP]` frame,
+// and pushes it onto that vCPU's `forwarded_rx` mailbox.
+//
+// Why a dedicated listener vs the previous "every vCPU races on
+// recvfrom" pattern:
+//
+//   - macOS serialises `recvfrom` on a UDP socket via the socket
+//     receive lock anyway. The N-vCPU race never extracted real
+//     parallelism — it just shuffled who happened to win each
+//     packet.
+//
+//   - The race produced multi-producer mutex contention on
+//     every vCPU's `forwarded_rx` (any of N-1 vCPUs could push a
+//     forwarded frame at any moment). At 4c the bench showed
+//     this as a regression vs 2c (`h3_diagnostics_max` 7.3K → 5.9K).
+//
+//   - With one writer the per-vCPU mailbox is effectively SPSC;
+//     the Mutex is uncontested in steady state and 4c scales as
+//     intended.
+//
+// The vCPU poll loop is now smaller too: no more polling N UDP
+// fds per iteration, no more `handle_udp_rx` call site. vCPUs
+// just drain their `forwarded_rx` at the top of each iteration
+// (the existing drain loop, unchanged).
+//
+// Production gVNIC is unaffected — there is no HVF runner on
+// the deploy path, and Linux SO_REUSEPORT does proper 4-tuple
+// hashing in-kernel.
+
+/// One UDP fd registered with the listener. Built from
+/// `UDP_RELAYS` + `UDP_RELAYS_V6` at thread start.
+struct ListenerFd {
+    fd: i32,
+    guest_port: u16,
+    family: IpFamily,
+}
+
+/// Spawn the listener thread. Called once from `start()` after
+/// `UDP_RELAYS`, `UDP_RELAYS_V6`, `WORKERS`, `VCPU_WAKE_PIPES`,
+/// and `CPU_COUNT` are populated.
+fn spawn_udp_listener() {
+    // Snapshot the relay tables onto Vec<ListenerFd>. Both tables
+    // are publish-once OnceLocks set before this thread starts, so
+    // a one-time snapshot is sound and avoids re-reading them on
+    // every loop iteration.
+    let mut fds: Vec<ListenerFd> = Vec::new();
+    if let Some(v4) = UDP_RELAYS.get() {
+        for r in v4 {
+            // The fds vector inside UdpRelayFds duplicates the
+            // single open fd cpu_count times for legacy reasons
+            // (it was per-sibling under the old SO_REUSEPORT
+            // design). Pick the first; they're all the same fd.
+            if let Some(&fd) = r.fds.first() {
+                fds.push(ListenerFd {
+                    fd,
+                    guest_port: r.guest_port,
+                    family: IpFamily::V4,
+                });
+            }
+        }
+    }
+    if let Some(v6) = UDP_RELAYS_V6.get() {
+        for r in v6 {
+            if let Some(&fd) = r.fds.first() {
+                fds.push(ListenerFd {
+                    fd,
+                    guest_port: r.guest_port,
+                    family: IpFamily::V6,
+                });
+            }
+        }
+    }
+
+    if fds.is_empty() {
+        return;
+    }
+
+    std::thread::Builder::new()
+        .name("hvf-udp-listener".into())
+        .spawn(move || udp_listener_loop(fds))
+        .expect("hvf-udp-listener thread spawn");
+}
+
+/// Listener main loop: poll all UDP fds, drain ready ones, hash
+/// + dispatch each datagram to the owning vCPU's `forwarded_rx`.
+fn udp_listener_loop(fds: Vec<ListenerFd>) {
+    let cpu_count = CPU_COUNT.load(Ordering::Relaxed);
+    let mut read_buf = vec![0u8; 65536];
+    let mut frame_buf = vec![0u8; 2048];
+    let mut pollfds: Vec<libc::pollfd> = fds
+        .iter()
+        .map(|f| libc::pollfd {
+            fd: f.fd,
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
+
+    loop {
+        // Poll with a 1-second timeout. The poll itself has no
+        // direct cost on the runner — the thread is otherwise
+        // idle — so a long timeout is fine. The wake-on-event
+        // path is the kernel's: a single packet arrival wakes
+        // poll instantly.
+        let ready = unsafe {
+            libc::poll(pollfds.as_mut_ptr(), pollfds.len() as u32, 1000)
+        };
+        if ready <= 0 {
+            continue;
+        }
+
+        for (i, f) in fds.iter().enumerate() {
+            if pollfds[i].revents & libc::POLLIN == 0 {
+                continue;
+            }
+            // Reset for next poll iteration.
+            pollfds[i].revents = 0;
+            match f.family {
+                IpFamily::V4 => listener_drain_v4(
+                    f.fd,
+                    f.guest_port,
+                    cpu_count,
+                    &mut read_buf,
+                    &mut frame_buf,
+                ),
+                IpFamily::V6 => listener_drain_v6(
+                    f.fd,
+                    f.guest_port,
+                    cpu_count,
+                    &mut read_buf,
+                    &mut frame_buf,
+                ),
+            }
+        }
+    }
+}
+
+/// Drain a v4 UDP fd: recvfrom in a loop until EAGAIN, hashing
+/// each datagram to a vCPU and forwarding the built frame.
+fn listener_drain_v4(
+    fd: i32,
+    guest_port: u16,
+    cpu_count: usize,
+    read_buf: &mut [u8],
+    frame_buf: &mut [u8],
+) {
+    loop {
+        let mut client_addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        let mut addr_len: libc::socklen_t = std::mem::size_of::<libc::sockaddr_in>() as u32;
+        let n = unsafe {
+            libc::recvfrom(
+                fd,
+                read_buf.as_mut_ptr() as *mut _,
+                read_buf.len(),
+                0,
+                &mut client_addr as *mut _ as *mut libc::sockaddr,
+                &mut addr_len,
+            )
+        };
+        if n <= 0 {
+            break;
+        }
+        let payload_len = n as usize;
+        let client_port = u16::from_be(client_addr.sin_port);
+        let client_ip = u32::from_be(client_addr.sin_addr.s_addr);
+
+        let target = target_vcpu_v4(client_ip, client_port, guest_port, cpu_count);
+
+        // Reply-path NAT map lives on the OWNING vCPU so when the
+        // guest sends a UDP reply the matching vCPU's
+        // `handle_udp` finds the right sockaddr.
+        {
+            let mut m = worker_shared(target).udp_clients.lock().unwrap();
+            m.insert((guest_port, client_port), client_addr);
+        }
+
+        let frame_len = build_udp_frame(
+            frame_buf,
+            &GUEST_MAC,
+            GW_IP,
+            VM_IP,
+            client_port,
+            guest_port,
+            &read_buf[..payload_len],
+        );
+        forward_frame_to_vcpu(target, &frame_buf[..frame_len]);
+    }
+}
+
+/// IPv6 counterpart to [`listener_drain_v4`].
+fn listener_drain_v6(
+    fd: i32,
+    guest_port: u16,
+    cpu_count: usize,
+    read_buf: &mut [u8],
+    frame_buf: &mut [u8],
+) {
+    loop {
+        let mut client_addr: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+        let mut addr_len: libc::socklen_t = std::mem::size_of::<libc::sockaddr_in6>() as u32;
+        let n = unsafe {
+            libc::recvfrom(
+                fd,
+                read_buf.as_mut_ptr() as *mut _,
+                read_buf.len(),
+                0,
+                &mut client_addr as *mut _ as *mut libc::sockaddr,
+                &mut addr_len,
+            )
+        };
+        if n <= 0 {
+            break;
+        }
+        let payload_len = n as usize;
+        let client_port = u16::from_be(client_addr.sin6_port);
+
+        let target = target_vcpu_v6(
+            &client_addr.sin6_addr.s6_addr,
+            client_port,
+            guest_port,
+            cpu_count,
+        );
+        {
+            let mut m = worker_shared(target).udp_clients_v6.lock().unwrap();
+            m.insert((guest_port, client_port), client_addr);
+        }
+
+        let frame_len = build_udp_frame_v6(
+            frame_buf,
+            &GUEST_MAC,
+            &GW_IPV6,
+            &VM_IPV6,
+            client_port,
+            guest_port,
+            &read_buf[..payload_len],
+        );
+        forward_frame_to_vcpu(target, &frame_buf[..frame_len]);
+    }
+}
+
 /// FNV-1a 32-bit hash of bytes. Cheap, deterministic, and good
 /// enough distribution for picking a vCPU index from a UDP
 /// 4-tuple.
@@ -1503,13 +1722,24 @@ fn target_vcpu_v6(
 /// `forwarded_rx` mailbox and wake it. The target vCPU drains
 /// the mailbox at the top of its next `vcpu_poll` and injects
 /// each frame into its own RX queue.
+///
+/// Wake-coalescing: only wake when the mailbox transitions
+/// empty → non-empty. If frames were already queued, the vCPU is
+/// either currently draining or about to (its next poll
+/// iteration will see them naturally), so a wake is redundant.
+/// Saves one `write(wake_pipe) + vm::wake_vcpu()` syscall pair
+/// per packet when the vCPU is keeping up under burst.
 fn forward_frame_to_vcpu(target_vcpu: usize, frame: &[u8]) {
     let target_shared = worker_shared(target_vcpu);
-    target_shared
-        .forwarded_rx
-        .lock()
-        .unwrap()
-        .push_back(frame.to_vec());
+    let need_wake = {
+        let mut q = target_shared.forwarded_rx.lock().unwrap();
+        let was_empty = q.is_empty();
+        q.push_back(frame.to_vec());
+        was_empty
+    };
+    if !need_wake {
+        return;
+    }
     if let Some(pipes) = VCPU_WAKE_PIPES.get() {
         if let Some(p) = pipes.get(target_vcpu) {
             let buf = [0u8; 1];
@@ -1521,81 +1751,9 @@ fn forward_frame_to_vcpu(target_vcpu: usize, frame: &[u8]) {
     crate::vm::wake_vcpu(target_vcpu);
 }
 
-fn handle_udp_rx(io: &mut IoState, qsnap: &virtio::QueueSnapshot,
-                 fd: i32, guest_port: u16, single_queue: bool) {
-    // `worker_shared(io.id)` is no longer needed locally — the
-    // udp_clients map insert routes to the FLOW-OWNING vCPU's
-    // shared state via `worker_shared(target)`, not this vCPU's.
-    let cpu_count = CPU_COUNT.load(Ordering::Relaxed);
-    let mut any_injected = false;
-    let mut ring_full = false;
-
-    loop {
-        let mut client_addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-        let mut addr_len: libc::socklen_t = std::mem::size_of::<libc::sockaddr_in>() as u32;
-        let n = unsafe {
-            libc::recvfrom(fd, io.read_buf.as_mut_ptr() as *mut _,
-                io.read_buf.len(), 0,
-                &mut client_addr as *mut _ as *mut libc::sockaddr,
-                &mut addr_len)
-        };
-        if n <= 0 { break; }
-        let payload_len = n as usize;
-
-        let client_port = u16::from_be(client_addr.sin_port);
-        // sin_addr.s_addr is in network byte order (BE). Convert to
-        // host-order u32 once for the hash.
-        let client_ip_be = u32::from_be(client_addr.sin_addr.s_addr);
-
-        // Register the sender → sockaddr mapping BEFORE publishing the
-        // packet into the guest ring, so the vCPU's handle_udp sees it
-        // when the echo reply comes back. udp_clients lives on the
-        // FLOW-OWNING vCPU's WorkerShared (not necessarily this one)
-        // because the reply path runs on the vCPU that processes the
-        // QUIC conn, and that's whichever vCPU owns the 4-tuple.
-        let target = target_vcpu_v4(client_ip_be, client_port, guest_port, cpu_count);
-        {
-            let mut m = worker_shared(target).udp_clients.lock().unwrap();
-            m.insert((guest_port, client_port), client_addr);
-        }
-
-        // Always build the frame; whether to inject locally or
-        // forward depends on the 4-tuple → vCPU hash.
-        let frame_len = build_udp_frame(&mut io.frame_buf, &io.guest_mac,
-            GW_IP, VM_IP, client_port, guest_port,
-            &io.read_buf[..payload_len]);
-
-        if target == io.id {
-            if !qsnap.ready {
-                ring_full = true;
-                continue;
-            }
-            if !inject_frame(&io.frame_buf[..frame_len], qsnap, &mut io.rx_last) {
-                ring_full = true;
-                continue;
-            }
-            any_injected = true;
-        } else {
-            // Cross-vCPU forward: target's vcpu_poll drains
-            // `forwarded_rx` at the top of its next iteration.
-            forward_frame_to_vcpu(target, &io.frame_buf[..frame_len]);
-        }
-    }
-
-    if !any_injected && !ring_full {
-        return;
-    }
-    unsafe { core::arch::asm!("dsb sy", options(nostack)); }
-    if single_queue {
-        unsafe {
-            hvf::hv_gic_set_spi(35, true);
-            hvf::hv_gic_set_spi(35, false);
-        }
-    }
-    // Multi-queue: no kick — we're already on the vCPU thread, the
-    // guest will see the new RX frames as soon as we return to it.
-    let _ = io.id;
-}
+// `handle_udp_rx` removed — the dedicated UDP listener thread now
+// owns recvfrom for every host UDP fd. See `udp_listener_loop` /
+// `listener_drain_v4` upstream.
 
 fn inject_frame(frame: &[u8], snap: &virtio::QueueSnapshot, rx_last: &mut u16) -> bool {
     let avail_idx = unsafe {
@@ -1771,69 +1929,8 @@ const VM_IPV6: [u8; 16] = [
 /// records the `(guest_port, client_port) → sockaddr_in6` mapping
 /// in `udp_clients_v6`, and injects a UDP-over-IPv6 frame into
 /// the guest. Mirrors `handle_udp_rx` for v4.
-fn handle_udp_rx_v6(
-    io: &mut IoState,
-    qsnap: &virtio::QueueSnapshot,
-    fd: i32,
-    guest_port: u16,
-    single_queue: bool,
-) {
-    let cpu_count = CPU_COUNT.load(Ordering::Relaxed);
-    let mut any_injected = false;
-    let mut ring_full = false;
-    loop {
-        let mut client_addr: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
-        let mut addr_len: libc::socklen_t = std::mem::size_of::<libc::sockaddr_in6>() as u32;
-        let n = unsafe {
-            libc::recvfrom(fd, io.read_buf.as_mut_ptr() as *mut _,
-                io.read_buf.len(), 0,
-                &mut client_addr as *mut _ as *mut libc::sockaddr,
-                &mut addr_len)
-        };
-        if n <= 0 { break; }
-        let payload_len = n as usize;
-        let client_port = u16::from_be(client_addr.sin6_port);
-
-        // 4-tuple hash → owning vCPU. Same rationale as the v4
-        // `handle_udp_rx`: pin a stateful flow to one vCPU even
-        // though macOS shared-fd UDP delivers by recvfrom race.
-        let target = target_vcpu_v6(&client_addr.sin6_addr.s6_addr,
-                                    client_port, guest_port, cpu_count);
-        {
-            let mut m = worker_shared(target).udp_clients_v6.lock().unwrap();
-            m.insert((guest_port, client_port), client_addr);
-        }
-
-        // Source address from the host's perspective: GW_IPV6
-        // (the runner's gateway). Destination = VM_IPV6.
-        let frame_len = build_udp_frame_v6(
-            &mut io.frame_buf,
-            &io.guest_mac,
-            &GW_IPV6, &VM_IPV6,
-            client_port, guest_port,
-            &io.read_buf[..payload_len],
-        );
-
-        if target == io.id {
-            if !qsnap.ready { ring_full = true; continue; }
-            if !inject_frame(&io.frame_buf[..frame_len], qsnap, &mut io.rx_last) {
-                ring_full = true; continue;
-            }
-            any_injected = true;
-        } else {
-            forward_frame_to_vcpu(target, &io.frame_buf[..frame_len]);
-        }
-    }
-    if !any_injected && !ring_full { return; }
-    unsafe { core::arch::asm!("dsb sy", options(nostack)); }
-    if single_queue {
-        unsafe {
-            hvf::hv_gic_set_spi(35, true);
-            hvf::hv_gic_set_spi(35, false);
-        }
-    }
-    let _ = io.id;
-}
+// `handle_udp_rx_v6` removed — replaced by the listener thread's
+// `listener_drain_v6` upstream.
 
 /// vCPU-side handler for guest-TX UDP-over-IPv6 packets.
 /// Distinguishes:
