@@ -343,5 +343,30 @@ pub mod diagnostics {
     /// Snapshot the heap. Cheap on bare-metal (O(1) + spinlock);
     /// best-effort zero on native.
     pub fn heap_stats() -> super::HeapStats { uni_backend::heap_stats() }
+
+    /// Snapshot the in-band diag-capture buffer (kernel panics +
+    /// unhandled CPU exceptions). Returns the byte count written
+    /// to `out`. Native build returns 0 (no kernel panics to
+    /// capture).
+    ///
+    /// The buffer is FIFO-bounded; up to ~4 KiB of records survive
+    /// the panicking core's halt and are readable by any other core
+    /// (or the same core after recovery, if it didn't actually
+    /// halt). See `kernel::diag` for the format.
+    pub fn diag_snapshot(out: &mut [u8]) -> usize {
+        uni_backend::diag_snapshot(out)
+    }
+
+    /// Bytes captured so far. Cheap "is there anything to show?"
+    /// check for the `/diag-panic` endpoint.
+    pub fn diag_captured_len() -> usize {
+        uni_backend::diag_captured_len()
+    }
+
+    /// Reset the diag buffer to empty. Used by debugger workflows
+    /// that want a fresh capture per repro iteration.
+    pub fn diag_reset() {
+        uni_backend::diag_reset()
+    }
 }
 

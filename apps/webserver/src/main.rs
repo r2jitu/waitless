@@ -234,6 +234,11 @@ async fn handle_request(req: &Request) -> Response {
             uni_tls::tls_profile_reset();
             Response::ok(b"text/plain; charset=utf-8", b"tls profile reset\n")
         }
+        b"/diag-panic"        => diag_panic_response(),
+        b"/diag-panic-reset"  => {
+            uni::diagnostics::diag_reset();
+            Response::ok(b"text/plain; charset=utf-8", b"diag reset\n")
+        }
 
         _ => Response::not_found(),
     }
@@ -975,6 +980,29 @@ fn quic_stats_response() -> Response {
         let _ = w.write_str("}");
     }
     Response::ok(&b"application/json"[..], body)
+}
+
+/// Render the kernel diag-capture buffer (panics + unhandled CPU
+/// exceptions) as plain text. Empty body when nothing's been captured.
+/// Critical for production GCE deploys where serial-port-output is
+/// access-controlled and the in-band channel is the only way to
+/// surface a panic from the running unikernel — combine with
+/// `curl http://<ip>/diag-panic` to read the trace.
+fn diag_panic_response() -> Response {
+    // Diag buffer caps at 4 KiB (cf. `kernel::diag::CAPTURE_LEN`); a
+    // 4 KiB scratch + small-string prelude lands in one body region
+    // without allocating beyond `body_iobuf`.
+    const CAP: usize = 4096;
+    let mut tmp = alloc::vec![0u8; CAP];
+    let n = uni::diagnostics::diag_snapshot(&mut tmp);
+    tmp.truncate(n);
+    if n == 0 {
+        return Response::ok(
+            &b"text/plain; charset=utf-8"[..],
+            b"(no panic captured)\n".to_vec(),
+        );
+    }
+    Response::ok(&b"text/plain; charset=utf-8"[..], tmp)
 }
 
 const PROFILE_BUF_LEN: usize = 4096;

@@ -10,6 +10,7 @@ rust_library(
         "src/cpu.rs",
         "src/cpu_info.rs",
         "src/deque.rs",
+        "src/diag.rs",
         "src/eventloop.rs",
         "src/runtime.rs",
         "src/lib.rs",

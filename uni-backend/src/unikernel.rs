@@ -45,6 +45,26 @@ pub fn heap_stats() -> super::HeapStats {
     }
 }
 
+// ---- Diag-capture re-exports --------------------------------------------
+
+/// Snapshot the in-band diag-capture buffer (panics + unhandled
+/// exceptions, cf. `kernel::diag`). Returns the byte count written.
+pub fn diag_snapshot(out: &mut [u8]) -> usize {
+    uni_kernel::diag::snapshot(out)
+}
+
+/// Bytes captured so far in the diag buffer. Cheap test for "is there
+/// anything to read?".
+pub fn diag_captured_len() -> usize {
+    uni_kernel::diag::captured_len()
+}
+
+/// Reset the diag buffer to empty. Useful for repro loops that want
+/// to capture a fresh trace per iteration.
+pub fn diag_reset() {
+    uni_kernel::diag::reset()
+}
+
 // ---- Wait for events ------------------------------------------------------
 
 /// RAII guard that masks IRQs on construction and unmasks on drop.

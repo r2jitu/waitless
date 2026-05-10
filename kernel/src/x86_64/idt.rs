@@ -282,7 +282,10 @@ pub unsafe extern "C" fn isr_common_handler(frame: *mut InterruptFrame) {
         return;
     }
 
-    // Unhandled CPU exception — print diagnostic and halt
+    // Unhandled CPU exception — capture diagnostic, print it, halt
+    // the offending core. Other cores keep running and can read the
+    // capture via `/diag-panic` — critical when serial-port-output is
+    // not externally accessible (sandboxed GCE deploys).
     if vector < 32 {
         let rip = (*frame).rip;
         let err = (*frame).error_code;
@@ -290,6 +293,30 @@ pub unsafe extern "C" fn isr_common_handler(frame: *mut InterruptFrame) {
         let rflags = (*frame).rflags;
         let mut cr2: u64;
         asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack));
+
+        // Capture into the in-band diag buffer first so it lands
+        // even on systems where the serial sink is silently
+        // dropped. We use the byte-oriented `append*` helpers to
+        // avoid pulling in `core::fmt` from a potentially-corrupt
+        // execution context.
+        crate::diag::append(b"\n!!! UNHANDLED EXCEPTION on cpu ");
+        crate::diag::append_u32(crate::cpu_id());
+        crate::diag::append(b" !!!\n  vector=0x");
+        crate::diag::append_hex(vector as u64);
+        crate::diag::append(b" err=0x");
+        crate::diag::append_hex(err);
+        crate::diag::append(b"\n  rip=0x");
+        crate::diag::append_hex(rip);
+        crate::diag::append(b" rsp=0x");
+        crate::diag::append_hex(rsp);
+        crate::diag::append(b"\n  rflags=0x");
+        crate::diag::append_hex(rflags);
+        crate::diag::append(b" cr2=0x");
+        crate::diag::append_hex(cr2);
+        crate::diag::append(b"\n");
+
+        // Mirror to serial for the case where the operator HAS
+        // serial access — same bytes either way.
         crate::serial::puts(b"\n!!! UNHANDLED EXCEPTION !!!\n");
         crate::serial::puts(b"  vector=");
         crate::serial::print_hex(vector as u64);

@@ -1144,6 +1144,12 @@ pub use uni_net_driver::TxDiag as NetTxDiag;
 pub const NET_DIAG_QP_CAP: usize = uni_net_driver::DIAG_QP_CAP;
 pub fn net_tx_diag() -> Option<NetTxDiag> { None }
 
+// ---- Diag-capture stubs (native has no kernel panic to capture) ----
+
+pub fn diag_snapshot(_out: &mut [u8]) -> usize { 0 }
+pub fn diag_captured_len() -> usize { 0 }
+pub fn diag_reset() {}
+
 // ---- Heap stats ------------------------------------------------------------
 
 pub fn heap_stats() -> super::HeapStats { super::HeapStats::default() }
