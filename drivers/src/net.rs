@@ -193,7 +193,19 @@ pub fn tx_diag() -> Option<uni_net_driver::TxDiag> {
         .map(|f| f())
 }
 
-pub use uni_net_driver::{TxDiag, DIAG_QP_CAP};
+/// Snapshot the active driver's TX descriptor capture log into the
+/// caller's buffer. Returns 0 when no driver is active or when the
+/// driver doesn't keep a per-descriptor log (currently only gve
+/// does, for TSO debug on GCE).
+pub fn tx_desc_log_snapshot(out: &mut [uni_net_driver::TxDescLogEntry]) -> usize {
+    active_ops()
+        .diag
+        .and_then(|d| d.tx_desc_log_snapshot)
+        .map(|f| f(out))
+        .unwrap_or(0)
+}
+
+pub use uni_net_driver::{TxDescLogEntry, TxDiag, DIAG_QP_CAP};
 
 /// Cold-path: used by `uni::Net::enable` to tell "no driver linked"
 /// from "drivers linked but none bound hardware".

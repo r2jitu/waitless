@@ -2168,6 +2168,12 @@ static VIRTIO_NET_DIAG_OPS: NicDiagOps = NicDiagOps {
     rx_counts,
     rx_used_cursors,
     tx_diag: Some(tx_diag),
+    // virtio-net doesn't keep a per-descriptor capture log — TSO on
+    // virtio-net works as designed, so the gve-style /diag-gve
+    // endpoint isn't needed here. Keep `None` so the trait surface
+    // stays uniform across drivers without forcing every backend
+    // to add the ring.
+    tx_desc_log_snapshot: None,
 };
 
 static VIRTIO_NET_OPS: NicOps = NicOps {

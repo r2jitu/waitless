@@ -279,6 +279,7 @@ async fn handle_request(req: &Request) -> Response {
             uni::diagnostics::diag_reset();
             Response::ok(b"text/plain; charset=utf-8", b"diag reset\n")
         }
+        b"/diag-gve"          => diag_gve_response(),
 
         _ => Response::not_found(),
     }
@@ -1043,6 +1044,52 @@ fn diag_panic_response() -> Response {
         );
     }
     Response::ok(&b"text/plain; charset=utf-8"[..], tmp)
+}
+
+/// Dump the gve driver's TX descriptor capture log as plain text.
+/// One row per descriptor written, oldest first:
+///
+///   seq=00000123 qp=0 kind=tso bytes=11 04 11 02 04 12 23 80 00 00 00 12 34 56 78 90
+///
+/// Empty body when no driver-side log is wired (any backend other
+/// than gve, or driver not yet attached). Used to debug gve TSO on
+/// GCE where serial-port output is sandboxed and `tcpdump` on the
+/// loadgen VM only shows post-hypervisor wire bytes — `/diag-gve`
+/// shows what the unikernel actually wrote to the descriptor ring.
+fn diag_gve_response() -> Response {
+    use core::fmt::Write as _;
+
+    let mut entries: alloc::vec::Vec<uni::diagnostics::NetTxDescLogEntry> =
+        alloc::vec![Default::default(); 32];
+    let n = uni::diagnostics::net_tx_desc_log_snapshot(&mut entries);
+    if n == 0 {
+        return Response::ok(
+            &b"text/plain; charset=utf-8"[..],
+            b"(no descriptor log available - driver doesn't surface one or hasn't sent yet)\n"
+                .to_vec(),
+        );
+    }
+    entries.truncate(n);
+
+    // ~80 bytes per row × 32 rows = 2.5 KiB; round up.
+    const CAP: usize = 4096;
+    let mut body = uni_http::body_iobuf(CAP);
+    {
+        let mut w = body.writer();
+        let _ = writeln!(w, "# gve TX descriptor capture (last {n} entries, oldest first)");
+        let _ = writeln!(w, "# kind: 0=STD 1=TSO_PKT 2=SEG");
+        for e in &entries {
+            let _ = write!(w, "seq={:08} qp={} kind={} bytes=", e.seq, e.qp, e.kind);
+            for (i, b) in e.bytes.iter().enumerate() {
+                if i > 0 {
+                    let _ = w.write_str(" ");
+                }
+                let _ = write!(w, "{:02x}", b);
+            }
+            let _ = w.write_str("\n");
+        }
+    }
+    Response::ok(&b"text/plain; charset=utf-8"[..], body)
 }
 
 const PROFILE_BUF_LEN: usize = 4096;

@@ -338,6 +338,26 @@ pub struct NicDiagOps {
     /// covering all qps — per-qp arrays are indexed up to
     /// `DIAG_QP_CAP`.
     pub tx_diag: Option<fn() -> TxDiag>,
+    /// Snapshot the driver's TX-descriptor capture log into the
+    /// caller's buffer. Returns the number of valid entries
+    /// written. `None` for drivers that don't keep a per-descriptor
+    /// log (only gve currently does, for TSO debug on GCE where
+    /// serial output is gated). The log is bounded; older entries
+    /// roll off as new ones land.
+    pub tx_desc_log_snapshot: Option<fn(&mut [TxDescLogEntry]) -> usize>,
+}
+
+/// Driver-emitted TX descriptor record. The `kind` field tells the
+/// renderer how to interpret `bytes` — gve has three descriptor
+/// shapes (STD, TSO pkt, SEG); virtio-net would have its own. The
+/// raw 16 bytes are forwarded as-is so the renderer can decode
+/// per-driver field semantics.
+#[derive(Clone, Copy, Default)]
+pub struct TxDescLogEntry {
+    pub seq: u32,
+    pub qp: u8,
+    pub kind: u8,
+    pub bytes: [u8; 16],
 }
 
 /// Cap on per-qp diagnostic arrays. Mirrors `rx_counts: [u64; 8]`

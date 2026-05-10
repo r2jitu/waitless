@@ -2163,6 +2163,7 @@ fn submit_tx_inner(
     unsafe {
         ptr::copy_nonoverlapping(desc.as_ptr(), desc_ptr, TX_DESC_SIZE);
     }
+    record_tx_desc(qp as u8, tx_desc_kind::STD, &desc);
 
     let new_fill = fill_cnt.wrapping_add(1);
     tx.fill_cnt.store(new_fill, Ordering::Release);
@@ -2722,6 +2723,117 @@ static TX_SMALL_ACQUIRES: AtomicU64 = AtomicU64::new(0);
 static TX_BIG_FULL_RETURNS: AtomicU64 = AtomicU64::new(0);
 static TX_BIG_ACQUIRES: AtomicU64 = AtomicU64::new(0);
 
+// ---- TX descriptor capture ring ----
+//
+// Records every 16-byte descriptor handed to the device, latest
+// `TX_DESC_LOG_DEPTH` retained. Surfaced via `tx_desc_log_snapshot`
+// → /diag-gve so a remote operator can inspect what the driver
+// actually wrote when the device misbehaves. Particularly load-
+// bearing for TSO debug on GCE where serial-port output is gated
+// by sandbox IAM.
+//
+// The ring is bounded so a steady-state production deploy doesn't
+// pay unbounded memory; 32 entries × 24 bytes per entry × 1 lock
+// ≈ 800 B + spinlock state. Each `submit_tx_*` call touches the
+// lock once on the hot path, but the contended window is tiny
+// (a few stores) so cross-core ping-pong is dwarfed by the
+// surrounding allocator + descriptor work.
+
+const TX_DESC_LOG_DEPTH: usize = 32;
+
+#[derive(Clone, Copy)]
+pub struct TxDescLogEntry {
+    /// Monotonic sequence number — lets readers reconstruct the
+    /// chronological order even when the ring has wrapped.
+    pub seq: u32,
+    /// Queue pair index (0..MAX_QUEUE_PAIRS). u8 is plenty: we never
+    /// expose more than 8 qps to the kernel.
+    pub qp: u8,
+    /// Descriptor kind: 0 = STD pkt, 1 = TSO pkt, 2 = SEG. Lets
+    /// `/diag-gve` annotate each row without re-parsing the type
+    /// byte (which lives at byte 0 but with flag bits OR'd in).
+    pub kind: u8,
+    /// Raw 16-byte gve descriptor bytes as written into the ring.
+    pub bytes: [u8; 16],
+}
+
+struct TxDescLog {
+    entries: [TxDescLogEntry; TX_DESC_LOG_DEPTH],
+    /// Next slot to overwrite (0..TX_DESC_LOG_DEPTH).
+    head: usize,
+    /// Monotonic counter; current value matches the most recently
+    /// written entry's `seq`. Wraps on overflow but the relative
+    /// order across ≤ TX_DESC_LOG_DEPTH live entries stays
+    /// unambiguous in practice.
+    seq: u32,
+    /// Total entries written since boot. `valid_count = min(written,
+    /// TX_DESC_LOG_DEPTH)` tells the snapshot reader how many slots
+    /// to walk.
+    written: u64,
+}
+
+impl TxDescLog {
+    const EMPTY: Self = TxDescLog {
+        entries: [TxDescLogEntry {
+            seq: 0,
+            qp: 0,
+            kind: 0,
+            bytes: [0; 16],
+        }; TX_DESC_LOG_DEPTH],
+        head: 0,
+        seq: 0,
+        written: 0,
+    };
+}
+
+static TX_DESC_LOG: Spinlock<TxDescLog> = Spinlock::new(TxDescLog::EMPTY);
+
+/// Descriptor kinds — use these (not raw integers) at call sites
+/// so `/diag-gve`'s rendering stays in sync with what the driver
+/// actually wrote.
+pub mod tx_desc_kind {
+    pub const STD: u8 = 0;
+    pub const TSO: u8 = 1;
+    pub const SEG: u8 = 2;
+}
+
+fn record_tx_desc(qp: u8, kind: u8, bytes: &[u8; 16]) {
+    let mut log = TX_DESC_LOG.lock();
+    log.seq = log.seq.wrapping_add(1);
+    log.written = log.written.wrapping_add(1);
+    let head = log.head;
+    log.entries[head] = TxDescLogEntry {
+        seq: log.seq,
+        qp,
+        kind,
+        bytes: *bytes,
+    };
+    log.head = (head + 1) % TX_DESC_LOG_DEPTH;
+}
+
+/// Snapshot the descriptor log into `out` in chronological order
+/// (oldest first). Returns the number of valid entries written
+/// (≤ `out.len()` and ≤ `TX_DESC_LOG_DEPTH`). Lock-bounded; the
+/// caller doesn't need to coordinate with `record_tx_desc`.
+pub fn tx_desc_log_snapshot(out: &mut [TxDescLogEntry]) -> usize {
+    let log = TX_DESC_LOG.lock();
+    let valid = (log.written as usize).min(TX_DESC_LOG_DEPTH);
+    let n = valid.min(out.len());
+    if n == 0 {
+        return 0;
+    }
+    // Oldest entry is at `head` when the ring is full, else at 0.
+    let start = if log.written as usize >= TX_DESC_LOG_DEPTH {
+        log.head
+    } else {
+        0
+    };
+    for i in 0..n {
+        out[i] = log.entries[(start + i) % TX_DESC_LOG_DEPTH];
+    }
+    n
+}
+
 fn tx_diag() -> uni_net_driver::TxDiag {
     let mut packets = [0u64; uni_net_driver::DIAG_QP_CAP];
     let mut inflight = [0u32; uni_net_driver::DIAG_QP_CAP];
@@ -2908,10 +3020,36 @@ fn probe() -> bool {
     probe_ok() || init()
 }
 
+/// Trampoline so the driver's local `TxDescLogEntry` (private
+/// shape, lives in this module) bridges to the cross-crate
+/// `uni_net_driver::TxDescLogEntry` the consumer reads. Same
+/// fields, same layout — we copy field-by-field rather than
+/// transmute to keep the boundary explicit.
+fn tx_desc_log_snapshot_export(out: &mut [uni_net_driver::TxDescLogEntry]) -> usize {
+    let mut local = [TxDescLogEntry {
+        seq: 0,
+        qp: 0,
+        kind: 0,
+        bytes: [0; 16],
+    }; TX_DESC_LOG_DEPTH];
+    let limit = out.len().min(TX_DESC_LOG_DEPTH);
+    let n = tx_desc_log_snapshot(&mut local[..limit]);
+    for i in 0..n {
+        out[i] = uni_net_driver::TxDescLogEntry {
+            seq: local[i].seq,
+            qp: local[i].qp,
+            kind: local[i].kind,
+            bytes: local[i].bytes,
+        };
+    }
+    n
+}
+
 static GVE_DIAG_OPS: NicDiagOps = NicDiagOps {
     rx_counts,
     rx_used_cursors,
     tx_diag: Some(tx_diag),
+    tx_desc_log_snapshot: Some(tx_desc_log_snapshot_export),
 };
 
 static GVE_OPS: NicOps = NicOps {

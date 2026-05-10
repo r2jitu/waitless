@@ -337,7 +337,17 @@ pub mod diagnostics {
         uni_backend::net_tx_diag()
     }
 
+    /// Snapshot the active driver's TX descriptor capture log into
+    /// the caller's buffer. Returns the number of valid entries
+    /// written. Returns 0 on native and on drivers without per-
+    /// descriptor instrumentation (currently only gve has it,
+    /// for TSO-on-GCE debug). Surfaced via `/diag-gve`.
+    pub fn net_tx_desc_log_snapshot(out: &mut [uni_backend::NetTxDescLogEntry]) -> usize {
+        uni_backend::net_tx_desc_log_snapshot(out)
+    }
+
     pub use uni_backend::NET_DIAG_QP_CAP;
+    pub use uni_backend::NetTxDescLogEntry;
     pub use uni_backend::NetTxDiag;
 
     /// Snapshot the heap. Cheap on bare-metal (O(1) + spinlock);
