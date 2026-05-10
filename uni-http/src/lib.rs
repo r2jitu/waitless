@@ -940,7 +940,14 @@ impl HttpStream for TlsStream {
         // through to the per-worker scratch path below.
         if src.total_len() <= PLAINTEXT_CHUNK {
             let mut tls_err = false;
-            let submitted = self.tcp.try_send_tso(|slot| {
+            // The resulting TLS 1.3 record is `plaintext + 22 B`
+            // (5 hdr + 16 AEAD tag + 1 inner content type). The
+            // TCP layer gates on this vs MSS so single-segment
+            // sends bypass the TSO descriptor path (which gve
+            // silently drops at <= MSS).
+            const TLS13_RECORD_OVERHEAD: usize = 5 + 16 + 1;
+            let min_payload = src.total_len() + TLS13_RECORD_OVERHEAD;
+            let submitted = self.tcp.try_send_tso(min_payload, |slot| {
                 // Wrap the slot's payload region as a transient
                 // IOBuf with TLS_HEADROOM (5 B) reserved for the
                 // record-header prepend. `seal_chain_to` writes

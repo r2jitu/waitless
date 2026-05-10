@@ -180,7 +180,12 @@ impl TcpStream {
     /// into the driver's TX-pool slot (eliminating the
     /// stack-scratch → TX-slot memcpy on the TLS-over-TCP fast
     /// path).
-    pub fn try_send_tso<F>(&self, mut fill: F) -> Option<usize>
+    /// `min_payload` is a lower bound on the TCP-payload bytes the
+    /// closure will produce; passing the exact size when known is
+    /// fine. The backend skips the TSO descriptor path (returning
+    /// `None` without running the closure) when `min_payload <=
+    /// mss` — see [`TcpBackend::try_send_tso`] for the why.
+    pub fn try_send_tso<F>(&self, min_payload: usize, mut fill: F) -> Option<usize>
     where
         F: FnMut(&mut [u8]) -> usize,
     {
@@ -189,7 +194,7 @@ impl TcpStream {
         }
         let backend = tcp_backend()?;
         let f = backend.try_send_tso?;
-        f(self.handle, self.generation, &mut fill)
+        f(self.handle, self.generation, min_payload, &mut fill)
     }
 
     /// Async byte-slice write — convenience wrapper that builds
@@ -364,9 +369,19 @@ pub struct TcpBackend {
     /// directly into the driver's TX-pool slot — eliminating the
     /// stack-scratch → TX-slot memcpy that `try_send` would do
     /// after a separate encrypt-into-scratch pass.
+    /// `min_payload` is a lower bound the caller can pre-compute on
+    /// the TCP-payload bytes the closure will write. The backend
+    /// short-circuits to `None` without acquiring a slot or running
+    /// the closure when `min_payload <= mss`, so single-segment
+    /// sends don't waste a big-slot acquire + encrypt pass on a
+    /// frame the device would emit as one wire packet anyway. (And
+    /// some hardware TSO — gve in particular — silently drops
+    /// payloads at or below MSS, so the gate is correctness-load-
+    /// bearing in those backends.)
     pub try_send_tso: Option<fn(
         handle: *mut (),
         generation: u16,
+        min_payload: usize,
         fill: &mut dyn FnMut(&mut [u8]) -> usize,
     ) -> Option<usize>>,
 

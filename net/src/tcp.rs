@@ -1089,6 +1089,7 @@ fn send_super_segment_from_cursor(
 pub fn try_send_tso(
     handle: *mut (),
     generation: u16,
+    min_payload: usize,
     fill: &mut dyn FnMut(&mut [u8]) -> usize,
 ) -> Option<usize> {
     let (core, slot) = decode_handle(handle)?;
@@ -1099,6 +1100,18 @@ pub fn try_send_tso(
         return None;
     }
     if c.state != TcpState::Established {
+        return None;
+    }
+    // TSO is only correct when the device will emit multiple
+    // segments — gve hardware silently drops sub-MSS TSO frames
+    // (the frame goes through `submit_tx_tso` and the device
+    // never delivers it on the wire). The same gate as
+    // `async_try_send_chain`'s `total > mss` check, but applied
+    // to the pre-fill estimate so we don't run the encrypt
+    // closure for a single-segment send. Caller falls back to
+    // its scratch path on `None`.
+    let mss = mss_for(c.local_ip);
+    if min_payload <= mss {
         return None;
     }
     let dst_mac = dst_mac::resolve(c.remote_ip)?;
@@ -1154,7 +1167,6 @@ pub fn try_send_tso(
     frame[tcp_off + 16] = 0;
     frame[tcp_off + 17] = 0;
 
-    let mss = mss_for(c.local_ip);
     let hdr_len = payload_off as u16;
     let csum_start = tcp_off as u16;
     uni_drivers::net::submit_tx_tso(
