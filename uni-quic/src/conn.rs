@@ -47,10 +47,25 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::crypto::{
-    aes128_gcm_open, aes128_gcm_seal, apply_hp_mask, derive_aes128_keys, derive_initial_keys,
-    derive_initial_secrets, hp_mask_aes128, next_traffic_secret, packet_nonce, AES_KEY_LEN,
+    apply_hp_mask, derive_aes128_keys, derive_initial_keys,
+    derive_initial_secrets, next_traffic_secret, packet_nonce, AES_KEY_LEN,
     HP_MASK_LEN, HP_SAMPLE_LEN, NONCE_LEN, TAG_LEN,
 };
+// Cached cipher state per `DirKeys` (see the struct doc comment for
+// the rationale). Same trait imports `crypto.rs` uses; reaching for
+// them here lets `DirKeys::aead_seal` / `aead_open` / `hp_mask` call
+// the cipher methods without going back through the per-call
+// `Aes128Gcm::new` / `Aes128::new` shims.
+//
+// Both `Aes128Gcm::new` (from `aead::KeyInit`) and `Aes128::new`
+// (from `cipher::KeyInit`) resolve through the same name; bringing
+// `aead::KeyInit` into scope is enough — `cipher::KeyInit` is
+// re-exported through the `aes_gcm::aes::cipher` module the AEAD
+// uses internally and no second alias is needed.
+use aes_gcm::aead::{generic_array::GenericArray, AeadInPlace, KeyInit};
+use aes_gcm::aes::cipher::BlockEncrypt;
+use aes_gcm::aes::Aes128;
+use aes_gcm::Aes128Gcm;
 use crate::frame::{parse_frame, write_ack, write_crypto, Frame};
 use crate::wire::{
     decode_packet_number, long_packet_type, parse_initial_header, parse_long_header_preamble,
@@ -125,24 +140,55 @@ impl ConnectionId {
 // Per-direction packet protection keys
 // ============================================================================
 
-/// AEAD/HP key material for one direction (client→server or
+/// AEAD/HP cipher state for one direction (client→server or
 /// server←client) at one packet-protection stage (Initial,
 /// Handshake, or 1-RTT). Always AES-128-GCM (16-byte AEAD key,
 /// 12-byte IV, 16-byte HP key) since `TLS_AES_128_GCM_SHA256` is
-/// our sole negotiated cipher suite. Pre-migration the struct
-/// carried a `is_chacha` discriminant + 32-byte buffers to also
-/// hold ChaCha20-Poly1305 keys; the migration to AES-128-GCM
-/// dropped the discriminant + halved the buffer sizes.
+/// our sole negotiated cipher suite.
+///
+/// Caches the keyed `Aes128Gcm` (AEAD) and `Aes128` (ECB-mode HP
+/// cipher) so each packet-protection / unprotection skips the AES
+/// round-key expansion + GHASH H-table init that `Aes128Gcm::new`
+/// and `Aes128::new` did per call previously. The work happens once
+/// per `from_*` call (once per stage, plus once per RFC 9001 §6.1
+/// key-phase rotation on the AEAD half) instead of once per packet.
+///
+/// On QUIC large-body workloads (e.g. `h3_diagnostics_max`'s ~9 KiB
+/// body fragmented into ~7 datagrams per request) this matters
+/// because the previous per-packet new-then-drop pattern paid the
+/// AES key schedule + (with the `zeroize` feature on aes-gcm) a
+/// zeroize-on-Drop on every seal/open.
+///
+/// Pre-migration this struct held only raw key bytes
+/// (`[u8; AES_KEY_LEN]` × 2) plus an `is_chacha` discriminant for
+/// the now-removed ChaCha20-Poly1305 path; the AES-128-GCM
+/// migration dropped the discriminant, and this commit drops the
+/// raw key bytes in favour of the keyed ciphers.
 #[derive(Clone)]
 struct DirKeys {
-    aead: [u8; AES_KEY_LEN],
+    aead_cipher: Aes128Gcm,
     iv: [u8; NONCE_LEN],
-    hp: [u8; AES_KEY_LEN],
+    hp_cipher: Aes128,
 }
 
 impl DirKeys {
+    /// Build a fresh `DirKeys` from raw key bytes — the AES
+    /// `Aes128Gcm` and `Aes128` ciphers are constructed once here
+    /// and then reused for every subsequent seal / open / hp_mask.
+    fn new(
+        aead_key: &[u8; AES_KEY_LEN],
+        iv: &[u8; NONCE_LEN],
+        hp_key: &[u8; AES_KEY_LEN],
+    ) -> Self {
+        DirKeys {
+            aead_cipher: Aes128Gcm::new(GenericArray::from_slice(aead_key)),
+            iv: *iv,
+            hp_cipher: Aes128::new(GenericArray::from_slice(hp_key)),
+        }
+    }
+
     fn from_initial(k: &crate::crypto::InitialKeys) -> Self {
-        DirKeys { aead: k.key, iv: k.iv, hp: k.hp }
+        Self::new(&k.key, &k.iv, &k.hp)
     }
 
     fn from_aes128(k: &crate::crypto::InitialKeys) -> Self {
@@ -150,19 +196,31 @@ impl DirKeys {
         // `derive_initial_keys` both return `InitialKeys` post-
         // migration. Kept as a separate method so call sites read
         // cleanly ("post-handshake keys" vs "Initial-stage keys").
-        DirKeys { aead: k.key, iv: k.iv, hp: k.hp }
+        Self::new(&k.key, &k.iv, &k.hp)
     }
 
     /// Build per-key-phase keys: AEAD `key`/`iv` from the freshly-
     /// derived `next_traffic_secret`, but reuse the existing HP key
-    /// from `prev`. RFC 9001 §6.1: "the same header protection key
-    /// is used" across key phases — only the AEAD half rotates.
+    /// (cipher) from `prev`. RFC 9001 §6.1: "the same header
+    /// protection key is used" across key phases — only the AEAD
+    /// half rotates. Cloning `prev.hp_cipher` avoids re-running
+    /// `Aes128::new` for the unchanged HP key.
     fn from_aes128_reuse_hp(k: &crate::crypto::InitialKeys, prev: &DirKeys) -> Self {
-        DirKeys { aead: k.key, iv: k.iv, hp: prev.hp }
+        DirKeys {
+            aead_cipher: Aes128Gcm::new(GenericArray::from_slice(&k.key)),
+            iv: k.iv,
+            hp_cipher: prev.hp_cipher.clone(),
+        }
     }
 
     fn aead_seal(&self, nonce: &[u8; NONCE_LEN], aad: &[u8], data: &mut [u8]) -> [u8; TAG_LEN] {
-        aes128_gcm_seal(&self.aead, nonce, aad, data)
+        let tag = self
+            .aead_cipher
+            .encrypt_in_place_detached(GenericArray::from_slice(nonce), aad, data)
+            .expect("AES-128-GCM encrypt: infallible for in-range buffers");
+        let mut out = [0u8; TAG_LEN];
+        out.copy_from_slice(tag.as_slice());
+        out
     }
 
     fn aead_open(
@@ -172,11 +230,24 @@ impl DirKeys {
         data: &mut [u8],
         tag: &[u8; TAG_LEN],
     ) -> Result<(), ()> {
-        aes128_gcm_open(&self.aead, nonce, aad, data, tag)
+        self.aead_cipher
+            .decrypt_in_place_detached(
+                GenericArray::from_slice(nonce),
+                aad,
+                data,
+                GenericArray::from_slice(tag),
+            )
+            .map_err(|_| ())
     }
 
+    /// AES-128-ECB on `sample`, truncated to `HP_MASK_LEN` (RFC 9001
+    /// §5.4.3). Cipher is pre-keyed; cost per call is one AES block.
     fn hp_mask(&self, sample: &[u8; HP_SAMPLE_LEN]) -> [u8; HP_MASK_LEN] {
-        hp_mask_aes128(&self.hp, sample)
+        let mut block = GenericArray::clone_from_slice(sample);
+        self.hp_cipher.encrypt_block(&mut block);
+        let mut mask = [0u8; HP_MASK_LEN];
+        mask.copy_from_slice(&block[..HP_MASK_LEN]);
+        mask
     }
 }
 
