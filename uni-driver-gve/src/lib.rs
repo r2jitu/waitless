@@ -299,17 +299,17 @@ struct TxQueue {
 
     // ---- Direct-fill (zero-copy) TX path (GQI_QPL only today) ----
     //
-    // The QPL is indexed by `slot * PAGE_SIZE`; each slot is one
-    // 4 KiB page. `slot_used[i]` tracks whether slot `i`'s page is
-    // currently filled-and-in-flight. acquire scans for the first
-    // `false`, sets `true`, hands the caller a handle pointing at
-    // QPL[slot]. submit writes a descriptor at the next ring
-    // position whose `seg_addr` references QPL[slot] (decoupled
-    // from ring index — the descriptor carries the seg_addr
-    // explicitly, so any slot can be referenced from any ring
-    // position). On completion the drain path reads `seg_addr`
-    // out of the descriptor to recover the slot index and clear
-    // `_used`.
+    // The QPL is split into two pools (see `TX_SMALL_POOL_SLOTS` /
+    // `TX_BIG_POOL_SLOTS`): the small pool holds one packet per
+    // 4 KiB page; the big pool holds one TSO super-segment per
+    // 16 KiB block (4 contiguous pages).
+    //
+    // acquire scans `_used[]` for the first `false`, sets `true`,
+    // hands the caller a handle pointing at QPL[slot]. submit writes
+    // 1 (small) or 2 (TSO + SEG) descriptor(s) whose `seg_addr`
+    // references the slot's page(s). On completion `tx_drain` reads
+    // the descriptor's type+seg_addr to recover the pool + slot
+    // index and clears `_used`.
     //
     // AtomicBool because the drain runs on the qp's owning core
     // (Tier 1) but slot-allocation is also on that core — single-
@@ -317,7 +317,8 @@ struct TxQueue {
     // though a plain `bool` would suffice on Tier 1; matches
     // virtio-net's pattern and keeps cross-core drain (Tier 2 if
     // we ever add it) sound for free.
-    slot_used: [core::sync::atomic::AtomicBool; TX_RING_ENTRIES as usize],
+    small_slot_used: [core::sync::atomic::AtomicBool; TX_SMALL_POOL_SLOTS as usize],
+    big_slot_used: [core::sync::atomic::AtomicBool; TX_BIG_POOL_SLOTS as usize],
 }
 
 /// Per-queue RX metadata. Also QPL-backed: incoming frames are
@@ -977,16 +978,32 @@ const RX_BUFFER_SIZE: u16 = 2048;
 /// the IP header lands 4-byte-aligned in the RX buffer.
 const _GVE_RX_PAD: u16 = 2;
 
-/// TX QPL size in pages. One 4 KiB page per ring slot — slot `i`
-/// always writes to QPL offset `i * PAGE_SIZE`, mirroring the RX
-/// layout. This lets us skip a real FIFO allocator: ring slot
-/// reuse waits on the device's `counter_array[counter_index]`,
-/// and the page for that slot is only written while the slot is
-/// free (`fill_cnt - done_cnt < ring_entries` gate in `send()`).
-/// Reference driver's `tx_desc_cnt / GVE_QPL_DIVISOR = 64` packs
-/// multiple packets per page and needs a full FIFO packer; not
-/// worth the code when RAM is cheap.
-const TX_QPL_PAGES: u32 = TX_RING_ENTRIES as u32;
+/// TX QPL layout — split into two pools that share the same
+/// pre-registered, contiguous range of pages.
+///
+/// **Small pool** (single-segment frames): one 4 KiB page per
+/// slot, `slot_idx ∈ 0..TX_SMALL_POOL_SLOTS`. QPL offset for slot
+/// `i` is `i * PAGE_SIZE`. Used by `send` / `acquire_tx_buf`.
+///
+/// **Big pool** (TSO super-segments): four contiguous 4 KiB pages
+/// per slot, `slot_idx ∈ 0..TX_BIG_POOL_SLOTS`. QPL offset for
+/// big slot `i` is `TX_BIG_POOL_QPL_OFFSET + i * TX_BIG_SLOT_SIZE`.
+/// Used by `acquire_tx_tso_buf` / `submit_tx_tso`. Sized at 16 KiB
+/// to fit one ~10× MSS super-segment (10 × 1460 ≈ 14.3 KiB), which
+/// is the typical TCP send-burst size that justifies TSO.
+///
+/// The 192 + 16×4 = 256 page total matches what we registered before
+/// the TSO split, so REGISTER_PAGE_LIST and CREATE_TX_QUEUE see no
+/// change. Linux's reference driver packs multiple packets per page
+/// via a FIFO; not worth that complexity when RAM is cheap. The 16
+/// big slots cap concurrent in-flight TSO super-segments per qp;
+/// per-MSS fallback covers any saturation.
+const TX_SMALL_POOL_SLOTS: u32 = 192;
+const TX_BIG_POOL_SLOTS: u32 = 16;
+const TX_BIG_SLOT_PAGES: u32 = 4;
+const TX_BIG_SLOT_SIZE: u32 = TX_BIG_SLOT_PAGES * PAGE_SIZE; // 16 KiB
+const TX_BIG_POOL_QPL_OFFSET: u32 = TX_SMALL_POOL_SLOTS * PAGE_SIZE;
+const TX_QPL_PAGES: u32 = TX_SMALL_POOL_SLOTS + TX_BIG_POOL_SLOTS * TX_BIG_SLOT_PAGES;
 /// RX QPL size in pages. The reference driver allocates
 /// `rx_desc_cnt` pages — one full page per ring entry, even though
 /// each packet only uses the first 2 KiB of that page. Smaller
@@ -1602,8 +1619,10 @@ fn finalize_tx_queue(qp: u32, alloc: &TxAlloc, fmt: QueueFormat) {
             // `>= 32` check and sets RE — so the device's
             // completion stream bootstraps on the first packet.
             last_re_at_fill: AtomicU32::new(0u32.wrapping_sub(DQO_TX_RE_INTERVAL)),
-            slot_used: [const { core::sync::atomic::AtomicBool::new(false) };
-                TX_RING_ENTRIES as usize],
+            small_slot_used: [const { core::sync::atomic::AtomicBool::new(false) };
+                TX_SMALL_POOL_SLOTS as usize],
+            big_slot_used: [const { core::sync::atomic::AtomicBool::new(false) };
+                TX_BIG_POOL_SLOTS as usize],
         });
         // Publish a raw pointer to the TxQueue living inside State
         // so the hot path (`send_on_qp`) can reach it without
@@ -1814,6 +1833,23 @@ const TX_DESC_SIZE: usize = 16;
 /// `send()` below for the actual check.
 const TX_MAX_PKT_LEN: usize = 2048;
 
+/// Highest TSO super-segment length we accept. A big-pool slot is
+/// 4 contiguous 4 KiB pages; we leave ~256 bytes of headroom over
+/// the Linux 16 KiB max-segment guidance for safety. The TCP layer
+/// will only build super-segments up to its own configured cap.
+const TX_MAX_TSO_LEN: usize = TX_BIG_SLOT_SIZE as usize - 256;
+
+// ---- GQI descriptor type/flag constants (gve_desc.h) ----------------------
+//
+// `type_flags` byte layout: low 4 bits = type, upper 4 bits = flags
+// for STD/TSO; for SEG the upper bit (GVE_TXSF_IPV6) is the only
+// flag we care about.
+const GVE_TXD_STD: u8 = 0x0 << 4;     // 0x00 — std packet (single-seg or first of multi-seg non-TSO)
+const GVE_TXD_TSO: u8 = 0x1 << 4;     // 0x10 — TSO header desc (first desc of a TSO super-segment)
+const GVE_TXD_SEG: u8 = 0x2 << 4;     // 0x20 — segment desc (TSO continuation)
+const GVE_TXF_L4CSUM: u8 = 1 << 0;    // device computes L4 csum
+const GVE_TXSF_IPV6: u8 = 1 << 1;     // TSO is over IPv6 (vs v4)
+
 fn post_initial_rx() {
     // After CREATE_RX_QUEUE the data ring needs a doorbell so the
     // device starts using the posted buffers/slots. GQI: data-slot
@@ -1938,9 +1974,19 @@ fn poll_qp_inner<F: FnMut(&[u8])>(qp: usize, mut callback: F) -> u32 {
 /// Lock-free fast path — reads TxQueue via the pre-published
 /// pointer + device counter via an atomic. For each completed
 /// descriptor in the range `[done_cnt, nic_done)`, reads the
-/// descriptor's `seg_addr` to recover which slot's QPL page it
-/// referenced and marks that slot free. Cheap: each completion
-/// is a 16-byte descriptor read + an atomic store.
+/// descriptor's type byte + `seg_addr` to recover the pool +
+/// slot index and marks the slot free.
+///
+/// Three GQI descriptor types end up in our ring (`gve_desc.h`
+/// type field, low 4 bits of `type_flags`):
+///   * `GVE_TXD_STD` (0x00) — single-segment packet; one desc
+///     references one small-pool page. Free `small_slot_used`.
+///   * `GVE_TXD_TSO` (0x10) — first desc of a TSO super-segment;
+///     references the header bytes at the start of a big-pool
+///     slot. Free `big_slot_used`.
+///   * `GVE_TXD_SEG` (0x20) — continuation desc of a TSO; its
+///     `seg_addr` is mid-big-slot (header + offset). Skip — the
+///     paired TSO desc already freed the slot.
 #[inline]
 fn tx_drain(tx: &TxQueue) {
     let counter_va = COUNTER_ARRAY_VA.load(Ordering::Acquire);
@@ -1957,16 +2003,39 @@ fn tx_drain(tx: &TxQueue) {
     while k != nic_done {
         let ring_idx = (k & mask) as usize;
         let desc_ptr = (tx.ring_va as *const u8).wrapping_add(ring_idx * TX_DESC_SIZE);
-        // gve_tx_pkt_desc: seg_addr is at offset 8, big-endian u64.
         // SAFETY: ring_va is a registered DMA-mapped page; idx is in
         // bounds via `& mask`; descriptor is 16 bytes wide.
+        let type_flags = unsafe { ptr::read_volatile(desc_ptr) };
+        let dtype = type_flags & 0xF0; // upper nibble = type
+        // gve_tx_pkt_desc / gve_tx_seg_desc: seg_addr at offset 8,
+        // big-endian u64.
         let seg_addr_be = unsafe {
             ptr::read_unaligned(desc_ptr.add(8) as *const u64)
         };
         let seg_addr = u64::from_be(seg_addr_be);
-        let slot = (seg_addr / PAGE_SIZE as u64) as usize;
-        if slot < TX_RING_ENTRIES as usize {
-            tx.slot_used[slot].store(false, Ordering::Release);
+        match dtype {
+            GVE_TXD_TSO => {
+                // First desc of a TSO packet — header lives at the
+                // start of a big-pool slot, so subtract the pool
+                // base and divide by big-slot size.
+                if seg_addr >= TX_BIG_POOL_QPL_OFFSET as u64 {
+                    let off = seg_addr - TX_BIG_POOL_QPL_OFFSET as u64;
+                    let big_slot = (off / TX_BIG_SLOT_SIZE as u64) as usize;
+                    if big_slot < TX_BIG_POOL_SLOTS as usize {
+                        tx.big_slot_used[big_slot].store(false, Ordering::Release);
+                    }
+                }
+            }
+            GVE_TXD_SEG => {
+                // Continuation desc of a TSO — paired TSO desc
+                // already freed the slot. Skip.
+            }
+            _ /* GVE_TXD_STD = 0x00, plus any unexpected type */ => {
+                let slot = (seg_addr / PAGE_SIZE as u64) as usize;
+                if slot < TX_SMALL_POOL_SLOTS as usize {
+                    tx.small_slot_used[slot].store(false, Ordering::Release);
+                }
+            }
         }
         k = k.wrapping_add(1);
     }
@@ -2000,11 +2069,12 @@ fn send_on_qp(qp: usize, data: &[u8]) -> bool {
     true
 }
 
-/// Acquire a TX slot for a specific qp. Used by `send_on_qp` (which
-/// has already picked the qp by core or fallback) and by the
-/// public `acquire_tx_buf` (which picks the worker's qp). Spin-
-/// drains on full pool — the caller is the qp's owning worker
-/// (Tier 1) so this is cooperative scheduling, not deadlock-prone.
+/// Acquire a small-pool TX slot for a specific qp. Used by
+/// `send_on_qp` (which has already picked the qp by core or
+/// fallback) and by the public `acquire_tx_buf` (which picks the
+/// worker's qp). Spin-drains on full pool — the caller is the qp's
+/// owning worker (Tier 1) so this is cooperative scheduling, not
+/// deadlock-prone.
 fn acquire_tx_buf_for_qp(qp: usize) -> Option<uni_net_driver::TxBufHandle> {
     if qp >= MAX_QUEUE_PAIRS { return None; }
     let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
@@ -2014,17 +2084,16 @@ fn acquire_tx_buf_for_qp(qp: usize) -> Option<uni_net_driver::TxBufHandle> {
     let mut local_iters: u64 = 0;
     loop {
         // Need both: a free slot in the pool AND ring-fill capacity
-        // (fill_cnt - done_cnt < ring_entries). With slot_count ==
-        // ring_entries, "free slot" implies "ring capacity" once
-        // drain runs; check both for clarity.
+        // (fill_cnt - done_cnt < ring_entries). Drain first so the
+        // small pool reflects the latest device-completed work.
         tx_drain(tx);
         let fill = tx.fill_cnt.load(Ordering::Relaxed);
         let done = tx.done_cnt.load(Ordering::Relaxed);
         if fill.wrapping_sub(done) < tx.ring_entries as u32 {
-            for slot in 0..(tx.ring_entries as usize) {
+            for slot in 0..(TX_SMALL_POOL_SLOTS as usize) {
                 local_iters += 1;
-                if !tx.slot_used[slot].load(Ordering::Acquire) {
-                    tx.slot_used[slot].store(true, Ordering::Relaxed);
+                if !tx.small_slot_used[slot].load(Ordering::Acquire) {
+                    tx.small_slot_used[slot].store(true, Ordering::Relaxed);
                     // Diag: record cumulative scan-iters + acquire
                     // count so the reader can compute the average
                     // scan depth. Single relaxed atomic each — off
@@ -2036,7 +2105,7 @@ fn acquire_tx_buf_for_qp(qp: usize) -> Option<uni_net_driver::TxBufHandle> {
                     return Some(uni_net_driver::TxBufHandle {
                         data_ptr,
                         data_cap: TX_MAX_PKT_LEN as u32,
-                        driver_token: encode_token(qp, slot),
+                        driver_token: encode_token(qp, slot, POOL_ID_SMALL),
                         release_fn: release_tx_slot,
                     });
                 }
@@ -2058,33 +2127,85 @@ fn acquire_tx_buf_for_qp(qp: usize) -> Option<uni_net_driver::TxBufHandle> {
     }
 }
 
-/// Encode `(qp, slot)` into the opaque `driver_token` of a
-/// [`uni_net_driver::TxBufHandle`]. Layout:
+/// Acquire a big-pool TX slot for a specific qp. Returns `None`
+/// when the big pool is full — caller falls back to per-MSS
+/// segmentation via the small pool. We don't spin-drain the big
+/// pool: TSO super-segments are best-effort batching, and a
+/// transient saturation should not block the worker; the per-MSS
+/// path is the safety net.
+fn acquire_tx_tso_buf_for_qp(qp: usize) -> Option<uni_net_driver::TxTsoBufHandle> {
+    if qp >= MAX_QUEUE_PAIRS { return None; }
+    let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
+    if tx_ptr.is_null() { return None; }
+    let tx = unsafe { &*tx_ptr };
+
+    // Drain so completions free big slots before we try to claim
+    // one. The ring-fill check uses `ring_entries - 1` headroom
+    // (TSO uses 2 descs per packet, leave space for one).
+    tx_drain(tx);
+    let fill = tx.fill_cnt.load(Ordering::Relaxed);
+    let done = tx.done_cnt.load(Ordering::Relaxed);
+    if fill.wrapping_sub(done) >= tx.ring_entries as u32 - 1 {
+        TX_BIG_FULL_RETURNS.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    for slot in 0..(TX_BIG_POOL_SLOTS as usize) {
+        if !tx.big_slot_used[slot].load(Ordering::Acquire) {
+            tx.big_slot_used[slot].store(true, Ordering::Relaxed);
+            TX_BIG_ACQUIRES.fetch_add(1, Ordering::Relaxed);
+            let qpl_offset = TX_BIG_POOL_QPL_OFFSET + (slot as u32) * TX_BIG_SLOT_SIZE;
+            let data_ptr = (tx.qpl_base_va + qpl_offset as u64) as *mut u8;
+            return Some(uni_net_driver::TxTsoBufHandle(uni_net_driver::TxBufHandle {
+                data_ptr,
+                data_cap: TX_MAX_TSO_LEN as u32,
+                driver_token: encode_token(qp, slot, POOL_ID_BIG),
+                release_fn: release_tx_slot,
+            }));
+        }
+    }
+    TX_BIG_FULL_RETURNS.fetch_add(1, Ordering::Relaxed);
+    None
+}
+
+const POOL_ID_SMALL: u8 = 0;
+const POOL_ID_BIG: u8 = 1;
+
+/// Encode `(qp, slot, pool_id)` into the opaque `driver_token` of
+/// a [`uni_net_driver::TxBufHandle`]. Layout:
+///   * bit  63    : pool_id (0 = small, 1 = big)
 ///   * bits 32..62: qp index
-///   * bits  0..32: slot index
+///   * bits  0..32: slot index (within the pool)
 #[inline]
-fn encode_token(qp: usize, slot: usize) -> u64 {
-    (((qp as u64) & 0x7FFF_FFFF) << 32) | (slot as u64 & 0xFFFF_FFFF)
+fn encode_token(qp: usize, slot: usize, pool: u8) -> u64 {
+    let pool_bit = ((pool & 1) as u64) << 63;
+    pool_bit | (((qp as u64) & 0x7FFF_FFFF) << 32) | (slot as u64 & 0xFFFF_FFFF)
 }
 
 #[inline]
-fn decode_token(token: u64) -> (usize, usize) {
+fn decode_token(token: u64) -> (usize, usize, u8) {
+    let pool = ((token >> 63) & 1) as u8;
     let qp = ((token >> 32) & 0x7FFF_FFFF) as usize;
     let slot = (token & 0xFFFF_FFFF) as usize;
-    (qp, slot)
+    (qp, slot, pool)
 }
 
 /// Drop callback for an unsubmitted handle: returns the slot to
-/// the pool. `submit_tx_inner` mem-forgets the handle to skip this
-/// path on the success leg.
+/// the right pool. `submit_tx_inner` / `submit_tx_tso_inner`
+/// mem-forget the handle on the success leg.
 fn release_tx_slot(token: u64) {
-    let (qp, slot) = decode_token(token);
+    let (qp, slot, pool) = decode_token(token);
     if qp >= MAX_QUEUE_PAIRS { return; }
     let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
     if tx_ptr.is_null() { return; }
     let tx = unsafe { &*tx_ptr };
-    if slot < TX_RING_ENTRIES as usize {
-        tx.slot_used[slot].store(false, Ordering::Release);
+    match pool {
+        POOL_ID_BIG if slot < TX_BIG_POOL_SLOTS as usize => {
+            tx.big_slot_used[slot].store(false, Ordering::Release);
+        }
+        _ if slot < TX_SMALL_POOL_SLOTS as usize => {
+            tx.small_slot_used[slot].store(false, Ordering::Release);
+        }
+        _ => {}
     }
 }
 
@@ -2115,19 +2236,23 @@ fn submit_tx_inner(
     frame_len: usize,
     csum: uni_net_driver::CsumOffload,
 ) {
-    let (qp, slot) = decode_token(handle.driver_token);
+    let (qp, slot, _pool) = decode_token(handle.driver_token);
     // mem::forget skips Drop's `release_fn` — the slot is about
     // to be in-flight, not unused. `tx_drain` returns it to the
     // pool when the device signals descriptor completion.
     core::mem::forget(handle);
 
-    if qp >= MAX_QUEUE_PAIRS || slot >= TX_RING_ENTRIES as usize {
+    // Type-distinct handles guarantee a `TxBufHandle` here came
+    // from the small pool (big-pool slots flow through
+    // `TxTsoBufHandle` + `submit_tx_tso`). Defensive bound checks
+    // for slot/qp index only.
+    if qp >= MAX_QUEUE_PAIRS || slot >= TX_SMALL_POOL_SLOTS as usize {
         return;
     }
     if frame_len == 0 || frame_len > TX_MAX_PKT_LEN {
         let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
         if !tx_ptr.is_null() {
-            unsafe { (*tx_ptr).slot_used[slot].store(false, Ordering::Release); }
+            unsafe { (*tx_ptr).small_slot_used[slot].store(false, Ordering::Release); }
         }
         return;
     }
@@ -2143,10 +2268,10 @@ fn submit_tx_inner(
     let qpl_offset = (slot as u32) * PAGE_SIZE;
     let desc_ptr = (tx.ring_va as *mut u8).wrapping_add(ring_idx * TX_DESC_SIZE);
     let mut desc = [0u8; TX_DESC_SIZE];
-    // type_flags: GVE_TXD_STD (= 0x00) | GVE_TXF_L4CSUM (= 0x01)
-    // when offload is on. Linux uses the upper-4-bit type encoding
+    // type_flags: GVE_TXD_STD (0x00) | GVE_TXF_L4CSUM (0x01) when
+    // offload is on. Linux uses the upper-4-bit type encoding
     // (`(0x0 << 4) = GVE_TXD_STD`) plus low-bit flags.
-    desc[0] = if csum.is_some() { 0x01 /* GVE_TXF_L4CSUM */ } else { 0x00 };
+    desc[0] = GVE_TXD_STD | if csum.is_some() { GVE_TXF_L4CSUM } else { 0 };
     if csum.is_some() {
         // Both fields are in 16-bit-word units per the spec
         // (`csum_offset >> 1`, `l4_hdr_offset >> 1` in Linux).
@@ -2176,6 +2301,129 @@ fn submit_tx_inner(
     }
 
     // Per-qp TX packet count for load-distribution diagnostics.
+    if qp < TX_PACKETS_PER_QP.len() {
+        TX_PACKETS_PER_QP[qp].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Submit a TSO super-segment on `qp`. Emits two GQI descriptors:
+///   * `desc[0]` (TSO pkt_desc): type=`GVE_TXD_TSO|GVE_TXF_L4CSUM`,
+///     header at the start of the big-pool slot, `desc_cnt=2`.
+///   * `desc[1]` (SEG desc): type=`GVE_TXD_SEG` (+ `GVE_TXSF_IPV6`
+///     if v6), `mss=gso_size`, payload immediately after the header
+///     in the same big-pool slot.
+///
+/// Per Linux's `gve_tx_fill_pkt_desc` / `gve_tx_fill_seg_desc`:
+///   * `l4_csum_offset` and `l4_hdr_offset` are in 16-bit-word units
+///     (`>> 1`); for TCP `csum_offset = 16` so `l4_csum_offset = 8`.
+///   * `l3_offset` is also in 16-bit-word units; for plain Ethernet
+///     it's `14 >> 1 = 7`.
+///   * `len` on the TSO desc is the **total** frame length (Linux
+///     passes `skb->len`); the device uses `desc_cnt` to know how
+///     many descs to fetch, then segments the payload using `mss`.
+fn submit_tx_tso_inner(
+    handle: uni_net_driver::TxTsoBufHandle,
+    frame_len: usize,
+    hdr_len: u16,
+    csum_start: u16,
+    gso_size: u16,
+) {
+    let (qp, slot, _pool) = decode_token(handle.0.driver_token);
+    // See `submit_tx_inner` for the mem::forget rationale.
+    core::mem::forget(handle);
+
+    // `TxTsoBufHandle` is type-distinct so we know this came from
+    // the big pool. Defensive index checks only.
+    if qp >= MAX_QUEUE_PAIRS || slot >= TX_BIG_POOL_SLOTS as usize {
+        return;
+    }
+    if frame_len == 0
+        || frame_len > TX_MAX_TSO_LEN
+        || hdr_len as usize >= frame_len
+        || gso_size == 0
+        || (csum_start as usize) >= frame_len
+    {
+        let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
+        if !tx_ptr.is_null() {
+            unsafe { (*tx_ptr).big_slot_used[slot].store(false, Ordering::Release); }
+        }
+        return;
+    }
+    let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
+    if tx_ptr.is_null() { return; }
+    let tx = unsafe { &*tx_ptr };
+    let bar2_va = BAR2_VA.load(Ordering::Acquire);
+
+    let fill_cnt = tx.fill_cnt.load(Ordering::Relaxed);
+    let mask = (tx.ring_entries - 1) as u32;
+    let ring_idx_0 = (fill_cnt & mask) as usize;
+    let ring_idx_1 = (fill_cnt.wrapping_add(1) & mask) as usize;
+
+    let qpl_off_hdr = TX_BIG_POOL_QPL_OFFSET + (slot as u32) * TX_BIG_SLOT_SIZE;
+    let qpl_off_payload = qpl_off_hdr + hdr_len as u32;
+    let payload_len = (frame_len - hdr_len as usize) as u16;
+
+    // Detect IPv4 vs IPv6 from the IP version nibble. `csum_start`
+    // points at the L4 header, so the IP version is at `csum_start
+    // - IP_HDR_LEN`. We sniff the byte just after the Ethernet
+    // header (offset 14) instead — robust to v4 vs v6 since both
+    // start with a `version<<4 | ...` byte.
+    let buf_ptr = (tx.qpl_base_va + qpl_off_hdr as u64) as *const u8;
+    let ip_ver = unsafe { ptr::read_volatile(buf_ptr.add(14)) >> 4 };
+    let is_v6 = ip_ver == 6;
+
+    // Fixed: TCP csum field is at offset 16 within TCP header.
+    // 16 >> 1 = 8.
+    const L4_CSUM_OFFSET_WORDS: u8 = 8;
+    // Plain Ethernet (no VLAN) — IP header begins at byte 14.
+    // 14 >> 1 = 7.
+    const L3_OFFSET_WORDS: u8 = 7;
+
+    // ---- desc[0]: TSO pkt_desc ----
+    let mut desc0 = [0u8; TX_DESC_SIZE];
+    desc0[0] = GVE_TXD_TSO | GVE_TXF_L4CSUM;
+    desc0[1] = L4_CSUM_OFFSET_WORDS;
+    desc0[2] = (csum_start >> 1) as u8;
+    desc0[3] = 2; // desc_cnt — TSO + 1 SEG
+    put_be16(&mut desc0, 4, frame_len as u16);
+    put_be16(&mut desc0, 6, hdr_len);
+    put_be64(&mut desc0, 8, qpl_off_hdr as u64);
+
+    // ---- desc[1]: SEG desc ----
+    let mut desc1 = [0u8; TX_DESC_SIZE];
+    desc1[0] = GVE_TXD_SEG | if is_v6 { GVE_TXSF_IPV6 } else { 0 };
+    desc1[1] = L3_OFFSET_WORDS;
+    // bytes 2..4 reserved
+    put_be16(&mut desc1, 4, gso_size);  // mss
+    put_be16(&mut desc1, 6, payload_len);
+    put_be64(&mut desc1, 8, qpl_off_payload as u64);
+
+    let desc_ptr_0 = (tx.ring_va as *mut u8).wrapping_add(ring_idx_0 * TX_DESC_SIZE);
+    let desc_ptr_1 = (tx.ring_va as *mut u8).wrapping_add(ring_idx_1 * TX_DESC_SIZE);
+    unsafe {
+        ptr::copy_nonoverlapping(desc0.as_ptr(), desc_ptr_0, TX_DESC_SIZE);
+        ptr::copy_nonoverlapping(desc1.as_ptr(), desc_ptr_1, TX_DESC_SIZE);
+    }
+    // Capture both descriptors so /diag-gve can render the TSO +
+    // SEG pair the device sees. Recorded in the same chronological
+    // order they were placed on the ring.
+    record_tx_desc(qp as u8, tx_desc_kind::TSO, &desc0);
+    record_tx_desc(qp as u8, tx_desc_kind::SEG, &desc1);
+
+    let new_fill = fill_cnt.wrapping_add(2);
+    tx.fill_cnt.store(new_fill, Ordering::Release);
+
+    let near_full = new_fill.wrapping_sub(tx.done_cnt.load(Ordering::Relaxed))
+        >= (tx.ring_entries as u32) - 16;
+    if !DEFERRED_KICK.load(Ordering::Relaxed) || near_full {
+        doorbell_write(bar2_va, tx.db_offset, new_fill);
+        tx.last_kicked.store(new_fill, Ordering::Relaxed);
+    }
+
+    // One super-segment carries many MSS-sized packets on the wire,
+    // but to the driver it's one TX submission. Count it as one
+    // packet so per-qp load-distribution maths still maps to
+    // descriptor-pair submits.
     if qp < TX_PACKETS_PER_QP.len() {
         TX_PACKETS_PER_QP[qp].fetch_add(1, Ordering::Relaxed);
     }
@@ -2222,6 +2470,39 @@ fn submit_tx(
     } else {
         submit_tx_inner(handle, frame_len, csum);
     }
+}
+
+/// Public TSO acquire — picks the calling worker's qp and returns
+/// a 16 KiB big-pool handle (or `None` on DQO / pool saturation).
+fn acquire_tx_tso_buf() -> Option<uni_net_driver::TxTsoBufHandle> {
+    if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
+        return None;
+    }
+    let num_qp = NUM_QP.load(Ordering::Acquire) as u32;
+    if num_qp == 0 { return None; }
+    let core = uni_kernel::cpu_id();
+    let qp = if core < num_qp { core as usize } else { 0 };
+    acquire_tx_tso_buf_for_qp(qp)
+}
+
+/// Public TSO submit — paired with [`acquire_tx_tso_buf`]. Emits
+/// 1 TSO + 1 SEG descriptor; the device segments the payload into
+/// `gso_size`-byte chunks with TCP/IP headers fixed up per segment.
+fn submit_tx_tso(
+    handle: uni_net_driver::TxTsoBufHandle,
+    frame_len: usize,
+    hdr_len: u16,
+    csum_start: u16,
+    gso_size: u16,
+) {
+    // GQI_QPL only — `acquire_tx_tso_buf` returns None on DQO so
+    // we never get a real big-pool handle in DQO mode. Just in
+    // case (e.g. a saved handle), drop it cleanly.
+    if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
+        // Dropping `handle` releases the slot via release_fn.
+        return;
+    }
+    submit_tx_tso_inner(handle, frame_len, hdr_len, csum_start, gso_size);
 }
 
 /// Flush the deferred TX kick for the given queue pair. Returns
@@ -2467,7 +2748,7 @@ fn acquire_tx_buf_dqo_for_qp(qp: usize) -> Option<uni_net_driver::TxBufHandle> {
             return Some(uni_net_driver::TxBufHandle {
                 data_ptr,
                 data_cap: RX_BUFFER_SIZE as u32,
-                driver_token: encode_token(qp, slot),
+                driver_token: encode_token(qp, slot, POOL_ID_SMALL),
                 release_fn: release_tx_slot_noop,
             });
         }
@@ -2512,7 +2793,7 @@ fn submit_tx_inner_dqo(
     frame_len: usize,
     csum: uni_net_driver::CsumOffload,
 ) {
-    let (qp, slot) = decode_token(handle.driver_token);
+    let (qp, slot, _pool) = decode_token(handle.driver_token);
     core::mem::forget(handle);
     if qp >= MAX_QUEUE_PAIRS || slot >= TX_RING_ENTRIES as usize {
         return;
@@ -2862,10 +3143,8 @@ fn tx_diag() -> uni_net_driver::TxDiag {
         small_pool_acquires: TX_SMALL_ACQUIRES.load(Ordering::Relaxed),
         big_pool_full_returns: TX_BIG_FULL_RETURNS.load(Ordering::Relaxed),
         big_pool_acquires: TX_BIG_ACQUIRES.load(Ordering::Relaxed),
-        small_pool_size: TX_RING_ENTRIES as u32,
-        // Big pool isn't wired in production (TSO parked); report 0
-        // until acquire_tx_tso_buf comes back online.
-        big_pool_size: 0,
+        small_pool_size: TX_SMALL_POOL_SLOTS,
+        big_pool_size: TX_BIG_POOL_SLOTS,
     }
 }
 
@@ -3061,10 +3340,13 @@ static GVE_OPS: NicOps = NicOps {
     // memcpy per frame). Wiring DQO direct-fill is a follow-up.
     acquire_tx_buf: Some(acquire_tx_buf),
     submit_tx: Some(submit_tx),
-    // GVE on GCE supports TSOv4 natively but we haven't wired the
-    // descriptor-side support yet; report unavailable so callers
-    // do per-MSS segmentation as today.
-    tso_available: || false,
+    // TSO v4 / v6 via GQI's `GVE_TXD_TSO` + `GVE_TXD_SEG` desc
+    // pair (per Linux's `gve_tx_fill_pkt_desc` / `_seg_desc`).
+    // The device segments super-segments host-side using the
+    // `mss` field on the SEG desc; CSUM is wired alongside via
+    // `GVE_TXF_L4CSUM`. Big-pool slots are 16 KiB so a typical
+    // 10× MSS super-segment lands in one slot.
+    tso_available: || true,
     // CSUM offload via GQI's `GVE_TXF_L4CSUM` + `l4_csum_offset` /
     // `l4_hdr_offset` (per Linux's `gve_tx_fill_pkt_desc`). Stamp
     // convention is `PseudoHeaderPartial` to match Linux's
@@ -3074,8 +3356,8 @@ static GVE_OPS: NicOps = NicOps {
     csum_tx_offload: || true,
     csum_stamp_convention:
         || uni_net_driver::CsumStampConvention::PseudoHeaderPartial,
-    acquire_tx_tso_buf: None,
-    submit_tx_tso: None,
+    acquire_tx_tso_buf: Some(acquire_tx_tso_buf),
+    submit_tx_tso: Some(submit_tx_tso),
     poll_rx: poll,
     poll_qp,
     get_mac,
