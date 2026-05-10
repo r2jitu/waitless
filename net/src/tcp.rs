@@ -1762,12 +1762,27 @@ pub fn async_try_send_chain(
     // whole chain to the driver in a single super-segment. The
     // device does the per-MSS split host-side AND computes per-
     // segment TCP/IP checksums (NEEDS_CSUM), so we save a
-    // checksum-compute pass per segment regardless of payload
-    // size — even single-MSS sends benefit. The size cap matches
-    // the big-pool slot capacity; payloads larger than that fall
-    // back to the per-MSS loop (rare for HTTPS — the TLS layer
-    // pre-chunks at PLAINTEXT_CHUNK = 16 KiB).
+    // checksum-compute pass per segment whenever there are 2+
+    // segments. The size cap matches the big-pool slot capacity;
+    // payloads larger than that fall back to the per-MSS loop
+    // (rare for HTTPS — the TLS layer pre-chunks at
+    // PLAINTEXT_CHUNK = 16 KiB).
+    //
+    // The `total > mss` gate keeps single-MSS sends out of the
+    // TSO descriptor path. Two reasons:
+    //   1. TSO on a single segment is a no-op for the host — it
+    //      emits one wire frame regardless. The descriptor-build
+    //      cost (TSO+SEG pair vs plain pkt_desc) is pure
+    //      overhead.
+    //   2. More importantly: it gives `/health` and other small
+    //      probe responses a path that doesn't depend on the
+    //      driver's TSO descriptor emission being correct. When
+    //      we're debugging a new TSO backend (gve in particular,
+    //      where serial-port output is gated on GCE) this is
+    //      what makes a `/diag-gve` HTTP endpoint reachable on
+    //      the same VM that's failing TSO sends for /diagnostics.
     if uni_drivers::net::tso_available()
+        && total > mss
         && payload_offset(c.local_ip) + total <= TSO_FRAME_BUF_LEN
     {
         send_super_segment_from_cursor(
