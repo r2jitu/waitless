@@ -920,6 +920,22 @@ pub fn num_workers() -> u32 {
     NUM_THREADS.load(Ordering::Acquire) as u32
 }
 
+/// Native lacks the bare-metal event-loop cycle accounting — there's
+/// no per-loop iter `now_cycles()` hook in the std/tokio-based
+/// runner and the OS owns scheduling decisions anyway. Return zeros;
+/// /stats consumers should treat zeros as "not available on this
+/// backend" rather than "core is idle".
+pub fn core_stats(_core_id: u32) -> (u64, u64, u64, u64, u64, u64, u64) {
+    (0, 0, 0, 0, 0, 0, 0)
+}
+
+/// Native has no easy cycle-rate accessor (we don't read TSC
+/// directly — the OS does that and exposes only wall-clock). 0
+/// signals "rate unknown".
+pub fn cycles_per_us() -> u64 {
+    0
+}
+
 // ============================================================================
 // Callback-driven event loop (mirrors uni_kernel::eventloop)
 // ============================================================================

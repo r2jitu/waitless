@@ -94,6 +94,56 @@ pub enum RecordError {
 }
 
 // ============================================================================
+// Encrypt-throughput counters (TLS record layer)
+// ============================================================================
+//
+// Bumped on every successful seal / open call with the plaintext
+// byte count. Surfaced via `tls_encrypt_stats()` so /stats can
+// report wire-bytes-per-second through the AEAD primitive (the
+// guest-side cost of TLS, modulo header / framing memcpys which
+// are already amortised by item A + B + D + the TLS-direct
+// fast path).
+//
+// Counters are u64 atomics with Relaxed ops — each fetch_add is
+// one extra cache-line touch per record. At 16 KiB / record that's
+// negligible (~ns) next to the encrypt itself.
+static TLS_ENCRYPT_BYTES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+static TLS_ENCRYPT_RECORDS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+static TLS_DECRYPT_BYTES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+static TLS_DECRYPT_RECORDS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+fn bump_encrypt(plaintext_len: usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    TLS_ENCRYPT_BYTES.fetch_add(plaintext_len as u64, Relaxed);
+    TLS_ENCRYPT_RECORDS.fetch_add(1, Relaxed);
+}
+
+#[inline]
+fn bump_decrypt(plaintext_len: usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    TLS_DECRYPT_BYTES.fetch_add(plaintext_len as u64, Relaxed);
+    TLS_DECRYPT_RECORDS.fetch_add(1, Relaxed);
+}
+
+/// Snapshot of `(encrypt_bytes, encrypt_records, decrypt_bytes,
+/// decrypt_records)` since boot. Differences across a sampling
+/// window give per-second AEAD throughput.
+pub fn encrypt_stats() -> (u64, u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        TLS_ENCRYPT_BYTES.load(Relaxed),
+        TLS_ENCRYPT_RECORDS.load(Relaxed),
+        TLS_DECRYPT_BYTES.load(Relaxed),
+        TLS_DECRYPT_RECORDS.load(Relaxed),
+    )
+}
+
+// ============================================================================
 // AAD helpers
 // ============================================================================
 
@@ -163,6 +213,7 @@ pub fn seal(
 
     // Append tag.
     out[pt_end..pt_end + TAG_LEN].copy_from_slice(&tag);
+    bump_encrypt(plaintext.len());
     Ok(total)
 }
 
@@ -261,6 +312,7 @@ pub fn seal_chain_to(
     hdr[3..5].copy_from_slice(&(record_len as u16).to_be_bytes());
     dst.prepend(&hdr).map_err(|_| RecordError::OutputTooSmall)?;
 
+    bump_encrypt(plaintext_len);
     Ok(())
 }
 
@@ -313,6 +365,7 @@ pub fn seal_in_place(
     hdr[3..5].copy_from_slice(&(record_len as u16).to_be_bytes());
     buf.prepend(&hdr).map_err(|_| RecordError::OutputTooSmall)?;
 
+    bump_encrypt(plaintext_len);
     Ok(())
 }
 
@@ -385,6 +438,7 @@ pub fn open<'a>(
     let inner_type = input[trailer_idx];
     let _ = decrypted_len; // consumed via decrypted_end
 
+    bump_decrypt(trailer_idx - decrypted_start);
     Ok((
         inner_type,
         &input[decrypted_start..trailer_idx],

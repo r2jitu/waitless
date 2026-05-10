@@ -1950,6 +1950,9 @@ fn poll_qp_inner<F: FnMut(&[u8])>(qp: usize, mut callback: F) -> u32 {
         let frame: &[u8] = unsafe {
             core::slice::from_raw_parts(frame_start as *const u8, len)
         };
+        if qp < RX_BYTES_PER_QP.len() {
+            RX_BYTES_PER_QP[qp].fetch_add(len as u64, Ordering::Relaxed);
+        }
         callback(frame);
 
         delivered += 1;
@@ -2303,6 +2306,7 @@ fn submit_tx_inner(
     // Per-qp TX packet count for load-distribution diagnostics.
     if qp < TX_PACKETS_PER_QP.len() {
         TX_PACKETS_PER_QP[qp].fetch_add(1, Ordering::Relaxed);
+        TX_BYTES_PER_QP[qp].fetch_add(frame_len as u64, Ordering::Relaxed);
     }
 }
 
@@ -2423,9 +2427,12 @@ fn submit_tx_tso_inner(
     // One super-segment carries many MSS-sized packets on the wire,
     // but to the driver it's one TX submission. Count it as one
     // packet so per-qp load-distribution maths still maps to
-    // descriptor-pair submits.
+    // descriptor-pair submits. The byte count is the
+    // pre-segmentation frame length (not the wire-emitted bytes
+    // after the device duplicates headers per segment).
     if qp < TX_PACKETS_PER_QP.len() {
         TX_PACKETS_PER_QP[qp].fetch_add(1, Ordering::Relaxed);
+        TX_BYTES_PER_QP[qp].fetch_add(frame_len as u64, Ordering::Relaxed);
     }
 }
 
@@ -2846,6 +2853,7 @@ fn submit_tx_inner_dqo(
     // Per-qp TX packet count, same field as the GQI path.
     if qp < TX_PACKETS_PER_QP.len() {
         TX_PACKETS_PER_QP[qp].fetch_add(1, Ordering::Relaxed);
+        TX_BYTES_PER_QP[qp].fetch_add(frame_len as u64, Ordering::Relaxed);
     }
 }
 
@@ -2905,6 +2913,9 @@ fn poll_qp_inner_dqo<F: FnMut(&[u8])>(qp: usize, mut callback: F) -> u32 {
         if buf_id < DQO_RX_POOL_BUFS && (status & DQO_RX_COMPL_STATUS_EOP) != 0 && pkt_len > 0 {
             let buf_va = (rx.qpl_base_va + (buf_id as u64) * (RX_BUFFER_SIZE as u64)) as *const u8;
             let bytes = unsafe { core::slice::from_raw_parts(buf_va, pkt_len) };
+            if qp < RX_BYTES_PER_QP.len() {
+                RX_BYTES_PER_QP[qp].fetch_add(pkt_len as u64, Ordering::Relaxed);
+            }
             callback(bytes);
 
             // Repost the buffer at the buffer-ring's next free slot.
@@ -2997,6 +3008,18 @@ fn num_queue_pairs() -> u16 {
 // the owning worker so a single set of counters captures the
 // driver's aggregate behaviour without needing a per-qp split).
 static TX_PACKETS_PER_QP: [AtomicU64; 8] =
+    [const { AtomicU64::new(0) }; 8];
+/// Per-qp cumulative TX wire bytes — sum of all `frame_len` values
+/// passed to `submit_tx` / `submit_tx_tso`. For TSO the count is
+/// the super-segment frame length (NOT the post-segmentation wire
+/// bytes the device actually emits), so a TSO/STD comparison is
+/// not byte-for-byte equal on the wire — interpret carefully.
+static TX_BYTES_PER_QP: [AtomicU64; 8] =
+    [const { AtomicU64::new(0) }; 8];
+/// Per-qp cumulative RX wire bytes — driver-side count of the
+/// frame length the callback receives. Includes Eth + IP + L4
+/// headers + payload.
+static RX_BYTES_PER_QP: [AtomicU64; 8] =
     [const { AtomicU64::new(0) }; 8];
 static TX_SMALL_FULL_SPINS: AtomicU64 = AtomicU64::new(0);
 static TX_SMALL_SCAN_ITERS: AtomicU64 = AtomicU64::new(0);
@@ -3118,8 +3141,14 @@ pub fn tx_desc_log_snapshot(out: &mut [TxDescLogEntry]) -> usize {
 fn tx_diag() -> uni_net_driver::TxDiag {
     let mut packets = [0u64; uni_net_driver::DIAG_QP_CAP];
     let mut inflight = [0u32; uni_net_driver::DIAG_QP_CAP];
+    let mut tx_bytes = [0u64; uni_net_driver::DIAG_QP_CAP];
+    let mut rx_bytes = [0u64; uni_net_driver::DIAG_QP_CAP];
     for i in 0..uni_net_driver::DIAG_QP_CAP {
         packets[i] = TX_PACKETS_PER_QP[i].load(Ordering::Relaxed);
+        if i < TX_BYTES_PER_QP.len() {
+            tx_bytes[i] = TX_BYTES_PER_QP[i].load(Ordering::Relaxed);
+            rx_bytes[i] = RX_BYTES_PER_QP[i].load(Ordering::Relaxed);
+        }
         // In-flight = fill_cnt - done_cnt for each live qp. Pinned
         // at `ring_entries` across multiple snapshots flags a
         // stall — the driver's queueing more, but the device
@@ -3138,6 +3167,8 @@ fn tx_diag() -> uni_net_driver::TxDiag {
     uni_net_driver::TxDiag {
         packets_per_qp: packets,
         inflight_per_qp: inflight,
+        tx_bytes_per_qp: tx_bytes,
+        rx_bytes_per_qp: rx_bytes,
         small_pool_full_spins: TX_SMALL_FULL_SPINS.load(Ordering::Relaxed),
         small_pool_scan_iters: TX_SMALL_SCAN_ITERS.load(Ordering::Relaxed),
         small_pool_acquires: TX_SMALL_ACQUIRES.load(Ordering::Relaxed),

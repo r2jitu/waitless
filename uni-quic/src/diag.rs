@@ -235,6 +235,22 @@ pub struct Counters {
     /// once enough peer bytes accumulate, or once a Handshake
     /// packet arrives and the limit is lifted entirely.
     pub anti_amp_throttled: AtomicU64,
+    /// Cumulative AEAD-sealed bytes (payload + frames protected
+    /// per packet, before the 16-byte tag). Pair with
+    /// `aead_seal_packets` to compute average packet size; pair
+    /// with the wall clock to compute encrypt throughput. The
+    /// AEAD primitive used is AES-128-GCM (negotiated by
+    /// TLS_AES_128_GCM_SHA256, our only ciphersuite).
+    pub aead_seal_bytes: AtomicU64,
+    /// Number of packets that went through the AEAD seal.
+    pub aead_seal_packets: AtomicU64,
+    /// Cumulative AEAD-opened bytes on inbound packets. Same
+    /// semantics as `aead_seal_bytes` for the RX direction.
+    pub aead_open_bytes: AtomicU64,
+    /// Number of packets that went through the AEAD open
+    /// (successful decrypts only; failed opens bump
+    /// `aead_decrypt_failed`).
+    pub aead_open_packets: AtomicU64,
 }
 
 impl Counters {
@@ -280,6 +296,10 @@ impl Counters {
             datagrams_sent: AtomicU64::new(0),
             datagrams_processed: AtomicU64::new(0),
             anti_amp_throttled: AtomicU64::new(0),
+            aead_seal_bytes: AtomicU64::new(0),
+            aead_seal_packets: AtomicU64::new(0),
+            aead_open_bytes: AtomicU64::new(0),
+            aead_open_packets: AtomicU64::new(0),
         }
     }
 }

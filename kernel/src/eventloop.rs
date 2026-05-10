@@ -8,9 +8,76 @@
 // spawned init task (see `#[uni::init]`); APs wait for `set_ready`
 // from the app's `uni::run(app)`. The loop runs until shutdown.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::sync::AtomicFn;
+
+/// Per-core event-loop counters exposed for live diagnostics. Each
+/// core writes its own slot; readers may snapshot from any core. The
+/// `busy_cycles` / `idle_cycles` pair lets `/stats` compute a
+/// per-core idle percentage without taking any lock.
+///
+/// `busy_cycles` is accumulated across loop iterations that did
+/// work (`did_work == true`) using `now_cycles()` deltas. `idle_cycles`
+/// accumulates across HLT/WFI / cooperative-yield idles. The sum
+/// `busy + idle` approximates wall-clock cycles since boot on this
+/// core — small drift comes from the per-iter overhead of reading
+/// the cycle counter and from spin-streak iterations that did no
+/// work but didn't sleep either (these get charged to `busy_cycles`
+/// as a conservative measurement; the spin loop is still on-CPU).
+#[repr(C)]
+pub struct CoreStats {
+    pub loops: AtomicU64,
+    pub poll_work: AtomicU64,
+    pub drain_work: AtomicU64,
+    pub service_work: AtomicU64,
+    pub idle_enters: AtomicU64,
+    pub busy_cycles: AtomicU64,
+    pub idle_cycles: AtomicU64,
+}
+
+impl CoreStats {
+    const fn new() -> Self {
+        Self {
+            loops: AtomicU64::new(0),
+            poll_work: AtomicU64::new(0),
+            drain_work: AtomicU64::new(0),
+            service_work: AtomicU64::new(0),
+            idle_enters: AtomicU64::new(0),
+            busy_cycles: AtomicU64::new(0),
+            idle_cycles: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Fixed per-core stats array. Sized to match the rest of the tree's
+/// 8-core ceiling (`MAX_QUEUE_PAIRS` in the drivers, the 8-deep diag
+/// arrays in `uni-net`). Sufficient for every machine type we
+/// target in production today.
+pub const MAX_CORE_STATS: usize = 8;
+
+static CORE_STATS: [CoreStats; MAX_CORE_STATS] =
+    [const { CoreStats::new() }; MAX_CORE_STATS];
+
+/// Snapshot the stats for `core_id`. Returns zeros for ids ≥ the
+/// fixed cap. Live readers should sample two snapshots a known
+/// interval apart and difference them to compute rates / idle %.
+pub fn core_stats_snapshot(core_id: u32) -> (u64, u64, u64, u64, u64, u64, u64) {
+    let i = core_id as usize;
+    if i >= MAX_CORE_STATS {
+        return (0, 0, 0, 0, 0, 0, 0);
+    }
+    let s = &CORE_STATS[i];
+    (
+        s.loops.load(Ordering::Relaxed),
+        s.poll_work.load(Ordering::Relaxed),
+        s.drain_work.load(Ordering::Relaxed),
+        s.service_work.load(Ordering::Relaxed),
+        s.idle_enters.load(Ordering::Relaxed),
+        s.busy_cycles.load(Ordering::Relaxed),
+        s.idle_cycles.load(Ordering::Relaxed),
+    )
+}
 
 /// Callback types. All receive core_id, return true if work was done.
 type PollFn = fn(u32) -> bool;
@@ -125,7 +192,12 @@ pub fn run(core_id: u32) -> ! {
     }
 
 
-    // Per-core counters for diagnostics.
+    // Per-core counters for diagnostics. These shadow the
+    // `CORE_STATS[core_id]` atomics — local registers stay hot in
+    // the inner loop; we publish to the atomics in bulk via
+    // `fetch_add` at the bottom of each iteration so /stats can
+    // observe them at run time. Sample-and-difference reads from
+    // `/stats` give a per-core utilisation breakdown.
     let mut loops: u64 = 0;
     let mut poll_work: u64 = 0;
     let mut drain_work: u64 = 0;
@@ -135,6 +207,14 @@ pub fn run(core_id: u32) -> ! {
     // a short window before we commit to HLT/WFI, so back-to-back
     // interactive requests don't eat an IRQ round-trip each.
     let mut idle_streak: u32 = 0;
+
+    // Cycle-counter snapshot from the start of the *current* loop
+    // iteration. Busy cycles (loop body) and idle cycles (HLT/WFI)
+    // are tallied separately by reading `now_cycles()` around the
+    // sleep call. See `CoreStats` for the rationale.
+    let stats_idx = (core_id as usize).min(MAX_CORE_STATS - 1);
+    let stats = &CORE_STATS[stats_idx];
+    let mut iter_start_cycles = crate::time::now_cycles();
 
     // How many no-work iterations to spin through before arming the
     // next RX IRQ and going idle. Each iteration is a full poll +
@@ -279,6 +359,17 @@ pub fn run(core_id: u32) -> ! {
             // Sleep until interrupt. WFI/HLT yields the CPU to the
             // host; the hypervisor resumes us when an interrupt fires.
             idle_streak = 0;
+            // Charge cycles spent in the iteration *up to* the sleep
+            // as busy, then time the sleep itself as idle. This is
+            // the only place the cycle counter is read on the hot
+            // path apart from the per-iter start sample at the end;
+            // bracket cost is ~10 ns on x86, ~5 ns on aarch64.
+            let pre_sleep = crate::time::now_cycles();
+            stats.busy_cycles.fetch_add(
+                pre_sleep.wrapping_sub(iter_start_cycles),
+                Ordering::Relaxed,
+            );
+            stats.idle_enters.fetch_add(1, Ordering::Relaxed);
             if uni_runtime::has_pending(core_id) {
                 // The executor has a pending timer or a task ready to
                 // re-poll. Force a local-timer-bounded idle so we wake
@@ -292,6 +383,35 @@ pub fn run(core_id: u32) -> ! {
             } else {
                 crate::cpu::idle_bounded();
             }
+            let post_sleep = crate::time::now_cycles();
+            stats.idle_cycles.fetch_add(
+                post_sleep.wrapping_sub(pre_sleep),
+                Ordering::Relaxed,
+            );
+            iter_start_cycles = post_sleep;
+        }
+
+        // Publish accumulated counters once every 64 iterations.
+        // Atomic stores are cheap individually but a single fetch_add
+        // per loop iter compounds — batch the publication to ~once
+        // per microsecond at peak rate. Sampling tools read the
+        // atomics directly, so staleness is bounded by 64 loops
+        // (~13 µs at peak).
+        if loops & 63 == 0 {
+            stats.loops.store(loops, Ordering::Relaxed);
+            stats.poll_work.store(poll_work, Ordering::Relaxed);
+            stats.drain_work.store(drain_work, Ordering::Relaxed);
+            stats.service_work.store(service_work, Ordering::Relaxed);
+            // idle_enters + busy_cycles + idle_cycles are written
+            // inline in the idle branch above (low frequency).
+            // Charge cycles since this iter started as busy too —
+            // we only update iter_start_cycles when entering idle.
+            let now = crate::time::now_cycles();
+            stats.busy_cycles.fetch_add(
+                now.wrapping_sub(iter_start_cycles),
+                Ordering::Relaxed,
+            );
+            iter_start_cycles = now;
         }
     }
 

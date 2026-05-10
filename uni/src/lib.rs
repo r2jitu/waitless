@@ -346,6 +346,24 @@ pub mod diagnostics {
         uni_backend::net_tx_desc_log_snapshot(out)
     }
 
+    /// Per-core event-loop stats: `(loops, poll_work, drain_work,
+    /// service_work, idle_enters, busy_cycles, idle_cycles)`.
+    ///
+    /// `busy_cycles + idle_cycles` ≈ wall-clock cycles since boot
+    /// on this core; `idle_cycles / total` is the per-core idle
+    /// fraction. The work counters tell whether the busy time was
+    /// going to net poll / inbox drain / app service. All zeros
+    /// on native (the OS owns scheduling).
+    pub fn core_stats(core_id: u32) -> (u64, u64, u64, u64, u64, u64, u64) {
+        uni_backend::core_stats(core_id)
+    }
+
+    /// Cycles-per-microsecond multiplier — divide cycle deltas by
+    /// this to get microseconds. 0 on native.
+    pub fn cycles_per_us() -> u64 {
+        uni_backend::cycles_per_us()
+    }
+
     pub use uni_backend::NET_DIAG_QP_CAP;
     pub use uni_backend::NetTxDescLogEntry;
     pub use uni_backend::NetTxDiag;

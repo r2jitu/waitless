@@ -1808,6 +1808,13 @@ impl Connection {
                 pn, pkt_kp, self.recv_key_phase, payload_end - payload_start);
             ConnError::Decrypt
         })?;
+        crate::diag::COUNTERS.aead_open_bytes.fetch_add(
+            (payload_end - payload_start) as u64,
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        crate::diag::COUNTERS
+            .aead_open_packets
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
         let payload = &buf[payload_start..payload_end];
         self.dispatch_frames(CryptoLevel::OneRtt, payload)?;
@@ -3001,6 +3008,12 @@ impl Connection {
         let aad: &[u8] = &header_part[header_start..payload_offset];
         let payload_slice = &mut payload_part[..payload_len];
         let tag = keys.aead_seal(&nonce, aad, payload_slice);
+        crate::diag::COUNTERS
+            .aead_seal_bytes
+            .fetch_add(payload_len as u64, core::sync::atomic::Ordering::Relaxed);
+        crate::diag::COUNTERS
+            .aead_seal_packets
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         out[payload_offset + payload_len..payload_offset + payload_len + TAG_LEN]
             .copy_from_slice(&tag);
 

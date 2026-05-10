@@ -919,9 +919,10 @@ fn stats_response() -> Response {
     let rx_chi = rss_chi_squared_x100(rx_slice);
     let rx_ratio = max_min_ratio_x100(rx_slice);
 
-    // 2 KiB body region — covers nqp ≤ 32 with TX/RX arrays + the
-    // small set of saturation scalars and stays well under cap.
-    let mut body = uni_http::body_iobuf(2048);
+    // 4 KiB body region — covers nqp ≤ 8 plus per-qp TX/RX byte
+    // arrays, per-core CPU stats, and TLS/QUIC AEAD counters.
+    // /stats is on the slow path so the extra reservation is free.
+    let mut body = uni_http::body_iobuf(4096);
     {
         let mut w = body.writer();
         let _ = w.write_str("{");
@@ -979,7 +980,98 @@ fn stats_response() -> Response {
                 t.big_pool_acquires,
                 t.big_pool_full_returns,
             );
+            let tx_bytes = &t.tx_bytes_per_qp[..nqp.min(t.tx_bytes_per_qp.len())];
+            let rx_bytes = &t.rx_bytes_per_qp[..nqp.min(t.rx_bytes_per_qp.len())];
+            let _ = w.write_str(",");
+            emit_json_array(&mut w, "tx_bytes", tx_bytes);
+            let _ = w.write_str(",");
+            emit_json_array(&mut w, "rx_bytes", rx_bytes);
         }
+
+        // ---- Per-core event-loop stats ----
+        //
+        // Captures the four numbers most directly relevant to "are
+        // we CPU- or network-bound?":
+        //   * `idle_cycles / (busy + idle)` → idle fraction; high =
+        //     plenty of CPU headroom, low = CPU-bound.
+        //   * `service_work` rate vs `loops` rate → fraction of
+        //     iterations that did real app work (vs poll-only spins
+        //     ticking the spin-before-HLT window).
+        //   * `idle_enters` → how many HLT/WFI bracketings happened;
+        //     each costs ~1µs IRQ round-trip on KVM/HVF. A low rate
+        //     means we're in steady-state poll mode.
+        //
+        // Per-core arrays so RSS imbalance (one core hot, others
+        // idle) is visible. cycles_per_us is emitted once so /stats
+        // consumers can convert cycle deltas to µs.
+        let nc = (uni::num_workers() as usize).min(8);
+        let mut loops = [0u64; 8];
+        let mut poll_work = [0u64; 8];
+        let mut drain_work = [0u64; 8];
+        let mut svc_work = [0u64; 8];
+        let mut idle_enters = [0u64; 8];
+        let mut busy_cyc = [0u64; 8];
+        let mut idle_cyc = [0u64; 8];
+        for i in 0..nc {
+            let s = uni::diagnostics::core_stats(i as u32);
+            loops[i] = s.0;
+            poll_work[i] = s.1;
+            drain_work[i] = s.2;
+            svc_work[i] = s.3;
+            idle_enters[i] = s.4;
+            busy_cyc[i] = s.5;
+            idle_cyc[i] = s.6;
+        }
+        let _ = w.write_str(",");
+        emit_json_array(&mut w, "core_loops", &loops[..nc]);
+        let _ = w.write_str(",");
+        emit_json_array(&mut w, "core_poll_work", &poll_work[..nc]);
+        let _ = w.write_str(",");
+        emit_json_array(&mut w, "core_drain_work", &drain_work[..nc]);
+        let _ = w.write_str(",");
+        emit_json_array(&mut w, "core_service_work", &svc_work[..nc]);
+        let _ = w.write_str(",");
+        emit_json_array(&mut w, "core_idle_enters", &idle_enters[..nc]);
+        let _ = w.write_str(",");
+        emit_json_array(&mut w, "core_busy_cycles", &busy_cyc[..nc]);
+        let _ = w.write_str(",");
+        emit_json_array(&mut w, "core_idle_cycles", &idle_cyc[..nc]);
+        let _ = write!(w, ",\"cycles_per_us\":{}", uni::diagnostics::cycles_per_us());
+
+        // ---- AEAD throughput (TLS + QUIC) ----
+        //
+        // TLS counters cover the record layer (every full-record
+        // seal / open). QUIC counters cover per-packet AEAD on the
+        // 1-RTT path (the only level where ~all bytes flow post-
+        // handshake). Divide bytes by wall-clock from two
+        // snapshots and compare to cycles_per_us × idle fraction
+        // to spot crypto-bound regimes (encrypt_bytes/sec capped
+        // well below the per-core AEAD ceiling means non-crypto
+        // overhead dominates).
+        let (tls_enc_b, tls_enc_r, tls_dec_b, tls_dec_r) =
+            uni_tls::record::encrypt_stats();
+        let qenc_b = uni_quic::diag::COUNTERS.aead_seal_bytes.load(
+            core::sync::atomic::Ordering::Relaxed);
+        let qenc_p = uni_quic::diag::COUNTERS.aead_seal_packets.load(
+            core::sync::atomic::Ordering::Relaxed);
+        let qdec_b = uni_quic::diag::COUNTERS.aead_open_bytes.load(
+            core::sync::atomic::Ordering::Relaxed);
+        let qdec_p = uni_quic::diag::COUNTERS.aead_open_packets.load(
+            core::sync::atomic::Ordering::Relaxed);
+        let _ = write!(
+            w,
+            ",\"tls_encrypt_bytes\":{},\
+              \"tls_encrypt_records\":{},\
+              \"tls_decrypt_bytes\":{},\
+              \"tls_decrypt_records\":{},\
+              \"quic_aead_seal_bytes\":{},\
+              \"quic_aead_seal_packets\":{},\
+              \"quic_aead_open_bytes\":{},\
+              \"quic_aead_open_packets\":{}",
+            tls_enc_b, tls_enc_r, tls_dec_b, tls_dec_r,
+            qenc_b, qenc_p, qdec_b, qdec_p,
+        );
+
         let _ = w.write_str("}");
     }
     Response::ok(&b"application/json"[..], body)

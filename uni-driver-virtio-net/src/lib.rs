@@ -1398,6 +1398,7 @@ fn submit_tx(
             // across qps. Even-ish counts under multi-core load
             // means worker→qp mapping + RSS are balanced.
             TX_PACKETS_PER_QP[qp].fetch_add(1, Ordering::Relaxed);
+            TX_BYTES_PER_QP[qp].fetch_add(frame_len as u64, Ordering::Relaxed);
         }
     }
 }
@@ -1493,6 +1494,7 @@ fn submit_tx_tso(
         };
         if ok && qp < DIAG_QP_CAP {
             TX_PACKETS_PER_QP[qp].fetch_add(1, Ordering::Relaxed);
+            TX_BYTES_PER_QP[qp].fetch_add(frame_len as u64, Ordering::Relaxed);
         }
     }
 }
@@ -1567,6 +1569,15 @@ static RX_COUNTS: [core::sync::atomic::AtomicU64; DIAG_QP_CAP] =
 /// indicator.
 static TX_PACKETS_PER_QP: [core::sync::atomic::AtomicU64; DIAG_QP_CAP] =
     [const { core::sync::atomic::AtomicU64::new(0) }; DIAG_QP_CAP];
+/// Per-qp cumulative TX wire bytes — sum of `frame_len` over every
+/// submit. For TSO the value is the pre-segmentation super-segment
+/// length, not post-segmentation wire bytes.
+static TX_BYTES_PER_QP: [core::sync::atomic::AtomicU64; DIAG_QP_CAP] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; DIAG_QP_CAP];
+/// Per-qp cumulative RX wire bytes — driver-side count of frame
+/// lengths the callback receives.
+static RX_BYTES_PER_QP: [core::sync::atomic::AtomicU64; DIAG_QP_CAP] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; DIAG_QP_CAP];
 static TX_SMALL_FULL_SPINS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 static TX_SMALL_SCAN_ITERS: core::sync::atomic::AtomicU64 =
@@ -1582,8 +1593,12 @@ fn tx_diag() -> uni_net_driver::TxDiag {
     use core::sync::atomic::Ordering::Relaxed;
     let mut packets = [0u64; DIAG_QP_CAP];
     let mut inflight = [0u32; DIAG_QP_CAP];
+    let mut tx_bytes = [0u64; DIAG_QP_CAP];
+    let mut rx_bytes = [0u64; DIAG_QP_CAP];
     for i in 0..DIAG_QP_CAP {
         packets[i] = TX_PACKETS_PER_QP[i].load(Relaxed);
+        tx_bytes[i] = TX_BYTES_PER_QP[i].load(Relaxed);
+        rx_bytes[i] = RX_BYTES_PER_QP[i].load(Relaxed);
     }
     // Per-qp in-flight count: virtio's avail-used delta on each TX
     // queue. Pool slot count instead would conflate small and big
@@ -1599,6 +1614,8 @@ fn tx_diag() -> uni_net_driver::TxDiag {
     uni_net_driver::TxDiag {
         packets_per_qp: packets,
         inflight_per_qp: inflight,
+        tx_bytes_per_qp: tx_bytes,
+        rx_bytes_per_qp: rx_bytes,
         small_pool_full_spins: TX_SMALL_FULL_SPINS.load(Relaxed),
         small_pool_scan_iters: TX_SMALL_SCAN_ITERS.load(Relaxed),
         small_pool_acquires: TX_SMALL_ACQUIRES.load(Relaxed),
@@ -2058,6 +2075,12 @@ fn poll_qp(qp: usize, callback: fn(uni_net_driver::IOBuf)) -> usize {
 
             if used_len > VIRTIO_NET_HDR_SIZE as u32 {
                 let frame_len = (used_len - VIRTIO_NET_HDR_SIZE as u32) as usize;
+                if qp < DIAG_QP_CAP {
+                    RX_BYTES_PER_QP[qp].fetch_add(
+                        frame_len as u64,
+                        core::sync::atomic::Ordering::Relaxed,
+                    );
+                }
                 // Wrap the buffer as `IOBuf::External` and hand
                 // ownership to the consumer. `ctx = qp` so the
                 // drop callback knows where to re-arm.

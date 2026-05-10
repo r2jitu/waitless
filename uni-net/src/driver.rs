@@ -389,6 +389,17 @@ pub struct TxDiag {
     /// emitting completions. Direct smoking gun for the gve
     /// DQO-direct-fill stall on c3.
     pub inflight_per_qp: [u32; DIAG_QP_CAP],
+    /// Per-qp cumulative TX wire bytes — sum of `frame_len` over
+    /// every submit. For TSO the value is the *pre-segmentation*
+    /// super-segment length, not the post-segmentation wire
+    /// bytes the device actually emits (so apples-to-apples
+    /// throughput comparison vs the small-pool path under-
+    /// counts TSO by the per-segment header duplication).
+    pub tx_bytes_per_qp: [u64; DIAG_QP_CAP],
+    /// Per-qp cumulative RX wire bytes — driver-side count of
+    /// frame lengths the callback receives (includes Eth + IP +
+    /// L4 headers + payload).
+    pub rx_bytes_per_qp: [u64; DIAG_QP_CAP],
     /// Cumulative number of times `acquire_tx_buf` had to spin
     /// because the small pool was fully in-flight. High counts
     /// = pool is undersized for the load.
