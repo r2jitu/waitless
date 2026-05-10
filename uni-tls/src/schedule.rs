@@ -28,7 +28,15 @@
 // merger from //net:tls into //uni-tls. `tls_crypto` was a separate
 // crate; it's now this crate's sibling `aead` module.)
 
-use crate::aead as tls_crypto;
+// Note: TrafficKey now reaches into `aes_gcm` directly (caching the
+// `Aes128Gcm` cipher in the struct) rather than going through the
+// crate-internal `aead` shim. The shim is still used for one-shot
+// callers that don't keep cipher state around (boot KAT, ticket
+// envelope) — see `uni-tls/src/aead.rs`.
+use aes_gcm::aead::generic_array::GenericArray;
+use aes_gcm::aead::AeadInPlace;
+use aes_gcm::aead::KeyInit;
+use aes_gcm::Aes128Gcm;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -201,32 +209,56 @@ pub fn empty_transcript_hash() -> [u8; HASH_LEN] {
 // Traffic key pair: (AEAD key, IV)
 // ============================================================================
 
-/// Per-direction traffic keys: the symmetric AEAD key plus the static
-/// nonce base. RFC 8446 §5.3 specifies the per-record nonce as
-/// `iv XOR seq_be`.
+/// Per-direction traffic keys: a pre-keyed AES-128-GCM cipher plus
+/// the static nonce base. RFC 8446 §5.3 specifies the per-record
+/// nonce as `iv XOR seq_be`.
+///
+/// Storing the keyed `Aes128Gcm` directly (vs the previous raw
+/// `[u8; KEY_LEN]`) means each `seal`/`open` skips the AES-128 key
+/// schedule + GHASH H-table init that `Aes128Gcm::new` does — that
+/// work happens once per TrafficKey, not once per record. With
+/// AES-NI it's only ~200 cycles, but at >100 K records/s the
+/// per-conn caching surfaces above noise on TLS-record-heavy
+/// workloads.
+///
+/// `aes-gcm`'s `zeroize` feature (enabled in our Cargo.toml)
+/// installs a `Drop` impl on `Aes128Gcm` that zeroes the round
+/// keys, replacing the per-byte `secure_zero` we used to do on the
+/// raw key.
 #[derive(Clone)]
 pub struct TrafficKey {
-    pub key: [u8; KEY_LEN],
+    cipher: Aes128Gcm,
     pub iv: [u8; IV_LEN],
     pub seq: u64,
 }
 
 impl Drop for TrafficKey {
     fn drop(&mut self) {
-        secure_zero(&mut self.key);
+        // `cipher`'s round keys are zeroed by `Aes128Gcm`'s `Drop`
+        // impl (via the `zeroize` feature). The IV is non-secret
+        // per RFC 8446 §5.3 (it's xored with `seq` to form the
+        // nonce, which is sent in the clear inside the record's
+        // associated data anyway), but zero it for hygiene with
+        // the same scrubbing primitive we use for stack secrets.
         secure_zero(&mut self.iv);
     }
 }
 
 impl TrafficKey {
     /// Derive `(key, iv)` from a 32-byte traffic secret via
-    /// `HKDF-Expand-Label(secret, "key"/"iv", "", …)`.
+    /// `HKDF-Expand-Label(secret, "key"/"iv", "", …)`, then
+    /// instantiate the `Aes128Gcm` cipher and discard the raw key.
     pub fn from_secret(secret: &[u8; HASH_LEN]) -> Self {
         let mut key = [0u8; KEY_LEN];
         let mut iv = [0u8; IV_LEN];
         hkdf_expand_label(secret, b"key", &[], &mut key);
         hkdf_expand_label(secret, b"iv", &[], &mut iv);
-        TrafficKey { key, iv, seq: 0 }
+        let cipher = Aes128Gcm::new(GenericArray::from_slice(&key));
+        // Wipe the raw key now that it's been folded into the
+        // cipher's round-key state — no plaintext key bytes
+        // outlive this call.
+        secure_zero(&mut key);
+        TrafficKey { cipher, iv, seq: 0 }
     }
 
     /// XOR the sequence number into the static IV to form the per-record
@@ -246,7 +278,13 @@ impl TrafficKey {
     pub fn seal(&mut self, aad: &[u8], data: &mut [u8]) -> [u8; 16] {
         let nonce = self.nonce_for_seq(self.seq);
         self.seq = self.seq.wrapping_add(1);
-        tls_crypto::seal(&self.key, &nonce, aad, data)
+        let tag = self
+            .cipher
+            .encrypt_in_place_detached(GenericArray::from_slice(&nonce), aad, data)
+            .expect("AES-128-GCM encrypt: infallible for in-range buffers");
+        let mut out = [0u8; 16];
+        out.copy_from_slice(tag.as_slice());
+        out
     }
 
     /// Fused copy-and-encrypt N-way variant of [`Self::seal`].
@@ -271,18 +309,45 @@ impl TrafficKey {
     {
         let nonce = self.nonce_for_seq(self.seq);
         self.seq = self.seq.wrapping_add(1);
-        tls_crypto::seal_chain_to(&self.key, &nonce, aad, src_parts, dst)
+        let mut cursor = 0usize;
+        for src_part in src_parts {
+            let n = src_part.len();
+            if n == 0 {
+                continue;
+            }
+            dst[cursor..cursor + n].copy_from_slice(src_part);
+            cursor += n;
+        }
+        let tag = self
+            .cipher
+            .encrypt_in_place_detached(
+                GenericArray::from_slice(&nonce),
+                aad,
+                &mut dst[..cursor],
+            )
+            .expect("AES-128-GCM encrypt: infallible for in-range buffers");
+        let mut out = [0u8; 16];
+        out.copy_from_slice(tag.as_slice());
+        out
     }
 
     /// Open `data` in place; returns Err on tag mismatch. Auto-increments
     /// `seq` on success.
     pub fn open(&mut self, aad: &[u8], data: &mut [u8], tag: &[u8; 16]) -> Result<(), ()> {
         let nonce = self.nonce_for_seq(self.seq);
-        tls_crypto::open(&self.key, &nonce, aad, data, tag)?;
+        self.cipher
+            .decrypt_in_place_detached(
+                GenericArray::from_slice(&nonce),
+                aad,
+                data,
+                GenericArray::from_slice(tag),
+            )
+            .map_err(|_| ())?;
         self.seq = self.seq.wrapping_add(1);
         Ok(())
     }
 }
+
 
 // ============================================================================
 // TLS 1.3 key schedule

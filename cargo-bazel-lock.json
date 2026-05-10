@@ -1,5 +1,5 @@
 {
-  "checksum": "a2e31cff43e2687d10de06eb6f0b2bd8b1915fe2d00b7e64cc577e1d9de88744",
+  "checksum": "b71c26a42a7ce4fa0a24d0a618bb69bb1c77b7a701248f0a34fe11b1e43f2f22",
   "crates": {
     "aead 0.5.2": {
       "name": "aead",
@@ -161,7 +161,8 @@
         "crate_features": {
           "common": [
             "aes",
-            "alloc"
+            "alloc",
+            "zeroize"
           ],
           "selects": {}
         },
@@ -190,6 +191,10 @@
             {
               "id": "subtle 2.6.1",
               "target": "subtle"
+            },
+            {
+              "id": "zeroize 1.8.2",
+              "target": "zeroize"
             }
           ],
           "selects": {}
