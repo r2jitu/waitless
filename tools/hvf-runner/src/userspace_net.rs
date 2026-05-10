@@ -174,6 +174,21 @@ struct WorkerShared {
     /// TX-side reply in `handle_udp_v6` can `sendto` the original
     /// peer over IPv6.
     udp_clients_v6: Mutex<HashMap<(u16, u16), libc::sockaddr_in6>>,
+    /// MTU-sized inbound frames staged by another vCPU's
+    /// `handle_udp_rx` for THIS vCPU's RX queue. Cross-vCPU
+    /// 4-tuple-hash UDP routing — necessary because macOS's
+    /// shared-fd UDP recv distributes by recvfrom race instead of
+    /// 4-tuple, so a stateful protocol like QUIC sees its own
+    /// connection's packets scatter across vCPUs randomly. The
+    /// receiving vCPU computes a hash on the 4-tuple, and if the
+    /// target isn't itself, it pushes the built Ethernet frame
+    /// here for the owning vCPU to inject on its next poll.
+    /// Vec<u8> rather than `TxFrame` (which is 600-byte fixed) so
+    /// MTU-1500 datagrams + 42-byte L2/L3/L4 headers fit.
+    /// Multi-producer (any vCPU) + single-consumer (this vCPU's
+    /// poll loop), so the Mutex is contended at most by
+    /// `cpu_count` threads.
+    forwarded_rx: Mutex<VecDeque<Vec<u8>>>,
 }
 
 impl WorkerShared {
@@ -183,6 +198,7 @@ impl WorkerShared {
             tx_replies: Mutex::new(VecDeque::new()),
             udp_clients_v6: Mutex::new(HashMap::new()),
             udp_clients: Mutex::new(HashMap::new()),
+            forwarded_rx: Mutex::new(VecDeque::new()),
         }
     }
 }
@@ -923,6 +939,31 @@ fn poll_worker_iteration(
         }
     }
 
+    // ── Drain UDP frames forwarded here by another vCPU's
+    //    `handle_udp_rx` (4-tuple hash routing). Identical
+    //    inject pattern to `tx_replies` above; kept separate
+    //    because forwarded frames are MTU-sized Vec<u8>s rather
+    //    than the 600-byte fixed `TxFrame` reply records.
+    {
+        let mut fwd = shared.forwarded_rx.lock().unwrap();
+        let mut any = false;
+        while let Some(f) = fwd.pop_front() {
+            if !qsnap.ready || !inject_frame(&f, &qsnap, &mut io.rx_last) {
+                fwd.push_front(f);
+                break;
+            }
+            any = true;
+        }
+        drop(fwd);
+        if any {
+            unsafe { core::arch::asm!("dsb sy", options(nostack)); }
+            if single_queue {
+                unsafe { hvf::hv_gic_set_spi(35, true); hvf::hv_gic_set_spi(35, false); }
+            }
+            any_injected = true;
+        }
+    }
+
     // ── Flush pending data for conns that just became ESTABLISHED ──
     {
         let mut conns = shared.conns.lock().unwrap();
@@ -1406,9 +1447,86 @@ fn alloc_src_port_for_vcpu(
 /// sibling fd (distributed by SO_REUSEPORT hashing at bind time), there's
 /// no cross-worker software RSS needed — the kernel already routed the
 /// datagram to us.
+/// FNV-1a 32-bit hash of bytes. Cheap, deterministic, and good
+/// enough distribution for picking a vCPU index from a UDP
+/// 4-tuple.
+fn fnv1a_32(bytes: &[u8]) -> u32 {
+    let mut h: u32 = 2166136261;
+    for &b in bytes {
+        h ^= b as u32;
+        h = h.wrapping_mul(16777619);
+    }
+    h
+}
+
+/// Pick the owning vCPU for a UDP IPv4 flow. Same 4-tuple always
+/// hashes to the same vCPU, giving stateful protocols (QUIC) the
+/// flow affinity that a 4-tuple-hashing kernel SO_REUSEPORT would
+/// give for free. macOS UDP shared-fd recv distributes by
+/// recvfrom race — so we recover affinity by routing in user
+/// space after the recv.
+fn target_vcpu_v4(
+    client_ip: u32,
+    client_port: u16,
+    guest_port: u16,
+    cpu_count: usize,
+) -> usize {
+    if cpu_count <= 1 {
+        return 0;
+    }
+    let mut buf = [0u8; 8];
+    buf[0..4].copy_from_slice(&client_ip.to_be_bytes());
+    buf[4..6].copy_from_slice(&client_port.to_be_bytes());
+    buf[6..8].copy_from_slice(&guest_port.to_be_bytes());
+    (fnv1a_32(&buf) as usize) % cpu_count
+}
+
+/// IPv6 counterpart to [`target_vcpu_v4`]. Hashes the 16-byte
+/// client address + ports.
+fn target_vcpu_v6(
+    client_ip: &[u8; 16],
+    client_port: u16,
+    guest_port: u16,
+    cpu_count: usize,
+) -> usize {
+    if cpu_count <= 1 {
+        return 0;
+    }
+    let mut buf = [0u8; 20];
+    buf[0..16].copy_from_slice(client_ip);
+    buf[16..18].copy_from_slice(&client_port.to_be_bytes());
+    buf[18..20].copy_from_slice(&guest_port.to_be_bytes());
+    (fnv1a_32(&buf) as usize) % cpu_count
+}
+
+/// Push a built Ethernet frame onto the target vCPU's
+/// `forwarded_rx` mailbox and wake it. The target vCPU drains
+/// the mailbox at the top of its next `vcpu_poll` and injects
+/// each frame into its own RX queue.
+fn forward_frame_to_vcpu(target_vcpu: usize, frame: &[u8]) {
+    let target_shared = worker_shared(target_vcpu);
+    target_shared
+        .forwarded_rx
+        .lock()
+        .unwrap()
+        .push_back(frame.to_vec());
+    if let Some(pipes) = VCPU_WAKE_PIPES.get() {
+        if let Some(p) = pipes.get(target_vcpu) {
+            let buf = [0u8; 1];
+            unsafe {
+                libc::write(p.write_fd, buf.as_ptr() as *const _, 1);
+            }
+        }
+    }
+    crate::vm::wake_vcpu(target_vcpu);
+}
+
 fn handle_udp_rx(io: &mut IoState, qsnap: &virtio::QueueSnapshot,
                  fd: i32, guest_port: u16, single_queue: bool) {
-    let shared = worker_shared(io.id);
+    // `worker_shared(io.id)` is no longer needed locally — the
+    // udp_clients map insert routes to the FLOW-OWNING vCPU's
+    // shared state via `worker_shared(target)`, not this vCPU's.
+    let cpu_count = CPU_COUNT.load(Ordering::Relaxed);
     let mut any_injected = false;
     let mut ring_full = false;
 
@@ -1425,28 +1543,43 @@ fn handle_udp_rx(io: &mut IoState, qsnap: &virtio::QueueSnapshot,
         let payload_len = n as usize;
 
         let client_port = u16::from_be(client_addr.sin_port);
+        // sin_addr.s_addr is in network byte order (BE). Convert to
+        // host-order u32 once for the hash.
+        let client_ip_be = u32::from_be(client_addr.sin_addr.s_addr);
 
         // Register the sender → sockaddr mapping BEFORE publishing the
         // packet into the guest ring, so the vCPU's handle_udp sees it
-        // when the echo reply comes back.
+        // when the echo reply comes back. udp_clients lives on the
+        // FLOW-OWNING vCPU's WorkerShared (not necessarily this one)
+        // because the reply path runs on the vCPU that processes the
+        // QUIC conn, and that's whichever vCPU owns the 4-tuple.
+        let target = target_vcpu_v4(client_ip_be, client_port, guest_port, cpu_count);
         {
-            let mut m = shared.udp_clients.lock().unwrap();
+            let mut m = worker_shared(target).udp_clients.lock().unwrap();
             m.insert((guest_port, client_port), client_addr);
         }
 
-        if !qsnap.ready {
-            ring_full = true;
-            continue;
-        }
-
+        // Always build the frame; whether to inject locally or
+        // forward depends on the 4-tuple → vCPU hash.
         let frame_len = build_udp_frame(&mut io.frame_buf, &io.guest_mac,
             GW_IP, VM_IP, client_port, guest_port,
             &io.read_buf[..payload_len]);
-        if !inject_frame(&io.frame_buf[..frame_len], qsnap, &mut io.rx_last) {
-            ring_full = true;
-            continue;
+
+        if target == io.id {
+            if !qsnap.ready {
+                ring_full = true;
+                continue;
+            }
+            if !inject_frame(&io.frame_buf[..frame_len], qsnap, &mut io.rx_last) {
+                ring_full = true;
+                continue;
+            }
+            any_injected = true;
+        } else {
+            // Cross-vCPU forward: target's vcpu_poll drains
+            // `forwarded_rx` at the top of its next iteration.
+            forward_frame_to_vcpu(target, &io.frame_buf[..frame_len]);
         }
-        any_injected = true;
     }
 
     if !any_injected && !ring_full {
@@ -1645,7 +1778,7 @@ fn handle_udp_rx_v6(
     guest_port: u16,
     single_queue: bool,
 ) {
-    let shared = worker_shared(io.id);
+    let cpu_count = CPU_COUNT.load(Ordering::Relaxed);
     let mut any_injected = false;
     let mut ring_full = false;
     loop {
@@ -1661,12 +1794,15 @@ fn handle_udp_rx_v6(
         let payload_len = n as usize;
         let client_port = u16::from_be(client_addr.sin6_port);
 
+        // 4-tuple hash → owning vCPU. Same rationale as the v4
+        // `handle_udp_rx`: pin a stateful flow to one vCPU even
+        // though macOS shared-fd UDP delivers by recvfrom race.
+        let target = target_vcpu_v6(&client_addr.sin6_addr.s6_addr,
+                                    client_port, guest_port, cpu_count);
         {
-            let mut m = shared.udp_clients_v6.lock().unwrap();
+            let mut m = worker_shared(target).udp_clients_v6.lock().unwrap();
             m.insert((guest_port, client_port), client_addr);
         }
-
-        if !qsnap.ready { ring_full = true; continue; }
 
         // Source address from the host's perspective: GW_IPV6
         // (the runner's gateway). Destination = VM_IPV6.
@@ -1677,10 +1813,16 @@ fn handle_udp_rx_v6(
             client_port, guest_port,
             &io.read_buf[..payload_len],
         );
-        if !inject_frame(&io.frame_buf[..frame_len], qsnap, &mut io.rx_last) {
-            ring_full = true; continue;
+
+        if target == io.id {
+            if !qsnap.ready { ring_full = true; continue; }
+            if !inject_frame(&io.frame_buf[..frame_len], qsnap, &mut io.rx_last) {
+                ring_full = true; continue;
+            }
+            any_injected = true;
+        } else {
+            forward_frame_to_vcpu(target, &io.frame_buf[..frame_len]);
         }
-        any_injected = true;
     }
     if !any_injected && !ring_full { return; }
     unsafe { core::arch::asm!("dsb sy", options(nostack)); }
