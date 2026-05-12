@@ -175,11 +175,10 @@ mod borrow_tracker {
 
 /// Per-`Inner::Borrowed` Drop guard that owns the tracker's
 /// register/unregister pairing. Carried as a field of the
-/// variant — its Drop fires when the variant drops (which happens
-/// when the IOBuf drops, OR when the variant is destructured in
-/// `into_owned_vec`), so we can't accidentally orphan a live
-/// registration. In release builds (`!debug_assertions`) the guard
-/// is a ZST and Drop is empty.
+/// variant — its Drop fires when the IOBuf (and thus the
+/// variant) drops, so we can't accidentally orphan a live
+/// registration. In release builds (`!debug_assertions`) the
+/// guard is a ZST and Drop is empty.
 #[cfg(any(test, debug_assertions))]
 struct BorrowGuard {
     base: core::ptr::NonNull<u8>,
@@ -1015,118 +1014,6 @@ impl IOBuf {
                 *len -= n as u32;
                 Ok(())
             }
-        }
-    }
-
-    /// Consume the IOBuf, producing an owned `Vec<u8>` of just
-    /// the visible payload bytes. Zero-copy when this is a Heap
-    /// variant whose visible payload spans the entire backing
-    /// storage (offset=0 and len=cap); otherwise copies into a
-    /// fresh Vec. For Static variants, always copies.
-    ///
-    /// Used as a bridge to APIs that take ownership of bytes via
-    /// `Vec<u8>` (uni-quic's `SendStream::write_owned`). When that
-    /// API itself moves to IOBuf the bridge goes away.
-    pub fn into_owned_vec(self) -> alloc::vec::Vec<u8> {
-        // For Heap with an exactly-fitting payload, migrate the
-        // Box<[u8]> into a Vec<u8> with no copy. Other variants
-        // (Static, ExternalOwned, Borrowed) require copying since
-        // we don't own the storage in a Vec-compatible shape.
-        // ExternalOwned notably ALSO has to release its
-        // descriptor on drop — copying out lets the drop callback
-        // fire promptly.
-        match self.inner {
-            Inner::Heap {
-                storage,
-                offset,
-                len,
-            } => {
-                let o = offset as usize;
-                let l = len as usize;
-                if o == 0 && l == storage.len() {
-                    // Whole-buffer ownership migrates without copy.
-                    storage.into_vec()
-                } else {
-                    storage[o..o + l].to_vec()
-                }
-            }
-            Inner::Shared {
-                storage,
-                offset,
-                len,
-            } => {
-                // Always copy: even with refcount 1 the Rc header
-                // sits in front of the bytes, so we can't recover a
-                // `Vec<u8>` without a copy.
-                let o = offset as usize;
-                let l = len as usize;
-                storage[o..o + l].to_vec()
-            }
-            Inner::Static { data } => data.to_vec(),
-            Inner::ExternalOwned(e) => {
-                // SAFETY: same access semantics as `data()`.
-                let slice = unsafe {
-                    core::slice::from_raw_parts(
-                        e.base.as_ptr().add(e.offset as usize),
-                        e.len as usize,
-                    )
-                };
-                let v = slice.to_vec();
-                // `e` (and its drop callback) is dropped at end
-                // of arm, returning the descriptor to its origin.
-                drop(e);
-                v
-            }
-            Inner::Borrowed {
-                base, offset, len, ..
-            } => {
-                // SAFETY: same access semantics as `data()`.
-                let slice = unsafe {
-                    core::slice::from_raw_parts(
-                        base.as_ptr().add(offset as usize),
-                        len as usize,
-                    )
-                };
-                slice.to_vec()
-            }
-        }
-    }
-
-    /// True if this IOBuf wraps a `&'static [u8]`. Used by
-    /// downstream layers to dispatch zero-alloc static-borrow vs
-    /// owned-move paths (e.g. `SendStream::send_static` vs
-    /// `send_owned`).
-    pub fn is_static(&self) -> bool {
-        matches!(self.inner, Inner::Static { .. })
-    }
-
-    /// True if `data_mut()` would return `Some` — i.e. this is a
-    /// `Heap`, `ExternalOwned`, or `Borrowed` variant. Used by
-    /// encrypt-in-place paths (e.g. TLS scatter-gather seal) to
-    /// pre-flight a chain before mutating any part: if any IOBuf
-    /// isn't mutable the caller falls back to coalesce-then-seal.
-    pub fn is_mutable(&self) -> bool {
-        match self.inner {
-            Inner::Heap { .. }
-            | Inner::Shared { .. }
-            | Inner::ExternalOwned(_)
-            | Inner::Borrowed { .. } => true,
-            Inner::Static { .. } => false,
-        }
-    }
-
-    /// If this IOBuf is a static borrow, return the underlying
-    /// `&'static [u8]`. Returns `None` for heap-owned and
-    /// external variants. Lets the H3 / TLS / TCP send paths
-    /// take a borrowed-static fast path that holds onto the
-    /// slice without copying.
-    pub fn as_static(&self) -> Option<&'static [u8]> {
-        match &self.inner {
-            Inner::Static { data } => Some(data),
-            Inner::Heap { .. }
-            | Inner::Shared { .. }
-            | Inner::ExternalOwned(_)
-            | Inner::Borrowed { .. } => None,
         }
     }
 
@@ -2453,8 +2340,8 @@ mod tests {
         let tail = head.split_at(6);
         assert_eq!(head.data(), b"hello ");
         assert_eq!(tail.data(), b"world");
-        assert!(head.is_static());
-        assert!(tail.is_static());
+        assert!(matches!(head.inner, Inner::Static { .. }));
+        assert!(matches!(tail.inner, Inner::Static { .. }));
     }
 
     #[test]

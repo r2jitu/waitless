@@ -691,11 +691,10 @@ fn write_response(
     conn.close_stream(sid);
 }
 
-/// Push one IOBuf chunk onto stream `sid`. SendStream now holds
-/// IOBufs natively, so we can move the chunk through without
-/// converting to a Vec. Saves the `into_owned_vec()` materialisation
-/// (which copied for non-trivial offset/len) plus preserves any
-/// reserved headroom/tailroom for layers below to prepend / append.
+/// Push one IOBuf chunk onto stream `sid`. SendStream holds
+/// IOBufs natively, so we move the chunk through without
+/// converting to a Vec — preserves any reserved
+/// headroom/tailroom for layers below to prepend / append.
 fn queue_chunk(conn: &QuicConn, sid: u64, b: uni_http::IOBuf) {
     conn.send_iobuf(sid, b);
 }
