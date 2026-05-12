@@ -1285,24 +1285,30 @@ fn build_register_page_list_cmd(
 ///   u64 hash_key_addr (be, DMA)
 ///   u64 hash_lut_addr (be, DMA)
 fn build_configure_rss_cmd(num_qp: u32) -> Option<AdminqCommand> {
-    // 40-byte Toeplitz RSS key. The default is Microsoft's
-    // standard key (every Linux / Windows NIC driver uses it),
-    // well-tested for realistic 4-tuples. Override at compile
-    // time with `--cfg=rss_key=symmetric` to use the symmetric
-    // form (`0x6d5a` repeated 20 times) — useful when the
-    // bench-client traffic shape is single-source-IP +
-    // many-ephemeral-ports, where the asymmetric MS key has
-    // surfaced 2× imbalance between hottest and coldest qp on
-    // c3 (see /stats `rx_chi_squared_x100`). The symmetric key
-    // gives identical hashes for both directions of a 4-tuple,
-    // which decorrelates the bias when one peer's port range
-    // is fixed.
+    // 40-byte Toeplitz RSS key.
+    //
+    // **Default: symmetric `0x6d5a` × 20.** A symmetric key gives
+    // identical hashes for both directions of a 4-tuple, which
+    // is what we want when one peer (the bench client, in
+    // particular) holds a single source IP with many ephemeral
+    // ports — the asymmetric MS key hashes those flows to a tiny
+    // subset of qps because the source-port LSBs feed the hash
+    // weakly. Concrete observation (2026-05-11): `static_1m_tls_max`
+    // (16 conns from kvm-vm) with the MS key pinned ~all conns to
+    // core 1, leaving cores 0/2/3 at 28-29% real idle and capping
+    // throughput at 1.07 Gbps; the symmetric key spreads evenly.
+    //
+    // `--cfg=rss_key=microsoft` flips back to the asymmetric MS key
+    // (every Linux/Windows NIC driver's default), useful only when
+    // production traffic is *not* single-source-IP — e.g. real
+    // Internet-facing serving with many distinct source IPs, where
+    // the asymmetric key's anti-correlation properties win.
     //
     // Our first attempt used a synthetic key
     // (`i * 0x9E3779B1 >> 24`) which happened to hash ~99 % of
     // wrk's flows onto qp 0 on n2-highcpu-4 — kept as a
     // cautionary tale in this comment.
-    #[cfg(rss_key = "symmetric")]
+    #[cfg(not(rss_key = "microsoft"))]
     let key: [u8; RSS_KEY_SIZE] = [
         0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a,
         0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a,
@@ -1310,7 +1316,7 @@ fn build_configure_rss_cmd(num_qp: u32) -> Option<AdminqCommand> {
         0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a,
         0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a,
     ];
-    #[cfg(not(rss_key = "symmetric"))]
+    #[cfg(rss_key = "microsoft")]
     let key: [u8; RSS_KEY_SIZE] = [
         0x6d, 0x5a, 0x56, 0xda, 0x25, 0x5b, 0x0e, 0xc2,
         0x41, 0x67, 0x25, 0x3d, 0x43, 0xa3, 0x8f, 0xb0,
