@@ -404,9 +404,9 @@ impl uni_http::TlsConn for PooledTlsConn {
 
     fn send_app_data_chain_to(
         &mut self,
-        src_chain: &uni_iobuf::IOBufChain,
-        dst: &mut uni_iobuf::IOBuf,
-    ) -> Result<(), ()> {
+        src_chain: &mut uni_iobuf::IOBufChain,
+        dst: &mut [u8],
+    ) -> Result<usize, ()> {
         self.inner.tls.send_app_data_chain_to(src_chain, dst).map_err(|_| ())
     }
 

@@ -2514,7 +2514,7 @@ mod tests {
     fn borrow_tracker_reregister_after_drop() {
         // Drop should unregister, freeing the region for a fresh
         // borrow over the same storage — this is the per-worker
-        // scratch reuse pattern in take_record_iobuf.
+        // scratch reuse pattern in TLS RecordScratch::into_iobuf.
         let mut storage: alloc::vec::Vec<u8> = alloc::vec![0u8; 32];
         let base = core::ptr::NonNull::new(storage.as_mut_ptr()).unwrap();
         // SAFETY: storage outlives both successive IOBufs; only one

@@ -573,9 +573,9 @@ impl TlsServer {
     /// copy-into-scratch + seal-in-place double pass.
     pub fn send_app_data_chain_to(
         &mut self,
-        src_chain: &uni_iobuf::IOBufChain,
-        dst: &mut uni_iobuf::IOBuf,
-    ) -> Result<(), HandshakeError> {
+        src_chain: &mut uni_iobuf::IOBufChain,
+        dst: &mut [u8],
+    ) -> Result<usize, HandshakeError> {
         if self.state != State::Established {
             return Err(HandshakeError::UnexpectedRecord);
         }

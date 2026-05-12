@@ -305,80 +305,110 @@ pub fn seal(
 ///   * `InputTooLarge` / `RecordTooLarge` for the same plaintext size
 ///     bounds as `seal`.
 /// Advances `traffic_key.seq` on success.
-/// Fused copy-and-encrypt sibling of [`seal_in_place`]. Reads
-/// plaintext from `src_chain`, encrypts-while-copying into the
-/// reserved space in `dst`, prepends the record header into
-/// `dst`'s headroom and appends the type byte + AEAD tag into
-/// `dst`'s tailroom.
+/// Fused copy-and-encrypt sibling of [`seal_in_place`]. Reads up
+/// to one record's worth of plaintext from `src_chain`, encrypts-
+/// while-copying directly into `dst` with the layout
+/// `[5 hdr || N ciphertext || 1 type || 16 tag]` starting at
+/// byte 0, and consumes the bytes it used from the front of
+/// `src_chain`.
 ///
-/// Single pass through `dst`'s payload region — saves the
-/// copy-then-encrypt-in-place double pass that the
-/// `coalesce-into-scratch + seal_in_place` pattern would do.
+/// The plaintext is capped at `MAX_INNER_PLAINTEXT - 1` (16384)
+/// bytes per call — exactly one TLS 1.3 record. Callers that
+/// want to ship a longer chain call this in a loop; the remainder
+/// is left in `src_chain` for the next iteration. This subsumes
+/// the older "external chunking" pattern: the caller no longer
+/// has to split the chain at record boundaries.
 ///
-/// Pre-conditions:
-///   * `dst.headroom() >= HEADER_LEN` (5).
-///   * `dst.tailroom() >= 1 + TAG_LEN` (17) AFTER fitting
-///     `src_chain.total_len()` plaintext bytes.
-///   * `dst`'s visible payload starts empty (`dst.len() == 0`).
+/// `dst` must be at least `HEADER_LEN + (plaintext + 1) + TAG_LEN`
+/// bytes (≤ 16406 for the max-record case). On `Ok(n)`, the
+/// wire-ready record occupies `dst[..n]`.
 ///
-/// On `Ok`, `dst.data()` is the wire-ready record:
-/// `[5 record header || N ciphertext || encrypted type byte || 16 tag]`.
-/// `traffic_key.seq` advances.
+/// `traffic_key.seq` advances by one on success.
 pub fn seal_chain_to(
     traffic_key: &mut tls::TrafficKey,
     inner_type: u8,
-    src_chain: &uni_iobuf::IOBufChain,
-    dst: &mut uni_iobuf::IOBuf,
-) -> Result<(), RecordError> {
+    src_chain: &mut uni_iobuf::IOBufChain,
+    dst: &mut [u8],
+) -> Result<usize, RecordError> {
     let _bracket = bracket(&TLS_ENCRYPT_CYCLES);
-    let plaintext_len = src_chain.total_len();
-    if plaintext_len >= MAX_INNER_PLAINTEXT {
-        return Err(RecordError::InputTooLarge);
-    }
-    if dst.headroom() < HEADER_LEN {
-        return Err(RecordError::OutputTooSmall);
-    }
+
+    // Cap one record's plaintext at MAX_INNER_PLAINTEXT - 1 (= 16384).
+    // The +1 byte room is for the inner-content-type trailer.
+    let plaintext_len = src_chain.total_len().min(MAX_INNER_PLAINTEXT - 1);
     let inner_len = plaintext_len + 1; // +1 for inner-content-type byte
     let record_len = inner_len + TAG_LEN;
     if record_len > u16::MAX as usize {
         return Err(RecordError::RecordTooLarge);
     }
-    if dst.tailroom() < inner_len + TAG_LEN {
+    let wire_len = HEADER_LEN + inner_len + TAG_LEN;
+    if dst.len() < wire_len {
         return Err(RecordError::OutputTooSmall);
     }
-    debug_assert_eq!(dst.len(), 0, "dst must start empty");
 
-    // Step 1: extend dst's visible payload by `inner_len` bytes.
-    // The new region (`dst.data_mut()[..inner_len]`) is where
-    // ciphertext will land.
-    let dst_slot = dst
-        .extend_uninit(inner_len)
-        .map_err(|_| RecordError::OutputTooSmall)?;
-
-    // Step 2: fused encrypt-while-copying. Walk src_chain's parts
-    // plus the trailing type byte, XOR keystream from each into
-    // the corresponding region of `dst_slot`.
+    // Slot layout:
+    //   dst[0..5]                          = record header
+    //   dst[5..5+inner_len]                = plaintext+type → ciphertext
+    //   dst[5+inner_len..5+inner_len+16]   = AEAD tag
     let aad = make_aad(record_len as u16);
     let type_buf = [inner_type];
+
+    // Cap the chain iterator at `plaintext_len` bytes: scan over
+    // parts, decrementing a running counter and yielding shorter
+    // slices once we approach the cap. Once the counter hits 0,
+    // scan returns None to end the iterator; the trailing type
+    // byte is then chained on.
     let src_iter = src_chain
         .iter()
-        .map(|p| p.data())
+        .scan(plaintext_len, |remaining, p| {
+            if *remaining == 0 {
+                return None;
+            }
+            let n = (*remaining).min(p.len());
+            *remaining -= n;
+            Some(&p.data()[..n])
+        })
         .chain(core::iter::once(&type_buf[..]));
-    let tag = traffic_key.seal_chain_to(&aad, src_iter, dst_slot);
+    let tag = traffic_key.seal_chain_to(
+        &aad,
+        src_iter,
+        &mut dst[HEADER_LEN..HEADER_LEN + inner_len],
+    );
 
-    // Step 3: append the AEAD tag into the tailroom.
-    dst.append_slice(&tag)
-        .map_err(|_| RecordError::OutputTooSmall)?;
+    // Tag.
+    dst[HEADER_LEN + inner_len..HEADER_LEN + inner_len + TAG_LEN]
+        .copy_from_slice(&tag);
 
-    // Step 4: prepend the TLSCiphertext record header.
-    let mut hdr = [0u8; HEADER_LEN];
-    hdr[0] = OPAQUE_TYPE;
-    hdr[1..3].copy_from_slice(&LEGACY_RECORD_VERSION.to_be_bytes());
-    hdr[3..5].copy_from_slice(&(record_len as u16).to_be_bytes());
-    dst.prepend(&hdr).map_err(|_| RecordError::OutputTooSmall)?;
+    // Record header.
+    dst[0] = OPAQUE_TYPE;
+    dst[1..3].copy_from_slice(&LEGACY_RECORD_VERSION.to_be_bytes());
+    dst[3..5].copy_from_slice(&(record_len as u16).to_be_bytes());
 
     bump_encrypt(plaintext_len);
-    Ok(())
+
+    // Consume `plaintext_len` bytes from the front of src_chain.
+    // Parts fully covered get popped; the straddler (if any) has
+    // `consume()` adjust its offset/len in place.
+    let mut to_consume = plaintext_len;
+    while to_consume > 0 {
+        let front = src_chain
+            .front_mut()
+            .expect("plaintext_len <= src_chain.total_len()");
+        let avail = front.len();
+        if avail <= to_consume {
+            src_chain
+                .pop_front()
+                .expect("front_mut returned Some above");
+            to_consume -= avail;
+        } else {
+            front
+                .consume(to_consume)
+                .expect("avail > to_consume; bounds hold");
+            src_chain.shrink_total_len(to_consume);
+            to_consume = 0;
+        }
+    }
+
+    Ok(wire_len)
 }
 
 pub fn seal_in_place(
@@ -677,7 +707,9 @@ mod tests {
 
     /// `seal_chain_to` produces wire bytes that round-trip
     /// cleanly through `open`, including the multi-part AES-GCM
-    /// 16-byte block-straddle path through GHASH.
+    /// 16-byte block-straddle path through GHASH. After the call
+    /// `src_chain` is drained (the entire plaintext fit in one
+    /// record).
     #[test]
     fn seal_chain_to_roundtrip() {
         let secret = [0xa5u8; 32];
@@ -700,29 +732,23 @@ mod tests {
             .iter()
             .flat_map(|p| p.data().iter().copied())
             .collect();
+        let plaintext_len = plaintext_total.len();
 
         // dst sized for: 5 B header + plaintext + 1 B type + 16 B tag.
-        let plaintext_len = plaintext_total.len();
-        let mut dst = uni_iobuf::IOBuf::new_with_reserved(
-            HEADER_LEN,
-            plaintext_len + 1 + TAG_LEN,
-            0,
-        );
+        let mut dst = alloc::vec![0u8; HEADER_LEN + plaintext_len + 1 + TAG_LEN];
 
-        seal_chain_to(
+        let n = seal_chain_to(
             &mut sender,
             content_type::APPLICATION_DATA,
-            &src_chain,
+            &mut src_chain,
             &mut dst,
         )
         .unwrap();
-
-        // dst.data() is now the wire-ready record.
-        let wire = dst.data();
-        assert_eq!(wire.len(), HEADER_LEN + plaintext_len + 1 + TAG_LEN);
+        assert_eq!(n, HEADER_LEN + plaintext_len + 1 + TAG_LEN);
+        assert!(src_chain.is_empty(), "all plaintext consumed");
 
         // Round-trip via `open`.
-        let mut wire_buf = wire.to_vec();
+        let mut wire_buf = dst[..n].to_vec();
         let (inner_type, decrypted, consumed) =
             open(&mut receiver, &mut wire_buf).unwrap();
         assert_eq!(inner_type, content_type::APPLICATION_DATA);
@@ -731,6 +757,68 @@ mod tests {
 
         assert_eq!(sender.seq, 1);
         assert_eq!(receiver.seq, 1);
+    }
+
+    /// When `src_chain` carries more than one record's worth of
+    /// plaintext, a single `seal_chain_to` call consumes exactly
+    /// `MAX_INNER_PLAINTEXT - 1` bytes (= 16384) and leaves the
+    /// rest for the next call.
+    #[test]
+    fn seal_chain_to_caps_at_one_record() {
+        let secret = [0x42u8; 32];
+        let mut sender = tls::TrafficKey::from_secret(&secret);
+        let mut receiver = tls::TrafficKey::from_secret(&secret);
+
+        // 25 KiB of plaintext across two parts → 16 KiB ships in
+        // the first call, ~8.7 KiB remains for the second.
+        let part1: alloc::vec::Vec<u8> =
+            (0u32..15000).map(|i| i as u8).collect();
+        let part2: alloc::vec::Vec<u8> =
+            (0u32..10000).map(|i| (i ^ 0x55) as u8).collect();
+        let mut src_chain = uni_iobuf::IOBufChain::new();
+        let mut b1 = uni_iobuf::IOBuf::new_with_reserved(0, part1.len(), 0);
+        b1.append_slice(&part1).unwrap();
+        src_chain.push_back(b1);
+        let mut b2 = uni_iobuf::IOBuf::new_with_reserved(0, part2.len(), 0);
+        b2.append_slice(&part2).unwrap();
+        src_chain.push_back(b2);
+        let total_before = src_chain.total_len();
+
+        let mut dst = alloc::vec![0u8; HEADER_LEN + MAX_INNER_PLAINTEXT + TAG_LEN];
+
+        let n1 = seal_chain_to(
+            &mut sender,
+            content_type::APPLICATION_DATA,
+            &mut src_chain,
+            &mut dst,
+        )
+        .unwrap();
+        let max_plaintext = MAX_INNER_PLAINTEXT - 1;
+        assert_eq!(n1, HEADER_LEN + max_plaintext + 1 + TAG_LEN);
+        assert_eq!(src_chain.total_len(), total_before - max_plaintext);
+
+        // Decrypt and compare to the first 16384 plaintext bytes.
+        let mut wire1 = dst[..n1].to_vec();
+        let (_ty, decrypted1, _) = open(&mut receiver, &mut wire1).unwrap();
+        let mut expected: alloc::vec::Vec<u8> = part1.clone();
+        expected.extend_from_slice(&part2);
+        assert_eq!(decrypted1, &expected[..max_plaintext]);
+
+        // Second call drains the rest.
+        let n2 = seal_chain_to(
+            &mut sender,
+            content_type::APPLICATION_DATA,
+            &mut src_chain,
+            &mut dst,
+        )
+        .unwrap();
+        assert!(src_chain.is_empty());
+        let mut wire2 = dst[..n2].to_vec();
+        let (_ty, decrypted2, _) = open(&mut receiver, &mut wire2).unwrap();
+        assert_eq!(decrypted2, &expected[max_plaintext..]);
+
+        assert_eq!(sender.seq, 2);
+        assert_eq!(receiver.seq, 2);
     }
 
     #[test]

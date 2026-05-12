@@ -66,10 +66,10 @@ use uni_worker::{CurrentWorker, WorkerLocal};
 ///    pages are sync `match` dispatches with no `.await`).
 /// 2. By the time `TlsStream::send` first awaits, the handler's
 ///    IOBufs from `body_scratch` have already been read and
-///    encrypted into the TLS scratch (`send_app_data_chain_to`
-///    consumes the bytes; `chain.clear()` drops the IOBufs).
-///    So no IOBuf still references `body_scratch` when the worker
-///    yields to another conn.
+///    encrypted into the TLS scratch — `send_app_data_chain_to`
+///    pops parts off the front of the chain as it consumes their
+///    plaintext, dropping each IOBuf in turn. So no IOBuf still
+///    references `body_scratch` when the worker yields.
 /// 3. Workers are single-threaded async — no two handlers can be
 ///    mid-carve concurrently.
 ///
@@ -232,9 +232,10 @@ fn try_carve_scratch(cap: usize) -> Option<IOBuf> {
 ///    the handler returns and we `clear`.
 /// 2. By the time `TlsStream::send` first awaits (or any other
 ///    transport TX path yields), the handler's IOBufs have
-///    already been read into the TLS scratch and dropped (via
-///    `send_app_data_chain_to` + `chain.clear()`). No IOBuf
-///    backed by `body_scratch` lives across an `.await`.
+///    already been consumed by the TLS seal —
+///    `send_app_data_chain_to` pops each part off the front of
+///    the chain as it drains its plaintext, so no IOBuf backed
+///    by `body_scratch` lives across an `.await`.
 /// 3. While the worker is yielded, no other handler runs on the
 ///    same worker (single-threaded async). When a new handler
 ///    starts, its `install_body_scratch` resets the cursor — by
@@ -314,24 +315,21 @@ pub trait TlsConn: Send + 'static {
     fn send_app_data_iobuf(&mut self, buf: &mut uni_iobuf::IOBuf) -> Result<(), ()>;
 
     /// Fused copy-and-encrypt sibling of [`Self::send_app_data_iobuf`].
-    /// Reads plaintext from `src_chain` and encrypts-while-copying
-    /// directly into `dst`'s reserved space — saves the
-    /// chain-into-scratch memcpy that the
-    /// `send_app_data_iobuf` path would do if used after a
-    /// caller-side coalesce.
+    /// Reads up to one record's worth of plaintext from
+    /// `src_chain` (capped at 16 KiB), encrypts-while-copying
+    /// directly into `dst` with the layout `[5 hdr || N
+    /// ciphertext || 1 type || 16 tag]` starting at byte 0, and
+    /// consumes the bytes it used from the front of `src_chain`.
     ///
-    /// `dst` must have:
-    ///   * `headroom() >= 5` (TLS 1.3 record header).
-    ///   * `tailroom() >= src_chain.total_len() + 1 + 16` (the
-    ///     ciphertext + type byte + AEAD tag).
-    /// `dst`'s visible payload must be empty on entry.
-    ///
-    /// On success `dst.data()` is the wire-ready TLS record.
+    /// `dst.len()` must be at least `5 + plaintext + 1 + 16`
+    /// (max 16406 for a full record). Returns the wire-byte
+    /// count written to `dst[..n]`. Callers ship multi-record
+    /// bodies by looping `while !src.is_empty()`.
     fn send_app_data_chain_to(
         &mut self,
-        src_chain: &uni_iobuf::IOBufChain,
-        dst: &mut uni_iobuf::IOBuf,
-    ) -> Result<(), ()>;
+        src_chain: &mut uni_iobuf::IOBufChain,
+        dst: &mut [u8],
+    ) -> Result<usize, ()>;
 
     /// What the TLS layer wants reserved at the front of every
     /// IOBuf the layer above hands to a future
@@ -767,70 +765,63 @@ impl TlsStream {
         }
     }
 
-    /// Ship `src` (whose total plaintext length must be
-    /// ≤ `PLAINTEXT_CHUNK`) as one TLS 1.3 application_data record.
-    /// `Err(())` is fatal — caller drops the conn.
+    /// Encrypt and ship one TLS 1.3 application_data record. The
+    /// TLS layer consumes up to `PLAINTEXT_CHUNK` (16 KiB) bytes
+    /// from the front of `src` and leaves the rest for the next
+    /// call — multi-record bodies loop in `send`.
     ///
     /// Two paths, both single-pass:
     ///
-    ///   * **TSO direct-encrypt**: when the TX big-pool has a free
-    ///     slot, run the fused chain-to seal primitive straight
-    ///     into the slot. Walks the plaintext chain, ciphertext
-    ///     lands in the TX descriptor's payload region, no
-    ///     intermediate buffer anywhere on the data path.
+    ///   * **TSO direct-encrypt**: when the TX big-pool has a
+    ///     free slot, seal straight into the slot's payload
+    ///     region — no intermediate buffer anywhere on the data
+    ///     path. Walks the plaintext chain, ciphertext lands in
+    ///     the TX descriptor.
     ///   * **Worker-scratch + tcp.send fallback**: TX big-pool
     ///     full / TSO not negotiated / dst MAC unresolved → seal
-    ///     while copying into the per-worker scratch, then ship
-    ///     via the chain-based TCP send (which TSO's the 16 KiB
-    ///     record into MSS-sized segments internally).
+    ///     into the per-worker scratch and ship via the chain-
+    ///     based TCP send (which TSO's the record into MSS-sized
+    ///     segments internally).
     ///
-    /// Exit invariant: `src` is empty.
+    /// `Err(())` is fatal — caller drops the conn.
     async fn send_one_record(&mut self, src: &mut IOBufChain) -> Result<(), ()> {
-        debug_assert!(src.total_len() <= PLAINTEXT_CHUNK);
         if src.is_empty() {
             return Ok(());
         }
 
         // Fast-fast path: TSO direct-encrypt into a TX big-slot.
-        // The resulting TLS 1.3 record is `plaintext + 22 B`
-        // (5 hdr + 16 AEAD tag + 1 inner content type). The TCP
-        // layer gates TSO on `min_payload` vs MSS so sub-MSS sends
-        // bypass the TSO descriptor path (which gve silently
-        // drops at <= MSS).
+        // The record is `plaintext + 22 B` (5 hdr + 1 type + 16
+        // tag). TCP layer gates TSO on `min_payload` vs MSS so
+        // sub-MSS sends bypass the TSO descriptor path (which gve
+        // silently drops at <= MSS).
         const TLS13_RECORD_OVERHEAD: usize = 5 + 16 + 1;
-        let min_payload = src.total_len() + TLS13_RECORD_OVERHEAD;
+        let min_payload =
+            src.total_len().min(PLAINTEXT_CHUNK) + TLS13_RECORD_OVERHEAD;
         let mut tls_err = false;
         let submitted = self.tcp.try_send_tso(min_payload, |slot| {
-            let mut dst = unsafe {
-                IOBuf::borrow(
-                    NonNull::new_unchecked(slot.as_mut_ptr()),
-                    slot.len() as u32,
-                    TLS_HEADROOM as u32,
-                    0,
-                )
-            };
-            if self.tls.send_app_data_chain_to(src, &mut dst).is_err() {
-                tls_err = true;
-                return 0;
+            match self.tls.send_app_data_chain_to(src, slot) {
+                Ok(n) => n,
+                Err(_) => {
+                    tls_err = true;
+                    0
+                }
             }
-            dst.len()
         });
         if tls_err {
             return Err(());
         }
         if submitted.is_some() {
-            src.clear();
             return Ok(());
         }
 
-        // Fallback: worker-scratch seal-while-copying + tcp.send.
-        let mut record = take_record_iobuf();
-        self.tls
-            .send_app_data_chain_to(src, &mut record)
+        // Fallback: worker-scratch seal + chain-based tcp.send.
+        let mut scratch = take_record_scratch();
+        let n = self
+            .tls
+            .send_app_data_chain_to(src, scratch.slot())
             .map_err(|_| ())?;
-        src.clear();
         let mut ship = IOBufChain::new();
-        ship.push_back(record);
+        ship.push_back(scratch.into_iobuf(n));
         self.tcp.send(&mut ship).await
     }
 }
@@ -846,10 +837,9 @@ const TLS_TAILROOM: usize = 1 + 16;
 /// Plaintext capacity of one TLS 1.3 record (RFC 8446 §5.1: 2^14 B).
 const PLAINTEXT_CHUNK: usize = 16384;
 
-/// Total bytes in one TLS record envelope + max plaintext. Sized
-/// for the per-worker bare-metal scratch; native doesn't need
-/// this because `take_record_iobuf` heap-allocs per call there.
-#[cfg(target_os = "none")]
+/// Total bytes in one TLS record envelope + max plaintext.
+/// Sized for the worker scratch and the wire-bytes capacity
+/// `send_app_data_chain_to` writes into.
 const TLS_RECORD_LEN: usize = TLS_HEADROOM + PLAINTEXT_CHUNK + TLS_TAILROOM;
 
 // ---- Per-worker TLS record scratch -----------------------------------------
@@ -872,7 +862,7 @@ const TLS_RECORD_LEN: usize = TLS_HEADROOM + PLAINTEXT_CHUNK + TLS_TAILROOM;
 // backpressure; another task that wakes on the same worker would
 // alias the scratch. We sidestep this by heap-allocating per
 // record on native (developer-machine scale, not the 10K-conn
-// target) — `take_record_iobuf` is cfg-gated.
+// target) — `take_record_scratch` is cfg-gated.
 
 #[cfg(target_os = "none")]
 struct TlsScratch {
@@ -906,38 +896,85 @@ pub fn tls_scratch_preinit() {
     tls_scratch_init();
 }
 
-/// Acquire a record IOBuf with `TLS_HEADROOM` headroom and enough
-/// tailroom for one full TLS record. On bare-metal, returns an
-/// IOBuf borrowing the per-worker scratch (zero alloc). On
-/// native, heap-allocates per call.
+/// Per-worker TLS record scratch. Acquired via
+/// [`take_record_scratch`] — hands out the raw scratch bytes for
+/// the seal pass via [`Self::slot`], then converts to an `IOBuf`
+/// wrapping just the wire bytes (`[..n]`) via [`Self::into_iobuf`]
+/// for the post-seal `tcp.send.await`.
 ///
-/// Bare-metal contract: only one record IOBuf is alive on a given
-/// worker at a time. `TlsStream::send` ensures this — it acquires
-/// the IOBuf, ships it via `tcp.send.await` (synchronous on
-/// bare-metal), and lets it drop before the next acquire.
+/// Two-stage shape rather than one IOBuf throughout: TLS seal
+/// writes `[hdr || ciphertext || type || tag]` starting at byte 0
+/// of its destination, so it doesn't actually want the IOBuf
+/// headroom/tailroom framing — just a flat `&mut [u8]`. Only the
+/// TCP layer below wants an IOBuf, and only for the
+/// post-seal wire-byte range.
+///
+/// Bare-metal contract: only one `RecordScratch` is live on a
+/// given worker at a time. `TlsStream::send_one_record` ensures
+/// this — it acquires, seals, ships via `tcp.send.await`
+/// (synchronous on bare-metal), and lets the wrapping IOBuf drop
+/// before the next acquire.
 #[cfg(target_os = "none")]
-fn take_record_iobuf() -> IOBuf {
+struct RecordScratch {
+    ptr: NonNull<u8>,
+}
+
+#[cfg(target_os = "none")]
+impl RecordScratch {
+    fn slot(&mut self) -> &mut [u8] {
+        // SAFETY: per-worker storage; `CurrentWorker` is `!Send`
+        // so no other worker can produce a pointer into this slot.
+        // Within a worker, the acquire → seal → ship → drop
+        // pattern (with `tcp.send.await` resolving synchronously)
+        // keeps at most one borrow live at a time.
+        unsafe {
+            core::slice::from_raw_parts_mut(self.ptr.as_ptr(), TLS_RECORD_LEN)
+        }
+    }
+    fn into_iobuf(self, len: usize) -> IOBuf {
+        debug_assert!(len <= TLS_RECORD_LEN);
+        // SAFETY: same per-worker contract; the Borrowed IOBuf
+        // lives until `tcp.send.await` returns and the wrapping
+        // chain drops.
+        unsafe {
+            IOBuf::borrow(self.ptr, TLS_RECORD_LEN as u32, 0, len as u32)
+        }
+    }
+}
+
+#[cfg(target_os = "none")]
+fn take_record_scratch() -> RecordScratch {
     let cc = CurrentWorker::enter();
     tls_scratch_init();
     let p = TLS_SCRATCH.with(&cc, |s| s.storage.get());
-    // SAFETY: per-worker storage; `CurrentWorker` is `!Send` so no
-    // other worker can produce a pointer into this slot. Within
-    // a worker, `TlsStream::send`'s structure (acquire → ship →
-    // drop, with `tcp.send.await` resolving synchronously) keeps
-    // at most one borrow live at a time.
-    unsafe {
-        IOBuf::borrow(
-            NonNull::new_unchecked(p as *mut u8),
-            TLS_RECORD_LEN as u32,
-            TLS_HEADROOM as u32,
-            0,
-        )
+    RecordScratch {
+        ptr: unsafe { NonNull::new_unchecked(p as *mut u8) },
     }
 }
 
 #[cfg(not(target_os = "none"))]
-fn take_record_iobuf() -> IOBuf {
-    IOBuf::new_with_reserved(TLS_HEADROOM, PLAINTEXT_CHUNK, TLS_TAILROOM)
+struct RecordScratch {
+    owned: Box<[u8]>,
+}
+
+#[cfg(not(target_os = "none"))]
+impl RecordScratch {
+    fn slot(&mut self) -> &mut [u8] {
+        &mut self.owned[..]
+    }
+    fn into_iobuf(self, len: usize) -> IOBuf {
+        debug_assert!(len <= self.owned.len());
+        let mut v = self.owned.into_vec();
+        v.truncate(len);
+        IOBuf::from(v)
+    }
+}
+
+#[cfg(not(target_os = "none"))]
+fn take_record_scratch() -> RecordScratch {
+    RecordScratch {
+        owned: alloc::vec![0u8; TLS_RECORD_LEN].into_boxed_slice(),
+    }
 }
 
 impl HttpStream for TlsStream {
@@ -974,24 +1011,15 @@ impl HttpStream for TlsStream {
         // byte order is what the peer expects.
         self.drain_tx().await?;
 
-        if src.is_empty() {
-            return Ok(());
+        // `send_one_record` consumes up to one record's plaintext
+        // from `src` per call (16 KiB cap inside the TLS layer);
+        // loop until the chain is drained. Multi-record bodies
+        // (>16 KiB) thus run through the same fast-fast TSO
+        // direct-encrypt path per record as single-record sends.
+        while !src.is_empty() {
+            self.send_one_record(src).await?;
         }
-
-        // Multi-record bodies (>16 KiB): peel off one record's
-        // worth at a time via `IOBufChain::split_off`, which
-        // promotes the straddling buf's `Box<[u8]>` to a refcount-
-        // shared `Rc<[u8]>` so neither half is copied. Each peeled
-        // chunk feeds `send_one_record`, which itself picks the
-        // fast-fast (TSO direct-encrypt) path when available — so
-        // multi-record bodies now skip the per-record memcpy into
-        // worker scratch that the old slow path paid.
-        while src.total_len() > PLAINTEXT_CHUNK {
-            let mut head = core::mem::take(src);
-            *src = head.split_off(PLAINTEXT_CHUNK);
-            self.send_one_record(&mut head).await?;
-        }
-        self.send_one_record(src).await
+        Ok(())
     }
 
     fn layer_reserve(&self) -> uni_iobuf::LayerReserve {
