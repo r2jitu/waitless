@@ -311,25 +311,6 @@ pub trait TlsConn: Send + 'static {
         src_chain: &mut uni_iobuf::IOBufChain,
         dst: &mut [u8],
     ) -> Result<usize, ()>;
-
-    /// What the TLS layer wants reserved at the front of every
-    /// IOBuf the layer above hands to a future
-    /// `send_app_data_iobuf` (encrypt-in-place) entry point.
-    /// 5 B for the TLS 1.3 record header, 17 B AEAD tag +
-    /// inner-content-type trailer, 16 KiB max plaintext.
-    fn layer_reserve(&self) -> uni_iobuf::LayerReserve {
-        uni_iobuf::LayerReserve {
-            // 5 B TLS 1.3 record header.
-            headroom: 5,
-            // 16 B AEAD tag + 1 B inner-content-type trailer.
-            tailroom: 17,
-            // Max plaintext bytes per TLS 1.3 record (MAX_INNER_PLAINTEXT
-            // in uni-tls/src/record.rs, but we don't depend on that
-            // crate here). Less 1 for the type trailer, less 16 for
-            // the tag. ~16 KiB.
-            max_payload: 16384,
-        }
-    }
 }
 
 // ---- HTTP types -------------------------------------------------------------
@@ -662,18 +643,6 @@ pub trait HttpStream {
     /// `Err(())` on fatal transport error; the conn handler tears
     /// down on error.
     async fn send(&mut self, chain: &mut IOBufChain) -> Result<(), ()>;
-
-    /// What this stream's transport stack reserves at the front
-    /// and back of every IOBuf the producer ships through
-    /// `send`. Lets the producer size headers/body buffers
-    /// so each part has enough headroom for the transport's
-    /// framing (TLS prepends 5 B record header) and tailroom for
-    /// trailers (TLS appends 17 B AEAD tag + inner-content-type)
-    /// — without this, the transport falls back to a slice copy
-    /// instead of encrypt-in-place.
-    fn layer_reserve(&self) -> uni_iobuf::LayerReserve {
-        uni_iobuf::LayerReserve::PASSTHROUGH
-    }
 
     /// Cleanly signal end-of-stream to the peer before the
     /// underlying transport closes. Plain TCP is already correct
@@ -1029,16 +998,6 @@ impl HttpStream for TlsStream {
         Ok(())
     }
 
-    fn layer_reserve(&self) -> uni_iobuf::LayerReserve {
-        // Mirror the TlsConn-level reserve so the framing layer
-        // sizes the header IOBuf (and any body chunks the app
-        // allocates with `IOBuf::new_with_reserved`) for the
-        // encrypt-in-place fast path. 5-B record header headroom
-        // + 17-B trailer (1-B type + 16-B AEAD tag) = the TLS 1.3
-        // record envelope.
-        self.tls.layer_reserve()
-    }
-
     async fn close(&mut self) -> Result<(), ()> {
         // Best-effort: the alert is only meaningful when the TLS
         // state machine is in `Established`. `close_notify` itself
@@ -1162,12 +1121,6 @@ async fn handle_conn<S, H>(
     // tail is invisible to the read path; only the
     // writes-then-reads-back range is observed.
     let mut req = Request::new();
-    // The stream's transport stack publishes the headroom +
-    // tailroom every IOBuf it ships should reserve (TLS prepends
-    // 5 B record header + appends 17 B AEAD tag for the encrypt-
-    // in-place path; plain TCP needs neither). Cache it once at
-    // conn-accept so we don't re-query per response.
-    let layer = stream.layer_reserve();
     // Outbound chain is amortised across every response on this
     // connection — `send` drains it via `pop_front`, leaving
     // the chain empty but with its `VecDeque` allocation
@@ -1259,7 +1212,7 @@ async fn handle_conn<S, H>(
                 IOBuf::borrow(
                     core::ptr::NonNull::new_unchecked(header_storage.as_mut_ptr()),
                     HEADER_BUF_SIZE as u32,
-                    layer.headroom as u32,
+                    0,
                     0,
                 )
             };

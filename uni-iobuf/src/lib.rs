@@ -707,9 +707,7 @@ impl IOBuf {
     /// overwrite via further mutation).
     ///
     /// `Err(IOBufError::NoHeadroom)` if the headroom is too small;
-    /// `Err(IOBufError::Immutable)` for static borrows. Lower
-    /// layers should choose buffer sizes with enough headroom for
-    /// every layer below them — see `MAX_HEADER_RESERVE`.
+    /// `Err(IOBufError::Immutable)` for static borrows.
     pub fn prepend(&mut self, data: &[u8]) -> Result<(), IOBufError> {
         // Headroom check up-front so a no-op make_unique doesn't
         // trigger a copy for a request the caller can't satisfy.
@@ -1306,29 +1304,6 @@ impl IOBuf {
     }
 }
 
-/// Headroom constant covering every layer's worst-case header
-/// size, so a buffer allocated by the topmost producer (the app)
-/// has enough room for every lower layer to prepend in place.
-///
-///   * Ethernet header:                 14 bytes
-///   * IPv6 header:                     40 bytes (worst of v4=20 / v6=40)
-///   * TCP header (no options):         20 bytes
-///   * TLS 1.3 record header:            5 bytes
-///   * H3 frame header (varint type +
-///     varint length, max sizes):       16 bytes
-///   * QUIC short-header packet:         9 bytes (type + DCID(8))
-///                                      ───
-///   Total worst-case stack:            104 bytes
-///
-/// Round to the next 16-byte alignment boundary for a
-/// cache-line-friendly headroom: 128 B.
-pub const MAX_HEADER_RESERVE: usize = 128;
-
-/// Tailroom constant covering layers that append (TLS / QUIC AEAD
-/// tags). 16 B handles a single AEAD tag; if a future layer adds
-/// its own trailer we'll bump.
-pub const MAX_TRAILER_RESERVE: usize = 16;
-
 /// `core::fmt::Write` adapter for [`IOBuf`]. Appends formatted
 /// bytes into the buffer's tailroom; if tailroom runs out
 /// mid-render the writer silently truncates (see `overflowed`).
@@ -1368,68 +1343,6 @@ impl core::fmt::Write for IOBufWriter<'_> {
             }
         }
     }
-}
-
-// ============================================================================
-// Per-layer MTU / headroom negotiation
-// ============================================================================
-
-/// What each layer of the network stack publishes to the layer
-/// above. The layer above (the producer) consults these fields
-/// when allocating an `IOBuf` so every lower layer's `prepend`
-/// in headroom and `append` in tailroom fits without
-/// reallocating.
-///
-/// Concrete numbers come out of each layer's protocol header
-/// shape: TCP wants 20 B headroom + 0 tailroom, IPv6 wants
-/// 40 B headroom + 0, TLS 1.3 wants 5 B headroom + 16 B
-/// tailroom for the AEAD tag, etc. The `compose` helper sums a
-/// stack of LayerReserve values into the cumulative reserve a
-/// producer should request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LayerReserve {
-    /// Bytes the layer wants reserved at the front of every
-    /// payload it ships. The layer's `send` method prepends
-    /// its header into these bytes.
-    pub headroom: usize,
-    /// Bytes the layer wants reserved at the back. AEAD tags
-    /// + trailers go here.
-    pub tailroom: usize,
-    /// Maximum payload bytes the layer can accept from the layer
-    /// above for a single send call (i.e. before fragmentation
-    /// kicks in). For TLS this is the record body size limit;
-    /// for TCP it's the MSS.
-    pub max_payload: usize,
-}
-
-impl LayerReserve {
-    /// Identity / no-op layer — zero overhead, unbounded payload.
-    /// Useful as a default for layers that don't add framing.
-    pub const PASSTHROUGH: Self = LayerReserve {
-        headroom: 0,
-        tailroom: 0,
-        max_payload: usize::MAX,
-    };
-}
-
-// (Composition of multiple layers' reserves — "app over TLS over
-// TCP — what's the cumulative headroom?" — is intentionally
-// omitted from this commit. The arithmetic depends on whether
-// we want "max per send call" semantics or "fit entirely in one
-// lower-layer packet" semantics, and the right answer differs by
-// layer pair. We'll add a concrete `compose_for_*` helper when
-// the first consumer needs it.)
-
-/// Trait every layer that wraps a payload implements so its
-/// own consumers (the layer above) can ask "how much space
-/// should I reserve in the IOBuf I hand to your `send`?". The
-/// network stack walks this top-down at conn-establish time;
-/// the producer caches the resulting `LayerReserve` and uses
-/// its `headroom` / `tailroom` to size body buffers.
-pub trait LayerInfo {
-    /// What this layer plus all layers below it reserve. The
-    /// layer above queries this to size its outgoing IOBufs.
-    fn layer_reserve(&self) -> LayerReserve;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1775,12 +1688,9 @@ impl IOBufChain {
 
     /// Append a payload as a heap-owned IOBuf with reserved
     /// `headroom` and `tailroom` for layers below to prepend or
-    /// append in place. Use when the part will be sealed by TLS:
-    /// pass `MAX_HEADER_RESERVE` (covers TLS record header +
-    /// downstream layers) and `MAX_TRAILER_RESERVE` (covers the
-    /// AEAD tag) so `TlsStream::send_chain`'s encrypt-in-place
-    /// path applies. One heap alloc per chunk (sized for payload
-    /// + reserve); the visible `data()` is exactly `payload`.
+    /// append in place. One heap alloc per chunk (sized for
+    /// payload + reserve); the visible `data()` is exactly
+    /// `payload`.
     pub fn push_with_reserve(
         &mut self,
         payload: &[u8],
@@ -2310,14 +2220,6 @@ mod tests {
     }
 
     #[test]
-    fn layer_reserve_passthrough_constants() {
-        let p = LayerReserve::PASSTHROUGH;
-        assert_eq!(p.headroom, 0);
-        assert_eq!(p.tailroom, 0);
-        assert_eq!(p.max_payload, usize::MAX);
-    }
-
-    #[test]
     fn iobuf_writer_renders_into_tailroom() {
         use core::fmt::Write as _;
         let mut buf = IOBuf::new_with_reserved(8, 0, 64);
@@ -2696,19 +2598,16 @@ mod tests {
 
     #[test]
     fn full_layer_stack_simulation() {
-        // Simulate the network stack: app builds a body, HTTP layer
-        // prepends headers, TLS prepends a record header, TCP/IP/Eth
-        // would all prepend in turn. Here we just check that
-        // prepend_in_place works end-to-end without copying bytes
-        // beyond the writes we explicitly perform.
+        // Simulate a layered prepend pattern: app puts a body in
+        // a chain, HTTP/1.1 prepends a status line, TLS prepends a
+        // record header — all in place into reserved headroom of
+        // the same IOBuf. Exercise the prepend_in_place path
+        // end-to-end without copying bytes beyond the writes we
+        // explicitly perform.
         let mut chain = IOBufChain::new();
-        // App: heap-alloc an HTML body chunk with headroom for every
-        // layer below.
-        let body = IOBuf::from_slice_with_headroom(
-            MAX_HEADER_RESERVE,
-            b"<html>...</html>",
-            MAX_TRAILER_RESERVE,
-        );
+        // 64 B headroom covers the HTTP status line + TLS record
+        // header we'll prepend below.
+        let body = IOBuf::from_slice_with_headroom(64, b"<html>...</html>", 0);
         chain.push_back(body);
 
         // HTTP layer: prepend headers in place. (Real impl writes
