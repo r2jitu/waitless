@@ -1090,8 +1090,8 @@ pub fn try_send_tso(
     handle: *mut (),
     generation: u16,
     min_payload: usize,
-    fill: &mut dyn FnMut(&mut [u8]) -> usize,
-) -> Option<usize> {
+    fill: &mut dyn FnMut(&mut [u8]) -> Result<usize, ()>,
+) -> Option<Result<usize, ()>> {
     let (core, slot) = decode_handle(handle)?;
     // SAFETY: per-core ownership; the worker that registered
     // this backend is the one calling here.
@@ -1122,16 +1122,24 @@ pub fn try_send_tso(
     let max_payload = cap.saturating_sub(payload_off);
 
     // Hand the post-header region of the slot to the closure.
-    // The closure (typically the TLS encrypt-chain-to path)
-    // writes ciphertext bytes here and returns the count.
+    // The closure (typically the TLS encrypt-chain path) writes
+    // ciphertext bytes here and returns the count, or `Err(())`
+    // on a fatal failure (TLS seal error).
     let payload_len = {
         let region = &mut handle.data_mut()[payload_off..payload_off + max_payload];
-        fill(region)
+        match fill(region) {
+            Ok(n) => n,
+            Err(()) => {
+                // Slot returns to the pool via handle's Drop
+                // without a virtio descriptor enqueue.
+                return Some(Err(()));
+            }
+        }
     };
     if payload_len == 0 {
         // Nothing to send — slot returns to the pool via the
         // handle's Drop without a virtio descriptor enqueue.
-        return Some(0);
+        return Some(Ok(0));
     }
     if payload_len > max_payload {
         // Closure overran (shouldn't happen given the slice we
@@ -1174,7 +1182,7 @@ pub fn try_send_tso(
     );
 
     c.snd_nxt = c.snd_nxt.wrapping_add(payload_len as u32);
-    Some(payload_len)
+    Some(Ok(payload_len))
 }
 
 /// Per-MSS fallback path — used when [`send_super_segment_from_cursor`]

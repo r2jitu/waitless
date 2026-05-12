@@ -167,27 +167,28 @@ impl TcpStream {
     /// Try to send a single TSO super-segment whose payload is
     /// produced by `fill`. The closure receives a mutable byte
     /// slice into the driver's TX-pool big-slot's payload region
-    /// (after L2/L3/L4 headers); it writes payload bytes and
-    /// returns the count. The TCP layer fills the headers around
-    /// it and submits.
+    /// (after L2/L3/L4 headers); on success it returns the
+    /// payload byte count and the TCP layer fills the headers
+    /// around it and submits. On `Err(())` the slot is returned
+    /// to the pool without enqueue and the error propagates.
     ///
-    /// Returns `Some(n)` when the super-segment was submitted
-    /// (n = bytes written), or `None` if no TSO slot was
-    /// available — caller falls back to the regular `send()`
-    /// path. Bare-metal only; native always returns `None`.
+    /// Three outcomes:
+    ///   * `Some(Ok(n))` — submitted, `n` bytes in flight.
+    ///   * `Some(Err(()))` — closure failed; caller treats as
+    ///     fatal (typically TLS seal error).
+    ///   * `None` — no TSO slot available (TSO not negotiated,
+    ///     big pool full, conn not Established, dst MAC
+    ///     unresolved, native backend). Caller falls back to the
+    ///     regular `send()` path. The closure is NOT called.
     ///
-    /// Used by `TlsStream::send` to encrypt ciphertext directly
-    /// into the driver's TX-pool slot (eliminating the
-    /// stack-scratch → TX-slot memcpy on the TLS-over-TCP fast
-    /// path).
-    /// `min_payload` is a lower bound on the TCP-payload bytes the
-    /// closure will produce; passing the exact size when known is
-    /// fine. The backend skips the TSO descriptor path (returning
-    /// `None` without running the closure) when `min_payload <=
-    /// mss` — see [`TcpBackend::try_send_tso`] for the why.
-    pub fn try_send_tso<F>(&self, min_payload: usize, mut fill: F) -> Option<usize>
+    /// `min_payload` is a lower bound on the TCP-payload bytes
+    /// the closure will produce; passing the exact size when
+    /// known is fine. The backend short-circuits to `None`
+    /// (without acquiring a slot or running the closure) when
+    /// `min_payload <= mss` — see [`TcpBackend::try_send_tso`].
+    pub fn try_send_tso<F>(&self, min_payload: usize, mut fill: F) -> Option<Result<usize, ()>>
     where
-        F: FnMut(&mut [u8]) -> usize,
+        F: FnMut(&mut [u8]) -> Result<usize, ()>,
     {
         if self.handle.is_null() {
             return None;
@@ -380,8 +381,8 @@ pub struct TcpBackend {
         handle: *mut (),
         generation: u16,
         min_payload: usize,
-        fill: &mut dyn FnMut(&mut [u8]) -> usize,
-    ) -> Option<usize>>,
+        fill: &mut dyn FnMut(&mut [u8]) -> Result<usize, ()>,
+    ) -> Option<Result<usize, ()>>>,
 
     /// Optional. RST every connection currently in the backend's
     /// pool — called once at shutdown so peers see an immediate

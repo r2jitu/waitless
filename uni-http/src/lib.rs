@@ -778,21 +778,13 @@ impl TlsStream {
         const TLS13_RECORD_OVERHEAD: usize = 5 + 16 + 1;
         let min_payload =
             src.total_len().min(PLAINTEXT_CHUNK) + TLS13_RECORD_OVERHEAD;
-        let mut tls_err = false;
-        let submitted = self.tcp.try_send_tso(min_payload, |slot| {
-            match self.tls.seal_app_data(src, slot) {
-                Ok(n) => n,
-                Err(_) => {
-                    tls_err = true;
-                    0
-                }
-            }
-        });
-        if tls_err {
-            return Err(());
-        }
-        if submitted.is_some() {
-            return Ok(());
+        match self
+            .tcp
+            .try_send_tso(min_payload, |slot| self.tls.seal_app_data(src, slot))
+        {
+            Some(Ok(_)) => return Ok(()),
+            Some(Err(())) => return Err(()),
+            None => {} // TSO unavailable — fall through to scratch path
         }
 
         // Fallback: worker-scratch seal + chain-based tcp.send.
