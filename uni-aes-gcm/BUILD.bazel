@@ -1,0 +1,79 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//bazel/rules:rust.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# `uni-aes-gcm` — hand-rolled AES-128-GCM with batched + stitched
+# AES-CTR + GHASH. no_std, no kernel deps.
+#
+# Decoupled from `uni-tls` so the crypto core has a clean
+# extraction shape if/when we publish it as a standalone crate.
+# Only upstream dependency is RustCrypto's `aes` crate (which
+# does the AES-NI / FEAT_AES batch encrypt for us — same backend
+# every TLS implementation in the ecosystem uses).
+#
+# The `ghash` crate dep is *test-only* — `ghash_batch::tests::
+# matches_ghash_crate` cross-checks our PCLMUL/PMULL math against
+# the audited per-block GHASH on every host test run. Not pulled
+# into the no_std build of the unikernel.
+rust_library(
+    name = "uni-aes-gcm",
+    srcs = [
+        "src/lib.rs",
+        "src/aes_gcm.rs",
+        "src/ghash_batch.rs",
+    ],
+    crate_features = select({
+        "//bazel/rules:tests_need_std_on": ["std"],
+        "//conditions:default": [],
+    }),
+    crate_name = "uni_aes_gcm",
+    rustc_flags = [
+        "--check-cfg=cfg(test)",
+        # `feature = "std"` is toggled by `tests_need_std_on` for
+        # the `rust_test` build (see crate_features above).
+        "--check-cfg=cfg(feature,values(\"std\"))",
+    ] + select({
+        # x86_64-unknown-none defaults to `+soft-float,-sse`, so
+        # `__m128i` intrinsics fail to legalize. Enable the full
+        # AES-NI/PCLMUL/AVX2 feature set (also turns the rustc
+        # cfg `target_feature = "pclmulqdq"` on, which selects
+        # our stitched SIMD path).
+        "//bazel/platforms:x86_64": [
+            "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2",
+        ],
+        # aarch64-unknown-none defaults to +neon only; FEAT_AES
+        # (which provides `vmull_p64` / PMULL needed by our 8-way
+        # batched GHASH) requires explicit `+aes`. Apple Silicon
+        # M-series and every GCE/Ampere ARM host supports it; we
+        # just need rustc to surface it as a target_feature cfg.
+        "//bazel/platforms:aarch64": [
+            "-Ctarget-feature=+neon,+aes",
+        ],
+        "//conditions:default": [],
+    }),
+    deps = [
+        "@crates//:aes",
+    ],
+)
+
+# Host-native unit tests:
+#   * `ghash_batch::tests::matches_ghash_crate` — cross-checks our
+#     PCLMUL/PMULL math against the audited `ghash` crate.
+#   * `aes_gcm::tests::matches_aes_gcm_crate_roundtrip` — sweeps
+#     AAD + plaintext sizes vs the audited `aes-gcm` crate.
+#   * `aes_gcm::tests::nist_kat_test_case_4` — NIST SP 800-38D §B
+#     Test Case 4.
+#
+# `aes-gcm` + `ghash` are test-only deps — they're only referenced
+# from `#[cfg(test)] mod tests`, so the `rust_test` target pulls
+# them in but the production `rust_library` build above does not.
+rust_test(
+    name = "uni_aes_gcm_test",
+    size = "small",
+    crate = ":uni-aes-gcm",
+    deps = [
+        "@crates//:aes-gcm",
+        "@crates//:ghash",
+    ],
+)

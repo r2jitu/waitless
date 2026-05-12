@@ -255,7 +255,7 @@ pub fn aes_gcm_fast_kat() -> Result<(), KatFailure> {
     use aes_gcm::aead::AeadInPlace;
     use aes_gcm::aead::KeyInit as KI;
     use aes_gcm::Aes128Gcm;
-    use crate::aes_gcm_fast::Aes128GcmFast;
+    use uni_aes_gcm::Aes128GcmFast;
 
     // Arbitrary deterministic fixture. Key/nonce/AAD picked to
     // not collide with the rfc8439_kat above.

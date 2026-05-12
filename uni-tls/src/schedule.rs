@@ -28,12 +28,13 @@
 // merger from //net:tls into //uni-tls. `tls_crypto` was a separate
 // crate; it's now this crate's sibling `aead` module.)
 
-// Note: TrafficKey caches a `crate::aes_gcm_fast::Aes128GcmFast`
-// — our hand-rolled stitched AES-128-GCM (see `aes_gcm_fast.rs`)
-// — bypassing the upstream `aes-gcm` crate's two-pass /
-// per-block-reduction structure. The `aead` shim still uses
-// upstream `Aes128Gcm` for one-shot boot KAT / ticket envelope
-// callers; those run rarely.
+// Note: TrafficKey caches a `uni_aes_gcm::Aes128GcmFast` — our
+// hand-rolled stitched AES-128-GCM with batched + deferred-
+// reduction GHASH — bypassing the upstream `aes-gcm` crate's
+// two-pass / per-block-reduction structure. See `//uni-aes-gcm`
+// for the crypto core. The `aead` shim still uses upstream
+// `Aes128Gcm` for one-shot boot KAT / ticket envelope callers;
+// those run rarely.
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -224,7 +225,7 @@ pub fn empty_transcript_hash() -> [u8; HASH_LEN] {
 /// raw key.
 #[derive(Clone)]
 pub struct TrafficKey {
-    cipher: crate::aes_gcm_fast::Aes128GcmFast,
+    cipher: uni_aes_gcm::Aes128GcmFast,
     pub iv: [u8; IV_LEN],
     pub seq: u64,
 }
@@ -254,7 +255,7 @@ impl TrafficKey {
         let mut iv = [0u8; IV_LEN];
         hkdf_expand_label(secret, b"key", &[], &mut key);
         hkdf_expand_label(secret, b"iv", &[], &mut iv);
-        let cipher = crate::aes_gcm_fast::Aes128GcmFast::new(&key);
+        let cipher = uni_aes_gcm::Aes128GcmFast::new(&key);
         // Wipe the raw key now that it's been folded into the
         // cipher's round-key state — no plaintext key bytes
         // outlive this call.
