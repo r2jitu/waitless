@@ -347,7 +347,7 @@ pub fn seal_chain(
             Some(&p.data()[..n])
         })
         .chain(core::iter::once(&type_buf[..]));
-    let tag = traffic_key.seal_chain_to(
+    let tag = traffic_key.seal_chain(
         &aad,
         src_iter,
         &mut dst[HEADER_LEN..HEADER_LEN + inner_len],

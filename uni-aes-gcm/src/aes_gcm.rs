@@ -245,7 +245,7 @@ impl Aes128GcmFast {
 
     /// Fused scatter-gather seal. Source plaintext from a chain
     /// of byte slices, ciphertext lands in `dst`, tag returned.
-    pub fn seal_chain_to<'a, I>(
+    pub fn seal_chain<'a, I>(
         &self,
         nonce: &[u8; NONCE_LEN],
         aad: &[u8],

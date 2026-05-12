@@ -84,7 +84,7 @@ pub fn seal(
 ///
 /// `dst` must be at least as long as the sum of `src_parts`'
 /// lengths. Bytes past the written prefix are left untouched.
-pub fn seal_chain_to<'a, I>(
+pub fn seal_chain<'a, I>(
     key: &[u8; KEY_LEN],
     nonce: &[u8; NONCE_LEN],
     aad: &[u8],
@@ -394,13 +394,13 @@ mod tests {
         assert!(opened.is_err());
     }
 
-    /// `seal_chain_to(key, nonce, aad, src_parts, dst)` must produce
+    /// `seal_chain(key, nonce, aad, src_parts, dst)` must produce
     /// the same tag and ciphertext as `seal(key, nonce, aad,
     /// concat(src_parts))` — i.e. the scatter-gather form is
     /// byte-identical to a single-buffer in-place seal of the
     /// coalesced plaintext.
     #[test]
-    fn seal_chain_to_matches_single_buffer() {
+    fn seal_chain_matches_single_buffer() {
         let key = [0x77u8; 16];
         let nonce = [0x42u8; 12];
         let aad: &[u8] = b"chain-to-aad";
@@ -434,7 +434,7 @@ mod tests {
                 v
             };
             let mut dst = alloc::vec![0u8; total];
-            let to_tag = seal_chain_to(
+            let to_tag = seal_chain(
                 &key,
                 &nonce,
                 aad,

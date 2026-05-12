@@ -294,7 +294,7 @@ impl TrafficKey {
     /// scratch and then encrypting in place, encrypt-while-
     /// copying in a single pass through `dst`. `dst` must be at
     /// least as long as the sum of `src_parts`' lengths.
-    pub fn seal_chain_to<'a, I>(
+    pub fn seal_chain<'a, I>(
         &mut self,
         aad: &[u8],
         src_parts: I,
@@ -305,7 +305,7 @@ impl TrafficKey {
     {
         let nonce = self.nonce_for_seq(self.seq);
         self.seq = self.seq.wrapping_add(1);
-        self.cipher.seal_chain_to(&nonce, aad, src_parts, dst)
+        self.cipher.seal_chain(&nonce, aad, src_parts, dst)
     }
 
     /// Open `data` in place; returns Err on tag mismatch. Auto-increments
