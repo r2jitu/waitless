@@ -262,6 +262,24 @@ async fn handle_request(req: &Request) -> Response {
 
         // ── JSON / text data endpoints (kept for tests + tooling) ─
         b"/health"       => Response::ok(b"application/json", HEALTH_JSON),
+
+        // ── Static bulk-throughput endpoints ─────────────────────
+        //
+        // Fixed-size response bodies with zero dynamic rendering
+        // cost — `STATIC_*_BYTES` are `&'static [u8]`, so
+        // `Response::ok` builds a 1-part borrowed chain (no
+        // alloc, no memcpy on the server side). Bench workloads
+        // request these in a loop over keep-alive TLS to measure
+        // the data-plane throughput ceiling (encrypt + TX
+        // descriptor + wire) isolated from request parsing /
+        // body rendering. `/diagnostics`-style dynamic pages
+        // bundle real CPU work per request and don't surface the
+        // wire ceiling.
+        b"/static-16k"   => Response::ok(b"application/octet-stream", STATIC_16K_BYTES),
+        b"/static-64k"   => Response::ok(b"application/octet-stream", STATIC_64K_BYTES),
+        b"/static-256k"  => Response::ok(b"application/octet-stream", STATIC_256K_BYTES),
+        b"/static-1m"    => Response::ok(b"application/octet-stream", STATIC_1M_BYTES),
+
         b"/stats"        => stats_response(),
         b"/heap"         => heap_response(),
         b"/quic_stats"   => quic_stats_response(),
@@ -789,6 +807,16 @@ auto-refreshes every 5 seconds; raw JSON endpoints below.</p>\
 
 const HEALTH_JSON: &[u8] =
     b"{\"status\":\"ok\",\"runtime\":\"unikernel\",\"version\":\"0.1.0\"}";
+
+/// Static bulk-throughput bodies. All-zero payloads sized for
+/// bench workloads that measure data-plane throughput
+/// (encrypt + TX descriptor + wire) without per-request dynamic
+/// rendering. Total ~1.34 MB of `.rodata`; trivial against a
+/// 128 MB+ VM.
+const STATIC_16K_BYTES: &[u8] = &[0u8; 16 * 1024];
+const STATIC_64K_BYTES: &[u8] = &[0u8; 64 * 1024];
+const STATIC_256K_BYTES: &[u8] = &[0u8; 256 * 1024];
+const STATIC_1M_BYTES: &[u8] = &[0u8; 1024 * 1024];
 
 /// Emit `"name":[v0,v1,...]` into `w` without a leading comma.
 /// Caller manages comma separators between fields. `T: Display`

@@ -209,6 +209,34 @@ WORKLOADS = [
     {"name": "diagnostics_tls_max", "type": "https", "endpoint": "/diagnostics",
      "threads_per_core": 1, "conns_per_core": 32,
      "desc": "/diagnostics throughput over TLS (~9 KB body, multi-segment)"},
+    # ── Static bulk-body workloads (pure data-plane throughput) ───────
+    #
+    # `/static-*` returns a fixed-size all-zero body via a
+    # `&'static [u8]` — zero per-request rendering cost, so the
+    # bench measures the *data-plane ceiling* (encrypt + descriptor
+    # build + wire), not request-side state-machine work. Pairs
+    # with `diagnostics_tls_max` (~9 KB dynamic body) to isolate
+    # "render cost" from "wire cost" by holding the latter constant
+    # at multiple body sizes.
+    #
+    # Sweep: 16 KB → 1 MB. The 16 KB tier is one full TLS record
+    # (exactly fills the 16 384-byte plaintext cap before a second
+    # record fires); 1 MB exercises ~64 records and several TSO
+    # super-segments per request. Conns scaled at 8 per core (vs
+    # 32) — bigger bodies need fewer concurrent in-flight requests
+    # to saturate.
+    {"name": "static_16k_tls_max", "type": "https", "endpoint": "/static-16k",
+     "threads_per_core": 1, "conns_per_core": 16,
+     "desc": "/static-16k throughput over TLS (one full TLS record)"},
+    {"name": "static_64k_tls_max", "type": "https", "endpoint": "/static-64k",
+     "threads_per_core": 1, "conns_per_core": 8,
+     "desc": "/static-64k throughput over TLS (~4 records, multi-segment)"},
+    {"name": "static_256k_tls_max", "type": "https", "endpoint": "/static-256k",
+     "threads_per_core": 1, "conns_per_core": 8,
+     "desc": "/static-256k throughput over TLS (~16 records)"},
+    {"name": "static_1m_tls_max", "type": "https", "endpoint": "/static-1m",
+     "threads_per_core": 1, "conns_per_core": 4,
+     "desc": "/static-1m throughput over TLS (~64 records, deep TSO)"},
     {"name": "tls_handshake_max", "type": "tls_handshake",
      "endpoint": "/health",
      "parallelism_per_core": 4,
