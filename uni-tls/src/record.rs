@@ -111,10 +111,67 @@ static TLS_ENCRYPT_BYTES: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 static TLS_ENCRYPT_RECORDS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
+static TLS_ENCRYPT_CYCLES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 static TLS_DECRYPT_BYTES: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 static TLS_DECRYPT_RECORDS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
+static TLS_DECRYPT_CYCLES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// RAII bracket: capture `now_cycles` on construction; on drop,
+/// commit the elapsed delta to the target counter. Used to
+/// attribute per-function CPU time without restructuring the call
+/// site. ~10 ns of overhead per bracketed call (two TSC reads +
+/// one relaxed add).
+#[inline]
+fn bracket(target: &'static core::sync::atomic::AtomicU64) -> CycleBracket {
+    CycleBracket { start: now_cycles_inline(), target }
+}
+
+pub struct CycleBracket {
+    start: u64,
+    target: &'static core::sync::atomic::AtomicU64,
+}
+
+impl Drop for CycleBracket {
+    #[inline]
+    fn drop(&mut self) {
+        let elapsed = now_cycles_inline().wrapping_sub(self.start);
+        self.target.fetch_add(elapsed, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[inline(always)]
+fn now_cycles_inline() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let lo: u32;
+        let hi: u32;
+        core::arch::asm!(
+            "rdtsc",
+            out("eax") lo,
+            out("edx") hi,
+            options(nomem, nostack, preserves_flags),
+        );
+        ((hi as u64) << 32) | (lo as u64)
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let v: u64;
+        core::arch::asm!(
+            "mrs {0}, cntvct_el0",
+            out(reg) v,
+            options(nomem, nostack, preserves_flags),
+        );
+        v
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        0
+    }
+}
 
 #[inline]
 fn bump_encrypt(plaintext_len: usize) {
@@ -130,18 +187,24 @@ fn bump_decrypt(plaintext_len: usize) {
     TLS_DECRYPT_RECORDS.fetch_add(1, Relaxed);
 }
 
-/// Snapshot of `(encrypt_bytes, encrypt_records, decrypt_bytes,
-/// decrypt_records)` since boot. Differences across a sampling
-/// window give per-second AEAD throughput.
-pub fn encrypt_stats() -> (u64, u64, u64, u64) {
+/// Snapshot of `(encrypt_bytes, encrypt_records, encrypt_cycles,
+/// decrypt_bytes, decrypt_records, decrypt_cycles)` since boot.
+/// Differences across a sampling window give per-second AEAD
+/// throughput AND per-second CPU-cycle cost — combined with
+/// per-core `busy_cycles` from `eventloop::core_stats_snapshot`,
+/// gives the % of total busy time spent in AEAD.
+pub fn encrypt_stats() -> (u64, u64, u64, u64, u64, u64) {
     use core::sync::atomic::Ordering::Relaxed;
     (
         TLS_ENCRYPT_BYTES.load(Relaxed),
         TLS_ENCRYPT_RECORDS.load(Relaxed),
+        TLS_ENCRYPT_CYCLES.load(Relaxed),
         TLS_DECRYPT_BYTES.load(Relaxed),
         TLS_DECRYPT_RECORDS.load(Relaxed),
+        TLS_DECRYPT_CYCLES.load(Relaxed),
     )
 }
+
 
 // ============================================================================
 // AAD helpers
@@ -183,6 +246,7 @@ pub fn seal(
     if plaintext.len() >= MAX_INNER_PLAINTEXT {
         return Err(RecordError::InputTooLarge);
     }
+    let _bracket = bracket(&TLS_ENCRYPT_CYCLES);
     let inner_len = plaintext.len() + 1; // +1 for the type trailer
     let record_len = inner_len + TAG_LEN; // what goes in the header length field
     let total = HEADER_LEN + record_len;
@@ -266,6 +330,7 @@ pub fn seal_chain_to(
     src_chain: &uni_iobuf::IOBufChain,
     dst: &mut uni_iobuf::IOBuf,
 ) -> Result<(), RecordError> {
+    let _bracket = bracket(&TLS_ENCRYPT_CYCLES);
     let plaintext_len = src_chain.total_len();
     if plaintext_len >= MAX_INNER_PLAINTEXT {
         return Err(RecordError::InputTooLarge);
@@ -321,6 +386,7 @@ pub fn seal_in_place(
     inner_type: u8,
     buf: &mut uni_iobuf::IOBuf,
 ) -> Result<(), RecordError> {
+    let _bracket = bracket(&TLS_ENCRYPT_CYCLES);
     let plaintext_len = buf.len();
     if plaintext_len >= MAX_INNER_PLAINTEXT {
         return Err(RecordError::InputTooLarge);
@@ -385,6 +451,7 @@ pub fn open<'a>(
     traffic_key: &mut tls::TrafficKey,
     input: &'a mut [u8],
 ) -> Result<(u8, &'a [u8], usize), RecordError> {
+    let _bracket = bracket(&TLS_DECRYPT_CYCLES);
     if input.len() < HEADER_LEN {
         return Err(RecordError::Truncated);
     }

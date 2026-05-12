@@ -1080,7 +1080,7 @@ fn stats_response() -> Response {
         // to spot crypto-bound regimes (encrypt_bytes/sec capped
         // well below the per-core AEAD ceiling means non-crypto
         // overhead dominates).
-        let (tls_enc_b, tls_enc_r, tls_dec_b, tls_dec_r) =
+        let (tls_enc_b, tls_enc_r, tls_enc_cyc, tls_dec_b, tls_dec_r, tls_dec_cyc) =
             uni_tls::record::encrypt_stats();
         let qenc_b = uni_quic::diag::COUNTERS.aead_seal_bytes.load(
             core::sync::atomic::Ordering::Relaxed);
@@ -1094,13 +1094,16 @@ fn stats_response() -> Response {
             w,
             ",\"tls_encrypt_bytes\":{},\
               \"tls_encrypt_records\":{},\
+              \"tls_encrypt_cycles\":{},\
               \"tls_decrypt_bytes\":{},\
               \"tls_decrypt_records\":{},\
+              \"tls_decrypt_cycles\":{},\
               \"quic_aead_seal_bytes\":{},\
               \"quic_aead_seal_packets\":{},\
               \"quic_aead_open_bytes\":{},\
               \"quic_aead_open_packets\":{}",
-            tls_enc_b, tls_enc_r, tls_dec_b, tls_dec_r,
+            tls_enc_b, tls_enc_r, tls_enc_cyc,
+            tls_dec_b, tls_dec_r, tls_dec_cyc,
             qenc_b, qenc_p, qdec_b, qdec_p,
         );
 
