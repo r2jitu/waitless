@@ -2,9 +2,9 @@
 // accepts, reads, parses, dispatches, and writes back.
 //
 // Per-core listener + connection set; routes are shared read-only.
-// HTTPS injection happens via the `Tls` trait object below so this
-// crate has no compile-time dep on TLS or crypto code — apps that
-// don't import a TLS provider link zero TLS bytes.
+// This crate is TLS-agnostic: HTTPS lives in `uni_tls`, which
+// defines its own `HttpStream` impl (TLS over TCP) and calls
+// `serve_conn` to drive the same request/response machinery.
 
 #![no_std]
 
@@ -30,10 +30,10 @@ use uni_worker::{CurrentWorker, WorkerLocal};
 
 // ---- Per-conn body scratch -------------------------------------------------
 //
-// `handle_conn` allocates one heap-backed `body_storage` per
+// `serve_conn` allocates one heap-backed `body_storage` per
 // connection and parks a pointer to it in this per-worker slot
 // before invoking the request handler. Handlers that opt in
-// call [`body_iobuf`] to wrap the storage as an a `Borrowed` IOBuf
+// call [`body_iobuf`] to wrap the storage as a `Borrowed` IOBuf
 // — zero allocation per response, the storage is reused on
 // every iteration of the conn's keep-alive loop. Apps that
 // don't opt in keep allocating fresh `IOBuf::new_with_reserved`
@@ -41,7 +41,7 @@ use uni_worker::{CurrentWorker, WorkerLocal};
 //
 // Lifetime contract (audited unsafe inside `body_iobuf`):
 //
-//   * `handle_conn`'s future is `Pin`'d, so `body_storage`'s
+//   * `serve_conn`'s future is `Pin`'d, so `body_storage`'s
 //     address is stable across awaits.
 //   * Per-worker single-threaded cooperative scheduling means
 //     at most one handler is "running" (between awaits) on a
@@ -50,7 +50,7 @@ use uni_worker::{CurrentWorker, WorkerLocal};
 //     send completes.
 //   * The IOBuf returned by `body_iobuf` captures the slot's
 //     pointer at construction time. Subsequent slot changes
-//     (a different `handle_conn` running concurrently on the
+//     (a different `serve_conn` running concurrently on the
 //     same worker because the first one awaited) don't
 //     affect already-issued IOBufs — each IOBuf still points
 //     at the `body_storage` of its originating conn.
@@ -64,7 +64,7 @@ use uni_worker::{CurrentWorker, WorkerLocal};
 /// 1. Handlers run synchronously to completion on a single worker
 ///    (the conn task awaits on TX, never inside the handler — our
 ///    pages are sync `match` dispatches with no `.await`).
-/// 2. By the time `TlsStream::send` first awaits, the handler's
+/// 2. By the time the TLS send path first awaits, the handler's
 ///    IOBufs from `body_scratch` have already been read and
 ///    encrypted into the TLS scratch — `seal_app_data`
 ///    pops parts off the front of the chain as it consumes their
@@ -74,11 +74,11 @@ use uni_worker::{CurrentWorker, WorkerLocal};
 ///    mid-carve concurrently.
 ///
 /// The previous design kept a per-conn `Box<[u8; 16 KiB]>` in
-/// `handle_conn`'s future state — one alloc per accepted HTTPS
+/// `serve_conn`'s future state — one alloc per accepted HTTPS
 /// connection. With this per-worker layout we pay the alloc
 /// once at boot (folded into HEAP_BASELINE via the eager
-/// `body_scratch_init` call from `listen_https`) and every
-/// subsequent accept costs zero body_scratch allocs.
+/// `body_scratch_init` call from `listen` / `uni_tls::listen`)
+/// and every subsequent accept costs zero body_scratch allocs.
 struct BodyScratch {
     /// Permanent storage. Allocated once per worker at first init;
     /// the same Box lives for the duration of the worker.
@@ -116,8 +116,8 @@ fn body_scratch_init() {
 /// Pre-init the per-worker body-scratch buffers so the 16 KiB ×
 /// `num_workers()` allocations land in `HEAP_BASELINE` rather
 /// than being charged to the first request as a leak-check
-/// delta. Called from `listen` / `listen_https` / `listen_h3`
-/// before any traffic arrives.
+/// delta. Called from `listen` / `uni_tls::listen` /
+/// `uni_http3::listen` before any traffic arrives.
 pub fn body_scratch_preinit() {
     body_scratch_init();
 }
@@ -133,9 +133,9 @@ pub fn body_scratch_preinit() {
 /// (`push_front` onto the response chain) rather than writing
 /// into a body part's reserved space:
 ///   * HTTP/1.1: response head IOBuf goes in front of the body
-///     parts (see `handle_conn`'s `out_chain`).
+///     parts (see `serve_conn`'s `out_chain`).
 ///   * TLS: encrypts the chain into a fresh record IOBuf with
-///     its own headroom/tailroom (see `TlsStream::send`).
+///     its own headroom/tailroom (see the TLS send path).
 ///   * HTTP/3: HEADERS/DATA frame headers are wrapped in a
 ///     separate IOBuf the H3 framer pushes ahead of body parts.
 /// So body IOBufs only need to hold their own bytes.
@@ -198,7 +198,7 @@ fn try_carve_scratch(cap: usize) -> Option<IOBuf> {
         // until it returns; subsequent carves return disjoint
         // sub-ranges (`cursor` monotonically increases until
         // `install` resets it). The IOBuf's bytes are read+
-        // dropped by the time `TlsStream::send` first awaits
+        // dropped by the time the TLS send path first awaits
         // (the chain-to primitive consumes plaintext and the
         // chain is `clear`'d before the `tcp.send().await`),
         // so the buffer is free for the next handler that runs
@@ -230,7 +230,7 @@ fn try_carve_scratch(cap: usize) -> Option<IOBuf> {
 ///    worker — the conn task awaits on TX, never inside the
 ///    handler body. The carve cursor advances monotonically until
 ///    the handler returns and we `clear`.
-/// 2. By the time `TlsStream::send` first awaits (or any other
+/// 2. By the time the TLS send path first awaits (or any other
 ///    transport TX path yields), the handler's IOBufs have
 ///    already been consumed by the TLS seal —
 ///    `seal_app_data` pops each part off the front of
@@ -271,47 +271,6 @@ pub fn clear_body_scratch() {
 
 // TLS injection boundary. `uni-tls` is the (currently sole) impl,
 // adapting its TLS 1.3 state machine onto these methods.
-
-/// TLS provider for `listen_https`. Implementations own per-
-/// connection-config state (cert + key + per-handshake scratch);
-/// `new_connection` is called once per accepted HTTPS connection
-/// to mint a fresh handshake state machine.
-pub trait Tls: Send + Sync + 'static {
-    /// `seed` is 32 bytes of platform entropy the caller has
-    /// already pulled from the RNG.
-    fn new_connection(&self, seed: [u8; 32]) -> Box<dyn TlsConn>;
-}
-
-/// Per-connection TLS state. `push_rx` / `pop_tx` move ciphertext
-/// bytes; `pop_plaintext` returns decrypted app data; `advance`
-/// runs the state machine after `push_rx`. App-data sends go
-/// through `seal_app_data`, which writes the wire-ready
-/// record into a caller-provided byte slice (bypassing the TLS
-/// layer's internal `tx_buf`).
-pub trait TlsConn: Send + 'static {
-    fn push_rx(&mut self, bytes: &[u8]);
-    /// `Err(())` is fatal — caller drops the connection.
-    fn advance(&mut self) -> Result<(), ()>;
-    fn pop_tx(&mut self, out: &mut [u8]) -> usize;
-    fn pop_plaintext(&mut self, out: &mut [u8]) -> usize;
-    fn close_notify(&mut self) -> Result<(), ()>;
-
-    /// Read up to one record's worth of plaintext from
-    /// `src_chain` (capped at 16 KiB), encrypt-while-copying
-    /// directly into `dst` with the layout `[5 hdr || N
-    /// ciphertext || 1 type || 16 tag]` starting at byte 0, and
-    /// consume the bytes used from the front of `src_chain`.
-    ///
-    /// `dst.len()` must be at least `5 + plaintext + 1 + 16`
-    /// (max 16406 for a full record). Returns the wire-byte
-    /// count written to `dst[..n]`. Callers ship multi-record
-    /// bodies by looping `while !src.is_empty()`.
-    fn seal_app_data(
-        &mut self,
-        src_chain: &mut uni_iobuf::IOBufChain,
-        dst: &mut [u8],
-    ) -> Result<usize, ()>;
-}
 
 // ---- HTTP types -------------------------------------------------------------
 
@@ -600,25 +559,25 @@ const IDLE_TIMEOUT_US: u64 = 30_000_000;
 //
 // `HttpStream` is the byte-level interface the conn handler uses
 // to talk to a peer. Plain HTTP impls it directly over
-// `TcpStream`; HTTPS impls it via `TlsStream`, which owns a
-// `TlsConn` and pumps the TLS state machine inside `recv` / `send`
-// so the handler stays protocol-agnostic.
+// `TcpStream`; HTTPS impls it via `uni_tls::TlsStream`, which
+// pumps the TLS state machine inside `recv` / `send` so the
+// handler stays protocol-agnostic.
 //
-// Static dispatch: `handle_conn<S: HttpStream>` is monomorphised
-// per impl, so trait method calls inline. Plain path is identical
-// to the pre-trait code; TLS path performs the same TLS pump
-// work, just relocated inside `TlsStream`.
+// Static dispatch: `serve_conn<S: HttpStream>` is monomorphised
+// per impl, so trait method calls inline. Plain and TLS paths
+// share the same connection-loop machinery; the only thing
+// changing is the byte-level transport.
 
 /// `async_fn_in_trait` lints because the lint can't see that
 /// our connection futures are `!Send` by design — `TcpStream` is
 /// per-worker. Allow at the trait level: callers always use this
-/// trait through static dispatch (see `handle_conn<S: HttpStream>`),
+/// trait through static dispatch (see `serve_conn<S: HttpStream>`),
 /// and the per-conn task spawns onto the same worker that
 /// accepted the connection, so cross-worker Send is never needed.
 #[allow(async_fn_in_trait)]
 pub trait HttpStream {
     /// Read up to `buf.len()` bytes from the peer (after
-    /// decryption, for `TlsStream`). Returns `0` on EOF / fatal
+    /// decryption, for TLS streams). Returns `0` on EOF / fatal
     /// transport error. Implementors decide whether to wake on
     /// partial reads or drain a full segment first.
     async fn recv(&mut self, buf: &mut [u8]) -> usize;
@@ -647,7 +606,7 @@ pub trait HttpStream {
     /// Cleanly signal end-of-stream to the peer before the
     /// underlying transport closes. Plain TCP is already correct
     /// with the implicit FIN-on-drop, so the default is a no-op.
-    /// `TlsStream` overrides to emit a `close_notify` alert: rustls
+    /// TLS streams override to emit a `close_notify` alert: rustls
     /// (and most spec-compliant TLS clients) treat a TCP close
     /// without close_notify as an unclean shutdown and discard any
     /// session ticket they were about to cache, blocking resumption.
@@ -675,330 +634,6 @@ impl HttpStream for uni::runtime::TcpStream {
     }
 }
 
-/// HTTPS-side `HttpStream`: owns the `TcpStream` + `TlsConn` and
-/// drives the TLS state machine. `recv` blocks until decrypted
-/// plaintext is available (pumping handshake records as needed);
-/// `send` encrypts via `send_app_data` and flushes ciphertext to
-/// TCP.
-pub struct TlsStream {
-    tcp: uni::runtime::TcpStream,
-    tls: Box<dyn TlsConn>,
-    /// Inline ciphertext scratch reused across recvs. Used to be
-    /// `Box<[u8]>` allocated separately in `new()`; folded into
-    /// the struct so the future state machine that holds the
-    /// `TlsStream` carries the buffer inline — one fewer alloc
-    /// per HTTPS conn accept.
-    cipher_buf: [u8; BUF_SIZE],
-    /// Stack-friendly scratch for draining `pop_tx` output.
-    tx_scratch: [u8; 2048],
-}
-
-impl TlsStream {
-    pub fn new(tcp: uni::runtime::TcpStream, tls: Box<dyn TlsConn>) -> Self {
-        TlsStream {
-            tcp,
-            tls,
-            cipher_buf: [0u8; BUF_SIZE],
-            tx_scratch: [0u8; 2048],
-        }
-    }
-
-    /// Drain any pending TLS TX (handshake flight, alerts, queued
-    /// app-data) to the underlying TCP stream. `Err(())` is fatal.
-    async fn drain_tx(&mut self) -> Result<(), ()> {
-        loop {
-            let n = self.tls.pop_tx(&mut self.tx_scratch);
-            if n == 0 {
-                return Ok(());
-            }
-            self.tcp.send_bytes(&self.tx_scratch[..n]).await?;
-        }
-    }
-
-    /// One full sans-io RX pump cycle:
-    ///   1. Drain any TLS TX bytes left in `tx_buf` from a prior
-    ///      `advance` (preserves NST / alert ordering — they must
-    ///      hit the wire before we block waiting for more peer
-    ///      bytes).
-    ///   2. Read fresh ciphertext from TCP.
-    ///   3. Hand it to the TLS state machine and `advance`.
-    ///   4. Drain anything `advance` produced (handshake reply,
-    ///      app data ACK in future versions, etc.).
-    ///
-    /// One call advances the conn by exactly one wire round-trip's
-    /// worth of received bytes. The handshake driver and the
-    /// app-data RX loop both bottom out here — there's no
-    /// separate "handshake state machine driver" task because the
-    /// handshake runs inside the same `recv` that consumes app
-    /// data; once `pop_plaintext` starts returning bytes, the
-    /// handshake is done.
-    ///
-    /// `Err(())` is fatal (peer closed, decrypt error, or TCP
-    /// error). Caller drops the conn.
-    async fn pump_rx(&mut self) -> Result<(), ()> {
-        self.drain_tx().await?;
-        let got = self.tcp.recv(&mut self.cipher_buf).await;
-        if got == 0 {
-            return Err(());
-        }
-        self.tls.push_rx(&self.cipher_buf[..got]);
-        self.tls.advance().map_err(|_| ())?;
-        self.drain_tx().await
-    }
-
-    /// Encrypt and ship one TLS 1.3 application_data record. The
-    /// TLS layer consumes up to `PLAINTEXT_CHUNK` (16 KiB) bytes
-    /// from the front of `src` and leaves the rest for the next
-    /// call — multi-record bodies loop in `send`.
-    ///
-    /// Two paths, both single-pass:
-    ///
-    ///   * **TSO direct-encrypt**: when the TX big-pool has a
-    ///     free slot, seal straight into the slot's payload
-    ///     region — no intermediate buffer anywhere on the data
-    ///     path. Walks the plaintext chain, ciphertext lands in
-    ///     the TX descriptor.
-    ///   * **Worker-scratch + tcp.send fallback**: TX big-pool
-    ///     full / TSO not negotiated / dst MAC unresolved → seal
-    ///     into the per-worker scratch and ship via the chain-
-    ///     based TCP send (which TSO's the record into MSS-sized
-    ///     segments internally).
-    ///
-    /// `Err(())` is fatal — caller drops the conn.
-    async fn send_one_record(&mut self, src: &mut IOBufChain) -> Result<(), ()> {
-        if src.is_empty() {
-            return Ok(());
-        }
-
-        // Fast-fast path: TSO direct-encrypt into a TX big-slot.
-        // The record is `plaintext + 22 B` (5 hdr + 1 type + 16
-        // tag). TCP layer gates TSO on `min_payload` vs MSS so
-        // sub-MSS sends bypass the TSO descriptor path (which gve
-        // silently drops at <= MSS).
-        const TLS13_RECORD_OVERHEAD: usize = 5 + 16 + 1;
-        let min_payload =
-            src.total_len().min(PLAINTEXT_CHUNK) + TLS13_RECORD_OVERHEAD;
-        match self
-            .tcp
-            .try_send_tso(min_payload, |slot| self.tls.seal_app_data(src, slot))
-        {
-            Some(Ok(_)) => return Ok(()),
-            Some(Err(())) => return Err(()),
-            None => {} // TSO unavailable — fall through to scratch path
-        }
-
-        // Fallback: worker-scratch seal + chain-based tcp.send.
-        let mut scratch = take_record_scratch();
-        let n = self
-            .tls
-            .seal_app_data(src, scratch.slot())
-            .map_err(|_| ())?;
-        let mut ship = IOBufChain::new();
-        ship.push_back(scratch.into_iobuf(n));
-        self.tcp.send(&mut ship).await
-    }
-}
-
-/// Headroom reserved at the front of every record IOBuf for the
-/// 5 B TLS 1.3 record header that the seal layer prepends.
-const TLS_HEADROOM: usize = 5;
-
-/// Tailroom reserved at the back of every record IOBuf for the
-/// 1 B inner-content-type byte + 16 B AEAD tag.
-const TLS_TAILROOM: usize = 1 + 16;
-
-/// Plaintext capacity of one TLS 1.3 record (RFC 8446 §5.1: 2^14 B).
-const PLAINTEXT_CHUNK: usize = 16384;
-
-/// Total bytes in one TLS record envelope + max plaintext.
-/// Sized for the worker scratch and the wire-bytes capacity
-/// `seal_app_data` writes into.
-const TLS_RECORD_LEN: usize = TLS_HEADROOM + PLAINTEXT_CHUNK + TLS_TAILROOM;
-
-// ---- Per-worker TLS record scratch -----------------------------------------
-//
-// `TlsStream::send` needs ~16 KiB of buffer to stage a wire-ready
-// TLS record across the `tcp.send.await` (TLS encrypts into the
-// buffer; TCP drains it to the wire). With one scratch per send
-// future, scaling to tens of thousands of concurrent TLS conns
-// would need 10K × 16 KiB = 160 MiB of inline scratch in the
-// per-conn pinned futures. Per-worker scratch instead bounds the
-// cost at `num_workers × TLS_RECORD_LEN` (a few dozen KiB).
-//
-// Aliasing safety on bare-metal: the runtime's
-// `async_try_send_chain` resolves synchronously — `tcp.send.await`
-// never yields, so no other task on the same worker can observe
-// the scratch in-use across an await. Single-task-per-worker plus
-// "the await isn't really an await" gives us free exclusion.
-//
-// On native, `tcp.send.await` CAN yield mid-writev under
-// backpressure; another task that wakes on the same worker would
-// alias the scratch. We sidestep this by heap-allocating per
-// record on native (developer-machine scale, not the 10K-conn
-// target) — `take_record_scratch` is cfg-gated.
-
-#[cfg(target_os = "none")]
-struct TlsScratch {
-    storage: core::cell::UnsafeCell<[u8; TLS_RECORD_LEN]>,
-}
-
-// SAFETY: cross-worker access is gated by WorkerLocal indexing;
-// only the owning worker can construct a pointer into the slot.
-#[cfg(target_os = "none")]
-unsafe impl Send for TlsScratch {}
-
-#[cfg(target_os = "none")]
-static TLS_SCRATCH: WorkerLocal<TlsScratch> = WorkerLocal::new();
-
-#[cfg(target_os = "none")]
-fn tls_scratch_init() {
-    TLS_SCRATCH.ensure_init(uni::num_workers(), |_| TlsScratch {
-        storage: core::cell::UnsafeCell::new([0u8; TLS_RECORD_LEN]),
-    });
-}
-
-#[cfg(not(target_os = "none"))]
-fn tls_scratch_init() {}
-
-/// Pre-init the per-worker TLS record scratch so the
-/// `num_workers × TLS_RECORD_LEN` allocation lands in
-/// HEAP_BASELINE rather than being charged to the first request
-/// as a leak-check delta. Called from `listen_https` /
-/// `listen_h3` before any traffic arrives. On native, no-op.
-pub fn tls_scratch_preinit() {
-    tls_scratch_init();
-}
-
-/// Per-worker TLS record scratch. Acquired via
-/// [`take_record_scratch`] — hands out the raw scratch bytes for
-/// the seal pass via [`Self::slot`], then converts to an `IOBuf`
-/// wrapping just the wire bytes (`[..n]`) via [`Self::into_iobuf`]
-/// for the post-seal `tcp.send.await`.
-///
-/// Two-stage shape rather than one IOBuf throughout: TLS seal
-/// writes `[hdr || ciphertext || type || tag]` starting at byte 0
-/// of its destination, so it doesn't actually want the IOBuf
-/// headroom/tailroom framing — just a flat `&mut [u8]`. Only the
-/// TCP layer below wants an IOBuf, and only for the
-/// post-seal wire-byte range.
-///
-/// Bare-metal contract: only one `RecordScratch` is live on a
-/// given worker at a time. `TlsStream::send_one_record` ensures
-/// this — it acquires, seals, ships via `tcp.send.await`
-/// (synchronous on bare-metal), and lets the wrapping IOBuf drop
-/// before the next acquire.
-#[cfg(target_os = "none")]
-struct RecordScratch {
-    ptr: NonNull<u8>,
-}
-
-#[cfg(target_os = "none")]
-impl RecordScratch {
-    fn slot(&mut self) -> &mut [u8] {
-        // SAFETY: per-worker storage; `CurrentWorker` is `!Send`
-        // so no other worker can produce a pointer into this slot.
-        // Within a worker, the acquire → seal → ship → drop
-        // pattern (with `tcp.send.await` resolving synchronously)
-        // keeps at most one borrow live at a time.
-        unsafe {
-            core::slice::from_raw_parts_mut(self.ptr.as_ptr(), TLS_RECORD_LEN)
-        }
-    }
-    fn into_iobuf(self, len: usize) -> IOBuf {
-        debug_assert!(len <= TLS_RECORD_LEN);
-        // SAFETY: same per-worker contract; the Borrowed IOBuf
-        // lives until `tcp.send.await` returns and the wrapping
-        // chain drops.
-        unsafe {
-            IOBuf::borrow(self.ptr, TLS_RECORD_LEN as u32, 0, len as u32)
-        }
-    }
-}
-
-#[cfg(target_os = "none")]
-fn take_record_scratch() -> RecordScratch {
-    let cc = CurrentWorker::enter();
-    tls_scratch_init();
-    let p = TLS_SCRATCH.with(&cc, |s| s.storage.get());
-    RecordScratch {
-        ptr: unsafe { NonNull::new_unchecked(p as *mut u8) },
-    }
-}
-
-#[cfg(not(target_os = "none"))]
-struct RecordScratch {
-    owned: Box<[u8]>,
-}
-
-#[cfg(not(target_os = "none"))]
-impl RecordScratch {
-    fn slot(&mut self) -> &mut [u8] {
-        &mut self.owned[..]
-    }
-    fn into_iobuf(self, len: usize) -> IOBuf {
-        debug_assert!(len <= self.owned.len());
-        let mut v = self.owned.into_vec();
-        v.truncate(len);
-        IOBuf::from(v)
-    }
-}
-
-#[cfg(not(target_os = "none"))]
-fn take_record_scratch() -> RecordScratch {
-    RecordScratch {
-        owned: alloc::vec![0u8; TLS_RECORD_LEN].into_boxed_slice(),
-    }
-}
-
-impl HttpStream for TlsStream {
-    async fn recv(&mut self, buf: &mut [u8]) -> usize {
-        loop {
-            // Try plaintext first — `pump_rx` may have decrypted
-            // app data on a previous iteration, or the TLS state
-            // machine may have buffered it from earlier records.
-            let n = self.tls.pop_plaintext(buf);
-            if n > 0 {
-                return n;
-            }
-            // No plaintext available → pump one wire round-trip
-            // through the TLS state machine. Returns Err on TCP
-            // close, decrypt error, or other fatal TLS error.
-            // Handshake records produce no plaintext, so the
-            // first 1-2 iterations of this loop drive the
-            // handshake to completion; subsequent iterations are
-            // app-data decrypt.
-            if self.pump_rx().await.is_err() {
-                return 0;
-            }
-        }
-    }
-
-    async fn send(&mut self, src: &mut IOBufChain) -> Result<(), ()> {
-        // Drain any TLS bytes queued before this send (handshake
-        // straggler, NewSessionTicket, prior alert) so the wire
-        // byte order is what the peer expects.
-        self.drain_tx().await?;
-
-        // `send_one_record` consumes up to one record's plaintext
-        // from `src` per call (16 KiB cap inside the TLS layer);
-        // loop until the chain is drained. Multi-record bodies
-        // (>16 KiB) thus run through the same fast-fast TSO
-        // direct-encrypt path per record as single-record sends.
-        while !src.is_empty() {
-            self.send_one_record(src).await?;
-        }
-        Ok(())
-    }
-
-    async fn close(&mut self) -> Result<(), ()> {
-        // Best-effort: the alert is only meaningful when the TLS
-        // state machine is in `Established`. `close_notify` itself
-        // handles other states by no-op'ing and moving to Closed,
-        // so we just drain whatever it produced (if anything).
-        let _ = self.tls.close_notify();
-        self.drain_tx().await
-    }
-}
 
 // ---- Public entry points -----------------------------------------------------
 
@@ -1021,65 +656,21 @@ pub fn listen<H>(port: u16, handler: H) -> Result<(), uni::runtime::TcpBindError
 where
     H: AsyncFn(&Request) -> Response + Send + Sync + 'static,
 {
-    // Pay the per-worker body-scratch allocations into HEAP_BASELINE
-    // before any traffic arrives. Idempotent across multiple
-    // listen()/listen_https() calls.
+    // Pay the per-worker body-scratch allocations into
+    // HEAP_BASELINE before any traffic arrives. Idempotent across
+    // multiple listen() / uni_tls::listen() calls.
     body_scratch_preinit();
     let listener = uni::runtime::TcpListener::bind(port)?;
     let handler = Arc::new(handler);
     let h = listener.run(move |stream| {
         let handler = Arc::clone(&handler);
         async move {
-            handle_conn(handler, stream).await;
+            serve_conn(handler, stream).await;
         }
     });
     uni::_retain(h);
     Ok(())
 }
-
-/// Listen for HTTPS (TLS 1.3) on `port`. `tls` is a TLS provider
-/// — typically `uni_tls::acceptor(cert, key)?`. The provider is
-/// shared across every accepted connection on this port; for
-/// multi-port HTTPS reusing the same cert, pass `tls.clone()`
-/// (`Arc::clone` is cheap).
-///
-/// To advertise an HTTP/3 endpoint via `Alt-Svc` on responses,
-/// the app's handler should emit it itself per-response — read
-/// `req.host_port()` and add a `with_header(b"Alt-Svc", ...)`
-/// to the `Response`. The framework no longer hardcodes this
-/// (the previous `listen_https_advertising_h3` plumbing); apps
-/// that don't use HTTP/3 don't pay the per-response Host-header
-/// re-parse, and apps that do retain full control over the
-/// advertised port and TTL.
-pub fn listen_https<H>(
-    port: u16,
-    handler: H,
-    tls: Arc<dyn Tls>,
-) -> Result<(), uni::runtime::TcpBindError>
-where
-    H: AsyncFn(&Request) -> Response + Send + Sync + 'static,
-{
-    // Pay the per-worker body-scratch and TLS-record-scratch
-    // allocations into HEAP_BASELINE before any traffic arrives.
-    // Idempotent across multiple listen()/listen_https() calls.
-    body_scratch_preinit();
-    tls_scratch_preinit();
-    let listener = uni::runtime::TcpListener::bind(port)?;
-    let handler = Arc::new(handler);
-    let h = listener.run(move |tcp| {
-        let handler = Arc::clone(&handler);
-        let tls = Arc::clone(&tls);
-        async move {
-            let mut seed = [0u8; 32];
-            uni::rng::fill_bytes(&mut seed);
-            let stream = TlsStream::new(tcp, tls.new_connection(seed));
-            handle_conn(handler, stream).await;
-        }
-    });
-    uni::_retain(h);
-    Ok(())
-}
-
 
 // ---- Unified per-connection handler ------------------------------------------
 
@@ -1088,7 +679,11 @@ where
 /// `handler`, sends responses. Returns when the peer closes,
 /// idle timeout fires, or the buffer overflows on a too-large
 /// request.
-async fn handle_conn<S, H>(
+///
+/// Public so transport-specific listeners (HTTPS in `uni_tls`,
+/// HTTP/3 in `uni_http3`) can drive their own `HttpStream` impls
+/// through the same request/response machinery.
+pub async fn serve_conn<S, H>(
     handler: Arc<H>,
     mut stream: S,
 ) where
@@ -1136,9 +731,9 @@ async fn handle_conn<S, H>(
     // shared across every conn that runs on this worker. Safe
     // because handlers are synchronous and the IOBufs they carve
     // are consumed (read into the TLS scratch + dropped) before
-    // `TlsStream::send` ever yields — see the safety comment on
+    // the TLS send path ever yields — see the safety comment on
     // `install_body_scratch`. Eliminates the per-accept 16 KiB
-    // allocation that handle_conn used to keep in its future
+    // allocation that serve_conn used to keep in its future
     // state.
     // Carries the parser's progress (`scan_pos`) across calls
     // when a request arrives in multiple recv'd segments — the
@@ -1271,7 +866,7 @@ async fn handle_conn<S, H>(
 /// requests that arrive in many small segments. With this state
 /// the scan is amortised O(N) regardless of segment shape.
 ///
-/// `handle_conn` keeps one of these per connection and resets it
+/// `serve_conn` keeps one of these per connection and resets it
 /// to `Default::default()` after each successfully-consumed
 /// request so the next pipelined request starts a fresh scan.
 #[derive(Default)]
