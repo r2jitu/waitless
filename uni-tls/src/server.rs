@@ -55,14 +55,14 @@ pub const RX_BUF_LEN: usize = 4 * 1024;
 
 /// Max raw TLS bytes we emit during the server flight
 /// (ServerHello + CCS + encrypted {EncExt, Certificate, CertVerify,
-/// Finished}). A typical self-signed ECDSA P-256 dev cert is ~550 bytes
-/// so the flight fits in ~1.5 KB; 4 KB is generous room.
+/// Finished}) plus a couple of NewSessionTickets and any alerts.
+/// A typical self-signed ECDSA P-256 dev cert is ~550 bytes so the
+/// flight fits in ~1.5 KB; 4 KB is generous room.
 ///
-/// Application-data sends bypass `tx_buf` entirely — they go through
-/// `send_app_data_chain`, which writes the wire-ready record into the
-/// caller's IOBufChain. Only `send_app_data` (the legacy slice-shaped
-/// API) seals into `tx_buf`, and it chunks plaintext to fit, so this
-/// constant doesn't have to scale to MAX_INNER_PLAINTEXT.
+/// Application data bypasses `tx_buf` entirely — `send_app_data_chain_to`
+/// writes the wire-ready record directly into the caller's destination
+/// slice. So this constant only has to scale to handshake messages,
+/// not to MAX_INNER_PLAINTEXT.
 pub const TX_BUF_LEN: usize = 4 * 1024;
 
 /// Max decrypted plaintext we buffer for the app (one HTTP request).
@@ -531,46 +531,16 @@ impl TlsServer {
         Ok(())
     }
 
-    /// Encrypt-in-place sibling of `send_app_data`. The caller hands
-    /// us an [`uni_iobuf::IOBuf`] containing plaintext (visible as
-    /// `buf.data()`) plus reserved headroom (≥ `HEADER_LEN`) and
-    /// tailroom (≥ `1 + TAG_LEN`); on success the IOBuf's visible
-    /// payload becomes the full TLSCiphertext record (header ||
-    /// ciphertext || type || tag).
+    /// Read up to one record's worth of plaintext from `src_chain`,
+    /// encrypt-while-copying directly into `dst` with the layout
+    /// `[5 hdr || N ciphertext || 1 type || 16 tag]` starting at
+    /// byte 0, and consume the bytes used from the front of
+    /// `src_chain`. Returns the wire byte count.
     ///
-    /// Compared to `send_app_data(&plaintext)` which copies the
-    /// plaintext into our `tx_buf` and seals there, this seals
-    /// directly into the caller's IOBuf. The caller drains the
-    /// sealed record straight to TCP — bypassing `tx_buf` entirely.
-    /// One fewer plaintext memcpy per body chunk on HTTPS sends.
-    ///
-    /// Single-record only — caller chunks oversized payloads (the
-    /// `TlsStream::send_iobuf` path uses the same 3 KiB chunk
-    /// boundary `send_app_data`'s callers already used).
-    pub fn send_app_data_iobuf(
-        &mut self,
-        buf: &mut uni_iobuf::IOBuf,
-    ) -> Result<(), HandshakeError> {
-        if self.state != State::Established {
-            return Err(HandshakeError::UnexpectedRecord);
-        }
-        let tk = self
-            .server_ap_tk
-            .as_mut()
-            .ok_or(HandshakeError::Internal)?;
-        record::seal_in_place(tk, content_type::APPLICATION_DATA, buf)
-            .map_err(|e| e.into())
-    }
-
-    /// Fused copy-and-encrypt sibling of [`Self::send_app_data_iobuf`].
-    /// Reads plaintext from `src_chain` and encrypts-while-copying
-    /// into `dst`'s reserved space. `dst` must have headroom (5 B
-    /// for the record header) and tailroom (1 B type + 16 B tag +
-    /// the plaintext bytes from `src_chain`).
-    ///
-    /// On success, `dst.data()` is the wire-ready TLS record. The
-    /// TLS layer's TlsStream uses this to skip the
-    /// copy-into-scratch + seal-in-place double pass.
+    /// Bypasses `tx_buf` entirely — `dst` is the caller's buffer
+    /// (TX-slot in the fast-fast path, worker scratch in the
+    /// fallback). The TLS layer's `TlsStream::send_one_record`
+    /// loops this until the chain is drained.
     pub fn send_app_data_chain_to(
         &mut self,
         src_chain: &mut uni_iobuf::IOBufChain,
@@ -590,43 +560,6 @@ impl TlsServer {
             dst,
         )
         .map_err(|e| e.into())
-    }
-
-    /// Encrypt `plaintext` into a TLSCiphertext application_data record
-    /// and append it to the TX buffer. Only valid in `Established` state.
-    pub fn send_app_data(&mut self, plaintext: &[u8]) -> Result<(), HandshakeError> {
-        if self.state != State::Established {
-            return Err(HandshakeError::UnexpectedRecord);
-        }
-        let tk = self
-            .server_ap_tk
-            .as_mut()
-            .ok_or(HandshakeError::Internal)?;
-
-        // Split plaintext into chunks that fit in `tx_buf` after
-        // record envelope overhead. Modern callers go through
-        // `send_app_data_chain` (no tx_buf round-trip) so this
-        // path is mostly for legacy callers that pass a contiguous
-        // plaintext slice — sized to one drain cycle.
-        const CHUNK: usize = TX_BUF_LEN - record::HEADER_LEN - 1 - record::TAG_LEN;
-        let mut offset = 0;
-        while offset < plaintext.len() {
-            let end = core::cmp::min(offset + CHUNK, plaintext.len());
-            let space = TX_BUF_LEN - self.tx_len;
-            let needed = record::HEADER_LEN + (end - offset) + 1 + record::TAG_LEN;
-            if space < needed {
-                return Err(HandshakeError::TxBufTooSmall);
-            }
-            let n = record_seal(
-                tk,
-                content_type::APPLICATION_DATA,
-                &plaintext[offset..end],
-                &mut self.tx_buf[self.tx_len..],
-            )?;
-            self.tx_len += n;
-            offset = end;
-        }
-        Ok(())
     }
 
     /// Advance the state machine as far as possible with what's in

@@ -283,43 +283,24 @@ pub trait Tls: Send + Sync + 'static {
 }
 
 /// Per-connection TLS state. `push_rx` / `pop_tx` move ciphertext
-/// bytes; `pop_plaintext` / `send_app_data` move plaintext bytes;
-/// `advance` runs the state machine after `push_rx`.
-///
-/// The IOBuf-shaped methods (`send_app_data_iobuf`,
-/// `send_app_data_chain_to`) are required, not defaulted: a
-/// fallback default that round-trips through `send_app_data` +
-/// `pop_tx` would silently change the contract (writing to the
-/// TLS layer's internal `tx_buf` instead of the caller-provided
-/// `dst`), so any concrete impl must do the in-place seal
-/// itself. `uni-tls`'s `TlsConnImpl` is the sole impl today.
+/// bytes; `pop_plaintext` returns decrypted app data; `advance`
+/// runs the state machine after `push_rx`. App-data sends go
+/// through `send_app_data_chain_to`, which writes the wire-ready
+/// record into a caller-provided byte slice (bypassing the TLS
+/// layer's internal `tx_buf`).
 pub trait TlsConn: Send + 'static {
     fn push_rx(&mut self, bytes: &[u8]);
     /// `Err(())` is fatal — caller drops the connection.
     fn advance(&mut self) -> Result<(), ()>;
     fn pop_tx(&mut self, out: &mut [u8]) -> usize;
     fn pop_plaintext(&mut self, out: &mut [u8]) -> usize;
-    fn send_app_data(&mut self, data: &[u8]) -> Result<(), ()>;
     fn close_notify(&mut self) -> Result<(), ()>;
 
-    /// Encrypt-in-place sibling of `send_app_data`. The caller hands
-    /// the TLS layer an [`uni_iobuf::IOBuf`] containing plaintext
-    /// (visible as `buf.data()`) plus reserved headroom (≥ 5 B) and
-    /// tailroom (≥ 17 B = 1 type byte + 16-B AEAD tag); on success
-    /// the IOBuf's visible payload becomes the full TLSCiphertext
-    /// record (header || ciphertext || type || tag), ready to write
-    /// straight to TCP.
-    ///
-    /// On `Err(())` the IOBuf state is unspecified — caller should
-    /// drop the connection.
-    fn send_app_data_iobuf(&mut self, buf: &mut uni_iobuf::IOBuf) -> Result<(), ()>;
-
-    /// Fused copy-and-encrypt sibling of [`Self::send_app_data_iobuf`].
-    /// Reads up to one record's worth of plaintext from
-    /// `src_chain` (capped at 16 KiB), encrypts-while-copying
+    /// Read up to one record's worth of plaintext from
+    /// `src_chain` (capped at 16 KiB), encrypt-while-copying
     /// directly into `dst` with the layout `[5 hdr || N
     /// ciphertext || 1 type || 16 tag]` starting at byte 0, and
-    /// consumes the bytes it used from the front of `src_chain`.
+    /// consume the bytes used from the front of `src_chain`.
     ///
     /// `dst.len()` must be at least `5 + plaintext + 1 + 16`
     /// (max 16406 for a full record). Returns the wire-byte

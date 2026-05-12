@@ -285,31 +285,10 @@ pub fn seal(
 // Open: TLSCiphertext → plaintext
 // ============================================================================
 
-/// Seal a TLSCiphertext record IN PLACE inside an [`uni_iobuf::IOBuf`]
-/// that the caller has pre-sized with `headroom >= HEADER_LEN` and
-/// `tailroom >= 1 + TAG_LEN`. The visible payload (`buf.data()`) is
-/// the plaintext to encrypt; on success the IOBuf grows in both
-/// directions:
-///
-///   before: `[5+ headroom][N plaintext bytes][17+ tailroom]`
-///   after:  `[5 record header || N+1 ciphertext+type || 16 tag]`
-///
-/// Compared to `seal(plaintext, out)` this skips the plaintext memcpy
-/// — the plaintext stays in the bytes the caller already wrote into
-/// the IOBuf's payload region. Used by HTTPS body-send paths where
-/// the app constructed body chunks via `IOBuf::new_with_reserved` so
-/// every layer below TLS can prepend/append in place.
-///
-/// Errors:
-///   * `OutputTooSmall` if headroom < HEADER_LEN or tailroom < 1 + TAG_LEN.
-///   * `InputTooLarge` / `RecordTooLarge` for the same plaintext size
-///     bounds as `seal`.
-/// Advances `traffic_key.seq` on success.
-/// Fused copy-and-encrypt sibling of [`seal_in_place`]. Reads up
-/// to one record's worth of plaintext from `src_chain`, encrypts-
-/// while-copying directly into `dst` with the layout
+/// Read up to one record's worth of plaintext from `src_chain`,
+/// encrypt-while-copying directly into `dst` with the layout
 /// `[5 hdr || N ciphertext || 1 type || 16 tag]` starting at
-/// byte 0, and consumes the bytes it used from the front of
+/// byte 0, and consume the bytes used from the front of
 /// `src_chain`.
 ///
 /// The plaintext is capped at `MAX_INNER_PLAINTEXT - 1` (16384)
@@ -409,60 +388,6 @@ pub fn seal_chain_to(
     }
 
     Ok(wire_len)
-}
-
-pub fn seal_in_place(
-    traffic_key: &mut tls::TrafficKey,
-    inner_type: u8,
-    buf: &mut uni_iobuf::IOBuf,
-) -> Result<(), RecordError> {
-    let _bracket = bracket(&TLS_ENCRYPT_CYCLES);
-    let plaintext_len = buf.len();
-    if plaintext_len >= MAX_INNER_PLAINTEXT {
-        return Err(RecordError::InputTooLarge);
-    }
-    if buf.headroom() < HEADER_LEN {
-        return Err(RecordError::OutputTooSmall);
-    }
-    if buf.tailroom() < 1 + TAG_LEN {
-        return Err(RecordError::OutputTooSmall);
-    }
-    let inner_len = plaintext_len + 1; // +1 for the type trailer
-    let record_len = inner_len + TAG_LEN;
-    if record_len > u16::MAX as usize {
-        return Err(RecordError::RecordTooLarge);
-    }
-
-    // Step 1: append the inner-content-type trailer (1 byte) into
-    // the tailroom. The IOBuf's visible payload is now plaintext +
-    // type byte, ready for AEAD-in-place.
-    buf.append_slice(&[inner_type])
-        .map_err(|_| RecordError::OutputTooSmall)?;
-
-    // Step 2: AEAD seals over (plaintext || type) in place. AAD is
-    // the (yet-to-be-prepended) record header.
-    let aad = make_aad(record_len as u16);
-    let pt_and_type = buf
-        .data_mut()
-        .ok_or(RecordError::OutputTooSmall)?;
-    let tag = traffic_key.seal(&aad, pt_and_type);
-
-    // Step 3: append the AEAD tag into the tailroom. After this
-    // the IOBuf's visible payload is (ciphertext || type || tag).
-    buf.append_slice(&tag)
-        .map_err(|_| RecordError::OutputTooSmall)?;
-
-    // Step 4: prepend the TLSCiphertext record header into the
-    // headroom. Its `length` field covers (ciphertext || type ||
-    // tag), exactly `record_len`.
-    let mut hdr = [0u8; HEADER_LEN];
-    hdr[0] = OPAQUE_TYPE;
-    hdr[1..3].copy_from_slice(&LEGACY_RECORD_VERSION.to_be_bytes());
-    hdr[3..5].copy_from_slice(&(record_len as u16).to_be_bytes());
-    buf.prepend(&hdr).map_err(|_| RecordError::OutputTooSmall)?;
-
-    bump_encrypt(plaintext_len);
-    Ok(())
 }
 
 /// Decrypt the TLSCiphertext record at the start of `input` with
