@@ -148,6 +148,38 @@ pub fn submit_tx_tso(
     }
 }
 
+/// True iff the driver advertises UDP-GSO (UDP analogue of TSO).
+pub fn udp_gso_available() -> bool {
+    (active_ops().udp_gso_available)()
+}
+
+/// Acquire a 16-KiB big-slot for a UDP-GSO super-packet. None
+/// when the surface isn't supported or the big pool is full;
+/// caller falls back to per-datagram `acquire_tx_buf` sends.
+pub fn acquire_tx_udp_gso_buf() -> Option<uni_net_driver::TxUdpGsoBufHandle> {
+    let f = active_ops().acquire_tx_udp_gso_buf?;
+    f()
+}
+
+/// Submit a UDP-GSO super-packet. The slot bytes are laid out as
+/// `[Eth | IP | UDP | seg₀ | seg₁ | … | seg_N]` and the device
+/// emits N UDP datagrams with the UDP header replicated per
+/// segment. See [`uni_net_driver::NicOps::submit_tx_udp_gso`] for
+/// field semantics.
+pub fn submit_tx_udp_gso(
+    handle: uni_net_driver::TxUdpGsoBufHandle,
+    frame_len: usize,
+    hdr_len: u16,
+    csum_start: u16,
+    gso_size: u16,
+) {
+    if let Some(f) = active_ops().submit_tx_udp_gso {
+        f(handle, frame_len, hdr_len, csum_start, gso_size);
+    } else {
+        drop(handle);
+    }
+}
+
 // ---- Idle / TX-flush knobs -----------------------------------------------
 
 pub fn flush_tx_staging() { (active_ops().flush_tx_staging)() }

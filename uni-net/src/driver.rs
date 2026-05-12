@@ -169,6 +169,30 @@ impl TxTsoBufHandle {
     }
 }
 
+/// Handle returned by [`NicOps::acquire_tx_udp_gso_buf`] for a
+/// UDP-GSO super-packet. Same big-pool storage as
+/// [`TxTsoBufHandle`] — the type distinction is so the API surface
+/// can route to the correct `submit_tx_*` variant (TCP TSO vs UDP
+/// GSO emit different descriptor bytes on the wire).
+#[repr(transparent)]
+pub struct TxUdpGsoBufHandle(pub TxBufHandle);
+
+// SAFETY: same rationale as `TxBufHandle::Send`.
+unsafe impl Send for TxUdpGsoBufHandle {}
+
+impl TxUdpGsoBufHandle {
+    /// Mutable view of the writable frame region (~16 KiB).
+    #[inline]
+    pub fn data_mut(&mut self) -> &mut [u8] {
+        self.0.data_mut()
+    }
+    /// Capacity of the writable region, in bytes.
+    #[inline]
+    pub fn data_cap(&self) -> u32 {
+        self.0.data_cap
+    }
+}
+
 /// All fn pointers a NIC driver exposes. A single `&'static NicOps`
 /// is published via `AtomicPtr` at boot; every dispatcher call does
 /// one Acquire load + one direct call.
@@ -274,6 +298,47 @@ pub struct NicOps {
     /// pool-ID check.
     pub submit_tx_tso: Option<fn(
         handle: TxTsoBufHandle,
+        frame_len: usize,
+        hdr_len: u16,
+        csum_start: u16,
+        gso_size: u16,
+    )>,
+    /// UDP-GSO (`UDP_SEGMENT` / `GSO_UDP_L4`) capability — the UDP
+    /// analogue of `tso_available`. `true` when the device can
+    /// segment a single big UDP super-packet into N same-size
+    /// per-datagram outputs host-side, replicating the UDP header
+    /// for each emitted segment and computing per-segment
+    /// checksums. The natural beneficiary is QUIC, which sends
+    /// streams of fixed-MTU datagrams to the same peer.
+    pub udp_gso_available: fn() -> bool,
+    /// Acquire a big-slot TX buffer for a UDP-GSO super-packet.
+    /// Same shape and pool as `acquire_tx_tso_buf` — drivers may
+    /// reuse the same big pool internally; the type-distinct
+    /// [`TxUdpGsoBufHandle`] enforces "this slot was acquired for
+    /// UDP GSO" at the API surface.
+    pub acquire_tx_udp_gso_buf: Option<fn() -> Option<TxUdpGsoBufHandle>>,
+    /// Submit a UDP-GSO super-packet. The slot's bytes are laid
+    /// out as
+    /// `[Eth | IP | UDP | seg₀(gso_size) | seg₁(gso_size) | … | seg_N]`
+    /// — one UDP header followed by N concatenated payload
+    /// segments. The device emits N UDP datagrams, each with a
+    /// copy of the UDP header (length-fixed up per segment) and
+    /// one `gso_size`-byte chunk of the payload.
+    ///
+    ///   * `hdr_len`: Eth + IP + UDP = 42 (v4) or 62 (v6); the
+    ///     prefix the device replicates per segment.
+    ///   * `csum_start`: offset of the UDP header within the
+    ///     frame (Eth + IP) — same value as for TSO's TCP-header
+    ///     offset, modulo the L4 protocol.
+    ///   * `gso_size`: payload bytes per emitted UDP datagram.
+    ///     The total payload length must be a multiple of
+    ///     `gso_size` (no short last segment) — devices generally
+    ///     enforce this.
+    ///
+    /// Takes a [`TxUdpGsoBufHandle`]; same handling rules as the
+    /// TSO wrapper.
+    pub submit_tx_udp_gso: Option<fn(
+        handle: TxUdpGsoBufHandle,
         frame_len: usize,
         hdr_len: u16,
         csum_start: u16,
@@ -507,6 +572,9 @@ static NULL_OPS: NicOps = NicOps {
     csum_stamp_convention: || CsumStampConvention::PseudoHeaderPartial,
     acquire_tx_tso_buf: None,
     submit_tx_tso: None,
+    udp_gso_available: null_false,
+    acquire_tx_udp_gso_buf: None,
+    submit_tx_udp_gso: None,
     poll_rx: null_poll,
     poll_qp: null_poll_qp,
     get_mac: null_get_mac,

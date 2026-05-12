@@ -2212,6 +2212,15 @@ static VIRTIO_NET_OPS: NicOps = NicOps {
     csum_stamp_convention: || uni_net_driver::CsumStampConvention::PseudoHeaderPartial,
     acquire_tx_tso_buf: Some(acquire_tx_tso_buf),
     submit_tx_tso: Some(submit_tx_tso),
+    // UDP-GSO would require negotiating `VIRTIO_NET_F_HOST_USO` and
+    // wiring `VIRTIO_NET_HDR_GSO_UDP_L4`. The HVF runner's
+    // userspace UDP proxy would also need to parse super-packets
+    // and emit N datagrams per super-packet — currently it reads
+    // the descriptor as a single frame and forwards verbatim.
+    // Until both pieces are in place, advertise unavailable.
+    udp_gso_available: || false,
+    acquire_tx_udp_gso_buf: None,
+    submit_tx_udp_gso: None,
     poll_rx: poll,
     poll_qp,
     get_mac,

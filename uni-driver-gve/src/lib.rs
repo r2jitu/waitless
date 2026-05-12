@@ -2436,6 +2436,139 @@ fn submit_tx_tso_inner(
     }
 }
 
+/// UDP-GSO submit. Layout-identical to [`submit_tx_tso_inner`]
+/// except the L4 checksum offset is 3 (UDP cksum at byte 6 of
+/// the UDP header) instead of 8 (TCP cksum at byte 16). The
+/// device decides "TCP vs UDP segmentation" from the IP-header
+/// protocol byte sniffed at offset `csum_start - IP_HDR_LEN`,
+/// so a single descriptor format covers both modes — we only
+/// need to point the device at the correct csum field.
+///
+/// Big-pool slot layout the caller is expected to have filled
+/// before submit:
+///   `[Eth | IP | UDP | seg0(gso_size) | seg1(gso_size) | … | segN]`
+/// where the UDP header's `length` field reflects the *total*
+/// payload (so the device knows the super-packet length); the
+/// device replicates the UDP header per emitted segment, rewriting
+/// per-segment length and checksum.
+fn submit_tx_udp_gso_inner(
+    handle: uni_net_driver::TxUdpGsoBufHandle,
+    frame_len: usize,
+    hdr_len: u16,
+    csum_start: u16,
+    gso_size: u16,
+) {
+    let (qp, slot, _pool) = decode_token(handle.0.driver_token);
+    core::mem::forget(handle);
+
+    if qp >= MAX_QUEUE_PAIRS || slot >= TX_BIG_POOL_SLOTS as usize {
+        return;
+    }
+    if frame_len == 0
+        || frame_len > TX_MAX_TSO_LEN
+        || hdr_len as usize >= frame_len
+        || gso_size == 0
+        || (csum_start as usize) >= frame_len
+    {
+        let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
+        if !tx_ptr.is_null() {
+            unsafe { (*tx_ptr).big_slot_used[slot].store(false, Ordering::Release); }
+        }
+        return;
+    }
+    let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
+    if tx_ptr.is_null() { return; }
+    let tx = unsafe { &*tx_ptr };
+    let bar2_va = BAR2_VA.load(Ordering::Acquire);
+
+    let fill_cnt = tx.fill_cnt.load(Ordering::Relaxed);
+    let mask = (tx.ring_entries - 1) as u32;
+    let ring_idx_0 = (fill_cnt & mask) as usize;
+    let ring_idx_1 = (fill_cnt.wrapping_add(1) & mask) as usize;
+
+    let qpl_off_hdr = TX_BIG_POOL_QPL_OFFSET + (slot as u32) * TX_BIG_SLOT_SIZE;
+    let qpl_off_payload = qpl_off_hdr + hdr_len as u32;
+    let payload_len = (frame_len - hdr_len as usize) as u16;
+
+    // IP version from the byte just after the Ethernet header
+    // (same heuristic as `submit_tx_tso_inner`).
+    let buf_ptr = (tx.qpl_base_va + qpl_off_hdr as u64) as *const u8;
+    let ip_ver = unsafe { ptr::read_volatile(buf_ptr.add(14)) >> 4 };
+    let is_v6 = ip_ver == 6;
+
+    // UDP checksum at byte 6 of the UDP header. 6 >> 1 = 3.
+    const L4_CSUM_OFFSET_WORDS_UDP: u8 = 3;
+    const L3_OFFSET_WORDS: u8 = 7; // Eth = 14 bytes → 14/2
+
+    // pkt_desc: type=TSO|L4CSUM, same as TCP TSO. The device
+    // distinguishes TCP vs UDP segmentation from the IP-header
+    // protocol field.
+    let mut desc0 = [0u8; TX_DESC_SIZE];
+    desc0[0] = GVE_TXD_TSO | GVE_TXF_L4CSUM;
+    desc0[1] = L4_CSUM_OFFSET_WORDS_UDP;
+    desc0[2] = (csum_start >> 1) as u8;
+    desc0[3] = 2;
+    put_be16(&mut desc0, 4, frame_len as u16);
+    put_be16(&mut desc0, 6, hdr_len);
+    put_be64(&mut desc0, 8, qpl_off_hdr as u64);
+
+    let mut desc1 = [0u8; TX_DESC_SIZE];
+    desc1[0] = GVE_TXD_SEG | if is_v6 { GVE_TXSF_IPV6 } else { 0 };
+    desc1[1] = L3_OFFSET_WORDS;
+    put_be16(&mut desc1, 4, gso_size);
+    put_be16(&mut desc1, 6, payload_len);
+    put_be64(&mut desc1, 8, qpl_off_payload as u64);
+
+    let desc_ptr_0 = (tx.ring_va as *mut u8).wrapping_add(ring_idx_0 * TX_DESC_SIZE);
+    let desc_ptr_1 = (tx.ring_va as *mut u8).wrapping_add(ring_idx_1 * TX_DESC_SIZE);
+    unsafe {
+        ptr::copy_nonoverlapping(desc0.as_ptr(), desc_ptr_0, TX_DESC_SIZE);
+        ptr::copy_nonoverlapping(desc1.as_ptr(), desc_ptr_1, TX_DESC_SIZE);
+    }
+    // Reuse the TSO/SEG kind markers for /diag-gve rendering —
+    // the bytes are descriptor-level identical apart from the
+    // l4_csum_offset, and a reader can read that out of byte 1.
+    record_tx_desc(qp as u8, tx_desc_kind::TSO, &desc0);
+    record_tx_desc(qp as u8, tx_desc_kind::SEG, &desc1);
+
+    let new_fill = fill_cnt.wrapping_add(2);
+    tx.fill_cnt.store(new_fill, Ordering::Release);
+
+    let near_full = new_fill.wrapping_sub(tx.done_cnt.load(Ordering::Relaxed))
+        >= (tx.ring_entries as u32) - 16;
+    if !DEFERRED_KICK.load(Ordering::Relaxed) || near_full {
+        doorbell_write(bar2_va, tx.db_offset, new_fill);
+        tx.last_kicked.store(new_fill, Ordering::Relaxed);
+    }
+
+    if qp < TX_PACKETS_PER_QP.len() {
+        TX_PACKETS_PER_QP[qp].fetch_add(1, Ordering::Relaxed);
+        TX_BYTES_PER_QP[qp].fetch_add(frame_len as u64, Ordering::Relaxed);
+    }
+}
+
+fn acquire_tx_udp_gso_buf() -> Option<uni_net_driver::TxUdpGsoBufHandle> {
+    // Share the big pool with TSO — same slot shape (16 KiB), same
+    // pool_id encoding. We just rewrap as the type-distinct handle
+    // so the API surface routes UDP-GSO slots through
+    // `submit_tx_udp_gso` (different descriptor bytes vs TSO).
+    let tso = acquire_tx_tso_buf()?;
+    Some(uni_net_driver::TxUdpGsoBufHandle(tso.0))
+}
+
+fn submit_tx_udp_gso(
+    handle: uni_net_driver::TxUdpGsoBufHandle,
+    frame_len: usize,
+    hdr_len: u16,
+    csum_start: u16,
+    gso_size: u16,
+) {
+    if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
+        return;
+    }
+    submit_tx_udp_gso_inner(handle, frame_len, hdr_len, csum_start, gso_size);
+}
+
 /// Public direct-fill TX entry — picks the calling worker's qp,
 /// scans for a free slot, returns a handle into the per-slot
 /// QPL page (GQI_QPL).
@@ -3389,6 +3522,18 @@ static GVE_OPS: NicOps = NicOps {
         || uni_net_driver::CsumStampConvention::PseudoHeaderPartial,
     acquire_tx_tso_buf: Some(acquire_tx_tso_buf),
     submit_tx_tso: Some(submit_tx_tso),
+    // UDP-GSO via the same TSO descriptor shape with
+    // l4_csum_offset = 3 (UDP cksum at byte 6 of UDP header). The
+    // device picks TCP vs UDP segmentation from the IP-header
+    // protocol field. Upstream Linux gve doesn't currently
+    // advertise `NETIF_F_GSO_UDP_L4`, so live device support on
+    // GCE is unverified — the descriptor path is wired and
+    // bench-validatable by flipping `udp_gso_available` to
+    // `|| true`. Default off keeps callers on the per-datagram
+    // small-pool path until we confirm.
+    udp_gso_available: || false,
+    acquire_tx_udp_gso_buf: Some(acquire_tx_udp_gso_buf),
+    submit_tx_udp_gso: Some(submit_tx_udp_gso),
     poll_rx: poll,
     poll_qp,
     get_mac,
