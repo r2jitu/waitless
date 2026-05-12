@@ -29,18 +29,20 @@ pub use uni_kernel::percpu::num_cores as num_workers;
 /// Per-core event-loop stats snapshot. Tuple form so the cross-
 /// boundary type is opaque (the bare struct lives in the kernel
 /// crate, not exported across `uni-backend`). Fields, in order:
-///   * `loops`        — total event-loop iterations on this core
-///   * `poll_work`    — iterations where the net-poll callback returned true
-///   * `drain_work`   — iterations where the net-drain callback returned true
-///   * `service_work` — iterations where the app-service callback returned true
-///   * `idle_enters`  — number of times the core actually slept (HLT/WFI)
-///   * `busy_cycles`  — cumulative cycles spent in the loop body (non-idle)
-///   * `idle_cycles`  — cumulative cycles spent inside HLT/WFI
+///   * `loops`         — total event-loop iterations on this core
+///   * `poll_work`     — iterations where the net-poll callback returned true
+///   * `drain_work`    — iterations where the net-drain callback returned true
+///   * `service_work`  — iterations where the app-service callback returned true
+///   * `runtime_work`  — iterations where `uni_runtime::tick` polled a ready task
+///                       (the webserver's TCP/TLS/QUIC accept loops live here)
+///   * `idle_enters`   — number of times the core actually slept (HLT/WFI)
+///   * `busy_cycles`   — cumulative cycles spent in the loop body (non-idle)
+///   * `idle_cycles`   — cumulative cycles spent inside HLT/WFI
 ///
 /// Idle-percent on core `c` is then
 /// `idle_cycles / (busy_cycles + idle_cycles)`. Caller computes
 /// rates from two snapshots a known interval apart.
-pub fn core_stats(core_id: u32) -> (u64, u64, u64, u64, u64, u64, u64) {
+pub fn core_stats(core_id: u32) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
     uni_kernel::eventloop::core_stats_snapshot(core_id)
 }
 

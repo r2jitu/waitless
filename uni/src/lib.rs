@@ -354,7 +354,7 @@ pub mod diagnostics {
     /// fraction. The work counters tell whether the busy time was
     /// going to net poll / inbox drain / app service. All zeros
     /// on native (the OS owns scheduling).
-    pub fn core_stats(core_id: u32) -> (u64, u64, u64, u64, u64, u64, u64) {
+    pub fn core_stats(core_id: u32) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
         uni_backend::core_stats(core_id)
     }
 

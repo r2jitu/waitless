@@ -31,6 +31,13 @@ pub struct CoreStats {
     pub poll_work: AtomicU64,
     pub drain_work: AtomicU64,
     pub service_work: AtomicU64,
+    /// Iterations where `uni_runtime::tick` reported work — the
+    /// async executor polled a ready task. On apps like the
+    /// webserver that route accepted conns through async-task
+    /// spawns this is where the bulk of real work shows up
+    /// (`NET_POLL`/`NET_DRAIN` only fire on actual NIC traffic,
+    /// `SERVICE` is unused by the webserver).
+    pub runtime_work: AtomicU64,
     pub idle_enters: AtomicU64,
     pub busy_cycles: AtomicU64,
     pub idle_cycles: AtomicU64,
@@ -43,6 +50,7 @@ impl CoreStats {
             poll_work: AtomicU64::new(0),
             drain_work: AtomicU64::new(0),
             service_work: AtomicU64::new(0),
+            runtime_work: AtomicU64::new(0),
             idle_enters: AtomicU64::new(0),
             busy_cycles: AtomicU64::new(0),
             idle_cycles: AtomicU64::new(0),
@@ -62,10 +70,10 @@ static CORE_STATS: [CoreStats; MAX_CORE_STATS] =
 /// Snapshot the stats for `core_id`. Returns zeros for ids ≥ the
 /// fixed cap. Live readers should sample two snapshots a known
 /// interval apart and difference them to compute rates / idle %.
-pub fn core_stats_snapshot(core_id: u32) -> (u64, u64, u64, u64, u64, u64, u64) {
+pub fn core_stats_snapshot(core_id: u32) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
     let i = core_id as usize;
     if i >= MAX_CORE_STATS {
-        return (0, 0, 0, 0, 0, 0, 0);
+        return (0, 0, 0, 0, 0, 0, 0, 0);
     }
     let s = &CORE_STATS[i];
     (
@@ -73,6 +81,7 @@ pub fn core_stats_snapshot(core_id: u32) -> (u64, u64, u64, u64, u64, u64, u64) 
         s.poll_work.load(Ordering::Relaxed),
         s.drain_work.load(Ordering::Relaxed),
         s.service_work.load(Ordering::Relaxed),
+        s.runtime_work.load(Ordering::Relaxed),
         s.idle_enters.load(Ordering::Relaxed),
         s.busy_cycles.load(Ordering::Relaxed),
         s.idle_cycles.load(Ordering::Relaxed),
@@ -214,6 +223,7 @@ pub fn run(core_id: u32) -> ! {
     // sleep call. See `CoreStats` for the rationale.
     let stats_idx = (core_id as usize).min(MAX_CORE_STATS - 1);
     let stats = &CORE_STATS[stats_idx];
+    let mut runtime_work: u64 = 0;
     let mut iter_start_cycles = crate::time::now_cycles();
 
     // How many no-work iterations to spin through before arming the
@@ -272,6 +282,7 @@ pub fn run(core_id: u32) -> ! {
         // arena. Spawned futures live here. See uni_kernel::runtime.
         if uni_runtime::tick(core_id) {
             did_work = true;
+            runtime_work += 1;
         }
 
         // 3b. Flush TX after service — responses must be sent immediately
@@ -413,6 +424,7 @@ pub fn run(core_id: u32) -> ! {
         stats.poll_work.store(poll_work, Ordering::Relaxed);
         stats.drain_work.store(drain_work, Ordering::Relaxed);
         stats.service_work.store(service_work, Ordering::Relaxed);
+        stats.runtime_work.store(runtime_work, Ordering::Relaxed);
         let now = crate::time::now_cycles();
         let delta = now.wrapping_sub(iter_start_cycles);
         // Cap the per-iter charge at a sane upper bound to make
