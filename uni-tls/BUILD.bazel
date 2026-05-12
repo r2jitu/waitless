@@ -26,6 +26,7 @@ rust_library(
         # Sans-io TLS primitives (formerly //net:tls{,_crypto,_handshake,_record})
         "src/aead.rs",
         "src/aes_gcm_fast.rs",
+        "src/ghash_batch.rs",
         "src/handshake.rs",
         "src/record.rs",
         "src/schedule.rs",
@@ -64,7 +65,16 @@ rust_library(
         # (cf. `_X86_CRYPTO_FLAG` in MODULE.bazel) to our crate
         # so the inlined SIMD compiles cleanly.
         "//bazel/platforms:x86_64": [
-            "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmul,+fma,+bmi1,+bmi2",
+            "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2",
+        ],
+        # aarch64-unknown-none defaults to +neon only; FEAT_AES
+        # (which provides vmull_p64 / PMULL needed by our 8-way
+        # batched GHASH) requires explicit `+aes`. Apple Silicon
+        # M-series and every GCE/Ampere ARM host already support
+        # it; we just need rustc to surface it as a target_feature
+        # cfg so the SIMD path isn't dead-coded.
+        "//bazel/platforms:aarch64": [
+            "-Ctarget-feature=+neon,+aes",
         ],
         "//conditions:default": [],
     }),

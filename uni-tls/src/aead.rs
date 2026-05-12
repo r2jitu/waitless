@@ -224,6 +224,104 @@ pub fn rfc8439_kat() -> Result<(), KatFailure> {
 }
 
 // ============================================================================
+// Boot-time KAT for the multi-chunk hand-rolled AES-128-GCM path
+// ============================================================================
+//
+// `rfc8439_kat` above exercises the upstream `aes-gcm` crate (60-
+// byte plaintext, single-chunk path). Our own `Aes128GcmFast` is
+// what every TLS / QUIC record actually flows through — including
+// the 8-block batched GHASH with deferred reduction. To get
+// coverage of that hot path at boot (before any TLS connection),
+// we cross-check our `seal` against upstream `Aes128Gcm::seal` on
+// a 256-byte plaintext: two full 128-byte chunks, so the batched
+// GHASH absorbs twice. Mismatch → KatFailure, captured to the
+// diag buffer.
+//
+// The cross-check approach (vs an embedded golden vector) means
+// any bit-order or reduction bug surfaces as `aead-fast-kat: FAIL
+// at byte N`, with N pointing into the second chunk for batched-
+// GHASH-only regressions — making the failure trivially
+// attributable.
+
+/// Cross-check `Aes128GcmFast` against the upstream
+/// `Aes128Gcm` on a 256-byte plaintext (= 2 full 128-byte GHASH
+/// chunks). Returns `Ok(())` on byte-for-byte match including
+/// tag, `Err(KatFailure)` on the first divergence.
+///
+/// Boot-time companion to [`rfc8439_kat`]. The latter validates
+/// the upstream crate compiled correctly; this one validates our
+/// batched-GHASH hand-roll matches it. Both fire on every boot.
+pub fn aes_gcm_fast_kat() -> Result<(), KatFailure> {
+    use aes_gcm::aead::AeadInPlace;
+    use aes_gcm::aead::KeyInit as KI;
+    use aes_gcm::Aes128Gcm;
+    use crate::aes_gcm_fast::Aes128GcmFast;
+
+    // Arbitrary deterministic fixture. Key/nonce/AAD picked to
+    // not collide with the rfc8439_kat above.
+    let key: [u8; 16] = *b"GhashBatchKat0!!";
+    let nonce: [u8; 12] = *b"ghash12bytes";
+    let aad: [u8; 19] = *b"x86_64+aarch64-aes!";
+
+    // 256 bytes = 2 full batched chunks; no tail. Pattern designed
+    // to make every byte unique so a one-byte XOR error is visible.
+    let mut plaintext = [0u8; 256];
+    for i in 0..256 {
+        plaintext[i] = (i as u8).wrapping_mul(37).wrapping_add(13);
+    }
+
+    // Reference: upstream aes-gcm.
+    let slow = Aes128Gcm::new(GenericArray::from_slice(&key));
+    let mut slow_buf = plaintext;
+    let slow_tag = slow
+        .encrypt_in_place_detached(GenericArray::from_slice(&nonce), &aad, &mut slow_buf)
+        .expect("aes-gcm in-range");
+
+    // Hand-roll.
+    let fast = Aes128GcmFast::new(&key);
+    let mut fast_buf = plaintext;
+    let fast_tag = fast.seal(&nonce, &aad, &mut fast_buf);
+
+    // Compare ciphertext byte by byte.
+    for i in 0..256 {
+        if fast_buf[i] != slow_buf[i] {
+            let mut expected_window = [0u8; 16];
+            let mut actual_window = [0u8; 16];
+            let n = core::cmp::min(16, 256 - i);
+            expected_window[..n].copy_from_slice(&slow_buf[i..i + n]);
+            actual_window[..n].copy_from_slice(&fast_buf[i..i + n]);
+            return Err(KatFailure {
+                first_diverge_at: i,
+                expected: slow_buf[i],
+                actual: fast_buf[i],
+                expected_window,
+                actual_window,
+            });
+        }
+    }
+    // And the tag.
+    for i in 0..16 {
+        if fast_tag[i] != slow_tag.as_slice()[i] {
+            let mut expected_window = [0u8; 16];
+            let mut actual_window = [0u8; 16];
+            expected_window.copy_from_slice(slow_tag.as_slice());
+            actual_window.copy_from_slice(&fast_tag);
+            return Err(KatFailure {
+                // Encode "tag, byte i" as 256 + i so the diag
+                // log distinguishes ciphertext divergence (<256)
+                // from tag divergence (>=256).
+                first_diverge_at: 256 + i,
+                expected: slow_tag.as_slice()[i],
+                actual: fast_tag[i],
+                expected_window,
+                actual_window,
+            });
+        }
+    }
+    Ok(())
+}
+
+// ============================================================================
 // Smoke tests — NIST SP 800-38D Test Case 4 round-trip
 // ============================================================================
 

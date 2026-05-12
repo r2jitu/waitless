@@ -144,7 +144,7 @@ crate.from_cargo(
 # Crates listed: any crate in the TLS 1.3 transitive graph that
 # either uses SIMD intrinsics directly or hits the LLVM bug via
 # `u128` math.
-_X86_CRYPTO_FLAG = "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmul,+fma,+bmi1,+bmi2"
+_X86_CRYPTO_FLAG = "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2"
 
 _X86_TRIPLES = [
     "x86_64-unknown-none",

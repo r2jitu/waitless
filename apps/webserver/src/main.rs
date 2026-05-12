@@ -80,6 +80,39 @@ async fn init() {
                 diag::diag_append(b"\n");
             }
         }
+        // Companion KAT for the hand-rolled `Aes128GcmFast` with
+        // 8-block batched GHASH (deferred polynomial reduction).
+        // 256-byte plaintext crosses the batched-chunk threshold
+        // (>= 128 B) so any bit-order or reduction bug in
+        // `ghash_batch::absorb_8` shows up at boot rather than in
+        // a live TLS tag-verify failure later. Mirrors the
+        // upstream/fast cross-check in
+        // `aes_gcm_fast::tests::matches_aes_gcm_crate_roundtrip`.
+        match uni_tls::aead::aes_gcm_fast_kat() {
+            Ok(()) => {
+                uni::println!("aead-fast-kat: ok");
+                diag::diag_append(b"aead-fast-kat: ok\n");
+            }
+            Err(f) => {
+                uni::println!(
+                    "aead-fast-kat: FAIL at byte {}: expected=0x{:02x} got=0x{:02x}",
+                    f.first_diverge_at, f.expected, f.actual,
+                );
+                diag::diag_append(b"aead-fast-kat: FAIL at byte ");
+                diag::diag_append_hex(f.first_diverge_at as u64);
+                diag::diag_append(b"\n  expected: ");
+                for &b in &f.expected_window {
+                    diag::diag_append_hex_u8(b);
+                    diag::diag_append(b" ");
+                }
+                diag::diag_append(b"\n  actual:   ");
+                for &b in &f.actual_window {
+                    diag::diag_append_hex_u8(b);
+                    diag::diag_append(b" ");
+                }
+                diag::diag_append(b"\n");
+            }
+        }
     }
 
     let net = Net::up().await.expect("Net::up failed");

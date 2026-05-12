@@ -63,6 +63,7 @@ use uni_worker::{CurrentWorker, WorkerLocal};
 // pay any cost — LTO drops it from QUIC binaries.
 pub mod aead;
 pub mod aes_gcm_fast;
+pub mod ghash_batch;
 pub mod handshake;
 pub mod record;
 pub mod schedule;

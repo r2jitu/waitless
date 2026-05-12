@@ -10,7 +10,7 @@ package(default_visibility = ["//visibility:public"])
 # on. Same fix as the per-crate annotations in MODULE.bazel — applied
 # here at the rust_library level so the x86 build of //uni-quic itself
 # (and downstream crates that monomorphise its types) compiles.
-_X86_CRYPTO_FLAG = "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmul,+fma,+bmi1,+bmi2"
+_X86_CRYPTO_FLAG = "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2"
 
 # QUIC v1 protocol stack (RFC 9000 + RFC 9001).
 #

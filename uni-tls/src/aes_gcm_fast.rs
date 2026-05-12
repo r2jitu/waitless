@@ -1,59 +1,42 @@
-// uni-tls/aes_gcm_fast.rs — 8-block batched, single-pass AES-128-GCM.
+// uni-tls/aes_gcm_fast.rs — 8-block batched, single-pass AES-128-GCM
+// with deferred-reduction GHASH.
 //
-// **Goal**: Cut the ~22 cycles/byte we measured for `aes-gcm 0.10`
-// (RustCrypto). See commit message of `17de406` for the cycle
-// attribution data that motivates this.
+// **Goal**: drop TLS encrypt cycles/byte from ~22 (upstream
+// `aes-gcm` baseline, see `record::TLS_ENCRYPT_CYCLES`) toward
+// the AES-NI + PCLMUL theoretical floor of ~3 c/B. The
+// reduction is what kept us at 22 c/B even after stitched AES;
+// `ghash_batch` defers it across 8-block chunks via Gueron 2010
+// §4 aggregated Karatsuba.
 //
-// **What upstream gets wrong** (RustCrypto/AEADs#74, open since
-// 2020): `aes-gcm::Aes128Gcm::encrypt_in_place_detached` runs the
-// full AES-CTR pass over the buffer, *then* the full GHASH pass.
-// Two passes through memory; no instruction-level pipelining
-// between AES-NI and PCLMUL.
+// **Pipeline per chunk** (128 B):
 //
-// **What this module does**: single-pass 8-block-batched loop.
-// Per iteration:
-//
-//   1. Generate 8 counter blocks.
-//   2. AES-encrypt all 8 via `aes::Aes128::encrypt_blocks` —
-//      which dispatches to the 8-way AES-NI backend on x86 (see
-//      `aes 0.8.4`'s `ni::aes128::encrypt8`) and the FEAT_AES
-//      backend on aarch64. The keystream stays in registers /
-//      hot in L1.
-//   3. XOR with plaintext → ciphertext in place.
-//   4. GHASH-absorb each of the 8 just-written ciphertext blocks
-//      via `ghash::GHash::update`. The block is still hot from
-//      the XOR.
-//
-// **Cross-arch**: identical source on every target. The
-// hardware acceleration comes from `aes` + `ghash` having
-// per-arch backends (`ni` / `armv8` / `clmul` / `pmull`).
-//
-// **What's still on the table (~4× more speedup)**: replacing
-// the per-block GHASH with a 4- or 8-way Karatsuba batched
-// GHASH that defers polynomial reduction to once per chunk.
-// The math is well-known (Gueron 2010 §4); the implementation
-// trap is the PCLMUL-vs-GHASH bit-order convention. An earlier
-// version of this file got that wrong (byte-swap without
-// bit-reverse), shipped working KAT but failed the integration
-// test under TLS record-layer tag verification. Building it
-// correctly is a focused follow-up.
+//   1. Build 8 CTR blocks, batch-encrypt via AES-NI 8-way.
+//   2. XOR with plaintext → ciphertext, in place.
+//   3. GHASH-absorb all 8 ciphertext blocks via the batched
+//      `GhashState::absorb_8` — 24 PCLMULs + 1 reduction
+//      (vs 8 PCLMULs + 8 reductions in the per-block path).
 //
 // **Correctness**:
 //
 //   * NIST SP 800-38D §B Test Case 4 — `tests::nist_kat_test_case_4`.
 //   * Round-trip + tamper test vs upstream `aes_gcm::Aes128Gcm`
 //     across an exhaustive size sweep + AAD variations —
-//     `tests::matches_aes_gcm_crate_roundtrip`.
+//     `tests::matches_aes_gcm_crate_roundtrip`. Covers the
+//     8-block, 16-block, 128-block, and partial-tail paths.
 //   * Live integration via `TrafficKey` exercising real TLS
 //     records over QEMU x86_64 + HVF aarch64 in
 //     `//apps/webserver:test_qemu_x86_64` + `:test_hvf`.
+//   * Boot-time KAT in `apps/webserver` exercises a multi-chunk
+//     seal so any future bit-order regression in the batched
+//     GHASH path surfaces on every boot, not just on the
+//     tail-only records that fit in <=127 bytes.
 
 use aes::cipher::BlockEncrypt;
 use aes::cipher::KeyInit as _;
 use aes::cipher::generic_array::GenericArray;
 use aes::Aes128;
-use ghash::universal_hash::UniversalHash;
-use ghash::GHash;
+
+use crate::ghash_batch::{GhashKey, BATCH_LEN, BLOCK_LEN as GHASH_BLOCK};
 
 pub const KEY_LEN: usize = 16;
 pub const NONCE_LEN: usize = 12;
@@ -62,27 +45,32 @@ const BLOCK_LEN: usize = 16;
 const CHUNK_BLOCKS: usize = 8;
 const CHUNK_LEN: usize = BLOCK_LEN * CHUNK_BLOCKS; // 128
 
+const _: () = {
+    assert!(BLOCK_LEN == GHASH_BLOCK);
+    assert!(CHUNK_LEN == BATCH_LEN);
+};
+
 /// Pre-keyed AES-128-GCM context. Holds the AES-128 round-key
-/// schedule and the pre-keyed GHASH accumulator template
-/// (`H = AES_K(0^128)` already folded in). Reusable across many
-/// `seal` / `open` calls — the per-record cost is one nonce-block
-/// AES encrypt + the inner 8-batched loop + the final tag XOR.
+/// schedule and the pre-computed H^1..H^8 GHASH table. Reusable
+/// across many `seal` / `open` calls — the per-record cost is one
+/// nonce-block AES encrypt + the inner 8-batched loop + the final
+/// tag XOR.
 #[derive(Clone)]
 pub struct Aes128GcmFast {
     aes: Aes128,
-    h_acc_template: GHash,
+    ghash_key: GhashKey,
 }
 
 impl Aes128GcmFast {
     /// Build a context for a 16-byte key.
     pub fn new(key: &[u8; KEY_LEN]) -> Self {
         let aes = Aes128::new(GenericArray::from_slice(key));
+        // H = AES_K(0^128).
         let mut h_block: GenericArray<u8, _> = GenericArray::default();
         aes.encrypt_block(&mut h_block);
-        let h_acc_template = <GHash as ghash::universal_hash::KeyInit>::new(
-            GenericArray::from_slice(&h_block),
-        );
-        Aes128GcmFast { aes, h_acc_template }
+        let h_bytes: [u8; BLOCK_LEN] = h_block.into();
+        let ghash_key = GhashKey::new(&h_bytes);
+        Aes128GcmFast { aes, ghash_key }
     }
 
     /// One-shot seal. `buffer` is plaintext on entry, ciphertext
@@ -101,10 +89,8 @@ impl Aes128GcmFast {
         self.aes.encrypt_block(&mut mask);
 
         // Initial GHASH state with H folded in; absorb AAD.
-        let mut g = self.h_acc_template.clone();
-        if !aad.is_empty() {
-            g.update_padded(aad);
-        }
+        let mut g = self.ghash_key.start();
+        g.absorb_padded_slice(aad);
 
         // Stitched 8-block batched inner loop.
         let mut counter = increment_be32(&j0);
@@ -119,16 +105,19 @@ impl Aes128GcmFast {
             }
             self.aes.encrypt_blocks(&mut ks_buf);
 
-            // XOR with plaintext to make ciphertext, GHASH each
-            // ciphertext block as we go.
+            // XOR with plaintext to make ciphertext.
             for i in 0..CHUNK_BLOCKS {
                 let block = &mut chunk[i * BLOCK_LEN..(i + 1) * BLOCK_LEN];
                 for j in 0..BLOCK_LEN {
                     block[j] ^= ks_buf[i][j];
                 }
-                let ct: &GenericArray<u8, _> = GenericArray::from_slice(block);
-                g.update(&[*ct]);
             }
+
+            // Batched GHASH-absorb all 8 ciphertext blocks.
+            let ct_chunk: &[u8; BATCH_LEN] = chunk[..BATCH_LEN]
+                .try_into()
+                .expect("chunks_exact_mut yields BATCH_LEN slices");
+            g.absorb_8(ct_chunk);
         }
 
         // Tail: 0..127 bytes. One block at a time.
@@ -142,8 +131,10 @@ impl Aes128GcmFast {
             for j in 0..BLOCK_LEN {
                 block[j] ^= ks[j];
             }
-            let ct: &GenericArray<u8, _> = GenericArray::from_slice(block);
-            g.update(&[*ct]);
+            let blk: &[u8; BLOCK_LEN] = (&*block)
+                .try_into()
+                .expect("tail block slice is BLOCK_LEN");
+            g.absorb_one(blk);
         }
         let partial = tail_blocks.into_remainder();
         if !partial.is_empty() {
@@ -154,18 +145,14 @@ impl Aes128GcmFast {
             for j in 0..n {
                 partial[j] ^= ks[j];
             }
-            let mut padded = [0u8; BLOCK_LEN];
-            padded[..n].copy_from_slice(partial);
-            let ct: &GenericArray<u8, _> = GenericArray::from_slice(&padded);
-            g.update(&[*ct]);
+            g.absorb_partial(partial);
         }
 
         // Length block, finalize, XOR with tag mask.
         let mut len_block = [0u8; BLOCK_LEN];
         len_block[0..8].copy_from_slice(&(aad.len() as u64).wrapping_mul(8).to_be_bytes());
         len_block[8..16].copy_from_slice(&(buffer.len() as u64).wrapping_mul(8).to_be_bytes());
-        let lb: &GenericArray<u8, _> = GenericArray::from_slice(&len_block);
-        g.update(&[*lb]);
+        g.absorb_one(&len_block);
 
         let g_out = g.finalize();
         let mut out = [0u8; TAG_LEN];
@@ -190,25 +177,23 @@ impl Aes128GcmFast {
         let mut mask: GenericArray<u8, _> = GenericArray::clone_from_slice(&j0);
         self.aes.encrypt_block(&mut mask);
 
-        let mut g = self.h_acc_template.clone();
-        if !aad.is_empty() {
-            g.update_padded(aad);
-        }
+        let mut g = self.ghash_key.start();
+        g.absorb_padded_slice(aad);
 
         // Decrypt path: GHASH the ciphertext BEFORE the XOR
-        // (otherwise we'd be authing plaintext). Snapshot 8
-        // blocks at a time, GHASH-absorb, then decrypt.
+        // (otherwise we'd be authing plaintext). Batched-absorb 8
+        // ciphertext blocks per iteration, then decrypt those 8.
         let mut counter = increment_be32(&j0);
         let mut ks_buf = [GenericArray::<u8, _>::default(); CHUNK_BLOCKS];
         let buf_len = buffer.len();
         let mut chunks = buffer.chunks_exact_mut(CHUNK_LEN);
         for chunk in chunks.by_ref() {
-            // GHASH ciphertext first.
-            for i in 0..CHUNK_BLOCKS {
-                let block_slice = &chunk[i * BLOCK_LEN..(i + 1) * BLOCK_LEN];
-                let ct: &GenericArray<u8, _> = GenericArray::from_slice(block_slice);
-                g.update(&[*ct]);
-            }
+            // GHASH ciphertext first — batched.
+            let ct_chunk: &[u8; BATCH_LEN] = chunk[..BATCH_LEN]
+                .try_into()
+                .expect("chunks_exact_mut yields BATCH_LEN slices");
+            g.absorb_8(ct_chunk);
+
             // Then decrypt.
             for i in 0..CHUNK_BLOCKS {
                 ks_buf[i].copy_from_slice(&counter);
@@ -226,13 +211,10 @@ impl Aes128GcmFast {
         let tail = chunks.into_remainder();
         let mut tail_blocks = tail.chunks_exact_mut(BLOCK_LEN);
         for block in tail_blocks.by_ref() {
-            let snapshot = {
-                let mut tmp = [0u8; BLOCK_LEN];
-                tmp.copy_from_slice(block);
-                tmp
-            };
-            let ct: &GenericArray<u8, _> = GenericArray::from_slice(&snapshot);
-            g.update(&[*ct]);
+            let snapshot: [u8; BLOCK_LEN] = (&*block)
+                .try_into()
+                .expect("tail block slice is BLOCK_LEN");
+            g.absorb_one(&snapshot);
             let mut ks: GenericArray<u8, _> = GenericArray::default();
             ks.copy_from_slice(&counter);
             self.aes.encrypt_block(&mut ks);
@@ -244,10 +226,7 @@ impl Aes128GcmFast {
         let partial = tail_blocks.into_remainder();
         if !partial.is_empty() {
             let n = partial.len();
-            let mut padded = [0u8; BLOCK_LEN];
-            padded[..n].copy_from_slice(partial);
-            let ct: &GenericArray<u8, _> = GenericArray::from_slice(&padded);
-            g.update(&[*ct]);
+            g.absorb_partial(partial);
             let mut ks: GenericArray<u8, _> = GenericArray::default();
             ks.copy_from_slice(&counter);
             self.aes.encrypt_block(&mut ks);
@@ -259,8 +238,7 @@ impl Aes128GcmFast {
         let mut len_block = [0u8; BLOCK_LEN];
         len_block[0..8].copy_from_slice(&(aad.len() as u64).wrapping_mul(8).to_be_bytes());
         len_block[8..16].copy_from_slice(&(buf_len as u64).wrapping_mul(8).to_be_bytes());
-        let lb: &GenericArray<u8, _> = GenericArray::from_slice(&len_block);
-        g.update(&[*lb]);
+        g.absorb_one(&len_block);
 
         let g_out = g.finalize();
         let mut computed = [0u8; TAG_LEN];
