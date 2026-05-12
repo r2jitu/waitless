@@ -31,6 +31,8 @@
 //     GHASH path surfaces on every boot, not just on the
 //     tail-only records that fit in <=127 bytes.
 
+#![allow(unsafe_op_in_unsafe_fn)]
+
 use aes::cipher::BlockEncrypt;
 use aes::cipher::KeyInit as _;
 use aes::cipher::generic_array::GenericArray;
@@ -92,32 +94,25 @@ impl Aes128GcmFast {
         let mut g = self.ghash_key.start();
         g.absorb_padded_slice(aad);
 
-        // Stitched 8-block batched inner loop.
+        // Stitched 8-block inner loop: AES-CTR keystream XOR'd
+        // into plaintext to produce ciphertext, then GHASH-absorb
+        // those same ciphertext blocks *while they're still in
+        // registers* — no second pass through the buffer for
+        // GHASH. See `stitched_chunk_*` for the per-arch SIMD body.
         let mut counter = increment_be32(&j0);
         let mut ks_buf = [GenericArray::<u8, _>::default(); CHUNK_BLOCKS];
         let mut chunks = buffer.chunks_exact_mut(CHUNK_LEN);
         for chunk in chunks.by_ref() {
-            // 8 counters → 8 keystreams (batched AES-NI on x86,
-            // batched FEAT_AES on aarch64).
             for i in 0..CHUNK_BLOCKS {
                 ks_buf[i].copy_from_slice(&counter);
                 counter = increment_be32(&counter);
             }
             self.aes.encrypt_blocks(&mut ks_buf);
 
-            // XOR with plaintext to make ciphertext.
-            for i in 0..CHUNK_BLOCKS {
-                let block = &mut chunk[i * BLOCK_LEN..(i + 1) * BLOCK_LEN];
-                for j in 0..BLOCK_LEN {
-                    block[j] ^= ks_buf[i][j];
-                }
-            }
-
-            // Batched GHASH-absorb all 8 ciphertext blocks.
-            let ct_chunk: &[u8; BATCH_LEN] = chunk[..BATCH_LEN]
+            let ct_chunk: &mut [u8; BATCH_LEN] = (&mut chunk[..BATCH_LEN])
                 .try_into()
                 .expect("chunks_exact_mut yields BATCH_LEN slices");
-            g.absorb_8(ct_chunk);
+            stitched_xor_and_absorb(&mut g, ct_chunk, &ks_buf);
         }
 
         // Tail: 0..127 bytes. One block at a time.
@@ -290,6 +285,120 @@ fn increment_be32(counter: &[u8; BLOCK_LEN]) -> [u8; BLOCK_LEN] {
     out[14] = be[2];
     out[15] = be[3];
     out
+}
+
+// ============================================================================
+// Stitched AES-CTR XOR + batched GHASH absorb
+// ============================================================================
+//
+// Per 128-byte chunk: each ciphertext block stays in a SIMD
+// register from the moment AES-CTR XOR produces it through the
+// PCLMUL/PMULL Karatsuba accumulate — only writing to memory
+// once. Reduces the chunk's L1 traffic from 3 read+writes (PT
+// in, CT out, CT in for GHASH) to 2 (PT in, CT out).
+//
+// The Karatsuba math lives in `ghash_batch::{xmm,neon}`; this
+// just orchestrates the per-arch SIMD load → XOR → store →
+// accumulate sequence with the H^k powers loaded once per chunk.
+
+#[inline]
+fn stitched_xor_and_absorb(
+    g: &mut crate::ghash_batch::GhashState<'_>,
+    chunk: &mut [u8; CHUNK_LEN],
+    ks_buf: &[GenericArray<u8, aes::cipher::consts::U16>; CHUNK_BLOCKS],
+) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+    unsafe {
+        stitched_chunk_x86(g, chunk, ks_buf);
+        return;
+    }
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    unsafe {
+        stitched_chunk_arm(g, chunk, ks_buf);
+        return;
+    }
+    #[allow(unreachable_code)]
+    {
+        // Portable fallback: XOR pass, then batched absorb.
+        // Same memory traffic as the pre-stitched code; only
+        // used on hosts without PCLMUL/PMULL (e.g. `cargo test`
+        // under emulation). Kept for compile-time portability.
+        for i in 0..CHUNK_BLOCKS {
+            let block = &mut chunk[i * BLOCK_LEN..(i + 1) * BLOCK_LEN];
+            for j in 0..BLOCK_LEN {
+                block[j] ^= ks_buf[i][j];
+            }
+        }
+        g.absorb_8(chunk);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2,ssse3,pclmulqdq")]
+unsafe fn stitched_chunk_x86(
+    g: &mut crate::ghash_batch::GhashState<'_>,
+    chunk: &mut [u8; CHUNK_LEN],
+    ks_buf: &[GenericArray<u8, aes::cipher::consts::U16>; CHUNK_BLOCKS],
+) {
+    use core::arch::x86_64::*;
+    use crate::ghash_batch::xmm;
+
+    let bswap = xmm::bswap_mask();
+    let state_polyval = g.polyval_state();
+    let state = _mm_loadu_si128(state_polyval.as_ptr() as *const __m128i);
+    let h = xmm::load_h_powers(g.key().h_powers());
+    let mut acc = xmm::acc_zero();
+
+    for i in 0..CHUNK_BLOCKS {
+        // Load plaintext + keystream into registers; XOR to get CT.
+        let pt = _mm_loadu_si128(chunk.as_ptr().add(i * BLOCK_LEN) as *const __m128i);
+        let ks = _mm_loadu_si128(ks_buf[i].as_ptr() as *const __m128i);
+        let ct = _mm_xor_si128(pt, ks);
+        // Write CT back to the buffer (the only memory traffic
+        // we owe the caller — plaintext-to-ciphertext output).
+        _mm_storeu_si128(chunk.as_mut_ptr().add(i * BLOCK_LEN) as *mut __m128i, ct);
+        // GHASH-absorb the same register-resident CT (no reload).
+        let ct_rev = _mm_shuffle_epi8(ct, bswap);
+        let yi = if i == 0 { _mm_xor_si128(state, ct_rev) } else { ct_rev };
+        xmm::karatsuba_accumulate(&mut acc, yi, h[i]);
+    }
+
+    let new_state = xmm::acc_reduce(acc);
+    let mut out = [0u8; BLOCK_LEN];
+    _mm_storeu_si128(out.as_mut_ptr() as *mut __m128i, new_state);
+    g.set_polyval_state(out);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes,neon")]
+unsafe fn stitched_chunk_arm(
+    g: &mut crate::ghash_batch::GhashState<'_>,
+    chunk: &mut [u8; CHUNK_LEN],
+    ks_buf: &[GenericArray<u8, aes::cipher::consts::U16>; CHUNK_BLOCKS],
+) {
+    use core::arch::aarch64::*;
+    use crate::ghash_batch::neon;
+
+    let bswap = neon::bswap_indices();
+    let state_polyval = g.polyval_state();
+    let state = vld1q_u8(state_polyval.as_ptr());
+    let h = neon::load_h_powers(g.key().h_powers());
+    let mut acc = neon::acc_zero();
+
+    for i in 0..CHUNK_BLOCKS {
+        let pt = vld1q_u8(chunk.as_ptr().add(i * BLOCK_LEN));
+        let ks = vld1q_u8(ks_buf[i].as_ptr());
+        let ct = veorq_u8(pt, ks);
+        vst1q_u8(chunk.as_mut_ptr().add(i * BLOCK_LEN), ct);
+        let ct_rev = vqtbl1q_u8(ct, bswap);
+        let yi = if i == 0 { veorq_u8(state, ct_rev) } else { ct_rev };
+        neon::karatsuba_accumulate(&mut acc, yi, h[i]);
+    }
+
+    let new_state = neon::acc_reduce(acc);
+    let mut out = [0u8; BLOCK_LEN];
+    vst1q_u8(out.as_mut_ptr(), new_state);
+    g.set_polyval_state(out);
 }
 
 #[cfg(test)]
