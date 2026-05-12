@@ -345,7 +345,7 @@ pub struct NicOps {
         gso_size: u16,
     )>,
     /// Zero-copy RX. The callback receives an owned [`IOBuf`]
-    /// (typically `IOBuf::External` wrapping the descriptor's
+    /// (typically `IOBuf::ExternalOwned` wrapping the descriptor's
     /// storage) per frame; the IOBuf's drop callback returns the
     /// buffer to the driver's pool. There used to be a parallel
     /// `poll_rx: fn(fn(&[u8]))` / `poll_qp: fn(usize, fn(&[u8]))`

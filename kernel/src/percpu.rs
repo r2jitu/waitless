@@ -45,7 +45,7 @@ fn noop(_: usize) {}
 const RX_POOL_SIZE: usize = 16;
 
 /// Zero-copy cross-core RX inbox — the distributor hands an owned
-/// [`uni_iobuf::IOBuf`] (typically `IOBuf::External` wrapping a NIC
+/// [`uni_iobuf::IOBuf`] (typically `IOBuf::ExternalOwned` wrapping a NIC
 /// descriptor's storage) and the owning core takes ownership of it.
 /// No memcpy on either side: the cross-core hand-off is just an
 /// SPSC ring exchange of a pointer-sized index, and the IOBuf

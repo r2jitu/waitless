@@ -33,7 +33,7 @@ use uni_worker::{CurrentWorker, WorkerLocal};
 // `handle_conn` allocates one heap-backed `body_storage` per
 // connection and parks a pointer to it in this per-worker slot
 // before invoking the request handler. Handlers that opt in
-// call [`body_iobuf`] to wrap the storage as an `IOBuf::External`
+// call [`body_iobuf`] to wrap the storage as an a `Borrowed` IOBuf
 // — zero allocation per response, the storage is reused on
 // every iteration of the conn's keep-alive loop. Apps that
 // don't opt in keep allocating fresh `IOBuf::new_with_reserved`
@@ -1131,7 +1131,7 @@ async fn handle_conn<S, H>(
     // Inline storage for the response-header IOBuf, sized for the
     // typical header set plus the worst-case transport reserve.
     // Folded into the future state so each iteration wraps it as
-    // an `IOBuf::External` rather than allocating a fresh
+    // an a `Borrowed` IOBuf rather than allocating a fresh
     // `Box<[u8]>` per response. 1 KiB covers HTTP/1.1 status line
     // + Content-Type + Content-Length + Connection + a handful
     // of `with_header`-set extras (Alt-Svc, Cache-Control,
@@ -1192,7 +1192,7 @@ async fn handle_conn<S, H>(
             clear_body_scratch();
 
             // Wrap the per-conn `header_storage` array as an
-            // `IOBuf::External` so the framing layer can build
+            // a `Borrowed` IOBuf so the framing layer can build
             // headers in stack-resident memory without a heap
             // allocation per response. SAFETY contract:
             //   * `header_storage` outlives every IOBuf wrapping

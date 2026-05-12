@@ -277,13 +277,13 @@ impl Scratch {
 /// Per-conn pool of `Box<[u8]>` storage backing response framing
 /// IOBufs. The pool is wrapped in an `Arc` and the IOBuf's drop
 /// callback decrements that refcount via `Arc::from_raw` —
-/// `Arc` because `IOBuf::External` is `Send` (an IOBuf could
+/// `Arc` because `IOBuf::ExternalOwned` is `Send` (an IOBuf could
 /// in principle move workers before drop) and `Rc` isn't, even
 /// though in practice every IOBuf this pool issues stays on
 /// the worker that created it.
 ///
 /// Per-request: pop a `Box<[u8]>` from `bufs` (or alloc fresh
-/// if empty), wrap as `IOBuf::External` with a drop callback
+/// if empty), wrap as `IOBuf::ExternalOwned` with a drop callback
 /// that returns the storage to `bufs`. The Arc strong count
 /// is bumped per outstanding IOBuf so the pool stays alive
 /// until every framing IOBuf has dropped, even past `Scratch`'s
@@ -594,7 +594,7 @@ fn write_response(
     //   * The H3 frame headers prepend / append IN PLACE.
     //
     // The framing IOBuf's underlying storage comes from a per-
-    // conn pool — pop a `Box<[u8]>`, wrap as `IOBuf::External`
+    // conn pool — pop a `Box<[u8]>`, wrap as `IOBuf::ExternalOwned`
     // with a drop callback that returns the storage to the
     // pool when SendStream finishes draining. Steady-state per-
     // request alloc count: 0 framing buffers (was 1).

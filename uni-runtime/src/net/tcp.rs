@@ -206,13 +206,13 @@ impl TcpStream {
     /// transport sees only chains, the byte-slice case is a
     /// trivial wrap on the way down. Per-call cost is one
     /// `VecDeque` allocation for the chain buffer plus an
-    /// `IOBuf::External` struct init — negligible at the call
+    /// `IOBuf::Borrowed` struct init — negligible at the call
     /// rates we hit in benchmarks.
     pub async fn send_bytes(&self, data: &[u8]) -> Result<(), ()> {
         // SAFETY: `chain` is dropped before this future returns;
-        // the `IOBuf::External` wrapping `data` therefore can't
-        // outlive `data`'s borrow. `drop_fn = None` because the
-        // bytes are borrowed, not owned.
+        // the `IOBuf::Borrowed` wrapping `data` therefore can't
+        // outlive `data`'s borrow. No drop callback — the bytes
+        // are borrowed, not owned.
         let mut chain = uni_iobuf::IOBufChain::new();
         let iobuf = unsafe {
             uni_iobuf::IOBuf::borrow(

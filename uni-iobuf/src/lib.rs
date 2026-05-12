@@ -28,33 +28,27 @@
 //     hardware TX descriptor — one memcpy total, no intermediate
 //     Vec.
 //
-// Design choices made for v1 (knowingly minimal — the goal is to
-// land the type and start porting consumers; we add features when
-// porting hits a wall):
+// Design choices:
 //
-//   * Single-owner heap segments. No `Rc<[u8]>` refcount yet — a
-//     consumer that wants to retain a chunk for retransmit storage
-//     today either copies (Vec) or moves the IOBuf out of the
-//     chain. Sharing comes when the QUIC retransmit window needs
-//     to hold onto chunks past their ACK-driven free.
-//   * Static borrows. Zero-copy for `&'static [u8]` literals (the
-//     STYLES block, every shell HTML chunk). No headroom/tailroom
-//     on these — they're immutable, layers can't prepend INTO
-//     them, but a heap-allocated header node can prepend before
-//     them in the chain.
-//   * Heap variant carries `offset` + `len` as `u32` (saves 8 B
-//     per node vs `usize`). 4 GiB per chunk is plenty for any
+//   * Five storage variants under one `IOBuf`: heap-owned
+//     (`Heap`), refcount-shared (`Shared`, `Rc<[u8]>`-backed for
+//     QUIC retransmit and any other "two live views of the same
+//     bytes" pattern), `&'static [u8]` (`Static`), foreign region
+//     with a drop callback (`ExternalOwned`, e.g. NIC zero-copy
+//     RX), and non-owning view (`Borrowed`, e.g. per-worker
+//     scratch slice).
+//   * `split_at` on `Heap` promotes to `Shared` in place — no
+//     copy, both halves see disjoint windows into the same Rc.
+//     Mutation paths call `make_unique` first so peer Rc holders
+//     never see surprise writes.
+//   * Heap/Shared carry `offset` + `len` as `u32` (saves 8 B per
+//     node vs `usize`). 4 GiB per chunk is plenty for any
 //     unikernel workload.
-//   * `IOBufChain` is a `VecDeque<IOBuf>`. Push-front and
-//     push-back are both amortised O(1); we don't actually need
-//     linked-list semantics, just chain-level prepend / append.
-//
-// Future additions (when ports demand them):
-//
-//   * `Rc<Storage>` heap variant for shared retransmit storage.
-//   * NIC-descriptor variant for true zero-copy RX (the descriptor
-//     gets recycled when the IOBuf drops).
-//   * `try_coalesce` for crypto APIs that need contiguous input.
+//   * `IOBufChain` is an inline `[Option<IOBuf>; INLINE_PARTS]` +
+//     a lazy `VecDeque<IOBuf>` overflow. Push-front and push-back
+//     are amortised O(1); the inline array covers the common
+//     layered shape (header + a few body parts) with zero chain-
+//     machinery allocations.
 
 #![no_std]
 #![allow(dead_code)]
@@ -1078,8 +1072,10 @@ impl IOBuf {
     /// Split this IOBuf into two halves at byte offset `n` within
     /// the visible payload. `self` keeps `[0..n)`, the returned
     /// IOBuf gets `[n..len)`. Used by [`IOBufChain::split_off`] to
-    /// peel a sub-range off a chain at TLS record boundaries
-    /// without copying the underlying bytes.
+    /// peel a sub-range off a chain without copying the underlying
+    /// bytes — the QUIC retransmit storage path wants this shape so
+    /// it can keep an Rc-shared reference to in-flight chunks while
+    /// the wire copy proceeds in parallel.
     ///
     /// Variant behavior:
     ///   * `Heap`: promotes in place to `Shared`, then clones the
@@ -1094,9 +1090,7 @@ impl IOBuf {
     ///     (ExternalOwned) is single-fire and tied to the whole
     ///     region, so splitting would either double-drop or leak;
     ///     the aliasing tracker (Borrowed) would refuse the second
-    ///     view over the same `[base, base+capacity)`. Neither shape
-    ///     is expected in app-side response bodies that reach the
-    ///     TLS slow path — the only sites that split today.
+    ///     view over the same `[base, base+capacity)`.
     ///
     /// Panics if `n > self.len()`.
     pub fn split_at(&mut self, n: usize) -> IOBuf {
@@ -1414,7 +1408,7 @@ impl IOBufChain {
     }
 
     /// Mutable iterate front-to-back. Lets the caller mutate
-    /// individual parts (e.g. encrypt-in-place via
+    /// individual parts (e.g. patch bytes through
     /// `IOBuf::data_mut()` per part) without consuming the
     /// chain.
     #[inline]

@@ -1959,7 +1959,7 @@ fn flush_tx_kick_if_dirty() -> bool {
 // ============================================================================
 //
 // `poll_qp` wraps each used descriptor's buffer as an
-// `IOBuf::External` and hands ownership to the consumer. Re-arming
+// `IOBuf::ExternalOwned` and hands ownership to the consumer. Re-arming
 // the descriptor is deferred until the consumer drops the IOBuf —
 // `rx_drop_callback` calls `add_buf` on the qp directly, re-posting
 // the buffer at the same physical address it came from.
@@ -2020,7 +2020,7 @@ unsafe fn rx_repost(qp: usize, buf_phys: u64) {
     }
 }
 
-/// Drop callback for `IOBuf::External` instances handed out by
+/// Drop callback for `IOBuf::ExternalOwned` instances handed out by
 /// `poll_qp`. Re-posts the buffer to its qp's avail ring and
 /// kicks the device if needed (see `rx_repost`).
 ///
@@ -2048,7 +2048,7 @@ unsafe fn rx_drop_callback(
 }
 
 /// Per-queue zero-copy RX poll. Drains the used ring, wrapping
-/// each descriptor's buffer as an `IOBuf::External`. Re-arming
+/// each descriptor's buffer as an `IOBuf::ExternalOwned`. Re-arming
 /// + kicking is deferred to `rx_drop_callback`, which fires when
 /// the consumer drops the IOBuf.
 fn poll_qp(qp: usize, callback: fn(uni_net_driver::IOBuf)) -> usize {
@@ -2081,7 +2081,7 @@ fn poll_qp(qp: usize, callback: fn(uni_net_driver::IOBuf)) -> usize {
                         core::sync::atomic::Ordering::Relaxed,
                     );
                 }
-                // Wrap the buffer as `IOBuf::External` and hand
+                // Wrap the buffer as `IOBuf::ExternalOwned` and hand
                 // ownership to the consumer. `ctx = qp` so the
                 // drop callback knows where to re-arm.
                 let iobuf = uni_net_driver::IOBuf::wrap_owned(
