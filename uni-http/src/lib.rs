@@ -765,6 +765,37 @@ impl TlsStream {
         }
     }
 
+    /// One full sans-io RX pump cycle:
+    ///   1. Drain any TLS TX bytes left in `tx_buf` from a prior
+    ///      `advance` (preserves NST / alert ordering — they must
+    ///      hit the wire before we block waiting for more peer
+    ///      bytes).
+    ///   2. Read fresh ciphertext from TCP.
+    ///   3. Hand it to the TLS state machine and `advance`.
+    ///   4. Drain anything `advance` produced (handshake reply,
+    ///      app data ACK in future versions, etc.).
+    ///
+    /// One call advances the conn by exactly one wire round-trip's
+    /// worth of received bytes. The handshake driver and the
+    /// app-data RX loop both bottom out here — there's no
+    /// separate "handshake state machine driver" task because the
+    /// handshake runs inside the same `recv` that consumes app
+    /// data; once `pop_plaintext` starts returning bytes, the
+    /// handshake is done.
+    ///
+    /// `Err(())` is fatal (peer closed, decrypt error, or TCP
+    /// error). Caller drops the conn.
+    async fn pump_rx(&mut self) -> Result<(), ()> {
+        self.drain_tx().await?;
+        let got = self.tcp.recv(&mut self.cipher_buf).await;
+        if got == 0 {
+            return Err(());
+        }
+        self.tls.push_rx(&self.cipher_buf[..got]);
+        self.tls.advance().map_err(|_| ())?;
+        self.drain_tx().await
+    }
+
     /// Encrypt and ship one TLS 1.3 application_data record. The
     /// TLS layer consumes up to `PLAINTEXT_CHUNK` (16 KiB) bytes
     /// from the front of `src` and leaves the rest for the next
@@ -980,26 +1011,21 @@ fn take_record_scratch() -> RecordScratch {
 impl HttpStream for TlsStream {
     async fn recv(&mut self, buf: &mut [u8]) -> usize {
         loop {
-            // Try to satisfy from already-decrypted plaintext.
+            // Try plaintext first — `pump_rx` may have decrypted
+            // app data on a previous iteration, or the TLS state
+            // machine may have buffered it from earlier records.
             let n = self.tls.pop_plaintext(buf);
             if n > 0 {
                 return n;
             }
-            // Pump TLS: drain pending tx, recv ciphertext, advance,
-            // drain again, then loop to pop_plaintext.
-            if self.drain_tx().await.is_err() {
-                return 0;
-            }
-            let cipher_len = self.cipher_buf.len();
-            let got = self.tcp.recv(&mut self.cipher_buf[..cipher_len]).await;
-            if got == 0 {
-                return 0;
-            }
-            self.tls.push_rx(&self.cipher_buf[..got]);
-            if self.tls.advance().is_err() {
-                return 0;
-            }
-            if self.drain_tx().await.is_err() {
+            // No plaintext available → pump one wire round-trip
+            // through the TLS state machine. Returns Err on TCP
+            // close, decrypt error, or other fatal TLS error.
+            // Handshake records produce no plaintext, so the
+            // first 1-2 iterations of this loop drive the
+            // handshake to completion; subsequent iterations are
+            // app-data decrypt.
+            if self.pump_rx().await.is_err() {
                 return 0;
             }
         }
