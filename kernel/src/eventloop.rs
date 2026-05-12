@@ -391,28 +391,40 @@ pub fn run(core_id: u32) -> ! {
             iter_start_cycles = post_sleep;
         }
 
-        // Publish accumulated counters once every 64 iterations.
-        // Atomic stores are cheap individually but a single fetch_add
-        // per loop iter compounds — batch the publication to ~once
-        // per microsecond at peak rate. Sampling tools read the
-        // atomics directly, so staleness is bounded by 64 loops
-        // (~13 µs at peak).
-        if loops & 63 == 0 {
-            stats.loops.store(loops, Ordering::Relaxed);
-            stats.poll_work.store(poll_work, Ordering::Relaxed);
-            stats.drain_work.store(drain_work, Ordering::Relaxed);
-            stats.service_work.store(service_work, Ordering::Relaxed);
-            // idle_enters + busy_cycles + idle_cycles are written
-            // inline in the idle branch above (low frequency).
-            // Charge cycles since this iter started as busy too —
-            // we only update iter_start_cycles when entering idle.
-            let now = crate::time::now_cycles();
-            stats.busy_cycles.fetch_add(
-                now.wrapping_sub(iter_start_cycles),
-                Ordering::Relaxed,
-            );
-            iter_start_cycles = now;
+        // Publish accumulated counters. Plain stores — the atomic
+        // is cache-line resident in the publishing core's L1 (we're
+        // the only writer); /stats readers pay a cache-miss to
+        // pull a fresh snapshot but readers are not on the hot path.
+        // Doing this every iter keeps the per-counter staleness at
+        // exactly one iter and avoids the gating bug where idle
+        // cores rarely landed on `loops & 63 == 0` for the bulk
+        // publish branch.
+        //
+        // Cycle bookkeeping: charge any cycles since this iter
+        // started (or since the last sleep wakeup) as busy. The
+        // sleep branch already handled its own busy/idle split
+        // and reset `iter_start_cycles` post-wake; here we cover
+        // the did_work-true and spin-window-continue cases.
+        //
+        // Frequency: ~once per ~100 ns on a hot core (10 M iters
+        // /sec). A relaxed atomic store is ~1 ns on x86 when the
+        // line is owner-cached; on idle cores it's free.
+        stats.loops.store(loops, Ordering::Relaxed);
+        stats.poll_work.store(poll_work, Ordering::Relaxed);
+        stats.drain_work.store(drain_work, Ordering::Relaxed);
+        stats.service_work.store(service_work, Ordering::Relaxed);
+        let now = crate::time::now_cycles();
+        let delta = now.wrapping_sub(iter_start_cycles);
+        // Cap the per-iter charge at a sane upper bound to make
+        // sampling values robust to one-off interruptions (e.g.
+        // hypervisor preempts). On x86 a normal iter is hundreds
+        // of cycles; a preempt can be millions. Charge per-iter
+        // deltas only when they're plausible (< 10 ms at typical
+        // clocks).
+        if delta < 30_000_000 {
+            stats.busy_cycles.fetch_add(delta, Ordering::Relaxed);
         }
+        iter_start_cycles = now;
     }
 
     // Print diagnostics
