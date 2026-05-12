@@ -379,6 +379,52 @@ impl IOBuf {
         }
     }
 
+    /// Zero-init-free variant of [`Self::new_with_reserved`]. Saves
+    /// the `vec![0u8; cap]` memset cost at the price of an unsafe
+    /// contract: the caller must write to every byte before reading.
+    /// Returns a `Heap` IOBuf with `len = 0` so `data()` is empty;
+    /// callers grow the visible region via `append_slice` /
+    /// `writer` / `extend_uninit` (which write before exposing
+    /// bytes) and / or `prepend` (which writes into headroom before
+    /// moving the visible window over it). The uninitialised
+    /// headroom / tailroom never become visible.
+    ///
+    /// Hot path for response-body construction at peak request
+    /// rate, where the memset on the cold-cache `vec![0u8; …]`
+    /// path was measurable in memory-bandwidth profiles.
+    ///
+    /// SAFETY: the caller must ensure no byte is read via `data()`
+    /// before it's been written through one of `append_slice`,
+    /// `writer`, `extend_uninit`, or a `prepend` that consumes
+    /// the byte's position from headroom into the visible region.
+    /// The IOBuf API enforces this for callers that only use the
+    /// public mutation entry points — but a caller that
+    /// manipulates `Inner::Heap`'s offsets directly could expose
+    /// uninit bytes.
+    pub unsafe fn new_with_reserved_uninit(
+        headroom: usize,
+        payload_capacity: usize,
+        tailroom: usize,
+    ) -> Self {
+        let cap = headroom + payload_capacity + tailroom;
+        // SAFETY: `Box::<[u8]>::new_uninit_slice(cap).assume_init()`
+        // returns a `Box<[u8]>` whose bytes are uninitialised. The
+        // caller's contract (above) is that no byte is read before
+        // it's been written; visible payload starts empty so
+        // `data()` is `&[]` (no read), and growth happens through
+        // entry points that write-then-expose.
+        let storage = unsafe {
+            alloc::boxed::Box::<[u8]>::new_uninit_slice(cap).assume_init()
+        };
+        IOBuf {
+            inner: Inner::Heap {
+                storage,
+                offset: headroom as u32,
+                len: 0,
+            },
+        }
+    }
+
     /// Heap-backed buffer pre-filled with `data`. Reserves
     /// `headroom` / `tailroom` around the payload for downstream
     /// layer prepend/append.

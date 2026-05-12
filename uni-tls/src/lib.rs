@@ -189,9 +189,8 @@ where
     let cfg = Arc::new(cfg);
     let pool = TlsConnPool::new();
 
-    // Pay the per-worker body-scratch + TLS-record-scratch
-    // allocations into HEAP_BASELINE before any traffic arrives.
-    uni_http::body_scratch_preinit();
+    // Pay the per-worker TLS-record-scratch allocation into
+    // HEAP_BASELINE before any traffic arrives.
     tls_scratch_preinit();
 
     let listener = uni::runtime::TcpListener::bind(port).map_err(ListenError::Bind)?;
