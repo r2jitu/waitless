@@ -54,8 +54,6 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::mem::ManuallyDrop;
 use core::ptr::addr_of_mut;
-#[cfg(target_os = "none")]
-use core::ptr::NonNull;
 
 use uni_worker::{CurrentWorker, WorkerLocal};
 
@@ -188,10 +186,6 @@ where
         .ok_or(ListenError::Cert)?;
     let cfg = Arc::new(cfg);
     let pool = TlsConnPool::new();
-
-    // Pay the per-worker TLS-record-scratch allocation into
-    // HEAP_BASELINE before any traffic arrives.
-    tls_scratch_preinit();
 
     let listener = uni::runtime::TcpListener::bind(port).map_err(ListenError::Bind)?;
     let handler = Arc::new(handler);
@@ -449,6 +443,16 @@ pub struct TlsStream {
     cipher_buf: [u8; CIPHER_BUF_LEN],
     /// Stack-friendly scratch for draining `pop_tx` output.
     tx_scratch: [u8; 2048],
+    /// Lazily-allocated scratch for the TLS record fallback path
+    /// (when TSO direct-encrypt isn't available — TX big-pool
+    /// full, TSO not negotiated, or dst MAC unresolved). Per-conn
+    /// ownership: the buffer is borrowed mutably from `&mut self`
+    /// for the entire `send_one_record` call including the
+    /// `tcp.send.await`, so no other task on this worker can
+    /// alias these bytes even if the send yields under
+    /// backpressure. Conns whose sends all take the fast-fast TSO
+    /// path never allocate.
+    record_scratch: Option<Box<[u8]>>,
 }
 
 impl TlsStream {
@@ -458,6 +462,7 @@ impl TlsStream {
             tls,
             cipher_buf: [0u8; CIPHER_BUF_LEN],
             tx_scratch: [0u8; 2048],
+            record_scratch: None,
         }
     }
 
@@ -514,13 +519,15 @@ impl TlsStream {
     ///   * **TSO direct-encrypt**: when the TX big-pool has a
     ///     free slot, seal straight into the slot's payload
     ///     region — no intermediate buffer anywhere on the data
-    ///     path. Walks the plaintext chain, ciphertext lands in
-    ///     the TX descriptor.
-    ///   * **Worker-scratch + tcp.send fallback**: TX big-pool
+    ///     path.
+    ///   * **Per-conn scratch + tcp.send fallback**: TX big-pool
     ///     full / TSO not negotiated / dst MAC unresolved → seal
-    ///     into the per-worker scratch and ship via the chain-
-    ///     based TCP send (which TSO's the record into MSS-sized
-    ///     segments internally).
+    ///     into this stream's `record_scratch` (lazily allocated
+    ///     on first miss, reused on subsequent misses) and ship
+    ///     via the chain-based TCP send. The scratch is owned by
+    ///     `&mut self` for the entire call, so the IOBuf wrapping
+    ///     it can't be aliased by another conn's send even if
+    ///     `tcp.send.await` yields under TX backpressure.
     ///
     /// `Err(())` is fatal — caller drops the conn.
     async fn send_one_record(&mut self, src: &mut IOBufChain) -> Result<(), ()> {
@@ -545,15 +552,27 @@ impl TlsStream {
             None => {} // TSO unavailable — fall through to scratch path
         }
 
-        // Fallback: worker-scratch seal + chain-based tcp.send.
-        let mut scratch = take_record_scratch();
-        let n = self
-            .tls
-            .seal_app_data(src, scratch.slot())
-            .map_err(|_| ())?;
+        // Fallback: per-conn scratch seal + chain-based tcp.send.
+        // Destructure self into disjoint field borrows so we can
+        // hold &mut record_scratch (for the seal) and &mut tcp
+        // (for the send) at the same time without the borrow
+        // checker conflating them.
+        let Self { tcp, tls, record_scratch, .. } = self;
+        let scratch = record_scratch
+            .get_or_insert_with(|| alloc::vec![0u8; TLS_RECORD_LEN].into_boxed_slice());
+        let n = tls.seal_app_data(src, &mut scratch[..]).map_err(|_| ())?;
+        // SAFETY: `scratch` is owned by `self` and stays alive
+        // across the `tcp.send.await` (we hold `&mut self` for
+        // the whole function). No other task on this worker can
+        // acquire a reference to `self.record_scratch` — it's
+        // per-conn private. The wrapping IOBuf drops at function
+        // exit, ending the raw-pointer borrow.
         let mut ship = IOBufChain::new();
-        ship.push_back(scratch.into_iobuf(n));
-        self.tcp.send(&mut ship).await
+        let ptr = unsafe { core::ptr::NonNull::new_unchecked(scratch.as_mut_ptr()) };
+        ship.push_back(unsafe {
+            IOBuf::borrow(ptr, TLS_RECORD_LEN as u32, 0, n as u32)
+        });
+        tcp.send(&mut ship).await
     }
 }
 
@@ -607,138 +626,3 @@ impl uni_http::HttpStream for TlsStream {
     }
 }
 
-// ============================================================================
-// Per-worker TLS record scratch
-// ============================================================================
-//
-// `TlsStream::send` needs ~16 KiB of buffer to stage a wire-ready
-// TLS record across the `tcp.send.await` (TLS encrypts into the
-// buffer; TCP drains it to the wire). With one scratch per send
-// future, scaling to tens of thousands of concurrent TLS conns
-// would need 10K × 16 KiB = 160 MiB of inline scratch in the
-// per-conn pinned futures. Per-worker scratch instead bounds the
-// cost at `num_workers × TLS_RECORD_LEN` (a few dozen KiB).
-//
-// Aliasing safety on bare-metal: the runtime's
-// `async_try_send_chain` resolves synchronously — `tcp.send.await`
-// never yields, so no other task on the same worker can observe
-// the scratch in-use across an await. Single-task-per-worker plus
-// "the await isn't really an await" gives us free exclusion.
-//
-// On native, `tcp.send.await` CAN yield mid-writev under
-// backpressure; another task that wakes on the same worker would
-// alias the scratch. We sidestep this by heap-allocating per
-// record on native (developer-machine scale, not the 10K-conn
-// target) — `take_record_scratch` is cfg-gated.
-
-#[cfg(target_os = "none")]
-struct TlsScratch {
-    storage: core::cell::UnsafeCell<[u8; TLS_RECORD_LEN]>,
-}
-
-// SAFETY: cross-worker access is gated by WorkerLocal indexing;
-// only the owning worker can construct a pointer into the slot.
-#[cfg(target_os = "none")]
-unsafe impl Send for TlsScratch {}
-
-#[cfg(target_os = "none")]
-static TLS_SCRATCH: WorkerLocal<TlsScratch> = WorkerLocal::new();
-
-#[cfg(target_os = "none")]
-fn tls_scratch_init() {
-    TLS_SCRATCH.ensure_init(uni::num_workers(), |_| TlsScratch {
-        storage: core::cell::UnsafeCell::new([0u8; TLS_RECORD_LEN]),
-    });
-}
-
-#[cfg(not(target_os = "none"))]
-fn tls_scratch_init() {}
-
-/// Pre-init the per-worker TLS record scratch so the
-/// `num_workers × TLS_RECORD_LEN` allocation lands in
-/// HEAP_BASELINE rather than being charged to the first request
-/// as a leak-check delta. Called from `listen` before any traffic
-/// arrives. On native, no-op.
-fn tls_scratch_preinit() {
-    tls_scratch_init();
-}
-
-/// Per-worker TLS record scratch handle. Hands out the raw
-/// scratch bytes for the seal pass via [`Self::slot`], then
-/// converts to an `IOBuf` wrapping just the wire bytes (`[..n]`)
-/// via [`Self::into_iobuf`] for the post-seal `tcp.send.await`.
-///
-/// Two-stage shape rather than one IOBuf throughout: TLS seal
-/// writes `[hdr || ciphertext || type || tag]` starting at byte 0
-/// of its destination, so it doesn't actually want the IOBuf
-/// headroom/tailroom framing — just a flat `&mut [u8]`. Only the
-/// TCP layer below wants an IOBuf, and only for the post-seal
-/// wire-byte range.
-///
-/// Bare-metal contract: only one `RecordScratch` is live on a
-/// given worker at a time. `TlsStream::send_one_record` ensures
-/// this — it acquires, seals, ships via `tcp.send.await`
-/// (synchronous on bare-metal), and lets the wrapping IOBuf drop
-/// before the next acquire.
-#[cfg(target_os = "none")]
-struct RecordScratch {
-    ptr: NonNull<u8>,
-}
-
-#[cfg(target_os = "none")]
-impl RecordScratch {
-    fn slot(&mut self) -> &mut [u8] {
-        // SAFETY: per-worker storage; `CurrentWorker` is `!Send`
-        // so no other worker can produce a pointer into this slot.
-        // Within a worker, the acquire → seal → ship → drop
-        // pattern (with `tcp.send.await` resolving synchronously)
-        // keeps at most one borrow live at a time.
-        unsafe {
-            core::slice::from_raw_parts_mut(self.ptr.as_ptr(), TLS_RECORD_LEN)
-        }
-    }
-    fn into_iobuf(self, len: usize) -> IOBuf {
-        debug_assert!(len <= TLS_RECORD_LEN);
-        // SAFETY: same per-worker contract; the Borrowed IOBuf
-        // lives until `tcp.send.await` returns and the wrapping
-        // chain drops.
-        unsafe {
-            IOBuf::borrow(self.ptr, TLS_RECORD_LEN as u32, 0, len as u32)
-        }
-    }
-}
-
-#[cfg(target_os = "none")]
-fn take_record_scratch() -> RecordScratch {
-    let cc = CurrentWorker::enter();
-    tls_scratch_init();
-    let p = TLS_SCRATCH.with(&cc, |s| s.storage.get());
-    RecordScratch {
-        ptr: unsafe { NonNull::new_unchecked(p as *mut u8) },
-    }
-}
-
-#[cfg(not(target_os = "none"))]
-struct RecordScratch {
-    owned: Box<[u8]>,
-}
-
-#[cfg(not(target_os = "none"))]
-impl RecordScratch {
-    fn slot(&mut self) -> &mut [u8] {
-        &mut self.owned[..]
-    }
-    fn into_iobuf(self, len: usize) -> IOBuf {
-        debug_assert!(len <= self.owned.len());
-        let mut v = self.owned.into_vec();
-        v.truncate(len);
-        IOBuf::from(v)
-    }
-}
-
-#[cfg(not(target_os = "none"))]
-fn take_record_scratch() -> RecordScratch {
-    RecordScratch {
-        owned: alloc::vec![0u8; TLS_RECORD_LEN].into_boxed_slice(),
-    }
-}
