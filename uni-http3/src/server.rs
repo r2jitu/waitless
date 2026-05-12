@@ -342,12 +342,12 @@ impl FramingPool {
         // callback `Box::from_raw`'s the same range and either
         // pushes back to the pool or drops it.
         unsafe {
-            uni_http::IOBuf::from_external(
+            uni_http::IOBuf::wrap_owned(
                 base,
                 FRAMING_BUF_SIZE as u32,
                 0,
                 0,
-                Some(framing_pool_drop),
+                framing_pool_drop,
                 ctx,
             )
         }

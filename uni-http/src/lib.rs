@@ -204,15 +204,13 @@ fn try_carve_scratch(cap: usize) -> Option<IOBuf> {
         // so the buffer is free for the next handler that runs
         // on this worker.
         unsafe {
-            Some(IOBuf::from_external(
+            Some(IOBuf::borrow(
                 NonNull::new_unchecked(
                     s.storage.as_ptr().add(cursor) as *mut u8,
                 ),
                 cap as u32,
                 0,
                 0,
-                None,
-                core::ptr::null_mut(),
             ))
         }
     })
@@ -812,24 +810,20 @@ impl TlsStream {
             let mut tls_err = false;
             let submitted = self.tcp.try_send_tso(min_payload, |slot| {
                 let mut dst = unsafe {
-                    IOBuf::from_external(
+                    IOBuf::borrow(
                         NonNull::new_unchecked(slot.as_mut_ptr()),
                         slot.len() as u32,
                         TLS_HEADROOM as u32,
                         0,
-                        None,
-                        core::ptr::null_mut(),
                     )
                 };
                 let mut src = IOBufChain::new();
                 let borrowed = unsafe {
-                    IOBuf::from_external(
+                    IOBuf::borrow(
                         NonNull::new_unchecked(pt_ptr as *mut u8),
                         plaintext_len as u32,
                         0,
                         plaintext_len as u32,
-                        None,
-                        core::ptr::null_mut(),
                     )
                 };
                 src.push_back(borrowed);
@@ -949,13 +943,11 @@ fn take_record_iobuf() -> IOBuf {
     // drop, with `tcp.send.await` resolving synchronously) keeps
     // at most one borrow live at a time.
     unsafe {
-        IOBuf::from_external(
+        IOBuf::borrow(
             NonNull::new_unchecked(p as *mut u8),
             TLS_RECORD_LEN as u32,
             TLS_HEADROOM as u32,
             0,
-            None,
-            core::ptr::null_mut(),
         )
     }
 }
@@ -1031,13 +1023,11 @@ impl HttpStream for TlsStream {
                 // header into the headroom — leaving `dst.data()`
                 // pointing at the wire-ready record.
                 let mut dst = unsafe {
-                    IOBuf::from_external(
+                    IOBuf::borrow(
                         NonNull::new_unchecked(slot.as_mut_ptr()),
                         slot.len() as u32,
                         TLS_HEADROOM as u32,
                         0,
-                        None,
-                        core::ptr::null_mut(),
                     )
                 };
                 if self.tls.send_app_data_chain_to(src, &mut dst).is_err() {
@@ -1327,13 +1317,11 @@ async fn handle_conn<S, H>(
             //     storage is borrowed, not owned, so the IOBuf's
             //     drop should be a no-op for the array.
             let header = unsafe {
-                IOBuf::from_external(
+                IOBuf::borrow(
                     core::ptr::NonNull::new_unchecked(header_storage.as_mut_ptr()),
                     HEADER_BUF_SIZE as u32,
                     layer.headroom as u32,
                     0,
-                    None,
-                    core::ptr::null_mut(),
                 )
             };
             // SAFETY: the only IOBuf currently aliasing

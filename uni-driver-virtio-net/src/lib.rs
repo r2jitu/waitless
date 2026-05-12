@@ -2084,12 +2084,12 @@ fn poll_qp(qp: usize, callback: fn(uni_net_driver::IOBuf)) -> usize {
                 // Wrap the buffer as `IOBuf::External` and hand
                 // ownership to the consumer. `ctx = qp` so the
                 // drop callback knows where to re-arm.
-                let iobuf = uni_net_driver::IOBuf::from_external(
+                let iobuf = uni_net_driver::IOBuf::wrap_owned(
                     core::ptr::NonNull::new_unchecked(buf),
                     BUFFER_SIZE,
                     VIRTIO_NET_HDR_SIZE as u32,
                     frame_len as u32,
-                    Some(rx_drop_callback),
+                    rx_drop_callback,
                     qp as *mut (),
                 );
                 callback(iobuf);

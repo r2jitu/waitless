@@ -70,14 +70,23 @@ pub struct RxInbox {
     next_slot: AtomicUsize,
 }
 
-// SAFETY: same producer/consumer discipline as `RxInbox`. The
-// `IOBuf` payload is `Send` (heap variant: `Box<[u8]>`; static:
-// `&'static [u8]`; external: explicit `unsafe impl Send`) so
-// moving it across cores via the slot is sound. Producer publishes
-// the slot's `Some(iobuf)` write with `ready.push`'s release-tail
-// store; consumer's `ready.pop` acquire-load makes that write
-// visible before it `take()`s.
+// SAFETY: producer/consumer discipline of `RxInbox`. The payload
+// IOBufs reaching this inbox are produced by NIC RX
+// (`ExternalOwned` variant — has its own `unsafe impl Send`) or
+// `Heap` / `Static`, all of which are cross-core safe; the
+// `Borrowed` variant doesn't appear on this path (per-worker
+// scratch buffers stay on their owning worker). Producer
+// publishes the slot's `Some(iobuf)` write with `ready.push`'s
+// release-tail store; consumer's `ready.pop` acquire-load makes
+// that write visible before it `take()`s.
+//
+// The `unsafe impl Send` is explicit (not auto-derived) because
+// `IOBuf` is `!Send` at the type level — the `Borrowed` variant
+// carries a `NonNull<u8>` and `PhantomData<*const ()>`. The
+// override vouches for this specific inbox's contents not being
+// the `Borrowed` variant.
 unsafe impl Sync for RxInbox {}
+unsafe impl Send for RxInbox {}
 
 impl RxInbox {
     pub const fn new() -> Self {

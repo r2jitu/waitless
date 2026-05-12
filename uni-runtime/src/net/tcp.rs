@@ -215,13 +215,11 @@ impl TcpStream {
         // bytes are borrowed, not owned.
         let mut chain = uni_iobuf::IOBufChain::new();
         let iobuf = unsafe {
-            uni_iobuf::IOBuf::from_external(
+            uni_iobuf::IOBuf::borrow(
                 core::ptr::NonNull::new_unchecked(data.as_ptr() as *mut u8),
                 data.len() as u32,
                 0,
                 data.len() as u32,
-                None,
-                core::ptr::null_mut(),
             )
         };
         chain.push_back(iobuf);
