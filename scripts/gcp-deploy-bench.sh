@@ -225,11 +225,16 @@ echo "==> Syncing bench harness + loadgen to $KVM_NAME..."
 # Skip the heavy loadgen target/ directory (compiled artefacts).
 SYNC_FILES=("$SCRIPT_DIR/bench.py" "$SCRIPT_DIR/bench")
 TARBALL="/tmp/gcp-deploy-bench-sync.tar"
-## macOS tar emits PAX `LIBARCHIVE.xattr.com.apple.provenance`
-## headers GNU tar warns about on extract; setting COPYFILE_DISABLE
-## suppresses the metadata at archive time so the remote tar is
-## quiet.
-COPYFILE_DISABLE=1 tar --exclude='loadgen/target' \
+## macOS bsdtar archives `com.apple.provenance` Gatekeeper xattrs
+## as PAX `LIBARCHIVE.xattr.*` headers, which GNU tar on the
+## remote then warns about on every entry ("Ignoring unknown
+## extended header keyword …"). `COPYFILE_DISABLE` only
+## suppresses AppleDouble (`._foo`) resource forks, not xattrs —
+## `--no-xattrs` is what actually drops the headers at create
+## time. Belt-and-braces: keep both, since `COPYFILE_DISABLE` is
+## still doing useful work for resource forks.
+COPYFILE_DISABLE=1 tar --no-xattrs \
+    --exclude='loadgen/target' \
     --exclude='loadgen/Cargo.lock' \
     --exclude='__pycache__' \
     -C "$SCRIPT_DIR" -cf "$TARBALL" \
