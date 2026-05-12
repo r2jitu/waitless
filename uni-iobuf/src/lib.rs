@@ -63,6 +63,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
+use alloc::rc::Rc;
 use core::marker::PhantomData;
 
 // ============================================================================
@@ -219,6 +220,28 @@ enum Inner {
     /// into, e.g. AEAD tags).
     Heap {
         storage: Box<[u8]>,
+        offset: u32,
+        len: u32,
+    },
+    /// Refcount-shared heap storage. Produced by [`IOBuf::split_at`]:
+    /// the head and tail halves of a split point at the same
+    /// `Rc<[u8]>` with disjoint `[offset..offset+len]` windows. This
+    /// is the analogue of folly's shared `Storage`: copy-free
+    /// peeling of byte ranges off a chain, at the cost of an `Rc`
+    /// refcount per split.
+    ///
+    /// Mutation paths (`data_mut`, `prepend`, `append_slice`,
+    /// `extend_uninit`) call [`IOBuf::make_unique`] first to
+    /// guarantee writes only land in this IOBuf's storage — if the
+    /// refcount is 1 that's a no-op, otherwise the visible payload
+    /// is cloned into a fresh `Heap` so the original `Rc` peers
+    /// stay intact.
+    ///
+    /// `Rc` (not `Arc`) because `IOBuf` is `!Send` (driven by
+    /// `Inner::Borrowed`'s `PhantomData<*const ()>`), so non-atomic
+    /// refcounting is correct.
+    Shared {
+        storage: Rc<[u8]>,
         offset: u32,
         len: u32,
     },
@@ -506,6 +529,15 @@ impl IOBuf {
                 let l = *len as usize;
                 &storage[o..o + l]
             }
+            Inner::Shared {
+                storage,
+                offset,
+                len,
+            } => {
+                let o = *offset as usize;
+                let l = *len as usize;
+                &storage[o..o + l]
+            }
             Inner::Static { data } => data,
             Inner::ExternalOwned(e) => {
                 // SAFETY: base + offset is in-bounds by
@@ -539,6 +571,7 @@ impl IOBuf {
     pub fn len(&self) -> usize {
         match &self.inner {
             Inner::Heap { len, .. } => *len as usize,
+            Inner::Shared { len, .. } => *len as usize,
             Inner::Static { data } => data.len(),
             Inner::ExternalOwned(e) => e.len as usize,
             Inner::Borrowed { len, .. } => *len as usize,
@@ -557,6 +590,7 @@ impl IOBuf {
     pub fn headroom(&self) -> usize {
         match &self.inner {
             Inner::Heap { offset, .. } => *offset as usize,
+            Inner::Shared { offset, .. } => *offset as usize,
             Inner::Static { .. } => 0,
             Inner::ExternalOwned(e) => e.offset as usize,
             Inner::Borrowed { offset, .. } => *offset as usize,
@@ -569,6 +603,14 @@ impl IOBuf {
     pub fn tailroom(&self) -> usize {
         match &self.inner {
             Inner::Heap {
+                storage,
+                offset,
+                len,
+            } => {
+                let used = *offset as usize + *len as usize;
+                storage.len().saturating_sub(used)
+            }
+            Inner::Shared {
                 storage,
                 offset,
                 len,
@@ -596,8 +638,16 @@ impl IOBuf {
     /// Mutable access to the visible payload. Returns `None` for
     /// static borrows. Used by in-place crypto (ChaCha20-Poly1305
     /// seals into the source bytes).
+    ///
+    /// For `Shared`, this calls [`make_unique`](Self::make_unique)
+    /// first — if the refcount is > 1 the visible payload is cloned
+    /// into a fresh `Heap` so the mutation can't be observed by the
+    /// peer Rc holders.
     #[inline]
     pub fn data_mut(&mut self) -> Option<&mut [u8]> {
+        if matches!(self.inner, Inner::Shared { .. }) {
+            self.make_unique();
+        }
         match &mut self.inner {
             Inner::Heap {
                 storage,
@@ -607,6 +657,20 @@ impl IOBuf {
                 let o = *offset as usize;
                 let l = *len as usize;
                 Some(&mut storage[o..o + l])
+            }
+            Inner::Shared {
+                storage,
+                offset,
+                len,
+            } => {
+                let o = *offset as usize;
+                let l = *len as usize;
+                // SAFETY contract: `make_unique` above guarantees
+                // this Rc has strong=1, weak=0, so `get_mut`
+                // returns Some.
+                let slice = Rc::get_mut(storage)
+                    .expect("make_unique ensures unique Rc");
+                Some(&mut slice[o..o + l])
             }
             Inner::Static { .. } => None,
             Inner::ExternalOwned(e) => {
@@ -647,6 +711,14 @@ impl IOBuf {
     /// layers should choose buffer sizes with enough headroom for
     /// every layer below them — see `MAX_HEADER_RESERVE`.
     pub fn prepend(&mut self, data: &[u8]) -> Result<(), IOBufError> {
+        // Headroom check up-front so a no-op make_unique doesn't
+        // trigger a copy for a request the caller can't satisfy.
+        if matches!(self.inner, Inner::Shared { .. }) {
+            if data.len() > self.headroom() {
+                return Err(IOBufError::NoHeadroom);
+            }
+            self.make_unique();
+        }
         match &mut self.inner {
             Inner::Heap {
                 storage,
@@ -659,6 +731,21 @@ impl IOBuf {
                 }
                 let new_offset = *offset - n as u32;
                 let dst = &mut storage[new_offset as usize..*offset as usize];
+                dst.copy_from_slice(data);
+                *offset = new_offset;
+                *len += n as u32;
+                Ok(())
+            }
+            Inner::Shared {
+                storage,
+                offset,
+                len,
+            } => {
+                let n = data.len();
+                let new_offset = *offset - n as u32;
+                let slice = Rc::get_mut(storage)
+                    .expect("make_unique ensures unique Rc");
+                let dst = &mut slice[new_offset as usize..*offset as usize];
                 dst.copy_from_slice(data);
                 *offset = new_offset;
                 *len += n as u32;
@@ -712,6 +799,12 @@ impl IOBuf {
     /// Append `data` into the tailroom and grow the visible
     /// payload accordingly.
     pub fn append_slice(&mut self, data: &[u8]) -> Result<(), IOBufError> {
+        if matches!(self.inner, Inner::Shared { .. }) {
+            if data.len() > self.tailroom() {
+                return Err(IOBufError::NoTailroom);
+            }
+            self.make_unique();
+        }
         match &mut self.inner {
             Inner::Heap {
                 storage,
@@ -724,6 +817,19 @@ impl IOBuf {
                     return Err(IOBufError::NoTailroom);
                 }
                 storage[end..end + n].copy_from_slice(data);
+                *len += n as u32;
+                Ok(())
+            }
+            Inner::Shared {
+                storage,
+                offset,
+                len,
+            } => {
+                let end = *offset as usize + *len as usize;
+                let n = data.len();
+                let slice = Rc::get_mut(storage)
+                    .expect("make_unique ensures unique Rc");
+                slice[end..end + n].copy_from_slice(data);
                 *len += n as u32;
                 Ok(())
             }
@@ -778,6 +884,12 @@ impl IOBuf {
     /// caller advances the visible len, then writes the tag bytes
     /// directly into the returned slice.
     pub fn extend_uninit(&mut self, n: usize) -> Result<&mut [u8], IOBufError> {
+        if matches!(self.inner, Inner::Shared { .. }) {
+            if n > self.tailroom() {
+                return Err(IOBufError::NoTailroom);
+            }
+            self.make_unique();
+        }
         match &mut self.inner {
             Inner::Heap {
                 storage,
@@ -790,6 +902,17 @@ impl IOBuf {
                 }
                 *len += n as u32;
                 Ok(&mut storage[end..end + n])
+            }
+            Inner::Shared {
+                storage,
+                offset,
+                len,
+            } => {
+                let end = *offset as usize + *len as usize;
+                *len += n as u32;
+                let slice = Rc::get_mut(storage)
+                    .expect("make_unique ensures unique Rc");
+                Ok(&mut slice[end..end + n])
             }
             Inner::Static { .. } => Err(IOBufError::Immutable),
             Inner::ExternalOwned(e) => {
@@ -860,6 +983,17 @@ impl IOBuf {
                 *len -= n as u32;
                 Ok(())
             }
+            Inner::Shared { offset, len, .. } => {
+                // Bounds-only narrow: doesn't write into storage,
+                // so safe to do without `make_unique`. Peer Rc
+                // holders keep their own offset/len.
+                if n > *len as usize {
+                    return Err(IOBufError::OutOfBounds);
+                }
+                *offset += n as u32;
+                *len -= n as u32;
+                Ok(())
+            }
             Inner::Static { data } => {
                 if n > data.len() {
                     return Err(IOBufError::OutOfBounds);
@@ -918,6 +1052,18 @@ impl IOBuf {
                     storage[o..o + l].to_vec()
                 }
             }
+            Inner::Shared {
+                storage,
+                offset,
+                len,
+            } => {
+                // Always copy: even with refcount 1 the Rc header
+                // sits in front of the bytes, so we can't recover a
+                // `Vec<u8>` without a copy.
+                let o = offset as usize;
+                let l = len as usize;
+                storage[o..o + l].to_vec()
+            }
             Inner::Static { data } => data.to_vec(),
             Inner::ExternalOwned(e) => {
                 // SAFETY: same access semantics as `data()`.
@@ -964,6 +1110,7 @@ impl IOBuf {
     pub fn is_mutable(&self) -> bool {
         match self.inner {
             Inner::Heap { .. }
+            | Inner::Shared { .. }
             | Inner::ExternalOwned(_)
             | Inner::Borrowed { .. } => true,
             Inner::Static { .. } => false,
@@ -979,6 +1126,7 @@ impl IOBuf {
         match &self.inner {
             Inner::Static { data } => Some(data),
             Inner::Heap { .. }
+            | Inner::Shared { .. }
             | Inner::ExternalOwned(_)
             | Inner::Borrowed { .. } => None,
         }
@@ -1009,6 +1157,15 @@ impl IOBuf {
                 *len -= n as u32;
                 Ok(())
             }
+            Inner::Shared { len, .. } => {
+                // Bounds-only narrow: doesn't write into storage,
+                // so safe to do without `make_unique`.
+                if n > *len as usize {
+                    return Err(IOBufError::OutOfBounds);
+                }
+                *len -= n as u32;
+                Ok(())
+            }
             Inner::Static { data } => {
                 if n > data.len() {
                     return Err(IOBufError::OutOfBounds);
@@ -1031,6 +1188,121 @@ impl IOBuf {
                 Ok(())
             }
         }
+    }
+
+    /// Split this IOBuf into two halves at byte offset `n` within
+    /// the visible payload. `self` keeps `[0..n)`, the returned
+    /// IOBuf gets `[n..len)`. Used by [`IOBufChain::split_off`] to
+    /// peel a sub-range off a chain at TLS record boundaries
+    /// without copying the underlying bytes.
+    ///
+    /// Variant behavior:
+    ///   * `Heap`: promotes in place to `Shared`, then clones the
+    ///     `Rc` and returns the tail half. Both halves point at the
+    ///     same backing `Box<[u8]>` (now wrapped in an `Rc<[u8]>`)
+    ///     with disjoint offset/len windows.
+    ///   * `Shared`: clones the `Rc` and returns the tail half.
+    ///     Bumps the refcount; no byte copy.
+    ///   * `Static`: slices the `&'static [u8]` in place; returns
+    ///     a fresh `Static` over the tail. Zero allocation.
+    ///   * `ExternalOwned` / `Borrowed`: panics. The drop callback
+    ///     (ExternalOwned) is single-fire and tied to the whole
+    ///     region, so splitting would either double-drop or leak;
+    ///     the aliasing tracker (Borrowed) would refuse the second
+    ///     view over the same `[base, base+capacity)`. Neither shape
+    ///     is expected in app-side response bodies that reach the
+    ///     TLS slow path — the only sites that split today.
+    ///
+    /// Panics if `n > self.len()`.
+    pub fn split_at(&mut self, n: usize) -> IOBuf {
+        assert!(
+            n <= self.len(),
+            "split_at: n={} > len={}",
+            n,
+            self.len()
+        );
+        // Replace self.inner with a dummy so we can move the old
+        // inner out and destructure it. The dummy Inner::Static
+        // costs nothing to construct or drop.
+        let old = core::mem::replace(&mut self.inner, Inner::Static { data: &[] });
+        let (head_inner, tail_inner) = match old {
+            Inner::Heap { storage, offset, len } => {
+                // Promote the Box<[u8]> into an Rc<[u8]>; both
+                // halves share the same allocation from here on.
+                let shared: Rc<[u8]> = Rc::from(storage);
+                let head = Inner::Shared {
+                    storage: shared.clone(),
+                    offset,
+                    len: n as u32,
+                };
+                let tail = Inner::Shared {
+                    storage: shared,
+                    offset: offset + n as u32,
+                    len: len - n as u32,
+                };
+                (head, tail)
+            }
+            Inner::Shared { storage, offset, len } => {
+                let head = Inner::Shared {
+                    storage: storage.clone(),
+                    offset,
+                    len: n as u32,
+                };
+                let tail = Inner::Shared {
+                    storage,
+                    offset: offset + n as u32,
+                    len: len - n as u32,
+                };
+                (head, tail)
+            }
+            Inner::Static { data } => {
+                let (a, b) = data.split_at(n);
+                (Inner::Static { data: a }, Inner::Static { data: b })
+            }
+            Inner::ExternalOwned(_) | Inner::Borrowed { .. } => {
+                unimplemented!(
+                    "IOBuf::split_at on ExternalOwned/Borrowed: \
+                     single-fire drop callback / aliasing tracker \
+                     forbids dual views"
+                )
+            }
+        };
+        self.inner = head_inner;
+        IOBuf { inner: tail_inner }
+    }
+
+    /// Ensure this IOBuf has exclusive ownership of its storage.
+    /// For `Shared` with refcount > 1, clones the visible payload
+    /// into a fresh `Heap` (no headroom/tailroom) so subsequent
+    /// mutations can't be observed by peer `Rc` holders. For
+    /// `Shared` with refcount == 1, no-op (we're already unique).
+    /// For every other variant, no-op.
+    ///
+    /// The mutation entry points (`data_mut`, `prepend`,
+    /// `append_slice`, `extend_uninit`) call this on the `Shared`
+    /// arm to maintain the "writes go to my storage only"
+    /// invariant. The unique-refcount no-op is the fast path —
+    /// after a `split_at` whose peer half was already dropped, we
+    /// stay zero-copy.
+    pub fn make_unique(&mut self) {
+        let Inner::Shared { storage, offset, len } = &mut self.inner else {
+            return;
+        };
+        if Rc::strong_count(storage) == 1 && Rc::weak_count(storage) == 0 {
+            // We're already unique. No copy.
+            return;
+        }
+        // Refcount > 1 (or a Weak handle exists): clone the visible
+        // payload into a fresh Heap. Drops our Rc handle; the peer
+        // refcount drops by 1 atomically.
+        let o = *offset as usize;
+        let l = *len as usize;
+        let copy = storage[o..o + l].to_vec().into_boxed_slice();
+        self.inner = Inner::Heap {
+            storage: copy,
+            offset: 0,
+            len: l as u32,
+        };
     }
 }
 
@@ -1526,6 +1798,76 @@ impl IOBufChain {
             in_node_off: 0,
             consumed: 0,
         }
+    }
+
+    /// Split the chain at byte offset `n` across visible payloads.
+    /// `self` keeps the first `n` bytes; the returned chain holds
+    /// the remainder.
+    ///
+    /// At most one `IOBuf` is split — the part that straddles byte
+    /// `n` is `split_at`'d via [`IOBuf::split_at`], promoting any
+    /// `Heap` half to refcount-shared storage so no payload bytes
+    /// are copied. Parts before / after the straddler move whole.
+    /// When `n` lands exactly on a part boundary, no buf is split.
+    ///
+    /// `n >= self.total_len()` returns an empty tail (no-op).
+    /// `n == 0` returns the entire original chain as tail and leaves
+    /// `self` empty.
+    pub fn split_off(&mut self, n: usize) -> IOBufChain {
+        if n >= self.total_len {
+            return IOBufChain::new();
+        }
+        if n == 0 {
+            return core::mem::take(self);
+        }
+
+        // Find the straddler: walk parts front-to-back, summing
+        // visible-payload lengths until the next part would push
+        // the cumulative past `n`.
+        let mut acc = 0usize;
+        let mut straddler_idx = 0usize;
+        let mut split_at_in_part = 0usize;
+        for (i, part) in self.iter().enumerate() {
+            let part_len = part.len();
+            if acc + part_len > n {
+                straddler_idx = i;
+                split_at_in_part = n - acc;
+                break;
+            }
+            acc += part_len;
+        }
+
+        // Pop straddler and everything after off the back into a
+        // scratch Vec in reverse chain order, then push them into
+        // `tail` in chain order. `pop_back` is O(1) per part; total
+        // cost is O(part_count - straddler_idx).
+        let pop_count = self.part_count() - straddler_idx;
+        let mut popped: alloc::vec::Vec<IOBuf> =
+            alloc::vec::Vec::with_capacity(pop_count);
+        for _ in 0..pop_count {
+            popped.push(self.pop_back().expect("part_count consistent"));
+        }
+        // popped is back-to-front; reverse to get chain order.
+        popped.reverse();
+
+        let mut tail = IOBufChain::with_capacity(pop_count);
+        // First popped element is the straddler. If
+        // `split_at_in_part == 0`, the split is at a clean part
+        // boundary and the straddler moves wholesale to `tail`;
+        // otherwise we split it via IOBuf::split_at.
+        let mut iter = popped.into_iter();
+        let mut straddler = iter.next().expect("pop_count >= 1");
+        if split_at_in_part > 0 {
+            let straddler_tail = straddler.split_at(split_at_in_part);
+            self.push_back(straddler);
+            tail.push_back(straddler_tail);
+        } else {
+            tail.push_back(straddler);
+        }
+        for part in iter {
+            tail.push_back(part);
+        }
+        tail
     }
 }
 
@@ -2183,6 +2525,173 @@ mod tests {
         // First IOBuf dropped → tracker unregistered → fresh borrow
         // over the same region is valid.
         let _b2 = unsafe { IOBuf::borrow(base, 32, 0, 0) };
+    }
+
+    #[test]
+    fn split_at_promotes_heap_to_shared() {
+        // Heap IOBuf → split_at(n) → both halves Shared, pointing
+        // at the same Rc<[u8]>. Tail's first byte is `n` bytes
+        // past head's first byte in the shared storage.
+        let mut head = IOBuf::from(alloc::vec![1u8, 2, 3, 4, 5]);
+        let tail = head.split_at(2);
+        assert_eq!(head.data(), &[1, 2]);
+        assert_eq!(tail.data(), &[3, 4, 5]);
+        assert!(matches!(head.inner, Inner::Shared { .. }));
+        assert!(matches!(tail.inner, Inner::Shared { .. }));
+        // Same backing allocation — head's last byte's address is
+        // tail's first byte's address minus 1.
+        let head_ptr = head.data().as_ptr() as usize;
+        let tail_ptr = tail.data().as_ptr() as usize;
+        assert_eq!(tail_ptr, head_ptr + 2);
+    }
+
+    #[test]
+    fn split_at_static_slices_without_rc() {
+        let mut head = IOBuf::from_static(b"hello world");
+        let tail = head.split_at(6);
+        assert_eq!(head.data(), b"hello ");
+        assert_eq!(tail.data(), b"world");
+        assert!(head.is_static());
+        assert!(tail.is_static());
+    }
+
+    #[test]
+    fn split_at_shared_clones_rc() {
+        // Splitting a Shared IOBuf bumps the Rc refcount; both
+        // halves remain Shared with disjoint windows.
+        let mut a = IOBuf::from(alloc::vec![0u8; 16]);
+        let _b = a.split_at(8); // a, _b both Shared
+        let c = a.split_at(4); // a, c both Shared (further split)
+        assert_eq!(a.len(), 4);
+        assert_eq!(c.len(), 4);
+        assert!(matches!(a.inner, Inner::Shared { .. }));
+        assert!(matches!(c.inner, Inner::Shared { .. }));
+    }
+
+    #[test]
+    fn make_unique_unique_is_zero_copy() {
+        // Shared IOBuf with refcount 1 → make_unique is a no-op;
+        // the storage pointer is unchanged.
+        let mut buf = IOBuf::from(alloc::vec![1u8, 2, 3, 4, 5]);
+        let tail = buf.split_at(2);
+        drop(tail); // refcount drops to 1
+        let ptr_before = buf.data().as_ptr() as usize;
+        buf.make_unique();
+        let ptr_after = buf.data().as_ptr() as usize;
+        assert_eq!(
+            ptr_before, ptr_after,
+            "refcount-1 Shared must not copy"
+        );
+        assert!(matches!(buf.inner, Inner::Shared { .. }));
+    }
+
+    #[test]
+    fn make_unique_shared_copies() {
+        // Shared IOBuf with refcount 2 → make_unique on one half
+        // clones the visible payload into a fresh Heap. The other
+        // half is unaffected.
+        let mut a = IOBuf::from(alloc::vec![1u8, 2, 3, 4, 5]);
+        let b = a.split_at(2);
+        // a and b share the same Rc<[u8]>, refcount 2.
+        let a_ptr_before = a.data().as_ptr() as usize;
+        a.make_unique();
+        let a_ptr_after = a.data().as_ptr() as usize;
+        assert_ne!(
+            a_ptr_before, a_ptr_after,
+            "shared refcount > 1 must copy"
+        );
+        // After make_unique, `a` should be Heap, `b` still Shared
+        // (now with refcount 1).
+        assert!(matches!(a.inner, Inner::Heap { .. }));
+        assert!(matches!(b.inner, Inner::Shared { .. }));
+        // Data preserved on both sides.
+        assert_eq!(a.data(), &[1, 2]);
+        assert_eq!(b.data(), &[3, 4, 5]);
+    }
+
+    #[test]
+    fn shared_data_mut_after_split_isolates_halves() {
+        // End-to-end: split a Heap, mutate one half, observe the
+        // other is untouched. Exercises data_mut's implicit
+        // make_unique path.
+        let mut a = IOBuf::from(alloc::vec![1u8, 2, 3, 4, 5]);
+        let b = a.split_at(2);
+        for byte in a.data_mut().unwrap() {
+            *byte = 0;
+        }
+        assert_eq!(a.data(), &[0, 0]);
+        assert_eq!(b.data(), &[3, 4, 5]);
+    }
+
+    #[test]
+    fn chain_split_off_at_buf_boundary() {
+        // Split at a clean part boundary → no IOBuf split_at fires.
+        let mut c = IOBufChain::new();
+        c.push_back(IOBuf::from_static(b"hello"));
+        c.push_back(IOBuf::from_static(b"world"));
+        let tail = c.split_off(5);
+        assert_eq!(c.total_len(), 5);
+        assert_eq!(tail.total_len(), 5);
+        assert_eq!(c.part_count(), 1);
+        assert_eq!(tail.part_count(), 1);
+        // Both halves are Static — split_at on Static slices, but
+        // here split_off should have moved the whole second part to
+        // tail with no per-buf split.
+        let mut out = [0u8; 16];
+        let n = c.cursor().read(&mut out);
+        assert_eq!(&out[..n], b"hello");
+        let n = tail.cursor().read(&mut out);
+        assert_eq!(&out[..n], b"world");
+    }
+
+    #[test]
+    fn chain_split_off_mid_buf() {
+        // Split inside a buf → exactly one split_at fires.
+        let mut c = IOBufChain::new();
+        c.push_back(IOBuf::from_static(b"hello"));
+        c.push_back(IOBuf::from_static(b"world"));
+        let tail = c.split_off(3);
+        assert_eq!(c.total_len(), 3);
+        assert_eq!(tail.total_len(), 7);
+        let mut out = [0u8; 16];
+        let n = c.cursor().read(&mut out);
+        assert_eq!(&out[..n], b"hel");
+        let n = tail.cursor().read(&mut out);
+        assert_eq!(&out[..n], b"loworld");
+    }
+
+    #[test]
+    fn chain_split_off_heap_promotes_to_shared() {
+        // Splitting inside a Heap part promotes both halves to
+        // Shared with the same backing Rc<[u8]>.
+        let mut c = IOBufChain::new();
+        c.push_back(IOBuf::from(alloc::vec![1u8, 2, 3, 4, 5, 6, 7, 8]));
+        let tail = c.split_off(3);
+        let mut head_out = [0u8; 16];
+        let n = c.cursor().read(&mut head_out);
+        assert_eq!(&head_out[..n], &[1, 2, 3]);
+        let mut tail_out = [0u8; 16];
+        let n = tail.cursor().read(&mut tail_out);
+        assert_eq!(&tail_out[..n], &[4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn chain_split_off_past_end_is_noop() {
+        let mut c = IOBufChain::new();
+        c.push_back(IOBuf::from_static(b"hello"));
+        let tail = c.split_off(100);
+        assert!(tail.is_empty());
+        assert_eq!(c.total_len(), 5);
+    }
+
+    #[test]
+    fn chain_split_off_zero_takes_everything() {
+        let mut c = IOBufChain::new();
+        c.push_back(IOBuf::from_static(b"hello"));
+        c.push_back(IOBuf::from_static(b"world"));
+        let tail = c.split_off(0);
+        assert!(c.is_empty());
+        assert_eq!(tail.total_len(), 10);
     }
 
     #[test]
