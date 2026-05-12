@@ -773,7 +773,82 @@ impl TlsStream {
     /// `TLS_HEADROOM` of headroom and `TLS_TAILROOM` of tailroom
     /// reserved) and ship the wire-ready record to TCP. `Err(())`
     /// is fatal — caller drops the conn.
+    ///
+    /// Two paths:
+    ///
+    ///   * **TSO direct-encrypt**: when the TX big-pool has a free
+    ///     slot, encrypt `record`'s plaintext directly into the
+    ///     slot via the `seal-while-copying` chain-to primitive.
+    ///     One pass through memory: scratch plaintext → TX-slot
+    ///     ciphertext. Skips the scratch-encrypt-in-place +
+    ///     scratch-to-TX-slot memcpy that the fallback path would
+    ///     do. Same TSO direct-encrypt path the single-record fast
+    ///     path uses for ≤16 KB bodies; extending it here means
+    ///     multi-record bodies (`/static-256k`, `/static-1m`) get
+    ///     it per record.
+    ///   * **Scratch + tcp.send fallback**: TX big-pool full / TSO
+    ///     not negotiated / dst MAC unresolved → seal `record`
+    ///     in-place and ship via the chain-based TCP send, which
+    ///     itself TSO's the 16 KB record into MSS-sized segments
+    ///     internally.
+    ///
+    /// Both paths exit with the wire bytes on (or queued for) the
+    /// wire and `record` consumed.
     async fn flush_record(&mut self, mut record: IOBuf) -> Result<(), ()> {
+        let plaintext_len = record.len();
+        if plaintext_len > 0 {
+            // The resulting TLS 1.3 record is `plaintext + 22 B`
+            // (5 hdr + 16 AEAD tag + 1 inner content type). The
+            // TCP layer gates TSO on this vs MSS so sub-MSS sends
+            // bypass the TSO descriptor path (which gve silently
+            // drops at <= MSS).
+            const TLS13_RECORD_OVERHEAD: usize = 5 + 16 + 1;
+            let min_payload = plaintext_len + TLS13_RECORD_OVERHEAD;
+            // SAFETY: `record` outlives the synchronous closure.
+            // `as_ptr` returns a pointer to the plaintext slice;
+            // the borrowed IOBuf wrapping it lives only inside the
+            // closure scope.
+            let pt_ptr = record.data().as_ptr();
+            let mut tls_err = false;
+            let submitted = self.tcp.try_send_tso(min_payload, |slot| {
+                let mut dst = unsafe {
+                    IOBuf::from_external(
+                        NonNull::new_unchecked(slot.as_mut_ptr()),
+                        slot.len() as u32,
+                        TLS_HEADROOM as u32,
+                        0,
+                        None,
+                        core::ptr::null_mut(),
+                    )
+                };
+                let mut src = IOBufChain::new();
+                let borrowed = unsafe {
+                    IOBuf::from_external(
+                        NonNull::new_unchecked(pt_ptr as *mut u8),
+                        plaintext_len as u32,
+                        0,
+                        plaintext_len as u32,
+                        None,
+                        core::ptr::null_mut(),
+                    )
+                };
+                src.push_back(borrowed);
+                if self.tls.send_app_data_chain_to(&src, &mut dst).is_err() {
+                    tls_err = true;
+                    return 0;
+                }
+                dst.len()
+            });
+            if tls_err {
+                return Err(());
+            }
+            if submitted.is_some() {
+                return Ok(());
+            }
+            // TSO direct-encrypt unavailable — fall through to the
+            // seal-in-place + tcp.send chain path.
+        }
+
         self.tls.send_app_data_iobuf(&mut record).map_err(|_| ())?;
         // Local chain is alloc-free (IOBufChain has 8-slot inline
         // storage; one part fits inline).
