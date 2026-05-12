@@ -94,10 +94,12 @@ dependencies = [
 name = "crates-bridge"
 version = "0.0.0"
 dependencies = [
+ "aes",
  "aes-gcm",
  "bitflags",
  "fdt",
  "getrandom",
+ "ghash",
  "hkdf",
  "hmac",
  "limine",

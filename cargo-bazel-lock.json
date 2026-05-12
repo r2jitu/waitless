@@ -1,5 +1,5 @@
 {
-  "checksum": "b71c26a42a7ce4fa0a24d0a618bb69bb1c77b7a701248f0a34fe11b1e43f2f22",
+  "checksum": "3660de8e2f43bf8b987acfea5399a8192e0d673d150e56022f929301093a1d33",
   "crates": {
     "aead 0.5.2": {
       "name": "aead",
@@ -571,6 +571,10 @@
         "deps": {
           "common": [
             {
+              "id": "aes 0.8.4",
+              "target": "aes"
+            },
+            {
               "id": "aes-gcm 0.10.3",
               "target": "aes_gcm"
             },
@@ -585,6 +589,10 @@
             {
               "id": "getrandom 0.2.17",
               "target": "getrandom"
+            },
+            {
+              "id": "ghash 0.5.1",
+              "target": "ghash"
             },
             {
               "id": "hkdf 0.12.4",
@@ -3403,10 +3411,12 @@
     ]
   },
   "direct_deps": [
+    "aes 0.8.4",
     "aes-gcm 0.10.3",
     "bitflags 2.11.0",
     "fdt 0.1.5",
     "getrandom 0.2.17",
+    "ghash 0.5.1",
     "hkdf 0.12.4",
     "hmac 0.12.1",
     "libc 0.2.185",

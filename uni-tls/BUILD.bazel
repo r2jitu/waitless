@@ -25,6 +25,7 @@ rust_library(
         "src/lib.rs",
         # Sans-io TLS primitives (formerly //net:tls{,_crypto,_handshake,_record})
         "src/aead.rs",
+        "src/aes_gcm_fast.rs",
         "src/handshake.rs",
         "src/record.rs",
         "src/schedule.rs",
@@ -72,7 +73,9 @@ rust_library(
         "//uni-http",
         "//uni-iobuf",
         "//uni-worker",
+        "@crates//:aes",
         "@crates//:aes-gcm",
+        "@crates//:ghash",
         "@crates//:getrandom",
         "@crates//:hkdf",
         "@crates//:hmac",
