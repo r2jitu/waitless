@@ -66,7 +66,7 @@ use uni_worker::{CurrentWorker, WorkerLocal};
 ///    pages are sync `match` dispatches with no `.await`).
 /// 2. By the time `TlsStream::send` first awaits, the handler's
 ///    IOBufs from `body_scratch` have already been read and
-///    encrypted into the TLS scratch — `send_app_data_chain_to`
+///    encrypted into the TLS scratch — `seal_app_data`
 ///    pops parts off the front of the chain as it consumes their
 ///    plaintext, dropping each IOBuf in turn. So no IOBuf still
 ///    references `body_scratch` when the worker yields.
@@ -233,7 +233,7 @@ fn try_carve_scratch(cap: usize) -> Option<IOBuf> {
 /// 2. By the time `TlsStream::send` first awaits (or any other
 ///    transport TX path yields), the handler's IOBufs have
 ///    already been consumed by the TLS seal —
-///    `send_app_data_chain_to` pops each part off the front of
+///    `seal_app_data` pops each part off the front of
 ///    the chain as it drains its plaintext, so no IOBuf backed
 ///    by `body_scratch` lives across an `.await`.
 /// 3. While the worker is yielded, no other handler runs on the
@@ -285,7 +285,7 @@ pub trait Tls: Send + Sync + 'static {
 /// Per-connection TLS state. `push_rx` / `pop_tx` move ciphertext
 /// bytes; `pop_plaintext` returns decrypted app data; `advance`
 /// runs the state machine after `push_rx`. App-data sends go
-/// through `send_app_data_chain_to`, which writes the wire-ready
+/// through `seal_app_data`, which writes the wire-ready
 /// record into a caller-provided byte slice (bypassing the TLS
 /// layer's internal `tx_buf`).
 pub trait TlsConn: Send + 'static {
@@ -306,7 +306,7 @@ pub trait TlsConn: Send + 'static {
     /// (max 16406 for a full record). Returns the wire-byte
     /// count written to `dst[..n]`. Callers ship multi-record
     /// bodies by looping `while !src.is_empty()`.
-    fn send_app_data_chain_to(
+    fn seal_app_data(
         &mut self,
         src_chain: &mut uni_iobuf::IOBufChain,
         dst: &mut [u8],
@@ -780,7 +780,7 @@ impl TlsStream {
             src.total_len().min(PLAINTEXT_CHUNK) + TLS13_RECORD_OVERHEAD;
         let mut tls_err = false;
         let submitted = self.tcp.try_send_tso(min_payload, |slot| {
-            match self.tls.send_app_data_chain_to(src, slot) {
+            match self.tls.seal_app_data(src, slot) {
                 Ok(n) => n,
                 Err(_) => {
                     tls_err = true;
@@ -799,7 +799,7 @@ impl TlsStream {
         let mut scratch = take_record_scratch();
         let n = self
             .tls
-            .send_app_data_chain_to(src, scratch.slot())
+            .seal_app_data(src, scratch.slot())
             .map_err(|_| ())?;
         let mut ship = IOBufChain::new();
         ship.push_back(scratch.into_iobuf(n));
@@ -820,7 +820,7 @@ const PLAINTEXT_CHUNK: usize = 16384;
 
 /// Total bytes in one TLS record envelope + max plaintext.
 /// Sized for the worker scratch and the wire-bytes capacity
-/// `send_app_data_chain_to` writes into.
+/// `seal_app_data` writes into.
 const TLS_RECORD_LEN: usize = TLS_HEADROOM + PLAINTEXT_CHUNK + TLS_TAILROOM;
 
 // ---- Per-worker TLS record scratch -----------------------------------------

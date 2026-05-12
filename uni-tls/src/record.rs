@@ -303,7 +303,7 @@ pub fn seal(
 /// wire-ready record occupies `dst[..n]`.
 ///
 /// `traffic_key.seq` advances by one on success.
-pub fn seal_chain_to(
+pub fn seal_chain(
     traffic_key: &mut tls::TrafficKey,
     inner_type: u8,
     src_chain: &mut uni_iobuf::IOBufChain,
@@ -630,13 +630,13 @@ mod tests {
         assert_eq!(consumed, n);
     }
 
-    /// `seal_chain_to` produces wire bytes that round-trip
+    /// `seal_chain` produces wire bytes that round-trip
     /// cleanly through `open`, including the multi-part AES-GCM
     /// 16-byte block-straddle path through GHASH. After the call
     /// `src_chain` is drained (the entire plaintext fit in one
     /// record).
     #[test]
-    fn seal_chain_to_roundtrip() {
+    fn seal_chain_roundtrip() {
         let secret = [0xa5u8; 32];
         let mut sender = tls::TrafficKey::from_secret(&secret);
         let mut receiver = tls::TrafficKey::from_secret(&secret);
@@ -662,7 +662,7 @@ mod tests {
         // dst sized for: 5 B header + plaintext + 1 B type + 16 B tag.
         let mut dst = alloc::vec![0u8; HEADER_LEN + plaintext_len + 1 + TAG_LEN];
 
-        let n = seal_chain_to(
+        let n = seal_chain(
             &mut sender,
             content_type::APPLICATION_DATA,
             &mut src_chain,
@@ -685,11 +685,11 @@ mod tests {
     }
 
     /// When `src_chain` carries more than one record's worth of
-    /// plaintext, a single `seal_chain_to` call consumes exactly
+    /// plaintext, a single `seal_chain` call consumes exactly
     /// `MAX_INNER_PLAINTEXT - 1` bytes (= 16384) and leaves the
     /// rest for the next call.
     #[test]
-    fn seal_chain_to_caps_at_one_record() {
+    fn seal_chain_caps_at_one_record() {
         let secret = [0x42u8; 32];
         let mut sender = tls::TrafficKey::from_secret(&secret);
         let mut receiver = tls::TrafficKey::from_secret(&secret);
@@ -711,7 +711,7 @@ mod tests {
 
         let mut dst = alloc::vec![0u8; HEADER_LEN + MAX_INNER_PLAINTEXT + TAG_LEN];
 
-        let n1 = seal_chain_to(
+        let n1 = seal_chain(
             &mut sender,
             content_type::APPLICATION_DATA,
             &mut src_chain,
@@ -730,7 +730,7 @@ mod tests {
         assert_eq!(decrypted1, &expected[..max_plaintext]);
 
         // Second call drains the rest.
-        let n2 = seal_chain_to(
+        let n2 = seal_chain(
             &mut sender,
             content_type::APPLICATION_DATA,
             &mut src_chain,

@@ -59,7 +59,7 @@ pub const RX_BUF_LEN: usize = 4 * 1024;
 /// A typical self-signed ECDSA P-256 dev cert is ~550 bytes so the
 /// flight fits in ~1.5 KB; 4 KB is generous room.
 ///
-/// Application data bypasses `tx_buf` entirely — `send_app_data_chain_to`
+/// Application data bypasses `tx_buf` entirely — `seal_app_data`
 /// writes the wire-ready record directly into the caller's destination
 /// slice. So this constant only has to scale to handshake messages,
 /// not to MAX_INNER_PLAINTEXT.
@@ -541,7 +541,7 @@ impl TlsServer {
     /// (TX-slot in the fast-fast path, worker scratch in the
     /// fallback). The TLS layer's `TlsStream::send_one_record`
     /// loops this until the chain is drained.
-    pub fn send_app_data_chain_to(
+    pub fn seal_app_data(
         &mut self,
         src_chain: &mut uni_iobuf::IOBufChain,
         dst: &mut [u8],
@@ -553,7 +553,7 @@ impl TlsServer {
             .server_ap_tk
             .as_mut()
             .ok_or(HandshakeError::Internal)?;
-        record::seal_chain_to(
+        record::seal_chain(
             tk,
             content_type::APPLICATION_DATA,
             src_chain,

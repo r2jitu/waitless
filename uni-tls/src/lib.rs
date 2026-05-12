@@ -394,12 +394,12 @@ impl uni_http::TlsConn for PooledTlsConn {
         self.inner.tls.pop_plaintext(out)
     }
 
-    fn send_app_data_chain_to(
+    fn seal_app_data(
         &mut self,
         src_chain: &mut uni_iobuf::IOBufChain,
         dst: &mut [u8],
     ) -> Result<usize, ()> {
-        self.inner.tls.send_app_data_chain_to(src_chain, dst).map_err(|_| ())
+        self.inner.tls.seal_app_data(src_chain, dst).map_err(|_| ())
     }
 
     fn close_notify(&mut self) -> Result<(), ()> {
