@@ -400,6 +400,11 @@ class RemoteEnv:
 
     name = "remote"
     label = "Remote"
+    # Signals to the bench-harness loop that the "==> Building …"
+    # print + `build()` call is a no-op for this env (the binary
+    # is already running on a different VM). Other envs leave this
+    # at the default of `True`.
+    needs_build = False
 
     # Matches KvmEnv so `isinstance` branches that dispatch on
     # "has GUEST_IP/PORT" pick up the same values. Override GUEST_IP

@@ -76,6 +76,40 @@ def fetch_total_allocs(port, host="localhost", https=False):
         return None
 
 
+def fetch_tls_encrypt_stats(port, host="localhost", https=False):
+    """GET `/stats` and return `(tls_encrypt_bytes, tls_encrypt_cycles)`
+    — the TSC-cycle and byte totals the server has accumulated in the
+    TLS record-layer seal path since boot. Returns `None` on any
+    failure or when both values are zero (counter not wired in this
+    build).
+
+    Snapshotting before + after a bench run and computing
+    `(d_cycles) / (d_bytes)` yields cycles-per-byte for the TLS
+    encrypt hot path — independent of client-side wrk/wait time, so
+    it's a clean signal of where the per-record AEAD cost sits.
+    """
+    import json
+    scheme = "https" if https else "http"
+    url = f"{scheme}://{host}:{port}/stats"
+    try:
+        flags = ["-sf", "--max-time", "3"]
+        if https:
+            flags.append("-k")
+        r = subprocess.run(
+            ["curl", *flags, url],
+            capture_output=True, timeout=5)
+        if r.returncode != 0:
+            return None
+        data = json.loads(r.stdout)
+        b = int(data.get("tls_encrypt_bytes", 0))
+        c = int(data.get("tls_encrypt_cycles", 0))
+        if b == 0 and c == 0:
+            return None
+        return (b, c)
+    except Exception:
+        return None
+
+
 def run_wrk(port, endpoint, threads, conns, duration, host="localhost"):
     # Hard-cap wrk's per-request timeout at 5 s so a stuck server can't
     # peg latency at the wrk default of 2 s and still appear "running"

@@ -90,6 +90,32 @@ def _alloc_tag(allocs_before, allocs_after, iterations):
     per_iter = delta / iterations
     return f"  allocs/iter={per_iter:.2f}"
 
+
+def _cycles_per_byte_tag(stats_before, stats_after):
+    """Format the TLS-encrypt cycles-per-byte derived from `/stats`
+    `tls_encrypt_bytes` + `tls_encrypt_cycles` snapshots. Returns
+    an empty string when sampling failed or the delta is too small
+    for a stable ratio.
+
+    Independent of wrk-side throughput: this is server-side TSC
+    cycles spent in the seal hot path divided by record-layer
+    bytes encrypted, so it isolates AEAD cost from network/RTT.
+    Useful to confirm whether a GHASH / AES-CTR optimisation
+    actually landed at the cycle level (vs only moving wall-clock).
+    """
+    if stats_before is None or stats_after is None:
+        return ""
+    db = stats_after[0] - stats_before[0]
+    dc = stats_after[1] - stats_before[1]
+    if db <= 0 or dc <= 0:
+        return ""
+    # Below ~1 MiB sampled the cycle counter is noisy (record-layer
+    # fixed cost dominates over inner-loop AES+GHASH).
+    if db < (1 << 20):
+        return ""
+    return f"  cy/B={dc / db:.2f}"
+
+
 from .envs import (
     ENV_MAP,
     HvfEnv,
@@ -101,6 +127,7 @@ from .envs import (
 )
 from .workloads import (
     _udp_with_retry,
+    fetch_tls_encrypt_stats,
     fetch_total_allocs,
     next_port,
     run_loadgen_gateway,
@@ -433,8 +460,12 @@ def main():
       for env_name, env in envs.items():
         _current["env"] = env
         # Rebuild before each environment group (bazel-bin is shared).
-        print(f"\n==> Building {env.label}...")
-        env.build()
+        # RemoteEnv opts out via `needs_build = False` — its binary
+        # is already running on another VM, so the "==> Building …"
+        # print + `build()` call are pure noise.
+        if getattr(env, "needs_build", True):
+            print(f"\n==> Building {env.label}...")
+            env.build()
 
         for cpus in core_counts:
             if env_name in single_core_only and cpus > 1:
@@ -560,7 +591,19 @@ def main():
                 elif w["type"] == "https":
                     # wrk over https://. Self-signed dev cert is fine
                     # because wrk doesn't verify by default.
+                    #
+                    # Two server-side snapshots flank the run:
+                    #   * `/heap` → talc total_allocation_count for
+                    #     the per-request alloc-per-iter readout.
+                    #   * `/stats` → TLS-encrypt byte+cycle counters
+                    #     so we can compute cycles-per-byte of the
+                    #     server-side AEAD hot path directly (vs
+                    #     inferring it from wrk req/s × body size,
+                    #     which is muddied by RTT, TCP windowing,
+                    #     etc.).
                     allocs_before = fetch_total_allocs(
+                        tls_target_port, host=wrk_host, https=True)
+                    aead_before = fetch_tls_encrypt_stats(
                         tls_target_port, host=wrk_host, https=True)
                     with measure_client_cpu() as m:
                         rps, p50, p99 = run_wrk_https(
@@ -568,13 +611,16 @@ def main():
                             host=wrk_host)
                     allocs_after = fetch_total_allocs(
                         tls_target_port, host=wrk_host, https=True)
+                    aead_after = fetch_tls_encrypt_stats(
+                        tls_target_port, host=wrk_host, https=True)
                     results[(env_name, cpus, wname)] = (rps, p50, p99)
                     client_cpu[(env_name, cpus, wname)] = m["cores"]
                     alloc_tag = _alloc_tag(allocs_before, allocs_after,
                                            rps * duration)
+                    cyb_tag = _cycles_per_byte_tag(aead_before, aead_after)
                     print(f"    {wname:<20s} {rps:>10.0f} req/s  "
                           f"p50={p50}  p99={p99}  "
-                          f"{_cpu_tag(m['cores'])}{alloc_tag}")
+                          f"{_cpu_tag(m['cores'])}{alloc_tag}{cyb_tag}")
                 elif w["type"] == "tls_handshake":
                     # Connection-per-request: each iteration opens a
                     # fresh TCP socket, completes the full TLS 1.3
