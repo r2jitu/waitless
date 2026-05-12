@@ -767,85 +767,68 @@ impl TlsStream {
         }
     }
 
-    /// Seal `record` (whose visible payload is plaintext, with
-    /// `TLS_HEADROOM` of headroom and `TLS_TAILROOM` of tailroom
-    /// reserved) and ship the wire-ready record to TCP. `Err(())`
-    /// is fatal — caller drops the conn.
+    /// Ship `src` (whose total plaintext length must be
+    /// ≤ `PLAINTEXT_CHUNK`) as one TLS 1.3 application_data record.
+    /// `Err(())` is fatal — caller drops the conn.
     ///
-    /// Two paths:
+    /// Two paths, both single-pass:
     ///
     ///   * **TSO direct-encrypt**: when the TX big-pool has a free
-    ///     slot, encrypt `record`'s plaintext directly into the
-    ///     slot via the `seal-while-copying` chain-to primitive.
-    ///     One pass through memory: scratch plaintext → TX-slot
-    ///     ciphertext. Skips the scratch-encrypt-in-place +
-    ///     scratch-to-TX-slot memcpy that the fallback path would
-    ///     do. Same TSO direct-encrypt path the single-record fast
-    ///     path uses for ≤16 KB bodies; extending it here means
-    ///     multi-record bodies (`/static-256k`, `/static-1m`) get
-    ///     it per record.
-    ///   * **Scratch + tcp.send fallback**: TX big-pool full / TSO
-    ///     not negotiated / dst MAC unresolved → seal `record`
-    ///     in-place and ship via the chain-based TCP send, which
-    ///     itself TSO's the 16 KB record into MSS-sized segments
-    ///     internally.
+    ///     slot, run the fused chain-to seal primitive straight
+    ///     into the slot. Walks the plaintext chain, ciphertext
+    ///     lands in the TX descriptor's payload region, no
+    ///     intermediate buffer anywhere on the data path.
+    ///   * **Worker-scratch + tcp.send fallback**: TX big-pool
+    ///     full / TSO not negotiated / dst MAC unresolved → seal
+    ///     while copying into the per-worker scratch, then ship
+    ///     via the chain-based TCP send (which TSO's the 16 KiB
+    ///     record into MSS-sized segments internally).
     ///
-    /// Both paths exit with the wire bytes on (or queued for) the
-    /// wire and `record` consumed.
-    async fn flush_record(&mut self, mut record: IOBuf) -> Result<(), ()> {
-        let plaintext_len = record.len();
-        if plaintext_len > 0 {
-            // The resulting TLS 1.3 record is `plaintext + 22 B`
-            // (5 hdr + 16 AEAD tag + 1 inner content type). The
-            // TCP layer gates TSO on this vs MSS so sub-MSS sends
-            // bypass the TSO descriptor path (which gve silently
-            // drops at <= MSS).
-            const TLS13_RECORD_OVERHEAD: usize = 5 + 16 + 1;
-            let min_payload = plaintext_len + TLS13_RECORD_OVERHEAD;
-            // SAFETY: `record` outlives the synchronous closure.
-            // `as_ptr` returns a pointer to the plaintext slice;
-            // the borrowed IOBuf wrapping it lives only inside the
-            // closure scope.
-            let pt_ptr = record.data().as_ptr();
-            let mut tls_err = false;
-            let submitted = self.tcp.try_send_tso(min_payload, |slot| {
-                let mut dst = unsafe {
-                    IOBuf::borrow(
-                        NonNull::new_unchecked(slot.as_mut_ptr()),
-                        slot.len() as u32,
-                        TLS_HEADROOM as u32,
-                        0,
-                    )
-                };
-                let mut src = IOBufChain::new();
-                let borrowed = unsafe {
-                    IOBuf::borrow(
-                        NonNull::new_unchecked(pt_ptr as *mut u8),
-                        plaintext_len as u32,
-                        0,
-                        plaintext_len as u32,
-                    )
-                };
-                src.push_back(borrowed);
-                if self.tls.send_app_data_chain_to(&src, &mut dst).is_err() {
-                    tls_err = true;
-                    return 0;
-                }
-                dst.len()
-            });
-            if tls_err {
-                return Err(());
-            }
-            if submitted.is_some() {
-                return Ok(());
-            }
-            // TSO direct-encrypt unavailable — fall through to the
-            // seal-in-place + tcp.send chain path.
+    /// Exit invariant: `src` is empty.
+    async fn send_one_record(&mut self, src: &mut IOBufChain) -> Result<(), ()> {
+        debug_assert!(src.total_len() <= PLAINTEXT_CHUNK);
+        if src.is_empty() {
+            return Ok(());
         }
 
-        self.tls.send_app_data_iobuf(&mut record).map_err(|_| ())?;
-        // Local chain is alloc-free (IOBufChain has 8-slot inline
-        // storage; one part fits inline).
+        // Fast-fast path: TSO direct-encrypt into a TX big-slot.
+        // The resulting TLS 1.3 record is `plaintext + 22 B`
+        // (5 hdr + 16 AEAD tag + 1 inner content type). The TCP
+        // layer gates TSO on `min_payload` vs MSS so sub-MSS sends
+        // bypass the TSO descriptor path (which gve silently
+        // drops at <= MSS).
+        const TLS13_RECORD_OVERHEAD: usize = 5 + 16 + 1;
+        let min_payload = src.total_len() + TLS13_RECORD_OVERHEAD;
+        let mut tls_err = false;
+        let submitted = self.tcp.try_send_tso(min_payload, |slot| {
+            let mut dst = unsafe {
+                IOBuf::borrow(
+                    NonNull::new_unchecked(slot.as_mut_ptr()),
+                    slot.len() as u32,
+                    TLS_HEADROOM as u32,
+                    0,
+                )
+            };
+            if self.tls.send_app_data_chain_to(src, &mut dst).is_err() {
+                tls_err = true;
+                return 0;
+            }
+            dst.len()
+        });
+        if tls_err {
+            return Err(());
+        }
+        if submitted.is_some() {
+            src.clear();
+            return Ok(());
+        }
+
+        // Fallback: worker-scratch seal-while-copying + tcp.send.
+        let mut record = take_record_iobuf();
+        self.tls
+            .send_app_data_chain_to(src, &mut record)
+            .map_err(|_| ())?;
+        src.clear();
         let mut ship = IOBufChain::new();
         ship.push_back(record);
         self.tcp.send(&mut ship).await
@@ -995,99 +978,20 @@ impl HttpStream for TlsStream {
             return Ok(());
         }
 
-        // Fast-fast path: encrypt directly into a driver TX-pool
-        // big-slot when the chain fits one TLS record AND TSO is
-        // negotiated. The fused chain-to primitive walks the
-        // plaintext chain and writes ciphertext bytes straight
-        // into the slot's payload region — no intermediate buffer
-        // anywhere on the data path. `try_send_tso` returns None
-        // when the big pool is full, TSO isn't negotiated, the
-        // conn isn't Established, or we're on native (no driver
-        // TX pool to write into); in any of those cases we fall
-        // through to the per-worker scratch path below.
-        if src.total_len() <= PLAINTEXT_CHUNK {
-            let mut tls_err = false;
-            // The resulting TLS 1.3 record is `plaintext + 22 B`
-            // (5 hdr + 16 AEAD tag + 1 inner content type). The
-            // TCP layer gates on this vs MSS so single-segment
-            // sends bypass the TSO descriptor path (which gve
-            // silently drops at <= MSS).
-            const TLS13_RECORD_OVERHEAD: usize = 5 + 16 + 1;
-            let min_payload = src.total_len() + TLS13_RECORD_OVERHEAD;
-            let submitted = self.tcp.try_send_tso(min_payload, |slot| {
-                // Wrap the slot's payload region as a transient
-                // IOBuf with TLS_HEADROOM (5 B) reserved for the
-                // record-header prepend. `seal_chain_to` writes
-                // ciphertext bytes into the slot in place, then
-                // appends the AEAD tag, then prepends the record
-                // header into the headroom — leaving `dst.data()`
-                // pointing at the wire-ready record.
-                let mut dst = unsafe {
-                    IOBuf::borrow(
-                        NonNull::new_unchecked(slot.as_mut_ptr()),
-                        slot.len() as u32,
-                        TLS_HEADROOM as u32,
-                        0,
-                    )
-                };
-                if self.tls.send_app_data_chain_to(src, &mut dst).is_err() {
-                    tls_err = true;
-                    return 0;
-                }
-                dst.len()
-            });
-            if tls_err {
-                return Err(());
-            }
-            if submitted.is_some() {
-                src.clear();
-                return Ok(());
-            }
-            // TSO direct-encrypt unavailable — fall through.
+        // Multi-record bodies (>16 KiB): peel off one record's
+        // worth at a time via `IOBufChain::split_off`, which
+        // promotes the straddling buf's `Box<[u8]>` to a refcount-
+        // shared `Rc<[u8]>` so neither half is copied. Each peeled
+        // chunk feeds `send_one_record`, which itself picks the
+        // fast-fast (TSO direct-encrypt) path when available — so
+        // multi-record bodies now skip the per-record memcpy into
+        // worker scratch that the old slow path paid.
+        while src.total_len() > PLAINTEXT_CHUNK {
+            let mut head = core::mem::take(src);
+            *src = head.split_off(PLAINTEXT_CHUNK);
+            self.send_one_record(&mut head).await?;
         }
-
-        // Fast path: chain fits in one record but TSO direct-
-        // encrypt wasn't available. Acquire the per-worker scratch
-        // (zero alloc on uncontended path) and run the fused
-        // chain-to primitive — single-pass encrypt-while-copying,
-        // same as the fast-fast path, landing in worker scratch.
-        // The IOBuf borrows the scratch across the `tcp.send.await`;
-        // its drop callback releases the scratch when `ship` drops
-        // post-send.
-        if src.total_len() <= PLAINTEXT_CHUNK {
-            let mut record = take_record_iobuf();
-            self.tls.send_app_data_chain_to(src, &mut record).map_err(|_| ())?;
-            src.clear();
-            let mut ship = IOBufChain::new();
-            ship.push_back(record);
-            return self.tcp.send(&mut ship).await;
-        }
-
-        // Slow path: chain spans more than one TLS record (>16 KiB).
-        // Walk the chain, packing plaintext into a record-shaped
-        // IOBuf, sealing in place per record. Rare for HTTPS
-        // bodies (the typical diagnostics page is ~9 KB → fast
-        // path; only chunked HTML over the cap reaches here).
-        // The per-worker scratch is reused across records: each
-        // `flush_record` ships and drops, releasing the scratch
-        // back to the worker so the next record reuses it.
-        let mut record: Option<IOBuf> = None;
-        while let Some(part) = src.pop_front() {
-            let mut bytes = part.data();
-            while !bytes.is_empty() {
-                let buf = record.get_or_insert_with(take_record_iobuf);
-                let take = (PLAINTEXT_CHUNK - buf.len()).min(bytes.len());
-                buf.append_slice(&bytes[..take]).map_err(|_| ())?;
-                bytes = &bytes[take..];
-                if buf.len() == PLAINTEXT_CHUNK {
-                    self.flush_record(record.take().unwrap()).await?;
-                }
-            }
-        }
-        if let Some(tail) = record {
-            self.flush_record(tail).await?;
-        }
-        Ok(())
+        self.send_one_record(src).await
     }
 
     fn layer_reserve(&self) -> uni_iobuf::LayerReserve {
