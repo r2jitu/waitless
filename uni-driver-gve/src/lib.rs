@@ -985,23 +985,28 @@ const _GVE_RX_PAD: u16 = 2;
 /// slot, `slot_idx ∈ 0..TX_SMALL_POOL_SLOTS`. QPL offset for slot
 /// `i` is `i * PAGE_SIZE`. Used by `send` / `acquire_tx_buf`.
 ///
-/// **Big pool** (TSO super-segments): four contiguous 4 KiB pages
-/// per slot, `slot_idx ∈ 0..TX_BIG_POOL_SLOTS`. QPL offset for
-/// big slot `i` is `TX_BIG_POOL_QPL_OFFSET + i * TX_BIG_SLOT_SIZE`.
-/// Used by `acquire_tx_tso_buf` / `submit_tx_tso`. Sized at 16 KiB
-/// to fit one ~10× MSS super-segment (10 × 1460 ≈ 14.3 KiB), which
-/// is the typical TCP send-burst size that justifies TSO.
+/// **Big pool** (TSO super-segments): **five** contiguous 4 KiB
+/// pages per slot, `slot_idx ∈ 0..TX_BIG_POOL_SLOTS`. QPL offset
+/// for big slot `i` is `TX_BIG_POOL_QPL_OFFSET +
+/// i * TX_BIG_SLOT_SIZE`. Used by `acquire_tx_tso_buf` /
+/// `submit_tx_tso`. Sized at 20 KiB to fit one max-size TLS-1.3
+/// record (16384 plaintext + 22 envelope = 16406 wire bytes) plus
+/// 54-74 bytes of Eth+IP+TCP/UDP headers, with safety headroom.
+/// The earlier 4-page (16 KiB) sizing was the same as the TLS
+/// plaintext cap, leaving no room for the L2/L3/L4 prefix — fine
+/// for `/diagnostics` (~9 KB body) but `OutputTooSmall` on any
+/// request whose record fills the cap (e.g. `/static-16k`).
 ///
-/// The 192 + 16×4 = 256 page total matches what we registered before
-/// the TSO split, so REGISTER_PAGE_LIST and CREATE_TX_QUEUE see no
-/// change. Linux's reference driver packs multiple packets per page
-/// via a FIFO; not worth that complexity when RAM is cheap. The 16
-/// big slots cap concurrent in-flight TSO super-segments per qp;
-/// per-MSS fallback covers any saturation.
-const TX_SMALL_POOL_SLOTS: u32 = 192;
+/// The 176 + 16×5 = 256 page total matches what we registered
+/// before, so REGISTER_PAGE_LIST and CREATE_TX_QUEUE see no
+/// change. Linux's reference driver packs multiple packets per
+/// page via a FIFO; not worth that complexity when RAM is cheap.
+/// The 16 big slots cap concurrent in-flight TSO super-segments
+/// per qp; per-MSS fallback covers any saturation.
+const TX_SMALL_POOL_SLOTS: u32 = 176;
 const TX_BIG_POOL_SLOTS: u32 = 16;
-const TX_BIG_SLOT_PAGES: u32 = 4;
-const TX_BIG_SLOT_SIZE: u32 = TX_BIG_SLOT_PAGES * PAGE_SIZE; // 16 KiB
+const TX_BIG_SLOT_PAGES: u32 = 5;
+const TX_BIG_SLOT_SIZE: u32 = TX_BIG_SLOT_PAGES * PAGE_SIZE; // 20 KiB
 const TX_BIG_POOL_QPL_OFFSET: u32 = TX_SMALL_POOL_SLOTS * PAGE_SIZE;
 const TX_QPL_PAGES: u32 = TX_SMALL_POOL_SLOTS + TX_BIG_POOL_SLOTS * TX_BIG_SLOT_PAGES;
 /// RX QPL size in pages. The reference driver allocates
