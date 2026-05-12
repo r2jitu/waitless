@@ -244,6 +244,26 @@ deploy() {
         echo "    (using gVNIC, queue-count=${qc})"
         nic_args="nic-type=GVNIC,queue-count=${qc}"
     fi
+    # Optional: spot/preemptible provisioning. Spot VMs draw from a
+    # separate capacity pool than standard on-demand, so when a zone
+    # reports "no resources" for the on-demand pool (`us-west1-a`
+    # has been a chronic offender for n2-highcpu-4 since this script
+    # was written), `UNIKERNEL_GCE_PREEMPTIBLE=1` can place the VM
+    # anyway. Trade-off: spot VMs can be reclaimed with 30 s notice
+    # at any time — fine for short bench runs and dev iteration,
+    # not for steady serving. `kvm-vm` is already spot for the same
+    # reason. The flag adds `--provisioning-model=SPOT` plus the
+    # required `--no-restart-on-failure` / `--maintenance-policy=
+    # TERMINATE` companions.
+    local preempt_args=()
+    if [[ "${UNIKERNEL_GCE_PREEMPTIBLE:-0}" == "1" ]]; then
+        echo "    (preemptible / SPOT provisioning)"
+        preempt_args=(
+            --provisioning-model=SPOT
+            --no-restart-on-failure
+            --maintenance-policy=TERMINATE
+        )
+    fi
     gcloud compute instances create "$NAME" \
         --zone="$ZONE" \
         --machine-type="$MACHINE_TYPE" \
@@ -252,6 +272,7 @@ deploy() {
         --network-interface="network=default,${nic_args}" \
         --tags=http-server \
         --metadata=serial-port-enable=TRUE \
+        "${preempt_args[@]}" \
         --project="$PROJECT" \
         --quiet
 
