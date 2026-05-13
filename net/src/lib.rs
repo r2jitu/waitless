@@ -317,14 +317,10 @@ fn poll_tier2(num_cores: u32) -> bool {
 ///
 /// `frame` is a borrow over driver-pool storage (Tier 1) or the
 /// owning core's inbox slot (Tier 2). It is only valid for this
-/// call.
-///
-/// Bridge: `tcp::tcp_receive` / `udp::udp_receive` still take owned
-/// `IOBuf`, so we heap-wrap the L4 segment. That regresses RX to
-/// the pre-88a3ccd wrap-alloc shape (one heap alloc per packet) —
-/// the follow-up commit changes the L4 entries to `&[u8]` and adds
-/// per-conn ring buffers, restoring (and beating) the previous
-/// allocs/iter profile.
+/// call: the L4 receive entries finish (copy payload into per-conn
+/// ring buffers / direct-copy slots, dispatch ARP/ICMP replies)
+/// synchronously before returning, so the borrow is released by
+/// the time the driver re-arms the underlying buffer.
 pub fn net_receive(frame: &[u8]) {
     let Some((src_mac, ethertype, payload)) = ethernet::ethernet_parse_full(frame) else {
         return;
@@ -354,7 +350,7 @@ pub fn net_receive(frame: &[u8]) {
     }
 }
 
-/// Tier 2 distributor decision — classify an IOBuf for distribution.
+/// Tier 2 distributor decision — classify a frame for distribution.
 /// Returns where the frame should go: inline on the polling core,
 /// distributed to a peer core, or dropped. Side effect: ARP-learns
 /// from on-subnet IPv4 senders so the polling core's ARP cache
