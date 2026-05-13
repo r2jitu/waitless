@@ -2605,20 +2605,13 @@ fn submit_tx_udp_gso(
 
 /// Public direct-fill TX entry — picks the calling worker's qp,
 /// scans for a free slot, returns a handle into the per-slot
-/// QPL page (GQI_QPL).
+/// QPL page (GQI_QPL only).
 ///
 /// On DQO_RDA returns `None` so callers fall through to the
-/// slice-shaped `send_on_qp_dqo` path. The DQO direct-fill
-/// implementation (`acquire_tx_buf_dqo_for_qp` /
-/// `submit_tx_inner_dqo`) is in place and applies all the
-/// spec-correct fixes derived from Linux's `gve_tx_dqo` (RE
-/// spaced ≥ 32 descriptors, DESC completion's `tx_head` drives
-/// `done_cnt`, `checksum_offload_enable` bit), but real-device
-/// validation on c3 still shows a stall under sustained
-/// parallel load even with these fixes — there's at least one
-/// more issue that needs on-host debugging (likely doorbell or
-/// completion-ring related) before we can ship DQO direct-fill.
-/// Tracked as a follow-up.
+/// slice-shaped `send_on_qp_dqo` path (one extra memcpy per
+/// frame). A DQO direct-fill landed once but always stalled on
+/// real c3 hardware under load, so it was removed; everything
+/// goes through `send_on_qp_dqo` until that's diagnosed.
 fn acquire_tx_buf() -> Option<uni_net_driver::TxBufHandle> {
     if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
         return None;
@@ -2631,19 +2624,15 @@ fn acquire_tx_buf() -> Option<uni_net_driver::TxBufHandle> {
 }
 
 /// Public submit — paired with [`acquire_tx_buf`]. Consumes the
-/// handle (slot returns to pool on device completion). `csum`
-/// is not yet wired through gve's descriptor — caller's stamped
-/// checksum is shipped verbatim today.
+/// handle (slot returns to pool on device completion). GQI_QPL
+/// only: callers never get a real handle in DQO mode (acquire
+/// returns None), so there's no DQO branch.
 fn submit_tx(
     handle: uni_net_driver::TxBufHandle,
     frame_len: usize,
     csum: uni_net_driver::CsumOffload,
 ) {
-    if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
-        submit_tx_inner_dqo(handle, frame_len, csum);
-    } else {
-        submit_tx_inner(handle, frame_len, csum);
-    }
+    submit_tx_inner(handle, frame_len, csum);
 }
 
 /// Public TSO acquire — picks the calling worker's qp and returns
@@ -2990,144 +2979,6 @@ fn send_on_qp_dqo(qp: usize, data: &[u8]) -> bool {
         tx.last_kicked.store(new_fill, Ordering::Relaxed);
     }
     true
-}
-
-/// DQO direct-fill: claim the next ring position (slot index ==
-/// `fill_cnt & mask`) and return a handle pointing at the
-/// matching bounce-buffer page. Spin-drains on full.
-///
-/// Unlike GQI's pool-decoupled allocator, DQO uses the
-/// slot==ring_idx convention — same shape as the legacy
-/// `send_on_qp_dqo` that this path replaces. The pool decoupling
-/// turned out not to work on real DQO devices: the completion
-/// descriptor's `compl_tag` field doesn't reliably round-trip
-/// through the device on every instance type, so we can't
-/// recover an arbitrary slot index at drain time. Sticking with
-/// slot==ring_idx means drain just needs to advance `done_cnt`;
-/// slot reuse is implicit (ring position cycles).
-///
-/// Contract: the caller must pair acquire+submit synchronously
-/// (one outstanding handle per worker). Dropping a handle
-/// without submitting is a no-op — the next acquire returns the
-/// same slot since `fill_cnt` didn't move.
-fn acquire_tx_buf_dqo_for_qp(qp: usize) -> Option<uni_net_driver::TxBufHandle> {
-    if qp >= MAX_QUEUE_PAIRS { return None; }
-    let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
-    if tx_ptr.is_null() { return None; }
-    let tx = unsafe { &*tx_ptr };
-
-    loop {
-        tx_drain_dqo(tx);
-        let fill = tx.fill_cnt.load(Ordering::Relaxed);
-        let done = tx.done_cnt.load(Ordering::Relaxed);
-        if fill.wrapping_sub(done) < tx.ring_entries as u32 {
-            let mask = (tx.ring_entries - 1) as u32;
-            let slot = (fill & mask) as usize;
-            let buf_offset = (slot as u32) * (RX_BUFFER_SIZE as u32);
-            let data_ptr = (tx.qpl_base_va + buf_offset as u64) as *mut u8;
-            return Some(uni_net_driver::TxBufHandle {
-                data_ptr,
-                data_cap: RX_BUFFER_SIZE as u32,
-                driver_token: encode_token(qp, slot, POOL_ID_SMALL),
-                release_fn: release_tx_slot_noop,
-            });
-        }
-        // Force any deferred kick so the device drains and produces
-        // completions; spin-drain.
-        let bar2_va = BAR2_VA.load(Ordering::Acquire);
-        if bar2_va != 0 {
-            let last = tx.last_kicked.load(Ordering::Relaxed);
-            if fill != last {
-                doorbell_write_le(bar2_va, tx.db_offset, fill);
-                tx.last_kicked.store(fill, Ordering::Relaxed);
-            }
-        }
-        compiler_fence(Ordering::SeqCst);
-    }
-}
-
-/// No-op release for the slot==ring_idx convention: dropping a
-/// handle without submit doesn't advance `fill_cnt`, so the same
-/// slot is returned by the next acquire. No bookkeeping needed.
-fn release_tx_slot_noop(_token: u64) {}
-
-/// DQO submit: build the gve_tx_pkt_desc_dqo at ring[slot]
-/// (slot==ring_idx convention from acquire), advance fill_cnt,
-/// (unless deferred) write doorbell.
-///
-/// gve_tx_pkt_desc_dqo (16 bytes, all LE):
-///   0..8   buf_addr (DMA address)
-///   8      dtype:5 | end_of_packet:1 | checksum_offload_enable:1 | report_event:1
-///   9      reserved
-///   10..12 reserved
-///   12..14 compl_tag (we use the slot index — informational)
-///   14..16 buf_size (low 14 bits)
-///
-/// `report_event` is gated to fire at most every
-/// `DQO_TX_RE_INTERVAL` (= 32) descriptors per the device's spec.
-/// `checksum_offload_enable` is set when the caller passed a
-/// non-NONE `CsumOffload` (caller stamped the pseudo-header
-/// partial sum at the L4 checksum field).
-fn submit_tx_inner_dqo(
-    handle: uni_net_driver::TxBufHandle,
-    frame_len: usize,
-    csum: uni_net_driver::CsumOffload,
-) {
-    let (qp, slot, _pool) = decode_token(handle.driver_token);
-    core::mem::forget(handle);
-    if qp >= MAX_QUEUE_PAIRS || slot >= TX_RING_ENTRIES as usize {
-        return;
-    }
-    if frame_len == 0 || frame_len > RX_BUFFER_SIZE as usize {
-        return;
-    }
-    let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
-    if tx_ptr.is_null() { return; }
-    let tx = unsafe { &*tx_ptr };
-    let bar2_va = BAR2_VA.load(Ordering::Acquire);
-
-    // slot == fill_cnt & mask by acquire's contract; use it
-    // directly as the ring position (and the QPL bounce-buffer
-    // index — they coincide).
-    let buf_offset = (slot as u32) * (RX_BUFFER_SIZE as u32);
-    let buf_phys = tx.qpl_base_phys + buf_offset as u64;
-
-    let fill_cnt = tx.fill_cnt.load(Ordering::Relaxed);
-    let last_re = tx.last_re_at_fill.load(Ordering::Relaxed);
-    let want_re = fill_cnt.wrapping_sub(last_re) >= DQO_TX_RE_INTERVAL;
-    let mut flags = DQO_TX_DTYPE_PKT | DQO_TX_FLAG_EOP;
-    if want_re {
-        flags |= DQO_TX_FLAG_REPORT_EVENT;
-        tx.last_re_at_fill.store(fill_cnt, Ordering::Relaxed);
-    }
-    if csum.is_some() {
-        flags |= DQO_TX_FLAG_CSUM;
-    }
-
-    let desc_ptr = (tx.ring_va as *mut u8).wrapping_add(slot * DQO_TX_DESC_SIZE);
-    let mut desc = [0u8; DQO_TX_DESC_SIZE];
-    desc[0..8].copy_from_slice(&buf_phys.to_le_bytes());
-    desc[8] = flags;
-    desc[12..14].copy_from_slice(&(slot as u16).to_le_bytes());
-    let size_word = (frame_len as u16) & 0x3FFF;
-    desc[14..16].copy_from_slice(&size_word.to_le_bytes());
-    unsafe { ptr::copy_nonoverlapping(desc.as_ptr(), desc_ptr, DQO_TX_DESC_SIZE); }
-
-    let new_fill = fill_cnt.wrapping_add(1);
-    tx.fill_cnt.store(new_fill, Ordering::Release);
-
-    let near_full = new_fill.wrapping_sub(tx.done_cnt.load(Ordering::Relaxed))
-        >= (tx.ring_entries as u32) - 16;
-    if !DEFERRED_KICK.load(Ordering::Relaxed) || near_full {
-        doorbell_write_le(bar2_va, tx.db_offset, new_fill);
-        tx.last_kicked.store(new_fill, Ordering::Relaxed);
-    }
-
-    // Per-qp TX packet count, same field as the GQI path.
-    if qp < TX_PACKETS_PER_QP.len() {
-        TX_PACKETS_PER_QP[qp].fetch_add(1, Ordering::Relaxed);
-        TX_BYTES_PER_QP[qp].fetch_add(frame_len as u64, Ordering::Relaxed);
-    }
 }
 
 /// Post buffers on this queue's buffer ring and kick the doorbell.
