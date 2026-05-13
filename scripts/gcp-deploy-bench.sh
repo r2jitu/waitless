@@ -72,7 +72,12 @@ KVM_ZONE="${GCP_KVM_VM_ZONE:-$UNI_ZONE}"
 #                              larger bodies is comparable.
 DEFAULT_WORKLOADS="health_max,health_tls_max,h3_health_max,diagnostics_tls_max,h3_diagnostics_max"
 DEFAULT_CORES="1,2,4"
-DEFAULT_DURATION="10"
+# 5 s per workload: long enough for steady-state numbers, short
+# enough that iterating on driver/runtime changes is bearable. A
+# full default-set bench is 5 workloads × 3 core counts × 5 s ≈
+# 75 s of actual bench time (plus deploy + bench-host setup).
+# Override with `--duration 10` for low-noise measurements.
+DEFAULT_DURATION="5"
 
 do_redeploy=1
 do_stop=1
