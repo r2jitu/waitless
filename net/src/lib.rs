@@ -311,23 +311,25 @@ fn poll_tier2(num_cores: u32) -> bool {
 /// Process a single received frame through the full stack inline
 /// (no cross-core distribution). Called from the Tier 1 per-core
 /// poll, the single-core fallback, and `net_drain_cb` (after the
-/// Tier 2 distributor pushed an IOBuf to this core's inbox).
+/// Tier 2 distributor copied frame bytes into this core's inbox).
 ///
-/// The IOBuf is consumed: for IPv4 / IPv6 TCP and UDP the
-/// ownership flows to the L4 inbox slot (zero-copy, IOBuf is
-/// narrowed in place so the receiver sees just the L4 segment);
-/// for ARP / ICMPv6 the dispatch reads `iobuf.data()` synchronously
-/// and the IOBuf drops at end-of-scope (returning its backing
-/// buffer to the driver's pool).
-pub fn net_receive(mut iobuf: uni_iobuf::IOBuf) {
-    let frame = iobuf.data();
+/// `frame` is a borrow over driver-pool storage (Tier 1) or the
+/// owning core's inbox slot (Tier 2). It is only valid for this
+/// call.
+///
+/// Bridge: `tcp::tcp_receive` / `udp::udp_receive` still take owned
+/// `IOBuf`, so we heap-wrap the L4 segment. That regresses RX to
+/// the pre-88a3ccd wrap-alloc shape (one heap alloc per packet) —
+/// the follow-up commit changes the L4 entries to `&[u8]` and adds
+/// per-conn ring buffers, restoring (and beating) the previous
+/// allocs/iter profile.
+pub fn net_receive(frame: &[u8]) {
     let Some((src_mac, ethertype, payload)) = ethernet::ethernet_parse_full(frame) else {
         return;
     };
     match ethertype {
         ethernet::ETHERTYPE_ARP => {
             arp::arp_receive(payload);
-            // iobuf drops at fn exit
         }
         ethernet::ETHERTYPE_IPV4 => {
             let Some(pkt) = ipv4::ipv4_receive(payload) else { return };
@@ -337,43 +339,23 @@ pub fn net_receive(mut iobuf: uni_iobuf::IOBuf) {
             let proto = pkt.protocol;
             let src = types::IpAddr::V4(types::Ipv4Addr { addr: pkt.src.addr });
             let dst = types::IpAddr::V4(types::Ipv4Addr { addr: pkt.dst.addr });
-            // Offset of the L4 segment within the original frame.
-            // NLL ends `frame` / `payload` / `pkt` borrows after
-            // this line, so `iobuf.narrow(...)` below is OK.
-            let seg_offset = unsafe {
-                pkt.payload.as_ptr().offset_from(frame.as_ptr()) as usize
-            };
-            let seg_len = pkt.payload.len();
-            // Narrow the IOBuf so `data()` is just the L4 segment
-            // (header + payload), trimming pad-to-min-frame bytes
-            // that hang off the back of the Ethernet frame past
-            // the IP `total_length`. Then hand ownership to the
-            // L4 receive entry.
             match proto {
                 ipv4::PROTO_UDP => {
-                    if iobuf.narrow(seg_offset, seg_len).is_ok() {
-                        udp::udp_receive(src, dst, iobuf);
-                    }
-                    return;
+                    let iobuf = uni_iobuf::IOBuf::from_slice_with_headroom(0, pkt.payload, 0);
+                    udp::udp_receive(src, dst, iobuf);
                 }
                 ipv4::PROTO_TCP => {
-                    if iobuf.narrow(seg_offset, seg_len).is_ok() {
-                        tcp::tcp_receive(src, dst, iobuf);
-                    }
-                    return;
+                    let iobuf = uni_iobuf::IOBuf::from_slice_with_headroom(0, pkt.payload, 0);
+                    tcp::tcp_receive(src, dst, iobuf);
                 }
-                _ => {
-                    // Unknown IP protocol — iobuf drops at fn exit.
-                }
+                _ => {}
             }
         }
         ipv6::ETHERTYPE_IPV6 => {
-            ipv6_receive_frame(iobuf, src_mac);
-            return;
+            ipv6_receive_frame(frame, src_mac);
         }
         _ => {}
     }
-    // `iobuf` drops here for non-UDP-success paths.
 }
 
 /// Tier 2 distributor decision — classify an IOBuf for distribution.
@@ -421,35 +403,35 @@ enum ClassifyResult {
     /// Hand off to `net_receive` on this core (ARP, IPv6,
     /// or IPv4 destined for `my_core`).
     Inline,
-    /// Push to target core's `rx_inbox`; target wakes up and
-    /// consumes via `net_drain_cb`.
+    /// Copy frame bytes to target core's `rx_inbox`; target wakes
+    /// up and consumes via `net_drain_cb`.
     Distribute(u32),
-    /// Frame is unparseable / wrong ethertype — IOBuf drops here.
+    /// Frame is unparseable / wrong ethertype.
     Drop,
 }
 
-/// Zero-copy Tier 2 distributor. Identifies the target core, then
-/// either runs the full receive path inline (for ARP, IPv6, or
-/// my-core IPv4) or hands the IOBuf to the target core's
-/// `rx_inbox` — no memcpy at the cross-core boundary.
-fn distribute_frame(iobuf: uni_iobuf::IOBuf) {
+/// Tier 2 distributor. Picks a target core for the frame; runs the
+/// full receive path inline for ARP / IPv6 / my-core IPv4, or
+/// copies the bytes into the target core's `rx_inbox` for other
+/// IPv4. The copy at the cross-core boundary is unavoidable — the
+/// driver re-arms its buffer as soon as this fn returns, so we
+/// can't keep a borrow over it.
+fn distribute_frame(frame: &[u8]) {
     let num_cores = percpu::num_cores();
     let my_core = uni_kernel::cpu_id();
-    match classify_for_distribution(iobuf.data(), num_cores, my_core) {
-        ClassifyResult::Inline => net_receive(iobuf),
+    match classify_for_distribution(frame, num_cores, my_core) {
+        ClassifyResult::Inline => net_receive(frame),
         ClassifyResult::Distribute(target) => {
-            // SAFETY: same as the copy path — `percpu::init()` runs
-            // before any AP starts, target is bounded by num_cores.
+            // SAFETY: `percpu::init()` runs before any AP starts;
+            // target is bounded by `num_cores`.
             let core = unsafe { percpu::get(target) };
-            // `push` consumes the IOBuf either way: on success it
-            // moves it into the slot; on failure (ring full) it
-            // drops the IOBuf internally, which returns the
-            // backing buffer to the driver pool.
-            if core.rx_inbox.push(iobuf) {
+            if core.rx_inbox.push(frame) {
                 WAKEUP.at(target).store(true, core::sync::atomic::Ordering::Relaxed);
             }
+            // push returning false (oversize / ring full) drops the
+            // frame; TCP retransmit / UDP application retry recover.
         }
-        ClassifyResult::Drop => {} // iobuf drops here
+        ClassifyResult::Drop => {}
     }
 }
 
@@ -612,8 +594,7 @@ fn our_v6_addrs(out: &mut [types::Ipv6Addr; 5]) -> usize {
     n
 }
 
-fn ipv6_receive_frame(mut iobuf: uni_iobuf::IOBuf, src_mac: types::MacAddr) {
-    let frame = iobuf.data();
+fn ipv6_receive_frame(frame: &[u8], src_mac: types::MacAddr) {
     let Some((_, _, eth_payload)) = ethernet::ethernet_parse_full(frame) else {
         return;
     };
@@ -624,34 +605,23 @@ fn ipv6_receive_frame(mut iobuf: uni_iobuf::IOBuf, src_mac: types::MacAddr) {
         None => return,
     };
     // Snoop (peer_v6, peer_mac) into the NDP cache so future
-    // server-initiated outbound to this peer doesn't need an
-    // active Neighbor Solicitation. Mirrors the IPv4 ARP-snoop
-    // pattern in `dispatch_frame` above.
+    // server-initiated outbound to this peer doesn't need an active
+    // Neighbor Solicitation. Mirrors the IPv4 ARP-snoop pattern.
     ndp::ndp_learn(pkt.src, src_mac);
     match pkt.next_header {
         ipv6::next_header::ICMPV6 => {
             handle_icmpv6(&pkt, src_mac);
-            // iobuf drops at fn exit
         }
         proto @ (ipv6::next_header::TCP | ipv6::next_header::UDP) => {
-            // Same zero-copy shape as the IPv4 arm in `net_receive`:
-            // compute the L4-segment offset within the IOBuf's
-            // visible bytes via pointer arithmetic, drop the
-            // pkt/frame borrows (NLL), then narrow and hand the
-            // IOBuf to the L4 entry. No memcpy, no per-packet
-            // allocation.
             let src = types::IpAddr::V6(pkt.src);
             let dst = types::IpAddr::V6(pkt.dst);
-            let seg_offset = unsafe {
-                pkt.payload.as_ptr().offset_from(frame.as_ptr()) as usize
-            };
-            let seg_len = pkt.payload.len();
-            if iobuf.narrow(seg_offset, seg_len).is_ok() {
-                if proto == ipv6::next_header::TCP {
-                    tcp::tcp_receive(src, dst, iobuf);
-                } else {
-                    udp::udp_receive(src, dst, iobuf);
-                }
+            // Bridge: heap-wrap until tcp_receive / udp_receive
+            // take `&[u8]` in the follow-up commit.
+            let iobuf = uni_iobuf::IOBuf::from_slice_with_headroom(0, pkt.payload, 0);
+            if proto == ipv6::next_header::TCP {
+                tcp::tcp_receive(src, dst, iobuf);
+            } else {
+                udp::udp_receive(src, dst, iobuf);
             }
         }
         _ => {}
@@ -801,12 +771,11 @@ fn net_drain_cb(core_id: u32) -> bool {
     // current core's id; we threaded that id through, so it matches
     // `cpu_id()` at this exact moment without needing a second TLS read.
     let cc = unsafe { percpu::CurrentWorker::from_id_unchecked(core_id) };
-    let core = percpu::percore(&cc); // SAFE access via the token
+    let core = percpu::percore(&cc);
     let mut did_work = false;
-    // Tier 2 cross-core delivery: distributor pushes owned IOBufs;
-    // owning core takes ownership here and dispatches inline.
-    while let Some(iobuf) = core.rx_inbox.pop() {
-        net_receive(iobuf);
+    // Tier 2 cross-core delivery: distributor copied frame bytes
+    // into our inbox; pop each slot and dispatch inline.
+    while core.rx_inbox.pop_with(|frame| net_receive(frame)) {
         did_work = true;
     }
     did_work

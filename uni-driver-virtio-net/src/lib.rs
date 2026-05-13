@@ -176,18 +176,17 @@ pub(crate) enum Transport {
 struct QueuePairState {
     rx_buffers: [*mut u8; RX_BUFFERS],
     /// Serialises `(*rx_q(qp)).add_buf(...)` calls. With the
-    /// IOBuf-RX path, both `poll_qp` (running on the polling
-    /// core) and `rx_drop_callback` (running on the consumer
-    /// core, which under Tier 2 cross-core delivery may be any
-    /// core) re-arm descriptors. Per-qp lock keeps Tier 1 (per-
-    /// core qp ownership) uncontended while keeping Tier 2's
-    /// shared qp 0 sound under cross-core drops.
+    /// `&[u8]` RX path, re-arm runs inline in `poll_qp` right
+    /// after the callback returns — same core as the device-ring
+    /// drain. The lock is kept for forward-compat (e.g. an IRQ
+    /// handler that also re-arms) and as a single-writer
+    /// invariant inside `add_buf`.
     rx_lock: uni_kernel::sync::Spinlock<()>,
-    /// Set by `rx_drop_callback` after a successful `add_buf`.
-    /// Read + cleared by the next `poll_qp`, which kicks the
-    /// device if set so it sees the freshly-posted buffers.
-    /// Lets us batch kicks across many drops without losing
-    /// device-side visibility.
+    /// Set by inline re-arm after a successful `add_buf`.
+    /// Read + cleared by the end-of-batch kick in `poll_qp`,
+    /// which kicks the device if set so it sees the freshly-
+    /// posted buffers. Lets us batch kicks across many re-arms
+    /// within one poll cycle without losing device-side visibility.
     rx_dirty: core::sync::atomic::AtomicBool,
 }
 
@@ -1955,103 +1954,41 @@ fn flush_tx_kick_if_dirty() -> bool {
 }
 
 // ============================================================================
-// Zero-copy RX
+// RX
 // ============================================================================
 //
-// `poll_qp` wraps each used descriptor's buffer as an
-// `IOBuf::ExternalOwned` and hands ownership to the consumer. Re-arming
-// the descriptor is deferred until the consumer drops the IOBuf —
-// `rx_drop_callback` calls `add_buf` on the qp directly, re-posting
-// the buffer at the same physical address it came from.
+// `poll_qp` walks the used ring, hands each frame's bytes to the
+// callback as a `&[u8]`, and re-arms the descriptor inline as soon
+// as the callback returns. The callback is synchronous and cannot
+// retain the slice past return — so the descriptor is provably
+// free to re-arm when we do it. No drop callback, no cross-core
+// add_buf race.
 //
-// Why the drop callback re-arms (vs. routing through a side pool):
-// with a side pool, the polling thread would need to drain it on
-// every poll cycle, otherwise descriptors could stay un-armed
-// indefinitely — no incoming traffic ⇒ poll has nothing to drain
-// ⇒ no add_buf ⇒ no re-arm. The drop-side `add_buf` design is
-// self-driving: every consumer drop re-posts directly, regardless
-// of polling cadence. It also preserves the original 1:1
-// buffer↔descriptor mapping the init path established (no kmalloc
-// on the steady-state hot path).
-//
-// Synchronisation: `(*rx_q(qp)).add_buf` takes `&mut Virtqueue`,
-// so concurrent calls from poll + drop need serialising. Each
-// `QueuePairState` carries an `rx_lock: Spinlock<()>`. Tier 1
-// (per-core qp) sees uncontended acquires; Tier 2 (shared qp 0)
-// pays cross-core spinlock cost bounded by RX rate.
-//
-// Kicks are batched: drop adds_buf without kicking (drops can
-// fire many times per poll cycle, kicking each is wasteful) and
-// instead sets `rx_dirty`. The next `poll_qp` reads + clears
-// `rx_dirty` and kicks if it was set OR the poll itself drained
-// any frames. This caps kicks at one per poll regardless of
-// drop-burst size.
+// Kicks are batched within one poll cycle. The inline re-arm calls
+// `add_buf` and sets `rx_dirty`; the end-of-poll block kicks once
+// if any re-arm happened. This caps kicks at one per poll cycle.
 
-/// Re-post `buf_phys` to qp `qp`'s avail ring and notify the
-/// device IF this is the first re-post since the last poll
-/// cleared the dirty flag.
+/// Re-post `buf_phys` to qp `qp`'s avail ring. Sets `rx_dirty` so
+/// the end-of-poll-cycle block kicks the device once for the batch.
 ///
-/// Kick batching: the dirty flag is set true atomically with
-/// add_buf (under `rx_lock`); the swap returns the prior value.
-/// `prior == false` means we're the first re-post in a quiet
-/// period, so we kick. Subsequent re-posts before the next
-/// poll's clear see `prior == true` and skip the kick — their
-/// add_bufs piggyback on the kick the first one already did,
-/// because the device's avail-ring scan walks every entry up
-/// to `avail->idx` once it's woken.
-///
-/// Without this, drops that fire after a polling core has gone
-/// idle would set the dirty flag with no kick to follow:
-/// `VIRTIO_F_EVENT_IDX` means the device only re-scans on kick,
-/// so the avail-ring updates would stay invisible until the
-/// next poll cycle (which may never come if RX traffic is what
-/// would have woken the polling core).
+/// Runs inline from `poll_qp` on the polling core, so the rx_lock
+/// is uncontended in practice — kept anyway for the single-writer
+/// invariant `add_buf` requires.
 #[inline]
 unsafe fn rx_repost(qp: usize, buf_phys: u64) {
     let _g = unsafe { (*qps(qp)).rx_lock.lock() };
     let _ = unsafe { (*rx_q(qp)).add_buf(buf_phys, BUFFER_SIZE, 0, 1) };
-    let was_dirty = unsafe {
+    unsafe {
         (*qps(qp))
             .rx_dirty
-            .swap(true, core::sync::atomic::Ordering::AcqRel)
-    };
-    if !was_dirty {
-        unsafe { (*rx_q(qp)).kick(); }
+            .store(true, core::sync::atomic::Ordering::Release);
     }
 }
 
-/// Drop callback for `IOBuf::ExternalOwned` instances handed out by
-/// `poll_qp`. Re-posts the buffer to its qp's avail ring and
-/// kicks the device if needed (see `rx_repost`).
-///
-/// `ctx` carries the qp index (cast as `*mut ()`); `base` is the
-/// buffer payload pointer originally posted via `add_buf` at init.
-///
-/// SAFETY: `base` is the same pointer init posted to the
-/// descriptor; the underlying allocation is exclusively owned
-/// because the IOBuf was the sole reference between drain and
-/// drop (the descriptor's `addr` field still points at this
-/// buffer but the device only writes after we re-arm via
-/// `add_buf` inside `rx_repost`).
-unsafe fn rx_drop_callback(
-    base: core::ptr::NonNull<u8>,
-    _capacity: u32,
-    ctx: *mut (),
-) {
-    let qp = ctx as usize;
-    let buf = base.as_ptr();
-    // Zero the virtio header region — the consumer mutated the
-    // payload past it; defensively reset the header bytes so the
-    // device sees a clean slate when it next writes here.
-    unsafe { ptr::write_bytes(buf, 0, VIRTIO_NET_HDR_SIZE); }
-    unsafe { rx_repost(qp, virt_to_phys(buf)); }
-}
-
-/// Per-queue zero-copy RX poll. Drains the used ring, wrapping
-/// each descriptor's buffer as an `IOBuf::ExternalOwned`. Re-arming
-/// + kicking is deferred to `rx_drop_callback`, which fires when
-/// the consumer drops the IOBuf.
-fn poll_qp(qp: usize, callback: fn(uni_net_driver::IOBuf)) -> usize {
+/// Per-queue RX poll. Drains the used ring, hands each frame's
+/// bytes to the callback as a `&[u8]`, then re-arms the descriptor
+/// inline before moving to the next used entry.
+fn poll_qp(qp: usize, callback: fn(&[u8])) -> usize {
     unsafe {
         if let Transport::None = (*ndev()).transport { return 0; }
     }
@@ -2081,55 +2018,28 @@ fn poll_qp(qp: usize, callback: fn(uni_net_driver::IOBuf)) -> usize {
                         core::sync::atomic::Ordering::Relaxed,
                     );
                 }
-                // Wrap the buffer as `IOBuf::ExternalOwned` and hand
-                // ownership to the consumer. `ctx = qp` so the
-                // drop callback knows where to re-arm.
-                let iobuf = uni_net_driver::IOBuf::wrap_owned(
-                    core::ptr::NonNull::new_unchecked(buf),
-                    BUFFER_SIZE,
-                    VIRTIO_NET_HDR_SIZE as u32,
-                    frame_len as u32,
-                    rx_drop_callback,
-                    qp as *mut (),
+                // Hand the frame bytes (past the virtio-net header)
+                // to the callback as a slice. The slice lives only
+                // for the call; we re-arm immediately below.
+                let frame: &[u8] = core::slice::from_raw_parts(
+                    buf.add(VIRTIO_NET_HDR_SIZE),
+                    frame_len,
                 );
-                callback(iobuf);
-                // Drop happens later — when the consumer is done
-                // with the IOBuf. Re-arm + kick run there.
-            } else {
-                // Truncated / header-only frame — re-post the
-                // buffer directly without minting an IOBuf.
-                rx_repost(qp, virt_to_phys(buf));
+                callback(frame);
             }
+            // Re-arm: zero the virtio header region so the device
+            // sees a clean slate, then add_buf the same physical
+            // address back onto the avail ring. End-of-poll block
+            // below kicks once for the whole batch.
+            ptr::write_bytes(buf, 0, VIRTIO_NET_HDR_SIZE);
+            rx_repost(qp, virt_to_phys(buf));
             count += 1;
         }
 
-        // Dirty-flag bookkeeping at end of every poll cycle —
-        // unconditional, regardless of `count`. Two reasons:
-        //
-        // (a) If `count == 0` we still need to clear `rx_dirty`,
-        //     otherwise a stale `true` from a prior drop burst
-        //     would persist across quiet poll cycles and the next
-        //     drop's `swap(true)` would return `true → skip kick`,
-        //     leaving fresh add_bufs unkicked indefinitely.
-        //
-        // (b) Even with the clear, the rx_repost protocol has a
-        //     window: drop A kicks (was-clean), drops B/C/D
-        //     piggyback (was-dirty, no kick), and if the device
-        //     finishes processing A's avail entry and sleeps
-        //     before noticing B/C/D's adds, those adds stay
-        //     invisible until something else kicks. With
-        //     `VIRTIO_F_EVENT_IDX` the device only re-scans on
-        //     kick, so we can't rely on it polling. Poll's
-        //     end-of-cycle kick-if-dirty bounds the worst-case
-        //     stall to one event-loop tick.
-        //
-        // The lock serialises this swap with concurrent
-        // `rx_repost` calls on other cores: a repost that
-        // completes before our lock has either already kicked
-        // (was-clean path) or piggybacked on a same-period kick
-        // (was-dirty path); a repost that completes after sees
-        // was-clean and kicks. Every add_buf is therefore paired
-        // with at least one kick.
+        // Kick once at end of cycle if we re-armed anything. The
+        // dirty flag is set true by every `rx_repost`; we clear +
+        // kick here. Bounded one kick per poll regardless of batch
+        // size.
         {
             let _g = (*qps(qp)).rx_lock.lock();
             let was_dirty = (*qps(qp))
@@ -2150,7 +2060,7 @@ fn poll_qp(qp: usize, callback: fn(uni_net_driver::IOBuf)) -> usize {
 }
 
 /// All-queues fan-out wrapper.
-fn poll(callback: fn(uni_net_driver::IOBuf)) -> usize {
+fn poll(callback: fn(&[u8])) -> usize {
     let n = unsafe { (*ndev()).negotiated_queue_pairs as usize }.max(1);
     let mut total = 0;
     for qp in 0..n {

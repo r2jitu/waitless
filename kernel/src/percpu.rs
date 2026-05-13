@@ -43,102 +43,96 @@ fn noop(_: usize) {}
 
 /// Per-core RX inbox slot count for Tier 2 cross-core delivery.
 const RX_POOL_SIZE: usize = 16;
+/// Capacity of each RX inbox slot — one Ethernet frame.
+const RX_BUF_SIZE: usize = 1514;
 
-/// Zero-copy cross-core RX inbox — the distributor hands an owned
-/// [`uni_iobuf::IOBuf`] (typically `IOBuf::ExternalOwned` wrapping a NIC
-/// descriptor's storage) and the owning core takes ownership of it.
-/// No memcpy on either side: the cross-core hand-off is just an
-/// SPSC ring exchange of a pointer-sized index, and the IOBuf
-/// itself moves by-value through the slot.
+/// Per-slot owned packet record. The distributor copies frame
+/// bytes here so the owning core can drain them on its own
+/// schedule; the source slice (a borrow of driver-pool storage)
+/// is released the moment `push` returns and the driver may
+/// immediately re-arm.
+#[derive(Clone, Copy)]
+pub struct RxPacket {
+    pub len: u16,
+    pub data: [u8; RX_BUF_SIZE],
+}
+
+/// Cross-core RX inbox. Tier 2 distributor copies frame bytes
+/// into the next slot via `push`; the owning core drains via
+/// `pop_with`, which invokes the closure with a slice over the
+/// slot bytes before advancing the consumer cursor.
 ///
-/// SPSC discipline: a single producer (the distributor on the
-/// receiving core) calls `push`, a single consumer (the owning
-/// core) calls `pop`. Both take `&self` and rely on producer-only
-/// `next_slot` advance + the `ready` ring's release/acquire pair
-/// for visibility.
+/// SPSC discipline: single producer (the distributor running on
+/// the polling core) writes the slot at `next_slot` and publishes
+/// the index via the `ready` ring; single consumer (the target
+/// core) acquire-loads the index and reads the slot. The
+/// `ready` ring's release/acquire pair carries the slot-write
+/// visibility.
 ///
-/// Slot lifecycle: each `Option<IOBuf>` cell starts as `None`.
-/// `push` writes `Some(iobuf)` into `pool[next_slot]` and then
-/// publishes the index via `ready.push`. `pop` reads the index,
-/// `take()`s the IOBuf out of the slot (leaving `None`), and
-/// returns it. The producer can only wrap back to a slot once the
-/// consumer has drained it (by ring-capacity invariant), so the
-/// `Some → take → Some` sequence on the same slot is well-ordered.
+/// Memory: 16 slots × 1514 B = ~24 KB per core. Lives in
+/// `PerCore`, which is heap-allocated per core during boot, so
+/// idle cores still pay this — but it's bounded and modest.
 pub struct RxInbox {
-    pool: [UnsafeCell<Option<uni_iobuf::IOBuf>>; RX_POOL_SIZE],
+    pool: [UnsafeCell<RxPacket>; RX_POOL_SIZE],
     ready: spsc::Ring<u32>,
     next_slot: AtomicUsize,
 }
 
-// SAFETY: producer/consumer discipline of `RxInbox`. The payload
-// IOBufs reaching this inbox are produced by NIC RX
-// (`ExternalOwned` variant — has its own `unsafe impl Send`) or
-// `Heap` / `Static`, all of which are cross-core safe; the
-// `Borrowed` variant doesn't appear on this path (per-worker
-// scratch buffers stay on their owning worker). Producer
-// publishes the slot's `Some(iobuf)` write with `ready.push`'s
-// release-tail store; consumer's `ready.pop` acquire-load makes
-// that write visible before it `take()`s.
-//
-// The `unsafe impl Send` is explicit (not auto-derived) because
-// `IOBuf` is `!Send` at the type level — the `Borrowed` variant
-// carries a `NonNull<u8>` and `PhantomData<*const ()>`. The
-// override vouches for this specific inbox's contents not being
-// the `Borrowed` variant.
+// SAFETY: producer/consumer discipline above. Producer's write to
+// the slot bytes is published via `ready.push`'s release-tail
+// store; consumer's `ready.pop` acquire-load makes the write
+// visible. The producer can only re-use a slot index after the
+// consumer has popped it (ring capacity == pool size).
 unsafe impl Sync for RxInbox {}
 unsafe impl Send for RxInbox {}
 
 impl RxInbox {
     pub const fn new() -> Self {
         RxInbox {
-            pool: [const { UnsafeCell::new(None) }; RX_POOL_SIZE],
+            pool: [const { UnsafeCell::new(RxPacket {
+                len: 0,
+                data: [0; RX_BUF_SIZE],
+            }) }; RX_POOL_SIZE],
             ready: spsc::Ring::new(),
             next_slot: AtomicUsize::new(0),
         }
     }
 
-    /// Push an `IOBuf` into the inbox. Returns `false` (and drops
-    /// `iobuf` — the IOBuf's own Drop runs, releasing any backing
-    /// storage / NIC descriptor) when the ring is full. The slot at
-    /// `next_slot` is guaranteed `None` by the ring-capacity
-    /// invariant: consumer must have drained the previous content
-    /// before producer wraps to it.
-    pub fn push(&self, iobuf: uni_iobuf::IOBuf) -> bool {
+    /// Copy `frame` into the next slot. Returns `false` if the
+    /// frame is oversize or the ring is full (caller drops the
+    /// frame — Tier 2 RX drops are equivalent to NIC-level loss,
+    /// recovered by TCP retransmit or UDP application retry).
+    pub fn push(&self, frame: &[u8]) -> bool {
+        if frame.len() > RX_BUF_SIZE {
+            return false;
+        }
         let slot = self.next_slot.load(Ordering::Relaxed);
-        // SAFETY: producer-only write to its current slot. The
-        // consumer can only observe this Some after the release-
-        // store inside `ready.push`. The slot is guaranteed to be
-        // `None` here because the ring's capacity equals the pool
-        // size — wrapping back to slot N requires the consumer to
-        // have already `pop`'d it.
+        // SAFETY: producer-only write to its current slot. Consumer
+        // can only observe via the `ready.push` release below; the
+        // ring-capacity invariant guarantees the slot is drained.
         unsafe {
-            let cell = &mut *self.pool[slot].get();
-            *cell = Some(iobuf);
+            let pkt = &mut *self.pool[slot].get();
+            pkt.data[..frame.len()].copy_from_slice(frame);
+            pkt.len = frame.len() as u16;
         }
         if !self.ready.push(slot as u32) {
-            // Ring is full despite the wrap-invariant — should not
-            // happen, but undo the slot write so we don't leak.
-            // SAFETY: we just wrote `Some(iobuf)` above; nobody
-            // else has touched this slot.
-            unsafe {
-                let cell = &mut *self.pool[slot].get();
-                *cell = None;
-            }
             return false;
         }
         self.next_slot.store((slot + 1) % RX_POOL_SIZE, Ordering::Relaxed);
         true
     }
 
-    /// Pop a ready `IOBuf` from the inbox.
-    pub fn pop(&self) -> Option<uni_iobuf::IOBuf> {
-        let idx = self.ready.pop()?;
-        // SAFETY: the matching acquire-load inside `ready.pop`
-        // synchronises with the producer's release on
-        // `ready.tail`, so the `Some(iobuf)` write is visible.
+    /// Pop the next ready slot and invoke `f` with a borrow of
+    /// its bytes. Returns `true` if a slot was drained, `false`
+    /// if the inbox was empty.
+    pub fn pop_with<F: FnOnce(&[u8])>(&self, f: F) -> bool {
+        let Some(idx) = self.ready.pop() else { return false; };
+        // SAFETY: ready.pop's acquire matches producer's release.
         // Single consumer ⇒ no concurrent reader.
-        let cell = unsafe { &mut *self.pool[idx as usize].get() };
-        cell.take()
+        let pkt = unsafe { &*self.pool[idx as usize].get() };
+        let n = pkt.len as usize;
+        f(&pkt.data[..n.min(RX_BUF_SIZE)]);
+        true
     }
 }
 

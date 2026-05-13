@@ -31,16 +31,18 @@ pub fn enable_irq() { (active_ops().enable_irq)() }
 
 // ---- RX / TX datapath -----------------------------------------------------
 
-/// Drain every queue pair into `callback`, one owned [`IOBuf`] per
-/// frame. Used by Tier 2 (single-queue distribute) and the pre-
-/// `set_ready` boot window where APs aren't polling yet.
-pub fn poll(callback: fn(uni_net_driver::IOBuf)) -> usize {
+/// Drain every queue pair into `callback`, one `&[u8]` frame slice
+/// per packet. The slice is valid only for the duration of the
+/// callback — callers that need to retain bytes past return must
+/// copy them out. Used by Tier 2 (single-queue distribute) and the
+/// pre-`set_ready` boot window where APs aren't polling yet.
+pub fn poll(callback: fn(&[u8])) -> usize {
     (active_ops().poll_rx)(callback)
 }
 
 /// Per-queue variant for Tier 1 multi-queue, where each core only
 /// polls its own RX queue pair.
-pub fn poll_qp(qp: usize, callback: fn(uni_net_driver::IOBuf)) -> usize {
+pub fn poll_qp(qp: usize, callback: fn(&[u8])) -> usize {
     (active_ops().poll_qp)(qp, callback)
 }
 

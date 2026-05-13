@@ -385,11 +385,11 @@ pub fn arp_announce() {
     ethernet_send(MacAddr::BROADCAST, ETHERTYPE_ARP, pkt.as_bytes());
 }
 
-fn arp_poll_callback(iobuf: uni_iobuf::IOBuf) {
-    if let Some((ETHERTYPE_ARP, payload)) = ethernet_parse(iobuf.data()) {
+fn arp_poll_callback(frame: &[u8]) {
+    if let Some((ETHERTYPE_ARP, payload)) = ethernet_parse(frame) {
         arp_receive(payload);
     }
-    // iobuf drops at end of scope, returning its NIC buffer to
-    // the driver pool. Non-ARP frames are dropped silently — the
-    // ARP-resolve loop only cares about replies.
+    // Non-ARP frames are dropped silently — the ARP-resolve loop
+    // only cares about replies. Slice borrow ends at scope exit;
+    // the driver re-arms the underlying buffer.
 }

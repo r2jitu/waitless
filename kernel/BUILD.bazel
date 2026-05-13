@@ -53,7 +53,6 @@ rust_library(
     # library.
     target_compatible_with = ["@platforms//os:none"],
     deps = [
-        "//uni-iobuf",
         "//uni-runtime",
         "//uni-worker",
         "//uni-platform",

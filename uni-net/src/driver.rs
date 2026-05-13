@@ -344,17 +344,24 @@ pub struct NicOps {
         csum_start: u16,
         gso_size: u16,
     )>,
-    /// Zero-copy RX. The callback receives an owned [`IOBuf`]
-    /// (typically `IOBuf::ExternalOwned` wrapping the descriptor's
-    /// storage) per frame; the IOBuf's drop callback returns the
-    /// buffer to the driver's pool. There used to be a parallel
-    /// `poll_rx: fn(fn(&[u8]))` / `poll_qp: fn(usize, fn(&[u8]))`
-    /// pair for backends that hadn't been ported to IOBuf yet, but
-    /// every backend now implements this surface — so the legacy
-    /// `&[u8]` path is gone and the net stack only has one RX
-    /// shape to reason about.
-    pub poll_rx: fn(fn(IOBuf)) -> usize,
-    pub poll_qp: fn(usize, fn(IOBuf)) -> usize,
+    /// RX callback: the driver passes a `&[u8]` slice covering the
+    /// L2 frame (Eth + IP + L4 + payload) backed by the driver's
+    /// internal pool storage. The slice is valid for the duration
+    /// of the callback only — the driver re-arms the underlying
+    /// buffer as soon as the callback returns, so a consumer that
+    /// wants to retain bytes past return MUST copy them out.
+    ///
+    /// The earlier shape handed out an owned `IOBuf::ExternalOwned`
+    /// that the consumer could retain across awaits, but that made
+    /// correctness depend on consumer drop latency being shorter
+    /// than the device's ring-wrap window (~23 ms on a 512-deep
+    /// gVNIC ring at GCE rates). A handler that stalled (slow
+    /// `.await`, TX spin) would read into a page the device had
+    /// already overwritten — silent data corruption. The slice
+    /// shape forces the copy synchronously and makes re-arm
+    /// trivially safe.
+    pub poll_rx: fn(fn(&[u8])) -> usize,
+    pub poll_qp: fn(usize, fn(&[u8])) -> usize,
 
     // ── Config / bring-up ───────────────────────────────────────────
     pub get_mac: fn(*mut u8),
@@ -553,8 +560,8 @@ pub fn linked_ethernet_drivers() -> &'static [EthernetDriverReg] {
 // one Acquire load + one direct fn-pointer call.
 
 fn null_send(_: &[u8]) {}
-fn null_poll(_: fn(IOBuf)) -> usize { 0 }
-fn null_poll_qp(_: usize, _: fn(IOBuf)) -> usize { 0 }
+fn null_poll(_: fn(&[u8])) -> usize { 0 }
+fn null_poll_qp(_: usize, _: fn(&[u8])) -> usize { 0 }
 fn null_probe() -> bool { false }
 fn null_get_mac(_: *mut u8) {}
 fn null_num_queue_pairs() -> u16 { 1 }

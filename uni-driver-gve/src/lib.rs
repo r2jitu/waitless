@@ -1908,7 +1908,7 @@ fn doorbell_write(bar2_va: u64, offset: u32, value: u32) {
 /// each completion descriptor carries `flags_seq` whose low 3 bits
 /// cycle 1..7. When the next descriptor's sequence matches what
 /// we're expecting, it's a new completion.
-fn poll_qp_inner<F: FnMut(uni_net_driver::IOBuf)>(qp: usize, mut callback: F) -> u32 {
+fn poll_qp_inner<F: FnMut(&[u8])>(qp: usize, mut callback: F) -> u32 {
     if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
         return poll_qp_inner_dqo(qp, callback);
     }
@@ -1959,33 +1959,27 @@ fn poll_qp_inner<F: FnMut(uni_net_driver::IOBuf)>(qp: usize, mut callback: F) ->
         if qp < RX_BYTES_PER_QP.len() {
             RX_BYTES_PER_QP[qp].fetch_add(len as u64, Ordering::Relaxed);
         }
-        // Zero-copy hand-off: wrap slot `idx`'s QPL page directly
-        // as an `ExternalOwned` IOBuf. The drop callback is a
-        // no-op — `fill_cnt` advances unconditionally below
-        // (mirrors the original wrap-alloc shape: the device may
-        // reuse a slot's QPL page on its next wraparound). For
-        // close-conn / short-lived consumers this is safe because
-        // an IOBuf is read+dropped within microseconds, far
-        // faster than the device can wrap a 512-deep ring (~5 ms
-        // at 100 kpps). A consumer that holds an IOBuf longer
-        // than that would read into a slot that the device is
-        // re-filling — the bytes won't match a valid TCP/IP
-        // packet and L4 parsing fails. A correctness-first design
-        // would gate `fill_cnt` advance on consumer drops via an
-        // in-flight bitmap + refill walk; an earlier attempt at
-        // that hit a debug rabbit hole that wasn't worth burning
-        // (see `experiment/gve-zerocopy-rx` history).
-        let iobuf = unsafe {
-            uni_net_driver::IOBuf::wrap_owned(
-                core::ptr::NonNull::new_unchecked(page_va as *mut u8),
-                PAGE_SIZE,
-                RX_DATA_OFFSET_IN_PAGE as u32,
-                len as u32,
-                rx_drop_callback_noop,
-                core::ptr::null_mut(),
+        // Hand the QPL page bytes to the callback as a `&[u8]` slice.
+        // The slice is valid for the duration of the callback only;
+        // `fill_cnt` advances at end of batch (below) and the device
+        // may reuse this slot's page on its next ring wrap. The
+        // callback must copy out anything it wants to retain past
+        // return.
+        //
+        // SAFETY: `page_va` is the QPL page assigned to slot `idx`,
+        // allocated as DMA-coherent memory in `init`. `RX_DATA_OFFSET_IN_PAGE
+        // + len <= PAGE_SIZE` by device contract (one packet per
+        // page, max MTU + headers fits well under 4 KiB). No
+        // concurrent reader/writer: the device has handed the page
+        // back via the completion descriptor, and we won't re-arm
+        // until `fill_cnt` advances at end of batch.
+        let frame: &[u8] = unsafe {
+            core::slice::from_raw_parts(
+                (page_va + RX_DATA_OFFSET_IN_PAGE) as *const u8,
+                len,
             )
         };
-        callback(iobuf);
+        callback(frame);
 
         delivered += 1;
         cons = cons.wrapping_add(1);
@@ -3045,7 +3039,7 @@ fn post_initial_rx_for_qp_dqo(rx: &RxQueue) {
     doorbell_write_le(bar2_va, rx.db_offset, DQO_RX_POOL_BUFS);
 }
 
-fn poll_qp_inner_dqo<F: FnMut(uni_net_driver::IOBuf)>(qp: usize, mut callback: F) -> u32 {
+fn poll_qp_inner_dqo<F: FnMut(&[u8])>(qp: usize, mut callback: F) -> u32 {
     if qp >= MAX_QUEUE_PAIRS { return 0; }
     let rx_ptr = RX_QUEUES[qp].load(Ordering::Acquire);
     if rx_ptr.is_null() { return 0; }
@@ -3080,22 +3074,19 @@ fn poll_qp_inner_dqo<F: FnMut(uni_net_driver::IOBuf)>(qp: usize, mut callback: F
             if qp < RX_BYTES_PER_QP.len() {
                 RX_BYTES_PER_QP[qp].fetch_add(pkt_len as u64, Ordering::Relaxed);
             }
-            // Zero-copy hand-off: wrap the buf_id-backed page
-            // directly as an `ExternalOwned` IOBuf. Drop callback
-            // is a no-op — the device may reuse this buf_id's
-            // page on its next pass through the buffer ring (see
-            // the matching note in `poll_qp_inner` GQI path).
-            let iobuf = unsafe {
-                uni_net_driver::IOBuf::wrap_owned(
-                    core::ptr::NonNull::new_unchecked(buf_va as *mut u8),
-                    RX_BUFFER_SIZE as u32,
-                    0,
-                    pkt_len as u32,
-                    rx_drop_callback_noop,
-                    core::ptr::null_mut(),
-                )
+            // Hand the buf_id-backed page to the callback as a
+            // `&[u8]`. Valid for the duration of the callback only —
+            // the inline repost below puts buf_id back on the data
+            // ring, where the device may overwrite it on its next
+            // pass. Callback must copy out anything it wants to keep.
+            //
+            // SAFETY: `buf_va` is the DMA-coherent buffer for buf_id
+            // posted at init; `pkt_len <= RX_BUFFER_SIZE` is enforced
+            // by the device (descriptor length field).
+            let frame: &[u8] = unsafe {
+                core::slice::from_raw_parts(buf_va as *const u8, pkt_len)
             };
-            callback(iobuf);
+            callback(frame);
 
             // Repost buf_id at the next free data-ring slot —
             // inline, no MMIO doorbell here (a single batch-end
@@ -3394,27 +3385,27 @@ fn rx_used_cursors() -> [(u16, u16); 8] {
 
 // ---- RX (NicOps::poll_rx / poll_qp) --------------------------------------
 //
-// Zero-copy: the QPL page (GQI) or buf_id page (DQO) is wrapped
-// directly as an `ExternalOwned` IOBuf with a no-op drop callback.
-// `fill_cnt` advances at the end of every poll batch by exactly
-// the number of completions consumed, mirroring the original
-// wrap-alloc shape (the device may reuse a slot's QPL page on its
-// next wraparound; with a 512-deep ring at ~100 kpps that's a
-// ~5 ms reuse window, and our consumers drop within μs).
+// The callback receives a `&[u8]` slice over the QPL page (GQI) or
+// buf_id page (DQO) bytes. The slice is valid only for the duration
+// of the callback — `fill_cnt` advances at the end of the batch
+// (GQI) / repost runs inline (DQO), so the device may overwrite the
+// page as soon as the callback returns. The net stack must copy
+// any bytes it wants to retain past the callback boundary.
 //
-// The semantic difference from the wrap-alloc path is that the
-// consumer reads bytes directly from the QPL page rather than a
-// heap copy. A consumer that holds an IOBuf longer than the ring
-// wrap window would read into a slot the device is re-filling —
-// the bytes won't match a valid TCP/IP packet and L4 parsing
-// fails (TCP checksum mismatch / IP version corruption). A
-// correctness-first design would gate `fill_cnt` advance on
-// consumer drops via an in-flight bitmap + refill walk; an
-// earlier attempt at that hit a subtle bug that wasn't worth
-// burning more time on — see `experiment/gve-zerocopy-rx` git
-// history for the working-but-unlanded sketch.
+// This is the correctness-safe shape. An earlier design handed the
+// consumer an owned IOBuf wrapping the page directly (no copy) and
+// advanced `fill_cnt` unconditionally; that worked because consumers
+// dropped the IOBuf within ~µs vs. a ~23 ms device wrap window. But
+// "consumers drop fast enough" was an empirical property, not a
+// type-system guarantee — a request handler that stalled (slow
+// `.await`, TX spin, pipelined keep-alive) could keep an IOBuf live
+// past the wrap, after which reads silently observed bytes the
+// device had overwritten with another packet's data. The slice-shape
+// removes that footgun: re-arm cannot race a consumer because the
+// consumer has provably released the slice by the time the driver
+// re-arms.
 
-fn poll_qp(qp: usize, callback: fn(uni_net_driver::IOBuf)) -> usize {
+fn poll_qp(qp: usize, callback: fn(&[u8])) -> usize {
     poll_qp_inner(qp, callback) as usize
 }
 
@@ -3422,7 +3413,7 @@ fn poll_qp(qp: usize, callback: fn(uni_net_driver::IOBuf)) -> usize {
 /// don't know which RX queue a given packet landed on, so walk
 /// every live queue. RSS is active by the time `init()` returns,
 /// and DHCP's reply may hash onto any queue — not just qp 0.
-fn poll(callback: fn(uni_net_driver::IOBuf)) -> usize {
+fn poll(callback: fn(&[u8])) -> usize {
     let n = NUM_QP.load(Ordering::Acquire) as usize;
     let mut total: usize = 0;
     for qp in 0..n.min(MAX_QUEUE_PAIRS) {
@@ -3430,16 +3421,6 @@ fn poll(callback: fn(uni_net_driver::IOBuf)) -> usize {
     }
     total
 }
-
-/// No-op drop callback for IOBufs handed out by the RX paths.
-/// Pages are recycled by the device's ring wraparound, not by
-/// the consumer — see the module comment above `poll_qp` for the
-/// safety story.
-unsafe fn rx_drop_callback_noop(
-    _base: core::ptr::NonNull<u8>,
-    _cap: u32,
-    _ctx: *mut (),
-) {}
 
 // ---- Serial logging helpers ------------------------------------------------
 
