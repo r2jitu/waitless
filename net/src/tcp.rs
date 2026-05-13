@@ -88,12 +88,26 @@ const SEGMENT_SIZE: u16 = 64;
 /// and per-conn handler tasks will have starved out.
 const MAX_SEGMENTS: usize = 1023;
 const NULL_SLOT: u16 = 0xFFFF;
-/// Per-conn RX ring depth. Lifted out of `RX_BUF_SIZE` so the cap
-/// fits the rcv_wnd field (u16). 8 KiB matches the previous chunk-
-/// list's effective capacity (`RX_BUF_SIZE`) and is enough for a
-/// full HTTP request line + headers without back-pressure for the
-/// shapes we benchmark against.
-const RX_RING_BYTES: usize = 8192;
+/// Per-conn RX ring depth. Sized to hold one max-size TLS 1.3
+/// record fragment (`MAX_INNER_PLAINTEXT` = 16384 bytes) — when a
+/// record arrives faster than the consumer polls `recv()`, the
+/// whole fragment lands in the ring contiguously and the eventual
+/// `recv()` reads it in one go. The earlier 8 KiB sizing would
+/// spill any record over 8 KiB into a second `recv()` round-trip,
+/// which mattered for large HTTPS request bodies and (some) H2
+/// frames that pack into max-size records.
+///
+/// Trade: 16 KiB per live conn vs the old 8 KiB. On the
+/// "thousands of idle keep-alive clients" shape this doubles
+/// per-conn footprint; on the bench shapes we care about (close-
+/// conn /health, short-lived TLS handshakes) the rings cycle
+/// through the same small set of slots and total heap is bounded
+/// by `MAX_SEGMENTS × SEGMENT_SIZE × 16 KiB`, dominated by the
+/// other per-slot state.
+///
+/// `rcv_wnd: u16` still fits — 16384 < 65535. If we ever need to
+/// go past 64 KiB we'd need to widen that field.
+const RX_RING_BYTES: usize = 16384;
 /// IPv4 max TCP segment payload: MTU(1500) - IP(20) - TCP(20) = 1460.
 const MSS_V4: usize = 1460;
 /// IPv6 max TCP segment payload: MTU(1500) - IPv6(40) - TCP(20) = 1440.
