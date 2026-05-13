@@ -2887,6 +2887,32 @@ fn classify_outbound(frame: &[u8]) -> TxClassify {
     TxClassify { csum: true, path_hash }
 }
 
+/// Pack a DQO general context descriptor into a 16-byte u128. The
+/// layout matches `struct gve_tx_general_context_desc_dqo` from
+/// `gve_desc_dqo.h`. We zero everything except byte 8 (cmd_dtype)
+/// and bytes 13-14 (path_hash low + high in metadata.bytes[1..3]).
+#[inline]
+fn build_dqo_ctx_desc(path_hash: u16) -> u128 {
+    let mut bytes = [0u8; 16];
+    bytes[8] = DQO_TX_DTYPE_GENERAL_CTX;
+    bytes[13] = (path_hash & 0xff) as u8;
+    bytes[14] = ((path_hash >> 8) & 0x7f) as u8;
+    u128::from_le_bytes(bytes)
+}
+
+/// Pack a DQO TX packet descriptor into a 16-byte u128. Matches
+/// `struct gve_tx_pkt_desc_dqo`. Single u128 store is atomic on x86
+/// when 16-byte-aligned (which our ring descriptors are).
+#[inline]
+fn build_dqo_pkt_desc(buf_addr: u64, flags: u8, compl_tag: u16, buf_size: u16) -> u128 {
+    let mut bytes = [0u8; 16];
+    bytes[0..8].copy_from_slice(&buf_addr.to_le_bytes());
+    bytes[8] = flags;
+    bytes[12..14].copy_from_slice(&compl_tag.to_le_bytes());
+    bytes[14..16].copy_from_slice(&(buf_size & 0x3FFF).to_le_bytes());
+    u128::from_le_bytes(bytes)
+}
+
 fn send_on_qp_dqo(qp: usize, data: &[u8]) -> bool {
     if qp >= MAX_QUEUE_PAIRS || data.is_empty() || data.len() > (RX_BUFFER_SIZE as usize) {
         return false;
@@ -2925,23 +2951,19 @@ fn send_on_qp_dqo(qp: usize, data: &[u8]) -> bool {
         core::slice::from_raw_parts(buf_va as *const u8, data.len())
     });
 
-    // General context descriptor (DTYPE 0x4). Linux's gve_tx_add_skb_dqo
-    // always emits this before each packet descriptor. Layout per
-    // gve_desc_dqo.h:
-    //   bytes 0..7    flex4..flex11 (metadata bytes 4..11, all zero)
-    //   byte  8       cmd_dtype.dtype (bits 0..4) — set to 0x4 here
-    //   bytes 9..11   reserved
-    //   bytes 12..15  flex0..flex3 (= metadata bytes 0..3)
-    //     metadata.bytes[0]    = version (= 0)
-    //     metadata.bytes[1..3] = path_hash:15 + rehash_event:1
-    //     metadata.bytes[3]    = unused
-    let ctx_ptr = (tx.ring_va as *mut u8).wrapping_add(ctx_idx * DQO_TX_DESC_SIZE);
-    let mut ctx = [0u8; DQO_TX_DESC_SIZE];
-    ctx[8] = DQO_TX_DTYPE_GENERAL_CTX;
-    // path_hash low byte at ctx[13], high 7 bits at ctx[14] bits 0..6.
-    ctx[13] = (cls.path_hash & 0xff) as u8;
-    ctx[14] = ((cls.path_hash >> 8) & 0x7f) as u8;
-    unsafe { ptr::copy_nonoverlapping(ctx.as_ptr(), ctx_ptr, DQO_TX_DESC_SIZE); }
+    // Build the 16-byte general context descriptor as a single u128
+    // so the store hits memory atomically. Layout per gve_desc_dqo.h:
+    //   byte  8       cmd_dtype.dtype = 0x4
+    //   bytes 13..15  metadata.bytes[1..3] = path_hash:15 + rehash:1
+    //   all other bytes zero (version=0, no path_hash high bits set)
+    //
+    // Building as u128 lets LLVM emit a single 16-byte store; the
+    // previous byte-array + ptr::copy_nonoverlapping path translated
+    // to two movq stores, which the device could theoretically
+    // prefetch between, seeing a half-written desc.
+    let ctx_val: u128 = build_dqo_ctx_desc(cls.path_hash);
+    let ctx_ptr = (tx.ring_va as *mut u128).wrapping_add(ctx_idx);
+    unsafe { ptr::write_volatile(ctx_ptr, ctx_val); }
 
     // Packet descriptor. RE every 32nd descriptor per the device's
     // GVE_TX_MIN_RE_INTERVAL.
@@ -2955,14 +2977,9 @@ fn send_on_qp_dqo(qp: usize, data: &[u8]) -> bool {
         flags |= DQO_TX_FLAG_REPORT_EVENT;
         tx.last_re_at_fill.store(fill_cnt, Ordering::Relaxed);
     }
-    let pkt_ptr = (tx.ring_va as *mut u8).wrapping_add(pkt_idx * DQO_TX_DESC_SIZE);
-    let mut desc = [0u8; DQO_TX_DESC_SIZE];
-    desc[0..8].copy_from_slice(&buf_phys.to_le_bytes());
-    desc[8] = flags;
-    desc[12..14].copy_from_slice(&(slot as u16).to_le_bytes());
-    let size_word = (data.len() as u16) & 0x3FFF;
-    desc[14..16].copy_from_slice(&size_word.to_le_bytes());
-    unsafe { ptr::copy_nonoverlapping(desc.as_ptr(), pkt_ptr, DQO_TX_DESC_SIZE); }
+    let pkt_val: u128 = build_dqo_pkt_desc(buf_phys, flags, slot as u16, data.len() as u16);
+    let pkt_ptr = (tx.ring_va as *mut u128).wrapping_add(pkt_idx);
+    unsafe { ptr::write_volatile(pkt_ptr, pkt_val); }
 
     let new_fill = fill_cnt.wrapping_add(2);
     tx.fill_cnt.store(new_fill, Ordering::Release);
