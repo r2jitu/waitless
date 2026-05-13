@@ -8,9 +8,8 @@
 //
 // Brings up one TX + one RX queue pair on GCE and serves packets on
 // it. n2/n2d/e2 advertise GQI_QPL only; c3/c4 advertise both GQI_QPL
-// and DQO_RDA. We currently prefer GQI_QPL on c3 because DQO_RDA
-// unicast TX has a remaining drop somewhere off-host (see
-// `higher_priority`). The driver is split into three levels:
+// and DQO_RDA — we prefer DQO_RDA (modern 32 B descs, real RSS, the
+// path Linux's gve uses on c3+). The driver is split into three levels:
 //
 //   1. Admin queue: PCI probe, DESCRIBE_DEVICE, parse device
 //      descriptor + options.
@@ -820,29 +819,13 @@ fn parse_device_descriptor(desc_virt: *mut u8) -> bool {
 }
 
 fn higher_priority(a: QueueFormat, b: QueueFormat) -> QueueFormat {
-    // Linux's gve ranks DQO_RDA highest (32 B descs vs GQI's 64 B,
-    // better completion-ring shape, real RSS on c3+). The pieces
-    // of our DQO bring-up that ARE spec-correct:
-    //   - QPL_ID=GVE_RAW_ADDRESSING_QPL_ID for raw-addressing
-    //   - bufq init posts ring-1 buffers + writes masked tail
-    //   - TX emits the required general-context desc before each
-    //     packet desc (DTYPE 0x4)
-    // RX works end-to-end on c3 (DHCP completes, ICMP/TCP SYN
-    // arrive at our callback) but unicast TX silently drops
-    // between the GCE gateway and the destination VM: the gateway
-    // receives our packet (kvm-vm peer observes it ARPing for
-    // peer-MAC), but never forwards. Same MAC, src/dst checksum,
-    // TTL=64. Root cause is somewhere we can't see from outside
-    // the bench loop — possibly a missing device-options ack
-    // (id=9 / id=11), TX-side flow steering config, or a subtle
-    // descriptor encoding still off-spec. Until that's untangled
-    // we prefer GQI_QPL on c3 (advertises both formats) so the
-    // production deploy keeps working at ~189k req/s. n2/n2d/e2
-    // advertise only GQI_QPL — the fallback there is automatic.
+    // Linux's gve ranks DQO_RDA highest on c3+ — modern 32 B desc
+    // shape, real Toeplitz RSS, better completion-ring layout.
+    // n2/n2d/e2 only advertise GQI_QPL so they fall back naturally.
     use QueueFormat::{DqoRda, GqiQpl};
     match (a, b) {
-        (GqiQpl, _) | (_, GqiQpl) => GqiQpl,
-        (DqoRda, DqoRda) => DqoRda,
+        (DqoRda, _) | (_, DqoRda) => DqoRda,
+        (GqiQpl, GqiQpl) => GqiQpl,
     }
 }
 
@@ -2712,7 +2695,11 @@ fn flush_tx_kick_if_dirty_qp(qp: usize) -> bool {
     }
     let bar2_va = BAR2_VA.load(Ordering::Acquire);
     if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
-        doorbell_write_le(bar2_va, tx.db_offset, fill);
+        // DQO doorbell wants the masked tail position; raw cumulative
+        // fill_cnt wraps differently than what the device expects
+        // and wedges the queue after the first ring cycle.
+        let mask = (tx.ring_entries - 1) as u32;
+        doorbell_write_le(bar2_va, tx.db_offset, fill & mask);
     } else {
         doorbell_write(bar2_va, tx.db_offset, fill);
     }
@@ -2837,6 +2824,60 @@ fn tx_drain_dqo(tx: &TxQueue) {
     }
 }
 
+/// Complete the L4 checksum in software for TCP/UDP. Our net stack
+/// stamps only the pseudo-header partial in the L4 checksum field
+/// (`CsumStampConvention::PseudoHeaderPartial`), expecting the
+/// device to add the payload sum. On c3 DQO_RDA, the device emits
+/// our packets (we see TX completions for them) but Andromeda
+/// drops the IP frames between gateway and peer — most likely
+/// because the wire L4 checksum is just the pseudo partial, not a
+/// real checksum. Sum L4 (header + payload) into the existing
+/// partial, fold, ones-complement, and write back. ICMP/ARP have
+/// no pseudo-header so we skip them (full sums already correct).
+fn complete_l4_checksum(buf: &mut [u8]) {
+    if buf.len() < 14 { return; }
+    let etype = u16::from_be_bytes([buf[12], buf[13]]);
+    let (l4_proto, l4_off) = match etype {
+        0x0800 => {
+            if buf.len() < 14 + 20 { return; }
+            let ihl = (buf[14] & 0x0f) as usize;
+            if ihl < 5 { return; }
+            (buf[14 + 9], 14 + ihl * 4)
+        }
+        0x86dd => {
+            if buf.len() < 14 + 40 { return; }
+            (buf[14 + 6], 14 + 40)
+        }
+        _ => return,
+    };
+    let cksum_off_in_l4 = match l4_proto {
+        6 => 16,  // TCP
+        17 => 6,  // UDP
+        _ => return,
+    };
+    let cksum_off = l4_off + cksum_off_in_l4;
+    if cksum_off + 2 > buf.len() { return; }
+    let partial = u16::from_be_bytes([buf[cksum_off], buf[cksum_off + 1]]);
+    buf[cksum_off] = 0;
+    buf[cksum_off + 1] = 0;
+    let mut sum: u32 = partial as u32;
+    let region = &buf[l4_off..];
+    let mut i = 0;
+    while i + 1 < region.len() {
+        sum += u16::from_be_bytes([region[i], region[i + 1]]) as u32;
+        i += 2;
+    }
+    if i < region.len() {
+        sum += (region[i] as u32) << 8;
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    let final_cksum = !(sum as u16);
+    buf[cksum_off] = (final_cksum >> 8) as u8;
+    buf[cksum_off + 1] = (final_cksum & 0xff) as u8;
+}
+
 fn send_on_qp_dqo(qp: usize, data: &[u8]) -> bool {
     if qp >= MAX_QUEUE_PAIRS || data.is_empty() || data.len() > (RX_BUFFER_SIZE as usize) {
         return false;
@@ -2867,6 +2908,12 @@ fn send_on_qp_dqo(qp: usize, data: &[u8]) -> bool {
     let buf_va = (tx.qpl_base_va + buf_offset as u64) as *mut u8;
     let buf_phys = tx.qpl_base_phys + buf_offset as u64;
     unsafe { ptr::copy_nonoverlapping(data.as_ptr(), buf_va, data.len()); }
+
+    // Complete TCP/UDP L4 checksum in software (see fn comment).
+    unsafe {
+        let buf_mut = core::slice::from_raw_parts_mut(buf_va, data.len());
+        complete_l4_checksum(buf_mut);
+    }
 
     // General context descriptor (DTYPE 0x4). Linux's gve_tx_add_skb_dqo
     // always emits this before each packet descriptor. Layout per
