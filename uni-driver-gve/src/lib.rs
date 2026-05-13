@@ -2824,58 +2824,67 @@ fn tx_drain_dqo(tx: &TxQueue) {
     }
 }
 
-/// Complete the L4 checksum in software for TCP/UDP. Our net stack
-/// stamps only the pseudo-header partial in the L4 checksum field
-/// (`CsumStampConvention::PseudoHeaderPartial`), expecting the
-/// device to add the payload sum. On c3 DQO_RDA, the device emits
-/// our packets (we see TX completions for them) but Andromeda
-/// drops the IP frames between gateway and peer — most likely
-/// because the wire L4 checksum is just the pseudo partial, not a
-/// real checksum. Sum L4 (header + payload) into the existing
-/// partial, fold, ones-complement, and write back. ICMP/ARP have
-/// no pseudo-header so we skip them (full sums already correct).
-fn complete_l4_checksum(buf: &mut [u8]) {
-    if buf.len() < 14 { return; }
-    let etype = u16::from_be_bytes([buf[12], buf[13]]);
-    let (l4_proto, l4_off) = match etype {
+/// Inspect an outbound frame and report:
+///   - whether CSUM offload should be enabled (TCP/UDP only — those
+///     have a pseudo-header partial in the L4 cksum field that the
+///     device adds the payload sum to).
+///   - a 15-bit path hash derived from the L4 4-tuple, used as the
+///     `path_hash` metadata in the general context descriptor. Linux
+///     sets this from `skb->hash` for any flow with `skb->l4_hash`;
+///     we compute the same shape from the 4-tuple here. Setting it
+///     to a real per-flow value (rather than a constant zero) is
+///     what Linux does — the device exposes this as an opaque tag
+///     in TX completions, where it's mostly informational for the
+///     OS's queue tracking. We follow the spec for symmetry with
+///     Linux even though it doesn't move our benchmarks much.
+struct TxClassify {
+    csum: bool,
+    path_hash: u16, // 15-bit, never zero (matches Linux's sentinel rule)
+}
+
+fn classify_outbound(frame: &[u8]) -> TxClassify {
+    let default = TxClassify { csum: false, path_hash: 0 };
+    if frame.len() < 14 { return default; }
+    let etype = u16::from_be_bytes([frame[12], frame[13]]);
+    let (l4_proto, l4_off, ip_off, ip_hdr_len) = match etype {
         0x0800 => {
-            if buf.len() < 14 + 20 { return; }
-            let ihl = (buf[14] & 0x0f) as usize;
-            if ihl < 5 { return; }
-            (buf[14 + 9], 14 + ihl * 4)
+            if frame.len() < 14 + 20 { return default; }
+            let ihl = (frame[14] & 0x0f) as usize;
+            if ihl < 5 { return default; }
+            (frame[14 + 9], 14 + ihl * 4, 14, ihl * 4)
         }
         0x86dd => {
-            if buf.len() < 14 + 40 { return; }
-            (buf[14 + 6], 14 + 40)
+            if frame.len() < 14 + 40 { return default; }
+            (frame[14 + 6], 14 + 40, 14, 40)
         }
-        _ => return,
+        _ => return default,
     };
-    let cksum_off_in_l4 = match l4_proto {
-        6 => 16,  // TCP
-        17 => 6,  // UDP
-        _ => return,
+    if !matches!(l4_proto, 6 | 17) { return default; }
+    if l4_off + 4 > frame.len() { return default; }
+    // Cheap 4-tuple hash: XOR-fold the src/dst IP words with the
+    // src/dst port words. Linux uses a Jenkins-style hash; we just
+    // need something that distributes across distinct flows.
+    let mut h: u32 = 0;
+    let ip_end = ip_off + ip_hdr_len;
+    let ip_addrs_off = match etype {
+        0x0800 => ip_off + 12, // IPv4 src+dst at offsets 12-19
+        _      => ip_off + 8,  // IPv6 src at 8-23, dst at 24-39
     };
-    let cksum_off = l4_off + cksum_off_in_l4;
-    if cksum_off + 2 > buf.len() { return; }
-    let partial = u16::from_be_bytes([buf[cksum_off], buf[cksum_off + 1]]);
-    buf[cksum_off] = 0;
-    buf[cksum_off + 1] = 0;
-    let mut sum: u32 = partial as u32;
-    let region = &buf[l4_off..];
-    let mut i = 0;
-    while i + 1 < region.len() {
-        sum += u16::from_be_bytes([region[i], region[i + 1]]) as u32;
+    let addrs_len = if etype == 0x0800 { 8 } else { 32 };
+    let mut i = ip_addrs_off;
+    while i + 1 < (ip_addrs_off + addrs_len).min(ip_end) {
+        h ^= u16::from_be_bytes([frame[i], frame[i + 1]]) as u32;
+        h = h.wrapping_mul(0x9e37); // mix
         i += 2;
     }
-    if i < region.len() {
-        sum += (region[i] as u32) << 8;
-    }
-    while (sum >> 16) != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    let final_cksum = !(sum as u16);
-    buf[cksum_off] = (final_cksum >> 8) as u8;
-    buf[cksum_off + 1] = (final_cksum & 0xff) as u8;
+    // Add src/dst port words (first 4 bytes of L4 for both TCP/UDP).
+    let sp = u16::from_be_bytes([frame[l4_off], frame[l4_off + 1]]) as u32;
+    let dp = u16::from_be_bytes([frame[l4_off + 2], frame[l4_off + 3]]) as u32;
+    h ^= sp.wrapping_mul(0x9e37);
+    h ^= dp.wrapping_mul(0xc2b2);
+    let path_hash = (h ^ (h >> 16)) as u16 & 0x7fff;
+    let path_hash = if path_hash == 0 { 0x7fff } else { path_hash };
+    TxClassify { csum: true, path_hash }
 }
 
 fn send_on_qp_dqo(qp: usize, data: &[u8]) -> bool {
@@ -2909,20 +2918,29 @@ fn send_on_qp_dqo(qp: usize, data: &[u8]) -> bool {
     let buf_phys = tx.qpl_base_phys + buf_offset as u64;
     unsafe { ptr::copy_nonoverlapping(data.as_ptr(), buf_va, data.len()); }
 
-    // Complete TCP/UDP L4 checksum in software (see fn comment).
-    unsafe {
-        let buf_mut = core::slice::from_raw_parts_mut(buf_va, data.len());
-        complete_l4_checksum(buf_mut);
-    }
+    // Classify the outbound frame: figure out whether the device
+    // should do CSUM offload (for TCP/UDP), and compute a path_hash
+    // for Andromeda's per-flow fast path.
+    let cls = classify_outbound(unsafe {
+        core::slice::from_raw_parts(buf_va as *const u8, data.len())
+    });
 
     // General context descriptor (DTYPE 0x4). Linux's gve_tx_add_skb_dqo
     // always emits this before each packet descriptor. Layout per
-    // gve_desc_dqo.h: cmd_dtype byte at offset 8, all other bytes are
-    // packed metadata fields (path_hash, version) that are zero for
-    // packets without an l4_hash.
+    // gve_desc_dqo.h:
+    //   bytes 0..7    flex4..flex11 (metadata bytes 4..11, all zero)
+    //   byte  8       cmd_dtype.dtype (bits 0..4) — set to 0x4 here
+    //   bytes 9..11   reserved
+    //   bytes 12..15  flex0..flex3 (= metadata bytes 0..3)
+    //     metadata.bytes[0]    = version (= 0)
+    //     metadata.bytes[1..3] = path_hash:15 + rehash_event:1
+    //     metadata.bytes[3]    = unused
     let ctx_ptr = (tx.ring_va as *mut u8).wrapping_add(ctx_idx * DQO_TX_DESC_SIZE);
     let mut ctx = [0u8; DQO_TX_DESC_SIZE];
     ctx[8] = DQO_TX_DTYPE_GENERAL_CTX;
+    // path_hash low byte at ctx[13], high 7 bits at ctx[14] bits 0..6.
+    ctx[13] = (cls.path_hash & 0xff) as u8;
+    ctx[14] = ((cls.path_hash >> 8) & 0x7f) as u8;
     unsafe { ptr::copy_nonoverlapping(ctx.as_ptr(), ctx_ptr, DQO_TX_DESC_SIZE); }
 
     // Packet descriptor. RE every 32nd descriptor per the device's
@@ -2930,6 +2948,9 @@ fn send_on_qp_dqo(qp: usize, data: &[u8]) -> bool {
     let last_re = tx.last_re_at_fill.load(Ordering::Relaxed);
     let want_re = fill_cnt.wrapping_sub(last_re) >= DQO_TX_RE_INTERVAL;
     let mut flags = DQO_TX_DTYPE_PKT | DQO_TX_FLAG_EOP;
+    if cls.csum {
+        flags |= DQO_TX_FLAG_CSUM;
+    }
     if want_re {
         flags |= DQO_TX_FLAG_REPORT_EVENT;
         tx.last_re_at_fill.store(fill_cnt, Ordering::Relaxed);
