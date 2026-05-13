@@ -9,6 +9,7 @@ rust_library(
     srcs = [
         "src/lib.rs",
         "src/dqo.rs",
+        "src/gqi.rs",
     ],
     crate_name = "uni_driver_gve",
     target_compatible_with = ["@platforms//os:none"],
