@@ -313,10 +313,12 @@ fn poll_tier2(num_cores: u32) -> bool {
 /// poll, the single-core fallback, and `net_drain_cb` (after the
 /// Tier 2 distributor pushed an IOBuf to this core's inbox).
 ///
-/// The IOBuf is consumed: for UDP the ownership flows to the UDP
-/// inbox slot (zero-copy); for ARP / TCP / IPv6 the dispatch reads
-/// `iobuf.data()` synchronously and the IOBuf drops at end-of-
-/// scope (returning its backing buffer to the driver's pool).
+/// The IOBuf is consumed: for IPv4 / IPv6 TCP and UDP the
+/// ownership flows to the L4 inbox slot (zero-copy, IOBuf is
+/// narrowed in place so the receiver sees just the L4 segment);
+/// for ARP / ICMPv6 the dispatch reads `iobuf.data()` synchronously
+/// and the IOBuf drops at end-of-scope (returning its backing
+/// buffer to the driver's pool).
 pub fn net_receive(mut iobuf: uni_iobuf::IOBuf) {
     let frame = iobuf.data();
     let Some((src_mac, ethertype, payload)) = ethernet::ethernet_parse_full(frame) else {
@@ -365,7 +367,10 @@ pub fn net_receive(mut iobuf: uni_iobuf::IOBuf) {
                 }
             }
         }
-        ipv6::ETHERTYPE_IPV6 => ipv6_receive_frame(payload, src_mac),
+        ipv6::ETHERTYPE_IPV6 => {
+            ipv6_receive_frame(iobuf, src_mac);
+            return;
+        }
         _ => {}
     }
     // `iobuf` drops here for non-UDP-success paths.
@@ -607,10 +612,14 @@ fn our_v6_addrs(out: &mut [types::Ipv6Addr; 5]) -> usize {
     n
 }
 
-fn ipv6_receive_frame(frame: &[u8], src_mac: types::MacAddr) {
+fn ipv6_receive_frame(mut iobuf: uni_iobuf::IOBuf, src_mac: types::MacAddr) {
+    let frame = iobuf.data();
+    let Some((_, _, eth_payload)) = ethernet::ethernet_parse_full(frame) else {
+        return;
+    };
     let mut addr_buf = [types::Ipv6Addr::ANY; 5];
     let n = our_v6_addrs(&mut addr_buf);
-    let pkt = match ipv6::ipv6_receive(frame, &addr_buf[..n]) {
+    let pkt = match ipv6::ipv6_receive(eth_payload, &addr_buf[..n]) {
         Some(p) => p,
         None => return,
     };
@@ -620,37 +629,30 @@ fn ipv6_receive_frame(frame: &[u8], src_mac: types::MacAddr) {
     // pattern in `dispatch_frame` above.
     ndp::ndp_learn(pkt.src, src_mac);
     match pkt.next_header {
-        ipv6::next_header::ICMPV6 => handle_icmpv6(&pkt, src_mac),
-        ipv6::next_header::TCP => {
-            // IPv6 still threads `&[u8]` through `dispatch_ipv6_l4`,
-            // so wrap the borrowed segment in a Heap IOBuf before
-            // forwarding. Per-packet alloc on the IPv6 path; the
-            // IPv4 fast path goes straight from the NIC driver's
-            // owned IOBuf to `tcp_receive` without copying. (Same
-            // shape as the IPv6 UDP arm just below.)
-            let iobuf = uni_iobuf::IOBuf::from_slice_with_headroom(
-                0, pkt.payload, 0,
-            );
-            tcp::tcp_receive(
-                types::IpAddr::V6(pkt.src),
-                types::IpAddr::V6(pkt.dst),
-                iobuf,
-            );
+        ipv6::next_header::ICMPV6 => {
+            handle_icmpv6(&pkt, src_mac);
+            // iobuf drops at fn exit
         }
-        ipv6::next_header::UDP => {
-            // IPv6 still threads `&[u8]` through `dispatch_ipv6_l4`,
-            // so wrap the borrowed slice in a Heap IOBuf before
-            // forwarding. Per-packet alloc on the IPv6 path; the
-            // IPv4 fast path goes straight from the NIC driver's
-            // owned IOBuf to `udp_receive` without copying.
-            let iobuf = uni_iobuf::IOBuf::from_slice_with_headroom(
-                0, pkt.payload, 0,
-            );
-            udp::udp_receive(
-                types::IpAddr::V6(pkt.src),
-                types::IpAddr::V6(pkt.dst),
-                iobuf,
-            );
+        proto @ (ipv6::next_header::TCP | ipv6::next_header::UDP) => {
+            // Same zero-copy shape as the IPv4 arm in `net_receive`:
+            // compute the L4-segment offset within the IOBuf's
+            // visible bytes via pointer arithmetic, drop the
+            // pkt/frame borrows (NLL), then narrow and hand the
+            // IOBuf to the L4 entry. No memcpy, no per-packet
+            // allocation.
+            let src = types::IpAddr::V6(pkt.src);
+            let dst = types::IpAddr::V6(pkt.dst);
+            let seg_offset = unsafe {
+                pkt.payload.as_ptr().offset_from(frame.as_ptr()) as usize
+            };
+            let seg_len = pkt.payload.len();
+            if iobuf.narrow(seg_offset, seg_len).is_ok() {
+                if proto == ipv6::next_header::TCP {
+                    tcp::tcp_receive(src, dst, iobuf);
+                } else {
+                    udp::udp_receive(src, dst, iobuf);
+                }
+            }
         }
         _ => {}
     }

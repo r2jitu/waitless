@@ -722,8 +722,7 @@ fn free_connection(core: u32, slot: usize) {
     // Assigning a fresh TcpConnection drops the old one, which
     // walks `rx_slots: [Option<IOBuf>; RX_SLOTS]` and drops each
     // remaining IOBuf — running its drop callback returns each
-    // chunk's backing buffer to the driver pool (or frees the
-    // heap allocation on the legacy IPv6 wrap path).
+    // chunk's backing buffer to the driver pool.
     *c = TcpConnection::new();
     c.generation = next_gen;
     // Return the slot to the pool's free list. O(1) push; the next
