@@ -454,6 +454,32 @@ def run_loadgen_tls_handshake(port, endpoint, duration, host, parallelism, warmu
         return 0.0, "TIMEOUT", "TIMEOUT"
 
 
+def run_loadgen_http_close(port, endpoint, duration, host, parallelism, warmup=1):
+    """Run the Rust loadgen plain-HTTP fresh-conn workload. Each
+    worker loops: TCP connect, GET with `Connection: close`, drain
+    response, close. SO_LINGER={1,0} on the client side avoids
+    macOS TIME_WAIT pile-up. Returns the standard
+    `(rps, p50, p99)` triple.
+    """
+    bin_path = _loadgen_bin()
+    if bin_path is None:
+        return 0.0, "NO_LOADGEN", "NO_LOADGEN"
+    try:
+        r = subprocess.run(
+            [bin_path, "http-close",
+             "--host", host, "--port", str(port),
+             "--endpoint", endpoint,
+             "--duration-secs", str(duration),
+             "--warmup-secs", str(warmup),
+             "--parallelism", str(parallelism)],
+            capture_output=True, text=True, timeout=duration + warmup + 30)
+        if r.returncode != 0:
+            return 0.0, "ERROR", "ERROR"
+        return _parse_loadgen_output(r.stdout)
+    except (subprocess.TimeoutExpired, OSError):
+        return 0.0, "TIMEOUT", "TIMEOUT"
+
+
 def run_loadgen_tls_resume(port, endpoint, duration, host, parallelism, warmup=1):
     """Run the Rust loadgen TLS-resumption workload. Each worker
     seeds with one fresh handshake (excluded from the histogram) and

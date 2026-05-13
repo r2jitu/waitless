@@ -137,6 +137,7 @@ from .workloads import (
     run_loadgen_tls_resume,
     run_wrk,
     run_wrk_https,
+    run_loadgen_http_close,
     udp_peak_concurrent,
 )
 
@@ -162,6 +163,25 @@ WORKLOADS = [
     {"name": "compute_max", "type": "tcp", "endpoint": "/compute",
      "threads_per_core": 1, "conns_per_core": 8,
      "desc": "/compute throughput (8 conn × cpus)"},
+
+    # ── Plain HTTP, fresh TCP per request ───────────────────────────────
+    #
+    # `health_max` is keep-alive (one conn handles thousands of
+    # requests over a 10 s run). `http_close_max` issues each
+    # request from a fresh TCP connection — wrk dials a new socket
+    # every time the server closes (forced by `Connection: close`).
+    # The workload exercises the per-accept path end-to-end:
+    # 3-way handshake, TcpConnection slot alloc, accept-loop body
+    # (conn-Future Box), one request, FIN, close.
+    #
+    # No crypto, so the per-iter cost is dominated by accept-side
+    # work — the right workload for measuring conn-Future Box
+    # alloc pressure (and the FuturePool's effect if enabled).
+    # Compare against `health_max` to see the accept overhead's
+    # share of plain-HTTP throughput.
+    {"name": "http_close_max", "type": "http_close", "endpoint": "/health",
+     "parallelism_per_core": 4,
+     "desc": "/health throughput, fresh TCP per request (Connection: close)"},
 
     # UDP echo benchmarks.
     #
@@ -588,6 +608,30 @@ def main():
                     client_cpu[(env_name, cpus, wname)] = m["cores"]
                     print(f"    {wname:<20s} {rps:>10.0f} req/s  "
                           f"p50={p50}  p99={p99}  {_cpu_tag(m['cores'])}")
+                elif w["type"] == "http_close":
+                    # Accept-rate-bound plain-HTTP workload. Each
+                    # iter is a fresh TCP from a different
+                    # ephemeral port; SO_LINGER={1,0} on the
+                    # loadgen side skips TIME_WAIT so macOS's
+                    # ephemeral pool doesn't exhaust. Pairs with
+                    # `tls_handshake_max` to isolate the crypto
+                    # share of HTTPS handshake throughput.
+                    par = w.get("parallelism_per_core", 4) * cpus
+                    allocs_before = fetch_total_allocs(
+                        wrk_port, host=wrk_host)
+                    with measure_client_cpu() as m:
+                        rps, p50, p99 = run_loadgen_http_close(
+                            wrk_port, w["endpoint"], duration,
+                            host=wrk_host, parallelism=par)
+                    allocs_after = fetch_total_allocs(
+                        wrk_port, host=wrk_host)
+                    results[(env_name, cpus, wname)] = (rps, p50, p99)
+                    client_cpu[(env_name, cpus, wname)] = m["cores"]
+                    alloc_tag = _alloc_tag(allocs_before, allocs_after,
+                                           rps * duration)
+                    print(f"    {wname:<20s} {rps:>10.0f} req/s  "
+                          f"p50={p50}  p99={p99}  "
+                          f"{_cpu_tag(m['cores'])}{alloc_tag}")
                 elif w["type"] == "https":
                     # wrk over https://. Self-signed dev cert is fine
                     # because wrk doesn't verify by default.

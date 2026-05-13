@@ -17,6 +17,7 @@ use clap::{Parser, Subcommand};
 
 mod gateway;
 mod h3_health;
+mod http_close;
 mod tcp_echo;
 mod tls_handshake;
 mod tls_resume;
@@ -60,6 +61,25 @@ enum Workload {
     /// well above `tls-handshake` once the server supports
     /// resumption.
     TlsResume {
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        port: u16,
+        #[arg(long, default_value = "/health")]
+        endpoint: String,
+        #[arg(long, default_value = "5")]
+        duration_secs: u64,
+        #[arg(long, default_value = "1")]
+        warmup_secs: u64,
+        #[arg(long, default_value = "4")]
+        parallelism: usize,
+    },
+    /// Plain HTTP throughput with fresh TCP per request — accept-rate
+    /// bound, no crypto. Each worker loops: TCP connect, GET with
+    /// `Connection: close`, drain response, close. Pairs with
+    /// `tls-handshake` (same shape + crypto) to isolate the
+    /// per-accept work from crypto cost.
+    HttpClose {
         #[arg(long)]
         host: String,
         #[arg(long)]
@@ -183,6 +203,16 @@ fn main() -> std::io::Result<()> {
         Workload::H3Health {
             host, port, endpoint, duration_secs, warmup_secs, parallelism,
         } => runtime.block_on(h3_health::run(
+            &host,
+            port,
+            &endpoint,
+            Duration::from_secs(duration_secs),
+            Duration::from_secs(warmup_secs),
+            parallelism,
+        )),
+        Workload::HttpClose {
+            host, port, endpoint, duration_secs, warmup_secs, parallelism,
+        } => runtime.block_on(http_close::run(
             &host,
             port,
             &endpoint,
