@@ -290,7 +290,13 @@ class WebserverServiceTest(unittest.TestCase):
         slots until idle timeout, and a 200-burst test would
         exceed the cap in a way unrelated to the QUIC stack
         itself.
+
+        Skips if `aioquic` isn't importable.
         """
+        try:
+            import aioquic  # noqa: F401
+        except ImportError:
+            self.skipTest("aioquic not installed")
         n = 20
         failures = []
         for i in range(n):
