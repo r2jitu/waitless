@@ -465,6 +465,13 @@ pub(super) static NATIVE_TCP_BACKEND: uni_runtime::net::TcpBackend =
         do_recv: native_tcp_do_recv,
         register_recv_waker: native_tcp_register_recv_waker,
         clear_recv_waker: native_tcp_clear_recv_waker,
+        // Native (POSIX `recv`) already copies into the user buf in
+        // one shot at the syscall boundary — no benefit to wiring a
+        // bare-metal-style direct-copy slot. Leave both `None` and
+        // `TcpRecv::poll` falls through to `do_recv` after the
+        // wake.
+        set_recv_buf_slot: None,
+        clear_recv_buf_slot: None,
         close: tcp_close,
         try_send: native_tcp_try_send_chain,
         register_send_waker: native_tcp_register_send_waker,
