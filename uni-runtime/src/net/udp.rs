@@ -249,28 +249,33 @@ impl WorkerInbox {
         }
         // SAFETY: SPSC — consumer owns the head slot until Release
         // store below; same publication argument as `try_push`.
-        let slot = unsafe { &*slots_ptr.add(head as usize) };
-        let src_bytes: &[u8] = match &slot.iobuf {
+        let slot = unsafe { &mut *slots_ptr.add(head as usize) };
+        let n = match &slot.iobuf {
             Some(b) => {
                 let d = b.data();
-                let n = (slot.len as usize).min(d.len());
-                &d[..n]
+                let len = (slot.len as usize).min(d.len());
+                let n = len.min(buf.len());
+                buf[..n].copy_from_slice(&d[..n]);
+                n
             }
             // `try_push` is the only push path, so iobuf is
             // always Some on a filled slot. This None arm is
             // defensive — if it ever fires, we report 0 bytes
             // rather than alias whatever was in the slot before.
-            None => &[],
+            None => 0,
         };
-        let n = src_bytes.len().min(buf.len());
-        buf[..n].copy_from_slice(&src_bytes[..n]);
         let r = (slot.src_ip, slot.src_port, n);
+        // Release the IOBuf now that the bytes have been copied
+        // out, instead of leaving it parked in the slot until the
+        // next push overwrites it. With the &[u8] driver-callback
+        // refactor the IOBuf in this slot is a heap-wrap from
+        // `net::net_receive`'s bridge — keeping it past pop pins
+        // up to `capacity` Heap allocations against the global
+        // allocator. The follow-up commit drops the IOBuf field
+        // entirely; this is the minimal in-place fix.
+        slot.iobuf = None;
         let next = head.wrapping_add(1) & mask;
         self.head.store(next, Ordering::Release);
-        // The IOBuf stays in the slot until the next push
-        // overwrites it. Bounded by inbox capacity — at most that
-        // many descriptor buffers can stay "in flight" past
-        // consumer drain.
         Some(r)
     }
 
@@ -299,7 +304,7 @@ impl WorkerInbox {
         }
         // SAFETY: same SPSC ownership argument as `pop_into` — we
         // own the head slot for the duration of the closure call.
-        let slot = unsafe { &*slots_ptr.add(head as usize) };
+        let slot = unsafe { &mut *slots_ptr.add(head as usize) };
         let n = slot.len as usize;
         let src_bytes: &[u8] = match &slot.iobuf {
             Some(b) => {
@@ -309,6 +314,9 @@ impl WorkerInbox {
             None => &[],
         };
         let r = f(src_bytes, slot.src_ip, slot.src_port);
+        // Release the IOBuf after the closure observes the bytes
+        // — see `pop_into` for the rationale.
+        slot.iobuf = None;
         let next = head.wrapping_add(1) & mask;
         self.head.store(next, Ordering::Release);
         Ok(r)
