@@ -6,8 +6,11 @@
 // reference "gVNIC" when talking about the GCE product surface
 // (e.g., instance flags).
 //
-// Brings up one TX + one RX queue pair in GQI_QPL mode on GCE and
-// serves packets on it. The driver is split into three levels:
+// Brings up one TX + one RX queue pair on GCE and serves packets on
+// it. n2/n2d/e2 advertise GQI_QPL only; c3/c4 advertise both GQI_QPL
+// and DQO_RDA. We currently prefer GQI_QPL on c3 because DQO_RDA
+// unicast TX has a remaining drop somewhere off-host (see
+// `higher_priority`). The driver is split into three levels:
 //
 //   1. Admin queue: PCI probe, DESCRIBE_DEVICE, parse device
 //      descriptor + options.
@@ -567,12 +570,8 @@ fn init() -> bool {
 
     // ── Queue bring-up ──────────────────────────────────────────────────
     //
-    // Negotiated queue format. n2 / n2d / e2 advertise GQI_QPL;
-    // c3 / c4 / future generations advertise both GQI_QPL and
-    // DQO_RDA — `higher_priority` picks GQI_QPL today (DQO direct-
-    // fill debug is parked on the c3 stall). The match is now
-    // exhaustive: `QueueFormat` only enumerates the two formats
-    // the driver actually supports.
+    // Negotiated queue format — see `higher_priority` for why we
+    // prefer GQI_QPL on c3 even though DQO_RDA is offered.
     let fmt = match STATE.lock().as_ref().and_then(|s| s.queue_format) {
         Some(f) => f,
         None => return false,
@@ -722,9 +721,10 @@ fn parse_device_descriptor(desc_virt: *mut u8) -> bool {
 
     // Walk the option list to negotiate the queue format. Preference
     // order matches Linux: DQO_RDA > DQO_QPL > GQI_RDA > GQI_QPL.
-    // No per-option logging: GCE currently advertises GQI_QPL plus
-    // a fixed set of decoration options (MODIFY_RING etc.) that
-    // never vary across boots.
+    // Log every option the device offers — the set varies between
+    // n2/n2d/e2 (GQI_QPL only) and c3/c4 (GQI_QPL + DQO_RDA), and
+    // future SKUs may add more. Visibility makes negotiation
+    // mismatches diagnosable from serial alone.
     let mut best: Option<QueueFormat> = None;
     let mut offset = header_len;
     let end = if total_len > 0 && total_len <= ADMINQ_SIZE {
@@ -738,6 +738,12 @@ fn parse_device_descriptor(desc_virt: *mut u8) -> bool {
             unsafe { core::slice::from_raw_parts(desc_virt.add(offset), 8) };
         let id = read_be16(opt_hdr, 0);
         let len = read_be16(opt_hdr, 2) as usize;
+
+        log(b"[gvnic]  option id=");
+        log_u32(id as u32);
+        log(b" len=");
+        log_u32(len as u32);
+        log(b"\n");
 
         let fmt = match id {
             OPT_ID_DQO_RDA => Some(QueueFormat::DqoRda),
@@ -814,13 +820,25 @@ fn parse_device_descriptor(desc_virt: *mut u8) -> bool {
 }
 
 fn higher_priority(a: QueueFormat, b: QueueFormat) -> QueueFormat {
-    // Linux ranks DQO_RDA highest (it's the modern format, better
-    // perf on supporting hardware). Our DQO TX path stalls under
-    // sustained parallel load on c3-standard-4, while GQI_QPL is
-    // validated working on n2. Until DQO is debugged on host,
-    // prefer GQI_QPL so c3 deployments fall back to a known-good
-    // format. C3 advertises both per Google's gVNIC docs; older
-    // n2/n2d/e2 advertise only GQI_QPL.
+    // Linux's gve ranks DQO_RDA highest (32 B descs vs GQI's 64 B,
+    // better completion-ring shape, real RSS on c3+). The pieces
+    // of our DQO bring-up that ARE spec-correct:
+    //   - QPL_ID=GVE_RAW_ADDRESSING_QPL_ID for raw-addressing
+    //   - bufq init posts ring-1 buffers + writes masked tail
+    //   - TX emits the required general-context desc before each
+    //     packet desc (DTYPE 0x4)
+    // RX works end-to-end on c3 (DHCP completes, ICMP/TCP SYN
+    // arrive at our callback) but unicast TX silently drops
+    // between the GCE gateway and the destination VM: the gateway
+    // receives our packet (kvm-vm peer observes it ARPing for
+    // peer-MAC), but never forwards. Same MAC, src/dst checksum,
+    // TTL=64. Root cause is somewhere we can't see from outside
+    // the bench loop — possibly a missing device-options ack
+    // (id=9 / id=11), TX-side flow steering config, or a subtle
+    // descriptor encoding still off-spec. Until that's untangled
+    // we prefer GQI_QPL on c3 (advertises both formats) so the
+    // production deploy keeps working at ~189k req/s. n2/n2d/e2
+    // advertise only GQI_QPL — the fallback there is automatic.
     use QueueFormat::{DqoRda, GqiQpl};
     match (a, b) {
         (GqiQpl, _) | (_, GqiQpl) => GqiQpl,
@@ -1531,7 +1549,7 @@ fn build_create_tx_queue_cmd(qp: u32, alloc: &TxAlloc, fmt: QueueFormat) -> Admi
     put_be64(&mut cmd.bytes, 24, alloc.ring_phys);
     put_be32(&mut cmd.bytes, 32, match fmt {
         QueueFormat::GqiQpl => tx_qpl_id(qp),
-        _ => 0,
+        QueueFormat::DqoRda => GVE_RAW_ADDRESSING_QPL_ID,
     });
     put_be32(&mut cmd.bytes, 36, tx_ntfy_id(qp));
     if matches!(fmt, QueueFormat::DqoRda) {
@@ -1562,14 +1580,20 @@ fn build_create_rx_queue_cmd(qp: u32, alloc: &RxAlloc, num_qp: u32, fmt: QueueFo
     let mut cmd = AdminqCommand::ZERO;
     put_be32(&mut cmd.bytes, 0, OP_CREATE_RX_QUEUE);
     put_be32(&mut cmd.bytes, 8, qp);
-    put_be32(&mut cmd.bytes, 12, qp);
+    // `index` field. Linux + FreeBSD set this only for GQI; for
+    // DQO they leave it 0. We had it set unconditionally; the DQO
+    // device may interpret a non-zero `index` differently from
+    // `queue_id` and silently route packets oddly.
+    if matches!(fmt, QueueFormat::GqiQpl) {
+        put_be32(&mut cmd.bytes, 12, qp);
+    }
     put_be32(&mut cmd.bytes, 20, rx_ntfy_id(num_qp, qp));
     put_be64(&mut cmd.bytes, 24, alloc.qres_phys);
     put_be64(&mut cmd.bytes, 32, alloc.compl_phys);
     put_be64(&mut cmd.bytes, 40, alloc.data_phys);
     put_be32(&mut cmd.bytes, 48, match fmt {
         QueueFormat::GqiQpl => rx_qpl_id(qp),
-        _ => 0,
+        QueueFormat::DqoRda => GVE_RAW_ADDRESSING_QPL_ID,
     });
     put_be16(&mut cmd.bytes, 52, RX_RING_ENTRIES);
     put_be16(&mut cmd.bytes, 54, RX_BUFFER_SIZE);
@@ -2827,12 +2851,15 @@ fn send_on_qp_dqo(qp: usize, data: &[u8]) -> bool {
     let fill_cnt = tx.fill_cnt.load(Ordering::Relaxed);
     let done_cnt = tx.done_cnt.load(Ordering::Relaxed);
     let in_flight = fill_cnt.wrapping_sub(done_cnt);
-    if in_flight >= tx.ring_entries as u32 {
+    // Each packet emits 2 descriptors (general context + pkt).
+    if in_flight + 2 > tx.ring_entries as u32 {
         return false;
     }
 
     let mask = (tx.ring_entries - 1) as u32;
-    let slot = (fill_cnt & mask) as usize;
+    let ctx_idx = (fill_cnt & mask) as usize;
+    let pkt_idx = (fill_cnt.wrapping_add(1) & mask) as usize;
+    let slot = pkt_idx;
 
     // Per-slot bounce buffer: send copies the packet here so the
     // descriptor can hand the device a stable DMA address.
@@ -2841,17 +2868,18 @@ fn send_on_qp_dqo(qp: usize, data: &[u8]) -> bool {
     let buf_phys = tx.qpl_base_phys + buf_offset as u64;
     unsafe { ptr::copy_nonoverlapping(data.as_ptr(), buf_va, data.len()); }
 
-    // gve_tx_pkt_desc_dqo, 16 bytes, all LE. RE only every 32nd
-    // descriptor per the device's spec (`GVE_TX_MIN_RE_INTERVAL`).
-    //
-    // NOTE: Linux's `gve_tx_add_skb_dqo` ALWAYS emits a general
-    // context descriptor (DTYPE 0x4) before each data desc.
-    // I tried that — c3-standard-4 throughput got worse, not
-    // better, suggesting either my context-desc layout is wrong
-    // or there's an interaction with the RE/completion path I
-    // can't see from outside the bench loop. Reverted to the
-    // single-data-desc shape; needs on-host instrumentation to
-    // root-cause why the device wedges under sustained load.
+    // General context descriptor (DTYPE 0x4). Linux's gve_tx_add_skb_dqo
+    // always emits this before each packet descriptor. Layout per
+    // gve_desc_dqo.h: cmd_dtype byte at offset 8, all other bytes are
+    // packed metadata fields (path_hash, version) that are zero for
+    // packets without an l4_hash.
+    let ctx_ptr = (tx.ring_va as *mut u8).wrapping_add(ctx_idx * DQO_TX_DESC_SIZE);
+    let mut ctx = [0u8; DQO_TX_DESC_SIZE];
+    ctx[8] = DQO_TX_DTYPE_GENERAL_CTX;
+    unsafe { ptr::copy_nonoverlapping(ctx.as_ptr(), ctx_ptr, DQO_TX_DESC_SIZE); }
+
+    // Packet descriptor. RE every 32nd descriptor per the device's
+    // GVE_TX_MIN_RE_INTERVAL.
     let last_re = tx.last_re_at_fill.load(Ordering::Relaxed);
     let want_re = fill_cnt.wrapping_sub(last_re) >= DQO_TX_RE_INTERVAL;
     let mut flags = DQO_TX_DTYPE_PKT | DQO_TX_FLAG_EOP;
@@ -2859,21 +2887,21 @@ fn send_on_qp_dqo(qp: usize, data: &[u8]) -> bool {
         flags |= DQO_TX_FLAG_REPORT_EVENT;
         tx.last_re_at_fill.store(fill_cnt, Ordering::Relaxed);
     }
-    let desc_ptr = (tx.ring_va as *mut u8).wrapping_add(slot * DQO_TX_DESC_SIZE);
+    let pkt_ptr = (tx.ring_va as *mut u8).wrapping_add(pkt_idx * DQO_TX_DESC_SIZE);
     let mut desc = [0u8; DQO_TX_DESC_SIZE];
     desc[0..8].copy_from_slice(&buf_phys.to_le_bytes());
     desc[8] = flags;
     desc[12..14].copy_from_slice(&(slot as u16).to_le_bytes());
     let size_word = (data.len() as u16) & 0x3FFF;
     desc[14..16].copy_from_slice(&size_word.to_le_bytes());
-    unsafe { ptr::copy_nonoverlapping(desc.as_ptr(), desc_ptr, DQO_TX_DESC_SIZE); }
+    unsafe { ptr::copy_nonoverlapping(desc.as_ptr(), pkt_ptr, DQO_TX_DESC_SIZE); }
 
-    let new_fill = fill_cnt.wrapping_add(1);
+    let new_fill = fill_cnt.wrapping_add(2);
     tx.fill_cnt.store(new_fill, Ordering::Release);
 
     let near_full = new_fill.wrapping_sub(done_cnt) >= (tx.ring_entries as u32) - 16;
     if !DEFERRED_KICK.load(Ordering::Relaxed) || near_full {
-        doorbell_write_le(bar2_va, tx.db_offset, new_fill);
+        doorbell_write_le(bar2_va, tx.db_offset, new_fill & mask);
         tx.last_kicked.store(new_fill, Ordering::Relaxed);
     }
     true
@@ -3017,16 +3045,24 @@ fn submit_tx_inner_dqo(
     }
 }
 
-/// Post all DQO_RX_POOL_BUFS buffers on this queue's buffer ring and
-/// kick the doorbell — equivalent to GQI's "fill the data-slot ring +
-/// write fill_cnt to doorbell". Buffer i lives at
-/// `qpl_base + i * RX_BUFFER_SIZE` and is identified by `buf_id = i`
-/// when the device returns it via the completion ring.
+/// Post buffers on this queue's buffer ring and kick the doorbell.
+/// Leaves the last slot empty so the device sees `tail != head` —
+/// otherwise `tail & mask == head` is the device's "empty ring"
+/// signal and incoming packets get dropped silently. Doorbell
+/// receives the masked tail position (Linux's
+/// `gve_rx_write_doorbell_dqo` convention; raw cumulative values
+/// like our previous `DQO_RX_POOL_BUFS = 512` masked to 0 and
+/// equalled the device's `head = 0` → ring looks empty → unicast
+/// RX never delivers. Broadcast still works because GCE's DHCP
+/// server takes its own per-flow path; `dhcp: configured IP` got
+/// printed even with the bug active).
 fn post_initial_rx_for_qp_dqo(rx: &RxQueue) {
     let pool_base_phys = rx.qpl_base_phys;
-    let mask = (rx.ring_entries - 1) as u32;
-    for i in 0..DQO_RX_POOL_BUFS {
-        let post_idx = ((i) & mask) as usize;
+    let ring = rx.ring_entries as u32;
+    let mask = ring - 1;
+    let initial = ring - 1; // leave one slot empty
+    for i in 0..initial {
+        let post_idx = (i & mask) as usize;
         let desc_ptr = (rx.data_va as *mut u8).wrapping_add(post_idx * DQO_RX_DESC_SIZE);
         let mut desc = [0u8; DQO_RX_DESC_SIZE];
         desc[0..2].copy_from_slice(&(i as u16).to_le_bytes());
@@ -3034,9 +3070,9 @@ fn post_initial_rx_for_qp_dqo(rx: &RxQueue) {
         desc[8..16].copy_from_slice(&buf_phys.to_le_bytes());
         unsafe { ptr::copy_nonoverlapping(desc.as_ptr(), desc_ptr, DQO_RX_DESC_SIZE); }
     }
-    rx.fill_cnt.store(DQO_RX_POOL_BUFS, Ordering::Release);
+    rx.fill_cnt.store(initial, Ordering::Release);
     let bar2_va = BAR2_VA.load(Ordering::Acquire);
-    doorbell_write_le(bar2_va, rx.db_offset, DQO_RX_POOL_BUFS);
+    doorbell_write_le(bar2_va, rx.db_offset, initial & mask);
 }
 
 fn poll_qp_inner_dqo<F: FnMut(&[u8])>(qp: usize, mut callback: F) -> u32 {
@@ -3116,7 +3152,11 @@ fn poll_qp_inner_dqo<F: FnMut(&[u8])>(qp: usize, mut callback: F) -> u32 {
     if delivered > 0 {
         let bar2_va = BAR2_VA.load(Ordering::Acquire);
         let fill = rx.fill_cnt.load(Ordering::Relaxed);
-        doorbell_write_le(bar2_va, rx.db_offset, fill);
+        // Doorbell wants the masked tail position (Linux:
+        // `iowrite32(bufq->tail, db)` where `bufq->tail` is always
+        // `& bufq->mask`). Our cumulative `fill_cnt` grows
+        // unbounded; mask it before writing.
+        doorbell_write_le(bar2_va, rx.db_offset, fill & mask);
     }
 
     delivered
