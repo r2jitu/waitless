@@ -1908,7 +1908,7 @@ fn doorbell_write(bar2_va: u64, offset: u32, value: u32) {
 /// each completion descriptor carries `flags_seq` whose low 3 bits
 /// cycle 1..7. When the next descriptor's sequence matches what
 /// we're expecting, it's a new completion.
-fn poll_qp_inner<F: FnMut(&[u8])>(qp: usize, mut callback: F) -> u32 {
+fn poll_qp_inner<F: FnMut(uni_net_driver::IOBuf)>(qp: usize, mut callback: F) -> u32 {
     if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
         return poll_qp_inner_dqo(qp, callback);
     }
@@ -1927,7 +1927,6 @@ fn poll_qp_inner<F: FnMut(&[u8])>(qp: usize, mut callback: F) -> u32 {
     // tolerate concurrent access if another core ever calls in —
     // though in Tier 1 each queue is polled by exactly one core.
     let rx = unsafe { &*rx_ptr };
-    let bar2_va = BAR2_VA.load(Ordering::Acquire);
 
     let mask = (rx.ring_entries - 1) as u32;
     let mut cons = rx.cons_cnt.load(Ordering::Relaxed);
@@ -1956,15 +1955,37 @@ fn poll_qp_inner<F: FnMut(&[u8])>(qp: usize, mut callback: F) -> u32 {
         }
 
         let len = read_be16(desc, RX_DESC_LEN_OFF) as usize;
-        let frame_start = rx.qpl_base_va as usize + idx * (PAGE_SIZE as usize)
-            + RX_DATA_OFFSET_IN_PAGE;
-        let frame: &[u8] = unsafe {
-            core::slice::from_raw_parts(frame_start as *const u8, len)
-        };
+        let page_va = rx.qpl_base_va as usize + idx * (PAGE_SIZE as usize);
         if qp < RX_BYTES_PER_QP.len() {
             RX_BYTES_PER_QP[qp].fetch_add(len as u64, Ordering::Relaxed);
         }
-        callback(frame);
+        // Zero-copy hand-off: wrap slot `idx`'s QPL page directly
+        // as an `ExternalOwned` IOBuf. The drop callback is a
+        // no-op — `fill_cnt` advances unconditionally below
+        // (mirrors the original wrap-alloc shape: the device may
+        // reuse a slot's QPL page on its next wraparound). For
+        // close-conn / short-lived consumers this is safe because
+        // an IOBuf is read+dropped within microseconds, far
+        // faster than the device can wrap a 512-deep ring (~5 ms
+        // at 100 kpps). A consumer that holds an IOBuf longer
+        // than that would read into a slot that the device is
+        // re-filling — the bytes won't match a valid TCP/IP
+        // packet and L4 parsing fails. A correctness-first design
+        // would gate `fill_cnt` advance on consumer drops via an
+        // in-flight bitmap + refill walk; an earlier attempt at
+        // that hit a debug rabbit hole that wasn't worth burning
+        // (see `experiment/gve-zerocopy-rx` history).
+        let iobuf = unsafe {
+            uni_net_driver::IOBuf::wrap_owned(
+                core::ptr::NonNull::new_unchecked(page_va as *mut u8),
+                PAGE_SIZE,
+                RX_DATA_OFFSET_IN_PAGE as u32,
+                len as u32,
+                rx_drop_callback_noop,
+                core::ptr::null_mut(),
+            )
+        };
+        callback(iobuf);
 
         delivered += 1;
         cons = cons.wrapping_add(1);
@@ -1972,6 +1993,7 @@ fn poll_qp_inner<F: FnMut(&[u8])>(qp: usize, mut callback: F) -> u32 {
     }
 
     if delivered > 0 {
+        let bar2_va = BAR2_VA.load(Ordering::Acquire);
         let new_fill = rx.fill_cnt.load(Ordering::Relaxed).wrapping_add(delivered);
         rx.cons_cnt.store(cons, Ordering::Relaxed);
         rx.expected_seq.store(expected, Ordering::Relaxed);
@@ -3023,12 +3045,11 @@ fn post_initial_rx_for_qp_dqo(rx: &RxQueue) {
     doorbell_write_le(bar2_va, rx.db_offset, DQO_RX_POOL_BUFS);
 }
 
-fn poll_qp_inner_dqo<F: FnMut(&[u8])>(qp: usize, mut callback: F) -> u32 {
+fn poll_qp_inner_dqo<F: FnMut(uni_net_driver::IOBuf)>(qp: usize, mut callback: F) -> u32 {
     if qp >= MAX_QUEUE_PAIRS { return 0; }
     let rx_ptr = RX_QUEUES[qp].load(Ordering::Acquire);
     if rx_ptr.is_null() { return 0; }
     let rx = unsafe { &*rx_ptr };
-    let bar2_va = BAR2_VA.load(Ordering::Acquire);
 
     let mask = (rx.ring_entries - 1) as u32;
     let mut cons = rx.cons_cnt.load(Ordering::Relaxed);
@@ -3055,16 +3076,30 @@ fn poll_qp_inner_dqo<F: FnMut(&[u8])>(qp: usize, mut callback: F) -> u32 {
         ]) as u32;
 
         if buf_id < DQO_RX_POOL_BUFS && (status & DQO_RX_COMPL_STATUS_EOP) != 0 && pkt_len > 0 {
-            let buf_va = (rx.qpl_base_va + (buf_id as u64) * (RX_BUFFER_SIZE as u64)) as *const u8;
-            let bytes = unsafe { core::slice::from_raw_parts(buf_va, pkt_len) };
+            let buf_va = rx.qpl_base_va + (buf_id as u64) * (RX_BUFFER_SIZE as u64);
             if qp < RX_BYTES_PER_QP.len() {
                 RX_BYTES_PER_QP[qp].fetch_add(pkt_len as u64, Ordering::Relaxed);
             }
-            callback(bytes);
+            // Zero-copy hand-off: wrap the buf_id-backed page
+            // directly as an `ExternalOwned` IOBuf. Drop callback
+            // is a no-op — the device may reuse this buf_id's
+            // page on its next pass through the buffer ring (see
+            // the matching note in `poll_qp_inner` GQI path).
+            let iobuf = unsafe {
+                uni_net_driver::IOBuf::wrap_owned(
+                    core::ptr::NonNull::new_unchecked(buf_va as *mut u8),
+                    RX_BUFFER_SIZE as u32,
+                    0,
+                    pkt_len as u32,
+                    rx_drop_callback_noop,
+                    core::ptr::null_mut(),
+                )
+            };
+            callback(iobuf);
 
-            // Repost the buffer at the buffer-ring's next free slot.
-            // Same buf_id, same DMA addr — the device only needs the
-            // descriptor written, plus a doorbell at the end.
+            // Repost buf_id at the next free data-ring slot —
+            // inline, no MMIO doorbell here (a single batch-end
+            // doorbell below covers all reposts in this poll).
             let fill = rx.fill_cnt.load(Ordering::Relaxed);
             let post_idx = (fill & mask) as usize;
             let post_ptr = (rx.data_va as *mut u8).wrapping_add(post_idx * DQO_RX_DESC_SIZE);
@@ -3074,7 +3109,6 @@ fn poll_qp_inner_dqo<F: FnMut(&[u8])>(qp: usize, mut callback: F) -> u32 {
             post_desc[8..16].copy_from_slice(&buf_phys.to_le_bytes());
             unsafe { ptr::copy_nonoverlapping(post_desc.as_ptr(), post_ptr, DQO_RX_DESC_SIZE); }
             rx.fill_cnt.store(fill.wrapping_add(1), Ordering::Release);
-
             rx.cons_cnt.store(cons.wrapping_add(1), Ordering::Relaxed);
             delivered += 1;
         }
@@ -3085,10 +3119,11 @@ fn poll_qp_inner_dqo<F: FnMut(&[u8])>(qp: usize, mut callback: F) -> u32 {
         }
     }
 
-    rx.cons_cnt.store(cons, Ordering::Relaxed);
+    rx.cons_cnt.store(cons, Ordering::Release);
     rx.expected_seq.store(cur_gen, Ordering::Relaxed);
 
     if delivered > 0 {
+        let bar2_va = BAR2_VA.load(Ordering::Acquire);
         let fill = rx.fill_cnt.load(Ordering::Relaxed);
         doorbell_write_le(bar2_va, rx.db_offset, fill);
     }
@@ -3359,24 +3394,28 @@ fn rx_used_cursors() -> [(u16, u16); 8] {
 
 // ---- RX (NicOps::poll_rx / poll_qp) --------------------------------------
 //
-// gve's QPL design pins a fixed set of pages between guest and
-// device, so the device may overwrite a frame's QPL page once we
-// re-fill its descriptor. A real zero-copy IOBuf path for gve
-// would track which descriptors are out at consumers and gate
-// `fill_cnt` advance on in-flight drops — that's substantial
-// enough to be its own follow-up.
+// Zero-copy: the QPL page (GQI) or buf_id page (DQO) is wrapped
+// directly as an `ExternalOwned` IOBuf with a no-op drop callback.
+// `fill_cnt` advances at the end of every poll batch by exactly
+// the number of completions consumed, mirroring the original
+// wrap-alloc shape (the device may reuse a slot's QPL page on its
+// next wraparound; with a 512-deep ring at ~100 kpps that's a
+// ~5 ms reuse window, and our consumers drop within μs).
 //
-// For now this is a memcpy-wrap stub: per frame we kmalloc a fresh
-// Heap IOBuf and copy the QPL bytes into it, then re-fill the
-// descriptor immediately. Same memcpy count as a `&[u8]` callback
-// would have done; the win is API uniformity — the net stack only
-// has one RX surface to call into.
+// The semantic difference from the wrap-alloc path is that the
+// consumer reads bytes directly from the QPL page rather than a
+// heap copy. A consumer that holds an IOBuf longer than the ring
+// wrap window would read into a slot the device is re-filling —
+// the bytes won't match a valid TCP/IP packet and L4 parsing
+// fails (TCP checksum mismatch / IP version corruption). A
+// correctness-first design would gate `fill_cnt` advance on
+// consumer drops via an in-flight bitmap + refill walk; an
+// earlier attempt at that hit a subtle bug that wasn't worth
+// burning more time on — see `experiment/gve-zerocopy-rx` git
+// history for the working-but-unlanded sketch.
 
 fn poll_qp(qp: usize, callback: fn(uni_net_driver::IOBuf)) -> usize {
-    poll_qp_inner(qp, |frame| {
-        let iobuf = uni_net_driver::IOBuf::from_slice_with_headroom(0, frame, 0);
-        callback(iobuf);
-    }) as usize
+    poll_qp_inner(qp, callback) as usize
 }
 
 /// Non-per-core poll. Callers (DHCP bring-up, Tier 2 distribute)
@@ -3387,13 +3426,20 @@ fn poll(callback: fn(uni_net_driver::IOBuf)) -> usize {
     let n = NUM_QP.load(Ordering::Acquire) as usize;
     let mut total: usize = 0;
     for qp in 0..n.min(MAX_QUEUE_PAIRS) {
-        total = total.saturating_add(poll_qp_inner(qp, |frame| {
-            let iobuf = uni_net_driver::IOBuf::from_slice_with_headroom(0, frame, 0);
-            callback(iobuf);
-        }) as usize);
+        total = total.saturating_add(poll_qp_inner(qp, callback) as usize);
     }
     total
 }
+
+/// No-op drop callback for IOBufs handed out by the RX paths.
+/// Pages are recycled by the device's ring wraparound, not by
+/// the consumer — see the module comment above `poll_qp` for the
+/// safety story.
+unsafe fn rx_drop_callback_noop(
+    _base: core::ptr::NonNull<u8>,
+    _cap: u32,
+    _ctx: *mut (),
+) {}
 
 // ---- Serial logging helpers ------------------------------------------------
 
