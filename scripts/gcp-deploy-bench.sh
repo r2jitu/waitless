@@ -41,7 +41,11 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 UNI_NAME="${UNIKERNEL_GCE_NAME:-unikernel-webserver}"
-UNI_ZONE="${UNIKERNEL_GCE_ZONE:-us-west1-a}"
+# us-west1-c: c3 family availability + matches deploy-gcloud.sh's
+# zone default. Both VMs must co-locate (cross-zone same-region
+# RTT is ~5 ms — enough to RTT-bound `http_close_max` to single-
+# digit-kHz instead of the >100k the server stack can sustain).
+UNI_ZONE="${UNIKERNEL_GCE_ZONE:-us-west1-c}"
 
 KVM_NAME="${GCP_KVM_VM_NAME:-kvm-vm}"
 KVM_ZONE="${GCP_KVM_VM_ZONE:-$UNI_ZONE}"
