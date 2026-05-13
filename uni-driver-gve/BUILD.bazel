@@ -6,7 +6,10 @@ package(default_visibility = ["//visibility:public"])
 # MMIO + PCI; gve has its own BAR-register ABI, not VirtIO.
 rust_library(
     name = "uni-driver-gve",
-    srcs = ["src/lib.rs"],
+    srcs = [
+        "src/lib.rs",
+        "src/dqo.rs",
+    ],
     crate_name = "uni_driver_gve",
     target_compatible_with = ["@platforms//os:none"],
     deps = [
