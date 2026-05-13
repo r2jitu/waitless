@@ -25,6 +25,35 @@ bazel_dep(name = "rules_rust", version = "0.69.0")
 # test that spawns the guest needs.
 register_toolchains("@bazel_tools//tools/python:autodetecting_toolchain")
 
+# Register a hermetic Python 3.12 alongside the autodetecting
+# toolchain. `pip.parse` (below) requires a `python.toolchain(...)`
+# of the same version to be visible — it uses the bundled
+# interpreter to evaluate wheel environment markers (`os_name`,
+# `python_full_version`, etc.). The autodetecting toolchain stays
+# first in the registry order, so py_test execution still uses the
+# host `python3` and tests keep their direct access to the
+# guest-spawn paths (HVF / QEMU launcher subprocesses), but
+# pip-resolution gets the deterministic interpreter it needs.
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(
+    python_version = "3.12",
+    is_default = False,
+)
+
+# Pip dependency hub. py_test targets that need a third-party
+# Python package (aioquic for the h3 burst test) consume them as
+# `@pip//aioquic`. `requirements.txt` is generated from
+# `requirements.in` via `pip-compile --generate-hashes` — regen
+# with `pip-compile --generate-hashes --output-file=requirements.txt requirements.in`
+# when a dep changes.
+pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+pip.parse(
+    hub_name = "pip",
+    python_version = "3.12",
+    requirements_lock = "//:requirements.txt",
+)
+use_repo(pip, "pip")
+
 # Patch rules_rust to add aarch64-unknown-none to the platform registry.
 # Without this, crate_universe marks crates as incompatible for our
 # aarch64 bare-metal target. x86_64-unknown-none is already registered.

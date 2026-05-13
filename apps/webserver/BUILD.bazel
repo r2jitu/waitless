@@ -1,3 +1,4 @@
+load("@pip//:requirements.bzl", "requirement")
 load("@rules_python//python:defs.bzl", "py_test")
 load("@rules_rust//rust:defs.bzl", "rust_library")
 load("//bazel/rules:unikernel.bzl", "port_fwd", "unikernel_binary")
@@ -77,7 +78,13 @@ unikernel_app_test(
         "local",
     ],
     test_rule = py_test,
-    deps = ["//scripts:test_helpers"],
+    deps = [
+        "//scripts:test_helpers",
+        # `aioquic` is the QUIC client driving `test_h3_*` cases.
+        # Wheel + transitive deps come from the pip hub generated in
+        # MODULE.bazel from `//:requirements.txt`.
+        requirement("aioquic"),
+    ],
 )
 
 # Multi-core integration test. HVF-only: Apple's Hypervisor.framework
