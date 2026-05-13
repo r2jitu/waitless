@@ -88,14 +88,12 @@ const SEGMENT_SIZE: u16 = 64;
 /// and per-conn handler tasks will have starved out.
 const MAX_SEGMENTS: usize = 1023;
 const NULL_SLOT: u16 = 0xFFFF;
-const RX_BUF_SIZE: usize = 8192;
-/// Inline RX-chunk slots per `TcpConnection`. 8 slots × ~1024 B per
-/// chunk covers `RX_BUF_SIZE` (8 KiB) comfortably for the common
-/// MSS-1460 case (≤ 6 chunks fill the window). Inline avoids the
-/// per-conn `VecDeque` heap allocation that the previous design
-/// paid on every SYN-receive AND the `Option<VecDeque>` branch on
-/// every per-segment `rx_push` / `rx_pop` call.
-const RX_SLOTS: usize = 8;
+/// Per-conn RX ring depth. Lifted out of `RX_BUF_SIZE` so the cap
+/// fits the rcv_wnd field (u16). 8 KiB matches the previous chunk-
+/// list's effective capacity (`RX_BUF_SIZE`) and is enough for a
+/// full HTTP request line + headers without back-pressure for the
+/// shapes we benchmark against.
+const RX_RING_BYTES: usize = 8192;
 /// IPv4 max TCP segment payload: MTU(1500) - IP(20) - TCP(20) = 1460.
 const MSS_V4: usize = 1460;
 /// IPv6 max TCP segment payload: MTU(1500) - IPv6(40) - TCP(20) = 1440.
@@ -120,6 +118,17 @@ fn mss_for(local_ip: IpAddr) -> usize {
     }
 }
 
+/// Active `TcpRecv` future's destination buffer. The future
+/// registers this pointer + capacity when it parks, so a subsequent
+/// `tcp_receive` can copy payload bytes straight into the user buf
+/// — skipping the per-conn ring. Cleared by the future's `Drop`
+/// (cancel safety) and by `deliver_payload` after writing.
+#[derive(Clone, Copy)]
+struct RecvBufSlot {
+    ptr: *mut u8,
+    cap: u16,
+}
+
 pub struct TcpConnection {
     pub state: TcpState,
     /// Peer's IP — IPv4 or IPv6. Used as the destination of every
@@ -136,26 +145,40 @@ pub struct TcpConnection {
     snd_una: u32,
     rcv_nxt: u32,
     rcv_wnd: u16,
-    /// In-order RX chunk list. `None` until the connection is
-    /// accepted (allocated in `tcp_receive` SYN handling), then a
-    /// `VecDeque<IOBuf>` whose total visible-payload length is at
-    /// most `RX_BUF_SIZE` bytes. Each `rx_push` appends one chunk;
-    /// `rx_pop` walks chunks left-to-right copying into the user
-    /// buffer, dropping each chunk when fully drained or trimming
-    /// it via `IOBuf::consume(n)` on partial drain. Drop runs the
-    /// IOBuf chain's drop on connection reset, which returns each
-    /// chunk's backing buffer to its driver pool.
+    /// Per-conn RX ring buffer. Heap-allocated once at
+    /// `TcpConnection::alloc_storage` (lazily on first SYN that
+    /// lands on a fresh slot) and reused across SYN/close cycles.
+    /// `tcp_receive` writes payload bytes here via `deliver_payload`
+    /// (when there's no active recv slot to direct-copy into) or
+    /// when direct-copy doesn't consume the entire segment.
+    /// `async_recv` drains via `rx_ring_pop`.
     ///
-    /// The `Option` is the SYN-time admission gate — if the
-    /// `VecDeque::with_capacity` allocation fails on a fresh
-    /// connection we refuse the connection rather than panic.
-    rx_slots: [Option<uni_iobuf::IOBuf>; RX_SLOTS],
-    rx_head: u8,
-    rx_tail: u8,
-    /// Cached total length of `rx_slots` payloads. Avoids walking
-    /// the slots on every `rx_used` / `rx_free` call (TCP segment
-    /// processing reads them per-segment for the window field).
-    rx_used: usize,
+    /// Inline `[u8; RX_RING_BYTES]` would bloat the per-slot
+    /// footprint by 8 KiB × every slot in the per-core pool; with
+    /// the segmented-pool growth ceiling at MAX_SEGMENTS × SEGMENT_SIZE
+    /// that's ~512 MiB worst-case. Boxing the ring keeps idle
+    /// segments cheap and only materialises 8 KiB per live conn.
+    rx_ring: Option<Box<[u8; RX_RING_BYTES]>>,
+    rx_head: u16,
+    rx_tail: u16,
+    /// Bytes currently in `rx_ring`. Cached so the per-segment
+    /// rcv_wnd calc doesn't have to (head - tail) modulo every time.
+    rx_used: u16,
+    /// Bytes `deliver_payload` wrote directly into a parked
+    /// `TcpRecv`'s user buf via `recv_buf_slot`. Read + cleared by
+    /// `async_recv` on the very next poll (the conn knows the next
+    /// poll's `buf` is the same one whose pointer we already wrote
+    /// to, because `TcpRecv::poll` doesn't change the buf between
+    /// register and pop). Stored separately from `rx_ring` so the
+    /// fast-path bypass doesn't have to memmove anything.
+    direct_bytes: u16,
+    /// User buf registered by a parked `TcpRecv` future for the
+    /// direct-copy fast path. Cleared by either:
+    ///   * `TcpRecv::Drop` (the future was dropped / cancelled
+    ///     before resolving) — prevents `deliver_payload` from
+    ///     writing into freed user memory.
+    ///   * `deliver_payload` itself, after it consumes the slot.
+    recv_buf_slot: Option<RecvBufSlot>,
     listener_port: u16,
     accepted: bool,
     /// Incremented every time `free_connection` resets this slot, so
@@ -165,7 +188,7 @@ pub struct TcpConnection {
     /// NOT reset it; `free_connection` bumps it explicitly.
     generation: u16,
     /// Parked `TcpRecv` waker. Set by `register_recv_waker` on the
-    /// owning core; woken when data lands in `rx_slots` or the
+    /// owning core; woken when data lands in the ring or the
     /// peer closes. Per-core ownership — no lock needed.
     recv_waker: Option<Waker>,
     /// Free-list link. When this slot is on the free list (state ==
@@ -187,11 +210,13 @@ impl TcpConnection {
             snd_nxt: 0,
             snd_una: 0,
             rcv_nxt: 0,
-            rcv_wnd: RX_BUF_SIZE as u16,
-            rx_slots: [const { None }; RX_SLOTS],
+            rcv_wnd: RX_RING_BYTES as u16,
+            rx_ring: None,
             rx_head: 0,
             rx_tail: 0,
             rx_used: 0,
+            direct_bytes: 0,
+            recv_buf_slot: None,
             listener_port: 0,
             accepted: false,
             generation: 0,
@@ -200,93 +225,150 @@ impl TcpConnection {
         }
     }
 
+    /// Lazy-allocate the per-conn RX ring on the first SYN that
+    /// lands on this slot. Subsequent close+reuse cycles keep the
+    /// allocation (the pool's free-list bumps `generation` but
+    /// doesn't touch `rx_ring`); see `free_connection` for the
+    /// reset-preserve dance.
+    fn ensure_rx_ring(&mut self) -> bool {
+        if self.rx_ring.is_some() {
+            return true;
+        }
+        // The ring is reused across SYN/close cycles. Box::new
+        // on a [u8; 8192] allocates 8 KiB on the global heap;
+        // OOM at SYN time refuses the connection — same admission-
+        // gate behaviour the previous `VecDeque<IOBuf>` design had.
+        let mut v: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        if v.try_reserve_exact(RX_RING_BYTES).is_err() {
+            return false;
+        }
+        v.resize(RX_RING_BYTES, 0);
+        let boxed: Box<[u8]> = v.into_boxed_slice();
+        // SAFETY: we just resized to RX_RING_BYTES, so the slice
+        // length matches the array's. into_boxed_slice() returns a
+        // Box<[u8]>; we cast to Box<[u8; RX_RING_BYTES]>.
+        let ptr = Box::into_raw(boxed) as *mut [u8; RX_RING_BYTES];
+        self.rx_ring = Some(unsafe { Box::from_raw(ptr) });
+        true
+    }
+
     #[inline]
     fn rx_used(&self) -> usize {
-        self.rx_used
+        self.rx_used as usize
     }
 
     #[inline]
     fn rx_free(&self) -> usize {
-        // -1 to leave room for the FIN-with-data edge case the
-        // ring-buffer version reserved; behavioural parity.
-        RX_BUF_SIZE.saturating_sub(self.rx_used).saturating_sub(1)
+        // -1 reserves one slot — keeps head==tail unambiguous as
+        // "empty" without forcing a separate "full" flag. Matches
+        // the historic behaviour of the IOBuf-list version.
+        (RX_RING_BYTES - 1).saturating_sub(self.rx_used as usize)
     }
 
-    /// True when the slot ring has no IOBuf available to push into.
-    /// Caller treats this the same as window-full: drop the
-    /// segment and let the sender retransmit when our advertised
-    /// `rcv_wnd` opens.
-    #[inline]
-    fn rx_slots_full(&self) -> bool {
-        ((self.rx_tail as usize + 1) % RX_SLOTS) == self.rx_head as usize
-    }
-
-    /// Append an IOBuf chunk to the rx queue. `iobuf.data()` should
-    /// already be just the TCP segment payload (caller has consumed
-    /// past the TCP header). Returns the number of bytes accepted —
-    /// may be less than `iobuf.data().len()` if the receive window
-    /// is partially full, in which case the IOBuf is trimmed via
-    /// `IOBuf::trim_end(...)` before being pushed (the dropped
-    /// suffix isn't kept; the sender will retransmit when our
-    /// advertised window opens up).
-    fn rx_push(&mut self, mut iobuf: uni_iobuf::IOBuf) -> usize {
-        if self.rx_slots_full() { return 0; }
-        let free = RX_BUF_SIZE.saturating_sub(self.rx_used).saturating_sub(1);
-        if free == 0 { return 0; }
-        let len = iobuf.data().len();
-        let n = len.min(free);
-        if n == 0 { return 0; }
-        if n < len {
-            // Window can't take the whole segment; trim the trailing
-            // bytes so the chunk fits exactly. The sender will
-            // re-send those bytes on retransmit once `rcv_wnd` opens.
-            if iobuf.trim_end(len - n).is_err() {
-                return 0;
-            }
+    /// Write `payload` bytes into the conn's RX ring. Truncates to
+    /// the window's free space; the trimmed suffix is dropped (the
+    /// peer will retransmit once `rcv_wnd` opens).
+    fn rx_ring_push(&mut self, payload: &[u8]) -> usize {
+        if payload.is_empty() {
+            return 0;
         }
-        // SAFETY: `rx_tail < RX_SLOTS` always (kept in range by the
-        // mod below) and the slot at `rx_tail` is `None` because
-        // either it was just produced fresh by `new()` or `rx_pop`
-        // cleared it via `Option::take`. The full-check above
-        // guarantees we're not overwriting an in-flight chunk.
-        self.rx_slots[self.rx_tail as usize] = Some(iobuf);
-        self.rx_tail = ((self.rx_tail as usize + 1) % RX_SLOTS) as u8;
-        self.rx_used += n;
+        let free = self.rx_free();
+        if free == 0 {
+            return 0;
+        }
+        let n = payload.len().min(free);
+        let ring = match self.rx_ring.as_mut() {
+            Some(r) => r,
+            None => return 0,
+        };
+        let tail = self.rx_tail as usize;
+        if tail + n <= RX_RING_BYTES {
+            ring[tail..tail + n].copy_from_slice(&payload[..n]);
+        } else {
+            let first = RX_RING_BYTES - tail;
+            ring[tail..].copy_from_slice(&payload[..first]);
+            ring[..n - first].copy_from_slice(&payload[first..n]);
+        }
+        self.rx_tail = ((tail + n) % RX_RING_BYTES) as u16;
+        self.rx_used += n as u16;
         n
     }
 
-    fn rx_pop(&mut self, out: &mut [u8]) -> usize {
+    /// Deliver an in-sequence TCP payload to the consumer. Fast
+    /// path: if a `TcpRecv` future has registered a destination
+    /// slot, copy as many bytes as fit straight into the user buf
+    /// (one memcpy, no ring round-trip). Slow path: fall through
+    /// to the ring. Returns total bytes consumed (direct + ring) —
+    /// `rcv_nxt` advances by this much, and the segment trim happens
+    /// at the caller.
+    fn deliver_payload(&mut self, payload: &[u8]) -> usize {
         let mut written = 0;
-        while written < out.len() {
-            let head_idx = self.rx_head as usize;
-            let head = match &mut self.rx_slots[head_idx] {
-                Some(h) => h,
-                None => break,
-            };
-            let head_data = head.data();
-            let want = out.len() - written;
-            let take = want.min(head_data.len());
-            if take == 0 {
-                // Defensive: empty chunk shouldn't happen post-push,
-                // but if it does, drop and advance.
-                self.rx_slots[head_idx] = None;
-                self.rx_head = ((head_idx + 1) % RX_SLOTS) as u8;
-                continue;
-            }
-            out[written..written + take].copy_from_slice(&head_data[..take]);
-            written += take;
-            if take == head_data.len() {
-                // Fully drained — drop the IOBuf (releases its
-                // backing buffer to the driver pool) and advance.
-                self.rx_slots[head_idx] = None;
-                self.rx_head = ((head_idx + 1) % RX_SLOTS) as u8;
-            } else {
-                // Partial drain — advance the visible payload.
-                let _ = head.consume(take);
+        if let Some(slot) = self.recv_buf_slot.take() {
+            let cap = slot.cap as usize;
+            let take = payload.len().min(cap);
+            if take > 0 {
+                // SAFETY: `slot.ptr` was registered by `TcpRecv::poll`
+                // on this core; the future's `Drop` clears it (so
+                // it can't be dangling here). `slot.cap` is the
+                // length of the user buf. Both `slot.ptr` and
+                // `payload` are non-overlapping (separate
+                // allocations).
+                unsafe {
+                    ptr::copy_nonoverlapping(payload.as_ptr(), slot.ptr, take);
+                }
+                self.direct_bytes = take as u16;
+                written += take;
             }
         }
-        self.rx_used -= written;
+        if written < payload.len() {
+            written += self.rx_ring_push(&payload[written..]);
+        }
         written
+    }
+
+    /// Drain bytes from the ring (and any pending `direct_bytes`)
+    /// into `out`. `out` is the recv-future's user buf; if
+    /// `direct_bytes > 0` those bytes were already written there
+    /// by `deliver_payload` and we just need to consume them
+    /// counter-wise.
+    fn rx_pop(&mut self, out: &mut [u8]) -> usize {
+        let mut written = 0;
+        // Direct-copy bytes — already in `out` (same pointer),
+        // just claim them.
+        if self.direct_bytes > 0 {
+            let n = (self.direct_bytes as usize).min(out.len());
+            written = n;
+            self.direct_bytes -= n as u16;
+            // If the user buf was smaller than direct_bytes (which
+            // would only happen if poll didn't pass through the
+            // same buf — shouldn't, but be defensive), the rest is
+            // lost. Don't try to recover; this is the cancel-safety
+            // invariant.
+        }
+        if written >= out.len() {
+            return written;
+        }
+        if self.rx_used == 0 {
+            return written;
+        }
+        let ring = match self.rx_ring.as_mut() {
+            Some(r) => r,
+            None => return written,
+        };
+        let want = out.len() - written;
+        let take = want.min(self.rx_used as usize);
+        let head = self.rx_head as usize;
+        if head + take <= RX_RING_BYTES {
+            out[written..written + take].copy_from_slice(&ring[head..head + take]);
+        } else {
+            let first = RX_RING_BYTES - head;
+            out[written..written + first].copy_from_slice(&ring[head..]);
+            out[written + first..written + take]
+                .copy_from_slice(&ring[..take - first]);
+        }
+        self.rx_head = ((head + take) % RX_RING_BYTES) as u16;
+        self.rx_used -= take as u16;
+        written + take
     }
 }
 
@@ -653,10 +735,17 @@ fn alloc_connection(core: u32) -> Option<usize> {
         // from the free list, so no other code holds a reference.
         let c = unsafe { &mut *conn_ptr(core, slot as usize) };
         // Preserve generation across reuse so any still-outstanding
-        // async handle observes the bump on its next hook call.
+        // async handle observes the bump on its next hook call. Also
+        // preserve the 8 KiB RX ring allocation — `free_connection`
+        // already kept it across the close cycle, but the `*c =
+        // TcpConnection::new()` reset would drop it without this
+        // hand-off, costing one heap free + one re-allocation per
+        // close-conn /health cycle on the bench hot path.
         let preserved_gen = c.generation;
+        let preserved_ring = c.rx_ring.take();
         *c = TcpConnection::new();
         c.generation = preserved_gen;
+        c.rx_ring = preserved_ring;
         return Some(slot as usize);
     }
     // Pool grew to MAX_SEGMENTS without a free slot — try to reclaim
@@ -719,12 +808,14 @@ fn free_connection(core: u32, slot: usize) {
     // the slot has been reused on its next hook call. Preserved
     // across the reset below.
     let next_gen = c.generation.wrapping_add(1);
-    // Assigning a fresh TcpConnection drops the old one, which
-    // walks `rx_slots: [Option<IOBuf>; RX_SLOTS]` and drops each
-    // remaining IOBuf — running its drop callback returns each
-    // chunk's backing buffer to the driver pool.
+    // Preserve the 8 KiB heap-allocated RX ring across reuse — re-
+    // allocating it on every SYN would cost a `Box::new([0; 8192])`
+    // per accept on the close-conn /health hot path. The next SYN's
+    // `ensure_rx_ring` short-circuits when `rx_ring.is_some()`.
+    let preserved_ring = c.rx_ring.take();
     *c = TcpConnection::new();
     c.generation = next_gen;
+    c.rx_ring = preserved_ring;
     // Return the slot to the pool's free list. O(1) push; the next
     // `alloc_connection` call picks it up in O(1) too.
     POOLS.at(core).free_slot(slot as u16);
@@ -1274,16 +1365,13 @@ fn send_rst(local_ip: IpAddr, dst_ip: IpAddr, src_port: u16, dst_port: u16, seq:
 /// `src_ip` and `dst_ip` are family-tagged so v4 and v6 connections
 /// share the same TCB pool, hash table, and dispatch path.
 ///
-/// Takes ownership of the segment as an `IOBuf` whose `data()` is
-/// the full TCP segment (header + payload). After header parse,
-/// `iobuf.consume(data_offset)` advances the visible payload past
-/// the header so the IOBuf can be moved into `rx_push` directly
-/// (no memcpy at the protocol-recv boundary). Control-only
-/// segments (SYN, RST, FIN-only, ACK-only) drop the IOBuf at
-/// end-of-scope, returning its backing buffer to the driver pool.
-pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut iobuf: uni_iobuf::IOBuf) {
-    let data = iobuf.data();
-    let hdr = match TcpHeader::try_ref_from(data) {
+/// `segment` is a borrow over driver-pool storage (or the cross-core
+/// inbox slot) covering the full TCP segment (header + payload).
+/// Only valid for this call: a parked `TcpRecv` may consume payload
+/// bytes via direct-copy, and the rest land in the per-conn ring —
+/// both happen before this function returns.
+pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, segment: &[u8]) {
+    let hdr = match TcpHeader::try_ref_from(segment) {
         Some(h) => h,
         None => return,
     };
@@ -1293,7 +1381,11 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut iobuf: uni_iobuf::IOBuf) 
     let ack = ntohl(hdr.ack);
     let flags = hdr.flags;
     let data_offset = ((hdr.data_offset >> 4) as usize) * 4;
-    let payload_len = if data.len() > data_offset { data.len() - data_offset } else { 0 };
+    let payload_len = if segment.len() > data_offset {
+        segment.len() - data_offset
+    } else {
+        0
+    };
 
     // Determine which core owns this packet.
     let core = uni_kernel::cpu_id();
@@ -1355,6 +1447,15 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut iobuf: uni_iobuf::IOBuf) 
 
         {
             let c = unsafe { &mut *conn_ptr(core, slot) };
+            // Allocate the per-conn RX ring on first use (preserved
+            // across reuse; see `free_connection`). OOM here refuses
+            // the connection rather than proceeding with a missing
+            // ring that would silently drop every payload byte.
+            if !c.ensure_rx_ring() {
+                send_rst(dst_ip, src_ip, dst_port, src_port, 0, seq + 1);
+                free_connection(core, slot);
+                return;
+            }
             c.state = TcpState::SynReceived;
             c.remote_ip = src_ip;
             c.local_ip = dst_ip;
@@ -1367,14 +1468,13 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut iobuf: uni_iobuf::IOBuf) 
             c.listener_port = dst_port;
             c.accepted = false;
 
-            // RX chunk slots are inline (`rx_slots: [Option<IOBuf>;
-            // RX_SLOTS]`) and pre-zeroed by `TcpConnection::new()` —
-            // no per-conn heap allocation here. Reset cursors so the
-            // connection starts with an empty ring whether the slot
-            // was freshly allocated or reused from the free list.
+            // Ring cursors — reset on every SYN so a slot reused from
+            // the free list starts empty.
             c.rx_head = 0;
             c.rx_tail = 0;
             c.rx_used = 0;
+            c.direct_bytes = 0;
+            c.recv_buf_slot = None;
         }
 
         // Publish this 4-tuple to the per-core hash index so the
@@ -1386,7 +1486,7 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut iobuf: uni_iobuf::IOBuf) 
         // Send SYN+ACK
         {
             let c = unsafe { &*conn_ptr(core, slot) };
-            send_segment(dst_ip, src_ip, dst_port, src_port, c.snd_nxt, c.rcv_nxt, TCP_SYN | TCP_ACK, RX_BUF_SIZE as u16, &[]);
+            send_segment(dst_ip, src_ip, dst_port, src_port, c.snd_nxt, c.rcv_nxt, TCP_SYN | TCP_ACK, RX_RING_BYTES as u16, &[]);
         }
         unsafe {
             let cp = conn_ptr(core, slot);
@@ -1445,22 +1545,14 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut iobuf: uni_iobuf::IOBuf) 
     // Process data
     if payload_len > 0 && (c.state == TcpState::Established || c.state == TcpState::FinWait1 || c.state == TcpState::FinWait2) {
         if seq == c.rcv_nxt {
-            // Advance the IOBuf's visible payload past the TCP
-            // header so `data()` is just the segment body, then
-            // hand ownership to `rx_push`. Trim trailing pad
-            // bytes (the IPv4 caller already trimmed at the IP
-            // layer, so `visible == payload_len` typically; the
-            // belt-and-braces check costs nothing).
-            if iobuf.consume(data_offset).is_err() {
-                return;
-            }
-            let visible = iobuf.data().len();
-            if visible > payload_len
-                && iobuf.trim_end(visible - payload_len).is_err()
-            {
-                return;
-            }
-            let pushed = c.rx_push(iobuf);
+            // Slice payload bytes out of the segment and deliver —
+            // direct-copy into a parked recv buf when one is
+            // registered, with overflow into the ring; or straight
+            // to the ring when no recv is parked. `deliver_payload`
+            // is synchronous on this core so the borrow into
+            // `segment` is released before we return.
+            let payload = &segment[data_offset..data_offset + payload_len];
+            let pushed = c.deliver_payload(payload);
             c.rcv_nxt = c.rcv_nxt.wrapping_add(pushed as u32);
             c.rcv_wnd = c.rx_free() as u16;
             // Wake any `TcpRecvReady` parked on this conn. Same core
@@ -1611,7 +1703,11 @@ pub fn is_readable_or_closed(handle: *mut (), generation: u16) -> bool {
     if c.generation != generation {
         return true; // stale → treat as closed
     }
-    if c.rx_used() > 0 {
+    // `direct_bytes > 0` covers the case where `deliver_payload`
+    // wrote bytes straight into the parked `TcpRecv`'s user buf
+    // and bypassed the ring entirely — `rx_used` is 0 in that
+    // shape, but the future still has bytes to claim.
+    if c.rx_used() > 0 || c.direct_bytes > 0 {
         return true;
     }
     matches!(c.state, TcpState::Closed | TcpState::CloseWait
@@ -1680,11 +1776,21 @@ pub fn shutdown_all() {
             // eventloop; only BSP runs this and it owns its own
             // slots, with read-only access to AP slots.
             let c = unsafe { &mut *conn_ptr(core, slot) };
-            if c.state == TcpState::Closed || c.state == TcpState::Listen {
-                continue;
+            if c.state != TcpState::Closed && c.state != TcpState::Listen {
+                send_rst(c.local_ip, c.remote_ip, c.local_port, c.remote_port, c.snd_nxt, c.rcv_nxt);
+                free_connection(core, slot);
             }
-            send_rst(c.local_ip, c.remote_ip, c.local_port, c.remote_port, c.snd_nxt, c.rcv_nxt);
-            free_connection(core, slot);
+            // Release the per-conn RX ring at shutdown — `free_connection`
+            // preserves it across normal close+reuse (the next SYN re-
+            // uses the allocation), but at process shutdown there are no
+            // more SYNs, and the preserved 8 KiB blocks would show up in
+            // `HEAP_LEAK_CHECK` as residual heap that the cooldown didn't
+            // reclaim. Drop here so the leak-check delta returns to zero.
+            // SAFETY: same per-fn invariant as above; the slot is in
+            // Closed (post-`free_connection`) or Listen state, neither
+            // of which observes `rx_ring`.
+            let c = unsafe { &mut *conn_ptr(core, slot) };
+            c.rx_ring = None;
         }
     }
     // The caller (`net::bare_shutdown_all`) flushes the virtio TX
@@ -1741,6 +1847,43 @@ pub fn clear_recv_waker(handle: *mut (), generation: u16) {
         return;
     }
     c.recv_waker = None;
+}
+
+/// Register the `&mut buf` of a parked `TcpRecv` future as the
+/// direct-copy destination for the next inbound TCP payload. Called
+/// from `TcpRecv::poll` before parking; `deliver_payload` reads this
+/// slot, writes up to `cap` bytes straight into `ptr`, increments
+/// `direct_bytes`, and clears the slot.
+///
+/// Stale `generation` is a no-op — the future will see the closed
+/// state via `is_readable_or_closed` and resolve through `do_recv`.
+pub fn set_recv_buf_slot(handle: *mut (), generation: u16, ptr: *mut u8, cap: u16) {
+    let (core, slot) = match decode_handle(handle) {
+        Some(v) => v,
+        None => return,
+    };
+    let c = unsafe { &mut *conn_ptr(core, slot) };
+    if c.generation != generation {
+        return;
+    }
+    c.recv_buf_slot = Some(RecvBufSlot { ptr, cap });
+}
+
+/// Drop the registered direct-copy slot. Called from `TcpRecv::Drop`
+/// (cancel-safety: future was dropped before waker fired) and from
+/// `TcpRecv::poll` after resolving Ready. Stale `generation` is a
+/// no-op — the conn slot is already reused for someone else and
+/// the new owner's `set_recv_buf_slot` writes will dominate.
+pub fn clear_recv_buf_slot(handle: *mut (), generation: u16) {
+    let (core, slot) = match decode_handle(handle) {
+        Some(v) => v,
+        None => return,
+    };
+    let c = unsafe { &mut *conn_ptr(core, slot) };
+    if c.generation != generation {
+        return;
+    }
+    c.recv_buf_slot = None;
 }
 
 /// Async `TcpSendChain` try-send hook. Walks `chain` via cursor

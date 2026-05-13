@@ -371,31 +371,19 @@ pub fn send_to_addr(dst: IpAddr, src_port: u16, dst_port: u16, data: &[u8]) {
 /// `uni_runtime::net::UdpSocket` is bound to the destination port;
 /// otherwise drops it.
 ///
-/// The caller hands an owned `IOBuf` whose `data()` slice is the
-/// UDP datagram (header at the front, then payload). After parsing
-/// the header, this function `consume()`s 8 bytes off the front of
-/// the IOBuf so its visible payload becomes just the body, and
-/// forwards via `deliver_udp`. The IOBuf moves into the inbox slot
-/// — no memcpy at the protocol-recv boundary on the IPv4 fast
-/// path. (The IPv6 caller currently wraps a borrowed `&[u8]` slice
-/// in a Heap IOBuf inline before calling here; that's a per-
-/// packet alloc the IPv4 fast path avoids.)
-pub fn udp_receive(src_ip: IpAddr, _dst_ip: IpAddr, mut iobuf: uni_iobuf::IOBuf) {
-    let data = iobuf.data();
-    let Some(hdr) = UdpHeader::try_ref_from(data) else { return };
+/// `segment` is a borrow over driver-pool storage covering the full
+/// UDP datagram (header + body). After header parse the body slice
+/// is handed to `deliver_udp`, which copies it into the per-bind
+/// inbox slot — synchronous w.r.t. this call, so the borrow is
+/// released before we return.
+pub fn udp_receive(src_ip: IpAddr, _dst_ip: IpAddr, segment: &[u8]) {
+    let Some(hdr) = UdpHeader::try_ref_from(segment) else { return };
     let dst_port = ntohs(hdr.dst_port);
     let src_port = ntohs(hdr.src_port);
     let udp_len = ntohs(hdr.length) as usize;
-    if udp_len < 8 || udp_len > data.len() {
+    if udp_len < 8 || udp_len > segment.len() {
         return;
     }
-    let body_len = udp_len - 8;
-    // Narrow visible payload to just the UDP body — `narrow` runs
-    // `consume(8)` then trims any trailing IP padding past the
-    // body length. NLL ends the `data` / `hdr` borrow chain after
-    // the integer extractions above so the mutable borrow is OK.
-    if iobuf.narrow(8, body_len).is_err() {
-        return;
-    }
-    let _ = uni_runtime::net::deliver_udp(dst_port, src_ip, src_port, iobuf);
+    let body = &segment[8..udp_len];
+    let _ = uni_runtime::net::deliver_udp(dst_port, src_ip, src_port, body);
 }

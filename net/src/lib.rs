@@ -36,6 +36,8 @@ static BARE_TCP_BACKEND: uni_runtime::net::TcpBackend = uni_runtime::net::TcpBac
     do_recv: tcp::async_recv,
     register_recv_waker: tcp::register_recv_waker,
     clear_recv_waker: tcp::clear_recv_waker,
+    set_recv_buf_slot: Some(tcp::set_recv_buf_slot),
+    clear_recv_buf_slot: Some(tcp::clear_recv_buf_slot),
     close: tcp::close,
     try_send: tcp::async_try_send_chain,
     register_send_waker: tcp::register_send_waker,
@@ -340,14 +342,8 @@ pub fn net_receive(frame: &[u8]) {
             let src = types::IpAddr::V4(types::Ipv4Addr { addr: pkt.src.addr });
             let dst = types::IpAddr::V4(types::Ipv4Addr { addr: pkt.dst.addr });
             match proto {
-                ipv4::PROTO_UDP => {
-                    let iobuf = uni_iobuf::IOBuf::from_slice_with_headroom(0, pkt.payload, 0);
-                    udp::udp_receive(src, dst, iobuf);
-                }
-                ipv4::PROTO_TCP => {
-                    let iobuf = uni_iobuf::IOBuf::from_slice_with_headroom(0, pkt.payload, 0);
-                    tcp::tcp_receive(src, dst, iobuf);
-                }
+                ipv4::PROTO_UDP => udp::udp_receive(src, dst, pkt.payload),
+                ipv4::PROTO_TCP => tcp::tcp_receive(src, dst, pkt.payload),
                 _ => {}
             }
         }
@@ -615,13 +611,10 @@ fn ipv6_receive_frame(frame: &[u8], src_mac: types::MacAddr) {
         proto @ (ipv6::next_header::TCP | ipv6::next_header::UDP) => {
             let src = types::IpAddr::V6(pkt.src);
             let dst = types::IpAddr::V6(pkt.dst);
-            // Bridge: heap-wrap until tcp_receive / udp_receive
-            // take `&[u8]` in the follow-up commit.
-            let iobuf = uni_iobuf::IOBuf::from_slice_with_headroom(0, pkt.payload, 0);
             if proto == ipv6::next_header::TCP {
-                tcp::tcp_receive(src, dst, iobuf);
+                tcp::tcp_receive(src, dst, pkt.payload);
             } else {
-                udp::udp_receive(src, dst, iobuf);
+                udp::udp_receive(src, dst, pkt.payload);
             }
         }
         _ => {}

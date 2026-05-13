@@ -307,6 +307,26 @@ pub struct TcpBackend {
     /// is a no-op.
     pub clear_recv_waker: fn(handle: *mut (), generation: u16),
 
+    /// Optional direct-copy fast path. When set, `TcpRecv::poll`
+    /// registers its `&mut buf` (pointer + capacity) on the conn
+    /// before parking; the next inbound TCP payload writes bytes
+    /// straight into that buffer, skipping the per-conn ring. The
+    /// future's next poll claims the byte count from the conn
+    /// (`do_recv` returns it) without copying again.
+    ///
+    /// Cancel-safety: `TcpRecv::Drop` calls `clear_recv_buf_slot`
+    /// so a future dropped before the waker fires never leaves a
+    /// dangling pointer that the next `tcp_receive` would write
+    /// into. Native backends leave both `None` — POSIX `recv()`
+    /// already copies in one shot at the syscall boundary.
+    pub set_recv_buf_slot: Option<fn(
+        handle: *mut (),
+        generation: u16,
+        ptr: *mut u8,
+        cap: u16,
+    )>,
+    pub clear_recv_buf_slot: Option<fn(handle: *mut (), generation: u16)>,
+
     /// Send FIN on the conn and release the backend's per-stream
     /// state. Idempotent: a stale `gen` (slot already reused) or
     /// already-closed conn is a no-op. Called from
@@ -717,16 +737,49 @@ impl<'a> Future for TcpRecv<'a> {
         // Fast path — probe, read, clear any stale waker.
         if (b.has_data)(h, g) {
             (b.clear_recv_waker)(h, g);
+            if let Some(clear) = b.clear_recv_buf_slot {
+                clear(h, g);
+            }
             return Poll::Ready((b.do_recv)(h, g, this.buf));
         }
-        // Register waker, then re-check — closes the wake-before-park
-        // race with the backend's wake site.
+        // Register waker AND (optionally) the direct-copy slot.
+        // The slot lets `tcp_receive` write payload bytes straight
+        // into `this.buf` when the next packet lands, bypassing
+        // the per-conn ring. Bare-metal sets `set_recv_buf_slot`;
+        // native leaves it `None` and copies via `do_recv` as
+        // before.
+        if let Some(set) = b.set_recv_buf_slot {
+            // Cap at u16 to match the conn-side field width — TCP
+            // recv buffers larger than 64 KiB would just truncate
+            // the registered slot but the ring would absorb the
+            // remainder on the next call.
+            let cap = this.buf.len().min(u16::MAX as usize) as u16;
+            set(h, g, this.buf.as_mut_ptr(), cap);
+        }
         (b.register_recv_waker)(h, g, cx.waker());
         if (b.has_data)(h, g) {
             (b.clear_recv_waker)(h, g);
+            if let Some(clear) = b.clear_recv_buf_slot {
+                clear(h, g);
+            }
             return Poll::Ready((b.do_recv)(h, g, this.buf));
         }
         Poll::Pending
+    }
+}
+
+impl<'a> Drop for TcpRecv<'a> {
+    fn drop(&mut self) {
+        // Cancel-safety: if the future is dropped before its waker
+        // fires (parent task aborted, select! losing branch, etc.),
+        // clear the recv_buf_slot pointer we registered above so a
+        // subsequent `tcp_receive` doesn't write into freed user
+        // memory.
+        if let Some(b) = tcp_backend() {
+            if let Some(clear) = b.clear_recv_buf_slot {
+                clear(self.handle, self.generation);
+            }
+        }
     }
 }
 
