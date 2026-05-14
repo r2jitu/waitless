@@ -1112,9 +1112,12 @@ fn stats_response() -> Response {
         // throughput; the same info is already in TX_PACKETS_PER_QP.)
         let _ = write!(
             w,
-            ",\"dqo_tx_miss_compl\":{},\"dqo_tx_reinject_compl\":{}",
+            ",\"dqo_tx_miss_compl\":{},\"dqo_tx_reinject_compl\":{}\
+              ,\"dqo_rx_compl_skipped\":{},\"dqo_rx_last_skip_status\":{}",
             uni_driver_gve::dqo::DQO_TX_MISS_COMPL.load(core::sync::atomic::Ordering::Relaxed),
             uni_driver_gve::dqo::DQO_TX_REINJECT_COMPL.load(core::sync::atomic::Ordering::Relaxed),
+            uni_driver_gve::dqo::DQO_RX_COMPL_SKIPPED.load(core::sync::atomic::Ordering::Relaxed),
+            uni_driver_gve::dqo::DQO_RX_LAST_SKIP_STATUS.load(core::sync::atomic::Ordering::Relaxed),
         );
 
         // SYN-ingress vs SYN-ACK-egress counters. Compared against a

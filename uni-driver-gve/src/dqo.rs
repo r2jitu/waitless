@@ -92,6 +92,21 @@ pub static DQO_TX_MISS_COMPL: core::sync::atomic::AtomicU64 =
 pub static DQO_TX_REINJECT_COMPL: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
+/// Count of RX completion descriptors we saw with a valid generation
+/// (device has written this slot) but that we did NOT deliver to the
+/// callback because one of: `buf_id` out of range, EOP bit clear, or
+/// `pkt_len == 0`. Non-zero means the device is emitting completions
+/// for malformed/error packets and the upper stack never sees them.
+/// Diagnostic for distinguishing in-driver drops vs NIC/fabric drops.
+pub static DQO_RX_COMPL_SKIPPED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// Snapshot of the status byte (offset 8) of the most-recently-seen
+/// skipped completion descriptor. Lets us tell whether skipped
+/// descs are "EOP clear" (fragmented?), "RX error" (bit-pattern in
+/// reserved bits), or some other anomaly without re-flashing.
+pub static DQO_RX_LAST_SKIP_STATUS: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(0);
+
 /// DQO RX buffer descriptor — 32 bytes (driver-written, points to a
 /// device-readable packet buffer).
 ///   0..2   buf_id                         (LE16)  echoed back in RX completion
@@ -492,7 +507,14 @@ pub(crate) fn poll_qp_inner<F: FnMut(&[u8])>(qp: usize, mut callback: F) -> u32 
             unsafe { ptr::read_volatile(desc_ptr.add(13)) },
         ]) as u32;
 
-        if buf_id < DQO_RX_POOL_BUFS && (status & DQO_RX_COMPL_STATUS_EOP) != 0 && pkt_len > 0 {
+        let delivered_this = buf_id < DQO_RX_POOL_BUFS
+            && (status & DQO_RX_COMPL_STATUS_EOP) != 0
+            && pkt_len > 0;
+        if !delivered_this {
+            DQO_RX_COMPL_SKIPPED.fetch_add(1, Ordering::Relaxed);
+            DQO_RX_LAST_SKIP_STATUS.store(status, Ordering::Relaxed);
+        }
+        if delivered_this {
             let buf_va = rx.qpl_base_va + (buf_id as u64) * (RX_BUFFER_SIZE as u64);
             if qp < RX_BYTES_PER_QP.len() {
                 RX_BYTES_PER_QP[qp].fetch_add(pkt_len as u64, Ordering::Relaxed);
