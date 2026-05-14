@@ -281,6 +281,16 @@ fn build_pkt_desc(buf_addr: u64, flags: u8, compl_tag: u16, buf_size: u16) -> u1
 /// Slice-shaped send: copy `data` into the next ring's bounce buffer,
 /// emit a (general-ctx, pkt) descriptor pair, advance fill_cnt,
 /// doorbell unless deferred.
+///
+/// `#[inline(never)]` is load-bearing. When this function was a
+/// private `fn send_on_qp_dqo` in lib.rs, rustc inlined it into
+/// `send()`, bloating the hot dispatcher to ~1.2 KiB (vs ~220 B
+/// when un-inlined). The bloat hurt i-cache locality enough to
+/// 5× the fresh-conn (`http_close_max`) rate from ~2 k to ~10 k
+/// req/s at 1 core. The module boundary alone happens to defeat
+/// inlining today, but pin it explicitly so future refactors
+/// don't silently regress.
+#[inline(never)]
 pub(crate) fn send_on_qp(qp: usize, data: &[u8]) -> bool {
     if qp >= MAX_QUEUE_PAIRS || data.is_empty() || data.len() > (RX_BUFFER_SIZE as usize) {
         return false;
