@@ -57,11 +57,40 @@ pub(crate) const DQO_TX_RE_INTERVAL: u32 = 32;
 ///   2..4   tx_head_or_tag                 (LE16)  packet=compl_tag, descriptor=head+1
 ///   4..8   reserved                       (LE32)
 pub(crate) const DQO_TX_COMPL_SIZE: usize = 8;
-/// Descriptor completion. Carries `tx_head` (= last desc fetched
-/// by HW + 1) at compl bytes 2-3 — the authoritative driver
-/// `done_cnt` value. Emitted in response to a `report_event` bit
-/// in the TX descriptor.
+/// Per Linux's `gve_desc_dqo.h`:
+///   2: PKT      — normal per-packet completion (success)
+///   3: MISS     — device dropped this packet mid-flight; will try to
+///                 reinject. The MISS bit may also be encoded inline
+///                 in a PKT-typed completion via `GVE_ALT_MISS_COMPL_BIT`.
+///   4: DESC     — emitted when `report_event` was set on a desc;
+///                 carries `tx_head` (last desc fetched by HW + 1).
+///   5: REINJECT — previously-missed packet was eventually sent.
+const DQO_TX_COMPL_TYPE_PKT: u8 = 0x2;
+const DQO_TX_COMPL_TYPE_MISS: u8 = 0x3;
 const DQO_TX_COMPL_TYPE_DESC: u8 = 0x4;
+const DQO_TX_COMPL_TYPE_REINJECT: u8 = 0x5;
+/// Bit on a PKT-typed completion's `completion_tag` field that
+/// means "this PKT completion is actually a MISS". Per Linux's
+/// `GVE_ALT_MISS_COMPL_BIT`.
+const GVE_ALT_MISS_COMPL_BIT: u16 = 1 << 15;
+
+/// Diagnostic counters — how often the device emits MISS or
+/// REINJECT completions. MISS > 0 means the device internally
+/// dropped one of our TX packets and is attempting reinjection.
+/// REINJECT > 0 means a previously-missed packet eventually went
+/// out. On well-behaved flows both stay at 0.
+///
+/// We deliberately do NOT count the hot PKT/DESC completion types
+/// here — per-completion atomic increments on a shared cache line
+/// cost ~30% TX throughput at par=4 fresh-conn rates (measured
+/// 2026-05-13: 10.7k → 6.9k RPS with all four counted). The per-qp
+/// TX_PACKETS_PER_QP counter already tracks successful sends; the
+/// device's PKT-completion count just confirms the same fact from
+/// the other side, so the duplication isn't worth the cost.
+pub static DQO_TX_MISS_COMPL: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static DQO_TX_REINJECT_COMPL: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 /// DQO RX buffer descriptor — 32 bytes (driver-written, points to a
 /// device-readable packet buffer).
@@ -148,16 +177,36 @@ pub(crate) fn tx_drain(tx: &TxQueue) {
         let desc_gen = ((hdr_word >> 15) & 1) as u8;
         if desc_gen != cur_gen { break; }
         let cmpl_type = ((hdr_word >> 11) & 0x7) as u8;
-        if cmpl_type == DQO_TX_COMPL_TYPE_DESC {
-            let tx_head = u16::from_le_bytes([
-                unsafe { ptr::read_volatile(desc_ptr.add(2)) },
-                unsafe { ptr::read_volatile(desc_ptr.add(3)) },
-            ]);
-            latest_tx_head = Some(tx_head);
+        match cmpl_type {
+            DQO_TX_COMPL_TYPE_DESC => {
+                let tx_head = u16::from_le_bytes([
+                    unsafe { ptr::read_volatile(desc_ptr.add(2)) },
+                    unsafe { ptr::read_volatile(desc_ptr.add(3)) },
+                ]);
+                latest_tx_head = Some(tx_head);
+            }
+            DQO_TX_COMPL_TYPE_PKT => {
+                // Per Linux, GVE_ALT_MISS_COMPL_BIT can be set on
+                // a PKT-typed completion's completion_tag to mean
+                // "this is actually a MISS". Read the tag's high
+                // bit; only do an atomic increment for that rare
+                // case so the hot per-packet path stays free.
+                let tag_hi = unsafe { ptr::read_volatile(desc_ptr.add(3)) };
+                if tag_hi & ((GVE_ALT_MISS_COMPL_BIT >> 8) as u8) != 0 {
+                    DQO_TX_MISS_COMPL.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            DQO_TX_COMPL_TYPE_MISS => {
+                DQO_TX_MISS_COMPL.fetch_add(1, Ordering::Relaxed);
+            }
+            DQO_TX_COMPL_TYPE_REINJECT => {
+                DQO_TX_REINJECT_COMPL.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
         }
-        // PKT / MISS / REINJECTION completions: consume but
-        // don't act on them — slot reuse is keyed off DESC
-        // completions' tx_head.
+        // PKT / MISS / REINJECTION completions: not used for slot
+        // reuse (slot==ring_idx convention); only MISS / REINJECT
+        // counted as diagnostic.
         head = head.wrapping_add(1);
         if (head & cmask) == 0 {
             cur_gen ^= 1;

@@ -17,6 +17,7 @@ rust_library(
     ],
     deps = [
         "//uni",
+        "//uni-driver-gve",
         "//uni-http",
         "//uni-http3",
         "//uni-quic",

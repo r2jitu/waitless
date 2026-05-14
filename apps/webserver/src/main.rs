@@ -1103,6 +1103,20 @@ fn stats_response() -> Response {
         emit_json_array(&mut w, "core_idle_cycles", &idle_cyc[..nc]);
         let _ = write!(w, ",\"cycles_per_us\":{}", uni::diagnostics::cycles_per_us());
 
+        // gve DQO TX MISS/REINJECT completion counters. Either > 0
+        // means the device internally dropped/recovered one of our
+        // outbound packets — useful signal that hardware-side
+        // backpressure is pushing back. Both stay at 0 on healthy
+        // flows. (PKT/DESC completion counts are deliberately
+        // omitted: per-packet atomic increments cost ~30% TX
+        // throughput; the same info is already in TX_PACKETS_PER_QP.)
+        let _ = write!(
+            w,
+            ",\"dqo_tx_miss_compl\":{},\"dqo_tx_reinject_compl\":{}",
+            uni_driver_gve::dqo::DQO_TX_MISS_COMPL.load(core::sync::atomic::Ordering::Relaxed),
+            uni_driver_gve::dqo::DQO_TX_REINJECT_COMPL.load(core::sync::atomic::Ordering::Relaxed),
+        );
+
         // ---- AEAD throughput (TLS + QUIC) ----
         //
         // TLS counters cover the record layer (every full-record

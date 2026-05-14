@@ -44,7 +44,7 @@ extern crate drivers_infra;
 extern crate uni_kernel;
 extern crate uni_net_driver;
 
-mod dqo;
+pub mod dqo;
 mod gqi;
 
 use drivers_infra::{log, mmio_read32, mmio_write32};
