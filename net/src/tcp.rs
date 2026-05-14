@@ -574,6 +574,17 @@ impl TcpHashCore {
 static TCP_HASH: uni_kernel::percpu::PerWorker<TcpHashCore> =
     uni_kernel::percpu::PerWorker::new();
 
+/// Count of SYN (no-ACK) packets we see reach `tcp_receive` —
+/// diagnostic: compare against the bench client's SYN-sent count
+/// to detect ingress-side drops below the TCP stack (driver/NIC).
+pub static TCP_SYN_RX: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// Count of SYN-ACK segments we emit via `send_segment` in
+/// response to a SYN. Compare against bench-client SYN-ACK
+/// received to distinguish egress (fabric/strand) drops.
+pub static TCP_SYNACK_TX: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 #[inline]
 fn tcp_hash_key(src_ip: IpAddr, src_port: u16, dst_port: u16) -> u64 {
     // Fold the source address to 32 bits so the existing
@@ -1434,6 +1445,7 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, segment: &[u8]) {
 
     // SYN — new connection from client
     if flags & TCP_SYN != 0 && flags & TCP_ACK == 0 {
+        TCP_SYN_RX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         // Find listener on this core
         let listener_idx = {
             let mut found = None;
@@ -1501,6 +1513,7 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, segment: &[u8]) {
         {
             let c = unsafe { &*conn_ptr(core, slot) };
             send_segment(dst_ip, src_ip, dst_port, src_port, c.snd_nxt, c.rcv_nxt, TCP_SYN | TCP_ACK, RX_RING_BYTES as u16, &[]);
+            TCP_SYNACK_TX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
         unsafe {
             let cp = conn_ptr(core, slot);

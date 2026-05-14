@@ -1117,6 +1117,19 @@ fn stats_response() -> Response {
             uni_driver_gve::dqo::DQO_TX_REINJECT_COMPL.load(core::sync::atomic::Ordering::Relaxed),
         );
 
+        // SYN-ingress vs SYN-ACK-egress counters. Compared against a
+        // client-side pcap (SYNs sent / SYN-ACKs received) these
+        // localize the residual DQO drop: if `tcp_syn_rx` ≪ client
+        // SYNs the drop is below our TCP stack (RX driver / NIC);
+        // if they match but the client got fewer SYN-ACKs the drop
+        // is on egress.
+        let _ = write!(
+            w,
+            ",\"tcp_syn_rx\":{},\"tcp_synack_tx\":{}",
+            uni::net::tcp::TCP_SYN_RX.load(core::sync::atomic::Ordering::Relaxed),
+            uni::net::tcp::TCP_SYNACK_TX.load(core::sync::atomic::Ordering::Relaxed),
+        );
+
         // ---- AEAD throughput (TLS + QUIC) ----
         //
         // TLS counters cover the record layer (every full-record
