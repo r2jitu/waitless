@@ -344,14 +344,26 @@ pub(crate) fn send_on_qp(qp: usize, data: &[u8]) -> bool {
     let tx = unsafe { &*tx_ptr };
     let bar2_va = BAR2_VA.load(Ordering::Acquire);
 
-    tx_drain(tx);
-
+    // Drain only when we're getting close to a full ring. Linux's
+    // gve_tx_dqo drains only from NAPI poll, not per-send; the
+    // event loop's `poll_qp_inner` keeps `done_cnt` fresh in the
+    // common case. Per-send drain was costing significant cycles
+    // on the fresh-conn hot path (touching the completion ring's
+    // DMA-coherent cache line on every send).
     let fill_cnt = tx.fill_cnt.load(Ordering::Relaxed);
-    let done_cnt = tx.done_cnt.load(Ordering::Relaxed);
-    let in_flight = fill_cnt.wrapping_sub(done_cnt);
+    let mut done_cnt = tx.done_cnt.load(Ordering::Relaxed);
+    let mut in_flight = fill_cnt.wrapping_sub(done_cnt);
     // Each packet emits 2 descriptors (general context + pkt).
-    if in_flight + 2 > tx.ring_entries as u32 {
-        return false;
+    let ring_entries = tx.ring_entries as u32;
+    if in_flight + 64 > ring_entries {
+        // Approaching full — drain to make sure done_cnt is current
+        // before we reject the send.
+        tx_drain(tx);
+        done_cnt = tx.done_cnt.load(Ordering::Relaxed);
+        in_flight = fill_cnt.wrapping_sub(done_cnt);
+        if in_flight + 2 > ring_entries {
+            return false;
+        }
     }
 
     let mask = (tx.ring_entries - 1) as u32;
@@ -532,6 +544,17 @@ pub(crate) fn poll_qp_inner<F: FnMut(&[u8])>(qp: usize, mut callback: F) -> u32 
         // `& bufq->mask`). Our cumulative `fill_cnt` grows
         // unbounded; mask it before writing.
         doorbell_write_le(bar2_va, rx.db_offset, fill & mask);
+    }
+
+    // Drain the TX completion ring for this qp from the poll path,
+    // matching Linux's NAPI-clean pattern. Keeps `done_cnt` fresh
+    // so `send_on_qp` (above) can skip its per-send drain in the
+    // common case. We do this regardless of whether RX delivered
+    // anything — the event loop calls us at high frequency.
+    let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
+    if !tx_ptr.is_null() {
+        let tx = unsafe { &*tx_ptr };
+        tx_drain(tx);
     }
 
     delivered
