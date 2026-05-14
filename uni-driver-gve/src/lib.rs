@@ -1005,14 +1005,31 @@ const IRQ_DB_STRIDE: u32 = 64;
 
 /// TX + RX ring sizes — must be within the MODIFY_RING option's
 /// advertised [min, max]. On GCE n2-standard-2 that's [256, 2048]
-/// for TX and [512, 2048] for RX. Picking the minimum keeps the
-/// per-queue DMA footprint small: with a GQI_QPL RX QPL at one
-/// page per entry, 1024 entries means 4 MiB of RX buffers (and the
-/// device rejected that registration with FAILED_PRECONDITION on
-/// our side). 512 / 256 keeps the driver happy and is plenty for
-/// a single-queue bring-up.
+/// for TX and [512, 2048] for RX.
+///
+/// RX is 1024 (not the minimum 512) for DQO_RDA-specific reasons:
+/// the Mount Evans IPU prefetches RX descriptors via PCIe in a
+/// pipelined-bursts pattern. With ring=512 the prefetcher
+/// frequently hits the host-side tail mid-microburst, fully stalls,
+/// and on the next doorbell pays a full ~1-2 us PCIe RTT to
+/// restart. During that gap the NIC's internal RX staging buffer
+/// overflows on fresh-conn SYN bursts and drops packets silently
+/// (no completion descriptor emitted; not visible to us). Doubling
+/// to 1024 keeps the prefetcher in pipelined mode and roughly
+/// halves the SYN-drop rate at par=4 1c (86/30s -> 46/30s,
+/// throughput 8.7k -> 16k RPS, measured 2026-05-14 on c3-highcpu-8).
+///
+/// Do NOT bump further to 2048: at 1024 entries x 2 KiB buffers we
+/// sit exactly at the C3 Sapphire Rapids per-core L2 limit
+/// (~2 MiB); 2048 forces strict-FIFO eviction so every reposted
+/// buffer is a guaranteed L2 miss on its next reuse, regressing
+/// both latency and throughput (measured 76 drops, 7.8k RPS).
+///
+/// Doorbell rate (Linux's GVE_RX_BUF_THRESH_DQO = 32 mid-batch
+/// doorbell) was tested and made no difference in this regime;
+/// absolute ring depth is the load-bearing knob, not doorbell rate.
 pub(crate) const TX_RING_ENTRIES: u16 = 256;
-pub(crate) const RX_RING_ENTRIES: u16 = 512;
+pub(crate) const RX_RING_ENTRIES: u16 = 1024;
 /// RX buffer size in bytes (matches GVE_DEFAULT_RX_BUFFER_SIZE =
 /// 2048 from the reference driver; one packet per buffer).
 pub(crate) const RX_BUFFER_SIZE: u16 = 2048;
