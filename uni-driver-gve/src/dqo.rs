@@ -330,16 +330,6 @@ fn build_pkt_desc(buf_addr: u64, flags: u8, compl_tag: u16, buf_size: u16) -> u1
 /// Slice-shaped send: copy `data` into the next ring's bounce buffer,
 /// emit a (general-ctx, pkt) descriptor pair, advance fill_cnt,
 /// doorbell unless deferred.
-///
-/// `#[inline(never)]` is load-bearing. When this function was a
-/// private `fn send_on_qp_dqo` in lib.rs, rustc inlined it into
-/// `send()`, bloating the hot dispatcher to ~1.2 KiB (vs ~220 B
-/// when un-inlined). The bloat hurt i-cache locality enough to
-/// 5× the fresh-conn (`http_close_max`) rate from ~2 k to ~10 k
-/// req/s at 1 core. The module boundary alone happens to defeat
-/// inlining today, but pin it explicitly so future refactors
-/// don't silently regress.
-#[inline(never)]
 pub(crate) fn send_on_qp(qp: usize, data: &[u8]) -> bool {
     if qp >= MAX_QUEUE_PAIRS || data.is_empty() || data.len() > (RX_BUFFER_SIZE as usize) {
         return false;
@@ -413,6 +403,45 @@ pub(crate) fn send_on_qp(qp: usize, data: &[u8]) -> bool {
 
     let near_full = new_fill.wrapping_sub(done_cnt) >= (tx.ring_entries as u32) - 16;
     if !DEFERRED_KICK.load(Ordering::Relaxed) || near_full {
+        // Drain the CPU store buffer before ringing the BAR2 doorbell.
+        //
+        // The descriptor ring lives in WB-cached memory; BAR2 is UC and
+        // bypasses the cache hierarchy directly to PCIe. The volatile
+        // store(s) above can sit in the CPU store buffer while the
+        // doorbell is already on the wire as a PCIe TLP. The IPU
+        // (Mount Evans, on c3) snoops L1/L2/L3 when it DMA-reads the
+        // descriptor, but PCIe DMA cannot snoop the store buffer. If
+        // it samples before our store drains, it reads valid=0 and
+        // silently strands the packet — no completion of any type is
+        // emitted, so `DQO_TX_MISS_COMPL` stays at 0 even when packets
+        // are being lost.
+        //
+        // The unikernel's TCP RTO is 1 second; a stranded SYN-ACK on a
+        // fresh-conn workload deadlocks the client until its initial
+        // RTO fires, which is why this used to manifest as a ~5×
+        // throughput drop on http_close_max at par=4 — and not at all
+        // on keepalive (sustained pps generates a rescue doorbell
+        // within microseconds, well before any RTO).
+        //
+        // `sfence` drains the store buffer for prior stores; it's
+        // strictly correct here (TX path: only outbound stores need
+        // serialization) and cheaper than `mfence` on most µarch.
+        //
+        // gVNIC only ships on x86 GCE — but the gve crate compiles
+        // for both x86 and arm64 (unikernel platform). Fence is
+        // x86-gated; arm64 builds get a portable Release fence
+        // which lowers to `dmb st`. (gve never runs on arm64; this
+        // is just to keep the crate compilable.)
+        //
+        // We emit the `sfence` via inline asm because the stdlib's
+        // `_mm_sfence` intrinsic compiles to an out-of-line function
+        // call in our `-Copt-level=2` build (no LTO across the
+        // `core` boundary), defeating the point. Raw asm is always
+        // inlined and is exactly one instruction.
+        #[cfg(target_arch = "x86_64")]
+        unsafe { core::arch::asm!("sfence", options(nostack, preserves_flags)); }
+        #[cfg(not(target_arch = "x86_64"))]
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
         doorbell_write_le(bar2_va, tx.db_offset, new_fill & mask);
         tx.last_kicked.store(new_fill, Ordering::Relaxed);
     }
