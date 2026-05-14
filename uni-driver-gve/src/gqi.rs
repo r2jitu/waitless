@@ -89,8 +89,15 @@ const POOL_ID_BIG: u8 = 1;
 
 /// GQI doorbell write. Big-endian on the wire — Linux's
 /// `gve_*_write_doorbell` use `iowrite32be`. Opposite of DQO.
+///
+/// Includes `host_dma_fence()` (an `sfence` on x86) — every GQI
+/// doorbell write here signals the device to DMA-read host
+/// memory (descriptors or replenished RX QPL offsets), so the
+/// fence is always required. See `host_dma_fence` for the full
+/// story.
 #[inline]
 pub(crate) fn doorbell_write(bar2_va: u64, offset: u32, value: u32) {
+    crate::host_dma_fence();
     unsafe {
         mmio_write32(bar2_va + offset as u64, value.to_be());
     }

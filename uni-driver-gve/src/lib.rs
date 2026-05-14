@@ -425,6 +425,38 @@ pub(crate) static TX_QUEUES: [AtomicPtr<TxQueue>; MAX_QUEUE_PAIRS] =
 pub(crate) static RX_QUEUES: [AtomicPtr<RxQueue>; MAX_QUEUE_PAIRS] =
     [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_QUEUE_PAIRS];
 
+// ---- Host-DMA store barrier -----------------------------------------------
+//
+// Drain the CPU's store buffer to the coherent cache hierarchy.
+// Use this immediately before any MMIO doorbell write whose
+// semantics tell the device to DMA-read host memory that we just
+// modified (TX descriptor rings, RX buffer-queue replenishment,
+// admin-queue commands).
+//
+// Without this, the doorbell TLP can arrive at the IPU before our
+// descriptor stores have drained from the store buffer. PCIe DMA
+// reads snoop the CPU's caches but cannot snoop the store buffer,
+// so the device samples stale memory (valid=0) and silently strands
+// the operation. No completion of any type is emitted.
+//
+// `sfence` is the minimum-strength architectural barrier sufficient
+// here — drains prior stores without serializing loads. We use raw
+// inline asm because `core::arch::x86_64::_mm_sfence` lowers to an
+// out-of-line function call under `-Copt-level=2`.
+//
+// NOT required for: pure control-register writes (no DMA payload),
+// consecutive MMIO writes (UC stores are TSO-ordered with each
+// other), or RX completion reads on x86 (load ordering is intrinsic).
+//
+// Diagnostic story: see commit fa1ac4d.
+#[inline(always)]
+pub(crate) fn host_dma_fence() {
+    #[cfg(target_arch = "x86_64")]
+    unsafe { core::arch::asm!("sfence", options(nostack, preserves_flags)); }
+    #[cfg(not(target_arch = "x86_64"))]
+    core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+}
+
 // ---- Big-endian field helpers ---------------------------------------------
 
 #[inline]
@@ -864,6 +896,12 @@ fn submit_no_wait(cmd: &AdminqCommand) -> Option<(usize, u32)> {
 /// each individual command must be checked separately via
 /// `read_slot_status` / `check_slot_status`.
 fn kick_and_wait_to(expected_event_count: u32) -> bool {
+    // Drain the store buffer so the just-written admin command(s)
+    // are visible to the device's DMA-read before the doorbell TLP
+    // arrives. See `host_dma_fence` for the full mechanism. Without
+    // this the device can read a stale command slot (status=0) and
+    // either reject the command or execute garbage.
+    host_dma_fence();
     unsafe { reg_write32(REG_ADMINQ_DOORBELL, expected_event_count); }
     for _ in 0..ADMINQ_WAIT_SPINS {
         let ev = unsafe { reg_read32(REG_ADMINQ_EVENT_COUNTER) };
