@@ -813,18 +813,14 @@ fn parse_device_descriptor(desc_virt: *mut u8) -> bool {
     log_mac(&mac);
     log(b"\n");
 
-    // The device advertises `tx_pages_per_qpl` (Linux's
-    // `gve_device_descriptor.tx_pages_per_qpl`) as the MAXIMUM
-    // tx pages per registered QPL. Linux uses `tx_desc_cnt /
-    // GVE_QPL_DIVISOR = 256/64 = 4` and packs many packets into
-    // each page via a FIFO. We deliberately use `1 page per ring
-    // slot` (TX_QPL_PAGES = 256), which exceeds the advertised
-    // cap on most GCE generations, but our REGISTER_PAGE_LIST
-    // command has been working in practice. Log if we exceed and
-    // proceed; if a future device strictly enforces this cap and
-    // rejects our registration, we'll see it in a CREATE_TX_QUEUE
-    // failure later.
-    let _ = tx_pages_per_qpl;
+    // The device advertises `tx_pages_per_qpl` as the MAXIMUM tx
+    // pages per registered QPL. Linux packs many packets per page
+    // via a FIFO (`tx_desc_cnt / GVE_QPL_DIVISOR = 4`). We
+    // deliberately use `1 page per ring slot` (TX_QPL_PAGES = 256)
+    // which exceeds the advertised cap on most GCE generations;
+    // REGISTER_PAGE_LIST has accepted it on every SKU we've tested.
+    // If a future device enforces the cap strictly, CREATE_TX_QUEUE
+    // will fail and the log line above shows the gap.
 
     let mut st = STATE.lock();
     if let Some(s) = st.as_mut() {
