@@ -239,6 +239,25 @@ kvm_ssh "mkdir -p ~/bench && tar -xf /tmp/$(basename "$TARBALL") -C ~/bench && r
 echo "==> Building loadgen on $KVM_NAME..."
 kvm_ssh "cd ~/bench/bench/loadgen && PATH=\$HOME/.cargo/bin:\$PATH cargo build --release 2>&1 | tail -3"
 
+# Tune the loadgen kernel for fresh-conn workloads. Without
+# this, `get_tcp_fresh` at --cores 8 silently exits the loadgen
+# at 0 req/s (cli=0.0cpu) because the default 32 768-port
+# ephemeral range pairs with default TIME_WAIT behavior to
+# exhaust source ports faster than the kernel recycles them.
+#
+# `tcp_tw_reuse=1` lets the kernel reuse a TIME_WAIT slot for
+# a new outbound conn whose 4-tuple is unique (safe per RFC
+# 6191 — the timestamp option disambiguates retransmits).
+# Expanding `ip_local_port_range` to 1024-65535 doubles the
+# usable ephemeral pool. Both are pure loadgen-side tweaks;
+# the unikernel doesn't see them.
+#
+# `|| true` because some kernel builds may have one of these
+# read-only — better to log + continue than abort the bench
+# 15 minutes into a deploy cycle.
+echo "==> Tuning $KVM_NAME loadgen sysctls..."
+kvm_ssh "sudo sysctl -w net.ipv4.tcp_tw_reuse=1 net.ipv4.ip_local_port_range='1024 65535' 2>&1 | sed 's/^/    /' || true"
+
 # ── Step 3: run the bench ─────────────────────────────────────────
 
 if [ "$mode" = "raw" ]; then
