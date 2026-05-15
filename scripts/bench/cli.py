@@ -432,6 +432,79 @@ WORKLOADS = [
      "host_override": "::1",
      "tier": "available",
      "desc": "/health throughput over IPv6 (v6 header parse + pseudo-header csum)"},
+
+    # ── TODO stubs (registered placeholders, no implementation) ──────
+    #
+    # Each entry below names a concern we want a bench for but
+    # don't have an implementation for yet. They print a `TODO
+    # (reason)` row in the per-cores loop so the gap stays
+    # visible every run; they never consume bench time.
+
+    # TLS-over-TCP 0-RTT cold path. Server-side: TCP record-layer
+    # never derives client_early_traffic_secret (uni-tls flag
+    # exists, no record-path wire-up). Loadgen: needs 0-RTT mode
+    # (ticket cache + early-data send).
+    {"name": "get_tls_fresh_0rtt", "type": "todo",
+     "tier": "todo",
+     "reason": "server: wire up TCP early-data decrypt; loadgen: add 0-RTT mode",
+     "desc": "TLS 1.3 0-RTT (early-data) cold path"},
+
+    # QUIC 0-RTT cold path. Server-side IS implemented in
+    # uni-quic (early-data sentinel + handshake wiring). Blocked
+    # on loadgen: needs QUIC 0-RTT send (ticket cache + early data).
+    {"name": "get_quic_fresh_0rtt", "type": "todo",
+     "tier": "todo",
+     "reason": "loadgen: add QUIC 0-RTT send (server side ready)",
+     "desc": "QUIC 0-RTT cold path"},
+
+    # QUIC fresh handshake (rate). The `download_64k_quic`
+    # workload amortizes one handshake over many keep-alive GETs,
+    # so handshake-specific regressions are invisible there.
+    # Loadgen needs a `--quic-handshake-only` mode (or
+    # fresh-conn-per-iter for h3-health).
+    {"name": "get_quic_fresh", "type": "todo",
+     "tier": "todo",
+     "reason": "loadgen: add --quic-handshake-only / fresh-conn-per-iter mode",
+     "desc": "QUIC handshake state machine (cold path)"},
+
+    # HTTP/3 POST 32 KiB — bulk-RX over QUIC, mirrors
+    # upload_32k_tcp/tls but exercises the QUIC packet-decrypt
+    # path on the server. Loadgen's h3 client is GET-only today.
+    {"name": "upload_32k_quic", "type": "todo",
+     "tier": "todo",
+     "reason": "loadgen: add HTTP/3 POST subcommand",
+     "desc": "HTTP/3 POST 32 KiB (QUIC RX bulk, packet decrypt)"},
+
+    # HTTP/1.1 pipelining — multiple GETs serialized into one
+    # TCP write. Produces back-to-back same-4-tuple segments
+    # (the ideal RSC probe — even cleaner than upload_32k_tcp
+    # since it doesn't depend on POST body framing). Loadgen
+    # needs a `--pipeline N` mode (no existing client speaks it).
+    {"name": "get_tcp_pipeline", "type": "todo",
+     "tier": "todo",
+     "reason": "loadgen: add --pipeline N (serialized GETs per TCP write)",
+     "desc": "HTTP/1.1 pipelined GETs — ideal RSC probe"},
+
+    # TX backpressure: slow-receiver client that drains responses
+    # slowly enough to fill the server's TX queue. Tests whether
+    # the TX path yields gracefully (vs hanging / leaking) under
+    # backpressure. Loadgen needs a throttled-receive mode
+    # (--read-rate-bps cap).
+    {"name": "download_64k_tls_slow", "type": "todo",
+     "tier": "todo",
+     "reason": "loadgen: add --read-rate-bps (throttled receive)",
+     "desc": "TX backpressure under slow consumer (64 KiB TLS)"},
+
+    # Cold boot to first 200 OK. Out-of-process: needs to start
+    # the unikernel VM fresh, time until /health returns 200,
+    # tear down. Doesn't fit the per-request bench harness;
+    # needs a separate `scripts/bench_cold_boot.sh` wrapper that
+    # `gcloud compute instances start`s a stopped instance and
+    # polls /health.
+    {"name": "boot_cold", "type": "todo",
+     "tier": "todo",
+     "reason": "needs separate harness: scripts/bench_cold_boot.sh",
+     "desc": "Cold boot to first 200 OK"},
 ]
 
 
