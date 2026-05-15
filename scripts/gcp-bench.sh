@@ -19,7 +19,7 @@
 #   ./scripts/gcp-bench.sh                           # kvm + native, 1,2,4 cores
 #   ./scripts/gcp-bench.sh --env kvm                 # kvm only
 #   ./scripts/gcp-bench.sh --cores 1,4 --duration 10
-#   ./scripts/gcp-bench.sh --workload health_max
+#   ./scripts/gcp-bench.sh --workload get_tcp
 #   ./scripts/gcp-bench.sh --no-build                # skip local rebuild
 #   ./scripts/gcp-bench.sh --keep-running            # don't stop host after
 #

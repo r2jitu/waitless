@@ -25,7 +25,7 @@
 #
 # Usage:
 #   ./scripts/gcp-deploy-bench.sh                              # full deploy + bench
-#   ./scripts/gcp-deploy-bench.sh --workload h3_health_max     # one workload
+#   ./scripts/gcp-deploy-bench.sh --workload download_64k_quic # one workload
 #   ./scripts/gcp-deploy-bench.sh --no-redeploy --keep-running # iterate locally
 #   ./scripts/gcp-deploy-bench.sh --no-redeploy --par 64 --duration 5
 #                                                              # raw loadgen call,
@@ -43,7 +43,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 UNI_NAME="${UNIKERNEL_GCE_NAME:-unikernel-webserver}"
 # us-west1-c: c3 family availability + matches deploy-gcloud.sh's
 # zone default. Both VMs must co-locate (cross-zone same-region
-# RTT is ~5 ms — enough to RTT-bound `http_close_max` to single-
+# RTT is ~5 ms — enough to RTT-bound `get_tcp_fresh` to single-
 # digit-kHz instead of the >100k the server stack can sustain).
 UNI_ZONE="${UNIKERNEL_GCE_ZONE:-us-west1-c}"
 
@@ -51,26 +51,11 @@ KVM_NAME="${GCP_KVM_VM_NAME:-kvm-vm}"
 KVM_ZONE="${GCP_KVM_VM_ZONE:-$UNI_ZONE}"
 
 # Default workload set, picked to give signal across both protocol
-# stacks AND both small/large body shapes:
-#
-#   * `health_max`           — /health over plain HTTP. Pure
-#                              throughput baseline (we hit 466K
-#                              req/s on c3 here in 2026-05-09).
-#   * `health_tls_max`       — /health over TLS-over-TCP. Same
-#                              80 B body, exercises TLS record
-#                              hot path (1 record per request).
-#   * `h3_health_max`        — /health over QUIC. QUIC TX path
-#                              equivalent of the above.
-#   * `diagnostics_tls_max`  — /diagnostics (~9 KB HTML) over
-#                              TLS-over-TCP. Required to make
-#                              per-byte memcpy + CSUM-offload +
-#                              TSO wins visible — the small-body
-#                              workloads can't surface them
-#                              above run-to-run noise.
-#   * `h3_diagnostics_max`   — same multi-packet body but over
-#                              QUIC, so cross-protocol perf on
-#                              larger bodies is comparable.
-DEFAULT_WORKLOADS="health_max,health_tls_max,h3_health_max,diagnostics_tls_max,h3_diagnostics_max"
+# stacks AND both small/large body shapes. Includes a couple of
+# workloads still pending the C7 cleanup (h3_health_max,
+# diagnostics_tls_max); those drop after the cli.py tier-based
+# default takes over.
+DEFAULT_WORKLOADS="get_tcp,get_tls,h3_health_max,diagnostics_tls_max,download_64k_quic"
 DEFAULT_CORES="1,2,4"
 # 5 s per workload: long enough for steady-state numbers, short
 # enough that iterating on driver/runtime changes is bearable. A

@@ -354,7 +354,7 @@ class HvfEnv:
         # async TCP echo test; -p tcp:HOST:9000 forwards the
         # gateway listener; -p udp:HOST:7 forwards UDP echo;
         # -p udp:HOST:443 forwards the H3/QUIC listener.
-        # 512 MB so the gateway_max workload's thousand-conn shape
+        # 512 MB so the fanout_tcp workload's thousand-conn shape
         # — each ephemeral UDP binding allocates an inbox on the
         # kernel heap — fits with comfortable headroom. Smaller
         # workloads cost the host nothing extra; the heap grows

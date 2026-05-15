@@ -832,7 +832,7 @@ def run_tcp_echo(port, conns, duration, host="127.0.0.1", msg_size=64):
     return rps, "", ""
 
 
-def udp_peak_concurrent(port, duration, host, client_cpus=1, timeout_ms=100):
+def echo_udp_concurrent(port, duration, host, client_cpus=1, timeout_ms=100):
     """Find peak windowed-UDP throughput by sweeping the concurrency
     levels in `_UDP_PEAK_LEVELS` and taking the max.
 

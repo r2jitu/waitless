@@ -138,14 +138,14 @@ from .workloads import (
     run_wrk,
     run_wrk_https,
     run_loadgen_http_close,
-    udp_peak_concurrent,
+    echo_udp_concurrent,
 )
 
 
 WORKLOADS = [
     # Single-flow latency baselines: keep one connection regardless of
     # cpu count. Throughput reflects per-request cost on one core.
-    {"name": "health_c1", "type": "tcp", "endpoint": "/health",
+    {"name": "get_tcp_single", "type": "tcp", "endpoint": "/health",
      "threads": 1, "conns": 1,
      "desc": "/health × 1 conn (single-flow latency)"},
     {"name": "compute_c1", "type": "tcp", "endpoint": "/compute",
@@ -157,7 +157,7 @@ WORKLOADS = [
     # thread` on Linux/tap (the parallel mode was a workaround for
     # macOS loopback SO_REUSEPORT not hashing source ports — irrelevant
     # here, and the per-process fork+epoll overhead just hurts).
-    {"name": "health_max", "type": "tcp", "endpoint": "/health",
+    {"name": "get_tcp", "type": "tcp", "endpoint": "/health",
      "threads_per_core": 1, "conns_per_core": 32,
      "desc": "/health throughput (32 conn × cpus)"},
     {"name": "compute_max", "type": "tcp", "endpoint": "/compute",
@@ -166,8 +166,8 @@ WORKLOADS = [
 
     # ── Plain HTTP, fresh TCP per request ───────────────────────────────
     #
-    # `health_max` is keep-alive (one conn handles thousands of
-    # requests over a 10 s run). `http_close_max` issues each
+    # `get_tcp` is keep-alive (one conn handles thousands of
+    # requests over a 10 s run). `get_tcp_fresh` issues each
     # request from a fresh TCP connection — wrk dials a new socket
     # every time the server closes (forced by `Connection: close`).
     # The workload exercises the per-accept path end-to-end:
@@ -177,9 +177,9 @@ WORKLOADS = [
     # No crypto, so the per-iter cost is dominated by accept-side
     # work — the right workload for measuring conn-Future Box
     # alloc pressure (and the FuturePool's effect if enabled).
-    # Compare against `health_max` to see the accept overhead's
+    # Compare against `get_tcp` to see the accept overhead's
     # share of plain-HTTP throughput.
-    {"name": "http_close_max", "type": "http_close", "endpoint": "/health",
+    {"name": "get_tcp_fresh", "type": "http_close", "endpoint": "/health",
      "parallelism_per_core": 4,
      "desc": "/health throughput, fresh TCP per request (Connection: close)"},
 
@@ -190,7 +190,7 @@ WORKLOADS = [
     # machine-independent in shape — same workload on every host,
     # only the absolute latency varies.
     #
-    # `udp_peak` measures peak sustained server throughput via a
+    # `echo_udp` measures peak sustained server throughput via a
     # windowed (in-flight) bench with adaptive concurrency. For each
     # (env, cpus), probes `N in {32,64,128,256,512}` per client
     # thread, doubling until throughput stops improving by >5%. Each
@@ -207,21 +207,21 @@ WORKLOADS = [
     {"name": "udp_sync", "type": "udp", "endpoint": "",
      "senders": 1,
      "desc": "UDP echo single-flow latency (1 sender, sync RTT)"},
-    {"name": "udp_peak", "type": "udp_peak", "endpoint": "",
+    {"name": "echo_udp", "type": "echo_udp", "endpoint": "",
      "desc": "UDP echo peak throughput (windowed + adaptive concurrency ramp)"},
 
     # ── TLS 1.3 workloads ────────────────────────────────────────────
     #
-    # `health_tls_c1` is the HTTPS analogue of `health_c1`: a single
+    # `health_tls_c1` is the HTTPS analogue of `get_tcp_single`: a single
     # keep-alive connection sending /health requests over TLS 1.3 +
     # ECDSA P-256 + ChaCha20-Poly1305. The TLS handshake happens once
     # at the start of the run and amortises over `duration` seconds
     # of record-layer-only requests, so this number isolates the
     # hot-path encryption + record framing cost from the (much
-    # larger) one-time handshake cost. Compare against `health_c1`
+    # larger) one-time handshake cost. Compare against `get_tcp_single`
     # to see the per-request TLS overhead.
     #
-    # `tls_handshake_max` is the opposite: each "request" is a fresh
+    # `get_tls_fresh` is the opposite: each "request" is a fresh
     # TCP+TLS connection, exercising the full ECDSA sign + X25519
     # ECDHE + key schedule + handshake message encoding cost on
     # every iteration. This is the metric that matters for clients
@@ -238,18 +238,18 @@ WORKLOADS = [
     # server was oversubscribed 4× at 1c and the client became the
     # bottleneck at 3c+ because it couldn't push enough pressure.
     # Scaling with cores keeps the workload shape comparable
-    # across core counts the way health_tls_max does.
+    # across core counts the way get_tls does.
     {"name": "health_tls_c1", "type": "https", "endpoint": "/health",
      "threads": 1, "conns": 1,
      "desc": "/health × 1 conn over TLS 1.3 (record-layer hot path)"},
-    {"name": "health_tls_max", "type": "https", "endpoint": "/health",
+    {"name": "get_tls", "type": "https", "endpoint": "/health",
      "threads_per_core": 1, "conns_per_core": 32,
      "desc": "/health throughput over TLS (32 conn × cpus, keep-alive)"},
-    # `diagnostics_tls_max` is `health_tls_max` against a multi-segment
+    # `diagnostics_tls_max` is `get_tls` against a multi-segment
     # body (~9 KiB rendered HTML) instead of /health's 80 B JSON. The
     # post-Q TX path emits the same 16 KB TLS record either way, but
     # only the multi-segment shape exercises the TCP segmentation work
-    # — `health_tls_max` always fits in one MSS so it doesn't surface
+    # — `get_tls` always fits in one MSS so it doesn't surface
     # TSO wins. Compare the two before/after item G to see how much of
     # /diagnostics' guest CPU was per-segment header building +
     # checksum vs the encryption itself.
@@ -275,7 +275,7 @@ WORKLOADS = [
     {"name": "static_16k_tls_max", "type": "https", "endpoint": "/static-16k",
      "threads_per_core": 1, "conns_per_core": 16,
      "desc": "/static-16k throughput over TLS (one full TLS record)"},
-    {"name": "static_64k_tls_max", "type": "https", "endpoint": "/static-64k",
+    {"name": "download_64k_tls", "type": "https", "endpoint": "/static-64k",
      "threads_per_core": 1, "conns_per_core": 8,
      "desc": "/static-64k throughput over TLS (~4 records, multi-segment)"},
     {"name": "static_256k_tls_max", "type": "https", "endpoint": "/static-256k",
@@ -284,23 +284,23 @@ WORKLOADS = [
     {"name": "static_1m_tls_max", "type": "https", "endpoint": "/static-1m",
      "threads_per_core": 1, "conns_per_core": 4,
      "desc": "/static-1m throughput over TLS (~64 records, deep TSO)"},
-    {"name": "tls_handshake_max", "type": "tls_handshake",
+    {"name": "get_tls_fresh", "type": "tls_handshake",
      "endpoint": "/health",
      "parallelism_per_core": 4,
      "desc": "TLS 1.3 full handshake + GET + close (4 workers × cpus)"},
-    {"name": "tls_resume_max", "type": "tls_resume",
+    {"name": "get_tls_fresh_resume", "type": "tls_resume",
      "endpoint": "/health",
      "parallelism_per_core": 4,
      "desc": "TLS 1.3 resumed (PSK-DHE) handshake + GET + close (4 workers × cpus)"},
 
     # ── HTTP/3 over QUIC ──────────────────────────────────────────────
     #
-    # The QUIC analogue of `health_tls_max`: each worker opens its
+    # The QUIC analogue of `get_tls`: each worker opens its
     # own QUIC connection (one full handshake, skipped from the
     # histogram), then loops sequential GETs on the keep-alive
     # connection. Hits the post-handshake hot path that item B2
     # (encoder writes directly into the driver TX-pool slot)
-    # targets. Compare against `health_tls_max` to see the QUIC vs
+    # targets. Compare against `get_tls` to see the QUIC vs
     # TLS-over-TCP per-request cost on the same /health body.
     #
     # 4 workers × cpus mirrors the other `_max` workloads' shape.
@@ -308,19 +308,20 @@ WORKLOADS = [
      "endpoint": "/health",
      "parallelism_per_core": 4,
      "desc": "/health throughput over HTTP/3 (4 workers × cpus, QUIC keep-alive)"},
-    # Same shape as h3_health_max but pointed at /diagnostics
-    # (~9 KiB HTML body) so the QUIC TX path's multi-packet
-    # encrypt + send loop is the bottleneck, not the per-request
-    # parsing overhead. Pairs with `diagnostics_tls_max` to give
-    # a side-by-side QUIC-vs-TLS-over-TCP read on larger bodies
-    # — the gap is where the QUIC encoder's encode-into-TX-slot
-    # zero-copy (item B2) actually surfaces; on /health the
-    # body is too small for any of the per-byte wins to register
-    # above run-to-run noise.
-    {"name": "h3_diagnostics_max", "type": "h3_health",
-     "endpoint": "/diagnostics",
+    # `download_64k_quic` is the QUIC analogue of
+    # `download_64k_tls`: same 64 KiB static body, same shape,
+    # different transport. Pair the two to read off QUIC vs
+    # TLS-over-TCP bulk-TX cost cleanly — no rendering / parsing
+    # confound on the server side (the body is a borrowed
+    # `&'static [u8]`), so the delta is the QUIC encrypt + packet
+    # encode + UDP emit cost vs the TLS record + TCP segmentation
+    # cost. Used to target /diagnostics; switched to /static-64k
+    # so the suite has one comparable bulk-download size across
+    # transports.
+    {"name": "download_64k_quic", "type": "h3_health",
+     "endpoint": "/static-64k",
      "parallelism_per_core": 4,
-     "desc": "/diagnostics throughput over HTTP/3 (~9 KB body, multi-packet)"},
+     "desc": "/static-64k throughput over HTTP/3 (64 KiB body, multi-packet)"},
 
     # ── Async TCP echo (guest:9 via `uni::runtime::TcpListener`) ─────────
     #
@@ -331,7 +332,7 @@ WORKLOADS = [
     #
     # tcp_echo_c1 is the single-flow latency / small-message rate,
     # tcp_echo_max is the scaled-conn throughput mirroring
-    # health_max / compute_max.
+    # get_tcp / compute_max.
     {"name": "tcp_echo_c1", "type": "tcp_echo",
      "conns": 1,
      "desc": "Async TCP echo × 1 conn (single-flow ping-pong)"},
@@ -366,7 +367,7 @@ WORKLOADS = [
     # (16 384-port macOS ephemeral pool, 15 s 2×MSL); the
     # `set_zero_linger()` fix in scripts/bench/loadgen makes
     # close() RST instead of FIN, removing that cap entirely.
-    {"name": "gateway_max", "type": "gateway",
+    {"name": "fanout_tcp", "type": "gateway",
      "conns_per_core": 1500,
      "desc": "Gateway fan-out (TCP→UDP backend→TCP, 1500 conn × cpus)"},
 ]
@@ -569,7 +570,7 @@ def main():
                     # IPv6-first try fails immediately (the unikernel
                     # listens AF_INET only) but the fallback to IPv4
                     # adds enough latency per connect to push the
-                    # gateway_max workload over its subprocess timeout.
+                    # fanout_tcp workload over its subprocess timeout.
                     wrk_host = "127.0.0.1"
                     wrk_port = bench_port
                     tls_off = getattr(env, 'tls_port_offset', 1000)
@@ -632,7 +633,7 @@ def main():
                     # ephemeral port; SO_LINGER={1,0} on the
                     # loadgen side skips TIME_WAIT so macOS's
                     # ephemeral pool doesn't exhaust. Pairs with
-                    # `tls_handshake_max` to isolate the crypto
+                    # `get_tls_fresh` to isolate the crypto
                     # share of HTTPS handshake throughput.
                     par = w.get("parallelism_per_core", 4) * cpus
                     allocs_before = fetch_total_allocs(
@@ -783,7 +784,7 @@ def main():
                     client_cpu[(env_name, cpus, wname)] = m["cores"]
                     print(f"    {wname:<20s} {pps:>10.0f} pkt/s  "
                           f"p50={p50}  p99={p99}  {_cpu_tag(m['cores'])}")
-                elif w["type"] == "udp_peak":
+                elif w["type"] == "echo_udp":
                     time.sleep(0.5)
                     # Windowed mode with adaptive concurrency ramp:
                     # probe per-thread slot counts [32..512] and pick
@@ -791,7 +792,7 @@ def main():
                     # platform gets the concurrency that actually
                     # exposes its ceiling without over-pressuring it.
                     with measure_client_cpu() as m:
-                        pps, loss_pct, p50, p99, best_n = udp_peak_concurrent(
+                        pps, loss_pct, p50, p99, best_n = echo_udp_concurrent(
                             udp_target_port, duration, wrk_host,
                             client_cpus=cpus)
                     results[(env_name, cpus, wname)] = (pps, p50, p99)
