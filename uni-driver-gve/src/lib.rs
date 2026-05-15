@@ -45,8 +45,20 @@ extern crate uni_kernel;
 extern crate uni_net_driver;
 
 mod adminq;
+mod diag;
 pub mod dqo;
 mod gqi;
+
+// Re-export diagnostic counters + descriptor-log helpers so the
+// DQO/GQI submodules can `use crate::TX_PACKETS_PER_QP` etc.
+// without knowing the diag module exists, and so the public
+// `tx_desc_log_snapshot` keeps its `gve::tx_desc_log_snapshot`
+// path.
+pub use diag::{tx_desc_log_snapshot, TxDescLogEntry};
+pub(crate) use diag::{
+    record_tx_desc, tx_desc_kind, RX_BYTES_PER_QP, TX_BIG_ACQUIRES, TX_BIG_FULL_RETURNS,
+    TX_BYTES_PER_QP, TX_PACKETS_PER_QP, TX_SMALL_ACQUIRES, TX_SMALL_FULL_SPINS, TX_SMALL_SCAN_ITERS,
+};
 
 use adminq::{
     AdminqCommand, OP_CONFIGURE_DEVICE_RESOURCES, OP_CONFIGURE_RSS, OP_CREATE_RX_QUEUE,
@@ -1777,222 +1789,8 @@ fn num_queue_pairs() -> u16 {
     NUM_QP.load(Ordering::Acquire)
 }
 
-// ---- TX-side hot-path counters ----
-//
-// Bumped from `acquire_tx_buf_for_qp`, `acquire_tx_tso_buf_for_qp`,
-// and the GQI / DQO submit functions. Surfaced via `tx_diag()` →
-// `NicDiagOps::tx_diag` so the /stats endpoint can render them.
-//
-// Layout mirrors virtio-net's: per-qp packet counts (8-deep) plus
-// scalar saturation + scan-depth counters that don't depend on qp
-// (the small/big pools are per-qp here, but the scans run inside
-// the owning worker so a single set of counters captures the
-// driver's aggregate behaviour without needing a per-qp split).
-pub(crate) static TX_PACKETS_PER_QP: [AtomicU64; 8] =
-    [const { AtomicU64::new(0) }; 8];
-/// Per-qp cumulative TX wire bytes — sum of all `frame_len` values
-/// passed to `submit_tx` / `submit_tx_tso`. For TSO the count is
-/// the super-segment frame length (NOT the post-segmentation wire
-/// bytes the device actually emits), so a TSO/STD comparison is
-/// not byte-for-byte equal on the wire — interpret carefully.
-pub(crate) static TX_BYTES_PER_QP: [AtomicU64; 8] =
-    [const { AtomicU64::new(0) }; 8];
-/// Per-qp cumulative RX wire bytes — driver-side count of the
-/// frame length the callback receives. Includes Eth + IP + L4
-/// headers + payload.
-pub(crate) static RX_BYTES_PER_QP: [AtomicU64; 8] =
-    [const { AtomicU64::new(0) }; 8];
-pub(crate) static TX_SMALL_FULL_SPINS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static TX_SMALL_SCAN_ITERS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static TX_SMALL_ACQUIRES: AtomicU64 = AtomicU64::new(0);
-pub(crate) static TX_BIG_FULL_RETURNS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static TX_BIG_ACQUIRES: AtomicU64 = AtomicU64::new(0);
-
-// ---- TX descriptor capture ring ----
-//
-// Records every 16-byte descriptor handed to the device, latest
-// `TX_DESC_LOG_DEPTH` retained. Surfaced via `tx_desc_log_snapshot`
-// → /diag-gve so a remote operator can inspect what the driver
-// actually wrote when the device misbehaves. Particularly load-
-// bearing for TSO debug on GCE where serial-port output is gated
-// by sandbox IAM.
-//
-// The ring is bounded so a steady-state production deploy doesn't
-// pay unbounded memory; 32 entries × 24 bytes per entry × 1 lock
-// ≈ 800 B + spinlock state. Each `submit_tx_*` call touches the
-// lock once on the hot path, but the contended window is tiny
-// (a few stores) so cross-core ping-pong is dwarfed by the
-// surrounding allocator + descriptor work.
-
-const TX_DESC_LOG_DEPTH: usize = 32;
-
-#[derive(Clone, Copy)]
-pub struct TxDescLogEntry {
-    /// Monotonic sequence number — lets readers reconstruct the
-    /// chronological order even when the ring has wrapped.
-    pub seq: u32,
-    /// Queue pair index (0..MAX_QUEUE_PAIRS). u8 is plenty: we never
-    /// expose more than 8 qps to the kernel.
-    pub qp: u8,
-    /// Descriptor kind: 0 = STD pkt, 1 = TSO pkt, 2 = SEG. Lets
-    /// `/diag-gve` annotate each row without re-parsing the type
-    /// byte (which lives at byte 0 but with flag bits OR'd in).
-    pub kind: u8,
-    /// Raw 16-byte gve descriptor bytes as written into the ring.
-    pub bytes: [u8; 16],
-}
-
-struct TxDescLog {
-    entries: [TxDescLogEntry; TX_DESC_LOG_DEPTH],
-    /// Next slot to overwrite (0..TX_DESC_LOG_DEPTH).
-    head: usize,
-    /// Monotonic counter; current value matches the most recently
-    /// written entry's `seq`. Wraps on overflow but the relative
-    /// order across ≤ TX_DESC_LOG_DEPTH live entries stays
-    /// unambiguous in practice.
-    seq: u32,
-    /// Total entries written since boot. `valid_count = min(written,
-    /// TX_DESC_LOG_DEPTH)` tells the snapshot reader how many slots
-    /// to walk.
-    written: u64,
-}
-
-impl TxDescLog {
-    const EMPTY: Self = TxDescLog {
-        entries: [TxDescLogEntry {
-            seq: 0,
-            qp: 0,
-            kind: 0,
-            bytes: [0; 16],
-        }; TX_DESC_LOG_DEPTH],
-        head: 0,
-        seq: 0,
-        written: 0,
-    };
-}
-
-static TX_DESC_LOG: Spinlock<TxDescLog> = Spinlock::new(TxDescLog::EMPTY);
-
-/// Descriptor kinds — use these (not raw integers) at call sites
-/// so `/diag-gve`'s rendering stays in sync with what the driver
-/// actually wrote.
-pub(crate) mod tx_desc_kind {
-    pub const STD: u8 = 0;
-    pub const TSO: u8 = 1;
-    pub const SEG: u8 = 2;
-}
-
-pub(crate) fn record_tx_desc(qp: u8, kind: u8, bytes: &[u8; 16]) {
-    let mut log = TX_DESC_LOG.lock();
-    log.seq = log.seq.wrapping_add(1);
-    log.written = log.written.wrapping_add(1);
-    let head = log.head;
-    log.entries[head] = TxDescLogEntry {
-        seq: log.seq,
-        qp,
-        kind,
-        bytes: *bytes,
-    };
-    log.head = (head + 1) % TX_DESC_LOG_DEPTH;
-}
-
-/// Snapshot the descriptor log into `out` in chronological order
-/// (oldest first). Returns the number of valid entries written
-/// (≤ `out.len()` and ≤ `TX_DESC_LOG_DEPTH`). Lock-bounded; the
-/// caller doesn't need to coordinate with `record_tx_desc`.
-pub fn tx_desc_log_snapshot(out: &mut [TxDescLogEntry]) -> usize {
-    let log = TX_DESC_LOG.lock();
-    let valid = (log.written as usize).min(TX_DESC_LOG_DEPTH);
-    let n = valid.min(out.len());
-    if n == 0 {
-        return 0;
-    }
-    // Oldest entry is at `head` when the ring is full, else at 0.
-    let start = if log.written as usize >= TX_DESC_LOG_DEPTH {
-        log.head
-    } else {
-        0
-    };
-    for i in 0..n {
-        out[i] = log.entries[(start + i) % TX_DESC_LOG_DEPTH];
-    }
-    n
-}
-
-fn tx_diag() -> uni_net_driver::TxDiag {
-    let mut packets = [0u64; uni_net_driver::DIAG_QP_CAP];
-    let mut inflight = [0u32; uni_net_driver::DIAG_QP_CAP];
-    let mut tx_bytes = [0u64; uni_net_driver::DIAG_QP_CAP];
-    let mut rx_bytes = [0u64; uni_net_driver::DIAG_QP_CAP];
-    for i in 0..uni_net_driver::DIAG_QP_CAP {
-        packets[i] = TX_PACKETS_PER_QP[i].load(Ordering::Relaxed);
-        if i < TX_BYTES_PER_QP.len() {
-            tx_bytes[i] = TX_BYTES_PER_QP[i].load(Ordering::Relaxed);
-            rx_bytes[i] = RX_BYTES_PER_QP[i].load(Ordering::Relaxed);
-        }
-        // In-flight = fill_cnt - done_cnt for each live qp. Pinned
-        // at `ring_entries` across multiple snapshots flags a
-        // stall — the driver's queueing more, but the device
-        // hasn't issued completions. Direct smoking gun for the
-        // gve DQO-direct-fill stall on c3 (whichever qp shows
-        // a saturated in-flight + zero advance over time is the
-        // one to look at).
-        let tx_ptr = TX_QUEUES[i].load(Ordering::Acquire);
-        if !tx_ptr.is_null() {
-            let tx = unsafe { &*tx_ptr };
-            let fill = tx.fill_cnt.load(Ordering::Relaxed);
-            let done = tx.done_cnt.load(Ordering::Relaxed);
-            inflight[i] = fill.wrapping_sub(done);
-        }
-    }
-    uni_net_driver::TxDiag {
-        packets_per_qp: packets,
-        inflight_per_qp: inflight,
-        tx_bytes_per_qp: tx_bytes,
-        rx_bytes_per_qp: rx_bytes,
-        small_pool_full_spins: TX_SMALL_FULL_SPINS.load(Ordering::Relaxed),
-        small_pool_scan_iters: TX_SMALL_SCAN_ITERS.load(Ordering::Relaxed),
-        small_pool_acquires: TX_SMALL_ACQUIRES.load(Ordering::Relaxed),
-        big_pool_full_returns: TX_BIG_FULL_RETURNS.load(Ordering::Relaxed),
-        big_pool_acquires: TX_BIG_ACQUIRES.load(Ordering::Relaxed),
-        small_pool_size: TX_SMALL_POOL_SLOTS,
-        big_pool_size: TX_BIG_POOL_SLOTS,
-    }
-}
-
-/// Per-queue RX frame count. Lock-free snapshot — uses the atomic
-/// cons_cnt on each live queue.
-fn rx_counts() -> [u64; 8] {
-    let mut out = [0u64; 8];
-    for qp in 0..MAX_QUEUE_PAIRS.min(out.len()) {
-        let rx_ptr = RX_QUEUES[qp].load(Ordering::Acquire);
-        if !rx_ptr.is_null() {
-            out[qp] = unsafe { (*rx_ptr).cons_cnt.load(Ordering::Relaxed) as u64 };
-        }
-    }
-    out
-}
-
-/// Per-queue used-ring cursors. For gvnic we don't have a
-/// virtio-style "used ring" — the closest analogs are the
-/// completion ring's fill count (posted to device) and cons count
-/// (consumed by driver). Return `(fill_cnt, cons_cnt)` which maps
-/// naturally onto virtio's `(device_idx, driver_cursor)`
-/// interpretation in `/stats`.
-fn rx_used_cursors() -> [(u16, u16); 8] {
-    let mut out = [(0u16, 0u16); 8];
-    for qp in 0..MAX_QUEUE_PAIRS.min(out.len()) {
-        let rx_ptr = RX_QUEUES[qp].load(Ordering::Acquire);
-        if !rx_ptr.is_null() {
-            let rx = unsafe { &*rx_ptr };
-            out[qp] = (
-                rx.fill_cnt.load(Ordering::Relaxed) as u16,
-                rx.cons_cnt.load(Ordering::Relaxed) as u16,
-            );
-        }
-    }
-    out
-}
+// Diagnostic counters + descriptor capture + NicDiagOps adapters
+// live in `crate::diag`.
 
 // ---- RX (NicOps::poll_rx / poll_qp) --------------------------------------
 //
@@ -2105,36 +1903,11 @@ fn probe() -> bool {
     probe_ok() || init()
 }
 
-/// Trampoline so the driver's local `TxDescLogEntry` (private
-/// shape, lives in this module) bridges to the cross-crate
-/// `uni_net_driver::TxDescLogEntry` the consumer reads. Same
-/// fields, same layout — we copy field-by-field rather than
-/// transmute to keep the boundary explicit.
-fn tx_desc_log_snapshot_export(out: &mut [uni_net_driver::TxDescLogEntry]) -> usize {
-    let mut local = [TxDescLogEntry {
-        seq: 0,
-        qp: 0,
-        kind: 0,
-        bytes: [0; 16],
-    }; TX_DESC_LOG_DEPTH];
-    let limit = out.len().min(TX_DESC_LOG_DEPTH);
-    let n = tx_desc_log_snapshot(&mut local[..limit]);
-    for i in 0..n {
-        out[i] = uni_net_driver::TxDescLogEntry {
-            seq: local[i].seq,
-            qp: local[i].qp,
-            kind: local[i].kind,
-            bytes: local[i].bytes,
-        };
-    }
-    n
-}
-
 static GVE_DIAG_OPS: NicDiagOps = NicDiagOps {
-    rx_counts,
-    rx_used_cursors,
-    tx_diag: Some(tx_diag),
-    tx_desc_log_snapshot: Some(tx_desc_log_snapshot_export),
+    rx_counts: diag::rx_counts,
+    rx_used_cursors: diag::rx_used_cursors,
+    tx_diag: Some(diag::tx_diag),
+    tx_desc_log_snapshot: Some(diag::tx_desc_log_snapshot_export),
 };
 
 static GVE_OPS: NicOps = NicOps {
