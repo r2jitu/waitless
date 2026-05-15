@@ -50,12 +50,11 @@ UNI_ZONE="${UNIKERNEL_GCE_ZONE:-us-west1-c}"
 KVM_NAME="${GCP_KVM_VM_NAME:-kvm-vm}"
 KVM_ZONE="${GCP_KVM_VM_ZONE:-$UNI_ZONE}"
 
-# Default workload set, picked to give signal across both protocol
-# stacks AND both small/large body shapes. Includes a couple of
-# workloads still pending the C7 cleanup (h3_health_max,
-# diagnostics_tls_max); those drop after the cli.py tier-based
-# default takes over.
-DEFAULT_WORKLOADS="get_tcp,get_tls,h3_health_max,diagnostics_tls_max,download_64k_quic"
+# Default workload set is now picked by cli.py (tier == "default"
+# entries in `WORKLOADS`). Leaving `workloads` empty causes the
+# `--workload` flag to be omitted below, and cli.py falls back to
+# its tier-based default. Pass `--workload <name>[,<name>...]` to
+# override.
 DEFAULT_CORES="1,2,4"
 # 5 s per workload: long enough for steady-state numbers, short
 # enough that iterating on driver/runtime changes is bearable. A
@@ -98,7 +97,6 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-[ -n "$workloads" ] || workloads="$DEFAULT_WORKLOADS"
 [ -n "$cores" ]     || cores="$DEFAULT_CORES"
 [ -n "$duration" ]  || duration="$DEFAULT_DURATION"
 
@@ -255,10 +253,17 @@ else
     # `--target IP` and the per-workload `parallelism_per_core`
     # scaling (mirroring how nested-KVM benches scale).
     echo "==> Running bench harness against $UNI_IP..."
-    echo "    cores=$cores  duration=${duration}s  workloads=$workloads"
+    echo "    cores=$cores  duration=${duration}s  workloads=${workloads:-<default>}"
+    # Only forward `--workload` if the user actually passed one; an
+    # empty value lets cli.py fall through to its tier=="default"
+    # set.
+    workload_arg=""
+    if [ -n "$workloads" ]; then
+        workload_arg="--workload $workloads"
+    fi
     kvm_ssh "cd ~/bench && python3 bench.py \
         --env remote --target $UNI_IP \
-        --cores $cores --duration $duration --workload $workloads"
+        --cores $cores --duration $duration $workload_arg"
 fi
 
 # ── Step 4: tear down (unless --keep-running) ─────────────────────
