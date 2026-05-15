@@ -192,8 +192,6 @@ struct State {
     /// from init; consumed by queue bring-up when sizing rings.
     max_tx_queues: u32,
     max_rx_queues: u32,
-    tx_queue_entries: u16,
-    rx_queue_entries: u16,
     default_num_queues: u16,
     mtu: u16,
     /// Number of event counters the device advertises. Sized by
@@ -250,19 +248,14 @@ pub(crate) struct TxQueue {
     /// given via CREATE_TX_QUEUE.
     pub(crate) ring_va: u64,
     pub(crate) ring_entries: u16,
-    /// Queue-resources page. The device populates
-    /// `{db_index, counter_index}` here right after CREATE_TX_QUEUE
-    /// returns so the driver can find its doorbell / counter slot.
-    qres_va: u64,
     /// QPL backing storage — contiguous pages the device sees as a
     /// linear byte range; our TX packets live here for the device to
     /// read. Single contiguous alloc — simpler than page-by-page.
     pub(crate) qpl_base_va: u64,
     pub(crate) qpl_base_phys: u64,
-    qpl_size: u32, // bytes
-    qpl_id: u32,   // returned by REGISTER_PAGE_LIST
     /// Doorbell offset into BAR2 (bytes). Set once we read back the
-    /// `db_index` the device wrote into `qres_va`.
+    /// device-populated `db_index` from the queue-resources page at
+    /// queue-create time.
     pub(crate) db_offset: u32,
     pub(crate) counter_index: u32,
     /// Monotonically-increasing packet producer counter. Written to
@@ -336,17 +329,12 @@ pub(crate) struct RxQueue {
     /// a big-endian QPL offset the device will write buffer `i` to.
     pub(crate) data_va: u64,
     pub(crate) ring_entries: u16,
-    /// Queue-resources page (same layout as TX).
-    qres_va: u64,
-    /// RX QPL backing storage. Big: 1024 pages = 4 MiB on GCE.
+    /// RX QPL backing storage.
     pub(crate) qpl_base_va: u64,
     pub(crate) qpl_base_phys: u64,
-    qpl_size: u32,
-    qpl_id: u32,
     /// Doorbell for advancing the RX data-ring fill counter — we
     /// write the total number of posted slots here (monotonic).
     pub(crate) db_offset: u32,
-    counter_index: u32,
     /// How many slots have been advertised to the device (matches
     /// the value last written to the RX doorbell).
     pub(crate) fill_cnt: AtomicU32,
@@ -584,8 +572,6 @@ fn init() -> bool {
             mac: [0; 6],
             max_tx_queues: max_tx,
             max_rx_queues: max_rx,
-            tx_queue_entries: 0,
-            rx_queue_entries: 0,
             default_num_queues: 0,
             mtu: 0,
             num_event_counters: 0,
@@ -843,8 +829,6 @@ fn parse_device_descriptor(desc_virt: *mut u8) -> bool {
     let mut st = STATE.lock();
     if let Some(s) = st.as_mut() {
         s.mac = mac;
-        s.tx_queue_entries = tx_entries;
-        s.rx_queue_entries = rx_entries;
         s.default_num_queues = default_num_queues;
         s.mtu = mtu;
         s.num_event_counters = counters;
@@ -1557,24 +1541,13 @@ fn finalize_tx_queue(qp: u32, alloc: &TxAlloc, fmt: QueueFormat) {
         db_index = read_be32(bytes, 0);
         counter_index = read_be32(bytes, 4);
     }
-    let qpl_size = match fmt {
-        QueueFormat::GqiQpl => TX_QPL_PAGES * PAGE_SIZE,
-        QueueFormat::DqoRda => dqo::DQO_TX_POOL_BUFS * RX_BUFFER_SIZE as u32,
-    };
-    let qpl_id = match fmt {
-        QueueFormat::GqiQpl => tx_qpl_id(qp),
-        QueueFormat::DqoRda => 0, // RDA → no QPL; CREATE_TX_QUEUE uses GVE_RAW_ADDRESSING_QPL_ID
-    };
     let mut st = STATE.lock();
     if let Some(s) = st.as_mut() {
         s.tx[qp as usize] = Some(TxQueue {
             ring_va: alloc.ring_va,
             ring_entries: TX_RING_ENTRIES,
-            qres_va: alloc.qres_va,
             qpl_base_va: alloc.qpl_va,
             qpl_base_phys: alloc.qpl_phys,
-            qpl_size,
-            qpl_id,
             db_offset: db_index * 4,
             counter_index,
             fill_cnt: AtomicU32::new(0),
@@ -1609,22 +1582,14 @@ fn finalize_tx_queue(qp: u32, alloc: &TxAlloc, fmt: QueueFormat) {
     }
 }
 
-fn finalize_rx_queue(qp: u32, alloc: &RxAlloc, fmt: QueueFormat) {
+fn finalize_rx_queue(qp: u32, alloc: &RxAlloc, _fmt: QueueFormat) {
     let db_index;
-    let counter_index;
     unsafe {
         let bytes = slice_at(alloc.qres_va, 8);
         db_index = read_be32(bytes, 0);
-        counter_index = read_be32(bytes, 4);
+        // counter_index at offset 4 — RX doesn't use it (we never
+        // read the device's RX counter slot).
     }
-    let qpl_size = match fmt {
-        QueueFormat::GqiQpl => RX_QPL_PAGES * PAGE_SIZE,
-        QueueFormat::DqoRda => dqo::DQO_RX_POOL_BUFS * RX_BUFFER_SIZE as u32,
-    };
-    let qpl_id = match fmt {
-        QueueFormat::GqiQpl => rx_qpl_id(qp),
-        QueueFormat::DqoRda => 0, // RDA → CREATE_RX_QUEUE uses GVE_RAW_ADDRESSING_QPL_ID
-    };
     // GQI uses flags_seq starting at 1; DQO uses generation bit
     // starting at 1 (ring is zeroed, device fills with current gen,
     // flips each wrap).
@@ -1635,13 +1600,9 @@ fn finalize_rx_queue(qp: u32, alloc: &RxAlloc, fmt: QueueFormat) {
             compl_va: alloc.compl_va,
             data_va: alloc.data_va,
             ring_entries: RX_RING_ENTRIES,
-            qres_va: alloc.qres_va,
             qpl_base_va: alloc.qpl_va,
             qpl_base_phys: alloc.qpl_phys,
-            qpl_size,
-            qpl_id,
             db_offset: db_index * 4,
-            counter_index,
             fill_cnt: AtomicU32::new(0),
             cons_cnt: AtomicU32::new(0),
             expected_seq: AtomicU8::new(initial_seq),
