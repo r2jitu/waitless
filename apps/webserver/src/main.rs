@@ -1120,12 +1120,12 @@ fn stats_response() -> Response {
             uni_driver_gve::dqo::DQO_RX_LAST_SKIP_STATUS.load(core::sync::atomic::Ordering::Relaxed),
         );
 
-        // SYN-ingress vs SYN-ACK-egress counters. Compared against a
-        // client-side pcap (SYNs sent / SYN-ACKs received) these
-        // localize the residual DQO drop: if `tcp_syn_rx` ≪ client
-        // SYNs the drop is below our TCP stack (RX driver / NIC);
-        // if they match but the client got fewer SYN-ACKs the drop
-        // is on egress.
+        // SYN-ingress vs SYN-ACK-egress counters. Compared against
+        // a client-side pcap (or nstat TcpActiveOpens/SynRetrans)
+        // these localize ingress drops below the TCP stack:
+        //   client SYNs > tcp_syn_rx  → RX driver / NIC dropping
+        //   tcp_syn_rx == tcp_synack_tx ≠ client SYN-ACK received
+        //                             → egress drop after our TX.
         let _ = write!(
             w,
             ",\"tcp_syn_rx\":{},\"tcp_synack_tx\":{}",

@@ -398,9 +398,7 @@ pub(crate) fn send_on_qp(qp: usize, data: &[u8]) -> bool {
     // Classify the outbound frame: figure out whether the device
     // should do CSUM offload (for TCP/UDP), and compute a path_hash
     // for Andromeda's per-flow fast path.
-    let cls = classify_outbound(unsafe {
-        core::slice::from_raw_parts(buf_va as *const u8, data.len())
-    });
+    let cls = classify_outbound(data);
 
     // Build the 16-byte general context descriptor as a single u128
     // so the store hits memory atomically. Layout per gve_desc_dqo.h:
@@ -522,14 +520,10 @@ pub(crate) fn poll_qp_inner<F: FnMut(&[u8])>(qp: usize, mut callback: F) -> u32 
             ptr::read_volatile(desc_ptr.add(12) as *const u16)
         } as u32;
 
-        let delivered_this = buf_id < DQO_RX_POOL_BUFS
+        let deliver = buf_id < DQO_RX_POOL_BUFS
             && (status & DQO_RX_COMPL_STATUS_EOP) != 0
             && pkt_len > 0;
-        if !delivered_this {
-            DQO_RX_COMPL_SKIPPED.fetch_add(1, Ordering::Relaxed);
-            DQO_RX_LAST_SKIP_STATUS.store(status, Ordering::Relaxed);
-        }
-        if delivered_this {
+        if deliver {
             let buf_va = rx.qpl_base_va + (buf_id as u64) * (RX_BUFFER_SIZE as u64);
             if qp < RX_BYTES_PER_QP.len() {
                 RX_BYTES_PER_QP[qp].fetch_add(pkt_len as u64, Ordering::Relaxed);
@@ -560,8 +554,10 @@ pub(crate) fn poll_qp_inner<F: FnMut(&[u8])>(qp: usize, mut callback: F) -> u32 
             post_desc[8..16].copy_from_slice(&buf_phys.to_le_bytes());
             unsafe { ptr::copy_nonoverlapping(post_desc.as_ptr(), post_ptr, DQO_RX_DESC_SIZE); }
             rx.fill_cnt.store(fill.wrapping_add(1), Ordering::Release);
-            rx.cons_cnt.store(cons.wrapping_add(1), Ordering::Relaxed);
             delivered += 1;
+        } else {
+            DQO_RX_COMPL_SKIPPED.fetch_add(1, Ordering::Relaxed);
+            DQO_RX_LAST_SKIP_STATUS.store(status, Ordering::Relaxed);
         }
 
         cons = cons.wrapping_add(1);
