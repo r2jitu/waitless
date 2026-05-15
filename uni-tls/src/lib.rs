@@ -369,8 +369,8 @@ impl Drop for PooledTlsConn {
 }
 
 impl PooledTlsConn {
-    fn push_rx(&mut self, bytes: &[u8]) {
-        self.inner.tls.push_rx(bytes);
+    fn push_rx(&mut self, bytes: &[u8]) -> usize {
+        self.inner.tls.push_rx(bytes)
     }
 
     fn advance(&mut self) -> Result<(), ()> {
@@ -504,8 +504,25 @@ impl TlsStream {
         if got == 0 {
             return Err(());
         }
-        self.tls.push_rx(&self.cipher_buf[..got]);
-        self.tls.advance().map_err(|_| ())?;
+        // `push_rx` may accept fewer bytes than offered when the
+        // TLS-side rx_buf is near full. Loop, advancing between
+        // pushes so the state machine drains parsed records and
+        // frees space for the rest of this `cipher_buf` slice.
+        // Without this loop, leftover bytes would be silently
+        // dropped — bulk uploads that span multiple TCP segments
+        // would stall mid-record.
+        let mut off = 0usize;
+        while off < got {
+            let n = self.tls.push_rx(&self.cipher_buf[off..got]);
+            self.tls.advance().map_err(|_| ())?;
+            if n == 0 {
+                // advance() didn't drain anything and the buffer
+                // can't accept more — the peer sent a record
+                // bigger than rx_buf can hold. Fatal.
+                return Err(());
+            }
+            off += n;
+        }
         self.drain_tx().await
     }
 

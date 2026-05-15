@@ -47,11 +47,15 @@ use crate::schedule as tls;
 // request respectively; 4 KB is generous for all three.
 
 /// Max raw TLS bytes we buffer from the peer before advancing the
-/// state machine. Sized to hold a typical ClientHello (~500 bytes)
-/// or an HTTP/1.1 request under TLS record overhead. TLS 1.3 lets
-/// peers send up to 16 KB records but clients rarely do; anything
-/// bigger than this will close the connection.
-pub const RX_BUF_LEN: usize = 4 * 1024;
+/// state machine. TLS 1.3 lets peers send records up to ~16 KiB
+/// plaintext + 22 B AEAD/record overhead = 16406 B; production
+/// clients (rustls, OpenSSL, Chrome, Safari) routinely fill that
+/// for bulk uploads. Sized to one full max-size record so a
+/// 32 KiB POST that splits into 2 records can still be processed
+/// one-at-a-time: each record fills rx_buf, gets parsed +
+/// drained, then the next arrives. Anything bigger than this in
+/// a single record will close the connection.
+pub const RX_BUF_LEN: usize = 17 * 1024;
 
 /// Max raw TLS bytes we emit during the server flight
 /// (ServerHello + CCS + encrypted {EncExt, Certificate, CertVerify,
