@@ -292,6 +292,92 @@ AEAD to the NIC.
   pattern as the TLS scratch in `TlsStream::send`). B then
   upgrades it to a pool-borrowed IOBuf.
 
+### R. UDP GSO on DQO TX
+- **Status**: [ ]
+- **Result (when landed)**: UDP-heavy TX paths emit one
+  GSO-segmented "big frame" instead of N MTU-sized sends. The
+  device hardware segments on its side, eliminating
+  ~per-segment driver overhead on the QUIC and raw-UDP paths.
+  Linux's gve added the DQO variant in v1.4.10 ("Enable support
+  for UDP GSO when using DQO format"); we're matching that
+  capability on a path the GQI mode has had since the initial
+  UDP-GSO landing.
+- **Where**:
+  * Dispatcher (currently early-returns on DQO):
+    [`uni-driver-gve/src/lib.rs:1619-1630`](uni-driver-gve/src/lib.rs#L1619-L1630)
+    `submit_tx_udp_gso` — `if QUEUE_FORMAT_DQO { return; }` at
+    line 1626.
+  * Buf-acquire (currently shares GQI big-pool path, returns None
+    on DQO):
+    [`uni-driver-gve/src/lib.rs:1610-1617`](uni-driver-gve/src/lib.rs#L1610-L1617)
+    `acquire_tx_udp_gso_buf` → `acquire_tx_tso_buf()` → None on
+    DQO ([lib.rs:1641-1644](uni-driver-gve/src/lib.rs#L1641-L1644)).
+  * GQI implementation to mirror:
+    [`uni-driver-gve/src/gqi.rs:571`](uni-driver-gve/src/gqi.rs#L571)
+    `submit_tx_udp_gso_inner`. Same arg shape: `handle`,
+    `frame_len`, `hdr_len`, `csum_start`, `gso_size`.
+  * DQO TX descriptor format reference:
+    [`uni-driver-gve/src/dqo.rs:21-65`](uni-driver-gve/src/dqo.rs#L21-L65)
+    documents the general-context + pkt-desc pair; lines 130-138
+    cover the pkt-desc flags layout.
+- **What**:
+  1. Pull upstream Linux's `gve_tx_dqo.c` from
+     `torvalds/linux/master` and locate UDP-GSO handling — grep
+     for `SKB_GSO_UDP_L4`, `gso_size`, `udp_gso`. Identify the
+     exact metadata-byte offsets in the general-context
+     descriptor that carry hdr_len + gso_size (different
+     placement than GQI's flat descriptor).
+  2. Add `dqo::submit_tx_udp_gso_inner(handle, frame_len,
+     hdr_len, csum_start, gso_size)` mirroring the GQI shape.
+     Build the general-context descriptor with the GSO metadata
+     fields populated, emit the pkt descriptor with the GSO
+     flag set, ring the doorbell.
+  3. Swap the dispatcher at
+     [`lib.rs:1626-1628`](uni-driver-gve/src/lib.rs#L1626-L1628)
+     to call `dqo::submit_tx_udp_gso_inner` on DQO instead of
+     `return;`.
+  4. Extend `acquire_tx_udp_gso_buf` to allocate from the DQO TX
+     bounce pool. Today it shares the GQI big-pool via
+     `acquire_tx_tso_buf` which returns None on DQO; DQO needs
+     its own slot acquire (or the shared acquire needs to know
+     about the DQO bounce-pool slots). The DQO send path
+     (`send_on_qp_dqo`) already manages bounce-buffer slots —
+     extend that allocator to surface GSO-sized slots.
+- **Win**: +20-50% expected on `h3_health_max` (QUIC keep-alive,
+  one big UDP datagram per HTTP/3 response → currently fragments
+  into ~10 sends/response without GSO) and `udp_peak` (raw UDP
+  echo throughput) at 1c/4c on c3-highcpu-8. Non-UDP paths
+  (`http_close_max`, `get_tcp`, `get_tls_fresh`) untouched.
+- **Effort**: medium. ~150 LOC: new `dqo::submit_tx_udp_gso_inner`,
+  dispatcher swap, DQO bounce-pool GSO-slot acquire. The
+  descriptor-byte-level work needs the upstream Linux source
+  for guidance.
+- **Risk**: medium. Descriptor-byte-level bugs cause silent TX
+  drops (device fetches descriptors, no packet emerges) — the
+  same failure shape as the TSO bring-up bug documented in the
+  2026-05-10 progress-log entry below. Mitigations:
+  * Reuse the `/diag-gve` descriptor-capture pattern from the
+    TSO bring-up: surface the raw 16-byte descriptors over an
+    HTTP endpoint so we can inspect them from kvm-vm without
+    serial-console access on GCE.
+  * Bench dispatch: any descriptor regression manifests as a
+    complete TX drop on the first GSO send → `h3_health_max`
+    /`udp_peak` collapse to ~0 RPS in the bench, fail-fast.
+- **Bench protocol**: pre/post on c3-highcpu-8 at 1c and 4c.
+  Expected-win workloads: `h3_health_max`, `udp_peak`. Controls:
+  `http_close_max`, `get_tcp`, `get_tls_fresh` (must stay ±3%).
+  3-run median per workload-corecount. If no UDP win shows
+  after a clean implementation, check the loadgen for
+  `UDP_SEGMENT` setsockopt usage — without it the loadgen is
+  splitting per-MSS host-side and the bench measures naked
+  single-MSS UDP throughput rather than the GSO path.
+- **Tests**: `test_hvf` must pass — it uses the HVF runner's
+  userspace network and doesn't exercise the DQO descriptor
+  format, so it only catches wider regressions in the
+  dispatcher / TX-buf-acquire code, not the descriptor-bytes
+  themselves. Driver-level correctness for the descriptor
+  shape is GCE-only.
+
 ## Segment 2 — Wire & receive (NIC TX → browser RX)
 
 ### G. TSO (TCP Segmentation Offload)
