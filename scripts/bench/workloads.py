@@ -576,8 +576,15 @@ def run_loadgen_http_upload(port, endpoint, conns, duration, host,
     if tls:
         argv.append("--tls")
     try:
+        # `duration + 60` (was +30) — at higher core counts the
+        # upload workload sometimes stalls in the loadgen-internal
+        # scheduling for >10s under load, and the prior +30 budget
+        # caught those legitimate-but-slow runs as TIMEOUT (saw it
+        # as a 4c coin-flip between 60k req/s and TIMEOUT on
+        # identical builds). +60 keeps real hangs bounded while
+        # absorbing stall variance.
         r = subprocess.run(argv, capture_output=True, text=True,
-                           timeout=duration + 30)
+                           timeout=duration + 60)
         if r.returncode != 0:
             return 0.0, "ERROR", "ERROR"
         return _parse_loadgen_output(r.stdout)
