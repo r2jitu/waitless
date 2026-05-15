@@ -18,6 +18,7 @@ use clap::{Parser, Subcommand};
 mod gateway;
 mod h3_health;
 mod http_close;
+mod http_upload;
 mod tcp_echo;
 mod tls_handshake;
 mod tls_resume;
@@ -92,6 +93,27 @@ enum Workload {
         warmup_secs: u64,
         #[arg(long, default_value = "4")]
         parallelism: usize,
+    },
+    /// Bulk-RX upload: keep-alive HTTP/1.1 POST with sized body,
+    /// tiny response, optionally over TLS. Each iteration sends
+    /// ~msg_size/MSS RX segments to the server on the same 4-tuple
+    /// — the shape that exercises driver RX path / RSC coalescing.
+    HttpUpload {
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        port: u16,
+        #[arg(long, default_value = "/discard")]
+        endpoint: String,
+        #[arg(long, default_value = "5")]
+        duration_secs: u64,
+        #[arg(long, default_value = "16")]
+        connections: usize,
+        #[arg(long, default_value = "32768")]
+        msg_size: usize,
+        /// Wrap each connection in TLS 1.3. Off by default (plain HTTP).
+        #[arg(long, default_value = "false")]
+        tls: bool,
     },
     /// TCP ping-pong throughput: open `connections` TCP streams,
     /// each sending an `msg_size` byte payload and waiting for the
@@ -228,6 +250,17 @@ fn main() -> std::io::Result<()> {
             Duration::from_secs(duration_secs),
             connections,
             msg_size,
+        )),
+        Workload::HttpUpload {
+            host, port, endpoint, duration_secs, connections, msg_size, tls,
+        } => runtime.block_on(http_upload::run(
+            &host,
+            port,
+            &endpoint,
+            Duration::from_secs(duration_secs),
+            connections,
+            msg_size,
+            tls,
         )),
         Workload::Gateway {
             host, port, backend_port, duration_secs, connections, msg_size,
