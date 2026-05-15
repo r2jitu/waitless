@@ -106,22 +106,17 @@ impl Header {
     }
 }
 
-/// Maximum request body the parser will retain. Sized to accommodate
-/// the bulk-upload bench workloads (`upload_32k_*`) with headroom for
-/// future growth. Each accepted connection holds a Request inline in
-/// its future state, so this contributes BODY_CAP bytes per in-flight
-/// conn; budgeted against fanout_tcp's 1500 conn/core × 8 cores ≈
-/// 768 MB on the 16 GiB c3-highcpu-8 bench VM.
-pub const BODY_CAP: usize = 65536;
-
 pub struct Request {
     pub method: Method,
     path: [u8; 256],
     path_len: usize,
     headers: [Header; 16],
     header_count: usize,
-    body: [u8; BODY_CAP],
-    body_len: usize,
+    /// Content-Length from the request headers, or 0 if absent.
+    /// Authoritative count of body bytes that follow the headers
+    /// on the wire — the `BodyReader` handed to the handler will
+    /// deliver exactly this many bytes.
+    content_length: usize,
 }
 
 impl Request {
@@ -132,8 +127,7 @@ impl Request {
             path_len: 0,
             headers: [const { Header::new() }; 16],
             header_count: 0,
-            body: [0; BODY_CAP],
-            body_len: 0,
+            content_length: 0,
         }
     }
 
@@ -141,8 +135,12 @@ impl Request {
         &self.path[..self.path_len]
     }
 
-    pub fn body(&self) -> &[u8] {
-        &self.body[..self.body_len]
+    /// Total body length in bytes (declared by the Content-Length
+    /// header). The handler reads the body via the `BodyReader`
+    /// passed as the second argument; this is the count it will
+    /// deliver in total.
+    pub fn content_length(&self) -> usize {
+        self.content_length
     }
 
     pub fn header(&self, name: &[u8]) -> Option<&[u8]> {
@@ -175,13 +173,12 @@ impl Request {
         self.path_len = n;
     }
 
-    /// Overwrite the request body. Truncates if longer than the
-    /// fixed `body` buffer. Used by the HTTP/3 frontend after it
-    /// reassembles DATA frames.
-    pub fn set_body(&mut self, body: &[u8]) {
-        let n = body.len().min(self.body.len());
-        self.body[..n].copy_from_slice(&body[..n]);
-        self.body_len = n;
+    /// Used by the HTTP/3 frontend to install the Content-Length
+    /// value it parsed from the QPACK-decoded `content-length`
+    /// pseudo-header into the same `Request` shape the HTTP/1.1
+    /// parser fills in.
+    pub fn set_content_length(&mut self, n: usize) {
+        self.content_length = n;
     }
 
     /// Append a header line `(name, value)`. Drops silently if the
@@ -205,7 +202,153 @@ impl Request {
         self.method = Method::Unknown;
         self.path_len = 0;
         self.header_count = 0;
-        self.body_len = 0;
+        self.content_length = 0;
+    }
+}
+
+// ---- Streaming request body --------------------------------------------------
+
+/// Streaming reader for the request body.
+///
+/// Bytes are exposed via [`chunk`] as borrowed slices that alias
+/// either:
+///   * the per-connection parse buffer (`prebuf`) — for body bytes
+///     that arrived in the same TCP/TLS read that delivered the
+///     headers; zero-copy from the handler's perspective.
+///   * the reader's own [`refill`] scratch — populated by direct
+///     stream reads after `prebuf` is exhausted; the bytes are
+///     copied once from the transport's user-supplied recv buffer
+///     into `refill`, then handed to the handler as a borrowed
+///     slice.
+///
+/// The reader knows the total body length (from the request's
+/// `Content-Length`) and stops handing out bytes after exactly
+/// that many have been delivered, so the underlying transport
+/// stream is left positioned at the start of the next pipelined
+/// request.
+///
+/// If the handler returns without consuming all bytes,
+/// `serve_conn` calls [`discard`] before sending the response so
+/// the keep-alive contract holds. Handlers that intentionally
+/// want to abort a large unwanted upload should return a response
+/// with `Connection: close` set; `serve_conn` then skips the
+/// drain and tears down the conn.
+pub struct BodyReader<'a, S: HttpStream> {
+    stream: &'a mut S,
+    /// Bytes from `serve_conn`'s parse buffer that belong to the
+    /// body — already received from the wire by the time the
+    /// handler runs.
+    prebuf: &'a [u8],
+    prebuf_consumed: usize,
+    /// Scratch for stream-pumped bytes once `prebuf` is exhausted.
+    /// 4 KiB matches a typical MSS-sized chunk; small bodies that
+    /// fit in `prebuf` never touch this.
+    refill: [u8; 4096],
+    refill_start: usize,
+    refill_end: usize,
+    /// Total body length declared by the request's Content-Length.
+    total: usize,
+    /// Bytes already handed to the handler via `chunk`.
+    delivered: usize,
+}
+
+impl<'a, S: HttpStream> BodyReader<'a, S> {
+    /// Construct a reader against `stream`, with `prebuf` carrying
+    /// any body bytes already received during the parse step.
+    /// `total` is the declared body length; the reader delivers
+    /// exactly that many bytes (possibly fewer on EOF) and refuses
+    /// to read past it into the next pipelined request.
+    pub fn new(stream: &'a mut S, prebuf: &'a [u8], total: usize) -> Self {
+        // Trim `prebuf` to at most `total` so the reader never
+        // reaches into post-body bytes (next pipelined request).
+        let prebuf_avail = prebuf.len().min(total);
+        BodyReader {
+            stream,
+            prebuf: &prebuf[..prebuf_avail],
+            prebuf_consumed: 0,
+            refill: [0; 4096],
+            refill_start: 0,
+            refill_end: 0,
+            total,
+            delivered: 0,
+        }
+    }
+
+    /// Total body length (Content-Length).
+    pub fn len(&self) -> usize {
+        self.total
+    }
+
+    /// Bytes still to be delivered.
+    pub fn remaining(&self) -> usize {
+        self.total - self.delivered
+    }
+
+    /// True once the body is fully consumed.
+    pub fn is_empty(&self) -> bool {
+        self.remaining() == 0
+    }
+
+    /// Get the next chunk of body bytes as a borrowed slice. An
+    /// empty slice signals either "body fully delivered" (the
+    /// expected end state — caller stops) or "transport EOF before
+    /// Content-Length was reached" — distinguish via `remaining()`.
+    pub async fn chunk(&mut self) -> &[u8] {
+        if self.delivered >= self.total {
+            return &[];
+        }
+        let want_max = self.total - self.delivered;
+
+        // 1. Drain prebuf first — zero-copy, the bytes are already
+        //    sitting in serve_conn's parse buffer.
+        if self.prebuf_consumed < self.prebuf.len() {
+            let start = self.prebuf_consumed;
+            let avail = self.prebuf.len() - start;
+            let take = avail.min(want_max);
+            self.prebuf_consumed += take;
+            self.delivered += take;
+            return &self.prebuf[start..start + take];
+        }
+
+        // 2. Drain refill if any bytes are left over from a prior
+        //    pump that returned more than the previous `chunk`
+        //    request could deliver.
+        if self.refill_start < self.refill_end {
+            let start = self.refill_start;
+            let avail = self.refill_end - start;
+            let take = avail.min(want_max);
+            self.refill_start += take;
+            self.delivered += take;
+            return &self.refill[start..start + take];
+        }
+
+        // 3. Refill from the transport. Cap at `want_max` so the
+        //    `recv` doesn't read past Content-Length into the
+        //    next pipelined request.
+        let cap = want_max.min(self.refill.len());
+        let got = self.stream.recv(&mut self.refill[..cap]).await;
+        if got == 0 {
+            // Transport closed before body fully arrived.
+            return &[];
+        }
+        self.refill_start = got;
+        self.refill_end = got;
+        self.delivered += got;
+        &self.refill[..got]
+    }
+
+    /// Drain the rest of the body, dropping every byte. Returns
+    /// `Err` if the transport closed before delivering all
+    /// `Content-Length` bytes — caller's contract is to tear the
+    /// connection down in that case.
+    pub async fn discard(&mut self) -> Result<(), ()> {
+        while self.delivered < self.total {
+            let chunk = self.chunk().await;
+            if chunk.is_empty() {
+                return Err(());
+            }
+        }
+        Ok(())
     }
 }
 
@@ -351,12 +494,14 @@ pub fn bytes_owned(v: alloc::vec::Vec<u8>) -> IOBuf {
 
 // ---- Server -----------------------------------------------------------------
 
-/// Per-connection parse buffer. Must be ≥ BODY_CAP plus header
-/// headroom so a full Content-Length-sized POST fits in one
-/// parse pass. 1 KiB of header room covers the worst-case
-/// `Host` + auth + cookies set we expect from bench / browser
-/// clients.
-const BUF_SIZE: usize = BODY_CAP + 1024;
+/// Per-connection parse buffer. Sized for the request HEAD only —
+/// status line + headers, terminated by `\r\n\r\n`. Bodies are
+/// delivered to the handler via [`BodyReader`] which streams from
+/// the transport stream (with any body bytes that happened to land
+/// in this buffer as a prefix). 16 KiB covers worst-case header
+/// sets we expect from bench / browser clients plus headroom for
+/// the leading bytes of a POST body.
+const BUF_SIZE: usize = 16 * 1024;
 
 /// Idle-connection timeout. After this long without inbound data,
 /// the per-conn task tears down the connection and releases its
@@ -423,6 +568,34 @@ pub trait HttpStream {
     }
 }
 
+/// `HttpStream` impl for transports that hand the request body to
+/// the HTTP layer pre-buffered in one go (HTTP/3 reassembles DATA
+/// frames before invoking the handler). [`BodyReader`] only ever
+/// calls `recv` once its `prebuf` is exhausted — for an h3 body
+/// constructed with `prebuf.len() == total`, that path never
+/// fires. `NullStream` exists so the generic type parameter is
+/// satisfied for those transports; calling its methods past the
+/// trivial `recv` return-0 case panics.
+pub struct NullStream;
+
+/// Friendly alias for a [`BodyReader`] over [`NullStream`] — i.e.
+/// a body whose bytes are entirely in the prebuf and won't trigger
+/// any stream refill. Used by transports that buffer the request
+/// body before handing control to the application (HTTP/3 today).
+pub type BufferedBody<'a> = BodyReader<'a, NullStream>;
+
+impl HttpStream for NullStream {
+    async fn recv(&mut self, _buf: &mut [u8]) -> usize {
+        0
+    }
+    async fn send(&mut self, _chain: &mut IOBufChain) -> Result<(), ()> {
+        panic!("NullStream::send: this transport does not write through HttpStream")
+    }
+    async fn close(&mut self) -> Result<(), ()> {
+        Ok(())
+    }
+}
+
 impl HttpStream for uni::runtime::TcpStream {
     async fn recv(&mut self, buf: &mut [u8]) -> usize {
         (*self).recv(buf).await
@@ -462,7 +635,13 @@ impl HttpStream for uni::runtime::TcpStream {
 /// so a slow handler suspends only its own connection.
 pub fn listen<H>(port: u16, handler: H) -> Result<(), uni::runtime::TcpBindError>
 where
-    H: AsyncFn(&Request) -> Response + Send + Sync + 'static,
+    H: for<'a, 'b> AsyncFn(
+            &'a Request,
+            &'a mut BodyReader<'b, uni::runtime::TcpStream>,
+        ) -> Response
+        + Send
+        + Sync
+        + 'static,
 {
     let listener = uni::runtime::TcpListener::bind(port)?;
     let handler = Arc::new(handler);
@@ -492,7 +671,7 @@ pub async fn serve_conn<S, H>(
     mut stream: S,
 ) where
     S: HttpStream,
-    H: AsyncFn(&Request) -> Response,
+    H: for<'a, 'b> AsyncFn(&'a Request, &'a mut BodyReader<'b, S>) -> Response,
 {
     // Inline request-parse buffer in the future state. The
     // async runtime allocates the future once (as a
@@ -553,16 +732,45 @@ pub async fn serve_conn<S, H>(
 
         // Drain every complete request sitting in the buffer.
         while buf_len > 0 {
-            let consumed =
+            let body_start =
                 parse_request_with_state(&buf[..buf_len], &mut req, &mut parser_state);
-            if consumed == 0 {
+            if body_start == 0 {
                 break; // need more bytes
             }
             let want_close = match req.header(b"Connection") {
                 Some(v) => v.eq_ignore_ascii_case(b"close"),
                 None => false,
             };
-            let resp = (&*handler)(&req).await;
+            let content_length = req.content_length;
+
+            // Construct the streaming body reader. `prebuf` is the
+            // body bytes already sitting in `buf` after the
+            // headers; the reader will draw stream bytes for any
+            // tail that didn't fit. Restrict the prebuf to
+            // body-only bytes (the slice may otherwise include
+            // the start of the next pipelined request).
+            let prebuf_end = (body_start + content_length).min(buf_len);
+            let body_drained_ok;
+            let resp;
+            {
+                let prebuf = &buf[body_start..prebuf_end];
+                let mut body = BodyReader::new(&mut stream, prebuf, content_length);
+                resp = (&*handler)(&req, &mut body).await;
+                // Drain any leftover body bytes the handler didn't
+                // consume. Keep-alive contract requires the
+                // connection to be positioned at the start of the
+                // next request before we ship the response;
+                // skipping bytes mid-body would let them be
+                // mis-parsed as the next request's bytes. If the
+                // handler asked for `Connection: close` we tear
+                // down without draining (the conn is going away
+                // anyway).
+                body_drained_ok = want_close || body.is_empty()
+                    || body.discard().await.is_ok();
+            }
+            if !body_drained_ok {
+                return;
+            }
 
             // Wrap the per-conn `header_storage` array as an
             // a `Borrowed` IOBuf so the framing layer can build
@@ -630,9 +838,16 @@ pub async fn serve_conn<S, H>(
                 let _ = stream.close().await;
                 return;
             }
-            let remaining = buf_len - consumed;
+            // Shift any post-body bytes (start of the next
+            // pipelined request) to the front of `buf`. The body
+            // may have extended past the parse buffer's end (in
+            // which case `BodyReader` pulled the tail from the
+            // transport directly); compute the end-of-body offset
+            // capped at the current `buf_len`.
+            let body_end_in_buf = (body_start + content_length).min(buf_len);
+            let remaining = buf_len - body_end_in_buf;
             if remaining > 0 {
-                buf.copy_within(consumed..buf_len, 0);
+                buf.copy_within(body_end_in_buf..buf_len, 0);
             }
             buf_len = remaining;
             // The next pipelined request starts at byte 0 of the
@@ -769,22 +984,20 @@ fn parse_request_with_state(data: &[u8], req: &mut Request, state: &mut ParserSt
     }
 
     let body_start = header_end_pos + 4; // skip \r\n\r\n
-    let mut consumed = body_start;
 
-    // Handle Content-Length
-    if let Some(cl_val) = req.header(b"Content-Length") {
-        let body_len = parse_usize(cl_val);
-        let avail = data.len() - body_start;
-        if avail < body_len {
-            return 0; // incomplete body
-        }
-        let copy_len = body_len.min(BODY_CAP);
-        req.body[..copy_len].copy_from_slice(&data[body_start..body_start + copy_len]);
-        req.body_len = copy_len;
-        consumed += body_len;
-    }
+    // Extract Content-Length into the Request so the handler's
+    // `BodyReader` knows how many body bytes to deliver. The body
+    // bytes themselves stay in the caller's parse buffer (and the
+    // transport stream); `serve_conn` constructs the reader against
+    // them after this function returns. Bodies that span more than
+    // one recv are handled by the streaming reader, NOT by waiting
+    // here for all bytes to arrive.
+    req.content_length = match req.header(b"Content-Length") {
+        Some(cl_val) => parse_usize(cl_val),
+        None => 0,
+    };
 
-    consumed
+    body_start
 }
 
 // ---- Response sender --------------------------------------------------------

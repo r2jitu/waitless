@@ -180,7 +180,13 @@ pub fn listen<H>(
     key_der: &'static [u8],
 ) -> Result<(), ListenError>
 where
-    H: AsyncFn(&uni_http::Request) -> uni_http::Response + Send + Sync + 'static,
+    H: for<'a, 'b> AsyncFn(
+            &'a uni_http::Request,
+            &'a mut uni_http::BodyReader<'b, TlsStream>,
+        ) -> uni_http::Response
+        + Send
+        + Sync
+        + 'static,
 {
     let cfg = TlsServerConfig::from_dev_cert(cert_der, key_der)
         .ok_or(ListenError::Cert)?;

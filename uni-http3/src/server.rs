@@ -24,7 +24,7 @@ use alloc::vec::Vec;
 
 use uni_quic::{quic_listen, QuicConn, QuicListenError};
 
-use uni_http::{Method, Request, Response};
+use uni_http::{BodyReader, Method, NullStream, Request, Response};
 
 use crate::frame::{self, ftype as h3_ftype};
 use crate::qpack::{self, FieldSink};
@@ -60,15 +60,18 @@ impl From<QuicListenError> for ListenError {
 ///
 /// Returns once the server is bound; the listener stays alive for
 /// the duration of the program (uni's task system retains it).
-pub fn listen<H, F>(
+pub fn listen<H>(
     port: u16,
     handler: H,
     cert_der: &'static [u8],
     key_pkcs8_der: &'static [u8],
 ) -> Result<(), ListenError>
 where
-    H: Fn(Request) -> F + Send + Sync + Clone + 'static,
-    F: core::future::Future<Output = Response> + 'static,
+    H: for<'a, 'b> AsyncFn(Request, &'a mut BodyReader<'b, NullStream>) -> Response
+        + Send
+        + Sync
+        + Clone
+        + 'static,
 {
     // Pay one-time lazy-init costs upfront so they land in the
     // HEAP_BASELINE snapshot rather than the first request's
@@ -100,10 +103,9 @@ where
     Ok(())
 }
 
-async fn handle_conn<H, F>(conn: QuicConn, handler: Arc<H>)
+async fn handle_conn<H>(conn: QuicConn, handler: Arc<H>)
 where
-    H: Fn(Request) -> F + 'static,
-    F: core::future::Future<Output = Response> + 'static,
+    H: for<'a, 'b> AsyncFn(Request, &'a mut BodyReader<'b, NullStream>) -> Response + 'static,
 {
     // 1. Open control stream and send SETTINGS.
     //    Server-initiated unidirectional streams use IDs 3, 7, 11, ...
@@ -373,14 +375,13 @@ unsafe fn framing_pool_drop(
     // pool's Arc drops at scope-end too, decrementing the strong count.
 }
 
-async fn handle_request<H, F>(
+async fn handle_request<H>(
     conn: &QuicConn,
     sid: u64,
     handler: &H,
     scratch: &mut Scratch,
 ) where
-    H: Fn(Request) -> F,
-    F: core::future::Future<Output = Response>,
+    H: for<'a, 'b> AsyncFn(Request, &'a mut BodyReader<'b, NullStream>) -> Response,
 {
     // Accumulate stream bytes until we have a complete H3 frame
     // sequence: HEADERS frame, then 0+ DATA frames, then FIN.
@@ -525,10 +526,19 @@ async fn handle_request<H, F>(
             return;
         }
     }
-    req.set_body(&data[..]);
+    // Tell the request its Content-Length so the handler can
+    // budget reads — for h3 the entire body is already
+    // reassembled in `data`, but `BodyReader::chunk()` still
+    // needs a stop point that matches the prebuf length.
+    req.set_content_length(data.len());
 
     crate::diag::bump(&crate::diag::COUNTERS.user_handler_invoked);
-    let response = handler(req).await;
+    // Build a `BodyReader` whose `prebuf` is the fully-buffered
+    // body. The `NullStream` is unused — `total == prebuf.len()`
+    // means the reader never reaches its stream-refill path.
+    let mut null = NullStream;
+    let mut body = BodyReader::new(&mut null, &data[..], data.len());
+    let response = handler(req, &mut body).await;
     crate::diag::bump(&crate::diag::COUNTERS.user_handler_returned);
     let status = response.status;
     // Encode response: HEADERS + DATA + FIN.

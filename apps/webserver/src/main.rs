@@ -131,18 +131,8 @@ async fn init() {
     uni_http::listen(HTTP_PORT, handle_request).expect("http bind");
     uni::println!("listen tcp://:{} (http)", HTTP_PORT);
 
-    let h3_handler = move |req: uni_http::Request| async move {
-        // Bump the poll-entered counter the moment the future
-        // body starts executing. A gap between `user_handler_invoked`
-        // (set BEFORE handler(req).await in the H3 server) and
-        // `user_handler_polled` would mean the future was built
-        // but never polled — strong signal of a runtime/scheduler
-        // bug rather than handler-internal work.
-        uni_http3::diag::bump(&uni_http3::diag::COUNTERS.user_handler_polled);
-        handle_request(&req).await
-    };
     let h3_up = match uni_http3::listen(
-        HTTPS_PORT, h3_handler, DEV_CERT_DER, DEV_KEY_PKCS8_DER,
+        HTTPS_PORT, handle_request_h3, DEV_CERT_DER, DEV_KEY_PKCS8_DER,
     ) {
         Ok(()) => {
             uni::println!("listen udp://:{} (h3, TLS_AES_128_GCM_SHA256)", HTTPS_PORT);
@@ -239,12 +229,31 @@ fn alt_svc_value() -> Option<&'static [u8]> {
 /// `handle_request` (used by both HTTPS and H3 paths) and, when
 /// the H3 listener is up, layers a cached `Alt-Svc` header onto
 /// the response.
-async fn handle_request_https(req: &Request) -> Response {
-    let resp = handle_request(req).await;
+async fn handle_request_https<S: uni_http::HttpStream>(
+    req: &Request,
+    body: &mut uni_http::BodyReader<'_, S>,
+) -> Response {
+    let resp = handle_request(req, body).await;
     match alt_svc_value() {
         Some(v) => resp.with_header(&b"Alt-Svc"[..], v),
         None => resp,
     }
+}
+
+/// H3-side request dispatch. Takes an owned `Request` (h3's
+/// signature, since the QUIC stream is moved into the per-request
+/// future) and the buffered body. The `user_handler_polled`
+/// diag-counter bump matches the `user_handler_invoked` counter
+/// the H3 server records BEFORE `handler(...).await`; a gap
+/// between them means the future was constructed but never
+/// polled, which would be a runtime/scheduler bug rather than
+/// handler-internal work.
+async fn handle_request_h3(
+    req: Request,
+    body: &mut uni_http::BufferedBody<'_>,
+) -> Response {
+    uni_http3::diag::bump(&uni_http3::diag::COUNTERS.user_handler_polled);
+    handle_request(&req, body).await
 }
 
 // ---- Listener bodies --------------------------------------------------------
@@ -283,7 +292,10 @@ async fn gateway(stream: TcpStream, backend_ip: [u8; 4]) {
 
 // ---- Request dispatch -------------------------------------------------------
 
-async fn handle_request(req: &Request) -> Response {
+async fn handle_request<S: uni_http::HttpStream>(
+    req: &Request,
+    body: &mut uni_http::BodyReader<'_, S>,
+) -> Response {
     match req.path() {
         // ── HTML pages ───────────────────────────────────────────
         b"/"             => page_home(),
@@ -320,13 +332,28 @@ async fn handle_request(req: &Request) -> Response {
             core::hint::black_box(compute_work());
             Response::ok(b"application/json", b"{\"status\":\"computed\"}")
         }
-        // Bulk-RX bench sink. Accepts POST with any Content-Length
-        // up to BODY_CAP (64 KiB), reads the body into the request's
-        // inline buffer (so the wire bytes actually traverse the
-        // RX path), and returns a tiny 200 OK. Paired with the
-        // `upload_*_*` bench workloads — see scripts/bench/cli.py.
+        // Bulk-RX bench sink. Accepts POST of any length, drains
+        // the body via the streaming `BodyReader` (the bytes
+        // never sit in a single contiguous buffer — they flow
+        // through `body.chunk()` and get dropped each iter), and
+        // returns a tiny 200 OK. Paired with the `upload_*_*`
+        // bench workloads — see scripts/bench/cli.py.
         b"/discard" => {
-            core::hint::black_box(req.body().len());
+            // `chunk().await` yields the next slice of body
+            // bytes from either the parse buffer's leading
+            // prebuf (zero-copy) or the reader's internal
+            // refill scratch (one copy from the transport).
+            // We don't look at the bytes; just walking the
+            // stream is enough to advance the conn state past
+            // the body so the next keep-alive request can
+            // parse correctly.
+            loop {
+                let chunk = body.chunk().await;
+                if chunk.is_empty() {
+                    break;
+                }
+                core::hint::black_box(chunk.len());
+            }
             Response::ok(b"application/json", b"{\"status\":\"discarded\"}")
         }
         b"/tls_profile"       => tls_profile_response(),
