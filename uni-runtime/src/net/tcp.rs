@@ -410,24 +410,7 @@ pub struct TcpBackend {
     /// powers off. Native leaves this `None`: the kernel FINs every
     /// open fd at process exit.
     pub shutdown_all: Option<fn()>,
-
-    /// Optional. Reap connections stranded in a closing state by a
-    /// peer that never completed the four-way close. The bare-metal
-    /// stack has no RTO/2MSL timer, so without periodic reaping
-    /// these leak a connection slot (and a 4-tuple hash entry)
-    /// indefinitely. When set, `register_tcp_backend` spawns a
-    /// per-worker task that calls this on the runtime timer wheel.
-    /// Native leaves it `None` — the host kernel ages out closing
-    /// sockets itself.
-    pub reap: Option<fn()>,
 }
-
-/// Sweep interval for the per-worker TCP idle-connection reaper.
-/// The effective FIN_WAIT_2 / LAST_ACK timeout is this interval
-/// times the backend's per-sweep threshold (`REAP_AFTER_SWEEPS`,
-/// 2) — i.e. a connection whose peer vanishes is reclaimed in
-/// roughly 2-3 s.
-const TCP_REAP_INTERVAL_US: u64 = 1_000_000;
 
 static TCP_BACKEND: AtomicPtr<TcpBackend> =
     AtomicPtr::new(core::ptr::null_mut());
@@ -435,24 +418,6 @@ static TCP_BACKEND: AtomicPtr<TcpBackend> =
 /// Install the TCP backend. Call once at boot.
 pub fn register_tcp_backend(b: &'static TcpBackend) {
     TCP_BACKEND.store(b as *const _ as *mut _, Ordering::Release);
-    // If the backend exposes a reaper, drive it off the runtime
-    // timer wheel. The launcher fires once on every worker; the
-    // spawned task then loops forever, sleeping `TCP_REAP_INTERVAL_US`
-    // between sweeps. The bare-metal TCP stack has no RTO/2MSL timer
-    // of its own, so this per-worker task is what ages out
-    // closing-state connections (see `TcpBackend::reap`).
-    if b.reap.is_some() {
-        let _ = register_net_launcher(Box::new(|| {
-            let _ = crate::spawn(async {
-                loop {
-                    crate::sleep_us(TCP_REAP_INTERVAL_US).await;
-                    if let Some(reap) = tcp_backend().and_then(|b| b.reap) {
-                        reap();
-                    }
-                }
-            });
-        }));
-    }
 }
 
 /// Trigger the backend's `shutdown_all` hook if it has one. No-op

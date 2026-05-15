@@ -205,13 +205,6 @@ pub struct TcpConnection {
     /// owning core; woken when data lands in the ring or the
     /// peer closes. Per-core ownership — no lock needed.
     recv_waker: Option<Waker>,
-    /// Idle-reaper sweep counter. Incremented once per reaper sweep
-    /// while the connection sits in a peer-wait closing state
-    /// (FinWait1/FinWait2/LastAck/TimeWait); the connection is
-    /// force-freed once it exceeds `REAP_AFTER_SWEEPS`. Zero while
-    /// the connection is live; reset on every fresh allocation via
-    /// `TcpConnection::new`. See `reap_idle_closing`.
-    closing_sweeps: u8,
     /// Free-list link. When this slot is on the free list (state ==
     /// Closed AND the slot has been returned to the pool), this
     /// holds the index of the next free slot, or `NULL_SLOT` for
@@ -242,7 +235,6 @@ impl TcpConnection {
             accepted: false,
             generation: 0,
             recv_waker: None,
-            closing_sweeps: 0,
             next_free: NULL_SLOT,
         }
     }
@@ -886,55 +878,6 @@ fn free_connection(core: u32, slot: usize) {
     // Return the slot to the pool's free list. O(1) push; the next
     // `alloc_connection` call picks it up in O(1) too.
     POOLS.at(core).free_slot(slot as u16);
-}
-
-/// Reaper sweeps a closing-state connection must survive before
-/// it's force-freed. With the per-worker reaper's ~1 s interval
-/// this is an effective FIN_WAIT_2 / LAST_ACK timeout of ~2-3 s —
-/// far shorter than Linux's 60 s `tcp_fin_timeout`, which is fine
-/// for a churn-heavy server with no delayed-duplicate concerns on
-/// a cloud fabric.
-const REAP_AFTER_SWEEPS: u8 = 2;
-
-/// Reap idle connections stranded in a closing state. Called once
-/// per sweep interval by the runtime's per-worker TCP reaper task
-/// (see `uni_runtime::net::register_tcp_backend`).
-///
-/// This stack has no RTO/2MSL timer, so a peer that never finishes
-/// the four-way close — or whose final RST fails the RFC-5961
-/// in-window seq check in `tcp_receive` — strands its connection
-/// in FinWait1/FinWait2/LastAck/TimeWait indefinitely. Each such
-/// slot also pins a 4-tuple hash entry; once enough leak, the
-/// fixed 256-entry hash overflows (see `tcp_linear_find`). Without
-/// this sweep the only reclaim was the pool-exhaustion scavenge in
-/// `alloc_connection` at 65 472 slots — far too late.
-///
-/// Each call ticks `closing_sweeps` on every peer-wait connection
-/// and frees the ones past `REAP_AFTER_SWEEPS`. `CloseWait` is
-/// deliberately excluded: the peer has FIN'd but the local app
-/// still owns that slot (its handler hasn't closed yet). Live
-/// states (Established/SynReceived/Listen) are never touched.
-pub fn reap_idle_closing() {
-    let core = uni_kernel::cpu_id();
-    let cap = pool_capacity(core);
-    for i in 0..cap {
-        // SAFETY: per-core ownership — the reaper task runs pinned
-        // to the worker that owns this core's pool.
-        let c = unsafe { &mut *conn_ptr(core, i) };
-        match c.state {
-            TcpState::FinWait1
-            | TcpState::FinWait2
-            | TcpState::LastAck
-            | TcpState::TimeWait => {
-                if c.closing_sweeps >= REAP_AFTER_SWEEPS {
-                    free_connection(core, i);
-                } else {
-                    c.closing_sweeps += 1;
-                }
-            }
-            _ => {}
-        }
-    }
 }
 
 // ─── Unified TCP-frame builder ───────────────────────────────────────────────
