@@ -745,6 +745,36 @@ fn tcp_linear_find(core: u32, src_ip: IpAddr, src_port: u16, dst_port: u16) -> O
     None
 }
 
+/// Per-state census of every per-core connection pool, summed
+/// across cores. Index = `TcpState as usize` (0=Closed .. 8=TimeWait).
+/// Diagnostic only — exposed via `/stats` to show pool occupancy.
+/// A cross-core read of another core's pool is a benign race for a
+/// snapshot: the per-core ownership rule governs mutation, and a
+/// slightly-stale count is fine for an observability gauge.
+pub fn conn_state_census() -> [u32; 9] {
+    let mut counts = [0u32; 9];
+    let n = uni_kernel::percpu::num_cores();
+    for core in 0..n {
+        let cap = pool_capacity(core);
+        for i in 0..cap {
+            // SAFETY: diagnostic read; see doc comment.
+            let st = unsafe { (*conn_ptr(core, i)).state } as usize;
+            if st < counts.len() {
+                counts[st] += 1;
+            }
+        }
+    }
+    counts
+}
+
+/// Total materialized connection-pool capacity across all cores.
+/// Pairs with `conn_state_census` so `/stats` shows how full the
+/// pool is (capacity grows by `SEGMENT_SIZE` and never shrinks).
+pub fn pool_capacity_total() -> usize {
+    let n = uni_kernel::percpu::num_cores();
+    (0..n).map(pool_capacity).sum()
+}
+
 /// Draw a per-connection initial sequence number.
 ///
 /// Previously this was a global counter that stepped by 64 000, which

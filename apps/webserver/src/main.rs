@@ -1169,6 +1169,22 @@ fn stats_response() -> Response {
             uni::net::tcp::TCP_SYNACK_TX.load(core::sync::atomic::Ordering::Relaxed),
         );
 
+        // Connection-pool census — diagnostic for the fresh-conn
+        // degradation. `tcp_pool_cap` is total materialized slots
+        // (grows, never shrinks); `tcp_conn_states` is the count in
+        // each `TcpState` (0=Closed 1=Listen 2=SynReceived
+        // 3=Established 4=FinWait1 5=FinWait2 6=CloseWait 7=LastAck
+        // 8=TimeWait). When new SYNs go unanswered the pool is full
+        // of states the scavenge can't reclaim — this shows which.
+        let census = uni::net::tcp::conn_state_census();
+        let _ = write!(
+            w,
+            ",\"tcp_pool_cap\":{},\"tcp_conn_states\":[{},{},{},{},{},{},{},{},{}]",
+            uni::net::tcp::pool_capacity_total(),
+            census[0], census[1], census[2], census[3], census[4],
+            census[5], census[6], census[7], census[8],
+        );
+
         // ---- AEAD throughput (TLS + QUIC) ----
         //
         // TLS counters cover the record layer (every full-record
