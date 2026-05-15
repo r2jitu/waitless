@@ -407,11 +407,19 @@ def main():
     else:
         env_names = [e.strip() for e in args.env.split(",")]
 
-    workloads = WORKLOADS
+    # Workload tiers (`tier` field per entry, default = "default"):
+    #   "default"   — run on every bench (no --workload override)
+    #   "available" — implemented but off the default set; runs only
+    #                 when the user explicitly names it
+    #   "todo"      — registered placeholder for a concern we don't
+    #                 yet have a workload for; never runs, prints
+    #                 TODO row so the gap stays visible
+    # `--workload <name>` overrides tier filtering: any named
+    # workload runs (or, for `todo`, prints its SKIP row) regardless.
     if args.workload:
         # Comma-separated list; preserve the order the user supplied
         # rather than the WORKLOADS declaration order (useful for
-        # running a specific sequence like "health_c1,health_tls_c1").
+        # running a specific sequence like "get_tcp_single,get_tls").
         requested = [w.strip() for w in args.workload.split(",") if w.strip()]
         by_name = {w["name"]: w for w in WORKLOADS}
         unknown = [name for name in requested if name not in by_name]
@@ -420,6 +428,8 @@ def main():
             print(f"Available: {', '.join(w['name'] for w in WORKLOADS)}")
             sys.exit(1)
         workloads = [by_name[name] for name in requested]
+    else:
+        workloads = [w for w in WORKLOADS if w.get("tier", "default") == "default"]
 
     # These environments only run single-core benchmarks.
     # ARM TCG: no MTTCG support.
@@ -599,6 +609,14 @@ def main():
                 # impossible to read. udp_bench caps senders at [1, 64].
                 senders = max(1, min(64, w.get("senders", 0)))
 
+                if w["type"] == "todo":
+                    # Stub workload — concern is named in the
+                    # registry but no implementation exists yet.
+                    # Print a TODO row so the bench output makes
+                    # the gap visible every run, and skip to next.
+                    reason = w.get("reason", "not implemented")
+                    print(f"    {wname:<22s} TODO ({reason})")
+                    continue
                 if w["type"] == "tcp":
                     with measure_client_cpu() as m:
                         rps, p50, p99 = run_wrk(
@@ -902,3 +920,23 @@ def main():
     if any(c > 1 for c in core_counts):
         print(f"  Multi-core: MTTCG (x86_64) or hardware (HVF/KVM)")
     print("=" * (24 + (CELL + 2) * len(columns) + 10))
+
+    # List workloads not in the default set so the gap inventory
+    # stays visible every run. Available = implemented, off by
+    # default; todo = stub for a concern we don't have a workload
+    # for yet (intentional placeholder, never runs).
+    if not args.workload:
+        skipped = [w for w in WORKLOADS
+                   if w.get("tier", "default") != "default"]
+        if skipped:
+            available = [w for w in skipped if w.get("tier") == "available"]
+            todos = [w for w in skipped if w.get("tier") == "todo"]
+            print()
+            if available:
+                print(f"  Off by default ({len(available)} — run with --workload <name>):")
+                for w in available:
+                    print(f"    {w['name']:<22s} {w.get('desc', '')}")
+            if todos:
+                print(f"  TODO stubs ({len(todos)} — concerns without an impl):")
+                for w in todos:
+                    print(f"    {w['name']:<22s} TODO ({w.get('reason', '')})")
