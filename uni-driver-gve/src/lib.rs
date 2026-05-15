@@ -139,6 +139,11 @@ const DEVICE_DESCRIPTOR_VERSION: u32 = 1;
 // the device descriptor are skipped silently.
 const OPT_ID_GQI_QPL: u16 = 0x3;
 const OPT_ID_DQO_RDA: u16 = 0x4;
+// MODIFY_RING (advertised by every GCE generation we test) tells
+// the driver the [min, max] envelope for TX/RX ring sizes. The
+// option payload is a u32 supported_features_mask followed by
+// four big-endian u16s: max_rx, max_tx, min_rx, min_tx.
+const OPT_ID_MODIFY_RING: u16 = 0x6;
 
 // ---- Driver state ----------------------------------------------------------
 
@@ -164,6 +169,16 @@ struct State {
     /// allocates a DMA array of this size that the device writes
     /// TX-completion counters into.
     num_event_counters: u16,
+    /// Ring-size bounds advertised via the MODIFY_RING device option
+    /// (id=6). All zero if the option wasn't present in DESCRIBE_DEVICE
+    /// (no known GCE SKU omits it, but the field defaults are inert).
+    /// Our compile-time `TX_RING_ENTRIES` / `RX_RING_ENTRIES` are
+    /// asserted to fall within these bounds in `build_create_*_queue_cmd`
+    /// before the admin command goes out.
+    max_tx_ring: u16,
+    min_tx_ring: u16,
+    max_rx_ring: u16,
+    min_rx_ring: u16,
     /// Device-wide resources — filled once CONFIGURE_DEVICE_RESOURCES
     /// succeeds. `None` between DESCRIBE_DEVICE and that point.
     resources: Option<DeviceResources>,
@@ -538,6 +553,10 @@ fn init() -> bool {
             default_num_queues: 0,
             mtu: 0,
             num_event_counters: 0,
+            max_tx_ring: 0,
+            min_tx_ring: 0,
+            max_rx_ring: 0,
+            min_rx_ring: 0,
             resources: None,
             num_qp: 0,
             tx: [const { None }; MAX_QUEUE_PAIRS],
@@ -692,6 +711,12 @@ fn parse_device_descriptor(desc_virt: *mut u8) -> bool {
     // future SKUs may add more. Visibility makes negotiation
     // mismatches diagnosable from serial alone.
     let mut best: Option<QueueFormat> = None;
+    // MODIFY_RING bounds — left at 0 if the option isn't advertised
+    // (no known GCE SKU omits it, but we don't want to assume).
+    let mut max_tx_ring: u16 = 0;
+    let mut min_tx_ring: u16 = 0;
+    let mut max_rx_ring: u16 = 0;
+    let mut min_rx_ring: u16 = 0;
     let mut offset = header_len;
     let end = if total_len > 0 && total_len <= adminq::ADMINQ_SIZE {
         total_len
@@ -721,6 +746,26 @@ fn parse_device_descriptor(desc_virt: *mut u8) -> bool {
                 None => new,
                 Some(cur) => higher_priority(cur, new),
             });
+        }
+
+        // MODIFY_RING payload (per `gve_device_option_modify_ring`):
+        //   u32 supported_features_mask  // currently unused
+        //   u16 max_rx_ring_size         // offset 4 of payload
+        //   u16 max_tx_ring_size         // offset 6
+        //   u16 min_rx_ring_size         // offset 8
+        //   u16 min_tx_ring_size         // offset 10
+        // All big-endian. Total 12 bytes — older firmware may
+        // advertise only the first 8 (just the maxes), so we guard
+        // on `len >= 12` before reading mins.
+        if id == OPT_ID_MODIFY_RING && offset + 8 + len <= end && len >= 8 {
+            let payload: &[u8] =
+                unsafe { core::slice::from_raw_parts(desc_virt.add(offset + 8), len) };
+            max_rx_ring = read_be16(payload, 4);
+            max_tx_ring = read_be16(payload, 6);
+            if len >= 12 {
+                min_rx_ring = read_be16(payload, 8);
+                min_tx_ring = read_be16(payload, 10);
+            }
         }
 
         offset += 8 + len;
@@ -755,7 +800,18 @@ fn parse_device_descriptor(desc_virt: *mut u8) -> bool {
     log_u32(rx_entries as u32);
     log(b" tx_pages_per_qpl=");
     log_u32(tx_pages_per_qpl as u32);
-    log(b" mac=");
+    // MODIFY_RING bounds. Logged so a future ring-size experiment
+    // can pick a runtime-valid value from this line alone. Zeros
+    // mean the device didn't advertise the option.
+    log(b" rx_ring=[");
+    log_u32(min_rx_ring as u32);
+    log(b"..");
+    log_u32(max_rx_ring as u32);
+    log(b"] tx_ring=[");
+    log_u32(min_tx_ring as u32);
+    log(b"..");
+    log_u32(max_tx_ring as u32);
+    log(b"] mac=");
     log_mac(&mac);
     log(b"\n");
 
@@ -775,6 +831,10 @@ fn parse_device_descriptor(desc_virt: *mut u8) -> bool {
         s.mtu = mtu;
         s.num_event_counters = counters;
         s.queue_format = best;
+        s.max_tx_ring = max_tx_ring;
+        s.min_tx_ring = min_tx_ring;
+        s.max_rx_ring = max_rx_ring;
+        s.min_rx_ring = min_rx_ring;
     }
     true
 }
@@ -1291,6 +1351,20 @@ fn alloc_rx_resources(fmt: QueueFormat) -> Option<RxAlloc> {
 ///   u16  tx_comp_ring_size (be)          — DQO only; 0 in GQI
 ///   u8[4] padding
 fn build_create_tx_queue_cmd(qp: u32, alloc: &TxAlloc, fmt: QueueFormat) -> AdminqCommand {
+    // Honor the device-advertised MODIFY_RING bounds. If the option
+    // wasn't seen (`max_tx_ring == 0`) we skip the check rather than
+    // refusing to bring up older devices that didn't advertise it.
+    {
+        let st = STATE.lock();
+        if let Some(s) = st.as_ref() {
+            if s.max_tx_ring != 0 {
+                assert!(
+                    TX_RING_ENTRIES >= s.min_tx_ring && TX_RING_ENTRIES <= s.max_tx_ring,
+                    "TX_RING_ENTRIES out of MODIFY_RING bounds"
+                );
+            }
+        }
+    }
     let mut cmd = AdminqCommand::new(OP_CREATE_TX_QUEUE);
     cmd.put_be32(8, qp);
     cmd.put_be64(16, alloc.qres_phys);
@@ -1325,6 +1399,17 @@ fn build_create_tx_queue_cmd(qp: u32, alloc: &TxAlloc, fmt: QueueFormat) -> Admi
 ///   u8   enable_rsc
 ///   u8[5] padding
 fn build_create_rx_queue_cmd(qp: u32, alloc: &RxAlloc, num_qp: u32, fmt: QueueFormat) -> AdminqCommand {
+    {
+        let st = STATE.lock();
+        if let Some(s) = st.as_ref() {
+            if s.max_rx_ring != 0 {
+                assert!(
+                    RX_RING_ENTRIES >= s.min_rx_ring && RX_RING_ENTRIES <= s.max_rx_ring,
+                    "RX_RING_ENTRIES out of MODIFY_RING bounds"
+                );
+            }
+        }
+    }
     let mut cmd = AdminqCommand::new(OP_CREATE_RX_QUEUE);
     cmd.put_be32(8, qp);
     // `index` field. Linux + FreeBSD set this only for GQI; for
