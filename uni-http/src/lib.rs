@@ -106,13 +106,21 @@ impl Header {
     }
 }
 
+/// Maximum request body the parser will retain. Sized to accommodate
+/// the bulk-upload bench workloads (`upload_32k_*`) with headroom for
+/// future growth. Each accepted connection holds a Request inline in
+/// its future state, so this contributes BODY_CAP bytes per in-flight
+/// conn; budgeted against fanout_tcp's 1500 conn/core × 8 cores ≈
+/// 768 MB on the 16 GiB c3-highcpu-8 bench VM.
+pub const BODY_CAP: usize = 65536;
+
 pub struct Request {
     pub method: Method,
     path: [u8; 256],
     path_len: usize,
     headers: [Header; 16],
     header_count: usize,
-    body: [u8; 8192],
+    body: [u8; BODY_CAP],
     body_len: usize,
 }
 
@@ -124,7 +132,7 @@ impl Request {
             path_len: 0,
             headers: [const { Header::new() }; 16],
             header_count: 0,
-            body: [0; 8192],
+            body: [0; BODY_CAP],
             body_len: 0,
         }
     }
@@ -343,7 +351,12 @@ pub fn bytes_owned(v: alloc::vec::Vec<u8>) -> IOBuf {
 
 // ---- Server -----------------------------------------------------------------
 
-const BUF_SIZE: usize = 8192;
+/// Per-connection parse buffer. Must be ≥ BODY_CAP plus header
+/// headroom so a full Content-Length-sized POST fits in one
+/// parse pass. 1 KiB of header room covers the worst-case
+/// `Host` + auth + cookies set we expect from bench / browser
+/// clients.
+const BUF_SIZE: usize = BODY_CAP + 1024;
 
 /// Idle-connection timeout. After this long without inbound data,
 /// the per-conn task tears down the connection and releases its
@@ -481,19 +494,18 @@ pub async fn serve_conn<S, H>(
     S: HttpStream,
     H: AsyncFn(&Request) -> Response,
 {
-    // Inline 8 KiB request-parse buffer in the future state. The
+    // Inline request-parse buffer in the future state. The
     // async runtime allocates the future once (as a
     // `Pin<Box<dyn Future>>` per accepted conn); folding `buf` in
     // turns the previous "future alloc + Box<[u8]> alloc" pair
-    // into a single alloc per conn-accept. The future struct
-    // already carries an inline `Request` (8 KiB body + 256 B
-    // path) and the per-conn header storage + outbound chain;
-    // the extra 8 KiB here stays proportional.
+    // into a single alloc per conn-accept. Sized to BODY_CAP +
+    // header headroom so a full bulk-upload request fits in one
+    // parse pass.
     let mut buf = [0u8; BUF_SIZE];
     let mut buf_len = 0usize;
     // Per-connection scratch reused across every request on this
-    // conn — `Request` carries 8 KiB of body buffer and 256 B of
-    // path. Allocating + zero-initing it per request was costing
+    // conn — `Request` carries BODY_CAP of body buffer and 256 B
+    // of path. Allocating + zero-initing it per request was costing
     // ~1 GB/s of memory bandwidth per core at peak request rate.
     // `parse_request` resets length fields up front, so a stale
     // tail is invisible to the read path; only the
@@ -766,7 +778,7 @@ fn parse_request_with_state(data: &[u8], req: &mut Request, state: &mut ParserSt
         if avail < body_len {
             return 0; // incomplete body
         }
-        let copy_len = body_len.min(8191);
+        let copy_len = body_len.min(BODY_CAP);
         req.body[..copy_len].copy_from_slice(&data[body_start..body_start + copy_len]);
         req.body_len = copy_len;
         consumed += body_len;

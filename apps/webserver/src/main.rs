@@ -320,6 +320,15 @@ async fn handle_request(req: &Request) -> Response {
             core::hint::black_box(compute_work());
             Response::ok(b"application/json", b"{\"status\":\"computed\"}")
         }
+        // Bulk-RX bench sink. Accepts POST with any Content-Length
+        // up to BODY_CAP (64 KiB), reads the body into the request's
+        // inline buffer (so the wire bytes actually traverse the
+        // RX path), and returns a tiny 200 OK. Paired with the
+        // `upload_*_*` bench workloads — see scripts/bench/cli.py.
+        b"/discard" => {
+            core::hint::black_box(req.body().len());
+            Response::ok(b"application/json", b"{\"status\":\"discarded\"}")
+        }
         b"/tls_profile"       => tls_profile_response(),
         b"/tls_profile_reset" => {
             uni_tls::tls_profile_reset();
