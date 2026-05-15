@@ -217,9 +217,20 @@ WORKLOADS = [
     # recv waker — async + syscall-free datapath compound.
     # `conns_per_core: 1500` exercises deep fan-out scaling on the
     # unikernel side.
+    # fanout_tcp is parked in the `available` tier (off the default
+    # set) because it currently wedges the unikernel regardless of
+    # core count — at 1c the 1500-conn connect storm overruns the
+    # accept backlog; at 4c (6000 conns) it also TIMEOUTs and the
+    # damage *persists across core-count tiers* (8c starts in
+    # SKIP-not-ready and aborts immediately). Until the
+    # gateway-accept path or the loadgen's connect-rate is fixed,
+    # leaving this in the default set foot-guns every full bench.
+    # Invoke explicitly via `--workload fanout_tcp` once a fix
+    # lands. Bench client and unikernel both need to come back from
+    # a stop before it can be tried again.
     {"name": "fanout_tcp", "type": "gateway",
-     "conns_per_core": 1500, "min_cpus": 2,
-     "desc": "Gateway fan-out (TCP→UDP backend→TCP, 1500 conn × cpus; needs ≥2 cores)"},
+     "conns_per_core": 1500, "tier": "available",
+     "desc": "Gateway fan-out (TCP→UDP backend→TCP, 1500 conn × cpus; CURRENTLY WEDGES — see comment)"},
 
     # ── Bulk RX — POST /discard with sized body ──────────────────────
     #
