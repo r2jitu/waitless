@@ -44,9 +44,14 @@ extern crate drivers_infra;
 extern crate uni_kernel;
 extern crate uni_net_driver;
 
+mod adminq;
 pub mod dqo;
 mod gqi;
 
+use adminq::{
+    AdminqCommand, OP_CONFIGURE_DEVICE_RESOURCES, OP_CONFIGURE_RSS, OP_CREATE_RX_QUEUE,
+    OP_CREATE_TX_QUEUE, OP_DESCRIBE_DEVICE, OP_REGISTER_PAGE_LIST,
+};
 use drivers_infra::{log, mmio_read32, mmio_write32};
 use drivers_infra::pci;
 use core::mem::size_of;
@@ -74,28 +79,14 @@ const REG_DEVICE_STATUS: u64 = 0x00;
 const REG_DRIVER_STATUS: u64 = 0x04;
 const REG_MAX_TX_QUEUES: u64 = 0x08;
 const REG_MAX_RX_QUEUES: u64 = 0x0C;
-const REG_ADMINQ_PFN: u64 = 0x10;
-const REG_ADMINQ_DOORBELL: u64 = 0x14;
-const REG_ADMINQ_EVENT_COUNTER: u64 = 0x18;
+// REG_ADMINQ_* registers are owned by `crate::adminq`.
 // 0x1C..=0x1F: reserved (3) + driver_version (1)
 // 0x20..=0x2B: modern adminq base_address_hi/lo + length (we don't use these)
 
 const DEVICE_STATUS_RESET: u32 = 1 << 1;
 
-// ---- Admin queue constants -------------------------------------------------
-
-const ADMINQ_SIZE: usize = 4096; // single page, required by PFN addressing
-const ADMINQ_SLOTS: usize = 64;  // ADMINQ_SIZE / sizeof(AdminqCommand)
-const CMD_SIZE: usize = 64;
-
-// Admin queue opcodes (names match the enum in the reference
-// driver's `gve_adminq.h`). We only use a subset.
-const OP_DESCRIBE_DEVICE: u32 = 0x1;
-const OP_CONFIGURE_DEVICE_RESOURCES: u32 = 0x2;
-const OP_REGISTER_PAGE_LIST: u32 = 0x3;
-const OP_CREATE_TX_QUEUE: u32 = 0x5;
-const OP_CREATE_RX_QUEUE: u32 = 0x6;
-const OP_CONFIGURE_RSS: u32 = 0xA;
+// Admin queue constants, opcodes, command builder, and submission
+// helpers live in `crate::adminq` (q.v.).
 
 /// RSS hash algorithm value (Toeplitz). Matches Linux's
 /// `ETH_RSS_HASH_TOP = 1`. The device only implements Toeplitz.
@@ -125,17 +116,8 @@ const GVE_RAW_ADDRESSING_QPL_ID: u32 = 0xFFFFFFFF;
 const QF_GQI_QPL: u8 = 0x2;
 const QF_DQO_RDA: u8 = 0x3;
 
-// Adminq completion statuses.
-const STATUS_UNSET: u32 = 0x0;
-const STATUS_PASSED: u32 = 0x1;
-
 // Version field the device expects in DESCRIBE_DEVICE.
 const DEVICE_DESCRIPTOR_VERSION: u32 = 1;
-
-// Maximum time we'll poll the event counter for a single command.
-// Linux allows many seconds here; we need generous room for the
-// device to service DESCRIBE_DEVICE in a freshly-booted VM.
-const ADMINQ_WAIT_SPINS: u32 = 10_000_000;
 
 // Device-option ids — only the queue formats this driver knows
 // how to bring up. `OPT_ID_GQI_RDA` (0x2) and `OPT_ID_DQO_QPL`
@@ -146,24 +128,6 @@ const ADMINQ_WAIT_SPINS: u32 = 10_000_000;
 const OPT_ID_GQI_QPL: u16 = 0x3;
 const OPT_ID_DQO_RDA: u16 = 0x4;
 
-// ---- Wire structures -------------------------------------------------------
-//
-// All numeric fields are big-endian on the wire. We read/write them
-// through explicit byte-swap helpers (`put_be*` / `get_be*`) rather
-// than `#[repr(packed)]` with `to_be()` per field — the helpers are
-// cheaper to eyeball and survive any future alignment change.
-
-/// One slot in the admin queue. 64 bytes, naturally aligned.
-#[repr(C, align(64))]
-#[derive(Clone, Copy)]
-struct AdminqCommand {
-    bytes: [u8; CMD_SIZE],
-}
-
-impl AdminqCommand {
-    const ZERO: Self = AdminqCommand { bytes: [0; CMD_SIZE] };
-}
-
 // ---- Driver state ----------------------------------------------------------
 
 /// Publication guard. Set at the end of a successful `init()`. Lets
@@ -172,17 +136,6 @@ impl AdminqCommand {
 static GVNIC_OK: AtomicBool = AtomicBool::new(false);
 
 struct State {
-    /// Virtual address of the admin queue ring (one page, 64 × 64-byte
-    /// commands). Backing physical page is held implicitly — we
-    /// never free gVNIC allocations. Stored as a `u64` rather than a
-    /// raw pointer so `State` can live behind a `Spinlock` (which
-    /// requires `Send`).
-    adminq_va: u64,
-    /// Monotonically-increasing command counter. Writing this value
-    /// to ADMINQ_DOORBELL tells the device "I've produced this many
-    /// commands total"; waiting for ADMINQ_EVENT_COUNTER to catch up
-    /// is how we wait for completion.
-    prod_cnt: u32,
     /// Negotiated queue format — filled in by DESCRIBE_DEVICE.
     /// `None` until init runs. Read by queue bring-up to pick a datapath.
     queue_format: Option<QueueFormat>,
@@ -453,7 +406,7 @@ pub(crate) fn put_be16(dst: &mut [u8], offset: usize, v: u16) {
 }
 
 #[inline]
-fn put_be32(dst: &mut [u8], offset: usize, v: u32) {
+pub(crate) fn put_be32(dst: &mut [u8], offset: usize, v: u32) {
     dst[offset..offset + 4].copy_from_slice(&v.to_be_bytes());
 }
 
@@ -468,7 +421,7 @@ pub(crate) fn read_be16(src: &[u8], offset: usize) -> u16 {
 }
 
 #[inline]
-fn read_be32(src: &[u8], offset: usize) -> u32 {
+pub(crate) fn read_be32(src: &[u8], offset: usize) -> u32 {
     u32::from_be_bytes([
         src[offset], src[offset + 1], src[offset + 2], src[offset + 3],
     ])
@@ -482,13 +435,13 @@ fn read_be32(src: &[u8], offset: usize) -> u32 {
 // the helpers compile regardless.
 
 #[inline]
-unsafe fn reg_read32(offset: u64) -> u32 {
+pub(crate) unsafe fn reg_read32(offset: u64) -> u32 {
     let base = BAR0.load(Ordering::Acquire);
     u32::from_be(unsafe { mmio_read32(base + offset) })
 }
 
 #[inline]
-unsafe fn reg_write32(offset: u64, val: u32) {
+pub(crate) unsafe fn reg_write32(offset: u64, val: u32) {
     let base = BAR0.load(Ordering::Acquire);
     unsafe { mmio_write32(base + offset, val.to_be()) }
 }
@@ -554,20 +507,18 @@ fn init() -> bool {
         return false;
     }
     let adminq_va = phys_to_virt(adminq_phys) as u64;
-    unsafe { ptr::write_bytes(adminq_va as *mut u8, 0, ADMINQ_SIZE); }
+    unsafe { ptr::write_bytes(adminq_va as *mut u8, 0, adminq::ADMINQ_SIZE); }
 
     // Publish the ring PFN. `adminq_phys >> 12` is what the device
     // expects. Reading it back is how Linux / FreeBSD check the
     // device accepted it.
-    unsafe {
-        reg_write32(REG_ADMINQ_PFN, (adminq_phys >> 12) as u32);
+    if !adminq::init(adminq_va, adminq_phys) {
+        return false;
     }
 
     {
         let mut st = STATE.lock();
         *st = Some(State {
-            adminq_va,
-            prod_cnt: 0,
             queue_format: None,
             mac: [0; 6],
             max_tx_queues: max_tx,
@@ -671,33 +622,16 @@ fn describe_device() -> bool {
     let desc_virt = phys_to_virt(desc_phys);
     unsafe { ptr::write_bytes(desc_virt, 0, 4096); }
 
-    // Build the command. AdminqCommand is laid out as:
-    //   u8[0..4]   opcode  (be32)
-    //   u8[4..8]   status  (be32, written by device)
-    //   u8[8..]    per-opcode payload
-    //
-    // For DESCRIBE_DEVICE the payload is:
+    // Build the command. DESCRIBE_DEVICE payload (per `gve_adminq.h`):
     //   u8[8..16]  device_descriptor_addr (be64, physical)
     //   u8[16..20] device_descriptor_version (be32, = 1)
     //   u8[20..24] available_length (be32, = page size)
-    let mut cmd = AdminqCommand::ZERO;
-    put_be32(&mut cmd.bytes, 0, OP_DESCRIBE_DEVICE);
-    put_be64(&mut cmd.bytes, 8, desc_phys);
-    put_be32(&mut cmd.bytes, 16, DEVICE_DESCRIPTOR_VERSION);
-    put_be32(&mut cmd.bytes, 20, ADMINQ_SIZE as u32);
+    let mut cmd = AdminqCommand::new(OP_DESCRIBE_DEVICE);
+    cmd.put_be64(8, desc_phys);
+    cmd.put_be32(16, DEVICE_DESCRIPTOR_VERSION);
+    cmd.put_be32(20, adminq::ADMINQ_SIZE as u32);
 
-    if !submit_and_wait(&cmd) {
-        return false;
-    }
-
-    // Re-read the slot — the device writes `status` back in-place.
-    // Any slot in the ring would do; we submitted into slot
-    // (prod_cnt-1) & mask.
-    let status = unsafe { read_slot_status(current_slot_before_kick()) };
-    if status != STATUS_PASSED {
-        log(b"[gvnic] DESCRIBE_DEVICE status=");
-        log_hex32(status);
-        log(b"\n");
+    if !adminq::execute_cmd(b"DESCRIBE_DEVICE", &cmd) {
         return false;
     }
 
@@ -747,10 +681,10 @@ fn parse_device_descriptor(desc_virt: *mut u8) -> bool {
     // mismatches diagnosable from serial alone.
     let mut best: Option<QueueFormat> = None;
     let mut offset = header_len;
-    let end = if total_len > 0 && total_len <= ADMINQ_SIZE {
+    let end = if total_len > 0 && total_len <= adminq::ADMINQ_SIZE {
         total_len
     } else {
-        ADMINQ_SIZE
+        adminq::ADMINQ_SIZE
     };
     for _ in 0..num_options {
         if offset + 8 > end { break; }
@@ -842,120 +776,6 @@ fn higher_priority(a: QueueFormat, b: QueueFormat) -> QueueFormat {
         (DqoRda, _) | (_, DqoRda) => DqoRda,
         (GqiQpl, GqiQpl) => GqiQpl,
     }
-}
-
-// ---- Admin-queue plumbing -------------------------------------------------
-
-/// Enqueue `cmd` into the next admin-queue slot without ringing
-/// the doorbell. Returns `(slot_idx, new_prod_cnt)`. Caller is
-/// expected to either:
-///   - submit additional commands and then call
-///     `kick_and_wait_to(prod_cnt)` once to flush the whole batch,
-///     followed by `check_slot_status` per command, or
-///   - call `kick_and_wait_to` immediately for a one-off (the
-///     `submit_and_wait` / `execute_cmd` wrappers do this).
-///
-/// Batching matches the upstream Linux gve driver's
-/// `gve_adminq_issue_cmd` + `gve_adminq_kick_and_wait` pattern —
-/// instead of paying per-command device-side processing latency
-/// (~3 ms each on GCE) sequentially, we let the device pipeline a
-/// run of queued commands and wait for the final completion only.
-fn submit_no_wait(cmd: &AdminqCommand) -> Option<(usize, u32)> {
-    let mut st = STATE.lock();
-    let s = st.as_mut()?;
-    let slot_idx = (s.prod_cnt as usize) & (ADMINQ_SLOTS - 1);
-    let slot_ptr = (s.adminq_va as *mut AdminqCommand).wrapping_add(slot_idx);
-    unsafe { ptr::write_volatile(slot_ptr, *cmd); }
-    let new_prod = s.prod_cnt.wrapping_add(1);
-    s.prod_cnt = new_prod;
-    Some((slot_idx, new_prod))
-}
-
-/// Doorbell with the producer count and spin until the device's
-/// event counter catches up. Returns false on timeout. Status of
-/// each individual command must be checked separately via
-/// `read_slot_status` / `check_slot_status`.
-fn kick_and_wait_to(expected_event_count: u32) -> bool {
-    // Drain the store buffer so the just-written admin command(s)
-    // are visible to the device's DMA-read before the doorbell TLP
-    // arrives. See `host_dma_fence` for the full mechanism. Without
-    // this the device can read a stale command slot (status=0) and
-    // either reject the command or execute garbage.
-    host_dma_fence();
-    unsafe { reg_write32(REG_ADMINQ_DOORBELL, expected_event_count); }
-    for _ in 0..ADMINQ_WAIT_SPINS {
-        let ev = unsafe { reg_read32(REG_ADMINQ_EVENT_COUNTER) };
-        if ev == expected_event_count {
-            return true;
-        }
-        core::hint::spin_loop();
-    }
-    log(b"[gvnic] admin queue timeout\n");
-    false
-}
-
-/// Verify a previously-submitted slot's status word is `STATUS_PASSED`.
-/// `label` is logged on failure to identify the failing command.
-fn check_slot_status(slot_idx: usize, label: &[u8]) -> bool {
-    let status = unsafe { read_slot_status(slot_idx) };
-    if status != STATUS_PASSED {
-        log(b"[gvnic] ");
-        log(label);
-        log(b": status=");
-        log_hex32(status);
-        log(b"\n");
-        return false;
-    }
-    true
-}
-
-fn submit_and_wait(cmd: &AdminqCommand) -> bool {
-    let (_slot, prod) = match submit_no_wait(cmd) {
-        Some(x) => x,
-        None => return false,
-    };
-    kick_and_wait_to(prod)
-}
-
-/// Submit `cmd`, wait for the device, and check that the
-/// per-command status is PASSED. Logs and returns false on any
-/// failure (timeout or non-zero status). Used by every admin-queue
-/// command after DESCRIBE_DEVICE.
-fn execute_cmd(opcode_label: &[u8], cmd: &AdminqCommand) -> bool {
-    if !submit_and_wait(cmd) {
-        log(b"[gvnic] ");
-        log(opcode_label);
-        log(b": timeout\n");
-        return false;
-    }
-    let slot = current_slot_before_kick();
-    let status = unsafe { read_slot_status(slot) };
-    if status != STATUS_PASSED {
-        log(b"[gvnic] ");
-        log(opcode_label);
-        log(b": status=");
-        log_hex32(status);
-        log(b"\n");
-        return false;
-    }
-    true
-}
-
-fn current_slot_before_kick() -> usize {
-    // After submit_and_wait returns, the slot we just used is
-    // (prod_cnt - 1) & mask. Read it back to pick up the device's
-    // status write.
-    let st = STATE.lock();
-    let s = st.as_ref().expect("state");
-    ((s.prod_cnt - 1) as usize) & (ADMINQ_SLOTS - 1)
-}
-
-unsafe fn read_slot_status(slot_idx: usize) -> u32 {
-    let st = STATE.lock();
-    let s = st.as_ref().expect("state");
-    let slot_ptr = (s.adminq_va as *const AdminqCommand).wrapping_add(slot_idx);
-    let slot = unsafe { &*slot_ptr };
-    read_be32(&slot.bytes, 4)
 }
 
 /// Read a field the device wrote into a DMA-coherent buffer the
@@ -1100,25 +920,24 @@ fn configure_device_resources(bar2_va: u64, num_qp: u32, fmt: QueueFormat) -> bo
     //   u32  ntfy_blk_msix_base_idx (be, = 0 when we don't use MSI-X)
     //   u8   queue_format
     //   u8[7] padding
-    let mut cmd = AdminqCommand::ZERO;
-    put_be32(&mut cmd.bytes, 0, OP_CONFIGURE_DEVICE_RESOURCES);
-    put_be64(&mut cmd.bytes, 8, counter_phys);
-    put_be64(&mut cmd.bytes, 16, irq_db_phys);
-    put_be32(&mut cmd.bytes, 24, num_event_counters);
+    let mut cmd = AdminqCommand::new(OP_CONFIGURE_DEVICE_RESOURCES);
+    cmd.put_be64(8, counter_phys);
+    cmd.put_be64(16, irq_db_phys);
+    cmd.put_be32(24, num_event_counters);
     // num_irq_dbs = one notification block per active queue.
     // `num_qp * 2` covers both TX and RX queue pairs. Linux derives
     // this from the MSI-X count; we poll-only but the device still
     // wants a valid count here matching what the CREATE_*_QUEUE
     // ntfy_ids will reference.
-    put_be32(&mut cmd.bytes, 28, num_qp * 2);
-    put_be32(&mut cmd.bytes, 32, IRQ_DB_STRIDE);
-    put_be32(&mut cmd.bytes, 36, 0);
-    cmd.bytes[40] = match fmt {
+    cmd.put_be32(28, num_qp * 2);
+    cmd.put_be32(32, IRQ_DB_STRIDE);
+    cmd.put_be32(36, 0);
+    cmd.set_byte(40, match fmt {
         QueueFormat::GqiQpl => QF_GQI_QPL,
         QueueFormat::DqoRda => QF_DQO_RDA,
-    };
+    });
 
-    if !execute_cmd(b"CONFIGURE_DEVICE_RESOURCES", &cmd) {
+    if !adminq::execute_cmd(b"CONFIGURE_DEVICE_RESOURCES", &cmd) {
         return false;
     }
 
@@ -1188,12 +1007,11 @@ fn build_register_page_list_cmd(
     //   u32  num_pages    (be)
     //   u64  page_address_list_addr (be, DMA)
     //   u64  page_size    (be, 4096)
-    let mut cmd = AdminqCommand::ZERO;
-    put_be32(&mut cmd.bytes, 0, OP_REGISTER_PAGE_LIST);
-    put_be32(&mut cmd.bytes, 8, page_list_id);
-    put_be32(&mut cmd.bytes, 12, num_pages);
-    put_be64(&mut cmd.bytes, 16, page_addrs_phys);
-    put_be64(&mut cmd.bytes, 24, PAGE_SIZE as u64);
+    let mut cmd = AdminqCommand::new(OP_REGISTER_PAGE_LIST);
+    cmd.put_be32(8, page_list_id);
+    cmd.put_be32(12, num_pages);
+    cmd.put_be64(16, page_addrs_phys);
+    cmd.put_be64(24, PAGE_SIZE as u64);
     Some(cmd)
 }
 
@@ -1284,15 +1102,14 @@ fn build_configure_rss_cmd(num_qp: u32) -> Option<AdminqCommand> {
         ptr::copy_nonoverlapping(lut_bytes.as_ptr(), lut_va, lut_bytes.len());
     }
 
-    let mut cmd = AdminqCommand::ZERO;
-    put_be32(&mut cmd.bytes, 0, OP_CONFIGURE_RSS);
+    let mut cmd = AdminqCommand::new(OP_CONFIGURE_RSS);
     let hash_types = RSS_HASH_TCPV4 | RSS_HASH_TCPV6 | RSS_HASH_UDPV4 | RSS_HASH_UDPV6;
-    put_be16(&mut cmd.bytes, 8, hash_types);
-    cmd.bytes[10] = RSS_HASH_ALG_TOEPLITZ;
-    put_be16(&mut cmd.bytes, 12, RSS_KEY_SIZE as u16);
-    put_be16(&mut cmd.bytes, 14, RSS_LUT_SIZE as u16);
-    put_be64(&mut cmd.bytes, 16, key_phys);
-    put_be64(&mut cmd.bytes, 24, lut_phys);
+    cmd.put_be16(8, hash_types);
+    cmd.set_byte(10, RSS_HASH_ALG_TOEPLITZ);
+    cmd.put_be16(12, RSS_KEY_SIZE as u16);
+    cmd.put_be16(14, RSS_LUT_SIZE as u16);
+    cmd.put_be64(16, key_phys);
+    cmd.put_be64(24, lut_phys);
     Some(cmd)
 }
 
@@ -1462,22 +1279,21 @@ fn alloc_rx_resources(fmt: QueueFormat) -> Option<RxAlloc> {
 ///   u16  tx_comp_ring_size (be)          — DQO only; 0 in GQI
 ///   u8[4] padding
 fn build_create_tx_queue_cmd(qp: u32, alloc: &TxAlloc, fmt: QueueFormat) -> AdminqCommand {
-    let mut cmd = AdminqCommand::ZERO;
-    put_be32(&mut cmd.bytes, 0, OP_CREATE_TX_QUEUE);
-    put_be32(&mut cmd.bytes, 8, qp);
-    put_be64(&mut cmd.bytes, 16, alloc.qres_phys);
-    put_be64(&mut cmd.bytes, 24, alloc.ring_phys);
-    put_be32(&mut cmd.bytes, 32, match fmt {
+    let mut cmd = AdminqCommand::new(OP_CREATE_TX_QUEUE);
+    cmd.put_be32(8, qp);
+    cmd.put_be64(16, alloc.qres_phys);
+    cmd.put_be64(24, alloc.ring_phys);
+    cmd.put_be32(32, match fmt {
         QueueFormat::GqiQpl => tx_qpl_id(qp),
         QueueFormat::DqoRda => GVE_RAW_ADDRESSING_QPL_ID,
     });
-    put_be32(&mut cmd.bytes, 36, tx_ntfy_id(qp));
+    cmd.put_be32(36, tx_ntfy_id(qp));
     if matches!(fmt, QueueFormat::DqoRda) {
-        put_be64(&mut cmd.bytes, 40, alloc.tx_compl_phys);
+        cmd.put_be64(40, alloc.tx_compl_phys);
     }
-    put_be16(&mut cmd.bytes, 48, TX_RING_ENTRIES);
+    cmd.put_be16(48, TX_RING_ENTRIES);
     if matches!(fmt, QueueFormat::DqoRda) {
-        put_be16(&mut cmd.bytes, 50, TX_RING_ENTRIES);
+        cmd.put_be16(50, TX_RING_ENTRIES);
     }
     cmd
 }
@@ -1497,28 +1313,27 @@ fn build_create_tx_queue_cmd(qp: u32, alloc: &TxAlloc, fmt: QueueFormat) -> Admi
 ///   u8   enable_rsc
 ///   u8[5] padding
 fn build_create_rx_queue_cmd(qp: u32, alloc: &RxAlloc, num_qp: u32, fmt: QueueFormat) -> AdminqCommand {
-    let mut cmd = AdminqCommand::ZERO;
-    put_be32(&mut cmd.bytes, 0, OP_CREATE_RX_QUEUE);
-    put_be32(&mut cmd.bytes, 8, qp);
+    let mut cmd = AdminqCommand::new(OP_CREATE_RX_QUEUE);
+    cmd.put_be32(8, qp);
     // `index` field. Linux + FreeBSD set this only for GQI; for
     // DQO they leave it 0. We had it set unconditionally; the DQO
     // device may interpret a non-zero `index` differently from
     // `queue_id` and silently route packets oddly.
     if matches!(fmt, QueueFormat::GqiQpl) {
-        put_be32(&mut cmd.bytes, 12, qp);
+        cmd.put_be32(12, qp);
     }
-    put_be32(&mut cmd.bytes, 20, rx_ntfy_id(num_qp, qp));
-    put_be64(&mut cmd.bytes, 24, alloc.qres_phys);
-    put_be64(&mut cmd.bytes, 32, alloc.compl_phys);
-    put_be64(&mut cmd.bytes, 40, alloc.data_phys);
-    put_be32(&mut cmd.bytes, 48, match fmt {
+    cmd.put_be32(20, rx_ntfy_id(num_qp, qp));
+    cmd.put_be64(24, alloc.qres_phys);
+    cmd.put_be64(32, alloc.compl_phys);
+    cmd.put_be64(40, alloc.data_phys);
+    cmd.put_be32(48, match fmt {
         QueueFormat::GqiQpl => rx_qpl_id(qp),
         QueueFormat::DqoRda => GVE_RAW_ADDRESSING_QPL_ID,
     });
-    put_be16(&mut cmd.bytes, 52, RX_RING_ENTRIES);
-    put_be16(&mut cmd.bytes, 54, RX_BUFFER_SIZE);
+    cmd.put_be16(52, RX_RING_ENTRIES);
+    cmd.put_be16(54, RX_BUFFER_SIZE);
     if matches!(fmt, QueueFormat::DqoRda) {
-        put_be16(&mut cmd.bytes, 56, RX_RING_ENTRIES);
+        cmd.put_be16(56, RX_RING_ENTRIES);
     }
     cmd
 }
@@ -1645,7 +1460,7 @@ fn create_all_queues_batched(num_qp: u32, fmt: QueueFormat) -> bool {
                 Some(c) => c,
                 None => return false,
             };
-            match submit_no_wait(&cmd) {
+            match adminq::submit_no_wait(&cmd) {
                 Some((slot, prod)) => { tx_rpl_slots[qp] = slot; last_prod = prod; }
                 None => return false,
             }
@@ -1656,15 +1471,15 @@ fn create_all_queues_batched(num_qp: u32, fmt: QueueFormat) -> bool {
                 Some(c) => c,
                 None => return false,
             };
-            match submit_no_wait(&cmd) {
+            match adminq::submit_no_wait(&cmd) {
                 Some((slot, prod)) => { rx_rpl_slots[qp] = slot; last_prod = prod; }
                 None => return false,
             }
         }
-        if !kick_and_wait_to(last_prod) { return false; }
+        if !adminq::kick_and_wait_to(last_prod) { return false; }
         for qp in 0..n {
-            if !check_slot_status(tx_rpl_slots[qp], b"REGISTER_PAGE_LIST tx") { return false; }
-            if !check_slot_status(rx_rpl_slots[qp], b"REGISTER_PAGE_LIST rx") { return false; }
+            if !adminq::check_slot_status(tx_rpl_slots[qp], b"REGISTER_PAGE_LIST tx") { return false; }
+            if !adminq::check_slot_status(rx_rpl_slots[qp], b"REGISTER_PAGE_LIST rx") { return false; }
         }
     }
 
@@ -1677,14 +1492,14 @@ fn create_all_queues_batched(num_qp: u32, fmt: QueueFormat) -> bool {
     let mut rx_create_slots = [0usize; MAX_QUEUE_PAIRS];
     for qp in 0..n {
         let cmd = build_create_tx_queue_cmd(qp as u32, tx_allocs[qp].as_ref().unwrap(), fmt);
-        match submit_no_wait(&cmd) {
+        match adminq::submit_no_wait(&cmd) {
             Some((slot, prod)) => { tx_create_slots[qp] = slot; last_prod = prod; }
             None => return false,
         }
     }
     for qp in 0..n {
         let cmd = build_create_rx_queue_cmd(qp as u32, rx_allocs[qp].as_ref().unwrap(), num_qp, fmt);
-        match submit_no_wait(&cmd) {
+        match adminq::submit_no_wait(&cmd) {
             Some((slot, prod)) => { rx_create_slots[qp] = slot; last_prod = prod; }
             None => return false,
         }
@@ -1694,26 +1509,26 @@ fn create_all_queues_batched(num_qp: u32, fmt: QueueFormat) -> bool {
             Some(c) => c,
             None => return false,
         };
-        match submit_no_wait(&cmd) {
+        match adminq::submit_no_wait(&cmd) {
             Some((slot, prod)) => { last_prod = prod; Some(slot) }
             None => return false,
         }
     } else {
         None
     };
-    if !kick_and_wait_to(last_prod) { return false; }
+    if !adminq::kick_and_wait_to(last_prod) { return false; }
     for qp in 0..n {
-        if !check_slot_status(tx_create_slots[qp], b"CREATE_TX_QUEUE") { return false; }
+        if !adminq::check_slot_status(tx_create_slots[qp], b"CREATE_TX_QUEUE") { return false; }
         finalize_tx_queue(qp as u32, tx_allocs[qp].as_ref().unwrap(), fmt);
     }
     for qp in 0..n {
-        if !check_slot_status(rx_create_slots[qp], b"CREATE_RX_QUEUE") { return false; }
+        if !adminq::check_slot_status(rx_create_slots[qp], b"CREATE_RX_QUEUE") { return false; }
         finalize_rx_queue(qp as u32, rx_allocs[qp].as_ref().unwrap(), fmt);
     }
     if let Some(slot) = rss_slot {
         // RSS failure is non-fatal — log and fall through to qp 0
         // single-queue delivery, matching the previous behaviour.
-        if !check_slot_status(slot, b"CONFIGURE_RSS") {
+        if !adminq::check_slot_status(slot, b"CONFIGURE_RSS") {
             log(b"[gvnic] RSS not configured (falling back to single-queue delivery)\n");
         }
     }
@@ -2234,7 +2049,7 @@ fn log_u32(mut v: u32) {
     log(&out[..len]);
 }
 
-fn log_hex32(v: u32) {
+pub(crate) fn log_hex32(v: u32) {
     let mut buf = [0u8; 10];
     buf[0] = b'0';
     buf[1] = b'x';
@@ -2266,18 +2081,11 @@ fn log_mac(mac: &[u8; 6]) {
     log(&buf);
 }
 
-// ---- Keep the compiler honest about unused bits ----------------------------
-//
-// `DEVICE_STATUS_RESET`, `STATUS_UNSET`, and `size_of::<AdminqCommand>`
-// are only touched by diagnostics; reference them once here so the
-// crate still compiles with `-D unused`.
-const _: () = {
-    let _ = DEVICE_STATUS_RESET;
-    let _ = STATUS_UNSET;
-    let _ = OP_DESCRIBE_DEVICE; // already used but keep it explicit
-    assert!(size_of::<AdminqCommand>() == CMD_SIZE);
-    assert!(ADMINQ_SIZE / CMD_SIZE == ADMINQ_SLOTS);
-};
+// `DEVICE_STATUS_RESET` is defined for completeness vs the BAR0
+// register spec but the driver doesn't issue a reset path. Reference
+// it here so `#[deny(dead_code)]` builds don't trip.
+#[allow(dead_code)]
+const _: u32 = DEVICE_STATUS_RESET;
 
 // ============================================================================
 // NicOps registration

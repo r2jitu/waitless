@@ -8,6 +8,7 @@ rust_library(
     name = "uni-driver-gve",
     srcs = [
         "src/lib.rs",
+        "src/adminq.rs",
         "src/dqo.rs",
         "src/gqi.rs",
     ],
