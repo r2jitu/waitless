@@ -218,8 +218,8 @@ WORKLOADS = [
     # `conns_per_core: 1500` exercises deep fan-out scaling on the
     # unikernel side.
     {"name": "fanout_tcp", "type": "gateway",
-     "conns_per_core": 1500,
-     "desc": "Gateway fan-out (TCP→UDP backend→TCP, 1500 conn × cpus)"},
+     "conns_per_core": 1500, "min_cpus": 2,
+     "desc": "Gateway fan-out (TCP→UDP backend→TCP, 1500 conn × cpus; needs ≥2 cores)"},
 
     # ── Bulk RX — POST /discard with sized body ──────────────────────
     #
@@ -514,6 +514,20 @@ def main():
                 port = next_port()
 
                 bench_port = port
+
+                # Some workloads have a floor on the target core count
+                # they make sense at. `fanout_tcp` opens 1500 conn ×
+                # cpus to the gateway — at cpus=1 that's 1500 connect()
+                # handshakes against a single-core unikernel scheduler,
+                # which overruns the accept backlog and wedges every
+                # subsequent workload at that core count (the readiness
+                # probe never recovers). Mark such workloads with
+                # `min_cpus` and skip cleanly at lower counts — no
+                # SKIP-cascade, no consecutive-skip abort.
+                if cpus < w.get("min_cpus", 0):
+                    print(f"    {wname:<20s} SKIP (needs ≥{w['min_cpus']} cores)")
+                    results[(env_name, cpus, wname)] = (0, "", "")
+                    continue
 
                 proc = start_env_verified(env, cpus, port)
                 _current["proc"] = proc
