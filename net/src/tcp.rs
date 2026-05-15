@@ -1510,23 +1510,61 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, segment: &[u8]) {
     // SYN — new connection from client
     if flags & TCP_SYN != 0 && flags & TCP_ACK == 0 {
         TCP_SYN_RX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        // Find listener on this core
-        let listener_idx = {
-            let mut found = None;
+        // Single pool walk: find the `Listen` slot for `dst_port`,
+        // and also spot any existing connection already on this
+        // exact 4-tuple. A SYN landing on a live 4-tuple is the
+        // peer (re)starting — a retransmitted SYN whose SYN-ACK we
+        // lost, or a fresh connection on a reused ephemeral port.
+        // The stale twin is freed before we allocate, enforcing
+        // "at most one connection per 4-tuple".
+        //
+        // Without this, every retransmitted SYN `alloc_connection`s
+        // a fresh slot, orphaning the previous `SynReceived`
+        // connection — and nothing reclaims it (the scavenger skips
+        // `SynReceived`; the stack has no RTO timer). Orphans pile
+        // up, overflow the 256-entry 4-tuple hash, and then lookups
+        // for the real connection mis-resolve to a stale twin —
+        // stranding fresh handshakes (observed: 849 stuck
+        // `SynReceived` slots collapsing fresh-conn throughput).
+        //
+        // An `Established` match is left intact — that's a live
+        // connection, not a stale duplicate.
+        let mut listener_idx = None;
+        let mut stale_idx = None;
+        {
             let cap = pool_capacity(core);
             for i in 0..cap {
                 let c = unsafe { &*conn_ptr(core, i) };
-                if c.state == TcpState::Listen && c.local_port == dst_port {
-                    found = Some(i);
+                if listener_idx.is_none()
+                    && c.state == TcpState::Listen
+                    && c.local_port == dst_port
+                {
+                    listener_idx = Some(i);
+                } else if stale_idx.is_none()
+                    && c.state != TcpState::Closed
+                    && c.state != TcpState::Listen
+                    && c.state != TcpState::Established
+                    && c.remote_ip == src_ip
+                    && c.local_port == dst_port
+                    && c.remote_port == src_port
+                {
+                    stale_idx = Some(i);
+                }
+                if listener_idx.is_some() && stale_idx.is_some() {
                     break;
                 }
             }
-            found
-        };
+        }
 
         if listener_idx.is_none() {
             send_rst(dst_ip, src_ip, dst_port, src_port, 0, seq + 1);
             return;
+        }
+
+        // Drop the stale 4-tuple twin (if any) before allocating, so
+        // the pool never holds two connections for one 4-tuple.
+        if let Some(s) = stale_idx {
+            free_connection(core, s);
         }
 
         // Allocate new connection on this core
