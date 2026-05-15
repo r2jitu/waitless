@@ -69,8 +69,13 @@ pub const RX_BUF_LEN: usize = 17 * 1024;
 /// not to MAX_INNER_PLAINTEXT.
 pub const TX_BUF_LEN: usize = 4 * 1024;
 
-/// Max decrypted plaintext we buffer for the app (one HTTP request).
-pub const PT_BUF_LEN: usize = 4 * 1024;
+/// Max decrypted plaintext we buffer for the app between
+/// `pop_plaintext` calls. Must fit one full TLS 1.3 record's
+/// worth of plaintext (16 KiB max) — `do_app_data` refuses to
+/// consume a record whose plaintext exceeds remaining space,
+/// so a smaller cap stalls bulk uploads (curl test:
+/// >4 KiB POST hung at "0 bytes received" before this bump).
+pub const PT_BUF_LEN: usize = 17 * 1024;
 
 // ============================================================================
 // Configuration
