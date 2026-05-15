@@ -1772,6 +1772,17 @@ fn poll_qp_inner<F: FnMut(&[u8])>(qp: usize, callback: F) -> u32 {
     }
 }
 
+/// Queue-pair index for the current core, or `None` if the driver
+/// isn't ready (`num_qp == 0`). Tier 1 mode pins core N to qp N when
+/// `N < num_qp`; cores beyond fall back to qp 0 (no NIC TX from them
+/// in practice — they handle handlers, not the polling path).
+#[inline]
+fn current_qp() -> Option<usize> {
+    let num_qp = NUM_QP.load(Ordering::Acquire) as u32;
+    if num_qp == 0 { return None; }
+    let core = uni_kernel::cpu_id();
+    Some(if core < num_qp { core as usize } else { 0 })
+}
 
 fn acquire_tx_udp_gso_buf() -> Option<uni_net_driver::TxUdpGsoBufHandle> {
     // Share the big pool with TSO — same slot shape (16 KiB), same
@@ -1808,11 +1819,7 @@ fn acquire_tx_buf() -> Option<uni_net_driver::TxBufHandle> {
     if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
         return None;
     }
-    let num_qp = NUM_QP.load(Ordering::Acquire) as u32;
-    if num_qp == 0 { return None; }
-    let core = uni_kernel::cpu_id();
-    let qp = if core < num_qp { core as usize } else { 0 };
-    gqi::acquire_tx_buf_for_qp(qp)
+    gqi::acquire_tx_buf_for_qp(current_qp()?)
 }
 
 /// Public submit — paired with [`acquire_tx_buf`]. Consumes the
@@ -1833,11 +1840,7 @@ fn acquire_tx_tso_buf() -> Option<uni_net_driver::TxTsoBufHandle> {
     if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
         return None;
     }
-    let num_qp = NUM_QP.load(Ordering::Acquire) as u32;
-    if num_qp == 0 { return None; }
-    let core = uni_kernel::cpu_id();
-    let qp = if core < num_qp { core as usize } else { 0 };
-    gqi::acquire_tx_tso_buf_for_qp(qp)
+    gqi::acquire_tx_tso_buf_for_qp(current_qp()?)
 }
 
 /// Public TSO submit — paired with [`acquire_tx_tso_buf`]. Emits
@@ -1892,11 +1895,10 @@ fn flush_tx_kick_if_dirty_qp(qp: usize) -> bool {
 /// `uni_drivers::virtio_net::flush_tx_kick_if_dirty` so the shim in
 /// `uni_drivers::net` can dispatch through the same signature.
 fn flush_tx_kick_if_dirty() -> bool {
-    let num_qp = NUM_QP.load(Ordering::Acquire) as u32;
-    if num_qp == 0 { return false; }
-    let core = uni_kernel::cpu_id();
-    let qp = if core < num_qp { core as usize } else { 0 };
-    flush_tx_kick_if_dirty_qp(qp)
+    match current_qp() {
+        Some(qp) => flush_tx_kick_if_dirty_qp(qp),
+        None => false,
+    }
 }
 
 /// Flush every TX queue's pending kick. Not strictly needed in
@@ -1937,13 +1939,9 @@ fn send_on_qp(qp: usize, data: &[u8]) -> bool {
 /// virtio-net "send on your own core's queue" semantics so Tier 1
 /// scaling keeps working.
 fn send(data: &[u8]) {
-    let num_qp = NUM_QP.load(Ordering::Acquire) as u32;
-    if num_qp == 0 {
-        return;
+    if let Some(qp) = current_qp() {
+        let _ = send_on_qp(qp, data);
     }
-    let core = uni_kernel::cpu_id();
-    let qp = if core < num_qp { core as usize } else { 0 };
-    let _ = send_on_qp(qp, data);
 }
 
 // ---- virtio-net-compatible public surface --------------------------------
