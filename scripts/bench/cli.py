@@ -604,15 +604,25 @@ def main():
                 if "conns_per_core" in w:
                     conns = w["conns_per_core"] * cpus
                 if "threads_per_core" in w:
-                    # Scale with target cores but cap at half the host
-                    # count. `wrk` is event-loop (epoll/kqueue), not
-                    # thread-per-conn — one thread can comfortably
-                    # drive 100k req/s, so scaling 1:1 with target cpus
-                    # just burns host cores that the VM / native binary
-                    # needs. Keeping this ≤ host/2 leaves half the host
-                    # for the server.
+                    # Scale with target cores, but for *local* envs cap
+                    # at half the host count. `wrk` is event-loop
+                    # (epoll/kqueue), not thread-per-conn — one thread
+                    # can comfortably drive 100k req/s, so scaling 1:1
+                    # with target cpus just burns host cores that the
+                    # VM / native binary needs. Keeping this ≤ host/2
+                    # leaves half the host for the server.
+                    #
+                    # `RemoteEnv` is the exception: server and loadgen
+                    # live on separate VMs (the GCE deploy-bench shape),
+                    # so the loadgen is free to use the whole host. The
+                    # prior unconditional cap is exactly what made
+                    # `get_tcp` plateau at cli=4.0cpu on a 8-vCPU
+                    # kvm-vm — both 4c and 8c targets clamped to 4
+                    # client threads and the server's real ceiling
+                    # stayed invisible.
                     raw = max(1, w["threads_per_core"] * cpus)
-                    threads = min(raw, max(1, _HOST_CPUS // 2))
+                    cap = _HOST_CPUS if isinstance(env, RemoteEnv) else max(1, _HOST_CPUS // 2)
+                    threads = min(raw, cap)
                 # UDP workloads use a fixed sender count — tying senders
                 # to vCPUs would conflate client-side concurrency with
                 # the server's core count and make scaling curves
