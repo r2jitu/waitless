@@ -132,12 +132,13 @@ from .workloads import (
     next_port,
     run_loadgen_gateway,
     run_loadgen_h3_health,
+    run_loadgen_http_close,
+    run_loadgen_http_upload,
     run_loadgen_tcp_echo,
     run_loadgen_tls_handshake,
     run_loadgen_tls_resume,
     run_wrk,
     run_wrk_https,
-    run_loadgen_http_close,
     echo_udp_concurrent,
 )
 
@@ -370,6 +371,67 @@ WORKLOADS = [
     {"name": "fanout_tcp", "type": "gateway",
      "conns_per_core": 1500,
      "desc": "Gateway fan-out (TCP→UDP backend→TCP, 1500 conn × cpus)"},
+
+    # ── Bulk RX — POST /discard with sized body ──────────────────────
+    #
+    # Primary probe for the driver RX path under multi-segment
+    # same-flow load. Each iteration POSTs 32 KiB on a keep-alive
+    # conn — ~22 MSS segments per request, all same 4-tuple, which
+    # is the shape HW GRO / RSC wants to coalesce.
+    #
+    # Server-side handler `/discard` consumes the body and returns
+    # a tiny JSON 200 OK (so the bench cycles fast). 16 conn/core
+    # × cpus matches the other `_max`-style scaling.
+    {"name": "upload_32k_tcp", "type": "http_upload",
+     "endpoint": "/discard", "msg_size": 32768,
+     "conns_per_core": 16, "tls": False,
+     "desc": "POST /discard 32 KiB body (16 conn × cpus, plain HTTP)"},
+    # Same shape over TLS — `upload_32k_tls` ⊖ `upload_32k_tcp`
+    # isolates TLS bulk decrypt cost at fixed body size.
+    {"name": "upload_32k_tls", "type": "http_upload",
+     "endpoint": "/discard", "msg_size": 32768,
+     "conns_per_core": 16, "tls": True,
+     "desc": "POST /discard 32 KiB body (16 conn × cpus, over TLS)"},
+
+    # ── Bulk TX — GET /static-64k ────────────────────────────────────
+    #
+    # Plain-HTTP companion to `download_64k_tls`. Same body, no TLS
+    # — surfaces TCP TX path regressions (descriptor build, TSO,
+    # checksum offload) without TLS encrypt confound.
+    {"name": "download_64k_tcp", "type": "tcp", "endpoint": "/static-64k",
+     "threads_per_core": 1, "conns_per_core": 8,
+     "desc": "/static-64k throughput plain HTTP (~4 segments, multi-segment TX)"},
+
+    # ── Available tier (off the default set) ─────────────────────────
+
+    # TLS hot path at minimum concurrency. Δ vs `get_tcp_single` =
+    # per-request TLS record overhead at quiescent load. Pairs with
+    # `get_tls` (multi-conn throughput).
+    {"name": "get_tls_single", "type": "https", "endpoint": "/health",
+     "threads": 1, "conns": 1,
+     "tier": "available",
+     "desc": "/health × 1 conn over TLS 1.3 (record-layer hot path, latency)"},
+
+    # Single-flow UDP RTT. Replaces the dropped `udp_sync`; same
+    # shape, new name. Off by default — `echo_udp` (throughput
+    # sweep) covers the UDP path on every bench.
+    {"name": "echo_udp_single", "type": "udp", "endpoint": "",
+     "senders": 1,
+     "tier": "available",
+     "desc": "UDP echo single-flow latency (1 sender, sync RTT)"},
+
+    # IPv6 datapath. Same shape as `get_tcp` but targets [::1] so
+    # the v6 header parse + checksum path is exercised. Off by
+    # default — the v4 path is the throughput-dominant case; v6 is
+    # for catching regressions when ipv6.rs / ipv6_send.rs change.
+    # Requires the env to route [::1] to the unikernel (HVF runner
+    # binds both v4 and v6 listener sockets; RemoteEnv on GCE needs
+    # a v6-enabled subnet — not currently configured).
+    {"name": "get_tcp_v6", "type": "tcp", "endpoint": "/health",
+     "threads_per_core": 1, "conns_per_core": 32,
+     "host_override": "::1",
+     "tier": "available",
+     "desc": "/health throughput over IPv6 (v6 header parse + pseudo-header csum)"},
 ]
 
 
@@ -587,6 +649,12 @@ def main():
                     gateway_target_port = (
                         bench_port + gateway_off if gateway_off else None)
 
+                # Per-workload host override (e.g. `get_tcp_v6` pins
+                # the target to `::1` to exercise the IPv6 path
+                # regardless of what the env defaults to).
+                if "host_override" in w:
+                    wrk_host = w["host_override"]
+
                 # Workloads that scale with cpu count compute their final
                 # conn / thread / sender counts here. Static workloads keep
                 # the literal "conns" / "threads" / "senders" fields.
@@ -623,6 +691,25 @@ def main():
                         rps, p50, p99 = run_wrk(
                             wrk_port, w["endpoint"], threads, conns, duration,
                             host=wrk_host)
+                    results[(env_name, cpus, wname)] = (rps, p50, p99)
+                    client_cpu[(env_name, cpus, wname)] = m["cores"]
+                    print(f"    {wname:<20s} {rps:>10.0f} req/s  "
+                          f"p50={p50}  p99={p99}  {_cpu_tag(m['cores'])}")
+                elif w["type"] == "http_upload":
+                    # Keep-alive HTTP POST of a sized body to
+                    # /discard. The server reads + discards, returns
+                    # 200 OK. Each iteration drives ~msg_size/MSS
+                    # back-to-back RX segments on one 4-tuple —
+                    # the shape that exposes RX-driver / HW-GRO
+                    # behavior. `tls=True` wraps each conn in TLS;
+                    # the Δ vs the plain version isolates bulk
+                    # decrypt cost at fixed body size.
+                    target_port = tls_target_port if w.get("tls") else wrk_port
+                    with measure_client_cpu() as m:
+                        rps, p50, p99 = run_loadgen_http_upload(
+                            target_port, w["endpoint"], conns, duration,
+                            host=wrk_host, msg_size=w.get("msg_size", 32768),
+                            tls=w.get("tls", False))
                     results[(env_name, cpus, wname)] = (rps, p50, p99)
                     client_cpu[(env_name, cpus, wname)] = m["cores"]
                     print(f"    {wname:<20s} {rps:>10.0f} req/s  "
