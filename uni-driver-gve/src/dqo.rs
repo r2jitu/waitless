@@ -20,7 +20,7 @@ use crate::{
 
 // ---- DQO_RDA descriptor formats -------------------------------------------
 
-/// DQO TX packet descriptor — 16 bytes.
+/// DQO TX packet descriptor layout (16 bytes, see `build_pkt_desc`):
 ///   0..8   buf_addr     (LE64)            DMA addr of packet buffer
 ///   8      type_flags                     bits[4:0]=dtype (0xC), bit5=end_of_packet,
 ///                                         bit6=checksum_offload, bit7=report_event
@@ -28,19 +28,18 @@ use crate::{
 ///   10..12 reserved1                      (LE16)
 ///   12..14 compl_tag                      (LE16)  device echoes in TX completion
 ///   14..16 buf_size_and_resv              bits[13:0]=buf_size (max 16383)
-pub(crate) const DQO_TX_DESC_SIZE: usize = 16;
-pub(crate) const DQO_TX_DTYPE_PKT: u8 = 0xC;
+const DQO_TX_DTYPE_PKT: u8 = 0xC;
 /// General context descriptor type, per `gve_desc_dqo.h`'s
 /// `GVE_TX_GENERAL_CTX_DESC_DTYPE_DQO`. Linux emits one of
 /// these IMMEDIATELY before each data descriptor; without it,
 /// our packets miss the metadata preamble the device expects.
-pub(crate) const DQO_TX_DTYPE_GENERAL_CTX: u8 = 0x4;
-pub(crate) const DQO_TX_FLAG_EOP: u8 = 1 << 5;
+const DQO_TX_DTYPE_GENERAL_CTX: u8 = 0x4;
+const DQO_TX_FLAG_EOP: u8 = 1 << 5;
 /// `checksum_offload_enable` (byte 8 bit 6) — instructs the device
 /// to compute the L4 checksum host-side. Equivalent of virtio's
 /// NEEDS_CSUM. Per gve_desc_dqo.h.
-pub(crate) const DQO_TX_FLAG_CSUM: u8 = 1 << 6;
-pub(crate) const DQO_TX_FLAG_REPORT_EVENT: u8 = 1 << 7;
+const DQO_TX_FLAG_CSUM: u8 = 1 << 6;
+const DQO_TX_FLAG_REPORT_EVENT: u8 = 1 << 7;
 /// `report_event` flags MUST be spaced at least this many TX
 /// descriptors apart per `gve_desc_dqo.h`'s GVE_TX_MIN_RE_INTERVAL
 /// (= 32). Linux's gve_tx_dqo bumps `last_re_idx` after setting RE

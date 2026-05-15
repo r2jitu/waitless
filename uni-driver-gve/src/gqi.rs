@@ -33,11 +33,11 @@ use crate::{
 // `type_flags` byte layout: low 4 bits = type, upper 4 bits = flags
 // for STD/TSO; for SEG the upper bit (GVE_TXSF_IPV6) is the only
 // flag we care about.
-pub(crate) const GVE_TXD_STD: u8 = 0x0 << 4;     // 0x00 — std packet (single-seg or first of multi-seg non-TSO)
-pub(crate) const GVE_TXD_TSO: u8 = 0x1 << 4;     // 0x10 — TSO header desc (first desc of a TSO super-segment)
-pub(crate) const GVE_TXD_SEG: u8 = 0x2 << 4;     // 0x20 — segment desc (TSO continuation)
-pub(crate) const GVE_TXF_L4CSUM: u8 = 1 << 0;    // device computes L4 csum
-pub(crate) const GVE_TXSF_IPV6: u8 = 1 << 1;     // TSO is over IPv6 (vs v4)
+const GVE_TXD_STD: u8 = 0x0 << 4;     // 0x00 — std packet (single-seg or first of multi-seg non-TSO)
+const GVE_TXD_TSO: u8 = 0x1 << 4;     // 0x10 — TSO header desc (first desc of a TSO super-segment)
+const GVE_TXD_SEG: u8 = 0x2 << 4;     // 0x20 — segment desc (TSO continuation)
+const GVE_TXF_L4CSUM: u8 = 1 << 0;    // device computes L4 csum
+const GVE_TXSF_IPV6: u8 = 1 << 1;     // TSO is over IPv6 (vs v4)
 
 // ---- RX completion descriptor layout (gve_desc.h, big-endian) -------------
 
@@ -56,7 +56,7 @@ pub(crate) const GVE_TXSF_IPV6: u8 = 1 << 1;     // TSO is over IPv6 (vs v4)
 ///
 /// Only `len` and `flags_seq` are needed by this driver — csum +
 /// hash are hints for the stack and can be ignored here.
-pub(crate) const RX_DESC_SIZE: usize = 64;
+const RX_DESC_SIZE: usize = 64;
 const RX_DESC_LEN_OFF: usize = 60;
 const RX_DESC_FLAGS_SEQ_OFF: usize = 62;
 
@@ -69,18 +69,18 @@ const RX_DESC_FLAGS_SEQ_OFF: usize = 62;
 const RX_DATA_OFFSET_IN_PAGE: usize = _GVE_RX_PAD as usize;
 
 /// TX descriptor size (gve_tx_pkt_desc, packed, 16 bytes).
-pub(crate) const TX_DESC_SIZE: usize = 16;
+const TX_DESC_SIZE: usize = 16;
 
 /// Highest packet length we're willing to stage at once. Matches
 /// the device-advertised MTU + Ethernet + safety slack; see
 /// `send()` below for the actual check.
-pub(crate) const TX_MAX_PKT_LEN: usize = 2048;
+const TX_MAX_PKT_LEN: usize = 2048;
 
 /// Highest TSO super-segment length we accept. A big-pool slot is
 /// 5 contiguous 4 KiB pages; we leave ~256 bytes of headroom over
 /// the Linux 16 KiB max-segment guidance for safety. The TCP layer
 /// will only build super-segments up to its own configured cap.
-pub(crate) const TX_MAX_TSO_LEN: usize = TX_BIG_SLOT_SIZE as usize - 256;
+const TX_MAX_TSO_LEN: usize = TX_BIG_SLOT_SIZE as usize - 256;
 
 const POOL_ID_SMALL: u8 = 0;
 const POOL_ID_BIG: u8 = 1;
