@@ -711,6 +711,40 @@ fn pool_capacity(core: u32) -> usize {
     POOLS.at(core).capacity() as usize
 }
 
+/// Linear-scan fallback for `tcp_hash_find`: walk the pool for a
+/// live connection matching the 4-tuple.
+///
+/// The 4-tuple hash index is a fixed `TCP_HASH_SIZE` (256) entries,
+/// but the connection pool grows to `MAX_SEGMENTS × SEGMENT_SIZE`
+/// (65 472). Once more than ~256 connections are live — or lingering
+/// in a closing state the stack can't time out — `tcp_hash_insert`
+/// silently drops the new entry. Without this fallback every
+/// post-SYN segment for an overflowed connection misses the hash
+/// and `tcp_receive` drops it, stalling the connection a full RTO;
+/// a sustained fresh-conn workload then collapses to a few req/s.
+///
+/// With the fallback the hash is a pure optimisation: a miss is
+/// still correct, just `O(pool_capacity)`. Match criteria mirror the
+/// RST handler — `remote_ip`/`remote_port`/`local_port`; `local_ip`
+/// isn't part of the key (a host with multiple local IPs would need
+/// it, but the unikernel binds one).
+fn tcp_linear_find(core: u32, src_ip: IpAddr, src_port: u16, dst_port: u16) -> Option<usize> {
+    let cap = pool_capacity(core);
+    for i in 0..cap {
+        // SAFETY: per-core ownership — only the owning core scans.
+        let c = unsafe { &*conn_ptr(core, i) };
+        if c.state != TcpState::Closed
+            && c.state != TcpState::Listen
+            && c.remote_ip == src_ip
+            && c.local_port == dst_port
+            && c.remote_port == src_port
+        {
+            return Some(i);
+        }
+    }
+    None
+}
+
 /// Draw a per-connection initial sequence number.
 ///
 /// Previously this was a global counter that stepped by 64 000, which
@@ -1528,10 +1562,20 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, segment: &[u8]) {
     // filter out Closed/Listen implicitly; with the hash we must
     // guard against stale entries left behind if any transition to
     // Closed took a path that skipped `free_connection`.
+    //
+    // On a hash miss, fall back to a linear pool scan: the hash is
+    // a fixed 256 entries and overflows once the pool grows past
+    // that, at which point `tcp_hash_insert` silently drops entries
+    // (see `tcp_linear_find`). The fallback keeps an overflowed
+    // connection correct — found, just slower — instead of dropping
+    // every one of its segments.
     let key = tcp_hash_key(src_ip, src_port, dst_port);
     let slot = match tcp_hash_find(core, key) {
         Some(s) => s,
-        None => return,
+        None => match tcp_linear_find(core, src_ip, src_port, dst_port) {
+            Some(s) => s,
+            None => return,
+        },
     };
     {
         let c = unsafe { &*conn_ptr(core, slot) };
