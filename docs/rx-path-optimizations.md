@@ -305,7 +305,7 @@ a 100 MB POST). See item L for the follow-on plan.
 
 ### J. Enable HW GRO (RSC) on DQO_RDA queues
 - **Status**: [ ]
-- **Where**: [`uni-driver-gve/src/lib.rs:1327`](uni-driver-gve/src/lib.rs#L1327)
+- **Where**: [`uni-driver-gve/src/lib.rs:1401`](uni-driver-gve/src/lib.rs#L1401)
   `build_create_rx_queue_cmd`: `cmd.set_byte(58, 1)` for DqoRda.
 - **What**: the one-line flip that turns RSC on. Lives in this
   plan because items A–I make it safe (multi-buf delivery
@@ -469,6 +469,15 @@ backpressure. CPU-bound at ChaCha20-Poly1305 decrypt rate
   id=10 advertises 4096; using it reduces RSC multi-buf events
   (more coalesces stay single-desc). Driver + buffer-pool sizing
   tweak; one commit.
+- **Ring-size experiment**: `TX_RING_ENTRIES = 256` /
+  `RX_RING_ENTRIES = 512` sit at the bottom of the
+  MODIFY_RING-advertised envelope (`[256, 4096]` / `[512, 4096]`
+  on c3-highcpu-8; logged at boot since commit `daad48b`). For
+  workloads where the "DQO pool of 512 bufs/qp cycles ~140× across
+  a 100 MB body" math above implies hot eviction, try
+  `RX_RING_ENTRIES = 1024` to halve the cycle count. The
+  bounds-assert added in `daad48b` is the guardrail so the runtime
+  value can't drift out of range silently.
 - **Observability**: surface the new counters in
   `/stats`-style dashboards.
 - **GCE IPv6 subnet enablement** so `get_tcp_v6` runs against
