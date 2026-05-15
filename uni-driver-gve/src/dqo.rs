@@ -190,29 +190,31 @@ pub(crate) fn tx_drain(tx: &TxQueue) {
     loop {
         let idx = (head & cmask) as usize;
         let desc_ptr = (tx.tx_compl_va as *const u8).wrapping_add(idx * DQO_TX_COMPL_SIZE);
-        let hdr_word = u16::from_le_bytes([
-            unsafe { ptr::read_volatile(desc_ptr) },
-            unsafe { ptr::read_volatile(desc_ptr.add(1)) },
-        ]);
+        let hdr_word = unsafe {
+            ptr::read_volatile(desc_ptr as *const u16)
+        };
         let desc_gen = ((hdr_word >> 15) & 1) as u8;
         if desc_gen != cur_gen { break; }
+        // Mirror of the RX-side fence — bar LLVM from reordering
+        // type/tx_head reads ahead of the gen-bit check.
+        core::sync::atomic::compiler_fence(Ordering::Acquire);
         let cmpl_type = ((hdr_word >> 11) & 0x7) as u8;
         match cmpl_type {
             DQO_TX_COMPL_TYPE_DESC => {
-                let tx_head = u16::from_le_bytes([
-                    unsafe { ptr::read_volatile(desc_ptr.add(2)) },
-                    unsafe { ptr::read_volatile(desc_ptr.add(3)) },
-                ]);
+                let tx_head = unsafe {
+                    ptr::read_volatile(desc_ptr.add(2) as *const u16)
+                };
                 latest_tx_head = Some(tx_head);
             }
             DQO_TX_COMPL_TYPE_PKT => {
                 // Per Linux, GVE_ALT_MISS_COMPL_BIT can be set on
                 // a PKT-typed completion's completion_tag to mean
-                // "this is actually a MISS". Read the tag's high
-                // bit; only do an atomic increment for that rare
-                // case so the hot per-packet path stays free.
-                let tag_hi = unsafe { ptr::read_volatile(desc_ptr.add(3)) };
-                if tag_hi & ((GVE_ALT_MISS_COMPL_BIT >> 8) as u8) != 0 {
+                // "this is actually a MISS". Read the tag as u16
+                // and test the high bit.
+                let tag = unsafe {
+                    ptr::read_volatile(desc_ptr.add(2) as *const u16)
+                };
+                if tag & GVE_ALT_MISS_COMPL_BIT != 0 {
                     DQO_TX_MISS_COMPL.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -492,20 +494,33 @@ pub(crate) fn poll_qp_inner<F: FnMut(&[u8])>(qp: usize, mut callback: F) -> u32 
     while delivered < MAX_BATCH {
         let idx = (cons & mask) as usize;
         let desc_ptr = (rx.compl_va as *const u8).wrapping_add(idx * DQO_RX_COMPL_SIZE);
-        // packet_len LE16 at offset 4: bits[13:0]=len, bit14=generation.
-        let pkt_word = u16::from_le_bytes([
-            unsafe { ptr::read_volatile(desc_ptr.add(4)) },
-            unsafe { ptr::read_volatile(desc_ptr.add(5)) },
-        ]);
+        // Read pkt_word + len + gen + bq_id as a single aligned u16
+        // (was byte-by-byte). The descriptor is at a 32-byte-aligned
+        // offset inside a page-aligned ring; the u16 at offset 4 is
+        // naturally aligned. A single-instruction load is atomic at
+        // the CPU level, eliminating a software-level tearing window
+        // between the two bytes — without this, if the device's TLP
+        // updates the cache line exactly between the two byte loads,
+        // we'd assemble a half-old/half-new u16.
+        let pkt_word = unsafe {
+            ptr::read_volatile(desc_ptr.add(4) as *const u16)
+        };
         let desc_gen = ((pkt_word >> 14) & 1) as u8;
         if desc_gen != cur_gen { break; }
+        // `compiler_fence(Acquire)` is Linux's `dma_rmb()` analog: on
+        // x86 it doesn't emit a hardware fence (TSO already orders
+        // loads) but it bars LLVM from hoisting the subsequent
+        // volatile loads of status/buf_id ahead of the gen-bit
+        // observation.
+        core::sync::atomic::compiler_fence(Ordering::Acquire);
 
         let pkt_len = (pkt_word & 0x3FFF) as usize;
         let status = unsafe { ptr::read_volatile(desc_ptr.add(8)) };
-        let buf_id = u16::from_le_bytes([
-            unsafe { ptr::read_volatile(desc_ptr.add(12)) },
-            unsafe { ptr::read_volatile(desc_ptr.add(13)) },
-        ]) as u32;
+        // buf_id at offset 12 — aligned u16 read, same rationale as
+        // pkt_word above.
+        let buf_id = unsafe {
+            ptr::read_volatile(desc_ptr.add(12) as *const u16)
+        } as u32;
 
         let delivered_this = buf_id < DQO_RX_POOL_BUFS
             && (status & DQO_RX_COMPL_STATUS_EOP) != 0
