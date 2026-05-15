@@ -44,6 +44,7 @@ static BARE_TCP_BACKEND: uni_runtime::net::TcpBackend = uni_runtime::net::TcpBac
     clear_send_waker: tcp::clear_send_waker,
     try_send_tso: Some(tcp::try_send_tso),
     shutdown_all: Some(bare_shutdown_all),
+    reap: Some(tcp::reap_idle_closing),
 };
 
 /// Wrapper around `tcp::shutdown_all` that flushes the virtio-net

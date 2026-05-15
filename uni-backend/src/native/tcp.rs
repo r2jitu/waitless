@@ -481,6 +481,9 @@ pub(super) static NATIVE_TCP_BACKEND: uni_runtime::net::TcpBackend =
         // Callers fall back to the regular `try_send` chain path.
         try_send_tso: None,
         shutdown_all: None,
+        // Native sockets are aged out by the host kernel's own TCP
+        // timers — no in-process reaper needed.
+        reap: None,
     };
 
 /// Pump the worker's event queue non-blockingly. Flips
