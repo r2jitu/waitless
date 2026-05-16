@@ -52,34 +52,59 @@ a packet capture).
 
 ## Recommended design
 
-Asymmetric split — add a *restricted* owned type; keep the existing
-type as the *permissive* one.
+A sum-type split: `OwnedIOBuf` and `BorrowedIOBuf` are the
+primitives — each variant defined exactly once — and `IOBuf` is
+their sum. (An earlier draft proposed two *parallel* enums with
+duplicated `Heap`/`Static`/`ExternalOwned` bodies; the sum-type
+factoring below supersedes it — it removes that duplication
+entirely.)
 
 - **`OwnedIOBuf`** — `enum { Heap, Static, ExternalOwned }`, no
-  `Borrowed` variant, so `Send` **auto-derives** (no `unsafe impl`).
+  borrowing variant, so `Send` **auto-derives** (no `unsafe impl`).
   Drivers' `wrap_owned` and `IOBufPool::alloc` return this; the RX
   path and every cross-core container traffic in `OwnedIOBuf` only.
-- **`IOBuf`** — unchanged: permissive, `!Send`, keeps `Borrowed`.
-  The TX path keeps using it.
-- **`into_owned(self: IOBuf) -> OwnedIOBuf`** — now a *typed gate*.
-  The type changes, so the compiler tracks it: a `Send` container's
+- **`BorrowedIOBuf`** — the non-owning view (today's `Borrowed`),
+  `!Send`. Minted by `IOBuf::borrow`. Used only on the TX path.
+- **`IOBuf` = `enum { Owned(OwnedIOBuf), Borrowed(BorrowedIOBuf) }`**
+  — the permissive sum. `!Send` because it contains a
+  `BorrowedIOBuf`. The TX path uses this. Its methods are a thin
+  two-arm forwarding layer (`match self { Owned(o) => o.x(),
+  Borrowed(b) => b.x() }`) — *less* code than duplicating the
+  owned-variant logic, and macro-generatable. Cost: one extra enum
+  discriminant + one dispatch branch — negligible against the
+  payload.
+- **`into_owned(self: IOBuf) -> OwnedIOBuf`** — a *typed gate*:
+  `match self { Owned(o) => o, Borrowed(b) => b.copy_to_heap() }`.
+  The type changes, so the compiler tracks it — a `Send` container's
   slot is `OwnedIOBuf`, the only way to fill it is `into_owned()`,
-  forgetting it is a compile error, and the copy cost is visible at
-  the call site. `From<OwnedIOBuf> for IOBuf` gives free widening
-  (a proxy can feed an RX buffer into a TX chain).
+  forgetting it is a compile error, the copy cost is visible at the
+  call site. `From<OwnedIOBuf> for IOBuf` (`IOBuf::Owned`) gives
+  free widening (a proxy can feed an RX buffer into a TX chain).
 - **`IOBufChain` → generic `Chain<B>`.** A chain is just a
   `VecDeque<B>` + cached length — genericity works cleanly here
-  (unlike the `IOBuf` enum, where a variant cannot be conditionally
+  (unlike the IOBuf enum, where a variant cannot be conditionally
   absent). `Chain<OwnedIOBuf>` is `Send` by derivation;
   `Chain<IOBuf>` is `!Send`. RX delivers `Chain<OwnedIOBuf>`; TX
-  builds `Chain<IOBuf>`. One chain impl, two `Send` outcomes.
+  builds `Chain<IOBuf>` (mixed borrowed+owned parts are just
+  `IOBuf::Borrowed` / `IOBuf::Owned` elements). One chain impl, two
+  `Send` outcomes.
 - **Shared read surface** via an `IOBufRead` trait (`data`, `len`,
-  `headroom`, `tailroom`) implemented by both. `OwnedIOBuf` is
-  restricted, so it needs little beyond construct + read + `Drop`.
-- **`Shared` / `split_at` / `split_off`:** dead today. At
-  implementation time either delete them (YAGNI) or, if kept for a
-  future copy-free split, back `Shared` with `Arc`. No live perf
-  cost either way — nothing calls them.
+  `headroom`, `tailroom`), implemented by `OwnedIOBuf`,
+  `BorrowedIOBuf`, and `IOBuf` (forwarding).
+- **`Shared` / `split_at` / `split_off`:** dead today (zero
+  callers). Delete them — that also removes the `Rc` from uni-iobuf.
+
+### Deferred complement — a lifetime on `BorrowedIOBuf`
+
+`BorrowedIOBuf<'a>` (holding the borrow's lifetime) would make
+`IOBuf::borrow` a *safe* fn and obviate item F's `RecvChunkGuard`
+(the RX-path doc says the guard exists *because* "IOBuf has no
+lifetime parameter"). But a lifetime is **orthogonal to `Send`** —
+auto-traits ignore lifetimes, so it cannot substitute for this
+split — and it is viral (`IOBuf<'a>`, `Chain<'a>`, every TX-path
+signature). Its payoff concentrates at item F, so decide it at the
+**item-F session**, not here. This split deliberately leaves
+`BorrowedIOBuf` lifetime-free.
 
 ### What this buys
 
@@ -93,13 +118,23 @@ type as the *permissive* one.
 ### Why not the alternatives
 
 - *Generic `IOBuf<O>` over an ownership marker* — does not work: a
-  marker cannot make the `Borrowed` *variant* conditionally absent,
-  so `IOBuf<Owned>` could still be constructed borrowed. (The
-  *chain* can be generic — it is a plain container — the IOBuf enum
-  cannot.)
+  marker cannot make a *variant* conditionally absent, so
+  `IOBuf<Owned>` could still be constructed borrowed. (The *chain*
+  can be generic — it is a plain container — the IOBuf enum cannot.)
 - *`OwnedIOBuf` as a newtype over `IOBuf`* — still *contains* an
   `IOBuf`, which is `!Send`, so it needs `unsafe impl Send` anyway.
   No compiler-derived `Send`. Same disease.
+- *Lifetime parameter `IOBuf<'a>` instead of the split* — does not
+  give `Send`. Auto-traits ignore lifetimes: `IOBuf<'static>` and
+  `IOBuf<'a>` have identical `Send`-ness, and a raw pointer in the
+  borrowing variant makes every `IOBuf<'a>` `!Send`. A lifetime
+  tracks borrow *validity*, a different axis — see the deferred
+  complement above.
+- *Two parallel enums* (`OwnedIOBuf` and `IOBuf` both spelling out
+  `Heap`/`Static`/`ExternalOwned`) — works for `Send` but
+  duplicates every owned-variant's offset math, mutation, and
+  `Drop`. The sum-type factoring above keeps each variant defined
+  once.
 
 ## Sequencing, effort, risk
 
