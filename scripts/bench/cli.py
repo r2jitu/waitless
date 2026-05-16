@@ -398,8 +398,10 @@ def main():
     parser = argparse.ArgumentParser(description="Unikernel benchmark")
     parser.add_argument("--env", default="qemu",
                         help="Environments: qemu,hvf,docker,native,all (comma-separated)")
-    parser.add_argument("--cores", default="1,4",
-                        help="Core counts to test (comma-separated)")
+    parser.add_argument("--cores", default=None,
+                        help="Core counts to test (comma-separated). "
+                             "Default: '1,<host//2>' for local envs, or "
+                             "'1,<host>' when --env includes remote.")
     parser.add_argument("--workload", default=None,
                         help="Workload name(s), comma-separated (default: all)")
     parser.add_argument("--duration", type=int, default=5,
@@ -415,7 +417,6 @@ def main():
     args = parser.parse_args()
 
     duration = args.duration
-    core_counts = [int(c) for c in args.cores.split(",")]
 
     if args.env == "all":
         env_names = ["qemu", "qemu-arm", "hvf", "docker", "native"]
@@ -423,6 +424,24 @@ def main():
         env_names = ["qemu", "qemu-arm", "hvf"]
     else:
         env_names = [e.strip() for e in args.env.split(",")]
+
+    # Resolve --cores. An explicit value is parsed verbatim; otherwise
+    # the default is env-dependent. Local envs co-locate the load
+    # generator and the guest on this host, so benching past half the
+    # host's cores starves the loadgen and the result goes
+    # client-bound — the same reasoning behind the `threads_per_core`
+    # host//2 cap further down. RemoteEnv runs the guest on a separate
+    # VM, leaving this whole host free for the loadgen, so it benches
+    # up to the full host core count. Either way a 1-core baseline is
+    # always included so the scaling column has a denominator.
+    if args.cores is not None:
+        core_counts = [int(c) for c in args.cores.split(",")]
+    else:
+        top = _HOST_CPUS if "remote" in env_names else max(1, _HOST_CPUS // 2)
+        core_counts = [1] if top <= 1 else [1, top]
+        print(f"--cores not set; defaulting to "
+              f"{','.join(str(c) for c in core_counts)} "
+              f"({_HOST_CPUS}-core host)")
 
     # Workload tiers (`tier` field per entry, default = "default"):
     #   "default"   — run on every bench (no --workload override)
