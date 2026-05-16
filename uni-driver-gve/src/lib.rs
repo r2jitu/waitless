@@ -38,7 +38,6 @@
 // the rest of the code works in natural host-endian `u32`s.
 
 #![no_std]
-#![allow(dead_code, unused_imports)]
 
 extern crate drivers_infra;
 extern crate uni_kernel;
@@ -66,10 +65,9 @@ use adminq::{
 };
 use drivers_infra::{log, mmio_read32, mmio_write32};
 use drivers_infra::pci;
-use core::mem::size_of;
 use core::ptr;
 use core::sync::atomic::{
-    compiler_fence, AtomicBool, AtomicPtr, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering,
+    AtomicBool, AtomicPtr, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering,
 };
 use uni_kernel::mm::{alloc_pages, phys_to_virt};
 use uni_kernel::sync::Spinlock;
@@ -88,7 +86,7 @@ const PCI_DEVICE_GVE: u16 = 0x0042;
 // 64-bit base-address form (unused on current GCE firmware).
 
 const REG_DEVICE_STATUS: u64 = 0x00;
-const REG_DRIVER_STATUS: u64 = 0x04;
+// 0x04: REG_DRIVER_STATUS — defined by the device but unused here.
 const REG_MAX_TX_QUEUES: u64 = 0x08;
 const REG_MAX_RX_QUEUES: u64 = 0x0C;
 // REG_ADMINQ_* registers are owned by `crate::adminq`.
@@ -179,9 +177,6 @@ struct State {
     min_tx_ring: u16,
     max_rx_ring: u16,
     min_rx_ring: u16,
-    /// Device-wide resources — filled once CONFIGURE_DEVICE_RESOURCES
-    /// succeeds. `None` between DESCRIBE_DEVICE and that point.
-    resources: Option<DeviceResources>,
     /// Number of active queue pairs. <= MAX_QUEUE_PAIRS. Set by
     /// `init()` after all queues come up. Tier 1 polling in
     /// `net::poll_tier1` walks `0..num_qp`.
@@ -197,26 +192,6 @@ struct State {
 /// `net_rx_counts()` / `net_rx_used_cursors()` array sizes so the
 /// two drivers stay signature-compatible.
 pub(crate) const MAX_QUEUE_PAIRS: usize = 8;
-
-/// Device-wide resources negotiated via CONFIGURE_DEVICE_RESOURCES.
-/// The device owns these DMA regions for its lifetime; the driver
-/// just tells it where they live.
-struct DeviceResources {
-    /// Counter array (device writes per-TX-queue completion counts
-    /// and other stats here). One 32-bit counter per slot.
-    counter_array_va: u64,
-    counter_array_phys: u64,
-    /// IRQ doorbell block. Even though we're polling, the device
-    /// requires a valid IRQ doorbell region and per-queue index.
-    /// Each entry is a cache-line-aligned `u32` the device reads to
-    /// decide whether to raise MSI-X.
-    irq_db_va: u64,
-    irq_db_phys: u64,
-    /// Virtual address of BAR2 (per-queue doorbell register window).
-    /// `queue_resources->db_index * 4` is the byte offset of a given
-    /// queue's doorbell here.
-    bar2_va: u64,
-}
 
 /// Per-queue TX metadata. GQI_QPL format: outbound packets are
 /// memcpy'd into a pre-registered Queue Page List, and the
@@ -557,7 +532,6 @@ fn init() -> bool {
             min_tx_ring: 0,
             max_rx_ring: 0,
             min_rx_ring: 0,
-            resources: None,
             num_qp: 0,
             tx: [const { None }; MAX_QUEUE_PAIRS],
             rx: [const { None }; MAX_QUEUE_PAIRS],
@@ -1013,18 +987,6 @@ fn configure_device_resources(bar2_va: u64, num_qp: u32, fmt: QueueFormat) -> bo
         return false;
     }
 
-    {
-        let mut st = STATE.lock();
-        if let Some(s) = st.as_mut() {
-            s.resources = Some(DeviceResources {
-                counter_array_va: counter_va,
-                counter_array_phys: counter_phys,
-                irq_db_va,
-                irq_db_phys,
-                bar2_va,
-            });
-        }
-    }
     // Publish for the lock-free hot path. These values are read by
     // `send_on_qp` / `tx_drain_qp` on every packet; going through
     // `STATE.lock()` on a shared spinlock would serialise all TX
