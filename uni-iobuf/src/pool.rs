@@ -96,13 +96,17 @@ fn unpack(word: u64) -> (u32, u32) {
 /// by reference count for at least as long as any pool-issued
 /// IOBuf — which is what makes the pool's API sound.
 struct PoolInner {
-    /// Start of the contiguous slab region: `slab_size *
-    /// capacity_slabs` bytes. Obtained via `Box::<[u8]>::into_raw`
-    /// (so the pointer carries mutable provenance — pool-issued
-    /// IOBufs write slab payload through it); `Drop` reconstructs
-    /// the `Box` to free it. `PoolInner` itself never reads or
-    /// writes slab bytes — only IOBufs do.
-    base: NonNull<u8>,
+    /// The slab region: a fat pointer over the whole
+    /// `slab_size * capacity_slabs`-byte allocation. Obtained from
+    /// `Box::<[u8]>::into_raw` — so it carries mutable provenance
+    /// for the whole allocation (pool-issued IOBufs write payload
+    /// through sub-pointers derived from it) — and fed back to
+    /// `Box::from_raw` in `Drop`. Keeping the length in the pointer
+    /// metadata means `Drop` round-trips the *exact* pointer
+    /// `into_raw` produced, and `recycle` reads `base.len()` rather
+    /// than recomputing the region size. `PoolInner` itself never
+    /// dereferences this pointer — only IOBufs do.
+    base: NonNull<[u8]>,
     /// Bytes per slab. Immutable after construction.
     slab_size: u32,
     /// Number of slabs. Immutable after construction.
@@ -128,15 +132,17 @@ struct PoolInner {
     leaked: AtomicUsize,
 }
 
-// SAFETY: every field mutated after construction is an atomic
-// (`head`, `free_count`, `leaked`) or a slice of atomics (`next`) —
-// all sound to touch through `&self` from many threads. `base` is a
-// raw pointer used only for address arithmetic and for handing slab
-// pointers to IOBufs; `PoolInner` itself never dereferences it, so
-// it introduces no data race. `slab_size` / `capacity_slabs` are
-// immutable. Hence concurrent shared access is sound (`Sync`), and
-// it is sound to move / drop the `Arc<PoolInner>` on any thread
-// (`Send`).
+// SAFETY: `PoolInner` is `!Send + !Sync` only because of the
+// `NonNull<[u8]>` field. That pointer is used solely for address
+// arithmetic (deriving slab sub-pointers) and, exactly once, for
+// `Box::from_raw` in `Drop`; `PoolInner` never dereferences it to
+// read or write slab bytes — only IOBufs do, each through its own
+// disjoint sub-pointer. Every field mutated after construction is
+// an atomic (`head`, `free_count`, `leaked`) or a slice of atomics
+// (`next`), so concurrent `&PoolInner` access is data-race-free
+// (`Sync`). The backing allocation is owned by `PoolInner` and
+// released through the global (thread-safe) allocator in `Drop`, so
+// the value — and that `Drop` — may run on any thread (`Send`).
 unsafe impl Send for PoolInner {}
 unsafe impl Sync for PoolInner {}
 
@@ -208,12 +214,12 @@ impl PoolInner {
     /// corruption — we bump `leaked` and return, leaking that one
     /// slab. Panicking here would poison a `#![no_std]` `Drop`.
     fn recycle(&self, base: NonNull<u8>) {
-        let region_start = self.base.as_ptr() as usize;
+        let region_start = self.base.cast::<u8>().as_ptr() as usize;
+        let region_len = self.base.len();
         let addr = base.as_ptr() as usize;
-        let span = self.slab_size as usize * self.capacity_slabs as usize;
         let slot = addr
             .checked_sub(region_start)
-            .filter(|off| *off < span && off % self.slab_size as usize == 0)
+            .filter(|off| *off < region_len && off % self.slab_size as usize == 0)
             .map(|off| (off / self.slab_size as usize) as u32);
         match slot {
             Some(slot) => self.push_slot(slot),
@@ -228,19 +234,15 @@ impl PoolInner {
 
 impl Drop for PoolInner {
     fn drop(&mut self) {
-        // Reconstruct the `Box<[u8]>` leaked via `Box::into_raw` in
-        // `IOBufPool::new` so the slab region is freed exactly once.
-        //
-        // SAFETY: `base` came from `Box::<[u8]>::into_raw`;
-        // rebuilding a `*mut [u8]` of the original length and
-        // calling `Box::from_raw` is the documented round-trip.
-        // `PoolInner` drops only when its last `Arc` reference goes
-        // away — and every pool-issued IOBuf holds one — so no live
-        // IOBuf still views this region at drop time.
-        let span = self.slab_size as usize * self.capacity_slabs as usize;
+        // SAFETY: `base` is exactly the `*mut [u8]` that
+        // `Box::<[u8]>::into_raw` produced in `IOBufPool::new` —
+        // same address, same length metadata — so `Box::from_raw`
+        // rebuilds the original `Box` and frees the slab region
+        // once. `PoolInner` drops only when its last `Arc`
+        // reference goes away, and every pool-issued IOBuf holds
+        // one, so no live IOBuf still views the region here.
         unsafe {
-            let slice = core::ptr::slice_from_raw_parts_mut(self.base.as_ptr(), span);
-            drop(Box::from_raw(slice));
+            drop(Box::from_raw(self.base.as_ptr()));
         }
     }
 }
@@ -292,31 +294,33 @@ impl IOBufPool {
             "IOBufPool: slab_size_bytes {} out of range [1, u32::MAX]",
             slab_size_bytes,
         );
-        let span = slab_size_bytes
+        let region_len = slab_size_bytes
             .checked_mul(capacity_slabs)
             .expect("IOBufPool: slab_size * capacity overflows usize");
 
         // Contiguous slab region. `Box::into_raw` hands the
-        // allocation to a raw pointer carrying mutable provenance
-        // (pool-issued IOBufs write payload through it);
-        // `PoolInner::drop` reconstructs the `Box` to free it.
-        // Zero-filled to keep info-leak-class bugs away, matching
+        // allocation off as a `*mut [u8]` carrying mutable
+        // provenance for the whole region (pool-issued IOBufs write
+        // payload through sub-pointers of it); `PoolInner::drop`
+        // feeds the same pointer back to `Box::from_raw`. Zero-
+        // filled to keep info-leak-class bugs away, matching
         // `IOBuf::new_with_reserved`.
-        let storage: Box<[u8]> = alloc::vec![0u8; span].into_boxed_slice();
-        // SAFETY: a `Box`'s data pointer is always non-null.
-        let base = unsafe { NonNull::new_unchecked(Box::into_raw(storage) as *mut u8) };
+        let storage: Box<[u8]> = alloc::vec![0u8; region_len].into_boxed_slice();
+        let base: NonNull<[u8]> =
+            NonNull::new(Box::into_raw(storage)).expect("Box<[u8]> pointer is never null");
 
         // Intrusive free-list links: slab i → slab i+1, tail → NULL.
         // The whole pool starts free with the head at slot 0.
-        let mut links = alloc::vec::Vec::with_capacity(capacity_slabs);
-        for i in 0..capacity_slabs {
-            let next = if i + 1 < capacity_slabs {
-                (i + 1) as u32
-            } else {
-                NULL_SLOT
-            };
-            links.push(AtomicU32::new(next));
-        }
+        let next: Box<[AtomicU32]> = (0..capacity_slabs)
+            .map(|i| {
+                let link = if i + 1 < capacity_slabs {
+                    (i + 1) as u32
+                } else {
+                    NULL_SLOT
+                };
+                AtomicU32::new(link)
+            })
+            .collect();
         let head = if capacity_slabs == 0 {
             pack(NULL_SLOT, 0)
         } else {
@@ -328,7 +332,7 @@ impl IOBufPool {
                 base,
                 slab_size: slab_size_bytes as u32,
                 capacity_slabs: capacity_slabs as u32,
-                next: links.into_boxed_slice(),
+                next,
                 head: AtomicU64::new(head),
                 free_count: AtomicUsize::new(capacity_slabs),
                 leaked: AtomicUsize::new(0),
@@ -349,6 +353,7 @@ impl IOBufPool {
     /// see the [`IOBufPool`] type docs.
     pub fn alloc(&self) -> Option<IOBuf> {
         let slot = self.inner.pop_slot()?;
+
         // Hand the IOBuf its own strong reference to `PoolInner`:
         // `into_raw` consumes one `Arc` clone, parking that strong
         // count in the IOBuf's drop context; `return_slab` reclaims
@@ -356,25 +361,37 @@ impl IOBufPool {
         // slab region is reference-counted alive. (Done only after
         // `pop_slot` succeeds, so a `None` alloc leaks no count.)
         let ctx = Arc::into_raw(Arc::clone(&self.inner)) as *mut ();
+
+        // SAFETY: `slot` came off the free list, so it is in
+        // `0..capacity_slabs`; therefore `slot * slab_size` is
+        // strictly less than the region length and the resulting
+        // pointer stays in bounds of the slab allocation. `cast`
+        // only reinterprets the region pointer as a thin `*u8`
+        // (same address, same whole-allocation provenance).
+        let slab_base: NonNull<u8> = unsafe {
+            self.inner
+                .base
+                .cast::<u8>()
+                .add(slot as usize * self.inner.slab_size as usize)
+        };
+
         // SAFETY:
         //  * `slab_base .. slab_base + slab_size` is one distinct
-        //    slab inside the region — `slot` came off the free list
-        //    so it is in `0..capacity_slabs`, and `pop_slot`
-        //    removed it, so no other live IOBuf or concurrent pool
+        //    slab of the region; `pop_slot` removed `slot` from the
+        //    free list, so no other live IOBuf or concurrent pool
         //    op aliases it.
         //  * offset 0 + len 0 <= slab_size (the IOBuf's capacity).
         //  * `return_slab` is sound to invoke once at drop: it
-        //    reclaims the `Arc` from `ctx` and recycles the slab.
-        //    The `Arc` strong reference keeps `PoolInner` (and the
-        //    slab region) alive for the IOBuf's whole lifetime, so
-        //    both the slab bytes and the `ctx` pointee stay valid.
+        //    reclaims the `Arc` parked in `ctx` and recycles the
+        //    slab. That `Arc` strong reference keeps `PoolInner`
+        //    (slab region + free list) alive for the IOBuf's whole
+        //    lifetime, so the slab bytes and the `ctx` pointee both
+        //    stay valid until after the callback runs.
+        //  * the `(drop_fn, drop_ctx)` pair is Send-safe:
+        //    `PoolInner` is `Send + Sync`, so the parked `Arc` may
+        //    be reclaimed on whichever core ultimately drops the
+        //    IOBuf.
         let buf = unsafe {
-            let slab_base = NonNull::new_unchecked(
-                self.inner
-                    .base
-                    .as_ptr()
-                    .add(slot as usize * self.inner.slab_size as usize),
-            );
             IOBuf::wrap_owned(
                 slab_base,
                 self.inner.slab_size,
@@ -414,14 +431,20 @@ impl IOBufPool {
 /// by [`IOBufPool::alloc`]; runs once when the IOBuf drops, possibly
 /// on a different core than `alloc`.
 ///
-/// SAFETY: `ctx` is the pointer produced by
-/// `Arc::<PoolInner>::into_raw` in `alloc`. `Arc::from_raw` reclaims
-/// exactly the one strong reference the IOBuf held; the pairing is
+/// Must stay an `unsafe fn`: `ctx` carries a precondition that no
+/// caller can check. (`IOBufDropFn` is itself an `unsafe fn` type,
+/// so this still coerces into one.)
+///
+/// SAFETY: `ctx` must be a pointer produced by
+/// `Arc::<PoolInner>::into_raw` and not yet reclaimed — which is
+/// exactly what [`IOBufPool::alloc`] installs. `Arc::from_raw` then
+/// reclaims the one strong reference the IOBuf held; the pairing is
 /// balanced (one `into_raw` per `alloc`, one `from_raw` per drop,
 /// and `Drop` runs once). `base` / `capacity` are the originals
 /// passed to `wrap_owned`.
 unsafe fn return_slab(base: NonNull<u8>, _capacity: u32, ctx: *mut ()) {
-    // SAFETY: see the doc comment — `ctx` is a live `into_raw`'d Arc.
+    // SAFETY: per the contract above, `ctx` is a live, not-yet-
+    // reclaimed `Arc::<PoolInner>::into_raw` pointer.
     let inner: Arc<PoolInner> = unsafe { Arc::from_raw(ctx as *const PoolInner) };
     // `inner` holds a strong reference for the whole of this call,
     // so `PoolInner` (and the slab region) is alive while we
