@@ -1212,6 +1212,16 @@ fn stats_response() -> Response {
         emit_core_arr(&mut w, "lookup_linear_hit", &uni::net::tcp::LOOKUP_LINEAR_HIT);
         emit_core_arr(&mut w, "lookup_miss", &uni::net::tcp::LOOKUP_MISS);
         emit_core_arr(&mut w, "lookup_dead", &uni::net::tcp::LOOKUP_DEAD);
+        // Per-qp gve DQO TX-completion-drain diagnostics. On a queue
+        // whose `tx_inflight` has pinned at ring_entries, whether
+        // `tx_desc_compl` is still advancing tells us if the DESC
+        // completions that drive `done_cnt` have stalled.
+        emit_core_arr(&mut w, "tx_desc_compl",
+            &uni_driver_gve::dqo::TX_DESC_COMPL_PER_QP);
+        emit_core_arr(&mut w, "tx_pkt_compl",
+            &uni_driver_gve::dqo::TX_PKT_COMPL_PER_QP);
+        emit_core_arr(&mut w, "tx_drain_calls",
+            &uni_driver_gve::dqo::TX_DRAIN_CALLS_PER_QP);
 
         // ---- AEAD throughput (TLS + QUIC) ----
         //

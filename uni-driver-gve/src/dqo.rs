@@ -91,6 +91,18 @@ pub static DQO_TX_MISS_COMPL: core::sync::atomic::AtomicU64 =
 pub static DQO_TX_REINJECT_COMPL: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
+/// Per-qp TX-completion-drain diagnostics. `done_cnt` (hence TX
+/// slot reuse) advances only on DESC completions; if those stall,
+/// the ring wedges. These counters show, per queue, whether
+/// `tx_drain` is still seeing DESC vs PKT completions on a queue
+/// whose `tx_inflight` has pinned at `ring_entries`.
+pub static TX_DESC_COMPL_PER_QP: [core::sync::atomic::AtomicU64; crate::MAX_QUEUE_PAIRS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; crate::MAX_QUEUE_PAIRS];
+pub static TX_PKT_COMPL_PER_QP: [core::sync::atomic::AtomicU64; crate::MAX_QUEUE_PAIRS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; crate::MAX_QUEUE_PAIRS];
+pub static TX_DRAIN_CALLS_PER_QP: [core::sync::atomic::AtomicU64; crate::MAX_QUEUE_PAIRS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; crate::MAX_QUEUE_PAIRS];
+
 /// Count of RX completion descriptors we saw with a valid generation
 /// (device has written this slot) but that we did NOT deliver to the
 /// callback because one of: `buf_id` out of range, EOP bit clear, or
@@ -179,8 +191,11 @@ pub(crate) fn doorbell_write_le(bar2_va: u64, offset: u32, value: u32) {
 /// status — we don't need them for slot reuse since this driver
 /// uses the slot==ring_idx convention; ring positions cycle
 /// implicitly as `done_cnt` advances.
-pub(crate) fn tx_drain(tx: &TxQueue) {
+pub(crate) fn tx_drain(qp: usize, tx: &TxQueue) {
     if tx.tx_compl_va == 0 || tx.tx_compl_entries == 0 { return; }
+    if let Some(c) = TX_DRAIN_CALLS_PER_QP.get(qp) {
+        c.fetch_add(1, Ordering::Relaxed);
+    }
     let cmask = (tx.tx_compl_entries - 1) as u32;
     let rmask = (tx.ring_entries - 1) as u32;
     let mut head = tx.tx_compl_head.load(Ordering::Relaxed);
@@ -204,8 +219,14 @@ pub(crate) fn tx_drain(tx: &TxQueue) {
                     ptr::read_volatile(desc_ptr.add(2) as *const u16)
                 };
                 latest_tx_head = Some(tx_head);
+                if let Some(c) = TX_DESC_COMPL_PER_QP.get(qp) {
+                    c.fetch_add(1, Ordering::Relaxed);
+                }
             }
             DQO_TX_COMPL_TYPE_PKT => {
+                if let Some(c) = TX_PKT_COMPL_PER_QP.get(qp) {
+                    c.fetch_add(1, Ordering::Relaxed);
+                }
                 // Per Linux, GVE_ALT_MISS_COMPL_BIT can be set on
                 // a PKT-typed completion's completion_tag to mean
                 // "this is actually a MISS". Read the tag as u16
@@ -390,7 +411,7 @@ pub(crate) fn send_on_qp(qp: usize, data: &[u8]) -> bool {
     if in_flight + 64 > ring_entries {
         // Approaching full — drain to make sure done_cnt is current
         // before we reject the send.
-        tx_drain(tx);
+        tx_drain(qp, tx);
         done_cnt = tx.done_cnt.load(Ordering::Relaxed);
         in_flight = fill_cnt.wrapping_sub(done_cnt);
         if in_flight + 2 > ring_entries {
@@ -602,7 +623,7 @@ pub(crate) fn poll_qp_inner<F: FnMut(&[u8])>(qp: usize, mut callback: F) -> u32 
     let tx_ptr = TX_QUEUES[qp].load(Ordering::Acquire);
     if !tx_ptr.is_null() {
         let tx = unsafe { &*tx_ptr };
-        tx_drain(tx);
+        tx_drain(qp, tx);
     }
 
     delivered
