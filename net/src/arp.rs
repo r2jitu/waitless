@@ -9,7 +9,7 @@ extern crate net_ethernet as ethernet;
 extern crate uni_drivers;
 extern crate uni_iobuf;
 
-use uni_iobuf::IOBufChain;
+use uni_iobuf::{Chain, OwnedIOBuf};
 use from_bytes::FromBytes;
 use uni_kernel::sync::Spinlock;
 use types::{MacAddr, Ipv4Addr, CONFIG, htons, ntohs};
@@ -387,7 +387,7 @@ pub fn arp_announce() {
     ethernet_send(MacAddr::BROADCAST, ETHERTYPE_ARP, pkt.as_bytes());
 }
 
-fn arp_poll_callback(chain: IOBufChain) {
+fn arp_poll_callback(chain: Chain<OwnedIOBuf>) {
     for part in chain.iter() {
         if let Some((ETHERTYPE_ARP, payload)) = ethernet_parse(part.data()) {
             arp_receive(payload);

@@ -9,7 +9,7 @@ extern crate uni_iobuf;
 extern crate uni_kernel;
 extern crate uni_runtime;
 
-use uni_iobuf::IOBufChain;
+use uni_iobuf::{Chain, OwnedIOBuf};
 pub extern crate net_types as types;
 pub extern crate net_ethernet as ethernet;
 pub extern crate net_arp as arp;
@@ -314,8 +314,8 @@ fn poll_tier2(num_cores: u32) -> bool {
 
 
 /// RX callback for the NIC poll path (`NicOps::poll_rx` /
-/// `poll_qp`) — receives one frame as an owned [`IOBufChain`] and
-/// dispatches it through the full stack. Item B made the
+/// `poll_qp`) — receives one frame as an owned `Chain<OwnedIOBuf>`
+/// and dispatches it through the full stack. Item B made the
 /// driver↔net boundary deliver owned chains instead of borrowed
 /// `&[u8]` slices; until item C threads the chain into the
 /// per-conn layers, it is consumed synchronously here and dropped
@@ -325,7 +325,7 @@ fn poll_tier2(num_cores: u32) -> bool {
 /// A single-buffer frame is a one-part chain (the common case);
 /// hardware-coalesced super-segments (item I) arrive as multi-part
 /// chains, so we walk every part.
-pub fn net_receive(chain: IOBufChain) {
+pub fn net_receive(chain: Chain<OwnedIOBuf>) {
     for part in chain.iter() {
         net_receive_frame(part.data());
     }
@@ -427,14 +427,14 @@ enum ClassifyResult {
 
 /// Tier 2 distributor — the `NicOps::poll_rx` callback in
 /// single-queue mode. Receives one frame as an owned
-/// [`IOBufChain`] and, per part, picks a target core: runs the
+/// `Chain<OwnedIOBuf>` and, per part, picks a target core: runs the
 /// full receive path inline for ARP / IPv6 / my-core IPv4, or
 /// copies the bytes into the target core's `rx_inbox` for other
 /// IPv4. The cross-core copy is unavoidable until item C threads
 /// the IOBuf itself through the inbox — for now the chain (and its
 /// device-buffer reposts) is dropped at return, after the bytes
 /// have been copied or processed.
-fn distribute_frame(chain: IOBufChain) {
+fn distribute_frame(chain: Chain<OwnedIOBuf>) {
     let num_cores = percpu::num_cores();
     let my_core = uni_kernel::cpu_id();
     for part in chain.iter() {

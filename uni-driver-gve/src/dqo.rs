@@ -13,7 +13,7 @@ use core::ptr::NonNull;
 use core::sync::atomic::Ordering;
 
 use drivers_infra::mmio_write32;
-use uni_iobuf::{IOBuf, IOBufChain, IOBufDropFn};
+use uni_iobuf::{Chain, IOBufDropFn, OwnedIOBuf};
 
 use crate::{
     BAR2_VA, DEFERRED_KICK, MAX_QUEUE_PAIRS, RX_BUFFER_SIZE,
@@ -500,7 +500,7 @@ pub(crate) fn post_initial_rx_for_qp(rx: &RxQueue) {
 
 /// Drop callback for a delivered DQO RX `IOBuf` — reposts the
 /// device buffer `buf_id` to the data-buffer ring. Installed by
-/// [`poll_qp_inner`] via [`IOBuf::wrap_owned`]; runs from
+/// [`poll_qp_inner`] via [`OwnedIOBuf::wrap_owned`]; runs from
 /// `IOBuf::drop`, possibly on a core other than the one that
 /// received the frame (item C moves chains cross-core).
 ///
@@ -570,7 +570,7 @@ unsafe fn dqo_repost(_base: NonNull<u8>, _capacity: u32, ctx: *mut ()) {
     }
 }
 
-pub(crate) fn poll_qp_inner<F: FnMut(IOBufChain)>(qp: usize, mut callback: F) -> u32 {
+pub(crate) fn poll_qp_inner<F: FnMut(Chain<OwnedIOBuf>)>(qp: usize, mut callback: F) -> u32 {
     if qp >= MAX_QUEUE_PAIRS { return 0; }
     let rx_ptr = RX_QUEUES[qp].load(Ordering::Acquire);
     if rx_ptr.is_null() { return 0; }
@@ -639,8 +639,8 @@ pub(crate) fn poll_qp_inner<F: FnMut(IOBufChain)>(qp: usize, mut callback: F) ->
             // drop and panic-safe; `(qp, buf_id)` packed in `ctx`
             // survives the cross-core move `ExternalOwned` allows.
             let ctx = (((qp & 0xFFFF) << 16) | (buf_id as usize & 0xFFFF)) as *mut ();
-            let iobuf = unsafe {
-                IOBuf::wrap_owned(
+            let owned = unsafe {
+                OwnedIOBuf::wrap_owned(
                     NonNull::new_unchecked(buf_va as *mut u8),
                     RX_BUFFER_SIZE as u32,
                     0,
@@ -649,7 +649,7 @@ pub(crate) fn poll_qp_inner<F: FnMut(IOBufChain)>(qp: usize, mut callback: F) ->
                     ctx,
                 )
             };
-            callback(IOBufChain::from(iobuf));
+            callback(Chain::from(owned));
             delivered += 1;
         } else {
             DQO_RX_COMPL_SKIPPED.fetch_add(1, Ordering::Relaxed);

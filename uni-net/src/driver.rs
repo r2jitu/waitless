@@ -6,7 +6,7 @@
 pub mod error;
 pub use error::{DhcpError, NetError, NicError};
 
-pub use uni_iobuf::{IOBuf, IOBufChain};
+pub use uni_iobuf::{Chain, IOBuf, IOBufChain, OwnedIOBuf};
 
 use core::sync::atomic::{AtomicPtr, Ordering};
 
@@ -345,7 +345,10 @@ pub struct NicOps {
         gso_size: u16,
     )>,
     /// RX callback: the driver delivers each received L2 frame
-    /// (Eth + IP + L4 + payload) as an **owned** [`IOBufChain`].
+    /// (Eth + IP + L4 + payload) as an owned `Chain<OwnedIOBuf>`.
+    /// `OwnedIOBuf` is `Send` by derivation, so the chain — and the
+    /// frame it carries — can be moved cross-core (the Tier 2
+    /// distributor → per-core inbox) with no `unsafe impl Send`.
     /// A single-buffer frame is a one-part chain (the zero-alloc
     /// `Single` arm); a hardware-coalesced super-segment is a
     /// multi-part chain (item I). The callback takes the chain by
@@ -373,8 +376,8 @@ pub struct NicOps {
     /// the chain drops, wherever and whenever that happens. Each
     /// driver's drop callback MUST be panic-safe — it can run from
     /// `IOBuf::drop` on any core.
-    pub poll_rx: fn(fn(IOBufChain)) -> usize,
-    pub poll_qp: fn(usize, fn(IOBufChain)) -> usize,
+    pub poll_rx: fn(fn(Chain<OwnedIOBuf>)) -> usize,
+    pub poll_qp: fn(usize, fn(Chain<OwnedIOBuf>)) -> usize,
 
     // ── Config / bring-up ───────────────────────────────────────────
     pub get_mac: fn(*mut u8),
@@ -573,8 +576,8 @@ pub fn linked_ethernet_drivers() -> &'static [EthernetDriverReg] {
 // one Acquire load + one direct fn-pointer call.
 
 fn null_send(_: &[u8]) {}
-fn null_poll(_: fn(IOBufChain)) -> usize { 0 }
-fn null_poll_qp(_: usize, _: fn(IOBufChain)) -> usize { 0 }
+fn null_poll(_: fn(Chain<OwnedIOBuf>)) -> usize { 0 }
+fn null_poll_qp(_: usize, _: fn(Chain<OwnedIOBuf>)) -> usize { 0 }
 fn null_probe() -> bool { false }
 fn null_get_mac(_: *mut u8) {}
 fn null_num_queue_pairs() -> u16 { 1 }

@@ -332,8 +332,13 @@ impl FramingPool {
         // FRAMING_BUF_SIZE` is a valid Box<[u8]> region. The drop
         // callback `Box::from_raw`'s the same range and either
         // pushes back to the pool or drops it.
+        //
+        // `wrap_owned` yields an `OwnedIOBuf`; widen it to the
+        // `IOBuf` the (borrow-mixing) framing chain holds. The
+        // framing buffer is genuinely owned heap storage, so the
+        // widening is the infallible, zero-copy `From<OwnedIOBuf>`.
         unsafe {
-            uni_http::IOBuf::wrap_owned(
+            uni_http::OwnedIOBuf::wrap_owned(
                 base,
                 FRAMING_BUF_SIZE as u32,
                 0,
@@ -342,6 +347,7 @@ impl FramingPool {
                 ctx,
             )
         }
+        .into()
     }
 }
 

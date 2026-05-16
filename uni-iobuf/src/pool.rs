@@ -70,7 +70,7 @@ use alloc::sync::Arc;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-use crate::{IOBuf, IOBufDropFn};
+use crate::{IOBufDropFn, OwnedIOBuf};
 
 /// Free-list sentinel: a `slot_index` of `u32::MAX` marks both the
 /// empty stack and the tail of the `next` link chain. The pool
@@ -340,18 +340,33 @@ impl IOBufPool {
         }
     }
 
-    /// Take a slab off the free list and wrap it as an
-    /// `ExternalOwned` IOBuf, or `None` when the pool is exhausted.
+    /// Take a slab off the free list, copy `frame` into it, and
+    /// return it as a filled `OwnedIOBuf` — or `None` when the pool
+    /// is exhausted, or `frame` is larger than one slab.
     ///
-    /// The returned IOBuf has an empty visible payload (`len = 0`,
-    /// zero headroom, the whole slab as tailroom) — the consumer
-    /// grows it via `append_slice` / `extend_uninit`. On drop, the
-    /// slab recycles itself back here, possibly from another core.
+    /// The copy lives **here**, not behind an `OwnedIOBuf` mutation
+    /// method: the pool allocated the slab region as a `Box<[u8]>`,
+    /// so it *knows* the bytes are writable. A writable surface on
+    /// `OwnedIOBuf` would instead force *every* `wrap_owned` caller's
+    /// region to be writable (exclusive ≠ writable), which the type
+    /// model deliberately avoids — so `OwnedIOBuf` stays read-only
+    /// and the pool, the one place a slab's writability is known,
+    /// owns the fill. Canonical caller: the gVNIC GQI RX path.
     ///
-    /// The IOBuf carries a strong `Arc` reference to the pool's
-    /// inner state, so it keeps the slab region alive on its own —
-    /// see the [`IOBufPool`] type docs.
-    pub fn alloc(&self) -> Option<IOBuf> {
+    /// The returned `OwnedIOBuf` is `Send`; on drop the slab recycles
+    /// itself back here, possibly from another core. It carries a
+    /// strong `Arc` reference to the pool's inner state, so it keeps
+    /// the slab region alive on its own — see the [`IOBufPool`] type
+    /// docs.
+    pub fn alloc(&self, frame: &[u8]) -> Option<OwnedIOBuf> {
+        // An oversize frame can't fit a slab — reject before taking
+        // a slot so a `None` leaks nothing. Slabs are MTU-sized and
+        // RX frames MTU-bounded, so this is a never-in-practice
+        // guard; the caller recovers a dropped frame via TCP
+        // retransmit / UDP retry, same as a pool-exhaustion `None`.
+        if frame.len() > self.inner.slab_size as usize {
+            return None;
+        }
         let slot = self.inner.pop_slot()?;
 
         // Hand the IOBuf its own strong reference to `PoolInner`:
@@ -375,12 +390,26 @@ impl IOBufPool {
                 .add(slot as usize * self.inner.slab_size as usize)
         };
 
+        // Copy the frame into the slab before wrapping it as a
+        // read-only `OwnedIOBuf`. `pop_slot` removed this slab from
+        // the free list, so it is exclusively ours.
+        // SAFETY: `slab_base .. slab_base + frame.len()` is within
+        // this one slab (`frame.len() <= slab_size` checked above)
+        // and disjoint from every other live slab; `frame` is a
+        // distinct caller slice, so source and dest don't overlap.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                frame.as_ptr(),
+                slab_base.as_ptr(),
+                frame.len(),
+            );
+        }
+
         // SAFETY:
         //  * `slab_base .. slab_base + slab_size` is one distinct
-        //    slab of the region; `pop_slot` removed `slot` from the
-        //    free list, so no other live IOBuf or concurrent pool
-        //    op aliases it.
-        //  * offset 0 + len 0 <= slab_size (the IOBuf's capacity).
+        //    slab of the region; no other live IOBuf or concurrent
+        //    pool op aliases it.
+        //  * offset 0 + len `frame.len()` <= slab_size.
         //  * `return_slab` is sound to invoke once at drop: it
         //    reclaims the `Arc` parked in `ctx` and recycles the
         //    slab. That `Arc` strong reference keeps `PoolInner`
@@ -392,11 +421,11 @@ impl IOBufPool {
         //    be reclaimed on whichever core ultimately drops the
         //    IOBuf.
         let buf = unsafe {
-            IOBuf::wrap_owned(
+            OwnedIOBuf::wrap_owned(
                 slab_base,
                 self.inner.slab_size,
                 0,
-                0,
+                frame.len() as u32,
                 return_slab as IOBufDropFn,
                 ctx,
             )
@@ -495,21 +524,20 @@ mod tests {
     fn zero_capacity_pool_allocs_nothing() {
         let pool = IOBufPool::new(0, 128);
         assert_eq!(pool.free_count(), 0);
-        assert!(pool.alloc().is_none());
+        assert!(pool.alloc(b"x").is_none());
     }
 
     #[test]
-    fn alloc_slab_is_writable_and_recycles() {
+    fn alloc_copies_frame_and_recycles() {
         let pool = IOBufPool::new(4, 256);
         {
-            let mut buf = pool.alloc().expect("fresh pool has slabs");
-            // Empty payload, whole slab is tailroom.
-            assert_eq!(buf.len(), 0);
-            assert_eq!(buf.headroom(), 0);
-            assert_eq!(buf.tailroom(), 256);
-            // The ExternalOwned slab is a fully usable IOBuf.
-            buf.append_slice(b"frame-bytes").unwrap();
+            // `alloc` copies the frame into a slab and hands back a
+            // filled, read-only OwnedIOBuf.
+            let buf = pool.alloc(b"frame-bytes").expect("fresh pool has slabs");
             assert_eq!(buf.data(), b"frame-bytes");
+            assert_eq!(buf.len(), 11);
+            assert_eq!(buf.headroom(), 0);
+            assert_eq!(buf.tailroom(), 256 - 11);
             assert_eq!(pool.free_count(), 3);
         } // buf dropped here → drop callback recycles the slab
         assert_eq!(pool.free_count(), 4);
@@ -517,16 +545,25 @@ mod tests {
     }
 
     #[test]
+    fn oversize_frame_yields_none() {
+        // A frame larger than a slab can't be copied in — `alloc`
+        // rejects it without taking a slot.
+        let pool = IOBufPool::new(2, 8);
+        assert!(pool.alloc(b"this frame is way too long").is_none());
+        assert_eq!(pool.free_count(), 2, "no slot consumed by the reject");
+    }
+
+    #[test]
     fn exhaustion_yields_none_then_recovers() {
         let pool = IOBufPool::new(2, 64);
-        let a = pool.alloc();
-        let b = pool.alloc();
+        let a = pool.alloc(b"f");
+        let b = pool.alloc(b"f");
         assert!(a.is_some() && b.is_some());
-        assert!(pool.alloc().is_none(), "exhausted pool yields None");
+        assert!(pool.alloc(b"f").is_none(), "exhausted pool yields None");
         assert_eq!(pool.free_count(), 0);
         drop(a);
         assert_eq!(pool.free_count(), 1);
-        assert!(pool.alloc().is_some(), "a freed slab is reusable");
+        assert!(pool.alloc(b"f").is_some(), "a freed slab is reusable");
         drop(b);
         assert_eq!(pool.free_count(), 2);
     }
@@ -541,13 +578,13 @@ mod tests {
         // design this body is a use-after-free.
         let buf = {
             let pool = IOBufPool::new(4, 256);
-            let buf = pool.alloc().expect("fresh pool has slabs");
+            let buf = pool.alloc(b"data").expect("fresh pool has slabs");
             buf
             // every `pool` handle drops here; `buf` keeps the region alive
         };
         // Reading the slab is sound — the region is still mapped.
-        assert_eq!(buf.len(), 0);
-        assert_eq!(buf.tailroom(), 256);
+        assert_eq!(buf.data(), b"data");
+        assert_eq!(buf.len(), 4);
         // Dropping `buf` runs `return_slab`: it recycles into the
         // still-live PoolInner, then the last Arc drops and frees
         // the region. No use-after-free.
@@ -562,7 +599,8 @@ mod tests {
         assert_eq!(pool.free_count(), 16);
 
         // Drain the whole pool.
-        let mut slots: Vec<Option<IOBuf>> = (0..16).map(|_| pool.alloc()).collect();
+        let mut slots: Vec<Option<OwnedIOBuf>> =
+            (0..16).map(|_| pool.alloc(b"x")).collect();
         assert!(slots.iter().all(Option::is_some), "pool fully drained");
         assert_eq!(pool.free_count(), 0);
 
@@ -576,7 +614,7 @@ mod tests {
         assert_eq!(pool.leaked_count(), 0);
 
         // The pool is fully reusable afterward.
-        let again: Vec<Option<IOBuf>> = (0..16).map(|_| pool.alloc()).collect();
+        let again: Vec<Option<OwnedIOBuf>> = (0..16).map(|_| pool.alloc(b"x")).collect();
         assert!(again.iter().all(Option::is_some), "pool reusable post-recycle");
     }
 
@@ -621,9 +659,9 @@ mod tests {
                     // Hold a short batch before freeing it, so a
                     // slot is in flight while peers churn the rest
                     // — widens the ABA window.
-                    let mut batch: [Option<IOBuf>; 3] = [None, None, None];
+                    let mut batch: [Option<OwnedIOBuf>; 3] = [None, None, None];
                     for cell in batch.iter_mut() {
-                        *cell = p.alloc();
+                        *cell = p.alloc(b"frame");
                     }
                     // Drop in reverse to vary the rebuild order.
                     for cell in batch.iter_mut().rev() {
@@ -645,8 +683,8 @@ mod tests {
         // corrupted by an ABA-induced stale-`next` reinstall would
         // either resurrect a live slab (a duplicate address, or
         // > SLABS pops) or drop one (< SLABS pops).
-        let mut held: Vec<IOBuf> = Vec::new();
-        while let Some(buf) = pool.alloc() {
+        let mut held: Vec<OwnedIOBuf> = Vec::new();
+        while let Some(buf) = pool.alloc(b"d") {
             held.push(buf);
         }
         let mut bases: Vec<usize> = held.iter().map(|b| b.data().as_ptr() as usize).collect();

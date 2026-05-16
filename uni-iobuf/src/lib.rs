@@ -229,42 +229,6 @@ impl IOBuf {
         }
     }
 
-    /// Wrap a foreign region that this IOBuf takes ownership of via a
-    /// drop callback. On drop, `drop_fn(base, capacity, drop_ctx)`
-    /// runs exactly once, with the original `(base, capacity)`
-    /// regardless of how offset/len shifted.
-    ///
-    /// The result is an *owned* IOBuf. The owned, `Send` shape is
-    /// [`OwnedIOBuf`] — and that is exactly what
-    /// [`OwnedIOBuf::wrap_owned`] produces; this `IOBuf`-returning
-    /// form widens it via `From<OwnedIOBuf>` for callers that build
-    /// a (possibly borrow-mixing) `IOBuf` chain. For a non-owning
-    /// view use [`borrow`](Self::borrow) instead.
-    ///
-    /// SAFETY: the caller MUST guarantee:
-    ///   * `base..base+capacity` is a valid, exclusively-owned byte
-    ///     region for the IOBuf's lifetime.
-    ///   * `offset + len <= capacity`.
-    ///   * `drop_fn(base, capacity, drop_ctx)` is sound to invoke
-    ///     once at IOBuf-drop time.
-    ///   * The pair is Send-safe: the eventual drop runs on whichever
-    ///     worker owns the IOBuf at drop time.
-    pub unsafe fn wrap_owned(
-        base: NonNull<u8>,
-        capacity: u32,
-        offset: u32,
-        len: u32,
-        drop_fn: IOBufDropFn,
-        drop_ctx: *mut (),
-    ) -> Self {
-        // SAFETY: forwarded to `OwnedIOBuf::wrap_owned` verbatim —
-        // the caller's contract above is exactly its contract.
-        let owned = unsafe {
-            OwnedIOBuf::wrap_owned(base, capacity, offset, len, drop_fn, drop_ctx)
-        };
-        owned.into()
-    }
-
     /// Borrow a foreign region as an IOBuf view. No drop callback
     /// runs; the caller ensures the storage outlives every IOBuf
     /// that borrows it.
@@ -533,14 +497,21 @@ macro_rules! owned_dispatch {
 
 impl OwnedIOBuf {
     /// Wrap a foreign region this IOBuf takes ownership of via a drop
-    /// callback — the owned, `Send` constructor for the cross-core RX
-    /// path (NIC zero-copy RX, pool slabs). On drop, `drop_fn(base,
-    /// capacity, drop_ctx)` runs exactly once.
+    /// callback — *the* owned, `Send` constructor for the cross-core
+    /// RX path (NIC zero-copy RX, pool slabs). On drop, `drop_fn(base,
+    /// capacity, drop_ctx)` runs exactly once with the original
+    /// `(base, capacity)` regardless of how offset/len shifted. To
+    /// land the result in a (borrow-mixing) `IOBuf` chain, widen it
+    /// with `From<OwnedIOBuf>`.
     ///
-    /// SAFETY: identical contract to [`IOBuf::wrap_owned`] — the
-    /// region is valid + exclusively owned for the IOBuf's lifetime,
-    /// `offset + len <= capacity`, and `(drop_fn, drop_ctx)` is
-    /// Send-safe and sound to invoke once at drop time.
+    /// SAFETY: the caller MUST guarantee:
+    ///   * `base..base+capacity` is a valid, exclusively-owned byte
+    ///     region for the IOBuf's lifetime.
+    ///   * `offset + len <= capacity`.
+    ///   * `drop_fn(base, capacity, drop_ctx)` is sound to invoke
+    ///     once at drop time.
+    ///   * The pair is Send-safe: the eventual drop runs on whichever
+    ///     worker owns the IOBuf at drop time.
     pub unsafe fn wrap_owned(
         base: NonNull<u8>,
         capacity: u32,
@@ -688,7 +659,7 @@ mod tests {
     /// `IOBufChain` primitives, exercising the drop callback from a
     /// separate thread.
     mod mock_nic_rx {
-        use crate::{IOBuf, IOBufChain, IOBufDropFn};
+        use crate::{Chain, IOBufDropFn, OwnedIOBuf};
         extern crate std;
         use core::ptr::NonNull;
         use std::boxed::Box;
@@ -719,16 +690,21 @@ mod tests {
         }
 
         /// Simulate a driver's `poll_qp`: wrap the mock device buffer
-        /// as a one-part owned `IOBufChain` and hand it to `callback`.
-        fn mock_poll_qp(nic: &Arc<MockNic>, frame_len: usize, callback: impl FnOnce(IOBufChain)) {
+        /// as a one-part `Chain<OwnedIOBuf>` — the exact shape a real
+        /// driver's RX poll now produces — and hand it to `callback`.
+        fn mock_poll_qp(
+            nic: &Arc<MockNic>,
+            frame_len: usize,
+            callback: impl FnOnce(Chain<OwnedIOBuf>),
+        ) {
             let base = NonNull::new(nic.region.as_ptr() as *mut u8).unwrap();
             let capacity = nic.region.len() as u32;
             let ctx = Arc::into_raw(Arc::clone(nic)) as *mut ();
             // SAFETY: `region` outlives the IOBuf (kept alive by the
             // parked Arc ref); `0 + frame_len <= capacity`;
             // `mock_repost` is sound to invoke once at drop.
-            let iobuf = unsafe {
-                IOBuf::wrap_owned(
+            let owned = unsafe {
+                OwnedIOBuf::wrap_owned(
                     base,
                     capacity,
                     0,
@@ -737,19 +713,8 @@ mod tests {
                     ctx,
                 )
             };
-            callback(IOBufChain::from(iobuf));
+            callback(Chain::from(owned));
         }
-
-        /// A one-part owned RX chain moved across a thread boundary.
-        /// `IOBuf` is `!Send` (the `Borrowed` variant taints the
-        /// whole enum), so a struct-level `unsafe impl Send` is
-        /// needed here — the very thing the type-model split removes
-        /// once the RX path is typed `Chain<OwnedIOBuf>`.
-        ///
-        /// SAFETY: the only `IOBuf` inside is an `External` one,
-        /// produced by `mock_poll_qp` — never a `Borrowed` part.
-        struct SendChain(IOBufChain);
-        unsafe impl Send for SendChain {}
 
         #[test]
         fn rx_chain_drop_callback_reposts_cross_thread() {
@@ -761,17 +726,21 @@ mod tests {
             });
             let region_base = nic.region.as_ptr() as usize;
 
-            let mut captured: Option<SendChain> = None;
+            // A `Chain<OwnedIOBuf>` is `Send` *by derivation* — it
+            // crosses the thread boundary with no `unsafe impl Send`
+            // wrapper, the very thing the type-model split removes
+            // from the cross-core RX path.
+            let mut captured: Option<Chain<OwnedIOBuf>> = None;
             mock_poll_qp(&nic, 1400, |chain| {
                 assert_eq!(chain.part_count(), 1, "single-buffer frame is a 1-part chain");
                 assert_eq!(chain.total_len(), 1400);
-                captured = Some(SendChain(chain));
+                captured = Some(chain);
             });
             assert_eq!(nic.repost_count.load(Ordering::Relaxed), 0);
 
-            let send_chain = captured.take().unwrap();
+            let chain = captured.take().unwrap();
             let worker = thread::spawn(move || {
-                drop(send_chain); // fires `mock_repost` on this thread
+                drop(chain); // fires `mock_repost` on this thread
             });
             worker.join().unwrap();
 
@@ -919,7 +888,10 @@ mod tests {
         {
             // SAFETY: storage outlives the IOBuf in this block; the
             // callback reconstructs the Arc from ctx and lets it drop.
-            let mut buf = unsafe { IOBuf::wrap_owned(ptr, 32, 5, 8, cb, ctx) };
+            // `wrap_owned` produces an `OwnedIOBuf`; widen it to the
+            // mutable `IOBuf` this test exercises.
+            let mut buf =
+                IOBuf::from(unsafe { OwnedIOBuf::wrap_owned(ptr, 32, 5, 8, cb, ctx) });
             assert_eq!(buf.data(), b"abcdefgh");
             assert_eq!(buf.headroom(), 5);
             assert_eq!(buf.tailroom(), 19);
@@ -1060,7 +1032,7 @@ mod tests {
         {
             // SAFETY: storage outlives the IOBuf; the callback
             // reconstructs the Arc from ctx and lets it drop.
-            let b = unsafe { IOBuf::wrap_owned(ptr, 16, 0, 4, cb, ctx) };
+            let b = IOBuf::from(unsafe { OwnedIOBuf::wrap_owned(ptr, 16, 0, 4, cb, ctx) });
             let o = b.into_owned();
             assert!(matches!(o.inner, Inner::External(_)));
             assert_eq!(o.data(), b"data");

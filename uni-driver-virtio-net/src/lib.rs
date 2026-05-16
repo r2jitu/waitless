@@ -14,7 +14,7 @@ use core::ptr;
 use core::ptr::NonNull;
 use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
-use uni_iobuf::{IOBuf, IOBufChain, IOBufDropFn};
+use uni_iobuf::{Chain, IOBufDropFn, OwnedIOBuf};
 
 use drivers_infra::{
     log, dsb_st,
@@ -2006,7 +2006,7 @@ unsafe fn rx_repost(qp: usize, buf_phys: u64) {
 
 /// Drop callback for a delivered virtio-net RX `IOBuf` — returns
 /// the descriptor buffer to qp `qp`'s avail ring. Installed by
-/// [`poll_qp`] via [`IOBuf::wrap_owned`]; runs from `IOBuf::drop`,
+/// [`poll_qp`] via [`OwnedIOBuf::wrap_owned`]; runs from `IOBuf::drop`,
 /// possibly on a core other than the one that received the frame.
 ///
 /// `ctx` is the `qp` index packed as a pointer; `base` is the RX
@@ -2041,7 +2041,7 @@ unsafe fn virtio_rx_repost(base: NonNull<u8>, _capacity: u32, ctx: *mut ()) {
 /// as an owned one-part [`IOBufChain`] wrapping the descriptor
 /// buffer; `virtio_rx_repost` re-arms the descriptor when the
 /// chain drops.
-fn poll_qp(qp: usize, callback: fn(IOBufChain)) -> usize {
+fn poll_qp(qp: usize, callback: fn(Chain<OwnedIOBuf>)) -> usize {
     unsafe {
         if let Transport::None = (*ndev()).transport { return 0; }
     }
@@ -2087,7 +2087,7 @@ fn poll_qp(qp: usize, callback: fn(IOBufChain)) -> usize {
                 // drop and is panic-safe; `qp` packed in `ctx`
                 // survives the cross-core move `ExternalOwned`
                 // allows.
-                let iobuf = IOBuf::wrap_owned(
+                let owned = OwnedIOBuf::wrap_owned(
                     NonNull::new_unchecked(buf),
                     BUFFER_SIZE,
                     VIRTIO_NET_HDR_SIZE as u32,
@@ -2095,7 +2095,7 @@ fn poll_qp(qp: usize, callback: fn(IOBufChain)) -> usize {
                     virtio_rx_repost as IOBufDropFn,
                     qp as *mut (),
                 );
-                callback(IOBufChain::from(iobuf));
+                callback(Chain::from(owned));
             } else {
                 // Runt frame — no payload past the virtio-net
                 // header, so there's no IOBuf to deliver. Re-arm
@@ -2131,7 +2131,7 @@ fn poll_qp(qp: usize, callback: fn(IOBufChain)) -> usize {
 }
 
 /// All-queues fan-out wrapper.
-fn poll(callback: fn(IOBufChain)) -> usize {
+fn poll(callback: fn(Chain<OwnedIOBuf>)) -> usize {
     let n = unsafe { (*ndev()).negotiated_queue_pairs as usize }.max(1);
     let mut total = 0;
     for qp in 0..n {

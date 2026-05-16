@@ -18,7 +18,7 @@ use core::ptr;
 use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
 use drivers_infra::mmio_write32;
-use uni_iobuf::IOBufChain;
+use uni_iobuf::{Chain, OwnedIOBuf};
 
 use crate::{
     put_be16, put_be64, read_be16, record_tx_desc, tx_desc_kind, BAR2_VA,
@@ -695,7 +695,7 @@ pub(crate) fn submit_tx_udp_gso_inner(
 /// drops. `consumed` counts completions drained (= device buffers
 /// reposted); `delivered` counts frames a slab was actually
 /// allocated for — they differ only when the pool is exhausted.
-pub(crate) fn poll_qp_inner<F: FnMut(IOBufChain)>(qp: usize, mut callback: F) -> u32 {
+pub(crate) fn poll_qp_inner<F: FnMut(Chain<OwnedIOBuf>)>(qp: usize, mut callback: F) -> u32 {
     if qp >= MAX_QUEUE_PAIRS {
         return 0;
     }
@@ -742,41 +742,41 @@ pub(crate) fn poll_qp_inner<F: FnMut(IOBufChain)>(qp: usize, mut callback: F) ->
 
         let len = read_be16(desc, RX_DESC_LEN_OFF) as usize;
         if len > 0 {
-            // Copy the frame into a recycle-pool slab. The device
-            // QPL page is reposted at end of batch regardless, so
-            // the bytes must be copied out before then.
-            match rx.rx_pool.as_ref().and_then(|p| p.alloc()) {
-                Some(mut slab) => {
-                    let page_va = rx.qpl_base_va as usize + idx * (PAGE_SIZE as usize);
-                    // SAFETY: `page_va` is the QPL page assigned to
-                    // slot `idx`, DMA-coherent memory from `init`;
-                    // `RX_DATA_OFFSET_IN_PAGE + len <= PAGE_SIZE` by
-                    // device contract (one packet per page, MTU +
-                    // headers fits well under 4 KiB).
-                    let frame: &[u8] = unsafe {
-                        core::slice::from_raw_parts(
-                            (page_va + RX_DATA_OFFSET_IN_PAGE) as *const u8,
-                            len,
-                        )
-                    };
-                    if slab.append_slice(frame).is_ok() {
-                        if qp < RX_BYTES_PER_QP.len() {
-                            RX_BYTES_PER_QP[qp].fetch_add(len as u64, Ordering::Relaxed);
-                        }
-                        callback(IOBufChain::from(slab));
-                        delivered += 1;
+            // Borrow the frame in the device QPL page. The page is
+            // reposted at end of batch regardless, so the bytes must
+            // be copied into a recycle-pool slab before then.
+            //
+            // SAFETY: `page_va` is the QPL page assigned to slot
+            // `idx`, DMA-coherent memory from `init`;
+            // `RX_DATA_OFFSET_IN_PAGE + len <= PAGE_SIZE` by device
+            // contract (one packet per page, MTU + headers fits well
+            // under 4 KiB).
+            let page_va = rx.qpl_base_va as usize + idx * (PAGE_SIZE as usize);
+            let frame: &[u8] = unsafe {
+                core::slice::from_raw_parts(
+                    (page_va + RX_DATA_OFFSET_IN_PAGE) as *const u8,
+                    len,
+                )
+            };
+            // `alloc` copies `frame` into a pooled slab and hands
+            // back a filled, `Send`-able `OwnedIOBuf` — the copy
+            // lives in the pool because only the pool knows its
+            // slabs are writable. The slab recycles to the pool when
+            // its IOBuf drops, possibly on another core.
+            match rx.rx_pool.as_ref().and_then(|p| p.alloc(frame)) {
+                Some(slab) => {
+                    if qp < RX_BYTES_PER_QP.len() {
+                        RX_BYTES_PER_QP[qp].fetch_add(len as u64, Ordering::Relaxed);
                     }
-                    // `append_slice` fails only on an oversize frame
-                    // (> slab tailroom); slabs are MTU-sized so a
-                    // standard frame always fits. An oversize frame
-                    // is dropped — the slab recycles when it drops.
+                    callback(Chain::from(slab));
+                    delivered += 1;
                 }
                 None => {
-                    // Recycle pool exhausted — drop the frame. The
-                    // device page is still reposted below, so the
-                    // device ring stays consistent with the
-                    // completion ring; TCP retransmit / UDP retry
-                    // recover the lost frame.
+                    // Recycle pool exhausted (or — never in practice
+                    // — an oversize frame): drop it. The device page
+                    // is still reposted below, so the device ring
+                    // stays consistent with the completion ring;
+                    // TCP retransmit / UDP retry recover the frame.
                     if qp < GQI_RECYCLE_POOL_EXHAUSTED.len() {
                         GQI_RECYCLE_POOL_EXHAUSTED[qp].fetch_add(1, Ordering::Relaxed);
                     }

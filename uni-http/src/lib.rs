@@ -18,7 +18,7 @@ extern crate uni_iobuf;
 // depend on `uni-http`) can use the same type without crossing
 // the transport↛app dependency boundary.
 pub use uni_iobuf::{
-    Cursor as IOBufCursor, IOBuf, IOBufChain, IOBufError, IOBufWriter,
+    Cursor as IOBufCursor, IOBuf, IOBufChain, IOBufError, IOBufWriter, OwnedIOBuf,
 };
 
 use alloc::sync::Arc;

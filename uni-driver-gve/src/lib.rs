@@ -49,7 +49,7 @@ mod diag;
 pub mod dqo;
 mod gqi;
 
-use uni_iobuf::{IOBufChain, IOBufPool};
+use uni_iobuf::{Chain, IOBufPool, OwnedIOBuf};
 
 // Re-export diagnostic counters + descriptor-log helpers so the
 // DQO/GQI submodules can `use crate::TX_PACKETS_PER_QP` etc.
@@ -1662,7 +1662,7 @@ fn post_initial_rx() {
 
 /// Drain the RX completion ring for the given queue pair, dispatching
 /// to the GQI or DQO datapath based on the negotiated queue format.
-fn poll_qp_inner<F: FnMut(IOBufChain)>(qp: usize, callback: F) -> u32 {
+fn poll_qp_inner<F: FnMut(Chain<OwnedIOBuf>)>(qp: usize, callback: F) -> u32 {
     if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
         dqo::poll_qp_inner(qp, callback)
     } else {
@@ -1888,7 +1888,7 @@ fn num_queue_pairs() -> u16 {
 // hole: the buffer always reposts when the chain drops, and never
 // before — so re-arm provably cannot race a live consumer.
 
-fn poll_qp(qp: usize, callback: fn(IOBufChain)) -> usize {
+fn poll_qp(qp: usize, callback: fn(Chain<OwnedIOBuf>)) -> usize {
     poll_qp_inner(qp, callback) as usize
 }
 
@@ -1896,7 +1896,7 @@ fn poll_qp(qp: usize, callback: fn(IOBufChain)) -> usize {
 /// don't know which RX queue a given packet landed on, so walk
 /// every live queue. RSS is active by the time `init()` returns,
 /// and DHCP's reply may hash onto any queue — not just qp 0.
-fn poll(callback: fn(IOBufChain)) -> usize {
+fn poll(callback: fn(Chain<OwnedIOBuf>)) -> usize {
     let n = NUM_QP.load(Ordering::Acquire) as usize;
     let mut total: usize = 0;
     for qp in 0..n.min(MAX_QUEUE_PAIRS) {
