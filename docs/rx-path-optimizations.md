@@ -113,7 +113,7 @@ a 100 MB POST). See item L for the follow-on plan.
   correctness (Borrowed → Heap content identity).
 
 ### B. NicOps RX callback delivers `IOBufChain`
-- **Status**: [ ]
+- **Status**: [x] landed 2026-05-16 — commit `103202d`
 - **Where**:
   * [`uni-net/src/driver.rs`](uni-net/src/driver.rs) — `NicOps`
     struct (change `poll_qp: fn(usize, fn(&[u8])) -> usize` to
@@ -594,3 +594,86 @@ unikernel builds, and `test_hvf`.
 
 Next: item B (`NicOps` RX callback delivers `IOBufChain`) — a
 larger atomic change across 5 files; tracked for its own session.
+
+### 2026-05-16 — Phase 2/3, item B: `NicOps` RX callback delivers `IOBufChain` ([x] **landed** — commit `103202d`)
+
+Atomic trait-signature change: `NicOps::poll_rx` / `poll_qp` now
+deliver an owned `IOBufChain` per frame instead of a borrowed
+`&[u8]`. The trait + all three NIC drivers + net dispatch landed in
+one commit (`103202d`) — a signature change can't land
+incrementally; the `/stats` counter wiring followed in `2579a13`.
+
+- **DQO** wraps the device `buf_id` RX buffer as `ExternalOwned`;
+  the `dqo_repost` drop callback reposts `buf_id` to the data ring
+  (atomic `fill_cnt` + per-write BAR2 doorbell). The slice path's
+  explicit inline repost is deleted.
+- **GQI** can't lend device QPL pages (strict in-order repost), so
+  it copies each frame into a slab from a per-qp `IOBufPool` (item
+  A's pool), reposts the device page at the batch boundary, and
+  delivers the slab — which recycles to the pool on drop.
+- **virtio-net** wraps the descriptor buffer as `ExternalOwned`;
+  the drop callback zeroes the virtio header and returns it to the
+  avail ring.
+
+Every drop callback is panic-safe — it runs from `IOBuf::drop`,
+possibly cross-core, and leaks rather than panics on an impossible
+bad queue index (a panic in a `no_std` `Drop` is poison). New
+per-qp counters `RX_BUF_REPOST_COUNT` / `GQI_RECYCLE_POOL_EXHAUSTED`
+surfaced via `/stats`.
+
+Verified: x86_64 + aarch64 unikernel builds; `test_hvf` (exercises
+the virtio-net repost path under the 30-conn TLS burst);
+`iobuf_test` (new mock-driver test fires an `ExternalOwned` drop
+callback from a separate thread, checking base/capacity + the
+repost counter).
+
+Perf — controlled pre-B (`ae14530`) vs post-B (`103202d`) benches,
+identical hardware, 3 runs each so only the code differs.
+
+**Local HVF (virtio-net), 1c** — the cleanest measurement:
+
+| workload | pre-B | post-B | Δ |
+|---|---|---|---|
+| `get_tcp` | 194.3 k | 189.4 k | −2.6% |
+| `get_tcp_single` | 37.4 k | 37.0 k | −1.2% |
+| `get_tcp_fresh` | 26.6 k | 26.3 k | −1.2% |
+| `get_tls_fresh` | 2994 | 2951 | −1.4% |
+| `upload_32k_tcp` | 22.6 k | 22.1 k | −2.5% |
+| `download_64k_tcp` | 8907 | 8654 | −2.8% |
+
+Item B costs **~2 % on the virtio-net fast path** — a small,
+*uniform* per-frame cost (`IOBuf::wrap_owned` + `IOBufChain::from`
++ chain walk + `ExternalOwned::drop`, once per received frame; the
+uniformity across every workload is the signature of a fixed
+per-frame cost). QEMU-TCG magnifies it to −5…−9 % on throughput
+workloads — TCG translates every added guest instruction. This is
+within the plan's ±3 % pre-H tolerance and is the expected shape of
+"plumbing": items C and H *remove* memcpys and are budgeted to more
+than recoup it. Item B is **not** perf-neutral — it is a small,
+deliberate cost paid up front for the owned-chain architecture.
+
+**GCE gve**, on-demand n2 / c3, pre-B vs post-B at 1/4/8 cores:
+
+| path | `get_tcp` 1c/4c/8c | `get_tls_fresh` | `upload_32k_tcp` |
+|---|---|---|---|
+| DQO (c3 / `DQO_RDA`) | within ±2 % | −1.5 % | +0.4 % |
+| GQI (n2 / `GQI_QPL`) | +1 % / −0.5 % / −0.1 % | +1 % | +3…+4 % |
+
+On real gve the ~2 % RX-path cost sits below the measurement floor
+(8 cores, PCIe/network latency dominates, ±2–3 % run noise) — DQO
+and GQI both read flat. The GQI slab-copy specifically is ~0 %
+(even slightly favourable on `upload`): the copy is one cache-hot
+MTU read+write. The GQI 1/4/8 sweep was first attempted on spot
+VMs and repeatedly corrupted by n2 preemption; the figures above
+are a clean re-run on **on-demand** n2 (`UNIKERNEL_GCE_PREEMPTIBLE=0`).
+
+**Functional validation** (the part that de-risks the new code):
+>2 billion buffer reposts cycled across the DQO+GQI runs under
+sustained load with **zero** `dqo_rx_compl_skipped` and **zero**
+`gqi_recycle_pool_exhausted`. A leaking drop callback would have
+starved the RX ring within seconds; none did.
+
+Next: item C (`RxInbox` holds `IOBufChain` — cross-core zero-copy),
+the natural follow-on now that the driver boundary yields owned
+chains — and the first item that starts *removing* memcpys, which
+recoups item B's ~2 %.
