@@ -1156,6 +1156,27 @@ fn stats_response() -> Response {
             uni_driver_gve::dqo::DQO_RX_LAST_SKIP_STATUS.load(core::sync::atomic::Ordering::Relaxed),
         );
 
+        // RX-path item B counters, summed across queue pairs.
+        // `rx_buf_repost_count` is the cross-core drop-callback
+        // sanity check: every received frame's buffer must repost,
+        // so this tracks the per-qp RX frame count — a shortfall
+        // means a chain's IOBuf isn't dropping. `gqi_recycle_pool_
+        // exhausted` stays 0 unless GQI's recycle pool can't keep
+        // up with a slow consumer.
+        let rx_buf_repost: u64 = uni_driver_gve::RX_BUF_REPOST_COUNT
+            .iter()
+            .map(|c| c.load(core::sync::atomic::Ordering::Relaxed))
+            .sum();
+        let gqi_pool_exhausted: u64 = uni_driver_gve::GQI_RECYCLE_POOL_EXHAUSTED
+            .iter()
+            .map(|c| c.load(core::sync::atomic::Ordering::Relaxed))
+            .sum();
+        let _ = write!(
+            w,
+            ",\"rx_buf_repost_count\":{},\"gqi_recycle_pool_exhausted\":{}",
+            rx_buf_repost, gqi_pool_exhausted,
+        );
+
         // SYN-ingress vs SYN-ACK-egress counters. Compared against
         // a client-side pcap (or nstat TcpActiveOpens/SynRetrans)
         // these localize ingress drops below the TCP stack:
