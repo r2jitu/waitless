@@ -76,20 +76,25 @@ written twice — thin, mechanical, macro-able — but only dispatch).
 
 - **`IOBuf`** — a flat `!Send` enum over all four structs. `Inner`
   stays private; `IOBuf`'s public surface is preserved, so the
-  TX-path diff is near-zero. The TX path keeps `IOBuf`.
-- **`OwnedIOBuf`** — a flat enum over **`{Heap, External}`** only.
-  Two properties, not one: `Send` **auto-derives** (no `Borrowed`),
-  *and* it is **uniformly writable** (`Heap` owns a `Box`;
-  `External` owns a region per `wrap_owned`'s exclusively-owned
-  contract) — so `OwnedIOBuf::data_mut() -> &mut [u8]` is
-  **infallible**. `Static` is deliberately excluded: it is `Send`
-  but *not* writable, and keeping `OwnedIOBuf` uniformly writable is
-  what lets a future TLS RX path decrypt **in place** in the RX
-  buffer and drop `pt_buf` as a copy boundary.
+  TX-path diff is near-zero. The TX path keeps `IOBuf` — including
+  `IOBufWriter`, the `fmt::Write` render adapter, which stays
+  `IOBuf`-typed.
+- **`OwnedIOBuf`** — a flat enum over **`{Heap, External}`** only;
+  `Send` **auto-derives** (no `Borrowed`). `Static` is excluded as
+  a modelling choice, *not* a `Send` requirement (`Static` is
+  itself `Send`): a `&'static [u8]` is an *immortal borrow*, not
+  owned storage, so it stays in `IOBuf` with the other non-owning
+  view. Both remaining variants happen to be writable, so
+  `OwnedIOBuf` could later expose an infallible `data_mut()` — but
+  treat that as a latent affordance, not a motivation: it would
+  require tightening `wrap_owned`'s safety contract from
+  "exclusively-owned" to "exclusively-owned **and writable**"
+  (exclusive ≠ writable), and no RX-path site mutates an
+  `OwnedIOBuf` today.
 - **`Static` lives only in `IOBuf`.** Static bodies (HTML literals,
   the QPACK table) are TX-path; no cross-core path carries a
-  `Static`, so excluding it from the cross-core type costs that
-  path nothing.
+  `Static`, so excluding it from the owned type costs that path
+  nothing.
 
 **Conversions are one-way.**
 
@@ -97,7 +102,11 @@ written twice — thin, mechanical, macro-able — but only dispatch).
   the split adds, exercised at the **app RX API boundary**: a
   `BodyReader` spans RX-buffer-backed chunks (`OwnedIOBuf`) and
   prebuf-backed chunks (`Borrowed`) *within one body*, so it holds
-  `IOBuf`; RX buffers widen in. Infallible.
+  `IOBuf`; RX buffers widen in. Infallible, and applied
+  **per-chunk** — as each `OwnedIOBuf` surfaces from `recv_chunk`,
+  O(1) each. It must *not* be applied eagerly to a whole
+  `Chain<OwnedIOBuf>`: that would be an O(parts) re-tag + `VecDeque`
+  realloc on the RX hot path.
 - **No narrowing.** Nothing converts `IOBuf → OwnedIOBuf`. The
   cross-core path is *born* `OwnedIOBuf` — `wrap_owned` /
   `IOBufPool::alloc` produce it, and it stays `OwnedIOBuf` through
@@ -114,10 +123,11 @@ written twice — thin, mechanical, macro-able — but only dispatch).
   materializes the borrow so it outlives its source. Orthogonal to
   the split.
 
-- **`IOBufChain → Chain<B>`** — a `VecDeque<B>` + cached length.
-  `Chain<OwnedIOBuf>` is `Send` by derivation; `Chain<IOBuf>` is
-  `!Send`. Keep `type IOBufChain = Chain<IOBuf>` for a near-zero
-  TX-path diff.
+- **`IOBufChain → Chain<B>`** — a `VecDeque<B>` + cached length;
+  `B: IOBufRead` throughout (maintaining the cached `total_len`
+  alone needs `B::len()`). `Chain<OwnedIOBuf>` is `Send` by
+  derivation; `Chain<IOBuf>` is `!Send`. Keep `type IOBufChain =
+  Chain<IOBuf>` for a near-zero TX-path diff.
 - **`IOBufRead` trait** — the **read** surface (`data`, `len`,
   `headroom`, `tailroom`), implemented by `IOBuf`, `OwnedIOBuf`,
   and the structs. It is the bound *read-only* chain consumers are
@@ -160,9 +170,10 @@ already covers it — a cross-core TX chain is just `Chain<OwnedIOBuf>`
 `Static` parts to `Heap`). Strategy then mirrors the DQO/GQI split:
 *convert-at-crossing* (rare) vs *owned-from-origin pool* (common).
 Note `Borrowed` parts must copy at the crossing — re-opening the
-"Why keep `Borrowed`" fork — and `Static` parts too, which is the
-tell that "writable" and "`Send`" would then want to be separate
-properties rather than both bundled into `OwnedIOBuf`.
+"Why keep `Borrowed`" fork — and `Static` parts too, even though
+`Static` is already `Send`: the tell that cross-core TX wants a
+*`Send` superset* (`{Heap, External, Static}`), distinct from
+`OwnedIOBuf`'s *owned* set.
 
 ## What this buys
 
@@ -171,9 +182,6 @@ properties rather than both bundled into `OwnedIOBuf`.
   invariant both **delete**.
 - A `Borrowed` buffer physically cannot reach a cross-core path: a
   compile error, not silent UB.
-- `OwnedIOBuf` is uniformly writable → infallible `data_mut()`,
-  pre-positioning for in-place TLS RX decrypt (drops `pt_buf` as a
-  copy boundary).
 - The only `unsafe impl Send` left is on `ExternalOwned` — the
   genuine leaf where a raw region + drop_fn's thread-safety is
   asserted per the `wrap_owned` contract. One localized, documented
