@@ -6,7 +6,7 @@
 pub mod error;
 pub use error::{DhcpError, NetError, NicError};
 
-pub use uni_iobuf::IOBuf;
+pub use uni_iobuf::{IOBuf, IOBufChain};
 
 use core::sync::atomic::{AtomicPtr, Ordering};
 
@@ -344,24 +344,37 @@ pub struct NicOps {
         csum_start: u16,
         gso_size: u16,
     )>,
-    /// RX callback: the driver passes a `&[u8]` slice covering the
-    /// L2 frame (Eth + IP + L4 + payload) backed by the driver's
-    /// internal pool storage. The slice is valid for the duration
-    /// of the callback only — the driver re-arms the underlying
-    /// buffer as soon as the callback returns, so a consumer that
-    /// wants to retain bytes past return MUST copy them out.
+    /// RX callback: the driver delivers each received L2 frame
+    /// (Eth + IP + L4 + payload) as an **owned** [`IOBufChain`].
+    /// A single-buffer frame is a one-part chain (the zero-alloc
+    /// `Single` arm); a hardware-coalesced super-segment is a
+    /// multi-part chain (item I). The callback takes the chain by
+    /// value — it owns it, and may retain it past return.
     ///
-    /// The earlier shape handed out an owned `IOBuf::ExternalOwned`
-    /// that the consumer could retain across awaits, but that made
-    /// correctness depend on consumer drop latency being shorter
-    /// than the device's ring-wrap window (~23 ms on a 512-deep
-    /// gVNIC ring at GCE rates). A handler that stalled (slow
-    /// `.await`, TX spin) would read into a page the device had
-    /// already overwritten — silent data corruption. The slice
-    /// shape forces the copy synchronously and makes re-arm
-    /// trivially safe.
-    pub poll_rx: fn(fn(&[u8])) -> usize,
-    pub poll_qp: fn(usize, fn(&[u8])) -> usize,
+    /// Each part is an `IOBuf` whose drop callback returns the
+    /// backing storage to the device or pool:
+    ///   * DQO / virtio-net wrap the device's own RX buffer as
+    ///     `ExternalOwned`; the drop callback reposts that buffer
+    ///     to the receive ring (zero-copy delivery).
+    ///   * GQI cannot lend device buffers (strict in-order
+    ///     repost), so it copies each frame into a pooled MTU
+    ///     slab and delivers that; the slab recycles to the pool
+    ///     on drop.
+    ///
+    /// This is the shape that replaced an earlier borrowed-`&[u8]`
+    /// design. The slice form forced a synchronous copy at the
+    /// driver boundary and made cross-core delivery a memcpy; the
+    /// owned chain lets the net stack thread RX bytes through to
+    /// the application without that copy. The earlier *first*
+    /// attempt at owned delivery was unsound because it had no
+    /// auto-repost — a stalled consumer could pin a device buffer
+    /// past the ring-wrap window. `ExternalOwned`'s drop callback
+    /// (item A) closes that hole: the buffer always reposts when
+    /// the chain drops, wherever and whenever that happens. Each
+    /// driver's drop callback MUST be panic-safe — it can run from
+    /// `IOBuf::drop` on any core.
+    pub poll_rx: fn(fn(IOBufChain)) -> usize,
+    pub poll_qp: fn(usize, fn(IOBufChain)) -> usize,
 
     // ── Config / bring-up ───────────────────────────────────────────
     pub get_mac: fn(*mut u8),
@@ -560,8 +573,8 @@ pub fn linked_ethernet_drivers() -> &'static [EthernetDriverReg] {
 // one Acquire load + one direct fn-pointer call.
 
 fn null_send(_: &[u8]) {}
-fn null_poll(_: fn(&[u8])) -> usize { 0 }
-fn null_poll_qp(_: usize, _: fn(&[u8])) -> usize { 0 }
+fn null_poll(_: fn(IOBufChain)) -> usize { 0 }
+fn null_poll_qp(_: usize, _: fn(IOBufChain)) -> usize { 0 }
 fn null_probe() -> bool { false }
 fn null_get_mac(_: *mut u8) {}
 fn null_num_queue_pairs() -> u16 { 1 }

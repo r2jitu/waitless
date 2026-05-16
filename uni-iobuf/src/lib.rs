@@ -2027,6 +2027,160 @@ impl From<alloc::string::String> for IOBuf {
 mod tests {
     use super::*;
 
+    /// Mock-NIC RX-delivery tests for the contract the item-B
+    /// `NicOps` poll callback depends on: a driver hands up a
+    /// received frame as an **owned** [`IOBufChain`] whose
+    /// `ExternalOwned` `IOBuf`, on drop, reposts the backing buffer
+    /// via its drop callback — and that drop may run on a core
+    /// other than the one that received the frame.
+    ///
+    /// The real drivers' drop callbacks (DQO data-ring repost, GQI
+    /// pool recycle, virtio avail-ring push) touch
+    /// `target_os = "none"` hardware state and can't run
+    /// host-native; this mock reproduces the *shape* against the
+    /// same `wrap_owned` / `IOBufChain` primitives the drivers use,
+    /// and exercises the drop callback from a separate thread — the
+    /// std-test stand-in for the cross-core drop item C introduces.
+    mod mock_nic_rx {
+        use crate::{IOBuf, IOBufChain, IOBufDropFn};
+        extern crate std;
+        use core::ptr::NonNull;
+        use std::boxed::Box;
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+
+        /// Stand-in for a NIC's RX ring: a fixed buffer region plus
+        /// the `RX_BUF_REPOST_COUNT`-style counter every real
+        /// driver bumps from its repost path, and a record of the
+        /// `(base, capacity)` the drop callback was handed.
+        /// `Send + Sync` (a `Box` region + atomics) so the callback
+        /// can recycle into it from any thread — the property the
+        /// real `ExternalOwned` drop relies on for cross-core
+        /// safety.
+        struct MockNic {
+            region: Box<[u8]>,
+            repost_count: AtomicU64,
+            last_base: AtomicUsize,
+            last_capacity: AtomicUsize,
+        }
+
+        /// Drop callback installed on every mock RX `IOBuf`.
+        /// Mirrors the real drivers' repost callbacks: reconstruct
+        /// the device handle from `ctx`, record what came back,
+        /// bump the repost counter. Panic-safe — no `unwrap`, no
+        /// indexing — because a panic in `IOBuf::drop` is poison
+        /// under `#![no_std]`.
+        ///
+        /// SAFETY: `ctx` is an `Arc::<MockNic>::into_raw` pointer
+        /// installed by `mock_poll_qp`, reclaimed exactly once here.
+        unsafe fn mock_repost(base: NonNull<u8>, capacity: u32, ctx: *mut ()) {
+            // SAFETY: per the contract above, `ctx` is a live,
+            // not-yet-reclaimed `Arc::<MockNic>::into_raw` pointer.
+            let nic: Arc<MockNic> = unsafe { Arc::from_raw(ctx as *const MockNic) };
+            nic.last_base.store(base.as_ptr() as usize, Ordering::Relaxed);
+            nic.last_capacity.store(capacity as usize, Ordering::Relaxed);
+            nic.repost_count.fetch_add(1, Ordering::Relaxed);
+            // `nic` drops here, releasing the strong ref the IOBuf
+            // parked in `ctx`.
+        }
+
+        /// Simulate a driver's `poll_qp`: wrap the mock device
+        /// buffer as a one-part owned `IOBufChain` and hand it to
+        /// `callback` — the shape a real driver's RX poll produces.
+        fn mock_poll_qp(nic: &Arc<MockNic>, frame_len: usize, callback: impl FnOnce(IOBufChain)) {
+            let base = NonNull::new(nic.region.as_ptr() as *mut u8).unwrap();
+            let capacity = nic.region.len() as u32;
+            // Park one strong ref in the drop ctx; `mock_repost`
+            // reclaims it — the same `into_raw`/`from_raw` balance
+            // the real pool-backed drop callbacks use.
+            let ctx = Arc::into_raw(Arc::clone(nic)) as *mut ();
+            // SAFETY: `region` outlives the IOBuf (kept alive by the
+            // parked Arc ref); `0 + frame_len <= capacity`;
+            // `mock_repost` is sound to invoke once at drop.
+            let iobuf = unsafe {
+                IOBuf::wrap_owned(
+                    base,
+                    capacity,
+                    0,
+                    frame_len as u32,
+                    mock_repost as IOBufDropFn,
+                    ctx,
+                )
+            };
+            callback(IOBufChain::from(iobuf));
+        }
+
+        /// A one-part owned RX chain moved across a thread
+        /// boundary. `IOBuf` is `!Send` (the `Borrowed` variant
+        /// taints the whole enum), so the cross-core inbox item C
+        /// introduces must wrap the chain in a struct with an
+        /// `unsafe impl Send` — this mirrors that wrapper.
+        ///
+        /// SAFETY: the only `IOBuf` inside is an `ExternalOwned`
+        /// (which is `Send`), produced by `mock_poll_qp` — never a
+        /// `Borrowed` part.
+        struct SendChain(IOBufChain);
+        unsafe impl Send for SendChain {}
+
+        #[test]
+        fn rx_chain_drop_callback_reposts_cross_thread() {
+            let nic = Arc::new(MockNic {
+                region: std::vec![0u8; 2048].into_boxed_slice(),
+                repost_count: AtomicU64::new(0),
+                last_base: AtomicUsize::new(0),
+                last_capacity: AtomicUsize::new(0),
+            });
+            let region_base = nic.region.as_ptr() as usize;
+
+            // Driver poll hands us a one-part owned chain.
+            let mut captured: Option<SendChain> = None;
+            mock_poll_qp(&nic, 1400, |chain| {
+                assert_eq!(chain.part_count(), 1, "single-buffer frame is a 1-part chain");
+                assert_eq!(chain.total_len(), 1400);
+                captured = Some(SendChain(chain));
+            });
+            // Nothing reposted yet — the chain is still alive.
+            assert_eq!(nic.repost_count.load(Ordering::Relaxed), 0);
+
+            // Move the chain onto a worker thread and drop it
+            // there: the drop callback runs on a *different* thread
+            // than the one `mock_poll_qp` produced the chain on.
+            let send_chain = captured.take().unwrap();
+            let worker = thread::spawn(move || {
+                drop(send_chain); // fires `mock_repost` on this thread
+            });
+            worker.join().unwrap();
+
+            // The drop callback ran exactly once, with the
+            // `(base, capacity)` `wrap_owned` was given.
+            assert_eq!(nic.repost_count.load(Ordering::Relaxed), 1);
+            assert_eq!(nic.last_base.load(Ordering::Relaxed), region_base);
+            assert_eq!(nic.last_capacity.load(Ordering::Relaxed), 2048);
+        }
+
+        #[test]
+        fn rx_chain_walk_then_repost_same_thread() {
+            // The item-B net-dispatch shape: the callback walks the
+            // chain's parts (parsing each) and then drops it — so
+            // the repost fires when the walk finishes, here on one
+            // thread.
+            let nic = Arc::new(MockNic {
+                region: std::vec![7u8; 2048].into_boxed_slice(),
+                repost_count: AtomicU64::new(0),
+                last_base: AtomicUsize::new(0),
+                last_capacity: AtomicUsize::new(0),
+            });
+            mock_poll_qp(&nic, 64, |chain| {
+                let walked: usize = chain.iter().map(|p| p.data().len()).sum();
+                assert_eq!(walked, 64);
+                // `chain` drops at the end of this closure → repost.
+            });
+            assert_eq!(nic.repost_count.load(Ordering::Relaxed), 1);
+            assert_eq!(nic.last_capacity.load(Ordering::Relaxed), 2048);
+        }
+    }
+
     #[test]
     fn static_buf_basics() {
         let b = IOBuf::from_static(b"hello");

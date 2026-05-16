@@ -7,7 +7,9 @@ extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
 extern crate net_ethernet as ethernet;
 extern crate uni_drivers;
+extern crate uni_iobuf;
 
+use uni_iobuf::IOBufChain;
 use from_bytes::FromBytes;
 use uni_kernel::sync::Spinlock;
 use types::{MacAddr, Ipv4Addr, CONFIG, htons, ntohs};
@@ -385,11 +387,14 @@ pub fn arp_announce() {
     ethernet_send(MacAddr::BROADCAST, ETHERTYPE_ARP, pkt.as_bytes());
 }
 
-fn arp_poll_callback(frame: &[u8]) {
-    if let Some((ETHERTYPE_ARP, payload)) = ethernet_parse(frame) {
-        arp_receive(payload);
+fn arp_poll_callback(chain: IOBufChain) {
+    for part in chain.iter() {
+        if let Some((ETHERTYPE_ARP, payload)) = ethernet_parse(part.data()) {
+            arp_receive(payload);
+        }
+        // Non-ARP frames are dropped silently — the ARP-resolve
+        // loop only cares about replies.
     }
-    // Non-ARP frames are dropped silently — the ARP-resolve loop
-    // only cares about replies. Slice borrow ends at scope exit;
-    // the driver re-arms the underlying buffer.
+    // `chain` drops at scope exit → each part's drop callback
+    // reposts the backing buffer to the device.
 }

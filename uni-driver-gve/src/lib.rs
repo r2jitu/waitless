@@ -40,6 +40,7 @@
 #![no_std]
 
 extern crate drivers_infra;
+extern crate uni_iobuf;
 extern crate uni_kernel;
 extern crate uni_net_driver;
 
@@ -48,12 +49,18 @@ mod diag;
 pub mod dqo;
 mod gqi;
 
+use uni_iobuf::{IOBufChain, IOBufPool};
+
 // Re-export diagnostic counters + descriptor-log helpers so the
 // DQO/GQI submodules can `use crate::TX_PACKETS_PER_QP` etc.
 // without knowing the diag module exists, and so the public
 // `tx_desc_log_snapshot` keeps its `gve::tx_desc_log_snapshot`
-// path.
-pub use diag::{tx_desc_log_snapshot, TxDescLogEntry};
+// path. `RX_BUF_REPOST_COUNT` / `GQI_RECYCLE_POOL_EXHAUSTED` are
+// `pub` (not `pub(crate)`) so the app's /stats endpoint can read
+// them as `uni_driver_gve::…`.
+pub use diag::{
+    tx_desc_log_snapshot, GQI_RECYCLE_POOL_EXHAUSTED, RX_BUF_REPOST_COUNT, TxDescLogEntry,
+};
 pub(crate) use diag::{
     record_tx_desc, tx_desc_kind, RX_BYTES_PER_QP, TX_BIG_ACQUIRES, TX_BIG_FULL_RETURNS,
     TX_BYTES_PER_QP, TX_PACKETS_PER_QP, TX_SMALL_ACQUIRES, TX_SMALL_FULL_SPINS, TX_SMALL_SCAN_ITERS,
@@ -303,6 +310,15 @@ pub(crate) struct RxQueue {
     /// completion entry was just written by the device" without a
     /// separate producer-index read.
     pub(crate) expected_seq: AtomicU8,
+    /// RX recycle pool — `Some` for GQI_QPL, `None` for DQO_RDA.
+    /// GQI can't lend its device QPL pages up the stack (strict
+    /// in-order repost), so `gqi::poll_qp_inner` copies each frame
+    /// into a slab from this pool and delivers the slab; DQO lends
+    /// its device buffers directly and needs no pool. Set once at
+    /// init in `finalize_rx_queue`; an `IOBufPool` is a cheap
+    /// clonable `Arc` handle, so each issued slab keeps the pool's
+    /// backing region alive on its own.
+    pub(crate) rx_pool: Option<IOBufPool>,
 }
 
 /// The two queue formats we actually support. GCE today advertises
@@ -1452,7 +1468,7 @@ fn finalize_tx_queue(qp: u32, alloc: &TxAlloc, fmt: QueueFormat) {
     }
 }
 
-fn finalize_rx_queue(qp: u32, alloc: &RxAlloc, _fmt: QueueFormat) {
+fn finalize_rx_queue(qp: u32, alloc: &RxAlloc, fmt: QueueFormat) {
     let db_index;
     unsafe {
         let bytes = slice_at(alloc.qres_va, 8);
@@ -1464,6 +1480,17 @@ fn finalize_rx_queue(qp: u32, alloc: &RxAlloc, _fmt: QueueFormat) {
     // starting at 1 (ring is zeroed, device fills with current gen,
     // flips each wrap).
     let initial_seq: u8 = 1;
+    // GQI's RX poll copies each frame into a recycle-pool slab —
+    // it can't lend device QPL pages up the stack. DQO lends its
+    // device buffers directly (no pool). Build the pool before
+    // taking `STATE` so the 512 KiB slab-region allocation +
+    // zero-fill doesn't run under the spinlock.
+    let rx_pool = match fmt {
+        QueueFormat::GqiQpl => {
+            Some(IOBufPool::new(gqi::GQI_RX_POOL_SLABS, gqi::GQI_RX_SLAB_SIZE))
+        }
+        QueueFormat::DqoRda => None,
+    };
     let mut st = STATE.lock();
     if let Some(s) = st.as_mut() {
         s.rx[qp as usize] = Some(RxQueue {
@@ -1476,6 +1503,7 @@ fn finalize_rx_queue(qp: u32, alloc: &RxAlloc, _fmt: QueueFormat) {
             fill_cnt: AtomicU32::new(0),
             cons_cnt: AtomicU32::new(0),
             expected_seq: AtomicU8::new(initial_seq),
+            rx_pool,
         });
         let ptr = s.rx[qp as usize].as_ref().unwrap() as *const RxQueue as *mut RxQueue;
         RX_QUEUES[qp as usize].store(ptr, Ordering::Release);
@@ -1634,7 +1662,7 @@ fn post_initial_rx() {
 
 /// Drain the RX completion ring for the given queue pair, dispatching
 /// to the GQI or DQO datapath based on the negotiated queue format.
-fn poll_qp_inner<F: FnMut(&[u8])>(qp: usize, callback: F) -> u32 {
+fn poll_qp_inner<F: FnMut(IOBufChain)>(qp: usize, callback: F) -> u32 {
     if QUEUE_FORMAT_DQO.load(Ordering::Acquire) {
         dqo::poll_qp_inner(qp, callback)
     } else {
@@ -1841,27 +1869,26 @@ fn num_queue_pairs() -> u16 {
 
 // ---- RX (NicOps::poll_rx / poll_qp) --------------------------------------
 //
-// The callback receives a `&[u8]` slice over the QPL page (GQI) or
-// buf_id page (DQO) bytes. The slice is valid only for the duration
-// of the callback — `fill_cnt` advances at the end of the batch
-// (GQI) / repost runs inline (DQO), so the device may overwrite the
-// page as soon as the callback returns. The net stack must copy
-// any bytes it wants to retain past the callback boundary.
+// The callback receives an owned `IOBufChain` per frame (item B):
+//   * DQO wraps the device's buf_id RX buffer as an `ExternalOwned`
+//     IOBuf — zero copy. The `dqo_repost` drop callback returns
+//     buf_id to the data ring when the chain drops, so a consumer
+//     may retain the chain past the callback safely; the buffer is
+//     never re-armed while a live IOBuf still views it.
+//   * GQI cannot lend device QPL pages (strict in-order repost), so
+//     it copies each frame into a recycle-pool slab and delivers
+//     that; the device page is reposted at the batch boundary.
 //
-// This is the correctness-safe shape. An earlier design handed the
-// consumer an owned IOBuf wrapping the page directly (no copy) and
-// advanced `fill_cnt` unconditionally; that worked because consumers
-// dropped the IOBuf within ~µs vs. a ~23 ms device wrap window. But
-// "consumers drop fast enough" was an empirical property, not a
-// type-system guarantee — a request handler that stalled (slow
-// `.await`, TX spin, pipelined keep-alive) could keep an IOBuf live
-// past the wrap, after which reads silently observed bytes the
-// device had overwritten with another packet's data. The slice-shape
-// removes that footgun: re-arm cannot race a consumer because the
-// consumer has provably released the slice by the time the driver
-// re-arms.
+// This replaced an earlier borrowed-`&[u8]` shape that forced a
+// synchronous copy at the driver boundary. The earlier *first*
+// owned-IOBuf attempt was unsound because it had no auto-repost — a
+// stalled consumer could pin a device buffer past the ~23 ms
+// ring-wrap window, after which reads observed bytes the device had
+// overwritten. `ExternalOwned`'s drop callback (item A) closes that
+// hole: the buffer always reposts when the chain drops, and never
+// before — so re-arm provably cannot race a live consumer.
 
-fn poll_qp(qp: usize, callback: fn(&[u8])) -> usize {
+fn poll_qp(qp: usize, callback: fn(IOBufChain)) -> usize {
     poll_qp_inner(qp, callback) as usize
 }
 
@@ -1869,7 +1896,7 @@ fn poll_qp(qp: usize, callback: fn(&[u8])) -> usize {
 /// don't know which RX queue a given packet landed on, so walk
 /// every live queue. RSS is active by the time `init()` returns,
 /// and DHCP's reply may hash onto any queue — not just qp 0.
-fn poll(callback: fn(&[u8])) -> usize {
+fn poll(callback: fn(IOBufChain)) -> usize {
     let n = NUM_QP.load(Ordering::Acquire) as usize;
     let mut total: usize = 0;
     for qp in 0..n.min(MAX_QUEUE_PAIRS) {

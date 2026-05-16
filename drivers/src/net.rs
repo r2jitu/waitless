@@ -7,7 +7,7 @@
 // every dispatcher below is a single load + direct call with no
 // null branch.
 
-use uni_net_driver::{active_ops, is_installed, linked_ethernet_drivers, set_active_ops};
+use uni_net_driver::{active_ops, is_installed, linked_ethernet_drivers, set_active_ops, IOBufChain};
 
 pub use uni_net_driver::{CsumOffload, CsumStampConvention};
 
@@ -31,18 +31,19 @@ pub fn enable_irq() { (active_ops().enable_irq)() }
 
 // ---- RX / TX datapath -----------------------------------------------------
 
-/// Drain every queue pair into `callback`, one `&[u8]` frame slice
-/// per packet. The slice is valid only for the duration of the
-/// callback — callers that need to retain bytes past return must
-/// copy them out. Used by Tier 2 (single-queue distribute) and the
-/// pre-`set_ready` boot window where APs aren't polling yet.
-pub fn poll(callback: fn(&[u8])) -> usize {
+/// Drain every queue pair into `callback`, one owned [`IOBufChain`]
+/// per received frame. The callback owns the chain and may retain
+/// it past return — each part's drop callback reposts the backing
+/// buffer to the device / pool. Used by Tier 2 (single-queue
+/// distribute) and the pre-`set_ready` boot window where APs aren't
+/// polling yet.
+pub fn poll(callback: fn(IOBufChain)) -> usize {
     (active_ops().poll_rx)(callback)
 }
 
 /// Per-queue variant for Tier 1 multi-queue, where each core only
 /// polls its own RX queue pair.
-pub fn poll_qp(qp: usize, callback: fn(&[u8])) -> usize {
+pub fn poll_qp(qp: usize, callback: fn(IOBufChain)) -> usize {
     (active_ops().poll_qp)(qp, callback)
 }
 

@@ -18,15 +18,33 @@ use core::ptr;
 use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
 use drivers_infra::mmio_write32;
+use uni_iobuf::IOBufChain;
 
 use crate::{
     put_be16, put_be64, read_be16, record_tx_desc, tx_desc_kind, BAR2_VA,
-    COUNTER_ARRAY_VA, DEFERRED_KICK, MAX_QUEUE_PAIRS, PAGE_SIZE, RX_BYTES_PER_QP,
-    RX_QUEUES, TX_BIG_ACQUIRES, TX_BIG_FULL_RETURNS, TX_BIG_POOL_QPL_OFFSET,
-    TX_BIG_POOL_SLOTS, TX_BIG_SLOT_SIZE, TX_BYTES_PER_QP, TX_PACKETS_PER_QP,
-    TX_QUEUES, TX_SMALL_ACQUIRES, TX_SMALL_FULL_SPINS, TX_SMALL_POOL_SLOTS,
-    TX_SMALL_SCAN_ITERS, TxQueue, _GVE_RX_PAD,
+    COUNTER_ARRAY_VA, DEFERRED_KICK, GQI_RECYCLE_POOL_EXHAUSTED, MAX_QUEUE_PAIRS,
+    PAGE_SIZE, RX_BUF_REPOST_COUNT, RX_BYTES_PER_QP, RX_QUEUES, TX_BIG_ACQUIRES,
+    TX_BIG_FULL_RETURNS, TX_BIG_POOL_QPL_OFFSET, TX_BIG_POOL_SLOTS, TX_BIG_SLOT_SIZE,
+    TX_BYTES_PER_QP, TX_PACKETS_PER_QP, TX_QUEUES, TX_SMALL_ACQUIRES,
+    TX_SMALL_FULL_SPINS, TX_SMALL_POOL_SLOTS, TX_SMALL_SCAN_ITERS, TxQueue, _GVE_RX_PAD,
 };
+
+// ---- RX recycle pool sizing ------------------------------------------------
+
+/// Per-queue-pair recycle-pool slab size. GQI cannot lend a device
+/// QPL page up the stack (the device reposts RX buffers strictly
+/// in order, so the page must be returned the moment the frame is
+/// copied out), so each received frame is copied into one of these
+/// slabs. 2 KiB covers a standard 1500-byte MTU frame plus Ethernet
+/// and alignment slack — matches `RX_BUFFER_SIZE`.
+pub(crate) const GQI_RX_SLAB_SIZE: usize = 2048;
+
+/// Per-queue-pair recycle-pool depth. Sized well above `MAX_BATCH`
+/// (64 frames per poll) and the Tier-2 cross-core inbox depth so a
+/// transiently slow consumer doesn't exhaust the pool; on
+/// exhaustion the frame is dropped and `GQI_RECYCLE_POOL_EXHAUSTED`
+/// counts it (TCP retransmit / UDP retry recover the loss).
+pub(crate) const GQI_RX_POOL_SLABS: usize = 256;
 
 // ---- GQI descriptor type/flag constants (gve_desc.h) ----------------------
 //
@@ -659,14 +677,25 @@ pub(crate) fn submit_tx_udp_gso_inner(
 // ---- RX poll ---------------------------------------------------------------
 
 /// Drain the RX completion ring for the given queue pair,
-/// invoking `callback` for each frame. Returns number of frames
-/// delivered.
+/// delivering each frame as an owned one-part [`IOBufChain`].
+/// Returns the number of frames handed to `callback`.
 ///
 /// Progress is detected by sequence number, not producer index:
 /// each completion descriptor carries `flags_seq` whose low 3 bits
 /// cycle 1..7. When the next descriptor's sequence matches what
 /// we're expecting, it's a new completion.
-pub(crate) fn poll_qp_inner<F: FnMut(&[u8])>(qp: usize, mut callback: F) -> u32 {
+///
+/// GQI reposts RX buffers to the device strictly in order, so —
+/// unlike DQO — it cannot lend a device QPL page up the stack and
+/// rely on an auto-repost when the chain drops. Instead each frame
+/// is copied into a slab from the queue's recycle pool
+/// ([`uni_iobuf::IOBufPool`]); the device page is reposted in the
+/// batch-end `fill_cnt` advance + doorbell below, and the *slab*
+/// travels up the stack, recycling to the pool when its IOBuf
+/// drops. `consumed` counts completions drained (= device buffers
+/// reposted); `delivered` counts frames a slab was actually
+/// allocated for — they differ only when the pool is exhausted.
+pub(crate) fn poll_qp_inner<F: FnMut(IOBufChain)>(qp: usize, mut callback: F) -> u32 {
     if qp >= MAX_QUEUE_PAIRS {
         return 0;
     }
@@ -675,18 +704,20 @@ pub(crate) fn poll_qp_inner<F: FnMut(&[u8])>(qp: usize, mut callback: F) -> u32 
         return 0;
     }
     // SAFETY: pointer is published once after init. RxQueue's
-    // non-atomic fields (ring_va, db_offset, …) are only written
-    // during init under STATE lock, before the Release publish;
-    // Acquire above synchronises with that. Mutable fields
-    // (cons_cnt, expected_seq, fill_cnt) are AtomicU32/U8, which
-    // tolerate concurrent access if another core ever calls in —
-    // though in Tier 1 each queue is polled by exactly one core.
+    // non-atomic fields (ring_va, db_offset, rx_pool, …) are only
+    // written during init under STATE lock, before the Release
+    // publish; Acquire above synchronises with that. Mutable
+    // fields (cons_cnt, expected_seq, fill_cnt) are AtomicU32/U8,
+    // which tolerate concurrent access if another core ever calls
+    // in — though in Tier 1 each queue is polled by exactly one
+    // core.
     let rx = unsafe { &*rx_ptr };
 
     let mask = (rx.ring_entries - 1) as u32;
     let mut cons = rx.cons_cnt.load(Ordering::Relaxed);
     let mut expected = rx.expected_seq.load(Ordering::Relaxed);
     let mut delivered: u32 = 0;
+    let mut consumed: u32 = 0;
 
     // Batch limit. A runaway (matching-seq loop, or huge single
     // burst) could otherwise monopolise this core; the event loop
@@ -695,7 +726,7 @@ pub(crate) fn poll_qp_inner<F: FnMut(&[u8])>(qp: usize, mut callback: F) -> u32 
     // responsive.
     const MAX_BATCH: u32 = 64;
 
-    while delivered < MAX_BATCH {
+    while consumed < MAX_BATCH {
         let idx = (cons & mask) as usize;
         let desc_ptr = (rx.compl_va as *const u8).wrapping_add(idx * RX_DESC_SIZE);
         // SAFETY: descriptor is 64 bytes inside a DMA-coherent page.
@@ -710,44 +741,70 @@ pub(crate) fn poll_qp_inner<F: FnMut(&[u8])>(qp: usize, mut callback: F) -> u32 
         }
 
         let len = read_be16(desc, RX_DESC_LEN_OFF) as usize;
-        let page_va = rx.qpl_base_va as usize + idx * (PAGE_SIZE as usize);
-        if qp < RX_BYTES_PER_QP.len() {
-            RX_BYTES_PER_QP[qp].fetch_add(len as u64, Ordering::Relaxed);
+        if len > 0 {
+            // Copy the frame into a recycle-pool slab. The device
+            // QPL page is reposted at end of batch regardless, so
+            // the bytes must be copied out before then.
+            match rx.rx_pool.as_ref().and_then(|p| p.alloc()) {
+                Some(mut slab) => {
+                    let page_va = rx.qpl_base_va as usize + idx * (PAGE_SIZE as usize);
+                    // SAFETY: `page_va` is the QPL page assigned to
+                    // slot `idx`, DMA-coherent memory from `init`;
+                    // `RX_DATA_OFFSET_IN_PAGE + len <= PAGE_SIZE` by
+                    // device contract (one packet per page, MTU +
+                    // headers fits well under 4 KiB).
+                    let frame: &[u8] = unsafe {
+                        core::slice::from_raw_parts(
+                            (page_va + RX_DATA_OFFSET_IN_PAGE) as *const u8,
+                            len,
+                        )
+                    };
+                    if slab.append_slice(frame).is_ok() {
+                        if qp < RX_BYTES_PER_QP.len() {
+                            RX_BYTES_PER_QP[qp].fetch_add(len as u64, Ordering::Relaxed);
+                        }
+                        callback(IOBufChain::from(slab));
+                        delivered += 1;
+                    }
+                    // `append_slice` fails only on an oversize frame
+                    // (> slab tailroom); slabs are MTU-sized so a
+                    // standard frame always fits. An oversize frame
+                    // is dropped — the slab recycles when it drops.
+                }
+                None => {
+                    // Recycle pool exhausted — drop the frame. The
+                    // device page is still reposted below, so the
+                    // device ring stays consistent with the
+                    // completion ring; TCP retransmit / UDP retry
+                    // recover the lost frame.
+                    if qp < GQI_RECYCLE_POOL_EXHAUSTED.len() {
+                        GQI_RECYCLE_POOL_EXHAUSTED[qp].fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
         }
-        // Hand the QPL page bytes to the callback as a `&[u8]` slice.
-        // The slice is valid for the duration of the callback only;
-        // `fill_cnt` advances at end of batch (below) and the device
-        // may reuse this slot's page on its next ring wrap. The
-        // callback must copy out anything it wants to retain past
-        // return.
-        //
-        // SAFETY: `page_va` is the QPL page assigned to slot `idx`,
-        // allocated as DMA-coherent memory in `init`. `RX_DATA_OFFSET_IN_PAGE
-        // + len <= PAGE_SIZE` by device contract (one packet per
-        // page, max MTU + headers fits well under 4 KiB). No
-        // concurrent reader/writer: the device has handed the page
-        // back via the completion descriptor, and we won't re-arm
-        // until `fill_cnt` advances at end of batch.
-        let frame: &[u8] = unsafe {
-            core::slice::from_raw_parts(
-                (page_va + RX_DATA_OFFSET_IN_PAGE) as *const u8,
-                len,
-            )
-        };
-        callback(frame);
 
-        delivered += 1;
+        consumed += 1;
         cons = cons.wrapping_add(1);
         expected = if expected == 7 { 1 } else { expected + 1 };
     }
 
-    if delivered > 0 {
+    if consumed > 0 {
+        // Repost every drained completion's device buffer in one
+        // batch: advance `fill_cnt` and doorbell the cumulative
+        // tail. GQI's data-slot ring entries are static QPL
+        // offsets, so "repost" is purely advancing the producer
+        // counter — and it covers exhausted-pool frames too, so the
+        // device ring never desyncs from the completion ring.
         let bar2_va = BAR2_VA.load(Ordering::Acquire);
-        let new_fill = rx.fill_cnt.load(Ordering::Relaxed).wrapping_add(delivered);
+        let new_fill = rx.fill_cnt.load(Ordering::Relaxed).wrapping_add(consumed);
         rx.cons_cnt.store(cons, Ordering::Relaxed);
         rx.expected_seq.store(expected, Ordering::Relaxed);
         rx.fill_cnt.store(new_fill, Ordering::Relaxed);
         doorbell_write(bar2_va, rx.db_offset, new_fill);
+        if qp < RX_BUF_REPOST_COUNT.len() {
+            RX_BUF_REPOST_COUNT[qp].fetch_add(consumed as u64, Ordering::Relaxed);
+        }
     }
 
     delivered

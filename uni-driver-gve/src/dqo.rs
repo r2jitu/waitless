@@ -9,13 +9,15 @@
 // `gve_desc_dqo.h`.
 
 use core::ptr;
+use core::ptr::NonNull;
 use core::sync::atomic::Ordering;
 
 use drivers_infra::mmio_write32;
+use uni_iobuf::{IOBuf, IOBufChain, IOBufDropFn};
 
 use crate::{
     BAR2_VA, DEFERRED_KICK, MAX_QUEUE_PAIRS, RX_BUFFER_SIZE,
-    RX_BYTES_PER_QP, RX_QUEUES, RxQueue, TX_QUEUES, TxQueue,
+    RX_BUF_REPOST_COUNT, RX_BYTES_PER_QP, RX_QUEUES, RxQueue, TX_QUEUES, TxQueue,
 };
 
 // ---- DQO_RDA descriptor formats -------------------------------------------
@@ -496,7 +498,79 @@ pub(crate) fn post_initial_rx_for_qp(rx: &RxQueue) {
     doorbell_write_le(bar2_va, rx.db_offset, initial & mask);
 }
 
-pub(crate) fn poll_qp_inner<F: FnMut(&[u8])>(qp: usize, mut callback: F) -> u32 {
+/// Drop callback for a delivered DQO RX `IOBuf` — reposts the
+/// device buffer `buf_id` to the data-buffer ring. Installed by
+/// [`poll_qp_inner`] via [`IOBuf::wrap_owned`]; runs from
+/// `IOBuf::drop`, possibly on a core other than the one that
+/// received the frame (item C moves chains cross-core).
+///
+/// `ctx` packs `(qp << 16) | buf_id` — both small (qp < 8, buf_id
+/// < `DQO_RX_POOL_BUFS`), so no allocation is needed for the
+/// context. `base` / `capacity` are the originals from
+/// `wrap_owned` and are not needed here (buf_id is the device
+/// handle); they're accepted to satisfy [`IOBufDropFn`].
+///
+/// Cross-core repost safety: each invocation reserves a unique
+/// data-ring slot via an atomic `fetch_add` on `fill_cnt`, writes
+/// its 32-byte buffer descriptor there, and rings the doorbell.
+/// `doorbell_write_le`'s `host_dma_fence` (an `sfence`) drains
+/// this core's store buffer so the descriptor bytes are
+/// PCIe-visible before the device sees the advanced tail. With
+/// item B's inline-on-the-polling-core drops the reservations are
+/// serialized, so the doorbell values are monotonic; the
+/// cross-core case (item C) where a higher-slot doorbell could
+/// race a lower-slot descriptor write is a known follow-up that
+/// needs a contiguous-publish cursor.
+///
+/// Panic-safe: an out-of-range `qp` or a null queue pointer leaks
+/// the buffer (the RX pool shrinks by one) rather than panicking —
+/// a panic in a `#![no_std]` `Drop` is poison. Neither is
+/// reachable under correct use; both arise only from a corrupted
+/// `ctx`.
+unsafe fn dqo_repost(_base: NonNull<u8>, _capacity: u32, ctx: *mut ()) {
+    let packed = ctx as usize;
+    let qp = (packed >> 16) & 0xFFFF;
+    let buf_id = (packed & 0xFFFF) as u32;
+    if qp >= MAX_QUEUE_PAIRS {
+        return; // impossible under correct use — leak, never panic
+    }
+    let rx_ptr = RX_QUEUES[qp].load(Ordering::Acquire);
+    if rx_ptr.is_null() {
+        return; // queue torn down — leak the buffer
+    }
+    // SAFETY: pointer published once at init with Release; the
+    // non-atomic fields read here (ring_entries, data_va,
+    // qpl_base_phys, db_offset) are init-only, and the Acquire
+    // load above synchronises with their publish.
+    let rx = unsafe { &*rx_ptr };
+    let mask = (rx.ring_entries - 1) as u32;
+
+    // Reserve a data-ring slot. `Release` publishes the descriptor
+    // write that follows to any core that later `Acquire`-reads
+    // `fill_cnt` (the cross-core observation item C relies on).
+    let slot = rx.fill_cnt.fetch_add(1, Ordering::Release);
+    let post_idx = (slot & mask) as usize;
+    let post_ptr = (rx.data_va as *mut u8).wrapping_add(post_idx * DQO_RX_DESC_SIZE);
+    let mut post_desc = [0u8; DQO_RX_DESC_SIZE];
+    post_desc[0..2].copy_from_slice(&(buf_id as u16).to_le_bytes());
+    let buf_phys = rx.qpl_base_phys + (buf_id as u64) * (RX_BUFFER_SIZE as u64);
+    post_desc[8..16].copy_from_slice(&buf_phys.to_le_bytes());
+    // SAFETY: `post_idx < ring_entries`, so `post_ptr` addresses
+    // one 32-byte descriptor inside the data ring allocated at init.
+    unsafe { ptr::copy_nonoverlapping(post_desc.as_ptr(), post_ptr, DQO_RX_DESC_SIZE); }
+
+    // Doorbell the new masked tail. The fence inside drains the
+    // store buffer so the descriptor above is visible to the
+    // device's DMA read before it sees the tail advance.
+    let bar2_va = BAR2_VA.load(Ordering::Acquire);
+    doorbell_write_le(bar2_va, rx.db_offset, slot.wrapping_add(1) & mask);
+
+    if qp < RX_BUF_REPOST_COUNT.len() {
+        RX_BUF_REPOST_COUNT[qp].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn poll_qp_inner<F: FnMut(IOBufChain)>(qp: usize, mut callback: F) -> u32 {
     if qp >= MAX_QUEUE_PAIRS { return 0; }
     let rx_ptr = RX_QUEUES[qp].load(Ordering::Acquire);
     if rx_ptr.is_null() { return 0; }
@@ -547,32 +621,35 @@ pub(crate) fn poll_qp_inner<F: FnMut(&[u8])>(qp: usize, mut callback: F) -> u32 
             if qp < RX_BYTES_PER_QP.len() {
                 RX_BYTES_PER_QP[qp].fetch_add(pkt_len as u64, Ordering::Relaxed);
             }
-            // Hand the buf_id-backed page to the callback as a
-            // `&[u8]`. Valid for the duration of the callback only —
-            // the inline repost below puts buf_id back on the data
-            // ring, where the device may overwrite it on its next
-            // pass. Callback must copy out anything it wants to keep.
+            // Wrap the device's RX buffer as an owned, one-part
+            // IOBufChain. DQO_RDA descriptors carry raw DMA
+            // addresses, so the device buffer can be lent straight
+            // up the stack with no copy. `dqo_repost` puts buf_id
+            // back on the data ring when the chain's IOBuf drops —
+            // the slice-shaped path's explicit inline repost now
+            // lives entirely in that drop callback, so it fires
+            // wherever (and on whichever core) the chain is
+            // released.
             //
-            // SAFETY: `buf_va` is the DMA-coherent buffer for buf_id
-            // posted at init; `pkt_len <= RX_BUFFER_SIZE` is enforced
-            // by the device (descriptor length field).
-            let frame: &[u8] = unsafe {
-                core::slice::from_raw_parts(buf_va as *const u8, pkt_len)
+            // SAFETY: `buf_va` is the DMA-coherent buffer for
+            // buf_id (non-null, posted at init); `pkt_len <=
+            // RX_BUFFER_SIZE` is enforced by the device's
+            // descriptor length field, so `0 + pkt_len <=
+            // capacity`. `dqo_repost` is sound to invoke once at
+            // drop and panic-safe; `(qp, buf_id)` packed in `ctx`
+            // survives the cross-core move `ExternalOwned` allows.
+            let ctx = (((qp & 0xFFFF) << 16) | (buf_id as usize & 0xFFFF)) as *mut ();
+            let iobuf = unsafe {
+                IOBuf::wrap_owned(
+                    NonNull::new_unchecked(buf_va as *mut u8),
+                    RX_BUFFER_SIZE as u32,
+                    0,
+                    pkt_len as u32,
+                    dqo_repost as IOBufDropFn,
+                    ctx,
+                )
             };
-            callback(frame);
-
-            // Repost buf_id at the next free data-ring slot —
-            // inline, no MMIO doorbell here (a single batch-end
-            // doorbell below covers all reposts in this poll).
-            let fill = rx.fill_cnt.load(Ordering::Relaxed);
-            let post_idx = (fill & mask) as usize;
-            let post_ptr = (rx.data_va as *mut u8).wrapping_add(post_idx * DQO_RX_DESC_SIZE);
-            let mut post_desc = [0u8; DQO_RX_DESC_SIZE];
-            post_desc[0..2].copy_from_slice(&(buf_id as u16).to_le_bytes());
-            let buf_phys = rx.qpl_base_phys + (buf_id as u64) * (RX_BUFFER_SIZE as u64);
-            post_desc[8..16].copy_from_slice(&buf_phys.to_le_bytes());
-            unsafe { ptr::copy_nonoverlapping(post_desc.as_ptr(), post_ptr, DQO_RX_DESC_SIZE); }
-            rx.fill_cnt.store(fill.wrapping_add(1), Ordering::Release);
+            callback(IOBufChain::from(iobuf));
             delivered += 1;
         } else {
             DQO_RX_COMPL_SKIPPED.fetch_add(1, Ordering::Relaxed);
@@ -588,15 +665,12 @@ pub(crate) fn poll_qp_inner<F: FnMut(&[u8])>(qp: usize, mut callback: F) -> u32 
     rx.cons_cnt.store(cons, Ordering::Release);
     rx.expected_seq.store(cur_gen, Ordering::Relaxed);
 
-    if delivered > 0 {
-        let bar2_va = BAR2_VA.load(Ordering::Acquire);
-        let fill = rx.fill_cnt.load(Ordering::Relaxed);
-        // Doorbell wants the masked tail position (Linux:
-        // `iowrite32(bufq->tail, db)` where `bufq->tail` is always
-        // `& bufq->mask`). Our cumulative `fill_cnt` grows
-        // unbounded; mask it before writing.
-        doorbell_write_le(bar2_va, rx.db_offset, fill & mask);
-    }
+    // No batch-end RX doorbell here: each delivered buffer reposts
+    // itself — descriptor write + masked-tail doorbell — from
+    // `dqo_repost` when its chain drops. With item B's inline drops
+    // that is one doorbell per frame instead of one per poll batch;
+    // the cost is measured at the GCE checkpoint (expected ±0% for
+    // DQO; a posted BAR2 write is cheap).
 
     // Drain the TX completion ring for this qp from the poll path,
     // matching Linux's NAPI-clean pattern. Keeps `done_cnt` fresh

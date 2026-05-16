@@ -34,6 +34,24 @@ pub(crate) static TX_BYTES_PER_QP: [AtomicU64; 8] =
 pub(crate) static RX_BYTES_PER_QP: [AtomicU64; 8] =
     [const { AtomicU64::new(0) }; 8];
 
+/// Per-qp count of RX device buffers reposted to the receive ring
+/// (item B). DQO bumps it from the `dqo_repost` drop callback —
+/// once per buffer, possibly on a different core; GQI bumps it per
+/// drained completion at the batch-end repost. The cross-core
+/// drop-callback sanity check: this should track the per-qp RX
+/// frame count — a persistent shortfall means a drop callback
+/// isn't firing (a leaked device buffer). Surfaced via /stats.
+pub static RX_BUF_REPOST_COUNT: [AtomicU64; 8] =
+    [const { AtomicU64::new(0) }; 8];
+
+/// Per-qp count of GQI frames dropped because the recycle pool was
+/// exhausted — no slab free to copy the frame into (item B).
+/// Always 0 on a healthy GQI queue; a non-zero value means the
+/// consumer isn't draining pooled slabs fast enough (see
+/// `gqi::GQI_RX_POOL_SLABS`). Surfaced via /stats.
+pub static GQI_RECYCLE_POOL_EXHAUSTED: [AtomicU64; 8] =
+    [const { AtomicU64::new(0) }; 8];
+
 // ---- TX direct-fill pool saturation counters -------------------------------
 
 pub(crate) static TX_SMALL_FULL_SPINS: AtomicU64 = AtomicU64::new(0);

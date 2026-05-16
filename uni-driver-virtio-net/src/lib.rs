@@ -5,12 +5,16 @@
 
 extern crate alloc;
 extern crate drivers_infra;
+extern crate uni_iobuf;
 extern crate uni_kernel;
 extern crate uni_net_driver;
 
 use core::arch::asm;
 use core::ptr;
+use core::ptr::NonNull;
 use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
+
+use uni_iobuf::{IOBuf, IOBufChain, IOBufDropFn};
 
 use drivers_infra::{
     log, dsb_st,
@@ -1556,6 +1560,16 @@ fn poke_interrupt_status() {
 static RX_COUNTS: [core::sync::atomic::AtomicU64; DIAG_QP_CAP] =
     [const { core::sync::atomic::AtomicU64::new(0) }; DIAG_QP_CAP];
 
+/// Per-qp count of RX descriptor buffers reposted to the avail
+/// ring (item B). Bumped from `virtio_rx_repost` — the drop
+/// callback of a delivered RX `IOBuf` — once per buffer, possibly
+/// on a core other than the one that received the frame. Pairs
+/// with `RX_COUNTS` as a cross-core drop-callback sanity check: a
+/// persistent shortfall means a chain's IOBuf isn't being dropped
+/// (a leaked descriptor buffer).
+pub static RX_BUF_REPOST_COUNT: [core::sync::atomic::AtomicU64; DIAG_QP_CAP] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; DIAG_QP_CAP];
+
 /// TX-side hot-path counters surfaced via [`NicDiagOps::tx_diag`].
 /// Each is a single relaxed atomic — bumped once per acquire /
 /// once per scan-iteration / once per submit. `packets_per_qp[i]`
@@ -1957,23 +1971,28 @@ fn flush_tx_kick_if_dirty() -> bool {
 // RX
 // ============================================================================
 //
-// `poll_qp` walks the used ring, hands each frame's bytes to the
-// callback as a `&[u8]`, and re-arms the descriptor inline as soon
-// as the callback returns. The callback is synchronous and cannot
-// retain the slice past return — so the descriptor is provably
-// free to re-arm when we do it. No drop callback, no cross-core
-// add_buf race.
+// `poll_qp` walks the used ring and delivers each frame as an
+// owned one-part `IOBufChain` wrapping the descriptor buffer
+// directly (zero copy). The buffer is re-armed by `virtio_rx_repost`
+// — the IOBuf's drop callback — when the chain drops. With item B's
+// inline-on-the-polling-core drops that is the same instant the old
+// `&[u8]` path re-armed; the owned shape additionally lets the net
+// stack retain the chain past the callback (item C).
 //
-// Kicks are batched within one poll cycle. The inline re-arm calls
+// Kicks are batched within one poll cycle. Each re-arm calls
 // `add_buf` and sets `rx_dirty`; the end-of-poll block kicks once
 // if any re-arm happened. This caps kicks at one per poll cycle.
 
 /// Re-post `buf_phys` to qp `qp`'s avail ring. Sets `rx_dirty` so
 /// the end-of-poll-cycle block kicks the device once for the batch.
 ///
-/// Runs inline from `poll_qp` on the polling core, so the rx_lock
-/// is uncontended in practice — kept anyway for the single-writer
-/// invariant `add_buf` requires.
+/// Called from `virtio_rx_repost` (a delivered RX IOBuf's drop
+/// callback) and inline from `poll_qp` for runt frames. The
+/// `rx_lock` spinlock makes `add_buf`'s single-writer invariant
+/// hold even when a chain drops on a core other than the polling
+/// core (item C) — it is not lock-free, but a spinlock lock/unlock
+/// never panics, so the drop callback stays panic-safe; the
+/// contended window is a few avail-ring stores.
 #[inline]
 unsafe fn rx_repost(qp: usize, buf_phys: u64) {
     let _g = unsafe { (*qps(qp)).rx_lock.lock() };
@@ -1985,10 +2004,44 @@ unsafe fn rx_repost(qp: usize, buf_phys: u64) {
     }
 }
 
-/// Per-queue RX poll. Drains the used ring, hands each frame's
-/// bytes to the callback as a `&[u8]`, then re-arms the descriptor
-/// inline before moving to the next used entry.
-fn poll_qp(qp: usize, callback: fn(&[u8])) -> usize {
+/// Drop callback for a delivered virtio-net RX `IOBuf` — returns
+/// the descriptor buffer to qp `qp`'s avail ring. Installed by
+/// [`poll_qp`] via [`IOBuf::wrap_owned`]; runs from `IOBuf::drop`,
+/// possibly on a core other than the one that received the frame.
+///
+/// `ctx` is the `qp` index packed as a pointer; `base` is the RX
+/// buffer start `wrap_owned` was given. Zeroes the virtio-net
+/// header (the device expects a clean slate) and re-adds the
+/// buffer.
+///
+/// Panic-safe: an out-of-range `qp` leaks the buffer rather than
+/// panicking — a panic in a `#![no_std]` `Drop` is poison. Not
+/// reachable under correct use (`poll_qp` only packs a valid qp);
+/// it would arise only from a corrupted `ctx`.
+unsafe fn virtio_rx_repost(base: NonNull<u8>, _capacity: u32, ctx: *mut ()) {
+    let qp = ctx as usize;
+    let nqp = unsafe { (*ndev()).negotiated_queue_pairs as usize };
+    if qp >= nqp {
+        return; // impossible under correct use — leak, never panic
+    }
+    let buf = base.as_ptr();
+    // SAFETY: `buf` is the RX buffer start; the virtio-net header
+    // occupies its first VIRTIO_NET_HDR_SIZE bytes.
+    unsafe { ptr::write_bytes(buf, 0, VIRTIO_NET_HDR_SIZE); }
+    // SAFETY: `qp < negotiated_queue_pairs`, so `rx_q(qp)` /
+    // `qps(qp)` are in bounds; `add_buf` is serialised by the
+    // per-qp `rx_lock` `rx_repost` takes.
+    unsafe { rx_repost(qp, virt_to_phys(buf)); }
+    if qp < DIAG_QP_CAP {
+        RX_BUF_REPOST_COUNT[qp].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Per-queue RX poll. Drains the used ring, delivering each frame
+/// as an owned one-part [`IOBufChain`] wrapping the descriptor
+/// buffer; `virtio_rx_repost` re-arms the descriptor when the
+/// chain drops.
+fn poll_qp(qp: usize, callback: fn(IOBufChain)) -> usize {
     unsafe {
         if let Transport::None = (*ndev()).transport { return 0; }
     }
@@ -2018,21 +2071,39 @@ fn poll_qp(qp: usize, callback: fn(&[u8])) -> usize {
                         core::sync::atomic::Ordering::Relaxed,
                     );
                 }
-                // Hand the frame bytes (past the virtio-net header)
-                // to the callback as a slice. The slice lives only
-                // for the call; we re-arm immediately below.
-                let frame: &[u8] = core::slice::from_raw_parts(
-                    buf.add(VIRTIO_NET_HDR_SIZE),
-                    frame_len,
+                // Wrap the descriptor buffer as an owned one-part
+                // IOBufChain — visible payload is the frame past
+                // the virtio-net header. `virtio_rx_repost` zeroes
+                // the header and re-adds the buffer to the avail
+                // ring when the chain's IOBuf drops, so the
+                // explicit inline re-arm the `&[u8]` path used now
+                // lives entirely in that drop callback.
+                //
+                // SAFETY: `buf` is a live RX buffer (non-null,
+                // BUFFER_SIZE bytes); `frame_len = used_len - HDR`
+                // and `used_len <= BUFFER_SIZE`, so `HDR + frame_len
+                // <= BUFFER_SIZE` (`offset + len <= capacity`).
+                // `virtio_rx_repost` is sound to invoke once at
+                // drop and is panic-safe; `qp` packed in `ctx`
+                // survives the cross-core move `ExternalOwned`
+                // allows.
+                let iobuf = IOBuf::wrap_owned(
+                    NonNull::new_unchecked(buf),
+                    BUFFER_SIZE,
+                    VIRTIO_NET_HDR_SIZE as u32,
+                    frame_len as u32,
+                    virtio_rx_repost as IOBufDropFn,
+                    qp as *mut (),
                 );
-                callback(frame);
+                callback(IOBufChain::from(iobuf));
+            } else {
+                // Runt frame — no payload past the virtio-net
+                // header, so there's no IOBuf to deliver. Re-arm
+                // the descriptor inline, mirroring the wrapped
+                // path's `virtio_rx_repost`.
+                ptr::write_bytes(buf, 0, VIRTIO_NET_HDR_SIZE);
+                rx_repost(qp, virt_to_phys(buf));
             }
-            // Re-arm: zero the virtio header region so the device
-            // sees a clean slate, then add_buf the same physical
-            // address back onto the avail ring. End-of-poll block
-            // below kicks once for the whole batch.
-            ptr::write_bytes(buf, 0, VIRTIO_NET_HDR_SIZE);
-            rx_repost(qp, virt_to_phys(buf));
             count += 1;
         }
 
@@ -2060,7 +2131,7 @@ fn poll_qp(qp: usize, callback: fn(&[u8])) -> usize {
 }
 
 /// All-queues fan-out wrapper.
-fn poll(callback: fn(&[u8])) -> usize {
+fn poll(callback: fn(IOBufChain)) -> usize {
     let n = unsafe { (*ndev()).negotiated_queue_pairs as usize }.max(1);
     let mut total = 0;
     for qp in 0..n {

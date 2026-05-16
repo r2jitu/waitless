@@ -5,8 +5,11 @@
 
 extern crate alloc;
 extern crate uni_drivers;
+extern crate uni_iobuf;
 extern crate uni_kernel;
 extern crate uni_runtime;
+
+use uni_iobuf::IOBufChain;
 pub extern crate net_types as types;
 pub extern crate net_ethernet as ethernet;
 pub extern crate net_arp as arp;
@@ -310,18 +313,38 @@ fn poll_tier2(num_cores: u32) -> bool {
 }
 
 
-/// Process a single received frame through the full stack inline
-/// (no cross-core distribution). Called from the Tier 1 per-core
-/// poll, the single-core fallback, and `net_drain_cb` (after the
-/// Tier 2 distributor copied frame bytes into this core's inbox).
+/// RX callback for the NIC poll path (`NicOps::poll_rx` /
+/// `poll_qp`) — receives one frame as an owned [`IOBufChain`] and
+/// dispatches it through the full stack. Item B made the
+/// driver↔net boundary deliver owned chains instead of borrowed
+/// `&[u8]` slices; until item C threads the chain into the
+/// per-conn layers, it is consumed synchronously here and dropped
+/// at return — and dropping it reposts the backing device buffer
+/// (or recycles the GQI slab) via each part's drop callback.
 ///
-/// `frame` is a borrow over driver-pool storage (Tier 1) or the
-/// owning core's inbox slot (Tier 2). It is only valid for this
-/// call: the L4 receive entries finish (copy payload into per-conn
-/// ring buffers / direct-copy slots, dispatch ARP/ICMP replies)
-/// synchronously before returning, so the borrow is released by
-/// the time the driver re-arms the underlying buffer.
-pub fn net_receive(frame: &[u8]) {
+/// A single-buffer frame is a one-part chain (the common case);
+/// hardware-coalesced super-segments (item I) arrive as multi-part
+/// chains, so we walk every part.
+pub fn net_receive(chain: IOBufChain) {
+    for part in chain.iter() {
+        net_receive_frame(part.data());
+    }
+    // `chain` drops here → each part's IOBuf drops → the driver's
+    // drop callback reposts the buffer to the device / pool.
+}
+
+/// Process a single received frame through the full stack inline
+/// (no cross-core distribution). Called from [`net_receive`] (per
+/// chain part), the Tier 2 distributor's inline path, and
+/// `net_drain_cb` (after the Tier 2 distributor copied frame bytes
+/// into this core's inbox).
+///
+/// `frame` is a borrow over an `IOBufChain` part's storage (Tier 1)
+/// or the owning core's inbox slot (Tier 2). It is only valid for
+/// this call: the L4 receive entries finish (copy payload into
+/// per-conn ring buffers / direct-copy slots, dispatch ARP/ICMP
+/// replies) synchronously before returning.
+fn net_receive_frame(frame: &[u8]) {
     let Some((src_mac, ethertype, payload)) = ethernet::ethernet_parse_full(frame) else {
         return;
     };
@@ -392,7 +415,7 @@ fn classify_for_distribution(
 }
 
 enum ClassifyResult {
-    /// Hand off to `net_receive` on this core (ARP, IPv6,
+    /// Hand off to `net_receive_frame` on this core (ARP, IPv6,
     /// or IPv4 destined for `my_core`).
     Inline,
     /// Copy frame bytes to target core's `rx_inbox`; target wakes
@@ -402,28 +425,34 @@ enum ClassifyResult {
     Drop,
 }
 
-/// Tier 2 distributor. Picks a target core for the frame; runs the
+/// Tier 2 distributor — the `NicOps::poll_rx` callback in
+/// single-queue mode. Receives one frame as an owned
+/// [`IOBufChain`] and, per part, picks a target core: runs the
 /// full receive path inline for ARP / IPv6 / my-core IPv4, or
 /// copies the bytes into the target core's `rx_inbox` for other
-/// IPv4. The copy at the cross-core boundary is unavoidable — the
-/// driver re-arms its buffer as soon as this fn returns, so we
-/// can't keep a borrow over it.
-fn distribute_frame(frame: &[u8]) {
+/// IPv4. The cross-core copy is unavoidable until item C threads
+/// the IOBuf itself through the inbox — for now the chain (and its
+/// device-buffer reposts) is dropped at return, after the bytes
+/// have been copied or processed.
+fn distribute_frame(chain: IOBufChain) {
     let num_cores = percpu::num_cores();
     let my_core = uni_kernel::cpu_id();
-    match classify_for_distribution(frame, num_cores, my_core) {
-        ClassifyResult::Inline => net_receive(frame),
-        ClassifyResult::Distribute(target) => {
-            // SAFETY: `percpu::init()` runs before any AP starts;
-            // target is bounded by `num_cores`.
-            let core = unsafe { percpu::get(target) };
-            if core.rx_inbox.push(frame) {
-                WAKEUP.at(target).store(true, core::sync::atomic::Ordering::Relaxed);
+    for part in chain.iter() {
+        let frame = part.data();
+        match classify_for_distribution(frame, num_cores, my_core) {
+            ClassifyResult::Inline => net_receive_frame(frame),
+            ClassifyResult::Distribute(target) => {
+                // SAFETY: `percpu::init()` runs before any AP starts;
+                // target is bounded by `num_cores`.
+                let core = unsafe { percpu::get(target) };
+                if core.rx_inbox.push(frame) {
+                    WAKEUP.at(target).store(true, core::sync::atomic::Ordering::Relaxed);
+                }
+                // push returning false (oversize / ring full) drops
+                // the frame; TCP retransmit / UDP retry recover.
             }
-            // push returning false (oversize / ring full) drops the
-            // frame; TCP retransmit / UDP application retry recover.
+            ClassifyResult::Drop => {}
         }
-        ClassifyResult::Drop => {}
     }
 }
 
@@ -763,8 +792,10 @@ fn net_drain_cb(core_id: u32) -> bool {
     let core = percpu::percore(&cc);
     let mut did_work = false;
     // Tier 2 cross-core delivery: distributor copied frame bytes
-    // into our inbox; pop each slot and dispatch inline.
-    while core.rx_inbox.pop_with(|frame| net_receive(frame)) {
+    // into our inbox; pop each slot and dispatch inline. The inbox
+    // still carries raw bytes (item C makes it hold IOBufChains),
+    // so dispatch through the per-frame `net_receive_frame`.
+    while core.rx_inbox.pop_with(|frame| net_receive_frame(frame)) {
         did_work = true;
     }
     did_work
