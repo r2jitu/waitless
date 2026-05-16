@@ -236,33 +236,23 @@ pub(crate) fn tx_drain(tx: &TxQueue) {
     tx.tx_compl_head.store(head, Ordering::Relaxed);
     tx.tx_compl_gen.store(cur_gen, Ordering::Relaxed);
     if let Some(tx_head) = latest_tx_head {
-        // Translate the device's u16 ring-position `tx_head` into
-        // an advance for our cumulative `done_cnt` (u32). Both
-        // `done_cnt`'s low ring-mask bits and `tx_head` index into
-        // the same ring; the delta between them (mod ring_entries)
-        // is the number of descriptors the device has fetched
-        // since our last drain.
+        // Translate the device's u16 ring-position `tx_head` into a
+        // cumulative `done_cnt` advance. `done_cnt`'s low ring-mask
+        // bits and `tx_head` index into the same ring; the masked
+        // delta is the descriptor count the device fetched since the
+        // last drain.
+        //
+        // This relies on `send_on_qp` capping `fill_cnt - done_cnt`
+        // strictly below `ring_entries` (it leaves a packet of
+        // headroom): the device can therefore never have advanced a
+        // full ring between drains, which would alias mod-ring_entries
+        // to a delta of 0 and freeze `done_cnt`. Don't remove that
+        // cap without revisiting this.
         let mask16 = rmask as u16;
-        let ring_entries = tx.ring_entries as u32;
         let prev = tx.done_cnt.load(Ordering::Relaxed);
-        let fill = tx.fill_cnt.load(Ordering::Relaxed);
         let prev_low = (prev as u16) & mask16;
         let tx_head_low = tx_head & mask16;
-        let mut delta = (tx_head_low.wrapping_sub(prev_low) & mask16) as u32;
-        // The masked delta is computed mod `ring_entries`, so it
-        // cannot tell "device advanced 0" from "device advanced a
-        // whole ring" — both leave `tx_head_low == prev_low`. A
-        // DESC completion is only ever emitted for a descriptor the
-        // device actually fetched, so a fresh one with a computed
-        // delta of 0 while the ring is full means the device
-        // drained the entire ring, not nothing. Without this fix
-        // `done_cnt` freezes the instant the ring first fills and
-        // `tx_inflight` stays pinned at `ring_entries` forever —
-        // the queue wedges and every send (SYN-ACKs included) is
-        // silently dropped. (Race-dependent per qp; permanent.)
-        if delta == 0 && fill.wrapping_sub(prev) >= ring_entries {
-            delta = ring_entries;
-        }
+        let delta = (tx_head_low.wrapping_sub(prev_low) & mask16) as u32;
         if delta > 0 {
             tx.done_cnt.store(prev.wrapping_add(delta), Ordering::Relaxed);
         }
