@@ -549,6 +549,19 @@ sprawl that session.
   output readable. Port the existing registry as a
   no-behavior-change refactor first, then fill gaps.
 
+### uni-iobuf type model
+
+`IOBuf` conflates borrowed (`!Send`) and owned (`Send`) buffers in
+one `!Send` type, so every cross-core use needs a manual
+`unsafe impl Send` plus a human-maintained "no `Borrowed` parts"
+invariant (item C's `RxInbox` is one such site). Spike + recommended
+design — split out a `Send`-by-derivation `OwnedIOBuf`, make
+`into_owned` a typed `IOBuf → OwnedIOBuf` gate, generic-ize the
+chain — written up in
+[`uni-iobuf-type-model.md`](uni-iobuf-type-model.md). Land it before
+item F (its `RecvChunkGuard::into_owned()` is only a real gate, not
+discipline, with the typed conversion).
+
 ### Operational
 
 - Stuck-worker preemption / watchdog.
