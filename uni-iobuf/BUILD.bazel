@@ -19,8 +19,10 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "uni-iobuf",
     srcs = [
+        "src/chain.rs",
         "src/lib.rs",
         "src/pool.rs",
+        "src/storage.rs",
     ],
     crate_name = "uni_iobuf",
 )

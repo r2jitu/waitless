@@ -1,47 +1,52 @@
-// uni-http/src/iobuf.rs — IOBuf primitive for the network stack.
+// uni-iobuf — IOBuf primitive for the network stack.
 //
 // Inspired by folly::IOBuf: a chain of byte segments with reserved
 // space at each end ("headroom" / "tailroom") so layers below can
 // prepend / append their headers without re-allocating or copying
-// the existing payload. The chain owns its nodes; callers walk it
-// via a `Cursor` that hops node boundaries transparently.
+// the existing payload. Callers walk a chain via a `Cursor` that
+// hops node boundaries transparently.
 //
 // What this buys us in the unikernel stack:
 //
-//   * App-side: a `Body` is an `IOBufChain` of static literals
-//     (zero-copy) and dynamically-rendered owned chunks.
-//   * HTTP/1.1 framing layer: the response status line + headers
-//     get prepended onto the body chain via a single `push_front`,
-//     reusing the chain's reserved headroom rather than allocating
-//     a separate framing Vec.
-//   * HTTP/3 layer: same — the HEADERS / DATA frame headers
-//     prepend into the body chunk's headroom, the QPACK encoded
-//     field section sits in a wrapper IOBuf borrowed from the
-//     per-conn scratch, no `framing: Vec` copy.
-//   * TLS layer: prepends the 5-byte TLSCiphertext record header
-//     and appends the 16-byte AEAD tag in-place (encrypt straight
-//     into the existing buffer's tailroom).
-//   * QUIC: prepends short-header byte + packet number, encrypts
-//     in place, the rest of the chain (UDP/IP/Eth) follows the
-//     same prepend pattern.
+//   * App-side: a body is a chain of static literals (zero-copy)
+//     and dynamically-rendered owned chunks.
+//   * HTTP/1.1: the response status line + headers prepend onto the
+//     body chain via `prepend_in_place`, reusing reserved headroom.
+//   * TLS: prepends the 5-byte record header and appends the 16-byte
+//     AEAD tag in-place.
+//   * QUIC: prepends short-header byte + packet number, encrypts in
+//     place; the rest of the chain follows the same prepend pattern.
+//   * NIC RX: the driver wraps its DMA buffer as an IOBuf with a
+//     drop callback that reposts the buffer — zero-copy receive.
 //   * NIC TX: a final cursor pass copies bytes straight into the
-//     hardware TX descriptor — one memcpy total, no intermediate
-//     Vec.
+//     hardware TX descriptor — one memcpy total, no intermediate Vec.
 //
-// Design choices:
+// ── The borrowed / owned type split ─────────────────────────────
 //
-//   * Four storage variants under one `IOBuf`: heap-owned
-//     (`Heap`), `&'static [u8]` (`Static`), foreign region with a
-//     drop callback (`ExternalOwned`, e.g. NIC zero-copy RX), and
-//     non-owning view (`Borrowed`, e.g. per-worker scratch slice).
-//   * `Heap` carries `offset` + `len` as `u32` (saves 8 B per
-//     node vs `usize`). 4 GiB per chunk is plenty for any
-//     unikernel workload.
-//   * `IOBufChain` is a three-state value — `Empty`, `Single`
-//     (one part, stored inline, zero heap allocation), or `Many`
-//     (a `VecDeque<IOBuf>` for genuine multi-part chains).
-//     Push-front and push-back are amortised O(1); the dominant
-//     single-part shape costs no chain-machinery allocation.
+// An IOBuf has two ownership models, and they have different
+// thread-safety. Rather than one `!Send` type guarded by discipline,
+// the crate splits them — see docs/uni-iobuf-type-model.md:
+//
+//   * Each ownership variant is its own struct in `storage.rs`
+//     (`HeapStorage`, `StaticView`, `ExternalOwned`, `BorrowedView`),
+//     with its data *and* offset/len logic in one place.
+//   * `IOBuf` is a flat `!Send` enum over all four structs — the
+//     TX-path buffer, which legitimately mixes owned and borrowed
+//     parts. `BorrowedView`'s `PhantomData<*const ()>` is what makes
+//     `IOBuf` `!Send`, so a per-worker borrow can't cross workers.
+//   * `OwnedIOBuf` is a flat enum over `{HeapStorage, ExternalOwned}`
+//     only — the owning pair. It is `Send` *by auto-derivation* (no
+//     `unsafe impl`): both variants are `Send`. The cross-core RX
+//     path is *typed* `OwnedIOBuf` / `Chain<OwnedIOBuf>`, so a
+//     borrowed buffer physically cannot reach it — a compile error,
+//     not a human-maintained invariant.
+//   * `IOBufRead` is the read surface (`data` / `len` / `headroom` /
+//     `tailroom`) shared by both and by `Chain<B>`.
+//   * Widening is one-way: `From<OwnedIOBuf> for IOBuf` (infallible).
+//     Nothing narrows `IOBuf -> OwnedIOBuf`.
+//
+// `no_std` and dep-less so it can be pulled into the kernel proper
+// (driver layers) without dragging the runtime in.
 
 #![no_std]
 #![allow(dead_code)]
@@ -49,538 +54,256 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-use alloc::collections::VecDeque;
-use core::marker::PhantomData;
+use core::ptr::NonNull;
 
 // Fixed-size slab pool for IOBuf RX recycling. Self-contained
-// lock-free machinery, kept in its own module; `IOBufPool` is
-// re-exported at the crate root so consumers spell `uni_iobuf::IOBufPool`.
+// lock-free machinery, kept in its own module.
 mod pool;
 pub use pool::IOBufPool;
 
+// The four per-variant storage structs + the debug-mode borrow
+// tracker. `IOBuf` / `OwnedIOBuf` are flat enums over these.
+mod storage;
+pub use storage::{BorrowedView, ExternalOwned, HeapStorage, IOBufDropFn, StaticView};
+
+// `Chain<B>` — a chain of `B: IOBufRead` segments — plus `Cursor`.
+mod chain;
+pub use chain::{Chain, Cursor, IOBufChain};
+
 // ============================================================================
-// Borrow tracker — debug-mode aliasing detection for `Borrowed` IOBufs.
-//
-// Every `IOBuf::borrow(base, capacity, ...)` registers its
-// `[base..base+capacity)` region in a per-thread interval list. A
-// second `borrow` overlapping any live entry panics on the spot,
-// surfacing aliasing-arithmetic bugs (e.g. the body-scratch sub-range
-// allocator's cursor going wrong) at the point of construction rather
-// than as silent UAF later.
-//
-// Active only under `cfg(any(test, debug_assertions))`. In bazel
-// release builds (the unikernel target ships with `-Copt-level=2`),
-// `debug_assertions` is off and the tracker compiles to a no-op,
-// so production pays nothing. In `cargo test`, the iobuf_test bazel
-// target, and any debug build of a consumer, the tracker is on.
-//
-// The tracker lives on a per-thread `Vec` (via `std::thread_local!`)
-// because `Borrowed` IOBufs are `!Send` — a borrowed view is bound to
-// the worker / thread that constructed it, so cross-thread sharing of
-// the tracker state is structurally impossible. The `Vec` is bounded
-// in practice by the number of live `Borrowed` IOBufs on this thread;
-// typical depths are < 4 (one for body scratch, one for TLS scratch,
-// occasional inner sub-views).
+// IOBufRead — the shared read surface.
 // ============================================================================
-#[cfg(any(test, debug_assertions))]
-mod borrow_tracker {
-    extern crate std;
 
-    use alloc::vec::Vec;
-    use core::cell::RefCell;
-    use core::ptr::NonNull;
-
-    /// One live `[base..base+capacity)` byte region.
-    #[derive(Copy, Clone)]
-    struct Region {
-        base: usize,
-        end: usize,
-    }
-
-    std::thread_local! {
-        static ACTIVE: RefCell<Vec<Region>> = RefCell::new(Vec::new());
-    }
-
-    /// Register a new `Borrowed` region. Panics on overlap with any
-    /// already-live region — the typical failure mode is the body-
-    /// scratch sub-range allocator's cursor arithmetic going wrong,
-    /// or a re-entered scratch-acquire path minting a second view
-    /// over the same per-worker buffer.
-    pub(crate) fn register(base: NonNull<u8>, capacity: u32) {
-        let base_addr = base.as_ptr() as usize;
-        let end_addr = base_addr.wrapping_add(capacity as usize);
-        ACTIVE.with(|r| {
-            let mut reg = r.borrow_mut();
-            for existing in reg.iter() {
-                // Open-interval overlap test: [a, b) ∩ [c, d) ≠ ∅
-                // iff a < d ∧ c < b.
-                let overlap = base_addr < existing.end && existing.base < end_addr;
-                if overlap {
-                    panic!(
-                        "overlapping IOBuf::borrow mint: new=[{:#x}..{:#x}) \
-                         overlaps existing=[{:#x}..{:#x}); aliasing bug?",
-                        base_addr, end_addr, existing.base, existing.end,
-                    );
-                }
-            }
-            reg.push(Region {
-                base: base_addr,
-                end: end_addr,
-            });
-        });
-    }
-
-    /// Drop a previously-registered region. Panics if no matching
-    /// entry exists — that would indicate a balance error in the
-    /// register/unregister pairing (e.g. a `Borrowed` IOBuf
-    /// constructed without going through `register`).
-    pub(crate) fn unregister(base: NonNull<u8>, capacity: u32) {
-        let base_addr = base.as_ptr() as usize;
-        let end_addr = base_addr.wrapping_add(capacity as usize);
-        ACTIVE.with(|r| {
-            let mut reg = r.borrow_mut();
-            // LIFO-friendly scan (Borrowed IOBufs usually drop in
-            // reverse construction order on a synchronous code path).
-            for i in (0..reg.len()).rev() {
-                if reg[i].base == base_addr && reg[i].end == end_addr {
-                    reg.swap_remove(i);
-                    return;
-                }
-            }
-            panic!(
-                "IOBuf::borrow unregister with no matching register: \
-                 [{:#x}..{:#x}); register/unregister imbalance?",
-                base_addr, end_addr,
-            );
-        });
+/// The **read** surface every IOBuf-shaped buffer exposes: the
+/// visible payload, its length, and the reserved head/tail room.
+///
+/// Implemented by `IOBuf` (`!Send`), `OwnedIOBuf` (`Send`), and the
+/// four per-variant storage structs. It is the bound a `Chain<B>` is
+/// generic over — `fn consume<B: IOBufRead>(Chain<B>)` accepts both
+/// `Chain<IOBuf>` (TX) and `Chain<OwnedIOBuf>` (cross-core RX).
+///
+/// Deliberately **read-only**: mutating operations (`prepend`,
+/// `append`, partial-send `consume`) are *not* here. Cross-core RX
+/// consumers happen to be read-only, so `IOBufRead` suffices for the
+/// generic chain; TX-side mutation stays concrete-typed on `IOBuf`.
+pub trait IOBufRead {
+    /// Visible payload bytes.
+    fn data(&self) -> &[u8];
+    /// Visible payload length in bytes (`== data().len()`).
+    fn len(&self) -> usize;
+    /// Bytes reserved before the payload — lower layers (TLS, TCP,
+    /// IP, Eth) prepend their headers into this space.
+    fn headroom(&self) -> usize;
+    /// Bytes reserved after the payload — for AEAD tags, trailers.
+    fn tailroom(&self) -> usize;
+    /// True when the visible payload is empty.
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
-#[cfg(not(any(test, debug_assertions)))]
-mod borrow_tracker {
-    use core::ptr::NonNull;
-    #[inline(always)]
-    pub(crate) fn register(_: NonNull<u8>, _: u32) {}
-    #[inline(always)]
-    pub(crate) fn unregister(_: NonNull<u8>, _: u32) {}
+// ============================================================================
+// IOBufError
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IOBufError {
+    NoHeadroom,
+    NoTailroom,
+    OutOfBounds,
+    Immutable,
 }
 
-/// Per-`Inner::Borrowed` Drop guard that owns the tracker's
-/// register/unregister pairing. Carried as a field of the
-/// variant — its Drop fires when the IOBuf (and thus the
-/// variant) drops, so we can't accidentally orphan a live
-/// registration. In release builds (`!debug_assertions`) the
-/// guard is a ZST and Drop is empty.
-#[cfg(any(test, debug_assertions))]
-struct BorrowGuard {
-    base: core::ptr::NonNull<u8>,
-    capacity: u32,
-}
+// ============================================================================
+// IOBuf — the flat `!Send` enum over all four storage structs.
+// ============================================================================
 
-#[cfg(any(test, debug_assertions))]
-impl BorrowGuard {
-    fn new(base: core::ptr::NonNull<u8>, capacity: u32) -> Self {
-        borrow_tracker::register(base, capacity);
-        Self { base, capacity }
-    }
-}
-
-#[cfg(any(test, debug_assertions))]
-impl Drop for BorrowGuard {
-    fn drop(&mut self) {
-        borrow_tracker::unregister(self.base, self.capacity);
-    }
-}
-
-/// One byte segment in an IOBuf chain. Holds heap-owned storage,
-/// a borrow into static-lifetime bytes, foreign storage with a
-/// drop callback (owned), or a non-owning view of foreign storage
-/// (borrowed). The borrowed variant makes the whole `IOBuf`
-/// `!Send + !Sync` so per-worker borrows can't accidentally cross
-/// workers — see [`Inner::Borrowed`] for the contract.
+/// One byte segment. Holds heap-owned storage, a static-lifetime
+/// borrow, foreign storage owned via a drop callback, or a non-owning
+/// view of foreign storage. The `Borrowed` variant makes the whole
+/// `IOBuf` `!Send + !Sync` so per-worker borrows can't accidentally
+/// cross workers — see [`OwnedIOBuf`] for the `Send` counterpart that
+/// the cross-core path uses.
 pub struct IOBuf {
     inner: Inner,
 }
 
+/// Storage backing an [`IOBuf`]. Private: `IOBuf`'s public surface is
+/// its methods. A flat enum over the four per-variant structs — the
+/// per-variant logic lives on each struct (`storage.rs`); the arms
+/// here only forward.
 enum Inner {
-    /// Heap-owned. The buffer's full capacity is `storage.len()`;
-    /// the visible payload spans `[offset..offset+len]`. Headroom
-    /// is `offset` (bytes before the payload that lower layers
-    /// can prepend into); tailroom is `storage.len() - offset -
-    /// len` (bytes after the payload that lower layers can append
-    /// into, e.g. AEAD tags).
-    Heap {
-        storage: Box<[u8]>,
-        offset: u32,
-        len: u32,
-    },
-    /// Borrowed reference to static-lifetime bytes. Immutable; no
-    /// headroom / tailroom semantics. Common for HTML literal
-    /// chunks, the QPACK static table, etc.
-    Static { data: &'static [u8] },
-    /// Externally-owned buffer with a drop callback. Canonical
-    /// use cases: NIC zero-copy RX (callback returns the
-    /// descriptor to the receive ring) and pool-backed buffers
-    /// (callback pushes `Box<[u8]>` back to the pool free list).
-    /// Same offset/len semantics as `Heap`; the storage isn't
-    /// dropped — the callback fires instead.
-    ///
-    /// `Send` (via `unsafe impl Send for ExternalOwned`) because
-    /// the underlying memory is exclusively owned by this IOBuf
-    /// for its lifetime and the drop callback is responsible for
-    /// any cross-worker cleanup (typically via an `Arc`-backed
-    /// pool reference).
-    ExternalOwned(ExternalOwned),
-    /// Non-owning view into foreign storage. The caller manages
-    /// the region's lifetime out-of-band; no drop callback fires.
-    /// Typical sites:
-    ///   * Per-worker scratch buffers (TLS record scratch, body
-    ///     scratch) borrowed for the duration of one send.
-    ///   * Driver TX-pool slots borrowed inside a synchronous
-    ///     callback.
-    ///   * Per-conn stack-resident header arrays borrowed for
-    ///     the duration of one response render.
-    ///   * A `&[u8]` slice borrowed for a single async send.
-    ///
-    /// `!Send + !Sync` via the `PhantomData<*const ()>` — the
-    /// borrow contract is per-worker / per-stack-frame, and the
-    /// type system rejects cross-worker leak. Containing structs
-    /// that legitimately move IOBufs across workers (e.g.
-    /// `WorkerInbox` for inter-worker UDP delivery) must
-    /// override with `unsafe impl Send` and document why their
-    /// borrowed contents are cross-worker-safe.
-    Borrowed {
-        base: core::ptr::NonNull<u8>,
-        capacity: u32,
-        offset: u32,
-        len: u32,
-        _not_send: PhantomData<*const ()>,
-        /// Debug-mode aliasing-tracker registration guard. Carries
-        /// the registered `[base..base+capacity)` so its Drop can
-        /// unregister symmetrically; ZST + no-op Drop in release.
-        #[cfg(any(test, debug_assertions))]
-        _guard: BorrowGuard,
-    },
+    /// Heap-owned `Box<[u8]>`.
+    Heap(HeapStorage),
+    /// A `&'static [u8]` borrow. Immutable.
+    Static(StaticView),
+    /// A foreign region owned via a drop callback (NIC RX, pools).
+    External(ExternalOwned),
+    /// A non-owning view of foreign storage — the `!Send` variant.
+    Borrowed(BorrowedView),
 }
 
-/// Drop callback signature for [`Inner::ExternalOwned`]. Receives
-/// the original `(base, capacity, ctx)` from `wrap_owned`,
-/// regardless of how the IOBuf's offset/len shifted during its
-/// lifetime — the consumer that gave us the buffer wants the
-/// whole region back (e.g. a NIC descriptor index), not the
-/// shifted view. `unsafe` because the impl reconstructs
-/// concrete types (Box<[u8]>, descriptor index) from the raw
-/// pointers and must respect the contract the caller of
-/// `wrap_owned` established.
-pub type IOBufDropFn = unsafe fn(base: core::ptr::NonNull<u8>, capacity: u32, ctx: *mut ());
-
-/// Backing for [`Inner::ExternalOwned`]. Held in a wrapping
-/// struct so the manual `Drop` impl can run the release callback
-/// exactly once. Function-pointer + opaque-context drop instead
-/// of a `Box<dyn FnOnce>` — saves the per-IOBuf closure-box
-/// allocation, important for the framing-IOBuf-per-request
-/// recycling path where every saved alloc shows up.
-pub struct ExternalOwned {
-    /// Start of the underlying region.
-    base: core::ptr::NonNull<u8>,
-    /// Total bytes of the region (`base + capacity` is one past
-    /// the end). The visible payload is at `[offset..offset+len]`
-    /// within these bytes.
-    capacity: u32,
-    /// Visible-payload start, relative to `base`. `prepend`
-    /// shrinks toward 0; `consume` grows toward
-    /// `offset + len`.
-    offset: u32,
-    /// Visible-payload byte length.
-    len: u32,
-    /// Release callback — always present for `ExternalOwned`
-    /// (borrowed views with no callback are in
-    /// [`Inner::Borrowed`] instead).
-    drop_fn: IOBufDropFn,
-    /// Opaque context passed to `drop_fn`. Typically a raw
-    /// `*mut` pointer the caller cast from an `Rc`/`Arc` or
-    /// integer (e.g. a NIC ring index). Untyped so we don't
-    /// bake any one shape into the IOBuf.
-    drop_ctx: *mut (),
-}
-
-// SAFETY: `ExternalOwned` is Send because the underlying memory
-// is exclusively owned (the constructor takes that as a
-// precondition) and the function-pointer drop callback together
-// with the raw context pointer is Send-by-construction (function
-// pointers are Send; the caller is responsible for ensuring the
-// context's pointee is safe to drop on the worker that owns the
-// IOBuf at drop time).
-unsafe impl Send for ExternalOwned {}
-
-impl Drop for ExternalOwned {
-    fn drop(&mut self) {
-        // SAFETY: function-pointer's contract was set by the
-        // `wrap_owned` caller — they're responsible for ensuring
-        // the pair (drop_fn, drop_ctx) is sound to invoke now.
-        // Drop runs exactly once per `ExternalOwned`.
-        unsafe {
-            (self.drop_fn)(self.base, self.capacity, self.drop_ctx);
+/// Forward an `IOBuf` method to the active variant struct. The
+/// per-variant logic is written once on the struct (`storage.rs`);
+/// this is the thin, mechanical dispatch the doc calls "written
+/// twice" — once here for `&self`, once for `&mut self`.
+macro_rules! dispatch {
+    ($self:ident, $b:ident => $body:expr) => {
+        match &$self.inner {
+            Inner::Heap($b) => $body,
+            Inner::Static($b) => $body,
+            Inner::External($b) => $body,
+            Inner::Borrowed($b) => $body,
         }
-    }
+    };
+    (mut $self:ident, $b:ident => $body:expr) => {
+        match &mut $self.inner {
+            Inner::Heap($b) => $body,
+            Inner::Static($b) => $body,
+            Inner::External($b) => $body,
+            Inner::Borrowed($b) => $body,
+        }
+    };
 }
 
 impl IOBuf {
-    /// Allocate a heap-backed buffer with `headroom` bytes
-    /// reserved at the front and `tailroom` bytes reserved at the
-    /// end. Total allocation is `headroom + payload_capacity +
-    /// tailroom` bytes; the visible payload starts empty (`len =
-    /// 0`) at offset `headroom`. Lower layers prepend by writing
-    /// into the headroom; higher layers can append data into the
-    /// payload-then-tailroom region via `append_slice`.
+    /// Allocate a heap-backed buffer with `headroom` bytes reserved
+    /// at the front and `tailroom` at the end. Total allocation is
+    /// `headroom + payload_capacity + tailroom`; the visible payload
+    /// starts empty (`len = 0`) at offset `headroom`.
     pub fn new_with_reserved(
         headroom: usize,
         payload_capacity: usize,
         tailroom: usize,
     ) -> Self {
         let cap = headroom + payload_capacity + tailroom;
-        // `vec![0u8; cap].into_boxed_slice()` zero-fills the whole
-        // region. We don't strictly need zero-init for headroom /
-        // tailroom (nobody reads those), but the allocator's
-        // free-list returns it eventually so initial-zeroing keeps
-        // info-leak class bugs away. Fast enough at our buffer
-        // sizes (sub-µs for 1500-byte allocs on talc).
+        // Zero-fill: nobody reads headroom / tailroom, but the
+        // allocator's free-list returns this memory eventually so
+        // initial-zeroing keeps info-leak-class bugs away.
         let storage = alloc::vec![0u8; cap].into_boxed_slice();
         IOBuf {
-            inner: Inner::Heap {
-                storage,
-                offset: headroom as u32,
-                len: 0,
-            },
+            inner: Inner::Heap(HeapStorage::new(storage, headroom as u32, 0)),
         }
     }
 
     /// Zero-init-free variant of [`Self::new_with_reserved`]. Saves
-    /// the `vec![0u8; cap]` memset cost at the price of an unsafe
-    /// contract: the caller must write to every byte before reading.
-    /// Returns a `Heap` IOBuf with `len = 0` so `data()` is empty;
-    /// callers grow the visible region via `append_slice` /
-    /// `writer` / `extend_uninit` (which write before exposing
-    /// bytes) and / or `prepend` (which writes into headroom before
-    /// moving the visible window over it). The uninitialised
-    /// headroom / tailroom never become visible.
-    ///
-    /// Hot path for response-body construction at peak request
-    /// rate, where the memset on the cold-cache `vec![0u8; …]`
-    /// path was measurable in memory-bandwidth profiles.
+    /// the memset at the price of an unsafe contract: the caller must
+    /// write to every byte before reading it.
     ///
     /// SAFETY: the caller must ensure no byte is read via `data()`
     /// before it's been written through one of `append_slice`,
-    /// `writer`, `extend_uninit`, or a `prepend` that consumes
-    /// the byte's position from headroom into the visible region.
-    /// The IOBuf API enforces this for callers that only use the
-    /// public mutation entry points — but a caller that
-    /// manipulates `Inner::Heap`'s offsets directly could expose
-    /// uninit bytes.
+    /// `writer`, `extend_uninit`, or a `prepend` that moves the
+    /// visible window over it. The IOBuf API enforces this for
+    /// callers that only use the public mutation entry points.
     pub unsafe fn new_with_reserved_uninit(
         headroom: usize,
         payload_capacity: usize,
         tailroom: usize,
     ) -> Self {
         let cap = headroom + payload_capacity + tailroom;
-        // SAFETY: `Box::<[u8]>::new_uninit_slice(cap).assume_init()`
-        // returns a `Box<[u8]>` whose bytes are uninitialised. The
-        // caller's contract (above) is that no byte is read before
-        // it's been written; visible payload starts empty so
-        // `data()` is `&[]` (no read), and growth happens through
-        // entry points that write-then-expose.
-        let storage = unsafe {
-            alloc::boxed::Box::<[u8]>::new_uninit_slice(cap).assume_init()
-        };
+        // SAFETY: `new_uninit_slice(cap).assume_init()` returns a
+        // `Box<[u8]>` whose bytes are uninitialised; the caller's
+        // contract is that no byte is read before being written.
+        let storage = unsafe { Box::<[u8]>::new_uninit_slice(cap).assume_init() };
         IOBuf {
-            inner: Inner::Heap {
-                storage,
-                offset: headroom as u32,
-                len: 0,
-            },
+            inner: Inner::Heap(HeapStorage::new(storage, headroom as u32, 0)),
         }
     }
 
-    /// Heap-backed buffer pre-filled with `data`. Reserves
-    /// `headroom` / `tailroom` around the payload for downstream
-    /// layer prepend/append.
+    /// Heap-backed buffer pre-filled with `data`, with `headroom` /
+    /// `tailroom` reserved around the payload.
     pub fn from_slice_with_headroom(headroom: usize, data: &[u8], tailroom: usize) -> Self {
         let mut buf = Self::new_with_reserved(headroom, data.len(), tailroom);
-        buf.append_slice(data).expect("freshly-sized buffer accepts payload");
+        buf.append_slice(data)
+            .expect("freshly-sized buffer accepts payload");
         buf
     }
 
     /// Borrow a static-lifetime slice. Zero allocation. Subsequent
-    /// `prepend` / `append_slice` / `data_mut` calls return errors
+    /// `prepend` / `append_slice` / `data_mut` return errors / `None`
     /// — static borrows are immutable.
     pub const fn from_static(data: &'static [u8]) -> Self {
         IOBuf {
-            inner: Inner::Static { data },
+            inner: Inner::Static(StaticView::new(data)),
         }
     }
 
-    /// Wrap a foreign region that this IOBuf takes ownership of
-    /// via a drop callback. On drop, `drop_fn(base, capacity,
-    /// drop_ctx)` runs exactly once, regardless of how the
-    /// IOBuf's offset/len shifted during its lifetime — the
-    /// consumer that gave us the region wants the whole thing
-    /// back (e.g. a NIC descriptor index), not the shifted view.
+    /// Wrap a foreign region that this IOBuf takes ownership of via a
+    /// drop callback. On drop, `drop_fn(base, capacity, drop_ctx)`
+    /// runs exactly once, with the original `(base, capacity)`
+    /// regardless of how offset/len shifted.
     ///
-    /// Canonical sites: NIC zero-copy RX (callback returns the
-    /// descriptor to the ring), pool-backed buffer storage
-    /// (callback returns the `Box<[u8]>` to the pool's free list).
-    ///
-    /// `drop_ctx` is opaque — typically a raw `*mut` pointer the
-    /// caller cast from `Rc::into_raw` / `Arc::into_raw` (the
-    /// callback `Rc::from_raw` / `Arc::from_raw` it back) or a
-    /// packed integer (e.g. a ring slot index). Untyped so any
-    /// consumer shape fits without baking the IOBuf to one
-    /// pattern.
-    ///
-    /// The resulting IOBuf is `Send` (cross-worker movement is
-    /// allowed — the drop callback handles whichever worker the
-    /// IOBuf ends up on). For non-owning views — i.e. borrowed
-    /// regions whose lifetime the caller manages out-of-band —
-    /// use [`borrow`](Self::borrow) instead, which produces a
-    /// `!Send` IOBuf.
+    /// The result is an *owned* IOBuf. The owned, `Send` shape is
+    /// [`OwnedIOBuf`] — and that is exactly what
+    /// [`OwnedIOBuf::wrap_owned`] produces; this `IOBuf`-returning
+    /// form widens it via `From<OwnedIOBuf>` for callers that build
+    /// a (possibly borrow-mixing) `IOBuf` chain. For a non-owning
+    /// view use [`borrow`](Self::borrow) instead.
     ///
     /// SAFETY: the caller MUST guarantee:
-    ///   * `base..base+capacity` is a valid, exclusively-owned
-    ///     byte region for the IOBuf's lifetime.
+    ///   * `base..base+capacity` is a valid, exclusively-owned byte
+    ///     region for the IOBuf's lifetime.
     ///   * `offset + len <= capacity`.
-    ///   * `drop_fn(base, capacity, drop_ctx)` is sound to
-    ///     invoke once at IOBuf-drop time. Implementations
-    ///     typically reconstruct an owned type from `drop_ctx`
-    ///     (e.g. `Box::from_raw`, `Arc::from_raw`) and let it
-    ///     drop, returning storage to its pool.
-    ///   * The pair is Send-safe: the IOBuf may move across
-    ///     workers, and the eventual drop runs on whichever
+    ///   * `drop_fn(base, capacity, drop_ctx)` is sound to invoke
+    ///     once at IOBuf-drop time.
+    ///   * The pair is Send-safe: the eventual drop runs on whichever
     ///     worker owns the IOBuf at drop time.
     pub unsafe fn wrap_owned(
-        base: core::ptr::NonNull<u8>,
+        base: NonNull<u8>,
         capacity: u32,
         offset: u32,
         len: u32,
         drop_fn: IOBufDropFn,
         drop_ctx: *mut (),
     ) -> Self {
-        debug_assert!(offset.saturating_add(len) <= capacity);
-        IOBuf {
-            inner: Inner::ExternalOwned(ExternalOwned {
-                base,
-                capacity,
-                offset,
-                len,
-                drop_fn,
-                drop_ctx,
-            }),
-        }
+        // SAFETY: forwarded to `OwnedIOBuf::wrap_owned` verbatim —
+        // the caller's contract above is exactly its contract.
+        let owned = unsafe {
+            OwnedIOBuf::wrap_owned(base, capacity, offset, len, drop_fn, drop_ctx)
+        };
+        owned.into()
     }
 
-    /// Borrow a foreign region as an IOBuf view. No drop
-    /// callback runs; the caller is responsible for ensuring
-    /// the underlying storage outlives every IOBuf that borrows
-    /// it.
+    /// Borrow a foreign region as an IOBuf view. No drop callback
+    /// runs; the caller ensures the storage outlives every IOBuf
+    /// that borrows it.
     ///
-    /// Typical sites:
-    ///   * Per-worker scratch (TLS record, body) borrowed for
-    ///     the duration of one send call.
-    ///   * Driver TX-pool slot borrowed inside a synchronous
-    ///     `try_send_tso` closure.
-    ///   * Per-conn stack-resident header arrays borrowed for
-    ///     the duration of one response.
-    ///   * A `&[u8]` slice borrowed for a single async
-    ///     `send_bytes`.
-    ///
-    /// The resulting IOBuf is `!Send + !Sync` (the
-    /// `Inner::Borrowed` variant propagates this through the
-    /// enum's auto-traits). Crossing worker boundaries with a
-    /// borrowed IOBuf is therefore a compile error unless a
-    /// containing struct provides an `unsafe impl Send` override
-    /// — at which point the override author owns the
-    /// cross-worker-safety contract.
+    /// The result is `!Send + !Sync` (the `Borrowed` variant
+    /// propagates this through the enum). Crossing a worker boundary
+    /// with a borrowed IOBuf is therefore a compile error — and the
+    /// cross-core path is typed `OwnedIOBuf`, which has no borrowed
+    /// variant, so a borrow can't reach it at all.
     ///
     /// SAFETY: the caller MUST guarantee:
     ///   * `base..base+capacity` is a valid byte region for the
     ///     entire lifetime of this IOBuf.
     ///   * `offset + len <= capacity`.
-    ///   * No other route concurrently mutates the borrowed
-    ///     region while this IOBuf exists.
-    ///   * If multiple IOBufs view the same underlying storage
-    ///     (e.g. carving sub-ranges of a per-worker scratch),
-    ///     their visible regions do not overlap when any IOBuf
-    ///     is mutated through `data_mut`, `prepend`,
-    ///     `append_slice`, etc.
+    ///   * No other route concurrently mutates the borrowed region
+    ///     while this IOBuf exists.
+    ///   * If multiple IOBufs view the same storage, their visible
+    ///     regions do not overlap when any is mutated.
     pub unsafe fn borrow(
-        base: core::ptr::NonNull<u8>,
+        base: NonNull<u8>,
         capacity: u32,
         offset: u32,
         len: u32,
     ) -> Self {
-        debug_assert!(offset.saturating_add(len) <= capacity);
         IOBuf {
-            inner: Inner::Borrowed {
-                base,
-                capacity,
-                offset,
-                len,
-                _not_send: PhantomData,
-                #[cfg(any(test, debug_assertions))]
-                _guard: BorrowGuard::new(base, capacity),
-            },
+            inner: Inner::Borrowed(BorrowedView::new(base, capacity, offset, len)),
         }
     }
 
     /// Visible payload bytes.
     #[inline]
     pub fn data(&self) -> &[u8] {
-        match &self.inner {
-            Inner::Heap {
-                storage,
-                offset,
-                len,
-            } => {
-                let o = *offset as usize;
-                let l = *len as usize;
-                &storage[o..o + l]
-            }
-            Inner::Static { data } => data,
-            Inner::ExternalOwned(e) => {
-                // SAFETY: base + offset is in-bounds by
-                // construction precondition (offset + len <=
-                // capacity); the underlying memory is exclusively
-                // owned by this IOBuf for its lifetime.
-                unsafe {
-                    core::slice::from_raw_parts(
-                        e.base.as_ptr().add(e.offset as usize),
-                        e.len as usize,
-                    )
-                }
-            }
-            Inner::Borrowed {
-                base, offset, len, ..
-            } => {
-                // SAFETY: caller of `borrow` guaranteed the
-                // region is valid for this IOBuf's lifetime and
-                // not concurrently mutated.
-                unsafe {
-                    core::slice::from_raw_parts(
-                        base.as_ptr().add(*offset as usize),
-                        *len as usize,
-                    )
-                }
-            }
-        }
+        dispatch!(self, b => b.data())
     }
 
+    /// Visible payload length.
     #[inline]
     pub fn len(&self) -> usize {
-        match &self.inner {
-            Inner::Heap { len, .. } => *len as usize,
-            Inner::Static { data } => data.len(),
-            Inner::ExternalOwned(e) => e.len as usize,
-            Inner::Borrowed { len, .. } => *len as usize,
-        }
+        dispatch!(self, b => b.len())
     }
 
     #[inline]
@@ -588,47 +311,16 @@ impl IOBuf {
         self.len() == 0
     }
 
-    /// Bytes available before the payload. Lower layers (TLS,
-    /// TCP, IP, Eth) prepend their headers into this space.
-    /// Always `0` for static borrows.
+    /// Bytes available before the payload. `0` for static borrows.
     #[inline]
     pub fn headroom(&self) -> usize {
-        match &self.inner {
-            Inner::Heap { offset, .. } => *offset as usize,
-            Inner::Static { .. } => 0,
-            Inner::ExternalOwned(e) => e.offset as usize,
-            Inner::Borrowed { offset, .. } => *offset as usize,
-        }
+        dispatch!(self, b => b.headroom())
     }
 
-    /// Bytes available after the payload. Used for AEAD tags,
-    /// trailers, etc. Always `0` for static borrows.
+    /// Bytes available after the payload. `0` for static borrows.
     #[inline]
     pub fn tailroom(&self) -> usize {
-        match &self.inner {
-            Inner::Heap {
-                storage,
-                offset,
-                len,
-            } => {
-                let used = *offset as usize + *len as usize;
-                storage.len().saturating_sub(used)
-            }
-            Inner::Static { .. } => 0,
-            Inner::ExternalOwned(e) => {
-                let used = e.offset as usize + e.len as usize;
-                (e.capacity as usize).saturating_sub(used)
-            }
-            Inner::Borrowed {
-                capacity,
-                offset,
-                len,
-                ..
-            } => {
-                let used = *offset as usize + *len as usize;
-                (*capacity as usize).saturating_sub(used)
-            }
-        }
+        dispatch!(self, b => b.tailroom())
     }
 
     /// Mutable access to the visible payload. Returns `None` for
@@ -636,240 +328,31 @@ impl IOBuf {
     /// seals into the source bytes).
     #[inline]
     pub fn data_mut(&mut self) -> Option<&mut [u8]> {
-        match &mut self.inner {
-            Inner::Heap {
-                storage,
-                offset,
-                len,
-            } => {
-                let o = *offset as usize;
-                let l = *len as usize;
-                Some(&mut storage[o..o + l])
-            }
-            Inner::Static { .. } => None,
-            Inner::ExternalOwned(e) => {
-                // SAFETY: same as `data()`; we additionally hold
-                // `&mut self` so no aliasing with other readers
-                // during this call.
-                Some(unsafe {
-                    core::slice::from_raw_parts_mut(
-                        e.base.as_ptr().add(e.offset as usize),
-                        e.len as usize,
-                    )
-                })
-            }
-            Inner::Borrowed {
-                base, offset, len, ..
-            } => {
-                // SAFETY: `borrow` caller guaranteed the region
-                // is not concurrently mutated through any other
-                // route; `&mut self` gives us exclusive write
-                // access for this call.
-                Some(unsafe {
-                    core::slice::from_raw_parts_mut(
-                        base.as_ptr().add(*offset as usize),
-                        *len as usize,
-                    )
-                })
-            }
-        }
+        dispatch!(mut self, b => b.data_mut())
     }
 
-    /// Prepend `data` into the headroom and grow the visible
-    /// payload accordingly. The returned slice points at the
-    /// freshly-prepended region (in case the caller wants to
-    /// overwrite via further mutation).
-    ///
-    /// `Err(IOBufError::NoHeadroom)` if the headroom is too small;
-    /// `Err(IOBufError::Immutable)` for static borrows.
+    /// Prepend `data` into the headroom and grow the visible payload.
+    /// `Err(NoHeadroom)` if headroom is too small; `Err(Immutable)`
+    /// for static borrows.
     pub fn prepend(&mut self, data: &[u8]) -> Result<(), IOBufError> {
-        match &mut self.inner {
-            Inner::Heap {
-                storage,
-                offset,
-                len,
-            } => {
-                let n = data.len();
-                if n > *offset as usize {
-                    return Err(IOBufError::NoHeadroom);
-                }
-                let new_offset = *offset - n as u32;
-                let dst = &mut storage[new_offset as usize..*offset as usize];
-                dst.copy_from_slice(data);
-                *offset = new_offset;
-                *len += n as u32;
-                Ok(())
-            }
-            Inner::Static { .. } => Err(IOBufError::Immutable),
-            Inner::ExternalOwned(e) => {
-                let n = data.len();
-                if n > e.offset as usize {
-                    return Err(IOBufError::NoHeadroom);
-                }
-                let new_offset = e.offset - n as u32;
-                // SAFETY: bounds checked above; exclusive access
-                // via `&mut self`.
-                unsafe {
-                    let dst = core::slice::from_raw_parts_mut(
-                        e.base.as_ptr().add(new_offset as usize),
-                        n,
-                    );
-                    dst.copy_from_slice(data);
-                }
-                e.offset = new_offset;
-                e.len += n as u32;
-                Ok(())
-            }
-            Inner::Borrowed {
-                base, offset, len, ..
-            } => {
-                let n = data.len();
-                if n > *offset as usize {
-                    return Err(IOBufError::NoHeadroom);
-                }
-                let new_offset = *offset - n as u32;
-                // SAFETY: bounds checked above; exclusive access
-                // via `&mut self`; `borrow` caller guaranteed no
-                // concurrent mutation through other routes.
-                unsafe {
-                    let dst = core::slice::from_raw_parts_mut(
-                        base.as_ptr().add(new_offset as usize),
-                        n,
-                    );
-                    dst.copy_from_slice(data);
-                }
-                *offset = new_offset;
-                *len += n as u32;
-                Ok(())
-            }
-        }
+        dispatch!(mut self, b => b.prepend(data))
     }
 
-    /// Append `data` into the tailroom and grow the visible
-    /// payload accordingly.
+    /// Append `data` into the tailroom and grow the visible payload.
     pub fn append_slice(&mut self, data: &[u8]) -> Result<(), IOBufError> {
-        match &mut self.inner {
-            Inner::Heap {
-                storage,
-                offset,
-                len,
-            } => {
-                let end = *offset as usize + *len as usize;
-                let n = data.len();
-                if end + n > storage.len() {
-                    return Err(IOBufError::NoTailroom);
-                }
-                storage[end..end + n].copy_from_slice(data);
-                *len += n as u32;
-                Ok(())
-            }
-            Inner::Static { .. } => Err(IOBufError::Immutable),
-            Inner::ExternalOwned(e) => {
-                let end = e.offset as usize + e.len as usize;
-                let n = data.len();
-                if end + n > e.capacity as usize {
-                    return Err(IOBufError::NoTailroom);
-                }
-                // SAFETY: bounds checked above.
-                unsafe {
-                    let dst = core::slice::from_raw_parts_mut(
-                        e.base.as_ptr().add(end),
-                        n,
-                    );
-                    dst.copy_from_slice(data);
-                }
-                e.len += n as u32;
-                Ok(())
-            }
-            Inner::Borrowed {
-                base,
-                capacity,
-                offset,
-                len,
-                ..
-            } => {
-                let end = *offset as usize + *len as usize;
-                let n = data.len();
-                if end + n > *capacity as usize {
-                    return Err(IOBufError::NoTailroom);
-                }
-                // SAFETY: bounds checked above; `borrow` caller
-                // guaranteed no concurrent mutation.
-                unsafe {
-                    let dst = core::slice::from_raw_parts_mut(
-                        base.as_ptr().add(end),
-                        n,
-                    );
-                    dst.copy_from_slice(data);
-                }
-                *len += n as u32;
-                Ok(())
-            }
-        }
+        dispatch!(mut self, b => b.append_slice(data))
     }
 
-    /// Append `n` zero bytes (or rather, the slot's existing
-    /// uninitialised contents — we don't re-zero) and return a
-    /// mutable slice pointing at them. Used by AEAD seal: the
-    /// caller advances the visible len, then writes the tag bytes
-    /// directly into the returned slice.
+    /// Grow the visible payload by `n` bytes (contents
+    /// uninitialised) and return a mutable slice over them. Used by
+    /// AEAD seal: advance the visible len, write the tag in place.
     pub fn extend_uninit(&mut self, n: usize) -> Result<&mut [u8], IOBufError> {
-        match &mut self.inner {
-            Inner::Heap {
-                storage,
-                offset,
-                len,
-            } => {
-                let end = *offset as usize + *len as usize;
-                if end + n > storage.len() {
-                    return Err(IOBufError::NoTailroom);
-                }
-                *len += n as u32;
-                Ok(&mut storage[end..end + n])
-            }
-            Inner::Static { .. } => Err(IOBufError::Immutable),
-            Inner::ExternalOwned(e) => {
-                let end = e.offset as usize + e.len as usize;
-                if end + n > e.capacity as usize {
-                    return Err(IOBufError::NoTailroom);
-                }
-                e.len += n as u32;
-                // SAFETY: bounds checked above; exclusive access.
-                Ok(unsafe {
-                    core::slice::from_raw_parts_mut(e.base.as_ptr().add(end), n)
-                })
-            }
-            Inner::Borrowed {
-                base,
-                capacity,
-                offset,
-                len,
-                ..
-            } => {
-                let end = *offset as usize + *len as usize;
-                if end + n > *capacity as usize {
-                    return Err(IOBufError::NoTailroom);
-                }
-                *len += n as u32;
-                // SAFETY: bounds checked above; exclusive access
-                // via `&mut self`.
-                Ok(unsafe {
-                    core::slice::from_raw_parts_mut(base.as_ptr().add(end), n)
-                })
-            }
-        }
+        dispatch!(mut self, b => b.extend_uninit(n))
     }
 
     /// Narrow the visible payload to `[offset..offset+len]` relative
-    /// to the current visible region. Equivalent to
-    /// `self.consume(offset)?` followed by trimming any tail past
-    /// `len` via `trim_end`. The common case in protocol dispatch:
-    /// "advance past my header (offset = header_size), and cut
-    /// trailing IP padding if my payload is shorter than the
-    /// frame I came in on (len = next-layer total)."
-    ///
-    /// Returns `Err` if `offset + len` exceeds the current visible
-    /// payload length.
+    /// to the current visible region. `Err` if `offset + len`
+    /// exceeds the current visible length.
     #[inline]
     pub fn narrow(&mut self, offset: usize, len: usize) -> Result<(), IOBufError> {
         self.consume(offset)?;
@@ -881,156 +364,98 @@ impl IOBuf {
     }
 
     /// Trim `n` bytes from the FRONT of the visible payload.
-    /// Used by the consumer side after a layer has stripped its
-    /// header (e.g. TLS unprotect leaves the record header
-    /// untouched in headroom; the next layer up just wants the
-    /// plaintext).
     #[inline]
     pub fn consume(&mut self, n: usize) -> Result<(), IOBufError> {
-        match &mut self.inner {
-            Inner::Heap { offset, len, .. } => {
-                if n > *len as usize {
-                    return Err(IOBufError::OutOfBounds);
-                }
-                *offset += n as u32;
-                *len -= n as u32;
-                Ok(())
-            }
-            Inner::Static { data } => {
-                if n > data.len() {
-                    return Err(IOBufError::OutOfBounds);
-                }
-                *data = &data[n..];
-                Ok(())
-            }
-            Inner::ExternalOwned(e) => {
-                if n > e.len as usize {
-                    return Err(IOBufError::OutOfBounds);
-                }
-                e.offset += n as u32;
-                e.len -= n as u32;
-                Ok(())
-            }
-            Inner::Borrowed { offset, len, .. } => {
-                if n > *len as usize {
-                    return Err(IOBufError::OutOfBounds);
-                }
-                *offset += n as u32;
-                *len -= n as u32;
-                Ok(())
-            }
-        }
-    }
-
-    /// `core::fmt::Write` adapter that appends formatted bytes
-    /// into the IOBuf's tailroom. Lets callers `write!(buf.writer(),
-    /// "{}", value)` to render straight into the IOBuf instead of
-    /// going through an intermediate `String` + memcpy.
-    ///
-    /// The writer drops `Ok` even if the tailroom fills mid-render
-    /// — `core::fmt::Write` doesn't surface `Err` for buffer
-    /// exhaustion, so the caller checks `data().len()` afterward
-    /// to detect truncation. Sized correctly the truncation path
-    /// is cold.
-    pub fn writer(&mut self) -> IOBufWriter<'_> {
-        IOBufWriter { buf: self, overflowed: false }
+        dispatch!(mut self, b => b.consume(n))
     }
 
     /// Trim `n` bytes from the BACK of the visible payload.
     #[inline]
     pub fn trim_end(&mut self, n: usize) -> Result<(), IOBufError> {
-        match &mut self.inner {
-            Inner::Heap { len, .. } => {
-                if n > *len as usize {
-                    return Err(IOBufError::OutOfBounds);
-                }
-                *len -= n as u32;
-                Ok(())
-            }
-            Inner::Static { data } => {
-                if n > data.len() {
-                    return Err(IOBufError::OutOfBounds);
-                }
-                *data = &data[..data.len() - n];
-                Ok(())
-            }
-            Inner::ExternalOwned(e) => {
-                if n > e.len as usize {
-                    return Err(IOBufError::OutOfBounds);
-                }
-                e.len -= n as u32;
-                Ok(())
-            }
-            Inner::Borrowed { len, .. } => {
-                if n > *len as usize {
-                    return Err(IOBufError::OutOfBounds);
-                }
-                *len -= n as u32;
-                Ok(())
-            }
+        dispatch!(mut self, b => b.trim_end(n))
+    }
+
+    /// `core::fmt::Write` adapter that appends formatted bytes into
+    /// the IOBuf's tailroom — `write!(buf.writer(), "{}", value)`
+    /// renders straight into the IOBuf with no intermediate `String`.
+    pub fn writer(&mut self) -> IOBufWriter<'_> {
+        IOBufWriter {
+            buf: self,
+            overflowed: false,
         }
     }
 
     /// Convert this IOBuf into one that fully owns (or statically
-    /// outlives) its bytes — i.e. one carrying no out-of-band
-    /// lifetime contract, so it is safe to send across workers.
+    /// outlives) its bytes — carrying no out-of-band lifetime
+    /// contract.
     ///
-    ///   * `Heap` / `Static` / `ExternalOwned` — each already owns
-    ///     its storage (or `'static`-outlives it). Returned
-    ///     unchanged: **zero copy**.
+    ///   * `Heap` / `Static` / `External` — each already owns its
+    ///     storage (or `'static`-outlives it). Returned unchanged:
+    ///     **zero copy**.
     ///   * `Borrowed` — the sole non-owning variant. Its visible
-    ///     payload is copied into a freshly-allocated `Heap` buffer
-    ///     (offset 0, no headroom / tailroom), because a borrowed
-    ///     view has no claim on its backing storage's lifetime.
-    ///     This is the **only** variant that costs a copy.
+    ///     payload is copied into a freshly-allocated `Heap` buffer.
+    ///     The **only** variant that costs a copy.
     ///
     /// The escape hatch for "I hold a `Borrowed` view of inbound
-    /// bytes but need owned, `Send`-able possession of them" — e.g.
-    /// a proxy handler forwarding request bytes into an outbound
-    /// async `send`, where the borrowed source (a per-conn parse
-    /// buffer, or the TLS `pt_buf`) could be overwritten before
-    /// that send completes. Materialises owned storage on demand,
-    /// a no-op when ownership already holds.
+    /// bytes but need owned possession of them" — e.g. a proxy
+    /// handler forwarding request bytes into an outbound async
+    /// `send`, where the borrowed source could be overwritten before
+    /// that send completes. Materialises owned storage on demand, a
+    /// no-op when ownership already holds. It stays `IOBuf -> IOBuf`:
+    /// a cross-*time* tool, orthogonal to the borrowed/owned split's
+    /// cross-*core* `OwnedIOBuf` typing.
     pub fn into_owned(mut self) -> IOBuf {
-        if matches!(self.inner, Inner::Borrowed { .. }) {
+        if matches!(self.inner, Inner::Borrowed(_)) {
             // Copy the visible payload into owned heap storage.
-            // `data()`'s borrow ends at `.to_vec()` (which produces
-            // an independent allocation), so the subsequent
-            // `self.inner` write is unambiguous. That write drops
-            // the old `Inner::Borrowed`, whose `BorrowGuard`
-            // unregisters the region from the debug-mode aliasing
+            // `data()`'s borrow ends at `.to_vec()`; the subsequent
+            // `self.inner` write drops the old `Borrowed`, whose
+            // `BorrowGuard` unregisters from the debug-mode aliasing
             // tracker — symmetric with the `borrow` that minted it.
             let owned: Box<[u8]> = self.data().to_vec().into_boxed_slice();
             let len = owned.len() as u32;
-            self.inner = Inner::Heap {
-                storage: owned,
-                offset: 0,
-                len,
-            };
+            self.inner = Inner::Heap(HeapStorage::new(owned, 0, len));
         }
         self
     }
 }
 
-/// `core::fmt::Write` adapter for [`IOBuf`]. Appends formatted
-/// bytes into the buffer's tailroom; if tailroom runs out
-/// mid-render the writer silently truncates (see `overflowed`).
-/// Used by app-side response builders to render dynamic content
-/// directly into a TLS-ready IOBuf without an intermediate
-/// `String` allocation + memcpy.
+impl IOBufRead for IOBuf {
+    #[inline]
+    fn data(&self) -> &[u8] {
+        IOBuf::data(self)
+    }
+    #[inline]
+    fn len(&self) -> usize {
+        IOBuf::len(self)
+    }
+    #[inline]
+    fn headroom(&self) -> usize {
+        IOBuf::headroom(self)
+    }
+    #[inline]
+    fn tailroom(&self) -> usize {
+        IOBuf::tailroom(self)
+    }
+}
+
+// ============================================================================
+// IOBufWriter — `core::fmt::Write` adapter for IOBuf.
+// ============================================================================
+
+/// `core::fmt::Write` adapter for [`IOBuf`]. Appends formatted bytes
+/// into the buffer's tailroom; if tailroom runs out mid-render the
+/// writer silently truncates (see `overflowed`).
 pub struct IOBufWriter<'a> {
     buf: &'a mut IOBuf,
-    /// Set when an `extend_uninit` call inside `write_str` failed
-    /// (tailroom exhausted). The caller queries this after the
-    /// `write!`/`writeln!` chain completes — `core::fmt::Write`'s
-    /// `Result` doesn't propagate buffer-out-of-space errors.
+    /// Set when an append inside `write_str` failed (tailroom
+    /// exhausted). `core::fmt::Write`'s `Result` doesn't carry a
+    /// buffer-out-of-space signal, so callers query this afterward.
     overflowed: bool,
 }
 
 impl IOBufWriter<'_> {
     /// True if any append during this writer's lifetime hit a
-    /// tailroom exhaustion. Caller should treat the IOBuf as
-    /// truncated and either grow it or surface an error.
+    /// tailroom exhaustion. The IOBuf should be treated as truncated.
     pub fn overflowed(&self) -> bool {
         self.overflowed
     }
@@ -1042,604 +467,167 @@ impl core::fmt::Write for IOBufWriter<'_> {
             Ok(()) => Ok(()),
             Err(_) => {
                 self.overflowed = true;
-                // `core::fmt::Write::write_str` returns
-                // `core::fmt::Error` on failure. Returning Err
-                // here halts the `write!` macro chain. The
-                // caller still checks `overflowed()` for the
-                // narrower "tailroom exhausted" signal.
                 Err(core::fmt::Error)
             }
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IOBufError {
-    NoHeadroom,
-    NoTailroom,
-    OutOfBounds,
-    Immutable,
-}
-
 // ============================================================================
-// Chain
+// OwnedIOBuf — the flat `Send`-by-derivation enum for the RX path.
 // ============================================================================
 
-/// A chain of `IOBuf` segments. Push-front / push-back at the
-/// chain level are amortised O(1); the `Cursor` walks part
-/// boundaries transparently for readers.
+/// An IOBuf restricted to the two **owning** storage variants —
+/// `HeapStorage` and `ExternalOwned`. Both are `Send`, so `OwnedIOBuf`
+/// is `Send` **by auto-derivation**: no `unsafe impl`, no container
+/// invariant. `Chain<OwnedIOBuf>` is likewise `Send` for free.
 ///
-/// The chain is the natural shape for a multi-layer stack: each
-/// layer can append/prepend parts (or prepend INTO the front
-/// part's headroom) without disturbing the rest.
+/// This is the type the cross-core RX path is *born* in —
+/// [`OwnedIOBuf::wrap_owned`] and [`IOBufPool::alloc`] produce it,
+/// and it stays `OwnedIOBuf` through the `NicOps` callback, net
+/// dispatch, and the per-core RX inbox. A `BorrowedView` *cannot*
+/// reach that path: the path's type is `OwnedIOBuf` and no
+/// constructor of `OwnedIOBuf` takes a borrow — compile-time
+/// cross-core safety, not discipline.
 ///
-/// Representation — a three-state value (see the private `Repr`):
+/// `StaticView` is deliberately excluded — not for a `Send` reason
+/// (`&'static [u8]` is `Send`) but a modelling one: a static slice
+/// is an *immortal borrow*, not owned storage, so it stays in
+/// `IOBuf` with the other non-owning view.
 ///
-///   * **`Empty`** — no parts.
-///   * **`Single`** — exactly one part, stored inline. **Zero
-///     heap allocation** for the chain machinery. This is the
-///     dominant shape on both the TX and RX paths: a lone body
-///     buffer, a single borrowed slice for a raw send, a
-///     single-buffer RX frame.
-///   * **`Many`** — two or more parts, held in a `VecDeque<IOBuf>`
-///     (one heap allocation). Genuine multi-part chains: layered
-///     framing that can't prepend in place, multi-chunk bodies.
-///
-/// This deliberately specialises the *single-part* chain rather
-/// than reserving a fixed inline array sized for some guessed
-/// part count — so there is no `INLINE_PARTS`-style tuning knob
-/// to mis-set. One part is free; two-or-more pay a single
-/// `VecDeque` allocation, onto a path already allocation-heavy
-/// (each additional body part is itself an allocation).
-pub struct IOBufChain {
-    repr: Repr,
+/// Widening is one-way: `From<OwnedIOBuf> for IOBuf`. Nothing
+/// narrows `IOBuf -> OwnedIOBuf`.
+pub struct OwnedIOBuf {
+    inner: OwnedInner,
 }
 
-/// Storage backing an [`IOBufChain`]. Private: the chain's
-/// public surface is its methods — callers never match this.
-enum Repr {
-    /// No parts. Produced by `new()` / `Default`, and by a fully
-    /// drained or `clear`ed `Single` chain.
-    Empty,
-    /// Exactly one part, inline — no heap allocation for chain
-    /// machinery. `push_*` never store an empty `IOBuf`, so a
-    /// `Single` always holds a genuine part.
-    Single(IOBuf),
-    /// Two-or-more parts — or a `with_capacity`-preallocated
-    /// chain. `parts` is a heap `VecDeque`; `total_len` caches the
-    /// summed visible length so `total_len()` / `Cursor::remaining`
-    /// stay O(1). After pops or `clear`, `parts` may transiently
-    /// hold 0 or 1 entries: the `VecDeque` allocation is kept for
-    /// reuse rather than demoted back to `Single` / `Empty`.
-    Many {
-        parts: VecDeque<IOBuf>,
-        total_len: usize,
-    },
+/// Storage backing an [`OwnedIOBuf`] — the owning subset of `Inner`.
+enum OwnedInner {
+    /// Heap-owned `Box<[u8]>`.
+    Heap(HeapStorage),
+    /// A foreign region owned via a drop callback.
+    External(ExternalOwned),
 }
 
-/// `VecDeque` capacity reserved when a `Single` chain first
-/// upgrades to `Many`. Covers the common layered shape (a body
-/// part plus a couple of framing parts) without an immediate
-/// reallocation.
-const MANY_INIT_CAP: usize = 4;
+/// Static assertion: `OwnedIOBuf` (and a chain of them) is `Send` by
+/// auto-derivation. If a future change reintroduced a `!Send` field
+/// — a raw pointer, a `PhantomData<*const ()>` — this stops
+/// compiling, which is the point: the cross-core RX path's safety is
+/// this fact, checked by the compiler on every build.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<OwnedIOBuf>();
+    assert_send::<Chain<OwnedIOBuf>>();
+};
 
-impl IOBufChain {
-    pub const fn new() -> Self {
-        IOBufChain { repr: Repr::Empty }
-    }
+/// Forward an `OwnedIOBuf` read method to the active variant struct.
+/// The two-arm counterpart of `IOBuf`'s `dispatch!`.
+macro_rules! owned_dispatch {
+    ($self:ident, $b:ident => $body:expr) => {
+        match &$self.inner {
+            OwnedInner::Heap($b) => $body,
+            OwnedInner::External($b) => $body,
+        }
+    };
+}
 
-    /// Hint that the chain will hold at least `part_capacity`
-    /// parts. A hint of 0 or 1 is free — the chain starts `Empty`
-    /// and the first push lands in the zero-allocation `Single`
-    /// state. A hint of 2+ pre-allocates the `Many` `VecDeque` so
-    /// the multi-part pushes that follow don't reallocate.
-    pub fn with_capacity(part_capacity: usize) -> Self {
-        if part_capacity <= 1 {
-            IOBufChain { repr: Repr::Empty }
-        } else {
-            IOBufChain {
-                repr: Repr::Many {
-                    parts: VecDeque::with_capacity(part_capacity),
-                    total_len: 0,
-                },
-            }
+impl OwnedIOBuf {
+    /// Wrap a foreign region this IOBuf takes ownership of via a drop
+    /// callback — the owned, `Send` constructor for the cross-core RX
+    /// path (NIC zero-copy RX, pool slabs). On drop, `drop_fn(base,
+    /// capacity, drop_ctx)` runs exactly once.
+    ///
+    /// SAFETY: identical contract to [`IOBuf::wrap_owned`] — the
+    /// region is valid + exclusively owned for the IOBuf's lifetime,
+    /// `offset + len <= capacity`, and `(drop_fn, drop_ctx)` is
+    /// Send-safe and sound to invoke once at drop time.
+    pub unsafe fn wrap_owned(
+        base: NonNull<u8>,
+        capacity: u32,
+        offset: u32,
+        len: u32,
+        drop_fn: IOBufDropFn,
+        drop_ctx: *mut (),
+    ) -> Self {
+        OwnedIOBuf {
+            inner: OwnedInner::External(ExternalOwned::new(
+                base, capacity, offset, len, drop_fn, drop_ctx,
+            )),
         }
     }
 
-    /// Total visible-payload bytes summed across every part. O(1).
-    pub fn total_len(&self) -> usize {
-        match &self.repr {
-            Repr::Empty => 0,
-            Repr::Single(b) => b.len(),
-            Repr::Many { total_len, .. } => *total_len,
-        }
+    /// Visible payload bytes.
+    #[inline]
+    pub fn data(&self) -> &[u8] {
+        owned_dispatch!(self, b => b.data())
     }
 
-    /// True when the chain holds no parts.
+    /// Visible payload length.
+    #[inline]
+    pub fn len(&self) -> usize {
+        owned_dispatch!(self, b => b.len())
+    }
+
+    #[inline]
     pub fn is_empty(&self) -> bool {
-        match &self.repr {
-            Repr::Empty => true,
-            Repr::Single(_) => false,
-            Repr::Many { parts, .. } => parts.is_empty(),
-        }
+        self.len() == 0
     }
 
-    pub fn part_count(&self) -> usize {
-        match &self.repr {
-            Repr::Empty => 0,
-            Repr::Single(_) => 1,
-            Repr::Many { parts, .. } => parts.len(),
-        }
-    }
-
-    /// Borrow part `i` in front-to-back order, or `None` past the
-    /// last part. Backs both [`iter`](Self::iter) and the `Cursor`.
+    /// Bytes available before the payload.
     #[inline]
-    fn get_part(&self, i: usize) -> Option<&IOBuf> {
-        match &self.repr {
-            Repr::Empty => None,
-            Repr::Single(b) => (i == 0).then_some(b),
-            Repr::Many { parts, .. } => parts.get(i),
-        }
+    pub fn headroom(&self) -> usize {
+        owned_dispatch!(self, b => b.headroom())
     }
 
-    /// Append a buf to the back of the chain. Empty bufs are
-    /// dropped — a chain never carries a zero-length part.
-    pub fn push_back(&mut self, buf: IOBuf) {
-        if buf.is_empty() {
-            return;
-        }
-        // Fast path: an existing `Many` just pushes — no repr swap.
-        if let Repr::Many { parts, total_len } = &mut self.repr {
-            *total_len += buf.len();
-            parts.push_back(buf);
-            return;
-        }
-        // `Empty` -> `Single`, or `Single` -> `Many`.
-        self.repr = match core::mem::replace(&mut self.repr, Repr::Empty) {
-            Repr::Empty => Repr::Single(buf),
-            Repr::Single(existing) => {
-                let total_len = existing.len() + buf.len();
-                let mut parts = VecDeque::with_capacity(MANY_INIT_CAP);
-                parts.push_back(existing);
-                parts.push_back(buf);
-                Repr::Many { parts, total_len }
-            }
-            Repr::Many { .. } => unreachable!("Many handled by the fast path"),
-        };
-    }
-
-    /// Prepend a buf to the front of the chain. Empty bufs are
-    /// dropped. Amortised O(1).
-    pub fn push_front(&mut self, buf: IOBuf) {
-        if buf.is_empty() {
-            return;
-        }
-        if let Repr::Many { parts, total_len } = &mut self.repr {
-            *total_len += buf.len();
-            parts.push_front(buf);
-            return;
-        }
-        self.repr = match core::mem::replace(&mut self.repr, Repr::Empty) {
-            Repr::Empty => Repr::Single(buf),
-            Repr::Single(existing) => {
-                let total_len = existing.len() + buf.len();
-                let mut parts = VecDeque::with_capacity(MANY_INIT_CAP);
-                parts.push_back(buf); // new buf becomes the front
-                parts.push_back(existing);
-                Repr::Many { parts, total_len }
-            }
-            Repr::Many { .. } => unreachable!("Many handled by the fast path"),
-        };
-    }
-
-    /// Prepend `data` directly into the FRONT part's headroom,
-    /// without allocating a new part. Returns `Err` if the front
-    /// part is missing or static (no headroom). Lets a layer
-    /// prepend a small fixed header (TLS record header, H3 frame
-    /// header) without growing the chain.
-    pub fn prepend_in_place(&mut self, data: &[u8]) -> Result<(), IOBufError> {
-        let front = self.front_mut().ok_or(IOBufError::NoHeadroom)?;
-        front.prepend(data)?;
-        // A `Single`'s `total_len` is derived from the part itself,
-        // so the `prepend` above already accounts for the bytes;
-        // only `Many`'s cached `total_len` needs the adjustment.
-        if let Repr::Many { total_len, .. } = &mut self.repr {
-            *total_len += data.len();
-        }
-        Ok(())
-    }
-
-    /// Iterate the chain front-to-back.
+    /// Bytes available after the payload.
     #[inline]
-    pub fn iter(&self) -> impl Iterator<Item = &IOBuf> {
-        (0..self.part_count()).map(move |i| self.get_part(i).expect("i < part_count"))
+    pub fn tailroom(&self) -> usize {
+        owned_dispatch!(self, b => b.tailroom())
     }
+}
 
-    /// Mutable iterate front-to-back. Lets the caller mutate
-    /// individual parts (e.g. patch bytes through
-    /// `IOBuf::data_mut()` per part) without consuming the
-    /// chain.
+impl IOBufRead for OwnedIOBuf {
     #[inline]
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut IOBuf> {
-        match &mut self.repr {
-            Repr::Empty => ChainIterMut::Empty,
-            Repr::Single(b) => ChainIterMut::Single(Some(b)),
-            Repr::Many { parts, .. } => ChainIterMut::Many(parts.iter_mut()),
-        }
+    fn data(&self) -> &[u8] {
+        OwnedIOBuf::data(self)
     }
-
-    /// Pop the front part. Returns `None` when the chain is empty.
-    pub fn pop_front(&mut self) -> Option<IOBuf> {
-        if let Repr::Many { parts, total_len } = &mut self.repr {
-            let buf = parts.pop_front()?;
-            *total_len = total_len.saturating_sub(buf.len());
-            return Some(buf);
-        }
-        match core::mem::replace(&mut self.repr, Repr::Empty) {
-            Repr::Empty => None,
-            Repr::Single(buf) => Some(buf),
-            Repr::Many { .. } => unreachable!("Many handled by the fast path"),
-        }
+    #[inline]
+    fn len(&self) -> usize {
+        OwnedIOBuf::len(self)
     }
-
-    /// Mutable access to the front part. Used by partial-send
-    /// recovery paths that need to advance the head buf's visible
-    /// payload (`IOBuf::consume(n)`) when the underlying transport
-    /// committed only `n < head.len()` bytes. The caller is
-    /// responsible for keeping `total_len` in sync via
-    /// [`shrink_total_len`](Self::shrink_total_len).
-    pub fn front_mut(&mut self) -> Option<&mut IOBuf> {
-        match &mut self.repr {
-            Repr::Empty => None,
-            Repr::Single(b) => Some(b),
-            Repr::Many { parts, .. } => parts.front_mut(),
-        }
+    #[inline]
+    fn headroom(&self) -> usize {
+        OwnedIOBuf::headroom(self)
     }
-
-    /// Mutable access to the back part. Used by sealing paths
-    /// that append (e.g. an AEAD tag) onto the last IOBuf after
-    /// the encryption pass. Caller must call
-    /// [`bump_total_len`](Self::bump_total_len) after growing the
-    /// back part's visible payload.
-    pub fn back_mut(&mut self) -> Option<&mut IOBuf> {
-        match &mut self.repr {
-            Repr::Empty => None,
-            Repr::Single(b) => Some(b),
-            Repr::Many { parts, .. } => parts.back_mut(),
-        }
+    #[inline]
+    fn tailroom(&self) -> usize {
+        OwnedIOBuf::tailroom(self)
     }
+}
 
-    /// Pop the back part. Mirror of `pop_front`. Used by paths
-    /// that speculatively appended a part and need to rewind the
-    /// chain on a subsequent error.
-    pub fn pop_back(&mut self) -> Option<IOBuf> {
-        if let Repr::Many { parts, total_len } = &mut self.repr {
-            let buf = parts.pop_back()?;
-            *total_len = total_len.saturating_sub(buf.len());
-            return Some(buf);
-        }
-        match core::mem::replace(&mut self.repr, Repr::Empty) {
-            Repr::Empty => None,
-            Repr::Single(buf) => Some(buf),
-            Repr::Many { .. } => unreachable!("Many handled by the fast path"),
-        }
-    }
-
-    /// Decrease the cached `total_len` by `n`. Pair with a
-    /// `front_mut().consume(n)` (or equivalent) when the caller
-    /// shrank a buf's visible payload without going through
-    /// `pop_front`.
-    ///
-    /// A no-op for `Empty` / `Single`: those derive `total_len`
-    /// straight from the (single, or zero) part, so the part's own
-    /// `consume` already reflected the shrink — subtracting here
-    /// too would double-count.
-    pub fn shrink_total_len(&mut self, n: usize) {
-        if let Repr::Many { total_len, .. } = &mut self.repr {
-            *total_len = total_len.saturating_sub(n);
-        }
-    }
-
-    /// Increase the cached `total_len` by `n`. Pair with a
-    /// `back_mut().append_slice(...)` (or equivalent) that grew
-    /// a buf's visible payload without going through
-    /// `push_back` / `push_front`. Used by the TLS seal-chain
-    /// path to record the AEAD tag bytes appended to the
-    /// trailer IOBuf after the encryption pass.
-    ///
-    /// A no-op for `Empty` / `Single` — see
-    /// [`shrink_total_len`](Self::shrink_total_len).
-    pub fn bump_total_len(&mut self, n: usize) {
-        if let Repr::Many { total_len, .. } = &mut self.repr {
-            *total_len += n;
-        }
-    }
-
-    /// Drop every part still in the chain. The drops run
-    /// front-to-back — same ordering as a `pop_front` loop, which
-    /// matters for `ExternalOwned` IOBufs whose drop callbacks
-    /// return descriptors / slabs to driver pools. A `Many` chain
-    /// keeps its `VecDeque` allocation for reuse.
-    pub fn clear(&mut self) {
-        if let Repr::Many { parts, total_len } = &mut self.repr {
-            parts.clear();
-            *total_len = 0;
-            return;
-        }
-        self.repr = Repr::Empty;
-    }
-
-    /// Move all parts out, consuming the chain. Returns an
-    /// iterator yielding parts front-to-back.
-    pub fn into_parts(self) -> impl Iterator<Item = IOBuf> {
-        // `Empty` / `Single` collapse to `(Option, empty deque)`;
-        // `Many` to `(None, parts)`. `VecDeque::new()` is
-        // allocation-free, so the non-`Many` arms cost nothing.
-        let (single, many) = match self.repr {
-            Repr::Empty => (None, VecDeque::new()),
-            Repr::Single(b) => (Some(b), VecDeque::new()),
-            Repr::Many { parts, .. } => (None, parts),
+/// Widen an `OwnedIOBuf` into an `IOBuf` — the one conversion the
+/// borrowed/owned split adds. Infallible: every `OwnedIOBuf` variant
+/// is also an `IOBuf` variant, so this just re-tags the storage
+/// struct into the wider enum. Zero copy, no allocation.
+///
+/// Exercised at the app RX API boundary — a `BodyReader` spanning
+/// RX-buffer-backed chunks (`OwnedIOBuf`) and prebuf-backed chunks
+/// (`Borrowed`) within one body holds `IOBuf`, so RX buffers widen
+/// in per-chunk as they surface. There is deliberately **no**
+/// `From<IOBuf> for OwnedIOBuf`: narrowing would have to discard or
+/// materialise a `Borrowed`/`Static` part.
+impl From<OwnedIOBuf> for IOBuf {
+    fn from(o: OwnedIOBuf) -> IOBuf {
+        let inner = match o.inner {
+            OwnedInner::Heap(h) => Inner::Heap(h),
+            OwnedInner::External(e) => Inner::External(e),
         };
-        single.into_iter().chain(many)
-    }
-
-    /// Convenience: append a `&'static [u8]` part. Borrowed,
-    /// zero-alloc end-to-end for the first part (head); the
-    /// VecDeque tail materialises only on a second push.
-    pub fn push_static(&mut self, s: &'static [u8]) {
-        self.push_back(IOBuf::from_static(s));
-    }
-
-    /// Convenience: append a `Vec<u8>` part. Move-no-copy when
-    /// `len == capacity`; reallocates to fit otherwise.
-    pub fn push_owned(&mut self, v: alloc::vec::Vec<u8>) {
-        self.push_back(IOBuf::from(v));
-    }
-
-    /// Convenience: append a `String`'s underlying bytes.
-    pub fn push_string(&mut self, s: alloc::string::String) {
-        self.push_back(IOBuf::from(s.into_bytes()));
-    }
-
-    /// Append a payload as a heap-owned IOBuf with reserved
-    /// `headroom` and `tailroom` for layers below to prepend or
-    /// append in place. One heap alloc per chunk (sized for
-    /// payload + reserve); the visible `data()` is exactly
-    /// `payload`.
-    pub fn push_with_reserve(
-        &mut self,
-        payload: &[u8],
-        headroom: usize,
-        tailroom: usize,
-    ) {
-        self.push_back(IOBuf::from_slice_with_headroom(headroom, payload, tailroom));
-    }
-
-    /// Construct a `Cursor` for reading.
-    pub fn cursor(&self) -> Cursor<'_> {
-        Cursor {
-            chain: self,
-            node_idx: 0,
-            in_node_off: 0,
-            consumed: 0,
-        }
-    }
-
-}
-
-/// `iter_mut`'s return type. A hand-rolled enum iterator: the
-/// three `Repr` arms yield differently-typed iterators, and this
-/// unifies them behind one `impl Iterator` with no heap
-/// allocation and no `dyn` dispatch.
-enum ChainIterMut<'a> {
-    Empty,
-    Single(Option<&'a mut IOBuf>),
-    Many(alloc::collections::vec_deque::IterMut<'a, IOBuf>),
-}
-
-impl<'a> Iterator for ChainIterMut<'a> {
-    type Item = &'a mut IOBuf;
-    fn next(&mut self) -> Option<&'a mut IOBuf> {
-        match self {
-            ChainIterMut::Empty => None,
-            ChainIterMut::Single(slot) => slot.take(),
-            ChainIterMut::Many(it) => it.next(),
-        }
-    }
-}
-
-impl Default for IOBufChain {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ---- IOBufChain From<X> conversions ---------------------------------
-//
-// Every shape an HTTP body / response can land in flattens to a
-// 1-part chain via these. Apps build chains directly:
-//
-//   Response::ok(b"text/plain", b"hello")          // &'static [u8]
-//   Response::ok(b"text/plain", rendered)          // String / Vec<u8>
-//   Response::ok(b"text/html", chain)              // multi-part
-//
-// without picking a method based on body shape.
-
-impl From<IOBuf> for IOBufChain {
-    fn from(b: IOBuf) -> Self {
-        let mut c = IOBufChain::with_capacity(1);
-        c.push_back(b);
-        c
-    }
-}
-
-impl From<&'static [u8]> for IOBufChain {
-    fn from(s: &'static [u8]) -> Self {
-        IOBuf::from_static(s).into()
-    }
-}
-
-impl<const N: usize> From<&'static [u8; N]> for IOBufChain {
-    fn from(s: &'static [u8; N]) -> Self {
-        IOBuf::from_static(s).into()
-    }
-}
-
-impl From<&'static str> for IOBufChain {
-    fn from(s: &'static str) -> Self {
-        IOBuf::from_static(s.as_bytes()).into()
-    }
-}
-
-impl From<alloc::vec::Vec<u8>> for IOBufChain {
-    fn from(v: alloc::vec::Vec<u8>) -> Self {
-        IOBuf::from(v).into()
-    }
-}
-
-impl From<alloc::boxed::Box<[u8]>> for IOBufChain {
-    fn from(b: alloc::boxed::Box<[u8]>) -> Self {
-        IOBuf::from(b.into_vec()).into()
-    }
-}
-
-impl From<alloc::string::String> for IOBufChain {
-    fn from(s: alloc::string::String) -> Self {
-        IOBuf::from(s.into_bytes()).into()
+        IOBuf { inner }
     }
 }
 
 // ============================================================================
-// Cursor
-// ============================================================================
-
-/// Read-side traversal of an `IOBufChain`. Walks node boundaries
-/// transparently — `read` and `next_chunk` hop nodes when the
-/// current one is exhausted. `advance` can skip ahead without
-/// copying.
-pub struct Cursor<'a> {
-    chain: &'a IOBufChain,
-    /// Index of the current part within the chain.
-    node_idx: usize,
-    /// Bytes already consumed from the current node (offset into
-    /// the current node's `data()` slice).
-    in_node_off: usize,
-    /// Total bytes consumed so far across all nodes.
-    consumed: usize,
-}
-
-impl<'a> Cursor<'a> {
-    /// Bytes still available from the current cursor position to
-    /// the end of the chain.
-    pub fn remaining(&self) -> usize {
-        self.chain.total_len().saturating_sub(self.consumed)
-    }
-
-    pub fn position(&self) -> usize {
-        self.consumed
-    }
-
-    /// Resolve a part index to a borrowed `IOBuf`, or `None` past
-    /// the chain's end. Delegates to `IOBufChain::get_part`.
-    #[inline]
-    fn node_at(&self, idx: usize) -> Option<&'a IOBuf> {
-        self.chain.get_part(idx)
-    }
-
-    /// Advance the cursor by `n` bytes without reading. Caps at
-    /// `remaining()`; returns the number of bytes actually
-    /// advanced.
-    pub fn advance(&mut self, n: usize) -> usize {
-        let mut to_skip = n.min(self.remaining());
-        let advanced = to_skip;
-        while to_skip > 0 {
-            let node = match self.node_at(self.node_idx) {
-                Some(n) => n,
-                None => break,
-            };
-            let avail = node.len() - self.in_node_off;
-            if to_skip < avail {
-                self.in_node_off += to_skip;
-                to_skip = 0;
-            } else {
-                to_skip -= avail;
-                self.node_idx += 1;
-                self.in_node_off = 0;
-            }
-        }
-        self.consumed += advanced;
-        advanced
-    }
-
-    /// Read up to `dst.len()` bytes into `dst`, hopping node
-    /// boundaries as needed. Returns bytes copied. The "one
-    /// memcpy into the destination" property is what the NIC TX
-    /// driver wants — copy chain bytes straight into the TX
-    /// descriptor without an intermediate Vec.
-    pub fn read(&mut self, dst: &mut [u8]) -> usize {
-        let mut written = 0;
-        while written < dst.len() {
-            let node = match self.node_at(self.node_idx) {
-                Some(n) => n,
-                None => break,
-            };
-            let node_data = node.data();
-            let avail = node_data.len() - self.in_node_off;
-            if avail == 0 {
-                self.node_idx += 1;
-                self.in_node_off = 0;
-                continue;
-            }
-            let n = (dst.len() - written).min(avail);
-            dst[written..written + n]
-                .copy_from_slice(&node_data[self.in_node_off..self.in_node_off + n]);
-            self.in_node_off += n;
-            written += n;
-            if self.in_node_off == node_data.len() {
-                self.node_idx += 1;
-                self.in_node_off = 0;
-            }
-        }
-        self.consumed += written;
-        written
-    }
-
-    /// Return a borrowed slice for the next contiguous chunk of
-    /// up to `max_len` bytes (or `None` at end-of-chain), and
-    /// advance past it. The returned slice borrows directly from
-    /// the underlying IOBuf — zero copy — but is only valid for
-    /// the cursor's lifetime parameter `'a`.
-    ///
-    /// The returned chunk may be shorter than `max_len` if the
-    /// current node ends before `max_len` bytes; callers that
-    /// need exactly `max_len` should call repeatedly or use
-    /// `read`.
-    pub fn next_chunk(&mut self, max_len: usize) -> Option<&'a [u8]> {
-        loop {
-            let node = self.node_at(self.node_idx)?;
-            let node_data = node.data();
-            let avail = node_data.len() - self.in_node_off;
-            if avail == 0 {
-                self.node_idx += 1;
-                self.in_node_off = 0;
-                continue;
-            }
-            let n = avail.min(max_len);
-            let slice = &node_data[self.in_node_off..self.in_node_off + n];
-            self.in_node_off += n;
-            self.consumed += n;
-            if self.in_node_off == node_data.len() {
-                self.node_idx += 1;
-                self.in_node_off = 0;
-            }
-            return Some(slice);
-        }
-    }
-}
-
-// ============================================================================
-// From/Into for ergonomics
+// From/Into for ergonomics — body shapes that flatten to one IOBuf.
 // ============================================================================
 
 impl From<&'static [u8]> for IOBuf {
@@ -1662,18 +650,13 @@ impl From<&'static str> for IOBuf {
 
 impl From<alloc::vec::Vec<u8>> for IOBuf {
     fn from(v: alloc::vec::Vec<u8>) -> Self {
-        // Vec's allocation becomes a Box<[u8]> via into_boxed_slice
-        // (no copy — same bytes). Headroom = 0, tailroom = 0;
-        // callers who want layer-prepend room should construct via
+        // `Vec::into_boxed_slice` reuses the allocation when len ==
+        // capacity (no copy). Headroom = 0, tailroom = 0; callers who
+        // want layer-prepend room construct via
         // `from_slice_with_headroom`.
-        let len = v.len();
-        let storage: Box<[u8]> = v.into_boxed_slice();
+        let len = v.len() as u32;
         IOBuf {
-            inner: Inner::Heap {
-                storage,
-                offset: 0,
-                len: len as u32,
-            },
+            inner: Inner::Heap(HeapStorage::new(v.into_boxed_slice(), 0, len)),
         }
     }
 }
@@ -1692,20 +675,18 @@ impl From<alloc::string::String> for IOBuf {
 mod tests {
     use super::*;
 
-    /// Mock-NIC RX-delivery tests for the contract the item-B
-    /// `NicOps` poll callback depends on: a driver hands up a
-    /// received frame as an **owned** [`IOBufChain`] whose
-    /// `ExternalOwned` `IOBuf`, on drop, reposts the backing buffer
-    /// via its drop callback — and that drop may run on a core
-    /// other than the one that received the frame.
+    /// Mock-NIC RX-delivery tests for the contract the `NicOps` poll
+    /// callback depends on: a driver hands up a received frame as an
+    /// **owned** `IOBufChain` whose `ExternalOwned` `IOBuf`, on drop,
+    /// reposts the backing buffer via its drop callback — and that
+    /// drop may run on a core other than the one that received the
+    /// frame.
     ///
-    /// The real drivers' drop callbacks (DQO data-ring repost, GQI
-    /// pool recycle, virtio avail-ring push) touch
-    /// `target_os = "none"` hardware state and can't run
-    /// host-native; this mock reproduces the *shape* against the
-    /// same `wrap_owned` / `IOBufChain` primitives the drivers use,
-    /// and exercises the drop callback from a separate thread — the
-    /// std-test stand-in for the cross-core drop item C introduces.
+    /// The real drivers' drop callbacks touch `target_os = "none"`
+    /// hardware state and can't run host-native; this mock
+    /// reproduces the *shape* against the same `wrap_owned` /
+    /// `IOBufChain` primitives, exercising the drop callback from a
+    /// separate thread.
     mod mock_nic_rx {
         use crate::{IOBuf, IOBufChain, IOBufDropFn};
         extern crate std;
@@ -1716,13 +697,8 @@ mod tests {
         use std::thread;
 
         /// Stand-in for a NIC's RX ring: a fixed buffer region plus
-        /// the `RX_BUF_REPOST_COUNT`-style counter every real
-        /// driver bumps from its repost path, and a record of the
-        /// `(base, capacity)` the drop callback was handed.
-        /// `Send + Sync` (a `Box` region + atomics) so the callback
-        /// can recycle into it from any thread — the property the
-        /// real `ExternalOwned` drop relies on for cross-core
-        /// safety.
+        /// the repost counter every real driver bumps, and a record
+        /// of the `(base, capacity)` the drop callback was handed.
         struct MockNic {
             region: Box<[u8]>,
             repost_count: AtomicU64,
@@ -1730,35 +706,23 @@ mod tests {
             last_capacity: AtomicUsize,
         }
 
-        /// Drop callback installed on every mock RX `IOBuf`.
-        /// Mirrors the real drivers' repost callbacks: reconstruct
-        /// the device handle from `ctx`, record what came back,
-        /// bump the repost counter. Panic-safe — no `unwrap`, no
-        /// indexing — because a panic in `IOBuf::drop` is poison
-        /// under `#![no_std]`.
+        /// Drop callback installed on every mock RX `IOBuf`. Mirrors
+        /// the real drivers' repost callbacks; panic-safe.
         ///
         /// SAFETY: `ctx` is an `Arc::<MockNic>::into_raw` pointer
         /// installed by `mock_poll_qp`, reclaimed exactly once here.
         unsafe fn mock_repost(base: NonNull<u8>, capacity: u32, ctx: *mut ()) {
-            // SAFETY: per the contract above, `ctx` is a live,
-            // not-yet-reclaimed `Arc::<MockNic>::into_raw` pointer.
             let nic: Arc<MockNic> = unsafe { Arc::from_raw(ctx as *const MockNic) };
             nic.last_base.store(base.as_ptr() as usize, Ordering::Relaxed);
             nic.last_capacity.store(capacity as usize, Ordering::Relaxed);
             nic.repost_count.fetch_add(1, Ordering::Relaxed);
-            // `nic` drops here, releasing the strong ref the IOBuf
-            // parked in `ctx`.
         }
 
-        /// Simulate a driver's `poll_qp`: wrap the mock device
-        /// buffer as a one-part owned `IOBufChain` and hand it to
-        /// `callback` — the shape a real driver's RX poll produces.
+        /// Simulate a driver's `poll_qp`: wrap the mock device buffer
+        /// as a one-part owned `IOBufChain` and hand it to `callback`.
         fn mock_poll_qp(nic: &Arc<MockNic>, frame_len: usize, callback: impl FnOnce(IOBufChain)) {
             let base = NonNull::new(nic.region.as_ptr() as *mut u8).unwrap();
             let capacity = nic.region.len() as u32;
-            // Park one strong ref in the drop ctx; `mock_repost`
-            // reclaims it — the same `into_raw`/`from_raw` balance
-            // the real pool-backed drop callbacks use.
             let ctx = Arc::into_raw(Arc::clone(nic)) as *mut ();
             // SAFETY: `region` outlives the IOBuf (kept alive by the
             // parked Arc ref); `0 + frame_len <= capacity`;
@@ -1776,15 +740,14 @@ mod tests {
             callback(IOBufChain::from(iobuf));
         }
 
-        /// A one-part owned RX chain moved across a thread
-        /// boundary. `IOBuf` is `!Send` (the `Borrowed` variant
-        /// taints the whole enum), so the cross-core inbox item C
-        /// introduces must wrap the chain in a struct with an
-        /// `unsafe impl Send` — this mirrors that wrapper.
+        /// A one-part owned RX chain moved across a thread boundary.
+        /// `IOBuf` is `!Send` (the `Borrowed` variant taints the
+        /// whole enum), so a struct-level `unsafe impl Send` is
+        /// needed here — the very thing the type-model split removes
+        /// once the RX path is typed `Chain<OwnedIOBuf>`.
         ///
-        /// SAFETY: the only `IOBuf` inside is an `ExternalOwned`
-        /// (which is `Send`), produced by `mock_poll_qp` — never a
-        /// `Borrowed` part.
+        /// SAFETY: the only `IOBuf` inside is an `External` one,
+        /// produced by `mock_poll_qp` — never a `Borrowed` part.
         struct SendChain(IOBufChain);
         unsafe impl Send for SendChain {}
 
@@ -1798,27 +761,20 @@ mod tests {
             });
             let region_base = nic.region.as_ptr() as usize;
 
-            // Driver poll hands us a one-part owned chain.
             let mut captured: Option<SendChain> = None;
             mock_poll_qp(&nic, 1400, |chain| {
                 assert_eq!(chain.part_count(), 1, "single-buffer frame is a 1-part chain");
                 assert_eq!(chain.total_len(), 1400);
                 captured = Some(SendChain(chain));
             });
-            // Nothing reposted yet — the chain is still alive.
             assert_eq!(nic.repost_count.load(Ordering::Relaxed), 0);
 
-            // Move the chain onto a worker thread and drop it
-            // there: the drop callback runs on a *different* thread
-            // than the one `mock_poll_qp` produced the chain on.
             let send_chain = captured.take().unwrap();
             let worker = thread::spawn(move || {
                 drop(send_chain); // fires `mock_repost` on this thread
             });
             worker.join().unwrap();
 
-            // The drop callback ran exactly once, with the
-            // `(base, capacity)` `wrap_owned` was given.
             assert_eq!(nic.repost_count.load(Ordering::Relaxed), 1);
             assert_eq!(nic.last_base.load(Ordering::Relaxed), region_base);
             assert_eq!(nic.last_capacity.load(Ordering::Relaxed), 2048);
@@ -1826,10 +782,6 @@ mod tests {
 
         #[test]
         fn rx_chain_walk_then_repost_same_thread() {
-            // The item-B net-dispatch shape: the callback walks the
-            // chain's parts (parsing each) and then drops it — so
-            // the repost fires when the walk finishes, here on one
-            // thread.
             let nic = Arc::new(MockNic {
                 region: std::vec![7u8; 2048].into_boxed_slice(),
                 repost_count: AtomicU64::new(0),
@@ -1839,7 +791,6 @@ mod tests {
             mock_poll_qp(&nic, 64, |chain| {
                 let walked: usize = chain.iter().map(|p| p.data().len()).sum();
                 assert_eq!(walked, 64);
-                // `chain` drops at the end of this closure → repost.
             });
             assert_eq!(nic.repost_count.load(Ordering::Relaxed), 1);
             assert_eq!(nic.last_capacity.load(Ordering::Relaxed), 2048);
@@ -1887,7 +838,6 @@ mod tests {
     fn heap_buf_prepend_overflow() {
         let mut b = IOBuf::from_slice_with_headroom(2, b"x", 0);
         assert_eq!(b.prepend(b"abc"), Err(IOBufError::NoHeadroom));
-        // Original payload preserved on error.
         assert_eq!(b.data(), b"x");
     }
 
@@ -1917,117 +867,10 @@ mod tests {
     }
 
     #[test]
-    fn chain_push_total_len() {
-        let mut c = IOBufChain::new();
-        c.push_back(IOBuf::from_static(b"hello"));
-        c.push_back(IOBuf::from_static(b" "));
-        c.push_back(IOBuf::from_static(b"world"));
-        assert_eq!(c.total_len(), 11);
-        assert_eq!(c.part_count(), 3);
-    }
-
-    #[test]
-    fn chain_push_front_o1() {
-        // Build the body, then framing prepends in front.
-        let mut c = IOBufChain::new();
-        c.push_back(IOBuf::from_static(b"BODY"));
-        c.push_front(IOBuf::from_static(b"HEADERS"));
-        let mut out = [0u8; 16];
-        let n = c.cursor().read(&mut out);
-        assert_eq!(&out[..n], b"HEADERSBODY");
-    }
-
-    #[test]
-    fn chain_prepend_in_place() {
-        // Front node has 8 B headroom → TLS record header fits.
-        let mut c = IOBufChain::new();
-        c.push_back(IOBuf::from_slice_with_headroom(8, b"plaintext", 16));
-        c.prepend_in_place(b"REC1").unwrap();
-        let mut out = [0u8; 32];
-        let n = c.cursor().read(&mut out);
-        assert_eq!(&out[..n], b"REC1plaintext");
-    }
-
-    #[test]
-    fn chain_prepend_in_place_no_headroom_errors() {
-        let mut c = IOBufChain::new();
-        c.push_back(IOBuf::from_static(b"static"));
-        assert_eq!(c.prepend_in_place(b"x"), Err(IOBufError::Immutable));
-    }
-
-    #[test]
-    fn cursor_read_across_nodes() {
-        let mut c = IOBufChain::new();
-        c.push_back(IOBuf::from_static(b"abc"));
-        c.push_back(IOBuf::from_static(b"def"));
-        c.push_back(IOBuf::from_static(b"ghi"));
-        let mut cur = c.cursor();
-        let mut out = [0u8; 5];
-        let n = cur.read(&mut out);
-        assert_eq!(n, 5);
-        assert_eq!(&out, b"abcde");
-        let n = cur.read(&mut out);
-        assert_eq!(n, 4);
-        assert_eq!(&out[..n], b"fghi");
-        assert_eq!(cur.remaining(), 0);
-    }
-
-    #[test]
-    fn cursor_next_chunk_returns_node_at_a_time() {
-        let mut c = IOBufChain::new();
-        c.push_back(IOBuf::from_static(b"abc"));
-        c.push_back(IOBuf::from_static(b"def"));
-        let mut cur = c.cursor();
-        assert_eq!(cur.next_chunk(100), Some(b"abc".as_ref()));
-        assert_eq!(cur.next_chunk(100), Some(b"def".as_ref()));
-        assert_eq!(cur.next_chunk(100), None);
-    }
-
-    #[test]
-    fn cursor_next_chunk_caps_at_max_len() {
-        let mut c = IOBufChain::new();
-        c.push_back(IOBuf::from_static(b"abcdefgh"));
-        let mut cur = c.cursor();
-        assert_eq!(cur.next_chunk(3), Some(b"abc".as_ref()));
-        assert_eq!(cur.next_chunk(3), Some(b"def".as_ref()));
-        assert_eq!(cur.next_chunk(10), Some(b"gh".as_ref()));
-        assert_eq!(cur.next_chunk(10), None);
-    }
-
-    #[test]
-    fn cursor_advance_skips_into_later_node() {
-        let mut c = IOBufChain::new();
-        c.push_back(IOBuf::from_static(b"abc"));
-        c.push_back(IOBuf::from_static(b"def"));
-        let mut cur = c.cursor();
-        let skipped = cur.advance(4);
-        assert_eq!(skipped, 4);
-        assert_eq!(cur.position(), 4);
-        let mut out = [0u8; 4];
-        let n = cur.read(&mut out);
-        assert_eq!(n, 2);
-        assert_eq!(&out[..n], b"ef");
-    }
-
-    #[test]
-    fn cursor_advance_caps_at_remaining() {
-        let mut c = IOBufChain::new();
-        c.push_back(IOBuf::from_static(b"abc"));
-        let mut cur = c.cursor();
-        let skipped = cur.advance(100);
-        assert_eq!(skipped, 3);
-        assert_eq!(cur.remaining(), 0);
-    }
-
-    #[test]
     fn vec_into_iobuf_no_copy() {
         let v = alloc::vec![1u8, 2, 3, 4, 5];
         let ptr_before = v.as_ptr();
         let buf = IOBuf::from(v);
-        // `Vec::into_boxed_slice` reuses the allocation when len ==
-        // capacity; we don't guarantee no-copy in general, but for
-        // an exact-fit Vec (constructed from `vec!`) it should hold.
-        // Treat as a smoke test of the conversion direction.
         assert_eq!(buf.data(), &[1u8, 2, 3, 4, 5]);
         let _ = ptr_before;
     }
@@ -2036,11 +879,9 @@ mod tests {
     fn iobuf_writer_renders_into_tailroom() {
         use core::fmt::Write as _;
         let mut buf = IOBuf::new_with_reserved(8, 0, 64);
-        // Visible payload starts empty.
         assert_eq!(buf.len(), 0);
         write!(buf.writer(), "hello {}", 42).unwrap();
         assert_eq!(buf.data(), b"hello 42");
-        // Subsequent prepend uses headroom (still has 8 reserved).
         buf.prepend(b"REC1").unwrap();
         assert_eq!(buf.data(), b"REC1hello 42");
     }
@@ -2050,10 +891,7 @@ mod tests {
         use core::fmt::Write as _;
         let mut buf = IOBuf::new_with_reserved(0, 0, 4);
         let mut w = buf.writer();
-        // First write fits.
         let _ = write!(w, "ab");
-        // Second exceeds tailroom — the second write_str call
-        // sets overflowed and returns Err.
         let r = write!(w, "cdefgh");
         assert!(r.is_err());
         assert!(w.overflowed());
@@ -2068,57 +906,40 @@ mod tests {
 
         let released = Arc::new(AtomicBool::new(false));
 
-        // Drop callback: reconstructs the Arc from the raw ctx
-        // pointer (canceling the `into_raw` increment), flips
-        // the flag, then drops the Arc.
         unsafe fn cb(_base: NonNull<u8>, _cap: u32, ctx: *mut ()) {
             let arc: Arc<AtomicBool> =
                 unsafe { Arc::from_raw(ctx as *const AtomicBool) };
             arc.store(true, Ordering::SeqCst);
         }
 
-        // Owns a small backing region; we'll wrap it as
-        // ExternalOwned and ensure the drop callback fires when
-        // the IOBuf drops.
         let mut storage: alloc::vec::Vec<u8> = alloc::vec![0u8; 32];
         storage[5..13].copy_from_slice(b"abcdefgh");
         let ptr = NonNull::new(storage.as_mut_ptr()).unwrap();
         let ctx = Arc::into_raw(released.clone()) as *mut ();
         {
-            // SAFETY: storage outlives the IOBuf in this block;
-            // the drop callback reconstructs the Arc from ctx
-            // (via `Arc::from_raw`, canceling the `into_raw`
-            // refcount bump above) and lets it drop normally.
-            let mut buf = unsafe {
-                IOBuf::wrap_owned(ptr, 32, 5, 8, cb, ctx)
-            };
+            // SAFETY: storage outlives the IOBuf in this block; the
+            // callback reconstructs the Arc from ctx and lets it drop.
+            let mut buf = unsafe { IOBuf::wrap_owned(ptr, 32, 5, 8, cb, ctx) };
             assert_eq!(buf.data(), b"abcdefgh");
             assert_eq!(buf.headroom(), 5);
             assert_eq!(buf.tailroom(), 19);
-            // Prepend uses headroom (writes into storage[2..5]).
             buf.prepend(b"PRE").unwrap();
             assert_eq!(buf.data(), b"PREabcdefgh");
-            // Append uses tailroom.
             buf.append_slice(b"END").unwrap();
             assert_eq!(buf.data(), b"PREabcdefghEND");
-            // Mutate in place.
             for byte in buf.data_mut().unwrap() {
                 if (b'a'..=b'z').contains(byte) {
                     *byte ^= 0x20;
                 }
             }
             assert_eq!(buf.data(), b"PREABCDEFGHEND");
-            // Callback hasn't run yet.
             assert!(!released.load(Ordering::SeqCst));
         }
-        // IOBuf dropped at scope end → drop callback fires.
         assert!(released.load(Ordering::SeqCst));
     }
 
     #[test]
     fn borrowed_buf_no_drop_callback() {
-        // `borrow` produces a non-owning view; no callback runs
-        // at drop. Caller manages the storage's lifetime.
         let mut storage: alloc::vec::Vec<u8> = alloc::vec![0u8; 32];
         storage[5..13].copy_from_slice(b"abcdefgh");
         let ptr = core::ptr::NonNull::new(storage.as_mut_ptr()).unwrap();
@@ -2138,66 +959,29 @@ mod tests {
         }
         assert_eq!(buf.data(), b"PREABCDEFGHEND");
         drop(buf);
-        // Storage is still valid (no drop callback fired).
         assert_eq!(&storage[5..13], b"ABCDEFGH");
     }
 
-    /// Compile-time assertion that `IOBuf` is `!Send`. The
-    /// `Inner::Borrowed` variant carries a `PhantomData<*const ()>`
-    /// and a `NonNull<u8>`, both of which propagate `!Send`
-    /// through the enum's auto-traits — so a `Borrowed` IOBuf
-    /// can't accidentally cross workers. Containing structs that
-    /// legitimately move IOBufs across workers (e.g.
-    /// `WorkerInbox`) must override with `unsafe impl Send` and
-    /// document the contract.
-    ///
-    /// The trick: a blanket-impl trait that's only implemented for
-    /// `Send` types. If `IOBuf` were `Send` this `<IOBuf as
-    /// IsSend>::CHECK` would succeed; we assert it via an
-    /// expression that needs the trait to NOT be implemented.
-    /// We use the standard pattern of an inherent associated
-    /// `const _: ()` that would mention the trait method only if
-    /// `IOBuf: Send`. Since rust-stable doesn't support `!Send`
-    /// bounds directly, we instead use a struct that requires Send
-    /// in a field and ensure IOBuf doesn't fit.
+    /// `IOBuf` is `!Send` — the `Borrowed` variant's
+    /// `PhantomData<*const ()>` propagates through the enum. Stable
+    /// Rust can't express a `!Send` bound directly; this exercises
+    /// the `Borrowed` variant and documents intent. The companion
+    /// positive check — `OwnedIOBuf: Send` — is the module-level
+    /// `const _` static assertion near `OwnedIOBuf`.
     #[test]
     fn iobuf_is_not_send() {
-        // Strategy: any type that lives inside `std::sync::Mutex`
-        // must be Send (Mutex<T>: Send requires T: Send). If
-        // IOBuf were Send, this fn would compile. If it isn't,
-        // it won't. But we want the OPPOSITE — we want the test
-        // to confirm IOBuf isn't Send. So we use a function whose
-        // body would type-check ONLY IF IOBuf were Send, and we
-        // verify the negative via a `#[cfg]` gate.
-        //
-        // Stable Rust can't express this directly. Best we can do
-        // at the test level is run a positive runtime check that
-        // a thread-spawn over IOBuf would fail to compile if
-        // attempted; the body below is intentionally commented
-        // out — uncommenting it should fail compilation. CI can
-        // run a `cargo build --tests` and a separate `cargo build
-        // --tests --cfg=should_fail_send` to confirm.
-        //
-        // For now, this test just exercises the Borrowed variant
-        // (so the variant isn't dead code) and documents intent.
         let mut storage: alloc::vec::Vec<u8> = alloc::vec![0u8; 4];
         let ptr = core::ptr::NonNull::new(storage.as_mut_ptr()).unwrap();
+        // SAFETY: storage outlives the borrow.
         let buf = unsafe { IOBuf::borrow(ptr, 4, 0, 0) };
         assert_eq!(buf.len(), 0);
-
-        // Uncommenting the line below should produce a compile
-        // error of the form: "future cannot be sent between threads
-        // safely" / "IOBuf is not Send". Verified manually.
-        //
-        // extern crate std;
-        // std::thread::spawn(move || { let _ = buf; });
+        // Uncommenting the line below should fail to compile with
+        // "`*const ()` cannot be sent between threads safely":
+        //   std::thread::spawn(move || { let _ = buf; });
     }
 
     #[test]
     fn borrow_tracker_allows_disjoint_regions() {
-        // Two non-overlapping sub-views of the same backing array
-        // should coexist — this is exactly the body-scratch carving
-        // pattern at uni-http/src/lib.rs:207.
         let mut storage: alloc::vec::Vec<u8> = alloc::vec![0u8; 32];
         let base = core::ptr::NonNull::new(storage.as_mut_ptr()).unwrap();
         let p1 = unsafe { core::ptr::NonNull::new_unchecked(base.as_ptr()) };
@@ -2212,9 +996,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "overlapping IOBuf::borrow mint")]
     fn borrow_tracker_detects_overlap() {
-        // Two overlapping sub-views of the same backing array.
-        // Real-world equivalent: a body-scratch cursor bug minting
-        // a second sub-range that straddles the first.
         let mut storage: alloc::vec::Vec<u8> = alloc::vec![0u8; 32];
         let base = core::ptr::NonNull::new(storage.as_mut_ptr()).unwrap();
         let p1 = unsafe { core::ptr::NonNull::new_unchecked(base.as_ptr()) };
@@ -2227,9 +1008,6 @@ mod tests {
 
     #[test]
     fn borrow_tracker_reregister_after_drop() {
-        // Drop should unregister, freeing the region for a fresh
-        // borrow over the same storage — this is the per-worker
-        // scratch reuse pattern in TLS RecordScratch::into_iobuf.
         let mut storage: alloc::vec::Vec<u8> = alloc::vec![0u8; 32];
         let base = core::ptr::NonNull::new(storage.as_mut_ptr()).unwrap();
         // SAFETY: storage outlives both successive IOBufs; only one
@@ -2237,51 +1015,15 @@ mod tests {
         {
             let _b1 = unsafe { IOBuf::borrow(base, 32, 0, 0) };
         }
-        // First IOBuf dropped → tracker unregistered → fresh borrow
-        // over the same region is valid.
         let _b2 = unsafe { IOBuf::borrow(base, 32, 0, 0) };
     }
 
     #[test]
-    fn full_layer_stack_simulation() {
-        // Simulate a layered prepend pattern: app puts a body in
-        // a chain, HTTP/1.1 prepends a status line, TLS prepends a
-        // record header — all in place into reserved headroom of
-        // the same IOBuf. Exercise the prepend_in_place path
-        // end-to-end without copying bytes beyond the writes we
-        // explicitly perform.
-        let mut chain = IOBufChain::new();
-        // 64 B headroom covers the HTTP status line + TLS record
-        // header we'll prepend below.
-        let body = IOBuf::from_slice_with_headroom(64, b"<html>...</html>", 0);
-        chain.push_back(body);
-
-        // HTTP layer: prepend headers in place. (Real impl writes
-        // \r\n\r\n; here we just stand in.)
-        chain.prepend_in_place(b"HTTP/1.1 200 OK\r\n\r\n").unwrap();
-
-        // TLS layer: prepend record header.
-        chain.prepend_in_place(b"\x17\x03\x03\x00\x10").unwrap();
-
-        // Read the full chain into a destination buffer (NIC TX
-        // simulation).
-        let mut out = [0u8; 256];
-        let n = chain.cursor().read(&mut out);
-        assert_eq!(
-            &out[..n],
-            b"\x17\x03\x03\x00\x10HTTP/1.1 200 OK\r\n\r\n<html>...</html>"
-        );
-        assert_eq!(chain.total_len(), n);
-    }
-
-    #[test]
     fn into_owned_heap_is_zero_copy() {
-        // Heap already owns its storage — into_owned returns it
-        // unchanged, same allocation, no copy.
         let b = IOBuf::from(alloc::vec![1u8, 2, 3, 4]);
         let ptr_before = b.data().as_ptr() as usize;
         let o = b.into_owned();
-        assert!(matches!(o.inner, Inner::Heap { .. }));
+        assert!(matches!(o.inner, Inner::Heap(_)));
         assert_eq!(o.data(), &[1, 2, 3, 4]);
         assert_eq!(
             o.data().as_ptr() as usize,
@@ -2293,15 +1035,12 @@ mod tests {
     #[test]
     fn into_owned_static_is_noop() {
         let o = IOBuf::from_static(b"hello").into_owned();
-        assert!(matches!(o.inner, Inner::Static { .. }));
+        assert!(matches!(o.inner, Inner::Static(_)));
         assert_eq!(o.data(), b"hello");
     }
 
     #[test]
     fn into_owned_external_is_noop_and_drops_once() {
-        // ExternalOwned already owns its region: into_owned returns
-        // it unchanged, and the drop callback still fires exactly
-        // once when the surviving IOBuf drops.
         use core::ptr::NonNull;
         use core::sync::atomic::{AtomicBool, Ordering};
         extern crate std;
@@ -2323,7 +1062,7 @@ mod tests {
             // reconstructs the Arc from ctx and lets it drop.
             let b = unsafe { IOBuf::wrap_owned(ptr, 16, 0, 4, cb, ctx) };
             let o = b.into_owned();
-            assert!(matches!(o.inner, Inner::ExternalOwned(_)));
+            assert!(matches!(o.inner, Inner::External(_)));
             assert_eq!(o.data(), b"data");
             assert!(!released.load(Ordering::SeqCst), "callback not yet run");
         }
@@ -2335,9 +1074,6 @@ mod tests {
 
     #[test]
     fn into_owned_borrowed_copies_to_heap() {
-        // Borrowed is the one variant that costs a copy: into_owned
-        // materialises an independent Heap buffer with identical
-        // content.
         let mut storage: alloc::vec::Vec<u8> = alloc::vec![0u8; 32];
         storage[4..12].copy_from_slice(b"abcdefgh");
         let ptr = core::ptr::NonNull::new(storage.as_mut_ptr()).unwrap();
@@ -2345,14 +1081,57 @@ mod tests {
             // SAFETY: storage outlives the borrow; the borrow ends
             // when into_owned consumes it.
             let b = unsafe { IOBuf::borrow(ptr, 32, 4, 8) };
-            assert!(matches!(b.inner, Inner::Borrowed { .. }));
+            assert!(matches!(b.inner, Inner::Borrowed(_)));
             b.into_owned()
         };
-        assert!(matches!(owned.inner, Inner::Heap { .. }));
+        assert!(matches!(owned.inner, Inner::Heap(_)));
         assert_eq!(owned.data(), b"abcdefgh");
-        // Mutating the original backing store proves the owned copy
-        // is fully independent of it.
         storage[4..12].copy_from_slice(b"XXXXXXXX");
         assert_eq!(owned.data(), b"abcdefgh", "owned copy is independent");
+    }
+
+    /// `From<OwnedIOBuf> for IOBuf` — the one-way widening. Building
+    /// an `OwnedIOBuf` via `wrap_owned` and widening it preserves the
+    /// visible bytes *and* the drop callback: dropping the widened
+    /// `IOBuf` fires the original `drop_fn` exactly once.
+    #[test]
+    fn from_owned_iobuf_widens_preserving_bytes_and_drop_fn() {
+        use core::ptr::NonNull;
+        use core::sync::atomic::{AtomicBool, Ordering};
+        extern crate std;
+        use std::sync::Arc;
+
+        let released = Arc::new(AtomicBool::new(false));
+        unsafe fn cb(_base: NonNull<u8>, _cap: u32, ctx: *mut ()) {
+            let arc: Arc<AtomicBool> =
+                unsafe { Arc::from_raw(ctx as *const AtomicBool) };
+            arc.store(true, Ordering::SeqCst);
+        }
+
+        let mut storage: alloc::vec::Vec<u8> = alloc::vec![0u8; 16];
+        storage[2..10].copy_from_slice(b"owned-rx");
+        let ptr = NonNull::new(storage.as_mut_ptr()).unwrap();
+        let ctx = Arc::into_raw(released.clone()) as *mut ();
+        {
+            // SAFETY: storage outlives the buffers in this block; cb
+            // reclaims the Arc from ctx exactly once at drop.
+            let owned = unsafe { OwnedIOBuf::wrap_owned(ptr, 16, 2, 8, cb, ctx) };
+            assert_eq!(owned.data(), b"owned-rx");
+            assert_eq!(owned.headroom(), 2);
+            assert_eq!(owned.tailroom(), 6);
+
+            // Widen — infallible, zero copy. The storage struct is
+            // re-tagged into `Inner::External`.
+            let widened: IOBuf = owned.into();
+            assert!(matches!(widened.inner, Inner::External(_)));
+            assert_eq!(widened.data(), b"owned-rx");
+            assert!(!released.load(Ordering::SeqCst), "drop callback not yet run");
+        }
+        // The widened IOBuf dropped at scope end → the original
+        // drop_fn fires exactly once: widening kept it intact.
+        assert!(
+            released.load(Ordering::SeqCst),
+            "widening preserved the drop callback"
+        );
     }
 }
