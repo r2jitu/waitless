@@ -382,7 +382,59 @@ impl TcpConnection {
         }
         self.rx_head = ((head + take) % RX_RING_BYTES) as u16;
         self.rx_used -= take as u16;
+        // Draining the ring reopened the receive window. If the peer
+        // is SWS-stalled on the old sub-MSS window, tell it now —
+        // otherwise it waits for its persist timer.
+        self.maybe_send_window_update();
         written + take
+    }
+
+    /// Receiver-side silly-window-syndrome avoidance (RFC 1122
+    /// §4.2.2.16 / RFC 813).
+    ///
+    /// `rcv_wnd` — the window last advertised to the peer — is
+    /// normally refreshed on every ACK we send in response to an
+    /// inbound segment (see the `rcv_wnd = rx_free()` in
+    /// `tcp_receive`). But a peer that fills our `rx_ring`, sees the
+    /// resulting sub-MSS window, and then — correctly, under its own
+    /// sender-side SWS-avoidance — stops sending leaves us with no
+    /// inbound segment to ACK. Once the application drains the ring
+    /// the window has reopened, but the peer is never told: it
+    /// stalls until its own persist timer fires. Against QEMU's
+    /// SLIRP that timer is ~5 s, which collapsed `upload_32k` to
+    /// ~3 req/s (a 32 KiB upload overruns the 16 KiB ring, so every
+    /// upload past 16 KiB ate one persist-timer stall).
+    ///
+    /// Fix: when a drain lifts the window back across the one-MSS
+    /// boundary, send a standalone window-update ACK. The
+    /// `rcv_wnd < mss` guard fires this at most once per ring-full
+    /// episode — in steady flow `rcv_wnd` stays well above an MSS
+    /// (kept fresh by data-triggered ACKs) so this is a no-op.
+    fn maybe_send_window_update(&mut self) {
+        if self.state != TcpState::Established {
+            return;
+        }
+        let mss = mss_for(self.local_ip) as u16;
+        let free = self.rx_free() as u16;
+        // Only the stall case: the last window we advertised was too
+        // small for the peer to send a full segment (it may be
+        // SWS-stalled), and the drain has now opened at least an MSS
+        // of room — enough that advertising it actually unblocks the
+        // peer.
+        if self.rcv_wnd < mss && free >= mss {
+            self.rcv_wnd = free;
+            send_segment(
+                self.local_ip,
+                self.remote_ip,
+                self.local_port,
+                self.remote_port,
+                self.snd_nxt,
+                self.rcv_nxt,
+                TCP_ACK,
+                free,
+                &[],
+            );
+        }
     }
 }
 
