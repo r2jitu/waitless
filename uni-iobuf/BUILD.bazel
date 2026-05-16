@@ -18,7 +18,10 @@ package(default_visibility = ["//visibility:public"])
 # proper (driver layers) without dragging the runtime in.
 rust_library(
     name = "uni-iobuf",
-    srcs = ["src/lib.rs"],
+    srcs = [
+        "src/lib.rs",
+        "src/pool.rs",
+    ],
     crate_name = "uni_iobuf",
 )
 

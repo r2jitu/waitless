@@ -60,6 +60,12 @@ use alloc::collections::VecDeque;
 use alloc::rc::Rc;
 use core::marker::PhantomData;
 
+// Fixed-size slab pool for IOBuf RX recycling. Self-contained
+// lock-free machinery, kept in its own module; `IOBufPool` is
+// re-exported at the crate root so consumers spell `uni_iobuf::IOBufPool`.
+mod pool;
+pub use pool::IOBufPool;
+
 // ============================================================================
 // Borrow tracker — debug-mode aliasing detection for `Borrowed` IOBufs.
 //
@@ -1228,6 +1234,47 @@ impl IOBuf {
             offset: 0,
             len: l as u32,
         };
+    }
+
+    /// Convert this IOBuf into one that fully owns (or statically
+    /// outlives) its bytes — i.e. one carrying no out-of-band
+    /// lifetime contract, so it is safe to send across workers.
+    ///
+    ///   * `Heap` / `Shared` / `Static` / `ExternalOwned` — each
+    ///     already owns its storage (or `'static`-outlives it).
+    ///     Returned unchanged: **zero copy**.
+    ///   * `Borrowed` — the sole non-owning variant. Its visible
+    ///     payload is copied into a freshly-allocated `Heap` buffer
+    ///     (offset 0, no headroom / tailroom), because a borrowed
+    ///     view has no claim on its backing storage's lifetime.
+    ///     This is the **only** variant that costs a copy.
+    ///
+    /// The escape hatch for "I hold a `Borrowed` view of inbound
+    /// bytes but need owned, `Send`-able possession of them" — e.g.
+    /// a proxy handler forwarding request bytes into an outbound
+    /// async `send`, where the borrowed source (a per-conn parse
+    /// buffer, or the TLS `pt_buf`) could be overwritten before
+    /// that send completes. Shares the shape of
+    /// [`make_unique`](Self::make_unique): materialise owned
+    /// storage on demand, no-op when ownership already holds.
+    pub fn into_owned(mut self) -> IOBuf {
+        if matches!(self.inner, Inner::Borrowed { .. }) {
+            // Copy the visible payload into owned heap storage.
+            // `data()`'s borrow ends at `.to_vec()` (which produces
+            // an independent allocation), so the subsequent
+            // `self.inner` write is unambiguous. That write drops
+            // the old `Inner::Borrowed`, whose `BorrowGuard`
+            // unregisters the region from the debug-mode aliasing
+            // tracker — symmetric with the `borrow` that minted it.
+            let owned: Box<[u8]> = self.data().to_vec().into_boxed_slice();
+            let len = owned.len() as u32;
+            self.inner = Inner::Heap {
+                storage: owned,
+                offset: 0,
+                len,
+            };
+        }
+        self
     }
 }
 
@@ -2553,5 +2600,99 @@ mod tests {
             b"\x17\x03\x03\x00\x10HTTP/1.1 200 OK\r\n\r\n<html>...</html>"
         );
         assert_eq!(chain.total_len(), n);
+    }
+
+    #[test]
+    fn into_owned_heap_is_zero_copy() {
+        // Heap already owns its storage — into_owned returns it
+        // unchanged, same allocation, no copy.
+        let b = IOBuf::from(alloc::vec![1u8, 2, 3, 4]);
+        let ptr_before = b.data().as_ptr() as usize;
+        let o = b.into_owned();
+        assert!(matches!(o.inner, Inner::Heap { .. }));
+        assert_eq!(o.data(), &[1, 2, 3, 4]);
+        assert_eq!(
+            o.data().as_ptr() as usize,
+            ptr_before,
+            "Heap into_owned must not reallocate"
+        );
+    }
+
+    #[test]
+    fn into_owned_static_is_noop() {
+        let o = IOBuf::from_static(b"hello").into_owned();
+        assert!(matches!(o.inner, Inner::Static { .. }));
+        assert_eq!(o.data(), b"hello");
+    }
+
+    #[test]
+    fn into_owned_shared_stays_shared() {
+        // Shared is refcount-owned; into_owned leaves it Shared (no
+        // forced make_unique copy).
+        let mut a = IOBuf::from(alloc::vec![1u8, 2, 3, 4]);
+        let _tail = a.split_at(2); // promotes `a` to Shared
+        assert!(matches!(a.inner, Inner::Shared { .. }));
+        let o = a.into_owned();
+        assert!(matches!(o.inner, Inner::Shared { .. }));
+        assert_eq!(o.data(), &[1, 2]);
+    }
+
+    #[test]
+    fn into_owned_external_is_noop_and_drops_once() {
+        // ExternalOwned already owns its region: into_owned returns
+        // it unchanged, and the drop callback still fires exactly
+        // once when the surviving IOBuf drops.
+        use core::ptr::NonNull;
+        use core::sync::atomic::{AtomicBool, Ordering};
+        extern crate std;
+        use std::sync::Arc;
+
+        let released = Arc::new(AtomicBool::new(false));
+        unsafe fn cb(_base: NonNull<u8>, _cap: u32, ctx: *mut ()) {
+            let arc: Arc<AtomicBool> =
+                unsafe { Arc::from_raw(ctx as *const AtomicBool) };
+            arc.store(true, Ordering::SeqCst);
+        }
+
+        let mut storage: alloc::vec::Vec<u8> = alloc::vec![0u8; 16];
+        storage[0..4].copy_from_slice(b"data");
+        let ptr = NonNull::new(storage.as_mut_ptr()).unwrap();
+        let ctx = Arc::into_raw(released.clone()) as *mut ();
+        {
+            // SAFETY: storage outlives the IOBuf; the callback
+            // reconstructs the Arc from ctx and lets it drop.
+            let b = unsafe { IOBuf::wrap_owned(ptr, 16, 0, 4, cb, ctx) };
+            let o = b.into_owned();
+            assert!(matches!(o.inner, Inner::ExternalOwned(_)));
+            assert_eq!(o.data(), b"data");
+            assert!(!released.load(Ordering::SeqCst), "callback not yet run");
+        }
+        assert!(
+            released.load(Ordering::SeqCst),
+            "drop callback fires exactly once after into_owned"
+        );
+    }
+
+    #[test]
+    fn into_owned_borrowed_copies_to_heap() {
+        // Borrowed is the one variant that costs a copy: into_owned
+        // materialises an independent Heap buffer with identical
+        // content.
+        let mut storage: alloc::vec::Vec<u8> = alloc::vec![0u8; 32];
+        storage[4..12].copy_from_slice(b"abcdefgh");
+        let ptr = core::ptr::NonNull::new(storage.as_mut_ptr()).unwrap();
+        let owned = {
+            // SAFETY: storage outlives the borrow; the borrow ends
+            // when into_owned consumes it.
+            let b = unsafe { IOBuf::borrow(ptr, 32, 4, 8) };
+            assert!(matches!(b.inner, Inner::Borrowed { .. }));
+            b.into_owned()
+        };
+        assert!(matches!(owned.inner, Inner::Heap { .. }));
+        assert_eq!(owned.data(), b"abcdefgh");
+        // Mutating the original backing store proves the owned copy
+        // is fully independent of it.
+        storage[4..12].copy_from_slice(b"XXXXXXXX");
+        assert_eq!(owned.data(), b"abcdefgh", "owned copy is independent");
     }
 }
