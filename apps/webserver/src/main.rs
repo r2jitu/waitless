@@ -1169,60 +1169,6 @@ fn stats_response() -> Response {
             uni::net::tcp::TCP_SYNACK_TX.load(core::sync::atomic::Ordering::Relaxed),
         );
 
-        // Connection-pool census — diagnostic for the fresh-conn
-        // degradation. `tcp_pool_cap` is total materialized slots
-        // (grows, never shrinks); `tcp_conn_states` is the count in
-        // each `TcpState` (0=Closed 1=Listen 2=SynReceived
-        // 3=Established 4=FinWait1 5=FinWait2 6=CloseWait 7=LastAck
-        // 8=TimeWait). When new SYNs go unanswered the pool is full
-        // of states the scavenge can't reclaim — this shows which.
-        let census = uni::net::tcp::conn_state_census();
-        let _ = write!(
-            w,
-            ",\"tcp_pool_cap\":{},\"tcp_conn_states\":[{},{},{},{},{},{},{},{},{}]",
-            uni::net::tcp::pool_capacity_total(),
-            census[0], census[1], census[2], census[3], census[4],
-            census[5], census[6], census[7], census[8],
-        );
-
-        // Per-core SYN diagnostics. The global syn_rx/synack_tx gap
-        // stays ~0 even when fresh-conn collapses, so SYNs are lost
-        // before `tcp_receive`. These localize it: compare summed
-        // `syn_rx_core` against the loadgen's on-wire SYN count
-        // (pre-stack RX drops), and look for a single starved core.
-        let emit_core_arr = |w: &mut dyn core::fmt::Write,
-                             name: &str,
-                             arr: &[core::sync::atomic::AtomicU64]| {
-            let _ = write!(w, ",\"{}\":[", name);
-            for (i, slot) in arr.iter().enumerate() {
-                if i > 0 { let _ = w.write_str(","); }
-                let _ = write!(w, "{}",
-                    slot.load(core::sync::atomic::Ordering::Relaxed));
-            }
-            let _ = w.write_str("]");
-        };
-        emit_core_arr(&mut w, "syn_rx_core", &uni::net::tcp::SYN_RX_CORE);
-        emit_core_arr(&mut w, "synack_tx_core", &uni::net::tcp::SYNACK_TX_CORE);
-        emit_core_arr(&mut w, "syn_alloc_fail_core",
-            &uni::net::tcp::SYN_ALLOC_FAIL_CORE);
-        // Post-SYN lookup outcomes per core (see `LOOKUP_*` docs):
-        // sum localizes RX-path drop vs lookup-layer failure;
-        // lookup_dead > 0 means the hash returned stale slots.
-        emit_core_arr(&mut w, "lookup_hash_hit", &uni::net::tcp::LOOKUP_HASH_HIT);
-        emit_core_arr(&mut w, "lookup_linear_hit", &uni::net::tcp::LOOKUP_LINEAR_HIT);
-        emit_core_arr(&mut w, "lookup_miss", &uni::net::tcp::LOOKUP_MISS);
-        emit_core_arr(&mut w, "lookup_dead", &uni::net::tcp::LOOKUP_DEAD);
-        // Per-qp gve DQO TX-completion-drain diagnostics. On a queue
-        // whose `tx_inflight` has pinned at ring_entries, whether
-        // `tx_desc_compl` is still advancing tells us if the DESC
-        // completions that drive `done_cnt` have stalled.
-        emit_core_arr(&mut w, "tx_desc_compl",
-            &uni_driver_gve::dqo::TX_DESC_COMPL_PER_QP);
-        emit_core_arr(&mut w, "tx_pkt_compl",
-            &uni_driver_gve::dqo::TX_PKT_COMPL_PER_QP);
-        emit_core_arr(&mut w, "tx_drain_calls",
-            &uni_driver_gve::dqo::TX_DRAIN_CALLS_PER_QP);
-
         // ---- AEAD throughput (TLS + QUIC) ----
         //
         // TLS counters cover the record layer (every full-record

@@ -585,56 +585,6 @@ pub static TCP_SYN_RX: core::sync::atomic::AtomicU64 =
 pub static TCP_SYNACK_TX: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
-/// Per-core SYN diagnostics — indexed by `uni_kernel::cpu_id()`.
-/// The global `TCP_SYN_RX`/`TCP_SYNACK_TX` gap stays ~0 even when
-/// fresh connections collapse, so SYNs are lost *before* reaching
-/// `tcp_receive`. These per-core counters localize it:
-///   * `SYN_RX_CORE`        — SYNs that reached `tcp_receive`.
-///   * `SYNACK_TX_CORE`     — SYN-ACKs emitted.
-///   * `SYN_ALLOC_FAIL_CORE`— SYNs dropped because `alloc_connection`
-///                            returned `None` (pool exhausted).
-/// Summed `SYN_RX_CORE` vs the loadgen's on-wire SYN count
-/// quantifies pre-stack RX drops; a per-core skew shows whether a
-/// single core's RX path is starved.
-const MAX_DIAG_CORES: usize = 16;
-pub static SYN_RX_CORE: [core::sync::atomic::AtomicU64; MAX_DIAG_CORES] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_DIAG_CORES];
-pub static SYNACK_TX_CORE: [core::sync::atomic::AtomicU64; MAX_DIAG_CORES] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_DIAG_CORES];
-pub static SYN_ALLOC_FAIL_CORE: [core::sync::atomic::AtomicU64; MAX_DIAG_CORES] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_DIAG_CORES];
-
-/// Per-core post-SYN lookup diagnostics — indexed by cpu_id.
-/// Every non-SYN segment hits the 4-tuple lookup in `tcp_receive`;
-/// these counters split the outcome so a degraded-state probe
-/// shows *which* failure mode is stranding connections:
-///   * `LOOKUP_HASH_HIT`   — `tcp_hash_find` resolved it.
-///   * `LOOKUP_LINEAR_HIT` — hash missed, linear scan resolved it
-///                           (hash overflow → fallback in use).
-///   * `LOOKUP_MISS`       — hash + linear both missed → segment
-///                           dropped (connection unfindable).
-///   * `LOOKUP_DEAD`       — lookup returned a Closed/Listen slot
-///                           → dropped (stale/corrupt hash entry).
-/// Their sum is the count of non-SYN segments that reached the
-/// lookup; comparing it to the loadgen's ACK count localizes a
-/// pre-`tcp_receive` RX-path drop vs a lookup-layer failure.
-pub static LOOKUP_HASH_HIT: [core::sync::atomic::AtomicU64; MAX_DIAG_CORES] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_DIAG_CORES];
-pub static LOOKUP_LINEAR_HIT: [core::sync::atomic::AtomicU64; MAX_DIAG_CORES] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_DIAG_CORES];
-pub static LOOKUP_MISS: [core::sync::atomic::AtomicU64; MAX_DIAG_CORES] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_DIAG_CORES];
-pub static LOOKUP_DEAD: [core::sync::atomic::AtomicU64; MAX_DIAG_CORES] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_DIAG_CORES];
-
-/// Bump a per-core diagnostic counter, guarding the array bound.
-#[inline]
-fn diag_bump(arr: &[core::sync::atomic::AtomicU64; MAX_DIAG_CORES], core: u32) {
-    if let Some(slot) = arr.get(core as usize) {
-        slot.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    }
-}
-
 #[inline]
 fn tcp_hash_key(src_ip: IpAddr, src_port: u16, dst_port: u16) -> u64 {
     // Fold the source address to 32 bits so the existing
@@ -793,36 +743,6 @@ fn tcp_linear_find(core: u32, src_ip: IpAddr, src_port: u16, dst_port: u16) -> O
         }
     }
     None
-}
-
-/// Per-state census of every per-core connection pool, summed
-/// across cores. Index = `TcpState as usize` (0=Closed .. 8=TimeWait).
-/// Diagnostic only — exposed via `/stats` to show pool occupancy.
-/// A cross-core read of another core's pool is a benign race for a
-/// snapshot: the per-core ownership rule governs mutation, and a
-/// slightly-stale count is fine for an observability gauge.
-pub fn conn_state_census() -> [u32; 9] {
-    let mut counts = [0u32; 9];
-    let n = uni_kernel::percpu::num_cores();
-    for core in 0..n {
-        let cap = pool_capacity(core);
-        for i in 0..cap {
-            // SAFETY: diagnostic read; see doc comment.
-            let st = unsafe { (*conn_ptr(core, i)).state } as usize;
-            if st < counts.len() {
-                counts[st] += 1;
-            }
-        }
-    }
-    counts
-}
-
-/// Total materialized connection-pool capacity across all cores.
-/// Pairs with `conn_state_census` so `/stats` shows how full the
-/// pool is (capacity grows by `SEGMENT_SIZE` and never shrinks).
-pub fn pool_capacity_total() -> usize {
-    let n = uni_kernel::percpu::num_cores();
-    (0..n).map(pool_capacity).sum()
 }
 
 /// Draw a per-connection initial sequence number.
@@ -1560,7 +1480,6 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, segment: &[u8]) {
     // SYN — new connection from client
     if flags & TCP_SYN != 0 && flags & TCP_ACK == 0 {
         TCP_SYN_RX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        diag_bump(&SYN_RX_CORE, core);
         // Single pool walk: find the `Listen` slot for `dst_port`,
         // and also spot any existing connection already on this
         // exact 4-tuple. A SYN landing on a live 4-tuple is the
@@ -1621,10 +1540,7 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, segment: &[u8]) {
         // Allocate new connection on this core
         let slot = match alloc_connection(core) {
             Some(i) => i,
-            None => {
-                diag_bump(&SYN_ALLOC_FAIL_CORE, core);
-                return;
-            }
+            None => return,
         };
 
         {
@@ -1670,7 +1586,6 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, segment: &[u8]) {
             let c = unsafe { &*conn_ptr(core, slot) };
             send_segment(dst_ip, src_ip, dst_port, src_port, c.snd_nxt, c.rcv_nxt, TCP_SYN | TCP_ACK, RX_RING_BYTES as u16, &[]);
             TCP_SYNACK_TX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            diag_bump(&SYNACK_TX_CORE, core);
         }
         unsafe {
             let cp = conn_ptr(core, slot);
@@ -1694,25 +1609,15 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, segment: &[u8]) {
     // every one of its segments.
     let key = tcp_hash_key(src_ip, src_port, dst_port);
     let slot = match tcp_hash_find(core, key) {
-        Some(s) => {
-            diag_bump(&LOOKUP_HASH_HIT, core);
-            s
-        }
+        Some(s) => s,
         None => match tcp_linear_find(core, src_ip, src_port, dst_port) {
-            Some(s) => {
-                diag_bump(&LOOKUP_LINEAR_HIT, core);
-                s
-            }
-            None => {
-                diag_bump(&LOOKUP_MISS, core);
-                return;
-            }
+            Some(s) => s,
+            None => return,
         },
     };
     {
         let c = unsafe { &*conn_ptr(core, slot) };
         if c.state == TcpState::Closed || c.state == TcpState::Listen {
-            diag_bump(&LOOKUP_DEAD, core);
             return;
         }
     }
