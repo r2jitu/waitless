@@ -1205,6 +1205,13 @@ fn stats_response() -> Response {
         emit_core_arr(&mut w, "synack_tx_core", &uni::net::tcp::SYNACK_TX_CORE);
         emit_core_arr(&mut w, "syn_alloc_fail_core",
             &uni::net::tcp::SYN_ALLOC_FAIL_CORE);
+        // Post-SYN lookup outcomes per core (see `LOOKUP_*` docs):
+        // sum localizes RX-path drop vs lookup-layer failure;
+        // lookup_dead > 0 means the hash returned stale slots.
+        emit_core_arr(&mut w, "lookup_hash_hit", &uni::net::tcp::LOOKUP_HASH_HIT);
+        emit_core_arr(&mut w, "lookup_linear_hit", &uni::net::tcp::LOOKUP_LINEAR_HIT);
+        emit_core_arr(&mut w, "lookup_miss", &uni::net::tcp::LOOKUP_MISS);
+        emit_core_arr(&mut w, "lookup_dead", &uni::net::tcp::LOOKUP_DEAD);
 
         // ---- AEAD throughput (TLS + QUIC) ----
         //

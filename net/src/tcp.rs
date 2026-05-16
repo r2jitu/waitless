@@ -604,6 +604,29 @@ pub static SYNACK_TX_CORE: [core::sync::atomic::AtomicU64; MAX_DIAG_CORES] =
 pub static SYN_ALLOC_FAIL_CORE: [core::sync::atomic::AtomicU64; MAX_DIAG_CORES] =
     [const { core::sync::atomic::AtomicU64::new(0) }; MAX_DIAG_CORES];
 
+/// Per-core post-SYN lookup diagnostics — indexed by cpu_id.
+/// Every non-SYN segment hits the 4-tuple lookup in `tcp_receive`;
+/// these counters split the outcome so a degraded-state probe
+/// shows *which* failure mode is stranding connections:
+///   * `LOOKUP_HASH_HIT`   — `tcp_hash_find` resolved it.
+///   * `LOOKUP_LINEAR_HIT` — hash missed, linear scan resolved it
+///                           (hash overflow → fallback in use).
+///   * `LOOKUP_MISS`       — hash + linear both missed → segment
+///                           dropped (connection unfindable).
+///   * `LOOKUP_DEAD`       — lookup returned a Closed/Listen slot
+///                           → dropped (stale/corrupt hash entry).
+/// Their sum is the count of non-SYN segments that reached the
+/// lookup; comparing it to the loadgen's ACK count localizes a
+/// pre-`tcp_receive` RX-path drop vs a lookup-layer failure.
+pub static LOOKUP_HASH_HIT: [core::sync::atomic::AtomicU64; MAX_DIAG_CORES] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_DIAG_CORES];
+pub static LOOKUP_LINEAR_HIT: [core::sync::atomic::AtomicU64; MAX_DIAG_CORES] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_DIAG_CORES];
+pub static LOOKUP_MISS: [core::sync::atomic::AtomicU64; MAX_DIAG_CORES] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_DIAG_CORES];
+pub static LOOKUP_DEAD: [core::sync::atomic::AtomicU64; MAX_DIAG_CORES] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_DIAG_CORES];
+
 /// Bump a per-core diagnostic counter, guarding the array bound.
 #[inline]
 fn diag_bump(arr: &[core::sync::atomic::AtomicU64; MAX_DIAG_CORES], core: u32) {
@@ -1671,15 +1694,25 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, segment: &[u8]) {
     // every one of its segments.
     let key = tcp_hash_key(src_ip, src_port, dst_port);
     let slot = match tcp_hash_find(core, key) {
-        Some(s) => s,
+        Some(s) => {
+            diag_bump(&LOOKUP_HASH_HIT, core);
+            s
+        }
         None => match tcp_linear_find(core, src_ip, src_port, dst_port) {
-            Some(s) => s,
-            None => return,
+            Some(s) => {
+                diag_bump(&LOOKUP_LINEAR_HIT, core);
+                s
+            }
+            None => {
+                diag_bump(&LOOKUP_MISS, core);
+                return;
+            }
         },
     };
     {
         let c = unsafe { &*conn_ptr(core, slot) };
         if c.state == TcpState::Closed || c.state == TcpState::Listen {
+            diag_bump(&LOOKUP_DEAD, core);
             return;
         }
     }
