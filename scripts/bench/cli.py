@@ -218,19 +218,21 @@ WORKLOADS = [
     # `conns_per_core: 1500` exercises deep fan-out scaling on the
     # unikernel side.
     # fanout_tcp is parked in the `available` tier (off the default
-    # set) because it currently wedges the unikernel regardless of
-    # core count — at 1c the 1500-conn connect storm overruns the
-    # accept backlog; at 4c (6000 conns) it also TIMEOUTs and the
-    # damage *persists across core-count tiers* (8c starts in
-    # SKIP-not-ready and aborts immediately). Until the
-    # gateway-accept path or the loadgen's connect-rate is fixed,
-    # leaving this in the default set foot-guns every full bench.
-    # Invoke explicitly via `--workload fanout_tcp` once a fix
-    # lands. Bench client and unikernel both need to come back from
-    # a stop before it can be tried again.
+    # set). 1c runs clean (~70k req/s on hvf); 4c+ TIMEOUTs when
+    # benched locally — co-locating an N-vCPU VM and the loadgen on
+    # an 8-core laptop oversubscribes the host, so the loadgen gets
+    # starved (cli≈0.2cpu) rather than the unikernel wedging. Expect
+    # nothing useful above ~3c locally. Real multi-core fanout
+    # numbers need GCE, which first needs the gateway backend IP made
+    # configurable: the handler resolves it from `net.gateway()` (see
+    # apps/webserver gateway()), which only points at the loadgen
+    # host on local tap/SLIRP/bridge topologies — on GCE the gateway
+    # is the Andromeda subnet router, not the loadgen VM.
+    # Invoke explicitly via `--workload fanout_tcp`; kept off the
+    # default set so a full bench doesn't eat the 4c+ TIMEOUT.
     {"name": "fanout_tcp", "type": "gateway",
      "conns_per_core": 1500, "tier": "available",
-     "desc": "Gateway fan-out (TCP→UDP backend→TCP, 1500 conn × cpus; CURRENTLY WEDGES — see comment)"},
+     "desc": "Gateway fan-out (TCP→UDP backend→TCP, 1500 conn × cpus; bench 1c locally — see comment)"},
 
     # ── Bulk RX — POST /discard with sized body ──────────────────────
     #
@@ -526,15 +528,13 @@ def main():
 
                 bench_port = port
 
-                # Some workloads have a floor on the target core count
-                # they make sense at. `fanout_tcp` opens 1500 conn ×
-                # cpus to the gateway — at cpus=1 that's 1500 connect()
-                # handshakes against a single-core unikernel scheduler,
-                # which overruns the accept backlog and wedges every
-                # subsequent workload at that core count (the readiness
-                # probe never recovers). Mark such workloads with
-                # `min_cpus` and skip cleanly at lower counts — no
-                # SKIP-cascade, no consecutive-skip abort.
+                # Some workloads only make sense at or above a floor
+                # core count — a heavy conn-storm workload pointed at
+                # a too-small scheduler can overrun the accept path
+                # and wedge every subsequent workload at that core
+                # count (the readiness probe never recovers). Mark
+                # those with `min_cpus` and skip cleanly at lower
+                # counts — no SKIP-cascade, no consecutive-skip abort.
                 if cpus < w.get("min_cpus", 0):
                     print(f"    {wname:<20s} SKIP (needs ≥{w['min_cpus']} cores)")
                     results[(env_name, cpus, wname)] = (0, "", "")
