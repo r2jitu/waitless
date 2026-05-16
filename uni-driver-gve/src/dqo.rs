@@ -243,12 +243,28 @@ pub(crate) fn tx_drain(tx: &TxQueue) {
         // is the number of descriptors the device has fetched
         // since our last drain.
         let mask16 = rmask as u16;
+        let ring_entries = tx.ring_entries as u32;
         let prev = tx.done_cnt.load(Ordering::Relaxed);
+        let fill = tx.fill_cnt.load(Ordering::Relaxed);
         let prev_low = (prev as u16) & mask16;
         let tx_head_low = tx_head & mask16;
-        let delta = (tx_head_low.wrapping_sub(prev_low)) & mask16;
+        let mut delta = (tx_head_low.wrapping_sub(prev_low) & mask16) as u32;
+        // The masked delta is computed mod `ring_entries`, so it
+        // cannot tell "device advanced 0" from "device advanced a
+        // whole ring" — both leave `tx_head_low == prev_low`. A
+        // DESC completion is only ever emitted for a descriptor the
+        // device actually fetched, so a fresh one with a computed
+        // delta of 0 while the ring is full means the device
+        // drained the entire ring, not nothing. Without this fix
+        // `done_cnt` freezes the instant the ring first fills and
+        // `tx_inflight` stays pinned at `ring_entries` forever —
+        // the queue wedges and every send (SYN-ACKs included) is
+        // silently dropped. (Race-dependent per qp; permanent.)
+        if delta == 0 && fill.wrapping_sub(prev) >= ring_entries {
+            delta = ring_entries;
+        }
         if delta > 0 {
-            tx.done_cnt.store(prev.wrapping_add(delta as u32), Ordering::Relaxed);
+            tx.done_cnt.store(prev.wrapping_add(delta), Ordering::Relaxed);
         }
     }
 }
