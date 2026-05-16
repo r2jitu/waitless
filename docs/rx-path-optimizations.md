@@ -154,7 +154,8 @@ a 100 MB POST). See item L for the follow-on plan.
 - **Status**: [ ]
 - **Where**: [`kernel/src/percpu.rs:55-137`](kernel/src/percpu.rs#L55-L137)
   — `RxPacket { len, data: [u8; 1514] }` replaced with
-  `Option<IOBufChain>`.
+  `Option<IOBufChain>` (`Option<Chain<OwnedIOBuf>>` if the
+  type-model split lands first — see Risk).
 - **What**: cross-core inbox push moves an IOBufChain into a
   slot instead of copying frame bytes. Pop takes the chain out
   and hands to `net_receive`. Bounded queue with drop-on-overflow
@@ -165,9 +166,14 @@ a 100 MB POST). See item L for the follow-on plan.
   that received them.
 - **Effort**: low. ~80 LOC. Storage shape changes; push/pop logic
   is moves not copies.
-- **Risk**: low. `ExternalOwned` is `Send` (unsafe impl already
-  in place at [uni-iobuf/src/lib.rs:338](uni-iobuf/src/lib.rs#L338));
-  cross-core moves are sound.
+- **Risk**: low. The chain moves cross-core, not copies. **If the
+  uni-iobuf type-model split (see Follow-ups) lands first —
+  recommended — the inbox holds `Chain<OwnedIOBuf>`, `Send` by
+  derivation, with no `unsafe impl`.** Absent the split,
+  `ExternalOwned` is `Send` (unsafe impl at
+  [uni-iobuf/src/lib.rs:338](uni-iobuf/src/lib.rs#L338)) and
+  `RxInbox` carries an `unsafe impl Send` plus a human-maintained
+  "no `Borrowed` parts" invariant.
 - **Tests**: bounded-queue eviction (push N+1 chains, verify
   oldest's drop_fn fired).
 
@@ -555,12 +561,16 @@ sprawl that session.
 one `!Send` type, so every cross-core use needs a manual
 `unsafe impl Send` plus a human-maintained "no `Borrowed` parts"
 invariant (item C's `RxInbox` is one such site). Spike + recommended
-design — split out a `Send`-by-derivation `OwnedIOBuf`, make
-`into_owned` a typed `IOBuf → OwnedIOBuf` gate, generic-ize the
-chain — written up in
-[`uni-iobuf-type-model.md`](uni-iobuf-type-model.md). Land it before
-item F (its `RecvChunkGuard::into_owned()` is only a real gate, not
-discipline, with the typed conversion).
+design — split out a `Send`-by-derivation `OwnedIOBuf`, born from
+`wrap_owned` / `IOBufPool::alloc` so the RX path is *typed*
+`Chain<OwnedIOBuf>` rather than guarded by discipline; add a
+one-way `From<OwnedIOBuf> for IOBuf` widening at the app RX
+boundary; generic-ize the chain as `Chain<B>` — written up in
+[`uni-iobuf-type-model.md`](uni-iobuf-type-model.md). `into_owned`
+stays item A's `IOBuf → IOBuf` (it is a cross-*time* tool, not the
+cross-core gate). Land it **before item C**, so that item's
+`RxInbox` is `Send` by derivation rather than carrying an
+`unsafe impl Send` this work would later delete.
 
 ### Operational
 
