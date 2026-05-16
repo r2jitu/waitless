@@ -67,6 +67,17 @@ def _cpu_tag(cores):
     return f"cli={cores:.1f}cpu{sat}"
 
 
+def _throughput_tag(rps, nbytes, label):
+    """Wire-throughput tag for a bulk workload — `rps` requests each
+    moving `nbytes` of body. `label` is `rx` for uploads (bytes the
+    server receives) or `tx` for downloads (bytes it sends). Empty
+    for workloads with no fixed body size (`nbytes == 0`), so
+    small-request/response rows stay terse."""
+    if rps <= 0 or nbytes <= 0:
+        return ""
+    return f"  {label}={rps * nbytes / 1e6:.0f}MB/s"
+
+
 def _alloc_tag(allocs_before, allocs_after, iterations):
     """Format the allocs-per-iteration delta for the per-run output
     line. Returns an empty string (no extra tag) when sampling
@@ -189,7 +200,7 @@ WORKLOADS = [
     # SHA-256 on every iteration. Δ vs `get_tls_fresh_resume` (in
     # the available tier) reads full-vs-resumed handshake cost.
     {"name": "download_64k_tls", "type": "https", "endpoint": "/static-64k",
-     "threads_per_core": 1, "conns_per_core": 8,
+     "threads_per_core": 1, "conns_per_core": 8, "resp_bytes": 65536,
      "desc": "/static-64k throughput over TLS (~4 records, multi-segment TX)"},
     {"name": "get_tls_fresh", "type": "tls_handshake",
      "endpoint": "/health",
@@ -205,7 +216,7 @@ WORKLOADS = [
     # confound on either side — body is a borrowed `&'static [u8]`.
     {"name": "download_64k_quic", "type": "h3_health",
      "endpoint": "/static-64k",
-     "parallelism_per_core": 4,
+     "parallelism_per_core": 4, "resp_bytes": 65536,
      "desc": "/static-64k throughput over HTTP/3 (64 KiB body, multi-packet)"},
 
     # ── Async runtime / sidecar fan-out (guest:9000) ──────────────────
@@ -254,6 +265,21 @@ WORKLOADS = [
      "endpoint": "/discard", "msg_size": 32768,
      "conns_per_core": 16, "tls": True,
      "desc": "POST /discard 32 KiB body (16 conn × cpus, over TLS)"},
+    # Larger bodies — sustained-RX probes. Each overruns the 16 KiB
+    # per-conn `rx_ring` many times over, so they exercise the
+    # ring-fill → window-backpressure → drain → window-update cycle
+    # repeatedly (the path the `net-tcp` window-update fix hardened
+    # — pre-fix a 256 KiB upload hit the 30 s client timeout). Read
+    # the `rx=` MB/s tag rather than req/s here. `available` tier:
+    # run with `--workload upload_256k_tcp,upload_1m_tcp`.
+    {"name": "upload_256k_tcp", "type": "http_upload",
+     "endpoint": "/discard", "msg_size": 262144,
+     "conns_per_core": 16, "tls": False, "tier": "available",
+     "desc": "POST /discard 256 KiB body (16 conn × cpus, plain HTTP)"},
+    {"name": "upload_1m_tcp", "type": "http_upload",
+     "endpoint": "/discard", "msg_size": 1048576,
+     "conns_per_core": 16, "tls": False, "tier": "available",
+     "desc": "POST /discard 1 MiB body (16 conn × cpus, plain HTTP)"},
 
     # ── Bulk TX — GET /static-64k ────────────────────────────────────
     #
@@ -261,7 +287,7 @@ WORKLOADS = [
     # — surfaces TCP TX path regressions (descriptor build, TSO,
     # checksum offload) without TLS encrypt confound.
     {"name": "download_64k_tcp", "type": "tcp", "endpoint": "/static-64k",
-     "threads_per_core": 1, "conns_per_core": 8,
+     "threads_per_core": 1, "conns_per_core": 8, "resp_bytes": 65536,
      "desc": "/static-64k throughput plain HTTP (~4 segments, multi-segment TX)"},
 
     # ── Available tier (off the default set) ─────────────────────────
@@ -689,7 +715,8 @@ def main():
                     results[(env_name, cpus, wname)] = (rps, p50, p99)
                     client_cpu[(env_name, cpus, wname)] = m["cores"]
                     print(f"    {wname:<20s} {rps:>10.0f} req/s  "
-                          f"p50={p50}  p99={p99}  {_cpu_tag(m['cores'])}")
+                          f"p50={p50}  p99={p99}  {_cpu_tag(m['cores'])}"
+                          + _throughput_tag(rps, w.get("resp_bytes", 0), "tx"))
                 elif w["type"] == "http_upload":
                     # Keep-alive HTTP POST of a sized body to
                     # /discard. The server reads + discards, returns
@@ -708,7 +735,8 @@ def main():
                     results[(env_name, cpus, wname)] = (rps, p50, p99)
                     client_cpu[(env_name, cpus, wname)] = m["cores"]
                     print(f"    {wname:<20s} {rps:>10.0f} req/s  "
-                          f"p50={p50}  p99={p99}  {_cpu_tag(m['cores'])}")
+                          f"p50={p50}  p99={p99}  {_cpu_tag(m['cores'])}"
+                          + _throughput_tag(rps, w.get("msg_size", 32768), "rx"))
                 elif w["type"] == "http_close":
                     # Accept-rate-bound plain-HTTP workload. Each
                     # iter is a fresh TCP from a different
@@ -765,7 +793,8 @@ def main():
                     cyb_tag = _cycles_per_byte_tag(aead_before, aead_after)
                     print(f"    {wname:<20s} {rps:>10.0f} req/s  "
                           f"p50={p50}  p99={p99}  "
-                          f"{_cpu_tag(m['cores'])}{alloc_tag}{cyb_tag}")
+                          f"{_cpu_tag(m['cores'])}{alloc_tag}{cyb_tag}"
+                          + _throughput_tag(rps, w.get("resp_bytes", 0), "tx"))
                 elif w["type"] == "tls_handshake":
                     # Connection-per-request: each iteration opens a
                     # fresh TCP socket, completes the full TLS 1.3
@@ -852,7 +881,8 @@ def main():
                     results[(env_name, cpus, wname)] = (rps, p50, p99)
                     client_cpu[(env_name, cpus, wname)] = m["cores"]
                     print(f"    {wname:<20s} {rps:>10.0f} req/s  "
-                          f"p50={p50}  p99={p99}  {_cpu_tag(m['cores'])}")
+                          f"p50={p50}  p99={p99}  {_cpu_tag(m['cores'])}"
+                          + _throughput_tag(rps, w.get("resp_bytes", 0), "tx"))
                 elif w["type"] == "udp":
                     # Let wait_http's TCP teardown settle before firing a
                     # UDP burst — without this the first sender very
