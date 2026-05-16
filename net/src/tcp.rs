@@ -1482,22 +1482,21 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, segment: &[u8]) {
         TCP_SYN_RX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         // Single pool walk: find the `Listen` slot for `dst_port`,
         // and also spot any existing connection already on this
-        // exact 4-tuple. A SYN landing on a live 4-tuple is the
-        // peer (re)starting — a retransmitted SYN whose SYN-ACK we
+        // exact 4-tuple. A SYN on a live 4-tuple is the peer
+        // (re)starting — a retransmitted SYN whose SYN-ACK was
         // lost, or a fresh connection on a reused ephemeral port.
-        // The stale twin is freed before we allocate, enforcing
-        // "at most one connection per 4-tuple".
+        // Free that stale twin before allocating, so the pool
+        // never holds two connections for one 4-tuple.
         //
-        // Without this, every retransmitted SYN `alloc_connection`s
-        // a fresh slot, orphaning the previous `SynReceived`
-        // connection — and nothing reclaims it (the scavenger skips
-        // `SynReceived`; the stack has no RTO timer). Orphans pile
-        // up, overflow the 256-entry 4-tuple hash, and then lookups
-        // for the real connection mis-resolve to a stale twin —
-        // stranding fresh handshakes (observed: 849 stuck
-        // `SynReceived` slots collapsing fresh-conn throughput).
+        // Without this, a retransmitted SYN `alloc_connection`s a
+        // fresh slot and orphans the previous `SynReceived`
+        // connection. Nothing reclaims an orphaned `SynReceived`:
+        // the stack has no RTO timer, and `alloc_connection`'s
+        // pool-exhaustion reclaim scans only closing states. The
+        // orphan would leak until its 4-tuple is reused — which is
+        // exactly when this scan catches it.
         //
-        // An `Established` match is left intact — that's a live
+        // An `Established` match is left intact — a live
         // connection, not a stale duplicate.
         let mut listener_idx = None;
         let mut stale_idx = None;
@@ -2122,7 +2121,6 @@ pub fn register_send_waker(handle: *mut (), generation: u16, waker: &Waker) {
     // "ready" for this stack. Fire immediately so the future
     // re-probes and resolves.
     waker.wake_by_ref();
-    let _ = c;  // placate unused-var lint if we ever remove the wake.
 }
 
 pub fn clear_send_waker(_handle: *mut (), _generation: u16) {
