@@ -514,6 +514,41 @@ backpressure. CPU-bound at ChaCha20-Poly1305 decrypt rate
 TODO section. `get_tcp_pipeline` is especially worth landing
 as a validation probe for item J (ideal RSC shape).
 
+### Test & bench infrastructure
+
+Surfaced during item B's validation; deferred so they didn't
+sprawl that session.
+
+- **TCP conformance test harness.** `net_tcp` has no conformance
+  suite — the receiver-side window-update bug (commit `171c68e`,
+  found mid-item-B only because a QEMU upload anomaly got chased
+  into a packet capture) is exhibit A for why that's a gap. Build
+  an in-memory harness: a mock `NicOps` (the vtable is swappable
+  via `set_active_ops()`) captures TX frames into a `Vec`, and
+  `tcp_receive(src, dst, &[u8])` is already a `pub` RX entry point
+  that takes crafted segments — so a test drives scripted packets
+  in and asserts on captured output (packetdrill-in-a-unit-test).
+  *Blocker:* `net_tcp`'s `os:none` dep chain (`kernel` /
+  `uni-runtime`) must be made host-buildable — extend the
+  `tests_need_std` mechanism in
+  [`bazel/rules/rust.bzl`](bazel/rules/rust.bzl) (today only
+  `util/atomic_fn` uses it) and `#[cfg]`-gate the genuinely
+  bare-metal bits. First targets: a regression test for the
+  window-update fix, and a real **RTO / retransmit timer** — the
+  stack has none today (`net/src/tcp.rs` admits it in comments;
+  a lost *outbound* segment is never retransmitted, a correctness
+  gap on lossy paths, not just a perf one).
+
+- **Tag-based bench workload matrix.** `scripts/bench/cli.py`'s
+  `WORKLOADS` is hand-enumerated, but a workload is really a point
+  in `shape × transport × ipver × size × concurrency`. Move to tag
+  identity (`upload:1m:tls`) + a generator — but **sparse, not a
+  dense product**: per-shape declared-valid dimensions (no
+  `upload:quic` — no loadgen impl), v6 as a spot-check axis rather
+  than a product axis, and keep the curated Δ-pairs that make the
+  output readable. Port the existing registry as a
+  no-behavior-change refactor first, then fill gaps.
+
 ### Operational
 
 - Stuck-worker preemption / watchdog.
