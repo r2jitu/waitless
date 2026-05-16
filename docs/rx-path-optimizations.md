@@ -87,7 +87,7 @@ a 100 MB POST). See item L for the follow-on plan.
 ## Items
 
 ### A. `IOBuf::into_owned()` + `IOBufPool` infrastructure
-- **Status**: [ ]
+- **Status**: [x] landed 2026-05-15 — commit `180e29c`
 - **Where**: [`uni-iobuf/src/lib.rs`](uni-iobuf/src/lib.rs);
   possibly new [`uni-iobuf/src/pool.rs`](uni-iobuf/src/pool.rs).
 - **What**:
@@ -567,3 +567,30 @@ when bench started doing TLS POSTs > 4 KiB: `RX_BUF_LEN` was 4 KiB
 (too small for a 16 KiB TLS record), `PT_BUF_LEN` similarly.
 Both bumped to 17 KiB (commits `5e6d59f`, `c357337`). `upload_32k_tls`
 unblocked.
+
+### 2026-05-15 — Phase 2/3, item A: `IOBuf::into_owned` + `IOBufPool` ([x] **landed** — commit `180e29c`)
+
+Pure-additions infrastructure step. Two additions to `uni-iobuf`:
+
+- `IOBuf::into_owned(self) -> IOBuf` — zero-copy no-op for the four
+  owning variants (`Heap` / `Shared` / `Static` / `ExternalOwned`);
+  copies-to-`Heap` for `Borrowed`, the one non-owning variant. The
+  ownership-transfer escape hatch the item-F / item-H guards'
+  `into_owned()` will delegate to.
+- `IOBufPool` — fixed-size MTU-slab pool ([`uni-iobuf/src/pool.rs`](uni-iobuf/src/pool.rs))
+  with a lock-free tagged-pointer Treiber free list (`AtomicU64`
+  head packing `(slot_index, version_tag)`; version bumps on push
+  to defeat ABA; links in a dedicated `AtomicU32` array so they
+  never alias slab payload). `alloc()` hands out an `ExternalOwned`
+  IOBuf that recycles its slab on drop; the drop callback is
+  panic-safe (leak + counter, never panic in a `#![no_std]` `Drop`).
+  Consumed by item B's GQI recycle pool.
+
+No perf delta expected or measured — no GCE bench for this item
+per the plan (first checkpoint is after item B). Verified:
+`bazel test //uni-iobuf:iobuf_test` (50 tests, +12 new, including
+an 8-thread Treiber-stack ABA stress test), x86_64 + aarch64
+unikernel builds, and `test_hvf`.
+
+Next: item B (`NicOps` RX callback delivers `IOBufChain`) — a
+larger atomic change across 5 files; tracked for its own session.
