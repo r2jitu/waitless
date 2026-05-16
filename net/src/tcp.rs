@@ -585,6 +585,33 @@ pub static TCP_SYN_RX: core::sync::atomic::AtomicU64 =
 pub static TCP_SYNACK_TX: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
+/// Per-core SYN diagnostics — indexed by `uni_kernel::cpu_id()`.
+/// The global `TCP_SYN_RX`/`TCP_SYNACK_TX` gap stays ~0 even when
+/// fresh connections collapse, so SYNs are lost *before* reaching
+/// `tcp_receive`. These per-core counters localize it:
+///   * `SYN_RX_CORE`        — SYNs that reached `tcp_receive`.
+///   * `SYNACK_TX_CORE`     — SYN-ACKs emitted.
+///   * `SYN_ALLOC_FAIL_CORE`— SYNs dropped because `alloc_connection`
+///                            returned `None` (pool exhausted).
+/// Summed `SYN_RX_CORE` vs the loadgen's on-wire SYN count
+/// quantifies pre-stack RX drops; a per-core skew shows whether a
+/// single core's RX path is starved.
+const MAX_DIAG_CORES: usize = 16;
+pub static SYN_RX_CORE: [core::sync::atomic::AtomicU64; MAX_DIAG_CORES] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_DIAG_CORES];
+pub static SYNACK_TX_CORE: [core::sync::atomic::AtomicU64; MAX_DIAG_CORES] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_DIAG_CORES];
+pub static SYN_ALLOC_FAIL_CORE: [core::sync::atomic::AtomicU64; MAX_DIAG_CORES] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_DIAG_CORES];
+
+/// Bump a per-core diagnostic counter, guarding the array bound.
+#[inline]
+fn diag_bump(arr: &[core::sync::atomic::AtomicU64; MAX_DIAG_CORES], core: u32) {
+    if let Some(slot) = arr.get(core as usize) {
+        slot.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 #[inline]
 fn tcp_hash_key(src_ip: IpAddr, src_port: u16, dst_port: u16) -> u64 {
     // Fold the source address to 32 bits so the existing
@@ -1510,6 +1537,7 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, segment: &[u8]) {
     // SYN — new connection from client
     if flags & TCP_SYN != 0 && flags & TCP_ACK == 0 {
         TCP_SYN_RX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        diag_bump(&SYN_RX_CORE, core);
         // Single pool walk: find the `Listen` slot for `dst_port`,
         // and also spot any existing connection already on this
         // exact 4-tuple. A SYN landing on a live 4-tuple is the
@@ -1570,7 +1598,10 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, segment: &[u8]) {
         // Allocate new connection on this core
         let slot = match alloc_connection(core) {
             Some(i) => i,
-            None => return,
+            None => {
+                diag_bump(&SYN_ALLOC_FAIL_CORE, core);
+                return;
+            }
         };
 
         {
@@ -1616,6 +1647,7 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, segment: &[u8]) {
             let c = unsafe { &*conn_ptr(core, slot) };
             send_segment(dst_ip, src_ip, dst_port, src_port, c.snd_nxt, c.rcv_nxt, TCP_SYN | TCP_ACK, RX_RING_BYTES as u16, &[]);
             TCP_SYNACK_TX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            diag_bump(&SYNACK_TX_CORE, core);
         }
         unsafe {
             let cp = conn_ptr(core, slot);

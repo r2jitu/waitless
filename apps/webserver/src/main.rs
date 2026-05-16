@@ -1185,6 +1185,27 @@ fn stats_response() -> Response {
             census[5], census[6], census[7], census[8],
         );
 
+        // Per-core SYN diagnostics. The global syn_rx/synack_tx gap
+        // stays ~0 even when fresh-conn collapses, so SYNs are lost
+        // before `tcp_receive`. These localize it: compare summed
+        // `syn_rx_core` against the loadgen's on-wire SYN count
+        // (pre-stack RX drops), and look for a single starved core.
+        let emit_core_arr = |w: &mut dyn core::fmt::Write,
+                             name: &str,
+                             arr: &[core::sync::atomic::AtomicU64]| {
+            let _ = write!(w, ",\"{}\":[", name);
+            for (i, slot) in arr.iter().enumerate() {
+                if i > 0 { let _ = w.write_str(","); }
+                let _ = write!(w, "{}",
+                    slot.load(core::sync::atomic::Ordering::Relaxed));
+            }
+            let _ = w.write_str("]");
+        };
+        emit_core_arr(&mut w, "syn_rx_core", &uni::net::tcp::SYN_RX_CORE);
+        emit_core_arr(&mut w, "synack_tx_core", &uni::net::tcp::SYNACK_TX_CORE);
+        emit_core_arr(&mut w, "syn_alloc_fail_core",
+            &uni::net::tcp::SYN_ALLOC_FAIL_CORE);
+
         // ---- AEAD throughput (TLS + QUIC) ----
         //
         // TLS counters cover the record layer (every full-record
