@@ -414,7 +414,21 @@ pub(crate) fn send_on_qp(qp: usize, data: &[u8]) -> bool {
         tx_drain(qp, tx);
         done_cnt = tx.done_cnt.load(Ordering::Relaxed);
         in_flight = fill_cnt.wrapping_sub(done_cnt);
-        if in_flight + 2 > ring_entries {
+        // Reject with one packet (2 descriptors) of headroom — the
+        // TX ring must never fill *completely*. The doorbell carries
+        // the masked producer position `fill_cnt & mask`; with a
+        // full ring `fill_cnt - done == ring_entries`, so
+        // `fill_cnt & mask == done & mask` — the masked tail
+        // collides with the device's head, and the device reads
+        // tail == head as "ring empty" and stops servicing the
+        // queue entirely. That stall is permanent (the driver then
+        // can't send to un-stick it) and silently drops every
+        // egress packet, SYN-ACKs included. It's the same
+        // masked-position hazard the RX ring already avoids by
+        // leaving its last slot empty (see `post_initial_rx_for_qp`).
+        // Capping `in_flight` at `ring_entries - 2` guarantees the
+        // masked tail and head always differ.
+        if in_flight + 2 > ring_entries - 2 {
             return false;
         }
     }
