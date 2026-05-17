@@ -46,8 +46,9 @@ Variants produced (names & platform compat defined in _VARIANT_SPECS):
 #                                         Propagates to every rlib in
 #                                         the sub-graph; leaf BUILDs
 #                                         don't set `rustc_flags`.
-#   * `//bazel/rules:tests_need_std`    — False so atomic_fn stays
-#                                         no_std inside the sub-graph.
+#   * `//bazel/rules:tests_need_std`    — False: the unikernel
+#                                         sub-graph builds no
+#                                         rust_test targets.
 
 def _make_variant_transition(platform, uni_runner, target_arch):
     outputs = [

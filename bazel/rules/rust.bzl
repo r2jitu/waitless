@@ -54,31 +54,20 @@ def rust_proc_macro(rustc_flags = [], target_compatible_with = [], **kwargs):
 
 # Panic strategy is handled in `.bazelrc`:
 #
-#   * Global: `-Cpanic=abort` — every rlib in this repo is
-#     `#![cfg_attr(not(test), no_std)]` (or bare `#![no_std]`), and
-#     rustc rejects `panic=unwind` on a no_std crate.
+#   * Global: `-Cpanic=abort` — the production target is a
+#     unikernel with no unwinding runtime.
 #
 #   * `test` verb appends `-Cpanic=unwind` so rust_test targets
-#     get the unwinding libtest harness. Test source files flip
-#     to std under `--test` cfg via `cfg_attr(not(test), no_std)`,
-#     so the unwind strategy is legal there.
+#     get the unwinding libtest harness. A `rust_test` crate flips
+#     to std under `--test` via `#![cfg_attr(not(test), no_std)]`,
+#     so the unwind strategy is legal there. Its dependency rlibs
+#     don't get `--test` and stay no_std — but a no_std rlib links
+#     fine into the unwinding test binary, so no per-dep std-flip
+#     is needed.
 #
 #   * Integration tests are per-variant (`:test_hvf`, `:test_iso`,
 #     `:test_qemu_<arch>`) and depend on the matching unikernel
 #     variant target. The variant rule in
 #     `//bazel/rules:variants.bzl` applies a Bazel transition that
 #     re-asserts `-Cpanic=abort` on the unikernel sub-graph, so the
-#     test-verb unwind override never reaches the no_std rlibs.
-#
-#   * The one residual awkwardness: a `rust_test` that
-#     `crate = ":foo"` (or that `srcs =` foo's source directly)
-#     pulls `:foo`'s dep rlibs. Those deps don't get `--test`, so
-#     their `#![cfg_attr(not(test), no_std)]` stays active and
-#     rustc refuses panic=unwind on no_std. Fix: the
-#     `//bazel/rules:tests_need_std` bool_flag flips to True under
-#     the `test` verb, and affected crates (currently just
-#     `//util/atomic_fn`) `select()` on the matching config_setting
-#     to inject `crate_features = ["std"]`, flipping themselves to
-#     std + unwind for the duration of the test build. Variant
-#     transitions re-enter the production sub-graph with the flag
-#     reset to False.
+#     test-verb unwind override never reaches the unikernel rlibs.

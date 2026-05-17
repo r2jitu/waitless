@@ -14,17 +14,15 @@ exports_files([
     "unikernel_main.rs",
 ])
 
-# `bazel test` flips this to True via `.bazelrc`. Crates that are
-# `#![cfg_attr(not(feature = "std"), no_std)]` select on the
-# matching `:tests_need_std_on` config_setting below to pick up
-# `crate_features = ["std"]` when True, so they compile as std +
-# panic=unwind under the test verb (satisfying libtest) but stay
-# no_std + panic=abort for production unikernel builds.
+# `bazel test` flips this to True via `.bazelrc`. The `rust_test`
+# wrapper in `//bazel/rules:rust.bzl` selects on the matching
+# `:tests_need_std_on` config_setting to set `target_compatible_with`:
+# `bazel build //...` skips rust_test targets (rustc won't build a
+# test binary under the global `-Cpanic=abort`) and `bazel test`
+# picks them up.
 #
-# Per-variant transitions in `//bazel/rules:variants.bzl` re-enter
-# the production sub-graph from under `bazel test` and reset this
-# flag to False, so unikernel rlibs pulled in as variant data stay
-# no_std.
+# Per-variant transitions in `//bazel/rules:variants.bzl` reset
+# this flag to False for the unikernel sub-graph.
 bool_flag(
     name = "tests_need_std",
     build_setting_default = False,

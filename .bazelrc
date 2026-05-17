@@ -3,29 +3,32 @@ build --action_env=PATH
 
 # Rust compiler flags applied to all crates.
 #
-# Global `panic=abort` because every rust_library in this repo is
-# `#![no_std]` (or `#![cfg_attr(not(test), no_std)]`, staying no_std
-# outside `--test`), and rustc rejects `panic=unwind` on no_std.
+# Global `panic=abort`: the production target is a unikernel with
+# no unwinding runtime, and every rust_library here is no_std (or
+# `#![cfg_attr(not(test), no_std)]`, staying no_std outside
+# `--test`).
 #
 # `bazel test` overrides to `-Cpanic=unwind` so the libtest harness
-# can catch assertion panics. That's legal because every `rust_test`
-# source file uses `#![cfg_attr(not(test), no_std)]` — under `--test`
-# they flip to std.
+# can catch assertion panics. `rust_test` crates are
+# `#![cfg_attr(not(test), no_std)]`, so under `--test` they flip to
+# std where unwinding is fine; their no_std rlib deps stay no_std
+# and link in regardless.
 #
 # Per-variant unikernel targets (:<app>_hvf / _iso / _qemu_<arch>)
 # apply a Bazel transition via //bazel/rules:variants.bzl that
 # re-asserts `-Cpanic=abort` on the unikernel sub-graph, so under
 # `bazel test //apps/foo:test_hvf` the test-verb unwind override
-# never reaches the no_std unikernel rlibs.
+# never reaches the unikernel rlibs.
 build --@rules_rust//:extra_rustc_flags=-Cpanic=abort,-Copt-level=2,-Dwarnings
 test  --@rules_rust//:extra_rustc_flag=-Cpanic=unwind
 
-# `bazel test` flips //bazel/rules:tests_need_std=True so
-# `#![cfg_attr(not(feature = "std"), no_std)]` crates (currently
-# just //util/atomic_fn) pick up `crate_features = ["std"]` and
-# compile as std + panic=unwind to link into libtest harnesses.
-# Per-variant transitions reset the flag back to False for their
-# sub-graph so unikernel rlibs stay no_std in-process.
+# `bazel test` flips //bazel/rules:tests_need_std=True. The
+# `rust_test` wrapper in //bazel/rules:rust.bzl gates its targets'
+# `target_compatible_with` on this flag, so `bazel build //...`
+# skips rust_test targets (they can't compile under the global
+# `-Cpanic=abort`) while `bazel test` builds and runs them.
+# Per-variant transitions reset the flag to False for their
+# sub-graph.
 test --//bazel/rules:tests_need_std=True
 
 # ── Platform-only configs (runner is picked per-target, not per-build) ──────
