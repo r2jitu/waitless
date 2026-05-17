@@ -2037,6 +2037,41 @@ unsafe fn virtio_rx_repost(base: NonNull<u8>, _capacity: u32, ctx: *mut ()) {
     }
 }
 
+/// Harvest one completed RX descriptor from qp `qp`'s used ring,
+/// **under `rx_lock`**.
+///
+/// `Virtqueue::used()` mutates the shared descriptor free-list
+/// (`free_head` / `num_free` / `desc.next`) — the very state
+/// `add_buf` mutates. Item C lets a delivered chain drop on a core
+/// other than the polling one, so `virtio_rx_repost` → `rx_repost`
+/// → `add_buf` can run *concurrently* with this RX poll. `add_buf`
+/// is `rx_lock`-guarded; `used()` must be too, or the free-list
+/// corrupts and RX collapses (the Tier-2 multi-core regression).
+///
+/// The `desc(used_id)` read is inside the lock for a second reason:
+/// `used()` just returned `used_id`'s descriptor to the free-list,
+/// so a concurrent `add_buf` could re-grab it and overwrite `.addr`.
+/// Reading the buffer address before unlocking pins it.
+///
+/// Encapsulating "lock → used → desc-read" here means an unlocked
+/// `used()` is not a reachable pattern in the RX path. Returns
+/// `(used_len, buf_va)` — the descriptor id is not needed
+/// downstream (`virtio_rx_repost` re-arms by buffer address). The
+/// lock is released before the caller touches the frame: the
+/// per-frame callback can drop a chain → `rx_repost` → `rx_lock`,
+/// and the spinlock is not reentrant.
+///
+/// SAFETY: `qp < negotiated_queue_pairs` so `qps(qp)` / `rx_q(qp)`
+/// are in bounds; called only from `poll_qp`, which the dispatcher
+/// bounds.
+#[inline]
+unsafe fn rx_used_locked(qp: usize) -> Option<(u32, *mut u8)> {
+    let _g = unsafe { (*qps(qp)).rx_lock.lock() };
+    let (used_id, used_len) = unsafe { (*rx_q(qp)).used() }?;
+    let buf = unsafe { phys_to_virt((*rx_q(qp)).desc(used_id).addr) };
+    Some((used_len, buf))
+}
+
 /// Per-queue RX poll. Drains the used ring, delivering each frame
 /// as an owned one-part [`IOBufChain`] wrapping the descriptor
 /// buffer; `virtio_rx_repost` re-arms the descriptor when the
@@ -2059,10 +2094,12 @@ fn poll_qp(qp: usize, callback: fn(Chain<OwnedIOBuf>)) -> usize {
 
     let mut count: usize = 0;
     unsafe {
-        while let Some((used_id, used_len)) = (*rx_q(qp)).used() {
-            let desc = (*rx_q(qp)).desc(used_id);
-            let buf = phys_to_virt(desc.addr);
-
+        // `rx_used_locked` harvests each descriptor under `rx_lock`
+        // (and reads its buffer address there) so a cross-core
+        // `virtio_rx_repost` → `add_buf` cannot corrupt the shared
+        // free-list mid-`used()`. The frame is then processed with
+        // the lock released — the callback may itself repost.
+        while let Some((used_len, buf)) = rx_used_locked(qp) {
             if used_len > VIRTIO_NET_HDR_SIZE as u32 {
                 let frame_len = (used_len - VIRTIO_NET_HDR_SIZE as u32) as usize;
                 if qp < DIAG_QP_CAP {
