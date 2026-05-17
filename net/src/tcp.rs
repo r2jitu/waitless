@@ -25,7 +25,7 @@ use core::task::Waker;
 use from_bytes::FromBytes;
 use types::{IpAddr, MacAddr, tcp_checksum_any, tcp_pseudo_partial, htons, ntohs, htonl, ntohl};
 use ipv4::PROTO_TCP;
-use uni_iobuf::{Chain, OwnedIOBuf};
+use uni_iobuf::{Chain, IOBuf, OwnedIOBuf};
 
 bitflags::bitflags! {
     struct TcpFlags: u8 {
@@ -194,6 +194,26 @@ pub struct TcpConnection {
     ///     writing into freed user memory.
     ///   * `deliver_payload` itself, after it consumes the slot.
     recv_buf_slot: Option<RecvBufSlot>,
+    /// Set by `set_chunk_buf_slot` when a parked `RecvChunk` future
+    /// wants the next inbound payload as an owned `IOBuf` rather
+    /// than copied into a user buffer. While `true`, `tcp_receive`
+    /// *moves* the next in-sequence single-part segment's IOBuf
+    /// into `pending_chunk` (zero copy) instead of pushing its
+    /// bytes through `rx_ring`. Cleared the moment a chunk is
+    /// stashed, by `clear_chunk_buf_slot` (cancel-safety), or by a
+    /// slot reset. The whole chunk fast path is gated on this flag,
+    /// so a conn with no `recv_chunk` consumer behaves exactly as
+    /// before.
+    chunk_wanted: bool,
+    /// The IOBuf handed to a `recv_chunk` consumer, produced by
+    /// `tcp_receive`'s zero-copy stash and drained by
+    /// `do_recv_chunk`. Holds at most one buffer — the stated
+    /// "≤ 1 outstanding IOBuf per TcpStream" invariant, which the
+    /// `RecvChunkGuard<'_>` borrow also enforces at the type level.
+    /// Only ever stashed when `rx_ring` is empty, so a later ring
+    /// push can never make `pending_chunk` the *newer* bytes:
+    /// `do_recv_chunk` drains it strictly before the ring.
+    pending_chunk: Option<IOBuf>,
     listener_port: u16,
     accepted: bool,
     /// Incremented every time `free_connection` resets this slot, so
@@ -232,6 +252,8 @@ impl TcpConnection {
             rx_used: 0,
             direct_bytes: 0,
             recv_buf_slot: None,
+            chunk_wanted: false,
+            pending_chunk: None,
             listener_port: 0,
             accepted: false,
             generation: 0,
@@ -1491,7 +1513,7 @@ fn send_rst(local_ip: IpAddr, dst_ip: IpAddr, src_port: u16, dst_port: u16, seq:
 /// ring. RX item D keeps the ring a `Box<[u8; 16384]>` — this commit
 /// is plumbing, the copy count is unchanged, only the input is now
 /// IOBuf-typed.
-pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, segment: Chain<OwnedIOBuf>) {
+pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf>) {
     // The TCP header is contiguous in the first chain part: a frame's
     // L2/L3/L4 headers all land in the device's first RX buffer, and
     // the caller narrowed the chain to start exactly at the TCP header.
@@ -1634,6 +1656,8 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, segment: Chain<OwnedIOBuf>) {
             c.rx_used = 0;
             c.direct_bytes = 0;
             c.recv_buf_slot = None;
+            c.chunk_wanted = false;
+            c.pending_chunk = None;
         }
 
         // Publish this 4-tuple to the per-core hash index so the
@@ -1715,27 +1739,64 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, segment: Chain<OwnedIOBuf>) {
     // Process data
     if payload_len > 0 && (c.state == TcpState::Established || c.state == TcpState::FinWait1 || c.state == TcpState::FinWait2) {
         if seq == c.rcv_nxt {
-            // Walk the chain: skip the `data_offset`-byte TCP header,
-            // then deliver each part's payload bytes. `deliver_payload`
-            // direct-copies into a parked `TcpRecv`'s user buf when one
-            // is registered (consuming the slot on the first call),
-            // with the rest into the per-conn ring. One part today —
-            // one `deliver_payload` call over `data()[data_offset..]`,
-            // bit-identical to the pre-item-D `&segment[data_offset..]`
-            // slice path; item I's coalesced super-segments arrive
-            // multi-part. All synchronous on this core, so the chain's
-            // device buffers are still owned at return.
-            let mut pushed = 0usize;
-            let mut skip = data_offset;
-            for part in segment.iter() {
-                let bytes = part.data();
-                if skip >= bytes.len() {
-                    skip -= bytes.len();
-                    continue;
+            // A parked `recv_chunk` consumer wants the payload as an
+            // owned IOBuf. When the ring is empty and no direct-copy
+            // `recv` slot is registered, *move* a single-part
+            // segment's device buffer straight into `pending_chunk`
+            // — zero copy, no `rx_ring` round-trip. Multi-part chains
+            // (item I's coalesced super-segments) and the ring-non-
+            // empty case fall through to the copy path, which keeps
+            // stream order: `pending_chunk` is only ever stashed when
+            // the ring is empty, so it holds the *oldest* unread
+            // bytes and `do_recv_chunk` drains it strictly first.
+            //
+            // `chunk_wanted` is false unless a `recv_chunk` future is
+            // parked, so a conn with only `recv` consumers never
+            // takes this branch — the copy path below is byte-
+            // identical to the pre-item-F behaviour.
+            let pushed = if c.chunk_wanted
+                && c.pending_chunk.is_none()
+                && c.rx_used == 0
+                && c.recv_buf_slot.is_none()
+                && segment.part_count() == 1
+            {
+                let mut part = segment.pop_front().expect("part_count() == 1");
+                match part.narrow(data_offset, payload_len) {
+                    Ok(()) => {
+                        c.pending_chunk = Some(IOBuf::from(part));
+                        c.chunk_wanted = false;
+                        payload_len
+                    }
+                    // Unreachable for a single-part chain — the window
+                    // always covers `[data_offset, +payload_len)`. On
+                    // the impossible error drop the buffer and let the
+                    // peer retransmit rather than desync `rcv_nxt`.
+                    Err(_) => 0,
                 }
-                pushed += c.deliver_payload(&bytes[skip..]);
-                skip = 0;
-            }
+            } else {
+                // Walk the chain: skip the `data_offset`-byte TCP
+                // header, then deliver each part's payload bytes.
+                // `deliver_payload` direct-copies into a parked
+                // `TcpRecv`'s user buf when one is registered
+                // (consuming the slot on the first call), with the
+                // rest into the per-conn ring. One part today — one
+                // `deliver_payload` call over `data()[data_offset..]`;
+                // item I's coalesced super-segments arrive multi-part.
+                // All synchronous on this core, so the chain's device
+                // buffers are still owned at return.
+                let mut pushed = 0usize;
+                let mut skip = data_offset;
+                for part in segment.iter() {
+                    let bytes = part.data();
+                    if skip >= bytes.len() {
+                        skip -= bytes.len();
+                        continue;
+                    }
+                    pushed += c.deliver_payload(&bytes[skip..]);
+                    skip = 0;
+                }
+                pushed
+            };
             c.rcv_nxt = c.rcv_nxt.wrapping_add(pushed as u32);
             c.rcv_wnd = c.rx_free() as u16;
             // Wake any `TcpRecvReady` parked on this conn. Same core
@@ -1890,7 +1951,10 @@ pub fn is_readable_or_closed(handle: *mut (), generation: u16) -> bool {
     // wrote bytes straight into the parked `TcpRecv`'s user buf
     // and bypassed the ring entirely — `rx_used` is 0 in that
     // shape, but the future still has bytes to claim.
-    if c.rx_used() > 0 || c.direct_bytes > 0 {
+    // `pending_chunk` is the `recv_chunk` analogue: a zero-copy
+    // IOBuf stashed by `tcp_receive` that `do_recv_chunk` will
+    // hand out — also readable with `rx_used == 0`.
+    if c.rx_used() > 0 || c.direct_bytes > 0 || c.pending_chunk.is_some() {
         return true;
     }
     matches!(c.state, TcpState::Closed | TcpState::CloseWait
@@ -2067,6 +2131,86 @@ pub fn clear_recv_buf_slot(handle: *mut (), generation: u16) {
         return;
     }
     c.recv_buf_slot = None;
+}
+
+/// Register intent to receive the next inbound payload as an owned
+/// `IOBuf` (zero copy) rather than copied into a user buffer.
+/// Called from `RecvChunk::poll` before parking; `tcp_receive`
+/// then moves the next in-sequence single-part segment straight
+/// into `pending_chunk` instead of pushing it through `rx_ring`.
+///
+/// Unlike `set_recv_buf_slot` this carries no pointer — the
+/// consumer wants the transport's buffer, not a destination to
+/// copy into — so it is just a one-bit "deliver-as-IOBuf" request.
+/// Stale `generation` is a no-op; the future resolves to closed
+/// via `is_readable_or_closed` + `do_recv_chunk`.
+pub fn set_chunk_buf_slot(handle: *mut (), generation: u16) {
+    let (core, slot) = match decode_handle(handle) {
+        Some(v) => v,
+        None => return,
+    };
+    let c = unsafe { &mut *conn_ptr(core, slot) };
+    if c.generation != generation {
+        return;
+    }
+    c.chunk_wanted = true;
+}
+
+/// Drop the chunk-delivery request. Called from `RecvChunk::Drop`
+/// (cancel-safety: the future was dropped before resolving) and
+/// from `RecvChunk::poll` after resolving Ready. Does NOT discard
+/// an already-stashed `pending_chunk` — that IOBuf is still owed to
+/// whoever the slot belongs to and is cleared on slot reset. Stale
+/// `generation` is a no-op.
+pub fn clear_chunk_buf_slot(handle: *mut (), generation: u16) {
+    let (core, slot) = match decode_handle(handle) {
+        Some(v) => v,
+        None => return,
+    };
+    let c = unsafe { &mut *conn_ptr(core, slot) };
+    if c.generation != generation {
+        return;
+    }
+    c.chunk_wanted = false;
+}
+
+/// Async `RecvChunk` consume hook — the `recv_chunk` analogue of
+/// `async_recv`. Surfaces the next chunk of inbound data as an
+/// owned `IOBuf`:
+///
+///   * `pending_chunk` — a device buffer `tcp_receive` stashed
+///     zero-copy. Returned as-is (an `External` IOBuf): the guard
+///     reads it in place and `into_owned()` keeps it zero-copy.
+///   * otherwise, if `rx_ring` holds bytes, they are drained into
+///     a fresh `Heap` IOBuf. `pending_chunk` is only ever stashed
+///     while the ring is empty, so draining it first then the ring
+///     preserves stream order.
+///   * `None` — no data: EOF / peer close / stale `generation`,
+///     observed by the caller as the end of the body.
+pub fn do_recv_chunk(handle: *mut (), generation: u16) -> Option<IOBuf> {
+    let (core, slot) = decode_handle(handle)?;
+    let c = unsafe { &mut *conn_ptr(core, slot) };
+    if c.generation != generation {
+        return None;
+    }
+    if let Some(iobuf) = c.pending_chunk.take() {
+        return Some(iobuf);
+    }
+    let n = c.rx_used();
+    if n == 0 {
+        return None;
+    }
+    // Drain the ring into an owned heap buffer. `rx_pop` also runs
+    // the SWS window-update check, so a chunk read reopens the
+    // receive window exactly as a `recv` read does.
+    let mut v = alloc::vec::Vec::new();
+    if v.try_reserve_exact(n).is_err() {
+        return None;
+    }
+    v.resize(n, 0);
+    let got = c.rx_pop(&mut v);
+    v.truncate(got);
+    Some(IOBuf::from(v))
 }
 
 /// Async `TcpSendChain` try-send hook. Walks `chain` via cursor

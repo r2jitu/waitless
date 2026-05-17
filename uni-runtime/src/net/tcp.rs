@@ -327,6 +327,31 @@ pub struct TcpBackend {
     )>,
     pub clear_recv_buf_slot: Option<fn(handle: *mut (), generation: u16)>,
 
+    /// Optional zero-copy chunk-recv path — the backing for
+    /// [`TcpStream::recv_chunk`]. When set, `RecvChunk::poll`
+    /// flags the conn with `set_chunk_buf_slot` before parking; the
+    /// next inbound payload is surfaced as an owned `IOBuf` (the
+    /// transport's own buffer, not a copy) and claimed via
+    /// `do_recv_chunk`.
+    ///
+    /// `do_recv_chunk` returns `None` on EOF / peer close / stale
+    /// `generation` — the caller observes the end of the stream.
+    /// A backend that leaves these `None` (native POSIX, which
+    /// copies at the `recv()` syscall anyway) makes `recv_chunk`
+    /// resolve to `None` on its first poll.
+    ///
+    /// Cancel-safety mirrors `set_recv_buf_slot`: `RecvChunk::Drop`
+    /// calls `clear_chunk_buf_slot` so a future dropped before the
+    /// waker fires leaves no stale "deliver-as-IOBuf" request. The
+    /// recv-side waker hooks (`register_recv_waker` /
+    /// `clear_recv_waker`) are reused — readiness is a conn-level
+    /// signal, and a conn never has both a `recv` and a
+    /// `recv_chunk` future parked at once.
+    pub do_recv_chunk:
+        Option<fn(handle: *mut (), generation: u16) -> Option<uni_iobuf::IOBuf>>,
+    pub set_chunk_buf_slot: Option<fn(handle: *mut (), generation: u16)>,
+    pub clear_chunk_buf_slot: Option<fn(handle: *mut (), generation: u16)>,
+
     /// Send FIN on the conn and release the backend's per-stream
     /// state. Idempotent: a stale `gen` (slot already reused) or
     /// already-closed conn is a no-op. Called from
