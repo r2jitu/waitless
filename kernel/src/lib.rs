@@ -16,6 +16,7 @@ pub mod cpu;
 pub mod deque;
 pub mod once;
 pub mod spsc;
+pub mod rx_inbox;
 pub mod timer;
 pub mod percpu;
 pub mod eventloop;

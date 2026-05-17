@@ -19,6 +19,7 @@ rust_library(
         "src/once.rs",
         "src/percpu.rs",
         "src/rng.rs",
+        "src/rx_inbox.rs",
         "src/serial.rs",
         "src/spsc.rs",
         "src/sync.rs",
@@ -53,6 +54,7 @@ rust_library(
     # library.
     target_compatible_with = ["@platforms//os:none"],
     deps = [
+        "//uni-iobuf",
         "//uni-runtime",
         "//uni-worker",
         "//uni-platform",
@@ -88,6 +90,17 @@ rust_test(
     size = "small",
     srcs = ["src/sync.rs"],
     crate_root = "src/sync.rs",
+)
+
+# `rx_inbox.rs` is generic and `core`-only — it compiles standalone
+# with no deps, so the cross-core inbox + tagged free-list get a real
+# multi-threaded host stress test (the kernel library itself is
+# `os:none` and not host-buildable).
+rust_test(
+    name = "rx_inbox_test",
+    size = "small",
+    srcs = ["src/rx_inbox.rs"],
+    crate_root = "src/rx_inbox.rs",
 )
 
 # timer_test moved to //uni-worker:timer_test — the wheel now lives
