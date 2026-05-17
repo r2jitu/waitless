@@ -254,13 +254,19 @@ AEAD.
 - **Tests**: unit test for the rejection path.
 
 ### F. `TcpStream::recv_chunk` API (guard-pattern)
-- **Status**: [ ]
+- **Status**: [x] landed 2026-05-17 — commits `ae9e850` (net-tcp
+  backend hooks), `570e40a` (uni-runtime API). See the progress-log
+  entry below.
 - **Where**:
-  * [`uni-runtime/src/net/tcp.rs:122+`](uni-runtime/src/net/tcp.rs#L122)
-    — new `TcpStream::recv_chunk(&mut self) -> impl Future<Output = Option<RecvChunkGuard<'_>>>`.
-  * [`net/src/tcp.rs`](net/src/tcp.rs) — new backend hooks
-    `set_chunk_buf_slot` / `register_chunk_waker` / `do_recv_chunk`;
-    new per-`TcpConnection` field `pending_chunk: Option<IOBuf>`.
+  * [`uni-runtime/src/net/tcp.rs:161`](uni-runtime/src/net/tcp.rs#L161)
+    — new `TcpStream::recv_chunk(&mut self) -> RecvChunk<'_>`
+    (`Future<Output = Option<RecvChunkGuard<'_>>>`); `RecvChunkGuard`
+    / `RecvChunk` types and the three `TcpBackend` vtable fields.
+  * [`net/src/tcp.rs:2147`](net/src/tcp.rs#L2147) — new backend hooks
+    `set_chunk_buf_slot` / `clear_chunk_buf_slot` / `do_recv_chunk`
+    (`register_chunk_waker` folded into the existing recv-side waker
+    hooks — see the progress log); new per-`TcpConnection` fields
+    `chunk_wanted: bool` + `pending_chunk: Option<IOBuf>`.
 - **What**: new method alongside the existing fill-buf `recv`.
   Returns a `RecvChunkGuard<'a>` (borrows `&'a mut self`) wrapping
   the next IOBuf. Guard exposes `data() -> &[u8]` (in-place read)
@@ -1198,3 +1204,115 @@ now-running `host_port_tests`); `bazel test
 //apps/webserver:test_hvf` (TCP + TLS round-trips, 30-conn
 burst — confirms the `serve_conn` restructure left the
 non-rejected path unchanged).
+
+### 2026-05-17 — Phase 2/3, item F: `TcpStream::recv_chunk` guard-pattern API ([x] **landed** — commits `ae9e850`, `570e40a`)
+
+The first item that threads an inbound `IOBuf` to the application
+zero-copy. `recv_chunk` is the `recv` sibling that, instead of
+copying bytes into a caller buffer, surfaces the transport's *own*
+buffer behind a `RecvChunkGuard`. Items G (`TlsStream::recv_chunk`)
+and H (`BodyReader::chunk` returns a guard) build directly on the
+guard shape this commit fixes.
+
+**The guard is the load-bearing design choice.** `recv_chunk`
+returns `RecvChunkGuard<'a>`, not a bare `Option<IOBuf>`. `IOBuf`
+carries no lifetime parameter, so a bare-`IOBuf` return would be
+borrow-*unsafe* on the TLS path item G adds: a `Borrowed` IOBuf
+viewing `pt_buf` could be left dangling when the next `pump_rx`
+overwrites `pt_buf`. The guard binds the IOBuf's lifetime to the
+`&'a mut self` of `recv_chunk`: holding it keeps the stream
+mutably borrowed, so the compiler *itself* enforces the stated
+"≤ 1 outstanding IOBuf per `TcpStream`" invariant — two live
+guards do not borrow-check. `recv_chunk` therefore takes
+`&mut self` where `recv` takes `&self`; that asymmetry is
+deliberate, not an oversight. `RecvChunkGuard<'a>` carries the
+borrow as `PhantomData<&'a mut ()>` — the inner type is opaque so
+one guard type serves both `TcpStream` (here) and `TlsStream`
+(item G). `data()` reads in place; `into_owned()` delegates to
+`IOBuf::into_owned` (item A) — zero copy for an owned source, one
+memcpy for a `Borrowed` one.
+
+**Item F is perf-neutral by construction — the new path is dead
+until item H.** The zero-copy delivery is gated on a new
+per-`TcpConnection` flag `chunk_wanted`, which only
+`set_chunk_buf_slot` sets, which only `RecvChunk::poll` calls —
+and nothing calls `recv_chunk` until item H rewires `BodyReader`.
+With `chunk_wanted` false the `tcp_receive` data path is
+*byte-identical* to the pre-item-F code: the new branch is one
+short-circuiting `&&` test against a false bool. So `test_hvf`
+still fully exercises the only live path, and the bench below is
+flat not because the new code is fast but because it is unreached.
+
+**Two delivery sources, one ordering rule.** When `chunk_wanted`
+is set and the next in-sequence segment is single-part with the
+`rx_ring` empty, `tcp_receive` *moves* the segment's device
+buffer straight into the new `pending_chunk: Option<IOBuf>` field
+— `narrow`ed to the payload, widened `OwnedIOBuf → IOBuf` — with
+no `rx_ring` round-trip. `do_recv_chunk` then hands that
+`External` IOBuf out as-is (zero copy; `into_owned` stays zero
+copy). If instead the ring already holds bytes, `do_recv_chunk`
+drains it into a fresh `Heap` IOBuf. The stash only ever fires
+while the ring is empty, so `pending_chunk` always holds the
+*older* bytes — `do_recv_chunk` drains it strictly before the
+ring and stream order is preserved without a sequence number
+travelling alongside. Multi-part chains (item I's coalesced
+super-segments) fall through to the existing copy path.
+
+**`register_chunk_waker` folded into the recv-side waker hooks.**
+The item sketch listed a `register_chunk_waker` hook; it was not
+added. Readiness is a *connection*-level signal — `tcp_receive`
+wakes one per-conn `recv_waker` when data lands — and a conn
+never has both a `recv` and a `recv_chunk` future parked at once
+(a `BodyReader` picks one API). `RecvChunk::poll` reuses the
+existing `register_recv_waker` / `clear_recv_waker` vtable hooks;
+a second waker field would have to be woken from `tcp_receive`
+and `free_connection` too, for no behavioural gain. The genuinely
+new hooks are `set_chunk_buf_slot` / `clear_chunk_buf_slot` (the
+one-bit "deliver-as-IOBuf" request, cancel-safe via
+`RecvChunk::Drop`) and `do_recv_chunk`.
+
+**Test infrastructure.** `uni-runtime` had no `rust_test` target;
+it flips to the workspace-standard `#![cfg_attr(not(test),
+no_std)]` so `rust_test(crate = ":uni-runtime")` runs host-native.
+The `compile_fail` test — "two guards must not compile" — cannot
+be a `#[cfg(test)]` unit test (a crate with non-compiling code
+does not compile at all); it is a `compile_fail` doc-test, run by
+a new `rust_doc_test` wrapper in
+[`bazel/rules/rust.bzl`](../bazel/rules/rust.bzl), gated on
+`tests_need_std` exactly like `rust_test`. It is paired with a
+sequential-use doc-test that *does* compile, so the negative is
+pinned to the double-borrow and not to an unrelated error.
+
+Verified: `bazel build //apps/webserver:webserver_qemu_x86_64`;
+`bazel build //apps/webserver:webserver.elf
+--platforms=//bazel/platforms:aarch64_unikernel`; `bazel test
+//apps/webserver:test_hvf` (TCP + TLS round-trips, 30-conn burst);
+`bazel test //uni-runtime:uni_runtime_test` (2 tests —
+`RecvChunkGuard::into_owned` round-trips an owned `Heap` source
+and a `Borrowed` source, bytes preserved either way); `bazel test
+//uni-runtime:uni_runtime_doc_test` (the `compile_fail` guard test
++ its sequential-use companion). Each of the two implementation
+commits was gate-checked on its own tree.
+
+Local 3-run-median bench (HVF, 1c/3c; the `--env hvf --cores 1,3`
+protocol), confirming perf-neutrality:
+
+| Workload | 1c | 3c |
+|---|---|---|
+| `get_tcp` (control) | 196.1 k | 198.4 k |
+| `get_tls_fresh` (control) | 2985 | 7881 |
+| `upload_32k_tcp` | 22.0 k | 41.4 k |
+| `upload_32k_tls` | 4843 | 12.4 k |
+
+The per-run spread was ~0.1 % on `get_tcp` — `get_tcp` 1c sits at
+196 k against the doc's 197 k Phase-1 baseline (−0.5 %, well
+inside the ±3 % control tolerance), and the uploads match item B's
+HVF figures (~22 k / ~41 k — the 51 k upload baseline in the
+threshold table is a GCE/QEMU number, not HVF). No control
+regressed; the win is deferred to item H as planned. No GCE
+checkpoint for F (the plan reserves those for B, D, H, I, J).
+
+Next: item G (`TlsStream::recv_chunk` — a `RecvChunkGuard` over a
+`Borrowed` view into `pt_buf`), the smaller TLS-side counterpart,
+then item H wires `BodyReader::chunk` onto both and the zero-copy
+body win lands.
