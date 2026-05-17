@@ -6,17 +6,9 @@ package(default_visibility = ["//visibility:public"])
 # Typed atomic function-pointer cell. Kept as a zero-dep leaf crate
 # so rust_test consumers don't transitively inherit //kernel's
 # RustCrypto / talc / panic=abort chain.
-#
-# The `std` crate_feature (toggled by `//bazel/rules:tests_need_std`
-# under the `test` verb) flips the crate to std + panic=unwind so it
-# can link into rust_test binaries via `crate = ":foo"`.
 rust_library(
     name = "atomic_fn",
     srcs = ["src/lib.rs"],
-    crate_features = select({
-        "//bazel/rules:tests_need_std_on": ["std"],
-        "//conditions:default": [],
-    }),
     crate_name = "atomic_fn",
     crate_root = "src/lib.rs",
 )

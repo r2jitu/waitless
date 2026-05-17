@@ -9,18 +9,7 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "uni-http",
     srcs = ["src/lib.rs"],
-    # Under the `test` verb the crate flips to `std` for the
-    # libtest harness — see the `cfg_attr` in `src/lib.rs`.
-    # Mirrors `//uni-http3`.
-    crate_features = select({
-        "//bazel/rules:tests_need_std_on": ["std"],
-        "//conditions:default": [],
-    }),
     crate_name = "uni_http",
-    rustc_flags = [
-        "--check-cfg=cfg(test)",
-        "--check-cfg=cfg(feature,values(\"std\"))",
-    ],
     deps = [
         "//uni",
         "//uni-iobuf",

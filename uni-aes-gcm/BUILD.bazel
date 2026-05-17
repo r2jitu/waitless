@@ -23,17 +23,8 @@ rust_library(
         "src/aes_gcm.rs",
         "src/ghash_batch.rs",
     ],
-    crate_features = select({
-        "//bazel/rules:tests_need_std_on": ["std"],
-        "//conditions:default": [],
-    }),
     crate_name = "uni_aes_gcm",
-    rustc_flags = [
-        "--check-cfg=cfg(test)",
-        # `feature = "std"` is toggled by `tests_need_std_on` for
-        # the `rust_test` build (see crate_features above).
-        "--check-cfg=cfg(feature,values(\"std\"))",
-    ] + select({
+    rustc_flags = select({
         # x86_64-unknown-none defaults to `+soft-float,-sse`, so
         # `__m128i` intrinsics fail to legalize. Enable the full
         # AES-NI/PCLMUL/AVX2 feature set (also turns the rustc

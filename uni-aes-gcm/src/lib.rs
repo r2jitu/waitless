@@ -50,7 +50,7 @@
 //   * Sweep vs upstream audited `ghash` crate (multi-chunk +
 //     several H values).
 
-#![cfg_attr(all(not(test), not(feature = "std")), no_std)]
+#![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
 

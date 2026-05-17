@@ -47,11 +47,9 @@
 //   * Slot-encoding constants (`SERVER_CID_LEN`) for tests +
 //     debug tooling.
 
-// Stays no_std in production. Under `bazel test`, the
-// `tests_need_std` flag flips this crate's `std` feature on so
-// libtest's panic=unwind harness can link past the RustCrypto
-// deps' no_std requirement.
-#![cfg_attr(all(not(test), not(feature = "std")), no_std)]
+// Stays no_std in production; flips to std only under `--test`
+// so the libtest harness has the std it needs.
+#![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
 

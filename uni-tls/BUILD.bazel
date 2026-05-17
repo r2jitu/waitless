@@ -41,17 +41,15 @@ rust_library(
         "//apps/webserver/dev_certs:dev_cert.der",
         "//apps/webserver/dev_certs:dev_key.der",
     ],
-    crate_features = select({
-        "//bazel/rules:tests_need_std_on": ["std"],
-        "//conditions:default": [],
-    }),
     crate_name = "uni_tls",
     rustc_flags = [
+        # `tls_debug` is the opt-in diagnostic-trace cfg. Declaring
+        # any `--check-cfg` turns on cfg-checking for the whole
+        # crate, which then also requires `test` to be declared —
+        # the `#![cfg_attr(not(test), no_std)]` crate attribute and
+        # the `#[cfg(test)]` modules both reference it.
         "--check-cfg=cfg(tls_debug)",
         "--check-cfg=cfg(test)",
-        # `feature = "std"` is toggled by `tests_need_std_on` for
-        # the `rust_test` build (see crate_features above).
-        "--check-cfg=cfg(feature,values(\"std\"))",
     ] + select({
         # The aes-gcm AEAD path inlines `__m128i` intrinsics from
         # the `aes` + `polyval` crates into our own `aead.rs`
@@ -98,8 +96,7 @@ rust_library(
 
 # Host-native unit tests for in-crate `mod tests` blocks (handshake
 # parsing, key schedule, AEAD round-trip, record-layer framing,
-# ticket envelope, finished-key + ct_eq, etc.). Same `std` feature
-# trick as the rest of the workspace.
+# ticket envelope, finished-key + ct_eq, etc.).
 rust_test(
     name = "uni_tls_test",
     size = "small",

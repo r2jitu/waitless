@@ -20,15 +20,7 @@ rust_library(
         "src/server.rs",
         "src/static_table.rs",
     ],
-    crate_features = select({
-        "//bazel/rules:tests_need_std_on": ["std"],
-        "//conditions:default": [],
-    }),
     crate_name = "uni_http3",
-    rustc_flags = [
-        "--check-cfg=cfg(test)",
-        "--check-cfg=cfg(feature,values(\"std\"))",
-    ],
     deps = [
         "//uni",
         "//uni-http",

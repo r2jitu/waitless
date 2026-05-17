@@ -6,7 +6,7 @@
 // defines its own `HttpStream` impl (TLS over TCP) and calls
 // `serve_conn` to drive the same request/response machinery.
 
-#![cfg_attr(all(not(test), not(feature = "std")), no_std)]
+#![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
 extern crate uni;
