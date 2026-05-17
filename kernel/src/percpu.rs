@@ -14,8 +14,47 @@
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use uni_iobuf::{Chain, OwnedIOBuf};
 use crate::deque::{Deque, Task};
+use crate::rx_inbox::{RxInbox, RxNodePool};
 use crate::spsc;
+
+// ── Tier 2 cross-core RX inbox ──────────────────────────────────────
+//
+// `rx_inbox` holds the generic lock-free machinery; the kernel pins
+// the payload type and sizes the node pool here.
+
+/// The Tier 2 cross-core RX inbox payload: one received frame as an
+/// owned chain of device RX buffers. Moving it core-to-core copies no
+/// frame bytes; dropping it reposts the backing buffers.
+pub type RxChain = Chain<OwnedIOBuf>;
+
+/// Node count of the shared Tier-2 RX node pool.
+///
+/// The intrusive inbox parks at most one node per device RX buffer
+/// not yet reposted, and Tier 2 polls a single RX queue — so the
+/// inbox provably never holds more nodes than that queue has buffers
+/// (see `rx_inbox`'s overflow proof). This must therefore be ≥ the
+/// single-queue RX-buffer count of any driver that runs Tier 2.
+/// virtio-net — the only one in this tree — posts `RX_BUFFERS = 256`;
+/// gve always runs Tier 1 (per-core queues). 512 is 2× that headroom
+/// and also clears gve's 512-entry DQO ring should gve ever be forced
+/// single-queue. Bump this if a Tier-2-capable driver with a larger
+/// single-queue RX ring is added.
+pub const RX_NODE_POOL_CAP: usize = 512;
+
+/// The one shared Tier-2 RX node pool. `static` — no allocator, a
+/// stable address for the lifetime of the kernel. Valid only after
+/// [`init`] has run its `RX_NODE_POOL.init()`.
+static RX_NODE_POOL: RxNodePool<RxChain, RX_NODE_POOL_CAP> = RxNodePool::new();
+
+/// The global Tier-2 RX node pool — the net layer's distributor
+/// (`distribute_frame`) and per-core drain callback both route
+/// through it.
+#[inline]
+pub fn rx_node_pool() -> &'static RxNodePool<RxChain, RX_NODE_POOL_CAP> {
+    &RX_NODE_POOL
+}
 
 // `CurrentWorker` + `PerWorker<T>` (runtime-sized) live in `//uni-worker`
 // so native can share them. Kept under the `uni_kernel::percpu` path via
@@ -41,101 +80,6 @@ impl spsc::Zero for Task {
 
 fn noop(_: usize) {}
 
-/// Per-core RX inbox slot count for Tier 2 cross-core delivery.
-const RX_POOL_SIZE: usize = 16;
-/// Capacity of each RX inbox slot — one Ethernet frame.
-const RX_BUF_SIZE: usize = 1514;
-
-/// Per-slot owned packet record. The distributor copies frame
-/// bytes here so the owning core can drain them on its own
-/// schedule; the source slice (a borrow of driver-pool storage)
-/// is released the moment `push` returns and the driver may
-/// immediately re-arm.
-#[derive(Clone, Copy)]
-pub struct RxPacket {
-    pub len: u16,
-    pub data: [u8; RX_BUF_SIZE],
-}
-
-/// Cross-core RX inbox. Tier 2 distributor copies frame bytes
-/// into the next slot via `push`; the owning core drains via
-/// `pop_with`, which invokes the closure with a slice over the
-/// slot bytes before advancing the consumer cursor.
-///
-/// SPSC discipline: single producer (the distributor running on
-/// the polling core) writes the slot at `next_slot` and publishes
-/// the index via the `ready` ring; single consumer (the target
-/// core) acquire-loads the index and reads the slot. The
-/// `ready` ring's release/acquire pair carries the slot-write
-/// visibility.
-///
-/// Memory: 16 slots × 1514 B = ~24 KB per core. Lives in
-/// `PerCore`, which is heap-allocated per core during boot, so
-/// idle cores still pay this — but it's bounded and modest.
-pub struct RxInbox {
-    pool: [UnsafeCell<RxPacket>; RX_POOL_SIZE],
-    ready: spsc::Ring<u32>,
-    next_slot: AtomicUsize,
-}
-
-// SAFETY: producer/consumer discipline above. Producer's write to
-// the slot bytes is published via `ready.push`'s release-tail
-// store; consumer's `ready.pop` acquire-load makes the write
-// visible. The producer can only re-use a slot index after the
-// consumer has popped it (ring capacity == pool size).
-unsafe impl Sync for RxInbox {}
-unsafe impl Send for RxInbox {}
-
-impl RxInbox {
-    pub const fn new() -> Self {
-        RxInbox {
-            pool: [const { UnsafeCell::new(RxPacket {
-                len: 0,
-                data: [0; RX_BUF_SIZE],
-            }) }; RX_POOL_SIZE],
-            ready: spsc::Ring::new(),
-            next_slot: AtomicUsize::new(0),
-        }
-    }
-
-    /// Copy `frame` into the next slot. Returns `false` if the
-    /// frame is oversize or the ring is full (caller drops the
-    /// frame — Tier 2 RX drops are equivalent to NIC-level loss,
-    /// recovered by TCP retransmit or UDP application retry).
-    pub fn push(&self, frame: &[u8]) -> bool {
-        if frame.len() > RX_BUF_SIZE {
-            return false;
-        }
-        let slot = self.next_slot.load(Ordering::Relaxed);
-        // SAFETY: producer-only write to its current slot. Consumer
-        // can only observe via the `ready.push` release below; the
-        // ring-capacity invariant guarantees the slot is drained.
-        unsafe {
-            let pkt = &mut *self.pool[slot].get();
-            pkt.data[..frame.len()].copy_from_slice(frame);
-            pkt.len = frame.len() as u16;
-        }
-        if !self.ready.push(slot as u32) {
-            return false;
-        }
-        self.next_slot.store((slot + 1) % RX_POOL_SIZE, Ordering::Relaxed);
-        true
-    }
-
-    /// Pop the next ready slot and invoke `f` with a borrow of
-    /// its bytes. Returns `true` if a slot was drained, `false`
-    /// if the inbox was empty.
-    pub fn pop_with<F: FnOnce(&[u8])>(&self, f: F) -> bool {
-        let Some(idx) = self.ready.pop() else { return false; };
-        // SAFETY: ready.pop's acquire matches producer's release.
-        // Single consumer ⇒ no concurrent reader.
-        let pkt = unsafe { &*self.pool[idx as usize].get() };
-        let n = pkt.len as usize;
-        f(&pkt.data[..n.min(RX_BUF_SIZE)]);
-        true
-    }
-}
-
 /// Per-core state. Each core has exactly one of these.
 /// The TLS register (GS_BASE on x86_64, TPIDR_EL1 on aarch64) points
 /// to this struct. Fields at known offsets can be read directly via
@@ -155,9 +99,10 @@ pub struct PerCore {
 
     _pad: u32, // align next field to 8 bytes
 
-    /// RX inbox for Tier 2 cross-core delivery — distributor on
-    /// the polling core pushes IOBufs here; owning core pops and
-    /// processes via `net_drain_cb` → `net_receive_iobuf`.
+    /// RX inbox for Tier 2 cross-core delivery — the distributor
+    /// parks a received `Chain<OwnedIOBuf>` here (in a node from the
+    /// shared `rx_inbox` node pool, no frame copy); this core drains
+    /// it via `net_drain_cb`. See [`crate::rx_inbox`].
     pub rx_inbox: RxInbox,
 
     /// Inbox for Tier 2 RX delivery (SPSC: core 0 writes, this core reads).
@@ -267,6 +212,10 @@ static AP_POLL_FN: crate::sync::AtomicFn<fn(u32) -> bool> = crate::sync::AtomicF
 pub unsafe fn init(count: u32) {
     uni_worker::set_num_workers(count);
     CORES.init(count, |i| PerCore::new(i));
+    // Link the shared Tier-2 cross-core RX node pool's free-list.
+    // BSP-only, single-threaded — no AP has started, so this races
+    // nothing.
+    RX_NODE_POOL.init();
     uni_runtime::init(count);
 }
 

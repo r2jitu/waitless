@@ -315,12 +315,15 @@ fn poll_tier2(num_cores: u32) -> bool {
 
 /// RX callback for the NIC poll path (`NicOps::poll_rx` /
 /// `poll_qp`) — receives one frame as an owned `Chain<OwnedIOBuf>`
-/// and dispatches it through the full stack. Item B made the
-/// driver↔net boundary deliver owned chains instead of borrowed
-/// `&[u8]` slices; until item C threads the chain into the
-/// per-conn layers, it is consumed synchronously here and dropped
-/// at return — and dropping it reposts the backing device buffer
-/// (or recycles the GQI slab) via each part's drop callback.
+/// and dispatches it through the full stack. Also the per-chain
+/// consumer the Tier 2 owning core runs out of its `rx_inbox`
+/// (`net_drain_cb`), and the inline path in `distribute_frame`.
+///
+/// The chain is consumed synchronously here and dropped at return —
+/// dropping it reposts the backing device buffer (or recycles the
+/// GQI slab) via each part's drop callback. Threading the chain
+/// deeper into the per-conn layers is item D; item C only carried
+/// it zero-copy across the Tier 2 core boundary.
 ///
 /// A single-buffer frame is a one-part chain (the common case);
 /// hardware-coalesced super-segments (item I) arrive as multi-part
@@ -334,16 +337,13 @@ pub fn net_receive(chain: Chain<OwnedIOBuf>) {
 }
 
 /// Process a single received frame through the full stack inline
-/// (no cross-core distribution). Called from [`net_receive`] (per
-/// chain part), the Tier 2 distributor's inline path, and
-/// `net_drain_cb` (after the Tier 2 distributor copied frame bytes
-/// into this core's inbox).
+/// (no cross-core distribution). Called from [`net_receive`], once
+/// per chain part.
 ///
-/// `frame` is a borrow over an `IOBufChain` part's storage (Tier 1)
-/// or the owning core's inbox slot (Tier 2). It is only valid for
-/// this call: the L4 receive entries finish (copy payload into
-/// per-conn ring buffers / direct-copy slots, dispatch ARP/ICMP
-/// replies) synchronously before returning.
+/// `frame` is a borrow over a `Chain<OwnedIOBuf>` part's storage. It
+/// is only valid for this call: the L4 receive entries finish (copy
+/// payload into per-conn ring buffers / direct-copy slots, dispatch
+/// ARP/ICMP replies) synchronously before returning.
 fn net_receive_frame(frame: &[u8]) {
     let Some((src_mac, ethertype, payload)) = ethernet::ethernet_parse_full(frame) else {
         return;
@@ -418,8 +418,8 @@ enum ClassifyResult {
     /// Hand off to `net_receive_frame` on this core (ARP, IPv6,
     /// or IPv4 destined for `my_core`).
     Inline,
-    /// Copy frame bytes to target core's `rx_inbox`; target wakes
-    /// up and consumes via `net_drain_cb`.
+    /// Move the whole chain into the target core's `rx_inbox`; the
+    /// target wakes and consumes it via `net_drain_cb`.
     Distribute(u32),
     /// Frame is unparseable / wrong ethertype.
     Drop,
@@ -427,32 +427,42 @@ enum ClassifyResult {
 
 /// Tier 2 distributor — the `NicOps::poll_rx` callback in
 /// single-queue mode. Receives one frame as an owned
-/// `Chain<OwnedIOBuf>` and, per part, picks a target core: runs the
-/// full receive path inline for ARP / IPv6 / my-core IPv4, or
-/// copies the bytes into the target core's `rx_inbox` for other
-/// IPv4. The cross-core copy is unavoidable until item C threads
-/// the IOBuf itself through the inbox — for now the chain (and its
-/// device-buffer reposts) is dropped at return, after the bytes
-/// have been copied or processed.
+/// `Chain<OwnedIOBuf>` and picks a target core: runs the full
+/// receive path inline for ARP / IPv6 / my-core IPv4, or — for IPv4
+/// owned by another core — *moves the whole chain* into that core's
+/// `rx_inbox` (item C). The move copies no frame bytes; the chain
+/// carries its device RX buffers cross-core and reposts them when
+/// the owning core drops it after processing.
+///
+/// A Tier 2 frame is a single-buffer chain, so classification keys
+/// on the first part; a hypothetical multi-part chain (item I) is
+/// one flow, so part 0's verdict applies to the whole chain.
 fn distribute_frame(chain: Chain<OwnedIOBuf>) {
     let num_cores = percpu::num_cores();
     let my_core = uni_kernel::cpu_id();
-    for part in chain.iter() {
-        let frame = part.data();
-        match classify_for_distribution(frame, num_cores, my_core) {
-            ClassifyResult::Inline => net_receive_frame(frame),
-            ClassifyResult::Distribute(target) => {
-                // SAFETY: `percpu::init()` runs before any AP starts;
-                // target is bounded by `num_cores`.
-                let core = unsafe { percpu::get(target) };
-                if core.rx_inbox.push(frame) {
+    let Some(first) = chain.iter().next() else { return };
+    match classify_for_distribution(first.data(), num_cores, my_core) {
+        // Processes every part, then drops the chain → device
+        // buffers repost.
+        ClassifyResult::Inline => net_receive(chain),
+        ClassifyResult::Distribute(target) => {
+            // SAFETY: `percpu::init()` runs before any AP starts;
+            // target is bounded by `num_cores`.
+            let core = unsafe { percpu::get(target) };
+            match percpu::rx_node_pool().distribute(&core.rx_inbox, chain) {
+                Ok(()) => {
                     WAKEUP.at(target).store(true, core::sync::atomic::Ordering::Relaxed);
                 }
-                // push returning false (oversize / ring full) drops
-                // the frame; TCP retransmit / UDP retry recover.
+                Err(_chain) => {
+                    // Unreachable: the node pool is sized ≥ the RX
+                    // queue's buffer count, so a frame in flight
+                    // always has a free node (see `rx_inbox`'s
+                    // overflow proof). `_chain` drops here, which
+                    // auto-reposts its device buffers.
+                }
             }
-            ClassifyResult::Drop => {}
         }
+        ClassifyResult::Drop => {}
     }
 }
 
@@ -790,15 +800,11 @@ fn net_drain_cb(core_id: u32) -> bool {
     // `cpu_id()` at this exact moment without needing a second TLS read.
     let cc = unsafe { percpu::CurrentWorker::from_id_unchecked(core_id) };
     let core = percpu::percore(&cc);
-    let mut did_work = false;
-    // Tier 2 cross-core delivery: distributor copied frame bytes
-    // into our inbox; pop each slot and dispatch inline. The inbox
-    // still carries raw bytes (item C makes it hold IOBufChains),
-    // so dispatch through the per-frame `net_receive_frame`.
-    while core.rx_inbox.pop_with(|frame| net_receive_frame(frame)) {
-        did_work = true;
-    }
-    did_work
+    // Tier 2 cross-core delivery: the distributor parked received
+    // chains in our inbox. Drain them in arrival (FIFO) order — each
+    // chain runs the full stack via `net_receive` and drops there,
+    // reposting its device buffers. No frame-byte copy (item C).
+    core.rx_inbox.drain_each(percpu::rx_node_pool(), net_receive) > 0
 }
 
 fn net_flush_cb() {
