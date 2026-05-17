@@ -25,6 +25,7 @@ use core::task::Waker;
 use from_bytes::FromBytes;
 use types::{IpAddr, MacAddr, tcp_checksum_any, tcp_pseudo_partial, htons, ntohs, htonl, ntohl};
 use ipv4::PROTO_TCP;
+use uni_iobuf::{Chain, OwnedIOBuf};
 
 bitflags::bitflags! {
     struct TcpFlags: u8 {
@@ -1476,13 +1477,26 @@ fn send_rst(local_ip: IpAddr, dst_ip: IpAddr, src_port: u16, dst_port: u16, seq:
 /// `src_ip` and `dst_ip` are family-tagged so v4 and v6 connections
 /// share the same TCB pool, hash table, and dispatch path.
 ///
-/// `segment` is a borrow over driver-pool storage (or the cross-core
-/// inbox slot) covering the full TCP segment (header + payload).
-/// Only valid for this call: a parked `TcpRecv` may consume payload
-/// bytes via direct-copy, and the rest land in the per-conn ring —
-/// both happen before this function returns.
-pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, segment: &[u8]) {
-    let hdr = match TcpHeader::try_ref_from(segment) {
+/// `segment` is an owned `Chain<OwnedIOBuf>` covering exactly the TCP
+/// segment — header + payload — with the eth/IP headers and any
+/// ethernet trailing padding already narrowed off by the caller
+/// (`net::net_receive_frame`, RX item D). It is a one-part chain
+/// today; a hardware-coalesced super-segment (RX item I) would
+/// arrive multi-part, so the payload walk below iterates every part.
+///
+/// The chain — and the device RX buffer(s) it owns — drops at
+/// return; that drop reposts the buffer(s) to the NIC / pool.
+/// Payload bytes are copied out before then: into a parked
+/// `TcpRecv`'s direct-copy slot, with the rest into the per-conn
+/// ring. RX item D keeps the ring a `Box<[u8; 16384]>` — this commit
+/// is plumbing, the copy count is unchanged, only the input is now
+/// IOBuf-typed.
+pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, segment: Chain<OwnedIOBuf>) {
+    // The TCP header is contiguous in the first chain part: a frame's
+    // L2/L3/L4 headers all land in the device's first RX buffer, and
+    // the caller narrowed the chain to start exactly at the TCP header.
+    let Some(first) = segment.iter().next() else { return };
+    let hdr = match TcpHeader::try_ref_from(first.data()) {
         Some(h) => h,
         None => return,
     };
@@ -1492,11 +1506,7 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, segment: &[u8]) {
     let ack = ntohl(hdr.ack);
     let flags = hdr.flags;
     let data_offset = ((hdr.data_offset >> 4) as usize) * 4;
-    let payload_len = if segment.len() > data_offset {
-        segment.len() - data_offset
-    } else {
-        0
-    };
+    let payload_len = segment.total_len().saturating_sub(data_offset);
 
     // Determine which core owns this packet.
     let core = uni_kernel::cpu_id();
@@ -1705,14 +1715,27 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, segment: &[u8]) {
     // Process data
     if payload_len > 0 && (c.state == TcpState::Established || c.state == TcpState::FinWait1 || c.state == TcpState::FinWait2) {
         if seq == c.rcv_nxt {
-            // Slice payload bytes out of the segment and deliver —
-            // direct-copy into a parked recv buf when one is
-            // registered, with overflow into the ring; or straight
-            // to the ring when no recv is parked. `deliver_payload`
-            // is synchronous on this core so the borrow into
-            // `segment` is released before we return.
-            let payload = &segment[data_offset..data_offset + payload_len];
-            let pushed = c.deliver_payload(payload);
+            // Walk the chain: skip the `data_offset`-byte TCP header,
+            // then deliver each part's payload bytes. `deliver_payload`
+            // direct-copies into a parked `TcpRecv`'s user buf when one
+            // is registered (consuming the slot on the first call),
+            // with the rest into the per-conn ring. One part today —
+            // one `deliver_payload` call over `data()[data_offset..]`,
+            // bit-identical to the pre-item-D `&segment[data_offset..]`
+            // slice path; item I's coalesced super-segments arrive
+            // multi-part. All synchronous on this core, so the chain's
+            // device buffers are still owned at return.
+            let mut pushed = 0usize;
+            let mut skip = data_offset;
+            for part in segment.iter() {
+                let bytes = part.data();
+                if skip >= bytes.len() {
+                    skip -= bytes.len();
+                    continue;
+                }
+                pushed += c.deliver_payload(&bytes[skip..]);
+                skip = 0;
+            }
             c.rcv_nxt = c.rcv_nxt.wrapping_add(pushed as u32);
             c.rcv_wnd = c.rx_free() as u16;
             // Wake any `TcpRecvReady` parked on this conn. Same core

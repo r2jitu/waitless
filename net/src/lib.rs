@@ -314,38 +314,29 @@ fn poll_tier2(num_cores: u32) -> bool {
 
 
 /// RX callback for the NIC poll path (`NicOps::poll_rx` /
-/// `poll_qp`) — receives one frame as an owned `Chain<OwnedIOBuf>`
-/// and dispatches it through the full stack. Also the per-chain
-/// consumer the Tier 2 owning core runs out of its `rx_inbox`
-/// (`net_drain_cb`), and the inline path in `distribute_frame`.
+/// `poll_qp`) — dispatches one received frame through the full
+/// stack. Also the per-chain consumer the Tier 2 owning core runs
+/// out of its `rx_inbox` (`net_drain_cb`), and the inline path in
+/// `distribute_frame`.
 ///
-/// The chain is consumed synchronously here and dropped at return —
-/// dropping it reposts the backing device buffer (or recycles the
-/// GQI slab) via each part's drop callback. Threading the chain
-/// deeper into the per-conn layers is item D; item C only carried
-/// it zero-copy across the Tier 2 core boundary.
+/// **One chain is one frame.** The driver invokes this callback once
+/// per received frame; a frame is a single device buffer today, or —
+/// once RSC lands (item I) — a hardware-coalesced super-segment
+/// spanning several buffers (one chain, several parts). The chain is
+/// therefore handled as a *unit*: the L2/L3/L4 headers are parsed
+/// from part 0, and for TCP the whole narrowed chain is moved into
+/// `tcp::tcp_receive`, which walks every part for payload. Splitting
+/// the chain and re-parsing each part as its own frame would be
+/// wrong for RSC — parts 1..N of a super-segment are raw TCP payload
+/// continuation, not framed packets.
 ///
-/// A single-buffer frame is a one-part chain (the common case);
-/// hardware-coalesced super-segments (item I) arrive as multi-part
-/// chains, so we walk every part.
+/// The chain — and the device RX buffer(s) it owns — drops when this
+/// returns (or, for TCP, when `tcp_receive` returns); that drop
+/// reposts the buffer(s) via each part's drop callback.
 pub fn net_receive(chain: Chain<OwnedIOBuf>) {
-    for part in chain.iter() {
-        net_receive_frame(part.data());
-    }
-    // `chain` drops here → each part's IOBuf drops → the driver's
-    // drop callback reposts the buffer to the device / pool.
-}
-
-/// Process a single received frame through the full stack inline
-/// (no cross-core distribution). Called from [`net_receive`], once
-/// per chain part.
-///
-/// `frame` is a borrow over a `Chain<OwnedIOBuf>` part's storage. It
-/// is only valid for this call: the L4 receive entries finish (copy
-/// payload into per-conn ring buffers / direct-copy slots, dispatch
-/// ARP/ICMP replies) synchronously before returning.
-fn net_receive_frame(frame: &[u8]) {
-    let Some((src_mac, ethertype, payload)) = ethernet::ethernet_parse_full(frame) else {
+    // Part 0 carries the L2/L3/L4 headers contiguously.
+    let Some(first) = chain.iter().next() else { return };
+    let Some((src_mac, ethertype, payload)) = ethernet::ethernet_parse_full(first.data()) else {
         return;
     };
     match ethertype {
@@ -362,15 +353,70 @@ fn net_receive_frame(frame: &[u8]) {
             let dst = types::IpAddr::V4(types::Ipv4Addr { addr: pkt.dst.addr });
             match proto {
                 ipv4::PROTO_UDP => udp::udp_receive(src, dst, pkt.payload),
-                ipv4::PROTO_TCP => tcp::tcp_receive(src, dst, pkt.payload),
+                ipv4::PROTO_TCP => {
+                    // L4 segment's (offset, len) within the frame —
+                    // pointer arithmetic over the backing buffer
+                    // `pkt.payload` views. Robust across IPv4 header
+                    // options (a fixed header-length constant is not).
+                    let l4_off = pkt.payload.as_ptr() as usize
+                        - first.data().as_ptr() as usize;
+                    let l4_len = pkt.payload.len();
+                    tcp_receive_segment(src, dst, chain, l4_off, l4_len);
+                }
                 _ => {}
             }
         }
         ipv6::ETHERTYPE_IPV6 => {
-            ipv6_receive_frame(frame, src_mac);
+            ipv6_receive_frame(chain, src_mac);
         }
         _ => {}
     }
+}
+
+/// Narrow a received frame's chain down to its TCP segment and hand
+/// it to `tcp::tcp_receive` (RX item D). Part 0 — which holds the
+/// eth/IP/TCP headers — is narrowed to start at the TCP header and
+/// end at the segment's extent; the eth/IP headers and any ethernet
+/// trailing padding fall outside the visible window without a byte
+/// moving, and the `OwnedIOBuf`'s drop callback still reposts the
+/// *whole* device buffer.
+///
+/// One-part chain today, so this narrows the entire frame down to
+/// exactly the TCP segment. A future RSC super-segment (item I) is
+/// multi-part — part 0 holds the headers + first payload chunk,
+/// parts 1..N the payload continuation. `narrow` then only
+/// `consume`s the header bytes off part 0 (the segment outruns part
+/// 0, so there is no tail to trim), and `tcp_receive` walks every
+/// part — but item I must additionally refresh the chain's cached
+/// `total_len` (via `Chain::shrink_total_len`), which a `Single`-repr
+/// chain computes live and so does not need today.
+fn tcp_receive_segment(
+    src: types::IpAddr,
+    dst: types::IpAddr,
+    mut chain: Chain<OwnedIOBuf>,
+    l4_off: usize,
+    l4_len: usize,
+) {
+    // Single-part invariant (see fn doc): `narrow` mutates part 0 via
+    // `front_mut`, which bypasses a `Many` chain's cached `total_len`
+    // — so a multi-part chain would reach `tcp_receive` with a stale
+    // length. Tripwire for item I, which is what first produces
+    // multi-part RSC chains: it must narrow chain-aware (refresh
+    // `total_len`). Compiled out in release; never trips today.
+    debug_assert_eq!(
+        chain.part_count(),
+        1,
+        "multi-part RX chain in tcp_receive_segment: RSC (item I) must \
+         refresh the chain's cached total_len after the part-0 narrow",
+    );
+    let Some(part0) = chain.front_mut() else { return };
+    if part0.narrow(l4_off, l4_len).is_err() {
+        // Unreachable: `l4_off + l4_len` is the end of `pkt.payload`,
+        // a sub-slice of part 0, in-bounds by construction.
+        // Defensive — `chain` drops here, reposting.
+        return;
+    }
+    tcp::tcp_receive(src, dst, chain);
 }
 
 /// Tier 2 distributor decision — classify a frame for distribution.
@@ -415,8 +461,8 @@ fn classify_for_distribution(
 }
 
 enum ClassifyResult {
-    /// Hand off to `net_receive_frame` on this core (ARP, IPv6,
-    /// or IPv4 destined for `my_core`).
+    /// Hand the whole chain to `net_receive` on this core (ARP,
+    /// IPv6, or IPv4 destined for `my_core`).
     Inline,
     /// Move the whole chain into the target core's `rx_inbox`; the
     /// target wakes and consumes it via `net_drain_cb`.
@@ -442,8 +488,8 @@ fn distribute_frame(chain: Chain<OwnedIOBuf>) {
     let my_core = uni_kernel::cpu_id();
     let Some(first) = chain.iter().next() else { return };
     match classify_for_distribution(first.data(), num_cores, my_core) {
-        // Processes every part, then drops the chain → device
-        // buffers repost.
+        // Runs the full receive path inline, then drops the chain →
+        // device buffers repost.
         ClassifyResult::Inline => net_receive(chain),
         ClassifyResult::Distribute(target) => {
             // SAFETY: `percpu::init()` runs before any AP starts;
@@ -625,8 +671,9 @@ fn our_v6_addrs(out: &mut [types::Ipv6Addr; 5]) -> usize {
     n
 }
 
-fn ipv6_receive_frame(frame: &[u8], src_mac: types::MacAddr) {
-    let Some((_, _, eth_payload)) = ethernet::ethernet_parse_full(frame) else {
+fn ipv6_receive_frame(chain: Chain<OwnedIOBuf>, src_mac: types::MacAddr) {
+    let Some(first) = chain.iter().next() else { return };
+    let Some((_, _, eth_payload)) = ethernet::ethernet_parse_full(first.data()) else {
         return;
     };
     let mut addr_buf = [types::Ipv6Addr::ANY; 5];
@@ -647,7 +694,14 @@ fn ipv6_receive_frame(frame: &[u8], src_mac: types::MacAddr) {
             let src = types::IpAddr::V6(pkt.src);
             let dst = types::IpAddr::V6(pkt.dst);
             if proto == ipv6::next_header::TCP {
-                tcp::tcp_receive(src, dst, pkt.payload);
+                // L4 segment's (offset, len) within the frame —
+                // pointer arithmetic over the backing buffer. Robust
+                // across IPv6 extension headers (which a fixed
+                // `eth + 40` constant would miss).
+                let l4_off = pkt.payload.as_ptr() as usize
+                    - first.data().as_ptr() as usize;
+                let l4_len = pkt.payload.len();
+                tcp_receive_segment(src, dst, chain, l4_off, l4_len);
             } else {
                 udp::udp_receive(src, dst, pkt.payload);
             }
