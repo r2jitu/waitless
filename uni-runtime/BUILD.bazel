@@ -1,4 +1,5 @@
 load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//bazel/rules:rust.bzl", "rust_doc_test", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -27,4 +28,24 @@ rust_library(
         "//uni-worker",
         "//uni-platform",
     ],
+)
+
+# Inline #[cfg(test)] unit tests — item-F `RecvChunkGuard`
+# round-trips. The crate flips to `std` under `--test` via the
+# `#![cfg_attr(not(test), no_std)]` in `src/lib.rs`. Run via:
+#   bazel test //uni-runtime:uni_runtime_test
+rust_test(
+    name = "uni_runtime_test",
+    size = "small",
+    crate = ":uni-runtime",
+)
+
+# Doc-test target — runs the `///` examples, including the
+# `compile_fail` block on `TcpStream::recv_chunk` that asserts two
+# `RecvChunkGuard`s cannot be held at once. Run via:
+#   bazel test //uni-runtime:uni_runtime_doc_test
+rust_doc_test(
+    name = "uni_runtime_doc_test",
+    size = "small",
+    crate = ":uni-runtime",
 )

@@ -13,7 +13,11 @@
 // Rule of thumb for new files here: subdir when >1 file's worth of
 // implementation, top-level `.rs` when it's one file's worth.
 
-#![no_std]
+// `no_std` for the unikernel build; under `cfg(test)` the crate is
+// `std` so `rust_test(crate = ":uni-runtime")` can run host-native
+// unit tests (item-F `recv_chunk` round-trips) with the standard
+// libtest harness — the workspace pattern (see `bazel/rules/rust.bzl`).
+#![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
 pub extern crate net_types as ip;

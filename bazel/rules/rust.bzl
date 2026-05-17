@@ -6,7 +6,12 @@ are threaded through unikernel binaries via Bazel transitions in
 `//bazel/rules:{unikernel,variants}.bzl` — see those files.
 """
 
-load("@rules_rust//rust:defs.bzl", _rust_proc_macro = "rust_proc_macro", _rust_test = "rust_test")
+load(
+    "@rules_rust//rust:defs.bzl",
+    _rust_doc_test = "rust_doc_test",
+    _rust_proc_macro = "rust_proc_macro",
+    _rust_test = "rust_test",
+)
 
 # `bazel build ...` would otherwise try to compile every rust_test
 # under the global `-Cpanic=abort`, which rustc rejects for test
@@ -23,6 +28,20 @@ def rust_test(**kwargs):
         "//conditions:default": ["@platforms//:incompatible"],
     })
     _rust_test(**kwargs)
+
+# `rust_doc_test` compiles (and runs) the crate's `///` doc examples,
+# including `compile_fail` blocks — the only way to assert "this must
+# not compile" without a `trybuild`-style dep. Doc-test binaries are
+# `std` + libtest, so they hit the same `-Cpanic=abort` rejection as
+# `rust_test`; gate them on the same `tests_need_std` flag.
+def rust_doc_test(**kwargs):
+    if "target_compatible_with" in kwargs:
+        fail("rust_doc_test: unikernel wrapper owns target_compatible_with")
+    kwargs["target_compatible_with"] = select({
+        "//bazel/rules:tests_need_std_on": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    })
+    _rust_doc_test(**kwargs)
 
 # Proc-macros are dylibs loaded into rustc, so a panic in the macro
 # unwinds into the compiler. rustc warns ("building proc macro crate

@@ -123,6 +123,45 @@ impl TcpStream {
         TcpRecv::new(self.handle, self.generation, buf)
     }
 
+    /// Async zero-copy read. Resolves with a [`RecvChunkGuard`]
+    /// over the next inbound chunk of data, or `None` on peer close
+    /// / stale generation / a backend with no chunk path.
+    ///
+    /// Where [`Self::recv`] copies bytes into a caller-supplied
+    /// buffer, `recv_chunk` surfaces the transport's own buffer:
+    /// `guard.data()` reads it in place (zero copy), and
+    /// `guard.into_owned()` lifts it to an owned `IOBuf` — zero
+    /// copy when the buffer is already owned (the bare-metal NIC
+    /// RX case), one memcpy when it is a borrowed view.
+    ///
+    /// `recv_chunk` takes `&mut self` and the returned guard
+    /// borrows it for the guard's whole lifetime. That is
+    /// deliberate: at most one chunk is outstanding per stream, so
+    /// the transport may reuse the surfaced buffer the moment the
+    /// guard drops. Two simultaneously-live guards are therefore a
+    /// borrow-check error:
+    ///
+    /// ```compile_fail
+    /// # async fn two_guards(s: &mut uni_runtime::net::TcpStream) {
+    /// let g1 = s.recv_chunk().await;
+    /// let g2 = s.recv_chunk().await; // ERROR: `*s` already borrowed
+    /// let _ = (g1, g2);
+    /// # }
+    /// ```
+    ///
+    /// The same calls with one guard live at a time compile fine:
+    ///
+    /// ```no_run
+    /// # async fn sequential(s: &mut uni_runtime::net::TcpStream) {
+    /// { let _g = s.recv_chunk().await; }
+    /// { let _g = s.recv_chunk().await; }
+    /// # }
+    /// ```
+    #[inline]
+    pub fn recv_chunk(&mut self) -> RecvChunk<'_> {
+        RecvChunk::new(self.handle, self.generation)
+    }
+
     /// Drain exactly `buf.len()` bytes into `buf`. Returns `Ok(())`
     /// when full, `Err(n_filled)` if the peer closed before all
     /// bytes arrived (the partial prefix is left in `buf`).
@@ -808,6 +847,152 @@ impl<'a> Drop for TcpRecv<'a> {
     }
 }
 
+// ---- Per-stream zero-copy chunk recv ---------------------------------------
+//
+// `TcpStream::recv_chunk().await` resolves with a `RecvChunkGuard`
+// over the next inbound `IOBuf` — the transport's own buffer,
+// surfaced without the copy-into-caller-buffer that `recv` does.
+// The guard borrows `&mut TcpStream`, so the borrow checker permits
+// at most one outstanding chunk per stream; the transport is free
+// to reuse / repost the buffer once the guard drops.
+//
+// Backed by the optional `do_recv_chunk` / `set_chunk_buf_slot` /
+// `clear_chunk_buf_slot` hooks; the recv-side waker hooks are
+// reused. A backend without `do_recv_chunk` (native POSIX) makes
+// `recv_chunk` resolve to `None` on its first poll.
+
+/// RAII guard returned by [`TcpStream::recv_chunk`]. Owns the
+/// surfaced [`IOBuf`](uni_iobuf::IOBuf) and carries the `&'a mut`
+/// borrow of the stream it came from.
+///
+/// The borrow is the load-bearing part: it makes "at most one
+/// outstanding IOBuf per stream" a compile-time fact rather than a
+/// runtime invariant, and — for transports that surface a
+/// `Borrowed` view (TLS plaintext, a later RX-path item) — it
+/// prevents the stream from being re-read, and those bytes
+/// overwritten, while the guard is live.
+pub struct RecvChunkGuard<'a> {
+    iobuf: uni_iobuf::IOBuf,
+    /// Ties the guard to the `&'a mut self` of `recv_chunk`. The
+    /// inner type is opaque (`()`) so one guard type can serve
+    /// every stream — `TcpStream` here, `TlsStream` later.
+    _borrow: PhantomData<&'a mut ()>,
+}
+
+impl<'a> RecvChunkGuard<'a> {
+    #[inline]
+    fn new(iobuf: uni_iobuf::IOBuf) -> Self {
+        RecvChunkGuard { iobuf, _borrow: PhantomData }
+    }
+
+    /// The chunk's bytes, read in place. Zero copy. Callers that
+    /// need the length use `data().len()`.
+    #[inline]
+    pub fn data(&self) -> &[u8] {
+        self.iobuf.data()
+    }
+
+    /// Take owned possession of the chunk. Zero copy when the
+    /// surfaced `IOBuf` already owns its storage (`Heap`, or the
+    /// NIC-RX `ExternalOwned` device buffer); one memcpy into a
+    /// fresh heap buffer when it is a `Borrowed` view (TLS
+    /// plaintext). The escape hatch for holding the bytes past the
+    /// guard's borrow — e.g. a proxy forwarding the chunk into an
+    /// outbound `send`.
+    #[inline]
+    pub fn into_owned(self) -> uni_iobuf::IOBuf {
+        self.iobuf.into_owned()
+    }
+}
+
+/// Future returned by [`TcpStream::recv_chunk`]. Resolves to
+/// `Some(guard)` once the backend has a chunk, or `None` on peer
+/// close / stale generation / a backend with no chunk path. `!Send`
+/// — the conn handle points into per-worker state.
+pub struct RecvChunk<'a> {
+    handle: *mut (),
+    generation: u16,
+    _not_send: PhantomData<*mut ()>,
+    /// The `&'a mut TcpStream` borrow `recv_chunk` took — held by
+    /// the future, then carried into the resolved guard via the
+    /// shared `'a`.
+    _borrow: PhantomData<&'a mut TcpStream>,
+}
+
+impl<'a> RecvChunk<'a> {
+    #[inline]
+    fn new(handle: *mut (), generation: u16) -> Self {
+        RecvChunk {
+            handle,
+            generation,
+            _not_send: PhantomData,
+            _borrow: PhantomData,
+        }
+    }
+}
+
+impl<'a> Future for RecvChunk<'a> {
+    type Output = Option<RecvChunkGuard<'a>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let h = this.handle;
+        let g = this.generation;
+        let b = match tcp_backend() {
+            Some(b) => b,
+            None => return Poll::Pending,
+        };
+        // A backend with no chunk path (native POSIX, which copies
+        // at the `recv()` syscall anyway) — resolve `None` so a
+        // caller can fall back to `recv`.
+        let do_chunk = match b.do_recv_chunk {
+            Some(f) => f,
+            None => return Poll::Ready(None),
+        };
+        // Fast path — a chunk is already available (or the conn is
+        // closed, in which case `do_recv_chunk` returns `None`).
+        if (b.has_data)(h, g) {
+            (b.clear_recv_waker)(h, g);
+            if let Some(clear) = b.clear_chunk_buf_slot {
+                clear(h, g);
+            }
+            return Poll::Ready(do_chunk(h, g).map(RecvChunkGuard::new));
+        }
+        // Flag the conn for zero-copy delivery, park the waker, then
+        // re-probe once — closes the wake-before-park race with the
+        // `tcp_receive` data-arrival site.
+        if let Some(set) = b.set_chunk_buf_slot {
+            set(h, g);
+        }
+        (b.register_recv_waker)(h, g, cx.waker());
+        if (b.has_data)(h, g) {
+            (b.clear_recv_waker)(h, g);
+            if let Some(clear) = b.clear_chunk_buf_slot {
+                clear(h, g);
+            }
+            return Poll::Ready(do_chunk(h, g).map(RecvChunkGuard::new));
+        }
+        Poll::Pending
+    }
+}
+
+impl<'a> Drop for RecvChunk<'a> {
+    fn drop(&mut self) {
+        // Cancel-safety: a future dropped before its waker fires
+        // (parent task aborted, `select!` losing branch) must not
+        // leave a stale "deliver-as-IOBuf" request — the next
+        // segment would otherwise be stashed for a consumer that no
+        // longer exists. An already-stashed chunk is left intact;
+        // it's still owed to the conn slot and is released on slot
+        // reset.
+        if let Some(b) = tcp_backend() {
+            if let Some(clear) = b.clear_chunk_buf_slot {
+                clear(self.handle, self.generation);
+            }
+        }
+    }
+}
+
 // ---- Per-stream async send ------------------------------------------------
 //
 // `TcpStream::send(data).await` resolves when every byte in `data`
@@ -916,4 +1101,51 @@ pub fn deliver_tcp_ready(dst_port: u16) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RecvChunkGuard;
+    use uni_iobuf::IOBuf;
+
+    /// `RecvChunkGuard::into_owned` round-trips bytes for an
+    /// already-owned (`Heap`) IOBuf — the bare-metal NIC-RX shape,
+    /// where `into_owned` is a zero-copy no-op. `data()` reads the
+    /// same bytes in place beforehand.
+    #[test]
+    fn recv_chunk_guard_into_owned_owned_roundtrip() {
+        let bytes: &[u8] = b"item-F chunk payload";
+        let guard = RecvChunkGuard::new(IOBuf::from(bytes.to_vec()));
+        assert_eq!(guard.data(), bytes, "data() reads the chunk in place");
+        let owned = guard.into_owned();
+        assert_eq!(owned.data(), bytes, "owned IOBuf preserves the bytes");
+    }
+
+    /// `into_owned` on a guard wrapping a `Borrowed` view copies
+    /// the bytes into a fresh heap buffer — the TLS-plaintext shape
+    /// (the one memcpy case) — and the copy preserves the payload.
+    #[test]
+    fn recv_chunk_guard_into_owned_borrowed_roundtrip() {
+        let backing: alloc::vec::Vec<u8> = b"borrowed view -> heap".to_vec();
+        let len = backing.len() as u32;
+        // SAFETY: `backing` outlives `guard` (and `owned`, which
+        // copies out of it). The borrowed window spans the whole
+        // buffer; nothing else mutates it for the borrow's life.
+        let guard = RecvChunkGuard::new(unsafe {
+            IOBuf::borrow(
+                core::ptr::NonNull::new(backing.as_ptr() as *mut u8).unwrap(),
+                len,
+                0,
+                len,
+            )
+        });
+        assert_eq!(guard.data(), backing.as_slice());
+        let owned = guard.into_owned();
+        assert_eq!(
+            owned.data(),
+            backing.as_slice(),
+            "Borrowed -> Heap copy preserves the bytes",
+        );
+        drop(backing);
+    }
 }
