@@ -1,8 +1,15 @@
 # uni-iobuf type model — split borrowed (`!Send`) from owned (`Send`)
 
-**Status:** spike / design note — 2026-05-16. Not yet implemented.
-A safety-quality refactor that should precede RX-path **item C** —
-nothing hard-requires it (see Sequencing).
+**Status:** **Landed 2026-05-16.** Three commits: `fb755a3` (prep —
+deleted the dead `Shared` variant + `split_at` / `split_off`),
+`409b5dd` (additive — the per-variant storage structs + `OwnedIOBuf`
+/ `IOBufRead` / generic `Chain<B>`; the whole workspace still
+builds), and `d8b4c1e` (the atomic flip — `wrap_owned` /
+`IOBufPool::alloc` now return `OwnedIOBuf`, and the `NicOps` RX
+callback + all three drivers + net dispatch are typed
+`Chain<OwnedIOBuf>`). RX-path **item C** then built its cross-core
+`RxInbox<T: Send>` on top — `Send` by derivation, no `unsafe impl
+Send`, no human-maintained "no `Borrowed` parts" invariant.
 [`rx-path-optimizations.md`](rx-path-optimizations.md) has the plan.
 
 ## Problem

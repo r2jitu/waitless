@@ -150,32 +150,57 @@ a 100 MB POST). See item L for the follow-on plan.
   verify drop_fn fires with correct base+capacity; repost-counter
   advances.
 
-### C. RxInbox holds `IOBufChain` (cross-core zero-copy)
-- **Status**: [ ]
-- **Where**: [`kernel/src/percpu.rs:55-137`](kernel/src/percpu.rs#L55-L137)
-  — `RxPacket { len, data: [u8; 1514] }` replaced with
-  `Option<IOBufChain>` (`Option<Chain<OwnedIOBuf>>` if the
-  type-model split lands first — see Risk).
-- **What**: cross-core inbox push moves an IOBufChain into a
-  slot instead of copying frame bytes. Pop takes the chain out
-  and hands to `net_receive`. Bounded queue with drop-on-overflow
-  (chain drops → IOBufs drop → auto-repost).
+### C. RxInbox: intrusive-node cross-core inbox (zero-copy)
+- **Status**: [x] landed 2026-05-17 — commits `dc5cc26` (virtio
+  `rx_lock` prep), `35b4aff` (the `rx_inbox` data structure),
+  `59121b4` (kernel + net wiring)
+- **Where**: new [`kernel/src/rx_inbox.rs`](kernel/src/rx_inbox.rs)
+  — generic `RxNode<T>` / `RxNodePool<T, N>` / `RxInbox`;
+  [`kernel/src/percpu.rs`](kernel/src/percpu.rs) pins the payload
+  (`RxChain = Chain<OwnedIOBuf>`) and the `static` node pool;
+  `distribute_frame` / `net_drain_cb` in
+  [`net/src/lib.rs`](net/src/lib.rs);
+  [`uni-driver-virtio-net/src/lib.rs`](uni-driver-virtio-net/src/lib.rs)
+  `rx_used_locked` (fix #1 below).
+- **What**: the Tier 2 cross-core inbox stops copying frame bytes.
+  `distribute_frame` *moves* the received `Chain<OwnedIOBuf>` into a
+  pre-allocated `RxNode` and CAS-pushes the node onto the target
+  core's lock-free intrusive MPSC inbox list; `net_drain_cb` swaps
+  the list out, reverses it to arrival (FIFO) order, and runs
+  `net_receive` per chain. **No drop-on-overflow policy** — the
+  superseded first attempt's bounded ring tail-dropped fresh TCP
+  ACKs and collapsed `download_64k`. One `RxNode` exists per slot
+  in a fixed pool, and a frame in flight pins exactly one device RX
+  buffer, so the inbox provably never needs more nodes than the RX
+  queue has buffers (`RX_NODE_POOL_CAP` is sized ≥ that count). The
+  pool free-list is a tagged-pointer Treiber stack, ABA-immune like
+  `IOBufPool`.
+  * **Fix #1 (virtio)** — a delivered chain now drops on a
+    *non-polling* core, so `virtio_rx_repost` → `add_buf` races
+    `poll_qp`'s `used()` on the shared descriptor free-list. Both
+    are now serialised under `rx_lock`, via the encapsulated
+    `rx_used_locked` helper (so an unlocked `used()` is not a
+    reachable pattern in the RX path).
 - **Win**: **-1 memcpy per byte** on the cross-core distribution
-  path. Eliminates copy #3 from the path table. Most visible on
-  multi-queue setups where flows get distributed off the core
-  that received them.
-- **Effort**: low. ~80 LOC. Storage shape changes; push/pop logic
-  is moves not copies.
-- **Risk**: low. The chain moves cross-core, not copies. **If the
-  uni-iobuf type-model split (see Follow-ups) lands first —
-  recommended — the inbox holds `Chain<OwnedIOBuf>`, `Send` by
-  derivation, with no `unsafe impl`.** Absent the split,
-  `ExternalOwned` is `Send` (unsafe impl at
-  [uni-iobuf/src/lib.rs:338](uni-iobuf/src/lib.rs#L338)) and
-  `RxInbox` carries an `unsafe impl Send` plus a human-maintained
-  "no `Borrowed` parts" invariant.
-- **Tests**: bounded-queue eviction (push N+1 chains, verify
-  oldest's drop_fn fired).
+  path. Eliminates copy #3 from the path table. Per-core inbox
+  shrinks from ~24 KB (`16 × [u8; 1514]`) to a single pointer.
+- **Effort**: low–medium. ~330 LOC (`rx_inbox.rs` + wiring + the
+  virtio race fix).
+- **Risk**: low. The chain moves cross-core, not copies. The
+  uni-iobuf type-model split landed first, so the inbox is typed
+  `Chain<OwnedIOBuf>` — `Send` by derivation, no `unsafe impl Send`,
+  no human-maintained "no `Borrowed` parts" invariant.
+- **Node ownership** — kept in a kernel-side pool, *not* 1:1
+  driver-side nodes. The 1:1 form (`sk_buff`-style: the node folded
+  into per-buffer driver RX state, no pool) is the cleaner steady
+  state but needs a `NicOps` RX-surface change across all three
+  drivers, dead weight + untested for the two gve drivers (which
+  always run Tier 1). Tracked as a planned redesign — see item K.
+- **Tests**: [`kernel:rx_inbox_test`](../kernel/src/rx_inbox.rs) —
+  host-native, two 8-thread stress tests modelled on `IOBufPool`'s:
+  a pure tagged-free-list ABA hammer, and a 1-distributor /
+  N-consumer distribute→drain run asserting per-inbox FIFO order +
+  no node/payload leak.
 
 ### D. `tcp_receive` takes `IOBufChain`
 - **Status**: [ ]
@@ -328,9 +353,43 @@ a 100 MB POST). See item L for the follow-on plan.
   skipped); pair with `RX_BUF_REPOST_COUNT` to verify every
   received frame's bufs repost.
 
+### K. Driver-delivered RX frame (fold the inbox node into the driver)
+- **Status**: [ ]
+- **Where**: the `NicOps` RX-callback surface
+  ([`uni-net/src/driver.rs`](uni-net/src/driver.rs)); all three
+  drivers; [`kernel/src/rx_inbox.rs`](kernel/src/rx_inbox.rs) — the
+  `RxNodePool` free-list is deleted.
+- **What**: item C's cross-core inbox node lives in a kernel-side
+  pool *because the kernel cannot map a received `Chain` back to
+  the driver's per-buffer RX state* — only the driver knows its
+  buffer layout. The cleaner design (`sk_buff` / `mbuf` shape): the
+  device RX buffer's owned-frame object carries the intrusive
+  `next` link itself, and the driver delivers it up the RX path.
+  Node-supply then *is* buffer-supply — the `RxNodePool` and its
+  free-list vanish, and "the inbox provably never overflows" stops
+  being a sizing argument and becomes a tautology (a frame on an
+  inbox is a buffer not on the ring; there are only N buffers).
+- **Win**: deletes the kernel node pool + free-list; the overflow
+  proof becomes structural. No per-byte perf delta — item C
+  already removed the cross-core memcpy.
+- **Effort**: high. A `NicOps` RX-surface change atomic across all
+  three drivers + net dispatch, plus folding the link into each
+  driver's per-buffer RX state. Same blast radius as item B.
+- **Risk**: medium. Re-touches all three driver RX paths; gve's
+  first real test is GCE — so this item carries a **mandatory GCE
+  checkpoint**, which is exactly why it was *not* bundled into item
+  C (that session had no gve gate). The intrusive MPSC inbox +
+  drain logic from item C is reused verbatim — only the node
+  *storage* moves, so ~80% of `rx_inbox.rs` survives.
+- **Tests**: `rx_inbox_test` (the inbox half is unchanged); GCE
+  bench before/after on the kvm env (Tier 2 on real hardware).
+
 ## Recommended sequence
 
-A → B → C → D → E → F → G → H → I → J
+A → B → C → D → E → F → G → H → I → J. K is independent — it
+supersedes item C's kernel node pool and can land any time after
+C; it is sequenced last only because of its driver-wide blast
+radius.
 
 A is pure additions (infrastructure). B is the trait change that
 forces all drivers + net dispatch to land atomically. C through
@@ -392,7 +451,9 @@ triggers "halt and investigate."
 
 Exposed via `/stats`:
 - `DQO_RX_PENDING_CHAIN_TIMEOUTS` (per qp; item I)
-- `RX_INBOX_OVERFLOW_DROPS` (per core; item C)
+- ~~`RX_INBOX_OVERFLOW_DROPS`~~ — item C as landed has **no**
+  overflow: the intrusive-node inbox is provably bounded by the RX
+  buffer count, so there is no drop event to count.
 - `RX_RING_FULL_BACKPRESSURE` (per conn / aggregated; item D)
 - `GQI_RECYCLE_POOL_EXHAUSTED` (per qp; item B)
 - `RX_BUF_REPOST_COUNT` (per qp; item B — pairs with
@@ -488,6 +549,85 @@ backpressure. CPU-bound at ChaCha20-Poly1305 decrypt rate
   `/stats`-style dashboards.
 - **GCE IPv6 subnet enablement** so `get_tcp_v6` runs against
   the remote unikernel-webserver VM (currently HVF-only).
+- **Extract a shared `TaggedTreiberStack`**: `IOBufPool`
+  ([`uni-iobuf/src/pool.rs`](../uni-iobuf/src/pool.rs)) and
+  `RxNodePool` ([`kernel/src/rx_inbox.rs`](../kernel/src/rx_inbox.rs))
+  each carry their own copy of the same tagged-pointer Treiber
+  free-list (`AtomicU64` head packing `(index, version)`; the
+  version bumps on push to defeat ABA). Lift the ~40-line stack
+  core into a zero-dep `core`-only crate — à la `util/atomic_fn` —
+  generic over the next-link accessor (a separate `[AtomicU32]`
+  array for `IOBufPool`, an in-struct field for `RxNodePool`). One
+  audited, stress-tested implementation instead of two. Needs the
+  `tests_need_std` opt-in on the new crate so the dep-pulling
+  `rust_test`s (`iobuf_test`, `rx_inbox_test`) still link under
+  `-Cpanic=unwind`. Low urgency — a tagged Treiber stack is
+  textbook and stable, and both copies are independently stressed.
+- **Fuse the Tier-2 classify parse**: `classify_for_distribution`
+  ([`net/src/lib.rs`](../net/src/lib.rs)) walks eth → IPv4 → L4
+  ports purely to pick a target core, then discards the result;
+  `net_receive_frame` then re-parses the eth + IPv4 headers from
+  scratch (and `tcp_receive` / `udp_receive` re-cover the ports).
+  Every Tier-2 frame thus has its L2/L3 headers parsed **twice** —
+  the shadow cost of software distribution standing in for the
+  hardware RSS that Tier 1 gets for free. Fix: parse once — carry a
+  small `ParsedL3` value (ethertype, proto, src/dst `IpAddr`, L4
+  offset) on the inbox node alongside the chain, so the receive
+  path skips straight to `tcp_receive` / `udp_receive`. Eliminates
+  one eth-parse + one IPv4-parse per Tier-2 frame; the TCP-header
+  parse in `tcp_receive` stays — it needs seq/ack/flags/window, not
+  just the ports `classify` previewed. `arp_learn` also fires in
+  both `classify` and `net_receive_frame` (redundant for `Inline`
+  frames) — fold that in at the same time.
+
+### RX scheduler — unify the tier model
+
+The Tier 1 / Tier 2 split is well-defined only at its endpoints;
+the middle is frayed. "Tier 1 — each core polls its own queue" is
+total **only on the diagonal `nqp == num_cores`**. Off it:
+
+- `nqp < num_cores` — cores `>= nqp` poll nothing
+  ([`net/src/lib.rs`](../net/src/lib.rs), `poll_tier1`'s
+  `core >= nqp → return false`). That is a *degradation* (those
+  cores fall back to compute-stealing), not a real handling.
+- `nqp > num_cores` — queues `num_cores..nqp` are polled by
+  nobody; an RSS-hashed flow landing there stalls. The boot-window
+  "BSP polls every queue" special-case is evidence the code knows
+  this edge exists, but it patches only the boot window.
+
+Both the `core >= nqp` early-return and the boot-window hack are
+symptoms: the code already treats `nqp == num_cores` as its real
+domain. The cleanup, in two parts (one work item):
+
+1. **Pin Tier 1 to the diagonal.** Driver bring-up requests
+   exactly `num_cores` queue pairs (the HVF runner already sets
+   `num_queue_pairs = cpu_count`); the tier predicate becomes
+   `nqp == num_cores`, not `nqp > 1`. Tier 1 is then a precise
+   contract — a core↔queue bijection, no software distribution,
+   no unpolled queue.
+2. **Per-queue cohort distribution** for the genuine off-diagonal
+   (a NIC that cannot supply `num_cores` queues). Queue `q` is
+   polled by the cohort `{c : c ≡ q (mod nqp)}`, with a per-queue
+   rotating distributor (Tier 2's `RX_LOCK` + `JUST_DISTRIBUTED`
+   fairness, replicated per queue). Tier 2 then *is* the
+   `nqp == 1` case of this model, and `poll_tier1` / `poll_tier2`
+   collapse into one function. Item C's cross-core inbox is the
+   delivery mechanism unchanged — the cohort model only changes
+   *who polls*, not how a frame crosses to its owner.
+
+The taxonomy becomes three honest regimes — *bijection* (HW
+distributes via RSS), *single queue* (SW distributes all, today's
+Tier 2), *partial* (cohort: HW across `nqp` queues + SW the rest)
+— instead of two tiers with ad-hoc edges.
+
+**Dependency / caveat**: the cohort model routes every frame
+through `classify_for_distribution`, whose owner verdict
+(`flow_hash % num_cores`) must agree with the queue RSS chose, or
+`nqp == num_cores` frames that are inline-and-free today start
+crossing cores. So it is gated on **aligning the NIC's RSS key
+with the software `flow_hash`** (queue `q` ⟺ core `q`). Worth
+landing only once profiling shows real `nqp < num_cores`
+deployments whose `nqp` polling cores bottleneck on `tcp_receive`.
 
 ### Mid-term — Phase 4: HTTP parser refresh
 
@@ -555,22 +695,21 @@ sprawl that session.
   output readable. Port the existing registry as a
   no-behavior-change refactor first, then fill gaps.
 
-### uni-iobuf type model
+### uni-iobuf type model — [x] landed 2026-05-16
 
-`IOBuf` conflates borrowed (`!Send`) and owned (`Send`) buffers in
-one `!Send` type, so every cross-core use needs a manual
-`unsafe impl Send` plus a human-maintained "no `Borrowed` parts"
-invariant (item C's `RxInbox` is one such site). Spike + recommended
-design — split out a `Send`-by-derivation `OwnedIOBuf`, born from
-`wrap_owned` / `IOBufPool::alloc` so the RX path is *typed*
-`Chain<OwnedIOBuf>` rather than guarded by discipline; add a
-one-way `From<OwnedIOBuf> for IOBuf` widening at the app RX
-boundary; generic-ize the chain as `Chain<B>` — written up in
-[`uni-iobuf-type-model.md`](uni-iobuf-type-model.md). `into_owned`
-stays item A's `IOBuf → IOBuf` (it is a cross-*time* tool, not the
-cross-core gate). Land it **before item C**, so that item's
-`RxInbox` is `Send` by derivation rather than carrying an
-`unsafe impl Send` this work would later delete.
+`IOBuf` used to conflate borrowed (`!Send`) and owned (`Send`)
+buffers in one `!Send` type, so every cross-core use needed a
+manual `unsafe impl Send` plus a human-maintained "no `Borrowed`
+parts" invariant. The split landed (commits `fb755a3`, `409b5dd`,
+`d8b4c1e`): a `Send`-by-derivation `OwnedIOBuf`, born from
+`wrap_owned` / `IOBufPool::alloc`, so the RX path is *typed*
+`Chain<OwnedIOBuf>` rather than guarded by discipline; a one-way
+`From<OwnedIOBuf> for IOBuf` widening at the app RX boundary; the
+chain generic-ized as `Chain<B>`. Item C's `RxInbox<T: Send>`
+inherits the `Send` guarantee by derivation, with no `unsafe impl
+Send`. `into_owned` stayed item A's `IOBuf → IOBuf` (a cross-*time*
+tool, not the cross-core gate). Full write-up:
+[`uni-iobuf-type-model.md`](uni-iobuf-type-model.md).
 
 ### Operational
 
@@ -735,3 +874,96 @@ Next: item C (`RxInbox` holds `IOBufChain` — cross-core zero-copy),
 the natural follow-on now that the driver boundary yields owned
 chains — and the first item that starts *removing* memcpys, which
 recoups item B's ~2 %.
+
+### 2026-05-17 — Phase 2/3, item C: intrusive-node cross-core RX inbox ([x] **landed**)
+
+The Tier 2 cross-core RX inbox stops copying frame bytes. The
+pre-item-C inbox `memcpy`'d every distributed frame into a per-core
+`[u8; 1514]` ring slot; it now *moves* the received
+`Chain<OwnedIOBuf>` — the chain owns the device RX buffer, so the
+bytes never move. Copy #3 in the path table is eliminated.
+
+**An intrusive-node lock-free inbox, not a bounded ring.** A first
+attempt at item C — a bounded array ring with drop-on-overflow — was
+abandoned: benchmarking caught a severe Tier-2 multi-core RX
+regression (`get_tcp` 53k→4.7k, `download_64k`→0) from two bugs.
+(1) A delivered chain reposting its virtio descriptor on a
+non-polling core raced `poll_qp`'s `used()` on the shared descriptor
+free-list. (2) Tail-dropping on overflow discarded fresh TCP ACKs,
+stalling the sender's window. The landed design removes the overflow
+itself:
+
+- New [`kernel/src/rx_inbox.rs`](kernel/src/rx_inbox.rs) — generic,
+  `core`-only: `RxNode<T>` (an intrusive `next` link + payload
+  cell), `RxInbox` (per-core lock-free MPSC list — CAS-push,
+  `swap`-then-reverse-to-FIFO drain), and `RxNodePool<T, N>` (fixed
+  node pool; tagged-pointer Treiber free-list, ABA-immune like
+  `IOBufPool`).
+- One `RxNode` exists per pool slot, and a frame in flight pins
+  exactly one device RX buffer; the pool is sized (`RX_NODE_POOL_CAP`
+  = 512) ≥ the RX queue's buffer count. So the inbox **provably
+  never overflows** — no drop policy, no overflow counter, there is
+  no drop event to have.
+- `distribute_frame` moves a chain into a node and CAS-pushes it
+  onto the target core's inbox; `net_drain_cb` drains FIFO and runs
+  `net_receive`. `percpu.rs` pins the payload (`RxChain =
+  Chain<OwnedIOBuf>`) and the `static` pool.
+
+**Fix #1 — virtio `used()` / `add_buf` race.** Now that a delivered
+chain drops on a non-polling core, `virtio_rx_repost` → `add_buf`
+runs concurrently with `poll_qp`. Both mutate the shared descriptor
+free-list; `add_buf` was `rx_lock`-guarded, `used()` was not. The
+new `rx_used_locked` helper harvests each descriptor — and reads its
+buffer address — under `rx_lock`, releasing it before the per-frame
+callback (which may itself repost). Encapsulating it means an
+unlocked `used()` is not a reachable pattern in the RX path.
+
+**Node ownership — kernel pool, not driver-side 1:1.** The cleaner
+`sk_buff`-style design folds the node into per-buffer driver RX
+state (no pool, no free-list — node-supply *is* buffer-supply), but
+needs a `NicOps` RX-surface change across all three drivers and is
+dead weight + untested for the two gve drivers (which always run
+Tier 1). It is tracked as plan item K. The kernel pool keeps item C
+self-contained: no driver changes, gve untouched.
+
+The type-model split (`fb755a3` / `409b5dd` / `d8b4c1e`) landed
+first, so `RxInbox<T: Send>` is `Send` by derivation — no `unsafe
+impl Send`, no "no `Borrowed` parts" invariant.
+
+Verified: x86_64 + aarch64 unikernel builds; `iobuf_test`;
+`test_hvf`; new [`kernel:rx_inbox_test`](kernel/src/rx_inbox.rs) —
+host-native, two 8-thread stress tests (a tagged-free-list ABA
+hammer; a 1-distributor / N-consumer distribute→drain run asserting
+per-inbox FIFO order + zero node/payload leak).
+
+Perf — `test_hvf` is Tier 1 and structurally cannot exercise the
+cross-core inbox; QEMU (single virtio queue = Tier 2) is the check.
+Local, `main` vs item C, 10 s/workload, QEMU 3-core:
+
+| workload (QEMU 3c, Tier 2) | `main` | item C |
+|---|---|---|
+| `get_tcp` | 55.4 k | 57.2 k |
+| `echo_udp` | 73.3 k | 76.0 k |
+| `download_64k_tcp` | 3845 | 3680 |
+
+All at or above baseline — the abandoned attempt's 4.7 k / 0
+collapse is gone; HVF (Tier 1 control) stayed flat at 3c. Local
+QEMU 3c is **MTTCG** (each guest vCPU on its own host thread), so
+the lock-free inbox is exercised under genuine multi-threaded
+concurrency, not just emulation.
+
+GCE, item C, unikernel as a real GCE VM (gVNIC = Tier 1 / gve;
+item C touches no gve code — a no-regression check), 1/4/8 cores:
+
+| workload (GCE remote, Tier 1) | 1c | 4c | 8c |
+|---|---|---|---|
+| `get_tcp` | 191 k | 539 k | 858 k |
+| `echo_udp` | 323 k | 1.00 M | 1.72 M |
+| `get_tls_fresh` | 4.8 k | 10.4 k | 12.4 k |
+| `download_64k_tcp` | 31.7 k | 39.5 k | 39.0 k |
+
+Healthy gve scaling — the kernel's new `RX_NODE_POOL` static and
+the `net` dispatch changes leave the Tier-1 path untouched. (The
+nested-KVM GCE bench path — Tier 2 on real x86 hardware — hit a
+harness "not ready" snag this session; the Tier-2 cross-core inbox
+is covered by local QEMU 3c MTTCG + the `rx_inbox_test` stress.)
