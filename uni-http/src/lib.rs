@@ -117,6 +117,17 @@ pub struct Request {
     /// on the wire — the `BodyReader` handed to the handler will
     /// deliver exactly this many bytes.
     content_length: usize,
+    /// Set by the HTTP/1.1 parser when the request is malformed
+    /// in a way that must be answered with a hard `400 Bad
+    /// Request` + `Connection: close` instead of being dispatched
+    /// to a handler. The sole trigger today is a `Transfer-
+    /// Encoding: chunked` request — chunked framing is not yet
+    /// implemented (item E in docs/rx-path-optimizations.md), and
+    /// silently treating its body as length-0 is a request-
+    /// smuggling hole. `serve_conn` reads this flag right after
+    /// the parse. Always `false` for requests built by the
+    /// HTTP/3 frontend, which never sees chunked framing.
+    reject: bool,
 }
 
 impl Request {
@@ -128,6 +139,7 @@ impl Request {
             headers: [const { Header::new() }; 16],
             header_count: 0,
             content_length: 0,
+            reject: false,
         }
     }
 
@@ -203,6 +215,7 @@ impl Request {
         self.path_len = 0;
         self.header_count = 0;
         self.content_length = 0;
+        self.reject = false;
     }
 }
 
@@ -425,6 +438,21 @@ impl Response {
             status: 404,
             content_type: IOBuf::from_static(b"text/plain"),
             body: IOBuf::from_static(b"Not Found").into(),
+            extra_headers: [const { None }; MAX_EXTRA_HEADERS],
+        }
+    }
+
+    /// Build a `400 Bad Request`. Used by `serve_conn` to answer a
+    /// request the HTTP/1.1 parser flagged as malformed — today a
+    /// `Transfer-Encoding: chunked` request, which the parser
+    /// rejects rather than mis-frame (item E in
+    /// docs/rx-path-optimizations.md). `serve_conn` pairs this
+    /// response with `Connection: close`.
+    pub fn bad_request() -> Self {
+        Response {
+            status: 400,
+            content_type: IOBuf::from_static(b"text/plain"),
+            body: IOBuf::from_static(b"Bad Request").into(),
             extra_headers: [const { None }; MAX_EXTRA_HEADERS],
         }
     }
@@ -737,39 +765,60 @@ pub async fn serve_conn<S, H>(
             if body_start == 0 {
                 break; // need more bytes
             }
-            let want_close = match req.header(b"Connection") {
-                Some(v) => v.eq_ignore_ascii_case(b"close"),
-                None => false,
-            };
             let content_length = req.content_length;
 
-            // Construct the streaming body reader. `prebuf` is the
-            // body bytes already sitting in `buf` after the
-            // headers; the reader will draw stream bytes for any
-            // tail that didn't fit. Restrict the prebuf to
-            // body-only bytes (the slice may otherwise include
-            // the start of the next pipelined request).
-            let prebuf_end = (body_start + content_length).min(buf_len);
-            let body_drained_ok;
+            // A request the HTTP/1.1 parser flagged as malformed —
+            // today only a `Transfer-Encoding: chunked` request,
+            // which we don't frame yet (item E in
+            // docs/rx-path-optimizations.md). Answer it with a
+            // hard `400 Bad Request` and force the connection
+            // closed. Falling through to the keep-alive path would
+            // be a request-smuggling hole: the chunk-framed body
+            // bytes still sit in `buf` and the next loop iteration
+            // would misparse them as a second pipelined request.
+            // So skip the handler and the `BodyReader` entirely
+            // and drop into the shared send path below with
+            // `want_close` forced on — that emits `Connection:
+            // close` and `return`s without touching the
+            // post-header bytes.
+            let want_close;
             let resp;
-            {
-                let prebuf = &buf[body_start..prebuf_end];
-                let mut body = BodyReader::new(&mut stream, prebuf, content_length);
-                resp = (&*handler)(&req, &mut body).await;
-                // Drain any leftover body bytes the handler didn't
-                // consume. Keep-alive contract requires the
-                // connection to be positioned at the start of the
-                // next request before we ship the response;
-                // skipping bytes mid-body would let them be
-                // mis-parsed as the next request's bytes. If the
-                // handler asked for `Connection: close` we tear
-                // down without draining (the conn is going away
-                // anyway).
-                body_drained_ok = want_close || body.is_empty()
-                    || body.discard().await.is_ok();
-            }
-            if !body_drained_ok {
-                return;
+            if req.reject {
+                resp = Response::bad_request();
+                want_close = true;
+            } else {
+                want_close = match req.header(b"Connection") {
+                    Some(v) => v.eq_ignore_ascii_case(b"close"),
+                    None => false,
+                };
+
+                // Construct the streaming body reader. `prebuf` is
+                // the body bytes already sitting in `buf` after the
+                // headers; the reader will draw stream bytes for
+                // any tail that didn't fit. Restrict the prebuf to
+                // body-only bytes (the slice may otherwise include
+                // the start of the next pipelined request).
+                let prebuf_end = (body_start + content_length).min(buf_len);
+                let body_drained_ok;
+                {
+                    let prebuf = &buf[body_start..prebuf_end];
+                    let mut body = BodyReader::new(&mut stream, prebuf, content_length);
+                    resp = (&*handler)(&req, &mut body).await;
+                    // Drain any leftover body bytes the handler
+                    // didn't consume. Keep-alive contract requires
+                    // the connection to be positioned at the start
+                    // of the next request before we ship the
+                    // response; skipping bytes mid-body would let
+                    // them be mis-parsed as the next request's
+                    // bytes. If the handler asked for
+                    // `Connection: close` we tear down without
+                    // draining (the conn is going away anyway).
+                    body_drained_ok = want_close || body.is_empty()
+                        || body.discard().await.is_ok();
+                }
+                if !body_drained_ok {
+                    return;
+                }
             }
 
             // Wrap the per-conn `header_storage` array as an
@@ -997,6 +1046,23 @@ fn parse_request_with_state(data: &[u8], req: &mut Request, state: &mut ParserSt
         None => 0,
     };
 
+    // Reject `Transfer-Encoding: chunked`. Chunked framing is not
+    // implemented yet (deferred to the Phase 4 parser refresh);
+    // ignoring the header — which is what the parser did before
+    // item E — silently treats the chunk-framed body as a
+    // length-0 body, leaving the chunk bytes in the caller's
+    // buffer to be misparsed as the next pipelined request: an
+    // HTTP request-smuggling vector. Flag it so `serve_conn`
+    // answers `400 Bad Request` + `Connection: close` and reads
+    // no body. `req.header` already matches the header *name*
+    // case-insensitively; `transfer_encoding_is_chunked` matches
+    // `chunked` case-insensitively anywhere in the comma-separated
+    // transfer-coding list (e.g. `gzip, chunked`).
+    req.reject = match req.header(b"Transfer-Encoding") {
+        Some(te) => transfer_encoding_is_chunked(te),
+        None => false,
+    };
+
     body_start
 }
 
@@ -1109,6 +1175,87 @@ mod host_port_tests {
     }
 }
 
+/// Item E — the request parser must flag a `Transfer-Encoding:
+/// chunked` request for a `400` rejection rather than silently
+/// mis-frame its body (an HTTP request-smuggling vector). These
+/// tests pin both the value-matching helper and the parser flag.
+#[cfg(test)]
+mod chunked_reject_tests {
+    use super::{parse_request_with_state, transfer_encoding_is_chunked, ParserState, Request};
+
+    /// Parse one request out of `raw` and report `(body_start,
+    /// reject)` — `body_start` is the parser's return value (0
+    /// means "headers incomplete, need more bytes"), `reject` is
+    /// the flag `serve_conn` turns into a 400.
+    fn parse(raw: &[u8]) -> (usize, bool) {
+        let mut req = Request::new();
+        let mut state = ParserState::default();
+        let body_start = parse_request_with_state(raw, &mut req, &mut state);
+        (body_start, req.reject)
+    }
+
+    #[test]
+    fn helper_matches_chunked_case_insensitively() {
+        assert!(transfer_encoding_is_chunked(b"chunked"));
+        assert!(transfer_encoding_is_chunked(b"Chunked"));
+        assert!(transfer_encoding_is_chunked(b"CHUNKED"));
+    }
+
+    #[test]
+    fn helper_matches_chunked_anywhere_in_the_coding_list() {
+        assert!(transfer_encoding_is_chunked(b"gzip, chunked"));
+        assert!(transfer_encoding_is_chunked(b"chunked, gzip"));
+        assert!(transfer_encoding_is_chunked(b"gzip , chunked , deflate"));
+    }
+
+    #[test]
+    fn helper_ignores_non_chunked_codings() {
+        assert!(!transfer_encoding_is_chunked(b""));
+        assert!(!transfer_encoding_is_chunked(b"gzip"));
+        assert!(!transfer_encoding_is_chunked(b"identity"));
+    }
+
+    #[test]
+    fn chunked_request_is_flagged_for_rejection() {
+        let raw = b"POST /upload HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        let (body_start, reject) = parse(raw);
+        assert!(reject, "a chunked-TE request must be flagged for a 400");
+        assert!(body_start > 0, "headers are complete, body_start must be set");
+    }
+
+    #[test]
+    fn transfer_encoding_header_name_match_is_case_insensitive() {
+        let raw = b"POST / HTTP/1.1\r\ntRaNsFeR-eNcOdInG: chunked\r\n\r\n";
+        let (_, reject) = parse(raw);
+        assert!(reject);
+    }
+
+    #[test]
+    fn chunked_in_a_coding_list_is_flagged() {
+        let raw = b"POST / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n";
+        let (_, reject) = parse(raw);
+        assert!(reject);
+    }
+
+    #[test]
+    fn plain_content_length_request_is_not_flagged() {
+        let raw = b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello";
+        let (body_start, reject) = parse(raw);
+        assert!(!reject, "a normal Content-Length request must not be flagged");
+        assert!(body_start > 0);
+    }
+
+    #[test]
+    fn incomplete_headers_are_not_flagged() {
+        // No CRLF-CRLF terminator yet: the parser returns 0
+        // ("need more bytes") before it inspects any header.
+        let raw = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n";
+        let (body_start, reject) = parse(raw);
+        assert_eq!(body_start, 0, "incomplete headers => need more bytes");
+        assert!(!reject);
+    }
+}
+
 /// Write the decimal digits of a 3-digit HTTP status code into `out`,
 /// returning the number of bytes written. Limited to 100..=999, which
 /// is the entire HTTP status range; anything outside falls back to a
@@ -1169,6 +1316,20 @@ fn parse_usize(data: &[u8]) -> usize {
         }
     }
     n
+}
+
+/// True if a `Transfer-Encoding` header value names `chunked` as
+/// one of its transfer codings. The value is a comma-separated
+/// list (RFC 7230 §3.3.1); each entry is compared case-
+/// insensitively with its surrounding optional whitespace
+/// trimmed, so `chunked`, `Chunked`, and `gzip, chunked` all
+/// return `true` while `gzip` or `identity` return `false`. The
+/// caller has already matched the header *name* case-
+/// insensitively via `Request::header`.
+fn transfer_encoding_is_chunked(value: &[u8]) -> bool {
+    value
+        .split(|&b| b == b',')
+        .any(|coding| coding.trim_ascii().eq_ignore_ascii_case(b"chunked"))
 }
 
 
