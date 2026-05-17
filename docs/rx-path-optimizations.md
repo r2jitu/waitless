@@ -575,6 +575,32 @@ backpressure. CPU-bound at ChaCha20-Poly1305 decrypt rate
   this plan). Substantial parser rewrite; lives with the
   chunked-encoding support (item E rejects it; a real
   implementation goes in this Phase 4 work).
+- **In-place TLS RX decrypt** (zero-copy `into_owned()` on the
+  TLS path): item G's `TlsStream::recv_chunk` surfaces a
+  `Borrowed` view into `pt_buf` — `data()` is zero copy, but
+  `into_owned()` costs one memcpy (`Borrowed` → `Heap`), where
+  the TCP path's `ExternalOwned` chunk makes `into_owned()` free.
+  Closing the gap means decrypting ChaCha20-Poly1305 *in place*
+  into the device RX buffers that carried the ciphertext and
+  surfacing a `Chain<ExternalOwned>` plaintext chunk. The crypto
+  allows it — ChaCha20 is a stream cipher and the TX path already
+  seals in place — but TLS records don't align to device buffers
+  (a 16 KiB record spans ~11 MTU buffers) and AEAD is
+  all-or-nothing (the Poly1305 tag must verify over the whole
+  record before any plaintext byte is released), so the record
+  layer must reassemble first. Today reassembly copies into
+  `cipher_buf`; the zero-copy form is chain-threaded reassembly +
+  in-place AEAD across a discontiguous chain + per-fragment
+  `narrow` + content-type/padding strip — a `uni-tls` record-layer
+  rearchitecture, well past item G's scope. A single-device-buffer
+  fast path (a record that fits in one MTU buffer → decrypt in
+  place there) is the tractable partial win. Needs **no API
+  change**: `recv_chunk` keeps returning `RecvChunkGuard`, only
+  the wrapped payload changes (`Borrowed` → `Chain<ExternalOwned>`)
+  and `into_owned()` drops from 1 copy to 0 — the guard is the
+  stable façade that makes this a non-breaking evolution. Cost to
+  weigh: a held plaintext chunk then pins ~11 NIC buffers (the
+  item-L device-pool-pressure concern).
 - **Per-conn `rx_ring` as IOBufs**: the math forbids it
   (1500 conn × 11 bufs/conn-of-window = 16 500 bufs/core vs the
   4 096-buf DQO pool across all qps). Stays `Box<[u8; 16384]>`.
