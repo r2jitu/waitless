@@ -232,10 +232,14 @@ AEAD.
   refactor must not regress before more changes pile on).
 
 ### E. Reject `Transfer-Encoding: chunked` with 400
-- **Status**: [ ]
-- **Where**: HTTP/1.1 parser in
-  [`uni-http/src/lib.rs:810+`](uni-http/src/lib.rs#L810)
-  (`parse_request_with_state`).
+- **Status**: [x] landed 2026-05-17 — commit `8c2cb69` (the guard
+  + unit tests), `b98b499` (the `rust_test` target it needed).
+  See the progress-log entry below.
+- **Where**: [`uni-http/src/lib.rs`](uni-http/src/lib.rs) —
+  `parse_request_with_state` sets the new `Request.reject` flag
+  via the `transfer_encoding_is_chunked` helper; `serve_conn`
+  short-circuits a flagged request to `Response::bad_request()` +
+  `Connection: close`.
 - **What**: header parser detects `Transfer-Encoding: chunked`
   and short-circuits to a 400 response + `Connection: close`.
   Today the parser silently treats body as length-0 then
@@ -1133,3 +1137,64 @@ identical copy count, and the chain drops on the same core in the
 same poll cycle, one stack frame deeper — is the real basis for
 perf-neutrality. The **GCE gve bench checkpoint the plan mandates
 after D is the authoritative ±0 % gate and is still pending.**
+
+### 2026-05-17 — Phase 2/3, item E: reject chunked `Transfer-Encoding` with 400 ([x] **landed**)
+
+Security hardening, not perf — zero per-byte path touched, no GCE
+checkpoint needed.
+
+**The hole.** `parse_request_with_state` only ever read
+`Content-Length` to size the request body. A `Transfer-Encoding:
+chunked` request carries no `Content-Length`, so the parser sized
+the body at 0 — and `serve_conn`'s keep-alive loop then re-parsed
+the chunk-framed body bytes (`5\r\nhello\r\n0\r\n\r\n`) still
+sitting in its buffer as a *second* pipelined request. That
+request/response desync is the HTTP-request-smuggling primitive.
+
+**The guard.** The parser now detects a `Transfer-Encoding`
+header that lists `chunked` and sets a new `Request.reject` flag.
+`Request::header` already matches the header *name* case-
+insensitively; the new `transfer_encoding_is_chunked` helper
+splits the value on commas and matches `chunked` against each
+trimmed coding case-insensitively, so `chunked`, `Chunked`, and
+`gzip, chunked` all trip it. `serve_conn` reads the flag right
+after the parse and, instead of building a `BodyReader` and
+calling the handler, answers `400 Bad Request` with
+`Response::bad_request()` and forces `want_close` — which routes
+through the *existing* response-send path (so `Connection: close`
+falls out of the `!want_close` argument to
+`write_response_into_iobuf`) and `return`s without parsing a body
+or any further pipelined request on that connection.
+
+**Why a `Request` flag rather than a parser return code.**
+`parse_request_with_state` returns `body_start: usize`, with `0`
+already meaning "headers incomplete, need more bytes". A reject
+can't reuse `0`, and the parser's job is to produce a `Request`,
+not a `Response` — so the third outcome rides on the `Request`.
+The flag also keeps the HTTP/3 frontend untouched: it builds its
+`Request` via `set_path` / `push_header` and never sees chunked
+framing, so `reject` stays `false` there by construction.
+
+Proper chunked decoding is still deferred to Phase 4 (HTTP parser
+refresh) — item E is only the smuggling guard.
+
+**Test target.** `uni-http` had a `#[cfg(test)]` module but no
+`rust_test` target, so its tests had never run. A separate
+commit (`b98b499`) added `//uni-http:uni_http_test` and flipped
+the crate to the `#![cfg_attr(all(not(test), not(feature =
+"std")), no_std)]` form (mirroring `//uni-http3`). Item E adds
+eight tests there — the `transfer_encoding_is_chunked` helper
+(case-insensitivity, coding-list membership, non-chunked
+codings) and the parser flag end-to-end (chunked request flagged,
+case-insensitive header name, `gzip, chunked` list, plain
+`Content-Length` *not* flagged, incomplete headers *not*
+flagged).
+
+Verified: `bazel build //apps/webserver:webserver_qemu_x86_64`;
+`bazel build //apps/webserver:webserver.elf
+--platforms=//bazel/platforms:aarch64_unikernel`;
+`bazel test //uni-http:uni_http_test` (13 tests — 8 new + the 5
+now-running `host_port_tests`); `bazel test
+//apps/webserver:test_hvf` (TCP + TLS round-trips, 30-conn
+burst — confirms the `serve_conn` restructure left the
+non-rejected path unchanged).
