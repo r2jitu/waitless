@@ -48,7 +48,7 @@
 // `no_std` and dep-less so it can be pulled into the kernel proper
 // (driver layers) without dragging the runtime in.
 
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 #![allow(dead_code)]
 
 extern crate alloc;
@@ -700,7 +700,6 @@ mod tests {
     /// separate thread.
     mod mock_nic_rx {
         use crate::{Chain, IOBufDropFn, OwnedIOBuf};
-        extern crate std;
         use core::ptr::NonNull;
         use std::boxed::Box;
         use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -910,7 +909,6 @@ mod tests {
     fn external_buf_drop_runs_callback() {
         use core::ptr::NonNull;
         use core::sync::atomic::{AtomicBool, Ordering};
-        extern crate std;
         use std::sync::Arc;
 
         let released = Arc::new(AtomicBool::new(false));
@@ -1055,7 +1053,6 @@ mod tests {
     fn into_owned_external_is_noop_and_drops_once() {
         use core::ptr::NonNull;
         use core::sync::atomic::{AtomicBool, Ordering};
-        extern crate std;
         use std::sync::Arc;
 
         let released = Arc::new(AtomicBool::new(false));
@@ -1110,7 +1107,6 @@ mod tests {
     fn from_owned_iobuf_widens_preserving_bytes_and_drop_fn() {
         use core::ptr::NonNull;
         use core::sync::atomic::{AtomicBool, Ordering};
-        extern crate std;
         use std::sync::Arc;
 
         let released = Arc::new(AtomicBool::new(false));
@@ -1157,7 +1153,6 @@ mod tests {
     fn owned_iobuf_narrow_clamps_window_keeps_backing() {
         use core::ptr::NonNull;
         use core::sync::atomic::{AtomicU32, Ordering};
-        extern crate std;
         use std::sync::Arc;
 
         // cb records the capacity it was handed at drop time.
