@@ -82,7 +82,11 @@ and BodyReader refill) are the target.
 | 4 | BodyReader from buffered slice | uni-http (Phase 1) | 0 | Borrowed view of the accumulated Vec |
 
 QUIC's body-buffering is out of scope for this plan (would OOM on
-a 100 MB POST). See item L for the follow-on plan.
+a 100 MB POST) — the H3 `DATA` reassembly is a separate HTTP/3-layer
+effort (see "HTTP/3 streaming body" under Follow-ups). **Item L**
+does cover the UDP RX path up to that point: it removes the
+*datagram*-delivery copy (NIC → per-bind inbox) that precedes QUIC
+AEAD.
 
 ## Items
 
@@ -202,13 +206,17 @@ a 100 MB POST). See item L for the follow-on plan.
   N-consumer distribute→drain run asserting per-inbox FIFO order +
   no node/payload leak.
 
-### D. `tcp_receive` takes `IOBufChain`
-- **Status**: [ ]
-- **Where**: [`net/src/tcp.rs:1398`](net/src/tcp.rs#L1398) —
-  signature change. Walk chain in body; for each part:
-  * Fast path (parked recv): `ptr::copy_nonoverlapping` from part's
-    `data()` into the registered user buf. Drop IOBuf.
-  * Slow path: `rx_ring_push(part.data())`. Drop IOBuf.
+### D. `tcp_receive` takes a `Chain<OwnedIOBuf>`
+- **Status**: [x] landed 2026-05-17 — commits `bdd15ce` (uni-iobuf
+  `OwnedIOBuf::narrow`/`consume`/`trim_end`), `e940a10` (net
+  plumbing). See the progress-log entry below for the design
+  decisions.
+- **Where**: [`net/src/tcp.rs`](net/src/tcp.rs) `tcp_receive`
+  (signature + chain-walking payload delivery);
+  [`net/src/lib.rs`](net/src/lib.rs) `net_receive` /
+  `tcp_receive_segment` / `ipv6_receive_frame` (chain-as-unit
+  dispatch + narrow-to-segment); [`uni-iobuf/src/lib.rs`](uni-iobuf/src/lib.rs)
+  `OwnedIOBuf::narrow`.
 - **What**: per-conn `rx_ring` stays `Box<[u8; 16384]>` — the
   1500-conn × 11-bufs/conn math forbids holding IOBufs in the
   ring. This commit is plumbing: same copy count, IOBuf-typed
@@ -384,12 +392,74 @@ a 100 MB POST). See item L for the follow-on plan.
 - **Tests**: `rx_inbox_test` (the inbox half is unchanged); GCE
   bench before/after on the kvm env (Tier 2 on real hardware).
 
+### L. UDP datagram inbox — IOBuf-carrying slot
+
+Items A–K are the **TCP/TLS** RX path. This is the **UDP** path —
+the equivalent move-not-copy step for the per-bind datagram inbox.
+
+- **Status**: [ ]
+- **Where**:
+  * [`net/src/udp.rs`](net/src/udp.rs) — `udp_receive` signature
+    `&[u8]` → `Chain<OwnedIOBuf>` (the UDP-datagram-narrowed chain),
+    mirroring item D's `tcp_receive`. `net::net_receive` grows a
+    `udp_receive_segment` helper alongside `tcp_receive_segment`.
+  * [`uni-runtime/src/net/udp.rs`](uni-runtime/src/net/udp.rs) —
+    `deliver_udp` takes an owned `OwnedIOBuf` (datagram body), not
+    `&[u8]`; the `Datagram` inbox slot's inline `[u8; 1500]` becomes
+    an `Option<OwnedIOBuf>`; `WorkerInbox::try_push` *moves* the buf
+    in instead of `copy_from_slice`.
+- **What**: undo a documented regression. The `Datagram` slot's own
+  comment records that it *used* to hold an `Option<IOBuf>` and move
+  a driver descriptor straight in — "that shape is gone with the
+  &[u8] driver callback." Item B restored the `Chain<OwnedIOBuf>`
+  driver callback, so the precondition is back. This is the UDP
+  analogue of item C (move, don't copy) for the per-bind inbox: it
+  eliminates the up-to-1500-byte `try_push` memcpy. The consumer
+  side is already zero-copy-capable — `recv_inplace` / `pop_with`
+  read the slot in place; `recv_from` / `pop_into` still copy out,
+  the caller's choice of API, not a structural copy.
+- **Design question — device-buffer pool pressure**: an *occupied*
+  inbox slot now pins a device RX buffer instead of holding a copy.
+  Total pinned ≤ Σ capacities of occupied inboxes. Server binds
+  (small set of declared ports) and request-response ephemerals
+  (1–2 in flight, 8-deep) are fine; a pathological many-ephemeral
+  backlog could pin enough buffers to pressure the DQO/virtio pool.
+  Resolve in the item: cap total pinned bufs and fall back to
+  copy-into-heap (`into_owned`) past the cap. (This is the UDP
+  echo of item D's "the math forbids IOBufs in the TCP ring" — for
+  UDP the per-bind depth is small, so it is mostly affordable, but
+  the cap is the guard.)
+- **Memory note**: an *empty* slot shrinks from 1508 B to a ~48 B
+  `Option<OwnedIOBuf>` handle — at 5 000 ephemeral binds × 8 slots
+  the doc-noted "~60 MB inbox memory" cost mostly evaporates (it
+  reappears only as device-buffer pins under genuine backlog).
+- **QUIC**: QUIC/H3 datagrams traverse the same `WorkerInbox`, so L
+  delivers the ciphertext datagram to the QUIC AEAD with no copy.
+  The post-AEAD H3 `DATA`-frame reassembly (whole-body buffering
+  into `data: Vec<u8>`) is a separate HTTP/3-layer effort — see
+  "HTTP/3 streaming body" under Follow-ups.
+- **Win**: −1 memcpy per UDP datagram on the delivery boundary
+  (≤ 1500 B each). Benefits `echo_udp`, gateway / DNS / NTP flows,
+  and QUIC datagram delivery.
+- **Effort**: medium. ~150 LOC across `net/src/udp.rs` +
+  `uni-runtime/src/net/udp.rs`; the `udp_receive` / `deliver_udp` /
+  `try_push` / slot-type changes land as one atomic signature chain.
+- **Risk**: low–medium. The SPSC inbox ring shape is unchanged; only
+  the slot payload type changes. `test_hvf` exercises UDP echo; the
+  pool-pressure fallback wants a unit test.
+- **Tests**: UDP echo round-trips in `test_hvf`; unit test for the
+  pinned-buffer cap fallback; GCE `echo_udp` bench (expect ±0% —
+  plumbing, like item D).
+- **Sequencing**: independent of the TCP items D–J — a different
+  data structure (per-bind `WorkerInbox`, not the per-conn TCP
+  ring). Needs only item B; can land any time after it.
+
 ## Recommended sequence
 
-A → B → C → D → E → F → G → H → I → J. K is independent — it
-supersedes item C's kernel node pool and can land any time after
-C; it is sequenced last only because of its driver-wide blast
-radius.
+A → B → C → D → E → F → G → H → I → J. K and L are independent —
+K supersedes item C's kernel node pool and can land any time after
+C (sequenced last only for its driver-wide blast radius); L is the
+UDP-side counterpart of items C–D and needs only B.
 
 A is pure additions (infrastructure). B is the trait change that
 forces all drivers + net dispatch to land atomically. C through
@@ -967,3 +1037,99 @@ the `net` dispatch changes leave the Tier-1 path untouched. (The
 nested-KVM GCE bench path — Tier 2 on real x86 hardware — hit a
 harness "not ready" snag this session; the Tier-2 cross-core inbox
 is covered by local QEMU 3c MTTCG + the `rx_inbox_test` stress.)
+
+### 2026-05-17 — Phase 2/3, item D: `tcp_receive` takes a `Chain<OwnedIOBuf>` ([x] **landed**)
+
+`tcp_receive`'s entry signature changed from a borrowed `&[u8]`
+segment to an owned `Chain<OwnedIOBuf>`. Pure plumbing — the per-conn
+`rx_ring` stays `Box<[u8; 16384]>` (the 1500-conn × 11-bufs/conn math
+forbids IOBufs in the ring), so the copy count is unchanged. The
+point is an IOBuf-typed RX input so items F–H can later thread it to
+the application zero-copy.
+
+**Design decision 1 — how the TCP segment is represented.** The
+chain that reaches `net_receive` is the whole Ethernet frame (one
+`OwnedIOBuf` spanning eth + IP + TCP). `tcp_receive` wants just the
+TCP segment. Two options were on the table: (A) narrow the
+`OwnedIOBuf`'s window to the segment, or (B) pass the frame chain +
+a payload-offset parameter. **Chose (A).** `net_receive` parses
+eth + IP from the borrowed `data()`, computes the L4 segment's
+`(offset, len)` by *pointer arithmetic* against `pkt.payload`
+(`pkt.payload.as_ptr() - first.data().as_ptr()`), then
+`narrow()`s part 0 to exactly that range and moves the chain into
+`tcp_receive`. The `Chain<OwnedIOBuf>` type then *means* "the TCP
+segment" — no offset travels alongside it, and items F–H will
+`consume()` further past the TCP header to expose just the body.
+Pointer arithmetic (not an `ETH + IP_HDR` constant) is robust across
+IPv4 header options *and* IPv6 extension headers. This is also
+consistent with the "Fuse the Tier-2 classify parse" follow-up:
+once that lands, the carried L4 offset *is* the narrow.
+
+**Why `narrow` (offset *and* length), not a bare `consume`.** The
+device delivers the full wire frame *including ethernet trailing
+padding* — a 54-byte pure ACK is padded to 60. `tcp_receive` derives
+`payload_len` from the segment length; a chain that still carried
+6 padding bytes would make a pure ACK look like a 6-byte payload and
+desync `rcv_nxt`. Today `pkt.payload` is IP-total-length-trimmed;
+`narrow(l4_off, l4_len)` reproduces that trim exactly. New
+`OwnedIOBuf::narrow` / `consume` / `trim_end` (forwarders to the
+existing `ExternalOwned` / `HeapStorage` offset arithmetic; landed
+in the uni-iobuf commit) — narrowing shifts only `offset`/`len`, so
+`ExternalOwned`'s `base`/`capacity` are untouched and the drop
+callback still reposts the *whole* device buffer.
+
+**Design decision 2 — one chain is one frame; treat it as a unit.**
+The first cut of this work had `net_receive` `pop_front`-split the
+chain and re-dispatch each part as its own frame. That is **wrong
+for RSC**: the driver invokes the RX callback once per frame, so a
+chain is *one* frame — a single device buffer today, or (item I) a
+hardware-coalesced super-segment spanning several buffers, where
+parts 1..N are raw TCP payload continuation, not framed packets.
+`net_receive` now parses the L2/L3/L4 headers from part 0 and hands
+the *whole* narrowed chain to `tcp_receive`, which walks every part
+for payload. This makes `net_receive` consistent with
+`distribute_frame` (which the doc already noted treats the chain as
+one flow), and removes a latent item-I landmine. `net_receive_frame`
+folded into `net_receive` (no per-part loop left). The remaining
+multi-part work is genuinely item I's: when it builds multi-part
+chains it must also refresh the chain's cached `total_len` after the
+part-0 narrow (`Chain::shrink_total_len`) — a `Single`-repr chain
+computes `total_len` live, so item D needs nothing there.
+
+**Design decision 3 — the RX path stays `OwnedIOBuf`-typed; no
+widening to `IOBuf` at the target core.** Per the uni-iobuf
+type-model doc, `From<OwnedIOBuf> for IOBuf` is applied **per-chunk
+at the app RX API boundary** (`BodyReader`, items F/H), not eagerly
+to a `Chain` — an eager widen is an O(parts) re-tag + `VecDeque`
+realloc on the hot path, and it would discard the `Send`-by-
+derivation guarantee for nothing. `tcp_receive` needs only the read
+surface (`data` to copy into the ring) plus `narrow` — all of which
+`OwnedIOBuf` now has. The "rich" `IOBuf`-only surface
+(`Borrowed`-mixing, `IOBufWriter`, `prepend`/`append`) is TX-path
+and app-boundary, not RX-consume.
+
+**UDP left on `&[u8]`.** Item D is TCP-focused. `udp_receive` keeps
+its borrowed-slice shape; converting it with no consumer would be
+dead plumbing. The genuine UDP RX optimization — restoring the
+IOBuf-carrying datagram inbox — is now tracked as **item L** (added
+this session); it picks up the `udp_receive` signature change there.
+
+Verified: `bazel build //apps/webserver:webserver_qemu_x86_64`;
+`bazel build //apps/webserver:webserver.elf
+--platforms=//bazel/platforms:aarch64_unikernel`;
+`bazel test //uni-iobuf:iobuf_test` (+1 test —
+`owned_iobuf_narrow_clamps_window_keeps_backing`, asserting a
+narrowed buffer still reposts its original `(base, capacity)`);
+`bazel test //apps/webserver:test_hvf` (TCP + TLS round-trips under
+the 30-conn burst).
+
+Local 3-run-median bench (hvf + QEMU, 1c/3c) shows no regression
+above the host noise floor. `echo_udp` — whose code path item D does
+*not* touch — varied ~±15 % run-to-run and so calibrates that floor;
+every TCP/TLS workload sits inside it (`get_tcp` HVF 1c 191 k / 3c
+189 k, QEMU 1c 44 k / 3c 55 k; `download_64k_tcp` and `upload_32k_*`
+flat against the item-C numbers). The architectural guarantee —
+identical copy count, and the chain drops on the same core in the
+same poll cycle, one stack frame deeper — is the real basis for
+perf-neutrality. The **GCE gve bench checkpoint the plan mandates
+after D is the authoritative ±0 % gate and is still pending.**
