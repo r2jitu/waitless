@@ -290,12 +290,58 @@ deploy-gcloud.sh ───────► unikernel-webserver   (build a GCE cus
 - **SPOT preemption.** The VMs are preemptible — fine for iteration,
   but a run can be interrupted. Set `UNIKERNEL_GCE_PREEMPTIBLE=0` for
   an on-demand VM when a clean multi-point sweep matters.
-- **`SKIP (not ready)` on `gcp-bench.sh --env kvm`.** The nested-KVM
-  path has been seen to fail readiness on every workload — root cause
-  undiagnosed; the same x86_64 ELF boots and serves under local QEMU
-  and as a real GCE VM. If you hit it, the Tier-2 path is still
-  covered by local `--env qemu` at multiple cores (MTTCG gives real
-  multi-threaded concurrency).
+- **`SKIP (not ready)` on `gcp-bench.sh --env kvm` — nested
+  virtualization on `kvm-vm`.** *Diagnosed + fixed 2026-05-18.* `kvm-vm`
+  had GCE's per-instance nested-virt opt-in unset
+  (`advancedMachineFeatures.enableNestedVirtualization` absent), so its
+  guest CPU exposed no `vmx` flag, `/dev/kvm` did not exist, and
+  `kvm_intel` / `vhost_net` never loaded. Every `-accel kvm` QEMU launch
+  — `bench.py`'s `KvmEnv`, and equally `gcp.sh run`/`serve`/`test` —
+  died at accelerator init with `Could not access KVM kernel module: No
+  such file or directory`, exiting (code 1) *before* it opened the
+  `-serial file:` chardev. No `/tmp/bench_<port>.log` was ever written,
+  so there was no guest serial console to inspect — and `KvmEnv.start()`
+  runs QEMU with `stderr=DEVNULL`, which discarded the message too. The
+  harness then polled `http://10.20.30.10/health` for 20 s, got nothing,
+  and after 3 strikes printed `SKIP (not ready)`. (The two paths that
+  *do* work use no nested KVM: local `--env qemu` is TCG, and the real
+  `unikernel-webserver` GCE VM is itself the non-nested guest.)
+
+  Nested virtualization is now **enabled** on `kvm-vm` and `--env kvm`
+  produces real, core-scaling numbers again (`c3-highcpu-8` supports
+  it). To re-apply it if `kvm-vm` is recreated: the opt-in must be set
+  while the VM is stopped, and `gcloud compute instances update` has
+  *no* nested-virt flag (SDK 566) — so either set it at create time
+  (`gcloud compute instances create … --enable-nested-virtualization`),
+  or patch the stopped instance through the Compute API:
+
+  ```sh
+  gcloud compute instances stop kvm-vm --zone=us-west1-c
+  U=https://compute.googleapis.com/compute/v1/projects/unikernel-dev/zones/us-west1-c/instances/kvm-vm
+  T=$(gcloud auth print-access-token)
+  curl -s -H "Authorization: Bearer $T" "$U" > /tmp/kvm-vm.json
+  python3 - <<'PY'
+  import json
+  d = json.load(open("/tmp/kvm-vm.json"))
+  d.setdefault("advancedMachineFeatures", {})["enableNestedVirtualization"] = True
+  json.dump(d, open("/tmp/kvm-vm.json", "w"))
+  PY
+  curl -s -X PUT -H "Authorization: Bearer $T" \
+       -H "Content-Type: application/json" --data @/tmp/kvm-vm.json "$U"
+  gcloud compute instances start kvm-vm --zone=us-west1-c
+  ```
+
+  Confirm with `ls /dev/kvm` and `grep -c vmx /proc/cpuinfo` on the VM.
+  Note `--env kvm` is a *redundant* measurement regardless: the Tier-2
+  single-queue RX path it exercises is also covered by local `--env
+  qemu` at multiple cores (MTTCG gives genuine multi-threaded
+  concurrency).
+
+  One caveat surfaced once the path was restored: TCP **upload**
+  workloads (`upload_*`) stall on `--env kvm` (~1.3 s/req, throughput
+  near zero), while `get_*` and `echo_udp` are healthy and scale across
+  cores. That is a separate, still-undiagnosed issue in the tap +
+  vhost-net RX path — not the nested-virt problem above.
 - **`--cpu max` / AVX.** The p256 + chacha20poly1305 crates emit AVX;
   QEMU's default `qemu64` lacks it and faults at TLS init. Every
   bench-driven QEMU invocation passes `-cpu max` (or `-cpu host` under
