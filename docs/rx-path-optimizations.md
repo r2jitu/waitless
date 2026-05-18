@@ -2073,3 +2073,65 @@ Verified: `bazel build //apps/webserver:webserver_qemu_x86_64`;
 --platforms=//bazel/platforms:aarch64_unikernel`; `bazel test
 //apps/webserver:test_hvf`; `bazel test //net:ipv6_test
 //net:protocol_tests`.
+
+### 2026-05-18 — Follow-up: `net` RX-pipeline refactor + IPv6 Tier-2 distribution fix ([x] **landed** — commits `c22e84d`, `a0a2f92`)
+
+`net/src/lib.rs` had grown to 1028 lines holding four unrelated
+concerns (backend wiring, the Tier 1/2 poll scheduler, the receive
+pipeline, the IPv6 control plane), and the receive path itself was
+*two* entangled pipelines: the Tier-2 distributor (`distribute_frame
+→ classify_for_distribution`) looped **back** into the Tier-1 entry
+(`net_receive`) for ARP and IPv6 via an `InlineReparse` verdict — a
+call cycle, not a layered stack. The consequence was a latent bug.
+
+**Pass 1 — module split (`c22e84d`).** Pure code motion: `lib.rs`
+(1028 → 113 lines) keeps the crate root (backend vtables,
+`init_stack`, bring-up, `pub use`); `sched` owns the poll scheduler;
+`rx` the receive pipeline; `ipv6_nd` the IPv6 control plane. No
+behaviour change — it makes pass 2 a pure-logic diff.
+
+**Pass 2 — pipeline merge (`a0a2f92`).** The receive path collapses
+to one shape, three verbs: `classify` (eth + L3 parse, once, IPv4
+and IPv6 alike → `Classified::{Arp, Ip(ParsedL3), Drop}`, pure),
+`owner` (Tier-2-only flow-hash → owning core), `deliver` (snoop +
+L4 dispatch on the owning core). `net_receive` and `distribute_frame`
+become thin tier adapters; `classify_for_distribution`,
+`net_receive_parsed`, `dispatch_l4`, `ipv6_receive_frame`, and the
+`InlineReparse` verdict all fold away. The cycle is gone.
+
+**The bug this fixes.** Under `InlineReparse`, an IPv6 TCP segment in
+Tier 2 ran on whatever core was the current rotating distributor —
+*not* the flow-hashed owning core. `tcp_receive`'s per-core
+connection pool would then miss any segment landing on a different
+distributor than the one that handled the SYN: IPv6 TCP could not
+complete a handshake under Tier-2 multi-core. It was masked because
+GCE (the Tier-2 deployment) has no IPv6 subnet and IPv6 is otherwise
+HVF-only (Tier 1, where the NIC's RSS keeps a flow on one core).
+Post-merge, IPv6 flows through the same `classify`/`owner` path as
+IPv4, so it is flow-distributed to a consistent owning core.
+
+Supporting changes: `ParsedL3.arp` → `snoop_mac` (the field is
+family-neutral — ARP cache for v4, NDP cache for v6 — only the name
+was IPv4-specific); `ipv6_nd::handle_icmpv6` takes
+`(src, dst, payload, src_mac)` so `deliver` dispatches ICMPv6 by
+protocol number; `flow_hash` (IPv4) kept byte-identical so the GCE
+bench is a true A/B control, with `flow_hash_v6` folding the 16-byte
+addresses into the same FNV-1a + fmix32.
+
+Verified: `webserver_qemu_x86_64` + `webserver.elf` (aarch64)
+builds; `test_hvf`, `test_mc_hvf` (Tier-1 multi-core),
+`test_qemu_x86_64`; `bench.py --env qemu --cores 3` get_tcp
+(Tier-2 functional — 47 k req/s, no collapse); `//net:ipv6_test`,
+`//net:protocol_tests`. GCE Tier-2 (`gcp-bench.sh --env kvm`,
+KVM/virtio multi-core) `get_tcp` 1c/2c/3c = 225 k / 341 k / 386 k
+req/s — positive scaling, p50 122–223 µs, confirming the rewrite is
+perf-neutral on real Tier-2 hardware.
+
+The `classify` verdict has no host-native unit test: `classify`
+lives in `uni_net_stack`, whose `os:none` dep chain (`//kernel`)
+blocks a `rust_test` — the same blocker recorded for item M's
+`tcp_receive` test and the "Test & bench infrastructure" follow-up.
+IPv6 Tier-2 correctness rests on `ipv6_receive` being host-tested
+(`//net:ipv6_test`) plus the shared distribute path being exercised
+by IPv4 on QEMU-multicore and GCE — unification makes the two halves
+compose.
