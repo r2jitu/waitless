@@ -524,8 +524,8 @@ the partial mitigation.
 |---|---|---|
 | `get_tcp` | 197 k / 565 k | ±3% (control — must not regress) |
 | `get_tls_fresh` | 4.7 k / 10.3 k | ±3% (control) |
-| `upload_32k_tcp` | 51 k / 72 k | ±3% pre-H; +15–25% on 1c after H |
-| `upload_32k_tls` | 47 k / 70 k | ±3% pre-H; +10–20% on 1c after H |
+| `upload_32k_tcp` | 51 k / 72 k | ±3% (item H landed perf-neutral on GCE — the `+15–25%` budget did not hold; see item-H log) |
+| `upload_32k_tls` | 47 k / 70 k | ±3% (item H landed perf-neutral on GCE — the `+10–20%` budget did not hold; see item-H log) |
 
 Protocol: 3 runs per workload per core count, take median.
 Single-run > 3% deviation from baseline on a control workload
@@ -541,8 +541,13 @@ triggers "halt and investigate."
 - **After D** (`tcp_receive` takes IOBufChain): DQO bench
   (expect ±0% — heaviest upper-stack refactor; intermediate
   check catches regressions before more changes pile on).
-- **After H** (zero-copy body path lands): full bench. Expected:
-  `upload_32k_tcp` 1c climbs from ~51 k → ~62 k.
+- **After H** (zero-copy body path lands): [x] done — ran via
+  `gcp-deploy-bench.sh` (Tier 1; nested-KVM `gcp-bench.sh` hit the
+  `SKIP (not ready)` failure). Result: **perf-neutral on GCE** —
+  `upload_32k_tcp` 1c +0.7 % (~44 k, inside run noise), controls
+  within ±3 %. The expected ~51 k → ~62 k climb did **not**
+  materialise; the win was HVF-path-specific. See the item-H
+  progress-log entry.
 - **After I** (multi-buf chain handling, RSC still off): full
   bench. Expected ±0%. `/stats`: `dqo_rx_compl_skipped` stays
   at 0; `dqo_rx_pending_chain_timeouts` stays at 0.
@@ -1595,15 +1600,15 @@ drift), 3 medians each:
 
 Reading the numbers honestly:
 
-- **`upload_32k_tcp` 1c +13.6 %** — the headline win, and bigger
-  than a pure memcpy count predicts. `recv_chunk`'s item-F stash
-  path moves a single-part in-sequence segment's device buffer
-  *straight into the chunk*, skipping **both** the
-  `tcp_receive`→`rx_ring` copy and the old `rx_ring`→`refill` copy.
-  Just below the threshold table's `+15–25 %` budget, which is a
-  GCE/QEMU-calibrated figure (item F's entry already noted the
-  51 k upload baseline is a GCE number, not HVF) — on HVF this is a
-  clean, reproducible double-digit gain.
+- **`upload_32k_tcp` 1c +13.6 % — on HVF.** Bigger than a pure
+  memcpy count predicts: `recv_chunk`'s item-F stash path moves a
+  single-part in-sequence segment's device buffer *straight into
+  the chunk*, skipping **both** the `tcp_receive`→`rx_ring` copy
+  and the old `rx_ring`→`refill` copy. Reproducible across all
+  three interleaved rounds. **But this is HVF-path-specific** — the
+  GCE checkpoint below shows it does *not* carry over to real
+  gVNIC hardware, where the `upload_32k_tcp` bottleneck is not the
+  memcpy item H removed.
 - **`upload_32k_tls` 1c +0.3 %** — essentially flat, *below* the
   table's `+10–20 %` budget. This is the honest finding: the TLS
   body path is **AEAD-decrypt-bound, not memcpy-bound**. `recv_chunk`
@@ -1616,14 +1621,15 @@ Reading the numbers honestly:
   on the TLS body path — the bench just shows where the TLS
   bottleneck actually is.
 - **`get_tcp` (control) +6.1 % @1c** — exceeds the ±3 % control
-  band, but in the *favorable* direction and for an explained, real
-  reason: `BodyReader` is constructed per request (GET included),
-  and Phase-1's `BodyReader::new` zero-initialised the 4 KiB
-  `refill` array every time. Dropping the field removes a 4 KiB
-  `memset` per request — at ~200 k req/s that is the ~6 % gain. A
-  genuine secondary win, not a regression. Flat (+0.2 %) at 3c,
-  where `get_tcp` is bottlenecked on Tier-2 cross-core RX, not
-  per-request setup.
+  band, favourably. Candidate explanation: `BodyReader` is
+  constructed per request (GET included), and Phase-1's
+  `BodyReader::new` zero-initialised the 4 KiB `refill` array every
+  time; dropping the field removes a 4 KiB `memset` per request.
+  But the GCE checkpoint below measured this same control at only
+  +2.8 % @1c (inside ±3 %), so the HVF +6 % is mostly host
+  artifact — the `memset` removal is real but its throughput
+  effect sits inside the noise. Either way no regression: the GET
+  path is byte-identical bar the dropped field.
 - **`get_tls_fresh` (control) −5.4 % @1c / −1.5 % @3c** — within
   the noise envelope for this workload. No code path item H touches
   can systematically slow a TLS *handshake* (the body path runs
@@ -1632,17 +1638,56 @@ Reading the numbers honestly:
   it), and the 3c reading sits inside the ±3 % band. The −5 % @1c
   is host noise.
 
-**GCE checkpoint — PENDING.** The plan mandates a GCE checkpoint
-after H (`./scripts/gcp-bench.sh --cores 1,3`; expected
-`upload_32k_tcp` 1c ~51 k → ~62 k). It could not be run this
-session: the `kvm-vm` GCE instance no longer exists and `gcp.sh`
-exposes no `create` path, so the checkpoint needs the instance
-re-provisioned first (machine/zone/custom-image upload — see the
-GCE image-upload gotchas in project memory). Tracked as pending,
-the same state item D's checkpoint is recorded in. The local HVF
-A/B above — interleaved + a confirming non-interleaved sweep, 6
-runs per branch — is the landing evidence; the GCE run remains the
-authoritative gve gate and should be run before item I piles on.
+**GCE checkpoint — done, and it overturns the headline.** The
+nested-KVM `gcp-bench.sh --env kvm` path hit the documented
+`SKIP (not ready)` failure (see `docs/benchmarking.md`), so the
+checkpoint ran via `gcp-deploy-bench.sh` — the unikernel as the
+real `unikernel-webserver` GCE VM over gVNIC (**Tier 1**), loadgen
+on `kvm-vm`. Same-session A/B, baseline `4327a15` vs `main`, 2 runs
+per side (means):
+
+| Workload | base 1c/3c | item H 1c/3c | Δ 1c/3c |
+|---|---|---|---|
+| `get_tcp` (control) | 186.5 k / 438 k | 191.7 k / 444 k | +2.8 % / +1.4 % |
+| `get_tls_fresh` (control) | 4945 / 9337 | 4808 / 9237 | −2.8 % / −1.1 % |
+| `upload_32k_tcp` | 44.3 k / 64.0 k | 44.6 k / 64.2 k | +0.7 % / +0.3 % |
+| `upload_32k_tls` | 41.0 k / 63.0 k | 43.6 k / 62.8 k | +6.4 % / −0.2 % |
+
+**The HVF `upload_32k_tcp` +13.6 % does not reproduce on GCE** —
++0.7 % at 1c, inside the ~10 % run-to-run spread (the two item-H
+runs straddled the baseline). `upload_32k_tls` 1c reads +6.4 %, but
+at n = 2 with comparable spread that is not separable from noise.
+Every control sits within ±3 %; no regression anywhere. The plan's
+"After H" expectation — `upload_32k_tcp` 1c ~51 k → ~62 k, the
+threshold table's `+15–25 %` budget — **did not hold**: the GCE
+baseline measures ~44 k, not 51 k, and item H moves it by noise.
+
+Why the HVF/GCE divergence: HVF's RX path is virtio-net through a
+*userspace* TCP proxy on the Mac host, where the guest-side memcpy
+item H removes is a real fraction of a software path. GCE's gVNIC
+is hardware DMA + the DQO descriptor ring; on a fast NIC delivering
+segment bursts the per-conn `rx_ring` is rarely empty when
+`BodyReader` polls, so `do_recv_chunk` takes the ring-drain
+*fallback* (which still copies) rather than item F's zero-copy
+device-buffer *stash* (which only fires for a single-part
+in-sequence segment with the ring empty). The GCE `upload_32k_tcp`
+bottleneck is the NIC/DQO + TCP-stack path, not the BodyReader
+memcpy. The GCE controls also confirm the HVF control swings
+(`get_tcp` +6 %, `get_tls_fresh` −5 %) were mostly host artifact.
+
+So item H lands the end-to-end zero-copy body *architecture* —
+correct, the 4 KiB `refill` scratch gone, no regression on either
+host — but on real GCE hardware it is **perf-neutral**, not the win
+the plan budgeted. The threshold table's `upload_32k_*` "after H"
+budgets and the "After H" GCE-checkpoint expectation are corrected
+in place. Caveats on the GCE figures: 3c upload is client-bound
+(`cli` ≥ 70 % of the loadgen host — not load-bearing), and n = 2
+runs per side is below the 3-run protocol — but the effect is
+smaller than the run-to-run noise regardless, which is itself the
+conclusion.
 
 Next: item I (multi-buf RX chain accumulation in DQO), then item J
-(enable RSC).
+(enable RSC) — the genuine throughput items. Item I's multi-buf
+chain is also what would let the GCE `recv_chunk` path hit the
+zero-copy stash instead of the ring-drain fallback more often, so
+the `upload_32k_tcp` win may yet materialise on GCE after I/J.
