@@ -29,8 +29,11 @@ pub struct Ipv4Header {
 // SAFETY: repr(C, packed), all fields are POD integer / Ipv4Addr.
 unsafe impl FromBytes for Ipv4Header {}
 
-/// Parsed IPv4 packet returned by ipv4_parse.
-pub struct Ipv4Packet<'a> {
+/// The fields `ipv4_parse` extracts from an IPv4 packet — the L3
+/// addresses, the protocol, and a borrowed view of the L4 payload.
+/// Not the packet itself: it owns no bytes and omits the rest of
+/// the wire header (`Ipv4Header`).
+pub struct Ipv4Parsed<'a> {
     pub src: Ipv4Addr,
     pub dst: Ipv4Addr,
     pub protocol: u8,
@@ -114,7 +117,7 @@ pub fn fill_header(slot: &mut [u8], src: Ipv4Addr, dst: Ipv4Addr, proto: u8, tot
 
 /// Parse and validate an IPv4 packet. Returns None if invalid or not for us.
 /// Caller is responsible for dispatching based on protocol field.
-pub fn ipv4_parse(data: &[u8]) -> Option<Ipv4Packet<'_>> {
+pub fn ipv4_parse(data: &[u8]) -> Option<Ipv4Parsed<'_>> {
     let hdr = Ipv4Header::try_ref_from(data)?;
 
     let version = hdr.version_ihl >> 4;
@@ -157,7 +160,7 @@ pub fn ipv4_parse(data: &[u8]) -> Option<Ipv4Packet<'_>> {
         }
     }
 
-    Some(Ipv4Packet {
+    Some(Ipv4Parsed {
         src: hdr.src,
         dst: hdr.dst,
         protocol: hdr.protocol,

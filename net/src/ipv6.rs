@@ -69,8 +69,11 @@ unsafe impl FromBytes for Ipv6Header {}
 
 pub const HEADER_LEN: usize = 40;
 
-/// View into an IPv6 packet returned by `ipv6_parse`.
-pub struct Ipv6Packet<'a> {
+/// The fields `ipv6_parse` extracts from an IPv6 packet — the L3
+/// addresses, the next-header / hop-limit, and a borrowed view of
+/// the L4 payload. Not the packet itself: it owns no bytes and
+/// omits the rest of the wire header (`Ipv6Header`).
+pub struct Ipv6Parsed<'a> {
     pub src: Ipv6Addr,
     pub dst: Ipv6Addr,
     pub next_header: u8,
@@ -145,7 +148,7 @@ pub fn ipv6_build(
 /// applies the host accept predicate against the returned `dst`;
 /// the address policy itself lives in higher layers (NDP / SLAAC /
 /// app config).
-pub fn ipv6_parse(data: &[u8]) -> Option<Ipv6Packet<'_>> {
+pub fn ipv6_parse(data: &[u8]) -> Option<Ipv6Parsed<'_>> {
     let hdr = Ipv6Header::try_ref_from(data)?;
     let v_c_f = ntohl_local(hdr.version_class_flow);
     if (v_c_f >> 28) != 6 {
@@ -166,7 +169,7 @@ pub fn ipv6_parse(data: &[u8]) -> Option<Ipv6Packet<'_>> {
     // multi-buffer chain. `try_ref_from` already guaranteed
     // `data.len() >= HEADER_LEN`, so `payload_end >= HEADER_LEN`.
     let payload_end = (HEADER_LEN + payload_len).min(data.len());
-    Some(Ipv6Packet {
+    Some(Ipv6Parsed {
         src: hdr.src,
         dst: hdr.dst,
         next_header: hdr.next_header,
