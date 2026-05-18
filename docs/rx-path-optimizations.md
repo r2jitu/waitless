@@ -488,12 +488,113 @@ the equivalent move-not-copy step for the per-bind datagram inbox.
   data structure (per-bind `WorkerInbox`, not the per-conn TCP
   ring). Needs only item B; can land any time after it.
 
+### M–O. RX offload — HW GRO / RSC and virtio large-receive
+
+Items I–J enable HW GRO / RSC on the gve **DQO** datapath. Items
+M–O (added 2026-05-18, after the `gcp-bench.sh --env kvm`
+`upload_32k_tcp` stall — see [benchmarking.md](benchmarking.md))
+complete the picture: N–O are the matching **virtio-net**
+large-receive work, and M is the TCP/IP-stack precondition both
+halves share. Until N–O land, the virtio-net driver masks the
+guest RX-offload feature bits off (`VIRTIO_NET_RX_OFFLOAD_MASK`)
+so it never negotiates a capability its single-descriptor RX path
+cannot honour — the diagnosed cause of the `--env kvm` upload
+stall.
+
+### M. TCP/IP RX path accepts coalesced super-segments
+- **Status**: [ ]
+- **Where**: [`net/src/ipv4.rs`](net/src/ipv4.rs) `ipv4_receive`,
+  [`net/src/ipv6.rs`](net/src/ipv6.rs),
+  [`net/src/lib.rs`](net/src/lib.rs) `net_receive` /
+  `tcp_receive_segment`, [`net/src/tcp.rs`](net/src/tcp.rs)
+  `tcp_receive`.
+- **What**: a HW-GRO / RSC / LRO frame arrives as a *single*
+  IP+TCP header over a merged payload — one IP packet with
+  `total_length` up to ~64 KiB and a TCP segment far larger than
+  the negotiated MSS, its payload spanning several RX buffers.
+  Audit two things: (1) the L3/L4 header parse — `ipv4_receive` /
+  `ipv6_receive` take `&[u8]`; the headers still live in the first
+  buffer, but confirm nothing assumes the whole frame is
+  contiguous or MTU-bounded; (2) `tcp_receive` already takes a
+  `Chain<OwnedIOBuf>` (item D), but confirm it walks a chain whose
+  logical length exceeds MSS and advances `rcv.nxt` by the full
+  amount. Flag any fixed `[u8; 1514]` / `[u8; 1500]` RX staging.
+- **Win**: none on its own — a precondition. Unlocks items I+J and
+  N+O: without it, either RSC path delivers a super-segment the
+  stack mis-handles.
+- **Effort**: low–medium. Mostly an audit plus a few bound bumps;
+  no new data structures.
+- **Risk**: low. Tightenings, not behaviour changes, until an
+  offload item actually delivers a large segment.
+- **Tests**: a unit test that feeds `tcp_receive` a `Chain` whose
+  logical length spans many buffers and exceeds MSS; assert the
+  bytes land in-order and the window advances by the full length.
+
+### N. virtio-net multi-buf RX chain accumulation
+- **Status**: [ ]
+- **Where**: [`uni-driver-virtio-net/src/lib.rs`](uni-driver-virtio-net/src/lib.rs)
+  `poll_qp` / `poll_batch_qp`.
+- **What**: the virtio twin of item I. Today `poll_qp` reads one
+  used-ring descriptor, treats `used_len - 12` bytes as a whole
+  Ethernet frame, and never inspects the virtio-net header past
+  its size. With `MRG_RXBUF` a frame spans `hdr.num_buffers`
+  descriptors (the first carries the 12-byte header + data, the
+  rest are pure continuation). Read `hdr.num_buffers`, pull that
+  many used entries, and build a `Chain<OwnedIOBuf>` spanning them
+  — one chain emitted per frame. Also decode `hdr.flags`
+  (`VIRTIO_NET_HDR_F_DATA_VALID` ⇒ RX checksum already verified,
+  skip validation; `NEEDS_CSUM` ⇒ validate/compute) and tolerate
+  `gso_type != NONE` (an RSC/LRO-coalesced segment — informational
+  once item M accepts the large length).
+- **Win**: structural correctness for virtio large-receive. No
+  perf delta while item O keeps the mask in place.
+- **Effort**: medium. ~80–120 LOC; mirrors item I but on virtio's
+  descriptor model rather than DQO completions. `poll_qp` and
+  `poll_batch_qp` are separate code paths — both need it.
+- **Risk**: medium. Multi-descriptor walk under `rx_lock`; a chain
+  that straddles a poll batch needs the same pending-state care as
+  item I. The single-buffer (`num_buffers == 1`) path must stay
+  byte-identical.
+- **Tests**: unit test that a synthetic `num_buffers = N` frame
+  reassembles to the right bytes; the `--env kvm` `upload_32k_tcp`
+  bench once item O re-enables negotiation.
+
+### O. Re-negotiate virtio-net RX offloads (shrink the mask)
+- **Status**: [ ]
+- **Where**: [`drivers/src/virtio.rs`](drivers/src/virtio.rs)
+  `VIRTIO_NET_RX_OFFLOAD_MASK`; the PCI feature negotiation in
+  [`uni-driver-virtio-net/src/lib.rs`](uni-driver-virtio-net/src/lib.rs).
+- **What**: the virtio twin of item J — the enable. With item N's
+  reassembly in place, drop `MRG_RXBUF` + `GUEST_TSO4` / `TSO6`
+  (and, once N honours `hdr.flags`, `GUEST_CSUM`) from the mask so
+  the PCI path negotiates them again. Prefer a per-feature gate
+  over a bare mask edit, so the negotiated set provably tracks
+  what the RX path implements — the 2026-05-18 stall was precisely
+  a negotiated feature with no RX support behind it.
+- **Win**: vhost-net GRO-coalesces inbound TCP — fewer RX frames,
+  fewer descriptor trips, fewer cross-core inbox pushes on the
+  Tier-2 path. Expect a double-digit gain on `upload_*` (cf. item
+  J's +10–30 % estimate for the gve side).
+- **Effort**: trivial — a mask / negotiation edit. The work is all
+  in item N.
+- **Risk**: low if N lands first; high standalone — this is
+  exactly the change whose missing item N caused the original
+  `upload_32k_tcp` stall.
+- **Tests**: `gcp-bench.sh --env kvm` before/after on
+  `upload_32k_tcp` / `upload_32k_tls` (the stall workloads) plus
+  `get_tcp` / `download_64k_tcp` controls; confirm no `--env qemu`
+  regression.
+
 ## Recommended sequence
 
 A → B → C → D → E → F → G → H → I → J. K and L are independent —
 K supersedes item C's kernel node pool and can land any time after
 C (sequenced last only for its driver-wide blast radius); L is the
-UDP-side counterpart of items C–D and needs only B.
+UDP-side counterpart of items C–D and needs only B. The RX-offload
+items sequence M → [I ∥ N] → [J ; O]: M (the TCP/IP-stack
+precondition) first, then the two reassembly items — I (gve DQO)
+and N (virtio-net) — in either order, then each driver's enable,
+J (gve RSC) and O (virtio mask), each gated on its reassembly item.
 
 A is pure additions (infrastructure). B is the trait change that
 forces all drivers + net dispatch to land atomically. C through
@@ -501,7 +602,10 @@ H build the IOBuf threading layer-by-layer; each is independently
 buildable and testable atop the prior. E (chunked rejection)
 slots anywhere after the parser stays touchable but is placed
 between D and F to colocate with the HTTP-layer work. I sets up
-the multi-buf delivery shape; J enables RSC on top.
+the multi-buf delivery shape; J enables RSC on top. N and O are
+the virtio-net mirror of that pair; M is the shared TCP/IP-stack
+precondition both driver families need before either RSC path can
+deliver a coalesced super-segment.
 
 ## Test & regression-detection contract
 
