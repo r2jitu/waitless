@@ -116,10 +116,31 @@ impl TcpStream {
         self.handle.is_null()
     }
 
-    /// Async read. Resolves with the byte count when data is
+    /// Async read. Resolves with the byte count once data is
     /// available (or `0` on peer close / stale generation).
+    ///
+    /// Takes `&mut self`. `TcpStream` is a thin handle over an
+    /// *opaque backend pointer* — the borrow checker cannot see the
+    /// per-connection state aliased through that raw handle, so the
+    /// `&mut self` exclusivity is the *only* lever that enforces
+    /// "at most one read outstanding per stream." `recv` registers
+    /// `buf`'s pointer with the connection for the direct-copy fast
+    /// path; two overlapping reads would have the second silently
+    /// steal the first's slot. `&mut self` makes that a compile
+    /// error instead — the same discipline [`Self::recv_chunk`]
+    /// already used, now applied uniformly across the API.
+    ///
+    /// ```compile_fail
+    /// # async fn two_reads(s: &mut uni_runtime::net::TcpStream) {
+    /// let mut a = [0u8; 16];
+    /// let mut b = [0u8; 16];
+    /// let r1 = s.recv(&mut a);
+    /// let r2 = s.recv(&mut b); // ERROR: `*s` already borrowed
+    /// let _ = (r1.await, r2.await);
+    /// # }
+    /// ```
     #[inline]
-    pub fn recv<'a>(&'a self, buf: &'a mut [u8]) -> TcpRecv<'a> {
+    pub fn recv<'a>(&'a mut self, buf: &'a mut [u8]) -> TcpRecv<'a> {
         TcpRecv::new(self.handle, self.generation, buf)
     }
 
@@ -169,7 +190,10 @@ impl TcpStream {
     /// Saves the manual `while got < N { ... }` loop every TCP
     /// server otherwise writes for fixed-size frames; for streamed
     /// protocols use `recv` directly.
-    pub async fn recv_exact(&self, buf: &mut [u8]) -> Result<(), usize> {
+    ///
+    /// `&mut self` for the same reason as [`Self::recv`] — it loops
+    /// `recv`, so it inherits the one-read-at-a-time exclusivity.
+    pub async fn recv_exact(&mut self, buf: &mut [u8]) -> Result<(), usize> {
         let total = buf.len();
         let mut got = 0;
         while got < total {
@@ -195,9 +219,14 @@ impl TcpStream {
     /// Chain is the standard send surface — apps that already
     /// have a contiguous slice and don't want to wrap it use
     /// [`Self::send_bytes`] instead.
+    ///
+    /// `&mut self` for the same reason as [`Self::recv`]: a send
+    /// registers a waker on the connection's send slot, and the
+    /// opaque-handle aliasing is invisible to the borrow checker —
+    /// the exclusive borrow is what serialises sends per stream.
     #[inline]
     pub fn send<'a>(
-        &'a self,
+        &'a mut self,
         chain: &'a mut uni_iobuf::IOBufChain,
     ) -> TcpSendChain<'a> {
         TcpSendChain::new(self.handle, self.generation, chain)
@@ -225,7 +254,11 @@ impl TcpStream {
     /// known is fine. The backend short-circuits to `None`
     /// (without acquiring a slot or running the closure) when
     /// `min_payload <= mss` — see [`TcpBackend::try_send_tso`].
-    pub fn try_send_tso<F>(&self, min_payload: usize, mut fill: F) -> Option<Result<usize, ()>>
+    pub fn try_send_tso<F>(
+        &mut self,
+        min_payload: usize,
+        mut fill: F,
+    ) -> Option<Result<usize, ()>>
     where
         F: FnMut(&mut [u8]) -> Result<usize, ()>,
     {
@@ -248,7 +281,7 @@ impl TcpStream {
     /// `VecDeque` allocation for the chain buffer plus an
     /// `IOBuf::Borrowed` struct init — negligible at the call
     /// rates we hit in benchmarks.
-    pub async fn send_bytes(&self, data: &[u8]) -> Result<(), ()> {
+    pub async fn send_bytes(&mut self, data: &[u8]) -> Result<(), ()> {
         // SAFETY: `chain` is dropped before this future returns;
         // the `IOBuf::Borrowed` wrapping `data` therefore can't
         // outlive `data`'s borrow. No drop callback — the bytes

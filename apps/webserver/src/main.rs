@@ -296,7 +296,7 @@ async fn tcp_echo(mut stream: TcpStream) {
     }
 }
 
-async fn gateway(stream: TcpStream, backend_ip: [u8; 4]) {
+async fn gateway(mut stream: TcpStream, backend_ip: [u8; 4]) {
     let backend = uni::runtime::IpAddr::V4(uni::runtime::Ipv4Addr {
         addr: u32::from_ne_bytes(backend_ip),
     });
