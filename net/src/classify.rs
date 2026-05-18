@@ -49,6 +49,20 @@ fn offset_within(outer: &[u8], inner: &[u8]) -> usize {
     inner.as_ptr() as usize - outer.as_ptr() as usize
 }
 
+/// One RX frame past the Ethernet parse — the input to the L3
+/// summarize step. `l3` is the Ethernet payload (`ipv4_parse` /
+/// `ipv6_parse`'s input); `l3_off` is where `l3` sits in the frame's
+/// part-0 buffer, the anchor every `ParsedL3.l4_off` is measured
+/// from; `src_mac` is the L2 sender, for the neighbor-cache snoop.
+/// Borrow-bearing and short-lived — it never escapes `classify`, so
+/// unlike `ParsedL3` it can carry the `l3` slice directly.
+#[derive(Clone, Copy)]
+struct EthFrame<'a> {
+    l3_off: usize,
+    src_mac: MacAddr,
+    l3: &'a [u8],
+}
+
 /// Parse one frame's L2/L3 headers exactly once. `frame` is part 0
 /// of the RX chain — the headers are contiguous there. Pure: the
 /// arp/ndp snoop and the L4 dispatch are the caller's job, so the
@@ -60,48 +74,47 @@ fn offset_within(outer: &[u8], inner: &[u8]) -> usize {
 /// os:none `ipv6_nd::v6_addr_is_ours`, which `net_rx` must not depend
 /// on).
 pub fn classify(frame: &[u8], accept_v6: impl Fn(&Ipv6Addr) -> bool) -> Classified {
-    let Some((src_mac, ethertype, payload)) = ethernet::ethernet_parse_full(frame) else {
+    let Some((src_mac, ethertype, l3)) = ethernet::ethernet_parse_full(frame) else {
         return Classified::Drop;
     };
+    // `l3` is a sub-slice of `frame`; its offset is the Ethernet
+    // header length — the anchor every `ParsedL3.l4_off` is measured
+    // from, and the ARP payload's offset directly.
+    let eth = EthFrame {
+        l3_off: offset_within(frame, l3),
+        src_mac,
+        l3,
+    };
     match ethertype {
-        ethernet::ETHERTYPE_ARP => {
-            // `payload` is a sub-slice of `frame`, so this offset is
-            // in-bounds by construction.
-            Classified::Arp(offset_within(frame, payload))
+        ethernet::ETHERTYPE_ARP => Classified::Arp(eth.l3_off),
+        ethernet::ETHERTYPE_IPV4 => summarize_ipv4(eth).map_or(Classified::Drop, Classified::Ip),
+        ipv6::ETHERTYPE_IPV6 => {
+            summarize_ipv6(eth, accept_v6).map_or(Classified::Drop, Classified::Ip)
         }
-        ethernet::ETHERTYPE_IPV4 => match summarize_ipv4(frame, payload, src_mac) {
-            Some(p) => Classified::Ip(p),
-            None => Classified::Drop,
-        },
-        ipv6::ETHERTYPE_IPV6 => match summarize_ipv6(frame, payload, src_mac, accept_v6) {
-            Some(p) => Classified::Ip(p),
-            None => Classified::Drop,
-        },
         _ => Classified::Drop,
     }
 }
 
-/// Summarise an IPv4 packet into a [`ParsedL3`]. `frame` is part 0's
-/// bytes (so the L4 offset is absolute within it); `eth_payload` is
-/// the IPv4 packet with the Ethernet header stripped. A non-TCP/UDP
-/// IPv4 packet still parses to `Some` — the L4 dispatch no-ops on
-/// the protocol, but carrying it keeps the arp-snoop alive.
-fn summarize_ipv4(frame: &[u8], eth_payload: &[u8], src_mac: MacAddr) -> Option<ParsedL3> {
-    let pkt = ipv4::ipv4_parse(eth_payload)?;
-    // L4 segment's (offset, len) within part 0 — pointer arithmetic
-    // over the backing buffer. Robust across IPv4 header options.
-    let l4_off = offset_within(frame, pkt.payload);
-    let l4_len = pkt.payload.len();
+/// Summarise an IPv4 packet into a [`ParsedL3`]. `eth` is the frame
+/// past the Ethernet parse — `ipv4_parse`'s input and where it sits.
+/// A non-TCP/UDP IPv4 packet still summarises to `Some` — the L4
+/// dispatch no-ops on the protocol, but carrying it keeps the
+/// arp-snoop alive.
+fn summarize_ipv4(eth: EthFrame<'_>) -> Option<ParsedL3> {
+    let pkt = ipv4::ipv4_parse(eth.l3)?;
     Some(ParsedL3 {
         proto: pkt.protocol,
         src: IpAddr::V4(pkt.src),
         dst: IpAddr::V4(pkt.dst),
-        l4_off,
-        l4_len,
+        // Frame-relative L4 offset: where the L3 header starts in the
+        // frame, plus where L4 starts within L3 (the IPv4 header,
+        // robust across its options).
+        l4_off: eth.l3_off + offset_within(eth.l3, pkt.payload),
+        l4_len: pkt.payload.len(),
         // Snoop only on-subnet senders: off-subnet traffic's L2 src
         // MAC is the gateway's, not the IP's own.
         snoop_mac: if ipv4::same_subnet(pkt.src) {
-            Some(src_mac)
+            Some(eth.src_mac)
         } else {
             None
         },
@@ -109,33 +122,27 @@ fn summarize_ipv4(frame: &[u8], eth_payload: &[u8], src_mac: MacAddr) -> Option<
 }
 
 /// Summarise an IPv6 packet into a [`ParsedL3`] — the IPv6 twin of
-/// `summarize_ipv4`. The L4 offset is robust across IPv6 extension
-/// headers. `accept_v6` is the host's dst-address policy: a v6 frame
-/// whose dst it rejects summarises to `None` (→ `Classified::Drop`).
-fn summarize_ipv6(
-    frame: &[u8],
-    eth_payload: &[u8],
-    src_mac: MacAddr,
-    accept_v6: impl Fn(&Ipv6Addr) -> bool,
-) -> Option<ParsedL3> {
-    let pkt = ipv6::ipv6_parse(eth_payload)?;
+/// `summarize_ipv4`. `accept_v6` is the host's dst-address policy: a
+/// v6 frame whose dst it rejects summarises to `None` (→ `Drop`).
+fn summarize_ipv6(eth: EthFrame<'_>, accept_v6: impl Fn(&Ipv6Addr) -> bool) -> Option<ParsedL3> {
+    let pkt = ipv6::ipv6_parse(eth.l3)?;
     // `ipv6_parse` is a pure wire parse; applying the dst-address
     // policy is ours. `net_rx` stays a leaf — the predicate is
     // supplied by the os:none caller.
     if !accept_v6(&pkt.dst) {
         return None;
     }
-    let l4_off = offset_within(frame, pkt.payload);
-    let l4_len = pkt.payload.len();
     Some(ParsedL3 {
         proto: pkt.next_header,
         src: IpAddr::V6(pkt.src),
         dst: IpAddr::V6(pkt.dst),
-        l4_off,
-        l4_len,
+        // Frame-relative L4 offset: where the L3 header starts in the
+        // frame, plus where L4 starts within L3.
+        l4_off: eth.l3_off + offset_within(eth.l3, pkt.payload),
+        l4_len: pkt.payload.len(),
         // A v6 sender is link-local or same-prefix SLAAC — always
         // on-link — so always snoop it.
-        snoop_mac: Some(src_mac),
+        snoop_mac: Some(eth.src_mac),
     })
 }
 
