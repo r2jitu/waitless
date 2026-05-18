@@ -775,6 +775,25 @@ deployments whose `nqp` polling cores bottleneck on `tcp_receive`.
 
 - Symmetric outbound IOBufChain plumbing.
 - `StreamingResponse` shape for large echo / proxy responses.
+- **Zero-copy TCP proxy endpoint + benchmark.** The canonical
+  end-to-end zero-copy RX→TX showcase: a `proxy` handler that
+  accepts a client TCP conn, opens a backend TCP conn, and pumps
+  bytes `recv_chunk()` → `into_owned()` → `send()`. RX is already
+  zero-copy (items F–H surface the device buffer); this becomes
+  *genuinely* end-to-end only once TX-side IOBuf threading lands —
+  hence Phase 5, not now. Building it before then showcases only
+  the RX half (the `tcp_echo_64k` bench workload already measures
+  that half — zero-copy RX, copying TX). Two gotchas to plan for:
+  * a **full-duplex** proxy (both directions pumped concurrently)
+    needs `TcpStream::split()` into read/write halves — a direct
+    consequence of the per-stream-op `&mut self` hardening
+    (`710d64c`); a request-response proxy is sequential and needs
+    no `split()`. The proxy is the consumer that would justify
+    adding `split()`.
+  * the bench needs the loadgen to host a TCP backend (echo
+    server), the way `fanout_tcp` hosts a UDP backend today.
+  `gateway` is **not** the vehicle for this — TCP↔UDP, fixed-frame
+  (`recv_exact`), and its UDP legs are gated on item L.
 
 ### Mid-term — HTTP/3 streaming body
 
