@@ -181,6 +181,49 @@ impl From<Ipv6Addr> for IpAddr {
     }
 }
 
+// ── Parsed L2/L3 frame summary ─────────────────────────────────────
+
+/// The L2/L3 parse of a received IPv4 frame — ethertype resolved,
+/// IP addresses extracted, the L4 segment located — computed once so
+/// a later stage need not re-walk the headers.
+///
+/// The Tier-2 RX distributor produces one per IPv4 frame in its
+/// classify pass (which picks the owning core) and carries it — on the
+/// cross-core inbox node for a distributed frame, directly for an
+/// inline one — so the receiving core skips straight to `tcp_receive` /
+/// `udp_receive` instead of re-parsing eth + IPv4. See
+/// `docs/rx-path-optimizations.md`, "Fuse the Tier-2 classify parse".
+///
+/// Plain `Copy` data with no borrow of the frame buffer: the L4
+/// segment is referenced by `(l4_off, l4_len)` into the frame's part-0
+/// buffer, not by slice, so a `ParsedL3` can ride an inbox node
+/// alongside the frame's `Chain` without a lifetime. There is no
+/// `ethertype` field — `src`/`dst` already encode the IP family, and
+/// only IPv4 frames are ever summarised here.
+#[derive(Clone, Copy, Debug)]
+pub struct ParsedL3 {
+    /// IP protocol number of the L4 segment — `6` (TCP) or `17` (UDP)
+    /// for a frame the stack handles; any other value parses through
+    /// (carried only so the receive path can still ARP-snoop) and the
+    /// L4 dispatch no-ops on it.
+    pub proto: u8,
+    /// Source IP address (the frame's L3 src).
+    pub src: IpAddr,
+    /// Destination IP address (the frame's L3 dst).
+    pub dst: IpAddr,
+    /// Byte offset of the L4 segment within the frame's part-0 buffer.
+    pub l4_off: usize,
+    /// Length in bytes of the L4 segment.
+    pub l4_len: usize,
+    /// The L2 source MAC to ARP-snoop into the *receiving* core's
+    /// fast-cache, or `None` when the sender is off-subnet (its L2 src
+    /// MAC is the gateway's, not the IP's own — snooping it would be
+    /// wrong; see `arp_learn`). For a distributed frame the receiving
+    /// core is not the core the distributor warmed, so honouring this
+    /// is not redundant.
+    pub arp: Option<MacAddr>,
+}
+
 #[derive(Clone, Copy)]
 pub struct NetConfig {
     pub ip: Ipv4Addr,
