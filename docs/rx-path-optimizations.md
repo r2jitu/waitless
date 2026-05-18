@@ -1665,15 +1665,19 @@ baseline measures ~44 k, not 51 k, and item H moves it by noise.
 Why the HVF/GCE divergence: HVF's RX path is virtio-net through a
 *userspace* TCP proxy on the Mac host, where the guest-side memcpy
 item H removes is a real fraction of a software path. GCE's gVNIC
-is hardware DMA + the DQO descriptor ring; on a fast NIC delivering
-segment bursts the per-conn `rx_ring` is rarely empty when
-`BodyReader` polls, so `do_recv_chunk` takes the ring-drain
-*fallback* (which still copies) rather than item F's zero-copy
-device-buffer *stash* (which only fires for a single-part
-in-sequence segment with the ring empty). The GCE `upload_32k_tcp`
-bottleneck is the NIC/DQO + TCP-stack path, not the BodyReader
-memcpy. The GCE controls also confirm the HVF control swings
-(`get_tcp` +6 %, `get_tls_fresh` −5 %) were mostly host artifact.
+is hardware DMA + the DQO descriptor ring. This entry's first cut
+*hypothesised* that on a fast NIC the per-conn `rx_ring` is rarely
+empty when `BodyReader` polls, so `do_recv_chunk` mostly takes the
+copying ring-drain *fallback* rather than item F's zero-copy
+*stash*. **The follow-up `/stats` instrumentation refuted that** —
+see the 2026-05-17 verification entry below: the stash fires
+**~52 %** of the time on GCE, edging out the fallback. The real
+reason item H is flat on GCE is simpler: the `upload_32k_tcp` path
+is **not memcpy-bound** — eliminating the copy for even half the
+chunks stays inside run noise; the bottleneck is the NIC/DQO +
+TCP-stack work. The GCE controls also confirm the HVF control
+swings (`get_tcp` +6 %, `get_tls_fresh` −5 %) were mostly host
+artifact.
 
 So item H lands the end-to-end zero-copy body *architecture* —
 correct, the 4 KiB `refill` scratch gone, no regression on either
@@ -1687,7 +1691,96 @@ smaller than the run-to-run noise regardless, which is itself the
 conclusion.
 
 Next: item I (multi-buf RX chain accumulation in DQO), then item J
-(enable RSC) — the genuine throughput items. Item I's multi-buf
-chain is also what would let the GCE `recv_chunk` path hit the
-zero-copy stash instead of the ring-drain fallback more often, so
-the `upload_32k_tcp` win may yet materialise on GCE after I/J.
+(enable RSC) — the genuine throughput items. RSC cuts per-packet
+overhead, which *is* on the GCE upload critical path (unlike the
+memcpy item H removed). The `recv_chunk` stash already fires ~52 %
+of the time on GCE (verification entry below), so I/J's payoff
+there is the per-packet-overhead reduction, not more stash hits.
+
+### 2026-05-17 — Follow-up: universal `recv_chunk`, `tcp_echo` zero-copy, `/stats` verification ([x] **landed** — commits `5781f9a`, `eb4a029`, `fd41463`, `34d31f8`)
+
+Not a numbered plan item — the `tcp_echo`/`gateway` zero-copy
+follow-up flagged after item H, plus the `/stats` instrumentation
+that settles item H's GCE question.
+
+**Native `do_recv_chunk`** (`5781f9a`). Item F left the native
+backend's chunk hooks `None`, so `TcpStream::recv_chunk` resolved to
+`None` on native — and `None` is also the EOF signal, so a handler
+could not tell "no chunk path" from "peer closed". That blocked
+migrating any handler off the fill-buffer `recv`. Native now
+implements `do_recv_chunk`: a POSIX `recv` into a heap buffer,
+surfaced as a `Heap` `IOBuf`. Native still pays the one
+syscall-boundary copy `do_recv` always paid — but `recv_chunk` now
+resolves to a real chunk on **every** backend, so handlers get one
+uniform API with no `recv` fallback. This is step 1 of deprecating
+the non-zero-copy `recv`.
+
+**`tcp_echo` zero-copy** (`eb4a029`). The first app handler to use
+the guard's `into_owned()` escape hatch — the stream-to-stream
+proxy zero-copy path the "Scaling behavior" section names as the
+load-bearing reason for the owned-IOBuf guard, but which nothing
+demonstrated. `recv_chunk()` → `into_owned()` → `IOBufChain` →
+`send`; on bare-metal the `ExternalOwned` NIC RX buffer flows
+RX→TX→repost with no intermediate copy (vs the old `recv` into a
+stack buf + `send_bytes` — two copies).
+
+`gateway` was **not** migrated: its `recv_exact` fixed-frame
+(`GATEWAY_MSG_SIZE`) semantics need chunk reassembly — re-adding a
+copy — and its UDP leg cannot go zero-copy until item L. Migrating
+it would add copies, not remove them.
+
+**`tcp_echo` HVF A/B — flat**, and instructively so. Baseline
+(`2c4a864`, `recv`+`send_bytes`) vs the migration, HVF 1c/3c,
+3-round medians via a baseline worktree:
+
+| | base 1c/3c | zero-copy 1c/3c | Δ |
+|---|---|---|---|
+| `tcp_echo` (64 B msg) | 157.3 k / 183.1 k | 157.2 k / 178.8 k | −0.1 % / −2.4 % |
+
+The `tcp_echo` workload echoes **64-byte** messages — the copy the
+migration removes is 64 bytes, negligible against per-message
+TCP-segment + waker + chain overhead. Zero-copy wins are
+**payload-size-dependent**: they bite at KB scale, not tiny
+messages. The migration is still correct (`test_hvf`'s
+`test_tcp_echo` green) and right for large echo/proxy payloads — it
+just does not move a 64 B round-trip. (`run_loadgen_tcp_echo`'s
+`msg_size` is fixed at 64; a large-message variant would be the
+workload that shows the win.)
+
+**`/stats` verification — the headline result.** New `net::tcp`
+counters `RX_CHUNK_STASH_HITS` / `RX_CHUNK_RING_DRAIN` (`fd41463`),
+surfaced at `/stats` as `rx_chunk_stash_hits` / `rx_chunk_ring_drain`,
+count the two `do_recv_chunk` paths: the zero-copy device-buffer
+*stash* vs the copying *ring-drain* fallback. Deployed to the real
+`unikernel-webserver` gVNIC VM, ran `upload_32k_tcp`, read `/stats`:
+
+```
+rx_chunk_stash_hits  = 3_891_009   (52.0 %)
+rx_chunk_ring_drain  = 3_589_149   (48.0 %)
+```
+
+**This refutes the item-H entry's hypothesis.** That entry reasoned
+the ring-drain fallback *dominates* on GCE (segment bursts keeping
+the ring non-empty). It does not — the zero-copy stash fires ~52 %
+of the time, slightly *more* than the fallback. So zero-copy *is*
+in place and firing on GCE for the majority of body chunks. Item H
+was flat on GCE not because the stash misses, but because the
+`upload_32k_tcp` path is genuinely **not memcpy-bound**: removing
+the copy for half the chunks stays within run noise. The counter
+was worth adding precisely because it overturned a plausible —
+but wrong — story; the item-H GCE paragraph above is corrected to
+match.
+
+**Deprecating the non-zero-copy path — assessment.** `recv` is
+deprecatable for proxy/echo handlers *now* (native `do_recv_chunk`
+unblocked it; `tcp_echo` is migrated). It is **blocked for
+`serve_conn`** until the Phase-4 streaming HTTP header parser —
+`serve_conn` needs a contiguous parse buffer, `recv_chunk` delivers
+discontiguous chunks. The ring-drain copy inside `do_recv_chunk` is
+**never** deprecatable: the per-conn `rx_ring` is a structural
+backpressure buffer (the math forbids IOBufs in it). Full `recv`
+removal is a Phase-4 endgame.
+
+Verified: `webserver_qemu_x86_64` + `webserver.elf` aarch64 builds;
+`test_hvf`; `uni_http_test`; native backend compile via
+`uni_tls_test`. GCE VMs stopped after the run.
