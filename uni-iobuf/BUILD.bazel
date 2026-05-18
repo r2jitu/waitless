@@ -14,8 +14,10 @@ package(default_visibility = ["//visibility:public"])
 # on the other (transport ↛ app), so the shared primitive sits
 # below them.
 #
-# `no_std` and dep-less so it can also be pulled into the kernel
-# proper (driver layers) without dragging the runtime in.
+# `no_std` and core-only — its one dependency, the shared Treiber
+# stack core, is itself a zero-dep `core` crate — so it can also be
+# pulled into the kernel proper (driver layers) without dragging the
+# runtime in.
 rust_library(
     name = "uni-iobuf",
     srcs = [
@@ -25,6 +27,9 @@ rust_library(
         "src/storage.rs",
     ],
     crate_name = "uni_iobuf",
+    # `IOBufPool`'s free list delegates to the shared Treiber stack
+    # core. `iobuf_test` (crate = ":uni-iobuf") inherits this dep.
+    deps = ["//util/tagged_treiber"],
 )
 
 # Inline #[cfg(test)] unit tests. Run via:

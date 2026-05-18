@@ -31,25 +31,17 @@
 //
 // ── Free list: a tagged-pointer Treiber stack ───────────────────
 //
-// The free list is a lock-free Treiber stack. Its head is a single
-// `AtomicU64` packing `(slot_index: u32, version_tag: u32)`. Free
-// slabs are linked through a dedicated `next` array (one `AtomicU32`
-// per slab) — NOT through the slab bytes themselves, so reading a
-// link can never race a payload write on a slab that was just
-// popped and handed out.
+// The free list is a lock-free `tagged_treiber::TaggedTreiberStack`
+// — a single `AtomicU64` head packing `(slot_index, version_tag)`,
+// the version as the ABA defence. The mechanism lives, audited once,
+// in that crate's docs; `uni_kernel::rx_inbox::RxNodePool` is its
+// other consumer.
 //
-// The `version_tag` is the ABA defense. A plain Treiber stack that
-// keys its CAS on the head index alone is vulnerable to ABA: a
-// popping thread reads head = slot A, stalls, and by the time it
-// runs its CAS another thread has popped A, popped more, and pushed
-// A back. The CAS still sees `A` and succeeds — but reinstalls a
-// stale `next` link, corrupting the list (resurrecting a live slab,
-// or dropping a free one). Incrementing the tag on every *push*
-// means any push between a pop's read and its CAS changes the
-// 64-bit head word, so the pop's CAS fails and retries. A pop→pop
-// pair without an intervening push can't trigger ABA on its own
-// (the head index genuinely moves), so tagging pushes alone is
-// sufficient.
+// The one pool-specific point is link storage. Free slabs are linked
+// through a dedicated `next` array (one `AtomicU32` per slab), handed
+// to the stack via `PoolInner`'s `TreiberLinks` impl — NOT through
+// the slab bytes themselves, so reading a link can never race a
+// payload write on a slab that was just popped and handed out.
 //
 // If the stack ever shows contention in production, the documented
 // escape hatch (docs/rx-path-optimizations.md, "Operational") is to
@@ -68,27 +60,17 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+
+use tagged_treiber::{TaggedTreiberStack, TreiberLinks};
 
 use crate::{IOBufDropFn, OwnedIOBuf};
 
-/// Free-list sentinel: a `slot_index` of `u32::MAX` marks both the
-/// empty stack and the tail of the `next` link chain. The pool
-/// rejects a `capacity_slabs` that could collide with it, so no
-/// real slot ever has this index.
-const NULL_SLOT: u32 = u32::MAX;
-
-/// Pack `(slot_index, version)` into the 64-bit Treiber head word.
-#[inline]
-fn pack(slot: u32, version: u32) -> u64 {
-    ((slot as u64) << 32) | (version as u64)
-}
-
-/// Inverse of [`pack`].
-#[inline]
-fn unpack(word: u64) -> (u32, u32) {
-    ((word >> 32) as u32, word as u32)
-}
+/// Free-list sentinel: a `slot_index` of [`tagged_treiber::NULL_INDEX`]
+/// (`u32::MAX`) marks both the empty stack and the tail of the `next`
+/// link chain. The pool rejects a `capacity_slabs` that could collide
+/// with it, so no real slot ever has this index.
+const NULL_SLOT: u32 = tagged_treiber::NULL_INDEX;
 
 /// Shared inner state of a pool: the slab region, the lock-free
 /// free list, and the counters. Heap-pinned behind an `Arc` (see
@@ -117,10 +99,11 @@ struct PoolInner {
     /// aliased with slab payload — so reading a link cannot race a
     /// payload write on a popped-and-reused slab.
     next: Box<[AtomicU32]>,
-    /// Treiber-stack head: packed `(slot_index, version)`. A
-    /// `slot_index` of `NULL_SLOT` means the stack is empty. The
-    /// version increments on every push to defeat ABA.
-    head: AtomicU64,
+    /// The lock-free free list: a tagged-pointer Treiber stack of
+    /// slot indices, empty when its head index is `NULL_SLOT`. Its
+    /// `next` links are this struct's `next` array, reached through
+    /// the `TreiberLinks` impl below.
+    free_list: TaggedTreiberStack,
     /// Live count of free slabs. Eventually-consistent with `head`
     /// (each successful CAS updates it with `Relaxed` ordering);
     /// exact once the pool quiesces. For observability and tests.
@@ -138,69 +121,35 @@ struct PoolInner {
 // `Box::from_raw` in `Drop`; `PoolInner` never dereferences it to
 // read or write slab bytes — only IOBufs do, each through its own
 // disjoint sub-pointer. Every field mutated after construction is
-// an atomic (`head`, `free_count`, `leaked`) or a slice of atomics
-// (`next`), so concurrent `&PoolInner` access is data-race-free
-// (`Sync`). The backing allocation is owned by `PoolInner` and
+// an atomic counter (`free_count`, `leaked`), a lock-free stack of
+// atomics (`free_list`), or a slice of atomics (`next`), so
+// concurrent `&PoolInner` access is data-race-free (`Sync`). The
+// backing allocation is owned by `PoolInner` and
 // released through the global (thread-safe) allocator in `Drop`, so
 // the value — and that `Drop` — may run on any thread (`Send`).
 unsafe impl Send for PoolInner {}
 unsafe impl Sync for PoolInner {}
 
 impl PoolInner {
-    /// Treiber-stack pop. Loops on CAS contention; returns `None`
-    /// only when the stack is genuinely empty.
+    /// Take a slab off the lock-free free list. Returns `None` only
+    /// when the pool is genuinely exhausted.
     fn pop_slot(&self) -> Option<u32> {
-        loop {
-            let head = self.head.load(Ordering::Acquire);
-            let (slot, version) = unpack(head);
-            if slot == NULL_SLOT {
-                return None; // pool exhausted
-            }
-            // `next[slot]` is published by the push that placed
-            // `slot` at the head: that push stored the link, then
-            // ran a `Release` CAS on `head`; our `Acquire` load
-            // above synchronizes-with it, so this `Relaxed` load
-            // observes the correct link.
-            let next = self.next[slot as usize].load(Ordering::Relaxed);
-            // Pop keeps the version word unchanged — only pushes
-            // bump it. If a push slips in before our CAS, the head
-            // word differs and the CAS retries.
-            let new = pack(next, version);
-            if self
-                .head
-                .compare_exchange_weak(head, new, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-            {
-                self.free_count.fetch_sub(1, Ordering::Relaxed);
-                return Some(slot);
-            }
-            // CAS lost the race (or spuriously failed) — retry.
-        }
+        let slot = self.free_list.pop(self)?;
+        // `free_count` is a `Relaxed`, eventually-consistent
+        // observability counter (see the field docs). Bumping it
+        // just after the stack's CAS — rather than inside the stack
+        // — is observationally identical: no reader synchronises on
+        // it, so the code motion changes nothing.
+        self.free_count.fetch_sub(1, Ordering::Relaxed);
+        Some(slot)
     }
 
-    /// Treiber-stack push. Loops on CAS contention.
+    /// Return a slab to the lock-free free list.
     fn push_slot(&self, slot: u32) {
-        loop {
-            let head = self.head.load(Ordering::Acquire);
-            let (head_slot, version) = unpack(head);
-            // Point this slab's link at the current head. Only one
-            // thread ever pushes a given slab (the one dropping its
-            // IOBuf), so this store is unconflicted; the CAS below
-            // publishes it.
-            self.next[slot as usize].store(head_slot, Ordering::Relaxed);
-            // Bump the version on push — the tagged-pointer ABA
-            // defense. Any pop that read the old head between its
-            // load and CAS now sees a changed word and retries.
-            let new = pack(slot, version.wrapping_add(1));
-            if self
-                .head
-                .compare_exchange_weak(head, new, Ordering::Release, Ordering::Relaxed)
-                .is_ok()
-            {
-                self.free_count.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-        }
+        self.free_list.push(slot, self);
+        // See `pop_slot` on why this `Relaxed` counter bump is sound
+        // outside the stack's CAS.
+        self.free_count.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Map a slab `base` back to its slot index and return it to
@@ -229,6 +178,16 @@ impl PoolInner {
                 report_leak(addr);
             }
         }
+    }
+}
+
+impl TreiberLinks for PoolInner {
+    /// The free-list `next` links live in the dedicated `next` array
+    /// — never aliased with slab payload, so a link read cannot race
+    /// a payload write on a popped-and-reused slab. `idx` came off
+    /// the stack, so it indexes a real slot.
+    fn next_link(&self, idx: u32) -> &AtomicU32 {
+        &self.next[idx as usize]
     }
 }
 
@@ -321,11 +280,9 @@ impl IOBufPool {
                 AtomicU32::new(link)
             })
             .collect();
-        let head = if capacity_slabs == 0 {
-            pack(NULL_SLOT, 0)
-        } else {
-            pack(0, 0)
-        };
+        // The whole pool starts free, so the stack's head is slot 0
+        // — or `NULL_SLOT` for the degenerate zero-capacity pool.
+        let head_slot = if capacity_slabs == 0 { NULL_SLOT } else { 0 };
 
         IOBufPool {
             inner: Arc::new(PoolInner {
@@ -333,7 +290,7 @@ impl IOBufPool {
                 slab_size: slab_size_bytes as u32,
                 capacity_slabs: capacity_slabs as u32,
                 next,
-                head: AtomicU64::new(head),
+                free_list: TaggedTreiberStack::new(head_slot),
                 free_count: AtomicUsize::new(capacity_slabs),
                 leaked: AtomicUsize::new(0),
             }),
