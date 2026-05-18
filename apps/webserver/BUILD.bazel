@@ -1,4 +1,3 @@
-load("@bazel_skylib//rules:build_test.bzl", "build_test")
 load("@pip//:requirements.bzl", "requirement")
 load("@rules_python//python:defs.bzl", "py_test")
 load("@rules_rust//rust:defs.bzl", "rust_library")
@@ -13,8 +12,9 @@ package(default_visibility = ["//visibility:public"])
 # both the unikernel image and the native `webserver_bin`; any
 # `os:none`-only crate in its deps (the gve driver, once, for
 # `/stats` counters — now reached via `uni::diagnostics::gve_diag`)
-# makes the native binary unbuildable. `webserver_native_build_test`
-# below guards this.
+# makes the native binary unbuildable. The `:test_native` variant
+# of `:test` below builds and runs `webserver_bin`, so `bazel test`
+# catches such a leak.
 rust_library(
     name = "app",
     srcs = ["src/main.rs"],
@@ -69,20 +69,6 @@ unikernel_binary(
             host = 8009,
         ),
     ],
-)
-
-# Regression guard for the native build. `app` feeds both the
-# unikernel image and the native `webserver_bin` (used by
-# `bench.py --env native` / `--env docker`); nothing in the
-# per-commit gate set or `bazel test //...` compiled the native
-# target, so an `os:none`-only dep leaking into `app` broke the
-# native build silently — which is exactly what happened when the
-# gve driver was wired into `/stats`. This `build_test` makes
-# `bazel test` compile `webserver_bin`, so that regression class
-# fails a test instead of slipping through.
-build_test(
-    name = "webserver_native_build_test",
-    targets = [":webserver_bin"],
 )
 
 # Per-variant integration tests (generates `:test_hvf`, `:test_iso`,
