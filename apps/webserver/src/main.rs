@@ -1206,6 +1206,20 @@ fn stats_response() -> Response {
             uni::net::tcp::TCP_SYNACK_TX.load(core::sync::atomic::Ordering::Relaxed),
         );
 
+        // RX item H verification: the `recv_chunk` streaming-body
+        // path resolves either via the zero-copy device-buffer
+        // stash or the copying ring-drain fallback.
+        // `stash / (stash + ring_drain)` is the live zero-copy hit
+        // ratio — the measurement that settles whether item H's
+        // body-path zero-copy actually fires on this host (it won
+        // on HVF, was flat on GCE).
+        let _ = write!(
+            w,
+            ",\"rx_chunk_stash_hits\":{},\"rx_chunk_ring_drain\":{}",
+            uni::net::tcp::RX_CHUNK_STASH_HITS.load(core::sync::atomic::Ordering::Relaxed),
+            uni::net::tcp::RX_CHUNK_RING_DRAIN.load(core::sync::atomic::Ordering::Relaxed),
+        );
+
         // ---- AEAD throughput (TLS + QUIC) ----
         //
         // TLS counters cover the record layer (every full-record

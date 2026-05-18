@@ -660,6 +660,25 @@ pub static TCP_SYN_RX: core::sync::atomic::AtomicU64 =
 pub static TCP_SYNACK_TX: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
+/// RX item H verification counters. `do_recv_chunk` resolves a
+/// `recv_chunk` call by one of two paths:
+///   * the zero-copy **stash** — a device RX buffer `tcp_receive`
+///     moved straight into `pending_chunk`, surfaced as an
+///     `External` IOBuf with no copy;
+///   * the **ring-drain** fallback — the per-conn `rx_ring` copied
+///     into a fresh `Heap` IOBuf.
+/// `stash / (stash + ring_drain)` is the live measure of how often
+/// the streaming-body `recv_chunk` path is actually zero-copy — the
+/// signal item H's HVF-vs-GCE divergence needs to settle (item H
+/// won +13.6% on HVF but was flat on GCE; the hypothesis is that
+/// GCE segment bursts keep the ring non-empty so the fallback
+/// dominates — these counters confirm or refute it). Surfaced via
+/// `/stats` as `rx_chunk_stash_hits` / `rx_chunk_ring_drain`.
+pub static RX_CHUNK_STASH_HITS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static RX_CHUNK_RING_DRAIN: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 #[inline]
 fn tcp_hash_key(src_ip: IpAddr, src_port: u16, dst_port: u16) -> u64 {
     // Fold the source address to 32 bits so the existing
@@ -2194,6 +2213,8 @@ pub fn do_recv_chunk(handle: *mut (), generation: u16) -> Option<IOBuf> {
         return None;
     }
     if let Some(iobuf) = c.pending_chunk.take() {
+        // Zero-copy stash: the device RX buffer is surfaced as-is.
+        RX_CHUNK_STASH_HITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         return Some(iobuf);
     }
     let n = c.rx_used();
@@ -2210,6 +2231,10 @@ pub fn do_recv_chunk(handle: *mut (), generation: u16) -> Option<IOBuf> {
     v.resize(n, 0);
     let got = c.rx_pop(&mut v);
     v.truncate(got);
+    // Ring-drain fallback: one memcpy (rx_ring → Heap IOBuf). Not
+    // zero-copy — `into_owned()` on this is free, but the bytes
+    // already moved through the ring.
+    RX_CHUNK_RING_DRAIN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     Some(IOBuf::from(v))
 }
 
