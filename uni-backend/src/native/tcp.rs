@@ -259,6 +259,52 @@ fn native_tcp_do_recv(handle: *mut (), generation: u16, buf: &mut [u8]) -> usize
     }
 }
 
+/// Zero-copy-API chunk recv (RX items F/H), native variant.
+///
+/// The bare-metal path surfaces the NIC's own RX buffer as an
+/// `ExternalOwned` IOBuf — genuinely zero-copy. POSIX `recv` has no
+/// such buffer to lend; it copies at the syscall boundary. So this
+/// still pays one copy — but into a heap-owned `IOBuf` the
+/// `RecvChunkGuard` carries, exactly the copy native `do_recv`
+/// already pays. The point is *uniformity*: with this wired,
+/// `TcpStream::recv_chunk` resolves to a real chunk on native
+/// instead of `None`, so handlers (and `BodyReader`) can use the
+/// `recv_chunk` API on every backend without a `recv` fallback.
+/// `into_owned()` on the resulting `Heap` IOBuf is then zero-copy.
+fn native_tcp_do_recv_chunk(
+    handle: *mut (),
+    generation: u16,
+) -> Option<uni_iobuf::IOBuf> {
+    unsafe {
+        let (c, live) = check_gen(handle, generation);
+        if !live {
+            return None;
+        }
+        let fd = (*c).fd;
+        if fd < 0 {
+            return None;
+        }
+        // One recv per call into a heap buffer sized like the
+        // bare-metal per-conn rx_ring; `recv` returns only what is
+        // buffered and the Vec is truncated to that.
+        const CHUNK_LEN: usize = 16 * 1024;
+        let mut v = vec![0u8; CHUNK_LEN];
+        let n = recv(fd, v.as_mut_ptr(), v.len(), 0);
+        if n < 0 {
+            (*c).has_pending_data = false;
+            return None;
+        }
+        if n == 0 {
+            (*c).closed = true;
+            (*c).has_pending_data = false;
+            return None;
+        }
+        (*c).has_pending_data = false;
+        v.truncate(n as usize);
+        Some(uni_iobuf::IOBuf::from(v))
+    }
+}
+
 fn native_tcp_register_recv_waker(handle: *mut (), generation: u16, waker: &Waker) {
     unsafe {
         let (c, live) = check_gen(handle, generation);
@@ -472,14 +518,16 @@ pub(super) static NATIVE_TCP_BACKEND: uni_runtime::net::TcpBackend =
         // wake.
         set_recv_buf_slot: None,
         clear_recv_buf_slot: None,
-        // Zero-copy chunk recv (RX item F) is a bare-metal path:
-        // it surfaces the NIC's own RX buffer as an `ExternalOwned`
-        // IOBuf. POSIX `recv` has no such buffer to lend — it
-        // copies at the syscall boundary — so the native backend
-        // leaves all three chunk hooks `None`, which makes
-        // `TcpStream::recv_chunk` resolve to `None` on its first
-        // poll and callers fall back to `recv`.
-        do_recv_chunk: None,
+        // Zero-copy chunk recv (RX items F/H). `do_recv_chunk` is
+        // wired (not `None`) so `TcpStream::recv_chunk` resolves to
+        // a real chunk on native — handlers get one uniform API
+        // across bare-metal and native; see `native_tcp_do_recv_chunk`
+        // for why native still pays the syscall copy. The
+        // `set/clear_chunk_buf_slot` hooks stay `None`: they are the
+        // bare-metal "stash the device RX buffer" request, and
+        // native has no per-conn ring to bypass — `do_recv_chunk`
+        // just does the `recv` when called.
+        do_recv_chunk: Some(native_tcp_do_recv_chunk),
         set_chunk_buf_slot: None,
         clear_chunk_buf_slot: None,
         close: tcp_close,
