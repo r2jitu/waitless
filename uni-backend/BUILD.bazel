@@ -37,6 +37,14 @@ rust_library(
             "//drivers",
             "//kernel",
             "//net",
+            # `net_tcp` crate, for `tcp_diag()`'s TCP-stack counters.
+            # `gve` driver crate, for `gve_diag()`'s NIC counters.
+            # Both are bare-metal-only; `uni-backend` is the right
+            # home for these deps (it is the platform-split crate),
+            # and reading the atomics here keeps application crates
+            # off direct, native-build-breaking `os:none` deps.
+            "//net:tcp",
+            "//uni-driver-gve",
         ],
     }),
 )

@@ -318,6 +318,21 @@ pub mod diagnostics {
     /// (cursors apart) vs "host not delivering" (both stuck).
     pub fn net_rx_used_cursors() -> [(u16, u16); 8] { uni_backend::net_rx_used_cursors() }
 
+    /// gve NIC-driver diagnostic counters (RX-path items B/H —
+    /// surfaced on the `/stats` endpoint). Real values on a
+    /// bare-metal gve NIC; all-zero on native and under virtio-net.
+    /// Routed through `uni_backend` so application crates need no
+    /// direct — and native-build-breaking — dependency on the
+    /// `os:none`-only gve driver crate.
+    pub fn gve_diag() -> uni_backend::GveDiag { uni_backend::gve_diag() }
+
+    /// TCP/IP-stack diagnostic counters (`/stats`): SYN ingress vs
+    /// SYN-ACK egress, and the RX item-H `recv_chunk` zero-copy
+    /// stash-vs-ring-drain split. Real on bare-metal; all-zero on
+    /// native. Routed through `uni_backend` for the same reason as
+    /// [`gve_diag`] — app crates stay off a direct `net`-crate dep.
+    pub fn tcp_diag() -> uni_backend::TcpDiag { uni_backend::tcp_diag() }
+
     /// TX-side hot-path counters: per-qp packet counts + small/big
     /// pool saturation + scan-depth aggregates. `None` when no
     /// driver is bound or the active driver hasn't wired the

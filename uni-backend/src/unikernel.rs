@@ -21,6 +21,45 @@ pub use uni_drivers::net::{
     DIAG_QP_CAP as NET_DIAG_QP_CAP,
 };
 
+/// gve NIC driver diagnostic counters (RX-path items B/H — see
+/// `/stats`). Reads the bare-metal gve driver's atomics directly;
+/// every field stays 0 unless the gve NIC is the active driver
+/// (so all-zero under virtio-net). The native backend has no gve
+/// driver and stubs this all-zero (`native::gve_diag`), so an
+/// application can surface these counters through
+/// `uni::diagnostics` *without* itself depending on the
+/// `os:none`-only gve driver crate — the dependency that, placed
+/// in app code, breaks the native build.
+pub fn gve_diag() -> crate::GveDiag {
+    use core::sync::atomic::Ordering::Relaxed;
+    let sum = |a: &[core::sync::atomic::AtomicU64]| -> u64 {
+        a.iter().map(|c| c.load(Relaxed)).sum()
+    };
+    crate::GveDiag {
+        dqo_tx_miss_compl: uni_driver_gve::dqo::DQO_TX_MISS_COMPL.load(Relaxed),
+        dqo_tx_reinject_compl: uni_driver_gve::dqo::DQO_TX_REINJECT_COMPL.load(Relaxed),
+        dqo_rx_compl_skipped: uni_driver_gve::dqo::DQO_RX_COMPL_SKIPPED.load(Relaxed),
+        dqo_rx_last_skip_status: uni_driver_gve::dqo::DQO_RX_LAST_SKIP_STATUS.load(Relaxed),
+        rx_buf_repost_count: sum(&uni_driver_gve::RX_BUF_REPOST_COUNT),
+        gqi_recycle_pool_exhausted: sum(&uni_driver_gve::GQI_RECYCLE_POOL_EXHAUSTED),
+    }
+}
+
+/// TCP/IP-stack diagnostic counters (`/stats`). Reads the
+/// bare-metal `net` stack's atomics; the native backend has no
+/// `net` stack and stubs this all-zero (`native::tcp_diag`), so an
+/// application reads them through `uni::diagnostics` without a
+/// direct dependency on the `os:none` `net` crate.
+pub fn tcp_diag() -> crate::TcpDiag {
+    use core::sync::atomic::Ordering::Relaxed;
+    crate::TcpDiag {
+        syn_rx: net_tcp::TCP_SYN_RX.load(Relaxed),
+        synack_tx: net_tcp::TCP_SYNACK_TX.load(Relaxed),
+        rx_chunk_stash_hits: net_tcp::RX_CHUNK_STASH_HITS.load(Relaxed),
+        rx_chunk_ring_drain: net_tcp::RX_CHUNK_RING_DRAIN.load(Relaxed),
+    }
+}
+
 // ---- Event loop re-exports ------------------------------------------------
 
 pub use uni_kernel::eventloop::{request_shutdown, set_ready};

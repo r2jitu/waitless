@@ -1155,42 +1155,36 @@ fn stats_response() -> Response {
         emit_json_array(&mut w, "core_idle_cycles", &idle_cyc[..nc]);
         let _ = write!(w, ",\"cycles_per_us\":{}", uni::diagnostics::cycles_per_us());
 
-        // gve DQO TX MISS/REINJECT completion counters. Either > 0
-        // means the device internally dropped/recovered one of our
-        // outbound packets — useful signal that hardware-side
-        // backpressure is pushing back. Both stay at 0 on healthy
-        // flows. (PKT/DESC completion counts are deliberately
-        // omitted: per-packet atomic increments cost ~30% TX
-        // throughput; the same info is already in TX_PACKETS_PER_QP.)
+        // gve NIC-driver counters, via `uni::diagnostics::gve_diag`
+        // — NOT a direct `uni_driver_gve` reference: the gve driver
+        // is `os:none`-only, so reaching into it from this app crate
+        // makes `app` (hence the native `webserver_bin` and the
+        // `--env native` / `--env docker` benches) unbuildable. The
+        // accessor returns zeros on native and under virtio-net.
+        //   * dqo_tx_miss/reinject: device-side TX drop/recover —
+        //     > 0 means hardware backpressure (0 on healthy flows).
+        //     (PKT/DESC completion counts are deliberately omitted:
+        //     per-packet atomic increments cost ~30% TX throughput;
+        //     the same info is in TX_PACKETS_PER_QP.)
+        //   * dqo_rx_compl_skipped / last_skip_status: RX-completion
+        //     skips (RX-path item I observability).
+        //   * rx_buf_repost_count: per-qp RX frame count summed —
+        //     the item-B cross-core drop-callback sanity check; a
+        //     shortfall means a chain's IOBuf isn't dropping.
+        //   * gqi_recycle_pool_exhausted: 0 unless GQI's recycle
+        //     pool can't keep up with a slow consumer.
+        let gve = uni::diagnostics::gve_diag();
         let _ = write!(
             w,
             ",\"dqo_tx_miss_compl\":{},\"dqo_tx_reinject_compl\":{}\
-              ,\"dqo_rx_compl_skipped\":{},\"dqo_rx_last_skip_status\":{}",
-            uni_driver_gve::dqo::DQO_TX_MISS_COMPL.load(core::sync::atomic::Ordering::Relaxed),
-            uni_driver_gve::dqo::DQO_TX_REINJECT_COMPL.load(core::sync::atomic::Ordering::Relaxed),
-            uni_driver_gve::dqo::DQO_RX_COMPL_SKIPPED.load(core::sync::atomic::Ordering::Relaxed),
-            uni_driver_gve::dqo::DQO_RX_LAST_SKIP_STATUS.load(core::sync::atomic::Ordering::Relaxed),
-        );
-
-        // RX-path item B counters, summed across queue pairs.
-        // `rx_buf_repost_count` is the cross-core drop-callback
-        // sanity check: every received frame's buffer must repost,
-        // so this tracks the per-qp RX frame count — a shortfall
-        // means a chain's IOBuf isn't dropping. `gqi_recycle_pool_
-        // exhausted` stays 0 unless GQI's recycle pool can't keep
-        // up with a slow consumer.
-        let rx_buf_repost: u64 = uni_driver_gve::RX_BUF_REPOST_COUNT
-            .iter()
-            .map(|c| c.load(core::sync::atomic::Ordering::Relaxed))
-            .sum();
-        let gqi_pool_exhausted: u64 = uni_driver_gve::GQI_RECYCLE_POOL_EXHAUSTED
-            .iter()
-            .map(|c| c.load(core::sync::atomic::Ordering::Relaxed))
-            .sum();
-        let _ = write!(
-            w,
-            ",\"rx_buf_repost_count\":{},\"gqi_recycle_pool_exhausted\":{}",
-            rx_buf_repost, gqi_pool_exhausted,
+              ,\"dqo_rx_compl_skipped\":{},\"dqo_rx_last_skip_status\":{}\
+              ,\"rx_buf_repost_count\":{},\"gqi_recycle_pool_exhausted\":{}",
+            gve.dqo_tx_miss_compl,
+            gve.dqo_tx_reinject_compl,
+            gve.dqo_rx_compl_skipped,
+            gve.dqo_rx_last_skip_status,
+            gve.rx_buf_repost_count,
+            gve.gqi_recycle_pool_exhausted,
         );
 
         // SYN-ingress vs SYN-ACK-egress counters. Compared against
@@ -1199,25 +1193,31 @@ fn stats_response() -> Response {
         //   client SYNs > tcp_syn_rx  → RX driver / NIC dropping
         //   tcp_syn_rx == tcp_synack_tx ≠ client SYN-ACK received
         //                             → egress drop after our TX.
+        // TCP/IP-stack counters, via `uni::diagnostics::tcp_diag`
+        // — NOT a direct `uni::net::tcp` reference: `net` is the
+        // `os:none` bare-metal stack, and reaching into it from
+        // this app crate breaks the native build (same trap as the
+        // gve block above). Zeros on native.
+        //   * tcp_syn_rx vs tcp_synack_tx: SYN-ingress vs
+        //     SYN-ACK-egress — compared against a client-side pcap
+        //     (or nstat TcpActiveOpens/SynRetrans) these localize
+        //     ingress drops below the TCP stack:
+        //       client SYNs > tcp_syn_rx  → RX driver / NIC dropping
+        //       tcp_syn_rx == tcp_synack_tx ≠ client SYN-ACK got
+        //                                  → egress drop after TX.
+        //   * rx_chunk_stash_hits / ring_drain: the RX item-H
+        //     `recv_chunk` zero-copy device-buffer stash vs the
+        //     copying ring-drain fallback; stash / (stash +
+        //     ring_drain) is the live zero-copy hit ratio.
+        let tcp = uni::diagnostics::tcp_diag();
         let _ = write!(
             w,
-            ",\"tcp_syn_rx\":{},\"tcp_synack_tx\":{}",
-            uni::net::tcp::TCP_SYN_RX.load(core::sync::atomic::Ordering::Relaxed),
-            uni::net::tcp::TCP_SYNACK_TX.load(core::sync::atomic::Ordering::Relaxed),
-        );
-
-        // RX item H verification: the `recv_chunk` streaming-body
-        // path resolves either via the zero-copy device-buffer
-        // stash or the copying ring-drain fallback.
-        // `stash / (stash + ring_drain)` is the live zero-copy hit
-        // ratio — the measurement that settles whether item H's
-        // body-path zero-copy actually fires on this host (it won
-        // on HVF, was flat on GCE).
-        let _ = write!(
-            w,
-            ",\"rx_chunk_stash_hits\":{},\"rx_chunk_ring_drain\":{}",
-            uni::net::tcp::RX_CHUNK_STASH_HITS.load(core::sync::atomic::Ordering::Relaxed),
-            uni::net::tcp::RX_CHUNK_RING_DRAIN.load(core::sync::atomic::Ordering::Relaxed),
+            ",\"tcp_syn_rx\":{},\"tcp_synack_tx\":{}\
+              ,\"rx_chunk_stash_hits\":{},\"rx_chunk_ring_drain\":{}",
+            tcp.syn_rx,
+            tcp.synack_tx,
+            tcp.rx_chunk_stash_hits,
+            tcp.rx_chunk_ring_drain,
         );
 
         // ---- AEAD throughput (TLS + QUIC) ----

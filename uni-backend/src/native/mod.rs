@@ -1142,6 +1142,16 @@ pub const NET_DIAG_QP_CAP: usize = uni_net_driver::DIAG_QP_CAP;
 pub fn net_tx_diag() -> Option<NetTxDiag> { None }
 pub fn net_tx_desc_log_snapshot(_out: &mut [NetTxDescLogEntry]) -> usize { 0 }
 
+/// Native stub for the gve NIC-driver counters — gve is a
+/// bare-metal-only driver, so there is nothing to report. Mirrors
+/// the unikernel side's `gve_diag()` so cross-platform callers
+/// (`uni::diagnostics::gve_diag`) see one type on both backends.
+pub fn gve_diag() -> crate::GveDiag { crate::GveDiag::default() }
+
+/// Native stub for the TCP/IP-stack counters — the bare-metal
+/// `net` stack isn't linked on native. Mirrors `unikernel::tcp_diag`.
+pub fn tcp_diag() -> crate::TcpDiag { crate::TcpDiag::default() }
+
 // ---- Diag-capture stubs (native has no kernel panic to capture) ----
 
 pub fn diag_append(_bytes: &[u8]) {}
