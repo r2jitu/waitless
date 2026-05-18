@@ -53,17 +53,15 @@
 // single `next` link (a node index; `NULL` ends the list) serves
 // both:
 //
-//   * Free-list — a Treiber stack in `RxNodePool`. `alloc` pops,
-//     `free` pushes. Its head is a **tagged** `AtomicU64` packing
-//     `(node_index, version)`; the version increments on every push.
-//     That defeats ABA — a node popped, reused, and pushed back
-//     under a stalled `alloc` changes the version, so the stale
-//     `alloc`'s CAS fails and retries. So the free-list is correct
-//     under *any* number of concurrent `alloc`s / `free`s — no
-//     single-allocator discipline is load-bearing for soundness
-//     (Tier 2 happens to serialise distributors under `RX_LOCK`, but
-//     that is now only a performance fact). Same tagged-stack design
-//     as `uni_iobuf::IOBufPool`.
+//   * Free-list — a `tagged_treiber::TaggedTreiberStack` in
+//     `RxNodePool`. `alloc` pops, `free` pushes. Its tagged head
+//     defeats ABA (mechanism audited once in that crate's docs), so
+//     the free-list is correct under *any* number of concurrent
+//     `alloc`s / `free`s — no single-allocator discipline is load-
+//     bearing for soundness (Tier 2 happens to serialise
+//     distributors under `RX_LOCK`, but that is now only a
+//     performance fact). `uni_iobuf::IOBufPool` is the other
+//     consumer of that shared stack core.
 //
 //   * Inbox — a lock-free MPSC list rooted at `RxInbox::head`, one
 //     per core. `push` CAS-prepends; `drain_each` `swap(NULL)`s the
@@ -81,24 +79,15 @@
 #![allow(dead_code)]
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+
+use tagged_treiber::{TaggedTreiberStack, TreiberLinks};
 
 /// Sentinel node index: terminates an intrusive list and marks the
-/// empty free-list. `RxNodePool::new` rejects an `N` that could
-/// collide with it, so no real node ever has this index.
-const NULL: u32 = u32::MAX;
-
-/// Pack `(node_index, version)` into the tagged free-list head word.
-#[inline]
-const fn pack(idx: u32, version: u32) -> u64 {
-    ((idx as u64) << 32) | version as u64
-}
-
-/// Inverse of [`pack`].
-#[inline]
-const fn unpack(word: u64) -> (u32, u32) {
-    ((word >> 32) as u32, word as u32)
-}
+/// empty free-list. Equal to [`tagged_treiber::NULL_INDEX`].
+/// `RxNodePool::new` rejects an `N` that could collide with it, so no
+/// real node ever has this index.
+const NULL: u32 = tagged_treiber::NULL_INDEX;
 
 /// One intrusive hand-off node. Carries a single payload `T` from the
 /// distributor core to the owning core. Pre-allocated in an
@@ -283,10 +272,11 @@ pub struct RxNodePool<T, const N: usize> {
     /// The node storage. Indices into this array are the currency of
     /// both intrusive lists.
     nodes: [RxNode<T>; N],
-    /// Treiber-stack head of the free-list: packed `(node_index,
-    /// version)`. `node_index == NULL` means exhausted. The version
-    /// increments on every push to defeat ABA.
-    free_head: AtomicU64,
+    /// The lock-free free-list: a tagged-pointer Treiber stack of
+    /// node indices, empty when its head is `NULL`. Its `next` links
+    /// are the nodes' own `next` fields, reached via the
+    /// `TreiberLinks` impl below.
+    free_list: TaggedTreiberStack,
     /// Live count of free nodes — eventually-consistent, for
     /// observability and tests. Exact once the pool quiesces.
     free_count: AtomicUsize,
@@ -305,7 +295,7 @@ impl<T: Send, const N: usize> RxNodePool<T, N> {
         );
         RxNodePool {
             nodes: [const { RxNode::new() }; N],
-            free_head: AtomicU64::new(pack(NULL, 0)),
+            free_list: TaggedTreiberStack::new(NULL),
             free_count: AtomicUsize::new(0),
         }
     }
@@ -319,7 +309,7 @@ impl<T: Send, const N: usize> RxNodePool<T, N> {
             self.nodes[i].next.store(next, Ordering::Relaxed);
         }
         let head = if N == 0 { NULL } else { 0 };
-        self.free_head.store(pack(head, 0), Ordering::Release);
+        self.free_list.reset(head);
         self.free_count.store(N, Ordering::Relaxed);
     }
 
@@ -327,60 +317,22 @@ impl<T: Send, const N: usize> RxNodePool<T, N> {
     /// Correct under any number of concurrent `alloc`s / `free`s —
     /// the tagged head defeats ABA (see the module docs).
     fn alloc(&self) -> Option<u32> {
-        loop {
-            let head = self.free_head.load(Ordering::Acquire);
-            let (idx, version) = unpack(head);
-            if idx == NULL {
-                return None;
-            }
-            // `next[idx]` was published by the push that placed `idx`
-            // at the head (its Release CAS); our Acquire load above
-            // synchronises with it.
-            let next = self.nodes[idx as usize].next.load(Ordering::Relaxed);
-            // Pop leaves the version untouched — only pushes bump it.
-            // A push slipping in before this CAS changes the word, so
-            // the CAS fails and retries.
-            if self
-                .free_head
-                .compare_exchange_weak(
-                    head,
-                    pack(next, version),
-                    Ordering::Acquire,
-                    Ordering::Relaxed,
-                )
-                .is_ok()
-            {
-                self.free_count.fetch_sub(1, Ordering::Relaxed);
-                return Some(idx);
-            }
-        }
+        let idx = self.free_list.pop(self)?;
+        // `free_count` is a `Relaxed`, eventually-consistent
+        // observability counter (see the field docs). Bumping it just
+        // after the stack's CAS — rather than inside the stack — is
+        // observationally identical: nothing synchronises on it.
+        self.free_count.fetch_sub(1, Ordering::Relaxed);
+        Some(idx)
     }
 
     /// Return node `idx` to the free-list. Multi-producer-safe.
     /// `idx` must be off both the free-list and every inbox.
     fn free(&self, idx: u32) {
-        loop {
-            let head = self.free_head.load(Ordering::Acquire);
-            let (head_idx, version) = unpack(head);
-            self.nodes[idx as usize]
-                .next
-                .store(head_idx, Ordering::Relaxed);
-            // Bump the version — the ABA defence. Release publishes
-            // the `next` store to a future `alloc`'s Acquire load.
-            if self
-                .free_head
-                .compare_exchange_weak(
-                    head,
-                    pack(idx, version.wrapping_add(1)),
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                )
-                .is_ok()
-            {
-                self.free_count.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-        }
+        self.free_list.push(idx, self);
+        // See `alloc` on why this `Relaxed` counter bump is sound
+        // outside the stack's CAS.
+        self.free_count.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Distributor side: take a free node, move `payload` into it, and
@@ -414,6 +366,16 @@ impl<T: Send, const N: usize> RxNodePool<T, N> {
     /// Total node count (free + in-flight).
     pub fn capacity(&self) -> usize {
         N
+    }
+}
+
+impl<T: Send, const N: usize> TreiberLinks for RxNodePool<T, N> {
+    /// A node's free-list `next` link is the very `next` field the
+    /// inbox list also reuses — the two uses are mutually exclusive,
+    /// so one link serves both (see [`RxNode`]). `idx` came off the
+    /// stack, so it indexes a real node.
+    fn next_link(&self, idx: u32) -> &AtomicU32 {
+        &self.nodes[idx as usize].next
     }
 }
 

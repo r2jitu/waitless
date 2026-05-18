@@ -59,6 +59,7 @@ rust_library(
         "//uni-worker",
         "//uni-platform",
         "//util/atomic_fn",
+        "//util/tagged_treiber",
         "@crates//:getrandom",
         "@crates//:sha2",
         "@crates//:talc",
@@ -92,8 +93,9 @@ rust_test(
     crate_root = "src/sync.rs",
 )
 
-# `rx_inbox.rs` is generic and `core`-only — it compiles standalone
-# with no deps, so the cross-core inbox + tagged free-list get a real
+# `rx_inbox.rs` is generic and `core`-only — its one dependency is
+# the shared `tagged_treiber` Treiber-stack crate (itself zero-dep
+# `core`) — so the cross-core inbox + tagged free-list get a real
 # multi-threaded host stress test (the kernel library itself is
 # `os:none` and not host-buildable).
 rust_test(
@@ -101,6 +103,7 @@ rust_test(
     size = "small",
     srcs = ["src/rx_inbox.rs"],
     crate_root = "src/rx_inbox.rs",
+    deps = ["//util/tagged_treiber"],
 )
 
 # timer_test moved to //uni-worker:timer_test — the wheel now lives
