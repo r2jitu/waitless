@@ -172,9 +172,26 @@ pub fn ipv4_receive(data: &[u8]) -> Option<Ipv4Packet<'_>> {
     }
     let header_len = ihl * 4;
     let total_len = ntohs(hdr.total_length) as usize;
-    if total_len > data.len() || total_len < header_len {
+    // `total_len < header_len` is genuinely malformed — the packet
+    // claims fewer bytes than its own header. `header_len > data.len()`
+    // means part 0 of the RX chain doesn't even hold the claimed IPv4
+    // header (with options), so the `&data[header_len..]` slice below
+    // would be out of bounds. Both stay hard rejects.
+    if total_len < header_len || header_len > data.len() {
         return None;
     }
+    // A HW-GRO / RSC / LRO coalesced super-segment (RX item M) arrives
+    // as one IPv4 packet whose `total_length` — a 16-bit field, so
+    // ≤ 65535 — can far exceed part 0 of the RX chain; the payload
+    // continues in later chain parts this parser never sees. So
+    // `total_len > data.len()` is deliberately NOT a reject here:
+    // clamp the part-0 payload view to the bytes physically present
+    // and let the chain walk in `tcp_receive` cover the continuation.
+    // For an ordinary single-buffer frame `total_len <= data.len()`,
+    // so `payload_end == total_len` and this still trims any ethernet
+    // trailing padding exactly as before — behaviour-neutral until an
+    // RX-offload item (I / N) actually delivers a multi-buffer chain.
+    let payload_end = total_len.min(data.len());
 
     let our_ip = CONFIG.ip();
     let dst = hdr.dst;
@@ -189,6 +206,6 @@ pub fn ipv4_receive(data: &[u8]) -> Option<Ipv4Packet<'_>> {
         src: hdr.src,
         dst: hdr.dst,
         protocol: hdr.protocol,
-        payload: &data[header_len..total_len],
+        payload: &data[header_len..payload_end],
     })
 }

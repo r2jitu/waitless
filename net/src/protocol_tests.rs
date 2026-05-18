@@ -173,6 +173,44 @@ fn ipv4_reject_version6() {
     assert_ne!(version, 4);
 }
 
+#[test]
+fn ipv4_accepts_coalesced_super_segment_length() {
+    // RX item M: a HW-GRO / RSC coalesced super-segment hands
+    // `ipv4_receive` only part 0 of the RX chain — header + the first
+    // slice of payload — while `total_length` declares the whole
+    // coalesced length. The parse must NOT reject `total_length >
+    // data.len()` (that dropped every super-segment pre-item-M); it
+    // clamps the part-0 payload view to the bytes present instead.
+    // This mirrors `ipv4_receive`'s post-item-M bound check —
+    // `net_ipv4`'s `os:none` dep chain (`//kernel`) keeps the real
+    // function out of this host-native test crate.
+    let frame: [u8; 24] = [
+        0x45, 0x00, // version=4, IHL=5
+        0xC3, 0x50, // total_length = 50000 (coalesced; far past this buffer)
+        0x00, 0x01, 0x40, 0x00, // identification, flags=DF
+        0x40, 0x06, 0x00, 0x00, // TTL=64, proto=6 (TCP), checksum
+        0x0A, 0x00, 0x02, 0x0F, // src = 10.0.2.15
+        0x0A, 0x00, 0x02, 0x02, // dst = 10.0.2.2
+        0xDE, 0xAD, 0xBE, 0xEF, // 4 bytes of L4 payload present in part 0
+    ];
+    let data = &frame[..];
+    let ihl = (data[0] & 0x0F) as usize;
+    let header_len = ihl * 4;
+    let total_len = ntohs(u16::from_ne_bytes([data[2], data[3]])) as usize;
+
+    // Post-item-M reject conditions: a packet shorter than its own
+    // header, or whose header itself outruns the buffer. Neither here.
+    assert!(total_len >= header_len, "total_length covers the header");
+    assert!(header_len <= data.len(), "header present in part 0");
+    // `total_length` (50000) exceeds the buffer — this is the
+    // super-segment shape, and it is NOT a reject. The payload view
+    // clamps to the bytes physically present.
+    assert!(total_len > data.len());
+    let payload_end = total_len.min(data.len());
+    let payload = &data[header_len..payload_end];
+    assert_eq!(payload, &[0xDE, 0xAD, 0xBE, 0xEF]);
+}
+
 // ── TCP ──────────────────────────────────────────────────────────────────────
 
 #[test]

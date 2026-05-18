@@ -151,9 +151,20 @@ pub fn ipv6_receive<'a>(data: &'a [u8], our_addrs: &[Ipv6Addr]) -> Option<Ipv6Pa
         return None;
     }
     let payload_len = ntohs(hdr.payload_length) as usize;
-    if HEADER_LEN + payload_len > data.len() {
-        return None;
-    }
+    // A HW-GRO / RSC / LRO coalesced super-segment (RX item M) arrives
+    // as one IPv6 packet whose `payload_length` — a 16-bit field, so
+    // ≤ 65535 — can far exceed part 0 of the RX chain; the rest of the
+    // payload continues in later chain parts this parser never sees.
+    // So `HEADER_LEN + payload_len > data.len()` is deliberately NOT a
+    // reject here: clamp the part-0 payload view to the bytes
+    // physically present and let `tcp_receive`'s chain walk cover the
+    // continuation. For an ordinary single-buffer frame
+    // `HEADER_LEN + payload_len <= data.len()`, so `payload_end` is
+    // unchanged and any ethernet trailing padding is still trimmed —
+    // behaviour-neutral until an RX-offload item delivers a
+    // multi-buffer chain. `try_ref_from` already guaranteed
+    // `data.len() >= HEADER_LEN`, so `payload_end >= HEADER_LEN`.
+    let payload_end = (HEADER_LEN + payload_len).min(data.len());
     if !our_addrs.iter().any(|a| *a == hdr.dst) {
         return None;
     }
@@ -162,7 +173,7 @@ pub fn ipv6_receive<'a>(data: &'a [u8], our_addrs: &[Ipv6Addr]) -> Option<Ipv6Pa
         dst: hdr.dst,
         next_header: hdr.next_header,
         hop_limit: hdr.hop_limit,
-        payload: &data[HEADER_LEN..HEADER_LEN + payload_len],
+        payload: &data[HEADER_LEN..payload_end],
     })
 }
 
@@ -243,11 +254,37 @@ mod tests {
     }
 
     #[test]
-    fn rejects_truncated_payload() {
-        let mut buf = [0u8; HEADER_LEN + 1];
-        buf[0] = 0x60;
-        buf[5] = 8; // payload_length = 8 but only 1 byte of payload follows
-        buf[6] = next_header::UDP;
+    fn accepts_coalesced_super_segment_length() {
+        // RX item M: a HW-GRO / RSC coalesced super-segment hands the
+        // IPv6 parse only part 0 of the RX chain — the 40-byte header
+        // plus the first slice of payload — while `payload_length`
+        // declares the *whole* coalesced length, far more than is
+        // physically present. Pre-item-M the `HEADER_LEN + payload_len
+        // > data.len()` check rejected this and dropped every
+        // super-segment; now the parse clamps the part-0 payload view
+        // to the bytes present and accepts it (the continuation rides
+        // in later chain parts that `tcp_receive` walks).
+        let mut buf = [0u8; HEADER_LEN + 24]; // 40-byte hdr + 24 payload bytes here
+        buf[0] = 0x60; // version 6
+        // payload_length = 50000: a ~49 KiB coalesced segment whose
+        // tail lives in later chain parts the parser never sees.
+        buf[4..6].copy_from_slice(&50000u16.to_be_bytes());
+        buf[6] = next_header::TCP;
+        let our = [Ipv6Addr::ANY];
+        let pkt = ipv6_receive(&buf, &our).expect("super-segment accepted");
+        assert_eq!(pkt.next_header, next_header::TCP);
+        // Payload view is clamped to what part 0 actually holds — the
+        // 24 bytes after the header — not the 50000 declared.
+        assert_eq!(pkt.payload.len(), 24);
+    }
+
+    #[test]
+    fn rejects_too_short_for_header() {
+        // The super-segment clamp relaxes the *payload* length check,
+        // not the header one: a buffer too short to hold the 40-byte
+        // fixed header is still rejected by `try_ref_from`, which
+        // guards the header read the clamp relies on.
+        let buf = [0x60u8; HEADER_LEN - 1];
         let our = [Ipv6Addr::ANY];
         assert!(ipv6_receive(&buf, &our).is_none());
     }
