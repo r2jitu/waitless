@@ -18,6 +18,7 @@ pub mod diag;
 pub mod mmio;
 pub mod once;
 pub mod percpu;
+pub mod rng;
 pub mod rx_inbox;
 pub mod spsc;
 pub mod sync;

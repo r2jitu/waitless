@@ -18,6 +18,7 @@ rust_library(
         "src/mmio.rs",
         "src/once.rs",
         "src/percpu.rs",
+        "src/rng.rs",
         "src/rx_inbox.rs",
         "src/spsc.rs",
         "src/sync.rs",
