@@ -1,20 +1,13 @@
 // net/ipv4.rs — IPv4 packet parsing/building.
 
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
-extern crate net_arp as arp;
-extern crate net_eth_tx as eth_tx;
-extern crate net_ethernet as ethernet;
+extern crate kernel_core;
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
-extern crate uni_kernel;
 
-use arp::arp_resolve;
-use core::ptr;
-use eth_tx::ethernet_send;
-use ethernet::ETHERTYPE_IPV4;
 use from_bytes::FromBytes;
-use types::{CONFIG, Ipv4Addr, MacAddr, checksum, htons, ntohs};
+use types::{CONFIG, Ipv4Addr, checksum, htons, ntohs};
 
 pub const PROTO_TCP: u8 = 6;
 pub const PROTO_UDP: u8 = 17;
@@ -54,13 +47,13 @@ pub struct Ipv4Packet<'a> {
 struct IpIdSlot(core::sync::atomic::AtomicU16);
 
 /// Per-core IP-ID counter slots, sized at boot to actual core count.
-static IP_ID_PERCORE: uni_kernel::percpu::PerWorker<IpIdSlot> =
-    uni_kernel::percpu::PerWorker::new();
+static IP_ID_PERCORE: kernel_core::percpu::PerWorker<IpIdSlot> =
+    kernel_core::percpu::PerWorker::new();
 
 /// Allocate the per-core IP-ID counter table. Called from net stack
 /// init on the BSP after `percpu::init`. Idempotent.
 pub fn init() {
-    IP_ID_PERCORE.init(uni_kernel::percpu::num_cores(), |_| {
+    IP_ID_PERCORE.init(kernel_core::percpu::num_cores(), |_| {
         IpIdSlot(core::sync::atomic::AtomicU16::new(0))
     });
 }
@@ -84,7 +77,7 @@ fn next_ip_id() -> u16 {
     // model is happy and a borrow check on `&IpIdSlot` works through the
     // shared static. Relaxed is fine — IP IDs have no ordering needs.
     IP_ID_PERCORE
-        .at(uni_kernel::cpu_id())
+        .at(kernel_core::cpu_id())
         .0
         .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
 }
@@ -94,9 +87,9 @@ pub const HEADER_LEN: usize = 20;
 
 /// Write an IPv4 header in place into `slot` (which must be at
 /// least [`HEADER_LEN`] bytes). `total_len` is the IP `total_length`
-/// field (header + L4 payload). Used by upper layers that want to
-/// compose `[ETH][IP][L4][payload]` in a single buffer without
-/// memcpy'ing through the legacy `ipv4_send` slow path.
+/// field (header + L4 payload). Upper layers compose
+/// `[ETH][IP][L4][payload]` in a single buffer with this + the
+/// driver TX pool — there is no longer a memcpy-through send path.
 #[inline]
 pub fn fill_header(slot: &mut [u8], src: Ipv4Addr, dst: Ipv4Addr, proto: u8, total_len: u16) {
     debug_assert!(slot.len() >= HEADER_LEN);
@@ -117,46 +110,6 @@ pub fn fill_header(slot: &mut [u8], src: Ipv4Addr, dst: Ipv4Addr, proto: u8, tot
         hdr.dst = dst;
         hdr.checksum = checksum(slot.as_ptr(), HEADER_LEN);
     }
-}
-
-pub fn ipv4_send(dst: Ipv4Addr, proto: u8, payload: &[u8]) {
-    let payload_len = payload.len().min(1480);
-    let total_len = 20 + payload_len;
-
-    // Stack-allocated buffer: safe for multi-core (each core has its own stack).
-    // MaybeUninit avoids zeroing — we fill header + payload before send.
-    let mut buf = core::mem::MaybeUninit::<[u8; 1500]>::uninit();
-    let buf_ptr = buf.as_mut_ptr() as *mut u8;
-    let ip_id = next_ip_id();
-    unsafe {
-        let hdr = &mut *(buf_ptr as *mut Ipv4Header);
-        hdr.version_ihl = 0x45;
-        hdr.tos = 0;
-        hdr.total_length = htons(total_len as u16);
-        hdr.identification = htons(ip_id);
-        hdr.flags_fragment = htons(0x4000);
-        hdr.ttl = 64;
-        hdr.protocol = proto;
-        hdr.checksum = 0;
-        hdr.src = CONFIG.ip();
-        hdr.dst = dst;
-
-        hdr.checksum = checksum(buf_ptr, 20);
-
-        ptr::copy_nonoverlapping(payload.as_ptr(), buf_ptr.add(20), payload_len);
-    }
-
-    let dst_mac = if CONFIG.ip() == Ipv4Addr::ANY {
-        MacAddr::BROADCAST
-    } else {
-        match arp_resolve(dst) {
-            Some(mac) => mac,
-            None => return,
-        }
-    };
-
-    let frame = unsafe { core::slice::from_raw_parts(buf_ptr, total_len) };
-    ethernet_send(dst_mac, ETHERTYPE_IPV4, frame);
 }
 
 /// Parse and validate an IPv4 packet. Returns None if invalid or not for us.
@@ -210,4 +163,57 @@ pub fn ipv4_receive(data: &[u8]) -> Option<Ipv4Packet<'_>> {
         protocol: hdr.protocol,
         payload: &data[header_len..payload_end],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_a_well_formed_packet() {
+        // version=4 IHL=5, total_length=24 (20 header + 4 payload),
+        // protocol=TCP. Default `CONFIG` is all-zero (our_ip == ANY),
+        // so the dst-address filter is skipped.
+        let mut f = [0u8; 24];
+        f[0] = 0x45;
+        f[2..4].copy_from_slice(&24u16.to_be_bytes());
+        f[9] = PROTO_TCP;
+        f[20..24].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        let pkt = ipv4_receive(&f).expect("parse");
+        assert_eq!(pkt.protocol, PROTO_TCP);
+        assert_eq!(pkt.payload, &[0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    #[test]
+    fn accepts_coalesced_super_segment_length() {
+        // RX item M: a HW-GRO super-segment's `total_length` (50000
+        // here) outruns part 0 of the RX chain. `ipv4_receive` must
+        // not reject it — it clamps the part-0 payload view to the
+        // bytes present and leaves the rest to `tcp_receive`'s chain
+        // walk. (The real function — the parallel-logic check in
+        // `protocol_tests.rs` predates `net_ipv4` being host-testable.)
+        let mut f = [0u8; 24]; // 20-byte header + 4 payload bytes
+        f[0] = 0x45;
+        f[2..4].copy_from_slice(&50_000u16.to_be_bytes());
+        f[9] = PROTO_TCP;
+        let pkt = ipv4_receive(&f).expect("super-segment accepted");
+        assert_eq!(pkt.payload.len(), 4); // clamped to 24 - 20
+    }
+
+    #[test]
+    fn rejects_wrong_version() {
+        let mut f = [0u8; 24];
+        f[0] = 0x65; // version = 6
+        f[2..4].copy_from_slice(&24u16.to_be_bytes());
+        assert!(ipv4_receive(&f).is_none());
+    }
+
+    #[test]
+    fn rejects_total_len_below_header() {
+        // total_length = 10 — fewer bytes than the 20-byte header.
+        let mut f = [0u8; 24];
+        f[0] = 0x45;
+        f[2..4].copy_from_slice(&10u16.to_be_bytes());
+        assert!(ipv4_receive(&f).is_none());
+    }
 }
