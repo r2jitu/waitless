@@ -1298,8 +1298,12 @@ overwrites `pt_buf`. The guard binds the IOBuf's lifetime to the
 mutably borrowed, so the compiler *itself* enforces the stated
 "≤ 1 outstanding IOBuf per `TcpStream`" invariant — two live
 guards do not borrow-check. `recv_chunk` therefore takes
-`&mut self` where `recv` takes `&self`; that asymmetry is
-deliberate, not an oversight. `RecvChunkGuard<'a>` carries the
+`&mut self`. (This entry originally called the `recv`-`&self` /
+`recv_chunk`-`&mut self` asymmetry deliberate; commit `710d64c`
+later **closed** it — `recv` / `recv_exact` / `send` became
+`&mut self` too, since `&self` left the same ≤1-outstanding
+invariant *unenforced* for the fill-buffer path, a latent
+slot-stealing hazard.) `RecvChunkGuard<'a>` carries the
 borrow as `PhantomData<&'a mut ()>` — the inner type is opaque so
 one guard type serves both `TcpStream` (here) and `TlsStream`
 (item G). `data()` reads in place; `into_owned()` delegates to
@@ -1615,7 +1619,10 @@ drift), 3 medians each:
 | `upload_32k_tls` | 4853 / 12.6 k | 4866 / 12.6 k | +0.3 % / +0.5 % |
 
 (A separate 3-run non-interleaved sweep agreed: `upload_32k_tcp` 1c
-+14.5 %, `upload_32k_tls` 1c +1.1 %.)
++14.5 %, `upload_32k_tls` 1c +1.1 %. A later same-host A/B of
+`upload_1m_tcp` — 3-run medians, `4327a15` vs `main` — read
+**+12.9 %** 1c / +2.2 % 3c: the win holds across upload sizes, as
+expected for a steady-state per-chunk effect.)
 
 Reading the numbers honestly:
 
