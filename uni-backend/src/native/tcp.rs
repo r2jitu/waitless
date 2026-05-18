@@ -472,6 +472,16 @@ pub(super) static NATIVE_TCP_BACKEND: uni_runtime::net::TcpBackend =
         // wake.
         set_recv_buf_slot: None,
         clear_recv_buf_slot: None,
+        // Zero-copy chunk recv (RX item F) is a bare-metal path:
+        // it surfaces the NIC's own RX buffer as an `ExternalOwned`
+        // IOBuf. POSIX `recv` has no such buffer to lend — it
+        // copies at the syscall boundary — so the native backend
+        // leaves all three chunk hooks `None`, which makes
+        // `TcpStream::recv_chunk` resolve to `None` on its first
+        // poll and callers fall back to `recv`.
+        do_recv_chunk: None,
+        set_chunk_buf_slot: None,
+        clear_chunk_buf_slot: None,
         close: tcp_close,
         try_send: native_tcp_try_send_chain,
         register_send_waker: native_tcp_register_send_waker,
