@@ -8,6 +8,7 @@
 
 extern crate alloc;
 extern crate bitflags;
+extern crate kernel_core;
 extern crate net_dst_mac as dst_mac;
 extern crate net_ethernet as ethernet;
 extern crate net_from_bytes as from_bytes;
@@ -15,8 +16,7 @@ extern crate net_ipv4 as ipv4;
 extern crate net_ipv6 as ipv6;
 extern crate net_ipv6_send as ipv6_send;
 extern crate net_types as types;
-extern crate uni_drivers;
-extern crate uni_kernel;
+extern crate nic;
 extern crate uni_runtime;
 
 use alloc::boxed::Box;
@@ -465,7 +465,7 @@ impl TcpConnection {
 // Each `TcpConnection` is wrapped in `TcpConnCell` (an `UnsafeCell`
 // newtype) so cores share the `POOLS` static via shared references
 // rather than aliased `&mut`. The outer per-core array is held in
-// `uni_kernel::percpu::PerWorker`, which provides typed `current(&CurrentWorker)`
+// `kernel_core::percpu::PerWorker`, which provides typed `current(&CurrentWorker)`
 // access without manual unsafe at the call site.
 //
 // SAFETY discipline (enforced by flow-hash routing in net/lib.rs and by
@@ -612,7 +612,7 @@ impl TcpPool {
     }
 }
 
-static POOLS: uni_kernel::percpu::PerWorker<TcpPool> = uni_kernel::percpu::PerWorker::new();
+static POOLS: kernel_core::percpu::PerWorker<TcpPool> = kernel_core::percpu::PerWorker::new();
 
 // ---- Per-core 4-tuple → slot hash table ------------------------------------
 //
@@ -646,7 +646,8 @@ impl TcpHashCore {
     }
 }
 
-static TCP_HASH: uni_kernel::percpu::PerWorker<TcpHashCore> = uni_kernel::percpu::PerWorker::new();
+static TCP_HASH: kernel_core::percpu::PerWorker<TcpHashCore> =
+    kernel_core::percpu::PerWorker::new();
 
 /// Count of SYN (no-ACK) packets we see reach `tcp_receive` —
 /// diagnostic: compare against the bench client's SYN-sent count
@@ -859,7 +860,7 @@ fn tcp_linear_find(core: u32, src_ip: IpAddr, src_port: u16, dst_port: u16) -> O
 #[inline]
 fn next_seq() -> u32 {
     let mut buf = [0u8; 4];
-    uni_kernel::rng::fill_bytes(&mut buf);
+    kernel_core::rng::fill_bytes(&mut buf);
     u32::from_ne_bytes(buf)
 }
 
@@ -1074,12 +1075,12 @@ unsafe fn fill_tcp_frame_headers(
     // gve expects zero (device builds the pseudo-header from
     // the IP header). Without offload, we compute the full
     // checksum on the guest.
-    tcp_hdr.checksum = if uni_drivers::net::csum_tx_offload() {
-        match uni_drivers::net::csum_stamp_convention() {
-            uni_drivers::net::CsumStampConvention::PseudoHeaderPartial => {
+    tcp_hdr.checksum = if nic::csum_tx_offload() {
+        match nic::csum_stamp_convention() {
+            nic::CsumStampConvention::PseudoHeaderPartial => {
                 tcp_pseudo_partial(local_ip, dst_ip, PROTO_TCP, tcp_seg_len)
             }
-            uni_drivers::net::CsumStampConvention::Zero => 0,
+            nic::CsumStampConvention::Zero => 0,
         }
     } else {
         unsafe {
@@ -1150,17 +1151,17 @@ where
     F: FnOnce(&mut [u8]),
 {
     debug_assert!(frame_len <= FRAME_BUF_LEN);
-    let csum = if csum_tcp_off != 0 && uni_drivers::net::csum_tx_offload() {
+    let csum = if csum_tcp_off != 0 && nic::csum_tx_offload() {
         // 16 = byte offset of the TCP `checksum` field within
         // the TCP header.
-        uni_drivers::net::CsumOffload {
+        nic::CsumOffload {
             start: csum_tcp_off,
             offset: 16,
         }
     } else {
-        uni_drivers::net::CsumOffload::NONE
+        nic::CsumOffload::NONE
     };
-    if let Some(mut handle) = uni_drivers::net::acquire_tx_buf() {
+    if let Some(mut handle) = nic::acquire_tx_buf() {
         let cap = handle.data_cap as usize;
         debug_assert!(frame_len <= cap);
         // SAFETY: the handle's `data_mut()` returns a slice of
@@ -1168,7 +1169,7 @@ where
         // for the closure but the underlying buffer covers the
         // full slot.
         fill(&mut handle.data_mut()[..frame_len]);
-        uni_drivers::net::submit_tx(handle, frame_len, csum);
+        nic::submit_tx(handle, frame_len, csum);
         return;
     }
     // Slice-shaped fallback: stage on the stack, hand to the
@@ -1199,7 +1200,7 @@ where
         let frame = core::slice::from_raw_parts_mut(p, frame_len);
         fill(frame);
         let frame_const = core::slice::from_raw_parts(p, frame_len);
-        uni_drivers::net::send(frame_const);
+        nic::send(frame_const);
     }
 }
 
@@ -1262,7 +1263,7 @@ fn send_segment(
 /// cursor. The driver's NIC segments the payload into MSS-sized
 /// chunks host-side, fixing up TCP/IP headers per segment.
 ///
-/// Caller must have verified `uni_drivers::net::tso_available()`
+/// Caller must have verified `nic::tso_available()`
 /// before reaching this. Falls back to the per-MSS loop in
 /// `async_try_send_chain` when not available.
 fn send_super_segment_from_cursor(
@@ -1289,7 +1290,7 @@ fn send_super_segment_from_cursor(
     // TSO super-segments need a big-pool slot (16 KiB capacity).
     // Falls back to per-MSS when the big pool is full or TSO
     // isn't supported on this driver.
-    let Some(mut handle) = uni_drivers::net::acquire_tx_tso_buf() else {
+    let Some(mut handle) = nic::acquire_tx_tso_buf() else {
         send_per_mss_fallback(
             local_ip,
             dst_ip,
@@ -1350,7 +1351,7 @@ fn send_super_segment_from_cursor(
     let mss = mss_for(local_ip);
     let hdr_len = (payload_off) as u16;
     let csum_start = (tcp_off) as u16;
-    uni_drivers::net::submit_tx_tso(handle, frame_len, hdr_len, csum_start, mss as u16);
+    nic::submit_tx_tso(handle, frame_len, hdr_len, csum_start, mss as u16);
 }
 
 /// Try to send a single TCP TSO super-segment whose payload is
@@ -1403,7 +1404,7 @@ pub fn try_send_tso(
         return None;
     }
     let dst_mac = dst_mac::resolve(c.remote_ip)?;
-    let mut handle = uni_drivers::net::acquire_tx_tso_buf()?;
+    let mut handle = nic::acquire_tx_tso_buf()?;
 
     let payload_off = payload_offset(c.local_ip);
     let cap = handle.data_cap() as usize;
@@ -1470,7 +1471,7 @@ pub fn try_send_tso(
 
     let hdr_len = payload_off as u16;
     let csum_start = tcp_off as u16;
-    uni_drivers::net::submit_tx_tso(handle, frame_len, hdr_len, csum_start, mss as u16);
+    nic::submit_tx_tso(handle, frame_len, hdr_len, csum_start, mss as u16);
 
     c.snd_nxt = c.snd_nxt.wrapping_add(payload_len as u32);
     Some(Ok(payload_len))
@@ -1612,7 +1613,7 @@ pub fn tcp_receive(src_ip: IpAddr, dst_ip: IpAddr, mut segment: Chain<OwnedIOBuf
     let payload_len = segment.total_len().saturating_sub(data_offset);
 
     // Determine which core owns this packet.
-    let core = uni_kernel::cpu_id();
+    let core = kernel_core::cpu_id();
 
     // SAFETY for the closures below: per-core ownership — only this
     // core (== `core`) is touching POOLS[core][*].
@@ -2011,7 +2012,7 @@ fn seq_lt(a: u32, b: u32) -> bool {
 /// initializes every slot to a fresh `TcpConnection` and links them
 /// into the free list before publishing the segment.
 pub fn init() {
-    let n = uni_kernel::percpu::num_cores();
+    let n = kernel_core::percpu::num_cores();
     POOLS.init(n, |_| TcpPool::new());
     TCP_HASH.init(n, |_| TcpHashCore::new());
 }
@@ -2037,7 +2038,7 @@ pub fn listen_on_core(core: u32, port: u16) -> *mut () {
 /// hook. Returns `TcpStream::NULL` if no connection is ready
 /// on this core.
 pub fn accept_on_port(port: u16) -> uni_runtime::net::TcpStream {
-    accept_on_port_core(uni_kernel::cpu_id(), port)
+    accept_on_port_core(kernel_core::cpu_id(), port)
 }
 
 fn accept_on_port_core(core: u32, port: u16) -> uni_runtime::net::TcpStream {
@@ -2154,7 +2155,7 @@ pub fn close(handle: *mut (), generation: u16) {
 /// their pools, so cross-core read access is race-free for the
 /// shutdown window.
 pub fn shutdown_all() {
-    let n = uni_kernel::percpu::num_cores();
+    let n = kernel_core::percpu::num_cores();
     for core in 0..n {
         let cap = pool_capacity(core);
         for slot in 0..cap {
@@ -2186,9 +2187,9 @@ pub fn shutdown_all() {
             c.rx_ring = None;
         }
     }
-    // The caller (`net::bare_shutdown_all`) flushes the virtio TX
-    // staging + kick after this returns — `net_tcp` deliberately
-    // doesn't depend on `uni_drivers`.
+    // The caller (`net::bare_shutdown_all`) flushes the NIC TX
+    // staging + kick after this returns — this teardown path
+    // deliberately leaves that flush to the caller.
 }
 
 /// Async `TcpRecv` sync read hook. Verifies `generation`; stale
@@ -2425,7 +2426,7 @@ pub fn async_try_send_chain(
     //      where serial-port output is gated on GCE) this is
     //      what makes a `/diag-gve` HTTP endpoint reachable on
     //      the same VM that's failing TSO sends for /diagnostics.
-    if uni_drivers::net::tso_available()
+    if nic::tso_available()
         && total > mss
         && payload_offset(c.local_ip) + total <= TSO_FRAME_BUF_LEN
     {
