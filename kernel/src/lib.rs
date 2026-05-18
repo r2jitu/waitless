@@ -21,7 +21,9 @@ pub mod time;
 // crate (split out so they are unit-testable off the bare-metal
 // target). Re-export every one so consumers' `uni_kernel::{percpu,
 // sync, rx_inbox, ...}` paths are unchanged.
-pub use kernel_core::{deque, diag, mmio, once, percpu, rx_inbox, spsc, sync, timer, types};
+pub use kernel_core::{
+    cpu_id, deque, diag, mmio, once, percpu, rx_inbox, spsc, sync, timer, types,
+};
 
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;
@@ -29,8 +31,14 @@ pub mod x86_64;
 #[cfg(target_arch = "aarch64")]
 pub mod aarch64;
 
-/// Get current CPU ID (arch-independent).
-pub fn cpu_id() -> u32 {
+/// Arch CPU-id implementation, exported under a stable `#[no_mangle]`
+/// symbol so `kernel_core::cpu_id()`'s link seam resolves to it on
+/// the bare-metal target. `kernel_core` is the lower crate and can't
+/// reach `//kernel`'s arch modules directly, so it declares this
+/// symbol and `//kernel` defines it. Callers use `cpu_id()` (the
+/// re-exported `kernel_core::cpu_id`), never this directly.
+#[unsafe(no_mangle)]
+pub extern "Rust" fn __uni_kernel_cpu_id() -> u32 {
     #[cfg(target_arch = "x86_64")]
     {
         x86_64::smp::cpu_id()

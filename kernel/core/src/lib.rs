@@ -23,3 +23,34 @@ pub mod spsc;
 pub mod sync;
 pub mod timer;
 pub mod types;
+
+/// Current CPU id.
+///
+/// On the bare-metal target this resolves, via a link seam, to
+/// `//kernel`'s arch implementation (`__uni_kernel_cpu_id`);
+/// `kernel_core` is the lower crate and cannot call up into the
+/// arch modules, so it declares the symbol and `//kernel` defines
+/// it. On a host build there is one logical CPU, so it is `0` —
+/// which is what makes `net_tcp` (a `cpu_id` caller) host-testable.
+///
+/// Compile-time `cfg`, not a function pointer: the per-packet
+/// callers (`tcp_receive`, the Tier-2 RX distributor) pay nothing
+/// for the seam — production emits a single direct call, exactly as
+/// before the split.
+#[inline]
+pub fn cpu_id() -> u32 {
+    #[cfg(target_os = "none")]
+    {
+        unsafe extern "Rust" {
+            fn __uni_kernel_cpu_id() -> u32;
+        }
+        // SAFETY: `//kernel` defines this `#[no_mangle]` symbol, and
+        // every `os:none` binary that links `kernel_core` also links
+        // `//kernel` (it is the foundational crate).
+        unsafe { __uni_kernel_cpu_id() }
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        0
+    }
+}
