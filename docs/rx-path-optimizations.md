@@ -49,13 +49,15 @@ bufs past the callback).
 | 4 | TCP fast path (parked recv) | [`net/src/tcp.rs:331`](net/src/tcp.rs#L331) | **1× memcpy** | `ptr::copy_nonoverlapping` directly into user buf |
 | 4'| TCP slow path (no parked recv) | [`net/src/tcp.rs:303`](net/src/tcp.rs#L303) | **1× memcpy** (into ring) + **1× memcpy** (out at recv) | Per-conn 16 KiB byte ring |
 | 5 | HTTP parse-buf refill | [`uni-http/src/lib.rs`](uni-http/src/lib.rs) `serve_conn` | 0 (Phase 1: bytes flow through stream.recv into parse buf — same memcpy as step 4) | Headers + body prebuf land here |
-| 6 | BodyReader::chunk past prebuf | [`uni-http/src/lib.rs`](uni-http/src/lib.rs) | **1× memcpy** | Into 4 KiB `refill` scratch via `stream.recv` |
-| 7 | Handler reads body | app handler | 0 | Borrowed `&[u8]` (Phase 1) |
+| 6 | BodyReader::chunk past prebuf | [`uni-http/src/lib.rs:332`](uni-http/src/lib.rs#L332) | **0** (item H) | `recv_chunk` surfaces the transport buffer behind a `BodyChunkGuard`; the 4 KiB `refill` scratch is gone |
+| 7 | Handler reads body | app handler | 0 | `BodyChunkGuard::data()` — in-place view (item H) |
 
-Active per-byte memcpys on **TCP RX** guest side: **2** for body
-bytes past the prebuf on the fast path (one TCP-fast-path copy +
-one BodyReader refill); **2 + 2 = 4** on the slow path (ring in,
-ring out, prebuf, refill). Down from 5–6 before Phase 1.
+Active per-byte memcpys on **TCP RX** guest side for body bytes
+past the prebuf: **0** on the item-F stash fast path (the device
+buffer moves straight through `recv_chunk` to the handler) and
+**1** on the ring-drain fallback — item H removed the BodyReader
+`refill` copy that used to sit on top of both. Down from 2 (fast)
+/ 4 (slow) before this plan.
 
 ## Current path — TCP (HTTPS / TLS 1.3)
 
@@ -65,12 +67,14 @@ ring out, prebuf, refill). Down from 5–6 before Phase 1.
 | 5 | TLS pump_rx into cipher_buf | [`uni-tls/src/lib.rs:513`](uni-tls/src/lib.rs#L513) | 0 (in-place pump from TcpStream::recv) | 8 KiB inline cipher_buf |
 | 6 | AEAD decrypt | TLS state machine | **1× R/W** (ChaCha20) + **1× R** (Poly1305 verify) | Plaintext lands in `pt_buf` (17 KiB after Phase 1's bump) |
 | 7 | TlsStream::recv pops plaintext | [`uni-tls/src/lib.rs:685`](uni-tls/src/lib.rs#L685) | **1× memcpy** | pt_buf → user buf (item G's `recv_chunk` is the zero-copy sibling) |
-| 8 | HTTP / BodyReader same as TCP | | 1× memcpy | refill |
+| 8 | HTTP / BodyReader past prebuf | [`uni-http/src/lib.rs:332`](uni-http/src/lib.rs#L332) | **0** (items G + H) | `recv_chunk` hands a `Borrowed` view into `pt_buf`; the `refill` scratch is gone |
 
-Active per-byte memcpys on **TLS RX** guest side: **2** + the
-fundamental AEAD R/W. AEAD is unremovable without offloading
-crypto to a co-processor; the two structural memcpys (pt_buf→user
-and BodyReader refill) are the target.
+Active per-byte memcpys on **TLS RX** guest side: the fundamental
+AEAD R/W only — items G and H removed both structural memcpys
+(`pt_buf`→user buf, and the BodyReader `refill`). AEAD is
+unremovable without offloading crypto to a co-processor. Note the
+TLS body path is therefore AEAD-decrypt-bound, not memcpy-bound —
+see item H's progress-log bench note.
 
 ## Current path — QUIC / HTTP/3
 
@@ -311,10 +315,24 @@ AEAD.
   re-running pt_buf until the guard ends.
 
 ### H. `BodyReader::chunk` returns guard
-- **Status**: [ ]
-- **Where**: [`uni-http/src/lib.rs`](uni-http/src/lib.rs) `BodyReader`;
-  [`apps/webserver/src/main.rs`](apps/webserver/src/main.rs) `/discard`
-  handler update.
+- **Status**: [x] landed 2026-05-17 — commits `1e97350` (HttpStream
+  trait `recv_chunk`), `ad85de4` (uni-tls fold), `91aa952`
+  (`BodyReader::chunk` returns the guard). See the progress-log
+  entry below.
+- **Where**:
+  * [`uni-http/src/lib.rs:254`](../uni-http/src/lib.rs#L254) —
+    `BodyReader` struct (4 KiB `refill` scratch field dropped);
+    [`:332`](../uni-http/src/lib.rs#L332) — `BodyReader::chunk`;
+    [`:423`](../uni-http/src/lib.rs#L423) — new `BodyChunkGuard`
+    type; [`:804`](../uni-http/src/lib.rs#L804) — `HttpStream`
+    trait `recv_chunk` (default `-> None`);
+    [`:892`](../uni-http/src/lib.rs#L892) — `HttpStream for
+    TcpStream` `recv_chunk` (forwards to the inherent method).
+  * [`uni-tls/src/lib.rs:804`](../uni-tls/src/lib.rs#L804) —
+    `HttpStream for TlsStream` `recv_chunk` (item G's inherent
+    method folded into the trait impl).
+  * [`apps/webserver/src/main.rs:341`](../apps/webserver/src/main.rs#L341)
+    — `/discard` handler updated to the `BodyChunkGuard` shape.
 - **What**: change Phase 1's `BodyReader::chunk() -> &[u8]` to
   `BodyReader::chunk() -> Option<BodyChunkGuard<'_>>`. Guard
   exposes `data()` and `into_owned()`. Variants by source:
@@ -1460,3 +1478,171 @@ Next: item H — `BodyReader::chunk` returns a guard, wiring
 `TlsStream::recv_chunk`. That is where the zero-copy body win
 actually lands (the threshold table budgets +10–20 % on
 `upload_32k_tls` 1c after H).
+
+### 2026-05-17 — Phase 2/3, item H: `BodyReader::chunk` returns a guard ([x] **landed** — commits `1e97350`, `ad85de4`, `91aa952`)
+
+The item that *spends* the `recv_chunk` guard pattern items F and G
+built: `BodyReader::chunk` changes from `-> &[u8]` to
+`-> Option<BodyChunkGuard<'_>>`, and request-body bytes past the
+parse-buffer prebuf now reach the handler with no intermediate copy
+— end-to-end zero-copy body delivery on the TCP path.
+
+**The trait-method knot.** `BodyReader<S: HttpStream>` is generic
+over the stream, so `recv_chunk` had to be reachable through the
+`HttpStream` trait — F/G left it inherent on `TcpStream` /
+`TlsStream` only, and the two had different shapes (`TcpStream`: a
+non-`async fn` returning the `RecvChunk` future struct; `TlsStream`:
+an `async fn`). The trait method is
+`async fn recv_chunk(&mut self) -> Option<RecvChunkGuard<'_>>` with
+a **default body returning `None`** — that default is load-bearing:
+`NullStream` (the HTTP/3 pre-buffered-body transport) has no
+streaming chunk path and inherits it, so a `BodyReader` over
+`NullStream` serves the body from its prebuf alone. `TcpStream` and
+`TlsStream` override it. The two impls resolve the name collision
+differently, each cleanly:
+
+- **`TlsStream` folds in.** `uni-tls` owns both `TlsStream` and its
+  `impl HttpStream for TlsStream`, so the inherent `recv_chunk`
+  (item G) just *becomes* the trait-impl override — body moved
+  verbatim, inherent method deleted, no collision left to footgun.
+- **`TcpStream` forwards.** `uni::runtime::TcpStream` can't impl an
+  uni-http trait (the dependency runs the other way) and item-F
+  doc-tests call its inherent `recv_chunk`, so that method stays;
+  the trait impl forwards to it. The forward is written as a plain
+  `fn` returning the *concrete* `RecvChunk` future — not an
+  `async fn` block, and not the trait's opaque `impl Future` — so it
+  is type-checked against the inherent method. If the inherent
+  method were ever deleted, `uni::runtime::TcpStream::recv_chunk`
+  would resolve to the *trait* method (opaque return), and the
+  mismatch against `-> RecvChunk<'_>` is a compile error rather than
+  the silent infinite recursion an `impl Future` return would let
+  through. That concrete return refines the trait's `impl Trait`;
+  the targeted `#[allow(refining_impl_trait_reachable)]` is
+  intentional — the refinement *is* the footgun guard.
+
+**`BodyChunkGuard`.** A new guard type in uni-http wrapping the body
+chunk from either source behind one `data() -> &[u8]` (zero-copy in
+place) / `into_owned() -> IOBuf` façade:
+
+- *Prebuf bytes* — a `Borrowed` `IOBuf` over `serve_conn`'s parse
+  buffer; `data()` zero-copy, `into_owned()` materialises `Heap`.
+- *Past-prebuf bytes* — the `RecvChunkGuard` the transport surfaced:
+  `ExternalOwned` (bare-metal TCP, zero-copy `into_owned`) or
+  `Borrowed`-into-`pt_buf` (TLS, +1-memcpy `into_owned`).
+
+It is kept **separate** from `RecvChunkGuard`, not merged — the
+prebuf source is a plain `Borrowed` `IOBuf` with no `RecvChunkGuard`
+behind it, so a merge would not actually cover both. Single-part and
+frozen: `BodyReader` delivers one contiguous run per call;
+multi-part delivery is item I. `BodyChunkGuard<'a>` borrows
+`&'a mut BodyReader` — the `Stream` variant's `RecvChunkGuard<'a>`
+and the `Prebuf` variant's `PhantomData<&'a mut ()>` both thread
+that lifetime, so a live guard keeps the `BodyReader` (hence the
+stream, hence `pt_buf` / the device buffer) borrowed: the item-F/G
+borrow-safety property, one layer up. The 4 KiB `[u8; 4096]`
+`refill` scratch field (plus `refill_start` / `refill_end`) is gone
+— past-prebuf bytes come from `recv_chunk`, not `stream.recv` into
+scratch.
+
+**The over-read cap.** Phase-1's `chunk` capped `stream.recv` at the
+remaining body length so it never read past `Content-Length` into
+the next pipelined request; `recv_chunk` surfaces a *whole*
+transport chunk and cannot be told a limit. `chunk` therefore caps
+the *delivered* slice (`take = guard.data().len().min(want_max)`),
+which keeps the handler and the `delivered` accounting correct. The
+residue — a transport chunk straddling the `Content-Length`
+boundary — is dropped when the guard drops. That straddle is
+reachable only by pipelining a follow-up request into the tail
+segment of a body that overflowed the 16 KiB parse buffer; the
+pre-Phase-4 server has no streaming header parser and no test or
+bench exercises it, so this is a documented limitation, not a
+regression of a supported path. The proper fix lives with the
+Phase-4 streaming parser (already an "Out of scope" bullet).
+
+**Tests.** Four `body_reader_tests` added to `uni_http_test`
+(now 17 tests): prebuf `data()` zero-copy view, prebuf
+`into_owned()` heap copy, the prebuf trim to `Content-Length`, and
+the `NullStream` past-prebuf EOF case. They drive `chunk` through a
+minimal single-poll executor — the prebuf path and the inherited
+`NullStream::recv_chunk` `-> None` default both resolve without
+suspending. The transport-`recv_chunk` source needs a live backend
+and is exercised by `test_hvf` (which, with `/discard` on the new
+path, now runs body bytes through it live).
+
+Verified per commit: `bazel build
+//apps/webserver:webserver_qemu_x86_64`; `bazel build
+//apps/webserver:webserver.elf
+--platforms=//bazel/platforms:aarch64_unikernel`; `bazel test
+//uni-http:uni_http_test //apps/webserver:test_hvf` (TCP + TLS
+round-trips, 30-conn burst); plus `uni_tls_test` on the uni-tls
+commit.
+
+**Perf — same-session A/B, `main` vs item H, HVF 1c/3c** (the
+`--env hvf --cores 1,3` protocol). Item H is the first item with a
+real win, so the A/B matters: a 3-round **interleaved** sweep
+(`main`, item H, `main`, … — alternation cancels monotonic host
+drift), 3 medians each:
+
+| Workload | `main` 1c/3c | item H 1c/3c | Δ 1c/3c |
+|---|---|---|---|
+| `get_tcp` (control) | 199.4 k / 194.4 k | 211.6 k / 194.9 k | +6.1 % / +0.2 % |
+| `get_tls_fresh` (control) | 2939 / 7587 | 2779 / 7473 | −5.4 % / −1.5 % |
+| `upload_32k_tcp` | 21.6 k / 40.0 k | 24.5 k / 40.4 k | **+13.6 %** / +1.2 % |
+| `upload_32k_tls` | 4853 / 12.6 k | 4866 / 12.6 k | +0.3 % / +0.5 % |
+
+(A separate 3-run non-interleaved sweep agreed: `upload_32k_tcp` 1c
++14.5 %, `upload_32k_tls` 1c +1.1 %.)
+
+Reading the numbers honestly:
+
+- **`upload_32k_tcp` 1c +13.6 %** — the headline win, and bigger
+  than a pure memcpy count predicts. `recv_chunk`'s item-F stash
+  path moves a single-part in-sequence segment's device buffer
+  *straight into the chunk*, skipping **both** the
+  `tcp_receive`→`rx_ring` copy and the old `rx_ring`→`refill` copy.
+  Just below the threshold table's `+15–25 %` budget, which is a
+  GCE/QEMU-calibrated figure (item F's entry already noted the
+  51 k upload baseline is a GCE number, not HVF) — on HVF this is a
+  clean, reproducible double-digit gain.
+- **`upload_32k_tls` 1c +0.3 %** — essentially flat, *below* the
+  table's `+10–20 %` budget. This is the honest finding: the TLS
+  body path is **AEAD-decrypt-bound, not memcpy-bound**. `recv_chunk`
+  surfaces a `Borrowed` view of `pt_buf` (AEAD must always decrypt
+  *into* `pt_buf`), so item H removes exactly one ~16 KiB
+  `pt_buf`→`refill` copy per request — at ~4.9 k req/s ≈ 80 MB/s of
+  cache-hot memcpy, ~0.5–1 % of a core against the ChaCha20-Poly1305
+  decrypt that dominates. The `+10–20 %` budget was optimistic; the
+  win is real but small. Item H still achieves end-to-end zero-copy
+  on the TLS body path — the bench just shows where the TLS
+  bottleneck actually is.
+- **`get_tcp` (control) +6.1 % @1c** — exceeds the ±3 % control
+  band, but in the *favorable* direction and for an explained, real
+  reason: `BodyReader` is constructed per request (GET included),
+  and Phase-1's `BodyReader::new` zero-initialised the 4 KiB
+  `refill` array every time. Dropping the field removes a 4 KiB
+  `memset` per request — at ~200 k req/s that is the ~6 % gain. A
+  genuine secondary win, not a regression. Flat (+0.2 %) at 3c,
+  where `get_tcp` is bottlenecked on Tier-2 cross-core RX, not
+  per-request setup.
+- **`get_tls_fresh` (control) −5.4 % @1c / −1.5 % @3c** — within
+  the noise envelope for this workload. No code path item H touches
+  can systematically slow a TLS *handshake* (the body path runs
+  after it); `get_tls_fresh` is a documented-noisy small-N crypto
+  workload (item G's entry recorded a −6 % cross-session phantom on
+  it), and the 3c reading sits inside the ±3 % band. The −5 % @1c
+  is host noise.
+
+**GCE checkpoint — PENDING.** The plan mandates a GCE checkpoint
+after H (`./scripts/gcp-bench.sh --cores 1,3`; expected
+`upload_32k_tcp` 1c ~51 k → ~62 k). It could not be run this
+session: the `kvm-vm` GCE instance no longer exists and `gcp.sh`
+exposes no `create` path, so the checkpoint needs the instance
+re-provisioned first (machine/zone/custom-image upload — see the
+GCE image-upload gotchas in project memory). Tracked as pending,
+the same state item D's checkpoint is recorded in. The local HVF
+A/B above — interleaved + a confirming non-interleaved sweep, 6
+runs per branch — is the landing evidence; the GCE run remains the
+authoritative gve gate and should be run before item I piles on.
+
+Next: item I (multi-buf RX chain accumulation in DQO), then item J
+(enable RSC).
