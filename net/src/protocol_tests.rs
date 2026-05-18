@@ -176,12 +176,12 @@ fn ipv4_reject_version6() {
 #[test]
 fn ipv4_accepts_coalesced_super_segment_length() {
     // RX item M: a HW-GRO / RSC coalesced super-segment hands
-    // `ipv4_receive` only part 0 of the RX chain — header + the first
+    // `ipv4_parse` only part 0 of the RX chain — header + the first
     // slice of payload — while `total_length` declares the whole
     // coalesced length. The parse must NOT reject `total_length >
     // data.len()` (that dropped every super-segment pre-item-M); it
     // clamps the part-0 payload view to the bytes present instead.
-    // This mirrors `ipv4_receive`'s post-item-M bound check —
+    // This mirrors `ipv4_parse`'s post-item-M bound check —
     // `net_ipv4`'s `os:none` dep chain (`//kernel`) keeps the real
     // function out of this host-native test crate.
     let frame: [u8; 24] = [

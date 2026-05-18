@@ -29,7 +29,7 @@ pub struct Ipv4Header {
 // SAFETY: repr(C, packed), all fields are POD integer / Ipv4Addr.
 unsafe impl FromBytes for Ipv4Header {}
 
-/// Parsed IPv4 packet returned by ipv4_receive.
+/// Parsed IPv4 packet returned by ipv4_parse.
 pub struct Ipv4Packet<'a> {
     pub src: Ipv4Addr,
     pub dst: Ipv4Addr,
@@ -114,7 +114,7 @@ pub fn fill_header(slot: &mut [u8], src: Ipv4Addr, dst: Ipv4Addr, proto: u8, tot
 
 /// Parse and validate an IPv4 packet. Returns None if invalid or not for us.
 /// Caller is responsible for dispatching based on protocol field.
-pub fn ipv4_receive(data: &[u8]) -> Option<Ipv4Packet<'_>> {
+pub fn ipv4_parse(data: &[u8]) -> Option<Ipv4Packet<'_>> {
     let hdr = Ipv4Header::try_ref_from(data)?;
 
     let version = hdr.version_ihl >> 4;
@@ -179,7 +179,7 @@ mod tests {
         f[2..4].copy_from_slice(&24u16.to_be_bytes());
         f[9] = PROTO_TCP;
         f[20..24].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
-        let pkt = ipv4_receive(&f).expect("parse");
+        let pkt = ipv4_parse(&f).expect("parse");
         assert_eq!(pkt.protocol, PROTO_TCP);
         assert_eq!(pkt.payload, &[0xde, 0xad, 0xbe, 0xef]);
     }
@@ -187,7 +187,7 @@ mod tests {
     #[test]
     fn accepts_coalesced_super_segment_length() {
         // RX item M: a HW-GRO super-segment's `total_length` (50000
-        // here) outruns part 0 of the RX chain. `ipv4_receive` must
+        // here) outruns part 0 of the RX chain. `ipv4_parse` must
         // not reject it — it clamps the part-0 payload view to the
         // bytes present and leaves the rest to `tcp_receive`'s chain
         // walk. (The real function — the parallel-logic check in
@@ -196,7 +196,7 @@ mod tests {
         f[0] = 0x45;
         f[2..4].copy_from_slice(&50_000u16.to_be_bytes());
         f[9] = PROTO_TCP;
-        let pkt = ipv4_receive(&f).expect("super-segment accepted");
+        let pkt = ipv4_parse(&f).expect("super-segment accepted");
         assert_eq!(pkt.payload.len(), 4); // clamped to 24 - 20
     }
 
@@ -205,7 +205,7 @@ mod tests {
         let mut f = [0u8; 24];
         f[0] = 0x65; // version = 6
         f[2..4].copy_from_slice(&24u16.to_be_bytes());
-        assert!(ipv4_receive(&f).is_none());
+        assert!(ipv4_parse(&f).is_none());
     }
 
     #[test]
@@ -214,6 +214,6 @@ mod tests {
         let mut f = [0u8; 24];
         f[0] = 0x45;
         f[2..4].copy_from_slice(&10u16.to_be_bytes());
-        assert!(ipv4_receive(&f).is_none());
+        assert!(ipv4_parse(&f).is_none());
     }
 }

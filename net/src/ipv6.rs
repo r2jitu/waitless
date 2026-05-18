@@ -10,7 +10,7 @@
 //   * 40-byte fixed header parse + build (RFC 8200 §3).
 //   * `ipv6_build` — fills a caller-supplied buffer with header +
 //     payload, returns total length.
-//   * `ipv6_receive` — peels the v6 header, returns src/dst/
+//   * `ipv6_parse` — peels the v6 header, returns src/dst/
 //     next_header/payload after dst-address filtering.
 //   * `pseudo_checksum` — IPv6 pseudo-header for ICMPv6 / UDP /
 //     TCP (RFC 8200 §8.1 + RFC 4443 §2.3).
@@ -68,7 +68,7 @@ unsafe impl FromBytes for Ipv6Header {}
 
 pub const HEADER_LEN: usize = 40;
 
-/// View into an IPv6 packet returned by `ipv6_receive`.
+/// View into an IPv6 packet returned by `ipv6_parse`.
 pub struct Ipv6Packet<'a> {
     pub src: Ipv6Addr,
     pub dst: Ipv6Addr,
@@ -144,7 +144,7 @@ pub fn ipv6_build(
 /// drops packets whose dst isn't in this set. Caller-managed
 /// because the IPv6 module is plain L3 — the address policy lives
 /// in higher layers (NDP / SLAAC / app config).
-pub fn ipv6_receive<'a>(data: &'a [u8], our_addrs: &[Ipv6Addr]) -> Option<Ipv6Packet<'a>> {
+pub fn ipv6_parse<'a>(data: &'a [u8], our_addrs: &[Ipv6Addr]) -> Option<Ipv6Packet<'a>> {
     let hdr = Ipv6Header::try_ref_from(data)?;
     let v_c_f = ntohl_local(hdr.version_class_flow);
     if (v_c_f >> 28) != 6 {
@@ -237,7 +237,7 @@ mod tests {
         let n = ipv6_build(&src, &dst, next_header::ICMPV6, 255, payload, &mut buf).expect("build");
         assert_eq!(n, HEADER_LEN + 4);
 
-        let pkt = ipv6_receive(&buf, &[dst]).expect("parse");
+        let pkt = ipv6_parse(&buf, &[dst]).expect("parse");
         assert_eq!(pkt.src, src);
         assert_eq!(pkt.dst, dst);
         assert_eq!(pkt.next_header, next_header::ICMPV6);
@@ -250,7 +250,7 @@ mod tests {
         let mut buf = [0u8; HEADER_LEN];
         buf[0] = 0x40; // version=4 (impossible in v6 header but caught)
         let addrs: [Ipv6Addr; 0] = [];
-        assert!(ipv6_receive(&buf, &addrs).is_none());
+        assert!(ipv6_parse(&buf, &addrs).is_none());
     }
 
     #[test]
@@ -271,7 +271,7 @@ mod tests {
         buf[4..6].copy_from_slice(&50000u16.to_be_bytes());
         buf[6] = next_header::TCP;
         let our = [Ipv6Addr::ANY];
-        let pkt = ipv6_receive(&buf, &our).expect("super-segment accepted");
+        let pkt = ipv6_parse(&buf, &our).expect("super-segment accepted");
         assert_eq!(pkt.next_header, next_header::TCP);
         // Payload view is clamped to what part 0 actually holds — the
         // 24 bytes after the header — not the 50000 declared.
@@ -286,7 +286,7 @@ mod tests {
         // guards the header read the clamp relies on.
         let buf = [0x60u8; HEADER_LEN - 1];
         let our = [Ipv6Addr::ANY];
-        assert!(ipv6_receive(&buf, &our).is_none());
+        assert!(ipv6_parse(&buf, &our).is_none());
     }
 
     #[test]
@@ -296,7 +296,7 @@ mod tests {
         buf[6] = next_header::ICMPV6;
         buf[24 + 15] = 0x42; // dst = ::42
         let our = [Ipv6Addr::ANY]; // ::
-        assert!(ipv6_receive(&buf, &our).is_none());
+        assert!(ipv6_parse(&buf, &our).is_none());
     }
 
     #[test]

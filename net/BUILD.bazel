@@ -91,7 +91,7 @@ rust_library(
     ],
 )
 
-# IPv4 wire format — parse + header build. Pure leaf: `ipv4_receive`
+# IPv4 wire format — parse + header build. Pure leaf: `ipv4_parse`
 # / `same_subnet` are pure; `fill_header` / `next_ip_id` use only
 # `kernel_core` (the per-core IP-ID counter). Host-testable.
 rust_library(

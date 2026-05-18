@@ -42,6 +42,13 @@ pub enum Classified {
     Drop,
 }
 
+/// Byte offset of `inner` within `outer`. `inner` must be a
+/// sub-slice of `outer` (it always is here — both come from
+/// the same frame buffer).
+fn offset_within(outer: &[u8], inner: &[u8]) -> usize {
+    inner.as_ptr() as usize - outer.as_ptr() as usize
+}
+
 /// Parse one frame's L2/L3 headers exactly once. `frame` is part 0
 /// of the RX chain — the headers are contiguous there. Pure: the
 /// arp/ndp snoop and the L4 dispatch are the caller's job, so the
@@ -59,16 +66,16 @@ pub fn classify(frame: &[u8], fill_v6: impl FnOnce(&mut [Ipv6Addr; 5]) -> usize)
         ethernet::ETHERTYPE_ARP => {
             // `payload` is a sub-slice of `frame`, so this offset is
             // in-bounds by construction.
-            Classified::Arp(payload.as_ptr() as usize - frame.as_ptr() as usize)
+            Classified::Arp(offset_within(frame, payload))
         }
-        ethernet::ETHERTYPE_IPV4 => match parse_ipv4(frame, payload, src_mac) {
+        ethernet::ETHERTYPE_IPV4 => match summarize_ipv4(frame, payload, src_mac) {
             Some(p) => Classified::Ip(p),
             None => Classified::Drop,
         },
         ipv6::ETHERTYPE_IPV6 => {
             let mut accept = [Ipv6Addr::ANY; 5];
             let n = fill_v6(&mut accept);
-            match parse_ipv6(frame, payload, src_mac, &accept[..n]) {
+            match summarize_ipv6(frame, payload, src_mac, &accept[..n]) {
                 Some(p) => Classified::Ip(p),
                 None => Classified::Drop,
             }
@@ -82,11 +89,11 @@ pub fn classify(frame: &[u8], fill_v6: impl FnOnce(&mut [Ipv6Addr; 5]) -> usize)
 /// the IPv4 packet with the Ethernet header stripped. A non-TCP/UDP
 /// IPv4 packet still parses to `Some` — the L4 dispatch no-ops on
 /// the protocol, but carrying it keeps the arp-snoop alive.
-fn parse_ipv4(frame: &[u8], eth_payload: &[u8], src_mac: MacAddr) -> Option<ParsedL3> {
-    let pkt = ipv4::ipv4_receive(eth_payload)?;
+fn summarize_ipv4(frame: &[u8], eth_payload: &[u8], src_mac: MacAddr) -> Option<ParsedL3> {
+    let pkt = ipv4::ipv4_parse(eth_payload)?;
     // L4 segment's (offset, len) within part 0 — pointer arithmetic
     // over the backing buffer. Robust across IPv4 header options.
-    let l4_off = pkt.payload.as_ptr() as usize - frame.as_ptr() as usize;
+    let l4_off = offset_within(frame, pkt.payload);
     let l4_len = pkt.payload.len();
     Some(ParsedL3 {
         proto: pkt.protocol,
@@ -105,17 +112,17 @@ fn parse_ipv4(frame: &[u8], eth_payload: &[u8], src_mac: MacAddr) -> Option<Pars
 }
 
 /// Summarise an IPv6 packet into a [`ParsedL3`] — the IPv6 twin of
-/// `parse_ipv4`. The L4 offset is robust across IPv6 extension
-/// headers. `our_v6` is the dst-address accept-list `ipv6_receive`
+/// `summarize_ipv4`. The L4 offset is robust across IPv6 extension
+/// headers. `our_v6` is the dst-address accept-list `ipv6_parse`
 /// filters against.
-fn parse_ipv6(
+fn summarize_ipv6(
     frame: &[u8],
     eth_payload: &[u8],
     src_mac: MacAddr,
     our_v6: &[Ipv6Addr],
 ) -> Option<ParsedL3> {
-    let pkt = ipv6::ipv6_receive(eth_payload, our_v6)?;
-    let l4_off = pkt.payload.as_ptr() as usize - frame.as_ptr() as usize;
+    let pkt = ipv6::ipv6_parse(eth_payload, our_v6)?;
+    let l4_off = offset_within(frame, pkt.payload);
     let l4_len = pkt.payload.len();
     Some(ParsedL3 {
         proto: pkt.next_header,

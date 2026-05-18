@@ -119,7 +119,7 @@ pub(crate) fn distribute_frame(chain: Chain<OwnedIOBuf>) {
 /// Snoop an on-link sender's L2 MAC into *this* core's neighbor
 /// cache — the ARP cache for a v4 frame, the NDP cache for v6. A
 /// no-op when `snoop_mac` is `None` (an off-subnet v4 sender, whose
-/// L2 MAC is the gateway's; see `parse_ipv4`).
+/// L2 MAC is the gateway's; see `summarize_ipv4`).
 fn snoop(parsed: &types::ParsedL3) {
     match (parsed.snoop_mac, parsed.src) {
         (Some(mac), types::IpAddr::V4(s)) => arp::arp_learn(s, mac),
