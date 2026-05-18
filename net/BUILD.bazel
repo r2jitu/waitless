@@ -290,6 +290,29 @@ rust_test(
     crate_root = "src/dhcp_parse.rs",
 )
 
+# RX classify stage + Tier-2 flow distribution. Pure leaf — depends
+# only on the wire-format leaves — so the classify verdict logic and
+# the flow hash are host-unit-testable. `uni_net_stack`'s `rx` module
+# is the os:none shell that supplies the IPv6 accept-list + delivers.
+rust_library(
+    name = "net_rx",
+    srcs = ["src/classify.rs"],
+    crate_name = "net_rx",
+    crate_root = "src/classify.rs",
+    deps = [
+        ":ethernet",
+        ":ipv4",
+        ":ipv6",
+        ":types",
+    ],
+)
+
+rust_test(
+    name = "net_rx_test",
+    size = "small",
+    crate = ":net_rx",
+)
+
 # ── Umbrella crate: full-stack dispatch + poll ───────────────────────────────
 
 rust_library(
@@ -312,6 +335,7 @@ rust_library(
         ":ipv6",
         ":ipv6_send",
         ":ndp",
+        ":net_rx",
         ":tcp",
         ":types",
         ":udp",

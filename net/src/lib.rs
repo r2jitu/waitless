@@ -16,6 +16,8 @@ extern crate uni_iobuf;
 extern crate uni_kernel;
 extern crate uni_runtime;
 
+extern crate net_rx;
+
 pub extern crate net_arp as arp;
 pub extern crate net_dhcp as dhcp;
 pub extern crate net_eth_tx as eth_tx;
