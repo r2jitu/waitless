@@ -149,12 +149,10 @@ impl<'a, T> Drop for SpinlockGuard<'a, T> {
 // crate gives every consumer the same type.
 //
 // Re-exported here so existing `uni_kernel::sync::AtomicFn` imports
-// keep resolving unchanged. Gated on `not(test)` so the
-// `//kernel:sync_test` rust_test target (which compiles this file
-// as a standalone `panic=unwind` binary and only exercises
-// `Spinlock`) doesn't pull in the `atomic_fn` crate and hit the
-// `panic=abort` vs `=unwind` mismatch.
-#[cfg(not(test))]
+// keep resolving unchanged. (Was `#[cfg(not(test))]`-gated for the
+// old standalone `//kernel:sync_test`; `kernel_core`'s crate-level
+// `core_test` declares the `atomic_fn` dep, and `percpu` references
+// `crate::sync::AtomicFn` unconditionally, so the gate is gone.)
 pub use atomic_fn::AtomicFn;
 
 #[cfg(test)]

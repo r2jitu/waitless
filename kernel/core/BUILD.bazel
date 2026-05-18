@@ -1,0 +1,47 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//bazel/rules:rust.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Host-buildable pure-logic core of the kernel — lock-free data
+# structures, per-core state, sync primitives, plain data types. No
+# hardware or arch access; that stays in `//kernel` (os:none). Split
+# out so this logic is unit-testable on the host. `//kernel`
+# re-exports every module here, so `uni_kernel::{percpu, sync, ...}`
+# paths are unchanged for consumers.
+rust_library(
+    name = "core",
+    srcs = [
+        "src/deque.rs",
+        "src/diag.rs",
+        "src/lib.rs",
+        "src/mmio.rs",
+        "src/once.rs",
+        "src/percpu.rs",
+        "src/rx_inbox.rs",
+        "src/spsc.rs",
+        "src/sync.rs",
+        "src/timer.rs",
+        "src/types.rs",
+    ],
+    crate_name = "kernel_core",
+    crate_root = "src/lib.rs",
+    deps = [
+        "//net:types",
+        "//uni-iobuf",
+        "//uni-runtime",
+        "//uni-worker",
+        "//util/atomic_fn",
+        "//util/tagged_treiber",
+    ],
+)
+
+# One host-native test target covers every module's `#[cfg(test)]`
+# suite — the lock-free deque / spsc / rx_inbox stress tests, the
+# sync primitives — replacing the per-file `rust_test`s that used to
+# live in `//kernel`'s BUILD.
+rust_test(
+    name = "core_test",
+    size = "small",
+    crate = ":core",
+)

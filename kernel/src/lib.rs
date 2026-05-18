@@ -5,25 +5,23 @@
 #![no_std]
 
 extern crate alloc;
+extern crate kernel_core;
 
 pub mod cpu;
 pub mod cpu_info;
-pub mod deque;
-pub mod diag;
 pub mod eventloop;
 pub mod mm;
-pub mod mmio;
-pub mod once;
-pub mod percpu;
 pub mod rng;
 pub mod runtime;
-pub mod rx_inbox;
 pub mod serial;
-pub mod spsc;
-pub mod sync;
 pub mod time;
-pub mod timer;
-pub mod types;
+
+// The pure-logic kernel modules — lock-free data structures, per-core
+// state, sync primitives — live in the host-buildable `kernel_core`
+// crate (split out so they are unit-testable off the bare-metal
+// target). Re-export every one so consumers' `uni_kernel::{percpu,
+// sync, rx_inbox, ...}` paths are unchanged.
+pub use kernel_core::{deque, diag, mmio, once, percpu, rx_inbox, spsc, sync, timer, types};
 
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;

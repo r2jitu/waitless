@@ -1,5 +1,4 @@
 load("@rules_rust//rust:defs.bzl", "rust_library")
-load("//bazel/rules:rust.bzl", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -8,23 +7,13 @@ rust_library(
     srcs = [
         "src/cpu.rs",
         "src/cpu_info.rs",
-        "src/deque.rs",
-        "src/diag.rs",
         "src/eventloop.rs",
         "src/lib.rs",
         "src/mm.rs",
-        "src/mmio.rs",
-        "src/once.rs",
-        "src/percpu.rs",
         "src/rng.rs",
         "src/runtime.rs",
-        "src/rx_inbox.rs",
         "src/serial.rs",
-        "src/spsc.rs",
-        "src/sync.rs",
         "src/time.rs",
-        "src/timer.rs",
-        "src/types.rs",
     ] + select({
         "//bazel/platforms:x86_64": [
             "src/x86_64/acpi.rs",
@@ -59,6 +48,7 @@ rust_library(
         # leaf, so this adds no cycle with the `net_*` crates that
         # depend back on `//kernel`.
         "//net:types",
+        "//kernel/core",
         "//uni-iobuf",
         "//uni-runtime",
         "//uni-worker",
@@ -73,43 +63,3 @@ rust_library(
         "//conditions:default": [],
     }),
 )
-
-# Host-native unit tests for lock-free data structures. panic=unwind
-# is supplied via `.bazelrc`'s `test --extra_rustc_flag=-Cpanic=unwind`
-# — see that file for the full explanation.
-rust_test(
-    name = "deque_test",
-    size = "small",
-    srcs = ["src/deque.rs"],
-    crate_root = "src/deque.rs",
-)
-
-rust_test(
-    name = "spsc_test",
-    size = "small",
-    srcs = ["src/spsc.rs"],
-    crate_root = "src/spsc.rs",
-)
-
-rust_test(
-    name = "sync_test",
-    size = "small",
-    srcs = ["src/sync.rs"],
-    crate_root = "src/sync.rs",
-)
-
-# `rx_inbox.rs` is generic and `core`-only — its one dependency is
-# the shared `tagged_treiber` Treiber-stack crate (itself zero-dep
-# `core`) — so the cross-core inbox + tagged free-list get a real
-# multi-threaded host stress test (the kernel library itself is
-# `os:none` and not host-buildable).
-rust_test(
-    name = "rx_inbox_test",
-    size = "small",
-    srcs = ["src/rx_inbox.rs"],
-    crate_root = "src/rx_inbox.rs",
-    deps = ["//util/tagged_treiber"],
-)
-
-# timer_test moved to //uni-worker:timer_test — the wheel now lives
-# there so both backends can share it.
