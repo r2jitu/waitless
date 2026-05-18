@@ -25,13 +25,15 @@ rust_library(
     ],
     crate_name = "uni_aes_gcm",
     rustc_flags = select({
-        # x86_64-unknown-none defaults to `+soft-float,-sse`, so
-        # `__m128i` intrinsics fail to legalize. Enable the full
-        # AES-NI/PCLMUL/AVX2 feature set (also turns the rustc
-        # cfg `target_feature = "pclmulqdq"` on, which selects
-        # our stitched SIMD path).
+        # SSE2 (the register class `__m128i` intrinsics legalize to)
+        # is baked into the hard-float `@hardfloat_x86_64_none` target
+        # spec, so no ABI toggle is needed. This is the non-ABI
+        # x86_64-v3 SIMD perf baseline shared with the crypto crates
+        # (cf. `_X86_CRYPTO_FLAG` in MODULE.bazel); it also turns on
+        # the `target_feature = "pclmulqdq"` cfg that selects our
+        # stitched SIMD path.
         "//bazel/platforms:x86_64": [
-            "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2",
+            "-Ctarget-feature=+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2",
         ],
         # aarch64-unknown-none defaults to +neon only; FEAT_AES
         # (which provides `vmull_p64` / PMULL needed by our 8-way

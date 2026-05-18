@@ -80,19 +80,22 @@ hkdf = { version = "0.12", default-features = false }
 # vs AES-NI. See git log around the migration commit for the
 # full forensic chain.
 #
-# Hardware acceleration: with `+aes,+pclmul,+sse2,+avx,+avx2`
-# baked in via `_X86_CRYPTO_FLAG` in MODULE.bazel, the
+# Hardware acceleration: the x86_64 unikernel is built by the
+# custom hard-float `@hardfloat_x86_64_none` toolchain, whose
+# target spec bakes in SSE2 — so `__m128i` intrinsics have a
+# register class everywhere (the stock soft-float
+# `x86_64-unknown-none` makes LLVM bail with "Do not know how to
+# split the result of this operator!", rust-lang/rust #87642,
+# #92760). On top of that, `_X86_CRYPTO_FLAG` in MODULE.bazel
+# adds the non-ABI `+aes,+pclmul,+avx2` etc., so the
 # `cpufeatures::new!()` macros in `aes` + `polyval` evaluate to
-# compile-time `true`, so the AES-NI + PCLMULQDQ backends are
+# compile-time `true`: the AES-NI + PCLMULQDQ backends are
 # selected unconditionally — no runtime CPUID dispatch and no
-# soft-path fallback in the binary. The stock
-# `x86_64-unknown-none` target has `+soft-float,-sse` baked in
-# and LLVM bails with "Do not know how to split the result of
-# this operator!" (rust-lang/rust #87642, #92760) without those
-# overrides. The kernel already enables SSE at boot
-# (CR4.OSFXSR) and our cooperative scheduler never preempts, so
-# kernel-side SIMD is safe (see `boot/src/x86_64/idt_stubs.S`
-# for the YMM save/restore path that protects mid-IRQ SIMD).
+# soft-path fallback in the binary. The kernel already enables
+# SSE at boot (CR4.OSFXSR) and our cooperative scheduler never
+# preempts, so kernel-side SIMD is safe (see
+# `boot/src/x86_64/idt_stubs.S` for the YMM save/restore path
+# that protects mid-IRQ SIMD).
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc", "zeroize"] }
 # `aes` and `polyval` are direct deps for the hand-rolled stitched
 # AES-128-GCM in `uni-tls::aes_gcm_fast` — see comments there for

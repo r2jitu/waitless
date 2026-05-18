@@ -193,6 +193,21 @@
   },
   "selectedYankedVersions": {},
   "moduleExtensions": {
+    "//bazel/buildstd:extensions.bzl%hardfloat": {
+      "general": {
+        "bzlTransitiveDigest": "LR9p/spN9Dg498rZMv1+T5zjF9yXQZYKt9OeGwTLwHQ=",
+        "usagesDigest": "BVrwPHniN0pUieFl560KpZa01IzGsXA7pM9LfL4HbOA=",
+        "recordedInputs": [],
+        "generatedRepoSpecs": {
+          "hardfloat_x86_64_none": {
+            "repoRuleId": "@@//bazel/buildstd:extensions.bzl%_hardfloat_sysroot",
+            "attributes": {
+              "target_json": "@@//bazel/toolchain:x86_64-unikernel-none.json"
+            }
+          }
+        }
+      }
+    },
     "@@pybind11_bazel+//:internal_configure.bzl%internal_configure_extension": {
       "general": {
         "bzlTransitiveDigest": "06cynZ1bCvvy8zHPrrDlXq+Z68xmjctHpfFxi+zEpJY=",

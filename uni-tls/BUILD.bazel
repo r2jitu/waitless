@@ -51,17 +51,16 @@ rust_library(
         "--check-cfg=cfg(tls_debug)",
         "--check-cfg=cfg(test)",
     ] + select({
-        # The aes-gcm AEAD path inlines `__m128i` intrinsics from
-        # the `aes` + `polyval` crates into our own `aead.rs`
-        # call sites. With `x86_64-unknown-none`'s default
-        # `+soft-float`, LLVM has no register class for those
-        # vector types and bails with "Do not know how to split
-        # the result of this operator!". Apply the same
-        # target-feature override the crypto crates already use
-        # (cf. `_X86_CRYPTO_FLAG` in MODULE.bazel) to our crate
-        # so the inlined SIMD compiles cleanly.
+        # The aes-gcm AEAD path inlines `__m128i` intrinsics from the
+        # `aes` + `polyval` crates into our own `aead.rs` call sites.
+        # SSE2 (the register class those vector types need) is baked
+        # into the hard-float `@hardfloat_x86_64_none` target spec, so
+        # no ABI toggle is needed here. This flag is the same non-ABI
+        # x86_64-v3 SIMD perf baseline the crypto crates use (cf.
+        # `_X86_CRYPTO_FLAG` in MODULE.bazel) -- it just lets the
+        # inlined SIMD use the wider AVX2/AES/PCLMUL instructions.
         "//bazel/platforms:x86_64": [
-            "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2",
+            "-Ctarget-feature=+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2",
         ],
         # aarch64-unknown-none defaults to +neon only; FEAT_AES
         # (which provides vmull_p64 / PMULL needed by our 8-way

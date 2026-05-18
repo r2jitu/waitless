@@ -4,6 +4,9 @@ exports_files([
     "unikernel.ld",
     "unikernel_arm64.ld",
     "unikernel_limine.ld",
+    # Hard-float x86_64 bare-metal target spec. Consumed by the `hardfloat`
+    # module extension (//bazel/buildstd) to build the sysroot + toolchain.
+    "x86_64-unikernel-none.json",
 ])
 
 filegroup(name = "empty")

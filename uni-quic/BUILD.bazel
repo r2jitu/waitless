@@ -3,14 +3,14 @@ load("//bazel/rules:rust.bzl", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 
-# x86_64-unknown-none compiles with `+soft-float` baked in. AES-GCM
-# inlines 128-bit vector ops (`__m128i`, pclmulqdq) into call sites,
-# so any crate that calls into `aes-gcm` for AES-128-GCM packet
-# protection also needs the SSE/AES/PCLMUL target features turned
-# on. Same fix as the per-crate annotations in MODULE.bazel — applied
-# here at the rust_library level so the x86 build of //uni-quic itself
-# (and downstream crates that monomorphise its types) compiles.
-_X86_CRYPTO_FLAG = "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2"
+# AES-GCM inlines 128-bit vector ops (`__m128i`, pclmulqdq) into call
+# sites, so //uni-quic (and downstream crates that monomorphise its
+# types) pulls them in too. SSE2 -- the register class those need --
+# is baked into the hard-float `@hardfloat_x86_64_none` target spec,
+# so no ABI toggle is required. This flag is just the non-ABI
+# x86_64-v3 SIMD perf baseline shared with the crypto crates (cf.
+# `_X86_CRYPTO_FLAG` in MODULE.bazel).
+_X86_CRYPTO_FLAG = "-Ctarget-feature=+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2"
 
 # QUIC v1 protocol stack (RFC 9000 + RFC 9001).
 #

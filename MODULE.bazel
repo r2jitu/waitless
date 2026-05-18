@@ -91,8 +91,11 @@ register_execution_platforms(
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
 rust.toolchain(
     edition = "2024",
+    # `x86_64-unknown-none` is intentionally absent: the x86_64 unikernel is
+    # built by the custom hard-float `@hardfloat_x86_64_none` toolchain below
+    # (rust-lang/rust#116344). Its precompiled `rust-std` is soft-float, so
+    # registering it here would only invite the wrong toolchain to resolve.
     extra_target_triples = [
-        "x86_64-unknown-none",
         "aarch64-unknown-none",
         "x86_64-unknown-linux-musl",
     ],
@@ -100,13 +103,29 @@ rust.toolchain(
 )
 use_repo(rust, "rust_toolchains")
 
-# rules_rust 0.69+ auto-creates a `rust_host_tools` repo whose
-# version tracks `rust.toolchain(versions=...)` above, so an
-# explicit `rust_host_tools.host_tools(...)` is no longer needed
-# (and conflicts with the default). 1.86.0 is recent enough to
-# parse `edition = "2024"` in dependency Cargo.toml files.
+# `@rust_host_tools` is the rules_rust host (== exec) rustc/cargo download,
+# auto-created by rules_rust 0.69+ at the `rust.toolchain(versions=...)`
+# version. The hard-float toolchain below reuses its `rustc` instead of a
+# builtin `rust_toolchain`, so it is correct for whatever host fetched the
+# repo. We only `use_repo` it -- no `host_tools(...)` tag (that conflicts
+# with the default rules_rust already declares).
+rust_host_tools = use_extension("@rules_rust//rust:extensions.bzl", "rust_host_tools")
+use_repo(rust_host_tools, "rust_host_tools")
 
 register_toolchains("@rust_toolchains//:all")
+
+# ── x86_64 hard-float bare-metal toolchain ──────────────────────────────────
+# Builds a hard-float `core`/`compiler_builtins`/`alloc` sysroot from pinned
+# rust-src and emits a `rust_toolchain` targeting the custom
+# `//bazel/toolchain:x86_64-none.json` spec. This replaces the soft-float
+# builtin `x86_64-unknown-none` toolchain for the unikernel so the whole
+# x86_64 build -- kernel and crypto -- has one consistent hard-float ABI and
+# needs no `-Ctarget-feature` ABI toggle (rust-lang/rust#116344). See
+# //bazel/buildstd:extensions.bzl for the full rationale.
+hardfloat = use_extension("//bazel/buildstd:extensions.bzl", "hardfloat")
+hardfloat.toolchain(target_json = "//bazel/toolchain:x86_64-unikernel-none.json")
+use_repo(hardfloat, "hardfloat_x86_64_none")
+register_toolchains("@hardfloat_x86_64_none//:toolchain")
 
 # ── crates.io dependencies ──────────────────────────────────────────────────
 # Cargo.toml is the source of truth: a workspace at the repo root
@@ -146,59 +165,42 @@ crate.from_cargo(
     ],
 )
 
-# ── x86_64-unknown-none target-feature overrides for crypto ────────────────
+# ── x86_64-v3 SIMD features for crypto ──────────────────────────────────────
 #
-# The stock `x86_64-unknown-none` target has
-# `features: "-mmx,-sse,+soft-float"` baked in. That makes LLVM
-# refuse to compile any crate that uses `__m128i` / pclmulqdq /
-# SSE intrinsics, because there's no register class for 128-bit
-# vector types under `+soft-float`, and LLVM bails with:
-#     rustc-LLVM ERROR: Do not know how to split the result of
-#     this operator!
-# (rust-lang/rust#87642, #92760, #136544).
+# The float ABI is no longer a per-crate concern: the x86_64 unikernel is
+# built by the custom hard-float `@hardfloat_x86_64_none` toolchain (SSE2
+# baked into the target spec), so `__m128i` / pclmulqdq / SSE intrinsics
+# have a register class everywhere and no `-Ctarget-feature` ABI toggle is
+# needed. Previously each crypto crate carried
+# `-Ctarget-feature=-soft-float,+sse,+sse2,...` to escape the soft-float
+# `x86_64-unknown-none` target -- an ABI toggle rust-lang/rust#116344 is
+# turning into a hard error. That is gone.
 #
-# Every RustCrypto AEAD auto-compiles both a SIMD path and a software
-# path, dispatched at runtime by `cpufeatures`, so we can't just
-# "runtime-select" our way out — both paths must compile.
+# What remains here is purely a *performance* baseline: the non-ABI
+# x86_64-v3 SIMD features (AVX2/AES/PCLMUL/BMI2/FMA, Haswell 2013 -- what
+# every cloud VM runs). These are not #116344-affected; enabling them via
+# `-Ctarget-feature` is fine. They let LLVM use the wider instructions
+# crate-wide and make `cfg(target_feature=...)` pick the SIMD path at
+# compile time instead of via runtime `cpufeatures` dispatch.
 #
-# Fix: per-crate `rustc_flags` annotation that explicitly turns
-# `-soft-float` off and turns SSE/AVX/AES/PCLMUL on. The kernel
-# already enables SSE at boot (CR4.OSFXSR|OSXMMEXCPT in
-# `kernel/limine_boot.S`) and our scheduler is cooperative — nothing
-# preempts kernel code — so using SSE/AVX registers in the kernel
-# is safe without any FXSAVE/XSAVE dance. x86_64-v3 baseline
-# (Haswell, 2013) matches what every cloud VM runs today.
-#
-# Scoped via `crate.annotation_select` to the x86_64 triples only.
-# Setting these flags unconditionally makes LLVM emit a warning for
-# every feature on every non-x86 compilation ("'+sse2' is not a
-# recognized feature for this target (ignoring feature)" × every
-# flag × every affected crate), flooding the aarch64 build log.
-#
-# Crates listed: any crate in the TLS 1.3 transitive graph that
-# either uses SIMD intrinsics directly or hits the LLVM bug via
-# `u128` math.
-_X86_CRYPTO_FLAG = "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2"
-
-_X86_TRIPLES = [
-    "x86_64-unknown-none",
-    "x86_64-unknown-linux-gnu",
-]
+# Scoped via `crate.annotation_select` to `x86_64-unknown-none` only --
+# they are harmless no-ops on the aarch64/native builds but would flood
+# those logs with "not a recognized feature" warnings. The native build
+# (`x86_64-unknown-linux-gnu`) is already hard-float and runtime-dispatches
+# fine, so it is intentionally not listed.
+_X86_CRYPTO_FLAG = "-Ctarget-feature=+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2"
 
 [
     crate.annotation_select(
         crate = name,
         rustc_flags = [_X86_CRYPTO_FLAG],
-        triples = _X86_TRIPLES,
+        triples = ["x86_64-unknown-none"],
     )
     for name in (
         "aes",
         "aes-gcm",
         "ghash",
         "polyval",
-        # p256 + its big-int transitive deps also do `u128` math that
-        # trips the soft-float legalization bug on x86_64-unknown-none.
-        # Same fix as the AEADs above.
         "p256",
         "primeorder",
         "elliptic-curve",

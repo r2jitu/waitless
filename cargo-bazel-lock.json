@@ -1,5 +1,5 @@
 {
-  "checksum": "70d0a5a024acee3bbf31814a464e00f209fa83c94411b8e2637e86ef2a9f8c66",
+  "checksum": "119f1724fdd59f1e4c6989393d64490a2313a2fa6883ff574becdac3f4892ccf",
   "crates": {
     "aead 0.5.2": {
       "name": "aead",
@@ -112,11 +112,8 @@
         "rustc_flags": {
           "common": [],
           "selects": {
-            "x86_64-unknown-linux-gnu": [
-              "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2"
-            ],
             "x86_64-unknown-none": [
-              "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2"
+              "-Ctarget-feature=+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2"
             ]
           }
         },
@@ -203,11 +200,8 @@
         "rustc_flags": {
           "common": [],
           "selects": {
-            "x86_64-unknown-linux-gnu": [
-              "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2"
-            ],
             "x86_64-unknown-none": [
-              "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2"
+              "-Ctarget-feature=+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2"
             ]
           }
         },
@@ -698,11 +692,8 @@
         "rustc_flags": {
           "common": [],
           "selects": {
-            "x86_64-unknown-linux-gnu": [
-              "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2"
-            ],
             "x86_64-unknown-none": [
-              "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2"
+              "-Ctarget-feature=+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2"
             ]
           }
         },
@@ -901,11 +892,8 @@
         "rustc_flags": {
           "common": [],
           "selects": {
-            "x86_64-unknown-linux-gnu": [
-              "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2"
-            ],
             "x86_64-unknown-none": [
-              "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2"
+              "-Ctarget-feature=+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2"
             ]
           }
         },
@@ -1295,11 +1283,8 @@
         "rustc_flags": {
           "common": [],
           "selects": {
-            "x86_64-unknown-linux-gnu": [
-              "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2"
-            ],
             "x86_64-unknown-none": [
-              "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2"
+              "-Ctarget-feature=+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2"
             ]
           }
         },
@@ -1649,11 +1634,8 @@
         "rustc_flags": {
           "common": [],
           "selects": {
-            "x86_64-unknown-linux-gnu": [
-              "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2"
-            ],
             "x86_64-unknown-none": [
-              "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2"
+              "-Ctarget-feature=+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2"
             ]
           }
         },
@@ -2134,11 +2116,8 @@
         "rustc_flags": {
           "common": [],
           "selects": {
-            "x86_64-unknown-linux-gnu": [
-              "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2"
-            ],
             "x86_64-unknown-none": [
-              "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2"
+              "-Ctarget-feature=+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2"
             ]
           }
         },
@@ -2208,11 +2187,8 @@
         "rustc_flags": {
           "common": [],
           "selects": {
-            "x86_64-unknown-linux-gnu": [
-              "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2"
-            ],
             "x86_64-unknown-none": [
-              "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2"
+              "-Ctarget-feature=+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2"
             ]
           }
         },
@@ -2267,11 +2243,8 @@
         "rustc_flags": {
           "common": [],
           "selects": {
-            "x86_64-unknown-linux-gnu": [
-              "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2"
-            ],
             "x86_64-unknown-none": [
-              "-Ctarget-feature=-soft-float,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2"
+              "-Ctarget-feature=+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+aes,+pclmulqdq,+fma,+bmi1,+bmi2"
             ]
           }
         },

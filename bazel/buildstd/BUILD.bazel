@@ -1,0 +1,3 @@
+# Build-std machinery: see extensions.bzl. The hard-float x86_64 bare-metal
+# sysroot + rust_toolchain are produced by the `hardfloat` module extension
+# into the `@hardfloat_x86_64_none` repo; this package only hosts the .bzl.
