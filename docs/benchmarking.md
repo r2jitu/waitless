@@ -20,17 +20,15 @@ The system has five layers:
 | Bench locally on macOS (fastest path) | `python3 scripts/bench.py --env hvf --cores 1,4` |
 | Bench locally, portable (slow, TCG) | `python3 scripts/bench.py --env qemu` |
 | Bench one workload | `python3 scripts/bench.py --env hvf --workload get_tcp` |
-| Bench on GCE under nested KVM | `GCP_ZONE=us-west1-c ./scripts/gcp-bench.sh --env kvm --cores 1,4,8` |
+| Bench on GCE under nested KVM | `./scripts/gcp-bench.sh --env kvm --cores 1,4,8` |
 | Bench the unikernel as a real GCE VM | `./scripts/gcp-deploy-bench.sh --cores 1,4,8` |
-| Start / stop / ssh the GCE dev VM | `GCP_ZONE=us-west1-c ./scripts/gcp.sh {start,stop,ssh}` |
+| Start / stop / ssh the GCE dev VM | `./scripts/gcp.sh {start,stop,ssh}` |
 | Deploy the unikernel as a GCE image | `./scripts/deploy-gcloud.sh deploy` |
 
-> **Zone gotcha — read this first.** `gcp.sh` defaults `GCP_ZONE` to
-> `us-west1-a`, but the project's VMs live in **`us-west1-c`**. Any
-> `gcp.sh` / `gcp-bench.sh` invocation needs `GCP_ZONE=us-west1-c`
-> (see [Gotchas](#gotchas)). `gcp-deploy-bench.sh` and
-> `deploy-gcloud.sh` use `UNIKERNEL_GCE_ZONE`, already defaulted
-> correctly.
+> The GCE VMs live in zone **`us-west1-c`**. Every script defaults
+> there (`gcp.sh` via `GCP_ZONE`, `gcp-deploy-bench.sh` /
+> `deploy-gcloud.sh` via `UNIKERNEL_GCE_ZONE`); set those env vars
+> only to target a different zone.
 
 ---
 
@@ -166,7 +164,7 @@ can't spread RX across queues, so this exercises the **Tier 2**
 single-queue path.
 
 ```sh
-GCP_ZONE=us-west1-c ./scripts/gcp-bench.sh --env kvm --cores 1,4,8 \
+./scripts/gcp-bench.sh --env kvm --cores 1,4,8 \
     --workload get_tcp,echo_udp --duration 10
 ```
 
@@ -215,7 +213,7 @@ Manages a single dev instance (`kvm-vm` by default). `gcp-bench.sh`
 calls it under the hood.
 
 ```sh
-GCP_ZONE=us-west1-c ./scripts/gcp.sh <command>
+./scripts/gcp.sh <command>
 ```
 
 | Command | Action |
@@ -228,8 +226,8 @@ GCP_ZONE=us-west1-c ./scripts/gcp.sh <command>
 | `test` | Build + push, run sandboxed HTTP + UDP smoke tests; exit non-zero on failure. |
 | `kill` | Kill the nested QEMU on the VM (leaves the GCE instance running). |
 
-Env vars: `GCP_PROJECT` (`unikernel-dev`), **`GCP_ZONE` (`us-west1-a`
-— wrong; override to `us-west1-c`)**, `GCP_INSTANCE` (`kvm-vm`),
+Env vars: `GCP_PROJECT` (`unikernel-dev`), `GCP_ZONE`
+(`us-west1-c`), `GCP_INSTANCE` (`kvm-vm`),
 `GCP_SSH_HOST` (`gcp`), `UNIKERNEL_MEMORY` (`128` MB),
 `UNIKERNEL_CPUS` (remote `nproc`).
 
@@ -277,13 +275,12 @@ deploy-gcloud.sh ───────► unikernel-webserver   (build a GCE cus
 
 ## Gotchas
 
-- **`gcp.sh` zone default is wrong.** `GCP_ZONE` defaults to
-  `us-west1-a`; the VMs are in `us-west1-c`. With the wrong zone
-  `gcp.sh status` finds nothing, so `gcp-bench.sh` silently *skips*
-  the VM-start and then SSHes a stale IP and times out. Always run
-  `gcp.sh` / `gcp-bench.sh` with `GCP_ZONE=us-west1-c`.
-  `gcp-deploy-bench.sh` and `deploy-gcloud.sh` are unaffected — they
-  use `UNIKERNEL_GCE_ZONE`, correctly defaulted.
+- **A wrong `GCP_ZONE` fails quietly.** `GCP_ZONE` defaults to
+  `us-west1-c`, where the VMs live — but if it is overridden to a
+  zone with no instance, `gcp.sh status` finds nothing, so
+  `gcp-bench.sh` silently *skips* the VM-start, then SSHes a stale
+  IP and times out. If a bench mysteriously can't reach the VM,
+  check `gcloud compute instances list` for the real zone.
 - **VM teardown / billing.** `gcp-bench.sh` and `gcp-deploy-bench.sh`
   stop their VMs on exit by default. `--keep-running` skips that —
   remember to stop them yourself (`gcp.sh stop`, or `gcloud compute

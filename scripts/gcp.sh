@@ -4,7 +4,7 @@
 # One-time setup:
 #   gcloud auth login
 #   gcloud config set project unikernel-dev
-#   gcloud config set compute/zone us-west1-a
+#   gcloud config set compute/zone us-west1-c
 #   Add to ~/.ssh/config:
 #     Host gcp
 #         HostName <instance-external-ip>
@@ -30,7 +30,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 GCP_PROJECT="${GCP_PROJECT:-unikernel-dev}"
-GCP_ZONE="${GCP_ZONE:-us-west1-a}"
+GCP_ZONE="${GCP_ZONE:-us-west1-c}"
 GCP_INSTANCE="${GCP_INSTANCE:-kvm-vm}"
 SSH_HOST="${GCP_SSH_HOST:-gcp}"
 MEMORY="${UNIKERNEL_MEMORY:-128}"
@@ -526,7 +526,7 @@ Commands:
 
 Environment:
   GCP_PROJECT=unikernel-dev    GCP project
-  GCP_ZONE=us-west1-a          GCP zone
+  GCP_ZONE=us-west1-c          GCP zone
   GCP_INSTANCE=kvm-vm          Instance name
   GCP_SSH_HOST=gcp             SSH config alias
   UNIKERNEL_MEMORY=128         VM memory in MB
