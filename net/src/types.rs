@@ -241,6 +241,19 @@ pub struct ParsedL3 {
     pub snoop_mac: Option<MacAddr>,
 }
 
+impl ParsedL3 {
+    /// Re-derive the L4 segment from `frame` — the part-0 buffer the
+    /// borrow-free `(l4_off, l4_len)` pair indexes into. The inverse
+    /// of the offset the classify pass captured; `None` only if the
+    /// range falls outside `frame`, which never happens for the frame
+    /// this summary was built from. Lets the receive path name the
+    /// re-slice instead of open-coding `l4_off..l4_off + l4_len`.
+    #[inline]
+    pub fn l4<'a>(&self, frame: &'a [u8]) -> Option<&'a [u8]> {
+        frame.get(self.l4_off..self.l4_off + self.l4_len)
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct NetConfig {
     pub ip: Ipv4Addr,

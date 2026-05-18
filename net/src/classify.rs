@@ -145,9 +145,7 @@ fn summarize_ipv6(
 /// Tier 1 leaves distribution to the NIC's hardware RSS.
 pub fn owner(parsed: &ParsedL3, frame: &[u8], num_cores: u32) -> u32 {
     // L4 ports are the first 4 bytes of the segment `classify` located.
-    let l4 = frame
-        .get(parsed.l4_off..parsed.l4_off + parsed.l4_len)
-        .unwrap_or(&[]);
+    let l4 = parsed.l4(frame).unwrap_or(&[]);
     let (src_port, dst_port) = if l4.len() >= 4 {
         (
             u16::from_be_bytes([l4[0], l4[1]]),

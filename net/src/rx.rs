@@ -148,10 +148,7 @@ pub(crate) fn deliver(parsed: types::ParsedL3, chain: Chain<OwnedIOBuf>) {
             let Some(first) = chain.iter().next() else {
                 return;
             };
-            let Some(segment) = first
-                .data()
-                .get(parsed.l4_off..parsed.l4_off + parsed.l4_len)
-            else {
+            let Some(segment) = parsed.l4(first.data()) else {
                 return;
             };
             udp::udp_receive(parsed.src, parsed.dst, segment);
@@ -166,10 +163,7 @@ pub(crate) fn deliver(parsed: types::ParsedL3, chain: Chain<OwnedIOBuf>) {
                 let Some(first) = chain.iter().next() else {
                     return;
                 };
-                if let Some(segment) = first
-                    .data()
-                    .get(parsed.l4_off..parsed.l4_off + parsed.l4_len)
-                {
+                if let Some(segment) = parsed.l4(first.data()) {
                     ipv6_nd::handle_icmpv6(&s, &d, segment, mac);
                 }
             }
