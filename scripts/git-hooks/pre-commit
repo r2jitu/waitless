@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# pre-commit -- auto-format staged files before they are committed.
+#
+# Active once git is pointed at this directory:
+#     git config core.hooksPath scripts/git-hooks
+# scripts/setup-dev.sh runs that automatically for fresh clones.
+#
+#   * Fully-staged files are formatted and re-staged automatically.
+#   * A partially-staged file (some hunks staged, some not) is only
+#     CHECKED -- re-staging it would also stage the unstaged hunks --
+#     so if such a file needs formatting the commit aborts with
+#     instructions instead of silently rewriting it.
+#
+# Bypass the hook entirely with:  git commit --no-verify
+
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+# Staged, still-present files (Added / Copied / Modified).
+staged=()
+while IFS= read -r f; do
+    [ -n "$f" ] && staged+=("$f")
+done < <(git diff --cached --name-only --diff-filter=ACM)
+[ ${#staged[@]} -eq 0 ] && exit 0
+
+# Split into fully-staged vs partially-staged (file also has unstaged
+# changes). `git diff --quiet -- F` exits 0 when F has no unstaged work.
+full=()
+partial=()
+for f in "${staged[@]}"; do
+    if git diff --quiet -- "$f"; then
+        full+=("$f")
+    else
+        partial+=("$f")
+    fi
+done
+
+# Partially-staged files: check only, never auto-restage. Abort the
+# commit if any of them would be reformatted.
+if [ ${#partial[@]} -gt 0 ]; then
+    if ! scripts/format.sh --check "${partial[@]}"; then
+        echo
+        echo "pre-commit: the file(s) above are only partially staged but need"
+        echo "formatting. Re-staging them would also stage the unstaged hunks,"
+        echo "so this commit is aborted. Stage the whole file and recommit, or"
+        echo "bypass with: git commit --no-verify"
+        exit 1
+    fi
+fi
+
+# Fully-staged files: format in place and re-stage.
+if [ ${#full[@]} -gt 0 ]; then
+    scripts/format.sh "${full[@]}"
+    git add -- "${full[@]}"
+fi
+exit 0

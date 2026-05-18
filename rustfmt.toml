@@ -1,0 +1,12 @@
+# rustfmt configuration, applied repo-wide.
+#
+# The bare-metal kernel / uni-* crates are not part of the Cargo
+# workspace (see the comment at the top of Cargo.toml), so `cargo fmt`
+# only reaches the host crates. scripts/format.sh therefore invokes
+# `rustfmt` directly on every *.rs file -- and a bare `rustfmt` reads
+# its edition from THIS file, not from any per-crate Cargo.toml.
+#
+# `style_edition` defaults to 2015 when unset, so it is pinned
+# explicitly: we want 2024 *formatting* rules, not just 2024 parsing.
+edition = "2024"
+style_edition = "2024"

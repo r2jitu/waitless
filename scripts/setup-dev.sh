@@ -46,7 +46,18 @@ echo "==> Installing GRUB (for creating bootable ISO images)..."
 # grub for x86_64 on macOS
 brew install grub 2>/dev/null || echo "  (grub may not be available via Homebrew on ARM — using raw ELF boot instead)"
 
+echo "==> Installing code formatters (used by scripts/format.sh and the pre-commit hook)..."
+# clang-format ships with the LLVM install above; rustfmt comes via rustup.
+rustup component add rustfmt 2>/dev/null || true
+brew install buildifier ruff shfmt
+
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+echo "==> Installing git hooks (pre-commit autoformatter)..."
+# Point git at the versioned hooks directory, and let `git blame` skip
+# the repo-wide format commit recorded in .git-blame-ignore-revs.
+git -C "$PROJECT_ROOT" config core.hooksPath scripts/git-hooks
+git -C "$PROJECT_ROOT" config blame.ignoreRevsFile .git-blame-ignore-revs
 
 # Generate .bazelrc.local so that plain "bazel build / bazel run" uses the
 # correct target architecture for this machine (no --config flag needed).

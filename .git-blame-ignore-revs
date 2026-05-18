@@ -1,0 +1,10 @@
+# Revisions that `git blame` skips, configured via blame.ignoreRevsFile
+# (scripts/setup-dev.sh sets that for fresh clones; or run once:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs )
+#
+# List the full 40-character SHA of large mechanical commits -- repo-wide
+# reformats, bulk renames -- one per line. `git blame` then attributes
+# each line to its real author instead of the mechanical commit.
+
+# style: format entire repo with rustfmt/clang-format/ruff/shfmt/buildifier
+f4d65fdfed3056237acee4127a610d00c89b1fe9
