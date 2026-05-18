@@ -231,6 +231,7 @@ pub mod runtime {
     pub use uni_runtime::launcher::{LaunchTable, Launcher};
     pub use uni_runtime::net::{
         tcp_listen, udp_listen,
+        RecvChunk, RecvChunkGuard,
         TcpBindError, TcpHandle, TcpListener, TcpRecv, TcpSendChain, TcpStream,
         UdpBindError, UdpClient, UdpHandle, UdpRecv, UdpRecvInplace, UdpSocket,
     };

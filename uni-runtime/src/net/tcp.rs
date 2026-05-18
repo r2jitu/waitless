@@ -880,8 +880,23 @@ pub struct RecvChunkGuard<'a> {
 }
 
 impl<'a> RecvChunkGuard<'a> {
+    /// Wrap a transport-surfaced [`IOBuf`](uni_iobuf::IOBuf) in a
+    /// guard. The guard's `'a` is inferred at the call site — a
+    /// `recv_chunk` binds it to the `&'a mut self` it took, so the
+    /// borrow checker keeps that stream mutably borrowed (hence
+    /// un-re-readable) for the guard's whole life.
+    ///
+    /// `pub` because the guard is the *one* type shared across
+    /// every `recv_chunk` surface, and the constructions live in
+    /// different crates: the `TcpStream` backend builds it from the
+    /// `do_recv_chunk` hook here in `uni-runtime` (an owned
+    /// `External`/`Heap` IOBuf), and `TlsStream::recv_chunk` in
+    /// `uni-tls` builds it from a `Borrowed` view of decrypted
+    /// plaintext (RX item G). A single guard type — not a parallel
+    /// `TlsRecvChunkGuard` — is what lets item H's `BodyReader`
+    /// stay generic over the stream.
     #[inline]
-    fn new(iobuf: uni_iobuf::IOBuf) -> Self {
+    pub fn new(iobuf: uni_iobuf::IOBuf) -> Self {
         RecvChunkGuard { iobuf, _borrow: PhantomData }
     }
 
