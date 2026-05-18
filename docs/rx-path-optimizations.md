@@ -788,22 +788,6 @@ backpressure. CPU-bound at ChaCha20-Poly1305 decrypt rate
   `/stats`-style dashboards.
 - **GCE IPv6 subnet enablement** so `get_tcp_v6` runs against
   the remote unikernel-webserver VM (currently HVF-only).
-- **Fuse the Tier-2 classify parse**: `classify_for_distribution`
-  ([`net/src/lib.rs`](../net/src/lib.rs)) walks eth → IPv4 → L4
-  ports purely to pick a target core, then discards the result;
-  `net_receive_frame` then re-parses the eth + IPv4 headers from
-  scratch (and `tcp_receive` / `udp_receive` re-cover the ports).
-  Every Tier-2 frame thus has its L2/L3 headers parsed **twice** —
-  the shadow cost of software distribution standing in for the
-  hardware RSS that Tier 1 gets for free. Fix: parse once — carry a
-  small `ParsedL3` value (ethertype, proto, src/dst `IpAddr`, L4
-  offset) on the inbox node alongside the chain, so the receive
-  path skips straight to `tcp_receive` / `udp_receive`. Eliminates
-  one eth-parse + one IPv4-parse per Tier-2 frame; the TCP-header
-  parse in `tcp_receive` stays — it needs seq/ack/flags/window, not
-  just the ports `classify` previewed. `arp_learn` also fires in
-  both `classify` and `net_receive_frame` (redundant for `Inline`
-  frames) — fold that in at the same time.
 
 ### RX scheduler — unify the tier model
 
@@ -1950,3 +1934,53 @@ unchanged against the shared implementation.
 Verified: `bazel test //util/tagged_treiber:tagged_treiber_test
 //uni-iobuf:iobuf_test //kernel:rx_inbox_test`; `webserver_qemu_x86_64`
 + `webserver.elf` aarch64 builds; `test_hvf`.
+
+### 2026-05-18 — Follow-up: fuse the Tier-2 classify parse ([x] **landed**)
+
+The Tier-2 distributor parsed every frame's L2/L3 headers **twice**:
+`classify_for_distribution` walked eth → IPv4 → L4 ports to pick an
+owning core and discarded the parse; `net_receive` then re-parsed
+eth + IPv4 on the receiving core. `arp_learn` fired in both — the
+shadow cost of software distribution standing in for the hardware
+RSS Tier 1 gets free.
+
+**Parse once.** A new `net_types::ParsedL3` (proto, src/dst `IpAddr`,
+L4 `(off, len)`, on-subnet sender MAC) is built once by `parse_ipv4`
+and carried to the receive path — on the cross-core inbox node for a
+distributed frame (`percpu::RxChain` is now `{ parsed, chain }`),
+directly for an `InlineParsed` same-core frame. The receiving core
+reaches `tcp_receive` / `udp_receive` through `net_receive_parsed`
+with no eth/IPv4 re-walk. The TCP-header parse in `tcp_receive` stays
+— it needs seq/ack/flags/window, which `classify` never previewed.
+`net_receive` (single-core / Tier-1 / ARP+IPv6 inline) funnels its
+own IPv4 frames through `net_receive_parsed` too, so arp-snoop + L4
+dispatch has one implementation.
+
+**`arp_learn` fold.** `arp_fast_store` is per-core, so the snoop must
+run on whichever core handles the frame. `classify` now learns only
+for *distributed* frames (warming the distributor core, as before);
+`net_receive_parsed` learns on the handling core. The pre-fuse inline
+duplicate — `classify` + `net_receive` both snooping the same core —
+is gone. `ParsedL3.arp` carries the on-subnet sender MAC for the
+owning core's own snoop. A non-TCP/UDP IPv4 frame still parses and
+still snoops; only `dispatch_l4` no-ops on the protocol.
+
+`ParsedL3` lives in `net_types` (the zero-dep leaf) so `percpu.rs`
+can name the `RxNode` payload type; `//kernel` gains an acyclic
+`//net:types` dep.
+
+**Bench.** A/B vs `a60a267`. QEMU TCG (Tier 2 — the mandatory path,
+since HVF never runs `distribute_frame`), 5-round interleaved: 3c
+`get_tcp` / `echo_udp` flat-to-positive, no collapse — but TCG on a
+shared host was too noisy for a precise small-delta read (controls
+swung ±10–30 %). HVF (Tier 1, steady hardware), 3-round interleaved,
+settles it: `get_tcp` +0.3 % (1c) / +0.4 % (3c), `echo_udp` −0.4 % /
+−0.0 % — the `net_receive` refactor is neutral, and a transient
+QEMU-1c dip was pure TCG noise (the single-core path does provably
+identical work). The fuse's gain — one eth + one IPv4 parse saved per
+distributed Tier-2 frame — is real but below the measurement noise
+floor: a remove-redundant-work change, not a measurable win at
+request scale.
+
+Verified: `webserver_qemu_x86_64` + `webserver_qemu_aarch64` builds;
+`test_hvf`; `//kernel:rx_inbox_test`.
