@@ -563,6 +563,34 @@ pub trait HttpStream {
     /// partial reads or drain a full segment first.
     async fn recv(&mut self, buf: &mut [u8]) -> usize;
 
+    /// Zero-copy sibling of [`recv`](Self::recv): resolve the next
+    /// inbound run of bytes as a [`RecvChunkGuard`] over the
+    /// transport's *own* buffer, instead of copying into a caller
+    /// slice. `None` on peer close / EOF, or on a transport with no
+    /// streaming chunk path.
+    ///
+    /// [`BodyReader::chunk`] calls this once its prebuf is drained,
+    /// so request-body bytes past the prebuf reach the handler with
+    /// no intermediate copy — item H of
+    /// `docs/rx-path-optimizations.md`.
+    ///
+    /// The default returns `None`: a transport that hands the whole
+    /// request body to the HTTP layer pre-buffered ([`NullStream`],
+    /// the HTTP/3 case) has no streaming chunk path, and
+    /// `BodyReader` then serves the body from its prebuf alone.
+    /// `uni::runtime::TcpStream` and `uni_tls::TlsStream` override
+    /// this with their real `recv_chunk` implementations.
+    ///
+    /// `&mut self` is load-bearing, not incidental — the returned
+    /// [`RecvChunkGuard`] carries that borrow for its whole life, so
+    /// the transport cannot re-read (hence overwrite) the surfaced
+    /// buffer while the chunk is still held. See item F's write-up.
+    ///
+    /// [`RecvChunkGuard`]: uni::runtime::RecvChunkGuard
+    async fn recv_chunk(&mut self) -> Option<uni::runtime::RecvChunkGuard<'_>> {
+        None
+    }
+
     /// Send a chain of IOBuf parts. The transport decides how to
     /// chunk the bytes onto the wire — TCP coalesces parts into
     /// MSS-bounded segments, TLS encrypts each part as a record
@@ -598,12 +626,15 @@ pub trait HttpStream {
 
 /// `HttpStream` impl for transports that hand the request body to
 /// the HTTP layer pre-buffered in one go (HTTP/3 reassembles DATA
-/// frames before invoking the handler). [`BodyReader`] only ever
-/// calls `recv` once its `prebuf` is exhausted — for an h3 body
-/// constructed with `prebuf.len() == total`, that path never
-/// fires. `NullStream` exists so the generic type parameter is
-/// satisfied for those transports; calling its methods past the
-/// trivial `recv` return-0 case panics.
+/// frames before invoking the handler). [`BodyReader`] draws stream
+/// bytes (via `recv_chunk`) only once its `prebuf` is exhausted —
+/// for an h3 body constructed with `prebuf.len() == total`, that
+/// path never fires. `NullStream` exists so the generic type
+/// parameter is satisfied for those transports: it inherits the
+/// default `recv_chunk` (returns `None`, so `BodyReader` serves
+/// from the prebuf alone) and the trivial `recv` return-0; calling
+/// `send` panics — that transport does not write through
+/// `HttpStream`.
 pub struct NullStream;
 
 /// Friendly alias for a [`BodyReader`] over [`NullStream`] — i.e.
@@ -627,6 +658,25 @@ impl HttpStream for NullStream {
 impl HttpStream for uni::runtime::TcpStream {
     async fn recv(&mut self, buf: &mut [u8]) -> usize {
         (*self).recv(buf).await
+    }
+
+    /// Forwards to the inherent `uni::runtime::TcpStream::recv_chunk`.
+    ///
+    /// Deliberately a plain `fn` returning the *concrete* `RecvChunk`
+    /// future — not an `async fn` block, and not the trait's opaque
+    /// `impl Future` — so the forward is type-checked against the
+    /// inherent method: the inherent method is the only thing that
+    /// produces a `RecvChunk`. Were it ever removed,
+    /// `uni::runtime::TcpStream::recv_chunk` here would resolve to
+    /// *this* trait method, whose return type is opaque, and the
+    /// mismatch against `-> RecvChunk<'_>` is a compile error —
+    /// rather than the silent infinite recursion an `impl Future`
+    /// return type would let through. That is why the
+    /// `refining_impl_trait_reachable` allow below is intentional:
+    /// the refinement *is* the footgun guard.
+    #[allow(refining_impl_trait_reachable)]
+    fn recv_chunk(&mut self) -> uni::runtime::RecvChunk<'_> {
+        uni::runtime::TcpStream::recv_chunk(self)
     }
 
     async fn send(&mut self, chain: &mut IOBufChain) -> Result<(), ()> {
