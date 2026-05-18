@@ -1748,23 +1748,26 @@ stack buf + `send_bytes` — two copies).
 copy — and its UDP leg cannot go zero-copy until item L. Migrating
 it would add copies, not remove them.
 
-**`tcp_echo` HVF A/B — flat**, and instructively so. Baseline
+**`tcp_echo` HVF A/B — payload-size-dependent.** Baseline
 (`2c4a864`, `recv`+`send_bytes`) vs the migration, HVF 1c/3c,
 3-round medians via a baseline worktree:
 
 | | base 1c/3c | zero-copy 1c/3c | Δ |
 |---|---|---|---|
 | `tcp_echo` (64 B msg) | 157.3 k / 183.1 k | 157.2 k / 178.8 k | −0.1 % / −2.4 % |
+| `tcp_echo_64k` (64 KiB) | 3156 / 4814 | 4641 / 6940 | **+47 % / +44 %** |
 
-The `tcp_echo` workload echoes **64-byte** messages — the copy the
-migration removes is 64 bytes, negligible against per-message
-TCP-segment + waker + chain overhead. Zero-copy wins are
-**payload-size-dependent**: they bite at KB scale, not tiny
-messages. The migration is still correct (`test_hvf`'s
-`test_tcp_echo` green) and right for large echo/proxy payloads — it
-just does not move a 64 B round-trip. (`run_loadgen_tcp_echo`'s
-`msg_size` is fixed at 64; a large-message variant would be the
-workload that shows the win.)
+At **64 bytes** the migration is flat: the copy it removes is 64
+bytes, negligible against per-round-trip overhead. At **64 KiB**
+it is +47 % (1c) — zero-copy wins are **payload-size-dependent**,
+they bite at KB scale, not tiny messages. (Honest caveat: the
++47 % is the migration's *combined* effect — zero-copy RX *plus*
+moving transport-sized chunks instead of the old handler's
+artificially small 1 KiB stack buffer; both are real gains it
+delivered, not pure memcpy elimination. And it measures the RX
+half only — TX is still a copy until Phase 5.) The 64 B and
+64 KiB workloads are registered as `tcp_echo` / `tcp_echo_64k`
+(commit `f655f77`); `msg_size` is now a per-workload field.
 
 **`/stats` verification — the headline result.** New `net::tcp`
 counters `RX_CHUNK_STASH_HITS` / `RX_CHUNK_RING_DRAIN` (`fd41463`),
