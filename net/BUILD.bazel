@@ -61,8 +61,10 @@ rust_test(
     crate = ":ethernet",
 )
 
-# os:none Ethernet send path — NIC MAC init + frame TX. Split from
-# `:ethernet` so the parse side carries no `//drivers` dependency.
+# Ethernet send path — NIC MAC init + frame TX. Split from
+# `:ethernet` so the parse side carries no NIC dependency. Host-
+# buildable: its NIC dep is the host-buildable `//drivers:nic`
+# dispatch crate, not the os:none `//drivers` umbrella.
 rust_library(
     name = "eth_tx",
     srcs = ["src/eth_tx.rs"],
@@ -71,7 +73,7 @@ rust_library(
     deps = [
         ":ethernet",
         ":types",
-        "//drivers",
+        "//drivers:nic",
     ],
 )
 

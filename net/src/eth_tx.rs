@@ -1,16 +1,16 @@
 // net/eth_tx.rs — Ethernet send path: NIC MAC-cache init + frame TX.
 //
-// The os:none half of what used to be `net_ethernet` — split out so
+// The send half of what used to be `net_ethernet` — split out so
 // `net_ethernet` itself is a pure, host-testable leaf. Depends on
-// `net_ethernet` (the header builder + MAC cache) and `//drivers`
-// (the NIC). `ipv4_send` / `arp` / `ipv6_send` link against this
-// for `ethernet_send`; boot calls `init_mac`.
+// `net_ethernet` (the header builder + MAC cache) and `//drivers:nic`
+// (the host-buildable NIC dispatch). `arp` / `ipv6_send` link against
+// this for `ethernet_send`; boot calls `init_mac`.
 
 #![no_std]
 
 extern crate net_ethernet as ethernet;
 extern crate net_types as types;
-extern crate uni_drivers;
+extern crate nic;
 
 use core::ptr;
 use ethernet::{EthernetHeader, HEADER_LEN, ethernet_our_mac};
@@ -21,7 +21,7 @@ use types::{MacAddr, htons};
 /// `net_ethernet`'s cross-core cache via `set_our_mac`.
 pub fn init_mac() {
     let mut bytes = [0u8; 6];
-    uni_drivers::net::get_mac(bytes.as_mut_ptr());
+    nic::get_mac(bytes.as_mut_ptr());
     ethernet::set_our_mac(bytes);
 }
 
@@ -44,6 +44,6 @@ pub fn ethernet_send(dst: MacAddr, ethertype: u16, payload: &[u8]) {
         let payload_len = payload.len().min(1500);
         ptr::copy_nonoverlapping(payload.as_ptr(), p.add(HEADER_LEN), payload_len);
 
-        uni_drivers::net::send(core::slice::from_raw_parts(p, HEADER_LEN + payload_len));
+        nic::send(core::slice::from_raw_parts(p, HEADER_LEN + payload_len));
     }
 }
