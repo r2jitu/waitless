@@ -245,6 +245,21 @@ WORKLOADS = [
      "conns_per_core": 1500, "tier": "available",
      "desc": "Gateway fan-out (TCP→UDP backend→TCP, 1500 conn × cpus; bench 1c locally — see comment)"},
 
+    # ── Raw TCP echo (guest:9) ────────────────────────────────────────
+    #
+    # `tcp_echo` round-trips a small (64 B) message off the
+    # `tcp_echo` handler — no HTTP, no TLS, just recv→send. After
+    # the RX zero-copy migration the handler is `recv_chunk()` →
+    # `into_owned()` → `send`: on bare-metal the device RX buffer
+    # flows RX→TX with no intermediate copy (vs the old `recv` into
+    # a stack buffer + `send_bytes` — two copies). This is the A/B
+    # probe for that migration. `available` tier — name it
+    # explicitly (`--workload tcp_echo`); the harness already has
+    # the `tcp_echo` type wired (run_loadgen_tcp_echo).
+    {"name": "tcp_echo", "type": "tcp_echo",
+     "conns_per_core": 8, "tier": "available",
+     "desc": "Raw TCP echo round-trip throughput (64 B msg; recv_chunk zero-copy path)"},
+
     # ── Bulk RX — POST /discard with sized body ──────────────────────
     #
     # Primary probe for the driver RX path under multi-segment
