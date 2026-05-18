@@ -24,10 +24,18 @@ use crate::spsc;
 // `rx_inbox` holds the generic lock-free machinery; the kernel pins
 // the payload type and sizes the node pool here.
 
-/// The Tier 2 cross-core RX inbox payload: one received frame as an
-/// owned chain of device RX buffers. Moving it core-to-core copies no
-/// frame bytes; dropping it reposts the backing buffers.
-pub type RxChain = Chain<OwnedIOBuf>;
+/// The Tier 2 cross-core RX inbox payload: one received frame — its
+/// `Chain` of device RX buffers plus the L2/L3 parse the distributor's
+/// classify pass already computed. Carrying the parse lets the owning
+/// core skip re-walking eth + IPv4 and go straight to `tcp_receive` /
+/// `udp_receive`. Moving it core-to-core copies no frame bytes;
+/// dropping the `chain` reposts the backing buffers.
+pub struct RxChain {
+    /// The L2/L3 parse, computed once on the distributor core.
+    pub parsed: net_types::ParsedL3,
+    /// The received frame as an owned chain of device RX buffers.
+    pub chain: Chain<OwnedIOBuf>,
+}
 
 /// Node count of the shared Tier-2 RX node pool.
 ///

@@ -54,6 +54,11 @@ rust_library(
     # library.
     target_compatible_with = ["@platforms//os:none"],
     deps = [
+        # `net_types` only — the Tier-2 RX inbox payload carries a
+        # `ParsedL3` (see `percpu::RxChain`). `net_types` is a zero-dep
+        # leaf, so this adds no cycle with the `net_*` crates that
+        # depend back on `//kernel`.
+        "//net:types",
         "//uni-iobuf",
         "//uni-runtime",
         "//uni-worker",

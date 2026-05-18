@@ -5,8 +5,9 @@
 // distributor) and hands each received frame to its flow's owning
 // core. This module is *how* it crosses — generically, over whatever
 // payload `T` the node carries; the kernel instantiates it with
-// `T = Chain<OwnedIOBuf>` in `percpu.rs`, so a frame's device RX
-// buffers move core-to-core with no payload-byte copy.
+// `T = RxChain` in `percpu.rs` — a frame's device-RX-buffer `Chain`
+// plus its parsed L2/L3 headers — so the frame moves core-to-core
+// with no payload-byte copy.
 //
 // Kept generic (like `spsc::Ring<T>`) and `core`-only so it builds
 // and unit-tests standalone on the host — the lock-free correctness
