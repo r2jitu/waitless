@@ -502,9 +502,11 @@ cannot honour — the diagnosed cause of the `--env kvm` upload
 stall.
 
 ### M. TCP/IP RX path accepts coalesced super-segments
-- **Status**: [ ]
+- **Status**: [x] landed 2026-05-18 — commit `b73b946` (L3 parse
+  clamp + tests). See the progress-log entry for the audit findings
+  and the host-test blocker.
 - **Where**: [`net/src/ipv4.rs`](net/src/ipv4.rs) `ipv4_receive`,
-  [`net/src/ipv6.rs`](net/src/ipv6.rs),
+  [`net/src/ipv6.rs`](net/src/ipv6.rs) `ipv6_receive`,
   [`net/src/lib.rs`](net/src/lib.rs) `net_receive` /
   `tcp_receive_segment`, [`net/src/tcp.rs`](net/src/tcp.rs)
   `tcp_receive`.
@@ -1984,3 +1986,90 @@ request scale.
 
 Verified: `webserver_qemu_x86_64` + `webserver_qemu_aarch64` builds;
 `test_hvf`; `//kernel:rx_inbox_test`.
+
+### 2026-05-18 — Item M: TCP/IP RX path accepts coalesced super-segments ([x] **landed**)
+
+The shared TCP/IP-stack precondition for both RX-offload tracks —
+gve RSC (items I + J) and virtio-net large-receive (N + O). An
+audit-and-tighten item: nothing delivers a coalesced super-segment
+today, so M is behaviour-neutral; it makes the stack *accept* one so
+items I / N can later build big chained super-segments without the
+stack mis-framing or truncating them.
+
+**The one fix — the L3 parse.** `ipv4_receive` / `ipv6_receive` are
+handed only part 0 of the RX chain (the buffer carrying the
+L2/L3/L4 headers). A coalesced super-segment is one IP packet whose
+declared length — IPv4 `total_length` / IPv6 `payload_length`, each
+a 16-bit field, so ≤ 65535 — legitimately outruns part 0; the rest
+rides in later chain parts. Both parsers rejected `declared >
+data.len()`, which dropped *every* super-segment. Relaxed to a
+clamp: the part-0 payload view is bounded by the bytes physically
+present, and `tcp_receive` walks the rest of the chain. For an
+ordinary single-buffer frame `declared <= data.len()`, so the clamp
+is a no-op and ethernet trailing padding is still trimmed — the
+behaviour-neutral property. The header-length bound the removed
+check implied (`header_len > data.len()` for v4; `try_ref_from`'s
+≥ `HEADER_LEN` guard for v6) is kept explicit so the payload slice
+stays in bounds.
+
+**`tcp_receive` — audited, already correct, zero changes.** Item D
+left it chain-aware: `payload_len` is `segment.total_len()` (the
+chain's *logical* length, summed across parts for a `Many` repr) −
+`data_offset`, never MSS-clamped; the copy path walks `segment
+.iter()` over every part, skipping the TCP header then
+`deliver_payload`-ing each part's bytes; `rcv_nxt` advances by the
+full delivered count. The zero-copy `pending_chunk` fast path is
+gated on `part_count() == 1`, so a multi-part super-segment
+correctly falls through to the chain walk. The FIN check uses the
+same full `payload_len`. (`deliver_payload` truncates to the
+receive window's free space and `rcv_nxt` advances only by what was
+accepted — correct TCP, not an M bug: a properly coalesced
+super-segment is bounded by the `rcv_wnd` we advertised, ≤
+`RX_RING_BYTES − 1` = 16383, which the peer respects, so the ring
+holds it.)
+
+**`tcp_receive_segment` — the `Many`-chain `total_len` refresh is
+item I's, not M's.** It narrows part 0 via `front_mut`, which
+bypasses a `Many` chain's cached `total_len`. With the L3 clamp the
+narrow is correct *for part 0* (`l4_len` is now part 0's L4
+remainder, so the narrow consumes only the header bytes), but the
+cached `total_len` would be stale by `l4_off`. M never delivers a
+multi-part chain, so the existing `debug_assert_eq!(part_count(),
+1, …)` tripwire never fires; the doc comment already assigns the
+chain-aware narrow + `shrink_total_len` to item I.
+
+**Fixed-size RX staging — audited, clean.** No `[u8; 1514]` /
+`[u8; 1500]` on the receive path: item C removed the cross-core
+inbox's; every remaining `1500`/`1514` array (`ethernet.rs`,
+`ipv4_send`, `ipv6_send`, the ICMPv6 echo-reply builder, `tcp.rs`'s
+`FRAME_BUF_LEN`) is a TX-side frame builder. The per-conn 16 KiB
+`rx_ring` is a flow-control window, not an MTU buffer.
+
+**Tests.** `ipv6_receive` gains a host-native super-segment test
+exercising the real function (`net_ipv6` is a host-buildable leaf);
+`protocol_tests` gains the IPv4 mirror. The old IPv6
+`rejects_truncated_payload` test asserted the very reject M removes,
+so it is repurposed (`accepts_coalesced_super_segment_length`) and
+paired with `rejects_too_short_for_header` to pin the header guard
+that the clamp still relies on.
+
+**Not landed — the `tcp_receive` super-segment unit test (host-test
+blocker).** Feeding `tcp_receive` a synthetic multi-part chain needs
+`net_tcp` host-buildable, and `net_tcp` → `//kernel`, which is
+hard-marked `target_compatible_with = ["@platforms//os:none"]`
+(mach-o-hostile `#[link_section(".boot_bss")]`, MMU / APIC / IDT
+code). That is exactly the blocker the "Test & bench infrastructure"
+follow-up records — making `//kernel` host-buildable by `#[cfg]`-
+gating its bare-metal bits is a substantial, separate effort, not an
+M-sized tightening, so per the "report structural findings rather
+than force them" guidance it stays with that follow-up. `uni-runtime`
+is already host-buildable; `//kernel` is the remaining gate. Until
+then the M change is covered by the two L3-parse tests above plus
+the `tcp_receive` audit; the chain-walk itself is item D's code and
+is exercised end-to-end by `test_hvf`.
+
+Verified: `bazel build //apps/webserver:webserver_qemu_x86_64`;
+`bazel build //apps/webserver:webserver.elf
+--platforms=//bazel/platforms:aarch64_unikernel`; `bazel test
+//apps/webserver:test_hvf`; `bazel test //net:ipv6_test
+//net:protocol_tests`.
