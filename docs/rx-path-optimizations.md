@@ -684,20 +684,6 @@ backpressure. CPU-bound at ChaCha20-Poly1305 decrypt rate
   `/stats`-style dashboards.
 - **GCE IPv6 subnet enablement** so `get_tcp_v6` runs against
   the remote unikernel-webserver VM (currently HVF-only).
-- **Extract a shared `TaggedTreiberStack`**: `IOBufPool`
-  ([`uni-iobuf/src/pool.rs`](../uni-iobuf/src/pool.rs)) and
-  `RxNodePool` ([`kernel/src/rx_inbox.rs`](../kernel/src/rx_inbox.rs))
-  each carry their own copy of the same tagged-pointer Treiber
-  free-list (`AtomicU64` head packing `(index, version)`; the
-  version bumps on push to defeat ABA). Lift the ~40-line stack
-  core into a zero-dep `core`-only crate — à la `util/atomic_fn` —
-  generic over the next-link accessor (a separate `[AtomicU32]`
-  array for `IOBufPool`, an in-struct field for `RxNodePool`). One
-  audited, stress-tested implementation instead of two. Needs the
-  `tests_need_std` opt-in on the new crate so the dep-pulling
-  `rust_test`s (`iobuf_test`, `rx_inbox_test`) still link under
-  `-Cpanic=unwind`. Low urgency — a tagged Treiber stack is
-  textbook and stable, and both copies are independently stressed.
 - **Fuse the Tier-2 classify parse**: `classify_for_distribution`
   ([`net/src/lib.rs`](../net/src/lib.rs)) walks eth → IPv4 → L4
   ports purely to pick a target core, then discards the result;
@@ -1813,3 +1799,50 @@ removal is a Phase-4 endgame.
 Verified: `webserver_qemu_x86_64` + `webserver.elf` aarch64 builds;
 `test_hvf`; `uni_http_test`; native backend compile via
 `uni_tls_test`. GCE VMs stopped after the run.
+
+### 2026-05-18 — Follow-up: shared `TaggedTreiberStack` ([x] **landed**)
+
+The "Extract a shared `TaggedTreiberStack`" near-term follow-up.
+`IOBufPool` ([`uni-iobuf/src/pool.rs`](../uni-iobuf/src/pool.rs)) and
+`RxNodePool` ([`kernel/src/rx_inbox.rs`](../kernel/src/rx_inbox.rs))
+each carried a byte-identical ~40-line copy of the tagged-pointer
+Treiber free-list. Both now delegate to one audited copy — two
+independent copies of subtle lock-free code collapse to one.
+
+**New crate** [`util/tagged_treiber`](../util/tagged_treiber) — a
+zero-dep `core`-only leaf crate, à la `util/atomic_fn`. It exports
+`TaggedTreiberStack` (the `AtomicU64` head word + `push` / `pop` CAS
+loops + `pack` / `unpack` + the version-bump-on-push ABA defence)
+and the `NULL_INDEX` sentinel.
+
+**Generic over the next-link accessor.** The two pools differ only
+in where they store `next` links — `IOBufPool` in a dedicated
+`Box<[AtomicU32]>` array (kept apart from slab payload), `RxNodePool`
+in a per-node field. The stack stays storage-agnostic via a
+one-method `TreiberLinks` trait (`fn next_link(&self, idx: u32) ->
+&AtomicU32`); each pool implements it. The calls monomorphise per
+consumer — no dynamic dispatch on the RX hot path.
+
+**A faithful extraction, not a redesign.** Every memory ordering is
+preserved byte-for-byte: head load `Acquire`, `next` link load/store
+`Relaxed`, pop CAS `Acquire`/`Relaxed`, push CAS `Release`/`Relaxed`.
+The one deliberate code-motion: the `free_count` observability
+counter — and `IOBufPool`'s `leaked` counter — stay pool-side. They
+are `Relaxed`, eventually-consistent, and not load-bearing for
+lock-free correctness, so they fall outside "the stack *core*". The
+per-op `free_count` bump consequently moves from inside the stack's
+CAS-success branch to just after the `push` / `pop` call —
+observationally identical, since nothing synchronises on a `Relaxed`
+counter.
+
+**Stress.** The new crate gets its own 8-thread ABA stress test,
+ported from `iobuf_test` / `rx_inbox_test`: a tiny stack hammered by
+8 threads × 20 000 iterations, then a post-run drain asserts every
+slot came home distinct. Its `rust_test` uses the `tests_need_std`
+wrapper from `//bazel/rules:rust.bzl`. Both pools' existing stress
+suites — each with its own 8-thread Treiber test — still pass
+unchanged against the shared implementation.
+
+Verified: `bazel test //util/tagged_treiber:tagged_treiber_test
+//uni-iobuf:iobuf_test //kernel:rx_inbox_test`; `webserver_qemu_x86_64`
++ `webserver.elf` aarch64 builds; `test_hvf`.
