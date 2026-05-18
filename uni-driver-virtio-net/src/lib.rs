@@ -33,7 +33,7 @@ use drivers_infra::virtio::{
     vpci_set_queue_msix_vector, vpci_set_config_msix_vector,
     vpci_msix_enable, vpci_msix_write_entry,
     STATUS_ACKNOWLEDGE, STATUS_DRIVER, STATUS_DRIVER_OK, STATUS_FEATURES_OK, STATUS_FAILED,
-    VIRTIO_NET_F_CSUM, VIRTIO_NET_F_HOST_TSO4,
+    VIRTIO_NET_F_CSUM, VIRTIO_NET_F_HOST_TSO4, VIRTIO_NET_RX_OFFLOAD_MASK,
     VIRTIO_NET_F_MAC, VIRTIO_NET_F_MRG_RXBUF, VIRTIO_NET_F_STATUS,
     VIRTIO_NET_F_MQ, VIRTIO_NET_F_CTRL_VQ,
     VIRTIO_RING_F_EVENT_IDX, VIRTIO_F_USED_IDX_MMIO,
@@ -475,10 +475,18 @@ fn init_pci_modern() -> bool {
     vpci_set_status(dev, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
 
     let dev_features = vpci_read_features(dev, 0);
-    // Accept every offered word-0 feature. Some hypervisors (notably Apple
-    // Virtualization.framework) require CSUM/INDIRECT_DESC and reject us if
-    // we don't ack them, and there's nothing in word-0 we'd want to refuse.
-    let guest_features = dev_features;
+    // Accept every offered word-0 feature EXCEPT the guest-side RX
+    // offloads (VIRTIO_NET_RX_OFFLOAD_MASK). Some hypervisors (notably
+    // Apple Virtualization.framework) require CSUM/INDIRECT_DESC and
+    // reject us if we don't ack them — those stay. But the RX path
+    // (`poll_qp`) handles only single-descriptor ≤MTU frames: echoing
+    // GUEST_TSO4/MRG_RXBUF back lets a tap+vhost-net backend hand us
+    // GRO-coalesced, multi-descriptor super-frames it then shreds,
+    // which stalls large uploads on the `--env kvm` bench path. SLIRP
+    // never coalesces, so plain `--env qemu` never tripped it. VERSION_1
+    // is negotiated below, so the virtio-net header stays 12 bytes
+    // regardless of MRG_RXBUF.
+    let guest_features = dev_features & !VIRTIO_NET_RX_OFFLOAD_MASK;
 
     // Check for multi-queue support
     let has_mq = (dev_features & VIRTIO_NET_F_MQ) != 0

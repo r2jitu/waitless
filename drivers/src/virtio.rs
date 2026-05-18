@@ -433,6 +433,20 @@ pub const VIRTIO_NET_F_MAC: u32 = 1 << 5;
 /// segments it host-side. Saves the per-MSS frame-build loop on TX.
 pub const VIRTIO_NET_F_HOST_TSO4: u32 = 1 << 11;
 pub const VIRTIO_NET_F_MRG_RXBUF: u32 = 1 << 15;
+/// Guest-side RX-offload feature bits the virtio-net RX path does
+/// **not** implement, and so must clear from the negotiated set.
+///
+/// `poll_qp` delivers every received frame as a single
+/// ≤`BUFFER_SIZE` (2 KiB) descriptor and never reads the
+/// virtio-net header's `num_buffers`/`gso_type`. Negotiating
+/// `GUEST_TSO4` (bit 7) lets a tap+vhost-net backend GRO-coalesce
+/// inbound TCP into >MTU super-frames; `MRG_RXBUF` (bit 15) lets a
+/// single frame span several descriptors. Either shreds large
+/// inbound TCP, so both — plus `GUEST_CSUM`/`TSO6`/`ECN`/`UFO` —
+/// are masked off. Bits: GUEST_CSUM(1) GUEST_TSO4(7) GUEST_TSO6(8)
+/// GUEST_ECN(9) GUEST_UFO(10) MRG_RXBUF(15).
+pub const VIRTIO_NET_RX_OFFLOAD_MASK: u32 =
+    (1 << 1) | (1 << 7) | (1 << 8) | (1 << 9) | (1 << 10) | (1 << 15);
 pub const VIRTIO_NET_F_STATUS: u32 = 1 << 16;
 pub const VIRTIO_NET_F_MQ: u32 = 1 << 22;
 pub const VIRTIO_NET_F_CTRL_VQ: u32 = 1 << 17;

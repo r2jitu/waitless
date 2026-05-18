@@ -337,11 +337,13 @@ deploy-gcloud.sh ───────► unikernel-webserver   (build a GCE cus
   qemu` at multiple cores (MTTCG gives genuine multi-threaded
   concurrency).
 
-  One caveat surfaced once the path was restored: TCP **upload**
-  workloads (`upload_*`) stall on `--env kvm` (~1.3 s/req, throughput
-  near zero), while `get_*` and `echo_udp` are healthy and scale across
-  cores. That is a separate, still-undiagnosed issue in the tap +
-  vhost-net RX path — not the nested-virt problem above.
+  *(Resolved 2026-05-18.)* TCP **upload** workloads (`upload_*`) first
+  stalled here (~1.3 s/req, throughput near zero) while `get_*` /
+  `echo_udp` were fine: the virtio-net driver negotiated guest RX
+  offloads (`GUEST_TSO4` / `MRG_RXBUF`) that its single-descriptor RX
+  path can't honour, so vhost-net's GRO-coalesced multi-buffer
+  super-frames were shredded. Fixed by masking those bits — see
+  `VIRTIO_NET_RX_OFFLOAD_MASK` in `drivers/src/virtio.rs`.
 - **`--cpu max` / AVX.** The p256 + chacha20poly1305 crates emit AVX;
   QEMU's default `qemu64` lacks it and faults at TLS init. Every
   bench-driven QEMU invocation passes `-cpu max` (or `-cpu host` under
