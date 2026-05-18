@@ -1,0 +1,73 @@
+// Zed port of .vscode/settings.json — rust-analyzer config for this
+// bazel/rules_rust workspace. Zed reads JSONC, so the comments survive.
+{
+  "lsp": {
+    "rust-analyzer": {
+      // VSCode's `rust-analyzer.server.extraEnv` is an extension-side
+      // setting: env applied when the editor *spawns* the r-a process,
+      // not config sent to the server. Zed's equivalent is `binary.env`.
+      //
+      // RUSTUP_TOOLCHAIN must be pinned on the r-a process itself (not
+      // via initialization_options.cargo.extraEnv). When r-a probes the
+      // sysroot of the rules_rust-bundled toolchain it points its child
+      // cargo at a custom toolchain link with no `cargo` binary; the
+      // rustup shim then falls back to whatever cargo it finds (often
+      // nightly), which may reject flags like `--lockfile-path` and
+      // break project load. Forcing `stable` here keeps that probe sane.
+      "binary": {
+        "env": {
+          "RUSTUP_TOOLCHAIN": "stable"
+        }
+      },
+      "initialization_options": {
+        // Whenever the IDE needs project metadata (project open, BUILD
+        // file edit, etc.), it runs scripts/discover-rust-project.sh,
+        // which shells out to bazel and asks rules_rust for the current
+        // crate graph. No rust-project.json to regenerate by hand.
+        //
+        // r-a runs this command from the workspace root and only
+        // substitutes `{arg}`. `${workspaceFolder}` is a VSCode-only
+        // variable — Zed/r-a do not expand it — so the path is a plain
+        // relative path here. The script resolves the workspace itself.
+        //
+        // `filesToWatch` triggers a refresh on edits to BUILD files and
+        // MODULE.bazel so a new dependency shows up in completion /
+        // go-to-def almost immediately.
+        "workspace": {
+          "discoverConfig": {
+            "command": [
+              "scripts/discover-rust-project.sh",
+              "{arg}"
+            ],
+            "progressLabel": "rules_rust",
+            "filesToWatch": [
+              "BUILD",
+              "BUILD.bazel",
+              "MODULE.bazel",
+              "Cargo.toml"
+            ]
+          }
+        },
+        // Don't run `cargo check` — bazel is the build system, and the
+        // unikernel kernel/uni crates aren't even cargo-buildable.
+        "check": {
+          "overrideCommand": []
+        },
+        "cargo": {
+          "buildScripts": {
+            "enable": false
+          }
+        }
+      }
+    }
+  },
+  // VSCode's `rust-analyzer.inlayHints.{type,parameter}Hints.enable` are
+  // already r-a defaults. In Zed, inlay-hint *rendering* is gated by
+  // this top-level block, which is OFF by default — this is the setting
+  // that actually makes the hints appear in the editor margin.
+  "inlay_hints": {
+    "enabled": true,
+    "show_type_hints": true,
+    "show_parameter_hints": true
+  }
+}
