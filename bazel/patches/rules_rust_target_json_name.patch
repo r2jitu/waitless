@@ -1,0 +1,24 @@
+Name a custom `target_json` spec file `<toolchain>.json`, not
+`<toolchain>.target.json`.
+
+rustc derives a JSON target's triple identity from the spec filename
+with only the `.json` extension stripped, so `foo.target.json` yields
+the triple `foo.target`. That stray `.target` then leaks into the
+rustc triple, the sysroot directory (`lib/rustlib/foo.target/`) and
+every diagnostic. Dropping the extra extension makes the triple equal
+the `rust_toolchain` target name verbatim.
+
+Only affects `target_json` toolchains (the `elif` branch); builtin
+`target_triple` toolchains never reach this line.
+
+--- a/rust/toolchain.bzl
++++ b/rust/toolchain.bzl
+@@ -497,7 +497,7 @@
+     elif ctx.attr.target_json:
+         # Ensure the data provided is valid json
+         target_json_content = json.decode(ctx.attr.target_json)
+-        target_json = ctx.actions.declare_file("{}.target.json".format(ctx.label.name))
++        target_json = ctx.actions.declare_file("{}.json".format(ctx.label.name))
+
+         ctx.actions.write(
+             output = target_json,

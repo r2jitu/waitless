@@ -60,7 +60,12 @@ use_repo(pip, "pip")
 single_version_override(
     module_name = "rules_rust",
     patch_strip = 1,
-    patches = ["//bazel/patches:rules_rust_aarch64_none.patch"],
+    patches = [
+        "//bazel/patches:rules_rust_aarch64_none.patch",
+        # Drop the `.target` infix from custom `target_json` spec filenames
+        # so the hard-float toolchain's rustc triple is a clean name.
+        "//bazel/patches:rules_rust_target_json_name.patch",
+    ],
 )
 
 register_toolchains(
