@@ -264,8 +264,14 @@ rust_test(
 
 rust_library(
     name = "net",
-    srcs = ["src/lib.rs"],
+    srcs = [
+        "src/ipv6_nd.rs",
+        "src/lib.rs",
+        "src/rx.rs",
+        "src/sched.rs",
+    ],
     crate_name = "uni_net_stack",
+    crate_root = "src/lib.rs",
     deps = [
         ":arp",
         ":dhcp",
