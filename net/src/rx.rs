@@ -248,67 +248,15 @@ fn owner(parsed: &types::ParsedL3, frame: &[u8], num_cores: u32) -> u32 {
     };
     match (parsed.src, parsed.dst) {
         (types::IpAddr::V4(s), types::IpAddr::V4(d)) => {
-            flow_hash(s.addr, d.addr, src_port, dst_port, num_cores)
+            types::flow_hash(s.addr, d.addr, src_port, dst_port, num_cores)
         }
         (types::IpAddr::V6(s), types::IpAddr::V6(d)) => {
-            flow_hash_v6(&s.octets, &d.octets, src_port, dst_port, num_cores)
+            types::flow_hash_v6(&s.octets, &d.octets, src_port, dst_port, num_cores)
         }
         // A frame is one address family or the other — mixed is
         // impossible (`parse_ipv4`/`parse_ipv6` each yield one).
         _ => 0,
     }
-}
-
-/// IPv4 flow hash — FNV-1a over the 4-tuple, Murmur3 `fmix32`
-/// finalizer so `% num_cores` stays uniform even when inputs vary in
-/// only one field (e.g. wrk's N connections from one src IP to one
-/// dst port — without the finalizer all flows collapse to a single
-/// core on `num_cores = 2`).
-fn flow_hash(src_ip: u32, dst_ip: u32, src_port: u16, dst_port: u16, num_cores: u32) -> u32 {
-    let mut h: u32 = 2166136261; // FNV offset basis
-    h ^= src_ip;
-    h = h.wrapping_mul(16777619);
-    h ^= dst_ip;
-    h = h.wrapping_mul(16777619);
-    h ^= src_port as u32;
-    h = h.wrapping_mul(16777619);
-    h ^= dst_port as u32;
-    h = h.wrapping_mul(16777619);
-    // Murmur3 fmix32 — make low bits depend uniformly on the whole input.
-    h ^= h >> 16;
-    h = h.wrapping_mul(0x85ebca6b);
-    h ^= h >> 13;
-    h = h.wrapping_mul(0xc2b2ae35);
-    h ^= h >> 16;
-    h % num_cores
-}
-
-/// IPv6 flow hash — the v6 twin of [`flow_hash`]. Folds the two
-/// 16-byte addresses byte-by-byte into the same FNV-1a stream, then
-/// the same `fmix32` finalizer. Independent of `flow_hash`: a v4 and
-/// a v6 flow need not agree, only each be self-consistent.
-fn flow_hash_v6(
-    src: &[u8; 16],
-    dst: &[u8; 16],
-    src_port: u16,
-    dst_port: u16,
-    num_cores: u32,
-) -> u32 {
-    let mut h: u32 = 2166136261; // FNV offset basis
-    for &b in src.iter().chain(dst.iter()) {
-        h ^= b as u32;
-        h = h.wrapping_mul(16777619);
-    }
-    h ^= src_port as u32;
-    h = h.wrapping_mul(16777619);
-    h ^= dst_port as u32;
-    h = h.wrapping_mul(16777619);
-    h ^= h >> 16;
-    h = h.wrapping_mul(0x85ebca6b);
-    h ^= h >> 13;
-    h = h.wrapping_mul(0xc2b2ae35);
-    h ^= h >> 16;
-    h % num_cores
 }
 
 // ── deliver — L4 dispatch ───────────────────────────────────────────

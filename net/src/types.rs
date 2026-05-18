@@ -476,6 +476,62 @@ pub fn tcp_checksum(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, data: *const u8, le
     !(sum as u16)
 }
 
+// ── Flow hashing — Tier-2 RX distribution ───────────────────────────────────
+
+/// Map an IPv4 4-tuple to a core index — the Tier-2 RX flow hash.
+/// FNV-1a over the tuple, then a Murmur3 `fmix32` finalizer so
+/// `% num_cores` stays uniform even when inputs vary in only one
+/// field (e.g. wrk's N connections from one src IP to one dst port —
+/// without the finalizer all flows collapse to a single core on
+/// `num_cores = 2`). A pure function of the tuple, so every segment
+/// of a flow lands on the same core.
+pub fn flow_hash(src_ip: u32, dst_ip: u32, src_port: u16, dst_port: u16, num_cores: u32) -> u32 {
+    let mut h: u32 = 2166136261; // FNV offset basis
+    h ^= src_ip;
+    h = h.wrapping_mul(16777619);
+    h ^= dst_ip;
+    h = h.wrapping_mul(16777619);
+    h ^= src_port as u32;
+    h = h.wrapping_mul(16777619);
+    h ^= dst_port as u32;
+    h = h.wrapping_mul(16777619);
+    // Murmur3 fmix32 — make low bits depend uniformly on the whole input.
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x85ebca6b);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0xc2b2ae35);
+    h ^= h >> 16;
+    h % num_cores
+}
+
+/// The IPv6 twin of [`flow_hash`] — folds the two 16-byte addresses
+/// byte-by-byte into the same FNV-1a stream, then the same `fmix32`
+/// finalizer. Independent of `flow_hash`: a v4 and a v6 flow need
+/// not agree, only each be self-consistent.
+pub fn flow_hash_v6(
+    src: &[u8; 16],
+    dst: &[u8; 16],
+    src_port: u16,
+    dst_port: u16,
+    num_cores: u32,
+) -> u32 {
+    let mut h: u32 = 2166136261; // FNV offset basis
+    for &b in src.iter().chain(dst.iter()) {
+        h ^= b as u32;
+        h = h.wrapping_mul(16777619);
+    }
+    h ^= src_port as u32;
+    h = h.wrapping_mul(16777619);
+    h ^= dst_port as u32;
+    h = h.wrapping_mul(16777619);
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x85ebca6b);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0xc2b2ae35);
+    h ^= h >> 16;
+    h % num_cores
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -664,6 +720,58 @@ mod tests {
         assert_eq!(
             tcp_checksum(src, dst, 17, verified.as_ptr(), verified.len()),
             0
+        );
+    }
+
+    #[test]
+    fn flow_hash_is_deterministic() {
+        // Flow affinity: the same 4-tuple must always map to the same
+        // core, or a connection's segments scatter across the
+        // per-core TCP pools and miss.
+        let a = flow_hash(0x0a00_0201, 0x0a00_0202, 12345, 80, 4);
+        for _ in 0..256 {
+            assert_eq!(flow_hash(0x0a00_0201, 0x0a00_0202, 12345, 80, 4), a);
+        }
+        let s = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let d = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let b = flow_hash_v6(&s, &d, 33000, 443, 4);
+        for _ in 0..256 {
+            assert_eq!(flow_hash_v6(&s, &d, 33000, 443, 4), b);
+        }
+    }
+
+    #[test]
+    fn flow_hash_stays_in_range() {
+        let s6 = [1u8; 16];
+        let d6 = [2u8; 16];
+        for nc in 1..=8u32 {
+            assert!(flow_hash(1, 2, 3, 4, nc) < nc);
+            assert!(flow_hash_v6(&s6, &d6, 3, 4, nc) < nc);
+        }
+    }
+
+    #[test]
+    fn flow_hash_spreads_across_cores() {
+        // The fmix32 finalizer exists precisely so flows that differ
+        // in only the src port don't collapse onto one core. 256
+        // ports → 4 cores: every core must be reached, v4 and v6.
+        let mut seen_v4 = [false; 4];
+        let mut seen_v6 = [false; 4];
+        let d6 = [0xffu8; 16];
+        for port in 1024u16..1280 {
+            seen_v4[flow_hash(0x0a00_0201, 0x0a00_0202, port, 80, 4) as usize] = true;
+            let mut s6 = [0u8; 16];
+            s6[14] = (port >> 8) as u8;
+            s6[15] = port as u8;
+            seen_v6[flow_hash_v6(&s6, &d6, port, 443, 4) as usize] = true;
+        }
+        assert!(
+            seen_v4.iter().all(|&x| x),
+            "v4 flows should reach every core"
+        );
+        assert!(
+            seen_v6.iter().all(|&x| x),
+            "v6 flows should reach every core"
         );
     }
 }
