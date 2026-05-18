@@ -3,6 +3,7 @@
 #![no_std]
 
 extern crate net_arp as arp;
+extern crate net_eth_tx as eth_tx;
 extern crate net_ethernet as ethernet;
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
@@ -10,7 +11,8 @@ extern crate uni_kernel;
 
 use arp::arp_resolve;
 use core::ptr;
-use ethernet::{ETHERTYPE_IPV4, ethernet_send};
+use eth_tx::ethernet_send;
+use ethernet::ETHERTYPE_IPV4;
 use from_bytes::FromBytes;
 use types::{CONFIG, Ipv4Addr, MacAddr, checksum, htons, ntohs};
 

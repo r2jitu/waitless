@@ -18,6 +18,7 @@ extern crate uni_runtime;
 
 pub extern crate net_arp as arp;
 pub extern crate net_dhcp as dhcp;
+pub extern crate net_eth_tx as eth_tx;
 pub extern crate net_ethernet as ethernet;
 pub extern crate net_icmpv6 as icmpv6;
 pub extern crate net_ipv4 as ipv4;

@@ -499,7 +499,7 @@ unsafe fn kernel_boot(info: &BootInfo) {
             klog!("nic: none (no gVNIC, no virtio-net)\n");
         } else {
             // Cache MAC address for multi-core safe access.
-            net::ethernet::init_mac();
+            net::eth_tx::init_mac();
             let mut mac = [0u8; 6];
             uni_drivers::net::get_mac(mac.as_mut_ptr());
             klog!(

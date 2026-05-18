@@ -2,6 +2,7 @@
 
 #![no_std]
 
+extern crate net_eth_tx as eth_tx;
 extern crate net_ethernet as ethernet;
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
@@ -9,7 +10,8 @@ extern crate uni_drivers;
 extern crate uni_iobuf;
 extern crate uni_kernel;
 
-use ethernet::{ETHERTYPE_ARP, ethernet_our_mac, ethernet_parse, ethernet_send};
+use eth_tx::ethernet_send;
+use ethernet::{ETHERTYPE_ARP, ethernet_our_mac, ethernet_parse};
 use from_bytes::FromBytes;
 use types::{CONFIG, Ipv4Addr, MacAddr, htons, ntohs};
 use uni_iobuf::{Chain, OwnedIOBuf};

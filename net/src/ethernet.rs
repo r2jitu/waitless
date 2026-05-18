@@ -1,15 +1,17 @@
-// net/ethernet.rs — Ethernet frame parsing/building.
+// net/ethernet.rs — Ethernet frame parsing + header building.
 //
-// Layer 2 only: MAC addresses, frame headers, send/receive.
-// Protocol dispatch (ARP, IPv4) is handled by callers, not here.
+// Layer 2 wire format only: MAC addresses, the frame header, parse,
+// and in-place header fill. Pure — no driver dependency — so this
+// is a host-testable leaf crate (the `net_ipv6` model). The
+// os:none send path (`ethernet_send`, `init_mac`) lives in the
+// sibling `net_eth_tx` crate, which depends on this one plus
+// `//drivers`.
 
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 extern crate net_from_bytes as from_bytes;
 extern crate net_types as types;
-extern crate uni_drivers;
 
-use core::ptr;
 use from_bytes::FromBytes;
 use types::{MacAddr, htons};
 
@@ -32,14 +34,14 @@ unsafe impl FromBytes for EthernetHeader {}
 /// Cached MAC address. Packed into the low 48 bits of an `AtomicU64` so
 /// the cross-core publish is data-race-free without depending on
 /// `uni_kernel::once::InitOnce` (this leaf crate has no kernel dep).
-/// `init_mac` runs once on the BSP after virtio-net init; readers on
-/// every core load via Acquire and decode.
+/// `net_eth_tx::init_mac` writes it once on the BSP after virtio-net
+/// init via `set_our_mac`; readers on every core load via Acquire.
 static OUR_MAC_PACKED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Cache our MAC address. Called once at boot after virtio-net init.
-pub fn init_mac() {
-    let mut bytes = [0u8; 6];
-    uni_drivers::net::get_mac(bytes.as_mut_ptr());
+/// Store the NIC's MAC into the cross-core cache. Called once at boot
+/// by `net_eth_tx::init_mac`, which reads the MAC from the driver —
+/// the store lives here because the cache static and its readers do.
+pub fn set_our_mac(bytes: [u8; 6]) {
     let packed = (bytes[0] as u64)
         | ((bytes[1] as u64) << 8)
         | ((bytes[2] as u64) << 16)
@@ -80,25 +82,6 @@ pub fn fill_header(slot: &mut [u8], dst: MacAddr, src: MacAddr, ethertype: u16) 
     }
 }
 
-pub fn ethernet_send(dst: MacAddr, ethertype: u16, payload: &[u8]) {
-    // Stack-allocated buffer: safe for multi-core (each core has its own stack).
-    // Use MaybeUninit to avoid zeroing 1514 bytes — we fill the header and
-    // copy the payload, so the used portion is always initialized.
-    let mut buf = core::mem::MaybeUninit::<[u8; 1514]>::uninit();
-    unsafe {
-        let p = buf.as_mut_ptr() as *mut u8;
-        let hdr = &mut *(p as *mut EthernetHeader);
-        hdr.dst = dst;
-        hdr.src = ethernet_our_mac();
-        hdr.ethertype = htons(ethertype);
-
-        let payload_len = payload.len().min(1500);
-        ptr::copy_nonoverlapping(payload.as_ptr(), p.add(HEADER_LEN), payload_len);
-
-        uni_drivers::net::send(core::slice::from_raw_parts(p, HEADER_LEN + payload_len));
-    }
-}
-
 /// Parse an Ethernet frame into ethertype + payload. Returns None if too short.
 pub fn ethernet_parse(frame: &[u8]) -> Option<(u16, &[u8])> {
     let hdr = EthernetHeader::try_ref_from(frame)?;
@@ -112,4 +95,46 @@ pub fn ethernet_parse(frame: &[u8]) -> Option<(u16, &[u8])> {
 pub fn ethernet_parse_full(frame: &[u8]) -> Option<(MacAddr, u16, &[u8])> {
     let hdr = EthernetHeader::try_ref_from(frame)?;
     Some((hdr.src, u16::from_be(hdr.ethertype), &frame[HEADER_LEN..]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_full_extracts_src_ethertype_payload() {
+        // dst, src=52:54:00:12:34:56, ethertype=0x0806 (ARP), 4 payload bytes.
+        let frame = [
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x52, 0x54, 0x00, 0x12, 0x34, 0x56, 0x08, 0x06,
+            0xde, 0xad, 0xbe, 0xef,
+        ];
+        let (src, ethertype, payload) = ethernet_parse_full(&frame).expect("parse");
+        assert_eq!(src.bytes, [0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
+        assert_eq!(ethertype, ETHERTYPE_ARP);
+        assert_eq!(payload, &[0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    #[test]
+    fn parse_rejects_short_frame() {
+        // Fewer than the 14-byte header — `try_ref_from` must reject.
+        let frame = [0u8; 13];
+        assert!(ethernet_parse(&frame).is_none());
+        assert!(ethernet_parse_full(&frame).is_none());
+    }
+
+    #[test]
+    fn fill_header_round_trips() {
+        let mut buf = [0u8; HEADER_LEN];
+        let dst = MacAddr {
+            bytes: [1, 2, 3, 4, 5, 6],
+        };
+        let src = MacAddr {
+            bytes: [7, 8, 9, 10, 11, 12],
+        };
+        fill_header(&mut buf, dst, src, ETHERTYPE_IPV4);
+        let (got_src, et, _) = ethernet_parse_full(&buf).expect("parse");
+        assert_eq!(got_src.bytes, src.bytes);
+        assert_eq!(et, ETHERTYPE_IPV4);
+        assert_eq!(&buf[0..6], &dst.bytes);
+    }
 }

@@ -42,6 +42,8 @@ rust_test(
     srcs = ["src/protocol_tests.rs"],
 )
 
+# Ethernet wire format — parse + header build. Pure leaf (no driver
+# dep), host-testable. The os:none send path is `:eth_tx`.
 rust_library(
     name = "ethernet",
     srcs = ["src/ethernet.rs"],
@@ -49,6 +51,25 @@ rust_library(
     crate_root = "src/ethernet.rs",
     deps = [
         ":from_bytes",
+        ":types",
+    ],
+)
+
+rust_test(
+    name = "ethernet_test",
+    size = "small",
+    crate = ":ethernet",
+)
+
+# os:none Ethernet send path — NIC MAC init + frame TX. Split from
+# `:ethernet` so the parse side carries no `//drivers` dependency.
+rust_library(
+    name = "eth_tx",
+    srcs = ["src/eth_tx.rs"],
+    crate_name = "net_eth_tx",
+    crate_root = "src/eth_tx.rs",
+    deps = [
+        ":ethernet",
         ":types",
         "//drivers",
     ],
@@ -60,6 +81,7 @@ rust_library(
     crate_name = "net_arp",
     crate_root = "src/arp.rs",
     deps = [
+        ":eth_tx",
         ":ethernet",
         ":from_bytes",
         ":types",
@@ -76,6 +98,7 @@ rust_library(
     crate_root = "src/ipv4.rs",
     deps = [
         ":arp",
+        ":eth_tx",
         ":ethernet",
         ":from_bytes",
         ":types",
@@ -170,6 +193,7 @@ rust_library(
     crate_name = "net_ipv6_send",
     crate_root = "src/ipv6_send.rs",
     deps = [
+        ":eth_tx",
         ":ethernet",
         ":icmpv6",
         ":ipv6",
@@ -275,6 +299,7 @@ rust_library(
     deps = [
         ":arp",
         ":dhcp",
+        ":eth_tx",
         ":ethernet",
         ":icmpv6",
         ":ipv4",
