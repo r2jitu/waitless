@@ -1,92 +1,172 @@
-//! The RX receive pipeline — Ethernet → L3 → L4 dispatch. `net_receive`
-//! is the single-core / Tier-1 entry; `distribute_frame` is the Tier-2
-//! distributor entry. Which one runs is decided by `crate::sched`; the
-//! IPv6 control plane (ICMPv6 / NDP / SLAAC) lives in `crate::ipv6_nd`.
+//! The RX receive pipeline — Ethernet → L3 → L4 dispatch.
+//!
+//! One shape, two entry points. `net_receive` is the single-core /
+//! Tier-1 callback; `distribute_frame` is the Tier-2 distributor
+//! callback (`crate::sched` hands the driver whichever the tier
+//! calls for). Both run the same three-step pipeline:
+//!
+//!   * `classify` — eth + L3 parse, **once**, IPv4 and IPv6 alike,
+//!     into a `Classified` verdict. Pure: no snoop, no dispatch.
+//!   * `owner` — Tier-2 only: flow-hash the 4-tuple to an owning
+//!     core. Tier 1 skips this (the NIC's RSS already distributed).
+//!   * `deliver` — snoop the sender + dispatch to L4 (TCP / UDP /
+//!     ICMPv6), on the core that owns the frame.
+//!
+//! The IPv6 control plane (ICMPv6 / NDP / SLAAC) lives in
+//! `crate::ipv6_nd`; `deliver` calls into it for ICMPv6.
+//!
+//! **One chain is one frame.** The driver invokes the callback once
+//! per frame; a frame is a single device buffer today, or — once
+//! RSC lands (item I) — a hardware-coalesced super-segment spanning
+//! several buffers (one chain, several parts). The chain is handled
+//! as a unit: headers parse from part 0, and for TCP the whole
+//! narrowed chain moves into `tcp::tcp_receive`, which walks every
+//! part. The chain — and the device RX buffer(s) it owns — drops
+//! when the callback returns (or, for TCP, when `tcp_receive`
+//! returns), reposting the buffer(s) via each part's drop callback.
 
 use crate::{arp, ethernet, ipv4, ipv6, ipv6_nd, ndp, sched, tcp, types, udp};
 use uni_iobuf::{Chain, OwnedIOBuf};
 use uni_kernel::percpu;
 
-/// RX callback for the NIC poll path (`NicOps::poll_rx` / `poll_qp`)
-/// — dispatches one received frame through the full stack. This is
-/// the single-core and Tier-1 receive entry point, and the ARP / IPv6
-/// inline path of the Tier-2 distributor (`distribute_frame`'s
-/// `InlineReparse`). Tier 2's IPv4 frames skip this and reach the L4
-/// stack through `net_receive_parsed`, reusing the parse the
-/// distributor's classify pass already did — but this function funnels
-/// its own IPv4 frames through `net_receive_parsed` too, so the
-/// arp-snoop + L4 dispatch has exactly one implementation.
-///
-/// **One chain is one frame.** The driver invokes this callback once
-/// per received frame; a frame is a single device buffer today, or —
-/// once RSC lands (item I) — a hardware-coalesced super-segment
-/// spanning several buffers (one chain, several parts). The chain is
-/// therefore handled as a *unit*: the L2/L3/L4 headers are parsed
-/// from part 0, and for TCP the whole narrowed chain is moved into
-/// `tcp::tcp_receive`, which walks every part for payload. Splitting
-/// the chain and re-parsing each part as its own frame would be
-/// wrong for RSC — parts 1..N of a super-segment are raw TCP payload
-/// continuation, not framed packets.
-///
-/// The chain — and the device RX buffer(s) it owns — drops when this
-/// returns (or, for TCP, when `tcp_receive` returns); that drop
-/// reposts the buffer(s) via each part's drop callback.
+// ── Entry points — the tier adapters ────────────────────────────────
+
+/// Single-core / Tier-1 RX callback. Classifies one frame and
+/// delivers it on this core. No distribution: single-core has
+/// nowhere else to send it, and Tier 1's NIC already hashed the flow
+/// to this core's own RX queue.
 pub fn net_receive(chain: Chain<OwnedIOBuf>) {
     // Part 0 carries the L2/L3/L4 headers contiguously.
     let Some(first) = chain.iter().next() else {
         return;
     };
-    let Some((src_mac, ethertype, payload)) = ethernet::ethernet_parse_full(first.data()) else {
-        return;
-    };
-    match ethertype {
-        ethernet::ETHERTYPE_ARP => arp::arp_receive(payload),
-        ethernet::ETHERTYPE_IPV4 => {
-            // Single-core / Tier-1 parse the IPv4 headers here; Tier 2
-            // already parsed them in `classify_for_distribution` and
-            // routes through `net_receive_parsed` directly.
-            if let Some(parsed) = parse_ipv4(first.data(), payload, src_mac) {
-                net_receive_parsed(parsed, chain);
+    let frame = first.data();
+    match classify(frame) {
+        Classified::Arp(off) => {
+            if let Some(payload) = frame.get(off..) {
+                arp::arp_receive(payload);
             }
         }
-        ipv6::ETHERTYPE_IPV6 => ipv6_receive_frame(chain, src_mac),
-        _ => {}
+        Classified::Ip(parsed) => deliver(parsed, chain),
+        Classified::Drop => {}
     }
 }
 
-/// Receive a frame whose L2/L3 headers are already parsed — the Tier 2
-/// fast path. The owning core (a distributed frame, drained from its
-/// `rx_inbox`) and the distributor core (an inline IPv4 frame) both
-/// reach the L4 stack through here, skipping the eth + IPv4 re-parse
-/// `net_receive` would otherwise do a *second* time. `net_receive`
-/// funnels its own IPv4 frames through here too, so there is one
-/// arp-snoop + L4-dispatch path.
-///
-/// ARP-snoops `parsed.arp` (the on-subnet sender's MAC) into *this*
-/// core's fast-cache. For a distributed frame that is the owning
-/// core's cache — a different one than the distributor warmed in
-/// `classify_for_distribution` — so it is not the redundant learn the
-/// fuse removed. The duplicate the fuse removed was on the *inline*
-/// path: classify no longer learns for inline frames, leaving this the
-/// single learn on that core.
-pub(crate) fn net_receive_parsed(parsed: types::ParsedL3, chain: Chain<OwnedIOBuf>) {
-    if let (Some(src_mac), types::IpAddr::V4(src_v4)) = (parsed.arp, parsed.src) {
-        arp::arp_learn(src_v4, src_mac);
+/// Tier-2 distributor RX callback — the `NicOps::poll_rx` callback in
+/// single-queue mode. Classifies one frame, then for a TCP/UDP packet
+/// owned by another core *moves the whole chain* into that core's
+/// `rx_inbox` (item C — no frame-byte copy), bundled with the
+/// `ParsedL3` so the owning core skips straight to `deliver` with no
+/// re-parse. ARP, non-TCP/UDP, and frames this core owns are
+/// delivered inline. The owning core drains the inbox via
+/// `crate::sched::net_drain_cb`.
+pub(crate) fn distribute_frame(chain: Chain<OwnedIOBuf>) {
+    let num_cores = percpu::num_cores();
+    let my_core = uni_kernel::cpu_id();
+    let Some(first) = chain.iter().next() else {
+        return;
+    };
+    let frame = first.data();
+    match classify(frame) {
+        Classified::Arp(off) => {
+            if let Some(payload) = frame.get(off..) {
+                arp::arp_receive(payload);
+            }
+        }
+        Classified::Ip(parsed) => {
+            // Only TCP/UDP have a 4-tuple to flow-hash and a per-core
+            // connection pool to honour. Anything else (ICMPv6, ...)
+            // has no owning core — deliver it inline on this one.
+            let target = if parsed.proto == ipv4::PROTO_TCP || parsed.proto == ipv4::PROTO_UDP {
+                owner(&parsed, frame, num_cores)
+            } else {
+                my_core
+            };
+            if target == my_core || num_cores <= 1 {
+                deliver(parsed, chain);
+            } else {
+                // Warm *this* (distributor) core's neighbor cache for
+                // the on-link sender — the owning core warms its own
+                // when it drains the frame. Then move the chain over.
+                snoop(&parsed);
+                // SAFETY: `percpu::init()` runs before any AP starts;
+                // `target` is bounded by `num_cores`.
+                let core = unsafe { percpu::get(target) };
+                let rxframe = percpu::RxChain { parsed, chain };
+                match percpu::rx_node_pool().distribute(&core.rx_inbox, rxframe) {
+                    Ok(()) => {
+                        sched::WAKEUP
+                            .at(target)
+                            .store(true, core::sync::atomic::Ordering::Relaxed);
+                    }
+                    Err(_frame) => {
+                        // Unreachable: the node pool is sized ≥ the RX
+                        // queue's buffer count, so a frame in flight
+                        // always has a free node (see `rx_inbox`'s
+                        // overflow proof). `_frame` drops here, which
+                        // auto-reposts its chain's device buffers.
+                    }
+                }
+            }
+        }
+        Classified::Drop => {}
     }
-    dispatch_l4(&parsed, chain);
 }
 
-/// Parse the eth-stripped IPv4 packet of a frame into a [`ParsedL3`]
-/// — the single L2/L3 parse a Tier-2 frame now gets. `frame` is part
-/// 0's bytes (so the L4 offset is absolute within it); `eth_payload`
-/// is the IPv4 packet with the ethernet header already stripped;
-/// `src_mac` is the L2 source.
-///
-/// Returns `None` for a packet `ipv4_receive` rejects (malformed, or
-/// not addressed to us). A non-TCP/UDP IPv4 packet still parses to
-/// `Some` — the stack has no handler for it, but carrying it lets the
-/// receive path ARP-snoop an on-subnet sender exactly as the pre-fuse
-/// code did; `dispatch_l4` then no-ops on the protocol.
+// ── classify — eth + L3 parse, exactly once ─────────────────────────
+
+/// The classification verdict for one received frame, from a single
+/// eth + L3 parse. `Copy` and frame-borrow-free: the `Ip` variant's
+/// `ParsedL3` references the L4 segment by `(l4_off, l4_len)` rather
+/// than by slice, and `Arp` carries a byte offset — so a verdict can
+/// outlive the frame borrow and ride a cross-core inbox node.
+#[derive(Clone, Copy)]
+enum Classified {
+    /// ARP — L2.5, no L3/L4, no flow; handled inline on any core.
+    /// Carries the byte offset of the ARP payload within the frame
+    /// (past the Ethernet header) so the caller re-slices it without
+    /// a second parse.
+    Arp(usize),
+    /// An IP packet — IPv4 or IPv6 — summarised into a `ParsedL3`.
+    Ip(types::ParsedL3),
+    /// Unparseable, not addressed to us, or an ethertype with no
+    /// handler in this stack.
+    Drop,
+}
+
+/// Parse one frame's L2/L3 headers exactly once. `frame` is part 0
+/// of the RX chain — the headers are contiguous there. Pure: the
+/// arp/ndp snoop and the L4 dispatch are the caller's job (`deliver`
+/// / `distribute_frame`), so the same `classify` serves Tier 1 and
+/// Tier 2 with no behavioural fork.
+fn classify(frame: &[u8]) -> Classified {
+    let Some((src_mac, ethertype, payload)) = ethernet::ethernet_parse_full(frame) else {
+        return Classified::Drop;
+    };
+    match ethertype {
+        ethernet::ETHERTYPE_ARP => {
+            // `payload` is a sub-slice of `frame`, so this offset is
+            // in-bounds by construction.
+            Classified::Arp(payload.as_ptr() as usize - frame.as_ptr() as usize)
+        }
+        ethernet::ETHERTYPE_IPV4 => match parse_ipv4(frame, payload, src_mac) {
+            Some(p) => Classified::Ip(p),
+            None => Classified::Drop,
+        },
+        ipv6::ETHERTYPE_IPV6 => match parse_ipv6(frame, payload, src_mac) {
+            Some(p) => Classified::Ip(p),
+            None => Classified::Drop,
+        },
+        _ => Classified::Drop,
+    }
+}
+
+/// Summarise an IPv4 packet into a [`ParsedL3`]. `frame` is part 0's
+/// bytes (so the L4 offset is absolute within it); `eth_payload` is
+/// the IPv4 packet with the Ethernet header stripped; `src_mac` is
+/// the L2 source. `None` for a packet `ipv4_receive` rejects. A
+/// non-TCP/UDP IPv4 packet still parses to `Some` — `deliver` no-ops
+/// on the protocol, but carrying it keeps the arp-snoop alive.
 ///
 /// [`ParsedL3`]: types::ParsedL3
 fn parse_ipv4(
@@ -98,8 +178,6 @@ fn parse_ipv4(
     // L4 segment's (offset, len) within part 0 — pointer arithmetic
     // over the backing buffer `pkt.payload` views. Robust across IPv4
     // header options (a fixed header-length constant is not).
-    // `pkt.payload` is a sub-slice of `frame`, so the offset is
-    // in-bounds by construction.
     let l4_off = pkt.payload.as_ptr() as usize - frame.as_ptr() as usize;
     let l4_len = pkt.payload.len();
     Some(types::ParsedL3 {
@@ -108,9 +186,9 @@ fn parse_ipv4(
         dst: types::IpAddr::V4(pkt.dst),
         l4_off,
         l4_len,
-        // Snoop only on-subnet senders: off-subnet traffic's L2 src MAC
-        // is the gateway's, not the IP's own (see `arp::arp_learn`).
-        arp: if ipv4::same_subnet(pkt.src) {
+        // Snoop only on-subnet senders: off-subnet traffic's L2 src
+        // MAC is the gateway's, not the IP's own (see `arp::arp_learn`).
+        snoop_mac: if ipv4::same_subnet(pkt.src) {
             Some(src_mac)
         } else {
             None
@@ -118,20 +196,152 @@ fn parse_ipv4(
     })
 }
 
-/// Hand a parsed frame to the L4 stack: narrow the chain to its TCP
-/// segment for `tcp_receive`, or slice out the UDP datagram for
-/// `udp_receive`. A non-TCP/UDP `proto` falls through — this stack has
-/// no other IPv4 L4 handler. Consumes `chain` (it drops here, or in
-/// `tcp_receive`, reposting its device buffer).
-fn dispatch_l4(parsed: &types::ParsedL3, chain: Chain<OwnedIOBuf>) {
+/// Summarise an IPv6 packet into a [`ParsedL3`] — the IPv6 twin of
+/// [`parse_ipv4`]. The L4 offset is robust across IPv6 extension
+/// headers (a fixed `eth + 40` constant would miss them). `None` for
+/// a packet `ipv6_receive` rejects (malformed, or not addressed to
+/// one of `our_v6_addrs`).
+///
+/// [`ParsedL3`]: types::ParsedL3
+fn parse_ipv6(
+    frame: &[u8],
+    eth_payload: &[u8],
+    src_mac: types::MacAddr,
+) -> Option<types::ParsedL3> {
+    let mut addr_buf = [types::Ipv6Addr::ANY; 5];
+    let n = ipv6_nd::our_v6_addrs(&mut addr_buf);
+    let pkt = ipv6::ipv6_receive(eth_payload, &addr_buf[..n])?;
+    let l4_off = pkt.payload.as_ptr() as usize - frame.as_ptr() as usize;
+    let l4_len = pkt.payload.len();
+    Some(types::ParsedL3 {
+        proto: pkt.next_header,
+        src: types::IpAddr::V6(pkt.src),
+        dst: types::IpAddr::V6(pkt.dst),
+        l4_off,
+        l4_len,
+        // A v6 sender is link-local or same-prefix SLAAC — always
+        // on-link — so always snoop it (the pre-merge
+        // `ipv6_receive_frame` learned unconditionally too).
+        snoop_mac: Some(src_mac),
+    })
+}
+
+// ── owner — Tier-2 flow → core ──────────────────────────────────────
+
+/// Map a Tier-2 TCP/UDP flow to its owning core. A pure function of
+/// the 4-tuple, so every segment of a flow lands on the same core
+/// and the per-core TCP connection pool stays consistent. Called
+/// only by `distribute_frame`; Tier 1 leaves distribution to the
+/// NIC's hardware RSS and never computes this.
+fn owner(parsed: &types::ParsedL3, frame: &[u8], num_cores: u32) -> u32 {
+    // L4 ports are the first 4 bytes of the segment `classify` located.
+    let l4 = frame
+        .get(parsed.l4_off..parsed.l4_off + parsed.l4_len)
+        .unwrap_or(&[]);
+    let (src_port, dst_port) = if l4.len() >= 4 {
+        (
+            u16::from_be_bytes([l4[0], l4[1]]),
+            u16::from_be_bytes([l4[2], l4[3]]),
+        )
+    } else {
+        (0, 0)
+    };
+    match (parsed.src, parsed.dst) {
+        (types::IpAddr::V4(s), types::IpAddr::V4(d)) => {
+            flow_hash(s.addr, d.addr, src_port, dst_port, num_cores)
+        }
+        (types::IpAddr::V6(s), types::IpAddr::V6(d)) => {
+            flow_hash_v6(&s.octets, &d.octets, src_port, dst_port, num_cores)
+        }
+        // A frame is one address family or the other — mixed is
+        // impossible (`parse_ipv4`/`parse_ipv6` each yield one).
+        _ => 0,
+    }
+}
+
+/// IPv4 flow hash — FNV-1a over the 4-tuple, Murmur3 `fmix32`
+/// finalizer so `% num_cores` stays uniform even when inputs vary in
+/// only one field (e.g. wrk's N connections from one src IP to one
+/// dst port — without the finalizer all flows collapse to a single
+/// core on `num_cores = 2`).
+fn flow_hash(src_ip: u32, dst_ip: u32, src_port: u16, dst_port: u16, num_cores: u32) -> u32 {
+    let mut h: u32 = 2166136261; // FNV offset basis
+    h ^= src_ip;
+    h = h.wrapping_mul(16777619);
+    h ^= dst_ip;
+    h = h.wrapping_mul(16777619);
+    h ^= src_port as u32;
+    h = h.wrapping_mul(16777619);
+    h ^= dst_port as u32;
+    h = h.wrapping_mul(16777619);
+    // Murmur3 fmix32 — make low bits depend uniformly on the whole input.
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x85ebca6b);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0xc2b2ae35);
+    h ^= h >> 16;
+    h % num_cores
+}
+
+/// IPv6 flow hash — the v6 twin of [`flow_hash`]. Folds the two
+/// 16-byte addresses byte-by-byte into the same FNV-1a stream, then
+/// the same `fmix32` finalizer. Independent of `flow_hash`: a v4 and
+/// a v6 flow need not agree, only each be self-consistent.
+fn flow_hash_v6(
+    src: &[u8; 16],
+    dst: &[u8; 16],
+    src_port: u16,
+    dst_port: u16,
+    num_cores: u32,
+) -> u32 {
+    let mut h: u32 = 2166136261; // FNV offset basis
+    for &b in src.iter().chain(dst.iter()) {
+        h ^= b as u32;
+        h = h.wrapping_mul(16777619);
+    }
+    h ^= src_port as u32;
+    h = h.wrapping_mul(16777619);
+    h ^= dst_port as u32;
+    h = h.wrapping_mul(16777619);
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x85ebca6b);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0xc2b2ae35);
+    h ^= h >> 16;
+    h % num_cores
+}
+
+// ── deliver — L4 dispatch ───────────────────────────────────────────
+
+/// Snoop an on-link sender's L2 MAC into *this* core's neighbor
+/// cache — the ARP cache for a v4 frame, the NDP cache for v6. A
+/// no-op when `snoop_mac` is `None` (an off-subnet v4 sender, whose
+/// L2 MAC is the gateway's; see `parse_ipv4`).
+fn snoop(parsed: &types::ParsedL3) {
+    match (parsed.snoop_mac, parsed.src) {
+        (Some(mac), types::IpAddr::V4(s)) => arp::arp_learn(s, mac),
+        (Some(mac), types::IpAddr::V6(s)) => ndp::ndp_learn(s, mac),
+        _ => {}
+    }
+}
+
+/// Deliver a parsed frame to the transport stack — the single place
+/// the receive path reaches L4. Runs on the frame's *handling* core:
+/// Tier-1 inline, the Tier-2 distributor for a frame it owns, or the
+/// owning core after a cross-core inbox drain. Snoops the sender into
+/// this core's neighbor cache, then routes by L4 protocol. Consumes
+/// `chain` — it drops here (or in `tcp_receive`), reposting buffers.
+pub(crate) fn deliver(parsed: types::ParsedL3, chain: Chain<OwnedIOBuf>) {
+    snoop(&parsed);
+    // Protocol numbers are family-neutral (IANA): TCP 6 / UDP 17 for
+    // both v4 and v6, ICMPv6 58 for v6 only.
     match parsed.proto {
         ipv4::PROTO_TCP => {
             tcp_receive_segment(parsed.src, parsed.dst, chain, parsed.l4_off, parsed.l4_len);
         }
         ipv4::PROTO_UDP => {
             // The borrowed segment never outlives `udp_receive` (it
-            // runs synchronously); `chain` then drops at the end of
-            // this arm, reposting its device buffer.
+            // runs synchronously); `chain` then drops, reposting.
             let Some(first) = chain.iter().next() else {
                 return;
             };
@@ -143,6 +353,25 @@ fn dispatch_l4(parsed: &types::ParsedL3, chain: Chain<OwnedIOBuf>) {
             };
             udp::udp_receive(parsed.src, parsed.dst, segment);
         }
+        ipv6::next_header::ICMPV6 => {
+            // ICMPv6 — meaningful only for a v6 frame. Hand the IPv6
+            // control plane the (src, dst, payload, L2 src); the
+            // snoop above already warmed the NDP cache.
+            if let (types::IpAddr::V6(s), types::IpAddr::V6(d), Some(mac)) =
+                (parsed.src, parsed.dst, parsed.snoop_mac)
+            {
+                let Some(first) = chain.iter().next() else {
+                    return;
+                };
+                if let Some(segment) = first
+                    .data()
+                    .get(parsed.l4_off..parsed.l4_off + parsed.l4_len)
+                {
+                    ipv6_nd::handle_icmpv6(&s, &d, segment, mac);
+                }
+            }
+        }
+        // Any other L4 protocol — no handler; `chain` drops, reposting.
         _ => {}
     }
 }
@@ -193,207 +422,4 @@ fn tcp_receive_segment(
         return;
     }
     tcp::tcp_receive(src, dst, chain);
-}
-
-/// Tier 2 distributor decision — classify a frame for distribution,
-/// parsing its L2/L3 headers exactly once. Returns where the frame
-/// should go, carrying a [`ParsedL3`] so the receiving path never
-/// re-walks eth + IPv4 (the fuse — see `docs/rx-path-optimizations.md`,
-/// "Fuse the Tier-2 classify parse"). ARP / IPv6 fall back to
-/// `net_receive`'s own parse via `InlineReparse`.
-///
-/// Side effect: ARP-snoops on-subnet IPv4 senders of *distributed*
-/// frames, warming this (distributor) core's cache regardless of where
-/// the frame ends up handled — the comment the pre-fuse code carried.
-/// It deliberately does *not* snoop for inline frames: there
-/// `net_receive_parsed` does the single learn on this same core, so a
-/// learn here would be the redundant one the fuse removed.
-///
-/// [`ParsedL3`]: types::ParsedL3
-fn classify_for_distribution(frame: &[u8], num_cores: u32, my_core: u32) -> ClassifyResult {
-    let Some((src_mac, ethertype, payload)) = ethernet::ethernet_parse_full(frame) else {
-        return ClassifyResult::Drop;
-    };
-    match ethertype {
-        ethernet::ETHERTYPE_ARP | ipv6::ETHERTYPE_IPV6 => ClassifyResult::InlineReparse,
-        ethernet::ETHERTYPE_IPV4 => {
-            let Some(parsed) = parse_ipv4(frame, payload, src_mac) else {
-                return ClassifyResult::Drop;
-            };
-            let (src_v4, dst_v4) = match (parsed.src, parsed.dst) {
-                (types::IpAddr::V4(s), types::IpAddr::V4(d)) => (s, d),
-                // Unreachable: `parse_ipv4` only ever yields V4.
-                _ => return ClassifyResult::Drop,
-            };
-            // Non-TCP/UDP IPv4 (ICMP, ...) has no 4-tuple to hash and
-            // no L4 handler — run it inline. `net_receive_parsed` still
-            // ARP-snoops an on-subnet sender; `dispatch_l4` no-ops.
-            if parsed.proto != ipv4::PROTO_TCP && parsed.proto != ipv4::PROTO_UDP {
-                return ClassifyResult::InlineParsed(parsed);
-            }
-            // Flow-hash the 4-tuple — the L4 ports are the first 4
-            // bytes of the segment `parse_ipv4` already located.
-            let l4 = frame
-                .get(parsed.l4_off..parsed.l4_off + parsed.l4_len)
-                .unwrap_or(&[]);
-            let (src_port, dst_port) = if l4.len() >= 4 {
-                (
-                    u16::from_be_bytes([l4[0], l4[1]]),
-                    u16::from_be_bytes([l4[2], l4[3]]),
-                )
-            } else {
-                (0, 0)
-            };
-            let target = flow_hash(src_v4.addr, dst_v4.addr, src_port, dst_port, num_cores);
-            if target == my_core || num_cores <= 1 {
-                ClassifyResult::InlineParsed(parsed)
-            } else {
-                // Distributed: warm this (distributor) core's ARP
-                // cache for the on-subnet sender — the owning core
-                // warms its own when it drains the frame.
-                if let Some(mac) = parsed.arp {
-                    arp::arp_learn(src_v4, mac);
-                }
-                ClassifyResult::Distribute(target, parsed)
-            }
-        }
-        _ => ClassifyResult::Drop,
-    }
-}
-
-/// Where `classify_for_distribution` decided a Tier-2 frame should go.
-enum ClassifyResult {
-    /// ARP or IPv6 — hand the whole chain to `net_receive` on this
-    /// core, which re-parses. Classify stops at the ethertype for
-    /// these: they are rare, not the Tier-2 hot path the fuse targets.
-    InlineReparse,
-    /// IPv4 destined for this core — handle inline via
-    /// `net_receive_parsed`, reusing the parse classify just did.
-    InlineParsed(types::ParsedL3),
-    /// IPv4 TCP/UDP owned by another core — move the chain *and* its
-    /// parse into that core's `rx_inbox`; the owning core wakes,
-    /// drains it via `net_drain_cb`, and skips straight to the L4
-    /// stack with no re-parse.
-    Distribute(u32, types::ParsedL3),
-    /// Frame is unparseable, not for us, or a wrong ethertype.
-    Drop,
-}
-
-/// Tier 2 distributor — the `NicOps::poll_rx` callback in
-/// single-queue mode. Receives one frame as an owned
-/// `Chain<OwnedIOBuf>` and picks a target core: runs the receive
-/// path inline for ARP / IPv6 / my-core IPv4, or — for IPv4 owned by
-/// another core — *moves the whole chain* into that core's `rx_inbox`
-/// (item C), bundled with the L2/L3 parse so the owning core does not
-/// re-walk the headers. The move copies no frame bytes; the chain
-/// carries its device RX buffers cross-core and reposts them when
-/// the owning core drops it after processing.
-///
-/// A Tier 2 frame is a single-buffer chain, so classification keys
-/// on the first part; a hypothetical multi-part chain (item I) is
-/// one flow, so part 0's verdict applies to the whole chain.
-pub(crate) fn distribute_frame(chain: Chain<OwnedIOBuf>) {
-    let num_cores = percpu::num_cores();
-    let my_core = uni_kernel::cpu_id();
-    let Some(first) = chain.iter().next() else {
-        return;
-    };
-    match classify_for_distribution(first.data(), num_cores, my_core) {
-        // ARP / IPv6 — `net_receive` re-parses; the chain drops there.
-        ClassifyResult::InlineReparse => net_receive(chain),
-        // IPv4 for this core — receive inline, reusing classify's parse.
-        ClassifyResult::InlineParsed(parsed) => net_receive_parsed(parsed, chain),
-        ClassifyResult::Distribute(target, parsed) => {
-            // SAFETY: `percpu::init()` runs before any AP starts;
-            // target is bounded by `num_cores`.
-            let core = unsafe { percpu::get(target) };
-            let frame = percpu::RxChain { parsed, chain };
-            match percpu::rx_node_pool().distribute(&core.rx_inbox, frame) {
-                Ok(()) => {
-                    sched::WAKEUP
-                        .at(target)
-                        .store(true, core::sync::atomic::Ordering::Relaxed);
-                }
-                Err(_frame) => {
-                    // Unreachable: the node pool is sized ≥ the RX
-                    // queue's buffer count, so a frame in flight
-                    // always has a free node (see `rx_inbox`'s
-                    // overflow proof). `_frame` drops here, which
-                    // auto-reposts its chain's device buffers.
-                }
-            }
-        }
-        ClassifyResult::Drop => {}
-    }
-}
-
-fn ipv6_receive_frame(chain: Chain<OwnedIOBuf>, src_mac: types::MacAddr) {
-    let Some(first) = chain.iter().next() else {
-        return;
-    };
-    let Some((_, _, eth_payload)) = ethernet::ethernet_parse_full(first.data()) else {
-        return;
-    };
-    let mut addr_buf = [types::Ipv6Addr::ANY; 5];
-    let n = ipv6_nd::our_v6_addrs(&mut addr_buf);
-    let pkt = match ipv6::ipv6_receive(eth_payload, &addr_buf[..n]) {
-        Some(p) => p,
-        None => return,
-    };
-    // Snoop (peer_v6, peer_mac) into the NDP cache so future
-    // server-initiated outbound to this peer doesn't need an active
-    // Neighbor Solicitation. Mirrors the IPv4 ARP-snoop pattern.
-    ndp::ndp_learn(pkt.src, src_mac);
-    match pkt.next_header {
-        ipv6::next_header::ICMPV6 => {
-            ipv6_nd::handle_icmpv6(&pkt, src_mac);
-        }
-        proto @ (ipv6::next_header::TCP | ipv6::next_header::UDP) => {
-            let src = types::IpAddr::V6(pkt.src);
-            let dst = types::IpAddr::V6(pkt.dst);
-            if proto == ipv6::next_header::TCP {
-                // L4 segment's (offset, len) within the frame —
-                // pointer arithmetic over the backing buffer. Robust
-                // across IPv6 extension headers (which a fixed
-                // `eth + 40` constant would miss).
-                let l4_off = pkt.payload.as_ptr() as usize - first.data().as_ptr() as usize;
-                let l4_len = pkt.payload.len();
-                tcp_receive_segment(src, dst, chain, l4_off, l4_len);
-            } else {
-                udp::udp_receive(src, dst, pkt.payload);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Flow hash: map a 4-tuple to a core index for Tier 2 distribution.
-///
-/// Tier 2 uses a rotating distributor: any idle core can try_lock the
-/// RX_LOCK and become the distributor for one poll cycle. Flows are
-/// hashed across all cores, and the current distributor processes its
-/// own flows inline while pushing other cores' flows to their inbox.
-///
-/// Uses FNV-1a over the 4-tuple followed by a Murmur3 fmix32 so that
-/// `% num_cores` is uniform even when inputs vary in only one field
-/// (e.g. wrk opens N connections from the same src IP to the same
-/// dst port — without the finalizer all flows collapse to a single
-/// core on `num_cores = 2`, which was masking the multi-core path).
-fn flow_hash(src_ip: u32, dst_ip: u32, src_port: u16, dst_port: u16, num_cores: u32) -> u32 {
-    let mut h: u32 = 2166136261; // FNV offset basis
-    h ^= src_ip;
-    h = h.wrapping_mul(16777619);
-    h ^= dst_ip;
-    h = h.wrapping_mul(16777619);
-    h ^= src_port as u32;
-    h = h.wrapping_mul(16777619);
-    h ^= dst_port as u32;
-    h = h.wrapping_mul(16777619);
-    // Murmur3 fmix32 — make low bits depend uniformly on the whole input.
-    h ^= h >> 16;
-    h = h.wrapping_mul(0x85ebca6b);
-    h ^= h >> 13;
-    h = h.wrapping_mul(0xc2b2ae35);
-    h ^= h >> 16;
-    h % num_cores
 }

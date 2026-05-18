@@ -229,12 +229,12 @@ fn net_drain_cb(core_id: u32) -> bool {
     let core = percpu::percore(&cc);
     // Tier 2 cross-core delivery: the distributor parked received
     // frames in our inbox, each carrying the L2/L3 parse it already
-    // computed. Drain them in arrival (FIFO) order — `net_receive_parsed`
-    // skips straight to the L4 stack (no eth/IPv4 re-parse) and drops
-    // the chain there, reposting its device buffers. No frame-byte
-    // copy (item C).
+    // computed. Drain them in arrival (FIFO) order — `rx::deliver`
+    // skips straight to the L4 stack (no re-parse) and drops the
+    // chain there, reposting its device buffers. No frame-byte copy
+    // (item C).
     core.rx_inbox.drain_each(percpu::rx_node_pool(), |frame| {
-        rx::net_receive_parsed(frame.parsed, frame.chain)
+        rx::deliver(frame.parsed, frame.chain)
     }) > 0
 }
 

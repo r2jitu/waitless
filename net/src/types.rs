@@ -213,7 +213,7 @@ impl From<Ipv6Addr> for IpAddr {
 /// buffer, not by slice, so a `ParsedL3` can ride an inbox node
 /// alongside the frame's `Chain` without a lifetime. There is no
 /// `ethertype` field — `src`/`dst` already encode the IP family, and
-/// only IPv4 frames are ever summarised here.
+/// IPv4 and IPv6 frames alike are summarised here.
 #[derive(Clone, Copy, Debug)]
 pub struct ParsedL3 {
     /// IP protocol number of the L4 segment — `6` (TCP) or `17` (UDP)
@@ -229,13 +229,16 @@ pub struct ParsedL3 {
     pub l4_off: usize,
     /// Length in bytes of the L4 segment.
     pub l4_len: usize,
-    /// The L2 source MAC to ARP-snoop into the *receiving* core's
-    /// fast-cache, or `None` when the sender is off-subnet (its L2 src
-    /// MAC is the gateway's, not the IP's own — snooping it would be
-    /// wrong; see `arp_learn`). For a distributed frame the receiving
-    /// core is not the core the distributor warmed, so honouring this
-    /// is not redundant.
-    pub arp: Option<MacAddr>,
+    /// The on-link sender's L2 source MAC, to snoop into the
+    /// *receiving* core's neighbor cache — the ARP cache for a v4
+    /// frame, the NDP cache for v6. `None` when a v4 sender is
+    /// off-subnet (its L2 src MAC is the gateway's, not the IP's own
+    /// — snooping it would be wrong; see `arp_learn`); a v6 sender is
+    /// link-local or same-prefix SLAAC, hence always on-link, so a v6
+    /// frame always carries `Some`. For a distributed frame the
+    /// receiving core is not the core the distributor warmed, so
+    /// honouring this is not redundant.
+    pub snoop_mac: Option<MacAddr>,
 }
 
 #[derive(Clone, Copy)]

@@ -189,26 +189,30 @@ pub(crate) fn our_v6_addrs(out: &mut [types::Ipv6Addr; 5]) -> usize {
     n
 }
 
-pub(crate) fn handle_icmpv6(pkt: &ipv6::Ipv6Packet<'_>, src_mac: types::MacAddr) {
-    if pkt.payload.is_empty() {
+pub(crate) fn handle_icmpv6(
+    src: &types::Ipv6Addr,
+    dst: &types::Ipv6Addr,
+    payload: &[u8],
+    src_mac: types::MacAddr,
+) {
+    if payload.is_empty() {
         return;
     }
-    if icmpv6::verify_checksum(&pkt.src, &pkt.dst, pkt.payload).is_err() {
+    if icmpv6::verify_checksum(src, dst, payload).is_err() {
         return;
     }
-    match pkt.payload[0] {
+    match payload[0] {
         icmpv6::msg::ECHO_REQUEST => {
             // Reply: src = our LL, dst = original src. RFC 4443 §4.2:
             // hop limit 64 (default).
             let mut icmp_out = [0u8; 1500 - ipv6::HEADER_LEN];
-            let n = match icmpv6::build_echo_reply(&ipv6_ll(), &pkt.src, pkt.payload, &mut icmp_out)
-            {
+            let n = match icmpv6::build_echo_reply(&ipv6_ll(), src, payload, &mut icmp_out) {
                 Some(n) => n,
                 None => return,
             };
             ipv6_send::ipv6_send_to_mac(
                 &ipv6_ll(),
-                &pkt.src,
+                src,
                 src_mac,
                 ipv6::next_header::ICMPV6,
                 64,
@@ -216,10 +220,10 @@ pub(crate) fn handle_icmpv6(pkt: &ipv6::Ipv6Packet<'_>, src_mac: types::MacAddr)
             );
         }
         icmpv6::msg::ROUTER_ADVERTISEMENT => {
-            handle_router_advertisement(pkt.payload);
+            handle_router_advertisement(payload);
         }
         icmpv6::msg::NEIGHBOR_SOLICITATION => {
-            let ns = match icmpv6::parse_neighbor_solicitation(pkt.payload) {
+            let ns = match icmpv6::parse_neighbor_solicitation(payload) {
                 Ok(ns) => ns,
                 Err(_) => return,
             };
@@ -236,7 +240,7 @@ pub(crate) fn handle_icmpv6(pkt: &ipv6::Ipv6Packet<'_>, src_mac: types::MacAddr)
             let mut icmp_out = [0u8; 64];
             let n = match icmpv6::build_neighbor_advertisement(
                 &na_src,
-                &pkt.src,
+                src,
                 &ns.target,
                 &mac,
                 &mut icmp_out,
@@ -250,7 +254,7 @@ pub(crate) fn handle_icmpv6(pkt: &ipv6::Ipv6Packet<'_>, src_mac: types::MacAddr)
             let dst_mac = ns.src_lla.unwrap_or(src_mac);
             ipv6_send::ipv6_send_to_mac(
                 &na_src,
-                &pkt.src,
+                src,
                 dst_mac,
                 ipv6::next_header::ICMPV6,
                 255,
