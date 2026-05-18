@@ -495,6 +495,47 @@ impl TlsServer {
         n
     }
 
+    /// `true` when undelivered decrypted plaintext is buffered —
+    /// i.e. the next [`pop_plaintext`](Self::pop_plaintext) /
+    /// [`take_plaintext_chunk`](Self::take_plaintext_chunk) would
+    /// hand back bytes. A peek; does not move the cursor.
+    pub fn has_plaintext(&self) -> bool {
+        self.pt_pos < self.pt_len
+    }
+
+    /// Zero-copy sibling of [`pop_plaintext`](Self::pop_plaintext):
+    /// hand back the buffered plaintext window `pt_buf[pt_pos..pt_len]`
+    /// *in place* and consume it from the cursors' point of view,
+    /// instead of copying it into a caller buffer.
+    ///
+    /// The plaintext *bytes* in `pt_buf` are untouched — only the
+    /// `pt_pos` / `pt_len` cursors reset (matching the full-drain
+    /// branch of `pop_plaintext`). So a reader holding the returned
+    /// slice keeps seeing valid plaintext until the next
+    /// [`advance`](Self::advance) decrypts a fresh record into
+    /// `pt_buf`. The caller MUST therefore keep this `TlsServer`
+    /// borrowed and un-`advance`d for as long as it reads the
+    /// slice: `TlsStream::recv_chunk` does exactly that — the
+    /// `RecvChunkGuard` it returns carries the `&mut TlsStream`
+    /// borrow, which the borrow checker then forbids `pump_rx`
+    /// (the lone `advance` caller) to run under.
+    ///
+    /// `pt_buf` holds at most one record's plaintext, so the
+    /// returned slice is a single contiguous chunk. Returns an
+    /// empty slice when nothing is buffered; callers gate on
+    /// [`has_plaintext`](Self::has_plaintext).
+    pub fn take_plaintext_chunk(&mut self) -> &mut [u8] {
+        let lo = self.pt_pos;
+        let hi = self.pt_len;
+        // Consume the window now (eager): the caller wraps these
+        // bytes in a borrow-guarded view, and the next
+        // `pop_plaintext` / `take_plaintext_chunk` must not
+        // re-deliver them.
+        self.pt_pos = 0;
+        self.pt_len = 0;
+        &mut self.pt_buf[lo..hi]
+    }
+
     /// Emit a TLS 1.3 `close_notify` alert record (RFC 8446 §6.1)
     /// into the TX buffer and move the connection to `State::Closed`.
     ///
