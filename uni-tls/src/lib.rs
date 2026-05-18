@@ -538,82 +538,6 @@ impl TlsStream {
         self.drain_tx().await
     }
 
-    /// Zero-copy sibling of the `HttpStream::recv` fill-buffer
-    /// read. Where `recv` copies decrypted plaintext out of the
-    /// TLS layer's `pt_buf` into a caller buffer, `recv_chunk`
-    /// surfaces a `RecvChunkGuard` over a `Borrowed` `IOBuf`
-    /// viewing `pt_buf` *in place* — eliminating step 7 of the TLS
-    /// RX path table (the `pt_buf` → user-buf copy).
-    ///
-    /// Resolves to `Some(guard)` once a record's worth of
-    /// plaintext is available, or `None` on peer close / decrypt
-    /// error / any fatal TLS error — the same conditions under
-    /// which `recv` resolves to `0`. Handshake records carry no
-    /// plaintext, so the first one or two `pump_rx` iterations
-    /// drive the handshake to completion exactly as in `recv`.
-    ///
-    /// **`&mut self` is load-bearing, not incidental.** The
-    /// returned guard carries that borrow for its whole life (it
-    /// is `RecvChunkGuard<'_>` with `'_` tied to `&mut self`), so
-    /// the borrow checker forbids a second `recv` / `recv_chunk`
-    /// — hence `pump_rx`, hence the AEAD decrypt that overwrites
-    /// `pt_buf` — while the guard is live. That is what makes the
-    /// `Borrowed`-into-`pt_buf` view sound: the bytes it points at
-    /// cannot be rewritten under it. A bare
-    /// `recv_chunk() -> Option<IOBuf>` would be borrow-*unsafe*
-    /// here — `IOBuf` has no lifetime parameter — which is the
-    /// whole reason RX item F chose the guard shape.
-    ///
-    /// `guard.data()` reads the plaintext in place (zero copy);
-    /// `guard.into_owned()` lifts it to an owned `Heap` `IOBuf` at
-    /// the cost of one memcpy (the `Borrowed` → `Heap` case — the
-    /// TLS path has no `ExternalOwned` plaintext buffer to hand
-    /// out for free; closing that last copy is the documented
-    /// Phase-4 in-place-decrypt follow-up).
-    pub async fn recv_chunk(&mut self) -> Option<uni::runtime::RecvChunkGuard<'_>> {
-        // Drive the conn until `pt_buf` holds decrypted plaintext.
-        // Handshake records produce none, so early iterations just
-        // advance the handshake — same loop shape as `recv`.
-        while !self.tls.has_plaintext() {
-            if self.pump_rx().await.is_err() {
-                return None;
-            }
-        }
-
-        // Consume the plaintext window. `take_plaintext_chunk`
-        // resets `pt_pos` / `pt_len` *now* (eager, not on guard
-        // drop): the guard's `&mut self` borrow means no code can
-        // observe the cursors — or re-`pump_rx` `pt_buf` — between
-        // here and the guard's drop, so on-drop bookkeeping would
-        // be indistinguishable. The cross-crate `RecvChunkGuard`
-        // has no `Drop` hook by design (RX item F); eager advance
-        // needs none.
-        let window: &mut [u8] = self.tls.take_plaintext_chunk();
-        let len = window.len() as u32;
-        let base = window.as_mut_ptr();
-
-        // SAFETY: `IOBuf::borrow` requires the region stay valid,
-        // unaliased, and not mutated from elsewhere for the
-        // IOBuf's whole life.
-        //  * `base` points into `pt_buf`, an inline array in the
-        //    `Box<TlsConnImpl>` owned by `self.tls`; `len` bytes
-        //    from it are in-bounds (`take_plaintext_chunk`
-        //    sliced them out of `pt_buf`). `base` is a slice
-        //    pointer, hence non-null and aligned.
-        //  * The returned guard borrows `&mut self` for its whole
-        //    life, so `self` — hence the box, `pt_buf`, and these
-        //    bytes — can neither move nor be re-`pump_rx`'d (the
-        //    sole `pt_buf` writer) while the guard reads them.
-        //  * At most one guard exists at a time — the same
-        //    `&mut self` borrow — so no second view overlaps.
-        //  * The `Borrowed` IOBuf drops with the guard, ending the
-        //    borrow before the next `recv` / `recv_chunk` can run.
-        let iobuf = unsafe {
-            IOBuf::borrow(core::ptr::NonNull::new_unchecked(base), len, 0, len)
-        };
-        Some(uni::runtime::RecvChunkGuard::new(iobuf))
-    }
-
     /// Encrypt and ship one TLS 1.3 application_data record. The
     /// TLS layer consumes up to `PLAINTEXT_CHUNK` (16 KiB) bytes
     /// from the front of `src` and leaves the rest for the next
@@ -702,6 +626,83 @@ impl uni_http::HttpStream for TlsStream {
                 return 0;
             }
         }
+    }
+
+    /// Zero-copy sibling of [`recv`](Self::recv). Where `recv`
+    /// copies decrypted plaintext out of the TLS layer's `pt_buf`
+    /// into a caller buffer, `recv_chunk` surfaces a
+    /// `RecvChunkGuard` over a `Borrowed` `IOBuf` viewing `pt_buf`
+    /// *in place* — eliminating step 7 of the TLS RX path table
+    /// (the `pt_buf` → user-buf copy). [`BodyReader::chunk`] drives
+    /// it for HTTPS request bodies past the prebuf (RX item H).
+    ///
+    /// Resolves to `Some(guard)` once a record's worth of plaintext
+    /// is available, or `None` on peer close / decrypt error / any
+    /// fatal TLS error — the same conditions under which `recv`
+    /// resolves to `0`. Handshake records carry no plaintext, so
+    /// the first one or two `pump_rx` iterations drive the
+    /// handshake to completion exactly as in `recv`.
+    ///
+    /// **`&mut self` is load-bearing, not incidental.** The
+    /// returned guard carries that borrow for its whole life (it is
+    /// `RecvChunkGuard<'_>` with `'_` tied to `&mut self`), so the
+    /// borrow checker forbids a second `recv` / `recv_chunk` —
+    /// hence `pump_rx`, hence the AEAD decrypt that overwrites
+    /// `pt_buf` — while the guard is live. That is what makes the
+    /// `Borrowed`-into-`pt_buf` view sound: the bytes it points at
+    /// cannot be rewritten under it. A bare
+    /// `recv_chunk() -> Option<IOBuf>` would be borrow-*unsafe*
+    /// here — `IOBuf` has no lifetime parameter — which is the
+    /// whole reason RX item F chose the guard shape.
+    ///
+    /// `guard.data()` reads the plaintext in place (zero copy);
+    /// `guard.into_owned()` lifts it to an owned `Heap` `IOBuf` at
+    /// the cost of one memcpy (the `Borrowed` → `Heap` case — the
+    /// TLS path has no `ExternalOwned` plaintext buffer to hand out
+    /// for free; closing that last copy is the documented Phase-4
+    /// in-place-decrypt follow-up).
+    async fn recv_chunk(&mut self) -> Option<uni::runtime::RecvChunkGuard<'_>> {
+        // Drive the conn until `pt_buf` holds decrypted plaintext.
+        // Handshake records produce none, so early iterations just
+        // advance the handshake — same loop shape as `recv`.
+        while !self.tls.has_plaintext() {
+            if self.pump_rx().await.is_err() {
+                return None;
+            }
+        }
+
+        // Consume the plaintext window. `take_plaintext_chunk`
+        // resets `pt_pos` / `pt_len` *now* (eager, not on guard
+        // drop): the guard's `&mut self` borrow means no code can
+        // observe the cursors — or re-`pump_rx` `pt_buf` — between
+        // here and the guard's drop, so on-drop bookkeeping would
+        // be indistinguishable. The cross-crate `RecvChunkGuard`
+        // has no `Drop` hook by design (RX item F); eager advance
+        // needs none.
+        let window: &mut [u8] = self.tls.take_plaintext_chunk();
+        let len = window.len() as u32;
+        let base = window.as_mut_ptr();
+
+        // SAFETY: `IOBuf::borrow` requires the region stay valid,
+        // unaliased, and not mutated from elsewhere for the
+        // IOBuf's whole life.
+        //  * `base` points into `pt_buf`, an inline array in the
+        //    `Box<TlsConnImpl>` owned by `self.tls`; `len` bytes
+        //    from it are in-bounds (`take_plaintext_chunk`
+        //    sliced them out of `pt_buf`). `base` is a slice
+        //    pointer, hence non-null and aligned.
+        //  * The returned guard borrows `&mut self` for its whole
+        //    life, so `self` — hence the box, `pt_buf`, and these
+        //    bytes — can neither move nor be re-`pump_rx`'d (the
+        //    sole `pt_buf` writer) while the guard reads them.
+        //  * At most one guard exists at a time — the same
+        //    `&mut self` borrow — so no second view overlaps.
+        //  * The `Borrowed` IOBuf drops with the guard, ending the
+        //    borrow before the next `recv` / `recv_chunk` can run.
+        let iobuf = unsafe {
+            IOBuf::borrow(core::ptr::NonNull::new_unchecked(base), len, 0, len)
+        };
+        Some(uni::runtime::RecvChunkGuard::new(iobuf))
     }
 
     async fn send(&mut self, src: &mut IOBufChain) -> Result<(), ()> {
