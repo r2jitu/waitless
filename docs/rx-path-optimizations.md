@@ -62,9 +62,9 @@ ring out, prebuf, refill). Down from 5–6 before Phase 1.
 | # | Step | Site | Cost per byte | Notes |
 |---|------|------|---|---|
 | 1–4 | Same as TCP HTTP | (above) | 1–2 | Ciphertext bytes flow through |
-| 5 | TLS pump_rx into cipher_buf | [`uni-tls/src/lib.rs:501`](uni-tls/src/lib.rs#L501) | 0 (in-place pump from TcpStream::recv) | 8 KiB inline cipher_buf |
+| 5 | TLS pump_rx into cipher_buf | [`uni-tls/src/lib.rs:513`](uni-tls/src/lib.rs#L513) | 0 (in-place pump from TcpStream::recv) | 8 KiB inline cipher_buf |
 | 6 | AEAD decrypt | TLS state machine | **1× R/W** (ChaCha20) + **1× R** (Poly1305 verify) | Plaintext lands in `pt_buf` (17 KiB after Phase 1's bump) |
-| 7 | TlsStream::recv pops plaintext | [`uni-tls/src/lib.rs:580`](uni-tls/src/lib.rs#L580) | **1× memcpy** | pt_buf → user buf |
+| 7 | TlsStream::recv pops plaintext | [`uni-tls/src/lib.rs:685`](uni-tls/src/lib.rs#L685) | **1× memcpy** | pt_buf → user buf (item G's `recv_chunk` is the zero-copy sibling) |
 | 8 | HTTP / BodyReader same as TCP | | 1× memcpy | refill |
 
 Active per-byte memcpys on **TLS RX** guest side: **2** + the
@@ -289,9 +289,15 @@ AEAD.
   preserves bytes.
 
 ### G. `TlsStream::recv_chunk`
-- **Status**: [ ]
-- **Where**: [`uni-tls/src/lib.rs:580`](uni-tls/src/lib.rs#L580) —
-  new method alongside existing `recv`.
+- **Status**: [x] landed 2026-05-17 — commits `a0c9acf` (uni-runtime
+  guard constructor), `74357c6` (uni-tls `recv_chunk`). See the
+  progress-log entry below.
+- **Where**: [`uni-tls/src/lib.rs:573`](uni-tls/src/lib.rs#L573) —
+  `TlsStream::recv_chunk`, an inherent method alongside the existing
+  fill-buf `recv` (the `HttpStream` trait impl, now at
+  [`:685`](uni-tls/src/lib.rs#L685)); the `TlsServer` plaintext-window
+  accessors it drives are at
+  [`uni-tls/src/server.rs:502`](uni-tls/src/server.rs#L502).
 - **What**: returns a `RecvChunkGuard<'_>` wrapping a Borrowed
   IOBuf into `pt_buf` (already-decrypted plaintext from
   AEAD-open). Caller reads in place; advances `pt_pos` on guard
@@ -1342,3 +1348,115 @@ Next: item G (`TlsStream::recv_chunk` — a `RecvChunkGuard` over a
 `Borrowed` view into `pt_buf`), the smaller TLS-side counterpart,
 then item H wires `BodyReader::chunk` onto both and the zero-copy
 body win lands.
+
+### 2026-05-17 — Phase 2/3, item G: `TlsStream::recv_chunk` ([x] **landed** — commits `a0c9acf`, `74357c6`)
+
+The TLS-side counterpart of item F. `TlsStream::recv_chunk` is the
+zero-copy sibling of the fill-buffer `recv`: instead of copying
+decrypted plaintext out of the TLS layer's `pt_buf` into a caller
+buffer (step 7 of the TLS RX path table), it surfaces a
+`RecvChunkGuard` over a `Borrowed` `IOBuf` viewing `pt_buf` in
+place. Dead until item H rewires `BodyReader` onto it — perf-neutral
+by construction, exactly as item F was.
+
+**The guard knot — "advance `pt_pos` on guard drop" without a
+cross-crate `Drop`.** Item G's sketch said the TLS guard "advances
+`pt_pos` on guard drop." A typed mutate-the-`TlsStream`-on-drop is
+*impossible*: `RecvChunkGuard` lives in `uni-runtime` and cannot
+name `TlsStream` (the dependency runs `uni-tls → uni-runtime`), and
+item F deliberately gave the guard no `Drop`. Two clean options
+were on the table: (a) advance `pt_pos` **eagerly** when
+`recv_chunk` hands out the guard; (b) give the guard a type-erased
+drop hook. **Chose (a).** The guard carries the `&mut self` borrow
+of `recv_chunk` for its whole life, so between the eager advance
+and the guard's drop *no code can observe `pt_pos` / `pt_len` or
+re-run `pump_rx`* — eager and on-drop advance are observationally
+identical. Option (a) needs only a `pub` constructor on
+`RecvChunkGuard` (the guard is otherwise unchanged — no `Drop`, no
+hook field, the public API stays frozen); option (b) would add a
+`Drop` impl + a hook field firing cross-crate for zero behavioural
+gain. The cursor write is bookkeeping; the `&mut self` borrow is
+what is load-bearing for safety — the same point item F's entry
+makes about why the guard *return type* matters.
+
+**Shape.** `TlsServer` gains two sans-io accessors: `has_plaintext`
+(a peek) and `take_plaintext_chunk` (hands back
+`pt_buf[pt_pos..pt_len]` as a `&mut [u8]` and resets the cursors —
+the zero-copy sibling of `pop_plaintext`). `TlsStream::recv_chunk`
+loops `pump_rx` until plaintext is buffered (handshake records
+carry none, so the early iterations just drive the handshake,
+exactly as `recv` does), then wraps the window in a `Borrowed`
+`IOBuf` behind a `RecvChunkGuard`. The chunk is a *single
+contiguous* view — `pt_buf` holds at most one record's plaintext,
+so there is no chain; multi-part delivery is item I's concern and
+the `RecvChunkGuard` API stays frozen single-part. `data()` reads
+in place (zero copy); `into_owned()` is the `Borrowed → Heap` +1
+memcpy case — the TLS path has no `ExternalOwned` plaintext buffer
+to hand out for free. Closing that last copy (in-place AEAD into
+the device RX buffers, surfacing a `Chain<ExternalOwned>`) is the
+documented Phase-4 follow-up; it needs **no API change** — the
+guard is the stable façade — and is explicitly out of item G's
+scope.
+
+**A pre-existing item-F miss, fixed in passing (commit `4d3dda2`).**
+`uni_tls_test` would not build: item F added three fields to the
+`TcpBackend` vtable (`do_recv_chunk` / `set_chunk_buf_slot` /
+`clear_chunk_buf_slot`) and updated the bare-metal initializer in
+`net/src/tcp.rs`, but missed the native one in
+`uni-backend/src/native/tcp.rs`. Item F's gate set — two bare-metal
+`bazel build`s + `test_hvf` — never compiles the native backend
+(it is `select`'d in only for host builds), so the breakage slipped
+through; `uni_tls_test` catches it because `uni-tls → uni →
+uni-backend` pulls the native backend into a host-native test
+compile. Fixed by wiring the three hooks as `None` — the documented
+native-POSIX behaviour (`recv()` copies at the syscall boundary, so
+there is no device buffer to lend; `recv_chunk` resolves to `None`
+and callers fall back to `recv`).
+
+No new unit test. The guard revision is a `pub` on an existing
+constructor — already covered by item F's
+`RecvChunkGuard::into_owned` *Borrowed-source* round-trip in
+`uni_runtime_test`, which **is** the TLS-plaintext shape. A
+TLS-side `compile_fail` doc-test of the two-guards borrow error
+would need a full `TlsStream` to construct (a `TcpStream` +
+`PooledTlsConn` + a live runtime); the borrow mechanism is anyway
+*identical* to `TcpStream`'s — same guard, same `&mut self`
+lifetime — and already has a `compile_fail` doc-test on the TCP
+side. `test_hvf` (real TLS handshakes + the 30-conn TLS burst) is
+the functional gate the plan designates for G.
+
+Verified: `bazel build //apps/webserver:webserver_qemu_x86_64`;
+`bazel build //apps/webserver:webserver.elf
+--platforms=//bazel/platforms:aarch64_unikernel`; `bazel test
+//apps/webserver:test_hvf`; `bazel test //uni-runtime:uni_runtime_test
+//uni-runtime:uni_runtime_doc_test //uni-tls:uni_tls_test` (the last
+unblocked by the native-backend fix). The `4d3dda2` + `a0c9acf`
+intermediate tree was gate-checked on its own before `74357c6`
+landed on top.
+
+Perf — a controlled **same-session A/B**: `main` vs item G, 3 runs
+each, identical host, HVF 1c/3c (the `--env hvf --cores 1,3`
+protocol), so only the code differs. Medians:
+
+| Workload | `main` 1c/3c | item G 1c/3c | Δ 1c/3c |
+|---|---|---|---|
+| `get_tcp` (control) | 192.7 k / 191.3 k | 193.7 k / 193.9 k | +0.5 % / +1.3 % |
+| `get_tls_fresh` (control) | 2923 / 7439 | 2928 / 7394 | +0.2 % / −0.6 % |
+| `upload_32k_tcp` | 21.4 k / 39.7 k | 21.6 k / 39.2 k | +0.9 % / −1.3 % |
+| `upload_32k_tls` | 4792 / 12.7 k | 4814 / 12.4 k | +0.5 % / −1.9 % |
+
+Every workload sits within ±2 %, well inside the ±3 % control
+tolerance — item G is perf-neutral, as expected for code nothing
+calls until item H. The A/B against `main` (not against item F's
+progress-log figures) is load-bearing here: a first pass compared
+item G to item F's logged `get_tls_fresh` 3c of 7881 and read −6 %,
+but re-benching `main` on this host *today* gives 7439 — the gap
+was cross-session host drift, and the same-session control shows
+−0.6 %. No GCE checkpoint for G (the plan reserves those for B, D,
+H, I, J).
+
+Next: item H — `BodyReader::chunk` returns a guard, wiring
+`BodyReader` onto both `TcpStream::recv_chunk` and
+`TlsStream::recv_chunk`. That is where the zero-copy body win
+actually lands (the threshold table budgets +10–20 % on
+`upload_32k_tls` 1c after H).
