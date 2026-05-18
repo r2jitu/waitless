@@ -247,18 +247,32 @@ WORKLOADS = [
 
     # ── Raw TCP echo (guest:9) ────────────────────────────────────────
     #
-    # `tcp_echo` round-trips a small (64 B) message off the
-    # `tcp_echo` handler — no HTTP, no TLS, just recv→send. After
-    # the RX zero-copy migration the handler is `recv_chunk()` →
-    # `into_owned()` → `send`: on bare-metal the device RX buffer
-    # flows RX→TX with no intermediate copy (vs the old `recv` into
-    # a stack buffer + `send_bytes` — two copies). This is the A/B
-    # probe for that migration. `available` tier — name it
-    # explicitly (`--workload tcp_echo`); the harness already has
-    # the `tcp_echo` type wired (run_loadgen_tcp_echo).
+    # `tcp_echo` round-trips a message off the `tcp_echo` handler —
+    # no HTTP, no TLS, just recv→send. The handler is `recv_chunk()`
+    # → `into_owned()` → `send`: on bare-metal the device RX buffer
+    # is surfaced zero-copy and handed to the TX path with no
+    # intermediate copy (vs the old `recv` into a stack buffer +
+    # `send_bytes` — two copies).
+    #
+    # Two sizes, two regimes:
+    #   * `tcp_echo` (64 B) — round-trip *latency* probe. Too small
+    #     for the eliminated copy to register; the rate is bounded
+    #     by per-round-trip overhead, not bytes moved. (A 64 B A/B
+    #     of the recv_chunk migration came back flat, as expected.)
+    #   * `tcp_echo_64k` (64 KiB) — *throughput* probe. Large enough
+    #     that the per-segment RX copy is a real fraction of the
+    #     work, so this is the workload that actually surfaces the
+    #     `recv_chunk` zero-copy-RX win. (TX is still a copy until
+    #     the Phase-5 TX-side IOBuf work — see
+    #     docs/rx-path-optimizations.md — so this measures the RX
+    #     half, not yet end-to-end zero-copy.)
+    # Both `available` tier — name them explicitly.
     {"name": "tcp_echo", "type": "tcp_echo",
-     "conns_per_core": 8, "tier": "available",
-     "desc": "Raw TCP echo round-trip throughput (64 B msg; recv_chunk zero-copy path)"},
+     "conns_per_core": 8, "tier": "available", "msg_size": 64,
+     "desc": "TCP echo round-trip latency probe (64 B msg)"},
+    {"name": "tcp_echo_64k", "type": "tcp_echo",
+     "conns_per_core": 8, "tier": "available", "msg_size": 65536,
+     "desc": "TCP echo throughput (64 KiB msg) — surfaces the recv_chunk zero-copy RX path at scale"},
 
     # ── Bulk RX — POST /discard with sized body ──────────────────────
     #
@@ -937,7 +951,8 @@ def main():
                     # isn't installed.
                     with measure_client_cpu() as m:
                         rps, p50, p99 = run_loadgen_tcp_echo(
-                            tcp_echo_target_port, conns, duration, host=wrk_host)
+                            tcp_echo_target_port, conns, duration,
+                            host=wrk_host, msg_size=w.get("msg_size", 64))
                     results[(env_name, cpus, wname)] = (rps, p50, p99)
                     client_cpu[(env_name, cpus, wname)] = m["cores"]
                     print(f"    {wname:<20s} {rps:>10.0f} msg/s  "
