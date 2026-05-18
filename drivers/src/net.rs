@@ -1,4 +1,12 @@
-// drivers/net.rs — NIC dispatch through `uni_net_driver::active_ops()`.
+// drivers/net.rs — the `nic` crate: NIC dispatch through
+// `uni_net_driver::active_ops()`.
+//
+// Standalone host-buildable crate whose only dependency is the
+// host-buildable `uni_net_driver` interface crate. Split out of the
+// os:none `//drivers` umbrella so the TX-side net crates that call
+// these dispatchers (`net_eth_tx`, `net_tcp`, …) stay host-buildable.
+// `//drivers` re-exports this crate as `uni_drivers::net`, so os:none
+// callers are unchanged.
 //
 // `init()` walks `linked_ethernet_drivers()`, calls the `probe` fn
 // pointer on each registration, and installs the first success into
@@ -6,6 +14,8 @@
 // exists — `active_ops()` resolves to `NULL_OPS` (all no-ops), so
 // every dispatcher below is a single load + direct call with no
 // null branch.
+
+#![no_std]
 
 use uni_net_driver::{
     Chain, OwnedIOBuf, active_ops, is_installed, linked_ethernet_drivers, set_active_ops,

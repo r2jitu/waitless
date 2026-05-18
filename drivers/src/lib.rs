@@ -1,13 +1,14 @@
-// drivers/lib.rs — Outer `drivers` crate: NIC dispatcher that
-// trait-dispatches through the `uni_net_driver` active-driver slot,
-// plus umbrella re-exports of the shared infrastructure.
+// drivers/lib.rs — Outer `drivers` crate: umbrella re-exports of the
+// shared infrastructure plus the NIC dispatch layer.
 //
 // The shared hardware-access infrastructure (MMIO helpers, PCI
 // enumeration, VirtIO transport, virtio-console) lives in the sibling
-// `drivers_infra` sub-target. Each NIC lives in its own crate
+// `drivers_infra` sub-target. The NIC dispatch layer — thin wrappers
+// over the `uni_net_driver` active-driver slot — lives in the sibling
+// host-buildable `nic` crate. Each NIC lives in its own crate
 // (`//uni-driver-virtio-net`, `//uni-driver-gve`) that registers via
-// `register_ethernet_driver!`. `drivers/net.rs` walks the registry
-// at init, installs the winner in the active-driver slot, and every
+// `register_ethernet_driver!`; `nic::init()` walks the registry at
+// init, installs the winner in the active-driver slot, and every
 // subsequent call trait-dispatches through that slot.
 //
 // Crucially this crate has **no static references to the NIC crates**
@@ -23,4 +24,8 @@ extern crate drivers_infra;
 // about the sub-target split.
 pub use drivers_infra::*;
 
-pub mod net;
+// NIC dispatch lives in the standalone host-buildable `nic` crate
+// (`//drivers:nic`), split out so the TX-side net crates can call the
+// dispatchers without being dragged onto this os:none umbrella.
+// Re-exported as `uni_drivers::net` so existing callers are unchanged.
+pub extern crate nic as net;

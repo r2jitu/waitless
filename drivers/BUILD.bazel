@@ -19,21 +19,33 @@ rust_library(
     ],
 )
 
-# Outer umbrella: NIC dispatcher (trait-dispatched via
-# `uni_net_driver::active_driver`) + `pub use drivers_infra::*`. Does
-# NOT depend on specific NIC crates — apps pick their drivers via
-# `unikernel_binary(drivers = [...])`.
+# NIC dispatch layer: thin wrappers over the `uni_net_driver`
+# active-ops slot (`send`, `poll`, `acquire_tx_buf`, …). Standalone
+# host-buildable crate — its only dependency is the host-buildable
+# `//uni-net:driver` interface crate — so the TX-side net crates
+# (`net_eth_tx`, `net_tcp`, …) can call the dispatchers without being
+# dragged onto the os:none `//drivers` umbrella. The crate is named
+# `nic`; `crate_root` keeps the historical `src/net.rs` filename.
+rust_library(
+    name = "nic",
+    srcs = ["src/net.rs"],
+    crate_name = "nic",
+    crate_root = "src/net.rs",
+    deps = ["//uni-net:driver"],
+)
+
+# Outer umbrella: re-exports `drivers_infra` + the `nic` dispatch crate
+# (as `uni_drivers::net`). Does NOT depend on specific NIC crates —
+# apps pick their drivers via `unikernel_binary(drivers = [...])`.
 rust_library(
     name = "drivers",
     srcs = [
         "src/lib.rs",
-        "src/net.rs",
     ],
     crate_name = "uni_drivers",
     crate_root = "src/lib.rs",
     deps = [
         ":infra",
-        "//kernel",
-        "//uni-net:driver",
+        ":nic",
     ],
 )
