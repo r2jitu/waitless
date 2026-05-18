@@ -339,20 +339,16 @@ async fn handle_request<S: uni_http::HttpStream>(
         // returns a tiny 200 OK. Paired with the `upload_*_*`
         // bench workloads — see scripts/bench/cli.py.
         b"/discard" => {
-            // `chunk().await` yields the next slice of body
-            // bytes from either the parse buffer's leading
-            // prebuf (zero-copy) or the reader's internal
-            // refill scratch (one copy from the transport).
-            // We don't look at the bytes; just walking the
-            // stream is enough to advance the conn state past
-            // the body so the next keep-alive request can
-            // parse correctly.
-            loop {
-                let chunk = body.chunk().await;
-                if chunk.is_empty() {
-                    break;
-                }
-                core::hint::black_box(chunk.len());
+            // `chunk().await` yields the next run of body bytes as a
+            // `BodyChunkGuard` — a zero-copy view over the parse
+            // buffer's leading prebuf or, past it, the transport's
+            // own RX buffer (item H of docs/rx-path-optimizations.md).
+            // We don't look at the bytes; just walking the stream is
+            // enough to advance the conn state past the body so the
+            // next keep-alive request can parse correctly. `None`
+            // ends the body.
+            while let Some(chunk) = body.chunk().await {
+                core::hint::black_box(chunk.data().len());
             }
             Response::ok(b"application/json", b"{\"status\":\"discarded\"}")
         }
